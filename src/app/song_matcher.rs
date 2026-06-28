@@ -39,6 +39,9 @@ pub fn match_song_query(
         ));
     }
     if is_contained_query_name(&normalized_name, &normalized_query) {
+        if !is_safe_contained_query_name(&name_match.raw, query, &normalized_query) {
+            return MatchResult::no("歌名局部包含无明确边界");
+        }
         return MatchResult::yes("歌名包含匹配");
     }
 
@@ -50,6 +53,7 @@ pub fn match_song_query(
     if has_full_name
         && !has_singer_separator_after_name(query, &name_match.raw)
         && singer_candidate.chars().count() <= config.max_ocr_noise_chars + 1
+        && can_ignore_full_name_extra(&normalized_name, &singer_candidate)
     {
         return MatchResult::yes(&format!("忽略OCR噪声:{}", singer_candidate));
     }
@@ -290,6 +294,81 @@ fn is_contained_query_name(normalized_name: &str, normalized_query: &str) -> boo
         3
     };
     normalized_query.chars().count() >= min_length && normalized_name.contains(normalized_query)
+}
+
+fn is_safe_contained_query_name(
+    returned_name: &str,
+    raw_query: &str,
+    normalized_query: &str,
+) -> bool {
+    let query_len = normalized_query.chars().count();
+    if !normalized_query.chars().any(|ch| ch.is_alphabetic()) {
+        return false;
+    }
+    if is_mostly_chinese(normalized_query) {
+        return query_len >= 2;
+    }
+    if query_len >= 6 {
+        return true;
+    }
+    raw_query_occurs_at_title_start(returned_name, raw_query.trim())
+        || raw_query_occurs_after_missing_first_char(returned_name, raw_query.trim())
+        || raw_query_occurs_with_boundary(returned_name, raw_query.trim())
+}
+
+fn raw_query_occurs_at_title_start(value: &str, query: &str) -> bool {
+    if query.is_empty() {
+        return false;
+    }
+    value
+        .trim_start()
+        .to_lowercase()
+        .starts_with(&query.to_lowercase())
+}
+
+fn raw_query_occurs_after_missing_first_char(value: &str, query: &str) -> bool {
+    if query.chars().count() < 3 {
+        return false;
+    }
+    value.split_whitespace().any(|word| {
+        let mut chars = word.chars();
+        chars.next();
+        chars.as_str().eq_ignore_ascii_case(query)
+    })
+}
+
+fn raw_query_occurs_with_boundary(value: &str, query: &str) -> bool {
+    if query.is_empty() {
+        return false;
+    }
+    let value_lower = value.to_lowercase();
+    let query_lower = query.to_lowercase();
+    let mut start = 0;
+    while let Some(index) = value_lower[start..].find(&query_lower) {
+        let begin = start + index;
+        let end = begin + query_lower.len();
+        let before = value_lower[..begin].chars().next_back();
+        let after = value_lower[end..].chars().next();
+        if before.is_none_or(is_text_boundary) && after.is_none_or(is_text_boundary) {
+            return true;
+        }
+        start = end;
+    }
+    false
+}
+
+fn is_text_boundary(ch: char) -> bool {
+    ch.is_whitespace() || is_punctuation(ch)
+}
+
+fn can_ignore_full_name_extra(normalized_name: &str, extra: &str) -> bool {
+    if extra.is_empty() {
+        return true;
+    }
+    if is_mostly_chinese(normalized_name) {
+        return true;
+    }
+    extra.chars().count() <= 1 || normalized_name.chars().count() >= 6
 }
 
 fn score_chinese_name(config: &MatchConfig, normalized_name: &str, normalized_query: &str) -> f64 {
@@ -720,6 +799,71 @@ mod tests {
             "亲的那不是爱情",
             "亲爱的那不是爱情",
             "张韶涵",
+            false,
+        );
+
+        assert!(result.ok, "{}", result.reason);
+    }
+
+    #[test]
+    fn rejects_short_english_substring_without_word_boundary() {
+        let result = match_song_query(
+            &MatchConfig::default(),
+            "01:21",
+            "The New Birthday Song Contest",
+            "Cody Goss",
+            false,
+        );
+
+        assert!(!result.ok, "{}", result.reason);
+    }
+
+    #[test]
+    fn rejects_numeric_substring_inside_metadata_title() {
+        let result = match_song_query(
+            &MatchConfig::default(),
+            "01:21",
+            "https://freemusicarchive.org/file/images/albums/The_New_Birthday_Song_Contest_-_20121206162017883.png",
+            "Cody Goss",
+            false,
+        );
+
+        assert!(!result.ok, "{}", result.reason);
+    }
+
+    #[test]
+    fn rejects_longer_song_that_only_extends_returned_title() {
+        let result = match_song_query(
+            &MatchConfig::default(),
+            "Creepin",
+            "Creep",
+            "Radiohead",
+            false,
+        );
+
+        assert!(!result.ok, "{}", result.reason);
+    }
+
+    #[test]
+    fn keeps_english_word_suffix_match() {
+        let result = match_song_query(
+            &MatchConfig::default(),
+            "california",
+            "Hotel California",
+            "Eagles",
+            false,
+        );
+
+        assert!(result.ok, "{}", result.reason);
+    }
+
+    #[test]
+    fn keeps_english_prefix_match() {
+        let result = match_song_query(
+            &MatchConfig::default(),
+            "Blinding L",
+            "Blinding Lights",
+            "The Weeknd",
             false,
         );
 

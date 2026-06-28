@@ -1785,35 +1785,15 @@ mod app {
 
         fn execute_invite(&self, username: &str) -> Result<bool> {
             log::info!("开始邀请: {}", username);
-            click_game_point(self.config.output.focus_point, &self.config.window)?;
-            sleep(Duration::from_millis(
-                self.config.timing.invite_open_chat_ms,
-            ));
-            press_key(Key::Return, &self.config.window)?;
-            sleep(Duration::from_millis(
-                self.config.timing.invite_open_chat_ms,
-            ));
-
             let canvas = Canvas {
                 width: self.config.screen.expected_width,
                 height: self.config.screen.expected_height,
                 resize: true,
             };
-            let frame_args = FrameArgs { image: None };
-
-            let Some(point) = self.find_text_point(
-                &self.ocr_engine,
-                &canvas,
-                self.config.invite.friend_list_region.into(),
-                username,
-            )?
-            else {
-                log::error!("邀请失败: 好友列表未找到用户 {}", username);
-                self.return_to_primary_fixed();
+            if !self.open_friend_chat(username, &canvas)? {
                 return Ok(false);
-            };
-            click_game_point(PointConfig::new(point.x, point.y), &self.config.window)?;
-            sleep(Duration::from_millis(self.config.timing.invite_step_ms));
+            }
+            let frame_args = FrameArgs { image: None };
 
             let Some(point) = self.find_text_point(
                 &self.ocr_engine,
@@ -1864,6 +1844,47 @@ mod app {
             }
 
             log::info!("邀请完成: {}", username);
+            Ok(true)
+        }
+
+        #[allow(dead_code)]
+        fn send_friend_message(&self, username: &str, message: &str) -> Result<bool> {
+            log::info!("好友发言: {} -> {}", username, message);
+            let canvas = Canvas {
+                width: self.config.screen.expected_width,
+                height: self.config.screen.expected_height,
+                resize: true,
+            };
+            if !self.open_friend_chat(username, &canvas)? {
+                return Ok(false);
+            }
+            self.chat_output.send_current_chat(message)?;
+            Ok(true)
+        }
+
+        fn open_friend_chat(&self, username: &str, canvas: &Canvas) -> Result<bool> {
+            click_game_point(self.config.output.focus_point, &self.config.window)?;
+            sleep(Duration::from_millis(
+                self.config.timing.invite_open_chat_ms,
+            ));
+            press_key(Key::Return, &self.config.window)?;
+            sleep(Duration::from_millis(
+                self.config.timing.invite_open_chat_ms,
+            ));
+
+            let Some(point) = self.find_text_point(
+                &self.ocr_engine,
+                canvas,
+                self.config.invite.friend_list_region.into(),
+                username,
+            )?
+            else {
+                log::error!("好友聊天失败: 好友列表未找到用户 {}", username);
+                self.return_to_primary_fixed();
+                return Ok(false);
+            };
+            click_game_point(PointConfig::new(point.x, point.y), &self.config.window)?;
+            sleep(Duration::from_millis(self.config.timing.invite_step_ms));
             Ok(true)
         }
 

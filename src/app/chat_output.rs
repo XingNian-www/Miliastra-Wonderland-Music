@@ -45,6 +45,19 @@ impl ChatOutput {
         self.send_with_input(&message)
     }
 
+    pub fn send_current_chat(&self, message: &str) -> Result<()> {
+        let message = fit_chat_message(message);
+        log::info!("当前聊天回复: {}", message);
+        if self.notify {
+            let _ = notification::send_windows_notification("点歌命令待处理", &message);
+        }
+        if !self.enabled {
+            log::info!("当前聊天回复发送已关闭，仅记录日志");
+            return Ok(());
+        }
+        self.send_current_chat_with_input(&message)
+    }
+
     pub fn send_batch(&self, messages: &[&str], delay_ms: u64) -> Result<()> {
         if messages.is_empty() {
             return Ok(());
@@ -68,6 +81,23 @@ impl ChatOutput {
 
     fn send_with_input(&self, message: &str) -> Result<()> {
         self.send_batch_with_input(&[message.to_string()], 0)
+    }
+
+    fn send_current_chat_with_input(&self, message: &str) -> Result<()> {
+        let mut enigo = Enigo::new(&Settings::default()).context("create enigo")?;
+        let mut window = GameWindow::find(&self.window)?;
+        window.focus_for_keyboard(&mut enigo)?;
+        sleep_ms(self.timing.output_focus_ms);
+
+        window.click(&mut enigo, self.config.chat_click_2)?;
+        sleep_ms(self.timing.output_click_ms);
+        input_message(&mut enigo, message)?;
+        sleep_ms(self.timing.output_input_ms);
+        enigo
+            .key(Key::Return, Direction::Click)
+            .context("send message")?;
+        sleep_ms(self.timing.output_send_ms);
+        Ok(())
     }
 
     fn send_batch_with_input(&self, messages: &[String], delay_ms: u64) -> Result<()> {

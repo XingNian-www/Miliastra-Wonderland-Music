@@ -22,13 +22,16 @@ pub fn match_song_query(
         returned_name.to_string()
     };
     let normalized_query = normalize(&query_text);
-    let normalized_name = normalize(&name_text);
-    if normalized_query.is_empty() || normalized_name.is_empty() {
+    let Some(name_match) = best_returned_name_match(config, &normalized_query, &name_text) else {
+        return MatchResult::no("缺少点歌文本或返回歌曲名");
+    };
+    let normalized_name = name_match.normalized.as_str();
+    if normalized_query.is_empty() {
         return MatchResult::no("缺少点歌文本或返回歌曲名");
     }
 
     let has_full_name = normalized_query.contains(&normalized_name);
-    let name_score = score_returned_name(config, &normalized_name, &normalized_query);
+    let name_score = name_match.score;
     if name_score < config.min_song_name_score {
         return MatchResult::no(&format!(
             "歌曲名匹配度{}%",
@@ -45,7 +48,7 @@ pub fn match_song_query(
     }
 
     if has_full_name
-        && !has_singer_separator_after_name(query, returned_name)
+        && !has_singer_separator_after_name(query, &name_match.raw)
         && singer_candidate.chars().count() <= config.max_ocr_noise_chars + 1
     {
         return MatchResult::yes(&format!("忽略OCR噪声:{}", singer_candidate));
@@ -74,6 +77,44 @@ pub fn match_song_query(
     }
 
     MatchResult::no(&format!("歌手不匹配:{}", singer_candidate))
+}
+
+#[derive(Clone, Debug)]
+struct NameMatch {
+    raw: String,
+    normalized: String,
+    score: f64,
+}
+
+fn best_returned_name_match(
+    config: &MatchConfig,
+    normalized_query: &str,
+    returned_name: &str,
+) -> Option<NameMatch> {
+    title_match_candidates(returned_name)
+        .into_iter()
+        .filter_map(|raw| {
+            let normalized = normalize(&raw);
+            if normalized.is_empty() {
+                return None;
+            }
+            Some(NameMatch {
+                score: score_returned_name(config, &normalized, normalized_query),
+                raw,
+                normalized,
+            })
+        })
+        .max_by(|left, right| {
+            left.score
+                .partial_cmp(&right.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    left.normalized
+                        .chars()
+                        .count()
+                        .cmp(&right.normalized.chars().count())
+                })
+        })
 }
 
 #[derive(Clone, Debug)]
@@ -125,6 +166,55 @@ pub fn is_accompaniment_title(value: &str) -> bool {
     ]
     .iter()
     .any(|marker| lower.contains(marker))
+}
+
+fn title_match_candidates(value: &str) -> Vec<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    let mut candidates = vec![trimmed.to_string()];
+    let without_brackets = remove_bracketed_sections(trimmed).trim().to_string();
+    if !without_brackets.is_empty() {
+        candidates.push(without_brackets);
+    }
+
+    candidates.sort();
+    candidates.dedup();
+    candidates
+}
+
+fn remove_bracketed_sections(value: &str) -> String {
+    let mut output = String::new();
+    let mut stack = Vec::new();
+    for ch in value.chars() {
+        if let Some(close) = bracket_close(ch) {
+            stack.push(close);
+            continue;
+        }
+        if stack.last().is_some_and(|close| *close == ch) {
+            stack.pop();
+            continue;
+        }
+        if stack.is_empty() {
+            output.push(ch);
+        }
+    }
+    output.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn bracket_close(ch: char) -> Option<char> {
+    match ch {
+        '(' => Some(')'),
+        '（' => Some('）'),
+        '[' => Some(']'),
+        '【' => Some('】'),
+        '{' => Some('}'),
+        '《' => Some('》'),
+        '「' => Some('」'),
+        _ => None,
+    }
 }
 
 fn strip_accompaniment_markers(value: &str) -> String {
@@ -309,6 +399,9 @@ fn singer_matches(config: &MatchConfig, singer_candidate: &str, returned_singers
         return true;
     }
     let split = split_singers(returned_singers);
+    if split_singers_cover_candidate(config, &candidate, &split) {
+        return true;
+    }
     if split.iter().any(|singer| {
         singer.contains(&candidate) || fuzzy_singer_matches(config, &candidate, singer)
     }) {
@@ -318,6 +411,32 @@ fn singer_matches(config: &MatchConfig, singer_candidate: &str, returned_singers
         return ed_singer_matches(config, &candidate, returned_singers);
     }
     false
+}
+
+fn split_singers_cover_candidate(
+    config: &MatchConfig,
+    candidate: &str,
+    split_singers: &[String],
+) -> bool {
+    if split_singers.len() < 2 || candidate.chars().count() < 4 {
+        return false;
+    }
+
+    let mut remaining = candidate.to_string();
+    let mut singers = split_singers.iter().collect::<Vec<_>>();
+    singers.sort_by_key(|singer| std::cmp::Reverse(singer.chars().count()));
+    let mut matched_count = 0;
+    for singer in singers {
+        if singer.chars().count() < 2 {
+            continue;
+        }
+        if let Some(index) = remaining.find(singer) {
+            remaining.replace_range(index..index + singer.len(), "");
+            matched_count += 1;
+        }
+    }
+
+    matched_count >= 2 && remaining.chars().count() <= config.max_ocr_noise_chars + 1
 }
 
 fn ed_singer_matches(config: &MatchConfig, candidate: &str, returned_singers: &str) -> bool {
@@ -521,4 +640,35 @@ fn is_punctuation(ch: char) -> bool {
                 | '」'
                 | '・'
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn matches_title_with_parenthesized_version_and_reordered_singers() {
+        let result = match_song_query(
+            &MatchConfig::default(),
+            "最长的电影李心洁安崎",
+            "最长的电影（乘风2026 二公现场）",
+            "安崎 & 李心洁",
+            false,
+        );
+
+        assert!(result.ok, "{}", result.reason);
+    }
+
+    #[test]
+    fn bracketed_title_metadata_is_a_general_candidate() {
+        let result = match_song_query(
+            &MatchConfig::default(),
+            "Lemon 米津玄师",
+            "Lemon (Live at Tokyo)",
+            "米津玄师",
+            false,
+        );
+
+        assert!(result.ok, "{}", result.reason);
+    }
 }

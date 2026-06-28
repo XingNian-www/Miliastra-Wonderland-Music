@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FeelUOwn 点歌服务</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#121826;color:#eef2ff;font-family:"Microsoft YaHei",system-ui,sans-serif;max-width:420px;margin:0 auto;padding:16px}
+h1{text-align:center;font-size:20px;margin-bottom:16px;color:#7dd3fc}
+.section{margin-bottom:14px}
+.section label{display:block;font-size:13px;color:#a5b4fc;margin-bottom:4px}
+.row{display:flex;gap:8px;flex-wrap:wrap}
+input,select{background:#1e293b;color:#fff;border:1px solid #334155;border-radius:8px;padding:10px}
+.btn{flex:1;min-width:70px;padding:10px 8px;border:none;border-radius:8px;font-size:14px;cursor:pointer;background:#334155;color:#eef2ff;transition:background .2s}
+.btn:hover{background:#475569}
+.btn.primary{background:#0284c7;color:#fff}
+.btn.primary:hover{background:#0369a1}
+.btn.green{background:#047857}
+.btn.green:hover{background:#059669}
+#keyword{flex:2;min-width:140px}
+#sourceSelect{flex:1;min-width:110px}
+#volumeInput{width:70px}
+#result{margin-top:16px;padding:12px;background:#1e293b;border-radius:8px;font-size:13px;min-height:40px;white-space:pre-wrap;word-break:break-all}
+#history{margin-top:8px;font-size:12px;color:#cbd5e1}
+.history-item{padding:8px;margin-top:6px;background:#0f172a;border-radius:8px;border-left:3px solid #22c55e}
+.history-item.err{border-left-color:#ef4444}
+.history-time{color:#94a3b8;margin-right:6px}
+.history-result{color:#cbd5e1;margin-top:4px;word-break:break-all}
+</style>
+</head>
+<body>
+<h1>FeelUOwn 点歌服务</h1>
+
+<div class="section">
+  <label>点歌 / 搜索</label>
+  <div class="row">
+    <input id="keyword" placeholder="输入歌名或歌手">
+    <select id="sourceSelect">
+      <option value="" selected>聚合搜索</option>
+      <option value="qqmusic">QQ音乐</option>
+      <option value="netease">网易云</option>
+    </select>
+    <button class="btn primary" onclick="searchPlay()">点歌</button>
+    <button class="btn" onclick="searchPlay('qqmusic')">QQ点歌</button>
+    <button class="btn" onclick="searchPlay('netease')">网易点歌</button>
+    <button class="btn" onclick="searchOnly()">纯搜索</button>
+  </div>
+</div>
+
+<div class="section">
+  <label>播放控制</label>
+  <div class="row">
+    <button class="btn" onclick="call('/play','POST')">继续</button>
+    <button class="btn" onclick="call('/pause','POST')">暂停</button>
+    <button class="btn" onclick="call('/skip-next','POST')">下一首</button>
+    <button class="btn" onclick="call('/skip-prev','POST')">上一首</button>
+  </div>
+</div>
+
+<div class="section">
+  <label>音量</label>
+  <div class="row">
+    <button class="btn" onclick="call('/volume?volume='+$('volumeInput').value,'POST')">设置</button>
+    <input id="volumeInput" value="80" placeholder="0-100">
+    <button class="btn" onclick="call('/volume?volume=30','POST')">30%</button>
+    <button class="btn" onclick="call('/volume?volume=60','POST')">60%</button>
+    <button class="btn" onclick="call('/volume?volume=100','POST')">100%</button>
+  </div>
+</div>
+
+<div class="section">
+  <div class="row">
+    <button class="btn green" onclick="call('/status')">状态</button>
+  </div>
+</div>
+
+<div class="section">
+  <label>服务权限</label>
+  <div class="row">
+    <button class="btn green" onclick="loadAdminStatus()">管理员状态</button>
+  </div>
+</div>
+
+<div class="section">
+  <label>窗口监听</label>
+  <div class="row">
+    <input id="windowTarget" placeholder="进程名，如 yuanshen.exe，留空用服务端配置">
+    <button class="btn green" onclick="loadWindowStatus()">查看窗口</button>
+  </div>
+</div>
+
+<div id="result"></div>
+
+<div class="section">
+  <label>命令记录</label>
+  <div class="row">
+    <button class="btn" onclick="loadHistory()">刷新</button>
+    <button class="btn" onclick="clearHistory()">清空</button>
+  </div>
+  <div id="history"></div>
+</div>
+
+<script>
+function $(id){return document.getElementById(id)}
+const esc=(s)=>String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+const commandLabels={'/status':'状态','/play':'继续','/pause':'暂停','/skip-next':'下一首','/skip-prev':'上一首','/volume':'音量','/searchPlay':'点歌','/searchSource':'指定音源搜索','/search':'搜索','/open-scheme':'打开URI','/active-window':'窗口监听','/admin-status':'管理员状态'}
+const safeNum=(n)=>(n!=null&&isFinite(n)&&!isNaN(n))?Number(n):null
+const pad=(n)=>{n=parseInt(n);return isNaN(n)?'??':String(n).padStart(2,'0')}
+const fmt=(s)=>{s=safeNum(s);return s!=null?(Math.floor(s/60)+':'+pad(s%60)):'??:??'}
+const labels={status:'状态',name:'歌名',singer:'歌手',albumName:'专辑',lyricLineText:'歌词'}
+const stMap={playing:'播放中',paused:'已暂停',stopped:'已停止',stoped:'已停止'}
+function statusHTML(d){
+  if(!d||typeof d!=='object')return '无效数据'
+  const rows=[]
+  const st=d.status;rows.push('<div><b>状态</b> '+(st?esc(stMap[st]||st):'未知')+'</div>')
+  for(const k of['name','singer','albumName','lyricLineText']){const v=d[k];if(v!=null&&String(v).trim()!=='')rows.push('<div><b>'+labels[k]+'</b> '+esc(v)+'</div>')}
+  const dur=safeNum(d.duration)
+  rows.push('<div><b>时长</b> '+(dur!=null?fmt(dur):'??:??')+'</div>')
+  rows.push('<div><b>进度</b> '+fmt(d.progress)+'</div>')
+  if(dur!=null){const pr=safeNum(d.progress);rows.push('<div><b>剩余</b> '+(pr!=null?fmt(Math.max(0,dur-pr)):'??:??')+'</div>')}
+  const vol=safeNum(d.volume)
+  if(vol!=null)rows.push('<div><b>音量</b> '+Math.min(100,Math.max(0,Math.round(vol)))+'%</div>')
+  return rows.join('')
+}
+function windowHTML(d){
+  if(!d||typeof d!=='object')return '无效数据'
+  const rows=[]
+  rows.push('<div><b>支持</b> '+(d.supported?'是':'否')+'</div>')
+  rows.push('<div><b>监听</b> '+(d.enabled?'已启用':'未启用')+'</div>')
+  rows.push('<div><b>目标输入</b> '+esc(d.target||'未设置')+'</div>')
+  rows.push('<div><b>目标进程</b> '+esc(d.targetProcess||'未设置')+'</div>')
+  rows.push('<div><b>目标 PID</b> '+esc(d.targetProcessId||'未找到')+'</div>')
+  rows.push('<div><b>当前进程</b> '+esc(d.process||'未知')+'</div>')
+  rows.push('<div><b>当前 PID</b> '+esc(d.processId||'未知')+'</div>')
+  rows.push('<div><b>进程匹配</b> '+(!d.supported||!d.enabled?'未检查':d.active===false?'否':'是')+'</div>')
+  rows.push('<div><b>当前窗口</b> '+esc(d.title||'未知')+'</div>')
+  if(d.reason)rows.push('<div><b>说明</b> '+esc(d.reason)+'</div>')
+  return rows.join('')
+}
+function adminHTML(d){
+  if(!d||typeof d!=='object')return '无效数据'
+  const rows=[]
+  rows.push('<div><b>支持</b> '+(d.supported?'是':'否')+'</div>')
+  rows.push('<div><b>管理员</b> '+(d.isAdmin?'是':'否')+'</div>')
+  if(d.user)rows.push('<div><b>用户</b> '+esc(d.user)+'</div>')
+  if(d.reason)rows.push('<div><b>说明</b> '+esc(d.reason)+'</div>')
+  return rows.join('')
+}
+function queryText(q){const rows=Object.entries(q||{}).filter(([,v])=>v!=null&&String(v)!=='');return rows.length?' '+rows.map(([k,v])=>k+'='+v).join(' '):''}
+function searchPlay(source){const kw=$('keyword').value;const src=source!=null?source:$('sourceSelect').value;let url='/searchPlay?keyword='+encodeURIComponent(kw);if(src)url+='&source='+encodeURIComponent(src);call(url,'POST')}
+async function searchOnly(){const el=$('result');const kw=$('keyword').value.trim();if(!kw){el.textContent='请输入关键词';return}const src=$('sourceSelect').value;let url='/search?keyword='+encodeURIComponent(kw);if(src)url+='&source='+encodeURIComponent(src);el.textContent='搜索中...';try{const r=await fetch(url);const t=await r.text();if(!r.ok){el.textContent=t;await loadHistory();return}el.textContent='搜索 '+kw+' '+(src||'聚合')+' 返回 '+t.length+' 字节:\n\n'+t}catch(e){el.textContent='错误: '+e.message}await loadHistory()}
+function renderHistory(items){const el=$('history');if(!items.length){el.textContent='暂无记录';return}el.innerHTML=items.map((it)=>'<div class="history-item '+(it.ok?'':'err')+'"><div><span class="history-time">'+esc(it.time)+'</span><b>'+esc(commandLabels[it.command]||it.command)+'</b>'+esc(queryText(it.query))+'</div><div class="history-result">'+esc(it.result)+'</div></div>').join('')}
+async function loadHistory(){try{const r=await fetch('/history');const items=await r.json();renderHistory(Array.isArray(items)?items:[])}catch(e){$('history').textContent='读取记录失败: '+e.message}}
+async function clearHistory(){const el=$('result');try{const r=await fetch('/clear-history',{method:'POST'});el.textContent=await r.text()}catch(e){el.textContent='错误: '+e.message}await loadHistory()}
+async function loadAdminStatus(){const el=$('result');el.textContent='请求中...';try{const r=await fetch('/admin-status');const t=await r.text();if(!r.ok){el.textContent=t;return}try{el.innerHTML=adminHTML(JSON.parse(t))}catch{el.textContent=t}}catch(e){el.textContent='错误: '+e.message}}
+async function loadWindowStatus(){const el=$('result');const target=$('windowTarget').value.trim();let url='/active-window';if(target)url+='?target='+encodeURIComponent(target);el.textContent='请求中...';try{const r=await fetch(url,{method:'POST'});const t=await r.text();if(!r.ok){el.textContent=t;return}try{el.innerHTML=windowHTML(JSON.parse(t))}catch{el.textContent=t}}catch(e){el.textContent='错误: '+e.message}}
+async function call(url,method){const el=$('result');el.textContent='请求中...';try{const r=await fetch(url,{method:method||'GET'});const t=await r.text();if(!r.ok){el.textContent=t;await loadHistory();return}if(url==='/status'){try{const d=JSON.parse(t);el.innerHTML=statusHTML(d)}catch{el.textContent=t}}else{el.textContent=t}}catch(e){el.textContent='错误: '+e.message}await loadHistory()}
+loadHistory()
+</script>
+</body>
+</html>

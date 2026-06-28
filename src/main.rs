@@ -1059,27 +1059,33 @@ mod app {
                 return Ok(());
             }
 
-            let parsed = messages
-                .iter()
-                .filter(|message| !message.text.is_empty())
-                .filter_map(|message| {
-                    let parsed = command::parse_text(&message.text, &message.message_type);
-                    log::debug!("识别文本: [{}] {}", message.message_type, message.text);
-                    if let Some(parsed) = &parsed {
-                        log::info!("解析命令: {}", parsed.raw);
+            let mut parsed = Vec::new();
+            for message in messages.iter().filter(|message| !message.text.is_empty()) {
+                log::debug!("识别文本: [{}] {}", message.message_type, message.text);
+                let Some(parsed_command) = command::parse_text(&message.text, &message.message_type)
+                else {
+                    continue;
+                };
+                if let UserCommand::Invite(invite) = &parsed_command.command {
+                    if self.invite_executed_seqs.contains(&invite.seq) {
+                        log::info!(
+                            "邀请参数 {} 已执行过，跳过: {}",
+                            invite.seq,
+                            parsed_command.raw
+                        );
+                        continue;
                     }
-                    parsed
-                })
-                .filter(|parsed| match &parsed.command {
-                    UserCommand::Invite(invite)
-                        if self.invite_executed_seqs.contains(&invite.seq) =>
-                    {
-                        log::info!("邀请参数 {} 已执行过，跳过: {}", invite.seq, parsed.raw);
-                        false
-                    }
-                    _ => true,
-                })
-                .collect::<Vec<ParsedCommand>>();
+                }
+                if parsed
+                    .iter()
+                    .any(|existing| command::same_lock_command(existing, &parsed_command))
+                {
+                    log::info!("同轮重复识别命令，已合并: {}", parsed_command.raw);
+                    continue;
+                }
+                log::debug!("解析命令: {}", parsed_command.raw);
+                parsed.push(parsed_command);
+            }
 
             let update = self.locks.update(&parsed, self.command_executing);
             for command in update.unlocked {
@@ -1099,6 +1105,14 @@ mod app {
                 return Ok(());
             }
             for pending in update.accepted {
+                if self
+                    .pending
+                    .iter()
+                    .any(|queued| command::same_lock_command(&queued.parsed, &pending.parsed))
+                {
+                    log::info!("命令已在待处理队列，本轮跳过: {}", pending.parsed.raw);
+                    continue;
+                }
                 log::info!("命令已加入待处理队列: {}", pending.parsed.raw);
                 self.pending.push_back(pending);
             }

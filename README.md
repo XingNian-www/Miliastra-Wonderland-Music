@@ -192,6 +192,8 @@ Main endpoints:
 
 ## Configuration Notes
 
+`config.yaml` includes `config_version`. When an older config is detected, the app rewrites it from the latest commented template, migrates matching values into the new locations, creates a timestamped `.bak-*` backup, and appends unmigrated old fields as comments at the end. Those commented fields do not affect runtime.
+
 Default chat area:
 
 ```yaml

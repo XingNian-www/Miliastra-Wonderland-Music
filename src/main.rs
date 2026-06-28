@@ -9,6 +9,7 @@ mod app {
     mod chat_output;
     mod command;
     mod config;
+    mod config_migration;
     mod dpi;
     mod feeluown;
     mod hotkeys;

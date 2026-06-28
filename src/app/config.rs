@@ -4,9 +4,12 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use super::config_migration::{self, CURRENT_CONFIG_VERSION};
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
+    pub config_version: u32,
     pub window: WindowConfig,
     pub screen: ScreenConfig,
     pub timing: TimingConfig,
@@ -27,6 +30,7 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
+            config_version: CURRENT_CONFIG_VERSION,
             window: WindowConfig::default(),
             screen: ScreenConfig::default(),
             timing: TimingConfig::default(),
@@ -71,6 +75,36 @@ impl AppConfig {
         if path.exists() {
             let text = fs::read_to_string(path)
                 .with_context(|| format!("read config {}", path.display()))?;
+            if let Some(report) =
+                config_migration::migrate_config_text(&text, default_config_yaml())?
+            {
+                let config: Self = serde_yaml::from_str(&report.text)
+                    .with_context(|| format!("validate migrated config {}", path.display()))?;
+                let backup_path = config_migration::backup_path(path);
+                fs::write(&backup_path, &text)
+                    .with_context(|| format!("write config backup {}", backup_path.display()))?;
+                fs::write(path, &report.text)
+                    .with_context(|| format!("write migrated config {}", path.display()))?;
+                eprintln!(
+                    "配置已自动迁移: {} -> version {}，备份: {}，迁移 {} 项",
+                    report
+                        .old_version
+                        .map_or_else(|| "未标记".to_string(), |version| version.to_string()),
+                    CURRENT_CONFIG_VERSION,
+                    backup_path.display(),
+                    report.migrated_count
+                );
+                if !report.unmigrated.is_empty() {
+                    eprintln!(
+                        "有 {} 项配置未自动迁移，已追加到配置文件末尾的注释区，不影响运行",
+                        report.unmigrated.len()
+                    );
+                    for item in &report.unmigrated {
+                        eprintln!("未迁移配置: {} ({})", item.path, item.reason);
+                    }
+                }
+                return Ok(config);
+            }
             return serde_yaml::from_str(&text)
                 .with_context(|| format!("parse config {}", path.display()));
         }
@@ -94,6 +128,9 @@ impl AppConfig {
 fn default_config_yaml() -> &'static str {
     r#"# Miliastra Wonderland Music 配置
 # 坐标沿用旧脚本习惯：以游戏客户区左上角为原点，按 1920x1080 有效画面写坐标
+
+# 配置版本；程序启动时会把旧版本配置迁移到当前模板
+config_version: 2
 
 window:
   # 目标游戏进程名，按进程文件名匹配，大小写不敏感

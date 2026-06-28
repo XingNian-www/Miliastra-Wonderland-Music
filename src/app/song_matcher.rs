@@ -361,6 +361,8 @@ fn remove_matched_name(
                 .chain(chars[matched.end..].iter())
                 .collect();
         }
+    } else {
+        return remove_chinese_name_by_lcs(normalized_query, normalized_name);
     }
 
     let chars = normalized_query.chars().collect::<Vec<_>>();
@@ -380,6 +382,45 @@ fn remove_matched_name(
         }
     }
     chars
+        .iter()
+        .enumerate()
+        .filter_map(|(index, ch)| (!used[index]).then_some(*ch))
+        .collect()
+}
+
+fn remove_chinese_name_by_lcs(normalized_query: &str, normalized_name: &str) -> String {
+    let query_chars = normalized_query.chars().collect::<Vec<_>>();
+    let name_chars = normalized_name.chars().collect::<Vec<_>>();
+    let mut dp = vec![vec![0_usize; name_chars.len() + 1]; query_chars.len() + 1];
+
+    for query_index in (0..query_chars.len()).rev() {
+        for name_index in (0..name_chars.len()).rev() {
+            dp[query_index][name_index] = if query_chars[query_index] == name_chars[name_index] {
+                dp[query_index + 1][name_index + 1] + 1
+            } else {
+                dp[query_index + 1][name_index].max(dp[query_index][name_index + 1])
+            };
+        }
+    }
+
+    let mut used = vec![false; query_chars.len()];
+    let mut query_index = 0;
+    let mut name_index = 0;
+    while query_index < query_chars.len() && name_index < name_chars.len() {
+        if query_chars[query_index] == name_chars[name_index]
+            && dp[query_index][name_index] == dp[query_index + 1][name_index + 1] + 1
+        {
+            used[query_index] = true;
+            query_index += 1;
+            name_index += 1;
+        } else if dp[query_index + 1][name_index] >= dp[query_index][name_index + 1] {
+            query_index += 1;
+        } else {
+            name_index += 1;
+        }
+    }
+
+    query_chars
         .iter()
         .enumerate()
         .filter_map(|(index, ch)| (!used[index]).then_some(*ch))
@@ -666,6 +707,19 @@ mod tests {
             "Lemon 米津玄师",
             "Lemon (Live at Tokyo)",
             "米津玄师",
+            false,
+        );
+
+        assert!(result.ok, "{}", result.reason);
+    }
+
+    #[test]
+    fn missing_chinese_name_char_does_not_leave_middle_title_as_singer() {
+        let result = match_song_query(
+            &MatchConfig::default(),
+            "亲的那不是爱情",
+            "亲爱的那不是爱情",
+            "张韶涵",
             false,
         );
 

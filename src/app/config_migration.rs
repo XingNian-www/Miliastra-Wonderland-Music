@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde_yaml::{Mapping, Value};
 
 pub const CURRENT_CONFIG_VERSION: u32 = 4;
@@ -551,13 +551,17 @@ unknown_root:
         assert!(report.text.contains("output_focus_ms: 456"));
         assert!(report.text.contains("min_confidence: 0.8"));
         assert!(report.text.contains("# 未自动迁移的旧配置"));
-        assert!(report
-            .text
-            .contains("# unknown_root：当前版本没有对应配置项"));
-        assert!(report
-            .unmigrated
-            .iter()
-            .any(|item| item.path == "unknown_root"));
+        assert!(
+            report
+                .text
+                .contains("# unknown_root：当前版本没有对应配置项")
+        );
+        assert!(
+            report
+                .unmigrated
+                .iter()
+                .any(|item| item.path == "unknown_root")
+        );
     }
 
     #[test]

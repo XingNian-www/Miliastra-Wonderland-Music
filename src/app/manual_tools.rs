@@ -4,18 +4,18 @@ use std::path::{Path, PathBuf};
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use enigo::{Direction, Enigo, Key, Keyboard, Settings};
 
 use super::chat_output::ChatOutput;
 use super::config::{AppConfig, PointConfig};
 use super::ocr::{
-    make_ocr_engine, probe_ocr_backend_support, recognize_lines, OcrArgs, OcrBackendProbeStatus,
+    OcrArgs, OcrBackendProbeStatus, make_ocr_engine, probe_ocr_backend_support, recognize_lines,
 };
 use super::{
-    best_template_hit, click_game_point, crop_canvas, detect_ui_state, find_template_hits,
-    load_frame, parse_key, parse_rect, press_key, print_json, scan_chat, window, Canvas, FrameArgs,
-    TemplateArgs, UiTemplateArgs,
+    Canvas, FrameArgs, TemplateArgs, UiTemplateArgs, best_template_hit, click_game_point,
+    crop_canvas, detect_ui_state, find_template_hits, load_frame, parse_key, parse_rect, press_key,
+    print_json, scan_chat, window,
 };
 use super::{
     change_stats, configured_chat_change_fingerprint, count_chat_markers,

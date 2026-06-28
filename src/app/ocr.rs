@@ -2,14 +2,14 @@ use std::cmp::Ordering;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::Args;
 use image::DynamicImage;
 use ocr_rs::{Backend, DetOptions, OcrEngine, OcrEngineConfig};
 use serde::Serialize;
 
-use super::config::AppConfig;
 use super::Rect;
+use super::config::AppConfig;
 
 #[derive(Args, Clone, Debug, Default)]
 pub(super) struct OcrArgs {

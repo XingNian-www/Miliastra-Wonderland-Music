@@ -1,14 +1,14 @@
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    RegisterHotKey, UnregisterHotKey, MOD_NOREPEAT, VIRTUAL_KEY,
+    MOD_NOREPEAT, RegisterHotKey, UnregisterHotKey, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetMessageW, TranslateMessage, MSG, WM_HOTKEY,
+    DispatchMessageW, GetMessageW, MSG, TranslateMessage, WM_HOTKEY,
 };
 
 use super::config::HotkeyConfig;

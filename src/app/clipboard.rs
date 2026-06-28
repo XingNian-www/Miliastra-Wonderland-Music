@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 #[cfg(target_os = "windows")]
 pub fn set_text(text: &str) -> Result<()> {
@@ -6,7 +6,7 @@ pub fn set_text(text: &str) -> Result<()> {
 
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::System::DataExchange::{EmptyClipboard, OpenClipboard, SetClipboardData};
-    use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+    use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
 
     const CF_UNICODETEXT: u32 = 13;
 

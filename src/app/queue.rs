@@ -13,6 +13,7 @@ pub struct QueueItem {
     pub source: String,
     pub prefer_accompaniment: bool,
     pub ai_original_text: String,
+    pub uri: String,
 }
 
 impl Default for QueueItem {
@@ -22,6 +23,7 @@ impl Default for QueueItem {
             source: "qqmusic".to_string(),
             prefer_accompaniment: false,
             ai_original_text: String::new(),
+            uri: String::new(),
         }
     }
 }
@@ -78,10 +80,16 @@ impl PersistentQueue {
     pub fn has_duplicate(&self, keyword: &str, source: &str, prefer_accompaniment: bool) -> bool {
         let source = normalize_source(source);
         self.items.iter().any(|item| {
-            song_matcher::same_song_query(&item.keyword, keyword)
+            item.uri.is_empty()
+                && song_matcher::same_song_query(&item.keyword, keyword)
                 && normalize_source(&item.source) == source
                 && item.prefer_accompaniment == prefer_accompaniment
         })
+    }
+
+    pub fn has_duplicate_uri(&self, uri: &str) -> bool {
+        let uri = uri.trim();
+        !uri.is_empty() && self.items.iter().any(|item| item.uri.trim() == uri)
     }
 
     pub fn push(&mut self, item: QueueItem) -> Result<bool> {
@@ -93,6 +101,7 @@ impl PersistentQueue {
             prefer_accompaniment: item.prefer_accompaniment,
             keyword: item.keyword,
             ai_original_text: item.ai_original_text,
+            uri: item.uri,
         });
         self.save()?;
         Ok(true)
@@ -163,7 +172,9 @@ fn parse_queue_items(text: &str) -> Result<Vec<QueueItem>> {
 }
 
 fn normalize_source(source: &str) -> String {
-    if source == "netease" {
+    if source.trim().is_empty() {
+        String::new()
+    } else if source == "netease" {
         "netease".to_string()
     } else {
         "qqmusic".to_string()

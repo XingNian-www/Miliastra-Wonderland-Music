@@ -7,9 +7,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::ai;
 use super::config::AppConfig;
@@ -21,7 +21,7 @@ use super::runtime_state::PersistentRuntimeState;
 const MAX_REQUEST_HEADER_BYTES: usize = 64 * 1024;
 const MAX_ACTIVE_CONNECTIONS: usize = 32;
 const PAGE: &str = include_str!("page.html");
-const KNOWN_ROUTES: &str = "/status, /play, /pause, /skip-next, /skip-prev, /volume, /searchPlay, /searchSource, /search, /open-scheme, /history, /clear-history, /health, /admin-status, /restart-admin, /active-window, /notify, /queue, /queue/add, /queue/remove, /queue/clear, /state, /state/save, /ai/recognize, /ai/match";
+const KNOWN_ROUTES: &str = "/status, /play, /pause, /skip-next, /skip-prev, /volume, /searchPlay, /searchSource, /search, /open-scheme, /history, /clear-history, /health, /admin-status, /restart-admin, /active-window, /notify, /queue, /queue/add, /queue/remove, /queue/clear, /state, /state/save, /ai/recognize, /ai/match, /ai/pick";
 
 #[derive(Clone)]
 pub struct HttpSharedState {
@@ -384,6 +384,18 @@ fn route(
                 }
             })
         }
+        "/ai/pick" => {
+            ai::pick_with_query(&state.config.ai, &state.config.timing, query).map_err(|error| {
+                AppError {
+                    status: if is_client_error(&error.to_string()) {
+                        400
+                    } else {
+                        500
+                    },
+                    message: error.to_string(),
+                }
+            })
+        }
         "/notify" => {
             let title = query_value(query, "title").unwrap_or("点歌命令待处理");
             let message = query_value(query, "message").unwrap_or("");
@@ -423,6 +435,7 @@ fn queue_add(
     ));
     let ai_original_text =
         normalize_optional_text(query_value(query, "aiOriginalText"), "aiOriginalText")?;
+    let uri = normalize_optional_text(query_value(query, "uri"), "uri")?;
     let mut queue = state
         .queue
         .lock()
@@ -433,6 +446,7 @@ fn queue_add(
             source,
             prefer_accompaniment: prefer,
             ai_original_text,
+            uri,
         })
         .map_err(internal_error)?
     {
@@ -1060,6 +1074,7 @@ fn is_json_route(path: &str) -> bool {
             | "/active-window"
             | "/ai/recognize"
             | "/ai/match"
+            | "/ai/pick"
             | "/history"
             | "/notify"
     )
@@ -1094,6 +1109,7 @@ fn is_mutating_route(path: &str) -> bool {
             | "/state/save"
             | "/ai/recognize"
             | "/ai/match"
+            | "/ai/pick"
             | "/notify"
             | "/clear-history"
     )

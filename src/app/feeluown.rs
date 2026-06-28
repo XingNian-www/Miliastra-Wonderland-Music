@@ -2,7 +2,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
 use super::config::{FeelUOwnConfig, TimingConfig};
@@ -138,6 +138,10 @@ impl FeelUOwnClient {
             .trim()
             .to_string();
         self.request(&command)
+    }
+
+    pub fn search_candidates(&self, keyword: &str, source: &str) -> Result<Vec<SearchCandidate>> {
+        Ok(extract_search_candidates(&self.search(keyword, source)?))
     }
 
     pub fn play_keyword(
@@ -305,7 +309,7 @@ fn is_accompaniment_text(value: &str) -> bool {
         || lower.contains("karaoke")
 }
 
-fn extract_search_candidates(text: &str) -> Vec<SearchCandidate> {
+pub fn extract_search_candidates(text: &str) -> Vec<SearchCandidate> {
     let mut candidates = Vec::new();
     let mut block: Vec<String> = Vec::new();
     for line in text.lines() {
@@ -543,3 +547,27 @@ payload = {
 }
 print(json.dumps(payload, ensure_ascii=False))
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_args_uses_repeated_rpc_options() {
+        assert_eq!(
+            source_args("qqmusic,netease"),
+            "--source='qqmusic' --source='netease'"
+        );
+    }
+
+    #[test]
+    fn extracts_plain_search_candidates() {
+        let text = "fuo://qqmusic/songs/97773    \t# 晴天 - 周杰伦\n\
+fuo://netease/songs/3334653818\t# 晴天 - 周杰伦";
+        let candidates = extract_search_candidates(text);
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].uri, "fuo://qqmusic/songs/97773");
+        assert_eq!(candidates[0].text, "# 晴天 - 周杰伦");
+        assert_eq!(candidates[1].uri, "fuo://netease/songs/3334653818");
+    }
+}

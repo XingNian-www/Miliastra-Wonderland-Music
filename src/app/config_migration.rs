@@ -5,7 +5,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context, Result};
 use serde_yaml::{Mapping, Value};
 
-pub const CURRENT_CONFIG_VERSION: u32 = 3;
+pub const CURRENT_CONFIG_VERSION: u32 = 4;
+
+struct ChangedDefaultField {
+    path: &'static str,
+    old_default: u64,
+    changed_in_version: u32,
+}
+
+const CHANGED_DEFAULT_FIELDS: &[ChangedDefaultField] = &[ChangedDefaultField {
+    path: "queue.auto_advance_seconds",
+    old_default: 5,
+    changed_in_version: 4,
+}];
 
 const MOVED_FIELDS: &[(&str, &str)] = &[
     (
@@ -88,6 +100,7 @@ pub fn migrate_config_text(old_text: &str, default_text: &str) -> Result<Option<
         &mut unmigrated,
         &mut migrated_count,
     );
+    migrate_changed_default_fields(&old_value, &default_value, &mut new_value, old_version);
     set_path(
         &mut new_value,
         &["config_version"],
@@ -124,6 +137,27 @@ pub fn migrate_config_text(old_text: &str, default_text: &str) -> Result<Option<
         migrated_count,
         unmigrated,
     }))
+}
+
+fn migrate_changed_default_fields(
+    old_value: &Value,
+    default_value: &Value,
+    new_value: &mut Value,
+    old_version: Option<u64>,
+) {
+    for field in CHANGED_DEFAULT_FIELDS {
+        if old_version.is_some_and(|version| version >= field.changed_in_version as u64) {
+            continue;
+        }
+        let path = split_path(field.path);
+        if get_path(old_value, &path).and_then(Value::as_u64) != Some(field.old_default) {
+            continue;
+        }
+        let Some(current_default) = get_path(default_value, &path) else {
+            continue;
+        };
+        let _ = set_path(new_value, &path, current_default.clone());
+    }
 }
 
 pub fn backup_path(path: &Path) -> PathBuf {
@@ -475,13 +509,16 @@ mod tests {
 
     const DEFAULT: &str = r#"# test config
 # version comment
-config_version: 3
+config_version: 4
 
 timing:
   # fallback comment
   chat_scan_fallback_ms: 2000
   scan_loop_idle_ms: 60
   output_focus_ms: 300
+
+queue:
+  auto_advance_seconds: 2
 
 ocr:
   min_confidence: 0.9
@@ -508,7 +545,7 @@ unknown_root:
             .expect("migration needed");
 
         assert!(report.text.contains("# fallback comment"));
-        assert!(report.text.contains("config_version: 3"));
+        assert!(report.text.contains("config_version: 4"));
         assert!(report.text.contains("chat_scan_fallback_ms: 1234"));
         assert!(report.text.contains("scan_loop_idle_ms: 77"));
         assert!(report.text.contains("output_focus_ms: 456"));
@@ -525,11 +562,13 @@ unknown_root:
 
     #[test]
     fn current_version_without_moved_fields_does_not_migrate() {
-        let current = r#"config_version: 3
+        let current = r#"config_version: 4
 timing:
   chat_scan_fallback_ms: 2000
   scan_loop_idle_ms: 60
   output_focus_ms: 300
+queue:
+  auto_advance_seconds: 2
 ocr:
   min_confidence: 0.9
   change_mean_threshold: 6.0
@@ -566,5 +605,33 @@ ocr:
 
         assert!(report.text.contains("chat_scan_fallback_ms: 3333"));
         assert!(!report.text.contains("chat_scan_fallback_ms: 1234"));
+    }
+
+    #[test]
+    fn migrates_old_auto_advance_default_to_two_seconds() {
+        let old = r#"config_version: 3
+queue:
+  auto_advance_seconds: 5
+"#;
+
+        let report = migrate_config_text(old, DEFAULT)
+            .expect("migration succeeds")
+            .expect("migration needed");
+
+        assert!(report.text.contains("auto_advance_seconds: 2"));
+    }
+
+    #[test]
+    fn keeps_custom_auto_advance_seconds() {
+        let old = r#"config_version: 3
+queue:
+  auto_advance_seconds: 3
+"#;
+
+        let report = migrate_config_text(old, DEFAULT)
+            .expect("migration succeeds")
+            .expect("migration needed");
+
+        assert!(report.text.contains("auto_advance_seconds: 3"));
     }
 }

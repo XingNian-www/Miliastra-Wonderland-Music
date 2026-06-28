@@ -67,6 +67,7 @@ pub struct SongCommand {
     pub source: SongSource,
     pub prefix: String,
     pub prefer_accompaniment: bool,
+    pub ai_assisted: bool,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -310,6 +311,7 @@ fn same_user_command(left: &UserCommand, right: &UserCommand) -> bool {
         (UserCommand::Song(left), UserCommand::Song(right)) => {
             left.source == right.source
                 && left.prefer_accompaniment == right.prefer_accompaniment
+                && left.ai_assisted == right.ai_assisted
                 && same_lock_keyword(&left.keyword, &right.keyword)
         }
         (UserCommand::Invite(left), UserCommand::Invite(right)) => left.seq == right.seq,
@@ -334,9 +336,10 @@ fn same_user_command(left: &UserCommand, right: &UserCommand) -> bool {
 fn command_lock_key(command: &UserCommand) -> String {
     match command {
         UserCommand::Song(song) => format!(
-            "song:{}:{}:{}",
+            "song:{}:{}:{}:{}",
             song.source.as_str(),
             if song.prefer_accompaniment { 1 } else { 0 },
+            if song.ai_assisted { 1 } else { 0 },
             identity_text(&song.keyword)
         ),
         UserCommand::Pause => "pause".to_string(),
@@ -409,7 +412,7 @@ pub fn normalize_lock_text(text: &str) -> String {
 }
 
 pub fn parse_song_command(command: &str) -> Option<SongCommand> {
-    for (prefix, source) in SONG_COMMANDS {
+    for (prefix, source, ai_assisted) in SONG_COMMANDS {
         if command.starts_with(prefix) {
             let raw_keyword = command[prefix.len()..].trim();
             let prefer_accompaniment = raw_keyword.contains("伴奏");
@@ -427,6 +430,7 @@ pub fn parse_song_command(command: &str) -> Option<SongCommand> {
                 source: *source,
                 prefix: (*prefix).to_string(),
                 prefer_accompaniment,
+                ai_assisted: *ai_assisted,
             });
         }
     }
@@ -435,7 +439,7 @@ pub fn parse_song_command(command: &str) -> Option<SongCommand> {
 
 fn parse_command(matched: &str, param: &str) -> Option<UserCommand> {
     match matched {
-        "QQ点歌" | "网易点歌" | "点歌" => {
+        "AI点歌" | "QQ点歌" | "网易点歌" | "点歌" => {
             parse_song_command(&format!("{} {}", matched, param)).map(UserCommand::Song)
         }
         "暂停" => Some(UserCommand::Pause),
@@ -512,7 +516,7 @@ fn is_feedback_text(text: &str) -> bool {
 fn allows_param(command: &str) -> bool {
     matches!(
         command,
-        "点歌" | "QQ点歌" | "网易点歌" | "音量" | "队列删除"
+        "AI点歌" | "点歌" | "QQ点歌" | "网易点歌" | "音量" | "队列删除"
     )
 }
 
@@ -536,6 +540,7 @@ fn levenshtein_distance(left: &str, right: &str) -> usize {
 }
 
 const COMMANDS: &[&str] = &[
+    "AI点歌",
     "QQ点歌",
     "网易点歌",
     "点歌",
@@ -556,10 +561,11 @@ const COMMANDS: &[&str] = &[
     "大厅时间",
 ];
 
-const SONG_COMMANDS: &[(&str, SongSource)] = &[
-    ("QQ点歌", SongSource::QqMusic),
-    ("网易点歌", SongSource::Netease),
-    ("点歌", SongSource::QqMusic),
+const SONG_COMMANDS: &[(&str, SongSource, bool)] = &[
+    ("AI点歌", SongSource::QqMusic, true),
+    ("QQ点歌", SongSource::QqMusic, false),
+    ("网易点歌", SongSource::Netease, false),
+    ("点歌", SongSource::QqMusic, false),
 ];
 
 const FEEDBACK_TEXT_PATTERNS: &[&str] = &[
@@ -577,6 +583,8 @@ const FEEDBACK_TEXT_PATTERNS: &[&str] = &[
     "匹配失败",
     "换源",
     "AI自动匹配",
+    "AI点歌未启用",
+    "AI点歌识别失败",
     "默认通过",
     "麦克风状态切换",
     "麦克风状态设为",
@@ -617,5 +625,20 @@ mod tests {
     #[test]
     fn rejects_unknown_microphone_param() {
         assert!(parse_text("[Alice]：@麦克风开关", "pink").is_none());
+    }
+
+    #[test]
+    fn parses_ai_song_command() {
+        let parsed = parse_text("用户：@AI点歌 晴天 周杰伦", "blue").expect("parse ai song");
+        assert_eq!(
+            parsed.command,
+            UserCommand::Song(SongCommand {
+                keyword: "晴天 周杰伦".to_string(),
+                source: SongSource::QqMusic,
+                prefix: "AI点歌".to_string(),
+                prefer_accompaniment: false,
+                ai_assisted: true,
+            })
+        );
     }
 }

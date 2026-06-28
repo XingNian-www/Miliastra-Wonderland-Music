@@ -2,10 +2,11 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
-use serde_json::{json, Value};
+use anyhow::{Context, Result, bail};
+use serde_json::{Value, json};
 
 use super::config::{AiConfig, TimingConfig};
+use super::feeluown::SearchCandidate;
 
 const MIMO_ENDPOINT: &str = "https://api.xiaomimimo.com/v1/chat/completions";
 const MIMO_MODEL: &str = "mimo-v2.5";
@@ -13,6 +14,7 @@ const OPENAI_ENDPOINT: &str = "https://api.openai.com/v1/chat/completions";
 const OPENAI_MODEL: &str = "gpt-4o-mini";
 const DEEPSEEK_ENDPOINT: &str = "https://api.deepseek.com/chat/completions";
 const DEEPSEEK_MODEL: &str = "deepseek-chat";
+const CANDIDATE_PICK_LIMIT: usize = 30;
 
 #[derive(Clone)]
 pub struct AiClient {
@@ -23,6 +25,13 @@ pub struct AiClient {
 #[derive(Clone, Debug)]
 pub struct AiMatchResult {
     pub matched: bool,
+    pub reason: String,
+    pub score: f64,
+}
+
+#[derive(Clone, Debug)]
+pub struct AiCandidatePickResult {
+    pub uri: String,
     pub reason: String,
     pub score: f64,
 }
@@ -87,6 +96,33 @@ impl AiClient {
             score: value.get("score").and_then(Value::as_f64).unwrap_or(0.0),
         })
     }
+
+    pub fn pick_song_candidate(
+        &self,
+        request: &str,
+        prefer_accompaniment: bool,
+        candidates: &[SearchCandidate],
+    ) -> Result<AiCandidatePickResult> {
+        let provider = resolve_provider_config(&self.config, None)?;
+        let request = normalize_required(request, "request")?;
+        let candidates = candidates
+            .iter()
+            .take(CANDIDATE_PICK_LIMIT)
+            .cloned()
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            bail!("缺少搜索候选");
+        }
+        let reply = call_ai(
+            &provider,
+            &build_candidate_pick_prompt(&request, prefer_accompaniment, &candidates),
+            2048,
+            &self.timing,
+        )?;
+        let json_text = model_reply_json_object(&reply)?;
+        validate_candidate_pick_json(&json_text, &candidates)?;
+        parse_candidate_pick_result(&json_text)
+    }
 }
 
 pub fn recognize_with_query(
@@ -125,12 +161,66 @@ pub fn match_with_query(
     Ok(json)
 }
 
+pub fn pick_with_query(
+    config: &AiConfig,
+    timing: &TimingConfig,
+    query: &[(String, String)],
+) -> Result<String> {
+    let provider = resolve_provider_config(config, Some(query))?;
+    let request = normalize_required(query_value(query, "request").unwrap_or(""), "request")?;
+    let prefer_accompaniment = parse_bool(query_value(query, "preferAccompaniment"));
+    let candidates = parse_query_candidates(query_value(query, "candidates").unwrap_or(""))?;
+    let reply = call_ai(
+        &provider,
+        &build_candidate_pick_prompt(&request, prefer_accompaniment, &candidates),
+        2048,
+        timing,
+    )?;
+    let json = model_reply_json_object(&reply)?;
+    validate_candidate_pick_json(&json, &candidates)?;
+    Ok(json)
+}
+
 fn query_value<'a>(query: &'a [(String, String)], key: &str) -> Option<&'a str> {
     query
         .iter()
         .rev()
         .find(|(item_key, _)| item_key == key)
         .map(|(_, value)| value.as_str())
+}
+
+fn parse_bool(value: Option<&str>) -> bool {
+    matches!(
+        value.unwrap_or("").trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn parse_query_candidates(text: &str) -> Result<Vec<SearchCandidate>> {
+    let value: Value = serde_json::from_str(text).context("candidates参数必须是JSON数组")?;
+    let array = value
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("candidates参数必须是JSON数组"))?;
+    let mut candidates = Vec::new();
+    for item in array {
+        let uri = item.get("uri").and_then(Value::as_str).unwrap_or("").trim();
+        if uri.is_empty() {
+            continue;
+        }
+        candidates.push(SearchCandidate {
+            uri: uri.to_string(),
+            text: item
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string(),
+        });
+    }
+    if candidates.is_empty() {
+        bail!("candidates参数缺少有效候选");
+    }
+    Ok(candidates)
 }
 
 fn resolve_provider_config(
@@ -266,6 +356,60 @@ fn build_match_prompt(request: &str, song_name: &str, song_singer: &str) -> Stri
         &format!("平台歌手：{}", song_singer),
     ]
     .join("\n")
+}
+
+fn build_candidate_pick_prompt(
+    request: &str,
+    prefer_accompaniment: bool,
+    candidates: &[SearchCandidate],
+) -> String {
+    let candidates_json = candidates
+        .iter()
+        .enumerate()
+        .map(|(index, candidate)| {
+            json!({
+                "index": index + 1,
+                "uri": candidate.uri,
+                "text": candidate.text,
+            })
+        })
+        .collect::<Vec<_>>();
+    [
+        "任务：从 FeelUOwn 搜索候选中选出最适合用户点歌的一首。".to_string(),
+        "只返回 JSON，不要解释、不要注释、不要 Markdown 代码块。".to_string(),
+        "必须输出结构：{\"uri\":string,\"score\":number,\"reason\":string}。".to_string(),
+        "uri 必须逐字等于候选列表中的一个 uri，不能编造，不能改写。".to_string(),
+        "优先选择歌名和歌手最匹配用户点歌的一项。".to_string(),
+        "优先原唱、正式版、清晰标题；避开翻唱、DJ、钢琴版、纯音乐、Live、片段、伴奏，除非用户明确要求。".to_string(),
+        if prefer_accompaniment {
+            "用户明确要求伴奏或伴唱，优先选择伴奏/伴唱候选。".to_string()
+        } else {
+            "用户没有要求伴奏，不要选择伴奏/伴唱候选。".to_string()
+        },
+        "不要因为平台偏好压过歌名和歌手匹配度。".to_string(),
+        "score 范围 0 到 1，reason 简短说明选择原因。".to_string(),
+        format!("用户点歌：{}", request),
+        format!("候选列表：{}", serde_json::to_string(&candidates_json).unwrap_or_default()),
+    ]
+    .join("\n")
+}
+
+fn parse_candidate_pick_result(text: &str) -> Result<AiCandidatePickResult> {
+    let value: Value = serde_json::from_str(text)?;
+    Ok(AiCandidatePickResult {
+        uri: json_string(&value, "uri"),
+        reason: json_string(&value, "reason"),
+        score: value.get("score").and_then(Value::as_f64).unwrap_or(0.0),
+    })
+}
+
+fn json_string(value: &Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string()
 }
 
 fn call_ai(
@@ -423,6 +567,29 @@ fn validate_recognize_json(text: &str) -> Result<()> {
         .is_some_and(|score| score.is_finite() && (0.0..=1.0).contains(&score))
     {
         bail!("AI返回JSON字段无效: confidence");
+    }
+    Ok(())
+}
+
+fn validate_candidate_pick_json(text: &str, candidates: &[SearchCandidate]) -> Result<()> {
+    let value: Value = serde_json::from_str(text)?;
+    let uri = value
+        .get("uri")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    if uri.is_empty() || !candidates.iter().any(|candidate| candidate.uri == uri) {
+        bail!("AI返回JSON字段无效: uri");
+    }
+    if !value
+        .get("score")
+        .and_then(Value::as_f64)
+        .is_some_and(|score| score.is_finite() && (0.0..=1.0).contains(&score))
+    {
+        bail!("AI返回JSON字段无效: score");
+    }
+    if !value.get("reason").is_some_and(Value::is_string) {
+        bail!("AI返回JSON字段无效: reason");
     }
     Ok(())
 }

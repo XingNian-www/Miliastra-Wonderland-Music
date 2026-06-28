@@ -132,7 +132,7 @@ fn default_config_yaml() -> &'static str {
 # 坐标沿用旧脚本习惯：以游戏客户区左上角为原点，按 1920x1080 有效画面写坐标
 
 # 配置版本；程序启动时会把旧版本配置迁移到当前模板
-config_version: 3
+config_version: 4
 
 window:
   # 目标游戏进程名，按进程文件名匹配，大小写不敏感
@@ -375,7 +375,7 @@ queue:
   # 队列最大长度
   max_size: 5
   # 当前歌曲剩余多少秒以内自动播放队列下一首
-  auto_advance_seconds: 5
+  auto_advance_seconds: 2
 
 ai:
   # AI 供应商：mimo/openai/deepseek/custom
@@ -805,7 +805,7 @@ impl Default for QueueConfig {
     fn default() -> Self {
         Self {
             max_size: 5,
-            auto_advance_seconds: 5,
+            auto_advance_seconds: 2,
         }
     }
 }

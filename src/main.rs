@@ -777,6 +777,25 @@ mod app {
         command_executing: bool,
     }
 
+    #[derive(Clone, Debug)]
+    struct ResolvedSongRequest {
+        keyword: String,
+        source: String,
+        prefer_accompaniment: bool,
+        ai_original_text: String,
+        uri: String,
+    }
+
+    impl ResolvedSongRequest {
+        fn match_keyword(&self) -> &str {
+            if self.ai_original_text.trim().is_empty() {
+                &self.keyword
+            } else {
+                &self.ai_original_text
+            }
+        }
+    }
+
     impl AutomationApp {
         fn new(
             config: AppConfig,
@@ -1093,7 +1112,8 @@ mod app {
             let mut parsed = Vec::new();
             for message in messages.iter().filter(|message| !message.text.is_empty()) {
                 log::debug!("识别文本: [{}] {}", message.message_type, message.text);
-                let Some(parsed_command) = command::parse_text(&message.text, &message.message_type)
+                let Some(parsed_command) =
+                    command::parse_text(&message.text, &message.message_type)
                 else {
                     continue;
                 };
@@ -1338,37 +1358,118 @@ mod app {
             Ok(true)
         }
 
+        fn resolve_song_request(
+            &self,
+            song: &command::SongCommand,
+        ) -> Result<Option<ResolvedSongRequest>> {
+            if !song.ai_assisted {
+                return Ok(Some(ResolvedSongRequest {
+                    keyword: song.keyword.clone(),
+                    source: song.source.as_str().to_string(),
+                    prefer_accompaniment: song.prefer_accompaniment,
+                    ai_original_text: String::new(),
+                    uri: String::new(),
+                }));
+            }
+            if !self.ai.enabled() {
+                self.reply("AI点歌未启用，请先配置 ai.api_key")?;
+                return Ok(None);
+            }
+
+            let candidates = match self.feeluown.search_candidates(&song.keyword, "") {
+                Ok(candidates) => candidates,
+                Err(error) => {
+                    log::error!("AI点歌搜索候选失败: {error:#}");
+                    self.reply("平台无对应歌曲音源")?;
+                    return Ok(None);
+                }
+            };
+            if candidates.is_empty() {
+                self.reply("平台无对应歌曲音源")?;
+                return Ok(None);
+            }
+
+            let pick = match self.ai.pick_song_candidate(
+                &song.keyword,
+                song.prefer_accompaniment,
+                &candidates,
+            ) {
+                Ok(pick) => pick,
+                Err(error) => {
+                    log::error!("AI点歌选择候选失败: {error:#}");
+                    self.reply("AI点歌识别失败")?;
+                    return Ok(None);
+                }
+            };
+            let Some(candidate) = candidates
+                .iter()
+                .find(|candidate| candidate.uri == pick.uri)
+            else {
+                log::error!("AI点歌返回未知候选: {}", pick.uri);
+                self.reply("AI点歌识别失败")?;
+                return Ok(None);
+            };
+            log::info!(
+                "AI点歌候选: raw={} pick={} uri={} score={:.2} reason={}",
+                song.keyword,
+                candidate.text,
+                candidate.uri,
+                pick.score,
+                pick.reason
+            );
+            Ok(Some(ResolvedSongRequest {
+                keyword: candidate.text.clone(),
+                source: String::new(),
+                prefer_accompaniment: song.prefer_accompaniment,
+                ai_original_text: song.keyword.clone(),
+                uri: candidate.uri.clone(),
+            }))
+        }
+
+        fn queue_contains_request(&self, request: &ResolvedSongRequest) -> Result<bool> {
+            let queue = self.queue()?;
+            if !request.uri.is_empty() {
+                return Ok(queue.has_duplicate_uri(&request.uri));
+            }
+            Ok(queue.has_duplicate(
+                &request.keyword,
+                &request.source,
+                request.prefer_accompaniment,
+            ))
+        }
+
+        fn push_queue_request(&self, request: &ResolvedSongRequest) -> Result<Option<usize>> {
+            let mut queue = self.queue()?;
+            if queue.is_full() {
+                return Ok(None);
+            }
+            queue.push(queue::QueueItem {
+                keyword: request.keyword.clone(),
+                source: request.source.clone(),
+                prefer_accompaniment: request.prefer_accompaniment,
+                ai_original_text: request.ai_original_text.clone(),
+                uri: request.uri.clone(),
+            })?;
+            Ok(Some(queue.len()))
+        }
+
         fn execute_command(&mut self, parsed: &ParsedCommand) -> Result<()> {
             match &parsed.command {
                 UserCommand::Song(song) => {
-                    if self.queue()?.has_duplicate(
-                        &song.keyword,
-                        song.source.as_str(),
-                        song.prefer_accompaniment,
-                    ) {
-                        log::info!("队列已有: {}", song.keyword);
-                        self.reply(&format!("队列已有: {}", song.keyword))?;
+                    let Some(request) = self.resolve_song_request(song)? else {
+                        return Ok(());
+                    };
+                    if self.queue_contains_request(&request)? {
+                        log::info!("队列已有: {}", request.keyword);
+                        self.reply(&format!("队列已有: {}", request.keyword))?;
                         return Ok(());
                     }
                     if !self.queue()?.is_empty() {
-                        let added_len = {
-                            let mut queue = self.queue()?;
-                            if queue.is_full() {
-                                None
-                            } else {
-                                queue.push(queue::QueueItem {
-                                    keyword: song.keyword.clone(),
-                                    source: song.source.as_str().to_string(),
-                                    prefer_accompaniment: song.prefer_accompaniment,
-                                    ai_original_text: String::new(),
-                                })?;
-                                Some(queue.len())
-                            }
-                        };
+                        let added_len = self.push_queue_request(&request)?;
                         if let Some(len) = added_len {
                             self.reply(&format!(
                                 "队列已加入({}/{}): {}",
-                                len, self.config.queue.max_size, song.keyword
+                                len, self.config.queue.max_size, request.keyword
                             ))?;
                         } else {
                             self.reply("队列已满，请稍后再试")?;
@@ -1381,13 +1482,13 @@ mod app {
                         Ok(status) if is_playing(&status) => {
                             let current_match = song_matcher::match_song_query(
                                 &self.config.matching,
-                                &song.keyword,
+                                request.match_keyword(),
                                 &status.name,
                                 &status.singer,
-                                song.prefer_accompaniment,
+                                request.prefer_accompaniment,
                             );
                             if current_match.ok {
-                                self.reply(&format!("当前正在播放: {}", song.keyword))?;
+                                self.reply(&format!("当前正在播放: {}", request.keyword))?;
                                 return Ok(());
                             }
                             if !self.runtime_state()?.state().current_song_is_requested {
@@ -1395,32 +1496,14 @@ mod app {
                                 runtime_state.state_mut().paused_by_command = false;
                                 runtime_state.save()?;
                                 drop(runtime_state);
-                                let _ = self.play_keyword_confirmed(
-                                    &song.keyword,
-                                    song.source.as_str(),
-                                    song.prefer_accompaniment,
-                                    true,
-                                )?;
+                                let _ = self.play_request_confirmed(&request, true)?;
                                 return Ok(());
                             }
-                            let added_len = {
-                                let mut queue = self.queue()?;
-                                if queue.is_full() {
-                                    None
-                                } else {
-                                    queue.push(queue::QueueItem {
-                                        keyword: song.keyword.clone(),
-                                        source: song.source.as_str().to_string(),
-                                        prefer_accompaniment: song.prefer_accompaniment,
-                                        ai_original_text: String::new(),
-                                    })?;
-                                    Some(queue.len())
-                                }
-                            };
+                            let added_len = self.push_queue_request(&request)?;
                             if let Some(len) = added_len {
                                 self.reply(&format!(
                                     "队列已加入({}/{}): {}",
-                                    len, self.config.queue.max_size, song.keyword
+                                    len, self.config.queue.max_size, request.keyword
                                 ))?;
                             } else {
                                 self.reply("队列已满，请稍后再试")?;
@@ -1434,24 +1517,11 @@ mod app {
                         }
                         Err(error) => {
                             log::error!("获取播放状态失败: {error:#}");
-                            let added_len = {
-                                let mut queue = self.queue()?;
-                                if queue.is_full() {
-                                    None
-                                } else {
-                                    queue.push(queue::QueueItem {
-                                        keyword: song.keyword.clone(),
-                                        source: song.source.as_str().to_string(),
-                                        prefer_accompaniment: song.prefer_accompaniment,
-                                        ai_original_text: String::new(),
-                                    })?;
-                                    Some(queue.len())
-                                }
-                            };
+                            let added_len = self.push_queue_request(&request)?;
                             if let Some(len) = added_len {
                                 self.reply(&format!(
                                     "状态未知，队列已加入({}/{}): {}",
-                                    len, self.config.queue.max_size, song.keyword
+                                    len, self.config.queue.max_size, request.keyword
                                 ))?;
                             } else {
                                 self.reply("状态未知且队列已满，请稍后再试")?;
@@ -1460,12 +1530,7 @@ mod app {
                         }
                     }
 
-                    let _ = self.play_keyword_confirmed(
-                        &song.keyword,
-                        song.source.as_str(),
-                        song.prefer_accompaniment,
-                        true,
-                    )?;
+                    let _ = self.play_request_confirmed(&request, true)?;
                 }
                 UserCommand::Pause => {
                     let message = self.feeluown.pause()?;
@@ -2178,7 +2243,7 @@ mod app {
         fn send_help(&self) -> Result<()> {
             self.chat_output.send_batch(
                 &[
-                    "点歌示例: @点歌 歌名 歌手 伴奏,输入伴奏时优先匹配伴奏",
+                    "点歌示例: @点歌/@AI点歌 歌名 歌手 伴奏,输入伴奏时优先匹配伴奏",
                 "命令以@开头: 暂停、继续、播放、下一首、上一首、状态、歌词、帮助、队列、音量1-100",
                     "切换网易平台: @网易点歌 歌名 歌手 伴奏,默认为QQ平台",
                 ],
@@ -2199,6 +2264,64 @@ mod app {
                 prefer_accompaniment,
                 allow_switch_source,
                 false,
+            )
+        }
+
+        fn play_request_confirmed(
+            &mut self,
+            request: &ResolvedSongRequest,
+            allow_switch_source: bool,
+        ) -> Result<PlayOutcome> {
+            if request.uri.trim().is_empty() {
+                return self.play_keyword_confirmed(
+                    &request.keyword,
+                    &request.source,
+                    request.prefer_accompaniment,
+                    allow_switch_source,
+                );
+            }
+            self.play_uri_confirmed(
+                &request.uri,
+                &request.keyword,
+                request.match_keyword(),
+                request.prefer_accompaniment,
+            )
+        }
+
+        fn play_uri_confirmed(
+            &mut self,
+            uri: &str,
+            display_keyword: &str,
+            match_keyword: &str,
+            prefer_accompaniment: bool,
+        ) -> Result<PlayOutcome> {
+            self.clear_requested_song_state()?;
+            let initial_song = self
+                .feeluown
+                .status()
+                .map(|status| format!("{}{}", status.name, status.singer))
+                .unwrap_or_default();
+            match self.feeluown.play_uri(uri) {
+                Ok(_) => {}
+                Err(error) => {
+                    let message = error.to_string();
+                    log::error!("AI点歌播放候选失败: {message}");
+                    self.reply(if message.trim().is_empty() {
+                        "平台无对应歌曲音源"
+                    } else {
+                        message.trim()
+                    })?;
+                    return Ok(PlayOutcome::Error);
+                }
+            }
+            self.reply(&format!("正在播放AI候选: {}", display_keyword))?;
+            self.confirm_playback_started(
+                match_keyword,
+                "",
+                prefer_accompaniment,
+                false,
+                false,
+                initial_song,
             )
         }
 
@@ -2247,6 +2370,25 @@ mod app {
             if let Some(candidate) = result.candidate {
                 log::info!("FeelUOwn 候选: {} -> {}", candidate.text, candidate.uri);
             }
+            self.confirm_playback_started(
+                keyword,
+                search_source,
+                prefer_accompaniment,
+                allow_switch_source,
+                confirm_after_switch,
+                initial_song,
+            )
+        }
+
+        fn confirm_playback_started(
+            &mut self,
+            keyword: &str,
+            search_source: &str,
+            prefer_accompaniment: bool,
+            allow_switch_source: bool,
+            confirm_after_switch: bool,
+            initial_song: String,
+        ) -> Result<PlayOutcome> {
             sleep(Duration::from_millis(
                 self.config.timing.play_search_settle_ms,
             ));
@@ -2648,12 +2790,14 @@ mod app {
                     return Ok(());
                 };
                 log::info!("消费队列({}): {}", reason, item.keyword);
-                let outcome = self.play_keyword_confirmed(
-                    &item.keyword,
-                    &item.source,
-                    item.prefer_accompaniment,
-                    true,
-                )?;
+                let request = ResolvedSongRequest {
+                    keyword: item.keyword.clone(),
+                    source: item.source.clone(),
+                    prefer_accompaniment: item.prefer_accompaniment,
+                    ai_original_text: item.ai_original_text.clone(),
+                    uri: item.uri.clone(),
+                };
+                let outcome = self.play_request_confirmed(&request, true)?;
                 match outcome {
                     PlayOutcome::Success => {
                         self.queue()?.shift()?;

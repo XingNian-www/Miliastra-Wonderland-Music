@@ -97,6 +97,7 @@ Examples:
 
 ```text
 用户: @点歌 晴天
+用户: @AI点歌 晴天 周杰伦
 用户: @QQ点歌 晴天
 用户: @网易点歌 晴天
 用户: @暂停
@@ -189,7 +190,10 @@ Main endpoints:
 /notify
 /ai/recognize
 /ai/match
+/ai/pick
 ```
+
+`@AI点歌` first searches FeelUOwn with the original request and asks AI to pick one URI from the returned candidates. AI does not rewrite the search text.
 
 ## Configuration Notes
 

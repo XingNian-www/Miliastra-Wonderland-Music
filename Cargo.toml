@@ -23,6 +23,8 @@ template-matching = { version = "0.2", default-features = false }
 windows = { version = "0.62", features = [
   "Win32_Foundation",
   "Win32_Graphics_Gdi",
+  "Win32_System_DataExchange",
+  "Win32_System_Memory",
   "Win32_System_Threading",
   "Win32_UI_HiDpi",
   "Win32_UI_Input_KeyboardAndMouse",

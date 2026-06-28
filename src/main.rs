@@ -1684,6 +1684,7 @@ mod app {
             log::info!("邀请: 先检测是否公共大厅");
             if self.check_public_hall()? {
                 log::info!("邀请: 当前在公共大厅，直接执行");
+                self.notify_friend_invite_decision(username, "已同意加入大厅,请注意启动麦克风");
                 return self.execute_invite(username);
             }
             let announce = format!(

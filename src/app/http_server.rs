@@ -1,27 +1,48 @@
 use std::collections::{HashMap, VecDeque};
-use std::io::{Read, Write};
-use std::net::{Shutdown, TcpListener, TcpStream};
-use std::process::{Command, Stdio};
+use std::net::TcpListener;
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
+use axum::Router;
+use axum::body::Body;
+use axum::extract::State;
+use axum::http::header::CONTENT_TYPE;
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
+use axum::response::Response;
+use axum::routing::any;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::runtime::Builder;
+use url::form_urlencoded;
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM};
+use windows::Win32::Security::Authentication::Identity::{GetUserNameExW, NameSamCompatible};
+use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
+use windows::Win32::System::Threading::{
+    GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput, VIRTUAL_KEY,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    EnumWindows, GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
+    SW_RESTORE, SetForegroundWindow, ShowWindow,
+};
+use windows::core::BOOL;
 
 use super::ai;
 use super::config::AppConfig;
 use super::feeluown::FeelUOwnClient;
-use super::notification;
 use super::queue::{PersistentQueue, QueueItem};
 use super::runtime_state::PersistentRuntimeState;
 
-const MAX_REQUEST_HEADER_BYTES: usize = 64 * 1024;
 const MAX_ACTIVE_CONNECTIONS: usize = 32;
 const PAGE: &str = include_str!("page.html");
-const KNOWN_ROUTES: &str = "/status, /play, /pause, /skip-next, /skip-prev, /volume, /searchPlay, /searchSource, /search, /open-scheme, /history, /clear-history, /health, /admin-status, /restart-admin, /active-window, /notify, /queue, /queue/add, /queue/remove, /queue/clear, /state, /state/save, /ai/recognize, /ai/match, /ai/pick";
+const KNOWN_ROUTES: &str = "/status, /play, /pause, /skip-next, /skip-prev, /volume, /searchPlay, /searchSource, /search, /open-scheme, /history, /clear-history, /health, /admin-status, /restart-admin, /active-window, /queue, /queue/add, /queue/remove, /queue/clear, /state, /state/save, /ai/recognize, /ai/match, /ai/pick";
 
 #[derive(Clone)]
 pub struct HttpSharedState {
@@ -47,7 +68,7 @@ struct Request {
     method: String,
     path: String,
     query: Vec<(String, String)>,
-    headers: Vec<(String, String)>,
+    headers: HeaderMap,
 }
 
 #[derive(Debug)]
@@ -76,39 +97,70 @@ pub fn start(state: HttpSharedState) -> Result<()> {
     let bind_addr = format!("{}:{}", state.config.http.host, state.config.http.port);
     let listener = TcpListener::bind(&bind_addr)
         .with_context(|| format!("启动 HTTP/Web 面板失败: {}", bind_addr))?;
+    listener
+        .set_nonblocking(true)
+        .context("set HTTP listener nonblocking")?;
     log::info!("HTTP/Web 面板已启动: http://{}", bind_addr);
-    thread::spawn(move || accept_loop(listener, state));
+    thread::spawn(move || run_server(listener, state));
     Ok(())
 }
 
-fn accept_loop(listener: TcpListener, state: HttpSharedState) {
-    for stream in listener.incoming() {
-        match stream {
-            Ok(mut stream) => {
-                let active = state.active_connections.fetch_add(1, Ordering::SeqCst);
-                if active >= MAX_ACTIVE_CONNECTIONS {
-                    state.active_connections.fetch_sub(1, Ordering::SeqCst);
-                    let response = http_response(
-                        503,
-                        "text/plain; charset=utf-8",
-                        "服务繁忙，请稍后再试",
-                        Vec::new(),
-                    );
-                    let _ = stream.write_all(response.as_bytes());
-                    let _ = stream.flush();
-                    let _ = stream.shutdown(Shutdown::Both);
-                    continue;
-                }
-                let state = state.clone();
-                let counter = state.active_connections.clone();
-                thread::spawn(move || {
-                    let _guard = ActiveConnectionGuard { counter };
-                    handle_connection(stream, state);
-                });
-            }
-            Err(error) => log::error!("HTTP 连接失败: {error}"),
+fn run_server(listener: TcpListener, state: HttpSharedState) {
+    let runtime = match Builder::new_multi_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            log::error!("HTTP runtime 启动失败: {error}");
+            return;
         }
+    };
+    runtime.block_on(async move {
+        let listener = match tokio::net::TcpListener::from_std(listener) {
+            Ok(listener) => listener,
+            Err(error) => {
+                log::error!("HTTP listener 初始化失败: {error}");
+                return;
+            }
+        };
+        let app = Router::new()
+            .fallback(any(axum_entry))
+            .with_state(Arc::new(state));
+        if let Err(error) = axum::serve(listener, app).await {
+            log::error!("HTTP/Web 面板运行失败: {error}");
+        }
+    });
+}
+
+async fn axum_entry(
+    State(state): State<Arc<HttpSharedState>>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    let active = state.active_connections.fetch_add(1, Ordering::SeqCst);
+    let _guard = ActiveConnectionGuard {
+        counter: state.active_connections.clone(),
+    };
+    if active >= MAX_ACTIVE_CONNECTIONS {
+        return plain_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "服务繁忙，请稍后再试".to_string(),
+            Vec::new(),
+        );
     }
+    let request = request_from_axum(method, uri, headers);
+    let response = match handle_request(request, &state) {
+        Ok(response) => response,
+        Err(error) => plain_response(
+            status_code(error.status),
+            format!("错误: {}", error.message),
+            default_cors_headers(&state.config.http.host, state.config.http.port),
+        ),
+    };
+    response
 }
 
 struct ActiveConnectionGuard {
@@ -121,86 +173,27 @@ impl Drop for ActiveConnectionGuard {
     }
 }
 
-fn handle_connection(mut stream: TcpStream, state: HttpSharedState) {
-    let response = match read_request(
-        &mut stream,
-        state.config.timing.http_request_read_timeout_ms,
-    )
-    .and_then(|request| handle_request(request, &state))
-    {
-        Ok(response) => response,
-        Err(error) => http_response(
-            error.status,
-            "text/plain; charset=utf-8",
-            &format!("错误: {}", error.message),
-            default_cors_headers(&state.config.http.host, state.config.http.port),
-        ),
-    };
-    let _ = stream.write_all(response.as_bytes());
-    let _ = stream.flush();
-    let _ = stream.shutdown(Shutdown::Both);
-}
-
-fn read_request(
-    stream: &mut TcpStream,
-    read_timeout_ms: u64,
-) -> std::result::Result<Request, AppError> {
-    stream
-        .set_read_timeout(Some(Duration::from_millis(read_timeout_ms)))
-        .map_err(internal_error)?;
-    let mut buffer = Vec::new();
-    let mut chunk = [0_u8; 2048];
-    loop {
-        let size = stream.read(&mut chunk).map_err(internal_error)?;
-        if size == 0 {
-            if buffer.is_empty() {
-                return Err(bad_request("空请求"));
-            }
-            break;
-        }
-        buffer.extend_from_slice(&chunk[..size]);
-        if buffer.len() > MAX_REQUEST_HEADER_BYTES {
-            return Err(bad_request("请求头过大"));
-        }
-        if find_header_end(&buffer).is_some() {
-            break;
-        }
-    }
-
-    let header_end = find_header_end(&buffer).unwrap_or(buffer.len());
-    let text = String::from_utf8_lossy(&buffer[..header_end]);
-    let mut lines = text.split("\r\n");
-    let first = lines.next().ok_or_else(|| bad_request("无效请求"))?;
-    let mut first_parts = first.split_whitespace();
-    let method = first_parts.next().unwrap_or("").to_string();
-    let target = first_parts.next().unwrap_or("/");
-    let (path, query) = parse_target(target)?;
-    let headers = lines
-        .take_while(|line| !line.is_empty())
-        .filter_map(|line| {
-            line.split_once(':')
-                .map(|(key, value)| (key.trim().to_ascii_lowercase(), value.trim().to_string()))
+fn request_from_axum(method: Method, uri: Uri, headers: HeaderMap) -> Request {
+    let query = uri
+        .query()
+        .map(|query| {
+            form_urlencoded::parse(query.as_bytes())
+                .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                .collect()
         })
-        .collect();
-    Ok(Request {
-        method,
-        path,
+        .unwrap_or_default();
+    Request {
+        method: method.as_str().to_string(),
+        path: uri.path().to_string(),
         query,
         headers,
-    })
-}
-
-fn find_header_end(buffer: &[u8]) -> Option<usize> {
-    buffer
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .map(|index| index + 4)
+    }
 }
 
 fn handle_request(
     request: Request,
     state: &HttpSharedState,
-) -> std::result::Result<String, AppError> {
+) -> std::result::Result<Response, AppError> {
     if !is_allowed_origin(&request, &state.config.http.host, state.config.http.port) {
         return Err(AppError {
             status: 403,
@@ -209,10 +202,8 @@ fn handle_request(
     }
 
     if request.method == "OPTIONS" {
-        return Ok(http_response(
-            204,
-            "text/plain; charset=utf-8",
-            "",
+        return Ok(empty_response(
+            StatusCode::NO_CONTENT,
             options_headers(&request, &state.config.http.host, state.config.http.port),
         ));
     }
@@ -220,18 +211,16 @@ fn handle_request(
     enforce_method(&request, state)?;
 
     if request.path == "/" && request.query.is_empty() {
-        return Ok(http_response(
-            200,
+        return Ok(body_response(
+            StatusCode::OK,
             "text/html; charset=utf-8",
-            PAGE,
+            PAGE.to_string(),
             cors_headers(&request, &state.config.http.host, state.config.http.port),
         ));
     }
     if request.path == "/favicon.ico" {
-        return Ok(http_response(
-            204,
-            "text/plain; charset=utf-8",
-            "",
+        return Ok(empty_response(
+            StatusCode::NO_CONTENT,
             cors_headers(&request, &state.config.http.host, state.config.http.port),
         ));
     }
@@ -241,10 +230,9 @@ fn handle_request(
         Ok(body) => (body, true),
         Err(error) => {
             push_history(&request, &error.message, false, state);
-            return Ok(http_response(
-                error.status,
-                "text/plain; charset=utf-8",
-                &format!("错误: {}", error.message),
+            return Ok(plain_response(
+                status_code(error.status),
+                format!("错误: {}", error.message),
                 cors_headers(&request, &state.config.http.host, state.config.http.port),
             ));
         }
@@ -255,10 +243,10 @@ fn handle_request(
     } else {
         "text/plain; charset=utf-8"
     };
-    Ok(http_response(
-        200,
+    Ok(body_response(
+        StatusCode::OK,
         content_type,
-        &body,
+        body,
         cors_headers(&request, &state.config.http.host, state.config.http.port),
     ))
 }
@@ -352,10 +340,7 @@ fn route(
         "/queue/clear" => queue_clear(state),
         "/state" => state_json(state),
         "/state/save" => state_save(query, state),
-        "/admin-status" => admin_status_json(
-            state.config.timing.active_check_timeout_ms,
-            state.config.timing.external_process_poll_ms,
-        ),
+        "/admin-status" => admin_status_json(),
         "/restart-admin" => Ok(json!({
             "ok": false,
             "supported": true,
@@ -395,14 +380,6 @@ fn route(
                     message: error.to_string(),
                 }
             })
-        }
-        "/notify" => {
-            let title = query_value(query, "title").unwrap_or("点歌命令待处理");
-            let message = query_value(query, "message").unwrap_or("");
-            Ok(
-                json!({ "ok": notification::send_windows_notification(title, message) })
-                    .to_string(),
-            )
         }
         "/history" => history_json(state),
         "/clear-history" => clear_history(state),
@@ -541,9 +518,7 @@ fn active_window_json(
     active_window_status(
         target,
         auto_activate,
-        state.config.timing.active_check_timeout_ms,
         state.config.timing.active_after_activate_ms,
-        state.config.timing.external_process_poll_ms,
     )
     .map_err(internal_error)
 }
@@ -571,7 +546,6 @@ fn push_history(request: &Request, result: &str, ok: bool, state: &HttpSharedSta
         "/history"
             | "/clear-history"
             | "/active-window"
-            | "/notify"
             | "/admin-status"
             | "/restart-admin"
             | "/favicon.ico"
@@ -662,48 +636,6 @@ fn apply_runtime_patch(
     {
         state.hall_expiring_warning_sent = value;
     }
-}
-
-fn parse_target(target: &str) -> std::result::Result<(String, Vec<(String, String)>), AppError> {
-    if target.trim().is_empty() {
-        return Err(bad_request("无效请求URL"));
-    }
-    let target = normalize_request_target(target)?;
-    let (path, query) = target.split_once('?').unwrap_or((target.as_str(), ""));
-    if path.is_empty() || !path.starts_with('/') {
-        return Err(bad_request("无效请求URL"));
-    }
-    let path = path.to_string();
-    let query = if query.is_empty() {
-        Vec::new()
-    } else {
-        query
-            .split('&')
-            .filter(|part| !part.is_empty())
-            .map(|part| {
-                let (key, value) = part.split_once('=').unwrap_or((part, ""));
-                Ok((percent_decode(key)?, percent_decode(value)?))
-            })
-            .collect::<std::result::Result<Vec<_>, AppError>>()?
-    };
-    Ok((path, query))
-}
-
-fn normalize_request_target(target: &str) -> std::result::Result<String, AppError> {
-    if target.starts_with('/') {
-        return Ok(target.to_string());
-    }
-    if let Some(after_scheme) = target.strip_prefix("http://") {
-        let path_start = after_scheme.find('/').unwrap_or(after_scheme.len());
-        let path = &after_scheme[path_start..];
-        return Ok(if path.is_empty() { "/" } else { path }.to_string());
-    }
-    if let Some(after_scheme) = target.strip_prefix("https://") {
-        let path_start = after_scheme.find('/').unwrap_or(after_scheme.len());
-        let path = &after_scheme[path_start..];
-        return Ok(if path.is_empty() { "/" } else { path }.to_string());
-    }
-    Err(bad_request("无效请求URL"))
 }
 
 fn query_value<'a>(query: &'a [(String, String)], key: &str) -> Option<&'a str> {
@@ -838,9 +770,7 @@ fn current_time_text() -> String {
 fn active_window_status(
     target: &str,
     auto_activate: bool,
-    timeout_ms: u64,
     after_activate_ms: u64,
-    poll_ms: u64,
 ) -> Result<String> {
     if target.trim().is_empty() {
         return Ok(json!({
@@ -851,140 +781,64 @@ fn active_window_status(
         })
         .to_string());
     }
-    let payload = json!({
+    let target_process = target_process_name(target);
+    let target_process_label = strip_exe_suffix(target.trim());
+    let target_window = find_window_by_process(&target_process)?;
+    let target_process_id = target_window
+        .map(|window| window.process_id)
+        .unwrap_or_default();
+
+    let mut foreground = foreground_window_info();
+    let mut active = if target_process_id != 0 {
+        foreground.process_id == target_process_id
+    } else {
+        normalize_process_name(&foreground.process) == target_process
+    };
+    let mut activated = false;
+    let mut show_window_result = false;
+    let mut send_input_alt_result = 0_u32;
+    let mut set_foreground_result = false;
+
+    if !active && auto_activate {
+        if let Some(target_window) = target_window {
+            show_window_result = unsafe { ShowWindow(target_window.hwnd, SW_RESTORE).as_bool() };
+            send_input_alt_result = send_alt_keypress();
+            set_foreground_result = unsafe { SetForegroundWindow(target_window.hwnd).as_bool() };
+            thread::sleep(Duration::from_millis(after_activate_ms));
+
+            foreground = foreground_window_info();
+            active = foreground.process_id == target_process_id;
+            activated = active;
+        }
+    }
+
+    Ok(json!({
+        "supported": true,
+        "enabled": true,
+        "active": active,
+        "activated": activated,
+        "showWindow": show_window_result,
+        "sendInputAlt": send_input_alt_result,
+        "setForeground": set_foreground_result,
+        "autoClick": false,
+        "title": foreground.title,
+        "process": foreground.process,
+        "processId": foreground.process_id,
         "target": target,
-        "autoActivate": auto_activate,
-        "afterActivateMs": after_activate_ms,
+        "targetProcess": target_process_label,
+        "targetProcessId": target_process_id,
     })
-    .to_string();
-    let script = r#"
-Add-Type @"
-using System;
-using System.Text;
-using System.Runtime.InteropServices;
-public class Win32Window {
-  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
-  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
-  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
-  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
-  [DllImport("user32.dll")] public static extern uint SendInput(uint cInputs, INPUT[] pInputs, int cbSize);
+    .to_string())
 }
 
-[StructLayout(LayoutKind.Sequential)]
-public struct INPUT {
-  public uint type;
-  public INPUTUNION u;
-}
-
-[StructLayout(LayoutKind.Explicit)]
-public struct INPUTUNION {
-  [FieldOffset(0)] public MOUSEINPUT mi;
-  [FieldOffset(0)] public KEYBDINPUT ki;
-  [FieldOffset(0)] public HARDWAREINPUT hi;
-}
-
-[StructLayout(LayoutKind.Sequential)]
-public struct MOUSEINPUT {
-  public int dx;
-  public int dy;
-  public uint mouseData;
-  public uint dwFlags;
-  public uint time;
-  public IntPtr dwExtraInfo;
-}
-
-[StructLayout(LayoutKind.Sequential)]
-public struct KEYBDINPUT {
-  public ushort wVk;
-  public ushort wScan;
-  public uint dwFlags;
-  public uint time;
-  public IntPtr dwExtraInfo;
-}
-
-[StructLayout(LayoutKind.Sequential)]
-public struct HARDWAREINPUT {
-  public uint uMsg;
-  public ushort wParamL;
-  public ushort wParamH;
-}
-"@
-$inputData = [Console]::In.ReadToEnd() | ConvertFrom-Json
-$target = [string]$inputData.target
-$autoActivate = [bool]$inputData.autoActivate
-$afterActivateMs = [int]$inputData.afterActivateMs
-$handle = [Win32Window]::GetForegroundWindow()
-$builder = New-Object System.Text.StringBuilder 512
-[void][Win32Window]::GetWindowText($handle, $builder, $builder.Capacity)
-$processId = 0
-[void][Win32Window]::GetWindowThreadProcessId($handle, [ref]$processId)
-$processName = ""
-try { $processName = (Get-Process -Id $processId -ErrorAction Stop).ProcessName } catch {}
-$title = $builder.ToString()
-$targetProcessName = if ($target.EndsWith(".exe", [StringComparison]::OrdinalIgnoreCase)) { $target.Substring(0, $target.Length - 4) } else { $target }
-$targetProcess = Get-Process -Name $targetProcessName -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
-$targetProcessId = if ($targetProcess) { [int]$targetProcess.Id } else { 0 }
-$active = if ($targetProcessId -ne 0) { [int]$processId -eq $targetProcessId } else { $processName.Equals($targetProcessName, [StringComparison]::OrdinalIgnoreCase) }
-$activated = $false
-$showWindowResult = $false
-$sendInputAltResult = 0
-$setForegroundResult = $false
-if (-not $active -and $autoActivate -and $targetProcess) {
-  $targetHandle = $targetProcess.MainWindowHandle
-  $showWindowResult = [Win32Window]::ShowWindow($targetHandle, 9)
-  $inputs = New-Object 'INPUT[]' 2
-  $inputs[0].type = 1
-  $inputs[0].u.ki.wVk = 0x12
-  $inputs[1].type = 1
-  $inputs[1].u.ki.wVk = 0x12
-  $inputs[1].u.ki.dwFlags = 0x0002
-  $sendInputAltResult = [Win32Window]::SendInput(2, $inputs, [Runtime.InteropServices.Marshal]::SizeOf([type]'INPUT'))
-  $setForegroundResult = [Win32Window]::SetForegroundWindow($targetHandle)
-  Start-Sleep -Milliseconds $afterActivateMs
-  $handle = [Win32Window]::GetForegroundWindow()
-  $builder = New-Object System.Text.StringBuilder 512
-  [void][Win32Window]::GetWindowText($handle, $builder, $builder.Capacity)
-  $processId = 0
-  [void][Win32Window]::GetWindowThreadProcessId($handle, [ref]$processId)
-  $processName = ""
-  try { $processName = (Get-Process -Id $processId -ErrorAction Stop).ProcessName } catch {}
-  $title = $builder.ToString()
-  $active = [int]$processId -eq $targetProcessId
-  $activated = $active
-}
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-[pscustomobject]@{ supported = $true; enabled = $true; active = $active; activated = $activated; showWindow = $showWindowResult; sendInputAlt = $sendInputAltResult; setForeground = $setForegroundResult; autoClick = $false; title = $title; process = $processName; processId = [int]$processId; target = $target; targetProcess = $targetProcessName; targetProcessId = $targetProcessId } | ConvertTo-Json -Compress
-"#;
-    let output = run_powershell(script, &payload, Duration::from_millis(timeout_ms), poll_ms)?;
-    Ok(json_object_output(&output).unwrap_or_else(|| {
-        json!({
-            "supported": false,
-            "enabled": true,
-            "active": false,
-            "reason": "PowerShell返回无效JSON",
+fn admin_status_json() -> std::result::Result<String, AppError> {
+    match admin_status() {
+        Ok((is_admin, user)) => Ok(json!({
+            "supported": true,
+            "isAdmin": is_admin,
+            "user": user,
         })
-        .to_string()
-    }))
-}
-
-fn admin_status_json(timeout_ms: u64, poll_ms: u64) -> std::result::Result<String, AppError> {
-    let script = r#"
-$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-$principal = New-Object Security.Principal.WindowsPrincipal($identity)
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-[pscustomobject]@{ supported = $true; isAdmin = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator); user = $identity.Name } | ConvertTo-Json -Compress
-"#;
-    match run_powershell(script, "", Duration::from_millis(timeout_ms), poll_ms) {
-        Ok(output) if output.trim().is_empty() => Ok("{}".to_string()),
-        Ok(output) => Ok(json_object_output(&output).unwrap_or_else(|| {
-            json!({
-                "supported": false,
-                "isAdmin": false,
-                "reason": "PowerShell返回无效JSON",
-            })
-            .to_string()
-        })),
+        .to_string()),
         Err(error) => Ok(json!({
             "supported": false,
             "isAdmin": false,
@@ -994,68 +848,226 @@ $principal = New-Object Security.Principal.WindowsPrincipal($identity)
     }
 }
 
-fn run_powershell(script: &str, input: &str, timeout: Duration, poll_ms: u64) -> Result<String> {
-    let mut child = Command::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            script,
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("PowerShell执行失败")?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(input.as_bytes())
-            .context("PowerShell输入失败")?;
+#[derive(Clone, Copy)]
+struct ProcessWindow {
+    hwnd: HWND,
+    process_id: u32,
+}
+
+#[derive(Debug)]
+struct ForegroundWindowInfo {
+    title: String,
+    process: String,
+    process_id: u32,
+}
+
+struct SearchState {
+    target: String,
+    found: Option<ProcessWindow>,
+}
+
+fn foreground_window_info() -> ForegroundWindowInfo {
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.is_invalid() {
+        return ForegroundWindowInfo {
+            title: String::new(),
+            process: String::new(),
+            process_id: 0,
+        };
     }
-    let started_at = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                let output = child.wait_with_output().context("PowerShell执行失败")?;
-                if output.status.success() {
-                    return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
-                }
-                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                bail!(if stderr.is_empty() {
-                    "PowerShell执行失败".to_string()
-                } else {
-                    stderr
-                });
-            }
-            Ok(None) => {
-                if started_at.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    bail!("PowerShell执行超时");
-                }
-                thread::sleep(Duration::from_millis(poll_ms));
-            }
-            Err(error) => return Err(error).context("PowerShell执行失败"),
-        }
+
+    let mut process_id = 0_u32;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut process_id)) };
+    ForegroundWindowInfo {
+        title: window_title(hwnd),
+        process: process_name(process_id)
+            .map(|name| strip_exe_suffix(&name).to_string())
+            .unwrap_or_default(),
+        process_id,
     }
 }
 
-fn json_object_output(output: &str) -> Option<String> {
-    let trimmed = output.trim();
-    if serde_json::from_str::<Value>(trimmed).is_ok_and(|value| value.is_object()) {
-        return Some(trimmed.to_string());
+fn window_title(hwnd: HWND) -> String {
+    let mut buffer = vec![0_u16; 512];
+    let len = unsafe { GetWindowTextW(hwnd, &mut buffer) };
+    if len <= 0 {
+        return String::new();
     }
-    let start = trimmed.find('{')?;
-    let end = trimmed.rfind('}')?;
-    if end < start {
-        return None;
+    String::from_utf16_lossy(&buffer[..len as usize])
+}
+
+fn find_window_by_process(target_process: &str) -> Result<Option<ProcessWindow>> {
+    let mut state = SearchState {
+        target: target_process.to_string(),
+        found: None,
+    };
+    unsafe {
+        EnumWindows(
+            Some(enum_windows_proc),
+            LPARAM((&mut state as *mut SearchState) as isize),
+        )
     }
-    let candidate = &trimmed[start..=end];
-    if serde_json::from_str::<Value>(candidate).is_ok_and(|value| value.is_object()) {
-        Some(candidate.to_string())
+    .context("EnumWindows failed")?;
+    Ok(state.found)
+}
+
+unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let state = unsafe { &mut *(lparam.0 as *mut SearchState) };
+    if !unsafe { IsWindowVisible(hwnd).as_bool() } {
+        return true.into();
+    }
+
+    let mut process_id = 0_u32;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut process_id)) };
+    if process_id == 0 {
+        return true.into();
+    }
+
+    if process_name(process_id)
+        .map(|name| normalize_process_name(&name) == state.target)
+        .unwrap_or(false)
+    {
+        state.found = Some(ProcessWindow { hwnd, process_id });
+        return false.into();
+    }
+    true.into()
+}
+
+fn process_name(process_id: u32) -> Result<String> {
+    if process_id == 0 {
+        return Ok(String::new());
+    }
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id) }
+        .with_context(|| format!("OpenProcess failed for pid {}", process_id))?;
+    let _guard = HandleGuard(process);
+
+    let mut buffer = vec![0_u16; 32768];
+    let mut len = buffer.len() as u32;
+    unsafe {
+        QueryFullProcessImageNameW(
+            process,
+            PROCESS_NAME_WIN32,
+            windows::core::PWSTR(buffer.as_mut_ptr()),
+            &mut len,
+        )
+    }
+    .with_context(|| format!("QueryFullProcessImageNameW failed for pid {}", process_id))?;
+    let path = String::from_utf16_lossy(&buffer[..len as usize]);
+    Ok(Path::new(&path)
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(path))
+}
+
+fn admin_status() -> Result<(bool, String)> {
+    let process = unsafe { GetCurrentProcess() };
+    let mut token = HANDLE::default();
+    unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) }
+        .context("OpenProcessToken failed")?;
+    let _guard = HandleGuard(token);
+
+    let mut elevation = TOKEN_ELEVATION::default();
+    let mut returned = 0_u32;
+    unsafe {
+        GetTokenInformation(
+            token,
+            TokenElevation,
+            Some((&mut elevation as *mut TOKEN_ELEVATION).cast()),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut returned,
+        )
+    }
+    .context("GetTokenInformation(TokenElevation) failed")?;
+
+    Ok((elevation.TokenIsElevated != 0, current_user_name()))
+}
+
+fn current_user_name() -> String {
+    let mut len = 0_u32;
+    unsafe { GetUserNameExW(NameSamCompatible, None, &mut len) };
+    if len > 0 {
+        let mut buffer = vec![0_u16; len as usize];
+        if unsafe {
+            GetUserNameExW(
+                NameSamCompatible,
+                Some(windows::core::PWSTR(buffer.as_mut_ptr())),
+                &mut len,
+            )
+        } {
+            let usable_len = buffer
+                .iter()
+                .position(|ch| *ch == 0)
+                .unwrap_or(len as usize);
+            return String::from_utf16_lossy(&buffer[..usable_len]);
+        }
+    }
+
+    match (std::env::var("USERDOMAIN"), std::env::var("USERNAME")) {
+        (Ok(domain), Ok(user)) if !domain.is_empty() && !user.is_empty() => {
+            format!("{}\\{}", domain, user)
+        }
+        (_, Ok(user)) => user,
+        _ => String::new(),
+    }
+}
+
+fn send_alt_keypress() -> u32 {
+    let inputs = [
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VIRTUAL_KEY(0x12),
+                    ..Default::default()
+                },
+            },
+        },
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VIRTUAL_KEY(0x12),
+                    dwFlags: KEYEVENTF_KEYUP,
+                    ..Default::default()
+                },
+            },
+        },
+    ];
+    unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) }
+}
+
+fn target_process_name(value: &str) -> String {
+    normalize_process_name(strip_exe_suffix(value.trim()))
+}
+
+fn normalize_process_name(value: &str) -> String {
+    let mut name = value.trim().to_ascii_lowercase();
+    if !name.ends_with(".exe") {
+        name.push_str(".exe");
+    }
+    name
+}
+
+fn strip_exe_suffix(value: &str) -> &str {
+    let suffix_start = value.len().saturating_sub(4);
+    if value
+        .get(suffix_start..)
+        .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".exe"))
+    {
+        &value[..value.len() - 4]
     } else {
-        None
+        value
+    }
+}
+
+struct HandleGuard(HANDLE);
+
+impl Drop for HandleGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
     }
 }
 
@@ -1076,7 +1088,6 @@ fn is_json_route(path: &str) -> bool {
             | "/ai/match"
             | "/ai/pick"
             | "/history"
-            | "/notify"
     )
 }
 
@@ -1110,39 +1121,60 @@ fn is_mutating_route(path: &str) -> bool {
             | "/ai/recognize"
             | "/ai/match"
             | "/ai/pick"
-            | "/notify"
             | "/clear-history"
     )
 }
 
-fn http_response(
-    status: u16,
-    content_type: &str,
-    body: &str,
+fn status_code(status: u16) -> StatusCode {
+    StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+fn plain_response(
+    status: StatusCode,
+    body: String,
     extra_headers: Vec<(String, String)>,
-) -> String {
-    let reason = match status {
-        200 => "OK",
-        204 => "No Content",
-        400 => "Bad Request",
-        403 => "Forbidden",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        503 => "Service Unavailable",
-        _ => "Internal Server Error",
-    };
-    let mut response = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
-        status,
-        reason,
-        content_type,
-        body.as_bytes().len()
-    );
-    for (key, value) in extra_headers {
-        response.push_str(&format!("{}: {}\r\n", key, value));
+) -> Response {
+    body_response(status, "text/plain; charset=utf-8", body, extra_headers)
+}
+
+fn empty_response(status: StatusCode, extra_headers: Vec<(String, String)>) -> Response {
+    add_headers(
+        Response::builder().status(status).body(Body::empty()),
+        extra_headers,
+    )
+}
+
+fn body_response(
+    status: StatusCode,
+    content_type: &str,
+    body: String,
+    extra_headers: Vec<(String, String)>,
+) -> Response {
+    let response = Response::builder()
+        .status(status)
+        .header(CONTENT_TYPE, content_type)
+        .body(Body::from(body));
+    add_headers(response, extra_headers)
+}
+
+fn add_headers(
+    response: std::result::Result<Response, axum::http::Error>,
+    headers: Vec<(String, String)>,
+) -> Response {
+    let mut response = response.unwrap_or_else(|_| {
+        Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(Body::from("HTTP响应构造失败"))
+            .unwrap_or_else(|_| Response::new(Body::empty()))
+    });
+    for (key, value) in headers {
+        if let (Ok(key), Ok(value)) = (
+            HeaderName::try_from(key.as_str()),
+            HeaderValue::from_str(&value),
+        ) {
+            response.headers_mut().insert(key, value);
+        }
     }
-    response.push_str("\r\n");
-    response.push_str(body);
     response
 }
 
@@ -1250,12 +1282,11 @@ fn is_wildcard_host(value: &str) -> bool {
     matches!(normalize_host_name(value).as_str(), "0.0.0.0" | "::")
 }
 
-fn header_value<'a>(request: &'a Request, key: &str) -> Option<&'a str> {
+fn header_value<'a>(request: &'a Request, key: &'static str) -> Option<&'a str> {
     request
         .headers
-        .iter()
-        .find(|(header_key, _)| header_key == key)
-        .map(|(_, value)| value.as_str())
+        .get(key)
+        .and_then(|value| value.to_str().ok())
 }
 
 fn cors_headers(request: &Request, host: &str, port: u16) -> Vec<(String, String)> {
@@ -1301,40 +1332,6 @@ fn default_cors_headers(host: &str, port: u16) -> Vec<(String, String)> {
 
 fn is_same_origin(origin: &str, host: &str) -> bool {
     origin == format!("http://{}", host)
-}
-
-fn percent_decode(value: &str) -> std::result::Result<String, AppError> {
-    let mut output = Vec::with_capacity(value.len());
-    let bytes = value.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'+' => {
-                output.push(b' ');
-                index += 1;
-            }
-            b'%' if index + 2 < bytes.len() => {
-                let high = hex_value(bytes[index + 1]).ok_or_else(|| bad_request("URL编码无效"))?;
-                let low = hex_value(bytes[index + 2]).ok_or_else(|| bad_request("URL编码无效"))?;
-                output.push(high * 16 + low);
-                index += 3;
-            }
-            byte => {
-                output.push(byte);
-                index += 1;
-            }
-        }
-    }
-    String::from_utf8(output).map_err(|_| bad_request("URL编码不是UTF-8"))
-}
-
-fn hex_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
 }
 
 fn bad_request(message: &str) -> AppError {

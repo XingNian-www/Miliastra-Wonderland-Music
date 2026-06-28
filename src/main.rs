@@ -17,7 +17,6 @@ mod app {
     mod http_server;
     mod logger;
     mod manual_tools;
-    mod notification;
     mod ocr;
     mod queue;
     mod runtime_state;
@@ -38,11 +37,11 @@ mod app {
         CommandLockState, MicrophoneMode, ParsedCommand, PendingCommand, UserCommand,
     };
     use self::config::{AppConfig, PointConfig, RectConfig};
-    use self::feeluown::{format_lyrics, format_status, FeelUOwnClient, PlayerStatus};
-    use self::ocr::{make_ocr_engine, merged_ocr_text, recognize_lines, OcrArgs};
+    use self::feeluown::{FeelUOwnClient, PlayerStatus, format_lyrics, format_status};
+    use self::ocr::{OcrArgs, make_ocr_engine, merged_ocr_text, recognize_lines};
     use self::queue::PersistentQueue;
-    use self::runtime_state::{PersistentRuntimeState, HALL_EXPIRING_WARNING_MINUTES};
-    use anyhow::{anyhow, bail, Context, Result};
+    use self::runtime_state::{HALL_EXPIRING_WARNING_MINUTES, PersistentRuntimeState};
+    use anyhow::{Context, Result, anyhow, bail};
     use clap::{Args, Parser, Subcommand};
     use enigo::{Direction, Enigo, Key, Keyboard, Settings};
     use image::imageops::FilterType;
@@ -51,7 +50,7 @@ mod app {
     use ocr_rs::OcrEngine;
     use serde::Serialize;
     use template_matching::{
-        find_extremes, match_template, Image as MatchImage, MatchTemplateMethod,
+        Image as MatchImage, MatchTemplateMethod, find_extremes, match_template,
     };
 
     const CHAT_MARKER_SEARCH_WIDTH: u32 = 60;
@@ -2967,11 +2966,7 @@ mod app {
     }
 
     fn display_or_empty(text: &str) -> &str {
-        if text.is_empty() {
-            "空"
-        } else {
-            text
-        }
+        if text.is_empty() { "空" } else { text }
     }
 
     fn normalize_ascii_digit(ch: char) -> Option<char> {
@@ -3588,10 +3583,7 @@ mod app {
         chat_change_fingerprint(image, chat_rect.into())
     }
 
-    fn rect_chat_change_fingerprint(
-        image: &DynamicImage,
-        rect: Rect,
-    ) -> Result<ChangeFingerprint> {
+    fn rect_chat_change_fingerprint(image: &DynamicImage, rect: Rect) -> Result<ChangeFingerprint> {
         chat_change_fingerprint(image, rect)
     }
 

@@ -10,7 +10,7 @@ Windows-only Rust music request bot for Miliastra Wonderland chat. It watches th
 - Uses FeelUOwn TCP RPC for search, playback, status, lyrics, and queue transitions
 - Provides a local Web/API panel on `127.0.0.1:18888`
 - Persists queue and runtime state under `data/`
-- Sends Windows notifications and writes file logs
+- Writes file logs
 - Includes manual debug tools for screenshots, OCR, chat scanning, UI state, template matching, chat sending, chat change monitoring, and panel response benchmarking
 - Supports global hotkeys: `F7` pause/resume scanning, `F12` exit
 
@@ -187,7 +187,6 @@ Main endpoints:
 /history
 /clear-history
 /active-window
-/notify
 /ai/recognize
 /ai/match
 /ai/pick

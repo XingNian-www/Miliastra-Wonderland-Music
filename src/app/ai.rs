@@ -1,8 +1,8 @@
-use std::io::Write;
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use reqwest::blocking::Client;
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Value, json};
 
 use super::config::{AiConfig, TimingConfig};
@@ -432,107 +432,59 @@ fn call_ai(
         "thinking": { "type": "disabled" }
     })
     .to_string();
-    call_ai_powershell(config, &body, timing)
+    call_ai_http(config, &body, timing)
 }
 
-fn call_ai_powershell(
-    config: &AiProviderConfig,
-    body: &str,
-    timing: &TimingConfig,
-) -> Result<String> {
-    let auth_header = match config.provider {
-        AiProvider::Mimo => "api-key",
-        AiProvider::OpenAi | AiProvider::DeepSeek | AiProvider::Custom => "Authorization",
-    };
-    let auth_value = match config.provider {
-        AiProvider::Mimo => config.api_key.clone(),
+fn call_ai_http(config: &AiProviderConfig, body: &str, timing: &TimingConfig) -> Result<String> {
+    let response = Client::builder()
+        .timeout(Duration::from_millis(timing.ai_request_timeout_ms))
+        .build()
+        .context("创建AI HTTP客户端失败")?
+        .post(&config.endpoint)
+        .headers(ai_headers(config)?)
+        .body(body.to_string())
+        .send()
+        .with_context(|| format!("AI请求失败({:?})", config.provider))?;
+    let status = response.status();
+    let text = response.text().context("读取AI响应失败")?;
+    if !status.is_success() {
+        bail!(
+            "AI请求失败({:?}) status={}: {}",
+            config.provider,
+            status,
+            text
+        );
+    }
+    let value: Value =
+        serde_json::from_str(&text).with_context(|| format!("解析AI响应失败: {text}"))?;
+    value
+        .pointer("/choices/0/message/content")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("AI响应缺少choices[0].message.content"))
+}
+
+fn ai_headers(config: &AiProviderConfig) -> Result<HeaderMap> {
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    match config.provider {
+        AiProvider::Mimo => {
+            headers.insert(
+                HeaderName::from_static("api-key"),
+                HeaderValue::from_str(&config.api_key).context("api_key不是有效HTTP header")?,
+            );
+        }
         AiProvider::OpenAi | AiProvider::DeepSeek | AiProvider::Custom => {
-            format!("Bearer {}", config.api_key)
-        }
-    };
-    let payload = json!({
-        "provider": format!("{:?}", config.provider),
-        "authHeader": auth_header,
-        "authValue": auth_value,
-        "endpoint": config.endpoint,
-        "body": body,
-    })
-    .to_string();
-    let script = r#"
-$data = [Console]::In.ReadToEnd() | ConvertFrom-Json
-$headers = @{ 'Content-Type' = 'application/json' }
-$headers[[string]$data.authHeader] = [string]$data.authValue
-try {
-  [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-  $response = Invoke-RestMethod -Method Post -Uri ([string]$data.endpoint) -Headers $headers -Body ([string]$data.body) -ContentType 'application/json' -TimeoutSec 30
-  [string]$response.choices[0].message.content
-} catch {
-  $message = $_.Exception.Message
-  if ($_.Exception.Response -and $_.Exception.Response.GetResponseStream()) {
-    try {
-      $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
-      $body = $reader.ReadToEnd()
-      if ($body) { $message = $message + ': ' + $body }
-    } catch {}
-  }
-  Write-Error $message
-  exit 1
-}
-"#;
-    run_powershell(
-        script,
-        &payload,
-        Duration::from_millis(timing.ai_request_timeout_ms),
-        timing.external_process_poll_ms,
-    )
-    .map_err(|error| anyhow::anyhow!("AI请求失败({:?}): {}", config.provider, error))
-}
-
-fn run_powershell(script: &str, input: &str, timeout: Duration, poll_ms: u64) -> Result<String> {
-    let mut child = Command::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            script,
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("PowerShell执行失败")?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(input.as_bytes())
-            .context("PowerShell输入失败")?;
-    }
-    let started_at = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                let output = child.wait_with_output().context("PowerShell执行失败")?;
-                if output.status.success() {
-                    return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
-                }
-                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                bail!(if stderr.is_empty() {
-                    "PowerShell执行失败".to_string()
-                } else {
-                    stderr
-                });
-            }
-            Ok(None) => {
-                if started_at.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    bail!("PowerShell执行超时");
-                }
-                std::thread::sleep(Duration::from_millis(poll_ms));
-            }
-            Err(error) => return Err(error).context("PowerShell执行失败"),
+            headers.insert(
+                AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {}", config.api_key))
+                    .context("api_key不是有效HTTP header")?,
+            );
         }
     }
+    Ok(headers)
 }
 
 fn model_reply_json_object(reply: &str) -> Result<String> {

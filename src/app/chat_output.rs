@@ -6,7 +6,6 @@ use enigo::{Direction, Enigo, Key, Keyboard, Settings};
 
 use super::clipboard;
 use super::config::{OutputConfig, TimingConfig, WindowConfig};
-use super::notification;
 use super::window::GameWindow;
 
 const MAX_CHAT_WIDTH: usize = 80;
@@ -15,7 +14,6 @@ const OMIT: &str = "...";
 #[derive(Clone, Debug)]
 pub struct ChatOutput {
     enabled: bool,
-    notify: bool,
     config: OutputConfig,
     timing: TimingConfig,
     window: WindowConfig,
@@ -25,7 +23,6 @@ impl ChatOutput {
     pub fn new(config: &OutputConfig, timing: &TimingConfig, window: &WindowConfig) -> Self {
         Self {
             enabled: config.send_enabled,
-            notify: config.notify,
             config: config.clone(),
             timing: timing.clone(),
             window: window.clone(),
@@ -35,9 +32,6 @@ impl ChatOutput {
     pub fn send(&self, message: &str) -> Result<()> {
         let message = fit_chat_message(message);
         log::info!("游戏内回复: {}", message);
-        if self.notify {
-            let _ = notification::send_windows_notification("点歌命令待处理", &message);
-        }
         if !self.enabled {
             log::info!("游戏内回复发送已关闭，仅记录日志");
             return Ok(());
@@ -48,9 +42,6 @@ impl ChatOutput {
     pub fn send_current_chat(&self, message: &str) -> Result<()> {
         let message = fit_chat_message(message);
         log::info!("当前聊天回复: {}", message);
-        if self.notify {
-            let _ = notification::send_windows_notification("点歌命令待处理", &message);
-        }
         if !self.enabled {
             log::info!("当前聊天回复发送已关闭，仅记录日志");
             return Ok(());
@@ -68,9 +59,6 @@ impl ChatOutput {
             .collect::<Vec<_>>();
         for message in &messages {
             log::info!("游戏内回复: {}", message);
-            if self.notify {
-                let _ = notification::send_windows_notification("点歌命令待处理", message);
-            }
         }
         if !self.enabled {
             log::info!("游戏内回复发送已关闭，仅记录日志");
@@ -311,9 +299,5 @@ fn display_width(value: &str) -> usize {
 }
 
 fn char_width(ch: char) -> usize {
-    if ch.is_ascii() {
-        1
-    } else {
-        2
-    }
+    if ch.is_ascii() { 1 } else { 2 }
 }

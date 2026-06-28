@@ -245,13 +245,13 @@ timing:
   volume_smooth_step_ms: 300
   # 31. HTTP 读取单个请求头的超时，单位毫秒
   http_request_read_timeout_ms: 5000
-  # 32. /active-window 和 /admin-status PowerShell 检测超时，单位毫秒
+  # 32. 旧版 /active-window 和 /admin-status 检测超时，当前 Win32 直接检测不再使用
   active_check_timeout_ms: 2000
   # 33. 自动激活游戏窗口后等待前台窗口切换完成的时间，单位毫秒
   active_after_activate_ms: 200
-  # 34. AI 请求 PowerShell 进程超时，单位毫秒
+  # 34. AI HTTP 请求超时，单位毫秒
   ai_request_timeout_ms: 35000
-  # 35. 外部 PowerShell 进程轮询间隔，单位毫秒
+  # 35. 旧版外部进程轮询间隔，保留用于兼容旧配置
   external_process_poll_ms: 50
 
 ocr:
@@ -330,8 +330,6 @@ templates:
 output:
   # 是否真的向游戏内发送回复；false 时只写日志
   send_enabled: true
-  # 是否同时弹出 Windows 本地通知
-  notify: true
   # 用于聚焦/返回一级聊天界面的点击点
   focus_point:
     x: 1919
@@ -710,7 +708,6 @@ impl Default for TemplateConfig {
 #[serde(default)]
 pub struct OutputConfig {
     pub send_enabled: bool,
-    pub notify: bool,
     pub focus_point: PointConfig,
     pub chat_click_1: PointConfig,
     pub chat_click_2: PointConfig,
@@ -720,7 +717,6 @@ impl Default for OutputConfig {
     fn default() -> Self {
         Self {
             send_enabled: true,
-            notify: true,
             focus_point: PointConfig::new(1919, 540),
             chat_click_1: PointConfig::new(120, 225),
             chat_click_2: PointConfig::new(600, 1013),

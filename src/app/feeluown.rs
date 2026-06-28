@@ -56,6 +56,23 @@ impl FeelUOwnClient {
     }
 
     pub fn request(&self, command: &str) -> Result<String> {
+        let mut stream = self.connect()?;
+        self.send_command(&mut stream, command)?;
+        let status_line = read_line(&mut stream).context("read FeelUOwn ACK")?;
+        let (ok, body_len) = parse_ack(&status_line)?;
+        let mut body = vec![0_u8; body_len];
+        stream.read_exact(&mut body).context("read FeelUOwn body")?;
+        let body = String::from_utf8_lossy(&body).to_string();
+        if ok {
+            Ok(body)
+        } else if body.trim().is_empty() {
+            bail!(status_line)
+        } else {
+            bail!(body)
+        }
+    }
+
+    fn connect(&self) -> Result<TcpStream> {
         let addr = format!("{}:{}", self.host, self.port);
         let mut stream =
             TcpStream::connect(&addr).with_context(|| format!("连接 FeelUOwn 失败: {}", addr))?;
@@ -70,7 +87,10 @@ impl FeelUOwnClient {
         if !welcome.to_ascii_uppercase().starts_with("OK ") {
             bail!("FeelUOwn 连接失败: {}", welcome);
         }
+        Ok(stream)
+    }
 
+    fn send_command(&self, stream: &mut TcpStream, command: &str) -> Result<()> {
         let command_text = if command.ends_with('\n') {
             command.to_string()
         } else {
@@ -79,18 +99,7 @@ impl FeelUOwnClient {
         stream
             .write_all(command_text.as_bytes())
             .context("send FeelUOwn command")?;
-        let status_line = read_line(&mut stream).context("read FeelUOwn ACK")?;
-        let (ok, body_len) = parse_ack(&status_line)?;
-        let mut body = vec![0_u8; body_len];
-        stream.read_exact(&mut body).context("read FeelUOwn body")?;
-        let body = String::from_utf8_lossy(&body).to_string();
-        if ok {
-            Ok(body)
-        } else if body.trim().is_empty() {
-            bail!(status_line)
-        } else {
-            bail!(body)
-        }
+        Ok(())
     }
 
     pub fn play_uri(&self, uri: &str) -> Result<String> {

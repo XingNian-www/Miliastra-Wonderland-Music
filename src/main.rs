@@ -1695,11 +1695,28 @@ mod app {
                 return self.execute_invite(username);
             }
             match self.wait_for_invite_decision()? {
-                Some(true) | None => self.execute_invite(username),
+                Some(true) => {
+                    self.notify_friend_invite_decision(username, "已同意加入大厅,请注意启动麦克风");
+                    self.execute_invite(username)
+                }
+                None => {
+                    self.notify_friend_invite_decision(
+                        username,
+                        "已默认同意加入大厅,请注意启动麦克风",
+                    );
+                    self.execute_invite(username)
+                }
                 Some(false) => {
                     log::info!("收到邀请拒绝，取消邀请");
+                    self.notify_friend_invite_decision(username, "大厅成员已拒绝邀请");
                     Ok(false)
                 }
+            }
+        }
+
+        fn notify_friend_invite_decision(&self, username: &str, message: &str) {
+            if let Err(error) = self.send_friend_message(username, message) {
+                log::error!("好友邀请确认回复失败: {error:#}");
             }
         }
 
@@ -1847,7 +1864,6 @@ mod app {
             Ok(true)
         }
 
-        #[allow(dead_code)]
         fn send_friend_message(&self, username: &str, message: &str) -> Result<bool> {
             log::info!("好友发言: {} -> {}", username, message);
             let canvas = Canvas {

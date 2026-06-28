@@ -2009,7 +2009,7 @@ mod app {
         }
 
         fn send_help(&self) -> Result<()> {
-            self.chat_output.send_batch_paste(
+            self.chat_output.send_batch(
                 &[
                     "点歌示例: @点歌 歌名 歌手 伴奏,输入伴奏时优先匹配伴奏",
                 "命令以@开头: 暂停、继续、播放、下一首、上一首、状态、歌词、帮助、队列、音量1-100",

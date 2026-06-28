@@ -45,11 +45,7 @@ impl ChatOutput {
         self.send_with_input(&message)
     }
 
-    pub fn send_batch_paste(&self, messages: &[&str], delay_ms: u64) -> Result<()> {
-        self.send_batch_inner(messages, delay_ms, InputMode::Paste)
-    }
-
-    fn send_batch_inner(&self, messages: &[&str], delay_ms: u64, mode: InputMode) -> Result<()> {
+    pub fn send_batch(&self, messages: &[&str], delay_ms: u64) -> Result<()> {
         if messages.is_empty() {
             return Ok(());
         }
@@ -67,19 +63,14 @@ impl ChatOutput {
             log::info!("游戏内回复发送已关闭，仅记录日志");
             return Ok(());
         }
-        self.send_batch_with_input(&messages, delay_ms, mode)
+        self.send_batch_with_input(&messages, delay_ms)
     }
 
     fn send_with_input(&self, message: &str) -> Result<()> {
-        self.send_batch_with_input(&[message.to_string()], 0, InputMode::Type)
+        self.send_batch_with_input(&[message.to_string()], 0)
     }
 
-    fn send_batch_with_input(
-        &self,
-        messages: &[String],
-        delay_ms: u64,
-        mode: InputMode,
-    ) -> Result<()> {
+    fn send_batch_with_input(&self, messages: &[String], delay_ms: u64) -> Result<()> {
         let mut enigo = Enigo::new(&Settings::default()).context("create enigo")?;
         let mut window = GameWindow::find(&self.window)?;
         window.focus_for_keyboard(&mut enigo)?;
@@ -101,10 +92,7 @@ impl ChatOutput {
             window.click(&mut enigo, self.config.chat_click_2)?;
             sleep_ms(self.timing.output_open_chat_ms);
 
-            match mode {
-                InputMode::Type => enigo.text(message).context("input message text")?,
-                InputMode::Paste => paste_message(&mut enigo, message)?,
-            }
+            input_message(&mut enigo, message)?;
             sleep_ms(self.timing.output_input_ms);
             enigo
                 .key(Key::Return, Direction::Click)
@@ -116,10 +104,12 @@ impl ChatOutput {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-enum InputMode {
-    Type,
-    Paste,
+fn input_message(enigo: &mut Enigo, message: &str) -> Result<()> {
+    if let Err(error) = paste_message(enigo, message) {
+        log::error!("粘贴输入失败，回退到文字输入: {error:#}");
+        enigo.text(message).context("input message text")?;
+    }
+    Ok(())
 }
 
 fn paste_message(enigo: &mut Enigo, message: &str) -> Result<()> {

@@ -106,7 +106,7 @@ fn run_panel_response_benchmark(config_path: &Path) -> Result<()> {
     let mut enigo = Enigo::new(&Settings::default()).context("create enigo")?;
     let mut game_window = window::GameWindow::find(&config.window)?;
     game_window.focus_for_keyboard(&mut enigo)?;
-    sleep(Duration::from_millis(config.output.focus_delay_ms));
+    sleep(Duration::from_millis(config.timing.output_focus_ms));
 
     let mut open_times = Vec::new();
     let mut close_times = Vec::new();
@@ -295,7 +295,7 @@ fn run_chat_change_monitor(config_path: &Path) -> Result<()> {
     let config = AppConfig::load_or_create(config_path)?;
     let canvas = default_canvas(&config);
     let interval_ms = prompt_optional_u64("采样间隔毫秒，留空使用配置")?
-        .unwrap_or(config.ocr.change_poll_interval_ms);
+        .unwrap_or(config.timing.scan_loop_idle_ms);
     let mean_threshold = prompt_optional_f32("平均像素差阈值，留空使用配置")?
         .unwrap_or(config.ocr.change_mean_threshold);
     let ratio_threshold = prompt_optional_f32("变化像素比例阈值，留空使用配置")?
@@ -591,7 +591,7 @@ fn run_send_chat(config_path: &Path) -> Result<()> {
         return Ok(());
     }
     if prompt_yes_no("确认发送聊天？", true)? {
-        ChatOutput::new(&config.output, &config.window).send(&message)?;
+        ChatOutput::new(&config.output, &config.timing, &config.window).send(&message)?;
     }
     Ok(())
 }

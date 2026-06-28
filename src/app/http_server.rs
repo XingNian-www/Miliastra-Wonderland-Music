@@ -122,24 +122,31 @@ impl Drop for ActiveConnectionGuard {
 }
 
 fn handle_connection(mut stream: TcpStream, state: HttpSharedState) {
-    let response =
-        match read_request(&mut stream).and_then(|request| handle_request(request, &state)) {
-            Ok(response) => response,
-            Err(error) => http_response(
-                error.status,
-                "text/plain; charset=utf-8",
-                &format!("错误: {}", error.message),
-                default_cors_headers(&state.config.http.host, state.config.http.port),
-            ),
-        };
+    let response = match read_request(
+        &mut stream,
+        state.config.timing.http_request_read_timeout_ms,
+    )
+    .and_then(|request| handle_request(request, &state))
+    {
+        Ok(response) => response,
+        Err(error) => http_response(
+            error.status,
+            "text/plain; charset=utf-8",
+            &format!("错误: {}", error.message),
+            default_cors_headers(&state.config.http.host, state.config.http.port),
+        ),
+    };
     let _ = stream.write_all(response.as_bytes());
     let _ = stream.flush();
     let _ = stream.shutdown(Shutdown::Both);
 }
 
-fn read_request(stream: &mut TcpStream) -> std::result::Result<Request, AppError> {
+fn read_request(
+    stream: &mut TcpStream,
+    read_timeout_ms: u64,
+) -> std::result::Result<Request, AppError> {
     stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
+        .set_read_timeout(Some(Duration::from_millis(read_timeout_ms)))
         .map_err(internal_error)?;
     let mut buffer = Vec::new();
     let mut chunk = [0_u8; 2048];
@@ -261,7 +268,7 @@ fn route(
     query: &[(String, String)],
     state: &HttpSharedState,
 ) -> std::result::Result<String, AppError> {
-    let client = FeelUOwnClient::new(&state.config.feeluown);
+    let client = FeelUOwnClient::new(&state.config.feeluown, &state.config.timing);
     match path {
         "/status" => {
             serde_json::to_string(&client.status().map_err(internal_error)?).map_err(internal_error)
@@ -345,7 +352,10 @@ fn route(
         "/queue/clear" => queue_clear(state),
         "/state" => state_json(state),
         "/state/save" => state_save(query, state),
-        "/admin-status" => admin_status_json(state.config.window.active_check_timeout_ms),
+        "/admin-status" => admin_status_json(
+            state.config.timing.active_check_timeout_ms,
+            state.config.timing.external_process_poll_ms,
+        ),
         "/restart-admin" => Ok(json!({
             "ok": false,
             "supported": true,
@@ -353,24 +363,27 @@ fn route(
         })
         .to_string()),
         "/active-window" => active_window_json(query, state),
-        "/ai/recognize" => {
-            ai::recognize_with_query(&state.config.ai, query).map_err(|error| AppError {
+        "/ai/recognize" => ai::recognize_with_query(&state.config.ai, &state.config.timing, query)
+            .map_err(|error| AppError {
                 status: if is_client_error(&error.to_string()) {
                     400
                 } else {
                     500
                 },
                 message: error.to_string(),
+            }),
+        "/ai/match" => {
+            ai::match_with_query(&state.config.ai, &state.config.timing, query).map_err(|error| {
+                AppError {
+                    status: if is_client_error(&error.to_string()) {
+                        400
+                    } else {
+                        500
+                    },
+                    message: error.to_string(),
+                }
             })
         }
-        "/ai/match" => ai::match_with_query(&state.config.ai, query).map_err(|error| AppError {
-            status: if is_client_error(&error.to_string()) {
-                400
-            } else {
-                500
-            },
-            message: error.to_string(),
-        }),
         "/notify" => {
             let title = query_value(query, "title").unwrap_or("点歌命令待处理");
             let message = query_value(query, "message").unwrap_or("");
@@ -514,7 +527,9 @@ fn active_window_json(
     active_window_status(
         target,
         auto_activate,
-        state.config.window.active_check_timeout_ms,
+        state.config.timing.active_check_timeout_ms,
+        state.config.timing.active_after_activate_ms,
+        state.config.timing.external_process_poll_ms,
     )
     .map_err(internal_error)
 }
@@ -806,7 +821,13 @@ fn current_time_text() -> String {
     seconds.to_string()
 }
 
-fn active_window_status(target: &str, auto_activate: bool, timeout_ms: u64) -> Result<String> {
+fn active_window_status(
+    target: &str,
+    auto_activate: bool,
+    timeout_ms: u64,
+    after_activate_ms: u64,
+    poll_ms: u64,
+) -> Result<String> {
     if target.trim().is_empty() {
         return Ok(json!({
             "supported": true,
@@ -816,7 +837,12 @@ fn active_window_status(target: &str, auto_activate: bool, timeout_ms: u64) -> R
         })
         .to_string());
     }
-    let payload = json!({ "target": target, "autoActivate": auto_activate }).to_string();
+    let payload = json!({
+        "target": target,
+        "autoActivate": auto_activate,
+        "afterActivateMs": after_activate_ms,
+    })
+    .to_string();
     let script = r#"
 Add-Type @"
 using System;
@@ -873,6 +899,7 @@ public struct HARDWAREINPUT {
 $inputData = [Console]::In.ReadToEnd() | ConvertFrom-Json
 $target = [string]$inputData.target
 $autoActivate = [bool]$inputData.autoActivate
+$afterActivateMs = [int]$inputData.afterActivateMs
 $handle = [Win32Window]::GetForegroundWindow()
 $builder = New-Object System.Text.StringBuilder 512
 [void][Win32Window]::GetWindowText($handle, $builder, $builder.Capacity)
@@ -900,7 +927,7 @@ if (-not $active -and $autoActivate -and $targetProcess) {
   $inputs[1].u.ki.dwFlags = 0x0002
   $sendInputAltResult = [Win32Window]::SendInput(2, $inputs, [Runtime.InteropServices.Marshal]::SizeOf([type]'INPUT'))
   $setForegroundResult = [Win32Window]::SetForegroundWindow($targetHandle)
-  Start-Sleep -Milliseconds 200
+  Start-Sleep -Milliseconds $afterActivateMs
   $handle = [Win32Window]::GetForegroundWindow()
   $builder = New-Object System.Text.StringBuilder 512
   [void][Win32Window]::GetWindowText($handle, $builder, $builder.Capacity)
@@ -915,7 +942,7 @@ if (-not $active -and $autoActivate -and $targetProcess) {
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 [pscustomobject]@{ supported = $true; enabled = $true; active = $active; activated = $activated; showWindow = $showWindowResult; sendInputAlt = $sendInputAltResult; setForeground = $setForegroundResult; autoClick = $false; title = $title; process = $processName; processId = [int]$processId; target = $target; targetProcess = $targetProcessName; targetProcessId = $targetProcessId } | ConvertTo-Json -Compress
 "#;
-    let output = run_powershell(script, &payload, Duration::from_millis(timeout_ms))?;
+    let output = run_powershell(script, &payload, Duration::from_millis(timeout_ms), poll_ms)?;
     Ok(json_object_output(&output).unwrap_or_else(|| {
         json!({
             "supported": false,
@@ -927,14 +954,14 @@ if (-not $active -and $autoActivate -and $targetProcess) {
     }))
 }
 
-fn admin_status_json(timeout_ms: u64) -> std::result::Result<String, AppError> {
+fn admin_status_json(timeout_ms: u64, poll_ms: u64) -> std::result::Result<String, AppError> {
     let script = r#"
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = New-Object Security.Principal.WindowsPrincipal($identity)
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 [pscustomobject]@{ supported = $true; isAdmin = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator); user = $identity.Name } | ConvertTo-Json -Compress
 "#;
-    match run_powershell(script, "", Duration::from_millis(timeout_ms)) {
+    match run_powershell(script, "", Duration::from_millis(timeout_ms), poll_ms) {
         Ok(output) if output.trim().is_empty() => Ok("{}".to_string()),
         Ok(output) => Ok(json_object_output(&output).unwrap_or_else(|| {
             json!({
@@ -953,7 +980,7 @@ $principal = New-Object Security.Principal.WindowsPrincipal($identity)
     }
 }
 
-fn run_powershell(script: &str, input: &str, timeout: Duration) -> Result<String> {
+fn run_powershell(script: &str, input: &str, timeout: Duration, poll_ms: u64) -> Result<String> {
     let mut child = Command::new("powershell.exe")
         .args([
             "-NoProfile",
@@ -993,7 +1020,7 @@ fn run_powershell(script: &str, input: &str, timeout: Duration) -> Result<String
                     let _ = child.wait();
                     bail!("PowerShell执行超时");
                 }
-                thread::sleep(Duration::from_millis(50));
+                thread::sleep(Duration::from_millis(poll_ms));
             }
             Err(error) => return Err(error).context("PowerShell执行失败"),
         }

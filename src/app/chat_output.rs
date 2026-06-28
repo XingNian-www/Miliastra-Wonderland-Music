@@ -4,7 +4,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use enigo::{Direction, Enigo, Key, Keyboard, Settings};
 
-use super::config::{OutputConfig, WindowConfig};
+use super::config::{OutputConfig, TimingConfig, WindowConfig};
 use super::notification;
 use super::window::GameWindow;
 
@@ -16,15 +16,17 @@ pub struct ChatOutput {
     enabled: bool,
     notify: bool,
     config: OutputConfig,
+    timing: TimingConfig,
     window: WindowConfig,
 }
 
 impl ChatOutput {
-    pub fn new(config: &OutputConfig, window: &WindowConfig) -> Self {
+    pub fn new(config: &OutputConfig, timing: &TimingConfig, window: &WindowConfig) -> Self {
         Self {
             enabled: config.send_enabled,
             notify: config.notify,
             config: config.clone(),
+            timing: timing.clone(),
             window: window.clone(),
         }
     }
@@ -71,30 +73,30 @@ impl ChatOutput {
         let mut enigo = Enigo::new(&Settings::default()).context("create enigo")?;
         let mut window = GameWindow::find(&self.window)?;
         window.focus_for_keyboard(&mut enigo)?;
-        sleep_ms(self.config.focus_delay_ms);
+        sleep_ms(self.timing.output_focus_ms);
 
         window.click(&mut enigo, self.config.focus_point)?;
-        sleep_ms(self.config.focus_delay_ms);
+        sleep_ms(self.timing.output_focus_ms);
         enigo
             .key(Key::Return, Direction::Click)
             .context("open chat")?;
-        sleep_ms(self.config.open_chat_delay_ms);
+        sleep_ms(self.timing.output_open_chat_ms);
 
         for (index, message) in messages.iter().enumerate() {
             if index > 0 && delay_ms > 0 {
                 sleep_ms(delay_ms);
             }
             window.click(&mut enigo, self.config.chat_click_1)?;
-            sleep_ms(self.config.click_delay_ms);
+            sleep_ms(self.timing.output_click_ms);
             window.click(&mut enigo, self.config.chat_click_2)?;
-            sleep_ms(self.config.open_chat_delay_ms);
+            sleep_ms(self.timing.output_open_chat_ms);
 
             enigo.text(message).context("input message text")?;
-            sleep_ms(self.config.input_delay_ms);
+            sleep_ms(self.timing.output_input_ms);
             enigo
                 .key(Key::Return, Direction::Click)
                 .context("send message")?;
-            sleep_ms(self.config.send_delay_ms);
+            sleep_ms(self.timing.output_send_ms);
         }
         window.click(&mut enigo, self.config.focus_point)?;
         Ok(())

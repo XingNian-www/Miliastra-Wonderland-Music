@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 pub struct AppConfig {
     pub window: WindowConfig,
     pub screen: ScreenConfig,
+    pub timing: TimingConfig,
     pub ocr: OcrConfig,
     pub templates: TemplateConfig,
     pub output: OutputConfig,
@@ -28,6 +29,7 @@ impl Default for AppConfig {
         Self {
             window: WindowConfig::default(),
             screen: ScreenConfig::default(),
+            timing: TimingConfig::default(),
             ocr: OcrConfig::default(),
             templates: TemplateConfig::default(),
             output: OutputConfig::default(),
@@ -51,7 +53,6 @@ pub struct WindowConfig {
     pub content_width: u32,
     pub content_height: u32,
     pub auto_activate_window: bool,
-    pub active_check_timeout_ms: u64,
 }
 
 impl Default for WindowConfig {
@@ -61,7 +62,6 @@ impl Default for WindowConfig {
             content_width: 1920,
             content_height: 1080,
             auto_activate_window: false,
-            active_check_timeout_ms: 2000,
         }
     }
 }
@@ -104,8 +104,6 @@ window:
   content_height: 1080
   # /active-window 或输入保护是否尝试自动切回目标窗口
   auto_activate_window: false
-  # 活动窗口检测 PowerShell 超时，单位毫秒
-  active_check_timeout_ms: 2000
 
 screen:
   # 截图会缩放到这个宽度后再做模板匹配和 OCR
@@ -145,6 +143,78 @@ screen:
     width: 110
     height: 40
 
+timing:
+  # 1. 监听子进程异常退出后的重启等待时间，单位毫秒
+  watchdog_restart_ms: 2000
+  # 2. 监听主循环空转间隔；脚本暂停或每轮扫描结束后等待多久再继续，单位毫秒
+  scan_loop_idle_ms: 60
+  # 3. 聊天 OCR 兜底扫描间隔；画面没变化时按这个间隔强制扫描一次，单位毫秒
+  chat_scan_fallback_ms: 2000
+  # 4. 聊天变化后等待画面稳定再 OCR 的时间，单位毫秒
+  chat_change_debounce_ms: 120
+  # 5. 两次变化触发 OCR 之间的最小间隔，单位毫秒
+  chat_change_cooldown_ms: 250
+  # 6. 执行命令前等待回到一级界面的最长时间，单位毫秒
+  command_ui_timeout_ms: 15000
+  # 7. 返回一级界面时每次 ESC 后等待重新检测的时间，单位毫秒
+  return_to_primary_retry_ms: 400
+  # 8. 聚焦游戏窗口后的等待时间，单位毫秒
+  output_focus_ms: 300
+  # 9. 按回车打开聊天输入后的等待时间，单位毫秒
+  output_open_chat_ms: 300
+  # 10. 两次聊天输入点击之间的等待时间，单位毫秒
+  output_click_ms: 150
+  # 11. 输入文本后到发送前的等待时间，单位毫秒
+  output_input_ms: 250
+  # 12. 发送聊天后等待界面稳定的时间，单位毫秒
+  output_send_ms: 300
+  # 13. 命令执行后等待聊天列表/动画稳定再复扫的时间，单位毫秒
+  post_command_settle_ms: 500
+  # 14. @帮助 多条消息之间的间隔，单位毫秒
+  help_batch_ms: 500
+  # 15. 进入/退出大厅页面后等待页面稳定的时间，单位毫秒
+  hall_page_settle_ms: 800
+  # 16. 大厅信息多次 OCR 采样之间的间隔，单位毫秒
+  hall_ocr_sample_interval_ms: 120
+  # 17. 邀请流程打开好友/聊天面板前后的固定等待，单位毫秒
+  invite_open_chat_ms: 400
+  # 18. 邀请流程每一步点击后的等待时间，单位毫秒
+  invite_step_ms: 800
+  # 19. 非公共大厅邀请时等待 @邀请确认/@邀请拒绝 的最长时间，单位毫秒
+  invite_confirm_timeout_ms: 30000
+  # 20. 邀请确认扫描间隔，单位毫秒
+  invite_confirm_poll_ms: 2000
+  # 21. 点歌搜索发起后等待播放器切歌的时间，单位毫秒
+  play_search_settle_ms: 2000
+  # 22. 点歌后查询播放状态的间隔，单位毫秒
+  play_status_poll_ms: 1000
+  # 23. 点歌后最多查询播放状态次数
+  play_status_retries: 15
+  # 24. 下一首/上一首后首次查询播放器状态前的等待时间，单位毫秒
+  skip_status_initial_ms: 500
+  # 25. 下一首/上一首后轮询播放器状态的间隔，单位毫秒
+  skip_status_poll_ms: 300
+  # 26. 下一首/上一首后最多查询播放状态次数
+  skip_status_retries: 5
+  # 27. 匹配失败/AI 自动匹配后等待用户确认的最长时间，单位毫秒
+  decision_timeout_ms: 20000
+  # 28. 匹配失败/AI 自动匹配期间扫描确认命令的间隔，单位毫秒
+  decision_poll_ms: 2000
+  # 29. FeelUOwn TCP RPC 读写超时，单位毫秒
+  feeluown_rpc_timeout_ms: 10000
+  # 30. 调整音量时每个平滑步进之间的等待时间，单位毫秒
+  volume_smooth_step_ms: 300
+  # 31. HTTP 读取单个请求头的超时，单位毫秒
+  http_request_read_timeout_ms: 5000
+  # 32. /active-window 和 /admin-status PowerShell 检测超时，单位毫秒
+  active_check_timeout_ms: 2000
+  # 33. 自动激活游戏窗口后等待前台窗口切换完成的时间，单位毫秒
+  active_after_activate_ms: 200
+  # 34. AI 请求 PowerShell 进程超时，单位毫秒
+  ai_request_timeout_ms: 35000
+  # 35. 外部 PowerShell 进程轮询间隔，单位毫秒
+  external_process_poll_ms: 50
+
 ocr:
   # PaddleOCR 检测模型路径
   det_model: models/PP-OCRv6_small_det.mnn
@@ -169,16 +239,6 @@ ocr:
   det_min_area: 9
   # OCR 库额外裁剪边框；BetterGI 主要依赖 unclip 外扩，这里关闭额外扩边
   det_box_border: 0
-  # OCR 兜底扫描间隔，单位毫秒；画面没变化时按这个间隔强制扫描一次
-  poll_interval_ms: 2000
-  # 一级界面下的画面变化检测间隔，单位毫秒；只做轻量图像 diff，不跑 OCR
-  change_poll_interval_ms: 60
-  # 检测到画面变化后等待稳定的时间，单位毫秒
-  change_debounce_ms: 120
-  # 两次变化触发 OCR 之间的最小间隔，单位毫秒
-  change_cooldown_ms: 250
-  # 命令执行后等待聊天列表/动画稳定的时间，单位毫秒
-  post_command_settle_ms: 500
   # 聊天区缩略图平均像素差超过该值时认为画面有变化
   change_mean_threshold: 6.0
   # 聊天区缩略图变化像素比例超过该值时认为画面有变化
@@ -241,26 +301,12 @@ output:
   chat_click_2:
     x: 600
     y: 1013
-  # 执行命令前等待回到一级界面的最长时间，单位毫秒
-  paste_timeout_ms: 15000
-  # 聚焦游戏后的等待时间，单位毫秒
-  focus_delay_ms: 300
-  # 打开聊天窗口后的等待时间，单位毫秒
-  open_chat_delay_ms: 300
-  # 两次鼠标点击之间的等待时间，单位毫秒
-  click_delay_ms: 150
-  # 输入文本后到发送前的等待时间，单位毫秒
-  input_delay_ms: 250
-  # 发送聊天后等待界面稳定的时间，单位毫秒
-  send_delay_ms: 300
 
 feeluown:
   # FeelUOwn TCP RPC 地址
   host: 127.0.0.1
   # FeelUOwn TCP RPC 端口
   port: 23333
-  # FeelUOwn 请求超时，单位毫秒
-  timeout_ms: 10000
 
 http:
   # 预留 Web/API 面板监听地址
@@ -357,10 +403,6 @@ invite:
     y: 700
     width: 500
     height: 100
-  # 邀请流程每一步点击后的等待时间，单位毫秒
-  step_delay_ms: 800
-  # 非公共大厅邀请时等待 @邀请确认/@邀请拒绝 的时间，单位毫秒
-  confirm_timeout_ms: 30000
 "#
 }
 
@@ -439,6 +481,88 @@ impl Default for ScreenConfig {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
+pub struct TimingConfig {
+    pub watchdog_restart_ms: u64,
+    pub scan_loop_idle_ms: u64,
+    pub chat_scan_fallback_ms: u64,
+    pub chat_change_debounce_ms: u64,
+    pub chat_change_cooldown_ms: u64,
+    pub command_ui_timeout_ms: u64,
+    pub return_to_primary_retry_ms: u64,
+    pub output_focus_ms: u64,
+    pub output_open_chat_ms: u64,
+    pub output_click_ms: u64,
+    pub output_input_ms: u64,
+    pub output_send_ms: u64,
+    pub post_command_settle_ms: u64,
+    pub help_batch_ms: u64,
+    pub hall_page_settle_ms: u64,
+    pub hall_ocr_sample_interval_ms: u64,
+    pub invite_open_chat_ms: u64,
+    pub invite_step_ms: u64,
+    pub invite_confirm_timeout_ms: u64,
+    pub invite_confirm_poll_ms: u64,
+    pub play_search_settle_ms: u64,
+    pub play_status_poll_ms: u64,
+    pub play_status_retries: u32,
+    pub skip_status_initial_ms: u64,
+    pub skip_status_poll_ms: u64,
+    pub skip_status_retries: u32,
+    pub decision_timeout_ms: u64,
+    pub decision_poll_ms: u64,
+    pub feeluown_rpc_timeout_ms: u64,
+    pub volume_smooth_step_ms: u64,
+    pub http_request_read_timeout_ms: u64,
+    pub active_check_timeout_ms: u64,
+    pub active_after_activate_ms: u64,
+    pub ai_request_timeout_ms: u64,
+    pub external_process_poll_ms: u64,
+}
+
+impl Default for TimingConfig {
+    fn default() -> Self {
+        Self {
+            watchdog_restart_ms: 2000,
+            scan_loop_idle_ms: 60,
+            chat_scan_fallback_ms: 2000,
+            chat_change_debounce_ms: 120,
+            chat_change_cooldown_ms: 250,
+            command_ui_timeout_ms: 15000,
+            return_to_primary_retry_ms: 400,
+            output_focus_ms: 300,
+            output_open_chat_ms: 300,
+            output_click_ms: 150,
+            output_input_ms: 250,
+            output_send_ms: 300,
+            post_command_settle_ms: 500,
+            help_batch_ms: 500,
+            hall_page_settle_ms: 800,
+            hall_ocr_sample_interval_ms: 120,
+            invite_open_chat_ms: 400,
+            invite_step_ms: 800,
+            invite_confirm_timeout_ms: 30000,
+            invite_confirm_poll_ms: 2000,
+            play_search_settle_ms: 2000,
+            play_status_poll_ms: 1000,
+            play_status_retries: 15,
+            skip_status_initial_ms: 500,
+            skip_status_poll_ms: 300,
+            skip_status_retries: 5,
+            decision_timeout_ms: 20000,
+            decision_poll_ms: 2000,
+            feeluown_rpc_timeout_ms: 10000,
+            volume_smooth_step_ms: 300,
+            http_request_read_timeout_ms: 5000,
+            active_check_timeout_ms: 2000,
+            active_after_activate_ms: 200,
+            ai_request_timeout_ms: 35000,
+            external_process_poll_ms: 50,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct OcrConfig {
     pub det_model: PathBuf,
     pub rec_model: PathBuf,
@@ -451,11 +575,6 @@ pub struct OcrConfig {
     pub det_unclip_ratio: f32,
     pub det_min_area: u32,
     pub det_box_border: u32,
-    pub poll_interval_ms: u64,
-    pub change_poll_interval_ms: u64,
-    pub change_debounce_ms: u64,
-    pub change_cooldown_ms: u64,
-    pub post_command_settle_ms: u64,
     pub change_mean_threshold: f32,
     pub change_pixel_threshold: f32,
     pub text_left_gap: i32,
@@ -484,11 +603,6 @@ impl Default for OcrConfig {
             det_unclip_ratio: 2.0,
             det_min_area: 9,
             det_box_border: 0,
-            poll_interval_ms: 2000,
-            change_poll_interval_ms: 60,
-            change_debounce_ms: 120,
-            change_cooldown_ms: 250,
-            post_command_settle_ms: 500,
             change_mean_threshold: 6.0,
             change_pixel_threshold: 0.03,
             text_left_gap: 8,
@@ -543,12 +657,6 @@ pub struct OutputConfig {
     pub focus_point: PointConfig,
     pub chat_click_1: PointConfig,
     pub chat_click_2: PointConfig,
-    pub paste_timeout_ms: u64,
-    pub focus_delay_ms: u64,
-    pub open_chat_delay_ms: u64,
-    pub click_delay_ms: u64,
-    pub input_delay_ms: u64,
-    pub send_delay_ms: u64,
 }
 
 impl Default for OutputConfig {
@@ -559,12 +667,6 @@ impl Default for OutputConfig {
             focus_point: PointConfig::new(1919, 540),
             chat_click_1: PointConfig::new(120, 225),
             chat_click_2: PointConfig::new(600, 1013),
-            paste_timeout_ms: 15000,
-            focus_delay_ms: 300,
-            open_chat_delay_ms: 300,
-            click_delay_ms: 150,
-            input_delay_ms: 250,
-            send_delay_ms: 300,
         }
     }
 }
@@ -574,7 +676,6 @@ impl Default for OutputConfig {
 pub struct FeelUOwnConfig {
     pub host: String,
     pub port: u16,
-    pub timeout_ms: u64,
 }
 
 impl Default for FeelUOwnConfig {
@@ -582,7 +683,6 @@ impl Default for FeelUOwnConfig {
         Self {
             host: "127.0.0.1".to_string(),
             port: 23333,
-            timeout_ms: 10000,
         }
     }
 }
@@ -729,8 +829,6 @@ pub struct InviteConfig {
     pub view_star_region: RectConfig,
     pub goto_hall_region: RectConfig,
     pub enter_hall_region: RectConfig,
-    pub step_delay_ms: u64,
-    pub confirm_timeout_ms: u64,
 }
 
 impl Default for InviteConfig {
@@ -741,8 +839,6 @@ impl Default for InviteConfig {
             view_star_region: RectConfig::new(400, 80, 440, 860),
             goto_hall_region: RectConfig::new(700, 560, 500, 300),
             enter_hall_region: RectConfig::new(700, 700, 500, 100),
-            step_delay_ms: 800,
-            confirm_timeout_ms: 30000,
         }
     }
 }

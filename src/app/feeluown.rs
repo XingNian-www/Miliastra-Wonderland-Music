@@ -5,17 +5,17 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use super::config::FeelUOwnConfig;
+use super::config::{FeelUOwnConfig, TimingConfig};
 
 const VOLUME_CURVE_POWER: f64 = 0.5;
 const VOLUME_SMOOTH_STEPS: i64 = 8;
-const VOLUME_SMOOTH_DELAY_MS: u64 = 300;
 
 #[derive(Clone, Debug)]
 pub struct FeelUOwnClient {
     host: String,
     port: u16,
     timeout: Duration,
+    volume_smooth_step_ms: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -46,11 +46,12 @@ pub struct PlaySearchResult {
 }
 
 impl FeelUOwnClient {
-    pub fn new(config: &FeelUOwnConfig) -> Self {
+    pub fn new(config: &FeelUOwnConfig, timing: &TimingConfig) -> Self {
         Self {
             host: config.host.clone(),
             port: config.port,
-            timeout: Duration::from_millis(config.timeout_ms),
+            timeout: Duration::from_millis(timing.feeluown_rpc_timeout_ms),
+            volume_smooth_step_ms: timing.volume_smooth_step_ms,
         }
     }
 
@@ -129,7 +130,7 @@ impl FeelUOwnClient {
             bail!("volume 参数必须是 0-100");
         }
         let target = map_input_volume(volume.parse::<f64>().unwrap_or(0.0));
-        self.exec(&volume_smooth_script(target))
+        self.exec(&volume_smooth_script(target, self.volume_smooth_step_ms))
     }
 
     pub fn search(&self, keyword: &str, source: &str) -> Result<String> {
@@ -441,7 +442,7 @@ fn song_title(name: &str, singer: &str) -> String {
     }
 }
 
-fn volume_smooth_script(target: i64) -> String {
+fn volume_smooth_script(target: i64, step_ms: u64) -> String {
     format!(
         r#"import math, time
 
@@ -472,7 +473,7 @@ else:
 print('OK')"#,
         target = target,
         steps = VOLUME_SMOOTH_STEPS,
-        delay = VOLUME_SMOOTH_DELAY_MS as f64 / 1000.0
+        delay = step_ms as f64 / 1000.0
     )
 }
 

@@ -203,16 +203,16 @@ screen:
     height: 143
 ```
 
-Current OCR/change defaults:
+Current timing defaults:
 
 ```yaml
-ocr:
-  min_confidence: 0.9
-  poll_interval_ms: 2000
-  change_poll_interval_ms: 60
-  change_debounce_ms: 120
-  change_cooldown_ms: 250
+timing:
+  scan_loop_idle_ms: 60
+  chat_scan_fallback_ms: 2000
+  chat_change_debounce_ms: 120
+  chat_change_cooldown_ms: 250
   post_command_settle_ms: 500
+  command_ui_timeout_ms: 15000
 ```
 
 Game chat replies are capped at display width 80, roughly 40 full-width Chinese characters or 80 ASCII characters.

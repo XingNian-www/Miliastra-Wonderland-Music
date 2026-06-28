@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
-use super::config::AiConfig;
+use super::config::{AiConfig, TimingConfig};
 
 const MIMO_ENDPOINT: &str = "https://api.xiaomimimo.com/v1/chat/completions";
 const MIMO_MODEL: &str = "mimo-v2.5";
@@ -17,6 +17,7 @@ const DEEPSEEK_MODEL: &str = "deepseek-chat";
 #[derive(Clone)]
 pub struct AiClient {
     config: AiConfig,
+    timing: TimingConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -43,9 +44,10 @@ enum AiProvider {
 }
 
 impl AiClient {
-    pub fn new(config: &AiConfig) -> Self {
+    pub fn new(config: &AiConfig, timing: &TimingConfig) -> Self {
         Self {
             config: config.clone(),
+            timing: timing.clone(),
         }
     }
 
@@ -69,6 +71,7 @@ impl AiClient {
             &provider,
             &build_match_prompt(&request, &song_name, &song_singer),
             1024,
+            &self.timing,
         )?;
         let json_text = model_reply_json_object(&reply)?;
         validate_match_json(&json_text)?;
@@ -86,16 +89,24 @@ impl AiClient {
     }
 }
 
-pub fn recognize_with_query(config: &AiConfig, query: &[(String, String)]) -> Result<String> {
+pub fn recognize_with_query(
+    config: &AiConfig,
+    timing: &TimingConfig,
+    query: &[(String, String)],
+) -> Result<String> {
     let provider = resolve_provider_config(config, Some(query))?;
     let text = normalize_required(query_value(query, "text").unwrap_or(""), "text")?;
-    let reply = call_ai(&provider, &build_recognize_prompt(&text), 1024)?;
+    let reply = call_ai(&provider, &build_recognize_prompt(&text), 1024, timing)?;
     let json = model_reply_json_object(&reply)?;
     validate_recognize_json(&json)?;
     Ok(json)
 }
 
-pub fn match_with_query(config: &AiConfig, query: &[(String, String)]) -> Result<String> {
+pub fn match_with_query(
+    config: &AiConfig,
+    timing: &TimingConfig,
+    query: &[(String, String)],
+) -> Result<String> {
     let provider = resolve_provider_config(config, Some(query))?;
     let request = normalize_required(query_value(query, "request").unwrap_or(""), "request")?;
     let song_name = normalize_required(query_value(query, "songName").unwrap_or(""), "songName")?;
@@ -107,6 +118,7 @@ pub fn match_with_query(config: &AiConfig, query: &[(String, String)]) -> Result
         &provider,
         &build_match_prompt(&request, &song_name, &song_singer),
         1024,
+        timing,
     )?;
     let json = model_reply_json_object(&reply)?;
     validate_match_json(&json)?;
@@ -256,7 +268,12 @@ fn build_match_prompt(request: &str, song_name: &str, song_singer: &str) -> Stri
     .join("\n")
 }
 
-fn call_ai(config: &AiProviderConfig, prompt: &str, max_tokens: usize) -> Result<String> {
+fn call_ai(
+    config: &AiProviderConfig,
+    prompt: &str,
+    max_tokens: usize,
+    timing: &TimingConfig,
+) -> Result<String> {
     let body = json!({
         "model": config.model,
         "messages": [
@@ -271,10 +288,14 @@ fn call_ai(config: &AiProviderConfig, prompt: &str, max_tokens: usize) -> Result
         "thinking": { "type": "disabled" }
     })
     .to_string();
-    call_ai_powershell(config, &body)
+    call_ai_powershell(config, &body, timing)
 }
 
-fn call_ai_powershell(config: &AiProviderConfig, body: &str) -> Result<String> {
+fn call_ai_powershell(
+    config: &AiProviderConfig,
+    body: &str,
+    timing: &TimingConfig,
+) -> Result<String> {
     let auth_header = match config.provider {
         AiProvider::Mimo => "api-key",
         AiProvider::OpenAi | AiProvider::DeepSeek | AiProvider::Custom => "Authorization",
@@ -314,11 +335,16 @@ try {
   exit 1
 }
 "#;
-    run_powershell(script, &payload, Duration::from_secs(35))
-        .map_err(|error| anyhow::anyhow!("AI请求失败({:?}): {}", config.provider, error))
+    run_powershell(
+        script,
+        &payload,
+        Duration::from_millis(timing.ai_request_timeout_ms),
+        timing.external_process_poll_ms,
+    )
+    .map_err(|error| anyhow::anyhow!("AI请求失败({:?}): {}", config.provider, error))
 }
 
-fn run_powershell(script: &str, input: &str, timeout: Duration) -> Result<String> {
+fn run_powershell(script: &str, input: &str, timeout: Duration, poll_ms: u64) -> Result<String> {
     let mut child = Command::new("powershell.exe")
         .args([
             "-NoProfile",
@@ -358,7 +384,7 @@ fn run_powershell(script: &str, input: &str, timeout: Duration) -> Result<String
                     let _ = child.wait();
                     bail!("PowerShell执行超时");
                 }
-                std::thread::sleep(Duration::from_millis(50));
+                std::thread::sleep(Duration::from_millis(poll_ms));
             }
             Err(error) => return Err(error).context("PowerShell执行失败"),
         }

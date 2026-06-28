@@ -1525,6 +1525,7 @@ mod app {
                         log::info!("麦克风: 当前在公共大厅，跳过状态切换和通告");
                     } else {
                         self.reply(&format!("@{} 执行了 麦克风状态切换！", username))?;
+                        self.return_to_primary_from_transient_ui("麦克风");
                         press_key(Key::Unicode('n'), &self.config.window)?;
                     }
                 }
@@ -1541,13 +1542,7 @@ mod app {
 
             let result = self.read_hall_info();
 
-            log::info!("大厅检测: 按 ESC 返回一级界面");
-            if let Err(error) = press_key(Key::Escape, &self.config.window) {
-                log::error!("大厅检测返回失败: {error:#}");
-            }
-            sleep(Duration::from_millis(
-                self.config.timing.hall_page_settle_ms,
-            ));
+            self.return_to_primary_from_transient_ui("大厅检测");
 
             match result {
                 Ok(info) => {
@@ -1620,12 +1615,7 @@ mod app {
                 self.config.timing.hall_page_settle_ms,
             ));
             let result = self.read_hall_info();
-            if let Err(error) = press_key(Key::Escape, &self.config.window) {
-                log::error!("大厅检测返回失败: {error:#}");
-            }
-            sleep(Duration::from_millis(
-                self.config.timing.hall_page_settle_ms,
-            ));
+            self.return_to_primary_from_transient_ui("大厅时间");
 
             let info = match result {
                 Ok(info) => info,
@@ -1654,12 +1644,7 @@ mod app {
                 self.config.timing.hall_page_settle_ms,
             ));
             let result = self.read_hall_info();
-            if let Err(error) = press_key(Key::Escape, &self.config.window) {
-                log::error!("大厅检测返回失败: {error:#}");
-            }
-            sleep(Duration::from_millis(
-                self.config.timing.hall_page_settle_ms,
-            ));
+            self.return_to_primary_from_transient_ui("大厅检测");
             let info = match result {
                 Ok(info) => info,
                 Err(error) => {
@@ -1804,6 +1789,14 @@ mod app {
 
         fn execute_invite(&self, username: &str) -> Result<bool> {
             log::info!("开始邀请: {}", username);
+            let result = self.execute_invite_steps(username);
+            if result.is_err() {
+                self.return_to_primary_from_transient_ui("邀请失败");
+            }
+            result
+        }
+
+        fn execute_invite_steps(&self, username: &str) -> Result<bool> {
             let canvas = Canvas {
                 width: self.config.screen.expected_width,
                 height: self.config.screen.expected_height,
@@ -1822,7 +1815,7 @@ mod app {
             )?
             else {
                 log::error!("邀请失败: 确认列表未找到用户 {}", username);
-                self.return_to_primary_fixed();
+                self.return_to_primary_from_transient_ui("邀请失败");
                 return Ok(false);
             };
             click_game_point(PointConfig::new(point.x, point.y), &self.config.window)?;
@@ -1854,7 +1847,7 @@ mod app {
                 )?
                 else {
                     log::error!("邀请失败: 未找到{}按钮", label);
-                    self.return_to_primary_fixed();
+                    self.return_to_primary_from_transient_ui("邀请失败");
                     return Ok(false);
                 };
                 let center = hit.center();
@@ -1873,10 +1866,19 @@ mod app {
                 height: self.config.screen.expected_height,
                 resize: true,
             };
-            if !self.open_friend_chat(username, &canvas)? {
+            let opened = match self.open_friend_chat(username, &canvas) {
+                Ok(opened) => opened,
+                Err(error) => {
+                    self.return_to_primary_from_transient_ui("好友发言失败");
+                    return Err(error);
+                }
+            };
+            if !opened {
                 return Ok(false);
             }
-            self.chat_output.send_current_chat(message)?;
+            let result = self.chat_output.send_current_chat(message);
+            self.return_to_primary_from_transient_ui("好友发言");
+            result?;
             Ok(true)
         }
 
@@ -1898,7 +1900,7 @@ mod app {
             )?
             else {
                 log::error!("好友聊天失败: 好友列表未找到用户 {}", username);
-                self.return_to_primary_fixed();
+                self.return_to_primary_from_transient_ui("好友聊天失败");
                 return Ok(false);
             };
             click_game_point(PointConfig::new(point.x, point.y), &self.config.window)?;
@@ -1978,6 +1980,18 @@ mod app {
 
         fn return_to_primary_after_command_failure(&self, command: &str) {
             log::info!("命令失败后返回一级界面: {}", command);
+            self.return_to_primary_fixed();
+        }
+
+        fn return_to_primary_from_transient_ui(&self, context: &str) {
+            log::info!("{}: 先按 ESC 关闭临时界面", context);
+            if let Err(error) = press_key(Key::Escape, &self.config.window) {
+                log::error!("{}: 关闭临时界面失败: {error:#}", context);
+            } else {
+                sleep(Duration::from_millis(
+                    self.config.timing.return_to_primary_retry_ms,
+                ));
+            }
             self.return_to_primary_fixed();
         }
 

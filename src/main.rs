@@ -1710,6 +1710,7 @@ mod app {
                 Some(false) => {
                     log::info!("收到邀请拒绝，取消邀请");
                     self.notify_friend_invite_decision(username, "大厅成员已拒绝邀请");
+                    self.return_to_primary_fixed();
                     Ok(false)
                 }
             }

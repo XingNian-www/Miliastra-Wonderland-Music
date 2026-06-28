@@ -117,6 +117,7 @@ Friend-only pink message commands:
 ```text
 @邀请1
 @麦克风
+@麦克风关
 ```
 
 Queue commands:

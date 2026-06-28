@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context, Result};
 use serde_yaml::{Mapping, Value};
 
-pub const CURRENT_CONFIG_VERSION: u32 = 2;
+pub const CURRENT_CONFIG_VERSION: u32 = 3;
 
 const MOVED_FIELDS: &[(&str, &str)] = &[
     (
@@ -475,7 +475,7 @@ mod tests {
 
     const DEFAULT: &str = r#"# test config
 # version comment
-config_version: 2
+config_version: 3
 
 timing:
   # fallback comment
@@ -508,7 +508,7 @@ unknown_root:
             .expect("migration needed");
 
         assert!(report.text.contains("# fallback comment"));
-        assert!(report.text.contains("config_version: 2"));
+        assert!(report.text.contains("config_version: 3"));
         assert!(report.text.contains("chat_scan_fallback_ms: 1234"));
         assert!(report.text.contains("scan_loop_idle_ms: 77"));
         assert!(report.text.contains("output_focus_ms: 456"));
@@ -525,7 +525,7 @@ unknown_root:
 
     #[test]
     fn current_version_without_moved_fields_does_not_migrate() {
-        let current = r#"config_version: 2
+        let current = r#"config_version: 3
 timing:
   chat_scan_fallback_ms: 2000
   scan_loop_idle_ms: 60

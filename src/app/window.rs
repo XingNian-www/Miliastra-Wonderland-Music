@@ -185,7 +185,7 @@ pub fn capture_game(config: &WindowConfig) -> Result<DynamicImage> {
 }
 
 pub fn close_game(config: &WindowConfig) -> Result<()> {
-    let hwnd = GameWindow::find(config)?.hwnd;
+    let hwnd = find_window_by_process_for_close(&config.target_process)?;
     unsafe { PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) }
         .context("PostMessageW WM_CLOSE failed")
 }
@@ -286,17 +286,35 @@ fn capture_client_area(hwnd: HWND, width: i32, height: i32) -> Result<DynamicIma
 struct SearchState {
     target: String,
     found: Option<HWND>,
+    include_minimized: bool,
 }
 
 fn find_window_by_process(target_process: &str) -> Result<HWND> {
     let mut state = SearchState {
         target: normalize_process_name(target_process),
         found: None,
+        include_minimized: false,
     };
+    find_window_by_process_with_state(target_process, &mut state)
+}
+
+fn find_window_by_process_for_close(target_process: &str) -> Result<HWND> {
+    let mut state = SearchState {
+        target: normalize_process_name(target_process),
+        found: None,
+        include_minimized: true,
+    };
+    find_window_by_process_with_state(target_process, &mut state)
+}
+
+fn find_window_by_process_with_state(
+    target_process: &str,
+    state: &mut SearchState,
+) -> Result<HWND> {
     let enum_result = unsafe {
         EnumWindows(
             Some(enum_windows_proc),
-            LPARAM((&mut state as *mut SearchState) as isize),
+            LPARAM((state as *mut SearchState) as isize),
         )
     };
     if state.found.is_none() {
@@ -309,7 +327,9 @@ fn find_window_by_process(target_process: &str) -> Result<HWND> {
 
 unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
     let state = unsafe { &mut *(lparam.0 as *mut SearchState) };
-    if !unsafe { IsWindowVisible(hwnd).as_bool() } || unsafe { IsIconic(hwnd).as_bool() } {
+    if !unsafe { IsWindowVisible(hwnd).as_bool() }
+        || (!state.include_minimized && unsafe { IsIconic(hwnd).as_bool() })
+    {
         return true.into();
     }
 

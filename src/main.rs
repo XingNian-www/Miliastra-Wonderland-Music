@@ -978,6 +978,7 @@ mod app {
             log::info!("自动化扫描已启动");
             while self.running.load(AtomicOrdering::SeqCst) {
                 if self.paused.load(AtomicOrdering::SeqCst) {
+                    self.maybe_idle_exit()?;
                     sleep(Duration::from_millis(self.config.timing.scan_loop_idle_ms));
                     continue;
                 }

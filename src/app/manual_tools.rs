@@ -12,6 +12,8 @@ use super::config::{AppConfig, PointConfig};
 use super::ocr::{
     OcrArgs, OcrBackendProbeStatus, make_ocr_engine, probe_ocr_backend_support, recognize_lines,
 };
+use super::ai::AiClient;
+use super::feeluown::FeelUOwnClient;
 use super::{
     Canvas, FrameArgs, TemplateArgs, UiTemplateArgs, best_template_hit, click_game_point,
     crop_canvas, detect_ui_state, find_template_hits, load_frame, parse_key, parse_rect, press_key,
@@ -37,6 +39,7 @@ pub fn run(config_path: &Path) -> Result<()> {
         println!("9. OCR GPU 支持检测");
         println!("10. 监测聊天区变动");
         println!("11. 检测面板响应速度");
+        println!("12. AI点歌搜索测试");
         println!("0. 返回");
 
         match prompt("请选择")?.trim() {
@@ -51,6 +54,7 @@ pub fn run(config_path: &Path) -> Result<()> {
             "9" => run_ocr_gpu_probe(config_path)?,
             "10" => run_chat_change_monitor(config_path)?,
             "11" => run_panel_response_benchmark(config_path)?,
+            "12" => run_ai_search(config_path)?,
             "0" => return Ok(()),
             "" => continue,
             other => println!("未知选项: {}", other),
@@ -427,6 +431,60 @@ fn run_scan_chat(config_path: &Path) -> Result<()> {
     )?;
     println!("聊天区扫描耗时: {}ms", scan_started.elapsed().as_millis());
     print_chat_scan(&messages, config.screen.chat_rect);
+    Ok(())
+}
+
+fn run_ai_search(config_path: &Path) -> Result<()> {
+    let config = AppConfig::load_or_create(config_path)?;
+    let ai = AiClient::new(&config.ai, &config.timing);
+    if !ai.enabled() {
+        println!("AI点歌未启用，请先配置 ai.api_key");
+        return Ok(());
+    }
+    let keyword = prompt("输入搜索关键词")?;
+    if keyword.is_empty() {
+        println!("关键词不能为空");
+        return Ok(());
+    }
+    let prefer = prompt_yes_no("优先伴奏", false)?;
+    let feeluown = FeelUOwnClient::new(&config.feeluown, &config.timing);
+    println!("正在搜索 FeelUOwn 候选...");
+    let started = Instant::now();
+    match ai.search_and_pick(&feeluown, &keyword, prefer) {
+        Ok(result) => {
+            let elapsed = started.elapsed().as_millis();
+            println!("耗时: {}ms", elapsed);
+            println!();
+            println!("用户点歌: {}", result.request);
+            println!("候选数量: {}", result.candidates.len());
+            for (index, candidate) in result.candidates.iter().enumerate() {
+                println!(
+                    "  #{}: {} -> {}",
+                    index + 1,
+                    candidate.text,
+                    candidate.uri
+                );
+            }
+            println!();
+            if let Some(pick) = &result.pick {
+                let matched = result
+                    .candidates
+                    .iter()
+                    .find(|c| c.uri == pick.uri)
+                    .map(|c| c.text.as_str())
+                    .unwrap_or("?");
+                println!("AI 选择: {}", matched);
+                println!("  uri: {}", pick.uri);
+                println!("  score: {:.2}", pick.score);
+                println!("  reason: {}", pick.reason);
+            } else {
+                println!("AI 未选中任何候选（候选为空）");
+            }
+        }
+        Err(error) => {
+            println!("AI搜索失败: {error:#}");
+        }
+    }
     Ok(())
 }
 

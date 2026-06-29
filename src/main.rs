@@ -418,6 +418,7 @@ mod app {
         Confirm,
         Skip,
         SwitchSource,
+        Ai,
         Timeout,
         Stopped,
         PromptFailed,
@@ -1406,6 +1407,214 @@ mod app {
             }))
         }
 
+        fn resolve_and_confirm_song(
+            &mut self,
+            song: &command::SongCommand,
+        ) -> Result<Option<ResolvedSongRequest>> {
+            let Some(request) = self.resolve_song_request(song)? else {
+                return Ok(None);
+            };
+            if request.uri.is_empty() {
+                let source = if request.source.trim().is_empty() {
+                    "qqmusic"
+                } else {
+                    &request.source
+                };
+                let picked = match self
+                    .feeluown
+                    .search_and_pick(&request.keyword, source, request.prefer_accompaniment)
+                {
+                    Ok(Some(picked)) => picked,
+                    _ => {
+                        let actions = if self.ai.enabled() {
+                            "@换源@AI"
+                        } else {
+                            "@换源"
+                        };
+                        self.reply(&format!("平台无对应歌曲音源,{}", actions))?;
+                        let decision = self.wait_for_decision(true, self.ai.enabled(), true)?;
+                        match decision {
+                            UserDecision::SwitchSource => {
+                                let next_source = if source == "netease" {
+                                    "qqmusic"
+                                } else {
+                                    "netease"
+                                };
+                                return self.resolve_and_confirm_song_with_source(
+                                    song,
+                                    next_source,
+                                );
+                            }
+                            UserDecision::Ai if self.ai.enabled() => {
+                                return self.resolve_and_confirm_song_ai(song);
+                            }
+                            _ => return Ok(None),
+                        }
+                    }
+                };
+                let song_title = picked.0.text.clone();
+                let uri = picked.0.uri.clone();
+                let actions = if self.ai.enabled() {
+                    "@确认@跳过@换源@AI"
+                } else {
+                    "@确认@跳过@换源"
+                };
+                self.reply(&format!("搜索到:{},{}", song_title, actions))?;
+                let decision = self.wait_for_decision(true, self.ai.enabled(), true)?;
+                match decision {
+                    UserDecision::Confirm | UserDecision::Timeout => {
+                        return Ok(Some(ResolvedSongRequest {
+                            keyword: picked.0.text.clone(),
+                            source: source.to_string(),
+                            prefer_accompaniment: request.prefer_accompaniment,
+                            ai_original_text: String::new(),
+                            uri,
+                        }));
+                    }
+                    UserDecision::Skip => {
+                        return Ok(None);
+                    }
+                    UserDecision::SwitchSource => {
+                        let next_source = if source == "netease" {
+                            "qqmusic"
+                        } else {
+                            "netease"
+                        };
+                        return self.resolve_and_confirm_song_with_source(song, next_source);
+                    }
+                    UserDecision::Ai if self.ai.enabled() => {
+                        return self.resolve_and_confirm_song_ai(song);
+                    }
+                    _ => return Ok(None),
+                }
+            }
+            Ok(Some(request))
+        }
+
+        fn resolve_and_confirm_song_with_source(
+            &mut self,
+            song: &command::SongCommand,
+            source: &str,
+        ) -> Result<Option<ResolvedSongRequest>> {
+            let picked = match self
+                .feeluown
+                .search_and_pick(&song.keyword, source, song.prefer_accompaniment)
+            {
+                Ok(Some(picked)) => picked,
+                _ => {
+                    let actions = if self.ai.enabled() {
+                        "@换源@AI"
+                    } else {
+                        "@换源"
+                    };
+                    self.reply(&format!("换源后仍无音源,{}", actions))?;
+                    let decision = self.wait_for_decision(true, self.ai.enabled(), true)?;
+                    match decision {
+                        UserDecision::SwitchSource => {
+                            let next_source = if source == "netease" {
+                                "qqmusic"
+                            } else {
+                                "netease"
+                            };
+                            return self.resolve_and_confirm_song_with_source(song, next_source);
+                        }
+                        UserDecision::Ai if self.ai.enabled() => {
+                            return self.resolve_and_confirm_song_ai(song);
+                        }
+                        _ => return Ok(None),
+                    }
+                }
+            };
+            let actions = if self.ai.enabled() {
+                "@确认@跳过@换源@AI"
+            } else {
+                "@确认@跳过@换源"
+            };
+            self.reply(&format!(
+                "搜索到:{},{}",
+                picked.0.text, actions
+            ))?;
+            let decision = self.wait_for_decision(true, self.ai.enabled(), true)?;
+            match decision {
+                UserDecision::Confirm | UserDecision::Timeout => {
+                    Ok(Some(ResolvedSongRequest {
+                        keyword: picked.0.text.clone(),
+                        source: source.to_string(),
+                        prefer_accompaniment: song.prefer_accompaniment,
+                        ai_original_text: String::new(),
+                        uri: picked.0.uri.clone(),
+                    }))
+                }
+                UserDecision::Skip => Ok(None),
+                UserDecision::SwitchSource => {
+                    let next_source = if source == "netease" {
+                        "qqmusic"
+                    } else {
+                        "netease"
+                    };
+                    self.resolve_and_confirm_song_with_source(song, next_source)
+                }
+                UserDecision::Ai if self.ai.enabled() => {
+                    self.resolve_and_confirm_song_ai(song)
+                }
+                _ => Ok(None),
+            }
+        }
+
+        fn resolve_and_confirm_song_ai(
+            &mut self,
+            song: &command::SongCommand,
+        ) -> Result<Option<ResolvedSongRequest>> {
+            if !self.ai.enabled() {
+                self.reply("AI点歌未启用")?;
+                return Ok(None);
+            }
+            self.reply("AI匹配中")?;
+            let candidates = match self.feeluown.search_candidates(&song.keyword, "") {
+                Ok(candidates) => candidates,
+                Err(error) => {
+                    log::error!("AI点歌搜索候选失败: {error:#}");
+                    self.reply("平台无对应歌曲音源")?;
+                    return Ok(None);
+                }
+            };
+            if candidates.is_empty() {
+                self.reply("平台无对应歌曲音源")?;
+                return Ok(None);
+            }
+            let pick = match self
+                .ai
+                .pick_song_candidate(&song.keyword, song.prefer_accompaniment, &candidates)
+            {
+                Ok(pick) => pick,
+                Err(error) => {
+                    log::error!("AI点歌选择候选失败: {error:#}");
+                    self.reply("AI点歌识别失败")?;
+                    return Ok(None);
+                }
+            };
+            let Some(candidate) = candidates.iter().find(|c| c.uri == pick.uri) else {
+                log::error!("AI点歌返回未知候选: {}", pick.uri);
+                self.reply("AI点歌识别失败")?;
+                return Ok(None);
+            };
+            log::info!(
+                "AI点歌候选: raw={} pick={} uri={} score={:.2} reason={}",
+                song.keyword,
+                candidate.text,
+                candidate.uri,
+                pick.score,
+                pick.reason
+            );
+            Ok(Some(ResolvedSongRequest {
+                keyword: candidate.text.clone(),
+                source: String::new(),
+                prefer_accompaniment: song.prefer_accompaniment,
+                ai_original_text: song.keyword.clone(),
+                uri: candidate.uri.clone(),
+            }))
+        }
+
         fn queue_contains_request(&self, request: &ResolvedSongRequest) -> Result<bool> {
             let queue = self.queue()?;
             if !request.uri.is_empty() {
@@ -1436,7 +1645,7 @@ mod app {
         fn execute_command(&mut self, parsed: &ParsedCommand) -> Result<()> {
             match &parsed.command {
                 UserCommand::Song(song) => {
-                    let Some(request) = self.resolve_song_request(song)? else {
+                    let Some(request) = self.resolve_and_confirm_song(song)? else {
                         return Ok(());
                     };
                     if self.queue_contains_request(&request)? {
@@ -2459,6 +2668,7 @@ mod app {
                                 self.report_no_source(Some(&status), true)?;
                                 return Ok(PlayOutcome::NoSource);
                             }
+                            _ => {}
                         }
                     }
                 }
@@ -2541,13 +2751,13 @@ mod app {
             status: &PlayerStatus,
         ) -> Result<UserDecision> {
             let message = format!(
-                "换源结果: {}，@确认 @跳过(20s自动确认)",
+                "换源结果:{},@确认@跳过",
                 song_title(&status.name, &status.singer)
             );
             if self.reply(&message).is_err() {
                 return Ok(UserDecision::Timeout);
             }
-            self.wait_for_decision(false, true)
+            self.wait_for_decision(false, false, true)
         }
 
         fn clear_requested_song_state(&mut self) -> Result<()> {
@@ -2587,19 +2797,19 @@ mod app {
             allow_switch_source: bool,
         ) -> Result<UserDecision> {
             let actions = if allow_switch_source {
-                "@确认 @跳过 @换源"
+                "@确认@跳过@换源"
             } else {
-                "@确认 @跳过"
+                "@确认@跳过"
             };
             let message = format!(
-                "匹配失败: {}，{}",
+                "匹配失败:{},{}",
                 song_title(&status.name, &status.singer),
                 actions
             );
             if self.reply(&message).is_err() {
                 return Ok(UserDecision::PromptFailed);
             }
-            self.wait_for_decision(allow_switch_source, false)
+            self.wait_for_decision(allow_switch_source, false, false)
         }
 
         fn confirm_ai_auto_match(
@@ -2608,24 +2818,25 @@ mod app {
             allow_switch_source: bool,
         ) -> Result<UserDecision> {
             let actions = if allow_switch_source {
-                "@跳过 @换源"
+                "@跳过@换源"
             } else {
                 "@跳过"
             };
             let message = format!(
-                "AI自动匹配: {}，如非预期可{}(20s自动确认)",
+                "AI自动匹配:{},如非预期可{}",
                 song_title(&status.name, &status.singer),
                 actions
             );
             if self.reply(&message).is_err() {
                 return Ok(UserDecision::Timeout);
             }
-            self.wait_for_decision(allow_switch_source, true)
+            self.wait_for_decision(allow_switch_source, false, true)
         }
 
         fn wait_for_decision(
             &mut self,
             allow_switch_source: bool,
+            allow_ai: bool,
             timeout_confirms: bool,
         ) -> Result<UserDecision> {
             sleep(Duration::from_millis(
@@ -2675,6 +2886,9 @@ mod app {
                         Some(UserDecision::SwitchSource) if allow_switch_source => {
                             return Ok(UserDecision::SwitchSource);
                         }
+                        Some(UserDecision::Ai) if allow_ai => {
+                            return Ok(UserDecision::Ai);
+                        }
                         _ => {}
                     }
                 }
@@ -2685,9 +2899,9 @@ mod app {
                 Ok(UserDecision::Timeout)
             } else {
                 self.reply(if allow_switch_source {
-                    "此平台匹配失败,命令已超时(20s)下次可以尝试@确认 @跳过 @换源"
+                    "此平台匹配失败,命令已超时(20s)下次可以尝试@确认@跳过@换源"
                 } else {
-                    "此平台匹配失败,命令已超时(20s)下次可以尝试@确认 @跳过"
+                    "此平台匹配失败,命令已超时(20s)下次可以尝试@确认@跳过"
                 })?;
                 Ok(UserDecision::Timeout)
             }
@@ -2824,6 +3038,11 @@ mod app {
             .is_some_and(|rest| decision_boundary(rest.chars().next()))
         {
             Some(UserDecision::SwitchSource)
+        } else if command_text
+            .strip_prefix("@AI")
+            .is_some_and(|rest| decision_boundary(rest.chars().next()))
+        {
+            Some(UserDecision::Ai)
         } else {
             None
         }
@@ -2835,10 +3054,14 @@ mod app {
             "AI自动匹配",
             "换源结果",
             "换源到",
+            "换源后仍无音源",
             "下次可以尝试",
             "如非预期",
-            "20s自动确认",
             "命令已超时",
+            "搜索到:",
+            "AI匹配中",
+            "AI点歌未启用",
+            "AI点歌识别失败",
         ]
         .iter()
         .any(|pattern| text.contains(pattern))

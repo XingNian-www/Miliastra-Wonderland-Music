@@ -178,7 +178,7 @@ impl FeelUOwnClient {
         })
     }
 
-    fn search_and_pick(
+    pub fn search_and_pick(
         &self,
         keyword: &str,
         source: &str,

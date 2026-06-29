@@ -152,15 +152,22 @@ async fn axum_entry(
         );
     }
     let request = request_from_axum(method, uri, headers);
-    let response = match handle_request(request, &state) {
-        Ok(response) => response,
-        Err(error) => plain_response(
+    let fallback_host = state.config.http.host.clone();
+    let fallback_port = state.config.http.port;
+    let state_for_handler = Arc::clone(&state);
+    match tokio::task::spawn_blocking(move || handle_request(request, &state_for_handler)).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => plain_response(
             status_code(error.status),
             format!("错误: {}", error.message),
-            default_cors_headers(&state.config.http.host, state.config.http.port),
+            default_cors_headers(&fallback_host, fallback_port),
         ),
-    };
-    response
+        Err(error) => plain_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("错误: HTTP请求处理失败: {error}"),
+            default_cors_headers(&fallback_host, fallback_port),
+        ),
+    }
 }
 
 struct ActiveConnectionGuard {
@@ -749,7 +756,10 @@ fn sanitized_query(query: &[(String, String)]) -> HashMap<String, String> {
     query
         .iter()
         .map(|(key, value)| {
-            let value = if key.eq_ignore_ascii_case("apiKey") || key.eq_ignore_ascii_case("token") {
+            let value = if key.eq_ignore_ascii_case("apiKey")
+                || key.eq_ignore_ascii_case("api_key")
+                || key.eq_ignore_ascii_case("token")
+            {
                 "***".to_string()
             } else {
                 value.clone()

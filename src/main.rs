@@ -1630,15 +1630,16 @@ mod app {
             username: &str,
             target_mode: MicrophoneMode,
         ) -> Result<()> {
-            self.reply(&format!(
-                "@{} 麦克风状态设为{}！",
-                username,
-                target_mode.state_label()
-            ))?;
             self.return_to_primary_from_transient_ui("麦克风");
+            sleep(Duration::from_millis(500));
             let current_state = self.detect_microphone_state()?;
             if current_state.mode() == target_mode {
                 log::info!("麦克风: 当前已是{}，无需按 N", current_state.label());
+                self.reply(&format!(
+                    "@{} 麦克风状态设为{}！",
+                    username,
+                    target_mode.state_label()
+                ))?;
                 return Ok(());
             }
             log::info!(
@@ -1646,7 +1647,12 @@ mod app {
                 current_state.label(),
                 target_mode.label()
             );
-            press_key(Key::Unicode('n'), &self.config.window)
+            press_key(Key::Unicode('n'), &self.config.window)?;
+            self.reply(&format!(
+                "@{} 麦克风状态设为{}！",
+                username,
+                target_mode.state_label()
+            ))
         }
 
         fn detect_microphone_state(&self) -> Result<MicrophoneState> {

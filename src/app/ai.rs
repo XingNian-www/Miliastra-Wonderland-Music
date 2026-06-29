@@ -452,11 +452,11 @@ fn call_ai_http(config: &AiProviderConfig, body: &str, timing: &TimingConfig) ->
             "AI请求失败({:?}) status={}: {}",
             config.provider,
             status,
-            text
+            error_excerpt(&text)
         );
     }
-    let value: Value =
-        serde_json::from_str(&text).with_context(|| format!("解析AI响应失败: {text}"))?;
+    let value: Value = serde_json::from_str(&text)
+        .with_context(|| format!("解析AI响应失败: {}", error_excerpt(&text)))?;
     value
         .pointer("/choices/0/message/content")
         .and_then(Value::as_str)
@@ -464,6 +464,22 @@ fn call_ai_http(config: &AiProviderConfig, body: &str, timing: &TimingConfig) ->
         .filter(|text| !text.is_empty())
         .map(str::to_string)
         .ok_or_else(|| anyhow::anyhow!("AI响应缺少choices[0].message.content"))
+}
+
+fn error_excerpt(text: &str) -> String {
+    const MAX_ERROR_BODY_CHARS: usize = 500;
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= MAX_ERROR_BODY_CHARS {
+        normalized
+    } else {
+        format!(
+            "{}...",
+            normalized
+                .chars()
+                .take(MAX_ERROR_BODY_CHARS)
+                .collect::<String>()
+        )
+    }
 }
 
 fn ai_headers(config: &AiProviderConfig) -> Result<HeaderMap> {

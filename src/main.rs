@@ -34,7 +34,7 @@ mod app {
 
     use self::chat_output::ChatOutput;
     use self::command::{
-        CommandLockState, MicrophoneMode, ParsedCommand, PendingCommand, UserCommand,
+        CommandLockState, ParsedCommand, PendingCommand, UserCommand,
     };
     use self::config::{AppConfig, PointConfig, RectConfig};
     use self::feeluown::{FeelUOwnClient, PlayerStatus, format_lyrics, format_status};
@@ -424,33 +424,6 @@ mod app {
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum MicrophoneState {
-        On,
-        Off,
-    }
-
-    impl MicrophoneState {
-        fn mode(self) -> MicrophoneMode {
-            match self {
-                Self::On => MicrophoneMode::On,
-                Self::Off => MicrophoneMode::Off,
-            }
-        }
-
-        fn label(self) -> &'static str {
-            match self {
-                Self::On => "开",
-                Self::Off => "关",
-            }
-        }
-    }
-
-    #[derive(Clone, Debug)]
-    struct MicrophoneStateHit {
-        state: MicrophoneState,
-        score: f32,
-    }
-
     struct StderrLogger;
 
     impl Log for StderrLogger {
@@ -1613,50 +1586,27 @@ mod app {
                     }
                     self.execute_invite_with_announce(&invite.username)?;
                 }
-                UserCommand::Microphone { username, mode } => {
-                    log::info!("收到麦克风命令: {} -> {}", username, mode.label());
+                UserCommand::Microphone { username } => {
+                    log::info!("收到麦克风命令: {}", username);
                     if self.check_public_hall()? {
                         log::info!("麦克风: 当前在公共大厅，跳过状态切换和通告");
                     } else {
-                        self.execute_microphone_command(username, *mode)?;
+                        self.execute_microphone_command(username)?;
                     }
                 }
             };
             Ok(())
         }
 
-        fn execute_microphone_command(
-            &self,
-            username: &str,
-            target_mode: MicrophoneMode,
-        ) -> Result<()> {
+        fn execute_microphone_command(&self, username: &str) -> Result<()> {
             if !self.is_primary_ui()? {
                 log::info!("麦克风: 当前不在一级界面，返回一级界面");
                 self.return_to_primary_fixed();
             }
-            sleep(Duration::from_millis(500));
-            let current_state = self.detect_microphone_state()?;
-            if current_state.mode() == target_mode {
-                log::info!("麦克风: 当前已是{}，无需按 N", current_state.label());
-                self.reply(&format!(
-                    "@{} 麦克风状态设为{}！",
-                    username,
-                    target_mode.state_label()
-                ))?;
-                return Ok(());
-            }
-            log::info!(
-                "麦克风: 当前{}，目标{}，按 N 切换",
-                current_state.label(),
-                target_mode.label()
-            );
+            log::info!("麦克风: 按 N 切换状态");
             press_key(Key::Unicode('n'), &self.config.window)?;
             sleep(Duration::from_millis(100));
-            self.reply(&format!(
-                "@{} 麦克风状态设为{}！",
-                username,
-                target_mode.state_label()
-            ))
+            self.reply(&format!("@{} 执行了切换麦克风状态！", username))
         }
 
         fn is_primary_ui(&self) -> Result<bool> {
@@ -1669,68 +1619,6 @@ mod app {
             let frame = load_frame(&FrameArgs { image: None }, &canvas, &self.config.window)?;
             let ui_state = detect_ui_state(&frame.image, &templates, &self.config.screen)?;
             Ok(ui_state.is_primary())
-        }
-
-        fn detect_microphone_state(&self) -> Result<MicrophoneState> {
-            let canvas = Canvas {
-                width: self.config.screen.expected_width,
-                height: self.config.screen.expected_height,
-                resize: true,
-            };
-            let frame = load_frame(&FrameArgs { image: None }, &canvas, &self.config.window)?;
-            let state_region: Rect = self.config.microphone.state_region.into();
-            if state_region.right() > frame.image.width() as i32
-                || state_region.bottom() > frame.image.height() as i32
-            {
-                bail!(
-                    "麦克风状态区域 {},{},{},{} 超出截图 {}x{}，请检查 screen.expected_height 或 microphone.state_region",
-                    state_region.x,
-                    state_region.y,
-                    state_region.width,
-                    state_region.height,
-                    frame.image.width(),
-                    frame.image.height()
-                );
-            }
-            let rect = Some(state_region);
-            let threshold = self.config.microphone.state_threshold;
-            let on_hit = best_template_hit(
-                &frame.image,
-                rect,
-                &self.config.templates.microphone_on,
-                threshold,
-            )?;
-            let off_hit = best_template_hit(
-                &frame.image,
-                rect,
-                &self.config.templates.microphone_off,
-                threshold,
-            )?;
-            let best = [
-                on_hit.map(|hit| MicrophoneStateHit {
-                    state: MicrophoneState::On,
-                    score: hit.score,
-                }),
-                off_hit.map(|hit| MicrophoneStateHit {
-                    state: MicrophoneState::Off,
-                    score: hit.score,
-                }),
-            ]
-            .into_iter()
-            .flatten()
-            .max_by(|left, right| left.score.total_cmp(&right.score));
-
-            let Some(best) = best else {
-                bail!(
-                    "麦克风状态模板匹配失败，请检查 templates.microphone_on/off 和 microphone.state_region"
-                );
-            };
-            log::info!(
-                "麦克风状态模板匹配: {} score={:.3}",
-                best.state.label(),
-                best.score
-            );
-            Ok(best.state)
         }
 
         fn execute_hall_detect(&mut self) -> Result<()> {

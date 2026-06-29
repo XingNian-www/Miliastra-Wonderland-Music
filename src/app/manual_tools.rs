@@ -603,9 +603,7 @@ fn choose_template(config: &AppConfig) -> Result<PathBuf> {
     println!("3. 粉色聊天标志");
     println!("4. 回车 UI");
     println!("5. 大厅 UI");
-    println!("6. 麦克风开状态");
-    println!("7. 麦克风关状态");
-    println!("8. 自定义路径");
+    println!("6. 自定义路径");
 
     let path = match prompt("请选择模板")?.trim() {
         "1" => config.templates.blue_marker.clone(),
@@ -613,9 +611,7 @@ fn choose_template(config: &AppConfig) -> Result<PathBuf> {
         "3" => config.templates.pink_marker.clone(),
         "4" => config.templates.enter.clone(),
         "5" => config.templates.dating.clone(),
-        "6" => config.templates.microphone_on.clone(),
-        "7" => config.templates.microphone_off.clone(),
-        "8" => PathBuf::from(prompt("模板路径")?),
+        "6" => PathBuf::from(prompt("模板路径")?),
         other => return Err(anyhow!("未知模板选项: {}", other)),
     };
     Ok(path)

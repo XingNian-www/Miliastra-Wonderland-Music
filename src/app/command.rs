@@ -29,30 +29,7 @@ pub enum UserCommand {
     Invite(InviteCommand),
     Microphone {
         username: String,
-        mode: MicrophoneMode,
     },
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub enum MicrophoneMode {
-    On,
-    Off,
-}
-
-impl MicrophoneMode {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::On => "开",
-            Self::Off => "关",
-        }
-    }
-
-    pub fn state_label(self) -> &'static str {
-        match self {
-            Self::On => "开启",
-            Self::Off => "关闭",
-        }
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -183,32 +160,15 @@ fn parse_pink_text(text: &str) -> Option<ParsedCommand> {
         });
     }
     if let Some(rest) = command_text.strip_prefix("麦克风") {
-        let mode = parse_microphone_mode(rest)?;
-        return Some(ParsedCommand {
-            matched: "麦克风".to_string(),
-            raw: format!("麦克风 {} {}", username, mode.label()),
-            command: UserCommand::Microphone { username, mode },
-        });
-    }
-    None
-}
-
-fn parse_microphone_mode(rest: &str) -> Option<MicrophoneMode> {
-    let rest = rest.trim_start_matches(['：', ':', ' ', '\t']);
-    if rest.is_empty() || rest.starts_with([']', '】']) {
-        return Some(MicrophoneMode::On);
-    }
-    if rest
-        .strip_prefix('开')
-        .is_some_and(|tail| command_boundary(tail.chars().next()))
-    {
-        return Some(MicrophoneMode::On);
-    }
-    if rest
-        .strip_prefix('关')
-        .is_some_and(|tail| command_boundary(tail.chars().next()))
-    {
-        return Some(MicrophoneMode::Off);
+        let rest = rest.trim_start_matches(['：', ':', ' ', '\t']);
+        if rest.is_empty() || rest.starts_with([']', '】']) {
+            return Some(ParsedCommand {
+                matched: "麦克风".to_string(),
+                raw: format!("麦克风 {}", username),
+                command: UserCommand::Microphone { username },
+            });
+        }
+        return None;
     }
     None
 }
@@ -316,15 +276,9 @@ fn same_user_command(left: &UserCommand, right: &UserCommand) -> bool {
         }
         (UserCommand::Invite(left), UserCommand::Invite(right)) => left.seq == right.seq,
         (
-            UserCommand::Microphone {
-                username: left,
-                mode: left_mode,
-            },
-            UserCommand::Microphone {
-                username: right,
-                mode: right_mode,
-            },
-        ) => left_mode == right_mode && identity_text(left) == identity_text(right),
+            UserCommand::Microphone { username: left },
+            UserCommand::Microphone { username: right },
+        ) => identity_text(left) == identity_text(right),
         (UserCommand::Volume(left), UserCommand::Volume(right)) => {
             identity_text(left) == identity_text(right)
         }
@@ -363,8 +317,8 @@ fn command_lock_key(command: &UserCommand) -> String {
         UserCommand::HallTime => "hall_time".to_string(),
         UserCommand::Help => "help".to_string(),
         UserCommand::Invite(invite) => format!("invite:{}", invite.seq),
-        UserCommand::Microphone { username, mode } => {
-            format!("microphone:{}:{}", identity_text(username), mode.label())
+        UserCommand::Microphone { username } => {
+            format!("microphone:{}", identity_text(username))
         }
     }
 }
@@ -599,32 +553,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_microphone_default_on() {
+    fn parses_microphone() {
         let parsed = parse_text("[Alice]：@麦克风", "pink").expect("parse microphone");
         assert_eq!(
             parsed.command,
             UserCommand::Microphone {
                 username: "Alice".to_string(),
-                mode: MicrophoneMode::On,
             }
         );
     }
 
     #[test]
-    fn parses_microphone_off() {
-        let parsed = parse_text("[Alice]：@麦克风关", "pink").expect("parse microphone off");
-        assert_eq!(
-            parsed.command,
-            UserCommand::Microphone {
-                username: "Alice".to_string(),
-                mode: MicrophoneMode::Off,
-            }
-        );
-    }
-
-    #[test]
-    fn rejects_unknown_microphone_param() {
-        assert!(parse_text("[Alice]：@麦克风开关", "pink").is_none());
+    fn rejects_microphone_with_param() {
+        assert!(parse_text("[Alice]：@麦克风关", "pink").is_none());
+        assert!(parse_text("[Alice]：@麦克风开", "pink").is_none());
     }
 
     #[test]

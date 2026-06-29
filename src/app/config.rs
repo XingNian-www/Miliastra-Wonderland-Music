@@ -25,7 +25,6 @@ pub struct AppConfig {
     pub matching: MatchConfig,
     pub hotkeys: HotkeyConfig,
     pub invite: InviteConfig,
-    pub microphone: MicrophoneConfig,
 }
 
 impl Default for AppConfig {
@@ -47,7 +46,6 @@ impl Default for AppConfig {
             matching: MatchConfig::default(),
             hotkeys: HotkeyConfig::default(),
             invite: InviteConfig::default(),
-            microphone: MicrophoneConfig::default(),
         }
     }
 }
@@ -320,10 +318,6 @@ templates:
   invite_goto_hall: assets/invite-goto-hall.png
   # 邀请流程里的“进入大厅”按钮模板
   invite_enter_hall: assets/invite-enter-hall.png
-  # 麦克风开状态模板
-  microphone_on: assets/microphone-on.png
-  # 麦克风关状态模板
-  microphone_off: assets/microphone-off.png
   # 聊天标志模板匹配阈值，越高越严格
   marker_threshold: 0.82
 
@@ -444,16 +438,6 @@ invite:
     y: 700
     width: 500
     height: 100
-
-microphone:
-  # 麦克风状态模板搜索区域，需要覆盖开/关图标所在位置
-  state_region:
-    x: 340
-    y: 1020
-    width: 40
-    height: 30
-  # 麦克风状态模板匹配阈值，开/关两个模板中选最高置信度
-  state_threshold: 0.82
 "#
 }
 
@@ -681,8 +665,6 @@ pub struct TemplateConfig {
     pub invite_view_star: PathBuf,
     pub invite_goto_hall: PathBuf,
     pub invite_enter_hall: PathBuf,
-    pub microphone_on: PathBuf,
-    pub microphone_off: PathBuf,
     pub marker_threshold: f32,
 }
 
@@ -697,8 +679,6 @@ impl Default for TemplateConfig {
             invite_view_star: PathBuf::from("assets/invite-view-star.png"),
             invite_goto_hall: PathBuf::from("assets/invite-goto-hall.png"),
             invite_enter_hall: PathBuf::from("assets/invite-enter-hall.png"),
-            microphone_on: PathBuf::from("assets/microphone-on.png"),
-            microphone_off: PathBuf::from("assets/microphone-off.png"),
             marker_threshold: 0.82,
         }
     }
@@ -892,22 +872,6 @@ impl Default for InviteConfig {
             view_star_region: RectConfig::new(400, 80, 440, 860),
             goto_hall_region: RectConfig::new(700, 560, 500, 300),
             enter_hall_region: RectConfig::new(700, 700, 500, 100),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default)]
-pub struct MicrophoneConfig {
-    pub state_region: RectConfig,
-    pub state_threshold: f32,
-}
-
-impl Default for MicrophoneConfig {
-    fn default() -> Self {
-        Self {
-            state_region: RectConfig::new(340, 1020, 40, 30),
-            state_threshold: 0.82,
         }
     }
 }

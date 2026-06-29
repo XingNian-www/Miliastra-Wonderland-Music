@@ -30,6 +30,12 @@ pub enum UserCommand {
     Microphone {
         username: String,
     },
+    DisableCommands {
+        username: String,
+    },
+    EnableCommands {
+        username: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -170,6 +176,26 @@ fn parse_pink_text(text: &str) -> Option<ParsedCommand> {
         }
         return None;
     }
+    if let Some(rest) = command_text.strip_prefix("禁用") {
+        if rest.is_empty() || rest.starts_with([']', '】']) {
+            return Some(ParsedCommand {
+                matched: "禁用".to_string(),
+                raw: format!("禁用 {}", username),
+                command: UserCommand::DisableCommands { username },
+            });
+        }
+        return None;
+    }
+    if let Some(rest) = command_text.strip_prefix("启用") {
+        if rest.is_empty() || rest.starts_with([']', '】']) {
+            return Some(ParsedCommand {
+                matched: "启用".to_string(),
+                raw: format!("启用 {}", username),
+                command: UserCommand::EnableCommands { username },
+            });
+        }
+        return None;
+    }
     None
 }
 
@@ -279,6 +305,14 @@ fn same_user_command(left: &UserCommand, right: &UserCommand) -> bool {
             UserCommand::Microphone { username: left },
             UserCommand::Microphone { username: right },
         ) => identity_text(left) == identity_text(right),
+        (
+            UserCommand::DisableCommands { username: left },
+            UserCommand::DisableCommands { username: right },
+        ) => identity_text(left) == identity_text(right),
+        (
+            UserCommand::EnableCommands { username: left },
+            UserCommand::EnableCommands { username: right },
+        ) => identity_text(left) == identity_text(right),
         (UserCommand::Volume(left), UserCommand::Volume(right)) => {
             identity_text(left) == identity_text(right)
         }
@@ -320,6 +354,8 @@ fn command_lock_key(command: &UserCommand) -> String {
         UserCommand::Microphone { username } => {
             format!("microphone:{}", identity_text(username))
         }
+        UserCommand::DisableCommands { username: _ } => "disable_commands".to_string(),
+        UserCommand::EnableCommands { username: _ } => "enable_commands".to_string(),
     }
 }
 
@@ -542,6 +578,8 @@ const FEEDBACK_TEXT_PATTERNS: &[&str] = &[
     "默认通过",
     "麦克风状态切换",
     "麦克风状态设为",
+    "管理员已禁用",
+    "管理员已启用",
     "大厅到期时间",
     "大厅时间未知",
     "公共大厅无时间限制",
@@ -567,6 +605,33 @@ mod tests {
     fn rejects_microphone_with_param() {
         assert!(parse_text("[Alice]：@麦克风关", "pink").is_none());
         assert!(parse_text("[Alice]：@麦克风开", "pink").is_none());
+    }
+
+    #[test]
+    fn parses_disable_commands() {
+        let parsed = parse_text("[Alice]：@禁用", "pink").expect("parse disable");
+        assert_eq!(
+            parsed.command,
+            UserCommand::DisableCommands {
+                username: "Alice".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_enable_commands() {
+        let parsed = parse_text("[Alice]：@启用", "pink").expect("parse enable");
+        assert_eq!(
+            parsed.command,
+            UserCommand::EnableCommands {
+                username: "Alice".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_disable_with_param() {
+        assert!(parse_text("[Alice]：@禁用命令", "pink").is_none());
     }
 
     #[test]

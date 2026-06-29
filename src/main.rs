@@ -744,6 +744,7 @@ mod app {
         pending: VecDeque<PendingCommand>,
         screen_lock_primed: bool,
         invite_executed_seqs: HashSet<u32>,
+        commands_enabled: bool,
         running: Arc<AtomicBool>,
         paused: Arc<AtomicBool>,
         command_executing: bool,
@@ -791,6 +792,7 @@ mod app {
                 pending: VecDeque::new(),
                 screen_lock_primed: false,
                 invite_executed_seqs: HashSet::new(),
+                commands_enabled: true,
                 running: Arc::new(AtomicBool::new(true)),
                 paused: Arc::new(AtomicBool::new(false)),
                 command_executing: false,
@@ -1089,6 +1091,10 @@ mod app {
                 else {
                     continue;
                 };
+                if !self.commands_enabled && message.message_type != "pink" {
+                    log::info!("命令识别已禁用，跳过: {}", parsed_command.raw);
+                    continue;
+                }
                 if let UserCommand::Invite(invite) = &parsed_command.command {
                     if self.invite_executed_seqs.contains(&invite.seq) {
                         log::info!(
@@ -1595,6 +1601,16 @@ mod app {
                     } else {
                         self.execute_microphone_command(username)?;
                     }
+                }
+                UserCommand::DisableCommands { username: _ } => {
+                    log::info!("收到禁用命令");
+                    self.commands_enabled = false;
+                    self.reply("管理员已禁用大厅命令识别功能")?;
+                }
+                UserCommand::EnableCommands { username: _ } => {
+                    log::info!("收到启用命令");
+                    self.commands_enabled = true;
+                    self.reply("管理员已启用大厅命令识别功能")?;
                 }
             };
             Ok(())

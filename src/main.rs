@@ -1123,7 +1123,11 @@ mod app {
 
                                 if change_suppressed {
                                     last_fingerprint = None;
-                                } else if !scanned_this_round && !keep_previous_fingerprint {
+                                } else if !scanned_this_round
+                                    && !keep_previous_fingerprint
+                                    && last_fingerprint.is_none()
+                                {
+                                    // 不要每帧滚动更新基线，慢速聊天动画会在超过阈值前被吃掉。
                                     if let Some(fingerprint) = fingerprint {
                                         last_fingerprint = Some(fingerprint);
                                     }

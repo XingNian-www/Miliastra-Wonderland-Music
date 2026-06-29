@@ -448,8 +448,8 @@ invite:
 microphone:
   # 麦克风状态模板搜索区域，需要覆盖开/关图标所在位置
   state_region:
-    x: 710
-    y: 1230
+    x: 340
+    y: 1020
     width: 40
     height: 30
   # 麦克风状态模板匹配阈值，开/关两个模板中选最高置信度
@@ -906,7 +906,7 @@ pub struct MicrophoneConfig {
 impl Default for MicrophoneConfig {
     fn default() -> Self {
         Self {
-            state_region: RectConfig::new(710, 1230, 40, 30),
+            state_region: RectConfig::new(340, 1020, 40, 30),
             state_threshold: 0.82,
         }
     }

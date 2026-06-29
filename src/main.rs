@@ -1630,7 +1630,10 @@ mod app {
             username: &str,
             target_mode: MicrophoneMode,
         ) -> Result<()> {
-            self.return_to_primary_from_transient_ui("麦克风");
+            if !self.is_primary_ui()? {
+                log::info!("麦克风: 当前不在一级界面，返回一级界面");
+                self.return_to_primary_fixed();
+            }
             sleep(Duration::from_millis(500));
             let current_state = self.detect_microphone_state()?;
             if current_state.mode() == target_mode {
@@ -1648,11 +1651,24 @@ mod app {
                 target_mode.label()
             );
             press_key(Key::Unicode('n'), &self.config.window)?;
+            sleep(Duration::from_millis(100));
             self.reply(&format!(
                 "@{} 麦克风状态设为{}！",
                 username,
                 target_mode.state_label()
             ))
+        }
+
+        fn is_primary_ui(&self) -> Result<bool> {
+            let templates = UiTemplateArgs::default().resolve(&self.config);
+            let canvas = Canvas {
+                width: self.config.screen.expected_width,
+                height: self.config.screen.expected_height,
+                resize: true,
+            };
+            let frame = load_frame(&FrameArgs { image: None }, &canvas, &self.config.window)?;
+            let ui_state = detect_ui_state(&frame.image, &templates, &self.config.screen)?;
+            Ok(ui_state.is_primary())
         }
 
         fn detect_microphone_state(&self) -> Result<MicrophoneState> {

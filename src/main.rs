@@ -54,6 +54,8 @@ mod app {
     const CHAT_MARKER_SEARCH_WIDTH: u32 = 60;
     const HALL_INFO_OCR_SAMPLES: usize = 3;
 
+    static WINDOW_CAPTURE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
     #[derive(Parser, Debug)]
     #[command(
         version,
@@ -878,6 +880,7 @@ mod app {
                 command_executing: self.command_executing.clone(),
             };
             thread::spawn(move || {
+                log::info!("命令执行线程已启动");
                 if let Err(error) = executor.run_pending_command_loop() {
                     log::error!("命令执行线程异常退出: {error:#}");
                 }
@@ -1300,7 +1303,10 @@ mod app {
                 return Ok(None);
             }
             let executing = CommandExecutingGuard::new(Arc::clone(&self.command_executing));
-            Ok(guard.pop_front().map(|task| (task, executing)))
+            Ok(guard.pop_front().map(|task| {
+                log::info!("待处理任务开始: {}", task.label());
+                (task, executing)
+            }))
         }
 
         fn execute_pending_task(&mut self, task: PendingTask) -> Result<bool> {
@@ -3464,7 +3470,13 @@ mod app {
             Some(path) => {
                 image::open(path).with_context(|| format!("open image {}", path.display()))?
             }
-            None => window::capture_game(window_config)?,
+            None => {
+                let _guard = WINDOW_CAPTURE_LOCK
+                    .get_or_init(|| Mutex::new(()))
+                    .lock()
+                    .map_err(|_| anyhow!("window capture mutex poisoned"))?;
+                window::capture_game(window_config)?
+            }
         };
         let (source_width, source_height) = image.dimensions();
         let image =

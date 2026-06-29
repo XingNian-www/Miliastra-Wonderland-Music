@@ -7,13 +7,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow};
 use enigo::{Direction, Enigo, Key, Keyboard, Settings};
 
+use super::ai::AiClient;
 use super::chat_output::ChatOutput;
 use super::config::{AppConfig, PointConfig};
+use super::feeluown::FeelUOwnClient;
 use super::ocr::{
     OcrArgs, OcrBackendProbeStatus, make_ocr_engine, probe_ocr_backend_support, recognize_lines,
 };
-use super::ai::AiClient;
-use super::feeluown::FeelUOwnClient;
 use super::{
     Canvas, FrameArgs, TemplateArgs, UiTemplateArgs, best_template_hit, click_game_point,
     crop_canvas, detect_ui_state, find_template_hits, load_frame, parse_key, parse_rect, press_key,
@@ -458,12 +458,7 @@ fn run_ai_search(config_path: &Path) -> Result<()> {
             println!("用户点歌: {}", result.request);
             println!("候选数量: {}", result.candidates.len());
             for (index, candidate) in result.candidates.iter().enumerate() {
-                println!(
-                    "  #{}: {} -> {}",
-                    index + 1,
-                    candidate.text,
-                    candidate.uri
-                );
+                println!("  #{}: {} -> {}", index + 1, candidate.text, candidate.uri);
             }
             println!();
             if let Some(pick) = &result.pick {

@@ -27,15 +27,9 @@ pub enum UserCommand {
     HallTime,
     Help,
     Invite(InviteCommand),
-    Microphone {
-        username: String,
-    },
-    DisableCommands {
-        username: String,
-    },
-    EnableCommands {
-        username: String,
-    },
+    Microphone { username: String },
+    DisableCommands { username: String },
+    EnableCommands { username: String },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

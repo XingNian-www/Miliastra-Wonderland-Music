@@ -28,14 +28,12 @@ mod app {
     use std::path::{Path, PathBuf};
     use std::process::Command as ProcessCommand;
     use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-    use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
-    use std::thread::sleep;
+    use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
+    use std::thread::{self, sleep};
     use std::time::{Duration, Instant};
 
     use self::chat_output::ChatOutput;
-    use self::command::{
-        CommandLockState, ParsedCommand, PendingCommand, UserCommand,
-    };
+    use self::command::{CommandLockState, ParsedCommand, PendingCommand, UserCommand};
     use self::config::{AppConfig, PointConfig, RectConfig};
     use self::feeluown::{FeelUOwnClient, PlayerStatus, format_lyrics, format_status};
     use self::ocr::{OcrArgs, make_ocr_engine, merged_ocr_text, recognize_lines};
@@ -740,15 +738,16 @@ mod app {
         feeluown: FeelUOwnClient,
         ai: ai::AiClient,
         chat_output: ChatOutput,
-        ocr_engine: OcrEngine,
+        ocr_engine: Arc<Mutex<OcrEngine>>,
         locks: CommandLockState,
-        pending: VecDeque<PendingCommand>,
-        screen_lock_primed: bool,
-        invite_executed_seqs: HashSet<u32>,
-        commands_enabled: bool,
+        pending: Arc<(Mutex<VecDeque<PendingTask>>, Condvar)>,
+        screen_lock_primed: Arc<AtomicBool>,
+        reset_locks_requested: Arc<AtomicBool>,
+        invite_executed_seqs: Arc<Mutex<HashSet<u32>>>,
+        commands_enabled: Arc<AtomicBool>,
         running: Arc<AtomicBool>,
         paused: Arc<AtomicBool>,
-        command_executing: bool,
+        command_executing: Arc<AtomicBool>,
     }
 
     #[derive(Clone, Debug)]
@@ -770,6 +769,44 @@ mod app {
         }
     }
 
+    enum PendingTask {
+        Command(PendingCommand),
+        AdvanceQueue { reason: &'static str },
+    }
+
+    impl PendingTask {
+        fn label(&self) -> String {
+            match self {
+                Self::Command(pending) => pending.parsed.raw.clone(),
+                Self::AdvanceQueue { reason } => format!("自动出队({})", reason),
+            }
+        }
+
+        fn same_lock_command(&self, parsed: &ParsedCommand) -> bool {
+            match self {
+                Self::Command(pending) => command::same_lock_command(&pending.parsed, parsed),
+                Self::AdvanceQueue { .. } => false,
+            }
+        }
+    }
+
+    struct CommandExecutingGuard {
+        flag: Arc<AtomicBool>,
+    }
+
+    impl CommandExecutingGuard {
+        fn new(flag: Arc<AtomicBool>) -> Self {
+            flag.store(true, AtomicOrdering::SeqCst);
+            Self { flag }
+        }
+    }
+
+    impl Drop for CommandExecutingGuard {
+        fn drop(&mut self) {
+            self.flag.store(false, AtomicOrdering::SeqCst);
+        }
+    }
+
     impl AutomationApp {
         fn new(
             config: AppConfig,
@@ -788,15 +825,16 @@ mod app {
                 feeluown,
                 ai,
                 chat_output,
-                ocr_engine,
+                ocr_engine: Arc::new(Mutex::new(ocr_engine)),
                 locks: CommandLockState::default(),
-                pending: VecDeque::new(),
-                screen_lock_primed: false,
-                invite_executed_seqs: HashSet::new(),
-                commands_enabled: true,
+                pending: Arc::new((Mutex::new(VecDeque::new()), Condvar::new())),
+                screen_lock_primed: Arc::new(AtomicBool::new(false)),
+                reset_locks_requested: Arc::new(AtomicBool::new(false)),
+                invite_executed_seqs: Arc::new(Mutex::new(HashSet::new())),
+                commands_enabled: Arc::new(AtomicBool::new(true)),
                 running: Arc::new(AtomicBool::new(true)),
                 paused: Arc::new(AtomicBool::new(false)),
-                command_executing: false,
+                command_executing: Arc::new(AtomicBool::new(false)),
             })
         }
 
@@ -804,7 +842,51 @@ mod app {
             self.warn_if_screen_size_mismatch()?;
             self.start_http_server()?;
             self.start_hotkeys()?;
-            self.run_scan_loop()
+            let executor = self.start_command_executor();
+            let result = self.run_scan_loop();
+            self.running.store(false, AtomicOrdering::SeqCst);
+            self.notify_pending_executor();
+            if let Err(error) = executor.join() {
+                log::error!("命令执行线程 panic: {error:?}");
+            }
+            if let Err(error) = self.queue().and_then(|queue| queue.save()) {
+                log::error!("退出前保存队列失败: {error:#}");
+            }
+            if let Err(error) = self.runtime_state().and_then(|state| state.save()) {
+                log::error!("退出前保存运行状态失败: {error:#}");
+            }
+            result
+        }
+
+        fn start_command_executor(&self) -> thread::JoinHandle<()> {
+            let mut executor = Self {
+                config: self.config.clone(),
+                runtime_state: self.runtime_state.clone(),
+                queue: self.queue.clone(),
+                feeluown: self.feeluown.clone(),
+                ai: self.ai.clone(),
+                chat_output: self.chat_output.clone(),
+                ocr_engine: self.ocr_engine.clone(),
+                locks: CommandLockState::default(),
+                pending: self.pending.clone(),
+                screen_lock_primed: self.screen_lock_primed.clone(),
+                reset_locks_requested: self.reset_locks_requested.clone(),
+                invite_executed_seqs: self.invite_executed_seqs.clone(),
+                commands_enabled: self.commands_enabled.clone(),
+                running: self.running.clone(),
+                paused: self.paused.clone(),
+                command_executing: self.command_executing.clone(),
+            };
+            thread::spawn(move || {
+                if let Err(error) = executor.run_pending_command_loop() {
+                    log::error!("命令执行线程异常退出: {error:#}");
+                }
+            })
+        }
+
+        fn notify_pending_executor(&self) {
+            let (_, cvar) = &*self.pending;
+            cvar.notify_all();
         }
 
         fn queue(&self) -> Result<MutexGuard<'_, PersistentQueue>> {
@@ -817,6 +899,12 @@ mod app {
             self.runtime_state
                 .lock()
                 .map_err(|_| anyhow!("runtime state mutex poisoned"))
+        }
+
+        fn ocr_engine(&self) -> Result<MutexGuard<'_, OcrEngine>> {
+            self.ocr_engine
+                .lock()
+                .map_err(|_| anyhow!("ocr_engine mutex poisoned"))
         }
 
         fn warn_if_screen_size_mismatch(&self) -> Result<()> {
@@ -969,12 +1057,16 @@ mod app {
                                     ));
                                     match load_frame(&frame_args, &canvas, &self.config.window) {
                                         Ok(frame) => {
-                                            match scan_chat(
-                                                &frame.image,
-                                                &self.ocr_engine,
-                                                &template_args,
-                                                self.config.screen.chat_rect.into(),
-                                            ) {
+                                            let messages = {
+                                                let engine = self.ocr_engine()?;
+                                                scan_chat(
+                                                    &frame.image,
+                                                    &engine,
+                                                    &template_args,
+                                                    self.config.screen.chat_rect.into(),
+                                                )
+                                            };
+                                            match messages {
                                                 Ok(messages) => {
                                                     self.handle_scan_messages(messages)?
                                                 }
@@ -1006,12 +1098,16 @@ mod app {
                                         reason,
                                         now.duration_since(last_ocr_at).as_millis()
                                     );
-                                    match scan_chat(
-                                        &frame.image,
-                                        &self.ocr_engine,
-                                        &template_args,
-                                        self.config.screen.chat_rect.into(),
-                                    ) {
+                                    let messages = {
+                                        let engine = self.ocr_engine()?;
+                                        scan_chat(
+                                            &frame.image,
+                                            &engine,
+                                            &template_args,
+                                            self.config.screen.chat_rect.into(),
+                                        )
+                                    };
+                                    match messages {
                                         Ok(messages) => self.handle_scan_messages(messages)?,
                                         Err(error) => log::error!("聊天扫描失败: {error:#}"),
                                     }
@@ -1046,14 +1142,6 @@ mod app {
                         log::error!("截图失败: {error:#}");
                     }
                 }
-                if self.run_pending_commands()? {
-                    suppress_change_until = Instant::now()
-                        + Duration::from_millis(self.config.timing.post_command_settle_ms);
-                    force_scan_after = Some(suppress_change_until);
-                    force_scan_reason = Some("post-command");
-                    last_fingerprint = None;
-                    last_ocr_at = Instant::now();
-                }
                 if self.maybe_advance_queue()? {
                     suppress_change_until = Instant::now()
                         + Duration::from_millis(self.config.timing.post_command_settle_ms);
@@ -1079,6 +1167,13 @@ mod app {
         }
 
         fn handle_scan_messages(&mut self, messages: Vec<ChatMessage>) -> Result<()> {
+            if self
+                .reset_locks_requested
+                .swap(false, AtomicOrdering::SeqCst)
+            {
+                self.locks = CommandLockState::default();
+                log::info!("已重置命令屏幕锁");
+            }
             if messages.is_empty() {
                 log::debug!("没有找到聊天标志，本轮不更新命令锁");
                 return Ok(());
@@ -1092,12 +1187,19 @@ mod app {
                 else {
                     continue;
                 };
-                if !self.commands_enabled && message.message_type != "pink" {
+                if !self.commands_enabled.load(AtomicOrdering::SeqCst)
+                    && message.message_type != "pink"
+                {
                     log::info!("命令识别已禁用，跳过: {}", parsed_command.raw);
                     continue;
                 }
                 if let UserCommand::Invite(invite) = &parsed_command.command {
-                    if self.invite_executed_seqs.contains(&invite.seq) {
+                    let invite_executed = self
+                        .invite_executed_seqs
+                        .lock()
+                        .map_err(|_| anyhow!("invite_executed_seqs mutex poisoned"))?
+                        .contains(&invite.seq);
+                    if invite_executed {
                         log::info!(
                             "邀请参数 {} 已执行过，跳过: {}",
                             invite.seq,
@@ -1117,15 +1219,16 @@ mod app {
                 parsed.push(parsed_command);
             }
 
-            let update = self.locks.update(&parsed, self.command_executing);
+            let update = self
+                .locks
+                .update(&parsed, self.command_executing.load(AtomicOrdering::SeqCst));
             for command in update.unlocked {
                 log::info!("解锁: {}", command);
             }
             for command in update.skipped {
                 log::info!("命令仍在屏幕内，本轮跳过: {}", command);
             }
-            if !self.screen_lock_primed {
-                self.screen_lock_primed = true;
+            if !self.screen_lock_primed.swap(true, AtomicOrdering::SeqCst) {
                 for pending in update.accepted {
                     log::info!(
                         "启动屏幕锁已记录当前可见命令，不执行: {}",
@@ -1135,71 +1238,160 @@ mod app {
                 return Ok(());
             }
             for pending in update.accepted {
-                if self
-                    .pending
-                    .iter()
-                    .any(|queued| command::same_lock_command(&queued.parsed, &pending.parsed))
-                {
+                if self.pending_contains_command(&pending.parsed)? {
                     log::info!("命令已在待处理队列，本轮跳过: {}", pending.parsed.raw);
                     continue;
                 }
+                match &pending.parsed.command {
+                    UserCommand::DisableCommands { username: _ } => {
+                        self.commands_enabled.store(false, AtomicOrdering::SeqCst);
+                    }
+                    UserCommand::EnableCommands { username: _ } => {
+                        self.commands_enabled.store(true, AtomicOrdering::SeqCst);
+                    }
+                    _ => {}
+                }
                 log::info!("命令已加入待处理队列: {}", pending.parsed.raw);
-                self.pending.push_back(pending);
+                self.push_pending_task(PendingTask::Command(pending))?;
             }
             Ok(())
         }
 
-        fn run_pending_commands(&mut self) -> Result<bool> {
-            if self.command_executing || self.pending.is_empty() {
-                return Ok(false);
-            }
-            self.command_executing = true;
-            let mut executed = false;
-            while let Some(pending) = self.pending.pop_front() {
-                match self.prepare_command_ui(&pending.parsed.raw) {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        log::info!(
-                            "命令执行前未能回到一级界面，保留待处理命令: {}",
-                            pending.parsed.raw
-                        );
-                        self.pending.push_front(pending);
-                        break;
+        fn run_pending_command_loop(&mut self) -> Result<()> {
+            while self.running.load(AtomicOrdering::SeqCst) {
+                if self.paused.load(AtomicOrdering::SeqCst) {
+                    sleep(Duration::from_millis(self.config.timing.scan_loop_idle_ms));
+                    continue;
+                }
+                let Some((task, executing)) = self.wait_for_pending_task()? else {
+                    continue;
+                };
+                if self.paused.load(AtomicOrdering::SeqCst) {
+                    self.push_pending_task_front(task)?;
+                    drop(executing);
+                    sleep(Duration::from_millis(self.config.timing.scan_loop_idle_ms));
+                    continue;
+                }
+                match self.execute_pending_task(task) {
+                    Ok(true) => {
+                        sleep(Duration::from_millis(
+                            self.config.timing.post_command_settle_ms,
+                        ));
                     }
+                    Ok(false) => {}
                     Err(error) => {
-                        log::error!(
-                            "命令执行前准备界面失败，保留待处理命令 {}: {error:#}",
-                            pending.parsed.raw
-                        );
-                        self.pending.push_front(pending);
-                        break;
+                        log::error!("待处理任务执行异常: {error:#}");
                     }
                 }
-                log::info!(
-                    "执行待处理命令: {} lock={}",
+            }
+            Ok(())
+        }
+
+        fn wait_for_pending_task(&self) -> Result<Option<(PendingTask, CommandExecutingGuard)>> {
+            let (lock, cvar) = &*self.pending;
+            let mut guard = lock.lock().map_err(|_| anyhow!("pending mutex poisoned"))?;
+            while guard.is_empty() && self.running.load(AtomicOrdering::SeqCst) {
+                guard = cvar
+                    .wait_timeout(guard, Duration::from_secs(1))
+                    .map_err(|_| anyhow!("pending condvar poisoned"))?
+                    .0;
+            }
+            if !self.running.load(AtomicOrdering::SeqCst) {
+                return Ok(None);
+            }
+            let executing = CommandExecutingGuard::new(Arc::clone(&self.command_executing));
+            Ok(guard.pop_front().map(|task| (task, executing)))
+        }
+
+        fn execute_pending_task(&mut self, task: PendingTask) -> Result<bool> {
+            let label = task.label();
+            let result = match task {
+                PendingTask::Command(pending) => self.execute_pending_command(pending),
+                PendingTask::AdvanceQueue { reason } => self.consume_queue(reason),
+            };
+            match result {
+                Ok(()) => {
+                    log::info!("待处理任务完成: {}", label);
+                    Ok(true)
+                }
+                Err(error) => {
+                    log::error!("待处理任务失败 {}: {error:#}", label);
+                    self.return_to_primary_after_command_failure(&label);
+                    Err(error)
+                }
+            }
+        }
+
+        fn execute_pending_command(&mut self, pending: PendingCommand) -> Result<()> {
+            match self.prepare_command_ui(&pending.parsed.raw) {
+                Ok(true) => {}
+                Ok(false) => {
+                    log::info!(
+                        "命令执行前未能回到一级界面，保留待处理命令: {}",
+                        pending.parsed.raw
+                    );
+                    self.push_pending_task_front(PendingTask::Command(pending))?;
+                    return Ok(());
+                }
+                Err(error) => {
+                    log::error!(
+                        "命令执行前准备界面失败，保留待处理命令 {}: {error:#}",
+                        pending.parsed.raw
+                    );
+                    self.push_pending_task_front(PendingTask::Command(pending))?;
+                    return Ok(());
+                }
+            }
+            log::info!(
+                "执行待处理命令: {} lock={}",
+                pending.parsed.raw,
+                pending.lock_key
+            );
+            let command_started = Instant::now();
+            match self.execute_command(&pending.parsed) {
+                Ok(()) => log::info!(
+                    "命令执行完成: {} 耗时={}ms",
                     pending.parsed.raw,
-                    pending.lock_key
-                );
-                let command_started = Instant::now();
-                match self.execute_command(&pending.parsed) {
-                    Ok(()) => log::info!(
-                        "命令执行完成: {} 耗时={}ms",
+                    elapsed_ms(command_started)
+                ),
+                Err(error) => {
+                    log::error!(
+                        "命令执行失败 {} 耗时={}ms: {error:#}",
                         pending.parsed.raw,
                         elapsed_ms(command_started)
-                    ),
-                    Err(error) => {
-                        log::error!(
-                            "命令执行失败 {} 耗时={}ms: {error:#}",
-                            pending.parsed.raw,
-                            elapsed_ms(command_started)
-                        );
-                        self.return_to_primary_after_command_failure(&pending.parsed.raw);
-                    }
+                    );
+                    self.return_to_primary_after_command_failure(&pending.parsed.raw);
                 }
-                executed = true;
             }
-            self.command_executing = false;
-            Ok(executed)
+            Ok(())
+        }
+
+        fn pending_contains_command(&self, parsed: &ParsedCommand) -> Result<bool> {
+            let (lock, _) = &*self.pending;
+            let guard = lock.lock().map_err(|_| anyhow!("pending mutex poisoned"))?;
+            Ok(guard.iter().any(|task| task.same_lock_command(parsed)))
+        }
+
+        fn executor_is_idle(&self) -> Result<bool> {
+            let (lock, _) = &*self.pending;
+            let guard = lock.lock().map_err(|_| anyhow!("pending mutex poisoned"))?;
+            Ok(guard.is_empty() && !self.command_executing.load(AtomicOrdering::SeqCst))
+        }
+
+        fn push_pending_task(&self, task: PendingTask) -> Result<()> {
+            let (lock, cvar) = &*self.pending;
+            let mut guard = lock.lock().map_err(|_| anyhow!("pending mutex poisoned"))?;
+            guard.push_back(task);
+            cvar.notify_one();
+            Ok(())
+        }
+
+        fn push_pending_task_front(&self, task: PendingTask) -> Result<()> {
+            let (lock, cvar) = &*self.pending;
+            let mut guard = lock.lock().map_err(|_| anyhow!("pending mutex poisoned"))?;
+            guard.push_front(task);
+            cvar.notify_one();
+            Ok(())
         }
 
         fn prepare_command_ui(&self, command: &str) -> Result<bool> {
@@ -1232,7 +1424,7 @@ mod app {
         }
 
         fn maybe_advance_queue(&mut self) -> Result<bool> {
-            if self.command_executing || !self.pending.is_empty() {
+            if !self.executor_is_idle()? {
                 return Ok(false);
             }
 
@@ -1272,7 +1464,7 @@ mod app {
                 runtime_state.state_mut().paused_by_command = false;
                 runtime_state.save()?;
                 drop(runtime_state);
-                self.consume_queue("停止")?;
+                self.push_pending_task(PendingTask::AdvanceQueue { reason: "停止" })?;
                 return Ok(true);
             }
             if status.status == "paused" {
@@ -1283,7 +1475,7 @@ mod app {
                 runtime_state.state_mut().paused_by_command = false;
                 runtime_state.save()?;
                 drop(runtime_state);
-                self.consume_queue("暂停")?;
+                self.push_pending_task(PendingTask::AdvanceQueue { reason: "暂停" })?;
                 return Ok(true);
             }
             if status.status != "playing" {
@@ -1298,7 +1490,9 @@ mod app {
             if status.duration > 0.0 {
                 let remaining = status.duration - status.progress;
                 if remaining <= self.config.queue.auto_advance_seconds as f64 {
-                    self.consume_queue("即将结束")?;
+                    self.push_pending_task(PendingTask::AdvanceQueue {
+                        reason: "即将结束"
+                    })?;
                     return Ok(true);
                 }
             }
@@ -1306,7 +1500,7 @@ mod app {
         }
 
         fn maybe_warn_hall_expiring(&mut self) -> Result<bool> {
-            if self.command_executing || !self.pending.is_empty() {
+            if !self.executor_is_idle()? {
                 return Ok(false);
             }
             let minutes = {
@@ -1420,10 +1614,11 @@ mod app {
                 } else {
                     &request.source
                 };
-                let picked = match self
-                    .feeluown
-                    .search_and_pick(&request.keyword, source, request.prefer_accompaniment)
-                {
+                let picked = match self.feeluown.search_and_pick(
+                    &request.keyword,
+                    source,
+                    request.prefer_accompaniment,
+                ) {
                     Ok(Some(picked)) => picked,
                     _ => {
                         let actions = if self.ai.enabled() {
@@ -1440,10 +1635,8 @@ mod app {
                                 } else {
                                     "netease"
                                 };
-                                return self.resolve_and_confirm_song_with_source(
-                                    song,
-                                    next_source,
-                                );
+                                return self
+                                    .resolve_and_confirm_song_with_source(song, next_source);
                             }
                             UserDecision::Ai if self.ai.enabled() => {
                                 return self.resolve_and_confirm_song_ai(song);
@@ -1496,10 +1689,11 @@ mod app {
             song: &command::SongCommand,
             source: &str,
         ) -> Result<Option<ResolvedSongRequest>> {
-            let picked = match self
-                .feeluown
-                .search_and_pick(&song.keyword, source, song.prefer_accompaniment)
-            {
+            let picked = match self.feeluown.search_and_pick(
+                &song.keyword,
+                source,
+                song.prefer_accompaniment,
+            ) {
                 Ok(Some(picked)) => picked,
                 _ => {
                     let actions = if self.ai.enabled() {
@@ -1530,21 +1724,16 @@ mod app {
             } else {
                 "@确认@跳过@换源"
             };
-            self.reply(&format!(
-                "搜索到:{},{}",
-                picked.0.text, actions
-            ))?;
+            self.reply(&format!("搜索到:{},{}", picked.0.text, actions))?;
             let decision = self.wait_for_decision(true, self.ai.enabled(), true)?;
             match decision {
-                UserDecision::Confirm | UserDecision::Timeout => {
-                    Ok(Some(ResolvedSongRequest {
-                        keyword: picked.0.text.clone(),
-                        source: source.to_string(),
-                        prefer_accompaniment: song.prefer_accompaniment,
-                        ai_original_text: String::new(),
-                        uri: picked.0.uri.clone(),
-                    }))
-                }
+                UserDecision::Confirm | UserDecision::Timeout => Ok(Some(ResolvedSongRequest {
+                    keyword: picked.0.text.clone(),
+                    source: source.to_string(),
+                    prefer_accompaniment: song.prefer_accompaniment,
+                    ai_original_text: String::new(),
+                    uri: picked.0.uri.clone(),
+                })),
                 UserDecision::Skip => Ok(None),
                 UserDecision::SwitchSource => {
                     let next_source = if source == "netease" {
@@ -1554,9 +1743,7 @@ mod app {
                     };
                     self.resolve_and_confirm_song_with_source(song, next_source)
                 }
-                UserDecision::Ai if self.ai.enabled() => {
-                    self.resolve_and_confirm_song_ai(song)
-                }
+                UserDecision::Ai if self.ai.enabled() => self.resolve_and_confirm_song_ai(song),
                 _ => Ok(None),
             }
         }
@@ -1582,10 +1769,11 @@ mod app {
                 self.reply("平台无对应歌曲音源")?;
                 return Ok(None);
             }
-            let pick = match self
-                .ai
-                .pick_song_candidate(&song.keyword, song.prefer_accompaniment, &candidates)
-            {
+            let pick = match self.ai.pick_song_candidate(
+                &song.keyword,
+                song.prefer_accompaniment,
+                &candidates,
+            ) {
                 Ok(pick) => pick,
                 Err(error) => {
                     log::error!("AI点歌选择候选失败: {error:#}");
@@ -1797,9 +1985,15 @@ mod app {
                 UserCommand::HallTime => self.reply_hall_time()?,
                 UserCommand::Help => self.send_help()?,
                 UserCommand::Invite(invite) => {
-                    if !self.invite_executed_seqs.insert(invite.seq) {
-                        log::info!("邀请参数 {} 已执行过，跳过", invite.seq);
-                        return Ok(());
+                    {
+                        let mut executed = self
+                            .invite_executed_seqs
+                            .lock()
+                            .map_err(|_| anyhow!("invite_executed_seqs mutex poisoned"))?;
+                        if !executed.insert(invite.seq) {
+                            log::info!("邀请参数 {} 已执行过，跳过", invite.seq);
+                            return Ok(());
+                        }
                     }
                     self.execute_invite_with_announce(&invite.username)?;
                 }
@@ -1813,12 +2007,12 @@ mod app {
                 }
                 UserCommand::DisableCommands { username: _ } => {
                     log::info!("收到禁用命令");
-                    self.commands_enabled = false;
+                    self.commands_enabled.store(false, AtomicOrdering::SeqCst);
                     self.reply("管理员已禁用大厅命令识别功能")?;
                 }
                 UserCommand::EnableCommands { username: _ } => {
                     log::info!("收到启用命令");
-                    self.commands_enabled = true;
+                    self.commands_enabled.store(true, AtomicOrdering::SeqCst);
                     self.reply("管理员已启用大厅命令识别功能")?;
                 }
             };
@@ -1985,11 +2179,7 @@ mod app {
             if self.check_public_hall()? {
                 log::info!("邀请: 当前在公共大厅，直接执行");
                 self.notify_friend_invite_decision(username, "已同意加入大厅,请注意启动麦克风");
-                let joined = self.execute_invite(username)?;
-                if joined {
-                    self.on_entered_new_hall();
-                }
-                return Ok(joined);
+                return self.execute_invite(username);
             }
             let announce = format!(
                 "{}邀请BOT前往大厅,30s内@邀请确认@邀请拒绝,默认通过",
@@ -1997,31 +2187,19 @@ mod app {
             );
             if let Err(error) = self.reply(&announce) {
                 log::error!("邀请通告发送失败，直接执行邀请: {error:#}");
-                let joined = self.execute_invite(username)?;
-                if joined {
-                    self.on_entered_new_hall();
-                }
-                return Ok(joined);
+                return self.execute_invite(username);
             }
             match self.wait_for_invite_decision()? {
                 Some(true) => {
                     self.notify_friend_invite_decision(username, "已同意加入大厅,请注意启动麦克风");
-                    let joined = self.execute_invite(username)?;
-                    if joined {
-                        self.on_entered_new_hall();
-                    }
-                    Ok(joined)
+                    self.execute_invite(username)
                 }
                 None => {
                     self.notify_friend_invite_decision(
                         username,
                         "已默认同意加入大厅,请注意启动麦克风",
                     );
-                    let joined = self.execute_invite(username)?;
-                    if joined {
-                        self.on_entered_new_hall();
-                    }
-                    Ok(joined)
+                    self.execute_invite(username)
                 }
                 Some(false) => {
                     log::info!("收到邀请拒绝，取消邀请");
@@ -2032,10 +2210,12 @@ mod app {
             }
         }
 
-        fn on_entered_new_hall(&mut self) {
+        fn on_entered_new_hall(&self) {
             log::info!("已进入新大厅，重置命令识别状态");
-            self.commands_enabled = true;
-            self.screen_lock_primed = false;
+            self.commands_enabled.store(true, AtomicOrdering::SeqCst);
+            self.screen_lock_primed.store(false, AtomicOrdering::SeqCst);
+            self.reset_locks_requested
+                .store(true, AtomicOrdering::SeqCst);
         }
 
         fn notify_friend_invite_decision(&self, username: &str, message: &str) {
@@ -2066,12 +2246,22 @@ mod app {
                             continue;
                         }
                     };
-                let messages = match scan_chat(
-                    &frame.image,
-                    &self.ocr_engine,
-                    &template_args,
-                    self.config.screen.chat_rect.into(),
-                ) {
+                let scan_result = {
+                    let engine = match self.ocr_engine() {
+                        Ok(engine) => engine,
+                        Err(error) => {
+                            log::error!("邀请确认 OCR 锁失败: {error:#}");
+                            continue;
+                        }
+                    };
+                    scan_chat(
+                        &frame.image,
+                        &engine,
+                        &template_args,
+                        self.config.screen.chat_rect.into(),
+                    )
+                };
+                let messages = match scan_result {
                     Ok(messages) => messages,
                     Err(error) => {
                         log::error!("邀请确认扫描失败: {error:#}");
@@ -2104,9 +2294,12 @@ mod app {
             else {
                 return output;
             };
+            let Ok(engine) = self.ocr_engine() else {
+                return output;
+            };
             let Ok(messages) = scan_chat(
                 &frame.image,
-                &self.ocr_engine,
+                &engine,
                 &template_args,
                 self.config.screen.chat_rect.into(),
             ) else {
@@ -2148,13 +2341,16 @@ mod app {
             }
             let frame_args = FrameArgs { image: None };
 
-            let Some(point) = self.find_text_point(
-                &self.ocr_engine,
-                &canvas,
-                self.config.invite.confirm_list_region.into(),
-                username,
-            )?
-            else {
+            let point = {
+                let engine = self.ocr_engine()?;
+                self.find_text_point(
+                    &engine,
+                    &canvas,
+                    self.config.invite.confirm_list_region.into(),
+                    username,
+                )?
+            };
+            let Some(point) = point else {
                 log::error!("邀请失败: 确认列表未找到用户 {}", username);
                 self.return_to_primary_from_transient_ui("邀请失败");
                 return Ok(false);
@@ -2193,6 +2389,9 @@ mod app {
                 };
                 let center = hit.center();
                 click_game_point(PointConfig::new(center.x, center.y), &self.config.window)?;
+                if label == "进入大厅" {
+                    self.on_entered_new_hall();
+                }
                 sleep(Duration::from_millis(self.config.timing.invite_step_ms));
             }
 
@@ -2233,13 +2432,16 @@ mod app {
                 self.config.timing.invite_open_chat_ms,
             ));
 
-            let Some(point) = self.find_text_point(
-                &self.ocr_engine,
-                canvas,
-                self.config.invite.friend_list_region.into(),
-                username,
-            )?
-            else {
+            let point = {
+                let engine = self.ocr_engine()?;
+                self.find_text_point(
+                    &engine,
+                    canvas,
+                    self.config.invite.friend_list_region.into(),
+                    username,
+                )?
+            };
+            let Some(point) = point else {
                 log::error!("好友聊天失败: 好友列表未找到用户 {}", username);
                 self.return_to_primary_from_transient_ui("好友聊天失败");
                 return Ok(false);
@@ -2370,17 +2572,15 @@ mod app {
 
         fn read_hall_info_sample_from_frame(&self, image: &DynamicImage) -> Result<HallInfoSample> {
             let name_crop = crop_canvas(image, self.config.screen.hall_name_rect.into())?;
-            let name = merged_ocr_text(
-                &self.ocr_engine,
-                &name_crop,
-                self.config.ocr.same_line_y_tolerance,
-            )?;
+            let name = {
+                let engine = self.ocr_engine()?;
+                merged_ocr_text(&engine, &name_crop, self.config.ocr.same_line_y_tolerance)?
+            };
             let time_crop = crop_canvas(image, self.config.screen.hall_time_rect.into())?;
-            let time_text = merged_ocr_text(
-                &self.ocr_engine,
-                &time_crop,
-                self.config.ocr.same_line_y_tolerance,
-            )?;
+            let time_text = {
+                let engine = self.ocr_engine()?;
+                merged_ocr_text(&engine, &time_crop, self.config.ocr.same_line_y_tolerance)?
+            };
             Ok(HallInfoSample {
                 name,
                 time_text: time_text.clone(),
@@ -2861,12 +3061,22 @@ mod app {
                             continue;
                         }
                     };
-                let messages = match scan_chat(
-                    &frame.image,
-                    &self.ocr_engine,
-                    &template_args,
-                    self.config.screen.chat_rect.into(),
-                ) {
+                let scan_result = {
+                    let engine = match self.ocr_engine() {
+                        Ok(engine) => engine,
+                        Err(error) => {
+                            log::error!("确认命令 OCR 锁失败: {error:#}");
+                            continue;
+                        }
+                    };
+                    scan_chat(
+                        &frame.image,
+                        &engine,
+                        &template_args,
+                        self.config.screen.chat_rect.into(),
+                    )
+                };
+                let messages = match scan_result {
                     Ok(messages) => messages,
                     Err(error) => {
                         log::error!("确认命令扫描失败: {error:#}");
@@ -2919,9 +3129,12 @@ mod app {
             else {
                 return output;
             };
+            let Ok(engine) = self.ocr_engine() else {
+                return output;
+            };
             let Ok(messages) = scan_chat(
                 &frame.image,
-                &self.ocr_engine,
+                &engine,
                 &template_args,
                 self.config.screen.chat_rect.into(),
             ) else {

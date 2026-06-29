@@ -1776,7 +1776,11 @@ mod app {
             if self.check_public_hall()? {
                 log::info!("邀请: 当前在公共大厅，直接执行");
                 self.notify_friend_invite_decision(username, "已同意加入大厅,请注意启动麦克风");
-                return self.execute_invite(username);
+                let joined = self.execute_invite(username)?;
+                if joined {
+                    self.on_entered_new_hall();
+                }
+                return Ok(joined);
             }
             let announce = format!(
                 "{}邀请BOT前往大厅,30s内@邀请确认@邀请拒绝,默认通过",
@@ -1784,19 +1788,31 @@ mod app {
             );
             if let Err(error) = self.reply(&announce) {
                 log::error!("邀请通告发送失败，直接执行邀请: {error:#}");
-                return self.execute_invite(username);
+                let joined = self.execute_invite(username)?;
+                if joined {
+                    self.on_entered_new_hall();
+                }
+                return Ok(joined);
             }
             match self.wait_for_invite_decision()? {
                 Some(true) => {
                     self.notify_friend_invite_decision(username, "已同意加入大厅,请注意启动麦克风");
-                    self.execute_invite(username)
+                    let joined = self.execute_invite(username)?;
+                    if joined {
+                        self.on_entered_new_hall();
+                    }
+                    Ok(joined)
                 }
                 None => {
                     self.notify_friend_invite_decision(
                         username,
                         "已默认同意加入大厅,请注意启动麦克风",
                     );
-                    self.execute_invite(username)
+                    let joined = self.execute_invite(username)?;
+                    if joined {
+                        self.on_entered_new_hall();
+                    }
+                    Ok(joined)
                 }
                 Some(false) => {
                     log::info!("收到邀请拒绝，取消邀请");
@@ -1805,6 +1821,12 @@ mod app {
                     Ok(false)
                 }
             }
+        }
+
+        fn on_entered_new_hall(&mut self) {
+            log::info!("已进入新大厅，重置命令识别状态");
+            self.commands_enabled = true;
+            self.screen_lock_primed = false;
         }
 
         fn notify_friend_invite_decision(&self, username: &str, message: &str) {

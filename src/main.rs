@@ -1348,6 +1348,8 @@ mod app {
                 return Ok(None);
             }
 
+            self.reply("AI匹配中")?;
+
             let candidates = match self.feeluown.search_candidates(&song.keyword, "") {
                 Ok(candidates) => candidates,
                 Err(error) => {
@@ -2200,7 +2202,7 @@ mod app {
         fn play_uri_confirmed(
             &mut self,
             uri: &str,
-            display_keyword: &str,
+            _display_keyword: &str,
             match_keyword: &str,
             prefer_accompaniment: bool,
         ) -> Result<PlayOutcome> {
@@ -2223,7 +2225,6 @@ mod app {
                     return Ok(PlayOutcome::Error);
                 }
             }
-            self.reply(&format!("正在播放AI候选: {}", display_keyword))?;
             self.confirm_playback_started(
                 match_keyword,
                 "",

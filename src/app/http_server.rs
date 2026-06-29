@@ -42,7 +42,7 @@ use super::runtime_state::PersistentRuntimeState;
 
 const MAX_ACTIVE_CONNECTIONS: usize = 32;
 const PAGE: &str = include_str!("page.html");
-const KNOWN_ROUTES: &str = "/status, /play, /pause, /skip-next, /skip-prev, /volume, /searchPlay, /searchSource, /search, /open-scheme, /history, /clear-history, /health, /admin-status, /restart-admin, /active-window, /queue, /queue/add, /queue/remove, /queue/clear, /state, /state/save, /ai/recognize, /ai/match, /ai/pick";
+const KNOWN_ROUTES: &str = "/status, /play, /pause, /skip-next, /skip-prev, /volume, /searchPlay, /searchSource, /search, /open-scheme, /history, /clear-history, /health, /admin-status, /restart-admin, /active-window, /queue, /queue/add, /queue/remove, /queue/clear, /state, /state/save, /ai/recognize, /ai/match, /ai/pick, /ai/search";
 
 #[derive(Clone)]
 pub struct HttpSharedState {
@@ -387,6 +387,25 @@ fn route(
                     message: error.to_string(),
                 }
             })
+        }
+        "/ai/search" => {
+            let keyword = normalize_keyword(query_value(query, "keyword"))?;
+            let prefer = parse_bool(query_value_or(
+                query,
+                "preferAccompaniment",
+                "accompaniment",
+            ));
+            if !ai::AiClient::new(&state.config.ai, &state.config.timing).enabled() {
+                return Err(bad_request("AI点歌未启用，请先配置 ai.api_key"));
+            }
+            let ai_client = ai::AiClient::new(&state.config.ai, &state.config.timing);
+            let result = ai_client
+                .search_and_pick(&client, &keyword, prefer)
+                .map_err(|error| AppError {
+                    status: 500,
+                    message: error.to_string(),
+                })?;
+            serde_json::to_string(&result).map_err(internal_error)
         }
         "/history" => history_json(state),
         "/clear-history" => clear_history(state),
@@ -1097,6 +1116,7 @@ fn is_json_route(path: &str) -> bool {
             | "/ai/recognize"
             | "/ai/match"
             | "/ai/pick"
+            | "/ai/search"
             | "/history"
     )
 }
@@ -1131,6 +1151,7 @@ fn is_mutating_route(path: &str) -> bool {
             | "/ai/recognize"
             | "/ai/match"
             | "/ai/pick"
+            | "/ai/search"
             | "/clear-history"
     )
 }

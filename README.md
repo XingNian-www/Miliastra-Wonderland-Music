@@ -189,6 +189,7 @@ Main endpoints:
 /ai/recognize
 /ai/match
 /ai/pick
+/ai/search
 ```
 
 `@AI点歌` first searches FeelUOwn with the original request and asks AI to pick one URI from the returned candidates. AI does not rewrite the search text.

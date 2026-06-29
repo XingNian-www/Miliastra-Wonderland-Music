@@ -1,26 +1,31 @@
-# Miliastra Wonderland Music
+# 某动漫游戏点歌机器人
 
-Windows-only Rust music request bot for Miliastra Wonderland chat. It watches the game chat area with template matching and OCR, parses `@` commands, controls FeelUOwn through TCP RPC, and sends responses back into the game chat through keyboard and mouse automation.
+这是一个仅支持 Windows 的 Rust 点歌机器人。程序会识别某动漫游戏聊天区里的 `@` 命令，通过 FeelUOwn 控制搜索、播放、歌词和状态，并用键盘鼠标自动把回复发回游戏聊天
 
-## Features
+## 主要功能
 
-- Captures the target game window client area, not the full desktop
-- Locates chat messages with blue/yellow/pink marker templates, then runs Chinese OCR on each message block
-- Supports song requests, queue control, playback control, volume, status, lyrics, hall detection, invitations, and microphone toggling
-- Uses FeelUOwn TCP RPC for search, playback, status, lyrics, and queue transitions
-- Provides a local Web/API panel on `127.0.0.1:18888`
-- Persists queue and runtime state under `data/`
-- Writes file logs
-- Includes manual debug tools for screenshots, OCR, chat scanning, UI state, template matching, chat sending, chat change monitoring, and panel response benchmarking
-- Supports global hotkeys: `F7` pause/resume scanning, `F12` exit
+- 只截取目标游戏窗口客户区，不截取整个桌面
+- 通过蓝色、黄色、粉色聊天标志定位消息，再对消息块做中文识别
+- 支持点歌、AI 点歌、队列、播放控制、音量、状态、歌词、大厅检测、大厅时间、邀请和麦克风切换
+- 点歌默认使用 QQ 音乐源，也可以用命令指定网易云音乐源
+- 点歌会先搜索候选，搜到后让用户确认、跳过、换源或改用 AI；超时会自动确认
+- 播放统一走搜索结果 URI，避免播放器内部模糊搜索选错歌
+- AI 点歌会先从各音乐源搜索候选，再让 AI 从候选里选择最合适的一项
+- 队列支持持久化，当前歌曲快结束、暂停或停止时可自动出队播放下一首
+- 命令执行在后台线程进行，聊天扫描会持续运行
+- 好友粉色命令支持邀请、麦克风切换、禁用/启用大厅命令识别
+- 提供本地网页和接口面板，默认监听 `127.0.0.1:18888`
+- 运行状态、队列和日志都会写入本地文件
+- 提供手动调试工具，用于截图、识别、聊天扫描、界面状态、模板匹配、发送测试、AI 搜索测试等
+- 支持全局热键：`F7` 暂停/恢复扫描，`F12` 退出
 
-The previous BGI script path has been removed. This repository is now a standalone Rust application.
+## 构建 Windows 程序
 
-## Build Windows Exe
+仓库内置 GitHub Actions 工作流：`.github/workflows/build-windows-exe.yml`
 
-GitHub Actions includes `.github/workflows/build-windows-exe.yml`. It does not run on push by default. Run `Build Windows exe` manually from the GitHub Actions page. A successful run creates or updates a GitHub Release and uploads the Windows x64 zip package.
+这个工作流不会在每次推送时自动运行，需要在 GitHub Actions 页面手动执行构建。构建成功后会创建或更新 GitHub Release，并上传 Windows x64 压缩包
 
-The workflow builds `x86_64-pc-windows-msvc` release artifacts and downloads PP-OCRv6 small models:
+构建会生成 `x86_64-pc-windows-msvc` 发布产物，并下载 PP-OCRv6 小模型：
 
 ```text
 models/PP-OCRv6_small_det.mnn
@@ -28,27 +33,27 @@ models/PP-OCRv6_small_rec.mnn
 models/ppocr_keys_v6_small.txt
 ```
 
-Uploaded artifact:
+发布包结构大致如下：
 
 ```text
-miliastra-wonderland-music-windows-x64/
-├── miliastra-wonderland-music.exe
+程序发布包/
+├── 程序.exe
 ├── MNN.dll
 ├── assets/
 ├── models/
 └── README.md
 ```
 
-## Local Build
+## 本地构建
 
-Official release builds target Windows MSVC and use the vendored `alibaba/MNN` 3.6.0 Windows x64 dynamic library:
+正式发布建议使用 Windows MSVC 目标，并使用仓库内置的 MNN 3.6.0 Windows x64 动态库：
 
 ```powershell
 rustup default stable-x86_64-pc-windows-msvc
 cargo build --release
 ```
 
-The repository includes the required MNN runtime files:
+仓库包含所需的 MNN 运行文件：
 
 ```text
 vendor/mnn/3.6.0/windows-x64/include/
@@ -56,44 +61,44 @@ vendor/mnn/3.6.0/windows-x64/lib/MNN.lib
 vendor/mnn/3.6.0/windows-x64/bin/MNN.dll
 ```
 
-`MNN.dll` is copied next to the release executable during build. The OCR backend defaults to CPU. CUDA, Vulkan, OpenCL, source-built MNN, and `zibo-chen/MNN-Prebuilds` are not supported release paths.
+构建时会把 `MNN.dll` 复制到发布程序旁边。识别后端默认使用 CPU。发布路径不支持 CUDA、Vulkan、OpenCL、源码编译版 MNN 或其他预编译 MNN 包
 
-Target machines also need Microsoft Visual C++ Redistributable 2015-2022 x64 because the official MNN dynamic library depends on `MSVCP140.dll`, `VCRUNTIME140.dll`, and `VCRUNTIME140_1.dll`.
+运行机器还需要安装 Microsoft Visual C++ Redistributable 2015-2022 x64，因为官方 MNN 动态库依赖 `MSVCP140.dll`、`VCRUNTIME140.dll` 和 `VCRUNTIME140_1.dll`
 
-Linux can run checks for the Windows GNU target, but this is not a release build path:
+Linux 可以用来做 Windows GNU 目标的检查，但这不是正式发布构建路径：
 
 ```bash
 cargo check --target x86_64-pc-windows-gnu --features ocr-rs/docsrs
 ```
 
-## Run
+## 运行
+
+直接运行：
 
 ```powershell
-miliastra-wonderland-music.exe
+程序.exe
 ```
 
-With explicit config:
+指定配置文件运行：
 
 ```powershell
-miliastra-wonderland-music.exe --config config.yaml run
+程序.exe --config config.yaml run
 ```
 
-The first launch creates `config.yaml` with comments and defaults.
+首次启动会自动创建带注释的 `config.yaml`
 
-## Requirements
+## 运行要求
 
-- Windows
-- Target game process, default `yuanshen.exe`
-- FeelUOwn with TCP RPC enabled, default `127.0.0.1:23333`
-- OCR models in `models/`
-- Template images in `assets/`
-- Microsoft Visual C++ Redistributable 2015-2022 x64
+- Windows 系统
+- 某动漫游戏进程正在运行，并已在 `config.yaml` 的 `window.target_process` 中填写进程名
+- FeelUOwn 已启动并开启 TCP RPC，默认地址 `127.0.0.1:23333`
+- `models/` 目录里有识别模型
+- `assets/` 目录里有聊天标志和界面按钮模板
+- 已安装 Microsoft Visual C++ Redistributable 2015-2022 x64
 
-## Chat Commands
+## 聊天命令
 
-Commands must start with `@` after the chat name separator.
-
-Examples:
+普通聊天命令需要出现在聊天名称分隔符之后，并以 `@` 开头
 
 ```text
 用户: @点歌 晴天
@@ -102,72 +107,92 @@ Examples:
 用户: @网易点歌 晴天
 用户: @暂停
 用户: @继续
+用户: @播放
 用户: @下一首
 用户: @上一首
 用户: @音量 30
 用户: @状态
 用户: @歌词
 用户: @队列
+用户: @队列删除 1
+用户: @队列清空
 用户: @帮助
 用户: @大厅检测
 用户: @大厅时间
 ```
 
-Friend-only pink message commands:
+粉色好友命令：
 
 ```text
 @邀请1
 @麦克风
+@禁用
+@启用
 ```
 
-Queue commands:
+说明：
 
-```text
-@队列删除 1
-@队列清空
-```
+- `@点歌` 默认使用 QQ 音乐源
+- `@QQ点歌` 强制使用 QQ 音乐源
+- `@网易点歌` 强制使用网易云音乐源
+- 歌名里带“伴奏”时会优先匹配伴奏版本
+- `@麦克风` 只执行一次状态切换，不再判断当前开关状态
+- `@禁用` 会停止识别蓝色/黄色大厅命令，但粉色好友命令仍然可用
+- `@启用` 会恢复蓝色/黄色大厅命令识别
 
-When a requested song cannot be confidently matched, the bot can ask for confirmation and accepts:
+点歌确认命令：
 
 ```text
 @确认
 @跳过
 @换源
+@AI
 ```
 
-## Manual Tools
+当点歌搜到候选时，机器人会回复类似：
+
+```text
+搜索到:歌曲名,@确认@跳过@换源@AI
+```
+
+20 秒内无人选择时会自动确认。没有搜到候选时会提示当前平台没有对应音源，并允许换源或改用 AI
+
+## 手动调试工具
+
+启动手动工具：
 
 ```powershell
-miliastra-wonderland-music.exe --config config.yaml manual
+程序.exe --config config.yaml manual
 ```
 
-Manual menu includes:
+手动菜单包含：
 
-- Screenshot capture
-- OCR region recognition
-- Chat area scanning
-- UI state detection
-- Template matching
-- Coordinate click
-- Key press
-- Chat send test
-- OCR GPU support probe
-- Chat change monitor
-- Panel response benchmark
+- 截图保存
+- 指定区域文字识别
+- 聊天区扫描
+- 界面状态检测
+- 模板匹配
+- 坐标点击
+- 按键测试
+- 聊天发送测试
+- 识别后端支持检测
+- 聊天变化监听
+- 面板响应耗时测试
+- AI 点歌搜索测试
 
-Panel response benchmark presses `Enter` to open chat and `Esc` to close it, then samples the configured detection area until the panel is stable. It prints per-round first-change time, stable time, average, maximum, and failure count.
+面板响应耗时测试会按 `Enter` 打开聊天，再按 `Esc` 关闭聊天，采样配置中的检测区域，输出首次变化耗时、稳定耗时、平均值、最大值和失败次数
 
-## Web/API Panel
+## 本地网页和接口
 
-The local panel listens on:
+默认监听地址：
 
 ```text
 http://127.0.0.1:18888
 ```
 
-The server rejects cross-site control requests. Mutating endpoints accept local or same-origin requests only.
+会拒绝跨站控制请求。会改变状态的接口只接受本机或同源请求
 
-Main endpoints:
+主要接口：
 
 ```text
 /status
@@ -177,6 +202,9 @@ Main endpoints:
 /skip-prev
 /volume
 /searchPlay
+/searchSource
+/search
+/open-scheme
 /queue
 /queue/add
 /queue/remove
@@ -185,6 +213,9 @@ Main endpoints:
 /state/save
 /history
 /clear-history
+/health
+/admin-status
+/restart-admin
 /active-window
 /ai/recognize
 /ai/match
@@ -192,13 +223,13 @@ Main endpoints:
 /ai/search
 ```
 
-`@AI点歌` first searches FeelUOwn with the original request and asks AI to pick one URI from the returned candidates. AI does not rewrite the search text.
+`/ai/search` 用于测试 AI 点歌搜索。它会先调用 FeelUOwn 搜索候选，再让 AI 从候选中选择 URI，不会让 AI 自己改写搜索词
 
-## Configuration Notes
+## 配置说明
 
-`config.yaml` includes `config_version`. When an older config is detected, the app rewrites it from the latest commented template, migrates matching values into the new locations, creates a timestamped `.bak-*` backup, and appends unmigrated old fields as comments at the end. Those commented fields do not affect runtime.
+`config.yaml` 包含 `config_version`。如果检测到旧版本配置，程序会用最新带注释模板重写配置，把旧值迁移到新位置，创建带时间戳的 `.bak-*` 备份，并把无法自动迁移的旧字段追加到文件末尾作为注释。追加的注释字段不会影响运行
 
-Default chat area:
+默认聊天区域：
 
 ```yaml
 screen:
@@ -209,7 +240,7 @@ screen:
     height: 143
 ```
 
-Current timing defaults:
+当前主要时间参数默认值：
 
 ```yaml
 timing:
@@ -219,26 +250,35 @@ timing:
   chat_change_cooldown_ms: 250
   post_command_settle_ms: 500
   command_ui_timeout_ms: 15000
+  decision_timeout_ms: 20000
 ```
 
-Game chat replies are capped at display width 80, roughly 40 full-width Chinese characters or 80 ASCII characters.
+队列默认配置：
 
-## Logs And State
+```yaml
+queue:
+  max_size: 5
+  auto_advance_seconds: 2
+```
 
-- Logs: `logs/miliastra-wonderland-music.log`
-- Runtime state: `data/runtime-state.json`
-- Queue: `data/queue.json`
+游戏内回复会限制显示宽度为 80，约等于 40 个全角中文字符或 80 个半角字符
 
-Log prefix format:
+## 日志和状态文件
+
+- 日志：`logs/程序日志.log`
+- 运行状态：`data/runtime-state.json`
+- 点歌队列：`data/queue.json`
+
+日志前缀格式：
 
 ```text
 [MM-DD HH:MM:SS][INFO ] : message
 ```
 
-The timestamp uses UTC+8.
+时间使用 UTC+8
 
-## License
+## 许可证
 
-This project is licensed under the MIT License. See [LICENSE](LICENSE).
+本项目使用 MIT 许可证，详见 [LICENSE](LICENSE)
 
-Third-party components keep their own licenses. The vendored MNN binary and headers are distributed under Apache-2.0; see `vendor/mnn/3.6.0/LICENSE.txt`.
+第三方组件保留各自许可证。仓库内置的 MNN 二进制文件和头文件使用 Apache-2.0，详见 `vendor/mnn/3.6.0/LICENSE.txt`

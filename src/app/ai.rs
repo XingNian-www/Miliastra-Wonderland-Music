@@ -379,9 +379,9 @@ fn build_candidate_pick_prompt(
         "只返回 JSON，不要解释、不要注释、不要 Markdown 代码块。".to_string(),
         "必须输出结构：{\"uri\":string,\"score\":number,\"reason\":string}。".to_string(),
         "uri 必须逐字等于候选列表中的一个 uri，不能编造，不能改写。".to_string(),
-        "歌名必须字面包含用户输入的关键词，不能靠语义、翻译、近义词去猜。".to_string(),
-        "例如用户点歌 nostalgia，候选歌名必须包含 nostalgia 或其一部分，不能选 memories、reminiscence 等语义相近但字面不同的歌名。".to_string(),
-        "歌手也必须字面匹配，不能靠语义替换。".to_string(),
+        "歌名和歌手以字面匹配为主：用户输入的每个关键词应在候选标题中找到对应文字（允许大小写、空格、标点差异）。".to_string(),
+        "翻译名、别名、罗马音可作为补充匹配，但优先级低于字面匹配。".to_string(),
+        "不要仅凭语义相近就选择字面完全不同的歌名或歌手。".to_string(),
         "优先原唱、正式版、清晰标题。".to_string(),
         "避开翻唱、DJ、钢琴版、纯音乐、Live、片段、伴奏，除非用户明确要求。".to_string(),
         "伴奏标记包括但不限于：伴奏、伴唱、纯伴奏、纯伴唱、Inst.、Instrumental、Karaoke、KTV、消音、minus one，看到这些标记视为伴奏版。".to_string(),
@@ -390,7 +390,7 @@ fn build_candidate_pick_prompt(
         } else {
             "用户没有要求伴奏，不要选择任何带伴奏标记的候选。".to_string()
         },
-        "不要因为平台偏好压过歌名和歌手的字面匹配度。".to_string(),
+        "不要因为平台偏好压过歌名和歌手的匹配度。".to_string(),
         "score 范围 0 到 1，reason 简短说明选择原因。".to_string(),
         format!("用户点歌：{}", request),
         format!("候选列表：{}", serde_json::to_string(&candidates_json).unwrap_or_default()),

@@ -30,6 +30,7 @@ pub enum UserCommand {
     Microphone { username: String },
     DisableCommands { username: String },
     EnableCommands { username: String },
+    IdleExit { minutes: u32 },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -190,6 +191,37 @@ fn parse_pink_text(text: &str) -> Option<ParsedCommand> {
         }
         return None;
     }
+    if let Some(rest) = command_text.strip_prefix("闲置退出") {
+        let rest = rest.trim_start_matches(['：', ':', ' ', '\t']);
+        if rest.is_empty() || rest.starts_with([']', '】']) {
+            return Some(ParsedCommand {
+                matched: "闲置退出".to_string(),
+                raw: "闲置退出 30".to_string(),
+                command: UserCommand::IdleExit { minutes: 30 },
+            });
+        }
+        let digits = rest
+            .chars()
+            .take_while(|ch| ch.is_ascii_digit())
+            .collect::<String>();
+        if digits.is_empty() {
+            return None;
+        }
+        let suffix = rest[digits.len()..].trim_start();
+        let suffix = suffix
+            .strip_prefix("分钟")
+            .or_else(|| suffix.strip_prefix('分'))
+            .unwrap_or(suffix);
+        if !command_boundary(suffix.chars().next()) {
+            return None;
+        }
+        let minutes = digits.parse::<u32>().ok()?.max(15);
+        return Some(ParsedCommand {
+            matched: "闲置退出".to_string(),
+            raw: format!("闲置退出 {}", minutes),
+            command: UserCommand::IdleExit { minutes },
+        });
+    }
     None
 }
 
@@ -307,6 +339,9 @@ fn same_user_command(left: &UserCommand, right: &UserCommand) -> bool {
             UserCommand::EnableCommands { username: left },
             UserCommand::EnableCommands { username: right },
         ) => identity_text(left) == identity_text(right),
+        (UserCommand::IdleExit { minutes: left }, UserCommand::IdleExit { minutes: right }) => {
+            left == right
+        }
         (UserCommand::Volume(left), UserCommand::Volume(right)) => {
             identity_text(left) == identity_text(right)
         }
@@ -350,6 +385,7 @@ fn command_lock_key(command: &UserCommand) -> String {
         }
         UserCommand::DisableCommands { username: _ } => "disable_commands".to_string(),
         UserCommand::EnableCommands { username: _ } => "enable_commands".to_string(),
+        UserCommand::IdleExit { minutes } => format!("idle_exit:{}", minutes),
     }
 }
 
@@ -628,6 +664,24 @@ mod tests {
     #[test]
     fn rejects_disable_with_param() {
         assert!(parse_text("[Alice]：@禁用命令", "pink").is_none());
+    }
+
+    #[test]
+    fn parses_idle_exit_default() {
+        let parsed = parse_text("[Alice]：@闲置退出", "pink").expect("parse idle exit");
+        assert_eq!(parsed.command, UserCommand::IdleExit { minutes: 30 });
+    }
+
+    #[test]
+    fn parses_idle_exit_with_minimum() {
+        let parsed = parse_text("[Alice]：@闲置退出 5", "pink").expect("parse idle exit");
+        assert_eq!(parsed.command, UserCommand::IdleExit { minutes: 15 });
+    }
+
+    #[test]
+    fn parses_idle_exit_with_minutes_suffix() {
+        let parsed = parse_text("[Alice]：@闲置退出 20分钟", "pink").expect("parse idle exit");
+        assert_eq!(parsed.command, UserCommand::IdleExit { minutes: 20 });
     }
 
     #[test]

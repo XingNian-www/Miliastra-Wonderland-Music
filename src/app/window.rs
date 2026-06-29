@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow, bail};
 use enigo::{Button, Coordinate, Direction, Enigo, Mouse};
 use image::DynamicImage;
-use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, POINT, RECT};
+use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, ClientToScreen, CreateCompatibleBitmap,
     CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits, HGDIOBJ,
@@ -14,8 +14,8 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GA_ROOT, GetAncestor, GetClientRect, GetWindowThreadProcessId, HWND_NOTOPMOST,
-    HWND_TOPMOST, IsIconic, IsWindowVisible, SW_RESTORE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
-    SetWindowPos, ShowWindow, WindowFromPoint,
+    HWND_TOPMOST, IsIconic, IsWindowVisible, PostMessageW, SW_RESTORE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_SHOWWINDOW, SetWindowPos, ShowWindow, WM_CLOSE, WindowFromPoint,
 };
 use windows::core::BOOL;
 
@@ -182,6 +182,12 @@ impl GameWindow {
 
 pub fn capture_game(config: &WindowConfig) -> Result<DynamicImage> {
     GameWindow::find(config)?.capture()
+}
+
+pub fn close_game(config: &WindowConfig) -> Result<()> {
+    let hwnd = GameWindow::find(config)?.hwnd;
+    unsafe { PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) }
+        .context("PostMessageW WM_CLOSE failed")
 }
 
 fn capture_client_area(hwnd: HWND, width: i32, height: i32) -> Result<DynamicImage> {

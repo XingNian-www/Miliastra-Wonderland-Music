@@ -53,6 +53,7 @@ mod app {
 
     const CHAT_MARKER_SEARCH_WIDTH: u32 = 60;
     const HALL_INFO_OCR_SAMPLES: usize = 3;
+    const IDLE_EXIT_MIN_MINUTES: u32 = 15;
 
     static WINDOW_CAPTURE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -747,9 +748,16 @@ mod app {
         reset_locks_requested: Arc<AtomicBool>,
         invite_executed_seqs: Arc<Mutex<HashSet<u32>>>,
         commands_enabled: Arc<AtomicBool>,
+        idle_exit: Arc<Mutex<Option<IdleExitState>>>,
         running: Arc<AtomicBool>,
         paused: Arc<AtomicBool>,
         command_executing: Arc<AtomicBool>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct IdleExitState {
+        timeout: Duration,
+        last_command_at: Instant,
     }
 
     #[derive(Clone, Debug)]
@@ -834,6 +842,7 @@ mod app {
                 reset_locks_requested: Arc::new(AtomicBool::new(false)),
                 invite_executed_seqs: Arc::new(Mutex::new(HashSet::new())),
                 commands_enabled: Arc::new(AtomicBool::new(true)),
+                idle_exit: Arc::new(Mutex::new(None)),
                 running: Arc::new(AtomicBool::new(true)),
                 paused: Arc::new(AtomicBool::new(false)),
                 command_executing: Arc::new(AtomicBool::new(false)),
@@ -875,6 +884,7 @@ mod app {
                 reset_locks_requested: self.reset_locks_requested.clone(),
                 invite_executed_seqs: self.invite_executed_seqs.clone(),
                 commands_enabled: self.commands_enabled.clone(),
+                idle_exit: self.idle_exit.clone(),
                 running: self.running.clone(),
                 paused: self.paused.clone(),
                 command_executing: self.command_executing.clone(),
@@ -1165,6 +1175,7 @@ mod app {
                     last_fingerprint = None;
                     last_ocr_at = Instant::now();
                 }
+                self.maybe_idle_exit()?;
                 sleep(Duration::from_millis(self.config.timing.scan_loop_idle_ms));
             }
 
@@ -1256,12 +1267,60 @@ mod app {
                     UserCommand::EnableCommands { username: _ } => {
                         self.commands_enabled.store(true, AtomicOrdering::SeqCst);
                     }
+                    UserCommand::IdleExit { minutes } => {
+                        self.record_command_activity()?;
+                        self.configure_idle_exit(*minutes)?;
+                        continue;
+                    }
                     _ => {}
                 }
                 log::info!("命令已加入待处理队列: {}", pending.parsed.raw);
+                self.record_command_activity()?;
                 self.push_pending_task(PendingTask::Command(pending))?;
             }
             Ok(())
+        }
+
+        fn record_command_activity(&self) -> Result<()> {
+            let mut state = self
+                .idle_exit
+                .lock()
+                .map_err(|_| anyhow!("idle_exit mutex poisoned"))?;
+            if let Some(state) = state.as_mut() {
+                state.last_command_at = Instant::now();
+            }
+            Ok(())
+        }
+
+        fn maybe_idle_exit(&self) -> Result<()> {
+            let Some(timeout) = self.idle_exit_due()? else {
+                return Ok(());
+            };
+            if !self.executor_is_idle()? {
+                return Ok(());
+            }
+            log::info!("闲置退出触发: {}分钟无新命令", timeout.as_secs() / 60);
+            if let Err(error) = window::close_game(&self.config.window) {
+                log::error!("关闭目标窗口失败: {error:#}");
+            }
+            self.running.store(false, AtomicOrdering::SeqCst);
+            self.notify_pending_executor();
+            Ok(())
+        }
+
+        fn idle_exit_due(&self) -> Result<Option<Duration>> {
+            let state = self
+                .idle_exit
+                .lock()
+                .map_err(|_| anyhow!("idle_exit mutex poisoned"))?;
+            let Some(state) = state.as_ref() else {
+                return Ok(None);
+            };
+            if state.last_command_at.elapsed() >= state.timeout {
+                Ok(Some(state.timeout))
+            } else {
+                Ok(None)
+            }
         }
 
         fn run_pending_command_loop(&mut self) -> Result<()> {
@@ -2025,7 +2084,25 @@ mod app {
                     self.commands_enabled.store(true, AtomicOrdering::SeqCst);
                     self.reply("管理员已启用大厅命令识别功能")?;
                 }
+                UserCommand::IdleExit { minutes: _ } => {}
             };
+            Ok(())
+        }
+
+        fn configure_idle_exit(&self, minutes: u32) -> Result<()> {
+            let minutes = minutes.max(IDLE_EXIT_MIN_MINUTES);
+            let mut state = self
+                .idle_exit
+                .lock()
+                .map_err(|_| anyhow!("idle_exit mutex poisoned"))?;
+            *state = Some(IdleExitState {
+                timeout: Duration::from_secs(minutes as u64 * 60),
+                last_command_at: Instant::now(),
+            });
+            log::info!(
+                "已设置闲置退出: {}分钟无新命令后关闭目标窗口并退出",
+                minutes
+            );
             Ok(())
         }
 

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -16,6 +17,7 @@ const OPENAI_MODEL: &str = "gpt-4o-mini";
 const DEEPSEEK_ENDPOINT: &str = "https://api.deepseek.com/chat/completions";
 const DEEPSEEK_MODEL: &str = "deepseek-chat";
 const CANDIDATE_PICK_LIMIT: usize = 30;
+const CANDIDATES_PER_SOURCE: usize = 5;
 
 #[derive(Clone)]
 pub struct AiClient {
@@ -113,11 +115,7 @@ impl AiClient {
     ) -> Result<AiCandidatePickResult> {
         let provider = resolve_provider_config(&self.config, None)?;
         let request = normalize_required(request, "request")?;
-        let candidates = candidates
-            .iter()
-            .take(CANDIDATE_PICK_LIMIT)
-            .cloned()
-            .collect::<Vec<_>>();
+        let candidates = truncate_candidates_per_source(candidates, CANDIDATES_PER_SOURCE);
         if candidates.is_empty() {
             bail!("缺少搜索候选");
         }
@@ -153,6 +151,34 @@ impl AiClient {
             pick: Some(pick),
         })
     }
+}
+
+fn truncate_candidates_per_source(
+    candidates: &[SearchCandidate],
+    per_source: usize,
+) -> Vec<SearchCandidate> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    let mut result = Vec::new();
+    for candidate in candidates {
+        let source = candidate_source(&candidate.uri);
+        let count = counts.entry(source).or_insert(0);
+        if *count >= per_source {
+            continue;
+        }
+        *count += 1;
+        result.push(candidate.clone());
+        if result.len() >= CANDIDATE_PICK_LIMIT {
+            break;
+        }
+    }
+    result
+}
+
+fn candidate_source(uri: &str) -> String {
+    uri.strip_prefix("fuo://")
+        .and_then(|rest| rest.split('/').next())
+        .unwrap_or("unknown")
+        .to_string()
 }
 
 pub fn recognize_with_query(

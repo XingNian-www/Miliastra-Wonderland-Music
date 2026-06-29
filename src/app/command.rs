@@ -648,4 +648,19 @@ mod tests {
             })
         );
     }
+
+    #[test]
+    fn parses_default_song_command() {
+        let parsed = parse_text("用户：@点歌 晴天 周杰伦", "blue").expect("parse default song");
+        assert_eq!(
+            parsed.command,
+            UserCommand::Song(SongCommand {
+                keyword: "晴天 周杰伦".to_string(),
+                source: SongSource::QqMusic,
+                prefix: "点歌".to_string(),
+                prefer_accompaniment: false,
+                ai_assisted: false,
+            })
+        );
+    }
 }

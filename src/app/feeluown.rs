@@ -159,31 +159,22 @@ impl FeelUOwnClient {
         source: &str,
         prefer_accompaniment: bool,
     ) -> Result<PlaySearchResult> {
-        if !source.trim().is_empty() || prefer_accompaniment {
-            let picked = self
-                .search_and_pick(keyword, source, prefer_accompaniment)?
-                .ok_or_else(|| anyhow!("平台无对应歌曲音源"))?;
-            self.request(&format!("play {}", shell_quote(&picked.0.uri)))?;
-            return Ok(PlaySearchResult {
-                message: format!(
-                    "正在搜索: {}{}",
-                    keyword,
-                    if prefer_accompaniment {
-                        " (伴奏优先)"
-                    } else {
-                        ""
-                    }
-                ),
-                raw_search_result: picked.1,
-                candidate: Some(picked.0),
-            });
-        }
-
-        let body = self.request(&format!("play {}", shell_quote(keyword)))?;
+        let picked = self
+            .search_and_pick(keyword, source, prefer_accompaniment)?
+            .ok_or_else(|| anyhow!("平台无对应歌曲音源"))?;
+        self.request(&format!("play {}", shell_quote(&picked.0.uri)))?;
         Ok(PlaySearchResult {
-            message: format!("正在搜索: {}", keyword),
-            raw_search_result: body,
-            candidate: None,
+            message: format!(
+                "正在搜索: {}{}",
+                keyword,
+                if prefer_accompaniment {
+                    " (伴奏优先)"
+                } else {
+                    ""
+                }
+            ),
+            raw_search_result: picked.1,
+            candidate: Some(picked.0),
         })
     }
 

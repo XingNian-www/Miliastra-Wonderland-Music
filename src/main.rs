@@ -1920,6 +1920,10 @@ mod app {
             let result = self.execute_invite_steps(username);
             if result.is_err() {
                 self.return_to_primary_from_transient_ui("邀请失败");
+            } else if matches!(result, Ok(true)) {
+                log::info!("邀请成功，等待 10s 后兜底返回一级界面");
+                sleep(Duration::from_secs(10));
+                self.return_to_primary_fixed();
             }
             result
         }

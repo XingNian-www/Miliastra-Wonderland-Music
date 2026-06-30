@@ -90,6 +90,9 @@ pub fn parse_text(text: &str, message_type: &str) -> Option<ParsedCommand> {
     if message_type == "pink" {
         return parse_pink_text(text);
     }
+    if message_type != "blue" {
+        return None;
+    }
 
     let sep_index = text.find(['：', ':', ']', '】'])?;
     if text.starts_with("播放") && text.contains(" - ") {
@@ -697,6 +700,11 @@ mod tests {
                 ai_assisted: true,
             })
         );
+    }
+
+    #[test]
+    fn rejects_yellow_hall_command() {
+        assert!(parse_text("用户：@帮助", "yellow").is_none());
     }
 
     #[test]

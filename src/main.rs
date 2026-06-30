@@ -2385,6 +2385,9 @@ mod app {
                     }
                 };
                 for message in messages {
+                    if message.message_type != "blue" {
+                        continue;
+                    }
                     if is_existing_decision(&message, &existing) {
                         continue;
                     }
@@ -2422,6 +2425,9 @@ mod app {
                 return output;
             };
             for message in messages {
+                if message.message_type != "blue" {
+                    continue;
+                }
                 if parse_invite_decision(&message.text).is_some() {
                     let bottom = message.block.y + message.block.height as i32;
                     output
@@ -3208,6 +3214,9 @@ mod app {
                     }
                 };
                 for message in messages {
+                    if message.message_type != "blue" {
+                        continue;
+                    }
                     if message.text.is_empty()
                         || is_existing_decision(&message, &existing)
                         || is_decision_feedback_text(&message.text)
@@ -3265,6 +3274,9 @@ mod app {
                 return output;
             };
             for message in messages {
+                if message.message_type != "blue" {
+                    continue;
+                }
                 if parse_decision_command(&message.text).is_some() {
                     let bottom = message.block.y + message.block.height as i32;
                     output

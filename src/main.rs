@@ -774,6 +774,7 @@ mod app {
         prefer_accompaniment: bool,
         ai_original_text: String,
         uri: String,
+        skip_match_check: bool,
     }
 
     impl ResolvedSongRequest {
@@ -1630,7 +1631,7 @@ mod app {
         }
 
         fn resolve_song_request(
-            &self,
+            &mut self,
             song: &command::SongCommand,
         ) -> Result<Option<ResolvedSongRequest>> {
             if !song.ai_assisted {
@@ -1640,6 +1641,7 @@ mod app {
                     prefer_accompaniment: song.prefer_accompaniment,
                     ai_original_text: String::new(),
                     uri: String::new(),
+                    skip_match_check: false,
                 }));
             }
             if !self.ai.enabled() {
@@ -1690,12 +1692,21 @@ mod app {
                 pick.score,
                 pick.reason
             );
+            let message = format!("AI匹配:{},@确认@跳过", candidate.text);
+            self.reply(&message)?;
+            match self.wait_for_decision(false, false, true)? {
+                UserDecision::Confirm | UserDecision::Timeout => {}
+                UserDecision::Skip => return Ok(None),
+                UserDecision::PromptFailed | UserDecision::Stopped => return Ok(None),
+                _ => return Ok(None),
+            }
             Ok(Some(ResolvedSongRequest {
                 keyword: candidate.text.clone(),
                 source: String::new(),
                 prefer_accompaniment: song.prefer_accompaniment,
                 ai_original_text: song.keyword.clone(),
                 uri: candidate.uri.clone(),
+                skip_match_check: true,
             }))
         }
 
@@ -1760,6 +1771,7 @@ mod app {
                             prefer_accompaniment: request.prefer_accompaniment,
                             ai_original_text: String::new(),
                             uri,
+                            skip_match_check: false,
                         }));
                     }
                     UserDecision::Skip => {
@@ -1831,6 +1843,7 @@ mod app {
                     prefer_accompaniment: song.prefer_accompaniment,
                     ai_original_text: String::new(),
                     uri: picked.0.uri.clone(),
+                    skip_match_check: false,
                 })),
                 UserDecision::Skip => Ok(None),
                 UserDecision::SwitchSource => {
@@ -1892,12 +1905,21 @@ mod app {
                 pick.score,
                 pick.reason
             );
+            let message = format!("AI匹配:{},@确认@跳过", candidate.text);
+            self.reply(&message)?;
+            match self.wait_for_decision(false, false, true)? {
+                UserDecision::Confirm | UserDecision::Timeout => {}
+                UserDecision::Skip => return Ok(None),
+                UserDecision::PromptFailed | UserDecision::Stopped => return Ok(None),
+                _ => return Ok(None),
+            }
             Ok(Some(ResolvedSongRequest {
                 keyword: candidate.text.clone(),
                 source: String::new(),
                 prefer_accompaniment: song.prefer_accompaniment,
                 ai_original_text: song.keyword.clone(),
                 uri: candidate.uri.clone(),
+                skip_match_check: true,
             }))
         }
 
@@ -1955,16 +1977,18 @@ mod app {
                     let status = self.feeluown.status();
                     match status {
                         Ok(status) if is_playing(&status) => {
-                            let current_match = song_matcher::match_song_query(
-                                &self.config.matching,
-                                request.match_keyword(),
-                                &status.name,
-                                &status.singer,
-                                request.prefer_accompaniment,
-                            );
-                            if current_match.ok {
-                                self.reply(&format!("当前正在播放: {}", request.keyword))?;
-                                return Ok(());
+                            if !request.skip_match_check {
+                                let current_match = song_matcher::match_song_query(
+                                    &self.config.matching,
+                                    request.match_keyword(),
+                                    &status.name,
+                                    &status.singer,
+                                    request.prefer_accompaniment,
+                                );
+                                if current_match.ok {
+                                    self.reply(&format!("当前正在播放: {}", request.keyword))?;
+                                    return Ok(());
+                                }
                             }
                             if !self.runtime_state()?.state().current_song_is_requested {
                                 let mut runtime_state = self.runtime_state()?;
@@ -2777,6 +2801,7 @@ mod app {
                 &request.keyword,
                 request.match_keyword(),
                 request.prefer_accompaniment,
+                request.skip_match_check,
             )
         }
 
@@ -2786,12 +2811,13 @@ mod app {
             _display_keyword: &str,
             match_keyword: &str,
             prefer_accompaniment: bool,
+            skip_match_check: bool,
         ) -> Result<PlayOutcome> {
             self.clear_requested_song_state()?;
             let initial_song = self
                 .feeluown
                 .status()
-                .map(|status| format!("{}{}", status.name, status.singer))
+                .map(|status| (format!("{}{}", status.name, status.singer), status.progress))
                 .unwrap_or_default();
             match self.feeluown.play_uri(uri) {
                 Ok(_) => {}
@@ -2812,7 +2838,9 @@ mod app {
                 prefer_accompaniment,
                 false,
                 false,
-                initial_song,
+                initial_song.0,
+                initial_song.1,
+                skip_match_check,
             )
         }
 
@@ -2833,7 +2861,7 @@ mod app {
             let initial_song = self
                 .feeluown
                 .status()
-                .map(|status| format!("{}{}", status.name, status.singer))
+                .map(|status| (format!("{}{}", status.name, status.singer), status.progress))
                 .unwrap_or_default();
 
             let result =
@@ -2867,7 +2895,9 @@ mod app {
                 prefer_accompaniment,
                 allow_switch_source,
                 confirm_after_switch,
-                initial_song,
+                initial_song.0,
+                initial_song.1,
+                false,
             )
         }
 
@@ -2879,6 +2909,8 @@ mod app {
             allow_switch_source: bool,
             confirm_after_switch: bool,
             initial_song: String,
+            initial_progress: f64,
+            skip_match_check: bool,
         ) -> Result<PlayOutcome> {
             sleep(Duration::from_millis(
                 self.config.timing.play_search_settle_ms,
@@ -2910,95 +2942,114 @@ mod app {
                 }
 
                 let current_song = format!("{}{}", status.name, status.singer);
-                let local_match = song_matcher::match_song_query(
-                    &self.config.matching,
-                    keyword,
-                    &status.name,
-                    &status.singer,
-                    prefer_accompaniment,
-                );
-                if !local_match.ok {
-                    log::info!("歌曲暂不匹配: {}", local_match.reason);
-                    if !current_song.is_empty() && current_song == last_seen_song {
-                        log::info!(
-                            "歌曲未变化，搜索可能尚未完成，继续等待 ({}/{})",
-                            retry + 1,
-                            self.config.timing.play_status_retries
-                        );
-                        sleep(Duration::from_millis(
-                            self.config.timing.play_status_poll_ms,
-                        ));
-                        continue;
-                    }
-                    if !current_song.is_empty() {
-                        last_seen_song = current_song.clone();
-                    }
+                if skip_match_check
+                    && !current_song.is_empty()
+                    && current_song == last_seen_song
+                    && !playback_progress_restarted(initial_progress, status.progress)
+                {
+                    log::info!(
+                        "歌曲未变化，等待 URI 播放生效 ({}/{})",
+                        retry + 1,
+                        self.config.timing.play_status_retries
+                    );
+                    sleep(Duration::from_millis(
+                        self.config.timing.play_status_poll_ms,
+                    ));
+                    continue;
+                }
+                if !skip_match_check {
+                    let local_match = song_matcher::match_song_query(
+                        &self.config.matching,
+                        keyword,
+                        &status.name,
+                        &status.singer,
+                        prefer_accompaniment,
+                    );
+                    if !local_match.ok {
+                        log::info!("歌曲暂不匹配: {}", local_match.reason);
+                        if !current_song.is_empty() && current_song == last_seen_song {
+                            log::info!(
+                                "歌曲未变化，搜索可能尚未完成，继续等待 ({}/{})",
+                                retry + 1,
+                                self.config.timing.play_status_retries
+                            );
+                            sleep(Duration::from_millis(
+                                self.config.timing.play_status_poll_ms,
+                            ));
+                            continue;
+                        }
+                        if !current_song.is_empty() {
+                            last_seen_song = current_song.clone();
+                        }
 
-                    let mut ai_auto_matched = false;
-                    if self.ai.enabled() {
-                        match self
-                            .ai
-                            .match_same_song(keyword, &status.name, &status.singer)
-                        {
-                            Ok(ai_match) if ai_match.matched => {
-                                log::info!(
-                                    "AI自动匹配通过: {} score={}",
-                                    ai_match.reason,
-                                    ai_match.score
-                                );
-                                match self.confirm_ai_auto_match(&status, allow_switch_source)? {
-                                    UserDecision::Skip => {
-                                        self.report_no_source(Some(&status), true)?;
-                                        return Ok(PlayOutcome::NoSource);
-                                    }
-                                    UserDecision::SwitchSource => {
-                                        if allow_switch_source {
-                                            return self.switch_source_and_play(
-                                                keyword,
-                                                search_source,
-                                                prefer_accompaniment,
-                                            );
+                        let mut ai_auto_matched = false;
+                        if self.ai.enabled() {
+                            match self
+                                .ai
+                                .match_same_song(keyword, &status.name, &status.singer)
+                            {
+                                Ok(ai_match) if ai_match.matched => {
+                                    log::info!(
+                                        "AI自动匹配通过: {} score={}",
+                                        ai_match.reason,
+                                        ai_match.score
+                                    );
+                                    match self
+                                        .confirm_ai_auto_match(&status, allow_switch_source)?
+                                    {
+                                        UserDecision::Skip => {
+                                            self.report_no_source(Some(&status), true)?;
+                                            return Ok(PlayOutcome::NoSource);
                                         }
+                                        UserDecision::SwitchSource => {
+                                            if allow_switch_source {
+                                                return self.switch_source_and_play(
+                                                    keyword,
+                                                    search_source,
+                                                    prefer_accompaniment,
+                                                );
+                                            }
+                                        }
+                                        UserDecision::Stopped => return Ok(PlayOutcome::Error),
+                                        _ => ai_auto_matched = true,
                                     }
-                                    UserDecision::Stopped => return Ok(PlayOutcome::Error),
-                                    _ => ai_auto_matched = true,
                                 }
-                            }
-                            Ok(ai_match) => {
-                                log::info!("AI判断不是同一首: {}", ai_match.reason);
-                            }
-                            Err(error) => {
-                                log::info!("AI判断异常，回退到人工确认: {error:#}");
+                                Ok(ai_match) => {
+                                    log::info!("AI判断不是同一首: {}", ai_match.reason);
+                                }
+                                Err(error) => {
+                                    log::info!("AI判断异常，回退到人工确认: {error:#}");
+                                }
                             }
                         }
-                    }
 
-                    if !ai_auto_matched {
-                        match self.confirm_song(&status, allow_switch_source)? {
-                            UserDecision::PromptFailed | UserDecision::Stopped => {
-                                return Ok(PlayOutcome::Error);
-                            }
-                            UserDecision::SwitchSource => {
-                                if allow_switch_source {
-                                    return self.switch_source_and_play(
-                                        keyword,
-                                        search_source,
-                                        prefer_accompaniment,
-                                    );
+                        if !ai_auto_matched {
+                            match self.confirm_song(&status, allow_switch_source)? {
+                                UserDecision::PromptFailed | UserDecision::Stopped => {
+                                    return Ok(PlayOutcome::Error);
                                 }
-                            }
-                            UserDecision::Timeout => {
-                                if status.status == "playing" {
-                                    let _ = self.feeluown.pause();
+                                UserDecision::SwitchSource => {
+                                    if allow_switch_source {
+                                        return self.switch_source_and_play(
+                                            keyword,
+                                            search_source,
+                                            prefer_accompaniment,
+                                        );
+                                    }
                                 }
-                                return Ok(PlayOutcome::NoSource);
+                                UserDecision::Timeout => {
+                                    if status.status == "playing" {
+                                        let _ = self.feeluown.pause();
+                                    }
+                                    return Ok(PlayOutcome::NoSource);
+                                }
+                                UserDecision::Confirm => {}
+                                UserDecision::Skip => {
+                                    self.report_no_source(Some(&status), true)?;
+                                    return Ok(PlayOutcome::NoSource);
+                                }
+                                _ => {}
                             }
-                            UserDecision::Confirm => {}
-                            UserDecision::Skip => {
-                                self.report_no_source(Some(&status), true)?;
-                                return Ok(PlayOutcome::NoSource);
-                            }
-                            _ => {}
                         }
                     }
                 }
@@ -3311,6 +3362,8 @@ mod app {
                     prefer_accompaniment: item.prefer_accompaniment,
                     ai_original_text: item.ai_original_text.clone(),
                     uri: item.uri.clone(),
+                    skip_match_check: !item.ai_original_text.trim().is_empty()
+                        && !item.uri.trim().is_empty(),
                 };
                 let outcome = self.play_request_confirmed(&request, true)?;
                 match outcome {
@@ -3363,6 +3416,13 @@ mod app {
         status.status == "playing"
     }
 
+    fn playback_progress_restarted(before: f64, after: f64) -> bool {
+        before.is_finite()
+            && after.is_finite()
+            && before > 2.0
+            && (after < 2.0 || after + 1.0 < before)
+    }
+
     fn parse_decision_command(text: &str) -> Option<UserDecision> {
         let raw = text.trim();
         let command_text = if let Some(index) = raw.find(['：', ':', ']', '】']) {
@@ -3408,6 +3468,7 @@ mod app {
             "如非预期",
             "命令已超时",
             "搜索到:",
+            "AI匹配:",
             "AI匹配中",
             "AI点歌未启用",
             "AI点歌识别失败",

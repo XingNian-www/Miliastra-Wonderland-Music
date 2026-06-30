@@ -52,6 +52,7 @@ pub struct SongCommand {
 pub enum SongSource {
     QqMusic,
     Netease,
+    Bilibili,
 }
 
 impl SongSource {
@@ -59,6 +60,7 @@ impl SongSource {
         match self {
             Self::QqMusic => "qqmusic",
             Self::Netease => "netease",
+            Self::Bilibili => "bilibili",
         }
     }
 }
@@ -462,7 +464,7 @@ pub fn parse_song_command(command: &str) -> Option<SongCommand> {
 
 fn parse_command(matched: &str, param: &str) -> Option<UserCommand> {
     match matched {
-        "AI点歌" | "QQ点歌" | "网易点歌" | "点歌" => {
+        "AI点歌" | "QQ点歌" | "网易点歌" | "B站点歌" | "点歌" => {
             parse_song_command(&format!("{} {}", matched, param)).map(UserCommand::Song)
         }
         "暂停" => Some(UserCommand::Pause),
@@ -539,7 +541,7 @@ fn is_feedback_text(text: &str) -> bool {
 fn allows_param(command: &str) -> bool {
     matches!(
         command,
-        "AI点歌" | "点歌" | "QQ点歌" | "网易点歌" | "音量" | "队列删除"
+        "AI点歌" | "点歌" | "QQ点歌" | "网易点歌" | "B站点歌" | "音量" | "队列删除"
     )
 }
 
@@ -566,6 +568,7 @@ const COMMANDS: &[&str] = &[
     "AI点歌",
     "QQ点歌",
     "网易点歌",
+    "B站点歌",
     "点歌",
     "暂停",
     "继续",
@@ -588,6 +591,7 @@ const SONG_COMMANDS: &[(&str, SongSource, bool)] = &[
     ("AI点歌", SongSource::QqMusic, true),
     ("QQ点歌", SongSource::QqMusic, false),
     ("网易点歌", SongSource::Netease, false),
+    ("B站点歌", SongSource::Bilibili, false),
     ("点歌", SongSource::QqMusic, false),
 ];
 
@@ -716,6 +720,21 @@ mod tests {
                 keyword: "晴天 周杰伦".to_string(),
                 source: SongSource::QqMusic,
                 prefix: "点歌".to_string(),
+                prefer_accompaniment: false,
+                ai_assisted: false,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_hidden_bilibili_song_command() {
+        let parsed = parse_text("用户：@B站点歌 晴天 周杰伦", "blue").expect("parse bilibili song");
+        assert_eq!(
+            parsed.command,
+            UserCommand::Song(SongCommand {
+                keyword: "晴天 周杰伦".to_string(),
+                source: SongSource::Bilibili,
+                prefix: "B站点歌".to_string(),
                 prefer_accompaniment: false,
                 ai_assisted: false,
             })

@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use super::config::{FeelUOwnConfig, TimingConfig};
 
@@ -143,14 +144,23 @@ impl FeelUOwnClient {
     }
 
     pub fn search(&self, keyword: &str, source: &str) -> Result<String> {
-        let command = format!("search {} {}", shell_quote(keyword), source_args(source))
-            .trim()
-            .to_string();
+        let command = search_command(keyword, source, None);
+        self.request(&command)
+    }
+
+    fn search_json(&self, keyword: &str, source: &str) -> Result<String> {
+        let command = search_command(keyword, source, Some("json"));
         self.request(&command)
     }
 
     pub fn search_candidates(&self, keyword: &str, source: &str) -> Result<Vec<SearchCandidate>> {
-        Ok(extract_search_candidates(&self.search(keyword, source)?))
+        match self
+            .search_json(keyword, source)
+            .and_then(|text| extract_search_candidates_from_json(&text))
+        {
+            Ok(candidates) if !candidates.is_empty() => Ok(candidates),
+            Ok(_) | Err(_) => Ok(extract_search_candidates(&self.search(keyword, source)?)),
+        }
     }
 
     pub fn play_keyword(
@@ -292,6 +302,18 @@ fn source_args(source: &str) -> String {
         .join(" ")
 }
 
+fn search_command(keyword: &str, source: &str, format: Option<&str>) -> String {
+    let mut parts = vec!["search".to_string(), shell_quote(keyword)];
+    let sources = source_args(source);
+    if !sources.is_empty() {
+        parts.push(sources);
+    }
+    if let Some(format) = format {
+        parts.push(format!("--format={}", shell_quote(format)));
+    }
+    parts.join(" ")
+}
+
 fn shell_quote(value: &str) -> String {
     if value.is_empty() {
         return "''".to_string();
@@ -345,6 +367,80 @@ pub fn extract_search_candidates(text: &str) -> Vec<SearchCandidate> {
         }
     }
     candidates
+}
+
+fn extract_search_candidates_from_json(text: &str) -> Result<Vec<SearchCandidate>> {
+    let value: Value = serde_json::from_str(text).context("parse FeelUOwn search JSON")?;
+    let mut candidates = Vec::new();
+    collect_search_candidates_from_json(&value, &mut candidates);
+    Ok(candidates)
+}
+
+fn collect_search_candidates_from_json(value: &Value, candidates: &mut Vec<SearchCandidate>) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                collect_search_candidates_from_json(item, candidates);
+            }
+        }
+        Value::Object(map) => {
+            if let Some(songs) = map.get("songs").and_then(Value::as_array) {
+                for song in songs {
+                    if let Some(candidate) = json_song_candidate(song) {
+                        candidates.push(candidate);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn json_song_candidate(value: &Value) -> Option<SearchCandidate> {
+    let uri = json_string(value, "uri").or_else(|| {
+        let source = json_string(value, "source").or_else(|| json_string(value, "provider"))?;
+        let identifier = json_string(value, "identifier")?;
+        Some(format!("fuo://{}/songs/{}", source, identifier))
+    })?;
+
+    Some(SearchCandidate {
+        text: json_song_text(value).unwrap_or_else(|| uri.clone()),
+        uri,
+    })
+}
+
+fn json_song_text(value: &Value) -> Option<String> {
+    let title = json_string(value, "title").or_else(|| json_string(value, "name"))?;
+    let artists = json_string(value, "artists_name")
+        .or_else(|| json_string(value, "artist_name"))
+        .or_else(|| json_string(value, "singer"))
+        .or_else(|| json_artist_names(value.get("artists")));
+    Some(match artists {
+        Some(artists) if !artists.is_empty() => format!("{} - {}", title, artists),
+        _ => title,
+    })
+}
+
+fn json_artist_names(value: Option<&Value>) -> Option<String> {
+    let names = value?
+        .as_array()?
+        .iter()
+        .filter_map(|artist| json_string(artist, "name").or_else(|| json_string(artist, "title")))
+        .collect::<Vec<_>>();
+    if names.is_empty() {
+        None
+    } else {
+        Some(names.join(", "))
+    }
+}
+
+fn json_string(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(ToString::to_string)
 }
 
 fn pick_search_candidate(
@@ -561,6 +657,14 @@ mod tests {
     }
 
     #[test]
+    fn search_command_can_request_json_format() {
+        assert_eq!(
+            search_command("晴天", "qqmusic,netease", Some("json")),
+            "search '晴天' --source='qqmusic' --source='netease' --format='json'"
+        );
+    }
+
+    #[test]
     fn extracts_plain_search_candidates() {
         let text = "fuo://qqmusic/songs/97773    \t# 晴天 - 周杰伦\n\
 fuo://netease/songs/3334653818\t# 晴天 - 周杰伦";
@@ -569,5 +673,29 @@ fuo://netease/songs/3334653818\t# 晴天 - 周杰伦";
         assert_eq!(candidates[0].uri, "fuo://qqmusic/songs/97773");
         assert_eq!(candidates[0].text, "# 晴天 - 周杰伦");
         assert_eq!(candidates[1].uri, "fuo://netease/songs/3334653818");
+    }
+
+    #[test]
+    fn extracts_full_song_candidates_from_search_json() {
+        let text = r#"[
+  {
+    "songs": [
+      {
+        "identifier": "BV12sdZB2Ese",
+        "source": "bilibili",
+        "title": "“这世界其实就是如此荒诞又温柔的一场梦”完整版标题测试",
+        "artists_name": "指尖灬旋律丿和另一个很长很长的歌手名",
+        "uri": "fuo://bilibili/songs/BV12sdZB2Ese"
+      }
+    ]
+  }
+]"#;
+        let candidates = extract_search_candidates_from_json(text).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].uri, "fuo://bilibili/songs/BV12sdZB2Ese");
+        assert_eq!(
+            candidates[0].text,
+            "“这世界其实就是如此荒诞又温柔的一场梦”完整版标题测试 - 指尖灬旋律丿和另一个很长很长的歌手名"
+        );
     }
 }

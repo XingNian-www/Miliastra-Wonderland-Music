@@ -319,7 +319,7 @@ templates:
   # 邀请流程里的“进入大厅”按钮模板
   invite_enter_hall: assets/invite-enter-hall.png
   # 聊天标志模板匹配阈值，越高越严格
-  marker_threshold: 0.82
+  marker_threshold: 0.9
 
 output:
   # 是否真的向游戏内发送回复；false 时只写日志
@@ -679,7 +679,7 @@ impl Default for TemplateConfig {
             invite_view_star: PathBuf::from("assets/invite-view-star.png"),
             invite_goto_hall: PathBuf::from("assets/invite-goto-hall.png"),
             invite_enter_hall: PathBuf::from("assets/invite-enter-hall.png"),
-            marker_threshold: 0.82,
+            marker_threshold: 0.9,
         }
     }
 }

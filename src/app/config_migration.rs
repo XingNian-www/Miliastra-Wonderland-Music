@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow};
 use serde_yaml::{Mapping, Value};
 
-pub const CURRENT_CONFIG_VERSION: u32 = 4;
+pub const CURRENT_CONFIG_VERSION: u32 = 5;
 
 struct ChangedDefaultField {
     path: &'static str,
@@ -13,11 +13,18 @@ struct ChangedDefaultField {
     changed_in_version: u32,
 }
 
-const CHANGED_DEFAULT_FIELDS: &[ChangedDefaultField] = &[ChangedDefaultField {
-    path: "queue.auto_advance_seconds",
-    old_default: 5,
-    changed_in_version: 4,
-}];
+const CHANGED_DEFAULT_FIELDS: &[ChangedDefaultField] = &[
+    ChangedDefaultField {
+        path: "queue.auto_advance_seconds",
+        old_default: 5,
+        changed_in_version: 4,
+    },
+    ChangedDefaultField {
+        path: "queue.auto_advance_seconds",
+        old_default: 2,
+        changed_in_version: 5,
+    },
+];
 
 const MOVED_FIELDS: &[(&str, &str)] = &[
     (
@@ -509,7 +516,7 @@ mod tests {
 
     const DEFAULT: &str = r#"# test config
 # version comment
-config_version: 4
+config_version: 5
 
 timing:
   # fallback comment
@@ -518,7 +525,7 @@ timing:
   output_focus_ms: 300
 
 queue:
-  auto_advance_seconds: 2
+  auto_advance_seconds: 1
 
 ocr:
   min_confidence: 0.9
@@ -545,7 +552,7 @@ unknown_root:
             .expect("migration needed");
 
         assert!(report.text.contains("# fallback comment"));
-        assert!(report.text.contains("config_version: 4"));
+        assert!(report.text.contains("config_version: 5"));
         assert!(report.text.contains("chat_scan_fallback_ms: 1234"));
         assert!(report.text.contains("scan_loop_idle_ms: 77"));
         assert!(report.text.contains("output_focus_ms: 456"));
@@ -566,13 +573,13 @@ unknown_root:
 
     #[test]
     fn current_version_without_moved_fields_does_not_migrate() {
-        let current = r#"config_version: 4
+        let current = r#"config_version: 5
 timing:
   chat_scan_fallback_ms: 2000
   scan_loop_idle_ms: 60
   output_focus_ms: 300
 queue:
-  auto_advance_seconds: 2
+  auto_advance_seconds: 1
 ocr:
   min_confidence: 0.9
   change_mean_threshold: 6.0
@@ -612,7 +619,7 @@ ocr:
     }
 
     #[test]
-    fn migrates_old_auto_advance_default_to_two_seconds() {
+    fn migrates_v3_auto_advance_default_to_one_second() {
         let old = r#"config_version: 3
 queue:
   auto_advance_seconds: 5
@@ -622,7 +629,22 @@ queue:
             .expect("migration succeeds")
             .expect("migration needed");
 
-        assert!(report.text.contains("auto_advance_seconds: 2"));
+        assert!(report.text.contains("auto_advance_seconds: 1"));
+    }
+
+    #[test]
+    fn migrates_v4_auto_advance_default_to_one_second() {
+        let old = r#"config_version: 4
+queue:
+  auto_advance_seconds: 2
+"#;
+
+        let report = migrate_config_text(old, DEFAULT)
+            .expect("migration succeeds")
+            .expect("migration needed");
+
+        assert!(report.text.contains("config_version: 5"));
+        assert!(report.text.contains("auto_advance_seconds: 1"));
     }
 
     #[test]

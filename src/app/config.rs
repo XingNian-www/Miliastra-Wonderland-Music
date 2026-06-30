@@ -130,7 +130,7 @@ fn default_config_yaml() -> &'static str {
 # 坐标沿用旧脚本习惯：以游戏客户区左上角为原点，按 1920x1080 有效画面写坐标
 
 # 配置版本；程序启动时会把旧版本配置迁移到当前模板
-config_version: 4
+config_version: 5
 
 window:
   # 目标游戏进程名，按进程文件名匹配，大小写不敏感
@@ -251,6 +251,10 @@ timing:
   ai_request_timeout_ms: 35000
   # 35. 旧版外部进程轮询间隔，保留用于兼容旧配置
   external_process_poll_ms: 50
+  # 36. 播放结束监控本地推测循环间隔，单位毫秒
+  playback_monitor_tick_ms: 200
+  # 37. 播放结束监控向 FeelUOwn 校准状态的间隔，单位毫秒
+  playback_monitor_status_ms: 1000
 
 ocr:
   # PaddleOCR 检测模型路径
@@ -362,12 +366,14 @@ state:
   runtime_state_path: data/runtime-state.json
   # 点歌队列持久化路径
   queue_path: data/queue.json
+  # 最终执行命令记录路径
+  executed_commands_log_path: data/executed-commands.log
 
 queue:
   # 队列最大长度
   max_size: 5
   # 当前歌曲剩余多少秒以内自动播放队列下一首
-  auto_advance_seconds: 2
+  auto_advance_seconds: 1
 
 ai:
   # AI 供应商：mimo/openai/deepseek/custom
@@ -552,6 +558,8 @@ pub struct TimingConfig {
     pub active_after_activate_ms: u64,
     pub ai_request_timeout_ms: u64,
     pub external_process_poll_ms: u64,
+    pub playback_monitor_tick_ms: u64,
+    pub playback_monitor_status_ms: u64,
 }
 
 impl Default for TimingConfig {
@@ -592,6 +600,8 @@ impl Default for TimingConfig {
             active_after_activate_ms: 200,
             ai_request_timeout_ms: 35000,
             external_process_poll_ms: 50,
+            playback_monitor_tick_ms: 200,
+            playback_monitor_status_ms: 1000,
         }
     }
 }
@@ -759,6 +769,7 @@ impl Default for LoggingConfig {
 pub struct StateConfig {
     pub runtime_state_path: PathBuf,
     pub queue_path: PathBuf,
+    pub executed_commands_log_path: PathBuf,
 }
 
 impl Default for StateConfig {
@@ -766,6 +777,7 @@ impl Default for StateConfig {
         Self {
             runtime_state_path: PathBuf::from("data/runtime-state.json"),
             queue_path: PathBuf::from("data/queue.json"),
+            executed_commands_log_path: PathBuf::from("data/executed-commands.log"),
         }
     }
 }
@@ -781,7 +793,7 @@ impl Default for QueueConfig {
     fn default() -> Self {
         Self {
             max_size: 5,
-            auto_advance_seconds: 2,
+            auto_advance_seconds: 1,
         }
     }
 }

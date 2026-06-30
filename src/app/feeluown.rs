@@ -203,9 +203,9 @@ impl FeelUOwnClient {
 
         let mut fallback = None;
         for search_text in keywords {
-            let result = self.search(&search_text, source)?;
-            let chosen =
-                pick_search_candidate(&extract_search_candidates(&result), prefer_accompaniment);
+            let candidates = self.search_candidates(&search_text, source)?;
+            let result = format_search_candidates(&candidates);
+            let chosen = pick_search_candidate(&candidates, prefer_accompaniment);
             if let Some(candidate) = chosen {
                 if !prefer_accompaniment || is_accompaniment_text(&candidate.text) {
                     return Ok(Some((candidate, result)));
@@ -217,6 +217,14 @@ impl FeelUOwnClient {
         }
         Ok(fallback)
     }
+}
+
+fn format_search_candidates(candidates: &[SearchCandidate]) -> String {
+    candidates
+        .iter()
+        .map(|candidate| format!("{}\t# {}", candidate.uri, candidate.text))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 pub fn format_status(status: &PlayerStatus) -> String {

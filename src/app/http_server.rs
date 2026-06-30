@@ -450,6 +450,7 @@ fn queue_add(
             prefer_accompaniment: prefer,
             ai_original_text,
             uri,
+            friend_username: String::new(),
         })
         .map_err(internal_error)?
     {
@@ -631,6 +632,12 @@ fn apply_runtime_patch(
         .and_then(serde_json::Value::as_bool)
     {
         state.paused_by_command = value;
+    }
+    if let Some(value) = patch
+        .get("pausedForPendingPlayback")
+        .and_then(serde_json::Value::as_bool)
+    {
+        state.paused_for_pending_playback = value;
     }
     if let Some(value) = patch
         .get("hallRemainingMinutes")

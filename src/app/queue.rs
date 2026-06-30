@@ -14,6 +14,7 @@ pub struct QueueItem {
     pub prefer_accompaniment: bool,
     pub ai_original_text: String,
     pub uri: String,
+    pub friend_username: String,
 }
 
 impl Default for QueueItem {
@@ -24,6 +25,7 @@ impl Default for QueueItem {
             prefer_accompaniment: false,
             ai_original_text: String::new(),
             uri: String::new(),
+            friend_username: String::new(),
         }
     }
 }
@@ -102,6 +104,7 @@ impl PersistentQueue {
             keyword: item.keyword,
             ai_original_text: item.ai_original_text,
             uri: item.uri,
+            friend_username: item.friend_username,
         });
         self.save()?;
         Ok(true)
@@ -174,8 +177,8 @@ fn parse_queue_items(text: &str) -> Result<Vec<QueueItem>> {
 fn normalize_source(source: &str) -> String {
     if source.trim().is_empty() {
         String::new()
-    } else if source == "netease" {
-        "netease".to_string()
+    } else if matches!(source, "qqmusic" | "netease" | "bilibili") {
+        source.to_string()
     } else {
         "qqmusic".to_string()
     }

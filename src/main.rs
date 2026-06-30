@@ -54,6 +54,8 @@ mod app {
     const CHAT_MARKER_SEARCH_WIDTH: u32 = 60;
     const HALL_INFO_OCR_SAMPLES: usize = 3;
     const IDLE_EXIT_MIN_MINUTES: u32 = 15;
+    const OCR_REBUILD_INTERVAL: Duration = Duration::from_secs(60 * 60);
+    const OCR_REBUILD_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
     static WINDOW_CAPTURE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -741,7 +743,7 @@ mod app {
         feeluown: FeelUOwnClient,
         ai: ai::AiClient,
         chat_output: ChatOutput,
-        ocr_engine: Arc<Mutex<OcrEngine>>,
+        ocr_engine: Arc<Mutex<OcrEngineState>>,
         locks: CommandLockState,
         pending: Arc<(Mutex<VecDeque<PendingTask>>, Condvar)>,
         screen_lock_primed: Arc<AtomicBool>,
@@ -758,6 +760,11 @@ mod app {
     struct IdleExitState {
         timeout: Duration,
         last_command_at: Instant,
+    }
+
+    struct OcrEngineState {
+        engine: OcrEngine,
+        rebuild_due_at: Instant,
     }
 
     #[derive(Clone, Debug)]
@@ -835,7 +842,10 @@ mod app {
                 feeluown,
                 ai,
                 chat_output,
-                ocr_engine: Arc::new(Mutex::new(ocr_engine)),
+                ocr_engine: Arc::new(Mutex::new(OcrEngineState {
+                    engine: ocr_engine,
+                    rebuild_due_at: Instant::now() + OCR_REBUILD_INTERVAL,
+                })),
                 locks: CommandLockState::default(),
                 pending: Arc::new((Mutex::new(VecDeque::new()), Condvar::new())),
                 screen_lock_primed: Arc::new(AtomicBool::new(false)),
@@ -914,10 +924,28 @@ mod app {
                 .map_err(|_| anyhow!("runtime state mutex poisoned"))
         }
 
-        fn ocr_engine(&self) -> Result<MutexGuard<'_, OcrEngine>> {
-            self.ocr_engine
+        fn ocr_engine(&self) -> Result<MutexGuard<'_, OcrEngineState>> {
+            let mut guard = self
+                .ocr_engine
                 .lock()
-                .map_err(|_| anyhow!("ocr_engine mutex poisoned"))
+                .map_err(|_| anyhow!("ocr_engine mutex poisoned"))?;
+            if Instant::now() >= guard.rebuild_due_at {
+                log::info!("OCR 引擎运行超过 1 小时，开始重建");
+                let started = Instant::now();
+                let ocr_args = OcrArgs::default().resolve(&self.config);
+                match make_ocr_engine(&ocr_args) {
+                    Ok(engine) => {
+                        guard.engine = engine;
+                        guard.rebuild_due_at = Instant::now() + OCR_REBUILD_INTERVAL;
+                        log::info!("OCR 引擎重建完成: {}ms", elapsed_ms(started));
+                    }
+                    Err(error) => {
+                        guard.rebuild_due_at = Instant::now() + OCR_REBUILD_RETRY_INTERVAL;
+                        log::error!("OCR 引擎重建失败，继续使用旧引擎，5分钟后重试: {error:#}");
+                    }
+                }
+            }
+            Ok(guard)
         }
 
         fn warn_if_screen_size_mismatch(&self) -> Result<()> {
@@ -1075,7 +1103,7 @@ mod app {
                                                 let engine = self.ocr_engine()?;
                                                 scan_chat(
                                                     &frame.image,
-                                                    &engine,
+                                                    &engine.engine,
                                                     &template_args,
                                                     self.config.screen.chat_rect.into(),
                                                 )
@@ -1116,7 +1144,7 @@ mod app {
                                         let engine = self.ocr_engine()?;
                                         scan_chat(
                                             &frame.image,
-                                            &engine,
+                                            &engine.engine,
                                             &template_args,
                                             self.config.screen.chat_rect.into(),
                                         )
@@ -2344,7 +2372,7 @@ mod app {
                     };
                     scan_chat(
                         &frame.image,
-                        &engine,
+                        &engine.engine,
                         &template_args,
                         self.config.screen.chat_rect.into(),
                     )
@@ -2387,7 +2415,7 @@ mod app {
             };
             let Ok(messages) = scan_chat(
                 &frame.image,
-                &engine,
+                &engine.engine,
                 &template_args,
                 self.config.screen.chat_rect.into(),
             ) else {
@@ -2432,7 +2460,7 @@ mod app {
             let point = {
                 let engine = self.ocr_engine()?;
                 self.find_text_point(
-                    &engine,
+                    &engine.engine,
                     &canvas,
                     self.config.invite.confirm_list_region.into(),
                     username,
@@ -2523,7 +2551,7 @@ mod app {
             let point = {
                 let engine = self.ocr_engine()?;
                 self.find_text_point(
-                    &engine,
+                    &engine.engine,
                     canvas,
                     self.config.invite.friend_list_region.into(),
                     username,
@@ -2662,12 +2690,20 @@ mod app {
             let name_crop = crop_canvas(image, self.config.screen.hall_name_rect.into())?;
             let name = {
                 let engine = self.ocr_engine()?;
-                merged_ocr_text(&engine, &name_crop, self.config.ocr.same_line_y_tolerance)?
+                merged_ocr_text(
+                    &engine.engine,
+                    &name_crop,
+                    self.config.ocr.same_line_y_tolerance,
+                )?
             };
             let time_crop = crop_canvas(image, self.config.screen.hall_time_rect.into())?;
             let time_text = {
                 let engine = self.ocr_engine()?;
-                merged_ocr_text(&engine, &time_crop, self.config.ocr.same_line_y_tolerance)?
+                merged_ocr_text(
+                    &engine.engine,
+                    &time_crop,
+                    self.config.ocr.same_line_y_tolerance,
+                )?
             };
             Ok(HallInfoSample {
                 name,
@@ -3159,7 +3195,7 @@ mod app {
                     };
                     scan_chat(
                         &frame.image,
-                        &engine,
+                        &engine.engine,
                         &template_args,
                         self.config.screen.chat_rect.into(),
                     )
@@ -3222,7 +3258,7 @@ mod app {
             };
             let Ok(messages) = scan_chat(
                 &frame.image,
-                &engine,
+                &engine.engine,
                 &template_args,
                 self.config.screen.chat_rect.into(),
             ) else {

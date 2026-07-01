@@ -19,6 +19,7 @@ pub struct AppConfig {
     pub feeluown: FeelUOwnConfig,
     pub http: HttpConfig,
     pub logging: LoggingConfig,
+    pub tui: TuiConfig,
     pub state: StateConfig,
     pub queue: QueueConfig,
     pub ai: AiConfig,
@@ -40,6 +41,7 @@ impl Default for AppConfig {
             feeluown: FeelUOwnConfig::default(),
             http: HttpConfig::default(),
             logging: LoggingConfig::default(),
+            tui: TuiConfig::default(),
             state: StateConfig::default(),
             queue: QueueConfig::default(),
             ai: AiConfig::default(),
@@ -163,10 +165,10 @@ screen:
     height: 60
   # 二级大厅/面板界面模板检测区域
   secondary_hall_rect:
-    x: 0
-    y: 0
-    width: 260
-    height: 400
+    x: 10
+    y: 190
+    width: 65
+    height: 55
   # F2 大厅页顶部大厅名称 OCR 区域
   hall_name_rect:
     x: 75
@@ -304,6 +306,8 @@ ocr:
   right_padding: 4
   # OCR worker 内存重建阈值，暂作为后续内存保护配置
   memory_rebuild_limit_bytes: 4294967296
+  # 实验性：将聊天块拼接为单张图片一次性 OCR，减少推理次数
+  batch_recognize: false
 
 templates:
   # 蓝色聊天标志模板，通常是自己/普通聊天行标志
@@ -360,6 +364,14 @@ logging:
   dir: logs
   # 日志级别：error/warn/info/debug/trace
   level: info
+
+tui:
+  # 是否启用终端 TUI 面板；启用后实时显示日志和 OCR 内容
+  enabled: false
+  # TUI 刷新间隔，单位毫秒
+  refresh_ms: 100
+  # TUI 保留最近多少行日志
+  log_lines: 200
 
 state:
   # 运行时状态持久化路径
@@ -513,7 +525,7 @@ impl Default for ScreenConfig {
             warn_on_size_mismatch: true,
             chat_rect: RectConfig::new(39, 879, 416, 143),
             enter_rect: RectConfig::new(0, 1020, 120, 60),
-            secondary_hall_rect: RectConfig::new(0, 0, 260, 400),
+            secondary_hall_rect: RectConfig::new(10, 190, 65, 55),
             hall_name_rect: RectConfig::new(75, 425, 325, 40),
             hall_time_rect: RectConfig::new(430, 520, 110, 40),
         }
@@ -632,6 +644,7 @@ pub struct OcrConfig {
     pub next_marker_min_gap: i32,
     pub right_padding: i32,
     pub memory_rebuild_limit_bytes: u64,
+    pub batch_recognize: bool,
 }
 
 impl Default for OcrConfig {
@@ -660,6 +673,7 @@ impl Default for OcrConfig {
             next_marker_min_gap: 12,
             right_padding: 4,
             memory_rebuild_limit_bytes: 4 * 1024 * 1024 * 1024,
+            batch_recognize: false,
         }
     }
 }
@@ -760,6 +774,24 @@ impl Default for LoggingConfig {
         Self {
             dir: PathBuf::from("logs"),
             level: "info".to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TuiConfig {
+    pub enabled: bool,
+    pub refresh_ms: u64,
+    pub log_lines: usize,
+}
+
+impl Default for TuiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            refresh_ms: 100,
+            log_lines: 200,
         }
     }
 }

@@ -534,18 +534,18 @@ fn parse_song_command_with_source(
 
 fn parse_command(matched: &str, param: &str) -> Option<UserCommand> {
     match matched {
-        "AI点歌" | "QQ点歌" | "网易点歌" | "点歌" => {
+        "AI点歌" | "AI搜索" | "QQ点歌" | "QQ搜索" | "网易点歌" | "网易搜索" | "点歌" | "搜索" => {
             parse_song_command(&format!("{} {}", matched, param)).map(UserCommand::Song)
         }
         "暂停" => Some(UserCommand::Pause),
         "继续" | "恢复" => Some(UserCommand::Resume),
         "播放" => Some(UserCommand::Play),
-        "下一首" => Some(UserCommand::Next),
-        "上一首" => Some(UserCommand::Previous),
+        "下一首" | "下一曲" => Some(UserCommand::Next),
+        "上一首" | "上一曲" => Some(UserCommand::Previous),
         "音量" => Some(UserCommand::Volume(param.to_string())),
         "状态" => Some(UserCommand::Status),
         "歌词" => Some(UserCommand::Lyrics),
-        "队列" => Some(UserCommand::Queue),
+        "队列" | "列表" => Some(UserCommand::Queue),
         "队列删除" => Some(UserCommand::QueueDelete(parse_queue_indexes(param))),
         "队列清空" => Some(UserCommand::QueueClear),
         "大厅检测" => Some(UserCommand::HallDetect),
@@ -611,7 +611,16 @@ fn is_feedback_text(text: &str) -> bool {
 fn allows_param(command: &str) -> bool {
     matches!(
         command,
-        "AI点歌" | "点歌" | "QQ点歌" | "网易点歌" | "音量" | "队列删除"
+        "AI点歌"
+            | "AI搜索"
+            | "点歌"
+            | "搜索"
+            | "QQ点歌"
+            | "QQ搜索"
+            | "网易点歌"
+            | "网易搜索"
+            | "音量"
+            | "队列删除"
     )
 }
 
@@ -636,15 +645,21 @@ fn levenshtein_distance(left: &str, right: &str) -> usize {
 
 const COMMANDS: &[&str] = &[
     "AI点歌",
+    "AI搜索",
     "QQ点歌",
+    "QQ搜索",
     "网易点歌",
+    "网易搜索",
     "点歌",
+    "搜索",
     "暂停",
     "继续",
     "恢复",
     "播放",
     "下一首",
+    "下一曲",
     "上一首",
+    "上一曲",
     "音量",
     "状态",
     "帮助",
@@ -652,23 +667,33 @@ const COMMANDS: &[&str] = &[
     "队列删除",
     "队列清空",
     "队列",
+    "列表",
     "大厅检测",
     "大厅时间",
 ];
 
 const SONG_COMMANDS: &[(&str, SongSource, bool)] = &[
     ("AI点歌", SongSource::QqMusic, true),
+    ("AI搜索", SongSource::QqMusic, true),
     ("QQ点歌", SongSource::QqMusic, false),
+    ("QQ搜索", SongSource::QqMusic, false),
     ("网易点歌", SongSource::Netease, false),
+    ("网易搜索", SongSource::Netease, false),
     ("点歌", SongSource::QqMusic, false),
+    ("搜索", SongSource::QqMusic, false),
 ];
 
 const PINK_SONG_COMMANDS: &[(&str, SongSource, bool)] = &[
     ("AI点歌", SongSource::All, true),
+    ("AI搜索", SongSource::All, true),
     ("QQ点歌", SongSource::QqMusic, false),
+    ("QQ搜索", SongSource::QqMusic, false),
     ("网易点歌", SongSource::Netease, false),
+    ("网易搜索", SongSource::Netease, false),
     ("B站点歌", SongSource::Bilibili, false),
+    ("B站搜索", SongSource::Bilibili, false),
     ("点歌", SongSource::QqMusic, false),
+    ("搜索", SongSource::QqMusic, false),
 ];
 
 const FEEDBACK_TEXT_PATTERNS: &[&str] = &[

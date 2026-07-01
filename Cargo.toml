@@ -14,6 +14,8 @@ clap = { version = "4.5", default-features = false, features = ["std", "derive",
 enigo = "0.6"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 log = "0.4"
+ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
+crossterm = "0.28"
 ocr-rs = { git = "https://github.com/zibo-chen/rust-paddle-ocr.git", tag = "v2.3.1", features = ["mnn-dynamic"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }

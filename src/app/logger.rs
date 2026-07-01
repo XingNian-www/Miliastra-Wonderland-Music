@@ -7,9 +7,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use log::{LevelFilter, Log, Metadata, Record, SetLoggerError};
 
+use super::tui::TuiLogSink;
+
 struct FileLogger {
     file: Mutex<File>,
     level: LevelFilter,
+    tui: Option<TuiLogSink>,
 }
 
 impl Log for FileLogger {
@@ -22,10 +25,14 @@ impl Log for FileLogger {
             return;
         }
 
-        let line = format!("{} {}\n", format_prefix(record.level()), record.args());
-        let _ = std::io::stderr().write_all(line.as_bytes());
+        let line = format!("{} {}", format_prefix(record.level()), record.args());
+        if let Some(tui) = &self.tui {
+            tui.push(line.clone());
+        } else {
+            let _ = std::io::stderr().write_all(format!("{line}\n").as_bytes());
+        }
         if let Ok(mut file) = self.file.lock() {
-            let _ = file.write_all(line.as_bytes());
+            let _ = file.write_all(format!("{line}\n").as_bytes());
         }
     }
 
@@ -66,7 +73,7 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (year, month as u32, day as u32)
 }
 
-pub fn init(log_dir: &Path, level: &str) -> Result<PathBuf> {
+pub fn init(log_dir: &Path, level: &str, tui: Option<TuiLogSink>) -> Result<PathBuf> {
     fs::create_dir_all(log_dir)
         .with_context(|| format!("create log directory {}", log_dir.display()))?;
     let path = log_dir.join("miliastra-wonderland-music.log");
@@ -79,6 +86,7 @@ pub fn init(log_dir: &Path, level: &str) -> Result<PathBuf> {
     let logger = FileLogger {
         file: Mutex::new(file),
         level,
+        tui,
     };
     set_logger(logger).context("initialize logger")?;
     log::set_max_level(level);

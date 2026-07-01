@@ -18,9 +18,11 @@ mod app {
     mod logger;
     mod manual_tools;
     mod ocr;
+    mod ocr_batch;
     mod queue;
     mod runtime_state;
     mod song_matcher;
+    mod tui;
     mod window;
 
     use std::cmp::Ordering;
@@ -120,6 +122,7 @@ mod app {
         next_marker_min_gap: i32,
         right_padding: i32,
         same_line_y_tolerance: i32,
+        batch_recognize: bool,
     }
 
     impl TemplateArgs {
@@ -149,6 +152,7 @@ mod app {
                 next_marker_min_gap: config.ocr.next_marker_min_gap,
                 right_padding: config.ocr.right_padding,
                 same_line_y_tolerance: config.ocr.same_line_y_tolerance,
+                batch_recognize: config.ocr.batch_recognize,
             }
         }
     }
@@ -577,6 +581,7 @@ mod app {
                     &engine,
                     &templates,
                     config.screen.chat_rect.into(),
+                    None,
                 )?;
                 eprintln!("聊天区扫描耗时: {}ms", elapsed_ms(started));
                 print_json(&messages)
@@ -707,7 +712,20 @@ mod app {
 
     fn run_automation(config_path: &Path) -> Result<()> {
         let config = AppConfig::load_or_create(config_path)?;
-        let log_path = logger::init(&config.logging.dir, &config.logging.level)?;
+        let tui_handle = if config.tui.enabled {
+            match tui::TuiHandle::start(&config.tui) {
+                Ok(handle) => Some(handle),
+                Err(error) => {
+                    eprintln!("TUI 启动失败，回退普通日志输出: {error:#}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let tui_shared = tui_handle.as_ref().map(|handle| handle.shared());
+        let tui_log_sink = tui_handle.as_ref().map(|handle| handle.log_sink());
+        let log_path = logger::init(&config.logging.dir, &config.logging.level, tui_log_sink)?;
         log::info!("日志文件: {}", log_path.display());
         log::info!("配置文件: {}", config_path.display());
         log::info!(
@@ -734,8 +752,10 @@ mod app {
             runtime_state.state().paused_by_command
         );
 
-        let mut app = AutomationApp::new(config, runtime_state, queue)?;
-        app.run()
+        let mut app = AutomationApp::new(config, runtime_state, queue, tui_shared)?;
+        let result = app.run();
+        drop(tui_handle);
+        result
     }
 
     struct AutomationApp {
@@ -757,6 +777,7 @@ mod app {
         paused: Arc<AtomicBool>,
         command_executing: Arc<AtomicBool>,
         song_command_executing: Arc<AtomicBool>,
+        tui: Option<tui::TuiShared>,
     }
 
     #[derive(Clone, Debug)]
@@ -857,6 +878,7 @@ mod app {
             config: AppConfig,
             runtime_state: PersistentRuntimeState,
             queue: PersistentQueue,
+            tui: Option<tui::TuiShared>,
         ) -> Result<Self> {
             let ocr_args = OcrArgs::default().resolve(&config);
             let ocr_engine = make_ocr_engine(&ocr_args)?;
@@ -885,10 +907,14 @@ mod app {
                 paused: Arc::new(AtomicBool::new(false)),
                 command_executing: Arc::new(AtomicBool::new(false)),
                 song_command_executing: Arc::new(AtomicBool::new(false)),
+                tui,
             })
         }
 
         fn run(&mut self) -> Result<()> {
+            if let Some(tui) = &self.tui {
+                tui.set_status("运行中");
+            }
             self.warn_if_screen_size_mismatch()?;
             self.start_http_server()?;
             self.start_hotkeys()?;
@@ -908,6 +934,9 @@ mod app {
             }
             if let Err(error) = self.runtime_state().and_then(|state| state.save()) {
                 log::error!("退出前保存运行状态失败: {error:#}");
+            }
+            if let Some(tui) = &self.tui {
+                tui.set_status("已退出");
             }
             result
         }
@@ -932,6 +961,7 @@ mod app {
                 paused: self.paused.clone(),
                 command_executing: self.command_executing.clone(),
                 song_command_executing: self.song_command_executing.clone(),
+                tui: self.tui.clone(),
             };
             thread::spawn(move || {
                 log::info!("命令执行线程已启动");
@@ -961,6 +991,7 @@ mod app {
                 paused: self.paused.clone(),
                 command_executing: self.command_executing.clone(),
                 song_command_executing: self.song_command_executing.clone(),
+                tui: self.tui.clone(),
             };
             thread::spawn(move || {
                 log::info!("播放监控线程已启动");
@@ -1167,6 +1198,7 @@ mod app {
                                                     &engine.engine,
                                                     &template_args,
                                                     self.config.screen.chat_rect.into(),
+                                                    self.tui.as_ref(),
                                                 )
                                             };
                                             match messages {
@@ -1208,6 +1240,7 @@ mod app {
                                             &engine.engine,
                                             &template_args,
                                             self.config.screen.chat_rect.into(),
+                                            self.tui.as_ref(),
                                         )
                                     };
                                     match messages {
@@ -2719,6 +2752,7 @@ mod app {
                         &engine.engine,
                         &template_args,
                         self.config.screen.chat_rect.into(),
+                        self.tui.as_ref(),
                     )
                 };
                 let messages = match scan_result {
@@ -2765,6 +2799,7 @@ mod app {
                 &engine.engine,
                 &template_args,
                 self.config.screen.chat_rect.into(),
+                self.tui.as_ref(),
             ) else {
                 return output;
             };
@@ -3576,6 +3611,7 @@ mod app {
                         &engine.engine,
                         &template_args,
                         self.config.screen.chat_rect.into(),
+                        self.tui.as_ref(),
                     )
                 };
                 let messages = match scan_result {
@@ -3642,6 +3678,7 @@ mod app {
                 &engine.engine,
                 &template_args,
                 self.config.screen.chat_rect.into(),
+                self.tui.as_ref(),
             ) else {
                 return output;
             };
@@ -4013,6 +4050,16 @@ mod app {
             .is_some_and(|rest| decision_boundary(rest.chars().next()))
         {
             Some(false)
+        } else if command_text
+            .strip_prefix("@同意邀请")
+            .is_some_and(|rest| decision_boundary(rest.chars().next()))
+        {
+            Some(true)
+        } else if command_text
+            .strip_prefix("@拒绝邀请")
+            .is_some_and(|rest| decision_boundary(rest.chars().next()))
+        {
+            Some(false)
         } else {
             None
         }
@@ -4116,6 +4163,7 @@ mod app {
         engine: &OcrEngine,
         templates: &ResolvedTemplateArgs,
         chat_rect: Rect,
+        tui: Option<&tui::TuiShared>,
     ) -> Result<Vec<ChatMessage>> {
         let total_started = Instant::now();
         let chat = crop_canvas(image, chat_rect)?;
@@ -4125,20 +4173,56 @@ mod app {
 
         let mut messages = Vec::new();
         let ocr_started = Instant::now();
-        for marker in &markers {
-            let block = make_message_block(marker, &markers, chat_rect, templates);
-            let crop = crop_canvas(&chat, block)?;
-            let text = merged_ocr_text(engine, &crop, templates.same_line_y_tolerance)?;
-            messages.push(ChatMessage {
-                message_type: marker_type(marker).to_string(),
-                block,
-                text,
-            });
+        let blocks: Vec<(TemplateHit, Rect)> = markers
+            .iter()
+            .map(|marker| {
+                let block = make_message_block(marker, &markers, chat_rect, templates);
+                (marker.clone(), block)
+            })
+            .collect();
+        if templates.batch_recognize {
+            let block_rects: Vec<Rect> = blocks.iter().map(|(_, r)| *r).collect();
+            let texts = ocr_batch::batch_recognize_blocks(
+                engine,
+                &chat,
+                &block_rects,
+                templates.same_line_y_tolerance,
+            )?;
+            for ((marker, block), text) in blocks.iter().zip(texts) {
+                messages.push(ChatMessage {
+                    message_type: marker_type(marker).to_string(),
+                    block: *block,
+                    text,
+                });
+            }
+        } else {
+            for (marker, block) in &blocks {
+                let crop = crop_canvas(&chat, *block)?;
+                let text = merged_ocr_text(engine, &crop, templates.same_line_y_tolerance)?;
+                messages.push(ChatMessage {
+                    message_type: marker_type(marker).to_string(),
+                    block: *block,
+                    text,
+                });
+            }
         }
         let ocr_ms = elapsed_ms(ocr_started);
+        let total_ms = elapsed_ms(total_started);
+        if let Some(tui) = tui {
+            tui.set_ocr(tui::OcrSnapshot {
+                markers: markers.len(),
+                messages: messages
+                    .iter()
+                    .map(|message| format!("[{}] {}", message.message_type, message.text))
+                    .collect(),
+                marker_ms,
+                ocr_ms,
+                total_ms,
+            });
+        }
         log::info!(
             "聊天扫描耗时: total={}ms marker={}ms ocr={}ms markers={} messages={}",
-            elapsed_ms(total_started),
+            total_ms,
             marker_ms,
             ocr_ms,
             markers.len(),

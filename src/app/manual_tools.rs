@@ -428,6 +428,7 @@ fn run_scan_chat(config_path: &Path) -> Result<()> {
         &engine,
         &templates,
         config.screen.chat_rect.into(),
+        None,
     )?;
     println!("聊天区扫描耗时: {}ms", scan_started.elapsed().as_millis());
     print_chat_scan(&messages, config.screen.chat_rect);

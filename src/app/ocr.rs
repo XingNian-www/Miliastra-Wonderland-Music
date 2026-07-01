@@ -325,7 +325,7 @@ fn normalize_ocr_text(text: &str) -> String {
     normalize_ocr_spacing(text)
 }
 
-fn merge_ocr_lines(mut items: Vec<OcrLine>, same_line_y_tolerance: i32) -> String {
+pub(super) fn merge_ocr_lines(mut items: Vec<OcrLine>, same_line_y_tolerance: i32) -> String {
     items.sort_by(|left, right| compare_rect_top_left(left.bbox, right.bbox));
     let mut lines: Vec<(i32, Vec<OcrLine>)> = Vec::new();
     for item in items {

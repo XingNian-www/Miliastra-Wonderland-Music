@@ -141,7 +141,7 @@ window:
   content_width: 1920
   # 配置坐标对应的游戏有效画面高度
   content_height: 1080
-  # /active-window 或输入保护是否尝试自动切回目标窗口
+  # /active-window 接口是否尝试自动切回目标窗口
   auto_activate_window: false
 
 screen:
@@ -201,7 +201,7 @@ timing:
   output_focus_ms: 300
   # 9. 按回车打开聊天输入后的等待时间，单位毫秒
   output_open_chat_ms: 300
-  # 10. 两次聊天输入点击之间的等待时间，单位毫秒
+  # 10. 每次点击聊天输入区域后的等待时间，单位毫秒
   output_click_ms: 150
   # 11. 输入文本后到发送前的等待时间，单位毫秒
   output_input_ms: 250
@@ -219,7 +219,7 @@ timing:
   invite_open_chat_ms: 400
   # 18. 邀请流程每一步点击后的等待时间，单位毫秒
   invite_step_ms: 800
-  # 19. 非公共大厅邀请时等待 @邀请确认/@邀请拒绝 的最长时间，单位毫秒
+  # 19. 非公共大厅邀请时等待邀请确认/拒绝命令的最长时间，单位毫秒
   invite_confirm_timeout_ms: 30000
   # 20. 邀请确认扫描间隔，单位毫秒
   invite_confirm_poll_ms: 2000
@@ -243,19 +243,13 @@ timing:
   feeluown_rpc_timeout_ms: 10000
   # 30. 调整音量时每个平滑步进之间的等待时间，单位毫秒
   volume_smooth_step_ms: 300
-  # 31. HTTP 读取单个请求头的超时，单位毫秒
-  http_request_read_timeout_ms: 5000
-  # 32. 旧版 /active-window 和 /admin-status 检测超时，当前 Win32 直接检测不再使用
-  active_check_timeout_ms: 2000
-  # 33. 自动激活游戏窗口后等待前台窗口切换完成的时间，单位毫秒
+  # 31. 自动激活游戏窗口后等待前台窗口切换完成的时间，单位毫秒
   active_after_activate_ms: 200
-  # 34. AI HTTP 请求超时，单位毫秒
+  # 32. AI HTTP 请求超时，单位毫秒
   ai_request_timeout_ms: 35000
-  # 35. 旧版外部进程轮询间隔，保留用于兼容旧配置
-  external_process_poll_ms: 50
-  # 36. 播放结束监控本地推测循环间隔，单位毫秒
+  # 33. 播放监控线程循环间隔，单位毫秒
   playback_monitor_tick_ms: 200
-  # 37. 播放结束监控向 FeelUOwn 校准状态的间隔，单位毫秒
+  # 34. 播放结束监控向 FeelUOwn 校准状态的间隔，单位毫秒
   playback_monitor_status_ms: 1000
 
 ocr:
@@ -269,7 +263,7 @@ ocr:
   min_confidence: 0.9
   # OCR 线程数
   threads: 4
-  # OCR 后端优先级，当前发布包只使用 CPU OCR
+  # OCR 后端优先级，默认只使用 CPU OCR
   backend_priority:
     - cpu
   # 检测模型最长边限制；保持 960 与 PaddleOCR/BetterGI 常用配置一致
@@ -304,8 +298,6 @@ ocr:
   next_marker_min_gap: 12
   # 聊天文本区域右侧留白
   right_padding: 4
-  # OCR worker 内存重建阈值，暂作为后续内存保护配置
-  memory_rebuild_limit_bytes: 4294967296
   # 实验性：将聊天块拼接为单张图片一次性 OCR，减少推理次数
   batch_recognize: false
 
@@ -314,7 +306,7 @@ templates:
   blue_marker: assets/chat-marker-blue.png
   # 黄色聊天标志模板，通常是系统/高亮聊天行标志
   yellow_marker: assets/chat-marker-yellow.png
-  # 粉色聊天标志模板，用于识别好友命令：邀请、麦克风
+  # 粉色聊天标志模板，用于识别好友私聊命令
   pink_marker: assets/chat-marker-pink.png
   # 一级聊天界面的回车按钮模板
   enter: assets/ui-primary-enter.png
@@ -326,7 +318,7 @@ templates:
   invite_goto_hall: assets/invite-goto-hall.png
   # 邀请流程里的“进入大厅”按钮模板
   invite_enter_hall: assets/invite-enter-hall.png
-  # 聊天标志模板匹配阈值，越高越严格
+  # UI/聊天标志模板匹配阈值，越高越严格
   marker_threshold: 0.9
 
 output:
@@ -352,11 +344,11 @@ feeluown:
   port: 23333
 
 http:
-  # 预留 Web/API 面板监听地址
+  # Web/API 面板监听地址
   host: 127.0.0.1
-  # 预留 Web/API 面板端口
+  # Web/API 面板端口
   port: 18888
-  # 是否启用 Web/API 面板；当前仍是占位
+  # 是否启用 Web/API 面板
   enabled: true
 
 logging:
@@ -565,11 +557,8 @@ pub struct TimingConfig {
     pub decision_poll_ms: u64,
     pub feeluown_rpc_timeout_ms: u64,
     pub volume_smooth_step_ms: u64,
-    pub http_request_read_timeout_ms: u64,
-    pub active_check_timeout_ms: u64,
     pub active_after_activate_ms: u64,
     pub ai_request_timeout_ms: u64,
-    pub external_process_poll_ms: u64,
     pub playback_monitor_tick_ms: u64,
     pub playback_monitor_status_ms: u64,
 }
@@ -607,11 +596,8 @@ impl Default for TimingConfig {
             decision_poll_ms: 2000,
             feeluown_rpc_timeout_ms: 10000,
             volume_smooth_step_ms: 300,
-            http_request_read_timeout_ms: 5000,
-            active_check_timeout_ms: 2000,
             active_after_activate_ms: 200,
             ai_request_timeout_ms: 35000,
-            external_process_poll_ms: 50,
             playback_monitor_tick_ms: 200,
             playback_monitor_status_ms: 1000,
         }
@@ -643,7 +629,6 @@ pub struct OcrConfig {
     pub marker_dedupe_y: i32,
     pub next_marker_min_gap: i32,
     pub right_padding: i32,
-    pub memory_rebuild_limit_bytes: u64,
     pub batch_recognize: bool,
 }
 
@@ -672,7 +657,6 @@ impl Default for OcrConfig {
             marker_dedupe_y: 8,
             next_marker_min_gap: 12,
             right_padding: 4,
-            memory_rebuild_limit_bytes: 4 * 1024 * 1024 * 1024,
             batch_recognize: false,
         }
     }

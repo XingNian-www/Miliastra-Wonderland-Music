@@ -60,6 +60,8 @@ mod app {
     const IDLE_EXIT_MIN_MINUTES: u32 = 15;
     const OCR_REBUILD_INTERVAL: Duration = Duration::from_secs(60 * 60);
     const OCR_REBUILD_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
+    const TARGET_MISSING_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
+    const TARGET_MISSING_BACKOFF_MAX: Duration = Duration::from_secs(60);
 
     static WINDOW_CAPTURE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -739,10 +741,6 @@ mod app {
             config.feeluown.host,
             config.feeluown.port
         );
-        log::info!(
-            "OCR worker 内存重建阈值: {} bytes",
-            config.ocr.memory_rebuild_limit_bytes
-        );
 
         let runtime_state = PersistentRuntimeState::load(config.state.runtime_state_path.clone())?;
         let queue = PersistentQueue::load(config.state.queue_path.clone(), config.queue.max_size)?;
@@ -1041,7 +1039,13 @@ mod app {
         }
 
         fn warn_if_screen_size_mismatch(&self) -> Result<()> {
-            let frame = window::capture_game(&self.config.window)?;
+            let frame = match window::capture_game(&self.config.window) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    log::warn!("启动时未能截图，扫描循环将等待目标窗口恢复: {error:#}");
+                    return Ok(());
+                }
+            };
             if self.config.screen.warn_on_size_mismatch
                 && (frame.width() != self.config.screen.expected_width
                     || frame.height() != self.config.screen.expected_height)
@@ -1094,6 +1098,8 @@ mod app {
             let mut force_scan_after: Option<Instant> = None;
             let mut force_scan_reason: Option<&'static str> = None;
             let mut primary_visible = false;
+            let mut target_missing_backoff = TARGET_MISSING_BACKOFF_INITIAL;
+            let mut target_missing = false;
 
             log::info!("自动化扫描已启动");
             while self.running.load(AtomicOrdering::SeqCst) {
@@ -1105,6 +1111,11 @@ mod app {
 
                 match load_frame(&frame_args, &canvas, &self.config.window) {
                     Ok(frame) => {
+                        if target_missing {
+                            log::info!("目标窗口已恢复，重置截图退避");
+                            target_missing = false;
+                        }
+                        target_missing_backoff = TARGET_MISSING_BACKOFF_INITIAL;
                         match detect_ui_state(&frame.image, &ui_template_args, &self.config.screen)
                         {
                             Ok(ui_state) if ui_state.is_primary() => {
@@ -1279,7 +1290,17 @@ mod app {
                     }
                     Err(error) => {
                         primary_visible = false;
-                        log::error!("截图失败: {error:#}");
+                        last_fingerprint = None;
+                        log::warn!(
+                            "截图失败，{}秒后重试: {error:#}",
+                            target_missing_backoff.as_secs()
+                        );
+                        target_missing = true;
+                        self.maybe_idle_exit()?;
+                        sleep(target_missing_backoff);
+                        target_missing_backoff =
+                            next_target_missing_backoff(target_missing_backoff);
+                        continue;
                     }
                 }
                 if primary_visible && self.maybe_warn_hall_expiring()? {
@@ -4119,6 +4140,10 @@ mod app {
 
     fn elapsed_ms(started: Instant) -> u128 {
         started.elapsed().as_millis()
+    }
+
+    fn next_target_missing_backoff(current: Duration) -> Duration {
+        current.saturating_mul(2).min(TARGET_MISSING_BACKOFF_MAX)
     }
 
     fn load_frame(

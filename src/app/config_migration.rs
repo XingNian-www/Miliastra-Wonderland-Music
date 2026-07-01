@@ -27,10 +27,6 @@ const CHANGED_DEFAULT_FIELDS: &[ChangedDefaultField] = &[
 ];
 
 const MOVED_FIELDS: &[(&str, &str)] = &[
-    (
-        "window.active_check_timeout_ms",
-        "timing.active_check_timeout_ms",
-    ),
     ("ocr.poll_interval_ms", "timing.chat_scan_fallback_ms"),
     ("ocr.poll_interval_ms", "timing.invite_confirm_poll_ms"),
     ("ocr.change_poll_interval_ms", "timing.scan_loop_idle_ms"),

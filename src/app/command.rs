@@ -483,6 +483,8 @@ fn parse_moderation_command(
     for (prefix, action) in [
         ("拉黑UID", ModerationAction::Blacklist),
         ("屏蔽UID", ModerationAction::BlockChat),
+        ("拉黑", ModerationAction::Blacklist),
+        ("屏蔽", ModerationAction::BlockChat),
     ] {
         let Some(rest) = command_text.strip_prefix(prefix) else {
             continue;
@@ -892,6 +894,34 @@ mod tests {
     fn rejects_invalid_uid_length() {
         assert!(parse_text("[Alice]：@拉黑UID12345678", "pink").is_none());
         assert!(parse_text("[Alice]：@屏蔽UID1234567890", "pink").is_none());
+        assert!(parse_text("[Alice]：@拉黑12345678", "pink").is_none());
+        assert!(parse_text("[Alice]：@屏蔽1234567890", "pink").is_none());
+    }
+
+    #[test]
+    fn parses_pink_blacklist_uid_alias() {
+        let parsed = parse_text("[Alice]：@拉黑123456789", "pink").expect("parse blacklist alias");
+        assert_eq!(
+            parsed.command,
+            UserCommand::Moderation(ModerationCommand {
+                action: ModerationAction::Blacklist,
+                uid: "123456789".to_string(),
+                requester: "Alice".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_pink_block_chat_uid_alias() {
+        let parsed = parse_text("[Alice]：@屏蔽123456789", "pink").expect("parse block alias");
+        assert_eq!(
+            parsed.command,
+            UserCommand::Moderation(ModerationCommand {
+                action: ModerationAction::BlockChat,
+                uid: "123456789".to_string(),
+                requester: "Alice".to_string(),
+            })
+        );
     }
 
     #[test]

@@ -2981,7 +2981,13 @@ mod app {
             ))?;
             let result = self.execute_moderation_steps(command);
             match &result {
-                Ok(true) => {}
+                Ok(true) => {
+                    let _ = self.reply(&format!(
+                        "已对@UID{}执行{}",
+                        command.uid,
+                        command.action.label()
+                    ));
+                }
                 Ok(false) | Err(_) => {
                     let _ = self.reply(&format!(
                         "@UID{}的{}流程出错",

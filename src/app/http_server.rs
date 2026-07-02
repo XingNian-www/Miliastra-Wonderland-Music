@@ -37,18 +37,20 @@ use windows::core::BOOL;
 use super::ai;
 use super::config::AppConfig;
 use super::feeluown::FeelUOwnClient;
+use super::monitor::{MonitorQueueItem, MonitorShared};
 use super::queue::{PersistentQueue, QueueItem};
 use super::runtime_state::PersistentRuntimeState;
 
 const MAX_ACTIVE_CONNECTIONS: usize = 32;
 const PAGE: &str = include_str!("page.html");
-const KNOWN_ROUTES: &str = "/status, /play, /pause, /skip-next, /skip-prev, /volume, /searchPlay, /searchSource, /search, /open-scheme, /history, /clear-history, /health, /admin-status, /restart-admin, /active-window, /queue, /queue/add, /queue/remove, /queue/clear, /state, /state/save, /ai/recognize, /ai/match, /ai/pick, /ai/search";
+const KNOWN_ROUTES: &str = "/status, /play, /pause, /skip-next, /skip-prev, /volume, /searchPlay, /searchSource, /search, /open-scheme, /history, /clear-history, /health, /monitor, /admin-status, /restart-admin, /active-window, /queue, /queue/add, /queue/remove, /queue/clear, /state, /state/save, /ai/recognize, /ai/match, /ai/pick, /ai/search";
 
 #[derive(Clone)]
 pub struct HttpSharedState {
     pub config: AppConfig,
     pub queue: Arc<Mutex<PersistentQueue>>,
     pub runtime_state: Arc<Mutex<PersistentRuntimeState>>,
+    pub monitor: MonitorShared,
     pub history: Arc<Mutex<VecDeque<HistoryItem>>>,
     pub active_connections: Arc<AtomicUsize>,
 }
@@ -82,11 +84,13 @@ impl HttpSharedState {
         config: AppConfig,
         queue: Arc<Mutex<PersistentQueue>>,
         runtime_state: Arc<Mutex<PersistentRuntimeState>>,
+        monitor: MonitorShared,
     ) -> Self {
         Self {
             config,
             queue,
             runtime_state,
+            monitor,
             history: Arc::new(Mutex::new(VecDeque::new())),
             active_connections: Arc::new(AtomicUsize::new(0)),
         }
@@ -270,18 +274,22 @@ fn route(
         }
         "/play" => {
             client.play().map_err(internal_error)?;
+            set_pause_flags(state, false, false)?;
             Ok("已恢复播放".to_string())
         }
         "/pause" => {
             client.pause().map_err(internal_error)?;
+            set_pause_flags(state, true, false)?;
             Ok("已暂停".to_string())
         }
         "/skip-next" => {
             client.next().map_err(internal_error)?;
+            set_pause_flags(state, false, false)?;
             Ok("下一首".to_string())
         }
         "/skip-prev" => {
             client.previous().map_err(internal_error)?;
+            set_pause_flags(state, false, false)?;
             Ok("上一首".to_string())
         }
         "/volume" => {
@@ -311,6 +319,7 @@ fn route(
                     },
                     message: error.to_string(),
                 })?;
+            set_pause_flags(state, false, false)?;
             Ok(result.message)
         }
         "/searchSource" => {
@@ -324,6 +333,7 @@ fn route(
             client
                 .play_keyword(&keyword, &source, prefer)
                 .map_err(internal_error)?;
+            set_pause_flags(state, false, false)?;
             Ok(format!(
                 "正在搜索: {} ({}){}",
                 keyword,
@@ -339,6 +349,7 @@ fn route(
         "/open-scheme" => {
             let uri = normalize_fuo_uri(query_value_or(query, "url", "uri"))?;
             client.play_uri(uri.trim()).map_err(internal_error)?;
+            set_pause_flags(state, false, false)?;
             Ok("已打开 FeelUOwn URI".to_string())
         }
         "/queue" => queue_json(state),
@@ -409,6 +420,7 @@ fn route(
         }
         "/history" => history_json(state),
         "/clear-history" => clear_history(state),
+        "/monitor" => monitor_json(state),
         "/health" => Ok("OK".to_string()),
         _ => Err(AppError {
             status: 404,
@@ -459,6 +471,7 @@ fn queue_add(
             message: "队列已满".to_string(),
         });
     }
+    sync_monitor_queue(&state.monitor, &queue);
     Ok(json!({ "ok": true, "size": queue.len() }).to_string())
 }
 
@@ -485,6 +498,7 @@ fn queue_remove(
     } else if !queue.is_empty() {
         queue.remove_indexes(&[0]).map_err(internal_error)?;
     }
+    sync_monitor_queue(&state.monitor, &queue);
     Ok(json!({ "ok": true, "size": queue.len() }).to_string())
 }
 
@@ -494,7 +508,23 @@ fn queue_clear(state: &HttpSharedState) -> std::result::Result<String, AppError>
         .lock()
         .map_err(|_| internal_message("队列锁已损坏"))?;
     queue.clear().map_err(internal_error)?;
+    sync_monitor_queue(&state.monitor, &queue);
     Ok(json!({ "ok": true }).to_string())
+}
+
+fn sync_monitor_queue(monitor: &MonitorShared, queue: &PersistentQueue) {
+    monitor.set_queue(
+        queue
+            .items()
+            .iter()
+            .map(|item| MonitorQueueItem {
+                keyword: item.keyword.clone(),
+                source: item.source.clone(),
+                prefer_accompaniment: item.prefer_accompaniment,
+                friend_username: item.friend_username.clone(),
+            })
+            .collect(),
+    );
 }
 
 fn state_json(state: &HttpSharedState) -> std::result::Result<String, AppError> {
@@ -535,6 +565,20 @@ fn state_save(
     Ok(json!({ "ok": true }).to_string())
 }
 
+fn set_pause_flags(
+    state: &HttpSharedState,
+    paused_by_command: bool,
+    paused_for_pending_playback: bool,
+) -> std::result::Result<(), AppError> {
+    let mut runtime = state
+        .runtime_state
+        .lock()
+        .map_err(|_| internal_message("状态锁已损坏"))?;
+    runtime.state_mut().paused_by_command = paused_by_command;
+    runtime.state_mut().paused_for_pending_playback = paused_for_pending_playback;
+    runtime.save().map_err(internal_error)
+}
+
 fn active_window_json(
     query: &[(String, String)],
     state: &HttpSharedState,
@@ -567,11 +611,16 @@ fn clear_history(state: &HttpSharedState) -> std::result::Result<String, AppErro
     Ok("命令记录已清空".to_string())
 }
 
+fn monitor_json(state: &HttpSharedState) -> std::result::Result<String, AppError> {
+    serde_json::to_string(&state.monitor.snapshot()).map_err(internal_error)
+}
+
 fn push_history(request: &Request, result: &str, ok: bool, state: &HttpSharedState) {
     if matches!(
         request.path.as_str(),
         "/history"
             | "/clear-history"
+            | "/monitor"
             | "/active-window"
             | "/admin-status"
             | "/restart-admin"
@@ -1125,6 +1174,7 @@ fn is_json_route(path: &str) -> bool {
             | "/ai/pick"
             | "/ai/search"
             | "/history"
+            | "/monitor"
     )
 }
 

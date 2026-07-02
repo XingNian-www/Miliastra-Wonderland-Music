@@ -132,7 +132,7 @@ fn default_config_yaml() -> &'static str {
 # 坐标沿用旧脚本习惯：以游戏客户区左上角为原点，按 1920x1080 有效画面写坐标
 
 # 配置版本；程序启动时会把旧版本配置迁移到当前模板
-config_version: 5
+config_version: 6
 
 window:
   # 目标游戏进程名，按进程文件名匹配，大小写不敏感
@@ -327,7 +327,7 @@ output:
   # 用于聚焦/返回一级聊天界面的点击点
   focus_point:
     x: 1919
-    y: 540
+    y: 1079
   # 打开聊天输入后的第一次点击位置
   chat_click_1:
     x: 120
@@ -359,7 +359,7 @@ logging:
 
 tui:
   # 是否启用终端 TUI 面板；启用后实时显示日志和 OCR 内容
-  enabled: false
+  enabled: true
   # TUI 刷新间隔，单位毫秒
   refresh_ms: 100
   # TUI 保留最近多少行日志
@@ -378,6 +378,8 @@ queue:
   max_size: 5
   # 当前歌曲剩余多少秒以内自动播放队列下一首
   auto_advance_seconds: 1
+  # 队列自动播出的歌曲是否保护；true 时新点歌会排队，false 时可直接替换
+  protect_auto_played_songs: true
 
 ai:
   # AI 供应商：mimo/openai/deepseek/custom
@@ -705,7 +707,7 @@ impl Default for OutputConfig {
     fn default() -> Self {
         Self {
             send_enabled: true,
-            focus_point: PointConfig::new(1919, 540),
+            focus_point: PointConfig::new(1919, 1079),
             chat_click_1: PointConfig::new(120, 225),
             chat_click_2: PointConfig::new(600, 1013),
         }
@@ -773,7 +775,7 @@ pub struct TuiConfig {
 impl Default for TuiConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             refresh_ms: 100,
             log_lines: 200,
         }
@@ -803,6 +805,7 @@ impl Default for StateConfig {
 pub struct QueueConfig {
     pub max_size: usize,
     pub auto_advance_seconds: u64,
+    pub protect_auto_played_songs: bool,
 }
 
 impl Default for QueueConfig {
@@ -810,6 +813,7 @@ impl Default for QueueConfig {
         Self {
             max_size: 5,
             auto_advance_seconds: 1,
+            protect_auto_played_songs: true,
         }
     }
 }

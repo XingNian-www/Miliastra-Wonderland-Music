@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow};
 use serde_yaml::{Mapping, Value};
 
-pub const CURRENT_CONFIG_VERSION: u32 = 5;
+pub const CURRENT_CONFIG_VERSION: u32 = 6;
 
 struct ChangedDefaultField {
     path: &'static str,
@@ -25,6 +25,18 @@ const CHANGED_DEFAULT_FIELDS: &[ChangedDefaultField] = &[
         changed_in_version: 5,
     },
 ];
+
+struct ChangedBoolDefaultField {
+    path: &'static str,
+    old_default: bool,
+    changed_in_version: u32,
+}
+
+const CHANGED_BOOL_DEFAULT_FIELDS: &[ChangedBoolDefaultField] = &[ChangedBoolDefaultField {
+    path: "tui.enabled",
+    old_default: false,
+    changed_in_version: 6,
+}];
 
 const MOVED_FIELDS: &[(&str, &str)] = &[
     ("ocr.poll_interval_ms", "timing.chat_scan_fallback_ms"),
@@ -154,6 +166,19 @@ fn migrate_changed_default_fields(
         }
         let path = split_path(field.path);
         if get_path(old_value, &path).and_then(Value::as_u64) != Some(field.old_default) {
+            continue;
+        }
+        let Some(current_default) = get_path(default_value, &path) else {
+            continue;
+        };
+        let _ = set_path(new_value, &path, current_default.clone());
+    }
+    for field in CHANGED_BOOL_DEFAULT_FIELDS {
+        if old_version.is_some_and(|version| version >= field.changed_in_version as u64) {
+            continue;
+        }
+        let path = split_path(field.path);
+        if get_path(old_value, &path).and_then(Value::as_bool) != Some(field.old_default) {
             continue;
         }
         let Some(current_default) = get_path(default_value, &path) else {
@@ -512,7 +537,7 @@ mod tests {
 
     const DEFAULT: &str = r#"# test config
 # version comment
-config_version: 5
+config_version: 6
 
 timing:
   # fallback comment
@@ -522,6 +547,10 @@ timing:
 
 queue:
   auto_advance_seconds: 1
+  protect_auto_played_songs: true
+
+tui:
+  enabled: true
 
 ocr:
   min_confidence: 0.9
@@ -548,7 +577,7 @@ unknown_root:
             .expect("migration needed");
 
         assert!(report.text.contains("# fallback comment"));
-        assert!(report.text.contains("config_version: 5"));
+        assert!(report.text.contains("config_version: 6"));
         assert!(report.text.contains("chat_scan_fallback_ms: 1234"));
         assert!(report.text.contains("scan_loop_idle_ms: 77"));
         assert!(report.text.contains("output_focus_ms: 456"));
@@ -569,13 +598,16 @@ unknown_root:
 
     #[test]
     fn current_version_without_moved_fields_does_not_migrate() {
-        let current = r#"config_version: 5
+        let current = r#"config_version: 6
 timing:
   chat_scan_fallback_ms: 2000
   scan_loop_idle_ms: 60
   output_focus_ms: 300
 queue:
   auto_advance_seconds: 1
+  protect_auto_played_songs: true
+tui:
+  enabled: true
 ocr:
   min_confidence: 0.9
   change_mean_threshold: 6.0
@@ -639,8 +671,38 @@ queue:
             .expect("migration succeeds")
             .expect("migration needed");
 
-        assert!(report.text.contains("config_version: 5"));
+        assert!(report.text.contains("config_version: 6"));
         assert!(report.text.contains("auto_advance_seconds: 1"));
+    }
+
+    #[test]
+    fn migrates_v5_tui_default_to_enabled() {
+        let old = r#"config_version: 5
+tui:
+  enabled: false
+"#;
+
+        let report = migrate_config_text(old, DEFAULT)
+            .expect("migration succeeds")
+            .expect("migration needed");
+
+        assert!(report.text.contains("config_version: 6"));
+        assert!(report.text.contains("enabled: true"));
+        assert!(report.text.contains("protect_auto_played_songs: true"));
+    }
+
+    #[test]
+    fn keeps_custom_tui_enabled() {
+        let old = r#"config_version: 5
+tui:
+  enabled: true
+"#;
+
+        let report = migrate_config_text(old, DEFAULT)
+            .expect("migration succeeds")
+            .expect("migration needed");
+
+        assert!(report.text.contains("enabled: true"));
     }
 
     #[test]

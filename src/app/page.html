@@ -6,7 +6,7 @@
 <title>FeelUOwn 点歌服务</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-body{background:#121826;color:#eef2ff;font-family:"Microsoft YaHei",system-ui,sans-serif;max-width:420px;margin:0 auto;padding:16px}
+body{background:#121826;color:#eef2ff;font-family:"Microsoft YaHei",system-ui,sans-serif;max-width:960px;margin:0 auto;padding:16px}
 h1{text-align:center;font-size:20px;margin-bottom:16px;color:#7dd3fc}
 .section{margin-bottom:14px}
 .section label{display:block;font-size:13px;color:#a5b4fc;margin-bottom:4px}
@@ -27,6 +27,12 @@ input,select{background:#1e293b;color:#fff;border:1px solid #334155;border-radiu
 .history-item.err{border-left-color:#ef4444}
 .history-time{color:#94a3b8;margin-right:6px}
 .history-result{color:#cbd5e1;margin-top:4px;word-break:break-all}
+.monitor-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.panel{background:#0f172a;border:1px solid #243244;border-radius:10px;padding:10px;min-height:120px;overflow:hidden}
+.panel h2{font-size:14px;color:#7dd3fc;margin-bottom:8px}
+.panel pre{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px;white-space:pre-wrap;word-break:break-word;color:#cbd5e1;max-height:220px;overflow:auto}
+.monitor-status{font-size:13px;color:#c4b5fd;margin-bottom:8px}
+@media(max-width:680px){body{max-width:420px}.monitor-grid{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
@@ -93,6 +99,17 @@ input,select{background:#1e293b;color:#fff;border:1px solid #334155;border-radiu
 <div id="result"></div>
 
 <div class="section">
+  <label>实时监听</label>
+  <div class="monitor-status" id="monitorStatus">等待刷新</div>
+  <div class="monitor-grid">
+    <div class="panel"><h2>OCR</h2><pre id="monitorOcr">暂无 OCR 内容</pre></div>
+    <div class="panel"><h2>队列</h2><pre id="monitorQueue">队列为空</pre></div>
+    <div class="panel"><h2>命令</h2><pre id="monitorCommands">暂无命令</pre></div>
+    <div class="panel"><h2>日志</h2><pre id="monitorLogs">暂无日志</pre></div>
+  </div>
+</div>
+
+<div class="section">
   <label>命令记录</label>
   <div class="row">
     <button class="btn" onclick="loadHistory()">刷新</button>
@@ -151,12 +168,17 @@ function queryText(q){const rows=Object.entries(q||{}).filter(([,v])=>v!=null&&S
 function searchPlay(source){const kw=$('keyword').value;const src=source!=null?source:$('sourceSelect').value;let url='/searchPlay?keyword='+encodeURIComponent(kw);if(src)url+='&source='+encodeURIComponent(src);call(url,'POST')}
 async function searchOnly(){const el=$('result');const kw=$('keyword').value.trim();if(!kw){el.textContent='请输入关键词';return}const src=$('sourceSelect').value;let url='/search?keyword='+encodeURIComponent(kw);if(src)url+='&source='+encodeURIComponent(src);el.textContent='搜索中...';try{const r=await fetch(url);const t=await r.text();if(!r.ok){el.textContent=t;await loadHistory();return}el.textContent='搜索 '+kw+' '+(src||'聚合')+' 返回 '+t.length+' 字节:\n\n'+t}catch(e){el.textContent='错误: '+e.message}await loadHistory()}
 function renderHistory(items){const el=$('history');if(!items.length){el.textContent='暂无记录';return}el.innerHTML=items.map((it)=>'<div class="history-item '+(it.ok?'':'err')+'"><div><span class="history-time">'+esc(it.time)+'</span><b>'+esc(commandLabels[it.command]||it.command)+'</b>'+esc(queryText(it.query))+'</div><div class="history-result">'+esc(it.result)+'</div></div>').join('')}
+function queueLine(it,i){let s=(i+1)+'. ';if(it.friendUsername)s+=it.friendUsername+': ';s+=it.keyword||'';if(it.source)s+=' ['+it.source+']';if(it.preferAccompaniment)s+=' 伴奏';return s}
+function renderMonitor(d){$('monitorStatus').textContent='状态: '+(d.status||'未知');const o=d.ocr;if(o){$('monitorOcr').textContent='markers: '+o.markers+'  耗时: total='+o.totalMs+'ms marker='+o.markerMs+'ms ocr='+o.ocrMs+'ms\n'+(o.messages||[]).join('\n')}else{$('monitorOcr').textContent='暂无 OCR 内容'}const q=Array.isArray(d.queue)?d.queue:[];$('monitorQueue').textContent=q.length?q.map(queueLine).join('\n'):'队列为空';const c=Array.isArray(d.commands)?d.commands:[];$('monitorCommands').textContent=c.length?c.slice(-20).join('\n'):'暂无命令';const logs=Array.isArray(d.logs)?d.logs:[];$('monitorLogs').textContent=logs.length?logs.slice(-80).join('\n'):'暂无日志'}
 async function loadHistory(){try{const r=await fetch('/history');const items=await r.json();renderHistory(Array.isArray(items)?items:[])}catch(e){$('history').textContent='读取记录失败: '+e.message}}
+async function loadMonitor(){try{const r=await fetch('/monitor');if(!r.ok)throw new Error(await r.text());renderMonitor(await r.json())}catch(e){$('monitorStatus').textContent='监听读取失败: '+e.message}}
 async function clearHistory(){const el=$('result');try{const r=await fetch('/clear-history',{method:'POST'});el.textContent=await r.text()}catch(e){el.textContent='错误: '+e.message}await loadHistory()}
 async function loadAdminStatus(){const el=$('result');el.textContent='请求中...';try{const r=await fetch('/admin-status');const t=await r.text();if(!r.ok){el.textContent=t;return}try{el.innerHTML=adminHTML(JSON.parse(t))}catch{el.textContent=t}}catch(e){el.textContent='错误: '+e.message}}
 async function loadWindowStatus(){const el=$('result');const target=$('windowTarget').value.trim();let url='/active-window';if(target)url+='?target='+encodeURIComponent(target);el.textContent='请求中...';try{const r=await fetch(url,{method:'POST'});const t=await r.text();if(!r.ok){el.textContent=t;return}try{el.innerHTML=windowHTML(JSON.parse(t))}catch{el.textContent=t}}catch(e){el.textContent='错误: '+e.message}}
 async function call(url,method){const el=$('result');el.textContent='请求中...';try{const r=await fetch(url,{method:method||'GET'});const t=await r.text();if(!r.ok){el.textContent=t;await loadHistory();return}if(url==='/status'){try{const d=JSON.parse(t);el.innerHTML=statusHTML(d)}catch{el.textContent=t}}else{el.textContent=t}}catch(e){el.textContent='错误: '+e.message}await loadHistory()}
 loadHistory()
+loadMonitor()
+setInterval(loadMonitor,1000)
 </script>
 </body>
 </html>

@@ -1,7 +1,6 @@
-use std::collections::VecDeque;
 use std::io;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -11,97 +10,31 @@ use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use windows::Win32::Foundation::HANDLE;
+use windows::Win32::System::Console::{
+    CONSOLE_MODE, ENABLE_EXTENDED_FLAGS, ENABLE_INSERT_MODE, ENABLE_QUICK_EDIT_MODE,
+    GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE, SetConsoleMode,
+};
 
 use super::config::TuiConfig;
-
-#[derive(Clone, Debug)]
-pub(super) struct OcrSnapshot {
-    pub(super) markers: usize,
-    pub(super) messages: Vec<String>,
-    pub(super) marker_ms: u128,
-    pub(super) ocr_ms: u128,
-    pub(super) total_ms: u128,
-}
-
-#[derive(Clone)]
-pub(super) struct TuiShared {
-    state: Arc<Mutex<TuiState>>,
-}
-
-#[derive(Clone)]
-pub(super) struct TuiLogSink {
-    shared: TuiShared,
-}
+use super::monitor::{MonitorQueueItem, MonitorShared, MonitorSnapshot};
 
 pub(super) struct TuiHandle {
-    shared: TuiShared,
     running: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    console_mode_guard: Option<ConsoleInputModeGuard>,
 }
 
 type TuiTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 
-#[derive(Debug)]
-struct TuiState {
-    logs: VecDeque<String>,
-    log_limit: usize,
-    ocr: Option<OcrSnapshot>,
-    status: String,
-}
-
-impl TuiShared {
-    fn new(log_limit: usize) -> Self {
-        Self {
-            state: Arc::new(Mutex::new(TuiState {
-                logs: VecDeque::new(),
-                log_limit: log_limit.max(20),
-                ocr: None,
-                status: "启动中".to_string(),
-            })),
-        }
-    }
-
-    pub(super) fn push_log(&self, line: String) {
-        if let Ok(mut state) = self.state.lock() {
-            let mut pushed = false;
-            for part in line.lines() {
-                state.logs.push_back(part.to_string());
-                pushed = true;
-                while state.logs.len() > state.log_limit {
-                    state.logs.pop_front();
-                }
-            }
-            if !pushed {
-                state.logs.push_back(String::new());
-                while state.logs.len() > state.log_limit {
-                    state.logs.pop_front();
-                }
-            }
-        }
-    }
-
-    pub(super) fn set_ocr(&self, snapshot: OcrSnapshot) {
-        if let Ok(mut state) = self.state.lock() {
-            state.ocr = Some(snapshot);
-        }
-    }
-
-    pub(super) fn set_status(&self, status: impl Into<String>) {
-        if let Ok(mut state) = self.state.lock() {
-            state.status = status.into();
-        }
-    }
-}
-
-impl TuiLogSink {
-    pub(super) fn push(&self, line: String) {
-        self.shared.push_log(line);
-    }
+struct ConsoleInputModeGuard {
+    handle: HANDLE,
+    original_mode: CONSOLE_MODE,
 }
 
 impl TuiHandle {
-    pub(super) fn start(config: &TuiConfig) -> io::Result<Self> {
-        let shared = TuiShared::new(config.log_lines);
+    pub(super) fn start(config: &TuiConfig, shared: MonitorShared) -> io::Result<Self> {
+        let console_mode_guard = ConsoleInputModeGuard::disable_quick_edit_and_insert();
         let running = Arc::new(AtomicBool::new(true));
         let backend = CrosstermBackend::new(io::stdout());
         let mut terminal = Terminal::new(backend)?;
@@ -112,20 +45,34 @@ impl TuiHandle {
         let thread =
             thread::spawn(move || render_loop(terminal, thread_shared, thread_running, refresh));
         Ok(Self {
-            shared,
             running,
             thread: Some(thread),
+            console_mode_guard,
         })
     }
+}
 
-    pub(super) fn shared(&self) -> TuiShared {
-        self.shared.clone()
+impl ConsoleInputModeGuard {
+    fn disable_quick_edit_and_insert() -> Option<Self> {
+        let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) }.ok()?;
+        let mut original_mode = CONSOLE_MODE(0);
+        unsafe { GetConsoleMode(handle, &mut original_mode) }.ok()?;
+        let new_mode = CONSOLE_MODE(
+            (original_mode.0 | ENABLE_EXTENDED_FLAGS.0)
+                & !ENABLE_QUICK_EDIT_MODE.0
+                & !ENABLE_INSERT_MODE.0,
+        );
+        unsafe { SetConsoleMode(handle, new_mode) }.ok()?;
+        Some(Self {
+            handle,
+            original_mode,
+        })
     }
+}
 
-    pub(super) fn log_sink(&self) -> TuiLogSink {
-        TuiLogSink {
-            shared: self.shared.clone(),
-        }
+impl Drop for ConsoleInputModeGuard {
+    fn drop(&mut self) {
+        let _ = unsafe { SetConsoleMode(self.handle, self.original_mode) };
     }
 }
 
@@ -135,45 +82,42 @@ impl Drop for TuiHandle {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+        drop(self.console_mode_guard.take());
     }
 }
 
 fn render_loop(
     mut terminal: TuiTerminal,
-    shared: TuiShared,
+    shared: MonitorShared,
     running: Arc<AtomicBool>,
     refresh: Duration,
 ) {
     while running.load(Ordering::SeqCst) {
-        let snapshot = shared.state.lock().ok().map(|state| RenderState {
-            logs: state.logs.iter().cloned().collect(),
-            ocr: state.ocr.clone(),
-            status: state.status.clone(),
-        });
-        if let Some(snapshot) = snapshot {
-            let _ = terminal.draw(|frame| draw(frame, &snapshot));
-        }
+        let snapshot = shared.snapshot();
+        let _ = terminal.draw(|frame| draw(frame, &snapshot));
         thread::sleep(refresh);
     }
     let _ = terminal.show_cursor();
 }
 
-#[derive(Debug)]
-struct RenderState {
-    logs: Vec<String>,
-    ocr: Option<OcrSnapshot>,
-    status: String,
-}
-
-fn draw(frame: &mut ratatui::Frame<'_>, state: &RenderState) {
+fn draw(frame: &mut ratatui::Frame<'_>, state: &MonitorSnapshot) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Percentage(58),
-            Constraint::Percentage(37),
+            Constraint::Min(5),
+            Constraint::Length(8),
             Constraint::Length(3),
         ])
         .split(frame.area());
+
+    let dashboard = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(40),
+            Constraint::Percentage(30),
+            Constraint::Percentage(30),
+        ])
+        .split(chunks[1]);
 
     let log_lines = state
         .logs
@@ -214,7 +158,42 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &RenderState) {
         Paragraph::new(ocr_lines)
             .block(Block::default().title(" OCR 内容 ").borders(Borders::ALL))
             .wrap(Wrap { trim: false }),
-        chunks[1],
+        dashboard[0],
+    );
+
+    let queue_lines = if state.queue.is_empty() {
+        vec![Line::from("队列为空")]
+    } else {
+        state
+            .queue
+            .iter()
+            .map(|item| Line::from(format_queue_item(item)))
+            .collect::<Vec<_>>()
+    };
+    frame.render_widget(
+        Paragraph::new(queue_lines)
+            .block(Block::default().title(" 队列 ").borders(Borders::ALL))
+            .wrap(Wrap { trim: false }),
+        dashboard[1],
+    );
+
+    let command_lines = if state.commands.is_empty() {
+        vec![Line::from("暂无命令")]
+    } else {
+        state
+            .commands
+            .iter()
+            .rev()
+            .take(dashboard[2].height.saturating_sub(2) as usize)
+            .rev()
+            .map(|command| Line::from(command.as_str()))
+            .collect::<Vec<_>>()
+    };
+    frame.render_widget(
+        Paragraph::new(command_lines)
+            .block(Block::default().title(" 命令 ").borders(Borders::ALL))
+            .wrap(Wrap { trim: false }),
+        dashboard[2],
     );
 
     frame.render_widget(
@@ -225,4 +204,22 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &RenderState) {
         .block(Block::default().borders(Borders::ALL)),
         chunks[2],
     );
+}
+
+fn format_queue_item(item: &MonitorQueueItem) -> String {
+    let mut text = String::new();
+    if !item.friend_username.trim().is_empty() {
+        text.push_str(&item.friend_username);
+        text.push_str(": ");
+    }
+    text.push_str(&item.keyword);
+    if !item.source.trim().is_empty() {
+        text.push_str(" [");
+        text.push_str(&item.source);
+        text.push(']');
+    }
+    if item.prefer_accompaniment {
+        text.push_str(" 伴奏");
+    }
+    text
 }

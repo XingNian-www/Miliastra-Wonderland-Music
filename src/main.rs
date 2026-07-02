@@ -17,6 +17,7 @@ mod app {
     mod http_server;
     mod logger;
     mod manual_tools;
+    mod monitor;
     mod ocr;
     mod ocr_batch;
     mod queue;
@@ -28,7 +29,7 @@ mod app {
     use std::cmp::Ordering;
     use std::collections::{HashMap, HashSet, VecDeque};
     use std::fs::{self, OpenOptions};
-    use std::io::Write;
+    use std::io::{IsTerminal, Write};
     use std::path::{Path, PathBuf};
     use std::process::Command as ProcessCommand;
     use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -40,6 +41,7 @@ mod app {
     use self::command::{CommandLockState, ParsedCommand, PendingCommand, UserCommand};
     use self::config::{AppConfig, PointConfig, RectConfig};
     use self::feeluown::{FeelUOwnClient, PlayerStatus, format_lyrics, format_status};
+    use self::monitor::{MonitorQueueItem, MonitorShared};
     use self::ocr::{OcrArgs, make_ocr_engine, merged_ocr_text, recognize_lines};
     use self::queue::PersistentQueue;
     use self::runtime_state::{HALL_EXPIRING_WARNING_MINUTES, PersistentRuntimeState};
@@ -714,20 +716,27 @@ mod app {
 
     fn run_automation(config_path: &Path) -> Result<()> {
         let config = AppConfig::load_or_create(config_path)?;
-        let tui_handle = if config.tui.enabled {
-            match tui::TuiHandle::start(&config.tui) {
+        let monitor = MonitorShared::new(config.tui.log_lines);
+        let tui_handle = if config.tui.enabled && std::io::stdout().is_terminal() {
+            match tui::TuiHandle::start(&config.tui, monitor.clone()) {
                 Ok(handle) => Some(handle),
                 Err(error) => {
                     eprintln!("TUI 启动失败，回退普通日志输出: {error:#}");
                     None
                 }
             }
+        } else if config.tui.enabled {
+            eprintln!("检测到非交互终端，已关闭 TUI");
+            None
         } else {
             None
         };
-        let tui_shared = tui_handle.as_ref().map(|handle| handle.shared());
-        let tui_log_sink = tui_handle.as_ref().map(|handle| handle.log_sink());
-        let log_path = logger::init(&config.logging.dir, &config.logging.level, tui_log_sink)?;
+        let log_path = logger::init(
+            &config.logging.dir,
+            &config.logging.level,
+            Some(monitor.log_sink()),
+            tui_handle.is_none(),
+        )?;
         log::info!("日志文件: {}", log_path.display());
         log::info!("配置文件: {}", config_path.display());
         log::info!(
@@ -750,7 +759,7 @@ mod app {
             runtime_state.state().paused_by_command
         );
 
-        let mut app = AutomationApp::new(config, runtime_state, queue, tui_shared)?;
+        let mut app = AutomationApp::new(config, runtime_state, queue, monitor)?;
         let result = app.run();
         drop(tui_handle);
         result
@@ -775,7 +784,7 @@ mod app {
         paused: Arc<AtomicBool>,
         command_executing: Arc<AtomicBool>,
         song_command_executing: Arc<AtomicBool>,
-        tui: Option<tui::TuiShared>,
+        monitor: MonitorShared,
     }
 
     #[derive(Clone, Debug)]
@@ -876,7 +885,7 @@ mod app {
             config: AppConfig,
             runtime_state: PersistentRuntimeState,
             queue: PersistentQueue,
-            tui: Option<tui::TuiShared>,
+            monitor: MonitorShared,
         ) -> Result<Self> {
             let ocr_args = OcrArgs::default().resolve(&config);
             let ocr_engine = make_ocr_engine(&ocr_args)?;
@@ -905,14 +914,13 @@ mod app {
                 paused: Arc::new(AtomicBool::new(false)),
                 command_executing: Arc::new(AtomicBool::new(false)),
                 song_command_executing: Arc::new(AtomicBool::new(false)),
-                tui,
+                monitor,
             })
         }
 
         fn run(&mut self) -> Result<()> {
-            if let Some(tui) = &self.tui {
-                tui.set_status("运行中");
-            }
+            self.monitor.set_status("运行中");
+            self.update_monitor_queue_snapshot();
             self.warn_if_screen_size_mismatch()?;
             self.start_http_server()?;
             self.start_hotkeys()?;
@@ -933,9 +941,7 @@ mod app {
             if let Err(error) = self.runtime_state().and_then(|state| state.save()) {
                 log::error!("退出前保存运行状态失败: {error:#}");
             }
-            if let Some(tui) = &self.tui {
-                tui.set_status("已退出");
-            }
+            self.monitor.set_status("已退出");
             result
         }
 
@@ -959,7 +965,7 @@ mod app {
                 paused: self.paused.clone(),
                 command_executing: self.command_executing.clone(),
                 song_command_executing: self.song_command_executing.clone(),
-                tui: self.tui.clone(),
+                monitor: self.monitor.clone(),
             };
             thread::spawn(move || {
                 log::info!("命令执行线程已启动");
@@ -989,7 +995,7 @@ mod app {
                 paused: self.paused.clone(),
                 command_executing: self.command_executing.clone(),
                 song_command_executing: self.song_command_executing.clone(),
-                tui: self.tui.clone(),
+                monitor: self.monitor.clone(),
             };
             thread::spawn(move || {
                 log::info!("播放监控线程已启动");
@@ -1069,6 +1075,7 @@ mod app {
                 self.config.clone(),
                 Arc::clone(&self.queue),
                 Arc::clone(&self.runtime_state),
+                self.monitor.clone(),
             ))
         }
 
@@ -1209,7 +1216,7 @@ mod app {
                                                     &engine.engine,
                                                     &template_args,
                                                     self.config.screen.chat_rect.into(),
-                                                    self.tui.as_ref(),
+                                                    Some(&self.monitor),
                                                 )
                                             };
                                             match messages {
@@ -1251,7 +1258,7 @@ mod app {
                                             &engine.engine,
                                             &template_args,
                                             self.config.screen.chat_rect.into(),
-                                            self.tui.as_ref(),
+                                            Some(&self.monitor),
                                         )
                                     };
                                     match messages {
@@ -1588,6 +1595,8 @@ mod app {
         }
 
         fn log_executed_command(&self, parsed: &ParsedCommand, final_command: &str) -> Result<()> {
+            self.monitor
+                .push_command(format!("{} -> {}", parsed.user_command, final_command));
             let path = &self.config.state.executed_commands_log_path;
             if let Some(parent) = path
                 .parent()
@@ -1754,6 +1763,10 @@ mod app {
             let song_command_executing = self.song_command_executing.load(AtomicOrdering::SeqCst);
             let has_pending_playback = !queue_empty || has_pending_task || song_command_executing;
 
+            if self.runtime_state()?.state().paused_by_command {
+                return Ok(false);
+            }
+
             if queue_empty && !has_pending_task && !command_executing && !song_command_executing {
                 return self.resume_pending_playback_pause_if_idle();
             }
@@ -1770,16 +1783,25 @@ mod app {
                 return Ok(true);
             }
             if status.status == "paused" {
-                if self.runtime_state()?.state().paused_by_command {
-                    return Ok(false);
-                }
                 if self.runtime_state()?.state().paused_for_pending_playback {
+                    let Some(remaining) = playback_remaining_seconds(&status) else {
+                        return Ok(false);
+                    };
+                    if remaining > self.config.queue.auto_advance_seconds as f64 {
+                        return Ok(false);
+                    }
                     if !command_executing && !has_pending_task && !queue_empty {
                         self.push_pending_task(PendingTask::AdvanceQueue {
                             reason: "即将结束"
                         })?;
                         return Ok(true);
                     }
+                    return Ok(false);
+                }
+                let Some(remaining) = playback_remaining_seconds(&status) else {
+                    return Ok(false);
+                };
+                if remaining > self.config.queue.auto_advance_seconds as f64 {
                     return Ok(false);
                 }
                 if command_executing {
@@ -1814,8 +1836,7 @@ mod app {
                 runtime_state.state_mut().paused_for_pending_playback = false;
                 runtime_state.save()?;
             }
-            if status.duration > 0.0 {
-                let remaining = status.duration - status.progress;
+            if let Some(remaining) = playback_remaining_seconds(&status) {
                 if remaining <= self.config.queue.auto_advance_seconds as f64
                     && has_pending_playback
                 {
@@ -2242,7 +2263,10 @@ mod app {
                 uri: request.uri.clone(),
                 friend_username: request.friend_username.clone(),
             })?;
-            Ok(Some(queue.len()))
+            let len = queue.len();
+            drop(queue);
+            self.update_monitor_queue_snapshot();
+            Ok(Some(len))
         }
 
         fn execute_command(&mut self, parsed: &ParsedCommand) -> Result<()> {
@@ -2434,6 +2458,7 @@ mod app {
                         self.log_executed_command(parsed, "queue delete none")?;
                         self.reply("队列删除失败或序号不存在")?;
                     } else {
+                        self.update_monitor_queue_snapshot();
                         let removed_text = removed
                             .iter()
                             .map(|(index, item)| format!("{}.{}", index, item.keyword))
@@ -2448,6 +2473,7 @@ mod app {
                 }
                 UserCommand::QueueClear => {
                     let count = self.queue()?.clear()?;
+                    self.update_monitor_queue_snapshot();
                     self.log_executed_command(parsed, &format!("queue clear {}", count))?;
                     if count == 0 {
                         self.reply("队列为空")?;
@@ -2773,7 +2799,7 @@ mod app {
                         &engine.engine,
                         &template_args,
                         self.config.screen.chat_rect.into(),
-                        self.tui.as_ref(),
+                        Some(&self.monitor),
                     )
                 };
                 let messages = match scan_result {
@@ -2820,7 +2846,7 @@ mod app {
                 &engine.engine,
                 &template_args,
                 self.config.screen.chat_rect.into(),
-                self.tui.as_ref(),
+                Some(&self.monitor),
             ) else {
                 return output;
             };
@@ -3545,6 +3571,7 @@ mod app {
             runtime_state
                 .state_mut()
                 .last_requested_prefer_accompaniment = prefer_accompaniment;
+            runtime_state.state_mut().paused_by_command = false;
             runtime_state.state_mut().paused_for_pending_playback = false;
             runtime_state.save()
         }
@@ -3632,7 +3659,7 @@ mod app {
                         &engine.engine,
                         &template_args,
                         self.config.screen.chat_rect.into(),
-                        self.tui.as_ref(),
+                        Some(&self.monitor),
                     )
                 };
                 let messages = match scan_result {
@@ -3699,7 +3726,7 @@ mod app {
                 &engine.engine,
                 &template_args,
                 self.config.screen.chat_rect.into(),
-                self.tui.as_ref(),
+                Some(&self.monitor),
             ) else {
                 return output;
             };
@@ -3749,10 +3776,16 @@ mod app {
                 match outcome {
                     PlayOutcome::Success => {
                         self.queue()?.shift()?;
+                        self.update_monitor_queue_snapshot();
+                        if reason != "手动下一首" && !self.config.queue.protect_auto_played_songs
+                        {
+                            self.clear_requested_song_state()?;
+                        }
                         return Ok(());
                     }
                     PlayOutcome::NoSource => {
                         self.queue()?.shift()?;
+                        self.update_monitor_queue_snapshot();
                         log::error!("队列项无音源，已丢弃: {}", item.keyword);
                         continue;
                     }
@@ -3790,6 +3823,24 @@ mod app {
             }
             Ok(())
         }
+
+        fn update_monitor_queue_snapshot(&self) {
+            match self.queue() {
+                Ok(queue) => self.monitor.set_queue(
+                    queue
+                        .items()
+                        .iter()
+                        .map(|item| MonitorQueueItem {
+                            keyword: item.keyword.clone(),
+                            source: item.source.clone(),
+                            prefer_accompaniment: item.prefer_accompaniment,
+                            friend_username: item.friend_username.clone(),
+                        })
+                        .collect(),
+                ),
+                Err(error) => log::warn!("更新监控队列失败: {error:#}"),
+            }
+        }
     }
 
     fn is_playing(status: &PlayerStatus) -> bool {
@@ -3805,6 +3856,16 @@ mod app {
             }
         }
         status
+    }
+
+    fn playback_remaining_seconds(status: &PlayerStatus) -> Option<f64> {
+        if !status.duration.is_finite() || !status.progress.is_finite() {
+            return None;
+        }
+        if status.duration <= 0.0 || status.progress < 0.0 || status.progress > status.duration {
+            return None;
+        }
+        Some(status.duration - status.progress)
     }
 
     fn ai_candidate_source(song: &command::SongCommand) -> &'static str {
@@ -4188,7 +4249,7 @@ mod app {
         engine: &OcrEngine,
         templates: &ResolvedTemplateArgs,
         chat_rect: Rect,
-        tui: Option<&tui::TuiShared>,
+        monitor: Option<&MonitorShared>,
     ) -> Result<Vec<ChatMessage>> {
         let total_started = Instant::now();
         let chat = crop_canvas(image, chat_rect)?;
@@ -4233,8 +4294,8 @@ mod app {
         }
         let ocr_ms = elapsed_ms(ocr_started);
         let total_ms = elapsed_ms(total_started);
-        if let Some(tui) = tui {
-            tui.set_ocr(tui::OcrSnapshot {
+        if let Some(monitor) = monitor {
+            monitor.set_ocr(monitor::OcrSnapshot {
                 markers: markers.len(),
                 messages: messages
                     .iter()

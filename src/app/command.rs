@@ -30,6 +30,7 @@ pub enum UserCommand {
     HallTime,
     Help,
     Invite(InviteCommand),
+    Moderation(ModerationCommand),
     Microphone { username: String },
     DisableCommands { username: String },
     EnableCommands { username: String },
@@ -40,6 +41,28 @@ pub enum UserCommand {
 pub struct InviteCommand {
     pub username: String,
     pub seq: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModerationCommand {
+    pub action: ModerationAction,
+    pub uid: String,
+    pub requester: String,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ModerationAction {
+    Blacklist,
+    BlockChat,
+}
+
+impl ModerationAction {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Blacklist => "拉黑",
+            Self::BlockChat => "屏蔽",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -189,6 +212,9 @@ fn parse_pink_text(text: &str) -> Option<ParsedCommand> {
             username: username.clone(),
             command: UserCommand::Invite(InviteCommand { username, seq }),
         });
+    }
+    if let Some(command) = parse_moderation_command(command_text, &username, &user_command) {
+        return Some(command);
     }
     if let Some(rest) = command_text.strip_prefix("麦克风") {
         let rest = rest.trim_start_matches(['：', ':', ' ', '\t']);
@@ -380,6 +406,9 @@ fn same_user_command(left: &UserCommand, right: &UserCommand) -> bool {
                 && same_lock_keyword(&left.keyword, &right.keyword)
         }
         (UserCommand::Invite(left), UserCommand::Invite(right)) => left.seq == right.seq,
+        (UserCommand::Moderation(left), UserCommand::Moderation(right)) => {
+            left.action == right.action && left.uid == right.uid
+        }
         (
             UserCommand::Microphone { username: left },
             UserCommand::Microphone { username: right },
@@ -434,6 +463,9 @@ fn command_lock_key(command: &UserCommand) -> String {
         UserCommand::HallTime => "hall_time".to_string(),
         UserCommand::Help => "help".to_string(),
         UserCommand::Invite(invite) => format!("invite:{}", invite.seq),
+        UserCommand::Moderation(command) => {
+            format!("moderation:{}:{}", command.action.label(), command.uid)
+        }
         UserCommand::Microphone { username } => {
             format!("microphone:{}", identity_text(username))
         }
@@ -441,6 +473,44 @@ fn command_lock_key(command: &UserCommand) -> String {
         UserCommand::EnableCommands { username: _ } => "enable_commands".to_string(),
         UserCommand::IdleExit { minutes } => format!("idle_exit:{}", minutes),
     }
+}
+
+fn parse_moderation_command(
+    command_text: &str,
+    username: &str,
+    user_command: &str,
+) -> Option<ParsedCommand> {
+    for (prefix, action) in [
+        ("拉黑UID", ModerationAction::Blacklist),
+        ("屏蔽UID", ModerationAction::BlockChat),
+    ] {
+        let Some(rest) = command_text.strip_prefix(prefix) else {
+            continue;
+        };
+        let digits = rest
+            .chars()
+            .take_while(|ch| ch.is_ascii_digit())
+            .collect::<String>();
+        if digits.len() != 9 {
+            return None;
+        }
+        if !command_boundary(rest[digits.len()..].chars().next()) {
+            return None;
+        }
+        return Some(ParsedCommand {
+            matched: prefix.to_string(),
+            raw: format!("{} {} {}", prefix, username, digits),
+            user_command: user_command.to_string(),
+            message_type: "pink".to_string(),
+            username: username.to_string(),
+            command: UserCommand::Moderation(ModerationCommand {
+                action,
+                uid: digits,
+                requester: username.to_string(),
+            }),
+        });
+    }
+    None
 }
 
 fn identity_text(text: &str) -> String {
@@ -790,6 +860,38 @@ mod tests {
     fn parses_idle_exit_with_minutes_suffix() {
         let parsed = parse_text("[Alice]：@闲置退出 20分钟", "pink").expect("parse idle exit");
         assert_eq!(parsed.command, UserCommand::IdleExit { minutes: 20 });
+    }
+
+    #[test]
+    fn parses_pink_blacklist_uid_command() {
+        let parsed = parse_text("[Alice]：@拉黑UID123456789", "pink").expect("parse blacklist uid");
+        assert_eq!(
+            parsed.command,
+            UserCommand::Moderation(ModerationCommand {
+                action: ModerationAction::Blacklist,
+                uid: "123456789".to_string(),
+                requester: "Alice".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_pink_block_chat_uid_command() {
+        let parsed = parse_text("[Alice]：@屏蔽UID123456789", "pink").expect("parse block uid");
+        assert_eq!(
+            parsed.command,
+            UserCommand::Moderation(ModerationCommand {
+                action: ModerationAction::BlockChat,
+                uid: "123456789".to_string(),
+                requester: "Alice".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_uid_length() {
+        assert!(parse_text("[Alice]：@拉黑UID12345678", "pink").is_none());
+        assert!(parse_text("[Alice]：@屏蔽UID1234567890", "pink").is_none());
     }
 
     #[test]

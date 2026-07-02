@@ -38,7 +38,9 @@ mod app {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use self::chat_output::ChatOutput;
-    use self::command::{CommandLockState, ParsedCommand, PendingCommand, UserCommand};
+    use self::command::{
+        CommandLockState, ModerationAction, ParsedCommand, PendingCommand, UserCommand,
+    };
     use self::config::{AppConfig, PointConfig, RectConfig};
     use self::feeluown::{FeelUOwnClient, PlayerStatus, format_lyrics, format_status};
     use self::monitor::{MonitorQueueItem, MonitorShared};
@@ -2507,6 +2509,13 @@ mod app {
                     self.log_executed_command(parsed, &format!("invite {}", invite.username))?;
                     self.execute_invite_with_announce(&invite.username)?;
                 }
+                UserCommand::Moderation(command) => {
+                    self.log_executed_command(
+                        parsed,
+                        &format!("{} uid {}", command.action.label(), command.uid),
+                    )?;
+                    self.execute_moderation_with_vote(command)?;
+                }
                 UserCommand::Microphone { username } => {
                     log::info!("收到麦克风命令: {}", username);
                     if self.check_public_hall()? {
@@ -2944,6 +2953,293 @@ mod app {
             }
 
             log::info!("邀请完成: {}", username);
+            Ok(true)
+        }
+
+        fn execute_moderation_with_vote(
+            &mut self,
+            command: &command::ModerationCommand,
+        ) -> Result<bool> {
+            let announce = format!(
+                "管理员发起了对@UID{}的{}请求,请好友120s内使用@同意/不同意进行判决",
+                command.uid,
+                command.action.label()
+            );
+            self.reply(&announce)?;
+            if !self.wait_for_moderation_votes(command)? {
+                self.reply(&format!(
+                    "@UID{}的{}请求未通过",
+                    command.uid,
+                    command.action.label()
+                ))?;
+                return Ok(false);
+            }
+            self.reply(&format!(
+                "@UID{}的{}请求已通过,开始执行",
+                command.uid,
+                command.action.label()
+            ))?;
+            let result = self.execute_moderation_steps(command);
+            match &result {
+                Ok(true) => {}
+                Ok(false) | Err(_) => {
+                    let _ = self.reply(&format!(
+                        "@UID{}的{}流程出错",
+                        command.uid,
+                        command.action.label()
+                    ));
+                }
+            }
+            result
+        }
+
+        fn wait_for_moderation_votes(&self, command: &command::ModerationCommand) -> Result<bool> {
+            let existing = self.collect_moderation_vote_bottoms();
+            let deadline =
+                Instant::now() + Duration::from_millis(self.config.moderation.vote_timeout_ms);
+            let template_args = TemplateArgs::default().resolve(&self.config);
+            let canvas = Canvas {
+                width: self.config.screen.expected_width,
+                height: self.config.screen.expected_height,
+                resize: true,
+            };
+            let mut stable_votes: HashMap<String, bool> = HashMap::new();
+            let mut samples: HashMap<(String, bool), u32> = HashMap::new();
+            while self.running.load(AtomicOrdering::SeqCst) && Instant::now() < deadline {
+                sleep(Duration::from_millis(self.config.moderation.vote_poll_ms));
+                let frame =
+                    match load_frame(&FrameArgs { image: None }, &canvas, &self.config.window) {
+                        Ok(frame) => frame,
+                        Err(error) => {
+                            log::error!("{}投票截图失败: {error:#}", command.action.label());
+                            continue;
+                        }
+                    };
+                let messages = {
+                    let engine = match self.ocr_engine() {
+                        Ok(engine) => engine,
+                        Err(error) => {
+                            log::error!("{}投票 OCR 锁失败: {error:#}", command.action.label());
+                            continue;
+                        }
+                    };
+                    match scan_chat(
+                        &frame.image,
+                        &engine.engine,
+                        &template_args,
+                        self.config.screen.chat_rect.into(),
+                        Some(&self.monitor),
+                    ) {
+                        Ok(messages) => messages,
+                        Err(error) => {
+                            log::error!("{}投票扫描失败: {error:#}", command.action.label());
+                            continue;
+                        }
+                    }
+                };
+                for message in messages {
+                    if message.message_type != "pink" || is_existing_decision(&message, &existing) {
+                        continue;
+                    }
+                    let Some((username, agreed)) = parse_friend_moderation_vote(&message.text)
+                    else {
+                        continue;
+                    };
+                    let key = (username.clone(), agreed);
+                    let count = samples
+                        .entry(key)
+                        .and_modify(|value| *value += 1)
+                        .or_insert(1);
+                    if *count >= self.config.moderation.stable_vote_samples {
+                        stable_votes.insert(username, agreed);
+                    }
+                }
+                let agree = stable_votes.values().filter(|agreed| **agreed).count() as i32;
+                let disagree = stable_votes.values().filter(|agreed| !**agreed).count() as i32;
+                log::info!(
+                    "{}投票: 同意={} 不同意={} 差值={} 目标差值={}",
+                    command.action.label(),
+                    agree,
+                    disagree,
+                    agree - disagree,
+                    self.config.moderation.required_vote_margin,
+                );
+                if agree - disagree >= self.config.moderation.required_vote_margin {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+
+        fn collect_moderation_vote_bottoms(&self) -> HashMap<String, i32> {
+            let mut output = HashMap::new();
+            let template_args = TemplateArgs::default().resolve(&self.config);
+            let canvas = Canvas {
+                width: self.config.screen.expected_width,
+                height: self.config.screen.expected_height,
+                resize: true,
+            };
+            let Ok(frame) = load_frame(&FrameArgs { image: None }, &canvas, &self.config.window)
+            else {
+                return output;
+            };
+            let Ok(engine) = self.ocr_engine() else {
+                return output;
+            };
+            let Ok(messages) = scan_chat(
+                &frame.image,
+                &engine.engine,
+                &template_args,
+                self.config.screen.chat_rect.into(),
+                Some(&self.monitor),
+            ) else {
+                return output;
+            };
+            for message in messages {
+                if message.message_type == "pink"
+                    && parse_friend_moderation_vote(&message.text).is_some()
+                {
+                    let bottom = message.block.y + message.block.height as i32;
+                    output
+                        .entry(message.text)
+                        .and_modify(|value| *value = (*value).max(bottom))
+                        .or_insert(bottom);
+                }
+            }
+            output
+        }
+
+        fn execute_moderation_steps(&self, command: &command::ModerationCommand) -> Result<bool> {
+            log::info!("开始执行{} UID{}", command.action.label(), command.uid);
+            let result = self.execute_moderation_steps_inner(command);
+            if result.is_err() || matches!(result, Ok(false)) {
+                self.return_to_primary_from_transient_ui(command.action.label());
+            } else {
+                self.return_to_primary_from_transient_ui(command.action.label());
+            }
+            result
+        }
+
+        fn execute_moderation_steps_inner(
+            &self,
+            command: &command::ModerationCommand,
+        ) -> Result<bool> {
+            let canvas = Canvas {
+                width: self.config.screen.expected_width,
+                height: self.config.screen.expected_height,
+                resize: true,
+            };
+            let frame_args = FrameArgs { image: None };
+            press_key(Key::Unicode('o'), &self.config.window)?;
+            sleep(Duration::from_millis(self.config.timing.invite_step_ms));
+            if !self.ensure_template_visible(
+                &canvas,
+                &frame_args,
+                self.config.moderation.friend_panel_region.into(),
+                &self.config.templates.friend_panel,
+                "好友界面",
+            )? {
+                return Ok(false);
+            }
+            press_key(Key::Unicode('e'), &self.config.window)?;
+            sleep(Duration::from_millis(self.config.timing.invite_step_ms));
+            press_key(Key::Unicode('e'), &self.config.window)?;
+            sleep(Duration::from_millis(self.config.timing.invite_step_ms));
+            if !self.ensure_template_visible(
+                &canvas,
+                &frame_args,
+                self.config.moderation.search_panel_region.into(),
+                &self.config.templates.friend_search_panel,
+                "好友搜索界面",
+            )? {
+                return Ok(false);
+            }
+            click_game_point(
+                self.config.moderation.search_input_point,
+                &self.config.window,
+            )?;
+            sleep(Duration::from_millis(self.config.timing.output_click_ms));
+            paste_text(&command.uid)?;
+            sleep(Duration::from_millis(self.config.timing.output_input_ms));
+            click_rect_center(
+                self.config.moderation.search_button_region,
+                &self.config.window,
+            )?;
+            sleep(Duration::from_millis(self.config.timing.invite_step_ms));
+            if !self.click_template(
+                &canvas,
+                &frame_args,
+                self.config.moderation.more_settings_region.into(),
+                &self.config.templates.friend_more_settings,
+                "更多设置",
+            )? {
+                return Ok(false);
+            }
+            sleep(Duration::from_millis(self.config.timing.invite_step_ms));
+            let (region, template, label) = match command.action {
+                ModerationAction::Blacklist => (
+                    self.config.moderation.blacklist_region.into(),
+                    &self.config.templates.friend_blacklist,
+                    "拉黑按钮",
+                ),
+                ModerationAction::BlockChat => (
+                    self.config.moderation.block_chat_region.into(),
+                    &self.config.templates.friend_block_chat,
+                    "屏蔽聊天按钮",
+                ),
+            };
+            if !self.click_template(&canvas, &frame_args, region, template, label)? {
+                return Ok(false);
+            }
+            log::info!("{} UID{} 完成", command.action.label(), command.uid);
+            Ok(true)
+        }
+
+        fn ensure_template_visible(
+            &self,
+            canvas: &Canvas,
+            frame_args: &FrameArgs,
+            rect: Rect,
+            template: &Path,
+            label: &str,
+        ) -> Result<bool> {
+            let frame = load_frame(frame_args, canvas, &self.config.window)?;
+            if best_template_hit(
+                &frame.image,
+                Some(rect),
+                template,
+                self.config.templates.marker_threshold,
+            )?
+            .is_some()
+            {
+                Ok(true)
+            } else {
+                log::error!("未找到{}模板", label);
+                Ok(false)
+            }
+        }
+
+        fn click_template(
+            &self,
+            canvas: &Canvas,
+            frame_args: &FrameArgs,
+            rect: Rect,
+            template: &Path,
+            label: &str,
+        ) -> Result<bool> {
+            let frame = load_frame(frame_args, canvas, &self.config.window)?;
+            let Some(hit) = best_template_hit(
+                &frame.image,
+                Some(rect),
+                template,
+                self.config.templates.marker_threshold,
+            )?
+            else {
+                log::error!("未找到{}模板", label);
+                return Ok(false);
+            };
+            let center = hit.center();
+            click_game_point(PointConfig::new(center.x, center.y), &self.config.window)?;
             Ok(true)
         }
 
@@ -4167,6 +4463,34 @@ mod app {
             .is_some_and(|existing_bottom| bottom <= *existing_bottom)
     }
 
+    fn parse_friend_moderation_vote(text: &str) -> Option<(String, bool)> {
+        let sep_index = text.find(['：', ':', ']', '】'])?;
+        let username = text[..sep_index]
+            .trim_matches(['[', '【', ']', '】', ' ', '\t'])
+            .to_string();
+        if username.trim().is_empty() {
+            return None;
+        }
+        let sep_len = text[sep_index..].chars().next()?.len_utf8();
+        let command_text = text[sep_index + sep_len..]
+            .trim_start_matches(['：', ':', ' ', '\t', ']', '】'])
+            .strip_prefix('@')?
+            .trim_start();
+        if command_text
+            .strip_prefix("不同意")
+            .is_some_and(|rest| decision_boundary(rest.chars().next()))
+        {
+            Some((username, false))
+        } else if command_text
+            .strip_prefix("同意")
+            .is_some_and(|rest| decision_boundary(rest.chars().next()))
+        {
+            Some((username, true))
+        } else {
+            None
+        }
+    }
+
     fn format_play_message(status: &PlayerStatus) -> String {
         format!(
             "播放: {} ({}/{}) 音量{}",
@@ -4833,6 +5157,31 @@ mod app {
         let mut window = window::GameWindow::find(window_config)?;
         window.click(&mut enigo, point)?;
         Ok(())
+    }
+
+    fn click_rect_center(rect: RectConfig, window_config: &config::WindowConfig) -> Result<()> {
+        click_game_point(
+            PointConfig::new(
+                rect.x + rect.width as i32 / 2,
+                rect.y + rect.height as i32 / 2,
+            ),
+            window_config,
+        )
+    }
+
+    fn paste_text(text: &str) -> Result<()> {
+        clipboard::set_text(text).context("set clipboard text")?;
+        let mut enigo = Enigo::new(&Settings::default()).context("create enigo")?;
+        enigo
+            .key(Key::Control, Direction::Press)
+            .context("press control")?;
+        let paste_result = enigo
+            .key(Key::Unicode('v'), Direction::Click)
+            .context("paste text");
+        enigo
+            .key(Key::Control, Direction::Release)
+            .context("release control")?;
+        paste_result
     }
 
     fn press_key(key: Key, window_config: &config::WindowConfig) -> Result<()> {

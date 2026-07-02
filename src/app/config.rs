@@ -16,6 +16,7 @@ pub struct AppConfig {
     pub ocr: OcrConfig,
     pub templates: TemplateConfig,
     pub output: OutputConfig,
+    pub moderation: ModerationConfig,
     pub feeluown: FeelUOwnConfig,
     pub http: HttpConfig,
     pub logging: LoggingConfig,
@@ -38,6 +39,7 @@ impl Default for AppConfig {
             ocr: OcrConfig::default(),
             templates: TemplateConfig::default(),
             output: OutputConfig::default(),
+            moderation: ModerationConfig::default(),
             feeluown: FeelUOwnConfig::default(),
             http: HttpConfig::default(),
             logging: LoggingConfig::default(),
@@ -132,7 +134,7 @@ fn default_config_yaml() -> &'static str {
 # 坐标沿用旧脚本习惯：以游戏客户区左上角为原点，按 1920x1080 有效画面写坐标
 
 # 配置版本；程序启动时会把旧版本配置迁移到当前模板
-config_version: 6
+config_version: 7
 
 window:
   # 目标游戏进程名，按进程文件名匹配，大小写不敏感
@@ -318,6 +320,16 @@ templates:
   invite_goto_hall: assets/invite-goto-hall.png
   # 邀请流程里的“进入大厅”按钮模板
   invite_enter_hall: assets/invite-enter-hall.png
+  # 好友界面模板，用于 UID 拉黑/屏蔽流程
+  friend_panel: assets/friend-panel.png
+  # 好友搜索界面模板
+  friend_search_panel: assets/friend-search-panel.png
+  # 好友搜索结果里的更多设置按钮模板
+  friend_more_settings: assets/friend-more-settings.png
+  # 更多设置里的屏蔽聊天按钮模板
+  friend_block_chat: assets/friend-block-chat.png
+  # 更多设置里的拉黑按钮模板
+  friend_blacklist: assets/friend-blacklist.png
   # UI/聊天标志模板匹配阈值，越高越严格
   marker_threshold: 0.9
 
@@ -327,7 +339,7 @@ output:
   # 用于聚焦/返回一级聊天界面的点击点
   focus_point:
     x: 1919
-    y: 1079
+    y: 1000
   # 打开聊天输入后的第一次点击位置
   chat_click_1:
     x: 120
@@ -336,6 +348,56 @@ output:
   chat_click_2:
     x: 600
     y: 1013
+
+moderation:
+  # 拉黑/屏蔽 UID 请求的好友私聊投票等待时间，单位毫秒
+  vote_timeout_ms: 120000
+  # 投票 OCR 扫描间隔，单位毫秒
+  vote_poll_ms: 2000
+  # 同一好友同一判决需要连续稳定识别次数
+  stable_vote_samples: 3
+  # 同意人数 - 不同意人数 达到该值才执行
+  required_vote_margin: 3
+  # 好友界面模板搜索区域
+  friend_panel_region:
+    x: 770
+    y: 20
+    width: 75
+    height: 50
+  # 好友搜索界面模板搜索区域
+  search_panel_region:
+    x: 1640
+    y: 120
+    width: 120
+    height: 40
+  # 好友搜索输入框点击点，需要按实际 UI 调整
+  search_input_point:
+    x: 1100
+    y: 125
+  # 搜索按钮点击区域，点击区域中心
+  search_button_region:
+    x: 1450
+    y: 100
+    width: 120
+    height: 60
+  # 更多设置按钮模板搜索区域
+  more_settings_region:
+    x: 410
+    y: 190
+    width: 45
+    height: 35
+  # 屏蔽聊天按钮模板搜索区域
+  block_chat_region:
+    x: 440
+    y: 190
+    width: 460
+    height: 120
+  # 拉黑按钮模板搜索区域
+  blacklist_region:
+    x: 440
+    y: 190
+    width: 460
+    height: 120
 
 feeluown:
   # FeelUOwn TCP RPC 地址
@@ -675,6 +737,11 @@ pub struct TemplateConfig {
     pub invite_view_star: PathBuf,
     pub invite_goto_hall: PathBuf,
     pub invite_enter_hall: PathBuf,
+    pub friend_panel: PathBuf,
+    pub friend_search_panel: PathBuf,
+    pub friend_more_settings: PathBuf,
+    pub friend_block_chat: PathBuf,
+    pub friend_blacklist: PathBuf,
     pub marker_threshold: f32,
 }
 
@@ -689,7 +756,46 @@ impl Default for TemplateConfig {
             invite_view_star: PathBuf::from("assets/invite-view-star.png"),
             invite_goto_hall: PathBuf::from("assets/invite-goto-hall.png"),
             invite_enter_hall: PathBuf::from("assets/invite-enter-hall.png"),
+            friend_panel: PathBuf::from("assets/friend-panel.png"),
+            friend_search_panel: PathBuf::from("assets/friend-search-panel.png"),
+            friend_more_settings: PathBuf::from("assets/friend-more-settings.png"),
+            friend_block_chat: PathBuf::from("assets/friend-block-chat.png"),
+            friend_blacklist: PathBuf::from("assets/friend-blacklist.png"),
             marker_threshold: 0.9,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModerationConfig {
+    pub vote_timeout_ms: u64,
+    pub vote_poll_ms: u64,
+    pub stable_vote_samples: u32,
+    pub required_vote_margin: i32,
+    pub friend_panel_region: RectConfig,
+    pub search_panel_region: RectConfig,
+    pub search_input_point: PointConfig,
+    pub search_button_region: RectConfig,
+    pub more_settings_region: RectConfig,
+    pub block_chat_region: RectConfig,
+    pub blacklist_region: RectConfig,
+}
+
+impl Default for ModerationConfig {
+    fn default() -> Self {
+        Self {
+            vote_timeout_ms: 120_000,
+            vote_poll_ms: 2_000,
+            stable_vote_samples: 3,
+            required_vote_margin: 3,
+            friend_panel_region: RectConfig::new(770, 20, 75, 50),
+            search_panel_region: RectConfig::new(1640, 120, 120, 40),
+            search_input_point: PointConfig::new(1100, 125),
+            search_button_region: RectConfig::new(1450, 100, 120, 60),
+            more_settings_region: RectConfig::new(410, 190, 45, 35),
+            block_chat_region: RectConfig::new(440, 190, 460, 120),
+            blacklist_region: RectConfig::new(440, 190, 460, 120),
         }
     }
 }
@@ -707,7 +813,7 @@ impl Default for OutputConfig {
     fn default() -> Self {
         Self {
             send_enabled: true,
-            focus_point: PointConfig::new(1919, 1079),
+            focus_point: PointConfig::new(1919, 1000),
             chat_click_1: PointConfig::new(120, 225),
             chat_click_2: PointConfig::new(600, 1013),
         }

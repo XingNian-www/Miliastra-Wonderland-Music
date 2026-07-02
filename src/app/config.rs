@@ -134,7 +134,7 @@ fn default_config_yaml() -> &'static str {
 # 坐标沿用旧脚本习惯：以游戏客户区左上角为原点，按 1920x1080 有效画面写坐标
 
 # 配置版本；程序启动时会把旧版本配置迁移到当前模板
-config_version: 9
+config_version: 10
 
 window:
   # 目标游戏进程名，按进程文件名匹配，大小写不敏感
@@ -198,7 +198,7 @@ timing:
   # 6. 执行命令前等待回到一级界面的最长时间，单位毫秒
   command_ui_timeout_ms: 15000
   # 7. 返回一级界面时每次 ESC 后等待重新检测的时间，单位毫秒
-  return_to_primary_retry_ms: 400
+  return_to_primary_retry_ms: 1000
   # 8. 聚焦游戏窗口后的等待时间，单位毫秒
   output_focus_ms: 300
   # 9. 按回车打开聊天输入后的等待时间，单位毫秒
@@ -404,6 +404,8 @@ moderation:
     y: 700
     width: 500
     height: 100
+  # 点击确认按钮后等待动作完成的时间，单位毫秒
+  confirm_wait_ms: 2000
 
 feeluown:
   # FeelUOwn TCP RPC 地址
@@ -642,7 +644,7 @@ impl Default for TimingConfig {
             chat_change_debounce_ms: 120,
             chat_change_cooldown_ms: 250,
             command_ui_timeout_ms: 15000,
-            return_to_primary_retry_ms: 400,
+            return_to_primary_retry_ms: 1000,
             output_focus_ms: 300,
             output_open_chat_ms: 300,
             output_click_ms: 150,
@@ -789,6 +791,7 @@ pub struct ModerationConfig {
     pub block_chat_region: RectConfig,
     pub blacklist_region: RectConfig,
     pub confirm_region: RectConfig,
+    pub confirm_wait_ms: u64,
 }
 
 impl Default for ModerationConfig {
@@ -806,6 +809,7 @@ impl Default for ModerationConfig {
             block_chat_region: RectConfig::new(440, 190, 460, 120),
             blacklist_region: RectConfig::new(440, 190, 460, 120),
             confirm_region: RectConfig::new(900, 700, 500, 100),
+            confirm_wait_ms: 2_000,
         }
     }
 }

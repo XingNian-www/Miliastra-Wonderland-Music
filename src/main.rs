@@ -3208,6 +3208,9 @@ mod app {
             )? {
                 return Ok(false);
             }
+            sleep(Duration::from_millis(
+                self.config.moderation.confirm_wait_ms,
+            ));
             log::info!("{} UID{} 完成", command.action.label(), command.uid);
             Ok(true)
         }

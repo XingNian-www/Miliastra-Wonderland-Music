@@ -134,7 +134,7 @@ fn default_config_yaml() -> &'static str {
 # 坐标沿用旧脚本习惯：以游戏客户区左上角为原点，按 1920x1080 有效画面写坐标
 
 # 配置版本；程序启动时会把旧版本配置迁移到当前模板
-config_version: 8
+config_version: 9
 
 window:
   # 目标游戏进程名，按进程文件名匹配，大小写不敏感
@@ -330,6 +330,8 @@ templates:
   friend_block_chat: assets/friend-block-chat.png
   # 更多设置里的拉黑按钮模板
   friend_blacklist: assets/friend-blacklist.png
+  # 拉黑/屏蔽弹窗里的确认按钮模板
+  friend_confirm: assets/friend-confirm.png
   # UI/聊天标志模板匹配阈值，越高越严格
   marker_threshold: 0.9
 
@@ -396,6 +398,12 @@ moderation:
     y: 190
     width: 460
     height: 120
+  # 拉黑/屏蔽弹窗确认按钮模板搜索区域
+  confirm_region:
+    x: 900
+    y: 700
+    width: 500
+    height: 100
 
 feeluown:
   # FeelUOwn TCP RPC 地址
@@ -740,6 +748,7 @@ pub struct TemplateConfig {
     pub friend_more_settings: PathBuf,
     pub friend_block_chat: PathBuf,
     pub friend_blacklist: PathBuf,
+    pub friend_confirm: PathBuf,
     pub marker_threshold: f32,
 }
 
@@ -759,6 +768,7 @@ impl Default for TemplateConfig {
             friend_more_settings: PathBuf::from("assets/friend-more-settings.png"),
             friend_block_chat: PathBuf::from("assets/friend-block-chat.png"),
             friend_blacklist: PathBuf::from("assets/friend-blacklist.png"),
+            friend_confirm: PathBuf::from("assets/friend-confirm.png"),
             marker_threshold: 0.9,
         }
     }
@@ -778,6 +788,7 @@ pub struct ModerationConfig {
     pub more_settings_region: RectConfig,
     pub block_chat_region: RectConfig,
     pub blacklist_region: RectConfig,
+    pub confirm_region: RectConfig,
 }
 
 impl Default for ModerationConfig {
@@ -794,6 +805,7 @@ impl Default for ModerationConfig {
             more_settings_region: RectConfig::new(410, 190, 45, 35),
             block_chat_region: RectConfig::new(440, 190, 460, 120),
             blacklist_region: RectConfig::new(440, 190, 460, 120),
+            confirm_region: RectConfig::new(900, 700, 500, 100),
         }
     }
 }

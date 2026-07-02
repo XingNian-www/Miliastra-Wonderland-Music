@@ -3198,6 +3198,16 @@ mod app {
             if !self.click_template(&canvas, &frame_args, region, template, label)? {
                 return Ok(false);
             }
+            sleep(Duration::from_millis(self.config.timing.invite_step_ms));
+            if !self.click_template(
+                &canvas,
+                &frame_args,
+                self.config.moderation.confirm_region.into(),
+                &self.config.templates.friend_confirm,
+                "确认按钮",
+            )? {
+                return Ok(false);
+            }
             log::info!("{} UID{} 完成", command.action.label(), command.uid);
             Ok(true)
         }

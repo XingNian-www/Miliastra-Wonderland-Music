@@ -2980,13 +2980,16 @@ mod app {
                 command.action.label()
             ))?;
             let result = self.execute_moderation_steps(command);
+            sleep(Duration::from_millis(
+                self.config.timing.return_to_primary_retry_ms,
+            ));
             match &result {
                 Ok(true) => {
-                    let _ = self.reply(&format!(
+                    self.reply(&format!(
                         "已对@UID{}执行{}",
                         command.uid,
                         command.action.label()
-                    ));
+                    ))?;
                 }
                 Ok(false) | Err(_) => {
                     let _ = self.reply(&format!(

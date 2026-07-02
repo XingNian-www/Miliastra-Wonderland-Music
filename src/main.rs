@@ -3145,28 +3145,34 @@ mod app {
             sleep(Duration::from_millis(self.config.timing.invite_step_ms));
             press_key(Key::Unicode('e'), &self.config.window)?;
             sleep(Duration::from_millis(self.config.timing.invite_step_ms));
-            let Some(search_button) = self.find_template_center(
+            if !self.ensure_template_visible(
                 &canvas,
                 &frame_args,
                 self.config.moderation.search_panel_region.into(),
                 &self.config.templates.friend_search_panel,
                 "搜索按钮",
-            )?
-            else {
+            )? {
                 return Ok(false);
-            };
+            }
+            log::info!(
+                "UID 搜索点击: input=({}, {}) button=({}, {})",
+                self.config.moderation.search_input_point.x,
+                self.config.moderation.search_input_point.y,
+                self.config.moderation.search_button_point.x,
+                self.config.moderation.search_button_point.y,
+            );
             click_game_point(
-                PointConfig::new(search_button.x - 500, search_button.y),
+                self.config.moderation.search_input_point,
                 &self.config.window,
             )?;
             sleep(Duration::from_millis(self.config.timing.output_click_ms));
             paste_text(&command.uid)?;
             sleep(Duration::from_millis(self.config.timing.output_input_ms));
             click_game_point(
-                PointConfig::new(search_button.x, search_button.y),
+                self.config.moderation.search_button_point,
                 &self.config.window,
             )?;
-            sleep(Duration::from_millis(self.config.timing.invite_step_ms));
+            sleep(Duration::from_millis(2000));
             if !self.click_template(
                 &canvas,
                 &frame_args,
@@ -3242,28 +3248,6 @@ mod app {
             let center = hit.center();
             click_game_point(PointConfig::new(center.x, center.y), &self.config.window)?;
             Ok(true)
-        }
-
-        fn find_template_center(
-            &self,
-            canvas: &Canvas,
-            frame_args: &FrameArgs,
-            rect: Rect,
-            template: &Path,
-            label: &str,
-        ) -> Result<Option<Point>> {
-            let frame = load_frame(frame_args, canvas, &self.config.window)?;
-            let Some(hit) = best_template_hit(
-                &frame.image,
-                Some(rect),
-                template,
-                self.config.templates.marker_threshold,
-            )?
-            else {
-                log::error!("未找到{}模板", label);
-                return Ok(None);
-            };
-            Ok(Some(hit.center()))
         }
 
         fn send_friend_message(&self, username: &str, message: &str) -> Result<bool> {

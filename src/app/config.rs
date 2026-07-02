@@ -134,7 +134,7 @@ fn default_config_yaml() -> &'static str {
 # 坐标沿用旧脚本习惯：以游戏客户区左上角为原点，按 1920x1080 有效画面写坐标
 
 # 配置版本；程序启动时会把旧版本配置迁移到当前模板
-config_version: 7
+config_version: 8
 
 window:
   # 目标游戏进程名，按进程文件名匹配，大小写不敏感
@@ -366,10 +366,18 @@ moderation:
     height: 50
   # 搜索按钮模板搜索区域；命中后会点击按钮左侧 500 像素处粘贴 UID，再点击按钮
   search_panel_region:
-    x: 1640
-    y: 120
-    width: 120
-    height: 40
+    x: 1600
+    y: 100
+    width: 240
+    height: 90
+  # UID 搜索输入框点击点
+  search_input_point:
+    x: 1180
+    y: 135
+  # UID 搜索按钮点击点
+  search_button_point:
+    x: 1680
+    y: 135
   # 更多设置按钮模板搜索区域
   more_settings_region:
     x: 410
@@ -765,6 +773,8 @@ pub struct ModerationConfig {
     pub required_vote_margin: i32,
     pub friend_panel_region: RectConfig,
     pub search_panel_region: RectConfig,
+    pub search_input_point: PointConfig,
+    pub search_button_point: PointConfig,
     pub more_settings_region: RectConfig,
     pub block_chat_region: RectConfig,
     pub blacklist_region: RectConfig,
@@ -778,7 +788,9 @@ impl Default for ModerationConfig {
             stable_vote_samples: 3,
             required_vote_margin: 3,
             friend_panel_region: RectConfig::new(770, 20, 75, 50),
-            search_panel_region: RectConfig::new(1640, 120, 120, 40),
+            search_panel_region: RectConfig::new(1600, 100, 240, 90),
+            search_input_point: PointConfig::new(1180, 135),
+            search_button_point: PointConfig::new(1680, 135),
             more_settings_region: RectConfig::new(410, 190, 45, 35),
             block_chat_region: RectConfig::new(440, 190, 460, 120),
             blacklist_region: RectConfig::new(440, 190, 460, 120),

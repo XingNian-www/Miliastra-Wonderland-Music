@@ -364,22 +364,12 @@ moderation:
     y: 20
     width: 75
     height: 50
-  # 好友搜索界面模板搜索区域
+  # 搜索按钮模板搜索区域；命中后会点击按钮左侧 500 像素处粘贴 UID，再点击按钮
   search_panel_region:
     x: 1640
     y: 120
     width: 120
     height: 40
-  # 好友搜索输入框点击点，需要按实际 UI 调整
-  search_input_point:
-    x: 1100
-    y: 125
-  # 搜索按钮点击区域，点击区域中心
-  search_button_region:
-    x: 1450
-    y: 100
-    width: 120
-    height: 60
   # 更多设置按钮模板搜索区域
   more_settings_region:
     x: 410
@@ -775,8 +765,6 @@ pub struct ModerationConfig {
     pub required_vote_margin: i32,
     pub friend_panel_region: RectConfig,
     pub search_panel_region: RectConfig,
-    pub search_input_point: PointConfig,
-    pub search_button_region: RectConfig,
     pub more_settings_region: RectConfig,
     pub block_chat_region: RectConfig,
     pub blacklist_region: RectConfig,
@@ -791,8 +779,6 @@ impl Default for ModerationConfig {
             required_vote_margin: 3,
             friend_panel_region: RectConfig::new(770, 20, 75, 50),
             search_panel_region: RectConfig::new(1640, 120, 120, 40),
-            search_input_point: PointConfig::new(1100, 125),
-            search_button_region: RectConfig::new(1450, 100, 120, 60),
             more_settings_region: RectConfig::new(410, 190, 45, 35),
             block_chat_region: RectConfig::new(440, 190, 460, 120),
             blacklist_region: RectConfig::new(440, 190, 460, 120),

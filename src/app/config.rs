@@ -134,7 +134,7 @@ fn default_config_yaml() -> &'static str {
 # 坐标沿用旧脚本习惯：以游戏客户区左上角为原点，按 1920x1080 有效画面写坐标
 
 # 配置版本；程序启动时会把旧版本配置迁移到当前模板
-config_version: 10
+config_version: 11
 
 window:
   # 目标游戏进程名，按进程文件名匹配，大小写不敏感
@@ -380,6 +380,8 @@ moderation:
   search_button_point:
     x: 1680
     y: 135
+  # 点击 UID 搜索按钮后等待搜索结果出现的最长时间，单位毫秒
+  search_result_timeout_ms: 5000
   # 更多设置按钮模板搜索区域
   more_settings_region:
     x: 410
@@ -787,6 +789,7 @@ pub struct ModerationConfig {
     pub search_panel_region: RectConfig,
     pub search_input_point: PointConfig,
     pub search_button_point: PointConfig,
+    pub search_result_timeout_ms: u64,
     pub more_settings_region: RectConfig,
     pub block_chat_region: RectConfig,
     pub blacklist_region: RectConfig,
@@ -805,6 +808,7 @@ impl Default for ModerationConfig {
             search_panel_region: RectConfig::new(1600, 100, 240, 90),
             search_input_point: PointConfig::new(1180, 135),
             search_button_point: PointConfig::new(1680, 135),
+            search_result_timeout_ms: 5_000,
             more_settings_region: RectConfig::new(410, 190, 45, 35),
             block_chat_region: RectConfig::new(440, 190, 460, 120),
             blacklist_region: RectConfig::new(440, 190, 460, 120),

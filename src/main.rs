@@ -6,6 +6,7 @@ fn main() {
 #[cfg(target_os = "windows")]
 mod app {
     mod ai;
+    mod change_detection;
     mod chat_output;
     mod clipboard;
     mod command;
@@ -13,6 +14,7 @@ mod app {
     mod config_migration;
     mod dpi;
     mod feeluown;
+    mod geometry;
     mod hotkeys;
     mod http_server;
     mod logger;
@@ -23,10 +25,10 @@ mod app {
     mod queue;
     mod runtime_state;
     mod song_matcher;
+    mod template_match;
     mod tui;
     mod window;
 
-    use std::cmp::Ordering;
     use std::collections::{HashMap, HashSet, VecDeque};
     use std::fs::{self, OpenOptions};
     use std::io::{IsTerminal, Write};
@@ -37,27 +39,32 @@ mod app {
     use std::thread::{self, sleep};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+    use self::change_detection::{
+        ChangeFingerprint, change_stats, configured_chat_change_fingerprint,
+        rect_chat_change_fingerprint,
+    };
     use self::chat_output::ChatOutput;
     use self::command::{
         CommandLockState, ModerationAction, ParsedCommand, PendingCommand, UserCommand,
     };
     use self::config::{AppConfig, PointConfig, RectConfig};
     use self::feeluown::{FeelUOwnClient, PlayerStatus, format_lyrics, format_status};
+    use self::geometry::{Point, Rect, clamp_i32, crop_canvas, parse_rect};
     use self::monitor::{MonitorQueueItem, MonitorShared};
     use self::ocr::{OcrArgs, make_ocr_engine, merged_ocr_text, recognize_lines};
     use self::queue::PersistentQueue;
     use self::runtime_state::{HALL_EXPIRING_WARNING_MINUTES, PersistentRuntimeState};
+    use self::template_match::{
+        TemplateHit, best_template_hit, dedupe_hits, find_color_template_hits, find_template_hits,
+    };
     use anyhow::{Context, Result, anyhow, bail};
     use clap::{Args, Parser, Subcommand};
     use enigo::{Direction, Enigo, Key, Keyboard, Settings};
     use image::imageops::FilterType;
-    use image::{DynamicImage, GenericImageView, GrayImage, RgbImage};
+    use image::{DynamicImage, GenericImageView};
     use log::{LevelFilter, Log, Metadata, Record, SetLoggerError};
     use ocr_rs::OcrEngine;
     use serde::Serialize;
-    use template_matching::{
-        Image as MatchImage, MatchTemplateMethod, find_extremes, match_template,
-    };
 
     const CHAT_MARKER_SEARCH_WIDTH: u32 = 60;
     const HALL_INFO_OCR_SAMPLES: usize = 3;
@@ -278,58 +285,6 @@ mod app {
         },
     }
 
-    #[derive(Clone, Copy, Debug, Serialize)]
-    struct Point {
-        x: i32,
-        y: i32,
-    }
-
-    impl Point {
-        const fn new(x: i32, y: i32) -> Self {
-            Self { x, y }
-        }
-    }
-
-    #[derive(Clone, Copy, Debug, Serialize)]
-    struct Rect {
-        x: i32,
-        y: i32,
-        width: u32,
-        height: u32,
-    }
-
-    impl Rect {
-        const fn new(x: i32, y: i32, width: u32, height: u32) -> Self {
-            Self {
-                x,
-                y,
-                width,
-                height,
-            }
-        }
-
-        fn right(self) -> i32 {
-            self.x + self.width as i32
-        }
-
-        fn bottom(self) -> i32 {
-            self.y + self.height as i32
-        }
-
-        fn center(self) -> Point {
-            Point::new(
-                self.x + self.width as i32 / 2,
-                self.y + self.height as i32 / 2,
-            )
-        }
-    }
-
-    impl From<RectConfig> for Rect {
-        fn from(value: RectConfig) -> Self {
-            Self::new(value.x, value.y, value.width, value.height)
-        }
-    }
-
     #[derive(Clone, Debug)]
     struct Canvas {
         width: u32,
@@ -340,26 +295,6 @@ mod app {
     #[derive(Debug)]
     struct Frame {
         image: DynamicImage,
-    }
-
-    #[derive(Clone, Debug, Serialize)]
-    struct TemplateHit {
-        kind: String,
-        x: i32,
-        y: i32,
-        width: u32,
-        height: u32,
-        score: f32,
-    }
-
-    impl TemplateHit {
-        fn rect(&self) -> Rect {
-            Rect::new(self.x, self.y, self.width, self.height)
-        }
-
-        fn center(&self) -> Point {
-            self.rect().center()
-        }
     }
 
     #[derive(Clone, Debug, Serialize)]
@@ -399,19 +334,6 @@ mod app {
         hall_visible: bool,
         enter_visible: bool,
         source: &'static str,
-    }
-
-    #[derive(Clone, Debug)]
-    pub(super) struct ChangeFingerprint {
-        pub(super) pixels: Vec<u8>,
-        pub(super) width: u32,
-        pub(super) height: u32,
-    }
-
-    #[derive(Clone, Copy, Debug)]
-    pub(super) struct ChangeStats {
-        pub(super) mean_abs_diff: f32,
-        pub(super) changed_ratio: f32,
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -461,8 +383,6 @@ mod app {
     }
 
     static STDERR_LOGGER: StderrLogger = StderrLogger;
-    static RGB_TEMPLATE_CACHE: OnceLock<Mutex<HashMap<PathBuf, RgbImage>>> = OnceLock::new();
-
     impl UiState {
         fn primary_enter() -> Self {
             Self {
@@ -780,6 +700,7 @@ mod app {
         screen_lock_primed: Arc<AtomicBool>,
         reset_locks_requested: Arc<AtomicBool>,
         invite_executed_seqs: Arc<Mutex<HashSet<u32>>>,
+        moderation_workflows: Arc<Mutex<HashSet<String>>>,
         commands_enabled: Arc<AtomicBool>,
         idle_exit: Arc<Mutex<Option<IdleExitState>>>,
         running: Arc<AtomicBool>,
@@ -829,7 +750,14 @@ mod app {
 
     enum PendingTask {
         Command(Box<PendingCommand>),
-        AdvanceQueue { reason: &'static str },
+        AdvanceQueue {
+            reason: &'static str,
+        },
+        ModerationVoteResult {
+            command: Box<command::ModerationCommand>,
+            approved: bool,
+            workflow_key: String,
+        },
     }
 
     impl PendingTask {
@@ -837,6 +765,14 @@ mod app {
             match self {
                 Self::Command(pending) => pending.parsed.raw.clone(),
                 Self::AdvanceQueue { reason } => format!("自动出队({})", reason),
+                Self::ModerationVoteResult {
+                    command, approved, ..
+                } => format!(
+                    "{} UID{} 投票{}",
+                    command.action.label(),
+                    command.uid,
+                    if *approved { "通过" } else { "未通过" }
+                ),
             }
         }
 
@@ -844,6 +780,13 @@ mod app {
             match self {
                 Self::Command(pending) => command::same_lock_command(&pending.parsed, parsed),
                 Self::AdvanceQueue { .. } => false,
+                Self::ModerationVoteResult { command, .. } => {
+                    matches!(
+                        &parsed.command,
+                        UserCommand::Moderation(parsed_command)
+                            if parsed_command.action == command.action && parsed_command.uid == command.uid
+                    )
+                }
             }
         }
     }
@@ -882,6 +825,30 @@ mod app {
         }
     }
 
+    struct ModerationWorkflowRelease {
+        workflows: Arc<Mutex<HashSet<String>>>,
+        key: String,
+    }
+
+    impl ModerationWorkflowRelease {
+        fn new(workflows: Arc<Mutex<HashSet<String>>>, key: String) -> Self {
+            Self { workflows, key }
+        }
+    }
+
+    impl Drop for ModerationWorkflowRelease {
+        fn drop(&mut self) {
+            match self.workflows.lock() {
+                Ok(mut workflows) => {
+                    workflows.remove(&self.key);
+                }
+                Err(_) => {
+                    log::error!("moderation_workflows mutex poisoned");
+                }
+            }
+        }
+    }
+
     impl AutomationApp {
         fn new(
             config: AppConfig,
@@ -910,6 +877,7 @@ mod app {
                 screen_lock_primed: Arc::new(AtomicBool::new(false)),
                 reset_locks_requested: Arc::new(AtomicBool::new(false)),
                 invite_executed_seqs: Arc::new(Mutex::new(HashSet::new())),
+                moderation_workflows: Arc::new(Mutex::new(HashSet::new())),
                 commands_enabled: Arc::new(AtomicBool::new(true)),
                 idle_exit: Arc::new(Mutex::new(None)),
                 running: Arc::new(AtomicBool::new(true)),
@@ -961,6 +929,7 @@ mod app {
                 screen_lock_primed: self.screen_lock_primed.clone(),
                 reset_locks_requested: self.reset_locks_requested.clone(),
                 invite_executed_seqs: self.invite_executed_seqs.clone(),
+                moderation_workflows: self.moderation_workflows.clone(),
                 commands_enabled: self.commands_enabled.clone(),
                 idle_exit: self.idle_exit.clone(),
                 running: self.running.clone(),
@@ -991,6 +960,7 @@ mod app {
                 screen_lock_primed: self.screen_lock_primed.clone(),
                 reset_locks_requested: self.reset_locks_requested.clone(),
                 invite_executed_seqs: self.invite_executed_seqs.clone(),
+                moderation_workflows: self.moderation_workflows.clone(),
                 commands_enabled: self.commands_enabled.clone(),
                 idle_exit: self.idle_exit.clone(),
                 running: self.running.clone(),
@@ -1003,6 +973,31 @@ mod app {
                 log::info!("播放监控线程已启动");
                 monitor.run_playback_monitor_loop();
             })
+        }
+
+        fn clone_for_background_task(&self) -> Self {
+            Self {
+                config: self.config.clone(),
+                runtime_state: self.runtime_state.clone(),
+                queue: self.queue.clone(),
+                feeluown: self.feeluown.clone(),
+                ai: self.ai.clone(),
+                chat_output: self.chat_output.clone(),
+                ocr_engine: self.ocr_engine.clone(),
+                locks: CommandLockState::default(),
+                pending: self.pending.clone(),
+                screen_lock_primed: self.screen_lock_primed.clone(),
+                reset_locks_requested: self.reset_locks_requested.clone(),
+                invite_executed_seqs: self.invite_executed_seqs.clone(),
+                moderation_workflows: self.moderation_workflows.clone(),
+                commands_enabled: self.commands_enabled.clone(),
+                idle_exit: self.idle_exit.clone(),
+                running: self.running.clone(),
+                paused: self.paused.clone(),
+                command_executing: self.command_executing.clone(),
+                song_command_executing: self.song_command_executing.clone(),
+                monitor: self.monitor.clone(),
+            }
         }
 
         fn notify_pending_executor(&self) {
@@ -1020,6 +1015,17 @@ mod app {
             self.runtime_state
                 .lock()
                 .map_err(|_| anyhow!("runtime state mutex poisoned"))
+        }
+
+        fn release_moderation_workflow(&self, key: &str) {
+            match self.moderation_workflows.lock() {
+                Ok(mut workflows) => {
+                    workflows.remove(key);
+                }
+                Err(_) => {
+                    log::error!("moderation_workflows mutex poisoned");
+                }
+            }
         }
 
         fn ocr_engine(&self) -> Result<MutexGuard<'_, OcrEngineState>> {
@@ -1130,7 +1136,7 @@ mod app {
                             Ok(ui_state) if ui_state.is_primary() => {
                                 let entered_primary = !primary_visible;
                                 primary_visible = true;
-                                let fingerprint = match chat_change_fingerprint(
+                                let fingerprint = match rect_chat_change_fingerprint(
                                     &frame.image,
                                     self.config.screen.chat_rect.into(),
                                 ) {
@@ -1233,7 +1239,7 @@ mod app {
                                             last_change_ocr_at = last_ocr_at;
                                             force_scan_after = None;
                                             force_scan_reason = None;
-                                            last_fingerprint = chat_change_fingerprint(
+                                            last_fingerprint = rect_chat_change_fingerprint(
                                                 &frame.image,
                                                 self.config.screen.chat_rect.into(),
                                             )
@@ -1538,6 +1544,11 @@ mod app {
                     self.execute_pending_command(*pending)
                 }
                 PendingTask::AdvanceQueue { reason } => self.consume_queue(reason),
+                PendingTask::ModerationVoteResult {
+                    command,
+                    approved,
+                    workflow_key,
+                } => self.execute_moderation_vote_result(*command, approved, workflow_key),
             };
             match result {
                 Ok(()) => {
@@ -2960,36 +2971,133 @@ mod app {
             &mut self,
             command: &command::ModerationCommand,
         ) -> Result<bool> {
+            let workflow_key = moderation_workflow_key(command);
+            {
+                let mut workflows = self
+                    .moderation_workflows
+                    .lock()
+                    .map_err(|_| anyhow!("moderation_workflows mutex poisoned"))?;
+                if !workflows.insert(workflow_key.clone()) {
+                    log::info!(
+                        "{} UID{} 已有投票或执行流程，跳过重复请求",
+                        command.action.label(),
+                        command.uid
+                    );
+                    self.reply(&format!(
+                        "@UID{}的{}请求正在处理中",
+                        command.uid,
+                        command.action.label()
+                    ))?;
+                    return Ok(false);
+                }
+            }
+            let vote_timeout_seconds =
+                self.config.moderation.vote_timeout_ms.saturating_add(999) / 1000;
             let announce = format!(
-                "管理员发起了对@UID{}的{}请求,请好友120s内使用@同意/不同意进行判决",
+                "管理员发起了对@UID{}的{}请求,请好友{}s内使用@同意/不同意进行判决",
                 command.uid,
-                command.action.label()
+                command.action.label(),
+                vote_timeout_seconds,
             );
-            self.reply(&announce)?;
-            if !self.wait_for_moderation_votes(command)? {
+            if let Err(error) = self.reply(&announce) {
+                self.release_moderation_workflow(&workflow_key);
+                return Err(error);
+            }
+            self.spawn_moderation_vote(command.clone(), workflow_key);
+            Ok(true)
+        }
+
+        fn spawn_moderation_vote(&self, command: command::ModerationCommand, workflow_key: String) {
+            let worker = self.clone_for_background_task();
+            thread::spawn(move || {
+                log::info!(
+                    "{} UID{} 后台投票线程已启动",
+                    command.action.label(),
+                    command.uid
+                );
+                let approved = match worker.wait_for_moderation_votes(&command) {
+                    Ok(approved) => approved,
+                    Err(error) => {
+                        log::error!("{}后台投票失败: {error:#}", command.action.label());
+                        false
+                    }
+                };
+                if !worker.running.load(AtomicOrdering::SeqCst) {
+                    worker.release_moderation_workflow(&workflow_key);
+                    return;
+                }
+                let task = PendingTask::ModerationVoteResult {
+                    command: Box::new(command),
+                    approved,
+                    workflow_key: workflow_key.clone(),
+                };
+                if let Err(error) = worker.push_pending_task(task) {
+                    log::error!("后台投票结果加入队列失败: {error:#}");
+                    worker.release_moderation_workflow(&workflow_key);
+                }
+            });
+        }
+
+        fn execute_moderation_vote_result(
+            &mut self,
+            command: command::ModerationCommand,
+            approved: bool,
+            workflow_key: String,
+        ) -> Result<()> {
+            let task_label = format!("{} UID{} 投票结果", command.action.label(), command.uid);
+            match self.prepare_command_ui(&task_label) {
+                Ok(true) => {}
+                Ok(false) => {
+                    log::info!("投票结果处理前未能回到一级界面，保留任务: {}", task_label);
+                    self.push_pending_task_front(PendingTask::ModerationVoteResult {
+                        command: Box::new(command),
+                        approved,
+                        workflow_key,
+                    })?;
+                    return Ok(());
+                }
+                Err(error) => {
+                    log::error!(
+                        "投票结果处理前准备界面失败，保留任务 {}: {error:#}",
+                        task_label
+                    );
+                    self.push_pending_task_front(PendingTask::ModerationVoteResult {
+                        command: Box::new(command),
+                        approved,
+                        workflow_key,
+                    })?;
+                    return Ok(());
+                }
+            }
+
+            let _workflow_release =
+                ModerationWorkflowRelease::new(self.moderation_workflows.clone(), workflow_key);
+            if !approved {
                 self.reply(&format!(
                     "@UID{}的{}请求未通过",
                     command.uid,
                     command.action.label()
                 ))?;
-                return Ok(false);
+                return Ok(());
             }
             self.reply(&format!(
                 "@UID{}的{}请求已通过,开始执行",
                 command.uid,
                 command.action.label()
             ))?;
-            let result = self.execute_moderation_steps(command);
+            let result = self.execute_moderation_steps(&command);
             sleep(Duration::from_millis(
                 self.config.timing.return_to_primary_retry_ms,
             ));
             match &result {
                 Ok(true) => {
-                    self.reply(&format!(
+                    if let Err(error) = self.reply(&format!(
                         "已对@UID{}执行{}",
                         command.uid,
                         command.action.label()
-                    ))?;
+                    )) {
+                        log::error!("{}成功通告发送失败: {error:#}", command.action.label());
+                    }
                 }
                 Ok(false) | Err(_) => {
                     let _ = self.reply(&format!(
@@ -2999,7 +3107,7 @@ mod app {
                     ));
                 }
             }
-            result
+            result.map(|_| ())
         }
 
         fn wait_for_moderation_votes(&self, command: &command::ModerationCommand) -> Result<bool> {
@@ -3077,7 +3185,27 @@ mod app {
                     return Ok(true);
                 }
             }
-            Ok(false)
+            if !self.running.load(AtomicOrdering::SeqCst) {
+                return Ok(false);
+            }
+            let agree = stable_votes.values().filter(|agreed| **agreed).count() as i32;
+            let disagree = stable_votes.values().filter(|agreed| !**agreed).count() as i32;
+            if disagree == 0 {
+                log::info!(
+                    "{}投票超时: 同意={} 不同意=0，无反对，按通过处理",
+                    command.action.label(),
+                    agree,
+                );
+                Ok(true)
+            } else {
+                log::info!(
+                    "{}投票超时: 同意={} 不同意={}，未达到目标差值，按未通过处理",
+                    command.action.label(),
+                    agree,
+                    disagree,
+                );
+                Ok(false)
+            }
         }
 
         fn collect_moderation_vote_bottoms(&self) -> HashMap<String, i32> {
@@ -3121,10 +3249,13 @@ mod app {
         fn execute_moderation_steps(&self, command: &command::ModerationCommand) -> Result<bool> {
             log::info!("开始执行{} UID{}", command.action.label(), command.uid);
             let result = self.execute_moderation_steps_inner(command);
-            if result.is_err() || matches!(result, Ok(false)) {
-                self.return_to_primary_from_transient_ui(command.action.label());
-            } else {
-                self.return_to_primary_from_transient_ui(command.action.label());
+            let returned = self.return_to_primary_from_transient_ui(command.action.label());
+            if matches!(result, Ok(true)) && !returned {
+                log::error!(
+                    "{} UID{} 已执行，但返回一级界面失败，继续尝试发送成功通告",
+                    command.action.label(),
+                    command.uid
+                );
             }
             result
         }
@@ -3181,13 +3312,13 @@ mod app {
                 self.config.moderation.search_button_point,
                 &self.config.window,
             )?;
-            sleep(Duration::from_millis(2000));
-            if !self.click_template(
+            if !self.wait_and_click_template(
                 &canvas,
                 &frame_args,
                 self.config.moderation.more_settings_region.into(),
                 &self.config.templates.friend_more_settings,
                 "更多设置",
+                self.config.moderation.search_result_timeout_ms,
             )? {
                 return Ok(false);
             }
@@ -3217,9 +3348,16 @@ mod app {
             )? {
                 return Ok(false);
             }
-            sleep(Duration::from_millis(
+            if !self.wait_template_absent(
+                &canvas,
+                &frame_args,
+                self.config.moderation.confirm_region.into(),
+                &self.config.templates.friend_confirm,
+                "确认按钮",
                 self.config.moderation.confirm_wait_ms,
-            ));
+            )? {
+                return Ok(false);
+            }
             log::info!("{} UID{} 完成", command.action.label(), command.uid);
             Ok(true)
         }
@@ -3270,6 +3408,70 @@ mod app {
             let center = hit.center();
             click_game_point(PointConfig::new(center.x, center.y), &self.config.window)?;
             Ok(true)
+        }
+
+        fn wait_and_click_template(
+            &self,
+            canvas: &Canvas,
+            frame_args: &FrameArgs,
+            rect: Rect,
+            template: &Path,
+            label: &str,
+            timeout_ms: u64,
+        ) -> Result<bool> {
+            let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+            loop {
+                let frame = load_frame(frame_args, canvas, &self.config.window)?;
+                if let Some(hit) = best_template_hit(
+                    &frame.image,
+                    Some(rect),
+                    template,
+                    self.config.templates.marker_threshold,
+                )? {
+                    let center = hit.center();
+                    click_game_point(PointConfig::new(center.x, center.y), &self.config.window)?;
+                    return Ok(true);
+                }
+                if Instant::now() >= deadline {
+                    log::error!("等待{}模板超时", label);
+                    return Ok(false);
+                }
+                sleep(Duration::from_millis(self.template_poll_ms()));
+            }
+        }
+
+        fn wait_template_absent(
+            &self,
+            canvas: &Canvas,
+            frame_args: &FrameArgs,
+            rect: Rect,
+            template: &Path,
+            label: &str,
+            timeout_ms: u64,
+        ) -> Result<bool> {
+            let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+            loop {
+                let frame = load_frame(frame_args, canvas, &self.config.window)?;
+                if best_template_hit(
+                    &frame.image,
+                    Some(rect),
+                    template,
+                    self.config.templates.marker_threshold,
+                )?
+                .is_none()
+                {
+                    return Ok(true);
+                }
+                if Instant::now() >= deadline {
+                    log::error!("等待{}模板消失超时", label);
+                    return Ok(false);
+                }
+                sleep(Duration::from_millis(self.template_poll_ms()));
+            }
+        }
+
+        fn template_poll_ms(&self) -> u64 {
+            self.config.timing.output_click_ms.max(100)
         }
 
         fn send_friend_message(&self, username: &str, message: &str) -> Result<bool> {
@@ -3357,7 +3559,7 @@ mod app {
             Ok(fallback)
         }
 
-        fn return_to_primary_fixed(&self) {
+        fn return_to_primary_fixed(&self) -> bool {
             let templates = UiTemplateArgs::default().resolve(&self.config);
             let canvas = Canvas {
                 width: self.config.screen.expected_width,
@@ -3374,7 +3576,7 @@ mod app {
                 }) {
                     Ok(ui_state) if ui_state.is_primary() => {
                         log::info!("已返回一级界面: {}", ui_state);
-                        return;
+                        return true;
                     }
                     Ok(ui_state) => {
                         log::info!("返回一级界面中，当前: {}，按 ESC", ui_state);
@@ -3385,21 +3587,22 @@ mod app {
                 }
                 if let Err(error) = press_key(Key::Escape, &self.config.window) {
                     log::error!("返回一级界面按 ESC 失败: {error:#}");
-                    return;
+                    return false;
                 }
                 sleep(Duration::from_millis(
                     self.config.timing.return_to_primary_retry_ms,
                 ));
             }
             log::error!("返回一级界面超时");
+            false
         }
 
         fn return_to_primary_after_command_failure(&self, command: &str) {
             log::info!("命令失败后返回一级界面: {}", command);
-            self.return_to_primary_fixed();
+            let _ = self.return_to_primary_fixed();
         }
 
-        fn return_to_primary_from_transient_ui(&self, context: &str) {
+        fn return_to_primary_from_transient_ui(&self, context: &str) -> bool {
             log::info!("{}: 先按 ESC 关闭临时界面", context);
             if let Err(error) = press_key(Key::Escape, &self.config.window) {
                 log::error!("{}: 关闭临时界面失败: {error:#}", context);
@@ -3408,7 +3611,7 @@ mod app {
                     self.config.timing.return_to_primary_retry_ms,
                 ));
             }
-            self.return_to_primary_fixed();
+            self.return_to_primary_fixed()
         }
 
         fn read_hall_info(&self) -> Result<HallInfo> {
@@ -4520,6 +4723,10 @@ mod app {
         }
     }
 
+    fn moderation_workflow_key(command: &command::ModerationCommand) -> String {
+        format!("{}:{}", command.action.label(), command.uid)
+    }
+
     fn format_play_message(status: &PlayerStatus) -> String {
         format!(
             "播放: {} ({}/{}) 音量{}",
@@ -4869,262 +5076,6 @@ mod app {
         Ok(UiState::unknown())
     }
 
-    fn find_template_hits(
-        image: &DynamicImage,
-        search_rect: Option<Rect>,
-        template_path: &Path,
-        threshold: f32,
-    ) -> Result<Vec<TemplateHit>> {
-        let haystack = match search_rect {
-            Some(rect) => crop_canvas(image, rect)?,
-            None => image.clone(),
-        };
-        let template = image::open(template_path)
-            .with_context(|| format!("open template {}", template_path.display()))?;
-
-        if template.width() > haystack.width() || template.height() > haystack.height() {
-            return Ok(Vec::new());
-        }
-
-        let haystack_gray = haystack.to_luma8();
-        let template_gray = template.to_luma8();
-        let haystack_match = to_match_image(&haystack_gray);
-        let template_match = to_match_image(&template_gray);
-        let result = match_template(
-            haystack_match,
-            template_match,
-            MatchTemplateMethod::SumOfAbsoluteDifferences,
-        );
-        let max_sad = (template_gray.width() * template_gray.height()).max(1) as f32;
-        let mut hits = Vec::new();
-        for y in 0..result.height {
-            for x in 0..result.width {
-                let idx = (y * result.width + x) as usize;
-                let score = 1.0 - result.data[idx] / max_sad;
-                if score >= threshold {
-                    let base_x = search_rect.map(|rect| rect.x).unwrap_or(0);
-                    let base_y = search_rect.map(|rect| rect.y).unwrap_or(0);
-                    hits.push(TemplateHit {
-                        kind: "template".to_string(),
-                        x: base_x + x as i32,
-                        y: base_y + y as i32,
-                        width: template_gray.width(),
-                        height: template_gray.height(),
-                        score,
-                    });
-                }
-            }
-        }
-        hits.sort_by(|left, right| {
-            right
-                .score
-                .total_cmp(&left.score)
-                .then_with(|| left.y.cmp(&right.y))
-                .then_with(|| left.x.cmp(&right.x))
-        });
-        Ok(dedupe_hits(
-            hits,
-            template_gray.width().max(8) as i32 / 2,
-            template_gray.height().max(8) as i32 / 2,
-        ))
-    }
-
-    fn find_color_template_hits(
-        image: &DynamicImage,
-        search_rect: Option<Rect>,
-        template_path: &Path,
-        threshold: f32,
-    ) -> Result<Vec<TemplateHit>> {
-        let haystack = match search_rect {
-            Some(rect) => crop_canvas(image, rect)?,
-            None => image.clone(),
-        };
-        let template_rgb = cached_rgb_template(template_path)?;
-
-        if template_rgb.width() > haystack.width() || template_rgb.height() > haystack.height() {
-            return Ok(Vec::new());
-        }
-
-        let haystack_rgb = haystack.to_rgb8();
-        let max_sad = template_rgb.width() as u64 * template_rgb.height() as u64 * 3 * 255;
-        let max_allowed_sad = ((1.0 - threshold).clamp(0.0, 1.0) * max_sad as f32) as u64;
-        let mut hits = Vec::new();
-
-        for y in 0..=(haystack_rgb.height() - template_rgb.height()) {
-            for x in 0..=(haystack_rgb.width() - template_rgb.width()) {
-                let sad = color_sad_at(&haystack_rgb, &template_rgb, x, y, max_allowed_sad);
-                let score = 1.0 - sad as f32 / max_sad as f32;
-                if score >= threshold {
-                    let base_x = search_rect.map(|rect| rect.x).unwrap_or(0);
-                    let base_y = search_rect.map(|rect| rect.y).unwrap_or(0);
-                    hits.push(TemplateHit {
-                        kind: "template".to_string(),
-                        x: base_x + x as i32,
-                        y: base_y + y as i32,
-                        width: template_rgb.width(),
-                        height: template_rgb.height(),
-                        score,
-                    });
-                }
-            }
-        }
-        hits.sort_by(|left, right| {
-            right
-                .score
-                .total_cmp(&left.score)
-                .then_with(|| left.y.cmp(&right.y))
-                .then_with(|| left.x.cmp(&right.x))
-        });
-        Ok(dedupe_hits(
-            hits,
-            template_rgb.width().max(8) as i32 / 2,
-            template_rgb.height().max(8) as i32 / 2,
-        ))
-    }
-
-    fn cached_rgb_template(template_path: &Path) -> Result<RgbImage> {
-        let cache = RGB_TEMPLATE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-        let mut cache = cache
-            .lock()
-            .map_err(|_| anyhow!("template cache mutex poisoned"))?;
-        if let Some(image) = cache.get(template_path) {
-            return Ok(image.clone());
-        }
-        let image = image::open(template_path)
-            .with_context(|| format!("open template {}", template_path.display()))?
-            .to_rgb8();
-        cache.insert(template_path.to_path_buf(), image.clone());
-        Ok(image)
-    }
-
-    fn color_sad_at(
-        haystack: &RgbImage,
-        template: &RgbImage,
-        x: u32,
-        y: u32,
-        max_allowed_sad: u64,
-    ) -> u64 {
-        let haystack_width = haystack.width() as usize;
-        let template_width = template.width() as usize;
-        let template_height = template.height() as usize;
-        let x = x as usize;
-        let y = y as usize;
-        let haystack_data = haystack.as_raw();
-        let template_data = template.as_raw();
-        let mut sad = 0u64;
-
-        for row in 0..template_height {
-            let haystack_offset = ((y + row) * haystack_width + x) * 3;
-            let template_offset = row * template_width * 3;
-            for channel in 0..(template_width * 3) {
-                sad += haystack_data[haystack_offset + channel]
-                    .abs_diff(template_data[template_offset + channel])
-                    as u64;
-                if sad > max_allowed_sad {
-                    return sad;
-                }
-            }
-        }
-        sad
-    }
-
-    fn best_template_hit(
-        image: &DynamicImage,
-        search_rect: Option<Rect>,
-        template_path: &Path,
-        threshold: f32,
-    ) -> Result<Option<TemplateHit>> {
-        let haystack = match search_rect {
-            Some(rect) => crop_canvas(image, rect)?,
-            None => image.clone(),
-        };
-        let template = image::open(template_path)
-            .with_context(|| format!("open template {}", template_path.display()))?;
-        if template.width() > haystack.width() || template.height() > haystack.height() {
-            return Ok(None);
-        }
-
-        let haystack_gray = haystack.to_luma8();
-        let template_gray = template.to_luma8();
-        let result = match_template(
-            to_match_image(&haystack_gray),
-            to_match_image(&template_gray),
-            MatchTemplateMethod::SumOfAbsoluteDifferences,
-        );
-        let extremes = find_extremes(&result);
-        let max_sad = (template_gray.width() * template_gray.height()).max(1) as f32;
-        let score = 1.0 - extremes.min_value / max_sad;
-        if score < threshold {
-            return Ok(None);
-        }
-        let base_x = search_rect.map(|rect| rect.x).unwrap_or(0);
-        let base_y = search_rect.map(|rect| rect.y).unwrap_or(0);
-        Ok(Some(TemplateHit {
-            kind: "template".to_string(),
-            x: base_x + extremes.min_value_location.0 as i32,
-            y: base_y + extremes.min_value_location.1 as i32,
-            width: template_gray.width(),
-            height: template_gray.height(),
-            score,
-        }))
-    }
-
-    fn to_match_image(image: &GrayImage) -> MatchImage<'static> {
-        let data = image
-            .pixels()
-            .map(|pixel| pixel.0[0] as f32 / 255.0)
-            .collect::<Vec<_>>();
-        MatchImage::new(data, image.width(), image.height())
-    }
-
-    fn dedupe_hits(
-        mut hits: Vec<TemplateHit>,
-        tolerance_x: i32,
-        tolerance_y: i32,
-    ) -> Vec<TemplateHit> {
-        let mut picked: Vec<TemplateHit> = Vec::new();
-        for hit in hits.drain(..) {
-            if picked.iter().any(|picked| {
-                (hit.x - picked.x).abs() <= tolerance_x && (hit.y - picked.y).abs() <= tolerance_y
-            }) {
-                continue;
-            }
-            picked.push(hit);
-        }
-        picked.sort_by(compare_hits_top_left);
-        picked
-    }
-
-    fn crop_canvas(image: &DynamicImage, rect: Rect) -> Result<DynamicImage> {
-        if rect.x < 0
-            || rect.y < 0
-            || rect.right() > image.width() as i32
-            || rect.bottom() > image.height() as i32
-        {
-            bail!(
-                "crop rect {},{},{},{} outside image {}x{}",
-                rect.x,
-                rect.y,
-                rect.width,
-                rect.height,
-                image.width(),
-                image.height()
-            );
-        }
-        Ok(image.crop_imm(rect.x as u32, rect.y as u32, rect.width, rect.height))
-    }
-
-    pub(super) fn configured_chat_change_fingerprint(
-        image: &DynamicImage,
-        chat_rect: RectConfig,
-    ) -> Result<ChangeFingerprint> {
-        chat_change_fingerprint(image, chat_rect.into())
-    }
-
-    fn rect_chat_change_fingerprint(image: &DynamicImage, rect: Rect) -> Result<ChangeFingerprint> {
-        chat_change_fingerprint(image, rect)
-    }
-
     pub(super) fn count_chat_markers(
         image: &DynamicImage,
         templates: &ResolvedTemplateArgs,
@@ -5134,51 +5085,6 @@ mod app {
         let markers = find_chat_markers(&chat, templates)?;
         let counts = chat_marker_counts(&markers);
         Ok((counts.blue, counts.yellow, counts.pink))
-    }
-
-    fn chat_change_fingerprint(image: &DynamicImage, chat_rect: Rect) -> Result<ChangeFingerprint> {
-        const WIDTH: u32 = 104;
-        const HEIGHT: u32 = 36;
-
-        let chat = crop_canvas(image, chat_rect)?;
-        let gray = chat
-            .resize_exact(WIDTH, HEIGHT, FilterType::Triangle)
-            .to_luma8();
-        Ok(ChangeFingerprint {
-            pixels: gray.into_raw(),
-            width: WIDTH,
-            height: HEIGHT,
-        })
-    }
-
-    pub(super) fn change_stats(
-        previous: &ChangeFingerprint,
-        current: &ChangeFingerprint,
-    ) -> ChangeStats {
-        if previous.width != current.width
-            || previous.height != current.height
-            || previous.pixels.len() != current.pixels.len()
-        {
-            return ChangeStats {
-                mean_abs_diff: f32::MAX,
-                changed_ratio: 1.0,
-            };
-        }
-
-        let mut total_diff = 0u64;
-        let mut changed = 0usize;
-        for (left, right) in previous.pixels.iter().zip(&current.pixels) {
-            let diff = left.abs_diff(*right);
-            total_diff += diff as u64;
-            if diff >= 12 {
-                changed += 1;
-            }
-        }
-        let count = previous.pixels.len().max(1);
-        ChangeStats {
-            mean_abs_diff: total_diff as f32 / count as f32,
-            changed_ratio: changed as f32 / count as f32,
-        }
     }
 
     fn click_game_point(point: PointConfig, window_config: &config::WindowConfig) -> Result<()> {
@@ -5246,37 +5152,6 @@ mod app {
             _ => bail!("unsupported key: {}", value),
         };
         Ok(key)
-    }
-
-    fn parse_rect(value: &str) -> Result<Rect> {
-        let parts = value
-            .split(',')
-            .map(str::trim)
-            .map(str::parse::<i32>)
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        if parts.len() != 4 {
-            bail!("rect must be x,y,width,height");
-        }
-        if parts[2] <= 0 || parts[3] <= 0 {
-            bail!("rect width and height must be positive");
-        }
-        Ok(Rect::new(
-            parts[0],
-            parts[1],
-            parts[2] as u32,
-            parts[3] as u32,
-        ))
-    }
-
-    fn compare_hits_top_left(left: &TemplateHit, right: &TemplateHit) -> Ordering {
-        (left.y / 10)
-            .cmp(&(right.y / 10))
-            .then_with(|| left.x.cmp(&right.x))
-            .then_with(|| left.y.cmp(&right.y))
-    }
-
-    fn clamp_i32(value: i32, min: i32, max: i32) -> i32 {
-        value.max(min).min(max)
     }
 
     fn print_json<T: Serialize>(value: &T) -> Result<()> {

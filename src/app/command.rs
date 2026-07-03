@@ -35,6 +35,13 @@ pub enum UserCommand {
     DisableCommands { username: String },
     EnableCommands { username: String },
     IdleExit { minutes: u32 },
+    CustomWorkflow(CustomWorkflowCommand),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CustomWorkflowCommand {
+    pub name: String,
+    pub workflow: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -424,6 +431,9 @@ fn same_user_command(left: &UserCommand, right: &UserCommand) -> bool {
         (UserCommand::IdleExit { minutes: left }, UserCommand::IdleExit { minutes: right }) => {
             left == right
         }
+        (UserCommand::CustomWorkflow(left), UserCommand::CustomWorkflow(right)) => {
+            identity_text(&left.workflow) == identity_text(&right.workflow)
+        }
         (UserCommand::Volume(left), UserCommand::Volume(right)) => {
             identity_text(left) == identity_text(right)
         }
@@ -472,6 +482,9 @@ fn command_lock_key(command: &UserCommand) -> String {
         UserCommand::DisableCommands { username: _ } => "disable_commands".to_string(),
         UserCommand::EnableCommands { username: _ } => "enable_commands".to_string(),
         UserCommand::IdleExit { minutes } => format!("idle_exit:{}", minutes),
+        UserCommand::CustomWorkflow(command) => {
+            format!("custom_workflow:{}", identity_text(&command.workflow))
+        }
     }
 }
 

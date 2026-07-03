@@ -8,25 +8,32 @@ mod app {
     mod ai;
     mod change_detection;
     mod chat_output;
+    mod chat_scan;
     mod clipboard;
     mod command;
     mod config;
     mod config_migration;
+    mod custom_workflow;
     mod dpi;
     mod feeluown;
+    mod frame_source;
     mod geometry;
+    mod hall_info;
     mod hotkeys;
     mod http_server;
+    mod input_actions;
     mod logger;
     mod manual_tools;
     mod monitor;
     mod ocr;
     mod ocr_batch;
+    mod playback_format;
     mod queue;
     mod runtime_state;
     mod song_matcher;
     mod template_match;
     mod tui;
+    mod ui_state;
     mod window;
 
     use std::collections::{HashMap, HashSet, VecDeque};
@@ -35,7 +42,7 @@ mod app {
     use std::path::{Path, PathBuf};
     use std::process::Command as ProcessCommand;
     use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-    use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
+    use std::sync::{Arc, Condvar, Mutex, MutexGuard};
     use std::thread::{self, sleep};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -44,37 +51,42 @@ mod app {
         rect_chat_change_fingerprint,
     };
     use self::chat_output::ChatOutput;
-    use self::command::{
-        CommandLockState, ModerationAction, ParsedCommand, PendingCommand, UserCommand,
-    };
-    use self::config::{AppConfig, PointConfig, RectConfig};
+    use self::chat_scan::{ChatMessage, count_chat_markers, scan_chat};
+    use self::command::{CommandLockState, ParsedCommand, PendingCommand, UserCommand};
+    use self::config::{AppConfig, PointConfig};
     use self::feeluown::{FeelUOwnClient, PlayerStatus, format_lyrics, format_status};
-    use self::geometry::{Point, Rect, clamp_i32, crop_canvas, parse_rect};
+    use self::frame_source::{Canvas, load_frame};
+    use self::geometry::{Rect, crop_canvas, parse_rect};
+    use self::hall_info::{
+        HALL_INFO_OCR_SAMPLES, HallInfo, HallInfoSample, display_or_empty,
+        format_hall_remaining_suffix, merge_hall_info_samples, parse_hall_remaining_minutes,
+    };
+    use self::input_actions::{click_game_point, parse_key, press_key, run_or_print};
     use self::monitor::{MonitorQueueItem, MonitorShared};
     use self::ocr::{OcrArgs, make_ocr_engine, merged_ocr_text, recognize_lines};
-    use self::queue::PersistentQueue;
-    use self::runtime_state::{HALL_EXPIRING_WARNING_MINUTES, PersistentRuntimeState};
-    use self::template_match::{
-        TemplateHit, best_template_hit, dedupe_hits, find_color_template_hits, find_template_hits,
+    use self::playback_format::{
+        PlaybackSnapshot, estimated_player_status, format_play_message, format_time, is_playing,
+        playback_progress_restarted, playback_remaining_seconds, song_title,
     };
-    use anyhow::{Context, Result, anyhow, bail};
+    use self::queue::PersistentQueue;
+    use self::runtime_state::{
+        HALL_EXPIRING_WARNING_MINUTES, PersistentRuntimeState, RuntimeState,
+    };
+    use self::template_match::{best_template_hit, find_template_hits};
+    use self::ui_state::detect_ui_state;
+    use anyhow::{Context, Result, anyhow};
     use clap::{Args, Parser, Subcommand};
-    use enigo::{Direction, Enigo, Key, Keyboard, Settings};
-    use image::imageops::FilterType;
-    use image::{DynamicImage, GenericImageView};
+    use enigo::Key;
+    use image::DynamicImage;
     use log::{LevelFilter, Log, Metadata, Record, SetLoggerError};
     use ocr_rs::OcrEngine;
     use serde::Serialize;
 
-    const CHAT_MARKER_SEARCH_WIDTH: u32 = 60;
-    const HALL_INFO_OCR_SAMPLES: usize = 3;
     const IDLE_EXIT_MIN_MINUTES: u32 = 15;
     const OCR_REBUILD_INTERVAL: Duration = Duration::from_secs(60 * 60);
     const OCR_REBUILD_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
     const TARGET_MISSING_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
     const TARGET_MISSING_BACKOFF_MAX: Duration = Duration::from_secs(60);
-
-    static WINDOW_CAPTURE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     #[derive(Parser, Debug)]
     #[command(
@@ -285,64 +297,6 @@ mod app {
         },
     }
 
-    #[derive(Clone, Debug)]
-    struct Canvas {
-        width: u32,
-        height: u32,
-        resize: bool,
-    }
-
-    #[derive(Debug)]
-    struct Frame {
-        image: DynamicImage,
-    }
-
-    #[derive(Clone, Debug, Serialize)]
-    struct ChatMessage {
-        message_type: String,
-        block: Rect,
-        text: String,
-    }
-
-    #[derive(Clone, Debug)]
-    struct HallInfo {
-        name: String,
-        remaining_minutes: Option<u32>,
-    }
-
-    #[derive(Clone, Debug)]
-    struct HallInfoSample {
-        name: String,
-        time_text: String,
-        remaining_minutes: Option<u32>,
-    }
-
-    #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
-    #[serde(rename_all = "snake_case")]
-    enum UiStateKind {
-        Primary,
-        Secondary,
-        Unknown,
-    }
-
-    #[derive(Clone, Debug, Serialize)]
-    struct UiState {
-        state: UiStateKind,
-        blue_count: usize,
-        yellow_count: usize,
-        pink_count: usize,
-        hall_visible: bool,
-        enter_visible: bool,
-        source: &'static str,
-    }
-
-    #[derive(Clone, Copy, Debug)]
-    struct ChatMarkerCounts {
-        blue: usize,
-        yellow: usize,
-        pink: usize,
-    }
-
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum PlayOutcome {
         Success,
@@ -383,76 +337,6 @@ mod app {
     }
 
     static STDERR_LOGGER: StderrLogger = StderrLogger;
-    impl UiState {
-        fn primary_enter() -> Self {
-            Self {
-                state: UiStateKind::Primary,
-                blue_count: 0,
-                yellow_count: 0,
-                pink_count: 0,
-                hall_visible: false,
-                enter_visible: true,
-                source: "enter",
-            }
-        }
-
-        fn primary_marker(blue_count: usize, yellow_count: usize, pink_count: usize) -> Self {
-            Self {
-                state: UiStateKind::Primary,
-                blue_count,
-                yellow_count,
-                pink_count,
-                hall_visible: false,
-                enter_visible: false,
-                source: "marker",
-            }
-        }
-
-        fn secondary_hall() -> Self {
-            Self {
-                state: UiStateKind::Secondary,
-                blue_count: 0,
-                yellow_count: 0,
-                pink_count: 0,
-                hall_visible: true,
-                enter_visible: false,
-                source: "hall",
-            }
-        }
-
-        fn unknown() -> Self {
-            Self {
-                state: UiStateKind::Unknown,
-                blue_count: 0,
-                yellow_count: 0,
-                pink_count: 0,
-                hall_visible: false,
-                enter_visible: false,
-                source: "none",
-            }
-        }
-
-        fn is_primary(&self) -> bool {
-            self.state == UiStateKind::Primary
-        }
-    }
-
-    impl std::fmt::Display for UiState {
-        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match self.state {
-                UiStateKind::Primary if self.source == "enter" => {
-                    write!(formatter, "primary:enter")
-                }
-                UiStateKind::Primary => write!(
-                    formatter,
-                    "primary:marker blue={} yellow={} pink={}",
-                    self.blue_count, self.yellow_count, self.pink_count
-                ),
-                UiStateKind::Secondary => write!(formatter, "secondary:hall"),
-                UiStateKind::Unknown => write!(formatter, "unknown"),
-            }
-        }
-    }
 
     pub fn run() -> Result<()> {
         dpi::set_process_dpi_awareness();
@@ -722,12 +606,6 @@ mod app {
     }
 
     #[derive(Clone, Debug)]
-    struct PlaybackSnapshot {
-        status: PlayerStatus,
-        captured_at: Instant,
-    }
-
-    #[derive(Clone, Debug)]
     struct ResolvedSongRequest {
         keyword: String,
         source: String,
@@ -822,30 +700,6 @@ mod app {
     impl Drop for SongCommandExecutingGuard {
         fn drop(&mut self) {
             self.flag.store(false, AtomicOrdering::SeqCst);
-        }
-    }
-
-    struct ModerationWorkflowRelease {
-        workflows: Arc<Mutex<HashSet<String>>>,
-        key: String,
-    }
-
-    impl ModerationWorkflowRelease {
-        fn new(workflows: Arc<Mutex<HashSet<String>>>, key: String) -> Self {
-            Self { workflows, key }
-        }
-    }
-
-    impl Drop for ModerationWorkflowRelease {
-        fn drop(&mut self) {
-            match self.workflows.lock() {
-                Ok(mut workflows) => {
-                    workflows.remove(&self.key);
-                }
-                Err(_) => {
-                    log::error!("moderation_workflows mutex poisoned");
-                }
-            }
         }
     }
 
@@ -1015,17 +869,6 @@ mod app {
             self.runtime_state
                 .lock()
                 .map_err(|_| anyhow!("runtime state mutex poisoned"))
-        }
-
-        fn release_moderation_workflow(&self, key: &str) {
-            match self.moderation_workflows.lock() {
-                Ok(mut workflows) => {
-                    workflows.remove(key);
-                }
-                Err(_) => {
-                    log::error!("moderation_workflows mutex poisoned");
-                }
-            }
         }
 
         fn ocr_engine(&self) -> Result<MutexGuard<'_, OcrEngineState>> {
@@ -1352,7 +1195,13 @@ mod app {
             for message in messages.iter().filter(|message| !message.text.is_empty()) {
                 log::debug!("识别文本: [{}] {}", message.message_type, message.text);
                 let Some(parsed_command) =
-                    command::parse_text(&message.text, &message.message_type)
+                    command::parse_text(&message.text, &message.message_type).or_else(|| {
+                        custom_workflow::parse_text(
+                            &self.config.custom_workflows,
+                            &message.text,
+                            &message.message_type,
+                        )
+                    })
                 else {
                     continue;
                 };
@@ -1757,6 +1606,7 @@ mod app {
                 && !current_song.is_empty()
                 && !runtime_snapshot.last_requested_song.is_empty()
                 && current_song != runtime_snapshot.last_requested_song
+                && !self.status_matches_requested_song(&runtime_snapshot, &status)
             {
                 let mut runtime_state = self.runtime_state()?;
                 runtime_state.state_mut().current_song_is_requested = false;
@@ -2263,6 +2113,40 @@ mod app {
             ))
         }
 
+        fn current_status_matches_requested_song(&self, status: &PlayerStatus) -> Result<bool> {
+            let runtime_snapshot = self.runtime_state()?.state().clone();
+            Ok(self.status_matches_requested_song(&runtime_snapshot, status))
+        }
+
+        fn status_matches_requested_song(
+            &self,
+            runtime_state: &RuntimeState,
+            status: &PlayerStatus,
+        ) -> bool {
+            if !runtime_state.current_song_is_requested {
+                return false;
+            }
+            let current_song = format!("{}{}", status.name, status.singer);
+            if !current_song.is_empty()
+                && !runtime_state.last_requested_song.is_empty()
+                && current_song == runtime_state.last_requested_song
+            {
+                return true;
+            }
+            let keyword = runtime_state.last_requested_keyword.trim();
+            if keyword.is_empty() {
+                return false;
+            }
+            song_matcher::match_song_query(
+                &self.config.matching,
+                keyword,
+                &status.name,
+                &status.singer,
+                runtime_state.last_requested_prefer_accompaniment,
+            )
+            .ok
+        }
+
         fn push_queue_request(&self, request: &ResolvedSongRequest) -> Result<Option<usize>> {
             let mut queue = self.queue()?;
             if queue.is_full() {
@@ -2338,7 +2222,7 @@ mod app {
                                     return Ok(());
                                 }
                             }
-                            if !self.runtime_state()?.state().current_song_is_requested {
+                            if !self.current_status_matches_requested_song(&status)? {
                                 let mut runtime_state = self.runtime_state()?;
                                 runtime_state.state_mut().paused_by_command = false;
                                 runtime_state.save()?;
@@ -2558,6 +2442,13 @@ mod app {
                 UserCommand::IdleExit { minutes } => {
                     self.log_executed_command(parsed, &format!("idle exit {}", minutes))?;
                 }
+                UserCommand::CustomWorkflow(command) => {
+                    self.log_executed_command(
+                        parsed,
+                        &format!("custom workflow {}", command.workflow),
+                    )?;
+                    self.execute_custom_workflow(command)?;
+                }
             };
             Ok(())
         }
@@ -2732,831 +2623,6 @@ mod app {
                 log::info!("大厅剩余时间 OCR 结果: {}分钟", minutes);
             }
             Ok(is_public_hall)
-        }
-
-        fn execute_invite_with_announce(&mut self, username: &str) -> Result<bool> {
-            log::info!("邀请: 先检测是否公共大厅");
-            if self.check_public_hall()? {
-                log::info!("邀请: 当前在公共大厅，直接执行");
-                self.notify_friend_invite_decision(username, "已同意加入大厅,请注意启动麦克风");
-                return self.execute_invite(username);
-            }
-            let announce = format!(
-                "{}邀请BOT前往大厅,30s内@邀请确认@邀请拒绝,默认通过",
-                username
-            );
-            if let Err(error) = self.reply(&announce) {
-                log::error!("邀请通告发送失败，直接执行邀请: {error:#}");
-                return self.execute_invite(username);
-            }
-            match self.wait_for_invite_decision()? {
-                Some(true) => {
-                    self.notify_friend_invite_decision(username, "已同意加入大厅,请注意启动麦克风");
-                    self.execute_invite(username)
-                }
-                None => {
-                    self.notify_friend_invite_decision(
-                        username,
-                        "已默认同意加入大厅,请注意启动麦克风",
-                    );
-                    self.execute_invite(username)
-                }
-                Some(false) => {
-                    log::info!("收到邀请拒绝，取消邀请");
-                    self.notify_friend_invite_decision(username, "大厅成员已拒绝邀请");
-                    self.return_to_primary_fixed();
-                    Ok(false)
-                }
-            }
-        }
-
-        fn on_entered_new_hall(&self) {
-            log::info!("已进入新大厅，重置命令识别状态");
-            self.commands_enabled.store(true, AtomicOrdering::SeqCst);
-            self.screen_lock_primed.store(false, AtomicOrdering::SeqCst);
-            self.reset_locks_requested
-                .store(true, AtomicOrdering::SeqCst);
-        }
-
-        fn notify_friend_invite_decision(&self, username: &str, message: &str) {
-            if let Err(error) = self.send_friend_message(username, message) {
-                log::error!("好友邀请确认回复失败: {error:#}");
-            }
-        }
-
-        fn wait_for_invite_decision(&self) -> Result<Option<bool>> {
-            let existing = self.collect_invite_decision_bottoms();
-            let deadline = Instant::now()
-                + Duration::from_millis(self.config.timing.invite_confirm_timeout_ms);
-            let template_args = TemplateArgs::default().resolve(&self.config);
-            let canvas = Canvas {
-                width: self.config.screen.expected_width,
-                height: self.config.screen.expected_height,
-                resize: true,
-            };
-            while self.running.load(AtomicOrdering::SeqCst) && Instant::now() < deadline {
-                sleep(Duration::from_millis(
-                    self.config.timing.invite_confirm_poll_ms,
-                ));
-                let frame =
-                    match load_frame(&FrameArgs { image: None }, &canvas, &self.config.window) {
-                        Ok(frame) => frame,
-                        Err(error) => {
-                            log::error!("邀请确认截图失败: {error:#}");
-                            continue;
-                        }
-                    };
-                let scan_result = {
-                    let engine = match self.ocr_engine() {
-                        Ok(engine) => engine,
-                        Err(error) => {
-                            log::error!("邀请确认 OCR 锁失败: {error:#}");
-                            continue;
-                        }
-                    };
-                    scan_chat(
-                        &frame.image,
-                        &engine.engine,
-                        &template_args,
-                        self.config.screen.chat_rect.into(),
-                        Some(&self.monitor),
-                    )
-                };
-                let messages = match scan_result {
-                    Ok(messages) => messages,
-                    Err(error) => {
-                        log::error!("邀请确认扫描失败: {error:#}");
-                        continue;
-                    }
-                };
-                for message in messages {
-                    if message.message_type != "blue" {
-                        continue;
-                    }
-                    if is_existing_decision(&message, &existing) {
-                        continue;
-                    }
-                    match parse_invite_decision(&message.text) {
-                        Some(true) => return Ok(Some(true)),
-                        Some(false) => return Ok(Some(false)),
-                        None => {}
-                    }
-                }
-            }
-            Ok(None)
-        }
-
-        fn collect_invite_decision_bottoms(&self) -> HashMap<String, i32> {
-            let mut output = HashMap::new();
-            let template_args = TemplateArgs::default().resolve(&self.config);
-            let canvas = Canvas {
-                width: self.config.screen.expected_width,
-                height: self.config.screen.expected_height,
-                resize: true,
-            };
-            let Ok(frame) = load_frame(&FrameArgs { image: None }, &canvas, &self.config.window)
-            else {
-                return output;
-            };
-            let Ok(engine) = self.ocr_engine() else {
-                return output;
-            };
-            let Ok(messages) = scan_chat(
-                &frame.image,
-                &engine.engine,
-                &template_args,
-                self.config.screen.chat_rect.into(),
-                Some(&self.monitor),
-            ) else {
-                return output;
-            };
-            for message in messages {
-                if message.message_type != "blue" {
-                    continue;
-                }
-                if parse_invite_decision(&message.text).is_some() {
-                    let bottom = message.block.y + message.block.height as i32;
-                    output
-                        .entry(message.text)
-                        .and_modify(|value| *value = (*value).max(bottom))
-                        .or_insert(bottom);
-                }
-            }
-            output
-        }
-
-        fn execute_invite(&self, username: &str) -> Result<bool> {
-            log::info!("开始邀请: {}", username);
-            let result = self.execute_invite_steps(username);
-            if result.is_err() {
-                self.return_to_primary_from_transient_ui("邀请失败");
-            } else if matches!(result, Ok(true)) {
-                log::info!("邀请成功，等待 10s 后兜底返回一级界面");
-                sleep(Duration::from_secs(10));
-                self.return_to_primary_fixed();
-            }
-            result
-        }
-
-        fn execute_invite_steps(&self, username: &str) -> Result<bool> {
-            let canvas = Canvas {
-                width: self.config.screen.expected_width,
-                height: self.config.screen.expected_height,
-                resize: true,
-            };
-            if !self.open_friend_chat(username, &canvas)? {
-                return Ok(false);
-            }
-            let frame_args = FrameArgs { image: None };
-
-            let point = {
-                let engine = self.ocr_engine()?;
-                self.find_text_point(
-                    &engine.engine,
-                    &canvas,
-                    self.config.invite.confirm_list_region.into(),
-                    username,
-                )?
-            };
-            let Some(point) = point else {
-                log::error!("邀请失败: 确认列表未找到用户 {}", username);
-                self.return_to_primary_from_transient_ui("邀请失败");
-                return Ok(false);
-            };
-            click_game_point(PointConfig::new(point.x, point.y), &self.config.window)?;
-            sleep(Duration::from_millis(self.config.timing.invite_step_ms));
-
-            for (label, rect, template) in [
-                (
-                    "查看千星",
-                    self.config.invite.view_star_region.into(),
-                    self.config.templates.invite_view_star.clone(),
-                ),
-                (
-                    "前往其大厅",
-                    self.config.invite.goto_hall_region.into(),
-                    self.config.templates.invite_goto_hall.clone(),
-                ),
-                (
-                    "进入大厅",
-                    self.config.invite.enter_hall_region.into(),
-                    self.config.templates.invite_enter_hall.clone(),
-                ),
-            ] {
-                let frame = load_frame(&frame_args, &canvas, &self.config.window)?;
-                let Some(hit) = best_template_hit(
-                    &frame.image,
-                    Some(rect),
-                    &template,
-                    self.config.templates.marker_threshold,
-                )?
-                else {
-                    log::error!("邀请失败: 未找到{}按钮", label);
-                    self.return_to_primary_from_transient_ui("邀请失败");
-                    return Ok(false);
-                };
-                let center = hit.center();
-                click_game_point(PointConfig::new(center.x, center.y), &self.config.window)?;
-                if label == "进入大厅" {
-                    self.on_entered_new_hall();
-                }
-                sleep(Duration::from_millis(self.config.timing.invite_step_ms));
-            }
-
-            log::info!("邀请完成: {}", username);
-            Ok(true)
-        }
-
-        fn execute_moderation_with_vote(
-            &mut self,
-            command: &command::ModerationCommand,
-        ) -> Result<bool> {
-            let workflow_key = moderation_workflow_key(command);
-            {
-                let mut workflows = self
-                    .moderation_workflows
-                    .lock()
-                    .map_err(|_| anyhow!("moderation_workflows mutex poisoned"))?;
-                if !workflows.insert(workflow_key.clone()) {
-                    log::info!(
-                        "{} UID{} 已有投票或执行流程，跳过重复请求",
-                        command.action.label(),
-                        command.uid
-                    );
-                    self.reply(&format!(
-                        "@UID{}的{}请求正在处理中",
-                        command.uid,
-                        command.action.label()
-                    ))?;
-                    return Ok(false);
-                }
-            }
-            let vote_timeout_seconds =
-                self.config.moderation.vote_timeout_ms.saturating_add(999) / 1000;
-            let announce = format!(
-                "管理员发起了对@UID{}的{}请求,请好友{}s内使用@同意/不同意进行判决",
-                command.uid,
-                command.action.label(),
-                vote_timeout_seconds,
-            );
-            if let Err(error) = self.reply(&announce) {
-                self.release_moderation_workflow(&workflow_key);
-                return Err(error);
-            }
-            self.spawn_moderation_vote(command.clone(), workflow_key);
-            Ok(true)
-        }
-
-        fn spawn_moderation_vote(&self, command: command::ModerationCommand, workflow_key: String) {
-            let worker = self.clone_for_background_task();
-            thread::spawn(move || {
-                log::info!(
-                    "{} UID{} 后台投票线程已启动",
-                    command.action.label(),
-                    command.uid
-                );
-                let approved = match worker.wait_for_moderation_votes(&command) {
-                    Ok(approved) => approved,
-                    Err(error) => {
-                        log::error!("{}后台投票失败: {error:#}", command.action.label());
-                        false
-                    }
-                };
-                if !worker.running.load(AtomicOrdering::SeqCst) {
-                    worker.release_moderation_workflow(&workflow_key);
-                    return;
-                }
-                let task = PendingTask::ModerationVoteResult {
-                    command: Box::new(command),
-                    approved,
-                    workflow_key: workflow_key.clone(),
-                };
-                if let Err(error) = worker.push_pending_task(task) {
-                    log::error!("后台投票结果加入队列失败: {error:#}");
-                    worker.release_moderation_workflow(&workflow_key);
-                }
-            });
-        }
-
-        fn execute_moderation_vote_result(
-            &mut self,
-            command: command::ModerationCommand,
-            approved: bool,
-            workflow_key: String,
-        ) -> Result<()> {
-            let task_label = format!("{} UID{} 投票结果", command.action.label(), command.uid);
-            match self.prepare_command_ui(&task_label) {
-                Ok(true) => {}
-                Ok(false) => {
-                    log::info!("投票结果处理前未能回到一级界面，保留任务: {}", task_label);
-                    self.push_pending_task_front(PendingTask::ModerationVoteResult {
-                        command: Box::new(command),
-                        approved,
-                        workflow_key,
-                    })?;
-                    return Ok(());
-                }
-                Err(error) => {
-                    log::error!(
-                        "投票结果处理前准备界面失败，保留任务 {}: {error:#}",
-                        task_label
-                    );
-                    self.push_pending_task_front(PendingTask::ModerationVoteResult {
-                        command: Box::new(command),
-                        approved,
-                        workflow_key,
-                    })?;
-                    return Ok(());
-                }
-            }
-
-            let _workflow_release =
-                ModerationWorkflowRelease::new(self.moderation_workflows.clone(), workflow_key);
-            if !approved {
-                self.reply(&format!(
-                    "@UID{}的{}请求未通过",
-                    command.uid,
-                    command.action.label()
-                ))?;
-                return Ok(());
-            }
-            self.reply(&format!(
-                "@UID{}的{}请求已通过,开始执行",
-                command.uid,
-                command.action.label()
-            ))?;
-            let result = self.execute_moderation_steps(&command);
-            sleep(Duration::from_millis(
-                self.config.timing.return_to_primary_retry_ms,
-            ));
-            match &result {
-                Ok(true) => {
-                    if let Err(error) = self.reply(&format!(
-                        "已对@UID{}执行{}",
-                        command.uid,
-                        command.action.label()
-                    )) {
-                        log::error!("{}成功通告发送失败: {error:#}", command.action.label());
-                    }
-                }
-                Ok(false) | Err(_) => {
-                    let _ = self.reply(&format!(
-                        "@UID{}的{}流程出错",
-                        command.uid,
-                        command.action.label()
-                    ));
-                }
-            }
-            result.map(|_| ())
-        }
-
-        fn wait_for_moderation_votes(&self, command: &command::ModerationCommand) -> Result<bool> {
-            let existing = self.collect_moderation_vote_bottoms();
-            let deadline =
-                Instant::now() + Duration::from_millis(self.config.moderation.vote_timeout_ms);
-            let template_args = TemplateArgs::default().resolve(&self.config);
-            let canvas = Canvas {
-                width: self.config.screen.expected_width,
-                height: self.config.screen.expected_height,
-                resize: true,
-            };
-            let mut stable_votes: HashMap<String, bool> = HashMap::new();
-            let mut samples: HashMap<(String, bool), u32> = HashMap::new();
-            while self.running.load(AtomicOrdering::SeqCst) && Instant::now() < deadline {
-                sleep(Duration::from_millis(self.config.moderation.vote_poll_ms));
-                let frame =
-                    match load_frame(&FrameArgs { image: None }, &canvas, &self.config.window) {
-                        Ok(frame) => frame,
-                        Err(error) => {
-                            log::error!("{}投票截图失败: {error:#}", command.action.label());
-                            continue;
-                        }
-                    };
-                let messages = {
-                    let engine = match self.ocr_engine() {
-                        Ok(engine) => engine,
-                        Err(error) => {
-                            log::error!("{}投票 OCR 锁失败: {error:#}", command.action.label());
-                            continue;
-                        }
-                    };
-                    match scan_chat(
-                        &frame.image,
-                        &engine.engine,
-                        &template_args,
-                        self.config.screen.chat_rect.into(),
-                        Some(&self.monitor),
-                    ) {
-                        Ok(messages) => messages,
-                        Err(error) => {
-                            log::error!("{}投票扫描失败: {error:#}", command.action.label());
-                            continue;
-                        }
-                    }
-                };
-                for message in messages {
-                    if message.message_type != "pink" || is_existing_decision(&message, &existing) {
-                        continue;
-                    }
-                    let Some((username, agreed)) = parse_friend_moderation_vote(&message.text)
-                    else {
-                        continue;
-                    };
-                    let key = (username.clone(), agreed);
-                    let count = samples
-                        .entry(key)
-                        .and_modify(|value| *value += 1)
-                        .or_insert(1);
-                    if *count >= self.config.moderation.stable_vote_samples {
-                        stable_votes.insert(username, agreed);
-                    }
-                }
-                let agree = stable_votes.values().filter(|agreed| **agreed).count() as i32;
-                let disagree = stable_votes.values().filter(|agreed| !**agreed).count() as i32;
-                log::info!(
-                    "{}投票: 同意={} 不同意={} 差值={} 目标差值={}",
-                    command.action.label(),
-                    agree,
-                    disagree,
-                    agree - disagree,
-                    self.config.moderation.required_vote_margin,
-                );
-                if agree - disagree >= self.config.moderation.required_vote_margin {
-                    return Ok(true);
-                }
-            }
-            if !self.running.load(AtomicOrdering::SeqCst) {
-                return Ok(false);
-            }
-            let agree = stable_votes.values().filter(|agreed| **agreed).count() as i32;
-            let disagree = stable_votes.values().filter(|agreed| !**agreed).count() as i32;
-            if disagree == 0 {
-                log::info!(
-                    "{}投票超时: 同意={} 不同意=0，无反对，按通过处理",
-                    command.action.label(),
-                    agree,
-                );
-                Ok(true)
-            } else {
-                log::info!(
-                    "{}投票超时: 同意={} 不同意={}，未达到目标差值，按未通过处理",
-                    command.action.label(),
-                    agree,
-                    disagree,
-                );
-                Ok(false)
-            }
-        }
-
-        fn collect_moderation_vote_bottoms(&self) -> HashMap<String, i32> {
-            let mut output = HashMap::new();
-            let template_args = TemplateArgs::default().resolve(&self.config);
-            let canvas = Canvas {
-                width: self.config.screen.expected_width,
-                height: self.config.screen.expected_height,
-                resize: true,
-            };
-            let Ok(frame) = load_frame(&FrameArgs { image: None }, &canvas, &self.config.window)
-            else {
-                return output;
-            };
-            let Ok(engine) = self.ocr_engine() else {
-                return output;
-            };
-            let Ok(messages) = scan_chat(
-                &frame.image,
-                &engine.engine,
-                &template_args,
-                self.config.screen.chat_rect.into(),
-                Some(&self.monitor),
-            ) else {
-                return output;
-            };
-            for message in messages {
-                if message.message_type == "pink"
-                    && parse_friend_moderation_vote(&message.text).is_some()
-                {
-                    let bottom = message.block.y + message.block.height as i32;
-                    output
-                        .entry(message.text)
-                        .and_modify(|value| *value = (*value).max(bottom))
-                        .or_insert(bottom);
-                }
-            }
-            output
-        }
-
-        fn execute_moderation_steps(&self, command: &command::ModerationCommand) -> Result<bool> {
-            log::info!("开始执行{} UID{}", command.action.label(), command.uid);
-            let result = self.execute_moderation_steps_inner(command);
-            let returned = self.return_to_primary_from_transient_ui(command.action.label());
-            if matches!(result, Ok(true)) && !returned {
-                log::error!(
-                    "{} UID{} 已执行，但返回一级界面失败，继续尝试发送成功通告",
-                    command.action.label(),
-                    command.uid
-                );
-            }
-            result
-        }
-
-        fn execute_moderation_steps_inner(
-            &self,
-            command: &command::ModerationCommand,
-        ) -> Result<bool> {
-            let canvas = Canvas {
-                width: self.config.screen.expected_width,
-                height: self.config.screen.expected_height,
-                resize: true,
-            };
-            let frame_args = FrameArgs { image: None };
-            press_key(Key::Unicode('o'), &self.config.window)?;
-            sleep(Duration::from_millis(self.config.timing.invite_step_ms));
-            if !self.ensure_template_visible(
-                &canvas,
-                &frame_args,
-                self.config.moderation.friend_panel_region.into(),
-                &self.config.templates.friend_panel,
-                "好友界面",
-            )? {
-                return Ok(false);
-            }
-            press_key(Key::Unicode('e'), &self.config.window)?;
-            sleep(Duration::from_millis(self.config.timing.invite_step_ms));
-            press_key(Key::Unicode('e'), &self.config.window)?;
-            sleep(Duration::from_millis(self.config.timing.invite_step_ms));
-            if !self.ensure_template_visible(
-                &canvas,
-                &frame_args,
-                self.config.moderation.search_panel_region.into(),
-                &self.config.templates.friend_search_panel,
-                "搜索按钮",
-            )? {
-                return Ok(false);
-            }
-            log::info!(
-                "UID 搜索点击: input=({}, {}) button=({}, {})",
-                self.config.moderation.search_input_point.x,
-                self.config.moderation.search_input_point.y,
-                self.config.moderation.search_button_point.x,
-                self.config.moderation.search_button_point.y,
-            );
-            click_game_point(
-                self.config.moderation.search_input_point,
-                &self.config.window,
-            )?;
-            sleep(Duration::from_millis(self.config.timing.output_click_ms));
-            paste_text(&command.uid)?;
-            sleep(Duration::from_millis(self.config.timing.output_input_ms));
-            click_game_point(
-                self.config.moderation.search_button_point,
-                &self.config.window,
-            )?;
-            if !self.wait_and_click_template(
-                &canvas,
-                &frame_args,
-                self.config.moderation.more_settings_region.into(),
-                &self.config.templates.friend_more_settings,
-                "更多设置",
-                self.config.moderation.search_result_timeout_ms,
-            )? {
-                return Ok(false);
-            }
-            sleep(Duration::from_millis(self.config.timing.invite_step_ms));
-            let (region, template, label) = match command.action {
-                ModerationAction::Blacklist => (
-                    self.config.moderation.blacklist_region.into(),
-                    &self.config.templates.friend_blacklist,
-                    "拉黑按钮",
-                ),
-                ModerationAction::BlockChat => (
-                    self.config.moderation.block_chat_region.into(),
-                    &self.config.templates.friend_block_chat,
-                    "屏蔽聊天按钮",
-                ),
-            };
-            if !self.click_template(&canvas, &frame_args, region, template, label)? {
-                return Ok(false);
-            }
-            sleep(Duration::from_millis(self.config.timing.invite_step_ms));
-            if !self.click_template(
-                &canvas,
-                &frame_args,
-                self.config.moderation.confirm_region.into(),
-                &self.config.templates.friend_confirm,
-                "确认按钮",
-            )? {
-                return Ok(false);
-            }
-            if !self.wait_template_absent(
-                &canvas,
-                &frame_args,
-                self.config.moderation.confirm_region.into(),
-                &self.config.templates.friend_confirm,
-                "确认按钮",
-                self.config.moderation.confirm_wait_ms,
-            )? {
-                return Ok(false);
-            }
-            log::info!("{} UID{} 完成", command.action.label(), command.uid);
-            Ok(true)
-        }
-
-        fn ensure_template_visible(
-            &self,
-            canvas: &Canvas,
-            frame_args: &FrameArgs,
-            rect: Rect,
-            template: &Path,
-            label: &str,
-        ) -> Result<bool> {
-            let frame = load_frame(frame_args, canvas, &self.config.window)?;
-            if best_template_hit(
-                &frame.image,
-                Some(rect),
-                template,
-                self.config.templates.marker_threshold,
-            )?
-            .is_some()
-            {
-                Ok(true)
-            } else {
-                log::error!("未找到{}模板", label);
-                Ok(false)
-            }
-        }
-
-        fn click_template(
-            &self,
-            canvas: &Canvas,
-            frame_args: &FrameArgs,
-            rect: Rect,
-            template: &Path,
-            label: &str,
-        ) -> Result<bool> {
-            let frame = load_frame(frame_args, canvas, &self.config.window)?;
-            let Some(hit) = best_template_hit(
-                &frame.image,
-                Some(rect),
-                template,
-                self.config.templates.marker_threshold,
-            )?
-            else {
-                log::error!("未找到{}模板", label);
-                return Ok(false);
-            };
-            let center = hit.center();
-            click_game_point(PointConfig::new(center.x, center.y), &self.config.window)?;
-            Ok(true)
-        }
-
-        fn wait_and_click_template(
-            &self,
-            canvas: &Canvas,
-            frame_args: &FrameArgs,
-            rect: Rect,
-            template: &Path,
-            label: &str,
-            timeout_ms: u64,
-        ) -> Result<bool> {
-            let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-            loop {
-                let frame = load_frame(frame_args, canvas, &self.config.window)?;
-                if let Some(hit) = best_template_hit(
-                    &frame.image,
-                    Some(rect),
-                    template,
-                    self.config.templates.marker_threshold,
-                )? {
-                    let center = hit.center();
-                    click_game_point(PointConfig::new(center.x, center.y), &self.config.window)?;
-                    return Ok(true);
-                }
-                if Instant::now() >= deadline {
-                    log::error!("等待{}模板超时", label);
-                    return Ok(false);
-                }
-                sleep(Duration::from_millis(self.template_poll_ms()));
-            }
-        }
-
-        fn wait_template_absent(
-            &self,
-            canvas: &Canvas,
-            frame_args: &FrameArgs,
-            rect: Rect,
-            template: &Path,
-            label: &str,
-            timeout_ms: u64,
-        ) -> Result<bool> {
-            let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-            loop {
-                let frame = load_frame(frame_args, canvas, &self.config.window)?;
-                if best_template_hit(
-                    &frame.image,
-                    Some(rect),
-                    template,
-                    self.config.templates.marker_threshold,
-                )?
-                .is_none()
-                {
-                    return Ok(true);
-                }
-                if Instant::now() >= deadline {
-                    log::error!("等待{}模板消失超时", label);
-                    return Ok(false);
-                }
-                sleep(Duration::from_millis(self.template_poll_ms()));
-            }
-        }
-
-        fn template_poll_ms(&self) -> u64 {
-            self.config.timing.output_click_ms.max(100)
-        }
-
-        fn send_friend_message(&self, username: &str, message: &str) -> Result<bool> {
-            log::info!("好友发言: {} -> {}", username, message);
-            let canvas = Canvas {
-                width: self.config.screen.expected_width,
-                height: self.config.screen.expected_height,
-                resize: true,
-            };
-            let opened = match self.open_friend_chat(username, &canvas) {
-                Ok(opened) => opened,
-                Err(error) => {
-                    self.return_to_primary_from_transient_ui("好友发言失败");
-                    return Err(error);
-                }
-            };
-            if !opened {
-                return Ok(false);
-            }
-            let result = self.chat_output.send_current_chat(message);
-            self.return_to_primary_from_transient_ui("好友发言");
-            result?;
-            Ok(true)
-        }
-
-        fn open_friend_chat(&self, username: &str, canvas: &Canvas) -> Result<bool> {
-            click_game_point(self.config.output.focus_point, &self.config.window)?;
-            sleep(Duration::from_millis(
-                self.config.timing.invite_open_chat_ms,
-            ));
-            press_key(Key::Return, &self.config.window)?;
-            sleep(Duration::from_millis(
-                self.config.timing.invite_open_chat_ms,
-            ));
-
-            let point = {
-                let engine = self.ocr_engine()?;
-                self.find_text_point(
-                    &engine.engine,
-                    canvas,
-                    self.config.invite.friend_list_region.into(),
-                    username,
-                )?
-            };
-            let Some(point) = point else {
-                log::error!("好友聊天失败: 好友列表未找到用户 {}", username);
-                self.return_to_primary_from_transient_ui("好友聊天失败");
-                return Ok(false);
-            };
-            click_game_point(PointConfig::new(point.x, point.y), &self.config.window)?;
-            sleep(Duration::from_millis(self.config.timing.invite_step_ms));
-            Ok(true)
-        }
-
-        fn find_text_point(
-            &self,
-            engine: &OcrEngine,
-            canvas: &Canvas,
-            rect: Rect,
-            expected: &str,
-        ) -> Result<Option<Point>> {
-            let frame = load_frame(&FrameArgs { image: None }, canvas, &self.config.window)?;
-            let crop = crop_canvas(&frame.image, rect)?;
-            let target = command::normalize_lock_text(expected);
-            if target.is_empty() {
-                return Ok(None);
-            }
-            let mut fallback = None;
-            for line in recognize_lines(engine, &crop)? {
-                let norm = command::normalize_lock_text(&line.text);
-                if norm.is_empty() {
-                    continue;
-                }
-                let point = Point::new(
-                    rect.x + line.bbox.x + line.bbox.width as i32 / 2,
-                    rect.y + line.bbox.y + line.bbox.height as i32 / 2,
-                );
-                if norm == target {
-                    return Ok(Some(point));
-                }
-                if fallback.is_none() && (norm.contains(&target) || target.contains(&norm)) {
-                    fallback = Some(point);
-                }
-            }
-            Ok(fallback)
         }
 
         fn return_to_primary_fixed(&self) -> bool {
@@ -4371,31 +3437,6 @@ mod app {
         }
     }
 
-    fn is_playing(status: &PlayerStatus) -> bool {
-        status.status == "playing"
-    }
-
-    fn estimated_player_status(snapshot: &PlaybackSnapshot) -> PlayerStatus {
-        let mut status = snapshot.status.clone();
-        if status.status == "playing" && status.progress.is_finite() {
-            status.progress += snapshot.captured_at.elapsed().as_secs_f64();
-            if status.duration.is_finite() && status.duration > 0.0 {
-                status.progress = status.progress.min(status.duration);
-            }
-        }
-        status
-    }
-
-    fn playback_remaining_seconds(status: &PlayerStatus) -> Option<f64> {
-        if !status.duration.is_finite() || !status.progress.is_finite() {
-            return None;
-        }
-        if status.duration <= 0.0 || status.progress < 0.0 || status.progress > status.duration {
-            return None;
-        }
-        Some(status.duration - status.progress)
-    }
-
     fn ai_candidate_source(song: &command::SongCommand) -> &'static str {
         if song.friend_username.trim().is_empty() {
             "qqmusic,netease"
@@ -4486,13 +3527,6 @@ mod app {
         )
     }
 
-    fn playback_progress_restarted(before: f64, after: f64) -> bool {
-        before.is_finite()
-            && after.is_finite()
-            && before > 2.0
-            && (after < 2.0 || after + 1.0 < before)
-    }
-
     fn parse_decision_command(text: &str) -> Option<UserDecision> {
         let raw = text.trim();
         let command_text = if let Some(index) = raw.find(['：', ':', ']', '】']) {
@@ -4547,134 +3581,6 @@ mod app {
         .any(|pattern| text.contains(pattern))
     }
 
-    fn parse_hall_remaining_minutes(text: &str) -> Option<u32> {
-        let digits = text
-            .chars()
-            .filter_map(normalize_ascii_digit)
-            .collect::<String>();
-        if digits.is_empty() {
-            return None;
-        }
-        let minutes = digits.parse::<u32>().ok()?;
-        if (1..=180).contains(&minutes) {
-            Some(minutes)
-        } else {
-            None
-        }
-    }
-
-    fn merge_hall_info_samples(samples: &[HallInfoSample]) -> HallInfo {
-        let name = most_frequent_hall_name(samples).unwrap_or_else(|| {
-            samples
-                .first()
-                .map(|sample| sample.name.clone())
-                .unwrap_or_default()
-        });
-        let is_public_hall = samples
-            .iter()
-            .filter(|sample| {
-                command::normalize_lock_text(&sample.name)
-                    == command::normalize_lock_text("公共大厅")
-            })
-            .count()
-            * 2
-            >= samples.len().max(1);
-        let remaining_minutes = if is_public_hall {
-            None
-        } else {
-            most_frequent_hall_minutes(samples)
-        };
-        HallInfo {
-            name,
-            remaining_minutes,
-        }
-    }
-
-    fn most_frequent_hall_name(samples: &[HallInfoSample]) -> Option<String> {
-        let mut counts: HashMap<String, usize> = HashMap::new();
-        for name in samples
-            .iter()
-            .map(|sample| sample.name.trim())
-            .filter(|name| !name.is_empty())
-        {
-            *counts.entry(name.to_string()).or_default() += 1;
-        }
-        counts
-            .into_iter()
-            .max_by(|left, right| {
-                left.1
-                    .cmp(&right.1)
-                    .then_with(|| left.0.len().cmp(&right.0.len()))
-                    .then_with(|| right.0.cmp(&left.0))
-            })
-            .map(|(name, _)| name)
-    }
-
-    fn most_frequent_hall_minutes(samples: &[HallInfoSample]) -> Option<u32> {
-        let mut counts: HashMap<u32, usize> = HashMap::new();
-        for minutes in samples.iter().filter_map(|sample| sample.remaining_minutes) {
-            *counts.entry(minutes).or_default() += 1;
-        }
-        counts
-            .into_iter()
-            .max_by(|left, right| left.1.cmp(&right.1).then_with(|| right.0.cmp(&left.0)))
-            .map(|(minutes, _)| minutes)
-    }
-
-    fn display_or_empty(text: &str) -> &str {
-        if text.is_empty() { "空" } else { text }
-    }
-
-    fn normalize_ascii_digit(ch: char) -> Option<char> {
-        if ch.is_ascii_digit() {
-            return Some(ch);
-        }
-        if ('\u{ff10}'..='\u{ff19}').contains(&ch) {
-            return char::from_u32(ch as u32 - 0xfee0);
-        }
-        None
-    }
-
-    fn format_hall_remaining_suffix(minutes: Option<u32>) -> String {
-        minutes
-            .map(|value| format!("，剩余{}分钟", value))
-            .unwrap_or_default()
-    }
-
-    fn parse_invite_decision(text: &str) -> Option<bool> {
-        let raw = text.trim();
-        let command_text = if let Some(index) = raw.find(['：', ':', ']', '】']) {
-            let sep_len = raw[index..].chars().next().map(char::len_utf8).unwrap_or(1);
-            &raw[index + sep_len..]
-        } else {
-            raw
-        }
-        .trim_start_matches(['：', ':', ' ', '\t', ']', '】']);
-        if command_text
-            .strip_prefix("@邀请确认")
-            .is_some_and(|rest| decision_boundary(rest.chars().next()))
-        {
-            Some(true)
-        } else if command_text
-            .strip_prefix("@邀请拒绝")
-            .is_some_and(|rest| decision_boundary(rest.chars().next()))
-        {
-            Some(false)
-        } else if command_text
-            .strip_prefix("@同意邀请")
-            .is_some_and(|rest| decision_boundary(rest.chars().next()))
-        {
-            Some(true)
-        } else if command_text
-            .strip_prefix("@拒绝邀请")
-            .is_some_and(|rest| decision_boundary(rest.chars().next()))
-        {
-            Some(false)
-        } else {
-            None
-        }
-    }
-
     fn decision_boundary(ch: Option<char>) -> bool {
         match ch {
             None => true,
@@ -4695,463 +3601,12 @@ mod app {
             .is_some_and(|existing_bottom| bottom <= *existing_bottom)
     }
 
-    fn parse_friend_moderation_vote(text: &str) -> Option<(String, bool)> {
-        let sep_index = text.find(['：', ':', ']', '】'])?;
-        let username = text[..sep_index]
-            .trim_matches(['[', '【', ']', '】', ' ', '\t'])
-            .to_string();
-        if username.trim().is_empty() {
-            return None;
-        }
-        let sep_len = text[sep_index..].chars().next()?.len_utf8();
-        let command_text = text[sep_index + sep_len..]
-            .trim_start_matches(['：', ':', ' ', '\t', ']', '】'])
-            .strip_prefix('@')?
-            .trim_start();
-        if command_text
-            .strip_prefix("不同意")
-            .is_some_and(|rest| decision_boundary(rest.chars().next()))
-        {
-            Some((username, false))
-        } else if command_text
-            .strip_prefix("同意")
-            .is_some_and(|rest| decision_boundary(rest.chars().next()))
-        {
-            Some((username, true))
-        } else {
-            None
-        }
-    }
-
-    fn moderation_workflow_key(command: &command::ModerationCommand) -> String {
-        format!("{}:{}", command.action.label(), command.uid)
-    }
-
-    fn format_play_message(status: &PlayerStatus) -> String {
-        format!(
-            "播放: {} ({}/{}) 音量{}",
-            song_title(&status.name, &status.singer),
-            format_time(status.progress),
-            format_time(status.duration),
-            status.volume
-        )
-    }
-
-    fn song_title(name: &str, singer: &str) -> String {
-        let name = if name.trim().is_empty() {
-            "未知"
-        } else {
-            name.trim()
-        };
-        let singer = if singer.trim().is_empty() {
-            "未知"
-        } else {
-            singer.trim()
-        };
-        format!("{} - {}", name, singer)
-    }
-
-    fn format_time(value: f64) -> String {
-        if !value.is_finite() || value <= 0.0 {
-            return "0:00".to_string();
-        }
-        let total = value.floor() as i64;
-        format!("{}:{:02}", total / 60, total % 60)
-    }
-
     fn elapsed_ms(started: Instant) -> u128 {
         started.elapsed().as_millis()
     }
 
     fn next_target_missing_backoff(current: Duration) -> Duration {
         current.saturating_mul(2).min(TARGET_MISSING_BACKOFF_MAX)
-    }
-
-    fn load_frame(
-        args: &FrameArgs,
-        canvas: &Canvas,
-        window_config: &config::WindowConfig,
-    ) -> Result<Frame> {
-        let started = Instant::now();
-        let image = match &args.image {
-            Some(path) => {
-                image::open(path).with_context(|| format!("open image {}", path.display()))?
-            }
-            None => {
-                let _guard = WINDOW_CAPTURE_LOCK
-                    .get_or_init(|| Mutex::new(()))
-                    .lock()
-                    .map_err(|_| anyhow!("window capture mutex poisoned"))?;
-                window::capture_game(window_config)?
-            }
-        };
-        let (source_width, source_height) = image.dimensions();
-        let image =
-            if canvas.resize && (source_width != canvas.width || source_height != canvas.height) {
-                image.resize_exact(canvas.width, canvas.height, FilterType::Triangle)
-            } else {
-                image
-            };
-        log::debug!(
-            "截图加载耗时: {}ms source={}x{} output={}x{} resize={}",
-            elapsed_ms(started),
-            source_width,
-            source_height,
-            image.width(),
-            image.height(),
-            canvas.resize && (source_width != canvas.width || source_height != canvas.height)
-        );
-        Ok(Frame { image })
-    }
-
-    fn scan_chat(
-        image: &DynamicImage,
-        engine: &OcrEngine,
-        templates: &ResolvedTemplateArgs,
-        chat_rect: Rect,
-        monitor: Option<&MonitorShared>,
-    ) -> Result<Vec<ChatMessage>> {
-        let total_started = Instant::now();
-        let chat = crop_canvas(image, chat_rect)?;
-        let marker_started = Instant::now();
-        let markers = find_chat_markers(&chat, templates)?;
-        let marker_ms = elapsed_ms(marker_started);
-
-        let mut messages = Vec::new();
-        let ocr_started = Instant::now();
-        let blocks: Vec<(TemplateHit, Rect)> = markers
-            .iter()
-            .map(|marker| {
-                let block = make_message_block(marker, &markers, chat_rect, templates);
-                (marker.clone(), block)
-            })
-            .collect();
-        if templates.batch_recognize {
-            let block_rects: Vec<Rect> = blocks.iter().map(|(_, r)| *r).collect();
-            let texts = ocr_batch::batch_recognize_blocks(
-                engine,
-                &chat,
-                &block_rects,
-                templates.same_line_y_tolerance,
-            )?;
-            for ((marker, block), text) in blocks.iter().zip(texts) {
-                messages.push(ChatMessage {
-                    message_type: marker_type(marker).to_string(),
-                    block: *block,
-                    text,
-                });
-            }
-        } else {
-            for (marker, block) in &blocks {
-                let crop = crop_canvas(&chat, *block)?;
-                let text = merged_ocr_text(engine, &crop, templates.same_line_y_tolerance)?;
-                messages.push(ChatMessage {
-                    message_type: marker_type(marker).to_string(),
-                    block: *block,
-                    text,
-                });
-            }
-        }
-        let ocr_ms = elapsed_ms(ocr_started);
-        let total_ms = elapsed_ms(total_started);
-        if let Some(monitor) = monitor {
-            monitor.set_ocr(monitor::OcrSnapshot {
-                markers: markers.len(),
-                messages: messages
-                    .iter()
-                    .map(|message| format!("[{}] {}", message.message_type, message.text))
-                    .collect(),
-                marker_ms,
-                ocr_ms,
-                total_ms,
-            });
-        }
-        log::info!(
-            "聊天扫描耗时: total={}ms marker={}ms ocr={}ms markers={} messages={}",
-            total_ms,
-            marker_ms,
-            ocr_ms,
-            markers.len(),
-            messages.len()
-        );
-        Ok(messages)
-    }
-
-    fn marker_type(hit: &TemplateHit) -> &str {
-        &hit.kind
-    }
-
-    fn find_chat_markers(
-        chat: &DynamicImage,
-        templates: &ResolvedTemplateArgs,
-    ) -> Result<Vec<TemplateHit>> {
-        let search_rect = Some(Rect::new(
-            0,
-            0,
-            CHAT_MARKER_SEARCH_WIDTH.min(chat.width()),
-            chat.height(),
-        ));
-        let mut markers = Vec::new();
-        markers.extend(find_markers(
-            chat,
-            search_rect,
-            &templates.blue_template,
-            "blue",
-            templates.marker_threshold,
-        )?);
-        markers.extend(find_markers(
-            chat,
-            search_rect,
-            &templates.yellow_template,
-            "yellow",
-            templates.marker_threshold,
-        )?);
-        markers.extend(find_markers(
-            chat,
-            search_rect,
-            &templates.pink_template,
-            "pink",
-            templates.marker_threshold,
-        )?);
-        Ok(dedupe_chat_marker_hits(
-            markers,
-            templates.marker_dedupe_x,
-            templates.marker_dedupe_y,
-        ))
-    }
-
-    fn chat_marker_counts(markers: &[TemplateHit]) -> ChatMarkerCounts {
-        let mut counts = ChatMarkerCounts {
-            blue: 0,
-            yellow: 0,
-            pink: 0,
-        };
-        for marker in markers {
-            match marker.kind.as_str() {
-                "blue" => counts.blue += 1,
-                "yellow" => counts.yellow += 1,
-                "pink" => counts.pink += 1,
-                _ => {}
-            }
-        }
-        counts
-    }
-
-    fn dedupe_chat_marker_hits(
-        hits: Vec<TemplateHit>,
-        tolerance_x: i32,
-        tolerance_y: i32,
-    ) -> Vec<TemplateHit> {
-        let tolerance_x = tolerance_x.max(22);
-        let tolerance_y = tolerance_y.max(14);
-        let mut by_score = hits;
-        by_score.sort_by(|left, right| {
-            right
-                .score
-                .total_cmp(&left.score)
-                .then_with(|| left.y.cmp(&right.y))
-                .then_with(|| left.x.cmp(&right.x))
-        });
-        dedupe_hits(by_score, tolerance_x, tolerance_y)
-    }
-
-    fn find_markers(
-        image: &DynamicImage,
-        search_rect: Option<Rect>,
-        template: &Path,
-        marker_type: &str,
-        threshold: f32,
-    ) -> Result<Vec<TemplateHit>> {
-        let mut hits = find_color_template_hits(image, search_rect, template, threshold)?;
-        for hit in &mut hits {
-            hit.kind = marker_type.to_string();
-        }
-        Ok(hits)
-    }
-
-    fn make_message_block(
-        marker: &TemplateHit,
-        markers: &[TemplateHit],
-        chat_rect: Rect,
-        templates: &ResolvedTemplateArgs,
-    ) -> Rect {
-        let start_y = clamp_i32(
-            marker.y - templates.block_top_padding,
-            0,
-            chat_rect.height as i32 - 1,
-        );
-        let next_marker = next_marker(marker, markers, templates.next_marker_min_gap);
-        let max_end_y = clamp_i32(
-            start_y + templates.max_block_height,
-            start_y + 1,
-            chat_rect.height as i32,
-        );
-        let boundary_end_y = next_marker
-            .map(|hit| hit.y - templates.block_bottom_padding)
-            .unwrap_or(max_end_y);
-        let end_y = clamp_i32(
-            boundary_end_y.min(max_end_y),
-            start_y + 1,
-            chat_rect.height as i32,
-        );
-        let text_x = clamp_i32(
-            marker.x + marker.width as i32 + templates.text_left_gap,
-            0,
-            chat_rect.width as i32 - 1,
-        );
-        let width = clamp_i32(
-            chat_rect.width as i32 - text_x - templates.right_padding,
-            1,
-            chat_rect.width as i32,
-        ) as u32;
-        Rect::new(text_x, start_y, width, (end_y - start_y) as u32)
-    }
-
-    fn next_marker<'a>(
-        marker: &TemplateHit,
-        markers: &'a [TemplateHit],
-        next_marker_min_gap: i32,
-    ) -> Option<&'a TemplateHit> {
-        let min_y = marker.y + next_marker_min_gap.max((marker.height as f32 * 0.6).floor() as i32);
-        markers
-            .iter()
-            .filter(|candidate| candidate.y >= min_y)
-            .min_by_key(|candidate| candidate.y)
-    }
-
-    fn detect_ui_state(
-        image: &DynamicImage,
-        templates: &ResolvedUiTemplateArgs,
-        screen: &config::ScreenConfig,
-    ) -> Result<UiState> {
-        let started = Instant::now();
-        if best_template_hit(
-            image,
-            Some(screen.enter_rect.into()),
-            &templates.enter_template,
-            templates.chat_templates.marker_threshold,
-        )?
-        .is_some()
-        {
-            log::debug!(
-                "UI 状态检测耗时: {}ms state=primary_enter",
-                elapsed_ms(started)
-            );
-            return Ok(UiState::primary_enter());
-        }
-
-        if best_template_hit(
-            image,
-            Some(screen.secondary_hall_rect.into()),
-            &templates.dating_template,
-            templates.chat_templates.marker_threshold,
-        )?
-        .is_some()
-        {
-            log::debug!(
-                "UI 状态检测耗时: {}ms state=secondary_hall",
-                elapsed_ms(started)
-            );
-            return Ok(UiState::secondary_hall());
-        }
-
-        let chat = crop_canvas(image, screen.chat_rect.into())?;
-        let marker_counts =
-            chat_marker_counts(&find_chat_markers(&chat, &templates.chat_templates)?);
-        let blue = marker_counts.blue;
-        let yellow = marker_counts.yellow;
-        let pink = marker_counts.pink;
-        if blue + yellow + pink > 0 {
-            log::debug!(
-                "UI 状态检测耗时: {}ms state=primary_marker blue={} yellow={} pink={}",
-                elapsed_ms(started),
-                blue,
-                yellow,
-                pink
-            );
-            return Ok(UiState::primary_marker(blue, yellow, pink));
-        }
-
-        log::debug!("UI 状态检测耗时: {}ms state=unknown", elapsed_ms(started));
-        Ok(UiState::unknown())
-    }
-
-    pub(super) fn count_chat_markers(
-        image: &DynamicImage,
-        templates: &ResolvedTemplateArgs,
-        chat_rect: RectConfig,
-    ) -> Result<(usize, usize, usize)> {
-        let chat = crop_canvas(image, chat_rect.into())?;
-        let markers = find_chat_markers(&chat, templates)?;
-        let counts = chat_marker_counts(&markers);
-        Ok((counts.blue, counts.yellow, counts.pink))
-    }
-
-    fn click_game_point(point: PointConfig, window_config: &config::WindowConfig) -> Result<()> {
-        let mut enigo = Enigo::new(&Settings::default()).context("create enigo")?;
-        let mut window = window::GameWindow::find(window_config)?;
-        window.click(&mut enigo, point)?;
-        Ok(())
-    }
-
-    fn paste_text(text: &str) -> Result<()> {
-        clipboard::set_text(text).context("set clipboard text")?;
-        let mut enigo = Enigo::new(&Settings::default()).context("create enigo")?;
-        enigo
-            .key(Key::Control, Direction::Press)
-            .context("press control")?;
-        let paste_result = enigo
-            .key(Key::Unicode('v'), Direction::Click)
-            .context("paste text");
-        enigo
-            .key(Key::Control, Direction::Release)
-            .context("release control")?;
-        paste_result
-    }
-
-    fn press_key(key: Key, window_config: &config::WindowConfig) -> Result<()> {
-        let mut enigo = Enigo::new(&Settings::default()).context("create enigo")?;
-        let mut window = window::GameWindow::find(window_config)?;
-        window.focus_for_keyboard(&mut enigo)?;
-        enigo.key(key, Direction::Click).context("press key")?;
-        Ok(())
-    }
-
-    fn run_or_print<F>(execute: bool, description: String, action: F) -> Result<()>
-    where
-        F: FnOnce() -> Result<()>,
-    {
-        if execute {
-            action()
-        } else {
-            println!("dry-run: {}", description);
-            println!("pass --execute to send real keyboard/mouse input");
-            Ok(())
-        }
-    }
-
-    fn parse_key(value: &str) -> Result<Key> {
-        let normalized = value.trim().to_ascii_lowercase();
-        let key = match normalized.as_str() {
-            "return" | "enter" => Key::Return,
-            "escape" | "esc" => Key::Escape,
-            "f1" => Key::F1,
-            "f2" => Key::F2,
-            "f3" => Key::F3,
-            "f4" => Key::F4,
-            "f5" => Key::F5,
-            "f6" => Key::F6,
-            "f7" => Key::F7,
-            "f8" => Key::F8,
-            "f9" => Key::F9,
-            "f10" => Key::F10,
-            "f11" => Key::F11,
-            "f12" => Key::F12,
-            "n" => Key::Unicode('n'),
-            single if single.chars().count() == 1 => Key::Unicode(single.chars().next().unwrap()),
-            _ => bail!("unsupported key: {}", value),
-        };
-        Ok(key)
     }
 
     fn print_json<T: Serialize>(value: &T) -> Result<()> {

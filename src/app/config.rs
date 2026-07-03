@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -27,6 +28,7 @@ pub struct AppConfig {
     pub matching: MatchConfig,
     pub hotkeys: HotkeyConfig,
     pub invite: InviteConfig,
+    pub custom_workflows: CustomWorkflowConfig,
 }
 
 impl Default for AppConfig {
@@ -50,6 +52,7 @@ impl Default for AppConfig {
             matching: MatchConfig::default(),
             hotkeys: HotkeyConfig::default(),
             invite: InviteConfig::default(),
+            custom_workflows: CustomWorkflowConfig::default(),
         }
     }
 }
@@ -134,7 +137,7 @@ fn default_config_yaml() -> &'static str {
 # 坐标沿用旧脚本习惯：以游戏客户区左上角为原点，按 1920x1080 有效画面写坐标
 
 # 配置版本；程序启动时会把旧版本配置迁移到当前模板
-config_version: 11
+config_version: 12
 
 window:
   # 目标游戏进程名，按进程文件名匹配，大小写不敏感
@@ -522,6 +525,36 @@ invite:
     y: 700
     width: 500
     height: 100
+
+custom_workflows:
+  # 是否启用配置驱动的自定义流程命令
+  enabled: true
+  # 模板默认匹配阈值
+  default_threshold: 0.82
+  # wait_template/click_template 默认等待模板出现的最长时间，单位毫秒
+  default_timeout_ms: 5000
+  # 等待模板出现时的轮询间隔，单位毫秒
+  default_poll_ms: 200
+  # 每个步骤执行后的默认等待时间，单位毫秒
+  default_step_wait_ms: 300
+  # 自定义模板名到图片路径的映射，步骤里通过 template 引用这里的名字
+  templates: {}
+  # 示例：
+  # templates:
+  #   my_button: assets/my-button.png
+  # workflows:
+  #   - name: example
+  #     commands: [测试流程]
+  #     message_types: [blue]
+  #     steps:
+  #       - type: key
+  #         key: F2
+  #         wait_ms: 800
+  #       - type: click_template
+  #         template: my_button
+  #         region: { x: 700, y: 560, width: 500, height: 300 }
+  #       - type: return_primary
+  workflows: []
 "#
 }
 
@@ -938,6 +971,93 @@ impl Default for QueueConfig {
             max_size: 5,
             auto_advance_seconds: 1,
             protect_auto_played_songs: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CustomWorkflowConfig {
+    pub enabled: bool,
+    pub default_threshold: f32,
+    pub default_timeout_ms: u64,
+    pub default_poll_ms: u64,
+    pub default_step_wait_ms: u64,
+    pub templates: HashMap<String, PathBuf>,
+    pub workflows: Vec<CustomWorkflowDefinition>,
+}
+
+impl Default for CustomWorkflowConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            default_threshold: 0.82,
+            default_timeout_ms: 5_000,
+            default_poll_ms: 200,
+            default_step_wait_ms: 300,
+            templates: HashMap::new(),
+            workflows: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CustomWorkflowDefinition {
+    pub enabled: bool,
+    pub name: String,
+    pub commands: Vec<String>,
+    pub message_types: Vec<String>,
+    pub steps: Vec<CustomWorkflowStep>,
+    pub success_message: String,
+}
+
+impl Default for CustomWorkflowDefinition {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            name: String::new(),
+            commands: Vec::new(),
+            message_types: vec!["blue".to_string()],
+            steps: Vec::new(),
+            success_message: String::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CustomWorkflowStep {
+    #[serde(rename = "type")]
+    pub step_type: String,
+    pub template: String,
+    pub region: Option<RectConfig>,
+    pub point: Option<PointConfig>,
+    pub click_offset: Option<PointConfig>,
+    pub key: String,
+    pub text: String,
+    pub message: String,
+    pub threshold: Option<f32>,
+    pub timeout_ms: Option<u64>,
+    pub poll_ms: Option<u64>,
+    pub wait_ms: Option<u64>,
+}
+
+impl Default for CustomWorkflowStep {
+    fn default() -> Self {
+        Self {
+            step_type: String::new(),
+            template: String::new(),
+            region: None,
+            point: None,
+            click_offset: None,
+            key: String::new(),
+            text: String::new(),
+            message: String::new(),
+            threshold: None,
+            timeout_ms: None,
+            poll_ms: None,
+            wait_ms: None,
         }
     }
 }

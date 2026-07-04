@@ -447,3 +447,16 @@ custom_workflows:
       success_message: ""
       steps:
         - type: invite_user
+    # 好友私聊 @通告 内容，向当前大厅发送“内容”
+    - name: notice
+      enabled: true
+      commands: [通告]
+      allow_args: true
+      message_types: [pink]
+      confirm_before_run: false
+      confirm_message: ""
+      confirm_message_types: []
+      success_message: ""
+      steps:
+        - type: send_chat
+          message: "{{args}}"

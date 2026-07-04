@@ -1494,7 +1494,7 @@ fn find_command_workflow<'a>(
             let Some(rest) = command_text.strip_prefix(command) else {
                 continue;
             };
-            if !command_boundary(rest.chars().next()) {
+            if !command_boundary(rest.chars().next()) && !workflow.allow_args {
                 continue;
             }
             let args = command_args(rest);
@@ -1669,6 +1669,7 @@ mod tests {
         let config = test_config(test_workflow(false));
 
         assert!(parse_text(&config, "用户：@测试流程 参数", "blue").is_none());
+        assert!(parse_text(&config, "用户：@测试流程参数", "blue").is_none());
     }
 
     #[test]
@@ -1676,6 +1677,30 @@ mod tests {
         let config = test_config(test_workflow(true));
 
         let parsed = parse_text(&config, "用户：@测试流程 123 abc", "blue").expect("parse custom");
+        assert_eq!(parsed.raw, "测试流程 123 abc");
+        assert!(matches!(
+            parsed.command,
+            UserCommand::CustomWorkflow(CustomWorkflowCommand { args, .. }) if args == "123 abc"
+        ));
+    }
+
+    #[test]
+    fn parses_custom_workflow_with_attached_args_when_enabled() {
+        let config = test_config(test_workflow(true));
+
+        let parsed = parse_text(&config, "用户：@测试流程123 abc", "blue").expect("parse custom");
+        assert_eq!(parsed.raw, "测试流程 123 abc");
+        assert!(matches!(
+            parsed.command,
+            UserCommand::CustomWorkflow(CustomWorkflowCommand { args, .. }) if args == "123 abc"
+        ));
+    }
+
+    #[test]
+    fn parses_custom_workflow_with_colon_args_when_enabled() {
+        let config = test_config(test_workflow(true));
+
+        let parsed = parse_text(&config, "用户：@测试流程：123 abc", "blue").expect("parse custom");
         assert_eq!(parsed.raw, "测试流程 123 abc");
         assert!(matches!(
             parsed.command,

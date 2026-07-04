@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::Ordering as AtomicOrdering;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -8,16 +8,15 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
 use enigo::Key;
-use ocr_rs::OcrEngine;
 
 use super::chat_scan::scan_chat;
 use super::command::{self, CustomWorkflowCommand, ModerationAction, ParsedCommand, UserCommand};
 use super::config::{self, CustomWorkflowConfig, CustomWorkflowDefinition, PointConfig};
 use super::frame_source::{Canvas, load_frame};
-use super::geometry::{Point, Rect, crop_canvas};
+use super::geometry::Point;
 use super::input_actions::{click_game_point, parse_key, paste_text, press_key};
-use super::ocr::recognize_lines;
 use super::template_match::best_template_hit;
+use super::ui_locator::UiLocator;
 use super::{AutomationApp, FrameArgs, PendingTask, TemplateArgs};
 
 pub(super) fn parse_text(
@@ -122,6 +121,33 @@ impl Drop for ModerationWorkflowRelease {
             Err(_) => {
                 log::error!("moderation_workflows mutex poisoned");
             }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ModerationUiState {
+    OpenFriendPanel,
+    OpenSearchPanel,
+    EnterUid,
+    WaitSearchResult,
+    ClickAction,
+    ConfirmAction,
+    WaitActionApplied,
+    Done,
+}
+
+impl ModerationUiState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::OpenFriendPanel => "打开好友界面",
+            Self::OpenSearchPanel => "打开 UID 搜索",
+            Self::EnterUid => "输入 UID",
+            Self::WaitSearchResult => "等待搜索结果",
+            Self::ClickAction => "点击执行动作",
+            Self::ConfirmAction => "确认动作",
+            Self::WaitActionApplied => "等待动作完成",
+            Self::Done => "完成",
         }
     }
 }
@@ -428,36 +454,25 @@ impl AutomationApp {
             .poll_ms
             .unwrap_or(self.config.custom_workflows.default_poll_ms)
             .max(50);
-        let canvas = Canvas {
-            width: self.config.screen.expected_width,
-            height: self.config.screen.expected_height,
-            resize: true,
-        };
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-        while self.running.load(AtomicOrdering::SeqCst) && Instant::now() <= deadline {
-            let frame = load_frame(&FrameArgs { image: None }, &canvas, &self.config.window)?;
-            if let Some(hit) =
-                best_template_hit(&frame.image, Some(region.into()), &template, threshold)?
-            {
-                log::info!(
-                    "自定义流程模板命中: workflow={} template={} score={:.3} x={} y={}",
-                    context.workflow,
-                    template_name,
-                    hit.score,
-                    hit.x,
-                    hit.y
-                );
-                if click {
-                    let center = hit.center();
-                    let offset = step.click_offset.unwrap_or(PointConfig::new(0, 0));
-                    click_game_point(
-                        PointConfig::new(center.x + offset.x, center.y + offset.y),
-                        &self.config.window,
-                    )?;
-                }
-                return Ok(());
+        let locator = self.ui_locator(poll_ms);
+        let region = locator.region(region.into());
+        if let Some(hit) = region.wait_template_while(&template, threshold, timeout_ms, || {
+            self.running.load(AtomicOrdering::SeqCst)
+        })? {
+            log::info!(
+                "自定义流程模板命中: workflow={} template={} score={:.3} x={} y={}",
+                context.workflow,
+                template_name,
+                hit.score,
+                hit.x,
+                hit.y
+            );
+            if click {
+                let center = hit.center();
+                let offset = step.click_offset.unwrap_or(PointConfig::new(0, 0));
+                locator.click_point(Point::new(center.x + offset.x, center.y + offset.y))?;
             }
-            sleep(Duration::from_millis(poll_ms));
+            return Ok(());
         }
         Err(anyhow!(
             "custom workflow template not found: workflow={} template={}",
@@ -487,19 +502,14 @@ impl AutomationApp {
             .poll_ms
             .unwrap_or(self.config.custom_workflows.default_poll_ms)
             .max(50);
-        let canvas = Canvas {
-            width: self.config.screen.expected_width,
-            height: self.config.screen.expected_height,
-            resize: true,
-        };
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-        while self.running.load(AtomicOrdering::SeqCst) && Instant::now() <= deadline {
-            let frame = load_frame(&FrameArgs { image: None }, &canvas, &self.config.window)?;
-            if best_template_hit(&frame.image, Some(region.into()), &template, threshold)?.is_none()
-            {
-                return Ok(());
-            }
-            sleep(Duration::from_millis(poll_ms));
+        let locator = self.ui_locator(poll_ms);
+        if locator.region(region.into()).wait_template_absent_while(
+            &template,
+            threshold,
+            timeout_ms,
+            || self.running.load(AtomicOrdering::SeqCst),
+        )? {
+            return Ok(());
         }
         Err(anyhow!(
             "custom workflow template still visible: workflow={} template={}",
@@ -528,18 +538,16 @@ impl AutomationApp {
             .poll_ms
             .unwrap_or(self.config.custom_workflows.default_poll_ms)
             .max(50);
-        let canvas = Canvas {
-            width: self.config.screen.expected_width,
-            height: self.config.screen.expected_height,
-            resize: true,
-        };
+        let locator = self.ui_locator(poll_ms);
+        let region = locator.region(region.into());
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
         while self.running.load(AtomicOrdering::SeqCst) && Instant::now() <= deadline {
-            let point = {
+            let hit = {
                 let engine = self.ocr_engine()?;
-                self.find_text_point(&engine.engine, &canvas, region.into(), &expected)?
+                region.find_text(&engine.engine, &expected)?
             };
-            if let Some(point) = point {
+            if let Some(hit) = hit {
+                let point = hit.center();
                 log::info!(
                     "自定义流程文字命中: workflow={} text={} x={} y={}",
                     context.workflow,
@@ -549,10 +557,7 @@ impl AutomationApp {
                 );
                 if click {
                     let offset = step.click_offset.unwrap_or(PointConfig::new(0, 0));
-                    click_game_point(
-                        PointConfig::new(point.x + offset.x, point.y + offset.y),
-                        &self.config.window,
-                    )?;
+                    locator.click_point(Point::new(point.x + offset.x, point.y + offset.y))?;
                 }
                 return Ok(());
             }
@@ -726,22 +731,19 @@ impl AutomationApp {
             return Ok(false);
         }
         let frame_args = FrameArgs { image: None };
+        let locator = self.ui_locator_with_canvas(canvas.clone(), self.template_poll_ms());
 
-        let point = {
+        let clicked = {
             let engine = self.ocr_engine()?;
-            self.find_text_point(
-                &engine.engine,
-                &canvas,
-                self.config.invite.confirm_list_region.into(),
-                username,
-            )?
+            locator
+                .region(self.config.invite.confirm_list_region.into())
+                .click_text(&engine.engine, username)?
         };
-        let Some(point) = point else {
+        let Some(_) = clicked else {
             log::error!("邀请失败: 确认列表未找到用户 {}", username);
             self.return_to_primary_from_transient_ui("邀请失败");
             return Ok(false);
         };
-        click_game_point(PointConfig::new(point.x, point.y), &self.config.window)?;
         sleep(Duration::from_millis(self.config.timing.invite_step_ms));
 
         for (label, rect, template) in [
@@ -774,7 +776,7 @@ impl AutomationApp {
                 return Ok(false);
             };
             let center = hit.center();
-            click_game_point(PointConfig::new(center.x, center.y), &self.config.window)?;
+            locator.click_point(center)?;
             if label == "进入大厅" {
                 self.on_entered_new_hall();
             }
@@ -1097,210 +1099,157 @@ impl AutomationApp {
     }
 
     fn execute_moderation_steps_inner(&self, command: &command::ModerationCommand) -> Result<bool> {
-        let canvas = Canvas {
-            width: self.config.screen.expected_width,
-            height: self.config.screen.expected_height,
-            resize: true,
-        };
-        let frame_args = FrameArgs { image: None };
-        press_key(Key::Unicode('o'), &self.config.window)?;
-        sleep(Duration::from_millis(self.config.timing.invite_step_ms));
-        if !self.ensure_template_visible(
-            &canvas,
-            &frame_args,
-            self.config.moderation.friend_panel_region.into(),
-            &self.config.templates.friend_panel,
-            "好友界面",
-        )? {
-            return Ok(false);
-        }
-        press_key(Key::Unicode('e'), &self.config.window)?;
-        sleep(Duration::from_millis(self.config.timing.invite_step_ms));
-        press_key(Key::Unicode('e'), &self.config.window)?;
-        sleep(Duration::from_millis(self.config.timing.invite_step_ms));
-        if !self.ensure_template_visible(
-            &canvas,
-            &frame_args,
-            self.config.moderation.search_panel_region.into(),
-            &self.config.templates.friend_search_panel,
-            "搜索按钮",
-        )? {
-            return Ok(false);
-        }
-        log::info!(
-            "UID 搜索点击: input=({}, {}) button=({}, {})",
-            self.config.moderation.search_input_point.x,
-            self.config.moderation.search_input_point.y,
-            self.config.moderation.search_button_point.x,
-            self.config.moderation.search_button_point.y,
-        );
-        click_game_point(
-            self.config.moderation.search_input_point,
-            &self.config.window,
-        )?;
-        sleep(Duration::from_millis(self.config.timing.output_click_ms));
-        paste_text(&command.uid)?;
-        sleep(Duration::from_millis(self.config.timing.output_input_ms));
-        click_game_point(
-            self.config.moderation.search_button_point,
-            &self.config.window,
-        )?;
-        if !self.wait_and_click_template(
-            &canvas,
-            &frame_args,
-            self.config.moderation.more_settings_region.into(),
-            &self.config.templates.friend_more_settings,
-            "更多设置",
-            self.config.moderation.search_result_timeout_ms,
-        )? {
-            return Ok(false);
-        }
-        sleep(Duration::from_millis(self.config.timing.invite_step_ms));
-        let (region, template, label) = match command.action {
-            ModerationAction::Blacklist => (
-                self.config.moderation.blacklist_region.into(),
-                &self.config.templates.friend_blacklist,
-                "拉黑按钮",
-            ),
-            ModerationAction::BlockChat => (
-                self.config.moderation.block_chat_region.into(),
-                &self.config.templates.friend_block_chat,
-                "屏蔽聊天按钮",
-            ),
-        };
-        if !self.click_template(&canvas, &frame_args, region, template, label)? {
-            return Ok(false);
-        }
-        sleep(Duration::from_millis(self.config.timing.invite_step_ms));
-        if !self.click_template(
-            &canvas,
-            &frame_args,
-            self.config.moderation.confirm_region.into(),
-            &self.config.templates.friend_confirm,
-            "确认按钮",
-        )? {
-            return Ok(false);
-        }
-        if !self.wait_template_absent(
-            &canvas,
-            &frame_args,
-            self.config.moderation.confirm_region.into(),
-            &self.config.templates.friend_confirm,
-            "确认按钮",
-            self.config.moderation.confirm_wait_ms,
-        )? {
-            return Ok(false);
-        }
-        log::info!("{} UID{} 完成", command.action.label(), command.uid);
-        Ok(true)
-    }
+        let locator = self.ui_locator(self.template_poll_ms());
+        let mut state = ModerationUiState::OpenFriendPanel;
 
-    fn ensure_template_visible(
-        &self,
-        canvas: &Canvas,
-        frame_args: &FrameArgs,
-        rect: Rect,
-        template: &Path,
-        label: &str,
-    ) -> Result<bool> {
-        let frame = load_frame(frame_args, canvas, &self.config.window)?;
-        if best_template_hit(
-            &frame.image,
-            Some(rect),
-            template,
-            self.config.templates.marker_threshold,
-        )?
-        .is_some()
-        {
-            Ok(true)
-        } else {
-            log::error!("未找到{}模板", label);
-            Ok(false)
-        }
-    }
-
-    fn click_template(
-        &self,
-        canvas: &Canvas,
-        frame_args: &FrameArgs,
-        rect: Rect,
-        template: &Path,
-        label: &str,
-    ) -> Result<bool> {
-        let frame = load_frame(frame_args, canvas, &self.config.window)?;
-        let Some(hit) = best_template_hit(
-            &frame.image,
-            Some(rect),
-            template,
-            self.config.templates.marker_threshold,
-        )?
-        else {
-            log::error!("未找到{}模板", label);
-            return Ok(false);
-        };
-        let center = hit.center();
-        click_game_point(PointConfig::new(center.x, center.y), &self.config.window)?;
-        Ok(true)
-    }
-
-    fn wait_and_click_template(
-        &self,
-        canvas: &Canvas,
-        frame_args: &FrameArgs,
-        rect: Rect,
-        template: &Path,
-        label: &str,
-        timeout_ms: u64,
-    ) -> Result<bool> {
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
         loop {
-            let frame = load_frame(frame_args, canvas, &self.config.window)?;
-            if let Some(hit) = best_template_hit(
-                &frame.image,
-                Some(rect),
-                template,
-                self.config.templates.marker_threshold,
-            )? {
-                let center = hit.center();
-                click_game_point(PointConfig::new(center.x, center.y), &self.config.window)?;
-                return Ok(true);
-            }
-            if Instant::now() >= deadline {
-                log::error!("等待{}模板超时", label);
-                return Ok(false);
-            }
-            sleep(Duration::from_millis(self.template_poll_ms()));
+            log::debug!(
+                "{} UID{} UI 状态: {}",
+                command.action.label(),
+                command.uid,
+                state.label()
+            );
+
+            state = match state {
+                ModerationUiState::OpenFriendPanel => {
+                    press_key(Key::Unicode('o'), &self.config.window)?;
+                    sleep(Duration::from_millis(self.config.timing.invite_step_ms));
+                    if locator
+                        .region(self.config.moderation.friend_panel_region.into())
+                        .find_template(&self.config.templates.friend_panel)?
+                        .is_none()
+                    {
+                        log::error!("未找到好友界面模板");
+                        return Ok(false);
+                    }
+                    ModerationUiState::OpenSearchPanel
+                }
+                ModerationUiState::OpenSearchPanel => {
+                    press_key(Key::Unicode('e'), &self.config.window)?;
+                    sleep(Duration::from_millis(self.config.timing.invite_step_ms));
+                    press_key(Key::Unicode('e'), &self.config.window)?;
+                    sleep(Duration::from_millis(self.config.timing.invite_step_ms));
+                    if locator
+                        .region(self.config.moderation.search_panel_region.into())
+                        .find_template(&self.config.templates.friend_search_panel)?
+                        .is_none()
+                    {
+                        log::error!("未找到搜索按钮模板");
+                        return Ok(false);
+                    }
+                    ModerationUiState::EnterUid
+                }
+                ModerationUiState::EnterUid => {
+                    log::info!(
+                        "UID 搜索点击: input=({}, {}) button=({}, {})",
+                        self.config.moderation.search_input_point.x,
+                        self.config.moderation.search_input_point.y,
+                        self.config.moderation.search_button_point.x,
+                        self.config.moderation.search_button_point.y,
+                    );
+                    locator.click_point(Point::new(
+                        self.config.moderation.search_input_point.x,
+                        self.config.moderation.search_input_point.y,
+                    ))?;
+                    sleep(Duration::from_millis(self.config.timing.output_click_ms));
+                    paste_text(&command.uid)?;
+                    sleep(Duration::from_millis(self.config.timing.output_input_ms));
+                    locator.click_point(Point::new(
+                        self.config.moderation.search_button_point.x,
+                        self.config.moderation.search_button_point.y,
+                    ))?;
+                    ModerationUiState::WaitSearchResult
+                }
+                ModerationUiState::WaitSearchResult => {
+                    let Some(hit) = locator
+                        .region(self.config.moderation.more_settings_region.into())
+                        .wait_template_while(
+                            &self.config.templates.friend_more_settings,
+                            self.config.templates.marker_threshold,
+                            self.config.moderation.search_result_timeout_ms,
+                            || self.running.load(AtomicOrdering::SeqCst),
+                        )?
+                    else {
+                        log::error!("等待更多设置模板超时");
+                        return Ok(false);
+                    };
+                    locator.click_point(hit.center())?;
+                    sleep(Duration::from_millis(self.config.timing.invite_step_ms));
+                    ModerationUiState::ClickAction
+                }
+                ModerationUiState::ClickAction => {
+                    let (region, template, label) = match command.action {
+                        ModerationAction::Blacklist => (
+                            self.config.moderation.blacklist_region.into(),
+                            &self.config.templates.friend_blacklist,
+                            "拉黑按钮",
+                        ),
+                        ModerationAction::BlockChat => (
+                            self.config.moderation.block_chat_region.into(),
+                            &self.config.templates.friend_block_chat,
+                            "屏蔽聊天按钮",
+                        ),
+                    };
+                    if locator.region(region).click_template(template)?.is_none() {
+                        log::error!("未找到{}模板", label);
+                        return Ok(false);
+                    }
+                    sleep(Duration::from_millis(self.config.timing.invite_step_ms));
+                    ModerationUiState::ConfirmAction
+                }
+                ModerationUiState::ConfirmAction => {
+                    if locator
+                        .region(self.config.moderation.confirm_region.into())
+                        .click_template(&self.config.templates.friend_confirm)?
+                        .is_none()
+                    {
+                        log::error!("未找到确认按钮模板");
+                        return Ok(false);
+                    }
+                    ModerationUiState::WaitActionApplied
+                }
+                ModerationUiState::WaitActionApplied => {
+                    if !locator
+                        .region(self.config.moderation.confirm_region.into())
+                        .wait_template_absent_while(
+                            &self.config.templates.friend_confirm,
+                            self.config.templates.marker_threshold,
+                            self.config.moderation.confirm_wait_ms,
+                            || self.running.load(AtomicOrdering::SeqCst),
+                        )?
+                    {
+                        log::error!("等待确认按钮模板消失超时");
+                        return Ok(false);
+                    }
+                    ModerationUiState::Done
+                }
+                ModerationUiState::Done => {
+                    log::info!("{} UID{} 完成", command.action.label(), command.uid);
+                    return Ok(true);
+                }
+            };
         }
     }
 
-    fn wait_template_absent(
-        &self,
-        canvas: &Canvas,
-        frame_args: &FrameArgs,
-        rect: Rect,
-        template: &Path,
-        label: &str,
-        timeout_ms: u64,
-    ) -> Result<bool> {
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-        loop {
-            let frame = load_frame(frame_args, canvas, &self.config.window)?;
-            if best_template_hit(
-                &frame.image,
-                Some(rect),
-                template,
-                self.config.templates.marker_threshold,
-            )?
-            .is_none()
-            {
-                return Ok(true);
-            }
-            if Instant::now() >= deadline {
-                log::error!("等待{}模板消失超时", label);
-                return Ok(false);
-            }
-            sleep(Duration::from_millis(self.template_poll_ms()));
-        }
+    fn ui_locator(&self, poll_ms: u64) -> UiLocator {
+        self.ui_locator_with_canvas(
+            Canvas {
+                width: self.config.screen.expected_width,
+                height: self.config.screen.expected_height,
+                resize: true,
+            },
+            poll_ms,
+        )
+    }
+
+    fn ui_locator_with_canvas(&self, canvas: Canvas, poll_ms: u64) -> UiLocator {
+        UiLocator::new(
+            canvas,
+            FrameArgs { image: None },
+            self.config.window.clone(),
+            self.config.templates.marker_threshold,
+            poll_ms,
+        )
     }
 
     fn template_poll_ms(&self) -> u64 {
@@ -1339,57 +1288,21 @@ impl AutomationApp {
         sleep(Duration::from_millis(
             self.config.timing.invite_open_chat_ms,
         ));
+        let locator = self.ui_locator_with_canvas(canvas.clone(), self.template_poll_ms());
 
-        let point = {
+        let clicked = {
             let engine = self.ocr_engine()?;
-            self.find_text_point(
-                &engine.engine,
-                canvas,
-                self.config.invite.friend_list_region.into(),
-                username,
-            )?
+            locator
+                .region(self.config.invite.friend_list_region.into())
+                .click_text(&engine.engine, username)?
         };
-        let Some(point) = point else {
+        let Some(_) = clicked else {
             log::error!("好友聊天失败: 好友列表未找到用户 {}", username);
             self.return_to_primary_from_transient_ui("好友聊天失败");
             return Ok(false);
         };
-        click_game_point(PointConfig::new(point.x, point.y), &self.config.window)?;
         sleep(Duration::from_millis(self.config.timing.invite_step_ms));
         Ok(true)
-    }
-
-    fn find_text_point(
-        &self,
-        engine: &OcrEngine,
-        canvas: &Canvas,
-        rect: Rect,
-        expected: &str,
-    ) -> Result<Option<Point>> {
-        let frame = load_frame(&FrameArgs { image: None }, canvas, &self.config.window)?;
-        let crop = crop_canvas(&frame.image, rect)?;
-        let target = command::normalize_lock_text(expected);
-        if target.is_empty() {
-            return Ok(None);
-        }
-        let mut fallback = None;
-        for line in recognize_lines(engine, &crop)? {
-            let norm = command::normalize_lock_text(&line.text);
-            if norm.is_empty() {
-                continue;
-            }
-            let point = Point::new(
-                rect.x + line.bbox.x + line.bbox.width as i32 / 2,
-                rect.y + line.bbox.y + line.bbox.height as i32 / 2,
-            );
-            if norm == target {
-                return Ok(Some(point));
-            }
-            if fallback.is_none() && (norm.contains(&target) || target.contains(&norm)) {
-                fallback = Some(point);
-            }
-        }
-        Ok(fallback)
     }
 }
 

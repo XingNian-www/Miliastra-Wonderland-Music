@@ -33,6 +33,7 @@ mod app {
     mod song_matcher;
     mod template_match;
     mod tui;
+    mod ui_locator;
     mod ui_state;
     mod window;
 

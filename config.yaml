@@ -252,22 +252,22 @@ moderation:
   search_result_timeout_ms: 5000
   # 更多设置按钮模板搜索区域
   more_settings_region:
-    x: 410
-    y: 190
-    width: 45
-    height: 35
+    x: 1140
+    y: 180
+    width: 80
+    height: 70
   # 屏蔽聊天按钮模板搜索区域
   block_chat_region:
-    x: 440
-    y: 190
-    width: 460
-    height: 120
+    x: 1240
+    y: 130
+    width: 440
+    height: 505
   # 拉黑按钮模板搜索区域
   blacklist_region:
-    x: 440
-    y: 190
-    width: 460
-    height: 120
+    x: 1240
+    y: 130
+    width: 440
+    height: 505
   # 拉黑/屏蔽弹窗确认按钮模板搜索区域
   confirm_region:
     x: 900

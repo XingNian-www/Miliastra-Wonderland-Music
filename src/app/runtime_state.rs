@@ -16,6 +16,7 @@ pub struct RuntimeState {
     pub last_requested_keyword: String,
     pub last_requested_source: String,
     pub last_requested_prefer_accompaniment: bool,
+    pub last_requested_updated_at_ms: u64,
     pub paused_by_command: bool,
     pub paused_for_pending_playback: bool,
     pub hall_remaining_minutes: Option<u32>,

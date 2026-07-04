@@ -1599,10 +1599,40 @@ mod app {
         }
 
         fn maybe_advance_queue(&mut self, snapshot: &PlaybackSnapshot) -> Result<bool> {
-            let status = estimated_player_status(snapshot);
+            let mut status = estimated_player_status(snapshot);
+            let runtime_snapshot = self.runtime_state()?.state().clone();
+            let requested_guard_active = runtime_snapshot.current_song_is_requested
+                && self.requested_song_auto_advance_guard_active(&runtime_snapshot);
+
+            if runtime_snapshot.current_song_is_requested
+                && !self.status_matches_requested_song(&runtime_snapshot, &status)
+            {
+                match self.feeluown.status() {
+                    Ok(fresh_status) => {
+                        log::info!(
+                            "点歌状态与播放监控快照不一致，已刷新播放状态: snapshot_uri={} fresh_uri={} requested_uri={}",
+                            status.current_uri,
+                            fresh_status.current_uri,
+                            runtime_snapshot.last_requested_uri,
+                        );
+                        status = fresh_status;
+                    }
+                    Err(error) => {
+                        log::error!("刷新点歌播放状态失败，暂不自动出队: {error:#}");
+                        return Ok(false);
+                    }
+                }
+            }
+
+            if runtime_snapshot.current_song_is_requested
+                && requested_guard_active
+                && !self.status_matches_requested_song(&runtime_snapshot, &status)
+            {
+                log::info!("点歌刚切换，忽略可能过期的播放状态");
+                return Ok(false);
+            }
 
             let current_song = format!("{}{}", status.name, status.singer);
-            let runtime_snapshot = self.runtime_state()?.state().clone();
             let current_uri = status.current_uri.trim();
             let requested_uri = runtime_snapshot.last_requested_uri.trim();
             let requested_track_changed = if !current_uri.is_empty() && !requested_uri.is_empty() {
@@ -1625,8 +1655,14 @@ mod app {
                 runtime_state
                     .state_mut()
                     .last_requested_prefer_accompaniment = false;
+                runtime_state.state_mut().last_requested_updated_at_ms = 0;
                 runtime_state.save()?;
                 log::info!("检测到歌曲已切换，取消点歌标记");
+            }
+
+            if runtime_snapshot.current_song_is_requested && requested_guard_active {
+                log::debug!("点歌刚开始，暂不触发队列自动出队");
+                return Ok(false);
             }
 
             let queue_empty = self.queue()?.is_empty();
@@ -2127,6 +2163,20 @@ mod app {
             Ok(self.status_matches_requested_song(&runtime_snapshot, status))
         }
 
+        fn requested_song_auto_advance_guard_active(&self, state: &RuntimeState) -> bool {
+            if state.last_requested_updated_at_ms == 0 {
+                return false;
+            }
+            let guard_ms = self
+                .config
+                .timing
+                .playback_monitor_status_ms
+                .max(self.config.timing.play_status_poll_ms)
+                .saturating_mul(3)
+                .max(3000);
+            current_unix_millis() < state.last_requested_updated_at_ms.saturating_add(guard_ms)
+        }
+
         fn status_matches_requested_song(
             &self,
             runtime_state: &RuntimeState,
@@ -2180,18 +2230,32 @@ mod app {
             Ok(Some(len))
         }
 
-        fn should_queue_until_current_song_finished(&self, status: &PlayerStatus) -> bool {
+        fn should_queue_until_current_song_finished(&self, status: &PlayerStatus) -> Result<bool> {
             if !self.config.queue.protect_current_song_until_finished {
-                return false;
+                return Ok(false);
             }
             if status.status == "playing" {
-                return true;
+                return Ok(true);
             }
-            status.status == "paused"
+            if status.status == "paused"
                 && (playback_remaining_seconds(status).is_some()
                     || !status.current_uri.trim().is_empty()
                     || !status.name.trim().is_empty()
                     || !status.singer.trim().is_empty())
+            {
+                return Ok(true);
+            }
+
+            let runtime_snapshot = self.runtime_state()?.state().clone();
+            if !runtime_snapshot.current_song_is_requested {
+                return Ok(false);
+            }
+            if self.status_matches_requested_song(&runtime_snapshot, status)
+                || self.requested_song_auto_advance_guard_active(&runtime_snapshot)
+            {
+                return Ok(true);
+            }
+            Ok(status.status != "stopped" && status.status != "stoped")
         }
 
         fn execute_command(&mut self, parsed: &ParsedCommand) -> Result<()> {
@@ -2260,7 +2324,7 @@ mod app {
                                     return Ok(());
                                 }
                             }
-                            if self.should_queue_until_current_song_finished(&status) {
+                            if self.should_queue_until_current_song_finished(&status)? {
                                 let added_len = self.push_queue_request(&request)?;
                                 if let Some(len) = added_len {
                                     self.log_executed_command(
@@ -2312,7 +2376,7 @@ mod app {
                             return Ok(());
                         }
                         Ok(status) => {
-                            if self.should_queue_until_current_song_finished(&status) {
+                            if self.should_queue_until_current_song_finished(&status)? {
                                 let added_len = self.push_queue_request(&request)?;
                                 if let Some(len) = added_len {
                                     self.log_executed_command(
@@ -3275,6 +3339,7 @@ mod app {
             runtime_state
                 .state_mut()
                 .last_requested_prefer_accompaniment = false;
+            runtime_state.state_mut().last_requested_updated_at_ms = 0;
             runtime_state.save()
         }
 
@@ -3300,6 +3365,7 @@ mod app {
             runtime_state
                 .state_mut()
                 .last_requested_prefer_accompaniment = prefer_accompaniment;
+            runtime_state.state_mut().last_requested_updated_at_ms = current_unix_millis();
             runtime_state.state_mut().paused_by_command = false;
             runtime_state.state_mut().paused_for_pending_playback = false;
             runtime_state.save()
@@ -3609,6 +3675,13 @@ mod app {
         let minute = second_of_day % 3600 / 60;
         let second = second_of_day % 60;
         format!("{year:04}-{month:02}-{day:02}-{hour:02}:{minute:02}:{second:02}")
+    }
+
+    fn current_unix_millis() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+            .unwrap_or(0)
     }
 
     fn civil_from_days(days: i64) -> (i64, u32, u32) {

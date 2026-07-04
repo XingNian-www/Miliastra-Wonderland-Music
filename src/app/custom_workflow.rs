@@ -1491,7 +1491,7 @@ fn find_command_workflow<'a>(
             if command.is_empty() {
                 continue;
             }
-            let Some(rest) = command_text.strip_prefix(command) else {
+            let Some(rest) = command::strip_ascii_case_prefix(command_text, command) else {
                 continue;
             };
             if !command_boundary(rest.chars().next()) && !workflow.allow_args {
@@ -1661,6 +1661,18 @@ mod tests {
 
         let parsed = parse_text(&config, "用户：@测试流程", "blue").expect("parse custom");
         assert_eq!(parsed.matched, "测试流程");
+        assert!(matches!(parsed.command, UserCommand::CustomWorkflow(_)));
+    }
+
+    #[test]
+    fn parses_custom_workflow_command_case_insensitive() {
+        let mut workflow = test_workflow(false);
+        workflow.commands = vec!["TestFlow".to_string()];
+        let config = test_config(workflow);
+
+        let parsed =
+            parse_text(&config, "用户：@testflow", "blue").expect("parse custom case insensitive");
+        assert_eq!(parsed.matched, "TestFlow");
         assert!(matches!(parsed.command, UserCommand::CustomWorkflow(_)));
     }
 

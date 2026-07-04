@@ -438,7 +438,7 @@ http://127.0.0.1:18888
 | `logging` | 日志目录和日志等级 |
 | `tui` | 终端 TUI 开关和刷新参数 |
 | `state` | 运行状态、队列和已执行命令记录路径 |
-| `queue` | 队列长度、自动出队和自动播放保护 |
+| `queue` | 队列长度、自动出队和当前歌曲保护 |
 | `ai` | AI 供应商、API Key、模型和 OpenAI-compatible 地址 |
 | `matching` | 歌名、歌手和 OCR 噪声匹配阈值 |
 | `hotkeys` | 全局热键开关和按键 |
@@ -455,6 +455,7 @@ queue:
   max_size: 5
   auto_advance_seconds: 1
   protect_auto_played_songs: true
+  protect_current_song_until_finished: true
 
 http:
   host: 127.0.0.1
@@ -465,6 +466,8 @@ hotkeys:
   pause_key: F7
   exit_key: F12
 ```
+
+`protect_current_song_until_finished` 只限制新点歌打断当前歌曲；队列自动出队仍由 `auto_advance_seconds` 控制，`@下一首` 仍会立即消费队列
 
 游戏内回复会限制显示宽度为 80，约等于 40 个全角中文字符或 80 个半角字符
 

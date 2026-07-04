@@ -147,12 +147,13 @@ pub fn parse_text(text: &str, message_type: &str) -> Option<ParsedCommand> {
     let command_text = raw_command_text.strip_prefix('@')?.trim_start();
     let matched = COMMANDS
         .iter()
-        .find(|command| command_text.starts_with(**command))?;
-    if matched.len() < command_text.len() && command_text[matched.len()..].starts_with('/') {
+        .find(|command| strip_ascii_case_prefix(command_text, command).is_some())?;
+    let after_command = strip_ascii_case_prefix(command_text, matched)?;
+    if !after_command.is_empty() && after_command.starts_with('/') {
         return None;
     }
 
-    let after_match = command_text[matched.len()..]
+    let after_match = after_command
         .trim_start_matches(['：', ':', ' ', '\t'])
         .trim_end_matches([']', '】'])
         .trim();
@@ -199,7 +200,7 @@ fn parse_pink_text(text: &str) -> Option<ParsedCommand> {
             command: UserCommand::Song(song),
         });
     }
-    if let Some(rest) = command_text.strip_prefix("邀请") {
+    if let Some(rest) = strip_ascii_case_prefix(command_text, "邀请") {
         let rest = rest.trim_start();
         let digits = rest
             .chars()
@@ -224,7 +225,7 @@ fn parse_pink_text(text: &str) -> Option<ParsedCommand> {
     if let Some(command) = parse_moderation_command(command_text, &username, &user_command) {
         return Some(command);
     }
-    if let Some(rest) = command_text.strip_prefix("麦克风") {
+    if let Some(rest) = strip_ascii_case_prefix(command_text, "麦克风") {
         let rest = rest.trim_start_matches(['：', ':', ' ', '\t']);
         if rest.is_empty() || rest.starts_with([']', '】']) {
             return Some(ParsedCommand {
@@ -238,7 +239,7 @@ fn parse_pink_text(text: &str) -> Option<ParsedCommand> {
         }
         return None;
     }
-    if let Some(rest) = command_text.strip_prefix("禁用") {
+    if let Some(rest) = strip_ascii_case_prefix(command_text, "禁用") {
         if rest.is_empty() || rest.starts_with([']', '】']) {
             return Some(ParsedCommand {
                 matched: "禁用".to_string(),
@@ -251,7 +252,7 @@ fn parse_pink_text(text: &str) -> Option<ParsedCommand> {
         }
         return None;
     }
-    if let Some(rest) = command_text.strip_prefix("启用") {
+    if let Some(rest) = strip_ascii_case_prefix(command_text, "启用") {
         if rest.is_empty() || rest.starts_with([']', '】']) {
             return Some(ParsedCommand {
                 matched: "启用".to_string(),
@@ -264,7 +265,7 @@ fn parse_pink_text(text: &str) -> Option<ParsedCommand> {
         }
         return None;
     }
-    if let Some(rest) = command_text.strip_prefix("闲置退出") {
+    if let Some(rest) = strip_ascii_case_prefix(command_text, "闲置退出") {
         let rest = rest.trim_start_matches(['：', ':', ' ', '\t']);
         if rest.is_empty() || rest.starts_with([']', '】']) {
             return Some(ParsedCommand {
@@ -505,7 +506,7 @@ fn parse_moderation_command(
         ("拉黑", ModerationAction::Blacklist),
         ("屏蔽", ModerationAction::BlockChat),
     ] {
-        let Some(rest) = command_text.strip_prefix(prefix) else {
+        let Some(rest) = strip_ascii_case_prefix(command_text, prefix) else {
             continue;
         };
         let digits = rest
@@ -576,9 +577,18 @@ pub fn normalize_lock_text(text: &str) -> String {
         .collect()
 }
 
+pub(super) fn strip_ascii_case_prefix<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = text.get(..prefix.len())?;
+    if head.eq_ignore_ascii_case(prefix) {
+        Some(&text[prefix.len()..])
+    } else {
+        None
+    }
+}
+
 pub fn parse_song_command(command: &str) -> Option<SongCommand> {
     for (prefix, source, ai_assisted) in SONG_COMMANDS {
-        if command.starts_with(prefix) {
+        if strip_ascii_case_prefix(command, prefix).is_some() {
             return parse_song_command_with_source(command, prefix, *source, *ai_assisted);
         }
     }
@@ -587,7 +597,7 @@ pub fn parse_song_command(command: &str) -> Option<SongCommand> {
 
 fn parse_pink_song_command(command: &str, username: &str) -> Option<SongCommand> {
     for (prefix, source, ai_assisted) in PINK_SONG_COMMANDS {
-        if command.starts_with(prefix) {
+        if strip_ascii_case_prefix(command, prefix).is_some() {
             let mut song = parse_song_command_with_source(command, prefix, *source, *ai_assisted)?;
             song.friend_username = username.to_string();
             return Some(song);
@@ -897,6 +907,20 @@ mod tests {
     }
 
     #[test]
+    fn parses_pink_blacklist_uid_command_case_insensitive() {
+        let parsed = parse_text("[Alice]：@拉黑uid123456789", "pink")
+            .expect("parse blacklist uid case insensitive");
+        assert_eq!(
+            parsed.command,
+            UserCommand::Moderation(ModerationCommand {
+                action: ModerationAction::Blacklist,
+                uid: "123456789".to_string(),
+                requester: "Alice".to_string(),
+            })
+        );
+    }
+
+    #[test]
     fn parses_pink_block_chat_uid_command() {
         let parsed = parse_text("[Alice]：@屏蔽UID123456789", "pink").expect("parse block uid");
         assert_eq!(
@@ -961,6 +985,24 @@ mod tests {
     }
 
     #[test]
+    fn parses_ai_song_command_case_insensitive() {
+        let parsed = parse_text("用户：@ai点歌 晴天 周杰伦", "blue")
+            .expect("parse ai song case insensitive");
+        assert_eq!(parsed.user_command, "@ai点歌 晴天 周杰伦");
+        assert_eq!(
+            parsed.command,
+            UserCommand::Song(SongCommand {
+                keyword: "晴天 周杰伦".to_string(),
+                source: SongSource::QqMusic,
+                prefix: "AI点歌".to_string(),
+                prefer_accompaniment: false,
+                ai_assisted: true,
+                friend_username: String::new(),
+            })
+        );
+    }
+
+    #[test]
     fn rejects_yellow_hall_command() {
         assert!(parse_text("用户：@帮助", "yellow").is_none());
     }
@@ -1004,6 +1046,23 @@ mod tests {
         assert_eq!(parsed.username, "Alice");
         assert_eq!(parsed.message_type, "pink");
         assert_eq!(parsed.user_command, "@B站点歌 晴天 周杰伦");
+    }
+
+    #[test]
+    fn parses_pink_bilibili_song_command_case_insensitive() {
+        let parsed = parse_text("[Alice]：@b站点歌 晴天 周杰伦", "pink")
+            .expect("parse friend bilibili song case insensitive");
+        assert_eq!(
+            parsed.command,
+            UserCommand::Song(SongCommand {
+                keyword: "晴天 周杰伦".to_string(),
+                source: SongSource::Bilibili,
+                prefix: "B站点歌".to_string(),
+                prefer_accompaniment: false,
+                ai_assisted: false,
+                friend_username: "Alice".to_string(),
+            })
+        );
     }
 
     #[test]

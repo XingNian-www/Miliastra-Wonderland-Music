@@ -2180,6 +2180,20 @@ mod app {
             Ok(Some(len))
         }
 
+        fn should_queue_until_current_song_finished(&self, status: &PlayerStatus) -> bool {
+            if !self.config.queue.protect_current_song_until_finished {
+                return false;
+            }
+            if status.status == "playing" {
+                return true;
+            }
+            status.status == "paused"
+                && (playback_remaining_seconds(status).is_some()
+                    || !status.current_uri.trim().is_empty()
+                    || !status.name.trim().is_empty()
+                    || !status.singer.trim().is_empty())
+        }
+
         fn execute_command(&mut self, parsed: &ParsedCommand) -> Result<()> {
             match &parsed.command {
                 UserCommand::Song(song) => {
@@ -2246,6 +2260,26 @@ mod app {
                                     return Ok(());
                                 }
                             }
+                            if self.should_queue_until_current_song_finished(&status) {
+                                let added_len = self.push_queue_request(&request)?;
+                                if let Some(len) = added_len {
+                                    self.log_executed_command(
+                                        parsed,
+                                        &final_song_command_text(&request, "queue"),
+                                    )?;
+                                    self.reply(&format!(
+                                        "队列已加入({}/{}): {}",
+                                        len, self.config.queue.max_size, request.keyword
+                                    ))?;
+                                } else {
+                                    self.log_executed_command(
+                                        parsed,
+                                        &final_song_command_text(&request, "queue-full"),
+                                    )?;
+                                    self.reply("队列已满，请稍后再试")?;
+                                }
+                                return Ok(());
+                            }
                             if !self.current_status_matches_requested_song(&status)? {
                                 let mut runtime_state = self.runtime_state()?;
                                 runtime_state.state_mut().paused_by_command = false;
@@ -2277,7 +2311,27 @@ mod app {
                             }
                             return Ok(());
                         }
-                        Ok(_) => {
+                        Ok(status) => {
+                            if self.should_queue_until_current_song_finished(&status) {
+                                let added_len = self.push_queue_request(&request)?;
+                                if let Some(len) = added_len {
+                                    self.log_executed_command(
+                                        parsed,
+                                        &final_song_command_text(&request, "queue"),
+                                    )?;
+                                    self.reply(&format!(
+                                        "队列已加入({}/{}): {}",
+                                        len, self.config.queue.max_size, request.keyword
+                                    ))?;
+                                } else {
+                                    self.log_executed_command(
+                                        parsed,
+                                        &final_song_command_text(&request, "queue-full"),
+                                    )?;
+                                    self.reply("队列已满，请稍后再试")?;
+                                }
+                                return Ok(());
+                            }
                             let mut runtime_state = self.runtime_state()?;
                             runtime_state.state_mut().paused_by_command = false;
                             runtime_state.save()?;
@@ -3617,23 +3671,19 @@ mod app {
             raw
         }
         .trim_start_matches(['：', ':', ' ', '\t', ']', '】']);
-        if command_text
-            .strip_prefix("@确认")
+        if command::strip_ascii_case_prefix(command_text, "@确认")
             .is_some_and(|rest| decision_boundary(rest.chars().next()))
         {
             Some(UserDecision::Confirm)
-        } else if command_text
-            .strip_prefix("@跳过")
+        } else if command::strip_ascii_case_prefix(command_text, "@跳过")
             .is_some_and(|rest| decision_boundary(rest.chars().next()))
         {
             Some(UserDecision::Skip)
-        } else if command_text
-            .strip_prefix("@换源")
+        } else if command::strip_ascii_case_prefix(command_text, "@换源")
             .is_some_and(|rest| decision_boundary(rest.chars().next()))
         {
             Some(UserDecision::SwitchSource)
-        } else if command_text
-            .strip_prefix("@AI")
+        } else if command::strip_ascii_case_prefix(command_text, "@AI")
             .is_some_and(|rest| decision_boundary(rest.chars().next()))
         {
             Some(UserDecision::Ai)
@@ -3693,6 +3743,16 @@ mod app {
     fn print_json<T: Serialize>(value: &T) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(value)?);
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn parses_ai_decision_case_insensitive() {
+            assert_eq!(parse_decision_command("用户：@ai"), Some(UserDecision::Ai));
+        }
     }
 }
 

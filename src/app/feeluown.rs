@@ -23,6 +23,7 @@ pub struct FeelUOwnClient {
 #[serde(default, rename_all = "camelCase")]
 pub struct PlayerStatus {
     pub status: String,
+    pub current_uri: String,
     pub name: String,
     pub singer: String,
     pub album_name: String,
@@ -588,6 +589,11 @@ print('OK')"#,
 const STATUS_SCRIPT: &str = r#"
 import json, math
 
+try:
+    from feeluown.library import reverse
+except Exception:
+    reverse = None
+
 VOLUME_CURVE_POWER = 0.5
 
 player = app.player
@@ -613,6 +619,14 @@ def attr(obj, name, default=''):
         return getattr(obj, name, default) if obj is not None else default
     except Exception:
         return default
+
+def model_uri(model):
+    if model is None or reverse is None:
+        return ''
+    try:
+        return reverse(model)
+    except Exception:
+        return ''
 
 def number(value, default=0):
     try:
@@ -640,6 +654,7 @@ if not duration and song is not None:
 
 payload = {
     'status': state,
+    'currentUri': text(model_uri(song) or meta_get('uri', '')),
     'name': text(attr(song, 'title', '') or meta_get('title', '')),
     'singer': text(attr(song, 'artists_name', '') or meta_get('artists', '') or meta_get('artist', '')),
     'albumName': text(attr(song, 'album_name', '') or meta_get('album', '')),

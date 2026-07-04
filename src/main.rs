@@ -1603,14 +1603,22 @@ mod app {
 
             let current_song = format!("{}{}", status.name, status.singer);
             let runtime_snapshot = self.runtime_state()?.state().clone();
+            let current_uri = status.current_uri.trim();
+            let requested_uri = runtime_snapshot.last_requested_uri.trim();
+            let requested_track_changed = if !current_uri.is_empty() && !requested_uri.is_empty() {
+                current_uri != requested_uri
+            } else {
+                !current_song.is_empty()
+                    && !runtime_snapshot.last_requested_song.is_empty()
+                    && current_song != runtime_snapshot.last_requested_song
+            };
             if runtime_snapshot.current_song_is_requested
-                && !current_song.is_empty()
-                && !runtime_snapshot.last_requested_song.is_empty()
-                && current_song != runtime_snapshot.last_requested_song
+                && requested_track_changed
                 && !self.status_matches_requested_song(&runtime_snapshot, &status)
             {
                 let mut runtime_state = self.runtime_state()?;
                 runtime_state.state_mut().current_song_is_requested = false;
+                runtime_state.state_mut().last_requested_uri.clear();
                 runtime_state.state_mut().last_requested_song.clear();
                 runtime_state.state_mut().last_requested_keyword.clear();
                 runtime_state.state_mut().last_requested_source.clear();
@@ -2127,6 +2135,11 @@ mod app {
             if !runtime_state.current_song_is_requested {
                 return false;
             }
+            let current_uri = status.current_uri.trim();
+            let requested_uri = runtime_state.last_requested_uri.trim();
+            if !current_uri.is_empty() && !requested_uri.is_empty() {
+                return current_uri == requested_uri;
+            }
             let current_song = format!("{}{}", status.name, status.singer);
             if !current_song.is_empty()
                 && !runtime_state.last_requested_song.is_empty()
@@ -2206,6 +2219,16 @@ mod app {
                     let status = self.feeluown.status();
                     match status {
                         Ok(status) if is_playing(&status) => {
+                            if !request.uri.trim().is_empty()
+                                && status.current_uri.trim() == request.uri.trim()
+                            {
+                                self.log_executed_command(
+                                    parsed,
+                                    &final_song_command_text(&request, "already-playing"),
+                                )?;
+                                self.reply(&format!("当前正在播放: {}", request.keyword))?;
+                                return Ok(());
+                            }
                             if !request.skip_match_check {
                                 let current_match = song_matcher::match_song_query(
                                     &self.config.matching,
@@ -2837,6 +2860,7 @@ mod app {
                 false,
                 initial_song.0,
                 initial_song.1,
+                uri,
                 skip_match_check,
             )
         }
@@ -2883,7 +2907,12 @@ mod app {
                     }
                 };
             self.reply(&result.message)?;
-            if let Some(candidate) = result.candidate {
+            let requested_uri = result
+                .candidate
+                .as_ref()
+                .map(|candidate| candidate.uri.clone())
+                .unwrap_or_default();
+            if let Some(candidate) = &result.candidate {
                 log::info!("FeelUOwn 候选: {} -> {}", candidate.text, candidate.uri);
             }
             self.confirm_playback_started(
@@ -2894,6 +2923,7 @@ mod app {
                 confirm_after_switch,
                 initial_song.0,
                 initial_song.1,
+                &requested_uri,
                 false,
             )
         }
@@ -2907,6 +2937,7 @@ mod app {
             confirm_after_switch: bool,
             initial_song: String,
             initial_progress: f64,
+            requested_uri: &str,
             skip_match_check: bool,
         ) -> Result<PlayOutcome> {
             sleep(Duration::from_millis(
@@ -2914,6 +2945,7 @@ mod app {
             ));
 
             let mut last_seen_song = initial_song;
+            let mut requested_state_recorded = false;
             for retry in 0..self.config.timing.play_status_retries {
                 let status = match self.feeluown.status() {
                     Ok(status) => status,
@@ -2926,10 +2958,11 @@ mod app {
                     }
                 };
                 log::info!(
-                    "播放状态: {}, 歌曲: {} - {}",
+                    "播放状态: {}, 歌曲: {} - {}, URI: {}",
                     status.status,
                     status.name,
-                    status.singer
+                    status.singer,
+                    status.current_uri
                 );
                 if status.status != "playing" && status.status != "paused" {
                     sleep(Duration::from_millis(
@@ -2938,8 +2971,47 @@ mod app {
                     continue;
                 }
 
+                let current_uri = status.current_uri.trim();
+                let requested_uri = requested_uri.trim();
                 let current_song = format!("{}{}", status.name, status.singer);
+                let uri_matched = !requested_uri.is_empty()
+                    && !current_uri.is_empty()
+                    && current_uri == requested_uri;
+                if uri_matched && !requested_state_recorded {
+                    self.set_requested_song_state(
+                        keyword,
+                        search_source,
+                        prefer_accompaniment,
+                        requested_uri,
+                        &status,
+                    )?;
+                    requested_state_recorded = true;
+                }
+                if !requested_uri.is_empty()
+                    && !current_uri.is_empty()
+                    && current_uri != requested_uri
+                {
+                    log::info!(
+                        "URI 与请求资源不同，继续用歌曲信息确认: current={} requested={} ({}/{})",
+                        current_uri,
+                        requested_uri,
+                        retry + 1,
+                        self.config.timing.play_status_retries
+                    );
+                }
+                if current_song.is_empty() && current_uri.is_empty() {
+                    log::info!(
+                        "播放状态缺少歌曲标识，继续等待 ({}/{})",
+                        retry + 1,
+                        self.config.timing.play_status_retries
+                    );
+                    sleep(Duration::from_millis(
+                        self.config.timing.play_status_poll_ms,
+                    ));
+                    continue;
+                }
                 if skip_match_check
+                    && !uri_matched
                     && !current_song.is_empty()
                     && current_song == last_seen_song
                     && !playback_progress_restarted(initial_progress, status.progress)
@@ -2954,7 +3026,7 @@ mod app {
                     ));
                     continue;
                 }
-                if !skip_match_check {
+                if !skip_match_check && !uri_matched {
                     let local_match = song_matcher::match_song_query(
                         &self.config.matching,
                         keyword,
@@ -3087,6 +3159,7 @@ mod app {
                     keyword,
                     search_source,
                     prefer_accompaniment,
+                    requested_uri,
                     &status,
                 )?;
                 self.reply(&play_message)?;
@@ -3141,6 +3214,7 @@ mod app {
         fn clear_requested_song_state(&mut self) -> Result<()> {
             let mut runtime_state = self.runtime_state()?;
             runtime_state.state_mut().current_song_is_requested = false;
+            runtime_state.state_mut().last_requested_uri.clear();
             runtime_state.state_mut().last_requested_song.clear();
             runtime_state.state_mut().last_requested_keyword.clear();
             runtime_state.state_mut().last_requested_source.clear();
@@ -3155,10 +3229,16 @@ mod app {
             keyword: &str,
             source: &str,
             prefer_accompaniment: bool,
+            requested_uri: &str,
             status: &PlayerStatus,
         ) -> Result<()> {
             let mut runtime_state = self.runtime_state()?;
             runtime_state.state_mut().current_song_is_requested = true;
+            runtime_state.state_mut().last_requested_uri = if status.current_uri.trim().is_empty() {
+                requested_uri.trim().to_string()
+            } else {
+                status.current_uri.trim().to_string()
+            };
             runtime_state.state_mut().last_requested_song =
                 format!("{}{}", status.name, status.singer);
             runtime_state.state_mut().last_requested_keyword = keyword.to_string();

@@ -653,6 +653,12 @@ fn apply_runtime_patch(
         state.current_song_is_requested = value;
     }
     if let Some(value) = patch
+        .get("lastRequestedUri")
+        .and_then(serde_json::Value::as_str)
+    {
+        state.last_requested_uri = value.to_string();
+    }
+    if let Some(value) = patch
         .get("lastRequestedSong")
         .and_then(serde_json::Value::as_str)
     {

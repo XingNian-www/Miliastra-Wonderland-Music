@@ -11,6 +11,7 @@ pub const HALL_EXPIRING_WARNING_MINUTES: u32 = 10;
 #[serde(default, rename_all = "camelCase")]
 pub struct RuntimeState {
     pub current_song_is_requested: bool,
+    pub last_requested_uri: String,
     pub last_requested_song: String,
     pub last_requested_keyword: String,
     pub last_requested_source: String,

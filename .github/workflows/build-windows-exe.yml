@@ -7,6 +7,12 @@ on:
         description: Release version, for example v0.1.0. Empty uses Cargo.toml version.
         required: false
         type: string
+  push:
+    branches:
+      - main
+      - dev
+    paths:
+      - Cargo.toml
 
 permissions:
   contents: write
@@ -25,23 +31,70 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      - name: Check Cargo package version change
+        id: build_gate
+        shell: pwsh
+        run: |
+          function Read-PackageVersion($text) {
+            if ($text -notmatch '(?ms)^\[package\].*?^version\s*=\s*"([^"]+)"') {
+              throw 'Cannot read package version from Cargo.toml'
+            }
+            return $Matches[1]
+          }
+
+          if ('${{ github.event_name }}' -eq 'workflow_dispatch') {
+            'should_build=true' >> $env:GITHUB_OUTPUT
+            'reason=manual dispatch' >> $env:GITHUB_OUTPUT
+            exit 0
+          }
+
+          $before = '${{ github.event.before }}'
+          if (-not $before -or $before -match '^0+$') {
+            'should_build=true' >> $env:GITHUB_OUTPUT
+            'reason=no previous commit' >> $env:GITHUB_OUTPUT
+            exit 0
+          }
+
+          git fetch --no-tags --depth=1 origin $before
+          $oldCargo = git show "$($before):Cargo.toml"
+          $oldVersion = Read-PackageVersion $oldCargo
+          $newVersion = Read-PackageVersion (Get-Content Cargo.toml -Raw)
+
+          if ($oldVersion -ne $newVersion) {
+            'should_build=true' >> $env:GITHUB_OUTPUT
+            "reason=version $oldVersion -> $newVersion" >> $env:GITHUB_OUTPUT
+          } else {
+            'should_build=false' >> $env:GITHUB_OUTPUT
+            "reason=package version unchanged ($newVersion)" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Skip build
+        if: steps.build_gate.outputs.should_build != 'true'
+        shell: pwsh
+        run: |
+          Write-Host "Skipping build: ${{ steps.build_gate.outputs.reason }}"
+
       - name: Install Rust
+        if: steps.build_gate.outputs.should_build == 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
 
       - name: Cache Cargo
+        if: steps.build_gate.outputs.should_build == 'true'
         uses: Swatinem/rust-cache@v2
         with:
           key: windows-msvc-release
 
       - name: Cache OCR models
+        if: steps.build_gate.outputs.should_build == 'true'
         uses: actions/cache@v4
         with:
           path: models
           key: pp-ocrv6-small-models-v1
 
       - name: Download PP-OCRv6 small models
+        if: steps.build_gate.outputs.should_build == 'true'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path models | Out-Null
@@ -58,13 +111,15 @@ jobs:
           }
 
       - name: Build release exe
+        if: steps.build_gate.outputs.should_build == 'true'
         run: cargo build --release --target x86_64-pc-windows-msvc --locked
 
       - name: Resolve release version
+        if: steps.build_gate.outputs.should_build == 'true'
         id: version
         shell: pwsh
         run: |
-          $inputVersion = '${{ inputs.version }}'.Trim()
+          $inputVersion = '${{ github.event.inputs.version }}'.Trim()
           if ($inputVersion) {
             $version = $inputVersion
           } else {
@@ -81,6 +136,7 @@ jobs:
           "zip=miliastra-wonderland-music-windows-x64-$version.zip" >> $env:GITHUB_OUTPUT
 
       - name: Prepare artifact
+        if: steps.build_gate.outputs.should_build == 'true'
         shell: pwsh
         run: |
           $dist = 'dist/miliastra-wonderland-music-windows-x64'
@@ -93,6 +149,7 @@ jobs:
           Copy-Item 'README.md' $dist
 
       - name: Package release zip
+        if: steps.build_gate.outputs.should_build == 'true'
         shell: pwsh
         run: |
           Compress-Archive `
@@ -101,12 +158,14 @@ jobs:
             -Force
 
       - name: Upload artifact
+        if: steps.build_gate.outputs.should_build == 'true'
         uses: actions/upload-artifact@v5
         with:
           name: miliastra-wonderland-music-windows-x64
           path: dist/miliastra-wonderland-music-windows-x64
 
       - name: Create GitHub Release
+        if: steps.build_gate.outputs.should_build == 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.version }}

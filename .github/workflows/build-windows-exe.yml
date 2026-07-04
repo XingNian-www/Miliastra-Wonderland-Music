@@ -36,7 +36,8 @@ jobs:
         shell: pwsh
         run: |
           function Read-PackageVersion($text) {
-            if ($text -notmatch '(?ms)^\[package\].*?^version\s*=\s*"([^"]+)"') {
+            $content = if ($text -is [array]) { $text -join "`n" } else { [string]$text }
+            if ($content -notmatch '(?ms)^\[package\].*?^version\s*=\s*"([^"]+)"') {
               throw 'Cannot read package version from Cargo.toml'
             }
             return $Matches[1]

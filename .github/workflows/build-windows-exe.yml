@@ -89,6 +89,7 @@ jobs:
           Copy-Item 'target/x86_64-pc-windows-msvc/release/MNN.dll' $dist
           Copy-Item 'assets' $dist -Recurse
           Copy-Item 'models' $dist -Recurse
+          Copy-Item 'config.yaml' $dist
           Copy-Item 'README.md' $dist
 
       - name: Package release zip

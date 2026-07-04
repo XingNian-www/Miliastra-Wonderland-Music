@@ -2,13 +2,12 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use super::config_migration::{self, CURRENT_CONFIG_VERSION};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default)]
 pub struct AppConfig {
     pub config_version: u32,
     pub window: WindowConfig,
@@ -31,50 +30,12 @@ pub struct AppConfig {
     pub custom_workflows: CustomWorkflowConfig,
 }
 
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            config_version: CURRENT_CONFIG_VERSION,
-            window: WindowConfig::default(),
-            screen: ScreenConfig::default(),
-            timing: TimingConfig::default(),
-            ocr: OcrConfig::default(),
-            templates: TemplateConfig::default(),
-            output: OutputConfig::default(),
-            moderation: ModerationConfig::default(),
-            feeluown: FeelUOwnConfig::default(),
-            http: HttpConfig::default(),
-            logging: LoggingConfig::default(),
-            tui: TuiConfig::default(),
-            state: StateConfig::default(),
-            queue: QueueConfig::default(),
-            ai: AiConfig::default(),
-            matching: MatchConfig::default(),
-            hotkeys: HotkeyConfig::default(),
-            invite: InviteConfig::default(),
-            custom_workflows: CustomWorkflowConfig::default(),
-        }
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default)]
 pub struct WindowConfig {
     pub target_process: String,
     pub content_width: u32,
     pub content_height: u32,
     pub auto_activate_window: bool,
-}
-
-impl Default for WindowConfig {
-    fn default() -> Self {
-        Self {
-            target_process: "yuanshen.exe".to_string(),
-            content_width: 1920,
-            content_height: 1080,
-            auto_activate_window: false,
-        }
-    }
 }
 
 impl AppConfig {
@@ -116,450 +77,18 @@ impl AppConfig {
                 .with_context(|| format!("parse config {}", path.display()));
         }
 
-        let text = default_config_yaml();
-        let config: Self =
-            serde_yaml::from_str(text).context("validate default config template")?;
-        if let Some(parent) = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("create config directory {}", parent.display()))?;
-        }
-        fs::write(path, text)
-            .with_context(|| format!("write default config {}", path.display()))?;
-        Ok(config)
+        bail!(
+            "配置文件不存在: {}。请将发布包中的 config.yaml 放在程序工作目录，或使用 --config 指定配置文件",
+            path.display()
+        )
     }
 }
 
 fn default_config_yaml() -> &'static str {
-    r#"# Miliastra Wonderland Music 配置
-# 坐标沿用旧脚本习惯：以游戏客户区左上角为原点，按 1920x1080 有效画面写坐标
-
-# 配置版本；程序启动时会把旧版本配置迁移到当前模板
-config_version: 12
-
-window:
-  # 目标游戏进程名，按进程文件名匹配，大小写不敏感
-  target_process: yuanshen.exe
-  # 配置坐标对应的游戏有效画面宽度
-  content_width: 1920
-  # 配置坐标对应的游戏有效画面高度
-  content_height: 1080
-  # /active-window 接口是否尝试自动切回目标窗口
-  auto_activate_window: false
-
-screen:
-  # 截图会缩放到这个宽度后再做模板匹配和 OCR
-  expected_width: 1920
-  # 截图会缩放到这个高度后再做模板匹配和 OCR
-  expected_height: 1080
-  # 截图尺寸和预期不一致时是否记录 warning
-  warn_on_size_mismatch: true
-  # 聊天区域，用于匹配蓝/黄/粉聊天标志和 OCR 聊天文本
-  chat_rect:
-    x: 39
-    y: 879
-    width: 416
-    height: 143
-  # 一级聊天界面左下角回车按钮模板检测区域
-  enter_rect:
-    x: 0
-    y: 1020
-    width: 120
-    height: 60
-  # 二级大厅/面板界面模板检测区域
-  secondary_hall_rect:
-    x: 10
-    y: 190
-    width: 65
-    height: 55
-  # F2 大厅页顶部大厅名称 OCR 区域
-  hall_name_rect:
-    x: 75
-    y: 425
-    width: 325
-    height: 40
-  # F2 大厅页剩余时间 OCR 区域，只保留识别到的分钟数字
-  hall_time_rect:
-    x: 430
-    y: 520
-    width: 110
-    height: 40
-
-timing:
-  # 1. 监听子进程异常退出后的重启等待时间，单位毫秒
-  watchdog_restart_ms: 2000
-  # 2. 监听主循环空转间隔；脚本暂停或每轮扫描结束后等待多久再继续，单位毫秒
-  scan_loop_idle_ms: 60
-  # 3. 聊天 OCR 兜底扫描间隔；画面没变化时按这个间隔强制扫描一次，单位毫秒
-  chat_scan_fallback_ms: 2000
-  # 4. 聊天变化后等待画面稳定再 OCR 的时间，单位毫秒
-  chat_change_debounce_ms: 120
-  # 5. 两次变化触发 OCR 之间的最小间隔，单位毫秒
-  chat_change_cooldown_ms: 250
-  # 6. 执行命令前等待回到一级界面的最长时间，单位毫秒
-  command_ui_timeout_ms: 15000
-  # 7. 返回一级界面时每次 ESC 后等待重新检测的时间，单位毫秒
-  return_to_primary_retry_ms: 1000
-  # 8. 聚焦游戏窗口后的等待时间，单位毫秒
-  output_focus_ms: 300
-  # 9. 按回车打开聊天输入后的等待时间，单位毫秒
-  output_open_chat_ms: 300
-  # 10. 每次点击聊天输入区域后的等待时间，单位毫秒
-  output_click_ms: 150
-  # 11. 输入文本后到发送前的等待时间，单位毫秒
-  output_input_ms: 250
-  # 12. 发送聊天后等待界面稳定的时间，单位毫秒
-  output_send_ms: 300
-  # 13. 命令执行后等待聊天列表/动画稳定再复扫的时间，单位毫秒
-  post_command_settle_ms: 500
-  # 14. @帮助 多条消息之间的间隔，单位毫秒
-  help_batch_ms: 500
-  # 15. 进入/退出大厅页面后等待页面稳定的时间，单位毫秒
-  hall_page_settle_ms: 800
-  # 16. 大厅信息多次 OCR 采样之间的间隔，单位毫秒
-  hall_ocr_sample_interval_ms: 120
-  # 17. 邀请流程打开好友/聊天面板前后的固定等待，单位毫秒
-  invite_open_chat_ms: 400
-  # 18. 邀请流程每一步点击后的等待时间，单位毫秒
-  invite_step_ms: 800
-  # 19. 非公共大厅邀请时等待邀请确认/拒绝命令的最长时间，单位毫秒
-  invite_confirm_timeout_ms: 30000
-  # 20. 邀请确认扫描间隔，单位毫秒
-  invite_confirm_poll_ms: 2000
-  # 21. 点歌搜索发起后等待播放器切歌的时间，单位毫秒
-  play_search_settle_ms: 2000
-  # 22. 点歌后查询播放状态的间隔，单位毫秒
-  play_status_poll_ms: 1000
-  # 23. 点歌后最多查询播放状态次数
-  play_status_retries: 15
-  # 24. 下一首/上一首后首次查询播放器状态前的等待时间，单位毫秒
-  skip_status_initial_ms: 500
-  # 25. 下一首/上一首后轮询播放器状态的间隔，单位毫秒
-  skip_status_poll_ms: 300
-  # 26. 下一首/上一首后最多查询播放状态次数
-  skip_status_retries: 5
-  # 27. 匹配失败/AI 自动匹配后等待用户确认的最长时间，单位毫秒
-  decision_timeout_ms: 20000
-  # 28. 匹配失败/AI 自动匹配期间扫描确认命令的间隔，单位毫秒
-  decision_poll_ms: 2000
-  # 29. FeelUOwn TCP RPC 读写超时，单位毫秒
-  feeluown_rpc_timeout_ms: 10000
-  # 30. 调整音量时每个平滑步进之间的等待时间，单位毫秒
-  volume_smooth_step_ms: 300
-  # 31. 自动激活游戏窗口后等待前台窗口切换完成的时间，单位毫秒
-  active_after_activate_ms: 200
-  # 32. AI HTTP 请求超时，单位毫秒
-  ai_request_timeout_ms: 35000
-  # 33. 播放监控线程循环间隔，单位毫秒
-  playback_monitor_tick_ms: 200
-  # 34. 播放结束监控向 FeelUOwn 校准状态的间隔，单位毫秒
-  playback_monitor_status_ms: 1000
-
-ocr:
-  # PaddleOCR 检测模型路径
-  det_model: models/PP-OCRv6_small_det.mnn
-  # PaddleOCR 识别模型路径
-  rec_model: models/PP-OCRv6_small_rec.mnn
-  # PaddleOCR 字符集路径
-  charset: models/ppocr_keys_v6_small.txt
-  # OCR 最低置信度，低于该值的结果会被过滤
-  min_confidence: 0.9
-  # OCR 线程数
-  threads: 4
-  # OCR 后端优先级，默认只使用 CPU OCR
-  backend_priority:
-    - cpu
-  # 检测模型最长边限制；保持 960 与 PaddleOCR/BetterGI 常用配置一致
-  det_max_side_len: 960
-  # 检测分割阈值；越低越容易检出细小文字，也更容易产生噪声框
-  det_score_threshold: 0.3
-  # 文本框外扩比例；2.0 更接近 BetterGI，减少裁掉边缘字符
-  det_unclip_ratio: 2.0
-  # 最小文本框面积；小聊天文字用较低值，避免漏掉短命令
-  det_min_area: 9
-  # OCR 库额外裁剪边框；BetterGI 主要依赖 unclip 外扩，这里关闭额外扩边
-  det_box_border: 0
-  # 聊天区缩略图平均像素差超过该值时认为画面有变化
-  change_mean_threshold: 6.0
-  # 聊天区缩略图变化像素比例超过该值时认为画面有变化
-  change_pixel_threshold: 0.03
-  # 聊天标志右侧到文本区域的间距
-  text_left_gap: 8
-  # 聊天消息块顶部向上扩展像素
-  block_top_padding: 2
-  # 聊天消息块底部向上收缩像素，避免吃到下一条标志
-  block_bottom_padding: 2
-  # 单条聊天消息 OCR 块最大高度
-  max_block_height: 120
-  # OCR 结果合并为同一行的 Y 轴容差
-  same_line_y_tolerance: 10
-  # 聊天标志去重 X 轴容差
-  marker_dedupe_x: 8
-  # 聊天标志去重 Y 轴容差
-  marker_dedupe_y: 8
-  # 判定下一条聊天标志的最小 Y 轴间隔
-  next_marker_min_gap: 12
-  # 聊天文本区域右侧留白
-  right_padding: 4
-  # 实验性：将聊天块拼接为单张图片一次性 OCR，减少推理次数
-  batch_recognize: false
-
-templates:
-  # 蓝色聊天标志模板，通常是自己/普通聊天行标志
-  blue_marker: assets/chat-marker-blue.png
-  # 黄色聊天标志模板，通常是系统/高亮聊天行标志
-  yellow_marker: assets/chat-marker-yellow.png
-  # 粉色聊天标志模板，用于识别好友私聊命令
-  pink_marker: assets/chat-marker-pink.png
-  # 一级聊天界面的回车按钮模板
-  enter: assets/ui-primary-enter.png
-  # 二级大厅/面板界面模板
-  dating: assets/ui-secondary-dating.png
-  # 邀请流程里的“查看千星”按钮模板
-  invite_view_star: assets/invite-view-star.png
-  # 邀请流程里的“前往其大厅”按钮模板
-  invite_goto_hall: assets/invite-goto-hall.png
-  # 邀请流程里的“进入大厅”按钮模板
-  invite_enter_hall: assets/invite-enter-hall.png
-  # 好友界面模板，用于 UID 拉黑/屏蔽流程
-  friend_panel: assets/friend-panel.png
-  # 好友搜索界面模板
-  friend_search_panel: assets/friend-search-panel.png
-  # 好友搜索结果里的更多设置按钮模板
-  friend_more_settings: assets/friend-more-settings.png
-  # 更多设置里的屏蔽聊天按钮模板
-  friend_block_chat: assets/friend-block-chat.png
-  # 更多设置里的拉黑按钮模板
-  friend_blacklist: assets/friend-blacklist.png
-  # 拉黑/屏蔽弹窗里的确认按钮模板
-  friend_confirm: assets/friend-confirm.png
-  # UI/聊天标志模板匹配阈值，越高越严格
-  marker_threshold: 0.9
-
-output:
-  # 是否真的向游戏内发送回复；false 时只写日志
-  send_enabled: true
-  # 用于聚焦/返回一级聊天界面的点击点
-  focus_point:
-    x: 1919
-    y: 1000
-  # 打开聊天输入后的第一次点击位置
-  chat_click_1:
-    x: 120
-    y: 225
-  # 打开聊天输入后的第二次点击位置，通常是输入框位置
-  chat_click_2:
-    x: 600
-    y: 1013
-
-moderation:
-  # 拉黑/屏蔽 UID 请求的好友私聊投票等待时间，单位毫秒
-  vote_timeout_ms: 120000
-  # 投票 OCR 扫描间隔，单位毫秒
-  vote_poll_ms: 2000
-  # 同一好友同一判决需要连续稳定识别次数
-  stable_vote_samples: 3
-  # 同意人数 - 不同意人数 达到该值才执行
-  required_vote_margin: 3
-  # 好友界面模板搜索区域
-  friend_panel_region:
-    x: 770
-    y: 20
-    width: 75
-    height: 50
-  # 搜索按钮模板搜索区域；命中后会点击按钮左侧 500 像素处粘贴 UID，再点击按钮
-  search_panel_region:
-    x: 1600
-    y: 100
-    width: 240
-    height: 90
-  # UID 搜索输入框点击点
-  search_input_point:
-    x: 1180
-    y: 135
-  # UID 搜索按钮点击点
-  search_button_point:
-    x: 1680
-    y: 135
-  # 点击 UID 搜索按钮后等待搜索结果出现的最长时间，单位毫秒
-  search_result_timeout_ms: 5000
-  # 更多设置按钮模板搜索区域
-  more_settings_region:
-    x: 410
-    y: 190
-    width: 45
-    height: 35
-  # 屏蔽聊天按钮模板搜索区域
-  block_chat_region:
-    x: 440
-    y: 190
-    width: 460
-    height: 120
-  # 拉黑按钮模板搜索区域
-  blacklist_region:
-    x: 440
-    y: 190
-    width: 460
-    height: 120
-  # 拉黑/屏蔽弹窗确认按钮模板搜索区域
-  confirm_region:
-    x: 900
-    y: 700
-    width: 500
-    height: 100
-  # 点击确认按钮后等待动作完成的时间，单位毫秒
-  confirm_wait_ms: 2000
-
-feeluown:
-  # FeelUOwn TCP RPC 地址
-  host: 127.0.0.1
-  # FeelUOwn TCP RPC 端口
-  port: 23333
-
-http:
-  # Web/API 面板监听地址
-  host: 127.0.0.1
-  # Web/API 面板端口
-  port: 18888
-  # 是否启用 Web/API 面板
-  enabled: true
-
-logging:
-  # 日志目录
-  dir: logs
-  # 日志级别：error/warn/info/debug/trace
-  level: info
-
-tui:
-  # 是否启用终端 TUI 面板；启用后实时显示日志和 OCR 内容
-  enabled: true
-  # TUI 刷新间隔，单位毫秒
-  refresh_ms: 100
-  # TUI 保留最近多少行日志
-  log_lines: 200
-
-state:
-  # 运行时状态持久化路径
-  runtime_state_path: data/runtime-state.json
-  # 点歌队列持久化路径
-  queue_path: data/queue.json
-  # 最终执行命令记录路径
-  executed_commands_log_path: data/executed-commands.log
-
-queue:
-  # 队列最大长度
-  max_size: 5
-  # 当前歌曲剩余多少秒以内自动播放队列下一首
-  auto_advance_seconds: 1
-  # 队列自动播出的歌曲是否保护；true 时新点歌会排队，false 时可直接替换
-  protect_auto_played_songs: true
-
-ai:
-  # AI 供应商：mimo/openai/deepseek/custom
-  provider: mimo
-  # AI API Key，留空表示 AI 功能未启用
-  api_key: ""
-  # 自定义 OpenAI-compatible chat completions 地址；custom 必填，其他供应商留空使用默认地址
-  endpoint: ""
-  # AI 模型名；留空使用供应商默认模型，不同供应商可自行填写
-  model: ""
-
-matching:
-  # 歌名最低匹配分数
-  min_song_name_score: 0.5
-  # 4 字以内中文歌名最多允许漏字数
-  short_chinese_song_max_miss: 1
-  # 长中文歌名最低命中比例
-  long_chinese_song_min_score: 0.5
-  # 完整歌名后最多忽略的 OCR 噪声字符数
-  max_ocr_noise_chars: 1
-  # 是否启用中文歌手模糊匹配
-  enable_fuzzy_singer: true
-  # 4 字以内中文歌手最多允许漏字数
-  short_chinese_singer_max_miss: 1
-  # 长中文歌手最低命中比例
-  long_chinese_singer_min_score: 0.8
-  # 英文歌名编辑距离占比上限
-  en_max_edit_fraction: 0.3
-  # 英文歌手编辑距离占比上限
-  en_singer_max_edit_fraction: 0.35
-
-hotkeys:
-  # 是否启用全局热键
-  enabled: true
-  # 暂停/恢复热键
-  pause_key: F7
-  # 退出热键
-  exit_key: F12
-
-invite:
-  # 好友列表 OCR 区域，用于查找发起邀请的用户名
-  friend_list_region:
-    x: 80
-    y: 280
-    width: 170
-    height: 600
-  # 邀请确认列表 OCR 区域
-  confirm_list_region:
-    x: 400
-    y: 160
-    width: 180
-    height: 900
-  # “查看千星”模板搜索区域
-  view_star_region:
-    x: 400
-    y: 80
-    width: 440
-    height: 860
-  # “前往其大厅”模板搜索区域
-  goto_hall_region:
-    x: 700
-    y: 560
-    width: 500
-    height: 300
-  # “进入大厅”模板搜索区域
-  enter_hall_region:
-    x: 700
-    y: 700
-    width: 500
-    height: 100
-
-custom_workflows:
-  # 是否启用配置驱动的自定义流程命令
-  enabled: true
-  # 模板默认匹配阈值
-  default_threshold: 0.82
-  # wait_template/click_template 默认等待模板出现的最长时间，单位毫秒
-  default_timeout_ms: 5000
-  # 等待模板出现时的轮询间隔，单位毫秒
-  default_poll_ms: 200
-  # 每个步骤执行后的默认等待时间，单位毫秒
-  default_step_wait_ms: 300
-  # 自定义模板名到图片路径的映射，步骤里通过 template 引用这里的名字
-  templates: {}
-  # 示例：
-  # templates:
-  #   my_button: assets/my-button.png
-  # workflows:
-  #   - name: example
-  #     commands: [测试流程]
-  #     message_types: [blue]
-  #     steps:
-  #       - type: key
-  #         key: F2
-  #         wait_ms: 800
-  #       - type: click_template
-  #         template: my_button
-  #         region: { x: 700, y: 560, width: 500, height: 300 }
-  #       - type: return_primary
-  workflows: []
-"#
+    include_str!("../../config.yaml")
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
-#[serde(default)]
 pub struct RectConfig {
     pub x: i32,
     pub y: i32,
@@ -567,25 +96,7 @@ pub struct RectConfig {
     pub height: u32,
 }
 
-impl RectConfig {
-    pub const fn new(x: i32, y: i32, width: u32, height: u32) -> Self {
-        Self {
-            x,
-            y,
-            width,
-            height,
-        }
-    }
-}
-
-impl Default for RectConfig {
-    fn default() -> Self {
-        Self::new(0, 0, 1, 1)
-    }
-}
-
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
-#[serde(default)]
 pub struct PointConfig {
     pub x: i32,
     pub y: i32,
@@ -597,14 +108,7 @@ impl PointConfig {
     }
 }
 
-impl Default for PointConfig {
-    fn default() -> Self {
-        Self::new(0, 0)
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default)]
 pub struct ScreenConfig {
     pub expected_width: u32,
     pub expected_height: u32,
@@ -616,23 +120,7 @@ pub struct ScreenConfig {
     pub hall_time_rect: RectConfig,
 }
 
-impl Default for ScreenConfig {
-    fn default() -> Self {
-        Self {
-            expected_width: 1920,
-            expected_height: 1080,
-            warn_on_size_mismatch: true,
-            chat_rect: RectConfig::new(39, 879, 416, 143),
-            enter_rect: RectConfig::new(0, 1020, 120, 60),
-            secondary_hall_rect: RectConfig::new(10, 190, 65, 55),
-            hall_name_rect: RectConfig::new(75, 425, 325, 40),
-            hall_time_rect: RectConfig::new(430, 520, 110, 40),
-        }
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default)]
 pub struct TimingConfig {
     pub watchdog_restart_ms: u64,
     pub scan_loop_idle_ms: u64,
@@ -670,49 +158,7 @@ pub struct TimingConfig {
     pub playback_monitor_status_ms: u64,
 }
 
-impl Default for TimingConfig {
-    fn default() -> Self {
-        Self {
-            watchdog_restart_ms: 2000,
-            scan_loop_idle_ms: 60,
-            chat_scan_fallback_ms: 2000,
-            chat_change_debounce_ms: 120,
-            chat_change_cooldown_ms: 250,
-            command_ui_timeout_ms: 15000,
-            return_to_primary_retry_ms: 1000,
-            output_focus_ms: 300,
-            output_open_chat_ms: 300,
-            output_click_ms: 150,
-            output_input_ms: 250,
-            output_send_ms: 300,
-            post_command_settle_ms: 500,
-            help_batch_ms: 500,
-            hall_page_settle_ms: 800,
-            hall_ocr_sample_interval_ms: 120,
-            invite_open_chat_ms: 400,
-            invite_step_ms: 800,
-            invite_confirm_timeout_ms: 30000,
-            invite_confirm_poll_ms: 2000,
-            play_search_settle_ms: 2000,
-            play_status_poll_ms: 1000,
-            play_status_retries: 15,
-            skip_status_initial_ms: 500,
-            skip_status_poll_ms: 300,
-            skip_status_retries: 5,
-            decision_timeout_ms: 20000,
-            decision_poll_ms: 2000,
-            feeluown_rpc_timeout_ms: 10000,
-            volume_smooth_step_ms: 300,
-            active_after_activate_ms: 200,
-            ai_request_timeout_ms: 35000,
-            playback_monitor_tick_ms: 200,
-            playback_monitor_status_ms: 1000,
-        }
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default)]
 pub struct OcrConfig {
     pub det_model: PathBuf,
     pub rec_model: PathBuf,
@@ -739,38 +185,7 @@ pub struct OcrConfig {
     pub batch_recognize: bool,
 }
 
-impl Default for OcrConfig {
-    fn default() -> Self {
-        Self {
-            det_model: PathBuf::from("models/PP-OCRv6_small_det.mnn"),
-            rec_model: PathBuf::from("models/PP-OCRv6_small_rec.mnn"),
-            charset: PathBuf::from("models/ppocr_keys_v6_small.txt"),
-            min_confidence: 0.9,
-            threads: 4,
-            backend_priority: vec!["cpu".to_string()],
-            det_max_side_len: 960,
-            det_score_threshold: 0.3,
-            det_unclip_ratio: 2.0,
-            det_min_area: 9,
-            det_box_border: 0,
-            change_mean_threshold: 6.0,
-            change_pixel_threshold: 0.03,
-            text_left_gap: 8,
-            block_top_padding: 2,
-            block_bottom_padding: 2,
-            max_block_height: 120,
-            same_line_y_tolerance: 10,
-            marker_dedupe_x: 8,
-            marker_dedupe_y: 8,
-            next_marker_min_gap: 12,
-            right_padding: 4,
-            batch_recognize: false,
-        }
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default)]
 pub struct TemplateConfig {
     pub blue_marker: PathBuf,
     pub yellow_marker: PathBuf,
@@ -789,30 +204,7 @@ pub struct TemplateConfig {
     pub marker_threshold: f32,
 }
 
-impl Default for TemplateConfig {
-    fn default() -> Self {
-        Self {
-            blue_marker: PathBuf::from("assets/chat-marker-blue.png"),
-            yellow_marker: PathBuf::from("assets/chat-marker-yellow.png"),
-            pink_marker: PathBuf::from("assets/chat-marker-pink.png"),
-            enter: PathBuf::from("assets/ui-primary-enter.png"),
-            dating: PathBuf::from("assets/ui-secondary-dating.png"),
-            invite_view_star: PathBuf::from("assets/invite-view-star.png"),
-            invite_goto_hall: PathBuf::from("assets/invite-goto-hall.png"),
-            invite_enter_hall: PathBuf::from("assets/invite-enter-hall.png"),
-            friend_panel: PathBuf::from("assets/friend-panel.png"),
-            friend_search_panel: PathBuf::from("assets/friend-search-panel.png"),
-            friend_more_settings: PathBuf::from("assets/friend-more-settings.png"),
-            friend_block_chat: PathBuf::from("assets/friend-block-chat.png"),
-            friend_blacklist: PathBuf::from("assets/friend-blacklist.png"),
-            friend_confirm: PathBuf::from("assets/friend-confirm.png"),
-            marker_threshold: 0.9,
-        }
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default)]
 pub struct ModerationConfig {
     pub vote_timeout_ms: u64,
     pub vote_poll_ms: u64,
@@ -830,29 +222,7 @@ pub struct ModerationConfig {
     pub confirm_wait_ms: u64,
 }
 
-impl Default for ModerationConfig {
-    fn default() -> Self {
-        Self {
-            vote_timeout_ms: 120_000,
-            vote_poll_ms: 2_000,
-            stable_vote_samples: 3,
-            required_vote_margin: 3,
-            friend_panel_region: RectConfig::new(770, 20, 75, 50),
-            search_panel_region: RectConfig::new(1600, 100, 240, 90),
-            search_input_point: PointConfig::new(1180, 135),
-            search_button_point: PointConfig::new(1680, 135),
-            search_result_timeout_ms: 5_000,
-            more_settings_region: RectConfig::new(410, 190, 45, 35),
-            block_chat_region: RectConfig::new(440, 190, 460, 120),
-            blacklist_region: RectConfig::new(440, 190, 460, 120),
-            confirm_region: RectConfig::new(900, 700, 500, 100),
-            confirm_wait_ms: 2_000,
-        }
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default)]
 pub struct OutputConfig {
     pub send_enabled: bool,
     pub focus_point: PointConfig,
@@ -860,123 +230,47 @@ pub struct OutputConfig {
     pub chat_click_2: PointConfig,
 }
 
-impl Default for OutputConfig {
-    fn default() -> Self {
-        Self {
-            send_enabled: true,
-            focus_point: PointConfig::new(1919, 1000),
-            chat_click_1: PointConfig::new(120, 225),
-            chat_click_2: PointConfig::new(600, 1013),
-        }
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default)]
 pub struct FeelUOwnConfig {
     pub host: String,
     pub port: u16,
 }
 
-impl Default for FeelUOwnConfig {
-    fn default() -> Self {
-        Self {
-            host: "127.0.0.1".to_string(),
-            port: 23333,
-        }
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default)]
 pub struct HttpConfig {
     pub host: String,
     pub port: u16,
     pub enabled: bool,
 }
 
-impl Default for HttpConfig {
-    fn default() -> Self {
-        Self {
-            host: "127.0.0.1".to_string(),
-            port: 18888,
-            enabled: true,
-        }
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default)]
 pub struct LoggingConfig {
     pub dir: PathBuf,
     pub level: String,
 }
 
-impl Default for LoggingConfig {
-    fn default() -> Self {
-        Self {
-            dir: PathBuf::from("logs"),
-            level: "info".to_string(),
-        }
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default)]
 pub struct TuiConfig {
     pub enabled: bool,
     pub refresh_ms: u64,
     pub log_lines: usize,
 }
 
-impl Default for TuiConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            refresh_ms: 100,
-            log_lines: 200,
-        }
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default)]
 pub struct StateConfig {
     pub runtime_state_path: PathBuf,
     pub queue_path: PathBuf,
     pub executed_commands_log_path: PathBuf,
 }
 
-impl Default for StateConfig {
-    fn default() -> Self {
-        Self {
-            runtime_state_path: PathBuf::from("data/runtime-state.json"),
-            queue_path: PathBuf::from("data/queue.json"),
-            executed_commands_log_path: PathBuf::from("data/executed-commands.log"),
-        }
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default)]
 pub struct QueueConfig {
     pub max_size: usize,
     pub auto_advance_seconds: u64,
     pub protect_auto_played_songs: bool,
 }
 
-impl Default for QueueConfig {
-    fn default() -> Self {
-        Self {
-            max_size: 5,
-            auto_advance_seconds: 1,
-            protect_auto_played_songs: true,
-        }
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default)]
 pub struct CustomWorkflowConfig {
     pub enabled: bool,
     pub default_threshold: f32,
@@ -987,83 +281,41 @@ pub struct CustomWorkflowConfig {
     pub workflows: Vec<CustomWorkflowDefinition>,
 }
 
-impl Default for CustomWorkflowConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            default_threshold: 0.82,
-            default_timeout_ms: 5_000,
-            default_poll_ms: 200,
-            default_step_wait_ms: 300,
-            templates: HashMap::new(),
-            workflows: Vec::new(),
-        }
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default)]
 pub struct CustomWorkflowDefinition {
     pub enabled: bool,
     pub name: String,
     pub commands: Vec<String>,
+    pub allow_args: bool,
     pub message_types: Vec<String>,
+    pub confirm_before_run: bool,
+    pub confirm_message: String,
+    pub confirm_message_types: Vec<String>,
+    pub confirm_timeout_ms: Option<u64>,
+    pub confirm_poll_ms: Option<u64>,
     pub steps: Vec<CustomWorkflowStep>,
     pub success_message: String,
 }
 
-impl Default for CustomWorkflowDefinition {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            name: String::new(),
-            commands: Vec::new(),
-            message_types: vec!["blue".to_string()],
-            steps: Vec::new(),
-            success_message: String::new(),
-        }
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default)]
 pub struct CustomWorkflowStep {
     #[serde(rename = "type")]
     pub step_type: String,
-    pub template: String,
+    pub template: Option<String>,
     pub region: Option<RectConfig>,
     pub point: Option<PointConfig>,
     pub click_offset: Option<PointConfig>,
-    pub key: String,
-    pub text: String,
-    pub message: String,
+    pub key: Option<String>,
+    pub target: Option<String>,
+    pub text: Option<String>,
+    pub message: Option<String>,
     pub threshold: Option<f32>,
     pub timeout_ms: Option<u64>,
     pub poll_ms: Option<u64>,
     pub wait_ms: Option<u64>,
 }
 
-impl Default for CustomWorkflowStep {
-    fn default() -> Self {
-        Self {
-            step_type: String::new(),
-            template: String::new(),
-            region: None,
-            point: None,
-            click_offset: None,
-            key: String::new(),
-            text: String::new(),
-            message: String::new(),
-            threshold: None,
-            timeout_ms: None,
-            poll_ms: None,
-            wait_ms: None,
-        }
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default)]
 pub struct AiConfig {
     pub provider: String,
     pub api_key: String,
@@ -1072,7 +324,6 @@ pub struct AiConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default)]
 pub struct MatchConfig {
     pub min_song_name_score: f64,
     pub short_chinese_song_max_miss: usize,
@@ -1101,53 +352,18 @@ impl Default for MatchConfig {
     }
 }
 
-impl Default for AiConfig {
-    fn default() -> Self {
-        Self {
-            provider: "mimo".to_string(),
-            api_key: String::new(),
-            endpoint: String::new(),
-            model: String::new(),
-        }
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default)]
 pub struct HotkeyConfig {
     pub enabled: bool,
     pub pause_key: String,
     pub exit_key: String,
 }
 
-impl Default for HotkeyConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            pause_key: "F7".to_string(),
-            exit_key: "F12".to_string(),
-        }
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default)]
 pub struct InviteConfig {
     pub friend_list_region: RectConfig,
     pub confirm_list_region: RectConfig,
     pub view_star_region: RectConfig,
     pub goto_hall_region: RectConfig,
     pub enter_hall_region: RectConfig,
-}
-
-impl Default for InviteConfig {
-    fn default() -> Self {
-        Self {
-            friend_list_region: RectConfig::new(80, 280, 170, 600),
-            confirm_list_region: RectConfig::new(400, 160, 180, 900),
-            view_star_region: RectConfig::new(400, 80, 440, 860),
-            goto_hall_region: RectConfig::new(700, 560, 500, 300),
-            enter_hall_region: RectConfig::new(700, 700, 500, 100),
-        }
-    }
 }

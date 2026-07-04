@@ -29,17 +29,23 @@ pub(super) fn parse_text(
         return None;
     }
     let (username, command_text, user_command) = chat_command_parts(text, message_type)?;
-    let (workflow, matched) = find_command_workflow(config, command_text, message_type)?;
+    let (workflow, matched, args) = find_command_workflow(config, command_text, message_type)?;
     let workflow_name = workflow_name(workflow, matched);
+    let raw = if args.is_empty() {
+        matched.to_string()
+    } else {
+        format!("{} {}", matched, args)
+    };
     Some(ParsedCommand {
         matched: matched.to_string(),
-        raw: matched.to_string(),
+        raw,
         user_command,
         message_type: message_type.to_string(),
         username,
         command: UserCommand::CustomWorkflow(CustomWorkflowCommand {
             name: matched.to_string(),
             workflow: workflow_name,
+            args,
         }),
     })
 }
@@ -65,6 +71,35 @@ pub(super) fn template_path(config: &CustomWorkflowConfig, template: &str) -> Re
         .get(template)
         .cloned()
         .unwrap_or_else(|| PathBuf::from(template)))
+}
+
+#[derive(Clone, Debug)]
+struct WorkflowContext {
+    workflow: String,
+    command: String,
+    args: String,
+    argv: Vec<String>,
+    username: String,
+    message_type: String,
+    user_command: String,
+}
+
+impl WorkflowContext {
+    fn new(command: &command::CustomWorkflowCommand, parsed: &ParsedCommand) -> Self {
+        Self {
+            workflow: command.workflow.clone(),
+            command: command.name.clone(),
+            args: command.args.clone(),
+            argv: command
+                .args
+                .split_whitespace()
+                .map(str::to_string)
+                .collect(),
+            username: parsed.username.clone(),
+            message_type: parsed.message_type.clone(),
+            user_command: parsed.user_command.clone(),
+        }
+    }
 }
 
 struct ModerationWorkflowRelease {
@@ -95,6 +130,7 @@ impl AutomationApp {
     pub(super) fn execute_custom_workflow(
         &mut self,
         command: &command::CustomWorkflowCommand,
+        parsed: &ParsedCommand,
     ) -> Result<()> {
         let workflow = find_workflow(&self.config.custom_workflows, &command.workflow)
             .cloned()
@@ -111,6 +147,11 @@ impl AutomationApp {
             command.workflow,
             workflow.steps.len()
         );
+        let context = WorkflowContext::new(command, parsed);
+        if workflow.confirm_before_run && !self.confirm_custom_workflow(&workflow, &context)? {
+            log::info!("自定义流程已取消: {}", command.workflow);
+            return Ok(());
+        }
         for (index, step) in workflow.steps.iter().enumerate() {
             log::info!(
                 "自定义流程步骤 {}/{}: {}",
@@ -118,7 +159,7 @@ impl AutomationApp {
                 workflow.steps.len(),
                 step.step_type
             );
-            self.execute_custom_workflow_step(&command.workflow, step)?;
+            self.execute_custom_workflow_step(&context, step)?;
             let wait_ms = if matches!(step.step_type.trim(), "sleep" | "wait") {
                 0
             } else {
@@ -130,14 +171,150 @@ impl AutomationApp {
             }
         }
         if !workflow.success_message.trim().is_empty() {
-            self.reply(workflow.success_message.trim())?;
+            self.reply(&render_workflow_text(
+                workflow.success_message.trim(),
+                &context,
+            ))?;
         }
         Ok(())
     }
 
+    fn confirm_custom_workflow(
+        &mut self,
+        workflow: &CustomWorkflowDefinition,
+        context: &WorkflowContext,
+    ) -> Result<bool> {
+        let message = if workflow.confirm_message.trim().is_empty() {
+            format!(
+                "{} 请求执行 {},@确认@跳过",
+                context.username, context.command
+            )
+        } else {
+            render_workflow_text(workflow.confirm_message.trim(), context)
+        };
+        self.reply(&message)?;
+        match self.wait_for_custom_workflow_confirmation(workflow) {
+            Ok(Some(true)) => Ok(true),
+            Ok(Some(false)) => Ok(false),
+            Ok(None) => {
+                self.reply("自定义流程确认超时,已取消")?;
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn wait_for_custom_workflow_confirmation(
+        &self,
+        workflow: &CustomWorkflowDefinition,
+    ) -> Result<Option<bool>> {
+        let existing = self.collect_custom_workflow_confirmation_bottoms(workflow);
+        let timeout_ms = workflow
+            .confirm_timeout_ms
+            .unwrap_or(self.config.timing.decision_timeout_ms);
+        let poll_ms = workflow
+            .confirm_poll_ms
+            .unwrap_or(self.config.timing.decision_poll_ms)
+            .max(50);
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        let template_args = TemplateArgs::default().resolve(&self.config);
+        let canvas = Canvas {
+            width: self.config.screen.expected_width,
+            height: self.config.screen.expected_height,
+            resize: true,
+        };
+        while self.running.load(AtomicOrdering::SeqCst) && Instant::now() < deadline {
+            sleep(Duration::from_millis(poll_ms));
+            let frame = match load_frame(&FrameArgs { image: None }, &canvas, &self.config.window) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    log::error!("自定义流程确认截图失败: {error:#}");
+                    continue;
+                }
+            };
+            let messages = {
+                let engine = match self.ocr_engine() {
+                    Ok(engine) => engine,
+                    Err(error) => {
+                        log::error!("自定义流程确认 OCR 锁失败: {error:#}");
+                        continue;
+                    }
+                };
+                match scan_chat(
+                    &frame.image,
+                    &engine.engine,
+                    &template_args,
+                    self.config.screen.chat_rect.into(),
+                    Some(&self.monitor),
+                ) {
+                    Ok(messages) => messages,
+                    Err(error) => {
+                        log::error!("自定义流程确认扫描失败: {error:#}");
+                        continue;
+                    }
+                }
+            };
+            for message in messages {
+                if !accepts_confirmation_message_type(workflow, &message.message_type)
+                    || super::is_existing_decision(&message, &existing)
+                {
+                    continue;
+                }
+                if let Some(confirmed) = parse_custom_workflow_confirmation(&message.text) {
+                    return Ok(Some(confirmed));
+                }
+            }
+        }
+        if self.running.load(AtomicOrdering::SeqCst) {
+            Ok(None)
+        } else {
+            Ok(Some(false))
+        }
+    }
+
+    fn collect_custom_workflow_confirmation_bottoms(
+        &self,
+        workflow: &CustomWorkflowDefinition,
+    ) -> HashMap<String, i32> {
+        let mut output = HashMap::new();
+        let template_args = TemplateArgs::default().resolve(&self.config);
+        let canvas = Canvas {
+            width: self.config.screen.expected_width,
+            height: self.config.screen.expected_height,
+            resize: true,
+        };
+        let Ok(frame) = load_frame(&FrameArgs { image: None }, &canvas, &self.config.window) else {
+            return output;
+        };
+        let Ok(engine) = self.ocr_engine() else {
+            return output;
+        };
+        let Ok(messages) = scan_chat(
+            &frame.image,
+            &engine.engine,
+            &template_args,
+            self.config.screen.chat_rect.into(),
+            Some(&self.monitor),
+        ) else {
+            return output;
+        };
+        for message in messages {
+            if accepts_confirmation_message_type(workflow, &message.message_type)
+                && parse_custom_workflow_confirmation(&message.text).is_some()
+            {
+                let bottom = message.block.y + message.block.height as i32;
+                output
+                    .entry(message.text)
+                    .and_modify(|value| *value = (*value).max(bottom))
+                    .or_insert(bottom);
+            }
+        }
+        output
+    }
+
     fn execute_custom_workflow_step(
         &mut self,
-        workflow_name: &str,
+        context: &WorkflowContext,
         step: &config::CustomWorkflowStep,
     ) -> Result<()> {
         match step.step_type.trim() {
@@ -150,10 +327,12 @@ impl AutomationApp {
                 Ok(())
             }
             "key" | "press_key" => {
-                if step.key.trim().is_empty() {
+                let key_text =
+                    render_workflow_text(step.key.as_deref().unwrap_or("").trim(), context);
+                if key_text.trim().is_empty() {
                     return Err(anyhow!("custom workflow step key is empty"));
                 }
-                let key = parse_key(&step.key)?;
+                let key = parse_key(&key_text)?;
                 press_key(key, &self.config.window)
             }
             "click" => {
@@ -162,17 +341,65 @@ impl AutomationApp {
                     .ok_or_else(|| anyhow!("custom workflow click step missing point"))?;
                 click_game_point(point, &self.config.window)
             }
-            "click_template" => self.execute_custom_template_step(workflow_name, step, true),
-            "wait_template" => self.execute_custom_template_step(workflow_name, step, false),
+            "click_template" => self.execute_custom_template_step(context, step, true),
+            "wait_template" => self.execute_custom_template_step(context, step, false),
+            "wait_template_absent" => self.execute_custom_template_absent_step(context, step),
+            "click_text" => self.execute_custom_text_step(context, step, true),
+            "wait_text" => self.execute_custom_text_step(context, step, false),
+            "paste" | "paste_text" => {
+                let text = custom_step_text(step, context);
+                if text.is_empty() {
+                    return Err(anyhow!("custom workflow paste step missing text"));
+                }
+                paste_text(&text)
+            }
             "send_chat" | "reply" => {
-                let message = custom_step_message(step);
+                let message = custom_step_message(step, context);
                 if message.is_empty() {
                     return Err(anyhow!("custom workflow send_chat step missing message"));
                 }
                 self.reply(&message)
             }
+            "send_current_chat" => {
+                let message = custom_step_message(step, context);
+                if message.is_empty() {
+                    return Err(anyhow!(
+                        "custom workflow send_current_chat step missing message"
+                    ));
+                }
+                self.chat_output.send_current_chat(&message)
+            }
+            "send_friend_message" | "friend_reply" => {
+                let message = custom_step_message(step, context);
+                if message.is_empty() {
+                    return Err(anyhow!(
+                        "custom workflow send_friend_message step missing message"
+                    ));
+                }
+                let target = custom_step_target(step, context);
+                if target.is_empty() {
+                    return Err(anyhow!(
+                        "custom workflow send_friend_message step missing target"
+                    ));
+                }
+                if self.send_friend_message(&target, &message)? {
+                    Ok(())
+                } else {
+                    Err(anyhow!(
+                        "custom workflow send_friend_message target not found: {}",
+                        target
+                    ))
+                }
+            }
+            "invite_user" | "invite_current_user" => {
+                let target = custom_step_target(step, context);
+                if target.is_empty() {
+                    return Err(anyhow!("custom workflow invite step missing target"));
+                }
+                self.execute_invite_with_announce(&target).map(|_| ())
+            }
             "return_primary" => {
-                self.return_to_primary_from_transient_ui(workflow_name);
+                self.return_to_primary_from_transient_ui(&context.workflow);
                 Ok(())
             }
             other => Err(anyhow!("unsupported custom workflow step type: {}", other)),
@@ -181,11 +408,13 @@ impl AutomationApp {
 
     fn execute_custom_template_step(
         &self,
-        workflow_name: &str,
+        context: &WorkflowContext,
         step: &config::CustomWorkflowStep,
         click: bool,
     ) -> Result<()> {
-        let template = template_path(&self.config.custom_workflows, &step.template)?;
+        let template_name =
+            render_workflow_text(step.template.as_deref().unwrap_or("").trim(), context);
+        let template = template_path(&self.config.custom_workflows, &template_name)?;
         let region = step
             .region
             .ok_or_else(|| anyhow!("custom workflow template step missing region"))?;
@@ -212,15 +441,15 @@ impl AutomationApp {
             {
                 log::info!(
                     "自定义流程模板命中: workflow={} template={} score={:.3} x={} y={}",
-                    workflow_name,
-                    step.template,
+                    context.workflow,
+                    template_name,
                     hit.score,
                     hit.x,
                     hit.y
                 );
                 if click {
                     let center = hit.center();
-                    let offset = step.click_offset.unwrap_or_default();
+                    let offset = step.click_offset.unwrap_or(PointConfig::new(0, 0));
                     click_game_point(
                         PointConfig::new(center.x + offset.x, center.y + offset.y),
                         &self.config.window,
@@ -232,8 +461,107 @@ impl AutomationApp {
         }
         Err(anyhow!(
             "custom workflow template not found: workflow={} template={}",
-            workflow_name,
-            step.template
+            context.workflow,
+            template_name
+        ))
+    }
+
+    fn execute_custom_template_absent_step(
+        &self,
+        context: &WorkflowContext,
+        step: &config::CustomWorkflowStep,
+    ) -> Result<()> {
+        let template_name =
+            render_workflow_text(step.template.as_deref().unwrap_or("").trim(), context);
+        let template = template_path(&self.config.custom_workflows, &template_name)?;
+        let region = step
+            .region
+            .ok_or_else(|| anyhow!("custom workflow template step missing region"))?;
+        let threshold = step
+            .threshold
+            .unwrap_or(self.config.custom_workflows.default_threshold);
+        let timeout_ms = step
+            .timeout_ms
+            .unwrap_or(self.config.custom_workflows.default_timeout_ms);
+        let poll_ms = step
+            .poll_ms
+            .unwrap_or(self.config.custom_workflows.default_poll_ms)
+            .max(50);
+        let canvas = Canvas {
+            width: self.config.screen.expected_width,
+            height: self.config.screen.expected_height,
+            resize: true,
+        };
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        while self.running.load(AtomicOrdering::SeqCst) && Instant::now() <= deadline {
+            let frame = load_frame(&FrameArgs { image: None }, &canvas, &self.config.window)?;
+            if best_template_hit(&frame.image, Some(region.into()), &template, threshold)?.is_none()
+            {
+                return Ok(());
+            }
+            sleep(Duration::from_millis(poll_ms));
+        }
+        Err(anyhow!(
+            "custom workflow template still visible: workflow={} template={}",
+            context.workflow,
+            template_name
+        ))
+    }
+
+    fn execute_custom_text_step(
+        &self,
+        context: &WorkflowContext,
+        step: &config::CustomWorkflowStep,
+        click: bool,
+    ) -> Result<()> {
+        let expected = custom_step_text(step, context);
+        if expected.is_empty() {
+            return Err(anyhow!("custom workflow text step missing text"));
+        }
+        let region = step
+            .region
+            .ok_or_else(|| anyhow!("custom workflow text step missing region"))?;
+        let timeout_ms = step
+            .timeout_ms
+            .unwrap_or(self.config.custom_workflows.default_timeout_ms);
+        let poll_ms = step
+            .poll_ms
+            .unwrap_or(self.config.custom_workflows.default_poll_ms)
+            .max(50);
+        let canvas = Canvas {
+            width: self.config.screen.expected_width,
+            height: self.config.screen.expected_height,
+            resize: true,
+        };
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        while self.running.load(AtomicOrdering::SeqCst) && Instant::now() <= deadline {
+            let point = {
+                let engine = self.ocr_engine()?;
+                self.find_text_point(&engine.engine, &canvas, region.into(), &expected)?
+            };
+            if let Some(point) = point {
+                log::info!(
+                    "自定义流程文字命中: workflow={} text={} x={} y={}",
+                    context.workflow,
+                    expected,
+                    point.x,
+                    point.y
+                );
+                if click {
+                    let offset = step.click_offset.unwrap_or(PointConfig::new(0, 0));
+                    click_game_point(
+                        PointConfig::new(point.x + offset.x, point.y + offset.y),
+                        &self.config.window,
+                    )?;
+                }
+                return Ok(());
+            }
+            sleep(Duration::from_millis(poll_ms));
+        }
+        Err(anyhow!(
+            "custom workflow text not found: workflow={} text={}",
+            context.workflow,
+            expected
         ))
     }
 
@@ -1099,6 +1427,30 @@ fn parse_invite_decision(text: &str) -> Option<bool> {
     }
 }
 
+fn parse_custom_workflow_confirmation(text: &str) -> Option<bool> {
+    let raw = text.trim();
+    let command_text = if let Some(index) = raw.find(['：', ':', ']', '】']) {
+        let sep_len = raw[index..].chars().next().map(char::len_utf8).unwrap_or(1);
+        &raw[index + sep_len..]
+    } else {
+        raw
+    }
+    .trim_start_matches(['：', ':', ' ', '\t', ']', '】']);
+    if command_text
+        .strip_prefix("@确认")
+        .is_some_and(|rest| decision_boundary(rest.chars().next()))
+    {
+        Some(true)
+    } else if command_text
+        .strip_prefix("@跳过")
+        .is_some_and(|rest| decision_boundary(rest.chars().next()))
+    {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 fn parse_friend_moderation_vote(text: &str) -> Option<(String, bool)> {
     let sep_index = text.find(['：', ':', ']', '】'])?;
     let username = text[..sep_index]
@@ -1144,12 +1496,71 @@ fn moderation_workflow_key(command: &command::ModerationCommand) -> String {
     format!("{}:{}", command.action.label(), command.uid)
 }
 
-fn custom_step_message(step: &config::CustomWorkflowStep) -> String {
-    let message = step.message.trim();
-    if message.is_empty() {
-        step.text.trim().to_string()
+fn custom_step_text(step: &config::CustomWorkflowStep, context: &WorkflowContext) -> String {
+    let text = step.text.as_deref().unwrap_or("").trim();
+    let value = if text.is_empty() {
+        step.message.as_deref().unwrap_or("").trim()
     } else {
-        message.to_string()
+        text
+    };
+    render_workflow_text(value, context)
+}
+
+fn custom_step_message(step: &config::CustomWorkflowStep, context: &WorkflowContext) -> String {
+    let message = step.message.as_deref().unwrap_or("").trim();
+    let value = if message.is_empty() {
+        step.text.as_deref().unwrap_or("").trim()
+    } else {
+        message
+    };
+    render_workflow_text(value, context)
+}
+
+fn custom_step_target(step: &config::CustomWorkflowStep, context: &WorkflowContext) -> String {
+    let target = step.target.as_deref().unwrap_or("").trim();
+    if target.is_empty() {
+        context.username.trim().to_string()
+    } else {
+        render_workflow_text(target, context)
+    }
+}
+
+fn render_workflow_text(text: &str, context: &WorkflowContext) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("{{") {
+        output.push_str(&rest[..start]);
+        let after_start = &rest[start + 2..];
+        let Some(end) = after_start.find("}}") else {
+            output.push_str(&rest[start..]);
+            return output;
+        };
+        let key = after_start[..end].trim();
+        if let Some(value) = workflow_variable(key, context) {
+            output.push_str(&value);
+        } else {
+            output.push_str("{{");
+            output.push_str(&after_start[..end]);
+            output.push_str("}}");
+        }
+        rest = &after_start[end + 2..];
+    }
+    output.push_str(rest);
+    output
+}
+
+fn workflow_variable(key: &str, context: &WorkflowContext) -> Option<String> {
+    match key {
+        "workflow" | "workflow_name" => Some(context.workflow.clone()),
+        "command" | "command_name" => Some(context.command.clone()),
+        "args" | "param" | "params" => Some(context.args.clone()),
+        "username" | "user" => Some(context.username.clone()),
+        "message_type" => Some(context.message_type.clone()),
+        "user_command" => Some(context.user_command.clone()),
+        _ => key.strip_prefix("arg").and_then(|index| {
+            let index = index.parse::<usize>().ok()?.checked_sub(1)?;
+            context.argv.get(index).cloned()
+        }),
     }
 }
 
@@ -1157,7 +1568,7 @@ fn find_command_workflow<'a>(
     config: &'a CustomWorkflowConfig,
     command_text: &str,
     message_type: &str,
-) -> Option<(&'a CustomWorkflowDefinition, &'a str)> {
+) -> Option<(&'a CustomWorkflowDefinition, &'a str, String)> {
     for workflow in config.workflows.iter().filter(|workflow| workflow.enabled) {
         if !accepts_message_type(workflow, message_type) {
             continue;
@@ -1173,16 +1584,20 @@ fn find_command_workflow<'a>(
             if !command_boundary(rest.chars().next()) {
                 continue;
             }
-            if !rest
-                .trim_start_matches(['：', ':', ' ', '\t', ']', '】'])
-                .is_empty()
-            {
+            let args = command_args(rest);
+            if !workflow.allow_args && !args.is_empty() {
                 continue;
             }
-            return Some((workflow, command));
+            return Some((workflow, command, args.to_string()));
         }
     }
     None
+}
+
+fn command_args(rest: &str) -> &str {
+    rest.trim_start_matches(['：', ':', ' ', '\t', ']', '】'])
+        .trim_end_matches([']', '】'])
+        .trim()
 }
 
 fn chat_command_parts<'a>(text: &'a str, message_type: &str) -> Option<(String, &'a str, String)> {
@@ -1265,6 +1680,17 @@ fn accepts_message_type(workflow: &CustomWorkflowDefinition, message_type: &str)
             .any(|item| item.eq_ignore_ascii_case(message_type))
 }
 
+fn accepts_confirmation_message_type(
+    workflow: &CustomWorkflowDefinition,
+    message_type: &str,
+) -> bool {
+    workflow.confirm_message_types.is_empty()
+        || workflow
+            .confirm_message_types
+            .iter()
+            .any(|item| item.eq_ignore_ascii_case(message_type))
+}
+
 fn command_boundary(ch: Option<char>) -> bool {
     match ch {
         None => true,
@@ -1287,14 +1713,38 @@ mod tests {
     use super::super::config::CustomWorkflowDefinition;
     use super::*;
 
-    #[test]
-    fn parses_blue_custom_workflow_command() {
-        let mut config = CustomWorkflowConfig::default();
-        config.workflows.push(CustomWorkflowDefinition {
+    fn test_config(workflow: CustomWorkflowDefinition) -> CustomWorkflowConfig {
+        CustomWorkflowConfig {
+            enabled: true,
+            default_threshold: 0.9,
+            default_timeout_ms: 5_000,
+            default_poll_ms: 200,
+            default_step_wait_ms: 300,
+            templates: HashMap::new(),
+            workflows: vec![workflow],
+        }
+    }
+
+    fn test_workflow(allow_args: bool) -> CustomWorkflowDefinition {
+        CustomWorkflowDefinition {
+            enabled: true,
             name: "example".to_string(),
             commands: vec!["测试流程".to_string()],
-            ..CustomWorkflowDefinition::default()
-        });
+            allow_args,
+            message_types: vec!["blue".to_string()],
+            confirm_before_run: false,
+            confirm_message: String::new(),
+            confirm_message_types: vec!["blue".to_string()],
+            confirm_timeout_ms: None,
+            confirm_poll_ms: None,
+            steps: Vec::new(),
+            success_message: String::new(),
+        }
+    }
+
+    #[test]
+    fn parses_blue_custom_workflow_command() {
+        let config = test_config(test_workflow(false));
 
         let parsed = parse_text(&config, "用户：@测试流程", "blue").expect("parse custom");
         assert_eq!(parsed.matched, "测试流程");
@@ -1303,13 +1753,55 @@ mod tests {
 
     #[test]
     fn rejects_custom_workflow_with_extra_param() {
-        let mut config = CustomWorkflowConfig::default();
-        config.workflows.push(CustomWorkflowDefinition {
-            name: "example".to_string(),
-            commands: vec!["测试流程".to_string()],
-            ..CustomWorkflowDefinition::default()
-        });
+        let config = test_config(test_workflow(false));
 
         assert!(parse_text(&config, "用户：@测试流程 参数", "blue").is_none());
+    }
+
+    #[test]
+    fn parses_custom_workflow_with_args_when_enabled() {
+        let config = test_config(test_workflow(true));
+
+        let parsed = parse_text(&config, "用户：@测试流程 123 abc", "blue").expect("parse custom");
+        assert_eq!(parsed.raw, "测试流程 123 abc");
+        assert!(matches!(
+            parsed.command,
+            UserCommand::CustomWorkflow(CustomWorkflowCommand { args, .. }) if args == "123 abc"
+        ));
+    }
+
+    #[test]
+    fn renders_workflow_variables() {
+        let command = CustomWorkflowCommand {
+            name: "测试流程".to_string(),
+            workflow: "example".to_string(),
+            args: "123 abc".to_string(),
+        };
+        let parsed = ParsedCommand {
+            matched: "测试流程".to_string(),
+            raw: "测试流程 123 abc".to_string(),
+            user_command: "@测试流程 123 abc".to_string(),
+            message_type: "blue".to_string(),
+            username: "用户".to_string(),
+            command: UserCommand::CustomWorkflow(command.clone()),
+        };
+        let context = WorkflowContext::new(&command, &parsed);
+
+        assert_eq!(
+            render_workflow_text("{{username}} {{args}} {{arg1}} {{arg2}}", &context),
+            "用户 123 abc 123 abc"
+        );
+    }
+
+    #[test]
+    fn checks_confirmation_message_types() {
+        let mut workflow = test_workflow(false);
+        workflow.confirm_message_types = vec!["pink".to_string()];
+        assert!(accepts_confirmation_message_type(&workflow, "pink"));
+        assert!(!accepts_confirmation_message_type(&workflow, "blue"));
+
+        workflow.confirm_message_types.clear();
+        assert!(accepts_confirmation_message_type(&workflow, "blue"));
+        assert!(accepts_confirmation_message_type(&workflow, "pink"));
     }
 }

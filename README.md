@@ -39,6 +39,7 @@ models/ppocr_keys_v6_small.txt
 程序发布包/
 ├── 程序.exe
 ├── MNN.dll
+├── config.yaml
 ├── assets/
 ├── models/
 └── README.md
@@ -85,7 +86,7 @@ cargo check --target x86_64-pc-windows-gnu --features ocr-rs/docsrs
 程序.exe --config config.yaml run
 ```
 
-首次启动会自动创建带注释的 `config.yaml`
+发布包内已包含带注释的 `config.yaml`。程序不会自动生成配置文件；如果配置文件不存在，请把发布包里的 `config.yaml` 放在程序工作目录，或用 `--config` 指定路径
 
 ## 运行要求
 
@@ -125,6 +126,7 @@ cargo check --target x86_64-pc-windows-gnu --features ocr-rs/docsrs
 
 ```text
 @邀请1
+@过来
 @麦克风
 @禁用
 @启用
@@ -137,6 +139,7 @@ cargo check --target x86_64-pc-windows-gnu --features ocr-rs/docsrs
 - `@网易点歌` 强制使用网易云音乐源
 - 歌名里带“伴奏”时会优先匹配伴奏版本
 - `@麦克风` 只执行一次状态切换，不再判断当前开关状态
+- `@过来` 是默认 `custom_workflows` 参考命令，好友私聊触发，效果等同邀请 BOT 前往该好友大厅
 - `@禁用` 会停止识别蓝色/黄色大厅命令，但粉色好友命令仍然可用
 - `@启用` 会恢复蓝色/黄色大厅命令识别
 
@@ -156,6 +159,78 @@ cargo check --target x86_64-pc-windows-gnu --features ocr-rs/docsrs
 ```
 
 20 秒内无人选择时会自动确认。没有搜到候选时会提示当前平台没有对应音源，并允许换源或改用 AI
+
+## 自定义流程
+
+`config.yaml` 的 `custom_workflows` 可以添加配置驱动的大厅或好友命令。内置命令优先于自定义命令；默认自定义命令不接受参数，需要参数时给流程设置 `allow_args: true`
+
+顶层参数：
+
+- `enabled`：是否启用配置驱动的自定义流程命令。关闭后只识别内置命令
+- `default_threshold`：模板匹配默认阈值，用于 `click_template`、`wait_template`、`wait_template_absent`，单个步骤可用 `threshold` 覆盖
+- `default_timeout_ms`：等待模板或 OCR 文字出现/消失的默认超时时间，单位毫秒，单个步骤可用 `timeout_ms` 覆盖
+- `default_poll_ms`：等待模板或 OCR 文字时的默认轮询间隔，单位毫秒，实际最小值为 50ms，单个步骤可用 `poll_ms` 覆盖
+- `default_step_wait_ms`：非 `sleep/wait` 步骤执行后的默认等待时间，单位毫秒，单个步骤可用 `wait_ms` 覆盖
+- `templates`：模板别名到图片路径的映射。步骤里的 `template` 会先按别名查这里，查不到时把 `template` 当作实际文件路径
+- `workflows`：自定义流程列表，每一项定义一个可触发的命令流程
+
+单个 `workflow` 参数：
+
+- `enabled`：是否启用这个流程
+- `name`：流程名，用于日志、执行定位和去重；为空时使用命令名作为流程名
+- `commands`：触发命令列表，写命令名本身即可，例如 `测试流程`，聊天里使用 `@测试流程`
+- `allow_args`：是否允许命令后带参数。为 `false` 时 `@测试流程 参数` 不会匹配；为 `true` 时参数可通过变量读取
+- `message_types`：允许触发的聊天类型，常用 `blue` 或 `pink`；留空表示不限制类型
+- `confirm_before_run`：执行步骤前是否需要确认。为 `true` 时会先发送确认提示，收到允许来源里的 `@确认` 才继续执行，收到 `@跳过` 或超时会取消
+- `confirm_message`：确认提示内容。为空时使用默认提示；支持变量
+- `confirm_message_types`：确认命令来源。`[blue]` 只接受大厅确认，`[pink]` 只接受好友私聊确认，`[blue, pink]` 两者都接受，留空表示不限制来源
+- `confirm_timeout_ms`：确认等待超时时间，单位毫秒；不填时使用 `timing.decision_timeout_ms`
+- `confirm_poll_ms`：确认等待轮询间隔，单位毫秒；不填时使用 `timing.decision_poll_ms`，实际最小值为 50ms
+- `steps`：按顺序执行的步骤列表。任一步骤失败会中止流程，并走普通命令失败后的返回处理
+- `success_message`：全部步骤成功后发送到大厅的消息；空字符串表示不发送
+
+步骤通用参数：
+
+- `type`：步骤类型，必填
+- `wait_ms`：对 `sleep/wait` 表示等待时长；对其他步骤表示该步骤完成后的额外等待时长
+- `timeout_ms`：覆盖等待模板或 OCR 文字的超时时间；`sleep/wait` 没有 `wait_ms` 时也会使用它
+- `poll_ms`：覆盖等待模板或 OCR 文字时的轮询间隔
+- `threshold`：覆盖模板匹配阈值
+- `region`：模板匹配或 OCR 找文字的屏幕区域，格式为 `{ x, y, width, height }`
+- `point`：固定点击点，格式为 `{ x, y }`
+- `click_offset`：模板或文字命中点的点击偏移，格式为 `{ x, y }`
+- `template`：模板别名或图片路径，用于模板相关步骤
+- `key`：按键名，用于 `key/press_key`，支持 `Enter`、`Esc`、`F1` 到 `F12` 和单字符按键
+- `text`：文字内容，用于 `click_text`、`wait_text`、`paste`，也可作为发送消息的兜底内容
+- `message`：发送内容，用于 `send_chat`、`send_current_chat`、`send_friend_message`，优先于 `text`
+- `target`：好友名，用于 `send_friend_message`；不填时默认发送给触发命令的好友
+
+支持的步骤类型：
+
+- `sleep` / `wait`：等待一段时间
+- `key` / `press_key`：向游戏窗口发送按键
+- `click`：点击固定坐标 `point`
+- `click_template`：在 `region` 内等待模板出现，命中后点击模板中心加 `click_offset`
+- `wait_template`：在 `region` 内等待模板出现，不点击
+- `wait_template_absent`：在 `region` 内等待模板消失
+- `click_text`：在 `region` 内 OCR 查找 `text`，命中后点击文字中心加 `click_offset`
+- `wait_text`：在 `region` 内 OCR 查找 `text`，命中后继续，不点击
+- `paste` / `paste_text`：把 `text` 粘贴到当前焦点
+- `send_chat` / `reply`：按普通大厅回复流程发送 `message`
+- `send_current_chat`：向当前已打开的聊天输入框发送 `message`
+- `send_friend_message` / `friend_reply`：打开 `target` 好友聊天，发送 `message`，然后返回一级界面
+- `invite_user` / `invite_current_user`：调用内置邀请流程，默认邀请触发命令的好友；也可以用 `target` 指定好友名
+- `return_primary`：尝试返回一级界面
+
+步骤里的 `text`、`message`、`target`、`template`、`key`、`success_message` 支持变量：
+
+- `{{username}}` / `{{user}}`：触发命令的用户名
+- `{{args}}` / `{{param}}` / `{{params}}`：命令后的完整参数
+- `{{arg1}}`、`{{arg2}}`：按空白分隔后的第 1、2 个参数，序号从 1 开始
+- `{{command}}` / `{{command_name}}`：匹配到的命令名
+- `{{workflow}}` / `{{workflow_name}}`：流程名
+- `{{message_type}}`：消息类型，例如 `blue` 或 `pink`
+- `{{user_command}}`：用户原始命令文本
 
 ## 手动调试工具
 

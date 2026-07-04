@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow};
 use serde_yaml::{Mapping, Value};
 
-pub const CURRENT_CONFIG_VERSION: u32 = 12;
+pub const CURRENT_CONFIG_VERSION: u32 = 10;
 
 struct ChangedDefaultField {
     path: &'static str,
@@ -36,6 +36,18 @@ const CHANGED_BOOL_DEFAULT_FIELDS: &[ChangedBoolDefaultField] = &[ChangedBoolDef
     path: "tui.enabled",
     old_default: false,
     changed_in_version: 6,
+}];
+
+struct ChangedFloatDefaultField {
+    path: &'static str,
+    old_default: f64,
+    changed_in_version: u32,
+}
+
+const CHANGED_FLOAT_DEFAULT_FIELDS: &[ChangedFloatDefaultField] = &[ChangedFloatDefaultField {
+    path: "custom_workflows.default_threshold",
+    old_default: 0.82,
+    changed_in_version: 10,
 }];
 
 const MOVED_FIELDS: &[(&str, &str)] = &[
@@ -116,6 +128,7 @@ pub fn migrate_config_text(old_text: &str, default_text: &str) -> Result<Option<
         &mut migrated_count,
     );
     migrate_changed_default_fields(&old_value, &default_value, &mut new_value, old_version);
+    normalize_custom_workflows(&mut new_value);
     set_path(
         &mut new_value,
         &["config_version"],
@@ -186,6 +199,74 @@ fn migrate_changed_default_fields(
         };
         let _ = set_path(new_value, &path, current_default.clone());
     }
+    for field in CHANGED_FLOAT_DEFAULT_FIELDS {
+        if old_version.is_some_and(|version| version >= field.changed_in_version as u64) {
+            continue;
+        }
+        let path = split_path(field.path);
+        let Some(old_value) = get_path(old_value, &path).and_then(Value::as_f64) else {
+            continue;
+        };
+        if (old_value - field.old_default).abs() > f64::EPSILON {
+            continue;
+        }
+        let Some(current_default) = get_path(default_value, &path) else {
+            continue;
+        };
+        let _ = set_path(new_value, &path, current_default.clone());
+    }
+}
+
+fn normalize_custom_workflows(value: &mut Value) {
+    let Some(Value::Sequence(workflows)) = get_path_mut(value, &["custom_workflows", "workflows"])
+    else {
+        return;
+    };
+    for workflow in workflows {
+        let Value::Mapping(workflow_map) = workflow else {
+            continue;
+        };
+        insert_missing(workflow_map, "enabled", Value::Bool(true));
+        insert_missing(workflow_map, "name", Value::String(String::new()));
+        insert_missing(workflow_map, "commands", Value::Sequence(Vec::new()));
+        insert_missing(workflow_map, "allow_args", Value::Bool(false));
+        insert_missing(
+            workflow_map,
+            "message_types",
+            Value::Sequence(vec![Value::String("blue".to_string())]),
+        );
+        insert_missing(workflow_map, "confirm_before_run", Value::Bool(false));
+        insert_missing(
+            workflow_map,
+            "confirm_message",
+            Value::String(String::new()),
+        );
+        insert_missing(
+            workflow_map,
+            "confirm_message_types",
+            Value::Sequence(vec![Value::String("blue".to_string())]),
+        );
+        insert_missing(workflow_map, "steps", Value::Sequence(Vec::new()));
+        insert_missing(
+            workflow_map,
+            "success_message",
+            Value::String(String::new()),
+        );
+
+        let Some(Value::Sequence(steps)) = map_get_mut(workflow_map, "steps") else {
+            continue;
+        };
+        for step in steps {
+            let Value::Mapping(step_map) = step else {
+                continue;
+            };
+            insert_missing(step_map, "type", Value::String(String::new()));
+        }
+    }
+}
+
+fn insert_missing(map: &mut Mapping, key: &str, value: Value) {
+    map.entry(Value::String(key.to_string())).or_insert(value);
 }
 
 pub fn backup_path(path: &Path) -> PathBuf {
@@ -211,6 +292,15 @@ fn copy_common_fields(
 ) {
     match (old_value, default_value) {
         (Value::Mapping(old_map), Value::Mapping(default_map)) => {
+            if default_map.is_empty() && !path.is_empty() {
+                if set_path(new_value, &path_as_strs(path), old_value.clone()).is_ok() {
+                    used_paths.insert(path_key(path));
+                    if old_value != default_value {
+                        *migrated_count += 1;
+                    }
+                }
+                return;
+            }
             for (key, old_child) in old_map {
                 let Some(key) = key.as_str() else {
                     continue;
@@ -329,6 +419,7 @@ fn collect_unmigrated_fields(
 
 fn collect_template_paths(value: &Value, path: &mut Vec<String>, output: &mut Vec<Vec<String>>) {
     match value {
+        Value::Mapping(map) if map.is_empty() => output.push(path.clone()),
         Value::Mapping(map) => {
             for (key, child) in map {
                 let Some(key) = key.as_str() else {
@@ -469,6 +560,17 @@ fn get_path<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
     Some(current)
 }
 
+fn get_path_mut<'a>(value: &'a mut Value, path: &[&str]) -> Option<&'a mut Value> {
+    let mut current = value;
+    for key in path {
+        let Value::Mapping(map) = current else {
+            return None;
+        };
+        current = map_get_mut(map, key)?;
+    }
+    Some(current)
+}
+
 fn set_path(value: &mut Value, path: &[&str], replacement: Value) -> Result<()> {
     let Some((last, parents)) = path.split_last() else {
         return Err(anyhow!("empty config path"));
@@ -537,7 +639,7 @@ mod tests {
 
     const DEFAULT: &str = r#"# test config
 # version comment
-config_version: 12
+config_version: 10
 
 timing:
   # fallback comment
@@ -558,6 +660,15 @@ ocr:
 
 output:
   send_enabled: true
+
+custom_workflows:
+  enabled: true
+  default_threshold: 0.9
+  default_timeout_ms: 5000
+  default_poll_ms: 200
+  default_step_wait_ms: 300
+  templates: {}
+  workflows: []
 "#;
 
     #[test]
@@ -577,7 +688,7 @@ unknown_root:
             .expect("migration needed");
 
         assert!(report.text.contains("# fallback comment"));
-        assert!(report.text.contains("config_version: 12"));
+        assert!(report.text.contains("config_version: 10"));
         assert!(report.text.contains("chat_scan_fallback_ms: 1234"));
         assert!(report.text.contains("scan_loop_idle_ms: 77"));
         assert!(report.text.contains("output_focus_ms: 456"));
@@ -598,7 +709,7 @@ unknown_root:
 
     #[test]
     fn current_version_without_moved_fields_does_not_migrate() {
-        let current = r#"config_version: 12
+        let current = r#"config_version: 10
 timing:
   chat_scan_fallback_ms: 2000
   scan_loop_idle_ms: 60
@@ -647,6 +758,73 @@ ocr:
     }
 
     #[test]
+    fn normalizes_custom_workflow_fields() {
+        let old = r#"config_version: 9
+custom_workflows:
+  workflows:
+    - name: example
+      commands: [测试流程]
+      steps:
+        - type: key
+          key: F2
+"#;
+
+        let report = migrate_config_text(old, DEFAULT)
+            .expect("migration succeeds")
+            .expect("migration needed");
+
+        assert!(report.text.contains("config_version: 10"));
+        assert!(report.text.contains("allow_args: false"));
+        assert!(report.text.contains("message_types:"));
+        assert!(report.text.contains("confirm_before_run: false"));
+        assert!(report.text.contains("confirm_message: ''"));
+        assert!(report.text.contains("confirm_message_types:"));
+        assert!(report.text.contains("success_message: ''"));
+    }
+
+    #[test]
+    fn keeps_custom_workflow_template_mappings() {
+        let old = r#"config_version: 9
+custom_workflows:
+  templates:
+    my_button: assets/my-button.png
+  workflows:
+    - name: example
+      commands: [测试流程]
+      steps:
+        - type: click_template
+          template: my_button
+"#;
+
+        let report = migrate_config_text(old, DEFAULT)
+            .expect("migration succeeds")
+            .expect("migration needed");
+
+        assert!(report.text.contains("templates:"));
+        assert!(report.text.contains("my_button: assets/my-button.png"));
+        assert!(
+            !report
+                .unmigrated
+                .iter()
+                .any(|item| item.path.starts_with("custom_workflows.templates"))
+        );
+    }
+
+    #[test]
+    fn migrates_custom_workflow_threshold_default_to_current() {
+        let old = r#"config_version: 9
+custom_workflows:
+  default_threshold: 0.82
+"#;
+
+        let report = migrate_config_text(old, DEFAULT)
+            .expect("migration succeeds")
+            .expect("migration needed");
+
+        assert!(report.text.contains("default_threshold: 0.9"));
+    }
+
+    #[test]
     fn migrates_v3_auto_advance_default_to_one_second() {
         let old = r#"config_version: 3
 queue:
@@ -671,7 +849,7 @@ queue:
             .expect("migration succeeds")
             .expect("migration needed");
 
-        assert!(report.text.contains("config_version: 12"));
+        assert!(report.text.contains("config_version: 10"));
         assert!(report.text.contains("auto_advance_seconds: 1"));
     }
 
@@ -686,7 +864,7 @@ tui:
             .expect("migration succeeds")
             .expect("migration needed");
 
-        assert!(report.text.contains("config_version: 12"));
+        assert!(report.text.contains("config_version: 10"));
         assert!(report.text.contains("enabled: true"));
         assert!(report.text.contains("protect_auto_played_songs: true"));
     }

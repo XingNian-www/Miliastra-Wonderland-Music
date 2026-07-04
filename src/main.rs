@@ -2447,7 +2447,7 @@ mod app {
                         parsed,
                         &format!("custom workflow {}", command.workflow),
                     )?;
-                    self.execute_custom_workflow(command)?;
+                    self.execute_custom_workflow(command, parsed)?;
                 }
             };
             Ok(())

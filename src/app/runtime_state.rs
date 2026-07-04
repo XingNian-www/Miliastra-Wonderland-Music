@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-pub const HALL_EXPIRING_WARNING_MINUTES: u32 = 5;
+pub const HALL_EXPIRING_WARNING_MINUTES: u32 = 10;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 #[serde(default, rename_all = "camelCase")]

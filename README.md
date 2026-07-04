@@ -1,31 +1,35 @@
-# 某动漫游戏点歌机器人
+# Miliastra Wonderland Music
 
-这是一个仅支持 Windows 的 Rust 点歌机器人。程序会识别某动漫游戏聊天区里的 `@` 命令，通过 FeelUOwn 控制搜索、播放、歌词和状态，并用键盘鼠标自动把回复发回游戏聊天
+这是一个仅支持 Windows 的 Rust 点歌机器人。程序会截取目标游戏窗口客户区，识别聊天区里的命令，通过 FeelUOwn 控制搜索、播放、队列和状态，再用键盘鼠标把回复发回游戏聊天
 
 ## 主要功能
 
 - 只截取目标游戏窗口客户区，不截取整个桌面
-- 通过蓝色、黄色、粉色聊天标志定位消息，再对消息块做中文识别
-- 支持点歌、AI 点歌、队列、播放控制、音量、状态、歌词、大厅检测、大厅时间、邀请和麦克风切换
-- 点歌默认使用 QQ 音乐源，也可以用命令指定网易云音乐源
-- 点歌会先搜索候选，搜到后让用户确认、跳过、换源或改用 AI；超时会自动确认
-- 播放统一走搜索结果 URI，避免播放器内部模糊搜索选错歌
-- AI 点歌会先从各音乐源搜索候选，再让 AI 从候选里选择最合适的一项
-- 队列支持持久化，当前歌曲快结束、暂停或停止时可自动出队播放下一首
-- 命令执行在后台线程进行，聊天扫描会持续运行
-- 好友粉色命令支持邀请、麦克风切换、禁用/启用大厅命令识别
-- 提供本地网页和接口面板，默认监听 `127.0.0.1:18888`
-- 运行状态、队列和日志都会写入本地文件
-- 提供手动调试工具，用于截图、识别、聊天扫描、界面状态、模板匹配、发送测试、AI 搜索测试等
-- 支持全局热键：`F7` 暂停/恢复扫描，`F12` 退出
+- 通过蓝色、黄色、粉色聊天标志切分聊天块；命令只处理蓝色大厅消息和粉色好友私聊
+- 支持大厅点歌、AI 点歌、搜索确认、队列、播放控制、音量、状态、歌词、大厅检测和大厅剩余时间
+- 支持好友私聊点歌、邀请、麦克风切换、非粉色命令开关、闲置退出、UID 拉黑和 UID 屏蔽聊天
+- 点歌会先搜索候选，再等待 `@确认`、`@跳过`、`@换源`、`@AI`；超时按确认处理
+- 播放统一走搜索结果 URI，减少播放器内部模糊搜索选错歌的情况
+- AI 点歌会先从音乐源搜索候选，再让 AI 从候选里选择，不让 AI 直接编歌曲 URI
+- 队列会持久化，当前歌曲接近结束、暂停或停止时可以自动播放下一首
+- 命令执行在后台任务里跑，聊天扫描会持续运行
+- 提供本地网页和 HTTP 接口，初始监听 `127.0.0.1:18888`
+- 提供终端 TUI，显示日志、OCR 和队列状态
+- 提供手动调试工具，用于截图、OCR、聊天扫描、UI 状态、模板匹配、发送测试和 AI 搜索测试
+- 支持全局热键：`F7` 暂停/恢复扫描，`F12` 退出程序
 
-## 构建 Windows 程序
+## 发布包
 
-仓库内置 GitHub Actions 工作流：`.github/workflows/build-windows-exe.yml`
+GitHub Actions 工作流在 `.github/workflows/build-windows-exe.yml`
 
-这个工作流不会在每次推送时自动运行，需要在 GitHub Actions 页面手动执行构建。构建成功后会创建或更新 GitHub Release，并上传 Windows x64 压缩包
+触发方式：
 
-构建会生成 `x86_64-pc-windows-msvc` 发布产物，并下载 PP-OCRv6 小模型：
+- 在 GitHub Actions 页面手动执行 `workflow_dispatch`
+- 推送到 `main` 或 `dev`，并且本次推送包含 `Cargo.toml`
+
+推送触发时会比较 `Cargo.toml` 的 `[package].version`。只有版本号真的变化才会继续构建、打包和创建 Release；普通 `Cargo.toml` 改动会跳过构建
+
+构建产物是 `x86_64-pc-windows-msvc`，会下载 PP-OCRv6 小模型：
 
 ```text
 models/PP-OCRv6_small_det.mnn
@@ -33,11 +37,11 @@ models/PP-OCRv6_small_rec.mnn
 models/ppocr_keys_v6_small.txt
 ```
 
-发布包结构大致如下：
+发布包结构：
 
 ```text
-程序发布包/
-├── 程序.exe
+miliastra-wonderland-music-windows-x64/
+├── miliastra-wonderland-music.exe
 ├── MNN.dll
 ├── config.yaml
 ├── assets/
@@ -45,9 +49,11 @@ models/ppocr_keys_v6_small.txt
 └── README.md
 ```
 
+`config.yaml` 是运行必需文件。程序不会在运行时创建新配置文件
+
 ## 本地构建
 
-正式发布建议使用 Windows MSVC 目标，并使用仓库内置的 MNN 3.6.0 Windows x64 动态库：
+正式发布使用 Windows MSVC 目标，并使用仓库内置的 MNN 3.6.0 Windows x64 动态库：
 
 ```powershell
 rustup default stable-x86_64-pc-windows-msvc
@@ -62,11 +68,11 @@ vendor/mnn/3.6.0/windows-x64/lib/MNN.lib
 vendor/mnn/3.6.0/windows-x64/bin/MNN.dll
 ```
 
-构建时会把 `MNN.dll` 复制到发布程序旁边。识别后端默认使用 CPU。发布路径不支持 CUDA、Vulkan、OpenCL、源码编译版 MNN 或其他预编译 MNN 包
+构建时会把 `MNN.dll` 复制到程序旁边。识别后端使用 CPU。发布路径不支持 CUDA、Vulkan、OpenCL、源码编译版 MNN 或其他预编译 MNN 包
 
 运行机器还需要安装 Microsoft Visual C++ Redistributable 2015-2022 x64，因为官方 MNN 动态库依赖 `MSVCP140.dll`、`VCRUNTIME140.dll` 和 `VCRUNTIME140_1.dll`
 
-Linux 可以用来做 Windows GNU 目标的检查，但这不是正式发布构建路径：
+Linux 可以用来做 Windows GNU 目标检查，但这不是正式发布构建路径：
 
 ```bash
 cargo check --target x86_64-pc-windows-gnu --features ocr-rs/docsrs
@@ -77,272 +83,399 @@ cargo check --target x86_64-pc-windows-gnu --features ocr-rs/docsrs
 直接运行：
 
 ```powershell
-程序.exe
+miliastra-wonderland-music.exe
 ```
 
 指定配置文件运行：
 
 ```powershell
-程序.exe --config config.yaml run
+miliastra-wonderland-music.exe --config config.yaml run
 ```
 
-发布包内已包含带注释的 `config.yaml`。程序不会自动生成配置文件；如果配置文件不存在，请把发布包里的 `config.yaml` 放在程序工作目录，或用 `--config` 指定路径
+启动手动工具：
+
+```powershell
+miliastra-wonderland-music.exe --config config.yaml manual
+```
+
+常用离线调试子命令：
+
+```text
+ocr-image --image path.png
+ocr-region --image path.png --rect x,y,w,h
+scan-chat --image path.png
+ui-state --image path.png
+hall-name --image path.png
+match-template --image path.png --template assets/xxx.png --rect x,y,w,h
+click-template --template assets/xxx.png --rect x,y,w,h --execute
+click --x 100 --y 100 --execute
+key --key Enter --execute
+send-chat --message 测试 --execute
+```
+
+`--execute` 才会真的点击、按键或发送聊天。没有 `--execute` 时只做检测或打印结果
 
 ## 运行要求
 
 - Windows 系统
-- 某动漫游戏进程正在运行，并已在 `config.yaml` 的 `window.target_process` 中填写进程名
-- FeelUOwn 已启动并开启 TCP RPC，默认地址 `127.0.0.1:23333`
-- `models/` 目录里有识别模型
+- 目标游戏进程正在运行，并已在 `config.yaml` 的 `window.target_process` 中填写进程名
+- FeelUOwn 已启动并开启 TCP RPC，初始地址为 `127.0.0.1:23333`
+- `models/` 目录里有 OCR 模型
 - `assets/` 目录里有聊天标志和界面按钮模板
 - 已安装 Microsoft Visual C++ Redistributable 2015-2022 x64
+- 游戏画面、配置坐标和模板素材需要对应同一套分辨率，初始配置按 1920x1080 客户区写坐标
 
-## 聊天命令
+## 聊天命令规则
 
-普通聊天命令需要出现在聊天名称分隔符之后，并以 `@` 开头
+普通大厅命令来自蓝色聊天消息，格式需要包含用户名分隔符，并以 `@` 开头：
 
 ```text
 用户: @点歌 晴天
-用户: @AI点歌 晴天 周杰伦
-用户: @QQ点歌 晴天
-用户: @网易点歌 晴天
-用户: @暂停
-用户: @继续
-用户: @播放
-用户: @下一首
-用户: @上一首
-用户: @音量 30
 用户: @状态
-用户: @歌词
-用户: @队列
-用户: @队列删除 1
-用户: @队列清空
-用户: @帮助
-用户: @大厅检测
-用户: @大厅时间
 ```
 
-粉色好友命令：
+好友私聊命令来自粉色聊天消息，用户名需要能从中括号里识别：
 
 ```text
-@邀请1
-@过来
-@麦克风
-@禁用
-@启用
+[好友名]：@过来
+[好友名]：@麦克风
 ```
 
-说明：
+黄色聊天标志只用于辅助切分聊天块，不作为命令来源。`@帮助` 只展示基础命令，不展示隐藏命令和管理命令
 
-- `@点歌` 默认使用 QQ 音乐源
-- `@QQ点歌` 强制使用 QQ 音乐源
-- `@网易点歌` 强制使用网易云音乐源
-- 歌名里带“伴奏”时会优先匹配伴奏版本
-- `@麦克风` 只执行一次状态切换，不再判断当前开关状态
-- `@过来` 是默认 `custom_workflows` 参考命令，好友私聊触发，效果等同邀请 BOT 前往该好友大厅
-- `@禁用` 会停止识别蓝色/黄色大厅命令，但粉色好友命令仍然可用
-- `@启用` 会恢复蓝色/黄色大厅命令识别
+## 大厅命令
 
-点歌确认命令：
+| 命令 | 说明 |
+| --- | --- |
+| `@点歌 歌名 歌手` / `@搜索 歌名 歌手` | 使用 QQ 音乐搜索并点歌 |
+| `@AI点歌 歌名 歌手` / `@AI搜索 歌名 歌手` | 先搜索候选，再让 AI 选择 |
+| `@QQ点歌 歌名 歌手` / `@QQ搜索 歌名 歌手` | 强制使用 QQ 音乐 |
+| `@网易点歌 歌名 歌手` / `@网易搜索 歌名 歌手` | 强制使用网易云音乐 |
+| `@暂停` | 暂停播放 |
+| `@继续` / `@恢复` / `@播放` | 继续播放 |
+| `@下一首` / `@下一曲` | 播放下一首 |
+| `@上一首` / `@上一曲` | 播放上一首 |
+| `@音量 30` | 设置音量，范围 `0-100` |
+| `@状态` | 查询当前播放状态 |
+| `@歌词` | 查询当前歌词 |
+| `@队列` / `@列表` | 查看点歌队列 |
+| `@队列删除 1` | 删除队列第 1 首。支持写多个数字，如 `@队列删除 13` |
+| `@队列清空` | 清空队列 |
+| `@大厅检测` | 打开 F2 大厅页识别当前大厅 |
+| `@大厅时间` | 回复已识别到的大厅剩余时间 |
+| `@帮助` | 发送基础帮助 |
 
-```text
-@确认
-@跳过
-@换源
-@AI
-```
+点歌说明：
 
-当点歌搜到候选时，机器人会回复类似：
+- 歌名里带 `伴奏` 或 `伴唱` 时，会优先匹配伴奏/伴唱候选
+- `@点歌`、`@搜索`、`@AI点歌`、`@AI搜索` 在大厅里不接受 B 站源
+- `@B站点歌` 和 `@B站搜索` 只在粉色好友私聊里生效
+- AI 功能需要配置 `ai.api_key`，留空时 AI 命令会回复未启用
+
+## 点歌确认命令
+
+当搜到候选或匹配不确定时，机器人会发类似内容：
 
 ```text
 搜索到:歌曲名,@确认@跳过@换源@AI
 ```
 
-20 秒内无人选择时会自动确认。没有搜到候选时会提示当前平台没有对应音源，并允许换源或改用 AI
+可用回复：
+
+| 命令 | 说明 |
+| --- | --- |
+| `@确认` | 接受当前候选 |
+| `@跳过` | 取消本次点歌 |
+| `@换源` | 在 QQ 音乐和网易云音乐之间换源重搜 |
+| `@AI` | 改用 AI 从候选里选择 |
+
+20 秒内没有选择时，按 `@确认` 处理
+
+## 好友私聊命令
+
+粉色好友私聊支持点歌，也支持管理类命令
+
+| 命令 | 说明 |
+| --- | --- |
+| `@点歌 歌名 歌手` / `@搜索 歌名 歌手` | 好友私聊点歌，使用 QQ 音乐 |
+| `@AI点歌 歌名 歌手` / `@AI搜索 歌名 歌手` | 好友私聊 AI 点歌 |
+| `@QQ点歌 歌名 歌手` / `@QQ搜索 歌名 歌手` | 好友私聊 QQ 音乐点歌 |
+| `@网易点歌 歌名 歌手` / `@网易搜索 歌名 歌手` | 好友私聊网易云音乐点歌 |
+| `@B站点歌 关键词` / `@B站搜索 关键词` | 好友私聊 B 站源点歌 |
+| `@邀请1` | 邀请机器人前往该好友大厅，数字范围 `1-1000`，用于防止同屏重复执行 |
+| `@过来` | 配置里的自定义流程参考命令，效果等同邀请机器人前往该好友大厅 |
+| `@麦克风` | 按 `N` 切换麦克风状态；当前在公共大厅时跳过 |
+
+邀请确认命令在蓝色大厅消息里发送：
+
+| 命令 | 说明 |
+| --- | --- |
+| `@邀请确认` / `@同意邀请` | 同意好友邀请 |
+| `@邀请拒绝` / `@拒绝邀请` | 拒绝好友邀请 |
+
+邀请流程会先检测当前是否公共大厅。当前是公共大厅时直接执行；不是公共大厅时会在大厅发起确认，30 秒内无人回复则按同意处理
+
+## 隐藏命令
+
+这些命令不会出现在 `@帮助` 里，但只要粉色好友私聊能被识别就会执行
+
+| 命令 | 说明 |
+| --- | --- |
+| `@禁用` | 关闭非粉色命令识别。大厅命令和蓝色自定义流程会被跳过，粉色好友命令仍可用 |
+| `@启用` | 恢复非粉色命令识别 |
+| `@闲置退出` | 设置 30 分钟无新命令后关闭目标游戏窗口并退出程序 |
+| `@闲置退出 20` / `@闲置退出 20分钟` | 设置闲置退出时间，最小值为 15 分钟 |
+| `@拉黑UID123456789` / `@拉黑123456789` | 发起 UID 拉黑投票，UID 必须是 9 位数字 |
+| `@屏蔽UID123456789` / `@屏蔽123456789` | 发起 UID 屏蔽聊天投票，UID 必须是 9 位数字 |
+
+`@禁用` 不会影响粉色私聊里的 `@启用`、`@过来`、`@麦克风`、UID 操作等命令。进入新大厅后程序会重置命令识别状态
+
+## UID 拉黑和屏蔽聊天
+
+UID 操作只接受粉色好友私聊命令：
+
+```text
+[管理员]：@拉黑UID123456789
+[管理员]：@屏蔽UID123456789
+```
+
+流程：
+
+1. 机器人在大厅通告本次请求
+2. 后台等待粉色好友私聊投票，不阻塞普通点歌、状态、切歌等命令
+3. 好友发送 `@同意` 或 `@不同意`
+4. 同一好友同一判决需要连续稳定识别 `stable_vote_samples` 次才计入
+5. `同意人数 - 不同意人数 >= required_vote_margin` 时立即通过
+6. 等待超时后，如果稳定反对人数为 `0`，也按通过处理
+7. 投票通过后进入好友界面搜索 UID，执行拉黑或屏蔽聊天，并回大厅通告结果
+
+初始投票参数：
+
+```yaml
+moderation:
+  vote_timeout_ms: 120000
+  vote_poll_ms: 2000
+  stable_vote_samples: 3
+  required_vote_margin: 3
+```
+
+同一个 `动作 + UID` 同时只会有一个投票或执行流程，重复请求会回复正在处理中
 
 ## 自定义流程
 
-`config.yaml` 的 `custom_workflows` 可以添加配置驱动的大厅或好友命令。内置命令优先于自定义命令；默认自定义命令不接受参数，需要参数时给流程设置 `allow_args: true`
+`config.yaml` 的 `custom_workflows` 可以添加配置驱动的大厅或好友命令。内置命令优先于自定义命令；自定义命令不带参数时能直接匹配，需要参数时给流程设置 `allow_args: true`
 
 顶层参数：
 
-- `enabled`：是否启用配置驱动的自定义流程命令。关闭后只识别内置命令
-- `default_threshold`：模板匹配默认阈值，用于 `click_template`、`wait_template`、`wait_template_absent`，单个步骤可用 `threshold` 覆盖
-- `default_timeout_ms`：等待模板或 OCR 文字出现/消失的默认超时时间，单位毫秒，单个步骤可用 `timeout_ms` 覆盖
-- `default_poll_ms`：等待模板或 OCR 文字时的默认轮询间隔，单位毫秒，实际最小值为 50ms，单个步骤可用 `poll_ms` 覆盖
-- `default_step_wait_ms`：非 `sleep/wait` 步骤执行后的默认等待时间，单位毫秒，单个步骤可用 `wait_ms` 覆盖
-- `templates`：模板别名到图片路径的映射。步骤里的 `template` 会先按别名查这里，查不到时把 `template` 当作实际文件路径
-- `workflows`：自定义流程列表，每一项定义一个可触发的命令流程
+| 参数 | 说明 |
+| --- | --- |
+| `enabled` | 是否启用配置驱动的自定义流程命令 |
+| `default_threshold` | 模板匹配阈值，用于 `click_template`、`wait_template`、`wait_template_absent` |
+| `default_timeout_ms` | 等待模板或 OCR 文字出现/消失的超时时间，单位毫秒 |
+| `default_poll_ms` | 等待模板或 OCR 文字时的轮询间隔，单位毫秒，实际最小值 50ms |
+| `default_step_wait_ms` | 非等待步骤执行后的等待时间，单位毫秒 |
+| `templates` | 模板别名到图片路径的映射 |
+| `workflows` | 自定义流程列表 |
 
 单个 `workflow` 参数：
 
-- `enabled`：是否启用这个流程
-- `name`：流程名，用于日志、执行定位和去重；为空时使用命令名作为流程名
-- `commands`：触发命令列表，写命令名本身即可，例如 `测试流程`，聊天里使用 `@测试流程`
-- `allow_args`：是否允许命令后带参数。为 `false` 时 `@测试流程 参数` 不会匹配；为 `true` 时参数可通过变量读取
-- `message_types`：允许触发的聊天类型，常用 `blue` 或 `pink`；留空表示不限制类型
-- `confirm_before_run`：执行步骤前是否需要确认。为 `true` 时会先发送确认提示，收到允许来源里的 `@确认` 才继续执行，收到 `@跳过` 或超时会取消
-- `confirm_message`：确认提示内容。为空时使用默认提示；支持变量
-- `confirm_message_types`：确认命令来源。`[blue]` 只接受大厅确认，`[pink]` 只接受好友私聊确认，`[blue, pink]` 两者都接受，留空表示不限制来源
-- `confirm_timeout_ms`：确认等待超时时间，单位毫秒；不填时使用 `timing.decision_timeout_ms`
-- `confirm_poll_ms`：确认等待轮询间隔，单位毫秒；不填时使用 `timing.decision_poll_ms`，实际最小值为 50ms
-- `steps`：按顺序执行的步骤列表。任一步骤失败会中止流程，并走普通命令失败后的返回处理
-- `success_message`：全部步骤成功后发送到大厅的消息；空字符串表示不发送
+| 参数 | 说明 |
+| --- | --- |
+| `enabled` | 是否启用这个流程 |
+| `name` | 流程名，用于日志、执行定位和去重；为空时使用命令名 |
+| `commands` | 触发命令列表，写命令名本身即可，例如 `测试流程`，聊天里使用 `@测试流程` |
+| `allow_args` | 是否允许命令后带参数 |
+| `message_types` | 允许触发的聊天类型，支持 `blue`、`pink`；留空表示不限制这两类 |
+| `confirm_before_run` | 执行步骤前是否需要确认 |
+| `confirm_message` | 确认提示内容，支持变量 |
+| `confirm_message_types` | 确认命令来源。`[blue]` 只接受大厅确认，`[pink]` 只接受好友私聊确认，留空表示不限 |
+| `confirm_timeout_ms` | 确认等待超时时间，单位毫秒；不填时使用 `timing.decision_timeout_ms` |
+| `confirm_poll_ms` | 确认等待轮询间隔，单位毫秒；不填时使用 `timing.decision_poll_ms` |
+| `steps` | 按顺序执行的步骤列表，任一步骤失败会中止流程 |
+| `success_message` | 全部步骤成功后发送到大厅的消息；空字符串表示不发送 |
 
 步骤通用参数：
 
-- `type`：步骤类型，必填
-- `wait_ms`：对 `sleep/wait` 表示等待时长；对其他步骤表示该步骤完成后的额外等待时长
-- `timeout_ms`：覆盖等待模板或 OCR 文字的超时时间；`sleep/wait` 没有 `wait_ms` 时也会使用它
-- `poll_ms`：覆盖等待模板或 OCR 文字时的轮询间隔
-- `threshold`：覆盖模板匹配阈值
-- `region`：模板匹配或 OCR 找文字的屏幕区域，格式为 `{ x, y, width, height }`
-- `point`：固定点击点，格式为 `{ x, y }`
-- `click_offset`：模板或文字命中点的点击偏移，格式为 `{ x, y }`
-- `template`：模板别名或图片路径，用于模板相关步骤
-- `key`：按键名，用于 `key/press_key`，支持 `Enter`、`Esc`、`F1` 到 `F12` 和单字符按键
-- `text`：文字内容，用于 `click_text`、`wait_text`、`paste`，也可作为发送消息的兜底内容
-- `message`：发送内容，用于 `send_chat`、`send_current_chat`、`send_friend_message`，优先于 `text`
-- `target`：好友名，用于 `send_friend_message`；不填时默认发送给触发命令的好友
+| 参数 | 说明 |
+| --- | --- |
+| `type` | 步骤类型，必填 |
+| `wait_ms` | 对 `sleep/wait` 表示等待时长；对其他步骤表示完成后的额外等待时长 |
+| `timeout_ms` | 覆盖等待模板或 OCR 文字的超时时间 |
+| `poll_ms` | 覆盖等待模板或 OCR 文字时的轮询间隔 |
+| `threshold` | 覆盖模板匹配阈值 |
+| `region` | 模板匹配或 OCR 找文字的屏幕区域，格式 `{ x, y, width, height }` |
+| `point` | 固定点击点，格式 `{ x, y }` |
+| `click_offset` | 模板或文字命中点的点击偏移，格式 `{ x, y }` |
+| `template` | 模板别名或图片路径 |
+| `key` | 按键名，用于 `key/press_key`，支持 `Enter`、`Esc`、`F1` 到 `F12` 和单字符按键 |
+| `text` | 文字内容，用于 `click_text`、`wait_text`、`paste`，也可作为发送消息的兜底内容 |
+| `message` | 发送内容，用于 `send_chat`、`send_current_chat`、`send_friend_message`，优先于 `text` |
+| `target` | 好友名，用于 `send_friend_message`；不填时发送给触发命令的好友 |
 
 支持的步骤类型：
 
-- `sleep` / `wait`：等待一段时间
-- `key` / `press_key`：向游戏窗口发送按键
-- `click`：点击固定坐标 `point`
-- `click_template`：在 `region` 内等待模板出现，命中后点击模板中心加 `click_offset`
-- `wait_template`：在 `region` 内等待模板出现，不点击
-- `wait_template_absent`：在 `region` 内等待模板消失
-- `click_text`：在 `region` 内 OCR 查找 `text`，命中后点击文字中心加 `click_offset`
-- `wait_text`：在 `region` 内 OCR 查找 `text`，命中后继续，不点击
-- `paste` / `paste_text`：把 `text` 粘贴到当前焦点
-- `send_chat` / `reply`：按普通大厅回复流程发送 `message`
-- `send_current_chat`：向当前已打开的聊天输入框发送 `message`
-- `send_friend_message` / `friend_reply`：打开 `target` 好友聊天，发送 `message`，然后返回一级界面
-- `invite_user` / `invite_current_user`：调用内置邀请流程，默认邀请触发命令的好友；也可以用 `target` 指定好友名
-- `return_primary`：尝试返回一级界面
+| 类型 | 说明 |
+| --- | --- |
+| `sleep` / `wait` | 等待一段时间 |
+| `key` / `press_key` | 向游戏窗口发送按键 |
+| `click` | 点击固定坐标 `point` |
+| `click_template` | 在 `region` 内等待模板出现，命中后点击 |
+| `wait_template` | 在 `region` 内等待模板出现，不点击 |
+| `wait_template_absent` | 在 `region` 内等待模板消失 |
+| `click_text` | 在 `region` 内 OCR 查找 `text`，命中后点击 |
+| `wait_text` | 在 `region` 内 OCR 查找 `text`，命中后继续 |
+| `paste` / `paste_text` | 把 `text` 粘贴到当前焦点 |
+| `send_chat` / `reply` | 按普通大厅回复流程发送 `message` |
+| `send_current_chat` | 向当前已打开的聊天输入框发送 `message` |
+| `send_friend_message` / `friend_reply` | 打开好友聊天，发送 `message`，然后返回一级界面 |
+| `invite_user` / `invite_current_user` | 调用内置邀请流程，目标为触发命令的好友，也可用 `target` 指定 |
+| `return_primary` | 尝试返回一级界面 |
 
-步骤里的 `text`、`message`、`target`、`template`、`key`、`success_message` 支持变量：
+变量：
 
-- `{{username}}` / `{{user}}`：触发命令的用户名
-- `{{args}}` / `{{param}}` / `{{params}}`：命令后的完整参数
-- `{{arg1}}`、`{{arg2}}`：按空白分隔后的第 1、2 个参数，序号从 1 开始
-- `{{command}}` / `{{command_name}}`：匹配到的命令名
-- `{{workflow}}` / `{{workflow_name}}`：流程名
-- `{{message_type}}`：消息类型，例如 `blue` 或 `pink`
-- `{{user_command}}`：用户原始命令文本
+| 变量 | 说明 |
+| --- | --- |
+| `{{username}}` / `{{user}}` | 触发命令的用户名 |
+| `{{args}}` / `{{param}}` / `{{params}}` | 命令后的完整参数 |
+| `{{arg1}}`、`{{arg2}}` | 按空白分隔后的第 1、2 个参数，序号从 1 开始 |
+| `{{command}}` / `{{command_name}}` | 匹配到的命令名 |
+| `{{workflow}}` / `{{workflow_name}}` | 流程名 |
+| `{{message_type}}` | 消息类型，例如 `blue` 或 `pink` |
+| `{{user_command}}` | 用户原始命令文本 |
+
+`config.yaml` 自带一个参考流程：好友私聊 `@过来`，执行 `invite_user`
 
 ## 手动调试工具
 
-启动手动工具：
+启动：
 
 ```powershell
-程序.exe --config config.yaml manual
+miliastra-wonderland-music.exe --config config.yaml manual
 ```
 
-手动菜单包含：
+菜单内容：
 
-- 截图保存
-- 指定区域文字识别
-- 聊天区扫描
-- 界面状态检测
-- 模板匹配
-- 坐标点击
-- 按键测试
-- 聊天发送测试
-- 识别后端支持检测
-- 聊天变化监听
-- 面板响应耗时测试
-- AI 点歌搜索测试
+| 选项 | 功能 |
+| --- | --- |
+| `1` | 截图保存 |
+| `2` | OCR 识别 |
+| `3` | 扫描聊天区 |
+| `4` | 检测 UI 状态 |
+| `5` | 模板匹配 |
+| `6` | 点击坐标 |
+| `7` | 按键 |
+| `8` | 发送聊天 |
+| `9` | OCR GPU 支持检测 |
+| `10` | 监测聊天区变动 |
+| `11` | 检测面板响应速度 |
+| `12` | AI 点歌搜索测试 |
 
-面板响应耗时测试会按 `Enter` 打开聊天，再按 `Esc` 关闭聊天，采样配置中的检测区域，输出首次变化耗时、稳定耗时、平均值、最大值和失败次数
+面板响应速度测试会按 `Enter` 打开聊天，再按 `Esc` 关闭聊天，采样配置中的检测区域，输出首次变化耗时、稳定耗时、平均值、最大值和失败次数
 
 ## 本地网页和接口
 
-默认监听地址：
+初始监听地址：
 
 ```text
 http://127.0.0.1:18888
 ```
 
-会拒绝跨站控制请求。会改变状态的接口只接受本机或同源请求
+会拒绝跨站控制请求。会改变播放、队列或状态的接口只接受本机或同源请求
 
-主要接口：
+接口列表：
 
-```text
-/status
-/play
-/pause
-/skip-next
-/skip-prev
-/volume
-/searchPlay
-/searchSource
-/search
-/open-scheme
-/queue
-/queue/add
-/queue/remove
-/queue/clear
-/state
-/state/save
-/history
-/clear-history
-/health
-/admin-status
-/restart-admin
-/active-window
-/ai/recognize
-/ai/match
-/ai/pick
-/ai/search
-```
+| 接口 | 说明 |
+| --- | --- |
+| `/status` | FeelUOwn 播放状态 |
+| `/play` | 继续播放 |
+| `/pause` | 暂停播放 |
+| `/skip-next` | 下一首 |
+| `/skip-prev` | 上一首 |
+| `/volume?volume=30` | 设置音量 |
+| `/searchPlay?keyword=...&source=qqmusic` | 搜索并播放，返回播放结果 |
+| `/searchSource?keyword=...&source=netease` | 指定源搜索并播放 |
+| `/search?keyword=...&source=qqmusic` | 搜索歌曲 |
+| `/open-scheme?uri=fuo://...` | 播放 FeelUOwn URI |
+| `/queue` | 查看队列 |
+| `/queue/add?keyword=...` | 加入队列 |
+| `/queue/remove?index=0` | 删除队列项，索引从 0 开始 |
+| `/queue/clear` | 清空队列 |
+| `/state` | 查看运行状态 |
+| `/state/save` | 保存运行状态字段 |
+| `/history` | 查看最近 30 条接口调用记录 |
+| `/clear-history` | 清空接口调用记录 |
+| `/monitor` | 查看监控面板数据 |
+| `/health` | 健康检查 |
+| `/admin-status` | 管理员权限状态 |
+| `/restart-admin` | 返回不自动提权重启的说明 |
+| `/active-window` | 查看当前前台窗口；配置允许时可尝试切回目标窗口 |
+| `/ai/recognize` | AI 文本识别测试 |
+| `/ai/match` | AI 匹配测试 |
+| `/ai/pick` | AI 候选选择测试 |
+| `/ai/search?keyword=...` | AI 点歌搜索测试 |
 
-`/ai/search` 用于测试 AI 点歌搜索。它会先调用 FeelUOwn 搜索候选，再让 AI 从候选中选择 URI，不会让 AI 自己改写搜索词
+`/ai/search` 会先调用 FeelUOwn 搜索候选，再让 AI 从候选中选择 URI，不会让 AI 自己改写搜索词
 
 ## 配置说明
 
-`config.yaml` 包含 `config_version`。如果检测到旧版本配置，程序会用最新带注释模板重写配置，把旧值迁移到新位置，创建带时间戳的 `.bak-*` 备份，并把无法自动迁移的旧字段追加到文件末尾作为注释。追加的注释字段不会影响运行
+`config.yaml` 包含 `config_version`。启动时如果检测到旧配置，程序会用当前发布包里的 `config.yaml` 模板重写配置，把旧值迁移到新位置，创建带时间戳的 `.bak-*` 备份，并把无法自动迁移的旧字段追加到文件末尾作为注释。追加的注释字段不会影响运行
 
-默认聊天区域：
+如果配置文件不存在，程序会报错退出。请把发布包里的 `config.yaml` 放在程序工作目录，或用 `--config` 指定配置文件
+
+主要配置段：
+
+| 配置段 | 说明 |
+| --- | --- |
+| `window` | 目标进程名、画面尺寸、是否允许接口自动激活窗口 |
+| `screen` | 截图尺寸、聊天区、一级/二级界面检测区、大厅 OCR 区域 |
+| `timing` | 扫描、点击、发送、邀请、点歌确认、播放监控等时间参数 |
+| `ocr` | OCR 模型、置信度、文本框参数、聊天变化检测参数 |
+| `templates` | 聊天标志、UI、邀请、好友 UID 操作模板 |
+| `output` | 游戏内回复开关和聊天输入坐标 |
+| `moderation` | UID 拉黑/屏蔽投票参数和按钮搜索区域 |
+| `feeluown` | FeelUOwn TCP RPC 地址 |
+| `http` | 本地网页和接口监听配置 |
+| `logging` | 日志目录和日志等级 |
+| `tui` | 终端 TUI 开关和刷新参数 |
+| `state` | 运行状态、队列和已执行命令记录路径 |
+| `queue` | 队列长度、自动出队和自动播放保护 |
+| `ai` | AI 供应商、API Key、模型和 OpenAI-compatible 地址 |
+| `matching` | 歌名、歌手和 OCR 噪声匹配阈值 |
+| `hotkeys` | 全局热键开关和按键 |
+| `invite` | 好友列表 OCR 区域和邀请按钮模板搜索区域 |
+| `custom_workflows` | 配置驱动的自定义命令流程 |
+
+关键初始值：
 
 ```yaml
 screen:
-  chat_rect:
-    x: 39
-    y: 879
-    width: 416
-    height: 143
-```
+  chat_rect: { x: 39, y: 879, width: 416, height: 143 }
 
-当前主要时间参数默认值：
-
-```yaml
-timing:
-  scan_loop_idle_ms: 60
-  chat_scan_fallback_ms: 2000
-  chat_change_debounce_ms: 120
-  chat_change_cooldown_ms: 250
-  post_command_settle_ms: 500
-  command_ui_timeout_ms: 15000
-  decision_timeout_ms: 20000
-```
-
-队列默认配置：
-
-```yaml
 queue:
   max_size: 5
-  auto_advance_seconds: 2
+  auto_advance_seconds: 1
+  protect_auto_played_songs: true
+
+http:
+  host: 127.0.0.1
+  port: 18888
+  enabled: true
+
+hotkeys:
+  pause_key: F7
+  exit_key: F12
 ```
 
 游戏内回复会限制显示宽度为 80，约等于 40 个全角中文字符或 80 个半角字符
 
 ## 日志和状态文件
 
-- 日志：`logs/程序日志.log`
-- 运行状态：`data/runtime-state.json`
-- 点歌队列：`data/queue.json`
+| 文件 | 说明 |
+| --- | --- |
+| `logs/miliastra-wonderland-music.log` | 程序日志 |
+| `data/runtime-state.json` | 运行状态 |
+| `data/queue.json` | 点歌队列 |
+| `data/executed-commands.log` | 已执行命令记录 |
 
 日志前缀格式：
 

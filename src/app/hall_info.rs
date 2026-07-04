@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use super::command;
 
 pub(super) const HALL_INFO_OCR_SAMPLES: usize = 3;
+const HALL_TIME_RECOGNITION_TOLERANCE_MINUTES: u32 = 1;
 
 #[derive(Clone, Debug)]
 pub(super) struct HallInfo {
@@ -27,7 +28,7 @@ pub(super) fn parse_hall_remaining_minutes(text: &str) -> Option<u32> {
     }
     let minutes = digits.parse::<u32>().ok()?;
     if (1..=180).contains(&minutes) {
-        Some(minutes)
+        Some(minutes + HALL_TIME_RECOGNITION_TOLERANCE_MINUTES)
     } else {
         None
     }
@@ -108,4 +109,21 @@ pub(super) fn format_hall_remaining_suffix(minutes: Option<u32>) -> String {
     minutes
         .map(|value| format!("，剩余{}分钟", value))
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_hall_remaining_minutes_with_tolerance() {
+        assert_eq!(parse_hall_remaining_minutes("剩余10分钟"), Some(11));
+        assert_eq!(parse_hall_remaining_minutes("剩余９分钟"), Some(10));
+    }
+
+    #[test]
+    fn rejects_invalid_hall_remaining_minutes() {
+        assert_eq!(parse_hall_remaining_minutes("公共大厅"), None);
+        assert_eq!(parse_hall_remaining_minutes("剩余181分钟"), None);
+    }
 }

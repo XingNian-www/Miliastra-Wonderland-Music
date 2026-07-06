@@ -82,7 +82,7 @@ impl GameWindow {
         let started = Instant::now();
         if self.is_foreground_process() {
             let result = self.ensure_foreground();
-            log::debug!(
+            log::info!(target: "timing",
                 "激活游戏窗口耗时: {}ms already_foreground=true",
                 elapsed_ms(started)
             );
@@ -107,7 +107,7 @@ impl GameWindow {
             sleep(Duration::from_millis(after_activate_ms));
         }
         let result = self.ensure_foreground();
-        log::info!(
+        log::info!(target: "timing",
             "激活游戏窗口耗时: {}ms success={}",
             elapsed_ms(started),
             result.is_ok()
@@ -119,7 +119,7 @@ impl GameWindow {
         let started = Instant::now();
         self.click_focused(enigo, point)?;
         let result = self.ensure_foreground();
-        log::info!(
+        log::info!(target: "timing",
             "聚焦游戏耗时: {}ms success={}",
             elapsed_ms(started),
             result.is_ok()
@@ -146,7 +146,7 @@ impl GameWindow {
         enigo
             .button(Button::Left, Direction::Click)
             .context("click mouse")?;
-        log::debug!(
+        log::info!(target: "timing",
             "点击输入耗时: total={}ms check={}ms input={}ms x={} y={}",
             elapsed_ms(started),
             check_ms,

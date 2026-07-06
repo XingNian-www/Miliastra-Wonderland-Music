@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow};
 use serde_yaml::{Mapping, Value};
 
-pub const CURRENT_CONFIG_VERSION: u32 = 12;
+pub const CURRENT_CONFIG_VERSION: u32 = 13;
 
 struct ChangedDefaultField {
     path: &'static str,
@@ -51,26 +51,156 @@ const CHANGED_FLOAT_DEFAULT_FIELDS: &[ChangedFloatDefaultField] = &[ChangedFloat
 }];
 
 const MOVED_FIELDS: &[(&str, &str)] = &[
-    ("ocr.poll_interval_ms", "timing.chat_scan_fallback_ms"),
-    ("ocr.poll_interval_ms", "timing.invite_confirm_poll_ms"),
-    ("ocr.change_poll_interval_ms", "timing.scan_loop_idle_ms"),
-    ("ocr.change_debounce_ms", "timing.chat_change_debounce_ms"),
-    ("ocr.change_cooldown_ms", "timing.chat_change_cooldown_ms"),
+    ("ocr.poll_interval_ms", "timing.chat_scan.fallback_ms"),
+    ("ocr.poll_interval_ms", "timing.invite.confirm_poll_ms"),
+    ("ocr.change_poll_interval_ms", "timing.loop_idle_ms"),
+    (
+        "ocr.change_debounce_ms",
+        "timing.chat_scan.change_debounce_ms",
+    ),
+    (
+        "ocr.change_cooldown_ms",
+        "timing.chat_scan.change_cooldown_ms",
+    ),
     (
         "ocr.post_command_settle_ms",
-        "timing.post_command_settle_ms",
+        "timing.command.post_settle_ms",
     ),
-    ("output.paste_timeout_ms", "timing.command_ui_timeout_ms"),
-    ("output.focus_delay_ms", "timing.output_focus_ms"),
-    ("output.open_chat_delay_ms", "timing.output_open_chat_ms"),
-    ("output.click_delay_ms", "timing.output_click_ms"),
-    ("output.input_delay_ms", "timing.output_input_ms"),
-    ("output.send_delay_ms", "timing.output_send_ms"),
-    ("feeluown.timeout_ms", "timing.feeluown_rpc_timeout_ms"),
-    ("invite.step_delay_ms", "timing.invite_step_ms"),
+    ("output.paste_timeout_ms", "timing.command.ui_timeout_ms"),
+    ("output.focus_delay_ms", "timing.input.focus_ms"),
+    ("output.open_chat_delay_ms", "timing.input.open_chat_ms"),
+    ("output.click_delay_ms", "timing.input.click_ms"),
+    ("output.input_delay_ms", "timing.input.text_ms"),
+    ("output.send_delay_ms", "timing.input.send_ms"),
+    (
+        "feeluown.timeout_ms",
+        "timing.external.feeluown_rpc_timeout_ms",
+    ),
+    ("invite.step_delay_ms", "timing.invite.step_ms"),
     (
         "invite.confirm_timeout_ms",
+        "timing.invite.confirm_timeout_ms",
+    ),
+    ("timing.scan_loop_idle_ms", "timing.loop_idle_ms"),
+    (
+        "timing.chat_scan_fallback_ms",
+        "timing.chat_scan.fallback_ms",
+    ),
+    (
+        "timing.chat_change_debounce_ms",
+        "timing.chat_scan.change_debounce_ms",
+    ),
+    (
+        "timing.chat_change_cooldown_ms",
+        "timing.chat_scan.change_cooldown_ms",
+    ),
+    (
+        "timing.command_ui_timeout_ms",
+        "timing.command.ui_timeout_ms",
+    ),
+    (
+        "timing.return_to_primary_retry_ms",
+        "timing.command.return_retry_ms",
+    ),
+    (
+        "timing.post_command_settle_ms",
+        "timing.command.post_settle_ms",
+    ),
+    ("timing.help_batch_ms", "timing.command.help_batch_ms"),
+    (
+        "timing.active_after_activate_ms",
+        "timing.input.after_activate_ms",
+    ),
+    ("timing.output_focus_ms", "timing.input.focus_ms"),
+    ("timing.output_open_chat_ms", "timing.input.open_chat_ms"),
+    ("timing.output_click_ms", "timing.input.click_ms"),
+    ("timing.output_input_ms", "timing.input.text_ms"),
+    ("timing.output_send_ms", "timing.input.send_ms"),
+    ("timing.hall_page_settle_ms", "timing.hall.page_settle_ms"),
+    (
+        "timing.hall_ocr_sample_interval_ms",
+        "timing.hall.ocr_sample_interval_ms",
+    ),
+    ("timing.invite_open_chat_ms", "timing.invite.open_chat_ms"),
+    ("timing.invite_step_ms", "timing.invite.step_ms"),
+    (
         "timing.invite_confirm_timeout_ms",
+        "timing.invite.confirm_timeout_ms",
+    ),
+    (
+        "timing.invite_confirm_poll_ms",
+        "timing.invite.confirm_poll_ms",
+    ),
+    (
+        "timing.play_search_settle_ms",
+        "timing.playback.search_settle_ms",
+    ),
+    (
+        "timing.play_status_poll_ms",
+        "timing.playback.status_poll_ms",
+    ),
+    (
+        "timing.play_status_retries",
+        "timing.playback.status_retries",
+    ),
+    (
+        "timing.skip_status_initial_ms",
+        "timing.playback.skip_status_initial_ms",
+    ),
+    (
+        "timing.skip_status_poll_ms",
+        "timing.playback.skip_status_poll_ms",
+    ),
+    (
+        "timing.skip_status_retries",
+        "timing.playback.skip_status_retries",
+    ),
+    (
+        "timing.playback_monitor_tick_ms",
+        "timing.playback.monitor_tick_ms",
+    ),
+    (
+        "timing.playback_monitor_status_ms",
+        "timing.playback.monitor_status_ms",
+    ),
+    ("timing.decision_timeout_ms", "timing.decision.timeout_ms"),
+    ("timing.decision_poll_ms", "timing.decision.poll_ms"),
+    (
+        "timing.feeluown_rpc_timeout_ms",
+        "timing.external.feeluown_rpc_timeout_ms",
+    ),
+    (
+        "timing.volume_smooth_step_ms",
+        "timing.external.volume_smooth_step_ms",
+    ),
+    (
+        "timing.ai_request_timeout_ms",
+        "timing.external.ai_request_timeout_ms",
+    ),
+    (
+        "custom_workflows.default_timeout_ms",
+        "timing.workflow.default_timeout_ms",
+    ),
+    (
+        "custom_workflows.default_poll_ms",
+        "timing.workflow.default_poll_ms",
+    ),
+    (
+        "custom_workflows.default_step_wait_ms",
+        "timing.workflow.default_step_wait_ms",
+    ),
+    (
+        "moderation.vote_timeout_ms",
+        "timing.moderation.vote_timeout_ms",
+    ),
+    ("moderation.vote_poll_ms", "timing.moderation.vote_poll_ms"),
+    (
+        "moderation.search_result_timeout_ms",
+        "timing.moderation.search_result_timeout_ms",
+    ),
+    (
+        "moderation.confirm_wait_ms",
+        "timing.moderation.confirm_wait_ms",
     ),
 ];
 
@@ -637,15 +767,63 @@ fn yaml_lines(value: &Value) -> Result<Vec<String>> {
 mod tests {
     use super::*;
 
-    const DEFAULT: &str = r#"# test config
-# version comment
-config_version: 12
+    const DEFAULT: &str = r#"# 测试配置
+# 版本注释
+config_version: 13
 
 timing:
-  # fallback comment
-  chat_scan_fallback_ms: 2000
-  scan_loop_idle_ms: 60
-  output_focus_ms: 300
+  watchdog_restart_ms: 2000
+  loop_idle_ms: 60
+  chat_scan:
+    # 兜底扫描注释
+    fallback_ms: 2000
+    change_debounce_ms: 120
+    change_cooldown_ms: 250
+  command:
+    ui_timeout_ms: 15000
+    return_retry_ms: 1000
+    post_settle_ms: 500
+    help_batch_ms: 500
+  input:
+    after_activate_ms: 200
+    focus_ms: 300
+    open_chat_ms: 300
+    click_ms: 150
+    text_ms: 250
+    send_ms: 300
+  workflow:
+    default_timeout_ms: 5000
+    default_poll_ms: 200
+    default_step_wait_ms: 300
+  hall:
+    page_settle_ms: 800
+    ocr_sample_interval_ms: 120
+  invite:
+    open_chat_ms: 400
+    step_ms: 800
+    confirm_timeout_ms: 30000
+    confirm_poll_ms: 2000
+  moderation:
+    vote_timeout_ms: 120000
+    vote_poll_ms: 2000
+    search_result_timeout_ms: 5000
+    confirm_wait_ms: 2000
+  playback:
+    search_settle_ms: 2000
+    status_poll_ms: 1000
+    status_retries: 15
+    skip_status_initial_ms: 500
+    skip_status_poll_ms: 300
+    skip_status_retries: 5
+    monitor_tick_ms: 200
+    monitor_status_ms: 1000
+  decision:
+    timeout_ms: 20000
+    poll_ms: 2000
+  external:
+    feeluown_rpc_timeout_ms: 10000
+    volume_smooth_step_ms: 300
+    ai_request_timeout_ms: 35000
 
 queue:
   auto_advance_seconds: 1
@@ -665,9 +843,6 @@ output:
 custom_workflows:
   enabled: true
   default_threshold: 0.9
-  default_timeout_ms: 5000
-  default_poll_ms: 200
-  default_step_wait_ms: 300
   templates: {}
   workflows: []
 "#;
@@ -688,11 +863,11 @@ unknown_root:
             .expect("migration succeeds")
             .expect("migration needed");
 
-        assert!(report.text.contains("# fallback comment"));
-        assert!(report.text.contains("config_version: 12"));
-        assert!(report.text.contains("chat_scan_fallback_ms: 1234"));
-        assert!(report.text.contains("scan_loop_idle_ms: 77"));
-        assert!(report.text.contains("output_focus_ms: 456"));
+        assert!(report.text.contains("# 兜底扫描注释"));
+        assert!(report.text.contains("config_version: 13"));
+        assert!(report.text.contains("fallback_ms: 1234"));
+        assert!(report.text.contains("loop_idle_ms: 77"));
+        assert!(report.text.contains("focus_ms: 456"));
         assert!(report.text.contains("min_confidence: 0.8"));
         assert!(report.text.contains("# 未自动迁移的旧配置"));
         assert!(
@@ -709,12 +884,166 @@ unknown_root:
     }
 
     #[test]
-    fn current_version_without_moved_fields_does_not_migrate() {
-        let current = r#"config_version: 12
+    fn migrates_custom_workflow_timing_defaults_to_timing_workflow() {
+        let old = r#"config_version: 12
+custom_workflows:
+  default_timeout_ms: 9000
+  default_poll_ms: 333
+  default_step_wait_ms: 444
+"#;
+
+        let report = migrate_config_text(old, DEFAULT)
+            .expect("migration succeeds")
+            .expect("migration needed");
+        let migrated: Value = serde_yaml::from_str(&report.text).expect("valid migrated yaml");
+
+        assert_eq!(
+            get_path(&migrated, &["timing", "workflow", "default_timeout_ms"])
+                .and_then(Value::as_u64),
+            Some(9000)
+        );
+        assert_eq!(
+            get_path(&migrated, &["timing", "workflow", "default_poll_ms"]).and_then(Value::as_u64),
+            Some(333)
+        );
+        assert_eq!(
+            get_path(&migrated, &["timing", "workflow", "default_step_wait_ms"])
+                .and_then(Value::as_u64),
+            Some(444)
+        );
+        assert!(
+            !report
+                .unmigrated
+                .iter()
+                .any(|item| item.path.starts_with("custom_workflows.default_"))
+        );
+    }
+
+    #[test]
+    fn migrates_flat_timing_fields_to_grouped_timing() {
+        let old = r#"config_version: 12
 timing:
-  chat_scan_fallback_ms: 2000
-  scan_loop_idle_ms: 60
-  output_focus_ms: 300
+  scan_loop_idle_ms: 70
+  chat_scan_fallback_ms: 2100
+  chat_change_debounce_ms: 140
+  command_ui_timeout_ms: 16000
+  output_focus_ms: 310
+  invite_confirm_poll_ms: 1900
+  play_status_retries: 17
+  decision_timeout_ms: 22000
+  feeluown_rpc_timeout_ms: 12000
+"#;
+
+        let report = migrate_config_text(old, DEFAULT)
+            .expect("migration succeeds")
+            .expect("migration needed");
+        let migrated: Value = serde_yaml::from_str(&report.text).expect("valid migrated yaml");
+
+        assert_eq!(
+            get_path(&migrated, &["timing", "loop_idle_ms"]).and_then(Value::as_u64),
+            Some(70)
+        );
+        assert_eq!(
+            get_path(&migrated, &["timing", "chat_scan", "fallback_ms"]).and_then(Value::as_u64),
+            Some(2100)
+        );
+        assert_eq!(
+            get_path(&migrated, &["timing", "chat_scan", "change_debounce_ms"])
+                .and_then(Value::as_u64),
+            Some(140)
+        );
+        assert_eq!(
+            get_path(&migrated, &["timing", "command", "ui_timeout_ms"]).and_then(Value::as_u64),
+            Some(16000)
+        );
+        assert_eq!(
+            get_path(&migrated, &["timing", "input", "focus_ms"]).and_then(Value::as_u64),
+            Some(310)
+        );
+        assert_eq!(
+            get_path(&migrated, &["timing", "invite", "confirm_poll_ms"]).and_then(Value::as_u64),
+            Some(1900)
+        );
+        assert_eq!(
+            get_path(&migrated, &["timing", "playback", "status_retries"]).and_then(Value::as_u64),
+            Some(17)
+        );
+        assert_eq!(
+            get_path(&migrated, &["timing", "decision", "timeout_ms"]).and_then(Value::as_u64),
+            Some(22000)
+        );
+        assert_eq!(
+            get_path(
+                &migrated,
+                &["timing", "external", "feeluown_rpc_timeout_ms"]
+            )
+            .and_then(Value::as_u64),
+            Some(12000)
+        );
+        assert!(
+            !report
+                .unmigrated
+                .iter()
+                .any(|item| item.path.starts_with("timing."))
+        );
+    }
+
+    #[test]
+    fn migrates_moderation_timing_defaults_to_timing_moderation() {
+        let old = r#"config_version: 12
+moderation:
+  vote_timeout_ms: 90000
+  vote_poll_ms: 1500
+  search_result_timeout_ms: 6000
+  confirm_wait_ms: 2500
+"#;
+
+        let report = migrate_config_text(old, DEFAULT)
+            .expect("migration succeeds")
+            .expect("migration needed");
+        let migrated: Value = serde_yaml::from_str(&report.text).expect("valid migrated yaml");
+
+        assert_eq!(
+            get_path(&migrated, &["timing", "moderation", "vote_timeout_ms"])
+                .and_then(Value::as_u64),
+            Some(90000)
+        );
+        assert_eq!(
+            get_path(&migrated, &["timing", "moderation", "vote_poll_ms"]).and_then(Value::as_u64),
+            Some(1500)
+        );
+        assert_eq!(
+            get_path(
+                &migrated,
+                &["timing", "moderation", "search_result_timeout_ms"]
+            )
+            .and_then(Value::as_u64),
+            Some(6000)
+        );
+        assert_eq!(
+            get_path(&migrated, &["timing", "moderation", "confirm_wait_ms"])
+                .and_then(Value::as_u64),
+            Some(2500)
+        );
+        assert!(
+            !report
+                .unmigrated
+                .iter()
+                .any(|item| item.path.starts_with("moderation.") && item.path.ends_with("_ms"))
+        );
+    }
+
+    #[test]
+    fn current_version_without_moved_fields_does_not_migrate() {
+        let current = r#"config_version: 13
+timing:
+  loop_idle_ms: 60
+  chat_scan:
+    fallback_ms: 2000
+    change_debounce_ms: 120
+    change_cooldown_ms: 250
+  input:
+    focus_ms: 300
 queue:
   auto_advance_seconds: 1
   protect_auto_played_songs: true
@@ -744,7 +1073,7 @@ queue:
             .expect("migration succeeds")
             .expect("migration needed");
 
-        assert!(report.text.contains("config_version: 12"));
+        assert!(report.text.contains("config_version: 13"));
         assert!(
             report
                 .text
@@ -756,7 +1085,8 @@ queue:
     fn future_version_does_not_migrate() {
         let future = r#"config_version: 999
 timing:
-  chat_scan_fallback_ms: 2000
+  chat_scan:
+    fallback_ms: 2000
 "#;
 
         let report = migrate_config_text(future, DEFAULT).expect("migration check succeeds");
@@ -766,7 +1096,8 @@ timing:
     #[test]
     fn keeps_existing_new_field_over_moved_old_field() {
         let old = r#"timing:
-  chat_scan_fallback_ms: 3333
+  chat_scan:
+    fallback_ms: 3333
 ocr:
   poll_interval_ms: 1234
 "#;
@@ -775,8 +1106,8 @@ ocr:
             .expect("migration succeeds")
             .expect("migration needed");
 
-        assert!(report.text.contains("chat_scan_fallback_ms: 3333"));
-        assert!(!report.text.contains("chat_scan_fallback_ms: 1234"));
+        assert!(report.text.contains("fallback_ms: 3333"));
+        assert!(!report.text.contains("fallback_ms: 1234"));
     }
 
     #[test]
@@ -795,7 +1126,7 @@ custom_workflows:
             .expect("migration succeeds")
             .expect("migration needed");
 
-        assert!(report.text.contains("config_version: 12"));
+        assert!(report.text.contains("config_version: 13"));
         assert!(report.text.contains("allow_args: false"));
         assert!(report.text.contains("message_types:"));
         assert!(report.text.contains("confirm_before_run: false"));
@@ -871,7 +1202,7 @@ queue:
             .expect("migration succeeds")
             .expect("migration needed");
 
-        assert!(report.text.contains("config_version: 12"));
+        assert!(report.text.contains("config_version: 13"));
         assert!(report.text.contains("auto_advance_seconds: 1"));
     }
 
@@ -886,7 +1217,7 @@ tui:
             .expect("migration succeeds")
             .expect("migration needed");
 
-        assert!(report.text.contains("config_version: 12"));
+        assert!(report.text.contains("config_version: 13"));
         assert!(report.text.contains("enabled: true"));
         assert!(report.text.contains("protect_auto_played_songs: true"));
     }

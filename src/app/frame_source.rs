@@ -49,7 +49,7 @@ pub(super) fn load_frame(
     } else {
         image
     };
-    log::debug!(
+    log::info!(target: "timing",
         "截图加载耗时: {}ms source={}x{} output={}x{} resize={}",
         elapsed_ms(started),
         source_width,

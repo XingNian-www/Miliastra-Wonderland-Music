@@ -68,7 +68,7 @@ pub(super) fn paste_text(
         .key(Key::Control, Direction::Release)
         .context("release control")?;
     sleep(Duration::from_millis(clipboard_hold_ms));
-    log::info!(
+    log::info!(target: "timing",
         "粘贴文本耗时: total={}ms foreground={}ms clipboard={}ms input={}ms hold={}ms chars={}",
         elapsed_ms(started),
         foreground_ms,
@@ -88,7 +88,7 @@ pub(super) fn press_key(key: Key, window_config: &config::WindowConfig) -> Resul
     let input_started = Instant::now();
     let mut enigo = Enigo::new(&Settings::default()).context("create enigo")?;
     enigo.key(key, Direction::Click).context("press key")?;
-    log::debug!(
+    log::info!(target: "timing",
         "按键输入耗时: total={}ms foreground={}ms input={}ms",
         elapsed_ms(started),
         foreground_ms,

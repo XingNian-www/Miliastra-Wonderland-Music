@@ -123,7 +123,7 @@ impl TextRestoreGuard {
         let restore = match get_text() {
             Ok(Some(previous)) => {
                 let previous_summary = TextSummary::new(&previous);
-                log::info!(
+                log::info!(target: "timing",
                     "剪贴板临时占用: 写入chars={} 写入hash={:016x} 原文本存在=true 原文本chars={} 原文本hash={:016x}",
                     replacement.chars,
                     replacement.fingerprint,
@@ -133,7 +133,7 @@ impl TextRestoreGuard {
                 RestoreTarget::Text(previous)
             }
             Ok(None) => {
-                log::info!(
+                log::info!(target: "timing",
                     "剪贴板临时占用: 写入chars={} 写入hash={:016x} 原文本存在=false",
                     replacement.chars,
                     replacement.fingerprint
@@ -161,7 +161,7 @@ impl Drop for TextRestoreGuard {
                     if let Err(error) = set_text(&previous) {
                         log::warn!("恢复原剪贴板文本失败: {error:#}");
                     } else {
-                        log::info!(
+                        log::info!(target: "timing",
                             "剪贴板临时占用结束: 已恢复原文本 chars={} hash={:016x}",
                             previous_summary.chars,
                             previous_summary.fingerprint
@@ -172,7 +172,7 @@ impl Drop for TextRestoreGuard {
                     if let Err(error) = clear() {
                         log::warn!("清空临时剪贴板文本失败: {error:#}");
                     } else {
-                        log::info!("剪贴板临时占用结束: 已清空临时文本");
+                        log::info!(target: "timing", "剪贴板临时占用结束: 已清空临时文本");
                     }
                 }
             }

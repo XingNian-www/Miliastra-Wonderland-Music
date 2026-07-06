@@ -135,6 +135,12 @@ pub(super) fn recognize_prepared_chat(
         });
     }
     log::info!(
+        "聊天扫描结果: markers={} messages={} {}",
+        prepared.markers.len(),
+        messages.len(),
+        format_scan_result(&messages)
+    );
+    log::info!(target: "timing",
         "聊天扫描耗时: total={}ms prepare={}ms crop={}ms marker={}ms block={}ms ocr={}ms markers={} messages={}",
         total_ms,
         prepared.prepare_ms,
@@ -146,6 +152,29 @@ pub(super) fn recognize_prepared_chat(
         messages.len()
     );
     Ok(messages)
+}
+
+fn format_scan_result(messages: &[ChatMessage]) -> String {
+    if messages.is_empty() {
+        return "[]".to_string();
+    }
+    messages
+        .iter()
+        .map(|message| {
+            let text = compact_log_text(&message.text);
+            format!("[{}] {}", message.message_type, text)
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+fn compact_log_text(text: &str) -> String {
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.is_empty() {
+        "(空)".to_string()
+    } else {
+        text
+    }
 }
 
 fn marker_type(hit: &TemplateHit) -> &str {

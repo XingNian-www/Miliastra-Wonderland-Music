@@ -497,7 +497,7 @@ fn call_ai(
 
 fn call_ai_http(config: &AiProviderConfig, body: &str, timing: &TimingConfig) -> Result<String> {
     let response = Client::builder()
-        .timeout(Duration::from_millis(timing.ai_request_timeout_ms))
+        .timeout(Duration::from_millis(timing.external.ai_request_timeout_ms))
         .build()
         .context("创建AI HTTP客户端失败")?
         .post(&config.endpoint)

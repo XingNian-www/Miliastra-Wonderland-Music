@@ -1,10 +1,10 @@
-name: Build Windows exe
+name: 构建 Windows EXE
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: Release version, for example v0.1.0. Empty uses Cargo.toml version.
+        description: 发布版本，例如 v0.1.0。留空时使用 Cargo.toml 版本。
         required: false
         type: string
   push:
@@ -12,7 +12,15 @@ on:
       - main
       - dev
     paths:
+      - .cargo/**
+      - .github/workflows/build-windows-exe.yml
       - Cargo.toml
+      - Cargo.lock
+      - README.md
+      - assets/**
+      - config.yaml
+      - src/**
+      - vendor/mnn/3.6.0/windows-x64/**
 
 permissions:
   contents: write
@@ -24,78 +32,30 @@ env:
 
 jobs:
   build-windows-exe:
-    name: Build Windows x64 exe
+    name: 构建 Windows x64 EXE
     runs-on: windows-latest
 
     steps:
-      - name: Checkout
+      - name: 检出代码
         uses: actions/checkout@v5
 
-      - name: Check Cargo package version change
-        id: build_gate
-        shell: pwsh
-        run: |
-          function Read-PackageVersion($text) {
-            $content = if ($text -is [array]) { $text -join "`n" } else { [string]$text }
-            if ($content -notmatch '(?ms)^\[package\].*?^version\s*=\s*"([^"]+)"') {
-              throw 'Cannot read package version from Cargo.toml'
-            }
-            return $Matches[1]
-          }
-
-          if ('${{ github.event_name }}' -eq 'workflow_dispatch') {
-            'should_build=true' >> $env:GITHUB_OUTPUT
-            'reason=manual dispatch' >> $env:GITHUB_OUTPUT
-            exit 0
-          }
-
-          $before = '${{ github.event.before }}'
-          if (-not $before -or $before -match '^0+$') {
-            'should_build=true' >> $env:GITHUB_OUTPUT
-            'reason=no previous commit' >> $env:GITHUB_OUTPUT
-            exit 0
-          }
-
-          git fetch --no-tags --depth=1 origin $before
-          $oldCargo = git show "$($before):Cargo.toml"
-          $oldVersion = Read-PackageVersion $oldCargo
-          $newVersion = Read-PackageVersion (Get-Content Cargo.toml -Raw)
-
-          if ($oldVersion -ne $newVersion) {
-            'should_build=true' >> $env:GITHUB_OUTPUT
-            "reason=version $oldVersion -> $newVersion" >> $env:GITHUB_OUTPUT
-          } else {
-            'should_build=false' >> $env:GITHUB_OUTPUT
-            "reason=package version unchanged ($newVersion)" >> $env:GITHUB_OUTPUT
-          }
-
-      - name: Skip build
-        if: steps.build_gate.outputs.should_build != 'true'
-        shell: pwsh
-        run: |
-          Write-Host "Skipping build: ${{ steps.build_gate.outputs.reason }}"
-
-      - name: Install Rust
-        if: steps.build_gate.outputs.should_build == 'true'
+      - name: 安装 Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
 
-      - name: Cache Cargo
-        if: steps.build_gate.outputs.should_build == 'true'
+      - name: 缓存 Cargo
         uses: Swatinem/rust-cache@v2
         with:
           key: windows-msvc-release
 
-      - name: Cache OCR models
-        if: steps.build_gate.outputs.should_build == 'true'
+      - name: 缓存 OCR 模型
         uses: actions/cache@v4
         with:
           path: models
           key: pp-ocrv6-small-models-v1
 
-      - name: Download PP-OCRv6 small models
-        if: steps.build_gate.outputs.should_build == 'true'
+      - name: 下载 PP-OCRv6 small 模型
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path models | Out-Null
@@ -111,46 +71,64 @@ jobs:
             }
           }
 
-      - name: Build release exe
-        if: steps.build_gate.outputs.should_build == 'true'
+      - name: 编译 Release EXE
         run: cargo build --release --target x86_64-pc-windows-msvc --locked
 
-      - name: Resolve release version
-        if: steps.build_gate.outputs.should_build == 'true'
+      - name: 解析发布版本
         id: version
         shell: pwsh
         run: |
+          function Read-PackageVersion($text) {
+            $content = if ($text -is [array]) { $text -join "`n" } else { [string]$text }
+            if ($content -notmatch '(?ms)^\[package\].*?^version\s*=\s*"([^"]+)"') {
+              throw '无法从 Cargo.toml 读取包版本'
+            }
+            return $Matches[1]
+          }
+
           $inputVersion = '${{ github.event.inputs.version }}'.Trim()
+          $cargoToml = Get-Content Cargo.toml -Raw
+          $packageVersion = Read-PackageVersion $cargoToml
           if ($inputVersion) {
             $version = $inputVersion
           } else {
-            $cargoToml = Get-Content Cargo.toml -Raw
-            if ($cargoToml -notmatch '(?m)^version\s*=\s*"([^"]+)"') {
-              throw 'Cannot read package version from Cargo.toml'
-            }
-            $version = "v$($Matches[1])"
+            $version = "v$packageVersion"
           }
           if (-not $version.StartsWith('v')) {
             $version = "v$version"
           }
+          $createRelease = 'true'
+          if ('${{ github.event_name }}' -eq 'push') {
+            $createRelease = 'false'
+            $before = '${{ github.event.before }}'
+            if (-not $before -or $before -match '^0+$') {
+              $createRelease = 'true'
+            } else {
+              git fetch --no-tags --depth=1 origin $before
+              $oldCargo = git show "$($before):Cargo.toml"
+              $oldVersion = Read-PackageVersion $oldCargo
+              if ($oldVersion -ne $packageVersion) {
+                $createRelease = 'true'
+              }
+            }
+          }
           "version=$version" >> $env:GITHUB_OUTPUT
           "zip=miliastra-wonderland-music-windows-x64-$version.zip" >> $env:GITHUB_OUTPUT
+          "create_release=$createRelease" >> $env:GITHUB_OUTPUT
 
-      - name: Prepare artifact
-        if: steps.build_gate.outputs.should_build == 'true'
+      - name: 准备产物
         shell: pwsh
         run: |
           $dist = 'dist/miliastra-wonderland-music-windows-x64'
           New-Item -ItemType Directory -Force -Path $dist | Out-Null
           Copy-Item 'target/x86_64-pc-windows-msvc/release/miliastra-wonderland-music.exe' $dist
-          Copy-Item 'target/x86_64-pc-windows-msvc/release/MNN.dll' $dist
+          Copy-Item 'vendor/mnn/3.6.0/windows-x64/bin/MNN.dll' $dist
           Copy-Item 'assets' $dist -Recurse
           Copy-Item 'models' $dist -Recurse
           Copy-Item 'config.yaml' $dist
           Copy-Item 'README.md' $dist
 
-      - name: Package release zip
-        if: steps.build_gate.outputs.should_build == 'true'
+      - name: 打包 Release zip
         shell: pwsh
         run: |
           Compress-Archive `
@@ -158,15 +136,14 @@ jobs:
             -DestinationPath "dist/${{ steps.version.outputs.zip }}" `
             -Force
 
-      - name: Upload artifact
-        if: steps.build_gate.outputs.should_build == 'true'
+      - name: 上传产物
         uses: actions/upload-artifact@v5
         with:
           name: miliastra-wonderland-music-windows-x64
           path: dist/miliastra-wonderland-music-windows-x64
 
-      - name: Create GitHub Release
-        if: steps.build_gate.outputs.should_build == 'true'
+      - name: 创建 GitHub Release
+        if: steps.version.outputs.create_release == 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.version }}

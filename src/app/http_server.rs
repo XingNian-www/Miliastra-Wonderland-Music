@@ -589,7 +589,7 @@ fn active_window_json(
     active_window_status(
         target,
         auto_activate,
-        state.config.timing.active_after_activate_ms,
+        state.config.timing.input.after_activate_ms,
     )
     .map_err(internal_error)
 }

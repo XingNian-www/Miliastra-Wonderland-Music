@@ -195,7 +195,7 @@ impl AutomationApp {
                 0
             } else {
                 step.wait_ms
-                    .unwrap_or(self.config.custom_workflows.default_step_wait_ms)
+                    .unwrap_or(self.config.timing.workflow.default_step_wait_ms)
             };
             if wait_ms > 0 {
                 sleep(Duration::from_millis(wait_ms));
@@ -242,10 +242,10 @@ impl AutomationApp {
         let existing = self.collect_custom_workflow_confirmation_bottoms(workflow);
         let timeout_ms = workflow
             .confirm_timeout_ms
-            .unwrap_or(self.config.timing.decision_timeout_ms);
+            .unwrap_or(self.config.timing.decision.timeout_ms);
         let poll_ms = workflow
             .confirm_poll_ms
-            .unwrap_or(self.config.timing.decision_poll_ms)
+            .unwrap_or(self.config.timing.decision.poll_ms)
             .max(50);
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
         let template_args = TemplateArgs::default().resolve(&self.config);
@@ -329,7 +329,7 @@ impl AutomationApp {
                 let wait_ms = step
                     .wait_ms
                     .or(step.timeout_ms)
-                    .unwrap_or(self.config.custom_workflows.default_step_wait_ms);
+                    .unwrap_or(self.config.timing.workflow.default_step_wait_ms);
                 workflow_actions::wait(wait_ms);
                 Ok(())
             }
@@ -340,11 +340,11 @@ impl AutomationApp {
             }
             "activate_game" => workflow_actions::activate(
                 &self.config.window,
-                self.config.timing.active_after_activate_ms,
+                self.config.timing.input.after_activate_ms,
             ),
             "focus_game" => workflow_actions::focus(
                 &self.config.window,
-                self.config.timing.active_after_activate_ms,
+                self.config.timing.input.after_activate_ms,
             ),
             "click" => {
                 let point = step
@@ -362,7 +362,7 @@ impl AutomationApp {
                 workflow_actions::paste(
                     &text,
                     &self.config.window,
-                    self.config.timing.output_input_ms,
+                    self.config.timing.input.text_ms,
                 )
             }
             "send_chat" | "reply" => {
@@ -435,10 +435,10 @@ impl AutomationApp {
             .unwrap_or(self.config.custom_workflows.default_threshold);
         let timeout_ms = step
             .timeout_ms
-            .unwrap_or(self.config.custom_workflows.default_timeout_ms);
+            .unwrap_or(self.config.timing.workflow.default_timeout_ms);
         let poll_ms = step
             .poll_ms
-            .unwrap_or(self.config.custom_workflows.default_poll_ms)
+            .unwrap_or(self.config.timing.workflow.default_poll_ms)
             .max(50);
         let locator = self.ui_locator(poll_ms);
         let action = if click {
@@ -490,15 +490,15 @@ impl AutomationApp {
             .unwrap_or(self.config.custom_workflows.default_threshold);
         let timeout_ms = step
             .timeout_ms
-            .unwrap_or(self.config.custom_workflows.default_timeout_ms);
+            .unwrap_or(self.config.timing.workflow.default_timeout_ms);
         let poll_ms = step
             .poll_ms
-            .unwrap_or(self.config.custom_workflows.default_poll_ms)
+            .unwrap_or(self.config.timing.workflow.default_poll_ms)
             .max(50);
         let locator = self.ui_locator(poll_ms);
         let stability_timeout_ms = step
             .wait_ms
-            .unwrap_or(self.config.custom_workflows.default_step_wait_ms)
+            .unwrap_or(self.config.timing.workflow.default_step_wait_ms)
             .max(poll_ms);
         let stable_after_absent = step.stable_after_absent.unwrap_or(
             self.config
@@ -538,10 +538,10 @@ impl AutomationApp {
             .ok_or_else(|| anyhow!("custom workflow text step missing region"))?;
         let timeout_ms = step
             .timeout_ms
-            .unwrap_or(self.config.custom_workflows.default_timeout_ms);
+            .unwrap_or(self.config.timing.workflow.default_timeout_ms);
         let poll_ms = step
             .poll_ms
-            .unwrap_or(self.config.custom_workflows.default_poll_ms)
+            .unwrap_or(self.config.timing.workflow.default_poll_ms)
             .max(50);
         let locator = self.ui_locator(poll_ms);
         let action = if click {
@@ -623,7 +623,7 @@ impl AutomationApp {
     fn wait_for_invite_decision(&self) -> Result<Option<bool>> {
         let existing = self.collect_invite_decision_bottoms();
         let deadline =
-            Instant::now() + Duration::from_millis(self.config.timing.invite_confirm_timeout_ms);
+            Instant::now() + Duration::from_millis(self.config.timing.invite.confirm_timeout_ms);
         let template_args = TemplateArgs::default().resolve(&self.config);
         let canvas = Canvas {
             width: self.config.screen.expected_width,
@@ -632,7 +632,7 @@ impl AutomationApp {
         };
         while self.running.load(AtomicOrdering::SeqCst) && Instant::now() < deadline {
             sleep(Duration::from_millis(
-                self.config.timing.invite_confirm_poll_ms,
+                self.config.timing.invite.confirm_poll_ms,
             ));
             let frame = match load_frame(&FrameArgs { image: None }, &canvas, &self.config.window) {
                 Ok(frame) => frame,
@@ -731,7 +731,7 @@ impl AutomationApp {
             self.return_to_primary_from_transient_ui("邀请失败");
             return Ok(false);
         };
-        sleep(Duration::from_millis(self.config.timing.invite_step_ms));
+        sleep(Duration::from_millis(self.config.timing.invite.step_ms));
 
         for (label, rect, template) in [
             (
@@ -767,7 +767,7 @@ impl AutomationApp {
             if label == "进入大厅" {
                 self.on_entered_new_hall();
             }
-            sleep(Duration::from_millis(self.config.timing.invite_step_ms));
+            sleep(Duration::from_millis(self.config.timing.invite.step_ms));
         }
 
         log::info!("邀请完成: {}", username);
@@ -806,8 +806,13 @@ impl AutomationApp {
                 return Ok(false);
             }
         }
-        let vote_timeout_seconds =
-            self.config.moderation.vote_timeout_ms.saturating_add(999) / 1000;
+        let vote_timeout_seconds = self
+            .config
+            .timing
+            .moderation
+            .vote_timeout_ms
+            .saturating_add(999)
+            / 1000;
         let announce = format!(
             "管理员发起了对@UID{}的{}请求,请好友{}s内使用@同意/不同意进行判决",
             command.uid,
@@ -913,7 +918,7 @@ impl AutomationApp {
         ))?;
         let result = self.execute_moderation_steps(&command);
         sleep(Duration::from_millis(
-            self.config.timing.return_to_primary_retry_ms,
+            self.config.timing.command.return_retry_ms,
         ));
         match &result {
             Ok(true) => {
@@ -939,7 +944,7 @@ impl AutomationApp {
     fn wait_for_moderation_votes(&self, command: &command::ModerationCommand) -> Result<bool> {
         let existing = self.collect_moderation_vote_bottoms();
         let deadline =
-            Instant::now() + Duration::from_millis(self.config.moderation.vote_timeout_ms);
+            Instant::now() + Duration::from_millis(self.config.timing.moderation.vote_timeout_ms);
         let template_args = TemplateArgs::default().resolve(&self.config);
         let canvas = Canvas {
             width: self.config.screen.expected_width,
@@ -949,7 +954,9 @@ impl AutomationApp {
         let mut stable_votes: HashMap<String, bool> = HashMap::new();
         let mut samples: HashMap<(String, bool), u32> = HashMap::new();
         while self.running.load(AtomicOrdering::SeqCst) && Instant::now() < deadline {
-            sleep(Duration::from_millis(self.config.moderation.vote_poll_ms));
+            sleep(Duration::from_millis(
+                self.config.timing.moderation.vote_poll_ms,
+            ));
             let frame = match load_frame(&FrameArgs { image: None }, &canvas, &self.config.window) {
                 Ok(frame) => frame,
                 Err(error) => {
@@ -1064,7 +1071,7 @@ impl AutomationApp {
     fn execute_moderation_steps_inner(&self, command: &command::ModerationCommand) -> Result<bool> {
         ensure_game_ready_for_input(
             &self.config.window,
-            self.config.timing.active_after_activate_ms,
+            self.config.timing.input.after_activate_ms,
         )?;
         let locator = self.ui_locator(self.template_poll_ms());
         let mut state = ModerationUiState::OpenFriendPanel;
@@ -1080,7 +1087,7 @@ impl AutomationApp {
             state = match state {
                 ModerationUiState::OpenFriendPanel => {
                     press_key(Key::Unicode('o'), &self.config.window)?;
-                    sleep(Duration::from_millis(self.config.timing.invite_step_ms));
+                    sleep(Duration::from_millis(self.config.timing.invite.step_ms));
                     if locator
                         .region(self.config.moderation.friend_panel_region.into())
                         .find_template(&self.config.templates.friend_panel)?
@@ -1093,9 +1100,9 @@ impl AutomationApp {
                 }
                 ModerationUiState::OpenSearchPanel => {
                     press_key(Key::Unicode('e'), &self.config.window)?;
-                    sleep(Duration::from_millis(self.config.timing.invite_step_ms));
+                    sleep(Duration::from_millis(self.config.timing.invite.step_ms));
                     press_key(Key::Unicode('e'), &self.config.window)?;
-                    sleep(Duration::from_millis(self.config.timing.invite_step_ms));
+                    sleep(Duration::from_millis(self.config.timing.invite.step_ms));
                     if locator
                         .region(self.config.moderation.search_panel_region.into())
                         .find_template(&self.config.templates.friend_search_panel)?
@@ -1118,11 +1125,11 @@ impl AutomationApp {
                         self.config.moderation.search_input_point.x,
                         self.config.moderation.search_input_point.y,
                     ))?;
-                    sleep(Duration::from_millis(self.config.timing.output_click_ms));
+                    sleep(Duration::from_millis(self.config.timing.input.click_ms));
                     paste_text(
                         &command.uid,
                         &self.config.window,
-                        self.config.timing.output_input_ms,
+                        self.config.timing.input.text_ms,
                     )?;
                     locator.click_point(Point::new(
                         self.config.moderation.search_button_point.x,
@@ -1136,7 +1143,7 @@ impl AutomationApp {
                         .wait_template_while(
                             &self.config.templates.friend_more_settings,
                             self.config.templates.marker_threshold,
-                            self.config.moderation.search_result_timeout_ms,
+                            self.config.timing.moderation.search_result_timeout_ms,
                             || self.running.load(AtomicOrdering::SeqCst),
                         )?
                     else {
@@ -1144,7 +1151,7 @@ impl AutomationApp {
                         return Ok(false);
                     };
                     locator.click_point(hit.center())?;
-                    sleep(Duration::from_millis(self.config.timing.invite_step_ms));
+                    sleep(Duration::from_millis(self.config.timing.invite.step_ms));
                     ModerationUiState::ClickAction
                 }
                 ModerationUiState::ClickAction => {
@@ -1164,7 +1171,7 @@ impl AutomationApp {
                         log::error!("未找到{}模板", label);
                         return Ok(false);
                     }
-                    sleep(Duration::from_millis(self.config.timing.invite_step_ms));
+                    sleep(Duration::from_millis(self.config.timing.invite.step_ms));
                     ModerationUiState::ConfirmAction
                 }
                 ModerationUiState::ConfirmAction => {
@@ -1184,7 +1191,7 @@ impl AutomationApp {
                         .wait_template_absent_while(
                             &self.config.templates.friend_confirm,
                             self.config.templates.marker_threshold,
-                            self.config.moderation.confirm_wait_ms,
+                            self.config.timing.moderation.confirm_wait_ms,
                             || self.running.load(AtomicOrdering::SeqCst),
                         )?
                     {
@@ -1223,7 +1230,7 @@ impl AutomationApp {
     }
 
     fn template_poll_ms(&self) -> u64 {
-        self.config.timing.output_click_ms.max(100)
+        self.config.timing.input.click_ms.max(100)
     }
 
     fn send_friend_message(&self, username: &str, message: &str) -> Result<bool> {
@@ -1252,15 +1259,15 @@ impl AutomationApp {
     fn open_friend_chat(&self, username: &str, canvas: &Canvas) -> Result<bool> {
         ensure_game_ready_for_input(
             &self.config.window,
-            self.config.timing.active_after_activate_ms,
+            self.config.timing.input.after_activate_ms,
         )?;
         click_game_point(self.config.output.focus_point, &self.config.window)?;
         sleep(Duration::from_millis(
-            self.config.timing.invite_open_chat_ms,
+            self.config.timing.invite.open_chat_ms,
         ));
         press_key(Key::Return, &self.config.window)?;
         sleep(Duration::from_millis(
-            self.config.timing.invite_open_chat_ms,
+            self.config.timing.invite.open_chat_ms,
         ));
         let locator = self.ui_locator_with_canvas(canvas.clone(), self.template_poll_ms());
 
@@ -1275,7 +1282,7 @@ impl AutomationApp {
             self.return_to_primary_from_transient_ui("好友聊天失败");
             return Ok(false);
         };
-        sleep(Duration::from_millis(self.config.timing.invite_step_ms));
+        sleep(Duration::from_millis(self.config.timing.invite.step_ms));
         Ok(true)
     }
 }
@@ -1612,9 +1619,6 @@ mod tests {
         CustomWorkflowConfig {
             enabled: true,
             default_threshold: 0.9,
-            default_timeout_ms: 5_000,
-            default_poll_ms: 200,
-            default_step_wait_ms: 300,
             wait_template_absent_stable_default: true,
             templates: HashMap::new(),
             workflows: vec![workflow],

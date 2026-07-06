@@ -50,7 +50,7 @@ impl HitAction {
 pub(super) fn wait(wait_ms: u64) {
     let started = Instant::now();
     sleep(Duration::from_millis(wait_ms));
-    log::debug!(
+    log::info!(target: "timing",
         "原子动作耗时: action=wait total={}ms configured={}ms",
         elapsed_ms(started),
         wait_ms
@@ -64,7 +64,7 @@ pub(super) fn press_key_text(key_text: &str, window_config: &WindowConfig) -> Re
         return Err(anyhow!("custom workflow step key is empty"));
     }
     let result = press_key(parse_key(key_text)?, window_config);
-    log::debug!(
+    log::info!(target: "timing",
         "原子动作耗时: action=press_key total={}ms success={}",
         elapsed_ms(started),
         result.is_ok()
@@ -75,7 +75,7 @@ pub(super) fn press_key_text(key_text: &str, window_config: &WindowConfig) -> Re
 pub(super) fn activate(window_config: &WindowConfig, after_activate_ms: u64) -> Result<()> {
     let started = Instant::now();
     let result = activate_game(window_config, after_activate_ms);
-    log::info!(
+    log::info!(target: "timing",
         "原子动作耗时: action=activate_game total={}ms success={}",
         elapsed_ms(started),
         result.is_ok()
@@ -86,7 +86,7 @@ pub(super) fn activate(window_config: &WindowConfig, after_activate_ms: u64) -> 
 pub(super) fn focus(window_config: &WindowConfig, after_activate_ms: u64) -> Result<()> {
     let started = Instant::now();
     let result = focus_game(window_config, after_activate_ms);
-    log::info!(
+    log::info!(target: "timing",
         "原子动作耗时: action=focus_game total={}ms success={}",
         elapsed_ms(started),
         result.is_ok()
@@ -97,7 +97,7 @@ pub(super) fn focus(window_config: &WindowConfig, after_activate_ms: u64) -> Res
 pub(super) fn click_point(point: PointConfig, window_config: &WindowConfig) -> Result<()> {
     let started = Instant::now();
     let result = click_game_point(point, window_config);
-    log::debug!(
+    log::info!(target: "timing",
         "原子动作耗时: action=click_point total={}ms success={} x={} y={}",
         elapsed_ms(started),
         result.is_ok(),
@@ -117,7 +117,7 @@ pub(super) fn paste(
         return Err(anyhow!("custom workflow paste step missing text"));
     }
     let result = paste_text(text, window_config, clipboard_hold_ms);
-    log::info!(
+    log::info!(target: "timing",
         "原子动作耗时: action=paste total={}ms success={} hold={}ms chars={}",
         elapsed_ms(started),
         result.is_ok(),
@@ -145,7 +145,7 @@ where
         TemplateMode::Present => {
             let hit =
                 region.wait_template_while(template, threshold, timeout_ms, should_continue)?;
-            log::info!(
+            log::info!(target: "timing",
                 "原子动作耗时: action=locate_template mode=present total={}ms timeout={}ms found={} template={}",
                 elapsed_ms(started),
                 timeout_ms,
@@ -162,7 +162,7 @@ where
                 timeout_ms,
                 &mut should_continue,
             )? {
-                log::info!(
+                log::info!(target: "timing",
                     "原子动作耗时: action=locate_template mode=absent total={}ms absent={} stable=false timeout={}ms template={}",
                     elapsed_ms(started),
                     false,
@@ -182,7 +182,7 @@ where
                     should_continue,
                 )? {
                     stable_ms = elapsed_ms(stable_started);
-                    log::info!(
+                    log::info!(target: "timing",
                         "原子动作耗时: action=locate_template mode=absent total={}ms absent=true absent_wait={}ms stable=false stable_wait={}ms timeout={}ms template={}",
                         elapsed_ms(started),
                         absent_ms,
@@ -196,7 +196,7 @@ where
                 }
                 stable_ms = elapsed_ms(stable_started);
             }
-            log::info!(
+            log::info!(target: "timing",
                 "原子动作耗时: action=locate_template mode=absent total={}ms absent=true absent_wait={}ms stable={} stable_wait={}ms timeout={}ms template={}",
                 elapsed_ms(started),
                 absent_ms,
@@ -233,7 +233,7 @@ where
         should_continue,
     )?
     else {
-        log::info!(
+        log::info!(target: "timing",
             "原子动作耗时: action=wait_or_click_template total={}ms timeout={}ms hit=false clicked=false mode={}",
             elapsed_ms(started),
             timeout_ms,
@@ -247,7 +247,7 @@ where
         locator.click_point(Point::new(point.x + offset.x, point.y + offset.y))?;
         clicked = true;
     }
-    log::info!(
+    log::info!(target: "timing",
         "原子动作耗时: action=wait_or_click_template total={}ms timeout={}ms hit=true clicked={} mode={}",
         elapsed_ms(started),
         timeout_ms,
@@ -279,7 +279,7 @@ where
     let mut ocr_ms = 0_u128;
     loop {
         if !should_continue() {
-            log::info!(
+            log::info!(target: "timing",
                 "原子动作耗时: action=wait_or_click_text total={}ms timeout={}ms attempts={} ocr={}ms hit=false clicked=false canceled=true mode={}",
                 elapsed_ms(started),
                 timeout_ms,
@@ -299,7 +299,7 @@ where
                 locator.click_point(Point::new(point.x + offset.x, point.y + offset.y))?;
                 clicked = true;
             }
-            log::info!(
+            log::info!(target: "timing",
                 "原子动作耗时: action=wait_or_click_text total={}ms timeout={}ms attempts={} ocr={}ms hit=true clicked={} canceled=false mode={}",
                 elapsed_ms(started),
                 timeout_ms,
@@ -311,7 +311,7 @@ where
             return Ok(Some(point));
         }
         if Instant::now() >= deadline {
-            log::info!(
+            log::info!(target: "timing",
                 "原子动作耗时: action=wait_or_click_text total={}ms timeout={}ms attempts={} ocr={}ms hit=false clicked=false canceled=false mode={}",
                 elapsed_ms(started),
                 timeout_ms,

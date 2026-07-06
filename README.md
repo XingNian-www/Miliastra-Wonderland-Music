@@ -25,9 +25,9 @@ GitHub Actions 工作流在 `.github/workflows/build-windows-exe.yml`
 触发方式：
 
 - 在 GitHub Actions 页面手动执行 `workflow_dispatch`
-- 推送到 `main` 或 `dev`，并且本次推送包含 `Cargo.toml`
+- 推送到 `main` 或 `dev`，并且本次推送包含 EXE 构建相关文件
 
-推送触发时会比较 `Cargo.toml` 的 `[package].version`。只有版本号真的变化才会继续构建、打包和创建 Release；普通 `Cargo.toml` 改动会跳过构建
+推送触发时会自动构建并上传可运行构建产物。创建 GitHub Release 仍然只在手动执行工作流，或 `Cargo.toml` 的 `[package].version` 发生变化时进行
 
 构建产物是 `x86_64-pc-windows-msvc`，会下载 PP-OCRv6 小模型：
 
@@ -53,14 +53,14 @@ miliastra-wonderland-music-windows-x64/
 
 ## 本地构建
 
-正式发布使用 Windows MSVC 目标，并使用仓库内置的 MNN 3.6.0 Windows x64 动态库：
+正式发布使用 Windows MSVC 目标，并使用仓库内置的 MNN 3.6.0 Windows x64 头文件和导入库编译 EXE：
 
 ```powershell
 rustup default stable-x86_64-pc-windows-msvc
 cargo build --release
 ```
 
-仓库包含所需的 MNN 运行文件：
+仓库包含所需的 MNN 编译和运行文件：
 
 ```text
 vendor/mnn/3.6.0/windows-x64/include/
@@ -68,7 +68,7 @@ vendor/mnn/3.6.0/windows-x64/lib/MNN.lib
 vendor/mnn/3.6.0/windows-x64/bin/MNN.dll
 ```
 
-构建时会把 `MNN.dll` 复制到程序旁边。识别后端使用 CPU。发布路径不支持 CUDA、Vulkan、OpenCL、源码编译版 MNN 或其他预编译 MNN 包
+`cargo build` 只编译 EXE，不负责生成或复制 `MNN.dll`。发布包工作流会显式把仓库内置的 CPU 版 `MNN.dll` 放到 EXE 旁边；本地直接运行 target 里的 EXE 时，需要手动把 ABI 兼容的 `MNN.dll` 放到 EXE 旁边，或把 DLL 所在目录加入 `PATH`
 
 运行机器还需要安装 Microsoft Visual C++ Redistributable 2015-2022 x64，因为官方 MNN 动态库依赖 `MSVCP140.dll`、`VCRUNTIME140.dll` 和 `VCRUNTIME140_1.dll`
 
@@ -252,9 +252,11 @@ UID 操作只接受粉色好友私聊命令：
 初始投票参数：
 
 ```yaml
+timing:
+  moderation:
+    vote_timeout_ms: 120000
+    vote_poll_ms: 2000
 moderation:
-  vote_timeout_ms: 120000
-  vote_poll_ms: 2000
   stable_vote_samples: 3
   required_vote_margin: 3
 ```
@@ -271,11 +273,10 @@ moderation:
 | --- | --- |
 | `enabled` | 是否启用配置驱动的自定义流程命令 |
 | `default_threshold` | 模板匹配阈值，用于 `click_template`、`wait_template`、`wait_template_absent` |
-| `default_timeout_ms` | 等待模板或 OCR 文字出现/消失的超时时间，单位毫秒 |
-| `default_poll_ms` | 等待模板或 OCR 文字时的轮询间隔，单位毫秒，实际最小值 50ms |
-| `default_step_wait_ms` | 非等待步骤执行后的等待时间，单位毫秒 |
 | `templates` | 模板别名到图片路径的映射 |
 | `workflows` | 自定义流程列表 |
+
+自定义流程的默认等待时间统一放在 `timing.workflow.default_timeout_ms`、`timing.workflow.default_poll_ms` 和 `timing.workflow.default_step_wait_ms`。
 
 单个 `workflow` 参数：
 
@@ -289,8 +290,8 @@ moderation:
 | `confirm_before_run` | 执行步骤前是否需要确认 |
 | `confirm_message` | 确认提示内容，支持变量 |
 | `confirm_message_types` | 确认命令来源。`[blue]` 只接受大厅确认，`[pink]` 只接受好友私聊确认，留空表示不限 |
-| `confirm_timeout_ms` | 确认等待超时时间，单位毫秒；不填时使用 `timing.decision_timeout_ms` |
-| `confirm_poll_ms` | 确认等待轮询间隔，单位毫秒；不填时使用 `timing.decision_poll_ms` |
+| `confirm_timeout_ms` | 确认等待超时时间，单位毫秒；不填时使用 `timing.decision.timeout_ms` |
+| `confirm_poll_ms` | 确认等待轮询间隔，单位毫秒；不填时使用 `timing.decision.poll_ms` |
 | `steps` | 按顺序执行的步骤列表，任一步骤失败会中止流程 |
 | `success_message` | 全部步骤成功后发送到大厅的消息；空字符串表示不发送 |
 
@@ -445,6 +446,21 @@ http://127.0.0.1:18888
 | `invite` | 好友列表 OCR 区域和邀请按钮模板搜索区域 |
 | `custom_workflows` | 配置驱动的自定义命令流程 |
 
+`timing` 已按业务场景分组，旧版本的扁平字段会在启动时自动迁移到新位置：
+
+| 分组 | 说明 |
+| --- | --- |
+| `timing.chat_scan` | 聊天区变化检测、兜底扫描和变化 OCR 防抖 |
+| `timing.command` | 命令执行前后等待、返回一级界面重试和帮助消息间隔 |
+| `timing.input` | 激活窗口、聚焦、打开聊天、点击、输入和发送后的等待 |
+| `timing.workflow` | 自定义原子流程的默认超时、轮询和步骤后等待 |
+| `timing.hall` | F2 大厅页稳定等待和大厅信息 OCR 采样间隔 |
+| `timing.invite` | 邀请流程的面板等待、步骤等待和邀请确认扫描 |
+| `timing.moderation` | UID 拉黑/屏蔽投票、搜索结果等待和确认后等待 |
+| `timing.playback` | 点歌后播放状态轮询、切歌状态轮询和播放监控线程 |
+| `timing.decision` | 点歌确认、AI 匹配确认和自定义流程确认的默认等待 |
+| `timing.external` | FeelUOwn RPC、音量平滑步进和 AI HTTP 请求超时 |
+
 关键初始值：
 
 ```yaml
@@ -475,7 +491,8 @@ hotkeys:
 
 | 文件 | 说明 |
 | --- | --- |
-| `logs/miliastra-wonderland-music.log` | 程序日志 |
+| `logs/miliastra-wonderland-music.log` | 程序日志，只保留业务事件、扫描结果、错误和状态变化 |
+| `logs/miliastra-wonderland-music-timing.log` | 阶段耗时和性能诊断日志，包含 UI 检测、OCR、主循环、原子动作和输入阶段耗时 |
 | `data/runtime-state.json` | 运行状态 |
 | `data/queue.json` | 点歌队列 |
 | `data/executed-commands.log` | 已执行命令记录 |
@@ -487,6 +504,18 @@ hotkeys:
 ```
 
 时间使用 UTC+8
+
+聊天扫描的业务结果写入普通日志，格式类似：
+
+```text
+聊天扫描结果: markers=4 messages=4 [blue] 用户: @状态
+```
+
+耗时和阶段拆分只写入性能日志，例如：
+
+```text
+UI 状态检测耗时: total=218ms enter=12ms hall=8ms marker=198ms state=primary_marker blue=4 yellow=0 pink=0
+```
 
 ## 许可证
 

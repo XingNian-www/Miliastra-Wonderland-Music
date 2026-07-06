@@ -23,6 +23,17 @@ pub(super) struct ChatMessage {
     pub(super) text: String,
 }
 
+pub(super) struct PreparedChatScan {
+    chat: DynamicImage,
+    markers: Vec<TemplateHit>,
+    blocks: Vec<(TemplateHit, Rect)>,
+    crop_ms: u128,
+    marker_ms: u128,
+    block_ms: u128,
+    prepare_ms: u128,
+    started: Instant,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ChatMarkerCounts {
     blue: usize,
@@ -37,14 +48,23 @@ pub(super) fn scan_chat(
     chat_rect: Rect,
     monitor: Option<&MonitorShared>,
 ) -> Result<Vec<ChatMessage>> {
-    let total_started = Instant::now();
+    let prepared = prepare_chat_scan(image, templates, chat_rect)?;
+    recognize_prepared_chat(engine, templates, prepared, monitor)
+}
+
+pub(super) fn prepare_chat_scan(
+    image: &DynamicImage,
+    templates: &ResolvedTemplateArgs,
+    chat_rect: Rect,
+) -> Result<PreparedChatScan> {
+    let started = Instant::now();
+    let crop_started = Instant::now();
     let chat = crop_canvas(image, chat_rect)?;
+    let crop_ms = elapsed_ms(crop_started);
     let marker_started = Instant::now();
     let markers = find_chat_markers(&chat, templates)?;
     let marker_ms = elapsed_ms(marker_started);
-
-    let mut messages = Vec::new();
-    let ocr_started = Instant::now();
+    let block_started = Instant::now();
     let blocks: Vec<(TemplateHit, Rect)> = markers
         .iter()
         .map(|marker| {
@@ -52,15 +72,37 @@ pub(super) fn scan_chat(
             (marker.clone(), block)
         })
         .collect();
+    let block_ms = elapsed_ms(block_started);
+
+    Ok(PreparedChatScan {
+        chat,
+        markers,
+        blocks,
+        crop_ms,
+        marker_ms,
+        block_ms,
+        prepare_ms: elapsed_ms(started),
+        started,
+    })
+}
+
+pub(super) fn recognize_prepared_chat(
+    engine: &OcrEngine,
+    templates: &ResolvedTemplateArgs,
+    prepared: PreparedChatScan,
+    monitor: Option<&MonitorShared>,
+) -> Result<Vec<ChatMessage>> {
+    let mut messages = Vec::new();
+    let ocr_started = Instant::now();
     if templates.batch_recognize {
-        let block_rects: Vec<Rect> = blocks.iter().map(|(_, r)| *r).collect();
+        let block_rects: Vec<Rect> = prepared.blocks.iter().map(|(_, r)| *r).collect();
         let texts = ocr_batch::batch_recognize_blocks(
             engine,
-            &chat,
+            &prepared.chat,
             &block_rects,
             templates.same_line_y_tolerance,
         )?;
-        for ((marker, block), text) in blocks.iter().zip(texts) {
+        for ((marker, block), text) in prepared.blocks.iter().zip(texts) {
             messages.push(ChatMessage {
                 message_type: marker_type(marker).to_string(),
                 block: *block,
@@ -68,8 +110,8 @@ pub(super) fn scan_chat(
             });
         }
     } else {
-        for (marker, block) in &blocks {
-            let crop = crop_canvas(&chat, *block)?;
+        for (marker, block) in &prepared.blocks {
+            let crop = crop_canvas(&prepared.chat, *block)?;
             let text = merged_ocr_text(engine, &crop, templates.same_line_y_tolerance)?;
             messages.push(ChatMessage {
                 message_type: marker_type(marker).to_string(),
@@ -79,25 +121,28 @@ pub(super) fn scan_chat(
         }
     }
     let ocr_ms = elapsed_ms(ocr_started);
-    let total_ms = elapsed_ms(total_started);
+    let total_ms = elapsed_ms(prepared.started);
     if let Some(monitor) = monitor {
         monitor.set_ocr(OcrSnapshot {
-            markers: markers.len(),
+            markers: prepared.markers.len(),
             messages: messages
                 .iter()
                 .map(|message| format!("[{}] {}", message.message_type, message.text))
                 .collect(),
-            marker_ms,
+            marker_ms: prepared.marker_ms,
             ocr_ms,
             total_ms,
         });
     }
     log::info!(
-        "聊天扫描耗时: total={}ms marker={}ms ocr={}ms markers={} messages={}",
+        "聊天扫描耗时: total={}ms prepare={}ms crop={}ms marker={}ms block={}ms ocr={}ms markers={} messages={}",
         total_ms,
-        marker_ms,
+        prepared.prepare_ms,
+        prepared.crop_ms,
+        prepared.marker_ms,
+        prepared.block_ms,
         ocr_ms,
-        markers.len(),
+        prepared.markers.len(),
         messages.len()
     );
     Ok(messages)

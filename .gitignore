@@ -2,3 +2,7 @@
 /logs
 /data
 /models
+/.build
+/dist
+/CONTEXT.md
+/docs/adr/

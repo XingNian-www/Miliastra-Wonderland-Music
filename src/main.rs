@@ -36,6 +36,7 @@ mod app {
     mod ui_locator;
     mod ui_state;
     mod window;
+    mod workflow_actions;
 
     use std::collections::{HashMap, HashSet, VecDeque};
     use std::fs::{self, OpenOptions};
@@ -52,7 +53,9 @@ mod app {
         rect_chat_change_fingerprint,
     };
     use self::chat_output::ChatOutput;
-    use self::chat_scan::{ChatMessage, count_chat_markers, scan_chat};
+    use self::chat_scan::{
+        ChatMessage, count_chat_markers, prepare_chat_scan, recognize_prepared_chat, scan_chat,
+    };
     use self::command::{CommandLockState, ParsedCommand, PendingCommand, UserCommand};
     use self::config::{AppConfig, PointConfig};
     use self::feeluown::{FeelUOwnClient, PlayerStatus, format_lyrics, format_status};
@@ -896,6 +899,30 @@ mod app {
             Ok(guard)
         }
 
+        fn scan_chat_with_shared_ocr(
+            &self,
+            image: &DynamicImage,
+            templates: &ResolvedTemplateArgs,
+        ) -> Result<Vec<ChatMessage>> {
+            let total_started = Instant::now();
+            let prepared =
+                prepare_chat_scan(image, templates, self.config.screen.chat_rect.into())?;
+            let lock_started = Instant::now();
+            let engine = self.ocr_engine()?;
+            let lock_ms = elapsed_ms(lock_started);
+            if lock_ms > 0 {
+                log::debug!("OCR 锁等待耗时: {}ms", lock_ms);
+            }
+            let messages =
+                recognize_prepared_chat(&engine.engine, templates, prepared, Some(&self.monitor));
+            log::debug!(
+                "聊天扫描端到端耗时: total={}ms ocr_lock={}ms",
+                elapsed_ms(total_started),
+                lock_ms
+            );
+            messages
+        }
+
         fn warn_if_screen_size_mismatch(&self) -> Result<()> {
             let frame = match window::capture_game(&self.config.window) {
                 Ok(frame) => frame,
@@ -962,22 +989,29 @@ mod app {
 
             log::info!("自动化扫描已启动");
             while self.running.load(AtomicOrdering::SeqCst) {
+                let loop_started = Instant::now();
                 if self.paused.load(AtomicOrdering::SeqCst) {
                     self.maybe_idle_exit()?;
                     sleep(Duration::from_millis(self.config.timing.scan_loop_idle_ms));
                     continue;
                 }
 
+                let frame_started = Instant::now();
                 match load_frame(&frame_args, &canvas, &self.config.window) {
                     Ok(frame) => {
+                        let frame_ms = elapsed_ms(frame_started);
                         if target_missing {
                             log::info!("目标窗口已恢复，重置截图退避");
                             target_missing = false;
                         }
                         target_missing_backoff = TARGET_MISSING_BACKOFF_INITIAL;
-                        match detect_ui_state(&frame.image, &ui_template_args, &self.config.screen)
-                        {
+                        let ui_started = Instant::now();
+                        let ui_state_result =
+                            detect_ui_state(&frame.image, &ui_template_args, &self.config.screen);
+                        let ui_ms = elapsed_ms(ui_started);
+                        match ui_state_result {
                             Ok(ui_state) if ui_state.is_primary() => {
+                                let primary_started = Instant::now();
                                 let entered_primary = !primary_visible;
                                 primary_visible = true;
                                 let fingerprint = match rect_chat_change_fingerprint(
@@ -1059,18 +1093,21 @@ mod app {
                                     sleep(Duration::from_millis(
                                         self.config.timing.chat_change_debounce_ms,
                                     ));
+                                    let rescan_frame_started = Instant::now();
                                     match load_frame(&frame_args, &canvas, &self.config.window) {
                                         Ok(frame) => {
-                                            let messages = {
-                                                let engine = self.ocr_engine()?;
-                                                scan_chat(
-                                                    &frame.image,
-                                                    &engine.engine,
-                                                    &template_args,
-                                                    self.config.screen.chat_rect.into(),
-                                                    Some(&self.monitor),
-                                                )
-                                            };
+                                            let rescan_frame_ms = elapsed_ms(rescan_frame_started);
+                                            let scan_started = Instant::now();
+                                            let messages = self.scan_chat_with_shared_ocr(
+                                                &frame.image,
+                                                &template_args,
+                                            );
+                                            let scan_ms = elapsed_ms(scan_started);
+                                            log::info!(
+                                                "变化扫描阶段耗时: rescan_frame={}ms scan={}ms",
+                                                rescan_frame_ms,
+                                                scan_ms
+                                            );
                                             match messages {
                                                 Ok(messages) => {
                                                     self.handle_scan_messages(messages)?
@@ -1103,16 +1140,8 @@ mod app {
                                         reason,
                                         now.duration_since(last_ocr_at).as_millis()
                                     );
-                                    let messages = {
-                                        let engine = self.ocr_engine()?;
-                                        scan_chat(
-                                            &frame.image,
-                                            &engine.engine,
-                                            &template_args,
-                                            self.config.screen.chat_rect.into(),
-                                            Some(&self.monitor),
-                                        )
-                                    };
+                                    let messages = self
+                                        .scan_chat_with_shared_ocr(&frame.image, &template_args);
                                     match messages {
                                         Ok(messages) => self.handle_scan_messages(messages)?,
                                         Err(error) => log::error!("聊天扫描失败: {error:#}"),
@@ -1122,6 +1151,26 @@ mod app {
                                     force_scan_reason = None;
                                     last_fingerprint = fingerprint.clone();
                                     scanned_this_round = true;
+                                }
+                                let primary_ms = elapsed_ms(primary_started);
+                                let loop_ms = elapsed_ms(loop_started);
+                                if scanned_this_round || loop_ms >= 80 {
+                                    log::info!(
+                                        "主循环阶段耗时: total={}ms frame={}ms ui={}ms primary={}ms state=primary scanned={}",
+                                        loop_ms,
+                                        frame_ms,
+                                        ui_ms,
+                                        primary_ms,
+                                        scanned_this_round
+                                    );
+                                } else {
+                                    log::debug!(
+                                        "主循环阶段耗时: total={}ms frame={}ms ui={}ms primary={}ms state=primary scanned=false",
+                                        loop_ms,
+                                        frame_ms,
+                                        ui_ms,
+                                        primary_ms
+                                    );
                                 }
 
                                 if change_suppressed {
@@ -1139,20 +1188,40 @@ mod app {
                             Ok(ui_state) => {
                                 primary_visible = false;
                                 log::debug!("当前不是一级聊天界面，跳过聊天扫描: {}", ui_state);
+                                log::debug!(
+                                    "主循环阶段耗时: total={}ms frame={}ms ui={}ms state={} scanned=false",
+                                    elapsed_ms(loop_started),
+                                    frame_ms,
+                                    ui_ms,
+                                    ui_state
+                                );
                                 last_fingerprint = None;
                             }
                             Err(error) => {
                                 primary_visible = false;
                                 log::error!("界面状态检测失败: {error:#}");
+                                log::debug!(
+                                    "主循环阶段耗时: total={}ms frame={}ms ui={}ms state=ui_error scanned=false",
+                                    elapsed_ms(loop_started),
+                                    frame_ms,
+                                    ui_ms
+                                );
                             }
                         }
                     }
                     Err(error) => {
+                        let frame_ms = elapsed_ms(frame_started);
                         primary_visible = false;
                         last_fingerprint = None;
                         log::warn!(
                             "截图失败，{}秒后重试: {error:#}",
                             target_missing_backoff.as_secs()
+                        );
+                        log::debug!(
+                            "主循环阶段耗时: total={}ms frame={}ms state=capture_error retry={}ms",
+                            elapsed_ms(loop_started),
+                            frame_ms,
+                            target_missing_backoff.as_millis()
                         );
                         target_missing = true;
                         self.maybe_idle_exit()?;
@@ -1514,7 +1583,17 @@ mod app {
             Ok(())
         }
 
+        fn ensure_game_ready_for_input(&self, context: &str) -> Result<()> {
+            log::info!("{}: 激活并聚焦游戏窗口", context);
+            self::input_actions::ensure_game_ready_for_input(
+                &self.config.window,
+                self.config.timing.active_after_activate_ms,
+            )
+            .with_context(|| format!("{}: 激活并聚焦游戏窗口失败", context))
+        }
+
         fn prepare_command_ui(&self, command: &str) -> Result<bool> {
+            self.ensure_game_ready_for_input("命令执行前准备")?;
             let templates = UiTemplateArgs::default().resolve(&self.config);
             let canvas = Canvas {
                 width: self.config.screen.expected_width,
@@ -2549,6 +2628,7 @@ mod app {
         }
 
         fn execute_microphone_command(&self, username: &str) -> Result<()> {
+            self.ensure_game_ready_for_input("麦克风命令")?;
             if !self.is_primary_ui()? {
                 log::info!("麦克风: 当前不在一级界面，返回一级界面");
                 self.return_to_primary_fixed();
@@ -2572,6 +2652,7 @@ mod app {
         }
 
         fn execute_hall_detect(&mut self) -> Result<()> {
+            self.ensure_game_ready_for_input("大厅检测")?;
             log::info!("大厅检测: 按 F2 进入大厅页面");
             press_key(Key::F2, &self.config.window)?;
             sleep(Duration::from_millis(
@@ -2642,6 +2723,7 @@ mod app {
         }
 
         fn reply_hall_time(&mut self) -> Result<()> {
+            self.ensure_game_ready_for_input("大厅时间")?;
             let minutes = self.runtime_state()?.state().hall_remaining_minutes_now();
             if let Some(minutes) = minutes.filter(|minutes| *minutes > 0) {
                 return self.reply(&format!("大厅到期时间，剩余{}分钟", minutes));
@@ -2676,6 +2758,7 @@ mod app {
         }
 
         fn check_public_hall(&self) -> Result<bool> {
+            self.ensure_game_ready_for_input("大厅检测")?;
             log::info!("大厅检测: 按 F2 进入大厅页面");
             press_key(Key::F2, &self.config.window)?;
             sleep(Duration::from_millis(
@@ -2704,6 +2787,10 @@ mod app {
         }
 
         fn return_to_primary_fixed(&self) -> bool {
+            if let Err(error) = self.ensure_game_ready_for_input("返回一级界面") {
+                log::error!("返回一级界面前激活并聚焦游戏失败: {error:#}");
+                return false;
+            }
             let templates = UiTemplateArgs::default().resolve(&self.config);
             let canvas = Canvas {
                 width: self.config.screen.expected_width,
@@ -3375,22 +3462,7 @@ mod app {
                             continue;
                         }
                     };
-                let scan_result = {
-                    let engine = match self.ocr_engine() {
-                        Ok(engine) => engine,
-                        Err(error) => {
-                            log::error!("确认命令 OCR 锁失败: {error:#}");
-                            continue;
-                        }
-                    };
-                    scan_chat(
-                        &frame.image,
-                        &engine.engine,
-                        &template_args,
-                        self.config.screen.chat_rect.into(),
-                        Some(&self.monitor),
-                    )
-                };
+                let scan_result = self.scan_chat_with_shared_ocr(&frame.image, &template_args);
                 let messages = match scan_result {
                     Ok(messages) => messages,
                     Err(error) => {
@@ -3447,16 +3519,7 @@ mod app {
             else {
                 return output;
             };
-            let Ok(engine) = self.ocr_engine() else {
-                return output;
-            };
-            let Ok(messages) = scan_chat(
-                &frame.image,
-                &engine.engine,
-                &template_args,
-                self.config.screen.chat_rect.into(),
-                Some(&self.monitor),
-            ) else {
+            let Ok(messages) = self.scan_chat_with_shared_ocr(&frame.image, &template_args) else {
                 return output;
             };
             for message in messages {

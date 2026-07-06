@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow};
 use serde_yaml::{Mapping, Value};
 
-pub const CURRENT_CONFIG_VERSION: u32 = 11;
+pub const CURRENT_CONFIG_VERSION: u32 = 12;
 
 struct ChangedDefaultField {
     path: &'static str,
@@ -639,7 +639,7 @@ mod tests {
 
     const DEFAULT: &str = r#"# test config
 # version comment
-config_version: 11
+config_version: 12
 
 timing:
   # fallback comment
@@ -689,7 +689,7 @@ unknown_root:
             .expect("migration needed");
 
         assert!(report.text.contains("# fallback comment"));
-        assert!(report.text.contains("config_version: 11"));
+        assert!(report.text.contains("config_version: 12"));
         assert!(report.text.contains("chat_scan_fallback_ms: 1234"));
         assert!(report.text.contains("scan_loop_idle_ms: 77"));
         assert!(report.text.contains("output_focus_ms: 456"));
@@ -710,7 +710,7 @@ unknown_root:
 
     #[test]
     fn current_version_without_moved_fields_does_not_migrate() {
-        let current = r#"config_version: 11
+        let current = r#"config_version: 12
 timing:
   chat_scan_fallback_ms: 2000
   scan_loop_idle_ms: 60
@@ -744,7 +744,7 @@ queue:
             .expect("migration succeeds")
             .expect("migration needed");
 
-        assert!(report.text.contains("config_version: 11"));
+        assert!(report.text.contains("config_version: 12"));
         assert!(
             report
                 .text
@@ -795,7 +795,7 @@ custom_workflows:
             .expect("migration succeeds")
             .expect("migration needed");
 
-        assert!(report.text.contains("config_version: 11"));
+        assert!(report.text.contains("config_version: 12"));
         assert!(report.text.contains("allow_args: false"));
         assert!(report.text.contains("message_types:"));
         assert!(report.text.contains("confirm_before_run: false"));
@@ -871,7 +871,7 @@ queue:
             .expect("migration succeeds")
             .expect("migration needed");
 
-        assert!(report.text.contains("config_version: 11"));
+        assert!(report.text.contains("config_version: 12"));
         assert!(report.text.contains("auto_advance_seconds: 1"));
     }
 
@@ -886,7 +886,7 @@ tui:
             .expect("migration succeeds")
             .expect("migration needed");
 
-        assert!(report.text.contains("config_version: 11"));
+        assert!(report.text.contains("config_version: 12"));
         assert!(report.text.contains("enabled: true"));
         assert!(report.text.contains("protect_auto_played_songs: true"));
     }

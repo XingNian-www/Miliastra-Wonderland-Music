@@ -11,6 +11,7 @@ use super::ai::AiClient;
 use super::chat_output::ChatOutput;
 use super::config::{AppConfig, PointConfig};
 use super::feeluown::FeelUOwnClient;
+use super::input_actions::ensure_game_ready_for_input;
 use super::ocr::{
     OcrArgs, OcrBackendProbeStatus, make_ocr_engine, probe_ocr_backend_support, recognize_lines,
 };
@@ -107,9 +108,9 @@ fn run_panel_response_benchmark(config_path: &Path) -> Result<()> {
     );
     println!("测试会按 Enter 打开聊天面板，再按 Esc 收起，不发送消息");
 
+    ensure_game_ready_for_input(&config.window, config.timing.active_after_activate_ms)?;
     let mut enigo = Enigo::new(&Settings::default()).context("create enigo")?;
     let mut game_window = window::GameWindow::find(&config.window)?;
-    game_window.focus_for_keyboard(&mut enigo)?;
     sleep(Duration::from_millis(config.timing.output_focus_ms));
 
     let mut open_times = Vec::new();
@@ -633,6 +634,7 @@ fn run_key(config_path: &Path) -> Result<()> {
     let key = prompt("按键，例如 Return/Escape/F2/N")?;
     let key = parse_key(&key)?;
     if prompt_yes_no("确认发送按键？", true)? {
+        ensure_game_ready_for_input(&config.window, config.timing.active_after_activate_ms)?;
         press_key(key, &config.window)?;
     }
     Ok(())

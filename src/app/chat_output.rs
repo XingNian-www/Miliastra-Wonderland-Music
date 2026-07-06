@@ -1,5 +1,5 @@
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use enigo::{Direction, Enigo, Key, Keyboard, Settings};
@@ -74,13 +74,13 @@ impl ChatOutput {
     fn send_current_chat_with_input(&self, message: &str) -> Result<()> {
         let mut enigo = Enigo::new(&Settings::default()).context("create enigo")?;
         let mut window = GameWindow::find(&self.window)?;
-        window.focus_for_keyboard(&mut enigo)?;
+        window.activate(self.timing.active_after_activate_ms)?;
+        window.focus_game(&mut enigo, self.window.focus_point)?;
         sleep_ms(self.timing.output_focus_ms);
 
         window.click(&mut enigo, self.config.chat_click_2)?;
         sleep_ms(self.timing.output_click_ms);
-        input_message(&mut enigo, message)?;
-        sleep_ms(self.timing.output_input_ms);
+        input_message(&mut enigo, message, self.timing.output_input_ms)?;
         enigo
             .key(Key::Return, Direction::Click)
             .context("send message")?;
@@ -91,7 +91,8 @@ impl ChatOutput {
     fn send_batch_with_input(&self, messages: &[String], delay_ms: u64) -> Result<()> {
         let mut enigo = Enigo::new(&Settings::default()).context("create enigo")?;
         let mut window = GameWindow::find(&self.window)?;
-        window.focus_for_keyboard(&mut enigo)?;
+        window.activate(self.timing.active_after_activate_ms)?;
+        window.focus_game(&mut enigo, self.window.focus_point)?;
         sleep_ms(self.timing.output_focus_ms);
 
         window.click(&mut enigo, self.config.focus_point)?;
@@ -110,8 +111,7 @@ impl ChatOutput {
             window.click(&mut enigo, self.config.chat_click_2)?;
             sleep_ms(self.timing.output_open_chat_ms);
 
-            input_message(&mut enigo, message)?;
-            sleep_ms(self.timing.output_input_ms);
+            input_message(&mut enigo, message, self.timing.output_input_ms)?;
             enigo
                 .key(Key::Return, Direction::Click)
                 .context("send message")?;
@@ -122,16 +122,21 @@ impl ChatOutput {
     }
 }
 
-fn input_message(enigo: &mut Enigo, message: &str) -> Result<()> {
-    if let Err(error) = paste_message(enigo, message) {
+fn input_message(enigo: &mut Enigo, message: &str, input_settle_ms: u64) -> Result<()> {
+    if let Err(error) = paste_message(enigo, message, input_settle_ms) {
         log::error!("粘贴输入失败，回退到文字输入: {error:#}");
         enigo.text(message).context("input message text")?;
+        sleep_ms(input_settle_ms);
     }
     Ok(())
 }
 
-fn paste_message(enigo: &mut Enigo, message: &str) -> Result<()> {
-    clipboard::set_text(message).context("set clipboard text")?;
+fn paste_message(enigo: &mut Enigo, message: &str, clipboard_hold_ms: u64) -> Result<()> {
+    let started = Instant::now();
+    let clipboard_started = Instant::now();
+    let _clipboard_guard = clipboard::TextRestoreGuard::replace_with(message)?;
+    let clipboard_ms = elapsed_ms(clipboard_started);
+    let input_started = Instant::now();
     enigo
         .key(Key::Control, Direction::Press)
         .context("press control for paste")?;
@@ -141,11 +146,24 @@ fn paste_message(enigo: &mut Enigo, message: &str) -> Result<()> {
     enigo
         .key(Key::Control, Direction::Release)
         .context("release control after paste")?;
+    sleep_ms(clipboard_hold_ms);
+    log::info!(
+        "聊天粘贴耗时: total={}ms clipboard={}ms input={}ms hold={}ms chars={}",
+        elapsed_ms(started),
+        clipboard_ms,
+        elapsed_ms(input_started),
+        clipboard_hold_ms,
+        message.chars().count()
+    );
     result
 }
 
 fn sleep_ms(ms: u64) {
     sleep(Duration::from_millis(ms));
+}
+
+fn elapsed_ms(started: Instant) -> u128 {
+    started.elapsed().as_millis()
 }
 
 fn fit_chat_message(message: &str) -> String {

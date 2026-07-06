@@ -2,7 +2,7 @@
 # 坐标沿用旧脚本习惯：以游戏客户区左上角为原点，按 1920x1080 有效画面写坐标
 
 # 配置版本；程序启动时会把旧版本配置迁移到当前模板
-config_version: 11
+config_version: 12
 
 window:
   # 目标游戏进程名，按进程文件名匹配，大小写不敏感
@@ -13,6 +13,9 @@ window:
   content_height: 1080
   # /active-window 接口是否尝试自动切回目标窗口
   auto_activate_window: false
+  focus_point:
+    x: 1919
+    y: 1000
 
 screen:
   # 截图会缩放到这个宽度后再做模板匹配和 OCR
@@ -404,9 +407,11 @@ custom_workflows:
   default_poll_ms: 200
   # 每个步骤执行后的默认等待时间，单位毫秒
   default_step_wait_ms: 300
+  wait_template_absent_stable_default: true
   # 自定义模板名到图片路径的映射，步骤里通过 template 引用这里的名字
   templates: {}
-  # 支持的步骤：key/click/click_template/wait_template/wait_template_absent/click_text/wait_text/paste/send_chat/send_current_chat/send_friend_message/invite_user/return_primary/sleep
+  # 支持的步骤：activate_game/focus_game/key/click/click_template/wait_template/wait_template_absent/click_text/wait_text/paste/send_chat/send_current_chat/send_friend_message/invite_user/return_primary/sleep
+  # wait_template_absent 默认在模板消失后继续等待像素稳定；可在步骤上设置 stable_after_absent: false 关闭
   # 支持变量：{{username}}、{{args}}、{{arg1}}、{{arg2}}、{{command}}、{{workflow}}、{{message_type}}
   # send_friend_message 默认发送给触发命令的好友，也可以用 target 指定好友名
   # confirm_message_types 控制确认命令来源：[blue] 为大厅，[pink] 为好友私聊，留空表示不限

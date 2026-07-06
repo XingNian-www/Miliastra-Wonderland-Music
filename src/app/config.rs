@@ -36,6 +36,12 @@ pub struct WindowConfig {
     pub content_width: u32,
     pub content_height: u32,
     pub auto_activate_window: bool,
+    #[serde(default = "default_window_focus_point")]
+    pub focus_point: PointConfig,
+}
+
+fn default_window_focus_point() -> PointConfig {
+    PointConfig::new(1919, 1000)
 }
 
 impl AppConfig {
@@ -278,8 +284,14 @@ pub struct CustomWorkflowConfig {
     pub default_timeout_ms: u64,
     pub default_poll_ms: u64,
     pub default_step_wait_ms: u64,
+    #[serde(default = "default_wait_template_absent_stable")]
+    pub wait_template_absent_stable_default: bool,
     pub templates: HashMap<String, PathBuf>,
     pub workflows: Vec<CustomWorkflowDefinition>,
+}
+
+fn default_wait_template_absent_stable() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -314,6 +326,7 @@ pub struct CustomWorkflowStep {
     pub timeout_ms: Option<u64>,
     pub poll_ms: Option<u64>,
     pub wait_ms: Option<u64>,
+    pub stable_after_absent: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

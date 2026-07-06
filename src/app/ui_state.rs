@@ -105,6 +105,7 @@ pub(super) fn detect_ui_state(
     screen: &config::ScreenConfig,
 ) -> Result<UiState> {
     let started = Instant::now();
+    let enter_started = Instant::now();
     if best_template_hit(
         image,
         Some(screen.enter_rect.into()),
@@ -113,13 +114,17 @@ pub(super) fn detect_ui_state(
     )?
     .is_some()
     {
+        let enter_ms = elapsed_ms(enter_started);
         log::debug!(
-            "UI 状态检测耗时: {}ms state=primary_enter",
-            elapsed_ms(started)
+            "UI 状态检测耗时: total={}ms enter={}ms hall=0ms marker=0ms state=primary_enter",
+            elapsed_ms(started),
+            enter_ms
         );
         return Ok(UiState::primary_enter());
     }
+    let enter_ms = elapsed_ms(enter_started);
 
+    let hall_started = Instant::now();
     if best_template_hit(
         image,
         Some(screen.secondary_hall_rect.into()),
@@ -128,19 +133,28 @@ pub(super) fn detect_ui_state(
     )?
     .is_some()
     {
+        let hall_ms = elapsed_ms(hall_started);
         log::debug!(
-            "UI 状态检测耗时: {}ms state=secondary_hall",
-            elapsed_ms(started)
+            "UI 状态检测耗时: total={}ms enter={}ms hall={}ms marker=0ms state=secondary_hall",
+            elapsed_ms(started),
+            enter_ms,
+            hall_ms
         );
         return Ok(UiState::secondary_hall());
     }
+    let hall_ms = elapsed_ms(hall_started);
 
+    let marker_started = Instant::now();
     let (blue, yellow, pink) =
         count_chat_markers(image, &templates.chat_templates, screen.chat_rect)?;
+    let marker_ms = elapsed_ms(marker_started);
     if blue + yellow + pink > 0 {
         log::debug!(
-            "UI 状态检测耗时: {}ms state=primary_marker blue={} yellow={} pink={}",
+            "UI 状态检测耗时: total={}ms enter={}ms hall={}ms marker={}ms state=primary_marker blue={} yellow={} pink={}",
             elapsed_ms(started),
+            enter_ms,
+            hall_ms,
+            marker_ms,
             blue,
             yellow,
             pink
@@ -148,7 +162,13 @@ pub(super) fn detect_ui_state(
         return Ok(UiState::primary_marker(blue, yellow, pink));
     }
 
-    log::debug!("UI 状态检测耗时: {}ms state=unknown", elapsed_ms(started));
+    log::debug!(
+        "UI 状态检测耗时: total={}ms enter={}ms hall={}ms marker={}ms state=unknown",
+        elapsed_ms(started),
+        enter_ms,
+        hall_ms,
+        marker_ms
+    );
     Ok(UiState::unknown())
 }
 

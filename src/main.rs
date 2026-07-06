@@ -36,6 +36,7 @@ mod app {
     mod ui_locator;
     mod ui_state;
     mod window;
+    mod workflow_actions;
 
     use std::collections::{HashMap, HashSet, VecDeque};
     use std::fs::{self, OpenOptions};
@@ -52,7 +53,9 @@ mod app {
         rect_chat_change_fingerprint,
     };
     use self::chat_output::ChatOutput;
-    use self::chat_scan::{ChatMessage, count_chat_markers, scan_chat};
+    use self::chat_scan::{
+        ChatMessage, count_chat_markers, prepare_chat_scan, recognize_prepared_chat, scan_chat,
+    };
     use self::command::{CommandLockState, ParsedCommand, PendingCommand, UserCommand};
     use self::config::{AppConfig, PointConfig};
     use self::feeluown::{FeelUOwnClient, PlayerStatus, format_lyrics, format_status};
@@ -538,13 +541,14 @@ mod app {
         } else {
             None
         };
-        let log_path = logger::init(
+        let log_paths = logger::init(
             &config.logging.dir,
             &config.logging.level,
             Some(monitor.log_sink()),
             tui_handle.is_none(),
         )?;
-        log::info!("日志文件: {}", log_path.display());
+        log::info!("日志文件: {}", log_paths.main.display());
+        log::info!("性能日志文件: {}", log_paths.timing.display());
         log::info!("配置文件: {}", config_path.display());
         log::info!(
             "HTTP/Web 面板: {}:{} enabled={}",
@@ -885,7 +889,9 @@ mod app {
                     Ok(engine) => {
                         guard.engine = engine;
                         guard.rebuild_due_at = Instant::now() + OCR_REBUILD_INTERVAL;
-                        log::info!("OCR 引擎重建完成: {}ms", elapsed_ms(started));
+                        let rebuild_ms = elapsed_ms(started);
+                        log::info!("OCR 引擎重建完成");
+                        log::info!(target: "timing", "OCR 引擎重建耗时: {}ms", rebuild_ms);
                     }
                     Err(error) => {
                         guard.rebuild_due_at = Instant::now() + OCR_REBUILD_RETRY_INTERVAL;
@@ -894,6 +900,30 @@ mod app {
                 }
             }
             Ok(guard)
+        }
+
+        fn scan_chat_with_shared_ocr(
+            &self,
+            image: &DynamicImage,
+            templates: &ResolvedTemplateArgs,
+        ) -> Result<Vec<ChatMessage>> {
+            let total_started = Instant::now();
+            let prepared =
+                prepare_chat_scan(image, templates, self.config.screen.chat_rect.into())?;
+            let lock_started = Instant::now();
+            let engine = self.ocr_engine()?;
+            let lock_ms = elapsed_ms(lock_started);
+            if lock_ms > 0 {
+                log::info!(target: "timing", "OCR 锁等待耗时: {}ms", lock_ms);
+            }
+            let messages =
+                recognize_prepared_chat(&engine.engine, templates, prepared, Some(&self.monitor));
+            log::info!(target: "timing",
+                "聊天扫描端到端耗时: total={}ms ocr_lock={}ms",
+                elapsed_ms(total_started),
+                lock_ms
+            );
+            messages
         }
 
         fn warn_if_screen_size_mismatch(&self) -> Result<()> {
@@ -950,9 +980,9 @@ mod app {
             let frame_args = FrameArgs { image: None };
             let mut last_fingerprint: Option<ChangeFingerprint> = None;
             let mut last_ocr_at =
-                Instant::now() - Duration::from_millis(self.config.timing.chat_scan_fallback_ms);
-            let mut last_change_ocr_at =
-                Instant::now() - Duration::from_millis(self.config.timing.chat_change_cooldown_ms);
+                Instant::now() - Duration::from_millis(self.config.timing.chat_scan.fallback_ms);
+            let mut last_change_ocr_at = Instant::now()
+                - Duration::from_millis(self.config.timing.chat_scan.change_cooldown_ms);
             let mut suppress_change_until = Instant::now();
             let mut force_scan_after: Option<Instant> = None;
             let mut force_scan_reason: Option<&'static str> = None;
@@ -962,22 +992,29 @@ mod app {
 
             log::info!("自动化扫描已启动");
             while self.running.load(AtomicOrdering::SeqCst) {
+                let loop_started = Instant::now();
                 if self.paused.load(AtomicOrdering::SeqCst) {
                     self.maybe_idle_exit()?;
-                    sleep(Duration::from_millis(self.config.timing.scan_loop_idle_ms));
+                    sleep(Duration::from_millis(self.config.timing.loop_idle_ms));
                     continue;
                 }
 
+                let frame_started = Instant::now();
                 match load_frame(&frame_args, &canvas, &self.config.window) {
                     Ok(frame) => {
+                        let frame_ms = elapsed_ms(frame_started);
                         if target_missing {
                             log::info!("目标窗口已恢复，重置截图退避");
                             target_missing = false;
                         }
                         target_missing_backoff = TARGET_MISSING_BACKOFF_INITIAL;
-                        match detect_ui_state(&frame.image, &ui_template_args, &self.config.screen)
-                        {
+                        let ui_started = Instant::now();
+                        let ui_state_result =
+                            detect_ui_state(&frame.image, &ui_template_args, &self.config.screen);
+                        let ui_ms = elapsed_ms(ui_started);
+                        match ui_state_result {
                             Ok(ui_state) if ui_state.is_primary() => {
+                                let primary_started = Instant::now();
                                 let entered_primary = !primary_visible;
                                 primary_visible = true;
                                 let fingerprint = match rect_chat_change_fingerprint(
@@ -996,15 +1033,15 @@ mod app {
                                         last_fingerprint = Some(fingerprint);
                                         let scan_after = now
                                             + Duration::from_millis(
-                                                self.config.timing.chat_change_debounce_ms,
+                                                self.config.timing.chat_scan.change_debounce_ms,
                                             );
                                         if force_scan_after.is_none_or(|time| scan_after < time) {
                                             force_scan_after = Some(scan_after);
                                             force_scan_reason = Some("enter-primary");
                                         }
-                                        log::debug!(
+                                        log::info!(target: "timing",
                                             "进入一级界面，已建立聊天区对比基线，快速扫描延迟={}ms",
-                                            self.config.timing.chat_change_debounce_ms
+                                            self.config.timing.chat_scan.change_debounce_ms
                                         );
                                     }
                                 }
@@ -1013,7 +1050,7 @@ mod app {
                                     force_scan_after.is_some_and(|time| now >= time);
                                 let cooldown_until = last_change_ocr_at
                                     + Duration::from_millis(
-                                        self.config.timing.chat_change_cooldown_ms,
+                                        self.config.timing.chat_scan.change_cooldown_ms,
                                     );
                                 let change_stats = fingerprint.as_ref().and_then(|current| {
                                     last_fingerprint
@@ -1043,34 +1080,37 @@ mod app {
                                     && (forced_scan_due
                                         || now.duration_since(last_ocr_at)
                                             >= Duration::from_millis(
-                                                self.config.timing.chat_scan_fallback_ms,
+                                                self.config.timing.chat_scan.fallback_ms,
                                             ));
                                 let change_due = change_over_threshold && change_ready;
 
                                 let mut scanned_this_round = false;
                                 if change_due {
                                     let stats = change_stats.expect("change_due requires stats");
-                                    log::info!(
+                                    log::info!(target: "timing",
                                         "触发聊天扫描: reason=change mean={:.3} ratio={:.5} debounce={}ms",
                                         stats.mean_abs_diff,
                                         stats.changed_ratio,
-                                        self.config.timing.chat_change_debounce_ms
+                                        self.config.timing.chat_scan.change_debounce_ms
                                     );
                                     sleep(Duration::from_millis(
-                                        self.config.timing.chat_change_debounce_ms,
+                                        self.config.timing.chat_scan.change_debounce_ms,
                                     ));
+                                    let rescan_frame_started = Instant::now();
                                     match load_frame(&frame_args, &canvas, &self.config.window) {
                                         Ok(frame) => {
-                                            let messages = {
-                                                let engine = self.ocr_engine()?;
-                                                scan_chat(
-                                                    &frame.image,
-                                                    &engine.engine,
-                                                    &template_args,
-                                                    self.config.screen.chat_rect.into(),
-                                                    Some(&self.monitor),
-                                                )
-                                            };
+                                            let rescan_frame_ms = elapsed_ms(rescan_frame_started);
+                                            let scan_started = Instant::now();
+                                            let messages = self.scan_chat_with_shared_ocr(
+                                                &frame.image,
+                                                &template_args,
+                                            );
+                                            let scan_ms = elapsed_ms(scan_started);
+                                            log::info!(target: "timing",
+                                                "变化扫描阶段耗时: rescan_frame={}ms scan={}ms",
+                                                rescan_frame_ms,
+                                                scan_ms
+                                            );
                                             match messages {
                                                 Ok(messages) => {
                                                     self.handle_scan_messages(messages)?
@@ -1098,21 +1138,13 @@ mod app {
                                     } else {
                                         "poll"
                                     };
-                                    log::info!(
+                                    log::info!(target: "timing",
                                         "触发聊天扫描: reason={} since_last={}ms",
                                         reason,
                                         now.duration_since(last_ocr_at).as_millis()
                                     );
-                                    let messages = {
-                                        let engine = self.ocr_engine()?;
-                                        scan_chat(
-                                            &frame.image,
-                                            &engine.engine,
-                                            &template_args,
-                                            self.config.screen.chat_rect.into(),
-                                            Some(&self.monitor),
-                                        )
-                                    };
+                                    let messages = self
+                                        .scan_chat_with_shared_ocr(&frame.image, &template_args);
                                     match messages {
                                         Ok(messages) => self.handle_scan_messages(messages)?,
                                         Err(error) => log::error!("聊天扫描失败: {error:#}"),
@@ -1122,6 +1154,26 @@ mod app {
                                     force_scan_reason = None;
                                     last_fingerprint = fingerprint.clone();
                                     scanned_this_round = true;
+                                }
+                                let primary_ms = elapsed_ms(primary_started);
+                                let loop_ms = elapsed_ms(loop_started);
+                                if scanned_this_round || loop_ms >= 80 {
+                                    log::info!(target: "timing",
+                                        "主循环阶段耗时: total={}ms frame={}ms ui={}ms primary={}ms state=primary scanned={}",
+                                        loop_ms,
+                                        frame_ms,
+                                        ui_ms,
+                                        primary_ms,
+                                        scanned_this_round
+                                    );
+                                } else {
+                                    log::info!(target: "timing",
+                                        "主循环阶段耗时: total={}ms frame={}ms ui={}ms primary={}ms state=primary scanned=false",
+                                        loop_ms,
+                                        frame_ms,
+                                        ui_ms,
+                                        primary_ms
+                                    );
                                 }
 
                                 if change_suppressed {
@@ -1139,20 +1191,40 @@ mod app {
                             Ok(ui_state) => {
                                 primary_visible = false;
                                 log::debug!("当前不是一级聊天界面，跳过聊天扫描: {}", ui_state);
+                                log::info!(target: "timing",
+                                    "主循环阶段耗时: total={}ms frame={}ms ui={}ms state={} scanned=false",
+                                    elapsed_ms(loop_started),
+                                    frame_ms,
+                                    ui_ms,
+                                    ui_state
+                                );
                                 last_fingerprint = None;
                             }
                             Err(error) => {
                                 primary_visible = false;
                                 log::error!("界面状态检测失败: {error:#}");
+                                log::info!(target: "timing",
+                                    "主循环阶段耗时: total={}ms frame={}ms ui={}ms state=ui_error scanned=false",
+                                    elapsed_ms(loop_started),
+                                    frame_ms,
+                                    ui_ms
+                                );
                             }
                         }
                     }
                     Err(error) => {
+                        let frame_ms = elapsed_ms(frame_started);
                         primary_visible = false;
                         last_fingerprint = None;
                         log::warn!(
                             "截图失败，{}秒后重试: {error:#}",
                             target_missing_backoff.as_secs()
+                        );
+                        log::info!(target: "timing",
+                            "主循环阶段耗时: total={}ms frame={}ms state=capture_error retry={}ms",
+                            elapsed_ms(loop_started),
+                            frame_ms,
+                            target_missing_backoff.as_millis()
                         );
                         target_missing = true;
                         self.maybe_idle_exit()?;
@@ -1164,14 +1236,14 @@ mod app {
                 }
                 if primary_visible && self.maybe_warn_hall_expiring()? {
                     suppress_change_until = Instant::now()
-                        + Duration::from_millis(self.config.timing.post_command_settle_ms);
+                        + Duration::from_millis(self.config.timing.command.post_settle_ms);
                     force_scan_after = Some(suppress_change_until);
                     force_scan_reason = Some("hall-expiring");
                     last_fingerprint = None;
                     last_ocr_at = Instant::now();
                 }
                 self.maybe_idle_exit()?;
-                sleep(Duration::from_millis(self.config.timing.scan_loop_idle_ms));
+                sleep(Duration::from_millis(self.config.timing.loop_idle_ms));
             }
 
             self.queue()?.save()?;
@@ -1333,7 +1405,7 @@ mod app {
         fn run_pending_command_loop(&mut self) -> Result<()> {
             while self.running.load(AtomicOrdering::SeqCst) {
                 if self.paused.load(AtomicOrdering::SeqCst) {
-                    sleep(Duration::from_millis(self.config.timing.scan_loop_idle_ms));
+                    sleep(Duration::from_millis(self.config.timing.loop_idle_ms));
                     continue;
                 }
                 let Some((task, executing)) = self.wait_for_pending_task()? else {
@@ -1342,13 +1414,13 @@ mod app {
                 if self.paused.load(AtomicOrdering::SeqCst) {
                     self.push_pending_task_front(task)?;
                     drop(executing);
-                    sleep(Duration::from_millis(self.config.timing.scan_loop_idle_ms));
+                    sleep(Duration::from_millis(self.config.timing.loop_idle_ms));
                     continue;
                 }
                 match self.execute_pending_task(task) {
                     Ok(true) => {
                         sleep(Duration::from_millis(
-                            self.config.timing.post_command_settle_ms,
+                            self.config.timing.command.post_settle_ms,
                         ));
                     }
                     Ok(false) => {}
@@ -1440,16 +1512,22 @@ mod app {
             );
             let command_started = Instant::now();
             match self.execute_command(&pending.parsed) {
-                Ok(()) => log::info!(
-                    "命令执行完成: {} 耗时={}ms",
-                    pending.parsed.raw,
-                    elapsed_ms(command_started)
-                ),
-                Err(error) => {
-                    log::error!(
-                        "命令执行失败 {} 耗时={}ms: {error:#}",
+                Ok(()) => {
+                    let command_ms = elapsed_ms(command_started);
+                    log::info!("命令执行完成: {}", pending.parsed.raw);
+                    log::info!(target: "timing",
+                        "命令执行耗时: command={} success=true total={}ms",
                         pending.parsed.raw,
-                        elapsed_ms(command_started)
+                        command_ms
+                    );
+                }
+                Err(error) => {
+                    let command_ms = elapsed_ms(command_started);
+                    log::error!("命令执行失败 {}: {error:#}", pending.parsed.raw);
+                    log::info!(target: "timing",
+                        "命令执行耗时: command={} success=false total={}ms",
+                        pending.parsed.raw,
+                        command_ms
                     );
                     self.return_to_primary_after_command_failure(&pending.parsed.raw);
                 }
@@ -1514,7 +1592,17 @@ mod app {
             Ok(())
         }
 
+        fn ensure_game_ready_for_input(&self, context: &str) -> Result<()> {
+            log::info!("{}: 激活并聚焦游戏窗口", context);
+            self::input_actions::ensure_game_ready_for_input(
+                &self.config.window,
+                self.config.timing.input.after_activate_ms,
+            )
+            .with_context(|| format!("{}: 激活并聚焦游戏窗口失败", context))
+        }
+
         fn prepare_command_ui(&self, command: &str) -> Result<bool> {
+            self.ensure_game_ready_for_input("命令执行前准备")?;
             let templates = UiTemplateArgs::default().resolve(&self.config);
             let canvas = Canvas {
                 width: self.config.screen.expected_width,
@@ -1523,7 +1611,7 @@ mod app {
             };
             let frame_args = FrameArgs { image: None };
             let deadline =
-                Instant::now() + Duration::from_millis(self.config.timing.command_ui_timeout_ms);
+                Instant::now() + Duration::from_millis(self.config.timing.command.ui_timeout_ms);
 
             while self.running.load(AtomicOrdering::SeqCst) && Instant::now() < deadline {
                 let frame = load_frame(&frame_args, &canvas, &self.config.window)?;
@@ -1536,7 +1624,7 @@ mod app {
                 log::info!("命令执行前界面: {}，按 ESC 返回一级: {}", ui_state, command);
                 press_key(Key::Escape, &self.config.window)?;
                 sleep(Duration::from_millis(
-                    self.config.timing.return_to_primary_retry_ms,
+                    self.config.timing.command.return_retry_ms,
                 ));
             }
 
@@ -1544,8 +1632,8 @@ mod app {
         }
 
         fn run_playback_monitor_loop(&mut self) {
-            let tick_ms = self.config.timing.playback_monitor_tick_ms.max(50);
-            let status_ms = self.config.timing.playback_monitor_status_ms.max(tick_ms);
+            let tick_ms = self.config.timing.playback.monitor_tick_ms.max(50);
+            let status_ms = self.config.timing.playback.monitor_status_ms.max(tick_ms);
             let mut snapshot: Option<PlaybackSnapshot> = None;
             let mut next_status_at = Instant::now();
 
@@ -2170,8 +2258,9 @@ mod app {
             let guard_ms = self
                 .config
                 .timing
-                .playback_monitor_status_ms
-                .max(self.config.timing.play_status_poll_ms)
+                .playback
+                .monitor_status_ms
+                .max(self.config.timing.playback.status_poll_ms)
                 .saturating_mul(3)
                 .max(3000);
             current_unix_millis() < state.last_requested_updated_at_ms.saturating_add(guard_ms)
@@ -2613,6 +2702,7 @@ mod app {
         }
 
         fn execute_microphone_command(&self, username: &str) -> Result<()> {
+            self.ensure_game_ready_for_input("麦克风命令")?;
             if !self.is_primary_ui()? {
                 log::info!("麦克风: 当前不在一级界面，返回一级界面");
                 self.return_to_primary_fixed();
@@ -2636,10 +2726,11 @@ mod app {
         }
 
         fn execute_hall_detect(&mut self) -> Result<()> {
+            self.ensure_game_ready_for_input("大厅检测")?;
             log::info!("大厅检测: 按 F2 进入大厅页面");
             press_key(Key::F2, &self.config.window)?;
             sleep(Duration::from_millis(
-                self.config.timing.hall_page_settle_ms,
+                self.config.timing.hall.page_settle_ms,
             ));
 
             let result = self.read_hall_info();
@@ -2682,15 +2773,15 @@ mod app {
 
         fn reply_player_status_after_skip(&self, fallback: &str) -> Result<()> {
             sleep(Duration::from_millis(
-                self.config.timing.skip_status_initial_ms,
+                self.config.timing.playback.skip_status_initial_ms,
             ));
-            for _ in 0..self.config.timing.skip_status_retries {
+            for _ in 0..self.config.timing.playback.skip_status_retries {
                 match self.feeluown.status() {
                     Ok(status) if is_playing(&status) || status.status == "paused" => {
                         return self.reply(&format_play_message(&status));
                     }
                     Ok(_) => sleep(Duration::from_millis(
-                        self.config.timing.skip_status_poll_ms,
+                        self.config.timing.playback.skip_status_poll_ms,
                     )),
                     Err(error) => {
                         log::error!("切歌后查询播放状态失败: {error:#}");
@@ -2706,6 +2797,7 @@ mod app {
         }
 
         fn reply_hall_time(&mut self) -> Result<()> {
+            self.ensure_game_ready_for_input("大厅时间")?;
             let minutes = self.runtime_state()?.state().hall_remaining_minutes_now();
             if let Some(minutes) = minutes.filter(|minutes| *minutes > 0) {
                 return self.reply(&format!("大厅到期时间，剩余{}分钟", minutes));
@@ -2714,7 +2806,7 @@ mod app {
             log::info!("大厅时间未知，执行一次大厅识别");
             press_key(Key::F2, &self.config.window)?;
             sleep(Duration::from_millis(
-                self.config.timing.hall_page_settle_ms,
+                self.config.timing.hall.page_settle_ms,
             ));
             let result = self.read_hall_info();
             self.return_to_primary_from_transient_ui("大厅时间");
@@ -2740,10 +2832,11 @@ mod app {
         }
 
         fn check_public_hall(&self) -> Result<bool> {
+            self.ensure_game_ready_for_input("大厅检测")?;
             log::info!("大厅检测: 按 F2 进入大厅页面");
             press_key(Key::F2, &self.config.window)?;
             sleep(Duration::from_millis(
-                self.config.timing.hall_page_settle_ms,
+                self.config.timing.hall.page_settle_ms,
             ));
             let result = self.read_hall_info();
             self.return_to_primary_from_transient_ui("大厅检测");
@@ -2768,6 +2861,10 @@ mod app {
         }
 
         fn return_to_primary_fixed(&self) -> bool {
+            if let Err(error) = self.ensure_game_ready_for_input("返回一级界面") {
+                log::error!("返回一级界面前激活并聚焦游戏失败: {error:#}");
+                return false;
+            }
             let templates = UiTemplateArgs::default().resolve(&self.config);
             let canvas = Canvas {
                 width: self.config.screen.expected_width,
@@ -2776,7 +2873,7 @@ mod app {
             };
             let frame_args = FrameArgs { image: None };
             let deadline =
-                Instant::now() + Duration::from_millis(self.config.timing.command_ui_timeout_ms);
+                Instant::now() + Duration::from_millis(self.config.timing.command.ui_timeout_ms);
 
             while Instant::now() < deadline {
                 match load_frame(&frame_args, &canvas, &self.config.window).and_then(|frame| {
@@ -2798,7 +2895,7 @@ mod app {
                     return false;
                 }
                 sleep(Duration::from_millis(
-                    self.config.timing.return_to_primary_retry_ms,
+                    self.config.timing.command.return_retry_ms,
                 ));
             }
             log::error!("返回一级界面超时");
@@ -2816,7 +2913,7 @@ mod app {
                 log::error!("{}: 关闭临时界面失败: {error:#}", context);
             } else {
                 sleep(Duration::from_millis(
-                    self.config.timing.return_to_primary_retry_ms,
+                    self.config.timing.command.return_retry_ms,
                 ));
             }
             self.return_to_primary_fixed()
@@ -2833,7 +2930,7 @@ mod app {
             for index in 0..HALL_INFO_OCR_SAMPLES {
                 if index > 0 {
                     sleep(Duration::from_millis(
-                        self.config.timing.hall_ocr_sample_interval_ms,
+                        self.config.timing.hall.ocr_sample_interval_ms,
                     ));
                 }
                 let frame = load_frame(&FrameArgs { image: None }, &canvas, &self.config.window)?;
@@ -2901,7 +2998,7 @@ mod app {
                 "命令以@开头: 暂停、继续、播放、下一首、上一首、状态、歌词、帮助、队列、音量1-100",
                     "切换网易平台: @网易点歌 歌名 歌手 伴奏,默认为QQ平台",
                 ],
-                self.config.timing.help_batch_ms,
+                self.config.timing.command.help_batch_ms,
             )
         }
 
@@ -3059,18 +3156,18 @@ mod app {
             skip_match_check: bool,
         ) -> Result<PlayOutcome> {
             sleep(Duration::from_millis(
-                self.config.timing.play_search_settle_ms,
+                self.config.timing.playback.search_settle_ms,
             ));
 
             let mut last_seen_song = initial_song;
             let mut requested_state_recorded = false;
-            for retry in 0..self.config.timing.play_status_retries {
+            for retry in 0..self.config.timing.playback.status_retries {
                 let status = match self.feeluown.status() {
                     Ok(status) => status,
                     Err(error) => {
                         log::error!("查询播放状态失败: {error:#}");
                         sleep(Duration::from_millis(
-                            self.config.timing.play_status_poll_ms,
+                            self.config.timing.playback.status_poll_ms,
                         ));
                         continue;
                     }
@@ -3084,7 +3181,7 @@ mod app {
                 );
                 if status.status != "playing" && status.status != "paused" {
                     sleep(Duration::from_millis(
-                        self.config.timing.play_status_poll_ms,
+                        self.config.timing.playback.status_poll_ms,
                     ));
                     continue;
                 }
@@ -3114,17 +3211,17 @@ mod app {
                         current_uri,
                         requested_uri,
                         retry + 1,
-                        self.config.timing.play_status_retries
+                        self.config.timing.playback.status_retries
                     );
                 }
                 if current_song.is_empty() && current_uri.is_empty() {
                     log::info!(
                         "播放状态缺少歌曲标识，继续等待 ({}/{})",
                         retry + 1,
-                        self.config.timing.play_status_retries
+                        self.config.timing.playback.status_retries
                     );
                     sleep(Duration::from_millis(
-                        self.config.timing.play_status_poll_ms,
+                        self.config.timing.playback.status_poll_ms,
                     ));
                     continue;
                 }
@@ -3137,10 +3234,10 @@ mod app {
                     log::info!(
                         "歌曲未变化，等待 URI 播放生效 ({}/{})",
                         retry + 1,
-                        self.config.timing.play_status_retries
+                        self.config.timing.playback.status_retries
                     );
                     sleep(Duration::from_millis(
-                        self.config.timing.play_status_poll_ms,
+                        self.config.timing.playback.status_poll_ms,
                     ));
                     continue;
                 }
@@ -3158,10 +3255,10 @@ mod app {
                             log::info!(
                                 "歌曲未变化，搜索可能尚未完成，继续等待 ({}/{})",
                                 retry + 1,
-                                self.config.timing.play_status_retries
+                                self.config.timing.playback.status_retries
                             );
                             sleep(Duration::from_millis(
-                                self.config.timing.play_status_poll_ms,
+                                self.config.timing.playback.status_poll_ms,
                             ));
                             continue;
                         }
@@ -3247,10 +3344,10 @@ mod app {
                     log::info!(
                         "0:00/0:00，等待后重试 ({}/{})",
                         retry + 1,
-                        self.config.timing.play_status_retries
+                        self.config.timing.playback.status_retries
                     );
                     sleep(Duration::from_millis(
-                        self.config.timing.play_status_poll_ms,
+                        self.config.timing.playback.status_poll_ms,
                     ));
                     continue;
                 }
@@ -3420,11 +3517,11 @@ mod app {
             timeout_confirms: bool,
         ) -> Result<UserDecision> {
             sleep(Duration::from_millis(
-                self.config.timing.post_command_settle_ms,
+                self.config.timing.command.post_settle_ms,
             ));
             let existing = self.collect_decision_bottoms();
             let deadline =
-                Instant::now() + Duration::from_millis(self.config.timing.decision_timeout_ms);
+                Instant::now() + Duration::from_millis(self.config.timing.decision.timeout_ms);
             let template_args = TemplateArgs::default().resolve(&self.config);
             let canvas = Canvas {
                 width: self.config.screen.expected_width,
@@ -3432,7 +3529,7 @@ mod app {
                 resize: true,
             };
             while self.running.load(AtomicOrdering::SeqCst) && Instant::now() < deadline {
-                sleep(Duration::from_millis(self.config.timing.decision_poll_ms));
+                sleep(Duration::from_millis(self.config.timing.decision.poll_ms));
                 let frame =
                     match load_frame(&FrameArgs { image: None }, &canvas, &self.config.window) {
                         Ok(frame) => frame,
@@ -3441,22 +3538,7 @@ mod app {
                             continue;
                         }
                     };
-                let scan_result = {
-                    let engine = match self.ocr_engine() {
-                        Ok(engine) => engine,
-                        Err(error) => {
-                            log::error!("确认命令 OCR 锁失败: {error:#}");
-                            continue;
-                        }
-                    };
-                    scan_chat(
-                        &frame.image,
-                        &engine.engine,
-                        &template_args,
-                        self.config.screen.chat_rect.into(),
-                        Some(&self.monitor),
-                    )
-                };
+                let scan_result = self.scan_chat_with_shared_ocr(&frame.image, &template_args);
                 let messages = match scan_result {
                     Ok(messages) => messages,
                     Err(error) => {
@@ -3513,16 +3595,7 @@ mod app {
             else {
                 return output;
             };
-            let Ok(engine) = self.ocr_engine() else {
-                return output;
-            };
-            let Ok(messages) = scan_chat(
-                &frame.image,
-                &engine.engine,
-                &template_args,
-                self.config.screen.chat_rect.into(),
-                Some(&self.monitor),
-            ) else {
+            let Ok(messages) = self.scan_chat_with_shared_ocr(&frame.image, &template_args) else {
                 return output;
             };
             for message in messages {

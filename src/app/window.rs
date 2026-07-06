@@ -1,4 +1,6 @@
 use std::path::Path;
+use std::thread::sleep;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use enigo::{Button, Coordinate, Direction, Enigo, Mouse};
@@ -10,12 +12,16 @@ use windows::Win32::Graphics::Gdi::{
     ReleaseDC, SRCCOPY, SelectObject,
 };
 use windows::Win32::System::Threading::{
-    OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+    AttachThreadInput, GetCurrentThreadId, OpenProcess, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput, SetFocus, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GA_ROOT, GetAncestor, GetClientRect, GetWindowThreadProcessId, HWND_NOTOPMOST,
-    HWND_TOPMOST, IsIconic, IsWindowVisible, PostMessageW, SW_RESTORE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_SHOWWINDOW, SetWindowPos, ShowWindow, WM_CLOSE, WindowFromPoint,
+    BringWindowToTop, EnumWindows, GA_ROOT, GetAncestor, GetClientRect, GetForegroundWindow,
+    GetWindowThreadProcessId, IsIconic, IsWindowVisible, PostMessageW, SW_RESTORE,
+    SetForegroundWindow, ShowWindow, WM_CLOSE, WindowFromPoint,
 };
 use windows::core::BOOL;
 
@@ -30,6 +36,7 @@ pub struct ScreenPoint {
 #[derive(Clone, Debug)]
 pub struct GameWindow {
     hwnd: HWND,
+    process_id: u32,
     client_left: i32,
     client_top: i32,
     client_width: i32,
@@ -40,9 +47,10 @@ pub struct GameWindow {
 
 impl GameWindow {
     pub fn find(config: &WindowConfig) -> Result<Self> {
-        let hwnd = find_window_by_process(&config.target_process)?;
+        let target = find_window_by_process(&config.target_process)?;
         let mut window = Self {
-            hwnd,
+            hwnd: target.hwnd,
+            process_id: target.process_id,
             client_left: 0,
             client_top: 0,
             client_width: 0,
@@ -61,27 +69,91 @@ impl GameWindow {
     }
 
     pub fn click(&mut self, enigo: &mut Enigo, point: PointConfig) -> Result<()> {
-        self.raise_to_front()?;
+        self.click_focused(enigo, point)
+    }
+
+    pub fn click_focused(&mut self, enigo: &mut Enigo, point: PointConfig) -> Result<()> {
         self.refresh_client_area_for_click()?;
         let screen = self.screen_point(point);
         self.click_screen(enigo, screen)
     }
 
-    pub fn focus_for_keyboard(&mut self, enigo: &mut Enigo) -> Result<()> {
-        self.click(
-            enigo,
-            PointConfig::new(self.content_width - 1, self.content_height - 1),
-        )
+    pub fn activate(&mut self, after_activate_ms: u64) -> Result<()> {
+        let started = Instant::now();
+        if self.is_foreground_process() {
+            let result = self.ensure_foreground();
+            log::info!(target: "timing",
+                "激活游戏窗口耗时: {}ms already_foreground=true",
+                elapsed_ms(started)
+            );
+            return result;
+        }
+        unsafe {
+            let _ = ShowWindow(self.hwnd, SW_RESTORE);
+        }
+        send_alt_keypress();
+        unsafe {
+            let _ = SetForegroundWindow(self.hwnd);
+        }
+        if !self.is_foreground_window() {
+            unsafe {
+                let _ = BringWindowToTop(self.hwnd);
+            }
+        }
+        if !self.is_foreground_window() {
+            self.activate_with_attached_input();
+        }
+        if after_activate_ms > 0 {
+            sleep(Duration::from_millis(after_activate_ms));
+        }
+        let result = self.ensure_foreground();
+        log::info!(target: "timing",
+            "激活游戏窗口耗时: {}ms success={}",
+            elapsed_ms(started),
+            result.is_ok()
+        );
+        result
+    }
+
+    pub fn focus_game(&mut self, enigo: &mut Enigo, point: PointConfig) -> Result<()> {
+        let started = Instant::now();
+        self.click_focused(enigo, point)?;
+        let result = self.ensure_foreground();
+        log::info!(target: "timing",
+            "聚焦游戏耗时: {}ms success={}",
+            elapsed_ms(started),
+            result.is_ok()
+        );
+        result
+    }
+
+    pub fn ensure_foreground(&self) -> Result<()> {
+        if self.is_foreground_process() {
+            Ok(())
+        } else {
+            bail!("当前前台窗口不是目标游戏进程，已中止输入")
+        }
     }
 
     fn click_screen(&self, enigo: &mut Enigo, screen: ScreenPoint) -> Result<()> {
+        let started = Instant::now();
         self.ensure_point_targets_window(screen)?;
+        let check_ms = elapsed_ms(started);
+        let input_started = Instant::now();
         enigo
             .move_mouse(screen.x, screen.y, Coordinate::Abs)
             .context("move mouse")?;
         enigo
             .button(Button::Left, Direction::Click)
             .context("click mouse")?;
+        log::info!(target: "timing",
+            "点击输入耗时: total={}ms check={}ms input={}ms x={} y={}",
+            elapsed_ms(started),
+            check_ms,
+            elapsed_ms(input_started),
+            screen.x,
+            screen.y
+        );
         Ok(())
     }
 
@@ -127,31 +199,54 @@ impl GameWindow {
         Ok(())
     }
 
-    fn raise_to_front(&self) -> Result<()> {
-        unsafe {
-            let _ = ShowWindow(self.hwnd, SW_RESTORE);
-            SetWindowPos(
-                self.hwnd,
-                Some(HWND_TOPMOST),
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
-            )
-            .context("SetWindowPos topmost failed")?;
-            SetWindowPos(
-                self.hwnd,
-                Some(HWND_NOTOPMOST),
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
-            )
-            .context("SetWindowPos notopmost failed")?;
+    fn is_foreground_window(&self) -> bool {
+        unsafe { GetForegroundWindow() == self.hwnd }
+    }
+
+    fn is_foreground_process(&self) -> bool {
+        let foreground = unsafe { GetForegroundWindow() };
+        if foreground.is_invalid() {
+            return false;
         }
-        Ok(())
+        let mut process_id = 0_u32;
+        unsafe { GetWindowThreadProcessId(foreground, Some(&mut process_id)) };
+        process_id != 0 && process_id == self.process_id
+    }
+
+    fn activate_with_attached_input(&self) {
+        let foreground = unsafe { GetForegroundWindow() };
+        let current_thread = unsafe { GetCurrentThreadId() };
+        let target_thread = unsafe { GetWindowThreadProcessId(self.hwnd, None) };
+        let foreground_thread = if foreground.is_invalid() {
+            0
+        } else {
+            unsafe { GetWindowThreadProcessId(foreground, None) }
+        };
+
+        let attached_foreground = foreground_thread != 0
+            && foreground_thread != current_thread
+            && unsafe { AttachThreadInput(current_thread, foreground_thread, true).as_bool() };
+        let attached_target = target_thread != 0
+            && target_thread != current_thread
+            && target_thread != foreground_thread
+            && unsafe { AttachThreadInput(current_thread, target_thread, true).as_bool() };
+
+        unsafe {
+            let _ = BringWindowToTop(self.hwnd);
+            let _ = SetForegroundWindow(self.hwnd);
+            let _ = SetFocus(Some(self.hwnd));
+        }
+
+        if attached_target {
+            unsafe {
+                let _ = AttachThreadInput(current_thread, target_thread, false);
+            }
+        }
+        if attached_foreground {
+            unsafe {
+                let _ = AttachThreadInput(current_thread, foreground_thread, false);
+            }
+        }
     }
 
     fn ensure_point_targets_window(&self, point: ScreenPoint) -> Result<()> {
@@ -182,6 +277,10 @@ impl GameWindow {
 
 pub fn capture_game(config: &WindowConfig) -> Result<DynamicImage> {
     GameWindow::find(config)?.capture()
+}
+
+pub fn ensure_foreground(config: &WindowConfig) -> Result<()> {
+    GameWindow::find(config)?.ensure_foreground()
 }
 
 pub fn close_game(config: &WindowConfig) -> Result<()> {
@@ -283,13 +382,19 @@ fn capture_client_area(hwnd: HWND, width: i32, height: i32) -> Result<DynamicIma
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ProcessWindow {
+    hwnd: HWND,
+    process_id: u32,
+}
+
 struct SearchState {
     target: String,
-    found: Option<HWND>,
+    found: Option<ProcessWindow>,
     include_minimized: bool,
 }
 
-fn find_window_by_process(target_process: &str) -> Result<HWND> {
+fn find_window_by_process(target_process: &str) -> Result<ProcessWindow> {
     let mut state = SearchState {
         target: normalize_process_name(target_process),
         found: None,
@@ -304,13 +409,13 @@ fn find_window_by_process_for_close(target_process: &str) -> Result<HWND> {
         found: None,
         include_minimized: true,
     };
-    find_window_by_process_with_state(target_process, &mut state)
+    find_window_by_process_with_state(target_process, &mut state).map(|window| window.hwnd)
 }
 
 fn find_window_by_process_with_state(
     target_process: &str,
     state: &mut SearchState,
-) -> Result<HWND> {
+) -> Result<ProcessWindow> {
     let enum_result = unsafe {
         EnumWindows(
             Some(enum_windows_proc),
@@ -343,7 +448,7 @@ unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL 
         Ok(name) => {
             log::debug!("窗口进程: pid={} exe={}", process_id, name);
             if normalize_process_name(&name) == state.target {
-                state.found = Some(hwnd);
+                state.found = Some(ProcessWindow { hwnd, process_id });
                 return false.into();
             }
         }
@@ -392,4 +497,33 @@ fn normalize_process_name(value: &str) -> String {
 
 fn scale_i32(value: i32, from: i32, to: i32) -> i32 {
     ((value as f32 / from as f32) * to as f32).round() as i32
+}
+
+fn elapsed_ms(started: Instant) -> u128 {
+    started.elapsed().as_millis()
+}
+
+fn send_alt_keypress() -> u32 {
+    let inputs = [
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VIRTUAL_KEY(0x12),
+                    ..Default::default()
+                },
+            },
+        },
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VIRTUAL_KEY(0x12),
+                    dwFlags: KEYEVENTF_KEYUP,
+                    ..Default::default()
+                },
+            },
+        },
+    ];
+    unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) }
 }

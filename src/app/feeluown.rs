@@ -52,8 +52,8 @@ impl FeelUOwnClient {
         Self {
             host: config.host.clone(),
             port: config.port,
-            timeout: Duration::from_millis(timing.feeluown_rpc_timeout_ms),
-            volume_smooth_step_ms: timing.volume_smooth_step_ms,
+            timeout: Duration::from_millis(timing.external.feeluown_rpc_timeout_ms),
+            volume_smooth_step_ms: timing.external.volume_smooth_step_ms,
         }
     }
 

@@ -11,6 +11,7 @@ use super::monitor::MonitorLogSink;
 
 struct FileLogger {
     file: Mutex<File>,
+    timing_file: Mutex<File>,
     level: LevelFilter,
     monitor: Option<MonitorLogSink>,
     stderr: bool,
@@ -27,8 +28,17 @@ impl Log for FileLogger {
         }
 
         let line = format!("{} {}", format_prefix(record.level()), record.args());
-        if let Some(monitor) = &self.monitor {
-            monitor.push(line.clone());
+        if is_timing_target(record.target()) {
+            if let Ok(mut file) = self.timing_file.lock() {
+                let _ = file.write_all(format!("{line}\n").as_bytes());
+            }
+            return;
+        }
+
+        if !is_monitor_hidden_target(record.target()) {
+            if let Some(monitor) = &self.monitor {
+                monitor.push(line.clone());
+            }
         }
         if self.stderr {
             let _ = std::io::stderr().write_all(format!("{line}\n").as_bytes());
@@ -42,7 +52,15 @@ impl Log for FileLogger {
         if let Ok(mut file) = self.file.lock() {
             let _ = file.flush();
         }
+        if let Ok(mut file) = self.timing_file.lock() {
+            let _ = file.flush();
+        }
     }
+}
+
+pub(super) struct LogPaths {
+    pub(super) main: PathBuf,
+    pub(super) timing: PathBuf,
 }
 
 pub(super) fn format_prefix(level: log::Level) -> String {
@@ -80,25 +98,35 @@ pub fn init(
     level: &str,
     monitor: Option<MonitorLogSink>,
     stderr: bool,
-) -> Result<PathBuf> {
+) -> Result<LogPaths> {
     fs::create_dir_all(log_dir)
         .with_context(|| format!("create log directory {}", log_dir.display()))?;
     let path = log_dir.join("miliastra-wonderland-music.log");
+    let timing_path = log_dir.join("miliastra-wonderland-music-timing.log");
     let file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)
         .with_context(|| format!("open log file {}", path.display()))?;
+    let timing_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&timing_path)
+        .with_context(|| format!("open timing log file {}", timing_path.display()))?;
     let level = parse_level(level);
     let logger = FileLogger {
         file: Mutex::new(file),
+        timing_file: Mutex::new(timing_file),
         level,
         monitor,
         stderr,
     };
     set_logger(logger).context("initialize logger")?;
     log::set_max_level(level);
-    Ok(path)
+    Ok(LogPaths {
+        main: path,
+        timing: timing_path,
+    })
 }
 
 fn set_logger(logger: FileLogger) -> std::result::Result<(), SetLoggerError> {
@@ -117,6 +145,9 @@ fn parse_level(value: &str) -> LevelFilter {
 }
 
 fn target_level(target: &str, configured: LevelFilter) -> LevelFilter {
+    if is_timing_target(target) || is_monitor_hidden_target(target) {
+        return configured;
+    }
     if target.starts_with("miliastra_wonderland_music") {
         return configured;
     }
@@ -124,4 +155,12 @@ fn target_level(target: &str, configured: LevelFilter) -> LevelFilter {
         return LevelFilter::Warn;
     }
     configured.min(LevelFilter::Warn)
+}
+
+fn is_timing_target(target: &str) -> bool {
+    target == "timing"
+}
+
+fn is_monitor_hidden_target(target: &str) -> bool {
+    target == "chat_scan_result"
 }

@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect as TuiRect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
@@ -101,47 +101,91 @@ fn render_loop(
 }
 
 fn draw(frame: &mut ratatui::Frame<'_>, state: &MonitorSnapshot) {
+    let area = frame.area();
+    let log_height = event_log_height(area.height);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(5),
-            Constraint::Length(8),
+            Constraint::Min(8),
+            Constraint::Length(log_height),
             Constraint::Length(3),
         ])
-        .split(frame.area());
+        .split(area);
 
-    let dashboard = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(40),
-            Constraint::Percentage(30),
-            Constraint::Percentage(30),
-        ])
-        .split(chunks[1]);
+    draw_dashboard(frame, chunks[0], state);
+    draw_event_log(frame, chunks[1], state);
+    draw_status(frame, chunks[2], state);
+}
 
+fn draw_dashboard(frame: &mut ratatui::Frame<'_>, area: TuiRect, state: &MonitorSnapshot) {
+    if area.width >= 132 {
+        let dashboard = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(45),
+                Constraint::Percentage(27),
+                Constraint::Percentage(28),
+            ])
+            .split(area);
+        draw_ocr(frame, dashboard[0], state);
+        draw_queue(frame, dashboard[1], state);
+        draw_commands(frame, dashboard[2], state);
+    } else if area.width >= 72 {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(narrow_ocr_height(area.height)),
+                Constraint::Min(5),
+            ])
+            .split(area);
+        let lower = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(rows[1]);
+        draw_ocr(frame, rows[0], state);
+        draw_queue(frame, lower[0], state);
+        draw_commands(frame, lower[1], state);
+    } else {
+        let dashboard = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(45),
+                Constraint::Percentage(27),
+                Constraint::Percentage(28),
+            ])
+            .split(area);
+        draw_ocr(frame, dashboard[0], state);
+        draw_queue(frame, dashboard[1], state);
+        draw_commands(frame, dashboard[2], state);
+    }
+}
+
+fn draw_event_log(frame: &mut ratatui::Frame<'_>, area: TuiRect, state: &MonitorSnapshot) {
     let log_lines = state
         .logs
         .iter()
         .rev()
-        .take(chunks[0].height.saturating_sub(2) as usize)
+        .take(area.height.saturating_sub(2) as usize)
         .rev()
         .map(|line| Line::from(line.as_str()))
         .collect::<Vec<_>>();
     frame.render_widget(
         Paragraph::new(log_lines)
-            .block(Block::default().title(" 实时日志 ").borders(Borders::ALL))
+            .block(Block::default().title(" 事件日志 ").borders(Borders::ALL))
             .wrap(Wrap { trim: false }),
-        chunks[0],
+        area,
     );
+}
 
+fn draw_ocr(frame: &mut ratatui::Frame<'_>, area: TuiRect, state: &MonitorSnapshot) {
     let ocr_lines = match &state.ocr {
         Some(ocr) => {
             let mut lines = vec![Line::from(vec![
-                Span::styled("markers", Style::default().fg(Color::Cyan)),
+                Span::styled("标记", Style::default().fg(Color::Cyan)),
                 Span::raw(format!(": {}  ", ocr.markers)),
                 Span::styled("耗时", Style::default().fg(Color::Cyan)),
                 Span::raw(format!(
-                    ": total={}ms marker={}ms ocr={}ms",
+                    ": total={}ms marker={}ms OCR={}ms",
                     ocr.total_ms, ocr.marker_ms, ocr.ocr_ms
                 )),
             ])];
@@ -158,9 +202,11 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &MonitorSnapshot) {
         Paragraph::new(ocr_lines)
             .block(Block::default().title(" OCR 内容 ").borders(Borders::ALL))
             .wrap(Wrap { trim: false }),
-        dashboard[0],
+        area,
     );
+}
 
+fn draw_queue(frame: &mut ratatui::Frame<'_>, area: TuiRect, state: &MonitorSnapshot) {
     let queue_lines = if state.queue.is_empty() {
         vec![Line::from("队列为空")]
     } else {
@@ -174,9 +220,11 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &MonitorSnapshot) {
         Paragraph::new(queue_lines)
             .block(Block::default().title(" 队列 ").borders(Borders::ALL))
             .wrap(Wrap { trim: false }),
-        dashboard[1],
+        area,
     );
+}
 
+fn draw_commands(frame: &mut ratatui::Frame<'_>, area: TuiRect, state: &MonitorSnapshot) {
     let command_lines = if state.commands.is_empty() {
         vec![Line::from("暂无命令")]
     } else {
@@ -184,7 +232,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &MonitorSnapshot) {
             .commands
             .iter()
             .rev()
-            .take(dashboard[2].height.saturating_sub(2) as usize)
+            .take(area.height.saturating_sub(2) as usize)
             .rev()
             .map(|command| Line::from(command.as_str()))
             .collect::<Vec<_>>()
@@ -193,17 +241,37 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &MonitorSnapshot) {
         Paragraph::new(command_lines)
             .block(Block::default().title(" 命令 ").borders(Borders::ALL))
             .wrap(Wrap { trim: false }),
-        dashboard[2],
+        area,
     );
+}
 
+fn draw_status(frame: &mut ratatui::Frame<'_>, area: TuiRect, state: &MonitorSnapshot) {
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(" 状态 ", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(state.status.as_str()),
         ]))
         .block(Block::default().borders(Borders::ALL)),
-        chunks[2],
+        area,
     );
+}
+
+fn event_log_height(total_height: u16) -> u16 {
+    let desired = match total_height {
+        0..=20 => 4,
+        21..=30 => 5,
+        31..=40 => 6,
+        _ => 8,
+    };
+    desired.min(total_height.saturating_sub(11).max(3))
+}
+
+fn narrow_ocr_height(total_height: u16) -> u16 {
+    let desired = ((total_height as u32 * 45) / 100) as u16;
+    desired
+        .max(5)
+        .min(10)
+        .min(total_height.saturating_sub(5).max(3))
 }
 
 fn format_queue_item(item: &MonitorQueueItem) -> String {

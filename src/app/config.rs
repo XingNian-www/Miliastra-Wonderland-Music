@@ -36,6 +36,12 @@ pub struct WindowConfig {
     pub content_width: u32,
     pub content_height: u32,
     pub auto_activate_window: bool,
+    #[serde(default = "default_window_focus_point")]
+    pub focus_point: PointConfig,
+}
+
+fn default_window_focus_point() -> PointConfig {
+    PointConfig::new(1919, 1000)
 }
 
 impl AppConfig {
@@ -123,39 +129,96 @@ pub struct ScreenConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TimingConfig {
     pub watchdog_restart_ms: u64,
-    pub scan_loop_idle_ms: u64,
-    pub chat_scan_fallback_ms: u64,
-    pub chat_change_debounce_ms: u64,
-    pub chat_change_cooldown_ms: u64,
-    pub command_ui_timeout_ms: u64,
-    pub return_to_primary_retry_ms: u64,
-    pub output_focus_ms: u64,
-    pub output_open_chat_ms: u64,
-    pub output_click_ms: u64,
-    pub output_input_ms: u64,
-    pub output_send_ms: u64,
-    pub post_command_settle_ms: u64,
+    pub loop_idle_ms: u64,
+    pub chat_scan: ChatScanTimingConfig,
+    pub command: CommandTimingConfig,
+    pub input: InputTimingConfig,
+    pub workflow: WorkflowTimingConfig,
+    pub hall: HallTimingConfig,
+    pub invite: InviteTimingConfig,
+    pub moderation: ModerationTimingConfig,
+    pub playback: PlaybackTimingConfig,
+    pub decision: DecisionTimingConfig,
+    pub external: ExternalTimingConfig,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ChatScanTimingConfig {
+    pub fallback_ms: u64,
+    pub change_debounce_ms: u64,
+    pub change_cooldown_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CommandTimingConfig {
+    pub ui_timeout_ms: u64,
+    pub return_retry_ms: u64,
+    pub post_settle_ms: u64,
     pub help_batch_ms: u64,
-    pub hall_page_settle_ms: u64,
-    pub hall_ocr_sample_interval_ms: u64,
-    pub invite_open_chat_ms: u64,
-    pub invite_step_ms: u64,
-    pub invite_confirm_timeout_ms: u64,
-    pub invite_confirm_poll_ms: u64,
-    pub play_search_settle_ms: u64,
-    pub play_status_poll_ms: u64,
-    pub play_status_retries: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InputTimingConfig {
+    pub after_activate_ms: u64,
+    pub focus_ms: u64,
+    pub open_chat_ms: u64,
+    pub click_ms: u64,
+    pub text_ms: u64,
+    pub send_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkflowTimingConfig {
+    pub default_timeout_ms: u64,
+    pub default_poll_ms: u64,
+    pub default_step_wait_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HallTimingConfig {
+    pub page_settle_ms: u64,
+    pub ocr_sample_interval_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InviteTimingConfig {
+    pub open_chat_ms: u64,
+    pub step_ms: u64,
+    pub confirm_timeout_ms: u64,
+    pub confirm_poll_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ModerationTimingConfig {
+    pub vote_timeout_ms: u64,
+    pub vote_poll_ms: u64,
+    pub search_result_timeout_ms: u64,
+    pub confirm_wait_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PlaybackTimingConfig {
+    pub search_settle_ms: u64,
+    pub status_poll_ms: u64,
+    pub status_retries: u32,
     pub skip_status_initial_ms: u64,
     pub skip_status_poll_ms: u64,
     pub skip_status_retries: u32,
-    pub decision_timeout_ms: u64,
-    pub decision_poll_ms: u64,
+    pub monitor_tick_ms: u64,
+    pub monitor_status_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DecisionTimingConfig {
+    pub timeout_ms: u64,
+    pub poll_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExternalTimingConfig {
     pub feeluown_rpc_timeout_ms: u64,
     pub volume_smooth_step_ms: u64,
-    pub active_after_activate_ms: u64,
     pub ai_request_timeout_ms: u64,
-    pub playback_monitor_tick_ms: u64,
-    pub playback_monitor_status_ms: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -206,20 +269,16 @@ pub struct TemplateConfig {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ModerationConfig {
-    pub vote_timeout_ms: u64,
-    pub vote_poll_ms: u64,
     pub stable_vote_samples: u32,
     pub required_vote_margin: i32,
     pub friend_panel_region: RectConfig,
     pub search_panel_region: RectConfig,
     pub search_input_point: PointConfig,
     pub search_button_point: PointConfig,
-    pub search_result_timeout_ms: u64,
     pub more_settings_region: RectConfig,
     pub block_chat_region: RectConfig,
     pub blacklist_region: RectConfig,
     pub confirm_region: RectConfig,
-    pub confirm_wait_ms: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -275,11 +334,14 @@ pub struct QueueConfig {
 pub struct CustomWorkflowConfig {
     pub enabled: bool,
     pub default_threshold: f32,
-    pub default_timeout_ms: u64,
-    pub default_poll_ms: u64,
-    pub default_step_wait_ms: u64,
+    #[serde(default = "default_wait_template_absent_stable")]
+    pub wait_template_absent_stable_default: bool,
     pub templates: HashMap<String, PathBuf>,
     pub workflows: Vec<CustomWorkflowDefinition>,
+}
+
+fn default_wait_template_absent_stable() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -314,6 +376,7 @@ pub struct CustomWorkflowStep {
     pub timeout_ms: Option<u64>,
     pub poll_ms: Option<u64>,
     pub wait_ms: Option<u64>,
+    pub stable_after_absent: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

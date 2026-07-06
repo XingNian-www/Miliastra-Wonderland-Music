@@ -1,10 +1,10 @@
-name: Build Windows exe
+name: 构建 Windows EXE
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: Release version, for example v0.1.0. Empty uses Cargo.toml version.
+        description: 发布版本，例如 v0.1.0。留空时使用 Cargo.toml 版本。
         required: false
         type: string
   push:
@@ -32,30 +32,30 @@ env:
 
 jobs:
   build-windows-exe:
-    name: Build Windows x64 exe
+    name: 构建 Windows x64 EXE
     runs-on: windows-latest
 
     steps:
-      - name: Checkout
+      - name: 检出代码
         uses: actions/checkout@v5
 
-      - name: Install Rust
+      - name: 安装 Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
 
-      - name: Cache Cargo
+      - name: 缓存 Cargo
         uses: Swatinem/rust-cache@v2
         with:
           key: windows-msvc-release
 
-      - name: Cache OCR models
+      - name: 缓存 OCR 模型
         uses: actions/cache@v4
         with:
           path: models
           key: pp-ocrv6-small-models-v1
 
-      - name: Download PP-OCRv6 small models
+      - name: 下载 PP-OCRv6 small 模型
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path models | Out-Null
@@ -71,17 +71,17 @@ jobs:
             }
           }
 
-      - name: Build release exe
+      - name: 编译 Release EXE
         run: cargo build --release --target x86_64-pc-windows-msvc --locked
 
-      - name: Resolve release version
+      - name: 解析发布版本
         id: version
         shell: pwsh
         run: |
           function Read-PackageVersion($text) {
             $content = if ($text -is [array]) { $text -join "`n" } else { [string]$text }
             if ($content -notmatch '(?ms)^\[package\].*?^version\s*=\s*"([^"]+)"') {
-              throw 'Cannot read package version from Cargo.toml'
+              throw '无法从 Cargo.toml 读取包版本'
             }
             return $Matches[1]
           }
@@ -116,7 +116,7 @@ jobs:
           "zip=miliastra-wonderland-music-windows-x64-$version.zip" >> $env:GITHUB_OUTPUT
           "create_release=$createRelease" >> $env:GITHUB_OUTPUT
 
-      - name: Prepare artifact
+      - name: 准备产物
         shell: pwsh
         run: |
           $dist = 'dist/miliastra-wonderland-music-windows-x64'
@@ -128,7 +128,7 @@ jobs:
           Copy-Item 'config.yaml' $dist
           Copy-Item 'README.md' $dist
 
-      - name: Package release zip
+      - name: 打包 Release zip
         shell: pwsh
         run: |
           Compress-Archive `
@@ -136,13 +136,13 @@ jobs:
             -DestinationPath "dist/${{ steps.version.outputs.zip }}" `
             -Force
 
-      - name: Upload artifact
+      - name: 上传产物
         uses: actions/upload-artifact@v5
         with:
           name: miliastra-wonderland-music-windows-x64
           path: dist/miliastra-wonderland-music-windows-x64
 
-      - name: Create GitHub Release
+      - name: 创建 GitHub Release
         if: steps.version.outputs.create_release == 'true'
         uses: softprops/action-gh-release@v2
         with:

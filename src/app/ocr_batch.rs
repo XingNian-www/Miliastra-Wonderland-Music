@@ -63,7 +63,7 @@ pub(super) fn batch_recognize_blocks(
     let combined = DynamicImage::ImageRgba8(combined);
 
     let lines = recognize_lines(engine, &combined)?;
-    log::debug!(
+    log::info!(target: "timing",
         "批量 OCR 拼接: blocks={} combined={}x{} lines={} 耗时={}ms",
         blocks.len(),
         max_width,

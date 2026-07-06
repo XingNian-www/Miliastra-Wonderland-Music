@@ -2,7 +2,7 @@
 # 坐标沿用旧脚本习惯：以游戏客户区左上角为原点，按 1920x1080 有效画面写坐标
 
 # 配置版本；程序启动时会把旧版本配置迁移到当前模板
-config_version: 11
+config_version: 13
 
 window:
   # 目标游戏进程名，按进程文件名匹配，大小写不敏感
@@ -13,6 +13,9 @@ window:
   content_height: 1080
   # /active-window 接口是否尝试自动切回目标窗口
   auto_activate_window: false
+  focus_point:
+    x: 1919
+    y: 1000
 
 screen:
   # 截图会缩放到这个宽度后再做模板匹配和 OCR
@@ -56,71 +59,95 @@ timing:
   # 1. 监听子进程异常退出后的重启等待时间，单位毫秒
   watchdog_restart_ms: 2000
   # 2. 监听主循环空转间隔；脚本暂停或每轮扫描结束后等待多久再继续，单位毫秒
-  scan_loop_idle_ms: 60
-  # 3. 聊天 OCR 兜底扫描间隔；画面没变化时按这个间隔强制扫描一次，单位毫秒
-  chat_scan_fallback_ms: 2000
-  # 4. 聊天变化后等待画面稳定再 OCR 的时间，单位毫秒
-  chat_change_debounce_ms: 120
-  # 5. 两次变化触发 OCR 之间的最小间隔，单位毫秒
-  chat_change_cooldown_ms: 250
-  # 6. 执行命令前等待回到一级界面的最长时间，单位毫秒
-  command_ui_timeout_ms: 15000
-  # 7. 返回一级界面时每次 ESC 后等待重新检测的时间，单位毫秒
-  return_to_primary_retry_ms: 1000
-  # 8. 聚焦游戏窗口后的等待时间，单位毫秒
-  output_focus_ms: 300
-  # 9. 按回车打开聊天输入后的等待时间，单位毫秒
-  output_open_chat_ms: 300
-  # 10. 每次点击聊天输入区域后的等待时间，单位毫秒
-  output_click_ms: 150
-  # 11. 输入文本后到发送前的等待时间，单位毫秒
-  output_input_ms: 250
-  # 12. 发送聊天后等待界面稳定的时间，单位毫秒
-  output_send_ms: 300
-  # 13. 命令执行后等待聊天列表/动画稳定再复扫的时间，单位毫秒
-  post_command_settle_ms: 500
-  # 14. @帮助 多条消息之间的间隔，单位毫秒
-  help_batch_ms: 500
-  # 15. 进入/退出大厅页面后等待页面稳定的时间，单位毫秒
-  hall_page_settle_ms: 800
-  # 16. 大厅信息多次 OCR 采样之间的间隔，单位毫秒
-  hall_ocr_sample_interval_ms: 120
-  # 17. 邀请流程打开好友/聊天面板前后的固定等待，单位毫秒
-  invite_open_chat_ms: 400
-  # 18. 邀请流程每一步点击后的等待时间，单位毫秒
-  invite_step_ms: 800
-  # 19. 非公共大厅邀请时等待邀请确认/拒绝命令的最长时间，单位毫秒
-  invite_confirm_timeout_ms: 30000
-  # 20. 邀请确认扫描间隔，单位毫秒
-  invite_confirm_poll_ms: 2000
-  # 21. 点歌搜索发起后等待播放器切歌的时间，单位毫秒
-  play_search_settle_ms: 2000
-  # 22. 点歌后查询播放状态的间隔，单位毫秒
-  play_status_poll_ms: 1000
-  # 23. 点歌后最多查询播放状态次数
-  play_status_retries: 15
-  # 24. 下一首/上一首后首次查询播放器状态前的等待时间，单位毫秒
-  skip_status_initial_ms: 500
-  # 25. 下一首/上一首后轮询播放器状态的间隔，单位毫秒
-  skip_status_poll_ms: 300
-  # 26. 下一首/上一首后最多查询播放状态次数
-  skip_status_retries: 5
-  # 27. 匹配失败/AI 自动匹配后等待用户确认的最长时间，单位毫秒
-  decision_timeout_ms: 20000
-  # 28. 匹配失败/AI 自动匹配期间扫描确认命令的间隔，单位毫秒
-  decision_poll_ms: 2000
-  # 29. FeelUOwn TCP RPC 读写超时，单位毫秒
-  feeluown_rpc_timeout_ms: 10000
-  # 30. 调整音量时每个平滑步进之间的等待时间，单位毫秒
-  volume_smooth_step_ms: 300
-  # 31. 自动激活游戏窗口后等待前台窗口切换完成的时间，单位毫秒
-  active_after_activate_ms: 200
-  # 32. AI HTTP 请求超时，单位毫秒
-  ai_request_timeout_ms: 35000
-  # 33. 播放监控线程循环间隔，单位毫秒
-  playback_monitor_tick_ms: 200
-  # 34. 播放结束监控向 FeelUOwn 校准状态的间隔，单位毫秒
-  playback_monitor_status_ms: 1000
+  loop_idle_ms: 60
+  chat_scan:
+    # 聊天 OCR 兜底扫描间隔；画面没变化时按这个间隔强制扫描一次，单位毫秒
+    fallback_ms: 2000
+    # 聊天变化后等待画面稳定再 OCR 的时间，单位毫秒
+    change_debounce_ms: 120
+    # 两次变化触发 OCR 之间的最小间隔，单位毫秒
+    change_cooldown_ms: 250
+  command:
+    # 执行命令前等待回到一级界面的最长时间，单位毫秒
+    ui_timeout_ms: 15000
+    # 返回一级界面时每次 ESC 后等待重新检测的时间，单位毫秒
+    return_retry_ms: 1000
+    # 命令执行后等待聊天列表/动画稳定再复扫的时间，单位毫秒
+    post_settle_ms: 500
+    # @帮助 多条消息之间的间隔，单位毫秒
+    help_batch_ms: 500
+  input:
+    # 自动激活游戏窗口后等待前台窗口切换完成的时间，单位毫秒
+    after_activate_ms: 200
+    # 聚焦游戏窗口后的等待时间，单位毫秒
+    focus_ms: 300
+    # 按回车打开聊天输入后的等待时间，单位毫秒
+    open_chat_ms: 300
+    # 每次点击聊天输入区域后的等待时间，单位毫秒
+    click_ms: 150
+    # 输入文本后到发送前的等待时间，单位毫秒
+    text_ms: 250
+    # 发送聊天后等待界面稳定的时间，单位毫秒
+    send_ms: 300
+  workflow:
+    # wait_template/click_template 默认等待模板出现的最长时间，单位毫秒
+    default_timeout_ms: 5000
+    # 等待模板出现时的轮询间隔，单位毫秒
+    default_poll_ms: 200
+    # 每个步骤执行后的默认等待时间，单位毫秒
+    default_step_wait_ms: 300
+  hall:
+    # 进入/退出大厅页面后等待页面稳定的时间，单位毫秒
+    page_settle_ms: 800
+    # 大厅信息多次 OCR 采样之间的间隔，单位毫秒
+    ocr_sample_interval_ms: 120
+  invite:
+    # 邀请流程打开好友/聊天面板前后的固定等待，单位毫秒
+    open_chat_ms: 400
+    # 邀请流程每一步点击后的等待时间，单位毫秒
+    step_ms: 800
+    # 非公共大厅邀请时等待邀请确认/拒绝命令的最长时间，单位毫秒
+    confirm_timeout_ms: 30000
+    # 邀请确认扫描间隔，单位毫秒
+    confirm_poll_ms: 2000
+  moderation:
+    # 拉黑/屏蔽 UID 请求的好友私聊投票等待时间，单位毫秒
+    vote_timeout_ms: 120000
+    # 投票 OCR 扫描间隔，单位毫秒
+    vote_poll_ms: 2000
+    # 点击 UID 搜索按钮后等待搜索结果出现的最长时间，单位毫秒
+    search_result_timeout_ms: 5000
+    # 点击确认按钮后等待动作完成的时间，单位毫秒
+    confirm_wait_ms: 2000
+  playback:
+    # 点歌搜索发起后等待播放器切歌的时间，单位毫秒
+    search_settle_ms: 2000
+    # 点歌后查询播放状态的间隔，单位毫秒
+    status_poll_ms: 1000
+    # 点歌后最多查询播放状态次数
+    status_retries: 15
+    # 下一首/上一首后首次查询播放器状态前的等待时间，单位毫秒
+    skip_status_initial_ms: 500
+    # 下一首/上一首后轮询播放器状态的间隔，单位毫秒
+    skip_status_poll_ms: 300
+    # 下一首/上一首后最多查询播放状态次数
+    skip_status_retries: 5
+    # 播放监控线程循环间隔，单位毫秒
+    monitor_tick_ms: 200
+    # 播放结束监控向 FeelUOwn 校准状态的间隔，单位毫秒
+    monitor_status_ms: 1000
+  decision:
+    # 匹配失败/AI 自动匹配后等待用户确认的最长时间，单位毫秒
+    timeout_ms: 20000
+    # 匹配失败/AI 自动匹配期间扫描确认命令的间隔，单位毫秒
+    poll_ms: 2000
+  external:
+    # FeelUOwn TCP RPC 读写超时，单位毫秒
+    feeluown_rpc_timeout_ms: 10000
+    # 调整音量时每个平滑步进之间的等待时间，单位毫秒
+    volume_smooth_step_ms: 300
+    # AI HTTP 请求超时，单位毫秒
+    ai_request_timeout_ms: 35000
 
 ocr:
   # PaddleOCR 检测模型路径
@@ -220,10 +247,6 @@ output:
     y: 1013
 
 moderation:
-  # 拉黑/屏蔽 UID 请求的好友私聊投票等待时间，单位毫秒
-  vote_timeout_ms: 120000
-  # 投票 OCR 扫描间隔，单位毫秒
-  vote_poll_ms: 2000
   # 同一好友同一判决需要连续稳定识别次数
   stable_vote_samples: 3
   # 同意人数 - 不同意人数 达到该值才执行
@@ -248,8 +271,6 @@ moderation:
   search_button_point:
     x: 1680
     y: 135
-  # 点击 UID 搜索按钮后等待搜索结果出现的最长时间，单位毫秒
-  search_result_timeout_ms: 5000
   # 更多设置按钮模板搜索区域
   more_settings_region:
     x: 1140
@@ -274,9 +295,6 @@ moderation:
     y: 700
     width: 500
     height: 100
-  # 点击确认按钮后等待动作完成的时间，单位毫秒
-  confirm_wait_ms: 2000
-
 feeluown:
   # FeelUOwn TCP RPC 地址
   host: 127.0.0.1
@@ -298,7 +316,7 @@ logging:
   level: info
 
 tui:
-  # 是否启用终端 TUI 面板；启用后实时显示日志和 OCR 内容
+  # 是否启用终端 TUI 面板；启用后实时显示事件日志、OCR 内容和队列状态
   enabled: true
   # TUI 刷新间隔，单位毫秒
   refresh_ms: 100
@@ -398,19 +416,16 @@ custom_workflows:
   enabled: true
   # 模板默认匹配阈值
   default_threshold: 0.9
-  # wait_template/click_template 默认等待模板出现的最长时间，单位毫秒
-  default_timeout_ms: 5000
-  # 等待模板出现时的轮询间隔，单位毫秒
-  default_poll_ms: 200
-  # 每个步骤执行后的默认等待时间，单位毫秒
-  default_step_wait_ms: 300
+  wait_template_absent_stable_default: true
+  # 自定义流程默认超时、轮询和步骤等待统一在 timing.workflow 中配置
   # 自定义模板名到图片路径的映射，步骤里通过 template 引用这里的名字
   templates: {}
-  # 支持的步骤：key/click/click_template/wait_template/wait_template_absent/click_text/wait_text/paste/send_chat/send_current_chat/send_friend_message/invite_user/return_primary/sleep
+  # 支持的步骤：activate_game/focus_game/key/click/click_template/wait_template/wait_template_absent/click_text/wait_text/paste/send_chat/send_current_chat/send_friend_message/invite_user/return_primary/sleep
+  # wait_template_absent 默认在模板消失后继续等待像素稳定；可在步骤上设置 stable_after_absent: false 关闭
   # 支持变量：{{username}}、{{args}}、{{arg1}}、{{arg2}}、{{command}}、{{workflow}}、{{message_type}}
   # send_friend_message 默认发送给触发命令的好友，也可以用 target 指定好友名
   # confirm_message_types 控制确认命令来源：[blue] 为大厅，[pink] 为好友私聊，留空表示不限
-  # 默认 custom workflow 不接受参数；需要参数时设置 allow_args: true
+  # 默认自定义流程不接受参数；需要参数时设置 allow_args: true
   # 示例：
   # templates:
   #   my_button: assets/my-button.png

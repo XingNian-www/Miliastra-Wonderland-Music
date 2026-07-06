@@ -116,7 +116,8 @@ pub(super) fn make_ocr_engine(args: &ResolvedOcrArgs) -> Result<OcrEngine> {
         let backend_started = Instant::now();
         match new_ocr_engine(args, backend) {
             Ok(engine) => {
-                log::info!(
+                log::info!("OCR 后端已启用: {}", backend_name(backend));
+                log::info!(target: "timing",
                     "OCR 后端已启用: {} 初始化={}ms 总耗时={}ms",
                     backend_name(backend),
                     elapsed_ms(backend_started),
@@ -125,12 +126,15 @@ pub(super) fn make_ocr_engine(args: &ResolvedOcrArgs) -> Result<OcrEngine> {
                 return Ok(engine);
             }
             Err(error) => {
-                let message = format!(
-                    "{} 初始化={}ms: {error:#}",
-                    backend_name(backend),
-                    elapsed_ms(backend_started)
-                );
+                let backend = backend_name(backend);
+                let backend_ms = elapsed_ms(backend_started);
+                let message = format!("{backend}: {error:#}");
                 log::warn!("OCR 后端初始化失败，尝试下一个: {message}");
+                log::warn!(target: "timing",
+                    "OCR 后端初始化失败耗时: backend={} total={}ms error={error:#}",
+                    backend,
+                    backend_ms
+                );
                 failures.push(message);
             }
         }
@@ -190,7 +194,7 @@ pub(super) fn recognize_lines(engine: &OcrEngine, image: &DynamicImage) -> Resul
         .filter(|line| !line.text.is_empty())
         .collect();
     lines.sort_by(|left, right| compare_rect_top_left(left.bbox, right.bbox));
-    log::debug!(
+    log::info!(target: "timing",
         "OCR 识别耗时: {}ms image={}x{} lines={}",
         elapsed_ms(started),
         image.width(),

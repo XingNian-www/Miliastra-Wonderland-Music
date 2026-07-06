@@ -411,7 +411,6 @@ fn same_user_command(left: &UserCommand, right: &UserCommand) -> bool {
             identity_text(&left.friend_username) == identity_text(&right.friend_username)
                 && left.source == right.source
                 && left.prefer_accompaniment == right.prefer_accompaniment
-                && left.ai_assisted == right.ai_assisted
                 && same_lock_keyword(&left.keyword, &right.keyword)
         }
         (UserCommand::Invite(left), UserCommand::Invite(right)) => left.seq == right.seq,
@@ -448,11 +447,10 @@ fn same_user_command(left: &UserCommand, right: &UserCommand) -> bool {
 fn command_lock_key(command: &UserCommand) -> String {
     match command {
         UserCommand::Song(song) => format!(
-            "song:{}:{}:{}:{}:{}",
+            "song:{}:{}:{}:{}",
             identity_text(&song.friend_username),
             song.source.as_str(),
             if song.prefer_accompaniment { 1 } else { 0 },
-            if song.ai_assisted { 1 } else { 0 },
             identity_text(&song.keyword)
         ),
         UserCommand::Pause => "pause".to_string(),
@@ -1021,6 +1019,34 @@ mod tests {
                 friend_username: String::new(),
             })
         );
+    }
+
+    #[test]
+    fn song_lock_treats_ai_and_plain_hall_song_as_same_request() {
+        let plain = parse_text("用户：@点歌 晴天 周杰伦", "blue").expect("parse plain song");
+        let ai = parse_text("用户：@AI点歌 晴天 周杰伦", "blue").expect("parse ai song");
+
+        assert!(same_lock_command(&plain, &ai));
+    }
+
+    #[test]
+    fn command_lock_accepts_only_one_ai_or_plain_hall_song_request() {
+        let plain = parse_text("用户：@点歌 晴天 周杰伦", "blue").expect("parse plain song");
+        let ai = parse_text("用户：@AI点歌 晴天 周杰伦", "blue").expect("parse ai song");
+        let mut locks = CommandLockState::default();
+
+        let update = locks.update(&[plain, ai], false);
+
+        assert_eq!(update.accepted.len(), 1);
+    }
+
+    #[test]
+    fn song_lock_keeps_different_sources_separate() {
+        let qq = parse_text("用户：@点歌 晴天 周杰伦", "blue").expect("parse qq song");
+        let netease =
+            parse_text("用户：@网易点歌 晴天 周杰伦", "blue").expect("parse netease song");
+
+        assert!(!same_lock_command(&qq, &netease));
     }
 
     #[test]

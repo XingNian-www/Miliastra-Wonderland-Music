@@ -6,6 +6,7 @@ use anyhow::Result;
 use ocr_rs::OcrEngine;
 
 use super::FrameArgs;
+use super::change_detection::{change_stats, rect_chat_change_fingerprint};
 use super::command;
 use super::config::{self, PointConfig};
 use super::frame_source::{Canvas, Frame, load_frame};
@@ -52,6 +53,10 @@ impl UiLocator {
 
     pub(super) fn click_point(&self, point: Point) -> Result<()> {
         click_game_point(PointConfig::new(point.x, point.y), &self.window_config)
+    }
+
+    pub(super) fn poll_ms(&self) -> u64 {
+        self.poll_ms
     }
 }
 
@@ -190,6 +195,37 @@ impl UiRegion<'_> {
         };
         self.locator.click_point(hit.center())?;
         Ok(Some(hit))
+    }
+
+    pub(super) fn wait_pixels_stable_while<F>(
+        &self,
+        timeout_ms: u64,
+        mean_threshold: f32,
+        changed_ratio_threshold: f32,
+        mut should_continue: F,
+    ) -> Result<bool>
+    where
+        F: FnMut() -> bool,
+    {
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        let mut previous = rect_chat_change_fingerprint(&self.locator.capture()?.image, self.rect)?;
+        loop {
+            if !should_continue() {
+                return Ok(false);
+            }
+            sleep(Duration::from_millis(self.locator.poll_ms));
+            let current = rect_chat_change_fingerprint(&self.locator.capture()?.image, self.rect)?;
+            let stats = change_stats(&previous, &current);
+            if stats.mean_abs_diff <= mean_threshold
+                && stats.changed_ratio <= changed_ratio_threshold
+            {
+                return Ok(true);
+            }
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
+            previous = current;
+        }
     }
 }
 

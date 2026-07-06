@@ -10,7 +10,7 @@ on:
       cuda_version:
         description: 用于编译 MNN 的 CUDA Toolkit 版本。
         required: false
-        default: 12.3.2
+        default: 12.9.1
         type: string
       mnn_tag:
         description: MNN 源码 tag。应与 vendor/mnn 版本保持一致。

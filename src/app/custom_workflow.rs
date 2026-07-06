@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use super::command::{self, CustomWorkflowCommand, ModerationAction, ParsedCommand, UserCommand};
 use super::config::{self, CustomWorkflowConfig, CustomWorkflowDefinition, PointConfig};
+use super::decision_lock::DecisionScreenLock;
 use super::frame_source::{Canvas, load_frame};
 use super::ui_locator::UiLocator;
 use super::workflow_actions::{self, HitAction, PixelStability, TemplateMode};
@@ -272,7 +273,8 @@ impl AutomationApp {
         P: Fn(&str) -> Option<T>,
     {
         let poll_ms = poll_ms.max(50);
-        let existing = self.collect_chat_decision_bottoms(&accepts_message_type, &parse_decision);
+        let mut screen_lock =
+            self.collect_chat_decision_screen_lock(&accepts_message_type, &parse_decision);
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
         let template_args = TemplateArgs::default().resolve(&self.config);
         let canvas = Canvas {
@@ -297,12 +299,13 @@ impl AutomationApp {
                 }
             };
             for message in messages {
-                if !accepts_message_type(&message.message_type)
-                    || super::is_existing_decision(&message, &existing)
-                {
+                if !accepts_message_type(&message.message_type) {
                     continue;
                 }
                 if let Some(decision) = parse_decision(&message.text) {
+                    if !screen_lock.accept_once(&message) {
+                        continue;
+                    }
                     return Ok(ChatDecisionWait::Found(decision));
                 }
             }
@@ -314,16 +317,15 @@ impl AutomationApp {
         }
     }
 
-    fn collect_chat_decision_bottoms<T, A, P>(
+    fn collect_chat_decision_screen_lock<T, A, P>(
         &self,
         accepts_message_type: &A,
         parse_decision: &P,
-    ) -> HashMap<String, i32>
+    ) -> DecisionScreenLock
     where
         A: Fn(&str) -> bool,
         P: Fn(&str) -> Option<T>,
     {
-        let mut output = HashMap::new();
         let template_args = TemplateArgs::default().resolve(&self.config);
         let canvas = Canvas {
             width: self.config.screen.expected_width,
@@ -331,23 +333,14 @@ impl AutomationApp {
             resize: true,
         };
         let Ok(frame) = load_frame(&FrameArgs { image: None }, &canvas, &self.config.window) else {
-            return output;
+            return DecisionScreenLock::default();
         };
         let Ok(messages) = self.scan_chat_with_shared_ocr(&frame.image, &template_args) else {
-            return output;
+            return DecisionScreenLock::default();
         };
-        for message in messages {
-            if accepts_message_type(&message.message_type)
-                && parse_decision(&message.text).is_some()
-            {
-                let bottom = message.block.y + message.block.height as i32;
-                output
-                    .entry(message.text)
-                    .and_modify(|value| *value = (*value).max(bottom))
-                    .or_insert(bottom);
-            }
-        }
-        output
+        DecisionScreenLock::from_messages(&messages, accepts_message_type, &|text| {
+            parse_decision(text).is_some()
+        })
     }
 
     fn execute_custom_workflow_step(
@@ -661,15 +654,20 @@ impl AutomationApp {
             Some(false) => {
                 log::info!("收到邀请拒绝，取消邀请");
                 self.notify_friend_invite_decision(username, "大厅成员已拒绝邀请");
-                self.return_to_primary_fixed();
                 Ok(false)
             }
         }
     }
 
     fn notify_friend_invite_decision(&self, username: &str, message: &str) {
-        if let Err(error) = self.send_friend_message(username, message) {
-            log::error!("好友邀请确认回复失败: {error:#}");
+        match self.send_friend_message(username, message) {
+            Ok(true) => {}
+            Ok(false) => {
+                log::error!("好友邀请确认回复失败: 未能打开好友聊天 {}", username);
+            }
+            Err(error) => {
+                log::error!("好友邀请确认回复失败: {error:#}");
+            }
         }
     }
 
@@ -751,7 +749,7 @@ impl AutomationApp {
                 return Ok(false);
             }
             if label == "进入大厅" {
-                self.on_entered_new_hall();
+                self.on_entered_new_hall()?;
             }
         }
 
@@ -759,12 +757,14 @@ impl AutomationApp {
         Ok(true)
     }
 
-    fn on_entered_new_hall(&self) {
+    fn on_entered_new_hall(&self) -> Result<()> {
         log::info!("已进入新大厅，重置命令识别状态");
         self.commands_enabled.store(true, AtomicOrdering::SeqCst);
         self.screen_lock_primed.store(false, AtomicOrdering::SeqCst);
         self.reset_locks_requested
             .store(true, AtomicOrdering::SeqCst);
+        self.clear_hall_countdown_cache_for_new_visual_session("已进入新大厅")?;
+        Ok(())
     }
 
     pub(super) fn execute_moderation_with_vote(
@@ -925,7 +925,7 @@ impl AutomationApp {
     }
 
     fn wait_for_moderation_votes(&self, command: &command::ModerationCommand) -> Result<bool> {
-        let existing = self.collect_moderation_vote_bottoms();
+        let screen_lock = self.collect_moderation_vote_screen_lock();
         let deadline =
             Instant::now() + Duration::from_millis(self.config.timing.moderation.vote_timeout_ms);
         let template_args = TemplateArgs::default().resolve(&self.config);
@@ -953,9 +953,7 @@ impl AutomationApp {
                 }
             };
             for message in messages {
-                if message.message_type != "pink"
-                    || super::is_existing_decision(&message, &existing)
-                {
+                if message.message_type != "pink" || screen_lock.is_existing(&message) {
                     continue;
                 }
                 let Some((username, agreed)) = parse_friend_moderation_vote(&message.text) else {
@@ -1007,8 +1005,7 @@ impl AutomationApp {
         }
     }
 
-    fn collect_moderation_vote_bottoms(&self) -> HashMap<String, i32> {
-        let mut output = HashMap::new();
+    fn collect_moderation_vote_screen_lock(&self) -> DecisionScreenLock {
         let template_args = TemplateArgs::default().resolve(&self.config);
         let canvas = Canvas {
             width: self.config.screen.expected_width,
@@ -1016,23 +1013,16 @@ impl AutomationApp {
             resize: true,
         };
         let Ok(frame) = load_frame(&FrameArgs { image: None }, &canvas, &self.config.window) else {
-            return output;
+            return DecisionScreenLock::default();
         };
         let Ok(messages) = self.scan_chat_with_shared_ocr(&frame.image, &template_args) else {
-            return output;
+            return DecisionScreenLock::default();
         };
-        for message in messages {
-            if message.message_type == "pink"
-                && parse_friend_moderation_vote(&message.text).is_some()
-            {
-                let bottom = message.block.y + message.block.height as i32;
-                output
-                    .entry(message.text)
-                    .and_modify(|value| *value = (*value).max(bottom))
-                    .or_insert(bottom);
-            }
-        }
-        output
+        DecisionScreenLock::from_messages(
+            &messages,
+            &|message_type| message_type == "pink",
+            &|text| parse_friend_moderation_vote(text).is_some(),
+        )
     }
 
     fn execute_moderation_steps(&self, command: &command::ModerationCommand) -> Result<bool> {
@@ -1050,10 +1040,6 @@ impl AutomationApp {
     }
 
     fn execute_moderation_steps_inner(&self, command: &command::ModerationCommand) -> Result<bool> {
-        workflow_actions::focus(
-            &self.config.window,
-            self.config.timing.input.after_activate_ms,
-        )?;
         let locator = self.ui_locator(self.template_poll_ms());
         let mut state = ModerationUiState::OpenFriendPanel;
 
@@ -1351,12 +1337,10 @@ impl AutomationApp {
     }
 
     fn open_friend_chat(&self, username: &str, canvas: &Canvas) -> Result<bool> {
-        workflow_actions::focus(
-            &self.config.window,
-            self.config.timing.input.after_activate_ms,
-        )?;
-        workflow_actions::click_point(self.config.output.focus_point, &self.config.window)?;
-        workflow_actions::wait(self.config.timing.invite.open_chat_ms);
+        if !self.return_to_primary_fixed() {
+            log::error!("好友聊天失败: 打开好友聊天前未能回到一级界面");
+            return Ok(false);
+        }
         workflow_actions::press_key_text("Enter", &self.config.window)?;
         workflow_actions::wait(self.config.timing.invite.open_chat_ms);
         let locator = self.ui_locator_with_canvas(canvas.clone(), self.template_poll_ms());

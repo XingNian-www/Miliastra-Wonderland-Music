@@ -19,6 +19,14 @@ use windows::Win32::System::Console::{
 use super::config::TuiConfig;
 use super::monitor::{MonitorQueueItem, MonitorShared, MonitorSnapshot};
 
+const STATUS_HEIGHT: u16 = 3;
+const MAX_OCR_MESSAGES: usize = 5;
+const MAX_QUEUE_ITEMS: usize = 5;
+const OCR_PANEL_HEIGHT: u16 = MAX_OCR_MESSAGES as u16 + 3;
+const QUEUE_PANEL_HEIGHT: u16 = MAX_QUEUE_ITEMS as u16 + 2;
+const MIN_COMMAND_HEIGHT: u16 = 5;
+const MIN_NARROW_DASHBOARD_HEIGHT: u16 = OCR_PANEL_HEIGHT + QUEUE_PANEL_HEIGHT + 3;
+
 pub(super) struct TuiHandle {
     running: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
@@ -108,7 +116,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &MonitorSnapshot) {
         .constraints([
             Constraint::Min(8),
             Constraint::Length(log_height),
-            Constraint::Length(3),
+            Constraint::Length(STATUS_HEIGHT),
         ])
         .split(area);
 
@@ -118,45 +126,35 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &MonitorSnapshot) {
 }
 
 fn draw_dashboard(frame: &mut ratatui::Frame<'_>, area: TuiRect, state: &MonitorSnapshot) {
-    if area.width >= 132 {
-        let dashboard = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(45),
-                Constraint::Percentage(27),
-                Constraint::Percentage(28),
-            ])
-            .split(area);
-        draw_ocr(frame, dashboard[0], state);
-        draw_queue(frame, dashboard[1], state);
-        draw_commands(frame, dashboard[2], state);
-    } else if area.width >= 72 {
+    if area.width >= 72 {
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(narrow_ocr_height(area.height)),
-                Constraint::Min(5),
+                Constraint::Length(ocr_queue_row_height(area.height)),
+                Constraint::Min(MIN_COMMAND_HEIGHT),
             ])
             .split(area);
-        let lower = Layout::default()
+        let top = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(rows[1]);
-        draw_ocr(frame, rows[0], state);
-        draw_queue(frame, lower[0], state);
-        draw_commands(frame, lower[1], state);
+            .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+            .split(rows[0]);
+        draw_ocr(frame, top[0], state);
+        draw_queue(frame, top[1], state);
+        draw_commands(frame, rows[1], state);
     } else {
-        let dashboard = Layout::default()
+        let ocr_height = stacked_ocr_height(area.height);
+        let queue_height = stacked_queue_height(area.height.saturating_sub(ocr_height));
+        let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Percentage(45),
-                Constraint::Percentage(27),
-                Constraint::Percentage(28),
+                Constraint::Length(ocr_height),
+                Constraint::Length(queue_height),
+                Constraint::Min(3),
             ])
             .split(area);
-        draw_ocr(frame, dashboard[0], state);
-        draw_queue(frame, dashboard[1], state);
-        draw_commands(frame, dashboard[2], state);
+        draw_ocr(frame, rows[0], state);
+        draw_queue(frame, rows[1], state);
+        draw_commands(frame, rows[2], state);
     }
 }
 
@@ -190,18 +188,24 @@ fn draw_ocr(frame: &mut ratatui::Frame<'_>, area: TuiRect, state: &MonitorSnapsh
                 )),
             ])];
             lines.extend(
-                ocr.messages
-                    .iter()
-                    .map(|message| Line::from(message.as_str())),
+                recent_ocr_messages(&ocr.messages).map(|message| Line::from(message.as_str())),
             );
             lines
         }
         None => vec![Line::from("暂无 OCR 内容")],
     };
+    let title = state.ocr.as_ref().map_or_else(
+        || " OCR 内容 ".to_string(),
+        |ocr| {
+            format!(
+                " OCR 内容 {}/{} ",
+                ocr.messages.len().min(MAX_OCR_MESSAGES),
+                ocr.messages.len()
+            )
+        },
+    );
     frame.render_widget(
-        Paragraph::new(ocr_lines)
-            .block(Block::default().title(" OCR 内容 ").borders(Borders::ALL))
-            .wrap(Wrap { trim: false }),
+        Paragraph::new(ocr_lines).block(Block::default().title(title).borders(Borders::ALL)),
         area,
     );
 }
@@ -213,13 +217,21 @@ fn draw_queue(frame: &mut ratatui::Frame<'_>, area: TuiRect, state: &MonitorSnap
         state
             .queue
             .iter()
+            .take(MAX_QUEUE_ITEMS)
             .map(|item| Line::from(format_queue_item(item)))
             .collect::<Vec<_>>()
     };
+    let title = if state.queue.is_empty() {
+        " 队列 ".to_string()
+    } else {
+        format!(
+            " 队列 {}/{} ",
+            state.queue.len().min(MAX_QUEUE_ITEMS),
+            state.queue.len()
+        )
+    };
     frame.render_widget(
-        Paragraph::new(queue_lines)
-            .block(Block::default().title(" 队列 ").borders(Borders::ALL))
-            .wrap(Wrap { trim: false }),
+        Paragraph::new(queue_lines).block(Block::default().title(title).borders(Borders::ALL)),
         area,
     );
 }
@@ -257,21 +269,35 @@ fn draw_status(frame: &mut ratatui::Frame<'_>, area: TuiRect, state: &MonitorSna
 }
 
 fn event_log_height(total_height: u16) -> u16 {
-    let desired = match total_height {
-        0..=20 => 4,
-        21..=30 => 5,
-        31..=40 => 6,
-        _ => 8,
-    };
-    desired.min(total_height.saturating_sub(11).max(3))
+    let desired = ((total_height as u32 * 35) / 100) as u16;
+    let max_height = total_height
+        .saturating_sub(STATUS_HEIGHT + MIN_NARROW_DASHBOARD_HEIGHT)
+        .max(3);
+    desired.max(8).min(18).min(max_height)
 }
 
-fn narrow_ocr_height(total_height: u16) -> u16 {
-    let desired = ((total_height as u32 * 45) / 100) as u16;
-    desired
-        .max(5)
-        .min(10)
-        .min(total_height.saturating_sub(5).max(3))
+fn ocr_queue_row_height(total_height: u16) -> u16 {
+    OCR_PANEL_HEIGHT
+        .max(QUEUE_PANEL_HEIGHT)
+        .min(total_height.saturating_sub(MIN_COMMAND_HEIGHT).max(3))
+}
+
+fn stacked_ocr_height(total_height: u16) -> u16 {
+    OCR_PANEL_HEIGHT.min(total_height.saturating_sub(QUEUE_PANEL_HEIGHT + 3).max(3))
+}
+
+fn stacked_queue_height(total_height: u16) -> u16 {
+    QUEUE_PANEL_HEIGHT.min(total_height.saturating_sub(3).max(3))
+}
+
+fn recent_ocr_messages(messages: &[String]) -> impl DoubleEndedIterator<Item = &String> {
+    messages
+        .iter()
+        .rev()
+        .take(MAX_OCR_MESSAGES)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
 }
 
 fn format_queue_item(item: &MonitorQueueItem) -> String {
@@ -290,4 +316,34 @@ fn format_queue_item(item: &MonitorQueueItem) -> String {
         text.push_str(" 伴奏");
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn event_log_gets_a_taller_default_area() {
+        assert!(event_log_height(40) >= 13);
+        assert!(event_log_height(43) >= 15);
+    }
+
+    #[test]
+    fn ocr_and_queue_panels_match_five_visible_rows() {
+        assert_eq!(OCR_PANEL_HEIGHT, 8);
+        assert_eq!(QUEUE_PANEL_HEIGHT, 7);
+        assert_eq!(ocr_queue_row_height(30), 8);
+    }
+
+    #[test]
+    fn ocr_panel_keeps_latest_five_messages() {
+        let messages = (1..=7)
+            .map(|index| format!("消息{index}"))
+            .collect::<Vec<_>>();
+        let visible = recent_ocr_messages(&messages)
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+
+        assert_eq!(visible, vec!["消息3", "消息4", "消息5", "消息6", "消息7"]);
+    }
 }

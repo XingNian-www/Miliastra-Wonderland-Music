@@ -421,14 +421,6 @@ fn same_user_command(left: &UserCommand, right: &UserCommand) -> bool {
             UserCommand::Microphone { username: left },
             UserCommand::Microphone { username: right },
         ) => identity_text(left) == identity_text(right),
-        (
-            UserCommand::DisableCommands { username: left },
-            UserCommand::DisableCommands { username: right },
-        ) => identity_text(left) == identity_text(right),
-        (
-            UserCommand::EnableCommands { username: left },
-            UserCommand::EnableCommands { username: right },
-        ) => identity_text(left) == identity_text(right),
         (UserCommand::IdleExit { minutes: left }, UserCommand::IdleExit { minutes: right }) => {
             left == right
         }
@@ -1036,6 +1028,22 @@ mod tests {
         let mut locks = CommandLockState::default();
 
         let update = locks.update(&[plain, ai], false);
+
+        assert_eq!(update.accepted.len(), 1);
+    }
+
+    #[test]
+    fn command_lock_treats_disable_and_enable_as_global_commands() {
+        let alice_disable = parse_text("[Alice]：@禁用", "pink").expect("parse disable");
+        let bob_disable = parse_text("[Bob]：@禁用", "pink").expect("parse disable");
+        let alice_enable = parse_text("[Alice]：@启用", "pink").expect("parse enable");
+        let bob_enable = parse_text("[Bob]：@启用", "pink").expect("parse enable");
+        let mut locks = CommandLockState::default();
+
+        assert!(same_lock_command(&alice_disable, &bob_disable));
+        assert!(same_lock_command(&alice_enable, &bob_enable));
+
+        let update = locks.update(&[alice_disable, bob_disable], false);
 
         assert_eq!(update.accepted.len(), 1);
     }

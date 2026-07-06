@@ -13,6 +13,7 @@ window:
   content_height: 1080
   # /active-window 接口是否尝试自动切回目标窗口
   auto_activate_window: false
+  # 全局安全聚焦点，只在业务入口显式激活/聚焦游戏窗口时使用一次
   focus_point:
     x: 1919
     y: 1000
@@ -79,7 +80,7 @@ timing:
   input:
     # 自动激活游戏窗口后等待前台窗口切换完成的时间，单位毫秒
     after_activate_ms: 200
-    # 聚焦游戏窗口后的等待时间，单位毫秒
+    # 手动调试工具在显式聚焦游戏窗口后的等待时间，单位毫秒
     focus_ms: 300
     # 按回车打开聊天输入后的等待时间，单位毫秒
     open_chat_ms: 300
@@ -233,7 +234,7 @@ templates:
 output:
   # 是否真的向游戏内发送回复；false 时只写日志
   send_enabled: true
-  # 用于聚焦/返回一级聊天界面的点击点
+  # 保留给手动调试工具使用的聊天面板安全点击点；自动流程返回一级只使用 ESC
   focus_point:
     x: 1919
     y: 1000

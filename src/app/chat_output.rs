@@ -74,9 +74,7 @@ impl ChatOutput {
     fn send_current_chat_with_input(&self, message: &str) -> Result<()> {
         let mut enigo = Enigo::new(&Settings::default()).context("create enigo")?;
         let mut window = GameWindow::find(&self.window)?;
-        window.activate(self.timing.input.after_activate_ms)?;
-        window.focus_game(&mut enigo, self.window.focus_point)?;
-        sleep_ms(self.timing.input.focus_ms);
+        window.ensure_foreground()?;
 
         window.click(&mut enigo, self.config.chat_click_2)?;
         sleep_ms(self.timing.input.click_ms);
@@ -91,12 +89,8 @@ impl ChatOutput {
     fn send_batch_with_input(&self, messages: &[String], delay_ms: u64) -> Result<()> {
         let mut enigo = Enigo::new(&Settings::default()).context("create enigo")?;
         let mut window = GameWindow::find(&self.window)?;
-        window.activate(self.timing.input.after_activate_ms)?;
-        window.focus_game(&mut enigo, self.window.focus_point)?;
-        sleep_ms(self.timing.input.focus_ms);
+        window.ensure_foreground()?;
 
-        window.click(&mut enigo, self.config.focus_point)?;
-        sleep_ms(self.timing.input.focus_ms);
         enigo
             .key(Key::Return, Direction::Click)
             .context("open chat")?;
@@ -117,7 +111,11 @@ impl ChatOutput {
                 .context("send message")?;
             sleep_ms(self.timing.input.send_ms);
         }
-        window.click(&mut enigo, self.config.focus_point)?;
+        window.ensure_foreground()?;
+        enigo
+            .key(Key::Escape, Direction::Click)
+            .context("close chat")?;
+        sleep_ms(self.timing.input.click_ms);
         Ok(())
     }
 }

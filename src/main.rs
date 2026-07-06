@@ -14,6 +14,7 @@ mod app {
     mod config;
     mod config_migration;
     mod custom_workflow;
+    mod decision_lock;
     mod dpi;
     mod feeluown;
     mod frame_source;
@@ -38,7 +39,7 @@ mod app {
     mod window;
     mod workflow_actions;
 
-    use std::collections::{HashMap, HashSet, VecDeque};
+    use std::collections::{HashSet, VecDeque};
     use std::fs::{self, OpenOptions};
     use std::io::{IsTerminal, Write};
     use std::path::{Path, PathBuf};
@@ -58,6 +59,7 @@ mod app {
     };
     use self::command::{CommandLockState, ParsedCommand, PendingCommand, UserCommand};
     use self::config::{AppConfig, PointConfig};
+    use self::decision_lock::DecisionScreenLock;
     use self::feeluown::{FeelUOwnClient, PlayerStatus, format_lyrics, format_status};
     use self::frame_source::{Canvas, load_frame};
     use self::geometry::{Rect, crop_canvas, parse_rect};
@@ -562,7 +564,12 @@ mod app {
             config.feeluown.port
         );
 
-        let runtime_state = PersistentRuntimeState::load(config.state.runtime_state_path.clone())?;
+        let mut runtime_state =
+            PersistentRuntimeState::load(config.state.runtime_state_path.clone())?;
+        if runtime_state.state_mut().clear_hall_countdown_cache() {
+            runtime_state.save()?;
+            log::info!("启动时已清理上次运行的大厅倒计时缓存，等待本次大厅检测重新确认");
+        }
         let queue = PersistentQueue::load(config.state.queue_path.clone(), config.queue.max_size)?;
         log::info!("已加载队列: {} 首", queue.len());
         log::info!(
@@ -1005,6 +1012,7 @@ mod app {
                         let frame_ms = elapsed_ms(frame_started);
                         if target_missing {
                             log::info!("目标窗口已恢复，重置截图退避");
+                            self.clear_hall_countdown_cache_for_new_visual_session("目标窗口恢复")?;
                             target_missing = false;
                         }
                         target_missing_backoff = TARGET_MISSING_BACKOFF_INITIAL;
@@ -1465,7 +1473,7 @@ mod app {
                         };
                     self.execute_pending_command(*pending)
                 }
-                PendingTask::AdvanceQueue { reason } => self.consume_queue(reason),
+                PendingTask::AdvanceQueue { reason } => self.execute_advance_queue_task(reason),
                 PendingTask::ModerationVoteResult {
                     command,
                     approved,
@@ -1629,6 +1637,23 @@ mod app {
             }
 
             Ok(false)
+        }
+
+        fn execute_advance_queue_task(&mut self, reason: &'static str) -> Result<()> {
+            let task_label = format!("自动出队({})", reason);
+            match self.prepare_command_ui(&task_label) {
+                Ok(true) => self.consume_queue(reason),
+                Ok(false) => {
+                    log::info!("{} 执行前未能回到一级界面，保留任务", task_label);
+                    self.push_pending_task_front(PendingTask::AdvanceQueue { reason })?;
+                    Ok(())
+                }
+                Err(error) => {
+                    log::error!("{} 执行前准备界面失败，保留任务: {error:#}", task_label);
+                    self.push_pending_task_front(PendingTask::AdvanceQueue { reason })?;
+                    Ok(())
+                }
+            }
         }
 
         fn run_playback_monitor_loop(&mut self) {
@@ -1909,6 +1934,16 @@ mod app {
             let mut runtime_state = self.runtime_state()?;
             runtime_state.state_mut().hall_expiring_warning_sent = true;
             runtime_state.save()?;
+            Ok(true)
+        }
+
+        fn clear_hall_countdown_cache_for_new_visual_session(&self, reason: &str) -> Result<bool> {
+            let mut runtime_state = self.runtime_state()?;
+            if !runtime_state.state_mut().clear_hall_countdown_cache() {
+                return Ok(false);
+            }
+            runtime_state.save()?;
+            log::info!("{reason}，已清理大厅倒计时缓存，等待本次大厅检测重新确认");
             Ok(true)
         }
 
@@ -2702,7 +2737,6 @@ mod app {
         }
 
         fn execute_microphone_command(&self, username: &str) -> Result<()> {
-            self.ensure_game_ready_for_input("麦克风命令")?;
             if !self.is_primary_ui()? {
                 log::info!("麦克风: 当前不在一级界面，返回一级界面");
                 self.return_to_primary_fixed();
@@ -2726,7 +2760,6 @@ mod app {
         }
 
         fn execute_hall_detect(&mut self) -> Result<()> {
-            self.ensure_game_ready_for_input("大厅检测")?;
             log::info!("大厅检测: 按 F2 进入大厅页面");
             press_key(Key::F2, &self.config.window)?;
             sleep(Duration::from_millis(
@@ -2797,7 +2830,6 @@ mod app {
         }
 
         fn reply_hall_time(&mut self) -> Result<()> {
-            self.ensure_game_ready_for_input("大厅时间")?;
             let minutes = self.runtime_state()?.state().hall_remaining_minutes_now();
             if let Some(minutes) = minutes.filter(|minutes| *minutes > 0) {
                 return self.reply(&format!("大厅到期时间，剩余{}分钟", minutes));
@@ -2832,7 +2864,6 @@ mod app {
         }
 
         fn check_public_hall(&self) -> Result<bool> {
-            self.ensure_game_ready_for_input("大厅检测")?;
             log::info!("大厅检测: 按 F2 进入大厅页面");
             press_key(Key::F2, &self.config.window)?;
             sleep(Duration::from_millis(
@@ -2861,10 +2892,19 @@ mod app {
         }
 
         fn return_to_primary_fixed(&self) -> bool {
-            if let Err(error) = self.ensure_game_ready_for_input("返回一级界面") {
-                log::error!("返回一级界面前激活并聚焦游戏失败: {error:#}");
-                return false;
-            }
+            self.return_to_primary_by_escape("返回一级界面", false)
+        }
+
+        fn return_to_primary_after_command_failure(&self, command: &str) {
+            log::info!("命令失败后返回一级界面: {}", command);
+            let _ = self.return_to_primary_fixed();
+        }
+
+        fn return_to_primary_from_transient_ui(&self, context: &str) -> bool {
+            self.return_to_primary_by_escape(context, true)
+        }
+
+        fn return_to_primary_by_escape(&self, context: &str, force_first_escape: bool) -> bool {
             let templates = UiTemplateArgs::default().resolve(&self.config);
             let canvas = Canvas {
                 width: self.config.screen.expected_width,
@@ -2875,48 +2915,43 @@ mod app {
             let deadline =
                 Instant::now() + Duration::from_millis(self.config.timing.command.ui_timeout_ms);
 
+            if force_first_escape && !self.press_escape_for_primary_return(context) {
+                return false;
+            }
+
             while Instant::now() < deadline {
                 match load_frame(&frame_args, &canvas, &self.config.window).and_then(|frame| {
                     detect_ui_state(&frame.image, &templates, &self.config.screen)
                 }) {
                     Ok(ui_state) if ui_state.is_primary() => {
-                        log::info!("已返回一级界面: {}", ui_state);
+                        log::info!("{}: 已返回一级界面: {}", context, ui_state);
                         return true;
                     }
                     Ok(ui_state) => {
-                        log::info!("返回一级界面中，当前: {}，按 ESC", ui_state);
+                        log::info!("{}: 当前 {}，按 ESC 返回上一级", context, ui_state);
                     }
                     Err(error) => {
-                        log::error!("返回一级界面检测失败，继续按 ESC: {error:#}");
+                        log::error!("{}: 返回一级界面检测失败，继续按 ESC: {error:#}", context);
                     }
                 }
-                if let Err(error) = press_key(Key::Escape, &self.config.window) {
-                    log::error!("返回一级界面按 ESC 失败: {error:#}");
+                if !self.press_escape_for_primary_return(context) {
                     return false;
                 }
-                sleep(Duration::from_millis(
-                    self.config.timing.command.return_retry_ms,
-                ));
             }
-            log::error!("返回一级界面超时");
+            log::error!("{}: 返回一级界面超时", context);
             false
         }
 
-        fn return_to_primary_after_command_failure(&self, command: &str) {
-            log::info!("命令失败后返回一级界面: {}", command);
-            let _ = self.return_to_primary_fixed();
-        }
-
-        fn return_to_primary_from_transient_ui(&self, context: &str) -> bool {
-            log::info!("{}: 先按 ESC 关闭临时界面", context);
+        fn press_escape_for_primary_return(&self, context: &str) -> bool {
+            log::info!("{}: 按 ESC 返回上一级", context);
             if let Err(error) = press_key(Key::Escape, &self.config.window) {
-                log::error!("{}: 关闭临时界面失败: {error:#}", context);
-            } else {
-                sleep(Duration::from_millis(
-                    self.config.timing.command.return_retry_ms,
-                ));
+                log::error!("{}: 返回一级界面按 ESC 失败: {error:#}", context);
+                return false;
             }
-            self.return_to_primary_fixed()
+            sleep(Duration::from_millis(
+                self.config.timing.command.return_retry_ms,
+            ));
+            true
         }
 
         fn read_hall_info(&self) -> Result<HallInfo> {
@@ -3519,7 +3554,7 @@ mod app {
             sleep(Duration::from_millis(
                 self.config.timing.command.post_settle_ms,
             ));
-            let existing = self.collect_decision_bottoms();
+            let mut screen_lock = self.collect_decision_screen_lock();
             let deadline =
                 Instant::now() + Duration::from_millis(self.config.timing.decision.timeout_ms);
             let template_args = TemplateArgs::default().resolve(&self.config);
@@ -3550,19 +3585,22 @@ mod app {
                     if message.message_type != "blue" {
                         continue;
                     }
-                    if message.text.is_empty()
-                        || is_existing_decision(&message, &existing)
-                        || is_decision_feedback_text(&message.text)
-                    {
+                    if message.text.is_empty() || is_decision_feedback_text(&message.text) {
                         continue;
                     }
-                    match parse_decision_command(&message.text) {
-                        Some(UserDecision::Confirm) => return Ok(UserDecision::Confirm),
-                        Some(UserDecision::Skip) => return Ok(UserDecision::Skip),
-                        Some(UserDecision::SwitchSource) if allow_switch_source => {
+                    let Some(decision) = parse_decision_command(&message.text) else {
+                        continue;
+                    };
+                    if !screen_lock.accept_once(&message) {
+                        continue;
+                    }
+                    match decision {
+                        UserDecision::Confirm => return Ok(UserDecision::Confirm),
+                        UserDecision::Skip => return Ok(UserDecision::Skip),
+                        UserDecision::SwitchSource if allow_switch_source => {
                             return Ok(UserDecision::SwitchSource);
                         }
-                        Some(UserDecision::Ai) if allow_ai => {
+                        UserDecision::Ai if allow_ai => {
                             return Ok(UserDecision::Ai);
                         }
                         _ => {}
@@ -3583,8 +3621,7 @@ mod app {
             }
         }
 
-        fn collect_decision_bottoms(&self) -> HashMap<String, i32> {
-            let mut output = HashMap::new();
+        fn collect_decision_screen_lock(&self) -> DecisionScreenLock {
             let template_args = TemplateArgs::default().resolve(&self.config);
             let canvas = Canvas {
                 width: self.config.screen.expected_width,
@@ -3593,24 +3630,16 @@ mod app {
             };
             let Ok(frame) = load_frame(&FrameArgs { image: None }, &canvas, &self.config.window)
             else {
-                return output;
+                return DecisionScreenLock::default();
             };
             let Ok(messages) = self.scan_chat_with_shared_ocr(&frame.image, &template_args) else {
-                return output;
+                return DecisionScreenLock::default();
             };
-            for message in messages {
-                if message.message_type != "blue" {
-                    continue;
-                }
-                if parse_decision_command(&message.text).is_some() {
-                    let bottom = message.block.y + message.block.height as i32;
-                    output
-                        .entry(message.text)
-                        .and_modify(|value| *value = (*value).max(bottom))
-                        .or_insert(bottom);
-                }
-            }
-            output
+            DecisionScreenLock::from_messages(
+                &messages,
+                &|message_type| message_type == "blue",
+                &|text| parse_decision_command(text).is_some(),
+            )
         }
 
         fn report_no_source(
@@ -3869,13 +3898,6 @@ mod app {
                     )
             }
         }
-    }
-
-    fn is_existing_decision(message: &ChatMessage, existing: &HashMap<String, i32>) -> bool {
-        let bottom = message.block.y + message.block.height as i32;
-        existing
-            .get(&message.text)
-            .is_some_and(|existing_bottom| bottom <= *existing_bottom)
     }
 
     fn elapsed_ms(started: Instant) -> u128 {

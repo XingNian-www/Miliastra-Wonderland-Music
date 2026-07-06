@@ -65,6 +65,16 @@ impl RuntimeState {
         self.hall_expiring_warning_sent = false;
     }
 
+    pub fn clear_hall_countdown_cache(&mut self) -> bool {
+        let had_cache = self.hall_remaining_minutes.is_some()
+            || self.hall_remaining_updated_at.is_some()
+            || self.hall_expiring_warning_sent;
+        if had_cache {
+            self.clear_hall_remaining_minutes();
+        }
+        had_cache
+    }
+
     pub fn hall_remaining_minutes_now(&self) -> Option<u32> {
         let minutes = self.hall_remaining_minutes?;
         if minutes == 0 {
@@ -104,5 +114,32 @@ impl PersistentRuntimeState {
 
     pub fn save(&self) -> Result<()> {
         self.state.save(&self.path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clears_hall_countdown_cache_for_new_visual_session() {
+        let mut state = RuntimeState {
+            hall_remaining_minutes: Some(5),
+            hall_remaining_updated_at: Some(123),
+            hall_expiring_warning_sent: true,
+            ..RuntimeState::default()
+        };
+
+        assert!(state.clear_hall_countdown_cache());
+        assert_eq!(state.hall_remaining_minutes, None);
+        assert_eq!(state.hall_remaining_updated_at, None);
+        assert!(!state.hall_expiring_warning_sent);
+    }
+
+    #[test]
+    fn empty_hall_countdown_cache_is_noop() {
+        let mut state = RuntimeState::default();
+
+        assert!(!state.clear_hall_countdown_cache());
     }
 }

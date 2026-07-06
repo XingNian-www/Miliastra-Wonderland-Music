@@ -18,9 +18,9 @@ on:
         default: 3.6.0
         type: string
       cuda_archs:
-        description: MNN CUDA_ARCHS 值。P100 使用 Pascal / sm_60。
+        description: MNN CUDA_ARCHS 值。P100 使用 6.0 / sm_60。
         required: false
-        default: Pascal
+        default: "6.0"
         type: string
       create_release:
         description: 是否为 CUDA MNN 运行时包创建 GitHub Release。

@@ -325,6 +325,7 @@ moderation:
 | `click_template` | 在 `region` 内等待模板出现，命中后点击 |
 | `wait_template` | 在 `region` 内等待模板出现，不点击 |
 | `wait_template_absent` | 在 `region` 内等待模板消失 |
+| `wait_stable` / `wait_pixels_stable` | 等待 `region` 内像素变化稳定，适合点击后等待面板动画结束 |
 | `click_text` | 在 `region` 内 OCR 查找 `text`，命中后点击 |
 | `wait_text` | 在 `region` 内 OCR 查找 `text`，命中后继续 |
 | `paste` / `paste_text` | 把 `text` 粘贴到当前焦点 |
@@ -347,6 +348,8 @@ moderation:
 | `{{user_command}}` | 用户原始命令文本 |
 
 `config.yaml` 自带一个参考流程：好友私聊 `@过来`，执行 `invite_user`
+
+内置好友发言、邀请和 UID 管理流程也使用同一套原子动作：等待 OCR 文字时会轮询到超时，等待模板时会轮询到出现或消失，打开好友聊天后会等待聊天区域像素稳定再发送文本。
 
 ## 手动调试工具
 

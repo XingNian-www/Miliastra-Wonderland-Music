@@ -19,7 +19,6 @@ pub(super) struct UiLocator {
     canvas: Canvas,
     frame_args: FrameArgs,
     window_config: config::WindowConfig,
-    default_threshold: f32,
     poll_ms: u64,
 }
 
@@ -28,14 +27,12 @@ impl UiLocator {
         canvas: Canvas,
         frame_args: FrameArgs,
         window_config: config::WindowConfig,
-        default_threshold: f32,
         poll_ms: u64,
     ) -> Self {
         Self {
             canvas,
             frame_args,
             window_config,
-            default_threshold,
             poll_ms: poll_ms.max(50),
         }
     }
@@ -66,10 +63,6 @@ pub(super) struct UiRegion<'a> {
 }
 
 impl UiRegion<'_> {
-    pub(super) fn find_template(&self, template: &Path) -> Result<Option<TemplateHit>> {
-        self.find_template_with_threshold(template, self.locator.default_threshold)
-    }
-
     pub(super) fn find_template_with_threshold(
         &self,
         template: &Path,
@@ -132,22 +125,6 @@ impl UiRegion<'_> {
         }
     }
 
-    pub(super) fn click_template(&self, template: &Path) -> Result<Option<TemplateHit>> {
-        self.click_template_with_threshold(template, self.locator.default_threshold)
-    }
-
-    pub(super) fn click_template_with_threshold(
-        &self,
-        template: &Path,
-        threshold: f32,
-    ) -> Result<Option<TemplateHit>> {
-        let Some(hit) = self.find_template_with_threshold(template, threshold)? else {
-            return Ok(None);
-        };
-        self.locator.click_point(hit.center())?;
-        Ok(Some(hit))
-    }
-
     pub(super) fn find_text(
         &self,
         engine: &OcrEngine,
@@ -183,18 +160,6 @@ impl UiRegion<'_> {
             }
         }
         Ok(fallback)
-    }
-
-    pub(super) fn click_text(
-        &self,
-        engine: &OcrEngine,
-        expected: &str,
-    ) -> Result<Option<UiTextHit>> {
-        let Some(hit) = self.find_text(engine, expected)? else {
-            return Ok(None);
-        };
-        self.locator.click_point(hit.center())?;
-        Ok(Some(hit))
     }
 
     pub(super) fn wait_pixels_stable_while<F>(

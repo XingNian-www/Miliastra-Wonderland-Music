@@ -127,6 +127,39 @@ pub(super) fn paste(
     result
 }
 
+pub(super) fn wait_pixels_stable<F>(
+    locator: &UiLocator,
+    region: RectConfig,
+    stability: PixelStability,
+    should_continue: F,
+) -> Result<()>
+where
+    F: FnMut() -> bool,
+{
+    let started = Instant::now();
+    let stable = locator.region(region.into()).wait_pixels_stable_while(
+        stability.timeout_ms,
+        stability.mean_threshold,
+        stability.changed_ratio_threshold,
+        should_continue,
+    )?;
+    log::info!(target: "timing",
+        "原子动作耗时: action=wait_pixels_stable total={}ms timeout={}ms stable={} region={},{},{},{}",
+        elapsed_ms(started),
+        stability.timeout_ms,
+        stable,
+        region.x,
+        region.y,
+        region.width,
+        region.height
+    );
+    if stable {
+        Ok(())
+    } else {
+        Err(anyhow!("custom workflow pixels did not stabilize"))
+    }
+}
+
 pub(super) fn locate_template<F>(
     locator: &UiLocator,
     template: &Path,

@@ -6,11 +6,12 @@ use std::sync::{Mutex, OnceLock};
 use anyhow::{Context, Result, anyhow};
 use image::{DynamicImage, GrayImage, RgbImage};
 use serde::Serialize;
-use template_matching::{Image as MatchImage, MatchTemplateMethod, find_extremes, match_template};
+use template_matching::{Image as MatchImage, MatchTemplateMethod, match_template};
 
 use super::geometry::{Point, Rect, crop_canvas};
 
 static RGB_TEMPLATE_CACHE: OnceLock<Mutex<HashMap<PathBuf, RgbImage>>> = OnceLock::new();
+static GRAY_TEMPLATE_CACHE: OnceLock<Mutex<HashMap<PathBuf, GrayImage>>> = OnceLock::new();
 
 #[derive(Clone, Debug, Serialize)]
 pub(super) struct TemplateHit {
@@ -160,6 +161,21 @@ fn cached_rgb_template(template_path: &Path) -> Result<RgbImage> {
     Ok(image)
 }
 
+fn cached_gray_template(template_path: &Path) -> Result<GrayImage> {
+    let cache = GRAY_TEMPLATE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache
+        .lock()
+        .map_err(|_| anyhow!("template cache mutex poisoned"))?;
+    if let Some(image) = cache.get(template_path) {
+        return Ok(image.clone());
+    }
+    let image = image::open(template_path)
+        .with_context(|| format!("open template {}", template_path.display()))?
+        .to_luma8();
+    cache.insert(template_path.to_path_buf(), image.clone());
+    Ok(image)
+}
+
 fn color_sad_at(
     haystack: &RgbImage,
     template: &RgbImage,
@@ -200,22 +216,33 @@ pub(super) fn best_template_hit(
         Some(rect) => crop_canvas(image, rect)?,
         None => image.clone(),
     };
-    let template = image::open(template_path)
-        .with_context(|| format!("open template {}", template_path.display()))?;
-    if template.width() > haystack.width() || template.height() > haystack.height() {
+    let template_gray = cached_gray_template(template_path)?;
+    if template_gray.width() > haystack.width() || template_gray.height() > haystack.height() {
         return Ok(None);
     }
 
     let haystack_gray = haystack.to_luma8();
-    let template_gray = template.to_luma8();
-    let result = match_template(
-        to_match_image(&haystack_gray),
-        to_match_image(&template_gray),
-        MatchTemplateMethod::SumOfAbsoluteDifferences,
-    );
-    let extremes = find_extremes(&result);
-    let max_sad = (template_gray.width() * template_gray.height()).max(1) as f32;
-    let score = 1.0 - extremes.min_value / max_sad;
+    let max_sad = template_gray.width() as u64 * template_gray.height() as u64 * 255;
+    if max_sad == 0 {
+        return Ok(None);
+    }
+    let max_allowed_sad = ((1.0 - threshold).clamp(0.0, 1.0) * max_sad as f32) as u64;
+    let mut best_sad = max_allowed_sad.saturating_add(1);
+    let mut best_x = 0;
+    let mut best_y = 0;
+
+    for y in 0..=(haystack_gray.height() - template_gray.height()) {
+        for x in 0..=(haystack_gray.width() - template_gray.width()) {
+            let sad = gray_sad_at(&haystack_gray, &template_gray, x, y, best_sad);
+            if sad < best_sad {
+                best_sad = sad;
+                best_x = x;
+                best_y = y;
+            }
+        }
+    }
+
+    let score = 1.0 - best_sad as f32 / max_sad as f32;
     if score < threshold {
         return Ok(None);
     }
@@ -223,12 +250,42 @@ pub(super) fn best_template_hit(
     let base_y = search_rect.map(|rect| rect.y).unwrap_or(0);
     Ok(Some(TemplateHit {
         kind: "template".to_string(),
-        x: base_x + extremes.min_value_location.0 as i32,
-        y: base_y + extremes.min_value_location.1 as i32,
+        x: base_x + best_x as i32,
+        y: base_y + best_y as i32,
         width: template_gray.width(),
         height: template_gray.height(),
         score,
     }))
+}
+
+fn gray_sad_at(
+    haystack: &GrayImage,
+    template: &GrayImage,
+    x: u32,
+    y: u32,
+    max_allowed_sad: u64,
+) -> u64 {
+    let haystack_width = haystack.width() as usize;
+    let template_width = template.width() as usize;
+    let template_height = template.height() as usize;
+    let x = x as usize;
+    let y = y as usize;
+    let haystack_data = haystack.as_raw();
+    let template_data = template.as_raw();
+    let mut sad = 0u64;
+
+    for row in 0..template_height {
+        let haystack_offset = (y + row) * haystack_width + x;
+        let template_offset = row * template_width;
+        for column in 0..template_width {
+            sad += haystack_data[haystack_offset + column]
+                .abs_diff(template_data[template_offset + column]) as u64;
+            if sad > max_allowed_sad {
+                return sad;
+            }
+        }
+    }
+    sad
 }
 
 fn to_match_image(image: &GrayImage) -> MatchImage<'static> {
@@ -264,4 +321,49 @@ fn compare_hits_top_left(left: &TemplateHit, right: &TemplateHit) -> Ordering {
         .cmp(&(right.y / 10))
         .then_with(|| left.x.cmp(&right.x))
         .then_with(|| left.y.cmp(&right.y))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use image::{DynamicImage, Luma};
+
+    use super::*;
+
+    #[test]
+    fn best_template_hit_finds_best_gray_sad_match() {
+        let mut haystack = GrayImage::from_pixel(6, 5, Luma([0]));
+        let template = GrayImage::from_fn(2, 2, |x, y| match (x, y) {
+            (0, 0) => Luma([10]),
+            (1, 0) => Luma([40]),
+            (0, 1) => Luma([90]),
+            _ => Luma([160]),
+        });
+        for y in 0..template.height() {
+            for x in 0..template.width() {
+                haystack.put_pixel(3 + x, 2 + y, *template.get_pixel(x, y));
+            }
+        }
+
+        let path = std::env::temp_dir().join(format!(
+            "miliastra-template-test-{}-{}.png",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        template.save(&path).expect("save template");
+
+        let hit = best_template_hit(&DynamicImage::ImageLuma8(haystack), None, &path, 0.99)
+            .expect("match template")
+            .expect("template hit");
+        let _ = fs::remove_file(&path);
+
+        assert_eq!((hit.x, hit.y), (3, 2));
+        assert_eq!((hit.width, hit.height), (2, 2));
+        assert!(hit.score > 0.999);
+    }
 }

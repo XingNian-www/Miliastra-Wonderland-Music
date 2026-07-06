@@ -420,8 +420,9 @@ custom_workflows:
   # 自定义流程默认超时、轮询和步骤等待统一在 timing.workflow 中配置
   # 自定义模板名到图片路径的映射，步骤里通过 template 引用这里的名字
   templates: {}
-  # 支持的步骤：activate_game/focus_game/key/click/click_template/wait_template/wait_template_absent/click_text/wait_text/paste/send_chat/send_current_chat/send_friend_message/invite_user/return_primary/sleep
+  # 支持的步骤：activate_game/focus_game/key/click/click_template/wait_template/wait_template_absent/wait_stable/click_text/wait_text/paste/send_chat/send_current_chat/send_friend_message/invite_user/return_primary/sleep
   # wait_template_absent 默认在模板消失后继续等待像素稳定；可在步骤上设置 stable_after_absent: false 关闭
+  # wait_stable 会等待 region 内像素变化稳定，适合点击后等待面板动画结束
   # 支持变量：{{username}}、{{args}}、{{arg1}}、{{arg2}}、{{command}}、{{workflow}}、{{message_type}}
   # send_friend_message 默认发送给触发命令的好友，也可以用 target 指定好友名
   # confirm_message_types 控制确认命令来源：[blue] 为大厅，[pink] 为好友私聊，留空表示不限

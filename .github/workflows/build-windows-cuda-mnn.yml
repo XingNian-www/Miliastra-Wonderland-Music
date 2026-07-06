@@ -123,7 +123,7 @@ jobs:
           $vsDevCmd = Join-Path $vsInstall 'Common7\Tools\VsDevCmd.bat'
           $configure = @"
           call "$vsDevCmd" -arch=x64 -host_arch=x64
-          cmake -S "$buildDrive\" -B "$buildDir" -G Ninja ^
+          cmake -S "$buildDrive/" -B "$buildDir" -G Ninja ^
             -DCMAKE_BUILD_TYPE=Release ^
             -DMNN_CUDA=ON ^
             -DCUDA_ARCHS=${{ inputs.cuda_archs }} ^

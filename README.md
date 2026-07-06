@@ -27,7 +27,7 @@ GitHub Actions 工作流在 `.github/workflows/build-windows-exe.yml`
 - 在 GitHub Actions 页面手动执行 `workflow_dispatch`
 - 推送到 `main` 或 `dev`，并且本次推送包含 `Cargo.toml`
 
-推送触发时会比较 `Cargo.toml` 的 `[package].version`。只有版本号真的变化才会继续构建、打包和创建 Release；普通 `Cargo.toml` 改动会跳过构建
+推送触发时会自动构建并上传可运行 artifact。创建 GitHub Release 仍然只在手动执行 workflow，或 `Cargo.toml` 的 `[package].version` 发生变化时进行
 
 构建产物是 `x86_64-pc-windows-msvc`，会下载 PP-OCRv6 小模型：
 
@@ -53,14 +53,14 @@ miliastra-wonderland-music-windows-x64/
 
 ## 本地构建
 
-正式发布使用 Windows MSVC 目标，并使用仓库内置的 MNN 3.6.0 Windows x64 动态库：
+正式发布使用 Windows MSVC 目标，并使用仓库内置的 MNN 3.6.0 Windows x64 头文件和导入库编译 EXE：
 
 ```powershell
 rustup default stable-x86_64-pc-windows-msvc
 cargo build --release
 ```
 
-仓库包含所需的 MNN 运行文件：
+仓库包含所需的 MNN 编译和运行文件：
 
 ```text
 vendor/mnn/3.6.0/windows-x64/include/
@@ -68,7 +68,9 @@ vendor/mnn/3.6.0/windows-x64/lib/MNN.lib
 vendor/mnn/3.6.0/windows-x64/bin/MNN.dll
 ```
 
-构建时会把 `MNN.dll` 复制到程序旁边。识别后端使用 CPU。发布路径不支持 CUDA、Vulkan、OpenCL、源码编译版 MNN 或其他预编译 MNN 包
+`cargo build` 只编译 EXE，不再自动把 `MNN.dll` 复制到 target 目录。发布包 workflow 会显式把仓库内置的 CPU 版 `MNN.dll` 放到 EXE 旁边；本地直接运行 target 里的 EXE 时，需要手动把 ABI 兼容的 `MNN.dll` 放到 EXE 旁边，或把 DLL 所在目录加入 `PATH`
+
+EXE 与 `MNN.dll` 分开编译。普通发布包默认使用 CPU OCR；CUDA MNN 运行时包可以单独构建，使用时把其中的 `MNN.dll` 和 CUDA runtime DLL 放到 EXE 旁边，并把 `config.yaml` 中的 `ocr.backend_priority` 改为先 `cuda` 后 `cpu`。默认的 CUDA 12.9.1 运行时要求 Windows NVIDIA 驱动 576.57 或更新版本，V100 推荐 R580
 
 运行机器还需要安装 Microsoft Visual C++ Redistributable 2015-2022 x64，因为官方 MNN 动态库依赖 `MSVCP140.dll`、`VCRUNTIME140.dll` 和 `VCRUNTIME140_1.dll`
 

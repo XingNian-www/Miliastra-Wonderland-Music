@@ -520,7 +520,7 @@ fn run_ocr_gpu_probe(config_path: &Path) -> Result<()> {
     }
 
     if !gpu_checked {
-        println!("GPU 结论: 未检测，ocr.backend_priority 未包含 vulkan/opencl");
+        println!("GPU 结论: 未检测，ocr.backend_priority 未包含 cuda/vulkan/opencl");
     } else if gpu_available {
         println!("GPU 结论: 可用，至少一个 GPU 后端完成初始化和首次推理");
     } else {

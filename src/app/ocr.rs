@@ -258,6 +258,7 @@ fn probe_ocr_backend(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OcrBackendChoice {
+    Cuda,
     Vulkan,
     OpenCl,
     Cpu,
@@ -266,6 +267,7 @@ enum OcrBackendChoice {
 impl OcrBackendChoice {
     fn name(self) -> &'static str {
         match self {
+            Self::Cuda => "cuda",
             Self::Vulkan => "vulkan",
             Self::OpenCl => "opencl",
             Self::Cpu => "cpu",
@@ -273,11 +275,12 @@ impl OcrBackendChoice {
     }
 
     fn is_gpu(self) -> bool {
-        matches!(self, Self::Vulkan | Self::OpenCl)
+        matches!(self, Self::Cuda | Self::Vulkan | Self::OpenCl)
     }
 
     fn to_backend(self) -> Backend {
         match self {
+            Self::Cuda => Backend::CUDA,
             Self::Vulkan => Backend::Vulkan,
             Self::OpenCl => Backend::OpenCL,
             Self::Cpu => Backend::CPU,
@@ -302,6 +305,7 @@ fn resolve_ocr_backends(values: &[String]) -> Vec<OcrBackendChoice> {
 
 fn parse_ocr_backend(value: &str) -> Option<OcrBackendChoice> {
     match value.trim().to_ascii_lowercase().as_str() {
+        "cuda" => Some(OcrBackendChoice::Cuda),
         "vulkan" => Some(OcrBackendChoice::Vulkan),
         "opencl" | "open-cl" => Some(OcrBackendChoice::OpenCl),
         "cpu" => Some(OcrBackendChoice::Cpu),
@@ -432,4 +436,33 @@ fn compare_rect_top_left(left: Rect, right: Rect) -> Ordering {
 
 fn elapsed_ms(started: Instant) -> u128 {
     started.elapsed().as_millis()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn backend_values(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn resolves_cuda_backend_with_cpu_fallback() {
+        assert_eq!(
+            resolve_ocr_backends(&backend_values(&["cuda"])),
+            vec![OcrBackendChoice::Cuda, OcrBackendChoice::Cpu]
+        );
+    }
+
+    #[test]
+    fn resolves_backend_priority_case_insensitively_and_deduplicates() {
+        assert_eq!(
+            resolve_ocr_backends(&backend_values(&[" CUDA ", "open-cl", "CUDA", "cpu"])),
+            vec![
+                OcrBackendChoice::Cuda,
+                OcrBackendChoice::OpenCl,
+                OcrBackendChoice::Cpu
+            ]
+        );
+    }
 }

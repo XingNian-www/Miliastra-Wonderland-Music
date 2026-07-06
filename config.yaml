@@ -133,7 +133,7 @@ ocr:
   min_confidence: 0.9
   # OCR 线程数
   threads: 4
-  # OCR 后端优先级，默认只使用 CPU OCR
+  # OCR 后端优先级；可用值: cuda, vulkan, opencl, cpu。默认只使用 CPU OCR
   backend_priority:
     - cpu
   # 检测模型最长边限制；保持 960 与 PaddleOCR/BetterGI 常用配置一致

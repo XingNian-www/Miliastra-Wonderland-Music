@@ -1,0 +1,233 @@
+name: 构建 Windows CUDA MNN
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 发布版本，例如 v2.7.0。留空时使用 Cargo.toml 版本。
+        required: false
+        type: string
+      cuda_version:
+        description: 用于编译 MNN 的 CUDA Toolkit 版本。
+        required: false
+        default: 12.3.2
+        type: string
+      mnn_tag:
+        description: MNN 源码 tag。应与 vendor/mnn 版本保持一致。
+        required: false
+        default: 3.6.0
+        type: string
+      cuda_archs:
+        description: MNN CUDA_ARCHS 值。V100 使用 Volta / sm_70。
+        required: false
+        default: Volta
+        type: string
+      create_release:
+        description: 是否为 CUDA 包创建 GitHub Release。
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  LIBCLANG_PATH: C:\Program Files\LLVM\bin
+  OCR_MODEL_BASE_URL: https://raw.githubusercontent.com/zibo-chen/rust-paddle-ocr/next/models
+
+jobs:
+  build-windows-cuda-mnn:
+    name: 构建 Windows x64 CUDA MNN
+    runs-on: windows-2022
+    timeout-minutes: 360
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v5
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: 缓存 Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-msvc-cuda-mnn
+
+      - name: 安装 CUDA Toolkit
+        id: cuda-toolkit
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: ${{ inputs.cuda_version }}
+          method: network
+
+      - name: 检查 CUDA 工具
+        shell: pwsh
+        run: |
+          nvcc --version
+          Write-Host "CUDA_PATH=$env:CUDA_PATH"
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) {
+            choco install ninja -y --no-progress
+          }
+          ninja --version
+
+      - name: 缓存 OCR 模型
+        uses: actions/cache@v4
+        with:
+          path: models
+          key: pp-ocrv6-small-models-v1
+
+      - name: 下载 PP-OCRv6 small 模型
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path models | Out-Null
+          $files = @(
+            'PP-OCRv6_small_det.mnn',
+            'PP-OCRv6_small_rec.mnn',
+            'ppocr_keys_v6_small.txt'
+          )
+          foreach ($file in $files) {
+            $path = "models/$file"
+            if (-not (Test-Path $path)) {
+              Invoke-WebRequest -Uri "$env:OCR_MODEL_BASE_URL/$file" -OutFile $path
+            }
+          }
+
+      - name: 拉取 MNN 源码
+        shell: pwsh
+        run: |
+          $source = 'C:\mnn-src'
+          if (Test-Path $source) {
+            Remove-Item -Path $source -Recurse -Force
+          }
+          git clone --depth 1 --branch '${{ inputs.mnn_tag }}' https://github.com/alibaba/MNN.git $source
+
+      - name: 编译 CUDA 版 MNN.dll
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $source = 'C:\mnn-src'
+          $buildDrive = 'M:'
+          $buildDir = "$buildDrive\build-cuda-v100"
+
+          subst $buildDrive /D 2>$null
+          subst $buildDrive $source
+
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsInstall = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vsInstall) {
+            throw 'Cannot locate Visual Studio C++ tools'
+          }
+          $vsDevCmd = Join-Path $vsInstall 'Common7\Tools\VsDevCmd.bat'
+          $configure = @"
+          call "$vsDevCmd" -arch=x64 -host_arch=x64
+          cmake -S "$buildDrive\" -B "$buildDir" -G Ninja ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DMNN_CUDA=ON ^
+            -DCUDA_ARCHS=${{ inputs.cuda_archs }} ^
+            -DMNN_CUDA_NATIVE_ARCH=ON ^
+            -DMNN_BUILD_SHARED_LIBS=ON ^
+            -DMNN_BUILD_TOOLS=OFF ^
+            -DMNN_BUILD_CONVERTER=OFF ^
+            -DMNN_BUILD_TRAIN=OFF ^
+            -DMNN_BUILD_OPENCV=OFF ^
+            -DMNN_IMGCODECS=OFF ^
+            -DMNN_OPENCL=OFF ^
+            -DMNN_VULKAN=OFF ^
+            -DMNN_WIN_RUNTIME_MT=ON ^
+            -DMNN_SUPPORT_TRANSFORMER_FUSE=OFF
+          cmake --build "$buildDir" --target MNN --config Release --parallel 4
+          "@
+          $cmdPath = Join-Path $env:RUNNER_TEMP 'build-mnn-cuda.cmd'
+          Set-Content -Path $cmdPath -Value $configure -Encoding ASCII
+          cmd /c $cmdPath
+
+          Copy-Item "$buildDir\MNN.dll" 'vendor\mnn\3.6.0\windows-x64\bin\MNN.dll' -Force
+          Copy-Item "$buildDir\MNN.lib" 'vendor\mnn\3.6.0\windows-x64\lib\MNN.lib' -Force
+
+          subst $buildDrive /D
+
+      - name: 使用 CUDA MNN 编译 release exe
+        run: cargo build --release --target x86_64-pc-windows-msvc --locked
+
+      - name: 解析发布版本
+        id: version
+        shell: pwsh
+        run: |
+          $inputVersion = '${{ inputs.version }}'.Trim()
+          if ($inputVersion) {
+            $version = $inputVersion
+          } else {
+            $cargoToml = Get-Content Cargo.toml -Raw
+            if ($cargoToml -notmatch '(?m)^version\s*=\s*"([^"]+)"') {
+              throw 'Cannot read package version from Cargo.toml'
+            }
+            $version = "v$($Matches[1])"
+          }
+          if (-not $version.StartsWith('v')) {
+            $version = "v$version"
+          }
+          $suffix = "cuda${{ inputs.cuda_version }}-v100"
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "release_tag=$version-$suffix" >> $env:GITHUB_OUTPUT
+          "zip=miliastra-wonderland-music-windows-x64-$suffix-$version.zip" >> $env:GITHUB_OUTPUT
+          "artifact=miliastra-wonderland-music-windows-x64-$suffix" >> $env:GITHUB_OUTPUT
+
+      - name: 准备 CUDA 产物
+        shell: pwsh
+        run: |
+          $dist = 'dist/${{ steps.version.outputs.artifact }}'
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          Copy-Item 'target/x86_64-pc-windows-msvc/release/miliastra-wonderland-music.exe' $dist
+          Copy-Item 'target/x86_64-pc-windows-msvc/release/MNN.dll' $dist
+          Copy-Item 'assets' $dist -Recurse
+          Copy-Item 'models' $dist -Recurse
+          Copy-Item 'config.yaml' $dist
+          Copy-Item 'README.md' $dist
+
+          $cudaBin = Join-Path $env:CUDA_PATH 'bin'
+          $cudaRuntimeDlls = @(
+            'cudart64_*.dll',
+            'cublas64_*.dll',
+            'cublasLt64_*.dll'
+          )
+          foreach ($pattern in $cudaRuntimeDlls) {
+            Get-ChildItem -Path $cudaBin -Filter $pattern -ErrorAction SilentlyContinue |
+              Copy-Item -Destination $dist -Force
+          }
+
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsInstall = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $vsDevCmd = Join-Path $vsInstall 'Common7\Tools\VsDevCmd.bat'
+          $dumpCmd = @"
+          call "$vsDevCmd" -arch=x64 -host_arch=x64
+          dumpbin /dependents "$dist\MNN.dll" > "$dist\MNN-dependents.txt"
+          "@
+          $cmdPath = Join-Path $env:RUNNER_TEMP 'dump-mnn-dependents.cmd'
+          Set-Content -Path $cmdPath -Value $dumpCmd -Encoding ASCII
+          cmd /c $cmdPath
+
+      - name: 打包 CUDA release zip
+        shell: pwsh
+        run: |
+          Compress-Archive `
+            -Path 'dist/${{ steps.version.outputs.artifact }}' `
+            -DestinationPath 'dist/${{ steps.version.outputs.zip }}' `
+            -Force
+
+      - name: 上传 CUDA 产物
+        uses: actions/upload-artifact@v5
+        with:
+          name: ${{ steps.version.outputs.artifact }}
+          path: dist/${{ steps.version.outputs.artifact }}
+
+      - name: 创建 CUDA GitHub Release
+        if: ${{ inputs.create_release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.release_tag }}
+          name: Miliastra Wonderland Music ${{ steps.version.outputs.version }} CUDA 12 V100
+          files: dist/${{ steps.version.outputs.zip }}
+          generate_release_notes: true

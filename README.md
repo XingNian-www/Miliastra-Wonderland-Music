@@ -70,7 +70,7 @@ vendor/mnn/3.6.0/windows-x64/bin/MNN.dll
 
 `cargo build` 只编译 EXE，不再自动把 `MNN.dll` 复制到 target 目录。发布包 workflow 会显式把仓库内置的 CPU 版 `MNN.dll` 放到 EXE 旁边；本地直接运行 target 里的 EXE 时，需要手动把 ABI 兼容的 `MNN.dll` 放到 EXE 旁边，或把 DLL 所在目录加入 `PATH`
 
-EXE 与 `MNN.dll` 分开编译。普通发布包默认使用 CPU OCR；CUDA MNN 运行时包可以单独构建，使用时把其中的 `MNN.dll` 和 CUDA runtime DLL 放到 EXE 旁边，并把 `config.yaml` 中的 `ocr.backend_priority` 改为先 `cuda` 后 `cpu`。默认的 CUDA 12.9.1 运行时要求 Windows NVIDIA 驱动 576.57 或更新版本，V100 推荐 R580
+EXE 与 `MNN.dll` 分开编译。普通发布包默认使用 CPU OCR；CUDA MNN 运行时包可以单独构建，使用时把其中的 `MNN.dll` 和 CUDA runtime DLL 放到 EXE 旁边，并把 `config.yaml` 中的 `ocr.backend_priority` 改为先 `cuda` 后 `cpu`。默认的 CUDA 12.4.1 运行时面向 P100/Pascal，要求 Windows NVIDIA 驱动 551.78 或更新版本
 
 运行机器还需要安装 Microsoft Visual C++ Redistributable 2015-2022 x64，因为官方 MNN 动态库依赖 `MSVCP140.dll`、`VCRUNTIME140.dll` 和 `VCRUNTIME140_1.dll`
 

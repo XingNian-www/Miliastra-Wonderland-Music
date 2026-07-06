@@ -10,7 +10,7 @@ on:
       cuda_version:
         description: 用于编译 MNN 的 CUDA Toolkit 版本。
         required: false
-        default: 12.9.1
+        default: 12.4.1
         type: string
       mnn_tag:
         description: MNN 源码 tag。应与 vendor/mnn 版本保持一致。
@@ -18,9 +18,9 @@ on:
         default: 3.6.0
         type: string
       cuda_archs:
-        description: MNN CUDA_ARCHS 值。V100 使用 Volta / sm_70。
+        description: MNN CUDA_ARCHS 值。P100 使用 Pascal / sm_60。
         required: false
-        default: Volta
+        default: Pascal
         type: string
       create_release:
         description: 是否为 CUDA MNN 运行时包创建 GitHub Release。
@@ -74,8 +74,8 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $source = 'C:\mnn-src'
           $buildDrive = 'M:'
-          $buildDir = "$buildDrive\build-cuda-v100"
-          $buildDirOnDisk = "$source\build-cuda-v100"
+          $buildDir = "$buildDrive\build-cuda-p100"
+          $buildDirOnDisk = "$source\build-cuda-p100"
 
           subst $buildDrive /D 2>$null
           subst $buildDrive $source
@@ -141,7 +141,7 @@ jobs:
           if (-not $version.StartsWith('v')) {
             $version = "v$version"
           }
-          $suffix = "mnn-cuda${{ inputs.cuda_version }}-v100"
+          $suffix = "mnn-cuda${{ inputs.cuda_version }}-p100"
           "version=$version" >> $env:GITHUB_OUTPUT
           "release_tag=$version-$suffix" >> $env:GITHUB_OUTPUT
           "zip=miliastra-wonderland-music-windows-x64-$suffix-$version.zip" >> $env:GITHUB_OUTPUT
@@ -179,8 +179,8 @@ jobs:
              - cpu
 
           Driver requirements:
-          - The default CUDA 12.9.1 runtime requires NVIDIA driver 576.57 or newer on Windows.
-          - R580 is recommended for V100. Older 538.xx vGPU/GRID drivers are not compatible with CUDA 12.9.1.
+          - The default CUDA 12.4.1 runtime requires NVIDIA driver 551.78 or newer on Windows.
+          - P100 uses Pascal / sm_60. Older 538.xx vGPU/GRID drivers are not compatible with CUDA 12.4.1.
 
           The EXE and MNN.dll are built separately. The EXE still requires an ABI-compatible MNN.dll named MNN.dll at runtime.
           "@ | Set-Content -Path "$dist\README-CUDA-MNN.txt" -Encoding UTF8

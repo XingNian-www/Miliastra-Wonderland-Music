@@ -398,8 +398,8 @@ http://127.0.0.1:18888
 | `/skip-next` | 下一首 |
 | `/skip-prev` | 上一首 |
 | `/volume?volume=30` | 设置音量 |
-| `/searchPlay?keyword=...&source=qqmusic` | 搜索并播放，返回播放结果 |
-| `/searchSource?keyword=...&source=netease` | 指定源搜索并播放 |
+| `/searchPlay?keyword=...&source=qqmusic` | 远程点歌入主业务队列 |
+| `/searchSource?keyword=...&source=netease` | 指定源远程点歌入主业务队列 |
 | `/search?keyword=...&source=qqmusic` | 搜索歌曲 |
 | `/open-scheme?uri=fuo://...` | 播放 FeelUOwn URI |
 | `/queue` | 查看队列 |
@@ -411,16 +411,15 @@ http://127.0.0.1:18888
 | `/history` | 查看最近 30 条接口调用记录 |
 | `/clear-history` | 清空接口调用记录 |
 | `/monitor` | 查看监控面板数据 |
+| `/chat/send?text=...` | 控制台发言入主业务队列 |
+| `/screenshot?quality=88` | 手动获取一次游戏截图，返回 JPEG |
 | `/health` | 健康检查 |
-| `/admin-status` | 管理员权限状态 |
-| `/restart-admin` | 返回不自动提权重启的说明 |
-| `/active-window` | 查看当前前台窗口；配置允许时可尝试切回目标窗口 |
 | `/ai/recognize` | AI 文本识别测试 |
 | `/ai/match` | AI 匹配测试 |
 | `/ai/pick` | AI 候选选择测试 |
-| `/ai/search?keyword=...` | AI 点歌搜索测试 |
+| `/ai/search?keyword=...` | 远程 AI 点歌入主业务队列 |
 
-`/ai/search` 会先调用 FeelUOwn 搜索候选，再让 AI 从候选中选择 URI，不会让 AI 自己改写搜索词
+远程点歌、远程 AI 点歌和控制台发言只返回入队结果，具体搜索、AI 匹配、播放和游戏内反馈由主业务线程串行执行。程序必须以管理员权限启动，Web 面板不提供管理员状态或窗口状态诊断。
 
 ## 配置说明
 
@@ -432,7 +431,7 @@ http://127.0.0.1:18888
 
 | 配置段 | 说明 |
 | --- | --- |
-| `window` | 目标进程名、画面尺寸、是否允许接口自动激活窗口 |
+| `window` | 目标进程名、画面尺寸、业务流程激活窗口参数 |
 | `screen` | 截图尺寸、聊天区、一级/二级界面检测区、大厅 OCR 区域 |
 | `timing` | 扫描、点击、发送、邀请、点歌确认、播放监控等时间参数 |
 | `ocr` | OCR 模型、置信度、文本框参数、聊天变化检测参数 |

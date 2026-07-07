@@ -1,10 +1,9 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::TcpListener;
-use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
 use axum::Router;
@@ -14,27 +13,15 @@ use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use axum::response::Response;
 use axum::routing::any;
+use image::ColorType;
+use image::codecs::jpeg::JpegEncoder;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::runtime::Builder;
 use url::form_urlencoded;
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM};
-use windows::Win32::Security::Authentication::Identity::{GetUserNameExW, NameSamCompatible};
-use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
-use windows::Win32::System::Threading::{
-    GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_NAME_WIN32,
-    PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
-};
-use windows::Win32::UI::Input::KeyboardAndMouse::{
-    INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput, VIRTUAL_KEY,
-};
-use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
-    SW_RESTORE, SetForegroundWindow, ShowWindow,
-};
-use windows::core::BOOL;
 
 use super::ai;
+use super::command::{self, ParsedCommand, PendingCommand, SongCommand, SongSource, UserCommand};
 use super::config::AppConfig;
 use super::feeluown::FeelUOwnClient;
 use super::monitor::{MonitorQueueItem, MonitorShared};
@@ -43,7 +30,7 @@ use super::runtime_state::PersistentRuntimeState;
 
 const MAX_ACTIVE_CONNECTIONS: usize = 32;
 const PAGE: &str = include_str!("page.html");
-const KNOWN_ROUTES: &str = "/status, /play, /pause, /skip-next, /skip-prev, /volume, /searchPlay, /searchSource, /search, /open-scheme, /history, /clear-history, /health, /monitor, /admin-status, /restart-admin, /active-window, /queue, /queue/add, /queue/remove, /queue/clear, /state, /state/save, /ai/recognize, /ai/match, /ai/pick, /ai/search";
+const KNOWN_ROUTES: &str = "/status, /play, /pause, /skip-next, /skip-prev, /volume, /searchPlay, /searchSource, /search, /open-scheme, /history, /clear-history, /health, /monitor, /screenshot, /queue, /queue/add, /queue/remove, /queue/clear, /state, /state/save, /chat/send, /ai/recognize, /ai/match, /ai/pick, /ai/search";
 
 #[derive(Clone)]
 pub struct HttpSharedState {
@@ -53,6 +40,7 @@ pub struct HttpSharedState {
     pub monitor: MonitorShared,
     pub history: Arc<Mutex<VecDeque<HistoryItem>>>,
     pub active_connections: Arc<AtomicUsize>,
+    pending: Arc<(Mutex<VecDeque<super::PendingTask>>, Condvar)>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -80,10 +68,11 @@ struct AppError {
 }
 
 impl HttpSharedState {
-    pub fn new(
+    pub(super) fn new(
         config: AppConfig,
         queue: Arc<Mutex<PersistentQueue>>,
         runtime_state: Arc<Mutex<PersistentRuntimeState>>,
+        pending: Arc<(Mutex<VecDeque<super::PendingTask>>, Condvar)>,
         monitor: MonitorShared,
     ) -> Self {
         Self {
@@ -93,6 +82,7 @@ impl HttpSharedState {
             monitor,
             history: Arc::new(Mutex::new(VecDeque::new())),
             active_connections: Arc::new(AtomicUsize::new(0)),
+            pending,
         }
     }
 }
@@ -235,6 +225,9 @@ fn handle_request(
             cors_headers(&request, &state.config.http.host, state.config.http.port),
         ));
     }
+    if request.path == "/screenshot" {
+        return screenshot_response(&request, state);
+    }
 
     let routed = route(&request.path, &request.query, state);
     let (body, ok) = match routed {
@@ -301,46 +294,8 @@ fn route(
             client.set_volume(volume).map_err(internal_error)?;
             Ok(format!("音量已设置为 {}", volume))
         }
-        "/searchPlay" => {
-            let keyword = normalize_keyword(query_value(query, "keyword"))?;
-            let source = normalize_source(query_value(query, "source"))?;
-            let prefer = parse_bool(query_value_or(
-                query,
-                "preferAccompaniment",
-                "accompaniment",
-            ));
-            let result = client
-                .play_keyword(&keyword, &source, prefer)
-                .map_err(|error| AppError {
-                    status: if error.to_string().contains("平台无对应歌曲音源") {
-                        404
-                    } else {
-                        500
-                    },
-                    message: error.to_string(),
-                })?;
-            set_pause_flags(state, false, false)?;
-            Ok(result.message)
-        }
-        "/searchSource" => {
-            let keyword = normalize_keyword(query_value(query, "keyword"))?;
-            let source = normalize_source(query_value(query, "source"))?;
-            let prefer = parse_bool(query_value_or(
-                query,
-                "preferAccompaniment",
-                "accompaniment",
-            ));
-            client
-                .play_keyword(&keyword, &source, prefer)
-                .map_err(internal_error)?;
-            set_pause_flags(state, false, false)?;
-            Ok(format!(
-                "正在搜索: {} ({}){}",
-                keyword,
-                if source.is_empty() { "默认" } else { &source },
-                if prefer { " (伴奏优先)" } else { "" }
-            ))
-        }
+        "/searchPlay" => enqueue_remote_song(query, state, false),
+        "/searchSource" => enqueue_remote_song(query, state, false),
         "/search" => {
             let keyword = normalize_keyword(query_value(query, "keyword"))?;
             let source = normalize_optional_source(query_value(query, "source"))?;
@@ -358,14 +313,7 @@ fn route(
         "/queue/clear" => queue_clear(state),
         "/state" => state_json(state),
         "/state/save" => state_save(query, state),
-        "/admin-status" => admin_status_json(),
-        "/restart-admin" => Ok(json!({
-            "ok": false,
-            "supported": true,
-            "reason": "程序不会自动以管理员权限重启"
-        })
-        .to_string()),
-        "/active-window" => active_window_json(query, state),
+        "/chat/send" => chat_send(query, state),
         "/ai/recognize" => ai::recognize_with_query(&state.config.ai, &state.config.timing, query)
             .map_err(|error| AppError {
                 status: if is_client_error(&error.to_string()) {
@@ -399,25 +347,7 @@ fn route(
                 }
             })
         }
-        "/ai/search" => {
-            let keyword = normalize_keyword(query_value(query, "keyword"))?;
-            let prefer = parse_bool(query_value_or(
-                query,
-                "preferAccompaniment",
-                "accompaniment",
-            ));
-            if !ai::AiClient::new(&state.config.ai, &state.config.timing).enabled() {
-                return Err(bad_request("AI点歌未启用，请先配置 ai.api_key"));
-            }
-            let ai_client = ai::AiClient::new(&state.config.ai, &state.config.timing);
-            let result = ai_client
-                .search_and_pick(&client, &keyword, prefer)
-                .map_err(|error| AppError {
-                    status: 500,
-                    message: error.to_string(),
-                })?;
-            serde_json::to_string(&result).map_err(internal_error)
-        }
+        "/ai/search" => enqueue_remote_song(query, state, true),
         "/history" => history_json(state),
         "/clear-history" => clear_history(state),
         "/monitor" => monitor_json(state),
@@ -427,6 +357,88 @@ fn route(
             message: format!("未知接口，可用: {}", KNOWN_ROUTES),
         }),
     }
+}
+
+fn enqueue_remote_song(
+    query: &[(String, String)],
+    state: &HttpSharedState,
+    ai_assisted: bool,
+) -> std::result::Result<String, AppError> {
+    let keyword = normalize_keyword(query_value(query, "keyword"))?;
+    let source = normalize_source(query_value(query, "source"))?;
+    let prefer_accompaniment = parse_bool(query_value_or(
+        query,
+        "preferAccompaniment",
+        "accompaniment",
+    ));
+    let pending = remote_song_command(keyword, source, prefer_accompaniment, ai_assisted)?;
+    let command = pending.parsed.raw.clone();
+    let queued = enqueue_pending_command(state, pending)?;
+    Ok(json!({
+        "ok": true,
+        "queued": queued > 0,
+        "duplicate": queued == 0,
+        "position": queued,
+        "command": command,
+    })
+    .to_string())
+}
+
+fn remote_song_command(
+    keyword: String,
+    source: String,
+    prefer_accompaniment: bool,
+    ai_assisted: bool,
+) -> std::result::Result<PendingCommand, AppError> {
+    let contains_accompaniment = keyword.contains("伴奏");
+    let keyword = keyword
+        .replace("伴奏", " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if keyword.trim().is_empty() {
+        return Err(bad_request("缺少keyword参数"));
+    }
+
+    let prefer_accompaniment = prefer_accompaniment || contains_accompaniment;
+    let (prefix, song_source) = if ai_assisted {
+        ("AI点歌", SongSource::All)
+    } else {
+        match source.as_str() {
+            "qqmusic" => ("点歌", SongSource::QqMusic),
+            "netease" => ("网易点歌", SongSource::Netease),
+            _ => return Err(bad_request("远程点歌source只允许qqmusic或netease")),
+        }
+    };
+    let user_command = if prefer_accompaniment {
+        format!("@{} {} 伴奏", prefix, keyword)
+    } else {
+        format!("@{} {}", prefix, keyword)
+    };
+    let raw = if prefer_accompaniment {
+        format!("{} {} 伴奏", prefix, keyword)
+    } else {
+        format!("{} {}", prefix, keyword)
+    };
+    let parsed = ParsedCommand {
+        matched: prefix.to_string(),
+        raw,
+        user_command,
+        message_type: "控制台".to_string(),
+        username: "控制台".to_string(),
+        command: UserCommand::Song(SongCommand {
+            keyword,
+            source: song_source,
+            prefix: prefix.to_string(),
+            prefer_accompaniment,
+            ai_assisted,
+            friend_username: String::new(),
+        }),
+    };
+    Ok(PendingCommand {
+        lock_key: command::lock_key(&parsed),
+        parsed,
+    })
 }
 
 fn queue_json(state: &HttpSharedState) -> std::result::Result<String, AppError> {
@@ -579,21 +591,6 @@ fn set_pause_flags(
     runtime.save().map_err(internal_error)
 }
 
-fn active_window_json(
-    query: &[(String, String)],
-    state: &HttpSharedState,
-) -> std::result::Result<String, AppError> {
-    let query_target = query_value(query, "target");
-    let target = query_target.unwrap_or(&state.config.window.target_process);
-    let auto_activate = state.config.window.auto_activate_window && query_target.is_none();
-    active_window_status(
-        target,
-        auto_activate,
-        state.config.timing.input.after_activate_ms,
-    )
-    .map_err(internal_error)
-}
-
 fn history_json(state: &HttpSharedState) -> std::result::Result<String, AppError> {
     let history = state
         .history
@@ -611,20 +608,93 @@ fn clear_history(state: &HttpSharedState) -> std::result::Result<String, AppErro
     Ok("命令记录已清空".to_string())
 }
 
+fn screenshot_response(
+    request: &Request,
+    state: &HttpSharedState,
+) -> std::result::Result<Response, AppError> {
+    let quality = parse_jpeg_quality(query_value(&request.query, "quality"))?;
+    let image = super::window::capture_game(&state.config.window).map_err(internal_error)?;
+    let rgb = image.to_rgb8();
+    let mut bytes = Vec::new();
+    let mut encoder = JpegEncoder::new_with_quality(&mut bytes, quality);
+    encoder
+        .encode(&rgb, rgb.width(), rgb.height(), ColorType::Rgb8.into())
+        .map_err(internal_error)?;
+    Ok(bytes_response(
+        StatusCode::OK,
+        "image/jpeg",
+        bytes,
+        cors_headers(request, &state.config.http.host, state.config.http.port),
+    ))
+}
+
 fn monitor_json(state: &HttpSharedState) -> std::result::Result<String, AppError> {
-    serde_json::to_string(&state.monitor.snapshot()).map_err(internal_error)
+    let mut value = serde_json::to_value(state.monitor.snapshot()).map_err(internal_error)?;
+    if let Value::Object(object) = &mut value {
+        object.insert(
+            "pendingTasks".to_string(),
+            json!(pending_task_labels(state)?),
+        );
+    }
+    serde_json::to_string(&value).map_err(internal_error)
+}
+
+fn chat_send(
+    query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let text = normalize_required_text(query_value(query, "text"), "text")?;
+    let message = format!("[控制台]: {}", text);
+    let position = enqueue_pending_task(state, super::PendingTask::ConsoleChat { text })?;
+    Ok(json!({ "ok": true, "queued": true, "position": position, "message": message }).to_string())
+}
+
+fn pending_task_labels(state: &HttpSharedState) -> std::result::Result<Vec<String>, AppError> {
+    let (lock, _) = &*state.pending;
+    let guard = lock
+        .lock()
+        .map_err(|_| internal_message("待处理任务队列锁已损坏"))?;
+    Ok(guard.iter().map(super::PendingTask::label).collect())
+}
+
+fn enqueue_pending_task(
+    state: &HttpSharedState,
+    task: super::PendingTask,
+) -> std::result::Result<usize, AppError> {
+    let (lock, cvar) = &*state.pending;
+    let mut guard = lock
+        .lock()
+        .map_err(|_| internal_message("待处理任务队列锁已损坏"))?;
+    guard.push_back(task);
+    let position = guard.len();
+    cvar.notify_one();
+    Ok(position)
+}
+
+fn enqueue_pending_command(
+    state: &HttpSharedState,
+    pending: PendingCommand,
+) -> std::result::Result<usize, AppError> {
+    let (lock, cvar) = &*state.pending;
+    let mut guard = lock
+        .lock()
+        .map_err(|_| internal_message("待处理任务队列锁已损坏"))?;
+    if guard
+        .iter()
+        .any(|task| task.same_lock_command(&pending.parsed))
+    {
+        return Ok(0);
+    }
+    guard.push_back(super::PendingTask::Command(Box::new(pending)));
+    let position = guard.len();
+    cvar.notify_one();
+    Ok(position)
 }
 
 fn push_history(request: &Request, result: &str, ok: bool, state: &HttpSharedState) {
     if matches!(
         request.path.as_str(),
-        "/history"
-            | "/clear-history"
-            | "/monitor"
-            | "/active-window"
-            | "/admin-status"
-            | "/restart-admin"
-            | "/favicon.ico"
+        "/history" | "/clear-history" | "/monitor" | "/screenshot" | "/favicon.ico"
     ) {
         return;
     }
@@ -801,6 +871,18 @@ fn normalize_optional_text(
         .to_string())
 }
 
+fn normalize_required_text(
+    value: Option<&str>,
+    name: &str,
+) -> std::result::Result<String, AppError> {
+    let text = normalize_optional_text(value, name)?;
+    if text.is_empty() {
+        Err(bad_request(&format!("缺少{}参数", name)))
+    } else {
+        Ok(text)
+    }
+}
+
 fn assert_no_control_chars(value: &str, name: &str) -> std::result::Result<String, AppError> {
     if value.chars().any(char::is_control) {
         Err(bad_request(&format!("{}不能包含控制字符", name)))
@@ -823,6 +905,21 @@ fn is_valid_volume(value: &str) -> bool {
 
 fn parse_bool(value: Option<&str>) -> bool {
     matches!(value.unwrap_or(""), "1" | "true" | "yes" | "on")
+}
+
+fn parse_jpeg_quality(value: Option<&str>) -> std::result::Result<u8, AppError> {
+    let Some(value) = value.filter(|value| !value.trim().is_empty()) else {
+        return Ok(88);
+    };
+    let quality = value
+        .trim()
+        .parse::<u8>()
+        .map_err(|_| bad_request("quality参数必须是80-95"))?;
+    if (80..=95).contains(&quality) {
+        Ok(quality)
+    } else {
+        Err(bad_request("quality参数必须是80-95"))
+    }
 }
 
 fn is_client_error(message: &str) -> bool {
@@ -858,310 +955,6 @@ fn current_time_text() -> String {
     seconds.to_string()
 }
 
-fn active_window_status(
-    target: &str,
-    auto_activate: bool,
-    after_activate_ms: u64,
-) -> Result<String> {
-    if target.trim().is_empty() {
-        return Ok(json!({
-            "supported": true,
-            "enabled": false,
-            "active": true,
-            "reason": "no-target",
-        })
-        .to_string());
-    }
-    let target_process = target_process_name(target);
-    let target_process_label = strip_exe_suffix(target.trim());
-    let target_window = find_window_by_process(&target_process)?;
-    let target_process_id = target_window
-        .map(|window| window.process_id)
-        .unwrap_or_default();
-
-    let mut foreground = foreground_window_info();
-    let mut active = if target_process_id != 0 {
-        foreground.process_id == target_process_id
-    } else {
-        normalize_process_name(&foreground.process) == target_process
-    };
-    let mut activated = false;
-    let mut show_window_result = false;
-    let mut send_input_alt_result = 0_u32;
-    let mut set_foreground_result = false;
-
-    if !active && auto_activate {
-        if let Some(target_window) = target_window {
-            show_window_result = unsafe { ShowWindow(target_window.hwnd, SW_RESTORE).as_bool() };
-            send_input_alt_result = send_alt_keypress();
-            set_foreground_result = unsafe { SetForegroundWindow(target_window.hwnd).as_bool() };
-            thread::sleep(Duration::from_millis(after_activate_ms));
-
-            foreground = foreground_window_info();
-            active = foreground.process_id == target_process_id;
-            activated = active;
-        }
-    }
-
-    Ok(json!({
-        "supported": true,
-        "enabled": true,
-        "active": active,
-        "activated": activated,
-        "showWindow": show_window_result,
-        "sendInputAlt": send_input_alt_result,
-        "setForeground": set_foreground_result,
-        "autoClick": false,
-        "title": foreground.title,
-        "process": foreground.process,
-        "processId": foreground.process_id,
-        "target": target,
-        "targetProcess": target_process_label,
-        "targetProcessId": target_process_id,
-    })
-    .to_string())
-}
-
-fn admin_status_json() -> std::result::Result<String, AppError> {
-    match admin_status() {
-        Ok((is_admin, user)) => Ok(json!({
-            "supported": true,
-            "isAdmin": is_admin,
-            "user": user,
-        })
-        .to_string()),
-        Err(error) => Ok(json!({
-            "supported": false,
-            "isAdmin": false,
-            "reason": error.to_string(),
-        })
-        .to_string()),
-    }
-}
-
-#[derive(Clone, Copy)]
-struct ProcessWindow {
-    hwnd: HWND,
-    process_id: u32,
-}
-
-#[derive(Debug)]
-struct ForegroundWindowInfo {
-    title: String,
-    process: String,
-    process_id: u32,
-}
-
-struct SearchState {
-    target: String,
-    found: Option<ProcessWindow>,
-}
-
-fn foreground_window_info() -> ForegroundWindowInfo {
-    let hwnd = unsafe { GetForegroundWindow() };
-    if hwnd.is_invalid() {
-        return ForegroundWindowInfo {
-            title: String::new(),
-            process: String::new(),
-            process_id: 0,
-        };
-    }
-
-    let mut process_id = 0_u32;
-    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut process_id)) };
-    ForegroundWindowInfo {
-        title: window_title(hwnd),
-        process: process_name(process_id)
-            .map(|name| strip_exe_suffix(&name).to_string())
-            .unwrap_or_default(),
-        process_id,
-    }
-}
-
-fn window_title(hwnd: HWND) -> String {
-    let mut buffer = vec![0_u16; 512];
-    let len = unsafe { GetWindowTextW(hwnd, &mut buffer) };
-    if len <= 0 {
-        return String::new();
-    }
-    String::from_utf16_lossy(&buffer[..len as usize])
-}
-
-fn find_window_by_process(target_process: &str) -> Result<Option<ProcessWindow>> {
-    let mut state = SearchState {
-        target: target_process.to_string(),
-        found: None,
-    };
-    unsafe {
-        EnumWindows(
-            Some(enum_windows_proc),
-            LPARAM((&mut state as *mut SearchState) as isize),
-        )
-    }
-    .context("EnumWindows failed")?;
-    Ok(state.found)
-}
-
-unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    let state = unsafe { &mut *(lparam.0 as *mut SearchState) };
-    if !unsafe { IsWindowVisible(hwnd).as_bool() } {
-        return true.into();
-    }
-
-    let mut process_id = 0_u32;
-    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut process_id)) };
-    if process_id == 0 {
-        return true.into();
-    }
-
-    if process_name(process_id)
-        .map(|name| normalize_process_name(&name) == state.target)
-        .unwrap_or(false)
-    {
-        state.found = Some(ProcessWindow { hwnd, process_id });
-        return false.into();
-    }
-    true.into()
-}
-
-fn process_name(process_id: u32) -> Result<String> {
-    if process_id == 0 {
-        return Ok(String::new());
-    }
-    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id) }
-        .with_context(|| format!("OpenProcess failed for pid {}", process_id))?;
-    let _guard = HandleGuard(process);
-
-    let mut buffer = vec![0_u16; 32768];
-    let mut len = buffer.len() as u32;
-    unsafe {
-        QueryFullProcessImageNameW(
-            process,
-            PROCESS_NAME_WIN32,
-            windows::core::PWSTR(buffer.as_mut_ptr()),
-            &mut len,
-        )
-    }
-    .with_context(|| format!("QueryFullProcessImageNameW failed for pid {}", process_id))?;
-    let path = String::from_utf16_lossy(&buffer[..len as usize]);
-    Ok(Path::new(&path)
-        .file_name()
-        .map(|name| name.to_string_lossy().to_string())
-        .filter(|name| !name.is_empty())
-        .unwrap_or(path))
-}
-
-fn admin_status() -> Result<(bool, String)> {
-    let process = unsafe { GetCurrentProcess() };
-    let mut token = HANDLE::default();
-    unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) }
-        .context("OpenProcessToken failed")?;
-    let _guard = HandleGuard(token);
-
-    let mut elevation = TOKEN_ELEVATION::default();
-    let mut returned = 0_u32;
-    unsafe {
-        GetTokenInformation(
-            token,
-            TokenElevation,
-            Some((&mut elevation as *mut TOKEN_ELEVATION).cast()),
-            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
-            &mut returned,
-        )
-    }
-    .context("GetTokenInformation(TokenElevation) failed")?;
-
-    Ok((elevation.TokenIsElevated != 0, current_user_name()))
-}
-
-fn current_user_name() -> String {
-    let mut len = 0_u32;
-    unsafe { GetUserNameExW(NameSamCompatible, None, &mut len) };
-    if len > 0 {
-        let mut buffer = vec![0_u16; len as usize];
-        if unsafe {
-            GetUserNameExW(
-                NameSamCompatible,
-                Some(windows::core::PWSTR(buffer.as_mut_ptr())),
-                &mut len,
-            )
-        } {
-            let usable_len = buffer
-                .iter()
-                .position(|ch| *ch == 0)
-                .unwrap_or(len as usize);
-            return String::from_utf16_lossy(&buffer[..usable_len]);
-        }
-    }
-
-    match (std::env::var("USERDOMAIN"), std::env::var("USERNAME")) {
-        (Ok(domain), Ok(user)) if !domain.is_empty() && !user.is_empty() => {
-            format!("{}\\{}", domain, user)
-        }
-        (_, Ok(user)) => user,
-        _ => String::new(),
-    }
-}
-
-fn send_alt_keypress() -> u32 {
-    let inputs = [
-        INPUT {
-            r#type: INPUT_KEYBOARD,
-            Anonymous: INPUT_0 {
-                ki: KEYBDINPUT {
-                    wVk: VIRTUAL_KEY(0x12),
-                    ..Default::default()
-                },
-            },
-        },
-        INPUT {
-            r#type: INPUT_KEYBOARD,
-            Anonymous: INPUT_0 {
-                ki: KEYBDINPUT {
-                    wVk: VIRTUAL_KEY(0x12),
-                    dwFlags: KEYEVENTF_KEYUP,
-                    ..Default::default()
-                },
-            },
-        },
-    ];
-    unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) }
-}
-
-fn target_process_name(value: &str) -> String {
-    normalize_process_name(strip_exe_suffix(value.trim()))
-}
-
-fn normalize_process_name(value: &str) -> String {
-    let mut name = value.trim().to_ascii_lowercase();
-    if !name.ends_with(".exe") {
-        name.push_str(".exe");
-    }
-    name
-}
-
-fn strip_exe_suffix(value: &str) -> &str {
-    let suffix_start = value.len().saturating_sub(4);
-    if value
-        .get(suffix_start..)
-        .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".exe"))
-    {
-        &value[..value.len() - 4]
-    } else {
-        value
-    }
-}
-
-struct HandleGuard(HANDLE);
-
-impl Drop for HandleGuard {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = CloseHandle(self.0);
-        }
-    }
-}
-
 fn is_json_route(path: &str) -> bool {
     matches!(
         path,
@@ -1170,11 +963,11 @@ fn is_json_route(path: &str) -> bool {
             | "/queue/add"
             | "/queue/remove"
             | "/queue/clear"
+            | "/searchPlay"
+            | "/searchSource"
             | "/state"
             | "/state/save"
-            | "/admin-status"
-            | "/restart-admin"
-            | "/active-window"
+            | "/chat/send"
             | "/ai/recognize"
             | "/ai/match"
             | "/ai/pick"
@@ -1184,13 +977,14 @@ fn is_json_route(path: &str) -> bool {
     )
 }
 
-fn enforce_method(request: &Request, state: &HttpSharedState) -> std::result::Result<(), AppError> {
+fn enforce_method(
+    request: &Request,
+    _state: &HttpSharedState,
+) -> std::result::Result<(), AppError> {
     if request.method != "GET" && request.method != "POST" {
         return Err(method_not_allowed("只支持GET或POST"));
     }
-    let needs_post = is_mutating_route(&request.path)
-        || (request.path == "/active-window" && state.config.window.auto_activate_window);
-    if needs_post && request.method != "POST" {
+    if is_mutating_route(&request.path) && request.method != "POST" {
         return Err(method_not_allowed("该接口需要POST请求"));
     }
     Ok(())
@@ -1211,6 +1005,7 @@ fn is_mutating_route(path: &str) -> bool {
             | "/queue/remove"
             | "/queue/clear"
             | "/state/save"
+            | "/chat/send"
             | "/ai/recognize"
             | "/ai/match"
             | "/ai/pick"
@@ -1242,6 +1037,19 @@ fn body_response(
     status: StatusCode,
     content_type: &str,
     body: String,
+    extra_headers: Vec<(String, String)>,
+) -> Response {
+    let response = Response::builder()
+        .status(status)
+        .header(CONTENT_TYPE, content_type)
+        .body(Body::from(body));
+    add_headers(response, extra_headers)
+}
+
+fn bytes_response(
+    status: StatusCode,
+    content_type: &str,
+    body: Vec<u8>,
     extra_headers: Vec<(String, String)>,
 ) -> Response {
     let response = Response::builder()
@@ -1451,4 +1259,88 @@ fn internal_error(error: impl std::fmt::Display) -> AppError {
 
 fn internal_message(message: &str) -> AppError {
     internal_error(anyhow!(message.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chat_send_requires_post() {
+        assert!(is_mutating_route("/chat/send"));
+    }
+
+    #[test]
+    fn remote_song_routes_are_queued_json_post_routes() {
+        assert!(is_mutating_route("/searchPlay"));
+        assert!(is_mutating_route("/ai/search"));
+        assert!(is_json_route("/searchPlay"));
+        assert!(is_json_route("/ai/search"));
+    }
+
+    #[test]
+    fn chat_send_requires_non_empty_text() {
+        let error = normalize_required_text(Some("  "), "text").unwrap_err();
+
+        assert_eq!(error.status, 400);
+        assert!(error.message.contains("缺少text参数"));
+    }
+
+    #[test]
+    fn remote_song_command_builds_console_plain_song() {
+        let pending =
+            remote_song_command("晴天 伴奏".to_string(), "qqmusic".to_string(), false, false)
+                .expect("remote song command");
+
+        assert_eq!(pending.parsed.message_type, "控制台");
+        assert_eq!(pending.parsed.username, "控制台");
+        assert_eq!(pending.parsed.raw, "点歌 晴天 伴奏");
+        match pending.parsed.command {
+            UserCommand::Song(song) => {
+                assert_eq!(song.keyword, "晴天");
+                assert_eq!(song.source, SongSource::QqMusic);
+                assert!(song.prefer_accompaniment);
+                assert!(!song.ai_assisted);
+                assert!(song.friend_username.is_empty());
+            }
+            _ => panic!("expected song command"),
+        }
+    }
+
+    #[test]
+    fn remote_song_command_builds_console_ai_song() {
+        let pending = remote_song_command("晴天".to_string(), "qqmusic".to_string(), false, true)
+            .expect("remote ai song command");
+
+        assert_eq!(pending.parsed.raw, "AI点歌 晴天");
+        match pending.parsed.command {
+            UserCommand::Song(song) => {
+                assert_eq!(song.source, SongSource::All);
+                assert!(song.ai_assisted);
+            }
+            _ => panic!("expected song command"),
+        }
+    }
+
+    #[test]
+    fn remote_plain_song_rejects_multi_source() {
+        let error = remote_song_command(
+            "晴天".to_string(),
+            "qqmusic,netease".to_string(),
+            false,
+            false,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.status, 400);
+        assert!(error.message.contains("source只允许"));
+    }
+
+    #[test]
+    fn screenshot_quality_is_bounded() {
+        assert_eq!(parse_jpeg_quality(None).unwrap(), 88);
+        assert_eq!(parse_jpeg_quality(Some("95")).unwrap(), 95);
+        assert!(parse_jpeg_quality(Some("79")).is_err());
+        assert!(parse_jpeg_quality(Some("96")).is_err());
+    }
 }

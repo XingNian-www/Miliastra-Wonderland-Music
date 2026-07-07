@@ -605,6 +605,7 @@ mod app {
         paused: Arc<AtomicBool>,
         command_executing: Arc<AtomicBool>,
         song_command_executing: Arc<AtomicBool>,
+        console_reply_context: Arc<AtomicBool>,
         monitor: MonitorShared,
     }
 
@@ -645,6 +646,9 @@ mod app {
         AdvanceQueue {
             reason: &'static str,
         },
+        ConsoleChat {
+            text: String,
+        },
         ModerationVoteResult {
             command: Box<command::ModerationCommand>,
             approved: bool,
@@ -655,8 +659,12 @@ mod app {
     impl PendingTask {
         fn label(&self) -> String {
             match self {
+                Self::Command(pending) if pending.parsed.message_type == "控制台" => {
+                    format!("控制台命令: {}", pending.parsed.raw)
+                }
                 Self::Command(pending) => pending.parsed.raw.clone(),
                 Self::AdvanceQueue { reason } => format!("自动出队({})", reason),
+                Self::ConsoleChat { text } => format!("控制台发言: {}", text),
                 Self::ModerationVoteResult {
                     command, approved, ..
                 } => format!(
@@ -672,6 +680,7 @@ mod app {
             match self {
                 Self::Command(pending) => command::same_lock_command(&pending.parsed, parsed),
                 Self::AdvanceQueue { .. } => false,
+                Self::ConsoleChat { .. } => false,
                 Self::ModerationVoteResult { command, .. } => {
                     matches!(
                         &parsed.command,
@@ -717,6 +726,24 @@ mod app {
         }
     }
 
+    struct ConsoleReplyContextGuard {
+        flag: Arc<AtomicBool>,
+        previous: bool,
+    }
+
+    impl ConsoleReplyContextGuard {
+        fn new(flag: Arc<AtomicBool>) -> Self {
+            let previous = flag.swap(true, AtomicOrdering::SeqCst);
+            Self { flag, previous }
+        }
+    }
+
+    impl Drop for ConsoleReplyContextGuard {
+        fn drop(&mut self) {
+            self.flag.store(self.previous, AtomicOrdering::SeqCst);
+        }
+    }
+
     impl AutomationApp {
         fn new(
             config: AppConfig,
@@ -752,6 +779,7 @@ mod app {
                 paused: Arc::new(AtomicBool::new(false)),
                 command_executing: Arc::new(AtomicBool::new(false)),
                 song_command_executing: Arc::new(AtomicBool::new(false)),
+                console_reply_context: Arc::new(AtomicBool::new(false)),
                 monitor,
             })
         }
@@ -804,6 +832,7 @@ mod app {
                 paused: self.paused.clone(),
                 command_executing: self.command_executing.clone(),
                 song_command_executing: self.song_command_executing.clone(),
+                console_reply_context: self.console_reply_context.clone(),
                 monitor: self.monitor.clone(),
             };
             thread::spawn(move || {
@@ -835,6 +864,7 @@ mod app {
                 paused: self.paused.clone(),
                 command_executing: self.command_executing.clone(),
                 song_command_executing: self.song_command_executing.clone(),
+                console_reply_context: self.console_reply_context.clone(),
                 monitor: self.monitor.clone(),
             };
             thread::spawn(move || {
@@ -864,6 +894,7 @@ mod app {
                 paused: self.paused.clone(),
                 command_executing: self.command_executing.clone(),
                 song_command_executing: self.song_command_executing.clone(),
+                console_reply_context: self.console_reply_context.clone(),
                 monitor: self.monitor.clone(),
             }
         }
@@ -966,6 +997,7 @@ mod app {
                 self.config.clone(),
                 Arc::clone(&self.queue),
                 Arc::clone(&self.runtime_state),
+                Arc::clone(&self.pending),
                 self.monitor.clone(),
             ))
         }
@@ -1476,6 +1508,7 @@ mod app {
                     self.execute_pending_command(*pending)
                 }
                 PendingTask::AdvanceQueue { reason } => self.execute_advance_queue_task(reason),
+                PendingTask::ConsoleChat { text } => self.execute_console_chat_task(text),
                 PendingTask::ModerationVoteResult {
                     command,
                     approved,
@@ -1493,6 +1526,24 @@ mod app {
                     Err(error)
                 }
             }
+        }
+
+        fn execute_console_chat_task(&mut self, text: String) -> Result<()> {
+            let message = format!("[控制台]: {}", text);
+            match self.prepare_command_ui(&message) {
+                Ok(true) => {}
+                Ok(false) => {
+                    log::info!("控制台发言前未能回到一级界面，保留任务: {}", text);
+                    self.push_pending_task_front(PendingTask::ConsoleChat { text })?;
+                    return Ok(());
+                }
+                Err(error) => {
+                    log::error!("控制台发言前准备界面失败，保留任务 {}: {error:#}", text);
+                    self.push_pending_task_front(PendingTask::ConsoleChat { text })?;
+                    return Ok(());
+                }
+            }
+            self.reply(&message)
         }
 
         fn execute_pending_command(&mut self, pending: PendingCommand) -> Result<()> {
@@ -1520,6 +1571,13 @@ mod app {
                 pending.parsed.raw,
                 pending.lock_key
             );
+            let _console_reply_context = if pending.parsed.message_type == "控制台" {
+                Some(ConsoleReplyContextGuard::new(Arc::clone(
+                    &self.console_reply_context,
+                )))
+            } else {
+                None
+            };
             let command_started = Instant::now();
             match self.execute_command(&pending.parsed) {
                 Ok(()) => {
@@ -3709,6 +3767,11 @@ mod app {
         }
 
         fn reply(&self, message: &str) -> Result<()> {
+            if self.console_reply_context.load(AtomicOrdering::SeqCst)
+                && !message.starts_with("[控制台]:")
+            {
+                return self.chat_output.send(&format!("[控制台]: {}", message));
+            }
             self.chat_output.send(message)
         }
 

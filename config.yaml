@@ -33,10 +33,10 @@ screen:
     height: 143
   # 一级聊天界面左下角回车按钮模板检测区域
   enter_rect:
-    x: 30
-    y: 1020
-    width: 85
-    height: 40
+    x: 60
+    y: 1015
+    width: 120
+    height: 55
   # 二级大厅/面板界面模板检测区域
   secondary_hall_rect:
     x: 10

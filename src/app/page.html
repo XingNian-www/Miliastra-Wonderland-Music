@@ -8,59 +8,59 @@
 *{box-sizing:border-box}
 body{margin:0;background:#101211;color:#e7ece9;font-family:"Microsoft YaHei",system-ui,sans-serif}
 button,input,select,textarea{font:inherit}
-.shell{max-width:1480px;margin:0 auto;padding:14px}
-.topbar{display:grid;grid-template-columns:250px minmax(0,1fr) auto;gap:10px;align-items:stretch;margin-bottom:10px}
-.brand{border:1px solid #2d3530;background:#171b19;border-radius:8px;padding:9px 10px}
-.brand h1{font-size:20px;line-height:1.2;margin:0;color:#f8faf9}
+.shell{max-width:1320px;margin:0 auto;padding:10px}
+.topbar{display:grid;grid-template-columns:220px minmax(0,1fr) auto;gap:8px;align-items:stretch;margin-bottom:8px}
+.brand{border:1px solid #2d3530;background:#171b19;border-radius:8px;padding:7px 9px}
+.brand h1{font-size:18px;line-height:1.2;margin:0;color:#f8faf9}
 .brand p{margin:4px 0 0;color:#9aa6a0;font-size:12px}
-.status-strip{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}
-.metric{border:1px solid #2d3530;background:#171b19;border-radius:8px;padding:8px 10px;min-height:58px}
+.status-strip{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px}
+.metric{border:1px solid #2d3530;background:#171b19;border-radius:8px;padding:6px 8px;min-height:48px}
 .metric span{display:block;color:#9aa6a0;font-size:12px}
-.metric strong{display:block;margin-top:5px;color:#f8faf9;font-size:15px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.top-actions{display:flex;gap:8px;align-items:stretch}
-.layout{display:grid;grid-template-columns:minmax(0,1.85fr) 360px;gap:12px;align-items:start}
-.monitor{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:12px}
+.metric strong{display:block;margin-top:3px;color:#f8faf9;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.top-actions{display:flex;gap:6px;align-items:stretch}
+.layout{display:grid;grid-template-columns:minmax(0,1.9fr) 330px;gap:8px;align-items:start}
+.monitor{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:8px}
 .panel{border:1px solid #2d3530;background:#171b19;border-radius:8px;min-width:0;overflow:hidden}
 .panel.wide{grid-column:1/-1}
-.panel-head{height:36px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #2d3530;padding:0 10px;gap:8px}
+.panel-head{height:32px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #2d3530;padding:0 8px;gap:6px}
 .panel h2{font-size:14px;margin:0;color:#86efac}
 .panel small{color:#93a19a;white-space:nowrap}
-.panel-body{padding:10px}
-.scroll{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px;line-height:1.45;white-space:pre-wrap;word-break:break-word;overflow:auto;min-height:116px;max-height:300px;color:#d6ddd9}
-#monitorOcr{min-height:132px;max-height:210px}
-#monitorLogs{min-height:260px;max-height:500px}
-#monitorCommands{max-height:190px}
-.queue-list{display:flex;flex-direction:column;gap:6px;min-height:116px;max-height:230px;overflow:auto}
-.queue-item{display:grid;grid-template-columns:28px minmax(0,1fr) auto;gap:8px;align-items:center;border:1px solid #323b36;background:#111412;border-radius:8px;padding:7px}
+.panel-body{padding:8px}
+.scroll{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px;line-height:1.36;white-space:pre-wrap;word-break:break-word;overflow:auto;min-height:92px;max-height:260px;color:#d6ddd9}
+#monitorOcr{min-height:108px;max-height:172px}
+#monitorLogs{min-height:240px;max-height:420px}
+#monitorCommands{max-height:150px}
+.queue-list{display:flex;flex-direction:column;gap:5px;min-height:94px;max-height:180px;overflow:auto}
+.queue-item{display:grid;grid-template-columns:24px minmax(0,1fr) auto;gap:6px;align-items:center;border:1px solid #323b36;background:#111412;border-radius:8px;padding:6px}
 .queue-index{color:#93a19a;text-align:right;font-variant-numeric:tabular-nums}
 .queue-title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .queue-meta{color:#9aa6a0;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.pending-item{display:grid;grid-template-columns:28px minmax(0,1fr);gap:8px;align-items:center;border:1px solid #323b36;background:#111412;border-radius:8px;padding:8px}
-.sidebar{display:flex;flex-direction:column;gap:12px}
-.controls{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
-.row{display:flex;gap:8px;align-items:center}
+.pending-item{display:grid;grid-template-columns:24px minmax(0,1fr);gap:6px;align-items:center;border:1px solid #323b36;background:#111412;border-radius:8px;padding:6px}
+.sidebar{display:flex;flex-direction:column;gap:8px}
+.controls{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}
+.row{display:flex;gap:6px;align-items:center}
 .row.wrap{flex-wrap:wrap}
-.ocr-send{display:grid;grid-template-columns:minmax(0,1fr) 104px;gap:8px;border-top:1px solid #2d3530;margin-top:10px;padding-top:10px}
-input,select,textarea{width:100%;border:1px solid #3a4540;background:#101211;color:#f3f6f4;border-radius:8px;padding:9px 10px;outline:none}
+.ocr-send{display:grid;grid-template-columns:minmax(0,1fr) 92px;gap:6px;border-top:1px solid #2d3530;margin-top:8px;padding-top:8px}
+input,select,textarea{width:100%;border:1px solid #3a4540;background:#101211;color:#f3f6f4;border-radius:8px;padding:7px 8px;outline:none}
 textarea{min-height:74px;resize:vertical}
 input:focus,select:focus,textarea:focus{border-color:#2dd4bf}
-.btn{border:1px solid #3a4540;background:#222821;color:#f3f6f4;border-radius:8px;padding:9px 10px;cursor:pointer;min-height:38px}
+.btn{border:1px solid #3a4540;background:#222821;color:#f3f6f4;border-radius:8px;padding:7px 9px;cursor:pointer;min-height:34px}
 .btn:hover{background:#2b332d}
 .btn.primary{background:#0f766e;border-color:#14b8a6;color:#fff}
 .btn.primary:hover{background:#0d9488}
 .btn.good{background:#166534;border-color:#1b7d3f;color:#fff}
 .btn.warn{background:#7c2d12;border-color:#9a3412;color:#fff}
 .btn.ghost{background:#111412}
-.btn.small{min-height:32px;padding:6px 8px;font-size:12px}
-.two{display:grid;grid-template-columns:1fr 1fr;gap:8px}
-.three{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}
-.result{border:1px solid #2d3530;background:#101211;border-radius:8px;padding:9px 10px;font-size:12px;line-height:1.45;white-space:pre-wrap;word-break:break-word;min-height:58px;max-height:180px;overflow:auto;color:#d6ddd9}
-.history{display:flex;flex-direction:column;gap:6px;max-height:250px;overflow:auto}
-.history-item{border-left:3px solid #22c55e;background:#111412;border-radius:8px;padding:7px 8px;font-size:12px}
+.btn.small{min-height:28px;padding:5px 7px;font-size:12px}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+.three{display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px}
+.result{border:1px solid #2d3530;background:#101211;border-radius:8px;padding:7px 8px;font-size:12px;line-height:1.36;white-space:pre-wrap;word-break:break-word;min-height:48px;max-height:140px;overflow:auto;color:#d6ddd9}
+.history{display:flex;flex-direction:column;gap:5px;max-height:200px;overflow:auto}
+.history-item{border-left:3px solid #22c55e;background:#111412;border-radius:8px;padding:6px 7px;font-size:12px}
 .history-item.err{border-left-color:#ef4444}
 .history-time{color:#93a19a;margin-right:6px}
 .history-result{color:#d6ddd9;margin-top:3px;word-break:break-word}
-.compact-form{display:grid;grid-template-columns:minmax(0,1fr) 92px;gap:8px}
+.compact-form{display:grid;grid-template-columns:minmax(0,1fr) 82px;gap:6px}
 .switch-line{display:flex;align-items:center;gap:8px;color:#aab5af;font-size:12px}
 .switch-line input{width:auto}
 .modal{position:fixed;inset:0;background:rgba(0,0,0,.78);z-index:10;display:grid;grid-template-rows:auto minmax(0,1fr);padding:16px;gap:10px}
@@ -87,7 +87,7 @@ input:focus,select:focus,textarea:focus{border-color:#2dd4bf}
     </div>
     <div class="top-actions">
       <button class="btn" id="refreshToggle" onclick="toggleRefresh()">暂停刷新</button>
-      <button class="btn primary" onclick="loadMonitor()">刷新</button>
+      <button class="btn primary" onclick="refreshAll()">刷新</button>
     </div>
   </header>
 
@@ -234,7 +234,7 @@ function preferParam(){return $('preferAccompaniment').checked?'&preferAccompani
 function keyword(){return $('keyword').value.trim()}
 function source(){return $('sourceSelect').value}
 async function request(url,method){
-  const r=await fetch(url,{method:method||'GET'})
+  const r=await fetch(url,{method:method||'GET',cache:'no-store'})
   const text=await r.text()
   if(!r.ok)throw new Error(text||('HTTP '+r.status))
   const type=r.headers.get('content-type')||''
@@ -256,9 +256,14 @@ function renderPlayer(d){
   $('songState').textContent=title||'无歌曲'
   return title
 }
+async function refreshPlayer(){
+  const d=await request('/status')
+  renderPlayer(d)
+  return d
+}
 async function loadStatus(){
   try{
-    const d=await request('/status')
+    const d=await refreshPlayer()
     const title=renderPlayer(d)
     setResult([
       '状态: '+($('playerState').textContent||'未知'),
@@ -377,11 +382,14 @@ function toggleRefresh(){
   refreshPaused=!refreshPaused
   $('refreshToggle').textContent=refreshPaused?'继续刷新':'暂停刷新'
   $('lastRefresh').textContent=refreshPaused?'已暂停 '+nowText():'最后刷新 '+nowText()
-  if(!refreshPaused)loadMonitor()
+  if(!refreshPaused)refreshAll()
 }
-loadMonitor()
-loadHistory()
-loadStatus()
+async function refreshAll(){
+  const results=await Promise.allSettled([loadMonitor(),loadHistory(),refreshPlayer()])
+  const failed=results.find((item)=>item.status==='rejected')
+  if(failed)setResult('刷新失败: '+failed.reason.message)
+}
+refreshAll()
 setInterval(()=>{if(!refreshPaused)loadMonitor()},1000)
 </script>
 </body>

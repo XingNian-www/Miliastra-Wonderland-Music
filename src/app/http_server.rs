@@ -260,49 +260,53 @@ fn route(
     query: &[(String, String)],
     state: &HttpSharedState,
 ) -> std::result::Result<String, AppError> {
-    let client = FeelUOwnClient::new(&state.config.feeluown, &state.config.timing);
     match path {
         "/status" => {
+            let client = FeelUOwnClient::new(&state.config.feeluown, &state.config.timing);
             serde_json::to_string(&client.status().map_err(internal_error)?).map_err(internal_error)
         }
-        "/play" => {
-            client.play().map_err(internal_error)?;
-            set_pause_flags(state, false, false)?;
-            Ok("已恢复播放".to_string())
-        }
-        "/pause" => {
-            client.pause().map_err(internal_error)?;
-            set_pause_flags(state, true, false)?;
-            Ok("已暂停".to_string())
-        }
-        "/skip-next" => {
-            client.next().map_err(internal_error)?;
-            set_pause_flags(state, false, false)?;
-            Ok("下一首".to_string())
-        }
-        "/skip-prev" => {
-            client.previous().map_err(internal_error)?;
-            set_pause_flags(state, false, false)?;
-            Ok("上一首".to_string())
-        }
+        "/play" => enqueue_remote_command(
+            state,
+            remote_control_command("继续".to_string(), "继续", UserCommand::Resume),
+        ),
+        "/pause" => enqueue_remote_command(
+            state,
+            remote_control_command("暂停".to_string(), "暂停", UserCommand::Pause),
+        ),
+        "/skip-next" => enqueue_remote_command(
+            state,
+            remote_control_command("下一首".to_string(), "下一首", UserCommand::Next),
+        ),
+        "/skip-prev" => enqueue_remote_command(
+            state,
+            remote_control_command("上一首".to_string(), "上一首", UserCommand::Previous),
+        ),
         "/volume" => {
             let volume =
                 query_value(query, "volume").ok_or_else(|| bad_request("volume参数必须是0-100"))?;
             if !is_valid_volume(volume) {
                 return Err(bad_request("volume参数必须是0-100"));
             }
-            client.set_volume(volume).map_err(internal_error)?;
-            Ok(format!("音量已设置为 {}", volume))
+            enqueue_remote_command(
+                state,
+                remote_control_command(
+                    format!("音量 {}", volume),
+                    "音量",
+                    UserCommand::Volume(volume.to_string()),
+                ),
+            )
         }
         "/searchPlay" => enqueue_remote_song(query, state, false),
         "/searchSource" => enqueue_remote_song(query, state, false),
         "/search" => {
             let keyword = normalize_keyword(query_value(query, "keyword"))?;
             let source = normalize_optional_source(query_value(query, "source"))?;
+            let client = FeelUOwnClient::new(&state.config.feeluown, &state.config.timing);
             client.search(&keyword, &source).map_err(internal_error)
         }
         "/open-scheme" => {
             let uri = normalize_fuo_uri(query_value_or(query, "url", "uri"))?;
+            let client = FeelUOwnClient::new(&state.config.feeluown, &state.config.timing);
             client.play_uri(uri.trim()).map_err(internal_error)?;
             set_pause_flags(state, false, false)?;
             Ok("已打开 FeelUOwn URI".to_string())
@@ -356,6 +360,37 @@ fn route(
             status: 404,
             message: format!("未知接口，可用: {}", KNOWN_ROUTES),
         }),
+    }
+}
+
+fn enqueue_remote_command(
+    state: &HttpSharedState,
+    pending: PendingCommand,
+) -> std::result::Result<String, AppError> {
+    let command = pending.parsed.raw.clone();
+    let queued = enqueue_pending_command(state, pending)?;
+    Ok(json!({
+        "ok": true,
+        "queued": queued > 0,
+        "duplicate": queued == 0,
+        "position": queued,
+        "command": command,
+    })
+    .to_string())
+}
+
+fn remote_control_command(raw: String, matched: &str, command: UserCommand) -> PendingCommand {
+    let parsed = ParsedCommand {
+        matched: matched.to_string(),
+        user_command: format!("@{}", raw),
+        raw,
+        message_type: "控制台".to_string(),
+        username: "控制台".to_string(),
+        command,
+    };
+    PendingCommand {
+        lock_key: command::lock_key(&parsed),
+        parsed,
     }
 }
 
@@ -959,6 +994,11 @@ fn is_json_route(path: &str) -> bool {
     matches!(
         path,
         "/status"
+            | "/play"
+            | "/pause"
+            | "/skip-next"
+            | "/skip-prev"
+            | "/volume"
             | "/queue"
             | "/queue/add"
             | "/queue/remove"
@@ -1276,6 +1316,50 @@ mod tests {
         assert!(is_mutating_route("/ai/search"));
         assert!(is_json_route("/searchPlay"));
         assert!(is_json_route("/ai/search"));
+    }
+
+    #[test]
+    fn playback_control_routes_are_queued_json_post_routes() {
+        for route in ["/play", "/pause", "/skip-next", "/skip-prev", "/volume"] {
+            assert!(is_mutating_route(route), "{route} should require POST");
+            assert!(is_json_route(route), "{route} should return queued JSON");
+        }
+    }
+
+    #[test]
+    fn remote_next_builds_console_game_command() {
+        let pending = remote_control_command("下一首".to_string(), "下一首", UserCommand::Next);
+
+        assert_eq!(pending.parsed.message_type, "控制台");
+        assert_eq!(pending.parsed.username, "控制台");
+        assert_eq!(pending.parsed.raw, "下一首");
+        assert_eq!(pending.parsed.user_command, "@下一首");
+        assert!(matches!(pending.parsed.command, UserCommand::Next));
+    }
+
+    #[test]
+    fn remote_volume_builds_console_game_command() {
+        let pending = remote_control_command(
+            "音量 60".to_string(),
+            "音量",
+            UserCommand::Volume("60".to_string()),
+        );
+
+        assert_eq!(pending.parsed.raw, "音量 60");
+        assert_eq!(pending.parsed.user_command, "@音量 60");
+        assert!(matches!(
+            pending.parsed.command,
+            UserCommand::Volume(ref volume) if volume == "60"
+        ));
+    }
+
+    #[test]
+    fn refresh_button_runs_full_uncached_refresh() {
+        assert!(PAGE.contains("onclick=\"refreshAll()\""));
+        assert!(PAGE.contains("async function refreshAll()"));
+        assert!(PAGE.contains("refreshPlayer()"));
+        assert!(PAGE.contains("cache:'no-store'"));
+        assert!(!PAGE.contains("onclick=\"loadMonitor()\""));
     }
 
     #[test]

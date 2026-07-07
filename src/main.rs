@@ -93,6 +93,8 @@ mod app {
     const OCR_REBUILD_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
     const TARGET_MISSING_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
     const TARGET_MISSING_BACKOFF_MAX: Duration = Duration::from_secs(60);
+    const RETURN_TO_PRIMARY_SLOW_RETRY_AFTER: u32 = 5;
+    const RETURN_TO_PRIMARY_SLOW_RETRY_MS: u64 = 2_000;
 
     #[derive(Parser, Debug)]
     #[command(
@@ -2915,8 +2917,12 @@ mod app {
             let deadline =
                 Instant::now() + Duration::from_millis(self.config.timing.command.ui_timeout_ms);
 
-            if force_first_escape && !self.press_escape_for_primary_return(context) {
-                return false;
+            let mut failed_returns = 0_u32;
+            if force_first_escape {
+                failed_returns += 1;
+                if !self.press_escape_for_primary_return(context, failed_returns) {
+                    return false;
+                }
             }
 
             while Instant::now() < deadline {
@@ -2934,7 +2940,8 @@ mod app {
                         log::error!("{}: 返回一级界面检测失败，继续按 ESC: {error:#}", context);
                     }
                 }
-                if !self.press_escape_for_primary_return(context) {
+                failed_returns = failed_returns.saturating_add(1);
+                if !self.press_escape_for_primary_return(context, failed_returns) {
                     return false;
                 }
             }
@@ -2942,15 +2949,22 @@ mod app {
             false
         }
 
-        fn press_escape_for_primary_return(&self, context: &str) -> bool {
-            log::info!("{}: 按 ESC 返回上一级", context);
+        fn press_escape_for_primary_return(&self, context: &str, failed_returns: u32) -> bool {
+            let wait_ms = return_to_primary_retry_wait_ms(
+                self.config.timing.command.return_retry_ms,
+                failed_returns,
+            );
+            log::info!(
+                "{}: 按 ESC 返回上一级，连续失败={} wait={}ms",
+                context,
+                failed_returns,
+                wait_ms
+            );
             if let Err(error) = press_key(Key::Escape, &self.config.window) {
                 log::error!("{}: 返回一级界面按 ESC 失败: {error:#}", context);
                 return false;
             }
-            sleep(Duration::from_millis(
-                self.config.timing.command.return_retry_ms,
-            ));
+            sleep(Duration::from_millis(wait_ms));
             true
         }
 
@@ -3904,6 +3918,19 @@ mod app {
         started.elapsed().as_millis()
     }
 
+    fn return_to_primary_retry_wait_ms(configured_retry_ms: u64, failed_returns: u32) -> u64 {
+        let base_ms = configured_retry_ms.min(RETURN_TO_PRIMARY_SLOW_RETRY_MS);
+        if failed_returns > RETURN_TO_PRIMARY_SLOW_RETRY_AFTER {
+            return RETURN_TO_PRIMARY_SLOW_RETRY_MS;
+        }
+        if failed_returns <= 1 {
+            return base_ms;
+        }
+        let steps = RETURN_TO_PRIMARY_SLOW_RETRY_AFTER as u64;
+        let progress = failed_returns.saturating_sub(1) as u64;
+        base_ms + (RETURN_TO_PRIMARY_SLOW_RETRY_MS - base_ms) * progress / steps
+    }
+
     fn next_target_missing_backoff(current: Duration) -> Duration {
         current.saturating_mul(2).min(TARGET_MISSING_BACKOFF_MAX)
     }
@@ -3920,6 +3947,15 @@ mod app {
         #[test]
         fn parses_ai_decision_case_insensitive() {
             assert_eq!(parse_decision_command("用户：@ai"), Some(UserDecision::Ai));
+        }
+
+        #[test]
+        fn return_to_primary_retry_wait_increases_then_caps() {
+            let waits = (1..=7)
+                .map(|failed_returns| return_to_primary_retry_wait_ms(1_000, failed_returns))
+                .collect::<Vec<_>>();
+
+            assert_eq!(waits, vec![1_000, 1_200, 1_400, 1_600, 1_800, 2_000, 2_000]);
         }
     }
 }

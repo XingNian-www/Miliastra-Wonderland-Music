@@ -33,10 +33,10 @@ screen:
     height: 143
   # 一级聊天界面左下角回车按钮模板检测区域
   enter_rect:
-    x: 0
+    x: 30
     y: 1020
-    width: 120
-    height: 60
+    width: 85
+    height: 40
   # 二级大厅/面板界面模板检测区域
   secondary_hall_rect:
     x: 10
@@ -71,7 +71,7 @@ timing:
   command:
     # 执行命令前等待回到一级界面的最长时间，单位毫秒
     ui_timeout_ms: 15000
-    # 返回一级界面时每次 ESC 后等待重新检测的时间，单位毫秒
+    # 返回一级界面时每次 ESC 后等待重新检测的基础时间；连续失败后会递增，超过 5 次固定为 2000ms
     return_retry_ms: 1000
     # 命令执行后等待聊天列表/动画稳定再复扫的时间，单位毫秒
     post_settle_ms: 500

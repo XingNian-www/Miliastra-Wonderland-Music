@@ -26,12 +26,14 @@ pub struct AppConfig {
     pub ai: AiConfig,
     pub matching: MatchConfig,
     pub hotkeys: HotkeyConfig,
+    pub startup: StartupConfig,
     pub invite: InviteConfig,
     pub custom_workflows: CustomWorkflowConfig,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WindowConfig {
+    /// 支持逗号、分号、竖线或空白分隔的多个进程名。
     pub target_process: String,
     pub content_width: u32,
     pub content_height: u32,
@@ -421,6 +423,35 @@ pub struct HotkeyConfig {
     pub enabled: bool,
     pub pause_key: String,
     pub exit_key: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StartupConfig {
+    pub enabled: bool,
+    pub launch_game: bool,
+    pub enter_game: bool,
+    pub enter_wonderland: bool,
+    pub game_path: PathBuf,
+    pub game_args: String,
+    pub launch_wait_ms: u64,
+    pub launch_retries: u32,
+    pub enter_game_timeout_ms: u64,
+    pub enter_wonderland_timeout_ms: u64,
+    pub final_primary_timeout_ms: u64,
+    pub poll_ms: u64,
+    pub f6_retry_ms: u64,
+    pub stable_timeout_ms: u64,
+    pub stable_mean_threshold: f32,
+    pub stable_changed_ratio_threshold: f32,
+    pub enter_game_texts: Vec<String>,
+    pub prompt_confirm_texts: Vec<String>,
+    pub wonderland_home_texts: Vec<String>,
+    pub wonderland_enter_texts: Vec<String>,
+    pub enter_game_text_region: RectConfig,
+    pub prompt_confirm_text_region: RectConfig,
+    pub wonderland_home_text_region: RectConfig,
+    pub wonderland_enter_text_region: RectConfig,
+    pub wonderland_card_point: PointConfig,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

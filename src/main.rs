@@ -32,6 +32,7 @@ mod app {
     mod queue;
     mod runtime_state;
     mod song_matcher;
+    mod startup_flow;
     mod template_match;
     mod tui;
     mod ui_locator;
@@ -649,6 +650,9 @@ mod app {
         ConsoleChat {
             text: String,
         },
+        StartAndEnterWonderland {
+            source: &'static str,
+        },
         ModerationVoteResult {
             command: Box<command::ModerationCommand>,
             approved: bool,
@@ -665,6 +669,9 @@ mod app {
                 Self::Command(pending) => pending.parsed.raw.clone(),
                 Self::AdvanceQueue { reason } => format!("自动出队({})", reason),
                 Self::ConsoleChat { text } => format!("控制台发言: {}", text),
+                Self::StartAndEnterWonderland { source } => {
+                    format!("自动启动并进入千星({})", source)
+                }
                 Self::ModerationVoteResult {
                     command, approved, ..
                 } => format!(
@@ -681,6 +688,7 @@ mod app {
                 Self::Command(pending) => command::same_lock_command(&pending.parsed, parsed),
                 Self::AdvanceQueue { .. } => false,
                 Self::ConsoleChat { .. } => false,
+                Self::StartAndEnterWonderland { .. } => false,
                 Self::ModerationVoteResult { command, .. } => {
                     matches!(
                         &parsed.command,
@@ -791,6 +799,7 @@ mod app {
             self.start_http_server()?;
             self.start_hotkeys()?;
             let executor = self.start_command_executor();
+            self.enqueue_startup_task_if_enabled()?;
             let playback_monitor = self.start_playback_monitor();
             let result = self.run_scan_loop();
             self.running.store(false, AtomicOrdering::SeqCst);
@@ -1509,6 +1518,9 @@ mod app {
                 }
                 PendingTask::AdvanceQueue { reason } => self.execute_advance_queue_task(reason),
                 PendingTask::ConsoleChat { text } => self.execute_console_chat_task(text),
+                PendingTask::StartAndEnterWonderland { source } => {
+                    self.execute_startup_wonderland_task(source)
+                }
                 PendingTask::ModerationVoteResult {
                     command,
                     approved,
@@ -1544,6 +1556,15 @@ mod app {
                 }
             }
             self.reply(&message)
+        }
+
+        fn execute_startup_wonderland_task(&mut self, source: &'static str) -> Result<()> {
+            log::info!("执行启动/千星流程: {}", source);
+            let config = self.config.clone();
+            let engine = self.ocr_engine()?;
+            startup_flow::start_game_and_enter_wonderland(&config, &engine.engine, || {
+                self.running.load(AtomicOrdering::SeqCst)
+            })
         }
 
         fn execute_pending_command(&mut self, pending: PendingCommand) -> Result<()> {
@@ -1658,6 +1679,15 @@ mod app {
             guard.push_front(task);
             cvar.notify_one();
             Ok(())
+        }
+
+        fn enqueue_startup_task_if_enabled(&self) -> Result<()> {
+            if !self.config.startup.enabled {
+                return Ok(());
+            }
+            self.push_pending_task(PendingTask::StartAndEnterWonderland {
+                source: "启动配置"
+            })
         }
 
         fn ensure_game_ready_for_input(&self, context: &str) -> Result<()> {

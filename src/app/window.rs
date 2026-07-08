@@ -389,33 +389,33 @@ struct ProcessWindow {
 }
 
 struct SearchState {
-    target: String,
+    targets: Vec<String>,
+    target_label: String,
     found: Option<ProcessWindow>,
     include_minimized: bool,
 }
 
 fn find_window_by_process(target_process: &str) -> Result<ProcessWindow> {
     let mut state = SearchState {
-        target: normalize_process_name(target_process),
+        targets: normalize_process_names(target_process)?,
+        target_label: target_process.to_string(),
         found: None,
         include_minimized: false,
     };
-    find_window_by_process_with_state(target_process, &mut state)
+    find_window_by_process_with_state(&mut state)
 }
 
 fn find_window_by_process_for_close(target_process: &str) -> Result<HWND> {
     let mut state = SearchState {
-        target: normalize_process_name(target_process),
+        targets: normalize_process_names(target_process)?,
+        target_label: target_process.to_string(),
         found: None,
         include_minimized: true,
     };
-    find_window_by_process_with_state(target_process, &mut state).map(|window| window.hwnd)
+    find_window_by_process_with_state(&mut state).map(|window| window.hwnd)
 }
 
-fn find_window_by_process_with_state(
-    target_process: &str,
-    state: &mut SearchState,
-) -> Result<ProcessWindow> {
+fn find_window_by_process_with_state(state: &mut SearchState) -> Result<ProcessWindow> {
     let enum_result = unsafe {
         EnumWindows(
             Some(enum_windows_proc),
@@ -427,7 +427,7 @@ fn find_window_by_process_with_state(
     }
     state
         .found
-        .ok_or_else(|| anyhow!("未找到目标游戏窗口进程: {}", target_process))
+        .ok_or_else(|| anyhow!("未找到目标游戏窗口进程: {}", state.target_label))
 }
 
 unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
@@ -447,7 +447,11 @@ unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL 
     match process_name(process_id) {
         Ok(name) => {
             log::debug!("窗口进程: pid={} exe={}", process_id, name);
-            if normalize_process_name(&name) == state.target {
+            if state
+                .targets
+                .iter()
+                .any(|target| normalize_process_name(&name) == *target)
+            {
                 state.found = Some(ProcessWindow { hwnd, process_id });
                 return false.into();
             }
@@ -493,6 +497,34 @@ fn normalize_process_name(value: &str) -> String {
         name.push_str(".exe");
     }
     name
+}
+
+fn normalize_process_names(value: &str) -> Result<Vec<String>> {
+    let targets = value
+        .split(|ch: char| ch == ',' || ch == ';' || ch == '|' || ch.is_whitespace())
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(normalize_process_name)
+        .collect::<Vec<_>>();
+    if targets.is_empty() {
+        bail!("未配置目标游戏窗口进程名");
+    }
+    Ok(targets)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn splits_multiple_target_process_names() {
+        let names = normalize_process_names("yuanshen.exe, GenshinImpact").expect("process names");
+
+        assert_eq!(
+            names,
+            vec!["yuanshen.exe".to_string(), "genshinimpact.exe".to_string()]
+        );
+    }
 }
 
 fn scale_i32(value: i32, from: i32, to: i32) -> i32 {

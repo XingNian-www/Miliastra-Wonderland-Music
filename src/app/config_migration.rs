@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow};
 use serde_yaml::{Mapping, Value};
 
-pub const CURRENT_CONFIG_VERSION: u32 = 13;
+pub const CURRENT_CONFIG_VERSION: u32 = 14;
 
 struct ChangedDefaultField {
     path: &'static str,
@@ -769,7 +769,7 @@ mod tests {
 
     const DEFAULT: &str = r#"# 测试配置
 # 版本注释
-config_version: 13
+config_version: 14
 
 timing:
   watchdog_restart_ms: 2000
@@ -833,6 +833,51 @@ queue:
 tui:
   enabled: true
 
+startup:
+  enabled: true
+  launch_game: true
+  enter_game: true
+  enter_wonderland: true
+  game_path: ""
+  game_args: ""
+  launch_wait_ms: 5000
+  launch_retries: 12
+  enter_game_timeout_ms: 300000
+  enter_wonderland_timeout_ms: 300000
+  final_primary_timeout_ms: 120000
+  poll_ms: 1000
+  f6_retry_ms: 2500
+  stable_timeout_ms: 3000
+  stable_mean_threshold: 2.0
+  stable_changed_ratio_threshold: 0.01
+  enter_game_texts: [进入游戏, Enter Game, Start Game]
+  prompt_confirm_texts: [确认, 确定, 同意, OK]
+  wonderland_home_texts: [千星奇域, 奇域]
+  wonderland_enter_texts: [前往大厅, 进入大厅, 大厅]
+  enter_game_text_region:
+    x: 500
+    y: 560
+    width: 920
+    height: 480
+  prompt_confirm_text_region:
+    x: 560
+    y: 500
+    width: 800
+    height: 420
+  wonderland_home_text_region:
+    x: 0
+    y: 0
+    width: 1920
+    height: 360
+  wonderland_enter_text_region:
+    x: 560
+    y: 620
+    width: 800
+    height: 360
+  wonderland_card_point:
+    x: 680
+    y: 310
+
 ocr:
   min_confidence: 0.9
   change_mean_threshold: 6.0
@@ -864,7 +909,7 @@ unknown_root:
             .expect("migration needed");
 
         assert!(report.text.contains("# 兜底扫描注释"));
-        assert!(report.text.contains("config_version: 13"));
+        assert!(report.text.contains("config_version: 14"));
         assert!(report.text.contains("fallback_ms: 1234"));
         assert!(report.text.contains("loop_idle_ms: 77"));
         assert!(report.text.contains("focus_ms: 456"));
@@ -1035,7 +1080,7 @@ moderation:
 
     #[test]
     fn current_version_without_moved_fields_does_not_migrate() {
-        let current = r#"config_version: 13
+        let current = r#"config_version: 14
 timing:
   loop_idle_ms: 60
   chat_scan:
@@ -1073,7 +1118,7 @@ queue:
             .expect("migration succeeds")
             .expect("migration needed");
 
-        assert!(report.text.contains("config_version: 13"));
+        assert!(report.text.contains("config_version: 14"));
         assert!(
             report
                 .text
@@ -1126,7 +1171,7 @@ custom_workflows:
             .expect("migration succeeds")
             .expect("migration needed");
 
-        assert!(report.text.contains("config_version: 13"));
+        assert!(report.text.contains("config_version: 14"));
         assert!(report.text.contains("allow_args: false"));
         assert!(report.text.contains("message_types:"));
         assert!(report.text.contains("confirm_before_run: false"));
@@ -1202,7 +1247,7 @@ queue:
             .expect("migration succeeds")
             .expect("migration needed");
 
-        assert!(report.text.contains("config_version: 13"));
+        assert!(report.text.contains("config_version: 14"));
         assert!(report.text.contains("auto_advance_seconds: 1"));
     }
 
@@ -1217,7 +1262,7 @@ tui:
             .expect("migration succeeds")
             .expect("migration needed");
 
-        assert!(report.text.contains("config_version: 13"));
+        assert!(report.text.contains("config_version: 14"));
         assert!(report.text.contains("enabled: true"));
         assert!(report.text.contains("protect_auto_played_songs: true"));
     }

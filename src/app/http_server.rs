@@ -30,7 +30,7 @@ use super::runtime_state::PersistentRuntimeState;
 
 const MAX_ACTIVE_CONNECTIONS: usize = 32;
 const PAGE: &str = include_str!("page.html");
-const KNOWN_ROUTES: &str = "/status, /play, /pause, /skip-next, /skip-prev, /volume, /searchPlay, /searchSource, /search, /open-scheme, /history, /clear-history, /health, /monitor, /screenshot, /queue, /queue/add, /queue/remove, /queue/clear, /state, /state/save, /chat/send, /ai/recognize, /ai/match, /ai/pick, /ai/search";
+const KNOWN_ROUTES: &str = "/status, /play, /pause, /skip-next, /skip-prev, /volume, /startup/wonderland, /searchPlay, /searchSource, /search, /open-scheme, /history, /clear-history, /health, /monitor, /screenshot, /queue, /queue/add, /queue/remove, /queue/clear, /state, /state/save, /chat/send, /ai/recognize, /ai/match, /ai/pick, /ai/search";
 
 #[derive(Clone)]
 pub struct HttpSharedState {
@@ -296,6 +296,7 @@ fn route(
                 ),
             )
         }
+        "/startup/wonderland" => enqueue_startup_wonderland(state),
         "/searchPlay" => enqueue_remote_song(query, state, false),
         "/searchSource" => enqueue_remote_song(query, state, false),
         "/search" => {
@@ -375,6 +376,22 @@ fn enqueue_remote_command(
         "duplicate": queued == 0,
         "position": queued,
         "command": command,
+    })
+    .to_string())
+}
+
+fn enqueue_startup_wonderland(state: &HttpSharedState) -> std::result::Result<String, AppError> {
+    let position = enqueue_pending_task(
+        state,
+        super::PendingTask::StartAndEnterWonderland {
+            source: "远程指挥台",
+        },
+    )?;
+    Ok(json!({
+        "ok": true,
+        "queued": true,
+        "position": position,
+        "task": "自动启动并进入千星",
     })
     .to_string())
 }
@@ -999,6 +1016,7 @@ fn is_json_route(path: &str) -> bool {
             | "/skip-next"
             | "/skip-prev"
             | "/volume"
+            | "/startup/wonderland"
             | "/queue"
             | "/queue/add"
             | "/queue/remove"
@@ -1038,6 +1056,7 @@ fn is_mutating_route(path: &str) -> bool {
             | "/skip-next"
             | "/skip-prev"
             | "/volume"
+            | "/startup/wonderland"
             | "/searchPlay"
             | "/searchSource"
             | "/open-scheme"
@@ -1324,6 +1343,13 @@ mod tests {
             assert!(is_mutating_route(route), "{route} should require POST");
             assert!(is_json_route(route), "{route} should return queued JSON");
         }
+    }
+
+    #[test]
+    fn startup_wonderland_route_is_queued_json_post_route() {
+        assert!(is_mutating_route("/startup/wonderland"));
+        assert!(is_json_route("/startup/wonderland"));
+        assert!(PAGE.contains("call('/startup/wonderland','POST')"));
     }
 
     #[test]

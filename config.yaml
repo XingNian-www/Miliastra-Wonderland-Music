@@ -2,11 +2,11 @@
 # 坐标沿用旧脚本习惯：以游戏客户区左上角为原点，按 1920x1080 有效画面写坐标
 
 # 配置版本；程序启动时会把旧版本配置迁移到当前模板
-config_version: 13
+config_version: 14
 
 window:
-  # 目标游戏进程名，按进程文件名匹配，大小写不敏感
-  target_process: yuanshen.exe
+  # 目标游戏进程名，按进程文件名匹配，大小写不敏感；多个进程名可用逗号分隔
+  target_process: yuanshen.exe,GenshinImpact.exe
   # 配置坐标对应的游戏有效画面宽度
   content_width: 1920
   # 配置坐标对应的游戏有效画面高度
@@ -379,6 +379,76 @@ hotkeys:
   pause_key: F7
   # 退出热键
   exit_key: F12
+
+startup:
+  # 程序启动后是否自动排队执行“启动游戏并进入千星奇域”
+  enabled: true
+  # 找不到游戏窗口时是否启动游戏
+  launch_game: true
+  # 是否处理“进入游戏/确认”等开门按钮
+  enter_game: true
+  # 是否按 F6 打开千星奇域，并进入大厅后停止
+  enter_wonderland: true
+  # 游戏 exe 路径；留空时自动从米哈游启动器注册表查找官服/国际服
+  game_path: ""
+  # 启动游戏时附加的命令行参数
+  game_args: ""
+  # 启动游戏后每次等待窗口出现的时间，单位毫秒
+  launch_wait_ms: 5000
+  # 启动游戏后最多检查窗口次数
+  launch_retries: 12
+  # 仅开门模式等待进入游戏完成的最长时间，单位毫秒
+  enter_game_timeout_ms: 300000
+  # 等待千星奇域界面/大厅确认的最长时间，单位毫秒
+  enter_wonderland_timeout_ms: 300000
+  # 点击前往大厅后等待回到可聊天一级界面的最长时间，单位毫秒
+  final_primary_timeout_ms: 120000
+  # 启动流程 OCR/截图轮询间隔，单位毫秒
+  poll_ms: 1000
+  # 未检测到千星奇域界面时重复按 F6 的间隔，单位毫秒
+  f6_retry_ms: 2500
+  # 点击后等待局部像素稳定的最长时间，单位毫秒
+  stable_timeout_ms: 3000
+  # 像素稳定平均差阈值
+  stable_mean_threshold: 2.0
+  # 像素稳定变化比例阈值
+  stable_changed_ratio_threshold: 0.01
+  # “进入游戏”按钮 OCR 文本，按顺序匹配，点击文本框中心
+  enter_game_texts: [进入游戏, Enter Game, Start Game]
+  # 启动/适龄/协议等弹窗确认按钮 OCR 文本
+  prompt_confirm_texts: [确认, 确定, 同意, OK]
+  # 千星奇域主页 OCR 文本；检测到后点击下方配置的奇域卡片坐标
+  wonderland_home_texts: [千星奇域, 奇域]
+  # 选中奇域后进入大厅按钮 OCR 文本
+  wonderland_enter_texts: [前往大厅, 进入大厅, 大厅]
+  # 开门按钮 OCR 区域
+  enter_game_text_region:
+    x: 500
+    y: 560
+    width: 920
+    height: 480
+  # 弹窗确认按钮 OCR 区域
+  prompt_confirm_text_region:
+    x: 560
+    y: 500
+    width: 800
+    height: 420
+  # 千星奇域主页标题 OCR 区域
+  wonderland_home_text_region:
+    x: 0
+    y: 0
+    width: 1920
+    height: 360
+  # 前往大厅按钮 OCR 区域
+  wonderland_enter_text_region:
+    x: 560
+    y: 620
+    width: 800
+    height: 360
+  # 默认点击第一个奇域卡片的位置，按 1920x1080 坐标
+  wonderland_card_point:
+    x: 680
+    y: 310
 
 invite:
   # 好友列表 OCR 区域，用于查找发起邀请的用户名

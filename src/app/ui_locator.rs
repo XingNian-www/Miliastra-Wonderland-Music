@@ -130,8 +130,20 @@ impl UiRegion<'_> {
         engine: &OcrEngine,
         expected: &str,
     ) -> Result<Option<UiTextHit>> {
-        let target = command::normalize_lock_text(expected);
-        if target.is_empty() {
+        self.find_any_text(engine, &[expected])
+    }
+
+    pub(super) fn find_any_text(
+        &self,
+        engine: &OcrEngine,
+        expected: &[&str],
+    ) -> Result<Option<UiTextHit>> {
+        let targets = expected
+            .iter()
+            .map(|text| command::normalize_lock_text(text))
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>();
+        if targets.is_empty() {
             return Ok(None);
         }
 
@@ -151,10 +163,13 @@ impl UiRegion<'_> {
                     line.bbox.height,
                 ),
             };
-            if normalized == target {
+            if targets.iter().any(|target| normalized == *target) {
                 return Ok(Some(hit));
             }
-            if fallback.is_none() && (normalized.contains(&target) || target.contains(&normalized))
+            if fallback.is_none()
+                && targets
+                    .iter()
+                    .any(|target| normalized.contains(target) || target.contains(&normalized))
             {
                 fallback = Some(hit);
             }

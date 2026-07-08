@@ -2,7 +2,7 @@
 # 坐标沿用旧脚本习惯：以游戏客户区左上角为原点，按 1920x1080 有效画面写坐标
 
 # 配置版本；程序启动时会把旧版本配置迁移到当前模板
-config_version: 16
+config_version: 17
 
 window:
   # 目标游戏进程名，按进程文件名匹配，大小写不敏感；多个进程名可用逗号分隔
@@ -413,6 +413,20 @@ startup:
   stable_mean_threshold: 2.0
   # 像素稳定变化比例阈值
   stable_changed_ratio_threshold: 0.01
+  # BGI 启动模板匹配阈值；越高越严格
+  template_threshold: 0.8
+  # BGI 启动流程模板资源
+  templates:
+    choose_enter_game: assets/startup-choose-enter-game.png
+    enter_game: assets/startup-enter-game.png
+    welkin_moon_logo: assets/startup-welkin-moon-logo.png
+    girl_moon: assets/startup-girl-moon.png
+    confirm_black: assets/startup-confirm-black.png
+    confirm_white: assets/startup-confirm-white.png
+    paimon_menu: assets/startup-paimon-menu.png
+    primogem: assets/startup-primogem.png
+    wonderland_close: assets/startup-wonderland-close.png
+    wonderland_enter: assets/startup-wonderland-enter.png
   # “进入游戏”按钮 OCR 文本，按顺序匹配，点击文本框中心
   enter_game_texts: [进入游戏, Enter Game, Start Game]
   # 启动/适龄/协议等弹窗确认按钮 OCR 文本
@@ -421,18 +435,36 @@ startup:
   wonderland_home_texts: [千星奇域, 奇域]
   # 选中奇域后进入大厅按钮 OCR 文本
   wonderland_enter_texts: [前往大厅, 进入大厅, 大厅]
+  # 顶号/切号后的二次进入游戏按钮模板区域
+  choose_enter_game_region:
+    x: 700
+    y: 540
+    width: 520
+    height: 360
   # 开门按钮 OCR 区域
   enter_game_text_region:
     x: 500
     y: 560
     width: 920
     height: 480
+  # 月卡、原石等启动弹窗模板区域
+  loading_popup_region:
+    x: 560
+    y: 420
+    width: 800
+    height: 560
   # 弹窗确认按钮 OCR 区域
   prompt_confirm_text_region:
     x: 560
     y: 500
     width: 800
     height: 420
+  # 派蒙菜单/主界面模板区域
+  main_ui_region:
+    x: 0
+    y: 0
+    width: 480
+    height: 270
   # 千星奇域主页标题 OCR 区域
   wonderland_home_text_region:
     x: 0
@@ -445,6 +477,12 @@ startup:
     y: 620
     width: 800
     height: 360
+  # F6 打开的千星奇域主页关闭/返回模板区域
+  wonderland_close_region:
+    x: 0
+    y: 0
+    width: 1920
+    height: 220
   # 默认点击第一个奇域卡片的位置，按 1920x1080 坐标
   wonderland_card_point:
     x: 680

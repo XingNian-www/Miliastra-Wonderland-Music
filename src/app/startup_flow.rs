@@ -4,6 +4,7 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
+use image::DynamicImage;
 use ocr_rs::OcrEngine;
 use windows::Win32::System::Registry::{
     HKEY_CURRENT_USER, REG_VALUE_TYPE, RRF_RT_REG_SZ, RegGetValueW,
@@ -14,7 +15,7 @@ use super::FrameArgs;
 use super::config::{AppConfig, RectConfig};
 use super::frame_source::Canvas;
 use super::geometry::Point;
-use super::template_match::best_template_hit;
+use super::template_match::{TemplateHit, best_template_hit};
 use super::ui_locator::UiLocator;
 use super::window;
 use super::workflow_actions::{self, PixelStability};
@@ -34,11 +35,12 @@ where
         .context("启动流程聚焦游戏窗口失败")?;
 
     let locator = startup_locator(config);
+    if config.startup.enter_game {
+        open_game_gate_by_bgi(config, engine, &locator, &mut should_continue)?;
+    }
     if config.startup.enter_wonderland {
-        open_wonderland_home(config, engine, &locator, &mut should_continue)?;
-        enter_wonderland_lobby(config, engine, &locator, &mut should_continue)?;
-    } else if config.startup.enter_game {
-        open_game_gate_only(config, engine, &locator, &mut should_continue)?;
+        open_wonderland_home_by_bgi(config, engine, &locator, &mut should_continue)?;
+        enter_wonderland_lobby_by_bgi(config, &locator, &mut should_continue)?;
     }
 
     log::info!("启动流程: 已完成，耗时 {}ms", elapsed_ms(started));
@@ -99,7 +101,7 @@ where
     )
 }
 
-fn open_wonderland_home<F>(
+fn open_game_gate_by_bgi<F>(
     config: &AppConfig,
     engine: &OcrEngine,
     locator: &UiLocator,
@@ -108,6 +110,151 @@ fn open_wonderland_home<F>(
 where
     F: FnMut() -> bool,
 {
+    log::info!("启动流程: 按 BGI 开门流程处理进入游戏");
+    let deadline = Instant::now() + Duration::from_millis(config.startup.enter_game_timeout_ms);
+
+    while Instant::now() < deadline {
+        if !should_continue() {
+            bail!("启动流程已取消");
+        }
+
+        let frame = locator.capture()?;
+        if main_ui_visible(config, &frame.image)? {
+            log::info!("启动流程: 已检测到游戏主界面，开门流程完成");
+            return Ok(());
+        }
+
+        if click_template_on_frame(
+            locator,
+            &frame.image,
+            &config.startup.templates.confirm_white,
+            config.startup.prompt_confirm_text_region,
+            config.startup.template_threshold,
+            "启动白色确认按钮",
+        )? || click_template_on_frame(
+            locator,
+            &frame.image,
+            &config.startup.templates.confirm_black,
+            config.startup.prompt_confirm_text_region,
+            config.startup.template_threshold,
+            "启动黑色确认按钮",
+        )? {
+            wait_region_stable(
+                config,
+                locator,
+                config.startup.prompt_confirm_text_region,
+                should_continue,
+            )?;
+            continue;
+        }
+
+        if click_template_on_frame(
+            locator,
+            &frame.image,
+            &config.startup.templates.choose_enter_game,
+            config.startup.choose_enter_game_region,
+            config.startup.template_threshold,
+            "二次进入游戏",
+        )? || click_template_on_frame(
+            locator,
+            &frame.image,
+            &config.startup.templates.enter_game,
+            config.startup.enter_game_text_region,
+            config.startup.template_threshold,
+            "进入游戏",
+        )? {
+            wait_region_stable(
+                config,
+                locator,
+                config.startup.enter_game_text_region,
+                should_continue,
+            )?;
+            continue;
+        }
+
+        if template_on_frame(
+            config,
+            &frame.image,
+            &config.startup.templates.girl_moon,
+            config.startup.loading_popup_region,
+        )?
+        .is_some()
+            || template_on_frame(
+                config,
+                &frame.image,
+                &config.startup.templates.welkin_moon_logo,
+                config.startup.loading_popup_region,
+            )?
+            .is_some()
+        {
+            log::info!("启动流程: 检测到月卡弹窗，点击空白处关闭");
+            locator.click_point(Point::new(100, 100))?;
+            wait_region_stable(
+                config,
+                locator,
+                config.startup.loading_popup_region,
+                should_continue,
+            )?;
+            continue;
+        }
+
+        if template_on_frame(
+            config,
+            &frame.image,
+            &config.startup.templates.primogem,
+            config.startup.loading_popup_region,
+        )?
+        .is_some()
+        {
+            log::info!("启动流程: 检测到原石弹窗，点击空白处关闭");
+            locator.click_point(Point::new(100, 100))?;
+            wait_region_stable(
+                config,
+                locator,
+                config.startup.loading_popup_region,
+                should_continue,
+            )?;
+            continue;
+        }
+
+        if click_any_text(
+            locator,
+            engine,
+            &config.startup.prompt_confirm_texts,
+            config.startup.prompt_confirm_text_region,
+            "启动弹窗确认",
+        )? || click_any_text(
+            locator,
+            engine,
+            &config.startup.enter_game_texts,
+            config.startup.enter_game_text_region,
+            "进入游戏",
+        )? {
+            wait_region_stable(
+                config,
+                locator,
+                config.startup.enter_game_text_region,
+                should_continue,
+            )?;
+            continue;
+        }
+
+        sleep(Duration::from_millis(config.startup.poll_ms));
+    }
+
+    bail!("等待进入游戏完成超时");
+}
+
+fn open_wonderland_home_by_bgi<F>(
+    config: &AppConfig,
+    engine: &OcrEngine,
+    locator: &UiLocator,
+    should_continue: &mut F,
+) -> Result<()>
+where
+    F: FnMut() -> bool,
+{
+    log::info!("启动流程: 按 BGI 流程打开千星奇域主页");
     let deadline =
         Instant::now() + Duration::from_millis(config.startup.enter_wonderland_timeout_ms);
     let mut last_f6_at = Instant::now()
@@ -118,6 +265,20 @@ where
         if !should_continue() {
             bail!("启动流程已取消");
         }
+
+        let frame = locator.capture()?;
+        if template_on_frame(
+            config,
+            &frame.image,
+            &config.startup.templates.wonderland_close,
+            config.startup.wonderland_close_region,
+        )?
+        .is_some()
+        {
+            log::info!("启动流程: 已检测到千星奇域主页模板");
+            return Ok(());
+        }
+
         if find_any_text(
             locator,
             engine,
@@ -126,182 +287,229 @@ where
         )?
         .is_some()
         {
-            log::info!("启动流程: 已检测到千星奇域界面");
+            log::info!("启动流程: 已通过 OCR 检测到千星奇域主页");
             return Ok(());
         }
-        if click_any_text(
-            locator,
-            engine,
-            &config.startup.prompt_confirm_texts,
-            config.startup.prompt_confirm_text_region,
-            "启动弹窗确认",
-        )? {
-            wait_region_stable(
-                config,
-                locator,
-                config.startup.prompt_confirm_text_region,
-                should_continue,
-            )?;
-            continue;
-        }
-        if config.startup.enter_game
-            && click_any_text(
-                locator,
-                engine,
-                &config.startup.enter_game_texts,
-                config.startup.enter_game_text_region,
-                "进入游戏",
-            )?
-        {
-            wait_region_stable(
-                config,
-                locator,
-                config.startup.enter_game_text_region,
-                should_continue,
-            )?;
-            continue;
-        }
+
         if last_f6_at.elapsed() >= Duration::from_millis(config.startup.f6_retry_ms) {
             workflow_actions::press_key_text("f6", &config.window)
                 .context("启动流程按 F6 打开千星奇域失败")?;
             last_f6_at = Instant::now();
         }
+
         sleep(Duration::from_millis(config.startup.poll_ms));
     }
-
-    bail!("等待千星奇域界面出现超时");
+    bail!("等待千星奇域主页出现超时");
 }
 
-fn enter_wonderland_lobby<F>(
+fn enter_wonderland_lobby_by_bgi<F>(
     config: &AppConfig,
-    engine: &OcrEngine,
     locator: &UiLocator,
     should_continue: &mut F,
 ) -> Result<()>
 where
     F: FnMut() -> bool,
 {
-    log::info!(
-        "启动流程: 点击千星奇域卡片 {},{}",
-        config.startup.wonderland_card_point.x,
-        config.startup.wonderland_card_point.y
-    );
-    locator.click_point(Point::new(
-        config.startup.wonderland_card_point.x,
-        config.startup.wonderland_card_point.y,
-    ))?;
-    wait_region_stable(
+    log::info!("启动流程: 按 BGI 流程进入千星奇域大厅");
+    let confirm = wait_template_with_action(
         config,
         locator,
-        config.startup.wonderland_home_text_region,
-        &mut *should_continue,
-    )?;
-
-    let deadline =
-        Instant::now() + Duration::from_millis(config.startup.enter_wonderland_timeout_ms);
-    while Instant::now() < deadline {
-        if !should_continue() {
-            bail!("启动流程已取消");
-        }
-        if click_any_text(
-            locator,
-            engine,
-            &config.startup.wonderland_enter_texts,
-            config.startup.wonderland_enter_text_region,
-            "前往千星奇域大厅",
-        )? {
-            wait_region_stable(
-                config,
+        &config.startup.templates.confirm_black,
+        config.startup.prompt_confirm_text_region,
+        config.startup.enter_wonderland_timeout_ms,
+        config.startup.poll_ms.max(800),
+        "千星大厅黑色确认按钮",
+        should_continue,
+        |locator| {
+            let frame = locator.capture()?;
+            if click_template_on_frame(
                 locator,
+                &frame.image,
+                &config.startup.templates.wonderland_enter,
                 config.startup.wonderland_enter_text_region,
-                should_continue,
-            )?;
-            wait_primary_ui(config, locator, should_continue)?;
-            log::info!("启动流程: 已进入千星奇域大厅，不执行返回提瓦特");
-            return Ok(());
-        }
-        sleep(Duration::from_millis(config.startup.poll_ms));
-    }
+                config.startup.template_threshold,
+                "千星公共大厅入口",
+            )? {
+                return Ok(());
+            }
+            log::info!(
+                "启动流程: 点击千星奇域卡片 {},{}",
+                config.startup.wonderland_card_point.x,
+                config.startup.wonderland_card_point.y
+            );
+            locator.click_point(Point::new(
+                config.startup.wonderland_card_point.x,
+                config.startup.wonderland_card_point.y,
+            ))
+        },
+    )?;
+    let Some(confirm) = confirm else {
+        bail!("等待千星奇域大厅确认按钮超时");
+    };
 
-    bail!("等待千星奇域大厅确认按钮超时");
+    log::info!(
+        "启动流程: 点击千星确认按钮 {},{} score={:.3}",
+        confirm.center().x,
+        confirm.center().y,
+        confirm.score
+    );
+    locator.click_point(confirm.center())?;
+    if !locator
+        .region(config.startup.prompt_confirm_text_region.into())
+        .wait_template_absent_while(
+            &config.startup.templates.confirm_black,
+            config.startup.template_threshold,
+            config.startup.stable_timeout_ms.max(5000),
+            &mut *should_continue,
+        )?
+    {
+        bail!("千星确认按钮点击后未消失");
+    }
+    workflow_actions::wait(1000);
+
+    wait_main_ui_after_wonderland_enter(config, locator, should_continue)?;
+    log::info!("启动流程: 已进入千星奇域大厅，不执行返回提瓦特");
+    Ok(())
 }
 
-fn open_game_gate_only<F>(
+fn wait_main_ui_after_wonderland_enter<F>(
     config: &AppConfig,
-    engine: &OcrEngine,
     locator: &UiLocator,
     should_continue: &mut F,
 ) -> Result<()>
 where
     F: FnMut() -> bool,
 {
-    let deadline = Instant::now() + Duration::from_millis(config.startup.enter_game_timeout_ms);
+    let deadline = Instant::now() + Duration::from_millis(config.startup.final_primary_timeout_ms);
     while Instant::now() < deadline {
         if !should_continue() {
             bail!("启动流程已取消");
         }
-        if wait_primary_ui_once(config, locator)? {
+        let frame = locator.capture()?;
+        if template_on_frame(
+            config,
+            &frame.image,
+            &config.startup.templates.paimon_menu,
+            config.startup.main_ui_region,
+        )?
+        .is_some()
+        {
+            log::info!("启动流程: 已检测到派蒙菜单模板，主界面加载完成");
             return Ok(());
         }
-        let clicked_confirm = click_any_text(
-            locator,
-            engine,
-            &config.startup.prompt_confirm_texts,
-            config.startup.prompt_confirm_text_region,
-            "启动弹窗确认",
-        )?;
-        let clicked_enter = click_any_text(
-            locator,
-            engine,
-            &config.startup.enter_game_texts,
-            config.startup.enter_game_text_region,
-            "进入游戏",
-        )?;
-        if clicked_confirm || clicked_enter {
-            wait_region_stable(
-                config,
-                locator,
-                config.startup.enter_game_text_region,
-                should_continue,
-            )?;
-        }
-        sleep(Duration::from_millis(config.startup.poll_ms));
-    }
-    bail!("等待进入游戏完成超时");
-}
-
-fn wait_primary_ui<F>(
-    config: &AppConfig,
-    locator: &UiLocator,
-    should_continue: &mut F,
-) -> Result<()>
-where
-    F: FnMut() -> bool,
-{
-    let hit = locator
-        .region(config.screen.enter_rect.into())
-        .wait_template_while(
+        if best_template_hit(
+            &frame.image,
+            Some(config.screen.enter_rect.into()),
             &config.templates.enter,
             config.templates.marker_threshold,
-            config.startup.final_primary_timeout_ms,
-            should_continue,
-        )?;
-    if hit.is_some() {
-        Ok(())
-    } else {
-        bail!("等待千星奇域大厅主界面超时")
+        )?
+        .is_some()
+        {
+            log::info!("启动流程: 已检测到聊天回车模板，主界面加载完成");
+            return Ok(());
+        }
+        sleep(Duration::from_millis(locator.poll_ms()));
     }
+    bail!("等待千星奇域大厅主界面超时")
 }
 
-fn wait_primary_ui_once(config: &AppConfig, locator: &UiLocator) -> Result<bool> {
-    let frame = locator.capture()?;
-    Ok(best_template_hit(
-        &frame.image,
-        Some(config.screen.enter_rect.into()),
-        &config.templates.enter,
-        config.templates.marker_threshold,
+fn main_ui_visible(config: &AppConfig, image: &DynamicImage) -> Result<bool> {
+    Ok(template_on_frame(
+        config,
+        image,
+        &config.startup.templates.paimon_menu,
+        config.startup.main_ui_region,
     )?
-    .is_some())
+    .is_some()
+        || best_template_hit(
+            image,
+            Some(config.screen.enter_rect.into()),
+            &config.templates.enter,
+            config.templates.marker_threshold,
+        )?
+        .is_some())
+}
+
+fn template_on_frame(
+    config: &AppConfig,
+    image: &DynamicImage,
+    template: &PathBuf,
+    region: RectConfig,
+) -> Result<Option<TemplateHit>> {
+    best_template_hit(
+        image,
+        Some(region.into()),
+        template,
+        config.startup.template_threshold,
+    )
+}
+
+fn click_template_on_frame(
+    locator: &UiLocator,
+    image: &DynamicImage,
+    template: &PathBuf,
+    region: RectConfig,
+    threshold: f32,
+    label: &str,
+) -> Result<bool> {
+    let Some(hit) = best_template_hit(image, Some(region.into()), template, threshold)? else {
+        return Ok(false);
+    };
+    let point = hit.center();
+    log::info!(
+        "启动流程: 点击模板 {} {},{} score={:.3}",
+        label,
+        point.x,
+        point.y,
+        hit.score
+    );
+    locator.click_point(point)?;
+    Ok(true)
+}
+
+fn wait_template_with_action<F, A>(
+    config: &AppConfig,
+    locator: &UiLocator,
+    template: &PathBuf,
+    region: RectConfig,
+    timeout_ms: u64,
+    action_interval_ms: u64,
+    label: &str,
+    should_continue: &mut F,
+    mut action: A,
+) -> Result<Option<TemplateHit>>
+where
+    F: FnMut() -> bool,
+    A: FnMut(&UiLocator) -> Result<()>,
+{
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    let mut last_action_at = Instant::now()
+        .checked_sub(Duration::from_millis(action_interval_ms))
+        .unwrap_or_else(Instant::now);
+    loop {
+        if !should_continue() {
+            bail!("启动流程已取消");
+        }
+        let frame = locator.capture()?;
+        if let Some(hit) = template_on_frame(config, &frame.image, template, region)? {
+            log::info!(
+                "启动流程: 检测到模板 {} {},{} score={:.3}",
+                label,
+                hit.center().x,
+                hit.center().y,
+                hit.score
+            );
+            return Ok(Some(hit));
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        if last_action_at.elapsed() >= Duration::from_millis(action_interval_ms) {
+            action(locator)?;
+            last_action_at = Instant::now();
+        }
+        sleep(Duration::from_millis(config.startup.poll_ms));
+    }
 }
 
 fn wait_region_stable<F>(

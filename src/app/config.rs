@@ -443,15 +443,35 @@ pub struct StartupConfig {
     pub stable_timeout_ms: u64,
     pub stable_mean_threshold: f32,
     pub stable_changed_ratio_threshold: f32,
+    pub template_threshold: f32,
+    pub templates: StartupTemplateConfig,
     pub enter_game_texts: Vec<String>,
     pub prompt_confirm_texts: Vec<String>,
     pub wonderland_home_texts: Vec<String>,
     pub wonderland_enter_texts: Vec<String>,
+    pub choose_enter_game_region: RectConfig,
     pub enter_game_text_region: RectConfig,
+    pub loading_popup_region: RectConfig,
     pub prompt_confirm_text_region: RectConfig,
+    pub main_ui_region: RectConfig,
     pub wonderland_home_text_region: RectConfig,
     pub wonderland_enter_text_region: RectConfig,
+    pub wonderland_close_region: RectConfig,
     pub wonderland_card_point: PointConfig,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StartupTemplateConfig {
+    pub choose_enter_game: PathBuf,
+    pub enter_game: PathBuf,
+    pub welkin_moon_logo: PathBuf,
+    pub girl_moon: PathBuf,
+    pub confirm_black: PathBuf,
+    pub confirm_white: PathBuf,
+    pub paimon_menu: PathBuf,
+    pub primogem: PathBuf,
+    pub wonderland_close: PathBuf,
+    pub wonderland_enter: PathBuf,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

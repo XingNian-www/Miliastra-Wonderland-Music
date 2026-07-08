@@ -431,7 +431,7 @@ pub struct StartupConfig {
     pub launch_game: bool,
     pub enter_game: bool,
     pub enter_wonderland: bool,
-    pub game_path: PathBuf,
+    pub exe_path: PathBuf,
     pub game_args: String,
     pub launch_wait_ms: u64,
     pub launch_retries: u32,

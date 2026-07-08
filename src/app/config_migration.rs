@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow};
 use serde_yaml::{Mapping, Value};
 
-pub const CURRENT_CONFIG_VERSION: u32 = 14;
+pub const CURRENT_CONFIG_VERSION: u32 = 15;
 
 struct ChangedDefaultField {
     path: &'static str,
@@ -202,6 +202,7 @@ const MOVED_FIELDS: &[(&str, &str)] = &[
         "moderation.confirm_wait_ms",
         "timing.moderation.confirm_wait_ms",
     ),
+    ("startup.game_path", "startup.exe_path"),
 ];
 
 #[derive(Debug)]
@@ -769,7 +770,7 @@ mod tests {
 
     const DEFAULT: &str = r#"# 测试配置
 # 版本注释
-config_version: 14
+config_version: 15
 
 timing:
   watchdog_restart_ms: 2000
@@ -838,7 +839,7 @@ startup:
   launch_game: true
   enter_game: true
   enter_wonderland: true
-  game_path: ""
+  exe_path: ""
   game_args: ""
   launch_wait_ms: 5000
   launch_retries: 12
@@ -909,7 +910,7 @@ unknown_root:
             .expect("migration needed");
 
         assert!(report.text.contains("# 兜底扫描注释"));
-        assert!(report.text.contains("config_version: 14"));
+        assert!(report.text.contains("config_version: 15"));
         assert!(report.text.contains("fallback_ms: 1234"));
         assert!(report.text.contains("loop_idle_ms: 77"));
         assert!(report.text.contains("focus_ms: 456"));
@@ -1080,7 +1081,7 @@ moderation:
 
     #[test]
     fn current_version_without_moved_fields_does_not_migrate() {
-        let current = r#"config_version: 14
+        let current = r#"config_version: 15
 timing:
   loop_idle_ms: 60
   chat_scan:
@@ -1118,7 +1119,7 @@ queue:
             .expect("migration succeeds")
             .expect("migration needed");
 
-        assert!(report.text.contains("config_version: 14"));
+        assert!(report.text.contains("config_version: 15"));
         assert!(
             report
                 .text
@@ -1171,7 +1172,7 @@ custom_workflows:
             .expect("migration succeeds")
             .expect("migration needed");
 
-        assert!(report.text.contains("config_version: 14"));
+        assert!(report.text.contains("config_version: 15"));
         assert!(report.text.contains("allow_args: false"));
         assert!(report.text.contains("message_types:"));
         assert!(report.text.contains("confirm_before_run: false"));
@@ -1247,7 +1248,7 @@ queue:
             .expect("migration succeeds")
             .expect("migration needed");
 
-        assert!(report.text.contains("config_version: 14"));
+        assert!(report.text.contains("config_version: 15"));
         assert!(report.text.contains("auto_advance_seconds: 1"));
     }
 
@@ -1262,7 +1263,7 @@ tui:
             .expect("migration succeeds")
             .expect("migration needed");
 
-        assert!(report.text.contains("config_version: 14"));
+        assert!(report.text.contains("config_version: 15"));
         assert!(report.text.contains("enabled: true"));
         assert!(report.text.contains("protect_auto_played_songs: true"));
     }

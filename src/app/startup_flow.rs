@@ -11,7 +11,7 @@ use windows::Win32::System::Registry::{
 use windows::core::w;
 
 use super::FrameArgs;
-use super::config::{AppConfig, RectConfig, StartupConfig};
+use super::config::{AppConfig, RectConfig};
 use super::frame_source::Canvas;
 use super::geometry::Point;
 use super::template_match::best_template_hit;
@@ -57,7 +57,7 @@ where
         bail!("未找到游戏窗口，且 startup.launch_game=false，已中止启动流程");
     }
 
-    let game_path = resolve_game_path(&config.startup)?;
+    let game_path = resolve_game_path(config)?;
     if !game_path.exists() {
         bail!("游戏启动路径不存在: {}", game_path.display());
     }
@@ -378,16 +378,57 @@ fn startup_locator(config: &AppConfig) -> UiLocator {
     )
 }
 
-fn resolve_game_path(config: &StartupConfig) -> Result<PathBuf> {
-    if !config.game_path.as_os_str().is_empty() {
-        return Ok(config.game_path.clone());
+fn resolve_game_path(config: &AppConfig) -> Result<PathBuf> {
+    let exe_path = &config.startup.exe_path;
+    if !exe_path.as_os_str().is_empty() {
+        if exe_path.is_dir() {
+            return resolve_game_path_from_dir(exe_path, &config.window.target_process);
+        }
+        return Ok(exe_path.clone());
     }
     if let Some(path) = registry_game_path() {
         return Ok(path);
     }
     Err(anyhow!(
-        "未配置 startup.game_path，且未能从米哈游启动器注册表找到官服/国际服安装路径"
+        "未配置 startup.exe_path，且未能从米哈游启动器注册表找到官服/国际服安装路径"
     ))
+}
+
+fn resolve_game_path_from_dir(dir: &Path, target_process: &str) -> Result<PathBuf> {
+    for candidate in startup_exe_candidates(target_process) {
+        let path = dir.join(&candidate);
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+    bail!(
+        "启动 EXE 所在目录下未找到目标进程对应的 exe: {}",
+        dir.display()
+    )
+}
+
+fn startup_exe_candidates(target_process: &str) -> Vec<String> {
+    let mut candidates = target_process
+        .split(|ch: char| ch == ',' || ch == ';' || ch == '|' || ch.is_whitespace())
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(|item| {
+            if item.to_ascii_lowercase().ends_with(".exe") {
+                item.to_string()
+            } else {
+                format!("{item}.exe")
+            }
+        })
+        .collect::<Vec<_>>();
+    for fallback in ["YuanShen.exe", "GenshinImpact.exe"] {
+        if !candidates
+            .iter()
+            .any(|item| item.eq_ignore_ascii_case(fallback))
+        {
+            candidates.push(fallback.to_string());
+        }
+    }
+    candidates
 }
 
 fn registry_game_path() -> Option<PathBuf> {
@@ -508,5 +549,18 @@ mod tests {
     #[test]
     fn split_command_args_rejects_unclosed_quote() {
         assert!(split_command_args(r#""abc"#).is_err());
+    }
+
+    #[test]
+    fn startup_exe_candidates_adds_exe_suffix_and_fallbacks() {
+        let candidates = startup_exe_candidates("yuanshen.exe, GenshinImpact");
+
+        assert_eq!(candidates[0], "yuanshen.exe");
+        assert_eq!(candidates[1], "GenshinImpact.exe");
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case("YuanShen.exe"))
+        );
     }
 }

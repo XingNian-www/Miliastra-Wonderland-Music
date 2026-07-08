@@ -123,7 +123,7 @@ send-chat --message 测试 --execute
 - Windows 系统
 - 程序必须以管理员权限启动
 - `config.yaml` 的 `window.target_process` 已填写目标游戏进程名；官服/国际服可用逗号分隔，例如 `yuanshen.exe,GenshinImpact.exe`
-- 如启用 `startup.launch_game`，游戏未启动时会优先使用 `startup.game_path`；该项留空时会尝试从米哈游启动器注册表查找官服/国际服安装路径
+- 如启用 `startup.launch_game`，游戏未启动时会优先使用 `startup.exe_path`；该项可以填写完整 exe 文件路径，也可以填写 exe 所在目录，留空时会尝试从米哈游启动器注册表查找官服/国际服安装路径
 - FeelUOwn 已启动并开启 TCP RPC，初始地址为 `127.0.0.1:23333`
 - `models/` 目录里有 OCR 模型
 - `assets/` 目录里有聊天标志和界面按钮模板
@@ -137,7 +137,7 @@ send-chat --message 测试 --execute
 流程：
 
 1. 查找 `window.target_process` 中的官服/国际服游戏窗口
-2. 找不到窗口时按 `startup.game_path` 或注册表路径启动游戏
+2. 找不到窗口时按 `startup.exe_path` 或注册表路径启动游戏
 3. 聚焦游戏窗口一次
 4. 用 OCR 点击“进入游戏”和必要的“确认/同意”按钮
 5. 周期性按 `F6`，直到 OCR 检测到千星奇域界面

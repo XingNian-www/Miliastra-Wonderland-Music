@@ -1,0 +1,11 @@
+{
+  "name": "miliastra-wonderland-yunzai-plugin",
+  "version": "0.1.0",
+  "description": "Yunzai companion plugin for Miliastra Wonderland Music.",
+  "type": "module",
+  "main": "index.js",
+  "private": true,
+  "engines": {
+    "node": ">=18"
+  }
+}

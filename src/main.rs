@@ -1429,12 +1429,23 @@ mod app {
             if !self.executor_is_idle()? {
                 return Ok(());
             }
-            log::info!("闲置退出触发: {}分钟无新命令", timeout.as_secs() / 60);
+            log::info!(
+                "闲置退出触发: {}分钟无新命令，关闭目标游戏进程并保留软件进程",
+                timeout.as_secs() / 60
+            );
             if let Err(error) = window::close_game(&self.config.window) {
                 log::error!("关闭目标窗口失败: {error:#}");
             }
-            self.running.store(false, AtomicOrdering::SeqCst);
-            self.notify_pending_executor();
+            self.clear_idle_exit_timer()?;
+            Ok(())
+        }
+
+        fn clear_idle_exit_timer(&self) -> Result<()> {
+            let mut state = self
+                .idle_exit
+                .lock()
+                .map_err(|_| anyhow!("idle_exit mutex poisoned"))?;
+            *state = None;
             Ok(())
         }
 
@@ -2820,7 +2831,7 @@ mod app {
                 last_command_at: Instant::now(),
             });
             log::info!(
-                "已设置闲置退出: {}分钟无新命令后关闭目标窗口并退出",
+                "已设置闲置退出: {}分钟无新命令后关闭目标游戏进程，软件主进程继续运行",
                 minutes
             );
             Ok(())

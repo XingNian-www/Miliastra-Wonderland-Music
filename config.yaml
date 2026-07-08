@@ -2,7 +2,7 @@
 # 坐标沿用旧脚本习惯：以游戏客户区左上角为原点，按 1920x1080 有效画面写坐标
 
 # 配置版本；程序启动时会把旧版本配置迁移到当前模板
-config_version: 15
+config_version: 16
 
 window:
   # 目标游戏进程名，按进程文件名匹配，大小写不敏感；多个进程名可用逗号分隔
@@ -209,7 +209,7 @@ templates:
   # 一级聊天界面的回车按钮模板
   enter: assets/ui-primary-enter.png
   # 二级大厅/面板界面模板
-  dating: assets/ui-secondary-dating.png
+  secondary_hall: assets/ui-secondary-hall.png
   # 邀请流程里的“查看千星”按钮模板
   invite_view_star: assets/invite-view-star.png
   # 邀请流程里的“前往其大厅”按钮模板

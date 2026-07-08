@@ -666,7 +666,7 @@ fn choose_template(config: &AppConfig) -> Result<PathBuf> {
         "2" => config.templates.yellow_marker.clone(),
         "3" => config.templates.pink_marker.clone(),
         "4" => config.templates.enter.clone(),
-        "5" => config.templates.dating.clone(),
+        "5" => config.templates.secondary_hall.clone(),
         "6" => PathBuf::from(prompt("模板路径")?),
         other => return Err(anyhow!("未知模板选项: {}", other)),
     };

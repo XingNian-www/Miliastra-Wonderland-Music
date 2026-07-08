@@ -196,7 +196,7 @@ mod app {
         #[arg(long)]
         enter_template: Option<PathBuf>,
         #[arg(long)]
-        dating_template: Option<PathBuf>,
+        secondary_hall_template: Option<PathBuf>,
         #[command(flatten)]
         chat_templates: TemplateArgs,
     }
@@ -204,7 +204,7 @@ mod app {
     #[derive(Clone, Debug)]
     struct ResolvedUiTemplateArgs {
         enter_template: PathBuf,
-        dating_template: PathBuf,
+        secondary_hall_template: PathBuf,
         chat_templates: ResolvedTemplateArgs,
     }
 
@@ -215,10 +215,10 @@ mod app {
                     .enter_template
                     .clone()
                     .unwrap_or_else(|| config.templates.enter.clone()),
-                dating_template: self
-                    .dating_template
+                secondary_hall_template: self
+                    .secondary_hall_template
                     .clone()
-                    .unwrap_or_else(|| config.templates.dating.clone()),
+                    .unwrap_or_else(|| config.templates.secondary_hall.clone()),
                 chat_templates: self.chat_templates.resolve(config),
             }
         }

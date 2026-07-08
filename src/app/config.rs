@@ -256,7 +256,7 @@ pub struct TemplateConfig {
     pub yellow_marker: PathBuf,
     pub pink_marker: PathBuf,
     pub enter: PathBuf,
-    pub dating: PathBuf,
+    pub secondary_hall: PathBuf,
     pub invite_view_star: PathBuf,
     pub invite_goto_hall: PathBuf,
     pub invite_enter_hall: PathBuf,

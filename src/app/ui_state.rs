@@ -128,7 +128,7 @@ pub(super) fn detect_ui_state(
     if best_template_hit(
         image,
         Some(screen.secondary_hall_rect.into()),
-        &templates.dating_template,
+        &templates.secondary_hall_template,
         templates.chat_templates.marker_threshold,
     )?
     .is_some()

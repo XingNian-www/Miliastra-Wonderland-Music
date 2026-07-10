@@ -519,28 +519,81 @@ pub struct StartupConfig {
     pub launch_retries: u32,
     pub enter_game_timeout_ms: u64,
     pub enter_wonderland_timeout_ms: u64,
-    pub entered_wonderland_confirm_timeout_ms: Option<u64>,
+    #[serde(default = "default_wonderland_home_retries")]
+    pub wonderland_home_retries: u32,
+    #[serde(default = "default_wonderland_home_retry_ms")]
+    pub wonderland_home_retry_ms: u64,
+    #[serde(default = "default_wonderland_card_retries")]
+    pub wonderland_card_retries: u32,
+    #[serde(default = "default_wonderland_card_retry_ms")]
+    pub wonderland_card_retry_ms: u64,
+    #[serde(default = "default_wonderland_confirm_absent_timeout_ms")]
+    pub wonderland_confirm_absent_timeout_ms: u64,
+    #[serde(default = "default_wonderland_confirm_stable_timeout_ms")]
+    pub wonderland_confirm_stable_timeout_ms: u64,
     pub final_primary_timeout_ms: u64,
     pub poll_ms: u64,
-    pub f6_retry_ms: u64,
-    pub stable_timeout_ms: u64,
     pub stable_mean_threshold: f32,
     pub stable_changed_ratio_threshold: f32,
     pub template_threshold: f32,
+    #[serde(default = "default_wonderland_enter_button_threshold")]
+    pub wonderland_enter_button_threshold: f32,
     pub templates: StartupTemplateConfig,
     pub enter_game_text_region: RectConfig,
-    pub prompt_confirm_text_region: RectConfig,
-    pub entered_wonderland_confirm_region: Option<RectConfig>,
+    #[serde(default = "default_wonderland_enter_button_region")]
+    pub wonderland_enter_button_region: RectConfig,
     pub main_ui_region: RectConfig,
     pub wonderland_close_region: RectConfig,
     pub wonderland_card_point: PointConfig,
 }
 
+fn default_wonderland_home_retries() -> u32 {
+    120
+}
+
+fn default_wonderland_home_retry_ms() -> u64 {
+    2500
+}
+
+fn default_wonderland_card_retries() -> u32 {
+    90
+}
+
+fn default_wonderland_card_retry_ms() -> u64 {
+    2000
+}
+
+fn default_wonderland_confirm_absent_timeout_ms() -> u64 {
+    60000
+}
+
+fn default_wonderland_confirm_stable_timeout_ms() -> u64 {
+    60000
+}
+
+fn default_wonderland_enter_button_threshold() -> f32 {
+    0.9
+}
+
+fn default_wonderland_enter_button_region() -> RectConfig {
+    RectConfig {
+        x: 1400,
+        y: 850,
+        width: 360,
+        height: 150,
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StartupTemplateConfig {
-    pub confirm_black: PathBuf,
+    #[serde(default = "default_wonderland_enter_button_template")]
+    pub wonderland_enter_button: PathBuf,
     pub paimon_menu: PathBuf,
     pub wonderland_close: PathBuf,
+}
+
+fn default_wonderland_enter_button_template() -> PathBuf {
+    PathBuf::from("assets/startup-confirm-black.png")
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -550,4 +603,79 @@ pub struct InviteConfig {
     pub view_star_region: RectConfig,
     pub goto_hall_region: RectConfig,
     pub enter_hall_region: RectConfig,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_startup_confirm_fields_do_not_override_wonderland_enter_button_defaults() {
+        let startup: StartupConfig = serde_yaml::from_str(
+            r#"
+enabled: true
+launch_game: true
+enter_game: true
+enter_wonderland: true
+exe_path: ""
+game_args: ""
+launch_wait_ms: 5000
+launch_retries: 12
+enter_game_timeout_ms: 60000
+enter_wonderland_timeout_ms: 300000
+entered_wonderland_confirm_timeout_ms: 20000
+final_primary_timeout_ms: 120000
+poll_ms: 1000
+f6_retry_ms: 2500
+stable_timeout_ms: 3000
+stable_mean_threshold: 2.0
+stable_changed_ratio_threshold: 0.01
+template_threshold: 0.8
+templates:
+  confirm_black: assets/old-confirm-black.png
+  paimon_menu: assets/startup-paimon-menu.png
+  wonderland_close: assets/startup-wonderland-close.png
+enter_game_text_region:
+  x: 900
+  y: 1000
+  width: 130
+  height: 40
+prompt_confirm_text_region:
+  x: 1400
+  y: 900
+  width: 100
+  height: 100
+entered_wonderland_confirm_region:
+  x: 1100
+  y: 900
+  width: 100
+  height: 100
+main_ui_region:
+  x: 0
+  y: 0
+  width: 480
+  height: 270
+wonderland_close_region:
+  x: 1780
+  y: 0
+  width: 140
+  height: 90
+wonderland_card_point:
+  x: 680
+  y: 310
+"#,
+        )
+        .expect("old startup config should load with new defaults");
+
+        assert_eq!(startup.template_threshold, 0.8);
+        assert_eq!(startup.wonderland_enter_button_threshold, 0.9);
+        assert_eq!(
+            startup.templates.wonderland_enter_button,
+            PathBuf::from("assets/startup-confirm-black.png")
+        );
+        assert_eq!(startup.wonderland_enter_button_region.x, 1400);
+        assert_eq!(startup.wonderland_enter_button_region.y, 850);
+        assert_eq!(startup.wonderland_enter_button_region.width, 360);
+        assert_eq!(startup.wonderland_enter_button_region.height, 150);
+    }
 }

@@ -317,11 +317,9 @@ flowchart TD
 
 `src/app/startup_flow.rs` 是进入千星任务状态机：
 
-1. `OpenWonderlandHome`：按 F6，等待右上角千星关闭按钮模板稳定出现。
-2. `ClickWonderlandCard`：点击配置的千星卡片点，等待大厅确认按钮出现。
-3. `ConfirmEnter`：点击黑色确认按钮。
-4. `WaitConfirmGone`：等待确认按钮消失。
-5. `WaitEnteredWonderlandConfirm`：最多等待 20 秒，在进入后的确认区域再次检测黑色确认按钮。
+1. `OpenWonderlandHome`：按阶段重试配置按 F6，等待右上角千星关闭按钮模板稳定出现。
+2. `ClickWonderlandCard`：按阶段重试配置点击千星卡片点，在 `(1400,850,360,150)` 快速匹配“前往大厅”按钮后只点击一次。
+3. `WaitConfirmGone`：继续快速轮询同一区域；模板消失且区域像素稳定后认为进入千星。
 
 任务成功后由调用方执行返回一级界面。它不会清空后续待执行任务；返回一级后队列继续执行。
 

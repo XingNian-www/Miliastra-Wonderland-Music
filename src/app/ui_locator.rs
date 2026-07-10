@@ -16,6 +16,14 @@ use super::ocr::recognize_lines;
 use super::template_match::{TemplateHit, best_template_hit};
 
 pub(super) fn startup_locator(config: &config::AppConfig) -> UiLocator {
+    startup_locator_with_poll_ms(config, config.startup.poll_ms)
+}
+
+pub(super) fn startup_transition_locator(config: &config::AppConfig) -> UiLocator {
+    startup_locator_with_poll_ms(config, config.timing.input.click_ms.max(100))
+}
+
+fn startup_locator_with_poll_ms(config: &config::AppConfig, poll_ms: u64) -> UiLocator {
     UiLocator::new(
         Canvas {
             width: config.screen.expected_width,
@@ -24,7 +32,7 @@ pub(super) fn startup_locator(config: &config::AppConfig) -> UiLocator {
         },
         FrameArgs { image: None },
         config.window.clone(),
-        config.startup.poll_ms,
+        poll_ms,
     )
 }
 

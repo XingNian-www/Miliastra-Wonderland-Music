@@ -4,29 +4,21 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
-use super::config::{AppConfig, RectConfig};
+use super::config::{AppConfig, PointConfig, RectConfig};
 use super::geometry::Point;
 use super::template_match::{TemplateHit, best_template_hit};
-use super::ui_locator::{UiLocator, startup_locator};
+use super::ui_locator::{UiLocator, startup_locator, startup_transition_locator};
 use super::window;
 use super::workflow_actions;
+use super::workflow_actions::{HitAction, PixelStability, TemplateMode};
 
 const STARTUP_TEMPLATE_STABLE_HITS: u32 = 2;
-const ENTERED_WONDERLAND_CONFIRM_TIMEOUT_MS: u64 = 20_000;
-const ENTERED_WONDERLAND_CONFIRM_REGION: RectConfig = RectConfig {
-    x: 1100,
-    y: 900,
-    width: 100,
-    height: 100,
-};
 
 #[derive(Clone, Copy, Debug)]
 enum WonderlandStep {
     OpenWonderlandHome,
     ClickWonderlandCard,
-    ConfirmEnter,
     WaitConfirmGone,
-    WaitEnteredWonderlandConfirm,
 }
 
 impl WonderlandStep {
@@ -34,9 +26,7 @@ impl WonderlandStep {
         match self {
             Self::OpenWonderlandHome => "打开千星奇域主页",
             Self::ClickWonderlandCard => "点击千星奇域卡片",
-            Self::ConfirmEnter => "确认进入大厅",
-            Self::WaitConfirmGone => "等待确认弹窗消失",
-            Self::WaitEnteredWonderlandConfirm => "等待千星内确认按钮",
+            Self::WaitConfirmGone => "等待前往大厅按钮消失",
         }
     }
 }
@@ -77,18 +67,10 @@ where
             }
             WonderlandStep::ClickWonderlandCard => {
                 click_wonderland_card(config, locator, should_continue)?;
-                WonderlandStep::ConfirmEnter
-            }
-            WonderlandStep::ConfirmEnter => {
-                click_enter_confirm(config, locator, should_continue)?;
                 WonderlandStep::WaitConfirmGone
             }
             WonderlandStep::WaitConfirmGone => {
-                wait_enter_confirm_gone(config, locator, should_continue)?;
-                WonderlandStep::WaitEnteredWonderlandConfirm
-            }
-            WonderlandStep::WaitEnteredWonderlandConfirm => {
-                wait_entered_wonderland_confirm_reappeared(config, locator, should_continue)?;
+                wait_enter_confirm_gone(config, should_continue)?;
                 return Ok(());
             }
         };
@@ -103,16 +85,19 @@ fn open_wonderland_home<F>(
 where
     F: FnMut() -> bool,
 {
-    for attempt in 1..=attempt_count(
+    let retry_ms = config.startup.wonderland_home_retry_ms.max(100);
+    let attempts = capped_attempts(
+        config.startup.wonderland_home_retries,
         config.startup.enter_wonderland_timeout_ms,
-        config.startup.f6_retry_ms,
-    ) {
+        retry_ms,
+    );
+    for attempt in 1..=attempts {
         if !should_continue() {
             bail!("进入千星流程已取消");
         }
         workflow_actions::press_key_text("f6", &config.window)
             .context("进入千星流程按 F6 打开千星奇域失败")?;
-        sleep(Duration::from_millis(config.startup.f6_retry_ms));
+        sleep(Duration::from_millis(retry_ms));
         if template_stable_visible(
             config,
             locator,
@@ -121,10 +106,18 @@ where
             "千星奇域主页关闭按钮",
             should_continue,
         )? {
-            log::info!("进入千星流程: 已打开千星奇域主页 attempt={}", attempt);
+            log::info!(
+                "进入千星流程: 已打开千星奇域主页 attempt={}/{}",
+                attempt,
+                attempts
+            );
             return Ok(());
         }
-        log::info!("进入千星流程: 未检测到千星奇域主页 attempt={}", attempt);
+        log::info!(
+            "进入千星流程: 未检测到千星奇域主页 attempt={}/{}",
+            attempt,
+            attempts
+        );
     }
     bail!("等待千星奇域主页出现超时")
 }
@@ -137,10 +130,14 @@ fn click_wonderland_card<F>(
 where
     F: FnMut() -> bool,
 {
-    for attempt in 1..=attempt_count(
+    let prompt_locator = startup_transition_locator(config);
+    let prompt_timeout_ms = config.startup.wonderland_card_retry_ms.max(100);
+    let attempts = capped_attempts(
+        config.startup.wonderland_card_retries,
         config.startup.enter_wonderland_timeout_ms,
-        config.startup.poll_ms.max(800),
-    ) {
+        prompt_timeout_ms,
+    );
+    for attempt in 1..=attempts {
         if !should_continue() {
             bail!("进入千星流程已取消");
         }
@@ -154,124 +151,63 @@ where
             config.startup.wonderland_card_point.x,
             config.startup.wonderland_card_point.y,
         ))?;
-        sleep(Duration::from_millis(config.startup.poll_ms.max(800)));
-        if template_stable_visible(
-            config,
-            locator,
-            &config.startup.templates.confirm_black,
-            config.startup.prompt_confirm_text_region,
-            "千星大厅黑色确认按钮",
-            should_continue,
-        )? {
-            log::info!("进入千星流程: 已检测到千星大厅黑色确认按钮");
+        let confirm = workflow_actions::wait_or_click_template(
+            &prompt_locator,
+            &config.startup.templates.wonderland_enter_button,
+            config.startup.wonderland_enter_button_region,
+            config.startup.wonderland_enter_button_threshold,
+            prompt_timeout_ms,
+            HitAction::Click {
+                offset: PointConfig::new(0, 0),
+            },
+            || should_continue(),
+        )?;
+        if let Some(confirm) = confirm {
+            log::info!(
+                "进入千星流程: 已检测到前往大厅按钮，点击一次 {},{} score={:.3} attempt={}/{}",
+                confirm.center().x,
+                confirm.center().y,
+                confirm.score,
+                attempt,
+                attempts
+            );
             return Ok(());
         }
+        if !should_continue() {
+            bail!("进入千星流程已取消");
+        }
+        log::info!(
+            "进入千星流程: 未检测到前往大厅按钮 attempt={}/{}",
+            attempt,
+            attempts
+        );
     }
     bail!("等待千星奇域大厅确认按钮超时")
 }
 
-fn click_enter_confirm<F>(
-    config: &AppConfig,
-    locator: &UiLocator,
-    should_continue: &mut F,
-) -> Result<()>
+fn wait_enter_confirm_gone<F>(config: &AppConfig, should_continue: &mut F) -> Result<()>
 where
     F: FnMut() -> bool,
 {
-    let Some(confirm) = locate_template(
-        config,
-        locator,
-        &config.startup.templates.confirm_black,
-        config.startup.prompt_confirm_text_region,
-        "千星大厅黑色确认按钮",
+    let locator = startup_transition_locator(config);
+    workflow_actions::locate_template(
+        &locator,
+        &config.startup.templates.wonderland_enter_button,
+        config.startup.wonderland_enter_button_region,
+        config.startup.wonderland_enter_button_threshold,
+        config.startup.wonderland_confirm_absent_timeout_ms,
+        TemplateMode::Absent {
+            stability: Some(PixelStability {
+                timeout_ms: config.startup.wonderland_confirm_stable_timeout_ms,
+                mean_threshold: config.startup.stable_mean_threshold,
+                changed_ratio_threshold: config.startup.stable_changed_ratio_threshold,
+            }),
+        },
         should_continue,
-    )?
-    else {
-        bail!("确认进入大厅时未找到千星确认按钮");
-    };
-    log::info!(
-        "进入千星流程: 点击千星确认按钮 {},{} score={:.3}",
-        confirm.center().x,
-        confirm.center().y,
-        confirm.score
-    );
-    locator.click_point(confirm.center())?;
+    )
+    .context("点击前往大厅按钮后等待模板消失或区域稳定失败")?;
+    log::info!("进入千星流程: 前往大厅按钮已消失且区域稳定，判定已进入千星");
     Ok(())
-}
-
-fn wait_enter_confirm_gone<F>(
-    config: &AppConfig,
-    locator: &UiLocator,
-    should_continue: &mut F,
-) -> Result<()>
-where
-    F: FnMut() -> bool,
-{
-    let deadline =
-        Instant::now() + Duration::from_millis(config.startup.stable_timeout_ms.max(5000));
-    while Instant::now() < deadline {
-        if !should_continue() {
-            bail!("进入千星流程已取消");
-        }
-        if locate_template(
-            config,
-            locator,
-            &config.startup.templates.confirm_black,
-            config.startup.prompt_confirm_text_region,
-            "千星确认按钮",
-            should_continue,
-        )?
-        .is_none()
-        {
-            log::info!("进入千星流程: 千星确认按钮已消失");
-            workflow_actions::wait(1000);
-            return Ok(());
-        }
-        sleep(Duration::from_millis(config.startup.poll_ms.max(1000)));
-    }
-    bail!("千星确认按钮点击后未消失")
-}
-
-fn wait_entered_wonderland_confirm_reappeared<F>(
-    config: &AppConfig,
-    locator: &UiLocator,
-    should_continue: &mut F,
-) -> Result<()>
-where
-    F: FnMut() -> bool,
-{
-    let timeout_ms = config
-        .startup
-        .entered_wonderland_confirm_timeout_ms
-        .unwrap_or(ENTERED_WONDERLAND_CONFIRM_TIMEOUT_MS);
-    let region = config
-        .startup
-        .entered_wonderland_confirm_region
-        .unwrap_or(ENTERED_WONDERLAND_CONFIRM_REGION);
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-    while Instant::now() < deadline {
-        if !should_continue() {
-            bail!("进入千星流程已取消");
-        }
-        if let Some(hit) = locate_template(
-            config,
-            locator,
-            &config.startup.templates.confirm_black,
-            region,
-            "千星内黑色确认按钮",
-            should_continue,
-        )? {
-            log::info!(
-                "进入千星流程: 已检测到千星内确认按钮 {},{} score={:.3}",
-                hit.center().x,
-                hit.center().y,
-                hit.score
-            );
-            return Ok(());
-        }
-        sleep(Duration::from_millis(locator.poll_ms()));
-    }
-    bail!("等待千星内确认按钮再次出现超时: {}ms", timeout_ms)
 }
 
 fn template_on_frame(
@@ -346,6 +282,12 @@ where
         log::debug!("进入千星流程: 未检测到模板 {}", label);
     }
     Ok(hit)
+}
+
+fn capped_attempts(configured_retries: u32, timeout_ms: u64, interval_ms: u64) -> u32 {
+    configured_retries
+        .max(1)
+        .min(attempt_count(timeout_ms, interval_ms))
 }
 
 fn attempt_count(timeout_ms: u64, interval_ms: u64) -> u32 {

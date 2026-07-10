@@ -152,17 +152,18 @@ send-chat --message 测试 --execute
 1. 查找 `window.target_process` 中的官服/国际服游戏窗口
 2. 找不到窗口时按 `startup.exe_path` 或注册表路径启动游戏
 3. 检测到游戏窗口后聚焦游戏窗口一次
-4. 在 `startup.enter_game_text_region` 循环 OCR，最多 60 秒等待“点击进入”四个字
-5. 识别到“点击进入”后点击文本框中心，并持续点击直到该文字不再出现
-6. 文字消失后等待全局 `templates.enter` 在 `screen.enter_rect` 中出现，出现后认为启动游戏任务完成
+4. 每轮先匹配全局 `templates.enter` 在 `screen.enter_rect` 中是否已出现；出现即认为已经进入一级界面并完成任务
+5. 未出现时才在 `startup.enter_game_text_region` 循环 OCR，最多 60 秒等待“点击进入”四个字
+6. 识别到“点击进入”后点击文本框中心，并持续点击直到该文字不再出现
+7. 文字消失后等待全局 `templates.enter` 出现，出现后认为启动游戏任务完成
 
 进入千星任务流程：
 
 1. 查找并聚焦已有游戏窗口；找不到窗口时直接失败，需要先执行启动游戏任务
-2. 周期性按 `F6`，直到在右上角区域检测到千星奇域主页的 `wonderland_close` 模板
-3. 点击配置的第一个奇域卡片坐标，等待黑色确认按钮模板在确认区域出现
-4. 点击黑色确认按钮，并等待确认按钮消失
-5. 确认按钮消失后最多等待 20 秒，继续在进入后确认区域检测黑色确认按钮模板；再次出现就认为已经进入千星
+2. 按 `startup.wonderland_home_retries` 和 `startup.wonderland_home_retry_ms` 周期性按 `F6`，直到在右上角区域检测到千星奇域主页的 `wonderland_close` 模板
+3. 按 `startup.wonderland_card_retries` 和 `startup.wonderland_card_retry_ms` 点击配置的第一个奇域卡片坐标，在 `(1400,850,360,150)` 快速轮询并匹配“前往大厅”按钮模板
+4. 匹配成功后只点击一次“前往大厅”按钮
+5. 点击后继续快速轮询同一区域，最多等待 `startup.wonderland_confirm_absent_timeout_ms` 让模板消失，再最多等待 `startup.wonderland_confirm_stable_timeout_ms` 让区域像素稳定
 6. 进入千星后执行返回一级界面流程，然后任务完成，后续点歌、邀请等任务可以继续执行
 
 返回一级界面只回到千星内可操作的主界面，不自动退出千星。

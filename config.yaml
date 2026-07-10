@@ -443,25 +443,34 @@ startup:
   enter_game_timeout_ms: 60000
   # 等待千星奇域界面/大厅确认的最长时间，单位毫秒
   enter_wonderland_timeout_ms: 300000
-  # 点击千星确认并等待原确认按钮消失后，等待千星内确认按钮再次出现的最长时间，单位毫秒
-  entered_wonderland_confirm_timeout_ms: 20000
-  # 点击前往大厅后等待回到可聊天一级界面的最长时间，单位毫秒
+  # 打开千星主页阶段最多按 F6 次数
+  wonderland_home_retries: 120
+  # 打开千星主页阶段每次按 F6 后等待时间，单位毫秒
+  wonderland_home_retry_ms: 2500
+  # 点击奇域卡片阶段最多重试次数
+  wonderland_card_retries: 90
+  # 每次点击奇域卡片后等待“前往大厅”按钮出现的时间，单位毫秒
+  wonderland_card_retry_ms: 2000
+  # 点击“前往大厅”后等待按钮消失的最长时间，单位毫秒
+  wonderland_confirm_absent_timeout_ms: 60000
+  # “前往大厅”按钮消失后等待该区域像素稳定的最长时间，单位毫秒
+  wonderland_confirm_stable_timeout_ms: 60000
+  # 启动游戏结束时等待左下角 Enter 模板的最长时间，单位毫秒
   final_primary_timeout_ms: 120000
   # 启动流程 OCR/截图轮询间隔，单位毫秒
   poll_ms: 1000
-  # 未检测到千星奇域界面时重复按 F6 的间隔，单位毫秒
-  f6_retry_ms: 2500
-  # 点击后等待局部像素稳定的最长时间，单位毫秒
-  stable_timeout_ms: 3000
   # 像素稳定平均差阈值
   stable_mean_threshold: 2.0
   # 像素稳定变化比例阈值
   stable_changed_ratio_threshold: 0.01
   # 启动/千星模板匹配阈值；越高越严格
-  template_threshold: 0.8
+  template_threshold: 0.9
+  # 千星“前往大厅”按钮模板匹配阈值；旧配置中的 template_threshold 不影响该按钮
+  wonderland_enter_button_threshold: 0.9
   # 进入千星流程模板资源；启动游戏完成判断复用全局 templates.enter
   templates:
-    confirm_black: assets/startup-confirm-black.png
+    # 千星“前往大厅”按钮模板
+    wonderland_enter_button: assets/startup-confirm-black.png
     paimon_menu: assets/startup-paimon-menu.png
     wonderland_close: assets/startup-wonderland-close.png
   # “点击进入”按钮 OCR 区域
@@ -470,18 +479,12 @@ startup:
     y: 1000
     width: 130
     height: 40
-  # 千星黑色确认按钮模板区域
-  prompt_confirm_text_region:
+  # 千星“前往大厅”按钮模板区域；旧配置中的 prompt_confirm_text_region 不影响该按钮
+  wonderland_enter_button_region:
     x: 1400
-    y: 900
-    width: 100
-    height: 100
-  # 进入千星后再次出现的黑色确认按钮模板区域
-  entered_wonderland_confirm_region:
-    x: 1100
-    y: 900
-    width: 100
-    height: 100
+    y: 850
+    width: 360
+    height: 150
   # 派蒙菜单/主界面模板区域
   main_ui_region:
     x: 0

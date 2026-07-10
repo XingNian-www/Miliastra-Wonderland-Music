@@ -861,16 +861,20 @@ startup:
   launch_retries: 12
   enter_game_timeout_ms: 60000
   enter_wonderland_timeout_ms: 300000
-  entered_wonderland_confirm_timeout_ms: 20000
+  wonderland_home_retries: 120
+  wonderland_home_retry_ms: 2500
+  wonderland_card_retries: 90
+  wonderland_card_retry_ms: 2000
+  wonderland_confirm_absent_timeout_ms: 60000
+  wonderland_confirm_stable_timeout_ms: 60000
   final_primary_timeout_ms: 120000
   poll_ms: 1000
-  f6_retry_ms: 2500
-  stable_timeout_ms: 3000
   stable_mean_threshold: 2.0
   stable_changed_ratio_threshold: 0.01
-  template_threshold: 0.8
+  template_threshold: 0.9
+  wonderland_enter_button_threshold: 0.9
   templates:
-    confirm_black: assets/startup-confirm-black.png
+    wonderland_enter_button: assets/startup-confirm-black.png
     paimon_menu: assets/startup-paimon-menu.png
     wonderland_close: assets/startup-wonderland-close.png
   enter_game_text_region:
@@ -878,16 +882,11 @@ startup:
     y: 1000
     width: 130
     height: 40
-  prompt_confirm_text_region:
+  wonderland_enter_button_region:
     x: 1400
-    y: 900
-    width: 100
-    height: 100
-  entered_wonderland_confirm_region:
-    x: 1100
-    y: 900
-    width: 100
-    height: 100
+    y: 850
+    width: 360
+    height: 150
   main_ui_region:
     x: 0
     y: 0
@@ -937,7 +936,7 @@ unknown_root:
 
         assert!(report.text.contains("# 兜底扫描注释"));
         assert!(report.text.contains("config_version: 18"));
-        assert!(report.text.contains("template_threshold: 0.8"));
+        assert!(report.text.contains("template_threshold: 0.9"));
         assert!(report.text.contains("enter_game_timeout_ms: 60000"));
         assert!(report.text.contains("enter_game_text_region:"));
         assert!(report.text.contains("x: 900"));

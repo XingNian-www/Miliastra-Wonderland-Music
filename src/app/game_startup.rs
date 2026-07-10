@@ -11,7 +11,6 @@ use windows::Win32::System::Registry::{
 use windows::core::w;
 
 use super::config::AppConfig;
-use super::template_match::best_template_hit;
 use super::ui_locator::{UiLocator, startup_locator};
 use super::window;
 use super::workflow_actions;
@@ -26,6 +25,12 @@ enum GameStartupStep {
     WaitEnterGameTextGone,
     WaitPrimaryEnterTemplate,
     Done,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EnterGameEntryResult {
+    TextClicked,
+    PrimaryUiDetected,
 }
 
 impl GameStartupStep {
@@ -98,8 +103,19 @@ where
                 let deadline = *enter_game_deadline.get_or_insert_with(|| {
                     Instant::now() + Duration::from_millis(config.startup.enter_game_timeout_ms)
                 });
-                click_enter_game_text_once(config, engine, &locator, should_continue, deadline)?;
-                GameStartupStep::WaitEnterGameTextGone
+                match click_enter_game_text_once(
+                    config,
+                    engine,
+                    &locator,
+                    should_continue,
+                    deadline,
+                )? {
+                    EnterGameEntryResult::TextClicked => GameStartupStep::WaitEnterGameTextGone,
+                    EnterGameEntryResult::PrimaryUiDetected => {
+                        on_window_detection_reset("启动游戏流程已检测到一级界面");
+                        GameStartupStep::Done
+                    }
+                }
             }
             GameStartupStep::WaitEnterGameTextGone => {
                 let deadline = enter_game_deadline.expect("进入游戏文字点击步骤应该先设置超时时间");
@@ -199,13 +215,20 @@ fn click_enter_game_text_once<F>(
     locator: &UiLocator,
     should_continue: &mut F,
     deadline: Instant,
-) -> Result<()>
+) -> Result<EnterGameEntryResult>
 where
     F: FnMut() -> bool,
 {
     while Instant::now() < deadline {
         if !should_continue() {
             bail!("启动游戏流程已取消");
+        }
+        if primary_enter_template_visible(config, locator)? {
+            log::info!(
+                "启动游戏流程: 已检测到左下角 Enter 模板，跳过点击 {} 并进入游戏完成",
+                ENTER_GAME_OCR_TEXT
+            );
+            return Ok(EnterGameEntryResult::PrimaryUiDetected);
         }
         let region = locator.region(config.startup.enter_game_text_region.into());
         if let Some(hit) = region.find_text(engine, ENTER_GAME_OCR_TEXT)? {
@@ -217,7 +240,7 @@ where
                 point.y
             );
             locator.click_point(point)?;
-            return Ok(());
+            return Ok(EnterGameEntryResult::TextClicked);
         }
         sleep(Duration::from_millis(config.startup.poll_ms));
     }
@@ -226,6 +249,13 @@ where
         config.startup.enter_game_timeout_ms,
         ENTER_GAME_OCR_TEXT
     )
+}
+
+fn primary_enter_template_visible(config: &AppConfig, locator: &UiLocator) -> Result<bool> {
+    Ok(locator
+        .region(config.screen.enter_rect.into())
+        .find_template_with_threshold(&config.templates.enter, config.templates.marker_threshold)?
+        .is_some())
 }
 
 fn wait_enter_game_text_gone<F>(
@@ -277,15 +307,7 @@ where
         if !should_continue() {
             bail!("启动游戏流程已取消");
         }
-        let frame = locator.capture()?;
-        if best_template_hit(
-            &frame.image,
-            Some(config.screen.enter_rect.into()),
-            &config.templates.enter,
-            config.templates.marker_threshold,
-        )?
-        .is_some()
-        {
+        if primary_enter_template_visible(config, locator)? {
             log::info!("启动游戏流程: 已检测到左下角 Enter 模板，进入游戏完成");
             return Ok(());
         }

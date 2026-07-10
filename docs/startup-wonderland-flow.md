@@ -45,6 +45,7 @@ stateDiagram-v2
     EnsureGameWindow --> FocusGameWindow: 找到或启动游戏窗口
     FocusGameWindow --> ClickEnterGameText: startup.enter_game=true
     FocusGameWindow --> Done: startup.enter_game=false
+    ClickEnterGameText --> Done: Enter 模板已出现
     ClickEnterGameText --> WaitEnterGameTextGone: 点击 OCR “点击进入”
     WaitEnterGameTextGone --> WaitPrimaryEnterTemplate: “点击进入”消失
     WaitPrimaryEnterTemplate --> Done: Enter 模板出现
@@ -83,10 +84,11 @@ stateDiagram-v2
 
 如果 `startup.enter_game=true`，进入开门流程：
 
-1. 在 `startup.enter_game_text_region` 中 OCR。
-2. 目标文本固定为 `点击进入`。
-3. 找到后点击 OCR 文本框中心。
-4. 最长等待 `startup.enter_game_timeout_ms`。
+1. 每轮先在 `screen.enter_rect` 匹配全局 `templates.enter`。
+2. 若命中左下角 Enter 模板，直接认为已经进入一级界面并完成任务。
+3. 未命中时，才在 `startup.enter_game_text_region` 中 OCR 固定文本 `点击进入`。
+4. 找到后点击 OCR 文本框中心。
+5. 最长等待 `startup.enter_game_timeout_ms`。
 
 当前默认区域是 `900,1000,130,40`，默认超时 60 秒。
 
@@ -102,7 +104,9 @@ stateDiagram-v2
 
 ### 等待一级回车模板（WaitPrimaryEnterTemplate）
 
-文字消失后等待全局 `templates.enter` 在 `screen.enter_rect` 出现。检测到左下角 Enter 模板后，认为启动游戏任务完成。
+文字消失后继续等待全局 `templates.enter` 在 `screen.enter_rect` 出现。检测到左下角 Enter 模板后，认为启动游戏任务完成。
+
+启动时若游戏已跳过“点击进入”阶段并直接进入一级界面，`ClickEnterGameText` 里的模板检测会先命中，任务不会等待 OCR 超时。
 
 这里不判断白屏本身。白屏只是加载过程中的中间状态；成功条件是最终回到可聊天的一级界面信号。
 
@@ -114,10 +118,8 @@ stateDiagram-v2
 stateDiagram-v2
     [*] --> OpenWonderlandHome
     OpenWonderlandHome --> ClickWonderlandCard: 千星主页关闭按钮稳定出现
-    ClickWonderlandCard --> ConfirmEnter: 黑色确认按钮稳定出现
-    ConfirmEnter --> WaitConfirmGone: 点击确认按钮
-    WaitConfirmGone --> WaitEnteredWonderlandConfirm: 原确认按钮消失
-    WaitEnteredWonderlandConfirm --> [*]: 千星内确认按钮再次出现
+    ClickWonderlandCard --> WaitConfirmGone: 快速匹配前往大厅按钮并点击一次
+    WaitConfirmGone --> [*]: 模板消失且区域像素稳定
 ```
 
 进入千星任务前置条件更严格：
@@ -131,9 +133,10 @@ stateDiagram-v2
 循环执行：
 
 1. 按 `F6`。
-2. 等待 `startup.f6_retry_ms`。
+2. 等待 `startup.wonderland_home_retry_ms`。
 3. 在 `startup.wonderland_close_region` 检测 `startup.templates.wonderland_close`。
 4. 连续稳定命中 2 次后，认为千星奇域主页已打开。
+5. 未命中则继续按 F6，直到达到 `startup.wonderland_home_retries`，同时受 `startup.enter_wonderland_timeout_ms` 兜底限制。
 
 默认关闭按钮区域是右上角 `1780,0,140,90`。
 
@@ -141,28 +144,19 @@ stateDiagram-v2
 
 打开主页后循环点击 `startup.wonderland_card_point`，默认是第一个奇域卡片坐标 `680,310`。
 
-点击后在 `startup.prompt_confirm_text_region` 检测 `startup.templates.confirm_black`。连续稳定命中后，认为大厅确认按钮出现。
+点击后在 `startup.wonderland_enter_button_region` 检测 `startup.templates.wonderland_enter_button`。首次命中后立刻点击一次。
 
-默认确认区域是 `1400,900,100,100`。
+默认匹配区域是 `1400,850,360,150`，复用缓存灰度 SAD 匹配，阈值严格使用 `startup.wonderland_enter_button_threshold`，默认 `0.9`。
 
-### 确认进入（ConfirmEnter）
-
-重新定位 `confirm_black`，点击模板中心。这里使用模板命中中心，不使用固定确认点。
+该阶段按 `startup.wonderland_card_retries` 重试，每次点击卡片后最多等待 `startup.wonderland_card_retry_ms`。模板检测仍使用 `timing.input.click_ms`（默认 `150ms`）作为内部快速轮询间隔。
 
 ### 等待确认按钮消失（WaitConfirmGone）
 
-点击确认按钮后继续在原确认区域检测 `confirm_black`：
+点击“前往大厅”按钮后，不固定等待；改为按 `timing.input.click_ms`（默认 `150ms`）轮询同一区域：
 
-- 如果模板仍存在，继续等待。
-- 如果模板消失，认为点击确认被接受。
-- 消失后额外等待 1000ms，再进入下一步。
-- 如果在 `startup.stable_timeout_ms.max(5000)` 内一直不消失，任务失败。
-
-### 等待进入后确认按钮（WaitEnteredWonderlandConfirm）
-
-确认按钮消失后，最多等待 `startup.entered_wonderland_confirm_timeout_ms`，默认 20 秒。
-
-期间在 `startup.entered_wonderland_confirm_region` 检测同一个 `confirm_black` 模板，默认区域是 `1100,900,100,100`。再次检测到黑色确认按钮后，认为已经进入千星内部。
+- 模板消失后，继续等待该区域像素稳定。
+- 模板消失且区域稳定后，直接认为已进入千星内部。
+- 模板消失超过 `startup.wonderland_confirm_absent_timeout_ms`，或区域稳定超过 `startup.wonderland_confirm_stable_timeout_ms` 时，任务失败。
 
 这里是进入千星任务的最终成功条件。后续不再继续 BGI 原流程，也不会自动退出千星。
 
@@ -216,9 +210,14 @@ stateDiagram-v2
 | `startup.enter_game_text_region` | OCR “点击进入”的区域。 |
 | `screen.enter_rect` / `templates.enter` | 启动游戏完成信号。 |
 | `startup.wonderland_close_region` | 千星主页右上角关闭按钮搜索区域。 |
-| `startup.prompt_confirm_text_region` | 进入大厅确认按钮搜索区域。 |
-| `startup.entered_wonderland_confirm_region` | 进入千星后再次出现的确认按钮搜索区域。 |
-| `startup.template_threshold` | 启动/千星模板匹配阈值。 |
+| `startup.templates.wonderland_enter_button` | “前往大厅”按钮模板。 |
+| `startup.wonderland_enter_button_region` | “前往大厅”按钮搜索区域。 |
+| `startup.wonderland_enter_button_threshold` | “前往大厅”按钮模板匹配阈值。 |
+| `startup.wonderland_home_retries` / `startup.wonderland_home_retry_ms` | 打开千星主页阶段的 F6 重试次数和每次等待时间。 |
+| `startup.wonderland_card_retries` / `startup.wonderland_card_retry_ms` | 点击奇域卡片阶段的重试次数和每次等待“前往大厅”按钮时间。 |
+| `startup.wonderland_confirm_absent_timeout_ms` | 点击“前往大厅”后等待按钮模板消失的最长时间。 |
+| `startup.wonderland_confirm_stable_timeout_ms` | 按钮消失后等待原区域像素稳定的最长时间。 |
+| `startup.template_threshold` | 启动流程和千星主页关闭按钮模板匹配阈值。 |
 
 ## 关键边界
 
@@ -226,5 +225,5 @@ stateDiagram-v2
 - 进入千星任务不负责启动游戏；找不到窗口时直接失败。
 - `/startup/wonderland` 只是顺序入队两个任务。
 - 开门成功条件不是白屏结束，而是左下角 Enter 模板出现。
-- 进入千星成功条件不是确认按钮点击完成，而是确认按钮消失后，在千星内区域再次出现。
+- 进入千星成功条件是点击“前往大厅”按钮后，该按钮消失且原区域像素稳定。
 - 进入千星完成后只返回千星内一级界面，不自动退出千星，不清空后续待执行任务。

@@ -28,7 +28,7 @@ pub(super) fn parse_hall_remaining_minutes(text: &str) -> Option<u32> {
     }
     let minutes = digits.parse::<u32>().ok()?;
     if (1..=180).contains(&minutes) {
-        Some(minutes + HALL_TIME_RECOGNITION_TOLERANCE_MINUTES)
+        Some(minutes.saturating_sub(HALL_TIME_RECOGNITION_TOLERANCE_MINUTES))
     } else {
         None
     }
@@ -117,8 +117,9 @@ mod tests {
 
     #[test]
     fn parses_hall_remaining_minutes_with_tolerance() {
-        assert_eq!(parse_hall_remaining_minutes("剩余10分钟"), Some(11));
-        assert_eq!(parse_hall_remaining_minutes("剩余９分钟"), Some(10));
+        assert_eq!(parse_hall_remaining_minutes("剩余10分钟"), Some(9));
+        assert_eq!(parse_hall_remaining_minutes("剩余９分钟"), Some(8));
+        assert_eq!(parse_hall_remaining_minutes("剩余1分钟"), Some(0));
     }
 
     #[test]

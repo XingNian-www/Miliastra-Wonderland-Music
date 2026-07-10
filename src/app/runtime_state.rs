@@ -10,18 +10,105 @@ pub const HALL_EXPIRING_WARNING_MINUTES: u32 = 10;
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 #[serde(default, rename_all = "camelCase")]
 pub struct RuntimeState {
-    pub current_song_is_requested: bool,
-    pub last_requested_uri: String,
-    pub last_requested_song: String,
-    pub last_requested_keyword: String,
-    pub last_requested_source: String,
-    pub last_requested_prefer_accompaniment: bool,
-    pub last_requested_updated_at_ms: u64,
-    pub paused_by_command: bool,
-    pub paused_for_pending_playback: bool,
+    pub playback: PlaybackRuntimeState,
     pub hall_remaining_minutes: Option<u32>,
     pub hall_remaining_updated_at: Option<u64>,
     pub hall_expiring_warning_sent: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PlaybackRuntimeState {
+    pub state: ConfirmedPlaybackState,
+    pub pause_reason: PauseReason,
+    pub active_request: Option<ActivePlaybackRequest>,
+    pub last_observation: Option<PlaybackObservation>,
+}
+
+impl Default for PlaybackRuntimeState {
+    fn default() -> Self {
+        Self {
+            state: ConfirmedPlaybackState::Idle,
+            pause_reason: PauseReason::None,
+            active_request: None,
+            last_observation: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfirmedPlaybackState {
+    Idle,
+    Starting,
+    PlayingRequested,
+    PausedByUser,
+    PausedWaitingForQueue,
+    ExternalPlayback,
+    Unknown,
+}
+
+impl Default for ConfirmedPlaybackState {
+    fn default() -> Self {
+        Self::Idle
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PauseReason {
+    None,
+    User,
+    WaitingForQueue,
+}
+
+impl Default for PauseReason {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservationReliability {
+    Reliable,
+    Incomplete,
+    Stale,
+    Mismatched,
+    Unknown,
+}
+
+impl Default for ObservationReliability {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ActivePlaybackRequest {
+    pub keyword: String,
+    pub source: String,
+    pub prefer_accompaniment: bool,
+    pub requested_uri: String,
+    pub confirmed_uri: String,
+    pub song: String,
+    pub title: String,
+    pub artist: String,
+    pub started_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PlaybackObservation {
+    pub status: String,
+    pub uri: String,
+    pub title: String,
+    pub artist: String,
+    pub progress: f64,
+    pub duration: f64,
+    pub captured_at_ms: u64,
+    pub reliability: ObservationReliability,
 }
 
 impl RuntimeState {
@@ -114,6 +201,28 @@ impl PersistentRuntimeState {
 
     pub fn save(&self) -> Result<()> {
         self.state.save(&self.path)
+    }
+}
+
+impl PlaybackRuntimeState {
+    pub fn clear_active_request(&mut self) {
+        self.state = ConfirmedPlaybackState::Idle;
+        self.pause_reason = PauseReason::None;
+        self.active_request = None;
+    }
+
+    pub fn set_user_paused(&mut self) {
+        self.state = ConfirmedPlaybackState::PausedByUser;
+        self.pause_reason = PauseReason::User;
+    }
+
+    pub fn set_user_resumed(&mut self) {
+        self.pause_reason = PauseReason::None;
+        self.state = if self.active_request.is_some() {
+            ConfirmedPlaybackState::PlayingRequested
+        } else {
+            ConfirmedPlaybackState::ExternalPlayback
+        };
     }
 }
 

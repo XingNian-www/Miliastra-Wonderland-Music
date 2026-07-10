@@ -301,11 +301,7 @@ mod tests {
             source: "netease".to_string(),
             prefer_accompaniment: false,
         };
-        assert!(history.is_limited(
-            &SongDedupConfig::default(),
-            &matching_config(),
-            &candidate
-        ));
+        assert!(history.is_limited(&SongDedupConfig::default(), &matching_config(), &candidate));
     }
 
     #[test]
@@ -328,10 +324,6 @@ mod tests {
             source: "netease".to_string(),
             prefer_accompaniment: false,
         };
-        assert!(!history.is_limited(
-            &SongDedupConfig::default(),
-            &matching_config(),
-            &candidate
-        ));
+        assert!(!history.is_limited(&SongDedupConfig::default(), &matching_config(), &candidate));
     }
 }

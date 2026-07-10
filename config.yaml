@@ -343,7 +343,7 @@ queue:
   protect_current_song_until_finished: true
 
 song_dedup:
-  # 长时间同歌去重；只在实际播放前检查，确认播放成功后记录
+  # 长时间同歌去重；播放/入队前检查，确认播放成功后记录
   enabled: true
   # 最近多少秒内统计同一首歌播放次数
   window_seconds: 3600

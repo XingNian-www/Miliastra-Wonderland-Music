@@ -22,6 +22,16 @@ pub(super) struct MonitorQueueItem {
     pub(super) friend_username: String,
 }
 
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct MonitorPlaybackController {
+    pub(super) state: String,
+    pub(super) pause_reason: String,
+    pub(super) active_keyword: String,
+    pub(super) active_uri: String,
+    pub(super) last_observation_reliability: String,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct MonitorSnapshot {
@@ -30,6 +40,7 @@ pub(super) struct MonitorSnapshot {
     pub(super) queue: Vec<MonitorQueueItem>,
     pub(super) commands: Vec<String>,
     pub(super) status: String,
+    pub(super) playback_controller: MonitorPlaybackController,
 }
 
 #[derive(Clone)]
@@ -50,6 +61,7 @@ struct MonitorState {
     queue: Vec<MonitorQueueItem>,
     commands: VecDeque<String>,
     status: String,
+    playback_controller: MonitorPlaybackController,
 }
 
 impl MonitorShared {
@@ -62,6 +74,7 @@ impl MonitorShared {
                 queue: Vec::new(),
                 commands: VecDeque::new(),
                 status: "启动中".to_string(),
+                playback_controller: MonitorPlaybackController::default(),
             })),
         }
     }
@@ -118,6 +131,12 @@ impl MonitorShared {
         }
     }
 
+    pub(super) fn set_playback_controller(&self, snapshot: MonitorPlaybackController) {
+        if let Ok(mut state) = self.state.lock() {
+            state.playback_controller = snapshot;
+        }
+    }
+
     pub(super) fn snapshot(&self) -> MonitorSnapshot {
         self.state.lock().map_or_else(
             |_| MonitorSnapshot {
@@ -126,6 +145,7 @@ impl MonitorShared {
                 queue: Vec::new(),
                 commands: Vec::new(),
                 status: "监控状态不可用".to_string(),
+                playback_controller: MonitorPlaybackController::default(),
             },
             |state| MonitorSnapshot {
                 logs: state.logs.iter().cloned().collect(),
@@ -133,6 +153,7 @@ impl MonitorShared {
                 queue: state.queue.clone(),
                 commands: state.commands.iter().cloned().collect(),
                 status: state.status.clone(),
+                playback_controller: state.playback_controller.clone(),
             },
         )
     }

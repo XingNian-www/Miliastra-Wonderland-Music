@@ -1,0 +1,1531 @@
+use std::sync::{Arc, Mutex};
+use std::thread::sleep;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use anyhow::{Result, anyhow};
+
+use super::config::{MatchConfig, PlaybackTimingConfig, QueueConfig, SongDedupConfig};
+use super::feeluown::{FeelUOwnClient, PlayerStatus, SearchCandidate};
+use super::monitor::MonitorPlaybackController;
+use super::playback_format::{
+    format_play_message, format_time, playback_progress_restarted, playback_remaining_seconds,
+};
+use super::runtime_state::{
+    ActivePlaybackRequest, ConfirmedPlaybackState, ObservationReliability, PauseReason,
+    PersistentRuntimeState, PlaybackObservation,
+};
+use super::song_dedup::{PersistentSongDedupHistory, SongDedupCandidate};
+use super::song_matcher;
+
+pub(super) trait MusicPlayerBackend: Clone + Send + Sync + 'static {
+    fn status(&self) -> Result<PlayerStatus>;
+    fn play_uri(&self, uri: &str) -> Result<String>;
+    fn pause(&self) -> Result<String>;
+    fn resume(&self) -> Result<String>;
+    fn next(&self) -> Result<String>;
+    fn previous(&self) -> Result<String>;
+    fn set_volume(&self, volume: &str) -> Result<String>;
+    fn search_candidates(&self, keyword: &str, source: &str) -> Result<Vec<SearchCandidate>>;
+    fn search_and_pick(
+        &self,
+        keyword: &str,
+        source: &str,
+        prefer_accompaniment: bool,
+    ) -> Result<Option<(SearchCandidate, String)>>;
+}
+
+impl MusicPlayerBackend for FeelUOwnClient {
+    fn status(&self) -> Result<PlayerStatus> {
+        self.status()
+    }
+
+    fn play_uri(&self, uri: &str) -> Result<String> {
+        self.play_uri(uri)
+    }
+
+    fn pause(&self) -> Result<String> {
+        self.pause()
+    }
+
+    fn resume(&self) -> Result<String> {
+        self.play()
+    }
+
+    fn next(&self) -> Result<String> {
+        self.next()
+    }
+
+    fn previous(&self) -> Result<String> {
+        self.previous()
+    }
+
+    fn set_volume(&self, volume: &str) -> Result<String> {
+        self.set_volume(volume)
+    }
+
+    fn search_candidates(&self, keyword: &str, source: &str) -> Result<Vec<SearchCandidate>> {
+        self.search_candidates(keyword, source)
+    }
+
+    fn search_and_pick(
+        &self,
+        keyword: &str,
+        source: &str,
+        prefer_accompaniment: bool,
+    ) -> Result<Option<(SearchCandidate, String)>> {
+        self.search_and_pick(keyword, source, prefer_accompaniment)
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct PlayerController<B: MusicPlayerBackend> {
+    backend: B,
+    runtime_state: Arc<Mutex<PersistentRuntimeState>>,
+    song_dedup_history: Arc<Mutex<PersistentSongDedupHistory>>,
+    timing: PlaybackTimingConfig,
+    queue: QueueConfig,
+    matching: MatchConfig,
+    song_dedup: SongDedupConfig,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct PlaybackRequest {
+    pub(super) keyword: String,
+    pub(super) match_keyword: String,
+    pub(super) source: String,
+    pub(super) prefer_accompaniment: bool,
+    pub(super) uri: String,
+    pub(super) skip_match_check: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct PlaybackAttempt {
+    pub(super) initial_song: String,
+    pub(super) initial_progress: f64,
+    pub(super) requested_uri: String,
+    previous_playback: super::runtime_state::PlaybackRuntimeState,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct PlaybackMismatch {
+    pub(super) status: PlayerStatus,
+    pub(super) local_reason: String,
+}
+
+#[derive(Clone, Debug)]
+pub(super) enum PlaybackVerification {
+    Success {
+        status: PlayerStatus,
+        message: String,
+    },
+    NoSource,
+    MismatchedCandidate(PlaybackMismatch),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PlaybackOutcome {
+    Success,
+    NoSource,
+    Error,
+    DedupLimited,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum MismatchDecision {
+    Accept,
+    NoSource,
+    SwitchSource,
+    Error,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct QueueAdvanceContext {
+    pub(super) queue_empty: bool,
+    pub(super) has_pending_playback_task: bool,
+    pub(super) command_executing: bool,
+    pub(super) song_command_executing: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum QueueAdvanceDecision {
+    None,
+    PlaybackStateChanged,
+    PauseForQueue,
+    ResumeIfIdle,
+    AdvanceQueue { reason: &'static str },
+}
+
+impl<B: MusicPlayerBackend> PlayerController<B> {
+    pub(super) fn new(
+        backend: B,
+        runtime_state: Arc<Mutex<PersistentRuntimeState>>,
+        song_dedup_history: Arc<Mutex<PersistentSongDedupHistory>>,
+        timing: &PlaybackTimingConfig,
+        queue: &QueueConfig,
+        matching: &MatchConfig,
+        song_dedup: &SongDedupConfig,
+    ) -> Self {
+        Self {
+            backend,
+            runtime_state,
+            song_dedup_history,
+            timing: timing.clone(),
+            queue: queue.clone(),
+            matching: matching.clone(),
+            song_dedup: song_dedup.clone(),
+        }
+    }
+
+    pub(super) fn search_candidates(
+        &self,
+        keyword: &str,
+        source: &str,
+    ) -> Result<Vec<SearchCandidate>> {
+        self.backend.search_candidates(keyword, source)
+    }
+
+    pub(super) fn search_and_pick(
+        &self,
+        keyword: &str,
+        source: &str,
+        prefer_accompaniment: bool,
+    ) -> Result<Option<(SearchCandidate, String)>> {
+        self.backend
+            .search_and_pick(keyword, source, prefer_accompaniment)
+    }
+
+    pub(super) fn status(&self) -> Result<PlayerStatus> {
+        let status = self.backend.status()?;
+        self.record_observation(&status, classify_observation(&status))?;
+        Ok(status)
+    }
+
+    pub(super) fn play_uri(&self, uri: &str) -> Result<String> {
+        let message = self.backend.play_uri(uri)?;
+        self.mark_external_playback()?;
+        Ok(message)
+    }
+
+    pub(super) fn pause_by_user(&self) -> Result<String> {
+        let message = self.backend.pause()?;
+        self.with_playback_state(|state| {
+            state.playback.set_user_paused();
+        })?;
+        log::info!("播放器状态转移: pause_reason=user");
+        Ok(message)
+    }
+
+    pub(super) fn resume_by_user(&self) -> Result<String> {
+        let message = self.backend.resume()?;
+        self.with_playback_state(|state| {
+            state.playback.set_user_resumed();
+        })?;
+        log::info!("播放器状态转移: pause_reason=none");
+        Ok(message)
+    }
+
+    pub(super) fn next_external(&self) -> Result<String> {
+        let message = self.backend.next()?;
+        self.mark_external_playback()?;
+        Ok(message)
+    }
+
+    pub(super) fn previous_external(&self) -> Result<String> {
+        let message = self.backend.previous()?;
+        self.mark_external_playback()?;
+        Ok(message)
+    }
+
+    pub(super) fn set_volume(&self, volume: &str) -> Result<String> {
+        self.backend.set_volume(volume)
+    }
+
+    pub(super) fn clear_active_request(&self) -> Result<()> {
+        self.with_playback_state(|state| {
+            state.playback.clear_active_request();
+        })
+    }
+
+    pub(super) fn mark_external_playback(&self) -> Result<()> {
+        self.with_playback_state(|state| {
+            state.playback.state = ConfirmedPlaybackState::ExternalPlayback;
+            state.playback.pause_reason = PauseReason::None;
+            state.playback.active_request = None;
+        })
+    }
+
+    pub(super) fn current_status_matches_request(&self, status: &PlayerStatus) -> Result<bool> {
+        let runtime = self
+            .runtime_state
+            .lock()
+            .map_err(|_| anyhow!("运行状态锁已损坏"))?;
+        Ok(status_matches_active_request(
+            &self.matching,
+            runtime.state().playback.active_request.as_ref(),
+            status,
+        ))
+    }
+
+    pub(super) fn should_queue_until_current_song_finished(
+        &self,
+        status: &PlayerStatus,
+    ) -> Result<bool> {
+        if !self.queue.protect_current_song_until_finished {
+            return Ok(false);
+        }
+        if status.status == "playing" {
+            return Ok(true);
+        }
+        if status.status == "paused"
+            && (playback_remaining_seconds(status).is_some()
+                || !status.current_uri.trim().is_empty()
+                || !status.name.trim().is_empty()
+                || !status.singer.trim().is_empty())
+        {
+            return Ok(true);
+        }
+
+        let runtime = self
+            .runtime_state
+            .lock()
+            .map_err(|_| anyhow!("运行状态锁已损坏"))?;
+        let playback = &runtime.state().playback;
+        if playback.active_request.is_none() {
+            return Ok(false);
+        }
+        if status_matches_active_request(&self.matching, playback.active_request.as_ref(), status)
+            || active_request_guard_active(&self.timing, playback.active_request.as_ref())
+        {
+            return Ok(true);
+        }
+        Ok(status.status != "stopped" && status.status != "stoped")
+    }
+
+    pub(super) fn song_dedup_limited(&self, request: &PlaybackRequest) -> Result<bool> {
+        let candidate = request_dedup_candidate(request);
+        let history = self
+            .song_dedup_history
+            .lock()
+            .map_err(|_| anyhow!("长时间同歌去重历史锁已损坏"))?;
+        Ok(history.is_limited(&self.song_dedup, &self.matching, &candidate))
+    }
+
+    pub(super) fn begin_playback_attempt(
+        &self,
+        request: &PlaybackRequest,
+    ) -> Result<PlaybackAttempt> {
+        let previous_playback = self.playback_snapshot()?;
+        let initial = self
+            .backend
+            .status()
+            .map(|status| (format!("{}{}", status.name, status.singer), status.progress))
+            .unwrap_or_default();
+        self.with_playback_state(|state| {
+            state.playback.state = ConfirmedPlaybackState::Starting;
+            state.playback.pause_reason = PauseReason::None;
+            state.playback.active_request = Some(ActivePlaybackRequest {
+                keyword: request.keyword.clone(),
+                source: request.source.clone(),
+                prefer_accompaniment: request.prefer_accompaniment,
+                requested_uri: request.uri.clone(),
+                confirmed_uri: String::new(),
+                song: String::new(),
+                title: String::new(),
+                artist: String::new(),
+                started_at_ms: current_unix_millis(),
+            });
+        })?;
+        log::info!("播放器状态转移: Starting keyword={}", request.keyword);
+        Ok(PlaybackAttempt {
+            initial_song: initial.0,
+            initial_progress: initial.1,
+            requested_uri: request.uri.clone(),
+            previous_playback: previous_playback.clone(),
+        })
+    }
+
+    pub(super) fn play_request_uri(&self, request: &PlaybackRequest) -> Result<PlaybackAttempt> {
+        let attempt = self.begin_playback_attempt(request)?;
+        if let Err(error) = self.backend.play_uri(&request.uri) {
+            let _ = self.restore_failed_attempt(&attempt, "dispatch_failed");
+            return Err(error);
+        }
+        Ok(attempt)
+    }
+
+    pub(super) fn verify_playback_started(
+        &self,
+        request: &PlaybackRequest,
+        attempt: &mut PlaybackAttempt,
+    ) -> Result<PlaybackVerification> {
+        sleep(Duration::from_millis(self.timing.search_settle_ms));
+
+        for retry in 0..self.timing.status_retries {
+            let status = match self.backend.status() {
+                Ok(status) => status,
+                Err(error) => {
+                    log::error!("查询播放状态失败: {error:#}");
+                    self.mark_unknown()?;
+                    sleep(Duration::from_millis(self.timing.status_poll_ms));
+                    continue;
+                }
+            };
+            let reliability = classify_observation(&status);
+            self.record_observation(&status, reliability)?;
+            log::debug!(
+                "播放器观测: raw={} uri={} title={} artist={} reliability={:?}",
+                status.status,
+                status.current_uri,
+                status.name,
+                status.singer,
+                reliability
+            );
+
+            if status.status != "playing" && status.status != "paused" {
+                sleep(Duration::from_millis(self.timing.status_poll_ms));
+                continue;
+            }
+
+            let current_uri = status.current_uri.trim();
+            let requested_uri = attempt.requested_uri.trim();
+            let current_song = format!("{}{}", status.name, status.singer);
+            let uri_matched = !requested_uri.is_empty()
+                && !current_uri.is_empty()
+                && current_uri == requested_uri;
+
+            if !requested_uri.is_empty() && !current_uri.is_empty() && current_uri != requested_uri
+            {
+                log::info!(
+                    "URI 与请求资源不同，继续用歌曲信息确认: current={} requested={} ({}/{})",
+                    current_uri,
+                    requested_uri,
+                    retry + 1,
+                    self.timing.status_retries
+                );
+            }
+            if current_song.is_empty() && current_uri.is_empty() {
+                log::info!(
+                    "播放状态缺少歌曲标识，继续等待 ({}/{})",
+                    retry + 1,
+                    self.timing.status_retries
+                );
+                sleep(Duration::from_millis(self.timing.status_poll_ms));
+                continue;
+            }
+            if request.skip_match_check
+                && !uri_matched
+                && !current_song.is_empty()
+                && current_song == attempt.initial_song
+                && !playback_progress_restarted(attempt.initial_progress, status.progress)
+            {
+                log::info!(
+                    "歌曲未变化，等待 URI 播放生效 ({}/{})",
+                    retry + 1,
+                    self.timing.status_retries
+                );
+                sleep(Duration::from_millis(self.timing.status_poll_ms));
+                continue;
+            }
+
+            if !request.skip_match_check && !uri_matched {
+                let local_match = song_matcher::match_song_query(
+                    &self.matching,
+                    &request.match_keyword,
+                    &status.name,
+                    &status.singer,
+                    request.prefer_accompaniment,
+                );
+                if !local_match.ok {
+                    log::info!("歌曲暂不匹配: {}", local_match.reason);
+                    if !current_song.is_empty() && current_song == attempt.initial_song {
+                        log::info!(
+                            "歌曲未变化，搜索可能尚未完成，继续等待 ({}/{})",
+                            retry + 1,
+                            self.timing.status_retries
+                        );
+                        sleep(Duration::from_millis(self.timing.status_poll_ms));
+                        continue;
+                    }
+                    if !current_song.is_empty() {
+                        attempt.initial_song = current_song;
+                    }
+                    return Ok(PlaybackVerification::MismatchedCandidate(
+                        PlaybackMismatch {
+                            status,
+                            local_reason: local_match.reason,
+                        },
+                    ));
+                }
+            }
+
+            let progress = format_time(status.progress);
+            let duration = format_time(status.duration);
+            if (progress == "0:00" && duration == "0:00") || duration == "error" {
+                log::info!(
+                    "0:00/0:00，等待后重试 ({}/{})",
+                    retry + 1,
+                    self.timing.status_retries
+                );
+                sleep(Duration::from_millis(self.timing.status_poll_ms));
+                continue;
+            }
+            if status.duration > 0.0 && status.duration < 20.0 {
+                log::info!("歌曲时长过短 ({:.1}s)，视为无音源", status.duration);
+                self.restore_failed_attempt(attempt, "verification_failed")?;
+                return Ok(PlaybackVerification::NoSource);
+            }
+
+            let message = format_play_message(&status);
+            self.confirm_playback_success(request, &status)?;
+            log::info!("播放成功: {}", message);
+            return Ok(PlaybackVerification::Success { status, message });
+        }
+
+        log::info!("超时未播放成功");
+        self.restore_failed_attempt(attempt, "verification_failed")?;
+        Ok(PlaybackVerification::NoSource)
+    }
+
+    pub(super) fn accept_mismatch(
+        &self,
+        request: &PlaybackRequest,
+        status: &PlayerStatus,
+    ) -> Result<PlaybackVerification> {
+        if status.duration > 0.0 && status.duration < 20.0 {
+            return Ok(PlaybackVerification::NoSource);
+        }
+        let message = format_play_message(status);
+        self.confirm_playback_success(request, status)?;
+        log::info!("播放成功: {}", message);
+        Ok(PlaybackVerification::Success {
+            status: status.clone(),
+            message,
+        })
+    }
+
+    pub(super) fn reject_mismatch_as_no_source(&self, status: Option<&PlayerStatus>) -> Result<()> {
+        if status.is_some_and(|status| status.status == "playing") {
+            let _ = self.backend.pause();
+        }
+        self.clear_active_request()
+    }
+
+    pub(super) fn maybe_advance_queue(
+        &self,
+        snapshot_status: PlayerStatus,
+        context: QueueAdvanceContext,
+    ) -> Result<QueueAdvanceDecision> {
+        let mut status = snapshot_status;
+        let runtime_snapshot = self
+            .runtime_state
+            .lock()
+            .map_err(|_| anyhow!("运行状态锁已损坏"))?
+            .state()
+            .playback
+            .clone();
+        let guard_active =
+            active_request_guard_active(&self.timing, runtime_snapshot.active_request.as_ref());
+
+        if runtime_snapshot.active_request.is_some()
+            && !status_matches_active_request(
+                &self.matching,
+                runtime_snapshot.active_request.as_ref(),
+                &status,
+            )
+        {
+            match self.backend.status() {
+                Ok(fresh_status) => {
+                    log::info!(
+                        "点歌状态与播放监控快照不一致，已刷新播放状态: snapshot_uri={} fresh_uri={}",
+                        status.current_uri,
+                        fresh_status.current_uri,
+                    );
+                    status = fresh_status;
+                    self.record_observation(&status, classify_observation(&status))?;
+                }
+                Err(error) => {
+                    log::error!("刷新点歌播放状态失败，暂不自动出队: {error:#}");
+                    self.mark_unknown()?;
+                    return Ok(QueueAdvanceDecision::None);
+                }
+            }
+        }
+
+        if runtime_snapshot.active_request.is_some()
+            && guard_active
+            && !status_matches_active_request(
+                &self.matching,
+                runtime_snapshot.active_request.as_ref(),
+                &status,
+            )
+        {
+            log::debug!("点歌刚开始，忽略可能过期的播放状态");
+            return Ok(QueueAdvanceDecision::None);
+        }
+
+        if runtime_snapshot.active_request.is_some()
+            && active_request_track_changed(
+                runtime_snapshot.active_request.as_ref(),
+                &status,
+                &self.matching,
+            )
+        {
+            self.clear_active_request()?;
+            log::info!("播放器状态转移: PlayingRequested -> ExternalPlayback reason=track_changed");
+            self.mark_external_playback()?;
+            return Ok(QueueAdvanceDecision::PlaybackStateChanged);
+        }
+
+        if runtime_snapshot.active_request.is_some() && guard_active {
+            log::debug!("点歌刚开始，暂不触发队列自动出队");
+            return Ok(QueueAdvanceDecision::None);
+        }
+
+        let has_pending_playback = !context.queue_empty
+            || context.has_pending_playback_task
+            || context.song_command_executing;
+
+        let pause_reason = self
+            .runtime_state
+            .lock()
+            .map_err(|_| anyhow!("运行状态锁已损坏"))?
+            .state()
+            .playback
+            .pause_reason;
+
+        if pause_reason == PauseReason::User {
+            return Ok(QueueAdvanceDecision::None);
+        }
+
+        if status.status == "stopped" || status.status == "stoped" {
+            let had_active_request = runtime_snapshot.active_request.is_some();
+            if had_active_request {
+                self.clear_active_request()?;
+                log::info!("播放器状态转移: PlayingRequested -> Idle reason=stopped");
+            }
+            if context.command_executing || context.has_pending_playback_task || context.queue_empty
+            {
+                return Ok(if had_active_request {
+                    QueueAdvanceDecision::PlaybackStateChanged
+                } else {
+                    QueueAdvanceDecision::None
+                });
+            }
+            self.with_playback_state(|state| {
+                state.playback.pause_reason = PauseReason::None;
+            })?;
+            log::info!("队列推进决策: advance reason=stopped");
+            return Ok(QueueAdvanceDecision::AdvanceQueue { reason: "停止" });
+        }
+
+        if context.queue_empty
+            && !context.has_pending_playback_task
+            && !context.command_executing
+            && !context.song_command_executing
+        {
+            return self.resume_waiting_for_queue_if_idle();
+        }
+
+        if status.status == "paused" {
+            if pause_reason == PauseReason::WaitingForQueue {
+                let Some(remaining) = playback_remaining_seconds(&status) else {
+                    return Ok(QueueAdvanceDecision::None);
+                };
+                if remaining > self.queue.auto_advance_seconds as f64 {
+                    return Ok(QueueAdvanceDecision::None);
+                }
+                if !context.command_executing
+                    && !context.has_pending_playback_task
+                    && !context.queue_empty
+                {
+                    log::info!("队列推进决策: advance reason=near_end_paused");
+                    return Ok(QueueAdvanceDecision::AdvanceQueue {
+                        reason: "即将结束"
+                    });
+                }
+                return Ok(QueueAdvanceDecision::None);
+            }
+            let Some(remaining) = playback_remaining_seconds(&status) else {
+                return Ok(QueueAdvanceDecision::None);
+            };
+            if remaining > self.queue.auto_advance_seconds as f64 {
+                return Ok(QueueAdvanceDecision::None);
+            }
+            if context.command_executing || context.has_pending_playback_task || context.queue_empty
+            {
+                return Ok(QueueAdvanceDecision::None);
+            }
+            self.with_playback_state(|state| {
+                state.playback.pause_reason = PauseReason::None;
+            })?;
+            log::info!("队列推进决策: advance reason=paused");
+            return Ok(QueueAdvanceDecision::AdvanceQueue { reason: "暂停" });
+        }
+
+        if status.status != "playing" {
+            return Ok(QueueAdvanceDecision::None);
+        }
+
+        if pause_reason != PauseReason::None {
+            self.with_playback_state(|state| {
+                state.playback.pause_reason = PauseReason::None;
+                if state.playback.active_request.is_some() {
+                    state.playback.state = ConfirmedPlaybackState::PlayingRequested;
+                }
+            })?;
+        }
+        if let Some(remaining) = playback_remaining_seconds(&status) {
+            if remaining <= self.queue.auto_advance_seconds as f64 && has_pending_playback {
+                let paused = self.pause_for_queue()?;
+                if !context.command_executing
+                    && !context.has_pending_playback_task
+                    && !context.queue_empty
+                {
+                    log::info!("队列推进决策: advance reason=near_end");
+                    return Ok(QueueAdvanceDecision::AdvanceQueue {
+                        reason: "即将结束"
+                    });
+                }
+                return Ok(if paused {
+                    QueueAdvanceDecision::PauseForQueue
+                } else {
+                    QueueAdvanceDecision::None
+                });
+            }
+        }
+        Ok(QueueAdvanceDecision::None)
+    }
+
+    pub(super) fn snapshot(&self) -> MonitorPlaybackController {
+        self.runtime_state.lock().map_or_else(
+            |_| MonitorPlaybackController {
+                state: "unavailable".to_string(),
+                pause_reason: "unknown".to_string(),
+                active_keyword: String::new(),
+                active_uri: String::new(),
+                last_observation_reliability: "unknown".to_string(),
+            },
+            |runtime| {
+                let playback = &runtime.state().playback;
+                MonitorPlaybackController {
+                    state: format_state(playback.state),
+                    pause_reason: format_pause_reason(playback.pause_reason),
+                    active_keyword: playback
+                        .active_request
+                        .as_ref()
+                        .map(|request| request.keyword.clone())
+                        .unwrap_or_default(),
+                    active_uri: playback
+                        .active_request
+                        .as_ref()
+                        .map(|request| {
+                            if request.confirmed_uri.trim().is_empty() {
+                                request.requested_uri.clone()
+                            } else {
+                                request.confirmed_uri.clone()
+                            }
+                        })
+                        .unwrap_or_default(),
+                    last_observation_reliability: playback
+                        .last_observation
+                        .as_ref()
+                        .map(|observation| format_reliability(observation.reliability))
+                        .unwrap_or_else(|| "unknown".to_string()),
+                }
+            },
+        )
+    }
+
+    fn pause_for_queue(&self) -> Result<bool> {
+        let already_waiting = self
+            .runtime_state
+            .lock()
+            .map_err(|_| anyhow!("运行状态锁已损坏"))?
+            .state()
+            .playback
+            .pause_reason
+            == PauseReason::WaitingForQueue;
+        if already_waiting {
+            return Ok(false);
+        }
+        log::info!("队列推进决策: pause_waiting_for_queue");
+        self.backend.pause()?;
+        self.with_playback_state(|state| {
+            state.playback.pause_reason = PauseReason::WaitingForQueue;
+            state.playback.state = ConfirmedPlaybackState::PausedWaitingForQueue;
+        })?;
+        Ok(true)
+    }
+
+    fn resume_waiting_for_queue_if_idle(&self) -> Result<QueueAdvanceDecision> {
+        let should_resume = self
+            .runtime_state
+            .lock()
+            .map_err(|_| anyhow!("运行状态锁已损坏"))?
+            .state()
+            .playback
+            .pause_reason
+            == PauseReason::WaitingForQueue;
+        if !should_resume {
+            return Ok(QueueAdvanceDecision::None);
+        }
+        log::info!("队列推进决策: resume_waiting_for_queue_idle");
+        self.backend.resume()?;
+        self.with_playback_state(|state| {
+            state.playback.pause_reason = PauseReason::None;
+            if state.playback.active_request.is_some() {
+                state.playback.state = ConfirmedPlaybackState::PlayingRequested;
+            } else {
+                state.playback.state = ConfirmedPlaybackState::ExternalPlayback;
+            }
+        })?;
+        Ok(QueueAdvanceDecision::ResumeIfIdle)
+    }
+
+    fn confirm_playback_success(
+        &self,
+        request: &PlaybackRequest,
+        status: &PlayerStatus,
+    ) -> Result<()> {
+        let confirmed_uri = if status.current_uri.trim().is_empty() {
+            request.uri.trim().to_string()
+        } else {
+            status.current_uri.trim().to_string()
+        };
+        let active_request = ActivePlaybackRequest {
+            keyword: request.keyword.clone(),
+            source: request.source.clone(),
+            prefer_accompaniment: request.prefer_accompaniment,
+            requested_uri: request.uri.clone(),
+            confirmed_uri: confirmed_uri.clone(),
+            song: format!("{}{}", status.name, status.singer),
+            title: status.name.trim().to_string(),
+            artist: status.singer.trim().to_string(),
+            started_at_ms: current_unix_millis(),
+        };
+        self.with_playback_state(|state| {
+            state.playback.state = ConfirmedPlaybackState::PlayingRequested;
+            state.playback.pause_reason = PauseReason::None;
+            state.playback.active_request = Some(active_request);
+        })?;
+        self.record_song_dedup_playback(request, &confirmed_uri, status)?;
+        log::info!("播放器状态转移: Starting -> PlayingRequested reason=playback_confirmed");
+        Ok(())
+    }
+
+    fn record_song_dedup_playback(
+        &self,
+        request: &PlaybackRequest,
+        confirmed_uri: &str,
+        status: &PlayerStatus,
+    ) -> Result<()> {
+        let (fallback_title, fallback_artist) = split_title_artist(&request.keyword);
+        let title = if status.name.trim().is_empty() {
+            fallback_title
+        } else {
+            status.name.trim().to_string()
+        };
+        let artist = if status.singer.trim().is_empty() {
+            fallback_artist
+        } else {
+            status.singer.trim().to_string()
+        };
+        let candidate = SongDedupCandidate {
+            uri: confirmed_uri.to_string(),
+            title,
+            artist,
+            source: request.source.clone(),
+            prefer_accompaniment: request.prefer_accompaniment,
+        };
+        let mut history = self
+            .song_dedup_history
+            .lock()
+            .map_err(|_| anyhow!("长时间同歌去重历史锁已损坏"))?;
+        history.record_playback(&self.song_dedup, candidate)
+    }
+
+    fn record_observation(
+        &self,
+        status: &PlayerStatus,
+        reliability: ObservationReliability,
+    ) -> Result<()> {
+        let observation = PlaybackObservation {
+            status: status.status.clone(),
+            uri: status.current_uri.clone(),
+            title: status.name.clone(),
+            artist: status.singer.clone(),
+            progress: status.progress,
+            duration: status.duration,
+            captured_at_ms: current_unix_millis(),
+            reliability,
+        };
+        let mut runtime = self
+            .runtime_state
+            .lock()
+            .map_err(|_| anyhow!("运行状态锁已损坏"))?;
+        if !observation_identity_changed(
+            runtime.state().playback.last_observation.as_ref(),
+            &observation,
+        ) {
+            return Ok(());
+        }
+        runtime.state_mut().playback.last_observation = Some(observation);
+        runtime.save()
+    }
+
+    fn mark_unknown(&self) -> Result<()> {
+        self.with_playback_state(|state| {
+            state.playback.state = ConfirmedPlaybackState::Unknown;
+        })
+    }
+
+    fn with_playback_state(
+        &self,
+        update: impl FnOnce(&mut super::runtime_state::RuntimeState),
+    ) -> Result<()> {
+        let mut runtime = self
+            .runtime_state
+            .lock()
+            .map_err(|_| anyhow!("运行状态锁已损坏"))?;
+        update(runtime.state_mut());
+        runtime.save()
+    }
+
+    fn playback_snapshot(&self) -> Result<super::runtime_state::PlaybackRuntimeState> {
+        let runtime = self
+            .runtime_state
+            .lock()
+            .map_err(|_| anyhow!("运行状态锁已损坏"))?;
+        Ok(runtime.state().playback.clone())
+    }
+
+    fn restore_playback_state(
+        &self,
+        playback: super::runtime_state::PlaybackRuntimeState,
+    ) -> Result<()> {
+        self.with_playback_state(|state| {
+            state.playback = playback;
+        })
+    }
+
+    fn restore_failed_attempt(&self, attempt: &PlaybackAttempt, reason: &str) -> Result<()> {
+        self.restore_playback_state(attempt.previous_playback.clone())?;
+        log::info!("播放器状态转移: Starting -> previous reason={}", reason);
+        Ok(())
+    }
+}
+
+fn status_matches_active_request(
+    matching: &MatchConfig,
+    active_request: Option<&ActivePlaybackRequest>,
+    status: &PlayerStatus,
+) -> bool {
+    let Some(active_request) = active_request else {
+        return false;
+    };
+    let current_uri = status.current_uri.trim();
+    let requested_uri = active_request.confirmed_uri.trim();
+    let fallback_uri = active_request.requested_uri.trim();
+    if !current_uri.is_empty()
+        && ((!requested_uri.is_empty() && current_uri == requested_uri)
+            || (!fallback_uri.is_empty() && current_uri == fallback_uri))
+    {
+        return true;
+    }
+    let current_song = format!("{}{}", status.name, status.singer);
+    if !current_song.is_empty()
+        && !active_request.song.is_empty()
+        && current_song == active_request.song
+    {
+        return true;
+    }
+    let keyword = active_request.keyword.trim();
+    if keyword.is_empty() {
+        return false;
+    }
+    song_matcher::match_song_query(
+        matching,
+        keyword,
+        &status.name,
+        &status.singer,
+        active_request.prefer_accompaniment,
+    )
+    .ok
+}
+
+fn active_request_guard_active(
+    timing: &PlaybackTimingConfig,
+    active_request: Option<&ActivePlaybackRequest>,
+) -> bool {
+    let Some(active_request) = active_request else {
+        return false;
+    };
+    if active_request.started_at_ms == 0 {
+        return false;
+    }
+    let guard_ms = timing
+        .monitor_status_ms
+        .max(timing.status_poll_ms)
+        .saturating_mul(3)
+        .max(3000);
+    current_unix_millis() < active_request.started_at_ms.saturating_add(guard_ms)
+}
+
+fn active_request_track_changed(
+    active_request: Option<&ActivePlaybackRequest>,
+    status: &PlayerStatus,
+    matching: &MatchConfig,
+) -> bool {
+    let Some(active_request) = active_request else {
+        return false;
+    };
+    let current_song = format!("{}{}", status.name, status.singer);
+    let current_uri = status.current_uri.trim();
+    let requested_uri = if active_request.confirmed_uri.trim().is_empty() {
+        active_request.requested_uri.trim()
+    } else {
+        active_request.confirmed_uri.trim()
+    };
+    let changed = if !current_uri.is_empty() && !requested_uri.is_empty() {
+        current_uri != requested_uri
+    } else {
+        !current_song.is_empty()
+            && !active_request.song.is_empty()
+            && current_song != active_request.song
+    };
+    changed && !status_matches_active_request(matching, Some(active_request), status)
+}
+
+fn request_dedup_candidate(request: &PlaybackRequest) -> SongDedupCandidate {
+    let (title, artist) = split_title_artist(&request.keyword);
+    SongDedupCandidate {
+        uri: request.uri.clone(),
+        title,
+        artist,
+        source: request.source.clone(),
+        prefer_accompaniment: request.prefer_accompaniment,
+    }
+}
+
+fn split_title_artist(value: &str) -> (String, String) {
+    let text = value.trim();
+    if let Some((title, artist)) = text.split_once(" - ") {
+        return (title.trim().to_string(), artist.trim().to_string());
+    }
+    (text.to_string(), String::new())
+}
+
+fn classify_observation(status: &PlayerStatus) -> ObservationReliability {
+    if status.status.trim().is_empty() {
+        return ObservationReliability::Unknown;
+    }
+    if status.status != "playing" && status.status != "paused" {
+        return ObservationReliability::Stale;
+    }
+    if status.current_uri.trim().is_empty()
+        && status.name.trim().is_empty()
+        && status.singer.trim().is_empty()
+    {
+        return ObservationReliability::Incomplete;
+    }
+    ObservationReliability::Reliable
+}
+
+fn observation_identity_changed(
+    previous: Option<&PlaybackObservation>,
+    current: &PlaybackObservation,
+) -> bool {
+    let Some(previous) = previous else {
+        return true;
+    };
+    previous.status != current.status
+        || previous.uri != current.uri
+        || previous.title != current.title
+        || previous.artist != current.artist
+        || previous.reliability != current.reliability
+}
+
+fn format_state(state: ConfirmedPlaybackState) -> String {
+    match state {
+        ConfirmedPlaybackState::Idle => "idle",
+        ConfirmedPlaybackState::Starting => "starting",
+        ConfirmedPlaybackState::PlayingRequested => "playing_requested",
+        ConfirmedPlaybackState::PausedByUser => "paused_by_user",
+        ConfirmedPlaybackState::PausedWaitingForQueue => "paused_waiting_for_queue",
+        ConfirmedPlaybackState::ExternalPlayback => "external_playback",
+        ConfirmedPlaybackState::Unknown => "unknown",
+    }
+    .to_string()
+}
+
+fn format_pause_reason(reason: PauseReason) -> String {
+    match reason {
+        PauseReason::None => "none",
+        PauseReason::User => "user",
+        PauseReason::WaitingForQueue => "waiting_for_queue",
+    }
+    .to_string()
+}
+
+fn format_reliability(reliability: ObservationReliability) -> String {
+    match reliability {
+        ObservationReliability::Reliable => "reliable",
+        ObservationReliability::Incomplete => "incomplete",
+        ObservationReliability::Stale => "stale",
+        ObservationReliability::Mismatched => "mismatched",
+        ObservationReliability::Unknown => "unknown",
+    }
+    .to_string()
+}
+
+fn current_unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Clone)]
+    struct FakeBackend {
+        statuses: Arc<Mutex<VecDeque<PlayerStatus>>>,
+        paused: Arc<Mutex<u32>>,
+        resumed: Arc<Mutex<u32>>,
+        play_error: bool,
+    }
+
+    impl FakeBackend {
+        fn new(statuses: Vec<PlayerStatus>) -> Self {
+            Self {
+                statuses: Arc::new(Mutex::new(statuses.into())),
+                paused: Arc::new(Mutex::new(0)),
+                resumed: Arc::new(Mutex::new(0)),
+                play_error: false,
+            }
+        }
+
+        fn with_play_error(mut self) -> Self {
+            self.play_error = true;
+            self
+        }
+    }
+
+    impl MusicPlayerBackend for FakeBackend {
+        fn status(&self) -> Result<PlayerStatus> {
+            Ok(self
+                .statuses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_default())
+        }
+
+        fn play_uri(&self, _uri: &str) -> Result<String> {
+            if self.play_error {
+                return Err(anyhow!("play failed"));
+            }
+            Ok(String::new())
+        }
+
+        fn pause(&self) -> Result<String> {
+            *self.paused.lock().unwrap() += 1;
+            Ok("paused".to_string())
+        }
+
+        fn resume(&self) -> Result<String> {
+            *self.resumed.lock().unwrap() += 1;
+            Ok("resumed".to_string())
+        }
+
+        fn next(&self) -> Result<String> {
+            Ok(String::new())
+        }
+
+        fn previous(&self) -> Result<String> {
+            Ok(String::new())
+        }
+
+        fn set_volume(&self, _volume: &str) -> Result<String> {
+            Ok(String::new())
+        }
+
+        fn search_candidates(&self, _keyword: &str, _source: &str) -> Result<Vec<SearchCandidate>> {
+            Ok(Vec::new())
+        }
+
+        fn search_and_pick(
+            &self,
+            _keyword: &str,
+            _source: &str,
+            _prefer_accompaniment: bool,
+        ) -> Result<Option<(SearchCandidate, String)>> {
+            Ok(None)
+        }
+    }
+
+    fn status(name: &str, uri: &str, progress: f64, duration: f64) -> PlayerStatus {
+        PlayerStatus {
+            status: "playing".to_string(),
+            current_uri: uri.to_string(),
+            name: name.to_string(),
+            singer: "歌手".to_string(),
+            progress,
+            duration,
+            ..PlayerStatus::default()
+        }
+    }
+
+    fn stopped_status() -> PlayerStatus {
+        PlayerStatus {
+            status: "stopped".to_string(),
+            ..PlayerStatus::default()
+        }
+    }
+
+    fn controller(backend: FakeBackend) -> PlayerController<FakeBackend> {
+        let runtime_path = temp_path("runtime");
+        let history_path = temp_path("dedup");
+        let _ = fs::remove_file(&runtime_path);
+        let _ = fs::remove_file(&history_path);
+        let runtime = PersistentRuntimeState::load(runtime_path).unwrap();
+        let history = PersistentSongDedupHistory::load(history_path).unwrap();
+        PlayerController::new(
+            backend,
+            Arc::new(Mutex::new(runtime)),
+            Arc::new(Mutex::new(history)),
+            &PlaybackTimingConfig {
+                search_settle_ms: 0,
+                status_poll_ms: 0,
+                status_retries: 3,
+                skip_status_initial_ms: 0,
+                skip_status_poll_ms: 0,
+                skip_status_retries: 1,
+                monitor_tick_ms: 50,
+                monitor_status_ms: 50,
+            },
+            &QueueConfig {
+                max_size: 10,
+                auto_advance_seconds: 2,
+                protect_auto_played_songs: false,
+                protect_current_song_until_finished: true,
+            },
+            &MatchConfig::default(),
+            &SongDedupConfig {
+                history_path: temp_path("dedup-config"),
+                ..SongDedupConfig::default()
+            },
+        )
+    }
+
+    fn request() -> PlaybackRequest {
+        playback_request("目标 - 歌手", "fuo://qqmusic/songs/1")
+    }
+
+    fn playback_request(keyword: &str, uri: &str) -> PlaybackRequest {
+        PlaybackRequest {
+            keyword: keyword.to_string(),
+            match_keyword: keyword.to_string(),
+            source: "qqmusic".to_string(),
+            prefer_accompaniment: false,
+            uri: uri.to_string(),
+            skip_match_check: false,
+        }
+    }
+
+    fn temp_path(name: &str) -> PathBuf {
+        let seq = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "miliastra-player-controller-{}-{}-{}.json",
+            name,
+            std::process::id(),
+            seq
+        ))
+    }
+
+    #[test]
+    fn starting_waits_through_old_song_then_confirms_uri() {
+        let backend = FakeBackend::new(vec![
+            status("旧歌", "fuo://qqmusic/songs/old", 30.0, 120.0),
+            status("目标", "fuo://qqmusic/songs/1", 1.0, 180.0),
+        ]);
+        let controller = controller(backend);
+        let request = request();
+        let mut attempt = controller.play_request_uri(&request).unwrap();
+
+        let result = controller
+            .verify_playback_started(&request, &mut attempt)
+            .unwrap();
+
+        assert!(matches!(result, PlaybackVerification::Success { .. }));
+        assert_eq!(controller.snapshot().state, "playing_requested");
+    }
+
+    #[test]
+    fn unknown_status_does_not_advance_queue() {
+        let backend = FakeBackend::new(vec![]);
+        let controller = controller(backend);
+        let decision = controller
+            .maybe_advance_queue(
+                PlayerStatus {
+                    status: "unknown".to_string(),
+                    ..PlayerStatus::default()
+                },
+                QueueAdvanceContext {
+                    queue_empty: false,
+                    has_pending_playback_task: false,
+                    command_executing: false,
+                    song_command_executing: false,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(decision, QueueAdvanceDecision::None);
+    }
+
+    #[test]
+    fn stopped_status_clears_active_request_when_queue_is_empty() {
+        let backend = FakeBackend::new(vec![
+            status("目标", "fuo://qqmusic/songs/1", 100.0, 100.0),
+            stopped_status(),
+        ]);
+        let controller = controller(backend);
+        controller.begin_playback_attempt(&request()).unwrap();
+        {
+            let mut runtime = controller.runtime_state.lock().unwrap();
+            runtime
+                .state_mut()
+                .playback
+                .active_request
+                .as_mut()
+                .unwrap()
+                .started_at_ms = 1;
+            runtime.save().unwrap();
+        }
+
+        let decision = controller
+            .maybe_advance_queue(
+                stopped_status(),
+                QueueAdvanceContext {
+                    queue_empty: true,
+                    has_pending_playback_task: false,
+                    command_executing: false,
+                    song_command_executing: false,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(decision, QueueAdvanceDecision::PlaybackStateChanged);
+        assert_eq!(controller.snapshot().state, "idle");
+        assert!(controller.snapshot().active_keyword.is_empty());
+    }
+
+    #[test]
+    fn play_uri_failure_clears_starting_request() {
+        let controller = controller(FakeBackend::new(vec![]).with_play_error());
+
+        let result = controller.play_request_uri(&request());
+
+        assert!(result.is_err());
+        assert_eq!(controller.snapshot().state, "idle");
+        assert!(controller.snapshot().active_keyword.is_empty());
+    }
+
+    #[test]
+    fn direct_play_uri_failure_preserves_existing_request_state() {
+        let controller = controller(FakeBackend::new(vec![]).with_play_error());
+        let old_request = playback_request("旧歌 - 歌手", "fuo://qqmusic/songs/old");
+        let old_status = status("旧歌", "fuo://qqmusic/songs/old", 30.0, 180.0);
+        controller
+            .accept_mismatch(&old_request, &old_status)
+            .unwrap();
+
+        let result = controller.play_uri("fuo://qqmusic/songs/external");
+
+        assert!(result.is_err());
+        let snapshot = controller.snapshot();
+        assert_eq!(snapshot.state, "playing_requested");
+        assert_eq!(snapshot.active_keyword, "旧歌 - 歌手");
+        assert_eq!(snapshot.active_uri, "fuo://qqmusic/songs/old");
+    }
+
+    #[test]
+    fn direct_play_uri_success_marks_external_playback() {
+        let controller = controller(FakeBackend::new(vec![]));
+        let old_request = playback_request("旧歌 - 歌手", "fuo://qqmusic/songs/old");
+        let old_status = status("旧歌", "fuo://qqmusic/songs/old", 30.0, 180.0);
+        controller
+            .accept_mismatch(&old_request, &old_status)
+            .unwrap();
+
+        controller.play_uri("fuo://qqmusic/songs/external").unwrap();
+
+        let snapshot = controller.snapshot();
+        assert_eq!(snapshot.state, "external_playback");
+        assert!(snapshot.active_keyword.is_empty());
+        assert!(snapshot.active_uri.is_empty());
+    }
+
+    #[test]
+    fn request_play_uri_failure_restores_previous_request_state() {
+        let controller = controller(FakeBackend::new(vec![]).with_play_error());
+        let old_request = playback_request("旧歌 - 歌手", "fuo://qqmusic/songs/old");
+        let old_status = status("旧歌", "fuo://qqmusic/songs/old", 30.0, 180.0);
+        controller
+            .accept_mismatch(&old_request, &old_status)
+            .unwrap();
+
+        let result = controller.play_request_uri(&request());
+
+        assert!(result.is_err());
+        let snapshot = controller.snapshot();
+        assert_eq!(snapshot.state, "playing_requested");
+        assert_eq!(snapshot.active_keyword, "旧歌 - 歌手");
+        assert_eq!(snapshot.active_uri, "fuo://qqmusic/songs/old");
+    }
+
+    #[test]
+    fn verification_no_source_restores_previous_request_state() {
+        let backend = FakeBackend::new(vec![
+            status("旧歌", "fuo://qqmusic/songs/old", 30.0, 180.0),
+            status("短歌", "fuo://qqmusic/songs/1", 1.0, 10.0),
+        ]);
+        let controller = controller(backend);
+        let old_request = playback_request("旧歌 - 歌手", "fuo://qqmusic/songs/old");
+        let old_status = status("旧歌", "fuo://qqmusic/songs/old", 30.0, 180.0);
+        controller
+            .accept_mismatch(&old_request, &old_status)
+            .unwrap();
+        let request = request();
+        let mut attempt = controller.play_request_uri(&request).unwrap();
+
+        let result = controller
+            .verify_playback_started(&request, &mut attempt)
+            .unwrap();
+
+        assert!(matches!(result, PlaybackVerification::NoSource));
+        let snapshot = controller.snapshot();
+        assert_eq!(snapshot.state, "playing_requested");
+        assert_eq!(snapshot.active_keyword, "旧歌 - 歌手");
+        assert_eq!(snapshot.active_uri, "fuo://qqmusic/songs/old");
+    }
+
+    #[test]
+    fn verification_timeout_restores_previous_request_state() {
+        let backend =
+            FakeBackend::new(vec![status("旧歌", "fuo://qqmusic/songs/old", 30.0, 180.0)]);
+        let controller = controller(backend);
+        let old_request = playback_request("旧歌 - 歌手", "fuo://qqmusic/songs/old");
+        let old_status = status("旧歌", "fuo://qqmusic/songs/old", 30.0, 180.0);
+        controller
+            .accept_mismatch(&old_request, &old_status)
+            .unwrap();
+        let request = request();
+        let mut attempt = controller.play_request_uri(&request).unwrap();
+
+        let result = controller
+            .verify_playback_started(&request, &mut attempt)
+            .unwrap();
+
+        assert!(matches!(result, PlaybackVerification::NoSource));
+        let snapshot = controller.snapshot();
+        assert_eq!(snapshot.state, "playing_requested");
+        assert_eq!(snapshot.active_keyword, "旧歌 - 歌手");
+        assert_eq!(snapshot.active_uri, "fuo://qqmusic/songs/old");
+    }
+
+    #[test]
+    fn non_playback_pending_task_does_not_pause_near_end_song() {
+        let backend = FakeBackend::new(vec![]);
+        let controller = controller(backend.clone());
+
+        let decision = controller
+            .maybe_advance_queue(
+                status("目标", "fuo://qqmusic/songs/1", 179.0, 180.0),
+                QueueAdvanceContext {
+                    queue_empty: true,
+                    has_pending_playback_task: false,
+                    command_executing: false,
+                    song_command_executing: false,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(decision, QueueAdvanceDecision::None);
+        assert_eq!(*backend.paused.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn playback_pending_task_pauses_near_end_song() {
+        let backend = FakeBackend::new(vec![]);
+        let controller = controller(backend.clone());
+
+        let decision = controller
+            .maybe_advance_queue(
+                status("目标", "fuo://qqmusic/songs/1", 179.0, 180.0),
+                QueueAdvanceContext {
+                    queue_empty: true,
+                    has_pending_playback_task: true,
+                    command_executing: false,
+                    song_command_executing: false,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(decision, QueueAdvanceDecision::PauseForQueue);
+        assert_eq!(*backend.paused.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn waiting_for_queue_pause_resumes_only_when_idle() {
+        let backend = FakeBackend::new(vec![]);
+        let controller = controller(backend.clone());
+        assert!(controller.pause_for_queue().unwrap());
+
+        let decision = controller
+            .maybe_advance_queue(
+                status("目标", "fuo://qqmusic/songs/1", 10.0, 180.0),
+                QueueAdvanceContext {
+                    queue_empty: true,
+                    has_pending_playback_task: false,
+                    command_executing: false,
+                    song_command_executing: false,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(decision, QueueAdvanceDecision::ResumeIfIdle);
+        assert_eq!(*backend.resumed.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn user_pause_does_not_auto_resume() {
+        let backend = FakeBackend::new(vec![]);
+        let controller = controller(backend.clone());
+        controller.pause_by_user().unwrap();
+
+        let decision = controller
+            .maybe_advance_queue(
+                status("目标", "fuo://qqmusic/songs/1", 10.0, 180.0),
+                QueueAdvanceContext {
+                    queue_empty: true,
+                    has_pending_playback_task: false,
+                    command_executing: false,
+                    song_command_executing: false,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(decision, QueueAdvanceDecision::None);
+        assert_eq!(*backend.resumed.lock().unwrap(), 0);
+    }
+}

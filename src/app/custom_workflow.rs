@@ -433,7 +433,7 @@ impl AutomationApp {
                 if target.is_empty() {
                     return Err(anyhow!("custom workflow invite step missing target"));
                 }
-                self.execute_invite_with_announce(&target).map(|_| ())
+                self.execute_invite_with_announce(&target, None).map(|_| ())
             }
             "return_primary" => {
                 self.return_to_primary_from_transient_ui(&context.workflow);
@@ -627,12 +627,19 @@ impl AutomationApp {
         )
     }
 
-    pub(super) fn execute_invite_with_announce(&mut self, username: &str) -> Result<bool> {
+    pub(super) fn execute_invite_with_announce(
+        &mut self,
+        username: &str,
+        password: Option<&str>,
+    ) -> Result<bool> {
         log::info!("邀请: 先检测是否公共大厅");
         if self.check_public_hall()? {
             log::info!("邀请: 当前在公共大厅，直接执行");
-            self.notify_friend_invite_decision(username, "已同意加入大厅,请注意启动麦克风");
-            return self.execute_invite(username);
+            self.notify_friend_invite_decision(
+                username,
+                "已同意加入大厅,请等待BOT进入大厅并发送就绪信息后再开启麦克风",
+            );
+            return self.execute_invite(username, password);
         }
         let announce = format!(
             "{}邀请BOT前往大厅,30s内@邀请确认@邀请拒绝,默认通过",
@@ -640,16 +647,22 @@ impl AutomationApp {
         );
         if let Err(error) = self.reply(&announce) {
             log::error!("邀请通告发送失败，直接执行邀请: {error:#}");
-            return self.execute_invite(username);
+            return self.execute_invite(username, password);
         }
         match self.wait_for_invite_decision()? {
             Some(true) => {
-                self.notify_friend_invite_decision(username, "已同意加入大厅,请注意启动麦克风");
-                self.execute_invite(username)
+                self.notify_friend_invite_decision(
+                    username,
+                    "已同意加入大厅,请等待BOT进入大厅并发送就绪信息后再开启麦克风",
+                );
+                self.execute_invite(username, password)
             }
             None => {
-                self.notify_friend_invite_decision(username, "已默认同意加入大厅,请注意启动麦克风");
-                self.execute_invite(username)
+                self.notify_friend_invite_decision(
+                    username,
+                    "已默认同意加入大厅,请等待BOT进入大厅并发送就绪信息后再开启麦克风",
+                );
+                self.execute_invite(username, password)
             }
             Some(false) => {
                 log::info!("收到邀请拒绝，取消邀请");
@@ -684,20 +697,23 @@ impl AutomationApp {
         }
     }
 
-    fn execute_invite(&self, username: &str) -> Result<bool> {
+    fn execute_invite(&self, username: &str, password: Option<&str>) -> Result<bool> {
         log::info!("开始邀请: {}", username);
-        let result = self.execute_invite_steps(username);
+        let result = self.execute_invite_steps(username, password);
         if result.is_err() {
             self.return_to_primary_from_transient_ui("邀请失败");
         } else if matches!(result, Ok(true)) {
             log::info!("邀请成功，等待 10s 后兜底返回一级界面");
             workflow_actions::wait(10_000);
             self.return_to_primary_fixed();
+            if let Err(error) = self.reply("BOT已经就绪,可以使用@麦克风指令了") {
+                log::error!("邀请就绪消息发送失败: {error:#}");
+            }
         }
         result
     }
 
-    fn execute_invite_steps(&self, username: &str) -> Result<bool> {
+    fn execute_invite_steps(&self, username: &str, password: Option<&str>) -> Result<bool> {
         let canvas = Canvas {
             width: self.config.screen.expected_width,
             height: self.config.screen.expected_height,
@@ -749,12 +765,25 @@ impl AutomationApp {
                 return Ok(false);
             }
             if label == "进入大厅" {
+                if let Some(password) = password {
+                    self.input_invite_password(password)?;
+                }
                 self.on_entered_new_hall()?;
             }
         }
 
         log::info!("邀请完成: {}", username);
         Ok(true)
+    }
+
+    fn input_invite_password(&self, password: &str) -> Result<()> {
+        log::info!("邀请: 输入 6 位大厅密码");
+        workflow_actions::wait(self.config.timing.invite.step_ms);
+        for digit in password.chars() {
+            workflow_actions::press_key_text(&digit.to_string(), &self.config.window)?;
+            workflow_actions::wait(self.config.timing.input.text_ms);
+        }
+        Ok(())
     }
 
     fn on_entered_new_hall(&self) -> Result<()> {

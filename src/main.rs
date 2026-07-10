@@ -30,6 +30,7 @@ mod app {
     mod ocr;
     mod ocr_batch;
     mod playback_format;
+    mod player_controller;
     mod queue;
     mod runtime_state;
     mod song_dedup;
@@ -75,14 +76,15 @@ mod app {
     use self::monitor::{MonitorQueueItem, MonitorShared};
     use self::ocr::{OcrArgs, make_ocr_engine, merged_ocr_text, recognize_lines};
     use self::playback_format::{
-        PlaybackSnapshot, estimated_player_status, format_play_message, format_time, is_playing,
-        playback_progress_restarted, playback_remaining_seconds, song_title,
+        PlaybackSnapshot, estimated_player_status, format_play_message, is_playing, song_title,
+    };
+    use self::player_controller::{
+        MismatchDecision, PlaybackAttempt, PlaybackOutcome, PlaybackRequest, PlaybackVerification,
+        PlayerController, QueueAdvanceContext, QueueAdvanceDecision,
     };
     use self::queue::PersistentQueue;
-    use self::runtime_state::{
-        HALL_EXPIRING_WARNING_MINUTES, PersistentRuntimeState, RuntimeState,
-    };
-    use self::song_dedup::{PersistentSongDedupHistory, SongDedupCandidate};
+    use self::runtime_state::{HALL_EXPIRING_WARNING_MINUTES, PersistentRuntimeState};
+    use self::song_dedup::PersistentSongDedupHistory;
     use self::song_review::{SongReviewCandidate, SongReviewClient};
     use self::template_match::{best_template_hit, find_template_hits};
     use self::ui_state::detect_ui_state;
@@ -312,10 +314,9 @@ mod app {
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum PlayOutcome {
-        Success,
-        NoSource,
-        Error,
+    enum QueuePushOutcome {
+        Added(usize),
+        Full,
         DedupLimited,
     }
 
@@ -585,8 +586,8 @@ mod app {
         log::info!("已加载队列: {} 首", queue.len());
         log::info!("已加载长时间同歌去重历史: {} 条", song_dedup_history.len());
         log::info!(
-            "已加载运行时状态: paused_by_command={}",
-            runtime_state.state().paused_by_command
+            "已加载运行时状态: playback_state={:?}",
+            runtime_state.state().playback.state
         );
 
         let mut app =
@@ -601,7 +602,7 @@ mod app {
         runtime_state: Arc<Mutex<PersistentRuntimeState>>,
         queue: Arc<Mutex<PersistentQueue>>,
         song_dedup_history: Arc<Mutex<PersistentSongDedupHistory>>,
-        feeluown: FeelUOwnClient,
+        player: PlayerController<FeelUOwnClient>,
         ai: ai::AiClient,
         song_review: SongReviewClient,
         chat_output: ChatOutput,
@@ -712,6 +713,9 @@ mod app {
         ConsoleChat {
             text: String,
         },
+        PlayerPlayUri {
+            uri: String,
+        },
         StartGame {
             source: &'static str,
         },
@@ -734,6 +738,7 @@ mod app {
                 Self::Command(pending) => pending.parsed.raw.clone(),
                 Self::AdvanceQueue { reason } => format!("自动出队({})", reason),
                 Self::ConsoleChat { text } => format!("控制台发言: {}", text),
+                Self::PlayerPlayUri { uri } => format!("播放URI: {}", uri),
                 Self::StartGame { source } => format!("启动游戏({})", source),
                 Self::EnterWonderland { source } => format!("进入千星({})", source),
                 Self::ModerationVoteResult {
@@ -752,6 +757,7 @@ mod app {
                 Self::Command(pending) => command::same_lock_command(&pending.parsed, parsed),
                 Self::AdvanceQueue { .. } => false,
                 Self::ConsoleChat { .. } => false,
+                Self::PlayerPlayUri { .. } => false,
                 Self::StartGame { .. } => false,
                 Self::EnterWonderland { .. } => false,
                 Self::ModerationVoteResult { command, .. } => {
@@ -761,6 +767,25 @@ mod app {
                             if parsed_command.action == command.action && parsed_command.uid == command.uid
                     )
                 }
+            }
+        }
+
+        fn is_playback_task(&self) -> bool {
+            match self {
+                Self::AdvanceQueue { .. } | Self::PlayerPlayUri { .. } => true,
+                Self::Command(pending) => matches!(
+                    &pending.parsed.command,
+                    UserCommand::Song(_)
+                        | UserCommand::Pause
+                        | UserCommand::Resume
+                        | UserCommand::Play
+                        | UserCommand::Next
+                        | UserCommand::Previous
+                ),
+                Self::ConsoleChat { .. }
+                | Self::StartGame { .. }
+                | Self::EnterWonderland { .. }
+                | Self::ModerationVoteResult { .. } => false,
             }
         }
     }
@@ -835,12 +860,24 @@ mod app {
             let ai = ai::AiClient::new(&config.ai, &config.timing);
             let song_review = SongReviewClient::new(&config.song_review, &config.timing);
             let chat_output = ChatOutput::new(&config.output, &config.timing, &config.window);
+            let runtime_state = Arc::new(Mutex::new(runtime_state));
+            let queue = Arc::new(Mutex::new(queue));
+            let song_dedup_history = Arc::new(Mutex::new(song_dedup_history));
+            let player = PlayerController::new(
+                feeluown,
+                runtime_state.clone(),
+                song_dedup_history.clone(),
+                &config.timing.playback,
+                &config.queue,
+                &config.matching,
+                &config.song_dedup,
+            );
             Ok(Self {
                 config,
-                runtime_state: Arc::new(Mutex::new(runtime_state)),
-                queue: Arc::new(Mutex::new(queue)),
-                song_dedup_history: Arc::new(Mutex::new(song_dedup_history)),
-                feeluown,
+                runtime_state,
+                queue,
+                song_dedup_history,
+                player,
                 ai,
                 song_review,
                 chat_output,
@@ -869,6 +906,7 @@ mod app {
         fn run(&mut self) -> Result<()> {
             self.monitor.set_status("运行中");
             self.update_monitor_queue_snapshot();
+            self.update_monitor_playback_controller();
             self.warn_if_screen_size_mismatch()?;
             self.start_http_server()?;
             self.start_hotkeys()?;
@@ -900,7 +938,7 @@ mod app {
                 runtime_state: self.runtime_state.clone(),
                 queue: self.queue.clone(),
                 song_dedup_history: self.song_dedup_history.clone(),
-                feeluown: self.feeluown.clone(),
+                player: self.player.clone(),
                 ai: self.ai.clone(),
                 song_review: self.song_review.clone(),
                 chat_output: self.chat_output.clone(),
@@ -935,7 +973,7 @@ mod app {
                 runtime_state: self.runtime_state.clone(),
                 queue: self.queue.clone(),
                 song_dedup_history: self.song_dedup_history.clone(),
-                feeluown: self.feeluown.clone(),
+                player: self.player.clone(),
                 ai: self.ai.clone(),
                 song_review: self.song_review.clone(),
                 chat_output: self.chat_output.clone(),
@@ -968,7 +1006,7 @@ mod app {
                 runtime_state: self.runtime_state.clone(),
                 queue: self.queue.clone(),
                 song_dedup_history: self.song_dedup_history.clone(),
-                feeluown: self.feeluown.clone(),
+                player: self.player.clone(),
                 ai: self.ai.clone(),
                 song_review: self.song_review.clone(),
                 chat_output: self.chat_output.clone(),
@@ -1428,18 +1466,16 @@ mod app {
                     continue;
                 }
                 if let UserCommand::Invite(invite) = &parsed_command.command {
-                    let invite_executed = self
-                        .invite_executed_seqs
-                        .lock()
-                        .map_err(|_| anyhow!("invite_executed_seqs mutex poisoned"))?
-                        .contains(&invite.seq);
-                    if invite_executed {
-                        log::info!(
-                            "邀请参数 {} 已执行过，跳过: {}",
-                            invite.seq,
-                            parsed_command.raw
-                        );
-                        continue;
+                    if let Some(seq) = invite.seq {
+                        let invite_executed = self
+                            .invite_executed_seqs
+                            .lock()
+                            .map_err(|_| anyhow!("invite_executed_seqs mutex poisoned"))?
+                            .contains(&seq);
+                        if invite_executed {
+                            log::info!("邀请参数 {} 已执行过，跳过: {}", seq, parsed_command.raw);
+                            continue;
+                        }
                     }
                 }
                 if parsed
@@ -1621,6 +1657,7 @@ mod app {
                 }
                 PendingTask::AdvanceQueue { reason } => self.execute_advance_queue_task(reason),
                 PendingTask::ConsoleChat { text } => self.execute_console_chat_task(text),
+                PendingTask::PlayerPlayUri { uri } => self.execute_player_play_uri_task(uri),
                 PendingTask::StartGame { source } => self.execute_start_game_task(source),
                 PendingTask::EnterWonderland { source } => {
                     self.execute_enter_wonderland_task(source)
@@ -1689,6 +1726,13 @@ mod app {
                 },
             }
             self.reply(&message)
+        }
+
+        fn execute_player_play_uri_task(&mut self, uri: String) -> Result<()> {
+            log::info!("执行播放器 URI 播放任务: {}", uri);
+            self.player.play_uri(&uri)?;
+            self.update_monitor_playback_controller();
+            Ok(())
         }
 
         fn execute_start_game_task(&mut self, source: &'static str) -> Result<()> {
@@ -1932,7 +1976,7 @@ mod app {
 
                 let now = Instant::now();
                 if snapshot.is_none() || now >= next_status_at {
-                    match self.feeluown.status() {
+                    match self.player.status() {
                         Ok(status) => {
                             snapshot = Some(PlaybackSnapshot {
                                 status,
@@ -1949,9 +1993,9 @@ mod app {
                 }
 
                 if let Some(playback_snapshot) = snapshot.as_ref() {
-                    match self.maybe_advance_queue(playback_snapshot) {
+                    match self.handle_playback_monitor_snapshot(playback_snapshot) {
                         Ok(true) => {
-                            if let Ok(status) = self.feeluown.status() {
+                            if let Ok(status) = self.player.status() {
                                 snapshot = Some(PlaybackSnapshot {
                                     status,
                                     captured_at: Instant::now(),
@@ -1973,198 +2017,36 @@ mod app {
             }
         }
 
-        fn maybe_advance_queue(&mut self, snapshot: &PlaybackSnapshot) -> Result<bool> {
-            let mut status = estimated_player_status(snapshot);
-            let runtime_snapshot = self.runtime_state()?.state().clone();
-            let requested_guard_active = runtime_snapshot.current_song_is_requested
-                && self.requested_song_auto_advance_guard_active(&runtime_snapshot);
-
-            if runtime_snapshot.current_song_is_requested
-                && !self.status_matches_requested_song(&runtime_snapshot, &status)
-            {
-                match self.feeluown.status() {
-                    Ok(fresh_status) => {
-                        log::info!(
-                            "点歌状态与播放监控快照不一致，已刷新播放状态: snapshot_uri={} fresh_uri={} requested_uri={}",
-                            status.current_uri,
-                            fresh_status.current_uri,
-                            runtime_snapshot.last_requested_uri,
-                        );
-                        status = fresh_status;
-                    }
-                    Err(error) => {
-                        log::error!("刷新点歌播放状态失败，暂不自动出队: {error:#}");
-                        return Ok(false);
-                    }
-                }
-            }
-
-            if runtime_snapshot.current_song_is_requested
-                && requested_guard_active
-                && !self.status_matches_requested_song(&runtime_snapshot, &status)
-            {
-                log::info!("点歌刚切换，忽略可能过期的播放状态");
-                return Ok(false);
-            }
-
-            let current_song = format!("{}{}", status.name, status.singer);
-            let current_uri = status.current_uri.trim();
-            let requested_uri = runtime_snapshot.last_requested_uri.trim();
-            let requested_track_changed = if !current_uri.is_empty() && !requested_uri.is_empty() {
-                current_uri != requested_uri
-            } else {
-                !current_song.is_empty()
-                    && !runtime_snapshot.last_requested_song.is_empty()
-                    && current_song != runtime_snapshot.last_requested_song
+        fn handle_playback_monitor_snapshot(
+            &mut self,
+            snapshot: &PlaybackSnapshot,
+        ) -> Result<bool> {
+            let context = QueueAdvanceContext {
+                queue_empty: self.queue()?.is_empty(),
+                has_pending_playback_task: self.has_pending_playback_task()?,
+                command_executing: self.command_executing.load(AtomicOrdering::SeqCst),
+                song_command_executing: self.song_command_executing.load(AtomicOrdering::SeqCst),
             };
-            if runtime_snapshot.current_song_is_requested
-                && requested_track_changed
-                && !self.status_matches_requested_song(&runtime_snapshot, &status)
-            {
-                let mut runtime_state = self.runtime_state()?;
-                runtime_state.state_mut().current_song_is_requested = false;
-                runtime_state.state_mut().last_requested_uri.clear();
-                runtime_state.state_mut().last_requested_song.clear();
-                runtime_state.state_mut().last_requested_keyword.clear();
-                runtime_state.state_mut().last_requested_source.clear();
-                runtime_state
-                    .state_mut()
-                    .last_requested_prefer_accompaniment = false;
-                runtime_state.state_mut().last_requested_updated_at_ms = 0;
-                runtime_state.save()?;
-                log::info!("检测到歌曲已切换，取消点歌标记");
-            }
-
-            if runtime_snapshot.current_song_is_requested && requested_guard_active {
-                log::debug!("点歌刚开始，暂不触发队列自动出队");
-                return Ok(false);
-            }
-
-            let queue_empty = self.queue()?.is_empty();
-            let has_pending_task = self.has_pending_task()?;
-            let command_executing = self.command_executing.load(AtomicOrdering::SeqCst);
-            let song_command_executing = self.song_command_executing.load(AtomicOrdering::SeqCst);
-            let has_pending_playback = !queue_empty || has_pending_task || song_command_executing;
-
-            if self.runtime_state()?.state().paused_by_command {
-                return Ok(false);
-            }
-
-            if queue_empty && !has_pending_task && !command_executing && !song_command_executing {
-                return self.resume_pending_playback_pause_if_idle();
-            }
-
-            if status.status == "stopped" || status.status == "stoped" {
-                if command_executing || has_pending_task || queue_empty {
-                    return Ok(false);
-                }
-                let mut runtime_state = self.runtime_state()?;
-                runtime_state.state_mut().paused_by_command = false;
-                runtime_state.save()?;
-                drop(runtime_state);
-                self.push_pending_task(PendingTask::AdvanceQueue { reason: "停止" })?;
-                return Ok(true);
-            }
-            if status.status == "paused" {
-                if self.runtime_state()?.state().paused_for_pending_playback {
-                    let Some(remaining) = playback_remaining_seconds(&status) else {
-                        return Ok(false);
-                    };
-                    if remaining > self.config.queue.auto_advance_seconds as f64 {
-                        return Ok(false);
-                    }
-                    if !command_executing && !has_pending_task && !queue_empty {
-                        self.push_pending_task(PendingTask::AdvanceQueue {
-                            reason: "即将结束"
-                        })?;
-                        return Ok(true);
-                    }
-                    return Ok(false);
-                }
-                let Some(remaining) = playback_remaining_seconds(&status) else {
-                    return Ok(false);
-                };
-                if remaining > self.config.queue.auto_advance_seconds as f64 {
-                    return Ok(false);
-                }
-                if command_executing {
-                    return Ok(false);
-                }
-                if has_pending_task {
-                    return Ok(false);
-                }
-                if queue_empty {
-                    return Ok(false);
-                }
-                let mut runtime_state = self.runtime_state()?;
-                runtime_state.state_mut().paused_by_command = false;
-                runtime_state.state_mut().paused_for_pending_playback = false;
-                runtime_state.save()?;
-                drop(runtime_state);
-                self.push_pending_task(PendingTask::AdvanceQueue { reason: "暂停" })?;
-                return Ok(true);
-            }
-            if status.status != "playing" {
-                return Ok(false);
-            }
-
-            let should_clear_pause_flags = {
-                let runtime_state = self.runtime_state()?;
-                runtime_state.state().paused_by_command
-                    || runtime_state.state().paused_for_pending_playback
-            };
-            if should_clear_pause_flags {
-                let mut runtime_state = self.runtime_state()?;
-                runtime_state.state_mut().paused_by_command = false;
-                runtime_state.state_mut().paused_for_pending_playback = false;
-                runtime_state.save()?;
-            }
-            if let Some(remaining) = playback_remaining_seconds(&status) {
-                if remaining <= self.config.queue.auto_advance_seconds as f64
-                    && has_pending_playback
-                {
-                    let paused = self.pause_for_pending_playback()?;
-                    if !command_executing && !has_pending_task && !queue_empty {
-                        self.push_pending_task(PendingTask::AdvanceQueue {
-                            reason: "即将结束"
-                        })?;
-                        return Ok(true);
-                    }
-                    return Ok(paused);
+            let decision = self
+                .player
+                .maybe_advance_queue(estimated_player_status(snapshot), context)?;
+            self.update_monitor_playback_controller();
+            match decision {
+                QueueAdvanceDecision::None => Ok(false),
+                QueueAdvanceDecision::PlaybackStateChanged
+                | QueueAdvanceDecision::PauseForQueue
+                | QueueAdvanceDecision::ResumeIfIdle => Ok(true),
+                QueueAdvanceDecision::AdvanceQueue { reason } => {
+                    self.push_pending_task(PendingTask::AdvanceQueue { reason })?;
+                    Ok(true)
                 }
             }
-            Ok(false)
         }
 
-        fn has_pending_task(&self) -> Result<bool> {
+        fn has_pending_playback_task(&self) -> Result<bool> {
             let (lock, _) = &*self.pending;
             let guard = lock.lock().map_err(|_| anyhow!("pending mutex poisoned"))?;
-            Ok(!guard.is_empty())
-        }
-
-        fn pause_for_pending_playback(&mut self) -> Result<bool> {
-            if self.runtime_state()?.state().paused_for_pending_playback {
-                return Ok(false);
-            }
-            log::info!("歌曲即将结束，暂停等待点歌或队列播放");
-            self.feeluown.pause()?;
-            let mut runtime_state = self.runtime_state()?;
-            runtime_state.state_mut().paused_for_pending_playback = true;
-            runtime_state.state_mut().paused_by_command = false;
-            runtime_state.save()?;
-            Ok(true)
-        }
-
-        fn resume_pending_playback_pause_if_idle(&mut self) -> Result<bool> {
-            if !self.runtime_state()?.state().paused_for_pending_playback {
-                return Ok(false);
-            }
-            log::info!("没有待执行点歌或队列，恢复临近结束暂停的播放");
-            self.feeluown.play()?;
-            let mut runtime_state = self.runtime_state()?;
-            runtime_state.state_mut().paused_for_pending_playback = false;
-            runtime_state.save()?;
-            Ok(true)
+            Ok(guard.iter().any(PendingTask::is_playback_task))
         }
 
         fn maybe_warn_hall_expiring(&mut self) -> Result<bool> {
@@ -2234,10 +2116,7 @@ mod app {
             self.reply(&format!("{}AI匹配中", label))?;
 
             let search_source = ai_candidate_source(song);
-            let candidates = match self
-                .feeluown
-                .search_candidates(&song.keyword, search_source)
-            {
+            let candidates = match self.player.search_candidates(&song.keyword, search_source) {
                 Ok(candidates) => candidates,
                 Err(error) => {
                     log::error!("AI点歌搜索候选失败: {error:#}");
@@ -2311,7 +2190,7 @@ mod app {
                 } else {
                     &request.source
                 };
-                let picked = match self.feeluown.search_and_pick(
+                let picked = match self.player.search_and_pick(
                     &request.keyword,
                     source,
                     request.prefer_accompaniment,
@@ -2398,36 +2277,37 @@ mod app {
             song: &command::SongCommand,
             source: &str,
         ) -> Result<Option<ResolvedSongRequest>> {
-            let picked = match self.feeluown.search_and_pick(
-                &song.keyword,
-                source,
-                song.prefer_accompaniment,
-            ) {
-                Ok(Some(picked)) => picked,
-                _ => {
-                    let actions = if self.ai.enabled() {
-                        "@换源@AI"
-                    } else {
-                        "@换源"
-                    };
-                    self.reply(&format!("{}换源后仍无音源,{}", song_label(song), actions))?;
-                    let decision = self.wait_for_decision(true, self.ai.enabled(), true)?;
-                    match decision {
-                        UserDecision::SwitchSource => {
-                            let next_source = if source == "netease" {
-                                "qqmusic"
-                            } else {
-                                "netease"
-                            };
-                            return self.resolve_and_confirm_song_with_source(song, next_source);
+            let picked =
+                match self
+                    .player
+                    .search_and_pick(&song.keyword, source, song.prefer_accompaniment)
+                {
+                    Ok(Some(picked)) => picked,
+                    _ => {
+                        let actions = if self.ai.enabled() {
+                            "@换源@AI"
+                        } else {
+                            "@换源"
+                        };
+                        self.reply(&format!("{}换源后仍无音源,{}", song_label(song), actions))?;
+                        let decision = self.wait_for_decision(true, self.ai.enabled(), true)?;
+                        match decision {
+                            UserDecision::SwitchSource => {
+                                let next_source = if source == "netease" {
+                                    "qqmusic"
+                                } else {
+                                    "netease"
+                                };
+                                return self
+                                    .resolve_and_confirm_song_with_source(song, next_source);
+                            }
+                            UserDecision::Ai if self.ai.enabled() => {
+                                return self.resolve_and_confirm_song_ai(song);
+                            }
+                            _ => return Ok(None),
                         }
-                        UserDecision::Ai if self.ai.enabled() => {
-                            return self.resolve_and_confirm_song_ai(song);
-                        }
-                        _ => return Ok(None),
                     }
-                }
-            };
+                };
             let actions = if self.ai.enabled() {
                 "@确认@跳过@换源@AI"
             } else {
@@ -2476,10 +2356,7 @@ mod app {
             }
             self.reply(&format!("{}AI匹配中", label))?;
             let search_source = ai_candidate_source(song);
-            let candidates = match self
-                .feeluown
-                .search_candidates(&song.keyword, search_source)
-            {
+            let candidates = match self.player.search_candidates(&song.keyword, search_source) {
                 Ok(candidates) => candidates,
                 Err(error) => {
                     log::error!("AI点歌搜索候选失败: {error:#}");
@@ -2548,64 +2425,18 @@ mod app {
             ))
         }
 
-        fn current_status_matches_requested_song(&self, status: &PlayerStatus) -> Result<bool> {
-            let runtime_snapshot = self.runtime_state()?.state().clone();
-            Ok(self.status_matches_requested_song(&runtime_snapshot, status))
-        }
-
-        fn requested_song_auto_advance_guard_active(&self, state: &RuntimeState) -> bool {
-            if state.last_requested_updated_at_ms == 0 {
-                return false;
+        fn push_queue_request(&self, request: &ResolvedSongRequest) -> Result<QueuePushOutcome> {
+            if self.song_dedup_limited(request)? {
+                log::info!(
+                    "长时间同歌去重入队拦截: keyword={} uri={}",
+                    request.keyword,
+                    request.uri
+                );
+                return Ok(QueuePushOutcome::DedupLimited);
             }
-            let guard_ms = self
-                .config
-                .timing
-                .playback
-                .monitor_status_ms
-                .max(self.config.timing.playback.status_poll_ms)
-                .saturating_mul(3)
-                .max(3000);
-            current_unix_millis() < state.last_requested_updated_at_ms.saturating_add(guard_ms)
-        }
-
-        fn status_matches_requested_song(
-            &self,
-            runtime_state: &RuntimeState,
-            status: &PlayerStatus,
-        ) -> bool {
-            if !runtime_state.current_song_is_requested {
-                return false;
-            }
-            let current_uri = status.current_uri.trim();
-            let requested_uri = runtime_state.last_requested_uri.trim();
-            if !current_uri.is_empty() && !requested_uri.is_empty() {
-                return current_uri == requested_uri;
-            }
-            let current_song = format!("{}{}", status.name, status.singer);
-            if !current_song.is_empty()
-                && !runtime_state.last_requested_song.is_empty()
-                && current_song == runtime_state.last_requested_song
-            {
-                return true;
-            }
-            let keyword = runtime_state.last_requested_keyword.trim();
-            if keyword.is_empty() {
-                return false;
-            }
-            song_matcher::match_song_query(
-                &self.config.matching,
-                keyword,
-                &status.name,
-                &status.singer,
-                runtime_state.last_requested_prefer_accompaniment,
-            )
-            .ok
-        }
-
-        fn push_queue_request(&self, request: &ResolvedSongRequest) -> Result<Option<usize>> {
             let mut queue = self.queue()?;
             if queue.is_full() {
-                return Ok(None);
+                return Ok(QueuePushOutcome::Full);
             }
             queue.push(queue::QueueItem {
                 keyword: request.keyword.clone(),
@@ -2619,86 +2450,69 @@ mod app {
             let len = queue.len();
             drop(queue);
             self.update_monitor_queue_snapshot();
-            Ok(Some(len))
+            Ok(QueuePushOutcome::Added(len))
         }
 
-        fn request_dedup_candidate(&self, request: &ResolvedSongRequest) -> SongDedupCandidate {
-            let (title, artist) = song_review::split_candidate_title_artist(&request.keyword);
-            SongDedupCandidate {
-                uri: request.uri.clone(),
-                title,
-                artist,
-                source: request.source.clone(),
-                prefer_accompaniment: request.prefer_accompaniment,
-            }
-        }
-
-        fn status_dedup_candidate(
+        fn handle_queue_push_outcome(
             &self,
-            keyword: &str,
-            source: &str,
-            prefer_accompaniment: bool,
-            requested_uri: &str,
-            status: &PlayerStatus,
-        ) -> SongDedupCandidate {
-            let (fallback_title, fallback_artist) =
-                song_review::split_candidate_title_artist(keyword);
-            let title = if status.name.trim().is_empty() {
-                fallback_title
-            } else {
-                status.name.trim().to_string()
-            };
-            let artist = if status.singer.trim().is_empty() {
-                fallback_artist
-            } else {
-                status.singer.trim().to_string()
-            };
-            let uri = if status.current_uri.trim().is_empty() {
-                requested_uri.trim().to_string()
-            } else {
-                status.current_uri.trim().to_string()
-            };
-            SongDedupCandidate {
-                uri,
-                title,
-                artist,
-                source: source.to_string(),
-                prefer_accompaniment,
+            parsed: &ParsedCommand,
+            request: &ResolvedSongRequest,
+            outcome: QueuePushOutcome,
+            queued_action: &str,
+            full_action: &str,
+            queued_prefix: &str,
+            full_reply: &str,
+        ) -> Result<()> {
+            match outcome {
+                QueuePushOutcome::Added(len) => {
+                    self.log_executed_command(
+                        parsed,
+                        &final_song_command_text(request, queued_action),
+                    )?;
+                    self.reply(&format!(
+                        "{}({}/{}): {}",
+                        queued_prefix, len, self.config.queue.max_size, request.keyword
+                    ))?;
+                }
+                QueuePushOutcome::Full => {
+                    self.log_executed_command(
+                        parsed,
+                        &final_song_command_text(request, full_action),
+                    )?;
+                    self.reply(full_reply)?;
+                }
+                QueuePushOutcome::DedupLimited => {
+                    self.log_executed_command(
+                        parsed,
+                        &final_song_command_text(request, "dedup-limited-queue"),
+                    )?;
+                    self.reply(&self.song_dedup_reject_message(request))?;
+                }
             }
+            Ok(())
+        }
+
+        fn log_play_request_outcome(
+            &self,
+            parsed: &ParsedCommand,
+            request: &ResolvedSongRequest,
+            outcome: PlaybackOutcome,
+        ) -> Result<()> {
+            let action = match outcome {
+                PlaybackOutcome::Success => "play",
+                PlaybackOutcome::NoSource => "no-source",
+                PlaybackOutcome::Error => "play-error",
+                PlaybackOutcome::DedupLimited => "dedup-limited",
+            };
+            self.log_executed_command(parsed, &final_song_command_text(request, action))
         }
 
         fn song_dedup_limited(&self, request: &ResolvedSongRequest) -> Result<bool> {
             if request.console_bypass_dedup && self.config.song_dedup.console_bypass {
                 return Ok(false);
             }
-            let candidate = self.request_dedup_candidate(request);
-            let history = self
-                .song_dedup_history
-                .lock()
-                .map_err(|_| anyhow!("长时间同歌去重历史锁已损坏"))?;
-            Ok(history.is_limited(&self.config.song_dedup, &self.config.matching, &candidate))
-        }
-
-        fn record_song_dedup_playback(
-            &self,
-            keyword: &str,
-            source: &str,
-            prefer_accompaniment: bool,
-            requested_uri: &str,
-            status: &PlayerStatus,
-        ) -> Result<()> {
-            let candidate = self.status_dedup_candidate(
-                keyword,
-                source,
-                prefer_accompaniment,
-                requested_uri,
-                status,
-            );
-            let mut history = self
-                .song_dedup_history
-                .lock()
-                .map_err(|_| anyhow!("长时间同歌去重历史锁已损坏"))?;
-            history.record_playback(&self.config.song_dedup, candidate)
+            self.player
+                .song_dedup_limited(&self.playback_request_from_resolved(request))
         }
 
         fn song_dedup_reject_message(&self, request: &ResolvedSongRequest) -> String {
@@ -2707,6 +2521,17 @@ mod app {
 
         fn song_dedup_skip_message(&self, request: &ResolvedSongRequest) -> String {
             format!("{}近期已播放过,已跳过", request.keyword)
+        }
+
+        fn playback_request_from_resolved(&self, request: &ResolvedSongRequest) -> PlaybackRequest {
+            PlaybackRequest {
+                keyword: request.keyword.clone(),
+                match_keyword: request.match_keyword().to_string(),
+                source: request.source.clone(),
+                prefer_accompaniment: request.prefer_accompaniment,
+                uri: request.uri.clone(),
+                skip_match_check: request.skip_match_check,
+            }
         }
 
         fn review_song_candidate(
@@ -2800,34 +2625,6 @@ mod app {
             Ok(false)
         }
 
-        fn should_queue_until_current_song_finished(&self, status: &PlayerStatus) -> Result<bool> {
-            if !self.config.queue.protect_current_song_until_finished {
-                return Ok(false);
-            }
-            if status.status == "playing" {
-                return Ok(true);
-            }
-            if status.status == "paused"
-                && (playback_remaining_seconds(status).is_some()
-                    || !status.current_uri.trim().is_empty()
-                    || !status.name.trim().is_empty()
-                    || !status.singer.trim().is_empty())
-            {
-                return Ok(true);
-            }
-
-            let runtime_snapshot = self.runtime_state()?.state().clone();
-            if !runtime_snapshot.current_song_is_requested {
-                return Ok(false);
-            }
-            if self.status_matches_requested_song(&runtime_snapshot, status)
-                || self.requested_song_auto_advance_guard_active(&runtime_snapshot)
-            {
-                return Ok(true);
-            }
-            Ok(status.status != "stopped" && status.status != "stoped")
-        }
-
         fn execute_command(&mut self, parsed: &ParsedCommand) -> Result<()> {
             match &parsed.command {
                 UserCommand::Song(song) => {
@@ -2848,27 +2645,20 @@ mod app {
                         return Ok(());
                     }
                     if !self.queue()?.is_empty() {
-                        let added_len = self.push_queue_request(&request)?;
-                        if let Some(len) = added_len {
-                            self.log_executed_command(
-                                parsed,
-                                &final_song_command_text(&request, "queue"),
-                            )?;
-                            self.reply(&format!(
-                                "队列已加入({}/{}): {}",
-                                len, self.config.queue.max_size, request.keyword
-                            ))?;
-                        } else {
-                            self.log_executed_command(
-                                parsed,
-                                &final_song_command_text(&request, "queue-full"),
-                            )?;
-                            self.reply("队列已满，请稍后再试")?;
-                        }
+                        let outcome = self.push_queue_request(&request)?;
+                        self.handle_queue_push_outcome(
+                            parsed,
+                            &request,
+                            outcome,
+                            "queue",
+                            "queue-full",
+                            "队列已加入",
+                            "队列已满，请稍后再试",
+                        )?;
                         return Ok(());
                     }
 
-                    let status = self.feeluown.status();
+                    let status = self.player.status();
                     match status {
                         Ok(status) if is_playing(&status) => {
                             if !request.uri.trim().is_empty()
@@ -2898,115 +2688,80 @@ mod app {
                                     return Ok(());
                                 }
                             }
-                            if self.should_queue_until_current_song_finished(&status)? {
-                                let added_len = self.push_queue_request(&request)?;
-                                if let Some(len) = added_len {
-                                    self.log_executed_command(
-                                        parsed,
-                                        &final_song_command_text(&request, "queue"),
-                                    )?;
-                                    self.reply(&format!(
-                                        "队列已加入({}/{}): {}",
-                                        len, self.config.queue.max_size, request.keyword
-                                    ))?;
-                                } else {
-                                    self.log_executed_command(
-                                        parsed,
-                                        &final_song_command_text(&request, "queue-full"),
-                                    )?;
-                                    self.reply("队列已满，请稍后再试")?;
-                                }
+                            if self
+                                .player
+                                .should_queue_until_current_song_finished(&status)?
+                            {
+                                let outcome = self.push_queue_request(&request)?;
+                                self.handle_queue_push_outcome(
+                                    parsed,
+                                    &request,
+                                    outcome,
+                                    "queue",
+                                    "queue-full",
+                                    "队列已加入",
+                                    "队列已满，请稍后再试",
+                                )?;
                                 return Ok(());
                             }
-                            if !self.current_status_matches_requested_song(&status)? {
-                                let mut runtime_state = self.runtime_state()?;
-                                runtime_state.state_mut().paused_by_command = false;
-                                runtime_state.save()?;
-                                drop(runtime_state);
-                                self.log_executed_command(
-                                    parsed,
-                                    &final_song_command_text(&request, "play"),
-                                )?;
-                                let _ = self.play_request_confirmed(&request, true)?;
+                            if !self.player.current_status_matches_request(&status)? {
+                                let outcome = self.play_request_confirmed(&request, true)?;
+                                self.log_play_request_outcome(parsed, &request, outcome)?;
                                 return Ok(());
                             }
-                            let added_len = self.push_queue_request(&request)?;
-                            if let Some(len) = added_len {
-                                self.log_executed_command(
-                                    parsed,
-                                    &final_song_command_text(&request, "queue"),
-                                )?;
-                                self.reply(&format!(
-                                    "队列已加入({}/{}): {}",
-                                    len, self.config.queue.max_size, request.keyword
-                                ))?;
-                            } else {
-                                self.log_executed_command(
-                                    parsed,
-                                    &final_song_command_text(&request, "queue-full"),
-                                )?;
-                                self.reply("队列已满，请稍后再试")?;
-                            }
+                            let outcome = self.push_queue_request(&request)?;
+                            self.handle_queue_push_outcome(
+                                parsed,
+                                &request,
+                                outcome,
+                                "queue",
+                                "queue-full",
+                                "队列已加入",
+                                "队列已满，请稍后再试",
+                            )?;
                             return Ok(());
                         }
                         Ok(status) => {
-                            if self.should_queue_until_current_song_finished(&status)? {
-                                let added_len = self.push_queue_request(&request)?;
-                                if let Some(len) = added_len {
-                                    self.log_executed_command(
-                                        parsed,
-                                        &final_song_command_text(&request, "queue"),
-                                    )?;
-                                    self.reply(&format!(
-                                        "队列已加入({}/{}): {}",
-                                        len, self.config.queue.max_size, request.keyword
-                                    ))?;
-                                } else {
-                                    self.log_executed_command(
-                                        parsed,
-                                        &final_song_command_text(&request, "queue-full"),
-                                    )?;
-                                    self.reply("队列已满，请稍后再试")?;
-                                }
+                            if self
+                                .player
+                                .should_queue_until_current_song_finished(&status)?
+                            {
+                                let outcome = self.push_queue_request(&request)?;
+                                self.handle_queue_push_outcome(
+                                    parsed,
+                                    &request,
+                                    outcome,
+                                    "queue",
+                                    "queue-full",
+                                    "队列已加入",
+                                    "队列已满，请稍后再试",
+                                )?;
                                 return Ok(());
                             }
-                            let mut runtime_state = self.runtime_state()?;
-                            runtime_state.state_mut().paused_by_command = false;
-                            runtime_state.save()?;
                         }
                         Err(error) => {
                             log::error!("获取播放状态失败: {error:#}");
-                            let added_len = self.push_queue_request(&request)?;
-                            if let Some(len) = added_len {
-                                self.log_executed_command(
-                                    parsed,
-                                    &final_song_command_text(&request, "queue-status-unknown"),
-                                )?;
-                                self.reply(&format!(
-                                    "状态未知，队列已加入({}/{}): {}",
-                                    len, self.config.queue.max_size, request.keyword
-                                ))?;
-                            } else {
-                                self.log_executed_command(
-                                    parsed,
-                                    &final_song_command_text(&request, "queue-full-status-unknown"),
-                                )?;
-                                self.reply("状态未知且队列已满，请稍后再试")?;
-                            }
+                            let outcome = self.push_queue_request(&request)?;
+                            self.handle_queue_push_outcome(
+                                parsed,
+                                &request,
+                                outcome,
+                                "queue-status-unknown",
+                                "queue-full-status-unknown",
+                                "状态未知，队列已加入",
+                                "状态未知且队列已满，请稍后再试",
+                            )?;
                             return Ok(());
                         }
                     }
 
-                    self.log_executed_command(parsed, &final_song_command_text(&request, "play"))?;
-                    let _ = self.play_request_confirmed(&request, true)?;
+                    let outcome = self.play_request_confirmed(&request, true)?;
+                    self.log_play_request_outcome(parsed, &request, outcome)?;
                 }
                 UserCommand::Pause => {
-                    let message = self.feeluown.pause()?;
+                    let message = self.player.pause_by_user()?;
                     self.log_executed_command(parsed, "pause")?;
-                    let mut runtime_state = self.runtime_state()?;
-                    runtime_state.state_mut().paused_by_command = true;
-                    runtime_state.state_mut().paused_for_pending_playback = false;
-                    runtime_state.save()?;
+                    self.update_monitor_playback_controller();
                     self.reply(if message.trim().is_empty() {
                         "已暂停"
                     } else {
@@ -3014,12 +2769,9 @@ mod app {
                     })?;
                 }
                 UserCommand::Resume | UserCommand::Play => {
-                    let message = self.feeluown.play()?;
+                    let message = self.player.resume_by_user()?;
                     self.log_executed_command(parsed, "resume")?;
-                    let mut runtime_state = self.runtime_state()?;
-                    runtime_state.state_mut().paused_by_command = false;
-                    runtime_state.state_mut().paused_for_pending_playback = false;
-                    runtime_state.save()?;
+                    self.update_monitor_playback_controller();
                     self.reply(if message.trim().is_empty() {
                         "已恢复播放"
                     } else {
@@ -3031,28 +2783,30 @@ mod app {
                         self.consume_queue("手动下一首")?;
                         self.log_executed_command(parsed, "next queue")?;
                     } else {
-                        let message = self.feeluown.next()?;
+                        let message = self.player.next_external()?;
+                        self.update_monitor_playback_controller();
                         self.log_executed_command(parsed, "next feeluown")?;
                         self.reply_player_status_after_skip(message.trim())?;
                     }
                 }
                 UserCommand::Previous => {
-                    let message = self.feeluown.previous()?;
+                    let message = self.player.previous_external()?;
+                    self.update_monitor_playback_controller();
                     self.log_executed_command(parsed, "previous")?;
                     self.reply_player_status_after_skip(message.trim())?;
                 }
                 UserCommand::Volume(volume) => {
-                    self.feeluown.set_volume(volume)?;
+                    self.player.set_volume(volume)?;
                     self.log_executed_command(parsed, &format!("volume {}", volume))?;
                     self.reply(&format!("音量已设置为 {}", volume))?;
                 }
                 UserCommand::Status => {
-                    let status = self.feeluown.status()?;
+                    let status = self.player.status()?;
                     self.log_executed_command(parsed, "status")?;
                     self.reply(&format_status(&status))?;
                 }
                 UserCommand::Lyrics => {
-                    let status = self.feeluown.status()?;
+                    let status = self.player.status()?;
                     self.log_executed_command(parsed, "lyrics")?;
                     self.reply(&format_lyrics(&status))?;
                 }
@@ -3107,18 +2861,21 @@ mod app {
                     self.send_help()?;
                 }
                 UserCommand::Invite(invite) => {
-                    {
+                    if let Some(seq) = invite.seq {
                         let mut executed = self
                             .invite_executed_seqs
                             .lock()
                             .map_err(|_| anyhow!("invite_executed_seqs mutex poisoned"))?;
-                        if !executed.insert(invite.seq) {
-                            log::info!("邀请参数 {} 已执行过，跳过", invite.seq);
+                        if !executed.insert(seq) {
+                            log::info!("邀请参数 {} 已执行过，跳过", seq);
                             return Ok(());
                         }
                     }
                     self.log_executed_command(parsed, &format!("invite {}", invite.username))?;
-                    self.execute_invite_with_announce(&invite.username)?;
+                    self.execute_invite_with_announce(
+                        &invite.username,
+                        invite.password.as_deref(),
+                    )?;
                 }
                 UserCommand::Moderation(command) => {
                     self.log_executed_command(
@@ -3156,6 +2913,7 @@ mod app {
                     self.reply("管理员已启用大厅命令识别功能")?;
                 }
                 UserCommand::IdleExit { minutes } => {
+                    self.configure_idle_exit(*minutes)?;
                     self.log_executed_command(parsed, &format!("idle exit {}", minutes))?;
                 }
                 UserCommand::CustomWorkflow(command) => {
@@ -3259,7 +3017,7 @@ mod app {
                 self.config.timing.playback.skip_status_initial_ms,
             ));
             for _ in 0..self.config.timing.playback.skip_status_retries {
-                match self.feeluown.status() {
+                match self.player.status() {
                     Ok(status) if is_playing(&status) || status.status == "paused" => {
                         return self.reply(&format_play_message(&status));
                     }
@@ -3514,27 +3272,11 @@ mod app {
             )
         }
 
-        fn play_keyword_confirmed(
-            &mut self,
-            keyword: &str,
-            source: &str,
-            prefer_accompaniment: bool,
-            allow_switch_source: bool,
-        ) -> Result<PlayOutcome> {
-            self.play_keyword_confirmed_inner(
-                keyword,
-                source,
-                prefer_accompaniment,
-                allow_switch_source,
-                false,
-            )
-        }
-
         fn play_request_confirmed(
             &mut self,
             request: &ResolvedSongRequest,
             allow_switch_source: bool,
-        ) -> Result<PlayOutcome> {
+        ) -> Result<PlaybackOutcome> {
             if self.song_dedup_limited(request)? {
                 log::info!(
                     "长时间同歌去重拦截: keyword={} uri={}",
@@ -3542,91 +3284,20 @@ mod app {
                     request.uri
                 );
                 self.reply(&self.song_dedup_reject_message(request))?;
-                return Ok(PlayOutcome::DedupLimited);
+                return Ok(PlaybackOutcome::DedupLimited);
             }
             if request.uri.trim().is_empty() {
-                return self.play_keyword_confirmed(
+                let source = if request.source.trim().is_empty() {
+                    "qqmusic"
+                } else {
+                    &request.source
+                };
+                let picked = match self.player.search_and_pick(
                     &request.keyword,
-                    &request.source,
+                    source,
                     request.prefer_accompaniment,
-                    allow_switch_source,
-                );
-            }
-            self.play_uri_confirmed(
-                &request.uri,
-                &request.keyword,
-                request.match_keyword(),
-                request.prefer_accompaniment,
-                request.skip_match_check,
-            )
-        }
-
-        fn play_uri_confirmed(
-            &mut self,
-            uri: &str,
-            _display_keyword: &str,
-            match_keyword: &str,
-            prefer_accompaniment: bool,
-            skip_match_check: bool,
-        ) -> Result<PlayOutcome> {
-            self.clear_requested_song_state()?;
-            let initial_song = self
-                .feeluown
-                .status()
-                .map(|status| (format!("{}{}", status.name, status.singer), status.progress))
-                .unwrap_or_default();
-            match self.feeluown.play_uri(uri) {
-                Ok(_) => {}
-                Err(error) => {
-                    let message = error.to_string();
-                    log::error!("AI点歌播放候选失败: {message}");
-                    self.reply(if message.trim().is_empty() {
-                        "平台无对应歌曲音源"
-                    } else {
-                        message.trim()
-                    })?;
-                    return Ok(PlayOutcome::Error);
-                }
-            }
-            self.confirm_playback_started(
-                match_keyword,
-                "",
-                prefer_accompaniment,
-                false,
-                false,
-                initial_song.0,
-                initial_song.1,
-                uri,
-                skip_match_check,
-            )
-        }
-
-        fn play_keyword_confirmed_inner(
-            &mut self,
-            keyword: &str,
-            source: &str,
-            prefer_accompaniment: bool,
-            allow_switch_source: bool,
-            confirm_after_switch: bool,
-        ) -> Result<PlayOutcome> {
-            self.clear_requested_song_state()?;
-            let search_source = if source.trim().is_empty() {
-                "qqmusic"
-            } else {
-                source
-            };
-            let initial_song = self
-                .feeluown
-                .status()
-                .map(|status| (format!("{}{}", status.name, status.singer), status.progress))
-                .unwrap_or_default();
-
-            let result =
-                match self
-                    .feeluown
-                    .play_keyword(keyword, search_source, prefer_accompaniment)
-                {
-                    Ok(result) => result,
+                ) {
+                    Ok(Some(picked)) => picked,
                     Err(error) => {
                         let message = error.to_string();
                         log::error!("点歌搜索失败: {message}");
@@ -3636,282 +3307,191 @@ mod app {
                             message.trim()
                         })?;
                         return Ok(if message.contains("平台无对应歌曲音源") {
-                            PlayOutcome::NoSource
+                            PlaybackOutcome::NoSource
                         } else {
-                            PlayOutcome::Error
+                            PlaybackOutcome::Error
                         });
                     }
+                    Ok(None) => {
+                        self.reply("平台无对应歌曲音源")?;
+                        return Ok(PlaybackOutcome::NoSource);
+                    }
                 };
-            self.reply(&result.message)?;
-            let requested_uri = result
-                .candidate
-                .as_ref()
-                .map(|candidate| candidate.uri.clone())
-                .unwrap_or_default();
-            if let Some(candidate) = &result.candidate {
-                log::info!("FeelUOwn 候选: {} -> {}", candidate.text, candidate.uri);
+                log::info!("播放器候选: {} -> {}", picked.0.text, picked.0.uri);
+                let mut resolved = request.clone();
+                resolved.keyword = picked.0.text;
+                resolved.source = source.to_string();
+                resolved.uri = picked.0.uri;
+                return self.play_request_confirmed(&resolved, allow_switch_source);
             }
-            self.confirm_playback_started(
-                keyword,
-                search_source,
-                prefer_accompaniment,
+            let playback_request = self.playback_request_from_resolved(request);
+            self.play_playback_request(&playback_request, allow_switch_source, false)
+        }
+
+        fn play_playback_request(
+            &mut self,
+            request: &PlaybackRequest,
+            allow_switch_source: bool,
+            confirm_after_switch: bool,
+        ) -> Result<PlaybackOutcome> {
+            let mut attempt = match self.player.play_request_uri(request) {
+                Ok(attempt) => attempt,
+                Err(error) => {
+                    let message = error.to_string();
+                    log::error!("播放候选失败: {message}");
+                    self.reply(if message.trim().is_empty() {
+                        "平台无对应歌曲音源"
+                    } else {
+                        message.trim()
+                    })?;
+                    return Ok(PlaybackOutcome::Error);
+                }
+            };
+            self.complete_playback_verification(
+                request,
+                &mut attempt,
                 allow_switch_source,
                 confirm_after_switch,
-                initial_song.0,
-                initial_song.1,
-                &requested_uri,
-                false,
             )
         }
 
-        fn confirm_playback_started(
+        fn complete_playback_verification(
             &mut self,
-            keyword: &str,
-            search_source: &str,
-            prefer_accompaniment: bool,
+            request: &PlaybackRequest,
+            attempt: &mut PlaybackAttempt,
             allow_switch_source: bool,
             confirm_after_switch: bool,
-            initial_song: String,
-            initial_progress: f64,
-            requested_uri: &str,
-            skip_match_check: bool,
-        ) -> Result<PlayOutcome> {
-            sleep(Duration::from_millis(
-                self.config.timing.playback.search_settle_ms,
-            ));
-
-            let mut last_seen_song = initial_song;
-            let mut requested_state_recorded = false;
-            for retry in 0..self.config.timing.playback.status_retries {
-                let status = match self.feeluown.status() {
-                    Ok(status) => status,
-                    Err(error) => {
-                        log::error!("查询播放状态失败: {error:#}");
-                        sleep(Duration::from_millis(
-                            self.config.timing.playback.status_poll_ms,
-                        ));
-                        continue;
-                    }
-                };
-                log::info!(
-                    "播放状态: {}, 歌曲: {} - {}, URI: {}",
-                    status.status,
-                    status.name,
-                    status.singer,
-                    status.current_uri
-                );
-                if status.status != "playing" && status.status != "paused" {
-                    sleep(Duration::from_millis(
-                        self.config.timing.playback.status_poll_ms,
-                    ));
-                    continue;
-                }
-
-                let current_uri = status.current_uri.trim();
-                let requested_uri = requested_uri.trim();
-                let current_song = format!("{}{}", status.name, status.singer);
-                let uri_matched = !requested_uri.is_empty()
-                    && !current_uri.is_empty()
-                    && current_uri == requested_uri;
-                if uri_matched && !requested_state_recorded {
-                    self.set_requested_song_state(
-                        keyword,
-                        search_source,
-                        prefer_accompaniment,
-                        requested_uri,
-                        &status,
-                    )?;
-                    requested_state_recorded = true;
-                }
-                if !requested_uri.is_empty()
-                    && !current_uri.is_empty()
-                    && current_uri != requested_uri
-                {
-                    log::info!(
-                        "URI 与请求资源不同，继续用歌曲信息确认: current={} requested={} ({}/{})",
-                        current_uri,
-                        requested_uri,
-                        retry + 1,
-                        self.config.timing.playback.status_retries
-                    );
-                }
-                if current_song.is_empty() && current_uri.is_empty() {
-                    log::info!(
-                        "播放状态缺少歌曲标识，继续等待 ({}/{})",
-                        retry + 1,
-                        self.config.timing.playback.status_retries
-                    );
-                    sleep(Duration::from_millis(
-                        self.config.timing.playback.status_poll_ms,
-                    ));
-                    continue;
-                }
-                if skip_match_check
-                    && !uri_matched
-                    && !current_song.is_empty()
-                    && current_song == last_seen_song
-                    && !playback_progress_restarted(initial_progress, status.progress)
-                {
-                    log::info!(
-                        "歌曲未变化，等待 URI 播放生效 ({}/{})",
-                        retry + 1,
-                        self.config.timing.playback.status_retries
-                    );
-                    sleep(Duration::from_millis(
-                        self.config.timing.playback.status_poll_ms,
-                    ));
-                    continue;
-                }
-                if !skip_match_check && !uri_matched {
-                    let local_match = song_matcher::match_song_query(
-                        &self.config.matching,
-                        keyword,
-                        &status.name,
-                        &status.singer,
-                        prefer_accompaniment,
-                    );
-                    if !local_match.ok {
-                        log::info!("歌曲暂不匹配: {}", local_match.reason);
-                        if !current_song.is_empty() && current_song == last_seen_song {
-                            log::info!(
-                                "歌曲未变化，搜索可能尚未完成，继续等待 ({}/{})",
-                                retry + 1,
-                                self.config.timing.playback.status_retries
-                            );
-                            sleep(Duration::from_millis(
-                                self.config.timing.playback.status_poll_ms,
-                            ));
-                            continue;
-                        }
-                        if !current_song.is_empty() {
-                            last_seen_song = current_song.clone();
-                        }
-
-                        let mut ai_auto_matched = false;
-                        if self.ai.enabled() {
-                            match self
-                                .ai
-                                .match_same_song(keyword, &status.name, &status.singer)
-                            {
-                                Ok(ai_match) if ai_match.matched => {
-                                    log::info!(
-                                        "AI自动匹配通过: {} score={}",
-                                        ai_match.reason,
-                                        ai_match.score
-                                    );
-                                    match self
-                                        .confirm_ai_auto_match(&status, allow_switch_source)?
-                                    {
-                                        UserDecision::Skip => {
-                                            self.report_no_source(Some(&status), true)?;
-                                            return Ok(PlayOutcome::NoSource);
-                                        }
-                                        UserDecision::SwitchSource => {
-                                            if allow_switch_source {
-                                                return self.switch_source_and_play(
-                                                    keyword,
-                                                    search_source,
-                                                    prefer_accompaniment,
-                                                );
-                                            }
-                                        }
-                                        UserDecision::Stopped => return Ok(PlayOutcome::Error),
-                                        _ => ai_auto_matched = true,
-                                    }
-                                }
-                                Ok(ai_match) => {
-                                    log::info!("AI判断不是同一首: {}", ai_match.reason);
-                                }
-                                Err(error) => {
-                                    log::info!("AI判断异常，回退到人工确认: {error:#}");
-                                }
-                            }
-                        }
-
-                        if !ai_auto_matched {
-                            match self.confirm_song(&status, allow_switch_source)? {
-                                UserDecision::PromptFailed | UserDecision::Stopped => {
-                                    return Ok(PlayOutcome::Error);
-                                }
-                                UserDecision::SwitchSource => {
-                                    if allow_switch_source {
-                                        return self.switch_source_and_play(
-                                            keyword,
-                                            search_source,
-                                            prefer_accompaniment,
-                                        );
-                                    }
-                                }
-                                UserDecision::Timeout => {
-                                    if status.status == "playing" {
-                                        let _ = self.feeluown.pause();
-                                    }
-                                    return Ok(PlayOutcome::NoSource);
-                                }
-                                UserDecision::Confirm => {}
+        ) -> Result<PlaybackOutcome> {
+            loop {
+                match self.player.verify_playback_started(request, attempt)? {
+                    PlaybackVerification::Success { status, message } => {
+                        if confirm_after_switch {
+                            match self.confirm_switched_source_result(&status)? {
                                 UserDecision::Skip => {
-                                    self.report_no_source(Some(&status), true)?;
-                                    return Ok(PlayOutcome::NoSource);
+                                    self.player.reject_mismatch_as_no_source(Some(&status))?;
+                                    self.report_no_source(Some(&status), false)?;
+                                    self.update_monitor_playback_controller();
+                                    return Ok(PlaybackOutcome::NoSource);
                                 }
+                                UserDecision::Stopped => return Ok(PlaybackOutcome::Error),
                                 _ => {}
                             }
                         }
+                        self.reply(&message)?;
+                        self.update_monitor_playback_controller();
+                        return Ok(PlaybackOutcome::Success);
                     }
-                }
-
-                let progress = format_time(status.progress);
-                let duration = format_time(status.duration);
-                if (progress == "0:00" && duration == "0:00") || duration == "error" {
-                    log::info!(
-                        "0:00/0:00，等待后重试 ({}/{})",
-                        retry + 1,
-                        self.config.timing.playback.status_retries
-                    );
-                    sleep(Duration::from_millis(
-                        self.config.timing.playback.status_poll_ms,
-                    ));
-                    continue;
-                }
-                if status.duration > 0.0 && status.duration < 20.0 {
-                    log::info!("歌曲时长过短 ({:.1}s)，视为无音源", status.duration);
-                    self.report_no_source(Some(&status), true)?;
-                    return Ok(PlayOutcome::NoSource);
-                }
-
-                if confirm_after_switch {
-                    match self.confirm_switched_source_result(&status)? {
-                        UserDecision::Skip => {
-                            self.report_no_source(Some(&status), true)?;
-                            return Ok(PlayOutcome::NoSource);
+                    PlaybackVerification::NoSource => {
+                        self.report_no_source(None, false)?;
+                        self.update_monitor_playback_controller();
+                        return Ok(PlaybackOutcome::NoSource);
+                    }
+                    PlaybackVerification::MismatchedCandidate(mismatch) => {
+                        match self.handle_playback_mismatch(
+                            request,
+                            &mismatch.status,
+                            &mismatch.local_reason,
+                            allow_switch_source,
+                        )? {
+                            MismatchDecision::Accept => {
+                                match self.player.accept_mismatch(request, &mismatch.status)? {
+                                    PlaybackVerification::Success { status, message } => {
+                                        if confirm_after_switch {
+                                            match self.confirm_switched_source_result(&status)? {
+                                                UserDecision::Skip => {
+                                                    self.player.reject_mismatch_as_no_source(
+                                                        Some(&status),
+                                                    )?;
+                                                    self.report_no_source(Some(&status), false)?;
+                                                    self.update_monitor_playback_controller();
+                                                    return Ok(PlaybackOutcome::NoSource);
+                                                }
+                                                UserDecision::Stopped => {
+                                                    return Ok(PlaybackOutcome::Error);
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                        self.reply(&message)?;
+                                        self.update_monitor_playback_controller();
+                                        return Ok(PlaybackOutcome::Success);
+                                    }
+                                    PlaybackVerification::NoSource => {
+                                        self.report_no_source(Some(&mismatch.status), true)?;
+                                        self.update_monitor_playback_controller();
+                                        return Ok(PlaybackOutcome::NoSource);
+                                    }
+                                    _ => return Ok(PlaybackOutcome::Error),
+                                }
+                            }
+                            MismatchDecision::NoSource => {
+                                self.player
+                                    .reject_mismatch_as_no_source(Some(&mismatch.status))?;
+                                self.report_no_source(Some(&mismatch.status), false)?;
+                                self.update_monitor_playback_controller();
+                                return Ok(PlaybackOutcome::NoSource);
+                            }
+                            MismatchDecision::SwitchSource => {
+                                return self.switch_source_and_play(
+                                    &request.keyword,
+                                    &request.source,
+                                    request.prefer_accompaniment,
+                                );
+                            }
+                            MismatchDecision::Error => return Ok(PlaybackOutcome::Error),
                         }
-                        UserDecision::Stopped => return Ok(PlayOutcome::Error),
-                        _ => {}
                     }
                 }
+            }
+        }
 
-                let play_message = format_play_message(&status);
-                log::info!("播放成功: {}", play_message);
-                self.set_requested_song_state(
-                    keyword,
-                    search_source,
-                    prefer_accompaniment,
-                    requested_uri,
-                    &status,
-                )?;
-                self.record_song_dedup_playback(
-                    keyword,
-                    search_source,
-                    prefer_accompaniment,
-                    requested_uri,
-                    &status,
-                )?;
-                self.reply(&play_message)?;
-                return Ok(PlayOutcome::Success);
+        fn handle_playback_mismatch(
+            &mut self,
+            request: &PlaybackRequest,
+            status: &PlayerStatus,
+            local_reason: &str,
+            allow_switch_source: bool,
+        ) -> Result<MismatchDecision> {
+            log::info!("歌曲暂不匹配: {}", local_reason);
+            if self.ai.enabled() {
+                match self
+                    .ai
+                    .match_same_song(&request.match_keyword, &status.name, &status.singer)
+                {
+                    Ok(ai_match) if ai_match.matched => {
+                        log::info!(
+                            "AI自动匹配通过: {} score={}",
+                            ai_match.reason,
+                            ai_match.score
+                        );
+                        return Ok(
+                            match self.confirm_ai_auto_match(status, allow_switch_source)? {
+                                UserDecision::Skip => MismatchDecision::NoSource,
+                                UserDecision::SwitchSource if allow_switch_source => {
+                                    MismatchDecision::SwitchSource
+                                }
+                                UserDecision::Stopped => MismatchDecision::Error,
+                                _ => MismatchDecision::Accept,
+                            },
+                        );
+                    }
+                    Ok(ai_match) => {
+                        log::info!("AI判断不是同一首: {}", ai_match.reason);
+                    }
+                    Err(error) => {
+                        log::info!("AI判断异常，回退到人工确认: {error:#}");
+                    }
+                }
             }
 
-            log::info!("超时未播放成功");
-            self.report_no_source(None, false)?;
-            Ok(PlayOutcome::NoSource)
+            Ok(match self.confirm_song(status, allow_switch_source)? {
+                UserDecision::PromptFailed | UserDecision::Stopped => MismatchDecision::Error,
+                UserDecision::SwitchSource if allow_switch_source => MismatchDecision::SwitchSource,
+                UserDecision::Timeout => MismatchDecision::NoSource,
+                UserDecision::Confirm => MismatchDecision::Accept,
+                UserDecision::Skip => MismatchDecision::NoSource,
+                _ => MismatchDecision::NoSource,
+            })
         }
 
         fn switch_source_and_play(
@@ -3919,7 +3499,7 @@ mod app {
             keyword: &str,
             current_source: &str,
             prefer_accompaniment: bool,
-        ) -> Result<PlayOutcome> {
+        ) -> Result<PlaybackOutcome> {
             let next_source = if current_source == "netease" {
                 "qqmusic"
             } else {
@@ -3931,13 +3511,31 @@ mod app {
                 "QQ"
             };
             self.reply(&format!("换源到{}: {}", label, keyword))?;
-            self.play_keyword_confirmed_inner(
-                keyword,
-                next_source,
+            let request = ResolvedSongRequest {
+                keyword: keyword.to_string(),
+                source: next_source.to_string(),
                 prefer_accompaniment,
-                false,
-                true,
-            )
+                ai_original_text: String::new(),
+                uri: String::new(),
+                skip_match_check: false,
+                friend_username: String::new(),
+                console_bypass_dedup: false,
+            };
+            let outcome = self.play_request_confirmed(&request, false)?;
+            if outcome == PlaybackOutcome::Success {
+                // 换源成功后仍让用户有一次跳过机会。
+                if let Ok(status) = self.player.status() {
+                    if matches!(
+                        self.confirm_switched_source_result(&status)?,
+                        UserDecision::Skip
+                    ) {
+                        self.player.reject_mismatch_as_no_source(Some(&status))?;
+                        self.report_no_source(Some(&status), false)?;
+                        return Ok(PlaybackOutcome::NoSource);
+                    }
+                }
+            }
+            Ok(outcome)
         }
 
         fn confirm_switched_source_result(
@@ -3952,48 +3550,6 @@ mod app {
                 return Ok(UserDecision::Timeout);
             }
             self.wait_for_decision(false, false, true)
-        }
-
-        fn clear_requested_song_state(&mut self) -> Result<()> {
-            let mut runtime_state = self.runtime_state()?;
-            runtime_state.state_mut().current_song_is_requested = false;
-            runtime_state.state_mut().last_requested_uri.clear();
-            runtime_state.state_mut().last_requested_song.clear();
-            runtime_state.state_mut().last_requested_keyword.clear();
-            runtime_state.state_mut().last_requested_source.clear();
-            runtime_state
-                .state_mut()
-                .last_requested_prefer_accompaniment = false;
-            runtime_state.state_mut().last_requested_updated_at_ms = 0;
-            runtime_state.save()
-        }
-
-        fn set_requested_song_state(
-            &mut self,
-            keyword: &str,
-            source: &str,
-            prefer_accompaniment: bool,
-            requested_uri: &str,
-            status: &PlayerStatus,
-        ) -> Result<()> {
-            let mut runtime_state = self.runtime_state()?;
-            runtime_state.state_mut().current_song_is_requested = true;
-            runtime_state.state_mut().last_requested_uri = if status.current_uri.trim().is_empty() {
-                requested_uri.trim().to_string()
-            } else {
-                status.current_uri.trim().to_string()
-            };
-            runtime_state.state_mut().last_requested_song =
-                format!("{}{}", status.name, status.singer);
-            runtime_state.state_mut().last_requested_keyword = keyword.to_string();
-            runtime_state.state_mut().last_requested_source = source.to_string();
-            runtime_state
-                .state_mut()
-                .last_requested_prefer_accompaniment = prefer_accompaniment;
-            runtime_state.state_mut().last_requested_updated_at_ms = current_unix_millis();
-            runtime_state.state_mut().paused_by_command = false;
-            runtime_state.state_mut().paused_for_pending_playback = false;
-            runtime_state.save()
         }
 
         fn confirm_song(
@@ -4141,7 +3697,8 @@ mod app {
             pause_playback: bool,
         ) -> Result<()> {
             if pause_playback && status.is_some_and(|status| status.status == "playing") {
-                let _ = self.feeluown.pause();
+                let _ = self.player.reject_mismatch_as_no_source(status);
+                self.update_monitor_playback_controller();
             }
             self.reply("平台无对应歌曲音源")
         }
@@ -4172,26 +3729,27 @@ mod app {
                 }
                 let outcome = self.play_request_confirmed(&request, true)?;
                 match outcome {
-                    PlayOutcome::Success => {
+                    PlaybackOutcome::Success => {
                         self.queue()?.shift()?;
                         self.update_monitor_queue_snapshot();
                         if reason != "手动下一首" && !self.config.queue.protect_auto_played_songs
                         {
-                            self.clear_requested_song_state()?;
+                            self.player.clear_active_request()?;
+                            self.update_monitor_playback_controller();
                         }
                         return Ok(());
                     }
-                    PlayOutcome::NoSource => {
+                    PlaybackOutcome::NoSource => {
                         self.queue()?.shift()?;
                         self.update_monitor_queue_snapshot();
                         log::error!("队列项无音源，已丢弃: {}", item.keyword);
                         continue;
                     }
-                    PlayOutcome::Error => {
+                    PlaybackOutcome::Error => {
                         log::error!("队列项播放失败，保留在队首: {}", item.keyword);
                         return Ok(());
                     }
-                    PlayOutcome::DedupLimited => {
+                    PlaybackOutcome::DedupLimited => {
                         self.queue()?.shift()?;
                         self.update_monitor_queue_snapshot();
                         log::info!("队列项近期已播放过，已跳过: {}", item.keyword);
@@ -4250,6 +3808,10 @@ mod app {
                 Err(error) => log::warn!("更新监控队列失败: {error:#}"),
             }
         }
+
+        fn update_monitor_playback_controller(&self) {
+            self.monitor.set_playback_controller(self.player.snapshot());
+        }
     }
 
     fn ai_candidate_source(song: &command::SongCommand) -> &'static str {
@@ -4289,13 +3851,6 @@ mod app {
         let minute = second_of_day % 3600 / 60;
         let second = second_of_day % 60;
         format!("{year:04}-{month:02}-{day:02}-{hour:02}:{minute:02}:{second:02}")
-    }
-
-    fn current_unix_millis() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
-            .unwrap_or(0)
     }
 
     fn civil_from_days(days: i64) -> (i64, u32, u32) {

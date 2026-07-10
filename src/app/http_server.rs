@@ -116,10 +116,10 @@ const ROUTES: &[RouteSpec] = &[
         handler: search_route,
     },
     RouteSpec {
-        path: "/open-scheme",
-        json: false,
+        path: "/player/play-uri",
+        json: true,
         mutating: true,
-        handler: open_scheme_route,
+        handler: player_play_uri_route,
     },
     RouteSpec {
         path: "/queue",
@@ -576,15 +576,18 @@ fn search_route(
     client.search(&keyword, &source).map_err(internal_error)
 }
 
-fn open_scheme_route(
+fn player_play_uri_route(
     query: &[(String, String)],
     state: &HttpSharedState,
 ) -> std::result::Result<String, AppError> {
     let uri = normalize_fuo_uri(query_value_or(query, "url", "uri"))?;
-    let client = FeelUOwnClient::new(&state.config.feeluown, &state.config.timing);
-    client.play_uri(uri.trim()).map_err(internal_error)?;
-    set_pause_flags(state, false, false)?;
-    Ok("已打开 FeelUOwn URI".to_string())
+    let position = enqueue_pending_task(
+        state,
+        super::PendingTask::PlayerPlayUri {
+            uri: uri.trim().to_string(),
+        },
+    )?;
+    Ok(json!({ "ok": true, "queued": true, "position": position, "uri": uri }).to_string())
 }
 
 fn queue_route(
@@ -1009,20 +1012,6 @@ fn state_save(
     Ok(json!({ "ok": true }).to_string())
 }
 
-fn set_pause_flags(
-    state: &HttpSharedState,
-    paused_by_command: bool,
-    paused_for_pending_playback: bool,
-) -> std::result::Result<(), AppError> {
-    let mut runtime = state
-        .runtime_state
-        .lock()
-        .map_err(|_| internal_message("状态锁已损坏"))?;
-    runtime.state_mut().paused_by_command = paused_by_command;
-    runtime.state_mut().paused_for_pending_playback = paused_for_pending_playback;
-    runtime.save().map_err(internal_error)
-}
-
 fn history_json(state: &HttpSharedState) -> std::result::Result<String, AppError> {
     let history = state
         .history
@@ -1165,54 +1154,6 @@ fn apply_runtime_patch(
     state: &mut super::runtime_state::RuntimeState,
     patch: HashMap<String, serde_json::Value>,
 ) {
-    if let Some(value) = patch
-        .get("currentSongIsRequested")
-        .and_then(serde_json::Value::as_bool)
-    {
-        state.current_song_is_requested = value;
-    }
-    if let Some(value) = patch
-        .get("lastRequestedUri")
-        .and_then(serde_json::Value::as_str)
-    {
-        state.last_requested_uri = value.to_string();
-    }
-    if let Some(value) = patch
-        .get("lastRequestedSong")
-        .and_then(serde_json::Value::as_str)
-    {
-        state.last_requested_song = value.to_string();
-    }
-    if let Some(value) = patch
-        .get("lastRequestedKeyword")
-        .and_then(serde_json::Value::as_str)
-    {
-        state.last_requested_keyword = value.to_string();
-    }
-    if let Some(value) = patch
-        .get("lastRequestedSource")
-        .and_then(serde_json::Value::as_str)
-    {
-        state.last_requested_source = value.to_string();
-    }
-    if let Some(value) = patch
-        .get("lastRequestedPreferAccompaniment")
-        .and_then(serde_json::Value::as_bool)
-    {
-        state.last_requested_prefer_accompaniment = value;
-    }
-    if let Some(value) = patch
-        .get("pausedByCommand")
-        .and_then(serde_json::Value::as_bool)
-    {
-        state.paused_by_command = value;
-    }
-    if let Some(value) = patch
-        .get("pausedForPendingPlayback")
-        .and_then(serde_json::Value::as_bool)
-    {
-        state.paused_for_pending_playback = value;
-    }
     if let Some(value) = patch
         .get("hallRemainingMinutes")
         .and_then(serde_json::Value::as_u64)

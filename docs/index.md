@@ -26,6 +26,7 @@
 | --- | --- |
 | [点歌流程](song-request-flow.md) | 普通点歌、AI 点歌、搜索确认、入队和直接播放如何决策。 |
 | [AI 点歌与候选歌曲审核](ai-song-review-flow.md) | 点歌 AI、候选选择、审核 Provider、审核强度和失败策略如何分工。 |
+| [播放器控制器](player-controller-flow.md) | 播放器后端观测、确认播放状态、暂停原因和队列推进如何统一。 |
 | [播放队列与自动出队](playback-queue-flow.md) | 音乐播放队列、当前歌曲保护、临近结束暂停和自动出队如何工作。 |
 
 ## 启动、Web 与观测

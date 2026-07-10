@@ -40,13 +40,6 @@ pub struct SearchCandidate {
     pub uri: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
-pub struct PlaySearchResult {
-    pub message: String,
-    pub raw_search_result: String,
-    pub candidate: Option<SearchCandidate>,
-}
-
 impl FeelUOwnClient {
     pub fn new(config: &FeelUOwnConfig, timing: &TimingConfig) -> Self {
         Self {
@@ -162,31 +155,6 @@ impl FeelUOwnClient {
             Ok(candidates) if !candidates.is_empty() => Ok(candidates),
             Ok(_) | Err(_) => Ok(extract_search_candidates(&self.search(keyword, source)?)),
         }
-    }
-
-    pub fn play_keyword(
-        &self,
-        keyword: &str,
-        source: &str,
-        prefer_accompaniment: bool,
-    ) -> Result<PlaySearchResult> {
-        let picked = self
-            .search_and_pick(keyword, source, prefer_accompaniment)?
-            .ok_or_else(|| anyhow!("平台无对应歌曲音源"))?;
-        self.request(&format!("play {}", shell_quote(&picked.0.uri)))?;
-        Ok(PlaySearchResult {
-            message: format!(
-                "正在搜索: {}{}",
-                keyword,
-                if prefer_accompaniment {
-                    " (伴奏优先)"
-                } else {
-                    ""
-                }
-            ),
-            raw_search_result: picked.1,
-            candidate: Some(picked.0),
-        })
     }
 
     pub fn search_and_pick(

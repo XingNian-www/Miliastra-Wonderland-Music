@@ -48,7 +48,8 @@ pub struct CustomWorkflowCommand {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InviteCommand {
     pub username: String,
-    pub seq: u32,
+    pub seq: Option<u32>,
+    pub password: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -206,20 +207,24 @@ fn parse_pink_text(text: &str) -> Option<ParsedCommand> {
             .chars()
             .take_while(|ch| ch.is_ascii_digit())
             .collect::<String>();
-        let seq = digits.parse::<u32>().ok()?;
-        if !command_boundary(rest[digits.len()..].chars().next()) {
+        if digits.is_empty() {
             return None;
         }
-        if !(1..=1000).contains(&seq) {
+        if !invite_arg_trailing_is_empty(&rest[digits.len()..]) {
             return None;
         }
+        let (seq, password, raw_param) = parse_invite_arg(&digits)?;
         return Some(ParsedCommand {
             matched: "邀请".to_string(),
-            raw: format!("邀请 {} {}", username, seq),
+            raw: format!("邀请 {} {}", username, raw_param),
             user_command,
             message_type: "pink".to_string(),
             username: username.clone(),
-            command: UserCommand::Invite(InviteCommand { username, seq }),
+            command: UserCommand::Invite(InviteCommand {
+                username,
+                seq,
+                password,
+            }),
         });
     }
     if let Some(command) = parse_moderation_command(command_text, &username, &user_command) {
@@ -340,6 +345,28 @@ fn command_boundary(ch: Option<char>) -> bool {
     }
 }
 
+fn invite_arg_trailing_is_empty(value: &str) -> bool {
+    value
+        .trim_start_matches([' ', '\t'])
+        .trim_end_matches([']', '】'])
+        .trim()
+        .is_empty()
+}
+
+fn parse_invite_arg(digits: &str) -> Option<(Option<u32>, Option<String>, String)> {
+    match digits.len() {
+        1..=3 => {
+            let seq = digits.parse::<u32>().ok()?;
+            if seq == 0 {
+                return None;
+            }
+            Some((Some(seq), None, seq.to_string()))
+        }
+        6 => Some((None, Some(digits.to_string()), "6位密码".to_string())),
+        _ => None,
+    }
+}
+
 impl CommandLockState {
     pub fn update(
         &mut self,
@@ -413,7 +440,14 @@ fn same_user_command(left: &UserCommand, right: &UserCommand) -> bool {
                 && left.prefer_accompaniment == right.prefer_accompaniment
                 && same_lock_keyword(&left.keyword, &right.keyword)
         }
-        (UserCommand::Invite(left), UserCommand::Invite(right)) => left.seq == right.seq,
+        (UserCommand::Invite(left), UserCommand::Invite(right)) => match (left.seq, right.seq) {
+            (Some(left_seq), Some(right_seq)) => left_seq == right_seq,
+            (None, None) => {
+                identity_text(&left.username) == identity_text(&right.username)
+                    && left.password == right.password
+            }
+            _ => false,
+        },
         (UserCommand::Moderation(left), UserCommand::Moderation(right)) => {
             left.action == right.action && left.uid == right.uid
         }
@@ -465,7 +499,17 @@ fn command_lock_key(command: &UserCommand) -> String {
         UserCommand::HallDetect => "hall_detect".to_string(),
         UserCommand::HallTime => "hall_time".to_string(),
         UserCommand::Help => "help".to_string(),
-        UserCommand::Invite(invite) => format!("invite:{}", invite.seq),
+        UserCommand::Invite(invite) => {
+            if let Some(seq) = invite.seq {
+                format!("invite:{}", seq)
+            } else {
+                format!(
+                    "invite_password:{}:{}",
+                    identity_text(&invite.username),
+                    invite.password.as_deref().unwrap_or_default()
+                )
+            }
+        }
         UserCommand::Moderation(command) => {
             format!("moderation:{}:{}", command.action.label(), command.uid)
         }
@@ -863,6 +907,41 @@ mod tests {
     #[test]
     fn rejects_disable_with_param() {
         assert!(parse_text("[Alice]：@禁用命令", "pink").is_none());
+    }
+
+    #[test]
+    fn parses_invite_command_without_password() {
+        let parsed = parse_text("[Alice]：@邀请2", "pink").expect("parse invite");
+        assert_eq!(
+            parsed.command,
+            UserCommand::Invite(InviteCommand {
+                username: "Alice".to_string(),
+                seq: Some(2),
+                password: None,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_invite_command_with_password_as_only_argument() {
+        let parsed = parse_text("[Alice]：@邀请123456", "pink").expect("parse invite password");
+        assert_eq!(
+            parsed.command,
+            UserCommand::Invite(InviteCommand {
+                username: "Alice".to_string(),
+                seq: None,
+                password: Some("123456".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_invite_command_with_invalid_password() {
+        assert!(parse_text("[Alice]：@邀请2 12345", "pink").is_none());
+        assert!(parse_text("[Alice]：@邀请2 123456", "pink").is_none());
+        assert!(parse_text("[Alice]：@邀请2 1234567", "pink").is_none());
+        assert!(parse_text("[Alice]：@邀请2 abcdef", "pink").is_none());
+        assert!(parse_text("[Alice]：@邀请1000", "pink").is_none());
     }
 
     #[test]

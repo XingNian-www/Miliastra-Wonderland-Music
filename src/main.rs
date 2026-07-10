@@ -713,9 +713,6 @@ mod app {
         ConsoleChat {
             text: String,
         },
-        PlayerPlayUri {
-            uri: String,
-        },
         StartGame {
             source: &'static str,
         },
@@ -738,7 +735,6 @@ mod app {
                 Self::Command(pending) => pending.parsed.raw.clone(),
                 Self::AdvanceQueue { reason } => format!("自动出队({})", reason),
                 Self::ConsoleChat { text } => format!("控制台发言: {}", text),
-                Self::PlayerPlayUri { uri } => format!("播放URI: {}", uri),
                 Self::StartGame { source } => format!("启动游戏({})", source),
                 Self::EnterWonderland { source } => format!("进入千星({})", source),
                 Self::ModerationVoteResult {
@@ -757,7 +753,6 @@ mod app {
                 Self::Command(pending) => command::same_lock_command(&pending.parsed, parsed),
                 Self::AdvanceQueue { .. } => false,
                 Self::ConsoleChat { .. } => false,
-                Self::PlayerPlayUri { .. } => false,
                 Self::StartGame { .. } => false,
                 Self::EnterWonderland { .. } => false,
                 Self::ModerationVoteResult { command, .. } => {
@@ -772,7 +767,7 @@ mod app {
 
         fn is_playback_task(&self) -> bool {
             match self {
-                Self::AdvanceQueue { .. } | Self::PlayerPlayUri { .. } => true,
+                Self::AdvanceQueue { .. } => true,
                 Self::Command(pending) => matches!(
                     &pending.parsed.command,
                     UserCommand::Song(_)
@@ -1657,7 +1652,6 @@ mod app {
                 }
                 PendingTask::AdvanceQueue { reason } => self.execute_advance_queue_task(reason),
                 PendingTask::ConsoleChat { text } => self.execute_console_chat_task(text),
-                PendingTask::PlayerPlayUri { uri } => self.execute_player_play_uri_task(uri),
                 PendingTask::StartGame { source } => self.execute_start_game_task(source),
                 PendingTask::EnterWonderland { source } => {
                     self.execute_enter_wonderland_task(source)
@@ -1726,13 +1720,6 @@ mod app {
                 },
             }
             self.reply(&message)
-        }
-
-        fn execute_player_play_uri_task(&mut self, uri: String) -> Result<()> {
-            log::info!("执行播放器 URI 播放任务: {}", uri);
-            self.player.play_uri(&uri)?;
-            self.update_monitor_playback_controller();
-            Ok(())
         }
 
         fn execute_start_game_task(&mut self, source: &'static str) -> Result<()> {
@@ -3732,11 +3719,6 @@ mod app {
                     PlaybackOutcome::Success => {
                         self.queue()?.shift()?;
                         self.update_monitor_queue_snapshot();
-                        if reason != "手动下一首" && !self.config.queue.protect_auto_played_songs
-                        {
-                            self.player.clear_active_request()?;
-                            self.update_monitor_playback_controller();
-                        }
                         return Ok(());
                     }
                     PlaybackOutcome::NoSource => {

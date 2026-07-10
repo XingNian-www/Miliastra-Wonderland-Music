@@ -482,7 +482,7 @@ http://127.0.0.1:18888
 | `/searchPlay?keyword=...&source=qqmusic` | 远程点歌入主业务队列 |
 | `/searchSource?keyword=...&source=netease` | 指定源远程点歌入主业务队列 |
 | `/search?keyword=...&source=qqmusic` | 搜索歌曲 |
-| `/player/play-uri?uri=fuo://...` | 播放 FeelUOwn URI 任务入队 |
+| `/player/play-uri?uri=fuo://...` | FeelUOwn URI 作为控制台高权限项加入音乐播放队列 |
 | `/queue` | 查看队列 |
 | `/queue/add?keyword=...` | 控制台最高权限直接加入队列，不经过候选歌曲审核 |
 | `/queue/remove?index=0` | 删除队列项，索引从 0 开始 |
@@ -557,8 +557,8 @@ screen:
 queue:
   max_size: 5
   auto_advance_seconds: 1
-  protect_auto_played_songs: true
   protect_current_song_until_finished: true
+  ignore_external_playback: true
 
 song_dedup:
   enabled: true
@@ -577,7 +577,7 @@ hotkeys:
   exit_key: F12
 ```
 
-`protect_current_song_until_finished` 只限制新点歌打断当前歌曲；队列自动出队仍由 `auto_advance_seconds` 控制，`@下一首` 仍会立即消费队列
+`protect_current_song_until_finished` 只限制新点歌打断当前歌曲；队列自动出队仍由 `auto_advance_seconds` 控制，`@下一首` 仍会立即消费队列。`ignore_external_playback` 默认开启，表示外部播放不保护当前歌曲，音乐播放队列可以直接接管；未知状态只观察，不自动出队。
 
 游戏内回复会限制显示宽度为 80，约等于 40 个全角中文字符或 80 个半角字符
 

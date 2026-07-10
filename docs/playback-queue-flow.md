@@ -43,7 +43,7 @@ flowchart TD
 
 ### 待执行任务队列
 
-`PendingTask` 存在于内存里的 `VecDeque`，用于串行执行会影响游戏窗口或业务状态的高层任务。自动出队在这里表现为 `PendingTask::AdvanceQueue`，远程播放 URI 表现为 `PendingTask::PlayerPlayUri`。
+`PendingTask` 存在于内存里的 `VecDeque`，用于串行执行会影响游戏窗口或业务状态的高层任务。自动出队在这里表现为 `PendingTask::AdvanceQueue`。远程播放 URI 不再进入待执行任务队列，而是作为控制台高权限项直接写入音乐播放队列。
 
 它不是音乐播放队列。
 
@@ -65,7 +65,7 @@ flowchart TD
 
 `RuntimeState.playback` 是播放器控制器的持久状态：
 
-- `state`：确认播放状态，例如 `idle`、`starting`、`playing_requested`、`paused_by_user`、`paused_waiting_for_queue`、`external_playback`、`unknown`。
+- `state`：确认播放状态，例如 `idle`、`starting`、`requested_song_playing`、`paused_by_user`、`paused_waiting_for_queue`、`external_playback`、`unknown`。
 - `pauseReason`：暂停原因，区分 `user` 和 `waiting_for_queue`。
 - `activeRequest`：本项目已经确认的活动播放请求，保存关键词、来源、请求 URI、确认 URI、歌名歌手和开始时间。
 - `lastObservation`：最近一次播放器观测，保存原始状态、URI、歌名歌手、进度、时长、观测时间和可靠性。
@@ -110,7 +110,7 @@ flowchart TD
 1. `play_request_uri()`：写入 `starting` 状态，记录活动请求草稿，并向播放器后端发送播放 URI。
 2. `verify_playback_started()`：按配置重试读取播放器观测，直到确认播放成功、确认无音源，或发现候选不匹配。
 
-如果播放 URI 下发失败，或 URI 已下发但后续确认超时、短时长无音源，控制器会恢复下发前的确认播放状态。失败不会把仍在播放的旧活动请求清掉；只有后端接受播放命令并最终确认成功，才提交新的 `playing_requested` 状态。
+如果播放 URI 下发失败，说明播放器没有接受本次播放命令，控制器恢复下发前的确认播放状态。如果播放器已经接受播放命令，但后续确认超时、短时长无音源、候选不匹配或用户跳过，现实播放器状态已经可能被改变，控制器会标记为 `unknown` 并等待后续观测。只有后端接受播放命令并最终确认成功，才提交新的 `requested_song_playing` 状态。
 
 确认规则：
 
@@ -121,7 +121,7 @@ flowchart TD
 - 进度和时长不能是无效的 `0:00/0:00`。
 - 时长过短会视为无音源。
 
-确认成功后，控制器写入 `RuntimeState.playback.activeRequest`，状态变为 `playing_requested`，并写入长时间同歌去重历史。只有这个时刻才算实际播放成功。
+确认成功后，控制器写入 `RuntimeState.playback.activeRequest`，状态变为 `requested_song_playing`，并写入长时间同歌去重历史。只有这个时刻才算实际播放成功。
 
 ## 播放监控线程
 
@@ -141,6 +141,8 @@ flowchart TD
 5. 如果系统曾为了等待队列暂停，但现在队列和待执行播放都空了，恢复播放。
 6. 如果播放器停止且队列非空、没有其他命令执行，提交 `AdvanceQueue`。
 7. 如果播放器暂停且队列非空、没有其他命令执行，提交 `AdvanceQueue`。
+
+`queue.ignore_external_playback` 默认开启。开启时，外部播放只表示“当前不是本项目确认的点歌”，不再保护当前歌曲；只要音乐播放队列非空且没有其他播放任务执行，监控线程可以提交自动出队。`unknown` 表示控制器无法确认播放器现实状态，只允许继续观测，不自动推进队列。
 8. 如果播放器正在播放且接近结束，并且存在队列或待执行播放任务，先暂停等待队列接管。
 
 控制器只返回决策。真正入队 `PendingTask::AdvanceQueue`、更新监控快照和后续消费队列仍由 `main.rs` 执行。
@@ -175,7 +177,7 @@ flowchart TD
 - 无音源：移除队首，继续尝试下一项。
 - 播放错误：保留队首，等待后续重试或人工处理。
 
-如果自动出队成功，且 `queue.protect_auto_played_songs = false`，控制器会清理活动播放请求，让后续新点歌更容易直接替换。手动下一首不走这个清理分支。
+如果自动出队成功，控制器保持新的活动播放请求，状态仍表达“本项目确认播放中”。是否允许后续点歌打断当前歌曲，由 `queue.protect_current_song_until_finished` 决定。
 
 ## 手动播放控制
 
@@ -189,7 +191,7 @@ flowchart TD
 
 - 调用 `PlayerController::resume_by_user()`。
 - 播放器后端恢复。
-- 清除暂停原因；如果仍有活动请求，状态回到 `playing_requested`，否则标记为 `external_playback`。
+- 清除暂停原因；如果仍有活动请求，状态回到 `requested_song_playing`，否则标记为 `external_playback`。
 
 `@下一首` / 远程下一首：
 
@@ -221,7 +223,7 @@ flowchart TD
 - `AI自动匹配通过`
 - `0:00/0:00，等待后重试`
 - `歌曲时长过短`
-- `播放器状态转移: Starting -> PlayingRequested reason=playback_confirmed`
+- `播放器状态转移: Starting -> RequestedSongPlaying reason=playback_confirmed`
 - `播放成功`
 
 排查当前歌保护时重点看：
@@ -229,4 +231,4 @@ flowchart TD
 - `点歌状态与播放监控快照不一致，已刷新播放状态`
 - `点歌刚开始，忽略可能过期的播放状态`
 - `点歌刚开始，暂不触发队列自动出队`
-- `播放器状态转移: PlayingRequested -> ExternalPlayback reason=track_changed`
+- `播放器状态转移: RequestedSongPlaying -> ExternalPlayback reason=track_changed`

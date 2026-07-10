@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow};
 use serde_yaml::{Mapping, Value};
 
-pub const CURRENT_CONFIG_VERSION: u32 = 18;
+pub const CURRENT_CONFIG_VERSION: u32 = 19;
 
 struct ChangedDefaultField {
     path: &'static str,
@@ -771,7 +771,7 @@ mod tests {
 
     const DEFAULT: &str = r#"# 测试配置
 # 版本注释
-config_version: 18
+config_version: 19
 
 timing:
   watchdog_restart_ms: 2000
@@ -829,8 +829,8 @@ timing:
 
 queue:
   auto_advance_seconds: 1
-  protect_auto_played_songs: true
   protect_current_song_until_finished: true
+  ignore_external_playback: true
 
 song_review:
   enabled: false
@@ -935,7 +935,7 @@ unknown_root:
             .expect("migration needed");
 
         assert!(report.text.contains("# 兜底扫描注释"));
-        assert!(report.text.contains("config_version: 18"));
+        assert!(report.text.contains("config_version: 19"));
         assert!(report.text.contains("template_threshold: 0.9"));
         assert!(report.text.contains("enter_game_timeout_ms: 60000"));
         assert!(report.text.contains("enter_game_text_region:"));
@@ -1135,7 +1135,7 @@ templates:
 
     #[test]
     fn current_version_without_moved_fields_does_not_migrate() {
-        let current = r#"config_version: 18
+        let current = r#"config_version: 19
 timing:
   loop_idle_ms: 60
   chat_scan:
@@ -1146,8 +1146,8 @@ timing:
     focus_ms: 300
 queue:
   auto_advance_seconds: 1
-  protect_auto_played_songs: true
   protect_current_song_until_finished: true
+  ignore_external_playback: true
 tui:
   enabled: true
 ocr:
@@ -1173,12 +1173,13 @@ queue:
             .expect("migration succeeds")
             .expect("migration needed");
 
-        assert!(report.text.contains("config_version: 18"));
+        assert!(report.text.contains("config_version: 19"));
         assert!(
             report
                 .text
                 .contains("protect_current_song_until_finished: true")
         );
+        assert!(report.text.contains("ignore_external_playback: true"));
     }
 
     #[test]
@@ -1226,7 +1227,7 @@ custom_workflows:
             .expect("migration succeeds")
             .expect("migration needed");
 
-        assert!(report.text.contains("config_version: 18"));
+        assert!(report.text.contains("config_version: 19"));
         assert!(report.text.contains("allow_args: false"));
         assert!(report.text.contains("message_types:"));
         assert!(report.text.contains("confirm_before_run: false"));
@@ -1302,7 +1303,7 @@ queue:
             .expect("migration succeeds")
             .expect("migration needed");
 
-        assert!(report.text.contains("config_version: 18"));
+        assert!(report.text.contains("config_version: 19"));
         assert!(report.text.contains("auto_advance_seconds: 1"));
     }
 
@@ -1317,9 +1318,9 @@ tui:
             .expect("migration succeeds")
             .expect("migration needed");
 
-        assert!(report.text.contains("config_version: 18"));
+        assert!(report.text.contains("config_version: 19"));
         assert!(report.text.contains("enabled: true"));
-        assert!(report.text.contains("protect_auto_played_songs: true"));
+        assert!(report.text.contains("ignore_external_playback: true"));
     }
 
     #[test]

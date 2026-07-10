@@ -6,7 +6,7 @@
 
 Web 面板不是远程鼠标键盘面板。它只提交高层意图、查看监控快照、读取或修改少量持久状态。大多数会影响游戏窗口的操作都会进入待执行任务队列，由命令执行线程串行处理。
 
-少数接口是例外：`/queue/add` 直接写音乐播放队列，`/state/save` 只允许 patch 大厅倒计时等非播放器字段。`/player/play-uri` 不再直连 FeelUOwn，而是进入待执行任务队列，由播放器控制器统一处理。
+少数接口是例外：`/queue/add` 和 `/player/play-uri` 直接写音乐播放队列，`/state/save` 只允许 patch 大厅倒计时等非播放器字段。`/player/play-uri` 不再直连 FeelUOwn，也不再把播放器标记为外部播放。
 
 ```mermaid
 flowchart TD
@@ -14,7 +14,7 @@ flowchart TD
     B --> C{"接口类型"}
     C -->|只读| D["FeelUOwn / 队列 / 运行状态 / 监控快照"]
     C -->|远程命令| E["ParsedCommand message_type=控制台"]
-    C -->|直接任务| F["PendingTask::ConsoleChat / PlayerPlayUri / StartGame / EnterWonderland"]
+    C -->|直接任务| F["PendingTask::ConsoleChat / StartGame / EnterWonderland"]
     C -->|直接队列/状态| G["PersistentQueue / RuntimeState"]
     E --> H["待执行任务队列"]
     F --> H
@@ -111,7 +111,6 @@ HTTP 层只接受 `GET`、`POST`、`OPTIONS`。
 | 接口 | 入队任务 |
 | --- | --- |
 | `/chat/send` | `PendingTask::ConsoleChat`，执行时发送 `[控制台]: 文本`。 |
-| `/player/play-uri` | `PendingTask::PlayerPlayUri`，执行时交给播放器控制器播放 URI；后端接受播放命令后才标记为外部播放。 |
 | `/startup/game` | `PendingTask::StartGame`。 |
 | `/startup/enter-wonderland` | `PendingTask::EnterWonderland`。 |
 | `/startup/wonderland` | 依次入队 `StartGame` 和 `EnterWonderland`。 |
@@ -125,11 +124,12 @@ HTTP 层只接受 `GET`、`POST`、`OPTIONS`。
 | 接口 | 行为 |
 | --- | --- |
 | `/queue/add` | 直接写音乐播放队列，并同步监控队列快照。 |
+| `/player/play-uri` | 把 `fuo://` URI 作为控制台高权限队列项写入音乐播放队列，并同步监控队列快照。 |
 | `/queue/remove` | 直接删除音乐播放队列项，并同步监控队列快照。 |
 | `/queue/clear` | 直接清空音乐播放队列，并同步监控队列快照。 |
 | `/state/save` | 对运行状态里的大厅倒计时缓存做有限字段 patch 并保存。 |
 
-`/queue/add` 是控制台最高权限入口，不做候选歌曲审核。它适合人工明确知道要塞什么队列项的场景。
+`/queue/add` 和 `/player/play-uri` 是控制台最高权限入口，不做候选歌曲审核。它们适合人工明确知道要塞什么队列项的场景。
 
 播放器状态、暂停原因、活动播放请求和最近播放观测由播放器控制器维护，不能通过 `/state/save` 直接改写。
 
@@ -253,9 +253,9 @@ HTTP 服务会检查 `Host`、`Origin` 和 `Sec-Fetch-Site`：
 ## 关键边界
 
 - Web 面板提交的是高层意图，不暴露底层点击、按键或粘贴。
-- 远程播放控制和远程点歌默认走待执行任务队列。
+- 远程播放控制和远程点歌默认走待执行任务队列；`/player/play-uri` 直接进入音乐播放队列。
 - 控制台来源免候选歌曲审核，但不免队列和播放保护。
 - `/queue/add` 和 `/state/save` 是直接修改接口，需要谨慎使用。
-- `/player/play-uri` 是播放 URI 的高层任务入口，会进入待执行任务队列并交给播放器控制器处理；播放失败时保留原播放器确认状态。
+- `/player/play-uri` 是播放 URI 的队列入口，不会直接改变播放器状态；真正播放时仍由音乐播放队列和播放器控制器处理。
 - `/monitor` 是内存快照，不是持久化状态文件。
 - `/screenshot` 是按需截图，不是实时视频流。

@@ -332,8 +332,8 @@ pub struct StateConfig {
 pub struct QueueConfig {
     pub max_size: usize,
     pub auto_advance_seconds: u64,
-    pub protect_auto_played_songs: bool,
     pub protect_current_song_until_finished: bool,
+    pub ignore_external_playback: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

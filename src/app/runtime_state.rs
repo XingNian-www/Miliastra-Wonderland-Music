@@ -41,7 +41,7 @@ impl Default for PlaybackRuntimeState {
 pub enum ConfirmedPlaybackState {
     Idle,
     Starting,
-    PlayingRequested,
+    RequestedSongPlaying,
     PausedByUser,
     PausedWaitingForQueue,
     ExternalPlayback,
@@ -219,7 +219,7 @@ impl PlaybackRuntimeState {
     pub fn set_user_resumed(&mut self) {
         self.pause_reason = PauseReason::None;
         self.state = if self.active_request.is_some() {
-            ConfirmedPlaybackState::PlayingRequested
+            ConfirmedPlaybackState::RequestedSongPlaying
         } else {
             ConfirmedPlaybackState::ExternalPlayback
         };

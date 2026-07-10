@@ -200,12 +200,6 @@ impl<B: MusicPlayerBackend> PlayerController<B> {
         Ok(status)
     }
 
-    pub(super) fn play_uri(&self, uri: &str) -> Result<String> {
-        let message = self.backend.play_uri(uri)?;
-        self.mark_external_playback()?;
-        Ok(message)
-    }
-
     pub(super) fn pause_by_user(&self) -> Result<String> {
         let message = self.backend.pause()?;
         self.with_playback_state(|state| {
@@ -273,6 +267,20 @@ impl<B: MusicPlayerBackend> PlayerController<B> {
         if !self.queue.protect_current_song_until_finished {
             return Ok(false);
         }
+        let runtime = self
+            .runtime_state
+            .lock()
+            .map_err(|_| anyhow!("运行状态锁已损坏"))?;
+        let playback = &runtime.state().playback;
+        if playback.state == ConfirmedPlaybackState::Unknown {
+            return Ok(false);
+        }
+        if self.queue.ignore_external_playback
+            && playback.active_request.is_none()
+            && playback.state == ConfirmedPlaybackState::ExternalPlayback
+        {
+            return Ok(false);
+        }
         if status.status == "playing" {
             return Ok(true);
         }
@@ -285,11 +293,6 @@ impl<B: MusicPlayerBackend> PlayerController<B> {
             return Ok(true);
         }
 
-        let runtime = self
-            .runtime_state
-            .lock()
-            .map_err(|_| anyhow!("运行状态锁已损坏"))?;
-        let playback = &runtime.state().playback;
         if playback.active_request.is_none() {
             return Ok(false);
         }
@@ -507,7 +510,7 @@ impl<B: MusicPlayerBackend> PlayerController<B> {
         if status.is_some_and(|status| status.status == "playing") {
             let _ = self.backend.pause();
         }
-        self.clear_active_request()
+        self.mark_unknown()
     }
 
     pub(super) fn maybe_advance_queue(
@@ -523,6 +526,9 @@ impl<B: MusicPlayerBackend> PlayerController<B> {
             .state()
             .playback
             .clone();
+        if runtime_snapshot.state == ConfirmedPlaybackState::Unknown {
+            return Ok(QueueAdvanceDecision::None);
+        }
         let guard_active =
             active_request_guard_active(&self.timing, runtime_snapshot.active_request.as_ref());
 
@@ -571,9 +577,24 @@ impl<B: MusicPlayerBackend> PlayerController<B> {
             )
         {
             self.clear_active_request()?;
-            log::info!("播放器状态转移: PlayingRequested -> ExternalPlayback reason=track_changed");
+            log::info!(
+                "播放器状态转移: RequestedSongPlaying -> ExternalPlayback reason=track_changed"
+            );
             self.mark_external_playback()?;
             return Ok(QueueAdvanceDecision::PlaybackStateChanged);
+        }
+
+        if self.queue.ignore_external_playback
+            && runtime_snapshot.state == ConfirmedPlaybackState::ExternalPlayback
+            && runtime_snapshot.active_request.is_none()
+            && !context.command_executing
+            && !context.has_pending_playback_task
+            && !context.queue_empty
+        {
+            log::info!("队列推进决策: advance reason=external_ignored");
+            return Ok(QueueAdvanceDecision::AdvanceQueue {
+                reason: "外部播放"
+            });
         }
 
         if runtime_snapshot.active_request.is_some() && guard_active {
@@ -601,7 +622,7 @@ impl<B: MusicPlayerBackend> PlayerController<B> {
             let had_active_request = runtime_snapshot.active_request.is_some();
             if had_active_request {
                 self.clear_active_request()?;
-                log::info!("播放器状态转移: PlayingRequested -> Idle reason=stopped");
+                log::info!("播放器状态转移: RequestedSongPlaying -> Idle reason=stopped");
             }
             if context.command_executing || context.has_pending_playback_task || context.queue_empty
             {
@@ -670,7 +691,7 @@ impl<B: MusicPlayerBackend> PlayerController<B> {
             self.with_playback_state(|state| {
                 state.playback.pause_reason = PauseReason::None;
                 if state.playback.active_request.is_some() {
-                    state.playback.state = ConfirmedPlaybackState::PlayingRequested;
+                    state.playback.state = ConfirmedPlaybackState::RequestedSongPlaying;
                 }
             })?;
         }
@@ -774,7 +795,7 @@ impl<B: MusicPlayerBackend> PlayerController<B> {
         self.with_playback_state(|state| {
             state.playback.pause_reason = PauseReason::None;
             if state.playback.active_request.is_some() {
-                state.playback.state = ConfirmedPlaybackState::PlayingRequested;
+                state.playback.state = ConfirmedPlaybackState::RequestedSongPlaying;
             } else {
                 state.playback.state = ConfirmedPlaybackState::ExternalPlayback;
             }
@@ -804,12 +825,12 @@ impl<B: MusicPlayerBackend> PlayerController<B> {
             started_at_ms: current_unix_millis(),
         };
         self.with_playback_state(|state| {
-            state.playback.state = ConfirmedPlaybackState::PlayingRequested;
+            state.playback.state = ConfirmedPlaybackState::RequestedSongPlaying;
             state.playback.pause_reason = PauseReason::None;
             state.playback.active_request = Some(active_request);
         })?;
         self.record_song_dedup_playback(request, &confirmed_uri, status)?;
-        log::info!("播放器状态转移: Starting -> PlayingRequested reason=playback_confirmed");
+        log::info!("播放器状态转移: Starting -> RequestedSongPlaying reason=playback_confirmed");
         Ok(())
     }
 
@@ -876,6 +897,8 @@ impl<B: MusicPlayerBackend> PlayerController<B> {
     fn mark_unknown(&self) -> Result<()> {
         self.with_playback_state(|state| {
             state.playback.state = ConfirmedPlaybackState::Unknown;
+            state.playback.pause_reason = PauseReason::None;
+            state.playback.active_request = None;
         })
     }
 
@@ -909,8 +932,13 @@ impl<B: MusicPlayerBackend> PlayerController<B> {
     }
 
     fn restore_failed_attempt(&self, attempt: &PlaybackAttempt, reason: &str) -> Result<()> {
-        self.restore_playback_state(attempt.previous_playback.clone())?;
-        log::info!("播放器状态转移: Starting -> previous reason={}", reason);
+        if reason == "dispatch_failed" {
+            self.restore_playback_state(attempt.previous_playback.clone())?;
+            log::info!("播放器状态转移: Starting -> previous reason={}", reason);
+        } else {
+            self.mark_unknown()?;
+            log::info!("播放器状态转移: Starting -> Unknown reason={}", reason);
+        }
         Ok(())
     }
 }
@@ -1049,7 +1077,7 @@ fn format_state(state: ConfirmedPlaybackState) -> String {
     match state {
         ConfirmedPlaybackState::Idle => "idle",
         ConfirmedPlaybackState::Starting => "starting",
-        ConfirmedPlaybackState::PlayingRequested => "playing_requested",
+        ConfirmedPlaybackState::RequestedSongPlaying => "requested_song_playing",
         ConfirmedPlaybackState::PausedByUser => "paused_by_user",
         ConfirmedPlaybackState::PausedWaitingForQueue => "paused_waiting_for_queue",
         ConfirmedPlaybackState::ExternalPlayback => "external_playback",
@@ -1216,8 +1244,8 @@ mod tests {
             &QueueConfig {
                 max_size: 10,
                 auto_advance_seconds: 2,
-                protect_auto_played_songs: false,
                 protect_current_song_until_finished: true,
+                ignore_external_playback: true,
             },
             &MatchConfig::default(),
             &SongDedupConfig {
@@ -1267,7 +1295,7 @@ mod tests {
             .unwrap();
 
         assert!(matches!(result, PlaybackVerification::Success { .. }));
-        assert_eq!(controller.snapshot().state, "playing_requested");
+        assert_eq!(controller.snapshot().state, "requested_song_playing");
     }
 
     #[test]
@@ -1341,38 +1369,65 @@ mod tests {
     }
 
     #[test]
-    fn direct_play_uri_failure_preserves_existing_request_state() {
-        let controller = controller(FakeBackend::new(vec![]).with_play_error());
-        let old_request = playback_request("旧歌 - 歌手", "fuo://qqmusic/songs/old");
-        let old_status = status("旧歌", "fuo://qqmusic/songs/old", 30.0, 180.0);
-        controller
-            .accept_mismatch(&old_request, &old_status)
+    fn ignored_external_playback_does_not_protect_current_song() {
+        let controller = controller(FakeBackend::new(vec![]));
+        controller.mark_external_playback().unwrap();
+
+        let should_queue = controller
+            .should_queue_until_current_song_finished(&status(
+                "外部歌",
+                "fuo://qqmusic/songs/external",
+                30.0,
+                180.0,
+            ))
             .unwrap();
 
-        let result = controller.play_uri("fuo://qqmusic/songs/external");
-
-        assert!(result.is_err());
-        let snapshot = controller.snapshot();
-        assert_eq!(snapshot.state, "playing_requested");
-        assert_eq!(snapshot.active_keyword, "旧歌 - 歌手");
-        assert_eq!(snapshot.active_uri, "fuo://qqmusic/songs/old");
+        assert!(!should_queue);
     }
 
     #[test]
-    fn direct_play_uri_success_marks_external_playback() {
+    fn ignored_external_playback_allows_queue_takeover() {
         let controller = controller(FakeBackend::new(vec![]));
-        let old_request = playback_request("旧歌 - 歌手", "fuo://qqmusic/songs/old");
-        let old_status = status("旧歌", "fuo://qqmusic/songs/old", 30.0, 180.0);
-        controller
-            .accept_mismatch(&old_request, &old_status)
+        controller.mark_external_playback().unwrap();
+
+        let decision = controller
+            .maybe_advance_queue(
+                status("外部歌", "fuo://qqmusic/songs/external", 30.0, 180.0),
+                QueueAdvanceContext {
+                    queue_empty: false,
+                    has_pending_playback_task: false,
+                    command_executing: false,
+                    song_command_executing: false,
+                },
+            )
             .unwrap();
 
-        controller.play_uri("fuo://qqmusic/songs/external").unwrap();
+        assert_eq!(
+            decision,
+            QueueAdvanceDecision::AdvanceQueue {
+                reason: "外部播放"
+            }
+        );
+    }
 
-        let snapshot = controller.snapshot();
-        assert_eq!(snapshot.state, "external_playback");
-        assert!(snapshot.active_keyword.is_empty());
-        assert!(snapshot.active_uri.is_empty());
+    #[test]
+    fn unknown_state_does_not_auto_advance_queue() {
+        let controller = controller(FakeBackend::new(vec![]));
+        controller.mark_unknown().unwrap();
+
+        let decision = controller
+            .maybe_advance_queue(
+                status("未知歌", "fuo://qqmusic/songs/unknown", 179.0, 180.0),
+                QueueAdvanceContext {
+                    queue_empty: false,
+                    has_pending_playback_task: false,
+                    command_executing: false,
+                    song_command_executing: false,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(decision, QueueAdvanceDecision::None);
     }
 
     #[test]
@@ -1388,13 +1443,13 @@ mod tests {
 
         assert!(result.is_err());
         let snapshot = controller.snapshot();
-        assert_eq!(snapshot.state, "playing_requested");
+        assert_eq!(snapshot.state, "requested_song_playing");
         assert_eq!(snapshot.active_keyword, "旧歌 - 歌手");
         assert_eq!(snapshot.active_uri, "fuo://qqmusic/songs/old");
     }
 
     #[test]
-    fn verification_no_source_restores_previous_request_state() {
+    fn verification_no_source_marks_state_unknown_after_dispatch() {
         let backend = FakeBackend::new(vec![
             status("旧歌", "fuo://qqmusic/songs/old", 30.0, 180.0),
             status("短歌", "fuo://qqmusic/songs/1", 1.0, 10.0),
@@ -1414,13 +1469,13 @@ mod tests {
 
         assert!(matches!(result, PlaybackVerification::NoSource));
         let snapshot = controller.snapshot();
-        assert_eq!(snapshot.state, "playing_requested");
-        assert_eq!(snapshot.active_keyword, "旧歌 - 歌手");
-        assert_eq!(snapshot.active_uri, "fuo://qqmusic/songs/old");
+        assert_eq!(snapshot.state, "unknown");
+        assert!(snapshot.active_keyword.is_empty());
+        assert!(snapshot.active_uri.is_empty());
     }
 
     #[test]
-    fn verification_timeout_restores_previous_request_state() {
+    fn verification_timeout_marks_state_unknown_after_dispatch() {
         let backend =
             FakeBackend::new(vec![status("旧歌", "fuo://qqmusic/songs/old", 30.0, 180.0)]);
         let controller = controller(backend);
@@ -1438,9 +1493,32 @@ mod tests {
 
         assert!(matches!(result, PlaybackVerification::NoSource));
         let snapshot = controller.snapshot();
-        assert_eq!(snapshot.state, "playing_requested");
-        assert_eq!(snapshot.active_keyword, "旧歌 - 歌手");
-        assert_eq!(snapshot.active_uri, "fuo://qqmusic/songs/old");
+        assert_eq!(snapshot.state, "unknown");
+        assert!(snapshot.active_keyword.is_empty());
+        assert!(snapshot.active_uri.is_empty());
+    }
+
+    #[test]
+    fn rejected_mismatch_marks_state_unknown_after_dispatch() {
+        let backend = FakeBackend::new(vec![]);
+        let controller = controller(backend.clone());
+        let request = request();
+        let _attempt = controller.play_request_uri(&request).unwrap();
+
+        controller
+            .reject_mismatch_as_no_source(Some(&status(
+                "不匹配",
+                "fuo://qqmusic/songs/other",
+                1.0,
+                180.0,
+            )))
+            .unwrap();
+
+        let snapshot = controller.snapshot();
+        assert_eq!(snapshot.state, "unknown");
+        assert!(snapshot.active_keyword.is_empty());
+        assert!(snapshot.active_uri.is_empty());
+        assert_eq!(*backend.paused.lock().unwrap(), 1);
     }
 
     #[test]

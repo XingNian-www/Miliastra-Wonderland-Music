@@ -581,13 +581,50 @@ fn player_play_uri_route(
     state: &HttpSharedState,
 ) -> std::result::Result<String, AppError> {
     let uri = normalize_fuo_uri(query_value_or(query, "url", "uri"))?;
-    let position = enqueue_pending_task(
-        state,
-        super::PendingTask::PlayerPlayUri {
-            uri: uri.trim().to_string(),
-        },
+    let keyword = normalize_optional_text(
+        query_value_or(query, "keyword", "title")
+            .or_else(|| query_value(query, "text"))
+            .or_else(|| query_value(query, "name")),
+        "keyword",
     )?;
-    Ok(json!({ "ok": true, "queued": true, "position": position, "uri": uri }).to_string())
+    let keyword = if keyword.is_empty() {
+        uri.clone()
+    } else {
+        keyword
+    };
+    let source =
+        normalize_source(query_value(query, "source").or_else(|| source_from_fuo_uri(&uri)))?;
+    let prefer_accompaniment = parse_bool(query_value_or(
+        query,
+        "preferAccompaniment",
+        "accompaniment",
+    ));
+    let mut queue = state
+        .queue
+        .lock()
+        .map_err(|_| internal_message("音乐播放队列锁已损坏"))?;
+    if !queue
+        .push(QueueItem {
+            keyword: keyword.clone(),
+            source,
+            prefer_accompaniment,
+            ai_original_text: String::new(),
+            uri: uri.trim().to_string(),
+            friend_username: String::new(),
+            dedup_bypass: true,
+        })
+        .map_err(internal_error)?
+    {
+        return Err(AppError {
+            status: 400,
+            message: "音乐播放队列已满".to_string(),
+        });
+    }
+    sync_monitor_queue(&state.monitor, &queue);
+    Ok(
+        json!({ "ok": true, "queued": true, "size": queue.len(), "keyword": keyword, "uri": uri })
+            .to_string(),
+    )
 }
 
 fn queue_route(
@@ -1252,6 +1289,16 @@ fn normalize_fuo_uri(value: Option<&str>) -> std::result::Result<String, AppErro
     Ok(uri)
 }
 
+fn source_from_fuo_uri(uri: &str) -> Option<&'static str> {
+    let rest = uri.strip_prefix("fuo://")?;
+    let source = rest.split('/').next().unwrap_or("");
+    match source {
+        "qqmusic" => Some("qqmusic"),
+        "netease" => Some("netease"),
+        _ => None,
+    }
+}
+
 fn normalize_optional_text(
     value: Option<&str>,
     name: &str,
@@ -1652,6 +1699,47 @@ mod tests {
     }
 
     #[test]
+    fn player_play_uri_route_pushes_music_queue_item() {
+        let state = test_state();
+        let body = player_play_uri_route(
+            &[
+                ("uri".to_string(), "fuo://netease/songs/123".to_string()),
+                ("title".to_string(), "测试歌曲".to_string()),
+            ],
+            &state,
+        )
+        .expect("play uri route succeeds");
+
+        let value: Value = serde_json::from_str(&body).expect("json response");
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["queued"], true);
+        assert_eq!(value["size"], 1);
+        assert_eq!(value["keyword"], "测试歌曲");
+        assert_eq!(value["uri"], "fuo://netease/songs/123");
+
+        let queue = state.queue.lock().expect("queue lock");
+        let item = queue.front().expect("queued item");
+        assert_eq!(item.keyword, "测试歌曲");
+        assert_eq!(item.source, "netease");
+        assert_eq!(item.uri, "fuo://netease/songs/123");
+        assert!(item.dedup_bypass);
+        assert!(item.friend_username.is_empty());
+    }
+
+    #[test]
+    fn source_from_fuo_uri_supports_known_music_sources() {
+        assert_eq!(
+            source_from_fuo_uri("fuo://qqmusic/songs/1"),
+            Some("qqmusic")
+        );
+        assert_eq!(
+            source_from_fuo_uri("fuo://netease/songs/1"),
+            Some("netease")
+        );
+        assert_eq!(source_from_fuo_uri("fuo://local/songs/1"), None);
+    }
+
+    #[test]
     fn remote_next_builds_console_game_command() {
         let pending = remote_control_command("下一首".to_string(), "下一首", UserCommand::Next);
 
@@ -1751,5 +1839,33 @@ mod tests {
         assert_eq!(parse_jpeg_quality(Some("95")).unwrap(), 95);
         assert!(parse_jpeg_quality(Some("79")).is_err());
         assert!(parse_jpeg_quality(Some("96")).is_err());
+    }
+
+    fn test_state() -> HttpSharedState {
+        let mut config: AppConfig =
+            serde_yaml::from_str(include_str!("../../config.yaml")).expect("default config");
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("mwm-http-test-{suffix}"));
+        std::fs::create_dir_all(&dir).expect("test dir");
+        config.state.queue_path = dir.join("queue.json");
+        config.state.runtime_state_path = dir.join("runtime-state.json");
+
+        let queue = Arc::new(Mutex::new(
+            PersistentQueue::load(config.state.queue_path.clone(), config.queue.max_size)
+                .expect("queue"),
+        ));
+        let runtime_state = Arc::new(Mutex::new(
+            PersistentRuntimeState::load(config.state.runtime_state_path.clone())
+                .expect("runtime state"),
+        ));
+        let pending = Arc::new((
+            Mutex::new(VecDeque::<super::super::PendingTask>::new()),
+            Condvar::new(),
+        ));
+        let monitor = MonitorShared::new(20);
+        HttpSharedState::new(config, queue, runtime_state, pending, monitor)
     }
 }

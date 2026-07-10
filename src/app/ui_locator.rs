@@ -15,6 +15,19 @@ use super::input_actions::click_game_point;
 use super::ocr::recognize_lines;
 use super::template_match::{TemplateHit, best_template_hit};
 
+pub(super) fn startup_locator(config: &config::AppConfig) -> UiLocator {
+    UiLocator::new(
+        Canvas {
+            width: config.screen.expected_width,
+            height: config.screen.expected_height,
+            resize: true,
+        },
+        FrameArgs { image: None },
+        config.window.clone(),
+        config.startup.poll_ms,
+    )
+}
+
 pub(super) struct UiLocator {
     canvas: Canvas,
     frame_args: FrameArgs,

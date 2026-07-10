@@ -18,6 +18,7 @@ mod app {
     mod dpi;
     mod feeluown;
     mod frame_source;
+    mod game_startup;
     mod geometry;
     mod hall_info;
     mod hotkeys;
@@ -31,7 +32,9 @@ mod app {
     mod playback_format;
     mod queue;
     mod runtime_state;
+    mod song_dedup;
     mod song_matcher;
+    mod song_review;
     mod startup_flow;
     mod template_match;
     mod tui;
@@ -79,6 +82,8 @@ mod app {
     use self::runtime_state::{
         HALL_EXPIRING_WARNING_MINUTES, PersistentRuntimeState, RuntimeState,
     };
+    use self::song_dedup::{PersistentSongDedupHistory, SongDedupCandidate};
+    use self::song_review::{SongReviewCandidate, SongReviewClient};
     use self::template_match::{best_template_hit, find_template_hits};
     use self::ui_state::detect_ui_state;
     use anyhow::{Context, Result, anyhow};
@@ -311,6 +316,7 @@ mod app {
         Success,
         NoSource,
         Error,
+        DedupLimited,
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -574,13 +580,17 @@ mod app {
             log::info!("启动时已清理上次运行的大厅倒计时缓存，等待本次大厅检测重新确认");
         }
         let queue = PersistentQueue::load(config.state.queue_path.clone(), config.queue.max_size)?;
+        let song_dedup_history =
+            PersistentSongDedupHistory::load(config.song_dedup.history_path.clone())?;
         log::info!("已加载队列: {} 首", queue.len());
+        log::info!("已加载长时间同歌去重历史: {} 条", song_dedup_history.len());
         log::info!(
             "已加载运行时状态: paused_by_command={}",
             runtime_state.state().paused_by_command
         );
 
-        let mut app = AutomationApp::new(config, runtime_state, queue, monitor)?;
+        let mut app =
+            AutomationApp::new(config, runtime_state, queue, song_dedup_history, monitor)?;
         let result = app.run();
         drop(tui_handle);
         result
@@ -590,12 +600,15 @@ mod app {
         config: AppConfig,
         runtime_state: Arc<Mutex<PersistentRuntimeState>>,
         queue: Arc<Mutex<PersistentQueue>>,
+        song_dedup_history: Arc<Mutex<PersistentSongDedupHistory>>,
         feeluown: FeelUOwnClient,
         ai: ai::AiClient,
+        song_review: SongReviewClient,
         chat_output: ChatOutput,
         ocr_engine: Arc<Mutex<OcrEngineState>>,
         locks: CommandLockState,
         pending: Arc<(Mutex<VecDeque<PendingTask>>, Condvar)>,
+        window_detection_signal: WindowDetectionSignal,
         screen_lock_primed: Arc<AtomicBool>,
         reset_locks_requested: Arc<AtomicBool>,
         invite_executed_seqs: Arc<Mutex<HashSet<u32>>>,
@@ -621,6 +634,54 @@ mod app {
         rebuild_due_at: Instant,
     }
 
+    #[derive(Clone)]
+    struct WindowDetectionSignal {
+        inner: Arc<(Mutex<u64>, Condvar)>,
+    }
+
+    impl WindowDetectionSignal {
+        fn new() -> Self {
+            Self {
+                inner: Arc::new((Mutex::new(0), Condvar::new())),
+            }
+        }
+
+        fn generation(&self) -> Result<u64> {
+            let (lock, _) = &*self.inner;
+            let generation = lock
+                .lock()
+                .map_err(|_| anyhow!("window detection signal mutex poisoned"))?;
+            Ok(*generation)
+        }
+
+        fn request(&self, reason: &'static str) -> Result<()> {
+            let (lock, cvar) = &*self.inner;
+            let mut generation = lock
+                .lock()
+                .map_err(|_| anyhow!("window detection signal mutex poisoned"))?;
+            *generation = generation.wrapping_add(1);
+            cvar.notify_all();
+            log::info!("已请求重置窗口检测退避: {}", reason);
+            Ok(())
+        }
+
+        fn wait_for_change(&self, observed_generation: u64, timeout: Duration) -> Result<bool> {
+            let (lock, cvar) = &*self.inner;
+            let generation = lock
+                .lock()
+                .map_err(|_| anyhow!("window detection signal mutex poisoned"))?;
+            if *generation != observed_generation {
+                return Ok(true);
+            }
+            let (generation, _) = cvar
+                .wait_timeout_while(generation, timeout, |current| {
+                    *current == observed_generation
+                })
+                .map_err(|_| anyhow!("window detection signal condvar poisoned"))?;
+            Ok(*generation != observed_generation)
+        }
+    }
+
     #[derive(Clone, Debug)]
     struct ResolvedSongRequest {
         keyword: String,
@@ -630,6 +691,7 @@ mod app {
         uri: String,
         skip_match_check: bool,
         friend_username: String,
+        console_bypass_dedup: bool,
     }
 
     impl ResolvedSongRequest {
@@ -650,7 +712,10 @@ mod app {
         ConsoleChat {
             text: String,
         },
-        StartAndEnterWonderland {
+        StartGame {
+            source: &'static str,
+        },
+        EnterWonderland {
             source: &'static str,
         },
         ModerationVoteResult {
@@ -669,9 +734,8 @@ mod app {
                 Self::Command(pending) => pending.parsed.raw.clone(),
                 Self::AdvanceQueue { reason } => format!("自动出队({})", reason),
                 Self::ConsoleChat { text } => format!("控制台发言: {}", text),
-                Self::StartAndEnterWonderland { source } => {
-                    format!("自动启动并进入千星({})", source)
-                }
+                Self::StartGame { source } => format!("启动游戏({})", source),
+                Self::EnterWonderland { source } => format!("进入千星({})", source),
                 Self::ModerationVoteResult {
                     command, approved, ..
                 } => format!(
@@ -688,7 +752,8 @@ mod app {
                 Self::Command(pending) => command::same_lock_command(&pending.parsed, parsed),
                 Self::AdvanceQueue { .. } => false,
                 Self::ConsoleChat { .. } => false,
-                Self::StartAndEnterWonderland { .. } => false,
+                Self::StartGame { .. } => false,
+                Self::EnterWonderland { .. } => false,
                 Self::ModerationVoteResult { command, .. } => {
                     matches!(
                         &parsed.command,
@@ -698,6 +763,10 @@ mod app {
                 }
             }
         }
+    }
+
+    enum PrepareUiFailureAction {
+        Requeue,
     }
 
     struct CommandExecutingGuard {
@@ -757,19 +826,23 @@ mod app {
             config: AppConfig,
             runtime_state: PersistentRuntimeState,
             queue: PersistentQueue,
+            song_dedup_history: PersistentSongDedupHistory,
             monitor: MonitorShared,
         ) -> Result<Self> {
             let ocr_args = OcrArgs::default().resolve(&config);
             let ocr_engine = make_ocr_engine(&ocr_args)?;
             let feeluown = FeelUOwnClient::new(&config.feeluown, &config.timing);
             let ai = ai::AiClient::new(&config.ai, &config.timing);
+            let song_review = SongReviewClient::new(&config.song_review, &config.timing);
             let chat_output = ChatOutput::new(&config.output, &config.timing, &config.window);
             Ok(Self {
                 config,
                 runtime_state: Arc::new(Mutex::new(runtime_state)),
                 queue: Arc::new(Mutex::new(queue)),
+                song_dedup_history: Arc::new(Mutex::new(song_dedup_history)),
                 feeluown,
                 ai,
+                song_review,
                 chat_output,
                 ocr_engine: Arc::new(Mutex::new(OcrEngineState {
                     engine: ocr_engine,
@@ -777,6 +850,7 @@ mod app {
                 })),
                 locks: CommandLockState::default(),
                 pending: Arc::new((Mutex::new(VecDeque::new()), Condvar::new())),
+                window_detection_signal: WindowDetectionSignal::new(),
                 screen_lock_primed: Arc::new(AtomicBool::new(false)),
                 reset_locks_requested: Arc::new(AtomicBool::new(false)),
                 invite_executed_seqs: Arc::new(Mutex::new(HashSet::new())),
@@ -825,12 +899,15 @@ mod app {
                 config: self.config.clone(),
                 runtime_state: self.runtime_state.clone(),
                 queue: self.queue.clone(),
+                song_dedup_history: self.song_dedup_history.clone(),
                 feeluown: self.feeluown.clone(),
                 ai: self.ai.clone(),
+                song_review: self.song_review.clone(),
                 chat_output: self.chat_output.clone(),
                 ocr_engine: self.ocr_engine.clone(),
                 locks: CommandLockState::default(),
                 pending: self.pending.clone(),
+                window_detection_signal: self.window_detection_signal.clone(),
                 screen_lock_primed: self.screen_lock_primed.clone(),
                 reset_locks_requested: self.reset_locks_requested.clone(),
                 invite_executed_seqs: self.invite_executed_seqs.clone(),
@@ -857,12 +934,15 @@ mod app {
                 config: self.config.clone(),
                 runtime_state: self.runtime_state.clone(),
                 queue: self.queue.clone(),
+                song_dedup_history: self.song_dedup_history.clone(),
                 feeluown: self.feeluown.clone(),
                 ai: self.ai.clone(),
+                song_review: self.song_review.clone(),
                 chat_output: self.chat_output.clone(),
                 ocr_engine: self.ocr_engine.clone(),
                 locks: CommandLockState::default(),
                 pending: self.pending.clone(),
+                window_detection_signal: self.window_detection_signal.clone(),
                 screen_lock_primed: self.screen_lock_primed.clone(),
                 reset_locks_requested: self.reset_locks_requested.clone(),
                 invite_executed_seqs: self.invite_executed_seqs.clone(),
@@ -887,12 +967,15 @@ mod app {
                 config: self.config.clone(),
                 runtime_state: self.runtime_state.clone(),
                 queue: self.queue.clone(),
+                song_dedup_history: self.song_dedup_history.clone(),
                 feeluown: self.feeluown.clone(),
                 ai: self.ai.clone(),
+                song_review: self.song_review.clone(),
                 chat_output: self.chat_output.clone(),
                 ocr_engine: self.ocr_engine.clone(),
                 locks: CommandLockState::default(),
                 pending: self.pending.clone(),
+                window_detection_signal: self.window_detection_signal.clone(),
                 screen_lock_primed: self.screen_lock_primed.clone(),
                 reset_locks_requested: self.reset_locks_requested.clone(),
                 invite_executed_seqs: self.invite_executed_seqs.clone(),
@@ -1267,6 +1350,8 @@ mod app {
                         let frame_ms = elapsed_ms(frame_started);
                         primary_visible = false;
                         last_fingerprint = None;
+                        let observed_window_detection_generation =
+                            self.window_detection_signal.generation()?;
                         log::warn!(
                             "截图失败，{}秒后重试: {error:#}",
                             target_missing_backoff.as_secs()
@@ -1279,9 +1364,16 @@ mod app {
                         );
                         target_missing = true;
                         self.maybe_idle_exit()?;
-                        sleep(target_missing_backoff);
-                        target_missing_backoff =
-                            next_target_missing_backoff(target_missing_backoff);
+                        if self.window_detection_signal.wait_for_change(
+                            observed_window_detection_generation,
+                            target_missing_backoff,
+                        )? {
+                            log::info!("收到窗口检测重置请求，立即重试并重置截图退避");
+                            target_missing_backoff = TARGET_MISSING_BACKOFF_INITIAL;
+                        } else {
+                            target_missing_backoff =
+                                next_target_missing_backoff(target_missing_backoff);
+                        }
                         continue;
                     }
                 }
@@ -1529,8 +1621,9 @@ mod app {
                 }
                 PendingTask::AdvanceQueue { reason } => self.execute_advance_queue_task(reason),
                 PendingTask::ConsoleChat { text } => self.execute_console_chat_task(text),
-                PendingTask::StartAndEnterWonderland { source } => {
-                    self.execute_startup_wonderland_task(source)
+                PendingTask::StartGame { source } => self.execute_start_game_task(source),
+                PendingTask::EnterWonderland { source } => {
+                    self.execute_enter_wonderland_task(source)
                 }
                 PendingTask::ModerationVoteResult {
                     command,
@@ -1545,10 +1638,37 @@ mod app {
                 }
                 Err(error) => {
                     log::error!("待处理任务失败 {}: {error:#}", label);
-                    self.return_to_primary_after_command_failure(&label);
+                    self.handle_task_error_after_execution(&label, &error);
                     Err(error)
                 }
             }
+        }
+
+        fn handle_task_error_after_execution(&self, label: &str, error: &anyhow::Error) {
+            if is_target_window_unavailable_error(error) {
+                log::warn!("任务失败且目标游戏窗口不可用，跳过返回一级界面: {}", label);
+            } else {
+                self.return_to_primary_after_command_failure(label);
+            }
+        }
+
+        fn handle_prepare_ui_error(
+            &self,
+            stage: &str,
+            label: &str,
+            error: anyhow::Error,
+        ) -> Result<PrepareUiFailureAction> {
+            if is_target_window_unavailable_error(&error) {
+                log::error!(
+                    "{}目标游戏窗口不可用，已中止当前任务 {}: {error:#}",
+                    stage,
+                    label
+                );
+                return Err(error.context(format!("{}目标游戏窗口不可用: {}", stage, label)));
+            }
+
+            log::error!("{}准备界面失败，保留任务 {}: {error:#}", stage, label);
+            Ok(PrepareUiFailureAction::Requeue)
         }
 
         fn execute_console_chat_task(&mut self, text: String) -> Result<()> {
@@ -1560,22 +1680,50 @@ mod app {
                     self.push_pending_task_front(PendingTask::ConsoleChat { text })?;
                     return Ok(());
                 }
-                Err(error) => {
-                    log::error!("控制台发言前准备界面失败，保留任务 {}: {error:#}", text);
-                    self.push_pending_task_front(PendingTask::ConsoleChat { text })?;
-                    return Ok(());
-                }
+                Err(error) => match self.handle_prepare_ui_error("控制台发言前", &text, error)?
+                {
+                    PrepareUiFailureAction::Requeue => {
+                        self.push_pending_task_front(PendingTask::ConsoleChat { text })?;
+                        return Ok(());
+                    }
+                },
             }
             self.reply(&message)
         }
 
-        fn execute_startup_wonderland_task(&mut self, source: &'static str) -> Result<()> {
-            log::info!("执行启动/千星流程: {}", source);
+        fn execute_start_game_task(&mut self, source: &'static str) -> Result<()> {
+            log::info!("执行启动游戏任务: {}", source);
             let config = self.config.clone();
             let engine = self.ocr_engine()?;
-            startup_flow::start_game_and_enter_wonderland(&config, &engine.engine, || {
-                self.running.load(AtomicOrdering::SeqCst)
-            })
+            let running = Arc::clone(&self.running);
+            let window_detection_signal = self.window_detection_signal.clone();
+            window_detection_signal.request("启动游戏任务开始")?;
+            game_startup::start_game(
+                &config,
+                &engine.engine,
+                || running.load(AtomicOrdering::SeqCst),
+                |reason| {
+                    if let Err(error) = window_detection_signal.request(reason) {
+                        log::error!("请求重置窗口检测退避失败: {error:#}");
+                    }
+                },
+            )
+        }
+
+        fn execute_enter_wonderland_task(&mut self, source: &'static str) -> Result<()> {
+            log::info!("执行进入千星任务: {}", source);
+            let config = self.config.clone();
+            let running = Arc::clone(&self.running);
+            self.window_detection_signal.request("进入千星任务开始")?;
+            startup_flow::enter_wonderland(&config, || running.load(AtomicOrdering::SeqCst))?;
+            log::info!("进入千星完成信号已确认，执行返回一级界面");
+            let returned = self.return_to_primary_fixed();
+            log::info!(
+                "进入千星完成后返回一级界面结束，后续待处理任务将继续执行: returned_primary={}",
+                returned
+            );
+            self.window_detection_signal.request("进入千星任务完成")?;
+            Ok(())
         }
 
         fn execute_pending_command(&mut self, pending: PendingCommand) -> Result<()> {
@@ -1590,12 +1738,13 @@ mod app {
                     return Ok(());
                 }
                 Err(error) => {
-                    log::error!(
-                        "命令执行前准备界面失败，保留待处理命令 {}: {error:#}",
-                        pending.parsed.raw
-                    );
-                    self.push_pending_task_front(PendingTask::Command(Box::new(pending)))?;
-                    return Ok(());
+                    match self.handle_prepare_ui_error("命令执行前", &pending.parsed.raw, error)?
+                    {
+                        PrepareUiFailureAction::Requeue => {
+                            self.push_pending_task_front(PendingTask::Command(Box::new(pending)))?;
+                            return Ok(());
+                        }
+                    }
                 }
             }
             log::info!(
@@ -1629,7 +1778,7 @@ mod app {
                         pending.parsed.raw,
                         command_ms
                     );
-                    self.return_to_primary_after_command_failure(&pending.parsed.raw);
+                    self.handle_task_error_after_execution(&pending.parsed.raw, &error);
                 }
             }
             Ok(())
@@ -1696,9 +1845,17 @@ mod app {
             if !self.config.startup.enabled {
                 return Ok(());
             }
-            self.push_pending_task(PendingTask::StartAndEnterWonderland {
-                source: "启动配置"
-            })
+            if self.config.startup.launch_game || self.config.startup.enter_game {
+                self.push_pending_task(PendingTask::StartGame {
+                    source: "启动配置"
+                })?;
+            }
+            if self.config.startup.enter_wonderland {
+                self.push_pending_task(PendingTask::EnterWonderland {
+                    source: "启动配置"
+                })?;
+            }
+            Ok(())
         }
 
         fn ensure_game_ready_for_input(&self, context: &str) -> Result<()> {
@@ -1750,9 +1907,13 @@ mod app {
                     Ok(())
                 }
                 Err(error) => {
-                    log::error!("{} 执行前准备界面失败，保留任务: {error:#}", task_label);
-                    self.push_pending_task_front(PendingTask::AdvanceQueue { reason })?;
-                    Ok(())
+                    match self.handle_prepare_ui_error("自动出队执行前", &task_label, error)?
+                    {
+                        PrepareUiFailureAction::Requeue => {
+                            self.push_pending_task_front(PendingTask::AdvanceQueue { reason })?;
+                            Ok(())
+                        }
+                    }
                 }
             }
         }
@@ -2061,6 +2222,7 @@ mod app {
                     uri: String::new(),
                     skip_match_check: false,
                     friend_username: song.friend_username.clone(),
+                    console_bypass_dedup: false,
                 }));
             }
             let label = song_label(song);
@@ -2132,6 +2294,7 @@ mod app {
                 uri: candidate.uri.clone(),
                 skip_match_check: true,
                 friend_username: song.friend_username.clone(),
+                console_bypass_dedup: false,
             }))
         }
 
@@ -2207,6 +2370,7 @@ mod app {
                             uri,
                             skip_match_check: false,
                             friend_username: request.friend_username.clone(),
+                            console_bypass_dedup: request.console_bypass_dedup,
                         }));
                     }
                     UserDecision::Skip => {
@@ -2285,6 +2449,7 @@ mod app {
                     uri: picked.0.uri.clone(),
                     skip_match_check: false,
                     friend_username: song.friend_username.clone(),
+                    console_bypass_dedup: false,
                 })),
                 UserDecision::Skip => Ok(None),
                 UserDecision::SwitchSource => {
@@ -2367,6 +2532,7 @@ mod app {
                 uri: candidate.uri.clone(),
                 skip_match_check: true,
                 friend_username: song.friend_username.clone(),
+                console_bypass_dedup: false,
             }))
         }
 
@@ -2448,11 +2614,190 @@ mod app {
                 ai_original_text: request.ai_original_text.clone(),
                 uri: request.uri.clone(),
                 friend_username: request.friend_username.clone(),
+                dedup_bypass: request.console_bypass_dedup,
             })?;
             let len = queue.len();
             drop(queue);
             self.update_monitor_queue_snapshot();
             Ok(Some(len))
+        }
+
+        fn request_dedup_candidate(&self, request: &ResolvedSongRequest) -> SongDedupCandidate {
+            let (title, artist) = song_review::split_candidate_title_artist(&request.keyword);
+            SongDedupCandidate {
+                uri: request.uri.clone(),
+                title,
+                artist,
+                source: request.source.clone(),
+                prefer_accompaniment: request.prefer_accompaniment,
+            }
+        }
+
+        fn status_dedup_candidate(
+            &self,
+            keyword: &str,
+            source: &str,
+            prefer_accompaniment: bool,
+            requested_uri: &str,
+            status: &PlayerStatus,
+        ) -> SongDedupCandidate {
+            let (fallback_title, fallback_artist) =
+                song_review::split_candidate_title_artist(keyword);
+            let title = if status.name.trim().is_empty() {
+                fallback_title
+            } else {
+                status.name.trim().to_string()
+            };
+            let artist = if status.singer.trim().is_empty() {
+                fallback_artist
+            } else {
+                status.singer.trim().to_string()
+            };
+            let uri = if status.current_uri.trim().is_empty() {
+                requested_uri.trim().to_string()
+            } else {
+                status.current_uri.trim().to_string()
+            };
+            SongDedupCandidate {
+                uri,
+                title,
+                artist,
+                source: source.to_string(),
+                prefer_accompaniment,
+            }
+        }
+
+        fn song_dedup_limited(&self, request: &ResolvedSongRequest) -> Result<bool> {
+            if request.console_bypass_dedup && self.config.song_dedup.console_bypass {
+                return Ok(false);
+            }
+            let candidate = self.request_dedup_candidate(request);
+            let history = self
+                .song_dedup_history
+                .lock()
+                .map_err(|_| anyhow!("长时间同歌去重历史锁已损坏"))?;
+            Ok(history.is_limited(&self.config.song_dedup, &self.config.matching, &candidate))
+        }
+
+        fn record_song_dedup_playback(
+            &self,
+            keyword: &str,
+            source: &str,
+            prefer_accompaniment: bool,
+            requested_uri: &str,
+            status: &PlayerStatus,
+        ) -> Result<()> {
+            let candidate = self.status_dedup_candidate(
+                keyword,
+                source,
+                prefer_accompaniment,
+                requested_uri,
+                status,
+            );
+            let mut history = self
+                .song_dedup_history
+                .lock()
+                .map_err(|_| anyhow!("长时间同歌去重历史锁已损坏"))?;
+            history.record_playback(&self.config.song_dedup, candidate)
+        }
+
+        fn song_dedup_reject_message(&self, request: &ResolvedSongRequest) -> String {
+            format!("{}近期已播放过,请稍后再点", request.keyword)
+        }
+
+        fn song_dedup_skip_message(&self, request: &ResolvedSongRequest) -> String {
+            format!("{}近期已播放过,已跳过", request.keyword)
+        }
+
+        fn review_song_candidate(
+            &self,
+            parsed: &ParsedCommand,
+            request: &ResolvedSongRequest,
+        ) -> Result<bool> {
+            if !self.song_review.enabled() {
+                return Ok(true);
+            }
+            if parsed.message_type == "控制台" {
+                log::info!(
+                    "候选歌曲审核跳过: 控制台最高权限免审 command={} uri={}",
+                    parsed.raw,
+                    request.uri
+                );
+                return Ok(true);
+            }
+
+            let (title, artist) = song_review::split_candidate_title_artist(&request.keyword);
+            let candidate = SongReviewCandidate {
+                source: request.source.clone(),
+                title,
+                artist,
+                uri: request.uri.clone(),
+                message_type: parsed.message_type.clone(),
+                username: command_username(parsed).to_string(),
+            };
+            let decision = self.song_review.review(&candidate);
+            let level = song_review_level_text(decision.level);
+            let reason = normalized_review_reason(&decision.reason);
+            let tags = if decision.tags.is_empty() {
+                "无".to_string()
+            } else {
+                decision.tags.join(",")
+            };
+
+            if decision.allowed {
+                if decision.failed_open {
+                    log::warn!(
+                        "候选歌曲审核放行: failure_policy=allow attempts={} threshold={} command={} title={} artist={} source={} uri={} reason={}",
+                        decision.attempts,
+                        decision.threshold,
+                        parsed.raw,
+                        candidate.title,
+                        candidate.artist,
+                        candidate.source,
+                        candidate.uri,
+                        reason
+                    );
+                } else {
+                    log::info!(
+                        "候选歌曲审核通过: level={} threshold={} attempts={} command={} title={} artist={} source={} uri={} reason={} tags={}",
+                        level,
+                        decision.threshold,
+                        decision.attempts,
+                        parsed.raw,
+                        candidate.title,
+                        candidate.artist,
+                        candidate.source,
+                        candidate.uri,
+                        reason,
+                        tags
+                    );
+                }
+                return Ok(true);
+            }
+
+            log::warn!(
+                "候选歌曲审核拒绝: level={} threshold={} attempts={} command={} title={} artist={} source={} uri={} reason={} tags={}",
+                level,
+                decision.threshold,
+                decision.attempts,
+                parsed.raw,
+                candidate.title,
+                candidate.artist,
+                candidate.source,
+                candidate.uri,
+                reason,
+                tags
+            );
+            let action = decision.level.map_or_else(
+                || "review-reject-failed".to_string(),
+                |level| format!("review-reject-level-{level}"),
+            );
+            self.log_executed_command(parsed, &final_song_command_text(request, &action))?;
+            self.reply(&review_reject_reply(
+                &reason,
+                self.song_review.reply_reason_max_chars(),
+            ))?;
+            Ok(false)
         }
 
         fn should_queue_until_current_song_finished(&self, status: &PlayerStatus) -> Result<bool> {
@@ -2486,9 +2831,13 @@ mod app {
         fn execute_command(&mut self, parsed: &ParsedCommand) -> Result<()> {
             match &parsed.command {
                 UserCommand::Song(song) => {
-                    let Some(request) = self.resolve_and_confirm_song(song)? else {
+                    let Some(mut request) = self.resolve_and_confirm_song(song)? else {
                         return Ok(());
                     };
+                    request.console_bypass_dedup = parsed.message_type == "控制台";
+                    if !self.review_song_candidate(parsed, &request)? {
+                        return Ok(());
+                    }
                     if self.queue_contains_request(&request)? {
                         log::info!("队列已有: {}", request.keyword);
                         self.log_executed_command(
@@ -3006,6 +3355,14 @@ mod app {
         }
 
         fn return_to_primary_by_escape(&self, context: &str, force_first_escape: bool) -> bool {
+            if let Err(error) = window::GameWindow::find(&self.config.window) {
+                log::warn!(
+                    "{}: 目标游戏窗口不可用，跳过返回一级界面: {error:#}",
+                    context
+                );
+                return false;
+            }
+
             let templates = UiTemplateArgs::default().resolve(&self.config);
             let canvas = Canvas {
                 width: self.config.screen.expected_width,
@@ -3034,6 +3391,13 @@ mod app {
                     }
                     Ok(ui_state) => {
                         log::info!("{}: 当前 {}，按 ESC 返回上一级", context, ui_state);
+                    }
+                    Err(error) if is_target_window_unavailable_error(&error) => {
+                        log::warn!(
+                            "{}: 目标游戏窗口不可用，停止返回一级界面: {error:#}",
+                            context
+                        );
+                        return false;
                     }
                     Err(error) => {
                         log::error!("{}: 返回一级界面检测失败，继续按 ESC: {error:#}", context);
@@ -3171,6 +3535,15 @@ mod app {
             request: &ResolvedSongRequest,
             allow_switch_source: bool,
         ) -> Result<PlayOutcome> {
+            if self.song_dedup_limited(request)? {
+                log::info!(
+                    "长时间同歌去重拦截: keyword={} uri={}",
+                    request.keyword,
+                    request.uri
+                );
+                self.reply(&self.song_dedup_reject_message(request))?;
+                return Ok(PlayOutcome::DedupLimited);
+            }
             if request.uri.trim().is_empty() {
                 return self.play_keyword_confirmed(
                     &request.keyword,
@@ -3525,6 +3898,13 @@ mod app {
                     requested_uri,
                     &status,
                 )?;
+                self.record_song_dedup_playback(
+                    keyword,
+                    search_source,
+                    prefer_accompaniment,
+                    requested_uri,
+                    &status,
+                )?;
                 self.reply(&play_message)?;
                 return Ok(PlayOutcome::Success);
             }
@@ -3781,7 +4161,15 @@ mod app {
                     skip_match_check: !item.ai_original_text.trim().is_empty()
                         && !item.uri.trim().is_empty(),
                     friend_username: item.friend_username.clone(),
+                    console_bypass_dedup: item.dedup_bypass,
                 };
+                if self.song_dedup_limited(&request)? {
+                    self.queue()?.shift()?;
+                    self.update_monitor_queue_snapshot();
+                    log::info!("队列项近期已播放过，已跳过: {}", item.keyword);
+                    self.reply(&self.song_dedup_skip_message(&request))?;
+                    continue;
+                }
                 let outcome = self.play_request_confirmed(&request, true)?;
                 match outcome {
                     PlayOutcome::Success => {
@@ -3802,6 +4190,12 @@ mod app {
                     PlayOutcome::Error => {
                         log::error!("队列项播放失败，保留在队首: {}", item.keyword);
                         return Ok(());
+                    }
+                    PlayOutcome::DedupLimited => {
+                        self.queue()?.shift()?;
+                        self.update_monitor_queue_snapshot();
+                        log::info!("队列项近期已播放过，已跳过: {}", item.keyword);
+                        continue;
                     }
                 }
             }
@@ -3943,6 +4337,32 @@ mod app {
             .replace('-', "_")
     }
 
+    fn song_review_level_text(level: Option<u8>) -> String {
+        level
+            .map(|level| level.to_string())
+            .unwrap_or_else(|| "无".to_string())
+    }
+
+    fn normalized_review_reason(reason: &str) -> String {
+        let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+        if reason.trim().is_empty() {
+            "审核服务未给出原因".to_string()
+        } else {
+            reason
+        }
+    }
+
+    fn review_reject_reply(reason: &str, max_chars: usize) -> String {
+        let reason = normalized_review_reason(reason);
+        let max_chars = max_chars.max(1);
+        let shortened = if reason.chars().count() > max_chars {
+            format!("{}...", reason.chars().take(max_chars).collect::<String>())
+        } else {
+            reason
+        };
+        format!("点歌未通过审核: {shortened}")
+    }
+
     fn final_song_command_text(request: &ResolvedSongRequest, action: &str) -> String {
         let source = if request.source.trim().is_empty() {
             "all"
@@ -4035,6 +4455,10 @@ mod app {
         base_ms + (RETURN_TO_PRIMARY_SLOW_RETRY_MS - base_ms) * progress / steps
     }
 
+    fn is_target_window_unavailable_error(error: &anyhow::Error) -> bool {
+        window::is_target_window_unavailable(error)
+    }
+
     fn next_target_missing_backoff(current: Duration) -> Duration {
         current.saturating_mul(2).min(TARGET_MISSING_BACKOFF_MAX)
     }
@@ -4060,6 +4484,47 @@ mod app {
                 .collect::<Vec<_>>();
 
             assert_eq!(waits, vec![1_000, 1_200, 1_400, 1_600, 1_800, 2_000, 2_000]);
+        }
+
+        #[test]
+        fn target_window_unavailable_error_is_detected() {
+            let error =
+                window::target_window_unavailable("进入千星前未找到游戏窗口，请先执行启动游戏任务");
+
+            assert!(is_target_window_unavailable_error(&error));
+            assert!(!is_target_window_unavailable_error(&anyhow!(
+                "等待左下角 Enter 模板超时"
+            )));
+        }
+
+        #[test]
+        fn window_detection_signal_times_out_without_request() {
+            let signal = WindowDetectionSignal::new();
+            let generation = signal.generation().expect("generation");
+
+            assert!(
+                !signal
+                    .wait_for_change(generation, Duration::from_millis(1))
+                    .expect("wait")
+            );
+        }
+
+        #[test]
+        fn window_detection_signal_wakes_waiter() {
+            let signal = WindowDetectionSignal::new();
+            let generation = signal.generation().expect("generation");
+            let notifier = signal.clone();
+            let handle = thread::spawn(move || {
+                sleep(Duration::from_millis(10));
+                notifier.request("test").expect("request");
+            });
+
+            assert!(
+                signal
+                    .wait_for_change(generation, Duration::from_secs(1))
+                    .expect("wait")
+            );
+            handle.join().expect("join notifier");
         }
     }
 }

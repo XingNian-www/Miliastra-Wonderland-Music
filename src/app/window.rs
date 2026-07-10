@@ -1,3 +1,4 @@
+use std::fmt;
 use std::path::Path;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
@@ -26,6 +27,37 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::BOOL;
 
 use super::config::{PointConfig, WindowConfig};
+
+#[derive(Clone, Debug)]
+pub struct TargetWindowUnavailable {
+    message: String,
+}
+
+impl TargetWindowUnavailable {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for TargetWindowUnavailable {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for TargetWindowUnavailable {}
+
+pub fn target_window_unavailable(message: impl Into<String>) -> anyhow::Error {
+    TargetWindowUnavailable::new(message).into()
+}
+
+pub fn is_target_window_unavailable(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<TargetWindowUnavailable>().is_some())
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct ScreenPoint {
@@ -131,7 +163,9 @@ impl GameWindow {
         if self.is_foreground_process() {
             Ok(())
         } else {
-            bail!("当前前台窗口不是目标游戏进程，已中止输入")
+            Err(target_window_unavailable(
+                "当前前台窗口不是目标游戏进程，已中止输入",
+            ))
         }
     }
 
@@ -179,17 +213,24 @@ impl GameWindow {
 
     fn refresh_client_area_values(&mut self) -> Result<()> {
         let mut client_rect = RECT::default();
-        unsafe { GetClientRect(self.hwnd, &mut client_rect).context("GetClientRect failed")? };
+        if let Err(error) = unsafe { GetClientRect(self.hwnd, &mut client_rect) } {
+            return Err(target_window_unavailable(format!(
+                "GetClientRect failed: {error}"
+            )));
+        }
 
         let mut top_left = POINT { x: 0, y: 0 };
         if !unsafe { ClientToScreen(self.hwnd, &mut top_left).as_bool() } {
-            bail!("ClientToScreen failed");
+            return Err(target_window_unavailable("ClientToScreen failed"));
         }
 
         let client_width = client_rect.right - client_rect.left;
         let client_height = client_rect.bottom - client_rect.top;
         if client_width <= 0 || client_height <= 0 {
-            bail!("目标窗口客户区尺寸无效: {}x{}", client_width, client_height);
+            return Err(target_window_unavailable(format!(
+                "目标窗口客户区尺寸无效: {}x{}",
+                client_width, client_height
+            )));
         }
 
         self.client_left = top_left.x;
@@ -257,15 +298,17 @@ impl GameWindow {
             })
         };
         if target.is_invalid() {
-            bail!("目标点击点不在任何窗口内: {},{}", point.x, point.y);
+            return Err(target_window_unavailable(format!(
+                "目标点击点不在任何窗口内: {},{}",
+                point.x, point.y
+            )));
         }
         let root = unsafe { GetAncestor(target, GA_ROOT) };
         if root != self.hwnd {
-            bail!(
+            return Err(target_window_unavailable(format!(
                 "目标点击点当前不是游戏窗口，已取消点击: {},{}",
-                point.x,
-                point.y
-            );
+                point.x, point.y
+            )));
         }
         Ok(())
     }
@@ -293,20 +336,20 @@ fn capture_client_area(hwnd: HWND, width: i32, height: i32) -> Result<DynamicIma
     unsafe {
         let source_dc = GetDC(Some(hwnd));
         if source_dc.is_invalid() {
-            bail!("GetDC failed for game window");
+            return Err(target_window_unavailable("GetDC failed for game window"));
         }
 
         let memory_dc = CreateCompatibleDC(Some(source_dc));
         if memory_dc.is_invalid() {
             ReleaseDC(Some(hwnd), source_dc);
-            bail!("CreateCompatibleDC failed");
+            return Err(target_window_unavailable("CreateCompatibleDC failed"));
         }
 
         let bitmap = CreateCompatibleBitmap(source_dc, width, height);
         if bitmap.is_invalid() {
             let _ = DeleteDC(memory_dc);
             ReleaseDC(Some(hwnd), source_dc);
-            bail!("CreateCompatibleBitmap failed");
+            return Err(target_window_unavailable("CreateCompatibleBitmap failed"));
         }
 
         let old_object = SelectObject(memory_dc, HGDIOBJ::from(bitmap));
@@ -314,7 +357,7 @@ fn capture_client_area(hwnd: HWND, width: i32, height: i32) -> Result<DynamicIma
             let _ = DeleteObject(HGDIOBJ::from(bitmap));
             let _ = DeleteDC(memory_dc);
             ReleaseDC(Some(hwnd), source_dc);
-            bail!("SelectObject failed");
+            return Err(target_window_unavailable("SelectObject failed"));
         }
 
         if let Err(error) = BitBlt(
@@ -332,7 +375,9 @@ fn capture_client_area(hwnd: HWND, width: i32, height: i32) -> Result<DynamicIma
             let _ = DeleteObject(HGDIOBJ::from(bitmap));
             let _ = DeleteDC(memory_dc);
             ReleaseDC(Some(hwnd), source_dc);
-            return Err(error).context("BitBlt game window failed");
+            return Err(target_window_unavailable(format!(
+                "BitBlt game window failed: {error}"
+            )));
         }
 
         let mut bitmap_info = BITMAPINFO::default();
@@ -368,7 +413,9 @@ fn capture_client_area(hwnd: HWND, width: i32, height: i32) -> Result<DynamicIma
         ReleaseDC(Some(hwnd), source_dc);
 
         if lines == 0 {
-            bail!("GetDIBits failed for game window");
+            return Err(target_window_unavailable(
+                "GetDIBits failed for game window",
+            ));
         }
 
         for pixel in bgra.chunks_exact_mut(4) {
@@ -393,6 +440,8 @@ struct SearchState {
     target_label: String,
     found: Option<ProcessWindow>,
     include_minimized: bool,
+    hidden_target_windows: u32,
+    minimized_target_windows: u32,
 }
 
 fn find_window_by_process(target_process: &str) -> Result<ProcessWindow> {
@@ -401,6 +450,8 @@ fn find_window_by_process(target_process: &str) -> Result<ProcessWindow> {
         target_label: target_process.to_string(),
         found: None,
         include_minimized: false,
+        hidden_target_windows: 0,
+        minimized_target_windows: 0,
     };
     find_window_by_process_with_state(&mut state)
 }
@@ -411,6 +462,8 @@ fn find_window_by_process_for_close(target_process: &str) -> Result<HWND> {
         target_label: target_process.to_string(),
         found: None,
         include_minimized: true,
+        hidden_target_windows: 0,
+        minimized_target_windows: 0,
     };
     find_window_by_process_with_state(&mut state).map(|window| window.hwnd)
 }
@@ -425,19 +478,24 @@ fn find_window_by_process_with_state(state: &mut SearchState) -> Result<ProcessW
     if state.found.is_none() {
         enum_result.context("EnumWindows failed")?;
     }
-    state
-        .found
-        .ok_or_else(|| anyhow!("未找到目标游戏窗口进程: {}", state.target_label))
+    state.found.ok_or_else(|| {
+        if state.hidden_target_windows > 0 || state.minimized_target_windows > 0 {
+            target_window_unavailable(format!(
+                "未找到可用目标游戏窗口进程: {} hidden_windows={} minimized_windows={}",
+                state.target_label, state.hidden_target_windows, state.minimized_target_windows
+            ))
+        } else {
+            target_window_unavailable(format!(
+                "未找到目标游戏窗口进程: {} candidates={}",
+                state.target_label,
+                state.targets.join(",")
+            ))
+        }
+    })
 }
 
 unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
     let state = unsafe { &mut *(lparam.0 as *mut SearchState) };
-    if !unsafe { IsWindowVisible(hwnd).as_bool() }
-        || (!state.include_minimized && unsafe { IsIconic(hwnd).as_bool() })
-    {
-        return true.into();
-    }
-
     let mut process_id = 0_u32;
     unsafe { GetWindowThreadProcessId(hwnd, Some(&mut process_id)) };
     if process_id == 0 {
@@ -452,6 +510,14 @@ unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL 
                 .iter()
                 .any(|target| normalize_process_name(&name) == *target)
             {
+                if !unsafe { IsWindowVisible(hwnd).as_bool() } {
+                    state.hidden_target_windows += 1;
+                    return true.into();
+                }
+                if !state.include_minimized && unsafe { IsIconic(hwnd).as_bool() } {
+                    state.minimized_target_windows += 1;
+                    return true.into();
+                }
                 state.found = Some(ProcessWindow { hwnd, process_id });
                 return false.into();
             }

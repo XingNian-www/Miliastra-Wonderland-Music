@@ -2,7 +2,7 @@
 # 坐标沿用旧脚本习惯：以游戏客户区左上角为原点，按 1920x1080 有效画面写坐标
 
 # 配置版本；程序启动时会把旧版本配置迁移到当前模板
-config_version: 17
+config_version: 18
 
 window:
   # 目标游戏进程名，按进程文件名匹配，大小写不敏感；多个进程名可用逗号分隔
@@ -342,6 +342,18 @@ queue:
   # 任意渠道正在播放/暂停的歌曲是否保护；true 时新点歌会排队，未结束只能用 @下一首 提前切换；自动出队仍由 auto_advance_seconds 控制
   protect_current_song_until_finished: true
 
+song_dedup:
+  # 长时间同歌去重；只在实际播放前检查，确认播放成功后记录
+  enabled: true
+  # 最近多少秒内统计同一首歌播放次数
+  window_seconds: 3600
+  # 最近窗口内同一首歌最多允许播放次数；达到该值后拒绝或跳过
+  max_count: 1
+  # 控制台来源是否默认豁免长时间同歌去重
+  console_bypass: true
+  # 长时间同歌去重历史持久化路径
+  history_path: data/song-dedup-history.json
+
 ai:
   # AI 供应商：mimo/openai/deepseek/custom
   provider: mimo
@@ -351,6 +363,36 @@ ai:
   endpoint: ""
   # AI 模型名；留空使用供应商默认模型，不同供应商可自行填写
   model: ""
+
+song_review:
+  # 候选歌曲 AI 审核；只审核最终候选歌曲/URI，控制台来源最高权限免审
+  enabled: false
+  # 审核返回 level 为 1-10，超过该阈值会拒绝点歌
+  max_allowed_level: 4
+  # 审核服务多次失败后的策略：reject 拒绝，allow 放行并写警告日志
+  failure_policy: reject
+  # 审核请求失败后的重试次数；实际最多请求 retry_count + 1 次
+  retry_count: 2
+  # 审核重试间隔
+  retry_delay_ms: 500
+  # 游戏内拒绝原因最多显示的字符数；完整原因写日志
+  reply_reason_max_chars: 40
+  # 审核条件；可以按房间氛围修改，但不要要求模型改变 JSON 输出格式
+  policy_prompt: |
+    审核目标：只通过整体听感偏舒缓、柔和、轻松、安静、治愈、抒情、慢节奏或中低强度的歌曲。
+    拒绝明显炸场、吵闹、压迫感强、节奏过快、情绪过激、强烈电子噪音、重金属、硬核、鬼畜、洗脑循环、尖锐喊叫、强烈攻击性或明显破坏房间氛围的歌曲。
+    请尽量使用联网搜索得到的曲风、歌词摘要、歌曲介绍和公开听感描述判断。
+    如果信息不足，请保守判断；不确定时应给较高强度等级，而不是因为歌曲热门、用户喜欢或歌手知名就放宽标准。
+  # 追加审核规则；会附加在 policy_prompt 后面，用于临时补充口径
+  custom_prompt: |
+    本房间偏好舒缓、轻松、不吵闹的音乐。
+  # 独立的审核 Provider；当前仅支持阿里云百炼 OpenAI 兼容接口，因为审核请求依赖 enable_search 和 forced_search
+  provider:
+    # 示例：https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/chat/completions
+    endpoint: ""
+    api_key: ""
+    # 示例：qwen-plus
+    model: ""
 
 matching:
   # 歌名最低匹配分数
@@ -381,11 +423,11 @@ hotkeys:
   exit_key: F12
 
 startup:
-  # 程序启动后是否自动排队执行“启动游戏并进入千星奇域”
+  # 程序启动后是否按配置自动排队执行“启动游戏”和“进入千星”
   enabled: true
   # 找不到游戏窗口时是否启动游戏
   launch_game: true
-  # 是否处理“进入游戏/确认”等开门按钮
+  # 是否处理“点击进入”等开门按钮
   enter_game: true
   # 是否按 F6 打开千星奇域，并进入大厅后停止
   enter_wonderland: true
@@ -397,10 +439,12 @@ startup:
   launch_wait_ms: 5000
   # 启动游戏后最多检查窗口次数
   launch_retries: 12
-  # 仅开门模式等待进入游戏完成的最长时间，单位毫秒
-  enter_game_timeout_ms: 300000
+  # OCR 等待并点击“点击进入”的最长时间，单位毫秒
+  enter_game_timeout_ms: 60000
   # 等待千星奇域界面/大厅确认的最长时间，单位毫秒
   enter_wonderland_timeout_ms: 300000
+  # 点击千星确认并等待原确认按钮消失后，等待千星内确认按钮再次出现的最长时间，单位毫秒
+  entered_wonderland_confirm_timeout_ms: 20000
   # 点击前往大厅后等待回到可聊天一级界面的最长时间，单位毫秒
   final_primary_timeout_ms: 120000
   # 启动流程 OCR/截图轮询间隔，单位毫秒
@@ -413,76 +457,43 @@ startup:
   stable_mean_threshold: 2.0
   # 像素稳定变化比例阈值
   stable_changed_ratio_threshold: 0.01
-  # BGI 启动模板匹配阈值；越高越严格
+  # 启动/千星模板匹配阈值；越高越严格
   template_threshold: 0.8
-  # BGI 启动流程模板资源
+  # 进入千星流程模板资源；启动游戏完成判断复用全局 templates.enter
   templates:
-    choose_enter_game: assets/startup-choose-enter-game.png
-    enter_game: assets/startup-enter-game.png
-    welkin_moon_logo: assets/startup-welkin-moon-logo.png
-    girl_moon: assets/startup-girl-moon.png
     confirm_black: assets/startup-confirm-black.png
-    confirm_white: assets/startup-confirm-white.png
     paimon_menu: assets/startup-paimon-menu.png
-    primogem: assets/startup-primogem.png
     wonderland_close: assets/startup-wonderland-close.png
-    wonderland_enter: assets/startup-wonderland-enter.png
-  # “进入游戏”按钮 OCR 文本，按顺序匹配，点击文本框中心
-  enter_game_texts: [进入游戏, Enter Game, Start Game]
-  # 启动/适龄/协议等弹窗确认按钮 OCR 文本
-  prompt_confirm_texts: [确认, 确定, 同意, OK]
-  # 千星奇域主页 OCR 文本；检测到后点击下方配置的奇域卡片坐标
-  wonderland_home_texts: [千星奇域, 奇域]
-  # 选中奇域后进入大厅按钮 OCR 文本
-  wonderland_enter_texts: [前往大厅, 进入大厅, 大厅]
-  # 顶号/切号后的二次进入游戏按钮模板区域
-  choose_enter_game_region:
-    x: 700
-    y: 540
-    width: 520
-    height: 360
-  # 开门按钮 OCR 区域
+  # “点击进入”按钮 OCR 区域
   enter_game_text_region:
-    x: 500
-    y: 560
-    width: 920
-    height: 480
-  # 月卡、原石等启动弹窗模板区域
-  loading_popup_region:
-    x: 560
-    y: 420
-    width: 800
-    height: 560
-  # 弹窗确认按钮 OCR 区域
+    x: 900
+    y: 1000
+    width: 130
+    height: 40
+  # 千星黑色确认按钮模板区域
   prompt_confirm_text_region:
-    x: 560
-    y: 500
-    width: 800
-    height: 420
+    x: 1400
+    y: 900
+    width: 100
+    height: 100
+  # 进入千星后再次出现的黑色确认按钮模板区域
+  entered_wonderland_confirm_region:
+    x: 1100
+    y: 900
+    width: 100
+    height: 100
   # 派蒙菜单/主界面模板区域
   main_ui_region:
     x: 0
     y: 0
     width: 480
     height: 270
-  # 千星奇域主页标题 OCR 区域
-  wonderland_home_text_region:
-    x: 0
-    y: 0
-    width: 1920
-    height: 360
-  # 前往大厅按钮 OCR 区域
-  wonderland_enter_text_region:
-    x: 560
-    y: 620
-    width: 800
-    height: 360
-  # F6 打开的千星奇域主页关闭/返回模板区域
+  # F6 打开的千星奇域主页右上角关闭/返回模板区域
   wonderland_close_region:
-    x: 0
+    x: 1780
     y: 0
-    width: 1920
-    height: 220
+    width: 140
+    height: 90
   # 默认点击第一个奇域卡片的位置，按 1920x1080 坐标
   wonderland_card_point:
     x: 680

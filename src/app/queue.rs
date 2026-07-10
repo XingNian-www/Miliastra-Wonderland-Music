@@ -17,6 +17,7 @@ pub struct QueueItem {
     pub ai_original_text: String,
     pub uri: String,
     pub friend_username: String,
+    pub dedup_bypass: bool,
 }
 
 impl Default for QueueItem {
@@ -28,6 +29,7 @@ impl Default for QueueItem {
             ai_original_text: String::new(),
             uri: String::new(),
             friend_username: String::new(),
+            dedup_bypass: false,
         }
     }
 }
@@ -108,6 +110,7 @@ impl PersistentQueue {
             ai_original_text: item.ai_original_text,
             uri: item.uri,
             friend_username: item.friend_username,
+            dedup_bypass: item.dedup_bypass,
         });
         self.save_items(&items)?;
         self.items = items;

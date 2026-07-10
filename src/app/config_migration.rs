@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow};
 use serde_yaml::{Mapping, Value};
 
-pub const CURRENT_CONFIG_VERSION: u32 = 17;
+pub const CURRENT_CONFIG_VERSION: u32 = 18;
 
 struct ChangedDefaultField {
     path: &'static str,
@@ -771,7 +771,7 @@ mod tests {
 
     const DEFAULT: &str = r#"# 测试配置
 # 版本注释
-config_version: 17
+config_version: 18
 
 timing:
   watchdog_restart_ms: 2000
@@ -832,6 +832,21 @@ queue:
   protect_auto_played_songs: true
   protect_current_song_until_finished: true
 
+song_review:
+  enabled: false
+  max_allowed_level: 4
+  failure_policy: reject
+  retry_count: 2
+  retry_delay_ms: 500
+  reply_reason_max_chars: 40
+  custom_prompt: |
+    拒绝明显低俗、辱骂、擦边、引战、暴力、政治敏感、广告导流或不适合公开大厅播放的歌曲。
+    对信息不足但看起来正常的歌曲给较低风险分，不要凭空猜测。
+  provider:
+    endpoint: ""
+    api_key: ""
+    model: ""
+
 tui:
   enabled: true
 
@@ -844,8 +859,9 @@ startup:
   game_args: ""
   launch_wait_ms: 5000
   launch_retries: 12
-  enter_game_timeout_ms: 300000
+  enter_game_timeout_ms: 60000
   enter_wonderland_timeout_ms: 300000
+  entered_wonderland_confirm_timeout_ms: 20000
   final_primary_timeout_ms: 120000
   poll_ms: 1000
   f6_retry_ms: 2500
@@ -854,60 +870,34 @@ startup:
   stable_changed_ratio_threshold: 0.01
   template_threshold: 0.8
   templates:
-    choose_enter_game: assets/startup-choose-enter-game.png
-    enter_game: assets/startup-enter-game.png
-    welkin_moon_logo: assets/startup-welkin-moon-logo.png
-    girl_moon: assets/startup-girl-moon.png
     confirm_black: assets/startup-confirm-black.png
-    confirm_white: assets/startup-confirm-white.png
     paimon_menu: assets/startup-paimon-menu.png
-    primogem: assets/startup-primogem.png
     wonderland_close: assets/startup-wonderland-close.png
-    wonderland_enter: assets/startup-wonderland-enter.png
-  enter_game_texts: [进入游戏, Enter Game, Start Game]
-  prompt_confirm_texts: [确认, 确定, 同意, OK]
-  wonderland_home_texts: [千星奇域, 奇域]
-  wonderland_enter_texts: [前往大厅, 进入大厅, 大厅]
-  choose_enter_game_region:
-    x: 700
-    y: 540
-    width: 520
-    height: 360
   enter_game_text_region:
-    x: 500
-    y: 560
-    width: 920
-    height: 480
-  loading_popup_region:
-    x: 560
-    y: 420
-    width: 800
-    height: 560
+    x: 900
+    y: 1000
+    width: 130
+    height: 40
   prompt_confirm_text_region:
-    x: 560
-    y: 500
-    width: 800
-    height: 420
+    x: 1400
+    y: 900
+    width: 100
+    height: 100
+  entered_wonderland_confirm_region:
+    x: 1100
+    y: 900
+    width: 100
+    height: 100
   main_ui_region:
     x: 0
     y: 0
     width: 480
     height: 270
-  wonderland_home_text_region:
-    x: 0
-    y: 0
-    width: 1920
-    height: 360
-  wonderland_enter_text_region:
-    x: 560
-    y: 620
-    width: 800
-    height: 360
   wonderland_close_region:
-    x: 0
+    x: 1780
     y: 0
-    width: 1920
-    height: 220
+    width: 140
+    height: 90
   wonderland_card_point:
     x: 680
     y: 310
@@ -946,13 +936,11 @@ unknown_root:
             .expect("migration needed");
 
         assert!(report.text.contains("# 兜底扫描注释"));
-        assert!(report.text.contains("config_version: 17"));
+        assert!(report.text.contains("config_version: 18"));
         assert!(report.text.contains("template_threshold: 0.8"));
-        assert!(
-            report
-                .text
-                .contains("choose_enter_game: assets/startup-choose-enter-game.png")
-        );
+        assert!(report.text.contains("enter_game_timeout_ms: 60000"));
+        assert!(report.text.contains("enter_game_text_region:"));
+        assert!(report.text.contains("x: 900"));
         assert!(report.text.contains("wonderland_close_region:"));
         assert!(report.text.contains("fallback_ms: 1234"));
         assert!(report.text.contains("loop_idle_ms: 77"));
@@ -1148,7 +1136,7 @@ templates:
 
     #[test]
     fn current_version_without_moved_fields_does_not_migrate() {
-        let current = r#"config_version: 17
+        let current = r#"config_version: 18
 timing:
   loop_idle_ms: 60
   chat_scan:
@@ -1186,7 +1174,7 @@ queue:
             .expect("migration succeeds")
             .expect("migration needed");
 
-        assert!(report.text.contains("config_version: 17"));
+        assert!(report.text.contains("config_version: 18"));
         assert!(
             report
                 .text
@@ -1239,7 +1227,7 @@ custom_workflows:
             .expect("migration succeeds")
             .expect("migration needed");
 
-        assert!(report.text.contains("config_version: 17"));
+        assert!(report.text.contains("config_version: 18"));
         assert!(report.text.contains("allow_args: false"));
         assert!(report.text.contains("message_types:"));
         assert!(report.text.contains("confirm_before_run: false"));
@@ -1315,7 +1303,7 @@ queue:
             .expect("migration succeeds")
             .expect("migration needed");
 
-        assert!(report.text.contains("config_version: 17"));
+        assert!(report.text.contains("config_version: 18"));
         assert!(report.text.contains("auto_advance_seconds: 1"));
     }
 
@@ -1330,7 +1318,7 @@ tui:
             .expect("migration succeeds")
             .expect("migration needed");
 
-        assert!(report.text.contains("config_version: 17"));
+        assert!(report.text.contains("config_version: 18"));
         assert!(report.text.contains("enabled: true"));
         assert!(report.text.contains("protect_auto_played_songs: true"));
     }

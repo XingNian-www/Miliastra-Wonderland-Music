@@ -23,7 +23,11 @@ pub struct AppConfig {
     pub tui: TuiConfig,
     pub state: StateConfig,
     pub queue: QueueConfig,
+    #[serde(default)]
+    pub song_dedup: SongDedupConfig,
     pub ai: AiConfig,
+    #[serde(default)]
+    pub song_review: SongReviewConfig,
     pub matching: MatchConfig,
     pub hotkeys: HotkeyConfig,
     pub startup: StartupConfig,
@@ -333,6 +337,28 @@ pub struct QueueConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SongDedupConfig {
+    pub enabled: bool,
+    pub window_seconds: u64,
+    pub max_count: u32,
+    pub console_bypass: bool,
+    pub history_path: PathBuf,
+}
+
+impl Default for SongDedupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            window_seconds: 3600,
+            max_count: 1,
+            console_bypass: true,
+            history_path: PathBuf::from("data/song-dedup-history.json"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CustomWorkflowConfig {
     pub enabled: bool,
     pub default_threshold: f32,
@@ -390,6 +416,62 @@ pub struct AiConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SongReviewConfig {
+    pub enabled: bool,
+    pub max_allowed_level: u8,
+    pub failure_policy: SongReviewFailurePolicy,
+    pub retry_count: u32,
+    pub retry_delay_ms: u64,
+    pub reply_reason_max_chars: usize,
+    #[serde(default = "default_song_review_policy_prompt")]
+    pub policy_prompt: String,
+    pub custom_prompt: String,
+    pub provider: SongReviewProviderConfig,
+}
+
+impl Default for SongReviewConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_allowed_level: 4,
+            failure_policy: SongReviewFailurePolicy::Reject,
+            retry_count: 2,
+            retry_delay_ms: 500,
+            reply_reason_max_chars: 40,
+            policy_prompt: default_song_review_policy_prompt(),
+            custom_prompt: String::new(),
+            provider: SongReviewProviderConfig::default(),
+        }
+    }
+}
+
+fn default_song_review_policy_prompt() -> String {
+    [
+        "审核目标：只通过整体听感偏舒缓、柔和、轻松、安静、治愈、抒情、慢节奏或中低强度的歌曲。",
+        "拒绝明显炸场、吵闹、压迫感强、节奏过快、情绪过激、强烈电子噪音、重金属、硬核、鬼畜、洗脑循环、尖锐喊叫、强烈攻击性或明显破坏房间氛围的歌曲。",
+        "请尽量使用联网搜索得到的曲风、歌词摘要、歌曲介绍和公开听感描述判断。",
+        "如果信息不足，请保守判断；不确定时应给较高强度等级，而不是因为歌曲热门、用户喜欢或歌手知名就放宽标准。",
+    ]
+    .join("\n")
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SongReviewFailurePolicy {
+    Reject,
+    Allow,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SongReviewProviderConfig {
+    pub endpoint: String,
+    pub api_key: String,
+    pub model: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MatchConfig {
     pub min_song_name_score: f64,
     pub short_chinese_song_max_miss: usize,
@@ -437,6 +519,7 @@ pub struct StartupConfig {
     pub launch_retries: u32,
     pub enter_game_timeout_ms: u64,
     pub enter_wonderland_timeout_ms: u64,
+    pub entered_wonderland_confirm_timeout_ms: Option<u64>,
     pub final_primary_timeout_ms: u64,
     pub poll_ms: u64,
     pub f6_retry_ms: u64,
@@ -445,33 +528,19 @@ pub struct StartupConfig {
     pub stable_changed_ratio_threshold: f32,
     pub template_threshold: f32,
     pub templates: StartupTemplateConfig,
-    pub enter_game_texts: Vec<String>,
-    pub prompt_confirm_texts: Vec<String>,
-    pub wonderland_home_texts: Vec<String>,
-    pub wonderland_enter_texts: Vec<String>,
-    pub choose_enter_game_region: RectConfig,
     pub enter_game_text_region: RectConfig,
-    pub loading_popup_region: RectConfig,
     pub prompt_confirm_text_region: RectConfig,
+    pub entered_wonderland_confirm_region: Option<RectConfig>,
     pub main_ui_region: RectConfig,
-    pub wonderland_home_text_region: RectConfig,
-    pub wonderland_enter_text_region: RectConfig,
     pub wonderland_close_region: RectConfig,
     pub wonderland_card_point: PointConfig,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StartupTemplateConfig {
-    pub choose_enter_game: PathBuf,
-    pub enter_game: PathBuf,
-    pub welkin_moon_logo: PathBuf,
-    pub girl_moon: PathBuf,
     pub confirm_black: PathBuf,
-    pub confirm_white: PathBuf,
     pub paimon_menu: PathBuf,
-    pub primogem: PathBuf,
     pub wonderland_close: PathBuf,
-    pub wonderland_enter: PathBuf,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

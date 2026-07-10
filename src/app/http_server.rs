@@ -30,7 +30,188 @@ use super::runtime_state::PersistentRuntimeState;
 
 const MAX_ACTIVE_CONNECTIONS: usize = 32;
 const PAGE: &str = include_str!("page.html");
-const KNOWN_ROUTES: &str = "/status, /play, /pause, /skip-next, /skip-prev, /volume, /startup/wonderland, /searchPlay, /searchSource, /search, /open-scheme, /history, /clear-history, /health, /monitor, /screenshot, /queue, /queue/add, /queue/remove, /queue/clear, /state, /state/save, /chat/send, /ai/recognize, /ai/match, /ai/pick, /ai/search";
+
+type RouteHandler =
+    fn(&[(String, String)], &HttpSharedState) -> std::result::Result<String, AppError>;
+
+struct RouteSpec {
+    path: &'static str,
+    json: bool,
+    mutating: bool,
+    handler: RouteHandler,
+}
+
+const SPECIAL_ROUTES: &[&str] = &["/screenshot"];
+const ROUTES: &[RouteSpec] = &[
+    RouteSpec {
+        path: "/status",
+        json: true,
+        mutating: false,
+        handler: status_route,
+    },
+    RouteSpec {
+        path: "/play",
+        json: true,
+        mutating: true,
+        handler: play_route,
+    },
+    RouteSpec {
+        path: "/pause",
+        json: true,
+        mutating: true,
+        handler: pause_route,
+    },
+    RouteSpec {
+        path: "/skip-next",
+        json: true,
+        mutating: true,
+        handler: skip_next_route,
+    },
+    RouteSpec {
+        path: "/skip-prev",
+        json: true,
+        mutating: true,
+        handler: skip_prev_route,
+    },
+    RouteSpec {
+        path: "/volume",
+        json: true,
+        mutating: true,
+        handler: volume_route,
+    },
+    RouteSpec {
+        path: "/startup/game",
+        json: true,
+        mutating: true,
+        handler: startup_game_route,
+    },
+    RouteSpec {
+        path: "/startup/wonderland",
+        json: true,
+        mutating: true,
+        handler: startup_wonderland_route,
+    },
+    RouteSpec {
+        path: "/startup/enter-wonderland",
+        json: true,
+        mutating: true,
+        handler: enter_wonderland_route,
+    },
+    RouteSpec {
+        path: "/searchPlay",
+        json: true,
+        mutating: true,
+        handler: search_play_route,
+    },
+    RouteSpec {
+        path: "/searchSource",
+        json: true,
+        mutating: true,
+        handler: search_source_route,
+    },
+    RouteSpec {
+        path: "/search",
+        json: false,
+        mutating: false,
+        handler: search_route,
+    },
+    RouteSpec {
+        path: "/open-scheme",
+        json: false,
+        mutating: true,
+        handler: open_scheme_route,
+    },
+    RouteSpec {
+        path: "/queue",
+        json: true,
+        mutating: false,
+        handler: queue_route,
+    },
+    RouteSpec {
+        path: "/queue/add",
+        json: true,
+        mutating: true,
+        handler: queue_add_route,
+    },
+    RouteSpec {
+        path: "/queue/remove",
+        json: true,
+        mutating: true,
+        handler: queue_remove_route,
+    },
+    RouteSpec {
+        path: "/queue/clear",
+        json: true,
+        mutating: true,
+        handler: queue_clear_route,
+    },
+    RouteSpec {
+        path: "/state",
+        json: true,
+        mutating: false,
+        handler: state_route,
+    },
+    RouteSpec {
+        path: "/state/save",
+        json: true,
+        mutating: true,
+        handler: state_save_route,
+    },
+    RouteSpec {
+        path: "/chat/send",
+        json: true,
+        mutating: true,
+        handler: chat_send_route,
+    },
+    RouteSpec {
+        path: "/ai/recognize",
+        json: true,
+        mutating: true,
+        handler: ai_recognize_route,
+    },
+    RouteSpec {
+        path: "/ai/match",
+        json: true,
+        mutating: true,
+        handler: ai_match_route,
+    },
+    RouteSpec {
+        path: "/ai/pick",
+        json: true,
+        mutating: true,
+        handler: ai_pick_route,
+    },
+    RouteSpec {
+        path: "/ai/search",
+        json: true,
+        mutating: true,
+        handler: ai_search_route,
+    },
+    RouteSpec {
+        path: "/history",
+        json: true,
+        mutating: false,
+        handler: history_route,
+    },
+    RouteSpec {
+        path: "/clear-history",
+        json: false,
+        mutating: true,
+        handler: clear_history_route,
+    },
+    RouteSpec {
+        path: "/monitor",
+        json: true,
+        mutating: false,
+        handler: monitor_route,
+    },
+    RouteSpec {
+        path: "/health",
+        json: false,
+        mutating: false,
+        handler: health_route,
+    },
+];
 
 #[derive(Clone)]
 pub struct HttpSharedState {
@@ -260,107 +441,265 @@ fn route(
     query: &[(String, String)],
     state: &HttpSharedState,
 ) -> std::result::Result<String, AppError> {
-    match path {
-        "/status" => {
-            let client = FeelUOwnClient::new(&state.config.feeluown, &state.config.timing);
-            serde_json::to_string(&client.status().map_err(internal_error)?).map_err(internal_error)
-        }
-        "/play" => enqueue_remote_command(
-            state,
-            remote_control_command("继续".to_string(), "继续", UserCommand::Resume),
-        ),
-        "/pause" => enqueue_remote_command(
-            state,
-            remote_control_command("暂停".to_string(), "暂停", UserCommand::Pause),
-        ),
-        "/skip-next" => enqueue_remote_command(
-            state,
-            remote_control_command("下一首".to_string(), "下一首", UserCommand::Next),
-        ),
-        "/skip-prev" => enqueue_remote_command(
-            state,
-            remote_control_command("上一首".to_string(), "上一首", UserCommand::Previous),
-        ),
-        "/volume" => {
-            let volume =
-                query_value(query, "volume").ok_or_else(|| bad_request("volume参数必须是0-100"))?;
-            if !is_valid_volume(volume) {
-                return Err(bad_request("volume参数必须是0-100"));
-            }
-            enqueue_remote_command(
-                state,
-                remote_control_command(
-                    format!("音量 {}", volume),
-                    "音量",
-                    UserCommand::Volume(volume.to_string()),
-                ),
-            )
-        }
-        "/startup/wonderland" => enqueue_startup_wonderland(state),
-        "/searchPlay" => enqueue_remote_song(query, state, false),
-        "/searchSource" => enqueue_remote_song(query, state, false),
-        "/search" => {
-            let keyword = normalize_keyword(query_value(query, "keyword"))?;
-            let source = normalize_optional_source(query_value(query, "source"))?;
-            let client = FeelUOwnClient::new(&state.config.feeluown, &state.config.timing);
-            client.search(&keyword, &source).map_err(internal_error)
-        }
-        "/open-scheme" => {
-            let uri = normalize_fuo_uri(query_value_or(query, "url", "uri"))?;
-            let client = FeelUOwnClient::new(&state.config.feeluown, &state.config.timing);
-            client.play_uri(uri.trim()).map_err(internal_error)?;
-            set_pause_flags(state, false, false)?;
-            Ok("已打开 FeelUOwn URI".to_string())
-        }
-        "/queue" => queue_json(state),
-        "/queue/add" => queue_add(query, state),
-        "/queue/remove" => queue_remove(query, state),
-        "/queue/clear" => queue_clear(state),
-        "/state" => state_json(state),
-        "/state/save" => state_save(query, state),
-        "/chat/send" => chat_send(query, state),
-        "/ai/recognize" => ai::recognize_with_query(&state.config.ai, &state.config.timing, query)
-            .map_err(|error| AppError {
-                status: if is_client_error(&error.to_string()) {
-                    400
-                } else {
-                    500
-                },
-                message: error.to_string(),
-            }),
-        "/ai/match" => {
-            ai::match_with_query(&state.config.ai, &state.config.timing, query).map_err(|error| {
-                AppError {
-                    status: if is_client_error(&error.to_string()) {
-                        400
-                    } else {
-                        500
-                    },
-                    message: error.to_string(),
-                }
-            })
-        }
-        "/ai/pick" => {
-            ai::pick_with_query(&state.config.ai, &state.config.timing, query).map_err(|error| {
-                AppError {
-                    status: if is_client_error(&error.to_string()) {
-                        400
-                    } else {
-                        500
-                    },
-                    message: error.to_string(),
-                }
-            })
-        }
-        "/ai/search" => enqueue_remote_song(query, state, true),
-        "/history" => history_json(state),
-        "/clear-history" => clear_history(state),
-        "/monitor" => monitor_json(state),
-        "/health" => Ok("OK".to_string()),
-        _ => Err(AppError {
+    if let Some(spec) = route_spec(path) {
+        (spec.handler)(query, state)
+    } else {
+        Err(AppError {
             status: 404,
-            message: format!("未知接口，可用: {}", KNOWN_ROUTES),
-        }),
+            message: format!("未知接口，可用: {}", known_routes()),
+        })
+    }
+}
+
+fn route_spec(path: &str) -> Option<&'static RouteSpec> {
+    ROUTES.iter().find(|route| route.path == path)
+}
+
+fn known_routes() -> String {
+    ROUTES
+        .iter()
+        .map(|route| route.path)
+        .chain(SPECIAL_ROUTES.iter().copied())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn status_route(
+    _query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let client = FeelUOwnClient::new(&state.config.feeluown, &state.config.timing);
+    serde_json::to_string(&client.status().map_err(internal_error)?).map_err(internal_error)
+}
+
+fn play_route(
+    _query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    enqueue_remote_command(
+        state,
+        remote_control_command("继续".to_string(), "继续", UserCommand::Resume),
+    )
+}
+
+fn pause_route(
+    _query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    enqueue_remote_command(
+        state,
+        remote_control_command("暂停".to_string(), "暂停", UserCommand::Pause),
+    )
+}
+
+fn skip_next_route(
+    _query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    enqueue_remote_command(
+        state,
+        remote_control_command("下一首".to_string(), "下一首", UserCommand::Next),
+    )
+}
+
+fn skip_prev_route(
+    _query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    enqueue_remote_command(
+        state,
+        remote_control_command("上一首".to_string(), "上一首", UserCommand::Previous),
+    )
+}
+
+fn volume_route(
+    query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let volume =
+        query_value(query, "volume").ok_or_else(|| bad_request("volume参数必须是0-100"))?;
+    if !is_valid_volume(volume) {
+        return Err(bad_request("volume参数必须是0-100"));
+    }
+    enqueue_remote_command(
+        state,
+        remote_control_command(
+            format!("音量 {}", volume),
+            "音量",
+            UserCommand::Volume(volume.to_string()),
+        ),
+    )
+}
+
+fn startup_game_route(
+    _query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    enqueue_startup_game(state)
+}
+
+fn startup_wonderland_route(
+    _query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    enqueue_startup_wonderland(state)
+}
+
+fn enter_wonderland_route(
+    _query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    enqueue_enter_wonderland(state)
+}
+
+fn search_play_route(
+    query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    enqueue_remote_song(query, state, false)
+}
+
+fn search_source_route(
+    query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    enqueue_remote_song(query, state, false)
+}
+
+fn search_route(
+    query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let keyword = normalize_keyword(query_value(query, "keyword"))?;
+    let source = normalize_optional_source(query_value(query, "source"))?;
+    let client = FeelUOwnClient::new(&state.config.feeluown, &state.config.timing);
+    client.search(&keyword, &source).map_err(internal_error)
+}
+
+fn open_scheme_route(
+    query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let uri = normalize_fuo_uri(query_value_or(query, "url", "uri"))?;
+    let client = FeelUOwnClient::new(&state.config.feeluown, &state.config.timing);
+    client.play_uri(uri.trim()).map_err(internal_error)?;
+    set_pause_flags(state, false, false)?;
+    Ok("已打开 FeelUOwn URI".to_string())
+}
+
+fn queue_route(
+    _query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    queue_json(state)
+}
+
+fn queue_add_route(
+    query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    queue_add(query, state)
+}
+
+fn queue_remove_route(
+    query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    queue_remove(query, state)
+}
+
+fn queue_clear_route(
+    _query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    queue_clear(state)
+}
+
+fn state_route(
+    _query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    state_json(state)
+}
+
+fn state_save_route(
+    query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    state_save(query, state)
+}
+
+fn chat_send_route(
+    query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    chat_send(query, state)
+}
+
+fn ai_recognize_route(
+    query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    ai::recognize_with_query(&state.config.ai, &state.config.timing, query).map_err(ai_route_error)
+}
+
+fn ai_match_route(
+    query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    ai::match_with_query(&state.config.ai, &state.config.timing, query).map_err(ai_route_error)
+}
+
+fn ai_pick_route(
+    query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    ai::pick_with_query(&state.config.ai, &state.config.timing, query).map_err(ai_route_error)
+}
+
+fn ai_search_route(
+    query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    enqueue_remote_song(query, state, true)
+}
+
+fn history_route(
+    _query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    history_json(state)
+}
+
+fn clear_history_route(
+    _query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    clear_history(state)
+}
+
+fn monitor_route(
+    _query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    monitor_json(state)
+}
+
+fn health_route(
+    _query: &[(String, String)],
+    _state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    Ok("OK".to_string())
+}
+
+fn ai_route_error(error: anyhow::Error) -> AppError {
+    AppError {
+        status: if is_client_error(&error.to_string()) {
+            400
+        } else {
+            500
+        },
+        message: error.to_string(),
     }
 }
 
@@ -380,20 +719,60 @@ fn enqueue_remote_command(
     .to_string())
 }
 
-fn enqueue_startup_wonderland(state: &HttpSharedState) -> std::result::Result<String, AppError> {
-    let position = enqueue_pending_task(
+fn enqueue_startup_game(state: &HttpSharedState) -> std::result::Result<String, AppError> {
+    enqueue_startup_task_response(
         state,
-        super::PendingTask::StartAndEnterWonderland {
+        "启动游戏",
+        [super::PendingTask::StartGame {
             source: "远程指挥台",
-        },
-    )?;
-    Ok(json!({
+        }],
+    )
+}
+
+fn enqueue_enter_wonderland(state: &HttpSharedState) -> std::result::Result<String, AppError> {
+    enqueue_startup_task_response(
+        state,
+        "进入千星",
+        [super::PendingTask::EnterWonderland {
+            source: "远程指挥台",
+        }],
+    )
+}
+
+fn enqueue_startup_wonderland(state: &HttpSharedState) -> std::result::Result<String, AppError> {
+    enqueue_startup_task_response(
+        state,
+        "启动游戏并进入千星",
+        [
+            super::PendingTask::StartGame {
+                source: "远程指挥台",
+            },
+            super::PendingTask::EnterWonderland {
+                source: "远程指挥台",
+            },
+        ],
+    )
+}
+
+fn enqueue_startup_task_response<const N: usize>(
+    state: &HttpSharedState,
+    task_label: &'static str,
+    tasks: [super::PendingTask; N],
+) -> std::result::Result<String, AppError> {
+    let positions = enqueue_pending_tasks(state, tasks)?;
+    let mut response = json!({
         "ok": true,
         "queued": true,
-        "position": position,
-        "task": "自动启动并进入千星",
-    })
-    .to_string())
+        "task": task_label,
+    });
+    if let Some(object) = response.as_object_mut() {
+        if positions.len() == 1 {
+            object.insert("position".to_string(), json!(positions[0]));
+        } else {
+            object.insert("positions".to_string(), json!(positions));
+        }
+    }
+    Ok(response.to_string())
 }
 
 fn remote_control_command(raw: String, matched: &str, command: UserCommand) -> PendingCommand {
@@ -527,6 +906,7 @@ fn queue_add(
             ai_original_text,
             uri,
             friend_username: String::new(),
+            dedup_bypass: true,
         })
         .map_err(internal_error)?
     {
@@ -721,6 +1101,23 @@ fn enqueue_pending_task(
     let position = guard.len();
     cvar.notify_one();
     Ok(position)
+}
+
+fn enqueue_pending_tasks<const N: usize>(
+    state: &HttpSharedState,
+    tasks: [super::PendingTask; N],
+) -> std::result::Result<Vec<usize>, AppError> {
+    let (lock, cvar) = &*state.pending;
+    let mut guard = lock
+        .lock()
+        .map_err(|_| internal_message("待处理任务队列锁已损坏"))?;
+    let mut positions = Vec::with_capacity(N);
+    for task in tasks {
+        guard.push_back(task);
+        positions.push(guard.len());
+    }
+    cvar.notify_one();
+    Ok(positions)
 }
 
 fn enqueue_pending_command(
@@ -1008,31 +1405,7 @@ fn current_time_text() -> String {
 }
 
 fn is_json_route(path: &str) -> bool {
-    matches!(
-        path,
-        "/status"
-            | "/play"
-            | "/pause"
-            | "/skip-next"
-            | "/skip-prev"
-            | "/volume"
-            | "/startup/wonderland"
-            | "/queue"
-            | "/queue/add"
-            | "/queue/remove"
-            | "/queue/clear"
-            | "/searchPlay"
-            | "/searchSource"
-            | "/state"
-            | "/state/save"
-            | "/chat/send"
-            | "/ai/recognize"
-            | "/ai/match"
-            | "/ai/pick"
-            | "/ai/search"
-            | "/history"
-            | "/monitor"
-    )
+    route_spec(path).is_some_and(|route| route.json)
 }
 
 fn enforce_method(
@@ -1049,28 +1422,7 @@ fn enforce_method(
 }
 
 fn is_mutating_route(path: &str) -> bool {
-    matches!(
-        path,
-        "/play"
-            | "/pause"
-            | "/skip-next"
-            | "/skip-prev"
-            | "/volume"
-            | "/startup/wonderland"
-            | "/searchPlay"
-            | "/searchSource"
-            | "/open-scheme"
-            | "/queue/add"
-            | "/queue/remove"
-            | "/queue/clear"
-            | "/state/save"
-            | "/chat/send"
-            | "/ai/recognize"
-            | "/ai/match"
-            | "/ai/pick"
-            | "/ai/search"
-            | "/clear-history"
-    )
+    route_spec(path).is_some_and(|route| route.mutating)
 }
 
 fn status_code(status: u16) -> StatusCode {
@@ -1346,10 +1698,16 @@ mod tests {
     }
 
     #[test]
-    fn startup_wonderland_route_is_queued_json_post_route() {
+    fn startup_routes_are_queued_json_post_routes() {
+        assert!(is_mutating_route("/startup/game"));
         assert!(is_mutating_route("/startup/wonderland"));
+        assert!(is_mutating_route("/startup/enter-wonderland"));
+        assert!(is_json_route("/startup/game"));
         assert!(is_json_route("/startup/wonderland"));
+        assert!(is_json_route("/startup/enter-wonderland"));
+        assert!(PAGE.contains("call('/startup/game','POST')"));
         assert!(PAGE.contains("call('/startup/wonderland','POST')"));
+        assert!(PAGE.contains("call('/startup/enter-wonderland','POST')"));
     }
 
     #[test]

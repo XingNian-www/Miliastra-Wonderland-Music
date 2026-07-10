@@ -1102,8 +1102,22 @@ fn chat_send(
     state: &HttpSharedState,
 ) -> std::result::Result<String, AppError> {
     let text = normalize_required_text(query_value(query, "text"), "text")?;
-    let message = format!("[控制台]: {}", text);
-    let position = enqueue_pending_task(state, super::PendingTask::ConsoleChat { text })?;
+    let use_prefix = parse_bool_default(
+        query_value(query, "usePrefix")
+            .or_else(|| query_value(query, "prefixEnabled"))
+            .or_else(|| query_value(query, "withPrefix")),
+        true,
+    );
+    let prefix = if use_prefix {
+        normalize_optional_raw_text(
+            query_value(query, "prefix").or(Some("[控制台]: ")),
+            "prefix",
+        )?
+    } else {
+        String::new()
+    };
+    let message = format!("{}{}", prefix, text);
+    let position = enqueue_pending_task(state, super::PendingTask::ConsoleChat { text, prefix })?;
     Ok(json!({ "ok": true, "queued": true, "position": position, "message": message }).to_string())
 }
 
@@ -1308,6 +1322,13 @@ fn normalize_optional_text(
         .to_string())
 }
 
+fn normalize_optional_raw_text(
+    value: Option<&str>,
+    name: &str,
+) -> std::result::Result<String, AppError> {
+    assert_no_control_chars(value.unwrap_or(""), name)
+}
+
 fn normalize_required_text(
     value: Option<&str>,
     name: &str,
@@ -1342,6 +1363,10 @@ fn is_valid_volume(value: &str) -> bool {
 
 fn parse_bool(value: Option<&str>) -> bool {
     matches!(value.unwrap_or(""), "1" | "true" | "yes" | "on")
+}
+
+fn parse_bool_default(value: Option<&str>, default: bool) -> bool {
+    value.map_or(default, |value| parse_bool(Some(value)))
 }
 
 fn parse_jpeg_quality(value: Option<&str>) -> std::result::Result<u8, AppError> {
@@ -1773,6 +1798,60 @@ mod tests {
         assert!(PAGE.contains("refreshPlayer()"));
         assert!(PAGE.contains("cache:'no-store'"));
         assert!(!PAGE.contains("onclick=\"loadMonitor()\""));
+    }
+
+    #[test]
+    fn web_inputs_support_enter_submit() {
+        assert!(PAGE.contains("function isPlainEnter(e)"));
+        assert!(PAGE.contains("!e.isComposing"));
+        assert!(PAGE.contains("bindEnter('consoleChatText',sendConsoleChat)"));
+        assert!(PAGE.contains("bindEnter('consoleChatPrefix',sendConsoleChat)"));
+        assert!(PAGE.contains("bindEnter('keyword',()=>remoteSong(false))"));
+        assert!(PAGE.contains("bindEnter('volumeInput',setVolume)"));
+        assert!(PAGE.contains("bindEnter('removeIndex',queueRemove)"));
+    }
+
+    #[test]
+    fn console_chat_prefix_can_be_configured() {
+        let state = test_state();
+
+        let default_body = chat_send_route(&[("text".to_string(), "你好".to_string())], &state)
+            .expect("default prefix");
+        let default_value: Value = serde_json::from_str(&default_body).expect("json response");
+        assert_eq!(default_value["message"], "[控制台]: 你好");
+
+        let custom_body = chat_send_route(
+            &[
+                ("text".to_string(), "你好".to_string()),
+                ("prefix".to_string(), "[远程] ".to_string()),
+            ],
+            &state,
+        )
+        .expect("custom prefix");
+        let custom_value: Value = serde_json::from_str(&custom_body).expect("json response");
+        assert_eq!(custom_value["message"], "[远程] 你好");
+
+        let raw_body = chat_send_route(
+            &[
+                ("text".to_string(), "你好".to_string()),
+                ("usePrefix".to_string(), "0".to_string()),
+                ("prefix".to_string(), "[远程] ".to_string()),
+            ],
+            &state,
+        )
+        .expect("no prefix");
+        let raw_value: Value = serde_json::from_str(&raw_body).expect("json response");
+        assert_eq!(raw_value["message"], "你好");
+
+        let labels = pending_task_labels(&state).expect("pending labels");
+        assert_eq!(
+            labels,
+            vec![
+                "控制台发言: [控制台]: 你好",
+                "控制台发言: [远程] 你好",
+                "控制台发言: 你好",
+            ]
+        );
     }
 
     #[test]

@@ -492,7 +492,7 @@ http://127.0.0.1:18888
 | `/history` | 查看最近 30 条接口调用记录 |
 | `/clear-history` | 清空接口调用记录 |
 | `/monitor` | 查看监控面板数据 |
-| `/chat/send?text=...` | 控制台发言入主业务队列 |
+| `/chat/send?text=...&usePrefix=1&prefix=...` | 控制台发言入主业务队列；默认带 `[控制台]: ` 前缀，可关闭或自定义 |
 | `/screenshot?quality=88` | 手动获取一次游戏截图，返回 JPEG |
 | `/health` | 健康检查 |
 | `/ai/recognize` | AI 文本识别测试 |

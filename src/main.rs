@@ -712,6 +712,7 @@ mod app {
         },
         ConsoleChat {
             text: String,
+            prefix: String,
         },
         StartGame {
             source: &'static str,
@@ -734,7 +735,9 @@ mod app {
                 }
                 Self::Command(pending) => pending.parsed.raw.clone(),
                 Self::AdvanceQueue { reason } => format!("自动出队({})", reason),
-                Self::ConsoleChat { text } => format!("控制台发言: {}", text),
+                Self::ConsoleChat { text, prefix } => {
+                    format!("控制台发言: {}{}", prefix, text)
+                }
                 Self::StartGame { source } => format!("启动游戏({})", source),
                 Self::EnterWonderland { source } => format!("进入千星({})", source),
                 Self::ModerationVoteResult {
@@ -1651,7 +1654,9 @@ mod app {
                     self.execute_pending_command(*pending)
                 }
                 PendingTask::AdvanceQueue { reason } => self.execute_advance_queue_task(reason),
-                PendingTask::ConsoleChat { text } => self.execute_console_chat_task(text),
+                PendingTask::ConsoleChat { text, prefix } => {
+                    self.execute_console_chat_task(text, prefix)
+                }
                 PendingTask::StartGame { source } => self.execute_start_game_task(source),
                 PendingTask::EnterWonderland { source } => {
                     self.execute_enter_wonderland_task(source)
@@ -1702,19 +1707,19 @@ mod app {
             Ok(PrepareUiFailureAction::Requeue)
         }
 
-        fn execute_console_chat_task(&mut self, text: String) -> Result<()> {
-            let message = format!("[控制台]: {}", text);
+        fn execute_console_chat_task(&mut self, text: String, prefix: String) -> Result<()> {
+            let message = format!("{}{}", prefix, text);
             match self.prepare_command_ui(&message) {
                 Ok(true) => {}
                 Ok(false) => {
                     log::info!("控制台发言前未能回到一级界面，保留任务: {}", text);
-                    self.push_pending_task_front(PendingTask::ConsoleChat { text })?;
+                    self.push_pending_task_front(PendingTask::ConsoleChat { text, prefix })?;
                     return Ok(());
                 }
                 Err(error) => match self.handle_prepare_ui_error("控制台发言前", &text, error)?
                 {
                     PrepareUiFailureAction::Requeue => {
-                        self.push_pending_task_front(PendingTask::ConsoleChat { text })?;
+                        self.push_pending_task_front(PendingTask::ConsoleChat { text, prefix })?;
                         return Ok(());
                     }
                 },

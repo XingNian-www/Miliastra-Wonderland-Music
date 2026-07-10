@@ -40,7 +40,8 @@ button,input,select,textarea{font:inherit}
 .controls{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}
 .row{display:flex;gap:6px;align-items:center}
 .row.wrap{flex-wrap:wrap}
-.ocr-send{display:grid;grid-template-columns:minmax(0,1fr) 92px;gap:6px;border-top:1px solid #2d3530;margin-top:8px;padding-top:8px}
+.ocr-options{display:grid;grid-template-columns:92px minmax(0,1fr);gap:6px;align-items:center;border-top:1px solid #2d3530;margin-top:8px;padding-top:8px}
+.ocr-send{display:grid;grid-template-columns:minmax(0,1fr) 92px;gap:6px;margin-top:6px}
 input,select,textarea{width:100%;border:1px solid #3a4540;background:#101211;color:#f3f6f4;border-radius:8px;padding:7px 8px;outline:none}
 textarea{min-height:74px;resize:vertical}
 input:focus,select:focus,textarea:focus{border-color:#2dd4bf}
@@ -69,7 +70,7 @@ input:focus,select:focus,textarea:focus{border-color:#2dd4bf}
 .modal-body img{max-width:none;height:auto;background:#000;border:1px solid #2d3530}
 .hidden{display:none!important}
 @media(max-width:1050px){.layout{grid-template-columns:1fr}.topbar{grid-template-columns:1fr}.status-strip{grid-template-columns:repeat(2,minmax(0,1fr))}.top-actions{justify-content:flex-start}.sidebar{display:grid;grid-template-columns:1fr 1fr}.monitor{grid-template-columns:1fr}}
-@media(max-width:720px){.shell{padding:10px}.status-strip{grid-template-columns:1fr 1fr}.sidebar{display:flex}.controls,.two,.three,.compact-form,.ocr-send{grid-template-columns:1fr}.monitor{gap:10px}}
+@media(max-width:720px){.shell{padding:10px}.status-strip{grid-template-columns:1fr 1fr}.sidebar{display:flex}.controls,.two,.three,.compact-form,.ocr-send,.ocr-options{grid-template-columns:1fr}.monitor{gap:10px}}
 </style>
 </head>
 <body>
@@ -97,6 +98,10 @@ input:focus,select:focus,textarea:focus{border-color:#2dd4bf}
         <div class="panel-head"><h2>OCR 聊天</h2><small id="ocrMeta">暂无采样</small></div>
         <div class="panel-body">
           <pre class="scroll" id="monitorOcr">暂无 OCR 内容</pre>
+          <div class="ocr-options">
+            <label class="switch-line"><input id="consoleChatUsePrefix" type="checkbox" checked>前缀</label>
+            <input id="consoleChatPrefix" value="[控制台]: " placeholder="发言前缀">
+          </div>
           <div class="ocr-send">
             <input id="consoleChatText" placeholder="发送到游戏聊天">
             <button class="btn primary" onclick="sendConsoleChat()">发送</button>
@@ -244,6 +249,16 @@ function queryText(q){const rows=Object.entries(q||{}).filter(([,v])=>v!=null&&S
 function preferParam(){return $('preferAccompaniment').checked?'&preferAccompaniment=1':''}
 function keyword(){return $('keyword').value.trim()}
 function source(){return $('sourceSelect').value}
+function isPlainEnter(e){return e.key==='Enter'&&!e.shiftKey&&!e.ctrlKey&&!e.altKey&&!e.metaKey&&!e.isComposing&&e.keyCode!==229}
+function bindEnter(id,handler){
+  const el=$(id)
+  if(!el)return
+  el.addEventListener('keydown',(e)=>{
+    if(!isPlainEnter(e))return
+    e.preventDefault()
+    handler()
+  })
+}
 async function request(url,method){
   const r=await fetch(url,{method:method||'GET',cache:'no-store'})
   const text=await r.text()
@@ -318,7 +333,10 @@ async function loadQueue(){await call('/queue')}
 async function sendConsoleChat(){
   const text=$('consoleChatText').value.trim()
   if(!text){setResult('请输入发送内容');return}
-  await call('/chat/send?text='+encodeURIComponent(text),'POST')
+  const usePrefix=$('consoleChatUsePrefix').checked
+  let url='/chat/send?text='+encodeURIComponent(text)+'&usePrefix='+(usePrefix?'1':'0')
+  if(usePrefix)url+='&prefix='+encodeURIComponent($('consoleChatPrefix').value)
+  await call(url,'POST')
   $('consoleChatText').value=''
 }
 async function loadScreenshot(){
@@ -400,6 +418,11 @@ async function refreshAll(){
   const failed=results.find((item)=>item.status==='rejected')
   if(failed)setResult('刷新失败: '+failed.reason.message)
 }
+bindEnter('consoleChatText',sendConsoleChat)
+bindEnter('consoleChatPrefix',sendConsoleChat)
+bindEnter('keyword',()=>remoteSong(false))
+bindEnter('volumeInput',setVolume)
+bindEnter('removeIndex',queueRemove)
 refreshAll()
 setInterval(()=>{if(!refreshPaused)loadMonitor()},1000)
 </script>

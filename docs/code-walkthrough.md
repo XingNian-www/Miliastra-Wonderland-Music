@@ -340,7 +340,7 @@ flowchart TD
 
 - `/play`、`/pause`、`/skip-next`、`/skip-prev`、`/volume` 会构造控制台命令进入待执行任务队列。
 - `/searchPlay`、`/searchSource`、`/ai/search` 会构造控制台点歌命令进入待执行任务队列。
-- `/chat/send` 会构造 `PendingTask::ConsoleChat`，最终在游戏聊天里发送 `[控制台]: 文本`。
+- `/chat/send` 会构造 `PendingTask::ConsoleChat`，最终在游戏聊天里发送文本；默认带 `[控制台]: ` 前缀，控制面板可以关闭或自定义前缀。
 - `/startup/game` 入队启动游戏任务。
 - `/startup/enter-wonderland` 入队进入千星任务。
 - `/startup/wonderland` 按顺序入队启动游戏任务和进入千星任务。

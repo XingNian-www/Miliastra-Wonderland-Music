@@ -29,7 +29,7 @@ flowchart TD
 | --- | --- | --- |
 | `Command(Box<PendingCommand>)` | 游戏聊天 OCR、Web 远程播放控制、Web 远程点歌 | 执行业务命令 |
 | `AdvanceQueue` | 播放监控线程 | 从音乐播放队列取下一首 |
-| `ConsoleChat` | Web 聊天发送框 | 向当前游戏聊天发送 `[控制台]: ...` |
+| `ConsoleChat` | Web 聊天发送框 | 向当前游戏聊天发送文本，前缀由控制面板决定 |
 | `StartGame` | 启动配置、Web 面板 | 启动游戏并完成开门 |
 | `EnterWonderland` | 启动配置、Web 面板 | 从主界面进入千星 |
 | `ModerationVoteResult` | 管理投票后台线程 | 投票结束后执行或拒绝拉黑/屏蔽 |

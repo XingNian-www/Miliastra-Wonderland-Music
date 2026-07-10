@@ -110,7 +110,7 @@ HTTP 层只接受 `GET`、`POST`、`OPTIONS`。
 
 | 接口 | 入队任务 |
 | --- | --- |
-| `/chat/send` | `PendingTask::ConsoleChat`，执行时发送 `[控制台]: 文本`。 |
+| `/chat/send` | `PendingTask::ConsoleChat`，执行时发送文本；默认前缀是 `[控制台]: `，可用 `usePrefix=0` 关闭，或用 `prefix=...` 自定义。 |
 | `/startup/game` | `PendingTask::StartGame`。 |
 | `/startup/enter-wonderland` | `PendingTask::EnterWonderland`。 |
 | `/startup/wonderland` | 依次入队 `StartGame` 和 `EnterWonderland`。 |

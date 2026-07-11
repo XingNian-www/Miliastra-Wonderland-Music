@@ -35,7 +35,25 @@ pub enum UserCommand {
     DisableCommands { username: String },
     EnableCommands { username: String },
     IdleExit { minutes: u32 },
+    ChatListenerMode(ChatListenerModeCommand),
     CustomWorkflow(CustomWorkflowCommand),
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ChatListenerModeCommand {
+    Primary,
+    Secondary,
+    Status,
+}
+
+impl ChatListenerModeCommand {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Primary => "一级",
+            Self::Secondary => "二级",
+            Self::Status => "状态",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -191,6 +209,23 @@ fn parse_pink_text(text: &str) -> Option<ParsedCommand> {
     let raw_command_text = after_sep.trim_start_matches(['：', ':', ' ', '\t', ']', '】']);
     let user_command = user_command_text(raw_command_text);
     let command_text = raw_command_text.strip_prefix('@')?.trim_start();
+    if let Some(rest) = strip_ascii_case_prefix(command_text, "监听模式") {
+        let value = rest.trim_start_matches(['：', ':', ' ', '\t']).trim();
+        let mode = match value {
+            "一级" => ChatListenerModeCommand::Primary,
+            "二级" => ChatListenerModeCommand::Secondary,
+            "状态" => ChatListenerModeCommand::Status,
+            _ => return None,
+        };
+        return Some(ParsedCommand {
+            matched: "监听模式".to_string(),
+            raw: format!("监听模式 {}", mode.label()),
+            user_command,
+            message_type: "pink".to_string(),
+            username,
+            command: UserCommand::ChatListenerMode(mode),
+        });
+    }
     if let Some(song) = parse_pink_song_command(command_text, &username) {
         return Some(ParsedCommand {
             matched: song.prefix.clone(),
@@ -458,6 +493,9 @@ fn same_user_command(left: &UserCommand, right: &UserCommand) -> bool {
         (UserCommand::IdleExit { minutes: left }, UserCommand::IdleExit { minutes: right }) => {
             left == right
         }
+        (UserCommand::ChatListenerMode(left), UserCommand::ChatListenerMode(right)) => {
+            left == right
+        }
         (UserCommand::CustomWorkflow(left), UserCommand::CustomWorkflow(right)) => {
             identity_text(&left.workflow) == identity_text(&right.workflow)
                 && identity_text(&left.args) == identity_text(&right.args)
@@ -519,6 +557,7 @@ fn command_lock_key(command: &UserCommand) -> String {
         UserCommand::DisableCommands { username: _ } => "disable_commands".to_string(),
         UserCommand::EnableCommands { username: _ } => "enable_commands".to_string(),
         UserCommand::IdleExit { minutes } => format!("idle_exit:{}", minutes),
+        UserCommand::ChatListenerMode(mode) => format!("chat_listener:{}", mode.label()),
         UserCommand::CustomWorkflow(command) => {
             format!(
                 "custom_workflow:{}:{}",
@@ -1176,6 +1215,27 @@ mod tests {
                 friend_username: "Alice".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn parses_pink_chat_listener_mode_commands_only() {
+        let primary = parse_text("[Alice]：@监听模式 一级", "pink").expect("primary mode");
+        let secondary = parse_text("[Alice]：@监听模式：二级", "pink").expect("secondary mode");
+        let status = parse_text("[Alice]：@监听模式 状态", "pink").expect("mode status");
+
+        assert_eq!(
+            primary.command,
+            UserCommand::ChatListenerMode(ChatListenerModeCommand::Primary)
+        );
+        assert_eq!(
+            secondary.command,
+            UserCommand::ChatListenerMode(ChatListenerModeCommand::Secondary)
+        );
+        assert_eq!(
+            status.command,
+            UserCommand::ChatListenerMode(ChatListenerModeCommand::Status)
+        );
+        assert!(parse_text("大厅：@监听模式 二级", "blue").is_none());
     }
 
     #[test]

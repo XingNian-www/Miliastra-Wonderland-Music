@@ -80,6 +80,10 @@ impl UiState {
     pub(super) fn is_primary(&self) -> bool {
         self.state == UiStateKind::Primary
     }
+
+    pub(super) fn is_secondary(&self) -> bool {
+        self.state == UiStateKind::Secondary
+    }
 }
 
 impl std::fmt::Display for UiState {

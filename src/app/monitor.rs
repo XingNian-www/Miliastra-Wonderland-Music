@@ -32,6 +32,13 @@ pub(super) struct MonitorPlaybackController {
     pub(super) last_observation_reliability: String,
 }
 
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct MonitorChatListener {
+    pub(super) mode: String,
+    pub(super) pending_mode: String,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct MonitorSnapshot {
@@ -41,6 +48,7 @@ pub(super) struct MonitorSnapshot {
     pub(super) commands: Vec<String>,
     pub(super) status: String,
     pub(super) playback_controller: MonitorPlaybackController,
+    pub(super) chat_listener: MonitorChatListener,
 }
 
 #[derive(Clone)]
@@ -62,6 +70,7 @@ struct MonitorState {
     commands: VecDeque<String>,
     status: String,
     playback_controller: MonitorPlaybackController,
+    chat_listener: MonitorChatListener,
 }
 
 impl MonitorShared {
@@ -75,6 +84,7 @@ impl MonitorShared {
                 commands: VecDeque::new(),
                 status: "启动中".to_string(),
                 playback_controller: MonitorPlaybackController::default(),
+                chat_listener: MonitorChatListener::default(),
             })),
         }
     }
@@ -137,6 +147,15 @@ impl MonitorShared {
         }
     }
 
+    pub(super) fn set_chat_listener(&self, mode: impl Into<String>, pending_mode: Option<String>) {
+        if let Ok(mut state) = self.state.lock() {
+            state.chat_listener = MonitorChatListener {
+                mode: mode.into(),
+                pending_mode: pending_mode.unwrap_or_default(),
+            };
+        }
+    }
+
     pub(super) fn snapshot(&self) -> MonitorSnapshot {
         self.state.lock().map_or_else(
             |_| MonitorSnapshot {
@@ -146,6 +165,7 @@ impl MonitorShared {
                 commands: Vec::new(),
                 status: "监控状态不可用".to_string(),
                 playback_controller: MonitorPlaybackController::default(),
+                chat_listener: MonitorChatListener::default(),
             },
             |state| MonitorSnapshot {
                 logs: state.logs.iter().cloned().collect(),
@@ -154,6 +174,7 @@ impl MonitorShared {
                 commands: state.commands.iter().cloned().collect(),
                 status: state.status.clone(),
                 playback_controller: state.playback_controller.clone(),
+                chat_listener: state.chat_listener.clone(),
             },
         )
     }

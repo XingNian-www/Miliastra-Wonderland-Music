@@ -7,6 +7,7 @@ fn main() {
 mod app {
     mod ai;
     mod change_detection;
+    mod chat_listener;
     mod chat_output;
     mod chat_scan;
     mod clipboard;
@@ -58,11 +59,19 @@ mod app {
         ChangeFingerprint, change_stats, configured_chat_change_fingerprint,
         rect_chat_change_fingerprint,
     };
+    use self::chat_listener::{
+        ChatListenerMode, ChatListenerShared, SecondaryChatIdentity, SecondaryHallBubble,
+        UnreadFriendHit, classify_title, find_unread_friend_hits, hall_bubble_sequence_overlap,
+        latest_incoming_bubble_rect, latest_incoming_fingerprint, secondary_hall_bubbles,
+        unread_hit_still_visible,
+    };
     use self::chat_output::ChatOutput;
     use self::chat_scan::{
         ChatMessage, count_chat_markers, prepare_chat_scan, recognize_prepared_chat, scan_chat,
     };
-    use self::command::{CommandLockState, ParsedCommand, PendingCommand, UserCommand};
+    use self::command::{
+        ChatListenerModeCommand, CommandLockState, ParsedCommand, PendingCommand, UserCommand,
+    };
     use self::config::{AppConfig, PointConfig};
     use self::decision_lock::DecisionScreenLock;
     use self::feeluown::{FeelUOwnClient, PlayerStatus, format_lyrics, format_status};
@@ -73,7 +82,7 @@ mod app {
         format_hall_remaining_suffix, merge_hall_info_samples, parse_hall_remaining_minutes,
     };
     use self::input_actions::{click_game_point, parse_key, press_key, run_or_print};
-    use self::monitor::{MonitorQueueItem, MonitorShared};
+    use self::monitor::{MonitorQueueItem, MonitorShared, OcrSnapshot};
     use self::ocr::{OcrArgs, make_ocr_engine, merged_ocr_text, recognize_lines};
     use self::playback_format::{
         PlaybackSnapshot, estimated_player_status, format_play_message, is_playing, song_title,
@@ -621,6 +630,7 @@ mod app {
         command_executing: Arc<AtomicBool>,
         song_command_executing: Arc<AtomicBool>,
         console_reply_context: Arc<AtomicBool>,
+        chat_listener: ChatListenerShared,
         monitor: MonitorShared,
     }
 
@@ -725,6 +735,14 @@ mod app {
             approved: bool,
             workflow_key: String,
         },
+        SetChatListenerMode {
+            target: ChatListenerMode,
+        },
+        SecondaryUnread {
+            hit: UnreadFriendHit,
+            discard_only: bool,
+        },
+        RestoreSecondaryHall,
     }
 
     impl PendingTask {
@@ -748,6 +766,17 @@ mod app {
                     command.uid,
                     if *approved { "通过" } else { "未通过" }
                 ),
+                Self::SetChatListenerMode { target } => {
+                    format!("切换{}", target.label())
+                }
+                Self::SecondaryUnread { discard_only, .. } => {
+                    if *discard_only {
+                        "二级监听初始未读清场".to_string()
+                    } else {
+                        "二级监听好友未读".to_string()
+                    }
+                }
+                Self::RestoreSecondaryHall => "二级监听恢复当前大厅".to_string(),
             }
         }
 
@@ -765,6 +794,9 @@ mod app {
                             if parsed_command.action == command.action && parsed_command.uid == command.uid
                     )
                 }
+                Self::SetChatListenerMode { .. }
+                | Self::SecondaryUnread { .. }
+                | Self::RestoreSecondaryHall => false,
             }
         }
 
@@ -783,7 +815,26 @@ mod app {
                 Self::ConsoleChat { .. }
                 | Self::StartGame { .. }
                 | Self::EnterWonderland { .. }
+                | Self::ModerationVoteResult { .. }
+                | Self::SetChatListenerMode { .. }
+                | Self::SecondaryUnread { .. }
+                | Self::RestoreSecondaryHall => false,
+            }
+        }
+
+        fn restores_secondary_listener_after_success(&self) -> bool {
+            match self {
+                Self::SetChatListenerMode { .. }
+                | Self::SecondaryUnread { .. }
+                | Self::RestoreSecondaryHall
                 | Self::ModerationVoteResult { .. } => false,
+                Self::Command(pending) => {
+                    !matches!(pending.parsed.command, UserCommand::Moderation(_))
+                }
+                Self::AdvanceQueue { .. }
+                | Self::ConsoleChat { .. }
+                | Self::StartGame { .. }
+                | Self::EnterWonderland { .. } => true,
             }
         }
     }
@@ -897,6 +948,7 @@ mod app {
                 command_executing: Arc::new(AtomicBool::new(false)),
                 song_command_executing: Arc::new(AtomicBool::new(false)),
                 console_reply_context: Arc::new(AtomicBool::new(false)),
+                chat_listener: ChatListenerShared::new(),
                 monitor,
             })
         }
@@ -905,6 +957,7 @@ mod app {
             self.monitor.set_status("运行中");
             self.update_monitor_queue_snapshot();
             self.update_monitor_playback_controller();
+            self.update_monitor_chat_listener();
             self.warn_if_screen_size_mismatch()?;
             self.start_http_server()?;
             self.start_hotkeys()?;
@@ -955,6 +1008,7 @@ mod app {
                 command_executing: self.command_executing.clone(),
                 song_command_executing: self.song_command_executing.clone(),
                 console_reply_context: self.console_reply_context.clone(),
+                chat_listener: self.chat_listener.clone(),
                 monitor: self.monitor.clone(),
             };
             thread::spawn(move || {
@@ -990,6 +1044,7 @@ mod app {
                 command_executing: self.command_executing.clone(),
                 song_command_executing: self.song_command_executing.clone(),
                 console_reply_context: self.console_reply_context.clone(),
+                chat_listener: self.chat_listener.clone(),
                 monitor: self.monitor.clone(),
             };
             thread::spawn(move || {
@@ -1023,6 +1078,7 @@ mod app {
                 command_executing: self.command_executing.clone(),
                 song_command_executing: self.song_command_executing.clone(),
                 console_reply_context: self.console_reply_context.clone(),
+                chat_listener: self.chat_listener.clone(),
                 monitor: self.monitor.clone(),
             }
         }
@@ -1126,6 +1182,7 @@ mod app {
                 Arc::clone(&self.queue),
                 Arc::clone(&self.runtime_state),
                 Arc::clone(&self.pending),
+                self.chat_listener.clone(),
                 self.monitor.clone(),
             ))
         }
@@ -1156,6 +1213,10 @@ mod app {
             let mut force_scan_after: Option<Instant> = None;
             let mut force_scan_reason: Option<&'static str> = None;
             let mut primary_visible = false;
+            let mut secondary_friend_bubble_fingerprint: Option<ChangeFingerprint> = None;
+            let mut secondary_hall_bubble_sequence: Vec<SecondaryHallBubble> = Vec::new();
+            let mut secondary_title_fingerprint: Option<ChangeFingerprint> = None;
+            let mut secondary_identity: Option<SecondaryChatIdentity> = None;
             let mut target_missing_backoff = TARGET_MISSING_BACKOFF_INITIAL;
             let mut target_missing = false;
 
@@ -1183,7 +1244,49 @@ mod app {
                             detect_ui_state(&frame.image, &ui_template_args, &self.config.screen);
                         let ui_ms = elapsed_ms(ui_started);
                         match ui_state_result {
+                            Ok(ui_state)
+                                if self.chat_listener.snapshot().mode
+                                    == ChatListenerMode::Secondary =>
+                            {
+                                primary_visible = false;
+                                last_fingerprint = None;
+                                let secondary_started = Instant::now();
+                                let scanned = if ui_state.is_secondary() {
+                                    self.run_secondary_listener_round(
+                                        &frame.image,
+                                        &mut secondary_friend_bubble_fingerprint,
+                                        &mut secondary_hall_bubble_sequence,
+                                        &mut secondary_title_fingerprint,
+                                        &mut secondary_identity,
+                                    )?
+                                } else {
+                                    log::warn!(
+                                        "二级监听当前不在二级聊天界面: {}，回退一级监听",
+                                        ui_state
+                                    );
+                                    self.chat_listener.fail_mode_switch_to_primary();
+                                    self.update_monitor_chat_listener();
+                                    secondary_friend_bubble_fingerprint = None;
+                                    secondary_hall_bubble_sequence.clear();
+                                    secondary_title_fingerprint = None;
+                                    secondary_identity = None;
+                                    false
+                                };
+                                log::info!(target: "timing",
+                                    "主循环阶段耗时: total={}ms frame={}ms ui={}ms secondary={}ms state={} scanned={}",
+                                    elapsed_ms(loop_started),
+                                    frame_ms,
+                                    ui_ms,
+                                    elapsed_ms(secondary_started),
+                                    ui_state,
+                                    scanned
+                                );
+                            }
                             Ok(ui_state) if ui_state.is_primary() => {
+                                secondary_friend_bubble_fingerprint = None;
+                                secondary_hall_bubble_sequence.clear();
+                                secondary_title_fingerprint = None;
+                                secondary_identity = None;
                                 let primary_started = Instant::now();
                                 let entered_primary = !primary_visible;
                                 primary_visible = true;
@@ -1360,6 +1463,10 @@ mod app {
                             }
                             Ok(ui_state) => {
                                 primary_visible = false;
+                                secondary_friend_bubble_fingerprint = None;
+                                secondary_hall_bubble_sequence.clear();
+                                secondary_title_fingerprint = None;
+                                secondary_identity = None;
                                 log::debug!("当前不是一级聊天界面，跳过聊天扫描: {}", ui_state);
                                 log::info!(target: "timing",
                                     "主循环阶段耗时: total={}ms frame={}ms ui={}ms state={} scanned=false",
@@ -1386,6 +1493,10 @@ mod app {
                         let frame_ms = elapsed_ms(frame_started);
                         primary_visible = false;
                         last_fingerprint = None;
+                        secondary_friend_bubble_fingerprint = None;
+                        secondary_hall_bubble_sequence.clear();
+                        secondary_title_fingerprint = None;
+                        secondary_identity = None;
                         let observed_window_detection_generation =
                             self.window_detection_signal.generation()?;
                         log::warn!(
@@ -1428,6 +1539,186 @@ mod app {
             self.queue()?.save()?;
             self.runtime_state()?.save()?;
             Ok(())
+        }
+
+        fn run_secondary_listener_round(
+            &mut self,
+            image: &DynamicImage,
+            last_friend_bubble: &mut Option<ChangeFingerprint>,
+            hall_bubble_sequence: &mut Vec<SecondaryHallBubble>,
+            last_title: &mut Option<ChangeFingerprint>,
+            identity: &mut Option<SecondaryChatIdentity>,
+        ) -> Result<bool> {
+            if self.command_executing.load(AtomicOrdering::SeqCst) {
+                return Ok(false);
+            }
+            let title_fingerprint =
+                rect_chat_change_fingerprint(image, chat_listener::SECONDARY_TITLE_RECT)?;
+            let title_changed = identity.is_none()
+                || last_title.as_ref().is_none_or(|previous| {
+                    secondary_fingerprint_changed(previous, &title_fingerprint)
+                });
+            if title_changed {
+                *identity = Some(self.secondary_identity_from_frame(image)?);
+            }
+            *last_title = Some(title_fingerprint);
+
+            let state = self.chat_listener.snapshot();
+            if state.unread_task_pending {
+                return Ok(false);
+            }
+            let current_identity = identity.clone().unwrap_or(SecondaryChatIdentity::Unknown);
+
+            if state.initial_unread_clear {
+                if let Some(hit) = find_unread_friend_hits(image).into_iter().next() {
+                    return self.queue_secondary_unread_task(hit, true);
+                }
+                *last_friend_bubble = latest_incoming_fingerprint(image)?;
+                *hall_bubble_sequence = secondary_hall_bubbles(image)?;
+                self.chat_listener.finish_initial_unread_clear();
+                self.update_monitor_chat_listener();
+                log::info!("二级监听初始未读清场完成，当前大厅已建立消息基线");
+                return Ok(false);
+            }
+
+            match current_identity {
+                SecondaryChatIdentity::CurrentHall => {
+                    if state.hall_round_required {
+                        let scanned =
+                            self.scan_secondary_hall_if_changed(image, hall_bubble_sequence)?;
+                        self.chat_listener.finish_hall_round();
+                        self.update_monitor_chat_listener();
+                        return Ok(scanned);
+                    }
+                    if let Some(hit) = find_unread_friend_hits(image).into_iter().next() {
+                        return self.queue_secondary_unread_task(hit, false);
+                    }
+                    self.scan_secondary_hall_if_changed(image, hall_bubble_sequence)
+                }
+                SecondaryChatIdentity::Friend(name) => {
+                    if title_changed {
+                        *last_friend_bubble = latest_incoming_fingerprint(image)?;
+                        return Ok(false);
+                    }
+                    self.scan_secondary_latest_if_changed(image, "pink", &name, last_friend_bubble)
+                }
+                SecondaryChatIdentity::PublicChannel => self.queue_secondary_hall_recovery(),
+                SecondaryChatIdentity::StrangerMessages => Ok(false),
+                SecondaryChatIdentity::Unknown => Ok(false),
+            }
+        }
+
+        fn queue_secondary_unread_task(
+            &self,
+            hit: UnreadFriendHit,
+            discard_only: bool,
+        ) -> Result<bool> {
+            if !self.chat_listener.claim_unread_task() {
+                return Ok(false);
+            }
+            if let Err(error) =
+                self.push_pending_task(PendingTask::SecondaryUnread { hit, discard_only })
+            {
+                self.chat_listener.release_unread_task();
+                return Err(error);
+            }
+            self.update_monitor_chat_listener();
+            log::info!(
+                "二级监听检测到好友未读红点: y={} discard_only={}",
+                hit.row_click.y,
+                discard_only
+            );
+            Ok(false)
+        }
+
+        fn queue_secondary_hall_recovery(&self) -> Result<bool> {
+            if !self.chat_listener.claim_unread_task() {
+                return Ok(false);
+            }
+            if let Err(error) = self.push_pending_task(PendingTask::RestoreSecondaryHall) {
+                self.chat_listener.release_unread_task();
+                return Err(error);
+            }
+            self.update_monitor_chat_listener();
+            log::info!("二级监听检测到不可执行会话，已加入恢复当前大厅任务");
+            Ok(false)
+        }
+
+        fn scan_secondary_latest_if_changed(
+            &self,
+            image: &DynamicImage,
+            message_type: &str,
+            friend_name: &str,
+            last_bubble: &mut Option<ChangeFingerprint>,
+        ) -> Result<bool> {
+            let current = latest_incoming_fingerprint(image)?;
+            let changed = match (&*last_bubble, &current) {
+                (None, Some(_)) => true,
+                (Some(previous), Some(current)) => secondary_fingerprint_changed(previous, current),
+                _ => false,
+            };
+            if !changed {
+                *last_bubble = current;
+                return Ok(false);
+            }
+
+            let refreshed = self.wait_for_secondary_bubble_stability()?;
+            let refreshed_fingerprint = latest_incoming_fingerprint(&refreshed)?;
+            let processed =
+                self.process_secondary_latest_message(&refreshed, message_type, friend_name)?;
+            *last_bubble = refreshed_fingerprint;
+            Ok(processed)
+        }
+
+        fn scan_secondary_hall_if_changed(
+            &self,
+            image: &DynamicImage,
+            previous: &mut Vec<SecondaryHallBubble>,
+        ) -> Result<bool> {
+            let current = secondary_hall_bubbles(image)?;
+            if previous.is_empty() {
+                *previous = current;
+                log::debug!("二级大厅气泡序列尚未建立，当前仅记录基线");
+                return Ok(false);
+            }
+
+            let overlap = hall_bubble_sequence_overlap(previous, &current);
+            if overlap == 0 {
+                *previous = current;
+                log::debug!("二级大厅气泡序列没有可靠重叠，已重建基线，不处理当前可见历史消息");
+                return Ok(false);
+            }
+            if overlap == current.len() {
+                *previous = current;
+                return Ok(false);
+            }
+
+            let refreshed = self.wait_for_secondary_bubble_stability()?;
+            let refreshed_bubbles = secondary_hall_bubbles(&refreshed)?;
+            let refreshed_overlap = hall_bubble_sequence_overlap(previous, &refreshed_bubbles);
+            if refreshed_overlap == 0 {
+                *previous = refreshed_bubbles;
+                log::debug!("二级大厅气泡稳定后没有可靠重叠，已重建基线，不处理当前可见历史消息");
+                return Ok(false);
+            }
+            let new_bubbles = &refreshed_bubbles[refreshed_overlap..];
+            if new_bubbles.is_empty() {
+                *previous = refreshed_bubbles;
+                return Ok(false);
+            }
+
+            log::info!(
+                "二级大厅检测到 {} 条新增气泡，按显示顺序 OCR",
+                new_bubbles.len()
+            );
+            let processed = self.process_secondary_bubble_rects(
+                &refreshed,
+                new_bubbles.iter().map(|bubble| bubble.rect),
+                "blue",
+                "",
+            )?;
+            *previous = refreshed_bubbles;
+            Ok(processed)
         }
 
         fn handle_scan_messages(&mut self, messages: Vec<ChatMessage>) -> Result<()> {
@@ -1506,6 +1797,9 @@ mod app {
                 return Ok(());
             }
             for pending in update.accepted {
+                if self.enqueue_chat_listener_command(&pending.parsed)? {
+                    continue;
+                }
                 if self.pending_contains_command(&pending.parsed)? {
                     log::info!("命令已在待处理队列，本轮跳过: {}", pending.parsed.raw);
                     continue;
@@ -1535,6 +1829,101 @@ mod app {
                 self.push_pending_task(PendingTask::Command(Box::new(pending)))?;
             }
             Ok(())
+        }
+
+        fn enqueue_chat_listener_command(&self, parsed: &ParsedCommand) -> Result<bool> {
+            let UserCommand::ChatListenerMode(command) = &parsed.command else {
+                return Ok(false);
+            };
+            match command {
+                ChatListenerModeCommand::Status => {
+                    let snapshot = self.chat_listener.snapshot();
+                    let pending = snapshot
+                        .pending_mode
+                        .map(|mode| format!("，等待切换{}", mode.label()))
+                        .unwrap_or_default();
+                    let message = format!("监听模式状态: {}{}", snapshot.mode.label(), pending);
+                    log::info!("{}", message);
+                    self.monitor
+                        .push_command(format!("{} -> {}", parsed.user_command, message));
+                }
+                ChatListenerModeCommand::Primary | ChatListenerModeCommand::Secondary => {
+                    let target = match command {
+                        ChatListenerModeCommand::Primary => ChatListenerMode::Primary,
+                        ChatListenerModeCommand::Secondary => ChatListenerMode::Secondary,
+                        ChatListenerModeCommand::Status => unreachable!(),
+                    };
+                    if !self.chat_listener.request_mode(target) {
+                        let snapshot = self.chat_listener.snapshot();
+                        log::info!(
+                            "监听模式切换已处于当前或等待状态，跳过: current={} pending={:?}",
+                            snapshot.mode.label(),
+                            snapshot.pending_mode
+                        );
+                        return Ok(true);
+                    }
+                    self.record_command_activity()?;
+                    if let Err(error) =
+                        self.push_pending_task(PendingTask::SetChatListenerMode { target })
+                    {
+                        self.chat_listener.cancel_mode_request(target);
+                        self.update_monitor_chat_listener();
+                        return Err(error);
+                    }
+                    self.update_monitor_chat_listener();
+                    log::info!("监听模式切换已加入待处理队列: {}", target.label());
+                }
+            }
+            Ok(true)
+        }
+
+        fn submit_secondary_command(&self, parsed: ParsedCommand) -> Result<()> {
+            if self.enqueue_chat_listener_command(&parsed)? {
+                return Ok(());
+            }
+            if !self.commands_enabled.load(AtomicOrdering::SeqCst) && parsed.message_type != "pink"
+            {
+                log::info!("命令识别已禁用，跳过二级大厅命令: {}", parsed.raw);
+                return Ok(());
+            }
+            if let UserCommand::Invite(invite) = &parsed.command {
+                if let Some(seq) = invite.seq {
+                    let executed = self
+                        .invite_executed_seqs
+                        .lock()
+                        .map_err(|_| anyhow!("invite_executed_seqs mutex poisoned"))?
+                        .contains(&seq);
+                    if executed {
+                        log::info!("邀请参数 {} 已执行过，跳过: {}", seq, parsed.raw);
+                        return Ok(());
+                    }
+                }
+            }
+            if self.pending_contains_command(&parsed)? {
+                log::info!("二级监听命令已在待处理队列，跳过: {}", parsed.raw);
+                return Ok(());
+            }
+            match &parsed.command {
+                UserCommand::DisableCommands { .. } => {
+                    self.commands_enabled.store(false, AtomicOrdering::SeqCst);
+                }
+                UserCommand::EnableCommands { .. } => {
+                    self.commands_enabled.store(true, AtomicOrdering::SeqCst);
+                }
+                UserCommand::IdleExit { minutes } => {
+                    self.record_command_activity()?;
+                    self.configure_idle_exit(*minutes)?;
+                    self.log_executed_command(&parsed, &format!("idle exit {}", minutes))?;
+                    return Ok(());
+                }
+                _ => {}
+            }
+            self.record_command_activity()?;
+            log::info!("二级监听命令已加入待处理队列: {}", parsed.raw);
+            self.push_pending_task(PendingTask::Command(Box::new(PendingCommand {
+                lock_key: command::lock_key(&parsed),
+                parsed,
+            })))
         }
 
         fn record_command_activity(&self) -> Result<()> {
@@ -1641,6 +2030,7 @@ mod app {
 
         fn execute_pending_task(&mut self, task: PendingTask) -> Result<bool> {
             let label = task.label();
+            let restore_secondary_after_success = task.restores_secondary_listener_after_success();
             let result = match task {
                 PendingTask::Command(pending) => {
                     let _song_command_guard =
@@ -1666,9 +2056,21 @@ mod app {
                     approved,
                     workflow_key,
                 } => self.execute_moderation_vote_result(*command, approved, workflow_key),
+                PendingTask::SetChatListenerMode { target } => {
+                    self.execute_set_chat_listener_mode(target)
+                }
+                PendingTask::SecondaryUnread { hit, discard_only } => {
+                    self.execute_secondary_unread_task(hit, discard_only)
+                }
+                PendingTask::RestoreSecondaryHall => self.execute_restore_secondary_hall_task(),
             };
             match result {
                 Ok(()) => {
+                    if restore_secondary_after_success
+                        && self.chat_listener.snapshot().mode == ChatListenerMode::Secondary
+                    {
+                        self.restore_secondary_listener_after_task(&label)?;
+                    }
                     log::info!("待处理任务完成: {}", label);
                     Ok(true)
                 }
@@ -1725,6 +2127,351 @@ mod app {
                 },
             }
             self.reply(&message)
+        }
+
+        fn execute_set_chat_listener_mode(&mut self, target: ChatListenerMode) -> Result<()> {
+            let switched = match target {
+                ChatListenerMode::Primary => {
+                    self.ensure_game_ready_for_input("切换一级监听")?;
+                    self.return_to_primary_fixed()
+                }
+                ChatListenerMode::Secondary => self.open_secondary_current_hall()?,
+            };
+            if switched {
+                self.chat_listener.complete_mode_switch(target);
+                self.update_monitor_chat_listener();
+                log::info!("聊天监听模式已切换为{}", target.label());
+                return Ok(());
+            }
+
+            self.chat_listener.fail_mode_switch_to_primary();
+            self.update_monitor_chat_listener();
+            let _ = self.return_to_primary_fixed();
+            Err(anyhow!("切换{}失败，已回退一级监听", target.label()))
+        }
+
+        fn execute_secondary_unread_task(
+            &mut self,
+            hit: UnreadFriendHit,
+            discard_only: bool,
+        ) -> Result<()> {
+            let result = (|| {
+                if !self.restore_secondary_current_hall()? {
+                    return Err(anyhow!("二级监听未能恢复当前大厅"));
+                }
+
+                let canvas = Canvas {
+                    width: self.config.screen.expected_width,
+                    height: self.config.screen.expected_height,
+                    resize: true,
+                };
+                let frame_args = FrameArgs { image: None };
+                let mut opened = false;
+                for attempt in 1..=2 {
+                    log::info!(
+                        "二级监听好友未读: 点击红点行 attempt={}/2 y={}",
+                        attempt,
+                        hit.row_click.y
+                    );
+                    click_game_point(
+                        PointConfig::new(hit.row_click.x, hit.row_click.y),
+                        &self.config.window,
+                    )?;
+                    sleep(Duration::from_millis(self.config.timing.input.click_ms));
+                    let frame = load_frame(&frame_args, &canvas, &self.config.window)?;
+                    if !unread_hit_still_visible(&frame.image, hit) {
+                        opened = true;
+                        break;
+                    }
+                }
+                if !opened {
+                    log::warn!("二级监听好友未读: 红点未消失，放弃本次识别");
+                    let _ = self.restore_secondary_current_hall()?;
+                    return Ok(());
+                }
+
+                if !discard_only {
+                    let image = self.wait_for_secondary_bubble_stability()?;
+                    match self.secondary_identity_from_frame(&image)? {
+                        SecondaryChatIdentity::Friend(name) => {
+                            self.process_secondary_latest_message(&image, "pink", &name)?;
+                        }
+                        SecondaryChatIdentity::Unknown => {
+                            self.process_secondary_latest_message(&image, "pink", "二级好友")?;
+                        }
+                        SecondaryChatIdentity::CurrentHall
+                        | SecondaryChatIdentity::PublicChannel
+                        | SecondaryChatIdentity::StrangerMessages => {
+                            log::warn!("二级监听好友未读: 打开后不是可执行好友会话，跳过 OCR");
+                        }
+                    }
+                }
+                if !self.restore_secondary_current_hall()? {
+                    return Err(anyhow!("二级监听好友未读后未能回到当前大厅"));
+                }
+                Ok(())
+            })();
+
+            self.chat_listener.finish_unread_task(!discard_only);
+            self.update_monitor_chat_listener();
+            if result.is_err() {
+                self.chat_listener.fail_mode_switch_to_primary();
+                self.update_monitor_chat_listener();
+                let _ = self.return_to_primary_fixed();
+            }
+            result
+        }
+
+        fn execute_restore_secondary_hall_task(&mut self) -> Result<()> {
+            let result = self.restore_secondary_current_hall();
+            self.chat_listener.finish_unread_task(false);
+            self.update_monitor_chat_listener();
+            match result {
+                Ok(true) => Ok(()),
+                Ok(false) | Err(_) => {
+                    self.chat_listener.fail_mode_switch_to_primary();
+                    self.update_monitor_chat_listener();
+                    let _ = self.return_to_primary_fixed();
+                    Err(anyhow!("二级监听无法恢复当前大厅，已回退一级监听"))
+                }
+            }
+        }
+
+        fn restore_secondary_listener_after_task(&mut self, task_label: &str) -> Result<()> {
+            if self.restore_secondary_current_hall()? {
+                return Ok(());
+            }
+            self.chat_listener.fail_mode_switch_to_primary();
+            self.update_monitor_chat_listener();
+            let _ = self.return_to_primary_fixed();
+            let message = format!("二级监听恢复失败，已回退一级监听: {}", task_label);
+            log::error!("{}", message);
+            if let Err(error) = self.reply(&message) {
+                log::error!("二级监听回退异常信息发送失败: {error:#}");
+            }
+            Ok(())
+        }
+
+        fn open_secondary_current_hall(&self) -> Result<bool> {
+            for attempt in 1..=2 {
+                if attempt > 1 {
+                    let _ = self.return_to_primary_from_transient_ui("二级监听第二次进入前重置");
+                }
+                self.ensure_game_ready_for_input("进入二级监听")?;
+                let canvas = Canvas {
+                    width: self.config.screen.expected_width,
+                    height: self.config.screen.expected_height,
+                    resize: true,
+                };
+                let frame_args = FrameArgs { image: None };
+                let templates = UiTemplateArgs::default().resolve(&self.config);
+                let frame = load_frame(&frame_args, &canvas, &self.config.window)?;
+                let ui_state = detect_ui_state(&frame.image, &templates, &self.config.screen)?;
+                if !ui_state.is_secondary() {
+                    log::info!(
+                        "二级监听进入: 按 Enter 打开二级聊天界面 attempt={}/2",
+                        attempt
+                    );
+                    press_key(Key::Return, &self.config.window)?;
+                    sleep(Duration::from_millis(self.config.timing.input.open_chat_ms));
+                }
+                if self.click_secondary_hall_template()?
+                    && self.secondary_title_is_current_hall()?
+                {
+                    return Ok(true);
+                }
+                log::warn!("二级监听进入 attempt={}/2 未确认当前大厅", attempt);
+            }
+            Ok(false)
+        }
+
+        fn restore_secondary_current_hall(&self) -> Result<bool> {
+            self.ensure_game_ready_for_input("二级大厅恢复")?;
+            if self.secondary_title_is_current_hall()? {
+                return Ok(true);
+            }
+
+            let canvas = Canvas {
+                width: self.config.screen.expected_width,
+                height: self.config.screen.expected_height,
+                resize: true,
+            };
+            let frame = load_frame(&FrameArgs { image: None }, &canvas, &self.config.window)?;
+            let templates = UiTemplateArgs::default().resolve(&self.config);
+            let ui_state = detect_ui_state(&frame.image, &templates, &self.config.screen)?;
+            if ui_state.is_secondary() {
+                return Ok(self.click_secondary_hall_template()?
+                    && self.secondary_title_is_current_hall()?);
+            }
+            self.open_secondary_current_hall()
+        }
+
+        fn click_secondary_hall_template(&self) -> Result<bool> {
+            let canvas = Canvas {
+                width: self.config.screen.expected_width,
+                height: self.config.screen.expected_height,
+                resize: true,
+            };
+            let frame = load_frame(&FrameArgs { image: None }, &canvas, &self.config.window)?;
+            let templates = UiTemplateArgs::default().resolve(&self.config);
+            let hit = best_template_hit(
+                &frame.image,
+                Some(self.config.screen.secondary_hall_rect.into()),
+                &templates.secondary_hall_template,
+                templates.chat_templates.marker_threshold,
+            )?;
+            let Some(hit) = hit else {
+                log::warn!("二级大厅恢复: 未找到当前大厅模板");
+                return Ok(false);
+            };
+            let point = hit.center();
+            log::info!("二级大厅恢复: 点击当前大厅模板 {},{}", point.x, point.y);
+            click_game_point(PointConfig::new(point.x, point.y), &self.config.window)?;
+            sleep(Duration::from_millis(self.config.timing.input.click_ms));
+            Ok(true)
+        }
+
+        fn secondary_title_is_current_hall(&self) -> Result<bool> {
+            let canvas = Canvas {
+                width: self.config.screen.expected_width,
+                height: self.config.screen.expected_height,
+                resize: true,
+            };
+            let frame = load_frame(&FrameArgs { image: None }, &canvas, &self.config.window)?;
+            Ok(matches!(
+                self.secondary_identity_from_frame(&frame.image)?,
+                SecondaryChatIdentity::CurrentHall
+            ))
+        }
+
+        fn secondary_identity_from_frame(
+            &self,
+            image: &DynamicImage,
+        ) -> Result<SecondaryChatIdentity> {
+            let crop = crop_canvas(image, chat_listener::SECONDARY_TITLE_RECT)?;
+            let title = {
+                let engine = self.ocr_engine()?;
+                merged_ocr_text(&engine.engine, &crop, self.config.ocr.same_line_y_tolerance)?
+            };
+            log::debug!("二级监听顶部标题 OCR: {}", title);
+            Ok(classify_title(&title))
+        }
+
+        fn process_secondary_latest_message(
+            &self,
+            image: &DynamicImage,
+            message_type: &str,
+            friend_name: &str,
+        ) -> Result<bool> {
+            let Some(rect) = latest_incoming_bubble_rect(image) else {
+                return Ok(false);
+            };
+            self.process_secondary_bubble_rects(
+                image,
+                std::iter::once(rect),
+                message_type,
+                friend_name,
+            )
+        }
+
+        fn process_secondary_bubble_rects(
+            &self,
+            image: &DynamicImage,
+            rects: impl IntoIterator<Item = Rect>,
+            message_type: &str,
+            friend_name: &str,
+        ) -> Result<bool> {
+            let started = Instant::now();
+            let ocr_started = Instant::now();
+            let engine = self.ocr_engine()?;
+            let mut texts = Vec::new();
+            for rect in rects {
+                let crop = crop_canvas(image, rect)?;
+                texts.push(merged_ocr_text(
+                    &engine.engine,
+                    &crop,
+                    self.config.ocr.same_line_y_tolerance,
+                )?);
+            }
+            let ocr_ms = elapsed_ms(ocr_started);
+            self.monitor.set_ocr(OcrSnapshot {
+                markers: texts.len(),
+                messages: texts
+                    .iter()
+                    .map(|text| format!("[{}] {}", message_type, text))
+                    .collect(),
+                marker_ms: 0,
+                ocr_ms,
+                total_ms: elapsed_ms(started),
+            });
+            drop(engine);
+
+            let mut processed = false;
+            for text in texts {
+                let Some(index) = text.find('@') else {
+                    log::debug!("二级监听气泡不是命令: {}", text);
+                    continue;
+                };
+                let command_text = text[index..].trim();
+                let synthetic = if message_type == "pink" {
+                    let username = if friend_name.trim().is_empty() {
+                        "二级好友"
+                    } else {
+                        friend_name.trim()
+                    };
+                    format!("[{}]：{}", username, command_text)
+                } else {
+                    format!("二级大厅：{}", command_text)
+                };
+                let parsed = command::parse_text(&synthetic, message_type).or_else(|| {
+                    custom_workflow::parse_text(
+                        &self.config.custom_workflows,
+                        &synthetic,
+                        message_type,
+                    )
+                });
+                let Some(parsed) = parsed else {
+                    log::debug!("二级监听气泡未解析为命令: {}", synthetic);
+                    continue;
+                };
+                self.submit_secondary_command(parsed)?;
+                processed = true;
+            }
+            Ok(processed)
+        }
+
+        fn wait_for_secondary_bubble_stability(&self) -> Result<DynamicImage> {
+            const STABILITY_TIMEOUT_MS: u64 = 500;
+
+            let canvas = Canvas {
+                width: self.config.screen.expected_width,
+                height: self.config.screen.expected_height,
+                resize: true,
+            };
+            let frame_args = FrameArgs { image: None };
+            let first = load_frame(&frame_args, &canvas, &self.config.window)?;
+            let mut previous = latest_incoming_fingerprint(&first.image)?;
+            let mut latest_image = first.image;
+            let poll_ms = self
+                .config
+                .timing
+                .chat_scan
+                .change_debounce_ms
+                .clamp(100, 200);
+            let deadline = Instant::now() + Duration::from_millis(STABILITY_TIMEOUT_MS);
+
+            while Instant::now() < deadline {
+                sleep(Duration::from_millis(poll_ms));
+                let frame = load_frame(&frame_args, &canvas, &self.config.window)?;
+                let current = latest_incoming_fingerprint(&frame.image)?;
+                if !secondary_optional_fingerprint_changed(previous.as_ref(), current.as_ref()) {
+                    return Ok(frame.image);
+                }
+                previous = current;
+                latest_image = frame.image;
+            }
+            log::debug!("二级监听气泡稳定等待超时，按当前画面继续 OCR");
+            Ok(latest_image)
         }
 
         fn execute_start_game_task(&mut self, source: &'static str) -> Result<()> {
@@ -1814,7 +2561,7 @@ mod app {
                         pending.parsed.raw,
                         command_ms
                     );
-                    self.handle_task_error_after_execution(&pending.parsed.raw, &error);
+                    return Err(error);
                 }
             }
             Ok(())
@@ -2908,6 +3655,16 @@ mod app {
                     self.configure_idle_exit(*minutes)?;
                     self.log_executed_command(parsed, &format!("idle exit {}", minutes))?;
                 }
+                UserCommand::ChatListenerMode(command) => {
+                    self.log_executed_command(
+                        parsed,
+                        &format!("chat listener {}", command.label()),
+                    )?;
+                    log::warn!(
+                        "监听模式命令未经过专用队列分发，已只记录: {}",
+                        command.label()
+                    );
+                }
                 UserCommand::CustomWorkflow(command) => {
                     self.log_executed_command(
                         parsed,
@@ -3799,6 +4556,14 @@ mod app {
         fn update_monitor_playback_controller(&self) {
             self.monitor.set_playback_controller(self.player.snapshot());
         }
+
+        fn update_monitor_chat_listener(&self) {
+            let snapshot = self.chat_listener.snapshot();
+            self.monitor.set_chat_listener(
+                snapshot.mode.label(),
+                snapshot.pending_mode.map(|mode| mode.label().to_string()),
+            );
+        }
     }
 
     fn ai_candidate_source(song: &command::SongCommand) -> &'static str {
@@ -3982,6 +4747,25 @@ mod app {
 
     fn elapsed_ms(started: Instant) -> u128 {
         started.elapsed().as_millis()
+    }
+
+    fn secondary_fingerprint_changed(
+        previous: &ChangeFingerprint,
+        current: &ChangeFingerprint,
+    ) -> bool {
+        let stats = change_stats(previous, current);
+        stats.mean_abs_diff >= 0.8 || stats.changed_ratio >= 0.01
+    }
+
+    fn secondary_optional_fingerprint_changed(
+        previous: Option<&ChangeFingerprint>,
+        current: Option<&ChangeFingerprint>,
+    ) -> bool {
+        match (previous, current) {
+            (Some(previous), Some(current)) => secondary_fingerprint_changed(previous, current),
+            (None, None) => false,
+            _ => true,
+        }
     }
 
     fn return_to_primary_retry_wait_ms(configured_retry_ms: u64, failed_returns: u32) -> u64 {

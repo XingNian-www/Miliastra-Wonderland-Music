@@ -1247,23 +1247,6 @@ impl AutomationApp {
         }
     }
 
-    fn wait_region_stable_atom(
-        &self,
-        locator: &UiLocator,
-        region: config::RectConfig,
-        timeout_ms: u64,
-        label: &str,
-    ) -> Result<()> {
-        log::info!("等待区域像素稳定: {}", label);
-        workflow_actions::wait_pixels_stable(
-            locator,
-            region,
-            self.workflow_stability(timeout_ms),
-            || self.running.load(AtomicOrdering::SeqCst),
-        )
-        .map_err(|error| anyhow!("{} 等待像素稳定失败: {error:#}", label))
-    }
-
     fn wait_template_atom(
         &self,
         locator: &UiLocator,
@@ -1359,6 +1342,8 @@ impl AutomationApp {
         if !opened {
             return Ok(false);
         }
+        // 发送反馈需要等待当前好友会话的输入框接管焦点；邀请主流程则由下一步 OCR 直接确认。
+        workflow_actions::wait(self.config.timing.invite.step_ms);
         let result = self.chat_output.send_current_chat(message);
         self.return_to_primary_from_transient_ui("好友发言");
         result?;
@@ -1382,16 +1367,6 @@ impl AutomationApp {
             "好友列表用户名",
         )? {
             log::error!("好友聊天失败: 好友列表未找到用户 {}", username);
-            self.return_to_primary_from_transient_ui("好友聊天失败");
-            return Ok(false);
-        }
-        if let Err(error) = self.wait_region_stable_atom(
-            &locator,
-            self.config.screen.chat_rect,
-            self.config.timing.workflow.default_timeout_ms,
-            "好友聊天打开",
-        ) {
-            log::error!("{error:#}");
             self.return_to_primary_from_transient_ui("好友聊天失败");
             return Ok(false);
         }

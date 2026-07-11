@@ -13,7 +13,7 @@ button,input,select,textarea{font:inherit}
 .brand{border:1px solid #2d3530;background:#171b19;border-radius:8px;padding:7px 9px}
 .brand h1{font-size:18px;line-height:1.2;margin:0;color:#f8faf9}
 .brand p{margin:4px 0 0;color:#9aa6a0;font-size:12px}
-.status-strip{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px}
+.status-strip{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:6px}
 .metric{border:1px solid #2d3530;background:#171b19;border-radius:8px;padding:6px 8px;min-height:48px}
 .metric span{display:block;color:#9aa6a0;font-size:12px}
 .metric strong{display:block;margin-top:3px;color:#f8faf9;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -85,6 +85,7 @@ input:focus,select:focus,textarea:focus{border-color:#2dd4bf}
       <div class="metric"><span>播放</span><strong id="playerState">未知</strong></div>
       <div class="metric"><span>当前歌曲</span><strong id="songState">未读取</strong></div>
       <div class="metric"><span>待播 / 待执行</span><strong id="queueState">0 / 0</strong></div>
+      <div class="metric"><span>监听</span><strong id="listenerState">一级监听</strong></div>
     </div>
     <div class="top-actions">
       <button class="btn" id="refreshToggle" onclick="toggleRefresh()">暂停刷新</button>
@@ -199,6 +200,16 @@ input:focus,select:focus,textarea:focus{border-color:#2dd4bf}
       </div>
 
       <div class="panel">
+        <div class="panel-head"><h2>聊天监听</h2><small id="listenerMeta">一级监听</small></div>
+        <div class="panel-body">
+          <div class="two">
+            <button class="btn" id="listenerPrimary" onclick="setChatListener('primary')">一级</button>
+            <button class="btn" id="listenerSecondary" onclick="setChatListener('secondary')">二级</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
         <div class="panel-head"><h2>游戏截图</h2><small>手动</small></div>
         <div class="panel-body">
           <button class="btn primary" style="width:100%" onclick="loadScreenshot()">获取截图</button>
@@ -235,7 +246,7 @@ input:focus,select:focus,textarea:focus{border-color:#2dd4bf}
 <script>
 function $(id){return document.getElementById(id)}
 const esc=(s)=>String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
-const commandLabels={'/status':'状态','/play':'继续','/pause':'暂停','/skip-next':'下一首','/skip-prev':'上一首','/volume':'音量','/startup/game':'启动游戏','/startup/wonderland':'启动并进入千星','/startup/enter-wonderland':'进入千星','/searchPlay':'点歌','/searchSource':'指定音源点歌','/search':'搜索','/player/play-uri':'播放URI','/queue':'队列','/queue/add':'加入队列','/queue/remove':'删除队列','/queue/clear':'清空队列','/ai/search':'AI点歌','/chat/send':'控制台发言'}
+const commandLabels={'/status':'状态','/play':'继续','/pause':'暂停','/skip-next':'下一首','/skip-prev':'上一首','/volume':'音量','/startup/game':'启动游戏','/startup/wonderland':'启动并进入千星','/startup/enter-wonderland':'进入千星','/searchPlay':'点歌','/searchSource':'指定音源点歌','/search':'搜索','/player/play-uri':'播放URI','/queue':'队列','/queue/add':'加入队列','/queue/remove':'删除队列','/queue/clear':'清空队列','/ai/search':'AI点歌','/chat/send':'控制台发言','/chat-listener/mode':'聊天监听'}
 const stMap={playing:'播放中',paused:'已暂停',stopped:'已停止',stoped:'已停止'}
 const safeNum=(n)=>(n!=null&&isFinite(n)&&!isNaN(n))?Number(n):null
 const pad=(n)=>String(parseInt(n)||0).padStart(2,'0')
@@ -329,6 +340,7 @@ function queueRemove(){
   const index=raw?Math.max(0,parseInt(raw,10)-1):0
   call('/queue/remove?index='+encodeURIComponent(index),'POST')
 }
+function setChatListener(mode){call('/chat-listener/mode?mode='+encodeURIComponent(mode),'POST')}
 async function loadQueue(){await call('/queue')}
 async function sendConsoleChat(){
   const text=$('consoleChatText').value.trim()
@@ -378,6 +390,13 @@ function renderMonitor(d){
   $('queueState').textContent=q.length+' / '+pending.length
   $('queueMeta').textContent=q.length+' 首'
   $('pendingMeta').textContent=pending.length+' 个'
+  const listener=d.chatListener||{}
+  const listenerMode=listener.mode||'一级监听'
+  const pendingMode=listener.pendingMode||''
+  $('listenerState').textContent=pendingMode?listenerMode+' -> '+pendingMode:listenerMode
+  $('listenerMeta').textContent=pendingMode?'等待切换 '+pendingMode:listenerMode
+  $('listenerPrimary').classList.toggle('primary',listenerMode==='一级监听'&&!pendingMode)
+  $('listenerSecondary').classList.toggle('primary',listenerMode==='二级监听'&&!pendingMode)
   const o=d.ocr
   if(o){
     $('ocrMeta').textContent='markers '+o.markers+' / total '+o.totalMs+'ms'

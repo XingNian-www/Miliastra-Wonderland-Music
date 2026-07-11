@@ -33,6 +33,9 @@ flowchart TD
 | `StartGame` | 启动配置、Web 面板 | 启动游戏并完成开门 |
 | `EnterWonderland` | 启动配置、Web 面板 | 从主界面进入千星 |
 | `ModerationVoteResult` | 管理投票后台线程 | 投票结束后执行或拒绝拉黑/屏蔽 |
+| `SetChatListenerMode` | 好友私聊、Web 面板 | 切换一级或二级聊天监听。 |
+| `SecondaryUnread` | 二级扫描线程 | 点击好友未读红点，按需 OCR 最新私聊，再回当前大厅。 |
+| `RestoreSecondaryHall` | 二级扫描线程 | 公开频道出现时恢复当前大厅；失败则回退一级监听。 |
 
 `PendingTask::label()` 用于日志和 Web 监控面板显示。`same_lock_command()` 用于判断新的命令是否已经在待执行任务队列里，避免重复入队。
 
@@ -79,7 +82,7 @@ pending: Arc<(Mutex<VecDeque<PendingTask>>, Condvar)>
 Web 面板有两类行为：
 
 - 控制台命令：例如 `/play`、`/pause`、`/skip-next`、`/volume`、`/searchPlay`、`/ai/search`，会构造 `ParsedCommand { message_type: "控制台" }`，再入队为 `PendingTask::Command`。
-- 直接任务：例如 `/chat/send`、`/startup/game`、`/startup/enter-wonderland`，直接入队为对应 `PendingTask`。
+- 直接任务：例如 `/chat/send`、`/startup/game`、`/startup/enter-wonderland`、`/chat-listener/mode`，直接入队为对应 `PendingTask`。
 
 `/startup/wonderland` 不是一个单独大任务，而是顺序入队两个任务：
 
@@ -142,9 +145,12 @@ flowchart TD
     B --> F["StartGame -> execute_start_game_task"]
     B --> G["EnterWonderland -> execute_enter_wonderland_task"]
     B --> H["ModerationVoteResult -> execute_moderation_vote_result"]
+    B --> I["SetChatListenerMode / SecondaryUnread / RestoreSecondaryHall"]
 ```
 
 不同任务虽然执行内容不同，但凡是要在当前游戏界面上继续操作的，一般都先经过 UI 准备或独立状态机。
+
+当前运行在二级监听模式时，大多数成功任务会在执行完成后恢复“二级当前大厅”。这一步先检查是否仍在二级界面，只有已经离开二级界面时才经由一级界面重新进入；管理投票不恢复二级，因为它需要保留一级多好友表决监听。
 
 ## UI 准备
 

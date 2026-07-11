@@ -105,7 +105,7 @@ timing:
   invite:
     # 邀请流程打开好友/聊天面板前后的固定等待，单位毫秒
     open_chat_ms: 400
-    # 邀请流程每一步点击后的等待时间，单位毫秒
+    # 点击好友后发送私聊反馈、以及输入大厅密码前的短暂等待时间，单位毫秒；邀请主流程由后续 OCR 直接确认页面状态
     step_ms: 800
     # 非公共大厅邀请时等待邀请确认/拒绝命令的最长时间，单位毫秒
     confirm_timeout_ms: 30000
@@ -576,18 +576,6 @@ custom_workflows:
   #         message: "{{username}} 触发了测试流程 {{args}}"
   #       - type: return_primary
   workflows:
-    # 参考命令：好友私聊 @过来，效果等同内置 @邀请N 命令，邀请 BOT 前往该好友大厅
-    - name: invite_reference
-      enabled: true
-      commands: [过来]
-      allow_args: false
-      message_types: [pink]
-      confirm_before_run: false
-      confirm_message: ""
-      confirm_message_types: [blue]
-      success_message: ""
-      steps:
-        - type: invite_user
     # 好友私聊 @通告 内容，向当前大厅发送“内容”
     - name: notice
       enabled: true

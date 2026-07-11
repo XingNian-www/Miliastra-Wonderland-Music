@@ -17,19 +17,18 @@
 
 ```mermaid
 flowchart TD
-    A["主扫描循环<br/>run_scan_loop"] --> B{"当前是一级界面?"}
-    B -->|否| C["跳过聊天扫描"]
-    B -->|是| D["聊天区变化检测 / fallback 轮询"]
-    D --> E["scan_chat_with_shared_ocr"]
-    E --> F["prepare_chat_scan<br/>裁剪 / 标记 / block"]
-    F --> G["recognize_prepared_chat<br/>OCR 文本"]
-    G --> H["handle_scan_messages"]
-    H --> I["parse_text / custom_workflow::parse_text"]
-    I --> J["同轮合并"]
-    J --> K["CommandLockState"]
-    K --> L["启动屏幕锁"]
-    L --> M["pending_contains_command"]
-    M --> N["PendingTask::Command"]
+    A["主扫描循环<br/>run_scan_loop"] --> B{"当前监听模式"}
+    B -->|一级| C["一级聊天区变化检测 / fallback 轮询"]
+    B -->|二级| D["红点探针 / 最新深色气泡摘要"]
+    C --> E["scan_chat_with_shared_ocr"]
+    D --> F["仅 OCR 最新气泡"]
+    E --> G["handle_scan_messages"]
+    F --> H["submit_secondary_command"]
+    G --> I["parse_text / custom_workflow::parse_text"]
+    I --> J["同轮合并 / CommandLockState / 启动屏幕锁"]
+    J --> K["pending_contains_command"]
+    H --> K
+    K --> L["PendingTask::Command"]
 ```
 
 只有 `PendingTask::Command` 进入待执行任务队列后，命令执行线程才会真正执行业务。
@@ -38,12 +37,12 @@ flowchart TD
 
 主扫描循环在 `run_scan_loop()`。每轮先截图，再用 `detect_ui_state()` 判断当前界面。
 
-只有一级界面会扫描聊天：
+一级监听只在一级界面扫描聊天：
 
 - `primary:enter`：检测到左下角 Enter 模板。
 - `primary:marker`：检测到聊天标记。
 
-如果是大厅二级界面或未知界面，本轮跳过聊天扫描，并清空聊天区变化基线。
+二级监听的扫描规则见 [二级聊天监听](secondary-chat-listener.md)：它不使用聊天标记切块，也不走一级 `CommandLockState`；红点消失和最新气泡图像摘要分别承担旧未读清场与变化判断。未知界面会回退一级监听。
 
 进入一级界面后，扫描触发有三类：
 
@@ -115,6 +114,8 @@ flowchart TD
 收到 `DisableCommands` / `EnableCommands` 后，扫描线程会立即更新 `commands_enabled`，同时命令本身仍会入队执行，以便发送游戏内反馈并写执行日志。
 
 `IdleExit` 是例外：它在扫描线程内立即配置闲置退出并写日志，不进入待执行任务队列。
+
+`@监听模式 一级/二级` 也是例外：它不作为普通业务命令执行，而是直接提交监听模式切换任务；`@监听模式 状态` 只记录当前模式和等待目标。
 
 ## 同轮合并
 

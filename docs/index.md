@@ -16,6 +16,7 @@
 | 文档 | 适合回答的问题 |
 | --- | --- |
 | [聊天命令进入队列](chat-command-ingestion.md) | OCR 消息如何变成命令，哪些来源能触发业务。 |
+| [二级聊天监听](secondary-chat-listener.md) | 二级界面如何监听大厅和好友私聊，红点、气泡、恢复与回退如何协作。 |
 | [OCR 与 UI 检测](ocr-ui-detection-flow.md) | 主扫描循环、聊天切块、OCR、模板匹配和耗时日志如何工作。 |
 | [UI 自动化与原子动作](ui-automation-atoms.md) | 点击、按键、粘贴、模板等待、OCR 点击和像素稳定如何组合。 |
 | [自定义工作流、邀请与管理流程](custom-workflow-moderation-flow.md) | 自定义流程、好友发言、邀请确认、拉黑/屏蔽投票如何执行。 |

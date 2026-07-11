@@ -21,6 +21,7 @@ use tokio::runtime::Builder;
 use url::form_urlencoded;
 
 use super::ai;
+use super::chat_listener::{ChatListenerMode, ChatListenerShared};
 use super::command::{self, ParsedCommand, PendingCommand, SongCommand, SongSource, UserCommand};
 use super::config::AppConfig;
 use super::feeluown::FeelUOwnClient;
@@ -164,6 +165,12 @@ const ROUTES: &[RouteSpec] = &[
         handler: chat_send_route,
     },
     RouteSpec {
+        path: "/chat-listener/mode",
+        json: true,
+        mutating: true,
+        handler: chat_listener_mode_route,
+    },
+    RouteSpec {
         path: "/ai/recognize",
         json: true,
         mutating: true,
@@ -219,6 +226,7 @@ pub struct HttpSharedState {
     pub queue: Arc<Mutex<PersistentQueue>>,
     pub runtime_state: Arc<Mutex<PersistentRuntimeState>>,
     pub monitor: MonitorShared,
+    pub chat_listener: ChatListenerShared,
     pub history: Arc<Mutex<VecDeque<HistoryItem>>>,
     pub active_connections: Arc<AtomicUsize>,
     pending: Arc<(Mutex<VecDeque<super::PendingTask>>, Condvar)>,
@@ -254,6 +262,7 @@ impl HttpSharedState {
         queue: Arc<Mutex<PersistentQueue>>,
         runtime_state: Arc<Mutex<PersistentRuntimeState>>,
         pending: Arc<(Mutex<VecDeque<super::PendingTask>>, Condvar)>,
+        chat_listener: ChatListenerShared,
         monitor: MonitorShared,
     ) -> Self {
         Self {
@@ -261,6 +270,7 @@ impl HttpSharedState {
             queue,
             runtime_state,
             monitor,
+            chat_listener,
             history: Arc::new(Mutex::new(VecDeque::new())),
             active_connections: Arc::new(AtomicUsize::new(0)),
             pending,
@@ -674,6 +684,53 @@ fn chat_send_route(
     state: &HttpSharedState,
 ) -> std::result::Result<String, AppError> {
     chat_send(query, state)
+}
+
+fn chat_listener_mode_route(
+    query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let mode = match normalize_required_text(query_value(query, "mode"), "mode")?.as_str() {
+        "primary" | "一级" => ChatListenerMode::Primary,
+        "secondary" | "二级" => ChatListenerMode::Secondary,
+        _ => {
+            return Err(AppError {
+                status: 400,
+                message: "mode 仅支持 primary 或 secondary".to_string(),
+            });
+        }
+    };
+    let queued = state.chat_listener.request_mode(mode);
+    let snapshot = state.chat_listener.snapshot();
+    if !queued {
+        return Ok(json!({
+            "ok": true,
+            "queued": false,
+            "mode": snapshot.mode,
+            "pendingMode": snapshot.pending_mode,
+        })
+        .to_string());
+    }
+    let position = match enqueue_pending_task(
+        state,
+        super::PendingTask::SetChatListenerMode { target: mode },
+    ) {
+        Ok(position) => position,
+        Err(error) => {
+            state.chat_listener.cancel_mode_request(mode);
+            sync_chat_listener_monitor(state);
+            return Err(error);
+        }
+    };
+    sync_chat_listener_monitor(state);
+    Ok(json!({
+        "ok": true,
+        "queued": true,
+        "position": position,
+        "mode": snapshot.mode,
+        "pendingMode": mode,
+    })
+    .to_string())
 }
 
 fn ai_recognize_route(
@@ -1093,8 +1150,20 @@ fn monitor_json(state: &HttpSharedState) -> std::result::Result<String, AppError
             "pendingTasks".to_string(),
             json!(pending_task_labels(state)?),
         );
+        object.insert(
+            "chatListener".to_string(),
+            serde_json::to_value(state.chat_listener.snapshot()).map_err(internal_error)?,
+        );
     }
     serde_json::to_string(&value).map_err(internal_error)
+}
+
+fn sync_chat_listener_monitor(state: &HttpSharedState) {
+    let snapshot = state.chat_listener.snapshot();
+    state.monitor.set_chat_listener(
+        snapshot.mode.label(),
+        snapshot.pending_mode.map(|mode| mode.label().to_string()),
+    );
 }
 
 fn chat_send(
@@ -1920,6 +1989,29 @@ mod tests {
         assert!(parse_jpeg_quality(Some("96")).is_err());
     }
 
+    #[test]
+    fn chat_listener_mode_route_enqueues_secondary_switch() {
+        let state = test_state();
+        let query = vec![("mode".to_string(), "secondary".to_string())];
+
+        let response = chat_listener_mode_route(&query, &state).expect("listener route");
+        let response: Value = serde_json::from_str(&response).expect("listener response json");
+
+        assert_eq!(response["queued"], true);
+        assert_eq!(
+            state.chat_listener.snapshot().mode,
+            ChatListenerMode::Primary
+        );
+        assert_eq!(
+            state.chat_listener.snapshot().pending_mode,
+            Some(ChatListenerMode::Secondary)
+        );
+        assert_eq!(
+            pending_task_labels(&state).expect("pending labels"),
+            vec!["切换二级监听"]
+        );
+    }
+
     fn test_state() -> HttpSharedState {
         let mut config: AppConfig =
             serde_yaml::from_str(include_str!("../../config.yaml")).expect("default config");
@@ -1945,6 +2037,13 @@ mod tests {
             Condvar::new(),
         ));
         let monitor = MonitorShared::new(20);
-        HttpSharedState::new(config, queue, runtime_state, pending, monitor)
+        HttpSharedState::new(
+            config,
+            queue,
+            runtime_state,
+            pending,
+            ChatListenerShared::new(),
+            monitor,
+        )
     }
 }

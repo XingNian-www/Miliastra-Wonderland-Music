@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use image::{DynamicImage, GenericImageView};
 use serde::Serialize;
 
@@ -43,9 +43,20 @@ impl ChatListenerMode {
 pub(super) struct ChatListenerSnapshot {
     pub(super) mode: ChatListenerMode,
     pub(super) pending_mode: Option<ChatListenerMode>,
+    pub(super) temporary_primary: bool,
     pub(super) initial_unread_clear: bool,
     pub(super) unread_task_pending: bool,
     pub(super) hall_round_required: bool,
+}
+
+impl ChatListenerSnapshot {
+    pub(super) fn display_mode(&self) -> String {
+        if self.temporary_primary {
+            format!("{}（临时一级阶段）", self.mode.label())
+        } else {
+            self.mode.label().to_string()
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -57,6 +68,7 @@ pub(super) struct ChatListenerShared {
 struct ChatListenerState {
     mode: ChatListenerMode,
     pending_mode: Option<ChatListenerMode>,
+    temporary_primary_holds: usize,
     initial_unread_clear: bool,
     unread_task_pending: bool,
     hall_round_required: bool,
@@ -68,6 +80,7 @@ impl ChatListenerShared {
             state: Arc::new(Mutex::new(ChatListenerState {
                 mode: ChatListenerMode::Primary,
                 pending_mode: None,
+                temporary_primary_holds: 0,
                 initial_unread_clear: false,
                 unread_task_pending: false,
                 hall_round_required: false,
@@ -80,6 +93,7 @@ impl ChatListenerShared {
             |_| ChatListenerSnapshot {
                 mode: ChatListenerMode::Primary,
                 pending_mode: None,
+                temporary_primary: false,
                 initial_unread_clear: false,
                 unread_task_pending: false,
                 hall_round_required: false,
@@ -87,6 +101,7 @@ impl ChatListenerShared {
             |state| ChatListenerSnapshot {
                 mode: state.mode,
                 pending_mode: state.pending_mode,
+                temporary_primary: state.temporary_primary_holds > 0,
                 initial_unread_clear: state.initial_unread_clear,
                 unread_task_pending: state.unread_task_pending,
                 hall_round_required: state.hall_round_required,
@@ -109,6 +124,7 @@ impl ChatListenerShared {
         if let Ok(mut state) = self.state.lock() {
             state.mode = mode;
             state.pending_mode = None;
+            state.temporary_primary_holds = 0;
             state.initial_unread_clear = mode == ChatListenerMode::Secondary;
             state.unread_task_pending = false;
             state.hall_round_required = false;
@@ -127,9 +143,28 @@ impl ChatListenerShared {
         if let Ok(mut state) = self.state.lock() {
             state.mode = ChatListenerMode::Primary;
             state.pending_mode = None;
+            state.temporary_primary_holds = 0;
             state.initial_unread_clear = false;
             state.unread_task_pending = false;
             state.hall_round_required = false;
+        }
+    }
+
+    pub(super) fn begin_temporary_primary(&self) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("聊天监听状态锁已损坏"))?;
+        state.temporary_primary_holds = state.temporary_primary_holds.saturating_add(1);
+        Ok(())
+    }
+
+    pub(super) fn end_temporary_primary(&self) {
+        match self.state.lock() {
+            Ok(mut state) => {
+                state.temporary_primary_holds = state.temporary_primary_holds.saturating_sub(1);
+            }
+            Err(_) => log::error!("聊天监听状态锁已损坏"),
         }
     }
 
@@ -326,6 +361,41 @@ pub(super) fn latest_incoming_bubble_rect(image: &DynamicImage) -> Option<Rect> 
     ))
 }
 
+pub(super) fn lowest_dark_chat_box_center(
+    image: &DynamicImage,
+    search_rect: Rect,
+) -> Option<Point> {
+    let region = bounded_rect(image, search_rect)?;
+    let min_pixels_per_row = ((region.width as usize * 2) / 5).clamp(30, 120);
+    let mut candidates = Vec::new();
+    let mut active_start = None;
+    let mut active_end = region.y;
+
+    for y in region.y..region.bottom() {
+        let dark_pixels = (region.x..region.right())
+            .filter(|x| {
+                let pixel = image.get_pixel(*x as u32, y as u32).0;
+                is_incoming_bubble(pixel[0], pixel[1], pixel[2])
+            })
+            .count();
+        if dark_pixels >= min_pixels_per_row {
+            if active_start.is_none() {
+                active_start = Some(y);
+            }
+            active_end = y;
+            continue;
+        }
+        push_dark_chat_box_candidate(&mut candidates, active_start.take(), active_end);
+    }
+    push_dark_chat_box_candidate(&mut candidates, active_start, active_end);
+
+    let candidate = candidates.last()?;
+    Some(Point::new(
+        region.x + region.width as i32 / 2,
+        (*candidate.start() + *candidate.end()) / 2,
+    ))
+}
+
 pub(super) fn latest_incoming_fingerprint(
     image: &DynamicImage,
 ) -> Result<Option<ChangeFingerprint>> {
@@ -469,6 +539,20 @@ fn push_unread_group(
     });
 }
 
+fn push_dark_chat_box_candidate(
+    candidates: &mut Vec<std::ops::RangeInclusive<i32>>,
+    start: Option<i32>,
+    end: i32,
+) {
+    let Some(start) = start else {
+        return;
+    };
+    let height = end - start + 1;
+    if (28..=160).contains(&height) {
+        candidates.push(start..=end);
+    }
+}
+
 fn bounded_rect(image: &DynamicImage, rect: Rect) -> Option<Rect> {
     let right = rect.right().min(image.width() as i32);
     let bottom = rect.bottom().min(image.height() as i32);
@@ -521,6 +605,23 @@ mod tests {
     }
 
     #[test]
+    fn temporary_primary_holds_are_reference_counted() {
+        let listener = ChatListenerShared::new();
+        listener.complete_mode_switch(ChatListenerMode::Secondary);
+
+        listener.begin_temporary_primary().expect("first hold");
+        listener.begin_temporary_primary().expect("second hold");
+        assert!(listener.snapshot().temporary_primary);
+
+        listener.end_temporary_primary();
+        assert!(listener.snapshot().temporary_primary);
+
+        listener.end_temporary_primary();
+        assert!(!listener.snapshot().temporary_primary);
+        assert_eq!(listener.snapshot().mode, ChatListenerMode::Secondary);
+    }
+
+    #[test]
     fn finds_red_unread_indicator_in_friend_column() {
         let mut image = RgbaImage::new(1920, 1080);
         for y in 300..314 {
@@ -547,6 +648,44 @@ mod tests {
             latest_incoming_bubble_rect(&DynamicImage::ImageRgba8(image)).expect("latest bubble");
         assert!(rect.y >= 670);
         assert!(rect.bottom() >= 790);
+    }
+
+    #[test]
+    fn finds_lowest_dark_chat_box_center_in_requested_region() {
+        let mut image = RgbaImage::new(800, 600);
+        for top in [180, 330] {
+            for y in top..top + 80 {
+                for x in 120..280 {
+                    image.put_pixel(x, y, Rgba([62, 71, 89, 255]));
+                }
+            }
+        }
+
+        let point = lowest_dark_chat_box_center(
+            &DynamicImage::ImageRgba8(image),
+            Rect::new(100, 100, 200, 400),
+        )
+        .expect("lowest dark chat box");
+        assert_eq!(point.x, 200);
+        assert!((point.y - 369).abs() <= 1);
+    }
+
+    #[test]
+    fn ignores_dark_chat_box_that_is_too_narrow() {
+        let mut image = RgbaImage::new(800, 600);
+        for y in 200..280 {
+            for x in 120..180 {
+                image.put_pixel(x, y, Rgba([62, 71, 89, 255]));
+            }
+        }
+
+        assert!(
+            lowest_dark_chat_box_center(
+                &DynamicImage::ImageRgba8(image),
+                Rect::new(100, 100, 200, 400),
+            )
+            .is_none()
+        );
     }
 
     #[test]

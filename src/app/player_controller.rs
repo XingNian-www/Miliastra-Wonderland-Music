@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 use std::thread::sleep;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow};
 
@@ -86,6 +86,39 @@ pub(super) struct PlayerController<B: MusicPlayerBackend> {
     queue: QueueConfig,
     matching: MatchConfig,
     song_dedup: SongDedupConfig,
+    external_playback_tracker: Arc<Mutex<ExternalPlaybackTracker>>,
+}
+
+#[derive(Default)]
+struct ExternalPlaybackTracker {
+    identity: String,
+    playing_since: Option<Instant>,
+    protected: bool,
+}
+
+impl ExternalPlaybackTracker {
+    fn observe(&mut self, identity: &str, now: Instant, protect_after: Duration) -> bool {
+        if self.identity != identity {
+            self.identity = identity.to_string();
+            self.playing_since = Some(now);
+            self.protected = false;
+        }
+        if !self.protected
+            && protect_after > Duration::ZERO
+            && self
+                .playing_since
+                .is_some_and(|started| now.duration_since(started) >= protect_after)
+        {
+            self.protected = true;
+        }
+        self.protected
+    }
+
+    fn clear(&mut self) {
+        self.identity.clear();
+        self.playing_since = None;
+        self.protected = false;
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -173,6 +206,7 @@ impl<B: MusicPlayerBackend> PlayerController<B> {
             queue: queue.clone(),
             matching: matching.clone(),
             song_dedup: song_dedup.clone(),
+            external_playback_tracker: Arc::new(Mutex::new(ExternalPlaybackTracker::default())),
         }
     }
 
@@ -202,6 +236,7 @@ impl<B: MusicPlayerBackend> PlayerController<B> {
 
     pub(super) fn pause_by_user(&self) -> Result<String> {
         let message = self.backend.pause()?;
+        self.clear_external_playback_tracker()?;
         self.with_playback_state(|state| {
             state.playback.set_user_paused();
         })?;
@@ -220,12 +255,14 @@ impl<B: MusicPlayerBackend> PlayerController<B> {
 
     pub(super) fn next_external(&self) -> Result<String> {
         let message = self.backend.next()?;
+        self.clear_external_playback_tracker()?;
         self.mark_external_playback()?;
         Ok(message)
     }
 
     pub(super) fn previous_external(&self) -> Result<String> {
         let message = self.backend.previous()?;
+        self.clear_external_playback_tracker()?;
         self.mark_external_playback()?;
         Ok(message)
     }
@@ -235,12 +272,14 @@ impl<B: MusicPlayerBackend> PlayerController<B> {
     }
 
     pub(super) fn clear_active_request(&self) -> Result<()> {
+        self.clear_external_playback_tracker()?;
         self.with_playback_state(|state| {
             state.playback.clear_active_request();
         })
     }
 
     pub(super) fn mark_external_playback(&self) -> Result<()> {
+        self.clear_external_playback_tracker()?;
         self.with_playback_state(|state| {
             state.playback.state = ConfirmedPlaybackState::ExternalPlayback;
             state.playback.pause_reason = PauseReason::None;
@@ -267,18 +306,18 @@ impl<B: MusicPlayerBackend> PlayerController<B> {
         if !self.queue.protect_current_song_until_finished {
             return Ok(false);
         }
+        if let Some(protected) = self.observe_external_playback(status)? {
+            return Ok(protected);
+        }
         let runtime = self
             .runtime_state
             .lock()
             .map_err(|_| anyhow!("运行状态锁已损坏"))?;
         let playback = &runtime.state().playback;
-        if playback.state == ConfirmedPlaybackState::Unknown {
+        if playback.active_request.is_none() {
             return Ok(false);
         }
-        if self.queue.ignore_external_playback
-            && playback.active_request.is_none()
-            && playback.state == ConfirmedPlaybackState::ExternalPlayback
-        {
+        if playback.state == ConfirmedPlaybackState::Unknown {
             return Ok(false);
         }
         if status.status == "playing" {
@@ -317,6 +356,7 @@ impl<B: MusicPlayerBackend> PlayerController<B> {
         &self,
         request: &PlaybackRequest,
     ) -> Result<PlaybackAttempt> {
+        self.clear_external_playback_tracker()?;
         let previous_playback = self.playback_snapshot()?;
         let initial = self
             .backend
@@ -519,6 +559,7 @@ impl<B: MusicPlayerBackend> PlayerController<B> {
         context: QueueAdvanceContext,
     ) -> Result<QueueAdvanceDecision> {
         let mut status = snapshot_status;
+        let external_playback_protected = self.observe_external_playback(&status)?.unwrap_or(false);
         let runtime_snapshot = self
             .runtime_state
             .lock()
@@ -584,16 +625,16 @@ impl<B: MusicPlayerBackend> PlayerController<B> {
             return Ok(QueueAdvanceDecision::PlaybackStateChanged);
         }
 
-        if self.queue.ignore_external_playback
+        if !external_playback_protected
             && runtime_snapshot.state == ConfirmedPlaybackState::ExternalPlayback
             && runtime_snapshot.active_request.is_none()
             && !context.command_executing
             && !context.has_pending_playback_task
             && !context.queue_empty
         {
-            log::info!("队列推进决策: advance reason=external_ignored");
+            log::info!("队列推进决策: advance reason=external_not_stable");
             return Ok(QueueAdvanceDecision::AdvanceQueue {
-                reason: "外部播放"
+                reason: "外部播放未稳定",
             });
         }
 
@@ -725,9 +766,17 @@ impl<B: MusicPlayerBackend> PlayerController<B> {
                 active_keyword: String::new(),
                 active_uri: String::new(),
                 last_observation_reliability: "unknown".to_string(),
+                backend_status: String::new(),
+                current_uri: String::new(),
+                title: String::new(),
+                artist: String::new(),
+                progress: 0.0,
+                duration: 0.0,
+                observed_at_ms: 0,
             },
             |runtime| {
                 let playback = &runtime.state().playback;
+                let observation = playback.last_observation.as_ref();
                 MonitorPlaybackController {
                     state: format_state(playback.state),
                     pause_reason: format_pause_reason(playback.pause_reason),
@@ -752,6 +801,21 @@ impl<B: MusicPlayerBackend> PlayerController<B> {
                         .as_ref()
                         .map(|observation| format_reliability(observation.reliability))
                         .unwrap_or_else(|| "unknown".to_string()),
+                    backend_status: observation
+                        .map(|observation| observation.status.clone())
+                        .unwrap_or_default(),
+                    current_uri: observation
+                        .map(|observation| observation.uri.clone())
+                        .unwrap_or_default(),
+                    title: observation
+                        .map(|observation| observation.title.clone())
+                        .unwrap_or_default(),
+                    artist: observation
+                        .map(|observation| observation.artist.clone())
+                        .unwrap_or_default(),
+                    progress: observation.map_or(0.0, |observation| observation.progress),
+                    duration: observation.map_or(0.0, |observation| observation.duration),
+                    observed_at_ms: observation.map_or(0, |observation| observation.captured_at_ms),
                 }
             },
         )
@@ -895,6 +959,7 @@ impl<B: MusicPlayerBackend> PlayerController<B> {
     }
 
     fn mark_unknown(&self) -> Result<()> {
+        self.clear_external_playback_tracker()?;
         self.with_playback_state(|state| {
             state.playback.state = ConfirmedPlaybackState::Unknown;
             state.playback.pause_reason = PauseReason::None;
@@ -912,6 +977,60 @@ impl<B: MusicPlayerBackend> PlayerController<B> {
             .map_err(|_| anyhow!("运行状态锁已损坏"))?;
         update(runtime.state_mut());
         runtime.save()
+    }
+
+    fn observe_external_playback(&self, status: &PlayerStatus) -> Result<Option<bool>> {
+        let (is_external, should_mark_external) = {
+            let runtime = self
+                .runtime_state
+                .lock()
+                .map_err(|_| anyhow!("运行状态锁已损坏"))?;
+            let playback = &runtime.state().playback;
+            let is_external = playback.active_request.is_none()
+                && playback.state != ConfirmedPlaybackState::Unknown
+                && playback.pause_reason != PauseReason::WaitingForQueue;
+            (
+                is_external,
+                is_external
+                    && (playback.state != ConfirmedPlaybackState::ExternalPlayback
+                        || playback.pause_reason != PauseReason::None),
+            )
+        };
+        let Some(identity) = external_playback_identity(status).filter(|_| is_external) else {
+            self.clear_external_playback_tracker()?;
+            return Ok(None);
+        };
+        let protect_after = Duration::from_secs(self.queue.external_playback_protect_after_seconds);
+        let mut tracker = self
+            .external_playback_tracker
+            .lock()
+            .map_err(|_| anyhow!("外部播放观察器锁已损坏"))?;
+        let was_protected = tracker.protected;
+        let protected = tracker.observe(&identity, Instant::now(), protect_after);
+        drop(tracker);
+        if should_mark_external {
+            self.with_playback_state(|state| {
+                state.playback.state = ConfirmedPlaybackState::ExternalPlayback;
+                state.playback.pause_reason = PauseReason::None;
+                state.playback.active_request = None;
+            })?;
+        }
+        if protected && !was_protected {
+            log::info!(
+                "外部播放已稳定 {}s，加入当前歌曲保护: {}",
+                self.queue.external_playback_protect_after_seconds,
+                identity
+            );
+        }
+        Ok(Some(protected))
+    }
+
+    fn clear_external_playback_tracker(&self) -> Result<()> {
+        self.external_playback_tracker
+            .lock()
+            .map_err(|_| anyhow!("外部播放观察器锁已损坏"))?
+            .clear();
+        Ok(())
     }
 
     fn playback_snapshot(&self) -> Result<super::runtime_state::PlaybackRuntimeState> {
@@ -940,6 +1059,23 @@ impl<B: MusicPlayerBackend> PlayerController<B> {
             log::info!("播放器状态转移: Starting -> Unknown reason={}", reason);
         }
         Ok(())
+    }
+}
+
+fn external_playback_identity(status: &PlayerStatus) -> Option<String> {
+    if status.status != "playing" {
+        return None;
+    }
+    let uri = status.current_uri.trim();
+    if !uri.is_empty() {
+        return Some(format!("uri:{uri}"));
+    }
+    let title = status.name.trim();
+    let artist = status.singer.trim();
+    if title.is_empty() && artist.is_empty() {
+        None
+    } else {
+        Some(format!("song:{title}\u{1f}{artist}"))
     }
 }
 
@@ -1245,7 +1381,7 @@ mod tests {
                 max_size: 10,
                 auto_advance_seconds: 2,
                 protect_current_song_until_finished: true,
-                ignore_external_playback: true,
+                external_playback_protect_after_seconds: 20,
             },
             &MatchConfig::default(),
             &SongDedupConfig {
@@ -1369,7 +1505,7 @@ mod tests {
     }
 
     #[test]
-    fn ignored_external_playback_does_not_protect_current_song() {
+    fn unstable_external_playback_does_not_protect_current_song() {
         let controller = controller(FakeBackend::new(vec![]));
         controller.mark_external_playback().unwrap();
 
@@ -1386,7 +1522,7 @@ mod tests {
     }
 
     #[test]
-    fn ignored_external_playback_allows_queue_takeover() {
+    fn unstable_external_playback_allows_queue_takeover() {
         let controller = controller(FakeBackend::new(vec![]));
         controller.mark_external_playback().unwrap();
 
@@ -1405,8 +1541,53 @@ mod tests {
         assert_eq!(
             decision,
             QueueAdvanceDecision::AdvanceQueue {
-                reason: "外部播放"
+                reason: "外部播放未稳定"
             }
+        );
+    }
+
+    #[test]
+    fn external_playback_protects_only_after_same_song_is_stable_for_configured_time() {
+        let now = Instant::now();
+        let mut tracker = ExternalPlaybackTracker::default();
+        let delay = Duration::from_secs(20);
+
+        assert!(!tracker.observe("uri:fuo://qqmusic/songs/external", now, delay));
+        assert!(!tracker.observe(
+            "uri:fuo://qqmusic/songs/external",
+            now + Duration::from_secs(19),
+            delay
+        ));
+        assert!(tracker.observe(
+            "uri:fuo://qqmusic/songs/external",
+            now + Duration::from_secs(20),
+            delay
+        ));
+        assert!(!tracker.observe(
+            "uri:fuo://qqmusic/songs/next",
+            now + Duration::from_secs(21),
+            delay
+        ));
+    }
+
+    #[test]
+    fn stable_external_playback_protects_current_song_from_new_requests() {
+        let controller = controller(FakeBackend::new(vec![]));
+        let external = status("外部歌", "fuo://qqmusic/songs/external", 30.0, 180.0);
+        controller.mark_external_playback().unwrap();
+        {
+            let mut tracker = controller.external_playback_tracker.lock().unwrap();
+            tracker.observe(
+                &external_playback_identity(&external).expect("external identity"),
+                Instant::now() - Duration::from_secs(20),
+                Duration::from_secs(20),
+            );
+        }
+
+        assert!(
+            controller
+                .should_queue_until_current_song_finished(&external)
+                .unwrap()
         );
     }
 

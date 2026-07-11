@@ -64,7 +64,7 @@ flowchart TD
 
 ## 配置加载和自动迁移
 
-`AppConfig::load_or_create()` 的名字里有 `create`，但当前行为是：配置文件不存在时直接报错，提示用户把发布包里的 `config.yaml` 放到工作目录，或用 `--config` 指定配置文件。
+`AppConfig::load_or_create()` 的名字里有 `create`，但当前行为是：配置文件不存在时直接报错，提示用户把发布包里的 `config.yaml` 放到工作目录。
 
 配置存在时流程是：
 
@@ -105,10 +105,12 @@ flowchart TD
 
 ## 日志分流
 
-`logger::init()` 打开两个文件：
+`logger::init()` 默认按自然日打开两个文件：
 
-- `miliastra-wonderland-music.log`
-- `miliastra-wonderland-music-timing.log`
+- `miliastra-wonderland-music-YYYY-MM-DD.log`
+- `miliastra-wonderland-music-timing-YYYY-MM-DD.log`
+
+`logging.rotate_daily` 默认开启，跨日时自动切到新文件；`logging.retain_days` 默认是 `7`，表示保留当天在内最近七个自然日的按日日志。设为 `0` 可以关闭自动清理。日志目录读取、轮转或清理失败只会写入警告，当前监听继续运行。
 
 每条日志先按 target 过滤：
 

@@ -4,19 +4,24 @@
 
 ## 核心结论
 
-`PendingTask` 是所有高层业务流程进入游戏窗口操作层的统一入口。主扫描线程、Web 面板、播放监控线程和后台投票线程都可以提交任务，但只有命令执行线程会消费任务并真正操作游戏窗口。
+`PendingTask` 是普通高层业务流程进入游戏窗口操作层的统一入口。主扫描线程、Web 面板、播放监控线程和后台投票线程都可以提交任务，但只有命令执行线程会消费这些任务并真正操作游戏窗口。
+
+成语接龙是刻意保留的低优先级例外：聊天扫描线程直接更新接龙状态，只把回复文本和当前聊天目标放入独立发送队列，不创建 `PendingTask`，不占用任务追踪、命令活动或已执行命令日志。
 
 ```mermaid
 flowchart TD
-    A["主扫描线程<br/>聊天OCR"] -->|ParsedCommand| P["待执行任务队列<br/>VecDeque<PendingTask>"]
+    A["主扫描线程<br/>聊天OCR"] -->|普通 ParsedCommand| P["待执行任务队列<br/>VecDeque<PendingTask>"]
+    A -->|@接龙| J["接龙状态 + 延迟回复队列"]
     B["HTTP/Web 面板"] -->|远程任务| P
     C["播放监控线程"] -->|AdvanceQueue| P
     D["管理投票后台线程"] -->|ModerationVoteResult| P
     E["启动配置"] -->|StartGame / EnterWonderland| P
     P --> F["命令执行线程"]
-    F --> G["prepare_command_ui"]
-    G --> H["execute_pending_task"]
+    F --> G["execute_pending_task"]
+    G --> H["动作阶段界面协调"]
     H --> I["游戏窗口输入 / FeelUOwn / 队列 / 聊天回复"]
+    J --> S["低优先级聊天发送线程"]
+    S --> I
 ```
 
 ## PendingTask 是什么
@@ -58,11 +63,21 @@ pending: Arc<(Mutex<VecDeque<PendingTask>>, Condvar)>
 - `push_pending_task()`：追加到队尾，正常排队。
 - `push_pending_task_front()`：放回队首，用于“这次没准备好界面，稍后原任务优先重试”。
 
+## 成语接龙延迟回复队列
+
+`DeferredChatQueue` 是一个独立的有界 FIFO（32 条）。`@接龙` 通过屏幕锁或二级大厅气泡去重后立即更新 `IdiomChainGame`，只把 `outcome.reply` 和目标聊天上下文放入这个队列。它不会调用 `pending_contains_command()`、`push_pending_task()`、`record_command_activity()` 或 `log_executed_command()`。
+
+延迟聊天发送线程只在以下条件同时满足时取一条回复：主 `pending` 队列为空、没有命令或屏幕独占 Web 工具正在执行、未暂停，并且队列记录的聊天目标正处于当前监听驻留。它在持有 `pending` 互斥锁时取得一次 `CommandExecutingGuard`，一级目标使用 `ChatOutput::send()`，二级当前大厅目标使用 `ChatOutput::send_current_chat()`。未开始发送的接龙回复永远让位给主命令，也不会占用主命令队列。
+
+若队首回复属于当前未激活的监听目标，发送器会把它移到队尾，让当前目标的后续回复继续发送；队列满时则丢弃这条无法发送的旧回复，而不是阻塞其他回复。
+
+游戏输入无法安全地在一条粘贴/回车序列中被抢占。因此，命令若恰好在发送已开始后到达，会等待这条短发送完成；发送器随后立即释放 guard 并唤醒命令执行线程。
+
 ## 谁会提交任务
 
 ### 主扫描线程
 
-主扫描线程在 `run_scan_loop()` 里截图、检测 UI、扫描聊天。它不会直接执行命令，只会在 `handle_scan_messages()` 里把解析出的新命令放入待执行任务队列。
+主扫描线程在 `run_scan_loop()` 里截图、检测 UI、扫描聊天。普通命令会在 `handle_scan_messages()` 或二级大厅提交路径里进入待执行任务队列；成语接龙是例外，会直接更新纯内存游戏状态并进入延迟回复队列。
 
 入队前有几层过滤：
 
@@ -75,7 +90,7 @@ pending: Arc<(Mutex<VecDeque<PendingTask>>, Condvar)>
 7. 程序刚启动时，第一批可见命令只用于初始化屏幕锁，不执行。
 8. 如果同语义命令已经在待执行任务队列中，跳过。
 
-通过后才变成 `PendingTask::Command`。
+普通命令通过后才变成 `PendingTask::Command`。接龙则在第 7 步之后被分流，不参与第 8 步或主命令队列。
 
 ### HTTP/Web 面板
 
@@ -99,7 +114,7 @@ Web 面板提交任务后只返回入队位置，不等待实际执行完成。
 - 当前歌曲暂停且剩余时间接近结束，音乐播放队列非空，且没有其他业务任务正在执行。
 - 当前歌曲正在播放且接近结束，并且有待执行播放相关工作；此时它可能先暂停播放器，再在空闲时提交自动出队任务。
 
-这保证了自动出队也走同一套游戏 UI 准备、聊天反馈和串行保护。
+这保证了自动出队也走同一套聊天反馈、驻留恢复和串行保护。播放器与队列操作本身不再为了回复而先切到一级界面。
 
 ### 管理投票后台线程
 
@@ -128,7 +143,7 @@ Web 面板提交任务后只返回入队位置，不等待实际执行完成。
 6. 成功且返回 `Ok(true)` 时，按 `post_settle_ms` 等待界面沉降。
 7. 任务失败只记录错误；队列继续处理后续任务。
 
-`CommandExecutingGuard` 的作用是告诉其他线程“当前有业务命令正在执行”。它用 RAII 在任务结束时自动恢复 `command_executing=false`。
+`CommandExecutingGuard` 的作用是告诉其他线程“当前有业务命令正在执行”。它用 RAII 在任务结束时自动恢复 `command_executing=false` 并唤醒等待者。低优先级接龙发送器也会短暂取得同一个 guard，以确保不会和命令并发操作游戏输入。
 
 如果任务是点歌命令，还会创建 `SongCommandExecutingGuard`，把 `song_command_executing=true`。播放监控线程用这个标志避免在点歌过程中误触发自动出队。
 
@@ -148,15 +163,22 @@ flowchart TD
     B --> I["SetChatListenerMode / SecondaryUnread / RestoreSecondaryHall"]
 ```
 
-不同任务虽然执行内容不同，但凡是要在当前游戏界面上继续操作的，一般都先经过 UI 准备或独立状态机。
+不同任务虽然执行内容不同，但不会统一先切到一级界面。命令入口只负责激活和聚焦一次游戏窗口，具体动作在需要时调用界面协调器。
 
-当前运行在二级监听模式时，大多数成功任务会在执行完成后恢复“二级当前大厅”。这一步先检查是否仍在二级界面，只有已经离开二级界面时才经由一级界面重新进入；管理投票不恢复二级，因为它需要保留一级多好友表决监听。
+任务结束时读取此刻有效的监听驻留目标：一级监听恢复一级界面，二级监听恢复“二级当前大厅”。管理投票等待期间会对二级监听施加可嵌套的临时一级阶段，所以其他任务结束后仍保持一级；最后一个投票结果任务释放临时阶段后，才恢复二级当前大厅。
 
-## UI 准备
+## 动作阶段界面协调
 
-普通命令、控制台发言、自动出队、投票结果处理都会尽量先回到一级界面。
+界面协调使用两个明确目标：`Primary` 和 `SecondaryCurrentHall`。目标由当前动作决定，不由命令来源决定。
 
-`prepare_command_ui()` 做：
+- 普通命令开始时只保证游戏窗口已激活和聚焦，不改变当前游戏页面。
+- `reply()` 根据当前监听驻留目标选择一级发送或二级当前大厅发送。
+- 大厅 OCR、麦克风、管理面板等动作在自身开始前要求 `Primary`。
+- 好友回复先确保二级聊天已打开；已经在目标好友会话时直接复用。
+- 自定义工作流通过 `ensure_primary`、`ensure_current_hall` 或自身模板步骤显式组合前置界面。
+- 任务成功和普通业务失败都会恢复当前有效驻留目标。
+
+`prepare_command_ui()` 仍保留为“到达一级界面”的状态转换，只由确实要求一级的动作调用：
 
 1. `ensure_game_ready_for_input()`：激活并聚焦目标游戏窗口。
 2. 截图并 `detect_ui_state()`。
@@ -166,7 +188,7 @@ flowchart TD
 6. 超时返回 `Ok(false)`。
 7. 目标窗口不可用或截图/检测失败则返回错误。
 
-调用方处理结果：
+一级动作调用方处理结果：
 
 - `Ok(true)`：继续执行任务。
 - `Ok(false)`：任务放回队首，稍后重试。
@@ -185,7 +207,7 @@ flowchart TD
 
 ### 准备阶段重试
 
-准备阶段没能回到一级界面，但窗口仍可用时，任务放回队首。
+确实要求一级的长流程如果暂时没能到达目标页面，可以把尚未产生业务副作用的任务放回队首。
 
 这种重试用于处理临时 UI 过渡：比如某个弹窗正在关闭、加载动画未结束、ESC 后界面还没稳定。
 
@@ -194,7 +216,8 @@ flowchart TD
 任务已经开始执行，过程中失败：
 
 - 如果目标窗口不可用：跳过返回一级界面。
-- 其他错误：调用 `return_to_primary_after_command_failure()`，尝试用 ESC 回到一级界面。
+- 普通任务的其他错误：恢复当前有效监听驻留目标，而不是固定返回一级。
+- 自己管理完整界面生命周期的特殊任务：由业务状态机执行专用收尾。
 
 返回一级界面本身用 `return_to_primary_by_escape()`，如果连续失败超过阈值，等待时间会逐步增加，超过 5 次后固定到 2000ms。
 
@@ -242,9 +265,10 @@ sequenceDiagram
     Scan->>Pending: push_back(Command)
     Exec->>Pending: pop_front()
     Exec->>Exec: CommandExecutingGuard=true
-    Exec->>Game: prepare_command_ui()
+    Exec->>Game: 仅激活和聚焦，不统一切换页面
     Exec->>Fuo: 搜索/状态/播放
-    Exec->>Game: 回复结果
+    Exec->>Game: 按监听驻留目标发送回复
+    Exec->>Game: 校验并恢复监听驻留界面
     Exec->>Exec: guard drop
 ```
 
@@ -276,6 +300,7 @@ sequenceDiagram
 - HTTP 线程不直接操作游戏。
 - 播放监控线程不直接播放队列歌曲。
 - 后台投票线程不直接执行管理 UI 操作。
-- 只有命令执行线程消费 `PendingTask` 并执行游戏业务。
+- 只有命令执行线程消费 `PendingTask` 并执行普通游戏业务。
+- 成语接龙状态不属于业务任务；它的独立发送线程只发送已排队回复，并且只在主命令完全空闲时取得游戏输入。
 
 这个边界是当前项目稳定性的核心。后续如果增加新功能，优先判断它应该提交哪种 `PendingTask`，而不是从新线程里直接点击或按键。

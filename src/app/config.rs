@@ -6,6 +6,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use super::config_migration::{self, CURRENT_CONFIG_VERSION};
+use super::idiom_chain::IdiomChainConfig;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -25,6 +26,8 @@ pub struct AppConfig {
     pub queue: QueueConfig,
     #[serde(default)]
     pub song_dedup: SongDedupConfig,
+    #[serde(default)]
+    pub idiom_chain: IdiomChainConfig,
     pub ai: AiConfig,
     #[serde(default)]
     pub song_review: SongReviewConfig,
@@ -90,7 +93,7 @@ impl AppConfig {
         }
 
         bail!(
-            "配置文件不存在: {}。请将发布包中的 config.yaml 放在程序工作目录，或使用 --config 指定配置文件",
+            "配置文件不存在: {}。请将发布包中的 config.yaml 放在程序工作目录",
             path.display()
         )
     }
@@ -306,12 +309,26 @@ pub struct HttpConfig {
     pub host: String,
     pub port: u16,
     pub enabled: bool,
+    #[serde(default)]
+    pub access_token: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LoggingConfig {
     pub dir: PathBuf,
     pub level: String,
+    #[serde(default = "default_log_rotate_daily")]
+    pub rotate_daily: bool,
+    #[serde(default = "default_log_retain_days")]
+    pub retain_days: u32,
+}
+
+fn default_log_rotate_daily() -> bool {
+    true
+}
+
+fn default_log_retain_days() -> u32 {
+    7
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -333,7 +350,12 @@ pub struct QueueConfig {
     pub max_size: usize,
     pub auto_advance_seconds: u64,
     pub protect_current_song_until_finished: bool,
-    pub ignore_external_playback: bool,
+    #[serde(default = "default_external_playback_protect_after_seconds")]
+    pub external_playback_protect_after_seconds: u64,
+}
+
+fn default_external_playback_protect_after_seconds() -> u64 {
+    20
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -364,12 +386,18 @@ pub struct CustomWorkflowConfig {
     pub default_threshold: f32,
     #[serde(default = "default_wait_template_absent_stable")]
     pub wait_template_absent_stable_default: bool,
+    #[serde(default = "default_max_hold_key_seconds")]
+    pub max_hold_key_seconds: u64,
     pub templates: HashMap<String, PathBuf>,
     pub workflows: Vec<CustomWorkflowDefinition>,
 }
 
 fn default_wait_template_absent_stable() -> bool {
     true
+}
+
+fn default_max_hold_key_seconds() -> u64 {
+    10
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -404,6 +432,7 @@ pub struct CustomWorkflowStep {
     pub timeout_ms: Option<u64>,
     pub poll_ms: Option<u64>,
     pub wait_ms: Option<u64>,
+    pub hold_seconds_arg: Option<usize>,
     pub stable_after_absent: Option<bool>,
 }
 

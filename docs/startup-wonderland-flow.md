@@ -194,7 +194,7 @@ stateDiagram-v2
 - 目标窗口不可用类错误：记录错误并跳过返回一级界面。
 - 其他错误：调用 `return_to_primary_after_command_failure()`，尝试用 ESC 回到一级界面。
 
-准备界面阶段不同：`StartGame` 和 `EnterWonderland` 是直接任务，不走普通命令的 `prepare_command_ui()`。它们自己负责窗口检查、聚焦和流程状态机。
+准备界面阶段不同：`StartGame` 和 `EnterWonderland` 是直接任务，由各自状态机负责窗口检查、聚焦和页面转换。普通命令同样不再统一调用 `prepare_command_ui()`；只有明确要求一级布局的动作才调用一级界面转换。
 
 ## 配置面
 

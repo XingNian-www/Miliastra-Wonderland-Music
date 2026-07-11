@@ -2,7 +2,6 @@ use anyhow::Result;
 use image::DynamicImage;
 use image::imageops::FilterType;
 
-use super::config::RectConfig;
 use super::geometry::{Rect, crop_canvas};
 
 #[derive(Clone, Debug)]
@@ -16,13 +15,6 @@ pub(super) struct ChangeFingerprint {
 pub(super) struct ChangeStats {
     pub(super) mean_abs_diff: f32,
     pub(super) changed_ratio: f32,
-}
-
-pub(super) fn configured_chat_change_fingerprint(
-    image: &DynamicImage,
-    chat_rect: RectConfig,
-) -> Result<ChangeFingerprint> {
-    chat_change_fingerprint(image, chat_rect.into())
 }
 
 pub(super) fn rect_chat_change_fingerprint(

@@ -5,13 +5,17 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use super::chat_listener::lowest_dark_chat_box_center;
 use super::command::{self, CustomWorkflowCommand, ModerationAction, ParsedCommand, UserCommand};
 use super::config::{self, CustomWorkflowConfig, CustomWorkflowDefinition, PointConfig};
 use super::decision_lock::DecisionScreenLock;
 use super::frame_source::{Canvas, load_frame};
 use super::ui_locator::UiLocator;
 use super::workflow_actions::{self, HitAction, PixelStability, TemplateMode};
-use super::{AutomationApp, FrameArgs, PendingTask, TemplateArgs};
+use super::{
+    AutomationApp, ChatDecisionScope, FrameArgs, PendingTask, PendingTaskExecution, TemplateArgs,
+    TemporaryPrimaryHold, TrackedPendingTask, UiResidency,
+};
 use anyhow::{Result, anyhow, bail};
 
 pub(super) fn parse_text(
@@ -273,25 +277,19 @@ impl AutomationApp {
         P: Fn(&str) -> Option<T>,
     {
         let poll_ms = poll_ms.max(50);
-        let mut screen_lock =
-            self.collect_chat_decision_screen_lock(&accepts_message_type, &parse_decision);
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-        let template_args = TemplateArgs::default().resolve(&self.config);
-        let canvas = Canvas {
-            width: self.config.screen.expected_width,
-            height: self.config.screen.expected_height,
-            resize: true,
+        let scope = if accepts_message_type("pink") {
+            ChatDecisionScope::MultipleConversations
+        } else {
+            ChatDecisionScope::CurrentHall
         };
+        let mut reader =
+            self.begin_chat_decision_reader(scope, &accepts_message_type, &|text| {
+                parse_decision(text).is_some()
+            })?;
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
         while self.running.load(AtomicOrdering::SeqCst) && Instant::now() < deadline {
-            workflow_actions::wait(poll_ms);
-            let frame = match load_frame(&FrameArgs { image: None }, &canvas, &self.config.window) {
-                Ok(frame) => frame,
-                Err(error) => {
-                    log::error!("{}截图失败: {error:#}", label);
-                    continue;
-                }
-            };
-            let messages = match self.scan_chat_with_shared_ocr(&frame.image, &template_args) {
+            workflow_actions::wait(reader.poll_interval_ms(poll_ms));
+            let messages = match self.poll_chat_decision_reader(&mut reader) {
                 Ok(messages) => messages,
                 Err(error) => {
                     log::error!("{}扫描失败: {error:#}", label);
@@ -303,7 +301,7 @@ impl AutomationApp {
                     continue;
                 }
                 if let Some(decision) = parse_decision(&message.text) {
-                    if !screen_lock.accept_once(&message) {
+                    if !reader.accept_once(&message) {
                         continue;
                     }
                     return Ok(ChatDecisionWait::Found(decision));
@@ -315,32 +313,6 @@ impl AutomationApp {
         } else {
             Ok(ChatDecisionWait::Stopped)
         }
-    }
-
-    fn collect_chat_decision_screen_lock<T, A, P>(
-        &self,
-        accepts_message_type: &A,
-        parse_decision: &P,
-    ) -> DecisionScreenLock
-    where
-        A: Fn(&str) -> bool,
-        P: Fn(&str) -> Option<T>,
-    {
-        let template_args = TemplateArgs::default().resolve(&self.config);
-        let canvas = Canvas {
-            width: self.config.screen.expected_width,
-            height: self.config.screen.expected_height,
-            resize: true,
-        };
-        let Ok(frame) = load_frame(&FrameArgs { image: None }, &canvas, &self.config.window) else {
-            return DecisionScreenLock::default();
-        };
-        let Ok(messages) = self.scan_chat_with_shared_ocr(&frame.image, &template_args) else {
-            return DecisionScreenLock::default();
-        };
-        DecisionScreenLock::from_messages(&messages, accepts_message_type, &|text| {
-            parse_decision(text).is_some()
-        })
     }
 
     fn execute_custom_workflow_step(
@@ -361,6 +333,21 @@ impl AutomationApp {
                 let key_text =
                     render_workflow_text(step.key.as_deref().unwrap_or("").trim(), context);
                 workflow_actions::press_key_text(&key_text, &self.config.window)
+            }
+            "hold_key" => {
+                let key_text =
+                    render_workflow_text(step.key.as_deref().unwrap_or("").trim(), context);
+                let hold_seconds = custom_hold_key_seconds(
+                    step,
+                    context,
+                    self.config.custom_workflows.max_hold_key_seconds,
+                )?;
+                workflow_actions::hold_key_text(
+                    &key_text,
+                    hold_seconds,
+                    &self.config.window,
+                    || self.running.load(AtomicOrdering::SeqCst),
+                )
             }
             "activate_game" => workflow_actions::activate(
                 &self.config.window,
@@ -435,10 +422,13 @@ impl AutomationApp {
                 }
                 self.execute_invite_with_announce(&target, None).map(|_| ())
             }
-            "return_primary" => {
-                self.return_to_primary_from_transient_ui(&context.workflow);
-                Ok(())
+            "return_primary" | "ensure_primary" => {
+                self.ensure_ui_residency(UiResidency::Primary, "自定义流程要求一级界面")
             }
+            "ensure_current_hall" => self.ensure_ui_residency(
+                UiResidency::SecondaryCurrentHall,
+                "自定义流程要求二级当前大厅",
+            ),
             other => Err(anyhow!("unsupported custom workflow step type: {}", other)),
         }
     }
@@ -635,11 +625,12 @@ impl AutomationApp {
         log::info!("邀请: 先检测是否公共大厅");
         if self.check_public_hall()? {
             log::info!("邀请: 当前在公共大厅，直接执行");
-            self.notify_friend_invite_decision(
+            let friend_chat_open = self.notify_friend_invite_decision(
                 username,
                 "已同意加入大厅,请等待BOT进入大厅并发送就绪信息后再开启麦克风",
+                true,
             );
-            return self.execute_invite(username, password);
+            return self.execute_invite(username, password, friend_chat_open);
         }
         let announce = format!(
             "{}邀请BOT前往大厅,30s内@邀请确认@邀请拒绝,默认通过",
@@ -647,39 +638,53 @@ impl AutomationApp {
         );
         if let Err(error) = self.reply(&announce) {
             log::error!("邀请通告发送失败，直接执行邀请: {error:#}");
-            return self.execute_invite(username, password);
+            return self.execute_invite(username, password, false);
         }
         match self.wait_for_invite_decision()? {
             Some(true) => {
-                self.notify_friend_invite_decision(
+                let friend_chat_open = self.notify_friend_invite_decision(
                     username,
                     "已同意加入大厅,请等待BOT进入大厅并发送就绪信息后再开启麦克风",
+                    true,
                 );
-                self.execute_invite(username, password)
+                self.execute_invite(username, password, friend_chat_open)
             }
             None => {
-                self.notify_friend_invite_decision(
+                let friend_chat_open = self.notify_friend_invite_decision(
                     username,
                     "已默认同意加入大厅,请等待BOT进入大厅并发送就绪信息后再开启麦克风",
+                    true,
                 );
-                self.execute_invite(username, password)
+                self.execute_invite(username, password, friend_chat_open)
             }
             Some(false) => {
                 log::info!("收到邀请拒绝，取消邀请");
-                self.notify_friend_invite_decision(username, "大厅成员已拒绝邀请");
+                self.notify_friend_invite_decision(username, "大厅成员已拒绝邀请", false);
                 Ok(false)
             }
         }
     }
 
-    fn notify_friend_invite_decision(&self, username: &str, message: &str) {
-        match self.send_friend_message(username, message) {
-            Ok(true) => {}
+    fn notify_friend_invite_decision(
+        &self,
+        username: &str,
+        message: &str,
+        keep_friend_chat_open: bool,
+    ) -> bool {
+        let result = if keep_friend_chat_open {
+            self.send_friend_message_keep_open(username, message)
+        } else {
+            self.send_friend_message(username, message)
+        };
+        match result {
+            Ok(true) => true,
             Ok(false) => {
                 log::error!("好友邀请确认回复失败: 未能打开好友聊天 {}", username);
+                false
             }
             Err(error) => {
                 log::error!("好友邀请确认回复失败: {error:#}");
+                false
             }
         }
     }
@@ -697,9 +702,14 @@ impl AutomationApp {
         }
     }
 
-    fn execute_invite(&self, username: &str, password: Option<&str>) -> Result<bool> {
+    fn execute_invite(
+        &self,
+        username: &str,
+        password: Option<&str>,
+        friend_chat_open: bool,
+    ) -> Result<bool> {
         log::info!("开始邀请: {}", username);
-        let result = self.execute_invite_steps(username, password);
+        let result = self.execute_invite_steps(username, password, friend_chat_open);
         if result.is_err() {
             self.return_to_primary_from_transient_ui("邀请失败");
         } else if matches!(result, Ok(true)) {
@@ -713,24 +723,25 @@ impl AutomationApp {
         result
     }
 
-    fn execute_invite_steps(&self, username: &str, password: Option<&str>) -> Result<bool> {
+    fn execute_invite_steps(
+        &self,
+        username: &str,
+        password: Option<&str>,
+        friend_chat_open: bool,
+    ) -> Result<bool> {
         let canvas = Canvas {
             width: self.config.screen.expected_width,
             height: self.config.screen.expected_height,
             resize: true,
         };
-        if !self.open_friend_chat(username, &canvas)? {
+        if friend_chat_open {
+            log::info!("邀请: 已在目标好友会话，直接继续邀请步骤");
+        } else if !self.open_friend_chat(username, &canvas)? {
             return Ok(false);
         }
         let locator = self.ui_locator_with_canvas(canvas.clone(), self.template_poll_ms());
 
-        if !self.click_text_atom(
-            &locator,
-            username,
-            self.config.invite.confirm_list_region,
-            self.config.timing.workflow.default_timeout_ms,
-            "邀请确认列表用户名",
-        )? {
+        if !self.click_invite_target(&locator, username)? {
             log::error!("邀请失败: 确认列表未找到用户 {}", username);
             self.return_to_primary_from_transient_ui("邀请失败");
             return Ok(false);
@@ -837,7 +848,20 @@ impl AutomationApp {
             self.release_moderation_workflow(&workflow_key);
             return Err(error);
         }
-        self.spawn_moderation_vote(command.clone(), workflow_key);
+        if let Err(error) = self.ensure_ui_residency(UiResidency::Primary, "管理投票等待前准备")
+        {
+            self.release_moderation_workflow(&workflow_key);
+            return Err(error);
+        }
+        let temporary_primary_hold = match TemporaryPrimaryHold::new(self.chat_listener.clone()) {
+            Ok(hold) => hold,
+            Err(error) => {
+                self.release_moderation_workflow(&workflow_key);
+                return Err(error);
+            }
+        };
+        self.update_monitor_chat_listener();
+        self.spawn_moderation_vote(command.clone(), workflow_key, temporary_primary_hold);
         Ok(true)
     }
 
@@ -852,7 +876,12 @@ impl AutomationApp {
         }
     }
 
-    fn spawn_moderation_vote(&self, command: command::ModerationCommand, workflow_key: String) {
+    fn spawn_moderation_vote(
+        &self,
+        command: command::ModerationCommand,
+        workflow_key: String,
+        temporary_primary_hold: TemporaryPrimaryHold,
+    ) {
         let worker = self.clone_for_background_task();
         thread::spawn(move || {
             log::info!(
@@ -869,68 +898,104 @@ impl AutomationApp {
             };
             if !worker.running.load(AtomicOrdering::SeqCst) {
                 worker.release_moderation_workflow(&workflow_key);
+                drop(temporary_primary_hold);
+                worker.update_monitor_chat_listener();
                 return;
             }
             let task = PendingTask::ModerationVoteResult {
                 command: Box::new(command),
                 approved,
                 workflow_key: workflow_key.clone(),
+                temporary_primary_hold,
             };
             if let Err(error) = worker.push_pending_task(task) {
                 log::error!("后台投票结果加入队列失败: {error:#}");
                 worker.release_moderation_workflow(&workflow_key);
+                worker.update_monitor_chat_listener();
             }
         });
     }
 
     pub(super) fn execute_moderation_vote_result(
         &mut self,
+        task_id: u64,
         command: command::ModerationCommand,
         approved: bool,
         workflow_key: String,
-    ) -> Result<()> {
+        mut temporary_primary_hold: TemporaryPrimaryHold,
+    ) -> Result<PendingTaskExecution> {
         let task_label = format!("{} UID{} 投票结果", command.action.label(), command.uid);
         match self.prepare_command_ui(&task_label) {
             Ok(true) => {}
             Ok(false) => {
                 log::info!("投票结果处理前未能回到一级界面，保留任务: {}", task_label);
-                self.push_pending_task_front(PendingTask::ModerationVoteResult {
-                    command: Box::new(command),
-                    approved,
-                    workflow_key,
-                })?;
-                return Ok(());
+                let release_key = workflow_key.clone();
+                let task = TrackedPendingTask {
+                    id: task_id,
+                    task: PendingTask::ModerationVoteResult {
+                        command: Box::new(command),
+                        approved,
+                        workflow_key,
+                        temporary_primary_hold,
+                    },
+                };
+                if let Err(error) = self.push_pending_task_front(task) {
+                    self.release_moderation_workflow(&release_key);
+                    return Err(error);
+                }
+                return Ok(PendingTaskExecution::Requeued);
             }
             Err(error) => {
+                if super::is_target_window_unavailable_error(&error) {
+                    self.release_moderation_workflow(&workflow_key);
+                    return Err(error);
+                }
                 log::error!(
                     "投票结果处理前准备界面失败，保留任务 {}: {error:#}",
                     task_label
                 );
-                self.push_pending_task_front(PendingTask::ModerationVoteResult {
-                    command: Box::new(command),
-                    approved,
-                    workflow_key,
-                })?;
-                return Ok(());
+                let release_key = workflow_key.clone();
+                let task = TrackedPendingTask {
+                    id: task_id,
+                    task: PendingTask::ModerationVoteResult {
+                        command: Box::new(command),
+                        approved,
+                        workflow_key,
+                        temporary_primary_hold,
+                    },
+                };
+                if let Err(error) = self.push_pending_task_front(task) {
+                    self.release_moderation_workflow(&release_key);
+                    return Err(error);
+                }
+                return Ok(PendingTaskExecution::Requeued);
             }
         }
 
         let _workflow_release =
             ModerationWorkflowRelease::new(self.moderation_workflows.clone(), workflow_key);
         if !approved {
+            temporary_primary_hold.release();
+            self.update_monitor_chat_listener();
             self.reply(&format!(
                 "@UID{}的{}请求未通过",
                 command.uid,
                 command.action.label()
             ))?;
-            return Ok(());
+            return Ok(PendingTaskExecution::Completed);
         }
-        self.reply(&format!(
+        if let Err(error) = self.reply(&format!(
             "@UID{}的{}请求已通过,开始执行",
             command.uid,
             command.action.label()
-        ))?;
+        )) {
+            temporary_primary_hold.release();
+            self.update_monitor_chat_listener();
+            return Err(error);
+        }
         let result = self.execute_moderation_steps(&command);
+        temporary_primary_hold.release();
+        self.update_monitor_chat_listener();
         workflow_actions::wait(self.config.timing.command.return_retry_ms);
         match &result {
             Ok(true) => {
@@ -950,7 +1015,7 @@ impl AutomationApp {
                 ));
             }
         }
-        result.map(|_| ())
+        result.map(|_| PendingTaskExecution::Completed)
     }
 
     fn wait_for_moderation_votes(&self, command: &command::ModerationCommand) -> Result<bool> {
@@ -1069,6 +1134,7 @@ impl AutomationApp {
     }
 
     fn execute_moderation_steps_inner(&self, command: &command::ModerationCommand) -> Result<bool> {
+        self.ensure_ui_residency(UiResidency::Primary, "管理操作打开好友界面前准备")?;
         let locator = self.ui_locator(self.template_poll_ms());
         let mut state = ModerationUiState::OpenFriendPanel;
 
@@ -1325,7 +1391,39 @@ impl AutomationApp {
         Ok(point.is_some())
     }
 
+    fn click_invite_target(&self, locator: &UiLocator, username: &str) -> Result<bool> {
+        let region = self.config.invite.confirm_list_region;
+        let frame = locator.capture()?;
+        if let Some(point) = lowest_dark_chat_box_center(&frame.image, region.into()) {
+            log::info!("邀请: 检测到最下方深色好友会话框，直接点击");
+            locator.click_point(point)?;
+            return Ok(true);
+        }
+
+        log::info!("邀请: 未检测到深色好友会话框，回退 OCR 查找 {}", username);
+        self.click_text_atom(
+            locator,
+            username,
+            region,
+            self.config.timing.workflow.default_timeout_ms,
+            "邀请确认列表用户名",
+        )
+    }
+
     fn send_friend_message(&self, username: &str, message: &str) -> Result<bool> {
+        self.send_friend_message_with_state(username, message, true)
+    }
+
+    fn send_friend_message_keep_open(&self, username: &str, message: &str) -> Result<bool> {
+        self.send_friend_message_with_state(username, message, false)
+    }
+
+    fn send_friend_message_with_state(
+        &self,
+        username: &str,
+        message: &str,
+        restore_listener_residency: bool,
+    ) -> Result<bool> {
         log::info!("好友发言: {} -> {}", username, message);
         let canvas = Canvas {
             width: self.config.screen.expected_width,
@@ -1335,7 +1433,7 @@ impl AutomationApp {
         let opened = match self.open_friend_chat(username, &canvas) {
             Ok(opened) => opened,
             Err(error) => {
-                self.return_to_primary_from_transient_ui("好友发言失败");
+                let _ = self.restore_listener_residency_after_task("好友发言失败");
                 return Err(error);
             }
         };
@@ -1345,18 +1443,32 @@ impl AutomationApp {
         // 发送反馈需要等待当前好友会话的输入框接管焦点；邀请主流程则由下一步 OCR 直接确认。
         workflow_actions::wait(self.config.timing.invite.step_ms);
         let result = self.chat_output.send_current_chat(message);
-        self.return_to_primary_from_transient_ui("好友发言");
+        if restore_listener_residency {
+            if let Err(error) = self.restore_listener_residency_after_task("好友发言") {
+                log::error!("好友发言后恢复监听驻留界面失败: {error:#}");
+            }
+        }
         result?;
         Ok(true)
     }
 
     fn open_friend_chat(&self, username: &str, canvas: &Canvas) -> Result<bool> {
-        if !self.return_to_primary_fixed() {
-            log::error!("好友聊天失败: 打开好友聊天前未能回到一级界面");
+        if !self.ensure_secondary_chat_open("打开好友聊天")? {
+            log::error!("好友聊天失败: 未能打开二级聊天界面");
             return Ok(false);
         }
-        workflow_actions::press_key_text("Enter", &self.config.window)?;
-        workflow_actions::wait(self.config.timing.invite.open_chat_ms);
+        let frame = load_frame(&FrameArgs { image: None }, canvas, &self.config.window)?;
+        if let super::chat_listener::SecondaryChatIdentity::Friend(current) =
+            self.secondary_identity_from_frame(&frame.image)?
+        {
+            let current = command::normalize_lock_text(&current);
+            let expected = command::normalize_lock_text(username);
+            if !expected.is_empty() && (current.contains(&expected) || expected.contains(&current))
+            {
+                log::info!("好友聊天已打开，直接复用当前会话: {}", username);
+                return Ok(true);
+            }
+        }
         let locator = self.ui_locator_with_canvas(canvas.clone(), self.template_poll_ms());
 
         if !self.click_text_atom(
@@ -1367,7 +1479,7 @@ impl AutomationApp {
             "好友列表用户名",
         )? {
             log::error!("好友聊天失败: 好友列表未找到用户 {}", username);
-            self.return_to_primary_from_transient_ui("好友聊天失败");
+            let _ = self.restore_listener_residency_after_task("好友聊天失败");
             return Ok(false);
         }
         Ok(true)
@@ -1506,9 +1618,36 @@ fn custom_step_target(step: &config::CustomWorkflowStep, context: &WorkflowConte
     }
 }
 
+fn custom_hold_key_seconds(
+    step: &config::CustomWorkflowStep,
+    context: &WorkflowContext,
+    max_seconds: u64,
+) -> Result<u64> {
+    if max_seconds == 0 {
+        bail!("custom_workflows.max_hold_key_seconds 必须大于 0");
+    }
+    let argument = step.hold_seconds_arg.unwrap_or(1);
+    if argument == 0 {
+        bail!("hold_seconds_arg 必须从 1 开始");
+    }
+    let Some(raw) = context.argv.get(argument - 1) else {
+        return Ok(1);
+    };
+    if !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        bail!("按住按键时长必须是正整数秒，最大 {} 秒", max_seconds);
+    }
+    let seconds = raw
+        .parse::<u64>()
+        .map_err(|_| anyhow!("按住按键时长无效"))?;
+    if seconds == 0 || seconds > max_seconds {
+        bail!("按住按键时长必须在 1 到 {} 秒之间", max_seconds);
+    }
+    Ok(seconds)
+}
+
 fn step_consumes_wait(step: &config::CustomWorkflowStep, stable_absent_default: bool) -> bool {
     match step.step_type.trim() {
-        "sleep" | "wait" => true,
+        "sleep" | "wait" | "hold_key" => true,
         "wait_template_absent" => step.stable_after_absent.unwrap_or(stable_absent_default),
         "wait_stable" | "wait_pixels_stable" => true,
         _ => false,
@@ -1708,6 +1847,7 @@ mod tests {
             enabled: true,
             default_threshold: 0.9,
             wait_template_absent_stable_default: true,
+            max_hold_key_seconds: 10,
             templates: HashMap::new(),
             workflows: vec![workflow],
         }
@@ -1816,6 +1956,68 @@ mod tests {
             render_workflow_text("{{username}} {{args}} {{arg1}} {{arg2}}", &context),
             "用户 123 abc 123 abc"
         );
+    }
+
+    #[test]
+    fn hold_key_seconds_use_the_configured_argument_and_enforce_bounds() {
+        let context = WorkflowContext {
+            workflow: "hold-w".to_string(),
+            command: "W".to_string(),
+            args: "10 extra".to_string(),
+            argv: vec!["10".to_string(), "extra".to_string()],
+            username: "用户".to_string(),
+            message_type: "pink".to_string(),
+            user_command: "@W 10 extra".to_string(),
+        };
+        let step = config::CustomWorkflowStep {
+            step_type: "hold_key".to_string(),
+            template: None,
+            region: None,
+            point: None,
+            click_offset: None,
+            key: Some("W".to_string()),
+            target: None,
+            text: None,
+            message: None,
+            threshold: None,
+            timeout_ms: None,
+            poll_ms: None,
+            wait_ms: None,
+            hold_seconds_arg: Some(1),
+            stable_after_absent: None,
+        };
+
+        assert_eq!(custom_hold_key_seconds(&step, &context, 10).unwrap(), 10);
+        assert!(custom_hold_key_seconds(&step, &context, 9).is_err());
+
+        let no_argument_context = WorkflowContext {
+            workflow: "hold-w".to_string(),
+            command: "W".to_string(),
+            args: String::new(),
+            argv: Vec::new(),
+            username: "用户".to_string(),
+            message_type: "pink".to_string(),
+            user_command: "@W".to_string(),
+        };
+        assert_eq!(
+            custom_hold_key_seconds(&step, &no_argument_context, 10).unwrap(),
+            1
+        );
+
+        let mut invalid_context = WorkflowContext {
+            workflow: "hold-w".to_string(),
+            command: "W".to_string(),
+            args: "0".to_string(),
+            argv: vec!["0".to_string()],
+            username: "用户".to_string(),
+            message_type: "pink".to_string(),
+            user_command: "@W 0".to_string(),
+        };
+        assert!(custom_hold_key_seconds(&step, &invalid_context, 10).is_err());
+
+        invalid_context.args = "abc".to_string();
+        invalid_context.argv = vec!["abc".to_string()];
+        assert!(custom_hold_key_seconds(&step, &invalid_context, 10).is_err());
     }
 
     #[test]

@@ -3,7 +3,6 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
-use clap::Args;
 use image::DynamicImage;
 use ocr_rs::{Backend, DetOptions, OcrEngine, OcrEngineConfig};
 use serde::Serialize;
@@ -11,19 +10,13 @@ use serde::Serialize;
 use super::Rect;
 use super::config::AppConfig;
 
-#[derive(Args, Clone, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(super) struct OcrArgs {
-    #[arg(long)]
     det_model: Option<PathBuf>,
-    #[arg(long)]
     rec_model: Option<PathBuf>,
-    #[arg(long)]
     charset: Option<PathBuf>,
-    #[arg(long)]
     min_confidence: Option<f32>,
-    #[arg(long)]
     threads: Option<i32>,
-    #[arg(long, value_delimiter = ',')]
     backend_priority: Option<Vec<String>>,
 }
 
@@ -78,12 +71,6 @@ pub(super) struct OcrBackendProbeResult {
     pub(super) name: &'static str,
     pub(super) gpu: bool,
     pub(super) status: OcrBackendProbeStatus,
-}
-
-impl OcrBackendProbeResult {
-    pub(super) fn is_available(&self) -> bool {
-        matches!(self.status, OcrBackendProbeStatus::Available { .. })
-    }
 }
 
 #[derive(Clone, Debug)]

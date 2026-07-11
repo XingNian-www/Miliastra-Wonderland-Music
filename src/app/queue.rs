@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
@@ -11,6 +12,7 @@ use super::song_matcher;
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, rename_all = "camelCase")]
 pub struct QueueItem {
+    pub id: u64,
     pub keyword: String,
     pub source: String,
     pub prefer_accompaniment: bool,
@@ -23,6 +25,7 @@ pub struct QueueItem {
 impl Default for QueueItem {
     fn default() -> Self {
         Self {
+            id: 0,
             keyword: String::new(),
             source: "qqmusic".to_string(),
             prefer_accompaniment: false,
@@ -35,7 +38,10 @@ impl Default for QueueItem {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
 struct QueueFile {
+    #[serde(alias = "next_id")]
+    next_id: u64,
     items: Vec<QueueItem>,
 }
 
@@ -43,24 +49,47 @@ struct QueueFile {
 pub struct PersistentQueue {
     path: PathBuf,
     max_size: usize,
+    next_id: u64,
     items: Vec<QueueItem>,
 }
 
 impl PersistentQueue {
     pub fn load(path: PathBuf, max_size: usize) -> Result<Self> {
-        let items = if path.exists() {
+        let file_exists = path.exists();
+        let file = if file_exists {
             let text = fs::read_to_string(&path)
                 .with_context(|| format!("read queue state {}", path.display()))?;
-            parse_queue_items(&text)
+            parse_queue_file(&text)
                 .with_context(|| format!("parse queue state {}", path.display()))?
         } else {
-            Vec::new()
+            QueueFile::default()
         };
-        Ok(Self {
+        let mut items = file.items;
+        let mut seen = HashSet::new();
+        let max_existing_id = items.iter().map(|item| item.id).max().unwrap_or(0);
+        let mut next_id = file.next_id.max(max_existing_id.saturating_add(1)).max(1);
+        let mut assigned_ids = false;
+        for item in &mut items {
+            if item.id == 0 || !seen.insert(item.id) {
+                while next_id == 0 || seen.contains(&next_id) {
+                    next_id = next_id.wrapping_add(1).max(1);
+                }
+                item.id = next_id;
+                seen.insert(item.id);
+                next_id = next_id.wrapping_add(1).max(1);
+                assigned_ids = true;
+            }
+        }
+        let queue = Self {
             path,
             max_size,
+            next_id,
             items,
-        })
+        };
+        if file_exists && assigned_ids {
+            queue.save()?;
+        }
+        Ok(queue)
     }
 
     pub fn items(&self) -> &[QueueItem] {
@@ -103,7 +132,10 @@ impl PersistentQueue {
             return Ok(false);
         }
         let mut items = self.items.clone();
+        let id = self.next_id;
+        let next_id = self.next_id.wrapping_add(1).max(1);
         items.push(QueueItem {
+            id,
             source: normalize_source(&item.source),
             prefer_accompaniment: item.prefer_accompaniment,
             keyword: item.keyword,
@@ -112,8 +144,9 @@ impl PersistentQueue {
             friend_username: item.friend_username,
             dedup_bypass: item.dedup_bypass,
         });
-        self.save_items(&items)?;
+        self.save_state(&items, next_id)?;
         self.items = items;
+        self.next_id = next_id;
         Ok(true)
     }
 
@@ -123,7 +156,7 @@ impl PersistentQueue {
         }
         let mut items = self.items.clone();
         let item = items.remove(0);
-        self.save_items(&items)?;
+        self.save_state(&items, self.next_id)?;
         self.items = items;
         Ok(Some(item))
     }
@@ -146,28 +179,36 @@ impl PersistentQueue {
         }
         removed.reverse();
         if !removed.is_empty() {
-            self.save_items(&items)?;
+            self.save_state(&items, self.next_id)?;
             self.items = items;
         }
         Ok(removed)
     }
 
+    pub fn remove_id(&mut self, id: u64) -> Result<Option<(usize, QueueItem)>> {
+        let Some(index) = self.items.iter().position(|item| item.id == id) else {
+            return Ok(None);
+        };
+        Ok(self.remove_indexes(&[index])?.into_iter().next())
+    }
+
     pub fn clear(&mut self) -> Result<usize> {
         let count = self.items.len();
         if count > 0 {
-            self.save_items(&[])?;
+            self.save_state(&[], self.next_id)?;
             self.items.clear();
         }
         Ok(count)
     }
 
     pub fn save(&self) -> Result<()> {
-        self.save_items(&self.items)
+        self.save_state(&self.items, self.next_id)
     }
 
-    fn save_items(&self, items: &[QueueItem]) -> Result<()> {
+    fn save_state(&self, items: &[QueueItem], next_id: u64) -> Result<()> {
         ensure_parent(&self.path)?;
         let text = serde_json::to_string_pretty(&QueueFile {
+            next_id,
             items: items.to_vec(),
         })?;
         write_atomic(&self.path, &text)
@@ -233,18 +274,20 @@ fn replace_file(temporary: &Path, target: &Path) -> Result<()> {
     .with_context(|| "move queue temp file over target")
 }
 
-fn parse_queue_items(text: &str) -> Result<Vec<QueueItem>> {
-    if let Ok(file) = serde_json::from_str::<QueueFile>(text) {
-        return Ok(file.items);
-    }
-    if let Ok(items) = serde_json::from_str::<Vec<QueueItem>>(text) {
-        return Ok(items);
-    }
+fn parse_queue_file(text: &str) -> Result<QueueFile> {
     let value: serde_json::Value = serde_json::from_str(text)?;
-    if let Some(queue) = value.get("queue") {
-        return serde_json::from_value(queue.clone()).context("parse queue array");
+    if value.is_array() {
+        let items = serde_json::from_value(value).context("解析旧版队列数组")?;
+        return Ok(QueueFile { next_id: 0, items });
     }
-    serde_json::from_value(value).context("parse queue state")
+    if value.get("items").is_some() {
+        return serde_json::from_value(value).context("解析队列状态");
+    }
+    if let Some(queue) = value.get("queue") {
+        let items = serde_json::from_value(queue.clone()).context("解析旧版 queue 字段")?;
+        return Ok(QueueFile { next_id: 0, items });
+    }
+    anyhow::bail!("队列状态必须包含 items 或 queue 数组")
 }
 
 fn normalize_source(source: &str) -> String {
@@ -293,9 +336,11 @@ mod tests {
 
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.contains("\"items\""));
+        assert!(text.contains("\"nextId\""));
 
         let loaded = PersistentQueue::load(path.clone(), 5).unwrap();
         assert_eq!(loaded.len(), 1);
+        assert!(loaded.items()[0].id > 0);
         assert_eq!(loaded.items()[0].keyword, "song name");
         assert_eq!(loaded.items()[0].source, "netease");
 
@@ -315,6 +360,43 @@ mod tests {
         let loaded = PersistentQueue::load(path.clone(), 5).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded.items()[0].keyword, "legacy");
+        let assigned_id = loaded.items()[0].id;
+        assert!(assigned_id > 0);
+
+        let reloaded = PersistentQueue::load(path.clone(), 5).unwrap();
+        assert_eq!(reloaded.items()[0].id, assigned_id);
+
+        let persisted: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(persisted["items"][0]["id"], assigned_id);
+        assert!(persisted["nextId"].as_u64().unwrap() > assigned_id);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn remove_by_id_is_stable_after_front_item_is_shifted() {
+        let path = temp_queue_path("stable-id-remove");
+        let _ = fs::remove_file(&path);
+        let mut queue = PersistentQueue::load(path.clone(), 5).unwrap();
+
+        for keyword in ["first", "second", "third"] {
+            queue
+                .push(QueueItem {
+                    keyword: keyword.to_string(),
+                    ..QueueItem::default()
+                })
+                .unwrap();
+        }
+        let third_id = queue.items()[2].id;
+
+        assert_eq!(queue.shift().unwrap().unwrap().keyword, "first");
+        let removed = queue.remove_id(third_id).unwrap().unwrap();
+
+        assert_eq!(removed.0, 2);
+        assert_eq!(removed.1.keyword, "third");
+        assert_eq!(queue.items().len(), 1);
+        assert_eq!(queue.items()[0].keyword, "second");
 
         let _ = fs::remove_file(path);
     }

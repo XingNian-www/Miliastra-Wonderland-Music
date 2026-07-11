@@ -17,6 +17,7 @@ on:
       - Cargo.toml
       - Cargo.lock
       - README.md
+      - THIRD_PARTY_NOTICES.md
       - assets/**
       - config.yaml
       - src/**
@@ -127,6 +128,7 @@ jobs:
           Copy-Item 'models' $dist -Recurse
           Copy-Item 'config.yaml' $dist
           Copy-Item 'README.md' $dist
+          Copy-Item 'THIRD_PARTY_NOTICES.md' $dist
 
       - name: 打包 Release zip
         shell: pwsh

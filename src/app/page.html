@@ -13,13 +13,14 @@ button,input,select,textarea{font:inherit}
 .brand{border:1px solid #2d3530;background:#171b19;border-radius:8px;padding:7px 9px}
 .brand h1{font-size:18px;line-height:1.2;margin:0;color:#f8faf9}
 .brand p{margin:4px 0 0;color:#9aa6a0;font-size:12px}
-.status-strip{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:6px}
+.status-strip{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:6px}
 .metric{border:1px solid #2d3530;background:#171b19;border-radius:8px;padding:6px 8px;min-height:48px}
 .metric span{display:block;color:#9aa6a0;font-size:12px}
 .metric strong{display:block;margin-top:3px;color:#f8faf9;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.top-actions{display:flex;gap:6px;align-items:stretch}
-.layout{display:grid;grid-template-columns:minmax(0,1.9fr) 330px;gap:8px;align-items:start}
-.monitor{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:8px}
+.top-actions{display:flex;flex-wrap:wrap;gap:6px;align-items:stretch}
+.top-actions .access-token{width:148px;min-width:0}
+.layout{display:grid;grid-template-columns:minmax(0,1.9fr) 330px;grid-template-areas:"monitor sidebar";gap:8px;align-items:start}
+.monitor{grid-area:monitor;display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:8px}
 .panel{border:1px solid #2d3530;background:#171b19;border-radius:8px;min-width:0;overflow:hidden}
 .panel.wide{grid-column:1/-1}
 .panel-head{height:32px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #2d3530;padding:0 8px;gap:6px}
@@ -36,7 +37,14 @@ button,input,select,textarea{font:inherit}
 .queue-title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .queue-meta{color:#9aa6a0;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .pending-item{display:grid;grid-template-columns:24px minmax(0,1fr);gap:6px;align-items:center;border:1px solid #323b36;background:#111412;border-radius:8px;padding:6px}
-.sidebar{display:flex;flex-direction:column;gap:8px}
+.task-item{display:grid;grid-template-columns:52px minmax(0,1fr) auto;gap:6px;align-items:center;border:1px solid #323b36;background:#111412;border-radius:8px;padding:6px;cursor:pointer}
+.task-item:hover{background:#1b211d}
+.task-status{font-size:11px;color:#93a19a}.task-status.running{color:#67e8f9}.task-status.completed{color:#86efac}.task-status.failed{color:#fca5a5}.task-status.canceled{color:#fcd34d}
+.task-result{grid-column:2/-1;color:#9aa6a0;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.candidate-list{display:flex;flex-direction:column;gap:5px;margin-top:8px;max-height:220px;overflow:auto}
+.candidate-item{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:6px;align-items:center;border:1px solid #323b36;background:#111412;border-radius:8px;padding:6px}
+.candidate-uri{color:#93a19a;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sidebar{grid-area:sidebar;display:flex;flex-direction:column;gap:8px}
 .controls{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}
 .row{display:flex;gap:6px;align-items:center}
 .row.wrap{flex-wrap:wrap}
@@ -46,6 +54,7 @@ input,select,textarea{width:100%;border:1px solid #3a4540;background:#101211;col
 textarea{min-height:74px;resize:vertical}
 input:focus,select:focus,textarea:focus{border-color:#2dd4bf}
 .btn{border:1px solid #3a4540;background:#222821;color:#f3f6f4;border-radius:8px;padding:7px 9px;cursor:pointer;min-height:34px}
+a.btn{display:inline-flex;align-items:center;text-decoration:none}
 .btn:hover{background:#2b332d}
 .btn.primary{background:#0f766e;border-color:#14b8a6;color:#fff}
 .btn.primary:hover{background:#0d9488}
@@ -69,7 +78,7 @@ input:focus,select:focus,textarea:focus{border-color:#2dd4bf}
 .modal-body{overflow:auto;text-align:center}
 .modal-body img{max-width:none;height:auto;background:#000;border:1px solid #2d3530}
 .hidden{display:none!important}
-@media(max-width:1050px){.layout{grid-template-columns:1fr}.topbar{grid-template-columns:1fr}.status-strip{grid-template-columns:repeat(2,minmax(0,1fr))}.top-actions{justify-content:flex-start}.sidebar{display:grid;grid-template-columns:1fr 1fr}.monitor{grid-template-columns:1fr}}
+@media(max-width:1050px){.layout{grid-template-columns:1fr;grid-template-areas:"sidebar" "monitor"}.topbar{grid-template-columns:1fr}.status-strip{grid-template-columns:repeat(3,minmax(0,1fr))}.top-actions{justify-content:flex-start}.sidebar{display:grid;grid-template-columns:1fr 1fr}.monitor{grid-template-columns:1fr}}
 @media(max-width:720px){.shell{padding:10px}.status-strip{grid-template-columns:1fr 1fr}.sidebar{display:flex}.controls,.two,.three,.compact-form,.ocr-send,.ocr-options{grid-template-columns:1fr}.monitor{gap:10px}}
 </style>
 </head>
@@ -86,9 +95,12 @@ input:focus,select:focus,textarea:focus{border-color:#2dd4bf}
       <div class="metric"><span>当前歌曲</span><strong id="songState">未读取</strong></div>
       <div class="metric"><span>待播 / 待执行</span><strong id="queueState">0 / 0</strong></div>
       <div class="metric"><span>监听</span><strong id="listenerState">一级监听</strong></div>
+      <div class="metric"><span>界面</span><strong id="uiState">未知</strong></div>
     </div>
     <div class="top-actions">
+      <input class="access-token" id="accessToken" type="password" placeholder="访问令牌" oninput="storeAccessToken()" onchange="loadOperatorWorkflows()">
       <button class="btn" id="refreshToggle" onclick="toggleRefresh()">暂停刷新</button>
+      <a class="btn" href="/tools">高级控制</a>
       <button class="btn primary" onclick="refreshAll()">刷新</button>
     </div>
   </header>
@@ -115,7 +127,7 @@ input:focus,select:focus,textarea:focus{border-color:#2dd4bf}
         <div class="panel-body"><div class="queue-list" id="monitorQueue">队列为空</div></div>
       </div>
       <div class="panel">
-        <div class="panel-head"><h2>待执行任务</h2><small id="pendingMeta">0 个</small></div>
+        <div class="panel-head"><h2>任务状态</h2><small id="pendingMeta">0 个活动</small></div>
         <div class="panel-body"><div class="queue-list" id="monitorPending">暂无任务</div></div>
       </div>
 
@@ -140,7 +152,7 @@ input:focus,select:focus,textarea:focus{border-color:#2dd4bf}
             <button class="btn" onclick="call('/skip-prev','POST')">上一首</button>
             <button class="btn" onclick="call('/skip-next','POST')">下一首</button>
             <button class="btn" onclick="loadStatus()">状态</button>
-            <button class="btn" onclick="call('/queue/clear','POST')">清空队列</button>
+            <button class="btn" onclick="clearQueue()">清空队列</button>
           </div>
           <div class="row" style="margin-top:8px">
             <input id="volumeInput" value="80" inputmode="numeric" placeholder="0-100">
@@ -151,6 +163,7 @@ input:focus,select:focus,textarea:focus{border-color:#2dd4bf}
             <button class="btn small" onclick="quickVolume(60)">60%</button>
             <button class="btn small" onclick="quickVolume(100)">100%</button>
           </div>
+          <div class="result" id="playbackDetail" style="margin-top:8px;min-height:0">等待播放器状态</div>
         </div>
       </div>
 
@@ -162,6 +175,7 @@ input:focus,select:focus,textarea:focus{border-color:#2dd4bf}
             <select id="sourceSelect">
               <option value="qqmusic" selected>QQ音乐</option>
               <option value="netease">网易云</option>
+              <option value="bilibili">B站</option>
             </select>
             <label class="switch-line"><input id="preferAccompaniment" type="checkbox">伴奏</label>
           </div>
@@ -171,19 +185,25 @@ input:focus,select:focus,textarea:focus{border-color:#2dd4bf}
             <button class="btn" onclick="queueAdd()">加入队列</button>
             <button class="btn" onclick="searchOnly()">搜索</button>
           </div>
+          <div class="candidate-list hidden" id="searchCandidates"></div>
+          <div class="result hidden" id="decisionPanel" style="margin-top:8px;max-height:none">
+            <div id="decisionLabel">等待候选决策</div>
+            <div class="controls" style="margin-top:6px">
+              <button class="btn good" onclick="submitDecision('confirm')">确认</button>
+              <button class="btn warn" onclick="submitDecision('skip')">跳过</button>
+              <button class="btn" id="decisionSwitch" onclick="submitDecision('switch_source')">换源</button>
+              <button class="btn" id="decisionAi" onclick="submitDecision('ai')">AI</button>
+            </div>
+          </div>
         </div>
       </div>
 
       <div class="panel">
         <div class="panel-head"><h2>队列操作</h2><small>待播队列</small></div>
         <div class="panel-body">
-          <div class="row">
-            <input id="removeIndex" inputmode="numeric" placeholder="删除序号">
-            <button class="btn" onclick="queueRemove()">删除</button>
-          </div>
-          <div class="two" style="margin-top:8px">
+          <div class="two">
             <button class="btn" onclick="loadQueue()">刷新队列</button>
-            <button class="btn warn" onclick="call('/queue/clear','POST')">清空</button>
+            <button class="btn warn" onclick="clearQueue()">清空</button>
           </div>
         </div>
       </div>
@@ -206,6 +226,31 @@ input:focus,select:focus,textarea:focus{border-color:#2dd4bf}
             <button class="btn" id="listenerPrimary" onclick="setChatListener('primary')">一级</button>
             <button class="btn" id="listenerSecondary" onclick="setChatListener('secondary')">二级</button>
           </div>
+          <div class="result" id="runtimeDetail" style="margin-top:8px;min-height:0">等待运行状态</div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><h2>机器人操作</h2><small>排队执行</small></div>
+        <div class="panel-body">
+          <div class="controls">
+            <button class="btn" onclick="call('/operator/lyrics','POST')">发送歌词</button>
+            <button class="btn" onclick="call('/operator/microphone','POST')">麦克风</button>
+            <button class="btn" onclick="call('/operator/hall-detect','POST')">大厅检测</button>
+            <button class="btn" onclick="call('/operator/hall-time','POST')">大厅时间</button>
+            <button class="btn" onclick="setCommandsEnabled(true)">启用命令</button>
+            <button class="btn warn" onclick="setCommandsEnabled(false)">禁用命令</button>
+          </div>
+          <div class="row" style="margin-top:8px">
+            <input id="idleExitMinutes" value="30" inputmode="numeric" placeholder="15-1440分钟">
+            <button class="btn" onclick="setIdleExit()">闲置退出</button>
+            <button class="btn ghost" onclick="clearIdleExit()">取消</button>
+          </div>
+          <div class="row" style="margin-top:8px">
+            <select id="workflowSelect"><option value="">无可用工作流</option></select>
+            <button class="btn" onclick="runWorkflow()">执行</button>
+          </div>
+          <input id="workflowArgs" style="margin-top:6px" placeholder="工作流参数，可留空">
         </div>
       </div>
 
@@ -245,17 +290,41 @@ input:focus,select:focus,textarea:focus{border-color:#2dd4bf}
 
 <script>
 function $(id){return document.getElementById(id)}
-const esc=(s)=>String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
-const commandLabels={'/status':'状态','/play':'继续','/pause':'暂停','/skip-next':'下一首','/skip-prev':'上一首','/volume':'音量','/startup/game':'启动游戏','/startup/wonderland':'启动并进入千星','/startup/enter-wonderland':'进入千星','/searchPlay':'点歌','/searchSource':'指定音源点歌','/search':'搜索','/player/play-uri':'播放URI','/queue':'队列','/queue/add':'加入队列','/queue/remove':'删除队列','/queue/clear':'清空队列','/ai/search':'AI点歌','/chat/send':'控制台发言','/chat-listener/mode':'聊天监听'}
+const esc=(s)=>String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')
+const commandLabels={'/status':'状态','/play':'继续','/pause':'暂停','/skip-next':'下一首','/skip-prev':'上一首','/volume':'音量','/startup/game':'启动游戏','/startup/wonderland':'启动并进入千星','/startup/enter-wonderland':'进入千星','/searchPlay':'点歌','/searchSource':'指定音源点歌','/search':'搜索','/search/candidates':'候选搜索','/player/play-uri':'播放URI','/queue':'队列','/queue/add':'加入队列','/queue/remove':'删除队列','/queue/clear':'清空队列','/ai/search':'AI点歌','/chat/send':'控制台发言','/chat-listener/mode':'聊天监听','/tasks/cancel':'撤销任务','/operator/lyrics':'发送歌词','/operator/hall-detect':'大厅检测','/operator/hall-time':'大厅时间','/operator/microphone':'麦克风','/operator/commands':'命令开关','/operator/idle-exit':'闲置退出','/operator/workflows':'工作流','/operator/workflows/run':'执行工作流'}
 const stMap={playing:'播放中',paused:'已暂停',stopped:'已停止',stoped:'已停止'}
+const controllerStateMap={idle:'空闲',starting:'启动播放',requested_song_playing:'点歌播放中',paused_by_user:'用户暂停',paused_waiting_for_queue:'等待队列',external_playback:'外部播放',unknown:'状态未知',unavailable:'不可用'}
+const pauseReasonMap={none:'无',user:'用户暂停',waiting_for_queue:'等待队列',unknown:'未知'}
+const reliabilityMap={reliable:'可靠',incomplete:'信息不完整',stale:'已过期',mismatched:'不匹配',unknown:'未知'}
+const taskStatusLabel={queued:'等待',running:'执行中',completed:'完成',failed:'失败',canceled:'已撤销'}
 const safeNum=(n)=>(n!=null&&isFinite(n)&&!isNaN(n))?Number(n):null
 const pad=(n)=>String(parseInt(n)||0).padStart(2,'0')
 const fmt=(s)=>{s=safeNum(s);return s!=null?(Math.floor(s/60)+':'+pad(s%60)):'??:??'}
 const nowText=()=>new Date().toLocaleTimeString('zh-CN',{hour12:false})
 let refreshPaused=false
 let screenshotUrl=''
-function setResult(value){$('result').textContent=typeof value==='string'?value:JSON.stringify(value,null,2)}
-function sourceLabel(v){return v==='netease'?'网易':v==='qqmusic'?'QQ':v||'聚合'}
+let actionInFlight=false
+let monitorLoading=false
+let historyLoading=false
+let screenshotLoading=false
+let searchCandidateItems=[]
+let operatorWorkflows=[]
+let taskSnapshots=[]
+let activeDecisionId=0
+function setResult(value){
+  if(value&&typeof value==='object'&&value.duplicate){$('result').textContent='相同任务已在队列中';return}
+  if(value&&typeof value==='object'&&value.queued){
+    const ids=Array.isArray(value.taskIds)?value.taskIds:(value.taskId?[value.taskId]:[])
+    const positions=Array.isArray(value.positions)?value.positions:(value.position?[value.position]:[])
+    $('result').textContent=(ids.length?'任务 #'+ids.join('、'):'任务')+' 已入队'+(positions.length?'，位置 '+positions.join('、'):'')
+    return
+  }
+  $('result').textContent=typeof value==='string'?value:JSON.stringify(value,null,2)
+}
+function accessToken(){return sessionStorage.getItem('miliastraAccessToken')||''}
+function storeAccessToken(){sessionStorage.setItem('miliastraAccessToken',$('accessToken').value)}
+function requestHeaders(){const token=accessToken();return token?{'X-Miliastra-Token':token}:{}}
+function sourceLabel(v){return v==='netease'?'网易':v==='qqmusic'?'QQ':v==='bilibili'?'B站':v||'聚合'}
 function queryText(q){const rows=Object.entries(q||{}).filter(([,v])=>v!=null&&String(v)!=='');return rows.length?' '+rows.map(([k,v])=>k+'='+v).join(' '):''}
 function preferParam(){return $('preferAccompaniment').checked?'&preferAccompaniment=1':''}
 function keyword(){return $('keyword').value.trim()}
@@ -271,7 +340,7 @@ function bindEnter(id,handler){
   })
 }
 async function request(url,method){
-  const r=await fetch(url,{method:method||'GET',cache:'no-store'})
+  const r=await fetch(url,{method:method||'GET',cache:'no-store',headers:requestHeaders()})
   const text=await r.text()
   if(!r.ok)throw new Error(text||('HTTP '+r.status))
   const type=r.headers.get('content-type')||''
@@ -279,13 +348,20 @@ async function request(url,method){
   return text
 }
 async function call(url,method){
+  const mutating=(method||'GET')==='POST'
+  if(mutating&&actionInFlight){setResult('上一项操作仍在请求中');return false}
+  if(mutating)actionInFlight=true
+  let succeeded=false
   setResult('请求中...')
   try{
     const data=await request(url,method)
     if(url==='/status'&&typeof data==='object')renderPlayer(data)
     setResult(data)
+    succeeded=true
   }catch(e){setResult('错误: '+e.message)}
+  finally{if(mutating)actionInFlight=false}
   await Promise.allSettled([loadHistory(),loadMonitor()])
+  return succeeded
 }
 function renderPlayer(d){
   const title=[d.name,d.singer].filter(Boolean).join(' - ')
@@ -324,9 +400,32 @@ function remoteSong(ai){
 async function searchOnly(){
   const kw=keyword()
   if(!kw){setResult('请输入关键词');return}
-  let url='/search?keyword='+encodeURIComponent(kw)
+  let url='/search/candidates?keyword='+encodeURIComponent(kw)
   if(source())url+='&source='+encodeURIComponent(source())
-  call(url)
+  setResult('搜索中...')
+  try{
+    const items=await request(url)
+    searchCandidateItems=Array.isArray(items)?items:[]
+    renderSearchCandidates()
+    setResult(searchCandidateItems.length?'找到 '+searchCandidateItems.length+' 个候选':'没有找到候选')
+  }catch(e){searchCandidateItems=[];renderSearchCandidates();setResult('错误: '+e.message)}
+  await loadHistory()
+}
+function renderSearchCandidates(){
+  const el=$('searchCandidates')
+  if(!searchCandidateItems.length){el.innerHTML='';el.classList.add('hidden');return}
+  el.innerHTML=searchCandidateItems.map((item,index)=>'<div class="candidate-item"><div><div class="queue-title">'+esc(item.text||'未命名候选')+'</div><div class="candidate-uri">'+esc(item.uri||'')+'</div></div><button class="btn small" onclick="queueCandidate('+index+')">加入</button></div>').join('')
+  el.classList.remove('hidden')
+}
+function queueCandidate(index){
+  const item=searchCandidateItems[index]
+  if(!item||!item.uri){setResult('候选 URI 无效');return}
+  const url='/player/play-uri?uri='+encodeURIComponent(item.uri)+'&title='+encodeURIComponent(item.text||item.uri)
+  call(url,'POST')
+}
+function submitDecision(action){
+  if(!activeDecisionId){setResult('当前没有等待中的候选决策');return}
+  call('/decisions/submit?id='+encodeURIComponent(activeDecisionId)+'&action='+encodeURIComponent(action),'POST')
 }
 function queueAdd(){
   const kw=keyword()
@@ -335,12 +434,33 @@ function queueAdd(){
   if(source())url+='&source='+encodeURIComponent(source())
   call(url,'POST')
 }
-function queueRemove(){
-  const raw=$('removeIndex').value.trim()
-  const index=raw?Math.max(0,parseInt(raw,10)-1):0
-  call('/queue/remove?index='+encodeURIComponent(index),'POST')
-}
+function removeQueueId(id){call('/queue/remove?id='+encodeURIComponent(id),'POST')}
+function clearQueue(){if(confirm('确定清空全部待播歌曲？'))call('/queue/clear','POST')}
 function setChatListener(mode){call('/chat-listener/mode?mode='+encodeURIComponent(mode),'POST')}
+function setCommandsEnabled(enabled){call('/operator/commands?enabled='+(enabled?'1':'0'),'POST')}
+function setIdleExit(){
+  const value=$('idleExitMinutes').value.trim()
+  if(!/^\d+$/.test(value)||Number(value)<15||Number(value)>1440){setResult('闲置退出时间必须是15到1440分钟');return}
+  call('/operator/idle-exit?minutes='+encodeURIComponent(value),'POST')
+}
+function clearIdleExit(){call('/operator/idle-exit?enabled=0','POST')}
+async function loadOperatorWorkflows(){
+  try{
+    const items=await request('/operator/workflows')
+    operatorWorkflows=Array.isArray(items)?items:[]
+    const select=$('workflowSelect')
+    select.innerHTML=operatorWorkflows.length?operatorWorkflows.map(item=>'<option value="'+esc(item.name)+'">'+esc(item.name)+(item.confirmBeforeRun?'（需确认）':'')+'</option>').join(''):'<option value="">无可用工作流</option>'
+    $('workflowArgs').disabled=!operatorWorkflows.length
+  }catch(e){operatorWorkflows=[];$('workflowSelect').innerHTML='<option value="">读取失败</option>'}
+}
+function runWorkflow(){
+  const name=$('workflowSelect').value
+  if(!name){setResult('没有可执行的工作流');return}
+  const workflow=operatorWorkflows.find(item=>item.name===name)
+  const args=$('workflowArgs').value.trim()
+  if(args&&workflow&&!workflow.allowArgs){setResult('该工作流不允许参数');return}
+  call('/operator/workflows/run?name='+encodeURIComponent(name)+'&args='+encodeURIComponent(args),'POST')
+}
 async function loadQueue(){await call('/queue')}
 async function sendConsoleChat(){
   const text=$('consoleChatText').value.trim()
@@ -348,13 +468,14 @@ async function sendConsoleChat(){
   const usePrefix=$('consoleChatUsePrefix').checked
   let url='/chat/send?text='+encodeURIComponent(text)+'&usePrefix='+(usePrefix?'1':'0')
   if(usePrefix)url+='&prefix='+encodeURIComponent($('consoleChatPrefix').value)
-  await call(url,'POST')
-  $('consoleChatText').value=''
+  if(await call(url,'POST'))$('consoleChatText').value=''
 }
 async function loadScreenshot(){
+  if(screenshotLoading)return
+  screenshotLoading=true
   setResult('截图中...')
   try{
-    const r=await fetch('/screenshot?quality=88')
+    const r=await fetch('/screenshot?quality=88',{headers:requestHeaders(),cache:'no-store'})
     if(!r.ok)throw new Error(await r.text()||('HTTP '+r.status))
     const blob=await r.blob()
     if(screenshotUrl)URL.revokeObjectURL(screenshotUrl)
@@ -364,6 +485,7 @@ async function loadScreenshot(){
     $('screenshotModal').classList.remove('hidden')
     setResult('截图已获取')
   }catch(e){setResult('错误: '+e.message)}
+  finally{screenshotLoading=false}
 }
 function closeScreenshot(){
   $('screenshotModal').classList.add('hidden')
@@ -377,49 +499,117 @@ function renderHistory(items){
 }
 function queueLine(it,i){
   const meta=[it.friendUsername,sourceLabel(it.source),it.preferAccompaniment?'伴奏':''].filter(Boolean).join(' / ')
-  return '<div class="queue-item"><div class="queue-index">'+(i+1)+'</div><div><div class="queue-title">'+esc(it.keyword||'未命名')+'</div><div class="queue-meta">'+esc(meta||'普通点歌')+'</div></div><button class="btn small ghost" onclick="removeQueueIndex('+i+')">删除</button></div>'
+  return '<div class="queue-item"><div class="queue-index">'+(i+1)+'</div><div><div class="queue-title">'+esc(it.keyword||'未命名')+'</div><div class="queue-meta">'+esc(meta||'普通点歌')+'</div></div><button class="btn small ghost" onclick="removeQueueId('+Number(it.id||0)+')">删除</button></div>'
 }
-function pendingLine(text,i){
-  return '<div class="pending-item"><div class="queue-index">'+(i+1)+'</div><div class="queue-title">'+esc(text)+'</div></div>'
+function taskLine(task){
+  const status=task.status||'queued'
+  const elapsed=task.elapsedMs?Math.max(1,Math.round(task.elapsedMs/1000))+'s':''
+  const result=task.result?'<div class="task-result" title="'+esc(task.result)+'">'+esc(task.result)+'</div>':''
+  const action=status==='queued'?'<button class="btn small ghost" onclick="event.stopPropagation();cancelTask('+Number(task.id)+')">撤销</button>':'<div class="queue-meta">'+esc(elapsed)+'</div>'
+  return '<div class="task-item" onclick="showTask('+Number(task.id)+')"><div class="task-status '+esc(status)+'">'+esc(taskStatusLabel[status]||status)+'</div><div class="queue-title">#'+esc(task.id)+' '+esc(task.label||'未命名任务')+'</div>'+action+result+'</div>'
 }
-function removeQueueIndex(index){$('removeIndex').value=String(index+1);queueRemove()}
+function cancelTask(id){call('/tasks/cancel?id='+encodeURIComponent(id),'POST')}
+function showTask(id){
+  const task=taskSnapshots.find(item=>Number(item.id)===Number(id))
+  if(!task)return
+  const rows=[
+    '任务 #'+task.id,
+    '名称: '+(task.label||'未命名任务'),
+    '状态: '+(taskStatusLabel[task.status]||task.status||'未知'),
+    '耗时: '+(task.startedAtMs==null?'尚未开始':Math.max(0,Math.round(Number(task.elapsedMs||0)))+'ms'),
+    task.result?'结果: '+task.result:''
+  ].filter(Boolean)
+  setResult(rows.join('\n'))
+}
+function listenerLabel(mode){return mode==='secondary'?'二级监听':mode==='primary'?'一级监听':mode||'一级监听'}
+function ageText(timestamp){const age=Math.max(0,Date.now()-Number(timestamp||0));return timestamp?(age<1000?'刚刚':Math.round(age/1000)+'s前'):'未知时间'}
+function renderLiveLog(lines){
+  const el=$('monitorLogs')
+  const follow=!el.dataset.ready||el.scrollHeight-el.scrollTop-el.clientHeight<28
+  el.textContent=lines.length?lines.slice(-160).join('\n'):'暂无日志'
+  if(follow)el.scrollTop=el.scrollHeight
+  el.dataset.ready='1'
+}
 function renderMonitor(d){
-  $('serviceState').textContent=d.status||'未知'
+  const operational=d.operational||{}
+  $('serviceState').textContent=(d.status||'未知')+(operational.scannerPaused?' / 扫描暂停':'')
+  $('uiState').textContent=operational.uiState||'未知'
   const q=Array.isArray(d.queue)?d.queue:[]
-  const pending=Array.isArray(d.pendingTasks)?d.pendingTasks:[]
-  $('queueState').textContent=q.length+' / '+pending.length
+  const tasks=Array.isArray(d.tasks)?d.tasks:[]
+  taskSnapshots=tasks
+  const activeTasks=tasks.filter(task=>task.status==='queued'||task.status==='running')
+  const pendingLabels=Array.isArray(d.pendingTasks)?d.pendingTasks:[]
+  const runningCount=tasks.filter(task=>task.status==='running').length
+  const activeCount=Math.max(activeTasks.length,pendingLabels.length+runningCount)
+  $('queueState').textContent=q.length+' / '+activeCount
   $('queueMeta').textContent=q.length+' 首'
-  $('pendingMeta').textContent=pending.length+' 个'
+  $('pendingMeta').textContent=activeCount+' 个活动'
   const listener=d.chatListener||{}
-  const listenerMode=listener.mode||'一级监听'
-  const pendingMode=listener.pendingMode||''
+  const listenerMode=listenerLabel(listener.mode)
+  const pendingMode=listener.pendingMode?listenerLabel(listener.pendingMode):''
   $('listenerState').textContent=pendingMode?listenerMode+' -> '+pendingMode:listenerMode
   $('listenerMeta').textContent=pendingMode?'等待切换 '+pendingMode:listenerMode
-  $('listenerPrimary').classList.toggle('primary',listenerMode==='一级监听'&&!pendingMode)
-  $('listenerSecondary').classList.toggle('primary',listenerMode==='二级监听'&&!pendingMode)
+  $('listenerPrimary').classList.toggle('primary',listener.mode==='primary'&&!pendingMode)
+  $('listenerSecondary').classList.toggle('primary',listener.mode==='secondary'&&!pendingMode)
+  const runtimeRows=[
+    '命令: '+(operational.commandsEnabled===false?'已禁用':'已启用'),
+    '大厅: '+(operational.hallRemainingMinutes==null?'时间未知':operational.hallRemainingMinutes+'分钟'),
+    '闲置退出: '+(operational.idleExitRemainingSeconds==null?'未启用':Math.ceil(operational.idleExitRemainingSeconds/60)+'分钟'),
+    listener.temporaryPrimary?'监听正在临时一级阶段':'',
+    listener.initialUnreadClear?'正在清理初始未读':'',
+    listener.unreadTaskPending?'正在处理好友未读':'',
+    listener.hallRoundRequired?'等待返回当前大厅扫描':''
+  ].filter(Boolean)
+  $('runtimeDetail').textContent=runtimeRows.join('\n')
+  const pc=d.playbackController||{}
+  const backendStatus=pc.backendStatus||''
+  $('playerState').textContent=stMap[backendStatus]||controllerStateMap[pc.state]||pc.state||'未知'
+  $('songState').textContent=[pc.title,pc.artist].filter(Boolean).join(' - ')||pc.activeKeyword||'无歌曲'
+  $('playbackDetail').textContent=[
+    '控制器: '+(controllerStateMap[pc.state]||pc.state||'未知'),
+    '暂停原因: '+(pauseReasonMap[pc.pauseReason]||pc.pauseReason||'无'),
+    '进度: '+fmt(pc.progress)+' / '+fmt(pc.duration),
+    '观测: '+(reliabilityMap[pc.lastObservationReliability]||pc.lastObservationReliability||'未知')+' / '+ageText(pc.observedAtMs)
+  ].join('\n')
+  const decision=d.decision
+  activeDecisionId=decision&&decision.id?Number(decision.id):0
+  $('decisionPanel').classList.toggle('hidden',!activeDecisionId)
+  if(activeDecisionId){
+    const remaining=Math.max(0,Math.ceil((Number(decision.deadlineAtMs||0)-Date.now())/1000))
+    $('decisionLabel').textContent=(decision.label||'候选决策')+' / 剩余 '+remaining+'s'
+    $('decisionSwitch').classList.toggle('hidden',!decision.allowSwitchSource)
+    $('decisionAi').classList.toggle('hidden',!decision.allowAi)
+  }
   const o=d.ocr
   if(o){
-    $('ocrMeta').textContent='markers '+o.markers+' / total '+o.totalMs+'ms'
+    $('ocrMeta').textContent=(o.source||'聊天')+' / '+ageText(o.capturedAtMs)+' / 标记 '+o.markers+' / '+o.markerMs+'+'+o.ocrMs+'='+o.totalMs+'ms'
     $('monitorOcr').textContent=(o.messages||[]).join('\n')||'暂无 OCR 文本'
   }else{
     $('ocrMeta').textContent='暂无采样'
     $('monitorOcr').textContent='暂无 OCR 内容'
   }
   $('monitorQueue').innerHTML=q.length?q.map(queueLine).join(''):'队列为空'
-  $('monitorPending').innerHTML=pending.length?pending.map(pendingLine).join(''):'暂无任务'
+  const visibleTasks=[...activeTasks,...tasks.filter(task=>task.status!=='queued'&&task.status!=='running')].slice(0,10)
+  $('monitorPending').innerHTML=visibleTasks.length?visibleTasks.map(taskLine).join(''):'暂无任务'
   const logs=Array.isArray(d.logs)?d.logs:[]
-  $('monitorLogs').textContent=logs.length?logs.slice(-160).join('\n'):'暂无日志'
+  renderLiveLog(logs)
   const c=Array.isArray(d.commands)?d.commands:[]
   $('monitorCommands').textContent=c.length?c.slice(-20).join('\n'):'暂无命令'
   $('lastRefresh').textContent=(refreshPaused?'已暂停 ':'最后刷新 ')+nowText()
 }
 async function loadMonitor(){
+  if(monitorLoading)return
+  monitorLoading=true
   try{renderMonitor(await request('/monitor'))}
   catch(e){$('serviceState').textContent='监控失败';$('lastRefresh').textContent=e.message}
+  finally{monitorLoading=false}
 }
 async function loadHistory(){
+  if(historyLoading)return
+  historyLoading=true
   try{renderHistory(await request('/history'))}
   catch(e){$('history').textContent='读取记录失败: '+e.message}
+  finally{historyLoading=false}
 }
 async function clearHistory(){
   try{setResult(await request('/clear-history','POST'))}
@@ -441,7 +631,10 @@ bindEnter('consoleChatText',sendConsoleChat)
 bindEnter('consoleChatPrefix',sendConsoleChat)
 bindEnter('keyword',()=>remoteSong(false))
 bindEnter('volumeInput',setVolume)
-bindEnter('removeIndex',queueRemove)
+bindEnter('idleExitMinutes',setIdleExit)
+bindEnter('workflowArgs',runWorkflow)
+$('accessToken').value=accessToken()
+loadOperatorWorkflows()
 refreshAll()
 setInterval(()=>{if(!refreshPaused)loadMonitor()},1000)
 </script>

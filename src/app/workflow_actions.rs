@@ -7,7 +7,7 @@ use anyhow::{Result, anyhow};
 use super::config::{PointConfig, RectConfig, WindowConfig};
 use super::geometry::Point;
 use super::input_actions::{
-    activate_game, click_game_point, focus_game, parse_key, paste_text, press_key,
+    activate_game, click_game_point, focus_game, hold_key, parse_key, paste_text, press_key,
 };
 use super::template_match::TemplateHit;
 use super::ui_locator::{UiLocator, UiRegion};
@@ -123,6 +123,35 @@ pub(super) fn paste(
         result.is_ok(),
         clipboard_hold_ms,
         text.chars().count()
+    );
+    result
+}
+
+pub(super) fn hold_key_text<F>(
+    key_text: &str,
+    hold_seconds: u64,
+    window_config: &WindowConfig,
+    should_continue: F,
+) -> Result<()>
+where
+    F: FnMut() -> bool,
+{
+    let started = Instant::now();
+    let key_text = key_text.trim();
+    if key_text.is_empty() {
+        return Err(anyhow!("自定义流程按住按键缺少 key"));
+    }
+    let result = hold_key(
+        parse_key(key_text)?,
+        Duration::from_secs(hold_seconds),
+        window_config,
+        should_continue,
+    );
+    log::info!(target: "timing",
+        "原子动作耗时: action=hold_key total={}ms configured={}ms success={}",
+        elapsed_ms(started),
+        hold_seconds.saturating_mul(1_000),
+        result.is_ok()
     );
     result
 }

@@ -1,9 +1,9 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 use anyhow::{Context, Result, anyhow};
 use axum::Router;
@@ -22,15 +22,24 @@ use url::form_urlencoded;
 
 use super::ai;
 use super::chat_listener::{ChatListenerMode, ChatListenerShared};
-use super::command::{self, ParsedCommand, PendingCommand, SongCommand, SongSource, UserCommand};
+use super::command::{
+    self, CustomWorkflowCommand, ParsedCommand, PendingCommand, SongCommand, SongSource,
+    UserCommand,
+};
 use super::config::AppConfig;
+use super::custom_workflow;
+use super::decision_control::{DecisionAction, DecisionControlShared};
 use super::feeluown::FeelUOwnClient;
+use super::geometry::parse_rect;
 use super::monitor::{MonitorQueueItem, MonitorShared};
 use super::queue::{PersistentQueue, QueueItem};
 use super::runtime_state::PersistentRuntimeState;
+use super::task_tracker::TaskTrackerShared;
+use super::web_tools::{WebToolRequest, WebToolShared, WebToolTemplate};
 
 const MAX_ACTIVE_CONNECTIONS: usize = 32;
 const PAGE: &str = include_str!("page.html");
+const TOOLS_PAGE: &str = include_str!("tools.html");
 
 type RouteHandler =
     fn(&[(String, String)], &HttpSharedState) -> std::result::Result<String, AppError>;
@@ -117,6 +126,12 @@ const ROUTES: &[RouteSpec] = &[
         handler: search_route,
     },
     RouteSpec {
+        path: "/search/candidates",
+        json: true,
+        mutating: false,
+        handler: search_candidates_route,
+    },
+    RouteSpec {
         path: "/player/play-uri",
         json: true,
         mutating: true,
@@ -171,6 +186,66 @@ const ROUTES: &[RouteSpec] = &[
         handler: chat_listener_mode_route,
     },
     RouteSpec {
+        path: "/tasks/cancel",
+        json: true,
+        mutating: true,
+        handler: task_cancel_route,
+    },
+    RouteSpec {
+        path: "/decisions/submit",
+        json: true,
+        mutating: true,
+        handler: decision_submit_route,
+    },
+    RouteSpec {
+        path: "/operator/lyrics",
+        json: true,
+        mutating: true,
+        handler: operator_lyrics_route,
+    },
+    RouteSpec {
+        path: "/operator/hall-detect",
+        json: true,
+        mutating: true,
+        handler: operator_hall_detect_route,
+    },
+    RouteSpec {
+        path: "/operator/hall-time",
+        json: true,
+        mutating: true,
+        handler: operator_hall_time_route,
+    },
+    RouteSpec {
+        path: "/operator/microphone",
+        json: true,
+        mutating: true,
+        handler: operator_microphone_route,
+    },
+    RouteSpec {
+        path: "/operator/commands",
+        json: true,
+        mutating: true,
+        handler: operator_commands_route,
+    },
+    RouteSpec {
+        path: "/operator/idle-exit",
+        json: true,
+        mutating: true,
+        handler: operator_idle_exit_route,
+    },
+    RouteSpec {
+        path: "/operator/workflows",
+        json: true,
+        mutating: false,
+        handler: operator_workflows_route,
+    },
+    RouteSpec {
+        path: "/operator/workflows/run",
+        json: true,
+        mutating: true,
+        handler: operator_workflow_run_route,
+    },
+    RouteSpec {
         path: "/ai/recognize",
         json: true,
         mutating: true,
@@ -213,6 +288,84 @@ const ROUTES: &[RouteSpec] = &[
         handler: monitor_route,
     },
     RouteSpec {
+        path: "/tools/task",
+        json: true,
+        mutating: false,
+        handler: tool_task_route,
+    },
+    RouteSpec {
+        path: "/tools/templates",
+        json: true,
+        mutating: false,
+        handler: tool_templates_route,
+    },
+    RouteSpec {
+        path: "/tools/ocr",
+        json: true,
+        mutating: true,
+        handler: tool_ocr_route,
+    },
+    RouteSpec {
+        path: "/tools/scan-chat",
+        json: true,
+        mutating: true,
+        handler: tool_scan_chat_route,
+    },
+    RouteSpec {
+        path: "/tools/ui-state",
+        json: true,
+        mutating: true,
+        handler: tool_ui_state_route,
+    },
+    RouteSpec {
+        path: "/tools/hall-name",
+        json: true,
+        mutating: true,
+        handler: tool_hall_name_route,
+    },
+    RouteSpec {
+        path: "/tools/template",
+        json: true,
+        mutating: true,
+        handler: tool_template_route,
+    },
+    RouteSpec {
+        path: "/tools/click",
+        json: true,
+        mutating: true,
+        handler: tool_click_route,
+    },
+    RouteSpec {
+        path: "/tools/key",
+        json: true,
+        mutating: true,
+        handler: tool_key_route,
+    },
+    RouteSpec {
+        path: "/tools/chat-change-samples",
+        json: true,
+        mutating: true,
+        handler: tool_chat_change_samples_route,
+    },
+    RouteSpec {
+        path: "/tools/panel-benchmark",
+        json: true,
+        mutating: true,
+        handler: tool_panel_benchmark_route,
+    },
+    RouteSpec {
+        path: "/tools/ocr-backends",
+        json: true,
+        mutating: true,
+        handler: tool_ocr_backends_route,
+    },
+    RouteSpec {
+        path: "/tools/ai-preview",
+        json: true,
+        mutating: true,
+        handler: tool_ai_preview_route,
+    },
+    RouteSpec {
         path: "/health",
         json: false,
         mutating: false,
@@ -229,7 +382,12 @@ pub struct HttpSharedState {
     pub chat_listener: ChatListenerShared,
     pub history: Arc<Mutex<VecDeque<HistoryItem>>>,
     pub active_connections: Arc<AtomicUsize>,
-    pending: Arc<(Mutex<VecDeque<super::PendingTask>>, Condvar)>,
+    pending: Arc<(Mutex<VecDeque<super::TrackedPendingTask>>, Condvar)>,
+    task_tracker: TaskTrackerShared,
+    decision_control: DecisionControlShared,
+    moderation_workflows: Arc<Mutex<HashSet<String>>>,
+    web_tools: WebToolShared,
+    latest_frame: Arc<Mutex<Option<Arc<image::DynamicImage>>>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -256,14 +414,25 @@ struct AppError {
     message: String,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct EnqueueReceipt {
+    task_id: u64,
+    position: usize,
+}
+
 impl HttpSharedState {
     pub(super) fn new(
         config: AppConfig,
         queue: Arc<Mutex<PersistentQueue>>,
         runtime_state: Arc<Mutex<PersistentRuntimeState>>,
-        pending: Arc<(Mutex<VecDeque<super::PendingTask>>, Condvar)>,
+        pending: Arc<(Mutex<VecDeque<super::TrackedPendingTask>>, Condvar)>,
         chat_listener: ChatListenerShared,
         monitor: MonitorShared,
+        task_tracker: TaskTrackerShared,
+        decision_control: DecisionControlShared,
+        moderation_workflows: Arc<Mutex<HashSet<String>>>,
+        web_tools: WebToolShared,
+        latest_frame: Arc<Mutex<Option<Arc<image::DynamicImage>>>>,
     ) -> Self {
         Self {
             config,
@@ -274,11 +443,23 @@ impl HttpSharedState {
             history: Arc::new(Mutex::new(VecDeque::new())),
             active_connections: Arc::new(AtomicUsize::new(0)),
             pending,
+            task_tracker,
+            decision_control,
+            moderation_workflows,
+            web_tools,
+            latest_frame,
         }
     }
 }
 
 pub fn start(state: HttpSharedState) -> Result<()> {
+    if !is_loopback_host(&state.config.http.host)
+        && state.config.http.access_token.trim().is_empty()
+    {
+        return Err(anyhow!(
+            "HTTP 监听地址不是本机地址，必须设置 http.access_token 后才能启动"
+        ));
+    }
     let bind_addr = format!("{}:{}", state.config.http.host, state.config.http.port);
     let listener = TcpListener::bind(&bind_addr)
         .with_context(|| format!("启动 HTTP/Web 面板失败: {}", bind_addr))?;
@@ -400,6 +581,15 @@ fn handle_request(
         ));
     }
 
+    if requires_access_token(&state.config.http, &request.path)
+        && !has_valid_access_token(&request, &state.config.http.access_token)
+    {
+        return Err(AppError {
+            status: 401,
+            message: "需要有效的 Web 访问令牌".to_string(),
+        });
+    }
+
     enforce_method(&request, state)?;
 
     if request.path == "/" && request.query.is_empty() {
@@ -407,6 +597,17 @@ fn handle_request(
             StatusCode::OK,
             "text/html; charset=utf-8",
             PAGE.to_string(),
+            cors_headers(&request, &state.config.http.host, state.config.http.port),
+        ));
+    }
+    if request.path == "/tools" && request.query.is_empty() {
+        if request.method != "GET" {
+            return Err(method_not_allowed("工具页面仅支持GET请求"));
+        }
+        return Ok(body_response(
+            StatusCode::OK,
+            "text/html; charset=utf-8",
+            TOOLS_PAGE.to_string(),
             cors_headers(&request, &state.config.http.host, state.config.http.port),
         ));
     }
@@ -586,6 +787,21 @@ fn search_route(
     client.search(&keyword, &source).map_err(internal_error)
 }
 
+fn search_candidates_route(
+    query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let keyword = normalize_keyword(query_value(query, "keyword"))?;
+    let source = normalize_optional_source(query_value(query, "source"))?;
+    let client = FeelUOwnClient::new(&state.config.feeluown, &state.config.timing);
+    serde_json::to_string(
+        &client
+            .search_candidates(&keyword, &source)
+            .map_err(internal_error)?,
+    )
+    .map_err(internal_error)
+}
+
 fn player_play_uri_route(
     query: &[(String, String)],
     state: &HttpSharedState,
@@ -615,6 +831,7 @@ fn player_play_uri_route(
         .map_err(|_| internal_message("音乐播放队列锁已损坏"))?;
     if !queue
         .push(QueueItem {
+            id: 0,
             keyword: keyword.clone(),
             source,
             prefer_accompaniment,
@@ -711,11 +928,11 @@ fn chat_listener_mode_route(
         })
         .to_string());
     }
-    let position = match enqueue_pending_task(
+    let receipt = match enqueue_pending_task(
         state,
         super::PendingTask::SetChatListenerMode { target: mode },
     ) {
-        Ok(position) => position,
+        Ok(receipt) => receipt,
         Err(error) => {
             state.chat_listener.cancel_mode_request(mode);
             sync_chat_listener_monitor(state);
@@ -726,11 +943,275 @@ fn chat_listener_mode_route(
     Ok(json!({
         "ok": true,
         "queued": true,
-        "position": position,
+        "taskId": receipt.task_id,
+        "position": receipt.position,
         "mode": snapshot.mode,
         "pendingMode": mode,
     })
     .to_string())
+}
+
+fn task_cancel_route(
+    query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let task_id = normalize_required_text(query_value(query, "id"), "id")?
+        .parse::<u64>()
+        .ok()
+        .filter(|id| *id > 0)
+        .ok_or_else(|| bad_request("无效的任务ID"))?;
+    let (lock, cvar) = &*state.pending;
+    let mut pending = lock
+        .lock()
+        .map_err(|_| internal_message("待处理任务队列锁已损坏"))?;
+    let Some(index) = pending.iter().position(|task| task.id == task_id) else {
+        return Err(AppError {
+            status: 409,
+            message: "任务已开始、已结束或不存在，不能撤销".to_string(),
+        });
+    };
+    let task = pending
+        .remove(index)
+        .ok_or_else(|| internal_message("待处理任务撤销失败"))?;
+    let label = task.label();
+    drop(pending);
+    let mut sync_listener = false;
+    match &task.task {
+        super::PendingTask::SetChatListenerMode { target } => {
+            state.chat_listener.cancel_mode_request(*target);
+            sync_listener = true;
+        }
+        super::PendingTask::SecondaryUnread { .. } | super::PendingTask::RestoreSecondaryHall => {
+            state.chat_listener.release_unread_task();
+            sync_listener = true;
+        }
+        super::PendingTask::ModerationVoteResult { workflow_key, .. } => {
+            match state.moderation_workflows.lock() {
+                Ok(mut workflows) => {
+                    workflows.remove(workflow_key);
+                }
+                Err(_) => log::error!("管理流程锁已损坏，撤销任务后无法释放流程: {workflow_key}"),
+            }
+            sync_listener = true;
+        }
+        _ => {}
+    }
+    drop(task);
+    if sync_listener {
+        sync_chat_listener_monitor(state);
+    }
+    state
+        .task_tracker
+        .cancel(task_id, format!("{}已由控制台撤销", label));
+    cvar.notify_all();
+    Ok(json!({ "ok": true, "taskId": task_id, "canceled": true }).to_string())
+}
+
+fn decision_submit_route(
+    query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let id = normalize_required_text(query_value(query, "id"), "id")?
+        .parse::<u64>()
+        .ok()
+        .filter(|id| *id > 0)
+        .ok_or_else(|| bad_request("无效的决策ID"))?;
+    let action_text = normalize_required_text(query_value(query, "action"), "action")?;
+    let action = DecisionAction::parse(&action_text)
+        .ok_or_else(|| bad_request("action仅支持confirm、skip、switch_source或ai"))?;
+    state
+        .decision_control
+        .submit(id, action)
+        .map_err(|error| AppError {
+            status: 409,
+            message: error.to_string(),
+        })?;
+    Ok(json!({ "ok": true, "decisionId": id, "submitted": action_text }).to_string())
+}
+
+fn operator_lyrics_route(
+    _query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    enqueue_remote_command(
+        state,
+        remote_control_command("歌词".to_string(), "歌词", UserCommand::Lyrics),
+    )
+}
+
+fn operator_hall_detect_route(
+    _query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    enqueue_remote_command(
+        state,
+        remote_control_command("大厅检测".to_string(), "大厅检测", UserCommand::HallDetect),
+    )
+}
+
+fn operator_hall_time_route(
+    _query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    enqueue_remote_command(
+        state,
+        remote_control_command("大厅时间".to_string(), "大厅时间", UserCommand::HallTime),
+    )
+}
+
+fn operator_microphone_route(
+    _query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    enqueue_remote_command(
+        state,
+        remote_control_command(
+            "麦克风".to_string(),
+            "麦克风",
+            UserCommand::Microphone {
+                username: "控制台".to_string(),
+            },
+        ),
+    )
+}
+
+fn operator_commands_route(
+    query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let enabled = match normalize_required_text(query_value(query, "enabled"), "enabled")?
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "1" | "true" | "on" | "enable" | "enabled" => true,
+        "0" | "false" | "off" | "disable" | "disabled" => false,
+        _ => return Err(bad_request("enabled参数必须是1或0")),
+    };
+    let (raw, command) = if enabled {
+        (
+            "启用".to_string(),
+            UserCommand::EnableCommands {
+                username: "控制台".to_string(),
+            },
+        )
+    } else {
+        (
+            "禁用".to_string(),
+            UserCommand::DisableCommands {
+                username: "控制台".to_string(),
+            },
+        )
+    };
+    enqueue_remote_command(state, remote_control_command(raw.clone(), &raw, command))
+}
+
+fn operator_idle_exit_route(
+    query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    if let Some(enabled) = query_value(query, "enabled") {
+        match enabled.trim().to_ascii_lowercase().as_str() {
+            "0" | "false" | "off" | "disabled" => {
+                let receipt = enqueue_pending_task(state, super::PendingTask::ClearIdleExit)?;
+                return Ok(json!({
+                    "ok": true,
+                    "queued": true,
+                    "taskId": receipt.task_id,
+                    "position": receipt.position,
+                    "command": "取消闲置退出"
+                })
+                .to_string());
+            }
+            "1" | "true" | "on" | "enabled" => {}
+            _ => return Err(bad_request("enabled参数必须是1或0")),
+        }
+    }
+    let minutes = normalize_required_text(query_value(query, "minutes"), "minutes")?
+        .parse::<u32>()
+        .ok()
+        .filter(|minutes| (15..=1440).contains(minutes))
+        .ok_or_else(|| bad_request("minutes参数必须在15到1440之间"))?;
+    enqueue_remote_command(
+        state,
+        remote_control_command(
+            format!("闲置退出 {minutes}"),
+            "闲置退出",
+            UserCommand::IdleExit { minutes },
+        ),
+    )
+}
+
+fn operator_workflows_route(
+    _query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let workflows = state
+        .config
+        .custom_workflows
+        .workflows
+        .iter()
+        .filter(|workflow| workflow.enabled)
+        .filter_map(|workflow| {
+            let name = if workflow.name.trim().is_empty() {
+                workflow.commands.first()?.trim()
+            } else {
+                workflow.name.trim()
+            };
+            Some(json!({
+                "name": name,
+                "commands": workflow.commands,
+                "allowArgs": workflow.allow_args,
+                "confirmBeforeRun": workflow.confirm_before_run,
+            }))
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string(&workflows).map_err(internal_error)
+}
+
+fn operator_workflow_run_route(
+    query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    if !state.config.custom_workflows.enabled {
+        return Err(bad_request("自定义工作流未启用"));
+    }
+    let name = normalize_required_text(query_value(query, "name"), "name")?;
+    let args = normalize_optional_text(query_value(query, "args"), "args")?;
+    let workflow = custom_workflow::find_workflow(&state.config.custom_workflows, &name)
+        .ok_or_else(|| bad_request("自定义工作流不存在或未启用"))?;
+    if !workflow.allow_args && !args.is_empty() {
+        return Err(bad_request("该自定义工作流不允许参数"));
+    }
+    let command_name = workflow
+        .commands
+        .first()
+        .map(|command| command.trim().trim_start_matches('@'))
+        .filter(|command| !command.is_empty())
+        .unwrap_or(name.as_str())
+        .to_string();
+    let workflow_name = if workflow.name.trim().is_empty() {
+        command_name.clone()
+    } else {
+        workflow.name.trim().to_string()
+    };
+    let raw = if args.is_empty() {
+        command_name.clone()
+    } else {
+        format!("{command_name} {args}")
+    };
+    let matched = command_name.clone();
+    enqueue_remote_command(
+        state,
+        remote_control_command(
+            raw,
+            &matched,
+            UserCommand::CustomWorkflow(CustomWorkflowCommand {
+                name: command_name,
+                workflow: workflow_name,
+                args,
+            }),
+        ),
+    )
 }
 
 fn ai_recognize_route(
@@ -782,6 +1263,284 @@ fn monitor_route(
     monitor_json(state)
 }
 
+fn tool_task_route(
+    query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let id = parse_tool_id(query)?;
+    let snapshot = state
+        .web_tools
+        .snapshot(id)
+        .map_err(internal_error)?
+        .ok_or_else(|| AppError {
+            status: 404,
+            message: "Web 工具任务不存在或已过期".to_string(),
+        })?;
+    serde_json::to_string(&snapshot).map_err(internal_error)
+}
+
+fn tool_templates_route(
+    _query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let marker_threshold = state.config.templates.marker_threshold;
+    let mut templates = vec![
+        json!({ "name": "blue-marker", "label": "蓝色聊天标志", "region": state.config.screen.chat_rect, "threshold": marker_threshold }),
+        json!({ "name": "yellow-marker", "label": "黄色聊天标志", "region": state.config.screen.chat_rect, "threshold": marker_threshold }),
+        json!({ "name": "pink-marker", "label": "粉色聊天标志", "region": state.config.screen.chat_rect, "threshold": marker_threshold }),
+        json!({ "name": "enter", "label": "回车界面", "region": state.config.screen.enter_rect, "threshold": marker_threshold }),
+        json!({ "name": "secondary-hall", "label": "二级当前大厅", "region": state.config.screen.secondary_hall_rect, "threshold": marker_threshold }),
+        json!({ "name": "invite-view-star", "label": "邀请查看千星", "region": state.config.invite.view_star_region, "threshold": marker_threshold }),
+        json!({ "name": "invite-goto-hall", "label": "邀请前往大厅", "region": state.config.invite.goto_hall_region, "threshold": marker_threshold }),
+        json!({ "name": "invite-enter-hall", "label": "邀请进入大厅", "region": state.config.invite.enter_hall_region, "threshold": marker_threshold }),
+        json!({ "name": "friend-panel", "label": "好友面板", "region": state.config.moderation.friend_panel_region, "threshold": marker_threshold }),
+        json!({ "name": "friend-search-panel", "label": "好友搜索面板", "region": state.config.moderation.search_panel_region, "threshold": marker_threshold }),
+        json!({ "name": "friend-more-settings", "label": "好友更多设置", "region": state.config.moderation.more_settings_region, "threshold": marker_threshold }),
+        json!({ "name": "friend-block-chat", "label": "屏蔽聊天", "region": state.config.moderation.block_chat_region, "threshold": marker_threshold }),
+        json!({ "name": "friend-blacklist", "label": "拉黑", "region": state.config.moderation.blacklist_region, "threshold": marker_threshold }),
+        json!({ "name": "friend-confirm", "label": "好友操作确认", "region": state.config.moderation.confirm_region, "threshold": marker_threshold }),
+        json!({ "name": "wonderland-enter-button", "label": "千星前往大厅", "region": state.config.startup.wonderland_enter_button_region, "threshold": state.config.startup.wonderland_enter_button_threshold }),
+        json!({ "name": "paimon-menu", "label": "派蒙主界面", "region": state.config.startup.main_ui_region, "threshold": state.config.startup.template_threshold }),
+        json!({ "name": "wonderland-close", "label": "千星主页关闭按钮", "region": state.config.startup.wonderland_close_region, "threshold": state.config.startup.template_threshold }),
+    ];
+    let mut custom = state
+        .config
+        .custom_workflows
+        .templates
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    custom.sort();
+    templates.extend(custom.into_iter().map(|name| {
+        json!({
+            "name": name,
+            "label": format!("自定义: {name}"),
+            "region": null,
+            "threshold": state.config.custom_workflows.default_threshold,
+        })
+    }));
+    serde_json::to_string(&templates).map_err(internal_error)
+}
+
+fn tool_ocr_route(
+    query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let rect = query_value(query, "rect")
+        .filter(|value| !value.trim().is_empty())
+        .map(parse_rect)
+        .transpose()
+        .map_err(|error| bad_request(&format!("rect参数无效: {error}")))?;
+    enqueue_web_tool(state, WebToolRequest::Ocr { rect })
+}
+
+fn tool_scan_chat_route(
+    _query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    enqueue_web_tool(state, WebToolRequest::ScanChat)
+}
+
+fn tool_ui_state_route(
+    _query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    enqueue_web_tool(state, WebToolRequest::UiState)
+}
+
+fn tool_hall_name_route(
+    _query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    enqueue_web_tool(state, WebToolRequest::HallName)
+}
+
+fn tool_template_route(
+    query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let name = normalize_required_text(query_value(query, "template"), "template")?;
+    let template = WebToolTemplate::parse(&name, &state.config.custom_workflows.templates)
+        .map_err(|error| bad_request(&error.to_string()))?;
+    let rect = query_value(query, "rect")
+        .filter(|value| !value.trim().is_empty())
+        .map(parse_rect)
+        .transpose()
+        .map_err(|error| bad_request(&format!("rect参数无效: {error}")))?;
+    let threshold = query_value(query, "threshold")
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| {
+            value
+                .trim()
+                .parse::<f32>()
+                .map_err(|_| bad_request("threshold参数必须是0到1之间的小数"))
+        })
+        .transpose()?;
+    if threshold.is_some_and(|value| !(0.0..=1.0).contains(&value)) {
+        return Err(bad_request("threshold参数必须是0到1之间的小数"));
+    }
+    enqueue_web_tool(
+        state,
+        WebToolRequest::MatchTemplate {
+            template,
+            rect,
+            threshold,
+            click: parse_bool(query_value(query, "click")),
+        },
+    )
+}
+
+fn tool_click_route(
+    query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let x = parse_coordinate(query_value(query, "x"), "x")?;
+    let y = parse_coordinate(query_value(query, "y"), "y")?;
+    enqueue_web_tool(state, WebToolRequest::Click { x, y })
+}
+
+fn tool_key_route(
+    query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let key = normalize_required_text(query_value(query, "key"), "key")?;
+    if key.chars().count() > 40 {
+        return Err(bad_request("key参数过长"));
+    }
+    enqueue_web_tool(state, WebToolRequest::Key { key })
+}
+
+fn tool_chat_change_samples_route(
+    query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let samples = parse_bounded_u32(query_value(query, "samples"), "samples", 1, 30, 10)?;
+    let interval_ms = parse_bounded_u64(
+        query_value(query, "intervalMs"),
+        "intervalMs",
+        50,
+        5_000,
+        state.config.timing.loop_idle_ms,
+    )?;
+    enqueue_web_tool(
+        state,
+        WebToolRequest::ChatChangeSamples {
+            samples,
+            interval_ms,
+        },
+    )
+}
+
+fn tool_panel_benchmark_route(
+    query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let rounds = parse_bounded_u32(query_value(query, "rounds"), "rounds", 1, 10, 3)?;
+    enqueue_web_tool(state, WebToolRequest::PanelResponseBenchmark { rounds })
+}
+
+fn tool_ocr_backends_route(
+    _query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    enqueue_web_tool(state, WebToolRequest::OcrBackendProbe)
+}
+
+fn tool_ai_preview_route(
+    query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let keyword = normalize_keyword(query_value(query, "keyword"))?;
+    let prefer_accompaniment = parse_bool(query_value_or(
+        query,
+        "preferAccompaniment",
+        "accompaniment",
+    ));
+    enqueue_web_tool(
+        state,
+        WebToolRequest::AiSearchPreview {
+            keyword,
+            prefer_accompaniment,
+        },
+    )
+}
+
+fn enqueue_web_tool(
+    state: &HttpSharedState,
+    request: WebToolRequest,
+) -> std::result::Result<String, AppError> {
+    let snapshot = state.web_tools.enqueue(request).map_err(|error| AppError {
+        status: if error.to_string().contains("任务过多") {
+            429
+        } else {
+            500
+        },
+        message: error.to_string(),
+    })?;
+    let (_, cvar) = &*state.pending;
+    cvar.notify_one();
+    serde_json::to_string(&snapshot).map_err(internal_error)
+}
+
+fn parse_tool_id(query: &[(String, String)]) -> std::result::Result<u64, AppError> {
+    query_value(query, "id")
+        .ok_or_else(|| bad_request("缺少id参数"))?
+        .parse::<u64>()
+        .map_err(|_| bad_request("id参数无效"))
+}
+
+fn parse_coordinate(value: Option<&str>, name: &str) -> std::result::Result<i32, AppError> {
+    normalize_required_text(value, name)?
+        .parse::<i32>()
+        .map_err(|_| bad_request(&format!("{}参数必须是整数", name)))
+}
+
+fn parse_bounded_u32(
+    value: Option<&str>,
+    name: &str,
+    min: u32,
+    max: u32,
+    default: u32,
+) -> std::result::Result<u32, AppError> {
+    let Some(value) = value.filter(|value| !value.trim().is_empty()) else {
+        return Ok(default);
+    };
+    let parsed = value
+        .parse::<u32>()
+        .map_err(|_| bad_request(&format!("{}参数必须是整数", name)))?;
+    if (min..=max).contains(&parsed) {
+        Ok(parsed)
+    } else {
+        Err(bad_request(&format!(
+            "{}参数必须在{}到{}之间",
+            name, min, max
+        )))
+    }
+}
+
+fn parse_bounded_u64(
+    value: Option<&str>,
+    name: &str,
+    min: u64,
+    max: u64,
+    default: u64,
+) -> std::result::Result<u64, AppError> {
+    let Some(value) = value.filter(|value| !value.trim().is_empty()) else {
+        return Ok(default);
+    };
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|_| bad_request(&format!("{}参数必须是整数", name)))?;
+    if (min..=max).contains(&parsed) {
+        Ok(parsed)
+    } else {
+        Err(bad_request(&format!(
+            "{}参数必须在{}到{}之间",
+            name, min, max
+        )))
+    }
+}
+
 fn health_route(
     _query: &[(String, String)],
     _state: &HttpSharedState,
@@ -806,11 +1565,14 @@ fn enqueue_remote_command(
 ) -> std::result::Result<String, AppError> {
     let command = pending.parsed.raw.clone();
     let queued = enqueue_pending_command(state, pending)?;
+    let task_id = queued.map(|receipt| receipt.task_id);
+    let position = queued.map_or(0, |receipt| receipt.position);
     Ok(json!({
         "ok": true,
-        "queued": queued > 0,
-        "duplicate": queued == 0,
-        "position": queued,
+        "queued": queued.is_some(),
+        "duplicate": queued.is_none(),
+        "taskId": task_id,
+        "position": position,
         "command": command,
     })
     .to_string())
@@ -856,17 +1618,27 @@ fn enqueue_startup_task_response<const N: usize>(
     task_label: &'static str,
     tasks: [super::PendingTask; N],
 ) -> std::result::Result<String, AppError> {
-    let positions = enqueue_pending_tasks(state, tasks)?;
+    let receipts = enqueue_pending_tasks(state, tasks)?;
+    let positions = receipts
+        .iter()
+        .map(|receipt| receipt.position)
+        .collect::<Vec<_>>();
+    let task_ids = receipts
+        .iter()
+        .map(|receipt| receipt.task_id)
+        .collect::<Vec<_>>();
     let mut response = json!({
         "ok": true,
         "queued": true,
         "task": task_label,
     });
     if let Some(object) = response.as_object_mut() {
-        if positions.len() == 1 {
+        if receipts.len() == 1 {
             object.insert("position".to_string(), json!(positions[0]));
+            object.insert("taskId".to_string(), json!(task_ids[0]));
         } else {
             object.insert("positions".to_string(), json!(positions));
+            object.insert("taskIds".to_string(), json!(task_ids));
         }
     }
     Ok(response.to_string())
@@ -902,11 +1674,14 @@ fn enqueue_remote_song(
     let pending = remote_song_command(keyword, source, prefer_accompaniment, ai_assisted)?;
     let command = pending.parsed.raw.clone();
     let queued = enqueue_pending_command(state, pending)?;
+    let task_id = queued.map(|receipt| receipt.task_id);
+    let position = queued.map_or(0, |receipt| receipt.position);
     Ok(json!({
         "ok": true,
-        "queued": queued > 0,
-        "duplicate": queued == 0,
-        "position": queued,
+        "queued": queued.is_some(),
+        "duplicate": queued.is_none(),
+        "taskId": task_id,
+        "position": position,
         "command": command,
     })
     .to_string())
@@ -935,7 +1710,12 @@ fn remote_song_command(
         match source.as_str() {
             "qqmusic" => ("点歌", SongSource::QqMusic),
             "netease" => ("网易点歌", SongSource::Netease),
-            _ => return Err(bad_request("远程点歌source只允许qqmusic或netease")),
+            "bilibili" => ("B站点歌", SongSource::Bilibili),
+            _ => {
+                return Err(bad_request(
+                    "远程点歌source只允许qqmusic、netease或bilibili",
+                ));
+            }
         }
     };
     let user_command = if prefer_accompaniment {
@@ -997,6 +1777,7 @@ fn queue_add(
         .map_err(|_| internal_message("队列锁已损坏"))?;
     if !queue
         .push(QueueItem {
+            id: 0,
             keyword,
             source,
             prefer_accompaniment: prefer,
@@ -1024,7 +1805,21 @@ fn queue_remove(
         .queue
         .lock()
         .map_err(|_| internal_message("队列锁已损坏"))?;
-    if let Some(index_text) = query_value(query, "index") {
+    let removed = if let Some(id_text) = query_value(query, "id").filter(|value| !value.is_empty())
+    {
+        let id = id_text
+            .parse::<u64>()
+            .ok()
+            .filter(|id| *id > 0)
+            .ok_or_else(|| bad_request("无效的队列项ID"))?;
+        queue
+            .remove_id(id)
+            .map_err(internal_error)?
+            .ok_or_else(|| AppError {
+                status: 409,
+                message: "队列已发生变化，请刷新后重试".to_string(),
+            })?
+    } else if let Some(index_text) = query_value(query, "index") {
         if !index_text.is_empty() {
             let index = index_text
                 .parse::<usize>()
@@ -1032,15 +1827,43 @@ fn queue_remove(
             if index >= queue.len() {
                 return Err(bad_request("无效的队列索引"));
             }
-            queue.remove_indexes(&[index]).map_err(internal_error)?;
+            queue
+                .remove_indexes(&[index])
+                .map_err(internal_error)?
+                .into_iter()
+                .next()
+                .ok_or_else(|| internal_message("队列删除结果为空"))?
         } else if !queue.is_empty() {
-            queue.remove_indexes(&[0]).map_err(internal_error)?;
+            queue
+                .remove_indexes(&[0])
+                .map_err(internal_error)?
+                .into_iter()
+                .next()
+                .ok_or_else(|| internal_message("队首删除结果为空"))?
+        } else {
+            return Err(bad_request("队列为空"));
         }
     } else if !queue.is_empty() {
-        queue.remove_indexes(&[0]).map_err(internal_error)?;
-    }
+        queue
+            .remove_indexes(&[0])
+            .map_err(internal_error)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| internal_message("队首删除结果为空"))?
+    } else {
+        return Err(bad_request("队列为空"));
+    };
     sync_monitor_queue(&state.monitor, &queue);
-    Ok(json!({ "ok": true, "size": queue.len() }).to_string())
+    Ok(json!({
+        "ok": true,
+        "size": queue.len(),
+        "removed": {
+            "index": removed.0,
+            "id": removed.1.id,
+            "keyword": removed.1.keyword,
+        }
+    })
+    .to_string())
 }
 
 fn queue_clear(state: &HttpSharedState) -> std::result::Result<String, AppError> {
@@ -1059,6 +1882,7 @@ fn sync_monitor_queue(monitor: &MonitorShared, queue: &PersistentQueue) {
             .items()
             .iter()
             .map(|item| MonitorQueueItem {
+                id: item.id,
                 keyword: item.keyword.clone(),
                 source: item.source.clone(),
                 prefer_accompaniment: item.prefer_accompaniment,
@@ -1128,7 +1952,15 @@ fn screenshot_response(
     state: &HttpSharedState,
 ) -> std::result::Result<Response, AppError> {
     let quality = parse_jpeg_quality(query_value(&request.query, "quality"))?;
-    let image = super::window::capture_game(&state.config.window).map_err(internal_error)?;
+    let image = state
+        .latest_frame
+        .lock()
+        .map_err(|_| internal_message("主扫描画面缓存锁已损坏"))?
+        .clone()
+        .ok_or_else(|| AppError {
+            status: 503,
+            message: "尚未获取主扫描画面，请稍后重试".to_string(),
+        })?;
     let rgb = image.to_rgb8();
     let mut bytes = Vec::new();
     let mut encoder = JpegEncoder::new_with_quality(&mut bytes, quality);
@@ -1154,6 +1986,21 @@ fn monitor_json(state: &HttpSharedState) -> std::result::Result<String, AppError
             "chatListener".to_string(),
             serde_json::to_value(state.chat_listener.snapshot()).map_err(internal_error)?,
         );
+        object.insert(
+            "webTools".to_string(),
+            serde_json::to_value(state.web_tools.recent().map_err(internal_error)?)
+                .map_err(internal_error)?,
+        );
+        object.insert(
+            "tasks".to_string(),
+            serde_json::to_value(state.task_tracker.recent().map_err(internal_error)?)
+                .map_err(internal_error)?,
+        );
+        object.insert(
+            "decision".to_string(),
+            serde_json::to_value(state.decision_control.snapshot().map_err(internal_error)?)
+                .map_err(internal_error)?,
+        );
     }
     serde_json::to_string(&value).map_err(internal_error)
 }
@@ -1161,7 +2008,7 @@ fn monitor_json(state: &HttpSharedState) -> std::result::Result<String, AppError
 fn sync_chat_listener_monitor(state: &HttpSharedState) {
     let snapshot = state.chat_listener.snapshot();
     state.monitor.set_chat_listener(
-        snapshot.mode.label(),
+        snapshot.display_mode(),
         snapshot.pending_mode.map(|mode| mode.label().to_string()),
     );
 }
@@ -1186,8 +2033,15 @@ fn chat_send(
         String::new()
     };
     let message = format!("{}{}", prefix, text);
-    let position = enqueue_pending_task(state, super::PendingTask::ConsoleChat { text, prefix })?;
-    Ok(json!({ "ok": true, "queued": true, "position": position, "message": message }).to_string())
+    let receipt = enqueue_pending_task(state, super::PendingTask::ConsoleChat { text, prefix })?;
+    Ok(json!({
+        "ok": true,
+        "queued": true,
+        "taskId": receipt.task_id,
+        "position": receipt.position,
+        "message": message
+    })
+    .to_string())
 }
 
 fn pending_task_labels(state: &HttpSharedState) -> std::result::Result<Vec<String>, AppError> {
@@ -1195,44 +2049,55 @@ fn pending_task_labels(state: &HttpSharedState) -> std::result::Result<Vec<Strin
     let guard = lock
         .lock()
         .map_err(|_| internal_message("待处理任务队列锁已损坏"))?;
-    Ok(guard.iter().map(super::PendingTask::label).collect())
+    Ok(guard.iter().map(super::TrackedPendingTask::label).collect())
 }
 
 fn enqueue_pending_task(
     state: &HttpSharedState,
     task: super::PendingTask,
-) -> std::result::Result<usize, AppError> {
+) -> std::result::Result<EnqueueReceipt, AppError> {
     let (lock, cvar) = &*state.pending;
     let mut guard = lock
         .lock()
         .map_err(|_| internal_message("待处理任务队列锁已损坏"))?;
-    guard.push_back(task);
+    let task_id = state
+        .task_tracker
+        .create(task.label())
+        .map_err(internal_error)?;
+    guard.push_back(super::TrackedPendingTask { id: task_id, task });
     let position = guard.len();
     cvar.notify_one();
-    Ok(position)
+    Ok(EnqueueReceipt { task_id, position })
 }
 
 fn enqueue_pending_tasks<const N: usize>(
     state: &HttpSharedState,
     tasks: [super::PendingTask; N],
-) -> std::result::Result<Vec<usize>, AppError> {
+) -> std::result::Result<Vec<EnqueueReceipt>, AppError> {
     let (lock, cvar) = &*state.pending;
     let mut guard = lock
         .lock()
         .map_err(|_| internal_message("待处理任务队列锁已损坏"))?;
-    let mut positions = Vec::with_capacity(N);
+    let mut receipts = Vec::with_capacity(N);
     for task in tasks {
-        guard.push_back(task);
-        positions.push(guard.len());
+        let task_id = state
+            .task_tracker
+            .create(task.label())
+            .map_err(internal_error)?;
+        guard.push_back(super::TrackedPendingTask { id: task_id, task });
+        receipts.push(EnqueueReceipt {
+            task_id,
+            position: guard.len(),
+        });
     }
     cvar.notify_one();
-    Ok(positions)
+    Ok(receipts)
 }
 
 fn enqueue_pending_command(
     state: &HttpSharedState,
     pending: PendingCommand,
-) -> std::result::Result<usize, AppError> {
+) -> std::result::Result<Option<EnqueueReceipt>, AppError> {
     let (lock, cvar) = &*state.pending;
     let mut guard = lock
         .lock()
@@ -1241,19 +2106,26 @@ fn enqueue_pending_command(
         .iter()
         .any(|task| task.same_lock_command(&pending.parsed))
     {
-        return Ok(0);
+        return Ok(None);
     }
-    guard.push_back(super::PendingTask::Command(Box::new(pending)));
+    let task = super::PendingTask::Command(Box::new(pending));
+    let task_id = state
+        .task_tracker
+        .create(task.label())
+        .map_err(internal_error)?;
+    guard.push_back(super::TrackedPendingTask { id: task_id, task });
     let position = guard.len();
     cvar.notify_one();
-    Ok(position)
+    Ok(Some(EnqueueReceipt { task_id, position }))
 }
 
 fn push_history(request: &Request, result: &str, ok: bool, state: &HttpSharedState) {
-    if matches!(
-        request.path.as_str(),
-        "/history" | "/clear-history" | "/monitor" | "/screenshot" | "/favicon.ico"
-    ) {
+    if request.path.starts_with("/tools/")
+        || matches!(
+            request.path.as_str(),
+            "/history" | "/clear-history" | "/monitor" | "/screenshot" | "/favicon.ico"
+        )
+    {
         return;
     }
     if let Ok(mut history) = state.history.lock() {
@@ -1352,8 +2224,8 @@ fn validate_source(raw: &str) -> std::result::Result<String, AppError> {
         return Ok(text);
     }
     for part in text.split(',').map(str::trim) {
-        if !part.is_empty() && part != "qqmusic" && part != "netease" {
-            return Err(bad_request("source参数只允许qqmusic或netease"));
+        if !part.is_empty() && part != "qqmusic" && part != "netease" && part != "bilibili" {
+            return Err(bad_request("source参数只允许qqmusic、netease或bilibili"));
         }
     }
     Ok(text)
@@ -1378,6 +2250,7 @@ fn source_from_fuo_uri(uri: &str) -> Option<&'static str> {
     match source {
         "qqmusic" => Some("qqmusic"),
         "netease" => Some("netease"),
+        "bilibili" => Some("bilibili"),
         _ => None,
     }
 }
@@ -1468,6 +2341,9 @@ fn sanitized_query(query: &[(String, String)]) -> HashMap<String, String> {
             let value = if key.eq_ignore_ascii_case("apiKey")
                 || key.eq_ignore_ascii_case("api_key")
                 || key.eq_ignore_ascii_case("token")
+                || key.eq_ignore_ascii_case("access_token")
+                || key.eq_ignore_ascii_case("authorization")
+                || key.eq_ignore_ascii_case("password")
             {
                 "***".to_string()
             } else {
@@ -1478,12 +2354,17 @@ fn sanitized_query(query: &[(String, String)]) -> HashMap<String, String> {
         .collect()
 }
 
+fn requires_access_token(config: &super::config::HttpConfig, path: &str) -> bool {
+    !config.access_token.trim().is_empty()
+        && !matches!(path, "/" | "/tools" | "/favicon.ico" | "/health")
+}
+
+fn has_valid_access_token(request: &Request, expected: &str) -> bool {
+    header_value(request, "x-miliastra-token").is_some_and(|value| value == expected)
+}
+
 fn current_time_text() -> String {
-    let seconds = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0);
-    seconds.to_string()
+    super::logger::format_time(SystemTime::now())
 }
 
 fn is_json_route(path: &str) -> bool {
@@ -1499,6 +2380,13 @@ fn enforce_method(
     }
     if is_mutating_route(&request.path) && request.method != "POST" {
         return Err(method_not_allowed("该接口需要POST请求"));
+    }
+    if matches!(
+        request.path.as_str(),
+        "/" | "/tools" | "/screenshot" | "/favicon.ico"
+    ) && request.method != "GET"
+    {
+        return Err(method_not_allowed("该资源仅支持GET请求"));
     }
     Ok(())
 }
@@ -1710,7 +2598,7 @@ fn options_headers(request: &Request, host: &str, port: u16) -> Vec<(String, Str
     ));
     headers.push((
         "Access-Control-Allow-Headers".to_string(),
-        "Content-Type".to_string(),
+        "Content-Type, X-Miliastra-Token".to_string(),
     ));
     headers
 }
@@ -1761,6 +2649,190 @@ mod tests {
     #[test]
     fn chat_send_requires_post() {
         assert!(is_mutating_route("/chat/send"));
+    }
+
+    #[test]
+    fn web_tool_routes_are_queued_json_post_routes() {
+        for route in [
+            "/tools/ocr",
+            "/tools/scan-chat",
+            "/tools/ui-state",
+            "/tools/hall-name",
+            "/tools/template",
+            "/tools/click",
+            "/tools/key",
+            "/tools/chat-change-samples",
+            "/tools/panel-benchmark",
+            "/tools/ocr-backends",
+            "/tools/ai-preview",
+        ] {
+            assert!(is_mutating_route(route), "{route} should require POST");
+            assert!(is_json_route(route), "{route} should return JSON");
+        }
+        assert!(!is_mutating_route("/tools/task"));
+        assert!(is_json_route("/tools/task"));
+        assert!(TOOLS_PAGE.contains("Miliastra 高级控制"));
+    }
+
+    #[test]
+    fn web_tools_wait_outside_the_formal_pending_queue() {
+        let state = test_state();
+        let body = tool_ui_state_route(&[], &state).expect("tool route succeeds");
+        let ticket: Value = serde_json::from_str(&body).expect("tool ticket");
+        let id = ticket["id"].as_u64().expect("tool id");
+
+        assert_eq!(ticket["status"], "queued");
+        assert!(
+            pending_task_labels(&state)
+                .expect("pending labels")
+                .is_empty()
+        );
+        assert_eq!(
+            state
+                .web_tools
+                .snapshot(id)
+                .expect("tool snapshot")
+                .expect("queued tool")
+                .label,
+            "UI 状态检测"
+        );
+    }
+
+    #[test]
+    fn web_tool_ocr_rejects_malformed_rect_as_client_error() {
+        let state = test_state();
+        let error = tool_ocr_route(&[("rect".to_string(), "invalid".to_string())], &state)
+            .expect_err("invalid rect rejected");
+
+        assert_eq!(error.status, 400);
+        assert!(error.message.contains("rect参数无效"));
+    }
+
+    #[test]
+    fn web_tool_templates_expose_configured_fixed_regions() {
+        let state = test_state();
+        let body = tool_templates_route(&[], &state).expect("template list");
+        let templates: Vec<Value> = serde_json::from_str(&body).expect("template list json");
+        let marker_threshold = state.config.templates.marker_threshold;
+        let expected = [
+            (
+                "blue-marker",
+                state.config.screen.chat_rect,
+                marker_threshold,
+            ),
+            (
+                "yellow-marker",
+                state.config.screen.chat_rect,
+                marker_threshold,
+            ),
+            (
+                "pink-marker",
+                state.config.screen.chat_rect,
+                marker_threshold,
+            ),
+            ("enter", state.config.screen.enter_rect, marker_threshold),
+            (
+                "secondary-hall",
+                state.config.screen.secondary_hall_rect,
+                marker_threshold,
+            ),
+            (
+                "invite-view-star",
+                state.config.invite.view_star_region,
+                marker_threshold,
+            ),
+            (
+                "invite-goto-hall",
+                state.config.invite.goto_hall_region,
+                marker_threshold,
+            ),
+            (
+                "invite-enter-hall",
+                state.config.invite.enter_hall_region,
+                marker_threshold,
+            ),
+            (
+                "friend-panel",
+                state.config.moderation.friend_panel_region,
+                marker_threshold,
+            ),
+            (
+                "friend-search-panel",
+                state.config.moderation.search_panel_region,
+                marker_threshold,
+            ),
+            (
+                "friend-more-settings",
+                state.config.moderation.more_settings_region,
+                marker_threshold,
+            ),
+            (
+                "friend-block-chat",
+                state.config.moderation.block_chat_region,
+                marker_threshold,
+            ),
+            (
+                "friend-blacklist",
+                state.config.moderation.blacklist_region,
+                marker_threshold,
+            ),
+            (
+                "friend-confirm",
+                state.config.moderation.confirm_region,
+                marker_threshold,
+            ),
+            (
+                "wonderland-enter-button",
+                state.config.startup.wonderland_enter_button_region,
+                state.config.startup.wonderland_enter_button_threshold,
+            ),
+            (
+                "paimon-menu",
+                state.config.startup.main_ui_region,
+                state.config.startup.template_threshold,
+            ),
+            (
+                "wonderland-close",
+                state.config.startup.wonderland_close_region,
+                state.config.startup.template_threshold,
+            ),
+        ];
+        for (name, region, threshold) in expected {
+            let template = templates
+                .iter()
+                .find(|template| template["name"] == name)
+                .unwrap_or_else(|| panic!("missing template {name}"));
+            assert_eq!(
+                template["region"],
+                serde_json::to_value(region).expect("template region json"),
+                "template region mismatch: {name}"
+            );
+            let actual_threshold =
+                template["threshold"].as_f64().expect("template threshold") as f32;
+            assert!(
+                (actual_threshold - threshold).abs() < f32::EPSILON,
+                "template threshold mismatch: {name}"
+            );
+        }
+        assert!(TOOLS_PAGE.contains("useConfiguredTemplateRegion"));
+    }
+
+    #[test]
+    fn remote_http_api_requires_token_when_configured() {
+        let mut config: AppConfig =
+            serde_yaml::from_str(include_str!("../../config.yaml")).expect("default config");
+        config.http.host = "0.0.0.0".to_string();
+        config.http.access_token = "secret".to_string();
+        let request = Request {
+            method: "GET".to_string(),
+            path: "/monitor".to_string(),
+            query: Vec::new(),
+            headers: HeaderMap::new(),
+        };
+
+        assert!(requires_access_token(&config.http, &request.path));
+        assert!(!has_valid_access_token(&request, &config.http.access_token));
+        assert!(!requires_access_token(&config.http, "/"));
     }
 
     #[test]
@@ -1877,7 +2949,150 @@ mod tests {
         assert!(PAGE.contains("bindEnter('consoleChatPrefix',sendConsoleChat)"));
         assert!(PAGE.contains("bindEnter('keyword',()=>remoteSong(false))"));
         assert!(PAGE.contains("bindEnter('volumeInput',setVolume)"));
-        assert!(PAGE.contains("bindEnter('removeIndex',queueRemove)"));
+        assert!(PAGE.contains("bindEnter('workflowArgs',runWorkflow)"));
+        assert!(PAGE.contains("function removeQueueId(id)"));
+    }
+
+    #[test]
+    fn remote_control_response_includes_trackable_task_id() {
+        let state = test_state();
+        let body = play_route(&[], &state).expect("play route");
+        let response: Value = serde_json::from_str(&body).expect("play response json");
+        let task_id = response["taskId"].as_u64().expect("task id");
+
+        assert_eq!(response["queued"], true);
+        assert_eq!(response["position"], 1);
+        assert_eq!(
+            pending_task_labels(&state).expect("pending labels"),
+            vec!["控制台命令: 继续"]
+        );
+        let tasks = state.task_tracker.recent().expect("task snapshots");
+        assert_eq!(tasks[0].id, task_id);
+        assert_eq!(tasks[0].status, "queued");
+    }
+
+    #[test]
+    fn waiting_formal_task_can_be_canceled() {
+        let state = test_state();
+        let body = pause_route(&[], &state).expect("pause route");
+        let response: Value = serde_json::from_str(&body).expect("pause response json");
+        let task_id = response["taskId"].as_u64().expect("task id");
+
+        let cancel_body = task_cancel_route(&[("id".to_string(), task_id.to_string())], &state)
+            .expect("cancel route");
+        let canceled: Value = serde_json::from_str(&cancel_body).expect("cancel response json");
+
+        assert_eq!(canceled["canceled"], true);
+        assert!(
+            pending_task_labels(&state)
+                .expect("pending labels")
+                .is_empty()
+        );
+        let task = state
+            .task_tracker
+            .recent()
+            .expect("task snapshots")
+            .into_iter()
+            .find(|task| task.id == task_id)
+            .expect("canceled task");
+        assert_eq!(task.status, "canceled");
+        assert!(task.result.expect("cancel result").contains("控制台撤销"));
+    }
+
+    #[test]
+    fn canceling_secondary_recovery_releases_unread_claim() {
+        let state = test_state();
+        state
+            .chat_listener
+            .complete_mode_switch(ChatListenerMode::Secondary);
+        assert!(state.chat_listener.claim_unread_task());
+        let receipt = enqueue_pending_task(&state, super::super::PendingTask::RestoreSecondaryHall)
+            .expect("enqueue recovery");
+
+        task_cancel_route(&[("id".to_string(), receipt.task_id.to_string())], &state)
+            .expect("cancel recovery");
+
+        assert!(!state.chat_listener.snapshot().unread_task_pending);
+    }
+
+    #[test]
+    fn canceling_moderation_result_releases_workflow_and_listener_hold() {
+        let state = test_state();
+        state
+            .chat_listener
+            .complete_mode_switch(ChatListenerMode::Secondary);
+        let workflow_key = "blacklist:123456789".to_string();
+        state
+            .moderation_workflows
+            .lock()
+            .expect("moderation workflow lock")
+            .insert(workflow_key.clone());
+        let temporary_primary_hold =
+            super::super::TemporaryPrimaryHold::new(state.chat_listener.clone())
+                .expect("temporary primary hold");
+        let receipt = enqueue_pending_task(
+            &state,
+            super::super::PendingTask::ModerationVoteResult {
+                command: Box::new(command::ModerationCommand {
+                    action: command::ModerationAction::Blacklist,
+                    uid: "123456789".to_string(),
+                    requester: "测试用户".to_string(),
+                }),
+                approved: false,
+                workflow_key: workflow_key.clone(),
+                temporary_primary_hold,
+            },
+        )
+        .expect("enqueue moderation result");
+        assert!(state.chat_listener.snapshot().temporary_primary);
+
+        task_cancel_route(&[("id".to_string(), receipt.task_id.to_string())], &state)
+            .expect("cancel moderation result");
+
+        assert!(
+            !state
+                .moderation_workflows
+                .lock()
+                .expect("moderation workflow lock")
+                .contains(&workflow_key)
+        );
+        assert!(!state.chat_listener.snapshot().temporary_primary);
+    }
+
+    #[test]
+    fn web_decision_submission_reaches_active_song_decision() {
+        let state = test_state();
+        let session = state
+            .decision_control
+            .begin(
+                "点歌候选确认",
+                true,
+                false,
+                std::time::Duration::from_secs(1),
+            )
+            .expect("decision session");
+        let id = state
+            .decision_control
+            .snapshot()
+            .expect("decision snapshot")
+            .expect("active decision")
+            .id;
+
+        decision_submit_route(
+            &[
+                ("id".to_string(), id.to_string()),
+                ("action".to_string(), "switch_source".to_string()),
+            ],
+            &state,
+        )
+        .expect("decision route");
+
+        assert_eq!(
+            session
+                .wait(std::time::Duration::from_millis(1))
+                .expect("decision wait"),
+            Some(DecisionAction::SwitchSource)
+        );
     }
 
     #[test]
@@ -1968,6 +3183,58 @@ mod tests {
     }
 
     #[test]
+    fn remote_song_command_supports_bilibili_source() {
+        let pending = remote_song_command(
+            "耀斑 HOYO-MiX".to_string(),
+            "bilibili".to_string(),
+            false,
+            false,
+        )
+        .expect("remote bilibili song command");
+
+        assert_eq!(pending.parsed.raw, "B站点歌 耀斑 HOYO-MiX");
+        match pending.parsed.command {
+            UserCommand::Song(song) => {
+                assert_eq!(song.source, SongSource::Bilibili);
+                assert_eq!(song.prefix, "B站点歌");
+            }
+            _ => panic!("expected song command"),
+        }
+    }
+
+    #[test]
+    fn queue_removal_by_id_survives_automatic_front_shift() {
+        let state = test_state();
+        let third_id = {
+            let mut queue = state.queue.lock().expect("queue lock");
+            for keyword in ["第一首", "第二首", "第三首"] {
+                queue
+                    .push(QueueItem {
+                        keyword: keyword.to_string(),
+                        ..QueueItem::default()
+                    })
+                    .expect("queue push");
+            }
+            let third_id = queue.items()[2].id;
+            assert_eq!(
+                queue.shift().expect("queue shift").unwrap().keyword,
+                "第一首"
+            );
+            third_id
+        };
+
+        let body = queue_remove(&[("id".to_string(), third_id.to_string())], &state)
+            .expect("remove by id");
+        let response: Value = serde_json::from_str(&body).expect("remove response json");
+
+        assert_eq!(response["removed"]["id"], third_id);
+        assert_eq!(response["removed"]["keyword"], "第三首");
+        let queue = state.queue.lock().expect("queue lock");
+        assert_eq!(queue.items().len(), 1);
+        assert_eq!(queue.items()[0].keyword, "第二首");
+    }
+
+    #[test]
     fn remote_plain_song_rejects_multi_source() {
         let error = remote_song_command(
             "晴天".to_string(),
@@ -2016,7 +3283,7 @@ mod tests {
         let mut config: AppConfig =
             serde_yaml::from_str(include_str!("../../config.yaml")).expect("default config");
         let suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
+            .duration_since(std::time::UNIX_EPOCH)
             .expect("system time")
             .as_nanos();
         let dir = std::env::temp_dir().join(format!("mwm-http-test-{suffix}"));
@@ -2033,7 +3300,7 @@ mod tests {
                 .expect("runtime state"),
         ));
         let pending = Arc::new((
-            Mutex::new(VecDeque::<super::super::PendingTask>::new()),
+            Mutex::new(VecDeque::<super::super::TrackedPendingTask>::new()),
             Condvar::new(),
         ));
         let monitor = MonitorShared::new(20);
@@ -2044,6 +3311,11 @@ mod tests {
             pending,
             ChatListenerShared::new(),
             monitor,
+            TaskTrackerShared::new(),
+            DecisionControlShared::new(),
+            Arc::new(Mutex::new(HashSet::new())),
+            WebToolShared::new(),
+            Arc::new(Mutex::new(None)),
         )
     }
 }

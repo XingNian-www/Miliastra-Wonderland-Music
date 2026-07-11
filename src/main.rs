@@ -15,7 +15,9 @@ mod app {
     mod config;
     mod config_migration;
     mod custom_workflow;
+    mod decision_control;
     mod decision_lock;
+    mod deferred_chat;
     mod dpi;
     mod feeluown;
     mod frame_source;
@@ -24,9 +26,9 @@ mod app {
     mod hall_info;
     mod hotkeys;
     mod http_server;
+    mod idiom_chain;
     mod input_actions;
     mod logger;
-    mod manual_tools;
     mod monitor;
     mod ocr;
     mod ocr_batch;
@@ -38,16 +40,19 @@ mod app {
     mod song_matcher;
     mod song_review;
     mod startup_flow;
+    mod task_tracker;
     mod template_match;
     mod tui;
     mod ui_locator;
     mod ui_state;
+    mod web_tools;
     mod window;
     mod workflow_actions;
 
     use std::collections::{HashSet, VecDeque};
     use std::fs::{self, OpenOptions};
     use std::io::{IsTerminal, Write};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::path::{Path, PathBuf};
     use std::process::Command as ProcessCommand;
     use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -55,10 +60,7 @@ mod app {
     use std::thread::{self, sleep};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-    use self::change_detection::{
-        ChangeFingerprint, change_stats, configured_chat_change_fingerprint,
-        rect_chat_change_fingerprint,
-    };
+    use self::change_detection::{ChangeFingerprint, change_stats, rect_chat_change_fingerprint};
     use self::chat_listener::{
         ChatListenerMode, ChatListenerShared, SecondaryChatIdentity, SecondaryHallBubble,
         UnreadFriendHit, classify_title, find_unread_friend_hits, hall_bubble_sequence_overlap,
@@ -66,24 +68,33 @@ mod app {
         unread_hit_still_visible,
     };
     use self::chat_output::ChatOutput;
-    use self::chat_scan::{
-        ChatMessage, count_chat_markers, prepare_chat_scan, recognize_prepared_chat, scan_chat,
-    };
+    use self::chat_scan::{ChatMessage, prepare_chat_scan, recognize_prepared_chat};
     use self::command::{
         ChatListenerModeCommand, CommandLockState, ParsedCommand, PendingCommand, UserCommand,
     };
     use self::config::{AppConfig, PointConfig};
+    use self::decision_control::{DecisionAction, DecisionControlShared};
     use self::decision_lock::DecisionScreenLock;
+    use self::deferred_chat::{
+        DEFAULT_CAPACITY as DEFERRED_CHAT_CAPACITY, DeferredChatMessage, DeferredChatQueue,
+        DeferredChatTarget, EnqueueOutcome,
+    };
     use self::feeluown::{FeelUOwnClient, PlayerStatus, format_lyrics, format_status};
     use self::frame_source::{Canvas, load_frame};
-    use self::geometry::{Rect, crop_canvas, parse_rect};
+    use self::geometry::{Rect, crop_canvas};
     use self::hall_info::{
         HALL_INFO_OCR_SAMPLES, HallInfo, HallInfoSample, display_or_empty,
         format_hall_remaining_suffix, merge_hall_info_samples, parse_hall_remaining_minutes,
     };
-    use self::input_actions::{click_game_point, parse_key, press_key, run_or_print};
+    use self::idiom_chain::IdiomChainGame;
+    use self::input_actions::{
+        click_game_point, ensure_game_ready_for_input, parse_key, press_key,
+    };
     use self::monitor::{MonitorQueueItem, MonitorShared, OcrSnapshot};
-    use self::ocr::{OcrArgs, make_ocr_engine, merged_ocr_text, recognize_lines};
+    use self::ocr::{
+        OcrArgs, OcrBackendProbeStatus, make_ocr_engine, merged_ocr_text,
+        probe_ocr_backend_support, recognize_lines,
+    };
     use self::playback_format::{
         PlaybackSnapshot, estimated_player_status, format_play_message, is_playing, song_title,
     };
@@ -95,15 +106,14 @@ mod app {
     use self::runtime_state::{HALL_EXPIRING_WARNING_MINUTES, PersistentRuntimeState};
     use self::song_dedup::PersistentSongDedupHistory;
     use self::song_review::{SongReviewCandidate, SongReviewClient};
+    use self::task_tracker::TaskTrackerShared;
     use self::template_match::{best_template_hit, find_template_hits};
     use self::ui_state::detect_ui_state;
+    use self::web_tools::{WebToolRequest, WebToolShared, WebToolTask, WebToolTemplate};
     use anyhow::{Context, Result, anyhow};
-    use clap::{Args, Parser, Subcommand};
     use enigo::Key;
     use image::DynamicImage;
-    use log::{LevelFilter, Log, Metadata, Record, SetLoggerError};
     use ocr_rs::OcrEngine;
-    use serde::Serialize;
 
     const IDLE_EXIT_MIN_MINUTES: u32 = 15;
     const OCR_REBUILD_INTERVAL: Duration = Duration::from_secs(60 * 60);
@@ -113,47 +123,16 @@ mod app {
     const RETURN_TO_PRIMARY_SLOW_RETRY_AFTER: u32 = 5;
     const RETURN_TO_PRIMARY_SLOW_RETRY_MS: u64 = 2_000;
 
-    #[derive(Parser, Debug)]
-    #[command(
-        version,
-        about = "Pure Rust OCR/template/input prototype for song-request"
-    )]
-    struct Cli {
-        #[arg(long, default_value = "config.yaml", global = true)]
-        config: PathBuf,
-        #[arg(long, hide = true, global = true)]
-        watchdog_child: bool,
-        #[command(flatten)]
-        canvas: CanvasArgs,
-        #[command(subcommand)]
-        command: Option<Command>,
-    }
-
-    #[derive(Args, Clone, Debug)]
-    struct CanvasArgs {
-        #[arg(long, default_value_t = 1920)]
-        canvas_width: u32,
-        #[arg(long, default_value_t = 1080)]
-        canvas_height: u32,
-        #[arg(long)]
-        no_resize_canvas: bool,
-    }
-
-    #[derive(Args, Clone, Debug)]
+    #[derive(Clone, Debug, Default)]
     struct FrameArgs {
-        #[arg(long)]
         image: Option<PathBuf>,
     }
 
-    #[derive(Args, Clone, Debug, Default)]
+    #[derive(Clone, Debug, Default)]
     struct TemplateArgs {
-        #[arg(long)]
         blue_template: Option<PathBuf>,
-        #[arg(long)]
         yellow_template: Option<PathBuf>,
-        #[arg(long)]
         pink_template: Option<PathBuf>,
-        #[arg(long)]
         marker_threshold: Option<f32>,
     }
 
@@ -207,13 +186,10 @@ mod app {
         }
     }
 
-    #[derive(Args, Clone, Debug, Default)]
+    #[derive(Clone, Debug, Default)]
     struct UiTemplateArgs {
-        #[arg(long)]
         enter_template: Option<PathBuf>,
-        #[arg(long)]
         secondary_hall_template: Option<PathBuf>,
-        #[command(flatten)]
         chat_templates: TemplateArgs,
     }
 
@@ -240,88 +216,6 @@ mod app {
         }
     }
 
-    #[derive(Subcommand, Debug)]
-    enum Command {
-        Run,
-        Manual,
-        OcrImage {
-            #[command(flatten)]
-            ocr: OcrArgs,
-            #[arg(long)]
-            image: PathBuf,
-        },
-        OcrRegion {
-            #[command(flatten)]
-            frame: FrameArgs,
-            #[command(flatten)]
-            ocr: OcrArgs,
-            #[arg(long)]
-            rect: String,
-        },
-        ScanChat {
-            #[command(flatten)]
-            frame: FrameArgs,
-            #[command(flatten)]
-            ocr: OcrArgs,
-            #[command(flatten)]
-            templates: TemplateArgs,
-        },
-        UiState {
-            #[command(flatten)]
-            frame: FrameArgs,
-            #[command(flatten)]
-            templates: UiTemplateArgs,
-        },
-        HallName {
-            #[command(flatten)]
-            frame: FrameArgs,
-            #[command(flatten)]
-            ocr: OcrArgs,
-        },
-        MatchTemplate {
-            #[command(flatten)]
-            frame: FrameArgs,
-            #[arg(long)]
-            template: PathBuf,
-            #[arg(long)]
-            rect: Option<String>,
-            #[arg(long)]
-            threshold: Option<f32>,
-        },
-        ClickTemplate {
-            #[command(flatten)]
-            frame: FrameArgs,
-            #[arg(long)]
-            template: PathBuf,
-            #[arg(long)]
-            rect: String,
-            #[arg(long)]
-            threshold: Option<f32>,
-            #[arg(long)]
-            execute: bool,
-        },
-        Click {
-            #[arg(long)]
-            x: i32,
-            #[arg(long)]
-            y: i32,
-            #[arg(long)]
-            execute: bool,
-        },
-        Key {
-            #[arg(long)]
-            key: String,
-            #[arg(long)]
-            execute: bool,
-        },
-        SendChat {
-            #[arg(long)]
-            message: String,
-            #[arg(long)]
-            execute: bool,
-        },
-    }
-
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum QueuePushOutcome {
         Added(usize),
@@ -340,195 +234,20 @@ mod app {
         PromptFailed,
     }
 
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    struct StderrLogger;
-
-    impl Log for StderrLogger {
-        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
-            metadata.level() <= log::max_level()
-        }
-
-        fn log(&self, record: &Record<'_>) {
-            if self.enabled(record.metadata()) {
-                eprintln!(
-                    "{} {}",
-                    logger::format_prefix(record.level()),
-                    record.args()
-                );
-            }
-        }
-
-        fn flush(&self) {}
-    }
-
-    static STDERR_LOGGER: StderrLogger = StderrLogger;
-
     pub fn run() -> Result<()> {
         dpi::set_process_dpi_awareness();
-        let cli = Cli::parse();
-        if cli.command.is_none() {
-            return run_automation_with_watchdog(&cli.config, cli.watchdog_child);
-        }
-        let canvas = Canvas {
-            width: cli.canvas.canvas_width,
-            height: cli.canvas.canvas_height,
-            resize: !cli.canvas.no_resize_canvas,
-        };
-
-        match cli.command.expect("checked command") {
-            Command::Run => run_automation_with_watchdog(&cli.config, cli.watchdog_child),
-            Command::Manual => manual_tools::run(&cli.config),
-            Command::OcrImage { ocr, image } => {
-                init_stderr_logger_once();
-                let config = AppConfig::load_or_create(&cli.config)?;
-                let ocr = ocr.resolve(&config);
-                let engine = make_ocr_engine(&ocr)?;
-                let image = image::open(&image)
-                    .with_context(|| format!("open image {}", image.display()))?;
-                let results = recognize_lines(&engine, &image)?;
-                print_json(&results)
-            }
-            Command::OcrRegion { frame, ocr, rect } => {
-                init_stderr_logger_once();
-                let config = AppConfig::load_or_create(&cli.config)?;
-                let ocr = ocr.resolve(&config);
-                let engine = make_ocr_engine(&ocr)?;
-                let frame = load_frame(&frame, &canvas, &config.window)?;
-                let rect = parse_rect(&rect)?;
-                let crop = crop_canvas(&frame.image, rect)?;
-                let results = recognize_lines(&engine, &crop)?;
-                print_json(&results)
-            }
-            Command::ScanChat {
-                frame,
-                ocr,
-                templates,
-            } => {
-                init_stderr_logger_once();
-                let config = AppConfig::load_or_create(&cli.config)?;
-                let ocr = ocr.resolve(&config);
-                let templates = templates.resolve(&config);
-                let engine = make_ocr_engine(&ocr)?;
-                let frame = load_frame(&frame, &canvas, &config.window)?;
-                let started = Instant::now();
-                let messages = scan_chat(
-                    &frame.image,
-                    &engine,
-                    &templates,
-                    config.screen.chat_rect.into(),
-                    None,
-                )?;
-                eprintln!("聊天区扫描耗时: {}ms", elapsed_ms(started));
-                print_json(&messages)
-            }
-            Command::UiState { frame, templates } => {
-                init_stderr_logger_once();
-                let config = AppConfig::load_or_create(&cli.config)?;
-                let templates = templates.resolve(&config);
-                let frame = load_frame(&frame, &canvas, &config.window)?;
-                let state = detect_ui_state(&frame.image, &templates, &config.screen)?;
-                println!("{}", state);
-                Ok(())
-            }
-            Command::HallName { frame, ocr } => {
-                init_stderr_logger_once();
-                let config = AppConfig::load_or_create(&cli.config)?;
-                let ocr = ocr.resolve(&config);
-                let engine = make_ocr_engine(&ocr)?;
-                let frame = load_frame(&frame, &canvas, &config.window)?;
-                let crop = crop_canvas(&frame.image, config.screen.hall_name_rect.into())?;
-                let text = merged_ocr_text(&engine, &crop, config.ocr.same_line_y_tolerance)?;
-                println!("{}", text);
-                Ok(())
-            }
-            Command::MatchTemplate {
-                frame,
-                template,
-                rect,
-                threshold,
-            } => {
-                init_stderr_logger_once();
-                let config = AppConfig::load_or_create(&cli.config)?;
-                let frame = load_frame(&frame, &canvas, &config.window)?;
-                let threshold = threshold.unwrap_or(config.templates.marker_threshold);
-                let search_rect = match rect {
-                    Some(value) => Some(parse_rect(&value)?),
-                    None => None,
-                };
-                let started = Instant::now();
-                let hits = find_template_hits(&frame.image, search_rect, &template, threshold)?;
-                eprintln!("模板匹配耗时: {}ms", elapsed_ms(started));
-                print_json(&hits)
-            }
-            Command::ClickTemplate {
-                frame,
-                template,
-                rect,
-                threshold,
-                execute,
-            } => {
-                init_stderr_logger_once();
-                let config = AppConfig::load_or_create(&cli.config)?;
-                let frame = load_frame(&frame, &canvas, &config.window)?;
-                let threshold = threshold.unwrap_or(config.templates.marker_threshold);
-                let rect = parse_rect(&rect)?;
-                let started = Instant::now();
-                let hit = best_template_hit(&frame.image, Some(rect), &template, threshold)?
-                    .ok_or_else(|| anyhow!("template not found above threshold"))?;
-                eprintln!("模板匹配耗时: {}ms", elapsed_ms(started));
-                let point = hit.center();
-                run_or_print(execute, format!("click {},{}", point.x, point.y), || {
-                    let config = AppConfig::load_or_create(&cli.config)?;
-                    click_game_point(PointConfig::new(point.x, point.y), &config.window)
-                })
-            }
-            Command::Click { x, y, execute } => {
-                init_stderr_logger_once();
-                run_or_print(execute, format!("click {},{}", x, y), || {
-                    let config = AppConfig::load_or_create(&cli.config)?;
-                    click_game_point(PointConfig::new(x, y), &config.window)
-                })
-            }
-            Command::Key { key, execute } => {
-                init_stderr_logger_once();
-                let key = parse_key(&key)?;
-                run_or_print(execute, format!("key {:?}", key), || {
-                    let config = AppConfig::load_or_create(&cli.config)?;
-                    press_key(key, &config.window)
-                })
-            }
-            Command::SendChat { message, execute } => {
-                run_or_print(execute, format!("send chat message: {}", message), || {
-                    let config = AppConfig::load_or_create(&cli.config)?;
-                    let output = ChatOutput::new(&config.output, &config.timing, &config.window);
-                    output.send(&message)
-                })
-            }
-        }
+        run_automation_with_watchdog(Path::new("config.yaml"))
     }
 
-    fn init_stderr_logger_once() {
-        let _ = init_stderr_logger(LevelFilter::Info);
-    }
-
-    fn init_stderr_logger(level: LevelFilter) -> std::result::Result<(), SetLoggerError> {
-        log::set_logger(&STDERR_LOGGER)?;
-        log::set_max_level(level);
-        Ok(())
-    }
-
-    fn run_automation_with_watchdog(config_path: &Path, watchdog_child: bool) -> Result<()> {
-        if watchdog_child {
+    fn run_automation_with_watchdog(config_path: &Path) -> Result<()> {
+        if std::env::var_os("MILIASTRA_WATCHDOG_CHILD").is_some() {
             return run_automation(config_path);
         }
 
         loop {
             let current_exe = std::env::current_exe().context("locate current executable")?;
             let mut child = ProcessCommand::new(&current_exe)
-                .arg("--watchdog-child")
-                .arg("--config")
-                .arg(config_path)
-                .arg("run")
+                .env("MILIASTRA_WATCHDOG_CHILD", "1")
                 .spawn()
                 .with_context(|| format!("启动监听子进程失败: {}", current_exe.display()))?;
             let status = child.wait().context("等待监听子进程退出")?;
@@ -563,8 +282,7 @@ mod app {
             None
         };
         let log_paths = logger::init(
-            &config.logging.dir,
-            &config.logging.level,
+            &config.logging,
             Some(monitor.log_sink()),
             tui_handle.is_none(),
         )?;
@@ -609,6 +327,8 @@ mod app {
     struct AutomationApp {
         config: AppConfig,
         runtime_state: Arc<Mutex<PersistentRuntimeState>>,
+        idiom_chain: Arc<Mutex<IdiomChainGame>>,
+        deferred_chat: DeferredChatQueue,
         queue: Arc<Mutex<PersistentQueue>>,
         song_dedup_history: Arc<Mutex<PersistentSongDedupHistory>>,
         player: PlayerController<FeelUOwnClient>,
@@ -616,8 +336,13 @@ mod app {
         song_review: SongReviewClient,
         chat_output: ChatOutput,
         ocr_engine: Arc<Mutex<OcrEngineState>>,
+        web_tool_ocr_engine: Arc<Mutex<Option<OcrEngineState>>>,
+        latest_frame: Arc<Mutex<Option<Arc<DynamicImage>>>>,
         locks: CommandLockState,
-        pending: Arc<(Mutex<VecDeque<PendingTask>>, Condvar)>,
+        pending: Arc<(Mutex<VecDeque<TrackedPendingTask>>, Condvar)>,
+        task_tracker: TaskTrackerShared,
+        decision_control: DecisionControlShared,
+        web_tools: WebToolShared,
         window_detection_signal: WindowDetectionSignal,
         screen_lock_primed: Arc<AtomicBool>,
         reset_locks_requested: Arc<AtomicBool>,
@@ -730,10 +455,12 @@ mod app {
         EnterWonderland {
             source: &'static str,
         },
+        ClearIdleExit,
         ModerationVoteResult {
             command: Box<command::ModerationCommand>,
             approved: bool,
             workflow_key: String,
+            temporary_primary_hold: TemporaryPrimaryHold,
         },
         SetChatListenerMode {
             target: ChatListenerMode,
@@ -743,6 +470,31 @@ mod app {
             discard_only: bool,
         },
         RestoreSecondaryHall,
+    }
+
+    struct TrackedPendingTask {
+        id: u64,
+        task: PendingTask,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum PendingTaskExecution {
+        Completed,
+        Requeued,
+    }
+
+    impl TrackedPendingTask {
+        fn label(&self) -> String {
+            self.task.label()
+        }
+
+        fn same_lock_command(&self, parsed: &ParsedCommand) -> bool {
+            self.task.same_lock_command(parsed)
+        }
+
+        fn is_playback_task(&self) -> bool {
+            self.task.is_playback_task()
+        }
     }
 
     impl PendingTask {
@@ -758,6 +510,7 @@ mod app {
                 }
                 Self::StartGame { source } => format!("启动游戏({})", source),
                 Self::EnterWonderland { source } => format!("进入千星({})", source),
+                Self::ClearIdleExit => "取消闲置退出".to_string(),
                 Self::ModerationVoteResult {
                     command, approved, ..
                 } => format!(
@@ -787,6 +540,7 @@ mod app {
                 Self::ConsoleChat { .. } => false,
                 Self::StartGame { .. } => false,
                 Self::EnterWonderland { .. } => false,
+                Self::ClearIdleExit => false,
                 Self::ModerationVoteResult { command, .. } => {
                     matches!(
                         &parsed.command,
@@ -815,6 +569,7 @@ mod app {
                 Self::ConsoleChat { .. }
                 | Self::StartGame { .. }
                 | Self::EnterWonderland { .. }
+                | Self::ClearIdleExit
                 | Self::ModerationVoteResult { .. }
                 | Self::SetChatListenerMode { .. }
                 | Self::SecondaryUnread { .. }
@@ -822,41 +577,115 @@ mod app {
             }
         }
 
-        fn restores_secondary_listener_after_success(&self) -> bool {
+        fn restores_listener_residency_after_execution(&self) -> bool {
             match self {
                 Self::SetChatListenerMode { .. }
                 | Self::SecondaryUnread { .. }
                 | Self::RestoreSecondaryHall
-                | Self::ModerationVoteResult { .. } => false,
-                Self::Command(pending) => {
-                    !matches!(pending.parsed.command, UserCommand::Moderation(_))
-                }
-                Self::AdvanceQueue { .. }
+                | Self::ClearIdleExit => false,
+                Self::Command(_)
+                | Self::AdvanceQueue { .. }
                 | Self::ConsoleChat { .. }
                 | Self::StartGame { .. }
-                | Self::EnterWonderland { .. } => true,
+                | Self::EnterWonderland { .. }
+                | Self::ModerationVoteResult { .. } => true,
             }
         }
     }
 
-    enum PrepareUiFailureAction {
-        Requeue,
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum UiResidency {
+        Primary,
+        SecondaryCurrentHall,
+    }
+
+    fn listener_residency(mode: ChatListenerMode, temporary_primary: bool) -> UiResidency {
+        if mode == ChatListenerMode::Secondary && !temporary_primary {
+            UiResidency::SecondaryCurrentHall
+        } else {
+            UiResidency::Primary
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ChatDecisionScope {
+        CurrentHall,
+        MultipleConversations,
+    }
+
+    enum ChatDecisionReaderKind {
+        Primary,
+        SecondaryCurrentHall { previous: Vec<SecondaryHallBubble> },
+    }
+
+    struct ChatDecisionReader {
+        kind: ChatDecisionReaderKind,
+        screen_lock: DecisionScreenLock,
+    }
+
+    impl ChatDecisionReader {
+        fn accept_once(&mut self, message: &ChatMessage) -> bool {
+            self.screen_lock.accept_once(message)
+        }
+
+        fn poll_interval_ms(&self, configured_ms: u64) -> u64 {
+            match &self.kind {
+                ChatDecisionReaderKind::Primary => configured_ms.max(50),
+                ChatDecisionReaderKind::SecondaryCurrentHall { .. } => {
+                    configured_ms.clamp(100, 500)
+                }
+            }
+        }
+    }
+
+    struct TemporaryPrimaryHold {
+        listener: ChatListenerShared,
+        active: bool,
+    }
+
+    impl TemporaryPrimaryHold {
+        fn new(listener: ChatListenerShared) -> Result<Self> {
+            let active = listener.snapshot().mode == ChatListenerMode::Secondary;
+            if active {
+                listener.begin_temporary_primary()?;
+            }
+            Ok(Self { listener, active })
+        }
+
+        fn release(&mut self) {
+            if self.active {
+                self.listener.end_temporary_primary();
+                self.active = false;
+            }
+        }
+    }
+
+    impl Drop for TemporaryPrimaryHold {
+        fn drop(&mut self) {
+            self.release();
+        }
     }
 
     struct CommandExecutingGuard {
         flag: Arc<AtomicBool>,
+        pending: Arc<(Mutex<VecDeque<TrackedPendingTask>>, Condvar)>,
     }
 
     impl CommandExecutingGuard {
-        fn new(flag: Arc<AtomicBool>) -> Self {
+        fn new(
+            flag: Arc<AtomicBool>,
+            pending: Arc<(Mutex<VecDeque<TrackedPendingTask>>, Condvar)>,
+        ) -> Self {
             flag.store(true, AtomicOrdering::SeqCst);
-            Self { flag }
+            Self { flag, pending }
         }
     }
 
     impl Drop for CommandExecutingGuard {
         fn drop(&mut self) {
             self.flag.store(false, AtomicOrdering::SeqCst);
+            let (_, cvar) = &*self.pending;
+            cvar.notify_all();
         }
     }
 
@@ -910,6 +739,12 @@ mod app {
             let song_review = SongReviewClient::new(&config.song_review, &config.timing);
             let chat_output = ChatOutput::new(&config.output, &config.timing, &config.window);
             let runtime_state = Arc::new(Mutex::new(runtime_state));
+            let idiom_chain_game = IdiomChainGame::load(config.idiom_chain.clone())?;
+            if config.idiom_chain.enabled {
+                log::info!("已加载成语接龙词库: {} 条", idiom_chain_game.lexicon_len());
+            }
+            let idiom_chain = Arc::new(Mutex::new(idiom_chain_game));
+            let deferred_chat = DeferredChatQueue::new(DEFERRED_CHAT_CAPACITY);
             let queue = Arc::new(Mutex::new(queue));
             let song_dedup_history = Arc::new(Mutex::new(song_dedup_history));
             let player = PlayerController::new(
@@ -924,6 +759,8 @@ mod app {
             Ok(Self {
                 config,
                 runtime_state,
+                idiom_chain,
+                deferred_chat,
                 queue,
                 song_dedup_history,
                 player,
@@ -934,8 +771,13 @@ mod app {
                     engine: ocr_engine,
                     rebuild_due_at: Instant::now() + OCR_REBUILD_INTERVAL,
                 })),
+                web_tool_ocr_engine: Arc::new(Mutex::new(None)),
+                latest_frame: Arc::new(Mutex::new(None)),
                 locks: CommandLockState::default(),
                 pending: Arc::new((Mutex::new(VecDeque::new()), Condvar::new())),
+                task_tracker: TaskTrackerShared::new(),
+                decision_control: DecisionControlShared::new(),
+                web_tools: WebToolShared::new(),
                 window_detection_signal: WindowDetectionSignal::new(),
                 screen_lock_primed: Arc::new(AtomicBool::new(false)),
                 reset_locks_requested: Arc::new(AtomicBool::new(false)),
@@ -958,17 +800,27 @@ mod app {
             self.update_monitor_queue_snapshot();
             self.update_monitor_playback_controller();
             self.update_monitor_chat_listener();
+            self.update_monitor_operational_state();
             self.warn_if_screen_size_mismatch()?;
             self.start_http_server()?;
             self.start_hotkeys()?;
             let executor = self.start_command_executor();
+            let deferred_chat_sender = self.start_deferred_chat_sender();
             self.enqueue_startup_task_if_enabled()?;
+            let web_tool_executor = self.start_web_tool_executor();
             let playback_monitor = self.start_playback_monitor();
             let result = self.run_scan_loop();
             self.running.store(false, AtomicOrdering::SeqCst);
             self.notify_pending_executor();
+            self.deferred_chat.notify_all();
             if let Err(error) = executor.join() {
                 log::error!("命令执行线程 panic: {error:?}");
+            }
+            if let Err(error) = deferred_chat_sender.join() {
+                log::error!("延迟聊天发送线程 panic: {error:?}");
+            }
+            if let Err(error) = web_tool_executor.join() {
+                log::error!("Web 工具执行线程 panic: {error:?}");
             }
             if let Err(error) = playback_monitor.join() {
                 log::error!("播放监控线程 panic: {error:?}");
@@ -987,6 +839,8 @@ mod app {
             let mut executor = Self {
                 config: self.config.clone(),
                 runtime_state: self.runtime_state.clone(),
+                idiom_chain: self.idiom_chain.clone(),
+                deferred_chat: self.deferred_chat.clone(),
                 queue: self.queue.clone(),
                 song_dedup_history: self.song_dedup_history.clone(),
                 player: self.player.clone(),
@@ -994,8 +848,13 @@ mod app {
                 song_review: self.song_review.clone(),
                 chat_output: self.chat_output.clone(),
                 ocr_engine: self.ocr_engine.clone(),
+                web_tool_ocr_engine: self.web_tool_ocr_engine.clone(),
+                latest_frame: self.latest_frame.clone(),
                 locks: CommandLockState::default(),
                 pending: self.pending.clone(),
+                task_tracker: self.task_tracker.clone(),
+                decision_control: self.decision_control.clone(),
+                web_tools: self.web_tools.clone(),
                 window_detection_signal: self.window_detection_signal.clone(),
                 screen_lock_primed: self.screen_lock_primed.clone(),
                 reset_locks_requested: self.reset_locks_requested.clone(),
@@ -1019,10 +878,70 @@ mod app {
             })
         }
 
+        fn start_deferred_chat_sender(&self) -> thread::JoinHandle<()> {
+            let mut sender = self.clone_for_background_task();
+            thread::spawn(move || {
+                log::info!("延迟聊天发送线程已启动");
+                if let Err(error) = sender.run_deferred_chat_sender_loop() {
+                    log::error!("延迟聊天发送线程异常退出: {error:#}");
+                }
+            })
+        }
+
+        fn run_deferred_chat_sender_loop(&mut self) -> Result<()> {
+            let retry_delay = Duration::from_millis(self.config.timing.loop_idle_ms.max(50));
+            while self.running.load(AtomicOrdering::SeqCst) {
+                let Some(message) = self.deferred_chat.wait_take(retry_delay)? else {
+                    continue;
+                };
+                if !self.running.load(AtomicOrdering::SeqCst) {
+                    break;
+                }
+
+                if !self.deferred_chat_target_is_active(message.target) {
+                    if self.deferred_chat.requeue_back(message)? == EnqueueOutcome::DroppedMessage {
+                        log::warn!("延迟聊天发送队列已满，已丢弃目标聊天未激活的回复");
+                    }
+                    sleep(retry_delay);
+                    continue;
+                }
+
+                let Some(_sending) = self.try_begin_deferred_chat_send(message.target)? else {
+                    if self.deferred_chat.requeue_front(message)? == EnqueueOutcome::DroppedMessage
+                    {
+                        log::warn!("延迟聊天发送队列已满，重试时丢弃了一条较新的回复");
+                    }
+                    sleep(retry_delay);
+                    continue;
+                };
+
+                let result = match message.target {
+                    DeferredChatTarget::Primary => self.chat_output.send(&message.text),
+                    DeferredChatTarget::SecondaryCurrentHall => {
+                        self.chat_output.send_current_chat(&message.text)
+                    }
+                };
+                if let Err(error) = result {
+                    log::error!("成语接龙延迟回复发送失败，已丢弃: {error:#}");
+                }
+            }
+            Ok(())
+        }
+
+        fn start_web_tool_executor(&self) -> thread::JoinHandle<()> {
+            let mut worker = self.clone_for_background_task();
+            thread::spawn(move || {
+                log::info!("Web 工具执行线程已启动");
+                worker.run_web_tool_loop();
+            })
+        }
+
         fn start_playback_monitor(&self) -> thread::JoinHandle<()> {
             let mut monitor = Self {
                 config: self.config.clone(),
                 runtime_state: self.runtime_state.clone(),
+                idiom_chain: self.idiom_chain.clone(),
+                deferred_chat: self.deferred_chat.clone(),
                 queue: self.queue.clone(),
                 song_dedup_history: self.song_dedup_history.clone(),
                 player: self.player.clone(),
@@ -1030,8 +949,13 @@ mod app {
                 song_review: self.song_review.clone(),
                 chat_output: self.chat_output.clone(),
                 ocr_engine: self.ocr_engine.clone(),
+                web_tool_ocr_engine: self.web_tool_ocr_engine.clone(),
+                latest_frame: self.latest_frame.clone(),
                 locks: CommandLockState::default(),
                 pending: self.pending.clone(),
+                task_tracker: self.task_tracker.clone(),
+                decision_control: self.decision_control.clone(),
+                web_tools: self.web_tools.clone(),
                 window_detection_signal: self.window_detection_signal.clone(),
                 screen_lock_primed: self.screen_lock_primed.clone(),
                 reset_locks_requested: self.reset_locks_requested.clone(),
@@ -1057,6 +981,8 @@ mod app {
             Self {
                 config: self.config.clone(),
                 runtime_state: self.runtime_state.clone(),
+                idiom_chain: self.idiom_chain.clone(),
+                deferred_chat: self.deferred_chat.clone(),
                 queue: self.queue.clone(),
                 song_dedup_history: self.song_dedup_history.clone(),
                 player: self.player.clone(),
@@ -1064,8 +990,13 @@ mod app {
                 song_review: self.song_review.clone(),
                 chat_output: self.chat_output.clone(),
                 ocr_engine: self.ocr_engine.clone(),
+                web_tool_ocr_engine: self.web_tool_ocr_engine.clone(),
+                latest_frame: self.latest_frame.clone(),
                 locks: CommandLockState::default(),
                 pending: self.pending.clone(),
+                task_tracker: self.task_tracker.clone(),
+                decision_control: self.decision_control.clone(),
+                web_tools: self.web_tools.clone(),
                 window_detection_signal: self.window_detection_signal.clone(),
                 screen_lock_primed: self.screen_lock_primed.clone(),
                 reset_locks_requested: self.reset_locks_requested.clone(),
@@ -1100,6 +1031,12 @@ mod app {
                 .map_err(|_| anyhow!("runtime state mutex poisoned"))
         }
 
+        fn idiom_chain(&self) -> Result<MutexGuard<'_, IdiomChainGame>> {
+            self.idiom_chain
+                .lock()
+                .map_err(|_| anyhow!("idiom chain mutex poisoned"))
+        }
+
         fn ocr_engine(&self) -> Result<MutexGuard<'_, OcrEngineState>> {
             let mut guard = self
                 .ocr_engine
@@ -1124,6 +1061,81 @@ mod app {
                 }
             }
             Ok(guard)
+        }
+
+        fn web_tool_ocr_engine(&self) -> Result<MutexGuard<'_, Option<OcrEngineState>>> {
+            let mut guard = self
+                .web_tool_ocr_engine
+                .lock()
+                .map_err(|_| anyhow!("Web 工具 OCR 引擎锁已损坏"))?;
+            let rebuild_due = guard
+                .as_ref()
+                .is_some_and(|state| Instant::now() >= state.rebuild_due_at);
+            if guard.is_none() || rebuild_due {
+                let engine = make_ocr_engine(&OcrArgs::default().resolve(&self.config))?;
+                *guard = Some(OcrEngineState {
+                    engine,
+                    rebuild_due_at: Instant::now() + OCR_REBUILD_INTERVAL,
+                });
+                log::info!("Web 工具 OCR 引擎已初始化");
+            }
+            Ok(guard)
+        }
+
+        fn latest_frame(&self) -> Result<Arc<DynamicImage>> {
+            self.latest_frame
+                .lock()
+                .map_err(|_| anyhow!("主扫描画面缓存锁已损坏"))?
+                .clone()
+                .ok_or_else(|| anyhow!("尚未获取主扫描画面，请稍后重试"))
+        }
+
+        fn run_web_tool_loop(&mut self) {
+            while self.running.load(AtomicOrdering::SeqCst) {
+                match self.take_web_tool_when_idle() {
+                    Ok(Some(task)) => {
+                        if let Err(error) = self.execute_web_tool_task(task) {
+                            log::error!("Web 工具任务收尾异常: {error:#}");
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        log::error!("Web 工具任务调度异常: {error:#}");
+                        sleep(Duration::from_millis(250));
+                    }
+                }
+            }
+        }
+
+        fn take_web_tool_when_idle(&self) -> Result<Option<WebToolTask>> {
+            let (lock, cvar) = &*self.pending;
+            let mut pending = lock.lock().map_err(|_| anyhow!("pending mutex poisoned"))?;
+            while self.running.load(AtomicOrdering::SeqCst)
+                && (!pending.is_empty() || self.command_executing.load(AtomicOrdering::SeqCst))
+            {
+                pending = cvar
+                    .wait_timeout(pending, Duration::from_millis(100))
+                    .map_err(|_| anyhow!("pending condvar poisoned"))?
+                    .0;
+            }
+            if !self.running.load(AtomicOrdering::SeqCst) {
+                return Ok(None);
+            }
+            let task = self.web_tools.take_next()?;
+            if let Some(task) = task {
+                if task.request.requires_screen_exclusive() {
+                    self.command_executing.store(true, AtomicOrdering::SeqCst);
+                }
+                return Ok(Some(task));
+            }
+            {
+                pending = cvar
+                    .wait_timeout(pending, Duration::from_millis(250))
+                    .map_err(|_| anyhow!("pending condvar poisoned"))?
+                    .0;
+                drop(pending);
+            }
+            Ok(None)
         }
 
         fn scan_chat_with_shared_ocr(
@@ -1184,6 +1196,11 @@ mod app {
                 Arc::clone(&self.pending),
                 self.chat_listener.clone(),
                 self.monitor.clone(),
+                self.task_tracker.clone(),
+                self.decision_control.clone(),
+                self.moderation_workflows.clone(),
+                self.web_tools.clone(),
+                self.latest_frame.clone(),
             ))
         }
 
@@ -1223,6 +1240,7 @@ mod app {
             log::info!("自动化扫描已启动");
             while self.running.load(AtomicOrdering::SeqCst) {
                 let loop_started = Instant::now();
+                self.update_monitor_operational_state();
                 if self.paused.load(AtomicOrdering::SeqCst) {
                     self.maybe_idle_exit()?;
                     sleep(Duration::from_millis(self.config.timing.loop_idle_ms));
@@ -1232,6 +1250,11 @@ mod app {
                 let frame_started = Instant::now();
                 match load_frame(&frame_args, &canvas, &self.config.window) {
                     Ok(frame) => {
+                        if let Ok(mut latest_frame) = self.latest_frame.lock() {
+                            *latest_frame = Some(Arc::clone(&frame.image));
+                        } else {
+                            log::error!("主扫描画面缓存锁已损坏");
+                        }
                         let frame_ms = elapsed_ms(frame_started);
                         if target_missing {
                             log::info!("目标窗口已恢复，重置截图退避");
@@ -1242,11 +1265,17 @@ mod app {
                         let ui_started = Instant::now();
                         let ui_state_result =
                             detect_ui_state(&frame.image, &ui_template_args, &self.config.screen);
+                        match &ui_state_result {
+                            Ok(ui_state) => self.monitor.set_ui_state(ui_state.to_string()),
+                            Err(_) => self.monitor.set_ui_state("界面检测失败"),
+                        }
                         let ui_ms = elapsed_ms(ui_started);
+                        let listener_snapshot = self.chat_listener.snapshot();
+                        let command_executing = self.command_executing.load(AtomicOrdering::SeqCst);
                         match ui_state_result {
                             Ok(ui_state)
-                                if self.chat_listener.snapshot().mode
-                                    == ChatListenerMode::Secondary =>
+                                if listener_snapshot.mode == ChatListenerMode::Secondary
+                                    && !listener_snapshot.temporary_primary =>
                             {
                                 primary_visible = false;
                                 last_fingerprint = None;
@@ -1259,6 +1288,12 @@ mod app {
                                         &mut secondary_title_fingerprint,
                                         &mut secondary_identity,
                                     )?
+                                } else if command_executing {
+                                    log::debug!(
+                                        "二级监听任务临时离开二级界面，等待任务状态机恢复: {}",
+                                        ui_state
+                                    );
+                                    false
                                 } else {
                                     log::warn!(
                                         "二级监听当前不在二级聊天界面: {}，回退一级监听",
@@ -1283,10 +1318,12 @@ mod app {
                                 );
                             }
                             Ok(ui_state) if ui_state.is_primary() => {
-                                secondary_friend_bubble_fingerprint = None;
-                                secondary_hall_bubble_sequence.clear();
-                                secondary_title_fingerprint = None;
-                                secondary_identity = None;
+                                if listener_snapshot.mode == ChatListenerMode::Primary {
+                                    secondary_friend_bubble_fingerprint = None;
+                                    secondary_hall_bubble_sequence.clear();
+                                    secondary_title_fingerprint = None;
+                                    secondary_identity = None;
+                                }
                                 let primary_started = Instant::now();
                                 let entered_primary = !primary_visible;
                                 primary_visible = true;
@@ -1491,6 +1528,7 @@ mod app {
                     }
                     Err(error) => {
                         let frame_ms = elapsed_ms(frame_started);
+                        self.monitor.set_ui_state("目标窗口不可用");
                         primary_visible = false;
                         last_fingerprint = None;
                         secondary_friend_bubble_fingerprint = None;
@@ -1797,6 +1835,9 @@ mod app {
                 return Ok(());
             }
             for pending in update.accepted {
+                if self.handle_idiom_chain_command(&pending.parsed)? {
+                    continue;
+                }
                 if self.enqueue_chat_listener_command(&pending.parsed)? {
                     continue;
                 }
@@ -1877,6 +1918,33 @@ mod app {
             Ok(true)
         }
 
+        fn handle_idiom_chain_command(&self, parsed: &ParsedCommand) -> Result<bool> {
+            let UserCommand::IdiomChain(command) = &parsed.command else {
+                return Ok(false);
+            };
+            let outcome = {
+                let mut game = self.idiom_chain()?;
+                game.handle(&parsed.username, command)
+            };
+            let target = match self.active_ui_residency() {
+                UiResidency::Primary => DeferredChatTarget::Primary,
+                UiResidency::SecondaryCurrentHall => DeferredChatTarget::SecondaryCurrentHall,
+            };
+            let queue_outcome = self.deferred_chat.enqueue(DeferredChatMessage {
+                text: outcome.reply,
+                target,
+            })?;
+            log::info!(
+                "成语接龙已处理，回复进入延迟发送队列: command={} action={}",
+                parsed.raw,
+                outcome.action
+            );
+            if queue_outcome == EnqueueOutcome::DroppedMessage {
+                log::warn!("延迟聊天发送队列已满，已丢弃一条较早的回复");
+            }
+            Ok(true)
+        }
+
         fn submit_secondary_command(&self, parsed: ParsedCommand) -> Result<()> {
             if self.enqueue_chat_listener_command(&parsed)? {
                 return Ok(());
@@ -1884,6 +1952,9 @@ mod app {
             if !self.commands_enabled.load(AtomicOrdering::SeqCst) && parsed.message_type != "pink"
             {
                 log::info!("命令识别已禁用，跳过二级大厅命令: {}", parsed.raw);
+                return Ok(());
+            }
+            if self.handle_idiom_chain_command(&parsed)? {
                 return Ok(());
             }
             if let UserCommand::Invite(invite) = &parsed.command {
@@ -1994,14 +2065,29 @@ mod app {
                     sleep(Duration::from_millis(self.config.timing.loop_idle_ms));
                     continue;
                 }
-                match self.execute_pending_task(task) {
-                    Ok(true) => {
+                let task_id = task.id;
+                let task_label = task.label();
+                self.task_tracker.mark_running(task_id);
+                let result =
+                    match catch_unwind(AssertUnwindSafe(|| self.execute_pending_task(task))) {
+                        Ok(result) => result,
+                        Err(_) => Err(anyhow!("待处理任务执行发生未捕获异常")),
+                    };
+                match result {
+                    Ok(PendingTaskExecution::Completed) => {
+                        self.task_tracker
+                            .finish_ok(task_id, format!("{}执行完成", task_label));
                         sleep(Duration::from_millis(
                             self.config.timing.command.post_settle_ms,
                         ));
                     }
-                    Ok(false) => {}
+                    Ok(PendingTaskExecution::Requeued) => {
+                        sleep(Duration::from_millis(
+                            self.config.timing.command.post_settle_ms,
+                        ));
+                    }
                     Err(error) => {
+                        self.task_tracker.finish_error(task_id, &error);
                         log::error!("待处理任务执行异常: {error:#}");
                     }
                 }
@@ -2009,10 +2095,14 @@ mod app {
             Ok(())
         }
 
-        fn wait_for_pending_task(&self) -> Result<Option<(PendingTask, CommandExecutingGuard)>> {
+        fn wait_for_pending_task(
+            &self,
+        ) -> Result<Option<(TrackedPendingTask, CommandExecutingGuard)>> {
             let (lock, cvar) = &*self.pending;
             let mut guard = lock.lock().map_err(|_| anyhow!("pending mutex poisoned"))?;
-            while guard.is_empty() && self.running.load(AtomicOrdering::SeqCst) {
+            while (guard.is_empty() || self.command_executing.load(AtomicOrdering::SeqCst))
+                && self.running.load(AtomicOrdering::SeqCst)
+            {
                 guard = cvar
                     .wait_timeout(guard, Duration::from_secs(1))
                     .map_err(|_| anyhow!("pending condvar poisoned"))?
@@ -2021,16 +2111,56 @@ mod app {
             if !self.running.load(AtomicOrdering::SeqCst) {
                 return Ok(None);
             }
-            let executing = CommandExecutingGuard::new(Arc::clone(&self.command_executing));
+            let executing = CommandExecutingGuard::new(
+                Arc::clone(&self.command_executing),
+                Arc::clone(&self.pending),
+            );
             Ok(guard.pop_front().map(|task| {
                 log::info!("待处理任务开始: {}", task.label());
                 (task, executing)
             }))
         }
 
-        fn execute_pending_task(&mut self, task: PendingTask) -> Result<bool> {
+        fn try_begin_deferred_chat_send(
+            &self,
+            target: DeferredChatTarget,
+        ) -> Result<Option<CommandExecutingGuard>> {
+            let (lock, _) = &*self.pending;
+            let pending = lock.lock().map_err(|_| anyhow!("pending mutex poisoned"))?;
+            if !self.running.load(AtomicOrdering::SeqCst)
+                || self.paused.load(AtomicOrdering::SeqCst)
+                || !pending.is_empty()
+                || self.command_executing.load(AtomicOrdering::SeqCst)
+                || !self.deferred_chat_target_is_active(target)
+            {
+                return Ok(None);
+            }
+            Ok(Some(CommandExecutingGuard::new(
+                Arc::clone(&self.command_executing),
+                Arc::clone(&self.pending),
+            )))
+        }
+
+        fn deferred_chat_target_is_active(&self, target: DeferredChatTarget) -> bool {
+            matches!(
+                (target, self.active_ui_residency()),
+                (DeferredChatTarget::Primary, UiResidency::Primary)
+                    | (
+                        DeferredChatTarget::SecondaryCurrentHall,
+                        UiResidency::SecondaryCurrentHall
+                    )
+            )
+        }
+
+        fn execute_pending_task(
+            &mut self,
+            tracked: TrackedPendingTask,
+        ) -> Result<PendingTaskExecution> {
+            let task_id = tracked.id;
+            let task = tracked.task;
             let label = task.label();
-            let restore_secondary_after_success = task.restores_secondary_listener_after_success();
+            let restore_residency_after_execution =
+                task.restores_listener_residency_after_execution();
             let result = match task {
                 PendingTask::Command(pending) => {
                     let _song_command_guard =
@@ -2042,90 +2172,510 @@ mod app {
                             None
                         };
                     self.execute_pending_command(*pending)
+                        .map(|_| PendingTaskExecution::Completed)
                 }
-                PendingTask::AdvanceQueue { reason } => self.execute_advance_queue_task(reason),
-                PendingTask::ConsoleChat { text, prefix } => {
-                    self.execute_console_chat_task(text, prefix)
-                }
-                PendingTask::StartGame { source } => self.execute_start_game_task(source),
-                PendingTask::EnterWonderland { source } => {
-                    self.execute_enter_wonderland_task(source)
-                }
+                PendingTask::AdvanceQueue { reason } => self
+                    .execute_advance_queue_task(reason)
+                    .map(|_| PendingTaskExecution::Completed),
+                PendingTask::ConsoleChat { text, prefix } => self
+                    .execute_console_chat_task(text, prefix)
+                    .map(|_| PendingTaskExecution::Completed),
+                PendingTask::StartGame { source } => self
+                    .execute_start_game_task(source)
+                    .map(|_| PendingTaskExecution::Completed),
+                PendingTask::EnterWonderland { source } => self
+                    .execute_enter_wonderland_task(source)
+                    .map(|_| PendingTaskExecution::Completed),
+                PendingTask::ClearIdleExit => self
+                    .clear_idle_exit_timer()
+                    .map(|_| PendingTaskExecution::Completed),
                 PendingTask::ModerationVoteResult {
                     command,
                     approved,
                     workflow_key,
-                } => self.execute_moderation_vote_result(*command, approved, workflow_key),
-                PendingTask::SetChatListenerMode { target } => {
-                    self.execute_set_chat_listener_mode(target)
-                }
-                PendingTask::SecondaryUnread { hit, discard_only } => {
-                    self.execute_secondary_unread_task(hit, discard_only)
-                }
-                PendingTask::RestoreSecondaryHall => self.execute_restore_secondary_hall_task(),
+                    temporary_primary_hold,
+                } => self.execute_moderation_vote_result(
+                    task_id,
+                    *command,
+                    approved,
+                    workflow_key,
+                    temporary_primary_hold,
+                ),
+                PendingTask::SetChatListenerMode { target } => self
+                    .execute_set_chat_listener_mode(target)
+                    .map(|_| PendingTaskExecution::Completed),
+                PendingTask::SecondaryUnread { hit, discard_only } => self
+                    .execute_secondary_unread_task(hit, discard_only)
+                    .map(|_| PendingTaskExecution::Completed),
+                PendingTask::RestoreSecondaryHall => self
+                    .execute_restore_secondary_hall_task()
+                    .map(|_| PendingTaskExecution::Completed),
             };
             match result {
-                Ok(()) => {
-                    if restore_secondary_after_success
-                        && self.chat_listener.snapshot().mode == ChatListenerMode::Secondary
-                    {
-                        self.restore_secondary_listener_after_task(&label)?;
+                Ok(PendingTaskExecution::Completed) => {
+                    if restore_residency_after_execution {
+                        self.restore_listener_residency_after_task(&label)?;
                     }
                     log::info!("待处理任务完成: {}", label);
-                    Ok(true)
+                    Ok(PendingTaskExecution::Completed)
+                }
+                Ok(PendingTaskExecution::Requeued) => {
+                    log::info!("待处理任务已重新排队: {}", label);
+                    Ok(PendingTaskExecution::Requeued)
                 }
                 Err(error) => {
                     log::error!("待处理任务失败 {}: {error:#}", label);
-                    self.handle_task_error_after_execution(&label, &error);
+                    self.handle_task_error_after_execution(
+                        &label,
+                        &error,
+                        restore_residency_after_execution,
+                    );
                     Err(error)
                 }
             }
         }
 
-        fn handle_task_error_after_execution(&self, label: &str, error: &anyhow::Error) {
+        fn handle_task_error_after_execution(
+            &self,
+            label: &str,
+            error: &anyhow::Error,
+            restore_listener_residency: bool,
+        ) {
             if is_target_window_unavailable_error(error) {
-                log::warn!("任务失败且目标游戏窗口不可用，跳过返回一级界面: {}", label);
+                log::warn!("任务失败且目标游戏窗口不可用，跳过界面恢复: {}", label);
+            } else if restore_listener_residency {
+                if let Err(recovery_error) = self.restore_listener_residency_after_task(label) {
+                    log::error!(
+                        "任务失败后恢复监听驻留界面失败 {}: {recovery_error:#}",
+                        label
+                    );
+                }
             } else {
                 self.return_to_primary_after_command_failure(label);
             }
         }
 
-        fn handle_prepare_ui_error(
-            &self,
-            stage: &str,
-            label: &str,
-            error: anyhow::Error,
-        ) -> Result<PrepareUiFailureAction> {
-            if is_target_window_unavailable_error(&error) {
-                log::error!(
-                    "{}目标游戏窗口不可用，已中止当前任务 {}: {error:#}",
-                    stage,
-                    label
-                );
-                return Err(error.context(format!("{}目标游戏窗口不可用: {}", stage, label)));
+        fn execute_web_tool_task(&mut self, task: WebToolTask) -> Result<()> {
+            let id = task.id;
+            let label = task.request.label();
+            let requires_screen_exclusive = task.request.requires_screen_exclusive();
+            let result = match catch_unwind(AssertUnwindSafe(|| {
+                self.execute_web_tool_request(task.request)
+            })) {
+                Ok(result) => result,
+                Err(_) => Err(anyhow!("Web 工具执行发生未捕获异常")),
+            };
+            if let Err(error) = &result {
+                log::error!("Web 工具执行失败 {}: {error:#}", label);
+            }
+            self.web_tools.finish(id, result);
+            if requires_screen_exclusive {
+                self.command_executing.store(false, AtomicOrdering::SeqCst);
+                self.notify_pending_executor();
+            }
+            Ok(())
+        }
+
+        fn execute_web_tool_request(&mut self, request: WebToolRequest) -> Result<String> {
+            match request {
+                WebToolRequest::Ocr { rect } => {
+                    let frame = self.latest_frame()?;
+                    let image = match rect {
+                        Some(rect) => crop_canvas(&frame, rect)?,
+                        None => (*frame).clone(),
+                    };
+                    let engine = self.web_tool_ocr_engine()?;
+                    let engine = engine
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("Web 工具 OCR 引擎不可用"))?;
+                    serde_json::to_string_pretty(&recognize_lines(&engine.engine, &image)?)
+                        .map_err(|error| anyhow!(error))
+                }
+                WebToolRequest::ScanChat => {
+                    let frame = self.latest_frame()?;
+                    let templates = TemplateArgs::default().resolve(&self.config);
+                    let prepared =
+                        prepare_chat_scan(&frame, &templates, self.config.screen.chat_rect.into())?;
+                    let engine = self.web_tool_ocr_engine()?;
+                    let engine = engine
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("Web 工具 OCR 引擎不可用"))?;
+                    serde_json::to_string_pretty(&recognize_prepared_chat(
+                        &engine.engine,
+                        &templates,
+                        prepared,
+                        None,
+                    )?)
+                    .map_err(|error| anyhow!(error))
+                }
+                WebToolRequest::UiState => {
+                    let frame = self.latest_frame()?;
+                    let templates = UiTemplateArgs::default().resolve(&self.config);
+                    Ok(detect_ui_state(&frame, &templates, &self.config.screen)?.to_string())
+                }
+                WebToolRequest::HallName => {
+                    let frame = self.latest_frame()?;
+                    let image = crop_canvas(&frame, self.config.screen.hall_name_rect.into())?;
+                    let engine = self.web_tool_ocr_engine()?;
+                    let engine = engine
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("Web 工具 OCR 引擎不可用"))?;
+                    merged_ocr_text(
+                        &engine.engine,
+                        &image,
+                        self.config.ocr.same_line_y_tolerance,
+                    )
+                }
+                WebToolRequest::MatchTemplate {
+                    template,
+                    rect,
+                    threshold,
+                    click,
+                } => {
+                    let frame = self.latest_frame()?;
+                    let default_threshold = match &template {
+                        WebToolTemplate::WonderlandEnterButton => {
+                            self.config.startup.wonderland_enter_button_threshold
+                        }
+                        WebToolTemplate::PaimonMenu | WebToolTemplate::WonderlandClose => {
+                            self.config.startup.template_threshold
+                        }
+                        WebToolTemplate::Custom(_) => {
+                            self.config.custom_workflows.default_threshold
+                        }
+                        _ => self.config.templates.marker_threshold,
+                    };
+                    let path = match &template {
+                        WebToolTemplate::BlueMarker => self.config.templates.blue_marker.clone(),
+                        WebToolTemplate::YellowMarker => {
+                            self.config.templates.yellow_marker.clone()
+                        }
+                        WebToolTemplate::PinkMarker => self.config.templates.pink_marker.clone(),
+                        WebToolTemplate::Enter => self.config.templates.enter.clone(),
+                        WebToolTemplate::SecondaryHall => {
+                            self.config.templates.secondary_hall.clone()
+                        }
+                        WebToolTemplate::InviteViewStar => {
+                            self.config.templates.invite_view_star.clone()
+                        }
+                        WebToolTemplate::InviteGotoHall => {
+                            self.config.templates.invite_goto_hall.clone()
+                        }
+                        WebToolTemplate::InviteEnterHall => {
+                            self.config.templates.invite_enter_hall.clone()
+                        }
+                        WebToolTemplate::FriendPanel => self.config.templates.friend_panel.clone(),
+                        WebToolTemplate::FriendSearchPanel => {
+                            self.config.templates.friend_search_panel.clone()
+                        }
+                        WebToolTemplate::FriendMoreSettings => {
+                            self.config.templates.friend_more_settings.clone()
+                        }
+                        WebToolTemplate::FriendBlockChat => {
+                            self.config.templates.friend_block_chat.clone()
+                        }
+                        WebToolTemplate::FriendBlacklist => {
+                            self.config.templates.friend_blacklist.clone()
+                        }
+                        WebToolTemplate::FriendConfirm => {
+                            self.config.templates.friend_confirm.clone()
+                        }
+                        WebToolTemplate::WonderlandEnterButton => self
+                            .config
+                            .startup
+                            .templates
+                            .wonderland_enter_button
+                            .clone(),
+                        WebToolTemplate::PaimonMenu => {
+                            self.config.startup.templates.paimon_menu.clone()
+                        }
+                        WebToolTemplate::WonderlandClose => {
+                            self.config.startup.templates.wonderland_close.clone()
+                        }
+                        WebToolTemplate::Custom(name) => self
+                            .config
+                            .custom_workflows
+                            .templates
+                            .get(name)
+                            .cloned()
+                            .ok_or_else(|| anyhow!("自定义模板不存在: {name}"))?,
+                    };
+                    let threshold = threshold.unwrap_or(default_threshold);
+                    if click {
+                        self.ensure_web_tool_input_still_idle()?;
+                        let hit = best_template_hit(&frame, rect, &path, threshold)?
+                            .ok_or_else(|| anyhow!("未找到超过阈值的模板: {}", template.label()))?;
+                        let point = hit.center();
+                        ensure_game_ready_for_input(
+                            &self.config.window,
+                            self.config.timing.input.after_activate_ms,
+                        )?;
+                        click_game_point(PointConfig::new(point.x, point.y), &self.config.window)?;
+                        Ok(format!(
+                            "已点击 {}: x={} y={} score={:.3}",
+                            template.label(),
+                            point.x,
+                            point.y,
+                            hit.score
+                        ))
+                    } else {
+                        serde_json::to_string_pretty(&find_template_hits(
+                            &frame, rect, &path, threshold,
+                        )?)
+                        .map_err(|error| anyhow!(error))
+                    }
+                }
+                WebToolRequest::Click { x, y } => {
+                    let width = self.config.screen.expected_width as i32;
+                    let height = self.config.screen.expected_height as i32;
+                    if !(0..width).contains(&x) || !(0..height).contains(&y) {
+                        return Err(anyhow!(
+                            "坐标超出画布范围: x=0..{} y=0..{}",
+                            width - 1,
+                            height - 1
+                        ));
+                    }
+                    self.ensure_web_tool_input_still_idle()?;
+                    ensure_game_ready_for_input(
+                        &self.config.window,
+                        self.config.timing.input.after_activate_ms,
+                    )?;
+                    click_game_point(PointConfig::new(x, y), &self.config.window)?;
+                    Ok(format!("已点击坐标: {x},{y}"))
+                }
+                WebToolRequest::Key { key } => {
+                    let key = parse_key(&key)?;
+                    self.ensure_web_tool_input_still_idle()?;
+                    ensure_game_ready_for_input(
+                        &self.config.window,
+                        self.config.timing.input.after_activate_ms,
+                    )?;
+                    press_key(key, &self.config.window)?;
+                    Ok("按键已发送".to_string())
+                }
+                WebToolRequest::ChatChangeSamples {
+                    samples,
+                    interval_ms,
+                } => self.sample_web_tool_chat_changes(samples, interval_ms),
+                WebToolRequest::PanelResponseBenchmark { rounds } => {
+                    self.run_web_tool_panel_benchmark(rounds)
+                }
+                WebToolRequest::OcrBackendProbe => {
+                    let args = OcrArgs::default().resolve(&self.config);
+                    let result = probe_ocr_backend_support(&args)
+                        .into_iter()
+                        .map(|probe| match probe.status {
+                            OcrBackendProbeStatus::Available {
+                                init_ms,
+                                detect_ms,
+                                rec_ms,
+                            } => format!(
+                                "{} [{}] 可用: 初始化={}ms 检测={}ms 识别={}ms",
+                                probe.name,
+                                if probe.gpu { "GPU" } else { "CPU" },
+                                init_ms,
+                                detect_ms,
+                                rec_ms
+                            ),
+                            OcrBackendProbeStatus::Failed { elapsed_ms, error } => format!(
+                                "{} [{}] 不可用: {}ms {error}",
+                                probe.name,
+                                if probe.gpu { "GPU" } else { "CPU" },
+                                elapsed_ms
+                            ),
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    Ok(result)
+                }
+                WebToolRequest::AiSearchPreview {
+                    keyword,
+                    prefer_accompaniment,
+                } => {
+                    if !self.ai.enabled() {
+                        return Err(anyhow!("AI 点歌未启用，请先配置 ai.api_key"));
+                    }
+                    let feeluown = FeelUOwnClient::new(&self.config.feeluown, &self.config.timing);
+                    let result =
+                        self.ai
+                            .search_and_pick(&feeluown, &keyword, prefer_accompaniment)?;
+                    let mut lines = vec![
+                        format!("用户请求: {}", result.request),
+                        format!("候选数量: {}", result.candidates.len()),
+                    ];
+                    lines.extend(
+                        result
+                            .candidates
+                            .iter()
+                            .enumerate()
+                            .map(|(index, candidate)| {
+                                format!("{}. {} -> {}", index + 1, candidate.text, candidate.uri)
+                            }),
+                    );
+                    if let Some(pick) = result.pick {
+                        lines.push(format!(
+                            "AI 选择: {} score={:.2} reason={}",
+                            pick.uri, pick.score, pick.reason
+                        ));
+                    }
+                    Ok(lines.join("\n"))
+                }
+            }
+        }
+
+        fn sample_web_tool_chat_changes(&self, samples: u32, interval_ms: u64) -> Result<String> {
+            let baseline = self.latest_frame()?;
+            let mut previous =
+                rect_chat_change_fingerprint(&baseline, self.config.screen.chat_rect.into())?;
+            let templates = TemplateArgs::default().resolve(&self.config);
+            let mut lines = vec![format!(
+                "采样次数={} 间隔={}ms，区域为一级聊天区",
+                samples, interval_ms
+            )];
+
+            for index in 1..=samples {
+                sleep(Duration::from_millis(interval_ms));
+                let frame = self.latest_frame()?;
+                let current =
+                    rect_chat_change_fingerprint(&frame, self.config.screen.chat_rect.into())?;
+                let stats = change_stats(&previous, &current);
+                let changed = stats.mean_abs_diff >= self.config.ocr.change_mean_threshold
+                    || stats.changed_ratio >= self.config.ocr.change_pixel_threshold;
+                let markers = if changed {
+                    let (blue, yellow, pink) = self::chat_scan::count_chat_markers(
+                        &frame,
+                        &templates,
+                        self.config.screen.chat_rect,
+                    )?;
+                    format!(" 蓝={} 黄={} 粉={}", blue, yellow, pink)
+                } else {
+                    String::new()
+                };
+                lines.push(format!(
+                    "#{} mean={:.3} ratio={:.5} changed={}{}",
+                    index, stats.mean_abs_diff, stats.changed_ratio, changed, markers
+                ));
+                previous = current;
+            }
+            Ok(lines.join("\n"))
+        }
+
+        fn run_web_tool_panel_benchmark(&self, rounds: u32) -> Result<String> {
+            const TIMEOUT_MS: u64 = 1_500;
+            const POLL_MS: u64 = 50;
+            const STABLE_SAMPLES: usize = 3;
+
+            self.ensure_web_tool_input_still_idle()?;
+            ensure_game_ready_for_input(
+                &self.config.window,
+                self.config.timing.input.after_activate_ms,
+            )?;
+            let mut open_times = Vec::new();
+            let mut close_times = Vec::new();
+            let mut failures = 0u32;
+            let detect_rect = web_tool_panel_response_rect(&self.config);
+
+            for _ in 0..rounds {
+                self.ensure_web_tool_input_still_idle()?;
+                press_key(Key::Escape, &self.config.window)?;
+                let closed = self.latest_frame()?;
+                let closed = rect_chat_change_fingerprint(&closed, detect_rect)?;
+
+                let opened_at = Instant::now();
+                self.ensure_web_tool_input_still_idle()?;
+                press_key(Key::Return, &self.config.window)?;
+                let Some(opened) = self.wait_for_web_tool_change(
+                    &closed,
+                    detect_rect,
+                    opened_at,
+                    TIMEOUT_MS,
+                    POLL_MS,
+                    STABLE_SAMPLES,
+                )?
+                else {
+                    failures += 1;
+                    continue;
+                };
+                open_times.push(opened.0);
+
+                let closed_at = Instant::now();
+                self.ensure_web_tool_input_still_idle()?;
+                press_key(Key::Escape, &self.config.window)?;
+                let Some(closed_again) = self.wait_for_web_tool_change(
+                    &opened.1,
+                    detect_rect,
+                    closed_at,
+                    TIMEOUT_MS,
+                    POLL_MS,
+                    STABLE_SAMPLES,
+                )?
+                else {
+                    failures += 1;
+                    continue;
+                };
+                close_times.push(closed_again.0);
             }
 
-            log::error!("{}准备界面失败，保留任务 {}: {error:#}", stage, label);
-            Ok(PrepareUiFailureAction::Requeue)
+            let _ = press_key(Key::Escape, &self.config.window);
+            Ok(format!(
+                "轮数={} 失败={}\n打开: {}\n关闭: {}",
+                rounds,
+                failures,
+                format_web_tool_latency_summary(&open_times),
+                format_web_tool_latency_summary(&close_times)
+            ))
+        }
+
+        fn ensure_web_tool_input_still_idle(&self) -> Result<()> {
+            let (lock, _) = &*self.pending;
+            let pending = lock.lock().map_err(|_| anyhow!("pending mutex poisoned"))?;
+            if pending.is_empty() {
+                Ok(())
+            } else {
+                Err(anyhow!("正式任务已进入队列，已取消 Web 工具输入"))
+            }
+        }
+
+        fn wait_for_web_tool_change(
+            &self,
+            baseline: &ChangeFingerprint,
+            detect_rect: Rect,
+            started: Instant,
+            timeout_ms: u64,
+            poll_ms: u64,
+            stable_samples: usize,
+        ) -> Result<Option<(u128, ChangeFingerprint)>> {
+            let mut previous = baseline.clone();
+            let mut stable_count = 0usize;
+            let deadline = started + Duration::from_millis(timeout_ms);
+
+            while Instant::now() < deadline {
+                sleep(Duration::from_millis(poll_ms));
+                let frame = self.latest_frame()?;
+                let current = rect_chat_change_fingerprint(&frame, detect_rect)?;
+                let from_baseline = change_stats(baseline, &current);
+                let from_previous = change_stats(&previous, &current);
+                let changed = from_baseline.mean_abs_diff >= self.config.ocr.change_mean_threshold
+                    || from_baseline.changed_ratio >= self.config.ocr.change_pixel_threshold;
+                let stable = from_previous.mean_abs_diff < self.config.ocr.change_mean_threshold
+                    && from_previous.changed_ratio < self.config.ocr.change_pixel_threshold;
+
+                if changed && stable {
+                    stable_count += 1;
+                    if stable_count >= stable_samples {
+                        return Ok(Some((started.elapsed().as_millis(), current)));
+                    }
+                } else if !stable {
+                    stable_count = 0;
+                }
+                previous = current;
+            }
+            Ok(None)
         }
 
         fn execute_console_chat_task(&mut self, text: String, prefix: String) -> Result<()> {
             let message = format!("{}{}", prefix, text);
-            match self.prepare_command_ui(&message) {
-                Ok(true) => {}
-                Ok(false) => {
-                    log::info!("控制台发言前未能回到一级界面，保留任务: {}", text);
-                    self.push_pending_task_front(PendingTask::ConsoleChat { text, prefix })?;
-                    return Ok(());
-                }
-                Err(error) => match self.handle_prepare_ui_error("控制台发言前", &text, error)?
-                {
-                    PrepareUiFailureAction::Requeue => {
-                        self.push_pending_task_front(PendingTask::ConsoleChat { text, prefix })?;
-                        return Ok(());
-                    }
-                },
-            }
+            self.ensure_game_ready_for_input("控制台发言前准备")?;
             self.reply(&message)
         }
 
@@ -2237,9 +2787,26 @@ mod app {
             }
         }
 
-        fn restore_secondary_listener_after_task(&mut self, task_label: &str) -> Result<()> {
-            if self.restore_secondary_current_hall()? {
-                return Ok(());
+        fn restore_listener_residency_after_task(&self, task_label: &str) -> Result<()> {
+            match self.active_ui_residency() {
+                UiResidency::Primary => self.ensure_ui_residency(
+                    UiResidency::Primary,
+                    &format!("任务结束恢复一级界面: {}", task_label),
+                ),
+                UiResidency::SecondaryCurrentHall => {
+                    self.restore_secondary_listener_after_task(task_label)
+                }
+            }
+        }
+
+        fn restore_secondary_listener_after_task(&self, task_label: &str) -> Result<()> {
+            match self.restore_secondary_current_hall() {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(error) if is_target_window_unavailable_error(&error) => return Err(error),
+                Err(error) => {
+                    log::error!("二级监听恢复过程异常 {}: {error:#}", task_label);
+                }
             }
             self.chat_listener.fail_mode_switch_to_primary();
             self.update_monitor_chat_listener();
@@ -2254,10 +2821,28 @@ mod app {
 
         fn open_secondary_current_hall(&self) -> Result<bool> {
             for attempt in 1..=2 {
-                if attempt > 1 {
+                if !self.ensure_secondary_chat_open("进入二级监听")? {
+                    continue;
+                }
+                if self.secondary_title_is_current_hall()? {
+                    return Ok(true);
+                }
+                if self.click_secondary_hall_template()?
+                    && self.secondary_title_is_current_hall()?
+                {
+                    return Ok(true);
+                }
+                log::warn!("二级监听进入 attempt={}/2 未确认当前大厅", attempt);
+                if attempt < 2 {
                     let _ = self.return_to_primary_from_transient_ui("二级监听第二次进入前重置");
                 }
-                self.ensure_game_ready_for_input("进入二级监听")?;
+            }
+            Ok(false)
+        }
+
+        fn ensure_secondary_chat_open(&self, context: &str) -> Result<bool> {
+            for attempt in 1..=2 {
+                self.ensure_game_ready_for_input(context)?;
                 let canvas = Canvas {
                     width: self.config.screen.expected_width,
                     height: self.config.screen.expected_height,
@@ -2266,31 +2851,45 @@ mod app {
                 let frame_args = FrameArgs { image: None };
                 let templates = UiTemplateArgs::default().resolve(&self.config);
                 let frame = load_frame(&frame_args, &canvas, &self.config.window)?;
-                let ui_state = detect_ui_state(&frame.image, &templates, &self.config.screen)?;
-                if !ui_state.is_secondary() {
-                    log::info!(
-                        "二级监听进入: 按 Enter 打开二级聊天界面 attempt={}/2",
-                        attempt
-                    );
-                    press_key(Key::Return, &self.config.window)?;
-                    sleep(Duration::from_millis(self.config.timing.input.open_chat_ms));
-                }
-                if self.click_secondary_hall_template()?
-                    && self.secondary_title_is_current_hall()?
-                {
+                let mut ui_state = detect_ui_state(&frame.image, &templates, &self.config.screen)?;
+                if ui_state.is_secondary() {
                     return Ok(true);
                 }
-                log::warn!("二级监听进入 attempt={}/2 未确认当前大厅", attempt);
+                if !ui_state.is_primary() {
+                    log::warn!(
+                        "{}: 当前界面为 {}，先恢复一级 attempt={}/2",
+                        context,
+                        ui_state,
+                        attempt
+                    );
+                    if !self.return_to_primary_from_transient_ui(context) {
+                        continue;
+                    }
+                    let frame = load_frame(&frame_args, &canvas, &self.config.window)?;
+                    ui_state = detect_ui_state(&frame.image, &templates, &self.config.screen)?;
+                    if !ui_state.is_primary() {
+                        continue;
+                    }
+                }
+
+                log::info!(
+                    "{}: 按 Enter 打开二级聊天界面 attempt={}/2",
+                    context,
+                    attempt
+                );
+                press_key(Key::Return, &self.config.window)?;
+                sleep(Duration::from_millis(self.config.timing.input.open_chat_ms));
+                let frame = load_frame(&frame_args, &canvas, &self.config.window)?;
+                let ui_state = detect_ui_state(&frame.image, &templates, &self.config.screen)?;
+                if ui_state.is_secondary() {
+                    return Ok(true);
+                }
             }
             Ok(false)
         }
 
         fn restore_secondary_current_hall(&self) -> Result<bool> {
             self.ensure_game_ready_for_input("二级大厅恢复")?;
-            if self.secondary_title_is_current_hall()? {
-                return Ok(true);
-            }
-
             let canvas = Canvas {
                 width: self.config.screen.expected_width,
                 height: self.config.screen.expected_height,
@@ -2300,6 +2899,12 @@ mod app {
             let templates = UiTemplateArgs::default().resolve(&self.config);
             let ui_state = detect_ui_state(&frame.image, &templates, &self.config.screen)?;
             if ui_state.is_secondary() {
+                if matches!(
+                    self.secondary_identity_from_frame(&frame.image)?,
+                    SecondaryChatIdentity::CurrentHall
+                ) {
+                    return Ok(true);
+                }
                 return Ok(self.click_secondary_hall_template()?
                     && self.secondary_title_is_current_hall()?);
             }
@@ -2357,6 +2962,147 @@ mod app {
             Ok(classify_title(&title))
         }
 
+        fn begin_chat_decision_reader<A, P>(
+            &self,
+            scope: ChatDecisionScope,
+            accepts_message_type: &A,
+            is_decision: &P,
+        ) -> Result<ChatDecisionReader>
+        where
+            A: Fn(&str) -> bool,
+            P: Fn(&str) -> bool,
+        {
+            let use_secondary = scope == ChatDecisionScope::CurrentHall
+                && self.active_ui_residency() == UiResidency::SecondaryCurrentHall;
+            if use_secondary {
+                self.ensure_ui_residency(
+                    UiResidency::SecondaryCurrentHall,
+                    "建立二级当前大厅确认基线",
+                )?;
+                let canvas = Canvas {
+                    width: self.config.screen.expected_width,
+                    height: self.config.screen.expected_height,
+                    resize: true,
+                };
+                let frame = load_frame(&FrameArgs { image: None }, &canvas, &self.config.window)?;
+                let previous = secondary_hall_bubbles(&frame.image)?;
+                return Ok(ChatDecisionReader {
+                    kind: ChatDecisionReaderKind::SecondaryCurrentHall { previous },
+                    screen_lock: DecisionScreenLock::default(),
+                });
+            }
+
+            self.ensure_ui_residency(UiResidency::Primary, "建立一级聊天确认基线")?;
+            let template_args = TemplateArgs::default().resolve(&self.config);
+            let canvas = Canvas {
+                width: self.config.screen.expected_width,
+                height: self.config.screen.expected_height,
+                resize: true,
+            };
+            let frame = load_frame(&FrameArgs { image: None }, &canvas, &self.config.window)?;
+            let messages = self.scan_chat_with_shared_ocr(&frame.image, &template_args)?;
+            Ok(ChatDecisionReader {
+                kind: ChatDecisionReaderKind::Primary,
+                screen_lock: DecisionScreenLock::from_messages(
+                    &messages,
+                    accepts_message_type,
+                    is_decision,
+                ),
+            })
+        }
+
+        fn poll_chat_decision_reader(
+            &self,
+            reader: &mut ChatDecisionReader,
+        ) -> Result<Vec<ChatMessage>> {
+            match &mut reader.kind {
+                ChatDecisionReaderKind::Primary => {
+                    let template_args = TemplateArgs::default().resolve(&self.config);
+                    let canvas = Canvas {
+                        width: self.config.screen.expected_width,
+                        height: self.config.screen.expected_height,
+                        resize: true,
+                    };
+                    let frame =
+                        load_frame(&FrameArgs { image: None }, &canvas, &self.config.window)?;
+                    self.scan_chat_with_shared_ocr(&frame.image, &template_args)
+                }
+                ChatDecisionReaderKind::SecondaryCurrentHall { previous } => {
+                    self.scan_secondary_decision_messages(previous)
+                }
+            }
+        }
+
+        fn scan_secondary_decision_messages(
+            &self,
+            previous: &mut Vec<SecondaryHallBubble>,
+        ) -> Result<Vec<ChatMessage>> {
+            let canvas = Canvas {
+                width: self.config.screen.expected_width,
+                height: self.config.screen.expected_height,
+                resize: true,
+            };
+            let frame = load_frame(&FrameArgs { image: None }, &canvas, &self.config.window)?;
+            let current = secondary_hall_bubbles(&frame.image)?;
+            let Some(start) = secondary_new_bubble_start(previous, &current) else {
+                *previous = current;
+                log::debug!("二级确认气泡序列失去重叠，已重建基线");
+                return Ok(Vec::new());
+            };
+            if start >= current.len() {
+                *previous = current;
+                return Ok(Vec::new());
+            }
+
+            let refreshed = self.wait_for_secondary_bubble_stability()?;
+            let refreshed_bubbles = secondary_hall_bubbles(&refreshed)?;
+            let Some(start) = secondary_new_bubble_start(previous, &refreshed_bubbles) else {
+                *previous = refreshed_bubbles;
+                log::debug!("二级确认气泡稳定后失去重叠，已重建基线");
+                return Ok(Vec::new());
+            };
+            let rects = refreshed_bubbles[start..]
+                .iter()
+                .map(|bubble| bubble.rect)
+                .collect::<Vec<_>>();
+            let messages = self.recognize_secondary_hall_messages(&refreshed, &rects)?;
+            *previous = refreshed_bubbles;
+            Ok(messages)
+        }
+
+        fn recognize_secondary_hall_messages(
+            &self,
+            image: &DynamicImage,
+            rects: &[Rect],
+        ) -> Result<Vec<ChatMessage>> {
+            let started = Instant::now();
+            let engine = self.ocr_engine()?;
+            let mut messages = Vec::with_capacity(rects.len());
+            for rect in rects {
+                let crop = crop_canvas(image, *rect)?;
+                let text =
+                    merged_ocr_text(&engine.engine, &crop, self.config.ocr.same_line_y_tolerance)?;
+                messages.push(ChatMessage {
+                    message_type: "blue".to_string(),
+                    block: *rect,
+                    text,
+                });
+            }
+            let ocr_ms = elapsed_ms(started);
+            self.monitor.set_ocr(OcrSnapshot::new(
+                messages.len(),
+                messages
+                    .iter()
+                    .map(|message| format!("[blue] {}", message.text))
+                    .collect(),
+                0,
+                ocr_ms,
+                ocr_ms,
+                "二级当前大厅",
+            ));
+            Ok(messages)
+        }
+
         fn process_secondary_latest_message(
             &self,
             image: &DynamicImage,
@@ -2394,16 +3140,21 @@ mod app {
                 )?);
             }
             let ocr_ms = elapsed_ms(ocr_started);
-            self.monitor.set_ocr(OcrSnapshot {
-                markers: texts.len(),
-                messages: texts
+            self.monitor.set_ocr(OcrSnapshot::new(
+                texts.len(),
+                texts
                     .iter()
                     .map(|text| format!("[{}] {}", message_type, text))
                     .collect(),
-                marker_ms: 0,
+                0,
                 ocr_ms,
-                total_ms: elapsed_ms(started),
-            });
+                elapsed_ms(started),
+                if message_type == "pink" {
+                    "二级好友私聊"
+                } else {
+                    "二级当前大厅"
+                },
+            ));
             drop(engine);
 
             let mut processed = false;
@@ -2451,7 +3202,7 @@ mod app {
             let frame_args = FrameArgs { image: None };
             let first = load_frame(&frame_args, &canvas, &self.config.window)?;
             let mut previous = latest_incoming_fingerprint(&first.image)?;
-            let mut latest_image = first.image;
+            let mut latest_image = (*first.image).clone();
             let poll_ms = self
                 .config
                 .timing
@@ -2465,10 +3216,10 @@ mod app {
                 let frame = load_frame(&frame_args, &canvas, &self.config.window)?;
                 let current = latest_incoming_fingerprint(&frame.image)?;
                 if !secondary_optional_fingerprint_changed(previous.as_ref(), current.as_ref()) {
-                    return Ok(frame.image);
+                    return Ok((*frame.image).clone());
                 }
                 previous = current;
-                latest_image = frame.image;
+                latest_image = (*frame.image).clone();
             }
             log::debug!("二级监听气泡稳定等待超时，按当前画面继续 OCR");
             Ok(latest_image)
@@ -2510,26 +3261,7 @@ mod app {
         }
 
         fn execute_pending_command(&mut self, pending: PendingCommand) -> Result<()> {
-            match self.prepare_command_ui(&pending.parsed.raw) {
-                Ok(true) => {}
-                Ok(false) => {
-                    log::info!(
-                        "命令执行前未能回到一级界面，保留待处理命令: {}",
-                        pending.parsed.raw
-                    );
-                    self.push_pending_task_front(PendingTask::Command(Box::new(pending)))?;
-                    return Ok(());
-                }
-                Err(error) => {
-                    match self.handle_prepare_ui_error("命令执行前", &pending.parsed.raw, error)?
-                    {
-                        PrepareUiFailureAction::Requeue => {
-                            self.push_pending_task_front(PendingTask::Command(Box::new(pending)))?;
-                            return Ok(());
-                        }
-                    }
-                }
-            }
+            self.ensure_game_ready_for_input("命令执行前准备")?;
             log::info!(
                 "执行待处理命令: {} lock={}",
                 pending.parsed.raw,
@@ -2611,14 +3343,16 @@ mod app {
         fn push_pending_task(&self, task: PendingTask) -> Result<()> {
             let (lock, cvar) = &*self.pending;
             let mut guard = lock.lock().map_err(|_| anyhow!("pending mutex poisoned"))?;
-            guard.push_back(task);
+            let id = self.task_tracker.create(task.label())?;
+            guard.push_back(TrackedPendingTask { id, task });
             cvar.notify_one();
             Ok(())
         }
 
-        fn push_pending_task_front(&self, task: PendingTask) -> Result<()> {
+        fn push_pending_task_front(&self, task: TrackedPendingTask) -> Result<()> {
             let (lock, cvar) = &*self.pending;
             let mut guard = lock.lock().map_err(|_| anyhow!("pending mutex poisoned"))?;
+            self.task_tracker.mark_queued(task.id);
             guard.push_front(task);
             cvar.notify_one();
             Ok(())
@@ -2648,6 +3382,27 @@ mod app {
                 self.config.timing.input.after_activate_ms,
             )
             .with_context(|| format!("{}: 激活并聚焦游戏窗口失败", context))
+        }
+
+        fn active_ui_residency(&self) -> UiResidency {
+            let snapshot = self.chat_listener.snapshot();
+            listener_residency(snapshot.mode, snapshot.temporary_primary)
+        }
+
+        fn ensure_ui_residency(&self, target: UiResidency, context: &str) -> Result<()> {
+            match target {
+                UiResidency::Primary => match self.prepare_command_ui(context)? {
+                    true => Ok(()),
+                    false => Err(anyhow!("{}: 未能到达一级界面", context)),
+                },
+                UiResidency::SecondaryCurrentHall => {
+                    if self.restore_secondary_current_hall()? {
+                        Ok(())
+                    } else {
+                        Err(anyhow!("{}: 未能到达二级当前大厅", context))
+                    }
+                }
+            }
         }
 
         fn prepare_command_ui(&self, command: &str) -> Result<bool> {
@@ -2681,24 +3436,7 @@ mod app {
         }
 
         fn execute_advance_queue_task(&mut self, reason: &'static str) -> Result<()> {
-            let task_label = format!("自动出队({})", reason);
-            match self.prepare_command_ui(&task_label) {
-                Ok(true) => self.consume_queue(reason),
-                Ok(false) => {
-                    log::info!("{} 执行前未能回到一级界面，保留任务", task_label);
-                    self.push_pending_task_front(PendingTask::AdvanceQueue { reason })?;
-                    Ok(())
-                }
-                Err(error) => {
-                    match self.handle_prepare_ui_error("自动出队执行前", &task_label, error)?
-                    {
-                        PrepareUiFailureAction::Requeue => {
-                            self.push_pending_task_front(PendingTask::AdvanceQueue { reason })?;
-                            Ok(())
-                        }
-                    }
-                }
-            }
+            self.consume_queue(reason)
         }
 
         fn run_playback_monitor_loop(&mut self) {
@@ -2785,7 +3523,7 @@ mod app {
         fn has_pending_playback_task(&self) -> Result<bool> {
             let (lock, _) = &*self.pending;
             let guard = lock.lock().map_err(|_| anyhow!("pending mutex poisoned"))?;
-            Ok(guard.iter().any(PendingTask::is_playback_task))
+            Ok(guard.iter().any(TrackedPendingTask::is_playback_task))
         }
 
         fn maybe_warn_hall_expiring(&mut self) -> Result<bool> {
@@ -3178,6 +3916,7 @@ mod app {
                 return Ok(QueuePushOutcome::Full);
             }
             queue.push(queue::QueueItem {
+                id: 0,
                 keyword: request.keyword.clone(),
                 source: request.source.clone(),
                 prefer_accompaniment: request.prefer_accompaniment,
@@ -3599,6 +4338,10 @@ mod app {
                     self.log_executed_command(parsed, "help")?;
                     self.send_help()?;
                 }
+                UserCommand::IdiomChain(_) => {
+                    log::warn!("成语接龙命令错误进入主执行器，改由延迟聊天队列处理");
+                    let _ = self.handle_idiom_chain_command(parsed)?;
+                }
                 UserCommand::Invite(invite) => {
                     if let Some(seq) = invite.seq {
                         let mut executed = self
@@ -3694,29 +4437,15 @@ mod app {
         }
 
         fn execute_microphone_command(&self, username: &str) -> Result<()> {
-            if !self.is_primary_ui()? {
-                log::info!("麦克风: 当前不在一级界面，返回一级界面");
-                self.return_to_primary_fixed();
-            }
+            self.ensure_ui_residency(UiResidency::Primary, "麦克风切换前准备")?;
             log::info!("麦克风: 按 N 切换状态");
             press_key(Key::Unicode('n'), &self.config.window)?;
             sleep(Duration::from_millis(100));
             self.reply(&format!("@{} 执行了切换麦克风状态！", username))
         }
 
-        fn is_primary_ui(&self) -> Result<bool> {
-            let templates = UiTemplateArgs::default().resolve(&self.config);
-            let canvas = Canvas {
-                width: self.config.screen.expected_width,
-                height: self.config.screen.expected_height,
-                resize: true,
-            };
-            let frame = load_frame(&FrameArgs { image: None }, &canvas, &self.config.window)?;
-            let ui_state = detect_ui_state(&frame.image, &templates, &self.config.screen)?;
-            Ok(ui_state.is_primary())
-        }
-
         fn execute_hall_detect(&mut self) -> Result<()> {
+            self.ensure_ui_residency(UiResidency::Primary, "大厅检测前准备")?;
             log::info!("大厅检测: 按 F2 进入大厅页面");
             press_key(Key::F2, &self.config.window)?;
             sleep(Duration::from_millis(
@@ -3793,6 +4522,7 @@ mod app {
             }
 
             log::info!("大厅时间未知，执行一次大厅识别");
+            self.ensure_ui_residency(UiResidency::Primary, "大厅时间识别前准备")?;
             press_key(Key::F2, &self.config.window)?;
             sleep(Duration::from_millis(
                 self.config.timing.hall.page_settle_ms,
@@ -3821,6 +4551,7 @@ mod app {
         }
 
         fn check_public_hall(&self) -> Result<bool> {
+            self.ensure_ui_residency(UiResidency::Primary, "公共大厅检测前准备")?;
             log::info!("大厅检测: 按 F2 进入大厅页面");
             press_key(Key::F2, &self.config.window)?;
             sleep(Duration::from_millis(
@@ -3849,7 +4580,7 @@ mod app {
         }
 
         fn return_to_primary_fixed(&self) -> bool {
-            self.return_to_primary_by_escape("返回一级界面", false)
+            self.return_to_primary_by_escape("返回一级界面")
         }
 
         fn return_to_primary_after_command_failure(&self, command: &str) {
@@ -3858,10 +4589,10 @@ mod app {
         }
 
         fn return_to_primary_from_transient_ui(&self, context: &str) -> bool {
-            self.return_to_primary_by_escape(context, true)
+            self.return_to_primary_by_escape(context)
         }
 
-        fn return_to_primary_by_escape(&self, context: &str, force_first_escape: bool) -> bool {
+        fn return_to_primary_by_escape(&self, context: &str) -> bool {
             if let Err(error) = window::GameWindow::find(&self.config.window) {
                 log::warn!(
                     "{}: 目标游戏窗口不可用，跳过返回一级界面: {error:#}",
@@ -3881,12 +4612,6 @@ mod app {
                 Instant::now() + Duration::from_millis(self.config.timing.command.ui_timeout_ms);
 
             let mut failed_returns = 0_u32;
-            if force_first_escape {
-                failed_returns += 1;
-                if !self.press_escape_for_primary_return(context, failed_returns) {
-                    return false;
-                }
-            }
 
             while Instant::now() < deadline {
                 match load_frame(&frame_args, &canvas, &self.config.window).and_then(|frame| {
@@ -4011,11 +4736,12 @@ mod app {
         }
 
         fn send_help(&self) -> Result<()> {
-            self.chat_output.send_batch(
+            self.reply_batch(
                 &[
                     "点歌示例: @点歌/@AI点歌 歌名 歌手 伴奏,输入伴奏时优先匹配伴奏",
-                "命令以@开头: 暂停、继续、播放、下一首、上一首、状态、歌词、帮助、队列、音量1-100",
+                    "命令以@开头: 暂停、继续、播放、下一首、上一首、状态、歌词、帮助、队列、音量1-100",
                     "切换网易平台: @网易点歌 歌名 歌手 伴奏,默认为QQ平台",
+                    "成语接龙: @接龙 开始 成语,随后 @接龙 成语;可用 @接龙 状态/结束",
                 ],
                 self.config.timing.command.help_batch_ms,
             )
@@ -4349,30 +5075,36 @@ mod app {
             allow_ai: bool,
             timeout_confirms: bool,
         ) -> Result<UserDecision> {
-            sleep(Duration::from_millis(
-                self.config.timing.command.post_settle_ms,
-            ));
-            let mut screen_lock = self.collect_decision_screen_lock();
-            let deadline =
-                Instant::now() + Duration::from_millis(self.config.timing.decision.timeout_ms);
-            let template_args = TemplateArgs::default().resolve(&self.config);
-            let canvas = Canvas {
-                width: self.config.screen.expected_width,
-                height: self.config.screen.expected_height,
-                resize: true,
+            let accepts_message_type = |message_type: &str| message_type == "blue";
+            let is_decision = |text: &str| parse_decision_command(text).is_some();
+            let mut reader = self.begin_chat_decision_reader(
+                ChatDecisionScope::CurrentHall,
+                &accepts_message_type,
+                &is_decision,
+            )?;
+            let timeout = Duration::from_millis(self.config.timing.decision.timeout_ms);
+            let map_web_decision = |decision| match decision {
+                DecisionAction::Confirm => UserDecision::Confirm,
+                DecisionAction::Skip => UserDecision::Skip,
+                DecisionAction::SwitchSource => UserDecision::SwitchSource,
+                DecisionAction::Ai => UserDecision::Ai,
             };
+            let web_decision = self.decision_control.begin(
+                "点歌候选确认",
+                allow_switch_source,
+                allow_ai,
+                timeout,
+            )?;
+            let deadline = Instant::now() + timeout;
             while self.running.load(AtomicOrdering::SeqCst) && Instant::now() < deadline {
-                sleep(Duration::from_millis(self.config.timing.decision.poll_ms));
-                let frame =
-                    match load_frame(&FrameArgs { image: None }, &canvas, &self.config.window) {
-                        Ok(frame) => frame,
-                        Err(error) => {
-                            log::error!("确认命令截图失败: {error:#}");
-                            continue;
-                        }
-                    };
-                let scan_result = self.scan_chat_with_shared_ocr(&frame.image, &template_args);
-                let messages = match scan_result {
+                let wait = Duration::from_millis(
+                    reader.poll_interval_ms(self.config.timing.decision.poll_ms),
+                )
+                .min(deadline.saturating_duration_since(Instant::now()));
+                if let Some(decision) = web_decision.wait(wait)? {
+                    return Ok(map_web_decision(decision));
+                }
+                let messages = match self.poll_chat_decision_reader(&mut reader) {
                     Ok(messages) => messages,
                     Err(error) => {
                         log::error!("确认命令扫描失败: {error:#}");
@@ -4389,7 +5121,7 @@ mod app {
                     let Some(decision) = parse_decision_command(&message.text) else {
                         continue;
                     };
-                    if !screen_lock.accept_once(&message) {
+                    if !reader.accept_once(&message) {
                         continue;
                     }
                     match decision {
@@ -4405,6 +5137,9 @@ mod app {
                     }
                 }
             }
+            if let Some(decision) = web_decision.wait(Duration::from_millis(0))? {
+                return Ok(map_web_decision(decision));
+            }
             if !self.running.load(AtomicOrdering::SeqCst) {
                 Ok(UserDecision::Stopped)
             } else if timeout_confirms {
@@ -4417,27 +5152,6 @@ mod app {
                 })?;
                 Ok(UserDecision::Timeout)
             }
-        }
-
-        fn collect_decision_screen_lock(&self) -> DecisionScreenLock {
-            let template_args = TemplateArgs::default().resolve(&self.config);
-            let canvas = Canvas {
-                width: self.config.screen.expected_width,
-                height: self.config.screen.expected_height,
-                resize: true,
-            };
-            let Ok(frame) = load_frame(&FrameArgs { image: None }, &canvas, &self.config.window)
-            else {
-                return DecisionScreenLock::default();
-            };
-            let Ok(messages) = self.scan_chat_with_shared_ocr(&frame.image, &template_args) else {
-                return DecisionScreenLock::default();
-            };
-            DecisionScreenLock::from_messages(
-                &messages,
-                &|message_type| message_type == "blue",
-                &|text| parse_decision_command(text).is_some(),
-            )
         }
 
         fn report_no_source(
@@ -4504,12 +5218,44 @@ mod app {
         }
 
         fn reply(&self, message: &str) -> Result<()> {
-            if self.console_reply_context.load(AtomicOrdering::SeqCst)
+            let prefixed;
+            let message = if self.console_reply_context.load(AtomicOrdering::SeqCst)
                 && !message.starts_with("[控制台]:")
             {
-                return self.chat_output.send(&format!("[控制台]: {}", message));
+                prefixed = format!("[控制台]: {}", message);
+                prefixed.as_str()
+            } else {
+                message
+            };
+            match self.active_ui_residency() {
+                UiResidency::Primary => {
+                    self.ensure_ui_residency(UiResidency::Primary, "发送一级聊天回复")?;
+                    self.chat_output.send(message)
+                }
+                UiResidency::SecondaryCurrentHall => {
+                    self.ensure_ui_residency(
+                        UiResidency::SecondaryCurrentHall,
+                        "发送二级当前大厅回复",
+                    )?;
+                    self.chat_output.send_current_chat(message)
+                }
             }
-            self.chat_output.send(message)
+        }
+
+        fn reply_batch(&self, messages: &[&str], delay_ms: u64) -> Result<()> {
+            match self.active_ui_residency() {
+                UiResidency::Primary => {
+                    self.ensure_ui_residency(UiResidency::Primary, "发送一级批量回复")?;
+                    self.chat_output.send_batch(messages, delay_ms)
+                }
+                UiResidency::SecondaryCurrentHall => {
+                    self.ensure_ui_residency(
+                        UiResidency::SecondaryCurrentHall,
+                        "发送二级当前大厅批量回复",
+                    )?;
+                    self.chat_output.send_current_chat_batch(messages, delay_ms)
+                }
+            }
         }
 
         fn log_queue(&self) -> Result<()> {
@@ -4542,6 +5288,7 @@ mod app {
                         .items()
                         .iter()
                         .map(|item| MonitorQueueItem {
+                            id: item.id,
                             keyword: item.keyword.clone(),
                             source: item.source.clone(),
                             prefer_accompaniment: item.prefer_accompaniment,
@@ -4560,8 +5307,30 @@ mod app {
         fn update_monitor_chat_listener(&self) {
             let snapshot = self.chat_listener.snapshot();
             self.monitor.set_chat_listener(
-                snapshot.mode.label(),
+                snapshot.display_mode(),
                 snapshot.pending_mode.map(|mode| mode.label().to_string()),
+            );
+        }
+
+        fn update_monitor_operational_state(&self) {
+            let idle_exit_remaining_seconds = self.idle_exit.lock().ok().and_then(|state| {
+                state.as_ref().map(|state| {
+                    state
+                        .timeout
+                        .saturating_sub(state.last_command_at.elapsed())
+                        .as_secs()
+                })
+            });
+            let hall_remaining_minutes = self
+                .runtime_state
+                .lock()
+                .ok()
+                .and_then(|state| state.state().hall_remaining_minutes_now());
+            self.monitor.set_operational(
+                self.paused.load(AtomicOrdering::SeqCst),
+                self.commands_enabled.load(AtomicOrdering::SeqCst),
+                idle_exit_remaining_seconds,
+                hall_remaining_minutes,
             );
         }
     }
@@ -4757,6 +5526,17 @@ mod app {
         stats.mean_abs_diff >= 0.8 || stats.changed_ratio >= 0.01
     }
 
+    fn secondary_new_bubble_start(
+        previous: &[SecondaryHallBubble],
+        current: &[SecondaryHallBubble],
+    ) -> Option<usize> {
+        if previous.is_empty() {
+            return Some(0);
+        }
+        let overlap = hall_bubble_sequence_overlap(previous, current);
+        (overlap > 0).then_some(overlap)
+    }
+
     fn secondary_optional_fingerprint_changed(
         previous: Option<&ChangeFingerprint>,
         current: Option<&ChangeFingerprint>,
@@ -4789,9 +5569,35 @@ mod app {
         current.saturating_mul(2).min(TARGET_MISSING_BACKOFF_MAX)
     }
 
-    fn print_json<T: Serialize>(value: &T) -> Result<()> {
-        println!("{}", serde_json::to_string_pretty(value)?);
-        Ok(())
+    fn format_web_tool_latency_summary(values: &[u128]) -> String {
+        if values.is_empty() {
+            return "无有效样本".to_string();
+        }
+        let total = values.iter().sum::<u128>();
+        let max = values.iter().copied().max().unwrap_or(0);
+        format!(
+            "样本={} 平均={}ms 最大={}ms",
+            values.len(),
+            total / values.len() as u128,
+            max
+        )
+    }
+
+    fn web_tool_panel_response_rect(config: &AppConfig) -> Rect {
+        let chat = config.screen.chat_rect;
+        let point = config.output.chat_click_2;
+        let x = chat.x.min(point.x - 80).max(0);
+        let y = chat.y.min(point.y - 80).max(0);
+        let right = (chat.x + chat.width as i32).max(point.x + 360);
+        let bottom = (chat.y + chat.height as i32).max(point.y + 50);
+        let max_right = config.screen.expected_width as i32;
+        let max_bottom = config.screen.expected_height as i32;
+        Rect::new(
+            x,
+            y,
+            (right.min(max_right) - x).max(1) as u32,
+            (bottom.min(max_bottom) - y).max(1) as u32,
+        )
     }
 
     #[cfg(test)]
@@ -4801,6 +5607,45 @@ mod app {
         #[test]
         fn parses_ai_decision_case_insensitive() {
             assert_eq!(parse_decision_command("用户：@ai"), Some(UserDecision::Ai));
+        }
+
+        #[test]
+        fn secondary_listener_resides_in_current_hall() {
+            assert_eq!(
+                listener_residency(ChatListenerMode::Secondary, false),
+                UiResidency::SecondaryCurrentHall
+            );
+        }
+
+        #[test]
+        fn temporary_primary_stage_overrides_secondary_residency() {
+            assert_eq!(
+                listener_residency(ChatListenerMode::Secondary, true),
+                UiResidency::Primary
+            );
+        }
+
+        #[test]
+        fn primary_listener_resides_in_primary_ui() {
+            assert_eq!(
+                listener_residency(ChatListenerMode::Primary, false),
+                UiResidency::Primary
+            );
+        }
+
+        #[test]
+        fn secondary_decision_reader_accepts_first_bubble_after_empty_baseline() {
+            let mut image = image::RgbaImage::new(1920, 1080);
+            for y in 300..354 {
+                for x in 415..700 {
+                    image.put_pixel(x, y, image::Rgba([62, 71, 89, 255]));
+                }
+            }
+            let current = secondary_hall_bubbles(&DynamicImage::ImageRgba8(image))
+                .expect("secondary bubbles");
+
+            assert!(!current.is_empty());
+            assert_eq!(secondary_new_bubble_start(&[], &current), Some(0));
         }
 
         #[test]

@@ -49,6 +49,24 @@ impl ChatOutput {
         self.send_current_chat_with_input(&message)
     }
 
+    pub fn send_current_chat_batch(&self, messages: &[&str], delay_ms: u64) -> Result<()> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+        let messages = messages
+            .iter()
+            .map(|message| fit_chat_message(message))
+            .collect::<Vec<_>>();
+        for message in &messages {
+            log::info!("当前聊天回复: {}", message);
+        }
+        if !self.enabled {
+            log::info!("当前聊天回复发送已关闭，仅记录日志");
+            return Ok(());
+        }
+        self.send_current_chat_batch_with_input(&messages, delay_ms)
+    }
+
     pub fn send_batch(&self, messages: &[&str], delay_ms: u64) -> Result<()> {
         if messages.is_empty() {
             return Ok(());
@@ -72,17 +90,26 @@ impl ChatOutput {
     }
 
     fn send_current_chat_with_input(&self, message: &str) -> Result<()> {
+        self.send_current_chat_batch_with_input(&[message.to_string()], 0)
+    }
+
+    fn send_current_chat_batch_with_input(&self, messages: &[String], delay_ms: u64) -> Result<()> {
         let mut enigo = Enigo::new(&Settings::default()).context("create enigo")?;
         let mut window = GameWindow::find(&self.window)?;
         window.ensure_foreground()?;
 
-        window.click(&mut enigo, self.config.chat_click_2)?;
-        sleep_ms(self.timing.input.click_ms);
-        input_message(&mut enigo, message, self.timing.input.text_ms, &self.window)?;
-        enigo
-            .key(Key::Return, Direction::Click)
-            .context("send message")?;
-        sleep_ms(self.timing.input.send_ms);
+        for (index, message) in messages.iter().enumerate() {
+            if index > 0 && delay_ms > 0 {
+                sleep_ms(delay_ms);
+            }
+            window.click(&mut enigo, self.config.chat_click_2)?;
+            sleep_ms(self.timing.input.click_ms);
+            input_message(&mut enigo, message, self.timing.input.text_ms, &self.window)?;
+            enigo
+                .key(Key::Return, Direction::Click)
+                .context("send message")?;
+            sleep_ms(self.timing.input.send_ms);
+        }
         Ok(())
     }
 

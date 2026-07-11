@@ -2,6 +2,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use super::idiom_chain::IdiomChainCommand;
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ParsedCommand {
     pub matched: String,
@@ -29,6 +31,7 @@ pub enum UserCommand {
     HallDetect,
     HallTime,
     Help,
+    IdiomChain(IdiomChainCommand),
     Invite(InviteCommand),
     Moderation(ModerationCommand),
     Microphone { username: String },
@@ -537,6 +540,17 @@ fn command_lock_key(command: &UserCommand) -> String {
         UserCommand::HallDetect => "hall_detect".to_string(),
         UserCommand::HallTime => "hall_time".to_string(),
         UserCommand::Help => "help".to_string(),
+        UserCommand::IdiomChain(command) => match command {
+            IdiomChainCommand::Start(idiom) => {
+                format!("idiom_chain:start:{}", identity_text(idiom))
+            }
+            IdiomChainCommand::Submit(idiom) => {
+                format!("idiom_chain:submit:{}", identity_text(idiom))
+            }
+            IdiomChainCommand::Status => "idiom_chain:status".to_string(),
+            IdiomChainCommand::Stop => "idiom_chain:stop".to_string(),
+            IdiomChainCommand::Help => "idiom_chain:help".to_string(),
+        },
         UserCommand::Invite(invite) => {
             if let Some(seq) = invite.seq {
                 format!("invite:{}", seq)
@@ -725,6 +739,7 @@ fn parse_command(matched: &str, param: &str) -> Option<UserCommand> {
         "大厅检测" => Some(UserCommand::HallDetect),
         "大厅时间" => Some(UserCommand::HallTime),
         "帮助" => Some(UserCommand::Help),
+        "接龙" | "成语接龙" => Some(UserCommand::IdiomChain(IdiomChainCommand::parse(param))),
         _ => None,
     }
 }
@@ -795,6 +810,8 @@ fn allows_param(command: &str) -> bool {
             | "网易搜索"
             | "音量"
             | "队列删除"
+            | "接龙"
+            | "成语接龙"
     )
 }
 
@@ -837,6 +854,8 @@ const COMMANDS: &[&str] = &[
     "音量",
     "状态",
     "帮助",
+    "成语接龙",
+    "接龙",
     "歌词",
     "队列删除",
     "队列清空",
@@ -903,6 +922,23 @@ const FEEDBACK_TEXT_PATTERNS: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_idiom_chain_command() {
+        let started =
+            parse_text("用户：@接龙 开始 画蛇添足", "blue").expect("parse idiom chain start");
+        assert_eq!(
+            started.command,
+            UserCommand::IdiomChain(IdiomChainCommand::Start("画蛇添足".to_string()))
+        );
+
+        let submitted =
+            parse_text("用户：@成语接龙 足智多谋", "blue").expect("parse idiom chain submit");
+        assert_eq!(
+            submitted.command,
+            UserCommand::IdiomChain(IdiomChainCommand::Submit("足智多谋".to_string()))
+        );
+    }
 
     #[test]
     fn parses_microphone() {

@@ -42,17 +42,6 @@ struct ChatMarkerCounts {
     pink: usize,
 }
 
-pub(super) fn scan_chat(
-    image: &DynamicImage,
-    engine: &OcrEngine,
-    templates: &ResolvedTemplateArgs,
-    chat_rect: Rect,
-    monitor: Option<&MonitorShared>,
-) -> Result<Vec<ChatMessage>> {
-    let prepared = prepare_chat_scan(image, templates, chat_rect)?;
-    recognize_prepared_chat(engine, templates, prepared, monitor)
-}
-
 pub(super) fn prepare_chat_scan(
     image: &DynamicImage,
     templates: &ResolvedTemplateArgs,
@@ -124,16 +113,17 @@ pub(super) fn recognize_prepared_chat(
     let ocr_ms = elapsed_ms(ocr_started);
     let total_ms = elapsed_ms(prepared.started);
     if let Some(monitor) = monitor {
-        monitor.set_ocr(OcrSnapshot {
-            markers: prepared.markers.len(),
-            messages: messages
+        monitor.set_ocr(OcrSnapshot::new(
+            prepared.markers.len(),
+            messages
                 .iter()
                 .map(|message| format!("[{}] {}", message.message_type, message.text))
                 .collect(),
-            marker_ms: prepared.marker_ms,
+            prepared.marker_ms,
             ocr_ms,
             total_ms,
-        });
+            "一级聊天",
+        ));
     }
     log::info!(target: CHAT_SCAN_RESULT_LOG_TARGET,
         "聊天扫描结果: markers={} messages={} {}",

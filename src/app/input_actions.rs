@@ -41,7 +41,15 @@ pub(super) fn ensure_game_ready_for_input(
     window_config: &config::WindowConfig,
     after_activate_ms: u64,
 ) -> Result<()> {
-    focus_game(window_config, after_activate_ms)
+    let mut enigo = Enigo::new(&Settings::default()).context("create enigo")?;
+    let mut window = window::GameWindow::find(window_config)?;
+    let already_foreground = window.is_foreground();
+    window.activate(after_activate_ms)?;
+    if already_foreground {
+        window.ensure_foreground()
+    } else {
+        window.focus_game(&mut enigo, window_config.focus_point)
+    }
 }
 
 pub(super) fn paste_text(
@@ -97,16 +105,93 @@ pub(super) fn press_key(key: Key, window_config: &config::WindowConfig) -> Resul
     Ok(())
 }
 
-pub(super) fn run_or_print<F>(execute: bool, description: String, action: F) -> Result<()>
+pub(super) fn hold_key<F>(
+    key: Key,
+    duration: Duration,
+    window_config: &config::WindowConfig,
+    mut should_continue: F,
+) -> Result<()>
 where
-    F: FnOnce() -> Result<()>,
+    F: FnMut() -> bool,
 {
-    if execute {
-        action()
-    } else {
-        println!("dry-run: {}", description);
-        println!("pass --execute to send real keyboard/mouse input");
+    if duration.is_zero() {
+        bail!("按住按键时长必须大于 0 秒");
+    }
+    if !should_continue() {
+        bail!("程序正在退出，未发送按住按键输入");
+    }
+
+    let started = Instant::now();
+    let foreground_started = Instant::now();
+    window::ensure_foreground(window_config)?;
+    let foreground_ms = elapsed_ms(foreground_started);
+    let input_started = Instant::now();
+    let mut enigo = Enigo::new(&Settings::default()).context("create enigo")?;
+    enigo
+        .key(key.clone(), Direction::Press)
+        .context("press and hold key")?;
+    let mut release = KeyReleaseGuard::new(&mut enigo, key);
+    let deadline = Instant::now() + duration;
+    let mut interrupted = false;
+
+    while Instant::now() < deadline {
+        if !should_continue() {
+            interrupted = true;
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        sleep(remaining.min(Duration::from_millis(50)));
+    }
+
+    let release_result = release.release();
+    log::info!(target: "timing",
+        "按住按键耗时: total={}ms foreground={}ms input={}ms configured={}ms interrupted={} release_success={}",
+        elapsed_ms(started),
+        foreground_ms,
+        elapsed_ms(input_started),
+        duration.as_millis(),
+        interrupted,
+        release_result.is_ok()
+    );
+    release_result?;
+    if interrupted {
+        bail!("程序正在退出，已提前松开按键");
+    }
+    Ok(())
+}
+
+struct KeyReleaseGuard<'a> {
+    enigo: &'a mut Enigo,
+    key: Key,
+    released: bool,
+}
+
+impl<'a> KeyReleaseGuard<'a> {
+    fn new(enigo: &'a mut Enigo, key: Key) -> Self {
+        Self {
+            enigo,
+            key,
+            released: false,
+        }
+    }
+
+    fn release(&mut self) -> Result<()> {
+        self.enigo
+            .key(self.key.clone(), Direction::Release)
+            .context("release held key")?;
+        self.released = true;
         Ok(())
+    }
+}
+
+impl Drop for KeyReleaseGuard<'_> {
+    fn drop(&mut self) {
+        if !self.released {
+            let _ = self.enigo.key(self.key.clone(), Direction::Release);
+        }
     }
 }
 

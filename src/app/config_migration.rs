@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow};
 use serde_yaml::{Mapping, Value};
 
-pub const CURRENT_CONFIG_VERSION: u32 = 19;
+pub const CURRENT_CONFIG_VERSION: u32 = 22;
 
 struct ChangedDefaultField {
     path: &'static str,
@@ -771,7 +771,7 @@ mod tests {
 
     const DEFAULT: &str = r#"# 测试配置
 # 版本注释
-config_version: 19
+config_version: 22
 
 timing:
   watchdog_restart_ms: 2000
@@ -830,7 +830,7 @@ timing:
 queue:
   auto_advance_seconds: 1
   protect_current_song_until_finished: true
-  ignore_external_playback: true
+  external_playback_protect_after_seconds: 20
 
 song_review:
   enabled: false
@@ -935,7 +935,7 @@ unknown_root:
             .expect("migration needed");
 
         assert!(report.text.contains("# 兜底扫描注释"));
-        assert!(report.text.contains("config_version: 19"));
+        assert!(report.text.contains("config_version: 22"));
         assert!(report.text.contains("template_threshold: 0.9"));
         assert!(report.text.contains("enter_game_timeout_ms: 60000"));
         assert!(report.text.contains("enter_game_text_region:"));
@@ -1135,7 +1135,7 @@ templates:
 
     #[test]
     fn current_version_without_moved_fields_does_not_migrate() {
-        let current = r#"config_version: 19
+        let current = r#"config_version: 22
 timing:
   loop_idle_ms: 60
   chat_scan:
@@ -1147,7 +1147,7 @@ timing:
 queue:
   auto_advance_seconds: 1
   protect_current_song_until_finished: true
-  ignore_external_playback: true
+  external_playback_protect_after_seconds: 20
 tui:
   enabled: true
 ocr:
@@ -1162,6 +1162,41 @@ output:
     }
 
     #[test]
+    fn migrates_v20_to_project_idiom_chain_configuration() {
+        let old = r#"config_version: 20
+idiom_chain:
+  enabled: true
+  dictionary_paths:
+    - data/idioms.txt
+  history_limit: 200
+  idle_timeout_seconds: 300
+  allow_consecutive_player: false
+  allow_anyone_stop: false
+"#;
+
+        let report = migrate_config_text(old, include_str!("../../config.yaml"))
+            .expect("migration succeeds")
+            .expect("migration needed");
+        let migrated: Value = serde_yaml::from_str(&report.text).expect("valid migrated yaml");
+
+        assert_eq!(
+            get_path(&migrated, &["config_version"]).and_then(Value::as_u64),
+            Some(22)
+        );
+        assert_eq!(
+            get_path(&migrated, &["idiom_chain", "enabled"]).and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(get_path(&migrated, &["idiom_chain", "dictionary_paths"]).is_none());
+        assert!(
+            report
+                .unmigrated
+                .iter()
+                .any(|item| item.path == "idiom_chain.dictionary_paths")
+        );
+    }
+
+    #[test]
     fn migrates_v10_current_song_protection_to_default_enabled() {
         let old = r#"config_version: 10
 queue:
@@ -1173,13 +1208,17 @@ queue:
             .expect("migration succeeds")
             .expect("migration needed");
 
-        assert!(report.text.contains("config_version: 19"));
+        assert!(report.text.contains("config_version: 22"));
         assert!(
             report
                 .text
                 .contains("protect_current_song_until_finished: true")
         );
-        assert!(report.text.contains("ignore_external_playback: true"));
+        assert!(
+            report
+                .text
+                .contains("external_playback_protect_after_seconds: 20")
+        );
     }
 
     #[test]
@@ -1227,7 +1266,7 @@ custom_workflows:
             .expect("migration succeeds")
             .expect("migration needed");
 
-        assert!(report.text.contains("config_version: 19"));
+        assert!(report.text.contains("config_version: 22"));
         assert!(report.text.contains("allow_args: false"));
         assert!(report.text.contains("message_types:"));
         assert!(report.text.contains("confirm_before_run: false"));
@@ -1303,7 +1342,7 @@ queue:
             .expect("migration succeeds")
             .expect("migration needed");
 
-        assert!(report.text.contains("config_version: 19"));
+        assert!(report.text.contains("config_version: 22"));
         assert!(report.text.contains("auto_advance_seconds: 1"));
     }
 
@@ -1318,9 +1357,13 @@ tui:
             .expect("migration succeeds")
             .expect("migration needed");
 
-        assert!(report.text.contains("config_version: 19"));
+        assert!(report.text.contains("config_version: 22"));
         assert!(report.text.contains("enabled: true"));
-        assert!(report.text.contains("ignore_external_playback: true"));
+        assert!(
+            report
+                .text
+                .contains("external_playback_protect_after_seconds: 20")
+        );
     }
 
     #[test]

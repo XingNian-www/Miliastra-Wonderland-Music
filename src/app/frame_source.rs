@@ -1,4 +1,4 @@
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow};
@@ -21,7 +21,7 @@ pub(super) struct Canvas {
 
 #[derive(Debug)]
 pub(super) struct Frame {
-    pub(super) image: DynamicImage,
+    pub(super) image: Arc<DynamicImage>,
 }
 
 pub(super) fn load_frame(
@@ -34,14 +34,23 @@ pub(super) fn load_frame(
         Some(path) => {
             image::open(path).with_context(|| format!("open image {}", path.display()))?
         }
-        None => {
-            let _guard = WINDOW_CAPTURE_LOCK
-                .get_or_init(|| Mutex::new(()))
-                .lock()
-                .map_err(|_| anyhow!("window capture mutex poisoned"))?;
-            window::capture_game(window_config)?
-        }
+        None => capture_game_blocking(window_config)?,
     };
+    let image = normalize_frame(image, canvas, started);
+    Ok(Frame {
+        image: Arc::new(image),
+    })
+}
+
+fn capture_game_blocking(window_config: &config::WindowConfig) -> Result<DynamicImage> {
+    let _guard = WINDOW_CAPTURE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| anyhow!("window capture mutex poisoned"))?;
+    window::capture_game(window_config)
+}
+
+fn normalize_frame(image: DynamicImage, canvas: &Canvas, started: Instant) -> DynamicImage {
     let (source_width, source_height) = image.dimensions();
     let image = if canvas.resize && (source_width != canvas.width || source_height != canvas.height)
     {
@@ -58,7 +67,7 @@ pub(super) fn load_frame(
         image.height(),
         canvas.resize && (source_width != canvas.width || source_height != canvas.height)
     );
-    Ok(Frame { image })
+    image
 }
 
 fn elapsed_ms(started: Instant) -> u128 {

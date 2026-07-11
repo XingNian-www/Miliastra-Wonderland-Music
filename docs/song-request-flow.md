@@ -135,7 +135,7 @@ AI 点歌路径：
 - 播放器状态未知时，为了避免误切歌，把请求加入音乐播放队列并回复状态未知。
 - 没有保护条件且可以立即播放时，先检查长时间同歌去重，通过后把最终候选转成 `PlaybackRequest` 交给播放器控制器。
 
-当前歌曲保护由 `PlayerController::should_queue_until_current_song_finished()` 判断。配置关闭时可以更积极地直接播放；配置开启时，正在播放或可识别的暂停歌曲会优先保留，新点歌进入音乐播放队列。
+当前歌曲保护由 `PlayerController::should_queue_until_current_song_finished()` 判断。配置关闭时可以更积极地直接播放；机器人确认播放的歌曲会优先保留。非点歌歌曲必须连续正常播放达到 `queue.external_playback_protect_after_seconds`，才会加入保护；切歌、暂停、停止和歌曲变化会重新计时。
 
 ## 实际播放确认
 
@@ -168,7 +168,7 @@ AI 点歌路径：
 - 播放器暂停并接近结束，且音乐播放队列非空。
 - 播放器正在播放并接近结束，且存在待执行播放工作；此时控制器可能先标记 `paused_waiting_for_queue` 并暂停，避免播放器自然跳到非队列歌曲。
 
-`AdvanceQueue` 仍由命令执行线程处理。执行前会调用 `prepare_command_ui()` 回到一级界面，然后 `consume_queue()` 取队首播放：
+`AdvanceQueue` 仍由命令执行线程处理，但播放器与队列操作没有页面依赖，因此直接调用 `consume_queue()` 取队首播放；只有回复和任务结束时才按监听驻留目标协调游戏界面：
 
 - 播放成功：移除队首。
 - 近期已播放过：移除队首，回复 `歌曲名近期已播放过,已跳过`，继续尝试下一项。

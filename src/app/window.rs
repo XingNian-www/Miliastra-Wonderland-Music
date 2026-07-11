@@ -147,6 +147,10 @@ impl GameWindow {
         result
     }
 
+    pub fn is_foreground(&self) -> bool {
+        self.is_foreground_process()
+    }
+
     pub fn focus_game(&mut self, enigo: &mut Enigo, point: PointConfig) -> Result<()> {
         let started = Instant::now();
         self.click_focused(enigo, point)?;

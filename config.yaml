@@ -2,7 +2,7 @@
 # 坐标沿用旧脚本习惯：以游戏客户区左上角为原点，按 1920x1080 有效画面写坐标
 
 # 配置版本；程序启动时会把旧版本配置迁移到当前模板
-config_version: 19
+config_version: 22
 
 window:
   # 目标游戏进程名，按进程文件名匹配，大小写不敏感；多个进程名可用逗号分隔
@@ -309,12 +309,18 @@ http:
   port: 18888
   # 是否启用 Web/API 面板
   enabled: true
+  # 非本机监听时必须设置；Web 页面会在当前浏览器会话中保存该令牌
+  access_token: ""
 
 logging:
   # 日志目录
   dir: logs
   # 日志级别：error/warn/info/debug/trace
   level: info
+  # 是否按自然日分文件；启用后主日志和性能日志都会在跨日时自动轮转
+  rotate_daily: true
+  # 最多保留多少个自然日的按日日志；设为 0 时不自动清理
+  retain_days: 7
 
 tui:
   # 是否启用终端 TUI 面板；启用后实时显示事件日志、OCR 内容和队列状态
@@ -337,10 +343,10 @@ queue:
   max_size: 5
   # 当前歌曲剩余多少秒以内自动播放队列下一首
   auto_advance_seconds: 1
-  # 任意渠道正在播放/暂停的歌曲是否保护；true 时新点歌会排队，未结束只能用 @下一首 提前切换；自动出队仍由 auto_advance_seconds 控制
+  # 机器人确认播放的歌曲是否保护；true 时新点歌会排队，未结束只能用 @下一首 提前切换；自动出队仍由 auto_advance_seconds 控制
   protect_current_song_until_finished: true
-  # 是否忽略外部播放；true 时非机器人确认播放的歌曲不保护，也不会阻止音乐播放队列接管
-  ignore_external_playback: true
+  # 非点歌歌曲连续正常播放多少秒后加入当前歌曲保护；0 表示外部播放永不保护
+  external_playback_protect_after_seconds: 20
 
 song_dedup:
   # 长时间同歌去重；播放/入队前检查，确认播放成功后记录
@@ -353,6 +359,18 @@ song_dedup:
   console_bypass: true
   # 长时间同歌去重历史持久化路径
   history_path: data/song-dedup-history.json
+
+idiom_chain:
+  # 是否启用项目内置成语词库的接龙功能；词库位于 assets/idioms.txt，并随发布包携带
+  enabled: true
+  # 记住最近多少个成语，用于防止重复；超出后较早的成语可以再次使用
+  history_limit: 200
+  # 多久无人接词就自动结束本局；0 表示不超时，单位秒
+  idle_timeout_seconds: 300
+  # false 时开局玩家不能连续接词
+  allow_consecutive_player: false
+  # false 时仅开局玩家可使用 @接龙 结束
+  allow_anyone_stop: false
 
 ai:
   # AI 供应商：mimo/openai/deepseek/custom
@@ -540,10 +558,12 @@ custom_workflows:
   # 模板默认匹配阈值
   default_threshold: 0.9
   wait_template_absent_stable_default: true
+  # hold_key 单次按住按键允许的最大秒数；时长从命令参数读取
+  max_hold_key_seconds: 10
   # 自定义流程默认超时、轮询和步骤等待统一在 timing.workflow 中配置
   # 自定义模板名到图片路径的映射，步骤里通过 template 引用这里的名字
   templates: {}
-  # 支持的步骤：activate_game/focus_game/key/click/click_template/wait_template/wait_template_absent/wait_stable/click_text/wait_text/paste/send_chat/send_current_chat/send_friend_message/invite_user/return_primary/sleep
+  # 支持的步骤：activate_game/focus_game/key/hold_key/click/click_template/wait_template/wait_template_absent/wait_stable/click_text/wait_text/paste/send_chat/send_current_chat/send_friend_message/invite_user/ensure_primary/ensure_current_hall/return_primary/sleep
   # wait_template_absent 默认在模板消失后继续等待像素稳定；可在步骤上设置 stable_after_absent: false 关闭
   # wait_stable 会等待 region 内像素变化稳定，适合点击后等待面板动画结束
   # 支持变量：{{username}}、{{args}}、{{arg1}}、{{arg2}}、{{command}}、{{workflow}}、{{message_type}}
@@ -576,6 +596,92 @@ custom_workflows:
   #         message: "{{username}} 触发了测试流程 {{args}}"
   #       - type: return_primary
   workflows:
+    # 好友私聊 @W/@S/@A/@D [秒数]，例如 @W 默认按住 1 秒、@W 10 按住 10 秒；指定秒数必须在 1 到 max_hold_key_seconds 之间
+    - name: hold-w
+      enabled: true
+      commands: [W]
+      allow_args: true
+      message_types: [pink]
+      confirm_before_run: false
+      confirm_message: ""
+      confirm_message_types: []
+      success_message: ""
+      steps:
+        - type: ensure_primary
+        - type: hold_key
+          key: W
+          hold_seconds_arg: 1
+    - name: hold-s
+      enabled: true
+      commands: [S]
+      allow_args: true
+      message_types: [pink]
+      confirm_before_run: false
+      confirm_message: ""
+      confirm_message_types: []
+      success_message: ""
+      steps:
+        - type: ensure_primary
+        - type: hold_key
+          key: S
+          hold_seconds_arg: 1
+    - name: hold-a
+      enabled: true
+      commands: [A]
+      allow_args: true
+      message_types: [pink]
+      confirm_before_run: false
+      confirm_message: ""
+      confirm_message_types: []
+      success_message: ""
+      steps:
+        - type: ensure_primary
+        - type: hold_key
+          key: A
+          hold_seconds_arg: 1
+    - name: hold-d
+      enabled: true
+      commands: [D]
+      allow_args: true
+      message_types: [pink]
+      confirm_before_run: false
+      confirm_message: ""
+      confirm_message_types: []
+      success_message: ""
+      steps:
+        - type: ensure_primary
+        - type: hold_key
+          key: D
+          hold_seconds_arg: 1
+    # 好友私聊 @F：先确保一级界面，再发送一次 F；任务结束后按监听模式恢复驻留界面
+    - name: press-f
+      enabled: true
+      commands: [F]
+      allow_args: false
+      message_types: [pink]
+      confirm_before_run: false
+      confirm_message: ""
+      confirm_message_types: []
+      success_message: ""
+      steps:
+        - type: ensure_primary
+        - type: key
+          key: F
+        - type: return_primary
+    # 好友私聊 @X：先确保一级界面，再发送一次 X；任务结束后按监听模式恢复驻留界面
+    - name: press-x
+      enabled: true
+      commands: [X]
+      allow_args: false
+      message_types: [pink]
+      confirm_before_run: false
+      confirm_message: ""
+      confirm_message_types: []
+      success_message: ""
+      steps:
+        - type: ensure_primary
+        - type: key
+          key: X
     # 好友私聊 @通告 内容，向当前大厅发送“内容”
     - name: notice
       enabled: true

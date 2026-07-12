@@ -19,6 +19,7 @@ mod app {
     mod decision_lock;
     mod deferred_chat;
     mod dpi;
+    mod entertainment;
     mod feeluown;
     mod frame_source;
     mod game_startup;
@@ -28,6 +29,7 @@ mod app {
     mod http_server;
     mod idiom_chain;
     mod input_actions;
+    mod landlord;
     mod logger;
     mod monitor;
     mod ocr;
@@ -43,6 +45,7 @@ mod app {
     mod task_tracker;
     mod template_match;
     mod tui;
+    mod turtle_soup;
     mod ui_locator;
     mod ui_state;
     mod web_tools;
@@ -67,7 +70,10 @@ mod app {
         latest_incoming_bubble_rect, latest_incoming_fingerprint, secondary_hall_bubbles,
         unread_hit_still_visible,
     };
-    use self::chat_output::ChatOutput;
+    use self::chat_output::{
+        ChatBatchSendOutcome, ChatBatchSendStatus, ChatOutput, redacted_chat_text,
+        split_numbered_chat_message,
+    };
     use self::chat_scan::{ChatMessage, prepare_chat_scan, recognize_prepared_chat};
     use self::command::{
         ChatListenerModeCommand, CommandLockState, ParsedCommand, PendingCommand, UserCommand,
@@ -76,9 +82,10 @@ mod app {
     use self::decision_control::{DecisionAction, DecisionControlShared};
     use self::decision_lock::DecisionScreenLock;
     use self::deferred_chat::{
-        DEFAULT_CAPACITY as DEFERRED_CHAT_CAPACITY, DeferredChatMessage, DeferredChatQueue,
-        DeferredChatTarget, EnqueueOutcome,
+        BatchFailureOutcome, DEFAULT_CAPACITY as DEFERRED_CHAT_CAPACITY, DeferredChatItem,
+        DeferredChatMessage, DeferredChatQueue, DeferredChatTarget, EnqueueOutcome,
     };
+    use self::entertainment::{AcquireOutcome, EntertainmentCoordinator, EntertainmentKind};
     use self::feeluown::{FeelUOwnClient, PlayerStatus, format_lyrics, format_status};
     use self::frame_source::{Canvas, load_frame};
     use self::geometry::{Rect, crop_canvas};
@@ -90,6 +97,7 @@ mod app {
     use self::input_actions::{
         click_game_point, ensure_game_ready_for_input, parse_key, press_key,
     };
+    use self::landlord::{LandlordCommand, LandlordGame, LandlordOutcome};
     use self::monitor::{MonitorQueueItem, MonitorShared, OcrSnapshot};
     use self::ocr::{
         OcrArgs, OcrBackendProbeStatus, make_ocr_engine, merged_ocr_text,
@@ -108,7 +116,10 @@ mod app {
     use self::song_review::{SongReviewCandidate, SongReviewClient};
     use self::task_tracker::TaskTrackerShared;
     use self::template_match::{best_template_hit, find_template_hits};
-    use self::ui_state::detect_ui_state;
+    use self::turtle_soup::{
+        QuestionSubmitOutcome, SecondaryOcrObservation, SecondaryOcrStability, TurtleSoupService,
+    };
+    use self::ui_state::{UiState, detect_ui_state};
     use self::web_tools::{WebToolRequest, WebToolShared, WebToolTask, WebToolTemplate};
     use anyhow::{Context, Result, anyhow};
     use enigo::Key;
@@ -122,10 +133,18 @@ mod app {
     const TARGET_MISSING_BACKOFF_MAX: Duration = Duration::from_secs(60);
     const RETURN_TO_PRIMARY_SLOW_RETRY_AFTER: u32 = 5;
     const RETURN_TO_PRIMARY_SLOW_RETRY_MS: u64 = 2_000;
+    const PRIMARY_REGION_STABILITY_POLL_MS: u64 = 100;
+    const PRIMARY_REGION_STABILITY_TIMEOUT_MS: u64 = 1_000;
 
     #[derive(Clone, Debug, Default)]
     struct FrameArgs {
         image: Option<PathBuf>,
+    }
+
+    #[derive(Clone, Copy, Debug, Default)]
+    struct SecondaryBubbleProcessOutcome {
+        processed: bool,
+        ocr_pending: bool,
     }
 
     #[derive(Clone, Debug, Default)]
@@ -188,14 +207,14 @@ mod app {
 
     #[derive(Clone, Debug, Default)]
     struct UiTemplateArgs {
-        enter_template: Option<PathBuf>,
+        friend_template: Option<PathBuf>,
         secondary_hall_template: Option<PathBuf>,
         chat_templates: TemplateArgs,
     }
 
     #[derive(Clone, Debug)]
     struct ResolvedUiTemplateArgs {
-        enter_template: PathBuf,
+        friend_template: PathBuf,
         secondary_hall_template: PathBuf,
         chat_templates: ResolvedTemplateArgs,
     }
@@ -203,10 +222,10 @@ mod app {
     impl UiTemplateArgs {
         fn resolve(&self, config: &AppConfig) -> ResolvedUiTemplateArgs {
             ResolvedUiTemplateArgs {
-                enter_template: self
-                    .enter_template
+                friend_template: self
+                    .friend_template
                     .clone()
-                    .unwrap_or_else(|| config.templates.enter.clone()),
+                    .unwrap_or_else(|| config.templates.friend.clone()),
                 secondary_hall_template: self
                     .secondary_hall_template
                     .clone()
@@ -327,7 +346,10 @@ mod app {
     struct AutomationApp {
         config: AppConfig,
         runtime_state: Arc<Mutex<PersistentRuntimeState>>,
+        entertainment: EntertainmentCoordinator,
         idiom_chain: Arc<Mutex<IdiomChainGame>>,
+        landlord: Arc<Mutex<LandlordGame>>,
+        turtle_soup: TurtleSoupService,
         deferred_chat: DeferredChatQueue,
         queue: Arc<Mutex<PersistentQueue>>,
         song_dedup_history: Arc<Mutex<PersistentSongDedupHistory>>,
@@ -599,12 +621,84 @@ mod app {
         SecondaryCurrentHall,
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum PrimaryReturnObservation {
+        Primary,
+        Secondary,
+        Unknown,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum PrimaryReturnAction {
+        Complete,
+        WaitForPrimaryStability,
+        WaitForTransition,
+        PressEscape,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum PrimaryRegionReadiness {
+        Pending,
+        Stable,
+        TimedOut,
+    }
+
+    #[derive(Default)]
+    struct PrimaryRegionStability {
+        started_at: Option<Instant>,
+        previous: Option<ChangeFingerprint>,
+    }
+
+    impl PrimaryRegionStability {
+        fn observe(
+            &mut self,
+            current: ChangeFingerprint,
+            now: Instant,
+            mean_threshold: f32,
+            changed_ratio_threshold: f32,
+        ) -> PrimaryRegionReadiness {
+            let started_at = *self.started_at.get_or_insert(now);
+            let stable = self.previous.as_ref().is_some_and(|previous| {
+                let stats = change_stats(previous, &current);
+                stats.mean_abs_diff <= mean_threshold
+                    && stats.changed_ratio <= changed_ratio_threshold
+            });
+            self.previous = Some(current);
+
+            if stable {
+                PrimaryRegionReadiness::Stable
+            } else if now.duration_since(started_at)
+                >= Duration::from_millis(PRIMARY_REGION_STABILITY_TIMEOUT_MS)
+            {
+                PrimaryRegionReadiness::TimedOut
+            } else {
+                PrimaryRegionReadiness::Pending
+            }
+        }
+
+        fn reset(&mut self) {
+            self.started_at = None;
+            self.previous = None;
+        }
+    }
+
     fn listener_residency(mode: ChatListenerMode, temporary_primary: bool) -> UiResidency {
         if mode == ChatListenerMode::Secondary && !temporary_primary {
             UiResidency::SecondaryCurrentHall
         } else {
             UiResidency::Primary
         }
+    }
+
+    fn idiom_command_requires_executor(command: &idiom_chain::IdiomChainCommand) -> bool {
+        matches!(command, idiom_chain::IdiomChainCommand::Explain(_))
+    }
+
+    fn landlord_command_requires_executor(command: &LandlordCommand) -> bool {
+        matches!(
+            command,
+            LandlordCommand::Start | LandlordCommand::Join | LandlordCommand::Hand
+        )
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -739,12 +833,19 @@ mod app {
             let song_review = SongReviewClient::new(&config.song_review, &config.timing);
             let chat_output = ChatOutput::new(&config.output, &config.timing, &config.window);
             let runtime_state = Arc::new(Mutex::new(runtime_state));
+            let entertainment = EntertainmentCoordinator::new();
             let idiom_chain_game = IdiomChainGame::load(config.idiom_chain.clone())?;
             if config.idiom_chain.enabled {
                 log::info!("已加载成语接龙词库: {} 条", idiom_chain_game.lexicon_len());
             }
             let idiom_chain = Arc::new(Mutex::new(idiom_chain_game));
+            let landlord = Arc::new(Mutex::new(LandlordGame::new(config.landlord.clone())));
             let deferred_chat = DeferredChatQueue::new(DEFERRED_CHAT_CAPACITY);
+            let turtle_soup = TurtleSoupService::new(
+                config.turtle_soup.clone(),
+                entertainment.clone(),
+                deferred_chat.clone(),
+            );
             let queue = Arc::new(Mutex::new(queue));
             let song_dedup_history = Arc::new(Mutex::new(song_dedup_history));
             let player = PlayerController::new(
@@ -759,7 +860,10 @@ mod app {
             Ok(Self {
                 config,
                 runtime_state,
+                entertainment,
                 idiom_chain,
+                landlord,
+                turtle_soup,
                 deferred_chat,
                 queue,
                 song_dedup_history,
@@ -804,6 +908,7 @@ mod app {
             self.warn_if_screen_size_mismatch()?;
             self.start_http_server()?;
             self.start_hotkeys()?;
+            self.turtle_soup.start_workers();
             let executor = self.start_command_executor();
             let deferred_chat_sender = self.start_deferred_chat_sender();
             self.enqueue_startup_task_if_enabled()?;
@@ -811,6 +916,7 @@ mod app {
             let playback_monitor = self.start_playback_monitor();
             let result = self.run_scan_loop();
             self.running.store(false, AtomicOrdering::SeqCst);
+            self.turtle_soup.shutdown();
             self.notify_pending_executor();
             self.deferred_chat.notify_all();
             if let Err(error) = executor.join() {
@@ -839,7 +945,10 @@ mod app {
             let mut executor = Self {
                 config: self.config.clone(),
                 runtime_state: self.runtime_state.clone(),
+                entertainment: self.entertainment.clone(),
                 idiom_chain: self.idiom_chain.clone(),
+                landlord: self.landlord.clone(),
+                turtle_soup: self.turtle_soup.clone(),
                 deferred_chat: self.deferred_chat.clone(),
                 queue: self.queue.clone(),
                 song_dedup_history: self.song_dedup_history.clone(),
@@ -891,38 +1000,240 @@ mod app {
         fn run_deferred_chat_sender_loop(&mut self) -> Result<()> {
             let retry_delay = Duration::from_millis(self.config.timing.loop_idle_ms.max(50));
             while self.running.load(AtomicOrdering::SeqCst) {
-                let Some(message) = self.deferred_chat.wait_take(retry_delay)? else {
+                let Some(item) = self.deferred_chat.wait_take(retry_delay)? else {
                     continue;
                 };
                 if !self.running.load(AtomicOrdering::SeqCst) {
                     break;
                 }
 
-                if !self.deferred_chat_target_is_active(message.target) {
-                    if self.deferred_chat.requeue_back(message)? == EnqueueOutcome::DroppedMessage {
-                        log::warn!("延迟聊天发送队列已满，已丢弃目标聊天未激活的回复");
+                if let DeferredChatItem::Batch(batch) = &item {
+                    if !self.turtle_soup.delivery_is_current(batch.turtle_soup) {
+                        log::debug!(
+                            "延迟聊天分段批次所属海龟汤会话已失效，跳过: {:?}",
+                            batch.turtle_soup
+                        );
+                        continue;
+                    }
+                }
+
+                let target = item.target();
+
+                if !self.deferred_chat_target_is_active(target) {
+                    match self.deferred_chat.requeue_back(item)? {
+                        EnqueueOutcome::DroppedMessage => {
+                            log::warn!("延迟聊天发送队列已满，已丢弃一条较早的普通回复")
+                        }
+                        EnqueueOutcome::Rejected => {
+                            log::warn!("延迟聊天目标未激活且队列已满，当前回复已丢弃")
+                        }
+                        EnqueueOutcome::Added => {}
                     }
                     sleep(retry_delay);
                     continue;
                 }
 
-                let Some(_sending) = self.try_begin_deferred_chat_send(message.target)? else {
-                    if self.deferred_chat.requeue_front(message)? == EnqueueOutcome::DroppedMessage
-                    {
-                        log::warn!("延迟聊天发送队列已满，重试时丢弃了一条较新的回复");
+                let Some(sending) = self.try_begin_deferred_chat_send(target)? else {
+                    match self.deferred_chat.requeue_front(item)? {
+                        EnqueueOutcome::DroppedMessage => {
+                            log::warn!("延迟聊天重排时淘汰了一条较新的普通回复")
+                        }
+                        EnqueueOutcome::Rejected => {
+                            log::warn!("延迟聊天重排失败，当前普通回复已丢弃")
+                        }
+                        EnqueueOutcome::Added => {}
                     }
                     sleep(retry_delay);
                     continue;
                 };
 
-                let result = match message.target {
-                    DeferredChatTarget::Primary => self.chat_output.send(&message.text),
-                    DeferredChatTarget::SecondaryCurrentHall => {
-                        self.chat_output.send_current_chat(&message.text)
+                match item {
+                    DeferredChatItem::Message(message) => {
+                        let result = match target {
+                            DeferredChatTarget::Primary => self.chat_output.send(&message.text),
+                            DeferredChatTarget::SecondaryCurrentHall => {
+                                self.chat_output.send_current_chat(&message.text)
+                            }
+                            DeferredChatTarget::CurrentHall => {
+                                let residency = self.active_ui_residency();
+                                self.ensure_ui_residency(residency, "大厅延迟回复发送前")
+                                    .and_then(|_| match residency {
+                                        UiResidency::Primary => {
+                                            self.chat_output.send(&message.text)
+                                        }
+                                        UiResidency::SecondaryCurrentHall => {
+                                            self.chat_output.send_current_chat(&message.text)
+                                        }
+                                    })
+                            }
+                        };
+                        drop(sending);
+                        if let Err(error) = result {
+                            log::error!("延迟聊天普通回复发送失败，已丢弃: {error:#}");
+                        }
                     }
-                };
-                if let Err(error) = result {
-                    log::error!("成语接龙延迟回复发送失败，已丢弃: {error:#}");
+                    DeferredChatItem::Batch(mut batch) => {
+                        let delivery = batch.turtle_soup;
+                        let residency = match target {
+                            DeferredChatTarget::Primary => UiResidency::Primary,
+                            DeferredChatTarget::SecondaryCurrentHall => {
+                                UiResidency::SecondaryCurrentHall
+                            }
+                            DeferredChatTarget::CurrentHall => self.active_ui_residency(),
+                        };
+                        let prepared = if target == DeferredChatTarget::CurrentHall {
+                            self.ensure_ui_residency(residency, "大厅延迟批量回复发送前")
+                        } else {
+                            Ok(())
+                        };
+                        let outcome = match prepared {
+                            Err(error) => ChatBatchSendOutcome::failed(0, error),
+                            Ok(()) => {
+                                let running = Arc::clone(&self.running);
+                                let paused = Arc::clone(&self.paused);
+                                let pending = Arc::clone(&self.pending);
+                                let chat_listener = self.chat_listener.clone();
+                                let turtle_soup = self.turtle_soup.clone();
+                                let should_continue = move || {
+                                    if !running.load(AtomicOrdering::SeqCst)
+                                        || paused.load(AtomicOrdering::SeqCst)
+                                        || !turtle_soup.delivery_is_current(delivery)
+                                    {
+                                        return false;
+                                    }
+                                    let snapshot = chat_listener.snapshot();
+                                    if listener_residency(snapshot.mode, snapshot.temporary_primary)
+                                        != residency
+                                    {
+                                        return false;
+                                    }
+                                    let (lock, _) = &*pending;
+                                    match lock.lock() {
+                                        Ok(queue) => queue.is_empty(),
+                                        Err(_) => {
+                                            log::error!(
+                                                "延迟聊天批量发送检查正式任务时发现队列锁已损坏"
+                                            );
+                                            false
+                                        }
+                                    }
+                                };
+                                let messages = batch.remaining_texts();
+                                match residency {
+                                    UiResidency::Primary => self
+                                        .chat_output
+                                        .send_batch_interruptible(&messages, 0, should_continue),
+                                    UiResidency::SecondaryCurrentHall => {
+                                        self.chat_output.send_current_chat_batch_interruptible(
+                                            &messages,
+                                            0,
+                                            should_continue,
+                                        )
+                                    }
+                                }
+                            }
+                        };
+                        drop(sending);
+
+                        let ChatBatchSendOutcome { sent, status } = outcome;
+                        let all_sent = match batch.mark_sent(sent) {
+                            Ok(all_sent) => all_sent,
+                            Err(error) => {
+                                log::error!("海龟汤批量发送进度无效: {error:#}");
+                                self.turtle_soup.handle_delivery_failure(delivery, &error);
+                                continue;
+                            }
+                        };
+                        if !self.running.load(AtomicOrdering::SeqCst)
+                            || !self.turtle_soup.delivery_is_current(delivery)
+                        {
+                            continue;
+                        }
+                        if all_sent {
+                            if let ChatBatchSendStatus::Failed(error) = &status {
+                                log::warn!(
+                                    "海龟汤批次内容已完整发送，但聊天界面收尾失败，不重发内容: {error:#}"
+                                );
+                            }
+                            self.turtle_soup.handle_delivery_success(delivery);
+                            continue;
+                        }
+
+                        match status {
+                            ChatBatchSendStatus::Complete => {
+                                let error = anyhow!(
+                                    "海龟汤批量发送提前完成: sent={} remaining={}",
+                                    sent,
+                                    batch.remaining_texts().len()
+                                );
+                                log::error!("{error:#}");
+                                self.turtle_soup.handle_delivery_failure(delivery, &error);
+                            }
+                            ChatBatchSendStatus::Interrupted => {
+                                match self
+                                    .deferred_chat
+                                    .requeue_front(DeferredChatItem::Batch(batch))?
+                                {
+                                    EnqueueOutcome::Added => {}
+                                    EnqueueOutcome::DroppedMessage => {
+                                        log::warn!("海龟汤批量发送让行时淘汰了一条普通回复")
+                                    }
+                                    EnqueueOutcome::Rejected => {
+                                        let error =
+                                            anyhow!("海龟汤批量发送让行后无法重新进入延迟队列");
+                                        log::error!("{error:#}");
+                                        self.turtle_soup.handle_delivery_failure(delivery, &error);
+                                    }
+                                }
+                                sleep(retry_delay);
+                            }
+                            ChatBatchSendStatus::Failed(error) => {
+                                let attempt = batch.current_attempt();
+                                let max_attempts = batch.max_attempts();
+                                match batch.mark_current_failed() {
+                                    BatchFailureOutcome::Retry => {
+                                        log::warn!(
+                                            "海龟汤批量发送失败，准备从首条未发送消息重试: purpose={:?} attempt={}/{} sent={} error={:#}",
+                                            delivery.purpose,
+                                            attempt,
+                                            max_attempts,
+                                            sent,
+                                            error
+                                        );
+                                        match self
+                                            .deferred_chat
+                                            .requeue_front(DeferredChatItem::Batch(batch))?
+                                        {
+                                            EnqueueOutcome::Added => {}
+                                            EnqueueOutcome::DroppedMessage => {
+                                                log::warn!("海龟汤批量重试入队时淘汰了一条普通回复")
+                                            }
+                                            EnqueueOutcome::Rejected => {
+                                                let requeue_error =
+                                                    anyhow!("海龟汤批量重试无法重新进入延迟队列");
+                                                log::error!("{requeue_error:#}");
+                                                self.turtle_soup.handle_delivery_failure(
+                                                    delivery,
+                                                    &requeue_error,
+                                                );
+                                            }
+                                        }
+                                        sleep(retry_delay);
+                                    }
+                                    BatchFailureOutcome::Exhausted => {
+                                        log::error!(
+                                            "海龟汤批量发送已耗尽当前消息重试: purpose={:?} attempts={} sent={} error={:#}",
+                                            delivery.purpose,
+                                            max_attempts,
+                                            sent,
+                                            error
+                                        );
+                                        self.turtle_soup.handle_delivery_failure(delivery, &error);
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
             Ok(())
@@ -940,7 +1251,10 @@ mod app {
             let mut monitor = Self {
                 config: self.config.clone(),
                 runtime_state: self.runtime_state.clone(),
+                entertainment: self.entertainment.clone(),
                 idiom_chain: self.idiom_chain.clone(),
+                landlord: self.landlord.clone(),
+                turtle_soup: self.turtle_soup.clone(),
                 deferred_chat: self.deferred_chat.clone(),
                 queue: self.queue.clone(),
                 song_dedup_history: self.song_dedup_history.clone(),
@@ -981,7 +1295,10 @@ mod app {
             Self {
                 config: self.config.clone(),
                 runtime_state: self.runtime_state.clone(),
+                entertainment: self.entertainment.clone(),
                 idiom_chain: self.idiom_chain.clone(),
+                landlord: self.landlord.clone(),
+                turtle_soup: self.turtle_soup.clone(),
                 deferred_chat: self.deferred_chat.clone(),
                 queue: self.queue.clone(),
                 song_dedup_history: self.song_dedup_history.clone(),
@@ -1035,6 +1352,12 @@ mod app {
             self.idiom_chain
                 .lock()
                 .map_err(|_| anyhow!("idiom chain mutex poisoned"))
+        }
+
+        fn landlord(&self) -> Result<MutexGuard<'_, LandlordGame>> {
+            self.landlord
+                .lock()
+                .map_err(|_| anyhow!("landlord mutex poisoned"))
         }
 
         fn ocr_engine(&self) -> Result<MutexGuard<'_, OcrEngineState>> {
@@ -1195,6 +1518,7 @@ mod app {
                 Arc::clone(&self.runtime_state),
                 Arc::clone(&self.pending),
                 self.chat_listener.clone(),
+                self.turtle_soup.clone(),
                 self.monitor.clone(),
                 self.task_tracker.clone(),
                 self.decision_control.clone(),
@@ -1241,6 +1565,7 @@ mod app {
             while self.running.load(AtomicOrdering::SeqCst) {
                 let loop_started = Instant::now();
                 self.update_monitor_operational_state();
+                self.tick_entertainment();
                 if self.paused.load(AtomicOrdering::SeqCst) {
                     self.maybe_idle_exit()?;
                     sleep(Duration::from_millis(self.config.timing.loop_idle_ms));
@@ -1528,6 +1853,9 @@ mod app {
                     }
                     Err(error) => {
                         let frame_ms = elapsed_ms(frame_started);
+                        if !target_missing {
+                            self.abort_entertainment_for_context_loss("目标游戏窗口已关闭或不可用");
+                        }
                         self.monitor.set_ui_state("目标窗口不可用");
                         primary_visible = false;
                         last_fingerprint = None;
@@ -1702,10 +2030,10 @@ mod app {
 
             let refreshed = self.wait_for_secondary_bubble_stability()?;
             let refreshed_fingerprint = latest_incoming_fingerprint(&refreshed)?;
-            let processed =
+            let outcome =
                 self.process_secondary_latest_message(&refreshed, message_type, friend_name)?;
             *last_bubble = refreshed_fingerprint;
-            Ok(processed)
+            Ok(outcome)
         }
 
         fn scan_secondary_hall_if_changed(
@@ -1715,6 +2043,7 @@ mod app {
         ) -> Result<bool> {
             let current = secondary_hall_bubbles(image)?;
             if previous.is_empty() {
+                self.turtle_soup.clear_secondary_ocr_stability();
                 *previous = current;
                 log::debug!("二级大厅气泡序列尚未建立，当前仅记录基线");
                 return Ok(false);
@@ -1722,11 +2051,13 @@ mod app {
 
             let overlap = hall_bubble_sequence_overlap(previous, &current);
             if overlap == 0 {
+                self.turtle_soup.clear_secondary_ocr_stability();
                 *previous = current;
                 log::debug!("二级大厅气泡序列没有可靠重叠，已重建基线，不处理当前可见历史消息");
                 return Ok(false);
             }
             if overlap == current.len() {
+                self.turtle_soup.clear_secondary_ocr_stability();
                 *previous = current;
                 return Ok(false);
             }
@@ -1735,12 +2066,14 @@ mod app {
             let refreshed_bubbles = secondary_hall_bubbles(&refreshed)?;
             let refreshed_overlap = hall_bubble_sequence_overlap(previous, &refreshed_bubbles);
             if refreshed_overlap == 0 {
+                self.turtle_soup.clear_secondary_ocr_stability();
                 *previous = refreshed_bubbles;
                 log::debug!("二级大厅气泡稳定后没有可靠重叠，已重建基线，不处理当前可见历史消息");
                 return Ok(false);
             }
             let new_bubbles = &refreshed_bubbles[refreshed_overlap..];
             if new_bubbles.is_empty() {
+                self.turtle_soup.clear_secondary_ocr_stability();
                 *previous = refreshed_bubbles;
                 return Ok(false);
             }
@@ -1749,14 +2082,18 @@ mod app {
                 "二级大厅检测到 {} 条新增气泡，按显示顺序 OCR",
                 new_bubbles.len()
             );
-            let processed = self.process_secondary_bubble_rects(
+            let outcome = self.process_secondary_bubble_rects(
                 &refreshed,
                 new_bubbles.iter().map(|bubble| bubble.rect),
                 "blue",
                 "",
             )?;
+            if outcome.ocr_pending {
+                log::debug!("二级大厅新增气泡的海龟汤 OCR 尚未稳定，保留旧气泡基线等待下轮复核");
+                return Ok(false);
+            }
             *previous = refreshed_bubbles;
-            Ok(processed)
+            Ok(outcome.processed)
         }
 
         fn handle_scan_messages(&mut self, messages: Vec<ChatMessage>) -> Result<()> {
@@ -1767,6 +2104,17 @@ mod app {
                 self.locks = CommandLockState::default();
                 log::info!("已重置命令屏幕锁");
             }
+            let visible_turtle_questions = messages
+                .iter()
+                .filter(|message| message.message_type == "blue" && !message.text.is_empty())
+                .filter_map(|message| turtle_soup::parse_question_message(&message.text, None))
+                .collect::<Vec<_>>();
+            let suppress_new_turtle_questions =
+                !self.screen_lock_primed.load(AtomicOrdering::SeqCst);
+            let new_turtle_questions = self.turtle_soup.filter_new_primary_questions(
+                visible_turtle_questions,
+                suppress_new_turtle_questions,
+            );
             if messages.is_empty() {
                 log::debug!("没有找到聊天标志，本轮不更新命令锁");
                 return Ok(());
@@ -1774,7 +2122,11 @@ mod app {
 
             let mut parsed = Vec::new();
             for message in messages.iter().filter(|message| !message.text.is_empty()) {
-                log::debug!("识别文本: [{}] {}", message.message_type, message.text);
+                log::debug!(
+                    "识别文本: [{}] {}",
+                    message.message_type,
+                    redacted_chat_text(&message.text)
+                );
                 let Some(parsed_command) =
                     command::parse_text(&message.text, &message.message_type).or_else(|| {
                         custom_workflow::parse_text(
@@ -1826,6 +2178,12 @@ mod app {
                 log::info!("命令仍在屏幕内，本轮跳过: {}", command);
             }
             if !self.screen_lock_primed.swap(true, AtomicOrdering::SeqCst) {
+                for question in new_turtle_questions {
+                    log::info!(
+                        "启动屏幕锁已记录当前可见海龟汤提问，不执行: nickname={}",
+                        question.player
+                    );
+                }
                 for pending in update.accepted {
                     log::info!(
                         "启动屏幕锁已记录当前可见命令，不执行: {}",
@@ -1834,8 +2192,19 @@ mod app {
                 }
                 return Ok(());
             }
+            if self.commands_enabled.load(AtomicOrdering::SeqCst) {
+                for question in new_turtle_questions {
+                    self.handle_turtle_soup_question(question)?;
+                }
+            }
             for pending in update.accepted {
+                if self.handle_turtle_soup_command(&pending.parsed)? {
+                    continue;
+                }
                 if self.handle_idiom_chain_command(&pending.parsed)? {
+                    continue;
+                }
+                if self.handle_landlord_command(&pending.parsed)? {
                     continue;
                 }
                 if self.enqueue_chat_listener_command(&pending.parsed)? {
@@ -1922,14 +2291,48 @@ mod app {
             let UserCommand::IdiomChain(command) = &parsed.command else {
                 return Ok(false);
             };
+            if idiom_command_requires_executor(command) {
+                return Ok(false);
+            }
+            if self.entertainment.active() == Some(EntertainmentKind::TurtleSoup) {
+                self.enqueue_current_hall_reply("海龟汤正在进行，请结束后再开始成语接龙")?;
+                return Ok(true);
+            }
+            let acquired_for_start =
+                if matches!(command, idiom_chain::IdiomChainCommand::Start { .. }) {
+                    match self
+                        .entertainment
+                        .try_acquire(EntertainmentKind::IdiomChain)?
+                    {
+                        AcquireOutcome::Acquired => true,
+                        AcquireOutcome::AlreadyOwned => false,
+                        AcquireOutcome::Occupied(kind) => {
+                            self.enqueue_current_hall_reply(&format!(
+                                "{}正在进行，请结束后再开始成语接龙",
+                                kind.label()
+                            ))?;
+                            return Ok(true);
+                        }
+                    }
+                } else {
+                    false
+                };
             let outcome = {
                 let mut game = self.idiom_chain()?;
                 game.handle(&parsed.username, command)
             };
+            if acquired_for_start && outcome.action != "started" {
+                self.entertainment.release(EntertainmentKind::IdiomChain);
+            }
+            if matches!(outcome.action, "completed" | "stopped" | "expired") {
+                self.entertainment.release(EntertainmentKind::IdiomChain);
+            }
             let target = match self.active_ui_residency() {
                 UiResidency::Primary => DeferredChatTarget::Primary,
                 UiResidency::SecondaryCurrentHall => DeferredChatTarget::SecondaryCurrentHall,
             };
+            let action = outcome.action;
+            debug_assert!(outcome.explanation.is_none());
             let queue_outcome = self.deferred_chat.enqueue(DeferredChatMessage {
                 text: outcome.reply,
                 target,
@@ -1937,12 +2340,156 @@ mod app {
             log::info!(
                 "成语接龙已处理，回复进入延迟发送队列: command={} action={}",
                 parsed.raw,
-                outcome.action
+                action
             );
             if queue_outcome == EnqueueOutcome::DroppedMessage {
                 log::warn!("延迟聊天发送队列已满，已丢弃一条较早的回复");
             }
+            if queue_outcome == EnqueueOutcome::Rejected {
+                log::warn!("延迟聊天发送队列已被受保护批次占满，成语接龙回复已丢弃");
+            }
             Ok(true)
+        }
+
+        fn handle_landlord_command(&self, parsed: &ParsedCommand) -> Result<bool> {
+            let UserCommand::Landlord(command) = &parsed.command else {
+                return Ok(false);
+            };
+            if landlord_command_requires_executor(command) {
+                return Ok(false);
+            }
+            if let Some(active) = self.entertainment.active()
+                && active != EntertainmentKind::Landlord
+                && !matches!(command, LandlordCommand::Status | LandlordCommand::Help)
+            {
+                self.enqueue_current_hall_reply(&format!(
+                    "{}正在进行，请结束后再开始斗地主",
+                    active.label()
+                ))?;
+                return Ok(true);
+            }
+            let outcome = self
+                .landlord()?
+                .handle(&parsed.username, command, Instant::now());
+            self.finish_landlord_outcome(outcome)?;
+            log::info!(
+                "斗地主命令已处理: command={} user={}",
+                parsed.raw,
+                parsed.username
+            );
+            Ok(true)
+        }
+
+        fn finish_landlord_outcome(&self, outcome: LandlordOutcome) -> Result<()> {
+            if outcome.ended {
+                self.entertainment.release(EntertainmentKind::Landlord);
+            }
+            if let Some(reply) = outcome.public_reply {
+                self.enqueue_current_hall_reply(&reply)?;
+            }
+            Ok(())
+        }
+
+        fn handle_turtle_soup_command(&self, parsed: &ParsedCommand) -> Result<bool> {
+            let UserCommand::TurtleSoup(command) = &parsed.command else {
+                return Ok(false);
+            };
+            let outcome = if parsed.message_type == "pink" {
+                self.turtle_soup
+                    .handle_friend_command(&parsed.username, command)
+            } else {
+                self.turtle_soup
+                    .handle_hall_command(&parsed.username, command)
+            };
+            if let Some(reply) = outcome.immediate_reply {
+                self.enqueue_current_hall_reply(&reply)?;
+            }
+            log::info!(
+                "海龟汤命令已处理: command={} action={}",
+                parsed.raw,
+                outcome.action
+            );
+            Ok(true)
+        }
+
+        fn handle_turtle_soup_question(
+            &self,
+            question: turtle_soup::TurtleSoupQuestion,
+        ) -> Result<bool> {
+            match self.turtle_soup.submit_question(question)? {
+                QuestionSubmitOutcome::Ignored => Ok(false),
+                QuestionSubmitOutcome::Queued { request_id } => {
+                    log::info!("海龟汤提问已进入 AI 队列: request_id={}", request_id);
+                    Ok(true)
+                }
+                QuestionSubmitOutcome::Reply(reply) => {
+                    self.enqueue_current_hall_reply(&reply)?;
+                    Ok(true)
+                }
+            }
+        }
+
+        fn enqueue_current_hall_reply(&self, text: &str) -> Result<()> {
+            match self.deferred_chat.enqueue(DeferredChatMessage {
+                text: text.to_string(),
+                target: DeferredChatTarget::CurrentHall,
+            })? {
+                EnqueueOutcome::Added => {}
+                EnqueueOutcome::DroppedMessage => {
+                    log::warn!("大厅延迟回复入队时淘汰了一条较早的普通回复")
+                }
+                EnqueueOutcome::Rejected => {
+                    log::warn!("大厅延迟回复队列已被受保护批次占满，当前回复已丢弃")
+                }
+            }
+            Ok(())
+        }
+
+        pub(super) fn abort_entertainment_for_context_loss(&self, reason: &str) {
+            self.turtle_soup.abort_for_context_loss(reason);
+            match self.landlord.lock() {
+                Ok(mut game) => {
+                    if game.abort() {
+                        self.entertainment.release(EntertainmentKind::Landlord);
+                        log::warn!("斗地主已因聊天上下文变化中止: {}", reason);
+                    }
+                }
+                Err(_) => log::error!("斗地主状态锁已损坏，无法中止旧牌局"),
+            }
+            match self.idiom_chain.lock() {
+                Ok(mut game) => {
+                    if game.abort() {
+                        self.entertainment.release(EntertainmentKind::IdiomChain);
+                        log::warn!("成语接龙已因聊天上下文变化中止: {}", reason);
+                    }
+                }
+                Err(_) => log::error!("成语接龙状态锁已损坏，无法中止旧会话"),
+            }
+        }
+
+        fn tick_entertainment(&self) {
+            self.turtle_soup.tick();
+            let clock_active = !self.paused.load(AtomicOrdering::SeqCst)
+                && !self.command_executing.load(AtomicOrdering::SeqCst);
+            match self.landlord.lock() {
+                Ok(mut game) => {
+                    if let Some(outcome) = game.tick(Instant::now(), clock_active)
+                        && let Err(error) = self.finish_landlord_outcome(outcome)
+                    {
+                        log::error!("斗地主计时事件回复失败: {error:#}");
+                    }
+                }
+                Err(_) => log::error!("斗地主状态锁已损坏，无法推进回合计时"),
+            }
+            match self.idiom_chain.lock() {
+                Ok(mut game) => {
+                    if game.expire_idle_now() {
+                        self.entertainment.release(EntertainmentKind::IdiomChain);
+                        log::info!("成语接龙已因空闲超时结束，娱乐互斥已释放");
+                    }
+                }
+                Err(_) => log::error!("成语接龙状态锁已损坏，无法检查空闲超时"),
+            }
         }
 
         fn submit_secondary_command(&self, parsed: ParsedCommand) -> Result<()> {
@@ -1954,7 +2501,13 @@ mod app {
                 log::info!("命令识别已禁用，跳过二级大厅命令: {}", parsed.raw);
                 return Ok(());
             }
+            if self.handle_turtle_soup_command(&parsed)? {
+                return Ok(());
+            }
             if self.handle_idiom_chain_command(&parsed)? {
+                return Ok(());
+            }
+            if self.handle_landlord_command(&parsed)? {
                 return Ok(());
             }
             if let UserCommand::Invite(invite) = &parsed.command {
@@ -2019,6 +2572,7 @@ mod app {
                 "闲置退出触发: {}分钟无新命令，关闭目标游戏进程并保留软件进程",
                 timeout.as_secs() / 60
             );
+            self.abort_entertainment_for_context_loss("闲置退出即将关闭游戏");
             if let Err(error) = window::close_game(&self.config.window) {
                 log::error!("关闭目标窗口失败: {error:#}");
             }
@@ -2149,6 +2703,7 @@ mod app {
                         DeferredChatTarget::SecondaryCurrentHall,
                         UiResidency::SecondaryCurrentHall
                     )
+                    | (DeferredChatTarget::CurrentHall, _)
             )
         }
 
@@ -2351,7 +2906,7 @@ mod app {
                             self.config.templates.yellow_marker.clone()
                         }
                         WebToolTemplate::PinkMarker => self.config.templates.pink_marker.clone(),
-                        WebToolTemplate::Enter => self.config.templates.enter.clone(),
+                        WebToolTemplate::Friend => self.config.templates.friend.clone(),
                         WebToolTemplate::SecondaryHall => {
                             self.config.templates.secondary_hall.clone()
                         }
@@ -2680,6 +3235,7 @@ mod app {
         }
 
         fn execute_set_chat_listener_mode(&mut self, target: ChatListenerMode) -> Result<()> {
+            self.abort_entertainment_for_context_loss("聊天监听模式即将切换");
             let switched = match target {
                 ChatListenerMode::Primary => {
                     self.ensure_game_ready_for_input("切换一级监听")?;
@@ -3093,7 +3649,7 @@ mod app {
                 messages.len(),
                 messages
                     .iter()
-                    .map(|message| format!("[blue] {}", message.text))
+                    .map(|message| format!("[blue] {}", redacted_chat_text(&message.text)))
                     .collect(),
                 0,
                 ocr_ms,
@@ -3112,12 +3668,14 @@ mod app {
             let Some(rect) = latest_incoming_bubble_rect(image) else {
                 return Ok(false);
             };
-            self.process_secondary_bubble_rects(
-                image,
-                std::iter::once(rect),
-                message_type,
-                friend_name,
-            )
+            Ok(self
+                .process_secondary_bubble_rects(
+                    image,
+                    std::iter::once(rect),
+                    message_type,
+                    friend_name,
+                )?
+                .processed)
         }
 
         fn process_secondary_bubble_rects(
@@ -3126,25 +3684,37 @@ mod app {
             rects: impl IntoIterator<Item = Rect>,
             message_type: &str,
             friend_name: &str,
-        ) -> Result<bool> {
+        ) -> Result<SecondaryBubbleProcessOutcome> {
             let started = Instant::now();
             let ocr_started = Instant::now();
             let engine = self.ocr_engine()?;
+            let accepts_turtle_questions = message_type == "blue"
+                && self.commands_enabled.load(AtomicOrdering::SeqCst)
+                && self.turtle_soup.accepts_questions();
             let mut texts = Vec::new();
             for rect in rects {
                 let crop = crop_canvas(image, rect)?;
-                texts.push(merged_ocr_text(
-                    &engine.engine,
-                    &crop,
-                    self.config.ocr.same_line_y_tolerance,
-                )?);
+                let text =
+                    merged_ocr_text(&engine.engine, &crop, self.config.ocr.same_line_y_tolerance)?;
+                let question_sender = if accepts_turtle_questions {
+                    let sender_rect = secondary_question_sender_rect(image, rect);
+                    let crop = crop_canvas(image, sender_rect)?;
+                    Some(merged_ocr_text(
+                        &engine.engine,
+                        &crop,
+                        self.config.ocr.same_line_y_tolerance,
+                    )?)
+                } else {
+                    None
+                };
+                texts.push((rect, text, question_sender));
             }
             let ocr_ms = elapsed_ms(ocr_started);
             self.monitor.set_ocr(OcrSnapshot::new(
                 texts.len(),
                 texts
                     .iter()
-                    .map(|text| format!("[{}] {}", message_type, text))
+                    .map(|(_, text, _)| format!("[{}] {}", message_type, redacted_chat_text(text)))
                     .collect(),
                 0,
                 ocr_ms,
@@ -3157,10 +3727,51 @@ mod app {
             ));
             drop(engine);
 
+            let texts = if accepts_turtle_questions {
+                let observations = texts
+                    .into_iter()
+                    .map(|(_, text, question_sender)| SecondaryOcrObservation {
+                        text,
+                        player: question_sender.unwrap_or_default(),
+                    })
+                    .collect::<Vec<_>>();
+                match self.turtle_soup.stabilize_secondary_ocr(observations) {
+                    SecondaryOcrStability::Pending => {
+                        return Ok(SecondaryBubbleProcessOutcome {
+                            processed: false,
+                            ocr_pending: true,
+                        });
+                    }
+                    SecondaryOcrStability::Stable(observations) => observations
+                        .into_iter()
+                        .map(|observation| (observation.text, Some(observation.player)))
+                        .collect::<Vec<_>>(),
+                }
+            } else {
+                self.turtle_soup.clear_secondary_ocr_stability();
+                texts
+                    .into_iter()
+                    .map(|(_, text, question_sender)| (text, question_sender))
+                    .collect::<Vec<_>>()
+            };
+
             let mut processed = false;
-            for text in texts {
+            for (text, question_sender) in texts {
+                if accepts_turtle_questions {
+                    let question = question_sender
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|player| !player.is_empty())
+                        .and_then(|player| {
+                            turtle_soup::parse_question_message(&text, Some(player))
+                        });
+                    if let Some(question) = question {
+                        processed |= self.handle_turtle_soup_question(question)?;
+                        continue;
+                    }
+                }
                 let Some(index) = text.find('@') else {
-                    log::debug!("二级监听气泡不是命令: {}", text);
+                    log::debug!("二级监听气泡不是命令: {}", redacted_chat_text(&text));
                     continue;
                 };
                 let command_text = text[index..].trim();
@@ -3182,13 +3793,16 @@ mod app {
                     )
                 });
                 let Some(parsed) = parsed else {
-                    log::debug!("二级监听气泡未解析为命令: {}", synthetic);
+                    log::debug!("二级监听气泡未解析为命令");
                     continue;
                 };
                 self.submit_secondary_command(parsed)?;
                 processed = true;
             }
-            Ok(processed)
+            Ok(SecondaryBubbleProcessOutcome {
+                processed,
+                ocr_pending: false,
+            })
         }
 
         fn wait_for_secondary_bubble_stability(&self) -> Result<DynamicImage> {
@@ -3227,6 +3841,7 @@ mod app {
 
         fn execute_start_game_task(&mut self, source: &'static str) -> Result<()> {
             log::info!("执行启动游戏任务: {}", source);
+            self.abort_entertainment_for_context_loss("启动游戏任务将重建聊天上下文");
             let config = self.config.clone();
             let engine = self.ocr_engine()?;
             let running = Arc::clone(&self.running);
@@ -3246,6 +3861,7 @@ mod app {
 
         fn execute_enter_wonderland_task(&mut self, source: &'static str) -> Result<()> {
             log::info!("执行进入千星任务: {}", source);
+            self.abort_entertainment_for_context_loss("进入千星任务将切换大厅");
             let config = self.config.clone();
             let running = Arc::clone(&self.running);
             self.window_detection_signal.request("进入千星任务开始")?;
@@ -3416,13 +4032,60 @@ mod app {
             let frame_args = FrameArgs { image: None };
             let deadline =
                 Instant::now() + Duration::from_millis(self.config.timing.command.ui_timeout_ms);
+            let mut allow_transition_wait = true;
+            let mut primary_region_stability = PrimaryRegionStability::default();
+            let mut primary_stability_required = false;
 
             while self.running.load(AtomicOrdering::SeqCst) && Instant::now() < deadline {
                 let frame = load_frame(&frame_args, &canvas, &self.config.window)?;
                 let ui_state = detect_ui_state(&frame.image, &templates, &self.config.screen)?;
-                if ui_state.is_primary() {
-                    log::info!("命令执行前界面: {}", ui_state);
-                    return Ok(true);
+                let observation = primary_return_observation(&ui_state);
+                if observation != PrimaryReturnObservation::Primary {
+                    primary_stability_required = true;
+                }
+                let primary_region_readiness = primary_region_stability.observe(
+                    rect_chat_change_fingerprint(
+                        &frame.image,
+                        self.config.screen.friend_rect.into(),
+                    )?,
+                    Instant::now(),
+                    self.config.ocr.change_mean_threshold,
+                    self.config.ocr.change_pixel_threshold,
+                );
+                match primary_return_action(
+                    observation,
+                    allow_transition_wait,
+                    primary_region_ready_for_command(
+                        primary_stability_required,
+                        primary_region_readiness,
+                    ),
+                ) {
+                    PrimaryReturnAction::Complete => {
+                        if primary_region_readiness == PrimaryRegionReadiness::TimedOut {
+                            log::warn!(
+                                "命令执行前好友按钮区域持续变化 {}ms，按当前一级界面识别结果继续",
+                                PRIMARY_REGION_STABILITY_TIMEOUT_MS
+                            );
+                        }
+                        log::info!("命令执行前界面: {}", ui_state);
+                        return Ok(true);
+                    }
+                    PrimaryReturnAction::WaitForPrimaryStability => {
+                        sleep(Duration::from_millis(PRIMARY_REGION_STABILITY_POLL_MS));
+                        continue;
+                    }
+                    PrimaryReturnAction::WaitForTransition => {
+                        let wait_ms = self.config.timing.command.post_settle_ms;
+                        log::info!(
+                            "命令执行前界面: {}，等待界面过渡后重新检测: {}ms",
+                            ui_state,
+                            wait_ms
+                        );
+                        sleep(Duration::from_millis(wait_ms));
+                        allow_transition_wait = false;
+                        continue;
+                    }
+                    PrimaryReturnAction::PressEscape => {}
                 }
 
                 log::info!("命令执行前界面: {}，按 ESC 返回一级: {}", ui_state, command);
@@ -3430,6 +4093,9 @@ mod app {
                 sleep(Duration::from_millis(
                     self.config.timing.command.return_retry_ms,
                 ));
+                primary_region_stability.reset();
+                primary_stability_required = true;
+                allow_transition_wait = allow_primary_transition_wait_after_escape();
             }
 
             Ok(false)
@@ -4338,9 +5004,20 @@ mod app {
                     self.log_executed_command(parsed, "help")?;
                     self.send_help()?;
                 }
-                UserCommand::IdiomChain(_) => {
-                    log::warn!("成语接龙命令错误进入主执行器，改由延迟聊天队列处理");
-                    let _ = self.handle_idiom_chain_command(parsed)?;
+                UserCommand::IdiomChain(command) => {
+                    if idiom_command_requires_executor(command) {
+                        self.execute_idiom_explanation(&parsed.username, command)?;
+                    } else {
+                        log::warn!("成语接龙命令错误进入主执行器，改由延迟聊天队列处理");
+                        let _ = self.handle_idiom_chain_command(parsed)?;
+                    }
+                }
+                UserCommand::Landlord(command) => {
+                    self.execute_landlord_command(&parsed.username, command)?;
+                }
+                UserCommand::TurtleSoup(_) => {
+                    log::warn!("海龟汤命令错误进入主执行器，改由娱乐模块处理");
+                    let _ = self.handle_turtle_soup_command(parsed)?;
                 }
                 UserCommand::Invite(invite) => {
                     if let Some(seq) = invite.seq {
@@ -4612,17 +5289,61 @@ mod app {
                 Instant::now() + Duration::from_millis(self.config.timing.command.ui_timeout_ms);
 
             let mut failed_returns = 0_u32;
+            let mut allow_transition_wait = true;
+            let mut primary_region_stability = PrimaryRegionStability::default();
 
             while Instant::now() < deadline {
                 match load_frame(&frame_args, &canvas, &self.config.window).and_then(|frame| {
-                    detect_ui_state(&frame.image, &templates, &self.config.screen)
+                    let ui_state = detect_ui_state(&frame.image, &templates, &self.config.screen)?;
+                    let primary_region_fingerprint = rect_chat_change_fingerprint(
+                        &frame.image,
+                        self.config.screen.friend_rect.into(),
+                    )?;
+                    Ok((ui_state, primary_region_fingerprint))
                 }) {
-                    Ok(ui_state) if ui_state.is_primary() => {
-                        log::info!("{}: 已返回一级界面: {}", context, ui_state);
-                        return true;
-                    }
-                    Ok(ui_state) => {
-                        log::info!("{}: 当前 {}，按 ESC 返回上一级", context, ui_state);
+                    Ok((ui_state, primary_region_fingerprint)) => {
+                        let primary_region_readiness = primary_region_stability.observe(
+                            primary_region_fingerprint,
+                            Instant::now(),
+                            self.config.ocr.change_mean_threshold,
+                            self.config.ocr.change_pixel_threshold,
+                        );
+                        match primary_return_action(
+                            primary_return_observation(&ui_state),
+                            allow_transition_wait,
+                            primary_region_readiness != PrimaryRegionReadiness::Pending,
+                        ) {
+                            PrimaryReturnAction::Complete => {
+                                if primary_region_readiness == PrimaryRegionReadiness::TimedOut {
+                                    log::warn!(
+                                        "{}: 好友按钮区域持续变化 {}ms，按当前一级界面识别结果完成返回",
+                                        context,
+                                        PRIMARY_REGION_STABILITY_TIMEOUT_MS
+                                    );
+                                }
+                                log::info!("{}: 已返回一级界面: {}", context, ui_state);
+                                return true;
+                            }
+                            PrimaryReturnAction::WaitForPrimaryStability => {
+                                sleep(Duration::from_millis(PRIMARY_REGION_STABILITY_POLL_MS));
+                                continue;
+                            }
+                            PrimaryReturnAction::WaitForTransition => {
+                                let wait_ms = self.config.timing.command.post_settle_ms;
+                                log::info!(
+                                    "{}: 当前 {}，等待界面过渡后重新检测: {}ms",
+                                    context,
+                                    ui_state,
+                                    wait_ms
+                                );
+                                sleep(Duration::from_millis(wait_ms));
+                                allow_transition_wait = false;
+                                continue;
+                            }
+                            PrimaryReturnAction::PressEscape => {
+                                log::info!("{}: 当前 {}，按 ESC 返回上一级", context, ui_state);
+                            }
+                        }
                     }
                     Err(error) if is_target_window_unavailable_error(&error) => {
                         log::warn!(
@@ -4639,6 +5360,8 @@ mod app {
                 if !self.press_escape_for_primary_return(context, failed_returns) {
                     return false;
                 }
+                primary_region_stability.reset();
+                allow_transition_wait = allow_primary_transition_wait_after_escape();
             }
             log::error!("{}: 返回一级界面超时", context);
             false
@@ -4741,10 +5464,127 @@ mod app {
                     "点歌示例: @点歌/@AI点歌 歌名 歌手 伴奏,输入伴奏时优先匹配伴奏",
                     "命令以@开头: 暂停、继续、播放、下一首、上一首、状态、歌词、帮助、队列、音量1-100",
                     "切换网易平台: @网易点歌 歌名 歌手 伴奏,默认为QQ平台",
-                    "成语接龙: @接龙 开始 成语,随后 @接龙 成语;可用 @接龙 状态/结束",
+                    "成语接龙: @接龙 开始 成语;同音模式用 @同音接龙 开始 成语;可用 @提示/@解释",
+                    "斗地主: @斗地主 开始,@加入,@出 牌组/@过;也可用 $/＄出牌,好友私聊 @手牌",
+                    "海龟汤: @海龟汤/@海龟汤开始用于开局或重发汤面,@海龟汤状态查看进度,以#开头提问",
+                    "海龟汤长答案: ##1第一段,##2第二段,最后发送##提交",
                 ],
                 self.config.timing.command.help_batch_ms,
             )
+        }
+
+        fn execute_idiom_explanation(
+            &self,
+            player: &str,
+            command: &idiom_chain::IdiomChainCommand,
+        ) -> Result<()> {
+            let outcome = {
+                let mut game = self.idiom_chain()?;
+                game.handle(player, command)
+            };
+            let mut messages = vec![outcome.reply];
+            if let Some(explanation) = outcome.explanation {
+                messages.extend(split_numbered_chat_message("来源", &explanation.source));
+                messages.extend(split_numbered_chat_message(
+                    "解释",
+                    &explanation.explanation,
+                ));
+            }
+            let message_refs = messages.iter().map(String::as_str).collect::<Vec<_>>();
+            self.reply_batch(&message_refs, self.config.timing.command.help_batch_ms)
+        }
+
+        fn execute_landlord_command(&self, player: &str, command: &LandlordCommand) -> Result<()> {
+            match command {
+                LandlordCommand::Start => {
+                    if !self.config.landlord.enabled {
+                        return self.reply("斗地主未启用");
+                    }
+                    if self.landlord()?.is_active() {
+                        let outcome = self.landlord()?.handle(player, command, Instant::now());
+                        return self.deliver_landlord_task_outcome(outcome);
+                    }
+                    match self
+                        .entertainment
+                        .try_acquire(EntertainmentKind::Landlord)?
+                    {
+                        AcquireOutcome::Acquired => {}
+                        AcquireOutcome::AlreadyOwned => {}
+                        AcquireOutcome::Occupied(kind) => {
+                            return self
+                                .reply(&format!("{}正在进行，请结束后再开始斗地主", kind.label()));
+                        }
+                    }
+                    let verified = match self
+                        .send_unique_friend_message(player, "斗地主报名成功，请回到大厅等待组局")
+                    {
+                        Ok(verified) => verified,
+                        Err(error) => {
+                            self.entertainment.release(EntertainmentKind::Landlord);
+                            return Err(error);
+                        }
+                    };
+                    if !verified {
+                        self.entertainment.release(EntertainmentKind::Landlord);
+                        return self.reply("斗地主报名失败：好友列表未找到唯一昵称");
+                    }
+                    let outcome = self.landlord()?.handle(player, command, Instant::now());
+                    if outcome.action != "created" {
+                        self.entertainment.release(EntertainmentKind::Landlord);
+                    }
+                    self.deliver_landlord_task_outcome(outcome)
+                }
+                LandlordCommand::Join => {
+                    if self.entertainment.active() != Some(EntertainmentKind::Landlord)
+                        || !self.landlord()?.is_lobby()
+                        || self.landlord()?.lobby_contains(player)
+                    {
+                        let outcome = self.landlord()?.handle(player, command, Instant::now());
+                        return self.deliver_landlord_task_outcome(outcome);
+                    }
+                    let verified = self
+                        .send_unique_friend_message(player, "斗地主报名成功，请回到大厅等待开局")?;
+                    if !verified {
+                        return self.reply("斗地主报名失败：好友列表未找到唯一昵称");
+                    }
+                    let outcome = self.landlord()?.handle(player, command, Instant::now());
+                    self.deliver_landlord_task_outcome(outcome)
+                }
+                LandlordCommand::Hand => {
+                    let outcome = self.landlord()?.handle(player, command, Instant::now());
+                    if let Some(message) = outcome.private_reply {
+                        match self.send_friend_message(player, &message) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                self.landlord()?.retry_hand_delivery(player);
+                                return Err(anyhow!(
+                                    "斗地主手牌发送失败：好友列表未找到 {}",
+                                    player
+                                ));
+                            }
+                            Err(error) => {
+                                self.landlord()?.retry_hand_delivery(player);
+                                return Err(error);
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+                _ => {
+                    let outcome = self.landlord()?.handle(player, command, Instant::now());
+                    self.deliver_landlord_task_outcome(outcome)
+                }
+            }
+        }
+
+        fn deliver_landlord_task_outcome(&self, outcome: LandlordOutcome) -> Result<()> {
+            if outcome.ended {
+                self.entertainment.release(EntertainmentKind::Landlord);
+            }
+            if let Some(reply) = outcome.public_reply {
+                self.reply(&reply)?;
+            }
+            Ok(())
         }
 
         fn play_request_confirmed(
@@ -5230,7 +6070,7 @@ mod app {
             match self.active_ui_residency() {
                 UiResidency::Primary => {
                     self.ensure_ui_residency(UiResidency::Primary, "发送一级聊天回复")?;
-                    self.chat_output.send(message)
+                    self.chat_output.send_for_command(message)
                 }
                 UiResidency::SecondaryCurrentHall => {
                     self.ensure_ui_residency(
@@ -5246,7 +6086,7 @@ mod app {
             match self.active_ui_residency() {
                 UiResidency::Primary => {
                     self.ensure_ui_residency(UiResidency::Primary, "发送一级批量回复")?;
-                    self.chat_output.send_batch(messages, delay_ms)
+                    self.chat_output.send_batch_for_command(messages, delay_ms)
                 }
                 UiResidency::SecondaryCurrentHall => {
                     self.ensure_ui_residency(
@@ -5537,6 +6377,19 @@ mod app {
         (overlap > 0).then_some(overlap)
     }
 
+    fn secondary_question_sender_rect(image: &DynamicImage, bubble: Rect) -> Rect {
+        let left = (bubble.x - 20).max(0);
+        let top = (bubble.y - 48).max(0);
+        let right = (bubble.right() + 20).min(image.width() as i32);
+        let bottom = bubble.y.min(image.height() as i32);
+        Rect::new(
+            left,
+            top,
+            (right - left).max(1) as u32,
+            (bottom - top).max(1) as u32,
+        )
+    }
+
     fn secondary_optional_fingerprint_changed(
         previous: Option<&ChangeFingerprint>,
         current: Option<&ChangeFingerprint>,
@@ -5559,6 +6412,46 @@ mod app {
         let steps = RETURN_TO_PRIMARY_SLOW_RETRY_AFTER as u64;
         let progress = failed_returns.saturating_sub(1) as u64;
         base_ms + (RETURN_TO_PRIMARY_SLOW_RETRY_MS - base_ms) * progress / steps
+    }
+
+    fn primary_return_observation(ui_state: &UiState) -> PrimaryReturnObservation {
+        if ui_state.is_primary() {
+            PrimaryReturnObservation::Primary
+        } else if ui_state.is_secondary() {
+            PrimaryReturnObservation::Secondary
+        } else {
+            PrimaryReturnObservation::Unknown
+        }
+    }
+
+    fn primary_return_action(
+        observation: PrimaryReturnObservation,
+        allow_transition_wait: bool,
+        primary_region_ready: bool,
+    ) -> PrimaryReturnAction {
+        match observation {
+            PrimaryReturnObservation::Secondary => PrimaryReturnAction::PressEscape,
+            _ if !primary_region_ready => PrimaryReturnAction::WaitForPrimaryStability,
+            PrimaryReturnObservation::Primary if primary_region_ready => {
+                PrimaryReturnAction::Complete
+            }
+            PrimaryReturnObservation::Unknown if allow_transition_wait => {
+                PrimaryReturnAction::WaitForTransition
+            }
+            PrimaryReturnObservation::Unknown => PrimaryReturnAction::PressEscape,
+            PrimaryReturnObservation::Primary => unreachable!("primary readiness was checked"),
+        }
+    }
+
+    fn primary_region_ready_for_command(
+        stability_required: bool,
+        readiness: PrimaryRegionReadiness,
+    ) -> bool {
+        !stability_required || readiness != PrimaryRegionReadiness::Pending
+    }
+
+    fn allow_primary_transition_wait_after_escape() -> bool {
+        true
     }
 
     fn is_target_window_unavailable_error(error: &anyhow::Error) -> bool {
@@ -5634,6 +6527,30 @@ mod app {
         }
 
         #[test]
+        fn idiom_explanation_uses_the_exclusive_command_executor() {
+            assert!(idiom_command_requires_executor(
+                &idiom_chain::IdiomChainCommand::Explain(Some("画蛇添足".to_string()))
+            ));
+            assert!(!idiom_command_requires_executor(
+                &idiom_chain::IdiomChainCommand::Hint
+            ));
+            assert!(!idiom_command_requires_executor(
+                &idiom_chain::IdiomChainCommand::Submit("足智多谋".to_string())
+            ));
+        }
+
+        #[test]
+        fn landlord_uses_executor_only_for_friend_ui_operations() {
+            assert!(landlord_command_requires_executor(&LandlordCommand::Start));
+            assert!(landlord_command_requires_executor(&LandlordCommand::Join));
+            assert!(landlord_command_requires_executor(&LandlordCommand::Hand));
+            assert!(!landlord_command_requires_executor(&LandlordCommand::Play(
+                "3".to_string()
+            )));
+            assert!(!landlord_command_requires_executor(&LandlordCommand::Pass));
+        }
+
+        #[test]
         fn secondary_decision_reader_accepts_first_bubble_after_empty_baseline() {
             let mut image = image::RgbaImage::new(1920, 1080);
             for y in 300..354 {
@@ -5658,13 +6575,120 @@ mod app {
         }
 
         #[test]
+        fn primary_return_waits_for_transitional_unknown_before_escape() {
+            assert_eq!(
+                primary_return_action(PrimaryReturnObservation::Unknown, true, true),
+                PrimaryReturnAction::WaitForTransition
+            );
+            assert_eq!(
+                primary_return_action(PrimaryReturnObservation::Unknown, false, true),
+                PrimaryReturnAction::PressEscape
+            );
+            assert_eq!(
+                primary_return_action(PrimaryReturnObservation::Secondary, true, true),
+                PrimaryReturnAction::PressEscape
+            );
+            assert_eq!(
+                primary_return_action(PrimaryReturnObservation::Primary, true, true),
+                PrimaryReturnAction::Complete
+            );
+            assert_eq!(
+                primary_return_action(PrimaryReturnObservation::Primary, true, false),
+                PrimaryReturnAction::WaitForPrimaryStability
+            );
+            assert_eq!(
+                primary_return_action(PrimaryReturnObservation::Unknown, true, false),
+                PrimaryReturnAction::WaitForPrimaryStability
+            );
+            assert_eq!(
+                primary_return_action(PrimaryReturnObservation::Secondary, true, false),
+                PrimaryReturnAction::PressEscape
+            );
+            assert_eq!(
+                primary_return_action(
+                    PrimaryReturnObservation::Unknown,
+                    allow_primary_transition_wait_after_escape(),
+                    true,
+                ),
+                PrimaryReturnAction::WaitForTransition
+            );
+        }
+
+        #[test]
+        fn primary_region_stability_waits_for_stability_or_timeout() {
+            fn fingerprint(value: u8) -> ChangeFingerprint {
+                ChangeFingerprint {
+                    pixels: vec![value; 4],
+                    width: 2,
+                    height: 2,
+                }
+            }
+
+            let started_at = Instant::now();
+            let mut stability = PrimaryRegionStability::default();
+            assert_eq!(
+                stability.observe(fingerprint(0), started_at, 1.0, 0.01),
+                PrimaryRegionReadiness::Pending
+            );
+            assert_eq!(
+                stability.observe(
+                    fingerprint(255),
+                    started_at + Duration::from_millis(999),
+                    1.0,
+                    0.01,
+                ),
+                PrimaryRegionReadiness::Pending
+            );
+            assert_eq!(
+                stability.observe(
+                    fingerprint(0),
+                    started_at + Duration::from_millis(1_000),
+                    1.0,
+                    0.01,
+                ),
+                PrimaryRegionReadiness::TimedOut
+            );
+
+            stability.reset();
+            assert_eq!(
+                stability.observe(fingerprint(10), started_at, 1.0, 0.01),
+                PrimaryRegionReadiness::Pending
+            );
+            assert_eq!(
+                stability.observe(
+                    fingerprint(10),
+                    started_at + Duration::from_millis(100),
+                    1.0,
+                    0.01,
+                ),
+                PrimaryRegionReadiness::Stable
+            );
+        }
+
+        #[test]
+        fn command_ui_uses_fast_path_only_for_initial_primary_state() {
+            assert!(primary_region_ready_for_command(
+                false,
+                PrimaryRegionReadiness::Pending
+            ));
+            assert!(!primary_region_ready_for_command(
+                true,
+                PrimaryRegionReadiness::Pending
+            ));
+            assert!(primary_region_ready_for_command(
+                true,
+                PrimaryRegionReadiness::Stable
+            ));
+        }
+
+        #[test]
         fn target_window_unavailable_error_is_detected() {
             let error =
                 window::target_window_unavailable("进入千星前未找到游戏窗口，请先执行启动游戏任务");
 
             assert!(is_target_window_unavailable_error(&error));
             assert!(!is_target_window_unavailable_error(&anyhow!(
-                "等待左下角 Enter 模板超时"
+                "等待派蒙菜单模板超时"
             )));
         }
 

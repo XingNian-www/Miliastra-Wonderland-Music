@@ -24,20 +24,20 @@ pub(super) struct UiState {
     yellow_count: usize,
     pink_count: usize,
     hall_visible: bool,
-    enter_visible: bool,
+    friend_visible: bool,
     source: &'static str,
 }
 
 impl UiState {
-    fn primary_enter() -> Self {
+    fn primary_friend() -> Self {
         Self {
             state: UiStateKind::Primary,
             blue_count: 0,
             yellow_count: 0,
             pink_count: 0,
             hall_visible: false,
-            enter_visible: true,
-            source: "enter",
+            friend_visible: true,
+            source: "friend",
         }
     }
 
@@ -48,7 +48,7 @@ impl UiState {
             yellow_count,
             pink_count,
             hall_visible: false,
-            enter_visible: false,
+            friend_visible: false,
             source: "marker",
         }
     }
@@ -60,7 +60,7 @@ impl UiState {
             yellow_count: 0,
             pink_count: 0,
             hall_visible: true,
-            enter_visible: false,
+            friend_visible: false,
             source: "hall",
         }
     }
@@ -72,7 +72,7 @@ impl UiState {
             yellow_count: 0,
             pink_count: 0,
             hall_visible: false,
-            enter_visible: false,
+            friend_visible: false,
             source: "none",
         }
     }
@@ -89,8 +89,8 @@ impl UiState {
 impl std::fmt::Display for UiState {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.state {
-            UiStateKind::Primary if self.source == "enter" => {
-                write!(formatter, "primary:enter")
+            UiStateKind::Primary if self.source == "friend" => {
+                write!(formatter, "primary:friend")
             }
             UiStateKind::Primary => write!(
                 formatter,
@@ -109,24 +109,24 @@ pub(super) fn detect_ui_state(
     screen: &config::ScreenConfig,
 ) -> Result<UiState> {
     let started = Instant::now();
-    let enter_started = Instant::now();
+    let friend_started = Instant::now();
     if best_template_hit(
         image,
-        Some(screen.enter_rect.into()),
-        &templates.enter_template,
+        Some(screen.friend_rect.into()),
+        &templates.friend_template,
         templates.chat_templates.marker_threshold,
     )?
     .is_some()
     {
-        let enter_ms = elapsed_ms(enter_started);
+        let friend_ms = elapsed_ms(friend_started);
         log::info!(target: "timing",
-            "UI 状态检测耗时: total={}ms enter={}ms hall=0ms marker=0ms state=primary_enter",
+            "UI 状态检测耗时: total={}ms friend={}ms hall=0ms marker=0ms state=primary_friend",
             elapsed_ms(started),
-            enter_ms
+            friend_ms
         );
-        return Ok(UiState::primary_enter());
+        return Ok(UiState::primary_friend());
     }
-    let enter_ms = elapsed_ms(enter_started);
+    let friend_ms = elapsed_ms(friend_started);
 
     let hall_started = Instant::now();
     if best_template_hit(
@@ -139,9 +139,9 @@ pub(super) fn detect_ui_state(
     {
         let hall_ms = elapsed_ms(hall_started);
         log::info!(target: "timing",
-            "UI 状态检测耗时: total={}ms enter={}ms hall={}ms marker=0ms state=secondary_hall",
+            "UI 状态检测耗时: total={}ms friend={}ms hall={}ms marker=0ms state=secondary_hall",
             elapsed_ms(started),
-            enter_ms,
+            friend_ms,
             hall_ms
         );
         return Ok(UiState::secondary_hall());
@@ -154,9 +154,9 @@ pub(super) fn detect_ui_state(
     let marker_ms = elapsed_ms(marker_started);
     if blue + yellow + pink > 0 {
         log::info!(target: "timing",
-            "UI 状态检测耗时: total={}ms enter={}ms hall={}ms marker={}ms state=primary_marker blue={} yellow={} pink={}",
+            "UI 状态检测耗时: total={}ms friend={}ms hall={}ms marker={}ms state=primary_marker blue={} yellow={} pink={}",
             elapsed_ms(started),
-            enter_ms,
+            friend_ms,
             hall_ms,
             marker_ms,
             blue,
@@ -167,9 +167,9 @@ pub(super) fn detect_ui_state(
     }
 
     log::info!(target: "timing",
-        "UI 状态检测耗时: total={}ms enter={}ms hall={}ms marker={}ms state=unknown",
+        "UI 状态检测耗时: total={}ms friend={}ms hall={}ms marker={}ms state=unknown",
         elapsed_ms(started),
-        enter_ms,
+        friend_ms,
         hall_ms,
         marker_ms
     );
@@ -178,4 +178,18 @@ pub(super) fn detect_ui_state(
 
 fn elapsed_ms(started: Instant) -> u128 {
     started.elapsed().as_millis()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn friend_anchor_uses_primary_friend_status() {
+        let state = UiState::primary_friend();
+
+        assert_eq!(state.to_string(), "primary:friend");
+        assert!(state.friend_visible);
+        assert_eq!(state.source, "friend");
+    }
 }

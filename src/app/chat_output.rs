@@ -1,15 +1,69 @@
 use std::thread::sleep;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use enigo::{Direction, Enigo, Key, Keyboard, Settings};
 
 use super::config::{OutputConfig, TimingConfig, WindowConfig};
 use super::input_actions;
 use super::window::GameWindow;
 
-const MAX_CHAT_WIDTH: usize = 80;
+pub(super) const MAX_CHAT_WIDTH: usize = 80;
 const OMIT: &str = "...";
+const REDACTED_TURTLE_SOUP_BOTTOM: &str = "[海龟汤汤底已隐藏]";
+
+#[derive(Debug)]
+pub(super) struct ChatBatchSendOutcome {
+    pub sent: usize,
+    pub status: ChatBatchSendStatus,
+}
+
+#[derive(Debug)]
+pub(super) enum ChatBatchSendStatus {
+    Complete,
+    Interrupted,
+    Failed(anyhow::Error),
+}
+
+impl ChatBatchSendOutcome {
+    fn complete(sent: usize) -> Self {
+        Self {
+            sent,
+            status: ChatBatchSendStatus::Complete,
+        }
+    }
+
+    fn interrupted(sent: usize) -> Self {
+        Self {
+            sent,
+            status: ChatBatchSendStatus::Interrupted,
+        }
+    }
+
+    pub(super) fn failed(sent: usize, error: anyhow::Error) -> Self {
+        Self {
+            sent,
+            status: ChatBatchSendStatus::Failed(error),
+        }
+    }
+
+    fn into_result(self, expected: usize) -> Result<()> {
+        match self.status {
+            ChatBatchSendStatus::Complete if self.sent == expected => Ok(()),
+            ChatBatchSendStatus::Complete => Err(anyhow!(
+                "批量发送提前完成: sent={} expected={}",
+                self.sent,
+                expected
+            )),
+            ChatBatchSendStatus::Interrupted => Err(anyhow!(
+                "不可中断的批量发送意外让行: sent={} expected={}",
+                self.sent,
+                expected
+            )),
+            ChatBatchSendStatus::Failed(error) => Err(error),
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct ChatOutput {
@@ -30,18 +84,26 @@ impl ChatOutput {
     }
 
     pub fn send(&self, message: &str) -> Result<()> {
+        self.send_primary(message, false)
+    }
+
+    pub fn send_for_command(&self, message: &str) -> Result<()> {
+        self.send_primary(message, true)
+    }
+
+    fn send_primary(&self, message: &str, restore_after_task: bool) -> Result<()> {
         let message = fit_chat_message(message);
-        log::info!("游戏内回复: {}", message);
+        log::info!("游戏内回复: {}", redacted_chat_text(&message));
         if !self.enabled {
             log::info!("游戏内回复发送已关闭，仅记录日志");
             return Ok(());
         }
-        self.send_with_input(&message)
+        self.send_with_input(&message, restore_after_task)
     }
 
     pub fn send_current_chat(&self, message: &str) -> Result<()> {
         let message = fit_chat_message(message);
-        log::info!("当前聊天回复: {}", message);
+        log::info!("当前聊天回复: {}", redacted_chat_text(&message));
         if !self.enabled {
             log::info!("当前聊天回复发送已关闭，仅记录日志");
             return Ok(());
@@ -58,16 +120,27 @@ impl ChatOutput {
             .map(|message| fit_chat_message(message))
             .collect::<Vec<_>>();
         for message in &messages {
-            log::info!("当前聊天回复: {}", message);
+            log::info!("当前聊天回复: {}", redacted_chat_text(message));
         }
         if !self.enabled {
             log::info!("当前聊天回复发送已关闭，仅记录日志");
             return Ok(());
         }
-        self.send_current_chat_batch_with_input(&messages, delay_ms)
+        let expected = messages.len();
+        self.send_current_chat_batch_interruptible_with_input(&messages, delay_ms, || true)
+            .into_result(expected)
     }
 
-    pub fn send_batch(&self, messages: &[&str], delay_ms: u64) -> Result<()> {
+    pub fn send_batch_for_command(&self, messages: &[&str], delay_ms: u64) -> Result<()> {
+        self.send_primary_batch(messages, delay_ms, true)
+    }
+
+    fn send_primary_batch(
+        &self,
+        messages: &[&str],
+        delay_ms: u64,
+        restore_after_task: bool,
+    ) -> Result<()> {
         if messages.is_empty() {
             return Ok(());
         }
@@ -76,68 +149,197 @@ impl ChatOutput {
             .map(|message| fit_chat_message(message))
             .collect::<Vec<_>>();
         for message in &messages {
-            log::info!("游戏内回复: {}", message);
+            log::info!("游戏内回复: {}", redacted_chat_text(message));
         }
         if !self.enabled {
             log::info!("游戏内回复发送已关闭，仅记录日志");
             return Ok(());
         }
-        self.send_batch_with_input(&messages, delay_ms)
+        let expected = messages.len();
+        self.send_batch_interruptible_with_input(&messages, delay_ms, restore_after_task, || true)
+            .into_result(expected)
     }
 
-    fn send_with_input(&self, message: &str) -> Result<()> {
-        self.send_batch_with_input(&[message.to_string()], 0)
+    pub fn send_current_chat_batch_interruptible(
+        &self,
+        messages: &[&str],
+        delay_ms: u64,
+        should_continue: impl FnMut() -> bool,
+    ) -> ChatBatchSendOutcome {
+        let messages = messages
+            .iter()
+            .map(|message| fit_chat_message(message))
+            .collect::<Vec<_>>();
+        if !self.enabled {
+            for message in &messages {
+                log::info!("当前聊天回复: {}", redacted_chat_text(message));
+            }
+            if !messages.is_empty() {
+                log::info!("当前聊天回复发送已关闭，仅记录日志");
+            }
+            return ChatBatchSendOutcome::complete(messages.len());
+        }
+        let outcome = self.send_current_chat_batch_interruptible_with_input(
+            &messages,
+            delay_ms,
+            should_continue,
+        );
+        for message in messages.iter().take(outcome.sent) {
+            log::info!("当前聊天回复: {}", redacted_chat_text(message));
+        }
+        outcome
+    }
+
+    pub fn send_batch_interruptible(
+        &self,
+        messages: &[&str],
+        delay_ms: u64,
+        should_continue: impl FnMut() -> bool,
+    ) -> ChatBatchSendOutcome {
+        let messages = messages
+            .iter()
+            .map(|message| fit_chat_message(message))
+            .collect::<Vec<_>>();
+        if !self.enabled {
+            for message in &messages {
+                log::info!("游戏内回复: {}", redacted_chat_text(message));
+            }
+            if !messages.is_empty() {
+                log::info!("游戏内回复发送已关闭，仅记录日志");
+            }
+            return ChatBatchSendOutcome::complete(messages.len());
+        }
+        let outcome =
+            self.send_batch_interruptible_with_input(&messages, delay_ms, false, should_continue);
+        for message in messages.iter().take(outcome.sent) {
+            log::info!("游戏内回复: {}", redacted_chat_text(message));
+        }
+        outcome
+    }
+
+    fn send_with_input(&self, message: &str, restore_after_task: bool) -> Result<()> {
+        let messages = [message.to_string()];
+        self.send_batch_interruptible_with_input(&messages, 0, restore_after_task, || true)
+            .into_result(messages.len())
     }
 
     fn send_current_chat_with_input(&self, message: &str) -> Result<()> {
-        self.send_current_chat_batch_with_input(&[message.to_string()], 0)
+        let messages = [message.to_string()];
+        self.send_current_chat_batch_interruptible_with_input(&messages, 0, || true)
+            .into_result(messages.len())
     }
 
-    fn send_current_chat_batch_with_input(&self, messages: &[String], delay_ms: u64) -> Result<()> {
-        let mut enigo = Enigo::new(&Settings::default()).context("create enigo")?;
-        let mut window = GameWindow::find(&self.window)?;
-        window.ensure_foreground()?;
-
-        for (index, message) in messages.iter().enumerate() {
-            if index > 0 && delay_ms > 0 {
-                sleep_ms(delay_ms);
-            }
-            window.click(&mut enigo, self.config.chat_click_2)?;
-            sleep_ms(self.timing.input.click_ms);
-            input_message(&mut enigo, message, self.timing.input.text_ms, &self.window)?;
-            enigo
-                .key(Key::Return, Direction::Click)
-                .context("send message")?;
-            sleep_ms(self.timing.input.send_ms);
+    fn send_current_chat_batch_interruptible_with_input(
+        &self,
+        messages: &[String],
+        delay_ms: u64,
+        mut should_continue: impl FnMut() -> bool,
+    ) -> ChatBatchSendOutcome {
+        if messages.is_empty() {
+            return ChatBatchSendOutcome::complete(0);
         }
-        Ok(())
+        if !should_continue() {
+            return ChatBatchSendOutcome::interrupted(0);
+        }
+
+        let mut enigo = match Enigo::new(&Settings::default()).context("create enigo") {
+            Ok(enigo) => enigo,
+            Err(error) => return ChatBatchSendOutcome::failed(0, error),
+        };
+        let mut window = match GameWindow::find(&self.window) {
+            Ok(window) => window,
+            Err(error) => return ChatBatchSendOutcome::failed(0, error),
+        };
+        if let Err(error) = window.ensure_foreground() {
+            return ChatBatchSendOutcome::failed(0, error);
+        }
+
+        send_messages_interruptibly(messages, delay_ms, should_continue, |message| {
+            (|| -> Result<()> {
+                window.click(&mut enigo, self.config.chat_click_2)?;
+                sleep_ms(self.timing.input.click_ms);
+                input_message(&mut enigo, message, self.timing.input.text_ms, &self.window)?;
+                enigo
+                    .key(Key::Return, Direction::Click)
+                    .context("send message")?;
+                sleep_ms(self.timing.input.send_ms);
+                Ok(())
+            })()
+        })
     }
 
-    fn send_batch_with_input(&self, messages: &[String], delay_ms: u64) -> Result<()> {
-        let mut enigo = Enigo::new(&Settings::default()).context("create enigo")?;
-        let mut window = GameWindow::find(&self.window)?;
-        window.ensure_foreground()?;
+    fn send_batch_interruptible_with_input(
+        &self,
+        messages: &[String],
+        delay_ms: u64,
+        restore_after_task: bool,
+        mut should_continue: impl FnMut() -> bool,
+    ) -> ChatBatchSendOutcome {
+        if messages.is_empty() {
+            return ChatBatchSendOutcome::complete(0);
+        }
+        if !should_continue() {
+            return ChatBatchSendOutcome::interrupted(0);
+        }
 
-        enigo
+        let mut enigo = match Enigo::new(&Settings::default()).context("create enigo") {
+            Ok(enigo) => enigo,
+            Err(error) => return ChatBatchSendOutcome::failed(0, error),
+        };
+        let mut window = match GameWindow::find(&self.window) {
+            Ok(window) => window,
+            Err(error) => return ChatBatchSendOutcome::failed(0, error),
+        };
+        if let Err(error) = window.ensure_foreground() {
+            return ChatBatchSendOutcome::failed(0, error);
+        }
+        if let Err(error) = enigo
             .key(Key::Return, Direction::Click)
-            .context("open chat")?;
+            .context("open chat")
+        {
+            return ChatBatchSendOutcome::failed(0, error);
+        }
         sleep_ms(self.timing.input.open_chat_ms);
 
-        for (index, message) in messages.iter().enumerate() {
-            if index > 0 && delay_ms > 0 {
-                sleep_ms(delay_ms);
-            }
-            window.click(&mut enigo, self.config.chat_click_1)?;
-            sleep_ms(self.timing.input.click_ms);
-            window.click(&mut enigo, self.config.chat_click_2)?;
-            sleep_ms(self.timing.input.open_chat_ms);
-
-            input_message(&mut enigo, message, self.timing.input.text_ms, &self.window)?;
-            enigo
-                .key(Key::Return, Direction::Click)
-                .context("send message")?;
-            sleep_ms(self.timing.input.send_ms);
+        let outcome = send_messages_interruptibly(messages, delay_ms, should_continue, |message| {
+            (|| -> Result<()> {
+                window.click(&mut enigo, self.config.chat_click_1)?;
+                sleep_ms(self.timing.input.click_ms);
+                window.click(&mut enigo, self.config.chat_click_2)?;
+                sleep_ms(self.timing.input.open_chat_ms);
+                input_message(&mut enigo, message, self.timing.input.text_ms, &self.window)?;
+                enigo
+                    .key(Key::Return, Direction::Click)
+                    .context("send message")?;
+                sleep_ms(self.timing.input.send_ms);
+                Ok(())
+            })()
+        });
+        if !primary_chat_should_close_directly(restore_after_task) {
+            return outcome;
         }
+        let ChatBatchSendOutcome { sent, status } = outcome;
+        match status {
+            ChatBatchSendStatus::Complete => match self.close_batch_chat(&mut enigo, &mut window) {
+                Ok(()) => ChatBatchSendOutcome::complete(sent),
+                Err(error) => ChatBatchSendOutcome::failed(sent, error),
+            },
+            ChatBatchSendStatus::Interrupted => {
+                match self.close_batch_chat(&mut enigo, &mut window) {
+                    Ok(()) => ChatBatchSendOutcome::interrupted(sent),
+                    Err(error) => ChatBatchSendOutcome::failed(sent, error),
+                }
+            }
+            ChatBatchSendStatus::Failed(error) => {
+                if let Err(close_error) = self.close_batch_chat(&mut enigo, &mut window) {
+                    log::error!("批量回复失败后关闭聊天界面也失败: {close_error:#}");
+                }
+                ChatBatchSendOutcome::failed(sent, error)
+            }
+        }
+    }
+
+    fn close_batch_chat(&self, enigo: &mut Enigo, window: &mut GameWindow) -> Result<()> {
         window.ensure_foreground()?;
         enigo
             .key(Key::Escape, Direction::Click)
@@ -145,6 +347,10 @@ impl ChatOutput {
         sleep_ms(self.timing.input.click_ms);
         Ok(())
     }
+}
+
+fn primary_chat_should_close_directly(restore_after_task: bool) -> bool {
+    !restore_after_task
 }
 
 fn input_message(
@@ -165,6 +371,53 @@ fn sleep_ms(ms: u64) {
     sleep(Duration::from_millis(ms));
 }
 
+fn send_messages_interruptibly<T>(
+    messages: &[T],
+    delay_ms: u64,
+    mut should_continue: impl FnMut() -> bool,
+    mut send_one: impl FnMut(&T) -> Result<()>,
+) -> ChatBatchSendOutcome {
+    let mut sent = 0;
+    for (index, message) in messages.iter().enumerate() {
+        if !should_continue() {
+            return ChatBatchSendOutcome::interrupted(sent);
+        }
+        if index > 0 && delay_ms > 0 {
+            sleep_ms(delay_ms);
+            if !should_continue() {
+                return ChatBatchSendOutcome::interrupted(sent);
+            }
+        }
+        if let Err(error) = send_one(message) {
+            return ChatBatchSendOutcome::failed(sent, error);
+        }
+        sent += 1;
+    }
+    ChatBatchSendOutcome::complete(sent)
+}
+
+pub(super) fn redacted_chat_text(message: &str) -> &str {
+    if contains_turtle_soup_bottom_marker(message) {
+        REDACTED_TURTLE_SOUP_BOTTOM
+    } else {
+        message
+    }
+}
+
+fn contains_turtle_soup_bottom_marker(message: &str) -> bool {
+    let mut saw_soup = false;
+    for ch in message.chars() {
+        if ch.is_whitespace() {
+            continue;
+        }
+        if saw_soup && ch == '底' {
+            return true;
+        }
+        saw_soup = ch == '汤';
+    }
+    false
+}
+
 fn fit_chat_message(message: &str) -> String {
     let message = message.trim();
     if display_width(message) <= MAX_CHAT_WIDTH {
@@ -181,6 +434,75 @@ fn fit_chat_message(message: &str) -> String {
         return output;
     }
     truncate_display_start(message, MAX_CHAT_WIDTH)
+}
+
+pub(super) fn split_numbered_chat_message(label: &str, message: &str) -> Vec<String> {
+    let source = normalize_segment_source(message);
+    let mut expected_total = 1usize;
+    for _ in 0..16 {
+        let messages = split_numbered_with_total(label, &source, expected_total);
+        if messages.len() == expected_total {
+            return messages;
+        }
+        expected_total = messages.len().max(1);
+    }
+    split_numbered_with_total(label, &source, expected_total)
+}
+
+fn split_numbered_with_total(label: &str, source: &str, total: usize) -> Vec<String> {
+    let chars = source.chars().collect::<Vec<_>>();
+    if chars.is_empty() {
+        return vec![format!("{}1/1：", label)];
+    }
+
+    let mut messages = Vec::new();
+    let mut offset = 0usize;
+    while offset < chars.len() {
+        let index = messages.len() + 1;
+        let prefix = format!("{}{}/{}：", label, index, total.max(1));
+        let available = MAX_CHAT_WIDTH.saturating_sub(display_width(&prefix));
+        let mut chunk = String::new();
+        let mut width = 0usize;
+        while offset < chars.len() {
+            let next_width = char_width(chars[offset]);
+            if !chunk.is_empty() && width + next_width > available {
+                break;
+            }
+            if chunk.is_empty() && next_width > available {
+                break;
+            }
+            chunk.push(chars[offset]);
+            width += next_width;
+            offset += 1;
+        }
+        if chunk.is_empty() {
+            chunk.push(chars[offset]);
+            offset += 1;
+        }
+        messages.push(format!("{}{}", prefix, chunk));
+    }
+    messages
+}
+
+fn normalize_segment_source(message: &str) -> String {
+    let mut output = String::new();
+    let mut previous_was_line_break = false;
+    for ch in message.trim().chars() {
+        match ch {
+            '\r' => {}
+            '\n' => {
+                if !previous_was_line_break && !output.ends_with(' ') {
+                    output.push(' ');
+                }
+                previous_was_line_break = true;
+            }
+            _ => {
+                output.push(ch);
+                previous_was_line_break = false;
+            }
+        }
+    }
+    output
 }
 
 fn fit_invite_message(message: &str) -> Option<String> {
@@ -311,8 +633,121 @@ fn take_display_end(value: &str, max_width: usize) -> String {
     output.into_iter().rev().collect()
 }
 
-fn display_width(value: &str) -> usize {
+pub(super) fn display_width(value: &str) -> usize {
     value.chars().map(char_width).sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn primary_command_reply_leaves_chat_open_for_residency_restore() {
+        assert!(!primary_chat_should_close_directly(true));
+        assert!(primary_chat_should_close_directly(false));
+    }
+
+    #[test]
+    fn numbered_split_preserves_all_content_without_truncation() {
+        let source = "这是一个用于验证海龟汤分段发送的较长汤面。".repeat(8);
+        let messages = split_numbered_chat_message("汤面", &source);
+
+        assert!(messages.len() > 1);
+        assert!(
+            messages
+                .iter()
+                .all(|message| display_width(message) <= MAX_CHAT_WIDTH)
+        );
+        let rebuilt = messages
+            .iter()
+            .map(|message| message.split_once('：').unwrap().1)
+            .collect::<String>();
+        assert_eq!(rebuilt, source);
+        let total = messages.len();
+        assert!(
+            messages
+                .iter()
+                .enumerate()
+                .all(|(index, message)| message.starts_with(&format!(
+                    "汤面{}/{}：",
+                    index + 1,
+                    total
+                )))
+        );
+    }
+
+    #[test]
+    fn numbered_split_counts_ascii_as_half_width() {
+        let source = "A".repeat(160);
+        let messages = split_numbered_chat_message("汤底", &source);
+
+        assert!(messages.len() >= 3);
+        assert!(
+            messages
+                .iter()
+                .all(|message| display_width(message) <= MAX_CHAT_WIDTH)
+        );
+    }
+
+    #[test]
+    fn turtle_soup_bottom_is_redacted_only_in_logs() {
+        assert_eq!(
+            redacted_chat_text("汤底1/2：秘密"),
+            REDACTED_TURTLE_SOUP_BOTTOM
+        );
+        assert_eq!(
+            redacted_chat_text("汤 底1/2：秘密"),
+            REDACTED_TURTLE_SOUP_BOTTOM
+        );
+        assert_eq!(redacted_chat_text("汤面1/2：线索"), "汤面1/2：线索");
+    }
+
+    #[test]
+    fn interruptible_batch_yields_before_the_next_message() {
+        let messages = ["第一段", "第二段", "第三段"];
+        let mut checks = 0;
+        let mut delivered = Vec::new();
+
+        let outcome = send_messages_interruptibly(
+            &messages,
+            0,
+            || {
+                checks += 1;
+                checks == 1
+            },
+            |message| {
+                delivered.push(*message);
+                Ok(())
+            },
+        );
+
+        assert_eq!(outcome.sent, 1);
+        assert!(matches!(outcome.status, ChatBatchSendStatus::Interrupted));
+        assert_eq!(delivered, vec!["第一段"]);
+    }
+
+    #[test]
+    fn interruptible_batch_reports_partial_success_before_failure() {
+        let messages = ["第一段", "第二段", "第三段"];
+        let mut delivered = Vec::new();
+
+        let outcome = send_messages_interruptibly(
+            &messages,
+            0,
+            || true,
+            |message| {
+                if *message == "第二段" {
+                    return Err(anyhow::anyhow!("模拟发送失败"));
+                }
+                delivered.push(*message);
+                Ok(())
+            },
+        );
+
+        assert_eq!(outcome.sent, 1);
+        assert!(matches!(outcome.status, ChatBatchSendStatus::Failed(_)));
+        assert_eq!(delivered, vec!["第一段"]);
+    }
 }
 
 fn char_width(ch: char) -> usize {

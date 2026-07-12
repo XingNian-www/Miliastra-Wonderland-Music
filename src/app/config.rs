@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 
 use super::config_migration::{self, CURRENT_CONFIG_VERSION};
 use super::idiom_chain::IdiomChainConfig;
+use super::landlord::LandlordConfig;
+use super::turtle_soup::TurtleSoupConfig;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -28,6 +30,10 @@ pub struct AppConfig {
     pub song_dedup: SongDedupConfig,
     #[serde(default)]
     pub idiom_chain: IdiomChainConfig,
+    #[serde(default)]
+    pub landlord: LandlordConfig,
+    #[serde(default)]
+    pub turtle_soup: TurtleSoupConfig,
     pub ai: AiConfig,
     #[serde(default)]
     pub song_review: SongReviewConfig,
@@ -129,7 +135,8 @@ pub struct ScreenConfig {
     pub expected_height: u32,
     pub warn_on_size_mismatch: bool,
     pub chat_rect: RectConfig,
-    pub enter_rect: RectConfig,
+    #[serde(alias = "enter_rect")]
+    pub friend_rect: RectConfig,
     pub secondary_hall_rect: RectConfig,
     pub hall_name_rect: RectConfig,
     pub hall_time_rect: RectConfig,
@@ -262,7 +269,8 @@ pub struct TemplateConfig {
     pub blue_marker: PathBuf,
     pub yellow_marker: PathBuf,
     pub pink_marker: PathBuf,
-    pub enter: PathBuf,
+    #[serde(alias = "enter")]
+    pub friend: PathBuf,
     pub secondary_hall: PathBuf,
     pub invite_view_star: PathBuf,
     pub invite_goto_hall: PathBuf,
@@ -637,6 +645,53 @@ pub struct InviteConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_primary_anchor_config_names_deserialize_to_friend_names() {
+        let screen: ScreenConfig = serde_yaml::from_str(
+            r#"
+expected_width: 1920
+expected_height: 1080
+warn_on_size_mismatch: true
+chat_rect: { x: 0, y: 0, width: 1, height: 1 }
+enter_rect: { x: 115, y: 1018, width: 50, height: 40 }
+secondary_hall_rect: { x: 0, y: 0, width: 1, height: 1 }
+hall_name_rect: { x: 0, y: 0, width: 1, height: 1 }
+hall_time_rect: { x: 0, y: 0, width: 1, height: 1 }
+"#,
+        )
+        .expect("old screen config");
+        assert_eq!(screen.friend_rect.x, 115);
+        let serialized_screen = serde_yaml::to_string(&screen).expect("serialize screen config");
+        assert!(serialized_screen.contains("friend_rect:"));
+        assert!(!serialized_screen.contains("enter_rect:"));
+
+        let templates: TemplateConfig = serde_yaml::from_str(
+            r#"
+blue_marker: blue.png
+yellow_marker: yellow.png
+pink_marker: pink.png
+enter: old-primary.png
+secondary_hall: hall.png
+invite_view_star: view.png
+invite_goto_hall: goto.png
+invite_enter_hall: invite.png
+friend_panel: panel.png
+friend_search_panel: search.png
+friend_more_settings: more.png
+friend_block_chat: block.png
+friend_blacklist: blacklist.png
+friend_confirm: confirm.png
+marker_threshold: 0.9
+"#,
+        )
+        .expect("old template config");
+        assert_eq!(templates.friend, PathBuf::from("old-primary.png"));
+        let serialized_templates =
+            serde_yaml::to_string(&templates).expect("serialize template config");
+        assert!(serialized_templates.contains("friend: old-primary.png"));
+        assert!(!serialized_templates.contains("enter: old-primary.png"));
+    }
 
     #[test]
     fn old_startup_confirm_fields_do_not_override_wonderland_enter_button_defaults() {

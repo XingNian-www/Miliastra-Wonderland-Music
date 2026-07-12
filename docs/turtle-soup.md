@@ -1,6 +1,6 @@
 # 海龟汤
 
-海龟汤是默认关闭的大厅娱乐模块。它与成语接龙共用全局娱乐互斥，同一时间只能运行其中一种玩法；它不进入正式 `PendingTask`，AI 裁决在独立 Worker 中进行，游戏内回复只在正式任务完全空闲时发送。
+海龟汤是默认关闭的大厅娱乐模块。它与成语接龙、斗地主共用全局娱乐互斥，同一时间只能运行其中一种玩法；它不进入正式 `PendingTask`，AI 裁决在独立 Worker 中进行，游戏内回复只在正式任务完全空闲时发送。
 
 ## 游戏命令
 
@@ -54,6 +54,20 @@
 
 题目选中后，程序先把 `id` 原子写入 `turtle_soup.used_state_path`，再开始发送汤面。已经使用的题目永久排除，即使汤面发送失败也不会恢复。程序、Web 和 API 都不提供重置操作；需要重置时只能停机后手动修改使用记录文件。
 
+外部工具可通过 `POST /turtle-soup/questions` 提交已经整理好的单题 JSON：
+
+```json
+{
+  "title": "标题",
+  "surface": "汤面",
+  "bottom": "汤底",
+  "adjudicationNotes": "裁决备注",
+  "enabled": true
+}
+```
+
+主程序按收到写入锁的顺序为题目分配 `soup-0001` 形式的 ID，校验完整题库后原子替换本地 YAML。请求正文上限 64 KiB，沿用 `X-Miliastra-Token` 鉴权且不会写入 HTTP 历史。主程序不负责 AI 改写；配套云崽插件先完成内容整理，再提交最终结构。
+
 ## AI 裁决
 
 海龟汤使用独立的 `turtle_soup.ai` Provider，不复用点歌 AI 或候选歌曲审核，也不启用联网搜索。默认配置使用 DeepSeek 官方 `https://api.deepseek.com/chat/completions` 和 `deepseek-v4-flash`。`thinking_enabled` 可省略且默认 `false`；程序只为模型名以 `deepseek-v4-` 开头的配置发送对应的 `thinking.type=enabled/disabled`。`deepseek-chat` 与 `deepseek-reasoner` 兼容别名将在 2026-07-24 15:59 UTC 弃用，不应作为新配置。其他 OpenAI 兼容 Provider 仍可通过修改 endpoint 和 model 使用。
@@ -102,5 +116,6 @@
 | `/turtle-soup/start` | POST | 从未使用题目中随机开局。 |
 | `/turtle-soup/start?id=...` | POST | 按未使用且已启用的题目 ID 开局。 |
 | `/turtle-soup/end` | POST | 主动结束并在当前大厅公布结算和汤底。 |
+| `/turtle-soup/questions` | POST | 串行追加一条已经整理好的题目并返回 ID 和位置。 |
 
-没有题库上传、在线编辑或使用记录重置接口。
+没有在线编辑、题库替换或使用记录重置接口。

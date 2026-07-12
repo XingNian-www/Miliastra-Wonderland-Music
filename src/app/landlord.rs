@@ -362,6 +362,14 @@ impl LandlordGame {
             .as_ref()
             .is_some_and(|last| last.player != current);
         if can_pass {
+            if !game.players[current].trustee {
+                pass_playing(game, current, now, true);
+                let next = game.players[game.current].name.clone();
+                return LandlordOutcome::public(
+                    "auto-pass",
+                    format!("{}超时，自动过牌；轮到{}", name, next),
+                );
+            }
             let previous = &game
                 .last_play
                 .as_ref()
@@ -1478,6 +1486,53 @@ mod tests {
                 .is_some_and(|item| item.action == "turn-warning")
         );
         assert!(game.tick(now + Duration::from_secs(190), true).is_some());
+    }
+
+    #[test]
+    fn first_timeout_passes_instead_of_spending_a_beating_card() {
+        let now = Instant::now();
+        let config = LandlordConfig {
+            turn_timeout_seconds: 1,
+            trustee_after_timeouts: 2,
+            ..LandlordConfig::default()
+        };
+        let players = vec![
+            Player {
+                hand: vec![Card::new(Rank::Three), Card::new(Rank::Five)],
+                ..Player::new("甲")
+            },
+            Player {
+                hand: vec![Card::new(Rank::Four), Card::new(Rank::Six)],
+                ..Player::new("乙")
+            },
+            Player {
+                hand: vec![Card::new(Rank::Seven)],
+                ..Player::new("丙")
+            },
+        ];
+        let mut game = LandlordGame::with_seed(config, 1);
+        game.state = GameState::Playing(Playing {
+            players,
+            landlord: 0,
+            current: 0,
+            last_play: None,
+            consecutive_passes: 0,
+            timer: ActiveTimer::new(now),
+            warning_sent: false,
+            turns: 0,
+            bombs: 0,
+        });
+        assert_eq!(game.play("甲", "3", now).action, "played");
+
+        let outcome = game
+            .tick(now + Duration::from_secs(1), true)
+            .expect("timeout outcome");
+        assert_eq!(outcome.action, "auto-pass");
+        let GameState::Playing(playing) = &game.state else {
+            panic!("expected playing")
+        };
+        assert_eq!(playing.players[1].hand.len(), 2);
+        assert!(!playing.players[1].trustee);
     }
 
     #[test]

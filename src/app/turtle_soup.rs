@@ -365,20 +365,20 @@ struct TurtleSoupJob {
     question: String,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct TurtleSoupPuzzle {
-    id: String,
+pub(super) struct TurtleSoupPuzzle {
+    pub(super) id: String,
     #[serde(rename = "标题")]
-    title: String,
+    pub(super) title: String,
     #[serde(rename = "汤面")]
-    surface: String,
+    pub(super) surface: String,
     #[serde(rename = "汤底")]
-    bottom: String,
+    pub(super) bottom: String,
     #[serde(rename = "裁决备注")]
-    adjudication_notes: String,
+    pub(super) adjudication_notes: String,
     #[serde(rename = "启用")]
-    enabled: bool,
+    pub(super) enabled: bool,
 }
 
 #[derive(Deserialize)]
@@ -2007,13 +2007,13 @@ fn normalize_player_key(value: &str) -> String {
     normalize_player_display(value).to_ascii_lowercase()
 }
 
-fn load_question_bank(path: &Path) -> Result<Vec<TurtleSoupPuzzle>> {
+pub(super) fn load_question_bank(path: &Path) -> Result<Vec<TurtleSoupPuzzle>> {
     let text = fs::read_to_string(path)
         .with_context(|| format!("读取海龟汤题库失败: {}", path.display()))?;
     parse_question_bank(&text, path)
 }
 
-fn parse_question_bank(text: &str, path: &Path) -> Result<Vec<TurtleSoupPuzzle>> {
+pub(super) fn parse_question_bank(text: &str, path: &Path) -> Result<Vec<TurtleSoupPuzzle>> {
     let file: QuestionBankFile = serde_yaml::from_str(text)
         .with_context(|| format!("解析海龟汤题库失败: {}", path.display()))?;
     let mut questions = match file {

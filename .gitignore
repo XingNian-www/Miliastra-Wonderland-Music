@@ -1,6 +1,7 @@
 /target
 /logs
 /data
+/turtle_soup.yaml
 /models
 /.build
 /dist

@@ -20,6 +20,7 @@ on:
       - THIRD_PARTY_NOTICES.md
       - assets/**
       - config.yaml
+      - turtle_soup.example.yaml
       - src/**
       - vendor/mnn/3.6.0/windows-x64/**
 
@@ -127,6 +128,7 @@ jobs:
           Copy-Item 'assets' $dist -Recurse
           Copy-Item 'models' $dist -Recurse
           Copy-Item 'config.yaml' $dist
+          Copy-Item 'turtle_soup.example.yaml' $dist
           Copy-Item 'README.md' $dist
           Copy-Item 'THIRD_PARTY_NOTICES.md' $dist
 

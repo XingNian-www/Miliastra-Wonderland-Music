@@ -799,6 +799,7 @@ impl AutomationApp {
 
     fn on_entered_new_hall(&self) -> Result<()> {
         log::info!("已进入新大厅，重置命令识别状态");
+        self.abort_entertainment_for_context_loss("邀请流程已进入新大厅");
         self.commands_enabled.store(true, AtomicOrdering::SeqCst);
         self.screen_lock_primed.store(false, AtomicOrdering::SeqCst);
         self.reset_locks_requested
@@ -1410,12 +1411,16 @@ impl AutomationApp {
         )
     }
 
-    fn send_friend_message(&self, username: &str, message: &str) -> Result<bool> {
-        self.send_friend_message_with_state(username, message, true)
+    pub(super) fn send_friend_message(&self, username: &str, message: &str) -> Result<bool> {
+        self.send_friend_message_with_state(username, message, true, false)
+    }
+
+    pub(super) fn send_unique_friend_message(&self, username: &str, message: &str) -> Result<bool> {
+        self.send_friend_message_with_state(username, message, true, true)
     }
 
     fn send_friend_message_keep_open(&self, username: &str, message: &str) -> Result<bool> {
-        self.send_friend_message_with_state(username, message, false)
+        self.send_friend_message_with_state(username, message, false, false)
     }
 
     fn send_friend_message_with_state(
@@ -1423,6 +1428,7 @@ impl AutomationApp {
         username: &str,
         message: &str,
         restore_listener_residency: bool,
+        require_unique_friend: bool,
     ) -> Result<bool> {
         log::info!("好友发言: {} -> {}", username, message);
         let canvas = Canvas {
@@ -1430,7 +1436,11 @@ impl AutomationApp {
             height: self.config.screen.expected_height,
             resize: true,
         };
-        let opened = match self.open_friend_chat(username, &canvas) {
+        let opened = match if require_unique_friend {
+            self.open_unique_friend_chat(username, &canvas)
+        } else {
+            self.open_friend_chat(username, &canvas)
+        } {
             Ok(opened) => opened,
             Err(error) => {
                 let _ = self.restore_listener_residency_after_task("好友发言失败");
@@ -1438,6 +1448,9 @@ impl AutomationApp {
             }
         };
         if !opened {
+            if restore_listener_residency {
+                let _ = self.restore_listener_residency_after_task("好友发言目标未找到");
+            }
             return Ok(false);
         }
         // 发送反馈需要等待当前好友会话的输入框接管焦点；邀请主流程则由下一步 OCR 直接确认。
@@ -1450,6 +1463,47 @@ impl AutomationApp {
         }
         result?;
         Ok(true)
+    }
+
+    fn open_unique_friend_chat(&self, username: &str, canvas: &Canvas) -> Result<bool> {
+        if !self.ensure_secondary_chat_open("打开唯一好友聊天")? {
+            return Ok(false);
+        }
+        let locator = self.ui_locator_with_canvas(canvas.clone(), self.template_poll_ms());
+        let region = locator.region(self.config.invite.friend_list_region.into());
+        let deadline =
+            Instant::now() + Duration::from_millis(self.config.timing.workflow.default_timeout_ms);
+        while Instant::now() < deadline && self.running.load(AtomicOrdering::SeqCst) {
+            let hits = {
+                let engine = self.ocr_engine()?;
+                region.find_text_hits(&engine.engine, username)?
+            };
+            match hits.as_slice() {
+                [hit] => {
+                    locator.click_point(hit.center())?;
+                    workflow_actions::wait(self.config.timing.invite.step_ms);
+                    let frame = locator.capture()?;
+                    let identity = self.secondary_identity_from_frame(&frame.image)?;
+                    let matched = matches!(
+                        identity,
+                        super::chat_listener::SecondaryChatIdentity::Friend(current)
+                            if {
+                                let current = command::normalize_lock_text(&current);
+                                let expected = command::normalize_lock_text(username);
+                                !expected.is_empty()
+                                    && (current.contains(&expected) || expected.contains(&current))
+                            }
+                    );
+                    return Ok(matched);
+                }
+                [] => workflow_actions::wait(locator.poll_ms()),
+                _ => {
+                    log::error!("好友聊天失败: 昵称存在多个匹配结果 {}", username);
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(false)
     }
 
     fn open_friend_chat(&self, username: &str, canvas: &Canvas) -> Result<bool> {

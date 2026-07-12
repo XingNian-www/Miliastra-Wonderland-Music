@@ -154,6 +154,38 @@ impl UiRegion<'_> {
         self.find_any_text(engine, &[expected])
     }
 
+    pub(super) fn find_text_hits(
+        &self,
+        engine: &OcrEngine,
+        expected: &str,
+    ) -> Result<Vec<UiTextHit>> {
+        let target = command::normalize_lock_text(expected);
+        if target.is_empty() {
+            return Ok(Vec::new());
+        }
+        let frame = self.locator.capture()?;
+        let crop = crop_canvas(&frame.image, self.rect)?;
+        let mut hits = Vec::new();
+        for line in recognize_lines(engine, &crop)? {
+            let normalized = command::normalize_lock_text(&line.text);
+            if normalized.is_empty() {
+                continue;
+            }
+            if normalized == target || normalized.contains(&target) || target.contains(&normalized)
+            {
+                hits.push(UiTextHit {
+                    rect: Rect::new(
+                        self.rect.x + line.bbox.x,
+                        self.rect.y + line.bbox.y,
+                        line.bbox.width,
+                        line.bbox.height,
+                    ),
+                });
+            }
+        }
+        Ok(hits)
+    }
+
     pub(super) fn find_any_text(
         &self,
         engine: &OcrEngine,

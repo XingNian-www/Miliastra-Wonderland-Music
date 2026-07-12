@@ -2,7 +2,7 @@
 
 本文专门梳理“启动游戏任务”和“进入千星任务”。当前实现已经删除 BGI 复刻式大流程，改成两个独立状态机：
 
-- `StartGame`：确保游戏进程和窗口存在，完成开门，直到左下角 Enter 模板出现。
+- `StartGame`：确保游戏进程和窗口存在，完成开门，直到派蒙菜单模板出现。
 - `EnterWonderland`：在已有游戏主界面中打开千星奇域，进入大厅后返回一级界面。
 
 `/startup/wonderland` 和启动配置里的“启动并进入千星”都只是把这两个任务按顺序放入待执行任务队列，不是一个绕过主执行器的同步流程。
@@ -45,10 +45,10 @@ stateDiagram-v2
     EnsureGameWindow --> FocusGameWindow: 找到或启动游戏窗口
     FocusGameWindow --> ClickEnterGameText: startup.enter_game=true
     FocusGameWindow --> Done: startup.enter_game=false
-    ClickEnterGameText --> Done: Enter 模板已出现
+    ClickEnterGameText --> Done: 派蒙菜单模板已出现
     ClickEnterGameText --> WaitEnterGameTextGone: 点击 OCR “点击进入”
-    WaitEnterGameTextGone --> WaitPrimaryEnterTemplate: “点击进入”消失
-    WaitPrimaryEnterTemplate --> Done: Enter 模板出现
+    WaitEnterGameTextGone --> WaitPaimonMenuTemplate: “点击进入”消失
+    WaitPaimonMenuTemplate --> Done: 派蒙菜单模板出现
     Done --> [*]
 ```
 
@@ -84,8 +84,8 @@ stateDiagram-v2
 
 如果 `startup.enter_game=true`，进入开门流程：
 
-1. 每轮先在 `screen.enter_rect` 匹配全局 `templates.enter`。
-2. 若命中左下角 Enter 模板，直接认为已经进入一级界面并完成任务。
+1. 每轮先在 `startup.main_ui_region` 匹配 `startup.templates.paimon_menu`。
+2. 若命中派蒙菜单模板，直接认为已经进入主界面并完成任务。
 3. 未命中时，才在 `startup.enter_game_text_region` 中 OCR 固定文本 `点击进入`。
 4. 找到后点击 OCR 文本框中心。
 5. 最长等待 `startup.enter_game_timeout_ms`。
@@ -102,9 +102,9 @@ stateDiagram-v2
 
 这个设计对应“先识别到文字，点击后文字消失，才说明点击进入动作被接受”。
 
-### 等待一级回车模板（WaitPrimaryEnterTemplate）
+### 等待派蒙菜单模板（WaitPaimonMenuTemplate）
 
-文字消失后继续等待全局 `templates.enter` 在 `screen.enter_rect` 出现。检测到左下角 Enter 模板后，认为启动游戏任务完成。
+文字消失后继续等待 `startup.templates.paimon_menu` 在 `startup.main_ui_region` 出现。检测到派蒙菜单模板后，认为启动游戏任务完成。
 
 启动时若游戏已跳过“点击进入”阶段并直接进入一级界面，`ClickEnterGameText` 里的模板检测会先命中，任务不会等待 OCR 超时。
 
@@ -208,7 +208,7 @@ stateDiagram-v2
 | `startup.enter_wonderland` | 是否自动入队进入千星任务。 |
 | `startup.exe_path` | 启动 exe 文件或所在目录。 |
 | `startup.enter_game_text_region` | OCR “点击进入”的区域。 |
-| `screen.enter_rect` / `templates.enter` | 启动游戏完成信号。 |
+| `startup.main_ui_region` / `startup.templates.paimon_menu` | 启动游戏完成信号。 |
 | `startup.wonderland_close_region` | 千星主页右上角关闭按钮搜索区域。 |
 | `startup.templates.wonderland_enter_button` | “前往大厅”按钮模板。 |
 | `startup.wonderland_enter_button_region` | “前往大厅”按钮搜索区域。 |
@@ -224,6 +224,6 @@ stateDiagram-v2
 - 启动游戏任务不负责进入千星。
 - 进入千星任务不负责启动游戏；找不到窗口时直接失败。
 - `/startup/wonderland` 只是顺序入队两个任务。
-- 开门成功条件不是白屏结束，而是左下角 Enter 模板出现。
+- 开门成功条件不是白屏结束，而是派蒙菜单模板出现。
 - 进入千星成功条件是点击“前往大厅”按钮后，该按钮消失且原区域像素稳定。
 - 进入千星完成后只返回千星内一级界面，不自动退出千星，不清空后续待执行任务。

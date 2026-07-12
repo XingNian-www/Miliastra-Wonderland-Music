@@ -17,6 +17,9 @@
 | --- | --- |
 | [聊天命令进入队列](chat-command-ingestion.md) | OCR 消息如何变成命令，哪些来源能触发业务。 |
 | [成语接龙](idiom-chain.md) | 成语词库、合法性规则、命令和配置如何工作。 |
+| [海龟汤](turtle-soup.md) | 题库、永久使用记录、AI 裁决、分段发送和 Web 控制如何工作。 |
+| [DeepSeek 海龟汤 API 调研](research/deepseek-turtle-soup-api.md) | DeepSeek 官方 endpoint、模型、JSON Output、思考模式和采样参数如何配置。 |
+| [DeepSeek 海龟汤稳定性评测](research/deepseek-turtle-soup-evaluation.md) | 553 次真实请求如何筛选提示词、思考模式和最大输出 Token。 |
 | [二级聊天监听](secondary-chat-listener.md) | 二级界面如何监听大厅和好友私聊，红点、气泡、恢复与回退如何协作。 |
 | [OCR 与 UI 检测](ocr-ui-detection-flow.md) | 主扫描循环、聊天切块、OCR、模板匹配和耗时日志如何工作。 |
 | [UI 自动化与原子动作](ui-automation-atoms.md) | 点击、按键、粘贴、模板等待、OCR 点击和像素稳定如何组合。 |

@@ -51,7 +51,7 @@ flowchart TD
 
 ## 路由表
 
-所有普通 API 都在 `ROUTES` 表里声明：
+普通查询 API 在 `ROUTES` 表里声明；需要 JSON 请求体的接口放在独立的 `BODY_ROUTES` 表中，避免所有查询 handler 都承担无关的正文参数：
 
 | 字段 | 含义 |
 | --- | --- |
@@ -60,7 +60,7 @@ flowchart TD
 | `mutating` | 是否会改变状态。为真时必须使用 POST。 |
 | `handler` | 同步处理函数。 |
 
-`/screenshot` 是特殊路由，不在 `ROUTES` 表里，因为它直接返回 JPEG bytes。`/tools` 是内嵌高级页；工具 API 仍在 `ROUTES` 表中。
+`/turtle-soup/questions` 是当前唯一的正文路由，正文上限 64 KiB。`/screenshot` 是特殊路由，因为它直接返回 JPEG bytes。`/tools` 是内嵌高级页；工具 API 仍在 `ROUTES` 表中。
 
 `/` 返回内嵌的 `page.html`。
 
@@ -146,8 +146,9 @@ HTTP 层只接受 `GET`、`POST`、`OPTIONS`。
 | `POST /turtle-soup/start` | 从启用且未使用的题目中随机开局。 |
 | `POST /turtle-soup/start?id=...` | 按启用且未使用的题目 ID 开局。 |
 | `POST /turtle-soup/end` | 主动结束并在当前大厅分段公布结算和汤底。 |
+| `POST /turtle-soup/questions` | 接收一条已经整理好的 JSON 题目，串行分配 ID 并原子追加到本地题库。 |
 
-Web 不提供题库上传、在线编辑、汤底预览或已使用记录重置。
+题目提交正文包含 `title`、`surface`、`bottom`，可选 `adjudicationNotes` 和 `enabled`。主程序不调用 AI 优化题目；调用方负责提交最终结构。接口沿用 Web 访问令牌，历史记录不会保存请求正文或汤底。Web 不提供在线编辑、汤底预览或已使用记录重置。
 
 ### 正式任务生命周期
 

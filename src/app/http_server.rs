@@ -7,8 +7,8 @@ use std::time::SystemTime;
 
 use anyhow::{Context, Result, anyhow};
 use axum::Router;
-use axum::body::Body;
-use axum::extract::State;
+use axum::body::{Body, Bytes};
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use axum::response::Response;
@@ -40,9 +40,11 @@ use super::queue::{PersistentQueue, QueueItem};
 use super::runtime_state::PersistentRuntimeState;
 use super::task_tracker::TaskTrackerShared;
 use super::turtle_soup::TurtleSoupService;
+use super::turtle_soup_bank::{TurtleSoupBankStore, TurtleSoupSubmission};
 use super::web_tools::{WebToolRequest, WebToolShared, WebToolTemplate};
 
 const MAX_ACTIVE_CONNECTIONS: usize = 32;
+const MAX_JSON_BODY_BYTES: usize = 64 * 1024;
 const PAGE: &str = include_str!("page.html");
 const TOOLS_PAGE: &str = include_str!("tools.html");
 
@@ -55,6 +57,18 @@ struct RouteSpec {
     mutating: bool,
     handler: RouteHandler,
 }
+
+type BodyRouteHandler = fn(&[u8], &HttpSharedState) -> std::result::Result<String, AppError>;
+
+struct BodyRouteSpec {
+    path: &'static str,
+    handler: BodyRouteHandler,
+}
+
+const BODY_ROUTES: &[BodyRouteSpec] = &[BodyRouteSpec {
+    path: "/turtle-soup/questions",
+    handler: turtle_soup_questions_route,
+}];
 
 const SPECIAL_ROUTES: &[&str] = &["/screenshot"];
 const ROUTES: &[RouteSpec] = &[
@@ -404,6 +418,7 @@ pub struct HttpSharedState {
     pub monitor: MonitorShared,
     pub chat_listener: ChatListenerShared,
     turtle_soup: TurtleSoupService,
+    turtle_soup_bank: TurtleSoupBankStore,
     pub history: Arc<Mutex<VecDeque<HistoryItem>>>,
     pub active_connections: Arc<AtomicUsize>,
     pending: Arc<(Mutex<VecDeque<super::TrackedPendingTask>>, Condvar)>,
@@ -430,6 +445,7 @@ struct Request {
     path: String,
     query: Vec<(String, String)>,
     headers: HeaderMap,
+    body: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -459,6 +475,8 @@ impl HttpSharedState {
         web_tools: WebToolShared,
         latest_frame: Arc<Mutex<Option<Arc<image::DynamicImage>>>>,
     ) -> Self {
+        let turtle_soup_bank =
+            TurtleSoupBankStore::new(config.turtle_soup.question_bank_path.clone());
         Self {
             config,
             queue,
@@ -466,6 +484,7 @@ impl HttpSharedState {
             monitor,
             chat_listener,
             turtle_soup,
+            turtle_soup_bank,
             history: Arc::new(Mutex::new(VecDeque::new())),
             active_connections: Arc::new(AtomicUsize::new(0)),
             pending,
@@ -519,6 +538,7 @@ fn run_server(listener: TcpListener, state: HttpSharedState) {
         };
         let app = Router::new()
             .fallback(any(axum_entry))
+            .layer(DefaultBodyLimit::max(MAX_JSON_BODY_BYTES))
             .with_state(Arc::new(state));
         if let Err(error) = axum::serve(listener, app).await {
             log::error!("HTTP/Web 面板运行失败: {error}");
@@ -531,6 +551,7 @@ async fn axum_entry(
     method: Method,
     uri: Uri,
     headers: HeaderMap,
+    body: Bytes,
 ) -> Response {
     let active = state.active_connections.fetch_add(1, Ordering::SeqCst);
     let _guard = ActiveConnectionGuard {
@@ -543,7 +564,7 @@ async fn axum_entry(
             Vec::new(),
         );
     }
-    let request = request_from_axum(method, uri, headers);
+    let request = request_from_axum(method, uri, headers, body);
     let fallback_host = state.config.http.host.clone();
     let fallback_port = state.config.http.port;
     let state_for_handler = Arc::clone(&state);
@@ -572,7 +593,7 @@ impl Drop for ActiveConnectionGuard {
     }
 }
 
-fn request_from_axum(method: Method, uri: Uri, headers: HeaderMap) -> Request {
+fn request_from_axum(method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> Request {
     let query = uri
         .query()
         .map(|query| {
@@ -586,6 +607,7 @@ fn request_from_axum(method: Method, uri: Uri, headers: HeaderMap) -> Request {
         path: uri.path().to_string(),
         query,
         headers,
+        body: body.to_vec(),
     }
 }
 
@@ -647,7 +669,18 @@ fn handle_request(
         return screenshot_response(&request, state);
     }
 
-    let routed = route(&request.path, &request.query, state);
+    let routed = if let Some(spec) = body_route_spec(&request.path) {
+        if request.body.len() > MAX_JSON_BODY_BYTES {
+            Err(AppError {
+                status: 413,
+                message: format!("JSON请求体不能超过{}字节", MAX_JSON_BODY_BYTES),
+            })
+        } else {
+            (spec.handler)(&request.body, state)
+        }
+    } else {
+        route(&request.path, &request.query, state)
+    };
     let (body, ok) = match routed {
         Ok(body) => (body, true),
         Err(error) => {
@@ -692,10 +725,15 @@ fn route_spec(path: &str) -> Option<&'static RouteSpec> {
     ROUTES.iter().find(|route| route.path == path)
 }
 
+fn body_route_spec(path: &str) -> Option<&'static BodyRouteSpec> {
+    BODY_ROUTES.iter().find(|route| route.path == path)
+}
+
 fn known_routes() -> String {
     ROUTES
         .iter()
         .map(|route| route.path)
+        .chain(BODY_ROUTES.iter().map(|route| route.path))
         .chain(SPECIAL_ROUTES.iter().copied())
         .collect::<Vec<_>>()
         .join(", ")
@@ -1334,6 +1372,28 @@ fn turtle_soup_end_route(
         "turtleSoup": state.turtle_soup.snapshot(),
     }))
     .map_err(internal_error)
+}
+
+fn turtle_soup_questions_route(
+    body: &[u8],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let submission =
+        serde_json::from_slice::<TurtleSoupSubmission>(body).map_err(|error| AppError {
+            status: 400,
+            message: format!("海龟汤提交JSON无效: {error}"),
+        })?;
+    if submission.title.trim().is_empty()
+        || submission.surface.trim().is_empty()
+        || submission.bottom.trim().is_empty()
+    {
+        return Err(bad_request("海龟汤标题、汤面和汤底不能为空"));
+    }
+    let receipt = state
+        .turtle_soup_bank
+        .append(submission)
+        .map_err(internal_error)?;
+    serde_json::to_string(&receipt).map_err(internal_error)
 }
 
 fn tool_task_route(
@@ -2445,7 +2505,7 @@ fn current_time_text() -> String {
 }
 
 fn is_json_route(path: &str) -> bool {
-    route_spec(path).is_some_and(|route| route.json)
+    body_route_spec(path).is_some() || route_spec(path).is_some_and(|route| route.json)
 }
 
 fn enforce_method(
@@ -2469,7 +2529,7 @@ fn enforce_method(
 }
 
 fn is_mutating_route(path: &str) -> bool {
-    route_spec(path).is_some_and(|route| route.mutating)
+    body_route_spec(path).is_some() || route_spec(path).is_some_and(|route| route.mutating)
 }
 
 fn status_code(status: u16) -> StatusCode {
@@ -2743,11 +2803,45 @@ mod tests {
             assert!(is_mutating_route(route));
             assert!(is_json_route(route));
         }
+        assert!(is_mutating_route("/turtle-soup/questions"));
+        assert!(is_json_route("/turtle-soup/questions"));
 
         let state = test_state();
         let monitor: Value = serde_json::from_str(&monitor_json(&state).unwrap()).unwrap();
         assert_eq!(monitor["turtleSoup"]["enabled"], false);
         assert_eq!(monitor["turtleSoup"]["phase"], "idle");
+    }
+
+    #[test]
+    fn turtle_soup_question_submission_appends_in_request_order() {
+        let state = test_state();
+        let first = r#"{"title":"第一题","surface":"第一面","bottom":"第一底"}"#;
+        let second =
+            r#"{"title":"第二题","surface":"第二面","bottom":"第二底","adjudicationNotes":"备注"}"#;
+
+        let first: Value = serde_json::from_str(
+            &turtle_soup_questions_route(first.as_bytes(), &state).expect("first submission"),
+        )
+        .expect("first receipt");
+        let second: Value = serde_json::from_str(
+            &turtle_soup_questions_route(second.as_bytes(), &state).expect("second submission"),
+        )
+        .expect("second receipt");
+
+        assert_eq!(first["id"], "soup-0001");
+        assert_eq!(first["position"], 1);
+        assert_eq!(second["id"], "soup-0002");
+        assert_eq!(second["position"], 2);
+    }
+
+    #[test]
+    fn turtle_soup_question_submission_rejects_invalid_json() {
+        let state = test_state();
+        let error = turtle_soup_questions_route(r#"{"title":"缺少内容"}"#.as_bytes(), &state)
+            .expect_err("invalid submission");
+
+        assert_eq!(error.status, 400);
+        assert!(!state.config.turtle_soup.question_bank_path.exists());
     }
 
     #[test]
@@ -2927,6 +3021,7 @@ mod tests {
             path: "/monitor".to_string(),
             query: Vec::new(),
             headers: HeaderMap::new(),
+            body: Vec::new(),
         };
 
         assert!(requires_access_token(&config.http, &request.path));
@@ -3389,6 +3484,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("test dir");
         config.state.queue_path = dir.join("queue.json");
         config.state.runtime_state_path = dir.join("runtime-state.json");
+        config.turtle_soup.question_bank_path = dir.join("turtle-soup.yaml");
 
         let queue = Arc::new(Mutex::new(
             PersistentQueue::load(config.state.queue_path.clone(), config.queue.max_size)

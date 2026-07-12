@@ -59,13 +59,13 @@ flowchart TD
 
 `detect_ui_state()` 按短路顺序检测：
 
-1. 在 `screen.enter_rect` 里找 Enter 模板。
+1. 在 `screen.friend_rect` 里找好友按钮模板。
 2. 在 `screen.secondary_hall_rect` 里找二级大厅/面板模板。
 3. 在 `screen.chat_rect` 里数蓝/黄/粉聊天标记。
 
 返回三类状态：
 
-- `primary:enter`：左下角 Enter 模板可见，认为在一级聊天界面。
+- `primary:friend`：左下角好友按钮模板可见，认为在一级聊天界面。
 - `primary:marker`：聊天标记可见，也认为在一级聊天界面。
 - `secondary:hall`：二级大厅/面板模板可见。
 - `unknown`：以上都没有命中。

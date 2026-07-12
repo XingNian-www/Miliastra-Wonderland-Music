@@ -7,6 +7,7 @@ use ocr_rs::OcrEngine;
 use serde::Serialize;
 
 use super::ResolvedTemplateArgs;
+use super::chat_output::redacted_chat_text;
 use super::config::RectConfig;
 use super::geometry::{Rect, clamp_i32, crop_canvas};
 use super::monitor::{MonitorShared, OcrSnapshot};
@@ -117,7 +118,13 @@ pub(super) fn recognize_prepared_chat(
             prepared.markers.len(),
             messages
                 .iter()
-                .map(|message| format!("[{}] {}", message.message_type, message.text))
+                .map(|message| {
+                    format!(
+                        "[{}] {}",
+                        message.message_type,
+                        redacted_chat_text(&message.text)
+                    )
+                })
                 .collect(),
             prepared.marker_ms,
             ocr_ms,
@@ -152,7 +159,7 @@ fn format_scan_result(messages: &[ChatMessage]) -> String {
     messages
         .iter()
         .map(|message| {
-            let text = compact_log_text(&message.text);
+            let text = compact_log_text(redacted_chat_text(&message.text));
             format!("[{}] {}", message.message_type, text)
         })
         .collect::<Vec<_>>()

@@ -23,7 +23,7 @@ enum GameStartupStep {
     FocusGameWindow,
     ClickEnterGameText,
     WaitEnterGameTextGone,
-    WaitPrimaryEnterTemplate,
+    WaitPaimonMenuTemplate,
     Done,
 }
 
@@ -40,7 +40,7 @@ impl GameStartupStep {
             Self::FocusGameWindow => "聚焦游戏窗口",
             Self::ClickEnterGameText => "点击进入入口文字",
             Self::WaitEnterGameTextGone => "等待进入入口文字消失",
-            Self::WaitPrimaryEnterTemplate => "等待一级界面 Enter 模板",
+            Self::WaitPaimonMenuTemplate => "等待派蒙菜单模板",
             Self::Done => "完成",
         }
     }
@@ -120,10 +120,10 @@ where
             GameStartupStep::WaitEnterGameTextGone => {
                 let deadline = enter_game_deadline.expect("进入游戏文字点击步骤应该先设置超时时间");
                 wait_enter_game_text_gone(config, engine, &locator, should_continue, deadline)?;
-                GameStartupStep::WaitPrimaryEnterTemplate
+                GameStartupStep::WaitPaimonMenuTemplate
             }
-            GameStartupStep::WaitPrimaryEnterTemplate => {
-                wait_primary_enter_template(config, &locator, should_continue)?;
+            GameStartupStep::WaitPaimonMenuTemplate => {
+                wait_paimon_menu_template(config, &locator, should_continue)?;
                 on_window_detection_reset("启动游戏流程进入游戏完成");
                 GameStartupStep::Done
             }
@@ -223,9 +223,9 @@ where
         if !should_continue() {
             bail!("启动游戏流程已取消");
         }
-        if primary_enter_template_visible(config, locator)? {
+        if paimon_menu_template_visible(config, locator)? {
             log::info!(
-                "启动游戏流程: 已检测到左下角 Enter 模板，跳过点击 {} 并进入游戏完成",
+                "启动游戏流程: 已检测到派蒙菜单模板，跳过点击 {} 并进入游戏完成",
                 ENTER_GAME_OCR_TEXT
             );
             return Ok(EnterGameEntryResult::PrimaryUiDetected);
@@ -251,10 +251,13 @@ where
     )
 }
 
-fn primary_enter_template_visible(config: &AppConfig, locator: &UiLocator) -> Result<bool> {
+fn paimon_menu_template_visible(config: &AppConfig, locator: &UiLocator) -> Result<bool> {
     Ok(locator
-        .region(config.screen.enter_rect.into())
-        .find_template_with_threshold(&config.templates.enter, config.templates.marker_threshold)?
+        .region(config.startup.main_ui_region.into())
+        .find_template_with_threshold(
+            &config.startup.templates.paimon_menu,
+            config.startup.template_threshold,
+        )?
         .is_some())
 }
 
@@ -286,7 +289,7 @@ where
             continue;
         }
         log::info!(
-            "启动游戏流程: {} 文字已消失，开始等待 Enter 模板",
+            "启动游戏流程: {} 文字已消失，开始等待派蒙菜单模板",
             ENTER_GAME_OCR_TEXT
         );
         return Ok(());
@@ -294,7 +297,7 @@ where
     bail!("等待 {} 文字消失超时", ENTER_GAME_OCR_TEXT)
 }
 
-fn wait_primary_enter_template<F>(
+fn wait_paimon_menu_template<F>(
     config: &AppConfig,
     locator: &UiLocator,
     should_continue: &mut F,
@@ -307,13 +310,13 @@ where
         if !should_continue() {
             bail!("启动游戏流程已取消");
         }
-        if primary_enter_template_visible(config, locator)? {
-            log::info!("启动游戏流程: 已检测到左下角 Enter 模板，进入游戏完成");
+        if paimon_menu_template_visible(config, locator)? {
+            log::info!("启动游戏流程: 已检测到派蒙菜单模板，进入游戏完成");
             return Ok(());
         }
         sleep(Duration::from_millis(locator.poll_ms()));
     }
-    bail!("等待左下角 Enter 模板超时")
+    bail!("等待派蒙菜单模板超时")
 }
 
 fn resolve_game_path(config: &AppConfig) -> Result<PathBuf> {

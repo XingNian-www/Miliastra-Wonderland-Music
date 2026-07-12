@@ -46,6 +46,7 @@ mod app {
     mod template_match;
     mod tui;
     mod turtle_soup;
+    mod turtle_soup_bank;
     mod ui_locator;
     mod ui_state;
     mod web_tools;
@@ -942,43 +943,7 @@ mod app {
         }
 
         fn start_command_executor(&self) -> thread::JoinHandle<()> {
-            let mut executor = Self {
-                config: self.config.clone(),
-                runtime_state: self.runtime_state.clone(),
-                entertainment: self.entertainment.clone(),
-                idiom_chain: self.idiom_chain.clone(),
-                landlord: self.landlord.clone(),
-                turtle_soup: self.turtle_soup.clone(),
-                deferred_chat: self.deferred_chat.clone(),
-                queue: self.queue.clone(),
-                song_dedup_history: self.song_dedup_history.clone(),
-                player: self.player.clone(),
-                ai: self.ai.clone(),
-                song_review: self.song_review.clone(),
-                chat_output: self.chat_output.clone(),
-                ocr_engine: self.ocr_engine.clone(),
-                web_tool_ocr_engine: self.web_tool_ocr_engine.clone(),
-                latest_frame: self.latest_frame.clone(),
-                locks: CommandLockState::default(),
-                pending: self.pending.clone(),
-                task_tracker: self.task_tracker.clone(),
-                decision_control: self.decision_control.clone(),
-                web_tools: self.web_tools.clone(),
-                window_detection_signal: self.window_detection_signal.clone(),
-                screen_lock_primed: self.screen_lock_primed.clone(),
-                reset_locks_requested: self.reset_locks_requested.clone(),
-                invite_executed_seqs: self.invite_executed_seqs.clone(),
-                moderation_workflows: self.moderation_workflows.clone(),
-                commands_enabled: self.commands_enabled.clone(),
-                idle_exit: self.idle_exit.clone(),
-                running: self.running.clone(),
-                paused: self.paused.clone(),
-                command_executing: self.command_executing.clone(),
-                song_command_executing: self.song_command_executing.clone(),
-                console_reply_context: self.console_reply_context.clone(),
-                chat_listener: self.chat_listener.clone(),
-                monitor: self.monitor.clone(),
-            };
+            let mut executor = self.clone_for_background_task();
             thread::spawn(move || {
                 log::info!("命令执行线程已启动");
                 if let Err(error) = executor.run_pending_command_loop() {
@@ -1248,43 +1213,7 @@ mod app {
         }
 
         fn start_playback_monitor(&self) -> thread::JoinHandle<()> {
-            let mut monitor = Self {
-                config: self.config.clone(),
-                runtime_state: self.runtime_state.clone(),
-                entertainment: self.entertainment.clone(),
-                idiom_chain: self.idiom_chain.clone(),
-                landlord: self.landlord.clone(),
-                turtle_soup: self.turtle_soup.clone(),
-                deferred_chat: self.deferred_chat.clone(),
-                queue: self.queue.clone(),
-                song_dedup_history: self.song_dedup_history.clone(),
-                player: self.player.clone(),
-                ai: self.ai.clone(),
-                song_review: self.song_review.clone(),
-                chat_output: self.chat_output.clone(),
-                ocr_engine: self.ocr_engine.clone(),
-                web_tool_ocr_engine: self.web_tool_ocr_engine.clone(),
-                latest_frame: self.latest_frame.clone(),
-                locks: CommandLockState::default(),
-                pending: self.pending.clone(),
-                task_tracker: self.task_tracker.clone(),
-                decision_control: self.decision_control.clone(),
-                web_tools: self.web_tools.clone(),
-                window_detection_signal: self.window_detection_signal.clone(),
-                screen_lock_primed: self.screen_lock_primed.clone(),
-                reset_locks_requested: self.reset_locks_requested.clone(),
-                invite_executed_seqs: self.invite_executed_seqs.clone(),
-                moderation_workflows: self.moderation_workflows.clone(),
-                commands_enabled: self.commands_enabled.clone(),
-                idle_exit: self.idle_exit.clone(),
-                running: self.running.clone(),
-                paused: self.paused.clone(),
-                command_executing: self.command_executing.clone(),
-                song_command_executing: self.song_command_executing.clone(),
-                console_reply_context: self.console_reply_context.clone(),
-                chat_listener: self.chat_listener.clone(),
-                monitor: self.monitor.clone(),
-            };
+            let mut monitor = self.clone_for_background_task();
             thread::spawn(move || {
                 log::info!("播放监控线程已启动");
                 monitor.run_playback_monitor_loop();

@@ -2,7 +2,7 @@
 # 坐标沿用旧脚本习惯：以游戏客户区左上角为原点，按 1920x1080 有效画面写坐标
 
 # 配置版本；程序启动时会把旧版本配置迁移到当前模板
-config_version: 22
+config_version: 23
 
 window:
   # 目标游戏进程名，按进程文件名匹配，大小写不敏感；多个进程名可用逗号分隔
@@ -31,12 +31,12 @@ screen:
     y: 879
     width: 416
     height: 143
-  # 一级聊天界面左下角回车按钮模板检测区域
-  enter_rect:
-    x: 60
-    y: 1015
-    width: 120
-    height: 55
+  # 一级聊天界面左下角好友按钮模板检测区域（游戏客户区坐标，不含标题栏）
+  friend_rect:
+    x: 115
+    y: 1018
+    width: 50
+    height: 40
   # 二级大厅/面板界面模板检测区域
   secondary_hall_rect:
     x: 10
@@ -206,8 +206,8 @@ templates:
   yellow_marker: assets/chat-marker-yellow.png
   # 粉色聊天标志模板，用于识别好友私聊命令
   pink_marker: assets/chat-marker-pink.png
-  # 一级聊天界面的回车按钮模板
-  enter: assets/ui-primary-enter.png
+  # 一级聊天界面的好友按钮模板
+  friend: assets/ui-primary-friend.png
   # 二级大厅/面板界面模板
   secondary_hall: assets/ui-secondary-hall.png
   # 邀请流程里的“查看千星”按钮模板
@@ -363,7 +363,7 @@ song_dedup:
 idiom_chain:
   # 是否启用项目内置成语词库的接龙功能；词库位于 assets/idioms.txt，并随发布包携带
   enabled: true
-  # 记住最近多少个成语，用于防止重复；超出后较早的成语可以再次使用
+  # 最多保留多少个最近成语用于会话历史；本局完整已用集合始终禁止重复
   history_limit: 200
   # 多久无人接词就自动结束本局；0 表示不超时，单位秒
   idle_timeout_seconds: 300
@@ -371,6 +371,65 @@ idiom_chain:
   allow_consecutive_player: false
   # false 时仅开局玩家可使用 @接龙 结束
   allow_anyone_stop: false
+
+landlord:
+  # 三名好友参与的单局斗地主娱乐模块
+  enabled: true
+  # 等待三人组局的最长时间
+  lobby_timeout_seconds: 120
+  # 每名玩家的出牌时间
+  turn_timeout_seconds: 90
+  # 连续超时多少次后进入自动托管
+  trustee_after_timeouts: 2
+  # 好友私聊 @手牌 的单人查询冷却
+  hand_cooldown_seconds: 10
+
+turtle_soup:
+  # 海龟汤娱乐模块默认关闭；启用前必须准备正式题库并配置独立 AI Provider
+  enabled: false
+  # 正式题库由使用者维护，不随仓库提交；格式参考 turtle_soup.example.yaml
+  question_bank_path: turtle_soup.yaml
+  # 永久已使用题目记录；程序不提供重置接口，只能手动修改此文件
+  used_state_path: data/turtle-soup-used.json
+  # 进行中多久没有新问题就自动结束，单位秒
+  idle_timeout_seconds: 600
+  # 单局最长时间，单位秒
+  max_session_seconds: 3600
+  # AI 同时裁决的最大请求数
+  max_concurrency: 4
+  # 除正在裁决外，最多等待多少条问题
+  max_pending: 32
+  # 单个昵称的一份批量长答案最多暂存多少段；每段仍受游戏聊天长度限制
+  batch_max_parts: 32
+  # 昵称 OCR 必须连续一致多少次才确认发言者；同一问题下仅有一个字符差异的昵称视为 OCR 变体；小于 1 时按 1 处理
+  nickname_stable_count: 2
+  # 正文 OCR 必须连续一致多少次才暂存、提交或送入 AI 裁决；小于 1 时按 1 处理
+  content_stable_count: 2
+  # 单次 AI 请求超时，单位秒
+  request_timeout_seconds: 20
+  # 单次裁决请求失败后的重试次数；实际最多请求 retry_count + 1 次
+  retry_count: 2
+  # AI 请求重试间隔，单位毫秒
+  retry_delay_ms: 500
+  # 附加在固定裁决提示词后的房间规则；不要要求模型输出自由解释或汤底
+  custom_prompt: |
+    裁决备注若以“主持裁决：问题=结果”的形式明确列出标准问法，语义等价的玩家问题优先遵循该结果。
+    对裁决备注没有列出的问法，严格使用内置的互斥裁决协议，只判断本次问题，不自行放宽“相容近似”或“完全正确”的范围。
+  # 海龟汤默认使用 DeepSeek 官方 API，不启用联网搜索；也可改成其他 OpenAI 兼容 Provider
+  ai:
+    # DeepSeek 官方完整 Chat Completions 地址
+    endpoint: "https://api.deepseek.com/chat/completions"
+    # 填写 DeepSeek API Key；不要提交到 Git
+    api_key: ""
+    # 官方长期模型；程序会为 deepseek-v4-* 显式关闭思考模式
+    # 不建议使用将在 2026-07-24 15:59 UTC 弃用的 deepseek-chat/deepseek-reasoner 别名
+    model: "deepseek-v4-flash"
+    # 是否开启 DeepSeek V4 思考模式；可省略，默认 false
+    # 开启后程序不发送 temperature，建议同时提高 max_tokens
+    thinking_enabled: false
+    # 单次裁决允许生成的最大 Token；可省略，默认 256
+    # 非思考模式 256 足够；思考模式建议从 1024 起测试，再按截断情况提高
+    max_tokens: 256
 
 ai:
   # AI 供应商：mimo/openai/deepseek/custom
@@ -473,7 +532,7 @@ startup:
   wonderland_confirm_absent_timeout_ms: 60000
   # “前往大厅”按钮消失后等待该区域像素稳定的最长时间，单位毫秒
   wonderland_confirm_stable_timeout_ms: 60000
-  # 启动游戏结束时等待左下角 Enter 模板的最长时间，单位毫秒
+  # 启动游戏结束时等待派蒙菜单模板的最长时间，单位毫秒
   final_primary_timeout_ms: 120000
   # 启动流程 OCR/截图轮询间隔，单位毫秒
   poll_ms: 1000
@@ -485,7 +544,7 @@ startup:
   template_threshold: 0.9
   # 千星“前往大厅”按钮模板匹配阈值；旧配置中的 template_threshold 不影响该按钮
   wonderland_enter_button_threshold: 0.9
-  # 进入千星流程模板资源；启动游戏完成判断复用全局 templates.enter
+  # 进入千星流程模板资源；启动游戏完成判断使用 paimon_menu
   templates:
     # 千星“前往大厅”按钮模板
     wonderland_enter_button: assets/startup-confirm-black.png

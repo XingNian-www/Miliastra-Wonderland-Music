@@ -10,12 +10,14 @@ pub const DEFAULT_CAPACITY: usize = 32;
 pub enum EnqueueOutcome {
     Added,
     DroppedMessage,
+    Rejected,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeferredChatTarget {
     Primary,
     SecondaryCurrentHall,
+    CurrentHall,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -24,9 +26,135 @@ pub struct DeferredChatMessage {
     pub target: DeferredChatTarget,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TurtleSoupDeliveryPurpose {
+    Opening,
+    SurfaceRepeat,
+    Judgment,
+    Settlement,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TurtleSoupDelivery {
+    pub generation: u64,
+    pub purpose: TurtleSoupDeliveryPurpose,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeferredChatBatch {
+    messages: VecDeque<String>,
+    pub target: DeferredChatTarget,
+    pub turtle_soup: TurtleSoupDelivery,
+    max_attempts: u8,
+    current_attempts: u8,
+    protected: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BatchFailureOutcome {
+    Retry,
+    Exhausted,
+}
+
+impl DeferredChatBatch {
+    pub fn new(
+        messages: Vec<String>,
+        target: DeferredChatTarget,
+        turtle_soup: TurtleSoupDelivery,
+        max_attempts: u8,
+        protected: bool,
+    ) -> Result<Self> {
+        if messages.is_empty() {
+            return Err(anyhow!("延迟聊天分段批次不能为空"));
+        }
+        Ok(Self {
+            messages: messages.into(),
+            target,
+            turtle_soup,
+            max_attempts: max_attempts.max(1),
+            current_attempts: 0,
+            protected,
+        })
+    }
+
+    pub fn remaining_texts(&self) -> Vec<&str> {
+        self.messages.iter().map(String::as_str).collect()
+    }
+
+    pub fn mark_sent(&mut self, count: usize) -> Result<bool> {
+        if count > self.messages.len() {
+            return Err(anyhow!(
+                "延迟聊天批次成功数量越界: sent={} remaining={}",
+                count,
+                self.messages.len()
+            ));
+        }
+        if count > 0 {
+            self.messages.drain(..count);
+            self.current_attempts = 0;
+        }
+        Ok(self.messages.is_empty())
+    }
+
+    pub fn mark_current_failed(&mut self) -> BatchFailureOutcome {
+        self.current_attempts = self.current_attempts.saturating_add(1);
+        if self.current_attempts >= self.max_attempts {
+            BatchFailureOutcome::Exhausted
+        } else {
+            BatchFailureOutcome::Retry
+        }
+    }
+
+    pub fn current_attempt(&self) -> u8 {
+        self.current_attempts.saturating_add(1)
+    }
+
+    pub fn max_attempts(&self) -> u8 {
+        self.max_attempts
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeferredChatItem {
+    Message(DeferredChatMessage),
+    Batch(DeferredChatBatch),
+}
+
+impl DeferredChatItem {
+    pub fn target(&self) -> DeferredChatTarget {
+        match self {
+            Self::Message(message) => message.target,
+            Self::Batch(batch) => batch.target,
+        }
+    }
+
+    fn protected(&self) -> bool {
+        matches!(self, Self::Batch(batch) if batch.protected)
+    }
+
+    fn critical(&self) -> bool {
+        matches!(self, Self::Batch(batch) if matches!(
+            batch.turtle_soup.purpose,
+            TurtleSoupDeliveryPurpose::Opening | TurtleSoupDeliveryPurpose::Settlement
+        ))
+    }
+}
+
+impl From<DeferredChatMessage> for DeferredChatItem {
+    fn from(message: DeferredChatMessage) -> Self {
+        Self::Message(message)
+    }
+}
+
+impl From<DeferredChatBatch> for DeferredChatItem {
+    fn from(batch: DeferredChatBatch) -> Self {
+        Self::Batch(batch)
+    }
+}
+
 #[derive(Clone)]
 pub struct DeferredChatQueue {
-    inner: Arc<(Mutex<VecDeque<DeferredChatMessage>>, Condvar)>,
+    inner: Arc<(Mutex<VecDeque<DeferredChatItem>>, Condvar)>,
     capacity: usize,
 }
 
@@ -38,60 +166,73 @@ impl DeferredChatQueue {
         }
     }
 
-    pub fn enqueue(&self, message: DeferredChatMessage) -> Result<EnqueueOutcome> {
+    pub fn enqueue(&self, item: impl Into<DeferredChatItem>) -> Result<EnqueueOutcome> {
         let (lock, cvar) = &*self.inner;
         let mut queue = lock
             .lock()
-            .map_err(|_| anyhow!("deferred chat queue mutex poisoned"))?;
-        let outcome = if queue.len() >= self.capacity {
-            queue.pop_front();
-            EnqueueOutcome::DroppedMessage
-        } else {
-            EnqueueOutcome::Added
-        };
-        queue.push_back(message);
-        cvar.notify_one();
-        Ok(outcome)
-    }
-
-    pub fn requeue_front(&self, message: DeferredChatMessage) -> Result<EnqueueOutcome> {
-        let (lock, cvar) = &*self.inner;
-        let mut queue = lock
-            .lock()
-            .map_err(|_| anyhow!("deferred chat queue mutex poisoned"))?;
-        let outcome = if queue.len() >= self.capacity {
-            queue.pop_back();
-            EnqueueOutcome::DroppedMessage
-        } else {
-            EnqueueOutcome::Added
-        };
-        queue.push_front(message);
-        cvar.notify_one();
-        Ok(outcome)
-    }
-
-    pub fn requeue_back(&self, message: DeferredChatMessage) -> Result<EnqueueOutcome> {
-        let (lock, cvar) = &*self.inner;
-        let mut queue = lock
-            .lock()
-            .map_err(|_| anyhow!("deferred chat queue mutex poisoned"))?;
-        if queue.len() >= self.capacity {
-            return Ok(EnqueueOutcome::DroppedMessage);
+            .map_err(|_| anyhow!("延迟聊天队列互斥锁已损坏"))?;
+        let item = item.into();
+        let outcome = make_room_for_enqueue(&mut queue, self.capacity, item.critical())?;
+        if outcome == EnqueueOutcome::Rejected {
+            return Ok(outcome);
         }
-        queue.push_back(message);
+        queue.push_back(item);
         cvar.notify_one();
-        Ok(EnqueueOutcome::Added)
+        Ok(outcome)
     }
 
-    pub fn wait_take(&self, timeout: Duration) -> Result<Option<DeferredChatMessage>> {
+    pub fn enqueue_front(&self, item: impl Into<DeferredChatItem>) -> Result<EnqueueOutcome> {
         let (lock, cvar) = &*self.inner;
         let mut queue = lock
             .lock()
-            .map_err(|_| anyhow!("deferred chat queue mutex poisoned"))?;
+            .map_err(|_| anyhow!("延迟聊天队列互斥锁已损坏"))?;
+        let item = item.into();
+        let outcome = make_room_for_enqueue(&mut queue, self.capacity, item.critical())?;
+        if outcome == EnqueueOutcome::Rejected {
+            return Ok(outcome);
+        }
+        queue.push_front(item);
+        cvar.notify_one();
+        Ok(outcome)
+    }
+
+    pub fn requeue_front(&self, item: DeferredChatItem) -> Result<EnqueueOutcome> {
+        let (lock, cvar) = &*self.inner;
+        let mut queue = lock
+            .lock()
+            .map_err(|_| anyhow!("延迟聊天队列互斥锁已损坏"))?;
+        let outcome = make_room_for_requeue(&mut queue, self.capacity, item.protected(), true);
+        if outcome == EnqueueOutcome::Rejected {
+            return Ok(outcome);
+        }
+        queue.push_front(item);
+        cvar.notify_one();
+        Ok(outcome)
+    }
+
+    pub fn requeue_back(&self, item: DeferredChatItem) -> Result<EnqueueOutcome> {
+        let (lock, cvar) = &*self.inner;
+        let mut queue = lock
+            .lock()
+            .map_err(|_| anyhow!("延迟聊天队列互斥锁已损坏"))?;
+        let outcome = make_room_for_requeue(&mut queue, self.capacity, item.protected(), false);
+        if outcome == EnqueueOutcome::Rejected {
+            return Ok(outcome);
+        }
+        queue.push_back(item);
+        cvar.notify_one();
+        Ok(outcome)
+    }
+
+    pub fn wait_take(&self, timeout: Duration) -> Result<Option<DeferredChatItem>> {
+        let (lock, cvar) = &*self.inner;
+        let mut queue = lock
+            .lock()
+            .map_err(|_| anyhow!("延迟聊天队列互斥锁已损坏"))?;
         if queue.is_empty() {
             let (waited, _) = cvar
                 .wait_timeout(queue, timeout)
-                .map_err(|_| anyhow!("deferred chat queue condvar poisoned"))?;
+                .map_err(|_| anyhow!("延迟聊天队列条件变量已损坏"))?;
             queue = waited;
         }
         Ok(queue.pop_front())
@@ -100,6 +241,53 @@ impl DeferredChatQueue {
     pub fn notify_all(&self) {
         let (_, cvar) = &*self.inner;
         cvar.notify_all();
+    }
+}
+
+fn make_room_for_enqueue(
+    queue: &mut VecDeque<DeferredChatItem>,
+    capacity: usize,
+    incoming_critical: bool,
+) -> Result<EnqueueOutcome> {
+    if queue.len() < capacity {
+        return Ok(EnqueueOutcome::Added);
+    }
+    let index = queue.iter().position(|item| !item.protected()).or_else(|| {
+        incoming_critical
+            .then(|| queue.iter().position(|item| !item.critical()))
+            .flatten()
+    });
+    let Some(index) = index else {
+        return Ok(EnqueueOutcome::Rejected);
+    };
+    queue
+        .remove(index)
+        .ok_or_else(|| anyhow!("延迟聊天队列项目移除失败"))?;
+    Ok(EnqueueOutcome::DroppedMessage)
+}
+
+fn make_room_for_requeue(
+    queue: &mut VecDeque<DeferredChatItem>,
+    capacity: usize,
+    protected: bool,
+    remove_from_back: bool,
+) -> EnqueueOutcome {
+    if queue.len() < capacity {
+        return EnqueueOutcome::Added;
+    }
+    let index = if remove_from_back {
+        queue.iter().rposition(|item| !item.protected())
+    } else {
+        queue.iter().position(|item| !item.protected())
+    };
+    if let Some(index) = index {
+        queue.remove(index);
+        EnqueueOutcome::DroppedMessage
+    } else if protected {
+        // 受保护批次已经开始发送，必须能放回队列等待下一段或重试。
+        EnqueueOutcome::Added
+    } else {
+        EnqueueOutcome::Rejected
     }
 }
 
@@ -114,6 +302,10 @@ mod tests {
         }
     }
 
+    fn item(text: &str) -> DeferredChatItem {
+        message(text).into()
+    }
+
     #[test]
     fn takes_messages_in_fifo_order() {
         let queue = DeferredChatQueue::new(3);
@@ -122,11 +314,11 @@ mod tests {
 
         assert_eq!(
             queue.wait_take(Duration::ZERO).unwrap(),
-            Some(message("first"))
+            Some(item("first"))
         );
         assert_eq!(
             queue.wait_take(Duration::ZERO).unwrap(),
-            Some(message("second"))
+            Some(item("second"))
         );
     }
 
@@ -142,11 +334,11 @@ mod tests {
         );
         assert_eq!(
             queue.wait_take(Duration::ZERO).unwrap(),
-            Some(message("second"))
+            Some(item("second"))
         );
         assert_eq!(
             queue.wait_take(Duration::ZERO).unwrap(),
-            Some(message("third"))
+            Some(item("third"))
         );
     }
 
@@ -157,16 +349,16 @@ mod tests {
         queue.enqueue(message("latest")).unwrap();
 
         assert_eq!(
-            queue.requeue_front(message("retry")).unwrap(),
+            queue.requeue_front(item("retry")).unwrap(),
             EnqueueOutcome::DroppedMessage
         );
         assert_eq!(
             queue.wait_take(Duration::ZERO).unwrap(),
-            Some(message("retry"))
+            Some(item("retry"))
         );
         assert_eq!(
             queue.wait_take(Duration::ZERO).unwrap(),
-            Some(message("later"))
+            Some(item("later"))
         );
     }
 
@@ -188,7 +380,186 @@ mod tests {
         );
         assert_eq!(
             queue.wait_take(Duration::ZERO).unwrap(),
-            Some(message("primary"))
+            Some(item("primary"))
         );
+    }
+
+    #[test]
+    fn protected_batch_is_not_evicted_by_normal_messages() {
+        let queue = DeferredChatQueue::new(2);
+        let batch = DeferredChatBatch::new(
+            vec!["汤面1/1：测试".to_string()],
+            DeferredChatTarget::CurrentHall,
+            TurtleSoupDelivery {
+                generation: 1,
+                purpose: TurtleSoupDeliveryPurpose::Opening,
+            },
+            3,
+            true,
+        )
+        .unwrap();
+        queue.enqueue(batch.clone()).unwrap();
+        queue.enqueue(message("normal-1")).unwrap();
+
+        assert_eq!(
+            queue.enqueue(message("normal-2")).unwrap(),
+            EnqueueOutcome::DroppedMessage
+        );
+        assert_eq!(
+            queue.wait_take(Duration::ZERO).unwrap(),
+            Some(DeferredChatItem::Batch(batch))
+        );
+        assert_eq!(
+            queue.wait_take(Duration::ZERO).unwrap(),
+            Some(item("normal-2"))
+        );
+    }
+
+    #[test]
+    fn settlement_can_supersede_a_queued_surface_repeat() {
+        let queue = DeferredChatQueue::new(1);
+        let repeat = DeferredChatBatch::new(
+            vec!["汤面1/1：测试".to_string()],
+            DeferredChatTarget::CurrentHall,
+            TurtleSoupDelivery {
+                generation: 1,
+                purpose: TurtleSoupDeliveryPurpose::SurfaceRepeat,
+            },
+            3,
+            true,
+        )
+        .unwrap();
+        let settlement = DeferredChatBatch::new(
+            vec!["汤底1/1：测试".to_string()],
+            DeferredChatTarget::CurrentHall,
+            TurtleSoupDelivery {
+                generation: 1,
+                purpose: TurtleSoupDeliveryPurpose::Settlement,
+            },
+            3,
+            true,
+        )
+        .unwrap();
+        queue.enqueue(repeat).unwrap();
+
+        assert_eq!(
+            queue.enqueue(settlement.clone()).unwrap(),
+            EnqueueOutcome::DroppedMessage
+        );
+        assert_eq!(
+            queue.wait_take(Duration::ZERO).unwrap(),
+            Some(DeferredChatItem::Batch(settlement))
+        );
+    }
+
+    #[test]
+    fn critical_batch_can_enter_at_the_front() {
+        let queue = DeferredChatQueue::new(2);
+        queue.enqueue(message("normal")).unwrap();
+        let opening = DeferredChatBatch::new(
+            vec!["汤面1/1：测试".to_string()],
+            DeferredChatTarget::CurrentHall,
+            TurtleSoupDelivery {
+                generation: 1,
+                purpose: TurtleSoupDeliveryPurpose::Opening,
+            },
+            3,
+            true,
+        )
+        .unwrap();
+
+        queue.enqueue_front(opening.clone()).unwrap();
+
+        assert_eq!(
+            queue.wait_take(Duration::ZERO).unwrap(),
+            Some(DeferredChatItem::Batch(opening))
+        );
+        assert_eq!(
+            queue.wait_take(Duration::ZERO).unwrap(),
+            Some(item("normal"))
+        );
+    }
+
+    #[test]
+    fn batch_consumes_only_successfully_sent_messages() {
+        let mut batch = DeferredChatBatch::new(
+            vec![
+                "第一段".to_string(),
+                "第二段".to_string(),
+                "第三段".to_string(),
+            ],
+            DeferredChatTarget::CurrentHall,
+            TurtleSoupDelivery {
+                generation: 1,
+                purpose: TurtleSoupDeliveryPurpose::Opening,
+            },
+            3,
+            true,
+        )
+        .unwrap();
+
+        assert!(!batch.mark_sent(2).unwrap());
+        assert_eq!(batch.remaining_texts(), vec!["第三段"]);
+        assert!(batch.mark_sent(1).unwrap());
+    }
+
+    #[test]
+    fn interrupted_batch_keeps_the_current_failure_count() {
+        let mut batch = DeferredChatBatch::new(
+            vec!["第一段".to_string(), "第二段".to_string()],
+            DeferredChatTarget::CurrentHall,
+            TurtleSoupDelivery {
+                generation: 1,
+                purpose: TurtleSoupDeliveryPurpose::Opening,
+            },
+            3,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(batch.mark_current_failed(), BatchFailureOutcome::Retry);
+        assert_eq!(batch.current_attempt(), 2);
+        assert!(!batch.mark_sent(0).unwrap());
+        assert_eq!(batch.current_attempt(), 2);
+    }
+
+    #[test]
+    fn partial_success_moves_failure_tracking_to_the_next_message() {
+        let mut batch = DeferredChatBatch::new(
+            vec!["第一段".to_string(), "第二段".to_string()],
+            DeferredChatTarget::CurrentHall,
+            TurtleSoupDelivery {
+                generation: 1,
+                purpose: TurtleSoupDeliveryPurpose::Opening,
+            },
+            3,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(batch.mark_current_failed(), BatchFailureOutcome::Retry);
+        assert!(!batch.mark_sent(1).unwrap());
+        assert_eq!(batch.remaining_texts(), vec!["第二段"]);
+        assert_eq!(batch.current_attempt(), 1);
+        assert_eq!(batch.mark_current_failed(), BatchFailureOutcome::Retry);
+        assert_eq!(batch.current_attempt(), 2);
+    }
+
+    #[test]
+    fn batch_rejects_an_invalid_success_count() {
+        let mut batch = DeferredChatBatch::new(
+            vec!["唯一一段".to_string()],
+            DeferredChatTarget::CurrentHall,
+            TurtleSoupDelivery {
+                generation: 1,
+                purpose: TurtleSoupDeliveryPurpose::Opening,
+            },
+            3,
+            true,
+        )
+        .unwrap();
+
+        assert!(batch.mark_sent(2).is_err());
+        assert_eq!(batch.remaining_texts(), vec!["唯一一段"]);
     }
 }

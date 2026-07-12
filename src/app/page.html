@@ -25,7 +25,7 @@ button,input,select,textarea{font:inherit}
 .panel.wide{grid-column:1/-1}
 .panel-head{height:32px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #2d3530;padding:0 8px;gap:6px}
 .panel h2{font-size:14px;margin:0;color:#86efac}
-.panel small{color:#93a19a;white-space:nowrap}
+.panel small{color:#93a19a;white-space:nowrap;min-width:0;overflow:hidden;text-overflow:ellipsis}
 .panel-body{padding:8px}
 .scroll{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px;line-height:1.36;white-space:pre-wrap;word-break:break-word;overflow:auto;min-height:92px;max-height:260px;color:#d6ddd9}
 #monitorOcr{min-height:108px;max-height:172px}
@@ -44,6 +44,13 @@ button,input,select,textarea{font:inherit}
 .candidate-list{display:flex;flex-direction:column;gap:5px;margin-top:8px;max-height:220px;overflow:auto}
 .candidate-item{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:6px;align-items:center;border:1px solid #323b36;background:#111412;border-radius:8px;padding:6px}
 .candidate-uri{color:#93a19a;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.turtle-toolbar{display:grid;grid-template-columns:minmax(0,1fr) auto auto auto;gap:6px}
+.turtle-stats{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:6px;margin-top:8px}
+.turtle-stat{border-top:1px solid #323b36;padding-top:6px;min-width:0}
+.turtle-stat span{display:block;color:#93a19a;font-size:11px}
+.turtle-stat strong{display:block;margin-top:2px;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.turtle-grid{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(0,1fr);gap:8px;margin-top:8px}
+.turtle-history{max-height:168px}
 .sidebar{grid-area:sidebar;display:flex;flex-direction:column;gap:8px}
 .controls{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}
 .row{display:flex;gap:6px;align-items:center}
@@ -61,6 +68,7 @@ a.btn{display:inline-flex;align-items:center;text-decoration:none}
 .btn.good{background:#166534;border-color:#1b7d3f;color:#fff}
 .btn.warn{background:#7c2d12;border-color:#9a3412;color:#fff}
 .btn.ghost{background:#111412}
+.btn:disabled{opacity:.45;cursor:not-allowed}
 .btn.small{min-height:28px;padding:5px 7px;font-size:12px}
 .two{display:grid;grid-template-columns:1fr 1fr;gap:6px}
 .three{display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px}
@@ -78,8 +86,8 @@ a.btn{display:inline-flex;align-items:center;text-decoration:none}
 .modal-body{overflow:auto;text-align:center}
 .modal-body img{max-width:none;height:auto;background:#000;border:1px solid #2d3530}
 .hidden{display:none!important}
-@media(max-width:1050px){.layout{grid-template-columns:1fr;grid-template-areas:"sidebar" "monitor"}.topbar{grid-template-columns:1fr}.status-strip{grid-template-columns:repeat(3,minmax(0,1fr))}.top-actions{justify-content:flex-start}.sidebar{display:grid;grid-template-columns:1fr 1fr}.monitor{grid-template-columns:1fr}}
-@media(max-width:720px){.shell{padding:10px}.status-strip{grid-template-columns:1fr 1fr}.sidebar{display:flex}.controls,.two,.three,.compact-form,.ocr-send,.ocr-options{grid-template-columns:1fr}.monitor{gap:10px}}
+@media(max-width:1050px){.layout{grid-template-columns:1fr;grid-template-areas:"monitor" "sidebar"}.topbar{grid-template-columns:1fr}.status-strip{grid-template-columns:repeat(3,minmax(0,1fr))}.top-actions{justify-content:flex-start}.sidebar{display:grid;grid-template-columns:1fr 1fr}.monitor{grid-template-columns:1fr}.turtle-stats{grid-template-columns:repeat(3,minmax(0,1fr))}}
+@media(max-width:720px){.shell{padding:10px}.status-strip{grid-template-columns:1fr 1fr}.sidebar{display:flex}.controls,.two,.three,.compact-form,.ocr-send,.ocr-options,.turtle-toolbar,.turtle-grid{grid-template-columns:1fr}.turtle-stats{grid-template-columns:1fr 1fr}.monitor{gap:10px}}
 </style>
 </head>
 <body>
@@ -129,6 +137,30 @@ a.btn{display:inline-flex;align-items:center;text-decoration:none}
       <div class="panel">
         <div class="panel-head"><h2>任务状态</h2><small id="pendingMeta">0 个活动</small></div>
         <div class="panel-body"><div class="queue-list" id="monitorPending">暂无任务</div></div>
+      </div>
+
+      <div class="panel wide">
+        <div class="panel-head"><h2>海龟汤</h2><small id="turtleMeta">功能未启用</small></div>
+        <div class="panel-body">
+          <div class="turtle-toolbar">
+            <input id="turtlePuzzleId" placeholder="未使用题目 ID，可留空随机">
+            <button class="btn primary" id="turtleRandomStart" onclick="startTurtleSoup(false)" disabled>随机开局</button>
+            <button class="btn" id="turtleIdStart" onclick="startTurtleSoup(true)" disabled>按 ID 开局</button>
+            <button class="btn warn" id="turtleEnd" onclick="endTurtleSoup()" disabled>结束</button>
+          </div>
+          <div class="turtle-stats">
+            <div class="turtle-stat"><span>状态</span><strong id="turtlePhase">空闲</strong></div>
+            <div class="turtle-stat"><span>时长</span><strong id="turtleElapsed">0s</strong></div>
+            <div class="turtle-stat"><span>参与者</span><strong id="turtleParticipants">0</strong></div>
+            <div class="turtle-stat"><span>有效提问</span><strong id="turtleQuestions">0</strong></div>
+            <div class="turtle-stat"><span>AI 待处理</span><strong id="turtlePending">0</strong></div>
+            <div class="turtle-stat"><span>剩余题目</span><strong id="turtleRemaining">未知</strong></div>
+          </div>
+          <div class="turtle-grid">
+            <div class="result" id="turtleSurface" style="max-height:168px">当前没有进行中的海龟汤</div>
+            <div class="history turtle-history" id="turtleJudgments">暂无裁决</div>
+          </div>
+        </div>
       </div>
 
       <div class="panel wide">
@@ -291,7 +323,7 @@ a.btn{display:inline-flex;align-items:center;text-decoration:none}
 <script>
 function $(id){return document.getElementById(id)}
 const esc=(s)=>String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')
-const commandLabels={'/status':'状态','/play':'继续','/pause':'暂停','/skip-next':'下一首','/skip-prev':'上一首','/volume':'音量','/startup/game':'启动游戏','/startup/wonderland':'启动并进入千星','/startup/enter-wonderland':'进入千星','/searchPlay':'点歌','/searchSource':'指定音源点歌','/search':'搜索','/search/candidates':'候选搜索','/player/play-uri':'播放URI','/queue':'队列','/queue/add':'加入队列','/queue/remove':'删除队列','/queue/clear':'清空队列','/ai/search':'AI点歌','/chat/send':'控制台发言','/chat-listener/mode':'聊天监听','/tasks/cancel':'撤销任务','/operator/lyrics':'发送歌词','/operator/hall-detect':'大厅检测','/operator/hall-time':'大厅时间','/operator/microphone':'麦克风','/operator/commands':'命令开关','/operator/idle-exit':'闲置退出','/operator/workflows':'工作流','/operator/workflows/run':'执行工作流'}
+const commandLabels={'/status':'状态','/play':'继续','/pause':'暂停','/skip-next':'下一首','/skip-prev':'上一首','/volume':'音量','/startup/game':'启动游戏','/startup/wonderland':'启动并进入千星','/startup/enter-wonderland':'进入千星','/searchPlay':'点歌','/searchSource':'指定音源点歌','/search':'搜索','/search/candidates':'候选搜索','/player/play-uri':'播放URI','/queue':'队列','/queue/add':'加入队列','/queue/remove':'删除队列','/queue/clear':'清空队列','/ai/search':'AI点歌','/chat/send':'控制台发言','/chat-listener/mode':'聊天监听','/tasks/cancel':'撤销任务','/operator/lyrics':'发送歌词','/operator/hall-detect':'大厅检测','/operator/hall-time':'大厅时间','/operator/microphone':'麦克风','/operator/commands':'命令开关','/operator/idle-exit':'闲置退出','/operator/workflows':'工作流','/operator/workflows/run':'执行工作流','/turtle-soup':'海龟汤状态','/turtle-soup/start':'海龟汤开局','/turtle-soup/end':'海龟汤结束'}
 const stMap={playing:'播放中',paused:'已暂停',stopped:'已停止',stoped:'已停止'}
 const controllerStateMap={idle:'空闲',starting:'启动播放',requested_song_playing:'点歌播放中',paused_by_user:'用户暂停',paused_waiting_for_queue:'等待队列',external_playback:'外部播放',unknown:'状态未知',unavailable:'不可用'}
 const pauseReasonMap={none:'无',user:'用户暂停',waiting_for_queue:'等待队列',unknown:'未知'}
@@ -437,6 +469,12 @@ function queueAdd(){
 function removeQueueId(id){call('/queue/remove?id='+encodeURIComponent(id),'POST')}
 function clearQueue(){if(confirm('确定清空全部待播歌曲？'))call('/queue/clear','POST')}
 function setChatListener(mode){call('/chat-listener/mode?mode='+encodeURIComponent(mode),'POST')}
+function startTurtleSoup(useId){
+  const id=$('turtlePuzzleId').value.trim()
+  if(useId&&!id){setResult('请输入题目 ID');return}
+  call('/turtle-soup/start'+(useId?'?id='+encodeURIComponent(id):''),'POST')
+}
+function endTurtleSoup(){if(confirm('确定结束当前海龟汤并在大厅公布汤底？'))call('/turtle-soup/end','POST')}
 function setCommandsEnabled(enabled){call('/operator/commands?enabled='+(enabled?'1':'0'),'POST')}
 function setIdleExit(){
   const value=$('idleExitMinutes').value.trim()
@@ -530,6 +568,33 @@ function renderLiveLog(lines){
   if(follow)el.scrollTop=el.scrollHeight
   el.dataset.ready='1'
 }
+function renderTurtleSoup(t){
+  t=t||{}
+  const enabled=t.enabled===true
+  const phase=t.phase||'idle'
+  const active=phase!=='idle'
+  $('turtleMeta').textContent=enabled?((t.puzzleId?'ID '+t.puzzleId+' / ':'')+(t.title||t.phaseLabel||'空闲')):'功能未启用'
+  $('turtlePhase').textContent=t.phaseLabel||'空闲'
+  $('turtleElapsed').textContent=Math.max(0,Number(t.elapsedSeconds||0))+'s'
+  $('turtleParticipants').textContent=String(Number(t.participantCount||0))
+  $('turtleQuestions').textContent=String(Number(t.questionCount||0))
+  $('turtlePending').textContent=String(Number(t.pendingAi||0))
+  $('turtleRemaining').textContent=t.remainingPuzzles==null?'未知':String(t.remainingPuzzles)
+  $('turtleRandomStart').disabled=!enabled||active
+  $('turtleIdStart').disabled=!enabled||active
+  $('turtleEnd').disabled=!enabled||!active||phase==='settling'
+  const surfaceRows=[]
+  if(active){
+    if(t.starter)surfaceRows.push('开局者: '+t.starter)
+    if(Array.isArray(t.participants)&&t.participants.length)surfaceRows.push('参与者: '+t.participants.join('、'))
+    surfaceRows.push('汤面: '+(t.surface||'等待公布'))
+  }else{surfaceRows.push(enabled?'当前没有进行中的海龟汤':'海龟汤功能未启用')}
+  if(t.settlementIncomplete)surfaceRows.push('上次结算消息发送不完整')
+  if(t.lastError)surfaceRows.push('状态: '+t.lastError)
+  $('turtleSurface').textContent=surfaceRows.join('\n')
+  const judgments=Array.isArray(t.recentJudgments)?t.recentJudgments:[]
+  $('turtleJudgments').innerHTML=judgments.length?judgments.slice(-30).reverse().map(item=>'<div class="history-item"><div><span class="history-time">#'+esc(item.requestId)+'</span><b>'+esc(item.player||'未知玩家')+'</b> · '+esc(item.judgmentLabel||item.judgment||'未知')+'</div><div class="history-result">'+esc(item.question||'')+' · '+Math.round(Number(item.elapsedMs||0))+'ms</div></div>').join(''):'暂无裁决'
+}
 function renderMonitor(d){
   const operational=d.operational||{}
   $('serviceState').textContent=(d.status||'未知')+(operational.scannerPaused?' / 扫描暂停':'')
@@ -591,6 +656,7 @@ function renderMonitor(d){
   $('monitorQueue').innerHTML=q.length?q.map(queueLine).join(''):'队列为空'
   const visibleTasks=[...activeTasks,...tasks.filter(task=>task.status!=='queued'&&task.status!=='running')].slice(0,10)
   $('monitorPending').innerHTML=visibleTasks.length?visibleTasks.map(taskLine).join(''):'暂无任务'
+  renderTurtleSoup(d.turtleSoup)
   const logs=Array.isArray(d.logs)?d.logs:[]
   renderLiveLog(logs)
   const c=Array.isArray(d.commands)?d.commands:[]
@@ -633,6 +699,7 @@ bindEnter('keyword',()=>remoteSong(false))
 bindEnter('volumeInput',setVolume)
 bindEnter('idleExitMinutes',setIdleExit)
 bindEnter('workflowArgs',runWorkflow)
+bindEnter('turtlePuzzleId',()=>startTurtleSoup(true))
 $('accessToken').value=accessToken()
 loadOperatorWorkflows()
 refreshAll()

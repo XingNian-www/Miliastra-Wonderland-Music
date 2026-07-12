@@ -29,12 +29,17 @@ use super::command::{
 use super::config::AppConfig;
 use super::custom_workflow;
 use super::decision_control::{DecisionAction, DecisionControlShared};
+#[cfg(test)]
+use super::deferred_chat::DeferredChatQueue;
+#[cfg(test)]
+use super::entertainment::EntertainmentCoordinator;
 use super::feeluown::FeelUOwnClient;
 use super::geometry::parse_rect;
 use super::monitor::{MonitorQueueItem, MonitorShared};
 use super::queue::{PersistentQueue, QueueItem};
 use super::runtime_state::PersistentRuntimeState;
 use super::task_tracker::TaskTrackerShared;
+use super::turtle_soup::TurtleSoupService;
 use super::web_tools::{WebToolRequest, WebToolShared, WebToolTemplate};
 
 const MAX_ACTIVE_CONNECTIONS: usize = 32;
@@ -288,6 +293,24 @@ const ROUTES: &[RouteSpec] = &[
         handler: monitor_route,
     },
     RouteSpec {
+        path: "/turtle-soup",
+        json: true,
+        mutating: false,
+        handler: turtle_soup_route,
+    },
+    RouteSpec {
+        path: "/turtle-soup/start",
+        json: true,
+        mutating: true,
+        handler: turtle_soup_start_route,
+    },
+    RouteSpec {
+        path: "/turtle-soup/end",
+        json: true,
+        mutating: true,
+        handler: turtle_soup_end_route,
+    },
+    RouteSpec {
         path: "/tools/task",
         json: true,
         mutating: false,
@@ -380,6 +403,7 @@ pub struct HttpSharedState {
     pub runtime_state: Arc<Mutex<PersistentRuntimeState>>,
     pub monitor: MonitorShared,
     pub chat_listener: ChatListenerShared,
+    turtle_soup: TurtleSoupService,
     pub history: Arc<Mutex<VecDeque<HistoryItem>>>,
     pub active_connections: Arc<AtomicUsize>,
     pending: Arc<(Mutex<VecDeque<super::TrackedPendingTask>>, Condvar)>,
@@ -427,6 +451,7 @@ impl HttpSharedState {
         runtime_state: Arc<Mutex<PersistentRuntimeState>>,
         pending: Arc<(Mutex<VecDeque<super::TrackedPendingTask>>, Condvar)>,
         chat_listener: ChatListenerShared,
+        turtle_soup: TurtleSoupService,
         monitor: MonitorShared,
         task_tracker: TaskTrackerShared,
         decision_control: DecisionControlShared,
@@ -440,6 +465,7 @@ impl HttpSharedState {
             runtime_state,
             monitor,
             chat_listener,
+            turtle_soup,
             history: Arc::new(Mutex::new(VecDeque::new())),
             active_connections: Arc::new(AtomicUsize::new(0)),
             pending,
@@ -1263,6 +1289,53 @@ fn monitor_route(
     monitor_json(state)
 }
 
+fn turtle_soup_route(
+    _query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    serde_json::to_string(&state.turtle_soup.snapshot()).map_err(internal_error)
+}
+
+fn turtle_soup_start_route(
+    query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    match query_value(query, "id")
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        Some(id) => state.turtle_soup.start_by_id_from_web(id),
+        None => state.turtle_soup.start_random_from_web(),
+    }
+    .map_err(turtle_soup_error)?;
+    serde_json::to_string(&json!({
+        "ok": true,
+        "turtleSoup": state.turtle_soup.snapshot(),
+    }))
+    .map_err(internal_error)
+}
+
+fn turtle_soup_end_route(
+    _query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let ended = state
+        .turtle_soup
+        .end_from_web()
+        .map_err(turtle_soup_error)?;
+    if !ended {
+        return Err(AppError {
+            status: 409,
+            message: "当前没有可结束的海龟汤".to_string(),
+        });
+    }
+    serde_json::to_string(&json!({
+        "ok": true,
+        "turtleSoup": state.turtle_soup.snapshot(),
+    }))
+    .map_err(internal_error)
+}
+
 fn tool_task_route(
     query: &[(String, String)],
     state: &HttpSharedState,
@@ -1288,7 +1361,7 @@ fn tool_templates_route(
         json!({ "name": "blue-marker", "label": "蓝色聊天标志", "region": state.config.screen.chat_rect, "threshold": marker_threshold }),
         json!({ "name": "yellow-marker", "label": "黄色聊天标志", "region": state.config.screen.chat_rect, "threshold": marker_threshold }),
         json!({ "name": "pink-marker", "label": "粉色聊天标志", "region": state.config.screen.chat_rect, "threshold": marker_threshold }),
-        json!({ "name": "enter", "label": "回车界面", "region": state.config.screen.enter_rect, "threshold": marker_threshold }),
+        json!({ "name": "friend", "label": "好友按钮", "region": state.config.screen.friend_rect, "threshold": marker_threshold }),
         json!({ "name": "secondary-hall", "label": "二级当前大厅", "region": state.config.screen.secondary_hall_rect, "threshold": marker_threshold }),
         json!({ "name": "invite-view-star", "label": "邀请查看千星", "region": state.config.invite.view_star_region, "threshold": marker_threshold }),
         json!({ "name": "invite-goto-hall", "label": "邀请前往大厅", "region": state.config.invite.goto_hall_region, "threshold": marker_threshold }),
@@ -2001,6 +2074,10 @@ fn monitor_json(state: &HttpSharedState) -> std::result::Result<String, AppError
             serde_json::to_value(state.decision_control.snapshot().map_err(internal_error)?)
                 .map_err(internal_error)?,
         );
+        object.insert(
+            "turtleSoup".to_string(),
+            serde_json::to_value(state.turtle_soup.snapshot()).map_err(internal_error)?,
+        );
     }
     serde_json::to_string(&value).map_err(internal_error)
 }
@@ -2642,6 +2719,13 @@ fn internal_message(message: &str) -> AppError {
     internal_error(anyhow!(message.to_string()))
 }
 
+fn turtle_soup_error(error: anyhow::Error) -> AppError {
+    AppError {
+        status: 409,
+        message: error.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2649,6 +2733,21 @@ mod tests {
     #[test]
     fn chat_send_requires_post() {
         assert!(is_mutating_route("/chat/send"));
+    }
+
+    #[test]
+    fn turtle_soup_routes_have_expected_methods_and_monitor_snapshot() {
+        assert!(!is_mutating_route("/turtle-soup"));
+        assert!(is_json_route("/turtle-soup"));
+        for route in ["/turtle-soup/start", "/turtle-soup/end"] {
+            assert!(is_mutating_route(route));
+            assert!(is_json_route(route));
+        }
+
+        let state = test_state();
+        let monitor: Value = serde_json::from_str(&monitor_json(&state).unwrap()).unwrap();
+        assert_eq!(monitor["turtleSoup"]["enabled"], false);
+        assert_eq!(monitor["turtleSoup"]["phase"], "idle");
     }
 
     #[test]
@@ -2730,7 +2829,7 @@ mod tests {
                 state.config.screen.chat_rect,
                 marker_threshold,
             ),
-            ("enter", state.config.screen.enter_rect, marker_threshold),
+            ("friend", state.config.screen.friend_rect, marker_threshold),
             (
                 "secondary-hall",
                 state.config.screen.secondary_hall_rect,
@@ -3304,12 +3403,18 @@ mod tests {
             Condvar::new(),
         ));
         let monitor = MonitorShared::new(20);
+        let turtle_soup = TurtleSoupService::new(
+            config.turtle_soup.clone(),
+            EntertainmentCoordinator::new(),
+            DeferredChatQueue::new(32),
+        );
         HttpSharedState::new(
             config,
             queue,
             runtime_state,
             pending,
             ChatListenerShared::new(),
+            turtle_soup,
             monitor,
             TaskTrackerShared::new(),
             DecisionControlShared::new(),

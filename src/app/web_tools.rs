@@ -68,7 +68,7 @@ pub(super) enum WebToolTemplate {
     BlueMarker,
     YellowMarker,
     PinkMarker,
-    Enter,
+    Friend,
     SecondaryHall,
     InviteViewStar,
     InviteGotoHall,
@@ -91,7 +91,7 @@ impl WebToolTemplate {
             "blue-marker" => Ok(Self::BlueMarker),
             "yellow-marker" => Ok(Self::YellowMarker),
             "pink-marker" => Ok(Self::PinkMarker),
-            "enter" => Ok(Self::Enter),
+            "friend" => Ok(Self::Friend),
             "secondary-hall" => Ok(Self::SecondaryHall),
             "invite-view-star" => Ok(Self::InviteViewStar),
             "invite-goto-hall" => Ok(Self::InviteGotoHall),
@@ -115,7 +115,7 @@ impl WebToolTemplate {
             Self::BlueMarker => "蓝色聊天标志".to_string(),
             Self::YellowMarker => "黄色聊天标志".to_string(),
             Self::PinkMarker => "粉色聊天标志".to_string(),
-            Self::Enter => "回车界面".to_string(),
+            Self::Friend => "好友按钮".to_string(),
             Self::SecondaryHall => "二级当前大厅".to_string(),
             Self::InviteViewStar => "邀请查看千星".to_string(),
             Self::InviteGotoHall => "邀请前往大厅".to_string(),
@@ -335,11 +335,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn friend_is_the_only_web_name_for_the_primary_anchor() {
+        let templates = HashMap::new();
+
+        assert!(matches!(
+            WebToolTemplate::parse("friend", &templates).expect("friend template"),
+            WebToolTemplate::Friend
+        ));
+        assert!(WebToolTemplate::parse("group", &templates).is_err());
+        assert!(WebToolTemplate::parse("enter", &templates).is_err());
+    }
+
+    #[test]
     fn only_input_tools_require_screen_exclusivity() {
         assert!(!WebToolRequest::UiState.requires_screen_exclusive());
         assert!(
             !WebToolRequest::MatchTemplate {
-                template: WebToolTemplate::Enter,
+                template: WebToolTemplate::Friend,
                 rect: None,
                 threshold: None,
                 click: false,
@@ -348,7 +360,7 @@ mod tests {
         );
         assert!(
             WebToolRequest::MatchTemplate {
-                template: WebToolTemplate::Enter,
+                template: WebToolTemplate::Friend,
                 rect: None,
                 threshold: None,
                 click: true,

@@ -1412,19 +1412,34 @@ impl AutomationApp {
     }
 
     pub(super) fn send_friend_message(&self, username: &str, message: &str) -> Result<bool> {
-        self.send_friend_message_with_state(username, message, true, false, true)
+        self.send_friend_message_with_state(username, message, true, None, true)
     }
 
     pub(super) fn send_unique_friend_message(&self, username: &str, message: &str) -> Result<bool> {
-        self.send_friend_message_with_state(username, message, true, true, true)
+        self.send_friend_message_with_state(username, message, true, Some(1), true)
+    }
+
+    pub(super) fn send_stable_unique_friend_message(
+        &self,
+        username: &str,
+        message: &str,
+        stable_count: u32,
+    ) -> Result<bool> {
+        self.send_friend_message_with_state(
+            username,
+            message,
+            true,
+            Some(stable_count.max(1)),
+            true,
+        )
     }
 
     pub(super) fn send_secret_friend_message(&self, username: &str, message: &str) -> Result<bool> {
-        self.send_friend_message_with_state(username, message, true, true, false)
+        self.send_friend_message_with_state(username, message, true, Some(1), false)
     }
 
     fn send_friend_message_keep_open(&self, username: &str, message: &str) -> Result<bool> {
-        self.send_friend_message_with_state(username, message, false, false, true)
+        self.send_friend_message_with_state(username, message, false, None, true)
     }
 
     fn send_friend_message_with_state(
@@ -1432,7 +1447,7 @@ impl AutomationApp {
         username: &str,
         message: &str,
         restore_listener_residency: bool,
-        require_unique_friend: bool,
+        unique_friend_stable_count: Option<u32>,
         log_content: bool,
     ) -> Result<bool> {
         if log_content {
@@ -1445,8 +1460,8 @@ impl AutomationApp {
             height: self.config.screen.expected_height,
             resize: true,
         };
-        let opened = match if require_unique_friend {
-            self.open_unique_friend_chat(username, &canvas)
+        let opened = match if let Some(stable_count) = unique_friend_stable_count {
+            self.open_unique_friend_chat(username, &canvas, stable_count)
         } else {
             self.open_friend_chat(username, &canvas)
         } {
@@ -1474,7 +1489,12 @@ impl AutomationApp {
         Ok(true)
     }
 
-    fn open_unique_friend_chat(&self, username: &str, canvas: &Canvas) -> Result<bool> {
+    fn open_unique_friend_chat(
+        &self,
+        username: &str,
+        canvas: &Canvas,
+        stable_count: u32,
+    ) -> Result<bool> {
         if !self.ensure_secondary_chat_open("打开唯一好友聊天")? {
             return Ok(false);
         }
@@ -1482,6 +1502,8 @@ impl AutomationApp {
         let region = locator.region(self.config.invite.friend_list_region.into());
         let deadline =
             Instant::now() + Duration::from_millis(self.config.timing.workflow.default_timeout_ms);
+        let required_streak = stable_count.max(1);
+        let mut streak = 0_u32;
         while Instant::now() < deadline && self.running.load(AtomicOrdering::SeqCst) {
             let hits = {
                 let engine = self.ocr_engine()?;
@@ -1489,6 +1511,17 @@ impl AutomationApp {
             };
             match hits.as_slice() {
                 [hit] => {
+                    streak = streak.saturating_add(1);
+                    if streak < required_streak {
+                        log::debug!(
+                            "好友昵称稳定识别: {} {}/{}",
+                            username,
+                            streak,
+                            required_streak
+                        );
+                        workflow_actions::wait(locator.poll_ms());
+                        continue;
+                    }
                     locator.click_point(hit.center())?;
                     workflow_actions::wait(self.config.timing.invite.step_ms);
                     let frame = locator.capture()?;
@@ -1505,7 +1538,10 @@ impl AutomationApp {
                     );
                     return Ok(matched);
                 }
-                [] => workflow_actions::wait(locator.poll_ms()),
+                [] => {
+                    streak = 0;
+                    workflow_actions::wait(locator.poll_ms());
+                }
                 _ => {
                     log::error!("好友聊天失败: 昵称存在多个匹配结果 {}", username);
                     return Ok(false);

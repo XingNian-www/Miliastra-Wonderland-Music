@@ -282,7 +282,7 @@ fn parse_pink_text(text: &str) -> Option<ParsedCommand> {
         }
         return Some(ParsedCommand {
             matched: "投".to_string(),
-            raw: format!("投 {position}"),
+            raw: "投票".to_string(),
             user_command,
             message_type: "pink".to_string(),
             username,
@@ -1251,11 +1251,15 @@ mod tests {
             description.command,
             UserCommand::Undercover(UndercoverCommand::Describe("一种常见事物".to_string()))
         );
+        assert_eq!(description.raw, "描述");
+        assert!(!description.raw.contains("常见事物"));
         let vote = parse_text("[用户]：@投 c", "pink").unwrap();
         assert_eq!(
             vote.command,
             UserCommand::Undercover(UndercoverCommand::Vote('C'))
         );
+        assert_eq!(vote.raw, "投票");
+        assert!(!vote.raw.contains('C'));
         assert!(parse_text("用户：@描述 一种常见事物", "blue").is_none());
         assert!(parse_text("用户：@投 A", "blue").is_none());
     }

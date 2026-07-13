@@ -155,6 +155,21 @@ enum CardGameVariant {
     HunanRunFast,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActionOrigin {
+    Manual,
+    Timeout,
+    Forced,
+}
+
+enum ForcedRunFastAction {
+    Pass,
+    Play {
+        cards: Vec<Card>,
+        pattern: PlayPattern,
+    },
+}
+
 impl CardGameVariant {
     fn label(self) -> &'static str {
         match self {
@@ -560,6 +575,20 @@ impl LandlordGame {
                     return None;
                 }
                 let current = game.current;
+                if let Some(action) = forced_run_fast_action(game) {
+                    let outcome = match action {
+                        ForcedRunFastAction::Pass => {
+                            pass_playing(game, current, now, ActionOrigin::Forced)
+                        }
+                        ForcedRunFastAction::Play { cards, pattern } => {
+                            play_cards(game, current, cards, pattern, now, ActionOrigin::Forced)
+                        }
+                    };
+                    if outcome.ended {
+                        self.state = GameState::Idle;
+                    }
+                    return Some(outcome);
+                }
                 if game.players[current].trustee {
                     return Some(self.timeout_action(now));
                 }
@@ -619,13 +648,14 @@ impl LandlordGame {
                             pattern = largest_single;
                         }
                     }
-                    let outcome = play_cards(game, current, cards, pattern, now, true);
+                    let outcome =
+                        play_cards(game, current, cards, pattern, now, ActionOrigin::Timeout);
                     if outcome.ended {
                         self.state = GameState::Idle;
                     }
                     return outcome;
                 }
-                pass_playing(game, current, now, true);
+                pass_playing(game, current, now, ActionOrigin::Timeout);
                 let next = game.players[game.current].name.clone();
                 return LandlordOutcome::public(
                     "auto-pass",
@@ -633,7 +663,7 @@ impl LandlordGame {
                 );
             }
             if !game.players[current].trustee {
-                pass_playing(game, current, now, true);
+                pass_playing(game, current, now, ActionOrigin::Timeout);
                 let next = game.players[game.current].name.clone();
                 return LandlordOutcome::public(
                     "auto-pass",
@@ -648,13 +678,13 @@ impl LandlordGame {
             if let Some((cards, pattern)) =
                 lowest_beating_play(&game.players[current].hand, previous)
             {
-                let outcome = play_cards(game, current, cards, pattern, now, true);
+                let outcome = play_cards(game, current, cards, pattern, now, ActionOrigin::Timeout);
                 if outcome.ended {
                     self.state = GameState::Idle;
                 }
                 outcome
             } else {
-                pass_playing(game, current, now, true);
+                pass_playing(game, current, now, ActionOrigin::Timeout);
                 let next = game.players[game.current].name.clone();
                 LandlordOutcome::public(
                     "auto-pass",
@@ -689,7 +719,7 @@ impl LandlordGame {
                 vec![card],
                 PlayPattern::Single(card.rank),
                 now,
-                true,
+                ActionOrigin::Timeout,
             );
             if outcome.ended {
                 self.state = GameState::Idle;
@@ -719,23 +749,14 @@ impl LandlordGame {
             Ok(_) => return LandlordOutcome::public("empty-play", "请输入要出的牌"),
             Err(error) => return LandlordOutcome::public("invalid-cards", error),
         };
-        let mut cards = match take_cards(&game.players[player_index].hand, &ranks) {
+        let cards = match take_cards_for_play(
+            &game.players[player_index].hand,
+            &ranks,
+            game.variant == CardGameVariant::HunanRunFast && game.opening_spade_three_required,
+        ) {
             Ok(cards) => cards,
             Err(error) => return LandlordOutcome::public("missing-card", error),
         };
-        if game.variant == CardGameVariant::HunanRunFast
-            && game.opening_spade_three_required
-            && ranks.contains(&Rank::Three)
-            && !cards.iter().any(|card| card.spade_three)
-            && let Some(spade_three) = game.players[player_index]
-                .hand
-                .iter()
-                .find(|card| card.spade_three)
-                .copied()
-            && let Some(normal_three) = cards.iter_mut().find(|card| card.rank == Rank::Three)
-        {
-            *normal_three = spade_three;
-        }
         if game.variant == CardGameVariant::HunanRunFast
             && game.opening_spade_three_required
             && !cards.iter().any(|card| card.spade_three)
@@ -767,7 +788,14 @@ impl LandlordGame {
                 format!("{}压不过上一手{}", pattern.label(), last.pattern.label()),
             );
         }
-        let outcome = play_cards(game, player_index, cards, pattern, now, false);
+        let outcome = play_cards(
+            game,
+            player_index,
+            cards,
+            pattern,
+            now,
+            ActionOrigin::Manual,
+        );
         if outcome.ended {
             self.state = GameState::Idle;
         }
@@ -813,7 +841,7 @@ impl LandlordGame {
                 return LandlordOutcome::public("must-play", "跑得快有牌能压时不能过牌");
             }
         }
-        pass_playing(game, player_index, now, false)
+        pass_playing(game, player_index, now, ActionOrigin::Manual)
     }
 
     fn hand(&mut self, player: &str, now: Instant) -> LandlordOutcome {
@@ -981,16 +1009,48 @@ fn report_one_largest_single(game: &Playing, player: usize) -> Option<Card> {
         .flatten()
 }
 
+fn forced_run_fast_action(game: &Playing) -> Option<ForcedRunFastAction> {
+    if game.variant != CardGameVariant::HunanRunFast {
+        return None;
+    }
+    let current = game.current;
+    let previous = game
+        .last_play
+        .as_ref()
+        .filter(|last| last.player != current)
+        .map(|last| &last.pattern);
+    let filter = RunFastPlayFilter {
+        previous,
+        requires_spade_three: game.opening_spade_three_required,
+        required_single: report_one_largest_single(game, current).map(|card| card.rank),
+    };
+    let hand = &game.players[current].hand;
+    let groups = rank_counts(&hand.iter().map(|card| card.rank).collect::<Vec<_>>())
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut selected = Vec::new();
+    let mut options = Vec::with_capacity(2);
+    collect_run_fast_legal_plays(&groups, 0, &mut selected, &filter, &mut options);
+    match options.as_slice() {
+        [] if previous.is_some() => Some(ForcedRunFastAction::Pass),
+        [(ranks, pattern)] => Some(ForcedRunFastAction::Play {
+            cards: take_cards_for_play(hand, ranks, filter.requires_spade_three).ok()?,
+            pattern: pattern.clone(),
+        }),
+        _ => None,
+    }
+}
+
 fn play_cards(
     game: &mut Playing,
     player: usize,
     cards: Vec<Card>,
     pattern: PlayPattern,
     now: Instant,
-    automatic: bool,
+    origin: ActionOrigin,
 ) -> LandlordOutcome {
     game.opening_spade_three_required = false;
-    if !automatic {
+    if origin == ActionOrigin::Manual {
         game.players[player].timeouts = 0;
     }
     remove_cards(&mut game.players[player].hand, &cards);
@@ -1014,11 +1074,23 @@ fn play_cards(
                 .map(|item| format!("{} {}张", item.name, item.hand.len()))
                 .collect::<Vec<_>>()
                 .join("、");
+            let winning_play = match origin {
+                ActionOrigin::Manual => format!("{}出完{}", name, played),
+                ActionOrigin::Timeout => format!(
+                    "{}超时{}，自动出 {}",
+                    name,
+                    trustee_suffix(game, player),
+                    played
+                ),
+                ActionOrigin::Forced => {
+                    format!("{}仅有一种合法出牌，自动出 {}", name, played)
+                }
+            };
             return LandlordOutcome::ended(
                 "won",
                 format!(
-                    "{}出完{}[{}]，跑得快获胜。剩余:{}；炸弹{}次；共{}手",
-                    name, played, pattern_name, summary, game.bombs, game.turns
+                    "{}[{}]，跑得快获胜。剩余:{}；炸弹{}次；共{}手",
+                    winning_play, pattern_name, summary, game.bombs, game.turns
                 ),
             );
         }
@@ -1048,16 +1120,16 @@ fn play_cards(
     });
     game.consecutive_passes = 0;
     advance_turn(game, now);
-    let automatic_text = if automatic {
-        format!("超时{}，自动出", trustee_suffix(game, player))
-    } else {
-        "出牌".to_string()
+    let action_text = match origin {
+        ActionOrigin::Manual => "出牌".to_string(),
+        ActionOrigin::Timeout => format!("超时{}，自动出", trustee_suffix(game, player)),
+        ActionOrigin::Forced => "仅有一种合法出牌，自动出".to_string(),
     };
     let message = if game.variant == CardGameVariant::HunanRunFast {
         format!(
             "{}{} {}[{}]，剩余{}张；轮到{}",
             name,
-            automatic_text,
+            action_text,
             played,
             pattern_name,
             game.players[player].hand.len(),
@@ -1068,23 +1140,30 @@ fn play_cards(
             "{}({}){} {}[{}]，剩余{}张；轮到{}",
             name,
             role,
-            automatic_text,
+            action_text,
             played,
             pattern_name,
             game.players[player].hand.len(),
             game.players[game.current].name
         )
     };
-    LandlordOutcome::public(if automatic { "auto-play" } else { "played" }, message)
+    LandlordOutcome::public(
+        match origin {
+            ActionOrigin::Manual => "played",
+            ActionOrigin::Timeout => "auto-play",
+            ActionOrigin::Forced => "forced-play",
+        },
+        message,
+    )
 }
 
 fn pass_playing(
     game: &mut Playing,
     player: usize,
     now: Instant,
-    automatic: bool,
+    origin: ActionOrigin,
 ) -> LandlordOutcome {
-    if !automatic {
+    if origin == ActionOrigin::Manual {
         game.players[player].timeouts = 0;
     }
     let name = game.players[player].name.clone();
@@ -1106,14 +1185,32 @@ fn pass_playing(
         advance_turn(game, now);
     }
     LandlordOutcome::public(
-        if automatic { "auto-pass" } else { "passed" },
+        match origin {
+            ActionOrigin::Manual => "passed",
+            ActionOrigin::Timeout => "auto-pass",
+            ActionOrigin::Forced => "forced-pass",
+        },
         if new_trick {
-            format!(
-                "{}过牌，重新由{}领出",
-                name, game.players[game.current].name
-            )
+            match origin {
+                ActionOrigin::Forced => format!(
+                    "{}无牌可压，自动过牌；重新由{}领出",
+                    name, game.players[game.current].name
+                ),
+                ActionOrigin::Manual | ActionOrigin::Timeout => format!(
+                    "{}过牌，重新由{}领出",
+                    name, game.players[game.current].name
+                ),
+            }
         } else {
-            format!("{}过牌，轮到{}", name, game.players[game.current].name)
+            match origin {
+                ActionOrigin::Forced => format!(
+                    "{}无牌可压，自动过牌；轮到{}",
+                    name, game.players[game.current].name
+                ),
+                ActionOrigin::Manual | ActionOrigin::Timeout => {
+                    format!("{}过牌，轮到{}", name, game.players[game.current].name)
+                }
+            }
         },
     )
 }
@@ -1384,6 +1481,23 @@ fn take_cards(hand: &[Card], ranks: &[Rank]) -> Result<Vec<Card>, String> {
     Ok(cards)
 }
 
+fn take_cards_for_play(
+    hand: &[Card],
+    ranks: &[Rank],
+    requires_spade_three: bool,
+) -> Result<Vec<Card>, String> {
+    let mut cards = take_cards(hand, ranks)?;
+    if requires_spade_three
+        && ranks.contains(&Rank::Three)
+        && !cards.iter().any(|card| card.spade_three)
+        && let Some(spade_three) = hand.iter().find(|card| card.spade_three).copied()
+        && let Some(normal_three) = cards.iter_mut().find(|card| card.rank == Rank::Three)
+    {
+        *normal_three = spade_three;
+    }
+    Ok(cards)
+}
+
 fn remove_cards(hand: &mut Vec<Card>, cards: &[Card]) {
     for card in cards {
         let index = hand
@@ -1408,7 +1522,6 @@ enum PlayPattern {
     AirplanePairs { high: Rank, triples: usize },
     FourTwoSingles(Rank),
     FourTwoPairs(Rank),
-    FourThree(Rank),
     Bomb(Rank),
     JokerBomb,
 }
@@ -1428,7 +1541,6 @@ impl PlayPattern {
             Self::AirplanePairs { .. } => "飞机带对",
             Self::FourTwoSingles(_) => "四带二单",
             Self::FourTwoPairs(_) => "四带二对",
-            Self::FourThree(_) => "四带三",
             Self::Bomb(_) => "炸弹",
             Self::JokerBomb => "王炸",
         }
@@ -1447,7 +1559,6 @@ impl PlayPattern {
             | Self::TriplePair(rank)
             | Self::FourTwoSingles(rank)
             | Self::FourTwoPairs(rank)
-            | Self::FourThree(rank)
             | Self::Bomb(rank) => *rank as u8,
             Self::Straight { high, .. }
             | Self::PairStraight { high, .. }
@@ -1471,8 +1582,7 @@ impl PlayPattern {
             | (Self::TripleSingle(left), Self::TripleSingle(right))
             | (Self::TriplePair(left), Self::TriplePair(right))
             | (Self::FourTwoSingles(left), Self::FourTwoSingles(right))
-            | (Self::FourTwoPairs(left), Self::FourTwoPairs(right))
-            | (Self::FourThree(left), Self::FourThree(right)) => left > right,
+            | (Self::FourTwoPairs(left), Self::FourTwoPairs(right)) => left > right,
             (
                 Self::Straight {
                     high: left,
@@ -1597,14 +1707,12 @@ fn classify(ranks: &[Rank]) -> Option<PlayPattern> {
 
 fn classify_for_variant(ranks: &[Rank], variant: CardGameVariant) -> Option<PlayPattern> {
     if variant == CardGameVariant::HunanRunFast {
-        if ranks.len() == 3 && ranks.iter().all(|rank| *rank == Rank::Ace) {
-            return Some(PlayPattern::Bomb(Rank::Ace));
-        }
-        if ranks.len() == 7 {
-            let counts = rank_counts(ranks);
-            if let Some(rank) = group_rank(&counts, 4) {
-                return Some(PlayPattern::FourThree(rank));
-            }
+        let counts = rank_counts(ranks);
+        if ranks.len() == 4 && counts.values().all(|count| *count == 2) && consecutive(&counts, 2) {
+            return Some(PlayPattern::PairStraight {
+                high: *counts.keys().next_back()?,
+                length: counts.len(),
+            });
         }
     }
     classify(ranks)
@@ -1627,6 +1735,54 @@ fn lowest_beating_play_for_variant(
     let (ranks, pattern) = best?;
     let cards = take_cards(hand, &ranks).ok()?;
     Some((cards, pattern))
+}
+
+struct RunFastPlayFilter<'a> {
+    previous: Option<&'a PlayPattern>,
+    requires_spade_three: bool,
+    required_single: Option<Rank>,
+}
+
+fn collect_run_fast_legal_plays(
+    groups: &[(Rank, usize)],
+    index: usize,
+    selected: &mut Vec<Rank>,
+    filter: &RunFastPlayFilter<'_>,
+    options: &mut Vec<(Vec<Rank>, PlayPattern)>,
+) {
+    if options.len() >= 2 {
+        return;
+    }
+    if index == groups.len() {
+        let Some(pattern) = classify_for_variant(selected, CardGameVariant::HunanRunFast) else {
+            return;
+        };
+        if filter.requires_spade_three && !selected.contains(&Rank::Three) {
+            return;
+        }
+        if let Some(previous) = filter.previous
+            && !pattern.beats(previous)
+        {
+            return;
+        }
+        if let (PlayPattern::Single(rank), Some(required)) = (&pattern, filter.required_single)
+            && *rank != required
+        {
+            return;
+        }
+        options.push((selected.clone(), pattern));
+        return;
+    }
+
+    let (rank, count) = groups[index];
+    for take in 0..=count {
+        selected.extend(std::iter::repeat_n(rank, take));
+        collect_run_fast_legal_plays(groups, index + 1, selected, filter, options);
+        selected.truncate(selected.len() - take);
+        if options.len() >= 2 {
+            break;
+        }
+    }
 }
 
 fn collect_beating_plays(
@@ -1993,14 +2149,33 @@ mod tests {
     }
 
     #[test]
-    fn hunan_run_fast_supports_three_aces_bomb_and_four_with_three() {
+    fn hunan_run_fast_uses_confirmed_triple_pair_straight_and_four_card_rules() {
         assert_eq!(
             classify_for_variant(&ranks("AAA"), CardGameVariant::HunanRunFast),
-            Some(PlayPattern::Bomb(Rank::Ace))
+            Some(PlayPattern::Triple(Rank::Ace))
+        );
+        assert_eq!(
+            classify_for_variant(&ranks("AAA4"), CardGameVariant::HunanRunFast),
+            Some(PlayPattern::TripleSingle(Rank::Ace))
+        );
+        assert_eq!(
+            classify_for_variant(&ranks("3344"), CardGameVariant::HunanRunFast),
+            Some(PlayPattern::PairStraight {
+                high: Rank::Four,
+                length: 2,
+            })
+        );
+        assert_eq!(
+            classify_for_variant(&ranks("444456"), CardGameVariant::HunanRunFast),
+            Some(PlayPattern::FourTwoSingles(Rank::Four))
+        );
+        assert_eq!(
+            classify_for_variant(&ranks("44445566"), CardGameVariant::HunanRunFast),
+            Some(PlayPattern::FourTwoPairs(Rank::Four))
         );
         assert_eq!(
             classify_for_variant(&ranks("4444356"), CardGameVariant::HunanRunFast),
-            Some(PlayPattern::FourThree(Rank::Four))
+            None
         );
     }
 
@@ -2081,6 +2256,160 @@ mod tests {
     }
 
     #[test]
+    fn hunan_run_fast_immediately_passes_with_no_legal_play() {
+        let now = Instant::now();
+        let mut game = LandlordGame::with_seed(LandlordConfig::default(), 1);
+        game.state = GameState::Playing(Playing {
+            players: vec![
+                Player {
+                    hand: vec![Card::new(Rank::Four)],
+                    ..Player::new("甲")
+                },
+                Player {
+                    hand: vec![Card::new(Rank::Six), Card::new(Rank::Seven)],
+                    ..Player::new("乙")
+                },
+                Player {
+                    hand: vec![Card::new(Rank::Eight)],
+                    ..Player::new("丙")
+                },
+            ],
+            variant: CardGameVariant::HunanRunFast,
+            landlord: 2,
+            current: 0,
+            last_play: Some(LastPlay {
+                player: 2,
+                cards: vec![Card::new(Rank::Five)],
+                pattern: PlayPattern::Single(Rank::Five),
+            }),
+            consecutive_passes: 0,
+            timer: ActiveTimer::new(now),
+            warning_sent: false,
+            turns: 1,
+            bombs: 0,
+            opening_spade_three_required: false,
+        });
+
+        let outcome = game.tick(now, true).expect("forced pass");
+
+        assert_eq!(outcome.action, "forced-pass");
+        assert!(
+            outcome
+                .public_reply
+                .is_some_and(|reply| reply.contains("无牌可压，自动过牌"))
+        );
+        let GameState::Playing(playing) = &game.state else {
+            panic!("expected playing")
+        };
+        assert_eq!(playing.current, 1);
+        assert_eq!(playing.players[0].timeouts, 0);
+        assert!(!playing.players[0].trustee);
+    }
+
+    #[test]
+    fn hunan_run_fast_immediately_plays_the_only_legal_option() {
+        let now = Instant::now();
+        let mut game = LandlordGame::with_seed(LandlordConfig::default(), 1);
+        game.state = GameState::Playing(Playing {
+            players: vec![
+                Player {
+                    hand: vec![
+                        Card::new(Rank::Four),
+                        Card::new(Rank::Four),
+                        Card::new(Rank::Five),
+                    ],
+                    ..Player::new("甲")
+                },
+                Player {
+                    hand: vec![Card::new(Rank::Six), Card::new(Rank::Seven)],
+                    ..Player::new("乙")
+                },
+                Player {
+                    hand: vec![Card::new(Rank::Eight)],
+                    ..Player::new("丙")
+                },
+            ],
+            variant: CardGameVariant::HunanRunFast,
+            landlord: 2,
+            current: 0,
+            last_play: Some(LastPlay {
+                player: 2,
+                cards: vec![Card::new(Rank::Three), Card::new(Rank::Three)],
+                pattern: PlayPattern::Pair(Rank::Three),
+            }),
+            consecutive_passes: 0,
+            timer: ActiveTimer::new(now),
+            warning_sent: false,
+            turns: 1,
+            bombs: 0,
+            opening_spade_three_required: false,
+        });
+
+        let outcome = game.tick(now, true).expect("forced play");
+
+        assert_eq!(outcome.action, "forced-play");
+        assert!(
+            outcome
+                .public_reply
+                .is_some_and(|reply| reply.contains("仅有一种合法出牌，自动出 4 4[对子]"))
+        );
+        let GameState::Playing(playing) = &game.state else {
+            panic!("expected playing")
+        };
+        assert_eq!(playing.players[0].hand, vec![Card::new(Rank::Five)]);
+        assert_eq!(playing.players[0].timeouts, 0);
+        assert!(!playing.players[0].trustee);
+    }
+
+    #[test]
+    fn hunan_run_fast_waits_when_multiple_legal_options_exist() {
+        let now = Instant::now();
+        let mut game = LandlordGame::with_seed(LandlordConfig::default(), 1);
+        game.state = GameState::Playing(Playing {
+            players: vec![
+                Player {
+                    hand: vec![
+                        Card::new(Rank::Four),
+                        Card::new(Rank::Four),
+                        Card::new(Rank::Five),
+                        Card::new(Rank::Five),
+                    ],
+                    ..Player::new("甲")
+                },
+                Player {
+                    hand: vec![Card::new(Rank::Six), Card::new(Rank::Seven)],
+                    ..Player::new("乙")
+                },
+                Player {
+                    hand: vec![Card::new(Rank::Eight)],
+                    ..Player::new("丙")
+                },
+            ],
+            variant: CardGameVariant::HunanRunFast,
+            landlord: 2,
+            current: 0,
+            last_play: Some(LastPlay {
+                player: 2,
+                cards: vec![Card::new(Rank::Three), Card::new(Rank::Three)],
+                pattern: PlayPattern::Pair(Rank::Three),
+            }),
+            consecutive_passes: 0,
+            timer: ActiveTimer::new(now),
+            warning_sent: false,
+            turns: 1,
+            bombs: 0,
+            opening_spade_three_required: false,
+        });
+
+        assert!(game.tick(now, true).is_none());
+        let GameState::Playing(playing) = &game.state else {
+            panic!("expected playing")
+        };
+        assert_eq!(playing.current, 0);
+        assert_eq!(playing.players[0].hand.len(), 4);
+    }
+
+    #[test]
     fn hunan_run_fast_requires_largest_single_when_next_player_has_one_card() {
         let now = Instant::now();
         let mut game = LandlordGame::with_seed(LandlordConfig::default(), 1);
@@ -2116,13 +2445,9 @@ mod tests {
     }
 
     #[test]
-    fn hunan_run_fast_timeout_obeys_report_one_largest_single_rule() {
+    fn hunan_run_fast_report_one_constraint_can_leave_one_forced_option() {
         let now = Instant::now();
-        let config = LandlordConfig {
-            turn_timeout_seconds: 1,
-            ..LandlordConfig::default()
-        };
-        let mut game = LandlordGame::with_seed(config, 1);
+        let mut game = LandlordGame::with_seed(LandlordConfig::default(), 1);
         game.state = GameState::Playing(Playing {
             players: vec![
                 Player {
@@ -2151,10 +2476,8 @@ mod tests {
         });
 
         assert_eq!(
-            game.tick(now + Duration::from_secs(1), true)
-                .expect("timeout play")
-                .action,
-            "auto-play"
+            game.tick(now, true).expect("report-one forced play").action,
+            "forced-play"
         );
         let GameState::Playing(playing) = &game.state else {
             panic!("expected playing")
@@ -2200,6 +2523,49 @@ mod tests {
             outcome
                 .public_reply
                 .is_some_and(|reply| reply.contains("跑得快获胜"))
+        );
+        assert!(!game.is_active());
+    }
+
+    #[test]
+    fn hunan_run_fast_leader_with_one_option_immediately_wins() {
+        let now = Instant::now();
+        let mut game = LandlordGame::with_seed(LandlordConfig::default(), 1);
+        game.state = GameState::Playing(Playing {
+            players: vec![
+                Player {
+                    hand: vec![Card::new(Rank::King)],
+                    ..Player::new("甲")
+                },
+                Player {
+                    hand: vec![Card::new(Rank::Six), Card::new(Rank::Seven)],
+                    ..Player::new("乙")
+                },
+                Player {
+                    hand: vec![Card::new(Rank::Eight), Card::new(Rank::Nine)],
+                    ..Player::new("丙")
+                },
+            ],
+            variant: CardGameVariant::HunanRunFast,
+            landlord: 0,
+            current: 0,
+            last_play: None,
+            consecutive_passes: 0,
+            timer: ActiveTimer::new(now),
+            warning_sent: false,
+            turns: 0,
+            bombs: 0,
+            opening_spade_three_required: false,
+        });
+
+        let outcome = game.tick(now, true).expect("forced winning play");
+
+        assert_eq!(outcome.action, "won");
+        assert!(outcome.ended);
+        assert!(
+            outcome
+                .public_reply
+                .is_some_and(|reply| reply.contains("仅有一种合法出牌，自动出 K[单张]"))
         );
         assert!(!game.is_active());
     }

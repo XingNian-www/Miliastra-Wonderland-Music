@@ -122,6 +122,7 @@ mod app {
     use self::turtle_soup::{
         QuestionSubmitOutcome, SecondaryOcrObservation, SecondaryOcrStability, TurtleSoupService,
     };
+    use self::ui_locator::UiLocator;
     use self::ui_state::{UiState, detect_ui_state};
     use self::undercover::{UndercoverCommand, UndercoverDelivery, UndercoverGame, UndercoverMode};
     use self::undercover_bank::UndercoverBankStore;
@@ -136,6 +137,14 @@ mod app {
     const OCR_REBUILD_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
     const TARGET_MISSING_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
     const TARGET_MISSING_BACKOFF_MAX: Duration = Duration::from_secs(60);
+
+    fn secondary_hall_search_rect(anchor: Rect, friend_list: Rect) -> Rect {
+        let left = anchor.x.min(friend_list.x);
+        let top = anchor.y.min(friend_list.y);
+        let right = anchor.right().max(friend_list.right());
+        let bottom = anchor.bottom().max(friend_list.bottom());
+        Rect::new(left, top, (right - left) as u32, (bottom - top) as u32)
+    }
     const RETURN_TO_PRIMARY_SLOW_RETRY_AFTER: u32 = 5;
     const RETURN_TO_PRIMARY_SLOW_RETRY_MS: u64 = 2_000;
     const PRIMARY_REGION_STABILITY_POLL_MS: u64 = 100;
@@ -213,6 +222,7 @@ mod app {
     #[derive(Clone, Debug, Default)]
     struct UiTemplateArgs {
         friend_template: Option<PathBuf>,
+        secondary_back_template: Option<PathBuf>,
         secondary_hall_template: Option<PathBuf>,
         chat_templates: TemplateArgs,
     }
@@ -220,6 +230,7 @@ mod app {
     #[derive(Clone, Debug)]
     struct ResolvedUiTemplateArgs {
         friend_template: PathBuf,
+        secondary_back_template: PathBuf,
         secondary_hall_template: PathBuf,
         chat_templates: ResolvedTemplateArgs,
     }
@@ -231,6 +242,10 @@ mod app {
                     .friend_template
                     .clone()
                     .unwrap_or_else(|| config.templates.friend.clone()),
+                secondary_back_template: self
+                    .secondary_back_template
+                    .clone()
+                    .unwrap_or_else(|| config.templates.secondary_back.clone()),
                 secondary_hall_template: self
                     .secondary_hall_template
                     .clone()
@@ -521,6 +536,9 @@ mod app {
             discard_only: bool,
         },
         RestoreSecondaryHall,
+        CardGameOutcome {
+            outcome: LandlordOutcome,
+        },
         UndercoverDelivery {
             deliveries: Vec<UndercoverDelivery>,
         },
@@ -584,6 +602,9 @@ mod app {
                     }
                 }
                 Self::RestoreSecondaryHall => "二级监听恢复当前大厅".to_string(),
+                Self::CardGameOutcome { outcome } => {
+                    format!("发送牌局计时结果({})", outcome.action)
+                }
                 Self::UndercoverDelivery { .. } => "发送谁是卧底阶段消息".to_string(),
             }
         }
@@ -606,6 +627,7 @@ mod app {
                 Self::SetChatListenerMode { .. }
                 | Self::SecondaryUnread { .. }
                 | Self::RestoreSecondaryHall
+                | Self::CardGameOutcome { .. }
                 | Self::UndercoverDelivery { .. } => false,
             }
         }
@@ -630,6 +652,7 @@ mod app {
                 | Self::SetChatListenerMode { .. }
                 | Self::SecondaryUnread { .. }
                 | Self::RestoreSecondaryHall
+                | Self::CardGameOutcome { .. }
                 | Self::UndercoverDelivery { .. } => false,
             }
         }
@@ -646,6 +669,7 @@ mod app {
                 | Self::StartGame { .. }
                 | Self::EnterWonderland { .. }
                 | Self::ModerationVoteResult { .. }
+                | Self::CardGameOutcome { .. }
                 | Self::UndercoverDelivery { .. } => true,
             }
         }
@@ -733,8 +757,28 @@ mod app {
     fn landlord_command_requires_executor(command: &LandlordCommand) -> bool {
         matches!(
             command,
-            LandlordCommand::Start | LandlordCommand::Join | LandlordCommand::Hand
+            LandlordCommand::Start
+                | LandlordCommand::RunFastStart
+                | LandlordCommand::Join
+                | LandlordCommand::Rob
+                | LandlordCommand::Decline
+                | LandlordCommand::Hand
         )
+    }
+
+    fn is_card_game_kind(kind: EntertainmentKind) -> bool {
+        matches!(
+            kind,
+            EntertainmentKind::Landlord | EntertainmentKind::RunFast
+        )
+    }
+
+    fn card_game_start_kind(command: &LandlordCommand) -> Option<EntertainmentKind> {
+        match command {
+            LandlordCommand::Start => Some(EntertainmentKind::Landlord),
+            LandlordCommand::RunFastStart => Some(EntertainmentKind::RunFast),
+            _ => None,
+        }
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -867,7 +911,14 @@ mod app {
             let feeluown = FeelUOwnClient::new(&config.feeluown, &config.timing);
             let ai = ai::AiClient::new(&config.ai, &config.timing);
             let song_review = SongReviewClient::new(&config.song_review, &config.timing);
-            let chat_output = ChatOutput::new(&config.output, &config.timing, &config.window);
+            let chat_output = ChatOutput::new(
+                &config.output,
+                &config.timing,
+                &config.window,
+                &config.screen,
+                &config.templates,
+                &config.invite,
+            );
             let runtime_state = Arc::new(Mutex::new(runtime_state));
             let entertainment = EntertainmentCoordinator::new();
             let idiom_chain_game = IdiomChainGame::load(config.idiom_chain.clone())?;
@@ -2337,11 +2388,11 @@ mod app {
                 return Ok(false);
             }
             if let Some(active) = self.entertainment.active()
-                && active != EntertainmentKind::Landlord
+                && !is_card_game_kind(active)
                 && !matches!(command, LandlordCommand::Status | LandlordCommand::Help)
             {
                 self.enqueue_current_hall_reply(&format!(
-                    "{}正在进行，请结束后再开始斗地主",
+                    "{}正在进行，请结束后再开始牌局",
                     active.label()
                 ))?;
                 return Ok(true);
@@ -2351,7 +2402,7 @@ mod app {
                 .handle(&parsed.username, command, Instant::now());
             self.finish_landlord_outcome(outcome)?;
             log::info!(
-                "斗地主命令已处理: command={} user={}",
+                "牌局命令已处理: command={} user={}",
                 parsed.raw,
                 parsed.username
             );
@@ -2359,8 +2410,13 @@ mod app {
         }
 
         fn finish_landlord_outcome(&self, outcome: LandlordOutcome) -> Result<()> {
-            if outcome.ended {
-                self.entertainment.release(EntertainmentKind::Landlord);
+            if outcome.ended
+                && let Some(kind) = self
+                    .entertainment
+                    .active()
+                    .filter(|kind| is_card_game_kind(*kind))
+            {
+                self.entertainment.release(kind);
             }
             if let Some(reply) = outcome.public_reply {
                 self.enqueue_current_hall_reply(&reply)?;
@@ -2437,11 +2493,17 @@ mod app {
             match self.landlord.lock() {
                 Ok(mut game) => {
                     if game.abort() {
-                        self.entertainment.release(EntertainmentKind::Landlord);
-                        log::warn!("斗地主已因聊天上下文变化中止: {}", reason);
+                        if let Some(kind) = self
+                            .entertainment
+                            .active()
+                            .filter(|kind| is_card_game_kind(*kind))
+                        {
+                            self.entertainment.release(kind);
+                        }
+                        log::warn!("牌局已因聊天上下文变化中止: {}", reason);
                     }
                 }
-                Err(_) => log::error!("斗地主状态锁已损坏，无法中止旧牌局"),
+                Err(_) => log::error!("牌局状态锁已损坏，无法中止旧牌局"),
             }
             match self.idiom_chain.lock() {
                 Ok(mut game) => {
@@ -2458,15 +2520,31 @@ mod app {
             self.turtle_soup.tick();
             let clock_active = !self.paused.load(AtomicOrdering::SeqCst)
                 && !self.command_executing.load(AtomicOrdering::SeqCst);
-            match self.landlord.lock() {
-                Ok(mut game) => {
-                    if let Some(outcome) = game.tick(Instant::now(), clock_active)
-                        && let Err(error) = self.finish_landlord_outcome(outcome)
+            let card_game_outcome = match self.landlord.lock() {
+                Ok(mut game) => game.tick(Instant::now(), clock_active),
+                Err(_) => {
+                    log::error!("牌局状态锁已损坏，无法推进回合计时");
+                    None
+                }
+            };
+            if let Some(outcome) = card_game_outcome {
+                let should_abort_on_failure = !outcome.private_deliveries.is_empty();
+                let ended = outcome.ended;
+                if let Err(error) = self.push_pending_task(PendingTask::CardGameOutcome { outcome })
+                {
+                    log::error!("牌局计时结果入队失败: {error:#}");
+                    if should_abort_on_failure && let Ok(mut game) = self.landlord.lock() {
+                        game.abort();
+                    }
+                    if (ended || should_abort_on_failure)
+                        && let Some(kind) = self
+                            .entertainment
+                            .active()
+                            .filter(|kind| is_card_game_kind(*kind))
                     {
-                        log::error!("斗地主计时事件回复失败: {error:#}");
+                        self.entertainment.release(kind);
                     }
                 }
-                Err(_) => log::error!("斗地主状态锁已损坏，无法推进回合计时"),
             }
             match self.undercover.lock() {
                 Ok(mut game) => {
@@ -2769,6 +2847,9 @@ mod app {
                 PendingTask::RestoreSecondaryHall => self
                     .execute_restore_secondary_hall_task()
                     .map(|_| PendingTaskExecution::Completed),
+                PendingTask::CardGameOutcome { outcome } => self
+                    .deliver_landlord_task_outcome(outcome)
+                    .map(|_| PendingTaskExecution::Completed),
                 PendingTask::UndercoverDelivery { deliveries } => self
                     .deliver_undercover_deliveries(deliveries)
                     .map(|_| PendingTaskExecution::Completed),
@@ -2914,6 +2995,9 @@ mod app {
                         }
                         WebToolTemplate::PinkMarker => self.config.templates.pink_marker.clone(),
                         WebToolTemplate::Friend => self.config.templates.friend.clone(),
+                        WebToolTemplate::SecondaryBack => {
+                            self.config.templates.secondary_back.clone()
+                        }
                         WebToolTemplate::SecondaryHall => {
                             self.config.templates.secondary_hall.clone()
                         }
@@ -3480,23 +3564,44 @@ mod app {
                 height: self.config.screen.expected_height,
                 resize: true,
             };
-            let frame = load_frame(&FrameArgs { image: None }, &canvas, &self.config.window)?;
             let templates = UiTemplateArgs::default().resolve(&self.config);
-            let hit = best_template_hit(
-                &frame.image,
-                Some(self.config.screen.secondary_hall_rect.into()),
+            let search_rect = secondary_hall_search_rect(
+                self.config.screen.secondary_hall_rect.into(),
+                self.config.invite.friend_list_region.into(),
+            );
+            let friend_list: Rect = self.config.invite.friend_list_region.into();
+            let locator = UiLocator::new(
+                canvas,
+                FrameArgs { image: None },
+                self.config.window.clone(),
+                self.config.timing.workflow.default_poll_ms,
+            );
+            let hit = workflow_actions::click_scrollable_template(
+                &locator,
                 &templates.secondary_hall_template,
+                search_rect,
+                friend_list,
                 templates.chat_templates.marker_threshold,
+                workflow_actions::ScrollTemplateOptions {
+                    max_scrolls: 3,
+                    scroll_length: -8,
+                    settle_ms: self.config.timing.input.click_ms,
+                },
+                || self.running.load(AtomicOrdering::SeqCst),
             )?;
-            let Some(hit) = hit else {
-                log::warn!("二级大厅恢复: 未找到当前大厅模板");
-                return Ok(false);
-            };
-            let point = hit.center();
-            log::info!("二级大厅恢复: 点击当前大厅模板 {},{}", point.x, point.y);
-            click_game_point(PointConfig::new(point.x, point.y), &self.config.window)?;
-            sleep(Duration::from_millis(self.config.timing.input.click_ms));
-            Ok(true)
+            if let Some(hit) = hit {
+                let point = hit.center();
+                log::info!(
+                    "二级大厅恢复: 已点击当前大厅模板 {},{} score={:.3}",
+                    point.x,
+                    point.y,
+                    hit.score
+                );
+                sleep(Duration::from_millis(self.config.timing.input.click_ms));
+                return Ok(true);
+            }
+            log::warn!("二级大厅恢复: 滚动好友列表后仍未找到当前大厅模板");
+            Ok(false)
         }
 
         fn secondary_title_is_current_hall(&self) -> Result<bool> {
@@ -5474,7 +5579,8 @@ mod app {
             self.reply_batch(
                 &[
                     "成语接龙: @接龙 开始 成语;同音模式用 @同音接龙 开始 成语;可用 @提示/@解释",
-                    "斗地主: @斗地主 开始,@加入,@出 牌组/@过;也可用 $/＄出牌,好友私聊 @手牌",
+                    "斗地主: @斗地主 开始,@加入,@抢地主/@不抢,@出 牌组/@过;也可用 $/＄出牌,好友私聊 @手牌",
+                    "跑得快: @跑得快 开始,@加入,@出 牌组/@过;也可用 $/＄出牌,好友私聊 @手牌",
                     "海龟汤: @海龟汤/@海龟汤开始用于开局或重发汤面,@海龟汤状态查看进度,以#开头提问",
                     "海龟汤长答案: ##1第一段,##2第二段,最后发送##提交",
                     "谁是卧底: @卧底开始/@卧底双卧底模式,@卧底加入/@卧底开局/@卧底状态/@卧底退出",
@@ -5507,56 +5613,63 @@ mod app {
 
         fn execute_landlord_command(&self, player: &str, command: &LandlordCommand) -> Result<()> {
             match command {
-                LandlordCommand::Start => {
+                LandlordCommand::Start | LandlordCommand::RunFastStart => {
+                    let kind = card_game_start_kind(command).expect("start command has game kind");
+                    let label = kind.label();
                     if !self.config.landlord.enabled {
-                        return self.reply("斗地主未启用");
+                        return self.reply(&format!("{}未启用", label));
                     }
                     if self.landlord()?.is_active() {
                         let outcome = self.landlord()?.handle(player, command, Instant::now());
                         return self.deliver_landlord_task_outcome(outcome);
                     }
-                    match self
-                        .entertainment
-                        .try_acquire(EntertainmentKind::Landlord)?
-                    {
+                    match self.entertainment.try_acquire(kind)? {
                         AcquireOutcome::Acquired => {}
                         AcquireOutcome::AlreadyOwned => {}
                         AcquireOutcome::Occupied(kind) => {
-                            return self
-                                .reply(&format!("{}正在进行，请结束后再开始斗地主", kind.label()));
+                            return self.reply(&format!(
+                                "{}正在进行，请结束后再开始{}",
+                                kind.label(),
+                                label
+                            ));
                         }
                     }
-                    let verified = match self
-                        .send_unique_friend_message(player, "斗地主报名成功，请回到大厅等待组局")
-                    {
+                    let verified = match self.send_unique_friend_message(
+                        player,
+                        &format!("{}报名成功，请回到大厅等待组局", label),
+                    ) {
                         Ok(verified) => verified,
                         Err(error) => {
-                            self.entertainment.release(EntertainmentKind::Landlord);
+                            self.entertainment.release(kind);
                             return Err(error);
                         }
                     };
                     if !verified {
-                        self.entertainment.release(EntertainmentKind::Landlord);
-                        return self.reply("斗地主报名失败：好友列表未找到唯一昵称");
+                        self.entertainment.release(kind);
+                        return self.reply(&format!("{}报名失败：好友列表未找到唯一昵称", label));
                     }
                     let outcome = self.landlord()?.handle(player, command, Instant::now());
                     if outcome.action != "created" {
-                        self.entertainment.release(EntertainmentKind::Landlord);
+                        self.entertainment.release(kind);
                     }
                     self.deliver_landlord_task_outcome(outcome)
                 }
                 LandlordCommand::Join => {
-                    if self.entertainment.active() != Some(EntertainmentKind::Landlord)
+                    let active_kind = self.entertainment.active();
+                    if !active_kind.is_some_and(is_card_game_kind)
                         || !self.landlord()?.is_lobby()
                         || self.landlord()?.lobby_contains(player)
                     {
                         let outcome = self.landlord()?.handle(player, command, Instant::now());
                         return self.deliver_landlord_task_outcome(outcome);
                     }
-                    let verified = self
-                        .send_unique_friend_message(player, "斗地主报名成功，请回到大厅等待开局")?;
+                    let label = active_kind.expect("active card game").label();
+                    let verified = self.send_unique_friend_message(
+                        player,
+                        &format!("{}报名成功，请回到大厅等待开局", label),
+                    )?;
                     if !verified {
-                        return self.reply("斗地主报名失败：好友列表未找到唯一昵称");
+                        return self.reply(&format!("{}报名失败：好友列表未找到唯一昵称", label));
                     }
                     let outcome = self.landlord()?.handle(player, command, Instant::now());
                     self.deliver_landlord_task_outcome(outcome)
@@ -5568,10 +5681,7 @@ mod app {
                             Ok(true) => {}
                             Ok(false) => {
                                 self.landlord()?.retry_hand_delivery(player);
-                                return Err(anyhow!(
-                                    "斗地主手牌发送失败：好友列表未找到 {}",
-                                    player
-                                ));
+                                return Err(anyhow!("牌局手牌发送失败：好友列表未找到 {}", player));
                             }
                             Err(error) => {
                                 self.landlord()?.retry_hand_delivery(player);
@@ -5589,11 +5699,41 @@ mod app {
         }
 
         fn deliver_landlord_task_outcome(&self, outcome: LandlordOutcome) -> Result<()> {
-            if outcome.ended {
-                self.entertainment.release(EntertainmentKind::Landlord);
+            if outcome.ended
+                && let Some(kind) = self
+                    .entertainment
+                    .active()
+                    .filter(|kind| is_card_game_kind(*kind))
+            {
+                self.entertainment.release(kind);
+            }
+            for delivery in outcome.private_deliveries {
+                match self.send_friend_message(&delivery.player, &delivery.message) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        self.abort_card_game_after_delivery_failure()?;
+                        return Err(anyhow!("牌局发牌失败：好友列表未找到 {}", delivery.player));
+                    }
+                    Err(error) => {
+                        self.abort_card_game_after_delivery_failure()?;
+                        return Err(error);
+                    }
+                }
             }
             if let Some(reply) = outcome.public_reply {
                 self.reply(&reply)?;
+            }
+            Ok(())
+        }
+
+        fn abort_card_game_after_delivery_failure(&self) -> Result<()> {
+            self.landlord()?.abort();
+            if let Some(kind) = self
+                .entertainment
+                .active()
+                .filter(|kind| is_card_game_kind(*kind))
+            {
+                self.entertainment.release(kind);
             }
             Ok(())
         }
@@ -5633,7 +5773,6 @@ mod app {
                     let verified = match self.send_stable_unique_friend_message(
                         &parsed.username,
                         "谁是卧底报名成功，请回到大厅等待组局",
-                        self.config.undercover.nickname_stable_count,
                     ) {
                         Ok(verified) => verified,
                         Err(error) => {
@@ -5665,7 +5804,6 @@ mod app {
                     let verified = self.send_stable_unique_friend_message(
                         &parsed.username,
                         "谁是卧底报名成功，请回到大厅等待开局",
-                        self.config.undercover.nickname_stable_count,
                     )?;
                     if !verified {
                         return self.reply("谁是卧底报名失败：好友列表未找到唯一昵称");
@@ -6775,6 +6913,19 @@ mod app {
         }
 
         #[test]
+        fn secondary_hall_search_covers_the_scrollable_friend_list() {
+            let anchor = Rect::new(10, 190, 65, 55);
+            let friend_list = Rect::new(80, 280, 170, 600);
+
+            let search = secondary_hall_search_rect(anchor, friend_list);
+
+            assert_eq!(search.x, 10);
+            assert_eq!(search.y, 190);
+            assert_eq!(search.right(), 250);
+            assert_eq!(search.bottom(), 880);
+        }
+
+        #[test]
         fn temporary_primary_stage_overrides_secondary_residency() {
             assert_eq!(
                 listener_residency(ChatListenerMode::Secondary, true),
@@ -6806,8 +6957,15 @@ mod app {
         #[test]
         fn landlord_uses_executor_only_for_friend_ui_operations() {
             assert!(landlord_command_requires_executor(&LandlordCommand::Start));
+            assert!(landlord_command_requires_executor(
+                &LandlordCommand::RunFastStart
+            ));
             assert!(landlord_command_requires_executor(&LandlordCommand::Join));
             assert!(landlord_command_requires_executor(&LandlordCommand::Hand));
+            assert!(landlord_command_requires_executor(&LandlordCommand::Rob));
+            assert!(landlord_command_requires_executor(
+                &LandlordCommand::Decline
+            ));
             assert!(!landlord_command_requires_executor(&LandlordCommand::Play(
                 "3".to_string()
             )));

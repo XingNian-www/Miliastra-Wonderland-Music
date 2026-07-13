@@ -2,7 +2,7 @@
 # 坐标沿用旧脚本习惯：以游戏客户区左上角为原点，按 1920x1080 有效画面写坐标
 
 # 配置版本；程序启动时会把旧版本配置迁移到当前模板
-config_version: 25
+config_version: 26
 
 window:
   # 目标游戏进程名，按进程文件名匹配，大小写不敏感；多个进程名可用逗号分隔
@@ -37,6 +37,12 @@ screen:
     y: 1018
     width: 50
     height: 40
+  # 二级聊天界面左上角返回按钮模板检测区域
+  secondary_back_rect:
+    x: 15
+    y: 15
+    width: 65
+    height: 65
   # 二级大厅/面板界面模板检测区域
   secondary_hall_rect:
     x: 10
@@ -208,6 +214,8 @@ templates:
   pink_marker: assets/chat-marker-pink.png
   # 一级聊天界面的好友按钮模板
   friend: assets/ui-primary-friend.png
+  # 二级聊天界面左上角返回按钮模板，用于稳定判断二级界面
+  secondary_back: assets/ui-secondary-back.png
   # 二级大厅/面板界面模板
   secondary_hall: assets/ui-secondary-hall.png
   # 邀请流程里的“查看千星”按钮模板
@@ -238,11 +246,7 @@ output:
   focus_point:
     x: 1919
     y: 1000
-  # 打开聊天输入后的第一次点击位置
-  chat_click_1:
-    x: 120
-    y: 225
-  # 打开聊天输入后的第二次点击位置，通常是输入框位置
+  # 打开聊天输入后的输入框位置
   chat_click_2:
     x: 600
     y: 1013
@@ -397,9 +401,6 @@ undercover:
   progress_interval_seconds: 20
   progress_batch_size: 3
   description_max_width: 70
-  # 创建或加入时，好友列表昵称必须连续唯一识别多少次才确认报名；小于 1 按 1 处理
-  nickname_stable_count: 2
-
 turtle_soup:
   # 海龟汤娱乐模块默认关闭；启用前必须准备正式题库并配置独立 AI Provider
   enabled: false
@@ -596,12 +597,20 @@ startup:
     y: 310
 
 invite:
+  # 好友备注在左侧列表和聊天内容区必须连续完整匹配多少次；小于 1 按 1 处理
+  friend_name_stable_count: 2
   # 好友列表 OCR 区域，用于查找发起邀请的用户名
   friend_list_region:
     x: 80
     y: 280
     width: 170
     height: 600
+  # 点击好友后用于确认备注的二级聊天内容区域，不使用顶部原昵称
+  friend_chat_region:
+    x: 260
+    y: 100
+    width: 920
+    height: 850
   # 邀请确认列表 OCR 区域
   confirm_list_region:
     x: 400

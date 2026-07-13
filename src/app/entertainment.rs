@@ -6,6 +6,7 @@ use anyhow::{Result, anyhow};
 pub(super) enum EntertainmentKind {
     IdiomChain,
     Landlord,
+    RunFast,
     TurtleSoup,
     Undercover,
 }
@@ -15,6 +16,7 @@ impl EntertainmentKind {
         match self {
             Self::IdiomChain => "成语接龙",
             Self::Landlord => "斗地主",
+            Self::RunFast => "跑得快",
             Self::TurtleSoup => "海龟汤",
             Self::Undercover => "谁是卧底",
         }

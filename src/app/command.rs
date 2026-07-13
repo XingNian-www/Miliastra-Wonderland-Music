@@ -689,7 +689,10 @@ fn command_lock_key(command: &UserCommand) -> String {
         },
         UserCommand::Landlord(command) => match command {
             LandlordCommand::Start => "landlord:start".to_string(),
+            LandlordCommand::RunFastStart => "run_fast:start".to_string(),
             LandlordCommand::Join => "landlord:join".to_string(),
+            LandlordCommand::Rob => "landlord:rob".to_string(),
+            LandlordCommand::Decline => "landlord:decline".to_string(),
             LandlordCommand::Status => "landlord:status".to_string(),
             LandlordCommand::Play(cards) => {
                 format!("landlord:play:{}", identity_text(cards))
@@ -925,8 +928,21 @@ fn parse_command(matched: &str, param: &str) -> Option<UserCommand> {
             _ => None,
         },
         "斗地主" => Some(UserCommand::Landlord(LandlordCommand::parse(param))),
+        "跑得快" => Some(UserCommand::Landlord(match param.trim() {
+            "" | "开始" | "创建" => LandlordCommand::RunFastStart,
+            "状态" | "查看" => LandlordCommand::Status,
+            "退出" | "结束" | "取消" => LandlordCommand::Exit,
+            "帮助" | "?" | "？" => LandlordCommand::Help,
+            _ => return None,
+        })),
         "卧底" => UndercoverCommand::parse_hall(param).map(UserCommand::Undercover),
         "加入" if param.trim().is_empty() => Some(UserCommand::Landlord(LandlordCommand::Join)),
+        "抢" | "抢地主" | "叫地主" if param.trim().is_empty() => {
+            Some(UserCommand::Landlord(LandlordCommand::Rob))
+        }
+        "不抢" | "不叫" if param.trim().is_empty() => {
+            Some(UserCommand::Landlord(LandlordCommand::Decline))
+        }
         "出" if !param.trim().is_empty() => Some(UserCommand::Landlord(LandlordCommand::Play(
             param.trim().to_string(),
         ))),
@@ -1007,6 +1023,7 @@ fn allows_param(command: &str) -> bool {
             | "解释"
             | "海龟汤"
             | "斗地主"
+            | "跑得快"
             | "卧底"
             | "出"
     )
@@ -1060,8 +1077,14 @@ const COMMANDS: &[&str] = &[
     "接龙",
     "海龟汤",
     "斗地主",
+    "跑得快",
     "卧底",
     "加入",
+    "抢地主",
+    "叫地主",
+    "不抢",
+    "不叫",
+    "抢",
     "出",
     "过",
     "歌词",
@@ -1201,7 +1224,10 @@ mod tests {
     fn parses_landlord_hall_and_friend_commands() {
         for (text, expected) in [
             ("用户：@斗地主 开始", LandlordCommand::Start),
+            ("用户：@跑得快 开始", LandlordCommand::RunFastStart),
             ("用户：@加入", LandlordCommand::Join),
+            ("用户：@抢地主", LandlordCommand::Rob),
+            ("用户：@不抢", LandlordCommand::Decline),
             ("用户：@出 3334", LandlordCommand::Play("3334".to_string())),
             ("用户：$10 10", LandlordCommand::Play("10 10".to_string())),
             ("用户：＄小王", LandlordCommand::Play("小王".to_string())),

@@ -5628,10 +5628,16 @@ mod app {
                             );
                         }
                     }
-                    let verified = self.send_unique_friend_message(
+                    let verified = match self.send_unique_friend_message(
                         &parsed.username,
                         "谁是卧底报名成功，请回到大厅等待组局",
-                    )?;
+                    ) {
+                        Ok(verified) => verified,
+                        Err(error) => {
+                            self.entertainment.release(EntertainmentKind::Undercover);
+                            return Err(error);
+                        }
+                    };
                     if !verified {
                         self.entertainment.release(EntertainmentKind::Undercover);
                         return self.reply("谁是卧底报名失败：好友列表未找到唯一昵称");

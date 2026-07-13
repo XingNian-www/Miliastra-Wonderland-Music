@@ -5630,9 +5630,10 @@ mod app {
                             );
                         }
                     }
-                    let verified = match self.send_unique_friend_message(
+                    let verified = match self.send_stable_unique_friend_message(
                         &parsed.username,
                         "谁是卧底报名成功，请回到大厅等待组局",
+                        self.config.undercover.nickname_stable_count,
                     ) {
                         Ok(verified) => verified,
                         Err(error) => {
@@ -5661,9 +5662,10 @@ mod app {
                     if self.undercover()?.lobby_contains(&parsed.username) {
                         return self.reply_undercover_error(parsed, "你已经加入本局谁是卧底");
                     }
-                    let verified = self.send_unique_friend_message(
+                    let verified = self.send_stable_unique_friend_message(
                         &parsed.username,
                         "谁是卧底报名成功，请回到大厅等待开局",
+                        self.config.undercover.nickname_stable_count,
                     )?;
                     if !verified {
                         return self.reply("谁是卧底报名失败：好友列表未找到唯一昵称");

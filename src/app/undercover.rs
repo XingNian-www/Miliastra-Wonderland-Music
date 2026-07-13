@@ -655,14 +655,6 @@ impl UndercoverGame {
                 )
             }
             GameState::Playing(game) => {
-                if game.creator_key == requester
-                    || game
-                        .players
-                        .iter()
-                        .any(|player| player.alive && player.key == requester)
-                {
-                    game.last_activity = now;
-                }
                 let snapshot = playing_progress(game);
                 format!(
                     "谁是卧底：{}，第{}轮，阶段：{}，存活：{}，进度：{}/{}",
@@ -1530,6 +1522,8 @@ mod tests {
         assert!(!early.iter().any(|delivery| matches!(delivery,
             UndercoverDelivery::HallBatch(lines)
                 if lines.first().is_some_and(|line| line.contains("谁是卧底结束")))));
+
+        let _ = game.status("甲", now + std::time::Duration::from_secs(290));
 
         let settled = game.tick(now + std::time::Duration::from_secs(300));
         assert!(!game.is_active());

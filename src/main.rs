@@ -247,6 +247,28 @@ mod app {
         DedupLimited,
     }
 
+    #[derive(Clone, Copy)]
+    struct QueuePushFeedback {
+        queued_action: &'static str,
+        full_action: &'static str,
+        queued_prefix: &'static str,
+        full_reply: &'static str,
+    }
+
+    const QUEUE_PUSH_FEEDBACK: QueuePushFeedback = QueuePushFeedback {
+        queued_action: "queue",
+        full_action: "queue-full",
+        queued_prefix: "队列已加入",
+        full_reply: "队列已满，请稍后再试",
+    };
+
+    const UNKNOWN_STATUS_QUEUE_PUSH_FEEDBACK: QueuePushFeedback = QueuePushFeedback {
+        queued_action: "queue-status-unknown",
+        full_action: "queue-full-status-unknown",
+        queued_prefix: "状态未知，队列已加入",
+        full_reply: "状态未知且队列已满，请稍后再试",
+    };
+
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum UserDecision {
         Confirm,
@@ -4587,34 +4609,30 @@ mod app {
             Ok(QueuePushOutcome::Added(len))
         }
 
-        #[allow(clippy::too_many_arguments)]
         fn handle_queue_push_outcome(
             &self,
             parsed: &ParsedCommand,
             request: &ResolvedSongRequest,
             outcome: QueuePushOutcome,
-            queued_action: &str,
-            full_action: &str,
-            queued_prefix: &str,
-            full_reply: &str,
+            feedback: QueuePushFeedback,
         ) -> Result<()> {
             match outcome {
                 QueuePushOutcome::Added(len) => {
                     self.log_executed_command(
                         parsed,
-                        &final_song_command_text(request, queued_action),
+                        &final_song_command_text(request, feedback.queued_action),
                     )?;
                     self.reply(&format!(
                         "{}({}/{}): {}",
-                        queued_prefix, len, self.config.queue.max_size, request.keyword
+                        feedback.queued_prefix, len, self.config.queue.max_size, request.keyword
                     ))?;
                 }
                 QueuePushOutcome::Full => {
                     self.log_executed_command(
                         parsed,
-                        &final_song_command_text(request, full_action),
+                        &final_song_command_text(request, feedback.full_action),
                     )?;
-                    self.reply(full_reply)?;
+                    self.reply(feedback.full_reply)?;
                 }
                 QueuePushOutcome::DedupLimited => {
                     self.log_executed_command(
@@ -4785,10 +4803,7 @@ mod app {
                             parsed,
                             &request,
                             outcome,
-                            "queue",
-                            "queue-full",
-                            "队列已加入",
-                            "队列已满，请稍后再试",
+                            QUEUE_PUSH_FEEDBACK,
                         )?;
                         return Ok(());
                     }
@@ -4832,10 +4847,7 @@ mod app {
                                     parsed,
                                     &request,
                                     outcome,
-                                    "queue",
-                                    "queue-full",
-                                    "队列已加入",
-                                    "队列已满，请稍后再试",
+                                    QUEUE_PUSH_FEEDBACK,
                                 )?;
                                 return Ok(());
                             }
@@ -4849,10 +4861,7 @@ mod app {
                                 parsed,
                                 &request,
                                 outcome,
-                                "queue",
-                                "queue-full",
-                                "队列已加入",
-                                "队列已满，请稍后再试",
+                                QUEUE_PUSH_FEEDBACK,
                             )?;
                             return Ok(());
                         }
@@ -4866,10 +4875,7 @@ mod app {
                                     parsed,
                                     &request,
                                     outcome,
-                                    "queue",
-                                    "queue-full",
-                                    "队列已加入",
-                                    "队列已满，请稍后再试",
+                                    QUEUE_PUSH_FEEDBACK,
                                 )?;
                                 return Ok(());
                             }
@@ -4881,10 +4887,7 @@ mod app {
                                 parsed,
                                 &request,
                                 outcome,
-                                "queue-status-unknown",
-                                "queue-full-status-unknown",
-                                "状态未知，队列已加入",
-                                "状态未知且队列已满，请稍后再试",
+                                UNKNOWN_STATUS_QUEUE_PUSH_FEEDBACK,
                             )?;
                             return Ok(());
                         }

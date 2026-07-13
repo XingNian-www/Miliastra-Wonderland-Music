@@ -315,29 +315,6 @@ fn days_in_month(year: i64, month: u32) -> u32 {
     }
 }
 
-#[cfg(test)]
-#[allow(clippy::items_after_test_module)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn daily_log_names_parse_both_log_streams() {
-        assert_eq!(
-            daily_log_day("miliastra-wonderland-music-2026-07-11.log"),
-            days_from_civil(2026, 7, 11)
-        );
-        assert_eq!(
-            daily_log_day("miliastra-wonderland-music-timing-2026-07-11.log"),
-            days_from_civil(2026, 7, 11)
-        );
-        assert_eq!(
-            daily_log_day("miliastra-wonderland-music-2026-02-30.log"),
-            None
-        );
-        assert_eq!(daily_log_day("unrelated.log"), None);
-    }
-}
-
 fn set_logger(logger: FileLogger) -> std::result::Result<(), SetLoggerError> {
     log::set_boxed_logger(Box::new(logger))
 }
@@ -372,4 +349,26 @@ fn is_timing_target(target: &str) -> bool {
 
 fn is_monitor_hidden_target(target: &str) -> bool {
     target == "chat_scan_result"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn daily_log_names_parse_both_log_streams() {
+        assert_eq!(
+            daily_log_day("miliastra-wonderland-music-2026-07-11.log"),
+            days_from_civil(2026, 7, 11)
+        );
+        assert_eq!(
+            daily_log_day("miliastra-wonderland-music-timing-2026-07-11.log"),
+            days_from_civil(2026, 7, 11)
+        );
+        assert_eq!(
+            daily_log_day("miliastra-wonderland-music-2026-02-30.log"),
+            None
+        );
+        assert_eq!(daily_log_day("unrelated.log"), None);
+    }
 }

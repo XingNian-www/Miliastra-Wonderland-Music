@@ -128,7 +128,7 @@ where
     let input_started = Instant::now();
     let mut enigo = Enigo::new(&Settings::default()).context("create enigo")?;
     enigo
-        .key(key.clone(), Direction::Press)
+        .key(key, Direction::Press)
         .context("press and hold key")?;
     let mut release = KeyReleaseGuard::new(&mut enigo, key);
     let deadline = Instant::now() + duration;
@@ -180,7 +180,7 @@ impl<'a> KeyReleaseGuard<'a> {
 
     fn release(&mut self) -> Result<()> {
         self.enigo
-            .key(self.key.clone(), Direction::Release)
+            .key(self.key, Direction::Release)
             .context("release held key")?;
         self.released = true;
         Ok(())
@@ -190,7 +190,7 @@ impl<'a> KeyReleaseGuard<'a> {
 impl Drop for KeyReleaseGuard<'_> {
     fn drop(&mut self) {
         if !self.released {
-            let _ = self.enigo.key(self.key.clone(), Direction::Release);
+            let _ = self.enigo.key(self.key, Direction::Release);
         }
     }
 }

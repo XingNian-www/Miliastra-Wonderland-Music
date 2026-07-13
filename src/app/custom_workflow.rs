@@ -1465,10 +1465,10 @@ impl AutomationApp {
         // 发送反馈需要等待当前好友会话的输入框接管焦点；邀请主流程则由下一步 OCR 直接确认。
         workflow_actions::wait(self.config.timing.invite.step_ms);
         let result = self.chat_output.send_current_chat(message);
-        if restore_listener_residency {
-            if let Err(error) = self.restore_listener_residency_after_task("好友发言") {
-                log::error!("好友发言后恢复监听驻留界面失败: {error:#}");
-            }
+        if restore_listener_residency
+            && let Err(error) = self.restore_listener_residency_after_task("好友发言")
+        {
+            log::error!("好友发言后恢复监听驻留界面失败: {error:#}");
         }
         result?;
         Ok(true)

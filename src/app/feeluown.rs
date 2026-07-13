@@ -455,9 +455,7 @@ fn extract_fuo_uris(text: &str) -> Vec<String> {
             .find(|(_, ch)| ch.is_whitespace())
             .map(|(index, _)| index)
             .unwrap_or(after.len());
-        let uri = after[..end]
-            .trim_end_matches(|ch: char| ch == ',' || ch == ';')
-            .to_string();
+        let uri = after[..end].trim_end_matches([',', ';']).to_string();
         if !uri.is_empty() {
             uris.push(uri);
         }

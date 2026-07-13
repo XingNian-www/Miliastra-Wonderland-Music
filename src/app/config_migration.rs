@@ -597,6 +597,16 @@ fn replace_template_value(text: &mut String, path: &[String], value: &Value) -> 
 
 fn render_key_value(indent: usize, key: &str, value: &Value) -> Result<Vec<String>> {
     let prefix = format!("{}{}:", " ".repeat(indent), key);
+    if is_multiline_string(value) {
+        let serialized = scalar_yaml(value)?;
+        let mut serialized_lines = serialized.lines();
+        let first = serialized_lines
+            .next()
+            .ok_or_else(|| anyhow!("serialized multiline yaml scalar is empty"))?;
+        let mut lines = vec![format!("{} {}", prefix, first)];
+        lines.extend(serialized_lines.map(|line| format!("{}{}", " ".repeat(indent), line)));
+        return Ok(lines);
+    }
     if is_inline_scalar(value) {
         return Ok(vec![format!("{} {}", prefix, scalar_yaml(value)?)]);
     }
@@ -743,9 +753,14 @@ fn path_key(path: &[String]) -> String {
 }
 
 fn is_inline_scalar(value: &Value) -> bool {
+    matches!(value, Value::Null | Value::Bool(_) | Value::Number(_))
+        || matches!(value, Value::String(text) if !text.contains('\n'))
+}
+
+fn is_multiline_string(value: &Value) -> bool {
     matches!(
         value,
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_)
+        Value::String(text) if text.contains('\n')
     )
 }
 
@@ -768,6 +783,57 @@ fn yaml_lines(value: &Value) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn renders_migrated_multiline_string_as_valid_yaml_block() {
+        let mut text =
+            "root:\n  prompt: |\n    默认第一行\n    默认第二行\n  next: true\n".to_string();
+        let expected = "旧配置第一行\n旧配置第二行\n";
+
+        replace_template_value(
+            &mut text,
+            &["root".to_string(), "prompt".to_string()],
+            &Value::String(expected.to_string()),
+        )
+        .expect("multiline replacement succeeds");
+
+        let parsed: Value = serde_yaml::from_str(&text).expect("rendered yaml remains valid");
+        assert_eq!(
+            get_path(&parsed, &["root", "prompt"]).and_then(Value::as_str),
+            Some(expected)
+        );
+        assert_eq!(
+            get_path(&parsed, &["root", "next"]).and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn migrates_v22_multiline_prompts_into_current_template() {
+        let old = r#"config_version: 22
+turtle_soup:
+  custom_prompt: |
+    第一条海龟汤规则。
+    第二条海龟汤规则。
+song_review:
+  custom_prompt: |
+    第一条歌曲审核规则。
+    第二条歌曲审核规则。
+"#;
+        let report = migrate_config_text(old, include_str!("../../config.yaml"))
+            .expect("migration succeeds")
+            .expect("migration needed");
+        let migrated: Value = serde_yaml::from_str(&report.text).expect("migrated yaml is valid");
+
+        assert_eq!(
+            get_path(&migrated, &["turtle_soup", "custom_prompt"]).and_then(Value::as_str),
+            Some("第一条海龟汤规则。\n第二条海龟汤规则。\n")
+        );
+        assert_eq!(
+            get_path(&migrated, &["song_review", "custom_prompt"]).and_then(Value::as_str),
+            Some("第一条歌曲审核规则。\n第二条歌曲审核规则。\n")
+        );
+    }
 
     const DEFAULT: &str = r#"# 测试配置
 # 版本注释

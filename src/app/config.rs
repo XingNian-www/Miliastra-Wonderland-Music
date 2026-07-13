@@ -9,6 +9,7 @@ use super::config_migration::{self, CURRENT_CONFIG_VERSION};
 use super::idiom_chain::IdiomChainConfig;
 use super::landlord::LandlordConfig;
 use super::turtle_soup::TurtleSoupConfig;
+use super::undercover::UndercoverConfig;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -32,6 +33,8 @@ pub struct AppConfig {
     pub idiom_chain: IdiomChainConfig,
     #[serde(default)]
     pub landlord: LandlordConfig,
+    #[serde(default)]
+    pub undercover: UndercoverConfig,
     #[serde(default)]
     pub turtle_soup: TurtleSoupConfig,
     pub ai: AiConfig,

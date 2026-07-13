@@ -2,7 +2,7 @@
 # 坐标沿用旧脚本习惯：以游戏客户区左上角为原点，按 1920x1080 有效画面写坐标
 
 # 配置版本；程序启动时会把旧版本配置迁移到当前模板
-config_version: 23
+config_version: 24
 
 window:
   # 目标游戏进程名，按进程文件名匹配，大小写不敏感；多个进程名可用逗号分隔
@@ -383,6 +383,20 @@ landlord:
   trustee_after_timeouts: 2
   # 好友私聊 @手牌 的单人查询冷却
   hand_cooldown_seconds: 10
+
+# 谁是卧底默认关闭；启用前复制 undercover.example.yaml 为 undercover.yaml 并审核词对
+undercover:
+  enabled: false
+  word_bank_path: undercover.yaml
+  used_state_path: data/undercover-used.yaml
+  min_players: 4
+  double_min_players: 6
+  max_players: 11
+  lobby_timeout_seconds: 180
+  phase_timeout_seconds: 180
+  progress_interval_seconds: 20
+  progress_batch_size: 3
+  description_max_width: 70
 
 turtle_soup:
   # 海龟汤娱乐模块默认关闭；启用前必须准备正式题库并配置独立 AI Provider

@@ -54,6 +54,7 @@ pub struct UndercoverConfig {
     pub progress_interval_seconds: u64,
     pub progress_batch_size: usize,
     pub description_max_width: usize,
+    pub nickname_stable_count: u32,
 }
 
 impl Default for UndercoverConfig {
@@ -70,6 +71,7 @@ impl Default for UndercoverConfig {
             progress_interval_seconds: 20,
             progress_batch_size: 3,
             description_max_width: 70,
+            nickname_stable_count: 2,
         }
     }
 }

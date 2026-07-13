@@ -1412,15 +1412,19 @@ impl AutomationApp {
     }
 
     pub(super) fn send_friend_message(&self, username: &str, message: &str) -> Result<bool> {
-        self.send_friend_message_with_state(username, message, true, false)
+        self.send_friend_message_with_state(username, message, true, false, true)
     }
 
     pub(super) fn send_unique_friend_message(&self, username: &str, message: &str) -> Result<bool> {
-        self.send_friend_message_with_state(username, message, true, true)
+        self.send_friend_message_with_state(username, message, true, true, true)
+    }
+
+    pub(super) fn send_secret_friend_message(&self, username: &str, message: &str) -> Result<bool> {
+        self.send_friend_message_with_state(username, message, true, true, false)
     }
 
     fn send_friend_message_keep_open(&self, username: &str, message: &str) -> Result<bool> {
-        self.send_friend_message_with_state(username, message, false, false)
+        self.send_friend_message_with_state(username, message, false, false, true)
     }
 
     fn send_friend_message_with_state(
@@ -1429,8 +1433,13 @@ impl AutomationApp {
         message: &str,
         restore_listener_residency: bool,
         require_unique_friend: bool,
+        log_content: bool,
     ) -> Result<bool> {
-        log::info!("好友发言: {} -> {}", username, message);
+        if log_content {
+            log::info!("好友发言: {} -> {}", username, message);
+        } else {
+            log::info!("好友发言: {} -> [谁是卧底秘密内容已隐藏]", username);
+        }
         let canvas = Canvas {
             width: self.config.screen.expected_width,
             height: self.config.screen.expected_height,

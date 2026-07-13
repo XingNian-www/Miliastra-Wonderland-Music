@@ -11,6 +11,8 @@ use super::window::GameWindow;
 pub(super) const MAX_CHAT_WIDTH: usize = 80;
 const OMIT: &str = "...";
 const REDACTED_TURTLE_SOUP_BOTTOM: &str = "[海龟汤汤底已隐藏]";
+const REDACTED_UNDERCOVER_SECRET: &str = "[谁是卧底秘密内容已隐藏]";
+const REDACTED_UNDERCOVER_INPUT: &str = "[谁是卧底私聊内容已隐藏]";
 
 #[derive(Debug)]
 pub(super) struct ChatBatchSendOutcome {
@@ -133,6 +135,39 @@ impl ChatOutput {
 
     pub fn send_batch_for_command(&self, messages: &[&str], delay_ms: u64) -> Result<()> {
         self.send_primary_batch(messages, delay_ms, true)
+    }
+
+    pub fn send_batch_for_command_redacted(&self, messages: &[&str], delay_ms: u64) -> Result<()> {
+        let messages = messages
+            .iter()
+            .map(|message| fit_chat_message(message))
+            .collect::<Vec<_>>();
+        log::info!("游戏内批量回复: [谁是卧底内容已隐藏] {}条", messages.len());
+        if !self.enabled {
+            log::info!("游戏内回复发送已关闭，仅记录脱敏日志");
+            return Ok(());
+        }
+        let expected = messages.len();
+        self.send_batch_interruptible_with_input(&messages, delay_ms, true, || true)
+            .into_result(expected)
+    }
+
+    pub fn send_current_chat_batch_redacted(&self, messages: &[&str], delay_ms: u64) -> Result<()> {
+        let messages = messages
+            .iter()
+            .map(|message| fit_chat_message(message))
+            .collect::<Vec<_>>();
+        log::info!(
+            "当前聊天批量回复: [谁是卧底内容已隐藏] {}条",
+            messages.len()
+        );
+        if !self.enabled {
+            log::info!("当前聊天回复发送已关闭，仅记录脱敏日志");
+            return Ok(());
+        }
+        let expected = messages.len();
+        self.send_current_chat_batch_interruptible_with_input(&messages, delay_ms, || true)
+            .into_result(expected)
     }
 
     fn send_primary_batch(
@@ -399,9 +434,27 @@ fn send_messages_interruptibly<T>(
 pub(super) fn redacted_chat_text(message: &str) -> &str {
     if contains_turtle_soup_bottom_marker(message) {
         REDACTED_TURTLE_SOUP_BOTTOM
+    } else if message.contains("你的位置：") && message.contains("你的词语：") {
+        REDACTED_UNDERCOVER_SECRET
+    } else if contains_undercover_private_input(message) {
+        REDACTED_UNDERCOVER_INPUT
     } else {
         message
     }
+}
+
+fn contains_undercover_private_input(message: &str) -> bool {
+    let body = message
+        .find(['：', ':', ']', '】'])
+        .map_or(message, |index| {
+            &message[index + message[index..].chars().next().map_or(0, char::len_utf8)..]
+        })
+        .trim_start_matches(['：', ':', ' ', '\t', ']', '】']);
+    let Some(command) = body.strip_prefix('@') else {
+        return false;
+    };
+    let command = command.trim_start();
+    command.starts_with("描述") || command.starts_with('投')
 }
 
 fn contains_turtle_soup_bottom_marker(message: &str) -> bool {
@@ -700,6 +753,30 @@ mod tests {
             REDACTED_TURTLE_SOUP_BOTTOM
         );
         assert_eq!(redacted_chat_text("汤面1/2：线索"), "汤面1/2：线索");
+    }
+
+    #[test]
+    fn undercover_word_delivery_is_redacted_only_in_logs() {
+        assert_eq!(
+            redacted_chat_text("你的位置：A；你的词语：苹果"),
+            "[谁是卧底秘密内容已隐藏]"
+        );
+        assert_eq!(
+            redacted_chat_text("A、B描述已记录（2/4）"),
+            "A、B描述已记录（2/4）"
+        );
+        assert_eq!(
+            redacted_chat_text("[玩家]：@描述 一种常见的水果"),
+            REDACTED_UNDERCOVER_INPUT
+        );
+        assert_eq!(
+            redacted_chat_text("[玩家]：@投 C"),
+            REDACTED_UNDERCOVER_INPUT
+        );
+        assert_eq!(
+            redacted_chat_text("请存活玩家好友私聊 @投 A"),
+            "请存活玩家好友私聊 @投 A"
+        );
     }
 
     #[test]

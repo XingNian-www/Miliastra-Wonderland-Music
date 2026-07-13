@@ -324,13 +324,13 @@ pub(super) fn merge_ocr_lines(mut items: Vec<OcrLine>, same_line_y_tolerance: i3
     items.sort_by(|left, right| compare_rect_top_left(left.bbox, right.bbox));
     let mut lines: Vec<(i32, Vec<OcrLine>)> = Vec::new();
     for item in items {
-        if let Some((line_y, line_items)) = lines.last_mut() {
-            if (item.bbox.y - *line_y).abs() <= same_line_y_tolerance {
-                let count = line_items.len() as i32;
-                *line_y = ((*line_y * count) + item.bbox.y) / (count + 1);
-                line_items.push(item);
-                continue;
-            }
+        if let Some((line_y, line_items)) = lines.last_mut()
+            && (item.bbox.y - *line_y).abs() <= same_line_y_tolerance
+        {
+            let count = line_items.len() as i32;
+            *line_y = ((*line_y * count) + item.bbox.y) / (count + 1);
+            line_items.push(item);
+            continue;
         }
         lines.push((item.bbox.y, vec![item]));
     }

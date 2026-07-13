@@ -18,7 +18,7 @@ pub(super) struct SongDedupCandidate {
     pub(super) prefer_accompaniment: bool,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 struct SongDedupEntry {
     uri: String,
@@ -27,19 +27,6 @@ struct SongDedupEntry {
     source: String,
     prefer_accompaniment: bool,
     played_at: u64,
-}
-
-impl Default for SongDedupEntry {
-    fn default() -> Self {
-        Self {
-            uri: String::new(),
-            title: String::new(),
-            artist: String::new(),
-            source: String::new(),
-            prefer_accompaniment: false,
-            played_at: 0,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -264,11 +251,11 @@ fn replace_file(temporary: &Path, target: &Path) -> Result<()> {
 }
 
 fn ensure_parent(path: &Path) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("创建长时间同歌去重历史目录失败: {}", parent.display()))?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("创建长时间同歌去重历史目录失败: {}", parent.display()))?;
     }
     Ok(())
 }

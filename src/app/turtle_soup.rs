@@ -1104,10 +1104,10 @@ impl TurtleSoupService {
                 None
             }
         };
-        if let Some(reason) = reason {
-            if let Err(error) = self.begin_settlement(reason) {
-                log::error!("海龟汤自动结算失败: {error:#}");
-            }
+        if let Some(reason) = reason
+            && let Err(error) = self.begin_settlement(reason)
+        {
+            log::error!("海龟汤自动结算失败: {error:#}");
         }
     }
 
@@ -2582,7 +2582,7 @@ mod tests {
     裁决备注: 无
     启用: true
 "#;
-        assert!(parse_question_bank(&duplicate, Path::new("test.yaml")).is_err());
+        assert!(parse_question_bank(duplicate, Path::new("test.yaml")).is_err());
     }
 
     #[test]
@@ -3156,9 +3156,11 @@ mod tests {
 
     #[test]
     fn start_validates_ai_before_reading_or_consuming_a_puzzle() {
-        let mut config = TurtleSoupConfig::default();
-        config.enabled = true;
-        config.question_bank_path = PathBuf::from("missing-turtle-soup-bank.yaml");
+        let config = TurtleSoupConfig {
+            enabled: true,
+            question_bank_path: PathBuf::from("missing-turtle-soup-bank.yaml"),
+            ..TurtleSoupConfig::default()
+        };
         let service = TurtleSoupService::new(
             config,
             EntertainmentCoordinator::new(),
@@ -3227,8 +3229,10 @@ mod tests {
     }
 
     fn active_test_service() -> TurtleSoupService {
-        let mut config = TurtleSoupConfig::default();
-        config.enabled = true;
+        let config = TurtleSoupConfig {
+            enabled: true,
+            ..TurtleSoupConfig::default()
+        };
         let service = TurtleSoupService::new(
             config,
             EntertainmentCoordinator::new(),

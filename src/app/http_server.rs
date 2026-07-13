@@ -481,6 +481,7 @@ struct EnqueueReceipt {
 }
 
 impl HttpSharedState {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         config: AppConfig,
         queue: Arc<Mutex<PersistentQueue>>,
@@ -2681,17 +2682,17 @@ fn is_allowed_origin(request: &Request, host: &str, port: u16) -> bool {
     };
     let origin = header_value(request, "origin");
     let fetch_site = header_value(request, "sec-fetch-site");
-    if let Some(origin_value) = origin {
-        if !is_same_origin(origin_value, &request_host) {
-            return false;
-        }
+    if let Some(origin_value) = origin
+        && !is_same_origin(origin_value, &request_host)
+    {
+        return false;
     }
-    if origin.is_none() {
-        if let Some(fetch_site_value) = fetch_site {
-            if fetch_site_value != "same-origin" && fetch_site_value != "none" {
-                return false;
-            }
-        }
+    if origin.is_none()
+        && let Some(fetch_site_value) = fetch_site
+        && fetch_site_value != "same-origin"
+        && fetch_site_value != "none"
+    {
+        return false;
     }
     true
 }
@@ -2701,9 +2702,7 @@ fn allowed_request_host(
     configured_host: &str,
     configured_port: u16,
 ) -> Option<String> {
-    let Some((host, port)) = parse_host_header(value) else {
-        return None;
-    };
+    let (host, port) = parse_host_header(value)?;
     if port.is_some_and(|port| port != configured_port) {
         return None;
     }
@@ -2786,16 +2785,16 @@ fn cors_headers(request: &Request, host: &str, port: u16) -> Vec<(String, String
     let request_host = header_value(request, "host")
         .and_then(|value| allowed_request_host(value, host, port))
         .unwrap_or_else(|| format_host_port(&normalize_host_name(host), port));
-    if let Some(origin) = header_value(request, "origin") {
-        if is_same_origin(origin, &request_host) {
-            return vec![
-                (
-                    "Access-Control-Allow-Origin".to_string(),
-                    origin.to_string(),
-                ),
-                ("Vary".to_string(), "Origin".to_string()),
-            ];
-        }
+    if let Some(origin) = header_value(request, "origin")
+        && is_same_origin(origin, &request_host)
+    {
+        return vec![
+            (
+                "Access-Control-Allow-Origin".to_string(),
+                origin.to_string(),
+            ),
+            ("Vary".to_string(), "Origin".to_string()),
+        ];
     }
     Vec::new()
 }

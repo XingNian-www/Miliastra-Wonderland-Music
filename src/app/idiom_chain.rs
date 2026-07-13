@@ -552,14 +552,13 @@ impl IdiomLexicon {
     }
 
     fn successors(&self, first: char, mode: IdiomChainMode) -> Option<&Vec<String>> {
-        let entries = match mode {
+        match mode {
             IdiomChainMode::Exact => self.entries_by_first.get(&first),
             IdiomChainMode::Homophone => pinyin_key(first)
                 .as_ref()
                 .and_then(|pinyin| self.entries_by_first_pinyin.get(pinyin))
                 .or_else(|| self.entries_by_first.get(&first)),
-        };
-        entries
+        }
     }
 
     fn len(&self) -> usize {

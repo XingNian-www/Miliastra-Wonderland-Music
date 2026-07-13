@@ -280,7 +280,7 @@ fn event_log_height(total_height: u16) -> u16 {
     let max_height = total_height
         .saturating_sub(STATUS_HEIGHT + MIN_NARROW_DASHBOARD_HEIGHT)
         .max(3);
-    desired.max(8).min(18).min(max_height)
+    desired.clamp(8, 18).min(max_height)
 }
 
 fn ocr_queue_row_height(total_height: u16) -> u16 {

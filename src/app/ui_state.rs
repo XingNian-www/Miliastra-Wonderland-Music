@@ -23,7 +23,7 @@ pub(super) struct UiState {
     blue_count: usize,
     yellow_count: usize,
     pink_count: usize,
-    hall_visible: bool,
+    secondary_visible: bool,
     friend_visible: bool,
     source: &'static str,
 }
@@ -35,7 +35,7 @@ impl UiState {
             blue_count: 0,
             yellow_count: 0,
             pink_count: 0,
-            hall_visible: false,
+            secondary_visible: false,
             friend_visible: true,
             source: "friend",
         }
@@ -47,21 +47,21 @@ impl UiState {
             blue_count,
             yellow_count,
             pink_count,
-            hall_visible: false,
+            secondary_visible: false,
             friend_visible: false,
             source: "marker",
         }
     }
 
-    fn secondary_hall() -> Self {
+    fn secondary_chat() -> Self {
         Self {
             state: UiStateKind::Secondary,
             blue_count: 0,
             yellow_count: 0,
             pink_count: 0,
-            hall_visible: true,
+            secondary_visible: true,
             friend_visible: false,
-            source: "hall",
+            source: "back",
         }
     }
 
@@ -71,7 +71,7 @@ impl UiState {
             blue_count: 0,
             yellow_count: 0,
             pink_count: 0,
-            hall_visible: false,
+            secondary_visible: false,
             friend_visible: false,
             source: "none",
         }
@@ -97,7 +97,7 @@ impl std::fmt::Display for UiState {
                 "primary:marker blue={} yellow={} pink={}",
                 self.blue_count, self.yellow_count, self.pink_count
             ),
-            UiStateKind::Secondary => write!(formatter, "secondary:hall"),
+            UiStateKind::Secondary => write!(formatter, "secondary:chat"),
             UiStateKind::Unknown => write!(formatter, "unknown"),
         }
     }
@@ -120,7 +120,7 @@ pub(super) fn detect_ui_state(
     {
         let friend_ms = elapsed_ms(friend_started);
         log::info!(target: "timing",
-            "UI 状态检测耗时: total={}ms friend={}ms hall=0ms marker=0ms state=primary_friend",
+            "UI 状态检测耗时: total={}ms friend={}ms back=0ms marker=0ms state=primary_friend",
             elapsed_ms(started),
             friend_ms
         );
@@ -128,25 +128,25 @@ pub(super) fn detect_ui_state(
     }
     let friend_ms = elapsed_ms(friend_started);
 
-    let hall_started = Instant::now();
+    let back_started = Instant::now();
     if best_template_hit(
         image,
-        Some(screen.secondary_hall_rect.into()),
-        &templates.secondary_hall_template,
+        Some(screen.secondary_back_rect.into()),
+        &templates.secondary_back_template,
         templates.chat_templates.marker_threshold,
     )?
     .is_some()
     {
-        let hall_ms = elapsed_ms(hall_started);
+        let back_ms = elapsed_ms(back_started);
         log::info!(target: "timing",
-            "UI 状态检测耗时: total={}ms friend={}ms hall={}ms marker=0ms state=secondary_hall",
+            "UI 状态检测耗时: total={}ms friend={}ms back={}ms marker=0ms state=secondary_chat",
             elapsed_ms(started),
             friend_ms,
-            hall_ms
+            back_ms
         );
-        return Ok(UiState::secondary_hall());
+        return Ok(UiState::secondary_chat());
     }
-    let hall_ms = elapsed_ms(hall_started);
+    let back_ms = elapsed_ms(back_started);
 
     let marker_started = Instant::now();
     let (blue, yellow, pink) =
@@ -154,10 +154,10 @@ pub(super) fn detect_ui_state(
     let marker_ms = elapsed_ms(marker_started);
     if blue + yellow + pink > 0 {
         log::info!(target: "timing",
-            "UI 状态检测耗时: total={}ms friend={}ms hall={}ms marker={}ms state=primary_marker blue={} yellow={} pink={}",
+            "UI 状态检测耗时: total={}ms friend={}ms back={}ms marker={}ms state=primary_marker blue={} yellow={} pink={}",
             elapsed_ms(started),
             friend_ms,
-            hall_ms,
+            back_ms,
             marker_ms,
             blue,
             yellow,
@@ -167,10 +167,10 @@ pub(super) fn detect_ui_state(
     }
 
     log::info!(target: "timing",
-        "UI 状态检测耗时: total={}ms friend={}ms hall={}ms marker={}ms state=unknown",
+        "UI 状态检测耗时: total={}ms friend={}ms back={}ms marker={}ms state=unknown",
         elapsed_ms(started),
         friend_ms,
-        hall_ms,
+        back_ms,
         marker_ms
     );
     Ok(UiState::unknown())
@@ -191,5 +191,14 @@ mod tests {
         assert_eq!(state.to_string(), "primary:friend");
         assert!(state.friend_visible);
         assert_eq!(state.source, "friend");
+    }
+
+    #[test]
+    fn back_anchor_identifies_secondary_chat_without_the_hall_row() {
+        let state = UiState::secondary_chat();
+
+        assert_eq!(state.to_string(), "secondary:chat");
+        assert!(state.secondary_visible);
+        assert_eq!(state.source, "back");
     }
 }

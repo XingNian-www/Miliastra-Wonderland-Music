@@ -1,12 +1,20 @@
+use std::path::PathBuf;
 use std::thread::sleep;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use enigo::{Direction, Enigo, Key, Keyboard, Settings};
 
-use super::config::{OutputConfig, TimingConfig, WindowConfig};
+use super::FrameArgs;
+use super::config::{
+    InviteConfig, OutputConfig, ScreenConfig, TemplateConfig, TimingConfig, WindowConfig,
+};
+use super::frame_source::Canvas;
+use super::geometry::Rect;
 use super::input_actions;
+use super::ui_locator::UiLocator;
 use super::window::GameWindow;
+use super::workflow_actions::{self, ScrollTemplateOptions};
 
 pub(super) const MAX_CHAT_WIDTH: usize = 80;
 const OMIT: &str = "...";
@@ -73,15 +81,38 @@ pub struct ChatOutput {
     config: OutputConfig,
     timing: TimingConfig,
     window: WindowConfig,
+    canvas: Canvas,
+    secondary_hall_template: PathBuf,
+    secondary_hall_search_region: Rect,
+    friend_list_region: Rect,
+    template_threshold: f32,
 }
 
 impl ChatOutput {
-    pub fn new(config: &OutputConfig, timing: &TimingConfig, window: &WindowConfig) -> Self {
+    pub fn new(
+        config: &OutputConfig,
+        timing: &TimingConfig,
+        window: &WindowConfig,
+        screen: &ScreenConfig,
+        templates: &TemplateConfig,
+        invite: &InviteConfig,
+    ) -> Self {
+        let hall_anchor: Rect = screen.secondary_hall_rect.into();
+        let friend_list_region: Rect = invite.friend_list_region.into();
         Self {
             enabled: config.send_enabled,
             config: config.clone(),
             timing: timing.clone(),
             window: window.clone(),
+            canvas: Canvas {
+                width: screen.expected_width,
+                height: screen.expected_height,
+                resize: true,
+            },
+            secondary_hall_template: templates.secondary_hall.clone(),
+            secondary_hall_search_region: bounding_rect(hall_anchor, friend_list_region),
+            friend_list_region,
+            template_threshold: templates.marker_threshold,
         }
     }
 
@@ -336,10 +367,35 @@ impl ChatOutput {
         }
         sleep_ms(self.timing.input.open_chat_ms);
 
+        let locator = UiLocator::new(
+            self.canvas.clone(),
+            FrameArgs { image: None },
+            self.window.clone(),
+            self.timing.workflow.default_poll_ms,
+        );
+        let hall_hit = workflow_actions::click_scrollable_template(
+            &locator,
+            &self.secondary_hall_template,
+            self.secondary_hall_search_region,
+            self.friend_list_region,
+            self.template_threshold,
+            ScrollTemplateOptions {
+                max_scrolls: 3,
+                scroll_length: -8,
+                settle_ms: self.timing.input.click_ms,
+            },
+            &mut should_continue,
+        );
+        match hall_hit {
+            Ok(Some(_)) => sleep_ms(self.timing.input.click_ms),
+            Ok(None) => {
+                return ChatBatchSendOutcome::failed(0, anyhow!("发送前未找到当前大厅模板"));
+            }
+            Err(error) => return ChatBatchSendOutcome::failed(0, error),
+        }
+
         let outcome = send_messages_interruptibly(messages, delay_ms, should_continue, |message| {
             (|| -> Result<()> {
-                window.click(&mut enigo, self.config.chat_click_1)?;
-                sleep_ms(self.timing.input.click_ms);
                 window.click(&mut enigo, self.config.chat_click_2)?;
                 sleep_ms(self.timing.input.open_chat_ms);
                 input_message(&mut enigo, message, self.timing.input.text_ms, &self.window)?;
@@ -382,6 +438,14 @@ impl ChatOutput {
         sleep_ms(self.timing.input.click_ms);
         Ok(())
     }
+}
+
+fn bounding_rect(left: Rect, right: Rect) -> Rect {
+    let x = left.x.min(right.x);
+    let y = left.y.min(right.y);
+    let far_right = left.right().max(right.right());
+    let bottom = left.bottom().max(right.bottom());
+    Rect::new(x, y, (far_right - x) as u32, (bottom - y) as u32)
 }
 
 fn primary_chat_should_close_directly(restore_after_task: bool) -> bool {

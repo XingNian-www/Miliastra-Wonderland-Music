@@ -362,41 +362,6 @@ pub(super) fn latest_incoming_bubble_rect(image: &DynamicImage) -> Option<Rect> 
     ))
 }
 
-pub(super) fn lowest_dark_chat_box_center(
-    image: &DynamicImage,
-    search_rect: Rect,
-) -> Option<Point> {
-    let region = bounded_rect(image, search_rect)?;
-    let min_pixels_per_row = ((region.width as usize * 2) / 5).clamp(30, 120);
-    let mut candidates = Vec::new();
-    let mut active_start = None;
-    let mut active_end = region.y;
-
-    for y in region.y..region.bottom() {
-        let dark_pixels = (region.x..region.right())
-            .filter(|x| {
-                let pixel = image.get_pixel(*x as u32, y as u32).0;
-                is_incoming_bubble(pixel[0], pixel[1], pixel[2])
-            })
-            .count();
-        if dark_pixels >= min_pixels_per_row {
-            if active_start.is_none() {
-                active_start = Some(y);
-            }
-            active_end = y;
-            continue;
-        }
-        push_dark_chat_box_candidate(&mut candidates, active_start.take(), active_end);
-    }
-    push_dark_chat_box_candidate(&mut candidates, active_start, active_end);
-
-    let candidate = candidates.last()?;
-    Some(Point::new(
-        region.x + region.width as i32 / 2,
-        (*candidate.start() + *candidate.end()) / 2,
-    ))
-}
-
 pub(super) fn latest_incoming_fingerprint(
     image: &DynamicImage,
 ) -> Result<Option<ChangeFingerprint>> {
@@ -540,20 +505,6 @@ fn push_unread_group(
     });
 }
 
-fn push_dark_chat_box_candidate(
-    candidates: &mut Vec<std::ops::RangeInclusive<i32>>,
-    start: Option<i32>,
-    end: i32,
-) {
-    let Some(start) = start else {
-        return;
-    };
-    let height = end - start + 1;
-    if (28..=160).contains(&height) {
-        candidates.push(start..=end);
-    }
-}
-
 fn bounded_rect(image: &DynamicImage, rect: Rect) -> Option<Rect> {
     let right = rect.right().min(image.width() as i32);
     let bottom = rect.bottom().min(image.height() as i32);
@@ -649,44 +600,6 @@ mod tests {
             latest_incoming_bubble_rect(&DynamicImage::ImageRgba8(image)).expect("latest bubble");
         assert!(rect.y >= 670);
         assert!(rect.bottom() >= 790);
-    }
-
-    #[test]
-    fn finds_lowest_dark_chat_box_center_in_requested_region() {
-        let mut image = RgbaImage::new(800, 600);
-        for top in [180, 330] {
-            for y in top..top + 80 {
-                for x in 120..280 {
-                    image.put_pixel(x, y, Rgba([62, 71, 89, 255]));
-                }
-            }
-        }
-
-        let point = lowest_dark_chat_box_center(
-            &DynamicImage::ImageRgba8(image),
-            Rect::new(100, 100, 200, 400),
-        )
-        .expect("lowest dark chat box");
-        assert_eq!(point.x, 200);
-        assert!((point.y - 369).abs() <= 1);
-    }
-
-    #[test]
-    fn ignores_dark_chat_box_that_is_too_narrow() {
-        let mut image = RgbaImage::new(800, 600);
-        for y in 200..280 {
-            for x in 120..180 {
-                image.put_pixel(x, y, Rgba([62, 71, 89, 255]));
-            }
-        }
-
-        assert!(
-            lowest_dark_chat_box_center(
-                &DynamicImage::ImageRgba8(image),
-                Rect::new(100, 100, 200, 400),
-            )
-            .is_none()
-        );
     }
 
     #[test]

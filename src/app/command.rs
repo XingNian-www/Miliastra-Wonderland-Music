@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use super::idiom_chain::{IdiomChainCommand, IdiomChainMode};
 use super::landlord::LandlordCommand;
 use super::turtle_soup::TurtleSoupCommand;
+use super::undercover::UndercoverCommand;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ParsedCommand {
@@ -33,9 +34,11 @@ pub enum UserCommand {
     HallDetect,
     HallTime,
     Help,
+    EntertainmentHelp,
     IdiomChain(IdiomChainCommand),
     Landlord(LandlordCommand),
     TurtleSoup(TurtleSoupCommand),
+    Undercover(UndercoverCommand),
     Invite(InviteCommand),
     Moderation(ModerationCommand),
     Microphone { username: String },
@@ -170,7 +173,13 @@ pub fn parse_text(text: &str, message_type: &str) -> Option<ParsedCommand> {
     let after_sep = &text[sep_index + text[sep_index..].chars().next()?.len_utf8()..];
     let raw_command_text = after_sep.trim_start_matches(['：', ':', ' ', '\t', ']', '】']);
     let user_command = user_command_text(raw_command_text);
-    let (matched, after_command) = if let Some(rest) = idiom_chain_alias_args(raw_command_text) {
+    let normalized_undercover = normalize_undercover_hall_command(raw_command_text);
+    let (matched, after_command) = if let Some(rest) = normalized_undercover
+        .as_deref()
+        .and_then(|text| text.strip_prefix("卧底"))
+    {
+        ("卧底", rest)
+    } else if let Some(rest) = idiom_chain_alias_args(raw_command_text) {
         ("接龙", rest)
     } else if let Some(rest) = landlord_play_alias_args(raw_command_text) {
         ("出", rest)
@@ -212,6 +221,15 @@ pub fn parse_text(text: &str, message_type: &str) -> Option<ParsedCommand> {
     })
 }
 
+fn normalize_undercover_hall_command(command_text: &str) -> Option<String> {
+    let text = command_text.strip_prefix('@')?;
+    let normalized = text
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>();
+    normalized.starts_with("卧底").then_some(normalized)
+}
+
 fn idiom_chain_alias_args(command_text: &str) -> Option<&str> {
     command_text
         .strip_prefix('!')
@@ -234,6 +252,43 @@ fn parse_pink_text(text: &str) -> Option<ParsedCommand> {
     let raw_command_text = after_sep.trim_start_matches(['：', ':', ' ', '\t', ']', '】']);
     let user_command = user_command_text(raw_command_text);
     let command_text = raw_command_text.strip_prefix('@')?.trim_start();
+    if let Some(rest) = strip_ascii_case_prefix(command_text, "描述") {
+        let description = rest
+            .trim_start_matches(['：', ':', ' ', '\t'])
+            .trim_end_matches([']', '】'])
+            .trim();
+        if description.is_empty() {
+            return None;
+        }
+        return Some(ParsedCommand {
+            matched: "描述".to_string(),
+            raw: "描述".to_string(),
+            user_command,
+            message_type: "pink".to_string(),
+            username,
+            command: UserCommand::Undercover(UndercoverCommand::Describe(description.to_string())),
+        });
+    }
+    if let Some(rest) = strip_ascii_case_prefix(command_text, "投") {
+        let value = rest
+            .chars()
+            .filter(|ch| !ch.is_whitespace() && !matches!(ch, '：' | ':' | ']' | '】'))
+            .collect::<String>()
+            .to_ascii_uppercase();
+        let mut chars = value.chars();
+        let position = chars.next()?;
+        if chars.next().is_some() || !('A'..='K').contains(&position) {
+            return None;
+        }
+        return Some(ParsedCommand {
+            matched: "投".to_string(),
+            raw: format!("投 {position}"),
+            user_command,
+            message_type: "pink".to_string(),
+            username,
+            command: UserCommand::Undercover(UndercoverCommand::Vote(position)),
+        });
+    }
     if strip_ascii_case_prefix(command_text, "手牌")
         .is_some_and(|rest| command_boundary(rest.chars().next()))
     {
@@ -515,7 +570,10 @@ impl CommandLockState {
 
 pub fn lock_key(command: &ParsedCommand) -> String {
     let key = command_lock_key(&command.command);
-    if matches!(command.command, UserCommand::Landlord(_)) {
+    if matches!(
+        command.command,
+        UserCommand::Landlord(_) | UserCommand::Undercover(_)
+    ) {
         format!("{}:{}", key, identity_text(&command.username))
     } else {
         key
@@ -525,6 +583,12 @@ pub fn lock_key(command: &ParsedCommand) -> String {
 pub fn same_lock_command(left: &ParsedCommand, right: &ParsedCommand) -> bool {
     if matches!(left.command, UserCommand::Landlord(_))
         && matches!(right.command, UserCommand::Landlord(_))
+        && identity_text(&left.username) != identity_text(&right.username)
+    {
+        return false;
+    }
+    if matches!(left.command, UserCommand::Undercover(_))
+        && matches!(right.command, UserCommand::Undercover(_))
         && identity_text(&left.username) != identity_text(&right.username)
     {
         return false;
@@ -602,6 +666,7 @@ fn command_lock_key(command: &UserCommand) -> String {
         UserCommand::HallDetect => "hall_detect".to_string(),
         UserCommand::HallTime => "hall_time".to_string(),
         UserCommand::Help => "help".to_string(),
+        UserCommand::EntertainmentHelp => "entertainment_help".to_string(),
         UserCommand::IdiomChain(command) => match command {
             IdiomChainCommand::Start { idiom, mode } => {
                 format!("idiom_chain:start:{}", identity_text(idiom))
@@ -638,6 +703,19 @@ fn command_lock_key(command: &UserCommand) -> String {
             TurtleSoupCommand::Start => "turtle_soup:start".to_string(),
             TurtleSoupCommand::Status => "turtle_soup:status".to_string(),
             TurtleSoupCommand::End => "turtle_soup:end".to_string(),
+        },
+        UserCommand::Undercover(command) => match command {
+            UndercoverCommand::CreateSingle => "undercover:create:single".to_string(),
+            UndercoverCommand::CreateDouble => "undercover:create:double".to_string(),
+            UndercoverCommand::Join => "undercover:join".to_string(),
+            UndercoverCommand::Start => "undercover:start".to_string(),
+            UndercoverCommand::Status => "undercover:status".to_string(),
+            UndercoverCommand::Exit => "undercover:exit".to_string(),
+            UndercoverCommand::End => "undercover:end".to_string(),
+            UndercoverCommand::Describe(text) => {
+                format!("undercover:describe:{}", identity_text(text))
+            }
+            UndercoverCommand::Vote(position) => format!("undercover:vote:{position}"),
         },
         UserCommand::Invite(invite) => {
             if let Some(seq) = invite.seq {
@@ -827,6 +905,7 @@ fn parse_command(matched: &str, param: &str) -> Option<UserCommand> {
         "大厅检测" => Some(UserCommand::HallDetect),
         "大厅时间" => Some(UserCommand::HallTime),
         "帮助" => Some(UserCommand::Help),
+        "娱乐" | "娱乐帮助" => Some(UserCommand::EntertainmentHelp),
         "接龙" | "成语接龙" => Some(UserCommand::IdiomChain(IdiomChainCommand::parse(param))),
         "同音接龙" => Some(UserCommand::IdiomChain(IdiomChainCommand::parse_homophone(
             param,
@@ -846,6 +925,7 @@ fn parse_command(matched: &str, param: &str) -> Option<UserCommand> {
             _ => None,
         },
         "斗地主" => Some(UserCommand::Landlord(LandlordCommand::parse(param))),
+        "卧底" => UndercoverCommand::parse_hall(param).map(UserCommand::Undercover),
         "加入" if param.trim().is_empty() => Some(UserCommand::Landlord(LandlordCommand::Join)),
         "出" if !param.trim().is_empty() => Some(UserCommand::Landlord(LandlordCommand::Play(
             param.trim().to_string(),
@@ -927,6 +1007,7 @@ fn allows_param(command: &str) -> bool {
             | "解释"
             | "海龟汤"
             | "斗地主"
+            | "卧底"
             | "出"
     )
 }
@@ -970,6 +1051,8 @@ const COMMANDS: &[&str] = &[
     "音量",
     "状态",
     "帮助",
+    "娱乐帮助",
+    "娱乐",
     "解释",
     "提示",
     "同音接龙",
@@ -977,6 +1060,7 @@ const COMMANDS: &[&str] = &[
     "接龙",
     "海龟汤",
     "斗地主",
+    "卧底",
     "加入",
     "出",
     "过",
@@ -1130,6 +1214,50 @@ mod tests {
         let hand = parse_text("[用户]：@手牌", "pink").expect("parse private hand command");
         assert_eq!(hand.command, UserCommand::Landlord(LandlordCommand::Hand));
         assert!(parse_text("用户：@手牌", "blue").is_none());
+    }
+
+    #[test]
+    fn parses_undercover_commands_without_caring_about_spaces_or_chat_punctuation() {
+        let cases = [
+            ("用户：@卧底开始", UndercoverCommand::CreateSingle),
+            (
+                "用户：@卧 底 双 卧 底 模 式",
+                UndercoverCommand::CreateDouble,
+            ),
+            ("用户：@卧底加入", UndercoverCommand::Join),
+            ("用户：@卧底开局", UndercoverCommand::Start),
+            ("用户：@卧底状态", UndercoverCommand::Status),
+            ("用户：@卧底退出", UndercoverCommand::Exit),
+            ("用户：@卧底结束", UndercoverCommand::End),
+        ];
+        for (text, expected) in cases {
+            let parsed = parse_text(text, "blue").expect(text);
+            assert_eq!(parsed.command, UserCommand::Undercover(expected));
+        }
+        assert_eq!(
+            parse_text("用户：@娱乐", "blue").unwrap().command,
+            UserCommand::EntertainmentHelp
+        );
+        assert_eq!(
+            parse_text("用户：@娱乐帮助", "blue").unwrap().command,
+            UserCommand::EntertainmentHelp
+        );
+    }
+
+    #[test]
+    fn parses_undercover_description_and_vote_only_from_friend_chat() {
+        let description = parse_text("[用户]：@描述 一种常见事物", "pink").unwrap();
+        assert_eq!(
+            description.command,
+            UserCommand::Undercover(UndercoverCommand::Describe("一种常见事物".to_string()))
+        );
+        let vote = parse_text("[用户]：@投 c", "pink").unwrap();
+        assert_eq!(
+            vote.command,
+            UserCommand::Undercover(UndercoverCommand::Vote('C'))
+        );
+        assert!(parse_text("用户：@描述 一种常见事物", "blue").is_none());
+        assert!(parse_text("用户：@投 A", "blue").is_none());
     }
 
     #[test]

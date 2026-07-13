@@ -49,6 +49,8 @@ mod app {
     mod turtle_soup_bank;
     mod ui_locator;
     mod ui_state;
+    mod undercover;
+    mod undercover_bank;
     mod web_tools;
     mod window;
     mod workflow_actions;
@@ -121,6 +123,8 @@ mod app {
         QuestionSubmitOutcome, SecondaryOcrObservation, SecondaryOcrStability, TurtleSoupService,
     };
     use self::ui_state::{UiState, detect_ui_state};
+    use self::undercover::{UndercoverCommand, UndercoverDelivery, UndercoverGame, UndercoverMode};
+    use self::undercover_bank::UndercoverBankStore;
     use self::web_tools::{WebToolRequest, WebToolShared, WebToolTask, WebToolTemplate};
     use anyhow::{Context, Result, anyhow};
     use enigo::Key;
@@ -350,6 +354,8 @@ mod app {
         entertainment: EntertainmentCoordinator,
         idiom_chain: Arc<Mutex<IdiomChainGame>>,
         landlord: Arc<Mutex<LandlordGame>>,
+        undercover: Arc<Mutex<UndercoverGame>>,
+        undercover_bank: UndercoverBankStore,
         turtle_soup: TurtleSoupService,
         deferred_chat: DeferredChatQueue,
         queue: Arc<Mutex<PersistentQueue>>,
@@ -493,6 +499,9 @@ mod app {
             discard_only: bool,
         },
         RestoreSecondaryHall,
+        UndercoverDelivery {
+            deliveries: Vec<UndercoverDelivery>,
+        },
     }
 
     struct TrackedPendingTask {
@@ -553,6 +562,7 @@ mod app {
                     }
                 }
                 Self::RestoreSecondaryHall => "二级监听恢复当前大厅".to_string(),
+                Self::UndercoverDelivery { .. } => "发送谁是卧底阶段消息".to_string(),
             }
         }
 
@@ -573,7 +583,8 @@ mod app {
                 }
                 Self::SetChatListenerMode { .. }
                 | Self::SecondaryUnread { .. }
-                | Self::RestoreSecondaryHall => false,
+                | Self::RestoreSecondaryHall
+                | Self::UndercoverDelivery { .. } => false,
             }
         }
 
@@ -596,7 +607,8 @@ mod app {
                 | Self::ModerationVoteResult { .. }
                 | Self::SetChatListenerMode { .. }
                 | Self::SecondaryUnread { .. }
-                | Self::RestoreSecondaryHall => false,
+                | Self::RestoreSecondaryHall
+                | Self::UndercoverDelivery { .. } => false,
             }
         }
 
@@ -611,7 +623,8 @@ mod app {
                 | Self::ConsoleChat { .. }
                 | Self::StartGame { .. }
                 | Self::EnterWonderland { .. }
-                | Self::ModerationVoteResult { .. } => true,
+                | Self::ModerationVoteResult { .. }
+                | Self::UndercoverDelivery { .. } => true,
             }
         }
     }
@@ -841,6 +854,11 @@ mod app {
             }
             let idiom_chain = Arc::new(Mutex::new(idiom_chain_game));
             let landlord = Arc::new(Mutex::new(LandlordGame::new(config.landlord.clone())));
+            let undercover = Arc::new(Mutex::new(UndercoverGame::new(config.undercover.clone())));
+            let undercover_bank = UndercoverBankStore::new(
+                config.undercover.word_bank_path.clone(),
+                config.undercover.used_state_path.clone(),
+            );
             let deferred_chat = DeferredChatQueue::new(DEFERRED_CHAT_CAPACITY);
             let turtle_soup = TurtleSoupService::new(
                 config.turtle_soup.clone(),
@@ -864,6 +882,8 @@ mod app {
                 entertainment,
                 idiom_chain,
                 landlord,
+                undercover,
+                undercover_bank,
                 turtle_soup,
                 deferred_chat,
                 queue,
@@ -1227,6 +1247,8 @@ mod app {
                 entertainment: self.entertainment.clone(),
                 idiom_chain: self.idiom_chain.clone(),
                 landlord: self.landlord.clone(),
+                undercover: self.undercover.clone(),
+                undercover_bank: self.undercover_bank.clone(),
                 turtle_soup: self.turtle_soup.clone(),
                 deferred_chat: self.deferred_chat.clone(),
                 queue: self.queue.clone(),
@@ -1287,6 +1309,12 @@ mod app {
             self.landlord
                 .lock()
                 .map_err(|_| anyhow!("landlord mutex poisoned"))
+        }
+
+        fn undercover(&self) -> Result<MutexGuard<'_, UndercoverGame>> {
+            self.undercover
+                .lock()
+                .map_err(|_| anyhow!("undercover mutex poisoned"))
         }
 
         fn ocr_engine(&self) -> Result<MutexGuard<'_, OcrEngineState>> {
@@ -1448,6 +1476,7 @@ mod app {
                 Arc::clone(&self.pending),
                 self.chat_listener.clone(),
                 self.turtle_soup.clone(),
+                self.undercover.clone(),
                 self.monitor.clone(),
                 self.task_tracker.clone(),
                 self.decision_control.clone(),
@@ -2376,6 +2405,15 @@ mod app {
 
         pub(super) fn abort_entertainment_for_context_loss(&self, reason: &str) {
             self.turtle_soup.abort_for_context_loss(reason);
+            match self.undercover.lock() {
+                Ok(mut game) => {
+                    if game.abort() {
+                        self.entertainment.release(EntertainmentKind::Undercover);
+                        log::warn!("谁是卧底已因聊天上下文变化中止: {}", reason);
+                    }
+                }
+                Err(_) => log::error!("谁是卧底状态锁已损坏，无法中止旧牌局"),
+            }
             match self.landlord.lock() {
                 Ok(mut game) => {
                     if game.abort() {
@@ -2409,6 +2447,23 @@ mod app {
                     }
                 }
                 Err(_) => log::error!("斗地主状态锁已损坏，无法推进回合计时"),
+            }
+            match self.undercover.lock() {
+                Ok(mut game) => {
+                    let deliveries = game.tick(Instant::now());
+                    let ended = !game.is_active();
+                    drop(game);
+                    if ended {
+                        self.entertainment.release(EntertainmentKind::Undercover);
+                    }
+                    if !deliveries.is_empty()
+                        && let Err(error) =
+                            self.push_pending_task(PendingTask::UndercoverDelivery { deliveries })
+                    {
+                        log::error!("谁是卧底计时消息入队失败: {error:#}");
+                    }
+                }
+                Err(_) => log::error!("谁是卧底状态锁已损坏，无法推进计时"),
             }
             match self.idiom_chain.lock() {
                 Ok(mut game) => {
@@ -2693,6 +2748,9 @@ mod app {
                     .map(|_| PendingTaskExecution::Completed),
                 PendingTask::RestoreSecondaryHall => self
                     .execute_restore_secondary_hall_task()
+                    .map(|_| PendingTaskExecution::Completed),
+                PendingTask::UndercoverDelivery { deliveries } => self
+                    .deliver_undercover_deliveries(deliveries)
                     .map(|_| PendingTaskExecution::Completed),
             };
             match result {
@@ -3807,10 +3865,15 @@ mod app {
 
         fn execute_pending_command(&mut self, pending: PendingCommand) -> Result<()> {
             self.ensure_game_ready_for_input("命令执行前准备")?;
+            let command_log = private_safe_command_log(&pending.parsed);
             log::info!(
                 "执行待处理命令: {} lock={}",
-                pending.parsed.raw,
-                pending.lock_key
+                command_log,
+                if is_private_undercover_input(&pending.parsed) {
+                    "[hidden]"
+                } else {
+                    pending.lock_key.as_str()
+                }
             );
             let _console_reply_context = if pending.parsed.message_type == "控制台" {
                 Some(ConsoleReplyContextGuard::new(Arc::clone(
@@ -3823,19 +3886,19 @@ mod app {
             match self.execute_command(&pending.parsed) {
                 Ok(()) => {
                     let command_ms = elapsed_ms(command_started);
-                    log::info!("命令执行完成: {}", pending.parsed.raw);
+                    log::info!("命令执行完成: {}", command_log);
                     log::info!(target: "timing",
                         "命令执行耗时: command={} success=true total={}ms",
-                        pending.parsed.raw,
+                        command_log,
                         command_ms
                     );
                 }
                 Err(error) => {
                     let command_ms = elapsed_ms(command_started);
-                    log::error!("命令执行失败 {}: {error:#}", pending.parsed.raw);
+                    log::error!("命令执行失败 {}: {error:#}", command_log);
                     log::info!(target: "timing",
                         "命令执行耗时: command={} success=false total={}ms",
-                        pending.parsed.raw,
+                        command_log,
                         command_ms
                     );
                     return Err(error);
@@ -4933,6 +4996,10 @@ mod app {
                     self.log_executed_command(parsed, "help")?;
                     self.send_help()?;
                 }
+                UserCommand::EntertainmentHelp => {
+                    self.log_executed_command(parsed, "entertainment help")?;
+                    self.send_entertainment_help()?;
+                }
                 UserCommand::IdiomChain(command) => {
                     if idiom_command_requires_executor(command) {
                         self.execute_idiom_explanation(&parsed.username, command)?;
@@ -4947,6 +5014,9 @@ mod app {
                 UserCommand::TurtleSoup(_) => {
                     log::warn!("海龟汤命令错误进入主执行器，改由娱乐模块处理");
                     let _ = self.handle_turtle_soup_command(parsed)?;
+                }
+                UserCommand::Undercover(command) => {
+                    self.execute_undercover_command(parsed, command)?;
                 }
                 UserCommand::Invite(invite) => {
                     if let Some(seq) = invite.seq {
@@ -5391,12 +5461,22 @@ mod app {
             self.reply_batch(
                 &[
                     "点歌示例: @点歌/@AI点歌 歌名 歌手 伴奏,输入伴奏时优先匹配伴奏",
-                    "命令以@开头: 暂停、继续、播放、下一首、上一首、状态、歌词、帮助、队列、音量1-100",
                     "切换网易平台: @网易点歌 歌名 歌手 伴奏,默认为QQ平台",
+                    "可用 @QQ点歌/@网易点歌 指定来源,@AI点歌用于智能识别歌名歌手",
+                ],
+                self.config.timing.command.help_batch_ms,
+            )
+        }
+
+        fn send_entertainment_help(&self) -> Result<()> {
+            self.reply_batch(
+                &[
                     "成语接龙: @接龙 开始 成语;同音模式用 @同音接龙 开始 成语;可用 @提示/@解释",
                     "斗地主: @斗地主 开始,@加入,@出 牌组/@过;也可用 $/＄出牌,好友私聊 @手牌",
                     "海龟汤: @海龟汤/@海龟汤开始用于开局或重发汤面,@海龟汤状态查看进度,以#开头提问",
                     "海龟汤长答案: ##1第一段,##2第二段,最后发送##提交",
+                    "谁是卧底: @卧底开始/@卧底双卧底模式,@卧底加入/@卧底开局/@卧底状态/@卧底退出",
+                    "谁是卧底进行中好友私聊 @描述 内容/@投 A;创建者可用 @卧底结束",
                 ],
                 self.config.timing.command.help_batch_ms,
             )
@@ -5512,6 +5592,241 @@ mod app {
             }
             if let Some(reply) = outcome.public_reply {
                 self.reply(&reply)?;
+            }
+            Ok(())
+        }
+
+        fn execute_undercover_command(
+            &self,
+            parsed: &ParsedCommand,
+            command: &UndercoverCommand,
+        ) -> Result<()> {
+            let now = Instant::now();
+            match command {
+                UndercoverCommand::CreateSingle | UndercoverCommand::CreateDouble => {
+                    if !self.config.undercover.enabled {
+                        return self.reply("谁是卧底未启用");
+                    }
+                    let mode = if matches!(command, UndercoverCommand::CreateDouble) {
+                        UndercoverMode::Double
+                    } else {
+                        UndercoverMode::Single
+                    };
+                    match self
+                        .entertainment
+                        .try_acquire(EntertainmentKind::Undercover)?
+                    {
+                        AcquireOutcome::Acquired => {}
+                        AcquireOutcome::AlreadyOwned => {
+                            return self
+                                .reply_undercover_error(parsed, "已有谁是卧底房间或牌局进行中");
+                        }
+                        AcquireOutcome::Occupied(kind) => {
+                            return self.reply_undercover_error(
+                                parsed,
+                                &format!("{}正在进行，请结束后再开始谁是卧底", kind.label()),
+                            );
+                        }
+                    }
+                    let verified = self.send_unique_friend_message(
+                        &parsed.username,
+                        "谁是卧底报名成功，请回到大厅等待组局",
+                    )?;
+                    if !verified {
+                        self.entertainment.release(EntertainmentKind::Undercover);
+                        return self.reply("谁是卧底报名失败：好友列表未找到唯一昵称");
+                    }
+                    if let Err(error) = self.undercover()?.create(&parsed.username, mode, now) {
+                        self.entertainment.release(EntertainmentKind::Undercover);
+                        return self.reply_undercover_error(parsed, &error.to_string());
+                    }
+                    let status = self.undercover()?.status(&parsed.username, now);
+                    self.reply(&status)
+                }
+                UndercoverCommand::Join => {
+                    if self.entertainment.active() != Some(EntertainmentKind::Undercover) {
+                        return self.reply_undercover_error(parsed, "当前没有谁是卧底报名房间");
+                    }
+                    if !self.undercover()?.is_lobby() {
+                        return self.reply_undercover_error(parsed, "谁是卧底已经开局");
+                    }
+                    if self.undercover()?.lobby_contains(&parsed.username) {
+                        return self.reply_undercover_error(parsed, "你已经加入本局谁是卧底");
+                    }
+                    let verified = self.send_unique_friend_message(
+                        &parsed.username,
+                        "谁是卧底报名成功，请回到大厅等待开局",
+                    )?;
+                    if !verified {
+                        return self.reply("谁是卧底报名失败：好友列表未找到唯一昵称");
+                    }
+                    if let Err(error) = self.undercover()?.join(&parsed.username, now) {
+                        return self.reply_undercover_error(parsed, &error.to_string());
+                    }
+                    if self.undercover()?.lobby_is_full() {
+                        self.start_undercover_game(None)
+                    } else {
+                        let status = self.undercover()?.status(&parsed.username, now);
+                        self.reply(&status)
+                    }
+                }
+                UndercoverCommand::Start => {
+                    let requester =
+                        (parsed.message_type != "控制台").then_some(parsed.username.as_str());
+                    self.start_undercover_game(requester)
+                }
+                UndercoverCommand::Status => {
+                    let message = self.undercover()?.status(&parsed.username, now);
+                    self.reply(&message)
+                }
+                UndercoverCommand::Exit => {
+                    let outcome = { self.undercover()?.exit(&parsed.username, now) };
+                    match outcome {
+                        Ok(deliveries) => {
+                            let ended = !self.undercover()?.is_active();
+                            if ended {
+                                self.entertainment.release(EntertainmentKind::Undercover);
+                            }
+                            self.deliver_undercover_deliveries(deliveries)
+                        }
+                        Err(error) => self.reply_undercover_error(parsed, &error.to_string()),
+                    }
+                }
+                UndercoverCommand::End => {
+                    let requester =
+                        (parsed.message_type != "控制台").then_some(parsed.username.as_str());
+                    let outcome = { self.undercover()?.end(requester) };
+                    match outcome {
+                        Ok(deliveries) => {
+                            self.entertainment.release(EntertainmentKind::Undercover);
+                            self.deliver_undercover_deliveries(deliveries)
+                        }
+                        Err(error) => self.reply_undercover_error(parsed, &error.to_string()),
+                    }
+                }
+                UndercoverCommand::Describe(description) => {
+                    let outcome = self
+                        .undercover()?
+                        .describe(&parsed.username, description, now);
+                    match outcome {
+                        Ok(deliveries) => self.deliver_undercover_deliveries(deliveries),
+                        Err(error) => self.reply_undercover_error(parsed, &error.to_string()),
+                    }
+                }
+                UndercoverCommand::Vote(position) => {
+                    let outcome = { self.undercover()?.vote(&parsed.username, *position, now) };
+                    match outcome {
+                        Ok(deliveries) => {
+                            let ended = !self.undercover()?.is_active();
+                            if ended {
+                                self.entertainment.release(EntertainmentKind::Undercover);
+                            }
+                            self.deliver_undercover_deliveries(deliveries)
+                        }
+                        Err(error) => self.reply_undercover_error(parsed, &error.to_string()),
+                    }
+                }
+            }
+        }
+
+        fn start_undercover_game(&self, requester: Option<&str>) -> Result<()> {
+            let now = Instant::now();
+            let seed = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos() as u64)
+                .unwrap_or_default();
+            let deliveries = {
+                let mut game = self.undercover()?;
+                if let Err(error) = game.authorize_start(requester) {
+                    return self.reply(&error.to_string());
+                }
+                let words = match self.undercover_bank.consume_random(seed) {
+                    Ok(words) => words,
+                    Err(error) => return self.reply(&error.to_string()),
+                };
+                game.start(words, now)?
+            };
+            for delivery in deliveries {
+                let UndercoverDelivery::Friend { player, message } = delivery else {
+                    continue;
+                };
+                let mut sent = false;
+                for attempt in 1..=2 {
+                    match self.send_secret_friend_message(&player, &message) {
+                        Ok(true) => {
+                            sent = true;
+                            break;
+                        }
+                        Ok(false) => log::warn!(
+                            "谁是卧底发词确认失败: player={} attempt={}",
+                            player,
+                            attempt
+                        ),
+                        Err(error) => log::warn!(
+                            "谁是卧底发词异常: player={} attempt={} error={:#}",
+                            player,
+                            attempt,
+                            error
+                        ),
+                    }
+                }
+                if !sent {
+                    let canceled = self.undercover()?.cancel_delivery();
+                    self.entertainment.release(EntertainmentKind::Undercover);
+                    self.deliver_undercover_deliveries(canceled)?;
+                    return Ok(());
+                }
+            }
+            let opening = self.undercover()?.complete_delivery(Instant::now())?;
+            self.deliver_undercover_deliveries(opening)
+        }
+
+        fn reply_undercover_error(&self, parsed: &ParsedCommand, message: &str) -> Result<()> {
+            if parsed.message_type == "pink" {
+                if !self.send_friend_message(&parsed.username, message)? {
+                    log::warn!("谁是卧底私聊错误回复失败: player={}", parsed.username);
+                }
+                Ok(())
+            } else {
+                self.reply(message)
+            }
+        }
+
+        fn deliver_undercover_deliveries(&self, deliveries: Vec<UndercoverDelivery>) -> Result<()> {
+            for delivery in deliveries {
+                match delivery {
+                    UndercoverDelivery::Hall(message) => self.reply(&message)?,
+                    UndercoverDelivery::HallBatch(messages) => {
+                        let refs = messages.iter().map(String::as_str).collect::<Vec<_>>();
+                        match self.active_ui_residency() {
+                            UiResidency::Primary => {
+                                self.ensure_ui_residency(
+                                    UiResidency::Primary,
+                                    "发送谁是卧底批量消息",
+                                )?;
+                                self.chat_output.send_batch_for_command_redacted(
+                                    &refs,
+                                    self.config.timing.command.help_batch_ms,
+                                )?;
+                            }
+                            UiResidency::SecondaryCurrentHall => {
+                                self.ensure_ui_residency(
+                                    UiResidency::SecondaryCurrentHall,
+                                    "发送谁是卧底批量消息",
+                                )?;
+                                self.chat_output.send_current_chat_batch_redacted(
+                                    &refs,
+                                    self.config.timing.command.help_batch_ms,
+                                )?;
+                            }
+                        }
+                    }
+                    UndercoverDelivery::Friend { player, message } => {
+                        if !self.send_secret_friend_message(&player, &message)? {
+                            return Err(anyhow!("谁是卧底好友消息发送失败: {}", player));
+                        }
+                    }
+                }
             }
             Ok(())
         }
@@ -6163,6 +6478,21 @@ mod app {
                 &song.friend_username
             }
             _ => &parsed.username,
+        }
+    }
+
+    fn is_private_undercover_input(parsed: &ParsedCommand) -> bool {
+        matches!(
+            &parsed.command,
+            UserCommand::Undercover(UndercoverCommand::Describe(_) | UndercoverCommand::Vote(_))
+        )
+    }
+
+    fn private_safe_command_log(parsed: &ParsedCommand) -> &str {
+        match &parsed.command {
+            UserCommand::Undercover(UndercoverCommand::Describe(_)) => "谁是卧底描述",
+            UserCommand::Undercover(UndercoverCommand::Vote(_)) => "谁是卧底投票",
+            _ => &parsed.raw,
         }
     }
 

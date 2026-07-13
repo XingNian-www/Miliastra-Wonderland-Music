@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow};
 
 use super::config::{PointConfig, RectConfig, WindowConfig};
-use super::geometry::Point;
+use super::geometry::{Point, Rect};
 use super::input_actions::{
     activate_game, click_game_point, focus_game, hold_key, parse_key, paste_text, press_key,
 };
@@ -317,6 +317,58 @@ where
         action.label()
     );
     Ok(Some(hit))
+}
+
+pub(super) struct ScrollTemplateOptions {
+    pub(super) max_scrolls: u32,
+    pub(super) scroll_length: i32,
+    pub(super) settle_ms: u64,
+}
+
+pub(super) fn click_scrollable_template<F>(
+    locator: &UiLocator,
+    template: &Path,
+    search_region: Rect,
+    scroll_region: Rect,
+    threshold: f32,
+    options: ScrollTemplateOptions,
+    mut should_continue: F,
+) -> Result<Option<TemplateHit>>
+where
+    F: FnMut() -> bool,
+{
+    let started = Instant::now();
+    for attempt in 0..=options.max_scrolls {
+        if !should_continue() {
+            return Ok(None);
+        }
+        if let Some(hit) = locator
+            .region(search_region)
+            .find_template_with_threshold(template, threshold)?
+        {
+            locator.click_point(hit.center())?;
+            log::info!(target: "timing",
+                "原子动作耗时: action=click_scrollable_template total={}ms scrolls={} hit=true score={:.3} template={}",
+                elapsed_ms(started),
+                attempt,
+                hit.score,
+                template.display()
+            );
+            return Ok(Some(hit));
+        }
+        if attempt == options.max_scrolls {
+            break;
+        }
+        locator.scroll_point(scroll_region.center(), options.scroll_length)?;
+        wait(options.settle_ms);
+    }
+    log::info!(target: "timing",
+        "原子动作耗时: action=click_scrollable_template total={}ms scrolls={} hit=false template={}",
+        elapsed_ms(started),
+        options.max_scrolls,
+        template.display()
+    );
+    Ok(None)
 }
 
 pub(super) fn wait_or_click_text<F>(

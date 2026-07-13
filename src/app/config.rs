@@ -140,9 +140,20 @@ pub struct ScreenConfig {
     pub chat_rect: RectConfig,
     #[serde(alias = "enter_rect")]
     pub friend_rect: RectConfig,
+    #[serde(default = "default_secondary_back_rect")]
+    pub secondary_back_rect: RectConfig,
     pub secondary_hall_rect: RectConfig,
     pub hall_name_rect: RectConfig,
     pub hall_time_rect: RectConfig,
+}
+
+fn default_secondary_back_rect() -> RectConfig {
+    RectConfig {
+        x: 15,
+        y: 15,
+        width: 65,
+        height: 65,
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -274,6 +285,8 @@ pub struct TemplateConfig {
     pub pink_marker: PathBuf,
     #[serde(alias = "enter")]
     pub friend: PathBuf,
+    #[serde(default = "default_secondary_back_template")]
+    pub secondary_back: PathBuf,
     pub secondary_hall: PathBuf,
     pub invite_view_star: PathBuf,
     pub invite_goto_hall: PathBuf,
@@ -285,6 +298,10 @@ pub struct TemplateConfig {
     pub friend_blacklist: PathBuf,
     pub friend_confirm: PathBuf,
     pub marker_threshold: f32,
+}
+
+fn default_secondary_back_template() -> PathBuf {
+    PathBuf::from("assets/ui-secondary-back.png")
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -305,7 +322,6 @@ pub struct ModerationConfig {
 pub struct OutputConfig {
     pub send_enabled: bool,
     pub focus_point: PointConfig,
-    pub chat_click_1: PointConfig,
     pub chat_click_2: PointConfig,
 }
 
@@ -638,11 +654,28 @@ fn default_wonderland_enter_button_template() -> PathBuf {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InviteConfig {
+    #[serde(default = "default_friend_name_stable_count")]
+    pub friend_name_stable_count: u32,
     pub friend_list_region: RectConfig,
+    #[serde(default = "default_friend_chat_region")]
+    pub friend_chat_region: RectConfig,
     pub confirm_list_region: RectConfig,
     pub view_star_region: RectConfig,
     pub goto_hall_region: RectConfig,
     pub enter_hall_region: RectConfig,
+}
+
+fn default_friend_name_stable_count() -> u32 {
+    2
+}
+
+fn default_friend_chat_region() -> RectConfig {
+    RectConfig {
+        x: 260,
+        y: 100,
+        width: 920,
+        height: 850,
+    }
 }
 
 #[cfg(test)]

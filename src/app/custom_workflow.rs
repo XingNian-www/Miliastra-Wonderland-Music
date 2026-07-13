@@ -5,12 +5,11 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use super::chat_listener::lowest_dark_chat_box_center;
 use super::command::{self, CustomWorkflowCommand, ModerationAction, ParsedCommand, UserCommand};
 use super::config::{self, CustomWorkflowConfig, CustomWorkflowDefinition, PointConfig};
 use super::decision_lock::DecisionScreenLock;
 use super::frame_source::{Canvas, load_frame};
-use super::ui_locator::UiLocator;
+use super::ui_locator::{UiLocator, text_contains_complete_target};
 use super::workflow_actions::{self, HitAction, PixelStability, TemplateMode};
 use super::{
     AutomationApp, ChatDecisionScope, FrameArgs, PendingTask, PendingTaskExecution, TemplateArgs,
@@ -736,7 +735,11 @@ impl AutomationApp {
         };
         if friend_chat_open {
             log::info!("邀请: 已在目标好友会话，直接继续邀请步骤");
-        } else if !self.open_friend_chat(username, &canvas)? {
+        } else if !self.open_friend_chat(
+            username,
+            &canvas,
+            self.config.invite.friend_name_stable_count,
+        )? {
             return Ok(false);
         }
         let locator = self.ui_locator_with_canvas(canvas.clone(), self.template_poll_ms());
@@ -1362,84 +1365,93 @@ impl AutomationApp {
         Ok(hit.is_some())
     }
 
-    fn click_text_atom(
-        &self,
-        locator: &UiLocator,
-        expected: &str,
-        region: config::RectConfig,
-        timeout_ms: u64,
-        label: &str,
-    ) -> Result<bool> {
-        let point = workflow_actions::wait_or_click_text(
-            locator,
-            expected,
-            region,
-            timeout_ms,
-            HitAction::Click {
-                offset: PointConfig::new(0, 0),
-            },
-            || self.running.load(AtomicOrdering::SeqCst),
-            |region, expected| {
-                let engine = self.ocr_engine()?;
-                Ok(region
-                    .find_text(&engine.engine, expected)?
-                    .map(|hit| hit.center()))
-            },
-        )?;
-        if point.is_none() {
-            log::error!("等待{}文字超时: {}", label, expected);
-        }
-        Ok(point.is_some())
-    }
-
     fn click_invite_target(&self, locator: &UiLocator, username: &str) -> Result<bool> {
-        let region = self.config.invite.confirm_list_region;
-        let frame = locator.capture()?;
-        if let Some(point) = lowest_dark_chat_box_center(&frame.image, region.into()) {
-            log::info!("邀请: 检测到最下方深色好友会话框，直接点击");
-            locator.click_point(point)?;
-            return Ok(true);
+        let region = locator.region(self.config.invite.confirm_list_region.into());
+        let deadline =
+            Instant::now() + Duration::from_millis(self.config.timing.workflow.default_timeout_ms);
+        let required_streak = self.config.invite.friend_name_stable_count.max(1);
+        let mut streak = 0_u32;
+        while Instant::now() < deadline && self.running.load(AtomicOrdering::SeqCst) {
+            let point = {
+                let engine = self.ocr_engine()?;
+                region
+                    .find_text_hits(&engine.engine, username)?
+                    .into_iter()
+                    .map(|hit| hit.center())
+                    .max_by_key(|point| point.y)
+            };
+            if let Some(point) = point {
+                streak = streak.saturating_add(1);
+                if streak >= required_streak {
+                    locator.click_point(point)?;
+                    log::info!(
+                        "邀请: 好友昵称完整稳定匹配，点击 {} samples={} x={} y={}",
+                        username,
+                        required_streak,
+                        point.x,
+                        point.y
+                    );
+                    return Ok(true);
+                }
+            } else {
+                streak = 0;
+            }
+            workflow_actions::wait(locator.poll_ms());
         }
-
-        log::info!("邀请: 未检测到深色好友会话框，回退 OCR 查找 {}", username);
-        self.click_text_atom(
-            locator,
+        log::error!(
+            "邀请: 聊天区未稳定找到好友昵称 {} samples={}",
             username,
-            region,
-            self.config.timing.workflow.default_timeout_ms,
-            "邀请确认列表用户名",
-        )
+            required_streak
+        );
+        Ok(false)
     }
 
     pub(super) fn send_friend_message(&self, username: &str, message: &str) -> Result<bool> {
-        self.send_friend_message_with_state(username, message, true, None, true)
+        self.send_friend_message_with_state(
+            username,
+            message,
+            true,
+            self.config.invite.friend_name_stable_count,
+            true,
+        )
     }
 
     pub(super) fn send_unique_friend_message(&self, username: &str, message: &str) -> Result<bool> {
-        self.send_friend_message_with_state(username, message, true, Some(1), true)
+        self.send_friend_message(username, message)
     }
 
     pub(super) fn send_stable_unique_friend_message(
         &self,
         username: &str,
         message: &str,
-        stable_count: u32,
     ) -> Result<bool> {
         self.send_friend_message_with_state(
             username,
             message,
             true,
-            Some(stable_count.max(1)),
+            self.config.invite.friend_name_stable_count,
             true,
         )
     }
 
     pub(super) fn send_secret_friend_message(&self, username: &str, message: &str) -> Result<bool> {
-        self.send_friend_message_with_state(username, message, true, Some(1), false)
+        self.send_friend_message_with_state(
+            username,
+            message,
+            true,
+            self.config.invite.friend_name_stable_count,
+            false,
+        )
     }
 
     fn send_friend_message_keep_open(&self, username: &str, message: &str) -> Result<bool> {
-        self.send_friend_message_with_state(username, message, false, None, true)
+        self.send_friend_message_with_state(
+            username,
+            message,
+            false,
+            self.config.invite.friend_name_stable_count,
+            true,
+        )
     }
 
     fn send_friend_message_with_state(
@@ -1447,7 +1459,7 @@ impl AutomationApp {
         username: &str,
         message: &str,
         restore_listener_residency: bool,
-        unique_friend_stable_count: Option<u32>,
+        friend_stable_count: u32,
         log_content: bool,
     ) -> Result<bool> {
         if log_content {
@@ -1460,11 +1472,7 @@ impl AutomationApp {
             height: self.config.screen.expected_height,
             resize: true,
         };
-        let opened = match if let Some(stable_count) = unique_friend_stable_count {
-            self.open_unique_friend_chat(username, &canvas, stable_count)
-        } else {
-            self.open_friend_chat(username, &canvas)
-        } {
+        let opened = match self.open_friend_chat(username, &canvas, friend_stable_count) {
             Ok(opened) => opened,
             Err(error) => {
                 let _ = self.restore_listener_residency_after_task("好友发言失败");
@@ -1489,16 +1497,24 @@ impl AutomationApp {
         Ok(true)
     }
 
-    fn open_unique_friend_chat(
-        &self,
-        username: &str,
-        canvas: &Canvas,
-        stable_count: u32,
-    ) -> Result<bool> {
+    fn open_friend_chat(&self, username: &str, canvas: &Canvas, stable_count: u32) -> Result<bool> {
         if !self.ensure_secondary_chat_open("打开唯一好友聊天")? {
             return Ok(false);
         }
         let locator = self.ui_locator_with_canvas(canvas.clone(), self.template_poll_ms());
+        if !self.click_secondary_friend_name_atom(&locator, username, stable_count)? {
+            return Ok(false);
+        }
+        workflow_actions::wait(self.config.timing.invite.step_ms);
+        self.confirm_secondary_friend_chat_atom(&locator, username, stable_count)
+    }
+
+    fn click_secondary_friend_name_atom(
+        &self,
+        locator: &UiLocator,
+        username: &str,
+        stable_count: u32,
+    ) -> Result<bool> {
         let region = locator.region(self.config.invite.friend_list_region.into());
         let deadline =
             Instant::now() + Duration::from_millis(self.config.timing.workflow.default_timeout_ms);
@@ -1523,20 +1539,12 @@ impl AutomationApp {
                         continue;
                     }
                     locator.click_point(hit.center())?;
-                    workflow_actions::wait(self.config.timing.invite.step_ms);
-                    let frame = locator.capture()?;
-                    let identity = self.secondary_identity_from_frame(&frame.image)?;
-                    let matched = matches!(
-                        identity,
-                        super::chat_listener::SecondaryChatIdentity::Friend(current)
-                            if {
-                                let current = command::normalize_lock_text(&current);
-                                let expected = command::normalize_lock_text(username);
-                                !expected.is_empty()
-                                    && (current.contains(&expected) || expected.contains(&current))
-                            }
+                    log::info!(
+                        "原子动作完成: 二级好友昵称唯一稳定匹配 {} samples={}",
+                        username,
+                        required_streak
                     );
-                    return Ok(matched);
+                    return Ok(true);
                 }
                 [] => {
                     streak = 0;
@@ -1548,40 +1556,64 @@ impl AutomationApp {
                 }
             }
         }
+        log::error!(
+            "原子动作失败: 二级好友昵称未达到唯一稳定匹配 {} samples={}",
+            username,
+            required_streak
+        );
         Ok(false)
     }
 
-    fn open_friend_chat(&self, username: &str, canvas: &Canvas) -> Result<bool> {
-        if !self.ensure_secondary_chat_open("打开好友聊天")? {
-            log::error!("好友聊天失败: 未能打开二级聊天界面");
-            return Ok(false);
-        }
-        let frame = load_frame(&FrameArgs { image: None }, canvas, &self.config.window)?;
-        if let super::chat_listener::SecondaryChatIdentity::Friend(current) =
+    fn confirm_secondary_friend_chat_atom(
+        &self,
+        locator: &UiLocator,
+        username: &str,
+        stable_count: u32,
+    ) -> Result<bool> {
+        let frame = locator.capture()?;
+        if let super::chat_listener::SecondaryChatIdentity::Friend(title) =
             self.secondary_identity_from_frame(&frame.image)?
         {
-            let current = command::normalize_lock_text(&current);
-            let expected = command::normalize_lock_text(username);
-            if !expected.is_empty() && (current.contains(&expected) || expected.contains(&current))
-            {
-                log::info!("好友聊天已打开，直接复用当前会话: {}", username);
+            let title = command::normalize_lock_text(&title);
+            let username = command::normalize_lock_text(username);
+            if text_contains_complete_target(&title, &username) {
+                log::info!("原子动作完成: 二级聊天标题确认好友 {}", username);
                 return Ok(true);
             }
         }
-        let locator = self.ui_locator_with_canvas(canvas.clone(), self.template_poll_ms());
+        log::debug!("二级聊天标题未包含好友备注，回退聊天内容区 OCR: {username}");
 
-        if !self.click_text_atom(
-            &locator,
-            username,
-            self.config.invite.friend_list_region,
-            self.config.timing.workflow.default_timeout_ms,
-            "好友列表用户名",
-        )? {
-            log::error!("好友聊天失败: 好友列表未找到用户 {}", username);
-            let _ = self.restore_listener_residency_after_task("好友聊天失败");
-            return Ok(false);
+        let region = locator.region(self.config.invite.friend_chat_region.into());
+        let deadline =
+            Instant::now() + Duration::from_millis(self.config.timing.workflow.default_timeout_ms);
+        let required_streak = stable_count.max(1);
+        let mut streak = 0_u32;
+        while Instant::now() < deadline && self.running.load(AtomicOrdering::SeqCst) {
+            let found = {
+                let engine = self.ocr_engine()?;
+                !region.find_text_hits(&engine.engine, username)?.is_empty()
+            };
+            if found {
+                streak = streak.saturating_add(1);
+                if streak >= required_streak {
+                    log::info!(
+                        "原子动作完成: 二级聊天内容区稳定确认好友备注 {} samples={}",
+                        username,
+                        required_streak
+                    );
+                    return Ok(true);
+                }
+            } else {
+                streak = 0;
+            }
+            workflow_actions::wait(locator.poll_ms());
         }
-        Ok(true)
+        log::error!(
+            "原子动作失败: 二级聊天内容区未稳定找到好友备注 {} samples={}",
+            username,
+            required_streak
+        );
+        Ok(false)
     }
 }
 

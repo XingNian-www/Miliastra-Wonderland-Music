@@ -584,22 +584,6 @@ fn normalize_process_names(value: &str) -> Result<Vec<String>> {
     Ok(targets)
 }
 
-#[cfg(test)]
-#[allow(clippy::items_after_test_module)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn splits_multiple_target_process_names() {
-        let names = normalize_process_names("yuanshen.exe, GenshinImpact").expect("process names");
-
-        assert_eq!(
-            names,
-            vec!["yuanshen.exe".to_string(), "genshinimpact.exe".to_string()]
-        );
-    }
-}
-
 fn scale_i32(value: i32, from: i32, to: i32) -> i32 {
     ((value as f32 / from as f32) * to as f32).round() as i32
 }
@@ -631,4 +615,19 @@ fn send_alt_keypress() -> u32 {
         },
     ];
     unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn splits_multiple_target_process_names() {
+        let names = normalize_process_names("yuanshen.exe, GenshinImpact").expect("process names");
+
+        assert_eq!(
+            names,
+            vec!["yuanshen.exe".to_string(), "genshinimpact.exe".to_string()]
+        );
+    }
 }

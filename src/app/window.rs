@@ -4,7 +4,7 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use enigo::{Button, Coordinate, Direction, Enigo, Mouse};
+use enigo::{Axis, Button, Coordinate, Direction, Enigo, Mouse};
 use image::DynamicImage;
 use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -108,6 +108,22 @@ impl GameWindow {
         self.refresh_client_area_for_click()?;
         let screen = self.screen_point(point);
         self.click_screen(enigo, screen)
+    }
+
+    pub fn scroll(
+        &mut self,
+        enigo: &mut Enigo,
+        point: PointConfig,
+        length: i32,
+        axis: Axis,
+    ) -> Result<()> {
+        self.refresh_client_area_for_click()?;
+        let screen = self.screen_point(point);
+        self.ensure_point_targets_window(screen)?;
+        enigo
+            .move_mouse(screen.x, screen.y, Coordinate::Abs)
+            .context("move mouse for scroll")?;
+        enigo.scroll(length, axis).context("scroll mouse")
     }
 
     pub fn activate(&mut self, after_activate_ms: u64) -> Result<()> {

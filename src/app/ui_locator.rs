@@ -11,7 +11,7 @@ use super::command;
 use super::config::{self, PointConfig};
 use super::frame_source::{Canvas, Frame, load_frame};
 use super::geometry::{Point, Rect, crop_canvas};
-use super::input_actions::click_game_point;
+use super::input_actions::{click_game_point, scroll_game_point};
 use super::ocr::recognize_lines;
 use super::template_match::{TemplateHit, best_template_hit};
 
@@ -71,6 +71,14 @@ impl UiLocator {
 
     pub(super) fn click_point(&self, point: Point) -> Result<()> {
         click_game_point(PointConfig::new(point.x, point.y), &self.window_config)
+    }
+
+    pub(super) fn scroll_point(&self, point: Point, length: i32) -> Result<()> {
+        scroll_game_point(
+            PointConfig::new(point.x, point.y),
+            length,
+            &self.window_config,
+        )
     }
 
     pub(super) fn poll_ms(&self) -> u64 {
@@ -171,8 +179,7 @@ impl UiRegion<'_> {
             if normalized.is_empty() {
                 continue;
             }
-            if normalized == target || normalized.contains(&target) || target.contains(&normalized)
-            {
+            if text_contains_complete_target(&normalized, &target) {
                 hits.push(UiTextHit {
                     rect: Rect::new(
                         self.rect.x + line.bbox.x,
@@ -259,6 +266,21 @@ impl UiRegion<'_> {
             }
             previous = current;
         }
+    }
+}
+
+pub(super) fn text_contains_complete_target(recognized: &str, target: &str) -> bool {
+    !target.is_empty() && (recognized == target || recognized.contains(target))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::text_contains_complete_target;
+
+    #[test]
+    fn complete_target_does_not_accept_a_truncated_ocr_name() {
+        assert!(!text_contains_complete_target("萌", "萌萌"));
+        assert!(text_contains_complete_target("原昵称(萌萌)", "萌萌"));
     }
 }
 

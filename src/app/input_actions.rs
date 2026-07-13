@@ -2,7 +2,7 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use enigo::{Direction, Enigo, Key, Keyboard, Settings};
+use enigo::{Axis, Direction, Enigo, Key, Keyboard, Settings};
 
 use super::clipboard;
 use super::config;
@@ -103,6 +103,16 @@ pub(super) fn press_key(key: Key, window_config: &config::WindowConfig) -> Resul
         elapsed_ms(input_started)
     );
     Ok(())
+}
+
+pub(super) fn scroll_game_point(
+    point: PointConfig,
+    length: i32,
+    window_config: &config::WindowConfig,
+) -> Result<()> {
+    let mut enigo = Enigo::new(&Settings::default()).context("create enigo")?;
+    let mut window = window::GameWindow::find(window_config)?;
+    window.scroll(&mut enigo, point, length, Axis::Vertical)
 }
 
 pub(super) fn hold_key<F>(

@@ -28,7 +28,10 @@ impl Default for LandlordConfig {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum LandlordCommand {
     Start,
+    RunFastStart,
     Join,
+    Rob,
+    Decline,
     Status,
     Play(String),
     Pass,
@@ -41,6 +44,8 @@ impl LandlordCommand {
     pub fn parse(args: &str) -> Self {
         match args.trim() {
             "开始" | "创建" => Self::Start,
+            "抢" | "抢地主" | "叫地主" => Self::Rob,
+            "不抢" | "不叫" => Self::Decline,
             "状态" | "查看" => Self::Status,
             "退出" | "结束" | "取消" => Self::Exit,
             "帮助" | "?" | "？" | "" => Self::Help,
@@ -54,7 +59,14 @@ pub struct LandlordOutcome {
     pub action: &'static str,
     pub public_reply: Option<String>,
     pub private_reply: Option<String>,
+    pub private_deliveries: Vec<LandlordPrivateDelivery>,
     pub ended: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LandlordPrivateDelivery {
+    pub player: String,
+    pub message: String,
 }
 
 impl LandlordOutcome {
@@ -63,6 +75,7 @@ impl LandlordOutcome {
             action,
             public_reply: Some(reply.into()),
             private_reply: None,
+            private_deliveries: Vec::new(),
             ended: false,
         }
     }
@@ -72,6 +85,7 @@ impl LandlordOutcome {
             action,
             public_reply: None,
             private_reply: Some(reply.into()),
+            private_deliveries: Vec::new(),
             ended: false,
         }
     }
@@ -81,8 +95,14 @@ impl LandlordOutcome {
             action,
             public_reply: Some(reply.into()),
             private_reply: None,
+            private_deliveries: Vec::new(),
             ended: true,
         }
+    }
+
+    fn with_private_deliveries(mut self, deliveries: Vec<LandlordPrivateDelivery>) -> Self {
+        self.private_deliveries = deliveries;
+        self
     }
 }
 
@@ -95,16 +115,29 @@ pub struct LandlordGame {
 enum GameState {
     Idle,
     Lobby(Lobby),
+    Bidding(Bidding),
     Playing(Playing),
 }
 
 struct Lobby {
     players: Vec<Player>,
+    variant: CardGameVariant,
     timer: ActiveTimer,
+}
+
+struct Bidding {
+    players: Vec<Player>,
+    bottom: Vec<Card>,
+    current: usize,
+    decisions: u8,
+    candidate: Option<usize>,
+    timer: ActiveTimer,
+    warning_sent: bool,
 }
 
 struct Playing {
     players: Vec<Player>,
+    variant: CardGameVariant,
     landlord: usize,
     current: usize,
     last_play: Option<LastPlay>,
@@ -113,6 +146,22 @@ struct Playing {
     warning_sent: bool,
     turns: u32,
     bombs: u32,
+    opening_spade_three_required: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CardGameVariant {
+    Landlord,
+    HunanRunFast,
+}
+
+impl CardGameVariant {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Landlord => "斗地主",
+            Self::HunanRunFast => "跑得快",
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -210,74 +259,132 @@ impl LandlordGame {
     }
 
     pub fn retry_hand_delivery(&mut self, player: &str) {
-        if let GameState::Playing(game) = &mut self.state
-            && let Some(index) = find_player(&game.players, player)
-        {
-            game.players[index].last_hand_reply = None;
+        match &mut self.state {
+            GameState::Bidding(game) => {
+                if let Some(index) = find_player(&game.players, player) {
+                    game.players[index].last_hand_reply = None;
+                }
+            }
+            GameState::Playing(game) => {
+                if let Some(index) = find_player(&game.players, player) {
+                    game.players[index].last_hand_reply = None;
+                }
+            }
+            GameState::Idle | GameState::Lobby(_) => {}
         }
     }
 
     pub fn create(&mut self, player: &str, now: Instant) -> LandlordOutcome {
+        self.create_variant(player, CardGameVariant::Landlord, now)
+    }
+
+    pub fn create_run_fast(&mut self, player: &str, now: Instant) -> LandlordOutcome {
+        self.create_variant(player, CardGameVariant::HunanRunFast, now)
+    }
+
+    fn create_variant(
+        &mut self,
+        player: &str,
+        variant: CardGameVariant,
+        now: Instant,
+    ) -> LandlordOutcome {
         if !self.config.enabled {
-            return LandlordOutcome::public("disabled", "斗地主未启用");
+            return LandlordOutcome::public("disabled", format!("{}未启用", variant.label()));
         }
         if self.is_active() {
-            return LandlordOutcome::public("already-active", "已有斗地主房间或牌局进行中");
+            return LandlordOutcome::public("already-active", "已有牌局或房间进行中");
         }
         self.state = GameState::Lobby(Lobby {
             players: vec![Player::new(player)],
+            variant,
             timer: ActiveTimer::new(now),
         });
         LandlordOutcome::public(
             "created",
             format!(
-                "{}创建了斗地主房间，还需2人，发送 @加入 参加",
-                player.trim()
+                "{}创建了{}房间，还需2人，发送 @加入 参加",
+                player.trim(),
+                variant.label()
             ),
         )
     }
 
     pub fn join(&mut self, player: &str, now: Instant) -> LandlordOutcome {
         let GameState::Lobby(lobby) = &mut self.state else {
-            return LandlordOutcome::public("no-lobby", "当前没有等待加入的斗地主房间");
+            return LandlordOutcome::public("no-lobby", "当前没有等待加入的牌局房间");
         };
         let key = player_key(player);
         if lobby.players.iter().any(|item| item.key == key) {
-            return LandlordOutcome::public("duplicate-player", "你已经加入本局斗地主");
+            return LandlordOutcome::public(
+                "duplicate-player",
+                format!("你已经加入本局{}", lobby.variant.label()),
+            );
         }
         lobby.players.push(Player::new(player));
         lobby.timer.reset(now);
         if lobby.players.len() < 3 {
             return LandlordOutcome::public(
                 "joined",
-                format!("{}加入斗地主，还需1人", player.trim()),
+                format!("{}加入{}，还需1人", player.trim(), lobby.variant.label()),
             );
         }
 
+        let variant = lobby.variant;
         let mut players = std::mem::take(&mut lobby.players);
-        let (hands, landlord) = deal(&mut self.rng);
+        if variant == CardGameVariant::HunanRunFast {
+            let (hands, first) = deal_hunan_run_fast(&mut self.rng);
+            for (player, hand) in players.iter_mut().zip(hands) {
+                player.hand = hand;
+            }
+            let first_name = players[first].name.clone();
+            let deliveries = initial_hand_deliveries(&players, variant);
+            self.state = GameState::Playing(Playing {
+                players,
+                variant,
+                landlord: first,
+                current: first,
+                last_play: None,
+                consecutive_passes: 0,
+                timer: ActiveTimer::new(now),
+                warning_sent: false,
+                turns: 0,
+                bombs: 0,
+                opening_spade_three_required: true,
+            });
+            return LandlordOutcome::public(
+                "run-fast-started",
+                format!(
+                    "跑得快已发手牌，{}持有黑桃3并先出；第一手必须包含黑桃3",
+                    first_name
+                ),
+            )
+            .with_private_deliveries(deliveries);
+        }
+
+        let (hands, bottom) = deal(&mut self.rng);
         for (player, hand) in players.iter_mut().zip(hands) {
             player.hand = hand;
         }
-        let landlord_name = players[landlord].name.clone();
-        self.state = GameState::Playing(Playing {
+        let first = self.rng.index(players.len());
+        let first_name = players[first].name.clone();
+        let deliveries = initial_hand_deliveries(&players, variant);
+        self.state = GameState::Bidding(Bidding {
             players,
-            landlord,
-            current: landlord,
-            last_play: None,
-            consecutive_passes: 0,
+            bottom,
+            current: first,
+            decisions: 0,
+            candidate: None,
             timer: ActiveTimer::new(now),
             warning_sent: false,
-            turns: 0,
-            bombs: 0,
         });
         LandlordOutcome::public(
-            "started",
+            "bidding-started",
             format!(
-                "斗地主开始，{}持有黑桃3成为地主并先出牌。请好友私聊 @手牌 查看手牌",
-                landlord_name
+                "斗地主已发手牌，随机由{}开始抢地主；发送 @抢地主 或 @不抢",
+                first_name
             ),
         )
+        .with_private_deliveries(deliveries)
     }
 
     pub fn handle(
@@ -288,7 +395,10 @@ impl LandlordGame {
     ) -> LandlordOutcome {
         match command {
             LandlordCommand::Start => self.create(player, now),
+            LandlordCommand::RunFastStart => self.create_run_fast(player, now),
             LandlordCommand::Join => self.join(player, now),
+            LandlordCommand::Rob => self.bid(player, true, now),
+            LandlordCommand::Decline => self.bid(player, false, now),
             LandlordCommand::Status => self.status(),
             LandlordCommand::Play(cards) => self.play(player, cards, now),
             LandlordCommand::Pass => self.pass(player, now),
@@ -296,9 +406,107 @@ impl LandlordGame {
             LandlordCommand::Exit => self.exit(player),
             LandlordCommand::Help => LandlordOutcome::public(
                 "help",
-                "斗地主: @斗地主 开始、@加入、@出 牌组/$牌组/＄牌组、@过、@斗地主 状态/退出；好友私聊 @手牌",
+                "牌类: @斗地主 开始或@跑得快 开始；共用@加入、@出 牌组/$牌组/＄牌组、@过、好友私聊@手牌；斗地主另用@抢地主/@不抢",
             ),
         }
+    }
+
+    fn bid(&mut self, player: &str, rob: bool, now: Instant) -> LandlordOutcome {
+        let GameState::Bidding(bidding) = &mut self.state else {
+            return LandlordOutcome::public("not-bidding", "当前不在抢地主阶段");
+        };
+        let Some(index) = find_player(&bidding.players, player) else {
+            return LandlordOutcome::public("not-player", "你不在本局斗地主中");
+        };
+        if index != bidding.current {
+            return LandlordOutcome::public(
+                "wrong-bidder",
+                format!("现在轮到{}抢地主", bidding.players[bidding.current].name),
+            );
+        }
+
+        if rob {
+            bidding.candidate = Some(index);
+        }
+        bidding.decisions = bidding.decisions.saturating_add(1);
+        let name = bidding.players[index].name.clone();
+        if bidding.decisions < bidding.players.len() as u8 {
+            bidding.current = (bidding.current + 1) % bidding.players.len();
+            bidding.timer.reset(now);
+            bidding.warning_sent = false;
+            let next = bidding.players[bidding.current].name.clone();
+            return LandlordOutcome::public(
+                if rob { "robbed" } else { "declined" },
+                format!(
+                    "{}{}；轮到{}抢地主",
+                    name,
+                    if rob { "抢地主" } else { "不抢" },
+                    next
+                ),
+            );
+        }
+
+        let GameState::Bidding(mut bidding) = std::mem::replace(&mut self.state, GameState::Idle)
+        else {
+            unreachable!("bidding state was checked")
+        };
+        let Some(landlord) = bidding.candidate else {
+            let (hands, bottom) = deal(&mut self.rng);
+            for (player, hand) in bidding.players.iter_mut().zip(hands) {
+                player.hand = hand;
+                player.timeouts = 0;
+                player.trustee = false;
+                player.last_hand_reply = None;
+            }
+            let first = self.rng.index(bidding.players.len());
+            let first_name = bidding.players[first].name.clone();
+            let deliveries = initial_hand_deliveries(&bidding.players, CardGameVariant::Landlord);
+            self.state = GameState::Bidding(Bidding {
+                players: bidding.players,
+                bottom,
+                current: first,
+                decisions: 0,
+                candidate: None,
+                timer: ActiveTimer::new(now),
+                warning_sent: false,
+            });
+            return LandlordOutcome::public(
+                "redealt",
+                format!("三人均未抢地主，已重新发牌；随机由{}开始", first_name),
+            )
+            .with_private_deliveries(deliveries);
+        };
+
+        let bottom_text = format_play(&bidding.bottom);
+        bidding.players[landlord].hand.append(&mut bidding.bottom);
+        sort_hand(&mut bidding.players[landlord].hand);
+        let landlord_name = bidding.players[landlord].name.clone();
+        let landlord_delivery = LandlordPrivateDelivery {
+            player: landlord_name.clone(),
+            message: format!(
+                "地主手牌({}张): {}",
+                bidding.players[landlord].hand.len(),
+                format_hand(&bidding.players[landlord].hand)
+            ),
+        };
+        self.state = GameState::Playing(Playing {
+            players: bidding.players,
+            variant: CardGameVariant::Landlord,
+            landlord,
+            current: landlord,
+            last_play: None,
+            consecutive_passes: 0,
+            timer: ActiveTimer::new(now),
+            warning_sent: false,
+            turns: 0,
+            bombs: 0,
+            opening_spade_three_required: false,
+        });
+        LandlordOutcome::public(
+            "landlord-selected",
+            format!("{}成为地主并先出牌；底牌: {}", landlord_name, bottom_text),
+        )
+        .with_private_deliveries(vec![landlord_delivery])
     }
 
     pub fn tick(&mut self, now: Instant, clock_active: bool) -> Option<LandlordOutcome> {
@@ -311,11 +519,40 @@ impl LandlordGame {
                 {
                     return None;
                 }
+                let label = lobby.variant.label();
                 self.state = GameState::Idle;
                 Some(LandlordOutcome::ended(
                     "lobby-timeout",
-                    "斗地主组局等待超时，房间已取消",
+                    format!("{}组局等待超时，房间已取消", label),
                 ))
+            }
+            GameState::Bidding(game) => {
+                game.timer.tick(now, clock_active);
+                if !clock_active {
+                    return None;
+                }
+                let timeout = Duration::from_secs(self.config.turn_timeout_seconds.max(1));
+                let warning_at = timeout.saturating_sub(Duration::from_secs(30));
+                if !game.warning_sent
+                    && game.timer.elapsed >= warning_at
+                    && game.timer.elapsed < timeout
+                {
+                    game.warning_sent = true;
+                    return Some(LandlordOutcome::public(
+                        "bid-warning",
+                        format!("{}抢地主剩余30秒", game.players[game.current].name),
+                    ));
+                }
+                if game.timer.elapsed < timeout {
+                    return None;
+                }
+                let player = game.players[game.current].name.clone();
+                let mut outcome = self.bid(&player, false, now);
+                if let Some(reply) = outcome.public_reply.take() {
+                    outcome.public_reply =
+                        Some(format!("{}抢地主超时，按不抢处理；{}", player, reply));
+                }
+                Some(outcome)
             }
             GameState::Playing(game) => {
                 game.timer.tick(now, clock_active);
@@ -362,6 +599,39 @@ impl LandlordGame {
             .as_ref()
             .is_some_and(|last| last.player != current);
         if can_pass {
+            if game.variant == CardGameVariant::HunanRunFast {
+                let previous = &game
+                    .last_play
+                    .as_ref()
+                    .expect("can pass has last play")
+                    .pattern;
+                if let Some((mut cards, mut pattern)) = lowest_beating_play_for_variant(
+                    &game.players[current].hand,
+                    previous,
+                    game.variant,
+                ) {
+                    if matches!(pattern, PlayPattern::Single(_))
+                        && let Some(card) = report_one_largest_single(game, current)
+                    {
+                        let largest_single = PlayPattern::Single(card.rank);
+                        if largest_single.beats(previous) {
+                            cards = vec![card];
+                            pattern = largest_single;
+                        }
+                    }
+                    let outcome = play_cards(game, current, cards, pattern, now, true);
+                    if outcome.ended {
+                        self.state = GameState::Idle;
+                    }
+                    return outcome;
+                }
+                pass_playing(game, current, now, true);
+                let next = game.players[game.current].name.clone();
+                return LandlordOutcome::public(
+                    "auto-pass",
+                    format!("{}超时且无牌可压，自动过牌；轮到{}", name, next),
+                );
+            }
             if !game.players[current].trustee {
                 pass_playing(game, current, now, true);
                 let next = game.players[game.current].name.clone();
@@ -397,11 +667,22 @@ impl LandlordGame {
                 )
             }
         } else {
-            let card = game.players[current]
-                .hand
-                .first()
-                .copied()
-                .expect("active player has cards");
+            let card = if game.opening_spade_three_required {
+                game.players[current]
+                    .hand
+                    .iter()
+                    .find(|card| card.spade_three)
+                    .copied()
+                    .expect("run-fast opening player has spade three")
+            } else if let Some(card) = report_one_largest_single(game, current) {
+                card
+            } else {
+                game.players[current]
+                    .hand
+                    .first()
+                    .copied()
+                    .expect("active player has cards")
+            };
             let outcome = play_cards(
                 game,
                 current,
@@ -419,10 +700,13 @@ impl LandlordGame {
 
     fn play(&mut self, player: &str, text: &str, now: Instant) -> LandlordOutcome {
         let GameState::Playing(game) = &mut self.state else {
-            return LandlordOutcome::public("no-game", "当前没有进行中的斗地主牌局");
+            return LandlordOutcome::public("no-game", "当前没有进行中的牌局");
         };
         let Some(player_index) = find_player(&game.players, player) else {
-            return LandlordOutcome::public("not-player", "你不在本局斗地主中");
+            return LandlordOutcome::public(
+                "not-player",
+                format!("你不在本局{}中", game.variant.label()),
+            );
         };
         if player_index != game.current {
             return LandlordOutcome::public(
@@ -435,14 +719,45 @@ impl LandlordGame {
             Ok(_) => return LandlordOutcome::public("empty-play", "请输入要出的牌"),
             Err(error) => return LandlordOutcome::public("invalid-cards", error),
         };
-        let cards = match take_cards(&game.players[player_index].hand, &ranks) {
+        let mut cards = match take_cards(&game.players[player_index].hand, &ranks) {
             Ok(cards) => cards,
             Err(error) => return LandlordOutcome::public("missing-card", error),
         };
-        let pattern = match classify(&ranks) {
+        if game.variant == CardGameVariant::HunanRunFast
+            && game.opening_spade_three_required
+            && ranks.contains(&Rank::Three)
+            && !cards.iter().any(|card| card.spade_three)
+            && let Some(spade_three) = game.players[player_index]
+                .hand
+                .iter()
+                .find(|card| card.spade_three)
+                .copied()
+            && let Some(normal_three) = cards.iter_mut().find(|card| card.rank == Rank::Three)
+        {
+            *normal_three = spade_three;
+        }
+        if game.variant == CardGameVariant::HunanRunFast
+            && game.opening_spade_three_required
+            && !cards.iter().any(|card| card.spade_three)
+        {
+            return LandlordOutcome::public("spade-three-required", "首手必须包含黑桃3");
+        }
+        let pattern = match classify_for_variant(&ranks, game.variant) {
             Some(pattern) => pattern,
-            None => return LandlordOutcome::public("invalid-pattern", "这组牌不是有效斗地主牌型"),
+            None => {
+                return LandlordOutcome::public("invalid-pattern", "这组牌不是当前玩法的有效牌型");
+            }
         };
+        if game.variant == CardGameVariant::HunanRunFast
+            && matches!(pattern, PlayPattern::Single(_))
+            && let Some(largest) = report_one_largest_single(game, player_index)
+            && !matches!(pattern, PlayPattern::Single(rank) if rank == largest.rank)
+        {
+            return LandlordOutcome::public(
+                "must-play-largest-single",
+                "下家已报单，出单张时必须出手中最大牌",
+            );
+        }
         if let Some(last) = &game.last_play
             && last.player != player_index
             && !pattern.beats(&last.pattern)
@@ -461,10 +776,13 @@ impl LandlordGame {
 
     fn pass(&mut self, player: &str, now: Instant) -> LandlordOutcome {
         let GameState::Playing(game) = &mut self.state else {
-            return LandlordOutcome::public("no-game", "当前没有进行中的斗地主牌局");
+            return LandlordOutcome::public("no-game", "当前没有进行中的牌局");
         };
         let Some(player_index) = find_player(&game.players, player) else {
-            return LandlordOutcome::public("not-player", "你不在本局斗地主中");
+            return LandlordOutcome::public(
+                "not-player",
+                format!("你不在本局{}中", game.variant.label()),
+            );
         };
         if player_index != game.current {
             return LandlordOutcome::public(
@@ -479,18 +797,38 @@ impl LandlordGame {
         {
             return LandlordOutcome::public("cannot-pass", "你是本轮领出者，不能过牌");
         }
+        if game.variant == CardGameVariant::HunanRunFast {
+            let previous = &game
+                .last_play
+                .as_ref()
+                .expect("pass requires previous play")
+                .pattern;
+            if lowest_beating_play_for_variant(
+                &game.players[player_index].hand,
+                previous,
+                game.variant,
+            )
+            .is_some()
+            {
+                return LandlordOutcome::public("must-play", "跑得快有牌能压时不能过牌");
+            }
+        }
         pass_playing(game, player_index, now, false)
     }
 
     fn hand(&mut self, player: &str, now: Instant) -> LandlordOutcome {
-        let GameState::Playing(game) = &mut self.state else {
-            return LandlordOutcome::private("no-game", "当前没有进行中的斗地主牌局");
+        let (players, label) = match &mut self.state {
+            GameState::Bidding(game) => (&mut game.players, CardGameVariant::Landlord.label()),
+            GameState::Playing(game) => (&mut game.players, game.variant.label()),
+            GameState::Idle | GameState::Lobby(_) => {
+                return LandlordOutcome::private("no-game", "当前没有已发牌的牌局");
+            }
         };
-        let Some(index) = find_player(&game.players, player) else {
-            return LandlordOutcome::private("not-player", "你不在本局斗地主中");
+        let Some(index) = find_player(players, player) else {
+            return LandlordOutcome::private("not-player", format!("你不在本局{}中", label));
         };
         let cooldown = Duration::from_secs(self.config.hand_cooldown_seconds);
-        if game.players[index]
+        if players[index]
             .last_hand_reply
             .is_some_and(|last| now.saturating_duration_since(last) < cooldown)
         {
@@ -498,27 +836,29 @@ impl LandlordGame {
                 action: "hand-cooldown",
                 public_reply: None,
                 private_reply: None,
+                private_deliveries: Vec::new(),
                 ended: false,
             };
         }
-        game.players[index].last_hand_reply = Some(now);
+        players[index].last_hand_reply = Some(now);
         LandlordOutcome::private(
             "hand",
             format!(
                 "当前手牌({}张): {}",
-                game.players[index].hand.len(),
-                format_hand(&game.players[index].hand)
+                players[index].hand.len(),
+                format_hand(&players[index].hand)
             ),
         )
     }
 
     fn status(&self) -> LandlordOutcome {
         match &self.state {
-            GameState::Idle => LandlordOutcome::public("idle", "当前没有斗地主房间或牌局"),
+            GameState::Idle => LandlordOutcome::public("idle", "当前没有牌局房间或进行中的牌局"),
             GameState::Lobby(lobby) => LandlordOutcome::public(
                 "lobby-status",
                 format!(
-                    "斗地主等待加入: {}，还需{}人",
+                    "{}等待加入: {}，还需{}人",
+                    lobby.variant.label(),
                     lobby
                         .players
                         .iter()
@@ -526,6 +866,16 @@ impl LandlordGame {
                         .collect::<Vec<_>>()
                         .join("、"),
                     3usize.saturating_sub(lobby.players.len())
+                ),
+            ),
+            GameState::Bidding(game) => LandlordOutcome::public(
+                "bidding-status",
+                format!(
+                    "斗地主抢地主中；轮到:{}；当前抢地主:{}",
+                    game.players[game.current].name,
+                    game.candidate
+                        .map(|index| game.players[index].name.as_str())
+                        .unwrap_or("暂无")
                 ),
             ),
             GameState::Playing(game) => {
@@ -540,41 +890,58 @@ impl LandlordGame {
                         )
                     },
                 );
-                LandlordOutcome::public(
-                    "playing-status",
+                let remaining = game
+                    .players
+                    .iter()
+                    .map(|player| format!("{} {}张", player.name, player.hand.len()))
+                    .collect::<Vec<_>>()
+                    .join("、");
+                let reply = if game.variant == CardGameVariant::HunanRunFast {
+                    format!(
+                        "跑得快；轮到:{}；剩余:{}；上一手:{}",
+                        game.players[game.current].name, remaining, last
+                    )
+                } else {
                     format!(
                         "地主:{}；轮到:{}；剩余:{}；上一手:{}",
                         game.players[game.landlord].name,
                         game.players[game.current].name,
-                        game.players
-                            .iter()
-                            .map(|player| format!("{} {}张", player.name, player.hand.len()))
-                            .collect::<Vec<_>>()
-                            .join("、"),
+                        remaining,
                         last
-                    ),
-                )
+                    )
+                };
+                LandlordOutcome::public("playing-status", reply)
             }
         }
     }
 
     fn exit(&mut self, player: &str) -> LandlordOutcome {
         match &mut self.state {
-            GameState::Idle => LandlordOutcome::public("idle", "当前没有斗地主房间或牌局"),
+            GameState::Idle => LandlordOutcome::public("idle", "当前没有牌局房间或进行中的牌局"),
             GameState::Lobby(lobby) => {
                 let Some(index) = find_player(&lobby.players, player) else {
-                    return LandlordOutcome::public("not-player", "你不在当前斗地主房间中");
+                    return LandlordOutcome::public(
+                        "not-player",
+                        format!("你不在当前{}房间中", lobby.variant.label()),
+                    );
                 };
                 let name = lobby.players[index].name.clone();
+                let variant = lobby.variant;
                 if index == 0 {
                     self.state = GameState::Idle;
-                    LandlordOutcome::ended("lobby-canceled", format!("{}取消了斗地主房间", name))
+                    LandlordOutcome::ended(
+                        "lobby-canceled",
+                        format!("{}取消了{}房间", name, variant.label()),
+                    )
                 } else {
                     lobby.players.remove(index);
-                    LandlordOutcome::public("left-lobby", format!("{}退出了斗地主房间", name))
+                    LandlordOutcome::public(
+                        "left-lobby",
+                        format!("{}退出了{}房间", name, variant.label()),
+                    )
                 }
             }
-            GameState::Playing(game) => {
+            GameState::Bidding(game) => {
                 let Some(index) = find_player(&game.players, player) else {
                     return LandlordOutcome::public("not-player", "你不在本局斗地主中");
                 };
@@ -582,8 +949,36 @@ impl LandlordGame {
                 self.state = GameState::Idle;
                 LandlordOutcome::ended("game-aborted", format!("{}退出，斗地主牌局已结束", name))
             }
+            GameState::Playing(game) => {
+                let Some(index) = find_player(&game.players, player) else {
+                    return LandlordOutcome::public(
+                        "not-player",
+                        format!("你不在本局{}中", game.variant.label()),
+                    );
+                };
+                let name = game.players[index].name.clone();
+                let label = game.variant.label();
+                self.state = GameState::Idle;
+                LandlordOutcome::ended("game-aborted", format!("{}退出，{}牌局已结束", name, label))
+            }
         }
     }
+}
+
+fn report_one_largest_single(game: &Playing, player: usize) -> Option<Card> {
+    if game.variant != CardGameVariant::HunanRunFast {
+        return None;
+    }
+    let next = (player + 1) % game.players.len();
+    (game.players[next].hand.len() == 1)
+        .then(|| {
+            game.players[player]
+                .hand
+                .iter()
+                .max_by_key(|card| card.rank)
+                .copied()
+        })
+        .flatten()
 }
 
 fn play_cards(
@@ -594,6 +989,7 @@ fn play_cards(
     now: Instant,
     automatic: bool,
 ) -> LandlordOutcome {
+    game.opening_spade_three_required = false;
     if !automatic {
         game.players[player].timeouts = 0;
     }
@@ -611,6 +1007,21 @@ fn play_cards(
     let played = format_play(&cards);
     let pattern_name = pattern.label();
     if game.players[player].hand.is_empty() {
+        if game.variant == CardGameVariant::HunanRunFast {
+            let summary = game
+                .players
+                .iter()
+                .map(|item| format!("{} {}张", item.name, item.hand.len()))
+                .collect::<Vec<_>>()
+                .join("、");
+            return LandlordOutcome::ended(
+                "won",
+                format!(
+                    "{}出完{}[{}]，跑得快获胜。剩余:{}；炸弹{}次；共{}手",
+                    name, played, pattern_name, summary, game.bombs, game.turns
+                ),
+            );
+        }
         let winner = if player == game.landlord {
             "地主方"
         } else {
@@ -642,8 +1053,17 @@ fn play_cards(
     } else {
         "出牌".to_string()
     };
-    LandlordOutcome::public(
-        if automatic { "auto-play" } else { "played" },
+    let message = if game.variant == CardGameVariant::HunanRunFast {
+        format!(
+            "{}{} {}[{}]，剩余{}张；轮到{}",
+            name,
+            automatic_text,
+            played,
+            pattern_name,
+            game.players[player].hand.len(),
+            game.players[game.current].name
+        )
+    } else {
         format!(
             "{}({}){} {}[{}]，剩余{}张；轮到{}",
             name,
@@ -653,8 +1073,9 @@ fn play_cards(
             pattern_name,
             game.players[player].hand.len(),
             game.players[game.current].name
-        ),
-    )
+        )
+    };
+    LandlordOutcome::public(if automatic { "auto-play" } else { "played" }, message)
 }
 
 fn pass_playing(
@@ -799,16 +1220,10 @@ impl Card {
     }
 }
 
-fn deal(rng: &mut SplitMix64) -> ([Vec<Card>; 3], usize) {
-    let landlord = rng.index(3);
-    let spade_three = Card {
-        rank: Rank::Three,
-        spade_three: true,
-    };
-    let mut deck = Vec::with_capacity(53);
+fn deal(rng: &mut SplitMix64) -> ([Vec<Card>; 3], Vec<Card>) {
+    let mut deck = Vec::with_capacity(54);
     for rank in Rank::NORMAL {
-        let copies = if rank == Rank::Three { 3 } else { 4 };
-        for _ in 0..copies {
+        for _ in 0..4 {
             deck.push(Card::new(rank));
         }
     }
@@ -816,22 +1231,16 @@ fn deal(rng: &mut SplitMix64) -> ([Vec<Card>; 3], usize) {
     deck.push(Card::new(Rank::BigJoker));
     rng.shuffle(&mut deck);
 
-    let mut hands: [Vec<Card>; 3] = std::array::from_fn(|_| Vec::with_capacity(20));
-    hands[landlord].push(spade_three);
-    let mut seat = (landlord + 1) % 3;
-    while hands.iter().any(|hand| hand.len() < 17) {
-        if hands[seat].len() < 17 {
-            hands[seat].push(deck.pop().expect("deck has enough cards"));
-        }
-        seat = (seat + 1) % 3;
+    let mut hands: [Vec<Card>; 3] = std::array::from_fn(|_| Vec::with_capacity(17));
+    for index in 0..51 {
+        hands[index % 3].push(deck.pop().expect("deck has enough cards"));
     }
-    while let Some(card) = deck.pop() {
-        hands[landlord].push(card);
-    }
+    let mut bottom = deck;
     for hand in &mut hands {
         sort_hand(hand);
     }
-    (hands, landlord)
+    sort_hand(&mut bottom);
+    (hands, bottom)
 }
 
 fn sort_hand(hand: &mut [Card]) {
@@ -849,6 +1258,66 @@ fn format_hand(hand: &[Card]) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn initial_hand_deliveries(
+    players: &[Player],
+    variant: CardGameVariant,
+) -> Vec<LandlordPrivateDelivery> {
+    players
+        .iter()
+        .map(|player| LandlordPrivateDelivery {
+            player: player.name.clone(),
+            message: format!(
+                "{}初始手牌({}张): {}",
+                variant.label(),
+                player.hand.len(),
+                format_hand(&player.hand)
+            ),
+        })
+        .collect()
+}
+
+fn deal_hunan_run_fast(rng: &mut SplitMix64) -> ([Vec<Card>; 3], usize) {
+    let mut deck = Vec::with_capacity(48);
+    for rank in [
+        Rank::Three,
+        Rank::Four,
+        Rank::Five,
+        Rank::Six,
+        Rank::Seven,
+        Rank::Eight,
+        Rank::Nine,
+        Rank::Ten,
+        Rank::Jack,
+        Rank::Queen,
+        Rank::King,
+    ] {
+        for copy in 0..4 {
+            deck.push(Card {
+                rank,
+                spade_three: rank == Rank::Three && copy == 0,
+            });
+        }
+    }
+    for _ in 0..3 {
+        deck.push(Card::new(Rank::Ace));
+    }
+    deck.push(Card::new(Rank::Two));
+    rng.shuffle(&mut deck);
+
+    let mut hands: [Vec<Card>; 3] = std::array::from_fn(|_| Vec::with_capacity(16));
+    for index in 0..48 {
+        hands[index % 3].push(deck.pop().expect("run-fast deck has enough cards"));
+    }
+    for hand in &mut hands {
+        sort_hand(hand);
+    }
+    let first = hands
+        .iter()
+        .position(|hand| hand.iter().any(|card| card.spade_three))
+        .expect("run-fast deck contains spade three");
+    (hands, first)
 }
 
 fn format_play(cards: &[Card]) -> String {
@@ -939,6 +1408,7 @@ enum PlayPattern {
     AirplanePairs { high: Rank, triples: usize },
     FourTwoSingles(Rank),
     FourTwoPairs(Rank),
+    FourThree(Rank),
     Bomb(Rank),
     JokerBomb,
 }
@@ -958,6 +1428,7 @@ impl PlayPattern {
             Self::AirplanePairs { .. } => "飞机带对",
             Self::FourTwoSingles(_) => "四带二单",
             Self::FourTwoPairs(_) => "四带二对",
+            Self::FourThree(_) => "四带三",
             Self::Bomb(_) => "炸弹",
             Self::JokerBomb => "王炸",
         }
@@ -976,6 +1447,7 @@ impl PlayPattern {
             | Self::TriplePair(rank)
             | Self::FourTwoSingles(rank)
             | Self::FourTwoPairs(rank)
+            | Self::FourThree(rank)
             | Self::Bomb(rank) => *rank as u8,
             Self::Straight { high, .. }
             | Self::PairStraight { high, .. }
@@ -999,7 +1471,8 @@ impl PlayPattern {
             | (Self::TripleSingle(left), Self::TripleSingle(right))
             | (Self::TriplePair(left), Self::TriplePair(right))
             | (Self::FourTwoSingles(left), Self::FourTwoSingles(right))
-            | (Self::FourTwoPairs(left), Self::FourTwoPairs(right)) => left > right,
+            | (Self::FourTwoPairs(left), Self::FourTwoPairs(right))
+            | (Self::FourThree(left), Self::FourThree(right)) => left > right,
             (
                 Self::Straight {
                     high: left,
@@ -1122,12 +1595,35 @@ fn classify(ranks: &[Rank]) -> Option<PlayPattern> {
     classify_airplane(&counts, len)
 }
 
+fn classify_for_variant(ranks: &[Rank], variant: CardGameVariant) -> Option<PlayPattern> {
+    if variant == CardGameVariant::HunanRunFast {
+        if ranks.len() == 3 && ranks.iter().all(|rank| *rank == Rank::Ace) {
+            return Some(PlayPattern::Bomb(Rank::Ace));
+        }
+        if ranks.len() == 7 {
+            let counts = rank_counts(ranks);
+            if let Some(rank) = group_rank(&counts, 4) {
+                return Some(PlayPattern::FourThree(rank));
+            }
+        }
+    }
+    classify(ranks)
+}
+
 fn lowest_beating_play(hand: &[Card], previous: &PlayPattern) -> Option<(Vec<Card>, PlayPattern)> {
+    lowest_beating_play_for_variant(hand, previous, CardGameVariant::Landlord)
+}
+
+fn lowest_beating_play_for_variant(
+    hand: &[Card],
+    previous: &PlayPattern,
+    variant: CardGameVariant,
+) -> Option<(Vec<Card>, PlayPattern)> {
     let counts = rank_counts(&hand.iter().map(|card| card.rank).collect::<Vec<_>>());
     let groups = counts.into_iter().collect::<Vec<_>>();
     let mut selected = Vec::new();
     let mut best: Option<(Vec<Rank>, PlayPattern)> = None;
-    collect_beating_plays(&groups, 0, &mut selected, previous, &mut best);
+    collect_beating_plays(&groups, 0, &mut selected, previous, variant, &mut best);
     let (ranks, pattern) = best?;
     let cards = take_cards(hand, &ranks).ok()?;
     Some((cards, pattern))
@@ -1138,10 +1634,11 @@ fn collect_beating_plays(
     index: usize,
     selected: &mut Vec<Rank>,
     previous: &PlayPattern,
+    variant: CardGameVariant,
     best: &mut Option<(Vec<Rank>, PlayPattern)>,
 ) {
     if index == groups.len() {
-        let Some(pattern) = classify(selected) else {
+        let Some(pattern) = classify_for_variant(selected, variant) else {
             return;
         };
         if !pattern.beats(previous) {
@@ -1169,7 +1666,7 @@ fn collect_beating_plays(
     let (rank, count) = groups[index];
     for take in 0..=count {
         selected.extend(std::iter::repeat_n(rank, take));
-        collect_beating_plays(groups, index + 1, selected, previous, best);
+        collect_beating_plays(groups, index + 1, selected, previous, variant, best);
         selected.truncate(selected.len() - take);
     }
 }
@@ -1308,6 +1805,17 @@ mod tests {
         parse_cards(text).unwrap()
     }
 
+    fn finish_bidding_with_all_players_robbing(game: &mut LandlordGame, now: Instant) {
+        for _ in 0..3 {
+            let GameState::Bidding(bidding) = &game.state else {
+                panic!("expected bidding")
+            };
+            let player = bidding.players[bidding.current].name.clone();
+            game.handle(&player, &LandlordCommand::Rob, now);
+        }
+        assert!(matches!(game.state, GameState::Playing(_)));
+    }
+
     #[test]
     fn parses_compact_and_separated_cards() {
         assert_eq!(ranks("33441010jQKA2小王大王").len(), 13);
@@ -1385,42 +1893,429 @@ mod tests {
     }
 
     #[test]
-    fn dealing_never_places_spade_three_in_bottom_cards() {
+    fn classic_deal_gives_each_player_seventeen_cards_and_three_bottom_cards() {
         for seed in 0..100 {
             let mut rng = SplitMix64::new(seed);
-            let (hands, landlord) = deal(&mut rng);
-            assert_eq!(hands[landlord].len(), 20);
-            assert_eq!(hands.iter().filter(|hand| hand.len() == 17).count(), 2);
-            assert!(hands[landlord].iter().any(|card| card.spade_three));
-            assert_eq!(
-                hands
-                    .iter()
-                    .flatten()
-                    .filter(|card| card.spade_three)
-                    .count(),
-                1
-            );
+            let (hands, bottom) = deal(&mut rng);
+            assert!(hands.iter().all(|hand| hand.len() == 17));
+            assert_eq!(bottom.len(), 3);
+            assert_eq!(hands.iter().map(Vec::len).sum::<usize>() + bottom.len(), 54);
         }
     }
 
     #[test]
-    fn three_players_start_and_landlord_leads() {
+    fn hunan_run_fast_deals_sixteen_cards_and_spade_three_leads() {
+        let now = Instant::now();
+        let mut game = LandlordGame::with_seed(LandlordConfig::default(), 41);
+        assert_eq!(game.create_run_fast("甲", now).action, "created");
+        assert_eq!(game.join("乙", now).action, "joined");
+
+        let outcome = game.join("丙", now);
+
+        assert_eq!(outcome.action, "run-fast-started");
+        assert_eq!(outcome.private_deliveries.len(), 3);
+        assert!(
+            outcome
+                .private_deliveries
+                .iter()
+                .all(|delivery| delivery.message.contains("初始手牌(16张)"))
+        );
+        let GameState::Playing(playing) = &game.state else {
+            panic!("expected playing")
+        };
+        assert_eq!(playing.variant, CardGameVariant::HunanRunFast);
+        assert!(playing.players.iter().all(|player| player.hand.len() == 16));
+        let dealt_ranks = playing
+            .players
+            .iter()
+            .flat_map(|player| player.hand.iter().map(|card| card.rank))
+            .collect::<Vec<_>>();
+        let dealt_counts = rank_counts(&dealt_ranks);
+        assert_eq!(dealt_counts.get(&Rank::Ace), Some(&3));
+        assert_eq!(dealt_counts.get(&Rank::Two), Some(&1));
+        assert!(!dealt_counts.contains_key(&Rank::SmallJoker));
+        assert!(!dealt_counts.contains_key(&Rank::BigJoker));
+        assert_eq!(
+            playing
+                .players
+                .iter()
+                .flat_map(|player| &player.hand)
+                .filter(|card| card.spade_three)
+                .count(),
+            1
+        );
+        assert!(
+            playing.players[playing.current]
+                .hand
+                .iter()
+                .any(|card| card.spade_three)
+        );
+        assert!(playing.opening_spade_three_required);
+    }
+
+    #[test]
+    fn hunan_run_fast_first_play_uses_spade_three() {
+        let now = Instant::now();
+        let mut game = LandlordGame::with_seed(LandlordConfig::default(), 43);
+        game.create_run_fast("甲", now);
+        game.join("乙", now);
+        game.join("丙", now);
+        let (player, other_rank) = {
+            let GameState::Playing(playing) = &game.state else {
+                panic!("expected playing")
+            };
+            let current = &playing.players[playing.current];
+            let other_rank = current
+                .hand
+                .iter()
+                .find(|card| card.rank != Rank::Three)
+                .expect("opening hand has a non-three")
+                .rank;
+            (current.name.clone(), other_rank)
+        };
+
+        assert_eq!(
+            game.play(&player, other_rank.label(), now).action,
+            "spade-three-required"
+        );
+        assert_eq!(game.play(&player, "3", now).action, "played");
+        let GameState::Playing(playing) = &game.state else {
+            panic!("expected playing")
+        };
+        assert!(!playing.opening_spade_three_required);
+        assert!(
+            playing
+                .players
+                .iter()
+                .flat_map(|player| &player.hand)
+                .all(|card| !card.spade_three)
+        );
+    }
+
+    #[test]
+    fn hunan_run_fast_supports_three_aces_bomb_and_four_with_three() {
+        assert_eq!(
+            classify_for_variant(&ranks("AAA"), CardGameVariant::HunanRunFast),
+            Some(PlayPattern::Bomb(Rank::Ace))
+        );
+        assert_eq!(
+            classify_for_variant(&ranks("4444356"), CardGameVariant::HunanRunFast),
+            Some(PlayPattern::FourThree(Rank::Four))
+        );
+    }
+
+    #[test]
+    fn hunan_run_fast_cannot_pass_when_a_beating_play_exists() {
+        let now = Instant::now();
+        let mut game = LandlordGame::with_seed(LandlordConfig::default(), 1);
+        game.state = GameState::Playing(Playing {
+            players: vec![
+                Player {
+                    hand: vec![Card::new(Rank::Five)],
+                    ..Player::new("甲")
+                },
+                Player {
+                    hand: vec![Card::new(Rank::Six)],
+                    ..Player::new("乙")
+                },
+                Player {
+                    hand: vec![Card::new(Rank::Seven)],
+                    ..Player::new("丙")
+                },
+            ],
+            variant: CardGameVariant::HunanRunFast,
+            landlord: 2,
+            current: 0,
+            last_play: Some(LastPlay {
+                player: 2,
+                cards: vec![Card::new(Rank::Four)],
+                pattern: PlayPattern::Single(Rank::Four),
+            }),
+            consecutive_passes: 0,
+            timer: ActiveTimer::new(now),
+            warning_sent: false,
+            turns: 1,
+            bombs: 0,
+            opening_spade_three_required: false,
+        });
+
+        assert_eq!(game.pass("甲", now).action, "must-play");
+    }
+
+    #[test]
+    fn hunan_run_fast_can_pass_when_no_beating_play_exists() {
+        let now = Instant::now();
+        let mut game = LandlordGame::with_seed(LandlordConfig::default(), 1);
+        game.state = GameState::Playing(Playing {
+            players: vec![
+                Player {
+                    hand: vec![Card::new(Rank::Three)],
+                    ..Player::new("甲")
+                },
+                Player {
+                    hand: vec![Card::new(Rank::Six)],
+                    ..Player::new("乙")
+                },
+                Player {
+                    hand: vec![Card::new(Rank::Seven)],
+                    ..Player::new("丙")
+                },
+            ],
+            variant: CardGameVariant::HunanRunFast,
+            landlord: 2,
+            current: 0,
+            last_play: Some(LastPlay {
+                player: 2,
+                cards: vec![Card::new(Rank::Four)],
+                pattern: PlayPattern::Single(Rank::Four),
+            }),
+            consecutive_passes: 0,
+            timer: ActiveTimer::new(now),
+            warning_sent: false,
+            turns: 1,
+            bombs: 0,
+            opening_spade_three_required: false,
+        });
+
+        assert_eq!(game.pass("甲", now).action, "passed");
+    }
+
+    #[test]
+    fn hunan_run_fast_requires_largest_single_when_next_player_has_one_card() {
+        let now = Instant::now();
+        let mut game = LandlordGame::with_seed(LandlordConfig::default(), 1);
+        game.state = GameState::Playing(Playing {
+            players: vec![
+                Player {
+                    hand: vec![Card::new(Rank::Five), Card::new(Rank::King)],
+                    ..Player::new("甲")
+                },
+                Player {
+                    hand: vec![Card::new(Rank::Six)],
+                    ..Player::new("乙")
+                },
+                Player {
+                    hand: vec![Card::new(Rank::Seven), Card::new(Rank::Eight)],
+                    ..Player::new("丙")
+                },
+            ],
+            variant: CardGameVariant::HunanRunFast,
+            landlord: 0,
+            current: 0,
+            last_play: None,
+            consecutive_passes: 0,
+            timer: ActiveTimer::new(now),
+            warning_sent: false,
+            turns: 0,
+            bombs: 0,
+            opening_spade_three_required: false,
+        });
+
+        assert_eq!(game.play("甲", "5", now).action, "must-play-largest-single");
+        assert_eq!(game.play("甲", "K", now).action, "played");
+    }
+
+    #[test]
+    fn hunan_run_fast_timeout_obeys_report_one_largest_single_rule() {
+        let now = Instant::now();
+        let config = LandlordConfig {
+            turn_timeout_seconds: 1,
+            ..LandlordConfig::default()
+        };
+        let mut game = LandlordGame::with_seed(config, 1);
+        game.state = GameState::Playing(Playing {
+            players: vec![
+                Player {
+                    hand: vec![Card::new(Rank::Five), Card::new(Rank::King)],
+                    ..Player::new("甲")
+                },
+                Player {
+                    hand: vec![Card::new(Rank::Six)],
+                    ..Player::new("乙")
+                },
+                Player {
+                    hand: vec![Card::new(Rank::Seven), Card::new(Rank::Eight)],
+                    ..Player::new("丙")
+                },
+            ],
+            variant: CardGameVariant::HunanRunFast,
+            landlord: 0,
+            current: 0,
+            last_play: None,
+            consecutive_passes: 0,
+            timer: ActiveTimer::new(now),
+            warning_sent: false,
+            turns: 0,
+            bombs: 0,
+            opening_spade_three_required: false,
+        });
+
+        assert_eq!(
+            game.tick(now + Duration::from_secs(1), true)
+                .expect("timeout play")
+                .action,
+            "auto-play"
+        );
+        let GameState::Playing(playing) = &game.state else {
+            panic!("expected playing")
+        };
+        assert_eq!(playing.players[0].hand, vec![Card::new(Rank::Five)]);
+    }
+
+    #[test]
+    fn hunan_run_fast_first_empty_hand_wins() {
+        let now = Instant::now();
+        let mut game = LandlordGame::with_seed(LandlordConfig::default(), 1);
+        game.state = GameState::Playing(Playing {
+            players: vec![
+                Player {
+                    hand: vec![Card::new(Rank::King)],
+                    ..Player::new("甲")
+                },
+                Player {
+                    hand: vec![Card::new(Rank::Six), Card::new(Rank::Seven)],
+                    ..Player::new("乙")
+                },
+                Player {
+                    hand: vec![Card::new(Rank::Eight), Card::new(Rank::Nine)],
+                    ..Player::new("丙")
+                },
+            ],
+            variant: CardGameVariant::HunanRunFast,
+            landlord: 0,
+            current: 0,
+            last_play: None,
+            consecutive_passes: 0,
+            timer: ActiveTimer::new(now),
+            warning_sent: false,
+            turns: 0,
+            bombs: 0,
+            opening_spade_three_required: false,
+        });
+
+        let outcome = game.play("甲", "K", now);
+
+        assert!(outcome.ended);
+        assert!(
+            outcome
+                .public_reply
+                .is_some_and(|reply| reply.contains("跑得快获胜"))
+        );
+        assert!(!game.is_active());
+    }
+
+    #[test]
+    fn three_players_receive_hands_then_random_player_starts_bidding() {
         let now = Instant::now();
         let mut game = LandlordGame::with_seed(LandlordConfig::default(), 7);
         assert_eq!(game.create("甲", now).action, "created");
         assert_eq!(game.join("乙", now).action, "joined");
         let outcome = game.join("丙", now);
-        assert_eq!(outcome.action, "started");
+        assert_eq!(outcome.action, "bidding-started");
+        assert_eq!(outcome.private_deliveries.len(), 3);
+        let GameState::Bidding(bidding) = &game.state else {
+            panic!("expected bidding")
+        };
+        assert!(bidding.current < 3);
+        assert!(bidding.players.iter().all(|player| player.hand.len() == 17));
+        assert_eq!(bidding.bottom.len(), 3);
+
+        finish_bidding_with_all_players_robbing(&mut game, now);
         let GameState::Playing(playing) = &game.state else {
             panic!("expected playing")
         };
         assert_eq!(playing.current, playing.landlord);
-        assert!(
-            playing.players[playing.landlord]
-                .hand
-                .iter()
-                .any(|card| card.spade_three)
-        );
+        assert_eq!(playing.players[playing.landlord].hand.len(), 20);
+    }
+
+    #[test]
+    fn last_player_to_rob_becomes_landlord_and_leads() {
+        let now = Instant::now();
+        let mut game = LandlordGame::with_seed(LandlordConfig::default(), 29);
+        game.create("甲", now);
+        game.join("乙", now);
+        game.join("丙", now);
+
+        let mut last_robber = String::new();
+        for rob in [true, false, true] {
+            let GameState::Bidding(bidding) = &game.state else {
+                panic!("expected bidding")
+            };
+            let player = bidding.players[bidding.current].name.clone();
+            if rob {
+                last_robber = player.clone();
+            }
+            game.handle(
+                &player,
+                if rob {
+                    &LandlordCommand::Rob
+                } else {
+                    &LandlordCommand::Decline
+                },
+                now,
+            );
+        }
+
+        let GameState::Playing(playing) = &game.state else {
+            panic!("expected playing")
+        };
+        assert_eq!(playing.players[playing.landlord].name, last_robber);
+        assert_eq!(playing.current, playing.landlord);
+        assert_eq!(playing.players[playing.landlord].hand.len(), 20);
+    }
+
+    #[test]
+    fn all_players_declining_redeals_and_sends_new_hands() {
+        let now = Instant::now();
+        let mut game = LandlordGame::with_seed(LandlordConfig::default(), 31);
+        game.create("甲", now);
+        game.join("乙", now);
+        game.join("丙", now);
+
+        let mut final_outcome = None;
+        for _ in 0..3 {
+            let GameState::Bidding(bidding) = &game.state else {
+                panic!("expected bidding")
+            };
+            let player = bidding.players[bidding.current].name.clone();
+            final_outcome = Some(game.handle(&player, &LandlordCommand::Decline, now));
+        }
+        let outcome = final_outcome.expect("third bidding outcome");
+        assert_eq!(outcome.action, "redealt");
+        assert_eq!(outcome.private_deliveries.len(), 3);
+        let GameState::Bidding(bidding) = &game.state else {
+            panic!("expected bidding")
+        };
+        assert_eq!(bidding.decisions, 0);
+        assert!(bidding.players.iter().all(|player| player.hand.len() == 17));
+        assert_eq!(bidding.bottom.len(), 3);
+    }
+
+    #[test]
+    fn bidding_timeout_counts_as_decline() {
+        let now = Instant::now();
+        let config = LandlordConfig {
+            turn_timeout_seconds: 1,
+            ..LandlordConfig::default()
+        };
+        let mut game = LandlordGame::with_seed(config, 37);
+        game.create("甲", now);
+        game.join("乙", now);
+        game.join("丙", now);
+        let GameState::Bidding(bidding) = &game.state else {
+            panic!("expected bidding")
+        };
+        let first = bidding.current;
+
+        let outcome = game
+            .tick(now + Duration::from_secs(1), true)
+            .expect("bidding timeout");
+        assert_eq!(outcome.action, "declined");
+        let GameState::Bidding(bidding) = &game.state else {
+            panic!("expected bidding")
+        };
+        assert_eq!(bidding.decisions, 1);
+        assert_ne!(bidding.current, first);
     }
 
     #[test]
@@ -1454,6 +2349,7 @@ mod tests {
         game.create("甲", now);
         game.join("乙", now);
         game.join("丙", now);
+        finish_bidding_with_all_players_robbing(&mut game, now);
         let GameState::Playing(playing) = &mut game.state else {
             panic!("expected playing")
         };
@@ -1480,6 +2376,7 @@ mod tests {
         game.create("甲", now);
         game.join("乙", now);
         game.join("丙", now);
+        finish_bidding_with_all_players_robbing(&mut game, now);
         assert!(game.tick(now + Duration::from_secs(100), false).is_none());
         assert!(
             game.tick(now + Duration::from_secs(189), true)
@@ -1513,6 +2410,7 @@ mod tests {
         let mut game = LandlordGame::with_seed(config, 1);
         game.state = GameState::Playing(Playing {
             players,
+            variant: CardGameVariant::Landlord,
             landlord: 0,
             current: 0,
             last_play: None,
@@ -1521,6 +2419,7 @@ mod tests {
             warning_sent: false,
             turns: 0,
             bombs: 0,
+            opening_spade_three_required: false,
         });
         assert_eq!(game.play("甲", "3", now).action, "played");
 
@@ -1555,6 +2454,7 @@ mod tests {
         let mut game = LandlordGame::with_seed(LandlordConfig::default(), 1);
         game.state = GameState::Playing(Playing {
             players,
+            variant: CardGameVariant::Landlord,
             landlord: 0,
             current: 0,
             last_play: None,
@@ -1563,6 +2463,7 @@ mod tests {
             warning_sent: false,
             turns: 0,
             bombs: 0,
+            opening_spade_three_required: false,
         });
         assert_eq!(game.play("甲", "3", now).action, "played");
         assert_eq!(game.pass("乙", now).action, "passed");
@@ -1581,6 +2482,7 @@ mod tests {
         game.create("甲", now);
         game.join("乙", now);
         game.join("丙", now);
+        finish_bidding_with_all_players_robbing(&mut game, now);
         let (name, card) = {
             let GameState::Playing(playing) = &mut game.state else {
                 panic!("expected playing")

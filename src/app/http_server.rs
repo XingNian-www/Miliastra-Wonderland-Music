@@ -41,6 +41,7 @@ use super::runtime_state::PersistentRuntimeState;
 use super::task_tracker::TaskTrackerShared;
 use super::turtle_soup::TurtleSoupService;
 use super::turtle_soup_bank::{TurtleSoupBankStore, TurtleSoupSubmission};
+use super::undercover::{UndercoverCommand, UndercoverGame};
 use super::web_tools::{WebToolRequest, WebToolShared, WebToolTemplate};
 
 const MAX_ACTIVE_CONNECTIONS: usize = 32;
@@ -325,6 +326,24 @@ const ROUTES: &[RouteSpec] = &[
         handler: turtle_soup_end_route,
     },
     RouteSpec {
+        path: "/undercover",
+        json: true,
+        mutating: false,
+        handler: undercover_route,
+    },
+    RouteSpec {
+        path: "/undercover/start",
+        json: true,
+        mutating: true,
+        handler: undercover_start_route,
+    },
+    RouteSpec {
+        path: "/undercover/end",
+        json: true,
+        mutating: true,
+        handler: undercover_end_route,
+    },
+    RouteSpec {
         path: "/tools/task",
         json: true,
         mutating: false,
@@ -419,6 +438,7 @@ pub struct HttpSharedState {
     pub chat_listener: ChatListenerShared,
     turtle_soup: TurtleSoupService,
     turtle_soup_bank: TurtleSoupBankStore,
+    undercover: Arc<Mutex<UndercoverGame>>,
     pub history: Arc<Mutex<VecDeque<HistoryItem>>>,
     pub active_connections: Arc<AtomicUsize>,
     pending: Arc<(Mutex<VecDeque<super::TrackedPendingTask>>, Condvar)>,
@@ -468,6 +488,7 @@ impl HttpSharedState {
         pending: Arc<(Mutex<VecDeque<super::TrackedPendingTask>>, Condvar)>,
         chat_listener: ChatListenerShared,
         turtle_soup: TurtleSoupService,
+        undercover: Arc<Mutex<UndercoverGame>>,
         monitor: MonitorShared,
         task_tracker: TaskTrackerShared,
         decision_control: DecisionControlShared,
@@ -485,6 +506,7 @@ impl HttpSharedState {
             chat_listener,
             turtle_soup,
             turtle_soup_bank,
+            undercover,
             history: Arc::new(Mutex::new(VecDeque::new())),
             active_connections: Arc::new(AtomicUsize::new(0)),
             pending,
@@ -1396,6 +1418,46 @@ fn turtle_soup_questions_route(
     serde_json::to_string(&receipt).map_err(internal_error)
 }
 
+fn undercover_route(
+    _query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let snapshot = state
+        .undercover
+        .lock()
+        .map_err(|_| internal_message("谁是卧底状态锁已损坏"))?
+        .snapshot(std::time::Instant::now());
+    serde_json::to_string(&snapshot).map_err(internal_error)
+}
+
+fn undercover_start_route(
+    _query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    enqueue_remote_command(
+        state,
+        remote_control_command(
+            "卧底开局".to_string(),
+            "卧底",
+            UserCommand::Undercover(UndercoverCommand::Start),
+        ),
+    )
+}
+
+fn undercover_end_route(
+    _query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    enqueue_remote_command(
+        state,
+        remote_control_command(
+            "卧底结束".to_string(),
+            "卧底",
+            UserCommand::Undercover(UndercoverCommand::End),
+        ),
+    )
+}
+
 fn tool_task_route(
     query: &[(String, String)],
     state: &HttpSharedState,
@@ -2138,6 +2200,17 @@ fn monitor_json(state: &HttpSharedState) -> std::result::Result<String, AppError
             "turtleSoup".to_string(),
             serde_json::to_value(state.turtle_soup.snapshot()).map_err(internal_error)?,
         );
+        object.insert(
+            "undercover".to_string(),
+            serde_json::to_value(
+                state
+                    .undercover
+                    .lock()
+                    .map_err(|_| internal_message("谁是卧底状态锁已损坏"))?
+                    .snapshot(std::time::Instant::now()),
+            )
+            .map_err(internal_error)?,
+        );
     }
     serde_json::to_string(&value).map_err(internal_error)
 }
@@ -2810,6 +2883,23 @@ mod tests {
         let monitor: Value = serde_json::from_str(&monitor_json(&state).unwrap()).unwrap();
         assert_eq!(monitor["turtleSoup"]["enabled"], false);
         assert_eq!(monitor["turtleSoup"]["phase"], "idle");
+    }
+
+    #[test]
+    fn undercover_routes_are_redacted_json_and_controls_require_post() {
+        assert!(!is_mutating_route("/undercover"));
+        assert!(is_json_route("/undercover"));
+        for route in ["/undercover/start", "/undercover/end"] {
+            assert!(is_mutating_route(route));
+            assert!(is_json_route(route));
+        }
+
+        let state = test_state();
+        let monitor: Value = serde_json::from_str(&monitor_json(&state).unwrap()).unwrap();
+        assert_eq!(monitor["undercover"]["enabled"], false);
+        assert_eq!(monitor["undercover"]["phase"], "idle");
+        assert!(monitor["undercover"].get("words").is_none());
+        assert!(monitor["undercover"].get("roles").is_none());
     }
 
     #[test]
@@ -3504,6 +3594,7 @@ mod tests {
             EntertainmentCoordinator::new(),
             DeferredChatQueue::new(32),
         );
+        let undercover = Arc::new(Mutex::new(UndercoverGame::new(config.undercover.clone())));
         HttpSharedState::new(
             config,
             queue,
@@ -3511,6 +3602,7 @@ mod tests {
             pending,
             ChatListenerShared::new(),
             turtle_soup,
+            undercover,
             monitor,
             TaskTrackerShared::new(),
             DecisionControlShared::new(),

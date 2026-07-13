@@ -36,9 +36,10 @@ impl Default for PlaybackRuntimeState {
     }
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ConfirmedPlaybackState {
+    #[default]
     Idle,
     Starting,
     RequestedSongPlaying,
@@ -48,40 +49,24 @@ pub enum ConfirmedPlaybackState {
     Unknown,
 }
 
-impl Default for ConfirmedPlaybackState {
-    fn default() -> Self {
-        Self::Idle
-    }
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PauseReason {
+    #[default]
     None,
     User,
     WaitingForQueue,
 }
 
-impl Default for PauseReason {
-    fn default() -> Self {
-        Self::None
-    }
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ObservationReliability {
     Reliable,
     Incomplete,
     Stale,
     Mismatched,
+    #[default]
     Unknown,
-}
-
-impl Default for ObservationReliability {
-    fn default() -> Self {
-        Self::Unknown
-    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

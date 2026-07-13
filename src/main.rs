@@ -992,14 +992,14 @@ mod app {
                     break;
                 }
 
-                if let DeferredChatItem::Batch(batch) = &item {
-                    if !self.turtle_soup.delivery_is_current(batch.turtle_soup) {
-                        log::debug!(
-                            "延迟聊天分段批次所属海龟汤会话已失效，跳过: {:?}",
-                            batch.turtle_soup
-                        );
-                        continue;
-                    }
+                if let DeferredChatItem::Batch(batch) = &item
+                    && !self.turtle_soup.delivery_is_current(batch.turtle_soup)
+                {
+                    log::debug!(
+                        "延迟聊天分段批次所属海龟汤会话已失效，跳过: {:?}",
+                        batch.turtle_soup
+                    );
+                    continue;
                 }
 
                 let target = item.target();
@@ -1621,22 +1621,20 @@ mod app {
                                     }
                                 };
                                 let now = Instant::now();
-                                if entered_primary {
-                                    if let Some(fingerprint) = fingerprint.clone() {
-                                        last_fingerprint = Some(fingerprint);
-                                        let scan_after = now
-                                            + Duration::from_millis(
-                                                self.config.timing.chat_scan.change_debounce_ms,
-                                            );
-                                        if force_scan_after.is_none_or(|time| scan_after < time) {
-                                            force_scan_after = Some(scan_after);
-                                            force_scan_reason = Some("enter-primary");
-                                        }
-                                        log::info!(target: "timing",
-                                            "进入一级界面，已建立聊天区对比基线，快速扫描延迟={}ms",
-                                            self.config.timing.chat_scan.change_debounce_ms
+                                if entered_primary && let Some(fingerprint) = fingerprint.clone() {
+                                    last_fingerprint = Some(fingerprint);
+                                    let scan_after = now
+                                        + Duration::from_millis(
+                                            self.config.timing.chat_scan.change_debounce_ms,
                                         );
+                                    if force_scan_after.is_none_or(|time| scan_after < time) {
+                                        force_scan_after = Some(scan_after);
+                                        force_scan_reason = Some("enter-primary");
                                     }
+                                    log::info!(target: "timing",
+                                        "进入一级界面，已建立聊天区对比基线，快速扫描延迟={}ms",
+                                        self.config.timing.chat_scan.change_debounce_ms
+                                    );
                                 }
                                 let change_suppressed = now < suppress_change_until;
                                 let forced_scan_due =
@@ -2102,17 +2100,17 @@ mod app {
                     log::info!("命令识别已禁用，跳过: {}", parsed_command.raw);
                     continue;
                 }
-                if let UserCommand::Invite(invite) = &parsed_command.command {
-                    if let Some(seq) = invite.seq {
-                        let invite_executed = self
-                            .invite_executed_seqs
-                            .lock()
-                            .map_err(|_| anyhow!("invite_executed_seqs mutex poisoned"))?
-                            .contains(&seq);
-                        if invite_executed {
-                            log::info!("邀请参数 {} 已执行过，跳过: {}", seq, parsed_command.raw);
-                            continue;
-                        }
+                if let UserCommand::Invite(invite) = &parsed_command.command
+                    && let Some(seq) = invite.seq
+                {
+                    let invite_executed = self
+                        .invite_executed_seqs
+                        .lock()
+                        .map_err(|_| anyhow!("invite_executed_seqs mutex poisoned"))?
+                        .contains(&seq);
+                    if invite_executed {
+                        log::info!("邀请参数 {} 已执行过，跳过: {}", seq, parsed_command.raw);
+                        continue;
                     }
                 }
                 if parsed
@@ -2494,17 +2492,17 @@ mod app {
             if self.handle_landlord_command(&parsed)? {
                 return Ok(());
             }
-            if let UserCommand::Invite(invite) = &parsed.command {
-                if let Some(seq) = invite.seq {
-                    let executed = self
-                        .invite_executed_seqs
-                        .lock()
-                        .map_err(|_| anyhow!("invite_executed_seqs mutex poisoned"))?
-                        .contains(&seq);
-                    if executed {
-                        log::info!("邀请参数 {} 已执行过，跳过: {}", seq, parsed.raw);
-                        return Ok(());
-                    }
+            if let UserCommand::Invite(invite) = &parsed.command
+                && let Some(seq) = invite.seq
+            {
+                let executed = self
+                    .invite_executed_seqs
+                    .lock()
+                    .map_err(|_| anyhow!("invite_executed_seqs mutex poisoned"))?
+                    .contains(&seq);
+                if executed {
+                    log::info!("邀请参数 {} 已执行过，跳过: {}", seq, parsed.raw);
+                    return Ok(());
                 }
             }
             if self.pending_contains_command(&parsed)? {
@@ -4589,6 +4587,7 @@ mod app {
             Ok(QueuePushOutcome::Added(len))
         }
 
+        #[allow(clippy::too_many_arguments)]
         fn handle_queue_push_outcome(
             &self,
             parsed: &ParsedCommand,
@@ -5927,84 +5926,79 @@ mod app {
             allow_switch_source: bool,
             confirm_after_switch: bool,
         ) -> Result<PlaybackOutcome> {
-            loop {
-                match self.player.verify_playback_started(request, attempt)? {
-                    PlaybackVerification::Success { status, message } => {
-                        if confirm_after_switch {
-                            match self.confirm_switched_source_result(&status)? {
-                                UserDecision::Skip => {
-                                    self.player.reject_mismatch_as_no_source(Some(&status))?;
-                                    self.report_no_source(Some(&status), false)?;
-                                    self.update_monitor_playback_controller();
-                                    return Ok(PlaybackOutcome::NoSource);
-                                }
-                                UserDecision::Stopped => return Ok(PlaybackOutcome::Error),
-                                _ => {}
-                            }
-                        }
-                        self.reply(&message)?;
-                        self.update_monitor_playback_controller();
-                        return Ok(PlaybackOutcome::Success);
-                    }
-                    PlaybackVerification::NoSource => {
-                        self.report_no_source(None, false)?;
-                        self.update_monitor_playback_controller();
-                        return Ok(PlaybackOutcome::NoSource);
-                    }
-                    PlaybackVerification::MismatchedCandidate(mismatch) => {
-                        match self.handle_playback_mismatch(
-                            request,
-                            &mismatch.status,
-                            &mismatch.local_reason,
-                            allow_switch_source,
-                        )? {
-                            MismatchDecision::Accept => {
-                                match self.player.accept_mismatch(request, &mismatch.status)? {
-                                    PlaybackVerification::Success { status, message } => {
-                                        if confirm_after_switch {
-                                            match self.confirm_switched_source_result(&status)? {
-                                                UserDecision::Skip => {
-                                                    self.player.reject_mismatch_as_no_source(
-                                                        Some(&status),
-                                                    )?;
-                                                    self.report_no_source(Some(&status), false)?;
-                                                    self.update_monitor_playback_controller();
-                                                    return Ok(PlaybackOutcome::NoSource);
-                                                }
-                                                UserDecision::Stopped => {
-                                                    return Ok(PlaybackOutcome::Error);
-                                                }
-                                                _ => {}
-                                            }
-                                        }
-                                        self.reply(&message)?;
-                                        self.update_monitor_playback_controller();
-                                        return Ok(PlaybackOutcome::Success);
-                                    }
-                                    PlaybackVerification::NoSource => {
-                                        self.report_no_source(Some(&mismatch.status), true)?;
-                                        self.update_monitor_playback_controller();
-                                        return Ok(PlaybackOutcome::NoSource);
-                                    }
-                                    _ => return Ok(PlaybackOutcome::Error),
-                                }
-                            }
-                            MismatchDecision::NoSource => {
-                                self.player
-                                    .reject_mismatch_as_no_source(Some(&mismatch.status))?;
-                                self.report_no_source(Some(&mismatch.status), false)?;
+            match self.player.verify_playback_started(request, attempt)? {
+                PlaybackVerification::Success { status, message } => {
+                    if confirm_after_switch {
+                        match self.confirm_switched_source_result(&status)? {
+                            UserDecision::Skip => {
+                                self.player.reject_mismatch_as_no_source(Some(&status))?;
+                                self.report_no_source(Some(&status), false)?;
                                 self.update_monitor_playback_controller();
                                 return Ok(PlaybackOutcome::NoSource);
                             }
-                            MismatchDecision::SwitchSource => {
-                                return self.switch_source_and_play(
-                                    &request.keyword,
-                                    &request.source,
-                                    request.prefer_accompaniment,
-                                );
-                            }
-                            MismatchDecision::Error => return Ok(PlaybackOutcome::Error),
+                            UserDecision::Stopped => return Ok(PlaybackOutcome::Error),
+                            _ => {}
                         }
+                    }
+                    self.reply(&message)?;
+                    self.update_monitor_playback_controller();
+                    Ok(PlaybackOutcome::Success)
+                }
+                PlaybackVerification::NoSource => {
+                    self.report_no_source(None, false)?;
+                    self.update_monitor_playback_controller();
+                    Ok(PlaybackOutcome::NoSource)
+                }
+                PlaybackVerification::MismatchedCandidate(mismatch) => {
+                    match self.handle_playback_mismatch(
+                        request,
+                        &mismatch.status,
+                        &mismatch.local_reason,
+                        allow_switch_source,
+                    )? {
+                        MismatchDecision::Accept => {
+                            match self.player.accept_mismatch(request, &mismatch.status)? {
+                                PlaybackVerification::Success { status, message } => {
+                                    if confirm_after_switch {
+                                        match self.confirm_switched_source_result(&status)? {
+                                            UserDecision::Skip => {
+                                                self.player
+                                                    .reject_mismatch_as_no_source(Some(&status))?;
+                                                self.report_no_source(Some(&status), false)?;
+                                                self.update_monitor_playback_controller();
+                                                return Ok(PlaybackOutcome::NoSource);
+                                            }
+                                            UserDecision::Stopped => {
+                                                return Ok(PlaybackOutcome::Error);
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    self.reply(&message)?;
+                                    self.update_monitor_playback_controller();
+                                    Ok(PlaybackOutcome::Success)
+                                }
+                                PlaybackVerification::NoSource => {
+                                    self.report_no_source(Some(&mismatch.status), true)?;
+                                    self.update_monitor_playback_controller();
+                                    Ok(PlaybackOutcome::NoSource)
+                                }
+                                _ => Ok(PlaybackOutcome::Error),
+                            }
+                        }
+                        MismatchDecision::NoSource => {
+                            self.player
+                                .reject_mismatch_as_no_source(Some(&mismatch.status))?;
+                            self.report_no_source(Some(&mismatch.status), false)?;
+                            self.update_monitor_playback_controller();
+                            Ok(PlaybackOutcome::NoSource)
+                        }
+                        MismatchDecision::SwitchSource => self.switch_source_and_play(
+                            &request.keyword,
+                            &request.source,
+                            request.prefer_accompaniment,
+                        ),
+                        MismatchDecision::Error => Ok(PlaybackOutcome::Error),
                     }
                 }
             }
@@ -6089,15 +6083,15 @@ mod app {
             let outcome = self.play_request_confirmed(&request, false)?;
             if outcome == PlaybackOutcome::Success {
                 // 换源成功后仍让用户有一次跳过机会。
-                if let Ok(status) = self.player.status() {
-                    if matches!(
+                if let Ok(status) = self.player.status()
+                    && matches!(
                         self.confirm_switched_source_result(&status)?,
                         UserDecision::Skip
-                    ) {
-                        self.player.reject_mismatch_as_no_source(Some(&status))?;
-                        self.report_no_source(Some(&status), false)?;
-                        return Ok(PlaybackOutcome::NoSource);
-                    }
+                    )
+                {
+                    self.player.reject_mismatch_as_no_source(Some(&status))?;
+                    self.report_no_source(Some(&status), false)?;
+                    return Ok(PlaybackOutcome::NoSource);
                 }
             }
             Ok(outcome)

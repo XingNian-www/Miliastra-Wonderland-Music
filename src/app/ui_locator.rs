@@ -216,7 +216,7 @@ impl UiRegion<'_> {
                     line.bbox.height,
                 ),
             };
-            if targets.iter().any(|target| normalized == *target) {
+            if targets.contains(&normalized) {
                 return Ok(Some(hit));
             }
             if fallback.is_none()

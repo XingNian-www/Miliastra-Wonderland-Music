@@ -30,7 +30,7 @@ pub fn match_song_query(
         return MatchResult::no("缺少点歌文本或返回歌曲名");
     }
 
-    let has_full_name = normalized_query.contains(&normalized_name);
+    let has_full_name = normalized_query.contains(normalized_name);
     let name_score = name_match.score;
     if name_score < config.min_song_name_score {
         return MatchResult::no(&format!(
@@ -38,14 +38,14 @@ pub fn match_song_query(
             (name_score * 100.0).round() as i32
         ));
     }
-    if is_contained_query_name(&normalized_name, &normalized_query) {
+    if is_contained_query_name(normalized_name, &normalized_query) {
         if !is_safe_contained_query_name(&name_match.raw, query, &normalized_query) {
             return MatchResult::no("歌名局部包含无明确边界");
         }
         return MatchResult::yes("歌名包含匹配");
     }
 
-    let singer_candidate = remove_matched_name(config, &normalized_query, &normalized_name);
+    let singer_candidate = remove_matched_name(config, &normalized_query, normalized_name);
     if singer_candidate.is_empty() {
         return MatchResult::yes("歌曲名匹配");
     }
@@ -53,7 +53,7 @@ pub fn match_song_query(
     if has_full_name
         && !has_singer_separator_after_name(query, &name_match.raw)
         && singer_candidate.chars().count() <= config.max_ocr_noise_chars + 1
-        && can_ignore_full_name_extra(&normalized_name, &singer_candidate)
+        && can_ignore_full_name_extra(normalized_name, &singer_candidate)
     {
         return MatchResult::yes(&format!("忽略OCR噪声:{}", singer_candidate));
     }
@@ -66,7 +66,7 @@ pub fn match_song_query(
         if singer_candidate.chars().count() <= config.max_ocr_noise_chars + 1 {
             return MatchResult::yes(&format!("模糊匹配:{}", singer_candidate));
         }
-        let name_cn_chars = chinese_chars(&normalized_name);
+        let name_cn_chars = chinese_chars(normalized_name);
         let max_strip = singer_candidate
             .chars()
             .count()

@@ -736,24 +736,25 @@ impl<B: MusicPlayerBackend> PlayerController<B> {
                 }
             })?;
         }
-        if let Some(remaining) = playback_remaining_seconds(&status) {
-            if remaining <= self.queue.auto_advance_seconds as f64 && has_pending_playback {
-                let paused = self.pause_for_queue()?;
-                if !context.command_executing
-                    && !context.has_pending_playback_task
-                    && !context.queue_empty
-                {
-                    log::info!("队列推进决策: advance reason=near_end");
-                    return Ok(QueueAdvanceDecision::AdvanceQueue {
-                        reason: "即将结束"
-                    });
-                }
-                return Ok(if paused {
-                    QueueAdvanceDecision::PauseForQueue
-                } else {
-                    QueueAdvanceDecision::None
+        if let Some(remaining) = playback_remaining_seconds(&status)
+            && remaining <= self.queue.auto_advance_seconds as f64
+            && has_pending_playback
+        {
+            let paused = self.pause_for_queue()?;
+            if !context.command_executing
+                && !context.has_pending_playback_task
+                && !context.queue_empty
+            {
+                log::info!("队列推进决策: advance reason=near_end");
+                return Ok(QueueAdvanceDecision::AdvanceQueue {
+                    reason: "即将结束"
                 });
             }
+            return Ok(if paused {
+                QueueAdvanceDecision::PauseForQueue
+            } else {
+                QueueAdvanceDecision::None
+            });
         }
         Ok(QueueAdvanceDecision::None)
     }

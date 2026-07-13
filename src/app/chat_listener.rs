@@ -132,10 +132,10 @@ impl ChatListenerShared {
     }
 
     pub(super) fn cancel_mode_request(&self, target: ChatListenerMode) {
-        if let Ok(mut state) = self.state.lock() {
-            if state.pending_mode == Some(target) {
-                state.pending_mode = None;
-            }
+        if let Ok(mut state) = self.state.lock()
+            && state.pending_mode == Some(target)
+        {
+            state.pending_mode = None;
         }
     }
 
@@ -195,11 +195,12 @@ impl ChatListenerShared {
     }
 
     pub(super) fn finish_initial_unread_clear(&self) {
-        if let Ok(mut state) = self.state.lock() {
-            if state.mode == ChatListenerMode::Secondary && !state.unread_task_pending {
-                state.initial_unread_clear = false;
-                state.hall_round_required = true;
-            }
+        if let Ok(mut state) = self.state.lock()
+            && state.mode == ChatListenerMode::Secondary
+            && !state.unread_task_pending
+        {
+            state.initial_unread_clear = false;
+            state.hall_round_required = true;
         }
     }
 
@@ -339,16 +340,16 @@ pub(super) fn latest_incoming_bubble_rect(image: &DynamicImage) -> Option<Rect> 
             active_end = y;
             continue;
         }
-        if let Some(start) = active_start.take() {
-            if active_end - start >= 8 {
-                groups.push((start, active_end));
-            }
-        }
-    }
-    if let Some(start) = active_start {
-        if active_end - start >= 8 {
+        if let Some(start) = active_start.take()
+            && active_end - start >= 8
+        {
             groups.push((start, active_end));
         }
+    }
+    if let Some(start) = active_start
+        && active_end - start >= 8
+    {
+        groups.push((start, active_end));
     }
     let (top, bottom) = *groups.last()?;
     let crop_top = (top - 42).max(region.y);

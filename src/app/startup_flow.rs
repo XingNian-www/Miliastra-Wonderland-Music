@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::Path;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -160,7 +160,7 @@ where
             HitAction::Click {
                 offset: PointConfig::new(0, 0),
             },
-            || should_continue(),
+            &mut *should_continue,
         )?;
         if let Some(confirm) = confirm {
             log::info!(
@@ -213,7 +213,7 @@ where
 fn template_on_frame(
     config: &AppConfig,
     image: &image::DynamicImage,
-    template: &PathBuf,
+    template: &Path,
     region: RectConfig,
 ) -> Result<Option<TemplateHit>> {
     best_template_hit(
@@ -227,7 +227,7 @@ fn template_on_frame(
 fn template_stable_visible<F>(
     config: &AppConfig,
     locator: &UiLocator,
-    template: &PathBuf,
+    template: &Path,
     region: RectConfig,
     label: &str,
     should_continue: &mut F,
@@ -265,7 +265,7 @@ where
 fn locate_template<F>(
     config: &AppConfig,
     locator: &UiLocator,
-    template: &PathBuf,
+    template: &Path,
     region: RectConfig,
     label: &str,
     should_continue: &mut F,
@@ -292,7 +292,7 @@ fn capped_attempts(configured_retries: u32, timeout_ms: u64, interval_ms: u64) -
 
 fn attempt_count(timeout_ms: u64, interval_ms: u64) -> u32 {
     let interval_ms = interval_ms.max(1);
-    ((timeout_ms.max(interval_ms) + interval_ms - 1) / interval_ms) as u32
+    timeout_ms.max(interval_ms).div_ceil(interval_ms) as u32
 }
 
 fn elapsed_ms(started: Instant) -> u128 {

@@ -61,10 +61,10 @@ impl Log for FileLogger {
             return;
         }
 
-        if !is_monitor_hidden_target(record.target()) {
-            if let Some(monitor) = &self.monitor {
-                monitor.push(line.clone());
-            }
+        if !is_monitor_hidden_target(record.target())
+            && let Some(monitor) = &self.monitor
+        {
+            monitor.push(line.clone());
         }
         if self.stderr {
             let _ = std::io::stderr().write_all(format!("{line}\n").as_bytes());
@@ -316,6 +316,7 @@ fn days_in_month(year: i64, month: u32) -> u32 {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 

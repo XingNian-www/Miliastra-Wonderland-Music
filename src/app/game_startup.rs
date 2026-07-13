@@ -408,7 +408,7 @@ fn registry_string(key: windows::core::PCWSTR, value: windows::core::PCWSTR) -> 
     if status.0 != 0 || byte_len == 0 {
         return None;
     }
-    let mut buffer = vec![0_u16; (byte_len as usize + 1) / 2];
+    let mut buffer = vec![0_u16; (byte_len as usize).div_ceil(2)];
     let status = unsafe {
         RegGetValueW(
             HKEY_CURRENT_USER,

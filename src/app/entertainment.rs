@@ -7,6 +7,7 @@ pub(super) enum EntertainmentKind {
     IdiomChain,
     Landlord,
     TurtleSoup,
+    Undercover,
 }
 
 impl EntertainmentKind {
@@ -15,6 +16,7 @@ impl EntertainmentKind {
             Self::IdiomChain => "成语接龙",
             Self::Landlord => "斗地主",
             Self::TurtleSoup => "海龟汤",
+            Self::Undercover => "谁是卧底",
         }
     }
 }

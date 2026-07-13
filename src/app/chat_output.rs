@@ -690,8 +690,11 @@ pub(super) fn display_width(value: &str) -> usize {
     value.chars().map(char_width).sum()
 }
 
+fn char_width(ch: char) -> usize {
+    if ch.is_ascii() { 1 } else { 2 }
+}
+
 #[cfg(test)]
-#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 
@@ -826,8 +829,4 @@ mod tests {
         assert!(matches!(outcome.status, ChatBatchSendStatus::Failed(_)));
         assert_eq!(delivered, vec!["第一段"]);
     }
-}
-
-fn char_width(ch: char) -> usize {
-    if ch.is_ascii() { 1 } else { 2 }
 }

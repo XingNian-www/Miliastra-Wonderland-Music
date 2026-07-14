@@ -36,13 +36,13 @@ struct SongDedupHistoryFile {
 }
 
 #[derive(Debug)]
-pub(super) struct PersistentSongDedupHistory {
+pub(crate) struct PersistentSongDedupHistory {
     path: PathBuf,
     entries: Vec<SongDedupEntry>,
 }
 
 impl PersistentSongDedupHistory {
-    pub(super) fn load(path: PathBuf) -> Result<Self> {
+    pub(crate) fn load(path: PathBuf) -> Result<Self> {
         let entries = if path.exists() {
             let text = fs::read_to_string(&path)
                 .with_context(|| format!("读取长时间同歌去重历史失败: {}", path.display()))?;
@@ -54,7 +54,7 @@ impl PersistentSongDedupHistory {
         Ok(Self { path, entries })
     }
 
-    pub(super) fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
 

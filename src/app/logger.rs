@@ -120,9 +120,9 @@ impl LogFiles {
     }
 }
 
-pub(super) struct LogPaths {
-    pub(super) main: PathBuf,
-    pub(super) timing: PathBuf,
+pub(crate) struct LogPaths {
+    pub(crate) main: PathBuf,
+    pub(crate) timing: PathBuf,
 }
 
 fn format_prefix_at(level: log::Level, now: SystemTime) -> String {

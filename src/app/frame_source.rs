@@ -8,6 +8,7 @@ use image::imageops::FilterType;
 
 use super::FrameArgs;
 use super::game_ui::GameUi;
+use crate::runtime::ui::CapturedFrame;
 
 #[derive(Clone, Debug)]
 pub(super) struct Canvas {
@@ -19,27 +20,39 @@ pub(super) struct Canvas {
 #[derive(Debug)]
 pub(super) struct Frame {
     pub(super) image: Arc<DynamicImage>,
+    pub(super) captured_at: Instant,
 }
 
 pub(super) fn load_frame(args: &FrameArgs, canvas: &Canvas, game_ui: &GameUi) -> Result<Frame> {
     let started = Instant::now();
-    let image = match &args.image {
+    let image = Arc::new(match &args.image {
         Some(path) => {
             image::open(path).with_context(|| format!("open image {}", path.display()))?
         }
         None => game_ui.capture()?,
-    };
+    });
+    let captured_at = Instant::now();
     let image = normalize_frame(image, canvas, started);
-    Ok(Frame {
-        image: Arc::new(image),
-    })
+    Ok(Frame { image, captured_at })
 }
 
-fn normalize_frame(image: DynamicImage, canvas: &Canvas, started: Instant) -> DynamicImage {
+pub(super) fn from_captured_frame(frame: &CapturedFrame, canvas: &Canvas) -> Frame {
+    let started = Instant::now();
+    Frame {
+        image: normalize_frame(frame.image_arc(), canvas, started),
+        captured_at: frame.captured_at(),
+    }
+}
+
+fn normalize_frame(
+    image: Arc<DynamicImage>,
+    canvas: &Canvas,
+    started: Instant,
+) -> Arc<DynamicImage> {
     let (source_width, source_height) = image.dimensions();
     let image = if canvas.resize && (source_width != canvas.width || source_height != canvas.height)
     {
-        image.resize_exact(canvas.width, canvas.height, FilterType::Triangle)
+        Arc::new(image.resize_exact(canvas.width, canvas.height, FilterType::Triangle))
     } else {
         image
     };

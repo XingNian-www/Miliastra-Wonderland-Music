@@ -1,4 +1,3 @@
-
 mod ai;
 mod change_detection;
 mod chat_listener;

@@ -2,20 +2,12 @@ use std::path::PathBuf;
 use std::thread::sleep;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
-use enigo::{Direction, Enigo, Key, Keyboard, Settings};
+use anyhow::{Result, anyhow};
 
-use super::FrameArgs;
 use super::frame_source::Canvas;
-use super::game_ui::GameUi;
+use super::game_ui::{ChatBatchRequest, ChatBatchTarget, GameUi};
 use super::geometry::Rect;
-use super::input_actions;
-use super::ui_locator::UiLocator;
-use super::window::GameWindow;
-use super::workflow_actions::{self, ScrollTemplateOptions};
-use crate::config::{
-    InviteConfig, OutputConfig, ScreenConfig, TemplateConfig, TimingConfig, WindowConfig,
-};
+use crate::config::{InviteConfig, OutputConfig, ScreenConfig, TemplateConfig, TimingConfig};
 #[cfg(test)]
 use crate::features::chat_text::split_numbered_chat_message;
 use crate::features::chat_text::{MAX_CHAT_WIDTH, char_width, display_width};
@@ -38,7 +30,7 @@ pub(super) enum ChatBatchSendStatus {
 }
 
 impl ChatBatchSendOutcome {
-    fn complete(sent: usize) -> Self {
+    pub(super) fn complete(sent: usize) -> Self {
         Self {
             sent,
             status: ChatBatchSendStatus::Complete,
@@ -71,7 +63,6 @@ pub struct ChatOutput {
     config: OutputConfig,
     timing: TimingConfig,
     game_ui: GameUi,
-    window: WindowConfig,
     canvas: Canvas,
     secondary_hall_template: PathBuf,
     secondary_hall_search_region: Rect,
@@ -84,7 +75,6 @@ impl ChatOutput {
         config: &OutputConfig,
         timing: &TimingConfig,
         game_ui: GameUi,
-        window: &WindowConfig,
         screen: &ScreenConfig,
         templates: &TemplateConfig,
         invite: &InviteConfig,
@@ -96,7 +86,6 @@ impl ChatOutput {
             config: config.clone(),
             timing: timing.clone(),
             game_ui,
-            window: window.clone(),
             canvas: Canvas {
                 width: screen.expected_width,
                 height: screen.expected_height,
@@ -286,34 +275,11 @@ impl ChatOutput {
         messages: &[String],
         delay_ms: u64,
     ) -> ChatBatchSendOutcome {
-        if messages.is_empty() {
-            return ChatBatchSendOutcome::complete(0);
-        }
-
-        let mut enigo = match Enigo::new(&Settings::default()).context("create enigo") {
-            Ok(enigo) => enigo,
-            Err(error) => return ChatBatchSendOutcome::failed(0, error),
-        };
-        let mut window = match GameWindow::find(&self.window) {
-            Ok(window) => window,
-            Err(error) => return ChatBatchSendOutcome::failed(0, error),
-        };
-        if let Err(error) = window.ensure_foreground() {
-            return ChatBatchSendOutcome::failed(0, error);
-        }
-
-        send_messages(messages, delay_ms, |message| {
-            (|| -> Result<()> {
-                window.click(&mut enigo, self.config.chat_click_2)?;
-                sleep_ms(self.timing.input.click_ms);
-                input_message(&mut enigo, message, self.timing.input.text_ms, &self.window)?;
-                enigo
-                    .key(Key::Return, Direction::Click)
-                    .context("send message")?;
-                sleep_ms(self.timing.input.send_ms);
-                Ok(())
-            })()
-        })
+        self.game_ui.send_chat_batch(self.batch_request(
+            messages,
+            delay_ms,
+            ChatBatchTarget::Current,
+        ))
     }
 
     fn send_batch_with_input(
@@ -322,93 +288,34 @@ impl ChatOutput {
         delay_ms: u64,
         restore_after_task: bool,
     ) -> ChatBatchSendOutcome {
-        if messages.is_empty() {
-            return ChatBatchSendOutcome::complete(0);
-        }
-
-        let mut enigo = match Enigo::new(&Settings::default()).context("create enigo") {
-            Ok(enigo) => enigo,
-            Err(error) => return ChatBatchSendOutcome::failed(0, error),
-        };
-        let mut window = match GameWindow::find(&self.window) {
-            Ok(window) => window,
-            Err(error) => return ChatBatchSendOutcome::failed(0, error),
-        };
-        if let Err(error) = window.ensure_foreground() {
-            return ChatBatchSendOutcome::failed(0, error);
-        }
-        if let Err(error) = enigo
-            .key(Key::Return, Direction::Click)
-            .context("open chat")
-        {
-            return ChatBatchSendOutcome::failed(0, error);
-        }
-        sleep_ms(self.timing.input.open_chat_ms);
-
-        let locator = UiLocator::new(
-            self.canvas.clone(),
-            FrameArgs { image: None },
-            self.game_ui.clone(),
-            self.timing.workflow.default_poll_ms,
-        );
-        let hall_hit = workflow_actions::click_scrollable_template(
-            &locator,
-            &self.secondary_hall_template,
-            self.secondary_hall_search_region,
-            self.friend_list_region,
-            self.template_threshold,
-            ScrollTemplateOptions {
-                max_scrolls: 3,
-                scroll_length: -8,
-                settle_ms: self.timing.input.click_ms,
-            },
-            || true,
-        );
-        match hall_hit {
-            Ok(Some(_)) => sleep_ms(self.timing.input.click_ms),
-            Ok(None) => {
-                return ChatBatchSendOutcome::failed(0, anyhow!("发送前未找到当前大厅模板"));
-            }
-            Err(error) => return ChatBatchSendOutcome::failed(0, error),
-        }
-
-        let outcome = send_messages(messages, delay_ms, |message| {
-            (|| -> Result<()> {
-                window.click(&mut enigo, self.config.chat_click_2)?;
-                sleep_ms(self.timing.input.open_chat_ms);
-                input_message(&mut enigo, message, self.timing.input.text_ms, &self.window)?;
-                enigo
-                    .key(Key::Return, Direction::Click)
-                    .context("send message")?;
-                sleep_ms(self.timing.input.send_ms);
-                Ok(())
-            })()
-        });
-        if !primary_chat_should_close_directly(restore_after_task) {
-            return outcome;
-        }
-        let ChatBatchSendOutcome { sent, status } = outcome;
-        match status {
-            ChatBatchSendStatus::Complete => match self.close_batch_chat(&mut enigo, &mut window) {
-                Ok(()) => ChatBatchSendOutcome::complete(sent),
-                Err(error) => ChatBatchSendOutcome::failed(sent, error),
-            },
-            ChatBatchSendStatus::Failed(error) => {
-                if let Err(close_error) = self.close_batch_chat(&mut enigo, &mut window) {
-                    log::error!("批量回复失败后关闭聊天界面也失败: {close_error:#}");
-                }
-                ChatBatchSendOutcome::failed(sent, error)
-            }
-        }
+        self.game_ui.send_chat_batch(self.batch_request(
+            messages,
+            delay_ms,
+            ChatBatchTarget::Primary { restore_after_task },
+        ))
     }
 
-    fn close_batch_chat(&self, enigo: &mut Enigo, window: &mut GameWindow) -> Result<()> {
-        window.ensure_foreground()?;
-        enigo
-            .key(Key::Escape, Direction::Click)
-            .context("close chat")?;
-        sleep_ms(self.timing.input.click_ms);
-        Ok(())
+    fn batch_request(
+        &self,
+        messages: &[String],
+        delay_ms: u64,
+        target: ChatBatchTarget,
+    ) -> ChatBatchRequest {
+        ChatBatchRequest {
+            messages: messages.to_vec(),
+            delay_ms,
+            target,
+            chat_click: self.config.chat_click_2,
+            click_ms: self.timing.input.click_ms,
+            open_chat_ms: self.timing.input.open_chat_ms,
+            text_ms: self.timing.input.text_ms,
+            send_ms: self.timing.input.send_ms,
+            canvas: self.canvas.clone(),
+            secondary_hall_template: self.secondary_hall_template.clone(),
+            secondary_hall_search_region: self.secondary_hall_search_region,
+            friend_list_region: self.friend_list_region,
+            template_threshold: self.template_threshold,
+        }
     }
 }
 
@@ -420,29 +327,15 @@ fn bounding_rect(left: Rect, right: Rect) -> Rect {
     Rect::new(x, y, (far_right - x) as u32, (bottom - y) as u32)
 }
 
-fn primary_chat_should_close_directly(restore_after_task: bool) -> bool {
+pub(super) fn primary_chat_should_close_directly(restore_after_task: bool) -> bool {
     !restore_after_task
-}
-
-fn input_message(
-    enigo: &mut Enigo,
-    message: &str,
-    input_settle_ms: u64,
-    window: &WindowConfig,
-) -> Result<()> {
-    if let Err(error) = input_actions::paste_text(message, window, input_settle_ms) {
-        log::error!("粘贴输入失败，回退到文字输入: {error:#}");
-        enigo.text(message).context("input message text")?;
-        sleep_ms(input_settle_ms);
-    }
-    Ok(())
 }
 
 fn sleep_ms(ms: u64) {
     sleep(Duration::from_millis(ms));
 }
 
-fn send_messages<T>(
+pub(super) fn send_messages<T>(
     messages: &[T],
     delay_ms: u64,
     mut send_one: impl FnMut(&T) -> Result<()>,

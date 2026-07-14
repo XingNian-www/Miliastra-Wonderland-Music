@@ -864,7 +864,6 @@ impl AutomationApp {
             &config.output,
             &config.timing,
             game_ui.clone(),
-            &config.window,
             &config.screen,
             &config.templates,
             &config.invite,

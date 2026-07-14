@@ -1,6 +1,9 @@
 use anyhow::Result;
 use image::{DynamicImage, GenericImageView};
-use miliastra_wonderland_music::runtime::ui::{CaptureFrame, InputCertainty, UiDevice, UiRuntime};
+use miliastra_wonderland_music::runtime::ui::{
+    CaptureFrame, FrameDemand, InputCertainty, UiDevice, UiRuntime,
+};
+use std::time::Duration;
 
 struct FixedFrameDevice {
     frame: DynamicImage,
@@ -57,5 +60,32 @@ fn capture_failure_reports_that_no_input_was_sent() {
 
     assert_eq!(failure.certainty(), InputCertainty::BeforeInput);
     assert_eq!(failure.stage(), "capture_frame");
+    runtime.shutdown().expect("UI runtime should stop");
+}
+
+#[test]
+fn declared_frame_demand_publishes_frames_and_the_latest_snapshot() {
+    let runtime = UiRuntime::start(
+        FixedFrameDevice {
+            frame: DynamicImage::new_rgba8(11, 9),
+        },
+        2,
+    )
+    .expect("UI runtime should start");
+    let handle = runtime.handle();
+
+    let demand = handle
+        .declare_frame_demand(FrameDemand::new(Duration::from_millis(10)).unwrap())
+        .expect("frame demand should be accepted");
+    let published = demand
+        .recv_timeout(Duration::from_secs(1))
+        .expect("frame demand should publish");
+
+    assert_eq!(published.image().dimensions(), (11, 9));
+    let latest = handle
+        .latest_frame()
+        .expect("latest frame should be cached");
+    assert_eq!(latest.image().dimensions(), (11, 9));
+    assert_eq!(latest.captured_at(), published.captured_at());
     runtime.shutdown().expect("UI runtime should stop");
 }

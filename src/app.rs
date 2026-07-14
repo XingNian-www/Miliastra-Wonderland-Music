@@ -111,7 +111,7 @@ use crate::features::card_games::{LandlordCommand, LandlordGame, LandlordOutcome
 use crate::features::chat_text::split_numbered_chat_message;
 use crate::features::entertainment::{AcquireOutcome, EntertainmentCoordinator, EntertainmentKind};
 use crate::features::idiom_chain;
-use crate::features::idiom_chain::IdiomChainGame;
+use crate::features::idiom_chain::IdiomChainService;
 use crate::features::turtle_soup::{
     self, QuestionSubmitOutcome, SecondaryOcrObservation, SecondaryOcrStability, TurtleSoupService,
 };
@@ -357,7 +357,7 @@ pub(crate) struct AutomationApp {
     ui_runtime: Option<UiRuntime>,
     runtime_state: Arc<Mutex<PersistentRuntimeState>>,
     entertainment: EntertainmentCoordinator,
-    idiom_chain: Arc<Mutex<IdiomChainGame>>,
+    idiom_chain: IdiomChainService,
     landlord: Arc<Mutex<LandlordGame>>,
     undercover: Arc<Mutex<UndercoverGame>>,
     undercover_bank: UndercoverBankStore,
@@ -913,11 +913,11 @@ impl AutomationApp {
         );
         let runtime_state = Arc::new(Mutex::new(runtime_state));
         let entertainment = EntertainmentCoordinator::new();
-        let idiom_chain_game = IdiomChainGame::load(config.idiom_chain.clone())?;
+        let idiom_chain =
+            IdiomChainService::load(config.idiom_chain.clone(), entertainment.clone())?;
         if config.idiom_chain.enabled {
-            log::info!("已加载成语接龙词库: {} 条", idiom_chain_game.lexicon_len());
+            log::info!("已加载成语接龙词库: {} 条", idiom_chain.lexicon_len()?);
         }
-        let idiom_chain = Arc::new(Mutex::new(idiom_chain_game));
         let landlord = Arc::new(Mutex::new(LandlordGame::new(config.landlord.clone())));
         let undercover = Arc::new(Mutex::new(UndercoverGame::new(config.undercover.clone())));
         let undercover_bank = UndercoverBankStore::new(
@@ -1329,12 +1329,6 @@ impl AutomationApp {
         self.runtime_state
             .lock()
             .map_err(|_| anyhow!("runtime state mutex poisoned"))
-    }
-
-    fn idiom_chain(&self) -> Result<MutexGuard<'_, IdiomChainGame>> {
-        self.idiom_chain
-            .lock()
-            .map_err(|_| anyhow!("idiom chain mutex poisoned"))
     }
 
     fn landlord(&self) -> Result<MutexGuard<'_, LandlordGame>> {
@@ -2376,39 +2370,7 @@ impl AutomationApp {
         if idiom_command_requires_executor(command) {
             return Ok(false);
         }
-        if self.entertainment.active() == Some(EntertainmentKind::TurtleSoup) {
-            self.enqueue_current_hall_reply("海龟汤正在进行，请结束后再开始成语接龙")?;
-            return Ok(true);
-        }
-        let acquired_for_start = if matches!(command, idiom_chain::IdiomChainCommand::Start { .. })
-        {
-            match self
-                .entertainment
-                .try_acquire(EntertainmentKind::IdiomChain)?
-            {
-                AcquireOutcome::Acquired => true,
-                AcquireOutcome::AlreadyOwned => false,
-                AcquireOutcome::Occupied(kind) => {
-                    self.enqueue_current_hall_reply(&format!(
-                        "{}正在进行，请结束后再开始成语接龙",
-                        kind.label()
-                    ))?;
-                    return Ok(true);
-                }
-            }
-        } else {
-            false
-        };
-        let outcome = {
-            let mut game = self.idiom_chain()?;
-            game.handle(&parsed.username, command)
-        };
-        if acquired_for_start && outcome.action != "started" {
-            self.entertainment.release(EntertainmentKind::IdiomChain);
-        }
-        if matches!(outcome.action, "completed" | "stopped" | "expired") {
-            self.entertainment.release(EntertainmentKind::IdiomChain);
-        }
+        let outcome = self.idiom_chain.handle(&parsed.username, command)?;
         let target = match self.active_ui_residency() {
             UiResidency::Primary => DeferredChatTarget::Primary,
             UiResidency::SecondaryCurrentHall => DeferredChatTarget::SecondaryCurrentHall,
@@ -2558,14 +2520,10 @@ impl AutomationApp {
             }
             Err(_) => log::error!("牌局状态锁已损坏，无法中止旧牌局"),
         }
-        match self.idiom_chain.lock() {
-            Ok(mut game) => {
-                if game.abort() {
-                    self.entertainment.release(EntertainmentKind::IdiomChain);
-                    log::warn!("成语接龙已因聊天上下文变化中止: {}", reason);
-                }
-            }
-            Err(_) => log::error!("成语接龙状态锁已损坏，无法中止旧会话"),
+        match self.idiom_chain.abort() {
+            Ok(true) => log::warn!("成语接龙已因聊天上下文变化中止: {}", reason),
+            Ok(false) => {}
+            Err(error) => log::error!("无法中止旧成语接龙会话: {error:#}"),
         }
     }
 
@@ -2614,14 +2572,10 @@ impl AutomationApp {
             }
             Err(error) => log::error!("无法推进谁是卧底计时: {error:#}"),
         }
-        match self.idiom_chain.lock() {
-            Ok(mut game) => {
-                if game.expire_idle_now() {
-                    self.entertainment.release(EntertainmentKind::IdiomChain);
-                    log::info!("成语接龙已因空闲超时结束，娱乐互斥已释放");
-                }
-            }
-            Err(_) => log::error!("成语接龙状态锁已损坏，无法检查空闲超时"),
+        match self.idiom_chain.expire_idle_now() {
+            Ok(true) => log::info!("成语接龙已因空闲超时结束，娱乐互斥已释放"),
+            Ok(false) => {}
+            Err(error) => log::error!("无法检查成语接龙空闲超时: {error:#}"),
         }
     }
 
@@ -5676,10 +5630,7 @@ impl AutomationApp {
         player: &str,
         command: &idiom_chain::IdiomChainCommand,
     ) -> Result<()> {
-        let outcome = {
-            let mut game = self.idiom_chain()?;
-            game.handle(player, command)
-        };
+        let outcome = self.idiom_chain.explain(player, command)?;
         let mut messages = vec![outcome.reply];
         if let Some(explanation) = outcome.explanation {
             messages.extend(split_numbered_chat_message("来源", &explanation.source));

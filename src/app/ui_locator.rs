@@ -9,21 +9,26 @@ use super::FrameArgs;
 use super::change_detection::{change_stats, rect_chat_change_fingerprint};
 use super::command;
 use super::frame_source::{Canvas, Frame, load_frame};
+use super::game_ui::GameUi;
 use super::geometry::{Point, Rect, crop_canvas};
 use super::input_actions::{click_game_point, scroll_game_point};
 use super::ocr::recognize_lines;
 use super::template_match::{TemplateHit, best_template_hit};
 use crate::config::{self, PointConfig};
 
-pub(super) fn startup_locator(config: &config::AppConfig) -> UiLocator {
-    startup_locator_with_poll_ms(config, config.startup.poll_ms)
+pub(super) fn startup_locator(config: &config::AppConfig, game_ui: GameUi) -> UiLocator {
+    startup_locator_with_poll_ms(config, game_ui, config.startup.poll_ms)
 }
 
-pub(super) fn startup_transition_locator(config: &config::AppConfig) -> UiLocator {
-    startup_locator_with_poll_ms(config, config.timing.input.click_ms.max(100))
+pub(super) fn startup_transition_locator(config: &config::AppConfig, game_ui: GameUi) -> UiLocator {
+    startup_locator_with_poll_ms(config, game_ui, config.timing.input.click_ms.max(100))
 }
 
-fn startup_locator_with_poll_ms(config: &config::AppConfig, poll_ms: u64) -> UiLocator {
+fn startup_locator_with_poll_ms(
+    config: &config::AppConfig,
+    game_ui: GameUi,
+    poll_ms: u64,
+) -> UiLocator {
     UiLocator::new(
         Canvas {
             width: config.screen.expected_width,
@@ -31,6 +36,7 @@ fn startup_locator_with_poll_ms(config: &config::AppConfig, poll_ms: u64) -> UiL
             resize: true,
         },
         FrameArgs { image: None },
+        game_ui,
         config.window.clone(),
         poll_ms,
     )
@@ -39,6 +45,7 @@ fn startup_locator_with_poll_ms(config: &config::AppConfig, poll_ms: u64) -> UiL
 pub(super) struct UiLocator {
     canvas: Canvas,
     frame_args: FrameArgs,
+    game_ui: GameUi,
     window_config: config::WindowConfig,
     poll_ms: u64,
 }
@@ -47,19 +54,21 @@ impl UiLocator {
     pub(super) fn new(
         canvas: Canvas,
         frame_args: FrameArgs,
+        game_ui: GameUi,
         window_config: config::WindowConfig,
         poll_ms: u64,
     ) -> Self {
         Self {
             canvas,
             frame_args,
+            game_ui,
             window_config,
             poll_ms: poll_ms.max(50),
         }
     }
 
     pub(super) fn capture(&self) -> Result<Frame> {
-        load_frame(&self.frame_args, &self.canvas, &self.window_config)
+        load_frame(&self.frame_args, &self.canvas, &self.game_ui)
     }
 
     pub(super) fn region(&self, rect: Rect) -> UiRegion<'_> {

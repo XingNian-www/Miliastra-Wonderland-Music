@@ -86,7 +86,12 @@ pub(super) fn recognize_prepared_chat(
     let mut messages = Vec::new();
     let ocr_started = Instant::now();
     if templates.batch_recognize {
-        let block_rects: Vec<Rect> = prepared.blocks.iter().map(|(_, r)| *r).collect();
+        let block_rects = prepared
+            .blocks
+            .iter()
+            .enumerate()
+            .map(|(id, (_, rect))| ocr_batch::OcrImageBlock { id, rect: *rect })
+            .collect::<Vec<_>>();
         let texts = ocr_batch::batch_recognize_blocks(
             ocr,
             &prepared.chat,
@@ -94,11 +99,12 @@ pub(super) fn recognize_prepared_chat(
             templates.same_line_y_tolerance,
             priority,
         )?;
-        for ((marker, block), text) in prepared.blocks.iter().zip(texts) {
+        for text in texts {
+            let (marker, block) = &prepared.blocks[text.id];
             messages.push(ChatMessage {
                 message_type: marker_type(marker).to_string(),
                 block: *block,
-                text,
+                text: text.text,
             });
         }
     } else {

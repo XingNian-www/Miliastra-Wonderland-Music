@@ -2,19 +2,20 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow};
 use image::{DynamicImage, GenericImage, ImageBuffer, Rgba};
-use ocr_rs::OcrEngine;
 
 use super::Rect;
-use super::ocr::{OcrLine, merge_ocr_lines, recognize_lines};
+use super::ocr::{OcrLine, merge_ocr_lines};
+use super::ocr_runtime::{OcrPriority, OcrRuntimeHandle};
 
 const BLOCK_GAP: u32 = 12;
 const GAP_COLOR: Rgba<u8> = Rgba([180, 180, 180, 255]);
 
 pub(super) fn batch_recognize_blocks(
-    engine: &OcrEngine,
+    ocr: &OcrRuntimeHandle,
     chat: &DynamicImage,
     blocks: &[Rect],
     same_line_y_tolerance: i32,
+    priority: OcrPriority,
 ) -> Result<Vec<String>> {
     if blocks.is_empty() {
         return Ok(Vec::new());
@@ -62,7 +63,7 @@ pub(super) fn batch_recognize_blocks(
     }
     let combined = DynamicImage::ImageRgba8(combined);
 
-    let lines = recognize_lines(engine, &combined)?;
+    let lines = ocr.recognize_lines(combined, priority)?;
     log::info!(target: "timing",
         "批量 OCR 拼接: blocks={} combined={}x{} lines={} 耗时={}ms",
         blocks.len(),

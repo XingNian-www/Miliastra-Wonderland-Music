@@ -23,6 +23,7 @@ pub(crate) mod logger;
 pub(crate) mod monitor;
 mod ocr;
 mod ocr_batch;
+mod ocr_runtime;
 mod playback_format;
 mod player_controller;
 pub(crate) mod queue;
@@ -81,10 +82,8 @@ use self::hall_info::{
 };
 use self::input_actions::parse_key;
 use self::monitor::{MonitorQueueItem, MonitorShared, OcrSnapshot};
-use self::ocr::{
-    OcrArgs, OcrBackendProbeStatus, make_ocr_engine, merged_ocr_text, probe_ocr_backend_support,
-    recognize_lines,
-};
+use self::ocr::{OcrArgs, OcrBackendProbeStatus, probe_ocr_backend_support};
+use self::ocr_runtime::{OcrPriority, OcrRuntime, OcrRuntimeHandle, ProductionOcrDevice};
 use self::playback_format::{
     PlaybackSnapshot, estimated_player_status, format_play_message, is_playing, song_title,
 };
@@ -120,14 +119,12 @@ use crate::runtime::ui::UiRuntime;
 use anyhow::{Context, Result, anyhow};
 use enigo::Key;
 use image::DynamicImage;
-use ocr_rs::OcrEngine;
 
 const IDLE_EXIT_MIN_MINUTES: u32 = 15;
-const OCR_REBUILD_INTERVAL: Duration = Duration::from_secs(60 * 60);
-const OCR_REBUILD_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const TARGET_MISSING_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const TARGET_MISSING_BACKOFF_MAX: Duration = Duration::from_secs(60);
 const UI_RUNTIME_QUEUE_CAPACITY: usize = 32;
+const OCR_RUNTIME_QUEUE_CAPACITY: usize = 64;
 
 fn secondary_hall_search_rect(anchor: Rect, friend_list: Rect) -> Rect {
     let left = anchor.x.min(friend_list.x);
@@ -334,8 +331,8 @@ pub(crate) struct AutomationApp {
     ai: ai::AiClient,
     song_review: SongReviewClient,
     chat_output: ChatOutput,
-    ocr_engine: Arc<Mutex<OcrEngineState>>,
-    web_tool_ocr_engine: Arc<Mutex<Option<OcrEngineState>>>,
+    ocr: OcrRuntimeHandle,
+    ocr_runtime: Option<OcrRuntime>,
     latest_frame: Arc<Mutex<Option<Arc<DynamicImage>>>>,
     locks: CommandLockState,
     pending: Arc<(Mutex<VecDeque<TrackedPendingTask>>, Condvar)>,
@@ -362,11 +359,6 @@ pub(crate) struct AutomationApp {
 struct IdleExitState {
     timeout: Duration,
     last_command_at: Instant,
-}
-
-struct OcrEngineState {
-    engine: OcrEngine,
-    rebuild_due_at: Instant,
 }
 
 #[derive(Clone)]
@@ -863,7 +855,11 @@ impl AutomationApp {
         )?;
         let game_ui = GameUi::runtime(ui_runtime.handle());
         let ocr_args = OcrArgs::default().resolve(&config);
-        let ocr_engine = make_ocr_engine(&ocr_args)?;
+        let ocr_runtime = OcrRuntime::start(
+            ProductionOcrDevice::new(ocr_args)?,
+            OCR_RUNTIME_QUEUE_CAPACITY,
+        )?;
+        let ocr = ocr_runtime.handle();
         let feeluown = FeelUOwnClient::new(&config.feeluown, &config.timing);
         let ai = ai::AiClient::new(&config.ai, &config.timing);
         let song_review = SongReviewClient::new(&config.song_review, &config.timing);
@@ -928,11 +924,8 @@ impl AutomationApp {
             ai,
             song_review,
             chat_output,
-            ocr_engine: Arc::new(Mutex::new(OcrEngineState {
-                engine: ocr_engine,
-                rebuild_due_at: Instant::now() + OCR_REBUILD_INTERVAL,
-            })),
-            web_tool_ocr_engine: Arc::new(Mutex::new(None)),
+            ocr,
+            ocr_runtime: Some(ocr_runtime),
             latest_frame: Arc::new(Mutex::new(None)),
             locks: CommandLockState::default(),
             pending: Arc::new((Mutex::new(VecDeque::new()), Condvar::new())),
@@ -992,6 +985,11 @@ impl AutomationApp {
             && let Err(error) = ui_runtime.shutdown()
         {
             log::error!("UI 运行时关闭失败: {error}");
+        }
+        if let Some(ocr_runtime) = self.ocr_runtime.take()
+            && let Err(error) = ocr_runtime.shutdown()
+        {
+            log::error!("OCR 运行时关闭失败: {error:#}");
         }
         if let Err(error) = self.queue().and_then(|queue| queue.save()) {
             log::error!("退出前保存队列失败: {error:#}");
@@ -1245,8 +1243,8 @@ impl AutomationApp {
             ai: self.ai.clone(),
             song_review: self.song_review.clone(),
             chat_output: self.chat_output.clone(),
-            ocr_engine: self.ocr_engine.clone(),
-            web_tool_ocr_engine: self.web_tool_ocr_engine.clone(),
+            ocr: self.ocr.clone(),
+            ocr_runtime: None,
             latest_frame: self.latest_frame.clone(),
             locks: CommandLockState::default(),
             pending: self.pending.clone(),
@@ -1303,51 +1301,6 @@ impl AutomationApp {
         self.undercover
             .lock()
             .map_err(|_| anyhow!("undercover mutex poisoned"))
-    }
-
-    fn ocr_engine(&self) -> Result<MutexGuard<'_, OcrEngineState>> {
-        let mut guard = self
-            .ocr_engine
-            .lock()
-            .map_err(|_| anyhow!("ocr_engine mutex poisoned"))?;
-        if Instant::now() >= guard.rebuild_due_at {
-            log::info!("OCR 引擎运行超过 1 小时，开始重建");
-            let started = Instant::now();
-            let ocr_args = OcrArgs::default().resolve(&self.config);
-            match make_ocr_engine(&ocr_args) {
-                Ok(engine) => {
-                    guard.engine = engine;
-                    guard.rebuild_due_at = Instant::now() + OCR_REBUILD_INTERVAL;
-                    let rebuild_ms = elapsed_ms(started);
-                    log::info!("OCR 引擎重建完成");
-                    log::info!(target: "timing", "OCR 引擎重建耗时: {}ms", rebuild_ms);
-                }
-                Err(error) => {
-                    guard.rebuild_due_at = Instant::now() + OCR_REBUILD_RETRY_INTERVAL;
-                    log::error!("OCR 引擎重建失败，继续使用旧引擎，5分钟后重试: {error:#}");
-                }
-            }
-        }
-        Ok(guard)
-    }
-
-    fn web_tool_ocr_engine(&self) -> Result<MutexGuard<'_, Option<OcrEngineState>>> {
-        let mut guard = self
-            .web_tool_ocr_engine
-            .lock()
-            .map_err(|_| anyhow!("Web 工具 OCR 引擎锁已损坏"))?;
-        let rebuild_due = guard
-            .as_ref()
-            .is_some_and(|state| Instant::now() >= state.rebuild_due_at);
-        if guard.is_none() || rebuild_due {
-            let engine = make_ocr_engine(&OcrArgs::default().resolve(&self.config))?;
-            *guard = Some(OcrEngineState {
-                engine,
-                rebuild_due_at: Instant::now() + OCR_REBUILD_INTERVAL,
-            });
-            log::info!("Web 工具 OCR 引擎已初始化");
-        }
-        Ok(guard)
     }
 
     fn latest_frame(&self) -> Result<Arc<DynamicImage>> {
@@ -1413,18 +1366,16 @@ impl AutomationApp {
     ) -> Result<Vec<ChatMessage>> {
         let total_started = Instant::now();
         let prepared = prepare_chat_scan(image, templates, self.config.screen.chat_rect.into())?;
-        let lock_started = Instant::now();
-        let engine = self.ocr_engine()?;
-        let lock_ms = elapsed_ms(lock_started);
-        if lock_ms > 0 {
-            log::info!(target: "timing", "OCR 锁等待耗时: {}ms", lock_ms);
-        }
-        let messages =
-            recognize_prepared_chat(&engine.engine, templates, prepared, Some(&self.monitor));
+        let messages = recognize_prepared_chat(
+            &self.ocr,
+            OcrPriority::ChatObservation,
+            templates,
+            prepared,
+            Some(&self.monitor),
+        );
         log::info!(target: "timing",
-            "聊天扫描端到端耗时: total={}ms ocr_lock={}ms",
-            elapsed_ms(total_started),
-            lock_ms
+            "聊天扫描端到端耗时: total={}ms",
+            elapsed_ms(total_started)
         );
         messages
     }
@@ -2843,24 +2794,19 @@ impl AutomationApp {
                     Some(rect) => crop_canvas(&frame, rect)?,
                     None => (*frame).clone(),
                 };
-                let engine = self.web_tool_ocr_engine()?;
-                let engine = engine
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("Web 工具 OCR 引擎不可用"))?;
-                serde_json::to_string_pretty(&recognize_lines(&engine.engine, &image)?)
-                    .map_err(|error| anyhow!(error))
+                serde_json::to_string_pretty(
+                    &self.ocr.recognize_lines(image, OcrPriority::Diagnostic)?,
+                )
+                .map_err(|error| anyhow!(error))
             }
             WebToolRequest::ScanChat => {
                 let frame = self.latest_frame()?;
                 let templates = TemplateArgs::default().resolve(&self.config);
                 let prepared =
                     prepare_chat_scan(&frame, &templates, self.config.screen.chat_rect.into())?;
-                let engine = self.web_tool_ocr_engine()?;
-                let engine = engine
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("Web 工具 OCR 引擎不可用"))?;
                 serde_json::to_string_pretty(&recognize_prepared_chat(
-                    &engine.engine,
+                    &self.ocr,
+                    OcrPriority::Diagnostic,
                     &templates,
                     prepared,
                     None,
@@ -2875,14 +2821,10 @@ impl AutomationApp {
             WebToolRequest::HallName => {
                 let frame = self.latest_frame()?;
                 let image = crop_canvas(&frame, self.config.screen.hall_name_rect.into())?;
-                let engine = self.web_tool_ocr_engine()?;
-                let engine = engine
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("Web 工具 OCR 引擎不可用"))?;
-                merged_ocr_text(
-                    &engine.engine,
-                    &image,
+                self.ocr.merged_text(
+                    image,
                     self.config.ocr.same_line_y_tolerance,
+                    OcrPriority::Diagnostic,
                 )
             }
             WebToolRequest::MatchTemplate {
@@ -3515,10 +3457,11 @@ impl AutomationApp {
 
     fn secondary_identity_from_frame(&self, image: &DynamicImage) -> Result<SecondaryChatIdentity> {
         let crop = crop_canvas(image, chat_listener::SECONDARY_TITLE_RECT)?;
-        let title = {
-            let engine = self.ocr_engine()?;
-            merged_ocr_text(&engine.engine, &crop, self.config.ocr.same_line_y_tolerance)?
-        };
+        let title = self.ocr.merged_text(
+            crop,
+            self.config.ocr.same_line_y_tolerance,
+            OcrPriority::ChatObservation,
+        )?;
         log::debug!("二级监听顶部标题 OCR: {}", title);
         Ok(classify_title(&title))
     }
@@ -3636,12 +3579,14 @@ impl AutomationApp {
         rects: &[Rect],
     ) -> Result<Vec<ChatMessage>> {
         let started = Instant::now();
-        let engine = self.ocr_engine()?;
         let mut messages = Vec::with_capacity(rects.len());
         for rect in rects {
             let crop = crop_canvas(image, *rect)?;
-            let text =
-                merged_ocr_text(&engine.engine, &crop, self.config.ocr.same_line_y_tolerance)?;
+            let text = self.ocr.merged_text(
+                crop,
+                self.config.ocr.same_line_y_tolerance,
+                OcrPriority::ChatObservation,
+            )?;
             messages.push(ChatMessage {
                 message_type: "blue".to_string(),
                 block: *rect,
@@ -3691,7 +3636,6 @@ impl AutomationApp {
     ) -> Result<SecondaryBubbleProcessOutcome> {
         let started = Instant::now();
         let ocr_started = Instant::now();
-        let engine = self.ocr_engine()?;
         let accepts_turtle_questions = message_type == "blue"
             && self.commands_enabled.load(AtomicOrdering::SeqCst)
             && self.turtle_soup.accepts_questions();
@@ -3700,17 +3644,20 @@ impl AutomationApp {
         let mut texts = Vec::new();
         for rect in rects {
             let crop = crop_canvas(image, rect)?;
-            let text =
-                merged_ocr_text(&engine.engine, &crop, self.config.ocr.same_line_y_tolerance)?;
+            let text = self.ocr.merged_text(
+                crop,
+                self.config.ocr.same_line_y_tolerance,
+                OcrPriority::ChatObservation,
+            )?;
             let trimmed_text = text.trim_start();
             let starts_with_hash = trimmed_text.starts_with('#') || trimmed_text.starts_with('＃');
             let message_sender = if captures_hash_sender && starts_with_hash {
                 let sender_rect = secondary_message_sender_rect(image, rect);
                 let crop = crop_canvas(image, sender_rect)?;
-                Some(merged_ocr_text(
-                    &engine.engine,
-                    &crop,
+                Some(self.ocr.merged_text(
+                    crop,
                     self.config.ocr.same_line_y_tolerance,
+                    OcrPriority::ChatObservation,
                 )?)
             } else {
                 None
@@ -3733,7 +3680,6 @@ impl AutomationApp {
                 "二级当前大厅"
             },
         ));
-        drop(engine);
 
         let texts = if accepts_turtle_questions {
             let observations = texts
@@ -3866,14 +3812,13 @@ impl AutomationApp {
         log::info!("执行启动游戏任务: {}", source);
         self.abort_entertainment_for_context_loss("启动游戏任务将重建聊天上下文");
         let config = self.config.clone();
-        let engine = self.ocr_engine()?;
         let running = Arc::clone(&self.running);
         let window_detection_signal = self.window_detection_signal.clone();
         window_detection_signal.request("启动游戏任务开始")?;
         game_startup::start_game(
             &config,
             &self.game_ui,
-            &engine.engine,
+            &self.ocr,
             || running.load(AtomicOrdering::SeqCst),
             |reason| {
                 if let Err(error) = window_detection_signal.request(reason) {
@@ -5411,23 +5356,17 @@ impl AutomationApp {
 
     fn read_hall_info_sample_from_frame(&self, image: &DynamicImage) -> Result<HallInfoSample> {
         let name_crop = crop_canvas(image, self.config.screen.hall_name_rect.into())?;
-        let name = {
-            let engine = self.ocr_engine()?;
-            merged_ocr_text(
-                &engine.engine,
-                &name_crop,
-                self.config.ocr.same_line_y_tolerance,
-            )?
-        };
+        let name = self.ocr.merged_text(
+            name_crop,
+            self.config.ocr.same_line_y_tolerance,
+            OcrPriority::BackgroundObservation,
+        )?;
         let time_crop = crop_canvas(image, self.config.screen.hall_time_rect.into())?;
-        let time_text = {
-            let engine = self.ocr_engine()?;
-            merged_ocr_text(
-                &engine.engine,
-                &time_crop,
-                self.config.ocr.same_line_y_tolerance,
-            )?
-        };
+        let time_text = self.ocr.merged_text(
+            time_crop,
+            self.config.ocr.same_line_y_tolerance,
+            OcrPriority::BackgroundObservation,
+        )?;
         Ok(HallInfoSample {
             name,
             time_text: time_text.clone(),

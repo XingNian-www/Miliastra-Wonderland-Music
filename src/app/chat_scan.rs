@@ -3,15 +3,14 @@ use std::time::Instant;
 
 use anyhow::Result;
 use image::DynamicImage;
-use ocr_rs::OcrEngine;
 use serde::Serialize;
 
 use super::ResolvedTemplateArgs;
 use super::chat_output::redacted_chat_text;
 use super::geometry::{Rect, clamp_i32, crop_canvas};
 use super::monitor::{MonitorShared, OcrSnapshot};
-use super::ocr::merged_ocr_text;
 use super::ocr_batch;
+use super::ocr_runtime::{OcrPriority, OcrRuntimeHandle};
 use super::template_match::{TemplateHit, dedupe_hits, find_color_template_hits};
 use crate::config::RectConfig;
 
@@ -78,7 +77,8 @@ pub(super) fn prepare_chat_scan(
 }
 
 pub(super) fn recognize_prepared_chat(
-    engine: &OcrEngine,
+    ocr: &OcrRuntimeHandle,
+    priority: OcrPriority,
     templates: &ResolvedTemplateArgs,
     prepared: PreparedChatScan,
     monitor: Option<&MonitorShared>,
@@ -88,10 +88,11 @@ pub(super) fn recognize_prepared_chat(
     if templates.batch_recognize {
         let block_rects: Vec<Rect> = prepared.blocks.iter().map(|(_, r)| *r).collect();
         let texts = ocr_batch::batch_recognize_blocks(
-            engine,
+            ocr,
             &prepared.chat,
             &block_rects,
             templates.same_line_y_tolerance,
+            priority,
         )?;
         for ((marker, block), text) in prepared.blocks.iter().zip(texts) {
             messages.push(ChatMessage {
@@ -103,7 +104,7 @@ pub(super) fn recognize_prepared_chat(
     } else {
         for (marker, block) in &prepared.blocks {
             let crop = crop_canvas(&prepared.chat, *block)?;
-            let text = merged_ocr_text(engine, &crop, templates.same_line_y_tolerance)?;
+            let text = ocr.merged_text(crop, templates.same_line_y_tolerance, priority)?;
             messages.push(ChatMessage {
                 message_type: marker_type(marker).to_string(),
                 block: *block,

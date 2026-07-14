@@ -8,7 +8,6 @@ use super::game_ui::GameUi;
 use super::geometry::Point;
 use super::template_match::{TemplateHit, best_template_hit};
 use super::ui_locator::{UiLocator, startup_locator, startup_transition_locator};
-use super::window;
 use super::workflow_actions;
 use super::workflow_actions::{HitAction, PixelStability, TemplateMode};
 use crate::config::{AppConfig, PointConfig, RectConfig};
@@ -42,9 +41,10 @@ where
 {
     let started = Instant::now();
     log::info!("进入千星流程: 开始");
-    window::GameWindow::find(&config.window)
+    game_ui
+        .ensure_window()
         .context("进入千星前未找到游戏窗口，请先执行启动游戏任务")?;
-    workflow_actions::focus(&config.window, config.timing.input.after_activate_ms)
+    workflow_actions::focus(game_ui, config.timing.input.after_activate_ms)
         .context("进入千星流程聚焦游戏窗口失败")?;
 
     let locator = startup_locator(config, game_ui.clone());
@@ -68,7 +68,7 @@ where
         log::info!("进入千星流程步骤: {}", step.label());
         step = match step {
             WonderlandStep::OpenWonderlandHome => {
-                open_wonderland_home(config, locator, should_continue)?;
+                open_wonderland_home(config, game_ui, locator, should_continue)?;
                 WonderlandStep::ClickWonderlandCard
             }
             WonderlandStep::ClickWonderlandCard => {
@@ -85,6 +85,7 @@ where
 
 fn open_wonderland_home<F>(
     config: &AppConfig,
+    game_ui: &GameUi,
     locator: &UiLocator,
     should_continue: &mut F,
 ) -> Result<()>
@@ -101,7 +102,7 @@ where
         if !should_continue() {
             bail!("进入千星流程已取消");
         }
-        workflow_actions::press_key_text("f6", &config.window)
+        workflow_actions::press_key_text("f6", game_ui)
             .context("进入千星流程按 F6 打开千星奇域失败")?;
         sleep(Duration::from_millis(retry_ms));
         if template_stable_visible(

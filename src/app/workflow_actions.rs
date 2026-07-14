@@ -1,4 +1,6 @@
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -6,13 +8,12 @@ use anyhow::{Result, anyhow};
 
 use super::chat_listener::latest_incoming_sender_rect;
 use super::command;
+use super::game_ui::GameUi;
 use super::geometry::{Point, Rect, crop_canvas};
-use super::input_actions::{
-    activate_game, click_game_point, focus_game, hold_key, parse_key, paste_text, press_key,
-};
+use super::input_actions::parse_key;
 use super::template_match::TemplateHit;
 use super::ui_locator::{UiLocator, UiRegion, text_contains_complete_target};
-use crate::config::{PointConfig, RectConfig, WindowConfig};
+use crate::config::{PointConfig, RectConfig};
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum TemplateMode {
@@ -59,13 +60,13 @@ pub(super) fn wait(wait_ms: u64) {
     );
 }
 
-pub(super) fn press_key_text(key_text: &str, window_config: &WindowConfig) -> Result<()> {
+pub(super) fn press_key_text(key_text: &str, game_ui: &GameUi) -> Result<()> {
     let started = Instant::now();
     let key_text = key_text.trim();
     if key_text.is_empty() {
         return Err(anyhow!("custom workflow step key is empty"));
     }
-    let result = press_key(parse_key(key_text)?, window_config);
+    let result = game_ui.press_key(parse_key(key_text)?);
     log::info!(target: "timing",
         "原子动作耗时: action=press_key total={}ms success={}",
         elapsed_ms(started),
@@ -74,9 +75,9 @@ pub(super) fn press_key_text(key_text: &str, window_config: &WindowConfig) -> Re
     result
 }
 
-pub(super) fn activate(window_config: &WindowConfig, after_activate_ms: u64) -> Result<()> {
+pub(super) fn activate(game_ui: &GameUi, after_activate_ms: u64) -> Result<()> {
     let started = Instant::now();
-    let result = activate_game(window_config, after_activate_ms);
+    let result = game_ui.activate(after_activate_ms);
     log::info!(target: "timing",
         "原子动作耗时: action=activate_game total={}ms success={}",
         elapsed_ms(started),
@@ -85,9 +86,9 @@ pub(super) fn activate(window_config: &WindowConfig, after_activate_ms: u64) -> 
     result
 }
 
-pub(super) fn focus(window_config: &WindowConfig, after_activate_ms: u64) -> Result<()> {
+pub(super) fn focus(game_ui: &GameUi, after_activate_ms: u64) -> Result<()> {
     let started = Instant::now();
-    let result = focus_game(window_config, after_activate_ms);
+    let result = game_ui.focus(after_activate_ms);
     log::info!(target: "timing",
         "原子动作耗时: action=focus_game total={}ms success={}",
         elapsed_ms(started),
@@ -96,9 +97,9 @@ pub(super) fn focus(window_config: &WindowConfig, after_activate_ms: u64) -> Res
     result
 }
 
-pub(super) fn click_point(point: PointConfig, window_config: &WindowConfig) -> Result<()> {
+pub(super) fn click_point(point: PointConfig, game_ui: &GameUi) -> Result<()> {
     let started = Instant::now();
-    let result = click_game_point(point, window_config);
+    let result = game_ui.click_point(point);
     log::info!(target: "timing",
         "原子动作耗时: action=click_point total={}ms success={} x={} y={}",
         elapsed_ms(started),
@@ -109,16 +110,12 @@ pub(super) fn click_point(point: PointConfig, window_config: &WindowConfig) -> R
     result
 }
 
-pub(super) fn paste(
-    text: &str,
-    window_config: &WindowConfig,
-    clipboard_hold_ms: u64,
-) -> Result<()> {
+pub(super) fn paste(text: &str, game_ui: &GameUi, clipboard_hold_ms: u64) -> Result<()> {
     let started = Instant::now();
     if text.is_empty() {
         return Err(anyhow!("custom workflow paste step missing text"));
     }
-    let result = paste_text(text, window_config, clipboard_hold_ms);
+    let result = game_ui.paste_text(text, clipboard_hold_ms);
     log::info!(target: "timing",
         "原子动作耗时: action=paste total={}ms success={} hold={}ms chars={}",
         elapsed_ms(started),
@@ -187,25 +184,21 @@ where
     Ok(false)
 }
 
-pub(super) fn hold_key_text<F>(
+pub(super) fn hold_key_text(
     key_text: &str,
     hold_seconds: u64,
-    window_config: &WindowConfig,
-    should_continue: F,
-) -> Result<()>
-where
-    F: FnMut() -> bool,
-{
+    game_ui: &GameUi,
+    running: Arc<AtomicBool>,
+) -> Result<()> {
     let started = Instant::now();
     let key_text = key_text.trim();
     if key_text.is_empty() {
         return Err(anyhow!("自定义流程按住按键缺少 key"));
     }
-    let result = hold_key(
+    let result = game_ui.hold_key(
         parse_key(key_text)?,
         Duration::from_secs(hold_seconds),
-        window_config,
-        should_continue,
+        running,
     );
     log::info!(target: "timing",
         "原子动作耗时: action=hold_key total={}ms configured={}ms success={}",

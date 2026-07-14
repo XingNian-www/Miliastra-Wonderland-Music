@@ -6,6 +6,7 @@ use image::DynamicImage;
 use serde::Serialize;
 
 use super::ResolvedTemplateArgs;
+use super::change_detection::{ChangeFingerprint, rect_chat_change_fingerprint};
 use super::chat_output::redacted_chat_text;
 use super::geometry::{Rect, clamp_i32, crop_canvas};
 use super::monitor::{MonitorShared, OcrSnapshot};
@@ -22,6 +23,8 @@ pub(super) struct ChatMessage {
     pub(super) message_type: String,
     pub(super) block: Rect,
     pub(super) text: String,
+    #[serde(skip)]
+    pub(super) visual: ChangeFingerprint,
 }
 
 pub(super) struct PreparedChatScan {
@@ -105,6 +108,7 @@ pub(super) fn recognize_prepared_chat(
                 message_type: marker_type(marker).to_string(),
                 block: *block,
                 text: text.text,
+                visual: rect_chat_change_fingerprint(&prepared.chat, *block)?,
             });
         }
     } else {
@@ -115,6 +119,7 @@ pub(super) fn recognize_prepared_chat(
                 message_type: marker_type(marker).to_string(),
                 block: *block,
                 text,
+                visual: rect_chat_change_fingerprint(&prepared.chat, *block)?,
             });
         }
     }

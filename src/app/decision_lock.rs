@@ -86,12 +86,18 @@ fn message_key(message: &ChatMessage) -> DecisionMessageKey {
 mod tests {
     use super::super::geometry::Rect;
     use super::*;
+    use crate::app::change_detection::ChangeFingerprint;
 
     fn message(message_type: &str, y: i32, text: &str) -> ChatMessage {
         ChatMessage {
             message_type: message_type.to_string(),
             block: Rect::new(0, y, 100, 20),
             text: text.to_string(),
+            visual: ChangeFingerprint {
+                pixels: vec![0],
+                width: 1,
+                height: 1,
+            },
         }
     }
 

@@ -4,7 +4,7 @@ use image::imageops::FilterType;
 
 use super::geometry::{Rect, crop_canvas};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ChangeFingerprint {
     pub(super) pixels: Vec<u8>,
     pub(super) width: u32,

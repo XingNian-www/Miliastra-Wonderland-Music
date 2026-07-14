@@ -4,6 +4,9 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Result, anyhow};
 
 use super::chat_scan::ChatMessage;
+use crate::observation::chat::{
+    BubbleSequence, ChatIdentity, ObservedChatMessageId, VisualSessionId,
+};
 use crate::observation::exclusive::{
     ExclusiveObservationRouter, ExclusiveSessionId, RoutedObservation,
 };
@@ -12,7 +15,14 @@ use crate::observation::shared::{ObservationGap, ObservationRead, ObservationSub
 const SHARED_CHAT_HISTORY_CAPACITY: usize = 64;
 
 #[derive(Clone)]
+pub(super) struct SecondaryRecognizedMessage {
+    pub(super) text: String,
+    pub(super) sender: Option<String>,
+}
+
+#[derive(Clone)]
 pub(super) struct SecondaryObservedMessage {
+    pub(super) id: ObservedChatMessageId,
     pub(super) text: String,
     pub(super) sender: Option<String>,
 }
@@ -40,6 +50,8 @@ pub(super) enum ChatObservationDispatch {
 struct ChatObservationState {
     router: ExclusiveObservationRouter<ChatObservation>,
     business: ObservationSubscriber,
+    visual_session: VisualSessionId,
+    next_bubble_sequence: u64,
 }
 
 #[derive(Clone)]
@@ -55,7 +67,12 @@ impl ChatObservationShared {
         );
         let business = router.subscribe();
         Self {
-            state: Arc::new(Mutex::new(ChatObservationState { router, business })),
+            state: Arc::new(Mutex::new(ChatObservationState {
+                router,
+                business,
+                visual_session: VisualSessionId::new(1),
+                next_bubble_sequence: 1,
+            })),
         }
     }
 
@@ -68,9 +85,46 @@ impl ChatObservationShared {
 
     pub(super) fn publish_secondary(
         &self,
-        observation: SecondaryChatObservation,
+        message_type: &str,
+        friend_name: &str,
+        accepts_turtle_questions: bool,
+        messages: Vec<SecondaryRecognizedMessage>,
     ) -> Result<Vec<ChatObservationDispatch>> {
-        self.publish(ChatObservation::Secondary(observation))
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("聊天观察流状态锁已损坏"))?;
+        let chat = if message_type == "pink" {
+            ChatIdentity::Friend(Arc::from(friend_name.trim()))
+        } else {
+            ChatIdentity::SecondaryHall
+        };
+        let mut observed = Vec::with_capacity(messages.len());
+        for message in messages {
+            let id = ObservedChatMessageId::new(
+                state.visual_session,
+                chat.clone(),
+                BubbleSequence::new(state.next_bubble_sequence),
+            );
+            state.next_bubble_sequence = state
+                .next_bubble_sequence
+                .checked_add(1)
+                .expect("secondary chat bubble sequence exhausted");
+            observed.push(SecondaryObservedMessage {
+                id,
+                text: message.text,
+                sender: message.sender,
+            });
+        }
+        Self::publish_locked(
+            &mut state,
+            ChatObservation::Secondary(SecondaryChatObservation {
+                message_type: message_type.to_string(),
+                friend_name: friend_name.to_string(),
+                accepts_turtle_questions,
+                messages: observed,
+            }),
+        )
     }
 
     fn publish(&self, observation: ChatObservation) -> Result<Vec<ChatObservationDispatch>> {
@@ -78,6 +132,13 @@ impl ChatObservationShared {
             .state
             .lock()
             .map_err(|_| anyhow!("聊天观察流状态锁已损坏"))?;
+        Self::publish_locked(&mut state, observation)
+    }
+
+    fn publish_locked(
+        state: &mut ChatObservationState,
+        observation: ChatObservation,
+    ) -> Result<Vec<ChatObservationDispatch>> {
         if matches!(
             state.router.route(observation),
             RoutedObservation::Exclusive { .. }
@@ -87,7 +148,9 @@ impl ChatObservationShared {
 
         let mut dispatches = Vec::new();
         loop {
-            let ChatObservationState { router, business } = &mut *state;
+            let ChatObservationState {
+                router, business, ..
+            } = &mut *state;
             match router.read_next(business) {
                 Some(ObservationRead::Item { value, .. }) => {
                     dispatches.push(match Arc::unwrap_or_clone(value) {
@@ -106,6 +169,21 @@ impl ChatObservationShared {
             }
         }
         Ok(dispatches)
+    }
+
+    pub(super) fn begin_visual_session(&self) -> Result<VisualSessionId> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("聊天观察流状态锁已损坏"))?;
+        let next = state
+            .visual_session
+            .get()
+            .checked_add(1)
+            .expect("chat visual session sequence exhausted");
+        state.visual_session = VisualSessionId::new(next);
+        state.next_bubble_sequence = 1;
+        Ok(state.visual_session)
     }
 
     pub(super) fn begin_exclusive(&self) -> Result<ChatObservationExclusiveGuard> {

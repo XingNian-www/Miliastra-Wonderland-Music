@@ -1094,54 +1094,20 @@ impl AutomationApp {
                     } else {
                         Ok(())
                     };
-                    let outcome =
-                        match prepared {
-                            Err(error) => ChatBatchSendOutcome::failed(0, error),
-                            Ok(()) => {
-                                let running = Arc::clone(&self.running);
-                                let paused = Arc::clone(&self.paused);
-                                let pending = Arc::clone(&self.pending);
-                                let chat_listener = self.chat_listener.clone();
-                                let turtle_soup = self.turtle_soup.clone();
-                                let should_continue = move || {
-                                    if !running.load(AtomicOrdering::SeqCst)
-                                        || paused.load(AtomicOrdering::SeqCst)
-                                        || !turtle_soup.delivery_is_current(delivery)
-                                    {
-                                        return false;
-                                    }
-                                    let snapshot = chat_listener.snapshot();
-                                    if listener_residency(snapshot.mode, snapshot.temporary_primary)
-                                        != residency
-                                    {
-                                        return false;
-                                    }
-                                    let (lock, _) = &*pending;
-                                    match lock.lock() {
-                                        Ok(queue) => queue.is_empty(),
-                                        Err(_) => {
-                                            log::error!(
-                                                "延迟聊天批量发送检查正式任务时发现队列锁已损坏"
-                                            );
-                                            false
-                                        }
-                                    }
-                                };
-                                let messages = batch.remaining_texts();
-                                match residency {
-                                    UiResidency::Primary => self
-                                        .chat_output
-                                        .send_batch_interruptible(&messages, 0, should_continue),
-                                    UiResidency::SecondaryCurrentHall => {
-                                        self.chat_output.send_current_chat_batch_interruptible(
-                                            &messages,
-                                            0,
-                                            should_continue,
-                                        )
-                                    }
+                    let outcome = match prepared {
+                        Err(error) => ChatBatchSendOutcome::failed(0, error),
+                        Ok(()) => {
+                            let messages = batch.remaining_texts();
+                            match residency {
+                                UiResidency::Primary => {
+                                    self.chat_output.send_batch_outcome(&messages, 0)
                                 }
+                                UiResidency::SecondaryCurrentHall => self
+                                    .chat_output
+                                    .send_current_chat_batch_outcome(&messages, 0),
                             }
-                        };
+                        }
+                    };
                     drop(sending);
 
                     let ChatBatchSendOutcome { sent, status } = outcome;
@@ -1177,23 +1143,6 @@ impl AutomationApp {
                             );
                             log::error!("{error:#}");
                             self.turtle_soup.handle_delivery_failure(delivery, &error);
-                        }
-                        ChatBatchSendStatus::Interrupted => {
-                            match self
-                                .deferred_chat
-                                .requeue_front(DeferredChatItem::Batch(batch))?
-                            {
-                                EnqueueOutcome::Added => {}
-                                EnqueueOutcome::DroppedMessage => {
-                                    log::warn!("海龟汤批量发送让行时淘汰了一条普通回复")
-                                }
-                                EnqueueOutcome::Rejected => {
-                                    let error = anyhow!("海龟汤批量发送让行后无法重新进入延迟队列");
-                                    log::error!("{error:#}");
-                                    self.turtle_soup.handle_delivery_failure(delivery, &error);
-                                }
-                            }
-                            sleep(retry_delay);
                         }
                         ChatBatchSendStatus::Failed(error) => {
                             let attempt = batch.current_attempt();

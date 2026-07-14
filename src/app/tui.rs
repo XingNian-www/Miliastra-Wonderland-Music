@@ -16,8 +16,8 @@ use windows::Win32::System::Console::{
     GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE, SetConsoleMode,
 };
 
-use super::config::TuiConfig;
 use super::monitor::{MonitorQueueItem, MonitorShared, MonitorSnapshot};
+use crate::config::TuiConfig;
 
 const STATUS_HEIGHT: u16 = 3;
 const MAX_OCR_MESSAGES: usize = 5;

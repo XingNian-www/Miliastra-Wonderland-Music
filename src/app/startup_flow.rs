@@ -4,13 +4,13 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
-use super::config::{AppConfig, PointConfig, RectConfig};
 use super::geometry::Point;
 use super::template_match::{TemplateHit, best_template_hit};
 use super::ui_locator::{UiLocator, startup_locator, startup_transition_locator};
 use super::window;
 use super::workflow_actions;
 use super::workflow_actions::{HitAction, PixelStability, TemplateMode};
+use crate::config::{AppConfig, PointConfig, RectConfig};
 
 const STARTUP_TEMPLATE_STABLE_HITS: u32 = 2;
 

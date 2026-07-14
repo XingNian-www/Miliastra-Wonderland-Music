@@ -8,12 +8,12 @@ use serde::Serialize;
 
 use super::ResolvedTemplateArgs;
 use super::chat_output::redacted_chat_text;
-use super::config::RectConfig;
 use super::geometry::{Rect, clamp_i32, crop_canvas};
 use super::monitor::{MonitorShared, OcrSnapshot};
 use super::ocr::merged_ocr_text;
 use super::ocr_batch;
 use super::template_match::{TemplateHit, dedupe_hits, find_color_template_hits};
+use crate::config::RectConfig;
 
 const CHAT_MARKER_SEARCH_WIDTH: u32 = 60;
 const CHAT_SCAN_RESULT_LOG_TARGET: &str = "chat_scan_result";

@@ -5,11 +5,13 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use super::config_migration::{self, CURRENT_CONFIG_VERSION};
-use super::idiom_chain::IdiomChainConfig;
-use super::landlord::LandlordConfig;
-use super::turtle_soup::TurtleSoupConfig;
-use super::undercover::UndercoverConfig;
+use self::migration::CURRENT_CONFIG_VERSION;
+use crate::app::idiom_chain::IdiomChainConfig;
+use crate::app::landlord::LandlordConfig;
+use crate::app::turtle_soup::TurtleSoupConfig;
+use crate::app::undercover::UndercoverConfig;
+
+mod migration;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -67,12 +69,10 @@ impl AppConfig {
         if path.exists() {
             let text = fs::read_to_string(path)
                 .with_context(|| format!("read config {}", path.display()))?;
-            if let Some(report) =
-                config_migration::migrate_config_text(&text, default_config_yaml())?
-            {
+            if let Some(report) = migration::migrate_config_text(&text, default_config_yaml())? {
                 let config: Self = serde_yaml::from_str(&report.text)
                     .with_context(|| format!("validate migrated config {}", path.display()))?;
-                let backup_path = config_migration::backup_path(path);
+                let backup_path = migration::backup_path(path);
                 fs::write(&backup_path, &text)
                     .with_context(|| format!("write config backup {}", backup_path.display()))?;
                 fs::write(path, &report.text)

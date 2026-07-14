@@ -8,7 +8,7 @@ use ocr_rs::{Backend, DetOptions, OcrEngine, OcrEngineConfig};
 use serde::Serialize;
 
 use super::Rect;
-use super::config::AppConfig;
+use crate::config::AppConfig;
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct OcrArgs {

@@ -1,13 +1,16 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
 pub(crate) mod repository;
 
 use super::chat_text::display_width;
+use super::entertainment::{AcquireOutcome, EntertainmentCoordinator, EntertainmentKind};
+use repository::UndercoverBankStore;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum UndercoverCommand {
@@ -94,6 +97,26 @@ pub enum UndercoverDelivery {
     Hall(String),
     HallBatch(Vec<String>),
     Friend { player: String, message: String },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UndercoverCommandSource {
+    Hall,
+    Friend,
+    Console,
+}
+
+pub struct UndercoverCommandContext<'a> {
+    pub player: &'a str,
+    pub source: UndercoverCommandSource,
+}
+
+pub trait UndercoverDeliveryPort {
+    fn verify_friend(&self, player: &str, message: &str) -> Result<bool>;
+    fn send_friend(&self, player: &str, message: &str) -> Result<bool>;
+    fn send_secret_friend(&self, player: &str, message: &str) -> Result<bool>;
+    fn send_hall(&self, message: &str) -> Result<()>;
+    fn send_hall_batch(&self, messages: &[String]) -> Result<()>;
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -212,6 +235,313 @@ pub struct UndercoverGame {
     config: UndercoverConfig,
     state: GameState,
     rng: SplitMix64,
+}
+
+#[derive(Clone)]
+pub struct UndercoverService {
+    game: Arc<Mutex<UndercoverGame>>,
+    bank: UndercoverBankStore,
+    entertainment: EntertainmentCoordinator,
+    enabled: bool,
+}
+
+impl UndercoverService {
+    pub fn new(config: UndercoverConfig, entertainment: EntertainmentCoordinator) -> Self {
+        let bank = UndercoverBankStore::new(
+            config.word_bank_path.clone(),
+            config.used_state_path.clone(),
+        );
+        let enabled = config.enabled;
+        Self {
+            game: Arc::new(Mutex::new(UndercoverGame::new(config))),
+            bank,
+            entertainment,
+            enabled,
+        }
+    }
+
+    pub fn execute(
+        &self,
+        context: UndercoverCommandContext<'_>,
+        command: &UndercoverCommand,
+        port: &dyn UndercoverDeliveryPort,
+        now: Instant,
+    ) -> Result<()> {
+        match command {
+            UndercoverCommand::CreateSingle | UndercoverCommand::CreateDouble => {
+                self.create(context, command, port, now)
+            }
+            UndercoverCommand::Join => self.join(context, port, now),
+            UndercoverCommand::Start => {
+                let requester =
+                    (context.source != UndercoverCommandSource::Console).then_some(context.player);
+                self.start(requester, port, now)
+            }
+            UndercoverCommand::Status => {
+                let message = self.game()?.status(context.player, now);
+                port.send_hall(&message)
+            }
+            UndercoverCommand::Exit => {
+                let outcome = {
+                    let mut game = self.game()?;
+                    game.exit(context.player, now)
+                        .map(|deliveries| (deliveries, !game.is_active()))
+                };
+                match outcome {
+                    Ok((deliveries, ended)) => {
+                        if ended {
+                            self.entertainment.release(EntertainmentKind::Undercover);
+                        }
+                        self.deliver(deliveries, port)
+                    }
+                    Err(error) => self.send_error(context, &error.to_string(), port),
+                }
+            }
+            UndercoverCommand::End => {
+                let requester =
+                    (context.source != UndercoverCommandSource::Console).then_some(context.player);
+                let outcome = self.game()?.end(requester);
+                match outcome {
+                    Ok(deliveries) => {
+                        self.entertainment.release(EntertainmentKind::Undercover);
+                        self.deliver(deliveries, port)
+                    }
+                    Err(error) => self.send_error(context, &error.to_string(), port),
+                }
+            }
+            UndercoverCommand::Describe(description) => {
+                let outcome = self.game()?.describe(context.player, description, now);
+                match outcome {
+                    Ok(deliveries) => self.deliver(deliveries, port),
+                    Err(error) => self.send_error(context, &error.to_string(), port),
+                }
+            }
+            UndercoverCommand::Vote(position) => {
+                let outcome = {
+                    let mut game = self.game()?;
+                    game.vote(context.player, *position, now)
+                        .map(|deliveries| (deliveries, !game.is_active()))
+                };
+                match outcome {
+                    Ok((deliveries, ended)) => {
+                        if ended {
+                            self.entertainment.release(EntertainmentKind::Undercover);
+                        }
+                        self.deliver(deliveries, port)
+                    }
+                    Err(error) => self.send_error(context, &error.to_string(), port),
+                }
+            }
+        }
+    }
+
+    pub fn tick(&self, now: Instant, clock_active: bool) -> Result<Vec<UndercoverDelivery>> {
+        if !clock_active {
+            return Ok(Vec::new());
+        }
+        let (deliveries, ended) = {
+            let mut game = self.game()?;
+            let deliveries = game.tick(now);
+            (deliveries, !game.is_active())
+        };
+        if ended {
+            self.entertainment.release(EntertainmentKind::Undercover);
+        }
+        Ok(deliveries)
+    }
+
+    pub fn abort(&self) -> Result<bool> {
+        let aborted = self.game()?.abort();
+        if aborted {
+            self.entertainment.release(EntertainmentKind::Undercover);
+        }
+        Ok(aborted)
+    }
+
+    pub fn snapshot(&self, now: Instant) -> Result<UndercoverSnapshot> {
+        Ok(self.game()?.snapshot(now))
+    }
+
+    pub fn deliver(
+        &self,
+        deliveries: Vec<UndercoverDelivery>,
+        port: &dyn UndercoverDeliveryPort,
+    ) -> Result<()> {
+        for delivery in deliveries {
+            match delivery {
+                UndercoverDelivery::Hall(message) => port.send_hall(&message)?,
+                UndercoverDelivery::HallBatch(messages) => port.send_hall_batch(&messages)?,
+                UndercoverDelivery::Friend { player, message } => {
+                    if !port.send_secret_friend(&player, &message)? {
+                        bail!("谁是卧底好友消息发送失败: {}", player);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn create(
+        &self,
+        context: UndercoverCommandContext<'_>,
+        command: &UndercoverCommand,
+        port: &dyn UndercoverDeliveryPort,
+        now: Instant,
+    ) -> Result<()> {
+        if !self.enabled {
+            return port.send_hall("谁是卧底未启用");
+        }
+        let mode = if matches!(command, UndercoverCommand::CreateDouble) {
+            UndercoverMode::Double
+        } else {
+            UndercoverMode::Single
+        };
+        match self
+            .entertainment
+            .try_acquire(EntertainmentKind::Undercover)?
+        {
+            AcquireOutcome::Acquired => {}
+            AcquireOutcome::AlreadyOwned => {
+                return self.send_error(context, "已有谁是卧底房间或牌局进行中", port);
+            }
+            AcquireOutcome::Occupied(kind) => {
+                return self.send_error(
+                    context,
+                    &format!("{}正在进行，请结束后再开始谁是卧底", kind.label()),
+                    port,
+                );
+            }
+        }
+        let verified = match port
+            .verify_friend(context.player, "谁是卧底报名成功，请回到大厅等待组局")
+        {
+            Ok(verified) => verified,
+            Err(error) => {
+                self.entertainment.release(EntertainmentKind::Undercover);
+                return Err(error);
+            }
+        };
+        if !verified {
+            self.entertainment.release(EntertainmentKind::Undercover);
+            return port.send_hall("谁是卧底报名失败：好友列表未找到唯一昵称");
+        }
+        if let Err(error) = self.game()?.create(context.player, mode, now) {
+            self.entertainment.release(EntertainmentKind::Undercover);
+            return self.send_error(context, &error.to_string(), port);
+        }
+        let status = self.game()?.status(context.player, now);
+        port.send_hall(&status)
+    }
+
+    fn join(
+        &self,
+        context: UndercoverCommandContext<'_>,
+        port: &dyn UndercoverDeliveryPort,
+        now: Instant,
+    ) -> Result<()> {
+        if self.entertainment.active() != Some(EntertainmentKind::Undercover) {
+            return self.send_error(context, "当前没有谁是卧底报名房间", port);
+        }
+        let gate = {
+            let game = self.game()?;
+            if !game.is_lobby() {
+                Err(anyhow!("谁是卧底已经开局"))
+            } else if game.lobby_contains(context.player) {
+                Err(anyhow!("你已经加入本局谁是卧底"))
+            } else {
+                Ok(())
+            }
+        };
+        if let Err(error) = gate {
+            return self.send_error(context, &error.to_string(), port);
+        }
+        if !port.verify_friend(context.player, "谁是卧底报名成功，请回到大厅等待开局")?
+        {
+            return port.send_hall("谁是卧底报名失败：好友列表未找到唯一昵称");
+        }
+        if let Err(error) = self.game()?.join(context.player, now) {
+            return self.send_error(context, &error.to_string(), port);
+        }
+        if self.game()?.lobby_is_full() {
+            self.start(None, port, now)
+        } else {
+            let status = self.game()?.status(context.player, now);
+            port.send_hall(&status)
+        }
+    }
+
+    fn start(
+        &self,
+        requester: Option<&str>,
+        port: &dyn UndercoverDeliveryPort,
+        now: Instant,
+    ) -> Result<()> {
+        let deliveries = {
+            let mut game = self.game()?;
+            if let Err(error) = game.authorize_start(requester) {
+                return port.send_hall(&error.to_string());
+            }
+            let words = match self.bank.consume_random(random_seed()) {
+                Ok(words) => words,
+                Err(error) => return port.send_hall(&error.to_string()),
+            };
+            game.start(words, now)?
+        };
+        for delivery in deliveries {
+            let UndercoverDelivery::Friend { player, message } = delivery else {
+                continue;
+            };
+            let mut sent = false;
+            for attempt in 1..=2 {
+                match port.send_secret_friend(&player, &message) {
+                    Ok(true) => {
+                        sent = true;
+                        break;
+                    }
+                    Ok(false) => log::warn!(
+                        "谁是卧底发词确认失败: player={} attempt={}",
+                        player,
+                        attempt
+                    ),
+                    Err(error) => log::warn!(
+                        "谁是卧底发词异常: player={} attempt={} error={:#}",
+                        player,
+                        attempt,
+                        error
+                    ),
+                }
+            }
+            if !sent {
+                let canceled = self.game()?.cancel_delivery();
+                self.entertainment.release(EntertainmentKind::Undercover);
+                return self.deliver(canceled, port);
+            }
+        }
+        let opening = self.game()?.complete_delivery(Instant::now())?;
+        self.deliver(opening, port)
+    }
+
+    fn send_error(
+        &self,
+        context: UndercoverCommandContext<'_>,
+        message: &str,
+        port: &dyn UndercoverDeliveryPort,
+    ) -> Result<()> {
+        if context.source == UndercoverCommandSource::Friend {
+            if !port.send_friend(context.player, message)? {
+                log::warn!("谁是卧底私聊错误回复失败: player={}", context.player);
+            }
+            Ok(())
+        } else {
+            port.send_hall(message)
+        }
+    }
+
+    fn game(&self) -> Result<MutexGuard<'_, UndercoverGame>> {
+        self.game
+            .lock()
+            .map_err(|_| anyhow!("undercover mutex poisoned"))
+    }
 }
 
 impl UndercoverGame {
@@ -1190,9 +1520,170 @@ fn random_seed() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+    use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;
 
     use super::*;
+
+    struct FakeDeliveryPort {
+        verified: bool,
+        secret_succeeds: bool,
+        secret_attempts: AtomicUsize,
+        hall_messages: StdMutex<Vec<String>>,
+    }
+
+    impl FakeDeliveryPort {
+        fn new(verified: bool, secret_succeeds: bool) -> Self {
+            Self {
+                verified,
+                secret_succeeds,
+                secret_attempts: AtomicUsize::new(0),
+                hall_messages: StdMutex::new(Vec::new()),
+            }
+        }
+
+        fn hall_messages(&self) -> Vec<String> {
+            self.hall_messages.lock().unwrap().clone()
+        }
+    }
+
+    impl UndercoverDeliveryPort for FakeDeliveryPort {
+        fn verify_friend(&self, _player: &str, _message: &str) -> Result<bool> {
+            Ok(self.verified)
+        }
+
+        fn send_friend(&self, _player: &str, _message: &str) -> Result<bool> {
+            Ok(true)
+        }
+
+        fn send_secret_friend(&self, _player: &str, _message: &str) -> Result<bool> {
+            self.secret_attempts.fetch_add(1, Ordering::SeqCst);
+            Ok(self.secret_succeeds)
+        }
+
+        fn send_hall(&self, message: &str) -> Result<()> {
+            self.hall_messages.lock().unwrap().push(message.to_string());
+            Ok(())
+        }
+
+        fn send_hall_batch(&self, messages: &[String]) -> Result<()> {
+            self.hall_messages
+                .lock()
+                .unwrap()
+                .extend(messages.iter().cloned());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn application_service_releases_signup_when_friend_verification_fails() {
+        let (config, directory) = service_config("verify-failure");
+        let entertainment = EntertainmentCoordinator::new();
+        let service = UndercoverService::new(config, entertainment.clone());
+        let port = FakeDeliveryPort::new(false, true);
+
+        service
+            .execute(
+                UndercoverCommandContext {
+                    player: "甲",
+                    source: UndercoverCommandSource::Hall,
+                },
+                &UndercoverCommand::CreateSingle,
+                &port,
+                Instant::now(),
+            )
+            .unwrap();
+
+        assert_eq!(entertainment.active(), None);
+        assert_eq!(service.snapshot(Instant::now()).unwrap().phase, "idle");
+        assert!(
+            port.hall_messages()
+                .iter()
+                .any(|message| message.contains("报名失败"))
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn application_service_retries_secret_delivery_once_then_cancels() {
+        let (config, directory) = service_config("delivery-failure");
+        let entertainment = EntertainmentCoordinator::new();
+        let service = UndercoverService::new(config, entertainment.clone());
+        let port = FakeDeliveryPort::new(true, false);
+        let now = Instant::now();
+
+        service
+            .execute(
+                UndercoverCommandContext {
+                    player: "甲",
+                    source: UndercoverCommandSource::Hall,
+                },
+                &UndercoverCommand::CreateSingle,
+                &port,
+                now,
+            )
+            .unwrap();
+        for player in ["乙", "丙", "丁"] {
+            service
+                .execute(
+                    UndercoverCommandContext {
+                        player,
+                        source: UndercoverCommandSource::Friend,
+                    },
+                    &UndercoverCommand::Join,
+                    &port,
+                    now,
+                )
+                .unwrap();
+        }
+        service
+            .execute(
+                UndercoverCommandContext {
+                    player: "甲",
+                    source: UndercoverCommandSource::Hall,
+                },
+                &UndercoverCommand::Start,
+                &port,
+                now,
+            )
+            .unwrap();
+
+        assert_eq!(port.secret_attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(entertainment.active(), None);
+        assert_eq!(service.snapshot(Instant::now()).unwrap().phase, "idle");
+        assert!(
+            port.hall_messages()
+                .iter()
+                .any(|message| message.contains("发词失败"))
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn service_config(name: &str) -> (UndercoverConfig, PathBuf) {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("mwm-undercover-{name}-{suffix}"));
+        std::fs::create_dir_all(&directory).unwrap();
+        let bank_path = directory.join("undercover.yaml");
+        std::fs::write(
+            &bank_path,
+            "词组:\n  - 平民词: 苹果\n    卧底词: 梨\n    启用: true\n",
+        )
+        .unwrap();
+        (
+            UndercoverConfig {
+                enabled: true,
+                word_bank_path: bank_path,
+                used_state_path: directory.join("used.yaml"),
+                ..UndercoverConfig::default()
+            },
+            directory,
+        )
+    }
 
     #[test]
     fn single_undercover_game_starts_with_four_players_and_hides_roles() {

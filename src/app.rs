@@ -111,7 +111,9 @@ use crate::features::card_games::{
     CardGameService, CardGameStartGate, LandlordCommand, LandlordOutcome,
 };
 use crate::features::chat_text::split_numbered_chat_message;
-use crate::features::entertainment::{AcquireOutcome, EntertainmentCoordinator, EntertainmentKind};
+use crate::features::entertainment::EntertainmentCoordinator;
+#[cfg(test)]
+use crate::features::entertainment::{AcquireOutcome, EntertainmentKind};
 use crate::features::idiom_chain;
 use crate::features::idiom_chain::IdiomChainService;
 use crate::features::turtle_soup::{
@@ -119,9 +121,9 @@ use crate::features::turtle_soup::{
 };
 #[cfg(test)]
 use crate::features::undercover;
-use crate::features::undercover::repository::UndercoverBankStore;
 use crate::features::undercover::{
-    UndercoverCommand, UndercoverDelivery, UndercoverGame, UndercoverMode,
+    UndercoverCommand, UndercoverCommandContext, UndercoverCommandSource, UndercoverDelivery,
+    UndercoverDeliveryPort, UndercoverService,
 };
 use crate::observation::chat::ObservedFrame;
 use crate::runtime::ui::{
@@ -361,8 +363,7 @@ pub(crate) struct AutomationApp {
     entertainment: EntertainmentCoordinator,
     idiom_chain: IdiomChainService,
     landlord: CardGameService,
-    undercover: Arc<Mutex<UndercoverGame>>,
-    undercover_bank: UndercoverBankStore,
+    undercover: UndercoverService,
     turtle_soup: TurtleSoupService,
     deferred_chat: DeferredChatQueue,
     queue: Arc<Mutex<PersistentQueue>>,
@@ -719,27 +720,6 @@ fn idiom_command_requires_executor(command: &idiom_chain::IdiomChainCommand) -> 
     matches!(command, idiom_chain::IdiomChainCommand::Explain(_))
 }
 
-fn tick_undercover_game(
-    game: &Arc<Mutex<UndercoverGame>>,
-    entertainment: &EntertainmentCoordinator,
-    now: Instant,
-    clock_active: bool,
-) -> Result<Vec<UndercoverDelivery>> {
-    if !clock_active {
-        return Ok(Vec::new());
-    }
-    let mut game = game
-        .lock()
-        .map_err(|_| anyhow!("undercover mutex poisoned"))?;
-    let deliveries = game.tick(now);
-    let ended = !game.is_active();
-    drop(game);
-    if ended {
-        entertainment.release(EntertainmentKind::Undercover);
-    }
-    Ok(deliveries)
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ChatDecisionScope {
     CurrentHall,
@@ -894,11 +874,7 @@ impl AutomationApp {
             log::info!("已加载成语接龙词库: {} 条", idiom_chain.lexicon_len()?);
         }
         let landlord = CardGameService::new(config.landlord.clone(), entertainment.clone());
-        let undercover = Arc::new(Mutex::new(UndercoverGame::new(config.undercover.clone())));
-        let undercover_bank = UndercoverBankStore::new(
-            config.undercover.word_bank_path.clone(),
-            config.undercover.used_state_path.clone(),
-        );
+        let undercover = UndercoverService::new(config.undercover.clone(), entertainment.clone());
         let deferred_chat = DeferredChatQueue::new(DEFERRED_CHAT_CAPACITY);
         let mut turtle_soup_config = config.turtle_soup.clone();
         turtle_soup_config.nickname_stable_count =
@@ -934,7 +910,6 @@ impl AutomationApp {
             idiom_chain,
             landlord,
             undercover,
-            undercover_bank,
             turtle_soup,
             deferred_chat,
             queue,
@@ -1254,7 +1229,6 @@ impl AutomationApp {
             idiom_chain: self.idiom_chain.clone(),
             landlord: self.landlord.clone(),
             undercover: self.undercover.clone(),
-            undercover_bank: self.undercover_bank.clone(),
             turtle_soup: self.turtle_soup.clone(),
             deferred_chat: self.deferred_chat.clone(),
             queue: self.queue.clone(),
@@ -1304,12 +1278,6 @@ impl AutomationApp {
         self.runtime_state
             .lock()
             .map_err(|_| anyhow!("runtime state mutex poisoned"))
-    }
-
-    fn undercover(&self) -> Result<MutexGuard<'_, UndercoverGame>> {
-        self.undercover
-            .lock()
-            .map_err(|_| anyhow!("undercover mutex poisoned"))
     }
 
     fn latest_frame(&self) -> Result<Arc<DynamicImage>> {
@@ -2442,14 +2410,10 @@ impl AutomationApp {
 
     pub(super) fn abort_entertainment_for_context_loss(&self, reason: &str) {
         self.turtle_soup.abort_for_context_loss(reason);
-        match self.undercover.lock() {
-            Ok(mut game) => {
-                if game.abort() {
-                    self.entertainment.release(EntertainmentKind::Undercover);
-                    log::warn!("谁是卧底已因聊天上下文变化中止: {}", reason);
-                }
-            }
-            Err(_) => log::error!("谁是卧底状态锁已损坏，无法中止旧牌局"),
+        match self.undercover.abort() {
+            Ok(true) => log::warn!("谁是卧底已因聊天上下文变化中止: {}", reason),
+            Ok(false) => {}
+            Err(error) => log::error!("无法中止旧谁是卧底牌局: {error:#}"),
         }
         match self.landlord.abort() {
             Ok(true) => log::warn!("牌局已因聊天上下文变化中止: {}", reason),
@@ -2486,12 +2450,7 @@ impl AutomationApp {
                 }
             }
         }
-        match tick_undercover_game(
-            &self.undercover,
-            &self.entertainment,
-            Instant::now(),
-            clock_active,
-        ) {
+        match self.undercover.tick(Instant::now(), clock_active) {
             Ok(deliveries) => {
                 if !deliveries.is_empty()
                     && let Err(error) =
@@ -2781,7 +2740,8 @@ impl AutomationApp {
                 .deliver_landlord_task_outcome(outcome)
                 .map(|_| PendingTaskExecution::Completed),
             PendingTask::UndercoverDelivery { deliveries } => self
-                .deliver_undercover_deliveries(deliveries)
+                .undercover
+                .deliver(deliveries, self)
                 .map(|_| PendingTaskExecution::Completed),
         };
         match result {
@@ -5669,236 +5629,20 @@ impl AutomationApp {
         parsed: &ParsedCommand,
         command: &UndercoverCommand,
     ) -> Result<()> {
-        let now = Instant::now();
-        match command {
-            UndercoverCommand::CreateSingle | UndercoverCommand::CreateDouble => {
-                if !self.config.undercover.enabled {
-                    return self.reply("谁是卧底未启用");
-                }
-                let mode = if matches!(command, UndercoverCommand::CreateDouble) {
-                    UndercoverMode::Double
-                } else {
-                    UndercoverMode::Single
-                };
-                match self
-                    .entertainment
-                    .try_acquire(EntertainmentKind::Undercover)?
-                {
-                    AcquireOutcome::Acquired => {}
-                    AcquireOutcome::AlreadyOwned => {
-                        return self.reply_undercover_error(parsed, "已有谁是卧底房间或牌局进行中");
-                    }
-                    AcquireOutcome::Occupied(kind) => {
-                        return self.reply_undercover_error(
-                            parsed,
-                            &format!("{}正在进行，请结束后再开始谁是卧底", kind.label()),
-                        );
-                    }
-                }
-                let verified = match self.send_stable_unique_friend_message(
-                    &parsed.username,
-                    "谁是卧底报名成功，请回到大厅等待组局",
-                ) {
-                    Ok(verified) => verified,
-                    Err(error) => {
-                        self.entertainment.release(EntertainmentKind::Undercover);
-                        return Err(error);
-                    }
-                };
-                if !verified {
-                    self.entertainment.release(EntertainmentKind::Undercover);
-                    return self.reply("谁是卧底报名失败：好友列表未找到唯一昵称");
-                }
-                if let Err(error) = self.undercover()?.create(&parsed.username, mode, now) {
-                    self.entertainment.release(EntertainmentKind::Undercover);
-                    return self.reply_undercover_error(parsed, &error.to_string());
-                }
-                let status = self.undercover()?.status(&parsed.username, now);
-                self.reply(&status)
-            }
-            UndercoverCommand::Join => {
-                if self.entertainment.active() != Some(EntertainmentKind::Undercover) {
-                    return self.reply_undercover_error(parsed, "当前没有谁是卧底报名房间");
-                }
-                if !self.undercover()?.is_lobby() {
-                    return self.reply_undercover_error(parsed, "谁是卧底已经开局");
-                }
-                if self.undercover()?.lobby_contains(&parsed.username) {
-                    return self.reply_undercover_error(parsed, "你已经加入本局谁是卧底");
-                }
-                let verified = self.send_stable_unique_friend_message(
-                    &parsed.username,
-                    "谁是卧底报名成功，请回到大厅等待开局",
-                )?;
-                if !verified {
-                    return self.reply("谁是卧底报名失败：好友列表未找到唯一昵称");
-                }
-                if let Err(error) = self.undercover()?.join(&parsed.username, now) {
-                    return self.reply_undercover_error(parsed, &error.to_string());
-                }
-                if self.undercover()?.lobby_is_full() {
-                    self.start_undercover_game(None)
-                } else {
-                    let status = self.undercover()?.status(&parsed.username, now);
-                    self.reply(&status)
-                }
-            }
-            UndercoverCommand::Start => {
-                let requester =
-                    (parsed.message_type != "控制台").then_some(parsed.username.as_str());
-                self.start_undercover_game(requester)
-            }
-            UndercoverCommand::Status => {
-                let message = self.undercover()?.status(&parsed.username, now);
-                self.reply(&message)
-            }
-            UndercoverCommand::Exit => {
-                let outcome = { self.undercover()?.exit(&parsed.username, now) };
-                match outcome {
-                    Ok(deliveries) => {
-                        let ended = !self.undercover()?.is_active();
-                        if ended {
-                            self.entertainment.release(EntertainmentKind::Undercover);
-                        }
-                        self.deliver_undercover_deliveries(deliveries)
-                    }
-                    Err(error) => self.reply_undercover_error(parsed, &error.to_string()),
-                }
-            }
-            UndercoverCommand::End => {
-                let requester =
-                    (parsed.message_type != "控制台").then_some(parsed.username.as_str());
-                let outcome = { self.undercover()?.end(requester) };
-                match outcome {
-                    Ok(deliveries) => {
-                        self.entertainment.release(EntertainmentKind::Undercover);
-                        self.deliver_undercover_deliveries(deliveries)
-                    }
-                    Err(error) => self.reply_undercover_error(parsed, &error.to_string()),
-                }
-            }
-            UndercoverCommand::Describe(description) => {
-                let outcome = self
-                    .undercover()?
-                    .describe(&parsed.username, description, now);
-                match outcome {
-                    Ok(deliveries) => self.deliver_undercover_deliveries(deliveries),
-                    Err(error) => self.reply_undercover_error(parsed, &error.to_string()),
-                }
-            }
-            UndercoverCommand::Vote(position) => {
-                let outcome = { self.undercover()?.vote(&parsed.username, *position, now) };
-                match outcome {
-                    Ok(deliveries) => {
-                        let ended = !self.undercover()?.is_active();
-                        if ended {
-                            self.entertainment.release(EntertainmentKind::Undercover);
-                        }
-                        self.deliver_undercover_deliveries(deliveries)
-                    }
-                    Err(error) => self.reply_undercover_error(parsed, &error.to_string()),
-                }
-            }
-        }
-    }
-
-    fn start_undercover_game(&self, requester: Option<&str>) -> Result<()> {
-        let now = Instant::now();
-        let seed = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos() as u64)
-            .unwrap_or_default();
-        let deliveries = {
-            let mut game = self.undercover()?;
-            if let Err(error) = game.authorize_start(requester) {
-                return self.reply(&error.to_string());
-            }
-            let words = match self.undercover_bank.consume_random(seed) {
-                Ok(words) => words,
-                Err(error) => return self.reply(&error.to_string()),
-            };
-            game.start(words, now)?
+        let source = match parsed.message_type.as_str() {
+            "pink" => UndercoverCommandSource::Friend,
+            "控制台" => UndercoverCommandSource::Console,
+            _ => UndercoverCommandSource::Hall,
         };
-        for delivery in deliveries {
-            let UndercoverDelivery::Friend { player, message } = delivery else {
-                continue;
-            };
-            let mut sent = false;
-            for attempt in 1..=2 {
-                match self.send_secret_friend_message(&player, &message) {
-                    Ok(true) => {
-                        sent = true;
-                        break;
-                    }
-                    Ok(false) => log::warn!(
-                        "谁是卧底发词确认失败: player={} attempt={}",
-                        player,
-                        attempt
-                    ),
-                    Err(error) => log::warn!(
-                        "谁是卧底发词异常: player={} attempt={} error={:#}",
-                        player,
-                        attempt,
-                        error
-                    ),
-                }
-            }
-            if !sent {
-                let canceled = self.undercover()?.cancel_delivery();
-                self.entertainment.release(EntertainmentKind::Undercover);
-                self.deliver_undercover_deliveries(canceled)?;
-                return Ok(());
-            }
-        }
-        let opening = self.undercover()?.complete_delivery(Instant::now())?;
-        self.deliver_undercover_deliveries(opening)
-    }
-
-    fn reply_undercover_error(&self, parsed: &ParsedCommand, message: &str) -> Result<()> {
-        if parsed.message_type == "pink" {
-            if !self.send_friend_message(&parsed.username, message)? {
-                log::warn!("谁是卧底私聊错误回复失败: player={}", parsed.username);
-            }
-            Ok(())
-        } else {
-            self.reply(message)
-        }
-    }
-
-    fn deliver_undercover_deliveries(&self, deliveries: Vec<UndercoverDelivery>) -> Result<()> {
-        for delivery in deliveries {
-            match delivery {
-                UndercoverDelivery::Hall(message) => self.reply(&message)?,
-                UndercoverDelivery::HallBatch(messages) => {
-                    let refs = messages.iter().map(String::as_str).collect::<Vec<_>>();
-                    match self.active_ui_residency() {
-                        UiResidency::Primary => {
-                            self.ensure_ui_residency(UiResidency::Primary, "发送谁是卧底批量消息")?;
-                            self.chat_output.send_batch_for_command_redacted(
-                                &refs,
-                                self.config.timing.command.help_batch_ms,
-                            )?;
-                        }
-                        UiResidency::SecondaryCurrentHall => {
-                            self.ensure_ui_residency(
-                                UiResidency::SecondaryCurrentHall,
-                                "发送谁是卧底批量消息",
-                            )?;
-                            self.chat_output.send_current_chat_batch_redacted(
-                                &refs,
-                                self.config.timing.command.help_batch_ms,
-                            )?;
-                        }
-                    }
-                }
-                UndercoverDelivery::Friend { player, message } => {
-                    if !self.send_secret_friend_message(&player, &message)? {
-                        return Err(anyhow!("谁是卧底好友消息发送失败: {}", player));
-                    }
-                }
-            }
-        }
-        Ok(())
+        self.undercover.execute(
+            UndercoverCommandContext {
+                player: &parsed.username,
+                source,
+            },
+            command,
+            self,
+            Instant::now(),
+        )
     }
 
     fn play_request_confirmed(
@@ -6473,6 +6217,47 @@ impl AutomationApp {
     }
 }
 
+impl UndercoverDeliveryPort for AutomationApp {
+    fn verify_friend(&self, player: &str, message: &str) -> Result<bool> {
+        self.send_stable_unique_friend_message(player, message)
+    }
+
+    fn send_friend(&self, player: &str, message: &str) -> Result<bool> {
+        self.send_friend_message(player, message)
+    }
+
+    fn send_secret_friend(&self, player: &str, message: &str) -> Result<bool> {
+        self.send_secret_friend_message(player, message)
+    }
+
+    fn send_hall(&self, message: &str) -> Result<()> {
+        self.reply(message)
+    }
+
+    fn send_hall_batch(&self, messages: &[String]) -> Result<()> {
+        let refs = messages.iter().map(String::as_str).collect::<Vec<_>>();
+        match self.active_ui_residency() {
+            UiResidency::Primary => {
+                self.ensure_ui_residency(UiResidency::Primary, "发送谁是卧底批量消息")?;
+                self.chat_output.send_batch_for_command_redacted(
+                    &refs,
+                    self.config.timing.command.help_batch_ms,
+                )
+            }
+            UiResidency::SecondaryCurrentHall => {
+                self.ensure_ui_residency(
+                    UiResidency::SecondaryCurrentHall,
+                    "发送谁是卧底批量消息",
+                )?;
+                self.chat_output.send_current_chat_batch_redacted(
+                    &refs,
+                    self.config.timing.command.help_batch_ms,
+                )
+            }
+        }
+    }
+}
+
 fn ai_candidate_source(song: &command::SongCommand) -> &'static str {
     if song.friend_username.trim().is_empty() {
         "qqmusic,netease"
@@ -6881,11 +6666,13 @@ mod tests {
                 .expect("acquire undercover"),
             AcquireOutcome::Acquired
         );
-        let game = Arc::new(Mutex::new(UndercoverGame::new(
+        let service = UndercoverService::new(
             undercover::UndercoverConfig::default(),
-        )));
+            entertainment.clone(),
+        );
 
-        let deliveries = tick_undercover_game(&game, &entertainment, Instant::now(), false)
+        let deliveries = service
+            .tick(Instant::now(), false)
             .expect("tick undercover");
 
         assert!(deliveries.is_empty());

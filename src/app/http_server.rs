@@ -42,7 +42,7 @@ use crate::config::AppConfig;
 use crate::features::entertainment::EntertainmentCoordinator;
 use crate::features::turtle_soup::TurtleSoupService;
 use crate::features::turtle_soup::repository::{TurtleSoupBankStore, TurtleSoupSubmission};
-use crate::features::undercover::{UndercoverCommand, UndercoverGame};
+use crate::features::undercover::{UndercoverCommand, UndercoverService};
 
 const MAX_ACTIVE_CONNECTIONS: usize = 32;
 const MAX_JSON_BODY_BYTES: usize = 64 * 1024;
@@ -438,7 +438,7 @@ pub struct HttpSharedState {
     pub chat_listener: ChatListenerShared,
     turtle_soup: TurtleSoupService,
     turtle_soup_bank: TurtleSoupBankStore,
-    undercover: Arc<Mutex<UndercoverGame>>,
+    undercover: UndercoverService,
     pub history: Arc<Mutex<VecDeque<HistoryItem>>>,
     pub active_connections: Arc<AtomicUsize>,
     pending: Arc<(Mutex<VecDeque<super::TrackedPendingTask>>, Condvar)>,
@@ -489,7 +489,7 @@ impl HttpSharedState {
         pending: Arc<(Mutex<VecDeque<super::TrackedPendingTask>>, Condvar)>,
         chat_listener: ChatListenerShared,
         turtle_soup: TurtleSoupService,
-        undercover: Arc<Mutex<UndercoverGame>>,
+        undercover: UndercoverService,
         monitor: MonitorShared,
         task_tracker: TaskTrackerShared,
         decision_control: DecisionControlShared,
@@ -1425,9 +1425,8 @@ fn undercover_route(
 ) -> std::result::Result<String, AppError> {
     let snapshot = state
         .undercover
-        .lock()
-        .map_err(|_| internal_message("谁是卧底状态锁已损坏"))?
-        .snapshot(std::time::Instant::now());
+        .snapshot(std::time::Instant::now())
+        .map_err(internal_error)?;
     serde_json::to_string(&snapshot).map_err(internal_error)
 }
 
@@ -2207,9 +2206,8 @@ fn monitor_json(state: &HttpSharedState) -> std::result::Result<String, AppError
             serde_json::to_value(
                 state
                     .undercover
-                    .lock()
-                    .map_err(|_| internal_message("谁是卧底状态锁已损坏"))?
-                    .snapshot(std::time::Instant::now()),
+                    .snapshot(std::time::Instant::now())
+                    .map_err(internal_error)?,
             )
             .map_err(internal_error)?,
         );
@@ -3599,7 +3597,8 @@ mod tests {
             EntertainmentCoordinator::new(),
             DeferredChatQueue::new(32),
         );
-        let undercover = Arc::new(Mutex::new(UndercoverGame::new(config.undercover.clone())));
+        let undercover =
+            UndercoverService::new(config.undercover.clone(), EntertainmentCoordinator::new());
         HttpSharedState::new(
             config,
             queue,

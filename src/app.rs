@@ -34,7 +34,6 @@ mod task_tracker;
 mod template_match;
 pub(crate) mod tui;
 pub(crate) mod turtle_soup;
-mod turtle_soup_bank;
 mod ui_locator;
 mod ui_state;
 mod web_tools;

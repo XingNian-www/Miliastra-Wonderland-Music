@@ -23,6 +23,9 @@ use super::deferred_chat::{
 };
 use crate::features::chat_text::{MAX_CHAT_WIDTH, display_width};
 use crate::features::entertainment::{AcquireOutcome, EntertainmentCoordinator, EntertainmentKind};
+#[cfg(test)]
+use crate::features::turtle_soup::parse_question_bank;
+use crate::features::turtle_soup::{TurtleSoupPuzzle, load_question_bank};
 
 const DELIVERY_ATTEMPTS: u8 = 3;
 const RECENT_JUDGMENT_LIMIT: usize = 30;
@@ -365,36 +368,6 @@ struct TurtleSoupJob {
     player: String,
     player_key: String,
     question: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct TurtleSoupPuzzle {
-    pub(super) id: String,
-    #[serde(rename = "标题")]
-    pub(super) title: String,
-    #[serde(rename = "汤面")]
-    pub(super) surface: String,
-    #[serde(rename = "汤底")]
-    pub(super) bottom: String,
-    #[serde(rename = "裁决备注")]
-    pub(super) adjudication_notes: String,
-    #[serde(rename = "启用")]
-    pub(super) enabled: bool,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WrappedQuestionBank {
-    #[serde(rename = "题目")]
-    questions: Vec<TurtleSoupPuzzle>,
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum QuestionBankFile {
-    Wrapped(WrappedQuestionBank),
-    List(Vec<TurtleSoupPuzzle>),
 }
 
 #[derive(Default, Deserialize, Serialize)]
@@ -2011,46 +1984,6 @@ fn normalize_player_display(value: &str) -> String {
 
 fn normalize_player_key(value: &str) -> String {
     normalize_player_display(value).to_ascii_lowercase()
-}
-
-pub(super) fn load_question_bank(path: &Path) -> Result<Vec<TurtleSoupPuzzle>> {
-    let text = fs::read_to_string(path)
-        .with_context(|| format!("读取海龟汤题库失败: {}", path.display()))?;
-    parse_question_bank(&text, path)
-}
-
-pub(super) fn parse_question_bank(text: &str, path: &Path) -> Result<Vec<TurtleSoupPuzzle>> {
-    let file: QuestionBankFile = serde_yaml::from_str(text)
-        .with_context(|| format!("解析海龟汤题库失败: {}", path.display()))?;
-    let mut questions = match file {
-        QuestionBankFile::Wrapped(file) => file.questions,
-        QuestionBankFile::List(questions) => questions,
-    };
-    if questions.is_empty() {
-        bail!("海龟汤题库没有题目: {}", path.display());
-    }
-    let mut ids = HashSet::new();
-    for (index, puzzle) in questions.iter_mut().enumerate() {
-        let number = index + 1;
-        if puzzle.id.trim().is_empty() {
-            bail!("海龟汤题库第 {} 题 id 不能为空", number);
-        }
-        if puzzle.title.trim().is_empty() {
-            bail!("海龟汤题库第 {} 题标题不能为空", number);
-        }
-        if puzzle.surface.trim().is_empty() {
-            bail!("海龟汤题库第 {} 题汤面不能为空", number);
-        }
-        if puzzle.bottom.trim().is_empty() {
-            bail!("海龟汤题库第 {} 题汤底不能为空", number);
-        }
-        puzzle.id = puzzle.id.trim().to_string();
-        puzzle.title = puzzle.title.trim().to_string();
-        if !ids.insert(puzzle.id.clone()) {
-            bail!("海龟汤题库存在重复 ID: {}", puzzle.id);
-        }
-    }
-    Ok(questions)
 }
 
 fn load_used_state(path: &Path) -> Result<UsedQuestionState> {

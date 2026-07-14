@@ -1,7 +1,11 @@
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
+
+use super::entertainment::{AcquireOutcome, EntertainmentCoordinator, EntertainmentKind};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -95,6 +99,162 @@ pub struct LandlordGame {
     config: LandlordConfig,
     state: GameState,
     rng: SplitMix64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CardGameStartGate {
+    Ready { kind: EntertainmentKind },
+    Reply(String),
+}
+
+#[derive(Clone)]
+pub struct CardGameService {
+    game: Arc<Mutex<LandlordGame>>,
+    entertainment: EntertainmentCoordinator,
+    enabled: bool,
+}
+
+impl CardGameService {
+    pub fn new(config: LandlordConfig, entertainment: EntertainmentCoordinator) -> Self {
+        let enabled = config.enabled;
+        Self {
+            game: Arc::new(Mutex::new(LandlordGame::new(config))),
+            entertainment,
+            enabled,
+        }
+    }
+
+    pub fn prepare_start(&self, command: &LandlordCommand) -> Result<CardGameStartGate> {
+        let kind = card_game_kind(command)?;
+        let label = kind.label();
+        if !self.enabled {
+            return Ok(CardGameStartGate::Reply(format!("{}未启用", label)));
+        }
+        if self.is_active()? {
+            return Ok(CardGameStartGate::Reply("已有牌局或房间进行中".to_string()));
+        }
+        match self.entertainment.try_acquire(kind)? {
+            AcquireOutcome::Acquired | AcquireOutcome::AlreadyOwned => {
+                Ok(CardGameStartGate::Ready { kind })
+            }
+            AcquireOutcome::Occupied(active) => Ok(CardGameStartGate::Reply(format!(
+                "{}正在进行，请结束后再开始{}",
+                active.label(),
+                label
+            ))),
+        }
+    }
+
+    pub fn cancel_start(&self, kind: EntertainmentKind) {
+        self.entertainment.release(kind);
+    }
+
+    pub fn complete_start(
+        &self,
+        player: &str,
+        command: &LandlordCommand,
+        now: Instant,
+    ) -> Result<LandlordOutcome> {
+        let kind = card_game_kind(command)?;
+        let outcome = self.game()?.handle(player, command, now);
+        if outcome.action != "created" {
+            self.entertainment.release(kind);
+        }
+        self.finish_outcome(&outcome);
+        Ok(outcome)
+    }
+
+    pub fn handle(
+        &self,
+        player: &str,
+        command: &LandlordCommand,
+        now: Instant,
+    ) -> Result<LandlordOutcome> {
+        if let Some(active) = self.entertainment.active()
+            && !is_card_game_kind(active)
+            && !matches!(command, LandlordCommand::Status)
+        {
+            return Ok(LandlordOutcome::public(
+                "occupied",
+                format!("{}正在进行，请结束后再开始牌局", active.label()),
+            ));
+        }
+        let outcome = self.game()?.handle(player, command, now);
+        self.finish_outcome(&outcome);
+        Ok(outcome)
+    }
+
+    pub fn tick(&self, now: Instant, clock_active: bool) -> Result<Option<LandlordOutcome>> {
+        Ok(self.game()?.tick(now, clock_active))
+    }
+
+    pub fn abort(&self) -> Result<bool> {
+        let aborted = self.game()?.abort();
+        let reserved = self.entertainment.active().is_some_and(is_card_game_kind);
+        if aborted || reserved {
+            self.release_active_card_game();
+        }
+        Ok(aborted || reserved)
+    }
+
+    pub fn is_active(&self) -> Result<bool> {
+        Ok(self.game()?.is_active())
+    }
+
+    pub fn lobby_kind_for_join(&self, player: &str) -> Result<Option<EntertainmentKind>> {
+        let active = self
+            .entertainment
+            .active()
+            .filter(|kind| is_card_game_kind(*kind));
+        let game = self.game()?;
+        Ok(active.filter(|_| game.is_lobby() && !game.lobby_contains(player)))
+    }
+
+    pub fn retry_hand_delivery(&self, player: &str) -> Result<()> {
+        self.game()?.retry_hand_delivery(player);
+        Ok(())
+    }
+
+    pub fn finish_delivery(&self, outcome: &LandlordOutcome) {
+        self.finish_outcome(outcome);
+    }
+
+    fn finish_outcome(&self, outcome: &LandlordOutcome) {
+        if outcome.ended {
+            self.release_active_card_game();
+        }
+    }
+
+    fn release_active_card_game(&self) {
+        if let Some(kind) = self
+            .entertainment
+            .active()
+            .filter(|kind| is_card_game_kind(*kind))
+        {
+            self.entertainment.release(kind);
+        }
+    }
+
+    fn game(&self) -> Result<MutexGuard<'_, LandlordGame>> {
+        self.game
+            .lock()
+            .map_err(|_| anyhow!("landlord mutex poisoned"))
+    }
+}
+
+fn card_game_kind(command: &LandlordCommand) -> Result<EntertainmentKind> {
+    match command {
+        LandlordCommand::Start => Ok(EntertainmentKind::Landlord),
+        LandlordCommand::RunFastStart => Ok(EntertainmentKind::RunFast),
+        _ => bail!("card game start gate requires a start command"),
+    }
+}
+
+fn is_card_game_kind(kind: EntertainmentKind) -> bool {
+    matches!(
+        kind,
+        EntertainmentKind::Landlord | EntertainmentKind::RunFast
+    )
 }
 
 enum GameState {
@@ -1957,6 +2117,76 @@ impl SplitMix64 {
 mod tests {
     use super::*;
     use crate::features::chat_text::{MAX_CHAT_WIDTH, display_width};
+    use crate::features::entertainment::{EntertainmentCoordinator, EntertainmentKind};
+
+    #[test]
+    fn application_service_releases_a_cancelled_start_reservation() {
+        let entertainment = EntertainmentCoordinator::new();
+        let service = CardGameService::new(LandlordConfig::default(), entertainment.clone());
+
+        let gate = service
+            .prepare_start(&LandlordCommand::Start)
+            .expect("start preparation should succeed");
+        let CardGameStartGate::Ready { kind } = gate else {
+            panic!("enabled idle game should reserve a start");
+        };
+        assert_eq!(kind, EntertainmentKind::Landlord);
+
+        service.cancel_start(kind);
+
+        assert_eq!(entertainment.active(), None);
+        assert!(!service.is_active().unwrap());
+    }
+
+    #[test]
+    fn application_service_does_not_replace_another_entertainment_session() {
+        let entertainment = EntertainmentCoordinator::new();
+        assert_eq!(
+            entertainment
+                .try_acquire(EntertainmentKind::Undercover)
+                .unwrap(),
+            AcquireOutcome::Acquired
+        );
+        let service = CardGameService::new(LandlordConfig::default(), entertainment.clone());
+
+        let gate = service
+            .prepare_start(&LandlordCommand::Start)
+            .expect("occupied start preparation should return a reply");
+
+        assert!(matches!(gate, CardGameStartGate::Reply(_)));
+        assert_eq!(entertainment.active(), Some(EntertainmentKind::Undercover));
+        assert!(!service.is_active().unwrap());
+    }
+
+    #[test]
+    fn application_service_releases_a_timeout_when_delivery_begins() {
+        let entertainment = EntertainmentCoordinator::new();
+        let config = LandlordConfig {
+            lobby_timeout_seconds: 1,
+            ..LandlordConfig::default()
+        };
+        let service = CardGameService::new(config, entertainment.clone());
+        let started_at = Instant::now();
+
+        let gate = service.prepare_start(&LandlordCommand::Start).unwrap();
+        assert!(matches!(gate, CardGameStartGate::Ready { .. }));
+        let created = service
+            .complete_start("甲", &LandlordCommand::Start, started_at)
+            .unwrap();
+        assert_eq!(created.action, "created");
+
+        let timeout = service
+            .tick(started_at + Duration::from_secs(2), true)
+            .unwrap()
+            .expect("lobby should time out");
+        assert!(timeout.ended);
+        assert_eq!(entertainment.active(), Some(EntertainmentKind::Landlord));
+
+        service.finish_delivery(&timeout);
+
+        assert_eq!(entertainment.active(), None);
+        assert!(!service.is_active().unwrap());
+    }
 
     fn ranks(text: &str) -> Vec<Rank> {
         parse_cards(text).unwrap()

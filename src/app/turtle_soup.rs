@@ -21,8 +21,8 @@ use super::deferred_chat::{
     DeferredChatBatch, DeferredChatQueue, DeferredChatTarget, EnqueueOutcome, TurtleSoupDelivery,
     TurtleSoupDeliveryPurpose,
 };
-use super::entertainment::{AcquireOutcome, EntertainmentCoordinator, EntertainmentKind};
 use crate::features::chat_text::{MAX_CHAT_WIDTH, display_width};
+use crate::features::entertainment::{AcquireOutcome, EntertainmentCoordinator, EntertainmentKind};
 
 const DELIVERY_ATTEMPTS: u8 = 3;
 const RECENT_JUDGMENT_LIMIT: usize = 30;

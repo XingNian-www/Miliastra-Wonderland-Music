@@ -4,7 +4,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow};
 
-use super::config::{MatchConfig, PlaybackTimingConfig, QueueConfig, SongDedupConfig};
 use super::feeluown::{FeelUOwnClient, PlayerStatus, SearchCandidate};
 use super::monitor::MonitorPlaybackController;
 use super::playback_format::{
@@ -16,6 +15,7 @@ use super::runtime_state::{
 };
 use super::song_dedup::{PersistentSongDedupHistory, SongDedupCandidate};
 use super::song_matcher;
+use crate::config::{MatchConfig, PlaybackTimingConfig, QueueConfig, SongDedupConfig};
 
 pub(super) trait MusicPlayerBackend: Clone + Send + Sync + 'static {
     fn status(&self) -> Result<PlayerStatus>;

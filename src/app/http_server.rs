@@ -30,8 +30,6 @@ use super::custom_workflow;
 use super::decision_control::{DecisionAction, DecisionControlShared};
 #[cfg(test)]
 use super::deferred_chat::DeferredChatQueue;
-#[cfg(test)]
-use super::entertainment::EntertainmentCoordinator;
 use super::feeluown::FeelUOwnClient;
 use super::geometry::parse_rect;
 use super::monitor::{MonitorQueueItem, MonitorShared};
@@ -42,6 +40,8 @@ use super::turtle_soup::TurtleSoupService;
 use super::turtle_soup_bank::{TurtleSoupBankStore, TurtleSoupSubmission};
 use super::web_tools::{WebToolRequest, WebToolShared, WebToolTemplate};
 use crate::config::AppConfig;
+#[cfg(test)]
+use crate::features::entertainment::EntertainmentCoordinator;
 use crate::features::undercover::{UndercoverCommand, UndercoverGame};
 
 const MAX_ACTIVE_CONNECTIONS: usize = 32;

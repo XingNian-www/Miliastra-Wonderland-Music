@@ -1,8 +1,9 @@
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -149,6 +150,31 @@ impl CapturedFrame {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrameDemand {
+    interval: Duration,
+}
+
+impl FrameDemand {
+    pub fn new(interval: Duration) -> Result<Self, FrameDemandError> {
+        if interval.is_zero() {
+            return Err(FrameDemandError);
+        }
+        Ok(Self { interval })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrameDemandError;
+
+impl Display for FrameDemandError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("frame demand interval must be greater than zero")
+    }
+}
+
+impl Error for FrameDemandError {}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CaptureFrame;
 
@@ -284,6 +310,12 @@ impl<R: UiRoutine> ErasedUiJob for TypedUiJob<R> {
 
 enum RuntimeMessage {
     Execute(Box<dyn ErasedUiJob>),
+    AddFrameDemand {
+        id: u64,
+        demand: FrameDemand,
+        sender: SyncSender<Arc<CapturedFrame>>,
+    },
+    RemoveFrameDemand(u64),
     Shutdown,
 }
 
@@ -296,6 +328,8 @@ struct RuntimeChannel {
 pub struct UiRuntimeHandle {
     channel: Arc<RuntimeChannel>,
     next_operation_id: Arc<AtomicU64>,
+    next_frame_demand_id: Arc<AtomicU64>,
+    latest_frame: Arc<Mutex<Option<Arc<CapturedFrame>>>>,
 }
 
 impl UiRuntimeHandle {
@@ -328,6 +362,85 @@ impl UiRuntimeHandle {
             Err(TrySendError::Disconnected(_)) => Err(UiSubmitError::RuntimeStopped),
         }
     }
+
+    pub fn declare_frame_demand(
+        &self,
+        demand: FrameDemand,
+    ) -> Result<FrameDemandSubscription, UiSubmitError> {
+        let accepting = self
+            .channel
+            .accepting
+            .lock()
+            .map_err(|_| UiSubmitError::RuntimeStopped)?;
+        if !*accepting {
+            return Err(UiSubmitError::RuntimeStopped);
+        }
+
+        let id = self
+            .next_frame_demand_id
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let message = RuntimeMessage::AddFrameDemand { id, demand, sender };
+        match self.channel.sender.try_send(message) {
+            Ok(()) => Ok(FrameDemandSubscription {
+                id,
+                receiver,
+                channel: Arc::clone(&self.channel),
+                active: true,
+            }),
+            Err(TrySendError::Full(_)) => Err(UiSubmitError::QueueFull),
+            Err(TrySendError::Disconnected(_)) => Err(UiSubmitError::RuntimeStopped),
+        }
+    }
+
+    pub fn latest_frame(&self) -> Option<Arc<CapturedFrame>> {
+        self.latest_frame
+            .lock()
+            .ok()
+            .and_then(|frame| frame.clone())
+    }
+}
+
+pub struct FrameDemandSubscription {
+    id: u64,
+    receiver: Receiver<Arc<CapturedFrame>>,
+    channel: Arc<RuntimeChannel>,
+    active: bool,
+}
+
+impl FrameDemandSubscription {
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<Arc<CapturedFrame>, RecvTimeoutError> {
+        self.receiver.recv_timeout(timeout)
+    }
+
+    pub fn cancel(mut self) -> Result<(), UiSubmitError> {
+        let accepting = self
+            .channel
+            .accepting
+            .lock()
+            .map_err(|_| UiSubmitError::RuntimeStopped)?;
+        if !*accepting {
+            return Err(UiSubmitError::RuntimeStopped);
+        }
+        self.channel
+            .sender
+            .send(RuntimeMessage::RemoveFrameDemand(self.id))
+            .map_err(|_| UiSubmitError::RuntimeStopped)?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for FrameDemandSubscription {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self
+                .channel
+                .sender
+                .try_send(RuntimeMessage::RemoveFrameDemand(self.id));
+        }
+    }
 }
 
 pub struct UiRuntime {
@@ -349,15 +462,19 @@ impl UiRuntime {
             sender,
             accepting: Mutex::new(true),
         });
+        let latest_frame = Arc::new(Mutex::new(None));
+        let worker_latest_frame = Arc::clone(&latest_frame);
         let worker = thread::Builder::new()
             .name("ui-runtime".to_string())
-            .spawn(move || run_ui_runtime(device, receiver))
+            .spawn(move || run_ui_runtime(device, receiver, worker_latest_frame))
             .map_err(UiRuntimeStartError::Spawn)?;
 
         Ok(Self {
             handle: UiRuntimeHandle {
                 channel,
                 next_operation_id: Arc::new(AtomicU64::new(0)),
+                next_frame_demand_id: Arc::new(AtomicU64::new(0)),
+                latest_frame,
             },
             worker: Some(worker),
         })
@@ -389,12 +506,104 @@ impl Drop for UiRuntime {
     }
 }
 
-fn run_ui_runtime(device: impl UiDevice, receiver: Receiver<RuntimeMessage>) {
+struct ActiveFrameDemand {
+    interval: Duration,
+    next_due: Instant,
+    sender: SyncSender<Arc<CapturedFrame>>,
+}
+
+fn run_ui_runtime(
+    device: impl UiDevice,
+    receiver: Receiver<RuntimeMessage>,
+    latest_frame: Arc<Mutex<Option<Arc<CapturedFrame>>>>,
+) {
     let mut device = device;
-    while let Ok(message) = receiver.recv() {
+    let mut demands = HashMap::<u64, ActiveFrameDemand>::new();
+    loop {
+        let message = match next_frame_timeout(&demands) {
+            Some(timeout) => match receiver.recv_timeout(timeout) {
+                Ok(message) => Some(message),
+                Err(RecvTimeoutError::Timeout) => None,
+                Err(RecvTimeoutError::Disconnected) => break,
+            },
+            None => match receiver.recv() {
+                Ok(message) => Some(message),
+                Err(_) => break,
+            },
+        };
         match message {
-            RuntimeMessage::Execute(job) => job.execute(&mut device),
-            RuntimeMessage::Shutdown => break,
+            Some(RuntimeMessage::Execute(job)) => job.execute(&mut device),
+            Some(RuntimeMessage::AddFrameDemand { id, demand, sender }) => {
+                demands.insert(
+                    id,
+                    ActiveFrameDemand {
+                        interval: demand.interval,
+                        next_due: Instant::now(),
+                        sender,
+                    },
+                );
+            }
+            Some(RuntimeMessage::RemoveFrameDemand(id)) => {
+                demands.remove(&id);
+            }
+            Some(RuntimeMessage::Shutdown) => break,
+            None => publish_due_frame(&mut device, &mut demands, &latest_frame),
+        }
+    }
+}
+
+fn next_frame_timeout(demands: &HashMap<u64, ActiveFrameDemand>) -> Option<Duration> {
+    let now = Instant::now();
+    demands
+        .values()
+        .map(|demand| demand.next_due.saturating_duration_since(now))
+        .min()
+}
+
+fn publish_due_frame(
+    device: &mut dyn UiDevice,
+    demands: &mut HashMap<u64, ActiveFrameDemand>,
+    latest_frame: &Mutex<Option<Arc<CapturedFrame>>>,
+) {
+    let now = Instant::now();
+    let due = demands
+        .iter()
+        .filter_map(|(&id, demand)| (demand.next_due <= now).then_some(id))
+        .collect::<Vec<_>>();
+    if due.is_empty() {
+        return;
+    }
+
+    let captured = match device.capture() {
+        Ok(image) => Some(Arc::new(CapturedFrame {
+            image,
+            captured_at: Instant::now(),
+        })),
+        Err(error) => {
+            log::error!("UI runtime 按需截图失败: {error:#}");
+            None
+        }
+    };
+    if let Some(frame) = &captured
+        && let Ok(mut latest) = latest_frame.lock()
+    {
+        *latest = Some(Arc::clone(frame));
+    }
+
+    let completed_at = Instant::now();
+    for id in due {
+        let Some(demand) = demands.get_mut(&id) else {
+            continue;
+        };
+        demand.next_due = completed_at + demand.interval;
+        let Some(frame) = &captured else {
+            continue;
+        };
+        match demand.sender.try_send(Arc::clone(frame)) {
+            Ok(()) | Err(TrySendError::Full(_)) => {}
+            Err(TrySendError::Disconnected(_)) => {
+                demands.remove(&id);
+            }
         }
     }
 }

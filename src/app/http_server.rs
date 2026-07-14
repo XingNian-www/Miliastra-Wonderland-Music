@@ -40,9 +40,9 @@ use super::runtime_state::PersistentRuntimeState;
 use super::task_tracker::TaskTrackerShared;
 use super::turtle_soup::TurtleSoupService;
 use super::turtle_soup_bank::{TurtleSoupBankStore, TurtleSoupSubmission};
-use super::undercover::{UndercoverCommand, UndercoverGame};
 use super::web_tools::{WebToolRequest, WebToolShared, WebToolTemplate};
 use crate::config::AppConfig;
+use crate::features::undercover::{UndercoverCommand, UndercoverGame};
 
 const MAX_ACTIVE_CONNECTIONS: usize = 32;
 const MAX_JSON_BODY_BYTES: usize = 64 * 1024;

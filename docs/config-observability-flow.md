@@ -87,7 +87,7 @@ flowchart TD
 - 旧版本号等于当前版本，且不存在旧字段来源：不迁移。
 - 版本缺失、版本落后，或当前版本里仍包含旧路径字段：执行迁移。
 
-如果新增配置段或字段具备完整 `serde(default)` 默认值，且没有移动或改变旧字段语义，可以保持配置版本不变。`turtle_soup` 就采用这种方式：旧的同版本配置没有该段时直接使用默认关闭配置，缺少 `nickname_stable_count` 或 `content_stable_count` 时分别使用默认值 `2`，都不触发模板重写；发布包里的新 `config.yaml` 仍提供完整中文注释。
+如果新增配置段或字段具备完整 `serde(default)` 默认值，且没有移动或改变旧字段语义，可以保持配置版本不变。`turtle_soup` 初次加入时采用这种方式；当前缺少 `nickname_stable_count` 或 `content_stable_count` 时使用局部继承值 `0`，再由 `stability.default_count` 解析连续次数。版本 27 会把旧默认值 `2` 迁移为 `0`，用户显式设置的大于 1 的局部覆盖保持不变。
 
 迁移以当前默认配置为 `new_value` 基底，然后分几步填充：
 

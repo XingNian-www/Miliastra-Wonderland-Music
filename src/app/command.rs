@@ -4,9 +4,9 @@ use serde::{Deserialize, Serialize};
 
 use super::entertainment::EntertainmentKind;
 use super::turtle_soup::TurtleSoupCommand;
-use super::undercover::UndercoverCommand;
 use crate::features::card_games::LandlordCommand;
 use crate::features::idiom_chain::{IdiomChainCommand, IdiomChainMode};
+use crate::features::undercover::UndercoverCommand;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ParsedCommand {

@@ -8,17 +8,17 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
-use super::undercover::{UndercoverWordPair, normalized_word_component, unordered_word_key};
+use super::{UndercoverWordPair, normalized_word_component, unordered_word_key};
 
 #[derive(Clone)]
-pub(super) struct UndercoverBankStore {
+pub(crate) struct UndercoverBankStore {
     bank_path: PathBuf,
     used_path: PathBuf,
     lock: Arc<Mutex<()>>,
 }
 
 impl UndercoverBankStore {
-    pub(super) fn new(bank_path: PathBuf, used_path: PathBuf) -> Self {
+    pub(crate) fn new(bank_path: PathBuf, used_path: PathBuf) -> Self {
         Self {
             bank_path,
             used_path,
@@ -26,7 +26,7 @@ impl UndercoverBankStore {
         }
     }
 
-    pub(super) fn consume_random(&self, seed: u64) -> Result<UndercoverWordPair> {
+    pub(crate) fn consume_random(&self, seed: u64) -> Result<UndercoverWordPair> {
         let _guard = self
             .lock
             .lock()

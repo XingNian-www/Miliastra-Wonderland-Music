@@ -73,7 +73,7 @@ use self::deferred_chat::{
 };
 use self::feeluown::{FeelUOwnClient, PlayerStatus, format_lyrics, format_status};
 use self::frame_source::{Canvas, load_frame};
-use self::game_ui::GameUi;
+use self::game_ui::{GameUi, WindowsUiDevice};
 use self::geometry::{Rect, crop_canvas};
 use self::hall_info::{
     HALL_INFO_OCR_SAMPLES, HallInfo, HallInfoSample, display_or_empty,
@@ -116,6 +116,7 @@ use crate::features::undercover::repository::UndercoverBankStore;
 use crate::features::undercover::{
     UndercoverCommand, UndercoverDelivery, UndercoverGame, UndercoverMode,
 };
+use crate::runtime::ui::UiRuntime;
 use anyhow::{Context, Result, anyhow};
 use enigo::Key;
 use image::DynamicImage;
@@ -126,6 +127,7 @@ const OCR_REBUILD_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const OCR_REBUILD_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const TARGET_MISSING_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const TARGET_MISSING_BACKOFF_MAX: Duration = Duration::from_secs(60);
+const UI_RUNTIME_QUEUE_CAPACITY: usize = 32;
 
 fn secondary_hall_search_rect(anchor: Rect, friend_list: Rect) -> Rect {
     let left = anchor.x.min(friend_list.x);
@@ -317,6 +319,7 @@ fn run_automation_with_watchdog(config_path: &Path) -> Result<()> {
 pub(crate) struct AutomationApp {
     config: AppConfig,
     game_ui: GameUi,
+    ui_runtime: Option<UiRuntime>,
     runtime_state: Arc<Mutex<PersistentRuntimeState>>,
     entertainment: EntertainmentCoordinator,
     idiom_chain: Arc<Mutex<IdiomChainGame>>,
@@ -854,7 +857,11 @@ impl AutomationApp {
         song_dedup_history: PersistentSongDedupHistory,
         monitor: MonitorShared,
     ) -> Result<Self> {
-        let game_ui = GameUi::direct(config.window.clone());
+        let ui_runtime = UiRuntime::start(
+            WindowsUiDevice::new(config.window.clone()),
+            UI_RUNTIME_QUEUE_CAPACITY,
+        )?;
+        let game_ui = GameUi::runtime(ui_runtime.handle());
         let ocr_args = OcrArgs::default().resolve(&config);
         let ocr_engine = make_ocr_engine(&ocr_args)?;
         let feeluown = FeelUOwnClient::new(&config.feeluown, &config.timing);
@@ -906,6 +913,7 @@ impl AutomationApp {
         Ok(Self {
             config,
             game_ui,
+            ui_runtime: Some(ui_runtime),
             runtime_state,
             entertainment,
             idiom_chain,
@@ -979,6 +987,11 @@ impl AutomationApp {
         }
         if let Err(error) = playback_monitor.join() {
             log::error!("播放监控线程 panic: {error:?}");
+        }
+        if let Some(ui_runtime) = self.ui_runtime.take()
+            && let Err(error) = ui_runtime.shutdown()
+        {
+            log::error!("UI 运行时关闭失败: {error}");
         }
         if let Err(error) = self.queue().and_then(|queue| queue.save()) {
             log::error!("退出前保存队列失败: {error:#}");
@@ -1217,6 +1230,7 @@ impl AutomationApp {
         Self {
             config: self.config.clone(),
             game_ui: self.game_ui.clone(),
+            ui_runtime: None,
             runtime_state: self.runtime_state.clone(),
             entertainment: self.entertainment.clone(),
             idiom_chain: self.idiom_chain.clone(),

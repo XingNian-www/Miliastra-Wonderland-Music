@@ -36,11 +36,11 @@ use super::monitor::{MonitorQueueItem, MonitorShared};
 use super::queue::{PersistentQueue, QueueItem};
 use super::runtime_state::PersistentRuntimeState;
 use super::task_tracker::TaskTrackerShared;
-use super::turtle_soup::TurtleSoupService;
 use super::web_tools::{WebToolRequest, WebToolShared, WebToolTemplate};
 use crate::config::AppConfig;
 #[cfg(test)]
 use crate::features::entertainment::EntertainmentCoordinator;
+use crate::features::turtle_soup::TurtleSoupService;
 use crate::features::turtle_soup::repository::{TurtleSoupBankStore, TurtleSoupSubmission};
 use crate::features::undercover::{UndercoverCommand, UndercoverGame};
 

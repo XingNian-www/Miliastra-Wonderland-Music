@@ -33,7 +33,6 @@ mod startup_flow;
 mod task_tracker;
 mod template_match;
 pub(crate) mod tui;
-pub(crate) mod turtle_soup;
 mod ui_locator;
 mod ui_state;
 mod web_tools;
@@ -97,9 +96,6 @@ use self::song_dedup::PersistentSongDedupHistory;
 use self::song_review::{SongReviewCandidate, SongReviewClient};
 use self::task_tracker::TaskTrackerShared;
 use self::template_match::{best_template_hit, find_template_hits};
-use self::turtle_soup::{
-    QuestionSubmitOutcome, SecondaryOcrObservation, SecondaryOcrStability, TurtleSoupService,
-};
 use self::ui_locator::UiLocator;
 use self::ui_state::{UiState, detect_ui_state};
 use self::web_tools::{WebToolRequest, WebToolShared, WebToolTask, WebToolTemplate};
@@ -109,6 +105,9 @@ use crate::features::chat_text::split_numbered_chat_message;
 use crate::features::entertainment::{AcquireOutcome, EntertainmentCoordinator, EntertainmentKind};
 use crate::features::idiom_chain;
 use crate::features::idiom_chain::IdiomChainGame;
+use crate::features::turtle_soup::{
+    self, QuestionSubmitOutcome, SecondaryOcrObservation, SecondaryOcrStability, TurtleSoupService,
+};
 #[cfg(test)]
 use crate::features::undercover;
 use crate::features::undercover::repository::UndercoverBankStore;

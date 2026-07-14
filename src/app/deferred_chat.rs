@@ -4,6 +4,11 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 
+use crate::features::turtle_soup::{
+    TurtleSoupDelivery, TurtleSoupDeliveryIntent, TurtleSoupDeliveryOutcome,
+    TurtleSoupDeliveryPort, TurtleSoupDeliveryPurpose,
+};
+
 pub const DEFAULT_CAPACITY: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -24,20 +29,6 @@ pub enum DeferredChatTarget {
 pub struct DeferredChatMessage {
     pub text: String,
     pub target: DeferredChatTarget,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TurtleSoupDeliveryPurpose {
-    Opening,
-    SurfaceRepeat,
-    Judgment,
-    Settlement,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TurtleSoupDelivery {
-    pub generation: u64,
-    pub purpose: TurtleSoupDeliveryPurpose,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -244,6 +235,35 @@ impl DeferredChatQueue {
     }
 }
 
+impl TurtleSoupDeliveryPort for DeferredChatQueue {
+    fn deliver_turtle_soup(
+        &self,
+        intent: TurtleSoupDeliveryIntent,
+    ) -> Result<TurtleSoupDeliveryOutcome> {
+        let urgent = intent.is_urgent();
+        let protected = intent.is_protected();
+        let max_attempts = intent.max_attempts();
+        let (messages, delivery) = intent.into_parts();
+        let batch = DeferredChatBatch::new(
+            messages,
+            DeferredChatTarget::CurrentHall,
+            delivery,
+            max_attempts,
+            protected,
+        )?;
+        let outcome = if urgent {
+            self.enqueue_front(batch)?
+        } else {
+            self.enqueue(batch)?
+        };
+        Ok(match outcome {
+            EnqueueOutcome::Added => TurtleSoupDeliveryOutcome::Added,
+            EnqueueOutcome::DroppedMessage => TurtleSoupDeliveryOutcome::DroppedEarlierMessage,
+            EnqueueOutcome::Rejected => TurtleSoupDeliveryOutcome::Rejected,
+        })
+    }
+}
+
 fn make_room_for_enqueue(
     queue: &mut VecDeque<DeferredChatItem>,
     capacity: usize,
@@ -294,6 +314,9 @@ fn make_room_for_requeue(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::features::turtle_soup::{
+        TurtleSoupDeliveryIntent, TurtleSoupDeliveryOutcome, TurtleSoupDeliveryPort,
+    };
 
     fn message(text: &str) -> DeferredChatMessage {
         DeferredChatMessage {
@@ -561,5 +584,36 @@ mod tests {
 
         assert!(batch.mark_sent(2).is_err());
         assert_eq!(batch.remaining_texts(), vec!["唯一一段"]);
+    }
+
+    #[test]
+    fn turtle_soup_opening_delivery_is_urgent_and_protected() {
+        let queue = DeferredChatQueue::new(2);
+        queue.enqueue(message("older normal message")).unwrap();
+
+        let outcome = queue
+            .deliver_turtle_soup(
+                TurtleSoupDeliveryIntent::new(
+                    vec!["汤面1/1：测试".to_string()],
+                    7,
+                    TurtleSoupDeliveryPurpose::Opening,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(outcome, TurtleSoupDeliveryOutcome::Added);
+
+        assert_eq!(
+            queue.enqueue(message("newer normal message")).unwrap(),
+            EnqueueOutcome::DroppedMessage
+        );
+        assert!(matches!(
+            queue.wait_take(Duration::ZERO).unwrap(),
+            Some(DeferredChatItem::Batch(_))
+        ));
+        assert_eq!(
+            queue.wait_take(Duration::ZERO).unwrap(),
+            Some(item("newer normal message"))
+        );
     }
 }

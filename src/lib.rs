@@ -7,4 +7,6 @@ mod config;
 #[cfg(target_os = "windows")]
 mod features;
 
+pub mod observation;
+
 pub mod runtime;

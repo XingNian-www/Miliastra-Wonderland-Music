@@ -6,9 +6,9 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use self::migration::CURRENT_CONFIG_VERSION;
-use crate::app::turtle_soup::TurtleSoupConfig;
 use crate::features::card_games::LandlordConfig;
 use crate::features::idiom_chain::IdiomChainConfig;
+use crate::features::turtle_soup::TurtleSoupConfig;
 use crate::features::undercover::UndercoverConfig;
 
 mod migration;

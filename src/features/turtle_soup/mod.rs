@@ -6,6 +6,91 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 pub(crate) mod repository;
+mod service;
+
+pub(crate) use service::{
+    QuestionSubmitOutcome, SecondaryOcrObservation, SecondaryOcrStability, TurtleSoupCommand,
+    TurtleSoupConfig, TurtleSoupQuestion, TurtleSoupService, parse_question_message,
+};
+
+const DELIVERY_ATTEMPTS: u8 = 3;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TurtleSoupDeliveryPurpose {
+    Opening,
+    SurfaceRepeat,
+    Judgment,
+    Settlement,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TurtleSoupDelivery {
+    pub(crate) generation: u64,
+    pub(crate) purpose: TurtleSoupDeliveryPurpose,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TurtleSoupDeliveryOutcome {
+    Added,
+    DroppedEarlierMessage,
+    Rejected,
+}
+
+pub(crate) trait TurtleSoupDeliveryPort: Send + Sync {
+    fn deliver_turtle_soup(
+        &self,
+        intent: TurtleSoupDeliveryIntent,
+    ) -> Result<TurtleSoupDeliveryOutcome>;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TurtleSoupDeliveryIntent {
+    messages: Vec<String>,
+    generation: u64,
+    purpose: TurtleSoupDeliveryPurpose,
+}
+
+impl TurtleSoupDeliveryIntent {
+    pub(crate) fn new(
+        messages: Vec<String>,
+        generation: u64,
+        purpose: TurtleSoupDeliveryPurpose,
+    ) -> Result<Self> {
+        if messages.is_empty() {
+            bail!("海龟汤投递不能为空");
+        }
+        Ok(Self {
+            messages,
+            generation,
+            purpose,
+        })
+    }
+
+    pub(crate) fn is_urgent(&self) -> bool {
+        matches!(
+            self.purpose,
+            TurtleSoupDeliveryPurpose::Opening | TurtleSoupDeliveryPurpose::Settlement
+        )
+    }
+
+    pub(crate) fn is_protected(&self) -> bool {
+        !matches!(self.purpose, TurtleSoupDeliveryPurpose::Judgment)
+    }
+
+    pub(crate) fn max_attempts(&self) -> u8 {
+        DELIVERY_ATTEMPTS
+    }
+
+    pub(crate) fn into_parts(self) -> (Vec<String>, TurtleSoupDelivery) {
+        (
+            self.messages,
+            TurtleSoupDelivery {
+                generation: self.generation,
+                purpose: self.purpose,
+            },
+        )
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -75,4 +160,37 @@ pub(crate) fn parse_question_bank(text: &str, path: &Path) -> Result<Vec<TurtleS
         }
     }
     Ok(questions)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delivery_intent_owns_turtle_soup_scheduling_policy() {
+        let opening = TurtleSoupDeliveryIntent::new(
+            vec!["汤面1/1：测试".to_string()],
+            7,
+            TurtleSoupDeliveryPurpose::Opening,
+        )
+        .unwrap();
+        assert!(opening.is_urgent());
+        assert!(opening.is_protected());
+        assert_eq!(opening.max_attempts(), 3);
+
+        let judgment = TurtleSoupDeliveryIntent::new(
+            vec!["[玩家]的问题回复：是".to_string()],
+            7,
+            TurtleSoupDeliveryPurpose::Judgment,
+        )
+        .unwrap();
+        assert!(!judgment.is_urgent());
+        assert!(!judgment.is_protected());
+        assert_eq!(judgment.max_attempts(), 3);
+
+        assert!(
+            TurtleSoupDeliveryIntent::new(Vec::new(), 7, TurtleSoupDeliveryPurpose::Settlement,)
+                .is_err()
+        );
+    }
 }

@@ -2,10 +2,11 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::turtle_soup::TurtleSoupCommand;
 use crate::features::card_games::LandlordCommand;
+use crate::features::chat_text::normalize_comparison_text;
 use crate::features::entertainment::EntertainmentKind;
 use crate::features::idiom_chain::{IdiomChainCommand, IdiomChainMode};
+use crate::features::turtle_soup::TurtleSoupCommand;
 use crate::features::undercover::UndercoverCommand;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -910,10 +911,7 @@ pub fn same_lock_keyword(left: &str, right: &str) -> bool {
 }
 
 pub fn normalize_lock_text(text: &str) -> String {
-    text.chars()
-        .filter_map(normalize_char)
-        .flat_map(|ch| ch.to_lowercase())
-        .collect()
+    normalize_comparison_text(text)
 }
 
 pub(super) fn strip_ascii_case_prefix<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
@@ -1003,44 +1001,6 @@ fn parse_queue_indexes(param: &str) -> Vec<usize> {
         .filter(|value| (1..=9).contains(value))
         .map(|value| value as usize - 1)
         .collect()
-}
-
-fn normalize_char(ch: char) -> Option<char> {
-    if ch.is_whitespace() || is_punctuation(ch) {
-        return None;
-    }
-    if ('\u{ff01}'..='\u{ff5e}').contains(&ch) {
-        return char::from_u32(ch as u32 - 0xfee0);
-    }
-    Some(ch)
-}
-
-fn is_punctuation(ch: char) -> bool {
-    ch.is_ascii_punctuation()
-        || matches!(
-            ch,
-            '，' | '。'
-                | '、'
-                | '；'
-                | '：'
-                | '？'
-                | '！'
-                | '（'
-                | '）'
-                | '【'
-                | '】'
-                | '《'
-                | '》'
-                | '“'
-                | '”'
-                | '‘'
-                | '’'
-                | '￥'
-                | '·'
-                | '—'
-                | '～'
-                | '…'
-        )
 }
 
 fn is_feedback_text(text: &str) -> bool {

@@ -79,7 +79,7 @@ use self::hall_info::{
     HALL_INFO_OCR_SAMPLES, HallInfo, HallInfoSample, display_or_empty,
     format_hall_remaining_suffix, merge_hall_info_samples, parse_hall_remaining_minutes,
 };
-use self::input_actions::{click_game_point, ensure_game_ready_for_input, parse_key, press_key};
+use self::input_actions::parse_key;
 use self::monitor::{MonitorQueueItem, MonitorShared, OcrSnapshot};
 use self::ocr::{
     OcrArgs, OcrBackendProbeStatus, make_ocr_engine, merged_ocr_text, probe_ocr_backend_support,
@@ -2562,7 +2562,7 @@ impl AutomationApp {
             timeout.as_secs() / 60
         );
         self.abort_entertainment_for_context_loss("闲置退出即将关闭游戏");
-        if let Err(error) = window::close_game(&self.config.window) {
+        if let Err(error) = self.game_ui.close_window() {
             log::error!("关闭目标窗口失败: {error:#}");
         }
         self.clear_idle_exit_timer()?;
@@ -2945,11 +2945,10 @@ impl AutomationApp {
                     let hit = best_template_hit(&frame, rect, &path, threshold)?
                         .ok_or_else(|| anyhow!("未找到超过阈值的模板: {}", template.label()))?;
                     let point = hit.center();
-                    ensure_game_ready_for_input(
-                        &self.config.window,
-                        self.config.timing.input.after_activate_ms,
-                    )?;
-                    click_game_point(PointConfig::new(point.x, point.y), &self.config.window)?;
+                    self.game_ui
+                        .ensure_ready(self.config.timing.input.after_activate_ms)?;
+                    self.game_ui
+                        .click_point(PointConfig::new(point.x, point.y))?;
                     Ok(format!(
                         "已点击 {}: x={} y={} score={:.3}",
                         template.label(),
@@ -2975,21 +2974,17 @@ impl AutomationApp {
                     ));
                 }
                 self.ensure_web_tool_input_still_idle()?;
-                ensure_game_ready_for_input(
-                    &self.config.window,
-                    self.config.timing.input.after_activate_ms,
-                )?;
-                click_game_point(PointConfig::new(x, y), &self.config.window)?;
+                self.game_ui
+                    .ensure_ready(self.config.timing.input.after_activate_ms)?;
+                self.game_ui.click_point(PointConfig::new(x, y))?;
                 Ok(format!("已点击坐标: {x},{y}"))
             }
             WebToolRequest::Key { key } => {
                 let key = parse_key(&key)?;
                 self.ensure_web_tool_input_still_idle()?;
-                ensure_game_ready_for_input(
-                    &self.config.window,
-                    self.config.timing.input.after_activate_ms,
-                )?;
-                press_key(key, &self.config.window)?;
+                self.game_ui
+                    .ensure_ready(self.config.timing.input.after_activate_ms)?;
+                self.game_ui.press_key(key)?;
                 Ok("按键已发送".to_string())
             }
             WebToolRequest::ChatChangeSamples {
@@ -3105,10 +3100,8 @@ impl AutomationApp {
         const STABLE_SAMPLES: usize = 3;
 
         self.ensure_web_tool_input_still_idle()?;
-        ensure_game_ready_for_input(
-            &self.config.window,
-            self.config.timing.input.after_activate_ms,
-        )?;
+        self.game_ui
+            .ensure_ready(self.config.timing.input.after_activate_ms)?;
         let mut open_times = Vec::new();
         let mut close_times = Vec::new();
         let mut failures = 0u32;
@@ -3116,13 +3109,13 @@ impl AutomationApp {
 
         for _ in 0..rounds {
             self.ensure_web_tool_input_still_idle()?;
-            press_key(Key::Escape, &self.config.window)?;
+            self.game_ui.press_key(Key::Escape)?;
             let closed = self.latest_frame()?;
             let closed = rect_chat_change_fingerprint(&closed, detect_rect)?;
 
             let opened_at = Instant::now();
             self.ensure_web_tool_input_still_idle()?;
-            press_key(Key::Return, &self.config.window)?;
+            self.game_ui.press_key(Key::Return)?;
             let Some(opened) = self.wait_for_web_tool_change(
                 &closed,
                 detect_rect,
@@ -3139,7 +3132,7 @@ impl AutomationApp {
 
             let closed_at = Instant::now();
             self.ensure_web_tool_input_still_idle()?;
-            press_key(Key::Escape, &self.config.window)?;
+            self.game_ui.press_key(Key::Escape)?;
             let Some(closed_again) = self.wait_for_web_tool_change(
                 &opened.1,
                 detect_rect,
@@ -3155,7 +3148,7 @@ impl AutomationApp {
             close_times.push(closed_again.0);
         }
 
-        let _ = press_key(Key::Escape, &self.config.window);
+        let _ = self.game_ui.press_key(Key::Escape);
         Ok(format!(
             "轮数={} 失败={}\n打开: {}\n关闭: {}",
             rounds,
@@ -3263,10 +3256,8 @@ impl AutomationApp {
                     attempt,
                     hit.row_click.y
                 );
-                click_game_point(
-                    PointConfig::new(hit.row_click.x, hit.row_click.y),
-                    &self.config.window,
-                )?;
+                self.game_ui
+                    .click_point(PointConfig::new(hit.row_click.x, hit.row_click.y))?;
                 sleep(Duration::from_millis(self.config.timing.input.click_ms));
                 let frame = load_frame(&frame_args, &canvas, &self.game_ui)?;
                 if !unread_hit_still_visible(&frame.image, hit) {
@@ -3415,7 +3406,7 @@ impl AutomationApp {
                 context,
                 attempt
             );
-            press_key(Key::Return, &self.config.window)?;
+            self.game_ui.press_key(Key::Return)?;
             sleep(Duration::from_millis(self.config.timing.input.open_chat_ms));
             let frame = load_frame(&frame_args, &canvas, &self.game_ui)?;
             let ui_state = detect_ui_state(&frame.image, &templates, &self.config.screen)?;
@@ -3466,7 +3457,6 @@ impl AutomationApp {
             canvas,
             FrameArgs { image: None },
             self.game_ui.clone(),
-            self.config.window.clone(),
             self.config.timing.workflow.default_poll_ms,
         );
         let hit = workflow_actions::click_scrollable_template(
@@ -4020,11 +4010,9 @@ impl AutomationApp {
 
     fn ensure_game_ready_for_input(&self, context: &str) -> Result<()> {
         log::info!("{}: 激活并聚焦游戏窗口", context);
-        self::input_actions::ensure_game_ready_for_input(
-            &self.config.window,
-            self.config.timing.input.after_activate_ms,
-        )
-        .with_context(|| format!("{}: 激活并聚焦游戏窗口失败", context))
+        self.game_ui
+            .ensure_ready(self.config.timing.input.after_activate_ms)
+            .with_context(|| format!("{}: 激活并聚焦游戏窗口失败", context))
     }
 
     fn active_ui_residency(&self) -> UiResidency {
@@ -4113,7 +4101,7 @@ impl AutomationApp {
             }
 
             log::info!("命令执行前界面: {}，按 ESC 返回一级: {}", ui_state, command);
-            press_key(Key::Escape, &self.config.window)?;
+            self.game_ui.press_key(Key::Escape)?;
             sleep(Duration::from_millis(
                 self.config.timing.command.return_retry_ms,
             ));
@@ -5107,7 +5095,7 @@ impl AutomationApp {
     fn execute_microphone_command(&self, username: &str) -> Result<()> {
         self.ensure_ui_residency(UiResidency::Primary, "麦克风切换前准备")?;
         log::info!("麦克风: 按 N 切换状态");
-        press_key(Key::Unicode('n'), &self.config.window)?;
+        self.game_ui.press_key(Key::Unicode('n'))?;
         sleep(Duration::from_millis(100));
         self.reply(&format!("@{} 执行了切换麦克风状态！", username))
     }
@@ -5115,7 +5103,7 @@ impl AutomationApp {
     fn execute_hall_detect(&mut self) -> Result<()> {
         self.ensure_ui_residency(UiResidency::Primary, "大厅检测前准备")?;
         log::info!("大厅检测: 按 F2 进入大厅页面");
-        press_key(Key::F2, &self.config.window)?;
+        self.game_ui.press_key(Key::F2)?;
         sleep(Duration::from_millis(
             self.config.timing.hall.page_settle_ms,
         ));
@@ -5190,7 +5178,7 @@ impl AutomationApp {
 
         log::info!("大厅时间未知，执行一次大厅识别");
         self.ensure_ui_residency(UiResidency::Primary, "大厅时间识别前准备")?;
-        press_key(Key::F2, &self.config.window)?;
+        self.game_ui.press_key(Key::F2)?;
         sleep(Duration::from_millis(
             self.config.timing.hall.page_settle_ms,
         ));
@@ -5220,7 +5208,7 @@ impl AutomationApp {
     fn check_public_hall(&self) -> Result<bool> {
         self.ensure_ui_residency(UiResidency::Primary, "公共大厅检测前准备")?;
         log::info!("大厅检测: 按 F2 进入大厅页面");
-        press_key(Key::F2, &self.config.window)?;
+        self.game_ui.press_key(Key::F2)?;
         sleep(Duration::from_millis(
             self.config.timing.hall.page_settle_ms,
         ));
@@ -5260,7 +5248,7 @@ impl AutomationApp {
     }
 
     fn return_to_primary_by_escape(&self, context: &str) -> bool {
-        if let Err(error) = window::GameWindow::find(&self.config.window) {
+        if let Err(error) = self.game_ui.ensure_window() {
             log::warn!(
                 "{}: 目标游戏窗口不可用，跳过返回一级界面: {error:#}",
                 context
@@ -5368,7 +5356,7 @@ impl AutomationApp {
             failed_returns,
             wait_ms
         );
-        if let Err(error) = press_key(Key::Escape, &self.config.window) {
+        if let Err(error) = self.game_ui.press_key(Key::Escape) {
             log::error!("{}: 返回一级界面按 ESC 失败: {error:#}", context);
             return false;
         }

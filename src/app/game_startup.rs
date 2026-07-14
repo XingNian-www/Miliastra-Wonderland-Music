@@ -89,11 +89,11 @@ where
         log::info!("启动游戏流程步骤: {}", step.label());
         step = match step {
             GameStartupStep::EnsureGameWindow => {
-                ensure_game_window(config, should_continue, on_window_detection_reset)?;
+                ensure_game_window(config, game_ui, should_continue, on_window_detection_reset)?;
                 GameStartupStep::FocusGameWindow
             }
             GameStartupStep::FocusGameWindow => {
-                workflow_actions::focus(&config.window, config.timing.input.after_activate_ms)
+                workflow_actions::focus(game_ui, config.timing.input.after_activate_ms)
                     .context("启动游戏流程聚焦游戏窗口失败")?;
                 on_window_detection_reset("启动游戏流程已聚焦游戏窗口");
                 if config.startup.enter_game {
@@ -138,6 +138,7 @@ where
 
 fn ensure_game_window<F, W>(
     config: &AppConfig,
+    game_ui: &GameUi,
     should_continue: &mut F,
     on_window_detection_reset: &mut W,
 ) -> Result<()>
@@ -145,7 +146,7 @@ where
     F: FnMut() -> bool,
     W: FnMut(&'static str),
 {
-    if window::GameWindow::find(&config.window).is_ok() {
+    if game_ui.ensure_window().is_ok() {
         log::info!("启动游戏流程: 已找到游戏窗口，跳过启动游戏");
         on_window_detection_reset("启动游戏流程发现已有游戏窗口");
         return Ok(());
@@ -195,7 +196,7 @@ where
             bail!("启动游戏流程已取消");
         }
         sleep(Duration::from_millis(config.startup.launch_wait_ms));
-        if window::GameWindow::find(&config.window).is_ok() {
+        if game_ui.ensure_window().is_ok() {
             log::info!("启动游戏流程: 游戏窗口已出现 attempt={}", attempt);
             on_window_detection_reset("启动游戏流程检测到游戏窗口");
             return Ok(());

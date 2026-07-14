@@ -349,7 +349,6 @@ impl ChatOutput {
             self.canvas.clone(),
             FrameArgs { image: None },
             self.game_ui.clone(),
-            self.window.clone(),
             self.timing.workflow.default_poll_ms,
         );
         let hall_hit = workflow_actions::click_scrollable_template(

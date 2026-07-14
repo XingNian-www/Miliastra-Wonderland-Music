@@ -150,6 +150,28 @@ impl CapturedFrame {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct FrameCaptureFailure {
+    failed_at: Instant,
+    reason: Arc<str>,
+}
+
+impl FrameCaptureFailure {
+    pub fn failed_at(&self) -> Instant {
+        self.failed_at
+    }
+
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum FramePublication {
+    Captured(Arc<CapturedFrame>),
+    Failed(FrameCaptureFailure),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameDemand {
     interval: Duration,
@@ -313,7 +335,7 @@ enum RuntimeMessage {
     AddFrameDemand {
         id: u64,
         demand: FrameDemand,
-        sender: SyncSender<Arc<CapturedFrame>>,
+        sender: SyncSender<FramePublication>,
     },
     RemoveFrameDemand(u64),
     Shutdown,
@@ -404,13 +426,13 @@ impl UiRuntimeHandle {
 
 pub struct FrameDemandSubscription {
     id: u64,
-    receiver: Receiver<Arc<CapturedFrame>>,
+    receiver: Receiver<FramePublication>,
     channel: Arc<RuntimeChannel>,
     active: bool,
 }
 
 impl FrameDemandSubscription {
-    pub fn recv_timeout(&self, timeout: Duration) -> Result<Arc<CapturedFrame>, RecvTimeoutError> {
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<FramePublication, RecvTimeoutError> {
         self.receiver.recv_timeout(timeout)
     }
 
@@ -509,7 +531,7 @@ impl Drop for UiRuntime {
 struct ActiveFrameDemand {
     interval: Duration,
     next_due: Instant,
-    sender: SyncSender<Arc<CapturedFrame>>,
+    sender: SyncSender<FramePublication>,
 }
 
 fn run_ui_runtime(
@@ -574,17 +596,20 @@ fn publish_due_frame(
         return;
     }
 
-    let captured = match device.capture() {
-        Ok(image) => Some(Arc::new(CapturedFrame {
+    let publication = match device.capture() {
+        Ok(image) => FramePublication::Captured(Arc::new(CapturedFrame {
             image,
             captured_at: Instant::now(),
         })),
         Err(error) => {
             log::error!("UI runtime 按需截图失败: {error:#}");
-            None
+            FramePublication::Failed(FrameCaptureFailure {
+                failed_at: Instant::now(),
+                reason: Arc::from(format!("{error:#}")),
+            })
         }
     };
-    if let Some(frame) = &captured
+    if let FramePublication::Captured(frame) = &publication
         && let Ok(mut latest) = latest_frame.lock()
     {
         *latest = Some(Arc::clone(frame));
@@ -596,10 +621,7 @@ fn publish_due_frame(
             continue;
         };
         demand.next_due = completed_at + demand.interval;
-        let Some(frame) = &captured else {
-            continue;
-        };
-        match demand.sender.try_send(Arc::clone(frame)) {
+        match demand.sender.try_send(publication.clone()) {
             Ok(()) | Err(TrySendError::Full(_)) => {}
             Err(TrySendError::Disconnected(_)) => {
                 demands.remove(&id);

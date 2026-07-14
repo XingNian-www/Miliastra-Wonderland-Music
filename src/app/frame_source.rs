@@ -1,16 +1,13 @@
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use image::DynamicImage;
 use image::GenericImageView;
 use image::imageops::FilterType;
 
 use super::FrameArgs;
-use super::window;
-use crate::config;
-
-static WINDOW_CAPTURE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+use super::game_ui::GameUi;
 
 #[derive(Clone, Debug)]
 pub(super) struct Canvas {
@@ -24,30 +21,18 @@ pub(super) struct Frame {
     pub(super) image: Arc<DynamicImage>,
 }
 
-pub(super) fn load_frame(
-    args: &FrameArgs,
-    canvas: &Canvas,
-    window_config: &config::WindowConfig,
-) -> Result<Frame> {
+pub(super) fn load_frame(args: &FrameArgs, canvas: &Canvas, game_ui: &GameUi) -> Result<Frame> {
     let started = Instant::now();
     let image = match &args.image {
         Some(path) => {
             image::open(path).with_context(|| format!("open image {}", path.display()))?
         }
-        None => capture_game_blocking(window_config)?,
+        None => game_ui.capture()?,
     };
     let image = normalize_frame(image, canvas, started);
     Ok(Frame {
         image: Arc::new(image),
     })
-}
-
-fn capture_game_blocking(window_config: &config::WindowConfig) -> Result<DynamicImage> {
-    let _guard = WINDOW_CAPTURE_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .map_err(|_| anyhow!("window capture mutex poisoned"))?;
-    window::capture_game(window_config)
 }
 
 fn normalize_frame(image: DynamicImage, canvas: &Canvas, started: Instant) -> DynamicImage {

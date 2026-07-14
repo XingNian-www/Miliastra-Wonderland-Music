@@ -5,7 +5,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
-use super::chat_output::display_width;
+pub(crate) mod repository;
+
+use super::chat_text::display_width;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum UndercoverCommand {

@@ -15,8 +15,8 @@ use super::workflow_actions::{self, ScrollTemplateOptions};
 use crate::config::{
     InviteConfig, OutputConfig, ScreenConfig, TemplateConfig, TimingConfig, WindowConfig,
 };
+use crate::features::chat_text::{MAX_CHAT_WIDTH, char_width, display_width};
 
-pub(crate) const MAX_CHAT_WIDTH: usize = 80;
 const OMIT: &str = "...";
 const REDACTED_TURTLE_SOUP_BOTTOM: &str = "[海龟汤汤底已隐藏]";
 const REDACTED_UNDERCOVER_SECRET: &str = "[谁是卧底秘密内容已隐藏]";
@@ -715,14 +715,6 @@ fn take_display_end(value: &str, max_width: usize) -> String {
         width += next_width;
     }
     output.into_iter().rev().collect()
-}
-
-pub(crate) fn display_width(value: &str) -> usize {
-    value.chars().map(char_width).sum()
-}
-
-fn char_width(ch: char) -> usize {
-    if ch.is_ascii() { 1 } else { 2 }
 }
 
 #[cfg(test)]

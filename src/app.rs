@@ -62,6 +62,7 @@ use self::chat_listener::{
 };
 use self::chat_observation::{
     ChatObservationDispatch, ChatObservationExclusiveGuard, ChatObservationShared,
+    SecondaryChatObservation, SecondaryObservedMessage,
 };
 use self::chat_output::{
     ChatBatchSendOutcome, ChatBatchSendStatus, ChatOutput, redacted_chat_text,
@@ -1994,7 +1995,7 @@ impl AutomationApp {
     }
 
     fn scan_secondary_latest_if_changed(
-        &self,
+        &mut self,
         image: &DynamicImage,
         message_type: &str,
         friend_name: &str,
@@ -2020,7 +2021,7 @@ impl AutomationApp {
     }
 
     fn scan_secondary_hall_if_changed(
-        &self,
+        &mut self,
         image: &DynamicImage,
         previous: &mut Vec<SecondaryHallBubble>,
     ) -> Result<bool> {
@@ -2080,10 +2081,23 @@ impl AutomationApp {
     }
 
     fn publish_primary_chat_observation(&mut self, messages: Vec<ChatMessage>) -> Result<()> {
-        for dispatch in self.chat_observations.publish(messages)? {
+        let dispatches = self.chat_observations.publish_primary(messages)?;
+        self.dispatch_chat_observations(dispatches)?;
+        Ok(())
+    }
+
+    fn dispatch_chat_observations(
+        &mut self,
+        dispatches: Vec<ChatObservationDispatch>,
+    ) -> Result<bool> {
+        let mut processed_secondary = false;
+        for dispatch in dispatches {
             match dispatch {
-                ChatObservationDispatch::Messages(messages) => {
+                ChatObservationDispatch::Primary(messages) => {
                     self.handle_scan_messages(messages)?;
+                }
+                ChatObservationDispatch::Secondary(observation) => {
+                    processed_secondary |= self.process_secondary_chat_observation(observation)?;
                 }
                 ChatObservationDispatch::Gap(gap) => {
                     self.locks = CommandLockState::default();
@@ -2097,7 +2111,7 @@ impl AutomationApp {
                 }
             }
         }
-        Ok(())
+        Ok(processed_secondary)
     }
 
     fn handle_scan_messages(&mut self, messages: Vec<ChatMessage>) -> Result<()> {
@@ -3726,7 +3740,7 @@ impl AutomationApp {
     }
 
     fn process_secondary_latest_message(
-        &self,
+        &mut self,
         image: &DynamicImage,
         message_type: &str,
         friend_name: &str,
@@ -3745,7 +3759,7 @@ impl AutomationApp {
     }
 
     fn process_secondary_bubble_rects(
-        &self,
+        &mut self,
         image: &DynamicImage,
         rects: impl IntoIterator<Item = Rect>,
         message_type: &str,
@@ -3826,8 +3840,39 @@ impl AutomationApp {
                 .collect::<Vec<_>>()
         };
 
+        let observation = SecondaryChatObservation {
+            message_type: message_type.to_string(),
+            friend_name: friend_name.to_string(),
+            accepts_turtle_questions,
+            messages: texts
+                .into_iter()
+                .map(|(text, sender)| SecondaryObservedMessage { text, sender })
+                .collect(),
+        };
+        let dispatches = self.chat_observations.publish_secondary(observation)?;
+        let processed = self.dispatch_chat_observations(dispatches)?;
+        Ok(SecondaryBubbleProcessOutcome {
+            processed,
+            ocr_pending: false,
+        })
+    }
+
+    fn process_secondary_chat_observation(
+        &self,
+        observation: SecondaryChatObservation,
+    ) -> Result<bool> {
+        let SecondaryChatObservation {
+            message_type,
+            friend_name,
+            accepts_turtle_questions,
+            messages,
+        } = observation;
         let mut processed = false;
-        for (text, message_sender) in texts {
+        for SecondaryObservedMessage {
+            text,
+            sender: message_sender,
+        } in messages
+        {
             let shortcut_player = if message_type == "pink" {
                 friend_name.trim()
             } else {
@@ -3841,7 +3886,7 @@ impl AutomationApp {
                 };
                 if let Some(parsed) = command::parse_entertainment_shortcut(
                     &synthetic,
-                    message_type,
+                    &message_type,
                     self.entertainment.active(),
                 ) {
                     self.submit_secondary_command(parsed)?;
@@ -3875,8 +3920,12 @@ impl AutomationApp {
             } else {
                 format!("二级大厅：{}", command_text)
             };
-            let parsed = command::parse_text(&synthetic, message_type).or_else(|| {
-                custom_workflow::parse_text(&self.config.custom_workflows, &synthetic, message_type)
+            let parsed = command::parse_text(&synthetic, &message_type).or_else(|| {
+                custom_workflow::parse_text(
+                    &self.config.custom_workflows,
+                    &synthetic,
+                    &message_type,
+                )
             });
             let Some(parsed) = parsed else {
                 log::debug!("二级监听气泡未解析为命令");
@@ -3885,10 +3934,7 @@ impl AutomationApp {
             self.submit_secondary_command(parsed)?;
             processed = true;
         }
-        Ok(SecondaryBubbleProcessOutcome {
-            processed,
-            ocr_pending: false,
-        })
+        Ok(processed)
     }
 
     fn wait_for_secondary_bubble_stability(&self) -> Result<DynamicImage> {

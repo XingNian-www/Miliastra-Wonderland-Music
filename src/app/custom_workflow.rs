@@ -6,7 +6,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use super::command::{self, CustomWorkflowCommand, ModerationAction, ParsedCommand, UserCommand};
-use super::config::{self, CustomWorkflowConfig, CustomWorkflowDefinition, PointConfig};
 use super::decision_lock::DecisionScreenLock;
 use super::frame_source::{Canvas, load_frame};
 use super::ocr::merged_ocr_text;
@@ -16,6 +15,7 @@ use super::{
     AutomationApp, ChatDecisionScope, FrameArgs, PendingTask, PendingTaskExecution, TemplateArgs,
     TemporaryPrimaryHold, TrackedPendingTask, UiResidency,
 };
+use crate::config::{self, CustomWorkflowConfig, CustomWorkflowDefinition, PointConfig};
 use anyhow::{Result, anyhow, bail};
 
 pub(super) fn parse_text(
@@ -1984,8 +1984,8 @@ fn normalize_name(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::config::CustomWorkflowDefinition;
     use super::*;
+    use crate::config::CustomWorkflowDefinition;
 
     fn test_config(workflow: CustomWorkflowDefinition) -> CustomWorkflowConfig {
         CustomWorkflowConfig {

@@ -7,7 +7,7 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use super::config::{SongReviewConfig, SongReviewFailurePolicy, TimingConfig};
+use crate::config::{SongReviewConfig, SongReviewFailurePolicy, TimingConfig};
 
 #[derive(Clone)]
 pub(super) struct SongReviewClient {

@@ -6,8 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use super::config::{MatchConfig, SongDedupConfig};
 use super::song_matcher;
+use crate::config::{MatchConfig, SongDedupConfig};
 
 #[derive(Clone, Debug)]
 pub(super) struct SongDedupCandidate {

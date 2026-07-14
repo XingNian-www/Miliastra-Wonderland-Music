@@ -60,7 +60,6 @@ use self::chat_listener::{
 };
 use self::chat_output::{
     ChatBatchSendOutcome, ChatBatchSendStatus, ChatOutput, redacted_chat_text,
-    split_numbered_chat_message,
 };
 use self::chat_scan::{ChatMessage, prepare_chat_scan, recognize_prepared_chat};
 use self::command::{
@@ -106,6 +105,7 @@ use self::ui_state::{UiState, detect_ui_state};
 use self::web_tools::{WebToolRequest, WebToolShared, WebToolTask, WebToolTemplate};
 use crate::config::{AppConfig, PointConfig};
 use crate::features::card_games::{LandlordCommand, LandlordGame, LandlordOutcome};
+use crate::features::chat_text::split_numbered_chat_message;
 use crate::features::entertainment::{AcquireOutcome, EntertainmentCoordinator, EntertainmentKind};
 use crate::features::idiom_chain;
 use crate::features::idiom_chain::IdiomChainGame;

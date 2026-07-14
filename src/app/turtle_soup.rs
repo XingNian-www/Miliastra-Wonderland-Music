@@ -15,13 +15,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use url::Url;
 
-use super::chat_output::split_numbered_chat_message;
 use super::command;
 use super::deferred_chat::{
     DeferredChatBatch, DeferredChatQueue, DeferredChatTarget, EnqueueOutcome, TurtleSoupDelivery,
     TurtleSoupDeliveryPurpose,
 };
-use crate::features::chat_text::{MAX_CHAT_WIDTH, display_width};
+use crate::features::chat_text::{MAX_CHAT_WIDTH, display_width, split_numbered_chat_message};
 use crate::features::entertainment::{AcquireOutcome, EntertainmentCoordinator, EntertainmentKind};
 #[cfg(test)]
 use crate::features::turtle_soup::parse_question_bank;

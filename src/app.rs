@@ -73,7 +73,7 @@ use self::deferred_chat::{
     DeferredChatMessage, DeferredChatQueue, DeferredChatTarget, EnqueueOutcome,
 };
 use self::feeluown::{FeelUOwnClient, PlayerStatus, format_lyrics, format_status};
-use self::frame_source::{Canvas, load_frame};
+use self::frame_source::{Canvas, from_captured_frame, load_frame};
 use self::game_ui::{GameUi, WindowsUiDevice};
 use self::geometry::{Rect, crop_canvas};
 use self::hall_info::{
@@ -115,7 +115,9 @@ use crate::features::undercover::repository::UndercoverBankStore;
 use crate::features::undercover::{
     UndercoverCommand, UndercoverDelivery, UndercoverGame, UndercoverMode,
 };
-use crate::runtime::ui::UiRuntime;
+use crate::runtime::ui::{
+    FrameDemand, FrameDemandSubscription, FramePublication, UiRuntime, UiRuntimeHandle,
+};
 use anyhow::{Context, Result, anyhow};
 use enigo::Key;
 use image::DynamicImage;
@@ -125,6 +127,35 @@ const TARGET_MISSING_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const TARGET_MISSING_BACKOFF_MAX: Duration = Duration::from_secs(60);
 const UI_RUNTIME_QUEUE_CAPACITY: usize = 32;
 const OCR_RUNTIME_QUEUE_CAPACITY: usize = 64;
+
+fn receive_observation_frame(
+    subscription: &FrameDemandSubscription,
+    ui: &UiRuntimeHandle,
+    canvas: &Canvas,
+) -> Result<frame_source::Frame> {
+    match subscription.recv().context("等待 UI runtime 发布观察帧")? {
+        FramePublication::Captured(published) => {
+            let frame = ui
+                .latest_frame()
+                .filter(|latest| latest.captured_at() >= published.captured_at())
+                .unwrap_or(published);
+            Ok(from_captured_frame(&frame, canvas))
+        }
+        FramePublication::Failed(failure) => {
+            if let Some(latest) = ui
+                .latest_frame()
+                .filter(|latest| latest.captured_at() >= failure.failed_at())
+            {
+                return Ok(from_captured_frame(&latest, canvas));
+            }
+            Err(anyhow!(
+                "UI runtime 观察帧截图失败 at {:?}: {}",
+                failure.failed_at(),
+                failure.reason()
+            ))
+        }
+    }
+}
 
 fn secondary_hall_search_rect(anchor: Rect, friend_list: Rect) -> Rect {
     let left = anchor.x.min(friend_list.x);
@@ -1440,7 +1471,16 @@ impl AutomationApp {
             height: self.config.screen.expected_height,
             resize: true,
         };
-        let frame_args = FrameArgs { image: None };
+        let ui_handle = self
+            .ui_runtime
+            .as_ref()
+            .context("UI runtime 在扫描循环启动前已停止")?
+            .handle();
+        let frame_demand = FrameDemand::new(Duration::from_millis(
+            self.config.timing.loop_idle_ms.max(1),
+        ))
+        .context("创建聊天观察帧需求")?;
+        let mut frame_subscription: Option<FrameDemandSubscription> = None;
         let mut last_fingerprint: Option<ChangeFingerprint> = None;
         let mut last_ocr_at =
             Instant::now() - Duration::from_millis(self.config.timing.chat_scan.fallback_ms);
@@ -1463,13 +1503,32 @@ impl AutomationApp {
             self.update_monitor_operational_state();
             self.tick_entertainment();
             if self.paused.load(AtomicOrdering::SeqCst) {
+                if let Some(subscription) = frame_subscription.take()
+                    && let Err(error) = subscription.cancel()
+                {
+                    log::warn!("暂停监听时撤销观察帧需求失败: {error}");
+                }
                 self.maybe_idle_exit()?;
                 sleep(Duration::from_millis(self.config.timing.loop_idle_ms));
                 continue;
             }
 
+            if frame_subscription.is_none() {
+                frame_subscription = Some(
+                    ui_handle
+                        .declare_frame_demand(frame_demand)
+                        .context("向 UI runtime 声明聊天观察帧需求")?,
+                );
+            }
+
             let frame_started = Instant::now();
-            match load_frame(&frame_args, &canvas, &self.game_ui) {
+            match receive_observation_frame(
+                frame_subscription
+                    .as_ref()
+                    .expect("frame subscription initialized above"),
+                &ui_handle,
+                &canvas,
+            ) {
                 Ok(frame) => {
                     if let Ok(mut latest_frame) = self.latest_frame.lock() {
                         *latest_frame = Some(Arc::clone(&frame.image));
@@ -1477,6 +1536,11 @@ impl AutomationApp {
                         log::error!("主扫描画面缓存锁已损坏");
                     }
                     let frame_ms = elapsed_ms(frame_started);
+                    log::debug!(target: "timing",
+                        "观察帧交付: wait={}ms age={}ms",
+                        frame_ms,
+                        frame.captured_at.elapsed().as_millis()
+                    );
                     if target_missing {
                         log::info!("目标窗口已恢复，重置截图退避");
                         self.clear_hall_countdown_cache_for_new_visual_session("目标窗口恢复")?;
@@ -1624,7 +1688,13 @@ impl AutomationApp {
                                     self.config.timing.chat_scan.change_debounce_ms,
                                 ));
                                 let rescan_frame_started = Instant::now();
-                                match load_frame(&frame_args, &canvas, &self.game_ui) {
+                                match receive_observation_frame(
+                                    frame_subscription
+                                        .as_ref()
+                                        .expect("frame subscription initialized above"),
+                                    &ui_handle,
+                                    &canvas,
+                                ) {
                                     Ok(frame) => {
                                         let rescan_frame_ms = elapsed_ms(rescan_frame_started);
                                         let scan_started = Instant::now();
@@ -1742,6 +1812,11 @@ impl AutomationApp {
                     }
                 }
                 Err(error) => {
+                    if let Some(subscription) = frame_subscription.take()
+                        && let Err(cancel_error) = subscription.cancel()
+                    {
+                        log::warn!("截图失败后撤销观察帧需求失败: {cancel_error}");
+                    }
                     let frame_ms = elapsed_ms(frame_started);
                     if !target_missing {
                         self.abort_entertainment_for_context_loss("目标游戏窗口已关闭或不可用");
@@ -1790,6 +1865,12 @@ impl AutomationApp {
             }
             self.maybe_idle_exit()?;
             sleep(Duration::from_millis(self.config.timing.loop_idle_ms));
+        }
+
+        if let Some(subscription) = frame_subscription
+            && let Err(error) = subscription.cancel()
+        {
+            log::warn!("扫描循环结束时撤销观察帧需求失败: {error}");
         }
 
         self.queue()?.save()?;

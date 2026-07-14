@@ -62,7 +62,7 @@ use self::chat_listener::{
 };
 use self::chat_observation::{
     ChatObservationDispatch, ChatObservationExclusiveGuard, ChatObservationShared,
-    SecondaryChatObservation, SecondaryObservedMessage,
+    SecondaryChatObservation, SecondaryObservedMessage, SecondaryRecognizedMessage,
 };
 use self::chat_output::{
     ChatBatchSendOutcome, ChatBatchSendStatus, ChatOutput, redacted_chat_text,
@@ -3840,16 +3840,16 @@ impl AutomationApp {
                 .collect::<Vec<_>>()
         };
 
-        let observation = SecondaryChatObservation {
-            message_type: message_type.to_string(),
-            friend_name: friend_name.to_string(),
+        let messages = texts
+            .into_iter()
+            .map(|(text, sender)| SecondaryRecognizedMessage { text, sender })
+            .collect();
+        let dispatches = self.chat_observations.publish_secondary(
+            message_type,
+            friend_name,
             accepts_turtle_questions,
-            messages: texts
-                .into_iter()
-                .map(|(text, sender)| SecondaryObservedMessage { text, sender })
-                .collect(),
-        };
-        let dispatches = self.chat_observations.publish_secondary(observation)?;
+            messages,
+        )?;
         let processed = self.dispatch_chat_observations(dispatches)?;
         Ok(SecondaryBubbleProcessOutcome {
             processed,
@@ -3869,10 +3869,12 @@ impl AutomationApp {
         } = observation;
         let mut processed = false;
         for SecondaryObservedMessage {
+            id: message_id,
             text,
             sender: message_sender,
         } in messages
         {
+            log::debug!("处理二级观察消息: id={message_id:?}");
             let shortcut_player = if message_type == "pink" {
                 friend_name.trim()
             } else {
@@ -4355,13 +4357,20 @@ impl AutomationApp {
     }
 
     fn clear_hall_countdown_cache_for_new_visual_session(&self, reason: &str) -> Result<bool> {
-        let mut runtime_state = self.runtime_state()?;
-        if !runtime_state.state_mut().clear_hall_countdown_cache() {
-            return Ok(false);
+        let cleared = {
+            let mut runtime_state = self.runtime_state()?;
+            let cleared = runtime_state.state_mut().clear_hall_countdown_cache();
+            if cleared {
+                runtime_state.save()?;
+            }
+            cleared
+        };
+        let visual_session = self.chat_observations.begin_visual_session()?;
+        if cleared {
+            log::info!("{reason}，已清理大厅倒计时缓存，等待本次大厅检测重新确认");
         }
-        runtime_state.save()?;
-        log::info!("{reason}，已清理大厅倒计时缓存，等待本次大厅检测重新确认");
-        Ok(true)
+        log::info!("{reason}，聊天观察进入新视觉会话: {}", visual_session.get());
+        Ok(cleared)
     }
 
     fn resolve_song_request(

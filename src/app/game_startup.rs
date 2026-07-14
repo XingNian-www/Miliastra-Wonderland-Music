@@ -4,13 +4,13 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use ocr_rs::OcrEngine;
 use windows::Win32::System::Registry::{
     HKEY_CURRENT_USER, REG_VALUE_TYPE, RRF_RT_REG_SZ, RegGetValueW,
 };
 use windows::core::w;
 
 use super::game_ui::GameUi;
+use super::ocr_runtime::OcrRuntimeHandle;
 use super::ui_locator::{UiLocator, startup_locator};
 use super::window;
 use super::workflow_actions;
@@ -50,7 +50,7 @@ impl GameStartupStep {
 pub(super) fn start_game<F>(
     config: &AppConfig,
     game_ui: &GameUi,
-    engine: &OcrEngine,
+    engine: &OcrRuntimeHandle,
     mut should_continue: F,
     mut on_window_detection_reset: impl FnMut(&'static str),
 ) -> Result<()>
@@ -73,7 +73,7 @@ where
 fn execute_game_startup_steps<F, W>(
     config: &AppConfig,
     game_ui: &GameUi,
-    engine: &OcrEngine,
+    engine: &OcrRuntimeHandle,
     should_continue: &mut F,
     on_window_detection_reset: &mut W,
 ) -> Result<()>
@@ -216,7 +216,7 @@ where
 
 fn click_enter_game_text_once<F>(
     config: &AppConfig,
-    engine: &OcrEngine,
+    engine: &OcrRuntimeHandle,
     locator: &UiLocator,
     should_continue: &mut F,
     deadline: Instant,
@@ -268,7 +268,7 @@ fn paimon_menu_template_visible(config: &AppConfig, locator: &UiLocator) -> Resu
 
 fn wait_enter_game_text_gone<F>(
     config: &AppConfig,
-    engine: &OcrEngine,
+    engine: &OcrRuntimeHandle,
     locator: &UiLocator,
     should_continue: &mut F,
     deadline: Instant,

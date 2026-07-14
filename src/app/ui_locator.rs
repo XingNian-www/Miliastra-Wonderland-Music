@@ -3,7 +3,6 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use ocr_rs::OcrEngine;
 
 use super::FrameArgs;
 use super::change_detection::{change_stats, rect_chat_change_fingerprint};
@@ -11,7 +10,7 @@ use super::command;
 use super::frame_source::{Canvas, Frame, load_frame};
 use super::game_ui::GameUi;
 use super::geometry::{Point, Rect, crop_canvas};
-use super::ocr::recognize_lines;
+use super::ocr_runtime::{OcrPriority, OcrRuntimeHandle};
 use super::template_match::{TemplateHit, best_template_hit};
 use crate::config::{self, PointConfig};
 
@@ -157,15 +156,15 @@ impl UiRegion<'_> {
 
     pub(super) fn find_text(
         &self,
-        engine: &OcrEngine,
+        ocr: &OcrRuntimeHandle,
         expected: &str,
     ) -> Result<Option<UiTextHit>> {
-        self.find_any_text(engine, &[expected])
+        self.find_any_text(ocr, &[expected])
     }
 
     pub(super) fn find_text_hits(
         &self,
-        engine: &OcrEngine,
+        ocr: &OcrRuntimeHandle,
         expected: &str,
     ) -> Result<Vec<UiTextHit>> {
         let target = command::normalize_lock_text(expected);
@@ -175,7 +174,7 @@ impl UiRegion<'_> {
         let frame = self.locator.capture()?;
         let crop = crop_canvas(&frame.image, self.rect)?;
         let mut hits = Vec::new();
-        for line in recognize_lines(engine, &crop)? {
+        for line in ocr.recognize_lines(crop, OcrPriority::UiConfirmation)? {
             let normalized = command::normalize_lock_text(&line.text);
             if normalized.is_empty() {
                 continue;
@@ -196,7 +195,7 @@ impl UiRegion<'_> {
 
     pub(super) fn find_any_text(
         &self,
-        engine: &OcrEngine,
+        ocr: &OcrRuntimeHandle,
         expected: &[&str],
     ) -> Result<Option<UiTextHit>> {
         let targets = expected
@@ -211,7 +210,7 @@ impl UiRegion<'_> {
         let frame = self.locator.capture()?;
         let crop = crop_canvas(&frame.image, self.rect)?;
         let mut fallback = None;
-        for line in recognize_lines(engine, &crop)? {
+        for line in ocr.recognize_lines(crop, OcrPriority::UiConfirmation)? {
             let normalized = command::normalize_lock_text(&line.text);
             if normalized.is_empty() {
                 continue;

@@ -130,7 +130,7 @@ impl Display for UiRoutineFailure {
 
 impl Error for UiRoutineFailure {}
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct CapturedFrame {
     image: Arc<DynamicImage>,
     captured_at: Instant,
@@ -212,6 +212,10 @@ pub trait UiRoutine: sealed::UiRoutineSealed + Send + 'static {
     type Output: Send + 'static;
 
     fn execute(self, device: &mut dyn UiDevice) -> Self::Output;
+
+    fn frame_publication(_output: &Self::Output) -> Option<FramePublication> {
+        None
+    }
 }
 
 impl sealed::UiRoutineSealed for CaptureFrame {}
@@ -226,6 +230,16 @@ impl UiRoutine for CaptureFrame {
         Ok(CapturedFrame {
             image: Arc::new(image),
             captured_at: Instant::now(),
+        })
+    }
+
+    fn frame_publication(output: &Self::Output) -> Option<FramePublication> {
+        Some(match output {
+            Ok(frame) => FramePublication::Captured(Arc::new(frame.clone())),
+            Err(failure) => FramePublication::Failed(FrameCaptureFailure {
+                failed_at: Instant::now(),
+                reason: Arc::from(failure.to_string()),
+            }),
         })
     }
 }
@@ -320,7 +334,12 @@ impl Display for UiShutdownError {
 impl Error for UiShutdownError {}
 
 trait ErasedUiJob: Send {
-    fn execute(self: Box<Self>, device: &mut dyn UiDevice);
+    fn execute(
+        self: Box<Self>,
+        device: &mut dyn UiDevice,
+        demands: &mut HashMap<u64, ActiveFrameDemand>,
+        latest_frame: &Mutex<Option<Arc<CapturedFrame>>>,
+    );
 }
 
 struct TypedUiJob<R: UiRoutine> {
@@ -329,8 +348,17 @@ struct TypedUiJob<R: UiRoutine> {
 }
 
 impl<R: UiRoutine> ErasedUiJob for TypedUiJob<R> {
-    fn execute(self: Box<Self>, device: &mut dyn UiDevice) {
-        let _ = self.response.send(self.routine.execute(device));
+    fn execute(
+        self: Box<Self>,
+        device: &mut dyn UiDevice,
+        demands: &mut HashMap<u64, ActiveFrameDemand>,
+        latest_frame: &Mutex<Option<Arc<CapturedFrame>>>,
+    ) {
+        let output = self.routine.execute(device);
+        if let Some(publication) = R::frame_publication(&output) {
+            publish_frame(publication, demands, latest_frame);
+        }
+        let _ = self.response.send(output);
     }
 }
 
@@ -562,7 +590,9 @@ fn run_ui_runtime(
             },
         };
         match message {
-            Some(RuntimeMessage::Execute(job)) => job.execute(&mut device),
+            Some(RuntimeMessage::Execute(job)) => {
+                job.execute(&mut device, &mut demands, &latest_frame)
+            }
             Some(RuntimeMessage::AddFrameDemand { id, demand, sender }) => {
                 demands.insert(
                     id,
@@ -617,14 +647,27 @@ fn publish_due_frame(
             })
         }
     };
+    publish_frame(publication, demands, latest_frame);
+}
+
+fn publish_frame(
+    publication: FramePublication,
+    demands: &mut HashMap<u64, ActiveFrameDemand>,
+    latest_frame: &Mutex<Option<Arc<CapturedFrame>>>,
+) {
     if let FramePublication::Captured(frame) = &publication
         && let Ok(mut latest) = latest_frame.lock()
     {
         *latest = Some(Arc::clone(frame));
     }
 
-    let completed_at = Instant::now();
-    for id in due {
+    let completed_at = match &publication {
+        FramePublication::Captured(frame) => frame.captured_at(),
+        FramePublication::Failed(failure) => failure.failed_at(),
+    };
+    let ids = demands.keys().copied().collect::<Vec<_>>();
+    let mut disconnected = Vec::new();
+    for id in ids {
         let Some(demand) = demands.get_mut(&id) else {
             continue;
         };
@@ -632,8 +675,11 @@ fn publish_due_frame(
         match demand.sender.try_send(publication.clone()) {
             Ok(()) | Err(TrySendError::Full(_)) => {}
             Err(TrySendError::Disconnected(_)) => {
-                demands.remove(&id);
+                disconnected.push(id);
             }
         }
+    }
+    for id in disconnected {
+        demands.remove(&id);
     }
 }

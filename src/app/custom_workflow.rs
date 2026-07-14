@@ -332,7 +332,7 @@ impl AutomationApp {
             "key" | "press_key" => {
                 let key_text =
                     render_workflow_text(step.key.as_deref().unwrap_or("").trim(), context);
-                workflow_actions::press_key_text(&key_text, &self.config.window)
+                workflow_actions::press_key_text(&key_text, &self.game_ui)
             }
             "hold_key" => {
                 let key_text =
@@ -345,23 +345,22 @@ impl AutomationApp {
                 workflow_actions::hold_key_text(
                     &key_text,
                     hold_seconds,
-                    &self.config.window,
-                    || self.running.load(AtomicOrdering::SeqCst),
+                    &self.game_ui,
+                    self.running.clone(),
                 )
             }
             "activate_game" => workflow_actions::activate(
-                &self.config.window,
+                &self.game_ui,
                 self.config.timing.input.after_activate_ms,
             ),
-            "focus_game" => workflow_actions::focus(
-                &self.config.window,
-                self.config.timing.input.after_activate_ms,
-            ),
+            "focus_game" => {
+                workflow_actions::focus(&self.game_ui, self.config.timing.input.after_activate_ms)
+            }
             "click" => {
                 let point = step
                     .point
                     .ok_or_else(|| anyhow!("custom workflow click step missing point"))?;
-                workflow_actions::click_point(point, &self.config.window)
+                workflow_actions::click_point(point, &self.game_ui)
             }
             "click_template" => self.execute_custom_template_step(context, step, true),
             "wait_template" => self.execute_custom_template_step(context, step, false),
@@ -371,11 +370,7 @@ impl AutomationApp {
             "wait_text" => self.execute_custom_text_step(context, step, false),
             "paste" | "paste_text" => {
                 let text = custom_step_text(step, context);
-                workflow_actions::paste(
-                    &text,
-                    &self.config.window,
-                    self.config.timing.input.text_ms,
-                )
+                workflow_actions::paste(&text, &self.game_ui, self.config.timing.input.text_ms)
             }
             "send_chat" | "reply" => {
                 let message = custom_step_message(step, context);
@@ -795,7 +790,7 @@ impl AutomationApp {
         log::info!("邀请: 输入 6 位大厅密码");
         workflow_actions::wait(self.config.timing.invite.step_ms);
         for digit in password.chars() {
-            workflow_actions::press_key_text(&digit.to_string(), &self.config.window)?;
+            workflow_actions::press_key_text(&digit.to_string(), &self.game_ui)?;
             workflow_actions::wait(self.config.timing.input.text_ms);
         }
         Ok(())
@@ -1153,7 +1148,7 @@ impl AutomationApp {
 
             state = match state {
                 ModerationUiState::OpenFriendPanel => {
-                    workflow_actions::press_key_text("o", &self.config.window)?;
+                    workflow_actions::press_key_text("o", &self.game_ui)?;
                     if !self.wait_template_atom(
                         &locator,
                         &self.config.templates.friend_panel,
@@ -1167,9 +1162,9 @@ impl AutomationApp {
                     ModerationUiState::OpenSearchPanel
                 }
                 ModerationUiState::OpenSearchPanel => {
-                    workflow_actions::press_key_text("e", &self.config.window)?;
+                    workflow_actions::press_key_text("e", &self.game_ui)?;
                     workflow_actions::wait(self.config.timing.invite.step_ms);
-                    workflow_actions::press_key_text("e", &self.config.window)?;
+                    workflow_actions::press_key_text("e", &self.game_ui)?;
                     if !self.wait_template_atom(
                         &locator,
                         &self.config.templates.friend_search_panel,
@@ -1192,17 +1187,17 @@ impl AutomationApp {
                     );
                     workflow_actions::click_point(
                         self.config.moderation.search_input_point,
-                        &self.config.window,
+                        &self.game_ui,
                     )?;
                     workflow_actions::wait(self.config.timing.input.click_ms);
                     workflow_actions::paste(
                         &command.uid,
-                        &self.config.window,
+                        &self.game_ui,
                         self.config.timing.input.text_ms,
                     )?;
                     workflow_actions::click_point(
                         self.config.moderation.search_button_point,
-                        &self.config.window,
+                        &self.game_ui,
                     )?;
                     ModerationUiState::WaitSearchResult
                 }
@@ -1302,7 +1297,6 @@ impl AutomationApp {
             canvas,
             FrameArgs { image: None },
             self.game_ui.clone(),
-            self.config.window.clone(),
             poll_ms,
         )
     }

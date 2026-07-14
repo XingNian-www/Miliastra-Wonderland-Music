@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
+use super::game_ui::GameUi;
 use super::geometry::Point;
 use super::template_match::{TemplateHit, best_template_hit};
 use super::ui_locator::{UiLocator, startup_locator, startup_transition_locator};
@@ -31,7 +32,11 @@ impl WonderlandStep {
     }
 }
 
-pub(super) fn enter_wonderland<F>(config: &AppConfig, mut should_continue: F) -> Result<()>
+pub(super) fn enter_wonderland<F>(
+    config: &AppConfig,
+    game_ui: &GameUi,
+    mut should_continue: F,
+) -> Result<()>
 where
     F: FnMut() -> bool,
 {
@@ -42,8 +47,8 @@ where
     workflow_actions::focus(&config.window, config.timing.input.after_activate_ms)
         .context("进入千星流程聚焦游戏窗口失败")?;
 
-    let locator = startup_locator(config);
-    execute_wonderland_steps(config, &locator, &mut should_continue)?;
+    let locator = startup_locator(config, game_ui.clone());
+    execute_wonderland_steps(config, game_ui, &locator, &mut should_continue)?;
 
     log::info!("进入千星流程: 已完成，耗时 {}ms", elapsed_ms(started));
     Ok(())
@@ -51,6 +56,7 @@ where
 
 fn execute_wonderland_steps<F>(
     config: &AppConfig,
+    game_ui: &GameUi,
     locator: &UiLocator,
     should_continue: &mut F,
 ) -> Result<()>
@@ -66,11 +72,11 @@ where
                 WonderlandStep::ClickWonderlandCard
             }
             WonderlandStep::ClickWonderlandCard => {
-                click_wonderland_card(config, locator, should_continue)?;
+                click_wonderland_card(config, game_ui, locator, should_continue)?;
                 WonderlandStep::WaitConfirmGone
             }
             WonderlandStep::WaitConfirmGone => {
-                wait_enter_confirm_gone(config, should_continue)?;
+                wait_enter_confirm_gone(config, game_ui, should_continue)?;
                 return Ok(());
             }
         };
@@ -124,13 +130,14 @@ where
 
 fn click_wonderland_card<F>(
     config: &AppConfig,
+    game_ui: &GameUi,
     locator: &UiLocator,
     should_continue: &mut F,
 ) -> Result<()>
 where
     F: FnMut() -> bool,
 {
-    let prompt_locator = startup_transition_locator(config);
+    let prompt_locator = startup_transition_locator(config, game_ui.clone());
     let prompt_timeout_ms = config.startup.wonderland_card_retry_ms.max(100);
     let attempts = capped_attempts(
         config.startup.wonderland_card_retries,
@@ -185,11 +192,15 @@ where
     bail!("等待千星奇域大厅确认按钮超时")
 }
 
-fn wait_enter_confirm_gone<F>(config: &AppConfig, should_continue: &mut F) -> Result<()>
+fn wait_enter_confirm_gone<F>(
+    config: &AppConfig,
+    game_ui: &GameUi,
+    should_continue: &mut F,
+) -> Result<()>
 where
     F: FnMut() -> bool,
 {
-    let locator = startup_transition_locator(config);
+    let locator = startup_transition_locator(config, game_ui.clone());
     workflow_actions::locate_template(
         &locator,
         &config.startup.templates.wonderland_enter_button,

@@ -10,6 +10,7 @@ use windows::Win32::System::Registry::{
 };
 use windows::core::w;
 
+use super::game_ui::GameUi;
 use super::ui_locator::{UiLocator, startup_locator};
 use super::window;
 use super::workflow_actions;
@@ -48,6 +49,7 @@ impl GameStartupStep {
 
 pub(super) fn start_game<F>(
     config: &AppConfig,
+    game_ui: &GameUi,
     engine: &OcrEngine,
     mut should_continue: F,
     mut on_window_detection_reset: impl FnMut(&'static str),
@@ -59,6 +61,7 @@ where
     log::info!("启动游戏流程: 启动游戏并进入游戏");
     execute_game_startup_steps(
         config,
+        game_ui,
         engine,
         &mut should_continue,
         &mut on_window_detection_reset,
@@ -69,6 +72,7 @@ where
 
 fn execute_game_startup_steps<F, W>(
     config: &AppConfig,
+    game_ui: &GameUi,
     engine: &OcrEngine,
     should_continue: &mut F,
     on_window_detection_reset: &mut W,
@@ -77,7 +81,7 @@ where
     F: FnMut() -> bool,
     W: FnMut(&'static str),
 {
-    let locator = startup_locator(config);
+    let locator = startup_locator(config, game_ui.clone());
     let mut step = GameStartupStep::EnsureGameWindow;
     let mut enter_game_deadline = None;
 

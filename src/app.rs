@@ -13,6 +13,7 @@ mod dpi;
 mod feeluown;
 mod frame_source;
 mod game_startup;
+mod game_ui;
 mod geometry;
 mod hall_info;
 mod hotkeys;
@@ -72,6 +73,7 @@ use self::deferred_chat::{
 };
 use self::feeluown::{FeelUOwnClient, PlayerStatus, format_lyrics, format_status};
 use self::frame_source::{Canvas, load_frame};
+use self::game_ui::GameUi;
 use self::geometry::{Rect, crop_canvas};
 use self::hall_info::{
     HALL_INFO_OCR_SAMPLES, HallInfo, HallInfoSample, display_or_empty,
@@ -314,6 +316,7 @@ fn run_automation_with_watchdog(config_path: &Path) -> Result<()> {
 
 pub(crate) struct AutomationApp {
     config: AppConfig,
+    game_ui: GameUi,
     runtime_state: Arc<Mutex<PersistentRuntimeState>>,
     entertainment: EntertainmentCoordinator,
     idiom_chain: Arc<Mutex<IdiomChainGame>>,
@@ -851,6 +854,7 @@ impl AutomationApp {
         song_dedup_history: PersistentSongDedupHistory,
         monitor: MonitorShared,
     ) -> Result<Self> {
+        let game_ui = GameUi::direct(config.window.clone());
         let ocr_args = OcrArgs::default().resolve(&config);
         let ocr_engine = make_ocr_engine(&ocr_args)?;
         let feeluown = FeelUOwnClient::new(&config.feeluown, &config.timing);
@@ -859,6 +863,7 @@ impl AutomationApp {
         let chat_output = ChatOutput::new(
             &config.output,
             &config.timing,
+            game_ui.clone(),
             &config.window,
             &config.screen,
             &config.templates,
@@ -901,6 +906,7 @@ impl AutomationApp {
         );
         Ok(Self {
             config,
+            game_ui,
             runtime_state,
             entertainment,
             idiom_chain,
@@ -1211,6 +1217,7 @@ impl AutomationApp {
     fn clone_for_background_task(&self) -> Self {
         Self {
             config: self.config.clone(),
+            game_ui: self.game_ui.clone(),
             runtime_state: self.runtime_state.clone(),
             entertainment: self.entertainment.clone(),
             idiom_chain: self.idiom_chain.clone(),
@@ -1410,7 +1417,7 @@ impl AutomationApp {
     }
 
     fn warn_if_screen_size_mismatch(&self) -> Result<()> {
-        let frame = match window::capture_game(&self.config.window) {
+        let frame = match self.game_ui.capture() {
             Ok(frame) => frame,
             Err(error) => {
                 log::warn!("启动时未能截图，扫描循环将等待目标窗口恢复: {error:#}");
@@ -1498,7 +1505,7 @@ impl AutomationApp {
             }
 
             let frame_started = Instant::now();
-            match load_frame(&frame_args, &canvas, &self.config.window) {
+            match load_frame(&frame_args, &canvas, &self.game_ui) {
                 Ok(frame) => {
                     if let Ok(mut latest_frame) = self.latest_frame.lock() {
                         *latest_frame = Some(Arc::clone(&frame.image));
@@ -1653,7 +1660,7 @@ impl AutomationApp {
                                     self.config.timing.chat_scan.change_debounce_ms,
                                 ));
                                 let rescan_frame_started = Instant::now();
-                                match load_frame(&frame_args, &canvas, &self.config.window) {
+                                match load_frame(&frame_args, &canvas, &self.game_ui) {
                                     Ok(frame) => {
                                         let rescan_frame_ms = elapsed_ms(rescan_frame_started);
                                         let scan_started = Instant::now();
@@ -3261,7 +3268,7 @@ impl AutomationApp {
                     &self.config.window,
                 )?;
                 sleep(Duration::from_millis(self.config.timing.input.click_ms));
-                let frame = load_frame(&frame_args, &canvas, &self.config.window)?;
+                let frame = load_frame(&frame_args, &canvas, &self.game_ui)?;
                 if !unread_hit_still_visible(&frame.image, hit) {
                     opened = true;
                     break;
@@ -3381,7 +3388,7 @@ impl AutomationApp {
             };
             let frame_args = FrameArgs { image: None };
             let templates = UiTemplateArgs::default().resolve(&self.config);
-            let frame = load_frame(&frame_args, &canvas, &self.config.window)?;
+            let frame = load_frame(&frame_args, &canvas, &self.game_ui)?;
             let mut ui_state = detect_ui_state(&frame.image, &templates, &self.config.screen)?;
             if ui_state.is_secondary() {
                 return Ok(true);
@@ -3396,7 +3403,7 @@ impl AutomationApp {
                 if !self.return_to_primary_from_transient_ui(context) {
                     continue;
                 }
-                let frame = load_frame(&frame_args, &canvas, &self.config.window)?;
+                let frame = load_frame(&frame_args, &canvas, &self.game_ui)?;
                 ui_state = detect_ui_state(&frame.image, &templates, &self.config.screen)?;
                 if !ui_state.is_primary() {
                     continue;
@@ -3410,7 +3417,7 @@ impl AutomationApp {
             );
             press_key(Key::Return, &self.config.window)?;
             sleep(Duration::from_millis(self.config.timing.input.open_chat_ms));
-            let frame = load_frame(&frame_args, &canvas, &self.config.window)?;
+            let frame = load_frame(&frame_args, &canvas, &self.game_ui)?;
             let ui_state = detect_ui_state(&frame.image, &templates, &self.config.screen)?;
             if ui_state.is_secondary() {
                 return Ok(true);
@@ -3426,7 +3433,7 @@ impl AutomationApp {
             height: self.config.screen.expected_height,
             resize: true,
         };
-        let frame = load_frame(&FrameArgs { image: None }, &canvas, &self.config.window)?;
+        let frame = load_frame(&FrameArgs { image: None }, &canvas, &self.game_ui)?;
         let templates = UiTemplateArgs::default().resolve(&self.config);
         let ui_state = detect_ui_state(&frame.image, &templates, &self.config.screen)?;
         if ui_state.is_secondary() {
@@ -3458,6 +3465,7 @@ impl AutomationApp {
         let locator = UiLocator::new(
             canvas,
             FrameArgs { image: None },
+            self.game_ui.clone(),
             self.config.window.clone(),
             self.config.timing.workflow.default_poll_ms,
         );
@@ -3495,7 +3503,7 @@ impl AutomationApp {
             height: self.config.screen.expected_height,
             resize: true,
         };
-        let frame = load_frame(&FrameArgs { image: None }, &canvas, &self.config.window)?;
+        let frame = load_frame(&FrameArgs { image: None }, &canvas, &self.game_ui)?;
         Ok(matches!(
             self.secondary_identity_from_frame(&frame.image)?,
             SecondaryChatIdentity::CurrentHall
@@ -3534,7 +3542,7 @@ impl AutomationApp {
                 height: self.config.screen.expected_height,
                 resize: true,
             };
-            let frame = load_frame(&FrameArgs { image: None }, &canvas, &self.config.window)?;
+            let frame = load_frame(&FrameArgs { image: None }, &canvas, &self.game_ui)?;
             let previous = secondary_hall_bubbles(&frame.image)?;
             return Ok(ChatDecisionReader {
                 kind: ChatDecisionReaderKind::SecondaryCurrentHall { previous },
@@ -3549,7 +3557,7 @@ impl AutomationApp {
             height: self.config.screen.expected_height,
             resize: true,
         };
-        let frame = load_frame(&FrameArgs { image: None }, &canvas, &self.config.window)?;
+        let frame = load_frame(&FrameArgs { image: None }, &canvas, &self.game_ui)?;
         let messages = self.scan_chat_with_shared_ocr(&frame.image, &template_args)?;
         Ok(ChatDecisionReader {
             kind: ChatDecisionReaderKind::Primary,
@@ -3573,7 +3581,7 @@ impl AutomationApp {
                     height: self.config.screen.expected_height,
                     resize: true,
                 };
-                let frame = load_frame(&FrameArgs { image: None }, &canvas, &self.config.window)?;
+                let frame = load_frame(&FrameArgs { image: None }, &canvas, &self.game_ui)?;
                 self.scan_chat_with_shared_ocr(&frame.image, &template_args)
             }
             ChatDecisionReaderKind::SecondaryCurrentHall { previous } => {
@@ -3591,7 +3599,7 @@ impl AutomationApp {
             height: self.config.screen.expected_height,
             resize: true,
         };
-        let frame = load_frame(&FrameArgs { image: None }, &canvas, &self.config.window)?;
+        let frame = load_frame(&FrameArgs { image: None }, &canvas, &self.game_ui)?;
         let current = secondary_hall_bubbles(&frame.image)?;
         let Some(start) = secondary_new_bubble_start(previous, &current) else {
             *previous = current;
@@ -3826,7 +3834,7 @@ impl AutomationApp {
             resize: true,
         };
         let frame_args = FrameArgs { image: None };
-        let first = load_frame(&frame_args, &canvas, &self.config.window)?;
+        let first = load_frame(&frame_args, &canvas, &self.game_ui)?;
         let mut previous = latest_incoming_fingerprint(&first.image)?;
         let mut latest_image = (*first.image).clone();
         let poll_ms = self
@@ -3839,7 +3847,7 @@ impl AutomationApp {
 
         while Instant::now() < deadline {
             sleep(Duration::from_millis(poll_ms));
-            let frame = load_frame(&frame_args, &canvas, &self.config.window)?;
+            let frame = load_frame(&frame_args, &canvas, &self.game_ui)?;
             let current = latest_incoming_fingerprint(&frame.image)?;
             if !secondary_optional_fingerprint_changed(previous.as_ref(), current.as_ref()) {
                 return Ok((*frame.image).clone());
@@ -3861,6 +3869,7 @@ impl AutomationApp {
         window_detection_signal.request("启动游戏任务开始")?;
         game_startup::start_game(
             &config,
+            &self.game_ui,
             &engine.engine,
             || running.load(AtomicOrdering::SeqCst),
             |reason| {
@@ -3877,7 +3886,9 @@ impl AutomationApp {
         let config = self.config.clone();
         let running = Arc::clone(&self.running);
         self.window_detection_signal.request("进入千星任务开始")?;
-        startup_flow::enter_wonderland(&config, || running.load(AtomicOrdering::SeqCst))?;
+        startup_flow::enter_wonderland(&config, &self.game_ui, || {
+            running.load(AtomicOrdering::SeqCst)
+        })?;
         log::info!("进入千星完成信号已确认，执行返回一级界面");
         let returned = self.return_to_primary_fixed();
         log::info!(
@@ -4053,7 +4064,7 @@ impl AutomationApp {
         let mut primary_stability_required = false;
 
         while self.running.load(AtomicOrdering::SeqCst) && Instant::now() < deadline {
-            let frame = load_frame(&frame_args, &canvas, &self.config.window)?;
+            let frame = load_frame(&frame_args, &canvas, &self.game_ui)?;
             let ui_state = detect_ui_state(&frame.image, &templates, &self.config.screen)?;
             let observation = primary_return_observation(&ui_state);
             if observation != PrimaryReturnObservation::Primary {
@@ -5272,7 +5283,7 @@ impl AutomationApp {
         let mut primary_region_stability = PrimaryRegionStability::default();
 
         while Instant::now() < deadline {
-            match load_frame(&frame_args, &canvas, &self.config.window).and_then(|frame| {
+            match load_frame(&frame_args, &canvas, &self.game_ui).and_then(|frame| {
                 let ui_state = detect_ui_state(&frame.image, &templates, &self.config.screen)?;
                 let primary_region_fingerprint = rect_chat_change_fingerprint(
                     &frame.image,
@@ -5379,7 +5390,7 @@ impl AutomationApp {
                     self.config.timing.hall.ocr_sample_interval_ms,
                 ));
             }
-            let frame = load_frame(&FrameArgs { image: None }, &canvas, &self.config.window)?;
+            let frame = load_frame(&FrameArgs { image: None }, &canvas, &self.game_ui)?;
             let sample = self.read_hall_info_sample_from_frame(&frame.image)?;
             log::info!(
                 "大厅检测 OCR 采样: {}/{} name={} time={} minutes={}",

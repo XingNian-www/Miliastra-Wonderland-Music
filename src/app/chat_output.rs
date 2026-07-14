@@ -7,6 +7,7 @@ use enigo::{Direction, Enigo, Key, Keyboard, Settings};
 
 use super::FrameArgs;
 use super::frame_source::Canvas;
+use super::game_ui::GameUi;
 use super::geometry::Rect;
 use super::input_actions;
 use super::ui_locator::UiLocator;
@@ -69,6 +70,7 @@ pub struct ChatOutput {
     enabled: bool,
     config: OutputConfig,
     timing: TimingConfig,
+    game_ui: GameUi,
     window: WindowConfig,
     canvas: Canvas,
     secondary_hall_template: PathBuf,
@@ -78,9 +80,10 @@ pub struct ChatOutput {
 }
 
 impl ChatOutput {
-    pub fn new(
+    pub(super) fn new(
         config: &OutputConfig,
         timing: &TimingConfig,
+        game_ui: GameUi,
         window: &WindowConfig,
         screen: &ScreenConfig,
         templates: &TemplateConfig,
@@ -92,6 +95,7 @@ impl ChatOutput {
             enabled: config.send_enabled,
             config: config.clone(),
             timing: timing.clone(),
+            game_ui,
             window: window.clone(),
             canvas: Canvas {
                 width: screen.expected_width,
@@ -344,6 +348,7 @@ impl ChatOutput {
         let locator = UiLocator::new(
             self.canvas.clone(),
             FrameArgs { image: None },
+            self.game_ui.clone(),
             self.window.clone(),
             self.timing.workflow.default_poll_ms,
         );

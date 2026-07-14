@@ -31,7 +31,6 @@ pub(super) struct ChatBatchSendOutcome {
 #[derive(Debug)]
 pub(super) enum ChatBatchSendStatus {
     Complete,
-    Interrupted,
     Failed(anyhow::Error),
 }
 
@@ -40,13 +39,6 @@ impl ChatBatchSendOutcome {
         Self {
             sent,
             status: ChatBatchSendStatus::Complete,
-        }
-    }
-
-    fn interrupted(sent: usize) -> Self {
-        Self {
-            sent,
-            status: ChatBatchSendStatus::Interrupted,
         }
     }
 
@@ -62,11 +54,6 @@ impl ChatBatchSendOutcome {
             ChatBatchSendStatus::Complete if self.sent == expected => Ok(()),
             ChatBatchSendStatus::Complete => Err(anyhow!(
                 "批量发送提前完成: sent={} expected={}",
-                self.sent,
-                expected
-            )),
-            ChatBatchSendStatus::Interrupted => Err(anyhow!(
-                "不可中断的批量发送意外让行: sent={} expected={}",
                 self.sent,
                 expected
             )),
@@ -160,7 +147,7 @@ impl ChatOutput {
             return Ok(());
         }
         let expected = messages.len();
-        self.send_current_chat_batch_interruptible_with_input(&messages, delay_ms, || true)
+        self.send_current_chat_batch_with_input(&messages, delay_ms)
             .into_result(expected)
     }
 
@@ -179,7 +166,7 @@ impl ChatOutput {
             return Ok(());
         }
         let expected = messages.len();
-        self.send_batch_interruptible_with_input(&messages, delay_ms, true, || true)
+        self.send_batch_with_input(&messages, delay_ms, true)
             .into_result(expected)
     }
 
@@ -197,7 +184,7 @@ impl ChatOutput {
             return Ok(());
         }
         let expected = messages.len();
-        self.send_current_chat_batch_interruptible_with_input(&messages, delay_ms, || true)
+        self.send_current_chat_batch_with_input(&messages, delay_ms)
             .into_result(expected)
     }
 
@@ -222,15 +209,14 @@ impl ChatOutput {
             return Ok(());
         }
         let expected = messages.len();
-        self.send_batch_interruptible_with_input(&messages, delay_ms, restore_after_task, || true)
+        self.send_batch_with_input(&messages, delay_ms, restore_after_task)
             .into_result(expected)
     }
 
-    pub fn send_current_chat_batch_interruptible(
+    pub fn send_current_chat_batch_outcome(
         &self,
         messages: &[&str],
         delay_ms: u64,
-        should_continue: impl FnMut() -> bool,
     ) -> ChatBatchSendOutcome {
         let messages = messages
             .iter()
@@ -245,23 +231,14 @@ impl ChatOutput {
             }
             return ChatBatchSendOutcome::complete(messages.len());
         }
-        let outcome = self.send_current_chat_batch_interruptible_with_input(
-            &messages,
-            delay_ms,
-            should_continue,
-        );
+        let outcome = self.send_current_chat_batch_with_input(&messages, delay_ms);
         for message in messages.iter().take(outcome.sent) {
             log::info!("当前聊天回复: {}", redacted_chat_text(message));
         }
         outcome
     }
 
-    pub fn send_batch_interruptible(
-        &self,
-        messages: &[&str],
-        delay_ms: u64,
-        should_continue: impl FnMut() -> bool,
-    ) -> ChatBatchSendOutcome {
+    pub fn send_batch_outcome(&self, messages: &[&str], delay_ms: u64) -> ChatBatchSendOutcome {
         let messages = messages
             .iter()
             .map(|message| fit_chat_message(message))
@@ -275,8 +252,7 @@ impl ChatOutput {
             }
             return ChatBatchSendOutcome::complete(messages.len());
         }
-        let outcome =
-            self.send_batch_interruptible_with_input(&messages, delay_ms, false, should_continue);
+        let outcome = self.send_batch_with_input(&messages, delay_ms, false);
         for message in messages.iter().take(outcome.sent) {
             log::info!("游戏内回复: {}", redacted_chat_text(message));
         }
@@ -285,27 +261,23 @@ impl ChatOutput {
 
     fn send_with_input(&self, message: &str, restore_after_task: bool) -> Result<()> {
         let messages = [message.to_string()];
-        self.send_batch_interruptible_with_input(&messages, 0, restore_after_task, || true)
+        self.send_batch_with_input(&messages, 0, restore_after_task)
             .into_result(messages.len())
     }
 
     fn send_current_chat_with_input(&self, message: &str) -> Result<()> {
         let messages = [message.to_string()];
-        self.send_current_chat_batch_interruptible_with_input(&messages, 0, || true)
+        self.send_current_chat_batch_with_input(&messages, 0)
             .into_result(messages.len())
     }
 
-    fn send_current_chat_batch_interruptible_with_input(
+    fn send_current_chat_batch_with_input(
         &self,
         messages: &[String],
         delay_ms: u64,
-        mut should_continue: impl FnMut() -> bool,
     ) -> ChatBatchSendOutcome {
         if messages.is_empty() {
             return ChatBatchSendOutcome::complete(0);
-        }
-        if !should_continue() {
-            return ChatBatchSendOutcome::interrupted(0);
         }
 
         let mut enigo = match Enigo::new(&Settings::default()).context("create enigo") {
@@ -320,7 +292,7 @@ impl ChatOutput {
             return ChatBatchSendOutcome::failed(0, error);
         }
 
-        send_messages_interruptibly(messages, delay_ms, should_continue, |message| {
+        send_messages(messages, delay_ms, |message| {
             (|| -> Result<()> {
                 window.click(&mut enigo, self.config.chat_click_2)?;
                 sleep_ms(self.timing.input.click_ms);
@@ -334,18 +306,14 @@ impl ChatOutput {
         })
     }
 
-    fn send_batch_interruptible_with_input(
+    fn send_batch_with_input(
         &self,
         messages: &[String],
         delay_ms: u64,
         restore_after_task: bool,
-        mut should_continue: impl FnMut() -> bool,
     ) -> ChatBatchSendOutcome {
         if messages.is_empty() {
             return ChatBatchSendOutcome::complete(0);
-        }
-        if !should_continue() {
-            return ChatBatchSendOutcome::interrupted(0);
         }
 
         let mut enigo = match Enigo::new(&Settings::default()).context("create enigo") {
@@ -384,7 +352,7 @@ impl ChatOutput {
                 scroll_length: -8,
                 settle_ms: self.timing.input.click_ms,
             },
-            &mut should_continue,
+            || true,
         );
         match hall_hit {
             Ok(Some(_)) => sleep_ms(self.timing.input.click_ms),
@@ -394,7 +362,7 @@ impl ChatOutput {
             Err(error) => return ChatBatchSendOutcome::failed(0, error),
         }
 
-        let outcome = send_messages_interruptibly(messages, delay_ms, should_continue, |message| {
+        let outcome = send_messages(messages, delay_ms, |message| {
             (|| -> Result<()> {
                 window.click(&mut enigo, self.config.chat_click_2)?;
                 sleep_ms(self.timing.input.open_chat_ms);
@@ -415,12 +383,6 @@ impl ChatOutput {
                 Ok(()) => ChatBatchSendOutcome::complete(sent),
                 Err(error) => ChatBatchSendOutcome::failed(sent, error),
             },
-            ChatBatchSendStatus::Interrupted => {
-                match self.close_batch_chat(&mut enigo, &mut window) {
-                    Ok(()) => ChatBatchSendOutcome::interrupted(sent),
-                    Err(error) => ChatBatchSendOutcome::failed(sent, error),
-                }
-            }
             ChatBatchSendStatus::Failed(error) => {
                 if let Err(close_error) = self.close_batch_chat(&mut enigo, &mut window) {
                     log::error!("批量回复失败后关闭聊天界面也失败: {close_error:#}");
@@ -470,22 +432,15 @@ fn sleep_ms(ms: u64) {
     sleep(Duration::from_millis(ms));
 }
 
-fn send_messages_interruptibly<T>(
+fn send_messages<T>(
     messages: &[T],
     delay_ms: u64,
-    mut should_continue: impl FnMut() -> bool,
     mut send_one: impl FnMut(&T) -> Result<()>,
 ) -> ChatBatchSendOutcome {
     let mut sent = 0;
     for (index, message) in messages.iter().enumerate() {
-        if !should_continue() {
-            return ChatBatchSendOutcome::interrupted(sent);
-        }
         if index > 0 && delay_ms > 0 {
             sleep_ms(delay_ms);
-            if !should_continue() {
-                return ChatBatchSendOutcome::interrupted(sent);
-            }
         }
         if let Err(error) = send_one(message) {
             return ChatBatchSendOutcome::failed(sent, error);
@@ -853,46 +808,32 @@ mod tests {
     }
 
     #[test]
-    fn interruptible_batch_yields_before_the_next_message() {
+    fn batch_sends_every_message_without_a_yield_point() {
         let messages = ["第一段", "第二段", "第三段"];
-        let mut checks = 0;
         let mut delivered = Vec::new();
 
-        let outcome = send_messages_interruptibly(
-            &messages,
-            0,
-            || {
-                checks += 1;
-                checks == 1
-            },
-            |message| {
-                delivered.push(*message);
-                Ok(())
-            },
-        );
+        let outcome = send_messages(&messages, 0, |message| {
+            delivered.push(*message);
+            Ok(())
+        });
 
-        assert_eq!(outcome.sent, 1);
-        assert!(matches!(outcome.status, ChatBatchSendStatus::Interrupted));
-        assert_eq!(delivered, vec!["第一段"]);
+        assert_eq!(outcome.sent, 3);
+        assert!(matches!(outcome.status, ChatBatchSendStatus::Complete));
+        assert_eq!(delivered, messages);
     }
 
     #[test]
-    fn interruptible_batch_reports_partial_success_before_failure() {
+    fn batch_reports_partial_success_before_failure() {
         let messages = ["第一段", "第二段", "第三段"];
         let mut delivered = Vec::new();
 
-        let outcome = send_messages_interruptibly(
-            &messages,
-            0,
-            || true,
-            |message| {
-                if *message == "第二段" {
-                    return Err(anyhow::anyhow!("模拟发送失败"));
-                }
-                delivered.push(*message);
-                Ok(())
-            },
-        );
+        let outcome = send_messages(&messages, 0, |message| {
+            if *message == "第二段" {
+                return Err(anyhow::anyhow!("模拟发送失败"));
+            }
+            delivered.push(*message);
+            Ok(())
+        });
 
         assert_eq!(outcome.sent, 1);
         assert!(matches!(outcome.status, ChatBatchSendStatus::Failed(_)));

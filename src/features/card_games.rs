@@ -1955,8 +1955,8 @@ impl SplitMix64 {
 
 #[cfg(test)]
 mod tests {
-    use super::super::chat_output::{MAX_CHAT_WIDTH, display_width};
     use super::*;
+    use crate::app::chat_output::{MAX_CHAT_WIDTH, display_width};
 
     fn ranks(text: &str) -> Vec<Rank> {
         parse_cards(text).unwrap()

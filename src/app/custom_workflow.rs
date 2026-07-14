@@ -1,7 +1,6 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering as AtomicOrdering;
-use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -97,30 +96,6 @@ impl WorkflowContext {
             username: parsed.username.clone(),
             message_type: parsed.message_type.clone(),
             user_command: parsed.user_command.clone(),
-        }
-    }
-}
-
-struct ModerationWorkflowRelease {
-    workflows: Arc<Mutex<HashSet<String>>>,
-    key: String,
-}
-
-impl ModerationWorkflowRelease {
-    fn new(workflows: Arc<Mutex<HashSet<String>>>, key: String) -> Self {
-        Self { workflows, key }
-    }
-}
-
-impl Drop for ModerationWorkflowRelease {
-    fn drop(&mut self) {
-        match self.workflows.lock() {
-            Ok(mut workflows) => {
-                workflows.remove(&self.key);
-            }
-            Err(_) => {
-                log::error!("moderation_workflows mutex poisoned");
-            }
         }
     }
 }
@@ -764,24 +739,18 @@ impl AutomationApp {
         command: &command::ModerationCommand,
     ) -> Result<bool> {
         let workflow_key = moderation_workflow_key(command);
-        {
-            let mut workflows = self
-                .moderation_workflows
-                .lock()
-                .map_err(|_| anyhow!("moderation_workflows mutex poisoned"))?;
-            if !workflows.insert(workflow_key.clone()) {
-                log::info!(
-                    "{} UID{} 已有投票或执行流程，跳过重复请求",
-                    command.action.label(),
-                    command.uid
-                );
-                self.reply(&format!(
-                    "@UID{}的{}请求正在处理中",
-                    command.uid,
-                    command.action.label()
-                ))?;
-                return Ok(false);
-            }
+        if !self.moderation.begin(&workflow_key)? {
+            log::info!(
+                "{} UID{} 已有投票或执行流程，跳过重复请求",
+                command.action.label(),
+                command.uid
+            );
+            self.reply(&format!(
+                "@UID{}的{}请求正在处理中",
+                command.uid,
+                command.action.label()
+            ))?;
+            return Ok(false);
         }
         let vote_timeout_seconds = self
             .config
@@ -818,14 +787,7 @@ impl AutomationApp {
     }
 
     fn release_moderation_workflow(&self, key: &str) {
-        match self.moderation_workflows.lock() {
-            Ok(mut workflows) => {
-                workflows.remove(key);
-            }
-            Err(_) => {
-                log::error!("moderation_workflows mutex poisoned");
-            }
-        }
+        self.moderation.release_best_effort(key);
     }
 
     fn spawn_moderation_vote(
@@ -924,8 +886,7 @@ impl AutomationApp {
             }
         }
 
-        let _workflow_release =
-            ModerationWorkflowRelease::new(self.moderation_workflows.clone(), workflow_key);
+        let _workflow_release = self.moderation.release_guard(workflow_key);
         if !approved {
             temporary_primary_hold.release();
             self.update_monitor_chat_listener();

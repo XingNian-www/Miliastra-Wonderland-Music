@@ -42,7 +42,7 @@ mod web_tools;
 mod window;
 mod workflow_actions;
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -117,6 +117,7 @@ use crate::features::entertainment::{AcquireOutcome, EntertainmentKind};
 use crate::features::idiom_chain;
 use crate::features::idiom_chain::IdiomChainService;
 use crate::features::invite::InviteService;
+use crate::features::moderation::ModerationService;
 use crate::features::turtle_soup::{
     self, QuestionSubmitOutcome, SecondaryOcrObservation, SecondaryOcrStability, TurtleSoupService,
 };
@@ -385,7 +386,7 @@ pub(crate) struct AutomationApp {
     screen_lock_primed: Arc<AtomicBool>,
     reset_locks_requested: Arc<AtomicBool>,
     invite: InviteService,
-    moderation_workflows: Arc<Mutex<HashSet<String>>>,
+    moderation: ModerationService,
     commands_enabled: Arc<AtomicBool>,
     idle_exit: Arc<Mutex<Option<IdleExitState>>>,
     running: Arc<AtomicBool>,
@@ -949,7 +950,7 @@ impl AutomationApp {
             screen_lock_primed: Arc::new(AtomicBool::new(false)),
             reset_locks_requested: Arc::new(AtomicBool::new(false)),
             invite: InviteService::new(),
-            moderation_workflows: Arc::new(Mutex::new(HashSet::new())),
+            moderation: ModerationService::new(),
             commands_enabled: Arc::new(AtomicBool::new(true)),
             idle_exit: Arc::new(Mutex::new(None)),
             running: Arc::new(AtomicBool::new(true)),
@@ -1268,7 +1269,7 @@ impl AutomationApp {
             screen_lock_primed: self.screen_lock_primed.clone(),
             reset_locks_requested: self.reset_locks_requested.clone(),
             invite: self.invite.clone(),
-            moderation_workflows: self.moderation_workflows.clone(),
+            moderation: self.moderation.clone(),
             commands_enabled: self.commands_enabled.clone(),
             idle_exit: self.idle_exit.clone(),
             running: self.running.clone(),
@@ -1414,7 +1415,7 @@ impl AutomationApp {
             self.monitor.clone(),
             self.task_tracker.clone(),
             self.decision_control.clone(),
-            self.moderation_workflows.clone(),
+            self.moderation.clone(),
             self.web_tools.clone(),
             self.latest_frame.clone(),
         ))

@@ -16,6 +16,7 @@ use super::{
     TemporaryPrimaryHold, TrackedPendingTask, UiResidency,
 };
 use crate::config::{self, CustomWorkflowConfig, CustomWorkflowDefinition, PointConfig};
+use crate::features::invite::{InviteDecision, InviteExecutionPort};
 use anyhow::{Result, anyhow, bail};
 
 pub(super) fn parse_text(
@@ -415,7 +416,7 @@ impl AutomationApp {
                 if target.is_empty() {
                     return Err(anyhow!("custom workflow invite step missing target"));
                 }
-                self.execute_invite_with_announce(&target, None).map(|_| ())
+                self.invite.execute(&target, None, self).map(|_| ())
             }
             "return_primary" | "ensure_primary" => {
                 self.ensure_ui_residency(UiResidency::Primary, "自定义流程要求一级界面")
@@ -609,54 +610,6 @@ impl AutomationApp {
             self.workflow_stability(timeout_ms),
             || self.running.load(AtomicOrdering::SeqCst),
         )
-    }
-
-    pub(super) fn execute_invite_with_announce(
-        &mut self,
-        username: &str,
-        password: Option<&str>,
-    ) -> Result<bool> {
-        log::info!("邀请: 先检测是否公共大厅");
-        if self.check_public_hall()? {
-            log::info!("邀请: 当前在公共大厅，直接执行");
-            let friend_chat_open = self.notify_friend_invite_decision(
-                username,
-                "已同意加入大厅,请等待BOT进入大厅并发送就绪信息后再开启麦克风",
-                true,
-            );
-            return self.execute_invite(username, password, friend_chat_open);
-        }
-        let announce = format!(
-            "{}邀请BOT前往大厅,30s内@邀请确认@邀请拒绝,默认通过",
-            username
-        );
-        if let Err(error) = self.reply(&announce) {
-            log::error!("邀请通告发送失败，直接执行邀请: {error:#}");
-            return self.execute_invite(username, password, false);
-        }
-        match self.wait_for_invite_decision()? {
-            Some(true) => {
-                let friend_chat_open = self.notify_friend_invite_decision(
-                    username,
-                    "已同意加入大厅,请等待BOT进入大厅并发送就绪信息后再开启麦克风",
-                    true,
-                );
-                self.execute_invite(username, password, friend_chat_open)
-            }
-            None => {
-                let friend_chat_open = self.notify_friend_invite_decision(
-                    username,
-                    "已默认同意加入大厅,请等待BOT进入大厅并发送就绪信息后再开启麦克风",
-                    true,
-                );
-                self.execute_invite(username, password, friend_chat_open)
-            }
-            Some(false) => {
-                log::info!("收到邀请拒绝，取消邀请");
-                self.notify_friend_invite_decision(username, "大厅成员已拒绝邀请", false);
-                Ok(false)
-            }
-        }
     }
 
     fn notify_friend_invite_decision(
@@ -1619,6 +1572,37 @@ impl AutomationApp {
             required_streak
         );
         Ok(false)
+    }
+}
+
+impl InviteExecutionPort for AutomationApp {
+    fn is_public_hall(&self) -> Result<bool> {
+        self.check_public_hall()
+    }
+
+    fn notify_friend(&self, username: &str, message: &str, keep_chat_open: bool) -> bool {
+        self.notify_friend_invite_decision(username, message, keep_chat_open)
+    }
+
+    fn send_hall(&self, message: &str) -> Result<()> {
+        self.reply(message)
+    }
+
+    fn wait_for_decision(&self) -> Result<InviteDecision> {
+        Ok(match self.wait_for_invite_decision()? {
+            Some(true) => InviteDecision::Approve,
+            Some(false) => InviteDecision::Reject,
+            None => InviteDecision::Timeout,
+        })
+    }
+
+    fn run_invite_ui(
+        &self,
+        username: &str,
+        password: Option<&str>,
+        friend_chat_open: bool,
+    ) -> Result<bool> {
+        self.execute_invite(username, password, friend_chat_open)
     }
 }
 

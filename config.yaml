@@ -373,7 +373,7 @@ idiom_chain:
   idle_timeout_seconds: 300
   # false 时开局玩家不能连续接词
   allow_consecutive_player: false
-  # false 时仅开局玩家可使用 @接龙 结束
+  # false 时仅开局玩家可使用 #结束
   allow_anyone_stop: false
 
 landlord:
@@ -385,7 +385,7 @@ landlord:
   turn_timeout_seconds: 90
   # 连续超时多少次后进入自动托管
   trustee_after_timeouts: 2
-  # 好友私聊 @手牌 的单人查询冷却
+  # 好友私聊 #手牌 的单人查询冷却
   hand_cooldown_seconds: 10
 
 # 谁是卧底默认关闭；启用前复制 undercover.example.yaml 为 undercover.yaml 并审核词对
@@ -398,8 +398,9 @@ undercover:
   max_players: 11
   lobby_timeout_seconds: 180
   phase_timeout_seconds: 180
+  # 投票阶段公布未投票位置的间隔，单位秒
   progress_interval_seconds: 20
-  progress_batch_size: 3
+  # 单条公屏 #内容 的最大显示宽度
   description_max_width: 70
 turtle_soup:
   # 海龟汤娱乐模块默认关闭；启用前必须准备正式题库并配置独立 AI Provider

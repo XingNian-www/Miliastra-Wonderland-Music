@@ -514,11 +514,19 @@ fn contains_undercover_private_input(message: &str) -> bool {
             &message[index + message[index..].chars().next().map_or(0, char::len_utf8)..]
         })
         .trim_start_matches(['：', ':', ' ', '\t', ']', '】']);
-    let Some(command) = body.strip_prefix('@') else {
+    let Some(command) = body.strip_prefix('#').or_else(|| body.strip_prefix('＃')) else {
         return false;
     };
-    let command = command.trim_start();
-    command.starts_with("描述") || command.starts_with('投')
+    let command = command
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>();
+    let vote = command.strip_prefix('投').unwrap_or(&command);
+    let mut chars = vote.chars();
+    chars
+        .next()
+        .is_some_and(|position| ('A'..='K').contains(&position.to_ascii_uppercase()))
+        && chars.next().is_none()
 }
 
 fn contains_turtle_soup_bottom_marker(message: &str) -> bool {
@@ -830,20 +838,17 @@ mod tests {
             "[谁是卧底秘密内容已隐藏]"
         );
         assert_eq!(
-            redacted_chat_text("A、B描述已记录（2/4）"),
-            "A、B描述已记录（2/4）"
+            redacted_chat_text("[玩家]：#一种常见的水果"),
+            "[玩家]：#一种常见的水果"
         );
         assert_eq!(
-            redacted_chat_text("[玩家]：@描述 一种常见的水果"),
+            redacted_chat_text("[玩家]：#投 C"),
             REDACTED_UNDERCOVER_INPUT
         );
+        assert_eq!(redacted_chat_text("[玩家]：＃c"), REDACTED_UNDERCOVER_INPUT);
         assert_eq!(
-            redacted_chat_text("[玩家]：@投 C"),
-            REDACTED_UNDERCOVER_INPUT
-        );
-        assert_eq!(
-            redacted_chat_text("请存活玩家好友私聊 @投 A"),
-            "请存活玩家好友私聊 @投 A"
+            redacted_chat_text("请存活玩家好友私聊 #A"),
+            "请存活玩家好友私聊 #A"
         );
     }
 

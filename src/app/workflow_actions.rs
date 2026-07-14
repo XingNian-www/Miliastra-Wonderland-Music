@@ -4,13 +4,15 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 
+use super::chat_listener::latest_incoming_sender_rect;
+use super::command;
 use super::config::{PointConfig, RectConfig, WindowConfig};
-use super::geometry::{Point, Rect};
+use super::geometry::{Point, Rect, crop_canvas};
 use super::input_actions::{
     activate_game, click_game_point, focus_game, hold_key, parse_key, paste_text, press_key,
 };
 use super::template_match::TemplateHit;
-use super::ui_locator::{UiLocator, UiRegion};
+use super::ui_locator::{UiLocator, UiRegion, text_contains_complete_target};
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum TemplateMode {
@@ -125,6 +127,64 @@ pub(super) fn paste(
         text.chars().count()
     );
     result
+}
+
+pub(super) fn wait_latest_incoming_sender_match<R, F>(
+    locator: &UiLocator,
+    expected: &str,
+    stable_count: u32,
+    timeout_ms: u64,
+    mut recognize_sender: R,
+    mut should_continue: F,
+) -> Result<bool>
+where
+    R: FnMut(&image::DynamicImage) -> Result<String>,
+    F: FnMut() -> bool,
+{
+    let started = Instant::now();
+    let deadline = started + Duration::from_millis(timeout_ms);
+    let required_streak = stable_count.max(1);
+    let expected = command::normalize_lock_text(expected);
+    let mut streak = 0_u32;
+    while Instant::now() < deadline && should_continue() {
+        let frame = locator.capture()?;
+        let recognized = if let Some(rect) = latest_incoming_sender_rect(&frame.image) {
+            let crop = crop_canvas(&frame.image, rect)?;
+            recognize_sender(&crop)?
+        } else {
+            String::new()
+        };
+        let normalized = command::normalize_lock_text(&recognized);
+        if text_contains_complete_target(&normalized, &expected) {
+            streak = streak.saturating_add(1);
+            if streak >= required_streak {
+                log::info!(target: "timing",
+                    "原子动作耗时: action=wait_latest_incoming_sender total={}ms timeout={}ms samples={} matched=true",
+                    elapsed_ms(started),
+                    timeout_ms,
+                    required_streak
+                );
+                return Ok(true);
+            }
+        } else {
+            streak = 0;
+        }
+        log::debug!(
+            "二级好友消息标题识别: target={} recognized={} streak={}/{}",
+            expected,
+            recognized,
+            streak,
+            required_streak
+        );
+        wait(locator.poll_ms());
+    }
+    log::info!(target: "timing",
+        "原子动作耗时: action=wait_latest_incoming_sender total={}ms timeout={}ms samples={} matched=false",
+        elapsed_ms(started),
+        timeout_ms,
+        required_streak
+    );
+    Ok(false)
 }
 
 pub(super) fn hold_key_text<F>(

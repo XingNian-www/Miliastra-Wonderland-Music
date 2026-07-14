@@ -719,18 +719,6 @@ fn idiom_command_requires_executor(command: &idiom_chain::IdiomChainCommand) -> 
     matches!(command, idiom_chain::IdiomChainCommand::Explain(_))
 }
 
-fn landlord_command_requires_executor(command: &LandlordCommand) -> bool {
-    matches!(
-        command,
-        LandlordCommand::Start
-            | LandlordCommand::RunFastStart
-            | LandlordCommand::Join
-            | LandlordCommand::Rob
-            | LandlordCommand::Decline
-            | LandlordCommand::Hand
-    )
-}
-
 fn tick_undercover_game(
     game: &Arc<Mutex<UndercoverGame>>,
     entertainment: &EntertainmentCoordinator,
@@ -2380,26 +2368,21 @@ impl AutomationApp {
         let UserCommand::Landlord(command) = &parsed.command else {
             return Ok(false);
         };
-        if landlord_command_requires_executor(command) {
+        if command.requires_executor() {
             return Ok(false);
         }
         let outcome = self
             .landlord
             .handle(&parsed.username, command, Instant::now())?;
-        self.finish_landlord_outcome(outcome)?;
+        if let Some(reply) = outcome.public_reply {
+            self.enqueue_current_hall_reply(&reply)?;
+        }
         log::info!(
             "牌局命令已处理: command={} user={}",
             parsed.raw,
             parsed.username
         );
         Ok(true)
-    }
-
-    fn finish_landlord_outcome(&self, outcome: LandlordOutcome) -> Result<()> {
-        if let Some(reply) = outcome.public_reply {
-            self.enqueue_current_hall_reply(&reply)?;
-        }
-        Ok(())
     }
 
     fn handle_turtle_soup_command(&self, parsed: &ParsedCommand) -> Result<bool> {
@@ -5593,10 +5576,11 @@ impl AutomationApp {
     fn execute_landlord_command(&self, player: &str, command: &LandlordCommand) -> Result<()> {
         match command {
             LandlordCommand::Start | LandlordCommand::RunFastStart => {
-                let kind = match self.landlord.prepare_start(command)? {
-                    CardGameStartGate::Ready { kind } => kind,
+                let reservation = match self.landlord.prepare_start(command)? {
+                    CardGameStartGate::Ready { reservation } => reservation,
                     CardGameStartGate::Reply(reply) => return self.reply(&reply),
                 };
+                let kind = reservation.kind();
                 let label = kind.label();
                 let verified = match self.send_unique_friend_message(
                     player,
@@ -5604,17 +5588,19 @@ impl AutomationApp {
                 ) {
                     Ok(verified) => verified,
                     Err(error) => {
-                        self.landlord.cancel_start(kind);
+                        if let Err(cancel_error) = self.landlord.cancel_start(reservation) {
+                            log::error!("好友验证失败后无法取消牌局预留: {cancel_error:#}");
+                        }
                         return Err(error);
                     }
                 };
                 if !verified {
-                    self.landlord.cancel_start(kind);
+                    self.landlord.cancel_start(reservation)?;
                     return self.reply(&format!("{}报名失败：好友列表未找到唯一昵称", label));
                 }
-                let outcome = self
-                    .landlord
-                    .complete_start(player, command, Instant::now())?;
+                let outcome =
+                    self.landlord
+                        .complete_start(player, command, reservation, Instant::now())?;
                 self.deliver_landlord_task_outcome(outcome)
             }
             LandlordCommand::Join => {
@@ -5658,16 +5644,16 @@ impl AutomationApp {
     }
 
     fn deliver_landlord_task_outcome(&self, outcome: LandlordOutcome) -> Result<()> {
-        self.landlord.finish_delivery(&outcome);
+        self.landlord.begin_delivery(&outcome);
         for delivery in outcome.private_deliveries {
             match self.send_friend_message(&delivery.player, &delivery.message) {
                 Ok(true) => {}
                 Ok(false) => {
-                    self.abort_card_game_after_delivery_failure()?;
+                    self.landlord.abort()?;
                     return Err(anyhow!("牌局发牌失败：好友列表未找到 {}", delivery.player));
                 }
                 Err(error) => {
-                    self.abort_card_game_after_delivery_failure()?;
+                    self.landlord.abort()?;
                     return Err(error);
                 }
             }
@@ -5675,11 +5661,6 @@ impl AutomationApp {
         if let Some(reply) = outcome.public_reply {
             self.reply(&reply)?;
         }
-        Ok(())
-    }
-
-    fn abort_card_game_after_delivery_failure(&self) -> Result<()> {
-        self.landlord.abort()?;
         Ok(())
     }
 
@@ -6881,20 +6862,14 @@ mod tests {
 
     #[test]
     fn landlord_uses_executor_only_for_friend_ui_operations() {
-        assert!(landlord_command_requires_executor(&LandlordCommand::Start));
-        assert!(landlord_command_requires_executor(
-            &LandlordCommand::RunFastStart
-        ));
-        assert!(landlord_command_requires_executor(&LandlordCommand::Join));
-        assert!(landlord_command_requires_executor(&LandlordCommand::Hand));
-        assert!(landlord_command_requires_executor(&LandlordCommand::Rob));
-        assert!(landlord_command_requires_executor(
-            &LandlordCommand::Decline
-        ));
-        assert!(!landlord_command_requires_executor(&LandlordCommand::Play(
-            "3".to_string()
-        )));
-        assert!(!landlord_command_requires_executor(&LandlordCommand::Pass));
+        assert!(LandlordCommand::Start.requires_executor());
+        assert!(LandlordCommand::RunFastStart.requires_executor());
+        assert!(LandlordCommand::Join.requires_executor());
+        assert!(LandlordCommand::Hand.requires_executor());
+        assert!(LandlordCommand::Rob.requires_executor());
+        assert!(LandlordCommand::Decline.requires_executor());
+        assert!(!LandlordCommand::Play("3".to_string()).requires_executor());
+        assert!(!LandlordCommand::Pass.requires_executor());
     }
 
     #[test]

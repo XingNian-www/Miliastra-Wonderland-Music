@@ -43,6 +43,19 @@ pub enum LandlordCommand {
     Exit,
 }
 
+impl LandlordCommand {
+    pub(crate) fn requires_executor(&self) -> bool {
+        matches!(
+            self,
+            Self::Start | Self::RunFastStart | Self::Join | Self::Rob | Self::Decline | Self::Hand
+        )
+    }
+
+    fn reports_entertainment_conflict(&self) -> bool {
+        matches!(self, Self::Play(_) | Self::Pass | Self::Exit)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LandlordOutcome {
     pub action: &'static str,
@@ -103,13 +116,33 @@ pub struct LandlordGame {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CardGameStartGate {
-    Ready { kind: EntertainmentKind },
+    Ready {
+        reservation: CardGameStartReservation,
+    },
     Reply(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CardGameStartReservation {
+    token: u64,
+    kind: EntertainmentKind,
+}
+
+impl CardGameStartReservation {
+    pub fn kind(self) -> EntertainmentKind {
+        self.kind
+    }
+}
+
+struct CardGameState {
+    game: LandlordGame,
+    pending_start: Option<CardGameStartReservation>,
+    next_reservation_token: u64,
 }
 
 #[derive(Clone)]
 pub struct CardGameService {
-    game: Arc<Mutex<LandlordGame>>,
+    state: Arc<Mutex<CardGameState>>,
     entertainment: EntertainmentCoordinator,
     enabled: bool,
 }
@@ -118,7 +151,11 @@ impl CardGameService {
     pub fn new(config: LandlordConfig, entertainment: EntertainmentCoordinator) -> Self {
         let enabled = config.enabled;
         Self {
-            game: Arc::new(Mutex::new(LandlordGame::new(config))),
+            state: Arc::new(Mutex::new(CardGameState {
+                game: LandlordGame::new(config),
+                pending_start: None,
+                next_reservation_token: 1,
+            })),
             entertainment,
             enabled,
         }
@@ -130,12 +167,22 @@ impl CardGameService {
         if !self.enabled {
             return Ok(CardGameStartGate::Reply(format!("{}未启用", label)));
         }
-        if self.is_active()? {
+        let mut state = self.state()?;
+        if state.game.is_active() || state.pending_start.is_some() {
             return Ok(CardGameStartGate::Reply("已有牌局或房间进行中".to_string()));
         }
         match self.entertainment.try_acquire(kind)? {
-            AcquireOutcome::Acquired | AcquireOutcome::AlreadyOwned => {
-                Ok(CardGameStartGate::Ready { kind })
+            AcquireOutcome::Acquired => {
+                let reservation = CardGameStartReservation {
+                    token: state.next_reservation_token,
+                    kind,
+                };
+                state.next_reservation_token = state.next_reservation_token.wrapping_add(1).max(1);
+                state.pending_start = Some(reservation);
+                Ok(CardGameStartGate::Ready { reservation })
+            }
+            AcquireOutcome::AlreadyOwned => {
+                Ok(CardGameStartGate::Reply("已有牌局或房间进行中".to_string()))
             }
             AcquireOutcome::Occupied(active) => Ok(CardGameStartGate::Reply(format!(
                 "{}正在进行，请结束后再开始{}",
@@ -145,18 +192,41 @@ impl CardGameService {
         }
     }
 
-    pub fn cancel_start(&self, kind: EntertainmentKind) {
-        self.entertainment.release(kind);
+    pub fn cancel_start(&self, reservation: CardGameStartReservation) -> Result<bool> {
+        let cancelled = {
+            let mut state = self.state()?;
+            if state.pending_start == Some(reservation) {
+                state.pending_start = None;
+                true
+            } else {
+                false
+            }
+        };
+        if cancelled {
+            self.entertainment.release(reservation.kind);
+        }
+        Ok(cancelled)
     }
 
     pub fn complete_start(
         &self,
         player: &str,
         command: &LandlordCommand,
+        reservation: CardGameStartReservation,
         now: Instant,
     ) -> Result<LandlordOutcome> {
         let kind = card_game_kind(command)?;
-        let outcome = self.game()?.handle(player, command, now);
+        if reservation.kind != kind {
+            bail!("card game start reservation does not match command");
+        }
+        let outcome = {
+            let mut state = self.state()?;
+            if state.pending_start != Some(reservation) {
+                bail!("card game start reservation is no longer active");
+            }
+            state.pending_start = None;
+            state.game.handle(player, command, now)
+        };
         if outcome.action != "created" {
             self.entertainment.release(kind);
         }
@@ -170,26 +240,30 @@ impl CardGameService {
         command: &LandlordCommand,
         now: Instant,
     ) -> Result<LandlordOutcome> {
-        if let Some(active) = self.entertainment.active()
+        if command.reports_entertainment_conflict()
+            && let Some(active) = self.entertainment.active()
             && !is_card_game_kind(active)
-            && !matches!(command, LandlordCommand::Status)
         {
             return Ok(LandlordOutcome::public(
                 "occupied",
                 format!("{}正在进行，请结束后再开始牌局", active.label()),
             ));
         }
-        let outcome = self.game()?.handle(player, command, now);
+        let outcome = self.state()?.game.handle(player, command, now);
         self.finish_outcome(&outcome);
         Ok(outcome)
     }
 
     pub fn tick(&self, now: Instant, clock_active: bool) -> Result<Option<LandlordOutcome>> {
-        Ok(self.game()?.tick(now, clock_active))
+        Ok(self.state()?.game.tick(now, clock_active))
     }
 
     pub fn abort(&self) -> Result<bool> {
-        let aborted = self.game()?.abort();
+        let aborted = {
+            let mut state = self.state()?;
+            let pending = state.pending_start.take().is_some();
+            state.game.abort() || pending
+        };
         let reserved = self.entertainment.active().is_some_and(is_card_game_kind);
         if aborted || reserved {
             self.release_active_card_game();
@@ -197,8 +271,10 @@ impl CardGameService {
         Ok(aborted || reserved)
     }
 
-    pub fn is_active(&self) -> Result<bool> {
-        Ok(self.game()?.is_active())
+    #[cfg(test)]
+    fn is_active(&self) -> Result<bool> {
+        let state = self.state()?;
+        Ok(state.game.is_active() || state.pending_start.is_some())
     }
 
     pub fn lobby_kind_for_join(&self, player: &str) -> Result<Option<EntertainmentKind>> {
@@ -206,16 +282,16 @@ impl CardGameService {
             .entertainment
             .active()
             .filter(|kind| is_card_game_kind(*kind));
-        let game = self.game()?;
-        Ok(active.filter(|_| game.is_lobby() && !game.lobby_contains(player)))
+        let state = self.state()?;
+        Ok(active.filter(|_| state.game.is_lobby() && !state.game.lobby_contains(player)))
     }
 
     pub fn retry_hand_delivery(&self, player: &str) -> Result<()> {
-        self.game()?.retry_hand_delivery(player);
+        self.state()?.game.retry_hand_delivery(player);
         Ok(())
     }
 
-    pub fn finish_delivery(&self, outcome: &LandlordOutcome) {
+    pub fn begin_delivery(&self, outcome: &LandlordOutcome) {
         self.finish_outcome(outcome);
     }
 
@@ -235,8 +311,8 @@ impl CardGameService {
         }
     }
 
-    fn game(&self) -> Result<MutexGuard<'_, LandlordGame>> {
-        self.game
+    fn state(&self) -> Result<MutexGuard<'_, CardGameState>> {
+        self.state
             .lock()
             .map_err(|_| anyhow!("landlord mutex poisoned"))
     }
@@ -2127,15 +2203,45 @@ mod tests {
         let gate = service
             .prepare_start(&LandlordCommand::Start)
             .expect("start preparation should succeed");
-        let CardGameStartGate::Ready { kind } = gate else {
+        let CardGameStartGate::Ready { reservation } = gate else {
             panic!("enabled idle game should reserve a start");
         };
-        assert_eq!(kind, EntertainmentKind::Landlord);
+        assert_eq!(reservation.kind(), EntertainmentKind::Landlord);
 
-        service.cancel_start(kind);
+        assert!(service.cancel_start(reservation).unwrap());
 
         assert_eq!(entertainment.active(), None);
         assert!(!service.is_active().unwrap());
+    }
+
+    #[test]
+    fn application_service_start_reservations_cannot_cancel_each_other() {
+        let entertainment = EntertainmentCoordinator::new();
+        let service = CardGameService::new(LandlordConfig::default(), entertainment.clone());
+
+        let CardGameStartGate::Ready { reservation: first } =
+            service.prepare_start(&LandlordCommand::Start).unwrap()
+        else {
+            panic!("first start should reserve the game");
+        };
+        assert!(matches!(
+            service.prepare_start(&LandlordCommand::Start).unwrap(),
+            CardGameStartGate::Reply(_)
+        ));
+        assert!(service.cancel_start(first).unwrap());
+
+        let CardGameStartGate::Ready {
+            reservation: second,
+        } = service.prepare_start(&LandlordCommand::Start).unwrap()
+        else {
+            panic!("new start should reserve the released game");
+        };
+        assert!(!service.cancel_start(first).unwrap());
+        assert_eq!(entertainment.active(), Some(EntertainmentKind::Landlord));
+        assert!(service.is_active().unwrap());
+
+        assert!(service.cancel_start(second).unwrap());
+        assert_eq!(entertainment.active(), None);
     }
 
     #[test]
@@ -2159,6 +2265,26 @@ mod tests {
     }
 
     #[test]
+    fn application_service_preserves_executor_command_behavior_during_other_entertainment() {
+        let entertainment = EntertainmentCoordinator::new();
+        entertainment
+            .try_acquire(EntertainmentKind::Undercover)
+            .unwrap();
+        let service = CardGameService::new(LandlordConfig::default(), entertainment);
+        let now = Instant::now();
+
+        let join = service.handle("甲", &LandlordCommand::Join, now).unwrap();
+        let hand = service.handle("甲", &LandlordCommand::Hand, now).unwrap();
+        let play = service
+            .handle("甲", &LandlordCommand::Play("3".to_string()), now)
+            .unwrap();
+
+        assert_eq!(join.action, "no-lobby");
+        assert_eq!(hand.action, "no-game");
+        assert_eq!(play.action, "occupied");
+    }
+
+    #[test]
     fn application_service_releases_a_timeout_when_delivery_begins() {
         let entertainment = EntertainmentCoordinator::new();
         let config = LandlordConfig {
@@ -2168,12 +2294,17 @@ mod tests {
         let service = CardGameService::new(config, entertainment.clone());
         let started_at = Instant::now();
 
-        let gate = service.prepare_start(&LandlordCommand::Start).unwrap();
-        assert!(matches!(gate, CardGameStartGate::Ready { .. }));
+        let CardGameStartGate::Ready { reservation } =
+            service.prepare_start(&LandlordCommand::Start).unwrap()
+        else {
+            panic!("start should reserve the game");
+        };
         let created = service
-            .complete_start("甲", &LandlordCommand::Start, started_at)
+            .complete_start("甲", &LandlordCommand::Start, reservation, started_at)
             .unwrap();
         assert_eq!(created.action, "created");
+        assert!(!service.cancel_start(reservation).unwrap());
+        assert_eq!(entertainment.active(), Some(EntertainmentKind::Landlord));
 
         let timeout = service
             .tick(started_at + Duration::from_secs(2), true)
@@ -2182,7 +2313,7 @@ mod tests {
         assert!(timeout.ended);
         assert_eq!(entertainment.active(), Some(EntertainmentKind::Landlord));
 
-        service.finish_delivery(&timeout);
+        service.begin_delivery(&timeout);
 
         assert_eq!(entertainment.active(), None);
         assert!(!service.is_active().unwrap());

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use super::command::{self, CustomWorkflowCommand, ModerationAction, ParsedCommand, UserCommand};
 use super::decision_lock::DecisionScreenLock;
 use super::frame_source::{Canvas, load_frame};
-use super::ocr::merged_ocr_text;
+use super::ocr_runtime::OcrPriority;
 use super::ui_locator::UiLocator;
 use super::workflow_actions::{self, HitAction, PixelStability, TemplateMode};
 use super::{
@@ -569,9 +569,8 @@ impl AutomationApp {
             action,
             || self.running.load(AtomicOrdering::SeqCst),
             |region, expected| {
-                let engine = self.ocr_engine()?;
                 Ok(region
-                    .find_text(&engine.engine, expected)?
+                    .find_text(&self.ocr, expected)?
                     .map(|hit| hit.center()))
             },
         )? {
@@ -1370,14 +1369,11 @@ impl AutomationApp {
             .resolve_stability_count(self.config.invite.friend_name_stable_count);
         let mut streak = 0_u32;
         while Instant::now() < deadline && self.running.load(AtomicOrdering::SeqCst) {
-            let point = {
-                let engine = self.ocr_engine()?;
-                region
-                    .find_text_hits(&engine.engine, username)?
-                    .into_iter()
-                    .map(|hit| hit.center())
-                    .max_by_key(|point| point.y)
-            };
+            let point = region
+                .find_text_hits(&self.ocr, username)?
+                .into_iter()
+                .map(|hit| hit.center())
+                .max_by_key(|point| point.y);
             if let Some(point) = point {
                 streak = streak.saturating_add(1);
                 if streak >= required_streak {
@@ -1519,10 +1515,7 @@ impl AutomationApp {
         let required_streak = self.config.resolve_stability_count(stable_count);
         let mut streak = 0_u32;
         while Instant::now() < deadline && self.running.load(AtomicOrdering::SeqCst) {
-            let hits = {
-                let engine = self.ocr_engine()?;
-                region.find_text_hits(&engine.engine, username)?
-            };
+            let hits = region.find_text_hits(&self.ocr, username)?;
             match hits.as_slice() {
                 [hit] => {
                     streak = streak.saturating_add(1);
@@ -1576,8 +1569,11 @@ impl AutomationApp {
             required_streak,
             title_timeout_ms,
             |crop| {
-                let engine = self.ocr_engine()?;
-                merged_ocr_text(&engine.engine, crop, self.config.ocr.same_line_y_tolerance)
+                self.ocr.merged_text(
+                    crop.clone(),
+                    self.config.ocr.same_line_y_tolerance,
+                    OcrPriority::UiConfirmation,
+                )
             },
             || self.running.load(AtomicOrdering::SeqCst),
         )?;
@@ -1600,10 +1596,7 @@ impl AutomationApp {
             Instant::now() + Duration::from_millis(self.config.timing.workflow.default_timeout_ms);
         let mut streak = 0_u32;
         while Instant::now() < deadline && self.running.load(AtomicOrdering::SeqCst) {
-            let found = {
-                let engine = self.ocr_engine()?;
-                !region.find_text_hits(&engine.engine, username)?.is_empty()
-            };
+            let found = !region.find_text_hits(&self.ocr, username)?.is_empty();
             if found {
                 streak = streak.saturating_add(1);
                 if streak >= required_streak {

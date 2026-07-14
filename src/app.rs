@@ -1,6 +1,7 @@
 mod ai;
 mod change_detection;
 mod chat_listener;
+mod chat_observation;
 pub(crate) mod chat_output;
 mod chat_scan;
 mod clipboard;
@@ -58,6 +59,9 @@ use self::chat_listener::{
     UnreadFriendHit, classify_title, find_unread_friend_hits, hall_bubble_sequence_overlap,
     latest_incoming_bubble_rect, latest_incoming_fingerprint, secondary_hall_bubbles,
     unread_hit_still_visible,
+};
+use self::chat_observation::{
+    ChatObservationDispatch, ChatObservationExclusiveGuard, ChatObservationShared,
 };
 use self::chat_output::{
     ChatBatchSendOutcome, ChatBatchSendStatus, ChatOutput, redacted_chat_text,
@@ -383,6 +387,7 @@ pub(crate) struct AutomationApp {
     song_command_executing: Arc<AtomicBool>,
     console_reply_context: Arc<AtomicBool>,
     chat_listener: ChatListenerShared,
+    chat_observations: ChatObservationShared,
     monitor: MonitorShared,
 }
 
@@ -771,6 +776,7 @@ enum ChatDecisionReaderKind {
 struct ChatDecisionReader {
     kind: ChatDecisionReaderKind,
     screen_lock: DecisionScreenLock,
+    _observation_session: ChatObservationExclusiveGuard,
 }
 
 impl ChatDecisionReader {
@@ -976,6 +982,7 @@ impl AutomationApp {
             song_command_executing: Arc::new(AtomicBool::new(false)),
             console_reply_context: Arc::new(AtomicBool::new(false)),
             chat_listener: ChatListenerShared::new(),
+            chat_observations: ChatObservationShared::new(),
             monitor,
         })
     }
@@ -1295,6 +1302,7 @@ impl AutomationApp {
             song_command_executing: self.song_command_executing.clone(),
             console_reply_context: self.console_reply_context.clone(),
             chat_listener: self.chat_listener.clone(),
+            chat_observations: self.chat_observations.clone(),
             monitor: self.monitor.clone(),
         }
     }
@@ -1709,7 +1717,9 @@ impl AutomationApp {
                                             scan_ms
                                         );
                                         match messages {
-                                            Ok(messages) => self.handle_scan_messages(messages)?,
+                                            Ok(messages) => {
+                                                self.publish_primary_chat_observation(messages)?
+                                            }
                                             Err(error) => {
                                                 log::error!("聊天扫描失败: {error:#}")
                                             }
@@ -1741,7 +1751,9 @@ impl AutomationApp {
                                 let messages =
                                     self.scan_chat_with_shared_ocr(&frame.image, &template_args);
                                 match messages {
-                                    Ok(messages) => self.handle_scan_messages(messages)?,
+                                    Ok(messages) => {
+                                        self.publish_primary_chat_observation(messages)?
+                                    }
                                     Err(error) => log::error!("聊天扫描失败: {error:#}"),
                                 }
                                 last_ocr_at = now;
@@ -2065,6 +2077,27 @@ impl AutomationApp {
         }
         *previous = refreshed_bubbles;
         Ok(outcome.processed)
+    }
+
+    fn publish_primary_chat_observation(&mut self, messages: Vec<ChatMessage>) -> Result<()> {
+        for dispatch in self.chat_observations.publish(messages)? {
+            match dispatch {
+                ChatObservationDispatch::Messages(messages) => {
+                    self.handle_scan_messages(messages)?;
+                }
+                ChatObservationDispatch::Gap(gap) => {
+                    self.locks = CommandLockState::default();
+                    self.screen_lock_primed.store(false, AtomicOrdering::SeqCst);
+                    log::warn!(
+                        "一级聊天观察出现缺口，下一屏仅重建命令基线: kind={:?} missing={:?}..={:?}",
+                        gap.kind,
+                        gap.missing_from,
+                        gap.missing_through
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     fn handle_scan_messages(&mut self, messages: Vec<ChatMessage>) -> Result<()> {
@@ -3557,6 +3590,7 @@ impl AutomationApp {
         A: Fn(&str) -> bool,
         P: Fn(&str) -> bool,
     {
+        let observation_session = self.chat_observations.begin_exclusive()?;
         let use_secondary = scope == ChatDecisionScope::CurrentHall
             && self.active_ui_residency() == UiResidency::SecondaryCurrentHall;
         if use_secondary {
@@ -3574,6 +3608,7 @@ impl AutomationApp {
             return Ok(ChatDecisionReader {
                 kind: ChatDecisionReaderKind::SecondaryCurrentHall { previous },
                 screen_lock: DecisionScreenLock::default(),
+                _observation_session: observation_session,
             });
         }
 
@@ -3593,6 +3628,7 @@ impl AutomationApp {
                 accepts_message_type,
                 is_decision,
             ),
+            _observation_session: observation_session,
         })
     }
 

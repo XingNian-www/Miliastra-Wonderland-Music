@@ -95,12 +95,12 @@ pub(super) struct MonitorSnapshot {
 }
 
 #[derive(Clone)]
-pub(super) struct MonitorShared {
+pub(crate) struct MonitorShared {
     state: Arc<Mutex<MonitorState>>,
 }
 
 #[derive(Clone)]
-pub(super) struct MonitorLogSink {
+pub(crate) struct MonitorLogSink {
     shared: MonitorShared,
 }
 
@@ -118,7 +118,7 @@ struct MonitorState {
 }
 
 impl MonitorShared {
-    pub(super) fn new(log_limit: usize) -> Self {
+    pub(crate) fn new(log_limit: usize) -> Self {
         Self {
             state: Arc::new(Mutex::new(MonitorState {
                 logs: VecDeque::new(),
@@ -137,7 +137,7 @@ impl MonitorShared {
         }
     }
 
-    pub(super) fn log_sink(&self) -> MonitorLogSink {
+    pub(crate) fn log_sink(&self) -> MonitorLogSink {
         MonitorLogSink {
             shared: self.clone(),
         }

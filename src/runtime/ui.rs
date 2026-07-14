@@ -3,7 +3,7 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::mpsc::{self, Receiver, RecvError, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -132,7 +132,7 @@ impl Error for UiRoutineFailure {}
 
 #[derive(Debug)]
 pub struct CapturedFrame {
-    image: DynamicImage,
+    image: Arc<DynamicImage>,
     captured_at: Instant,
 }
 
@@ -141,12 +141,16 @@ impl CapturedFrame {
         &self.image
     }
 
+    pub fn image_arc(&self) -> Arc<DynamicImage> {
+        Arc::clone(&self.image)
+    }
+
     pub fn captured_at(&self) -> Instant {
         self.captured_at
     }
 
     pub fn into_image(self) -> DynamicImage {
-        self.image
+        Arc::try_unwrap(self.image).unwrap_or_else(|image| (*image).clone())
     }
 }
 
@@ -220,7 +224,7 @@ impl UiRoutine for CaptureFrame {
             UiRoutineFailure::before_input("capture_frame", format!("{error:#}"))
         })?;
         Ok(CapturedFrame {
-            image,
+            image: Arc::new(image),
             captured_at: Instant::now(),
         })
     }
@@ -432,6 +436,10 @@ pub struct FrameDemandSubscription {
 }
 
 impl FrameDemandSubscription {
+    pub fn recv(&self) -> Result<FramePublication, RecvError> {
+        self.receiver.recv()
+    }
+
     pub fn recv_timeout(&self, timeout: Duration) -> Result<FramePublication, RecvTimeoutError> {
         self.receiver.recv_timeout(timeout)
     }
@@ -598,7 +606,7 @@ fn publish_due_frame(
 
     let publication = match device.capture() {
         Ok(image) => FramePublication::Captured(Arc::new(CapturedFrame {
-            image,
+            image: Arc::new(image),
             captured_at: Instant::now(),
         })),
         Err(error) => {

@@ -1,4 +1,4 @@
-use super::config::MatchConfig;
+use crate::config::MatchConfig;
 
 pub fn match_song_query(
     config: &MatchConfig,

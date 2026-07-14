@@ -7,8 +7,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use log::{LevelFilter, Log, Metadata, Record, SetLoggerError};
 
-use super::config::LoggingConfig;
 use super::monitor::MonitorLogSink;
+use crate::config::LoggingConfig;
 
 struct FileLogger {
     files: Mutex<LogFiles>,

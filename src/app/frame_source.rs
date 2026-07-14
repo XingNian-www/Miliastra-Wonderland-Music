@@ -7,8 +7,8 @@ use image::GenericImageView;
 use image::imageops::FilterType;
 
 use super::FrameArgs;
-use super::config;
 use super::window;
+use crate::config;
 
 static WINDOW_CAPTURE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 

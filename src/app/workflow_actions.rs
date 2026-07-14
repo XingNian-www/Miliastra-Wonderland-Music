@@ -6,13 +6,13 @@ use anyhow::{Result, anyhow};
 
 use super::chat_listener::latest_incoming_sender_rect;
 use super::command;
-use super::config::{PointConfig, RectConfig, WindowConfig};
 use super::geometry::{Point, Rect, crop_canvas};
 use super::input_actions::{
     activate_game, click_game_point, focus_game, hold_key, parse_key, paste_text, press_key,
 };
 use super::template_match::TemplateHit;
 use super::ui_locator::{UiLocator, UiRegion, text_contains_complete_target};
+use crate::config::{PointConfig, RectConfig, WindowConfig};
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum TemplateMode {

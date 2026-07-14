@@ -26,7 +26,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::BOOL;
 
-use super::config::{PointConfig, WindowConfig};
+use crate::config::{PointConfig, WindowConfig};
 
 #[derive(Clone, Debug)]
 pub struct TargetWindowUnavailable {

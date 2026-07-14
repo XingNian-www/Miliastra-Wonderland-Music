@@ -5,9 +5,9 @@ use anyhow::{Context, Result, bail};
 use enigo::{Axis, Direction, Enigo, Key, Keyboard, Settings};
 
 use super::clipboard;
-use super::config;
-use super::config::PointConfig;
 use super::window;
+use crate::config;
+use crate::config::PointConfig;
 
 pub(super) fn click_game_point(
     point: PointConfig,

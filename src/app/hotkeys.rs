@@ -11,7 +11,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetMessageW, MSG, TranslateMessage, WM_HOTKEY,
 };
 
-use super::config::HotkeyConfig;
+use crate::config::HotkeyConfig;
 
 const PAUSE_ID: i32 = 1;
 const EXIT_ID: i32 = 2;

@@ -8,12 +8,12 @@ use ocr_rs::OcrEngine;
 use super::FrameArgs;
 use super::change_detection::{change_stats, rect_chat_change_fingerprint};
 use super::command;
-use super::config::{self, PointConfig};
 use super::frame_source::{Canvas, Frame, load_frame};
 use super::geometry::{Point, Rect, crop_canvas};
 use super::input_actions::{click_game_point, scroll_game_point};
 use super::ocr::recognize_lines;
 use super::template_match::{TemplateHit, best_template_hit};
+use crate::config::{self, PointConfig};
 
 pub(super) fn startup_locator(config: &config::AppConfig) -> UiLocator {
     startup_locator_with_poll_ms(config, config.startup.poll_ms)

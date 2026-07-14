@@ -6,7 +6,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::config::{FeelUOwnConfig, TimingConfig};
+use crate::config::{FeelUOwnConfig, TimingConfig};
 
 const VOLUME_CURVE_POWER: f64 = 0.5;
 const VOLUME_SMOOTH_STEPS: i64 = 8;

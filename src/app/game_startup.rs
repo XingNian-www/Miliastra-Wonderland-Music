@@ -10,10 +10,10 @@ use windows::Win32::System::Registry::{
 };
 use windows::core::w;
 
-use super::config::AppConfig;
 use super::ui_locator::{UiLocator, startup_locator};
 use super::window;
 use super::workflow_actions;
+use crate::config::AppConfig;
 
 const ENTER_GAME_OCR_TEXT: &str = "点击进入";
 

@@ -64,42 +64,6 @@ pub enum IdiomChainCommand {
     Hint,
     Status,
     Stop,
-    Help,
-}
-
-impl IdiomChainCommand {
-    pub fn parse(args: &str) -> Self {
-        Self::parse_with_mode(args, IdiomChainMode::Exact)
-    }
-
-    pub fn parse_homophone(args: &str) -> Self {
-        Self::parse_with_mode(args, IdiomChainMode::Homophone)
-    }
-
-    fn parse_with_mode(args: &str, mode: IdiomChainMode) -> Self {
-        let args = args.trim();
-        if args.is_empty() || matches!(args, "帮助" | "?" | "？") {
-            return Self::Help;
-        }
-        if let Some(word) = args.strip_prefix("开始") {
-            let word = word.trim_start_matches(['：', ':', ' ', '\t']).trim();
-            return if word.is_empty() {
-                Self::Help
-            } else {
-                Self::Start {
-                    idiom: word.to_string(),
-                    mode,
-                }
-            };
-        }
-        if matches!(args, "状态" | "查看") {
-            return Self::Status;
-        }
-        if matches!(args, "结束" | "停止") {
-            return Self::Stop;
-        }
-        Self::Submit(args.to_string())
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -172,10 +136,7 @@ impl IdiomChainGame {
         }
 
         if !matches!(command, IdiomChainCommand::Start { .. }) && self.expire_if_idle(now) {
-            return outcome(
-                "expired",
-                "本局成语接龙已超时，请用 @接龙 开始 成语 重新开局",
-            );
+            return outcome("expired", "本局成语接龙已超时，请用 #接龙 成语 重新开局");
         }
 
         match command {
@@ -185,10 +146,6 @@ impl IdiomChainGame {
             IdiomChainCommand::Hint => self.hint(),
             IdiomChainCommand::Status => self.status(),
             IdiomChainCommand::Stop => self.stop(player),
-            IdiomChainCommand::Help => outcome(
-                "help",
-                "用法：@接龙 开始 自相矛盾；同音模式用 @同音接龙 开始 成语；随后 @接龙 成语；@接龙 状态/结束",
-            ),
         }
     }
 
@@ -201,7 +158,7 @@ impl IdiomChainGame {
     ) -> IdiomChainOutcome {
         self.expire_if_idle(now);
         if self.session.is_some() {
-            return outcome("already-active", "已有成语接龙正在进行，请先 @接龙 状态");
+            return outcome("already-active", "已有成语接龙正在进行，请先 #状态");
         }
         let idiom = match self.lookup_idiom(raw_idiom) {
             Ok(idiom) => idiom,
@@ -230,7 +187,7 @@ impl IdiomChainGame {
             Err(reply) => return outcome("invalid-submission", reply),
         };
         let Some(session) = self.session.as_ref() else {
-            return outcome("no-session", "还没有开局，请用 @接龙 开始 成语");
+            return outcome("no-session", "还没有开局，请用 #接龙 成语");
         };
         if !self.allow_consecutive_player && same_player(player, &session.last_player) {
             return outcome("same-player", "请让其他玩家接下一个成语");
@@ -303,7 +260,7 @@ impl IdiomChainGame {
         } else {
             return outcome(
                 "no-explanation-target",
-                "请使用 @解释 成语，或先开始一局接龙",
+                "请使用 #解释 成语，或先开始一局接龙",
             );
         };
         let Some(details) = self.lexicon.explanation(&idiom) else {
@@ -674,27 +631,6 @@ mod tests {
             idiom: idiom.to_string(),
             mode: IdiomChainMode::Exact,
         }
-    }
-
-    #[test]
-    fn parses_control_words_and_submission() {
-        assert_eq!(
-            IdiomChainCommand::parse("开始：画蛇添足"),
-            start_exact("画蛇添足")
-        );
-        assert_eq!(IdiomChainCommand::parse("状态"), IdiomChainCommand::Status);
-        assert_eq!(IdiomChainCommand::parse("结束"), IdiomChainCommand::Stop);
-        assert_eq!(
-            IdiomChainCommand::parse("足智多谋"),
-            IdiomChainCommand::Submit("足智多谋".to_string())
-        );
-        assert_eq!(
-            IdiomChainCommand::parse_homophone("开始 画蛇添足"),
-            IdiomChainCommand::Start {
-                idiom: "画蛇添足".to_string(),
-                mode: IdiomChainMode::Homophone,
-            }
-        );
     }
 
     #[test]

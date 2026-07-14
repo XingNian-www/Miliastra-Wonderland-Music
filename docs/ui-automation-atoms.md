@@ -56,6 +56,7 @@ flowchart TD
 | 等待像素稳定 | `wait_pixels_stable()` | 比较连续截图的区域指纹，满足均值差和变化比例阈值即稳定。 |
 | 等待文字 | `wait_or_click_text(..., Wait)` | 在区域内 OCR，找到指定文本或近似包含关系。 |
 | 点击文字 | `wait_or_click_text(..., Click)` | OCR 找到文字后点击文本框中心加可选偏移。 |
+| 等待最新消息发送者 | `wait_latest_incoming_sender_match()` | 动态定位最新他人消息标题，连续 OCR 到指定昵称达到稳定次数。 |
 
 这些动作只表达机械操作，不包含“邀请谁”“拉黑谁”“给谁发消息”之类业务语义。
 

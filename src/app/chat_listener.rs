@@ -362,6 +362,16 @@ pub(super) fn latest_incoming_bubble_rect(image: &DynamicImage) -> Option<Rect> 
     ))
 }
 
+pub(super) fn latest_incoming_sender_rect(image: &DynamicImage) -> Option<Rect> {
+    let bubble_with_title = latest_incoming_bubble_rect(image)?;
+    Some(Rect::new(
+        bubble_with_title.x,
+        bubble_with_title.y,
+        bubble_with_title.width,
+        bubble_with_title.height.min(42),
+    ))
+}
+
 pub(super) fn latest_incoming_fingerprint(
     image: &DynamicImage,
 ) -> Result<Option<ChangeFingerprint>> {
@@ -596,10 +606,14 @@ mod tests {
                 }
             }
         }
-        let rect =
-            latest_incoming_bubble_rect(&DynamicImage::ImageRgba8(image)).expect("latest bubble");
+        let image = DynamicImage::ImageRgba8(image);
+        let rect = latest_incoming_bubble_rect(&image).expect("latest bubble");
         assert!(rect.y >= 670);
         assert!(rect.bottom() >= 790);
+        let sender = latest_incoming_sender_rect(&image).expect("latest sender title");
+        assert_eq!(sender.y, rect.y);
+        assert_eq!(sender.height, 42);
+        assert_eq!(sender.bottom(), 720);
     }
 
     #[test]

@@ -9,7 +9,8 @@ use super::command::{self, CustomWorkflowCommand, ModerationAction, ParsedComman
 use super::config::{self, CustomWorkflowConfig, CustomWorkflowDefinition, PointConfig};
 use super::decision_lock::DecisionScreenLock;
 use super::frame_source::{Canvas, load_frame};
-use super::ui_locator::{UiLocator, text_contains_complete_target};
+use super::ocr::merged_ocr_text;
+use super::ui_locator::UiLocator;
 use super::workflow_actions::{self, HitAction, PixelStability, TemplateMode};
 use super::{
     AutomationApp, ChatDecisionScope, FrameArgs, PendingTask, PendingTaskExecution, TemplateArgs,
@@ -1570,23 +1571,36 @@ impl AutomationApp {
         username: &str,
         stable_count: u32,
     ) -> Result<bool> {
-        let frame = locator.capture()?;
-        if let super::chat_listener::SecondaryChatIdentity::Friend(title) =
-            self.secondary_identity_from_frame(&frame.image)?
-        {
-            let title = command::normalize_lock_text(&title);
-            let username = command::normalize_lock_text(username);
-            if text_contains_complete_target(&title, &username) {
-                log::info!("原子动作完成: 二级聊天标题确认好友 {}", username);
-                return Ok(true);
-            }
+        let required_streak = stable_count.max(1);
+        let title_timeout_ms = self.config.timing.workflow.default_timeout_ms.min(2_000);
+        let title_matched = workflow_actions::wait_latest_incoming_sender_match(
+            locator,
+            username,
+            required_streak,
+            title_timeout_ms,
+            |crop| {
+                let engine = self.ocr_engine()?;
+                merged_ocr_text(&engine.engine, crop, self.config.ocr.same_line_y_tolerance)
+            },
+            || self.running.load(AtomicOrdering::SeqCst),
+        )?;
+        if title_matched {
+            log::info!(
+                "原子动作完成: 二级好友消息标题稳定确认 {} samples={}",
+                username,
+                required_streak
+            );
+            return Ok(true);
         }
-        log::debug!("二级聊天标题未包含好友备注，回退聊天内容区 OCR: {username}");
+        log::info!(
+            "二级好友消息标题未稳定匹配，回退聊天内容区 OCR: target={} samples={}",
+            username,
+            required_streak
+        );
 
         let region = locator.region(self.config.invite.friend_chat_region.into());
         let deadline =
             Instant::now() + Duration::from_millis(self.config.timing.workflow.default_timeout_ms);
-        let required_streak = stable_count.max(1);
         let mut streak = 0_u32;
         while Instant::now() < deadline && self.running.load(AtomicOrdering::SeqCst) {
             let found = {

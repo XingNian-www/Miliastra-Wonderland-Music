@@ -773,6 +773,27 @@ mod app {
         )
     }
 
+    fn tick_undercover_game(
+        game: &Arc<Mutex<UndercoverGame>>,
+        entertainment: &EntertainmentCoordinator,
+        now: Instant,
+        clock_active: bool,
+    ) -> Result<Vec<UndercoverDelivery>> {
+        if !clock_active {
+            return Ok(Vec::new());
+        }
+        let mut game = game
+            .lock()
+            .map_err(|_| anyhow!("undercover mutex poisoned"))?;
+        let deliveries = game.tick(now);
+        let ended = !game.is_active();
+        drop(game);
+        if ended {
+            entertainment.release(EntertainmentKind::Undercover);
+        }
+        Ok(deliveries)
+    }
+
     fn card_game_start_kind(command: &LandlordCommand) -> Option<EntertainmentKind> {
         match command {
             LandlordCommand::Start => Some(EntertainmentKind::Landlord),
@@ -2133,11 +2154,24 @@ mod app {
                 self.locks = CommandLockState::default();
                 log::info!("已重置命令屏幕锁");
             }
-            let visible_turtle_questions = messages
-                .iter()
-                .filter(|message| message.message_type == "blue" && !message.text.is_empty())
-                .filter_map(|message| turtle_soup::parse_question_message(&message.text, None))
-                .collect::<Vec<_>>();
+            let active_entertainment = self.entertainment.active();
+            let visible_turtle_questions = if self.turtle_soup.accepts_questions() {
+                messages
+                    .iter()
+                    .filter(|message| message.message_type == "blue" && !message.text.is_empty())
+                    .filter(|message| {
+                        command::parse_entertainment_shortcut(
+                            &message.text,
+                            &message.message_type,
+                            active_entertainment,
+                        )
+                        .is_none()
+                    })
+                    .filter_map(|message| turtle_soup::parse_question_message(&message.text, None))
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
             let suppress_new_turtle_questions =
                 !self.screen_lock_primed.load(AtomicOrdering::SeqCst);
             let new_turtle_questions = self.turtle_soup.filter_new_primary_questions(
@@ -2156,15 +2190,19 @@ mod app {
                     message.message_type,
                     redacted_chat_text(&message.text)
                 );
-                let Some(parsed_command) =
-                    command::parse_text(&message.text, &message.message_type).or_else(|| {
-                        custom_workflow::parse_text(
-                            &self.config.custom_workflows,
-                            &message.text,
-                            &message.message_type,
-                        )
-                    })
-                else {
+                let Some(parsed_command) = command::parse_entertainment_shortcut(
+                    &message.text,
+                    &message.message_type,
+                    active_entertainment,
+                )
+                .or_else(|| command::parse_text(&message.text, &message.message_type))
+                .or_else(|| {
+                    custom_workflow::parse_text(
+                        &self.config.custom_workflows,
+                        &message.text,
+                        &message.message_type,
+                    )
+                }) else {
                     continue;
                 };
                 if !self.commands_enabled.load(AtomicOrdering::SeqCst)
@@ -2389,7 +2427,7 @@ mod app {
             }
             if let Some(active) = self.entertainment.active()
                 && !is_card_game_kind(active)
-                && !matches!(command, LandlordCommand::Status | LandlordCommand::Help)
+                && !matches!(command, LandlordCommand::Status)
             {
                 self.enqueue_current_hall_reply(&format!(
                     "{}正在进行，请结束后再开始牌局",
@@ -2546,14 +2584,13 @@ mod app {
                     }
                 }
             }
-            match self.undercover.lock() {
-                Ok(mut game) => {
-                    let deliveries = game.tick(Instant::now());
-                    let ended = !game.is_active();
-                    drop(game);
-                    if ended {
-                        self.entertainment.release(EntertainmentKind::Undercover);
-                    }
+            match tick_undercover_game(
+                &self.undercover,
+                &self.entertainment,
+                Instant::now(),
+                clock_active,
+            ) {
+                Ok(deliveries) => {
                     if !deliveries.is_empty()
                         && let Err(error) =
                             self.push_pending_task(PendingTask::UndercoverDelivery { deliveries })
@@ -2561,7 +2598,7 @@ mod app {
                         log::error!("谁是卧底计时消息入队失败: {error:#}");
                     }
                 }
-                Err(_) => log::error!("谁是卧底状态锁已损坏，无法推进计时"),
+                Err(error) => log::error!("无法推进谁是卧底计时: {error:#}"),
             }
             match self.idiom_chain.lock() {
                 Ok(mut game) => {
@@ -3803,13 +3840,18 @@ mod app {
             let accepts_turtle_questions = message_type == "blue"
                 && self.commands_enabled.load(AtomicOrdering::SeqCst)
                 && self.turtle_soup.accepts_questions();
+            let captures_hash_sender =
+                message_type == "blue" && self.commands_enabled.load(AtomicOrdering::SeqCst);
             let mut texts = Vec::new();
             for rect in rects {
                 let crop = crop_canvas(image, rect)?;
                 let text =
                     merged_ocr_text(&engine.engine, &crop, self.config.ocr.same_line_y_tolerance)?;
-                let question_sender = if accepts_turtle_questions {
-                    let sender_rect = secondary_question_sender_rect(image, rect);
+                let trimmed_text = text.trim_start();
+                let starts_with_hash =
+                    trimmed_text.starts_with('#') || trimmed_text.starts_with('＃');
+                let message_sender = if captures_hash_sender && starts_with_hash {
+                    let sender_rect = secondary_message_sender_rect(image, rect);
                     let crop = crop_canvas(image, sender_rect)?;
                     Some(merged_ocr_text(
                         &engine.engine,
@@ -3819,7 +3861,7 @@ mod app {
                 } else {
                     None
                 };
-                texts.push((rect, text, question_sender));
+                texts.push((rect, text, message_sender));
             }
             let ocr_ms = elapsed_ms(ocr_started);
             self.monitor.set_ocr(OcrSnapshot::new(
@@ -3842,9 +3884,9 @@ mod app {
             let texts = if accepts_turtle_questions {
                 let observations = texts
                     .into_iter()
-                    .map(|(_, text, question_sender)| SecondaryOcrObservation {
+                    .map(|(_, text, message_sender)| SecondaryOcrObservation {
                         text,
-                        player: question_sender.unwrap_or_default(),
+                        player: message_sender.unwrap_or_default(),
                     })
                     .collect::<Vec<_>>();
                 match self.turtle_soup.stabilize_secondary_ocr(observations) {
@@ -3863,14 +3905,35 @@ mod app {
                 self.turtle_soup.clear_secondary_ocr_stability();
                 texts
                     .into_iter()
-                    .map(|(_, text, question_sender)| (text, question_sender))
+                    .map(|(_, text, message_sender)| (text, message_sender))
                     .collect::<Vec<_>>()
             };
 
             let mut processed = false;
-            for (text, question_sender) in texts {
+            for (text, message_sender) in texts {
+                let shortcut_player = if message_type == "pink" {
+                    friend_name.trim()
+                } else {
+                    message_sender.as_deref().map(str::trim).unwrap_or_default()
+                };
+                if !shortcut_player.is_empty() {
+                    let synthetic = if message_type == "pink" {
+                        format!("[{}]：{}", shortcut_player, text.trim())
+                    } else {
+                        format!("{}：{}", shortcut_player, text.trim())
+                    };
+                    if let Some(parsed) = command::parse_entertainment_shortcut(
+                        &synthetic,
+                        message_type,
+                        self.entertainment.active(),
+                    ) {
+                        self.submit_secondary_command(parsed)?;
+                        processed = true;
+                        continue;
+                    }
+                }
                 if accepts_turtle_questions {
-                    let question = question_sender
+                    let question = message_sender
                         .as_deref()
                         .map(str::trim)
                         .filter(|player| !player.is_empty())
@@ -5578,13 +5641,13 @@ mod app {
         fn send_entertainment_help(&self) -> Result<()> {
             self.reply_batch(
                 &[
-                    "成语接龙: @接龙 开始 成语;同音模式用 @同音接龙 开始 成语;可用 @提示/@解释",
-                    "斗地主: @斗地主 开始,@加入,@抢地主/@不抢,@出 牌组/@过;也可用 $/＄出牌,好友私聊 @手牌",
-                    "跑得快: @跑得快 开始,@加入,@出 牌组/@过;也可用 $/＄出牌,好友私聊 @手牌",
-                    "海龟汤: @海龟汤/@海龟汤开始用于开局或重发汤面,@海龟汤状态查看进度,以#开头提问",
+                    "成语接龙: #接龙 成语;同音模式用 #同音接龙 成语;进行中用 #成语/#提示/#解释",
+                    "斗地主: #斗地主,#加入,#抢/#不抢,#牌组/#出牌组,#过;好友私聊 #手牌",
+                    "跑得快: #跑得快,#加入,#牌组/#出牌组,#过;好友私聊 #手牌",
+                    "海龟汤: #海龟汤;进行中 #状态/#结束;其他 #内容 作为问题",
                     "海龟汤长答案: ##1第一段,##2第二段,最后发送##提交",
-                    "谁是卧底: @卧底开始/@卧底双卧底模式,@卧底加入/@卧底开局/@卧底状态/@卧底退出",
-                    "谁是卧底进行中好友私聊 @描述 内容/@投 A;创建者可用 @卧底结束",
+                    "谁是卧底: #卧底/#卧底双;好友私聊 #加入;公屏 #开局/#状态/#退出",
+                    "谁是卧底: 描述用公屏 #内容;投票用好友私聊 #A 或 #投A",
                 ],
                 self.config.timing.command.help_batch_ms,
             )
@@ -6627,13 +6690,12 @@ mod app {
     fn is_private_undercover_input(parsed: &ParsedCommand) -> bool {
         matches!(
             &parsed.command,
-            UserCommand::Undercover(UndercoverCommand::Describe(_) | UndercoverCommand::Vote(_))
+            UserCommand::Undercover(UndercoverCommand::Vote(_))
         )
     }
 
     fn private_safe_command_log(parsed: &ParsedCommand) -> &str {
         match &parsed.command {
-            UserCommand::Undercover(UndercoverCommand::Describe(_)) => "谁是卧底描述",
             UserCommand::Undercover(UndercoverCommand::Vote(_)) => "谁是卧底投票",
             _ => &parsed.raw,
         }
@@ -6779,7 +6841,7 @@ mod app {
         (overlap > 0).then_some(overlap)
     }
 
-    fn secondary_question_sender_rect(image: &DynamicImage, bubble: Rect) -> Rect {
+    fn secondary_message_sender_rect(image: &DynamicImage, bubble: Rect) -> Rect {
         let left = (bubble.x - 20).max(0);
         let top = (bubble.y - 48).max(0);
         let right = (bubble.right() + 20).min(image.width() as i32);
@@ -6970,6 +7032,26 @@ mod app {
                 "3".to_string()
             )));
             assert!(!landlord_command_requires_executor(&LandlordCommand::Pass));
+        }
+
+        #[test]
+        fn undercover_tick_does_not_release_signup_reservation_during_command() {
+            let entertainment = EntertainmentCoordinator::new();
+            assert_eq!(
+                entertainment
+                    .try_acquire(EntertainmentKind::Undercover)
+                    .expect("acquire undercover"),
+                AcquireOutcome::Acquired
+            );
+            let game = Arc::new(Mutex::new(UndercoverGame::new(
+                undercover::UndercoverConfig::default(),
+            )));
+
+            let deliveries = tick_undercover_game(&game, &entertainment, Instant::now(), false)
+                .expect("tick undercover");
+
+            assert!(deliveries.is_empty());
+            assert_eq!(entertainment.active(), Some(EntertainmentKind::Undercover));
         }
 
         #[test]

@@ -20,26 +20,6 @@ pub enum UndercoverCommand {
     Vote(char),
 }
 
-impl UndercoverCommand {
-    pub fn parse_hall(value: &str) -> Option<Self> {
-        match value
-            .chars()
-            .filter(|ch| !ch.is_whitespace())
-            .collect::<String>()
-            .as_str()
-        {
-            "" | "状态" => Some(Self::Status),
-            "开始" => Some(Self::CreateSingle),
-            "双卧底模式" => Some(Self::CreateDouble),
-            "加入" => Some(Self::Join),
-            "开局" => Some(Self::Start),
-            "退出" => Some(Self::Exit),
-            "结束" => Some(Self::End),
-            _ => None,
-        }
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UndercoverConfig {
@@ -52,7 +32,6 @@ pub struct UndercoverConfig {
     pub lobby_timeout_seconds: u64,
     pub phase_timeout_seconds: u64,
     pub progress_interval_seconds: u64,
-    pub progress_batch_size: usize,
     pub description_max_width: usize,
 }
 
@@ -68,7 +47,6 @@ impl Default for UndercoverConfig {
             lobby_timeout_seconds: 180,
             phase_timeout_seconds: 180,
             progress_interval_seconds: 20,
-            progress_batch_size: 3,
             description_max_width: 70,
         }
     }
@@ -200,62 +178,31 @@ enum Phase {
     AwaitingDelivery,
     Describing {
         descriptions: BTreeMap<usize, String>,
-        progress: Progress,
     },
     Voting {
         votes: BTreeMap<usize, usize>,
-        progress: Progress,
+        reminder: VoteReminder,
     },
     RunoffDescribing {
         candidates: Vec<usize>,
         descriptions: BTreeMap<usize, String>,
-        progress: Progress,
     },
     RunoffVoting {
         candidates: Vec<usize>,
         votes: BTreeMap<usize, usize>,
-        progress: Progress,
+        reminder: VoteReminder,
     },
 }
 
-struct Progress {
-    pending: Vec<usize>,
+struct VoteReminder {
     last_announcement: Instant,
 }
 
-impl Progress {
+impl VoteReminder {
     fn new(now: Instant) -> Self {
         Self {
-            pending: Vec::new(),
             last_announcement: now,
         }
-    }
-
-    fn record(&mut self, player: usize) {
-        self.pending.push(player);
-    }
-
-    fn take_message(
-        &mut self,
-        players: &[Player],
-        label: &str,
-        completed: usize,
-        total: usize,
-        now: Instant,
-    ) -> Option<String> {
-        if self.pending.is_empty() {
-            return None;
-        }
-        let positions = std::mem::take(&mut self.pending)
-            .into_iter()
-            .map(|index| players[index].position.to_string())
-            .collect::<Vec<_>>()
-            .join("、");
-        self.last_announcement = now;
-        Some(format!(
-            "{}{}已记录（{}/{}）",
-            positions, label, completed, total
-        ))
     }
 }
 
@@ -387,7 +334,6 @@ impl UndercoverGame {
         }
         game.phase = Phase::Describing {
             descriptions: BTreeMap::new(),
-            progress: Progress::new(now),
         };
         game.last_activity = now;
         let mut lines = vec![format!(
@@ -396,7 +342,7 @@ impl UndercoverGame {
             game.players.len()
         )];
         lines.extend(position_mapping_lines(&game.players));
-        lines.push("请存活玩家好友私聊 @描述 内容".to_string());
+        lines.push("请存活玩家在公屏发送 #内容".to_string());
         Ok(vec![UndercoverDelivery::HallBatch(lines)])
     }
 
@@ -453,74 +399,39 @@ impl UndercoverGame {
         let total = runoff_candidates
             .as_ref()
             .map_or_else(|| alive_count(&game.players), Vec::len);
-        let (descriptions, progress) = match &mut game.phase {
-            Phase::Describing {
-                descriptions,
-                progress,
+        let descriptions = match &mut game.phase {
+            Phase::Describing { descriptions } | Phase::RunoffDescribing { descriptions, .. } => {
+                descriptions
             }
-            | Phase::RunoffDescribing {
-                descriptions,
-                progress,
-                ..
-            } => (descriptions, progress),
             _ => unreachable!("phase checked above"),
         };
         if descriptions.contains_key(&index) {
             bail!("本轮已描述");
         }
         descriptions.insert(index, description.to_string());
-        progress.record(index);
         game.last_activity = now;
         let completed = descriptions.len();
         let mut deliveries = Vec::new();
-        if progress.pending.len() >= self.config.progress_batch_size.max(1)
-            && let Some(message) =
-                progress.take_message(&game.players, "描述", completed, total, now)
-        {
-            deliveries.push(UndercoverDelivery::Hall(message));
-        }
         if completed == total {
-            if let Some(message) =
-                progress.take_message(&game.players, "描述", completed, total, now)
-            {
-                deliveries.push(UndercoverDelivery::Hall(message));
-            }
-            let descriptions = std::mem::take(descriptions);
-            let mut lines = game
-                .players
-                .iter()
-                .enumerate()
-                .filter(|(index, player)| {
-                    player.alive
-                        && runoff_candidates
-                            .as_ref()
-                            .is_none_or(|candidates| candidates.contains(index))
-                })
-                .filter_map(|(index, player)| {
-                    descriptions.get(&index).map(|text| {
-                        if runoff_candidates.is_some() {
-                            format!("{}加赛描述：{}", player.position, text)
-                        } else {
-                            format!("{}：{}", player.position, text)
-                        }
-                    })
-                })
-                .collect::<Vec<_>>();
+            descriptions.clear();
             if let Some(candidates) = runoff_candidates {
-                lines.push("加赛描述已公开，请其他存活玩家好友私聊 @投 A".to_string());
                 game.phase = Phase::RunoffVoting {
                     candidates,
                     votes: BTreeMap::new(),
-                    progress: Progress::new(now),
+                    reminder: VoteReminder::new(now),
                 };
+                deliveries.push(UndercoverDelivery::Hall(
+                    "并列玩家已完成公屏描述，请其他存活玩家好友私聊 #A".to_string(),
+                ));
             } else {
-                lines.push("描述已全部公开，请存活玩家好友私聊 @投 A".to_string());
                 game.phase = Phase::Voting {
                     votes: BTreeMap::new(),
-                    progress: Progress::new(now),
+                    reminder: VoteReminder::new(now),
                 };
+                deliveries.push(UndercoverDelivery::Hall(
+                    "所有存活玩家已描述，请好友私聊 #A".to_string(),
+                ));
             }
-            deliveries.push(UndercoverDelivery::HallBatch(lines));
         }
         Ok(deliveries)
     }
@@ -559,36 +470,22 @@ impl UndercoverGame {
             || alive_count(&game.players),
             |candidates| alive_count(&game.players).saturating_sub(candidates.len()),
         );
-        let (votes, progress) = match &mut game.phase {
-            Phase::Voting { votes, progress }
-            | Phase::RunoffVoting {
-                votes, progress, ..
-            } => (votes, progress),
+        let votes = match &mut game.phase {
+            Phase::Voting { votes, .. } | Phase::RunoffVoting { votes, .. } => votes,
             _ => unreachable!("phase checked above"),
         };
         if votes.contains_key(&voter) {
             bail!("本轮已投票");
         }
         votes.insert(voter, target_index);
-        progress.record(voter);
         game.last_activity = now;
         let completed = votes.len();
         let mut deliveries = Vec::new();
-        if progress.pending.len() >= self.config.progress_batch_size.max(1)
-            && let Some(message) =
-                progress.take_message(&game.players, "投票", completed, total, now)
-        {
-            deliveries.push(UndercoverDelivery::Hall(message));
-        }
         if completed != total {
             return Ok(deliveries);
         }
-        if let Some(message) = progress.take_message(&game.players, "投票", completed, total, now)
-        {
-            deliveries.push(UndercoverDelivery::Hall(message));
-        }
         let votes = std::mem::take(votes);
-        let ended = resolve_votes(game, votes, runoff_candidates, now, &mut deliveries);
+        let ended = resolve_votes(game, votes, runoff_candidates, &mut deliveries);
         if ended {
             self.state = GameState::Idle;
         }
@@ -716,9 +613,9 @@ impl UndercoverGame {
                     )));
                     self.state = GameState::Idle;
                 } else {
-                    start_next_round(game, now);
+                    start_next_round(game);
                     deliveries.push(UndercoverDelivery::Hall(format!(
-                        "第{}轮重新开始，请好友私聊 @描述 内容",
+                        "第{}轮重新开始，请存活玩家在公屏发送 #内容",
                         game.round
                     )));
                 }
@@ -846,45 +743,21 @@ impl UndercoverGame {
             GameState::Playing(game) => {
                 let interval =
                     std::time::Duration::from_secs(self.config.progress_interval_seconds.max(1));
-                let alive = alive_count(&game.players);
                 let message = match &mut game.phase {
-                    Phase::Describing {
-                        descriptions,
-                        progress,
-                    } if now.saturating_duration_since(progress.last_announcement) >= interval => {
-                        progress.take_message(&game.players, "描述", descriptions.len(), alive, now)
-                    }
-                    Phase::Voting { votes, progress }
-                        if now.saturating_duration_since(progress.last_announcement)
+                    Phase::Voting { votes, reminder }
+                        if now.saturating_duration_since(reminder.last_announcement)
                             >= interval =>
                     {
-                        progress.take_message(&game.players, "投票", votes.len(), alive, now)
-                    }
-                    Phase::RunoffDescribing {
-                        candidates,
-                        descriptions,
-                        progress,
-                    } if now.saturating_duration_since(progress.last_announcement) >= interval => {
-                        progress.take_message(
-                            &game.players,
-                            "描述",
-                            descriptions.len(),
-                            candidates.len(),
-                            now,
-                        )
+                        reminder.last_announcement = now;
+                        missing_vote_message(&game.players, votes, None)
                     }
                     Phase::RunoffVoting {
                         candidates,
                         votes,
-                        progress,
-                    } if now.saturating_duration_since(progress.last_announcement) >= interval => {
-                        progress.take_message(
-                            &game.players,
-                            "投票",
-                            votes.len(),
-                            alive.saturating_sub(candidates.len()),
-                            now,
-                        )
+                        reminder,
+                    } if now.saturating_duration_since(reminder.last_announcement) >= interval => {
+                        reminder.last_announcement = now;
+                        missing_vote_message(&game.players, votes, Some(candidates))
                     }
                     _ => None,
                 };
@@ -933,7 +806,7 @@ impl UndercoverGame {
                     )));
                     true
                 } else {
-                    resolve_votes(&mut game, votes, None, now, &mut deliveries)
+                    resolve_votes(&mut game, votes, None, &mut deliveries)
                 }
             }
             Phase::RunoffVoting {
@@ -946,7 +819,7 @@ impl UndercoverGame {
                     )));
                     true
                 } else {
-                    resolve_votes(&mut game, votes, Some(candidates), now, &mut deliveries)
+                    resolve_votes(&mut game, votes, Some(candidates), &mut deliveries)
                 }
             }
         };
@@ -961,12 +834,11 @@ fn playing_progress(game: &Playing) -> (&'static str, usize, usize) {
     let alive = alive_count(&game.players);
     match &game.phase {
         Phase::AwaitingDelivery => ("delivering", 0, game.players.len()),
-        Phase::Describing { descriptions, .. } => ("describing", descriptions.len(), alive),
+        Phase::Describing { descriptions } => ("describing", descriptions.len(), alive),
         Phase::Voting { votes, .. } => ("voting", votes.len(), alive),
         Phase::RunoffDescribing {
             candidates,
             descriptions,
-            ..
         } => ("runoff_describing", descriptions.len(), candidates.len()),
         Phase::RunoffVoting {
             candidates, votes, ..
@@ -982,6 +854,24 @@ fn remaining_seconds(started: Instant, timeout_seconds: u64, now: Instant) -> u6
     timeout_seconds
         .max(1)
         .saturating_sub(now.saturating_duration_since(started).as_secs())
+}
+
+fn missing_vote_message(
+    players: &[Player],
+    votes: &BTreeMap<usize, usize>,
+    excluded_voters: Option<&[usize]>,
+) -> Option<String> {
+    let positions = players
+        .iter()
+        .enumerate()
+        .filter(|(index, player)| {
+            player.alive
+                && !votes.contains_key(index)
+                && excluded_voters.is_none_or(|excluded| !excluded.contains(index))
+        })
+        .map(|(_, player)| player.position.to_string())
+        .collect::<Vec<_>>();
+    (!positions.is_empty()).then(|| format!("未投票：{}", positions.join("、")))
 }
 
 fn resolve_description_timeout(
@@ -1022,46 +912,35 @@ fn resolve_description_timeout(
         return true;
     }
 
-    let mut lines = game
-        .players
-        .iter()
-        .enumerate()
-        .filter(|(index, player)| player.alive && descriptions.contains_key(index))
-        .map(|(index, player)| {
-            if runoff_candidates.is_some() {
-                format!("{}加赛描述：{}", player.position, descriptions[&index])
-            } else {
-                format!("{}：{}", player.position, descriptions[&index])
-            }
-        })
-        .collect::<Vec<_>>();
     if let Some(candidates) = runoff_candidates {
         let candidates = candidates
             .into_iter()
             .filter(|index| game.players[*index].alive)
             .collect::<Vec<_>>();
         if candidates.len() < 2 {
-            start_next_round(game, now);
+            start_next_round(game);
             deliveries.push(UndercoverDelivery::Hall(format!(
-                "加赛描述超时，无法继续重投；第{}轮开始，请好友私聊 @描述 内容",
+                "加赛描述超时，无法继续重投；第{}轮开始，请在公屏发送 #内容",
                 game.round
             )));
         } else {
-            lines.push("加赛描述已公开，请其他存活玩家好友私聊 @投 A".to_string());
             game.phase = Phase::RunoffVoting {
                 candidates,
                 votes: BTreeMap::new(),
-                progress: Progress::new(now),
+                reminder: VoteReminder::new(now),
             };
-            deliveries.push(UndercoverDelivery::HallBatch(lines));
+            deliveries.push(UndercoverDelivery::Hall(
+                "加赛描述阶段已截止，请其他存活玩家好友私聊 #A".to_string(),
+            ));
         }
     } else {
-        lines.push("描述阶段已截止，请存活玩家好友私聊 @投 A".to_string());
         game.phase = Phase::Voting {
             votes: BTreeMap::new(),
-            progress: Progress::new(now),
+            reminder: VoteReminder::new(now),
         };
-        deliveries.push(UndercoverDelivery::HallBatch(lines));
+        deliveries.push(UndercoverDelivery::Hall(
+            "描述阶段已截止，请存活玩家好友私聊 #A".to_string(),
+        ));
     }
     false
 }
@@ -1070,15 +949,14 @@ fn resolve_votes(
     game: &mut Playing,
     votes: BTreeMap<usize, usize>,
     runoff_candidates: Option<Vec<usize>>,
-    now: Instant,
     deliveries: &mut Vec<UndercoverDelivery>,
 ) -> bool {
     let leaders = highest_targets(&votes);
     if leaders.len() > 1 {
         if runoff_candidates.is_some() {
-            start_next_round(game, now);
+            start_next_round(game);
             deliveries.push(UndercoverDelivery::Hall(format!(
-                "加赛仍并列，本轮无人淘汰；第{}轮开始，请好友私聊 @描述 内容",
+                "加赛仍并列，本轮无人淘汰；第{}轮开始，请在公屏发送 #内容",
                 game.round
             )));
         } else {
@@ -1090,10 +968,9 @@ fn resolve_votes(
             game.phase = Phase::RunoffDescribing {
                 candidates: leaders,
                 descriptions: BTreeMap::new(),
-                progress: Progress::new(now),
             };
             deliveries.push(UndercoverDelivery::Hall(format!(
-                "{}最高票并列，进入并列加赛，请并列玩家私聊 @描述 内容",
+                "{}最高票并列，进入并列加赛，请并列玩家在公屏发送 #内容",
                 positions
             )));
         }
@@ -1118,20 +995,19 @@ fn resolve_votes(
         )));
         true
     } else {
-        start_next_round(game, now);
+        start_next_round(game);
         deliveries.push(UndercoverDelivery::Hall(format!(
-            "第{}轮开始，请存活玩家好友私聊 @描述 内容",
+            "第{}轮开始，请存活玩家在公屏发送 #内容",
             game.round
         )));
         false
     }
 }
 
-fn start_next_round(game: &mut Playing, now: Instant) {
+fn start_next_round(game: &mut Playing) {
     game.round = game.round.saturating_add(1);
     game.phase = Phase::Describing {
         descriptions: BTreeMap::new(),
-        progress: Progress::new(now),
     };
 }
 
@@ -1347,7 +1223,7 @@ mod tests {
     }
 
     #[test]
-    fn descriptions_are_revealed_together_and_voting_eliminates_the_undercover() {
+    fn public_descriptions_are_not_relayed_and_voting_eliminates_the_undercover() {
         let now = Instant::now();
         let mut game = enabled_game(11);
         game.create("甲", UndercoverMode::Single, now).unwrap();
@@ -1384,14 +1260,15 @@ mod tests {
             let deliveries = game
                 .describe(player, &format!("第{}条描述", index + 1), now)
                 .unwrap();
-            if index == 2 {
-                assert!(matches!(&deliveries[0], UndercoverDelivery::Hall(message)
-                    if message.contains("描述已记录（3/4）")));
-            }
-            if index == 3 {
-                assert!(deliveries.iter().any(|delivery| matches!(delivery,
-                    UndercoverDelivery::HallBatch(lines)
-                        if lines.iter().any(|line| line.starts_with("A：")))));
+            if index < participants.len() - 1 {
+                assert!(deliveries.is_empty());
+            } else {
+                assert_eq!(
+                    deliveries,
+                    vec![UndercoverDelivery::Hall(
+                        "所有存活玩家已描述，请好友私聊 #A".to_string()
+                    )]
+                );
             }
         }
 
@@ -1451,10 +1328,13 @@ mod tests {
             UndercoverDelivery::Hall(message) if message.contains("进入并列加赛"))));
 
         game.describe(&players[0].0, "补充描述一", now).unwrap();
-        let reveal = game.describe(&players[1].0, "补充描述二", now).unwrap();
-        assert!(reveal.iter().any(|delivery| matches!(delivery,
-            UndercoverDelivery::HallBatch(lines)
-                if lines.iter().any(|line| line.contains("加赛描述")))));
+        let completed = game.describe(&players[1].0, "补充描述二", now).unwrap();
+        assert_eq!(
+            completed,
+            vec![UndercoverDelivery::Hall(
+                "并列玩家已完成公屏描述，请其他存活玩家好友私聊 #A".to_string()
+            )]
+        );
 
         let voters = [&players[2], &players[3]];
         game.vote(&voters[0].0, first, now).unwrap();
@@ -1465,7 +1345,7 @@ mod tests {
     }
 
     #[test]
-    fn progress_flushes_after_twenty_seconds_and_idle_phase_settles_after_three_minutes() {
+    fn voting_reminds_missing_positions_every_twenty_seconds() {
         let now = Instant::now();
         let mut game = enabled_game(23);
         game.create("甲", UndercoverMode::Single, now).unwrap();
@@ -1475,23 +1355,42 @@ mod tests {
         let deliveries = game
             .start(UndercoverWordPair::new("苹果", "梨"), now)
             .unwrap();
-        let first = match &deliveries[0] {
-            UndercoverDelivery::Friend { player, .. } => player.clone(),
-            _ => unreachable!(),
-        };
+        let players = deliveries
+            .iter()
+            .filter_map(|delivery| match delivery {
+                UndercoverDelivery::Friend { player, message } => {
+                    Some((player.clone(), message_position(message)))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         game.complete_delivery(now).unwrap();
-        game.describe(&first, "一种常见事物", now).unwrap();
+        for (index, (player, _)) in players.iter().enumerate() {
+            game.describe(player, &format!("第{}人描述", index + 1), now)
+                .unwrap();
+        }
+        game.vote(&players[0].0, players[1].1, now).unwrap();
 
-        let progress = game.tick(now + std::time::Duration::from_secs(20));
-        assert!(progress.iter().any(|delivery| matches!(delivery,
-            UndercoverDelivery::Hall(message)
-                if message.contains("描述已记录（1/4）"))));
+        let before = game.tick(now + std::time::Duration::from_secs(19));
+        assert!(before.is_empty());
 
-        let settled = game.tick(now + std::time::Duration::from_secs(180));
-        assert!(settled.iter().any(|delivery| matches!(delivery,
-            UndercoverDelivery::HallBatch(lines)
-                if lines.first().is_some_and(|line| line.contains("谁是卧底结束")))));
-        assert!(!game.is_active());
+        let first_reminder = game.tick(now + std::time::Duration::from_secs(20));
+        assert_eq!(first_reminder.len(), 1);
+        let UndercoverDelivery::Hall(message) = &first_reminder[0] else {
+            panic!("expected hall reminder");
+        };
+        assert!(message.starts_with("未投票："));
+        assert!(!message.contains(players[0].1));
+        for (_, position) in players.iter().skip(1) {
+            assert!(message.contains(*position));
+        }
+
+        assert!(
+            game.tick(now + std::time::Duration::from_secs(39))
+                .is_empty()
+        );
+        let second_reminder = game.tick(now + std::time::Duration::from_secs(40));
+        assert_eq!(second_reminder, first_reminder);
     }
 
     #[test]

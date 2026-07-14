@@ -11,13 +11,34 @@ use crate::observation::shared::{ObservationGap, ObservationRead, ObservationSub
 
 const SHARED_CHAT_HISTORY_CAPACITY: usize = 64;
 
+#[derive(Clone)]
+pub(super) struct SecondaryObservedMessage {
+    pub(super) text: String,
+    pub(super) sender: Option<String>,
+}
+
+#[derive(Clone)]
+pub(super) struct SecondaryChatObservation {
+    pub(super) message_type: String,
+    pub(super) friend_name: String,
+    pub(super) accepts_turtle_questions: bool,
+    pub(super) messages: Vec<SecondaryObservedMessage>,
+}
+
+#[derive(Clone)]
+enum ChatObservation {
+    Primary(Vec<ChatMessage>),
+    Secondary(SecondaryChatObservation),
+}
+
 pub(super) enum ChatObservationDispatch {
-    Messages(Vec<ChatMessage>),
+    Primary(Vec<ChatMessage>),
+    Secondary(SecondaryChatObservation),
     Gap(ObservationGap),
 }
 
 struct ChatObservationState {
-    router: ExclusiveObservationRouter<Vec<ChatMessage>>,
+    router: ExclusiveObservationRouter<ChatObservation>,
     business: ObservationSubscriber,
 }
 
@@ -38,16 +59,27 @@ impl ChatObservationShared {
         }
     }
 
-    pub(super) fn publish(
+    pub(super) fn publish_primary(
         &self,
         messages: Vec<ChatMessage>,
     ) -> Result<Vec<ChatObservationDispatch>> {
+        self.publish(ChatObservation::Primary(messages))
+    }
+
+    pub(super) fn publish_secondary(
+        &self,
+        observation: SecondaryChatObservation,
+    ) -> Result<Vec<ChatObservationDispatch>> {
+        self.publish(ChatObservation::Secondary(observation))
+    }
+
+    fn publish(&self, observation: ChatObservation) -> Result<Vec<ChatObservationDispatch>> {
         let mut state = self
             .state
             .lock()
             .map_err(|_| anyhow!("聊天观察流状态锁已损坏"))?;
         if matches!(
-            state.router.route(messages),
+            state.router.route(observation),
             RoutedObservation::Exclusive { .. }
         ) {
             return Ok(Vec::new());
@@ -58,9 +90,14 @@ impl ChatObservationShared {
             let ChatObservationState { router, business } = &mut *state;
             match router.read_next(business) {
                 Some(ObservationRead::Item { value, .. }) => {
-                    dispatches.push(ChatObservationDispatch::Messages(Arc::unwrap_or_clone(
-                        value,
-                    )));
+                    dispatches.push(match Arc::unwrap_or_clone(value) {
+                        ChatObservation::Primary(messages) => {
+                            ChatObservationDispatch::Primary(messages)
+                        }
+                        ChatObservation::Secondary(observation) => {
+                            ChatObservationDispatch::Secondary(observation)
+                        }
+                    });
                 }
                 Some(ObservationRead::Gap(gap)) => {
                     dispatches.push(ChatObservationDispatch::Gap(gap));

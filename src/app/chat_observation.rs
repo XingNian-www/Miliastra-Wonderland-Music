@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow};
 
+use super::change_detection::{ChangeFingerprint, change_stats};
 use super::chat_scan::ChatMessage;
 use crate::observation::chat::{
     BubbleSequence, ChatIdentity, ObservedChatMessageId, VisualSessionId,
@@ -13,6 +14,12 @@ use crate::observation::exclusive::{
 use crate::observation::shared::{ObservationGap, ObservationRead, ObservationSubscriber};
 
 const SHARED_CHAT_HISTORY_CAPACITY: usize = 64;
+
+#[derive(Clone)]
+pub(super) struct PrimaryObservedMessage {
+    pub(super) id: ObservedChatMessageId,
+    pub(super) message: ChatMessage,
+}
 
 #[derive(Clone)]
 pub(super) struct SecondaryRecognizedMessage {
@@ -37,12 +44,12 @@ pub(super) struct SecondaryChatObservation {
 
 #[derive(Clone)]
 enum ChatObservation {
-    Primary(Vec<ChatMessage>),
+    Primary(Vec<PrimaryObservedMessage>),
     Secondary(SecondaryChatObservation),
 }
 
 pub(super) enum ChatObservationDispatch {
-    Primary(Vec<ChatMessage>),
+    Primary(Vec<PrimaryObservedMessage>),
     Secondary(SecondaryChatObservation),
     Gap(ObservationGap),
 }
@@ -52,6 +59,15 @@ struct ChatObservationState {
     business: ObservationSubscriber,
     visual_session: VisualSessionId,
     next_bubble_sequence: u64,
+    primary_visible: Vec<PrimaryTrackedMessage>,
+    change_mean_threshold: f32,
+    change_pixel_threshold: f32,
+}
+
+struct PrimaryTrackedMessage {
+    id: ObservedChatMessageId,
+    message_type: String,
+    visual: ChangeFingerprint,
 }
 
 #[derive(Clone)]
@@ -60,7 +76,7 @@ pub(super) struct ChatObservationShared {
 }
 
 impl ChatObservationShared {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(change_mean_threshold: f32, change_pixel_threshold: f32) -> Self {
         let router = ExclusiveObservationRouter::new(
             NonZeroUsize::new(SHARED_CHAT_HISTORY_CAPACITY)
                 .expect("shared chat history capacity is non-zero"),
@@ -72,6 +88,9 @@ impl ChatObservationShared {
                 business,
                 visual_session: VisualSessionId::new(1),
                 next_bubble_sequence: 1,
+                primary_visible: Vec::new(),
+                change_mean_threshold,
+                change_pixel_threshold,
             })),
         }
     }
@@ -80,7 +99,40 @@ impl ChatObservationShared {
         &self,
         messages: Vec<ChatMessage>,
     ) -> Result<Vec<ChatObservationDispatch>> {
-        self.publish(ChatObservation::Primary(messages))
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("聊天观察流状态锁已损坏"))?;
+        if messages.is_empty() {
+            return Self::publish_locked(&mut state, ChatObservation::Primary(Vec::new()));
+        }
+
+        let previous_ids = match_primary_messages(&state, &messages);
+        let mut observed = Vec::with_capacity(messages.len());
+        for (index, message) in messages.into_iter().enumerate() {
+            let id = previous_ids[index].clone().unwrap_or_else(|| {
+                let id = ObservedChatMessageId::new(
+                    state.visual_session,
+                    ChatIdentity::PrimaryHall,
+                    BubbleSequence::new(state.next_bubble_sequence),
+                );
+                state.next_bubble_sequence = state
+                    .next_bubble_sequence
+                    .checked_add(1)
+                    .expect("primary chat bubble sequence exhausted");
+                id
+            });
+            observed.push(PrimaryObservedMessage { id, message });
+        }
+        state.primary_visible = observed
+            .iter()
+            .map(|observed| PrimaryTrackedMessage {
+                id: observed.id.clone(),
+                message_type: observed.message.message_type.clone(),
+                visual: observed.message.visual.clone(),
+            })
+            .collect();
+        Self::publish_locked(&mut state, ChatObservation::Primary(observed))
     }
 
     pub(super) fn publish_secondary(
@@ -125,14 +177,6 @@ impl ChatObservationShared {
                 messages: observed,
             }),
         )
-    }
-
-    fn publish(&self, observation: ChatObservation) -> Result<Vec<ChatObservationDispatch>> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow!("聊天观察流状态锁已损坏"))?;
-        Self::publish_locked(&mut state, observation)
     }
 
     fn publish_locked(
@@ -183,6 +227,7 @@ impl ChatObservationShared {
             .expect("chat visual session sequence exhausted");
         state.visual_session = VisualSessionId::new(next);
         state.next_bubble_sequence = 1;
+        state.primary_visible.clear();
         Ok(state.visual_session)
     }
 
@@ -209,6 +254,63 @@ impl ChatObservationShared {
     }
 }
 
+fn match_primary_messages(
+    state: &ChatObservationState,
+    current: &[ChatMessage],
+) -> Vec<Option<ObservedChatMessageId>> {
+    let previous = &state.primary_visible;
+    let mut lengths = vec![vec![0usize; current.len() + 1]; previous.len() + 1];
+    for left in (0..previous.len()).rev() {
+        for right in (0..current.len()).rev() {
+            lengths[left][right] = if primary_visual_matches(
+                &previous[left],
+                &current[right],
+                state.change_mean_threshold,
+                state.change_pixel_threshold,
+            ) {
+                1 + lengths[left + 1][right + 1]
+            } else {
+                lengths[left + 1][right].max(lengths[left][right + 1])
+            };
+        }
+    }
+
+    let mut matches = vec![None; current.len()];
+    let mut left = 0usize;
+    let mut right = 0usize;
+    while left < previous.len() && right < current.len() {
+        if primary_visual_matches(
+            &previous[left],
+            &current[right],
+            state.change_mean_threshold,
+            state.change_pixel_threshold,
+        ) && lengths[left][right] == 1 + lengths[left + 1][right + 1]
+        {
+            matches[right] = Some(previous[left].id.clone());
+            left += 1;
+            right += 1;
+        } else if lengths[left + 1][right] >= lengths[left][right + 1] {
+            left += 1;
+        } else {
+            right += 1;
+        }
+    }
+    matches
+}
+
+fn primary_visual_matches(
+    previous: &PrimaryTrackedMessage,
+    current: &ChatMessage,
+    mean_threshold: f32,
+    pixel_threshold: f32,
+) -> bool {
+    if previous.message_type != current.message_type {
+        return false;
+    }
+    let stats = change_stats(&previous.visual, &current.visual);
+    stats.mean_abs_diff < mean_threshold && stats.changed_ratio < pixel_threshold
+}
+
 pub(super) struct ChatObservationExclusiveGuard {
     shared: ChatObservationShared,
     session: Option<ExclusiveSessionId>,
@@ -222,5 +324,45 @@ impl Drop for ChatObservationExclusiveGuard {
         if let Err(error) = self.shared.finish_exclusive(session) {
             log::error!("结束独占聊天观察会话失败: {error:#}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::change_detection::ChangeFingerprint;
+    use crate::app::geometry::Rect;
+
+    #[test]
+    fn primary_ocr_revision_keeps_the_visual_message_identity() {
+        let shared = ChatObservationShared::new(6.0, 0.03);
+
+        let first = shared.publish_primary(vec![message("第一次 OCR")]).unwrap();
+        let first_id = primary_id(&first);
+        let revised = shared
+            .publish_primary(vec![message("修订后的 OCR")])
+            .unwrap();
+
+        assert_eq!(primary_id(&revised), first_id);
+    }
+
+    fn message(text: &str) -> ChatMessage {
+        ChatMessage {
+            message_type: "blue".to_string(),
+            block: Rect::new(0, 0, 10, 10),
+            text: text.to_string(),
+            visual: ChangeFingerprint {
+                pixels: vec![10, 20, 30, 40],
+                width: 2,
+                height: 2,
+            },
+        }
+    }
+
+    fn primary_id(dispatches: &[ChatObservationDispatch]) -> ObservedChatMessageId {
+        let ChatObservationDispatch::Primary(messages) = &dispatches[0] else {
+            panic!("primary observation was not dispatched");
+        };
+        messages[0].id.clone()
     }
 }

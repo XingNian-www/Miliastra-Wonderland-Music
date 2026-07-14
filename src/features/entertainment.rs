@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Result, anyhow};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum EntertainmentKind {
+pub(crate) enum EntertainmentKind {
     IdiomChain,
     Landlord,
     RunFast,
@@ -12,7 +12,7 @@ pub(super) enum EntertainmentKind {
 }
 
 impl EntertainmentKind {
-    pub(super) fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::IdiomChain => "成语接龙",
             Self::Landlord => "斗地主",
@@ -24,23 +24,23 @@ impl EntertainmentKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum AcquireOutcome {
+pub(crate) enum AcquireOutcome {
     Acquired,
     AlreadyOwned,
     Occupied(EntertainmentKind),
 }
 
 #[derive(Clone, Default)]
-pub(super) struct EntertainmentCoordinator {
+pub(crate) struct EntertainmentCoordinator {
     active: Arc<Mutex<Option<EntertainmentKind>>>,
 }
 
 impl EntertainmentCoordinator {
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
-    pub(super) fn try_acquire(&self, kind: EntertainmentKind) -> Result<AcquireOutcome> {
+    pub(crate) fn try_acquire(&self, kind: EntertainmentKind) -> Result<AcquireOutcome> {
         let mut active = self
             .active
             .lock()
@@ -55,7 +55,7 @@ impl EntertainmentCoordinator {
         }
     }
 
-    pub(super) fn release(&self, kind: EntertainmentKind) {
+    pub(crate) fn release(&self, kind: EntertainmentKind) {
         match self.active.lock() {
             Ok(mut active) if *active == Some(kind) => *active = None,
             Ok(_) => {}
@@ -63,7 +63,7 @@ impl EntertainmentCoordinator {
         }
     }
 
-    pub(super) fn active(&self) -> Option<EntertainmentKind> {
+    pub(crate) fn active(&self) -> Option<EntertainmentKind> {
         self.active.lock().ok().and_then(|active| *active)
     }
 }

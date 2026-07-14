@@ -2,7 +2,7 @@
 # 坐标沿用旧脚本习惯：以游戏客户区左上角为原点，按 1920x1080 有效画面写坐标
 
 # 配置版本；程序启动时会把旧版本配置迁移到当前模板
-config_version: 26
+config_version: 27
 
 window:
   # 目标游戏进程名，按进程文件名匹配，大小写不敏感；多个进程名可用逗号分隔
@@ -61,6 +61,10 @@ screen:
     y: 520
     width: 110
     height: 40
+
+stability:
+  # 连续确认次数的全局默认值；只有大于 1 才生效，否则使用内置默认值 2
+  default_count: 2
 
 timing:
   # 1. 监听子进程异常退出后的重启等待时间，单位毫秒
@@ -419,10 +423,10 @@ turtle_soup:
   max_pending: 32
   # 单个昵称的一份批量长答案最多暂存多少段；每段仍受游戏聊天长度限制
   batch_max_parts: 32
-  # 昵称 OCR 必须连续一致多少次才确认发言者；同一问题下仅有一个字符差异的昵称视为 OCR 变体；小于 1 时按 1 处理
-  nickname_stable_count: 2
-  # 正文 OCR 必须连续一致多少次才暂存、提交或送入 AI 裁决；小于 1 时按 1 处理
-  content_stable_count: 2
+  # 昵称 OCR 连续确认次数；大于 1 时覆盖全局值，0 或 1 表示继承
+  nickname_stable_count: 0
+  # 正文 OCR 连续确认次数；大于 1 时覆盖全局值，0 或 1 表示继承
+  content_stable_count: 0
   # 单次 AI 请求超时，单位秒
   request_timeout_seconds: 20
   # 单次裁决请求失败后的重试次数；实际最多请求 retry_count + 1 次
@@ -598,8 +602,8 @@ startup:
     y: 310
 
 invite:
-  # 好友备注在左侧列表和聊天内容区必须连续完整匹配多少次；小于 1 按 1 处理
-  friend_name_stable_count: 2
+  # 好友备注连续完整匹配次数；大于 1 时覆盖全局值，0 或 1 表示继承
+  friend_name_stable_count: 0
   # 好友列表 OCR 区域，用于查找发起邀请的用户名
   friend_list_region:
     x: 80

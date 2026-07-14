@@ -1370,7 +1370,9 @@ impl AutomationApp {
         let region = locator.region(self.config.invite.confirm_list_region.into());
         let deadline =
             Instant::now() + Duration::from_millis(self.config.timing.workflow.default_timeout_ms);
-        let required_streak = self.config.invite.friend_name_stable_count.max(1);
+        let required_streak = self
+            .config
+            .resolve_stability_count(self.config.invite.friend_name_stable_count);
         let mut streak = 0_u32;
         while Instant::now() < deadline && self.running.load(AtomicOrdering::SeqCst) {
             let point = {
@@ -1519,7 +1521,7 @@ impl AutomationApp {
         let region = locator.region(self.config.invite.friend_list_region.into());
         let deadline =
             Instant::now() + Duration::from_millis(self.config.timing.workflow.default_timeout_ms);
-        let required_streak = stable_count.max(1);
+        let required_streak = self.config.resolve_stability_count(stable_count);
         let mut streak = 0_u32;
         while Instant::now() < deadline && self.running.load(AtomicOrdering::SeqCst) {
             let hits = {
@@ -1571,7 +1573,7 @@ impl AutomationApp {
         username: &str,
         stable_count: u32,
     ) -> Result<bool> {
-        let required_streak = stable_count.max(1);
+        let required_streak = self.config.resolve_stability_count(stable_count);
         let title_timeout_ms = self.config.timing.workflow.default_timeout_ms.min(2_000);
         let title_matched = workflow_actions::wait_latest_incoming_sender_match(
             locator,

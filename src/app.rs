@@ -880,8 +880,13 @@ impl AutomationApp {
             config.undercover.used_state_path.clone(),
         );
         let deferred_chat = DeferredChatQueue::new(DEFERRED_CHAT_CAPACITY);
+        let mut turtle_soup_config = config.turtle_soup.clone();
+        turtle_soup_config.nickname_stable_count =
+            config.resolve_stability_count_usize(turtle_soup_config.nickname_stable_count);
+        turtle_soup_config.content_stable_count =
+            config.resolve_stability_count_usize(turtle_soup_config.content_stable_count);
         let turtle_soup = TurtleSoupService::new(
-            config.turtle_soup.clone(),
+            turtle_soup_config,
             entertainment.clone(),
             deferred_chat.clone(),
         );

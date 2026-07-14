@@ -1,7 +1,7 @@
 use anyhow::Result;
 use image::{DynamicImage, GenericImageView};
 use miliastra_wonderland_music::runtime::ui::{
-    CaptureFrame, FrameDemand, InputCertainty, UiDevice, UiRuntime,
+    CaptureFrame, FrameDemand, FramePublication, InputCertainty, UiDevice, UiRuntime,
 };
 use std::time::Duration;
 
@@ -77,9 +77,12 @@ fn declared_frame_demand_publishes_frames_and_the_latest_snapshot() {
     let demand = handle
         .declare_frame_demand(FrameDemand::new(Duration::from_millis(10)).unwrap())
         .expect("frame demand should be accepted");
-    let published = demand
+    let publication = demand
         .recv_timeout(Duration::from_secs(1))
         .expect("frame demand should publish");
+    let FramePublication::Captured(published) = publication else {
+        panic!("fixed frame device should publish a captured frame");
+    };
 
     assert_eq!(published.image().dimensions(), (11, 9));
     let latest = handle
@@ -87,5 +90,24 @@ fn declared_frame_demand_publishes_frames_and_the_latest_snapshot() {
         .expect("latest frame should be cached");
     assert_eq!(latest.image().dimensions(), (11, 9));
     assert_eq!(latest.captured_at(), published.captured_at());
+    runtime.shutdown().expect("UI runtime should stop");
+}
+
+#[test]
+fn declared_frame_demand_reports_capture_failure() {
+    let runtime = UiRuntime::start(FailingCaptureDevice, 1).expect("UI runtime should start");
+    let demand = runtime
+        .handle()
+        .declare_frame_demand(FrameDemand::new(Duration::from_millis(10)).unwrap())
+        .expect("frame demand should be accepted");
+
+    let publication = demand
+        .recv_timeout(Duration::from_secs(1))
+        .expect("frame demand should report a terminal capture result");
+    let FramePublication::Failed(failure) = publication else {
+        panic!("failing device should publish a capture failure");
+    };
+
+    assert!(failure.reason().contains("game window is unavailable"));
     runtime.shutdown().expect("UI runtime should stop");
 }

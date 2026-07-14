@@ -121,6 +121,7 @@ use crate::features::undercover::repository::UndercoverBankStore;
 use crate::features::undercover::{
     UndercoverCommand, UndercoverDelivery, UndercoverGame, UndercoverMode,
 };
+use crate::observation::chat::ObservedFrame;
 use crate::runtime::ui::{
     FrameDemand, FrameDemandSubscription, FramePublication, UiRuntime, UiRuntimeHandle,
 };
@@ -1712,6 +1713,9 @@ impl AutomationApp {
                                     Ok(frame) => {
                                         let rescan_frame_ms = elapsed_ms(rescan_frame_started);
                                         let scan_started = Instant::now();
+                                        let observation_frame = self
+                                            .chat_observations
+                                            .begin_frame(frame.captured_at)?;
                                         let messages = self.scan_chat_with_shared_ocr(
                                             &frame.image,
                                             &template_args,
@@ -1723,11 +1727,22 @@ impl AutomationApp {
                                             scan_ms
                                         );
                                         match messages {
-                                            Ok(messages) => {
-                                                self.publish_primary_chat_observation(messages)?
-                                            }
+                                            Ok(messages) => self.publish_primary_chat_observation(
+                                                observation_frame,
+                                                messages,
+                                            )?,
                                             Err(error) => {
-                                                log::error!("聊天扫描失败: {error:#}")
+                                                log::error!("聊天扫描失败: {error:#}");
+                                                if let Err(record_error) =
+                                                    self.chat_observations.record_terminal_failure(
+                                                        observation_frame,
+                                                        format!("{error:#}"),
+                                                    )
+                                                {
+                                                    log::error!(
+                                                        "记录聊天观察终止失败异常: {record_error:#}"
+                                                    );
+                                                }
                                             }
                                         }
                                         last_ocr_at = Instant::now();
@@ -1754,13 +1769,28 @@ impl AutomationApp {
                                     reason,
                                     now.duration_since(last_ocr_at).as_millis()
                                 );
+                                let observation_frame =
+                                    self.chat_observations.begin_frame(frame.captured_at)?;
                                 let messages =
                                     self.scan_chat_with_shared_ocr(&frame.image, &template_args);
                                 match messages {
-                                    Ok(messages) => {
-                                        self.publish_primary_chat_observation(messages)?
+                                    Ok(messages) => self.publish_primary_chat_observation(
+                                        observation_frame,
+                                        messages,
+                                    )?,
+                                    Err(error) => {
+                                        log::error!("聊天扫描失败: {error:#}");
+                                        if let Err(record_error) =
+                                            self.chat_observations.record_terminal_failure(
+                                                observation_frame,
+                                                format!("{error:#}"),
+                                            )
+                                        {
+                                            log::error!(
+                                                "记录聊天观察终止失败异常: {record_error:#}"
+                                            );
+                                        }
                                     }
-                                    Err(error) => log::error!("聊天扫描失败: {error:#}"),
                                 }
                                 last_ocr_at = now;
                                 force_scan_after = None;
@@ -2018,9 +2048,13 @@ impl AutomationApp {
         }
 
         let refreshed = self.wait_for_secondary_bubble_stability()?;
-        let refreshed_fingerprint = latest_incoming_fingerprint(&refreshed)?;
-        let outcome =
-            self.process_secondary_latest_message(&refreshed, message_type, friend_name)?;
+        let refreshed_fingerprint = latest_incoming_fingerprint(&refreshed.image)?;
+        let outcome = self.process_secondary_latest_message(
+            &refreshed.image,
+            refreshed.captured_at,
+            message_type,
+            friend_name,
+        )?;
         *last_bubble = refreshed_fingerprint;
         Ok(outcome)
     }
@@ -2052,7 +2086,7 @@ impl AutomationApp {
         }
 
         let refreshed = self.wait_for_secondary_bubble_stability()?;
-        let refreshed_bubbles = secondary_hall_bubbles(&refreshed)?;
+        let refreshed_bubbles = secondary_hall_bubbles(&refreshed.image)?;
         let refreshed_overlap = hall_bubble_sequence_overlap(previous, &refreshed_bubbles);
         if refreshed_overlap == 0 {
             self.turtle_soup.clear_secondary_ocr_stability();
@@ -2072,7 +2106,8 @@ impl AutomationApp {
             new_bubbles.len()
         );
         let outcome = self.process_secondary_bubble_rects(
-            &refreshed,
+            &refreshed.image,
+            refreshed.captured_at,
             new_bubbles.iter().map(|bubble| bubble.rect),
             "blue",
             "",
@@ -2085,8 +2120,12 @@ impl AutomationApp {
         Ok(outcome.processed)
     }
 
-    fn publish_primary_chat_observation(&mut self, messages: Vec<ChatMessage>) -> Result<()> {
-        let dispatches = self.chat_observations.publish_primary(messages)?;
+    fn publish_primary_chat_observation(
+        &mut self,
+        frame: ObservedFrame,
+        messages: Vec<ChatMessage>,
+    ) -> Result<()> {
+        let dispatches = self.chat_observations.publish_primary(frame, messages)?;
         self.dispatch_chat_observations(dispatches)?;
         Ok(())
     }
@@ -3367,13 +3406,23 @@ impl AutomationApp {
             }
 
             if !discard_only {
-                let image = self.wait_for_secondary_bubble_stability()?;
-                match self.secondary_identity_from_frame(&image)? {
+                let frame = self.wait_for_secondary_bubble_stability()?;
+                match self.secondary_identity_from_frame(&frame.image)? {
                     SecondaryChatIdentity::Friend(name) => {
-                        self.process_secondary_latest_message(&image, "pink", &name)?;
+                        self.process_secondary_latest_message(
+                            &frame.image,
+                            frame.captured_at,
+                            "pink",
+                            &name,
+                        )?;
                     }
                     SecondaryChatIdentity::Unknown => {
-                        self.process_secondary_latest_message(&image, "pink", "二级好友")?;
+                        self.process_secondary_latest_message(
+                            &frame.image,
+                            frame.captured_at,
+                            "pink",
+                            "二级好友",
+                        )?;
                     }
                     SecondaryChatIdentity::CurrentHall
                     | SecondaryChatIdentity::PublicChannel
@@ -3701,7 +3750,7 @@ impl AutomationApp {
         }
 
         let refreshed = self.wait_for_secondary_bubble_stability()?;
-        let refreshed_bubbles = secondary_hall_bubbles(&refreshed)?;
+        let refreshed_bubbles = secondary_hall_bubbles(&refreshed.image)?;
         let Some(start) = secondary_new_bubble_start(previous, &refreshed_bubbles) else {
             *previous = refreshed_bubbles;
             log::debug!("二级确认气泡稳定后失去重叠，已重建基线");
@@ -3711,7 +3760,7 @@ impl AutomationApp {
             .iter()
             .map(|bubble| bubble.rect)
             .collect::<Vec<_>>();
-        let messages = self.recognize_secondary_hall_messages(&refreshed, &rects)?;
+        let messages = self.recognize_secondary_hall_messages(&refreshed.image, &rects)?;
         *previous = refreshed_bubbles;
         Ok(messages)
     }
@@ -3755,6 +3804,7 @@ impl AutomationApp {
     fn process_secondary_latest_message(
         &mut self,
         image: &DynamicImage,
+        captured_at: Instant,
         message_type: &str,
         friend_name: &str,
     ) -> Result<bool> {
@@ -3764,6 +3814,7 @@ impl AutomationApp {
         Ok(self
             .process_secondary_bubble_rects(
                 image,
+                captured_at,
                 std::iter::once(rect),
                 message_type,
                 friend_name,
@@ -3774,40 +3825,58 @@ impl AutomationApp {
     fn process_secondary_bubble_rects(
         &mut self,
         image: &DynamicImage,
+        captured_at: Instant,
         rects: impl IntoIterator<Item = Rect>,
         message_type: &str,
         friend_name: &str,
     ) -> Result<SecondaryBubbleProcessOutcome> {
         let started = Instant::now();
+        let observation_frame = self.chat_observations.begin_frame(captured_at)?;
         let ocr_started = Instant::now();
         let accepts_turtle_questions = message_type == "blue"
             && self.commands_enabled.load(AtomicOrdering::SeqCst)
             && self.turtle_soup.accepts_questions();
         let captures_hash_sender =
             message_type == "blue" && self.commands_enabled.load(AtomicOrdering::SeqCst);
-        let mut texts = Vec::new();
-        for rect in rects {
-            let crop = crop_canvas(image, rect)?;
-            let text = self.ocr.merged_text(
-                crop,
-                self.config.ocr.same_line_y_tolerance,
-                OcrPriority::ChatObservation,
-            )?;
-            let trimmed_text = text.trim_start();
-            let starts_with_hash = trimmed_text.starts_with('#') || trimmed_text.starts_with('＃');
-            let message_sender = if captures_hash_sender && starts_with_hash {
-                let sender_rect = secondary_message_sender_rect(image, rect);
-                let crop = crop_canvas(image, sender_rect)?;
-                Some(self.ocr.merged_text(
+        let texts = (|| -> Result<Vec<(Rect, String, Option<String>)>> {
+            let mut texts = Vec::new();
+            for rect in rects {
+                let crop = crop_canvas(image, rect)?;
+                let text = self.ocr.merged_text(
                     crop,
                     self.config.ocr.same_line_y_tolerance,
                     OcrPriority::ChatObservation,
-                )?)
-            } else {
-                None
-            };
-            texts.push((rect, text, message_sender));
-        }
+                )?;
+                let trimmed_text = text.trim_start();
+                let starts_with_hash =
+                    trimmed_text.starts_with('#') || trimmed_text.starts_with('＃');
+                let message_sender = if captures_hash_sender && starts_with_hash {
+                    let sender_rect = secondary_message_sender_rect(image, rect);
+                    let crop = crop_canvas(image, sender_rect)?;
+                    Some(self.ocr.merged_text(
+                        crop,
+                        self.config.ocr.same_line_y_tolerance,
+                        OcrPriority::ChatObservation,
+                    )?)
+                } else {
+                    None
+                };
+                texts.push((rect, text, message_sender));
+            }
+            Ok(texts)
+        })();
+        let texts = match texts {
+            Ok(texts) => texts,
+            Err(error) => {
+                if let Err(record_error) = self
+                    .chat_observations
+                    .record_terminal_failure(observation_frame, format!("{error:#}"))
+                {
+                    log::error!("记录二级聊天观察终止失败异常: {record_error:#}");
+                }
+                return Err(error);
+            }
+        };
         let ocr_ms = elapsed_ms(ocr_started);
         self.monitor.set_ocr(OcrSnapshot::new(
             texts.len(),
@@ -3835,6 +3904,8 @@ impl AutomationApp {
                 .collect::<Vec<_>>();
             match self.turtle_soup.stabilize_secondary_ocr(observations) {
                 SecondaryOcrStability::Pending => {
+                    self.chat_observations
+                        .complete_without_messages(observation_frame)?;
                     return Ok(SecondaryBubbleProcessOutcome {
                         processed: false,
                         ocr_pending: true,
@@ -3858,6 +3929,7 @@ impl AutomationApp {
             .map(|(text, sender)| SecondaryRecognizedMessage { text, sender })
             .collect();
         let dispatches = self.chat_observations.publish_secondary(
+            observation_frame,
             message_type,
             friend_name,
             accepts_turtle_questions,
@@ -3952,7 +4024,7 @@ impl AutomationApp {
         Ok(processed)
     }
 
-    fn wait_for_secondary_bubble_stability(&self) -> Result<DynamicImage> {
+    fn wait_for_secondary_bubble_stability(&self) -> Result<frame_source::Frame> {
         const STABILITY_TIMEOUT_MS: u64 = 500;
 
         let canvas = Canvas {
@@ -3963,7 +4035,7 @@ impl AutomationApp {
         let frame_args = FrameArgs { image: None };
         let first = load_frame(&frame_args, &canvas, &self.game_ui)?;
         let mut previous = latest_incoming_fingerprint(&first.image)?;
-        let mut latest_image = (*first.image).clone();
+        let mut latest_frame = first;
         let poll_ms = self
             .config
             .timing
@@ -3977,13 +4049,13 @@ impl AutomationApp {
             let frame = load_frame(&frame_args, &canvas, &self.game_ui)?;
             let current = latest_incoming_fingerprint(&frame.image)?;
             if !secondary_optional_fingerprint_changed(previous.as_ref(), current.as_ref()) {
-                return Ok((*frame.image).clone());
+                return Ok(frame);
             }
             previous = current;
-            latest_image = (*frame.image).clone();
+            latest_frame = frame;
         }
         log::debug!("二级监听气泡稳定等待超时，按当前画面继续 OCR");
-        Ok(latest_image)
+        Ok(latest_frame)
     }
 
     fn execute_start_game_task(&mut self, source: &'static str) -> Result<()> {

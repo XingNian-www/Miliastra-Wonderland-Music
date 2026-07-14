@@ -21,21 +21,21 @@ mod http_server;
 pub(crate) mod idiom_chain;
 mod input_actions;
 pub(crate) mod landlord;
-mod logger;
-mod monitor;
+pub(crate) mod logger;
+pub(crate) mod monitor;
 mod ocr;
 mod ocr_batch;
 mod playback_format;
 mod player_controller;
-mod queue;
-mod runtime_state;
-mod song_dedup;
+pub(crate) mod queue;
+pub(crate) mod runtime_state;
+pub(crate) mod song_dedup;
 mod song_matcher;
 mod song_review;
 mod startup_flow;
 mod task_tracker;
 mod template_match;
-mod tui;
+pub(crate) mod tui;
 pub(crate) mod turtle_soup;
 mod turtle_soup_bank;
 mod ui_locator;
@@ -48,7 +48,7 @@ mod workflow_actions;
 
 use std::collections::{HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
-use std::io::{IsTerminal, Write};
+use std::io::Write;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
@@ -291,7 +291,7 @@ pub fn run() -> Result<()> {
 
 fn run_automation_with_watchdog(config_path: &Path) -> Result<()> {
     if std::env::var_os("MILIASTRA_WATCHDOG_CHILD").is_some() {
-        return run_automation(config_path);
+        return crate::composition::run(config_path);
     }
 
     loop {
@@ -314,65 +314,7 @@ fn run_automation_with_watchdog(config_path: &Path) -> Result<()> {
     }
 }
 
-fn run_automation(config_path: &Path) -> Result<()> {
-    let config = AppConfig::load_or_create(config_path)?;
-    let monitor = MonitorShared::new(config.tui.log_lines);
-    let tui_handle = if config.tui.enabled && std::io::stdout().is_terminal() {
-        match tui::TuiHandle::start(&config.tui, monitor.clone()) {
-            Ok(handle) => Some(handle),
-            Err(error) => {
-                eprintln!("TUI 启动失败，回退普通日志输出: {error:#}");
-                None
-            }
-        }
-    } else if config.tui.enabled {
-        eprintln!("检测到非交互终端，已关闭 TUI");
-        None
-    } else {
-        None
-    };
-    let log_paths = logger::init(
-        &config.logging,
-        Some(monitor.log_sink()),
-        tui_handle.is_none(),
-    )?;
-    log::info!("日志文件: {}", log_paths.main.display());
-    log::info!("性能日志文件: {}", log_paths.timing.display());
-    log::info!("配置文件: {}", config_path.display());
-    log::info!(
-        "HTTP/Web 面板: {}:{} enabled={}",
-        config.http.host,
-        config.http.port,
-        config.http.enabled
-    );
-    log::info!(
-        "FeelUOwn: {}:{}",
-        config.feeluown.host,
-        config.feeluown.port
-    );
-
-    let mut runtime_state = PersistentRuntimeState::load(config.state.runtime_state_path.clone())?;
-    if runtime_state.state_mut().clear_hall_countdown_cache() {
-        runtime_state.save()?;
-        log::info!("启动时已清理上次运行的大厅倒计时缓存，等待本次大厅检测重新确认");
-    }
-    let queue = PersistentQueue::load(config.state.queue_path.clone(), config.queue.max_size)?;
-    let song_dedup_history =
-        PersistentSongDedupHistory::load(config.song_dedup.history_path.clone())?;
-    log::info!("已加载队列: {} 首", queue.len());
-    log::info!("已加载长时间同歌去重历史: {} 条", song_dedup_history.len());
-    log::info!(
-        "已加载运行时状态: playback_state={:?}",
-        runtime_state.state().playback.state
-    );
-
-    let mut app = AutomationApp::new(config, runtime_state, queue, song_dedup_history, monitor)?;
-    let result = app.run();
-    drop(tui_handle);
-    result
-}
-
-struct AutomationApp {
+pub(crate) struct AutomationApp {
     config: AppConfig,
     runtime_state: Arc<Mutex<PersistentRuntimeState>>,
     entertainment: EntertainmentCoordinator,
@@ -904,7 +846,7 @@ impl Drop for ConsoleReplyContextGuard {
 }
 
 impl AutomationApp {
-    fn new(
+    pub(crate) fn new(
         config: AppConfig,
         runtime_state: PersistentRuntimeState,
         queue: PersistentQueue,
@@ -998,7 +940,7 @@ impl AutomationApp {
         })
     }
 
-    fn run(&mut self) -> Result<()> {
+    pub(crate) fn run(&mut self) -> Result<()> {
         self.monitor.set_status("运行中");
         self.update_monitor_queue_snapshot();
         self.update_monitor_playback_controller();

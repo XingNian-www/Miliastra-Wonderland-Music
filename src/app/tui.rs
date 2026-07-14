@@ -27,7 +27,7 @@ const QUEUE_PANEL_HEIGHT: u16 = MAX_QUEUE_ITEMS as u16 + 2;
 const MIN_COMMAND_HEIGHT: u16 = 5;
 const MIN_NARROW_DASHBOARD_HEIGHT: u16 = OCR_PANEL_HEIGHT + QUEUE_PANEL_HEIGHT + 3;
 
-pub(super) struct TuiHandle {
+pub(crate) struct TuiHandle {
     running: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     console_mode_guard: Option<ConsoleInputModeGuard>,
@@ -41,7 +41,7 @@ struct ConsoleInputModeGuard {
 }
 
 impl TuiHandle {
-    pub(super) fn start(config: &TuiConfig, shared: MonitorShared) -> io::Result<Self> {
+    pub(crate) fn start(config: &TuiConfig, shared: MonitorShared) -> io::Result<Self> {
         let console_mode_guard = ConsoleInputModeGuard::disable_quick_edit_and_insert();
         let running = Arc::new(AtomicBool::new(true));
         let backend = CrosstermBackend::new(io::stdout());

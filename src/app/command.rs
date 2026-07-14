@@ -2,9 +2,9 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::entertainment::EntertainmentKind;
 use super::turtle_soup::TurtleSoupCommand;
 use crate::features::card_games::LandlordCommand;
+use crate::features::entertainment::EntertainmentKind;
 use crate::features::idiom_chain::{IdiomChainCommand, IdiomChainMode};
 use crate::features::undercover::UndercoverCommand;
 

@@ -10,7 +10,6 @@ mod decision_control;
 mod decision_lock;
 mod deferred_chat;
 mod dpi;
-mod entertainment;
 mod feeluown;
 mod frame_source;
 mod game_startup;
@@ -74,7 +73,6 @@ use self::deferred_chat::{
     BatchFailureOutcome, DEFAULT_CAPACITY as DEFERRED_CHAT_CAPACITY, DeferredChatItem,
     DeferredChatMessage, DeferredChatQueue, DeferredChatTarget, EnqueueOutcome,
 };
-use self::entertainment::{AcquireOutcome, EntertainmentCoordinator, EntertainmentKind};
 use self::feeluown::{FeelUOwnClient, PlayerStatus, format_lyrics, format_status};
 use self::frame_source::{Canvas, load_frame};
 use self::geometry::{Rect, crop_canvas};
@@ -109,6 +107,7 @@ use self::ui_state::{UiState, detect_ui_state};
 use self::web_tools::{WebToolRequest, WebToolShared, WebToolTask, WebToolTemplate};
 use crate::config::{AppConfig, PointConfig};
 use crate::features::card_games::{LandlordCommand, LandlordGame, LandlordOutcome};
+use crate::features::entertainment::{AcquireOutcome, EntertainmentCoordinator, EntertainmentKind};
 use crate::features::idiom_chain;
 use crate::features::idiom_chain::IdiomChainGame;
 #[cfg(test)]

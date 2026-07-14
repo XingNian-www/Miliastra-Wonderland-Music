@@ -62,7 +62,8 @@ use self::chat_listener::{
 };
 use self::chat_observation::{
     ChatObservationDispatch, ChatObservationExclusiveGuard, ChatObservationShared,
-    SecondaryChatObservation, SecondaryObservedMessage, SecondaryRecognizedMessage,
+    PrimaryObservedMessage, SecondaryChatObservation, SecondaryObservedMessage,
+    SecondaryRecognizedMessage,
 };
 use self::chat_output::{
     ChatBatchSendOutcome, ChatBatchSendStatus, ChatOutput, redacted_chat_text,
@@ -944,6 +945,10 @@ impl AutomationApp {
             &config.matching,
             &config.song_dedup,
         );
+        let chat_observations = ChatObservationShared::new(
+            config.ocr.change_mean_threshold,
+            config.ocr.change_pixel_threshold,
+        );
         Ok(Self {
             config,
             game_ui,
@@ -983,7 +988,7 @@ impl AutomationApp {
             song_command_executing: Arc::new(AtomicBool::new(false)),
             console_reply_context: Arc::new(AtomicBool::new(false)),
             chat_listener: ChatListenerShared::new(),
-            chat_observations: ChatObservationShared::new(),
+            chat_observations,
             monitor,
         })
     }
@@ -2094,6 +2099,13 @@ impl AutomationApp {
         for dispatch in dispatches {
             match dispatch {
                 ChatObservationDispatch::Primary(messages) => {
+                    let messages = messages
+                        .into_iter()
+                        .map(|PrimaryObservedMessage { id, message }| {
+                            log::debug!("处理一级观察消息: id={id:?}");
+                            message
+                        })
+                        .collect();
                     self.handle_scan_messages(messages)?;
                 }
                 ChatObservationDispatch::Secondary(observation) => {
@@ -3722,6 +3734,7 @@ impl AutomationApp {
                 message_type: "blue".to_string(),
                 block: *rect,
                 text,
+                visual: rect_chat_change_fingerprint(image, *rect)?,
             });
         }
         let ocr_ms = elapsed_ms(started);

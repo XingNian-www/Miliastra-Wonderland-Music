@@ -4,5 +4,7 @@ pub mod app;
 mod composition;
 #[cfg(target_os = "windows")]
 mod config;
+#[cfg(target_os = "windows")]
+mod features;
 
 pub mod runtime;

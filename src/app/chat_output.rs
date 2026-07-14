@@ -16,7 +16,7 @@ use crate::config::{
     InviteConfig, OutputConfig, ScreenConfig, TemplateConfig, TimingConfig, WindowConfig,
 };
 
-pub(super) const MAX_CHAT_WIDTH: usize = 80;
+pub(crate) const MAX_CHAT_WIDTH: usize = 80;
 const OMIT: &str = "...";
 const REDACTED_TURTLE_SOUP_BOTTOM: &str = "[海龟汤汤底已隐藏]";
 const REDACTED_UNDERCOVER_SECRET: &str = "[谁是卧底秘密内容已隐藏]";
@@ -213,7 +213,7 @@ impl ChatOutput {
             .into_result(expected)
     }
 
-    pub fn send_current_chat_batch_outcome(
+    pub(super) fn send_current_chat_batch_outcome(
         &self,
         messages: &[&str],
         delay_ms: u64,
@@ -238,7 +238,11 @@ impl ChatOutput {
         outcome
     }
 
-    pub fn send_batch_outcome(&self, messages: &[&str], delay_ms: u64) -> ChatBatchSendOutcome {
+    pub(super) fn send_batch_outcome(
+        &self,
+        messages: &[&str],
+        delay_ms: u64,
+    ) -> ChatBatchSendOutcome {
         let messages = messages
             .iter()
             .map(|message| fit_chat_message(message))
@@ -713,7 +717,7 @@ fn take_display_end(value: &str, max_width: usize) -> String {
     output.into_iter().rev().collect()
 }
 
-pub(super) fn display_width(value: &str) -> usize {
+pub(crate) fn display_width(value: &str) -> usize {
     value.chars().map(char_width).sum()
 }
 

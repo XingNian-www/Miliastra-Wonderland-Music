@@ -1,7 +1,7 @@
 mod ai;
 mod change_detection;
 mod chat_listener;
-mod chat_output;
+pub(crate) mod chat_output;
 mod chat_scan;
 mod clipboard;
 mod command;
@@ -18,9 +18,7 @@ mod geometry;
 mod hall_info;
 mod hotkeys;
 mod http_server;
-pub(crate) mod idiom_chain;
 mod input_actions;
-pub(crate) mod landlord;
 pub(crate) mod logger;
 pub(crate) mod monitor;
 mod ocr;
@@ -86,9 +84,7 @@ use self::hall_info::{
     HALL_INFO_OCR_SAMPLES, HallInfo, HallInfoSample, display_or_empty,
     format_hall_remaining_suffix, merge_hall_info_samples, parse_hall_remaining_minutes,
 };
-use self::idiom_chain::IdiomChainGame;
 use self::input_actions::{click_game_point, ensure_game_ready_for_input, parse_key, press_key};
-use self::landlord::{LandlordCommand, LandlordGame, LandlordOutcome};
 use self::monitor::{MonitorQueueItem, MonitorShared, OcrSnapshot};
 use self::ocr::{
     OcrArgs, OcrBackendProbeStatus, make_ocr_engine, merged_ocr_text, probe_ocr_backend_support,
@@ -116,6 +112,9 @@ use self::undercover::{UndercoverCommand, UndercoverDelivery, UndercoverGame, Un
 use self::undercover_bank::UndercoverBankStore;
 use self::web_tools::{WebToolRequest, WebToolShared, WebToolTask, WebToolTemplate};
 use crate::config::{AppConfig, PointConfig};
+use crate::features::card_games::{LandlordCommand, LandlordGame, LandlordOutcome};
+use crate::features::idiom_chain;
+use crate::features::idiom_chain::IdiomChainGame;
 use anyhow::{Context, Result, anyhow};
 use enigo::Key;
 use image::DynamicImage;

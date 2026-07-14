@@ -3,6 +3,7 @@ use image::{DynamicImage, GenericImageView};
 use miliastra_wonderland_music::runtime::ui::{
     CaptureFrame, FrameDemand, FramePublication, InputCertainty, UiDevice, UiRuntime,
 };
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 struct FixedFrameDevice {
@@ -109,5 +110,51 @@ fn declared_frame_demand_reports_capture_failure() {
     };
 
     assert!(failure.reason().contains("game window is unavailable"));
+    runtime.shutdown().expect("UI runtime should stop");
+}
+
+struct OneShotCaptureDevice {
+    captures: AtomicUsize,
+}
+
+impl UiDevice for OneShotCaptureDevice {
+    fn capture(&mut self) -> Result<DynamicImage> {
+        if self.captures.fetch_add(1, Ordering::SeqCst) == 0 {
+            Ok(DynamicImage::new_rgba8(13, 7))
+        } else {
+            anyhow::bail!("unexpected duplicate capture")
+        }
+    }
+}
+
+#[test]
+fn capture_inside_a_ui_routine_satisfies_an_active_frame_demand() {
+    let runtime = UiRuntime::start(
+        OneShotCaptureDevice {
+            captures: AtomicUsize::new(0),
+        },
+        2,
+    )
+    .expect("UI runtime should start");
+    let handle = runtime.handle();
+    let demand = handle
+        .declare_frame_demand(FrameDemand::new(Duration::from_secs(1)).unwrap())
+        .expect("frame demand should be accepted");
+
+    let routine_frame = handle
+        .submit(CaptureFrame)
+        .expect("capture routine should be accepted")
+        .wait()
+        .expect("runtime should answer")
+        .expect("the one available capture should succeed");
+    let publication = demand
+        .recv_timeout(Duration::from_millis(100))
+        .expect("routine capture should satisfy the frame demand");
+    let FramePublication::Captured(observed) = publication else {
+        panic!("runtime performed a duplicate capture instead of reusing the routine frame");
+    };
+
+    assert_eq!(routine_frame.image().dimensions(), (13, 7));
+    assert_eq!(observed.image().dimensions(), (13, 7));
     runtime.shutdown().expect("UI runtime should stop");
 }

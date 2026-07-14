@@ -7,18 +7,18 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
-use super::turtle_soup::{TurtleSoupPuzzle, load_question_bank, parse_question_bank};
+use super::{TurtleSoupPuzzle, load_question_bank, parse_question_bank};
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(super) struct TurtleSoupSubmission {
-    pub(super) title: String,
-    pub(super) surface: String,
-    pub(super) bottom: String,
+pub(crate) struct TurtleSoupSubmission {
+    pub(crate) title: String,
+    pub(crate) surface: String,
+    pub(crate) bottom: String,
     #[serde(default)]
-    pub(super) adjudication_notes: String,
+    pub(crate) adjudication_notes: String,
     #[serde(default = "default_enabled")]
-    pub(super) enabled: bool,
+    pub(crate) enabled: bool,
 }
 
 fn default_enabled() -> bool {
@@ -27,27 +27,27 @@ fn default_enabled() -> bool {
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct TurtleSoupAppendReceipt {
-    pub(super) id: String,
-    pub(super) position: usize,
-    pub(super) total: usize,
+pub(crate) struct TurtleSoupAppendReceipt {
+    pub(crate) id: String,
+    pub(crate) position: usize,
+    pub(crate) total: usize,
 }
 
 #[derive(Clone)]
-pub(super) struct TurtleSoupBankStore {
+pub(crate) struct TurtleSoupBankStore {
     path: PathBuf,
     write_lock: Arc<Mutex<()>>,
 }
 
 impl TurtleSoupBankStore {
-    pub(super) fn new(path: PathBuf) -> Self {
+    pub(crate) fn new(path: PathBuf) -> Self {
         Self {
             path,
             write_lock: Arc::new(Mutex::new(())),
         }
     }
 
-    pub(super) fn append(
+    pub(crate) fn append(
         &self,
         submission: TurtleSoupSubmission,
     ) -> Result<TurtleSoupAppendReceipt> {

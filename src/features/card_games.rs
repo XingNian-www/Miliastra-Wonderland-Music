@@ -6,9 +6,9 @@ use serde::{Deserialize, Serialize};
 
 mod service;
 
-pub use service::{CardGameDeliveryPort, CardGameService};
 #[cfg(test)]
 use service::CardGameStartGate;
+pub use service::{CardGameDeliveryPort, CardGameService};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]

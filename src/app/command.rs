@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use super::entertainment::EntertainmentKind;
 use super::idiom_chain::{IdiomChainCommand, IdiomChainMode};
 use super::landlord::LandlordCommand;
 use super::turtle_soup::TurtleSoupCommand;
@@ -173,23 +174,11 @@ pub fn parse_text(text: &str, message_type: &str) -> Option<ParsedCommand> {
     let after_sep = &text[sep_index + text[sep_index..].chars().next()?.len_utf8()..];
     let raw_command_text = after_sep.trim_start_matches(['：', ':', ' ', '\t', ']', '】']);
     let user_command = user_command_text(raw_command_text);
-    let normalized_undercover = normalize_undercover_hall_command(raw_command_text);
-    let (matched, after_command) = if let Some(rest) = normalized_undercover
-        .as_deref()
-        .and_then(|text| text.strip_prefix("卧底"))
-    {
-        ("卧底", rest)
-    } else if let Some(rest) = idiom_chain_alias_args(raw_command_text) {
-        ("接龙", rest)
-    } else if let Some(rest) = landlord_play_alias_args(raw_command_text) {
-        ("出", rest)
-    } else {
-        let command_text = raw_command_text.strip_prefix('@')?.trim_start();
-        let matched = COMMANDS
-            .iter()
-            .find(|command| strip_ascii_case_prefix(command_text, command).is_some())?;
-        (*matched, strip_ascii_case_prefix(command_text, matched)?)
-    };
+    let command_text = raw_command_text.strip_prefix('@')?.trim_start();
+    let matched = COMMANDS
+        .iter()
+        .find(|command| strip_ascii_case_prefix(command_text, command).is_some())?;
+    let (matched, after_command) = (*matched, strip_ascii_case_prefix(command_text, matched)?);
     if !after_command.is_empty() && after_command.starts_with('/') {
         return None;
     }
@@ -221,25 +210,187 @@ pub fn parse_text(text: &str, message_type: &str) -> Option<ParsedCommand> {
     })
 }
 
-fn normalize_undercover_hall_command(command_text: &str) -> Option<String> {
-    let text = command_text.strip_prefix('@')?;
-    let normalized = text
-        .chars()
-        .filter(|ch| !ch.is_whitespace())
-        .collect::<String>();
-    normalized.starts_with("卧底").then_some(normalized)
+pub(super) fn parse_entertainment_shortcut(
+    text: &str,
+    message_type: &str,
+    active: Option<EntertainmentKind>,
+) -> Option<ParsedCommand> {
+    if !matches!(message_type, "blue" | "pink") || is_feedback_text(text) {
+        return None;
+    }
+    let username = if message_type == "pink" {
+        extract_bracket_username(text)?
+    } else {
+        let sep_index = text.find(['：', ':', ']', '】'])?;
+        text[..sep_index]
+            .trim_matches(['[', '【', ']', '】', ' ', '\t'])
+            .to_string()
+    };
+    let sep_index = text.find(['：', ':', ']', '】'])?;
+    let separator_len = text[sep_index..].chars().next()?.len_utf8();
+    let raw_command_text =
+        text[sep_index + separator_len..].trim_start_matches(['：', ':', ' ', '\t', ']', '】']);
+    let payload = raw_command_text
+        .strip_prefix('#')
+        .or_else(|| raw_command_text.strip_prefix('＃'))?
+        .trim_end_matches([']', '】'])
+        .trim();
+    if payload.is_empty() {
+        return None;
+    }
+    let command = if message_type == "blue" {
+        parse_entertainment_start(payload).or_else(|| match active {
+            Some(EntertainmentKind::IdiomChain) => parse_idiom_shortcut(payload),
+            Some(EntertainmentKind::Landlord | EntertainmentKind::RunFast) => {
+                parse_card_shortcut(payload)
+            }
+            Some(EntertainmentKind::TurtleSoup) => parse_turtle_soup_shortcut(payload),
+            Some(EntertainmentKind::Undercover) => parse_undercover_hall_shortcut(payload),
+            None => None,
+        })?
+    } else {
+        match active {
+            Some(EntertainmentKind::Landlord | EntertainmentKind::RunFast)
+                if normalized_shortcut(payload) == "手牌" =>
+            {
+                UserCommand::Landlord(LandlordCommand::Hand)
+            }
+            Some(EntertainmentKind::Undercover) => parse_undercover_friend_shortcut(payload)?,
+            _ => return None,
+        }
+    };
+    let raw = match &command {
+        UserCommand::Undercover(UndercoverCommand::Vote(_)) => "投票".to_string(),
+        UserCommand::Undercover(UndercoverCommand::Describe(_)) => "卧底描述".to_string(),
+        _ => payload.to_string(),
+    };
+    Some(ParsedCommand {
+        matched: "#".to_string(),
+        raw,
+        user_command: user_command_text(raw_command_text),
+        message_type: message_type.to_string(),
+        username,
+        command,
+    })
 }
 
-fn idiom_chain_alias_args(command_text: &str) -> Option<&str> {
-    command_text
-        .strip_prefix('!')
-        .or_else(|| command_text.strip_prefix('！'))
+fn parse_entertainment_start(payload: &str) -> Option<UserCommand> {
+    if let Some(idiom) = shortcut_argument(payload, "同音接龙") {
+        return Some(UserCommand::IdiomChain(IdiomChainCommand::Start {
+            idiom: idiom.to_string(),
+            mode: IdiomChainMode::Homophone,
+        }));
+    }
+    if let Some(idiom) = shortcut_argument(payload, "接龙") {
+        return Some(UserCommand::IdiomChain(IdiomChainCommand::Start {
+            idiom: idiom.to_string(),
+            mode: IdiomChainMode::Exact,
+        }));
+    }
+    match normalized_shortcut(payload).as_str() {
+        "斗地主" => Some(UserCommand::Landlord(LandlordCommand::Start)),
+        "跑得快" => Some(UserCommand::Landlord(LandlordCommand::RunFastStart)),
+        "海龟汤" => Some(UserCommand::TurtleSoup(TurtleSoupCommand::Start)),
+        "卧底" => Some(UserCommand::Undercover(UndercoverCommand::CreateSingle)),
+        "卧底双" => Some(UserCommand::Undercover(UndercoverCommand::CreateDouble)),
+        "娱乐" | "帮助" => Some(UserCommand::EntertainmentHelp),
+        _ => None,
+    }
 }
 
-fn landlord_play_alias_args(command_text: &str) -> Option<&str> {
-    command_text
-        .strip_prefix('$')
-        .or_else(|| command_text.strip_prefix('＄'))
+fn shortcut_argument<'a>(payload: &'a str, prefix: &str) -> Option<&'a str> {
+    let value = payload.strip_prefix(prefix)?;
+    let value = value.trim_start_matches(['：', ':', ' ', '\t']).trim();
+    (!value.is_empty()).then_some(value)
+}
+
+fn normalized_shortcut(payload: &str) -> String {
+    payload.chars().filter(|ch| !ch.is_whitespace()).collect()
+}
+
+fn parse_idiom_shortcut(payload: &str) -> Option<UserCommand> {
+    let normalized = normalized_shortcut(payload);
+    let command = match normalized.as_str() {
+        "提示" => IdiomChainCommand::Hint,
+        "状态" => IdiomChainCommand::Status,
+        "结束" => IdiomChainCommand::Stop,
+        "解释" => IdiomChainCommand::Explain(None),
+        _ => {
+            if let Some(idiom) = shortcut_argument(payload, "解释") {
+                IdiomChainCommand::Explain(Some(idiom.to_string()))
+            } else {
+                IdiomChainCommand::Submit(payload.to_string())
+            }
+        }
+    };
+    Some(UserCommand::IdiomChain(command))
+}
+
+fn parse_card_shortcut(payload: &str) -> Option<UserCommand> {
+    let normalized = normalized_shortcut(payload);
+    let command = match normalized.as_str() {
+        "加入" => LandlordCommand::Join,
+        "抢" => LandlordCommand::Rob,
+        "不抢" => LandlordCommand::Decline,
+        "过" => LandlordCommand::Pass,
+        "状态" => LandlordCommand::Status,
+        "结束" => LandlordCommand::Exit,
+        "手牌" => return None,
+        _ => {
+            let cards = payload
+                .strip_prefix('出')
+                .unwrap_or(payload)
+                .trim_start_matches(['：', ':', ' ', '\t'])
+                .trim();
+            if cards.is_empty() {
+                return None;
+            }
+            LandlordCommand::Play(cards.to_string())
+        }
+    };
+    Some(UserCommand::Landlord(command))
+}
+
+fn parse_turtle_soup_shortcut(payload: &str) -> Option<UserCommand> {
+    match normalized_shortcut(payload).as_str() {
+        "状态" => Some(UserCommand::TurtleSoup(TurtleSoupCommand::Status)),
+        "结束" => Some(UserCommand::TurtleSoup(TurtleSoupCommand::End)),
+        _ => None,
+    }
+}
+
+fn parse_undercover_hall_shortcut(payload: &str) -> Option<UserCommand> {
+    let normalized = normalized_shortcut(payload);
+    let command = match normalized.as_str() {
+        "开局" => UndercoverCommand::Start,
+        "状态" => UndercoverCommand::Status,
+        "退出" => UndercoverCommand::Exit,
+        "结束" => UndercoverCommand::End,
+        "加入" | "手牌" => return None,
+        _ if parse_vote_position(&normalized).is_some() => return None,
+        _ => UndercoverCommand::Describe(payload.to_string()),
+    };
+    Some(UserCommand::Undercover(command))
+}
+
+fn parse_undercover_friend_shortcut(payload: &str) -> Option<UserCommand> {
+    let normalized = normalized_shortcut(payload);
+    let command = match normalized.as_str() {
+        "加入" => UndercoverCommand::Join,
+        "退出" => UndercoverCommand::Exit,
+        _ => UndercoverCommand::Vote(parse_vote_position(&normalized)?),
+    };
+    Some(UserCommand::Undercover(command))
+}
+
+fn parse_vote_position(value: &str) -> Option<char> {
+    let value = value
+        .strip_prefix('投')
+        .unwrap_or(value)
+        .to_ascii_uppercase();
+    let mut chars = value.chars();
+    let position = chars.next()?;
+    (chars.next().is_none() && ('A'..='K').contains(&position)).then_some(position)
 }
 
 fn parse_pink_text(text: &str) -> Option<ParsedCommand> {
@@ -252,72 +403,6 @@ fn parse_pink_text(text: &str) -> Option<ParsedCommand> {
     let raw_command_text = after_sep.trim_start_matches(['：', ':', ' ', '\t', ']', '】']);
     let user_command = user_command_text(raw_command_text);
     let command_text = raw_command_text.strip_prefix('@')?.trim_start();
-    if let Some(rest) = strip_ascii_case_prefix(command_text, "描述") {
-        let description = rest
-            .trim_start_matches(['：', ':', ' ', '\t'])
-            .trim_end_matches([']', '】'])
-            .trim();
-        if description.is_empty() {
-            return None;
-        }
-        return Some(ParsedCommand {
-            matched: "描述".to_string(),
-            raw: "描述".to_string(),
-            user_command,
-            message_type: "pink".to_string(),
-            username,
-            command: UserCommand::Undercover(UndercoverCommand::Describe(description.to_string())),
-        });
-    }
-    if let Some(rest) = strip_ascii_case_prefix(command_text, "投") {
-        let value = rest
-            .chars()
-            .filter(|ch| !ch.is_whitespace() && !matches!(ch, '：' | ':' | ']' | '】'))
-            .collect::<String>()
-            .to_ascii_uppercase();
-        let mut chars = value.chars();
-        let position = chars.next()?;
-        if chars.next().is_some() || !('A'..='K').contains(&position) {
-            return None;
-        }
-        return Some(ParsedCommand {
-            matched: "投".to_string(),
-            raw: "投票".to_string(),
-            user_command,
-            message_type: "pink".to_string(),
-            username,
-            command: UserCommand::Undercover(UndercoverCommand::Vote(position)),
-        });
-    }
-    if strip_ascii_case_prefix(command_text, "手牌")
-        .is_some_and(|rest| command_boundary(rest.chars().next()))
-    {
-        return Some(ParsedCommand {
-            matched: "手牌".to_string(),
-            raw: "手牌".to_string(),
-            user_command,
-            message_type: "pink".to_string(),
-            username,
-            command: UserCommand::Landlord(LandlordCommand::Hand),
-        });
-    }
-    if let Some(rest) = strip_ascii_case_prefix(command_text, "海龟汤") {
-        let value = rest
-            .trim_start_matches(['：', ':', ' ', '\t'])
-            .trim_end_matches([']', '】'])
-            .trim();
-        if matches!(value, "结束" | "停止") {
-            return Some(ParsedCommand {
-                matched: "海龟汤".to_string(),
-                raw: "海龟汤 结束".to_string(),
-                user_command,
-                message_type: "pink".to_string(),
-                username,
-                command: UserCommand::TurtleSoup(TurtleSoupCommand::End),
-            });
-        }
-        return None;
-    }
     if let Some(rest) = strip_ascii_case_prefix(command_text, "监听模式") {
         let value = rest.trim_start_matches(['：', ':', ' ', '\t']).trim();
         let mode = match value {
@@ -685,7 +770,6 @@ fn command_lock_key(command: &UserCommand) -> String {
             IdiomChainCommand::Hint => "idiom_chain:hint".to_string(),
             IdiomChainCommand::Status => "idiom_chain:status".to_string(),
             IdiomChainCommand::Stop => "idiom_chain:stop".to_string(),
-            IdiomChainCommand::Help => "idiom_chain:help".to_string(),
         },
         UserCommand::Landlord(command) => match command {
             LandlordCommand::Start => "landlord:start".to_string(),
@@ -700,7 +784,6 @@ fn command_lock_key(command: &UserCommand) -> String {
             LandlordCommand::Pass => "landlord:pass".to_string(),
             LandlordCommand::Hand => "landlord:hand".to_string(),
             LandlordCommand::Exit => "landlord:exit".to_string(),
-            LandlordCommand::Help => "landlord:help".to_string(),
         },
         UserCommand::TurtleSoup(command) => match command {
             TurtleSoupCommand::Start => "turtle_soup:start".to_string(),
@@ -908,45 +991,7 @@ fn parse_command(matched: &str, param: &str) -> Option<UserCommand> {
         "大厅检测" => Some(UserCommand::HallDetect),
         "大厅时间" => Some(UserCommand::HallTime),
         "帮助" => Some(UserCommand::Help),
-        "娱乐" | "娱乐帮助" => Some(UserCommand::EntertainmentHelp),
-        "接龙" | "成语接龙" => Some(UserCommand::IdiomChain(IdiomChainCommand::parse(param))),
-        "同音接龙" => Some(UserCommand::IdiomChain(IdiomChainCommand::parse_homophone(
-            param,
-        ))),
-        "解释" => Some(UserCommand::IdiomChain(IdiomChainCommand::Explain(
-            (!param.trim().is_empty()).then(|| param.trim().to_string()),
-        ))),
-        "提示" if param.trim().is_empty() => {
-            Some(UserCommand::IdiomChain(IdiomChainCommand::Hint))
-        }
-        "海龟汤" => match param.trim() {
-            "" | "开始" | "开局" | "重发" | "重发汤面" => {
-                Some(UserCommand::TurtleSoup(TurtleSoupCommand::Start))
-            }
-            "状态" | "查看" => Some(UserCommand::TurtleSoup(TurtleSoupCommand::Status)),
-            "结束" | "停止" => Some(UserCommand::TurtleSoup(TurtleSoupCommand::End)),
-            _ => None,
-        },
-        "斗地主" => Some(UserCommand::Landlord(LandlordCommand::parse(param))),
-        "跑得快" => Some(UserCommand::Landlord(match param.trim() {
-            "" | "开始" | "创建" => LandlordCommand::RunFastStart,
-            "状态" | "查看" => LandlordCommand::Status,
-            "退出" | "结束" | "取消" => LandlordCommand::Exit,
-            "帮助" | "?" | "？" => LandlordCommand::Help,
-            _ => return None,
-        })),
-        "卧底" => UndercoverCommand::parse_hall(param).map(UserCommand::Undercover),
-        "加入" if param.trim().is_empty() => Some(UserCommand::Landlord(LandlordCommand::Join)),
-        "抢" | "抢地主" | "叫地主" if param.trim().is_empty() => {
-            Some(UserCommand::Landlord(LandlordCommand::Rob))
-        }
-        "不抢" | "不叫" if param.trim().is_empty() => {
-            Some(UserCommand::Landlord(LandlordCommand::Decline))
-        }
-        "出" if !param.trim().is_empty() => Some(UserCommand::Landlord(LandlordCommand::Play(
-            param.trim().to_string(),
-        ))),
-        "过" if param.trim().is_empty() => Some(UserCommand::Landlord(LandlordCommand::Pass)),
+        "娱乐帮助" => Some(UserCommand::EntertainmentHelp),
         _ => None,
     }
 }
@@ -1017,15 +1062,6 @@ fn allows_param(command: &str) -> bool {
             | "网易搜索"
             | "音量"
             | "队列删除"
-            | "接龙"
-            | "成语接龙"
-            | "同音接龙"
-            | "解释"
-            | "海龟汤"
-            | "斗地主"
-            | "跑得快"
-            | "卧底"
-            | "出"
     )
 }
 
@@ -1069,24 +1105,6 @@ const COMMANDS: &[&str] = &[
     "状态",
     "帮助",
     "娱乐帮助",
-    "娱乐",
-    "解释",
-    "提示",
-    "同音接龙",
-    "成语接龙",
-    "接龙",
-    "海龟汤",
-    "斗地主",
-    "跑得快",
-    "卧底",
-    "加入",
-    "抢地主",
-    "叫地主",
-    "不抢",
-    "不叫",
-    "抢",
-    "出",
-    "过",
     "歌词",
     "队列删除",
     "队列清空",
@@ -1155,9 +1173,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_idiom_chain_command() {
-        let started =
-            parse_text("用户：@接龙 开始 画蛇添足", "blue").expect("parse idiom chain start");
+    fn parses_hash_idiom_chain_commands_by_active_game() {
+        let started = parse_entertainment_shortcut("用户：#接龙 画蛇添足", "blue", None)
+            .expect("parse idiom chain start");
         assert_eq!(
             started.command,
             UserCommand::IdiomChain(IdiomChainCommand::Start {
@@ -1166,7 +1184,7 @@ mod tests {
             })
         );
 
-        let homophone = parse_text("用户：@同音接龙 开始 画蛇添足", "blue")
+        let homophone = parse_entertainment_shortcut("用户：＃同音接龙 画蛇添足", "blue", None)
             .expect("parse homophone idiom chain start");
         assert_eq!(
             homophone.command,
@@ -1176,20 +1194,33 @@ mod tests {
             })
         );
 
-        let submitted =
-            parse_text("用户：@成语接龙 足智多谋", "blue").expect("parse idiom chain submit");
+        let submitted = parse_entertainment_shortcut(
+            "用户：#足智多谋",
+            "blue",
+            Some(EntertainmentKind::IdiomChain),
+        )
+        .expect("parse idiom chain submit");
         assert_eq!(
             submitted.command,
             UserCommand::IdiomChain(IdiomChainCommand::Submit("足智多谋".to_string()))
         );
 
-        let explained =
-            parse_text("用户：@解释 画蛇添足", "blue").expect("parse idiom explanation command");
+        let explained = parse_entertainment_shortcut(
+            "用户：#解释 画蛇添足",
+            "blue",
+            Some(EntertainmentKind::IdiomChain),
+        )
+        .expect("parse idiom explanation command");
         assert_eq!(
             explained.command,
             UserCommand::IdiomChain(IdiomChainCommand::Explain(Some("画蛇添足".to_string())))
         );
-        let hint = parse_text("用户：@提示", "blue").expect("parse idiom hint command");
+        let hint = parse_entertainment_shortcut(
+            "用户：#提示",
+            "blue",
+            Some(EntertainmentKind::IdiomChain),
+        )
+        .expect("parse idiom hint command");
         assert_eq!(
             hint.command,
             UserCommand::IdiomChain(IdiomChainCommand::Hint)
@@ -1197,141 +1228,201 @@ mod tests {
     }
 
     #[test]
-    fn parses_ascii_and_fullwidth_bang_as_idiom_chain_aliases() {
-        let started =
-            parse_text("用户：!开始 画蛇添足", "blue").expect("parse ascii bang idiom chain start");
-        assert_eq!(started.matched, "接龙");
-        assert_eq!(started.user_command, "!开始 画蛇添足");
-        assert_eq!(
-            started.command,
-            UserCommand::IdiomChain(IdiomChainCommand::Start {
-                idiom: "画蛇添足".to_string(),
-                mode: IdiomChainMode::Exact,
-            })
-        );
-
-        let submitted =
-            parse_text("用户：！ 足智多谋", "blue").expect("parse fullwidth bang submission");
-        assert_eq!(submitted.matched, "接龙");
-        assert_eq!(submitted.user_command, "！ 足智多谋");
-        assert_eq!(
-            submitted.command,
-            UserCommand::IdiomChain(IdiomChainCommand::Submit("足智多谋".to_string()))
-        );
-    }
-
-    #[test]
-    fn parses_landlord_hall_and_friend_commands() {
+    fn explicit_hash_starts_are_available_without_an_active_game() {
         for (text, expected) in [
-            ("用户：@斗地主 开始", LandlordCommand::Start),
-            ("用户：@跑得快 开始", LandlordCommand::RunFastStart),
-            ("用户：@加入", LandlordCommand::Join),
-            ("用户：@抢地主", LandlordCommand::Rob),
-            ("用户：@不抢", LandlordCommand::Decline),
-            ("用户：@出 3334", LandlordCommand::Play("3334".to_string())),
-            ("用户：$10 10", LandlordCommand::Play("10 10".to_string())),
-            ("用户：＄小王", LandlordCommand::Play("小王".to_string())),
-            ("用户：@过", LandlordCommand::Pass),
-        ] {
-            let parsed = parse_text(text, "blue").expect("parse landlord hall command");
-            assert_eq!(parsed.command, UserCommand::Landlord(expected), "{text}");
-        }
-
-        let hand = parse_text("[用户]：@手牌", "pink").expect("parse private hand command");
-        assert_eq!(hand.command, UserCommand::Landlord(LandlordCommand::Hand));
-        assert!(parse_text("用户：@手牌", "blue").is_none());
-    }
-
-    #[test]
-    fn parses_undercover_commands_without_caring_about_spaces_or_chat_punctuation() {
-        let cases = [
-            ("用户：@卧底开始", UndercoverCommand::CreateSingle),
             (
-                "用户：@卧 底 双 卧 底 模 式",
-                UndercoverCommand::CreateDouble,
+                "用户：#斗地主",
+                UserCommand::Landlord(LandlordCommand::Start),
             ),
-            ("用户：@卧底加入", UndercoverCommand::Join),
-            ("用户：@卧底开局", UndercoverCommand::Start),
-            ("用户：@卧底状态", UndercoverCommand::Status),
-            ("用户：@卧底退出", UndercoverCommand::Exit),
-            ("用户：@卧底结束", UndercoverCommand::End),
-        ];
-        for (text, expected) in cases {
-            let parsed = parse_text(text, "blue").expect(text);
-            assert_eq!(parsed.command, UserCommand::Undercover(expected));
+            (
+                "用户：#跑得快",
+                UserCommand::Landlord(LandlordCommand::RunFastStart),
+            ),
+            (
+                "用户：#海龟汤",
+                UserCommand::TurtleSoup(TurtleSoupCommand::Start),
+            ),
+            (
+                "用户：#卧底",
+                UserCommand::Undercover(UndercoverCommand::CreateSingle),
+            ),
+            (
+                "用户：# 卧 底 双",
+                UserCommand::Undercover(UndercoverCommand::CreateDouble),
+            ),
+            ("用户：#娱乐", UserCommand::EntertainmentHelp),
+            ("用户：＃帮助", UserCommand::EntertainmentHelp),
+        ] {
+            assert_eq!(
+                parse_entertainment_shortcut(text, "blue", None)
+                    .unwrap_or_else(|| panic!("parse {text}"))
+                    .command,
+                expected,
+                "{text}"
+            );
         }
-        assert_eq!(
-            parse_text("用户：@娱乐", "blue").unwrap().command,
-            UserCommand::EntertainmentHelp
-        );
         assert_eq!(
             parse_text("用户：@娱乐帮助", "blue").unwrap().command,
             UserCommand::EntertainmentHelp
         );
+        assert!(parse_text("用户：@娱乐", "blue").is_none());
     }
 
     #[test]
-    fn parses_undercover_description_and_vote_only_from_friend_chat() {
-        let description = parse_text("[用户]：@描述 一种常见事物", "pink").unwrap();
-        assert_eq!(
-            description.command,
-            UserCommand::Undercover(UndercoverCommand::Describe("一种常见事物".to_string()))
+    fn parses_hash_card_commands_by_active_game_and_message_source() {
+        for (text, expected) in [
+            ("用户：#加入", LandlordCommand::Join),
+            ("用户：#抢", LandlordCommand::Rob),
+            ("用户：#不抢", LandlordCommand::Decline),
+            ("用户：#出 3334", LandlordCommand::Play("3334".to_string())),
+            ("用户：#10 10", LandlordCommand::Play("10 10".to_string())),
+            ("用户：＃小王", LandlordCommand::Play("小王".to_string())),
+            ("用户：#过", LandlordCommand::Pass),
+            ("用户：#状态", LandlordCommand::Status),
+            ("用户：#结束", LandlordCommand::Exit),
+        ] {
+            let parsed =
+                parse_entertainment_shortcut(text, "blue", Some(EntertainmentKind::Landlord))
+                    .expect("parse landlord hall command");
+            assert_eq!(parsed.command, UserCommand::Landlord(expected), "{text}");
+        }
+
+        let hand =
+            parse_entertainment_shortcut("[用户]：#手牌", "pink", Some(EntertainmentKind::RunFast))
+                .expect("parse private hand command");
+        assert_eq!(hand.command, UserCommand::Landlord(LandlordCommand::Hand));
+        assert!(
+            parse_entertainment_shortcut("用户：#手牌", "blue", Some(EntertainmentKind::Landlord))
+                .is_none()
         );
-        assert_eq!(description.raw, "描述");
-        assert!(!description.raw.contains("常见事物"));
-        let vote = parse_text("[用户]：@投 c", "pink").unwrap();
-        assert_eq!(
-            vote.command,
-            UserCommand::Undercover(UndercoverCommand::Vote('C'))
+    }
+
+    #[test]
+    fn parses_hash_undercover_commands_by_active_game_and_message_source() {
+        let cases = [
+            ("用户：#开局", UndercoverCommand::Start),
+            ("用户：#状 态", UndercoverCommand::Status),
+            ("用户：#退出", UndercoverCommand::Exit),
+            ("用户：#结束", UndercoverCommand::End),
+            (
+                "用户：#一种常见事物",
+                UndercoverCommand::Describe("一种常见事物".to_string()),
+            ),
+        ];
+        for (text, expected) in cases {
+            let parsed =
+                parse_entertainment_shortcut(text, "blue", Some(EntertainmentKind::Undercover))
+                    .unwrap_or_else(|| panic!("parse {text}"));
+            assert_eq!(parsed.command, UserCommand::Undercover(expected));
+        }
+        assert!(
+            parse_entertainment_shortcut(
+                "用户：#加入",
+                "blue",
+                Some(EntertainmentKind::Undercover)
+            )
+            .is_none()
         );
-        assert_eq!(vote.raw, "投票");
-        assert!(!vote.raw.contains('C'));
-        assert!(parse_text("用户：@描述 一种常见事物", "blue").is_none());
-        assert!(parse_text("用户：@投 A", "blue").is_none());
+
+        let join = parse_entertainment_shortcut(
+            "[用户]：#加入",
+            "pink",
+            Some(EntertainmentKind::Undercover),
+        )
+        .unwrap();
+        assert_eq!(
+            join.command,
+            UserCommand::Undercover(UndercoverCommand::Join)
+        );
+
+        for text in ["[用户]：#c", "[用户]：＃投 C"] {
+            let vote =
+                parse_entertainment_shortcut(text, "pink", Some(EntertainmentKind::Undercover))
+                    .unwrap();
+            assert_eq!(
+                vote.command,
+                UserCommand::Undercover(UndercoverCommand::Vote('C'))
+            );
+            assert_eq!(vote.raw, "投票");
+        }
     }
 
     #[test]
     fn landlord_command_locks_are_scoped_to_the_player() {
-        let left = parse_text("甲：@加入", "blue").unwrap();
-        let right = parse_text("乙：@加入", "blue").unwrap();
+        let left =
+            parse_entertainment_shortcut("甲：#加入", "blue", Some(EntertainmentKind::Landlord))
+                .unwrap();
+        let right =
+            parse_entertainment_shortcut("乙：#加入", "blue", Some(EntertainmentKind::Landlord))
+                .unwrap();
 
         assert!(!same_lock_command(&left, &right));
         assert_ne!(lock_key(&left), lock_key(&right));
     }
 
     #[test]
-    fn parses_turtle_soup_hall_commands() {
-        for text in [
-            "用户：@海龟汤",
-            "用户：@海龟汤 开始",
-            "用户：@海龟汤开始",
-            "用户：@海龟汤 开局",
-            "用户：@海龟汤开局",
-            "用户：@海龟汤 重发汤面",
-            "用户：@海龟汤重发汤面",
-        ] {
-            let start = parse_text(text, "blue").expect("parse turtle soup start");
-            assert_eq!(
-                start.command,
-                UserCommand::TurtleSoup(TurtleSoupCommand::Start)
-            );
-        }
-
-        let status = parse_text("用户：@海龟汤状态", "blue").expect("parse turtle soup status");
+    fn turtle_soup_hash_controls_do_not_consume_questions() {
+        let status = parse_entertainment_shortcut(
+            "用户：#状态",
+            "blue",
+            Some(EntertainmentKind::TurtleSoup),
+        )
+        .expect("parse turtle soup status");
         assert_eq!(
             status.command,
             UserCommand::TurtleSoup(TurtleSoupCommand::Status)
         );
-    }
-
-    #[test]
-    fn only_friend_chat_parses_turtle_soup_stop_as_privileged_stop() {
-        let stop = parse_text("[Alice]：@海龟汤结束", "pink").expect("parse friend turtle stop");
+        let stop = parse_entertainment_shortcut(
+            "用户：#结束",
+            "blue",
+            Some(EntertainmentKind::TurtleSoup),
+        )
+        .expect("parse turtle soup stop");
         assert_eq!(
             stop.command,
             UserCommand::TurtleSoup(TurtleSoupCommand::End)
         );
-        assert!(parse_text("[Alice]：@海龟汤", "pink").is_none());
+        assert!(
+            parse_entertainment_shortcut(
+                "用户：#他认识死者吗？",
+                "blue",
+                Some(EntertainmentKind::TurtleSoup)
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn rejects_legacy_entertainment_syntax_and_hash_in_the_middle() {
+        for text in [
+            "用户：@接龙 画蛇添足",
+            "用户：!画蛇添足",
+            "用户：！画蛇添足",
+            "用户：@斗地主",
+            "用户：@加入",
+            "用户：@出 345",
+            "用户：$345",
+            "用户：＄345",
+            "用户：@手牌",
+            "用户：@海龟汤",
+            "用户：@卧底开始",
+            "用户：@投A",
+        ] {
+            assert!(parse_text(text, "blue").is_none(), "{text}");
+            assert!(
+                parse_entertainment_shortcut(text, "blue", Some(EntertainmentKind::Landlord))
+                    .is_none(),
+                "{text}"
+            );
+        }
+        assert!(
+            parse_entertainment_shortcut(
+                "用户：普通聊天 #加入",
+                "blue",
+                Some(EntertainmentKind::Landlord)
+            )
+            .is_none()
+        );
     }
 
     #[test]

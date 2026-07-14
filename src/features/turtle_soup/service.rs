@@ -15,18 +15,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use url::Url;
 
-use super::command;
-use super::deferred_chat::{
-    DeferredChatBatch, DeferredChatQueue, DeferredChatTarget, EnqueueOutcome, TurtleSoupDelivery,
-    TurtleSoupDeliveryPurpose,
-};
-use crate::features::chat_text::{MAX_CHAT_WIDTH, display_width, split_numbered_chat_message};
-use crate::features::entertainment::{AcquireOutcome, EntertainmentCoordinator, EntertainmentKind};
 #[cfg(test)]
-use crate::features::turtle_soup::parse_question_bank;
-use crate::features::turtle_soup::{TurtleSoupPuzzle, load_question_bank};
+use super::parse_question_bank;
+use super::{
+    TurtleSoupDelivery, TurtleSoupDeliveryIntent, TurtleSoupDeliveryOutcome,
+    TurtleSoupDeliveryPort, TurtleSoupDeliveryPurpose, TurtleSoupPuzzle, load_question_bank,
+};
+use crate::features::chat_text::{
+    MAX_CHAT_WIDTH, display_width, normalize_comparison_text, split_numbered_chat_message,
+};
+use crate::features::entertainment::{AcquireOutcome, EntertainmentCoordinator, EntertainmentKind};
 
-const DELIVERY_ATTEMPTS: u8 = 3;
 const RECENT_JUDGMENT_LIMIT: usize = 30;
 const DEEPSEEK_DEFAULT_ENDPOINT: &str = "https://api.deepseek.com/chat/completions";
 const DEEPSEEK_DEFAULT_MODEL: &str = "deepseek-v4-flash";
@@ -108,13 +107,13 @@ pub enum TurtleSoupCommand {
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct TurtleSoupCommandOutcome {
+pub(crate) struct TurtleSoupCommandOutcome {
     pub action: &'static str,
     pub immediate_reply: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct TurtleSoupQuestion {
+pub(crate) struct TurtleSoupQuestion {
     pub player: String,
     player_key: String,
     pub question: String,
@@ -122,13 +121,13 @@ pub(super) struct TurtleSoupQuestion {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct SecondaryOcrObservation {
+pub(crate) struct SecondaryOcrObservation {
     pub text: String,
     pub player: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum SecondaryOcrStability {
+pub(crate) enum SecondaryOcrStability {
     Pending,
     Stable(Vec<SecondaryOcrObservation>),
 }
@@ -143,7 +142,7 @@ enum TurtleSoupQuestionKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum QuestionSubmitOutcome {
+pub(crate) enum QuestionSubmitOutcome {
     Ignored,
     Queued { request_id: u64 },
     Reply(String),
@@ -151,7 +150,7 @@ pub(super) enum QuestionSubmitOutcome {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum TurtleSoupPhase {
+pub(crate) enum TurtleSoupPhase {
     Idle,
     Announcing,
     Active,
@@ -261,7 +260,7 @@ fn truncate_reply_player(player: &str, max_width: usize) -> String {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct TurtleSoupJudgmentSnapshot {
+pub(crate) struct TurtleSoupJudgmentSnapshot {
     request_id: u64,
     player: String,
     question: String,
@@ -274,7 +273,7 @@ pub(super) struct TurtleSoupJudgmentSnapshot {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct TurtleSoupSnapshot {
+pub(crate) struct TurtleSoupSnapshot {
     pub enabled: bool,
     pub phase: TurtleSoupPhase,
     pub phase_label: String,
@@ -295,10 +294,10 @@ pub(super) struct TurtleSoupSnapshot {
 }
 
 #[derive(Clone)]
-pub(super) struct TurtleSoupService {
+pub(crate) struct TurtleSoupService {
     config: TurtleSoupConfig,
     entertainment: EntertainmentCoordinator,
-    deferred_chat: DeferredChatQueue,
+    delivery: Arc<dyn TurtleSoupDeliveryPort>,
     state: Arc<Mutex<TurtleSoupState>>,
     work: Arc<(Mutex<TurtleSoupWorkQueue>, Condvar)>,
     operation: Arc<Mutex<()>>,
@@ -689,11 +688,14 @@ enum SettlementReason {
 }
 
 impl TurtleSoupService {
-    pub(super) fn new(
+    pub(crate) fn new<D>(
         mut config: TurtleSoupConfig,
         entertainment: EntertainmentCoordinator,
-        deferred_chat: DeferredChatQueue,
-    ) -> Self {
+        delivery: D,
+    ) -> Self
+    where
+        D: TurtleSoupDeliveryPort + 'static,
+    {
         config.nickname_stable_count = config
             .nickname_stable_count
             .max(BUILTIN_OCR_STABILITY_COUNT);
@@ -701,7 +703,7 @@ impl TurtleSoupService {
         Self {
             config,
             entertainment,
-            deferred_chat,
+            delivery: Arc::new(delivery),
             state: Arc::new(Mutex::new(TurtleSoupState::default())),
             work: Arc::new((Mutex::new(TurtleSoupWorkQueue::default()), Condvar::new())),
             operation: Arc::new(Mutex::new(())),
@@ -710,7 +712,7 @@ impl TurtleSoupService {
         }
     }
 
-    pub(super) fn start_workers(&self) {
+    pub(crate) fn start_workers(&self) {
         if !self.config.enabled
             || self
                 .workers_started
@@ -727,13 +729,13 @@ impl TurtleSoupService {
         log::info!("海龟汤 AI Worker 已启动: concurrency={}", worker_count);
     }
 
-    pub(super) fn shutdown(&self) {
+    pub(crate) fn shutdown(&self) {
         self.shutting_down.store(true, Ordering::SeqCst);
         let (_, cvar) = &*self.work;
         cvar.notify_all();
     }
 
-    pub(super) fn snapshot(&self) -> TurtleSoupSnapshot {
+    pub(crate) fn snapshot(&self) -> TurtleSoupSnapshot {
         let Ok(state) = self.state.lock() else {
             return TurtleSoupSnapshot {
                 enabled: self.config.enabled,
@@ -785,7 +787,7 @@ impl TurtleSoupService {
         }
     }
 
-    pub(super) fn handle_hall_command(
+    pub(crate) fn handle_hall_command(
         &self,
         player: &str,
         command: &TurtleSoupCommand,
@@ -803,7 +805,7 @@ impl TurtleSoupService {
         }
     }
 
-    pub(super) fn handle_friend_command(
+    pub(crate) fn handle_friend_command(
         &self,
         player: &str,
         command: &TurtleSoupCommand,
@@ -830,11 +832,11 @@ impl TurtleSoupService {
         }
     }
 
-    pub(super) fn start_random_from_web(&self) -> Result<()> {
+    pub(crate) fn start_random_from_web(&self) -> Result<()> {
         self.start_new("Web控制台", None)
     }
 
-    pub(super) fn start_by_id_from_web(&self, id: &str) -> Result<()> {
+    pub(crate) fn start_by_id_from_web(&self, id: &str) -> Result<()> {
         let id = id.trim();
         if id.is_empty() {
             bail!("题目 ID 不能为空");
@@ -842,11 +844,11 @@ impl TurtleSoupService {
         self.start_new("Web控制台", Some(id))
     }
 
-    pub(super) fn end_from_web(&self) -> Result<bool> {
+    pub(crate) fn end_from_web(&self) -> Result<bool> {
         self.begin_settlement(SettlementReason::Web)
     }
 
-    pub(super) fn filter_new_primary_questions(
+    pub(crate) fn filter_new_primary_questions(
         &self,
         visible: Vec<TurtleSoupQuestion>,
         suppress_new: bool,
@@ -863,7 +865,7 @@ impl TurtleSoupService {
         )
     }
 
-    pub(super) fn stabilize_secondary_ocr(
+    pub(crate) fn stabilize_secondary_ocr(
         &self,
         visible: Vec<SecondaryOcrObservation>,
     ) -> SecondaryOcrStability {
@@ -878,7 +880,7 @@ impl TurtleSoupService {
         )
     }
 
-    pub(super) fn clear_secondary_ocr_stability(&self) {
+    pub(crate) fn clear_secondary_ocr_stability(&self) {
         let Ok(mut state) = self.state.lock() else {
             log::error!("海龟汤状态锁已损坏，无法清理二级提问 OCR 稳定状态");
             return;
@@ -886,7 +888,7 @@ impl TurtleSoupService {
         state.secondary_ocr_stability.clear();
     }
 
-    pub(super) fn accepts_questions(&self) -> bool {
+    pub(crate) fn accepts_questions(&self) -> bool {
         if !self.config.enabled {
             return false;
         }
@@ -896,7 +898,7 @@ impl TurtleSoupService {
             .unwrap_or(false)
     }
 
-    pub(super) fn submit_question(
+    pub(crate) fn submit_question(
         &self,
         mut question: TurtleSoupQuestion,
     ) -> Result<QuestionSubmitOutcome> {
@@ -1057,7 +1059,7 @@ impl TurtleSoupService {
         Ok(QuestionSubmitOutcome::Queued { request_id })
     }
 
-    pub(super) fn tick(&self) {
+    pub(crate) fn tick(&self) {
         let reason = {
             let Ok(state) = self.state.lock() else {
                 log::error!("海龟汤状态锁已损坏，无法检查超时");
@@ -1089,7 +1091,7 @@ impl TurtleSoupService {
         }
     }
 
-    pub(super) fn abort_for_context_loss(&self, reason: &str) {
+    pub(crate) fn abort_for_context_loss(&self, reason: &str) {
         let Ok(_operation) = self.operation.lock() else {
             log::error!("海龟汤操作锁已损坏，无法中止会话");
             return;
@@ -1117,7 +1119,7 @@ impl TurtleSoupService {
         log::warn!("海龟汤会话已中止且不公布汤底: {}", reason);
     }
 
-    pub(super) fn delivery_is_current(&self, delivery: TurtleSoupDelivery) -> bool {
+    pub(crate) fn delivery_is_current(&self, delivery: TurtleSoupDelivery) -> bool {
         let Ok(state) = self.state.lock() else {
             return false;
         };
@@ -1133,7 +1135,7 @@ impl TurtleSoupService {
         }
     }
 
-    pub(super) fn handle_delivery_success(&self, delivery: TurtleSoupDelivery) {
+    pub(crate) fn handle_delivery_success(&self, delivery: TurtleSoupDelivery) {
         let Ok(_operation) = self.operation.lock() else {
             log::error!("海龟汤操作锁已损坏，无法确认聊天批次完成");
             return;
@@ -1164,7 +1166,7 @@ impl TurtleSoupService {
         }
     }
 
-    pub(super) fn handle_delivery_failure(
+    pub(crate) fn handle_delivery_failure(
         &self,
         delivery: TurtleSoupDelivery,
         error: &anyhow::Error,
@@ -1314,17 +1316,14 @@ impl TurtleSoupService {
                 state.generation
             };
             let messages = split_numbered_chat_message("汤面", &puzzle.surface);
-            match self.enqueue_batch(
-                messages,
-                generation,
-                TurtleSoupDeliveryPurpose::Opening,
-                true,
-            )? {
-                EnqueueOutcome::Rejected => bail!("延迟聊天队列已被受保护批次占满"),
-                EnqueueOutcome::DroppedMessage => {
+            match self.enqueue_batch(messages, generation, TurtleSoupDeliveryPurpose::Opening)? {
+                TurtleSoupDeliveryOutcome::Rejected => {
+                    bail!("延迟聊天队列已被受保护批次占满")
+                }
+                TurtleSoupDeliveryOutcome::DroppedEarlierMessage => {
                     log::warn!("海龟汤开局入队时淘汰了一条较早的非关键回复")
                 }
-                EnqueueOutcome::Added => {}
+                TurtleSoupDeliveryOutcome::Added => {}
             }
             log::info!(
                 "海龟汤题目已选中并持久化为已使用: id={} remaining={}",
@@ -1367,12 +1366,11 @@ impl TurtleSoupService {
             split_numbered_chat_message("汤面", &surface),
             generation,
             TurtleSoupDeliveryPurpose::SurfaceRepeat,
-            true,
         )?;
-        if outcome == EnqueueOutcome::Rejected {
+        if outcome == TurtleSoupDeliveryOutcome::Rejected {
             bail!("延迟聊天队列已满");
         }
-        if outcome == EnqueueOutcome::DroppedMessage {
+        if outcome == TurtleSoupDeliveryOutcome::DroppedEarlierMessage {
             log::warn!("海龟汤汤面重发入队时淘汰了一条较早的普通回复");
         }
         Ok(())
@@ -1426,23 +1424,19 @@ impl TurtleSoupService {
             (state.generation, messages)
         };
         self.remove_waiting_generation(generation);
-        let outcome = match self.enqueue_batch(
-            messages,
-            generation,
-            TurtleSoupDeliveryPurpose::Settlement,
-            true,
-        ) {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                self.finish_settlement(
-                    generation,
-                    true,
-                    Some(format!("结算批次入队失败：{}", concise_error(&error))),
-                );
-                return Err(error);
-            }
-        };
-        if outcome == EnqueueOutcome::Rejected {
+        let outcome =
+            match self.enqueue_batch(messages, generation, TurtleSoupDeliveryPurpose::Settlement) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    self.finish_settlement(
+                        generation,
+                        true,
+                        Some(format!("结算批次入队失败：{}", concise_error(&error))),
+                    );
+                    return Err(error);
+                }
+            };
+        if outcome == TurtleSoupDeliveryOutcome::Rejected {
             self.finish_settlement(
                 generation,
                 true,
@@ -1450,7 +1444,7 @@ impl TurtleSoupService {
             );
             bail!("结算批次无法进入延迟聊天队列");
         }
-        if outcome == EnqueueOutcome::DroppedMessage {
+        if outcome == TurtleSoupDeliveryOutcome::DroppedEarlierMessage {
             log::warn!("海龟汤结算入队时淘汰了一条较早的非关键回复");
         }
         Ok(true)
@@ -1493,26 +1487,11 @@ impl TurtleSoupService {
         messages: Vec<String>,
         generation: u64,
         purpose: TurtleSoupDeliveryPurpose,
-        protected: bool,
-    ) -> Result<EnqueueOutcome> {
-        let batch = DeferredChatBatch::new(
-            messages,
-            DeferredChatTarget::CurrentHall,
-            TurtleSoupDelivery {
-                generation,
-                purpose,
-            },
-            DELIVERY_ATTEMPTS,
-            protected,
-        )?;
-        if matches!(
-            purpose,
-            TurtleSoupDeliveryPurpose::Opening | TurtleSoupDeliveryPurpose::Settlement
-        ) {
-            self.deferred_chat.enqueue_front(batch)
-        } else {
-            self.deferred_chat.enqueue(batch)
-        }
+    ) -> Result<TurtleSoupDeliveryOutcome> {
+        self.delivery
+            .deliver_turtle_soup(TurtleSoupDeliveryIntent::new(
+                messages, generation, purpose,
+            )?)
     }
 
     fn run_worker(&self, index: usize) {
@@ -1733,36 +1712,26 @@ impl TurtleSoupService {
 
         if let Some((generation, messages)) = settlement {
             self.remove_waiting_generation(generation);
-            match self.enqueue_batch(
-                messages,
-                generation,
-                TurtleSoupDeliveryPurpose::Settlement,
-                true,
-            ) {
-                Ok(EnqueueOutcome::Added) => {}
-                Ok(EnqueueOutcome::DroppedMessage) => {
+            match self.enqueue_batch(messages, generation, TurtleSoupDeliveryPurpose::Settlement) {
+                Ok(TurtleSoupDeliveryOutcome::Added) => {}
+                Ok(TurtleSoupDeliveryOutcome::DroppedEarlierMessage) => {
                     log::warn!("海龟汤获胜结算入队时淘汰了一条较早的非关键回复")
                 }
-                Ok(EnqueueOutcome::Rejected) | Err(_) => self.finish_settlement(
+                Ok(TurtleSoupDeliveryOutcome::Rejected) | Err(_) => self.finish_settlement(
                     generation,
                     true,
                     Some("获胜结算批次无法进入延迟聊天队列".to_string()),
                 ),
             }
         } else if let Some((generation, reply)) = judgment_reply {
-            match self.enqueue_batch(
-                vec![reply],
-                generation,
-                TurtleSoupDeliveryPurpose::Judgment,
-                false,
-            ) {
-                Ok(EnqueueOutcome::Rejected) => {
+            match self.enqueue_batch(vec![reply], generation, TurtleSoupDeliveryPurpose::Judgment) {
+                Ok(TurtleSoupDeliveryOutcome::Rejected) => {
                     log::warn!("海龟汤普通裁决回复队列已满，已丢弃")
                 }
-                Ok(EnqueueOutcome::DroppedMessage) => {
+                Ok(TurtleSoupDeliveryOutcome::DroppedEarlierMessage) => {
                     log::warn!("海龟汤普通裁决回复入队时淘汰了一条较早的普通回复")
                 }
-                Ok(EnqueueOutcome::Added) => {}
+                Ok(TurtleSoupDeliveryOutcome::Added) => {}
                 Err(error) => log::error!("海龟汤普通裁决回复入队失败: {error:#}"),
             }
         }
@@ -1778,7 +1747,7 @@ impl TurtleSoupService {
     }
 }
 
-pub(super) fn parse_question_message(
+pub(crate) fn parse_question_message(
     text: &str,
     fallback_player: Option<&str>,
 ) -> Option<TurtleSoupQuestion> {
@@ -1892,7 +1861,7 @@ fn question_identity(question: &TurtleSoupQuestion) -> QuestionIdentity {
     QuestionIdentity {
         player_key: question.player_key.clone(),
         kind: question.kind,
-        question_key: command::normalize_lock_text(&question.question),
+        question_key: normalize_comparison_text(&question.question),
     }
 }
 
@@ -1906,8 +1875,8 @@ fn question_identities_are_ocr_equivalent(
 }
 
 fn ocr_nicknames_are_equivalent(left: &str, right: &str) -> bool {
-    let left = command::normalize_lock_text(left);
-    let right = command::normalize_lock_text(right);
+    let left = normalize_comparison_text(left);
+    let right = normalize_comparison_text(right);
     if left == right {
         return true;
     }
@@ -1942,7 +1911,7 @@ fn levenshtein_distance(left: &str, right: &str) -> usize {
 fn question_content_identity(question: &TurtleSoupQuestion) -> QuestionContentIdentity {
     QuestionContentIdentity {
         kind: question.kind,
-        question_key: command::normalize_lock_text(&question.question),
+        question_key: normalize_comparison_text(&question.question),
     }
 }
 
@@ -2313,6 +2282,18 @@ fn unix_millis() -> u64 {
 mod tests {
     use super::*;
 
+    #[derive(Clone, Copy)]
+    struct TestDeliveryPort;
+
+    impl TurtleSoupDeliveryPort for TestDeliveryPort {
+        fn deliver_turtle_soup(
+            &self,
+            _intent: TurtleSoupDeliveryIntent,
+        ) -> Result<TurtleSoupDeliveryOutcome> {
+            Ok(TurtleSoupDeliveryOutcome::Added)
+        }
+    }
+
     #[test]
     fn default_configuration_is_disabled() {
         let config = TurtleSoupConfig::default();
@@ -2440,7 +2421,7 @@ mod tests {
     #[test]
     fn default_custom_prompt_does_not_redefine_the_builtin_protocol() {
         let config: serde_yaml::Value =
-            serde_yaml::from_str(include_str!("../../config.yaml")).expect("default config");
+            serde_yaml::from_str(include_str!("../../../config.yaml")).expect("default config");
         let prompt = config["turtle_soup"]["custom_prompt"]
             .as_str()
             .expect("turtle_soup.custom_prompt");
@@ -2728,7 +2709,7 @@ mod tests {
         let service = TurtleSoupService::new(
             TurtleSoupConfig::default(),
             EntertainmentCoordinator::new(),
-            DeferredChatQueue::new(4),
+            TestDeliveryPort,
         );
         let visible = |text| vec![parse_question_message(text, None).expect("question")];
 
@@ -2802,7 +2783,7 @@ mod tests {
         let service = TurtleSoupService::new(
             TurtleSoupConfig::default(),
             EntertainmentCoordinator::new(),
-            DeferredChatQueue::new(4),
+            TestDeliveryPort,
         );
         let visible = |text| vec![parse_question_message(text, None).expect("question")];
 
@@ -2835,7 +2816,7 @@ mod tests {
         let service = TurtleSoupService::new(
             TurtleSoupConfig::default(),
             EntertainmentCoordinator::new(),
-            DeferredChatQueue::new(4),
+            TestDeliveryPort,
         );
         let visible = |player: &str, question: &str| {
             vec![
@@ -2875,7 +2856,7 @@ mod tests {
         let service = TurtleSoupService::new(
             TurtleSoupConfig::default(),
             EntertainmentCoordinator::new(),
-            DeferredChatQueue::new(4),
+            TestDeliveryPort,
         );
         let visible = || {
             ["Alice", "Bob"]
@@ -2904,7 +2885,7 @@ mod tests {
         let service = TurtleSoupService::new(
             TurtleSoupConfig::default(),
             EntertainmentCoordinator::new(),
-            DeferredChatQueue::new(4),
+            TestDeliveryPort,
         );
         let visible = || {
             ["星念BOT", "星念B0T"]
@@ -2933,7 +2914,7 @@ mod tests {
         let service = TurtleSoupService::new(
             TurtleSoupConfig::default(),
             EntertainmentCoordinator::new(),
-            DeferredChatQueue::new(4),
+            TestDeliveryPort,
         );
         let observation = |player: &str, text: &str| {
             vec![SecondaryOcrObservation {
@@ -2969,7 +2950,7 @@ mod tests {
         let service = TurtleSoupService::new(
             TurtleSoupConfig::default(),
             EntertainmentCoordinator::new(),
-            DeferredChatQueue::new(4),
+            TestDeliveryPort,
         );
         let observation = |player: &str| {
             vec![SecondaryOcrObservation {
@@ -2995,11 +2976,8 @@ mod tests {
             content_stable_count: 2,
             ..TurtleSoupConfig::default()
         };
-        let service = TurtleSoupService::new(
-            config,
-            EntertainmentCoordinator::new(),
-            DeferredChatQueue::new(4),
-        );
+        let service =
+            TurtleSoupService::new(config, EntertainmentCoordinator::new(), TestDeliveryPort);
         let visible =
             || vec![parse_question_message("星念：# 他认识死者吗？", None).expect("question")];
 
@@ -3025,7 +3003,7 @@ mod tests {
         let service = TurtleSoupService::new(
             TurtleSoupConfig::default(),
             EntertainmentCoordinator::new(),
-            DeferredChatQueue::new(4),
+            TestDeliveryPort,
         );
         let observation = vec![SecondaryOcrObservation {
             text: "@状态".to_string(),
@@ -3099,11 +3077,8 @@ mod tests {
             question_bank_path: PathBuf::from("missing-turtle-soup-bank.yaml"),
             ..TurtleSoupConfig::default()
         };
-        let service = TurtleSoupService::new(
-            config,
-            EntertainmentCoordinator::new(),
-            DeferredChatQueue::new(4),
-        );
+        let service =
+            TurtleSoupService::new(config, EntertainmentCoordinator::new(), TestDeliveryPort);
 
         let error = service.start_random_from_web().unwrap_err();
 
@@ -3135,7 +3110,7 @@ mod tests {
         let service = TurtleSoupService::new(
             TurtleSoupConfig::default(),
             EntertainmentCoordinator::new(),
-            DeferredChatQueue::new(4),
+            TestDeliveryPort,
         );
         {
             let mut state = service.state.lock().unwrap();
@@ -3171,11 +3146,8 @@ mod tests {
             enabled: true,
             ..TurtleSoupConfig::default()
         };
-        let service = TurtleSoupService::new(
-            config,
-            EntertainmentCoordinator::new(),
-            DeferredChatQueue::new(32),
-        );
+        let service =
+            TurtleSoupService::new(config, EntertainmentCoordinator::new(), TestDeliveryPort);
         {
             let mut state = service.state.lock().unwrap();
             state.phase = TurtleSoupPhase::Active;

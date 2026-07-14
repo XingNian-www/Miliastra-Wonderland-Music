@@ -191,15 +191,6 @@ pub(super) fn recognize_lines(engine: &OcrEngine, image: &DynamicImage) -> Resul
     Ok(lines)
 }
 
-pub(super) fn merged_ocr_text(
-    engine: &OcrEngine,
-    image: &DynamicImage,
-    same_line_y_tolerance: i32,
-) -> Result<String> {
-    let lines = recognize_lines(engine, image)?;
-    Ok(merge_ocr_lines(lines, same_line_y_tolerance))
-}
-
 fn new_ocr_engine(args: &ResolvedOcrArgs, backend: Backend) -> Result<OcrEngine> {
     let mut det_options = DetOptions::new()
         .with_max_side_len(args.det_max_side_len)

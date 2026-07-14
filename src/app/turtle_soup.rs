@@ -29,8 +29,9 @@ const DEEPSEEK_DEFAULT_ENDPOINT: &str = "https://api.deepseek.com/chat/completio
 const DEEPSEEK_DEFAULT_MODEL: &str = "deepseek-v4-flash";
 const DEFAULT_AI_MAX_TOKENS: u32 = 256;
 const DEFAULT_BATCH_MAX_PARTS: usize = 32;
-const DEFAULT_NICKNAME_STABLE_COUNT: usize = 2;
-const DEFAULT_CONTENT_STABLE_COUNT: usize = 2;
+const DEFAULT_NICKNAME_STABLE_COUNT: usize = 0;
+const DEFAULT_CONTENT_STABLE_COUNT: usize = 0;
+const BUILTIN_OCR_STABILITY_COUNT: usize = 2;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -716,10 +717,14 @@ enum SettlementReason {
 
 impl TurtleSoupService {
     pub(super) fn new(
-        config: TurtleSoupConfig,
+        mut config: TurtleSoupConfig,
         entertainment: EntertainmentCoordinator,
         deferred_chat: DeferredChatQueue,
     ) -> Self {
+        config.nickname_stable_count = config
+            .nickname_stable_count
+            .max(BUILTIN_OCR_STABILITY_COUNT);
+        config.content_stable_count = config.content_stable_count.max(BUILTIN_OCR_STABILITY_COUNT);
         Self {
             config,
             entertainment,
@@ -880,8 +885,8 @@ impl TurtleSoupService {
         state.primary_ocr_stability.observe(
             visible,
             suppress_new,
-            self.config.nickname_stable_count.max(1),
-            self.config.content_stable_count.max(1),
+            self.config.nickname_stable_count,
+            self.config.content_stable_count,
         )
     }
 
@@ -895,8 +900,8 @@ impl TurtleSoupService {
         };
         state.secondary_ocr_stability.observe(
             visible,
-            self.config.nickname_stable_count.max(1),
-            self.config.content_stable_count.max(1),
+            self.config.nickname_stable_count,
+            self.config.content_stable_count,
         )
     }
 

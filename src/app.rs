@@ -108,7 +108,7 @@ use self::ui_state::{UiState, detect_ui_state};
 use self::web_tools::{WebToolRequest, WebToolShared, WebToolTask, WebToolTemplate};
 use crate::config::{AppConfig, PointConfig};
 use crate::features::card_games::{
-    CardGameService, CardGameStartGate, LandlordCommand, LandlordOutcome,
+    CardGameDeliveryPort, CardGameService, LandlordCommand, LandlordOutcome,
 };
 use crate::features::chat_text::split_numbered_chat_message;
 use crate::features::entertainment::EntertainmentCoordinator;
@@ -395,6 +395,24 @@ pub(crate) struct AutomationApp {
     chat_listener: ChatListenerShared,
     chat_observations: ChatObservationShared,
     monitor: MonitorShared,
+}
+
+struct DeferredCardGamePort<'a> {
+    app: &'a AutomationApp,
+}
+
+impl CardGameDeliveryPort for DeferredCardGamePort<'_> {
+    fn verify_friend(&self, _player: &str, _message: &str) -> Result<bool> {
+        Err(anyhow!("延迟牌类端口不能执行好友验证"))
+    }
+
+    fn send_friend(&self, _player: &str, _message: &str) -> Result<bool> {
+        Err(anyhow!("延迟牌类端口不能发送好友消息"))
+    }
+
+    fn send_hall(&self, message: &str) -> Result<()> {
+        self.app.enqueue_current_hall_reply(message)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -2339,12 +2357,12 @@ impl AutomationApp {
         if command.requires_executor() {
             return Ok(false);
         }
-        let outcome = self
-            .landlord
-            .handle(&parsed.username, command, Instant::now())?;
-        if let Some(reply) = outcome.public_reply {
-            self.enqueue_current_hall_reply(&reply)?;
-        }
+        self.landlord.execute(
+            &parsed.username,
+            command,
+            &DeferredCardGamePort { app: self },
+            Instant::now(),
+        )?;
         log::info!(
             "牌局命令已处理: command={} user={}",
             parsed.raw,
@@ -2737,7 +2755,8 @@ impl AutomationApp {
                 .execute_restore_secondary_hall_task()
                 .map(|_| PendingTaskExecution::Completed),
             PendingTask::CardGameOutcome { outcome } => self
-                .deliver_landlord_task_outcome(outcome)
+                .landlord
+                .deliver(outcome, self)
                 .map(|_| PendingTaskExecution::Completed),
             PendingTask::UndercoverDelivery { deliveries } => self
                 .undercover
@@ -5534,94 +5553,7 @@ impl AutomationApp {
     }
 
     fn execute_landlord_command(&self, player: &str, command: &LandlordCommand) -> Result<()> {
-        match command {
-            LandlordCommand::Start | LandlordCommand::RunFastStart => {
-                let reservation = match self.landlord.prepare_start(command)? {
-                    CardGameStartGate::Ready { reservation } => reservation,
-                    CardGameStartGate::Reply(reply) => return self.reply(&reply),
-                };
-                let kind = reservation.kind();
-                let label = kind.label();
-                let verified = match self.send_unique_friend_message(
-                    player,
-                    &format!("{}报名成功，请回到大厅等待组局", label),
-                ) {
-                    Ok(verified) => verified,
-                    Err(error) => {
-                        if let Err(cancel_error) = self.landlord.cancel_start(reservation) {
-                            log::error!("好友验证失败后无法取消牌局预留: {cancel_error:#}");
-                        }
-                        return Err(error);
-                    }
-                };
-                if !verified {
-                    self.landlord.cancel_start(reservation)?;
-                    return self.reply(&format!("{}报名失败：好友列表未找到唯一昵称", label));
-                }
-                let outcome =
-                    self.landlord
-                        .complete_start(player, command, reservation, Instant::now())?;
-                self.deliver_landlord_task_outcome(outcome)
-            }
-            LandlordCommand::Join => {
-                let Some(kind) = self.landlord.lobby_kind_for_join(player)? else {
-                    let outcome = self.landlord.handle(player, command, Instant::now())?;
-                    return self.deliver_landlord_task_outcome(outcome);
-                };
-                let label = kind.label();
-                let verified = self.send_unique_friend_message(
-                    player,
-                    &format!("{}报名成功，请回到大厅等待开局", label),
-                )?;
-                if !verified {
-                    return self.reply(&format!("{}报名失败：好友列表未找到唯一昵称", label));
-                }
-                let outcome = self.landlord.handle(player, command, Instant::now())?;
-                self.deliver_landlord_task_outcome(outcome)
-            }
-            LandlordCommand::Hand => {
-                let outcome = self.landlord.handle(player, command, Instant::now())?;
-                if let Some(message) = outcome.private_reply {
-                    match self.send_friend_message(player, &message) {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            self.landlord.retry_hand_delivery(player)?;
-                            return Err(anyhow!("牌局手牌发送失败：好友列表未找到 {}", player));
-                        }
-                        Err(error) => {
-                            self.landlord.retry_hand_delivery(player)?;
-                            return Err(error);
-                        }
-                    }
-                }
-                Ok(())
-            }
-            _ => {
-                let outcome = self.landlord.handle(player, command, Instant::now())?;
-                self.deliver_landlord_task_outcome(outcome)
-            }
-        }
-    }
-
-    fn deliver_landlord_task_outcome(&self, outcome: LandlordOutcome) -> Result<()> {
-        self.landlord.begin_delivery(&outcome);
-        for delivery in outcome.private_deliveries {
-            match self.send_friend_message(&delivery.player, &delivery.message) {
-                Ok(true) => {}
-                Ok(false) => {
-                    self.landlord.abort()?;
-                    return Err(anyhow!("牌局发牌失败：好友列表未找到 {}", delivery.player));
-                }
-                Err(error) => {
-                    self.landlord.abort()?;
-                    return Err(error);
-                }
-            }
-        }
-        if let Some(reply) = outcome.public_reply {
-            self.reply(&reply)?;
-        }
-        Ok(())
+        self.landlord.execute(player, command, self, Instant::now())
     }
 
     fn execute_undercover_command(
@@ -6214,6 +6146,20 @@ impl AutomationApp {
             idle_exit_remaining_seconds,
             hall_remaining_minutes,
         );
+    }
+}
+
+impl CardGameDeliveryPort for AutomationApp {
+    fn verify_friend(&self, player: &str, message: &str) -> Result<bool> {
+        self.send_unique_friend_message(player, message)
+    }
+
+    fn send_friend(&self, player: &str, message: &str) -> Result<bool> {
+        self.send_friend_message(player, message)
+    }
+
+    fn send_hall(&self, message: &str) -> Result<()> {
+        self.reply(message)
     }
 }
 

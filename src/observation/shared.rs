@@ -5,8 +5,15 @@ use std::sync::Arc;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ObservationSequence(u64);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObservationGapKind {
+    HistoryEvicted,
+    ExclusiveSession,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObservationGap {
+    pub kind: ObservationGapKind,
     pub missing_from: ObservationSequence,
     pub missing_through: ObservationSequence,
     pub resume_at: ObservationSequence,
@@ -32,8 +39,25 @@ impl<T> ObservationRead<T> {
 
 pub struct SharedObservationStream<T> {
     capacity: NonZeroUsize,
-    entries: VecDeque<(ObservationSequence, Arc<T>)>,
+    entries: VecDeque<StoredObservation<T>>,
     next_sequence: u64,
+}
+
+enum StoredObservation<T> {
+    Item {
+        sequence: ObservationSequence,
+        value: Arc<T>,
+    },
+    Gap(ObservationGap),
+}
+
+impl<T> StoredObservation<T> {
+    fn first_sequence(&self) -> ObservationSequence {
+        match self {
+            Self::Item { sequence, .. } => *sequence,
+            Self::Gap(gap) => gap.missing_from,
+        }
+    }
 }
 
 impl<T> SharedObservationStream<T> {
@@ -53,16 +77,39 @@ impl<T> SharedObservationStream<T> {
 
     pub fn publish(&mut self, value: T) -> ObservationSequence {
         let sequence = ObservationSequence(self.next_sequence);
-        self.next_sequence = self
-            .next_sequence
-            .checked_add(1)
-            .expect("observation sequence exhausted");
-        self.entries.push_back((sequence, Arc::new(value)));
+        self.next_sequence = next_sequence(self.next_sequence);
+        self.push(StoredObservation::Item {
+            sequence,
+            value: Arc::new(value),
+        });
+        sequence
+    }
+
+    pub fn mark_gap(&mut self, kind: ObservationGapKind) -> ObservationGap {
+        let missing = ObservationSequence(self.next_sequence);
+        self.next_sequence = next_sequence(self.next_sequence);
+        let gap = ObservationGap {
+            kind,
+            missing_from: missing,
+            missing_through: missing,
+            resume_at: ObservationSequence(self.next_sequence),
+        };
+        self.push(StoredObservation::Gap(gap.clone()));
+        gap
+    }
+
+    fn push(&mut self, entry: StoredObservation<T>) {
+        self.entries.push_back(entry);
         if self.entries.len() > self.capacity.get() {
             self.entries.pop_front();
         }
-        sequence
     }
+}
+
+fn next_sequence(sequence: u64) -> u64 {
+    sequence
+        .checked_add(1)
+        .expect("observation sequence exhausted")
 }
 
 pub struct ObservationSubscriber {
@@ -74,12 +121,13 @@ impl ObservationSubscriber {
         &mut self,
         stream: &SharedObservationStream<T>,
     ) -> Option<ObservationRead<T>> {
-        let (oldest, _) = stream.entries.front()?;
+        let oldest = stream.entries.front()?.first_sequence();
         if self.next_sequence < oldest.0 {
             let gap = ObservationGap {
+                kind: ObservationGapKind::HistoryEvicted,
                 missing_from: ObservationSequence(self.next_sequence),
                 missing_through: ObservationSequence(oldest.0 - 1),
-                resume_at: *oldest,
+                resume_at: oldest,
             };
             self.next_sequence = oldest.0;
             return Some(ObservationRead::Gap(gap));
@@ -88,16 +136,26 @@ impl ObservationSubscriber {
             return None;
         }
 
-        let offset = (self.next_sequence - oldest.0) as usize;
-        let (sequence, value) = stream.entries.get(offset)?;
-        self.next_sequence = self
-            .next_sequence
-            .checked_add(1)
-            .expect("observation subscriber sequence exhausted");
-        Some(ObservationRead::Item {
-            sequence: *sequence,
-            value: Arc::clone(value),
-        })
+        for entry in &stream.entries {
+            match entry {
+                StoredObservation::Item { sequence, value } if sequence.0 == self.next_sequence => {
+                    self.next_sequence = next_sequence(self.next_sequence);
+                    return Some(ObservationRead::Item {
+                        sequence: *sequence,
+                        value: Arc::clone(value),
+                    });
+                }
+                StoredObservation::Gap(gap)
+                    if self.next_sequence >= gap.missing_from.0
+                        && self.next_sequence <= gap.missing_through.0 =>
+                {
+                    self.next_sequence = gap.resume_at.0;
+                    return Some(ObservationRead::Gap(gap.clone()));
+                }
+                _ => {}
+            }
+        }
+        None
     }
 }
 
@@ -126,6 +184,7 @@ mod tests {
         assert_eq!(
             slow.read_next(&stream),
             Some(ObservationRead::Gap(ObservationGap {
+                kind: ObservationGapKind::HistoryEvicted,
                 missing_from: first,
                 missing_through: first,
                 resume_at: second,

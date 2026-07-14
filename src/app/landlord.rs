@@ -37,21 +37,6 @@ pub enum LandlordCommand {
     Pass,
     Hand,
     Exit,
-    Help,
-}
-
-impl LandlordCommand {
-    pub fn parse(args: &str) -> Self {
-        match args.trim() {
-            "开始" | "创建" => Self::Start,
-            "抢" | "抢地主" | "叫地主" => Self::Rob,
-            "不抢" | "不叫" => Self::Decline,
-            "状态" | "查看" => Self::Status,
-            "退出" | "结束" | "取消" => Self::Exit,
-            "帮助" | "?" | "？" | "" => Self::Help,
-            _ => Self::Help,
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -317,7 +302,7 @@ impl LandlordGame {
         LandlordOutcome::public(
             "created",
             format!(
-                "{}创建了{}房间，还需2人，发送 @加入 参加",
+                "{}创建了{}房间，还需2人，发送 #加入 参加",
                 player.trim(),
                 variant.label()
             ),
@@ -395,7 +380,7 @@ impl LandlordGame {
         LandlordOutcome::public(
             "bidding-started",
             format!(
-                "斗地主已发手牌，随机由{}开始抢地主；发送 @抢地主 或 @不抢",
+                "斗地主已发手牌，随机由{}开始抢地主；发送 #抢 或 #不抢",
                 first_name
             ),
         )
@@ -419,10 +404,6 @@ impl LandlordGame {
             LandlordCommand::Pass => self.pass(player, now),
             LandlordCommand::Hand => self.hand(player, now),
             LandlordCommand::Exit => self.exit(player),
-            LandlordCommand::Help => LandlordOutcome::public(
-                "help",
-                "牌类: @斗地主 开始或@跑得快 开始；共用@加入、@出 牌组/$牌组/＄牌组、@过、好友私聊@手牌；斗地主另用@抢地主/@不抢",
-            ),
         }
     }
 

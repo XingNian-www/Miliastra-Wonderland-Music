@@ -18,6 +18,8 @@ pub struct AppConfig {
     pub config_version: u32,
     pub window: WindowConfig,
     pub screen: ScreenConfig,
+    #[serde(default)]
+    pub stability: StabilityConfig,
     pub timing: TimingConfig,
     pub ocr: OcrConfig,
     pub templates: TemplateConfig,
@@ -49,6 +51,32 @@ pub struct AppConfig {
     pub custom_workflows: CustomWorkflowConfig,
 }
 
+const BUILTIN_STABILITY_COUNT: u32 = 2;
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StabilityConfig {
+    pub default_count: u32,
+}
+
+impl Default for StabilityConfig {
+    fn default() -> Self {
+        Self {
+            default_count: BUILTIN_STABILITY_COUNT,
+        }
+    }
+}
+
+pub(crate) fn resolve_stability_count(local: u32, global: u32) -> u32 {
+    if local > 1 {
+        local
+    } else if global > 1 {
+        global
+    } else {
+        BUILTIN_STABILITY_COUNT
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WindowConfig {
     /// 支持逗号、分号、竖线或空白分隔的多个进程名。
@@ -65,6 +93,18 @@ fn default_window_focus_point() -> PointConfig {
 }
 
 impl AppConfig {
+    pub(crate) fn resolve_stability_count(&self, local: u32) -> u32 {
+        resolve_stability_count(local, self.stability.default_count)
+    }
+
+    pub(crate) fn resolve_stability_count_usize(&self, local: usize) -> usize {
+        if local > 1 {
+            local
+        } else {
+            self.resolve_stability_count(local as u32) as usize
+        }
+    }
+
     pub fn load_or_create(path: &Path) -> Result<Self> {
         if path.exists() {
             let text = fs::read_to_string(path)
@@ -666,7 +706,7 @@ pub struct InviteConfig {
 }
 
 fn default_friend_name_stable_count() -> u32 {
-    2
+    0
 }
 
 fn default_friend_chat_region() -> RectConfig {
@@ -681,6 +721,14 @@ fn default_friend_chat_region() -> RectConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stability_count_uses_local_then_global_then_builtin_default() {
+        assert_eq!(resolve_stability_count(4, 3), 4);
+        assert_eq!(resolve_stability_count(1, 3), 3);
+        assert_eq!(resolve_stability_count(0, 3), 3);
+        assert_eq!(resolve_stability_count(1, 1), 2);
+    }
 
     #[test]
     fn old_primary_anchor_config_names_deserialize_to_friend_names() {

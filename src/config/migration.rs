@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow};
 use serde_yaml::{Mapping, Value};
 
-pub const CURRENT_CONFIG_VERSION: u32 = 26;
+pub const CURRENT_CONFIG_VERSION: u32 = 27;
 
 struct ChangedDefaultField {
     path: &'static str,
@@ -23,6 +23,21 @@ const CHANGED_DEFAULT_FIELDS: &[ChangedDefaultField] = &[
         path: "queue.auto_advance_seconds",
         old_default: 2,
         changed_in_version: 5,
+    },
+    ChangedDefaultField {
+        path: "invite.friend_name_stable_count",
+        old_default: 2,
+        changed_in_version: 27,
+    },
+    ChangedDefaultField {
+        path: "turtle_soup.nickname_stable_count",
+        old_default: 2,
+        changed_in_version: 27,
+    },
+    ChangedDefaultField {
+        path: "turtle_soup.content_stable_count",
+        old_default: 2,
+        changed_in_version: 27,
     },
 ];
 
@@ -841,7 +856,7 @@ song_review:
 
     const DEFAULT: &str = r#"# 测试配置
 # 版本注释
-config_version: 26
+config_version: 27
 
 timing:
   watchdog_restart_ms: 2000
@@ -1005,7 +1020,7 @@ unknown_root:
             .expect("migration needed");
 
         assert!(report.text.contains("# 兜底扫描注释"));
-        assert!(report.text.contains("config_version: 26"));
+        assert!(report.text.contains("config_version: 27"));
         assert!(report.text.contains("template_threshold: 0.9"));
         assert!(report.text.contains("enter_game_timeout_ms: 60000"));
         assert!(report.text.contains("enter_game_text_region:"));
@@ -1205,7 +1220,7 @@ templates:
 
     #[test]
     fn current_version_without_moved_fields_does_not_migrate() {
-        let current = r#"config_version: 26
+        let current = r#"config_version: 27
 timing:
   loop_idle_ms: 60
   chat_scan:
@@ -1251,7 +1266,7 @@ idiom_chain:
 
         assert_eq!(
             get_path(&migrated, &["config_version"]).and_then(Value::as_u64),
-            Some(26)
+            Some(27)
         );
         assert_eq!(
             get_path(&migrated, &["idiom_chain", "enabled"]).and_then(Value::as_bool),
@@ -1276,7 +1291,7 @@ idiom_chain:
 
         assert_eq!(
             get_path(&migrated, &["config_version"]).and_then(Value::as_u64),
-            Some(26)
+            Some(27)
         );
         assert_eq!(
             get_path(&migrated, &["landlord", "enabled"]).and_then(Value::as_bool),
@@ -1302,7 +1317,7 @@ idiom_chain:
 
         assert_eq!(
             get_path(&migrated, &["config_version"]).and_then(Value::as_u64),
-            Some(26)
+            Some(27)
         );
         assert_eq!(
             get_path(&migrated, &["undercover", "enabled"]).and_then(Value::as_bool),
@@ -1324,7 +1339,7 @@ idiom_chain:
 
         assert_eq!(
             get_path(&migrated, &["config_version"]).and_then(Value::as_u64),
-            Some(26)
+            Some(27)
         );
         assert_eq!(
             get_path(&migrated, &["undercover", "enabled"]).and_then(Value::as_bool),
@@ -1332,7 +1347,7 @@ idiom_chain:
         );
         assert_eq!(
             get_path(&migrated, &["invite", "friend_name_stable_count"]).and_then(Value::as_u64),
-            Some(2)
+            Some(0)
         );
     }
 
@@ -1351,6 +1366,37 @@ idiom_chain:
     }
 
     #[test]
+    fn migrates_v26_stability_defaults_to_global_inheritance() {
+        let old = r#"config_version: 26
+invite:
+  friend_name_stable_count: 2
+turtle_soup:
+  nickname_stable_count: 2
+  content_stable_count: 2
+"#;
+        let report = migrate_config_text(old, include_str!("../../config.yaml"))
+            .expect("migration succeeds")
+            .expect("migration needed");
+        let migrated: Value = serde_yaml::from_str(&report.text).expect("valid migrated yaml");
+
+        assert_eq!(
+            get_path(&migrated, &["config_version"]).and_then(Value::as_u64),
+            Some(27)
+        );
+        assert_eq!(
+            get_path(&migrated, &["stability", "default_count"]).and_then(Value::as_u64),
+            Some(2)
+        );
+        for path in [
+            &["invite", "friend_name_stable_count"][..],
+            &["turtle_soup", "nickname_stable_count"][..],
+            &["turtle_soup", "content_stable_count"][..],
+        ] {
+            assert_eq!(get_path(&migrated, path).and_then(Value::as_u64), Some(0));
+        }
+    }
+
+    #[test]
     fn migrates_v10_current_song_protection_to_default_enabled() {
         let old = r#"config_version: 10
 queue:
@@ -1362,7 +1408,7 @@ queue:
             .expect("migration succeeds")
             .expect("migration needed");
 
-        assert!(report.text.contains("config_version: 26"));
+        assert!(report.text.contains("config_version: 27"));
         assert!(
             report
                 .text
@@ -1420,7 +1466,7 @@ custom_workflows:
             .expect("migration succeeds")
             .expect("migration needed");
 
-        assert!(report.text.contains("config_version: 26"));
+        assert!(report.text.contains("config_version: 27"));
         assert!(report.text.contains("allow_args: false"));
         assert!(report.text.contains("message_types:"));
         assert!(report.text.contains("confirm_before_run: false"));
@@ -1496,7 +1542,7 @@ queue:
             .expect("migration succeeds")
             .expect("migration needed");
 
-        assert!(report.text.contains("config_version: 26"));
+        assert!(report.text.contains("config_version: 27"));
         assert!(report.text.contains("auto_advance_seconds: 1"));
     }
 
@@ -1511,7 +1557,7 @@ tui:
             .expect("migration succeeds")
             .expect("migration needed");
 
-        assert!(report.text.contains("config_version: 26"));
+        assert!(report.text.contains("config_version: 27"));
         assert!(report.text.contains("enabled: true"));
         assert!(
             report

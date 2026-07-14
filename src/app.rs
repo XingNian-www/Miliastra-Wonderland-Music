@@ -38,8 +38,6 @@ pub(crate) mod turtle_soup;
 mod turtle_soup_bank;
 mod ui_locator;
 mod ui_state;
-pub(crate) mod undercover;
-mod undercover_bank;
 mod web_tools;
 mod window;
 mod workflow_actions;
@@ -108,13 +106,17 @@ use self::turtle_soup::{
 };
 use self::ui_locator::UiLocator;
 use self::ui_state::{UiState, detect_ui_state};
-use self::undercover::{UndercoverCommand, UndercoverDelivery, UndercoverGame, UndercoverMode};
-use self::undercover_bank::UndercoverBankStore;
 use self::web_tools::{WebToolRequest, WebToolShared, WebToolTask, WebToolTemplate};
 use crate::config::{AppConfig, PointConfig};
 use crate::features::card_games::{LandlordCommand, LandlordGame, LandlordOutcome};
 use crate::features::idiom_chain;
 use crate::features::idiom_chain::IdiomChainGame;
+#[cfg(test)]
+use crate::features::undercover;
+use crate::features::undercover::repository::UndercoverBankStore;
+use crate::features::undercover::{
+    UndercoverCommand, UndercoverDelivery, UndercoverGame, UndercoverMode,
+};
 use anyhow::{Context, Result, anyhow};
 use enigo::Key;
 use image::DynamicImage;

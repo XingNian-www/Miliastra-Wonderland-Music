@@ -26,7 +26,6 @@ use super::command::{
     self, CustomWorkflowCommand, ParsedCommand, PendingCommand, SongCommand, SongSource,
     UserCommand,
 };
-use super::config::AppConfig;
 use super::custom_workflow;
 use super::decision_control::{DecisionAction, DecisionControlShared};
 #[cfg(test)]
@@ -43,6 +42,7 @@ use super::turtle_soup::TurtleSoupService;
 use super::turtle_soup_bank::{TurtleSoupBankStore, TurtleSoupSubmission};
 use super::undercover::{UndercoverCommand, UndercoverGame};
 use super::web_tools::{WebToolRequest, WebToolShared, WebToolTemplate};
+use crate::config::AppConfig;
 
 const MAX_ACTIVE_CONNECTIONS: usize = 32;
 const MAX_JSON_BODY_BYTES: usize = 64 * 1024;
@@ -2566,7 +2566,7 @@ fn sanitized_query(query: &[(String, String)]) -> HashMap<String, String> {
         .collect()
 }
 
-fn requires_access_token(config: &super::config::HttpConfig, path: &str) -> bool {
+fn requires_access_token(config: &crate::config::HttpConfig, path: &str) -> bool {
     !config.access_token.trim().is_empty()
         && !matches!(path, "/" | "/tools" | "/favicon.ico" | "/health")
 }

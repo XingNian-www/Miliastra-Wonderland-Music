@@ -6,8 +6,8 @@ use serde::Serialize;
 
 use super::ResolvedUiTemplateArgs;
 use super::chat_scan::count_chat_markers;
-use super::config;
 use super::template_match::best_template_hit;
+use crate::config;
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

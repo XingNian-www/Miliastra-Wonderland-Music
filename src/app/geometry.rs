@@ -2,7 +2,7 @@ use anyhow::{Result, bail};
 use image::DynamicImage;
 use serde::Serialize;
 
-use super::config::RectConfig;
+use crate::config::RectConfig;
 
 #[derive(Clone, Copy, Debug, Serialize)]
 pub(super) struct Point {

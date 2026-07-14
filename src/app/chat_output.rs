@@ -6,15 +6,15 @@ use anyhow::{Context, Result, anyhow};
 use enigo::{Direction, Enigo, Key, Keyboard, Settings};
 
 use super::FrameArgs;
-use super::config::{
-    InviteConfig, OutputConfig, ScreenConfig, TemplateConfig, TimingConfig, WindowConfig,
-};
 use super::frame_source::Canvas;
 use super::geometry::Rect;
 use super::input_actions;
 use super::ui_locator::UiLocator;
 use super::window::GameWindow;
 use super::workflow_actions::{self, ScrollTemplateOptions};
+use crate::config::{
+    InviteConfig, OutputConfig, ScreenConfig, TemplateConfig, TimingConfig, WindowConfig,
+};
 
 pub(super) const MAX_CHAT_WIDTH: usize = 80;
 const OMIT: &str = "...";

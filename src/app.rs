@@ -107,7 +107,9 @@ use self::ui_locator::UiLocator;
 use self::ui_state::{UiState, detect_ui_state};
 use self::web_tools::{WebToolRequest, WebToolShared, WebToolTask, WebToolTemplate};
 use crate::config::{AppConfig, PointConfig};
-use crate::features::card_games::{LandlordCommand, LandlordGame, LandlordOutcome};
+use crate::features::card_games::{
+    CardGameService, CardGameStartGate, LandlordCommand, LandlordOutcome,
+};
 use crate::features::chat_text::split_numbered_chat_message;
 use crate::features::entertainment::{AcquireOutcome, EntertainmentCoordinator, EntertainmentKind};
 use crate::features::idiom_chain;
@@ -358,7 +360,7 @@ pub(crate) struct AutomationApp {
     runtime_state: Arc<Mutex<PersistentRuntimeState>>,
     entertainment: EntertainmentCoordinator,
     idiom_chain: IdiomChainService,
-    landlord: Arc<Mutex<LandlordGame>>,
+    landlord: CardGameService,
     undercover: Arc<Mutex<UndercoverGame>>,
     undercover_bank: UndercoverBankStore,
     turtle_soup: TurtleSoupService,
@@ -729,13 +731,6 @@ fn landlord_command_requires_executor(command: &LandlordCommand) -> bool {
     )
 }
 
-fn is_card_game_kind(kind: EntertainmentKind) -> bool {
-    matches!(
-        kind,
-        EntertainmentKind::Landlord | EntertainmentKind::RunFast
-    )
-}
-
 fn tick_undercover_game(
     game: &Arc<Mutex<UndercoverGame>>,
     entertainment: &EntertainmentCoordinator,
@@ -755,14 +750,6 @@ fn tick_undercover_game(
         entertainment.release(EntertainmentKind::Undercover);
     }
     Ok(deliveries)
-}
-
-fn card_game_start_kind(command: &LandlordCommand) -> Option<EntertainmentKind> {
-    match command {
-        LandlordCommand::Start => Some(EntertainmentKind::Landlord),
-        LandlordCommand::RunFastStart => Some(EntertainmentKind::RunFast),
-        _ => None,
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -918,7 +905,7 @@ impl AutomationApp {
         if config.idiom_chain.enabled {
             log::info!("已加载成语接龙词库: {} 条", idiom_chain.lexicon_len()?);
         }
-        let landlord = Arc::new(Mutex::new(LandlordGame::new(config.landlord.clone())));
+        let landlord = CardGameService::new(config.landlord.clone(), entertainment.clone());
         let undercover = Arc::new(Mutex::new(UndercoverGame::new(config.undercover.clone())));
         let undercover_bank = UndercoverBankStore::new(
             config.undercover.word_bank_path.clone(),
@@ -1329,12 +1316,6 @@ impl AutomationApp {
         self.runtime_state
             .lock()
             .map_err(|_| anyhow!("runtime state mutex poisoned"))
-    }
-
-    fn landlord(&self) -> Result<MutexGuard<'_, LandlordGame>> {
-        self.landlord
-            .lock()
-            .map_err(|_| anyhow!("landlord mutex poisoned"))
     }
 
     fn undercover(&self) -> Result<MutexGuard<'_, UndercoverGame>> {
@@ -2402,19 +2383,9 @@ impl AutomationApp {
         if landlord_command_requires_executor(command) {
             return Ok(false);
         }
-        if let Some(active) = self.entertainment.active()
-            && !is_card_game_kind(active)
-            && !matches!(command, LandlordCommand::Status)
-        {
-            self.enqueue_current_hall_reply(&format!(
-                "{}正在进行，请结束后再开始牌局",
-                active.label()
-            ))?;
-            return Ok(true);
-        }
         let outcome = self
-            .landlord()?
-            .handle(&parsed.username, command, Instant::now());
+            .landlord
+            .handle(&parsed.username, command, Instant::now())?;
         self.finish_landlord_outcome(outcome)?;
         log::info!(
             "牌局命令已处理: command={} user={}",
@@ -2425,14 +2396,6 @@ impl AutomationApp {
     }
 
     fn finish_landlord_outcome(&self, outcome: LandlordOutcome) -> Result<()> {
-        if outcome.ended
-            && let Some(kind) = self
-                .entertainment
-                .active()
-                .filter(|kind| is_card_game_kind(*kind))
-        {
-            self.entertainment.release(kind);
-        }
         if let Some(reply) = outcome.public_reply {
             self.enqueue_current_hall_reply(&reply)?;
         }
@@ -2505,20 +2468,10 @@ impl AutomationApp {
             }
             Err(_) => log::error!("谁是卧底状态锁已损坏，无法中止旧牌局"),
         }
-        match self.landlord.lock() {
-            Ok(mut game) => {
-                if game.abort() {
-                    if let Some(kind) = self
-                        .entertainment
-                        .active()
-                        .filter(|kind| is_card_game_kind(*kind))
-                    {
-                        self.entertainment.release(kind);
-                    }
-                    log::warn!("牌局已因聊天上下文变化中止: {}", reason);
-                }
-            }
-            Err(_) => log::error!("牌局状态锁已损坏，无法中止旧牌局"),
+        match self.landlord.abort() {
+            Ok(true) => log::warn!("牌局已因聊天上下文变化中止: {}", reason),
+            Ok(false) => {}
+            Err(error) => log::error!("无法中止旧牌局: {error:#}"),
         }
         match self.idiom_chain.abort() {
             Ok(true) => log::warn!("成语接龙已因聊天上下文变化中止: {}", reason),
@@ -2531,10 +2484,10 @@ impl AutomationApp {
         self.turtle_soup.tick();
         let clock_active = !self.paused.load(AtomicOrdering::SeqCst)
             && !self.command_executing.load(AtomicOrdering::SeqCst);
-        let card_game_outcome = match self.landlord.lock() {
-            Ok(mut game) => game.tick(Instant::now(), clock_active),
-            Err(_) => {
-                log::error!("牌局状态锁已损坏，无法推进回合计时");
+        let card_game_outcome = match self.landlord.tick(Instant::now(), clock_active) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                log::error!("无法推进牌局回合计时: {error:#}");
                 None
             }
         };
@@ -2543,16 +2496,10 @@ impl AutomationApp {
             let ended = outcome.ended;
             if let Err(error) = self.push_pending_task(PendingTask::CardGameOutcome { outcome }) {
                 log::error!("牌局计时结果入队失败: {error:#}");
-                if should_abort_on_failure && let Ok(mut game) = self.landlord.lock() {
-                    game.abort();
-                }
                 if (ended || should_abort_on_failure)
-                    && let Some(kind) = self
-                        .entertainment
-                        .active()
-                        .filter(|kind| is_card_game_kind(*kind))
+                    && let Err(abort_error) = self.landlord.abort()
                 {
-                    self.entertainment.release(kind);
+                    log::error!("牌局计时结果入队失败后无法中止牌局: {abort_error:#}");
                 }
             }
         }
@@ -5646,56 +5593,36 @@ impl AutomationApp {
     fn execute_landlord_command(&self, player: &str, command: &LandlordCommand) -> Result<()> {
         match command {
             LandlordCommand::Start | LandlordCommand::RunFastStart => {
-                let kind = card_game_start_kind(command).expect("start command has game kind");
+                let kind = match self.landlord.prepare_start(command)? {
+                    CardGameStartGate::Ready { kind } => kind,
+                    CardGameStartGate::Reply(reply) => return self.reply(&reply),
+                };
                 let label = kind.label();
-                if !self.config.landlord.enabled {
-                    return self.reply(&format!("{}未启用", label));
-                }
-                if self.landlord()?.is_active() {
-                    let outcome = self.landlord()?.handle(player, command, Instant::now());
-                    return self.deliver_landlord_task_outcome(outcome);
-                }
-                match self.entertainment.try_acquire(kind)? {
-                    AcquireOutcome::Acquired => {}
-                    AcquireOutcome::AlreadyOwned => {}
-                    AcquireOutcome::Occupied(kind) => {
-                        return self.reply(&format!(
-                            "{}正在进行，请结束后再开始{}",
-                            kind.label(),
-                            label
-                        ));
-                    }
-                }
                 let verified = match self.send_unique_friend_message(
                     player,
                     &format!("{}报名成功，请回到大厅等待组局", label),
                 ) {
                     Ok(verified) => verified,
                     Err(error) => {
-                        self.entertainment.release(kind);
+                        self.landlord.cancel_start(kind);
                         return Err(error);
                     }
                 };
                 if !verified {
-                    self.entertainment.release(kind);
+                    self.landlord.cancel_start(kind);
                     return self.reply(&format!("{}报名失败：好友列表未找到唯一昵称", label));
                 }
-                let outcome = self.landlord()?.handle(player, command, Instant::now());
-                if outcome.action != "created" {
-                    self.entertainment.release(kind);
-                }
+                let outcome = self
+                    .landlord
+                    .complete_start(player, command, Instant::now())?;
                 self.deliver_landlord_task_outcome(outcome)
             }
             LandlordCommand::Join => {
-                let active_kind = self.entertainment.active();
-                if !active_kind.is_some_and(is_card_game_kind)
-                    || !self.landlord()?.is_lobby()
-                    || self.landlord()?.lobby_contains(player)
-                {
-                    let outcome = self.landlord()?.handle(player, command, Instant::now());
+                let Some(kind) = self.landlord.lobby_kind_for_join(player)? else {
+                    let outcome = self.landlord.handle(player, command, Instant::now())?;
                     return self.deliver_landlord_task_outcome(outcome);
-                }
-                let label = active_kind.expect("active card game").label();
+                };
+                let label = kind.label();
                 let verified = self.send_unique_friend_message(
                     player,
                     &format!("{}报名成功，请回到大厅等待开局", label),
@@ -5703,20 +5630,20 @@ impl AutomationApp {
                 if !verified {
                     return self.reply(&format!("{}报名失败：好友列表未找到唯一昵称", label));
                 }
-                let outcome = self.landlord()?.handle(player, command, Instant::now());
+                let outcome = self.landlord.handle(player, command, Instant::now())?;
                 self.deliver_landlord_task_outcome(outcome)
             }
             LandlordCommand::Hand => {
-                let outcome = self.landlord()?.handle(player, command, Instant::now());
+                let outcome = self.landlord.handle(player, command, Instant::now())?;
                 if let Some(message) = outcome.private_reply {
                     match self.send_friend_message(player, &message) {
                         Ok(true) => {}
                         Ok(false) => {
-                            self.landlord()?.retry_hand_delivery(player);
+                            self.landlord.retry_hand_delivery(player)?;
                             return Err(anyhow!("牌局手牌发送失败：好友列表未找到 {}", player));
                         }
                         Err(error) => {
-                            self.landlord()?.retry_hand_delivery(player);
+                            self.landlord.retry_hand_delivery(player)?;
                             return Err(error);
                         }
                     }
@@ -5724,21 +5651,14 @@ impl AutomationApp {
                 Ok(())
             }
             _ => {
-                let outcome = self.landlord()?.handle(player, command, Instant::now());
+                let outcome = self.landlord.handle(player, command, Instant::now())?;
                 self.deliver_landlord_task_outcome(outcome)
             }
         }
     }
 
     fn deliver_landlord_task_outcome(&self, outcome: LandlordOutcome) -> Result<()> {
-        if outcome.ended
-            && let Some(kind) = self
-                .entertainment
-                .active()
-                .filter(|kind| is_card_game_kind(*kind))
-        {
-            self.entertainment.release(kind);
-        }
+        self.landlord.finish_delivery(&outcome);
         for delivery in outcome.private_deliveries {
             match self.send_friend_message(&delivery.player, &delivery.message) {
                 Ok(true) => {}
@@ -5759,14 +5679,7 @@ impl AutomationApp {
     }
 
     fn abort_card_game_after_delivery_failure(&self) -> Result<()> {
-        self.landlord()?.abort();
-        if let Some(kind) = self
-            .entertainment
-            .active()
-            .filter(|kind| is_card_game_kind(*kind))
-        {
-            self.entertainment.release(kind);
-        }
+        self.landlord.abort()?;
         Ok(())
     }
 

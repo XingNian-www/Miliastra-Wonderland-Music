@@ -1,12 +1,14 @@
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use anyhow::{Result, anyhow};
 
 use super::change_detection::{ChangeFingerprint, change_stats};
 use super::chat_scan::ChatMessage;
 use crate::observation::chat::{
-    BubbleSequence, ChatIdentity, ObservedChatMessageId, VisualSessionId,
+    BubbleSequence, ChatIdentity, ChatObservationLedger, CompletionAdvance, FrameCompletionOutcome,
+    ObservationFrameId, ObservedChatMessageId, ObservedFrame, VisualSessionId,
 };
 use crate::observation::exclusive::{
     ExclusiveObservationRouter, ExclusiveSessionId, RoutedObservation,
@@ -62,6 +64,7 @@ struct ChatObservationState {
     primary_visible: Vec<PrimaryTrackedMessage>,
     change_mean_threshold: f32,
     change_pixel_threshold: f32,
+    ledger: ChatObservationLedger,
 }
 
 struct PrimaryTrackedMessage {
@@ -91,12 +94,14 @@ impl ChatObservationShared {
                 primary_visible: Vec::new(),
                 change_mean_threshold,
                 change_pixel_threshold,
+                ledger: ChatObservationLedger::new(),
             })),
         }
     }
 
     pub(super) fn publish_primary(
         &self,
+        frame: ObservedFrame,
         messages: Vec<ChatMessage>,
     ) -> Result<Vec<ChatObservationDispatch>> {
         let mut state = self
@@ -104,7 +109,10 @@ impl ChatObservationShared {
             .lock()
             .map_err(|_| anyhow!("聊天观察流状态锁已损坏"))?;
         if messages.is_empty() {
-            return Self::publish_locked(&mut state, ChatObservation::Primary(Vec::new()));
+            let dispatches =
+                Self::publish_locked(&mut state, ChatObservation::Primary(Vec::new()))?;
+            Self::complete_success(&mut state, frame.id())?;
+            return Ok(dispatches);
         }
 
         let previous_ids = match_primary_messages(&state, &messages);
@@ -132,11 +140,14 @@ impl ChatObservationShared {
                 visual: observed.message.visual.clone(),
             })
             .collect();
-        Self::publish_locked(&mut state, ChatObservation::Primary(observed))
+        let dispatches = Self::publish_locked(&mut state, ChatObservation::Primary(observed))?;
+        Self::complete_success(&mut state, frame.id())?;
+        Ok(dispatches)
     }
 
     pub(super) fn publish_secondary(
         &self,
+        frame: ObservedFrame,
         message_type: &str,
         friend_name: &str,
         accepts_turtle_questions: bool,
@@ -168,7 +179,7 @@ impl ChatObservationShared {
                 sender: message.sender,
             });
         }
-        Self::publish_locked(
+        let dispatches = Self::publish_locked(
             &mut state,
             ChatObservation::Secondary(SecondaryChatObservation {
                 message_type: message_type.to_string(),
@@ -176,7 +187,9 @@ impl ChatObservationShared {
                 accepts_turtle_questions,
                 messages: observed,
             }),
-        )
+        )?;
+        Self::complete_success(&mut state, frame.id())?;
+        Ok(dispatches)
     }
 
     fn publish_locked(
@@ -229,6 +242,43 @@ impl ChatObservationShared {
         state.next_bubble_sequence = 1;
         state.primary_visible.clear();
         Ok(state.visual_session)
+    }
+
+    pub(super) fn begin_frame(&self, captured_at: Instant) -> Result<ObservedFrame> {
+        Ok(self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("聊天观察流状态锁已损坏"))?
+            .ledger
+            .begin_frame(captured_at))
+    }
+
+    pub(super) fn complete_without_messages(&self, frame: ObservedFrame) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("聊天观察流状态锁已损坏"))?;
+        Self::complete_success(&mut state, frame.id())
+    }
+
+    pub(super) fn record_terminal_failure(
+        &self,
+        frame: ObservedFrame,
+        reason: impl Into<Arc<str>>,
+    ) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("聊天观察流状态锁已损坏"))?;
+        let advance = state.ledger.complete_failure(frame.id(), reason)?;
+        log_completion_advance(&advance);
+        Ok(())
+    }
+
+    fn complete_success(state: &mut ChatObservationState, frame: ObservationFrameId) -> Result<()> {
+        let advance = state.ledger.complete_success(frame)?;
+        log_completion_advance(&advance);
+        Ok(())
     }
 
     pub(super) fn begin_exclusive(&self) -> Result<ChatObservationExclusiveGuard> {
@@ -311,6 +361,25 @@ fn primary_visual_matches(
     stats.mean_abs_diff < mean_threshold && stats.changed_ratio < pixel_threshold
 }
 
+fn log_completion_advance(advance: &CompletionAdvance) {
+    for completed in advance.completed() {
+        if let FrameCompletionOutcome::TerminalFailure(reason) = completed.outcome() {
+            log::error!(
+                "聊天观察帧终止失败: frame={} reason={}",
+                completed.frame().id().get(),
+                reason
+            );
+        }
+    }
+    if let Some(watermark) = advance.watermark() {
+        log::debug!(
+            "聊天观察完成水位推进: frame={} age={}ms",
+            watermark.completed_through.get(),
+            watermark.captured_through.elapsed().as_millis()
+        );
+    }
+}
+
 pub(super) struct ChatObservationExclusiveGuard {
     shared: ChatObservationShared,
     session: Option<ExclusiveSessionId>,
@@ -337,10 +406,14 @@ mod tests {
     fn primary_ocr_revision_keeps_the_visual_message_identity() {
         let shared = ChatObservationShared::new(6.0, 0.03);
 
-        let first = shared.publish_primary(vec![message("第一次 OCR")]).unwrap();
+        let first_frame = shared.begin_frame(Instant::now()).unwrap();
+        let first = shared
+            .publish_primary(first_frame, vec![message("第一次 OCR")])
+            .unwrap();
         let first_id = primary_id(&first);
+        let revised_frame = shared.begin_frame(Instant::now()).unwrap();
         let revised = shared
-            .publish_primary(vec![message("修订后的 OCR")])
+            .publish_primary(revised_frame, vec![message("修订后的 OCR")])
             .unwrap();
 
         assert_eq!(primary_id(&revised), first_id);

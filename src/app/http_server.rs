@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -40,6 +40,7 @@ use super::web_tools::{WebToolRequest, WebToolShared, WebToolTemplate};
 use crate::config::AppConfig;
 #[cfg(test)]
 use crate::features::entertainment::EntertainmentCoordinator;
+use crate::features::moderation::ModerationService;
 use crate::features::turtle_soup::TurtleSoupService;
 use crate::features::turtle_soup::repository::{TurtleSoupBankStore, TurtleSoupSubmission};
 use crate::features::undercover::{UndercoverCommand, UndercoverService};
@@ -444,7 +445,7 @@ pub struct HttpSharedState {
     pending: Arc<(Mutex<VecDeque<super::TrackedPendingTask>>, Condvar)>,
     task_tracker: TaskTrackerShared,
     decision_control: DecisionControlShared,
-    moderation_workflows: Arc<Mutex<HashSet<String>>>,
+    moderation: ModerationService,
     web_tools: WebToolShared,
     latest_frame: Arc<Mutex<Option<Arc<image::DynamicImage>>>>,
 }
@@ -493,7 +494,7 @@ impl HttpSharedState {
         monitor: MonitorShared,
         task_tracker: TaskTrackerShared,
         decision_control: DecisionControlShared,
-        moderation_workflows: Arc<Mutex<HashSet<String>>>,
+        moderation: ModerationService,
         web_tools: WebToolShared,
         latest_frame: Arc<Mutex<Option<Arc<image::DynamicImage>>>>,
     ) -> Self {
@@ -513,7 +514,7 @@ impl HttpSharedState {
             pending,
             task_tracker,
             decision_control,
-            moderation_workflows,
+            moderation,
             web_tools,
             latest_frame,
         }
@@ -1073,12 +1074,7 @@ fn task_cancel_route(
             sync_listener = true;
         }
         super::PendingTask::ModerationVoteResult { workflow_key, .. } => {
-            match state.moderation_workflows.lock() {
-                Ok(mut workflows) => {
-                    workflows.remove(workflow_key);
-                }
-                Err(_) => log::error!("管理流程锁已损坏，撤销任务后无法释放流程: {workflow_key}"),
-            }
+            state.moderation.release_best_effort(workflow_key);
             sync_listener = true;
         }
         _ => {}
@@ -3309,11 +3305,7 @@ mod tests {
             .chat_listener
             .complete_mode_switch(ChatListenerMode::Secondary);
         let workflow_key = "blacklist:123456789".to_string();
-        state
-            .moderation_workflows
-            .lock()
-            .expect("moderation workflow lock")
-            .insert(workflow_key.clone());
+        assert!(state.moderation.begin(&workflow_key).unwrap());
         let temporary_primary_hold =
             super::super::TemporaryPrimaryHold::new(state.chat_listener.clone())
                 .expect("temporary primary hold");
@@ -3336,13 +3328,7 @@ mod tests {
         task_cancel_route(&[("id".to_string(), receipt.task_id.to_string())], &state)
             .expect("cancel moderation result");
 
-        assert!(
-            !state
-                .moderation_workflows
-                .lock()
-                .expect("moderation workflow lock")
-                .contains(&workflow_key)
-        );
+        assert!(!state.moderation.is_active(&workflow_key).unwrap());
         assert!(!state.chat_listener.snapshot().temporary_primary);
     }
 
@@ -3610,7 +3596,7 @@ mod tests {
             monitor,
             TaskTrackerShared::new(),
             DecisionControlShared::new(),
-            Arc::new(Mutex::new(HashSet::new())),
+            ModerationService::new(),
             WebToolShared::new(),
             Arc::new(Mutex::new(None)),
         )

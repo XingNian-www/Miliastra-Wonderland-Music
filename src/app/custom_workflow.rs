@@ -1037,7 +1037,7 @@ impl AutomationApp {
         let mut samples: HashMap<(String, bool), u32> = HashMap::new();
         while self.running.load(AtomicOrdering::SeqCst) && Instant::now() < deadline {
             workflow_actions::wait(self.config.timing.moderation.vote_poll_ms);
-            let frame = match load_frame(&FrameArgs { image: None }, &canvas, &self.config.window) {
+            let frame = match load_frame(&FrameArgs { image: None }, &canvas, &self.game_ui) {
                 Ok(frame) => frame,
                 Err(error) => {
                     log::error!("{}投票截图失败: {error:#}", command.action.label());
@@ -1111,7 +1111,7 @@ impl AutomationApp {
             height: self.config.screen.expected_height,
             resize: true,
         };
-        let Ok(frame) = load_frame(&FrameArgs { image: None }, &canvas, &self.config.window) else {
+        let Ok(frame) = load_frame(&FrameArgs { image: None }, &canvas, &self.game_ui) else {
             return DecisionScreenLock::default();
         };
         let Ok(messages) = self.scan_chat_with_shared_ocr(&frame.image, &template_args) else {
@@ -1301,6 +1301,7 @@ impl AutomationApp {
         UiLocator::new(
             canvas,
             FrameArgs { image: None },
+            self.game_ui.clone(),
             self.config.window.clone(),
             poll_ms,
         )

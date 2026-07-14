@@ -116,6 +116,7 @@ use crate::features::entertainment::EntertainmentCoordinator;
 use crate::features::entertainment::{AcquireOutcome, EntertainmentKind};
 use crate::features::idiom_chain;
 use crate::features::idiom_chain::IdiomChainService;
+use crate::features::invite::InviteService;
 use crate::features::turtle_soup::{
     self, QuestionSubmitOutcome, SecondaryOcrObservation, SecondaryOcrStability, TurtleSoupService,
 };
@@ -383,7 +384,7 @@ pub(crate) struct AutomationApp {
     window_detection_signal: WindowDetectionSignal,
     screen_lock_primed: Arc<AtomicBool>,
     reset_locks_requested: Arc<AtomicBool>,
-    invite_executed_seqs: Arc<Mutex<HashSet<u32>>>,
+    invite: InviteService,
     moderation_workflows: Arc<Mutex<HashSet<String>>>,
     commands_enabled: Arc<AtomicBool>,
     idle_exit: Arc<Mutex<Option<IdleExitState>>>,
@@ -947,7 +948,7 @@ impl AutomationApp {
             window_detection_signal: WindowDetectionSignal::new(),
             screen_lock_primed: Arc::new(AtomicBool::new(false)),
             reset_locks_requested: Arc::new(AtomicBool::new(false)),
-            invite_executed_seqs: Arc::new(Mutex::new(HashSet::new())),
+            invite: InviteService::new(),
             moderation_workflows: Arc::new(Mutex::new(HashSet::new())),
             commands_enabled: Arc::new(AtomicBool::new(true)),
             idle_exit: Arc::new(Mutex::new(None)),
@@ -1266,7 +1267,7 @@ impl AutomationApp {
             window_detection_signal: self.window_detection_signal.clone(),
             screen_lock_primed: self.screen_lock_primed.clone(),
             reset_locks_requested: self.reset_locks_requested.clone(),
-            invite_executed_seqs: self.invite_executed_seqs.clone(),
+            invite: self.invite.clone(),
             moderation_workflows: self.moderation_workflows.clone(),
             commands_enabled: self.commands_enabled.clone(),
             idle_exit: self.idle_exit.clone(),
@@ -2178,16 +2179,10 @@ impl AutomationApp {
             }
             if let UserCommand::Invite(invite) = &parsed_command.command
                 && let Some(seq) = invite.seq
+                && self.invite.was_executed(seq)?
             {
-                let invite_executed = self
-                    .invite_executed_seqs
-                    .lock()
-                    .map_err(|_| anyhow!("invite_executed_seqs mutex poisoned"))?
-                    .contains(&seq);
-                if invite_executed {
-                    log::info!("邀请参数 {} 已执行过，跳过: {}", seq, parsed_command.raw);
-                    continue;
-                }
+                log::info!("邀请参数 {} 已执行过，跳过: {}", seq, parsed_command.raw);
+                continue;
             }
             if parsed
                 .iter()
@@ -2505,16 +2500,10 @@ impl AutomationApp {
         }
         if let UserCommand::Invite(invite) = &parsed.command
             && let Some(seq) = invite.seq
+            && self.invite.was_executed(seq)?
         {
-            let executed = self
-                .invite_executed_seqs
-                .lock()
-                .map_err(|_| anyhow!("invite_executed_seqs mutex poisoned"))?
-                .contains(&seq);
-            if executed {
-                log::info!("邀请参数 {} 已执行过，跳过: {}", seq, parsed.raw);
-                return Ok(());
-            }
+            log::info!("邀请参数 {} 已执行过，跳过: {}", seq, parsed.raw);
+            return Ok(());
         }
         if self.pending_contains_command(&parsed)? {
             log::info!("二级监听命令已在待处理队列，跳过: {}", parsed.raw);
@@ -5086,18 +5075,15 @@ impl AutomationApp {
                 self.execute_undercover_command(parsed, command)?;
             }
             UserCommand::Invite(invite) => {
-                if let Some(seq) = invite.seq {
-                    let mut executed = self
-                        .invite_executed_seqs
-                        .lock()
-                        .map_err(|_| anyhow!("invite_executed_seqs mutex poisoned"))?;
-                    if !executed.insert(seq) {
-                        log::info!("邀请参数 {} 已执行过，跳过", seq);
-                        return Ok(());
-                    }
+                if let Some(seq) = invite.seq
+                    && !self.invite.reserve_execution(seq)?
+                {
+                    log::info!("邀请参数 {} 已执行过，跳过", seq);
+                    return Ok(());
                 }
                 self.log_executed_command(parsed, &format!("invite {}", invite.username))?;
-                self.execute_invite_with_announce(&invite.username, invite.password.as_deref())?;
+                self.invite
+                    .execute(&invite.username, invite.password.as_deref(), self)?;
             }
             UserCommand::Moderation(command) => {
                 self.log_executed_command(

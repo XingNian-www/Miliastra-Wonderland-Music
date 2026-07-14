@@ -128,6 +128,12 @@ pub struct CardGameStartReservation {
     kind: EntertainmentKind,
 }
 
+pub trait CardGameDeliveryPort {
+    fn verify_friend(&self, player: &str, message: &str) -> Result<bool>;
+    fn send_friend(&self, player: &str, message: &str) -> Result<bool>;
+    fn send_hall(&self, message: &str) -> Result<()>;
+}
+
 impl CardGameStartReservation {
     pub fn kind(self) -> EntertainmentKind {
         self.kind
@@ -159,6 +165,96 @@ impl CardGameService {
             entertainment,
             enabled,
         }
+    }
+
+    pub fn execute(
+        &self,
+        player: &str,
+        command: &LandlordCommand,
+        port: &dyn CardGameDeliveryPort,
+        now: Instant,
+    ) -> Result<()> {
+        match command {
+            LandlordCommand::Start | LandlordCommand::RunFastStart => {
+                let reservation = match self.prepare_start(command)? {
+                    CardGameStartGate::Ready { reservation } => reservation,
+                    CardGameStartGate::Reply(reply) => return port.send_hall(&reply),
+                };
+                let label = reservation.kind().label();
+                let verified = match port
+                    .verify_friend(player, &format!("{}报名成功，请回到大厅等待组局", label))
+                {
+                    Ok(verified) => verified,
+                    Err(error) => {
+                        if let Err(cancel_error) = self.cancel_start(reservation) {
+                            log::error!("好友验证失败后无法取消牌局预留: {cancel_error:#}");
+                        }
+                        return Err(error);
+                    }
+                };
+                if !verified {
+                    self.cancel_start(reservation)?;
+                    return port.send_hall(&format!("{}报名失败：好友列表未找到唯一昵称", label));
+                }
+                let outcome = self.complete_start(player, command, reservation, now)?;
+                self.deliver(outcome, port)
+            }
+            LandlordCommand::Join => {
+                let Some(kind) = self.lobby_kind_for_join(player)? else {
+                    let outcome = self.handle(player, command, now)?;
+                    return self.deliver(outcome, port);
+                };
+                let label = kind.label();
+                if !port.verify_friend(player, &format!("{}报名成功，请回到大厅等待开局", label))?
+                {
+                    return port.send_hall(&format!("{}报名失败：好友列表未找到唯一昵称", label));
+                }
+                let outcome = self.handle(player, command, now)?;
+                self.deliver(outcome, port)
+            }
+            LandlordCommand::Hand => {
+                let outcome = self.handle(player, command, now)?;
+                if let Some(message) = outcome.private_reply {
+                    match port.send_friend(player, &message) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            self.retry_hand_delivery(player)?;
+                            bail!("牌局手牌发送失败：好友列表未找到 {}", player);
+                        }
+                        Err(error) => {
+                            self.retry_hand_delivery(player)?;
+                            return Err(error);
+                        }
+                    }
+                }
+                Ok(())
+            }
+            _ => {
+                let outcome = self.handle(player, command, now)?;
+                self.deliver(outcome, port)
+            }
+        }
+    }
+
+    pub fn deliver(&self, outcome: LandlordOutcome, port: &dyn CardGameDeliveryPort) -> Result<()> {
+        self.begin_delivery(&outcome);
+        for delivery in outcome.private_deliveries {
+            match port.send_friend(&delivery.player, &delivery.message) {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.abort()?;
+                    bail!("牌局发牌失败：好友列表未找到 {}", delivery.player);
+                }
+                Err(error) => {
+                    self.abort()?;
+                    return Err(error);
+                }
+            }
+        }
+        if let Some(reply) = outcome.public_reply {
+            port.send_hall(&reply)?;
+        }
+        Ok(())
     }
 
     pub fn prepare_start(&self, command: &LandlordCommand) -> Result<CardGameStartGate> {
@@ -2191,9 +2287,92 @@ impl SplitMix64 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex as StdMutex;
+
     use super::*;
     use crate::features::chat_text::{MAX_CHAT_WIDTH, display_width};
     use crate::features::entertainment::{EntertainmentCoordinator, EntertainmentKind};
+
+    struct FakeCardGamePort {
+        verified: bool,
+        friend_sent: bool,
+        hall_messages: StdMutex<Vec<String>>,
+    }
+
+    impl FakeCardGamePort {
+        fn new(verified: bool, friend_sent: bool) -> Self {
+            Self {
+                verified,
+                friend_sent,
+                hall_messages: StdMutex::new(Vec::new()),
+            }
+        }
+
+        fn hall_messages(&self) -> Vec<String> {
+            self.hall_messages.lock().unwrap().clone()
+        }
+    }
+
+    impl CardGameDeliveryPort for FakeCardGamePort {
+        fn verify_friend(&self, _player: &str, _message: &str) -> Result<bool> {
+            Ok(self.verified)
+        }
+
+        fn send_friend(&self, _player: &str, _message: &str) -> Result<bool> {
+            Ok(self.friend_sent)
+        }
+
+        fn send_hall(&self, message: &str) -> Result<()> {
+            self.hall_messages.lock().unwrap().push(message.to_string());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn application_service_releases_start_when_friend_verification_fails() {
+        let entertainment = EntertainmentCoordinator::new();
+        let service = CardGameService::new(LandlordConfig::default(), entertainment.clone());
+        let port = FakeCardGamePort::new(false, true);
+
+        service
+            .execute("甲", &LandlordCommand::Start, &port, Instant::now())
+            .unwrap();
+
+        assert_eq!(entertainment.active(), None);
+        assert!(!service.is_active().unwrap());
+        assert!(
+            port.hall_messages()
+                .iter()
+                .any(|message| message.contains("报名失败"))
+        );
+    }
+
+    #[test]
+    fn application_service_aborts_when_initial_hand_delivery_fails() {
+        let entertainment = EntertainmentCoordinator::new();
+        let service = CardGameService::new(LandlordConfig::default(), entertainment.clone());
+        let successful_port = FakeCardGamePort::new(true, true);
+        let now = Instant::now();
+
+        service
+            .execute("甲", &LandlordCommand::Start, &successful_port, now)
+            .unwrap();
+        service
+            .execute("乙", &LandlordCommand::Join, &successful_port, now)
+            .unwrap();
+        let error = service
+            .execute(
+                "丙",
+                &LandlordCommand::Join,
+                &FakeCardGamePort::new(true, false),
+                now,
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("牌局发牌失败"));
+        assert_eq!(entertainment.active(), None);
+        assert!(!service.is_active().unwrap());
+    }
 
     #[test]
     fn application_service_releases_a_cancelled_start_reservation() {

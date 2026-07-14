@@ -1018,6 +1018,7 @@ impl AutomationApp {
     }
 
     fn wait_for_moderation_votes(&self, command: &command::ModerationCommand) -> Result<bool> {
+        let _observation_session = self.chat_observations.begin_exclusive()?;
         let screen_lock = self.collect_moderation_vote_screen_lock();
         let deadline =
             Instant::now() + Duration::from_millis(self.config.timing.moderation.vote_timeout_ms);

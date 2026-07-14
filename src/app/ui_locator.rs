@@ -11,7 +11,6 @@ use super::command;
 use super::frame_source::{Canvas, Frame, load_frame};
 use super::game_ui::GameUi;
 use super::geometry::{Point, Rect, crop_canvas};
-use super::input_actions::{click_game_point, scroll_game_point};
 use super::ocr::recognize_lines;
 use super::template_match::{TemplateHit, best_template_hit};
 use crate::config::{self, PointConfig};
@@ -37,7 +36,6 @@ fn startup_locator_with_poll_ms(
         },
         FrameArgs { image: None },
         game_ui,
-        config.window.clone(),
         poll_ms,
     )
 }
@@ -46,7 +44,6 @@ pub(super) struct UiLocator {
     canvas: Canvas,
     frame_args: FrameArgs,
     game_ui: GameUi,
-    window_config: config::WindowConfig,
     poll_ms: u64,
 }
 
@@ -55,14 +52,12 @@ impl UiLocator {
         canvas: Canvas,
         frame_args: FrameArgs,
         game_ui: GameUi,
-        window_config: config::WindowConfig,
         poll_ms: u64,
     ) -> Self {
         Self {
             canvas,
             frame_args,
             game_ui,
-            window_config,
             poll_ms: poll_ms.max(50),
         }
     }
@@ -79,15 +74,12 @@ impl UiLocator {
     }
 
     pub(super) fn click_point(&self, point: Point) -> Result<()> {
-        click_game_point(PointConfig::new(point.x, point.y), &self.window_config)
+        self.game_ui.click_point(PointConfig::new(point.x, point.y))
     }
 
     pub(super) fn scroll_point(&self, point: Point, length: i32) -> Result<()> {
-        scroll_game_point(
-            PointConfig::new(point.x, point.y),
-            length,
-            &self.window_config,
-        )
+        self.game_ui
+            .scroll_point(PointConfig::new(point.x, point.y), length)
     }
 
     pub(super) fn poll_ms(&self) -> u64 {

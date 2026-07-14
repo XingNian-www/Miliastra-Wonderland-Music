@@ -1,16 +1,71 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
+use enigo::Key;
 use image::DynamicImage;
 
 pub trait UiDevice: Send + 'static {
     fn capture(&mut self) -> Result<DynamicImage>;
+
+    fn press_key(&mut self, _key: Key) -> Result<()> {
+        bail!("UI device does not support keyboard input")
+    }
+
+    fn click_point(&mut self, _x: i32, _y: i32) -> Result<()> {
+        bail!("UI device does not support mouse input")
+    }
+
+    fn scroll_point(&mut self, _x: i32, _y: i32, _length: i32) -> Result<()> {
+        bail!("UI device does not support mouse scrolling")
+    }
+
+    fn activate(&mut self, _after_activate_ms: u64) -> Result<()> {
+        bail!("UI device does not support window activation")
+    }
+
+    fn focus(&mut self, _after_activate_ms: u64) -> Result<()> {
+        bail!("UI device does not support window focus")
+    }
+
+    fn ensure_ready(&mut self, _after_activate_ms: u64) -> Result<()> {
+        bail!("UI device does not support input preparation")
+    }
+
+    fn ensure_foreground(&mut self) -> Result<()> {
+        bail!("UI device does not support foreground validation")
+    }
+
+    fn paste_text(&mut self, _text: &str, _clipboard_hold_ms: u64) -> Result<()> {
+        bail!("UI device does not support clipboard input")
+    }
+
+    fn input_text(&mut self, _text: &str, _input_settle_ms: u64) -> Result<()> {
+        bail!("UI device does not support text input")
+    }
+
+    fn hold_key(
+        &mut self,
+        _key: Key,
+        _duration: Duration,
+        _running: Arc<AtomicBool>,
+    ) -> Result<()> {
+        bail!("UI device does not support held keyboard input")
+    }
+
+    fn ensure_window(&mut self) -> Result<()> {
+        bail!("UI device does not support window availability checks")
+    }
+
+    fn close_window(&mut self) -> Result<()> {
+        bail!("UI device does not support window closing")
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,6 +84,18 @@ pub struct UiRoutineFailure {
 }
 
 impl UiRoutineFailure {
+    pub(crate) fn new(
+        certainty: InputCertainty,
+        stage: &'static str,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            certainty,
+            stage,
+            reason: reason.into(),
+        }
+    }
+
     fn before_input(stage: &'static str, reason: impl Into<String>) -> Self {
         Self {
             certainty: InputCertainty::BeforeInput,
@@ -85,7 +152,7 @@ impl CapturedFrame {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CaptureFrame;
 
-mod sealed {
+pub(crate) mod sealed {
     pub trait UiRoutineSealed {}
 }
 

@@ -117,7 +117,7 @@ use crate::features::entertainment::{AcquireOutcome, EntertainmentKind};
 use crate::features::idiom_chain;
 use crate::features::idiom_chain::IdiomChainService;
 use crate::features::invite::InviteService;
-use crate::features::moderation::ModerationService;
+use crate::features::moderation::{ModerationPolicy, ModerationResultTask, ModerationService};
 use crate::features::turtle_soup::{
     self, QuestionSubmitOutcome, SecondaryOcrObservation, SecondaryOcrStability, TurtleSoupService,
 };
@@ -509,12 +509,7 @@ enum PendingTask {
         source: &'static str,
     },
     ClearIdleExit,
-    ModerationVoteResult {
-        command: Box<command::ModerationCommand>,
-        approved: bool,
-        workflow_key: String,
-        temporary_primary_hold: TemporaryPrimaryHold,
-    },
+    ModerationResult(ModerationResultTask),
     SetChatListenerMode {
         target: ChatListenerMode,
     },
@@ -568,14 +563,7 @@ impl PendingTask {
             Self::StartGame { source } => format!("启动游戏({})", source),
             Self::EnterWonderland { source } => format!("进入千星({})", source),
             Self::ClearIdleExit => "取消闲置退出".to_string(),
-            Self::ModerationVoteResult {
-                command, approved, ..
-            } => format!(
-                "{} UID{} 投票{}",
-                command.action.label(),
-                command.uid,
-                if *approved { "通过" } else { "未通过" }
-            ),
+            Self::ModerationResult(task) => task.label(),
             Self::SetChatListenerMode { target } => {
                 format!("切换{}", target.label())
             }
@@ -600,11 +588,11 @@ impl PendingTask {
             Self::StartGame { .. } => false,
             Self::EnterWonderland { .. } => false,
             Self::ClearIdleExit => false,
-            Self::ModerationVoteResult { command, .. } => {
+            Self::ModerationResult(task) => {
                 matches!(
                     &parsed.command,
                     UserCommand::Moderation(parsed_command)
-                        if parsed_command.action == command.action && parsed_command.uid == command.uid
+                        if task.matches(parsed_command)
                 )
             }
             Self::SetChatListenerMode { .. }
@@ -631,7 +619,7 @@ impl PendingTask {
             | Self::StartGame { .. }
             | Self::EnterWonderland { .. }
             | Self::ClearIdleExit
-            | Self::ModerationVoteResult { .. }
+            | Self::ModerationResult(_)
             | Self::SetChatListenerMode { .. }
             | Self::SecondaryUnread { .. }
             | Self::RestoreSecondaryHall
@@ -651,7 +639,7 @@ impl PendingTask {
             | Self::ConsoleChat { .. }
             | Self::StartGame { .. }
             | Self::EnterWonderland { .. }
-            | Self::ModerationVoteResult { .. }
+            | Self::ModerationResult(_)
             | Self::CardGameDelivery(_)
             | Self::UndercoverDelivery { .. } => true,
         }
@@ -917,6 +905,12 @@ impl AutomationApp {
             config.ocr.change_mean_threshold,
             config.ocr.change_pixel_threshold,
         );
+        let moderation = ModerationService::new(ModerationPolicy::new(
+            Duration::from_millis(config.timing.moderation.vote_timeout_ms),
+            Duration::from_millis(config.timing.moderation.vote_poll_ms),
+            config.moderation.stable_vote_samples,
+            config.moderation.required_vote_margin,
+        ));
         Ok(Self {
             config,
             game_ui,
@@ -946,7 +940,7 @@ impl AutomationApp {
             screen_lock_primed: Arc::new(AtomicBool::new(false)),
             reset_locks_requested: Arc::new(AtomicBool::new(false)),
             invite: InviteService::new(),
-            moderation: ModerationService::new(),
+            moderation,
             commands_enabled: Arc::new(AtomicBool::new(true)),
             idle_exit: Arc::new(Mutex::new(None)),
             running: Arc::new(AtomicBool::new(true)),
@@ -1411,7 +1405,6 @@ impl AutomationApp {
             self.monitor.clone(),
             self.task_tracker.clone(),
             self.decision_control.clone(),
-            self.moderation.clone(),
             self.web_tools.clone(),
             self.latest_frame.clone(),
         ))
@@ -2717,18 +2710,9 @@ impl AutomationApp {
             PendingTask::ClearIdleExit => self
                 .clear_idle_exit_timer()
                 .map(|_| PendingTaskExecution::Completed),
-            PendingTask::ModerationVoteResult {
-                command,
-                approved,
-                workflow_key,
-                temporary_primary_hold,
-            } => self.execute_moderation_vote_result(
-                task_id,
-                *command,
-                approved,
-                workflow_key,
-                temporary_primary_hold,
-            ),
+            PendingTask::ModerationResult(task) => {
+                self.execute_moderation_vote_result(task_id, task)
+            }
             PendingTask::SetChatListenerMode { target } => self
                 .execute_set_chat_listener_mode(target)
                 .map(|_| PendingTaskExecution::Completed),

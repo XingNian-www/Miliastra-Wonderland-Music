@@ -1077,6 +1077,11 @@ fn task_cancel_route(
             state.moderation.release_best_effort(workflow_key);
             sync_listener = true;
         }
+        super::PendingTask::CardGameDelivery(delivery) => {
+            if let Err(error) = delivery.cancel() {
+                log::error!("撤销牌局计时结果后无法清理牌局: {error:#}");
+            }
+        }
         _ => {}
     }
     drop(task);
@@ -3330,6 +3335,45 @@ mod tests {
 
         assert!(!state.moderation.is_active(&workflow_key).unwrap());
         assert!(!state.chat_listener.snapshot().temporary_primary);
+    }
+
+    #[test]
+    fn canceling_card_game_timeout_releases_entertainment_session() {
+        let state = test_state();
+        let entertainment = EntertainmentCoordinator::new();
+        entertainment
+            .try_acquire(crate::features::entertainment::EntertainmentKind::Landlord)
+            .expect("acquire card game");
+        let service = crate::features::card_games::CardGameService::new(
+            crate::features::card_games::LandlordConfig {
+                lobby_timeout_seconds: 1,
+                ..crate::features::card_games::LandlordConfig::default()
+            },
+            entertainment.clone(),
+        );
+        let started_at = std::time::Instant::now();
+        service
+            .handle(
+                "甲",
+                &crate::features::card_games::LandlordCommand::Start,
+                started_at,
+            )
+            .expect("start card game");
+        let outcome = service
+            .tick(started_at + std::time::Duration::from_secs(2), true)
+            .expect("tick card game")
+            .expect("lobby timeout");
+        let receipt = enqueue_pending_task(
+            &state,
+            super::super::PendingTask::CardGameDelivery(service.delivery_task(outcome)),
+        )
+        .expect("enqueue card game delivery");
+
+        task_cancel_route(&[("id".to_string(), receipt.task_id.to_string())], &state)
+            .expect("cancel card game delivery");
+
+        assert_eq!(entertainment.active(), None);
+        assert!(!service.is_active().unwrap());
     }
 
     #[test]

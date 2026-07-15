@@ -26,6 +26,26 @@ pub trait CardGameDeliveryPort {
     fn send_hall(&self, message: &str) -> Result<()>;
 }
 
+#[derive(Clone)]
+pub struct CardGameDeliveryTask {
+    service: CardGameService,
+    outcome: LandlordOutcome,
+}
+
+impl CardGameDeliveryTask {
+    pub fn label(&self) -> String {
+        format!("发送牌局计时结果({})", self.outcome.action)
+    }
+
+    pub fn execute(self, port: &dyn CardGameDeliveryPort) -> Result<()> {
+        self.service.deliver(self.outcome, port)
+    }
+
+    pub fn cancel(&self) -> Result<bool> {
+        self.service.cancel_delivery(&self.outcome)
+    }
+}
+
 impl CardGameStartReservation {
     pub fn kind(self) -> EntertainmentKind {
         self.kind
@@ -246,6 +266,21 @@ impl CardGameService {
         Ok(self.state()?.game.tick(now, clock_active))
     }
 
+    pub fn delivery_task(&self, outcome: LandlordOutcome) -> CardGameDeliveryTask {
+        CardGameDeliveryTask {
+            service: self.clone(),
+            outcome,
+        }
+    }
+
+    fn cancel_delivery(&self, outcome: &LandlordOutcome) -> Result<bool> {
+        if outcome.ended || !outcome.private_deliveries.is_empty() {
+            self.abort()
+        } else {
+            Ok(false)
+        }
+    }
+
     pub fn abort(&self) -> Result<bool> {
         let aborted = {
             let mut state = self.state()?;
@@ -260,7 +295,7 @@ impl CardGameService {
     }
 
     #[cfg(test)]
-    pub(super) fn is_active(&self) -> Result<bool> {
+    pub(crate) fn is_active(&self) -> Result<bool> {
         let state = self.state()?;
         Ok(state.game.is_active() || state.pending_start.is_some())
     }

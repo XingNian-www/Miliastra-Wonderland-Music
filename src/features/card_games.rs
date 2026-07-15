@@ -8,7 +8,7 @@ mod service;
 
 #[cfg(test)]
 use service::CardGameStartGate;
-pub use service::{CardGameDeliveryPort, CardGameService};
+pub use service::{CardGameDeliveryPort, CardGameDeliveryTask, CardGameService};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -2183,6 +2183,35 @@ mod tests {
         assert_eq!(entertainment.active(), Some(EntertainmentKind::Landlord));
 
         service.begin_delivery(&timeout);
+
+        assert_eq!(entertainment.active(), None);
+        assert!(!service.is_active().unwrap());
+    }
+
+    #[test]
+    fn application_service_releases_a_timeout_when_delivery_is_cancelled() {
+        let entertainment = EntertainmentCoordinator::new();
+        let config = LandlordConfig {
+            lobby_timeout_seconds: 1,
+            ..LandlordConfig::default()
+        };
+        let service = CardGameService::new(config, entertainment.clone());
+        let started_at = Instant::now();
+
+        let CardGameStartGate::Ready { reservation } =
+            service.prepare_start(&LandlordCommand::Start).unwrap()
+        else {
+            panic!("start should reserve the game");
+        };
+        service
+            .complete_start("甲", &LandlordCommand::Start, reservation, started_at)
+            .unwrap();
+        let timeout = service
+            .tick(started_at + Duration::from_secs(2), true)
+            .unwrap()
+            .expect("lobby should time out");
+
+        assert!(service.delivery_task(timeout).cancel().unwrap());
 
         assert_eq!(entertainment.active(), None);
         assert!(!service.is_active().unwrap());

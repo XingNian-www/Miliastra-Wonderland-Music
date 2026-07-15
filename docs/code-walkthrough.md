@@ -44,7 +44,7 @@ flowchart TD
 
 ## 配置层
 
-`src/app/config.rs` 是配置结构的中心。`AppConfig` 聚合所有配置分组：
+`src/config/mod.rs` 是配置结构的中心。`AppConfig` 聚合所有配置分组：
 
 更完整的配置加载、自动迁移、日志分流和监控快照说明见 `docs/config-observability-flow.md`。
 
@@ -66,7 +66,7 @@ flowchart TD
 - `startup`：启动游戏和进入千星配置。
 - `custom_workflows`：自定义工作流配置。
 
-`src/app/config_migration.rs` 负责配置迁移。启动时如果配置版本落后，会用当前发布包里的 `config.yaml` 作为模板，把旧字段迁移到新结构，并写 `.bak-*` 备份。
+`src/config/migration.rs` 负责配置迁移。启动时如果配置版本落后，会用当前发布包里的 `config.yaml` 作为模板，把旧字段迁移到新结构，并写 `.bak-*` 备份。
 
 ## 主对象 AutomationApp
 
@@ -77,7 +77,7 @@ flowchart TD
 - 游戏聊天输出器。
 - 共享 OCR 引擎。
 - 命令屏幕锁、待执行任务队列、窗口检测重置信号。
-- 娱乐互斥、成语接龙状态、谁是卧底牌局、海龟汤会话、按昵称隔离的编号答案草稿和低优先级分段回复队列；成语接龙和牌局状态已经由业务运行时句柄串行拥有。
+- 娱乐互斥、业务运行时句柄、按昵称隔离的编号答案草稿和低优先级分段回复队列；成语接龙、牌类、谁是卧底和海龟汤状态由业务运行时线程串行拥有。
 - 热键暂停/退出状态、命令执行状态、点歌执行状态。
 - TUI/Web 监控共享状态。
 
@@ -85,7 +85,7 @@ flowchart TD
 
 - HTTP/Web 面板。
 - 热键监听。
-- 海龟汤 AI Worker。
+- 业务运行时及其海龟汤 AI Worker。
 - 命令执行线程。
 - 延迟聊天发送线程。
 - 启动配置任务入队。
@@ -167,7 +167,7 @@ flowchart TD
 - `StartGame`：启动游戏任务。
 - `EnterWonderland`：进入千星任务。
 - `ModerationVoteResult`：后台投票结束后的管理动作。
-- `UndercoverDelivery`：计时触发的谁是卧底阶段公告或结算。
+- `UndercoverEffect`：谁是卧底命令或计时触发的阶段公告、私聊和结算效果。
 
 命令执行线程运行 `run_pending_command_loop()`，一次只取一个任务执行。所有会操作游戏窗口的高层业务都经过这条串行通道，避免多个流程同时点击、按键、粘贴。
 
@@ -355,7 +355,7 @@ flowchart TD
 - `/startup/wonderland` 按顺序入队启动游戏任务和进入千星任务。
 - `/queue/add` 是控制台最高权限直接写音乐播放队列，不走审核。
 - `/monitor` 读取 `MonitorShared`。
-- `/turtle-soup/start` 和 `/turtle-soup/end` 直接更新共享海龟汤服务；实际游戏回复仍等待延迟发送线程。
+- `/turtle-soup/start` 和 `/turtle-soup/end` 向业务运行时提交类型化意图；实际游戏回复仍等待延迟发送线程。
 - `/screenshot` 手动截一次游戏图并返回 JPEG，不常驻推流。
 
 HTTP 层只负责验证参数、入队或读取状态。除少数只读/播放器调试接口外，不应该直接做游戏窗口输入。

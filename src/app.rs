@@ -72,7 +72,8 @@ use self::chat_output::{
 };
 use self::chat_scan::{ChatMessage, prepare_chat_scan, recognize_prepared_chat};
 use self::command::{
-    ChatListenerModeCommand, CommandLockState, ParsedCommand, PendingCommand, UserCommand,
+    ChatListenerModeCommand, CommandLockState, CommandObservation, ParsedCommand, PendingCommand,
+    UserCommand,
 };
 use self::decision_control::{DecisionAction, DecisionControlShared};
 use self::decision_lock::DecisionScreenLock;
@@ -89,7 +90,7 @@ use self::hall_info::{
     format_hall_remaining_suffix, merge_hall_info_samples, parse_hall_remaining_minutes,
 };
 use self::input_actions::parse_key;
-use self::monitor::{MonitorQueueItem, MonitorShared, OcrSnapshot};
+use self::monitor::{MonitorEvent, MonitorQueueItem, MonitorShared, OcrSnapshot};
 use self::ocr::{OcrArgs, OcrBackendProbeStatus, probe_ocr_backend_support};
 use self::ocr_runtime::{OcrPriority, OcrRuntime, OcrRuntimeHandle, ProductionOcrDevice};
 use self::playback_format::{
@@ -119,8 +120,6 @@ use crate::features::card_games::{
 use crate::features::chat_text::split_numbered_chat_message;
 use crate::features::custom_workflow::CustomWorkflowService;
 use crate::features::entertainment::EntertainmentCoordinator;
-#[cfg(test)]
-use crate::features::entertainment::{AcquireOutcome, EntertainmentKind};
 use crate::features::idiom_chain;
 use crate::features::idiom_chain::IdiomChainService;
 use crate::features::invite::{InviteRequest, InviteService, InviteStart};
@@ -129,11 +128,10 @@ use crate::features::startup::{StartupService, StartupSource, StartupTask};
 use crate::features::turtle_soup::{
     self, QuestionSubmitOutcome, SecondaryOcrObservation, SecondaryOcrStability, TurtleSoupService,
 };
-#[cfg(test)]
-use crate::features::undercover;
 use crate::features::undercover::{
-    UndercoverCommand, UndercoverCommandContext, UndercoverCommandSource, UndercoverDeliveryPort,
-    UndercoverDeliveryTask, UndercoverService,
+    UndercoverCommand, UndercoverCommandSource, UndercoverCommandStart, UndercoverDeliveryPort,
+    UndercoverEffect, UndercoverEffectClaim, UndercoverEffectLane, UndercoverEffectRequest,
+    UndercoverEffectResult, UndercoverResume, UndercoverRuntimeService,
 };
 use crate::observation::chat::ObservedFrame;
 use crate::observation::shared::ObservationRead;
@@ -342,7 +340,6 @@ enum UserDecision {
     Ai,
     Timeout,
     Stopped,
-    PromptFailed,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -414,8 +411,6 @@ pub(crate) struct AutomationApp {
     business_runtime: Option<BusinessRuntimeGroup>,
     runtime_state: Arc<Mutex<PersistentRuntimeState>>,
     entertainment: EntertainmentCoordinator,
-    undercover: UndercoverService,
-    turtle_soup: TurtleSoupService,
     deferred_chat: DeferredChatQueue,
     queue: Arc<Mutex<PersistentQueue>>,
     song_dedup_history: Arc<Mutex<PersistentSongDedupHistory>>,
@@ -578,6 +573,169 @@ fn handle_late_card_game_effect(policy: CardGameLatePolicy) -> Result<()> {
     }
 }
 
+struct QueuedUndercoverEffect {
+    business: BusinessRuntimeHandle,
+    action: &'static str,
+    request: UndercoverEffectRequest,
+}
+
+impl QueuedUndercoverEffect {
+    fn new(
+        business: BusinessRuntimeHandle,
+        action: &'static str,
+        request: UndercoverEffectRequest,
+    ) -> Self {
+        Self {
+            business,
+            action,
+            request,
+        }
+    }
+
+    fn label(&self) -> String {
+        format!("发送谁是卧底效果({})", self.action)
+    }
+
+    fn execute(self, port: &dyn UndercoverDeliveryPort) -> Result<()> {
+        drive_undercover_effect_chain(
+            &self.business,
+            self.request,
+            UndercoverEffectLane::Deferred,
+            UndercoverLatePolicy::Ignore,
+            port,
+        )
+    }
+
+    fn cancel(&self) -> Result<()> {
+        Ok(self.business.cancel_undercover_effect(self.request.key)?)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum UndercoverLatePolicy {
+    Error,
+    Ignore,
+}
+
+fn drive_undercover_start(
+    business: &BusinessRuntimeHandle,
+    start: UndercoverCommandStart,
+    port: &dyn UndercoverDeliveryPort,
+) -> Result<()> {
+    match start {
+        UndercoverCommandStart::Completed(_) => Ok(()),
+        UndercoverCommandStart::Suspended(request) => drive_undercover_effect_chain(
+            business,
+            request,
+            UndercoverEffectLane::Formal,
+            UndercoverLatePolicy::Error,
+            port,
+        ),
+    }
+}
+
+fn drive_undercover_effect_chain(
+    business: &BusinessRuntimeHandle,
+    mut request: UndercoverEffectRequest,
+    expected_lane: UndercoverEffectLane,
+    late_policy: UndercoverLatePolicy,
+    port: &dyn UndercoverDeliveryPort,
+) -> Result<()> {
+    loop {
+        if request.lane != expected_lane {
+            let _ = business.cancel_undercover_effect(request.key);
+            bail!(
+                "谁是卧底效果通道不一致: expected={expected_lane:?} actual={:?}",
+                request.lane
+            );
+        }
+        match business.claim_undercover_effect(request.key)? {
+            UndercoverEffectClaim::Claimed => {}
+            UndercoverEffectClaim::Late(_) => return handle_late_undercover_effect(late_policy),
+        }
+        let key = request.key;
+        let result =
+            match request.effect {
+                UndercoverEffect::FriendVerify { player, message } => {
+                    UndercoverEffectResult::FriendVerify(run_undercover_delivery(
+                        "好友验证",
+                        || port.verify_friend(&player, &message),
+                    ))
+                }
+                UndercoverEffect::Friend { player, message } => UndercoverEffectResult::Friend(
+                    run_undercover_delivery("好友消息发送", || {
+                        port.send_friend(&player, &message)
+                    }),
+                ),
+                UndercoverEffect::SecretFriend { player, message } => {
+                    UndercoverEffectResult::SecretFriend(run_undercover_secret_delivery(
+                        &player, &message, port,
+                    ))
+                }
+                UndercoverEffect::Hall { message } => UndercoverEffectResult::Hall(
+                    run_undercover_delivery("大厅消息发送", || port.send_hall(&message)),
+                ),
+                UndercoverEffect::HallBatch { messages } => UndercoverEffectResult::HallBatch(
+                    run_undercover_delivery("大厅批量消息发送", || {
+                        port.send_hall_batch(&messages)
+                    }),
+                ),
+            };
+        match business.resume_undercover(key, result)? {
+            UndercoverResume::Completed(_) => return Ok(()),
+            UndercoverResume::Suspended(next) => request = next,
+            UndercoverResume::Late(_) => return handle_late_undercover_effect(late_policy),
+        }
+    }
+}
+
+fn run_undercover_secret_delivery(
+    player: &str,
+    message: &str,
+    port: &dyn UndercoverDeliveryPort,
+) -> Result<bool> {
+    let mut last_error = None;
+    for attempt in 1..=2 {
+        match run_undercover_delivery("好友私密消息发送", || {
+            port.send_secret_friend(player, message)
+        }) {
+            Ok(true) => return Ok(true),
+            Ok(false) => log::warn!(
+                "谁是卧底发词确认失败: player={} attempt={}",
+                player,
+                attempt
+            ),
+            Err(error) => {
+                log::warn!(
+                    "谁是卧底发词异常: player={} attempt={} error={:#}",
+                    player,
+                    attempt,
+                    error
+                );
+                last_error = Some(error);
+            }
+        }
+    }
+    match last_error {
+        Some(error) => Err(error),
+        None => Ok(false),
+    }
+}
+
+fn run_undercover_delivery<T>(label: &str, delivery: impl FnOnce() -> Result<T>) -> Result<T> {
+    match catch_unwind(AssertUnwindSafe(delivery)) {
+        Ok(result) => result,
+        Err(_) => Err(anyhow!("谁是卧底{label}发生未捕获异常")),
+    }
+}
+
+fn handle_late_undercover_effect(policy: UndercoverLatePolicy) -> Result<()> {
+    match policy {
+        UndercoverLatePolicy::Ignore => Ok(()),
+        UndercoverLatePolicy::Error => bail!("谁是卧底命令在效果链完成前已失效"),
+    }
+}
+
 impl CardGameDeliveryPort for DeferredCardGamePort<'_> {
     fn verify_friend(&self, _player: &str, _message: &str) -> Result<bool> {
         Err(anyhow!("延迟牌类端口不能执行好友验证"))
@@ -653,19 +811,8 @@ struct ResolvedSongRequest {
     prefer_accompaniment: bool,
     ai_original_text: String,
     uri: String,
-    skip_match_check: bool,
     friend_username: String,
     console_bypass_dedup: bool,
-}
-
-impl ResolvedSongRequest {
-    fn match_keyword(&self) -> &str {
-        if self.ai_original_text.trim().is_empty() {
-            &self.keyword
-        } else {
-            &self.ai_original_text
-        }
-    }
 }
 
 enum PendingTask {
@@ -689,7 +836,7 @@ enum PendingTask {
     },
     RestoreSecondaryHall,
     CardGameEffect(QueuedCardGameEffect),
-    UndercoverDelivery(UndercoverDeliveryTask),
+    UndercoverEffect(QueuedUndercoverEffect),
 }
 
 struct TrackedPendingTask {
@@ -736,6 +883,11 @@ impl TrackedPendingTask {
                     log::error!("撤销牌局计时结果后无法清理牌局: {error:#}");
                 }
             }
+            PendingTask::UndercoverEffect(effect) => {
+                if let Err(error) = effect.cancel() {
+                    log::error!("撤销谁是卧底效果后无法清理牌局: {error:#}");
+                }
+            }
             _ => {}
         }
         sync_listener
@@ -768,7 +920,7 @@ impl PendingTask {
             }
             Self::RestoreSecondaryHall => "二级监听恢复当前大厅".to_string(),
             Self::CardGameEffect(effect) => effect.label(),
-            Self::UndercoverDelivery(delivery) => delivery.label().to_string(),
+            Self::UndercoverEffect(effect) => effect.label(),
         }
     }
 
@@ -790,7 +942,7 @@ impl PendingTask {
             | Self::SecondaryUnread { .. }
             | Self::RestoreSecondaryHall
             | Self::CardGameEffect(_)
-            | Self::UndercoverDelivery(_) => false,
+            | Self::UndercoverEffect(_) => false,
         }
     }
 
@@ -814,7 +966,7 @@ impl PendingTask {
             | Self::SecondaryUnread { .. }
             | Self::RestoreSecondaryHall
             | Self::CardGameEffect(_)
-            | Self::UndercoverDelivery(_) => false,
+            | Self::UndercoverEffect(_) => false,
         }
     }
 
@@ -830,7 +982,7 @@ impl PendingTask {
             | Self::ConsoleChat { .. }
             | Self::ModerationResult(_)
             | Self::CardGameEffect(_)
-            | Self::UndercoverDelivery(_) => true,
+            | Self::UndercoverEffect(_) => true,
         }
     }
 }
@@ -1087,7 +1239,8 @@ impl AutomationApp {
             log::info!("已加载成语接龙词库: {} 条", idiom_chain.lexicon_len());
         }
         let landlord = CardGameService::new(config.landlord.clone(), entertainment.clone());
-        let undercover = UndercoverService::new(config.undercover.clone(), entertainment.clone());
+        let undercover =
+            UndercoverRuntimeService::new(config.undercover.clone(), entertainment.clone());
         let deferred_chat = DeferredChatQueue::new(DEFERRED_CHAT_CAPACITY);
         let mut turtle_soup_config = config.turtle_soup.clone();
         turtle_soup_config.nickname_stable_count =
@@ -1117,10 +1270,12 @@ impl AutomationApp {
         );
         let business_timer = business_runtime_builder.handle();
         let business_runtime = business_runtime_builder.build_with(|| {
-            BusinessRuntime::start_with_timer(
+            BusinessRuntime::start_with_timer_and_modules(
                 BUSINESS_RUNTIME_QUEUE_CAPACITY,
                 idiom_chain,
                 landlord,
+                undercover,
+                turtle_soup.clone(),
                 business_timer,
             )
         })?;
@@ -1144,8 +1299,6 @@ impl AutomationApp {
             business_runtime: Some(business_runtime),
             runtime_state,
             entertainment,
-            undercover,
-            turtle_soup,
             deferred_chat,
             queue,
             song_dedup_history,
@@ -1185,7 +1338,8 @@ impl AutomationApp {
     }
 
     pub(crate) fn run(&mut self) -> Result<()> {
-        self.monitor.set_status("运行中");
+        self.monitor
+            .publish(MonitorEvent::Status("运行中".to_string()));
         self.update_monitor_queue_snapshot();
         self.update_monitor_playback_controller();
         self.update_monitor_chat_listener();
@@ -1195,7 +1349,6 @@ impl AutomationApp {
         self.enqueue_startup_task_if_enabled()?;
         self.start_http_server()?;
         self.hotkeys = Some(self.start_hotkeys()?);
-        self.turtle_soup.start_workers();
         let executor = self.start_command_executor();
         let deferred_chat_sender = self.start_deferred_chat_sender();
         let web_tool_executor = self.start_web_tool_executor();
@@ -1212,7 +1365,6 @@ impl AutomationApp {
         {
             log::error!("HTTP/Web 面板关闭失败: {error:#}");
         }
-        self.turtle_soup.shutdown();
         self.notify_pending_executor();
         self.deferred_chat.notify_all();
         if let Err(error) = executor.join() {
@@ -1267,7 +1419,8 @@ impl AutomationApp {
         if let Err(error) = self.runtime_state().and_then(|state| state.save()) {
             log::error!("退出前保存运行状态失败: {error:#}");
         }
-        self.monitor.set_status("已退出");
+        self.monitor
+            .publish(MonitorEvent::Status("已退出".to_string()));
         result
     }
 
@@ -1302,7 +1455,9 @@ impl AutomationApp {
             }
 
             if let DeferredChatItem::Batch(batch) = &item
-                && !self.turtle_soup.delivery_is_current(batch.turtle_soup)
+                && !self
+                    .business
+                    .turtle_soup_delivery_is_current(batch.turtle_soup)
             {
                 log::debug!(
                     "延迟聊天分段批次所属海龟汤会话已失效，跳过: {:?}",
@@ -1399,12 +1554,12 @@ impl AutomationApp {
                         Ok(all_sent) => all_sent,
                         Err(error) => {
                             log::error!("海龟汤批量发送进度无效: {error:#}");
-                            self.turtle_soup.handle_delivery_failure(delivery, &error);
+                            self.business.turtle_soup_delivery_failure(delivery, &error);
                             continue;
                         }
                     };
                     if !self.running.load(AtomicOrdering::SeqCst)
-                        || !self.turtle_soup.delivery_is_current(delivery)
+                        || !self.business.turtle_soup_delivery_is_current(delivery)
                     {
                         continue;
                     }
@@ -1414,7 +1569,7 @@ impl AutomationApp {
                                 "海龟汤批次内容已完整发送，但聊天界面收尾失败，不重发内容: {error:#}"
                             );
                         }
-                        self.turtle_soup.handle_delivery_success(delivery);
+                        self.business.turtle_soup_delivery_success(delivery);
                         continue;
                     }
 
@@ -1426,7 +1581,7 @@ impl AutomationApp {
                                 batch.remaining_texts().len()
                             );
                             log::error!("{error:#}");
-                            self.turtle_soup.handle_delivery_failure(delivery, &error);
+                            self.business.turtle_soup_delivery_failure(delivery, &error);
                         }
                         ChatBatchSendStatus::Failed(error) => {
                             let attempt = batch.current_attempt();
@@ -1453,8 +1608,10 @@ impl AutomationApp {
                                             let requeue_error =
                                                 anyhow!("海龟汤批量重试无法重新进入延迟队列");
                                             log::error!("{requeue_error:#}");
-                                            self.turtle_soup
-                                                .handle_delivery_failure(delivery, &requeue_error);
+                                            self.business.turtle_soup_delivery_failure(
+                                                delivery,
+                                                &requeue_error,
+                                            );
                                         }
                                     }
                                     sleep(retry_delay);
@@ -1467,7 +1624,7 @@ impl AutomationApp {
                                         sent,
                                         error
                                     );
-                                    self.turtle_soup.handle_delivery_failure(delivery, &error);
+                                    self.business.turtle_soup_delivery_failure(delivery, &error);
                                 }
                             }
                         }
@@ -1506,8 +1663,6 @@ impl AutomationApp {
             business_runtime: None,
             runtime_state: self.runtime_state.clone(),
             entertainment: self.entertainment.clone(),
-            undercover: self.undercover.clone(),
-            turtle_soup: self.turtle_soup.clone(),
             deferred_chat: self.deferred_chat.clone(),
             queue: self.queue.clone(),
             song_dedup_history: self.song_dedup_history.clone(),
@@ -1681,8 +1836,7 @@ impl AutomationApp {
             Arc::clone(&self.runtime_state),
             Arc::clone(&self.pending),
             self.chat_listener.clone(),
-            self.turtle_soup.clone(),
-            self.undercover.clone(),
+            self.business.clone(),
             self.monitor.clone(),
             self.task_tracker.clone(),
             self.decision_control.clone(),
@@ -1814,8 +1968,12 @@ impl AutomationApp {
                     let ui_state_result =
                         detect_ui_state(&frame.image, &ui_template_args, &self.config.screen);
                     match &ui_state_result {
-                        Ok(ui_state) => self.monitor.set_ui_state(ui_state.to_string()),
-                        Err(_) => self.monitor.set_ui_state("界面检测失败"),
+                        Ok(ui_state) => self
+                            .monitor
+                            .publish(MonitorEvent::UiState(ui_state.to_string())),
+                        Err(_) => self
+                            .monitor
+                            .publish(MonitorEvent::UiState("界面检测失败".to_string())),
                     }
                     let ui_ms = elapsed_ms(ui_started);
                     let listener_snapshot = self.chat_listener.snapshot();
@@ -2117,7 +2275,8 @@ impl AutomationApp {
                     if !target_missing {
                         self.abort_entertainment_for_context_loss("目标游戏窗口已关闭或不可用");
                     }
-                    self.monitor.set_ui_state("目标窗口不可用");
+                    self.monitor
+                        .publish(MonitorEvent::UiState("目标窗口不可用".to_string()));
                     primary_visible = false;
                     last_fingerprint = None;
                     secondary_friend_bubble_fingerprint = None;
@@ -2336,7 +2495,7 @@ impl AutomationApp {
     ) -> Result<bool> {
         let current = secondary_hall_bubbles(image)?;
         if previous.is_empty() {
-            self.turtle_soup.clear_secondary_ocr_stability();
+            self.business.clear_turtle_soup_secondary_stability()?;
             *previous = current;
             log::debug!("二级大厅气泡序列尚未建立，当前仅记录基线");
             return Ok(false);
@@ -2344,13 +2503,13 @@ impl AutomationApp {
 
         let overlap = hall_bubble_sequence_overlap(previous, &current);
         if overlap == 0 {
-            self.turtle_soup.clear_secondary_ocr_stability();
+            self.business.clear_turtle_soup_secondary_stability()?;
             *previous = current;
             log::debug!("二级大厅气泡序列没有可靠重叠，已重建基线，不处理当前可见历史消息");
             return Ok(false);
         }
         if overlap == current.len() {
-            self.turtle_soup.clear_secondary_ocr_stability();
+            self.business.clear_turtle_soup_secondary_stability()?;
             *previous = current;
             return Ok(false);
         }
@@ -2359,14 +2518,14 @@ impl AutomationApp {
         let refreshed_bubbles = secondary_hall_bubbles(&refreshed.image)?;
         let refreshed_overlap = hall_bubble_sequence_overlap(previous, &refreshed_bubbles);
         if refreshed_overlap == 0 {
-            self.turtle_soup.clear_secondary_ocr_stability();
+            self.business.clear_turtle_soup_secondary_stability()?;
             *previous = refreshed_bubbles;
             log::debug!("二级大厅气泡稳定后没有可靠重叠，已重建基线，不处理当前可见历史消息");
             return Ok(false);
         }
         let new_bubbles = &refreshed_bubbles[refreshed_overlap..];
         if new_bubbles.is_empty() {
-            self.turtle_soup.clear_secondary_ocr_stability();
+            self.business.clear_turtle_soup_secondary_stability()?;
             *previous = refreshed_bubbles;
             return Ok(false);
         }
@@ -2407,18 +2566,13 @@ impl AutomationApp {
         let mut processed_secondary = false;
         for dispatch in dispatches {
             match dispatch {
-                ChatObservationDispatch::Primary(messages) => {
-                    let messages = messages
-                        .into_iter()
-                        .map(|PrimaryObservedMessage { id, message }| {
-                            log::debug!("处理一级观察消息: id={id:?}");
-                            message
-                        })
-                        .collect();
-                    self.handle_scan_messages(messages)?;
+                ChatObservationDispatch::Primary { frame, messages } => {
+                    let messages = messages.into_iter().collect::<Vec<_>>();
+                    self.handle_scan_messages(frame, messages)?;
                 }
-                ChatObservationDispatch::Secondary(observation) => {
-                    processed_secondary |= self.process_secondary_chat_observation(observation)?;
+                ChatObservationDispatch::Secondary { frame, observation } => {
+                    processed_secondary |=
+                        self.process_secondary_chat_observation(frame, observation)?;
                 }
                 ChatObservationDispatch::Gap(gap) => {
                     self.locks = CommandLockState::default();
@@ -2435,7 +2589,18 @@ impl AutomationApp {
         Ok(processed_secondary)
     }
 
-    fn handle_scan_messages(&mut self, messages: Vec<ChatMessage>) -> Result<()> {
+    fn handle_scan_messages(
+        &mut self,
+        frame: ObservedFrame,
+        observed_messages: Vec<PrimaryObservedMessage>,
+    ) -> Result<()> {
+        let messages = observed_messages
+            .iter()
+            .map(|observed| {
+                log::debug!("处理一级观察消息: id={:?}", observed.id);
+                &observed.message
+            })
+            .collect::<Vec<_>>();
         if self
             .reset_locks_requested
             .swap(false, AtomicOrdering::SeqCst)
@@ -2444,7 +2609,7 @@ impl AutomationApp {
             log::info!("已重置命令屏幕锁");
         }
         let active_entertainment = self.entertainment.active();
-        let visible_turtle_questions = if self.turtle_soup.accepts_questions() {
+        let visible_turtle_questions = if self.business.turtle_soup_accepts_questions()? {
             messages
                 .iter()
                 .filter(|message| message.message_type == "blue" && !message.text.is_empty())
@@ -2462,16 +2627,20 @@ impl AutomationApp {
             Vec::new()
         };
         let suppress_new_turtle_questions = !self.screen_lock_primed.load(AtomicOrdering::SeqCst);
-        let new_turtle_questions = self
-            .turtle_soup
-            .filter_new_primary_questions(visible_turtle_questions, suppress_new_turtle_questions);
+        let new_turtle_questions = self.business.filter_turtle_soup_primary_questions(
+            visible_turtle_questions,
+            suppress_new_turtle_questions,
+        )?;
         if messages.is_empty() {
             log::debug!("没有找到聊天标志，本轮不更新命令锁");
             return Ok(());
         }
 
         let mut parsed = Vec::new();
-        for message in messages.iter().filter(|message| !message.text.is_empty()) {
+        for (observed, message) in observed_messages.iter().zip(messages) {
+            if message.text.is_empty() {
+                continue;
+            }
             log::debug!(
                 "识别文本: [{}] {}",
                 message.message_type,
@@ -2504,18 +2673,38 @@ impl AutomationApp {
             }
             if parsed
                 .iter()
-                .any(|existing| command::same_lock_command(existing, &parsed_command))
+                .any(|(existing, _)| command::same_lock_command(existing, &parsed_command))
             {
                 log::info!("同轮重复识别命令，已合并: {}", parsed_command.raw);
                 continue;
             }
             log::debug!("解析命令: {}", parsed_command.raw);
-            parsed.push(parsed_command);
+            parsed.push((
+                parsed_command,
+                CommandObservation {
+                    frame_id: Some(frame.id()),
+                    captured_at: Some(frame.captured_at()),
+                    message_id: Some(observed.id.clone()),
+                },
+            ));
         }
 
-        let update = self
-            .locks
-            .update(&parsed, self.command_executing.load(AtomicOrdering::SeqCst));
+        let visible_commands = parsed
+            .iter()
+            .map(|(parsed, _)| parsed.clone())
+            .collect::<Vec<_>>();
+        let mut update = self.locks.update(
+            &visible_commands,
+            self.command_executing.load(AtomicOrdering::SeqCst),
+        );
+        for pending in &mut update.accepted {
+            if let Some((_, observation)) = parsed
+                .iter()
+                .find(|(parsed, _)| command::same_lock_command(parsed, &pending.parsed))
+            {
+                pending.observation = observation.clone();
+            }
+        }
         for command in update.unlocked {
             log::info!("解锁: {}", command);
         }
@@ -2598,8 +2787,10 @@ impl AutomationApp {
                     .unwrap_or_default();
                 let message = format!("监听模式状态: {}{}", snapshot.mode.label(), pending);
                 log::info!("{}", message);
-                self.monitor
-                    .push_command(format!("{} -> {}", parsed.user_command, message));
+                self.monitor.publish(MonitorEvent::Command(format!(
+                    "{} -> {}",
+                    parsed.user_command, message
+                )));
             }
             ChatListenerModeCommand::Primary | ChatListenerModeCommand::Secondary => {
                 let target = match command {
@@ -2694,11 +2885,11 @@ impl AutomationApp {
             return Ok(false);
         };
         let outcome = if parsed.message_type == "pink" {
-            self.turtle_soup
-                .handle_friend_command(&parsed.username, command)
+            self.business
+                .handle_turtle_soup_friend_command(&parsed.username, command)?
         } else {
-            self.turtle_soup
-                .handle_hall_command(&parsed.username, command)
+            self.business
+                .handle_turtle_soup_hall_command(&parsed.username, command)?
         };
         if let Some(reply) = outcome.immediate_reply {
             self.enqueue_current_hall_reply(&reply)?;
@@ -2715,7 +2906,7 @@ impl AutomationApp {
         &self,
         question: turtle_soup::TurtleSoupQuestion,
     ) -> Result<bool> {
-        match self.turtle_soup.submit_question(question)? {
+        match self.business.submit_turtle_soup_question(question)? {
             QuestionSubmitOutcome::Ignored => Ok(false),
             QuestionSubmitOutcome::Queued { request_id } => {
                 log::info!("海龟汤提问已进入 AI 队列: request_id={}", request_id);
@@ -2745,8 +2936,10 @@ impl AutomationApp {
     }
 
     pub(super) fn abort_entertainment_for_context_loss(&self, reason: &str) {
-        self.turtle_soup.abort_for_context_loss(reason);
-        match self.undercover.abort() {
+        if let Err(error) = self.business.abort_turtle_soup(reason) {
+            log::error!("无法中止海龟汤会话: {error:#}");
+        }
+        match self.business.abort_undercover() {
             Ok(true) => log::warn!("谁是卧底已因聊天上下文变化中止: {}", reason),
             Ok(false) => {}
             Err(error) => log::error!("无法中止旧谁是卧底牌局: {error:#}"),
@@ -2764,9 +2957,14 @@ impl AutomationApp {
     }
 
     fn tick_entertainment(&self) {
-        self.turtle_soup.tick();
         let clock_active = !self.paused.load(AtomicOrdering::SeqCst)
             && !self.command_executing.load(AtomicOrdering::SeqCst);
+        if let Err(error) = self
+            .business
+            .refresh_turtle_soup_deadline(Instant::now(), clock_active)
+        {
+            log::error!("无法同步海龟汤期限: {error:#}");
+        }
         let card_game_outcome = match self
             .business
             .poll_card_game_timed_outcome(Instant::now(), clock_active)
@@ -2789,21 +2987,35 @@ impl AutomationApp {
                 }
             }
         }
-        match self.undercover.tick(Instant::now(), clock_active) {
-            Ok(deliveries) => {
-                if !deliveries.is_empty()
-                    && let Err(error) = self.push_pending_task(PendingTask::UndercoverDelivery(
-                        self.undercover.delivery_task(deliveries),
-                    ))
-                {
-                    log::error!("谁是卧底计时消息入队失败: {error:#}");
+        let undercover_outcome = match self
+            .business
+            .poll_undercover_timed_outcome(Instant::now(), clock_active)
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                log::error!("无法推进谁是卧底计时: {error:#}");
+                None
+            }
+        };
+        if let Some(outcome) = undercover_outcome {
+            let action = outcome.action();
+            let request = outcome.into_request();
+            let key = request.key;
+            let effect = QueuedUndercoverEffect::new(self.business.clone(), action, request);
+            if let Err(error) = self.push_pending_task(PendingTask::UndercoverEffect(effect)) {
+                log::error!("谁是卧底计时消息入队失败: {error:#}");
+                if let Err(cancel_error) = self.business.cancel_undercover_effect(key) {
+                    log::error!("谁是卧底计时消息入队失败后无法清理牌局: {cancel_error:#}");
                 }
             }
-            Err(error) => log::error!("无法推进谁是卧底计时: {error:#}"),
         }
     }
 
-    fn submit_secondary_command(&self, parsed: ParsedCommand) -> Result<()> {
+    fn submit_secondary_command(
+        &self,
+        parsed: ParsedCommand,
+        observation: CommandObservation,
+    ) -> Result<()> {
         if self.enqueue_chat_listener_command(&parsed)? {
             return Ok(());
         }
@@ -2851,6 +3063,7 @@ impl AutomationApp {
         self.push_pending_task(PendingTask::Command(Box::new(PendingCommand {
             lock_key: command::lock_key(&parsed),
             parsed,
+            observation,
         })))
     }
 
@@ -3057,7 +3270,7 @@ impl AutomationApp {
             PendingTask::CardGameEffect(effect) => effect
                 .execute(self)
                 .map(|_| PendingTaskExecution::Completed),
-            PendingTask::UndercoverDelivery(delivery) => delivery
+            PendingTask::UndercoverEffect(effect) => effect
                 .execute(self)
                 .map(|_| PendingTaskExecution::Completed),
         };
@@ -3948,7 +4161,7 @@ impl AutomationApp {
             });
         }
         let ocr_ms = elapsed_ms(started);
-        self.monitor.set_ocr(OcrSnapshot::new(
+        self.monitor.publish(MonitorEvent::Ocr(OcrSnapshot::new(
             messages.len(),
             messages
                 .iter()
@@ -3958,7 +4171,7 @@ impl AutomationApp {
             ocr_ms,
             ocr_ms,
             "二级当前大厅",
-        ));
+        )));
         Ok(messages)
     }
 
@@ -3996,7 +4209,7 @@ impl AutomationApp {
         let ocr_started = Instant::now();
         let accepts_turtle_questions = message_type == "blue"
             && self.commands_enabled.load(AtomicOrdering::SeqCst)
-            && self.turtle_soup.accepts_questions();
+            && self.business.turtle_soup_accepts_questions()?;
         let captures_hash_sender =
             message_type == "blue" && self.commands_enabled.load(AtomicOrdering::SeqCst);
         let texts = (|| -> Result<Vec<(Rect, String, Option<String>)>> {
@@ -4039,7 +4252,7 @@ impl AutomationApp {
             }
         };
         let ocr_ms = elapsed_ms(ocr_started);
-        self.monitor.set_ocr(OcrSnapshot::new(
+        self.monitor.publish(MonitorEvent::Ocr(OcrSnapshot::new(
             texts.len(),
             texts
                 .iter()
@@ -4053,7 +4266,7 @@ impl AutomationApp {
             } else {
                 "二级当前大厅"
             },
-        ));
+        )));
 
         let texts = if accepts_turtle_questions {
             let observations = texts
@@ -4063,7 +4276,10 @@ impl AutomationApp {
                     player: message_sender.unwrap_or_default(),
                 })
                 .collect::<Vec<_>>();
-            match self.turtle_soup.stabilize_secondary_ocr(observations) {
+            match self
+                .business
+                .stabilize_turtle_soup_secondary(observations)?
+            {
                 SecondaryOcrStability::Pending => {
                     self.chat_observations
                         .complete_without_messages(observation_frame)?;
@@ -4078,7 +4294,7 @@ impl AutomationApp {
                     .collect::<Vec<_>>(),
             }
         } else {
-            self.turtle_soup.clear_secondary_ocr_stability();
+            self.business.clear_turtle_soup_secondary_stability()?;
             texts
                 .into_iter()
                 .map(|(_, text, message_sender)| (text, message_sender))
@@ -4105,6 +4321,7 @@ impl AutomationApp {
 
     fn process_secondary_chat_observation(
         &self,
+        frame: ObservedFrame,
         observation: SecondaryChatObservation,
     ) -> Result<bool> {
         let SecondaryChatObservation {
@@ -4121,6 +4338,11 @@ impl AutomationApp {
         } in messages
         {
             log::debug!("处理二级观察消息: id={message_id:?}");
+            let command_observation = CommandObservation {
+                frame_id: Some(frame.id()),
+                captured_at: Some(frame.captured_at()),
+                message_id: Some(message_id.clone()),
+            };
             let shortcut_player = if message_type == "pink" {
                 friend_name.trim()
             } else {
@@ -4137,7 +4359,7 @@ impl AutomationApp {
                     &message_type,
                     self.entertainment.active(),
                 ) {
-                    self.submit_secondary_command(parsed)?;
+                    self.submit_secondary_command(parsed, command_observation.clone())?;
                     processed = true;
                     continue;
                 }
@@ -4177,7 +4399,7 @@ impl AutomationApp {
                 log::debug!("二级监听气泡未解析为命令");
                 continue;
             };
-            self.submit_secondary_command(parsed)?;
+            self.submit_secondary_command(parsed, command_observation)?;
             processed = true;
         }
         Ok(processed)
@@ -4262,8 +4484,10 @@ impl AutomationApp {
     }
 
     fn log_executed_command(&self, parsed: &ParsedCommand, final_command: &str) -> Result<()> {
-        self.monitor
-            .push_command(format!("{} -> {}", parsed.user_command, final_command));
+        self.monitor.publish(MonitorEvent::Command(format!(
+            "{} -> {}",
+            parsed.user_command, final_command
+        )));
         let path = &self.config.state.executed_commands_log_path;
         if let Some(parent) = path
             .parent()
@@ -4599,7 +4823,6 @@ impl AutomationApp {
                 prefer_accompaniment: song.prefer_accompaniment,
                 ai_original_text: String::new(),
                 uri: String::new(),
-                skip_match_check: false,
                 friend_username: song.friend_username.clone(),
                 console_bypass_dedup: false,
             }));
@@ -4662,7 +4885,7 @@ impl AutomationApp {
         match self.wait_for_decision(false, false, true)? {
             UserDecision::Confirm | UserDecision::Timeout => {}
             UserDecision::Skip => return Ok(None),
-            UserDecision::PromptFailed | UserDecision::Stopped => return Ok(None),
+            UserDecision::Stopped => return Ok(None),
             _ => return Ok(None),
         }
         Ok(Some(ResolvedSongRequest {
@@ -4671,7 +4894,6 @@ impl AutomationApp {
             prefer_accompaniment: song.prefer_accompaniment,
             ai_original_text: song.keyword.clone(),
             uri: candidate.uri.clone(),
-            skip_match_check: true,
             friend_username: song.friend_username.clone(),
             console_bypass_dedup: false,
         }))
@@ -4755,7 +4977,6 @@ impl AutomationApp {
                         prefer_accompaniment: request.prefer_accompaniment,
                         ai_original_text: String::new(),
                         uri,
-                        skip_match_check: false,
                         friend_username: request.friend_username.clone(),
                         console_bypass_dedup: request.console_bypass_dedup,
                     }));
@@ -4843,7 +5064,6 @@ impl AutomationApp {
                 prefer_accompaniment: song.prefer_accompaniment,
                 ai_original_text: String::new(),
                 uri: picked.candidate.uri.clone(),
-                skip_match_check: false,
                 friend_username: song.friend_username.clone(),
                 console_bypass_dedup: false,
             })),
@@ -4917,7 +5137,7 @@ impl AutomationApp {
         match self.wait_for_decision(false, false, true)? {
             UserDecision::Confirm | UserDecision::Timeout => {}
             UserDecision::Skip => return Ok(None),
-            UserDecision::PromptFailed | UserDecision::Stopped => return Ok(None),
+            UserDecision::Stopped => return Ok(None),
             _ => return Ok(None),
         }
         Ok(Some(ResolvedSongRequest {
@@ -4926,7 +5146,6 @@ impl AutomationApp {
             prefer_accompaniment: song.prefer_accompaniment,
             ai_original_text: song.keyword.clone(),
             uri: candidate.uri.clone(),
-            skip_match_check: true,
             friend_username: song.friend_username.clone(),
             console_bypass_dedup: false,
         }))
@@ -5043,11 +5262,9 @@ impl AutomationApp {
     fn playback_request_from_resolved(&self, request: &ResolvedSongRequest) -> PlaybackRequest {
         PlaybackRequest {
             keyword: request.keyword.clone(),
-            match_keyword: request.match_keyword().to_string(),
             source: request.source.clone(),
             prefer_accompaniment: request.prefer_accompaniment,
             uri: request.uri.clone(),
-            skip_match_check: request.skip_match_check,
         }
     }
 
@@ -5845,15 +6062,10 @@ impl AutomationApp {
             "控制台" => UndercoverCommandSource::Console,
             _ => UndercoverCommandSource::Hall,
         };
-        self.undercover.execute(
-            UndercoverCommandContext {
-                player: &parsed.username,
-                source,
-            },
-            command,
-            self,
-            Instant::now(),
-        )
+        let start =
+            self.business
+                .begin_undercover(&parsed.username, source, command, Instant::now())?;
+        drive_undercover_start(&self.business, start, self)
     }
 
     fn play_request_confirmed(
@@ -6033,7 +6245,6 @@ impl AutomationApp {
             prefer_accompaniment,
             ai_original_text: String::new(),
             uri: String::new(),
-            skip_match_check: false,
             friend_username: String::new(),
             console_bypass_dedup: false,
         };
@@ -6166,8 +6377,6 @@ impl AutomationApp {
                 prefer_accompaniment: item.prefer_accompaniment,
                 ai_original_text: item.ai_original_text.clone(),
                 uri: item.uri.clone(),
-                skip_match_check: !item.ai_original_text.trim().is_empty()
-                    && !item.uri.trim().is_empty(),
                 friend_username: item.friend_username.clone(),
                 console_bypass_dedup: item.dedup_bypass,
             };
@@ -6271,7 +6480,7 @@ impl AutomationApp {
 
     fn update_monitor_queue_snapshot(&self) {
         match self.queue() {
-            Ok(queue) => self.monitor.set_queue(
+            Ok(queue) => self.monitor.publish(MonitorEvent::Queue(
                 queue
                     .items()
                     .iter()
@@ -6283,21 +6492,25 @@ impl AutomationApp {
                         friend_username: item.friend_username.clone(),
                     })
                     .collect(),
-            ),
+            )),
             Err(error) => log::warn!("更新监控队列失败: {error:#}"),
         }
     }
 
     fn update_monitor_playback_controller(&self) {
-        self.monitor.set_playback_controller(self.player.snapshot());
+        self.monitor
+            .publish(MonitorEvent::PlaybackController(self.player.snapshot()));
     }
 
     fn update_monitor_chat_listener(&self) {
         let snapshot = self.chat_listener.snapshot();
-        self.monitor.set_chat_listener(
-            snapshot.display_mode(),
-            snapshot.pending_mode.map(|mode| mode.label().to_string()),
-        );
+        self.monitor.publish(MonitorEvent::ChatListener {
+            mode: snapshot.display_mode().to_string(),
+            pending_mode: snapshot
+                .pending_mode
+                .map(|mode| mode.label().to_string())
+                .unwrap_or_default(),
+        });
     }
 
     fn update_monitor_operational_state(&self) {
@@ -6314,12 +6527,12 @@ impl AutomationApp {
             .lock()
             .ok()
             .and_then(|state| state.state().hall_remaining_minutes_now());
-        self.monitor.set_operational(
-            self.paused.load(AtomicOrdering::SeqCst),
-            self.commands_enabled.load(AtomicOrdering::SeqCst),
+        self.monitor.publish(MonitorEvent::Operational {
+            scanner_paused: self.paused.load(AtomicOrdering::SeqCst),
+            commands_enabled: self.commands_enabled.load(AtomicOrdering::SeqCst),
             idle_exit_remaining_seconds,
             hall_remaining_minutes,
-        );
+        });
     }
 }
 
@@ -6998,28 +7211,6 @@ mod tests {
             .execute(&NeverCalledCardGamePort)
             .unwrap();
         runtime.shutdown().unwrap();
-    }
-
-    #[test]
-    fn undercover_tick_does_not_release_signup_reservation_during_command() {
-        let entertainment = EntertainmentCoordinator::new();
-        assert_eq!(
-            entertainment
-                .try_acquire(EntertainmentKind::Undercover)
-                .expect("acquire undercover"),
-            AcquireOutcome::Acquired
-        );
-        let service = UndercoverService::new(
-            undercover::UndercoverConfig::default(),
-            entertainment.clone(),
-        );
-
-        let deliveries = service
-            .tick(Instant::now(), false)
-            .expect("tick undercover");
-
-        assert!(deliveries.is_empty());
-        assert_eq!(entertainment.active(), Some(EntertainmentKind::Undercover));
     }
 
     #[test]

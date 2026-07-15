@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
@@ -11,6 +12,7 @@ use crate::features::moderation;
 pub use crate::features::moderation::{ModerationAction, ModerationCommand};
 use crate::features::turtle_soup::TurtleSoupCommand;
 use crate::features::undercover::UndercoverCommand;
+use crate::observation::chat::{ObservationFrameId, ObservedChatMessageId};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ParsedCommand {
@@ -111,6 +113,18 @@ impl SongSource {
 pub struct PendingCommand {
     pub lock_key: String,
     pub parsed: ParsedCommand,
+    pub observation: CommandObservation,
+}
+
+/// Observation context retained when a chat message becomes a queued command.
+///
+/// This is deliberately runtime-only metadata. It is useful for correlating execution with
+/// the frame and message that produced it, but it is not part of the external command protocol.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CommandObservation {
+    pub(crate) frame_id: Option<ObservationFrameId>,
+    pub(crate) captured_at: Option<Instant>,
+    pub(crate) message_id: Option<ObservedChatMessageId>,
 }
 
 /// A command submitted by a local control surface rather than read from chat.
@@ -151,6 +165,7 @@ impl ConsoleCommandIntent {
         PendingCommand {
             lock_key: lock_key(&parsed),
             parsed,
+            observation: CommandObservation::default(),
         }
     }
 }
@@ -656,6 +671,7 @@ impl CommandLockState {
             update.accepted.push(PendingCommand {
                 lock_key,
                 parsed: parsed.clone(),
+                observation: CommandObservation::default(),
             });
         }
 
@@ -1628,6 +1644,32 @@ mod tests {
         let update = locks.update(&[alice_disable, bob_disable], false);
 
         assert_eq!(update.accepted.len(), 1);
+    }
+
+    #[test]
+    fn pending_command_keeps_observation_context_with_the_command() {
+        let parsed = parse_text("用户：@状态", "blue").expect("parse status");
+        let mut ledger = crate::observation::chat::ChatObservationLedger::new();
+        let frame = ledger.begin_frame(Instant::now());
+        let message_id = ObservedChatMessageId::new(
+            crate::observation::chat::VisualSessionId::new(7),
+            crate::observation::chat::ChatIdentity::PrimaryHall,
+            crate::observation::chat::BubbleSequence::new(3),
+        );
+        let observation = CommandObservation {
+            frame_id: Some(frame.id()),
+            captured_at: Some(frame.captured_at()),
+            message_id: Some(message_id),
+        };
+        let pending = PendingCommand {
+            lock_key: lock_key(&parsed),
+            parsed,
+            observation: observation.clone(),
+        };
+
+        assert_eq!(pending.observation.frame_id, observation.frame_id);
+        assert_eq!(pending.observation.captured_at, observation.captured_at);
+        assert_eq!(pending.observation.message_id, observation.message_id);
     }
 
     #[test]

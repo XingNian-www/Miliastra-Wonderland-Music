@@ -9,7 +9,7 @@ use super::ResolvedTemplateArgs;
 use super::change_detection::{ChangeFingerprint, rect_chat_change_fingerprint};
 use super::chat_output::redacted_chat_text;
 use super::geometry::{Rect, clamp_i32, crop_canvas};
-use super::monitor::{MonitorShared, OcrSnapshot};
+use super::monitor::{MonitorEvent, MonitorShared, OcrSnapshot};
 use super::ocr_batch;
 use super::ocr_runtime::{OcrPriority, OcrRuntimeHandle};
 use super::template_match::{TemplateHit, dedupe_hits, find_color_template_hits};
@@ -126,7 +126,7 @@ pub(super) fn recognize_prepared_chat(
     let ocr_ms = elapsed_ms(ocr_started);
     let total_ms = elapsed_ms(prepared.started);
     if let Some(monitor) = monitor {
-        monitor.set_ocr(OcrSnapshot::new(
+        monitor.publish(MonitorEvent::Ocr(OcrSnapshot::new(
             prepared.markers.len(),
             messages
                 .iter()
@@ -142,7 +142,7 @@ pub(super) fn recognize_prepared_chat(
             ocr_ms,
             total_ms,
             "一级聊天",
-        ));
+        )));
     }
     log::info!(target: CHAT_SCAN_RESULT_LOG_TARGET,
         "聊天扫描结果: markers={} messages={} {}",

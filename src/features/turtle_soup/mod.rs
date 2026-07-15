@@ -12,7 +12,8 @@ mod service;
 
 pub(crate) use service::{
     QuestionSubmitOutcome, SecondaryOcrObservation, SecondaryOcrStability, TurtleSoupCommand,
-    TurtleSoupConfig, TurtleSoupQuestion, TurtleSoupService, parse_question_message,
+    TurtleSoupCommandOutcome, TurtleSoupConfig, TurtleSoupQuestion, TurtleSoupService,
+    TurtleSoupSnapshot, parse_question_message,
 };
 
 #[derive(Debug)]

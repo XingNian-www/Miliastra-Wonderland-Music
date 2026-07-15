@@ -14,6 +14,18 @@ use crate::features::idiom_chain::{
     IdiomChainCommand, IdiomChainDeadlineKind, IdiomChainDeadlineToken, IdiomChainOutcome,
     IdiomChainService,
 };
+use crate::features::turtle_soup::{
+    QuestionSubmitOutcome, SecondaryOcrObservation, SecondaryOcrStability, TurtleSoupCommand,
+    TurtleSoupCommandOutcome, TurtleSoupDeadlineKind, TurtleSoupDeadlineToken, TurtleSoupDelivery,
+    TurtleSoupQuestion, TurtleSoupService, TurtleSoupSnapshot,
+};
+#[cfg(test)]
+use crate::features::undercover::UndercoverConfig;
+use crate::features::undercover::{
+    UndercoverCommand, UndercoverCommandSource, UndercoverCommandStart, UndercoverDeadlineKind,
+    UndercoverDeadlineToken, UndercoverEffectClaim, UndercoverEffectKey, UndercoverEffectResult,
+    UndercoverResume, UndercoverRuntimeService, UndercoverSnapshot, UndercoverTimedOutcome,
+};
 use crate::observation::chat::{
     CompletionAdvance, ObservationCompletionEvent, ObservationWatermark,
 };
@@ -28,6 +40,8 @@ use crate::runtime::timer::{
 
 const IDIOM_DEADLINE_TOKEN_ID: u64 = 1;
 const CARD_GAME_DEADLINE_TOKEN_ID: u64 = 1;
+const UNDERCOVER_DEADLINE_TOKEN_ID: u64 = 1;
+const TURTLE_SOUP_DEADLINE_TOKEN_ID: u64 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BusinessEvent {
@@ -169,6 +183,8 @@ pub enum BusinessRuntimeError {
     WorkerPanicked,
     IdiomChainOperationFailed(String),
     CardGameOperationFailed(String),
+    UndercoverOperationFailed(String),
+    TurtleSoupOperationFailed(String),
     TimerOperationFailed(String),
 }
 
@@ -186,6 +202,12 @@ impl Display for BusinessRuntimeError {
             }
             Self::CardGameOperationFailed(message) => {
                 write!(formatter, "card game operation failed: {message}")
+            }
+            Self::UndercoverOperationFailed(message) => {
+                write!(formatter, "undercover operation failed: {message}")
+            }
+            Self::TurtleSoupOperationFailed(message) => {
+                write!(formatter, "turtle soup operation failed: {message}")
             }
             Self::TimerOperationFailed(message) => {
                 write!(formatter, "business timer operation failed: {message}")
@@ -211,6 +233,15 @@ enum RuntimeMessage {
     AbortIdiomChain(SyncSender<Result<bool, BusinessRuntimeError>>),
     ExpireIdiomChain(SyncSender<Result<bool, BusinessRuntimeError>>),
     CardGame(CardGameRuntimeMessage),
+    Undercover(UndercoverRuntimeMessage),
+    UndercoverSnapshot(SyncSender<Result<UndercoverSnapshot, BusinessRuntimeError>>),
+    TurtleSoup(TurtleSoupRuntimeMessage),
+    TurtleSoupSnapshot(SyncSender<Result<TurtleSoupSnapshot, BusinessRuntimeError>>),
+    RefreshTurtleSoup {
+        now: Instant,
+        clock_active: bool,
+        response: SyncSender<Result<(), BusinessRuntimeError>>,
+    },
     Snapshot(SyncSender<BusinessRuntimeSnapshot>),
     PrepareShutdown(SyncSender<BusinessRuntimeSnapshot>),
     Shutdown(SyncSender<BusinessRuntimeSnapshot>),
@@ -224,8 +255,24 @@ struct ActiveIdiomDeadline {
     deadline: Instant,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ActiveCardGameDeadline {
+    token: BusinessDeadlineToken,
+    operation_id: BusinessOperationId,
+    session_generation: SessionGeneration,
+    deadline: Instant,
+}
+
+#[derive(Clone, Debug)]
+struct ActiveUndercoverDeadline {
+    token: BusinessDeadlineToken,
+    operation_id: BusinessOperationId,
+    session_generation: SessionGeneration,
+    deadline: Instant,
+}
+
+#[derive(Clone, Debug)]
+struct ActiveTurtleSoupDeadline {
     token: BusinessDeadlineToken,
     operation_id: BusinessOperationId,
     session_generation: SessionGeneration,
@@ -258,6 +305,87 @@ enum CardGameRuntimeMessage {
         response: SyncSender<Result<Option<CardGameTimedOutcome>, BusinessRuntimeError>>,
     },
     Abort(SyncSender<Result<bool, BusinessRuntimeError>>),
+}
+
+enum UndercoverRuntimeMessage {
+    Begin {
+        player: String,
+        source: UndercoverCommandSource,
+        command: UndercoverCommand,
+        now: Instant,
+        response: SyncSender<Result<UndercoverCommandStart, BusinessRuntimeError>>,
+    },
+    Claim {
+        key: UndercoverEffectKey,
+        response: SyncSender<Result<UndercoverEffectClaim, BusinessRuntimeError>>,
+    },
+    Resume {
+        key: UndercoverEffectKey,
+        result: UndercoverEffectResult,
+        response: SyncSender<Result<UndercoverResume, BusinessRuntimeError>>,
+    },
+    Cancel {
+        key: UndercoverEffectKey,
+        response: SyncSender<Result<(), BusinessRuntimeError>>,
+    },
+    Poll {
+        now: Instant,
+        clock_active: bool,
+        response: SyncSender<Result<Option<UndercoverTimedOutcome>, BusinessRuntimeError>>,
+    },
+    Abort(SyncSender<Result<bool, BusinessRuntimeError>>),
+}
+
+enum TurtleSoupRuntimeMessage {
+    HallCommand {
+        player: String,
+        command: TurtleSoupCommand,
+        response: SyncSender<TurtleSoupCommandOutcome>,
+    },
+    FriendCommand {
+        player: String,
+        command: TurtleSoupCommand,
+        response: SyncSender<TurtleSoupCommandOutcome>,
+    },
+    StartRandom {
+        response: SyncSender<Result<(), BusinessRuntimeError>>,
+    },
+    StartById {
+        id: String,
+        response: SyncSender<Result<(), BusinessRuntimeError>>,
+    },
+    End {
+        response: SyncSender<Result<bool, BusinessRuntimeError>>,
+    },
+    FilterPrimary {
+        visible: Vec<TurtleSoupQuestion>,
+        suppress_new: bool,
+        response: SyncSender<Vec<TurtleSoupQuestion>>,
+    },
+    StabilizeSecondary {
+        observations: Vec<SecondaryOcrObservation>,
+        response: SyncSender<SecondaryOcrStability>,
+    },
+    ClearSecondary,
+    Accepts(SyncSender<bool>),
+    Submit {
+        question: TurtleSoupQuestion,
+        response: SyncSender<Result<QuestionSubmitOutcome, BusinessRuntimeError>>,
+    },
+    Abort {
+        reason: String,
+    },
+    DeliveryCurrent {
+        delivery: TurtleSoupDelivery,
+        response: SyncSender<bool>,
+    },
+    DeliverySuccess {
+        delivery: TurtleSoupDelivery,
+    },
+    DeliveryFailure {
+        delivery: TurtleSoupDelivery,
+        error: String,
+    },
 }
 
 struct RuntimeChannel {
@@ -388,6 +516,244 @@ impl BusinessRuntimeHandle {
         self.request(|response| RuntimeMessage::CardGame(CardGameRuntimeMessage::Abort(response)))
     }
 
+    pub fn begin_undercover(
+        &self,
+        player: &str,
+        source: UndercoverCommandSource,
+        command: &UndercoverCommand,
+        now: Instant,
+    ) -> Result<UndercoverCommandStart, BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::Undercover(UndercoverRuntimeMessage::Begin {
+                player: player.to_string(),
+                source,
+                command: command.clone(),
+                now,
+                response,
+            })
+        })
+    }
+
+    pub fn claim_undercover_effect(
+        &self,
+        key: UndercoverEffectKey,
+    ) -> Result<UndercoverEffectClaim, BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::Undercover(UndercoverRuntimeMessage::Claim { key, response })
+        })
+    }
+
+    pub fn resume_undercover(
+        &self,
+        key: UndercoverEffectKey,
+        result: UndercoverEffectResult,
+    ) -> Result<UndercoverResume, BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::Undercover(UndercoverRuntimeMessage::Resume {
+                key,
+                result,
+                response,
+            })
+        })
+    }
+
+    pub fn cancel_undercover_effect(
+        &self,
+        key: UndercoverEffectKey,
+    ) -> Result<(), BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::Undercover(UndercoverRuntimeMessage::Cancel { key, response })
+        })
+    }
+
+    pub fn abort_undercover(&self) -> Result<bool, BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::Undercover(UndercoverRuntimeMessage::Abort(response))
+        })
+    }
+
+    pub fn poll_undercover_timed_outcome(
+        &self,
+        now: Instant,
+        clock_active: bool,
+    ) -> Result<Option<UndercoverTimedOutcome>, BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::Undercover(UndercoverRuntimeMessage::Poll {
+                now,
+                clock_active,
+                response,
+            })
+        })
+    }
+
+    pub fn undercover_snapshot(&self) -> Result<UndercoverSnapshot, BusinessRuntimeError> {
+        let (response, receiver) = mpsc::sync_channel(1);
+        self.send_query(RuntimeMessage::UndercoverSnapshot(response))?;
+        receiver
+            .recv()
+            .map_err(|_| BusinessRuntimeError::RuntimeStopped)?
+    }
+
+    pub(crate) fn refresh_turtle_soup_deadline(
+        &self,
+        now: Instant,
+        clock_active: bool,
+    ) -> Result<(), BusinessRuntimeError> {
+        self.request(|response| RuntimeMessage::RefreshTurtleSoup {
+            now,
+            clock_active,
+            response,
+        })
+    }
+
+    pub(crate) fn turtle_soup_snapshot(&self) -> Result<TurtleSoupSnapshot, BusinessRuntimeError> {
+        let (response, receiver) = mpsc::sync_channel(1);
+        self.send_query(RuntimeMessage::TurtleSoupSnapshot(response))?;
+        receiver
+            .recv()
+            .map_err(|_| BusinessRuntimeError::RuntimeStopped)?
+    }
+
+    pub(crate) fn handle_turtle_soup_hall_command(
+        &self,
+        player: &str,
+        command: &TurtleSoupCommand,
+    ) -> Result<TurtleSoupCommandOutcome, BusinessRuntimeError> {
+        self.request_value(|response| {
+            RuntimeMessage::TurtleSoup(TurtleSoupRuntimeMessage::HallCommand {
+                player: player.to_string(),
+                command: command.clone(),
+                response,
+            })
+        })
+    }
+
+    pub(crate) fn handle_turtle_soup_friend_command(
+        &self,
+        player: &str,
+        command: &TurtleSoupCommand,
+    ) -> Result<TurtleSoupCommandOutcome, BusinessRuntimeError> {
+        self.request_value(|response| {
+            RuntimeMessage::TurtleSoup(TurtleSoupRuntimeMessage::FriendCommand {
+                player: player.to_string(),
+                command: command.clone(),
+                response,
+            })
+        })
+    }
+
+    pub(crate) fn start_turtle_soup_random(&self) -> Result<(), BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::TurtleSoup(TurtleSoupRuntimeMessage::StartRandom { response })
+        })
+    }
+
+    pub(crate) fn start_turtle_soup_by_id(&self, id: &str) -> Result<(), BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::TurtleSoup(TurtleSoupRuntimeMessage::StartById {
+                id: id.to_string(),
+                response,
+            })
+        })
+    }
+
+    pub(crate) fn end_turtle_soup(&self) -> Result<bool, BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::TurtleSoup(TurtleSoupRuntimeMessage::End { response })
+        })
+    }
+
+    pub(crate) fn filter_turtle_soup_primary_questions(
+        &self,
+        visible: Vec<TurtleSoupQuestion>,
+        suppress_new: bool,
+    ) -> Result<Vec<TurtleSoupQuestion>, BusinessRuntimeError> {
+        self.request_value(|response| {
+            RuntimeMessage::TurtleSoup(TurtleSoupRuntimeMessage::FilterPrimary {
+                visible,
+                suppress_new,
+                response,
+            })
+        })
+    }
+
+    pub(crate) fn stabilize_turtle_soup_secondary(
+        &self,
+        observations: Vec<SecondaryOcrObservation>,
+    ) -> Result<SecondaryOcrStability, BusinessRuntimeError> {
+        self.request_value(|response| {
+            RuntimeMessage::TurtleSoup(TurtleSoupRuntimeMessage::StabilizeSecondary {
+                observations,
+                response,
+            })
+        })
+    }
+
+    pub(crate) fn clear_turtle_soup_secondary_stability(&self) -> Result<(), BusinessRuntimeError> {
+        self.send_request(RuntimeMessage::TurtleSoup(
+            TurtleSoupRuntimeMessage::ClearSecondary,
+        ))
+    }
+
+    pub(crate) fn turtle_soup_accepts_questions(&self) -> Result<bool, BusinessRuntimeError> {
+        let (response, receiver) = mpsc::sync_channel(1);
+        self.send_query(RuntimeMessage::TurtleSoup(
+            TurtleSoupRuntimeMessage::Accepts(response),
+        ))?;
+        receiver
+            .recv()
+            .map_err(|_| BusinessRuntimeError::RuntimeStopped)
+    }
+
+    pub(crate) fn submit_turtle_soup_question(
+        &self,
+        question: TurtleSoupQuestion,
+    ) -> Result<QuestionSubmitOutcome, BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::TurtleSoup(TurtleSoupRuntimeMessage::Submit { question, response })
+        })
+    }
+
+    pub(crate) fn abort_turtle_soup(&self, reason: &str) -> Result<(), BusinessRuntimeError> {
+        self.send_request(RuntimeMessage::TurtleSoup(
+            TurtleSoupRuntimeMessage::Abort {
+                reason: reason.to_string(),
+            },
+        ))
+    }
+
+    pub(crate) fn turtle_soup_delivery_is_current(&self, delivery: TurtleSoupDelivery) -> bool {
+        let (response, receiver) = mpsc::sync_channel(1);
+        if self
+            .send_query(RuntimeMessage::TurtleSoup(
+                TurtleSoupRuntimeMessage::DeliveryCurrent { delivery, response },
+            ))
+            .is_err()
+        {
+            return false;
+        }
+        receiver.recv().unwrap_or(false)
+    }
+
+    pub(crate) fn turtle_soup_delivery_success(&self, delivery: TurtleSoupDelivery) {
+        let _ = self.send_request(RuntimeMessage::TurtleSoup(
+            TurtleSoupRuntimeMessage::DeliverySuccess { delivery },
+        ));
+    }
+
+    pub(crate) fn turtle_soup_delivery_failure(
+        &self,
+        delivery: TurtleSoupDelivery,
+        error: &anyhow::Error,
+    ) {
+        let _ = self.send_request(RuntimeMessage::TurtleSoup(
+            TurtleSoupRuntimeMessage::DeliveryFailure {
+                delivery,
+                error: error.to_string(),
+            },
+        ));
+    }
+
     fn request<T>(
         &self,
         message: impl FnOnce(SyncSender<Result<T, BusinessRuntimeError>>) -> RuntimeMessage,
@@ -397,6 +763,17 @@ impl BusinessRuntimeHandle {
         receiver
             .recv()
             .map_err(|_| BusinessRuntimeError::RuntimeStopped)?
+    }
+
+    fn request_value<T>(
+        &self,
+        message: impl FnOnce(SyncSender<T>) -> RuntimeMessage,
+    ) -> Result<T, BusinessRuntimeError> {
+        let (response, receiver) = mpsc::sync_channel(1);
+        self.send_request(message(response))?;
+        receiver
+            .recv()
+            .map_err(|_| BusinessRuntimeError::RuntimeStopped)
     }
 
     #[deprecated(
@@ -477,22 +854,58 @@ impl BusinessRuntime {
         idiom_chain: IdiomChainService,
         card_games: CardGameService,
     ) -> Result<Self, BusinessRuntimeError> {
-        Self::start_internal(queue_capacity, idiom_chain, card_games, None)
+        Self::start_internal(
+            queue_capacity,
+            idiom_chain,
+            card_games,
+            default_undercover_service(),
+            None,
+            None,
+        )
     }
 
-    pub(crate) fn start_with_timer(
+    #[cfg(test)]
+    pub(crate) fn start_with_undercover(
         queue_capacity: usize,
         idiom_chain: IdiomChainService,
         card_games: CardGameService,
+        undercover: UndercoverRuntimeService,
+        turtle_soup: TurtleSoupService,
+    ) -> Result<Self, BusinessRuntimeError> {
+        Self::start_internal(
+            queue_capacity,
+            idiom_chain,
+            card_games,
+            undercover,
+            Some(turtle_soup),
+            None,
+        )
+    }
+
+    pub(crate) fn start_with_timer_and_modules(
+        queue_capacity: usize,
+        idiom_chain: IdiomChainService,
+        card_games: CardGameService,
+        undercover: UndercoverRuntimeService,
+        turtle_soup: TurtleSoupService,
         timer: TimerRuntimeHandle<BusinessDeadlineToken>,
     ) -> Result<Self, BusinessRuntimeError> {
-        Self::start_internal(queue_capacity, idiom_chain, card_games, Some(timer))
+        Self::start_internal(
+            queue_capacity,
+            idiom_chain,
+            card_games,
+            undercover,
+            Some(turtle_soup),
+            Some(timer),
+        )
     }
 
     fn start_internal(
         queue_capacity: usize,
         idiom_chain: IdiomChainService,
         card_games: CardGameService,
+        undercover: UndercoverRuntimeService,
+        turtle_soup: Option<TurtleSoupService>,
         timer: Option<TimerRuntimeHandle<BusinessDeadlineToken>>,
     ) -> Result<Self, BusinessRuntimeError> {
         if queue_capacity == 0 {
@@ -505,7 +918,16 @@ impl BusinessRuntime {
         });
         let worker = thread::Builder::new()
             .name("business-runtime".to_string())
-            .spawn(move || run_business_runtime(receiver, idiom_chain, card_games, timer))
+            .spawn(move || {
+                run_business_runtime(
+                    receiver,
+                    idiom_chain,
+                    card_games,
+                    undercover,
+                    turtle_soup,
+                    timer,
+                )
+            })
             .map_err(|_| BusinessRuntimeError::RuntimeStopped)?;
         Ok(Self {
             handle: BusinessRuntimeHandle { channel },
@@ -583,6 +1005,14 @@ impl BusinessRuntime {
             .map_err(|_| BusinessRuntimeError::WorkerPanicked)?;
         snapshot.ok_or(BusinessRuntimeError::RuntimeStopped)
     }
+}
+
+#[cfg(test)]
+fn default_undercover_service() -> UndercoverRuntimeService {
+    UndercoverRuntimeService::new(
+        UndercoverConfig::default(),
+        crate::features::entertainment::EntertainmentCoordinator::new(),
+    )
 }
 
 impl Drop for BusinessRuntime {
@@ -724,24 +1154,21 @@ fn sync_card_game_deadline(
             return Ok(());
         }
         if previous.token == token {
-            let previous_token = previous.token.clone();
-            let operation_id = operation_ids
-                .allocate()
-                .map_err(|error| BusinessRuntimeError::TimerOperationFailed(error.to_string()))?;
-            timer
-                .reschedule(DeadlineSchedule::new(
-                    previous_token,
-                    operation_id,
-                    session_generation,
-                    deadline,
-                ))
-                .map_err(|error| BusinessRuntimeError::TimerOperationFailed(error.to_string()))?;
             let previous = active
-                .as_mut()
-                .expect("active card deadline remains while rescheduling");
-            previous.operation_id = operation_id;
-            previous.session_generation = session_generation;
-            previous.deadline = deadline;
+                .take()
+                .expect("active card deadline remains while replacing it");
+            let cancellation = DeadlineCancellation::new(
+                previous.token.clone(),
+                previous.operation_id,
+                previous.session_generation,
+            );
+            if let Err(error) = timer.cancel(cancellation) {
+                *active = Some(previous);
+                return Err(BusinessRuntimeError::TimerOperationFailed(
+                    error.to_string(),
+                ));
+            }
+            pending_cancellations.push(previous);
             return Ok(());
         }
         let previous = active
@@ -798,19 +1225,428 @@ fn schedule_card_game_deadline(
     Ok(())
 }
 
+fn undercover_deadline_token(kind: UndercoverDeadlineKind) -> BusinessDeadlineToken {
+    BusinessDeadlineToken::from(UndercoverDeadlineToken::new(
+        UNDERCOVER_DEADLINE_TOKEN_ID,
+        kind,
+    ))
+}
+
+fn turtle_soup_deadline_token(kind: TurtleSoupDeadlineKind) -> BusinessDeadlineToken {
+    BusinessDeadlineToken::from(TurtleSoupDeadlineToken::new(
+        TURTLE_SOUP_DEADLINE_TOKEN_ID,
+        kind,
+    ))
+}
+
+fn sync_turtle_soup_deadline(
+    turtle_soup: Option<&TurtleSoupService>,
+    timer: Option<&TimerRuntimeHandle<BusinessDeadlineToken>>,
+    active: &mut Option<ActiveTurtleSoupDeadline>,
+    pending_cancellations: &mut Vec<ActiveTurtleSoupDeadline>,
+    operation_ids: &BusinessOperationIdAllocator,
+    now: Instant,
+    clock_active: bool,
+) -> Result<(), BusinessRuntimeError> {
+    let Some(timer) = timer else {
+        *active = None;
+        pending_cancellations.clear();
+        return Ok(());
+    };
+    let desired = turtle_soup.and_then(|service| service.next_deadline(now, clock_active));
+    let Some((kind, deadline)) = desired else {
+        if let Some(previous) = active.take() {
+            let cancellation = DeadlineCancellation::new(
+                previous.token.clone(),
+                previous.operation_id,
+                previous.session_generation,
+            );
+            if let Err(error) = timer.cancel(cancellation) {
+                *active = Some(previous);
+                return Err(BusinessRuntimeError::TimerOperationFailed(
+                    error.to_string(),
+                ));
+            }
+            pending_cancellations.push(previous);
+        }
+        return Ok(());
+    };
+    let service = turtle_soup.expect("deadline exists only with turtle soup service");
+    let token = turtle_soup_deadline_token(kind);
+    let session_generation = service.session_generation();
+    if let Some(previous) = active.as_ref() {
+        if previous.token == token
+            && previous.session_generation == session_generation
+            && previous.deadline == deadline
+        {
+            return Ok(());
+        }
+        if previous.token == token {
+            let previous = active
+                .take()
+                .expect("active turtle soup deadline remains while replacing it");
+            let cancellation = DeadlineCancellation::new(
+                previous.token.clone(),
+                previous.operation_id,
+                previous.session_generation,
+            );
+            if let Err(error) = timer.cancel(cancellation) {
+                *active = Some(previous);
+                return Err(BusinessRuntimeError::TimerOperationFailed(
+                    error.to_string(),
+                ));
+            }
+            pending_cancellations.push(previous);
+            return Ok(());
+        }
+        let previous = active
+            .take()
+            .expect("active turtle soup deadline exists while replacing its token");
+        let cancellation = DeadlineCancellation::new(
+            previous.token.clone(),
+            previous.operation_id,
+            previous.session_generation,
+        );
+        if let Err(error) = timer.cancel(cancellation) {
+            *active = Some(previous);
+            return Err(BusinessRuntimeError::TimerOperationFailed(
+                error.to_string(),
+            ));
+        }
+        pending_cancellations.push(previous);
+    }
+    let operation_id = operation_ids
+        .allocate()
+        .map_err(|error| BusinessRuntimeError::TimerOperationFailed(error.to_string()))?;
+    timer
+        .schedule(DeadlineSchedule::new(
+            token.clone(),
+            operation_id,
+            session_generation,
+            deadline,
+        ))
+        .map_err(|error| BusinessRuntimeError::TimerOperationFailed(error.to_string()))?;
+    *active = Some(ActiveTurtleSoupDeadline {
+        token,
+        operation_id,
+        session_generation,
+        deadline,
+    });
+    Ok(())
+}
+
+fn sync_undercover_deadline(
+    undercover: &UndercoverRuntimeService,
+    timer: Option<&TimerRuntimeHandle<BusinessDeadlineToken>>,
+    active: &mut Option<ActiveUndercoverDeadline>,
+    pending_cancellations: &mut Vec<ActiveUndercoverDeadline>,
+    operation_ids: &BusinessOperationIdAllocator,
+    now: Instant,
+    clock_active: bool,
+) -> Result<(), BusinessRuntimeError> {
+    let Some(timer) = timer else {
+        *active = None;
+        pending_cancellations.clear();
+        return Ok(());
+    };
+    let desired = undercover.next_deadline(now, clock_active);
+    let Some((kind, deadline)) = desired else {
+        if let Some(previous) = active.take() {
+            let cancellation = DeadlineCancellation::new(
+                previous.token.clone(),
+                previous.operation_id,
+                previous.session_generation,
+            );
+            if let Err(error) = timer.cancel(cancellation) {
+                *active = Some(previous);
+                return Err(BusinessRuntimeError::TimerOperationFailed(
+                    error.to_string(),
+                ));
+            }
+            pending_cancellations.push(previous);
+        }
+        return Ok(());
+    };
+    let token = undercover_deadline_token(kind);
+    let session_generation = undercover.session_generation();
+    if let Some(previous) = active.as_ref() {
+        if previous.token == token
+            && previous.session_generation == session_generation
+            && previous.deadline == deadline
+        {
+            return Ok(());
+        }
+        if previous.token == token {
+            let previous = active
+                .take()
+                .expect("active undercover deadline remains while replacing it");
+            let cancellation = DeadlineCancellation::new(
+                previous.token.clone(),
+                previous.operation_id,
+                previous.session_generation,
+            );
+            if let Err(error) = timer.cancel(cancellation) {
+                *active = Some(previous);
+                return Err(BusinessRuntimeError::TimerOperationFailed(
+                    error.to_string(),
+                ));
+            }
+            pending_cancellations.push(previous);
+            return Ok(());
+        }
+        let previous = active
+            .take()
+            .expect("active undercover deadline exists while replacing its token");
+        let cancellation = DeadlineCancellation::new(
+            previous.token.clone(),
+            previous.operation_id,
+            previous.session_generation,
+        );
+        if let Err(error) = timer.cancel(cancellation) {
+            *active = Some(previous);
+            return Err(BusinessRuntimeError::TimerOperationFailed(
+                error.to_string(),
+            ));
+        }
+        pending_cancellations.push(previous);
+    }
+    let operation_id = operation_ids
+        .allocate()
+        .map_err(|error| BusinessRuntimeError::TimerOperationFailed(error.to_string()))?;
+    timer
+        .schedule(DeadlineSchedule::new(
+            token.clone(),
+            operation_id,
+            session_generation,
+            deadline,
+        ))
+        .map_err(|error| BusinessRuntimeError::TimerOperationFailed(error.to_string()))?;
+    *active = Some(ActiveUndercoverDeadline {
+        token,
+        operation_id,
+        session_generation,
+        deadline,
+    });
+    Ok(())
+}
+
+// The deadline bridge passes each module's state and correlation lanes explicitly so the
+// orchestrator cannot accidentally share one module's pending effects with another.
+#[allow(clippy::too_many_arguments)]
 fn handle_business_timer(
     event: BusinessDeadlineEvent,
     idiom_chain: &mut IdiomChainService,
     card_games: &mut CardGameService,
+    undercover: &mut UndercoverRuntimeService,
+    turtle_soup: Option<&TurtleSoupService>,
     timer: Option<&TimerRuntimeHandle<BusinessDeadlineToken>>,
     active_idiom_deadline: &mut Option<ActiveIdiomDeadline>,
     active_card_game_deadline: &mut Option<ActiveCardGameDeadline>,
+    active_undercover_deadline: &mut Option<ActiveUndercoverDeadline>,
+    active_turtle_soup_deadline: &mut Option<ActiveTurtleSoupDeadline>,
     pending_card_game_cancellations: &mut Vec<ActiveCardGameDeadline>,
+    pending_undercover_cancellations: &mut Vec<ActiveUndercoverDeadline>,
+    pending_turtle_soup_cancellations: &mut Vec<ActiveTurtleSoupDeadline>,
     pending_card_game_outcomes: &mut std::collections::VecDeque<CardGameTimedOutcome>,
+    pending_undercover_outcomes: &mut std::collections::VecDeque<UndercoverTimedOutcome>,
     operation_ids: &BusinessOperationIdAllocator,
     generation: &mut SessionGeneration,
     clock_active: bool,
 ) -> Result<(), BusinessRuntimeError> {
+    if let BusinessDeadlineEvent::TurtleSoup(timer_event) = &event {
+        match timer_event {
+            TimerRuntimeEvent::DeadlineExpired(expired) => {
+                let Some(previous) = active_turtle_soup_deadline.take() else {
+                    return Ok(());
+                };
+                let token = BusinessDeadlineToken::from(expired.token().clone());
+                if previous.token != token
+                    || previous.operation_id != expired.operation_id()
+                    || previous.session_generation != expired.session_generation()
+                {
+                    *active_turtle_soup_deadline = Some(previous);
+                    return Ok(());
+                }
+                if let Some(service) = turtle_soup {
+                    service.handle_deadline(*expired.token().kind(), Instant::now());
+                }
+                return sync_turtle_soup_deadline(
+                    turtle_soup,
+                    timer,
+                    active_turtle_soup_deadline,
+                    pending_turtle_soup_cancellations,
+                    operation_ids,
+                    Instant::now(),
+                    clock_active,
+                );
+            }
+            TimerRuntimeEvent::CommandCompleted(completed) => {
+                let token = BusinessDeadlineToken::from(completed.token().clone());
+                if completed.command() == TimerCommandKind::Cancel {
+                    let Some(index) =
+                        pending_turtle_soup_cancellations
+                            .iter()
+                            .position(|pending| {
+                                pending.token == token
+                                    && pending.operation_id == completed.operation_id()
+                                    && pending.session_generation == completed.session_generation()
+                            })
+                    else {
+                        return Ok(());
+                    };
+                    let previous = pending_turtle_soup_cancellations.remove(index);
+                    if completed.result().is_err() {
+                        if active_turtle_soup_deadline.is_none() {
+                            *active_turtle_soup_deadline = Some(previous);
+                        } else {
+                            let Some(timer) = timer else {
+                                return Ok(());
+                            };
+                            timer
+                                .cancel(DeadlineCancellation::new(
+                                    previous.token.clone(),
+                                    previous.operation_id,
+                                    previous.session_generation,
+                                ))
+                                .map_err(|error| {
+                                    BusinessRuntimeError::TimerOperationFailed(error.to_string())
+                                })?;
+                            pending_turtle_soup_cancellations.push(previous);
+                        }
+                    }
+                    return sync_turtle_soup_deadline(
+                        turtle_soup,
+                        timer,
+                        active_turtle_soup_deadline,
+                        pending_turtle_soup_cancellations,
+                        operation_ids,
+                        Instant::now(),
+                        clock_active,
+                    );
+                }
+                let Some(active) = active_turtle_soup_deadline.as_ref() else {
+                    return Ok(());
+                };
+                if active.token != token
+                    || active.operation_id != completed.operation_id()
+                    || active.session_generation != completed.session_generation()
+                {
+                    return Ok(());
+                }
+                if completed.result().is_err() {
+                    *active_turtle_soup_deadline = None;
+                    return sync_turtle_soup_deadline(
+                        turtle_soup,
+                        timer,
+                        active_turtle_soup_deadline,
+                        pending_turtle_soup_cancellations,
+                        operation_ids,
+                        Instant::now(),
+                        clock_active,
+                    );
+                }
+                return Ok(());
+            }
+        }
+    }
+    if let BusinessDeadlineEvent::Undercover(timer_event) = &event {
+        match timer_event {
+            TimerRuntimeEvent::DeadlineExpired(expired) => {
+                let Some(previous) = active_undercover_deadline.take() else {
+                    return Ok(());
+                };
+                let token = BusinessDeadlineToken::from(expired.token().clone());
+                if previous.token != token
+                    || previous.operation_id != expired.operation_id()
+                    || previous.session_generation != expired.session_generation()
+                {
+                    *active_undercover_deadline = Some(previous);
+                    return Ok(());
+                }
+                let outcome_operation = operation_ids.allocate().map_err(|error| {
+                    BusinessRuntimeError::UndercoverOperationFailed(error.to_string())
+                })?;
+                if let Some(outcome) = undercover
+                    .handle_deadline(*expired.token().kind(), Instant::now(), outcome_operation)
+                    .map_err(undercover_operation_failed)?
+                {
+                    pending_undercover_outcomes.push_back(outcome);
+                }
+                return sync_undercover_deadline(
+                    undercover,
+                    timer,
+                    active_undercover_deadline,
+                    pending_undercover_cancellations,
+                    operation_ids,
+                    Instant::now(),
+                    clock_active,
+                );
+            }
+            TimerRuntimeEvent::CommandCompleted(completed) => {
+                let token = BusinessDeadlineToken::from(completed.token().clone());
+                if completed.command() == TimerCommandKind::Cancel {
+                    let Some(index) = pending_undercover_cancellations.iter().position(|pending| {
+                        pending.token == token
+                            && pending.operation_id == completed.operation_id()
+                            && pending.session_generation == completed.session_generation()
+                    }) else {
+                        return Ok(());
+                    };
+                    let previous = pending_undercover_cancellations.remove(index);
+                    if completed.result().is_err() {
+                        if active_undercover_deadline.is_none() {
+                            *active_undercover_deadline = Some(previous);
+                        } else {
+                            let Some(timer) = timer else {
+                                return Ok(());
+                            };
+                            timer
+                                .cancel(DeadlineCancellation::new(
+                                    previous.token.clone(),
+                                    previous.operation_id,
+                                    previous.session_generation,
+                                ))
+                                .map_err(|error| {
+                                    BusinessRuntimeError::TimerOperationFailed(error.to_string())
+                                })?;
+                            pending_undercover_cancellations.push(previous);
+                        }
+                    }
+                    return sync_undercover_deadline(
+                        undercover,
+                        timer,
+                        active_undercover_deadline,
+                        pending_undercover_cancellations,
+                        operation_ids,
+                        Instant::now(),
+                        clock_active,
+                    );
+                }
+                let Some(active) = active_undercover_deadline.as_ref() else {
+                    return Ok(());
+                };
+                if active.token != token
+                    || active.operation_id != completed.operation_id()
+                    || active.session_generation != completed.session_generation()
+                {
+                    return Ok(());
+                }
+                if completed.result().is_err() {
+                    *active_undercover_deadline = None;
+                    return sync_undercover_deadline(
+                        undercover,
+                        timer,
+                        active_undercover_deadline,
+                        pending_undercover_cancellations,
+                        operation_ids,
+                        Instant::now(),
+                        clock_active,
+                    );
+                }
+                return Ok(());
+            }
+        }
+    }
     if let BusinessDeadlineEvent::CardGame(timer_event) = &event {
         match timer_event {
             TimerRuntimeEvent::DeadlineExpired(expired) => {
@@ -852,19 +1688,35 @@ fn handle_business_timer(
                     }) else {
                         return Ok(());
                     };
-                    pending_card_game_cancellations.remove(index);
+                    let previous = pending_card_game_cancellations.remove(index);
                     if completed.result().is_err() {
-                        return sync_card_game_deadline(
-                            card_games,
-                            timer,
-                            active_card_game_deadline,
-                            pending_card_game_cancellations,
-                            operation_ids,
-                            Instant::now(),
-                            clock_active,
-                        );
+                        if active_card_game_deadline.is_none() {
+                            *active_card_game_deadline = Some(previous);
+                        } else {
+                            let Some(timer) = timer else {
+                                return Ok(());
+                            };
+                            timer
+                                .cancel(DeadlineCancellation::new(
+                                    previous.token.clone(),
+                                    previous.operation_id,
+                                    previous.session_generation,
+                                ))
+                                .map_err(|error| {
+                                    BusinessRuntimeError::TimerOperationFailed(error.to_string())
+                                })?;
+                            pending_card_game_cancellations.push(previous);
+                        }
                     }
-                    return Ok(());
+                    return sync_card_game_deadline(
+                        card_games,
+                        timer,
+                        active_card_game_deadline,
+                        pending_card_game_cancellations,
+                        operation_ids,
+                        Instant::now(),
+                        clock_active,
+                    );
                 }
 
                 let Some(active) = active_card_game_deadline.as_ref() else {
@@ -927,16 +1779,26 @@ fn run_business_runtime(
     receiver: Receiver<RuntimeMessage>,
     mut idiom_chain: IdiomChainService,
     mut card_games: CardGameService,
+    mut undercover: UndercoverRuntimeService,
+    turtle_soup: Option<TurtleSoupService>,
     timer: Option<TimerRuntimeHandle<BusinessDeadlineToken>>,
 ) {
     let mut snapshot = BusinessRuntimeSnapshot::default();
     let mut active_idiom_deadline = None;
     let mut active_card_game_deadline = None;
+    let mut active_undercover_deadline = None;
+    let mut active_turtle_soup_deadline = None;
     let mut pending_card_game_cancellations = Vec::new();
+    let mut pending_undercover_cancellations = Vec::new();
+    let mut pending_turtle_soup_cancellations = Vec::new();
     let mut pending_card_game_outcomes = std::collections::VecDeque::new();
+    let mut pending_undercover_outcomes = std::collections::VecDeque::new();
     let mut card_game_clock_active = true;
     let operation_ids = BusinessOperationIdAllocator::new();
     let mut session_generation = SessionGeneration::INITIAL;
+    if let Some(service) = turtle_soup.as_ref() {
+        service.start_workers();
+    }
     while let Ok(message) = receiver.recv() {
         match message {
             RuntimeMessage::Event(event) => {
@@ -946,11 +1808,18 @@ fn run_business_runtime(
                         timer_event.clone(),
                         &mut idiom_chain,
                         &mut card_games,
+                        &mut undercover,
+                        turtle_soup.as_ref(),
                         timer.as_ref(),
                         &mut active_idiom_deadline,
                         &mut active_card_game_deadline,
+                        &mut active_undercover_deadline,
+                        &mut active_turtle_soup_deadline,
                         &mut pending_card_game_cancellations,
+                        &mut pending_undercover_cancellations,
+                        &mut pending_turtle_soup_cancellations,
                         &mut pending_card_game_outcomes,
+                        &mut pending_undercover_outcomes,
                         &operation_ids,
                         &mut session_generation,
                         card_game_clock_active,
@@ -1047,6 +1916,59 @@ fn run_business_runtime(
                     log::error!("业务运行时处理牌局消息失败: {error}");
                 }
             }
+            RuntimeMessage::Undercover(message) => {
+                if let Err(error) = handle_undercover_message(
+                    &mut undercover,
+                    message,
+                    timer.as_ref(),
+                    &mut active_undercover_deadline,
+                    &mut pending_undercover_cancellations,
+                    &operation_ids,
+                    &mut pending_undercover_outcomes,
+                    &mut card_game_clock_active,
+                ) {
+                    log::error!("业务运行时处理谁是卧底消息失败: {error}");
+                }
+            }
+            RuntimeMessage::UndercoverSnapshot(response) => {
+                let _ = response.send(Ok(undercover.snapshot(Instant::now())));
+            }
+            RuntimeMessage::TurtleSoup(message) => {
+                if let Err(error) = handle_turtle_soup_message(
+                    turtle_soup.as_ref(),
+                    message,
+                    timer.as_ref(),
+                    &mut active_turtle_soup_deadline,
+                    &mut pending_turtle_soup_cancellations,
+                    &operation_ids,
+                    card_game_clock_active,
+                ) {
+                    log::error!("业务运行时处理海龟汤消息失败: {error}");
+                }
+            }
+            RuntimeMessage::RefreshTurtleSoup {
+                now,
+                clock_active,
+                response,
+            } => {
+                let result = sync_turtle_soup_deadline(
+                    turtle_soup.as_ref(),
+                    timer.as_ref(),
+                    &mut active_turtle_soup_deadline,
+                    &mut pending_turtle_soup_cancellations,
+                    &operation_ids,
+                    now,
+                    clock_active,
+                );
+                let _ = response.send(result);
+            }
+            RuntimeMessage::TurtleSoupSnapshot(response) => {
+                let result = turtle_soup
+                    .as_ref()
+                    .map(|service| service.snapshot())
+                    .ok_or(BusinessRuntimeError::RuntimeStopped);
+                let _ = response.send(result);
+            }
             RuntimeMessage::Snapshot(response) => {
                 let _ = response.send(snapshot);
             }
@@ -1054,13 +1976,20 @@ fn run_business_runtime(
                 abort_business_modules(
                     &mut idiom_chain,
                     &mut card_games,
+                    &mut undercover,
+                    turtle_soup.as_ref(),
                     timer.as_ref(),
                     &mut active_idiom_deadline,
                     &mut active_card_game_deadline,
+                    &mut active_undercover_deadline,
+                    &mut active_turtle_soup_deadline,
                     &mut pending_card_game_cancellations,
+                    &mut pending_undercover_cancellations,
+                    &mut pending_turtle_soup_cancellations,
                     &operation_ids,
                     &mut session_generation,
                     &mut pending_card_game_outcomes,
+                    &mut pending_undercover_outcomes,
                     card_game_clock_active,
                 );
                 snapshot.quiescing = true;
@@ -1070,13 +1999,20 @@ fn run_business_runtime(
                 abort_business_modules(
                     &mut idiom_chain,
                     &mut card_games,
+                    &mut undercover,
+                    turtle_soup.as_ref(),
                     timer.as_ref(),
                     &mut active_idiom_deadline,
                     &mut active_card_game_deadline,
+                    &mut active_undercover_deadline,
+                    &mut active_turtle_soup_deadline,
                     &mut pending_card_game_cancellations,
+                    &mut pending_undercover_cancellations,
+                    &mut pending_turtle_soup_cancellations,
                     &operation_ids,
                     &mut session_generation,
                     &mut pending_card_game_outcomes,
+                    &mut pending_undercover_outcomes,
                     card_game_clock_active,
                 );
                 let _ = response.send(snapshot);
@@ -1086,16 +2022,24 @@ fn run_business_runtime(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn abort_business_modules(
     idiom_chain: &mut IdiomChainService,
     card_games: &mut CardGameService,
+    undercover: &mut UndercoverRuntimeService,
+    turtle_soup: Option<&TurtleSoupService>,
     timer: Option<&TimerRuntimeHandle<BusinessDeadlineToken>>,
     active_idiom_deadline: &mut Option<ActiveIdiomDeadline>,
     active_card_game_deadline: &mut Option<ActiveCardGameDeadline>,
+    active_undercover_deadline: &mut Option<ActiveUndercoverDeadline>,
+    active_turtle_soup_deadline: &mut Option<ActiveTurtleSoupDeadline>,
     pending_card_game_cancellations: &mut Vec<ActiveCardGameDeadline>,
+    pending_undercover_cancellations: &mut Vec<ActiveUndercoverDeadline>,
+    pending_turtle_soup_cancellations: &mut Vec<ActiveTurtleSoupDeadline>,
     operation_ids: &BusinessOperationIdAllocator,
     session_generation: &mut SessionGeneration,
     pending_card_game_outcomes: &mut std::collections::VecDeque<CardGameTimedOutcome>,
+    pending_undercover_outcomes: &mut std::collections::VecDeque<UndercoverTimedOutcome>,
     clock_active: bool,
 ) {
     if let Err(error) = card_games.abort() {
@@ -1103,6 +2047,11 @@ fn abort_business_modules(
     }
     if let Err(error) = idiom_chain.abort() {
         log::error!("业务运行时关闭时无法中止成语接龙: {error:#}");
+    }
+    let _ = undercover.abort();
+    if let Some(turtle_soup) = turtle_soup {
+        turtle_soup.abort_for_context_loss("业务运行时关闭");
+        turtle_soup.shutdown();
     }
     if let Err(error) = sync_idiom_deadline(
         idiom_chain,
@@ -1124,10 +2073,36 @@ fn abort_business_modules(
     ) {
         log::error!("业务运行时关闭时无法撤销牌局期限: {error}");
     }
+    if let Err(error) = sync_undercover_deadline(
+        undercover,
+        timer,
+        active_undercover_deadline,
+        pending_undercover_cancellations,
+        operation_ids,
+        Instant::now(),
+        clock_active,
+    ) {
+        log::error!("业务运行时关闭时无法撤销谁是卧底期限: {error}");
+    }
+    if let Err(error) = sync_turtle_soup_deadline(
+        turtle_soup,
+        timer,
+        active_turtle_soup_deadline,
+        pending_turtle_soup_cancellations,
+        operation_ids,
+        Instant::now(),
+        clock_active,
+    ) {
+        log::error!("业务运行时关闭时无法撤销海龟汤期限: {error}");
+    }
     pending_card_game_outcomes.clear();
     pending_card_game_cancellations.clear();
+    pending_undercover_outcomes.clear();
+    pending_undercover_cancellations.clear();
+    pending_turtle_soup_cancellations.clear();
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_card_game_message(
     card_games: &mut CardGameService,
     message: CardGameRuntimeMessage,
@@ -1279,12 +2254,371 @@ fn handle_card_game_message(
     Ok(())
 }
 
+fn handle_turtle_soup_message(
+    turtle_soup: Option<&TurtleSoupService>,
+    message: TurtleSoupRuntimeMessage,
+    timer: Option<&TimerRuntimeHandle<BusinessDeadlineToken>>,
+    active_deadline: &mut Option<ActiveTurtleSoupDeadline>,
+    pending_cancellations: &mut Vec<ActiveTurtleSoupDeadline>,
+    operation_ids: &BusinessOperationIdAllocator,
+    clock_active: bool,
+) -> Result<(), BusinessRuntimeError> {
+    let Some(service) = turtle_soup else {
+        match message {
+            TurtleSoupRuntimeMessage::HallCommand { response, .. }
+            | TurtleSoupRuntimeMessage::FriendCommand { response, .. } => {
+                let _ = response.send(TurtleSoupCommandOutcome {
+                    action: "unavailable",
+                    immediate_reply: Some("海龟汤运行时不可用".to_string()),
+                });
+            }
+            TurtleSoupRuntimeMessage::StartRandom { response }
+            | TurtleSoupRuntimeMessage::StartById { response, .. } => {
+                let _ = response.send(Err(BusinessRuntimeError::RuntimeStopped));
+            }
+            TurtleSoupRuntimeMessage::End { response } => {
+                let _ = response.send(Err(BusinessRuntimeError::RuntimeStopped));
+            }
+            TurtleSoupRuntimeMessage::FilterPrimary { response, .. } => {
+                let _ = response.send(Vec::new());
+            }
+            TurtleSoupRuntimeMessage::StabilizeSecondary { response, .. } => {
+                let _ = response.send(SecondaryOcrStability::Pending);
+            }
+            TurtleSoupRuntimeMessage::ClearSecondary
+            | TurtleSoupRuntimeMessage::Abort { .. }
+            | TurtleSoupRuntimeMessage::DeliverySuccess { .. }
+            | TurtleSoupRuntimeMessage::DeliveryFailure { .. } => {}
+            TurtleSoupRuntimeMessage::Accepts(response) => {
+                let _ = response.send(false);
+            }
+            TurtleSoupRuntimeMessage::Submit { response, .. } => {
+                let _ = response.send(Err(BusinessRuntimeError::RuntimeStopped));
+            }
+            TurtleSoupRuntimeMessage::DeliveryCurrent { response, .. } => {
+                let _ = response.send(false);
+            }
+        }
+        return Ok(());
+    };
+
+    match message {
+        TurtleSoupRuntimeMessage::HallCommand {
+            player,
+            command,
+            response,
+        } => {
+            let outcome = service.handle_hall_command(&player, &command);
+            if let Err(error) = sync_turtle_soup_deadline(
+                Some(service),
+                timer,
+                active_deadline,
+                pending_cancellations,
+                operation_ids,
+                Instant::now(),
+                clock_active,
+            ) {
+                log::error!("处理海龟汤大厅命令后同步期限失败: {error}");
+            }
+            let _ = response.send(outcome);
+        }
+        TurtleSoupRuntimeMessage::FriendCommand {
+            player,
+            command,
+            response,
+        } => {
+            let outcome = service.handle_friend_command(&player, &command);
+            if let Err(error) = sync_turtle_soup_deadline(
+                Some(service),
+                timer,
+                active_deadline,
+                pending_cancellations,
+                operation_ids,
+                Instant::now(),
+                clock_active,
+            ) {
+                log::error!("处理海龟汤好友命令后同步期限失败: {error}");
+            }
+            let _ = response.send(outcome);
+        }
+        TurtleSoupRuntimeMessage::StartRandom { response } => {
+            let result = service
+                .start_random_from_web()
+                .map_err(turtle_soup_operation_failed)
+                .and_then(|()| {
+                    sync_turtle_soup_deadline(
+                        Some(service),
+                        timer,
+                        active_deadline,
+                        pending_cancellations,
+                        operation_ids,
+                        Instant::now(),
+                        clock_active,
+                    )
+                });
+            let _ = response.send(result);
+        }
+        TurtleSoupRuntimeMessage::StartById { id, response } => {
+            let result = service
+                .start_by_id_from_web(&id)
+                .map_err(turtle_soup_operation_failed)
+                .and_then(|()| {
+                    sync_turtle_soup_deadline(
+                        Some(service),
+                        timer,
+                        active_deadline,
+                        pending_cancellations,
+                        operation_ids,
+                        Instant::now(),
+                        clock_active,
+                    )
+                });
+            let _ = response.send(result);
+        }
+        TurtleSoupRuntimeMessage::End { response } => {
+            let result = service
+                .end_from_web()
+                .map_err(turtle_soup_operation_failed)
+                .and_then(|ended| {
+                    sync_turtle_soup_deadline(
+                        Some(service),
+                        timer,
+                        active_deadline,
+                        pending_cancellations,
+                        operation_ids,
+                        Instant::now(),
+                        clock_active,
+                    )?;
+                    Ok(ended)
+                });
+            let _ = response.send(result);
+        }
+        TurtleSoupRuntimeMessage::FilterPrimary {
+            visible,
+            suppress_new,
+            response,
+        } => {
+            let _ = response.send(service.filter_new_primary_questions(visible, suppress_new));
+        }
+        TurtleSoupRuntimeMessage::StabilizeSecondary {
+            observations,
+            response,
+        } => {
+            let _ = response.send(service.stabilize_secondary_ocr(observations));
+        }
+        TurtleSoupRuntimeMessage::ClearSecondary => service.clear_secondary_ocr_stability(),
+        TurtleSoupRuntimeMessage::Accepts(response) => {
+            let _ = response.send(service.accepts_questions());
+        }
+        TurtleSoupRuntimeMessage::Submit { question, response } => {
+            let result = service
+                .submit_question(question)
+                .map_err(turtle_soup_operation_failed)
+                .and_then(|outcome| {
+                    sync_turtle_soup_deadline(
+                        Some(service),
+                        timer,
+                        active_deadline,
+                        pending_cancellations,
+                        operation_ids,
+                        Instant::now(),
+                        clock_active,
+                    )?;
+                    Ok(outcome)
+                });
+            let _ = response.send(result);
+        }
+        TurtleSoupRuntimeMessage::Abort { reason } => {
+            service.abort_for_context_loss(&reason);
+            sync_turtle_soup_deadline(
+                Some(service),
+                timer,
+                active_deadline,
+                pending_cancellations,
+                operation_ids,
+                Instant::now(),
+                clock_active,
+            )?;
+        }
+        TurtleSoupRuntimeMessage::DeliveryCurrent { delivery, response } => {
+            let _ = response.send(service.delivery_is_current(delivery));
+        }
+        TurtleSoupRuntimeMessage::DeliverySuccess { delivery } => {
+            service.handle_delivery_success(delivery);
+            sync_turtle_soup_deadline(
+                Some(service),
+                timer,
+                active_deadline,
+                pending_cancellations,
+                operation_ids,
+                Instant::now(),
+                clock_active,
+            )?;
+        }
+        TurtleSoupRuntimeMessage::DeliveryFailure { delivery, error } => {
+            let error = anyhow::anyhow!(error);
+            service.handle_delivery_failure(delivery, &error);
+            sync_turtle_soup_deadline(
+                Some(service),
+                timer,
+                active_deadline,
+                pending_cancellations,
+                operation_ids,
+                Instant::now(),
+                clock_active,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_undercover_message(
+    undercover: &mut UndercoverRuntimeService,
+    message: UndercoverRuntimeMessage,
+    timer: Option<&TimerRuntimeHandle<BusinessDeadlineToken>>,
+    active_deadline: &mut Option<ActiveUndercoverDeadline>,
+    pending_cancellations: &mut Vec<ActiveUndercoverDeadline>,
+    operation_ids: &BusinessOperationIdAllocator,
+    pending_outcomes: &mut std::collections::VecDeque<UndercoverTimedOutcome>,
+    clock_active: &mut bool,
+) -> Result<(), BusinessRuntimeError> {
+    match message {
+        UndercoverRuntimeMessage::Begin {
+            player,
+            source,
+            command,
+            now,
+            response,
+        } => {
+            let operation_id = operation_ids.allocate().map_err(|error| {
+                BusinessRuntimeError::UndercoverOperationFailed(error.to_string())
+            })?;
+            let result = undercover
+                .begin_command(&player, source, &command, now, operation_id)
+                .map_err(undercover_operation_failed)
+                .and_then(|result| {
+                    sync_undercover_deadline(
+                        undercover,
+                        timer,
+                        active_deadline,
+                        pending_cancellations,
+                        operation_ids,
+                        now,
+                        *clock_active,
+                    )?;
+                    Ok(result)
+                });
+            let _ = response.send(result);
+        }
+        UndercoverRuntimeMessage::Claim { key, response } => {
+            let result = undercover
+                .claim(key)
+                .map_err(undercover_operation_failed)
+                .and_then(|result| {
+                    sync_undercover_deadline(
+                        undercover,
+                        timer,
+                        active_deadline,
+                        pending_cancellations,
+                        operation_ids,
+                        Instant::now(),
+                        *clock_active,
+                    )?;
+                    Ok(result)
+                });
+            let _ = response.send(result);
+        }
+        UndercoverRuntimeMessage::Resume {
+            key,
+            result: effect_result,
+            response,
+        } => {
+            let result = undercover
+                .resume(key, effect_result)
+                .map_err(undercover_operation_failed)
+                .and_then(|result| {
+                    sync_undercover_deadline(
+                        undercover,
+                        timer,
+                        active_deadline,
+                        pending_cancellations,
+                        operation_ids,
+                        Instant::now(),
+                        *clock_active,
+                    )?;
+                    Ok(result)
+                });
+            let _ = response.send(result);
+        }
+        UndercoverRuntimeMessage::Cancel { key, response } => {
+            let result = undercover
+                .cancel(key)
+                .map_err(undercover_operation_failed)
+                .and_then(|result| {
+                    sync_undercover_deadline(
+                        undercover,
+                        timer,
+                        active_deadline,
+                        pending_cancellations,
+                        operation_ids,
+                        Instant::now(),
+                        *clock_active,
+                    )?;
+                    Ok(result)
+                });
+            let _ = response.send(result);
+        }
+        UndercoverRuntimeMessage::Poll {
+            now,
+            clock_active: requested_clock_active,
+            response,
+        } => {
+            *clock_active = requested_clock_active;
+            let result = sync_undercover_deadline(
+                undercover,
+                timer,
+                active_deadline,
+                pending_cancellations,
+                operation_ids,
+                now,
+                requested_clock_active,
+            )
+            .map(|()| pending_outcomes.pop_front());
+            let _ = response.send(result);
+        }
+        UndercoverRuntimeMessage::Abort(response) => {
+            let aborted = undercover.abort();
+            let result = sync_undercover_deadline(
+                undercover,
+                timer,
+                active_deadline,
+                pending_cancellations,
+                operation_ids,
+                Instant::now(),
+                *clock_active,
+            )
+            .map(|()| aborted);
+            let _ = response.send(result);
+        }
+    }
+    Ok(())
+}
+
 fn idiom_chain_operation_failed(error: anyhow::Error) -> BusinessRuntimeError {
     BusinessRuntimeError::IdiomChainOperationFailed(format!("{error:#}"))
 }
 
 fn card_game_operation_failed(error: anyhow::Error) -> BusinessRuntimeError {
     BusinessRuntimeError::CardGameOperationFailed(format!("{error:#}"))
+}
+
+fn undercover_operation_failed(error: anyhow::Error) -> BusinessRuntimeError {
+    BusinessRuntimeError::UndercoverOperationFailed(format!("{error:#}"))
+}
+
+fn turtle_soup_operation_failed(error: anyhow::Error) -> BusinessRuntimeError {
+    BusinessRuntimeError::TurtleSoupOperationFailed(format!("{error:#}"))
 }
 
 #[cfg(test)]
@@ -1309,7 +2643,7 @@ mod tests {
     use crate::observation::shared::{ObservationGapKind, SharedObservationStream};
     use crate::runtime::deadline::{BusinessDeadlineEvent, BusinessDeadlineToken};
     use crate::runtime::identity::{BusinessOperationId, SessionGeneration};
-    use crate::runtime::timer::{DeadlineSchedule, TimerCore, TimerRuntimeEvent};
+    use crate::runtime::timer::{DeadlineSchedule, TimerCore, TimerRuntime, TimerRuntimeEvent};
 
     fn idiom_service(
         entertainment: EntertainmentCoordinator,
@@ -1869,19 +3203,32 @@ mod tests {
         let mut next_generation = session_generation;
         let mut card_games =
             CardGameService::new(LandlordConfig::default(), EntertainmentCoordinator::new());
+        let mut undercover = default_undercover_service();
+        let mut turtle_active = None;
         let mut card_active = None;
+        let mut undercover_active = None;
+        let mut pending_turtle_cancellations = Vec::new();
         let mut pending_card_cancellations = Vec::new();
+        let mut pending_undercover_cancellations = Vec::new();
         let mut pending_card_outcomes = std::collections::VecDeque::new();
+        let mut pending_undercover_outcomes = std::collections::VecDeque::new();
 
         handle_business_timer(
             event,
             &mut idiom_chain,
             &mut card_games,
+            &mut undercover,
+            None,
             None,
             &mut active,
             &mut card_active,
+            &mut undercover_active,
+            &mut turtle_active,
             &mut pending_card_cancellations,
+            &mut pending_undercover_cancellations,
+            &mut pending_turtle_cancellations,
             &mut pending_card_outcomes,
+            &mut pending_undercover_outcomes,
             &operation_ids,
             &mut next_generation,
             true,
@@ -1891,6 +3238,43 @@ mod tests {
         assert!(active.is_none());
         assert_eq!(entertainment.active(), None);
         assert_eq!(idiom_chain.idle_deadline(), None);
+    }
+
+    #[test]
+    fn card_deadline_cancel_submission_failure_restores_the_old_deadline() {
+        let (event_sender, _event_receiver) = mpsc::sync_channel(4);
+        let timer_runtime = TimerRuntime::start(4, event_sender).unwrap();
+        let timer = timer_runtime.handle();
+        let entertainment = EntertainmentCoordinator::new();
+        let card_games = CardGameService::new(LandlordConfig::default(), entertainment);
+        let previous = ActiveCardGameDeadline {
+            token: card_game_deadline_token(CardGameDeadlineKind::LobbyExpiry),
+            operation_id: BusinessOperationId::new(17),
+            session_generation: SessionGeneration::INITIAL,
+            deadline: Instant::now(),
+        };
+        let mut active = Some(previous.clone());
+        let mut pending = Vec::new();
+        let operation_ids = BusinessOperationIdAllocator::new();
+
+        timer_runtime.shutdown().unwrap();
+        let result = sync_card_game_deadline(
+            &card_games,
+            Some(&timer),
+            &mut active,
+            &mut pending,
+            &operation_ids,
+            Instant::now(),
+            true,
+        );
+
+        assert!(matches!(
+            result,
+            Err(BusinessRuntimeError::TimerOperationFailed(message))
+                if message.contains("timer runtime is stopped")
+        ));
+        assert_eq!(active, Some(previous));
+        assert!(pending.is_empty());
     }
 
     #[test]

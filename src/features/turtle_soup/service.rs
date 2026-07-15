@@ -3,8 +3,9 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -298,37 +299,101 @@ pub(crate) struct TurtleSoupSnapshot {
     pub last_error: Option<String>,
 }
 
-#[derive(Clone)]
+impl Default for TurtleSoupSnapshot {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            phase: TurtleSoupPhase::Idle,
+            phase_label: TurtleSoupPhase::Idle.label().to_string(),
+            generation: 0,
+            puzzle_id: None,
+            title: None,
+            surface: None,
+            starter: None,
+            elapsed_seconds: 0,
+            participant_count: 0,
+            participants: Vec::new(),
+            question_count: 0,
+            pending_ai: 0,
+            remaining_puzzles: None,
+            recent_judgments: Vec::new(),
+            settlement_incomplete: false,
+            last_error: None,
+        }
+    }
+}
+
 pub(crate) struct TurtleSoupService {
     config: TurtleSoupConfig,
     bank: TurtleSoupBankStore,
     openai: OpenAiRuntimeHandle,
     entertainment: EntertainmentCoordinator,
     delivery: Arc<dyn TurtleSoupDeliveryPort>,
-    state: Arc<Mutex<TurtleSoupState>>,
-    work: Arc<(Mutex<TurtleSoupWorkQueue>, Condvar)>,
-    operation: Arc<Mutex<()>>,
-    workers_started: Arc<AtomicBool>,
-    shutting_down: Arc<AtomicBool>,
-    workers: Arc<Mutex<Vec<thread::JoinHandle<()>>>>,
+    state: TurtleSoupState,
+    worker_sender: SyncSender<TurtleSoupJob>,
+    worker_receiver: Option<Arc<Mutex<Receiver<TurtleSoupJob>>>>,
+    cancelled_through: Arc<AtomicU64>,
 }
 
-#[derive(Clone)]
+pub(crate) struct TurtleSoupWorkerRuntime {
+    shutting_down: Arc<AtomicBool>,
+    workers: Vec<thread::JoinHandle<()>>,
+}
+
 struct TurtleSoupWorker {
     config: TurtleSoupConfig,
     openai: OpenAiRuntimeHandle,
-    work: Arc<(Mutex<TurtleSoupWorkQueue>, Condvar)>,
+    receiver: Arc<Mutex<Receiver<TurtleSoupJob>>>,
     shutting_down: Arc<AtomicBool>,
+    cancelled_through: Arc<AtomicU64>,
 }
 
-impl TurtleSoupWorker {
-    fn from_service(service: &TurtleSoupService) -> Self {
-        Self {
-            config: service.config.clone(),
-            openai: service.openai.clone(),
-            work: service.work.clone(),
-            shutting_down: service.shutting_down.clone(),
+impl TurtleSoupWorkerRuntime {
+    fn start(
+        config: TurtleSoupConfig,
+        openai: OpenAiRuntimeHandle,
+        receiver: Arc<Mutex<Receiver<TurtleSoupJob>>>,
+        cancelled_through: Arc<AtomicU64>,
+        completion_port: Arc<dyn TurtleSoupAiCompletionPort>,
+    ) -> Self {
+        let worker_count = config.max_concurrency.max(1);
+        let shutting_down = Arc::new(AtomicBool::new(false));
+        let mut workers = Vec::with_capacity(worker_count);
+        for index in 0..worker_count {
+            let worker = TurtleSoupWorker {
+                config: config.clone(),
+                openai: openai.clone(),
+                receiver: receiver.clone(),
+                shutting_down: shutting_down.clone(),
+                cancelled_through: cancelled_through.clone(),
+            };
+            let completion_port = completion_port.clone();
+            workers.push(thread::spawn(move || {
+                worker.run(index + 1, completion_port)
+            }));
         }
+        log::info!("海龟汤 AI Worker 已启动: concurrency={}", worker_count);
+        Self {
+            shutting_down,
+            workers,
+        }
+    }
+
+    pub(crate) fn shutdown(&mut self) {
+        if self.shutting_down.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        for worker in self.workers.drain(..) {
+            if worker.join().is_err() {
+                log::error!("海龟汤 AI Worker 退出时 panic");
+            }
+        }
+    }
+}
+
+impl Drop for TurtleSoupWorkerRuntime {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -379,11 +444,6 @@ struct TurtleSoupSession {
 #[derive(Default)]
 struct TurtleSoupBatchDraft {
     parts: BTreeMap<usize, String>,
-}
-
-#[derive(Default)]
-struct TurtleSoupWorkQueue {
-    waiting: VecDeque<TurtleSoupJob>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -749,18 +809,17 @@ impl TurtleSoupService {
             .max(BUILTIN_OCR_STABILITY_COUNT);
         config.content_stable_count = config.content_stable_count.max(BUILTIN_OCR_STABILITY_COUNT);
         let bank = TurtleSoupBankStore::new(config.question_bank_path.clone());
+        let (worker_sender, worker_receiver) = mpsc::sync_channel(config.max_pending.max(1));
         Self {
             config,
             bank,
             openai,
             entertainment,
             delivery: Arc::new(delivery),
-            state: Arc::new(Mutex::new(TurtleSoupState::default())),
-            work: Arc::new((Mutex::new(TurtleSoupWorkQueue::default()), Condvar::new())),
-            operation: Arc::new(Mutex::new(())),
-            workers_started: Arc::new(AtomicBool::new(false)),
-            shutting_down: Arc::new(AtomicBool::new(false)),
-            workers: Arc::new(Mutex::new(Vec::new())),
+            state: TurtleSoupState::default(),
+            worker_sender,
+            worker_receiver: Some(Arc::new(Mutex::new(worker_receiver))),
+            cancelled_through: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -772,82 +831,29 @@ impl TurtleSoupService {
     }
 
     #[cfg(test)]
-    pub(crate) fn start_workers(&self) {
-        self.start_workers_with_port(Arc::new(DiscardedAiCompletionPort));
+    pub(crate) fn start_workers(&mut self) -> Option<TurtleSoupWorkerRuntime> {
+        self.start_workers_with_port(Arc::new(DiscardedAiCompletionPort))
     }
 
     pub(crate) fn start_workers_with_port(
-        &self,
+        &mut self,
         completion_port: Arc<dyn TurtleSoupAiCompletionPort>,
-    ) {
-        if !self.config.enabled
-            || self.shutting_down.load(Ordering::SeqCst)
-            || self
-                .workers_started
-                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                .is_err()
-        {
-            return;
+    ) -> Option<TurtleSoupWorkerRuntime> {
+        if !self.config.enabled {
+            return None;
         }
-        let worker_count = self.config.max_concurrency.max(1);
-        let Ok(mut workers) = self.workers.lock() else {
-            log::error!("海龟汤 AI Worker 句柄锁已损坏，无法启动");
-            self.shutting_down.store(true, Ordering::SeqCst);
-            return;
-        };
-        for index in 0..worker_count {
-            let worker = TurtleSoupWorker::from_service(self);
-            let completion_port = completion_port.clone();
-            workers.push(thread::spawn(move || {
-                worker.run(index + 1, completion_port)
-            }));
-        }
-        drop(workers);
-        log::info!("海龟汤 AI Worker 已启动: concurrency={}", worker_count);
-    }
-
-    pub(crate) fn shutdown(&self) {
-        if self.shutting_down.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        let (_, cvar) = &*self.work;
-        cvar.notify_all();
-        let workers = match self.workers.lock() {
-            Ok(mut workers) => std::mem::take(&mut *workers),
-            Err(_) => {
-                log::error!("海龟汤 AI Worker 句柄锁已损坏，无法等待退出");
-                return;
-            }
-        };
-        for worker in workers {
-            if worker.join().is_err() {
-                log::error!("海龟汤 AI Worker 退出时 panic");
-            }
-        }
+        let receiver = self.worker_receiver.take()?;
+        Some(TurtleSoupWorkerRuntime::start(
+            self.config.clone(),
+            self.openai.clone(),
+            receiver,
+            self.cancelled_through.clone(),
+            completion_port,
+        ))
     }
 
     pub(crate) fn snapshot(&self) -> TurtleSoupSnapshot {
-        let Ok(state) = self.state.lock() else {
-            return TurtleSoupSnapshot {
-                enabled: self.config.enabled,
-                phase: TurtleSoupPhase::Idle,
-                phase_label: "状态不可用".to_string(),
-                generation: 0,
-                puzzle_id: None,
-                title: None,
-                surface: None,
-                starter: None,
-                elapsed_seconds: 0,
-                participant_count: 0,
-                participants: Vec::new(),
-                question_count: 0,
-                pending_ai: 0,
-                remaining_puzzles: None,
-                recent_judgments: Vec::new(),
-                settlement_incomplete: false,
-                last_error: Some("海龟汤状态锁已损坏".to_string()),
-            };
-        };
+        let state = &self.state;
         let session = state.session.as_ref();
         let elapsed_seconds = session
             .and_then(|session| session.active_at.or(Some(session.selected_at)))
@@ -879,14 +885,11 @@ impl TurtleSoupService {
     }
 
     pub(crate) fn session_generation(&self) -> SessionGeneration {
-        self.state
-            .lock()
-            .map(|state| SessionGeneration::new(state.generation))
-            .unwrap_or(SessionGeneration::INITIAL)
+        SessionGeneration::new(self.state.generation)
     }
 
     pub(crate) fn handle_hall_command(
-        &self,
+        &mut self,
         player: &str,
         command: &TurtleSoupCommand,
     ) -> TurtleSoupCommandOutcome {
@@ -904,7 +907,7 @@ impl TurtleSoupService {
     }
 
     pub(crate) fn handle_friend_command(
-        &self,
+        &mut self,
         player: &str,
         command: &TurtleSoupCommand,
     ) -> TurtleSoupCommandOutcome {
@@ -930,11 +933,11 @@ impl TurtleSoupService {
         }
     }
 
-    pub(crate) fn start_random_from_web(&self) -> Result<()> {
+    pub(crate) fn start_random_from_web(&mut self) -> Result<()> {
         self.start_new("Web控制台", None)
     }
 
-    pub(crate) fn start_by_id_from_web(&self, id: &str) -> Result<()> {
+    pub(crate) fn start_by_id_from_web(&mut self, id: &str) -> Result<()> {
         let id = id.trim();
         if id.is_empty() {
             bail!("题目 ID 不能为空");
@@ -942,20 +945,16 @@ impl TurtleSoupService {
         self.start_new("Web控制台", Some(id))
     }
 
-    pub(crate) fn end_from_web(&self) -> Result<bool> {
+    pub(crate) fn end_from_web(&mut self) -> Result<bool> {
         self.begin_settlement(SettlementReason::Web)
     }
 
     pub(crate) fn filter_new_primary_questions(
-        &self,
+        &mut self,
         visible: Vec<TurtleSoupQuestion>,
         suppress_new: bool,
     ) -> Vec<TurtleSoupQuestion> {
-        let Ok(mut state) = self.state.lock() else {
-            log::error!("海龟汤状态锁已损坏，无法更新一级提问 OCR 稳定状态");
-            return Vec::new();
-        };
-        state.primary_ocr_stability.observe(
+        self.state.primary_ocr_stability.observe(
             visible,
             suppress_new,
             self.config.nickname_stable_count,
@@ -964,51 +963,36 @@ impl TurtleSoupService {
     }
 
     pub(crate) fn stabilize_secondary_ocr(
-        &self,
+        &mut self,
         visible: Vec<SecondaryOcrObservation>,
     ) -> SecondaryOcrStability {
-        let Ok(mut state) = self.state.lock() else {
-            log::error!("海龟汤状态锁已损坏，无法更新二级提问 OCR 稳定状态");
-            return SecondaryOcrStability::Pending;
-        };
-        state.secondary_ocr_stability.observe(
+        self.state.secondary_ocr_stability.observe(
             visible,
             self.config.nickname_stable_count,
             self.config.content_stable_count,
         )
     }
 
-    pub(crate) fn clear_secondary_ocr_stability(&self) {
-        let Ok(mut state) = self.state.lock() else {
-            log::error!("海龟汤状态锁已损坏，无法清理二级提问 OCR 稳定状态");
-            return;
-        };
-        state.secondary_ocr_stability.clear();
+    pub(crate) fn clear_secondary_ocr_stability(&mut self) {
+        self.state.secondary_ocr_stability.clear();
     }
 
     pub(crate) fn accepts_questions(&self) -> bool {
         if !self.config.enabled {
             return false;
         }
-        self.state
-            .lock()
-            .map(|state| state.phase == TurtleSoupPhase::Active)
-            .unwrap_or(false)
+        self.state.phase == TurtleSoupPhase::Active
     }
 
     pub(crate) fn submit_question(
-        &self,
+        &mut self,
         mut question: TurtleSoupQuestion,
     ) -> Result<QuestionSubmitOutcome> {
         if !self.config.enabled {
             return Ok(QuestionSubmitOutcome::Ignored);
         }
         let player_for_log = question.player.clone();
-        let (work_lock, cvar) = &*self.work;
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow!("海龟汤状态锁已损坏"))?;
+        let state = &mut self.state;
         if state.phase != TurtleSoupPhase::Active {
             return Ok(QuestionSubmitOutcome::Ignored);
         }
@@ -1112,10 +1096,7 @@ impl TurtleSoupService {
                 question.player
             )));
         }
-        let mut work = work_lock
-            .lock()
-            .map_err(|_| anyhow!("海龟汤 AI 队列锁已损坏"))?;
-        if work.waiting.len() >= self.config.max_pending.max(1) {
+        if state.pending_players.len() >= self.config.max_pending.max(1) {
             return Ok(QuestionSubmitOutcome::Reply(format!(
                 "{}，当前提问过多，请稍后再试",
                 question.player
@@ -1123,11 +1104,6 @@ impl TurtleSoupService {
         }
 
         let request_id = state.next_request_id;
-        state.next_request_id = state.next_request_id.wrapping_add(1).max(1);
-        state.pending_players.insert(question.player_key.clone());
-        if question.kind == TurtleSoupQuestionKind::BatchSubmit {
-            state.batch_drafts.remove(&question.player_key);
-        }
         let generation = state.generation;
         let puzzle = state
             .session
@@ -1135,27 +1111,35 @@ impl TurtleSoupService {
             .ok_or_else(|| anyhow!("海龟汤进行中但缺少会话"))?
             .puzzle
             .clone();
-        let session = state
-            .session
-            .as_mut()
-            .ok_or_else(|| anyhow!("海龟汤进行中但缺少会话"))?;
-        session
-            .participants
-            .entry(question.player_key.clone())
-            .or_insert_with(|| question.player.clone());
-        session.question_count = session.question_count.saturating_add(1);
-        session.last_question_at = Some(Instant::now());
-        work.waiting.push_back(TurtleSoupJob {
+        let job = TurtleSoupJob {
             generation,
             request_id,
             player: question.player,
             player_key: question.player_key,
             question: question.question,
             puzzle,
-        });
-        drop(work);
-        drop(state);
-        cvar.notify_one();
+        };
+        if let Err(error) = self.worker_sender.try_send(job.clone()) {
+            return Ok(QuestionSubmitOutcome::Reply(match error {
+                TrySendError::Full(_) => format!("{}，当前提问过多，请稍后再试", player_for_log),
+                TrySendError::Disconnected(_) => "海龟汤 AI Worker 不可用，请稍后再试".to_string(),
+            }));
+        }
+        state.next_request_id = state.next_request_id.wrapping_add(1).max(1);
+        state.pending_players.insert(job.player_key.clone());
+        if question.kind == TurtleSoupQuestionKind::BatchSubmit {
+            state.batch_drafts.remove(&job.player_key);
+        }
+        let session = state
+            .session
+            .as_mut()
+            .ok_or_else(|| anyhow!("海龟汤进行中但缺少会话"))?;
+        session
+            .participants
+            .entry(job.player_key.clone())
+            .or_insert_with(|| job.player.clone());
+        session.question_count = session.question_count.saturating_add(1);
+        session.last_question_at = Some(Instant::now());
         log::info!(
             "海龟汤 AI 请求已排队: request_id={} nickname={}",
             request_id,
@@ -1172,7 +1156,7 @@ impl TurtleSoupService {
         if !clock_active {
             return None;
         }
-        let state = self.state.lock().ok()?;
+        let state = &self.state;
         if state.phase != TurtleSoupPhase::Active {
             return None;
         }
@@ -1192,7 +1176,7 @@ impl TurtleSoupService {
         }
     }
 
-    pub(crate) fn handle_deadline(&self, kind: TurtleSoupDeadlineKind, now: Instant) {
+    pub(crate) fn handle_deadline(&mut self, kind: TurtleSoupDeadlineKind, now: Instant) {
         let Some((expected, deadline)) = self.next_deadline(now, true) else {
             return;
         };
@@ -1202,12 +1186,9 @@ impl TurtleSoupService {
         self.tick_at(now);
     }
 
-    fn tick_at(&self, now: Instant) {
+    fn tick_at(&mut self, now: Instant) {
         let reason = {
-            let Ok(state) = self.state.lock() else {
-                log::error!("海龟汤状态锁已损坏，无法检查超时");
-                return;
-            };
+            let state = &self.state;
             if state.phase != TurtleSoupPhase::Active {
                 return;
             }
@@ -1233,16 +1214,9 @@ impl TurtleSoupService {
         }
     }
 
-    pub(crate) fn abort_for_context_loss(&self, reason: &str) {
-        let Ok(_operation) = self.operation.lock() else {
-            log::error!("海龟汤操作锁已损坏，无法中止会话");
-            return;
-        };
-        let old_generation = {
-            let Ok(mut state) = self.state.lock() else {
-                log::error!("海龟汤状态锁已损坏，无法中止会话");
-                return;
-            };
+    pub(crate) fn abort_for_context_loss(&mut self, reason: &str) {
+        let _old_generation = {
+            let state = &mut self.state;
             if state.phase == TurtleSoupPhase::Idle {
                 return;
             }
@@ -1256,15 +1230,13 @@ impl TurtleSoupService {
             state.last_error = Some(format!("会话已中止：{}", reason));
             old_generation
         };
-        self.remove_waiting_generation(old_generation);
+        self.cancel_waiting_generation(_old_generation);
         self.entertainment.release(EntertainmentKind::TurtleSoup);
         log::warn!("海龟汤会话已中止且不公布汤底: {}", reason);
     }
 
     pub(crate) fn delivery_is_current(&self, delivery: TurtleSoupDelivery) -> bool {
-        let Ok(state) = self.state.lock() else {
-            return false;
-        };
+        let state = &self.state;
         if state.generation != delivery.generation || state.session.is_none() {
             return false;
         }
@@ -1277,17 +1249,10 @@ impl TurtleSoupService {
         }
     }
 
-    pub(crate) fn handle_delivery_success(&self, delivery: TurtleSoupDelivery) {
-        let Ok(_operation) = self.operation.lock() else {
-            log::error!("海龟汤操作锁已损坏，无法确认聊天批次完成");
-            return;
-        };
+    pub(crate) fn handle_delivery_success(&mut self, delivery: TurtleSoupDelivery) {
         match delivery.purpose {
             TurtleSoupDeliveryPurpose::Opening => {
-                let Ok(mut state) = self.state.lock() else {
-                    log::error!("海龟汤状态锁已损坏，无法进入提问阶段");
-                    return;
-                };
+                let state = &mut self.state;
                 if state.generation != delivery.generation
                     || state.phase != TurtleSoupPhase::Announcing
                 {
@@ -1309,14 +1274,10 @@ impl TurtleSoupService {
     }
 
     pub(crate) fn handle_delivery_failure(
-        &self,
+        &mut self,
         delivery: TurtleSoupDelivery,
         error: &anyhow::Error,
     ) {
-        let Ok(_operation) = self.operation.lock() else {
-            log::error!("海龟汤操作锁已损坏，无法处理聊天批次失败");
-            return;
-        };
         let summary = concise_error(error);
         match delivery.purpose {
             TurtleSoupDeliveryPurpose::Opening => {
@@ -1342,12 +1303,8 @@ impl TurtleSoupService {
         }
     }
 
-    fn start_or_repeat(&self, player: &str) -> TurtleSoupCommandOutcome {
-        let phase = self
-            .state
-            .lock()
-            .map(|state| state.phase)
-            .unwrap_or(TurtleSoupPhase::Idle);
+    fn start_or_repeat(&mut self, player: &str) -> TurtleSoupCommandOutcome {
+        let phase = self.state.phase;
         match phase {
             TurtleSoupPhase::Idle => match self.start_new(player, None) {
                 Ok(()) => TurtleSoupCommandOutcome {
@@ -1380,22 +1337,12 @@ impl TurtleSoupService {
         }
     }
 
-    fn start_new(&self, starter: &str, requested_id: Option<&str>) -> Result<()> {
-        let _operation = self
-            .operation
-            .lock()
-            .map_err(|_| anyhow!("海龟汤操作锁已损坏"))?;
+    fn start_new(&mut self, starter: &str, requested_id: Option<&str>) -> Result<()> {
         if !self.config.enabled {
             bail!("海龟汤功能未启用");
         }
         validate_provider_config(&self.config.ai)?;
-        if self
-            .state
-            .lock()
-            .map_err(|_| anyhow!("海龟汤状态锁已损坏"))?
-            .phase
-            != TurtleSoupPhase::Idle
-        {
+        if self.state.phase != TurtleSoupPhase::Idle {
             bail!("已有海龟汤正在进行");
         }
         match self
@@ -1433,10 +1380,7 @@ impl TurtleSoupService {
             let remaining = available.len();
 
             let generation = {
-                let mut state = self
-                    .state
-                    .lock()
-                    .map_err(|_| anyhow!("海龟汤状态锁已损坏"))?;
+                let state = &mut self.state;
                 state.generation = state.generation.wrapping_add(1).max(1);
                 state.phase = TurtleSoupPhase::Announcing;
                 state.session = Some(TurtleSoupSession {
@@ -1476,25 +1420,20 @@ impl TurtleSoupService {
         })();
 
         if let Err(error) = result {
-            if let Ok(mut state) = self.state.lock() {
-                state.phase = TurtleSoupPhase::Idle;
-                state.session = None;
-                state.pending_players.clear();
-                state.batch_drafts.clear();
-                state.last_error = Some(concise_error(&error));
-            }
+            self.state.phase = TurtleSoupPhase::Idle;
+            self.state.session = None;
+            self.state.pending_players.clear();
+            self.state.batch_drafts.clear();
+            self.state.last_error = Some(concise_error(&error));
             self.entertainment.release(EntertainmentKind::TurtleSoup);
             return Err(error);
         }
         Ok(())
     }
 
-    fn repeat_surface(&self) -> Result<()> {
+    fn repeat_surface(&mut self) -> Result<()> {
         let (generation, surface) = {
-            let state = self
-                .state
-                .lock()
-                .map_err(|_| anyhow!("海龟汤状态锁已损坏"))?;
+            let state = &self.state;
             if state.phase != TurtleSoupPhase::Active {
                 bail!("当前不在海龟汤提问阶段");
             }
@@ -1522,9 +1461,7 @@ impl TurtleSoupService {
         if !self.config.enabled {
             return "海龟汤功能未启用".to_string();
         }
-        let Ok(state) = self.state.lock() else {
-            return "海龟汤状态读取失败".to_string();
-        };
+        let state = &self.state;
         let Some(session) = state.session.as_ref() else {
             return "当前没有进行中的海龟汤".to_string();
         };
@@ -1538,16 +1475,9 @@ impl TurtleSoupService {
         )
     }
 
-    fn begin_settlement(&self, reason: SettlementReason) -> Result<bool> {
-        let _operation = self
-            .operation
-            .lock()
-            .map_err(|_| anyhow!("海龟汤操作锁已损坏"))?;
+    fn begin_settlement(&mut self, reason: SettlementReason) -> Result<bool> {
         let (generation, messages) = {
-            let mut state = self
-                .state
-                .lock()
-                .map_err(|_| anyhow!("海龟汤状态锁已损坏"))?;
+            let state = &mut self.state;
             if !matches!(
                 state.phase,
                 TurtleSoupPhase::Announcing | TurtleSoupPhase::Active
@@ -1565,7 +1495,7 @@ impl TurtleSoupService {
             state.secondary_ocr_stability.clear();
             (state.generation, messages)
         };
-        self.remove_waiting_generation(generation);
+        self.cancel_waiting_generation(generation);
         let outcome =
             match self.enqueue_batch(messages, generation, TurtleSoupDeliveryPurpose::Settlement) {
                 Ok(outcome) => outcome,
@@ -1592,29 +1522,22 @@ impl TurtleSoupService {
         Ok(true)
     }
 
-    fn finish_settlement(&self, generation: u64, incomplete: bool, error: Option<String>) {
-        let finished = match self.state.lock() {
-            Ok(mut state) => {
-                if state.generation != generation || state.phase == TurtleSoupPhase::Idle {
-                    false
-                } else {
-                    state.phase = TurtleSoupPhase::Idle;
-                    state.session = None;
-                    state.pending_players.clear();
-                    state.batch_drafts.clear();
-                    state.secondary_ocr_stability.clear();
-                    state.settlement_incomplete = incomplete;
-                    state.last_error = error;
-                    true
-                }
-            }
-            Err(_) => {
-                log::error!("海龟汤状态锁已损坏，无法完成结算");
-                false
-            }
+    fn finish_settlement(&mut self, generation: u64, incomplete: bool, error: Option<String>) {
+        let state = &mut self.state;
+        let finished = if state.generation != generation || state.phase == TurtleSoupPhase::Idle {
+            false
+        } else {
+            state.phase = TurtleSoupPhase::Idle;
+            state.session = None;
+            state.pending_players.clear();
+            state.batch_drafts.clear();
+            state.secondary_ocr_stability.clear();
+            state.settlement_incomplete = incomplete;
+            state.last_error = error;
+            true
         };
         if finished {
-            self.remove_waiting_generation(generation);
+            self.cancel_waiting_generation(generation);
             self.entertainment.release(EntertainmentKind::TurtleSoup);
             if incomplete {
                 log::error!("海龟汤结算已结束，但游戏内消息发送不完整");
@@ -1635,6 +1558,21 @@ impl TurtleSoupService {
                 messages, generation, purpose,
             )?)
     }
+
+    fn cancel_waiting_generation(&self, generation: u64) {
+        let mut current = self.cancelled_through.load(Ordering::SeqCst);
+        while generation > current {
+            match self.cancelled_through.compare_exchange(
+                current,
+                generation,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
+    }
 }
 
 impl TurtleSoupWorker {
@@ -1654,16 +1592,23 @@ impl TurtleSoupWorker {
     }
 
     fn wait_for_job(&self) -> Option<TurtleSoupJob> {
-        let (lock, cvar) = &*self.work;
-        let mut work = lock.lock().ok()?;
-        while work.waiting.is_empty() && !self.shutting_down.load(Ordering::SeqCst) {
-            work = cvar.wait(work).ok()?;
+        loop {
+            if self.shutting_down.load(Ordering::SeqCst) {
+                return None;
+            }
+            let receiver = self.receiver.lock().ok()?;
+            match receiver.recv_timeout(Duration::from_millis(100)) {
+                Ok(job) if !self.shutting_down.load(Ordering::SeqCst) => {
+                    if job.generation <= self.cancelled_through.load(Ordering::SeqCst) {
+                        continue;
+                    }
+                    return Some(job);
+                }
+                Ok(_) => continue,
+                Err(mpsc::RecvTimeoutError::Timeout) => return None,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return None,
+            }
         }
-        if self.shutting_down.load(Ordering::SeqCst) {
-            return None;
-        }
-        let job = work.waiting.pop_front()?;
-        Some(job)
     }
 
     fn adjudicate(&self, job: &TurtleSoupJob, context: &ReviewContext) -> ReviewOutcome {
@@ -1773,7 +1718,7 @@ impl TurtleSoupWorker {
 }
 
 impl TurtleSoupService {
-    pub(crate) fn apply_ai_completion(&self, completion: TurtleSoupAiCompletion) {
+    pub(crate) fn apply_ai_completion(&mut self, completion: TurtleSoupAiCompletion) {
         let TurtleSoupAiCompletion { job, outcome } = completion;
         let log_error = outcome.error_summary.clone();
         log::info!(
@@ -1793,17 +1738,10 @@ impl TurtleSoupService {
             );
         }
 
-        let Ok(_operation) = self.operation.lock() else {
-            log::error!("海龟汤操作锁已损坏，丢弃 AI 裁决结果");
-            return;
-        };
         let mut settlement = None;
         let mut judgment_reply = None;
         {
-            let Ok(mut state) = self.state.lock() else {
-                log::error!("海龟汤状态锁已损坏，丢弃 AI 裁决结果");
-                return;
-            };
+            let state = &mut self.state;
             if state.generation != job.generation || state.phase != TurtleSoupPhase::Active {
                 return;
             }
@@ -1842,7 +1780,7 @@ impl TurtleSoupService {
         }
 
         if let Some((generation, messages)) = settlement {
-            self.remove_waiting_generation(generation);
+            self.cancel_waiting_generation(generation);
             match self.enqueue_batch(messages, generation, TurtleSoupDeliveryPurpose::Settlement) {
                 Ok(TurtleSoupDeliveryOutcome::Added) => {}
                 Ok(TurtleSoupDeliveryOutcome::DroppedEarlierMessage) => {
@@ -1865,15 +1803,6 @@ impl TurtleSoupService {
                 Ok(TurtleSoupDeliveryOutcome::Added) => {}
                 Err(error) => log::error!("海龟汤普通裁决回复入队失败: {error:#}"),
             }
-        }
-    }
-
-    fn remove_waiting_generation(&self, generation: u64) {
-        let (lock, _) = &*self.work;
-        if let Ok(mut work) = lock.lock() {
-            work.waiting.retain(|job| job.generation != generation);
-        } else {
-            log::error!("海龟汤 AI 队列锁已损坏，无法清理旧请求");
         }
     }
 }
@@ -2420,7 +2349,7 @@ mod tests {
 
     #[test]
     fn worker_lifecycle_is_idempotent() {
-        let service = TurtleSoupService::new(
+        let mut service = TurtleSoupService::new(
             TurtleSoupConfig {
                 enabled: true,
                 max_concurrency: 1,
@@ -2431,13 +2360,10 @@ mod tests {
             test_openai(),
         );
 
-        service.start_workers();
-        service.start_workers();
-        service.shutdown();
-        service.shutdown();
-
-        assert!(service.shutting_down.load(Ordering::SeqCst));
-        assert!(service.workers.lock().unwrap().is_empty());
+        let mut workers = service.start_workers().expect("workers start");
+        assert!(service.start_workers().is_none());
+        workers.shutdown();
+        workers.shutdown();
     }
 
     #[test]
@@ -2705,7 +2631,7 @@ mod tests {
 
     #[test]
     fn numbered_batch_replaces_parts_and_queues_one_merged_question() {
-        let service = active_test_service();
+        let mut service = active_test_service();
 
         let reply = service
             .submit_question(parse_question_message("Alice：##2 第二段旧内容", None).unwrap())
@@ -2726,22 +2652,14 @@ mod tests {
             .unwrap();
         assert_eq!(outcome, QuestionSubmitOutcome::Queued { request_id: 1 });
 
-        let (work, _) = &*service.work;
-        let work = work.lock().unwrap();
-        assert_eq!(work.waiting.len(), 1);
-        assert_eq!(
-            work.waiting.front().unwrap().question,
-            "第一段内容\n第二段新内容"
-        );
-        drop(work);
-        let state = service.state.lock().unwrap();
+        let state = &service.state;
         assert!(!state.batch_drafts.contains_key("alice"));
         assert_eq!(state.session.as_ref().unwrap().question_count, 1);
     }
 
     #[test]
     fn numbered_batch_rejects_missing_parts_without_consuming_the_draft() {
-        let service = active_test_service();
+        let mut service = active_test_service();
         service
             .submit_question(parse_question_message("Alice：##1 第一段内容", None).unwrap())
             .unwrap();
@@ -2757,52 +2675,30 @@ mod tests {
             QuestionSubmitOutcome::Reply("缺少[Alice]:##2".to_string())
         );
         assert_eq!(
-            service
-                .state
-                .lock()
-                .unwrap()
-                .batch_drafts
-                .get("alice")
-                .unwrap()
-                .parts
-                .len(),
+            service.state.batch_drafts.get("alice").unwrap().parts.len(),
             2
         );
-        let (work, _) = &*service.work;
-        assert!(work.lock().unwrap().waiting.is_empty());
     }
 
     #[test]
     fn batch_submit_keeps_draft_while_the_player_has_a_pending_judgment() {
-        let service = active_test_service();
+        let mut service = active_test_service();
         service
             .submit_question(parse_question_message("Alice：##1 完整内容", None).unwrap())
             .unwrap();
-        service
-            .state
-            .lock()
-            .unwrap()
-            .pending_players
-            .insert("alice".to_string());
+        service.state.pending_players.insert("alice".to_string());
 
         let outcome = service
             .submit_question(parse_question_message("Alice：##提交", None).unwrap())
             .unwrap();
 
         assert!(matches!(outcome, QuestionSubmitOutcome::Reply(_)));
-        assert!(
-            service
-                .state
-                .lock()
-                .unwrap()
-                .batch_drafts
-                .contains_key("alice")
-        );
+        assert!(service.state.batch_drafts.contains_key("alice"));
     }
 
     #[test]
     fn batch_drafts_are_isolated_by_player_and_cleared_on_context_loss() {
-        let service = active_test_service();
+        let mut service = active_test_service();
         service
             .submit_question(parse_question_message("Alice：##1 Alice内容", None).unwrap())
             .unwrap();
@@ -2813,14 +2709,14 @@ mod tests {
             .submit_question(parse_question_message("Alice：##提交", None).unwrap())
             .unwrap();
         {
-            let state = service.state.lock().unwrap();
+            let state = &service.state;
             assert!(!state.batch_drafts.contains_key("alice"));
             assert!(state.batch_drafts.contains_key("bob"));
         }
 
         service.abort_for_context_loss("测试上下文丢失");
 
-        let state = service.state.lock().unwrap();
+        let state = &service.state;
         assert!(state.batch_drafts.is_empty());
         assert_eq!(state.phase, TurtleSoupPhase::Idle);
     }
@@ -2838,7 +2734,7 @@ mod tests {
 
     #[test]
     fn primary_question_ocr_requires_independently_stable_nickname_and_content() {
-        let service = TurtleSoupService::new(
+        let mut service = TurtleSoupService::new(
             TurtleSoupConfig::default(),
             EntertainmentCoordinator::new(),
             TestDeliveryPort,
@@ -2913,7 +2809,7 @@ mod tests {
 
     #[test]
     fn primary_question_content_ocr_resets_on_change_but_accepts_punctuation_variants() {
-        let service = TurtleSoupService::new(
+        let mut service = TurtleSoupService::new(
             TurtleSoupConfig::default(),
             EntertainmentCoordinator::new(),
             TestDeliveryPort,
@@ -2947,7 +2843,7 @@ mod tests {
 
     #[test]
     fn primary_question_uses_content_to_dedupe_nickname_ocr_variants() {
-        let service = TurtleSoupService::new(
+        let mut service = TurtleSoupService::new(
             TurtleSoupConfig::default(),
             EntertainmentCoordinator::new(),
             TestDeliveryPort,
@@ -2988,7 +2884,7 @@ mod tests {
 
     #[test]
     fn identical_questions_from_distinct_players_remain_independent() {
-        let service = TurtleSoupService::new(
+        let mut service = TurtleSoupService::new(
             TurtleSoupConfig::default(),
             EntertainmentCoordinator::new(),
             TestDeliveryPort,
@@ -3018,7 +2914,7 @@ mod tests {
 
     #[test]
     fn same_scan_nickname_ocr_aliases_are_deduplicated_by_question() {
-        let service = TurtleSoupService::new(
+        let mut service = TurtleSoupService::new(
             TurtleSoupConfig::default(),
             EntertainmentCoordinator::new(),
             TestDeliveryPort,
@@ -3048,7 +2944,7 @@ mod tests {
 
     #[test]
     fn secondary_question_ocr_keeps_pending_until_content_and_nickname_are_stable() {
-        let service = TurtleSoupService::new(
+        let mut service = TurtleSoupService::new(
             TurtleSoupConfig::default(),
             EntertainmentCoordinator::new(),
             TestDeliveryPort,
@@ -3085,7 +2981,7 @@ mod tests {
 
     #[test]
     fn secondary_question_accepts_minor_nickname_ocr_variants_for_the_same_content() {
-        let service = TurtleSoupService::new(
+        let mut service = TurtleSoupService::new(
             TurtleSoupConfig::default(),
             EntertainmentCoordinator::new(),
             TestDeliveryPort,
@@ -3115,7 +3011,7 @@ mod tests {
             content_stable_count: 2,
             ..TurtleSoupConfig::default()
         };
-        let service = TurtleSoupService::new(
+        let mut service = TurtleSoupService::new(
             config,
             EntertainmentCoordinator::new(),
             TestDeliveryPort,
@@ -3143,7 +3039,7 @@ mod tests {
 
     #[test]
     fn secondary_non_question_content_does_not_wait_for_a_nickname() {
-        let service = TurtleSoupService::new(
+        let mut service = TurtleSoupService::new(
             TurtleSoupConfig::default(),
             EntertainmentCoordinator::new(),
             TestDeliveryPort,
@@ -3221,7 +3117,7 @@ mod tests {
             question_bank_path: PathBuf::from("missing-turtle-soup-bank.yaml"),
             ..TurtleSoupConfig::default()
         };
-        let service = TurtleSoupService::new(
+        let mut service = TurtleSoupService::new(
             config,
             EntertainmentCoordinator::new(),
             TestDeliveryPort,
@@ -3255,14 +3151,14 @@ mod tests {
 
     #[test]
     fn web_snapshot_never_contains_the_puzzle_bottom() {
-        let service = TurtleSoupService::new(
+        let mut service = TurtleSoupService::new(
             TurtleSoupConfig::default(),
             EntertainmentCoordinator::new(),
             TestDeliveryPort,
             test_openai(),
         );
         {
-            let mut state = service.state.lock().unwrap();
+            let state = &mut service.state;
             state.phase = TurtleSoupPhase::Active;
             state.generation = 1;
             state.session = Some(TurtleSoupSession {
@@ -3295,14 +3191,14 @@ mod tests {
             enabled: true,
             ..TurtleSoupConfig::default()
         };
-        let service = TurtleSoupService::new(
+        let mut service = TurtleSoupService::new(
             config,
             EntertainmentCoordinator::new(),
             TestDeliveryPort,
             test_openai(),
         );
         {
-            let mut state = service.state.lock().unwrap();
+            let state = &mut service.state;
             state.phase = TurtleSoupPhase::Active;
             state.generation = 1;
             state.session = Some(TurtleSoupSession {

@@ -65,8 +65,15 @@ pub(crate) fn run(config_path: &Path) -> Result<()> {
         runtime_state.state().playback.state
     );
 
-    let mut app = AutomationApp::new(config, runtime_state, queue, song_dedup_history, monitor)?;
+    let mut app = AutomationApp::new(
+        config,
+        runtime_state,
+        queue,
+        song_dedup_history,
+        monitor.clone(),
+    )?;
     let result = app.run();
     drop(tui_handle);
+    monitor.shutdown();
     result
 }

@@ -137,6 +137,21 @@ pub struct UndercoverSnapshot {
     pub remaining_seconds: u64,
 }
 
+impl Default for UndercoverSnapshot {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            phase: "idle",
+            mode: None,
+            round: 0,
+            players: Vec::new(),
+            completed: 0,
+            total: 0,
+            remaining_seconds: 0,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UndercoverPlayerSnapshot {

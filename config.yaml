@@ -460,16 +460,49 @@ turtle_soup:
     extra_body: {}
 
 ai:
-  # AI 供应商：mimo/openai/deepseek/custom
+  # 点歌 AI Provider。可选：mimo、openai、deepseek、custom。
+  #
+  # mimo：默认使用小米 Mimo，鉴权头为 api-key。
+  #   默认 endpoint: https://api.xiaomimimo.com/v1/chat/completions
+  #   默认 model: mimo-v2.5
+  # openai：默认使用 OpenAI，鉴权头为 Authorization: Bearer。
+  #   默认 endpoint: https://api.openai.com/v1/chat/completions
+  #   默认 model: gpt-4o-mini
+  # deepseek：默认使用 DeepSeek OpenAI Chat Completions 接口。
+  #   默认 endpoint: https://api.deepseek.com/chat/completions
+  #   默认 model: deepseek-chat
+  # custom：自定义 OpenAI-compatible 网关，必须同时填写 endpoint 和 model。
   provider: mimo
-  # AI API Key，留空表示 AI 功能未启用
+  # API Key。留空表示点歌 AI 未启用；不要提交到 Git，也不要放进 URL 查询参数。
+  # mimo 使用 api-key 请求头，其他 Provider 使用 Authorization Bearer 请求头。
   api_key: ""
-  # 自定义 OpenAI Chat Completions 完整地址；custom 必填，其他供应商留空使用默认地址
+  # 完整的 Chat Completions 请求地址，必须以 /chat/completions 结尾。
+  # 非 custom Provider 留空时使用上面列出的默认 endpoint；custom 必填。
+  # 可包含网关要求的查询参数，例如：
+  #   https://gateway.example/v1/chat/completions?api-version=2026-07-15
+  # 你测试过的临时网关示例（只填地址，不要把密钥写入配置）：
+  #   provider: custom
+  #   endpoint: https://api.777358.xyz/v1/chat/completions
+  #   model: gpt-5.4-mini
   endpoint: ""
-  # AI 模型名；留空使用供应商默认模型，不同供应商可自行填写
+  # 模型名；留空使用 Provider 默认模型，custom 必填。
+  # 网关可用模型以其 /v1/models 返回结果为准，例如 gpt-5.4-mini。
   model: ""
-  # 第三方兼容字段；默认空，和官方 Chat Completions 字段同名时官方值优先
+  # 第三方兼容字段。必须是 JSON object；默认空对象。
+  # 程序会自动生成官方 Chat Completions 字段：model、messages、response_format、
+  # temperature、stream=false、store=false、max_completion_tokens、top_p。
+  # extra_body 与这些字段同名时，官方值覆盖 extra_body；其他字段原样传给网关。
+  # 例如 DeepSeek 私有思考开关（仅在网关明确支持时配置）：
+  #   extra_body:
+  #     thinking:
+  #       type: disabled
+  # 也可以放置网关自定义的租户、路由或思考参数；程序不会自动猜测这些字段。
   extra_body: {}
+
+  # 点歌 AI 请求超时不在本段配置，由 timing.external.ai_request_timeout_ms 控制。
+  # Web 调试接口 /ai/recognize、/ai/match、/ai/pick 还允许用 query 临时覆盖：
+  # provider、apiKey（或 api_key）、endpoint、model。
+  # 切换到不同 Provider 时，配置中的 extra_body 不会带过去，避免跨供应商泄漏私有字段。
 
 song_review:
   # 候选歌曲 AI 审核；只审核最终候选歌曲/URI，控制台来源最高权限免审

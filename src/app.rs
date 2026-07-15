@@ -33,6 +33,7 @@ pub(crate) mod runtime_state;
 pub(crate) mod song_dedup;
 mod song_matcher;
 mod song_review;
+mod startup_adapter;
 mod startup_flow;
 mod task_tracker;
 mod template_match;
@@ -119,6 +120,7 @@ use crate::features::idiom_chain;
 use crate::features::idiom_chain::IdiomChainService;
 use crate::features::invite::{InviteRequest, InviteService, InviteStart};
 use crate::features::moderation::{ModerationPolicy, ModerationResultTask, ModerationService};
+use crate::features::startup::{StartupService, StartupSource, StartupTask};
 use crate::features::turtle_soup::{
     self, QuestionSubmitOutcome, SecondaryOcrObservation, SecondaryOcrStability, TurtleSoupService,
 };
@@ -388,6 +390,7 @@ pub(crate) struct AutomationApp {
     reset_locks_requested: Arc<AtomicBool>,
     invite: InviteService,
     moderation: ModerationService,
+    startup: StartupService,
     commands_enabled: Arc<AtomicBool>,
     idle_exit: Arc<Mutex<Option<IdleExitState>>>,
     running: Arc<AtomicBool>,
@@ -503,12 +506,7 @@ enum PendingTask {
         text: String,
         prefix: String,
     },
-    StartGame {
-        source: &'static str,
-    },
-    EnterWonderland {
-        source: &'static str,
-    },
+    Startup(StartupTask),
     ClearIdleExit,
     ModerationResult(ModerationResultTask),
     SetChatListenerMode {
@@ -584,8 +582,7 @@ impl PendingTask {
             Self::ConsoleChat { text, prefix } => {
                 format!("控制台发言: {}{}", prefix, text)
             }
-            Self::StartGame { source } => format!("启动游戏({})", source),
-            Self::EnterWonderland { source } => format!("进入千星({})", source),
+            Self::Startup(task) => task.label(),
             Self::ClearIdleExit => "取消闲置退出".to_string(),
             Self::ModerationResult(task) => task.label(),
             Self::SetChatListenerMode { target } => {
@@ -609,8 +606,7 @@ impl PendingTask {
             Self::Command(pending) => command::same_lock_command(&pending.parsed, parsed),
             Self::AdvanceQueue { .. } => false,
             Self::ConsoleChat { .. } => false,
-            Self::StartGame { .. } => false,
-            Self::EnterWonderland { .. } => false,
+            Self::Startup(_) => false,
             Self::ClearIdleExit => false,
             Self::ModerationResult(task) => {
                 matches!(
@@ -640,8 +636,7 @@ impl PendingTask {
                     | UserCommand::Previous
             ),
             Self::ConsoleChat { .. }
-            | Self::StartGame { .. }
-            | Self::EnterWonderland { .. }
+            | Self::Startup(_)
             | Self::ClearIdleExit
             | Self::ModerationResult(_)
             | Self::SetChatListenerMode { .. }
@@ -661,8 +656,7 @@ impl PendingTask {
             Self::Command(_)
             | Self::AdvanceQueue { .. }
             | Self::ConsoleChat { .. }
-            | Self::StartGame { .. }
-            | Self::EnterWonderland { .. }
+            | Self::Startup(_)
             | Self::ModerationResult(_)
             | Self::CardGameDelivery(_)
             | Self::UndercoverDelivery(_) => true,
@@ -965,6 +959,7 @@ impl AutomationApp {
             reset_locks_requested: Arc::new(AtomicBool::new(false)),
             invite: InviteService::new(),
             moderation,
+            startup: StartupService::new(),
             commands_enabled: Arc::new(AtomicBool::new(true)),
             idle_exit: Arc::new(Mutex::new(None)),
             running: Arc::new(AtomicBool::new(true)),
@@ -1284,6 +1279,7 @@ impl AutomationApp {
             reset_locks_requested: self.reset_locks_requested.clone(),
             invite: self.invite.clone(),
             moderation: self.moderation.clone(),
+            startup: self.startup,
             commands_enabled: self.commands_enabled.clone(),
             idle_exit: self.idle_exit.clone(),
             running: self.running.clone(),
@@ -2726,11 +2722,9 @@ impl AutomationApp {
             PendingTask::ConsoleChat { text, prefix } => self
                 .execute_console_chat_task(text, prefix)
                 .map(|_| PendingTaskExecution::Completed),
-            PendingTask::StartGame { source } => self
-                .execute_start_game_task(source)
-                .map(|_| PendingTaskExecution::Completed),
-            PendingTask::EnterWonderland { source } => self
-                .execute_enter_wonderland_task(source)
+            PendingTask::Startup(task) => self
+                .startup
+                .execute(task, self)
                 .map(|_| PendingTaskExecution::Completed),
             PendingTask::ClearIdleExit => self
                 .clear_idle_exit_timer()
@@ -3912,45 +3906,6 @@ impl AutomationApp {
         Ok(latest_frame)
     }
 
-    fn execute_start_game_task(&mut self, source: &'static str) -> Result<()> {
-        log::info!("执行启动游戏任务: {}", source);
-        self.abort_entertainment_for_context_loss("启动游戏任务将重建聊天上下文");
-        let config = self.config.clone();
-        let running = Arc::clone(&self.running);
-        let window_detection_signal = self.window_detection_signal.clone();
-        window_detection_signal.request("启动游戏任务开始")?;
-        game_startup::start_game(
-            &config,
-            &self.game_ui,
-            &self.ocr,
-            || running.load(AtomicOrdering::SeqCst),
-            |reason| {
-                if let Err(error) = window_detection_signal.request(reason) {
-                    log::error!("请求重置窗口检测退避失败: {error:#}");
-                }
-            },
-        )
-    }
-
-    fn execute_enter_wonderland_task(&mut self, source: &'static str) -> Result<()> {
-        log::info!("执行进入千星任务: {}", source);
-        self.abort_entertainment_for_context_loss("进入千星任务将切换大厅");
-        let config = self.config.clone();
-        let running = Arc::clone(&self.running);
-        self.window_detection_signal.request("进入千星任务开始")?;
-        startup_flow::enter_wonderland(&config, &self.game_ui, || {
-            running.load(AtomicOrdering::SeqCst)
-        })?;
-        log::info!("进入千星完成信号已确认，执行返回一级界面");
-        let returned = self.return_to_primary_fixed();
-        log::info!(
-            "进入千星完成后返回一级界面结束，后续待处理任务将继续执行: returned_primary={}",
-            returned
-        );
-        self.window_detection_signal.request("进入千星任务完成")?;
-        Ok(())
-    }
-
     fn execute_pending_command(&mut self, pending: PendingCommand) -> Result<()> {
         self.ensure_game_ready_for_input("命令执行前准备")?;
         let command_log = private_safe_command_log(&pending.parsed);
@@ -4058,14 +4013,14 @@ impl AutomationApp {
             return Ok(());
         }
         if self.config.startup.launch_game || self.config.startup.enter_game {
-            self.push_pending_task(PendingTask::StartGame {
-                source: "启动配置"
-            })?;
+            self.push_pending_task(PendingTask::Startup(StartupTask::start_game(
+                StartupSource::STARTUP_CONFIG,
+            )))?;
         }
         if self.config.startup.enter_wonderland {
-            self.push_pending_task(PendingTask::EnterWonderland {
-                source: "启动配置"
-            })?;
+            self.push_pending_task(PendingTask::Startup(StartupTask::enter_wonderland(
+                StartupSource::STARTUP_CONFIG,
+            )))?;
         }
         Ok(())
     }

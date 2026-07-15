@@ -5,6 +5,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::runtime::timer::{DeadlineKind, DeadlineModule, DeadlineToken};
+
 pub(crate) mod repository;
 mod service;
 
@@ -13,6 +15,26 @@ pub use service::{
     UndercoverCommandContext, UndercoverCommandSource, UndercoverDeliveryPort,
     UndercoverDeliveryTask, UndercoverService,
 };
+
+#[derive(Debug)]
+pub struct UndercoverDeadlineModule;
+
+impl DeadlineModule for UndercoverDeadlineModule {
+    const NAME: &'static str = "undercover";
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum UndercoverDeadlineKind {
+    LobbyIdle,
+    PhaseIdle,
+    VoteReminder,
+}
+
+impl DeadlineKind for UndercoverDeadlineKind {
+    type Module = UndercoverDeadlineModule;
+}
+
+pub type UndercoverDeadlineToken = DeadlineToken<UndercoverDeadlineKind>;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum UndercoverCommand {

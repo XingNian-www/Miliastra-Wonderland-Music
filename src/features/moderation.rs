@@ -1,5 +1,6 @@
-use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -26,91 +27,979 @@ impl ModerationAction {
     }
 }
 
-#[derive(Clone, Default)]
+pub struct ModerationCommandMatch {
+    pub matched: &'static str,
+    pub command: ModerationCommand,
+}
+
+pub fn parse_command(command_text: &str, username: &str) -> Option<ModerationCommandMatch> {
+    for (prefix, action) in [
+        ("拉黑UID", ModerationAction::Blacklist),
+        ("屏蔽UID", ModerationAction::BlockChat),
+        ("拉黑", ModerationAction::Blacklist),
+        ("屏蔽", ModerationAction::BlockChat),
+    ] {
+        let Some(rest) = strip_ascii_case_prefix(command_text, prefix) else {
+            continue;
+        };
+        let digits = rest
+            .chars()
+            .take_while(|ch| ch.is_ascii_digit())
+            .collect::<String>();
+        if digits.len() != 9 || !command_boundary(rest[digits.len()..].chars().next()) {
+            return None;
+        }
+        return Some(ModerationCommandMatch {
+            matched: prefix,
+            command: ModerationCommand {
+                action,
+                uid: digits,
+                requester: username.to_string(),
+            },
+        });
+    }
+    None
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ModerationPolicy {
+    vote_timeout: Duration,
+    vote_poll_interval: Duration,
+    stable_vote_samples: u32,
+    required_vote_margin: i32,
+}
+
+impl ModerationPolicy {
+    pub fn new(
+        vote_timeout: Duration,
+        vote_poll_interval: Duration,
+        stable_vote_samples: u32,
+        required_vote_margin: i32,
+    ) -> Self {
+        Self {
+            vote_timeout,
+            vote_poll_interval,
+            stable_vote_samples,
+            required_vote_margin,
+        }
+    }
+}
+
+pub trait ModerationPrimaryHold: Send {
+    fn release(&mut self);
+}
+
+pub trait ModerationCommandPort {
+    fn send_hall(&mut self, message: &str) -> Result<()>;
+    fn prepare_vote_hold(&mut self) -> Result<Box<dyn ModerationPrimaryHold>>;
+}
+
+pub trait ModerationVotePort {
+    fn now(&self) -> Instant;
+    fn wait(&mut self, duration: Duration);
+    fn is_running(&self) -> bool;
+    fn poll_visible_friend_messages(&mut self) -> Result<Vec<String>>;
+    fn finish(&mut self);
+}
+
+pub trait ModerationTaskPort {
+    fn is_running(&self) -> bool;
+    fn submit_result(&self, task: ModerationResultTask) -> Result<()>;
+    fn sync_listener_state(&self);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModerationResultPreparation {
+    Ready,
+    Retry,
+}
+
+pub trait ModerationExecutionPort {
+    fn prepare_result(&mut self, label: &str) -> Result<ModerationResultPreparation>;
+    fn send_hall(&mut self, message: &str) -> Result<()>;
+    fn execute_action(&mut self, command: &ModerationCommand) -> Result<bool>;
+    fn sync_listener_state(&mut self);
+    fn wait_after_action(&mut self);
+}
+
+#[derive(Clone)]
 pub struct ModerationService {
-    active_workflows: Arc<Mutex<HashSet<String>>>,
+    state: Arc<Mutex<ModerationState>>,
+    policy: ModerationPolicy,
+}
+
+#[derive(Default)]
+struct ModerationState {
+    active_workflows: HashSet<String>,
+}
+
+pub enum ModerationStart {
+    Duplicate,
+    Started(ModerationVoteWork),
+}
+
+pub struct ModerationVoteWork {
+    command: ModerationCommand,
+    lease: ModerationWorkflowLease,
+    hold: ModerationHoldLease,
+}
+
+pub struct ModerationResultTask {
+    command: ModerationCommand,
+    approved: bool,
+    lease: ModerationWorkflowLease,
+    hold: ModerationHoldLease,
+}
+
+pub enum ModerationResultExecution {
+    Completed,
+    Retry(ModerationResultTask),
+}
+
+struct ModerationWorkflowLease {
+    service: ModerationService,
+    key: String,
+    active: bool,
+}
+
+struct ModerationHoldLease {
+    hold: Box<dyn ModerationPrimaryHold>,
+    active: bool,
 }
 
 impl ModerationService {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn begin(&self, key: &str) -> Result<bool> {
-        Ok(self
-            .active_workflows
-            .lock()
-            .map_err(|_| anyhow!("moderation workflow registry mutex poisoned"))?
-            .insert(key.to_string()))
-    }
-
-    pub fn release(&self, key: &str) -> Result<bool> {
-        Ok(self
-            .active_workflows
-            .lock()
-            .map_err(|_| anyhow!("moderation workflow registry mutex poisoned"))?
-            .remove(key))
-    }
-
-    pub fn release_best_effort(&self, key: &str) {
-        if let Err(error) = self.release(key) {
-            log::error!("无法释放管理工作流 {key}: {error:#}");
+    pub fn new(policy: ModerationPolicy) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(ModerationState::default())),
+            policy,
         }
     }
 
-    pub fn release_guard(&self, key: String) -> ModerationWorkflowGuard {
-        ModerationWorkflowGuard {
+    pub fn start(
+        &self,
+        command: &ModerationCommand,
+        port: &mut dyn ModerationCommandPort,
+    ) -> Result<ModerationStart> {
+        let Some(lease) = self.try_acquire(command)? else {
+            log::info!(
+                "{} UID{} 已有投票或执行流程，跳过重复请求",
+                command.action.label(),
+                command.uid
+            );
+            port.send_hall(&format!(
+                "@UID{}的{}请求正在处理中",
+                command.uid,
+                command.action.label()
+            ))?;
+            return Ok(ModerationStart::Duplicate);
+        };
+
+        let vote_timeout_seconds = self.policy.vote_timeout.as_millis().saturating_add(999) / 1000;
+        port.send_hall(&format!(
+            "管理员发起了对@UID{}的{}请求,请好友{}s内使用@同意/不同意进行判决",
+            command.uid,
+            command.action.label(),
+            vote_timeout_seconds,
+        ))?;
+        let hold = port.prepare_vote_hold()?;
+        Ok(ModerationStart::Started(ModerationVoteWork {
+            command: command.clone(),
+            lease,
+            hold: ModerationHoldLease::new(hold),
+        }))
+    }
+
+    pub fn run_vote(
+        &self,
+        mut work: ModerationVoteWork,
+        vote_port: &mut dyn ModerationVotePort,
+        task_port: &dyn ModerationTaskPort,
+    ) -> Result<()> {
+        let approved = match self.wait_for_votes(&work.command, vote_port) {
+            Ok(approved) => approved,
+            Err(error) => {
+                log::error!("{}后台投票失败: {error:#}", work.command.action.label());
+                false
+            }
+        };
+        vote_port.finish();
+        if !vote_port.is_running() {
+            work.cancel();
+            task_port.sync_listener_state();
+            return Ok(());
+        }
+        self.submit_vote_result(work.finish(approved), task_port)
+    }
+
+    pub fn fail_vote(
+        &self,
+        mut work: ModerationVoteWork,
+        task_port: &dyn ModerationTaskPort,
+    ) -> Result<()> {
+        if !task_port.is_running() {
+            work.cancel();
+            task_port.sync_listener_state();
+            return Ok(());
+        }
+        self.submit_vote_result(work.finish(false), task_port)
+    }
+
+    pub fn execute_result(
+        &self,
+        mut task: ModerationResultTask,
+        port: &mut dyn ModerationExecutionPort,
+    ) -> Result<ModerationResultExecution> {
+        let label = task.result_label();
+        match port.prepare_result(&label) {
+            Ok(ModerationResultPreparation::Ready) => {}
+            Ok(ModerationResultPreparation::Retry) => {
+                return Ok(ModerationResultExecution::Retry(task));
+            }
+            Err(error) => {
+                task.cancel();
+                port.sync_listener_state();
+                return Err(error);
+            }
+        }
+
+        if !task.approved {
+            task.release_hold();
+            port.sync_listener_state();
+            let result = port.send_hall(&format!(
+                "@UID{}的{}请求未通过",
+                task.command.uid,
+                task.command.action.label()
+            ));
+            task.release_lease();
+            result?;
+            return Ok(ModerationResultExecution::Completed);
+        }
+
+        if let Err(error) = port.send_hall(&format!(
+            "@UID{}的{}请求已通过,开始执行",
+            task.command.uid,
+            task.command.action.label()
+        )) {
+            task.release_hold();
+            port.sync_listener_state();
+            task.release_lease();
+            return Err(error);
+        }
+
+        let result = port.execute_action(&task.command);
+        task.release_hold();
+        port.sync_listener_state();
+        port.wait_after_action();
+        match &result {
+            Ok(true) => {
+                if let Err(error) = port.send_hall(&format!(
+                    "已对@UID{}执行{}",
+                    task.command.uid,
+                    task.command.action.label()
+                )) {
+                    log::error!("{}成功通告发送失败: {error:#}", task.command.action.label());
+                }
+            }
+            Ok(false) | Err(_) => {
+                let _ = port.send_hall(&format!(
+                    "@UID{}的{}流程出错",
+                    task.command.uid,
+                    task.command.action.label()
+                ));
+            }
+        }
+        task.release_lease();
+        result.map(|_| ModerationResultExecution::Completed)
+    }
+
+    fn wait_for_votes(
+        &self,
+        command: &ModerationCommand,
+        port: &mut dyn ModerationVotePort,
+    ) -> Result<bool> {
+        let deadline = port.now() + self.policy.vote_timeout;
+        let mut stable_votes: HashMap<String, bool> = HashMap::new();
+        let mut samples: HashMap<(String, bool), u32> = HashMap::new();
+        while port.is_running() && port.now() < deadline {
+            port.wait(self.policy.vote_poll_interval);
+            match port.poll_visible_friend_messages() {
+                Ok(messages) => {
+                    for message in messages {
+                        let Some((username, agreed)) = parse_friend_moderation_vote(&message)
+                        else {
+                            continue;
+                        };
+                        let key = (username.clone(), agreed);
+                        let count = samples
+                            .entry(key)
+                            .and_modify(|value| *value += 1)
+                            .or_insert(1);
+                        if *count >= self.policy.stable_vote_samples {
+                            stable_votes.insert(username, agreed);
+                        }
+                    }
+                }
+                Err(error) => {
+                    log::error!("{}投票扫描失败: {error:#}", command.action.label());
+                    continue;
+                }
+            }
+            let agree = stable_votes.values().filter(|agreed| **agreed).count() as i32;
+            let disagree = stable_votes.values().filter(|agreed| !**agreed).count() as i32;
+            log::info!(
+                "{}投票: 同意={} 不同意={} 差值={} 目标差值={}",
+                command.action.label(),
+                agree,
+                disagree,
+                agree - disagree,
+                self.policy.required_vote_margin,
+            );
+            if agree - disagree >= self.policy.required_vote_margin {
+                return Ok(true);
+            }
+        }
+        if !port.is_running() {
+            return Ok(false);
+        }
+        let agree = stable_votes.values().filter(|agreed| **agreed).count() as i32;
+        let disagree = stable_votes.values().filter(|agreed| !**agreed).count() as i32;
+        if disagree == 0 {
+            log::info!(
+                "{}投票超时: 同意={} 不同意=0，无反对，按通过处理",
+                command.action.label(),
+                agree,
+            );
+            Ok(true)
+        } else {
+            log::info!(
+                "{}投票超时: 同意={} 不同意={}，未达到目标差值，按未通过处理",
+                command.action.label(),
+                agree,
+                disagree,
+            );
+            Ok(false)
+        }
+    }
+
+    fn submit_vote_result(
+        &self,
+        task: ModerationResultTask,
+        port: &dyn ModerationTaskPort,
+    ) -> Result<()> {
+        if let Err(error) = port.submit_result(task) {
+            port.sync_listener_state();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn try_acquire(&self, command: &ModerationCommand) -> Result<Option<ModerationWorkflowLease>> {
+        let key = workflow_key(command);
+        if !self.state()?.active_workflows.insert(key.clone()) {
+            return Ok(None);
+        }
+        Ok(Some(ModerationWorkflowLease {
             service: self.clone(),
             key,
-        }
+            active: true,
+        }))
+    }
+
+    fn release(&self, key: &str) -> Result<bool> {
+        Ok(self.state()?.active_workflows.remove(key))
+    }
+
+    fn state(&self) -> Result<MutexGuard<'_, ModerationState>> {
+        self.state
+            .lock()
+            .map_err(|_| anyhow!("moderation workflow state mutex poisoned"))
     }
 
     #[cfg(test)]
-    pub fn is_active(&self, key: &str) -> Result<bool> {
+    pub(crate) fn is_active(&self, command: &ModerationCommand) -> Result<bool> {
         Ok(self
+            .state()?
             .active_workflows
-            .lock()
-            .map_err(|_| anyhow!("moderation workflow registry mutex poisoned"))?
-            .contains(key))
+            .contains(&workflow_key(command)))
     }
 }
 
-pub struct ModerationWorkflowGuard {
-    service: ModerationService,
-    key: String,
+impl ModerationVoteWork {
+    pub fn command(&self) -> &ModerationCommand {
+        &self.command
+    }
+
+    pub fn finish(self, approved: bool) -> ModerationResultTask {
+        ModerationResultTask {
+            command: self.command,
+            approved,
+            lease: self.lease,
+            hold: self.hold,
+        }
+    }
+
+    pub fn cancel(&mut self) {
+        self.hold.release();
+        self.lease.release();
+    }
 }
 
-impl Drop for ModerationWorkflowGuard {
+impl ModerationResultTask {
+    pub fn label(&self) -> String {
+        format!(
+            "{} UID{} 投票{}",
+            self.command.action.label(),
+            self.command.uid,
+            if self.approved { "通过" } else { "未通过" }
+        )
+    }
+
+    pub fn result_label(&self) -> String {
+        format!(
+            "{} UID{} 投票结果",
+            self.command.action.label(),
+            self.command.uid
+        )
+    }
+
+    pub fn matches(&self, command: &ModerationCommand) -> bool {
+        self.command.action == command.action && self.command.uid == command.uid
+    }
+
+    pub fn cancel(&mut self) {
+        self.release_hold();
+        self.release_lease();
+    }
+
+    fn release_hold(&mut self) {
+        self.hold.release();
+    }
+
+    fn release_lease(&mut self) {
+        self.lease.release();
+    }
+}
+
+impl ModerationWorkflowLease {
+    fn release(&mut self) {
+        if !self.active {
+            return;
+        }
+        self.active = false;
+        if let Err(error) = self.service.release(&self.key) {
+            log::error!("无法释放管理工作流 {}: {error:#}", self.key);
+        }
+    }
+}
+
+impl ModerationHoldLease {
+    fn new(hold: Box<dyn ModerationPrimaryHold>) -> Self {
+        Self { hold, active: true }
+    }
+
+    fn release(&mut self) {
+        if self.active {
+            self.hold.release();
+            self.active = false;
+        }
+    }
+}
+
+impl Drop for ModerationHoldLease {
     fn drop(&mut self) {
-        self.service.release_best_effort(&self.key);
+        self.release();
     }
+}
+
+impl Drop for ModerationWorkflowLease {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+fn workflow_key(command: &ModerationCommand) -> String {
+    format!("{}:{}", command.action.label(), command.uid)
+}
+
+fn parse_friend_moderation_vote(text: &str) -> Option<(String, bool)> {
+    let sep_index = text.find(['：', ':', ']', '】'])?;
+    let username = text[..sep_index]
+        .trim_matches(['[', '【', ']', '】', ' ', '\t'])
+        .to_string();
+    if username.trim().is_empty() {
+        return None;
+    }
+    let sep_len = text[sep_index..].chars().next()?.len_utf8();
+    let command_text = text[sep_index + sep_len..]
+        .trim_start_matches(['：', ':', ' ', '\t', ']', '】'])
+        .strip_prefix('@')?
+        .trim_start();
+    if command_text
+        .strip_prefix("不同意")
+        .is_some_and(|rest| decision_boundary(rest.chars().next()))
+    {
+        Some((username, false))
+    } else if command_text
+        .strip_prefix("同意")
+        .is_some_and(|rest| decision_boundary(rest.chars().next()))
+    {
+        Some((username, true))
+    } else {
+        None
+    }
+}
+
+pub(crate) fn is_moderation_vote_message(text: &str) -> bool {
+    parse_friend_moderation_vote(text).is_some()
+}
+
+fn decision_boundary(ch: Option<char>) -> bool {
+    match ch {
+        None => true,
+        Some(ch) => {
+            ch.is_whitespace()
+                || matches!(
+                    ch,
+                    '，' | ',' | '。' | '.' | '!' | '！' | '?' | '？' | ']' | '】'
+                )
+        }
+    }
+}
+
+fn command_boundary(ch: Option<char>) -> bool {
+    decision_boundary(ch)
+}
+
+fn strip_ascii_case_prefix<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = text.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
+        .then(|| &text[prefix.len()..])
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
     use super::*;
 
-    #[test]
-    fn registry_accepts_one_workflow_per_key_until_release() {
-        let service = ModerationService::new();
+    struct FakeHold {
+        active: Arc<AtomicBool>,
+    }
 
-        assert!(service.begin("blacklist:123").unwrap());
-        assert!(!service.begin("blacklist:123").unwrap());
-        assert!(service.is_active("blacklist:123").unwrap());
-        assert!(service.release("blacklist:123").unwrap());
-        assert!(service.begin("blacklist:123").unwrap());
+    impl ModerationPrimaryHold for FakeHold {
+        fn release(&mut self) {
+            self.active.store(false, Ordering::SeqCst);
+        }
+    }
+
+    struct FakeCommandPort {
+        messages: Vec<String>,
+        hold_active: Arc<AtomicBool>,
+    }
+
+    impl FakeCommandPort {
+        fn new() -> Self {
+            Self {
+                messages: Vec::new(),
+                hold_active: Arc::new(AtomicBool::new(false)),
+            }
+        }
+    }
+
+    impl ModerationCommandPort for FakeCommandPort {
+        fn send_hall(&mut self, message: &str) -> Result<()> {
+            self.messages.push(message.to_string());
+            Ok(())
+        }
+
+        fn prepare_vote_hold(&mut self) -> Result<Box<dyn ModerationPrimaryHold>> {
+            self.hold_active.store(true, Ordering::SeqCst);
+            Ok(Box::new(FakeHold {
+                active: self.hold_active.clone(),
+            }))
+        }
+    }
+
+    struct FakeVotePort {
+        now: Instant,
+        running: bool,
+        finished: bool,
+        polls: VecDeque<Result<Vec<String>>>,
+    }
+
+    impl FakeVotePort {
+        fn new(polls: impl IntoIterator<Item = Vec<String>>) -> Self {
+            Self {
+                now: Instant::now(),
+                running: true,
+                finished: false,
+                polls: polls.into_iter().map(Ok).collect(),
+            }
+        }
+    }
+
+    impl ModerationVotePort for FakeVotePort {
+        fn now(&self) -> Instant {
+            self.now
+        }
+
+        fn wait(&mut self, duration: Duration) {
+            self.now += duration;
+        }
+
+        fn is_running(&self) -> bool {
+            self.running
+        }
+
+        fn poll_visible_friend_messages(&mut self) -> Result<Vec<String>> {
+            self.polls.pop_front().unwrap_or_else(|| Ok(Vec::new()))
+        }
+
+        fn finish(&mut self) {
+            self.finished = true;
+        }
+    }
+
+    struct FakeTaskPort {
+        running: bool,
+        fail_submit: bool,
+        tasks: Mutex<Vec<ModerationResultTask>>,
+        sync_count: AtomicUsize,
+    }
+
+    impl FakeTaskPort {
+        fn new() -> Self {
+            Self {
+                running: true,
+                fail_submit: false,
+                tasks: Mutex::new(Vec::new()),
+                sync_count: AtomicUsize::new(0),
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                fail_submit: true,
+                ..Self::new()
+            }
+        }
+
+        fn take(&self) -> ModerationResultTask {
+            self.tasks.lock().unwrap().pop().expect("submitted task")
+        }
+    }
+
+    impl ModerationTaskPort for FakeTaskPort {
+        fn is_running(&self) -> bool {
+            self.running
+        }
+
+        fn submit_result(&self, task: ModerationResultTask) -> Result<()> {
+            if self.fail_submit {
+                return Err(anyhow!("submit failed"));
+            }
+            self.tasks.lock().unwrap().push(task);
+            Ok(())
+        }
+
+        fn sync_listener_state(&self) {
+            self.sync_count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct FakeExecutionPort {
+        preparation: Option<Result<ModerationResultPreparation>>,
+        action_result: Result<bool>,
+        hold_active: Arc<AtomicBool>,
+        events: Vec<String>,
+    }
+
+    impl FakeExecutionPort {
+        fn ready(hold_active: Arc<AtomicBool>, action_result: Result<bool>) -> Self {
+            Self {
+                preparation: Some(Ok(ModerationResultPreparation::Ready)),
+                action_result,
+                hold_active,
+                events: Vec::new(),
+            }
+        }
+    }
+
+    impl ModerationExecutionPort for FakeExecutionPort {
+        fn prepare_result(&mut self, _label: &str) -> Result<ModerationResultPreparation> {
+            self.events.push("prepare".to_string());
+            self.preparation.take().expect("one preparation result")
+        }
+
+        fn send_hall(&mut self, message: &str) -> Result<()> {
+            self.events.push(format!(
+                "send:{}:{}",
+                message,
+                self.hold_active.load(Ordering::SeqCst)
+            ));
+            Ok(())
+        }
+
+        fn execute_action(&mut self, _command: &ModerationCommand) -> Result<bool> {
+            self.events.push(format!(
+                "action:{}",
+                self.hold_active.load(Ordering::SeqCst)
+            ));
+            self.action_result
+                .as_ref()
+                .copied()
+                .map_err(|error| anyhow!(error.to_string()))
+        }
+
+        fn sync_listener_state(&mut self) {
+            self.events
+                .push(format!("sync:{}", self.hold_active.load(Ordering::SeqCst)));
+        }
+
+        fn wait_after_action(&mut self) {
+            self.events.push("wait".to_string());
+        }
+    }
+
+    fn service(samples: u32, margin: i32) -> ModerationService {
+        ModerationService::new(ModerationPolicy::new(
+            Duration::from_secs(4),
+            Duration::from_secs(1),
+            samples,
+            margin,
+        ))
+    }
+
+    fn command() -> ModerationCommand {
+        ModerationCommand {
+            action: ModerationAction::Blacklist,
+            uid: "123456789".to_string(),
+            requester: "发起者".to_string(),
+        }
+    }
+
+    fn start(service: &ModerationService, port: &mut FakeCommandPort) -> ModerationVoteWork {
+        let ModerationStart::Started(work) = service.start(&command(), port).unwrap() else {
+            panic!("moderation vote should start");
+        };
+        work
     }
 
     #[test]
-    fn release_guard_cleans_up_on_every_exit_path() {
-        let service = ModerationService::new();
-        service.begin("block:456").unwrap();
+    fn duplicate_workflow_is_rejected_until_the_lease_is_released() {
+        let service = service(2, 2);
+        let mut port = FakeCommandPort::new();
+        let mut work = start(&service, &mut port);
 
-        {
-            let _guard = service.release_guard("block:456".to_string());
-            assert!(service.is_active("block:456").unwrap());
-        }
+        assert!(matches!(
+            service.start(&command(), &mut port).unwrap(),
+            ModerationStart::Duplicate
+        ));
+        assert!(service.is_active(&command()).unwrap());
+        assert!(port.hold_active.load(Ordering::SeqCst));
 
-        assert!(!service.is_active("block:456").unwrap());
+        work.cancel();
+
+        assert!(!service.is_active(&command()).unwrap());
+        assert!(!port.hold_active.load(Ordering::SeqCst));
+        assert!(matches!(
+            service.start(&command(), &mut port).unwrap(),
+            ModerationStart::Started(_)
+        ));
+    }
+
+    #[test]
+    fn stable_votes_reach_the_required_margin() {
+        let service = service(2, 2);
+        let mut command_port = FakeCommandPort::new();
+        let work = start(&service, &mut command_port);
+        let batch = vec!["[甲]：@同意".to_string(), "[乙]：@同意".to_string()];
+        let mut vote_port = FakeVotePort::new([batch.clone(), batch]);
+        let task_port = FakeTaskPort::new();
+
+        service.run_vote(work, &mut vote_port, &task_port).unwrap();
+        let task = task_port.take();
+
+        assert!(task.approved);
+        assert!(vote_port.finished);
+        assert!(service.is_active(&command()).unwrap());
+    }
+
+    #[test]
+    fn timeout_passes_only_when_no_stable_disagreement_exists() {
+        let service = service(1, 3);
+        let mut command_port = FakeCommandPort::new();
+        let work = start(&service, &mut command_port);
+        let mut vote_port = FakeVotePort::new([
+            vec!["[甲]：@同意".to_string()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ]);
+        let task_port = FakeTaskPort::new();
+        service.run_vote(work, &mut vote_port, &task_port).unwrap();
+        let task = task_port.take();
+        assert!(task.approved);
+
+        let mut command_port = FakeCommandPort::new();
+        let mut first = task;
+        first.cancel();
+        let work = start(&service, &mut command_port);
+        let mut vote_port = FakeVotePort::new([
+            vec!["[甲]：@不同意".to_string()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ]);
+        let task_port = FakeTaskPort::new();
+        service.run_vote(work, &mut vote_port, &task_port).unwrap();
+        let task = task_port.take();
+        assert!(!task.approved);
+    }
+
+    #[test]
+    fn failed_result_submission_releases_the_workflow_and_hold() {
+        let service = service(1, 1);
+        let mut command_port = FakeCommandPort::new();
+        let hold_active = command_port.hold_active.clone();
+        let work = start(&service, &mut command_port);
+        let mut vote_port = FakeVotePort::new([vec!["[甲]：@同意".to_string()]]);
+        let task_port = FakeTaskPort::failing();
+
+        assert!(service.run_vote(work, &mut vote_port, &task_port).is_err());
+
+        assert!(!service.is_active(&command()).unwrap());
+        assert!(!hold_active.load(Ordering::SeqCst));
+        assert_eq!(task_port.sync_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn stopped_vote_does_not_submit_a_result() {
+        let service = service(1, 1);
+        let mut command_port = FakeCommandPort::new();
+        let hold_active = command_port.hold_active.clone();
+        let work = start(&service, &mut command_port);
+        let mut vote_port = FakeVotePort::new(Vec::<Vec<String>>::new());
+        vote_port.running = false;
+        let task_port = FakeTaskPort::new();
+
+        service.run_vote(work, &mut vote_port, &task_port).unwrap();
+
+        assert!(task_port.tasks.lock().unwrap().is_empty());
+        assert!(!service.is_active(&command()).unwrap());
+        assert!(!hold_active.load(Ordering::SeqCst));
+        assert_eq!(task_port.sync_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn recoverable_result_preparation_keeps_the_task_and_resources() {
+        let service = service(1, 1);
+        let mut command_port = FakeCommandPort::new();
+        let hold_active = command_port.hold_active.clone();
+        let task = start(&service, &mut command_port).finish(true);
+        let mut execution = FakeExecutionPort {
+            preparation: Some(Ok(ModerationResultPreparation::Retry)),
+            action_result: Ok(true),
+            hold_active: hold_active.clone(),
+            events: Vec::new(),
+        };
+
+        let ModerationResultExecution::Retry(mut task) = service
+            .execute_result(task, &mut execution)
+            .expect("retry result")
+        else {
+            panic!("result should be retried");
+        };
+
+        assert_eq!(execution.events, ["prepare"]);
+        assert!(service.is_active(&command()).unwrap());
+        assert!(hold_active.load(Ordering::SeqCst));
+        task.cancel();
+    }
+
+    #[test]
+    fn fatal_result_preparation_releases_the_task_and_resources() {
+        let service = service(1, 1);
+        let mut command_port = FakeCommandPort::new();
+        let hold_active = command_port.hold_active.clone();
+        let task = start(&service, &mut command_port).finish(true);
+        let mut execution = FakeExecutionPort {
+            preparation: Some(Err(anyhow!("window unavailable"))),
+            action_result: Ok(true),
+            hold_active: hold_active.clone(),
+            events: Vec::new(),
+        };
+
+        assert!(service.execute_result(task, &mut execution).is_err());
+
+        assert!(!service.is_active(&command()).unwrap());
+        assert!(!hold_active.load(Ordering::SeqCst));
+        assert_eq!(execution.events, ["prepare", "sync:false"]);
+    }
+
+    #[test]
+    fn approved_result_keeps_primary_hold_through_action_then_releases_before_feedback() {
+        let service = service(1, 1);
+        let mut command_port = FakeCommandPort::new();
+        let hold_active = command_port.hold_active.clone();
+        let task = start(&service, &mut command_port).finish(true);
+        let mut execution = FakeExecutionPort::ready(hold_active.clone(), Ok(true));
+
+        assert!(matches!(
+            service.execute_result(task, &mut execution).unwrap(),
+            ModerationResultExecution::Completed
+        ));
+
+        assert_eq!(
+            execution.events,
+            [
+                "prepare",
+                "send:@UID123456789的拉黑请求已通过,开始执行:true",
+                "action:true",
+                "sync:false",
+                "wait",
+                "send:已对@UID123456789执行拉黑:false",
+            ]
+        );
+        assert!(!service.is_active(&command()).unwrap());
+        assert!(!hold_active.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn rejected_result_releases_primary_hold_before_feedback() {
+        let service = service(1, 1);
+        let mut command_port = FakeCommandPort::new();
+        let hold_active = command_port.hold_active.clone();
+        let task = start(&service, &mut command_port).finish(false);
+        let mut execution = FakeExecutionPort::ready(hold_active.clone(), Ok(true));
+
+        assert!(matches!(
+            service.execute_result(task, &mut execution).unwrap(),
+            ModerationResultExecution::Completed
+        ));
+
+        assert_eq!(
+            execution.events,
+            [
+                "prepare",
+                "sync:false",
+                "send:@UID123456789的拉黑请求未通过:false",
+            ]
+        );
+        assert!(!service.is_active(&command()).unwrap());
+    }
+
+    #[test]
+    fn vote_parser_requires_a_complete_command_boundary() {
+        assert_eq!(
+            parse_friend_moderation_vote("[甲]：@同意"),
+            Some(("甲".to_string(), true))
+        );
+        assert_eq!(
+            parse_friend_moderation_vote("乙:@不同意！"),
+            Some(("乙".to_string(), false))
+        );
+        assert_eq!(parse_friend_moderation_vote("[甲]：@同意执行"), None);
     }
 }

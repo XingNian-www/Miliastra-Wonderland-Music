@@ -194,11 +194,19 @@ impl IdiomChainService {
     }
 
     pub(crate) fn expire_idle_now(&mut self) -> Result<bool> {
-        let expired = self.game.expire_idle_now();
+        self.expire_idle_at(Instant::now())
+    }
+
+    pub(crate) fn expire_idle_at(&mut self, now: Instant) -> Result<bool> {
+        let expired = self.game.expire_idle_at(now);
         if expired {
             self.entertainment.release(EntertainmentKind::IdiomChain);
         }
         Ok(expired)
+    }
+
+    pub(crate) fn idle_deadline(&self) -> Option<Instant> {
+        self.game.idle_deadline()
     }
 
     #[cfg(test)]
@@ -251,7 +259,17 @@ impl IdiomChainGame {
     }
 
     pub fn expire_idle_now(&mut self) -> bool {
-        self.expire_if_idle(Instant::now())
+        self.expire_idle_at(Instant::now())
+    }
+
+    pub fn expire_idle_at(&mut self, now: Instant) -> bool {
+        self.expire_if_idle(now)
+    }
+
+    pub fn idle_deadline(&self) -> Option<Instant> {
+        let timeout = self.idle_timeout?;
+        let session = self.session.as_ref()?;
+        Some(session.last_activity + timeout)
     }
 
     pub fn handle(&mut self, player: &str, command: &IdiomChainCommand) -> IdiomChainOutcome {

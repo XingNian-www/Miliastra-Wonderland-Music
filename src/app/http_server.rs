@@ -22,10 +22,7 @@ use url::form_urlencoded;
 
 use super::ai;
 use super::chat_listener::{ChatListenerMode, ChatListenerShared};
-use super::command::{
-    self, CustomWorkflowCommand, ParsedCommand, PendingCommand, SongCommand, SongSource,
-    UserCommand,
-};
+use super::command::{self, ParsedCommand, PendingCommand, SongCommand, SongSource, UserCommand};
 use super::custom_workflow;
 use super::decision_control::{DecisionAction, DecisionControlShared};
 #[cfg(test)]
@@ -38,6 +35,7 @@ use super::runtime_state::PersistentRuntimeState;
 use super::task_tracker::TaskTrackerShared;
 use super::web_tools::{WebToolRequest, WebToolShared, WebToolTemplate};
 use crate::config::AppConfig;
+use crate::features::custom_workflow::CustomWorkflowService;
 #[cfg(test)]
 use crate::features::entertainment::EntertainmentCoordinator;
 #[cfg(test)]
@@ -442,6 +440,7 @@ pub struct HttpSharedState {
     turtle_soup: TurtleSoupService,
     turtle_soup_bank: TurtleSoupBankStore,
     undercover: UndercoverService,
+    custom_workflow: CustomWorkflowService,
     pub history: Arc<Mutex<VecDeque<HistoryItem>>>,
     pub active_connections: Arc<AtomicUsize>,
     pending: Arc<(Mutex<VecDeque<super::TrackedPendingTask>>, Condvar)>,
@@ -500,6 +499,7 @@ impl HttpSharedState {
     ) -> Self {
         let turtle_soup_bank =
             TurtleSoupBankStore::new(config.turtle_soup.question_bank_path.clone());
+        let custom_workflow = custom_workflow::service_from_config(&config);
         Self {
             config,
             queue,
@@ -509,6 +509,7 @@ impl HttpSharedState {
             turtle_soup,
             turtle_soup_bank,
             undercover,
+            custom_workflow,
             history: Arc::new(Mutex::new(VecDeque::new())),
             active_connections: Arc::new(AtomicUsize::new(0)),
             pending,
@@ -1212,23 +1213,16 @@ fn operator_workflows_route(
     state: &HttpSharedState,
 ) -> std::result::Result<String, AppError> {
     let workflows = state
-        .config
-        .custom_workflows
-        .workflows
-        .iter()
-        .filter(|workflow| workflow.enabled)
-        .filter_map(|workflow| {
-            let name = if workflow.name.trim().is_empty() {
-                workflow.commands.first()?.trim()
-            } else {
-                workflow.name.trim()
-            };
-            Some(json!({
-                "name": name,
+        .custom_workflow
+        .list()
+        .into_iter()
+        .map(|workflow| {
+            json!({
+                "name": workflow.name,
                 "commands": workflow.commands,
                 "allowArgs": workflow.allow_args,
                 "confirmBeforeRun": workflow.confirm_before_run,
-            }))
+            })
         })
         .collect::<Vec<_>>();
     serde_json::to_string(&workflows).map_err(internal_error)
@@ -1238,44 +1232,21 @@ fn operator_workflow_run_route(
     query: &[(String, String)],
     state: &HttpSharedState,
 ) -> std::result::Result<String, AppError> {
-    if !state.config.custom_workflows.enabled {
+    if !state.custom_workflow.enabled() {
         return Err(bad_request("自定义工作流未启用"));
     }
     let name = normalize_required_text(query_value(query, "name"), "name")?;
     let args = normalize_optional_text(query_value(query, "args"), "args")?;
-    let workflow = custom_workflow::find_workflow(&state.config.custom_workflows, &name)
-        .ok_or_else(|| bad_request("自定义工作流不存在或未启用"))?;
-    if !workflow.allow_args && !args.is_empty() {
-        return Err(bad_request("该自定义工作流不允许参数"));
-    }
-    let command_name = workflow
-        .commands
-        .first()
-        .map(|command| command.trim().trim_start_matches('@'))
-        .filter(|command| !command.is_empty())
-        .unwrap_or(name.as_str())
-        .to_string();
-    let workflow_name = if workflow.name.trim().is_empty() {
-        command_name.clone()
-    } else {
-        workflow.name.trim().to_string()
-    };
-    let raw = if args.is_empty() {
-        command_name.clone()
-    } else {
-        format!("{command_name} {args}")
-    };
-    let matched = command_name.clone();
+    let prepared = state
+        .custom_workflow
+        .prepare_remote(&name, &args)
+        .map_err(|error| bad_request(&error.to_string()))?;
     enqueue_remote_command(
         state,
         remote_control_command(
-            raw,
-            &matched,
-            UserCommand::CustomWorkflow(CustomWorkflowCommand {
-                name: command_name,
-                workflow: workflow_name,
-                args,
-            }),
+            prepared.raw,
+            &prepared.matched,
+            UserCommand::CustomWorkflow(prepared.command),
         ),
     )
 }
@@ -2893,6 +2864,63 @@ mod tests {
         assert_eq!(monitor["undercover"]["phase"], "idle");
         assert!(monitor["undercover"].get("words").is_none());
         assert!(monitor["undercover"].get("roles").is_none());
+    }
+
+    #[test]
+    fn custom_workflow_routes_keep_their_list_and_enqueue_contracts() {
+        let mut state = test_state();
+        state.config.custom_workflows = serde_yaml::from_str(
+            r#"
+enabled: true
+default_threshold: 0.9
+wait_template_absent_stable_default: true
+max_hold_key_seconds: 10
+templates: {}
+workflows:
+  - enabled: true
+    name: example
+    commands: ["入口", "别名"]
+    allow_args: true
+    message_types: [blue]
+    confirm_before_run: false
+    confirm_message: ""
+    confirm_message_types: [blue]
+    confirm_timeout_ms: null
+    confirm_poll_ms: null
+    steps:
+      - type: press_key
+        key: F
+    success_message: ""
+"#,
+        )
+        .expect("custom workflow config");
+        state.custom_workflow = custom_workflow::service_from_config(&state.config);
+
+        let listed: Value =
+            serde_json::from_str(&operator_workflows_route(&[], &state).unwrap()).unwrap();
+        assert_eq!(listed[0]["name"], "example");
+        assert_eq!(listed[0]["commands"], json!(["入口", "别名"]));
+        assert_eq!(listed[0]["allowArgs"], true);
+        assert_eq!(listed[0]["confirmBeforeRun"], false);
+
+        let response: Value = serde_json::from_str(
+            &operator_workflow_run_route(
+                &[
+                    ("name".to_string(), "example".to_string()),
+                    ("args".to_string(), "5".to_string()),
+                ],
+                &state,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(response["ok"], true);
+        assert_eq!(response["queued"], true);
+        assert_eq!(response["duplicate"], false);
+        assert_eq!(response["position"], 1);
+        assert_eq!(response["command"], "入口 5");
+        assert!(response["taskId"].as_u64().is_some());
+        assert_eq!(pending_task_labels(&state).unwrap(), ["控制台命令: 入口 5"]);
     }
 
     #[test]

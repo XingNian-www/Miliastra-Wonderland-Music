@@ -30,6 +30,21 @@ pub trait UndercoverDeliveryPort {
     fn send_hall_batch(&self, messages: &[String]) -> Result<()>;
 }
 
+pub struct UndercoverDeliveryTask {
+    service: UndercoverService,
+    deliveries: Vec<UndercoverDelivery>,
+}
+
+impl UndercoverDeliveryTask {
+    pub fn label(&self) -> &'static str {
+        "发送谁是卧底阶段消息"
+    }
+
+    pub fn execute(self, port: &dyn UndercoverDeliveryPort) -> Result<()> {
+        self.service.deliver(self.deliveries, port)
+    }
+}
+
 #[derive(Clone)]
 pub struct UndercoverService {
     game: Arc<Mutex<UndercoverGame>>,
@@ -141,6 +156,13 @@ impl UndercoverService {
             self.entertainment.release(EntertainmentKind::Undercover);
         }
         Ok(deliveries)
+    }
+
+    pub fn delivery_task(&self, deliveries: Vec<UndercoverDelivery>) -> UndercoverDeliveryTask {
+        UndercoverDeliveryTask {
+            service: self.clone(),
+            deliveries,
+        }
     }
 
     pub fn abort(&self) -> Result<bool> {

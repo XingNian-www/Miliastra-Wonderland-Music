@@ -125,8 +125,8 @@ use crate::features::turtle_soup::{
 #[cfg(test)]
 use crate::features::undercover;
 use crate::features::undercover::{
-    UndercoverCommand, UndercoverCommandContext, UndercoverCommandSource, UndercoverDelivery,
-    UndercoverDeliveryPort, UndercoverService,
+    UndercoverCommand, UndercoverCommandContext, UndercoverCommandSource, UndercoverDeliveryPort,
+    UndercoverDeliveryTask, UndercoverService,
 };
 use crate::observation::chat::ObservedFrame;
 use crate::runtime::ui::{
@@ -520,9 +520,7 @@ enum PendingTask {
     },
     RestoreSecondaryHall,
     CardGameDelivery(CardGameDeliveryTask),
-    UndercoverDelivery {
-        deliveries: Vec<UndercoverDelivery>,
-    },
+    UndercoverDelivery(UndercoverDeliveryTask),
 }
 
 struct TrackedPendingTask {
@@ -602,7 +600,7 @@ impl PendingTask {
             }
             Self::RestoreSecondaryHall => "二级监听恢复当前大厅".to_string(),
             Self::CardGameDelivery(delivery) => delivery.label(),
-            Self::UndercoverDelivery { .. } => "发送谁是卧底阶段消息".to_string(),
+            Self::UndercoverDelivery(delivery) => delivery.label().to_string(),
         }
     }
 
@@ -625,7 +623,7 @@ impl PendingTask {
             | Self::SecondaryUnread { .. }
             | Self::RestoreSecondaryHall
             | Self::CardGameDelivery(_)
-            | Self::UndercoverDelivery { .. } => false,
+            | Self::UndercoverDelivery(_) => false,
         }
     }
 
@@ -650,7 +648,7 @@ impl PendingTask {
             | Self::SecondaryUnread { .. }
             | Self::RestoreSecondaryHall
             | Self::CardGameDelivery(_)
-            | Self::UndercoverDelivery { .. } => false,
+            | Self::UndercoverDelivery(_) => false,
         }
     }
 
@@ -667,7 +665,7 @@ impl PendingTask {
             | Self::EnterWonderland { .. }
             | Self::ModerationResult(_)
             | Self::CardGameDelivery(_)
-            | Self::UndercoverDelivery { .. } => true,
+            | Self::UndercoverDelivery(_) => true,
         }
     }
 }
@@ -2480,8 +2478,9 @@ impl AutomationApp {
         match self.undercover.tick(Instant::now(), clock_active) {
             Ok(deliveries) => {
                 if !deliveries.is_empty()
-                    && let Err(error) =
-                        self.push_pending_task(PendingTask::UndercoverDelivery { deliveries })
+                    && let Err(error) = self.push_pending_task(PendingTask::UndercoverDelivery(
+                        self.undercover.delivery_task(deliveries),
+                    ))
                 {
                     log::error!("谁是卧底计时消息入队失败: {error:#}");
                 }
@@ -2751,9 +2750,8 @@ impl AutomationApp {
             PendingTask::CardGameDelivery(delivery) => delivery
                 .execute(self)
                 .map(|_| PendingTaskExecution::Completed),
-            PendingTask::UndercoverDelivery { deliveries } => self
-                .undercover
-                .deliver(deliveries, self)
+            PendingTask::UndercoverDelivery(delivery) => delivery
+                .execute(self)
                 .map(|_| PendingTaskExecution::Completed),
         };
         match result {

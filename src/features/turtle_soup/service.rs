@@ -18,10 +18,11 @@ use serde_json::{Value, json};
 
 #[cfg(test)]
 use super::parse_question_bank;
+use super::repository::TurtleSoupBankStore;
 use super::{
-    TurtleSoupDeadlineKind, TurtleSoupDelivery, TurtleSoupDeliveryIntent,
+    TurtleSoupAppendReceipt, TurtleSoupDeadlineKind, TurtleSoupDelivery, TurtleSoupDeliveryIntent,
     TurtleSoupDeliveryOutcome, TurtleSoupDeliveryPort, TurtleSoupDeliveryPurpose, TurtleSoupPuzzle,
-    load_question_bank,
+    TurtleSoupSubmission, load_question_bank,
 };
 use crate::features::chat_text::{
     MAX_CHAT_WIDTH, display_width, normalize_comparison_text, split_numbered_chat_message,
@@ -32,7 +33,7 @@ use crate::runtime::openai::{Authentication, OpenAiRuntimeHandle, Target};
 
 const RECENT_JUDGMENT_LIMIT: usize = 30;
 const OPENAI_DEFAULT_ENDPOINT: &str = "https://api.openai.com/v1/chat/completions";
-const OPENAI_DEFAULT_MODEL: &str = "gpt-5.5";
+const OPENAI_DEFAULT_MODEL: &str = "gpt-5.6";
 const DEFAULT_AI_MAX_TOKENS: u32 = 1_024;
 const DEFAULT_BATCH_MAX_PARTS: usize = 32;
 const DEFAULT_NICKNAME_STABLE_COUNT: usize = 0;
@@ -300,6 +301,7 @@ pub(crate) struct TurtleSoupSnapshot {
 #[derive(Clone)]
 pub(crate) struct TurtleSoupService {
     config: TurtleSoupConfig,
+    bank: TurtleSoupBankStore,
     openai: OpenAiRuntimeHandle,
     entertainment: EntertainmentCoordinator,
     delivery: Arc<dyn TurtleSoupDeliveryPort>,
@@ -309,6 +311,25 @@ pub(crate) struct TurtleSoupService {
     workers_started: Arc<AtomicBool>,
     shutting_down: Arc<AtomicBool>,
     workers: Arc<Mutex<Vec<thread::JoinHandle<()>>>>,
+}
+
+#[derive(Clone)]
+struct TurtleSoupWorker {
+    config: TurtleSoupConfig,
+    openai: OpenAiRuntimeHandle,
+    work: Arc<(Mutex<TurtleSoupWorkQueue>, Condvar)>,
+    shutting_down: Arc<AtomicBool>,
+}
+
+impl TurtleSoupWorker {
+    fn from_service(service: &TurtleSoupService) -> Self {
+        Self {
+            config: service.config.clone(),
+            openai: service.openai.clone(),
+            work: service.work.clone(),
+            shutting_down: service.shutting_down.clone(),
+        }
+    }
 }
 
 struct TurtleSoupState {
@@ -365,13 +386,14 @@ struct TurtleSoupWorkQueue {
     waiting: VecDeque<TurtleSoupJob>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct TurtleSoupJob {
     generation: u64,
     request_id: u64,
     player: String,
     player_key: String,
     question: String,
+    puzzle: TurtleSoupPuzzle,
 }
 
 #[derive(Default, Deserialize, Serialize)]
@@ -673,11 +695,22 @@ impl SecondaryMessageOcrLane {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct ReviewContext {
     puzzle: TurtleSoupPuzzle,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct TurtleSoupAiCompletion {
+    job: TurtleSoupJob,
+    outcome: ReviewOutcome,
+}
+
+pub(crate) trait TurtleSoupAiCompletionPort: Send + Sync {
+    fn submit(&self, completion: TurtleSoupAiCompletion);
+}
+
+#[derive(Clone, PartialEq, Eq)]
 struct ReviewOutcome {
     judgment: Judgment,
     elapsed_ms: u128,
@@ -691,6 +724,14 @@ enum SettlementReason {
     Web,
     IdleTimeout,
     MaxDuration,
+}
+
+#[cfg(test)]
+struct DiscardedAiCompletionPort;
+
+#[cfg(test)]
+impl TurtleSoupAiCompletionPort for DiscardedAiCompletionPort {
+    fn submit(&self, _completion: TurtleSoupAiCompletion) {}
 }
 
 impl TurtleSoupService {
@@ -707,8 +748,10 @@ impl TurtleSoupService {
             .nickname_stable_count
             .max(BUILTIN_OCR_STABILITY_COUNT);
         config.content_stable_count = config.content_stable_count.max(BUILTIN_OCR_STABILITY_COUNT);
+        let bank = TurtleSoupBankStore::new(config.question_bank_path.clone());
         Self {
             config,
+            bank,
             openai,
             entertainment,
             delivery: Arc::new(delivery),
@@ -721,7 +764,22 @@ impl TurtleSoupService {
         }
     }
 
+    pub(crate) fn append_puzzle(
+        &self,
+        submission: TurtleSoupSubmission,
+    ) -> Result<TurtleSoupAppendReceipt> {
+        self.bank.append(submission)
+    }
+
+    #[cfg(test)]
     pub(crate) fn start_workers(&self) {
+        self.start_workers_with_port(Arc::new(DiscardedAiCompletionPort));
+    }
+
+    pub(crate) fn start_workers_with_port(
+        &self,
+        completion_port: Arc<dyn TurtleSoupAiCompletionPort>,
+    ) {
         if !self.config.enabled
             || self.shutting_down.load(Ordering::SeqCst)
             || self
@@ -738,8 +796,11 @@ impl TurtleSoupService {
             return;
         };
         for index in 0..worker_count {
-            let worker = self.clone();
-            workers.push(thread::spawn(move || worker.run_worker(index + 1)));
+            let worker = TurtleSoupWorker::from_service(self);
+            let completion_port = completion_port.clone();
+            workers.push(thread::spawn(move || {
+                worker.run(index + 1, completion_port)
+            }));
         }
         drop(workers);
         log::info!("海龟汤 AI Worker 已启动: concurrency={}", worker_count);
@@ -1068,6 +1129,12 @@ impl TurtleSoupService {
             state.batch_drafts.remove(&question.player_key);
         }
         let generation = state.generation;
+        let puzzle = state
+            .session
+            .as_ref()
+            .ok_or_else(|| anyhow!("海龟汤进行中但缺少会话"))?
+            .puzzle
+            .clone();
         let session = state
             .session
             .as_mut()
@@ -1084,6 +1151,7 @@ impl TurtleSoupService {
             player: question.player,
             player_key: question.player_key,
             question: question.question,
+            puzzle,
         });
         drop(work);
         drop(state);
@@ -1124,7 +1192,13 @@ impl TurtleSoupService {
         }
     }
 
-    pub(crate) fn handle_deadline(&self, _kind: TurtleSoupDeadlineKind, now: Instant) {
+    pub(crate) fn handle_deadline(&self, kind: TurtleSoupDeadlineKind, now: Instant) {
+        let Some((expected, deadline)) = self.next_deadline(now, true) else {
+            return;
+        };
+        if expected != kind || deadline > now {
+            return;
+        }
         self.tick_at(now);
     }
 
@@ -1561,23 +1635,20 @@ impl TurtleSoupService {
                 messages, generation, purpose,
             )?)
     }
+}
 
-    fn run_worker(&self, index: usize) {
+impl TurtleSoupWorker {
+    fn run(&self, index: usize, completion_port: Arc<dyn TurtleSoupAiCompletionPort>) {
         log::info!("海龟汤 AI Worker {} 已就绪", index);
         while !self.shutting_down.load(Ordering::SeqCst) {
             let Some(job) = self.wait_for_job() else {
                 continue;
             };
-            let outcome = match self.review_context(&job) {
-                Some(context) => self.adjudicate(&job, &context),
-                None => ReviewOutcome {
-                    judgment: Judgment::ReviewFailed,
-                    elapsed_ms: 0,
-                    retries: 0,
-                    error_summary: Some("请求所属会话已失效".to_string()),
-                },
+            let context = ReviewContext {
+                puzzle: job.puzzle.clone(),
             };
-            self.finish_job(job, outcome);
+            let outcome = self.adjudicate(&job, &context);
+            completion_port.submit(TurtleSoupAiCompletion { job, outcome });
         }
         log::info!("海龟汤 AI Worker {} 已停止", index);
     }
@@ -1593,16 +1664,6 @@ impl TurtleSoupService {
         }
         let job = work.waiting.pop_front()?;
         Some(job)
-    }
-
-    fn review_context(&self, job: &TurtleSoupJob) -> Option<ReviewContext> {
-        let state = self.state.lock().ok()?;
-        if state.generation != job.generation || state.phase != TurtleSoupPhase::Active {
-            return None;
-        }
-        Some(ReviewContext {
-            puzzle: state.session.as_ref()?.puzzle.clone(),
-        })
     }
 
     fn adjudicate(&self, job: &TurtleSoupJob, context: &ReviewContext) -> ReviewOutcome {
@@ -1709,8 +1770,11 @@ impl TurtleSoupService {
         let content = model_reply_content(&response)?;
         parse_judgment(&content)
     }
+}
 
-    fn finish_job(&self, job: TurtleSoupJob, outcome: ReviewOutcome) {
+impl TurtleSoupService {
+    pub(crate) fn apply_ai_completion(&self, completion: TurtleSoupAiCompletion) {
+        let TurtleSoupAiCompletion { job, outcome } = completion;
         let log_error = outcome.error_summary.clone();
         log::info!(
             "海龟汤 AI 裁决完成: request_id={} nickname={} verdict={} elapsed={}ms retries={}",

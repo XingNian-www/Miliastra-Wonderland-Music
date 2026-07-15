@@ -8,6 +8,15 @@ mod service;
 
 #[cfg(test)]
 use service::CardGameStartGate;
+#[allow(
+    unused_imports,
+    reason = "removed when CardGameService moves into BusinessRuntime"
+)]
+pub use service::{
+    CardGameCancel, CardGameCommandStart, CardGameCompletion, CardGameDeliveryCancel,
+    CardGameEffect, CardGameEffectKey, CardGameEffectLane, CardGameEffectRequest,
+    CardGameEffectResult, CardGameLateResult, CardGameResume, CardGameTimedOutcome,
+};
 pub use service::{CardGameDeliveryPort, CardGameDeliveryTask, CardGameService};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1975,7 +1984,8 @@ impl SplitMix64 {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex as StdMutex;
+    use std::sync::{Arc, Condvar, Mutex as StdMutex};
+    use std::thread;
 
     use super::*;
     use crate::features::chat_text::{MAX_CHAT_WIDTH, display_width};
@@ -2016,6 +2026,937 @@ mod tests {
             self.hall_messages.lock().unwrap().push(message.to_string());
             Ok(())
         }
+    }
+
+    #[derive(Default)]
+    struct BlockingPortGate {
+        entered: bool,
+        released: bool,
+    }
+
+    #[derive(Default)]
+    struct BlockingCardGamePort {
+        gate: StdMutex<BlockingPortGate>,
+        changed: Condvar,
+        hall_messages: StdMutex<Vec<String>>,
+    }
+
+    impl BlockingCardGamePort {
+        fn block_until_released(&self) {
+            let mut gate = self.gate.lock().unwrap();
+            gate.entered = true;
+            self.changed.notify_all();
+            while !gate.released {
+                gate = self.changed.wait(gate).unwrap();
+            }
+        }
+
+        fn wait_until_entered(&self) {
+            let gate = self.gate.lock().unwrap();
+            let (gate, timeout) = self
+                .changed
+                .wait_timeout_while(gate, Duration::from_secs(5), |gate| !gate.entered)
+                .unwrap();
+            assert!(!timeout.timed_out() && gate.entered, "effect did not start");
+        }
+
+        fn release(&self) {
+            let mut gate = self.gate.lock().unwrap();
+            gate.released = true;
+            self.changed.notify_all();
+        }
+
+        fn hall_messages(&self) -> Vec<String> {
+            self.hall_messages.lock().unwrap().clone()
+        }
+    }
+
+    impl CardGameDeliveryPort for BlockingCardGamePort {
+        fn verify_friend(&self, _player: &str, _message: &str) -> Result<bool> {
+            self.block_until_released();
+            Ok(true)
+        }
+
+        fn send_friend(&self, _player: &str, _message: &str) -> Result<bool> {
+            Ok(true)
+        }
+
+        fn send_hall(&self, message: &str) -> Result<()> {
+            self.block_until_released();
+            self.hall_messages.lock().unwrap().push(message.to_string());
+            Ok(())
+        }
+    }
+
+    struct NeverCalledCardGamePort;
+
+    impl CardGameDeliveryPort for NeverCalledCardGamePort {
+        fn verify_friend(&self, _player: &str, _message: &str) -> Result<bool> {
+            panic!("cancelled effect must not be executed")
+        }
+
+        fn send_friend(&self, _player: &str, _message: &str) -> Result<bool> {
+            panic!("cancelled effect must not be executed")
+        }
+
+        fn send_hall(&self, _message: &str) -> Result<()> {
+            panic!("cancelled effect must not be executed")
+        }
+    }
+
+    fn suspended(start: CardGameCommandStart) -> CardGameEffectRequest {
+        match start {
+            CardGameCommandStart::Suspended(request) => request,
+            CardGameCommandStart::Completed(CardGameCompletion { action }) => {
+                panic!("expected a suspended effect, completed as {action}")
+            }
+        }
+    }
+
+    #[test]
+    fn effect_state_machine_releases_a_start_after_friend_verification_is_rejected() {
+        let entertainment = EntertainmentCoordinator::new();
+        let service = CardGameService::new(LandlordConfig::default(), entertainment.clone());
+        let now = Instant::now();
+
+        let CardGameCommandStart::Suspended(verification) = service
+            .begin_command("甲", &LandlordCommand::Start, now)
+            .unwrap()
+        else {
+            panic!("start should wait for friend verification")
+        };
+        assert_eq!(verification.lane, CardGameEffectLane::Formal);
+        assert!(matches!(
+            verification.effect,
+            CardGameEffect::FriendVerify { ref player, .. } if player == "甲"
+        ));
+
+        let CardGameResume::Suspended(failure_reply) = service
+            .resume(
+                verification.key,
+                CardGameEffectResult::FriendVerify(Ok(false)),
+            )
+            .unwrap()
+        else {
+            panic!("rejected verification should announce the failure")
+        };
+        assert_ne!(
+            verification.key.operation_id,
+            failure_reply.key.operation_id
+        );
+        assert_eq!(
+            verification.key.session_generation,
+            failure_reply.key.session_generation
+        );
+        assert!(matches!(
+            failure_reply.effect,
+            CardGameEffect::HallDelivery { ref message } if message.contains("报名失败")
+        ));
+
+        assert!(matches!(
+            service
+                .resume(
+                    failure_reply.key,
+                    CardGameEffectResult::HallDelivery(Ok(())),
+                )
+                .unwrap(),
+            CardGameResume::Completed(_)
+        ));
+        assert_eq!(entertainment.active(), None);
+        assert!(!service.is_active().unwrap());
+    }
+
+    #[test]
+    fn effect_state_machine_cancels_a_suspended_start_and_ignores_its_late_result() {
+        let entertainment = EntertainmentCoordinator::new();
+        let service = CardGameService::new(LandlordConfig::default(), entertainment.clone());
+
+        let CardGameCommandStart::Suspended(verification) = service
+            .begin_command("甲", &LandlordCommand::Start, Instant::now())
+            .unwrap()
+        else {
+            panic!("start should wait for friend verification")
+        };
+
+        assert!(matches!(
+            service.cancel(verification.key).unwrap(),
+            CardGameCancel::Cancelled(_)
+        ));
+        assert_eq!(entertainment.active(), None);
+        assert!(!service.is_active().unwrap());
+        assert!(matches!(
+            service
+                .resume(
+                    verification.key,
+                    CardGameEffectResult::FriendVerify(Ok(true)),
+                )
+                .unwrap(),
+            CardGameResume::Late(_)
+        ));
+        assert_eq!(entertainment.active(), None);
+        assert!(!service.is_active().unwrap());
+    }
+
+    #[test]
+    fn formal_compatibility_driver_rejects_a_cancelled_queued_effect() {
+        let service =
+            CardGameService::new(LandlordConfig::default(), EntertainmentCoordinator::new());
+        let request = suspended(
+            service
+                .begin_command("甲", &LandlordCommand::Start, Instant::now())
+                .unwrap(),
+        );
+        assert!(matches!(
+            service.cancel(request.key).unwrap(),
+            CardGameCancel::Cancelled(_)
+        ));
+
+        let error = service
+            .drive_formal_for_test(
+                CardGameCommandStart::Suspended(request),
+                &NeverCalledCardGamePort,
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("cancelled"));
+    }
+
+    #[test]
+    fn queued_cancel_does_not_cancel_a_claimed_effect() {
+        let entertainment = EntertainmentCoordinator::new();
+        let service = CardGameService::new(LandlordConfig::default(), entertainment.clone());
+        let port = Arc::new(BlockingCardGamePort::default());
+        let worker_service = service.clone();
+        let worker_port = Arc::clone(&port);
+        let now = Instant::now();
+        let worker = thread::spawn(move || {
+            worker_service.execute("甲", &LandlordCommand::Start, worker_port.as_ref(), now)
+        });
+        port.wait_until_entered();
+        let key = service
+            .pending_effect_key_for_test()
+            .expect("claimed effect remains registered until completion");
+
+        let cancel = service.cancel(key);
+        let pending_during_execution = service.pending_effect_count_for_test();
+        port.release();
+        let execution = worker.join().expect("card game worker panicked");
+
+        assert!(matches!(cancel.unwrap(), CardGameCancel::Late(_)));
+        assert_eq!(pending_during_execution, 1);
+        execution.unwrap();
+        assert_eq!(service.pending_effect_count_for_test(), 0);
+        assert_eq!(port.hall_messages().len(), 1);
+        assert!(service.is_active().unwrap());
+        assert_eq!(entertainment.active(), Some(EntertainmentKind::Landlord));
+    }
+
+    #[test]
+    fn aborting_while_a_formal_effect_is_in_flight_fails_its_command_chain() {
+        let entertainment = EntertainmentCoordinator::new();
+        let service = CardGameService::new(LandlordConfig::default(), entertainment.clone());
+        let port = Arc::new(BlockingCardGamePort::default());
+        let worker_service = service.clone();
+        let worker_port = Arc::clone(&port);
+        let now = Instant::now();
+        let worker = thread::spawn(move || {
+            worker_service.execute("甲", &LandlordCommand::Start, worker_port.as_ref(), now)
+        });
+        port.wait_until_entered();
+
+        let aborted = service.abort();
+        port.release();
+        let execution = worker.join().expect("card game worker panicked");
+
+        assert!(aborted.unwrap());
+        let error = execution.unwrap_err();
+        assert!(error.to_string().contains("cancelled"));
+        assert!(port.hall_messages().is_empty());
+        assert_eq!(service.pending_effect_count_for_test(), 0);
+        assert!(!service.is_active().unwrap());
+        assert_eq!(entertainment.active(), None);
+    }
+
+    #[test]
+    fn effect_state_machine_releases_a_start_when_friend_verification_errors() {
+        let entertainment = EntertainmentCoordinator::new();
+        let service = CardGameService::new(LandlordConfig::default(), entertainment.clone());
+        let CardGameCommandStart::Suspended(verification) = service
+            .begin_command("甲", &LandlordCommand::Start, Instant::now())
+            .unwrap()
+        else {
+            panic!("start should wait for friend verification")
+        };
+
+        let error = service
+            .resume(
+                verification.key,
+                CardGameEffectResult::FriendVerify(Err(anyhow::anyhow!("verification failed"))),
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("verification failed"));
+        assert_eq!(entertainment.active(), None);
+        assert!(!service.is_active().unwrap());
+    }
+
+    #[test]
+    fn effect_state_machine_does_not_roll_back_a_started_room_when_hall_delivery_fails() {
+        let entertainment = EntertainmentCoordinator::new();
+        let service = CardGameService::new(LandlordConfig::default(), entertainment.clone());
+        let CardGameCommandStart::Suspended(verification) = service
+            .begin_command("甲", &LandlordCommand::Start, Instant::now())
+            .unwrap()
+        else {
+            panic!("start should wait for friend verification")
+        };
+        let CardGameResume::Suspended(hall_delivery) = service
+            .resume(
+                verification.key,
+                CardGameEffectResult::FriendVerify(Ok(true)),
+            )
+            .unwrap()
+        else {
+            panic!("verified start should announce the room")
+        };
+
+        let error = service
+            .resume(
+                hall_delivery.key,
+                CardGameEffectResult::HallDelivery(Err(anyhow::anyhow!("hall unavailable"))),
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("hall unavailable"));
+        assert_eq!(entertainment.active(), Some(EntertainmentKind::Landlord));
+        assert!(service.is_active().unwrap());
+    }
+
+    #[test]
+    fn effect_state_machine_aborts_when_the_second_initial_hand_delivery_fails() {
+        let entertainment = EntertainmentCoordinator::new();
+        let service = CardGameService::new(LandlordConfig::default(), entertainment.clone());
+        let port = FakeCardGamePort::new(true, true);
+        let now = Instant::now();
+        service
+            .execute("甲", &LandlordCommand::Start, &port, now)
+            .unwrap();
+        service
+            .execute("乙", &LandlordCommand::Join, &port, now)
+            .unwrap();
+
+        let CardGameCommandStart::Suspended(verification) = service
+            .begin_command("丙", &LandlordCommand::Join, now)
+            .unwrap()
+        else {
+            panic!("third player should wait for friend verification")
+        };
+        let CardGameResume::Suspended(first_hand) = service
+            .resume(
+                verification.key,
+                CardGameEffectResult::FriendVerify(Ok(true)),
+            )
+            .unwrap()
+        else {
+            panic!("verified third player should start hand delivery")
+        };
+        assert!(matches!(
+            first_hand.effect,
+            CardGameEffect::PrivateDelivery { ref player, .. } if player == "甲"
+        ));
+        let CardGameResume::Suspended(second_hand) = service
+            .resume(
+                first_hand.key,
+                CardGameEffectResult::PrivateDelivery(Ok(true)),
+            )
+            .unwrap()
+        else {
+            panic!("first delivered hand should advance to the second")
+        };
+        assert_ne!(first_hand.key.operation_id, second_hand.key.operation_id);
+        assert_eq!(
+            first_hand.key.session_generation,
+            second_hand.key.session_generation
+        );
+        assert!(matches!(
+            second_hand.effect,
+            CardGameEffect::PrivateDelivery { ref player, .. } if player == "乙"
+        ));
+
+        let error = service
+            .resume(
+                second_hand.key,
+                CardGameEffectResult::PrivateDelivery(Ok(false)),
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("牌局发牌失败"));
+        assert_eq!(entertainment.active(), None);
+        assert!(!service.is_active().unwrap());
+    }
+
+    #[test]
+    fn effect_state_machine_makes_a_failed_hand_delivery_immediately_retryable() {
+        let entertainment = EntertainmentCoordinator::new();
+        let service = CardGameService::new(LandlordConfig::default(), entertainment.clone());
+        let port = FakeCardGamePort::new(true, true);
+        let now = Instant::now();
+        service
+            .execute("甲", &LandlordCommand::Start, &port, now)
+            .unwrap();
+        service
+            .execute("乙", &LandlordCommand::Join, &port, now)
+            .unwrap();
+        service
+            .execute("丙", &LandlordCommand::Join, &port, now)
+            .unwrap();
+
+        let CardGameCommandStart::Suspended(first_hand) = service
+            .begin_command("甲", &LandlordCommand::Hand, now)
+            .unwrap()
+        else {
+            panic!("first hand request should be delivered privately")
+        };
+        let error = service
+            .resume(
+                first_hand.key,
+                CardGameEffectResult::PrivateDelivery(Ok(false)),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("牌局手牌发送失败"));
+        assert_eq!(entertainment.active(), Some(EntertainmentKind::Landlord));
+        assert!(service.is_active().unwrap());
+
+        let CardGameCommandStart::Suspended(retry) = service
+            .begin_command("甲", &LandlordCommand::Hand, now)
+            .unwrap()
+        else {
+            panic!("failed hand delivery should clear the cooldown")
+        };
+        assert_ne!(first_hand.key.operation_id, retry.key.operation_id);
+        assert!(matches!(
+            retry.effect,
+            CardGameEffect::PrivateDelivery { ref player, .. } if player == "甲"
+        ));
+    }
+
+    #[test]
+    fn hand_delivery_errors_and_cancellation_both_clear_the_cooldown() {
+        let service =
+            CardGameService::new(LandlordConfig::default(), EntertainmentCoordinator::new());
+        let port = FakeCardGamePort::new(true, true);
+        let now = Instant::now();
+        service
+            .execute("甲", &LandlordCommand::Start, &port, now)
+            .unwrap();
+        service
+            .execute("乙", &LandlordCommand::Join, &port, now)
+            .unwrap();
+        service
+            .execute("丙", &LandlordCommand::Join, &port, now)
+            .unwrap();
+
+        let failed = suspended(
+            service
+                .begin_command("甲", &LandlordCommand::Hand, now)
+                .unwrap(),
+        );
+        let error = service
+            .resume(
+                failed.key,
+                CardGameEffectResult::PrivateDelivery(Err(anyhow::anyhow!("send failed"))),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("send failed"));
+
+        let cancelled = suspended(
+            service
+                .begin_command("甲", &LandlordCommand::Hand, now)
+                .unwrap(),
+        );
+        assert!(matches!(
+            service.cancel(cancelled.key).unwrap(),
+            CardGameCancel::Cancelled(_)
+        ));
+
+        let retry = suspended(
+            service
+                .begin_command("甲", &LandlordCommand::Hand, now)
+                .unwrap(),
+        );
+        assert!(matches!(
+            retry.effect,
+            CardGameEffect::PrivateDelivery { ref player, .. } if player == "甲"
+        ));
+    }
+
+    #[test]
+    fn command_transaction_completes_without_registering_an_effect_when_no_reply_is_needed() {
+        let service =
+            CardGameService::new(LandlordConfig::default(), EntertainmentCoordinator::new());
+        let port = FakeCardGamePort::new(true, true);
+        let now = Instant::now();
+        service
+            .execute("甲", &LandlordCommand::Start, &port, now)
+            .unwrap();
+        service
+            .execute("乙", &LandlordCommand::Join, &port, now)
+            .unwrap();
+        service
+            .execute("丙", &LandlordCommand::Join, &port, now)
+            .unwrap();
+
+        let first = suspended(
+            service
+                .begin_command("甲", &LandlordCommand::Hand, now)
+                .unwrap(),
+        );
+        assert!(matches!(
+            service
+                .resume(first.key, CardGameEffectResult::PrivateDelivery(Ok(true)),)
+                .unwrap(),
+            CardGameResume::Completed(_)
+        ));
+
+        assert!(matches!(
+            service
+                .begin_command("甲", &LandlordCommand::Hand, now)
+                .unwrap(),
+            CardGameCommandStart::Completed(CardGameCompletion {
+                action: "hand-cooldown"
+            })
+        ));
+    }
+
+    #[test]
+    fn effect_state_machine_ignores_wrong_keys_without_consuming_the_pending_effect() {
+        let service =
+            CardGameService::new(LandlordConfig::default(), EntertainmentCoordinator::new());
+        let CardGameCommandStart::Suspended(verification) = service
+            .begin_command("甲", &LandlordCommand::Start, Instant::now())
+            .unwrap()
+        else {
+            panic!("start should wait for friend verification")
+        };
+        let wrong_operation = CardGameEffectKey::new(
+            verification.key.operation_id.checked_next().unwrap(),
+            verification.key.session_generation,
+        );
+        let wrong_generation = CardGameEffectKey::new(
+            verification.key.operation_id,
+            verification.key.session_generation.checked_next().unwrap(),
+        );
+
+        for wrong_key in [wrong_operation, wrong_generation] {
+            let CardGameResume::Late(CardGameLateResult { key }) = service
+                .resume(wrong_key, CardGameEffectResult::FriendVerify(Ok(false)))
+                .unwrap()
+            else {
+                panic!("wrong effect key should be late")
+            };
+            assert_eq!(key, wrong_key);
+        }
+        assert!(matches!(
+            service
+                .resume(
+                    verification.key,
+                    CardGameEffectResult::FriendVerify(Ok(false)),
+                )
+                .unwrap(),
+            CardGameResume::Suspended(_)
+        ));
+    }
+
+    #[test]
+    fn effect_state_machine_does_not_let_a_repeated_private_result_skip_a_hand() {
+        let service =
+            CardGameService::new(LandlordConfig::default(), EntertainmentCoordinator::new());
+        let port = FakeCardGamePort::new(true, true);
+        let now = Instant::now();
+        service
+            .execute("甲", &LandlordCommand::Start, &port, now)
+            .unwrap();
+        service
+            .execute("乙", &LandlordCommand::Join, &port, now)
+            .unwrap();
+        let CardGameCommandStart::Suspended(verification) = service
+            .begin_command("丙", &LandlordCommand::Join, now)
+            .unwrap()
+        else {
+            panic!("third player should wait for verification")
+        };
+        let CardGameResume::Suspended(first_hand) = service
+            .resume(
+                verification.key,
+                CardGameEffectResult::FriendVerify(Ok(true)),
+            )
+            .unwrap()
+        else {
+            panic!("verified join should deliver the first hand")
+        };
+        let CardGameResume::Suspended(second_hand) = service
+            .resume(
+                first_hand.key,
+                CardGameEffectResult::PrivateDelivery(Ok(true)),
+            )
+            .unwrap()
+        else {
+            panic!("first hand should advance to the second")
+        };
+
+        assert!(matches!(
+            service
+                .resume(
+                    first_hand.key,
+                    CardGameEffectResult::PrivateDelivery(Ok(true)),
+                )
+                .unwrap(),
+            CardGameResume::Late(_)
+        ));
+        let CardGameResume::Suspended(third_hand) = service
+            .resume(
+                second_hand.key,
+                CardGameEffectResult::PrivateDelivery(Ok(true)),
+            )
+            .unwrap()
+        else {
+            panic!("second hand should advance to the third")
+        };
+        assert!(matches!(
+            third_hand.effect,
+            CardGameEffect::PrivateDelivery { ref player, .. } if player == "丙"
+        ));
+    }
+
+    #[test]
+    fn an_old_start_verification_cannot_cancel_a_new_start_reservation() {
+        let entertainment = EntertainmentCoordinator::new();
+        let service = CardGameService::new(LandlordConfig::default(), entertainment.clone());
+        let now = Instant::now();
+        let CardGameCommandStart::Suspended(old_verification) = service
+            .begin_command("甲", &LandlordCommand::Start, now)
+            .unwrap()
+        else {
+            panic!("first start should wait for verification")
+        };
+        assert!(matches!(
+            service.cancel(old_verification.key).unwrap(),
+            CardGameCancel::Cancelled(_)
+        ));
+        let CardGameCommandStart::Suspended(new_verification) = service
+            .begin_command("乙", &LandlordCommand::Start, now)
+            .unwrap()
+        else {
+            panic!("replacement start should wait for verification")
+        };
+        assert_ne!(
+            old_verification.key.session_generation,
+            new_verification.key.session_generation
+        );
+
+        assert!(matches!(
+            service
+                .resume(
+                    old_verification.key,
+                    CardGameEffectResult::FriendVerify(Ok(false)),
+                )
+                .unwrap(),
+            CardGameResume::Late(_)
+        ));
+        assert_eq!(entertainment.active(), Some(EntertainmentKind::Landlord));
+        assert!(service.is_active().unwrap());
+        assert!(matches!(
+            service
+                .resume(
+                    new_verification.key,
+                    CardGameEffectResult::FriendVerify(Ok(true)),
+                )
+                .unwrap(),
+            CardGameResume::Suspended(_)
+        ));
+    }
+
+    #[test]
+    fn aborting_a_session_makes_its_suspended_effect_late() {
+        let entertainment = EntertainmentCoordinator::new();
+        let service = CardGameService::new(LandlordConfig::default(), entertainment.clone());
+        let CardGameCommandStart::Suspended(verification) = service
+            .begin_command("甲", &LandlordCommand::Start, Instant::now())
+            .unwrap()
+        else {
+            panic!("start should wait for verification")
+        };
+
+        assert!(service.abort().unwrap());
+        assert!(matches!(
+            service
+                .resume(
+                    verification.key,
+                    CardGameEffectResult::FriendVerify(Ok(true)),
+                )
+                .unwrap(),
+            CardGameResume::Late(_)
+        ));
+        assert_eq!(entertainment.active(), None);
+        assert!(!service.is_active().unwrap());
+    }
+
+    #[test]
+    fn ending_a_game_invalidates_old_effects_but_keeps_the_terminal_announcement() {
+        let entertainment = EntertainmentCoordinator::new();
+        let service = CardGameService::new(LandlordConfig::default(), entertainment.clone());
+        let port = FakeCardGamePort::new(true, true);
+        let now = Instant::now();
+        service
+            .execute("甲", &LandlordCommand::Start, &port, now)
+            .unwrap();
+
+        let stale_status = suspended(
+            service
+                .begin_command("甲", &LandlordCommand::Status, now)
+                .unwrap(),
+        );
+        let terminal = suspended(
+            service
+                .begin_command("甲", &LandlordCommand::Exit, now)
+                .unwrap(),
+        );
+
+        assert_ne!(
+            stale_status.key.session_generation,
+            terminal.key.session_generation
+        );
+        assert!(matches!(
+            service
+                .resume(stale_status.key, CardGameEffectResult::HallDelivery(Ok(())),)
+                .unwrap(),
+            CardGameResume::Late(_)
+        ));
+        let blocked_start = suspended(
+            service
+                .begin_command("乙", &LandlordCommand::Start, now)
+                .unwrap(),
+        );
+        assert_eq!(
+            terminal.key.session_generation,
+            blocked_start.key.session_generation
+        );
+        assert!(matches!(
+            service
+                .resume(terminal.key, CardGameEffectResult::HallDelivery(Ok(())),)
+                .unwrap(),
+            CardGameResume::Completed(_)
+        ));
+        assert_eq!(entertainment.active(), None);
+        assert!(!service.is_active().unwrap());
+
+        let new_start = suspended(
+            service
+                .begin_command("乙", &LandlordCommand::Start, now)
+                .unwrap(),
+        );
+        assert_ne!(
+            terminal.key.session_generation,
+            new_start.key.session_generation
+        );
+        assert!(matches!(
+            service
+                .resume(
+                    blocked_start.key,
+                    CardGameEffectResult::HallDelivery(Ok(())),
+                )
+                .unwrap(),
+            CardGameResume::Late(_)
+        ));
+    }
+
+    #[test]
+    fn redealt_and_landlord_bottom_deliveries_abort_the_game_on_failure() {
+        for (command, expected_action) in [
+            (LandlordCommand::Decline, "redealt"),
+            (LandlordCommand::Rob, "landlord-selected"),
+        ] {
+            let entertainment = EntertainmentCoordinator::new();
+            let service = CardGameService::new(LandlordConfig::default(), entertainment.clone());
+            let port = FakeCardGamePort::new(true, true);
+            let now = Instant::now();
+            service
+                .execute("甲", &LandlordCommand::Start, &port, now)
+                .unwrap();
+            service
+                .execute("乙", &LandlordCommand::Join, &port, now)
+                .unwrap();
+            service
+                .execute("丙", &LandlordCommand::Join, &port, now)
+                .unwrap();
+
+            let mut final_outcome = None;
+            for _ in 0..3 {
+                let accepted = ["甲", "乙", "丙"]
+                    .into_iter()
+                    .map(|player| service.handle(player, &command, now).unwrap())
+                    .find(|outcome| outcome.action != "wrong-bidder")
+                    .expect("one player must own the bidding turn");
+                final_outcome = Some(accepted);
+            }
+            let outcome = final_outcome.unwrap();
+            assert_eq!(outcome.action, expected_action);
+            assert!(!outcome.private_deliveries.is_empty());
+            let CardGameCommandStart::Suspended(delivery) =
+                service.begin_delivery_outcome(outcome).unwrap()
+            else {
+                panic!("private outcome should suspend for delivery")
+            };
+
+            let (result, expected_error) = if expected_action == "redealt" {
+                (Ok(false), "牌局发牌失败")
+            } else {
+                (
+                    Err(anyhow::anyhow!("private delivery failed")),
+                    "private delivery failed",
+                )
+            };
+            let error = service
+                .resume(delivery.key, CardGameEffectResult::PrivateDelivery(result))
+                .unwrap_err();
+
+            assert!(error.to_string().contains(expected_error));
+            assert_eq!(entertainment.active(), None);
+            assert!(!service.is_active().unwrap());
+        }
+    }
+
+    #[test]
+    fn effect_requests_preserve_formal_and_deferred_delivery_lanes() {
+        let service =
+            CardGameService::new(LandlordConfig::default(), EntertainmentCoordinator::new());
+        let now = Instant::now();
+
+        let deferred = suspended(
+            service
+                .begin_command("甲", &LandlordCommand::Status, now)
+                .unwrap(),
+        );
+        assert_eq!(deferred.lane, CardGameEffectLane::Deferred);
+        service.cancel(deferred.key).unwrap();
+
+        let formal = suspended(
+            service
+                .begin_command("甲", &LandlordCommand::Rob, now)
+                .unwrap(),
+        );
+        assert_eq!(formal.lane, CardGameEffectLane::Formal);
+        service.cancel(formal.key).unwrap();
+
+        let timed_delivery = suspended(
+            service
+                .begin_delivery_outcome(LandlordOutcome::public("timer", "计时消息"))
+                .unwrap(),
+        );
+        assert_eq!(timed_delivery.lane, CardGameEffectLane::Formal);
+        service.cancel(timed_delivery.key).unwrap();
+    }
+
+    #[test]
+    fn cancelling_the_final_hall_effect_of_a_hand_deal_keeps_the_game_active() {
+        let entertainment = EntertainmentCoordinator::new();
+        let service = CardGameService::new(LandlordConfig::default(), entertainment.clone());
+        let port = FakeCardGamePort::new(true, true);
+        let now = Instant::now();
+        service
+            .execute("甲", &LandlordCommand::Start, &port, now)
+            .unwrap();
+        service
+            .execute("乙", &LandlordCommand::Join, &port, now)
+            .unwrap();
+        let verification = suspended(
+            service
+                .begin_command("丙", &LandlordCommand::Join, now)
+                .unwrap(),
+        );
+        let CardGameResume::Suspended(mut delivery) = service
+            .resume(
+                verification.key,
+                CardGameEffectResult::FriendVerify(Ok(true)),
+            )
+            .unwrap()
+        else {
+            panic!("verified join should start hand delivery")
+        };
+        for _ in 0..3 {
+            let CardGameResume::Suspended(next) = service
+                .resume(
+                    delivery.key,
+                    CardGameEffectResult::PrivateDelivery(Ok(true)),
+                )
+                .unwrap()
+            else {
+                panic!("three hands should be followed by a hall announcement")
+            };
+            delivery = next;
+        }
+        assert!(matches!(
+            delivery.effect,
+            CardGameEffect::HallDelivery { .. }
+        ));
+
+        assert!(matches!(
+            service.cancel(delivery.key).unwrap(),
+            CardGameCancel::Cancelled(_)
+        ));
+        assert_eq!(entertainment.active(), Some(EntertainmentKind::Landlord));
+        assert!(service.is_active().unwrap());
+    }
+
+    #[test]
+    fn failing_the_final_hall_effect_of_a_hand_deal_keeps_the_game_active() {
+        let entertainment = EntertainmentCoordinator::new();
+        let service = CardGameService::new(LandlordConfig::default(), entertainment.clone());
+        let port = FakeCardGamePort::new(true, true);
+        let now = Instant::now();
+        service
+            .execute("甲", &LandlordCommand::Start, &port, now)
+            .unwrap();
+        service
+            .execute("乙", &LandlordCommand::Join, &port, now)
+            .unwrap();
+        let verification = suspended(
+            service
+                .begin_command("丙", &LandlordCommand::Join, now)
+                .unwrap(),
+        );
+        let CardGameResume::Suspended(mut delivery) = service
+            .resume(
+                verification.key,
+                CardGameEffectResult::FriendVerify(Ok(true)),
+            )
+            .unwrap()
+        else {
+            panic!("verified join should start hand delivery")
+        };
+        for _ in 0..3 {
+            let CardGameResume::Suspended(next) = service
+                .resume(
+                    delivery.key,
+                    CardGameEffectResult::PrivateDelivery(Ok(true)),
+                )
+                .unwrap()
+            else {
+                panic!("three hands should be followed by a hall announcement")
+            };
+            delivery = next;
+        }
+
+        let error = service
+            .resume(
+                delivery.key,
+                CardGameEffectResult::HallDelivery(Err(anyhow::anyhow!("hall unavailable"))),
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("hall unavailable"));
+        assert_eq!(entertainment.active(), Some(EntertainmentKind::Landlord));
+        assert!(service.is_active().unwrap());
     }
 
     #[test]
@@ -2179,10 +3120,12 @@ mod tests {
             .tick(started_at + Duration::from_secs(2), true)
             .unwrap()
             .expect("lobby should time out");
-        assert!(timeout.ended);
         assert_eq!(entertainment.active(), Some(EntertainmentKind::Landlord));
 
-        service.begin_delivery(&timeout);
+        service
+            .delivery_task(timeout)
+            .execute(&FakeCardGamePort::new(true, true))
+            .unwrap();
 
         assert_eq!(entertainment.active(), None);
         assert!(!service.is_active().unwrap());
@@ -2211,10 +3154,308 @@ mod tests {
             .unwrap()
             .expect("lobby should time out");
 
-        assert!(service.delivery_task(timeout).cancel().unwrap());
+        assert!(matches!(
+            service.delivery_task(timeout).cancel().unwrap(),
+            CardGameDeliveryCancel::Cancelled { .. }
+        ));
 
         assert_eq!(entertainment.active(), None);
         assert!(!service.is_active().unwrap());
+    }
+
+    #[test]
+    fn cancelling_an_old_timed_delivery_does_not_abort_a_new_game() {
+        let entertainment = EntertainmentCoordinator::new();
+        let config = LandlordConfig {
+            lobby_timeout_seconds: 1,
+            ..LandlordConfig::default()
+        };
+        let service = CardGameService::new(config, entertainment.clone());
+        let port = FakeCardGamePort::new(true, true);
+        let started_at = Instant::now();
+
+        service
+            .execute("甲", &LandlordCommand::Start, &port, started_at)
+            .unwrap();
+        let timeout = service
+            .tick(started_at + Duration::from_secs(2), true)
+            .unwrap()
+            .expect("lobby should time out");
+        let stale_delivery = service.delivery_task(timeout.clone());
+        service
+            .delivery_task(timeout)
+            .execute(&FakeCardGamePort::new(true, true))
+            .unwrap();
+        service
+            .execute("乙", &LandlordCommand::Start, &port, started_at)
+            .unwrap();
+
+        assert!(matches!(
+            stale_delivery.cancel().unwrap(),
+            CardGameDeliveryCancel::Late { .. }
+        ));
+        assert_eq!(entertainment.active(), Some(EntertainmentKind::Landlord));
+        assert!(service.is_active().unwrap());
+    }
+
+    #[test]
+    fn executing_an_old_timed_delivery_does_not_send_into_a_new_game() {
+        let entertainment = EntertainmentCoordinator::new();
+        let config = LandlordConfig {
+            lobby_timeout_seconds: 1,
+            ..LandlordConfig::default()
+        };
+        let service = CardGameService::new(config, entertainment.clone());
+        let setup_port = FakeCardGamePort::new(true, true);
+        let started_at = Instant::now();
+
+        service
+            .execute("甲", &LandlordCommand::Start, &setup_port, started_at)
+            .unwrap();
+        let timeout = service
+            .tick(started_at + Duration::from_secs(2), true)
+            .unwrap()
+            .expect("lobby should time out");
+        let stale_delivery = service.delivery_task(timeout.clone());
+        service
+            .delivery_task(timeout)
+            .execute(&FakeCardGamePort::new(true, true))
+            .unwrap();
+        service
+            .execute("乙", &LandlordCommand::Start, &setup_port, started_at)
+            .unwrap();
+        let stale_port = FakeCardGamePort::new(true, true);
+
+        stale_delivery.execute(&stale_port).unwrap();
+
+        assert!(stale_port.hall_messages().is_empty());
+        assert_eq!(entertainment.active(), Some(EntertainmentKind::Landlord));
+        assert!(service.is_active().unwrap());
+    }
+
+    #[test]
+    fn cloned_timed_delivery_only_sends_its_registered_effect_once() {
+        let service = CardGameService::new(
+            LandlordConfig {
+                lobby_timeout_seconds: 1,
+                ..LandlordConfig::default()
+            },
+            EntertainmentCoordinator::new(),
+        );
+        let setup_port = FakeCardGamePort::new(true, true);
+        let started_at = Instant::now();
+        service
+            .execute("甲", &LandlordCommand::Start, &setup_port, started_at)
+            .unwrap();
+        let timeout = service
+            .tick(started_at + Duration::from_secs(2), true)
+            .unwrap()
+            .expect("lobby should time out");
+        let first = service.delivery_task(timeout.clone());
+        let duplicate = service.delivery_task(timeout);
+        let delivery_port = FakeCardGamePort::new(true, true);
+
+        first.execute(&delivery_port).unwrap();
+        duplicate.execute(&delivery_port).unwrap();
+
+        assert_eq!(delivery_port.hall_messages().len(), 1);
+    }
+
+    #[test]
+    fn timed_delivery_that_becomes_late_in_flight_stays_idempotent() {
+        let entertainment = EntertainmentCoordinator::new();
+        let service = CardGameService::new(
+            LandlordConfig {
+                lobby_timeout_seconds: 1,
+                ..LandlordConfig::default()
+            },
+            entertainment.clone(),
+        );
+        let setup_port = FakeCardGamePort::new(true, true);
+        let started_at = Instant::now();
+        service
+            .execute("甲", &LandlordCommand::Start, &setup_port, started_at)
+            .unwrap();
+        let timeout = service
+            .tick(started_at + Duration::from_secs(2), true)
+            .unwrap()
+            .expect("lobby should time out");
+        let first = service.delivery_task(timeout.clone());
+        let duplicate = service.delivery_task(timeout);
+        let port = Arc::new(BlockingCardGamePort::default());
+        let worker_port = Arc::clone(&port);
+        let worker = thread::spawn(move || first.execute(worker_port.as_ref()));
+        port.wait_until_entered();
+
+        let aborted = service.abort();
+        port.release();
+        let first_result = worker.join().expect("timed delivery worker panicked");
+        let duplicate_result = duplicate.execute(port.as_ref());
+
+        assert!(aborted.unwrap());
+        first_result.unwrap();
+        duplicate_result.unwrap();
+        assert_eq!(port.hall_messages().len(), 1);
+        assert_eq!(service.pending_effect_count_for_test(), 0);
+        assert!(!service.is_active().unwrap());
+        assert_eq!(entertainment.active(), None);
+    }
+
+    #[test]
+    fn identifier_exhaustion_clears_reservations_and_unfinishable_effects() {
+        let entertainment = EntertainmentCoordinator::new();
+        let service = CardGameService::new(LandlordConfig::default(), entertainment.clone());
+        let now = Instant::now();
+        service.set_next_operation_id_for_test(u64::MAX);
+
+        let error = service
+            .begin_command("甲", &LandlordCommand::Start, now)
+            .unwrap_err();
+        assert!(error.to_string().contains("operation identifier exhausted"));
+        assert_eq!(entertainment.active(), None);
+        assert!(!service.is_active().unwrap());
+
+        service.set_next_operation_id_for_test(1);
+        let verification = suspended(
+            service
+                .begin_command("甲", &LandlordCommand::Start, now)
+                .unwrap(),
+        );
+        service.set_next_operation_id_for_test(u64::MAX);
+        let error = service
+            .resume(
+                verification.key,
+                CardGameEffectResult::FriendVerify(Ok(true)),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("operation identifier exhausted"));
+        assert_eq!(entertainment.active(), None);
+        assert!(!service.is_active().unwrap());
+        assert_eq!(service.pending_effect_count_for_test(), 0);
+
+        service.set_next_operation_id_for_test(2);
+        assert!(matches!(
+            service
+                .resume(
+                    verification.key,
+                    CardGameEffectResult::FriendVerify(Ok(true)),
+                )
+                .unwrap(),
+            CardGameResume::Late(_)
+        ));
+
+        service.set_session_generation_for_test(u64::MAX);
+        let error = service
+            .begin_command("乙", &LandlordCommand::Start, now)
+            .unwrap_err();
+        assert!(error.to_string().contains("session generation exhausted"));
+        assert_eq!(entertainment.active(), None);
+        assert!(!service.is_active().unwrap());
+    }
+
+    #[test]
+    fn claimed_start_chain_exhaustion_clears_its_reservation_and_entertainment_lock() {
+        let entertainment = EntertainmentCoordinator::new();
+        let service = CardGameService::new(LandlordConfig::default(), entertainment.clone());
+        service.set_next_operation_id_for_test(u64::MAX - 1);
+
+        let error = service
+            .execute(
+                "甲",
+                &LandlordCommand::Start,
+                &FakeCardGamePort::new(true, true),
+                Instant::now(),
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("operation identifier exhausted"));
+        assert_eq!(service.pending_effect_count_for_test(), 0);
+        assert!(!service.is_active().unwrap());
+        assert_eq!(entertainment.active(), None);
+    }
+
+    #[test]
+    fn claimed_join_chain_exhaustion_aborts_the_active_game_and_releases_ownership() {
+        let entertainment = EntertainmentCoordinator::new();
+        let service = CardGameService::new(LandlordConfig::default(), entertainment.clone());
+        let port = FakeCardGamePort::new(true, true);
+        let now = Instant::now();
+        service
+            .execute("甲", &LandlordCommand::Start, &port, now)
+            .unwrap();
+        service
+            .execute("乙", &LandlordCommand::Join, &port, now)
+            .unwrap();
+        service.set_next_operation_id_for_test(u64::MAX - 1);
+
+        let error = service
+            .execute("丙", &LandlordCommand::Join, &port, now)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("operation identifier exhausted"));
+        assert_eq!(service.pending_effect_count_for_test(), 0);
+        assert!(!service.is_active().unwrap());
+        assert_eq!(entertainment.active(), None);
+    }
+
+    #[test]
+    fn start_refuses_the_last_generation_before_reserving_or_running_an_effect() {
+        let entertainment = EntertainmentCoordinator::new();
+        let service = CardGameService::new(LandlordConfig::default(), entertainment.clone());
+        service.set_session_generation_for_test(u64::MAX - 1);
+
+        let error = service
+            .execute(
+                "甲",
+                &LandlordCommand::Start,
+                &NeverCalledCardGamePort,
+                Instant::now(),
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("session generation exhausted"));
+        assert_eq!(service.pending_effect_count_for_test(), 0);
+        assert!(!service.is_active().unwrap());
+        assert_eq!(entertainment.active(), None);
+    }
+
+    #[test]
+    fn unclaimed_delivery_at_the_last_generation_clears_the_active_session() {
+        let entertainment = EntertainmentCoordinator::new();
+        let service = CardGameService::new(LandlordConfig::default(), entertainment.clone());
+        service
+            .execute(
+                "甲",
+                &LandlordCommand::Start,
+                &FakeCardGamePort::new(true, true),
+                Instant::now(),
+            )
+            .unwrap();
+        service.set_session_generation_for_test(u64::MAX);
+        let request = suspended(
+            service
+                .begin_delivery_outcome(
+                    LandlordOutcome::public("test-delivery", "完成").with_private_deliveries(vec![
+                        LandlordPrivateDelivery {
+                            player: "甲".to_string(),
+                            message: "测试".to_string(),
+                        },
+                    ]),
+                )
+                .unwrap(),
+        );
+
+        let error = service
+            .resume(
+                request.key,
+                CardGameEffectResult::PrivateDelivery(Ok(false)),
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("session generation exhausted"));
+        assert_eq!(service.pending_effect_count_for_test(), 0);
+        assert!(!service.is_active().unwrap());
+        assert_eq!(entertainment.active(), None);
     }
 
     fn ranks(text: &str) -> Vec<Rank> {

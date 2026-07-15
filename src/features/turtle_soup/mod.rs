@@ -10,10 +10,11 @@ use crate::runtime::timer::{DeadlineKind, DeadlineModule, DeadlineToken};
 pub(crate) mod repository;
 mod service;
 
+pub(crate) use repository::{TurtleSoupAppendReceipt, TurtleSoupSubmission};
 pub(crate) use service::{
-    QuestionSubmitOutcome, SecondaryOcrObservation, SecondaryOcrStability, TurtleSoupCommand,
-    TurtleSoupCommandOutcome, TurtleSoupConfig, TurtleSoupQuestion, TurtleSoupService,
-    TurtleSoupSnapshot, parse_question_message,
+    QuestionSubmitOutcome, SecondaryOcrObservation, SecondaryOcrStability, TurtleSoupAiCompletion,
+    TurtleSoupAiCompletionPort, TurtleSoupCommand, TurtleSoupCommandOutcome, TurtleSoupConfig,
+    TurtleSoupQuestion, TurtleSoupService, TurtleSoupSnapshot, parse_question_message,
 };
 
 #[derive(Debug)]
@@ -114,7 +115,7 @@ impl TurtleSoupDeliveryIntent {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TurtleSoupPuzzle {
     pub(crate) id: String,

@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{self, Sender, SyncSender};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -115,9 +116,17 @@ pub(super) enum MonitorEvent {
     UiState(String),
 }
 
+enum MonitorMessage {
+    Event {
+        event: Box<MonitorEvent>,
+        applied: SyncSender<()>,
+    },
+    Snapshot(SyncSender<MonitorSnapshot>),
+}
+
 #[derive(Clone)]
 pub(crate) struct MonitorShared {
-    projection: Arc<MonitorProjection>,
+    events: Sender<MonitorMessage>,
 }
 
 #[derive(Clone)]
@@ -139,14 +148,12 @@ struct MonitorState {
 }
 
 struct MonitorProjection {
-    state: Mutex<MonitorState>,
+    state: MonitorState,
 }
 
 impl MonitorProjection {
-    fn apply(&self, event: MonitorEvent) {
-        let Ok(mut state) = self.state.lock() else {
-            return;
-        };
+    fn apply(&mut self, event: MonitorEvent) {
+        let state = &mut self.state;
         match event {
             MonitorEvent::Log(line) => {
                 let mut pushed = false;
@@ -193,51 +200,56 @@ impl MonitorProjection {
     }
 
     fn snapshot(&self) -> MonitorSnapshot {
-        self.state.lock().map_or_else(
-            |_| MonitorSnapshot {
-                logs: Vec::new(),
-                ocr: None,
-                queue: Vec::new(),
-                commands: Vec::new(),
-                status: "监控状态不可用".to_string(),
-                playback_controller: MonitorPlaybackController::default(),
-                chat_listener: MonitorChatListener::default(),
-                operational: MonitorOperationalState::default(),
-            },
-            |state| MonitorSnapshot {
-                logs: state.logs.iter().cloned().collect(),
-                ocr: state.ocr.clone(),
-                queue: state.queue.clone(),
-                commands: state.commands.iter().cloned().collect(),
-                status: state.status.clone(),
-                playback_controller: state.playback_controller.clone(),
-                chat_listener: state.chat_listener.clone(),
-                operational: state.operational.clone(),
-            },
-        )
+        let state = &self.state;
+        MonitorSnapshot {
+            logs: state.logs.iter().cloned().collect(),
+            ocr: state.ocr.clone(),
+            queue: state.queue.clone(),
+            commands: state.commands.iter().cloned().collect(),
+            status: state.status.clone(),
+            playback_controller: state.playback_controller.clone(),
+            chat_listener: state.chat_listener.clone(),
+            operational: state.operational.clone(),
+        }
     }
 }
 
 impl MonitorShared {
     pub(crate) fn new(log_limit: usize) -> Self {
-        Self {
-            projection: Arc::new(MonitorProjection {
-                state: Mutex::new(MonitorState {
-                    logs: VecDeque::new(),
-                    log_limit: log_limit.max(20),
-                    ocr: None,
-                    queue: Vec::new(),
-                    commands: VecDeque::new(),
-                    status: "启动中".to_string(),
-                    playback_controller: MonitorPlaybackController::default(),
-                    chat_listener: MonitorChatListener::default(),
-                    operational: MonitorOperationalState {
-                        commands_enabled: true,
-                        ..MonitorOperationalState::default()
-                    },
-                }),
-            }),
-        }
+        let mut projection = MonitorProjection {
+            state: MonitorState {
+                logs: VecDeque::new(),
+                log_limit: log_limit.max(20),
+                ocr: None,
+                queue: Vec::new(),
+                commands: VecDeque::new(),
+                status: "启动中".to_string(),
+                playback_controller: MonitorPlaybackController::default(),
+                chat_listener: MonitorChatListener::default(),
+                operational: MonitorOperationalState {
+                    commands_enabled: true,
+                    ..MonitorOperationalState::default()
+                },
+            },
+        };
+        let (events, receiver) = mpsc::channel::<MonitorMessage>();
+        thread::Builder::new()
+            .name("monitor-projection".to_string())
+            .spawn(move || {
+                while let Ok(message) = receiver.recv() {
+                    match message {
+                        MonitorMessage::Event { event, applied } => {
+                            projection.apply(*event);
+                            let _ = applied.send(());
+                        }
+                        MonitorMessage::Snapshot(response) => {
+                            let _ = response.send(projection.snapshot());
+                        }
+                    }
+                }
+            })
+            .ok();
+        Self { events }
     }
 
     pub(crate) fn log_sink(&self) -> MonitorLogSink {
@@ -247,11 +259,42 @@ impl MonitorShared {
     }
 
     pub(super) fn publish(&self, event: MonitorEvent) {
-        self.projection.apply(event);
+        let (applied, wait) = mpsc::sync_channel(0);
+        if self
+            .events
+            .send(MonitorMessage::Event {
+                event: Box::new(event),
+                applied,
+            })
+            .is_ok()
+        {
+            let _ = wait.recv();
+        }
     }
 
     pub(super) fn snapshot(&self) -> MonitorSnapshot {
-        self.projection.snapshot()
+        let (response, receiver) = mpsc::sync_channel(1);
+        if self
+            .events
+            .send(MonitorMessage::Snapshot(response))
+            .is_err()
+        {
+            return unavailable_snapshot();
+        }
+        receiver.recv().unwrap_or_else(|_| unavailable_snapshot())
+    }
+}
+
+fn unavailable_snapshot() -> MonitorSnapshot {
+    MonitorSnapshot {
+        logs: Vec::new(),
+        ocr: None,
+        queue: Vec::new(),
+        commands: Vec::new(),
+        status: "监控状态不可用".to_string(),
+        playback_controller: MonitorPlaybackController::default(),
+        chat_listener: MonitorChatListener::default(),
+        operational: MonitorOperationalState::default(),
     }
 }
 

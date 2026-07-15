@@ -1,5 +1,6 @@
 pub(crate) mod card_games;
 pub(crate) mod chat_text;
+pub(crate) mod custom_workflow;
 pub(crate) mod entertainment;
 pub(crate) mod idiom_chain;
 pub(crate) mod invite;

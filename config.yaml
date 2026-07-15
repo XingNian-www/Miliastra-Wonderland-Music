@@ -443,31 +443,33 @@ turtle_soup:
   custom_prompt: |
     裁决备注若以“主持裁决：问题=结果”的形式明确列出标准问法，语义等价的玩家问题优先遵循该结果。
     对裁决备注没有列出的问法，严格使用内置的互斥裁决协议，只判断本次问题，不自行放宽“相容近似”或“完全正确”的范围。
-  # 海龟汤默认使用 DeepSeek 官方 API，不启用联网搜索；也可改成其他 OpenAI 兼容 Provider
+  # 海龟汤默认使用 DeepSeek 的 OpenAI Chat Completions 接口，不启用联网搜索
   ai:
     # DeepSeek 官方完整 Chat Completions 地址
     endpoint: "https://api.deepseek.com/chat/completions"
     # 填写 DeepSeek API Key；不要提交到 Git
     api_key: ""
-    # 官方长期模型；程序会为 deepseek-v4-* 显式关闭思考模式
+    # 官方长期模型；请求只发送 OpenAI 标准字段，不发送供应商私有思考参数
     # 不建议使用将在 2026-07-24 15:59 UTC 弃用的 deepseek-chat/deepseek-reasoner 别名
     model: "deepseek-v4-flash"
-    # 是否开启 DeepSeek V4 思考模式；可省略，默认 false
-    # 开启后程序不发送 temperature，建议同时提高 max_tokens
-    thinking_enabled: false
     # 单次裁决允许生成的最大 Token；可省略，默认 256
-    # 非思考模式 256 足够；思考模式建议从 1024 起测试，再按截断情况提高
+    # 程序按 OpenAI Chat Completions 的 max_tokens 字段发送
     max_tokens: 256
+    # 第三方兼容字段；默认空。只能补充字段，和官方字段同名时官方值优先
+    # 例如某 Provider 必须显式关闭私有思考模式时，可填：{ thinking: { type: disabled } }
+    extra_body: {}
 
 ai:
   # AI 供应商：mimo/openai/deepseek/custom
   provider: mimo
   # AI API Key，留空表示 AI 功能未启用
   api_key: ""
-  # 自定义 OpenAI-compatible chat completions 地址；custom 必填，其他供应商留空使用默认地址
+  # 自定义 OpenAI Chat Completions 完整地址；custom 必填，其他供应商留空使用默认地址
   endpoint: ""
   # AI 模型名；留空使用供应商默认模型，不同供应商可自行填写
   model: ""
+  # 第三方兼容字段；默认空，和官方 Chat Completions 字段同名时官方值优先
+  extra_body: {}
 
 song_review:
   # 候选歌曲 AI 审核；只审核最终候选歌曲/URI，控制台来源最高权限免审
@@ -491,13 +493,15 @@ song_review:
   # 追加审核规则；会附加在 policy_prompt 后面，用于临时补充口径
   custom_prompt: |
     本房间偏好舒缓、轻松、不吵闹的音乐。
-  # 独立的审核 Provider；当前仅支持阿里云百炼 OpenAI 兼容接口，因为审核请求依赖 enable_search 和 forced_search
+  # 独立审核 Provider；必须支持 OpenAI Responses API、web_search 和严格 JSON Schema
   provider:
-    # 示例：https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/chat/completions
+    # 填写完整 /responses 地址，例如：https://api.openai.com/v1/responses
     endpoint: ""
     api_key: ""
-    # 示例：qwen-plus
+    # 示例：gpt-5-mini
     model: ""
+    # 第三方兼容字段；默认空，和官方 Responses 字段同名时官方值优先
+    extra_body: {}
 
 matching:
   # 歌名最低匹配分数

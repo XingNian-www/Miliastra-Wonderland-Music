@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use self::migration::CURRENT_CONFIG_VERSION;
 use crate::features::card_games::LandlordConfig;
@@ -276,6 +276,34 @@ pub struct PlaybackTimingConfig {
     pub skip_status_retries: u32,
     pub monitor_tick_ms: u64,
     pub monitor_status_ms: u64,
+    #[serde(default = "default_player_stability_samples")]
+    pub uri_stable_samples: u32,
+    #[serde(default = "default_player_stability_samples")]
+    pub transport_stable_samples: u32,
+    #[serde(
+        default = "default_player_stale_timeout_ms",
+        deserialize_with = "deserialize_positive_u64"
+    )]
+    pub stale_timeout_ms: u64,
+}
+
+fn default_player_stability_samples() -> u32 {
+    0
+}
+
+fn default_player_stale_timeout_ms() -> u64 {
+    5000
+}
+
+fn deserialize_positive_u64<'de, D>(deserializer: D) -> std::result::Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = u64::deserialize(deserializer)?;
+    if value == 0 {
+        return Err(serde::de::Error::custom("value must be a positive integer"));
+    }
+    Ok(value)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -721,6 +749,87 @@ fn default_friend_chat_region() -> RectConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn playback_timing(yaml: &str) -> PlaybackTimingConfig {
+        serde_yaml::from_str(yaml).expect("valid playback timing config")
+    }
+
+    #[test]
+    fn playback_observation_fields_default_to_global_inheritance_and_five_seconds() {
+        let playback = playback_timing(
+            r#"
+search_settle_ms: 2000
+status_poll_ms: 1000
+status_retries: 15
+skip_status_initial_ms: 500
+skip_status_poll_ms: 300
+skip_status_retries: 5
+monitor_tick_ms: 200
+monitor_status_ms: 1000
+"#,
+        );
+
+        assert_eq!(playback.uri_stable_samples, 0);
+        assert_eq!(playback.transport_stable_samples, 0);
+        assert_eq!(playback.stale_timeout_ms, 5000);
+    }
+
+    #[test]
+    fn playback_observation_rejects_zero_stale_timeout() {
+        let error = serde_yaml::from_str::<PlaybackTimingConfig>(
+            r#"
+search_settle_ms: 2000
+status_poll_ms: 1000
+status_retries: 15
+skip_status_initial_ms: 500
+skip_status_poll_ms: 300
+skip_status_retries: 5
+monitor_tick_ms: 200
+monitor_status_ms: 1000
+stale_timeout_ms: 0
+"#,
+        )
+        .expect_err("zero stale timeout must be rejected");
+
+        assert!(error.to_string().contains("positive integer"));
+    }
+
+    #[test]
+    fn playback_observation_stability_uses_local_then_global_then_builtin_default() {
+        let local = playback_timing(
+            r#"
+search_settle_ms: 2000
+status_poll_ms: 1000
+status_retries: 15
+skip_status_initial_ms: 500
+skip_status_poll_ms: 300
+skip_status_retries: 5
+monitor_tick_ms: 200
+monitor_status_ms: 1000
+uri_stable_samples: 4
+transport_stable_samples: 3
+stale_timeout_ms: 7500
+"#,
+        );
+        assert_eq!(resolve_stability_count(local.uri_stable_samples, 6), 4);
+        assert_eq!(
+            resolve_stability_count(local.transport_stable_samples, 6),
+            3
+        );
+        assert_eq!(local.stale_timeout_ms, 7500);
+
+        let inherited = PlaybackTimingConfig {
+            uri_stable_samples: 1,
+            transport_stable_samples: 0,
+            ..local
+        };
+        assert_eq!(resolve_stability_count(inherited.uri_stable_samples, 6), 6);
+        assert_eq!(
+            resolve_stability_count(inherited.transport_stable_samples, 6),
+            6
+        );
+        assert_eq!(resolve_stability_count(inherited.uri_stable_samples, 1), 2);
+    }
 
     #[test]
     fn stability_count_uses_local_then_global_then_builtin_default() {

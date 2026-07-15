@@ -1377,6 +1377,9 @@ mod tests {
                 skip_status_retries: 1,
                 monitor_tick_ms: 50,
                 monitor_status_ms: 50,
+                uri_stable_samples: 0,
+                transport_stable_samples: 0,
+                stale_timeout_ms: 5000,
             },
             &QueueConfig {
                 max_size: 10,

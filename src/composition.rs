@@ -1,7 +1,7 @@
 use std::io::IsTerminal;
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::app::AutomationApp;
 use crate::app::logger;
@@ -14,6 +14,7 @@ use crate::config::AppConfig;
 
 pub(crate) fn run(config_path: &Path) -> Result<()> {
     let config = AppConfig::load_or_create(config_path)?;
+    config.validate().context("启动前校验组合配置")?;
     let monitor = MonitorShared::new(config.tui.log_lines);
     let tui_handle = if config.tui.enabled && std::io::stdout().is_terminal() {
         match TuiHandle::start(&config.tui, monitor.clone()) {

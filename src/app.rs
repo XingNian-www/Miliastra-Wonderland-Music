@@ -21,6 +21,7 @@ mod hotkeys;
 mod http_server;
 mod input_actions;
 pub(crate) mod logger;
+mod moderation_adapter;
 pub(crate) mod monitor;
 mod ocr;
 mod ocr_batch;
@@ -546,6 +547,31 @@ impl TrackedPendingTask {
 
     fn is_playback_task(&self) -> bool {
         self.task.is_playback_task()
+    }
+
+    fn cancel(mut self, chat_listener: &ChatListenerShared) -> bool {
+        let mut sync_listener = false;
+        match &mut self.task {
+            PendingTask::SetChatListenerMode { target } => {
+                chat_listener.cancel_mode_request(*target);
+                sync_listener = true;
+            }
+            PendingTask::SecondaryUnread { .. } | PendingTask::RestoreSecondaryHall => {
+                chat_listener.release_unread_task();
+                sync_listener = true;
+            }
+            PendingTask::ModerationResult(task) => {
+                task.cancel();
+                sync_listener = true;
+            }
+            PendingTask::CardGameDelivery(delivery) => {
+                if let Err(error) = delivery.cancel() {
+                    log::error!("撤销牌局计时结果后无法清理牌局: {error:#}");
+                }
+            }
+            _ => {}
+        }
+        sync_listener
     }
 }
 

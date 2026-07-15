@@ -113,6 +113,7 @@ use crate::features::card_games::{
     CardGameDeliveryPort, CardGameDeliveryTask, CardGameService, LandlordCommand,
 };
 use crate::features::chat_text::split_numbered_chat_message;
+use crate::features::custom_workflow::CustomWorkflowService;
 use crate::features::entertainment::EntertainmentCoordinator;
 #[cfg(test)]
 use crate::features::entertainment::{AcquireOutcome, EntertainmentKind};
@@ -391,6 +392,7 @@ pub(crate) struct AutomationApp {
     invite: InviteService,
     moderation: ModerationService,
     startup: StartupService,
+    custom_workflow: CustomWorkflowService,
     commands_enabled: Arc<AtomicBool>,
     idle_exit: Arc<Mutex<Option<IdleExitState>>>,
     running: Arc<AtomicBool>,
@@ -653,10 +655,10 @@ impl PendingTask {
             | Self::SecondaryUnread { .. }
             | Self::RestoreSecondaryHall
             | Self::ClearIdleExit => false,
+            Self::Startup(task) => task.restores_listener_residency(),
             Self::Command(_)
             | Self::AdvanceQueue { .. }
             | Self::ConsoleChat { .. }
-            | Self::Startup(_)
             | Self::ModerationResult(_)
             | Self::CardGameDelivery(_)
             | Self::UndercoverDelivery(_) => true,
@@ -929,6 +931,7 @@ impl AutomationApp {
             config.moderation.stable_vote_samples,
             config.moderation.required_vote_margin,
         ));
+        let custom_workflow = custom_workflow::service_from_config(&config);
         Ok(Self {
             config,
             game_ui,
@@ -960,6 +963,7 @@ impl AutomationApp {
             invite: InviteService::new(),
             moderation,
             startup: StartupService::new(),
+            custom_workflow,
             commands_enabled: Arc::new(AtomicBool::new(true)),
             idle_exit: Arc::new(Mutex::new(None)),
             running: Arc::new(AtomicBool::new(true)),
@@ -1280,6 +1284,7 @@ impl AutomationApp {
             invite: self.invite.clone(),
             moderation: self.moderation.clone(),
             startup: self.startup,
+            custom_workflow: self.custom_workflow.clone(),
             commands_enabled: self.commands_enabled.clone(),
             idle_exit: self.idle_exit.clone(),
             running: self.running.clone(),
@@ -2174,11 +2179,9 @@ impl AutomationApp {
             )
             .or_else(|| command::parse_text(&message.text, &message.message_type))
             .or_else(|| {
-                custom_workflow::parse_text(
-                    &self.config.custom_workflows,
-                    &message.text,
-                    &message.message_type,
-                )
+                self.custom_workflow
+                    .parse_chat(&message.text, &message.message_type)
+                    .map(custom_workflow::into_parsed_command)
             }) else {
                 continue;
             };
@@ -3856,11 +3859,9 @@ impl AutomationApp {
                 format!("二级大厅：{}", command_text)
             };
             let parsed = command::parse_text(&synthetic, &message_type).or_else(|| {
-                custom_workflow::parse_text(
-                    &self.config.custom_workflows,
-                    &synthetic,
-                    &message_type,
-                )
+                self.custom_workflow
+                    .parse_chat(&synthetic, &message_type)
+                    .map(custom_workflow::into_parsed_command)
             });
             let Some(parsed) = parsed else {
                 log::debug!("二级监听气泡未解析为命令");

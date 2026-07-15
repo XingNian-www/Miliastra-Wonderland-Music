@@ -24,10 +24,6 @@ impl StartupSource {
     pub const fn new(label: &'static str) -> Self {
         Self(label)
     }
-
-    pub const fn label(self) -> &'static str {
-        self.0
-    }
 }
 
 impl From<&'static str> for StartupSource {
@@ -59,14 +55,6 @@ impl StartupTask {
 
     pub fn enter_wonderland(source: impl Into<StartupSource>) -> Self {
         Self::new(StartupTaskKind::EnterWonderland, source.into())
-    }
-
-    pub const fn kind(self) -> StartupTaskKind {
-        self.kind
-    }
-
-    pub const fn source(self) -> StartupSource {
-        self.source
     }
 
     pub fn label(self) -> String {
@@ -228,11 +216,7 @@ mod tests {
         let start = StartupTask::start_game(StartupSource::STARTUP_CONFIG);
         let enter = StartupTask::enter_wonderland("远程指挥台");
 
-        assert_eq!(start.kind(), StartupTaskKind::StartGame);
-        assert_eq!(start.source().label(), "启动配置");
         assert_eq!(start.label(), "启动游戏(启动配置)");
-        assert_eq!(enter.kind(), StartupTaskKind::EnterWonderland);
-        assert_eq!(enter.source(), StartupSource::REMOTE_CONSOLE);
         assert_eq!(enter.label(), "进入千星(远程指挥台)");
         assert!(start.restores_listener_residency());
         assert!(enter.restores_listener_residency());

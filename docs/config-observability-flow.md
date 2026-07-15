@@ -173,6 +173,8 @@ flowchart TD
 - `queue`：音乐播放队列摘要。
 - `commands`：最近执行命令，最多 20 条。
 - `status`：程序状态，例如启动中、运行中、已退出。
+- `turtleSoup`：业务运行时发布的海龟汤公开快照，不包含汤底或裁决备注。
+- `undercover`：业务运行时发布的谁是卧底公开快照。
 
 写入点主要有：
 
@@ -181,8 +183,9 @@ flowchart TD
 - 队列变化后提交 `MonitorEvent::Queue`。
 - `log_executed_command()` 提交 `MonitorEvent::Command`。
 - 应用启动和退出时提交 `MonitorEvent::Status`。
+- 业务运行时通过窄状态端口提交 `MonitorEvent::TurtleSoup` 和 `MonitorEvent::Undercover`。
 
-Web `/monitor` 和 TUI 都只读取这个快照。
+Web `/monitor` 和 TUI 都只读取这个快照。监控投影线程收到停止消息后会被显式等待，不能脱离应用生命周期运行。
 
 ## TUI 布局
 

@@ -1270,13 +1270,14 @@ impl AutomationApp {
         );
         let business_timer = business_runtime_builder.handle();
         let business_runtime = business_runtime_builder.build_with(|| {
-            BusinessRuntime::start_with_timer_and_modules(
+            BusinessRuntime::start_with_timer_and_modules_and_state_sink(
                 BUSINESS_RUNTIME_QUEUE_CAPACITY,
                 idiom_chain,
                 landlord,
                 undercover,
-                turtle_soup.clone(),
+                turtle_soup,
                 business_timer,
+                Arc::new(monitor.clone()),
             )
         })?;
         let business = business_runtime.business_handle();

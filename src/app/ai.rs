@@ -16,7 +16,7 @@ use crate::runtime::player_io::SearchCandidate;
 const MIMO_ENDPOINT: &str = "https://api.xiaomimimo.com/v1/chat/completions";
 const MIMO_MODEL: &str = "mimo-v2.5";
 const OPENAI_ENDPOINT: &str = "https://api.openai.com/v1/chat/completions";
-const OPENAI_MODEL: &str = "gpt-4o-mini";
+const OPENAI_MODEL: &str = "gpt-5.4-mini";
 const DEEPSEEK_ENDPOINT: &str = "https://api.deepseek.com/chat/completions";
 const DEEPSEEK_MODEL: &str = "deepseek-chat";
 const CANDIDATE_PICK_LIMIT: usize = 30;
@@ -27,13 +27,6 @@ pub struct AiClient {
     config: AiConfig,
     timing: TimingConfig,
     openai: OpenAiRuntimeHandle,
-}
-
-#[derive(Clone, Debug)]
-pub struct AiMatchResult {
-    pub matched: bool,
-    pub reason: String,
-    pub score: f64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -71,40 +64,6 @@ impl AiClient {
 
     pub fn enabled(&self) -> bool {
         !self.config.api_key.trim().is_empty()
-    }
-
-    pub fn match_same_song(
-        &self,
-        request: &str,
-        song_name: &str,
-        song_singer: &str,
-    ) -> Result<AiMatchResult> {
-        let provider = resolve_provider_config(&self.config, None)?;
-        let request = normalize_required(request, "request")?;
-        let song_name = normalize_required(song_name, "songName")?;
-        let song_singer = assert_no_control_chars(song_singer, "songSinger")?
-            .trim()
-            .to_string();
-        let reply = call_ai(
-            &self.openai,
-            &provider,
-            &build_match_prompt(&request, &song_name, &song_singer),
-            1024,
-            &self.timing,
-        )?;
-        let json_text = model_reply_json_object(&reply)?;
-        validate_match_json(&json_text)?;
-        let value: Value = serde_json::from_str(&json_text)?;
-        Ok(AiMatchResult {
-            matched: value.get("match").and_then(Value::as_bool).unwrap_or(false)
-                || value.get("decision").and_then(Value::as_str) == Some("match"),
-            reason: value
-                .get("reason")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            score: value.get("score").and_then(Value::as_f64).unwrap_or(0.0),
-        })
     }
 
     pub fn pick_song_candidate(

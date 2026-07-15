@@ -33,22 +33,28 @@ use super::decision_control::{DecisionAction, DecisionControlShared};
 #[cfg(test)]
 use super::deferred_chat::DeferredChatQueue;
 use super::geometry::parse_rect;
-use super::monitor::{MonitorQueueItem, MonitorShared};
+use super::monitor::{MonitorEvent, MonitorQueueItem, MonitorShared};
 use super::player_controller::{MusicPlayerBackend, PlayerRuntimeBackend};
 use super::queue::{PersistentQueue, QueueItem};
 use super::runtime_state::PersistentRuntimeState;
 use super::task_tracker::TaskTrackerShared;
 use super::web_tools::{WebToolRequest, WebToolShared, WebToolTemplate};
 use crate::config::AppConfig;
+#[cfg(test)]
+use crate::features::card_games::{CardGameService, LandlordConfig};
 use crate::features::custom_workflow::CustomWorkflowService;
 #[cfg(test)]
 use crate::features::entertainment::EntertainmentCoordinator;
 #[cfg(test)]
 use crate::features::moderation::{ModerationPolicy, ModerationService};
 use crate::features::startup::{StartupSource, StartupTask};
+#[cfg(test)]
 use crate::features::turtle_soup::TurtleSoupService;
 use crate::features::turtle_soup::repository::{TurtleSoupBankStore, TurtleSoupSubmission};
-use crate::features::undercover::{UndercoverCommand, UndercoverService};
+use crate::features::undercover::UndercoverCommand;
+#[cfg(test)]
+use crate::features::undercover::UndercoverRuntimeService;
+use crate::runtime::business::BusinessRuntimeHandle;
 use crate::runtime::player_io::PlayerRuntimeHandle;
 use crate::runtime::player_io::{PlayerSearchClient, PlayerSearchClientError};
 
@@ -444,9 +450,8 @@ pub struct HttpSharedState {
     pub runtime_state: Arc<Mutex<PersistentRuntimeState>>,
     pub monitor: MonitorShared,
     pub chat_listener: ChatListenerShared,
-    turtle_soup: TurtleSoupService,
     turtle_soup_bank: TurtleSoupBankStore,
-    undercover: UndercoverService,
+    business: BusinessRuntimeHandle,
     custom_workflow: CustomWorkflowService,
     pub history: Arc<Mutex<VecDeque<HistoryItem>>>,
     pub active_connections: Arc<AtomicUsize>,
@@ -499,8 +504,7 @@ impl HttpSharedState {
         runtime_state: Arc<Mutex<PersistentRuntimeState>>,
         pending: Arc<(Mutex<VecDeque<super::TrackedPendingTask>>, Condvar)>,
         chat_listener: ChatListenerShared,
-        turtle_soup: TurtleSoupService,
-        undercover: UndercoverService,
+        business: BusinessRuntimeHandle,
         monitor: MonitorShared,
         task_tracker: TaskTrackerShared,
         decision_control: DecisionControlShared,
@@ -519,9 +523,8 @@ impl HttpSharedState {
             runtime_state,
             monitor,
             chat_listener,
-            turtle_soup,
             turtle_soup_bank,
-            undercover,
+            business,
             custom_workflow,
             history: Arc::new(Mutex::new(VecDeque::new())),
             active_connections: Arc::new(AtomicUsize::new(0)),
@@ -1371,7 +1374,13 @@ fn turtle_soup_route(
     _query: &[(String, String)],
     state: &HttpSharedState,
 ) -> std::result::Result<String, AppError> {
-    serde_json::to_string(&state.turtle_soup.snapshot()).map_err(internal_error)
+    serde_json::to_string(
+        &state
+            .business
+            .turtle_soup_snapshot()
+            .map_err(internal_error)?,
+    )
+    .map_err(internal_error)
 }
 
 fn turtle_soup_start_route(
@@ -1382,13 +1391,13 @@ fn turtle_soup_start_route(
         .map(str::trim)
         .filter(|id| !id.is_empty())
     {
-        Some(id) => state.turtle_soup.start_by_id_from_web(id),
-        None => state.turtle_soup.start_random_from_web(),
+        Some(id) => state.business.start_turtle_soup_by_id(id),
+        None => state.business.start_turtle_soup_random(),
     }
-    .map_err(turtle_soup_error)?;
+    .map_err(internal_error)?;
     serde_json::to_string(&json!({
         "ok": true,
-        "turtleSoup": state.turtle_soup.snapshot(),
+        "turtleSoup": state.business.turtle_soup_snapshot().map_err(internal_error)?,
     }))
     .map_err(internal_error)
 }
@@ -1397,10 +1406,7 @@ fn turtle_soup_end_route(
     _query: &[(String, String)],
     state: &HttpSharedState,
 ) -> std::result::Result<String, AppError> {
-    let ended = state
-        .turtle_soup
-        .end_from_web()
-        .map_err(turtle_soup_error)?;
+    let ended = state.business.end_turtle_soup().map_err(internal_error)?;
     if !ended {
         return Err(AppError {
             status: 409,
@@ -1409,7 +1415,7 @@ fn turtle_soup_end_route(
     }
     serde_json::to_string(&json!({
         "ok": true,
-        "turtleSoup": state.turtle_soup.snapshot(),
+        "turtleSoup": state.business.turtle_soup_snapshot().map_err(internal_error)?,
     }))
     .map_err(internal_error)
 }
@@ -1441,8 +1447,8 @@ fn undercover_route(
     state: &HttpSharedState,
 ) -> std::result::Result<String, AppError> {
     let snapshot = state
-        .undercover
-        .snapshot(std::time::Instant::now())
+        .business
+        .undercover_snapshot()
         .map_err(internal_error)?;
     serde_json::to_string(&snapshot).map_err(internal_error)
 }
@@ -2057,7 +2063,7 @@ fn queue_clear(state: &HttpSharedState) -> std::result::Result<String, AppError>
 }
 
 fn sync_monitor_queue(monitor: &MonitorShared, queue: &PersistentQueue) {
-    monitor.set_queue(
+    monitor.publish(MonitorEvent::Queue(
         queue
             .items()
             .iter()
@@ -2069,7 +2075,7 @@ fn sync_monitor_queue(monitor: &MonitorShared, queue: &PersistentQueue) {
                 friend_username: item.friend_username.clone(),
             })
             .collect(),
-    );
+    ));
 }
 
 fn state_json(state: &HttpSharedState) -> std::result::Result<String, AppError> {
@@ -2183,14 +2189,20 @@ fn monitor_json(state: &HttpSharedState) -> std::result::Result<String, AppError
         );
         object.insert(
             "turtleSoup".to_string(),
-            serde_json::to_value(state.turtle_soup.snapshot()).map_err(internal_error)?,
+            serde_json::to_value(
+                state
+                    .business
+                    .turtle_soup_snapshot()
+                    .map_err(internal_error)?,
+            )
+            .map_err(internal_error)?,
         );
         object.insert(
             "undercover".to_string(),
             serde_json::to_value(
                 state
-                    .undercover
-                    .snapshot(std::time::Instant::now())
+                    .business
+                    .undercover_snapshot()
                     .map_err(internal_error)?,
             )
             .map_err(internal_error)?,
@@ -2201,10 +2213,13 @@ fn monitor_json(state: &HttpSharedState) -> std::result::Result<String, AppError
 
 fn sync_chat_listener_monitor(state: &HttpSharedState) {
     let snapshot = state.chat_listener.snapshot();
-    state.monitor.set_chat_listener(
-        snapshot.display_mode(),
-        snapshot.pending_mode.map(|mode| mode.label().to_string()),
-    );
+    state.monitor.publish(MonitorEvent::ChatListener {
+        mode: snapshot.display_mode().to_string(),
+        pending_mode: snapshot
+            .pending_mode
+            .map(|mode| mode.label().to_string())
+            .unwrap_or_default(),
+    });
 }
 
 fn chat_send(
@@ -2842,13 +2857,6 @@ fn internal_message(message: &str) -> AppError {
     internal_error(anyhow!(message.to_string()))
 }
 
-fn turtle_soup_error(error: anyhow::Error) -> AppError {
-    AppError {
-        status: 409,
-        message: error.to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2946,6 +2954,7 @@ mod tests {
         state: HttpSharedState,
         _player_runtime: PlayerRuntime,
         _openai_runtime: crate::runtime::openai::OpenAiRuntime,
+        _business_runtime: crate::runtime::business::BusinessRuntime,
     }
 
     impl Deref for HttpTestState {
@@ -4106,14 +4115,29 @@ workflows:
         let openai_runtime =
             crate::runtime::openai::OpenAiRuntime::start().expect("test OpenAI runtime");
         let openai = openai_runtime.handle();
+        let entertainment = EntertainmentCoordinator::new();
         let turtle_soup = TurtleSoupService::new(
             config.turtle_soup.clone(),
-            EntertainmentCoordinator::new(),
+            entertainment.clone(),
             DeferredChatQueue::new(32),
             openai.clone(),
         );
         let undercover =
-            UndercoverService::new(config.undercover.clone(), EntertainmentCoordinator::new());
+            UndercoverRuntimeService::new(config.undercover.clone(), entertainment.clone());
+        let idiom_chain = crate::features::idiom_chain::IdiomChainService::from_entries_for_test(
+            &["画蛇添足", "足智多谋"],
+            entertainment.clone(),
+            None,
+        );
+        let business_runtime = crate::runtime::business::BusinessRuntime::start_with_undercover(
+            16,
+            idiom_chain,
+            CardGameService::new(LandlordConfig::default(), entertainment),
+            undercover,
+            turtle_soup,
+        )
+        .expect("business runtime");
+        let business = business_runtime.handle();
         let player_runtime_config = config.player_runtime_config().expect("player config");
         let player_runtime = PlayerRuntime::start(
             HttpTestObservationPort,
@@ -4135,8 +4159,7 @@ workflows:
                 runtime_state,
                 pending,
                 ChatListenerShared::new(),
-                turtle_soup,
-                undercover,
+                business,
                 monitor,
                 TaskTrackerShared::new(),
                 DecisionControlShared::new(),
@@ -4148,6 +4171,7 @@ workflows:
             ),
             _player_runtime: player_runtime,
             _openai_runtime: openai_runtime,
+            _business_runtime: business_runtime,
         }
     }
 }

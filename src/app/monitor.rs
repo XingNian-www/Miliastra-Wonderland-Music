@@ -94,9 +94,30 @@ pub(super) struct MonitorSnapshot {
     pub(super) operational: MonitorOperationalState,
 }
 
+#[derive(Debug)]
+pub(super) enum MonitorEvent {
+    Log(String),
+    Ocr(OcrSnapshot),
+    Queue(Vec<MonitorQueueItem>),
+    Command(String),
+    Status(String),
+    PlaybackController(MonitorPlaybackController),
+    ChatListener {
+        mode: String,
+        pending_mode: String,
+    },
+    Operational {
+        scanner_paused: bool,
+        commands_enabled: bool,
+        idle_exit_remaining_seconds: Option<u64>,
+        hall_remaining_minutes: Option<u32>,
+    },
+    UiState(String),
+}
+
 #[derive(Clone)]
 pub(crate) struct MonitorShared {
-    state: Arc<Mutex<MonitorState>>,
+    projection: Arc<MonitorProjection>,
 }
 
 #[derive(Clone)]
@@ -117,115 +138,61 @@ struct MonitorState {
     operational: MonitorOperationalState,
 }
 
-impl MonitorShared {
-    pub(crate) fn new(log_limit: usize) -> Self {
-        Self {
-            state: Arc::new(Mutex::new(MonitorState {
-                logs: VecDeque::new(),
-                log_limit: log_limit.max(20),
-                ocr: None,
-                queue: Vec::new(),
-                commands: VecDeque::new(),
-                status: "启动中".to_string(),
-                playback_controller: MonitorPlaybackController::default(),
-                chat_listener: MonitorChatListener::default(),
-                operational: MonitorOperationalState {
-                    commands_enabled: true,
-                    ..MonitorOperationalState::default()
-                },
-            })),
-        }
-    }
+struct MonitorProjection {
+    state: Mutex<MonitorState>,
+}
 
-    pub(crate) fn log_sink(&self) -> MonitorLogSink {
-        MonitorLogSink {
-            shared: self.clone(),
-        }
-    }
-
-    pub(super) fn push_log(&self, line: String) {
-        if let Ok(mut state) = self.state.lock() {
-            let mut pushed = false;
-            for part in line.lines() {
-                state.logs.push_back(part.to_string());
-                pushed = true;
-                while state.logs.len() > state.log_limit {
-                    state.logs.pop_front();
+impl MonitorProjection {
+    fn apply(&self, event: MonitorEvent) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        match event {
+            MonitorEvent::Log(line) => {
+                let mut pushed = false;
+                for part in line.lines() {
+                    state.logs.push_back(part.to_string());
+                    pushed = true;
+                    while state.logs.len() > state.log_limit {
+                        state.logs.pop_front();
+                    }
+                }
+                if !pushed {
+                    state.logs.push_back(String::new());
+                    while state.logs.len() > state.log_limit {
+                        state.logs.pop_front();
+                    }
                 }
             }
-            if !pushed {
-                state.logs.push_back(String::new());
-                while state.logs.len() > state.log_limit {
-                    state.logs.pop_front();
+            MonitorEvent::Ocr(snapshot) => state.ocr = Some(snapshot),
+            MonitorEvent::Queue(queue) => state.queue = queue,
+            MonitorEvent::Command(command) => {
+                state.commands.push_back(command);
+                while state.commands.len() > 20 {
+                    state.commands.pop_front();
                 }
             }
-        }
-    }
-
-    pub(super) fn set_ocr(&self, snapshot: OcrSnapshot) {
-        if let Ok(mut state) = self.state.lock() {
-            state.ocr = Some(snapshot);
-        }
-    }
-
-    pub(super) fn set_queue(&self, queue: Vec<MonitorQueueItem>) {
-        if let Ok(mut state) = self.state.lock() {
-            state.queue = queue;
-        }
-    }
-
-    pub(super) fn push_command(&self, command: String) {
-        if let Ok(mut state) = self.state.lock() {
-            state.commands.push_back(command);
-            while state.commands.len() > 20 {
-                state.commands.pop_front();
+            MonitorEvent::Status(status) => state.status = status,
+            MonitorEvent::PlaybackController(snapshot) => state.playback_controller = snapshot,
+            MonitorEvent::ChatListener { mode, pending_mode } => {
+                state.chat_listener = MonitorChatListener { mode, pending_mode };
             }
+            MonitorEvent::Operational {
+                scanner_paused,
+                commands_enabled,
+                idle_exit_remaining_seconds,
+                hall_remaining_minutes,
+            } => {
+                state.operational.scanner_paused = scanner_paused;
+                state.operational.commands_enabled = commands_enabled;
+                state.operational.idle_exit_remaining_seconds = idle_exit_remaining_seconds;
+                state.operational.hall_remaining_minutes = hall_remaining_minutes;
+            }
+            MonitorEvent::UiState(ui_state) => state.operational.ui_state = ui_state,
         }
     }
 
-    pub(super) fn set_status(&self, status: impl Into<String>) {
-        if let Ok(mut state) = self.state.lock() {
-            state.status = status.into();
-        }
-    }
-
-    pub(super) fn set_playback_controller(&self, snapshot: MonitorPlaybackController) {
-        if let Ok(mut state) = self.state.lock() {
-            state.playback_controller = snapshot;
-        }
-    }
-
-    pub(super) fn set_chat_listener(&self, mode: impl Into<String>, pending_mode: Option<String>) {
-        if let Ok(mut state) = self.state.lock() {
-            state.chat_listener = MonitorChatListener {
-                mode: mode.into(),
-                pending_mode: pending_mode.unwrap_or_default(),
-            };
-        }
-    }
-
-    pub(super) fn set_operational(
-        &self,
-        scanner_paused: bool,
-        commands_enabled: bool,
-        idle_exit_remaining_seconds: Option<u64>,
-        hall_remaining_minutes: Option<u32>,
-    ) {
-        if let Ok(mut state) = self.state.lock() {
-            state.operational.scanner_paused = scanner_paused;
-            state.operational.commands_enabled = commands_enabled;
-            state.operational.idle_exit_remaining_seconds = idle_exit_remaining_seconds;
-            state.operational.hall_remaining_minutes = hall_remaining_minutes;
-        }
-    }
-
-    pub(super) fn set_ui_state(&self, ui_state: impl Into<String>) {
-        if let Ok(mut state) = self.state.lock() {
-            state.operational.ui_state = ui_state.into();
-        }
-    }
-
-    pub(super) fn snapshot(&self) -> MonitorSnapshot {
+    fn snapshot(&self) -> MonitorSnapshot {
         self.state.lock().map_or_else(
             |_| MonitorSnapshot {
                 logs: Vec::new(),
@@ -251,9 +218,46 @@ impl MonitorShared {
     }
 }
 
+impl MonitorShared {
+    pub(crate) fn new(log_limit: usize) -> Self {
+        Self {
+            projection: Arc::new(MonitorProjection {
+                state: Mutex::new(MonitorState {
+                    logs: VecDeque::new(),
+                    log_limit: log_limit.max(20),
+                    ocr: None,
+                    queue: Vec::new(),
+                    commands: VecDeque::new(),
+                    status: "启动中".to_string(),
+                    playback_controller: MonitorPlaybackController::default(),
+                    chat_listener: MonitorChatListener::default(),
+                    operational: MonitorOperationalState {
+                        commands_enabled: true,
+                        ..MonitorOperationalState::default()
+                    },
+                }),
+            }),
+        }
+    }
+
+    pub(crate) fn log_sink(&self) -> MonitorLogSink {
+        MonitorLogSink {
+            shared: self.clone(),
+        }
+    }
+
+    pub(super) fn publish(&self, event: MonitorEvent) {
+        self.projection.apply(event);
+    }
+
+    pub(super) fn snapshot(&self) -> MonitorSnapshot {
+        self.projection.snapshot()
+    }
+}
+
 impl MonitorLogSink {
     pub(super) fn push(&self, line: String) {
-        self.shared.push_log(line);
+        self.shared.publish(MonitorEvent::Log(line));
     }
 }
 
@@ -262,4 +266,43 @@ fn current_unix_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn typed_events_update_the_single_monitor_projection() {
+        let monitor = MonitorShared::new(20);
+        monitor.publish(MonitorEvent::Queue(vec![MonitorQueueItem {
+            id: 9,
+            keyword: "晴天".to_string(),
+            source: "qqmusic".to_string(),
+            prefer_accompaniment: false,
+            friend_username: String::new(),
+        }]));
+        monitor.publish(MonitorEvent::ChatListener {
+            mode: "二级".to_string(),
+            pending_mode: "一级".to_string(),
+        });
+        monitor.publish(MonitorEvent::Operational {
+            scanner_paused: true,
+            commands_enabled: false,
+            idle_exit_remaining_seconds: Some(12),
+            hall_remaining_minutes: Some(8),
+        });
+        monitor.publish(MonitorEvent::UiState("secondary:chat".to_string()));
+
+        let snapshot = monitor.snapshot();
+        assert_eq!(snapshot.queue.len(), 1);
+        assert_eq!(snapshot.queue[0].id, 9);
+        assert_eq!(snapshot.chat_listener.mode, "二级");
+        assert_eq!(snapshot.chat_listener.pending_mode, "一级");
+        assert!(snapshot.operational.scanner_paused);
+        assert!(!snapshot.operational.commands_enabled);
+        assert_eq!(snapshot.operational.idle_exit_remaining_seconds, Some(12));
+        assert_eq!(snapshot.operational.hall_remaining_minutes, Some(8));
+        assert_eq!(snapshot.operational.ui_state, "secondary:chat");
+    }
 }

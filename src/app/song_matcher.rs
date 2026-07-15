@@ -8,7 +8,7 @@ pub fn match_song_query(
     prefer_accompaniment: bool,
 ) -> MatchResult {
     if !prefer_accompaniment && is_accompaniment_title(returned_name) {
-        return MatchResult::no("非伴奏点歌不接受伴奏版本");
+        return MatchResult::no();
     }
 
     let query_text = if prefer_accompaniment {
@@ -23,31 +23,28 @@ pub fn match_song_query(
     };
     let normalized_query = normalize(&query_text);
     let Some(name_match) = best_returned_name_match(config, &normalized_query, &name_text) else {
-        return MatchResult::no("缺少点歌文本或返回歌曲名");
+        return MatchResult::no();
     };
     let normalized_name = name_match.normalized.as_str();
     if normalized_query.is_empty() {
-        return MatchResult::no("缺少点歌文本或返回歌曲名");
+        return MatchResult::no();
     }
 
     let has_full_name = normalized_query.contains(normalized_name);
     let name_score = name_match.score;
     if name_score < config.min_song_name_score {
-        return MatchResult::no(&format!(
-            "歌曲名匹配度{}%",
-            (name_score * 100.0).round() as i32
-        ));
+        return MatchResult::no();
     }
     if is_contained_query_name(normalized_name, &normalized_query) {
         if !is_safe_contained_query_name(&name_match.raw, query, &normalized_query) {
-            return MatchResult::no("歌名局部包含无明确边界");
+            return MatchResult::no();
         }
-        return MatchResult::yes("歌名包含匹配");
+        return MatchResult::yes();
     }
 
     let singer_candidate = remove_matched_name(config, &normalized_query, normalized_name);
     if singer_candidate.is_empty() {
-        return MatchResult::yes("歌曲名匹配");
+        return MatchResult::yes();
     }
 
     if has_full_name
@@ -55,16 +52,16 @@ pub fn match_song_query(
         && singer_candidate.chars().count() <= config.max_ocr_noise_chars + 1
         && can_ignore_full_name_extra(normalized_name, &singer_candidate)
     {
-        return MatchResult::yes(&format!("忽略OCR噪声:{}", singer_candidate));
+        return MatchResult::yes();
     }
 
     if singer_matches(config, &singer_candidate, returned_singers) {
-        return MatchResult::yes(&format!("歌手匹配:{}", singer_candidate));
+        return MatchResult::yes();
     }
 
     if !has_full_name {
         if singer_candidate.chars().count() <= config.max_ocr_noise_chars + 1 {
-            return MatchResult::yes(&format!("模糊匹配:{}", singer_candidate));
+            return MatchResult::yes();
         }
         let name_cn_chars = chinese_chars(normalized_name);
         let max_strip = singer_candidate
@@ -75,12 +72,12 @@ pub fn match_song_query(
         for strip in 1..=max_strip {
             let stripped = singer_candidate.chars().skip(strip).collect::<String>();
             if singer_matches(config, &stripped, returned_singers) {
-                return MatchResult::yes(&format!("剥字后歌手匹配:{}", stripped));
+                return MatchResult::yes();
             }
         }
     }
 
-    MatchResult::no(&format!("歌手不匹配:{}", singer_candidate))
+    MatchResult::no()
 }
 
 #[derive(Clone, Debug)]
@@ -124,22 +121,15 @@ fn best_returned_name_match(
 #[derive(Clone, Debug)]
 pub struct MatchResult {
     pub ok: bool,
-    pub reason: String,
 }
 
 impl MatchResult {
-    fn yes(reason: &str) -> Self {
-        Self {
-            ok: true,
-            reason: reason.to_string(),
-        }
+    fn yes() -> Self {
+        Self { ok: true }
     }
 
-    fn no(reason: &str) -> Self {
-        Self {
-            ok: false,
-            reason: reason.to_string(),
-        }
+    fn no() -> Self {
+        Self { ok: false }
     }
 }
 
@@ -776,7 +766,7 @@ mod tests {
             false,
         );
 
-        assert!(result.ok, "{}", result.reason);
+        assert!(result.ok);
     }
 
     #[test]
@@ -789,7 +779,7 @@ mod tests {
             false,
         );
 
-        assert!(result.ok, "{}", result.reason);
+        assert!(result.ok);
     }
 
     #[test]
@@ -802,7 +792,7 @@ mod tests {
             false,
         );
 
-        assert!(result.ok, "{}", result.reason);
+        assert!(result.ok);
     }
 
     #[test]
@@ -815,7 +805,7 @@ mod tests {
             false,
         );
 
-        assert!(!result.ok, "{}", result.reason);
+        assert!(!result.ok);
     }
 
     #[test]
@@ -828,7 +818,7 @@ mod tests {
             false,
         );
 
-        assert!(!result.ok, "{}", result.reason);
+        assert!(!result.ok);
     }
 
     #[test]
@@ -841,7 +831,7 @@ mod tests {
             false,
         );
 
-        assert!(!result.ok, "{}", result.reason);
+        assert!(!result.ok);
     }
 
     #[test]
@@ -854,7 +844,7 @@ mod tests {
             false,
         );
 
-        assert!(result.ok, "{}", result.reason);
+        assert!(result.ok);
     }
 
     #[test]
@@ -867,6 +857,6 @@ mod tests {
             false,
         );
 
-        assert!(result.ok, "{}", result.reason);
+        assert!(result.ok);
     }
 }

@@ -193,10 +193,6 @@ impl IdiomChainService {
         Ok(aborted)
     }
 
-    pub(crate) fn expire_idle_now(&mut self) -> Result<bool> {
-        self.expire_idle_at(Instant::now())
-    }
-
     pub(crate) fn expire_idle_at(&mut self, now: Instant) -> Result<bool> {
         let expired = self.game.expire_idle_at(now);
         if expired {
@@ -256,10 +252,6 @@ impl IdiomChainGame {
 
     pub fn abort(&mut self) -> bool {
         self.session.take().is_some()
-    }
-
-    pub fn expire_idle_now(&mut self) -> bool {
-        self.expire_idle_at(Instant::now())
     }
 
     pub fn expire_idle_at(&mut self, now: Instant) -> bool {

@@ -35,7 +35,7 @@ flowchart TD
 | `src/app/decision_lock.rs` | 确认窗口开始前收集已存在决策，避免旧消息误触发。 |
 | `src/app/command.rs` | `CustomWorkflowCommand`、`ModerationCommand` 等命令模型。 |
 | `src/main.rs` | 把解析出的命令和投票结果接入待执行任务队列。 |
-| `src/app/config.rs` | `CustomWorkflowConfig`、`CustomWorkflowDefinition`、`CustomWorkflowStep` 配置结构。 |
+| `src/config/mod.rs` | `CustomWorkflowConfig`、`CustomWorkflowDefinition`、`CustomWorkflowStep` 配置结构。 |
 
 ## 自定义命令解析
 

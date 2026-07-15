@@ -1,4 +1,4 @@
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
@@ -7,6 +7,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::{FeelUOwnConfig, TimingConfig};
+use crate::runtime::player::{RawPlayerSample, TransportState};
+use crate::runtime::player_io::{
+    ControlDispatchOutcome, PickedCandidate as RuntimePickedCandidate, PlayerControl,
+    PlayerControlPort, PlayerObservationPort, PlayerObservationReadError, PlayerSearchError,
+    PlayerSearchPort, SearchCandidate as RuntimeSearchCandidate,
+};
 
 const VOLUME_CURVE_POWER: f64 = 0.5;
 const VOLUME_SMOOTH_STEPS: i64 = 8;
@@ -34,10 +40,125 @@ pub struct PlayerStatus {
     pub volume: i64,
 }
 
+#[derive(Clone, Debug, Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+struct RawPlayerStatus {
+    status: Option<String>,
+    current_uri: Option<String>,
+    name: Option<String>,
+    singer: Option<String>,
+    album_name: Option<String>,
+    lyric_line_text: Option<String>,
+    duration: Option<f64>,
+    progress: Option<f64>,
+    playback_rate: Option<f64>,
+    volume: Option<i64>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct SearchCandidate {
     pub text: String,
     pub uri: String,
+}
+
+impl From<RawPlayerStatus> for RawPlayerSample {
+    fn from(status: RawPlayerStatus) -> Self {
+        Self {
+            uri: status.current_uri.and_then(nonempty_text),
+            transport: status.status.as_deref().and_then(parse_transport_state),
+            title: status.name.and_then(nonempty_text),
+            artist: status.singer.and_then(nonempty_text),
+            album_name: status.album_name.and_then(nonempty_text),
+            lyric_line_text: status.lyric_line_text.map(|line| line.trim().to_string()),
+            progress: status.progress.and_then(nonnegative_duration),
+            duration: status.duration.and_then(nonnegative_duration),
+            playback_rate: status
+                .playback_rate
+                .filter(|rate| rate.is_finite() && *rate > 0.0),
+            volume: status.volume.filter(|volume| (0..=100).contains(volume)),
+        }
+    }
+}
+
+impl From<RawPlayerStatus> for PlayerStatus {
+    fn from(status: RawPlayerStatus) -> Self {
+        Self {
+            status: status.status.unwrap_or_else(|| "stopped".to_string()),
+            current_uri: status.current_uri.unwrap_or_default(),
+            name: status.name.unwrap_or_default(),
+            singer: status.singer.unwrap_or_default(),
+            album_name: status.album_name.unwrap_or_default(),
+            lyric_line_text: status.lyric_line_text.unwrap_or_default(),
+            duration: status.duration.unwrap_or(0.0),
+            progress: status.progress.unwrap_or(0.0),
+            playback_rate: status.playback_rate.unwrap_or(1.0),
+            volume: status.volume.unwrap_or(0),
+        }
+    }
+}
+
+fn nonempty_text(value: String) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn parse_transport_state(value: &str) -> Option<TransportState> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "playing" => Some(TransportState::Playing),
+        "paused" => Some(TransportState::Paused),
+        "stopped" | "stoped" => Some(TransportState::Stopped),
+        _ => None,
+    }
+}
+
+fn nonnegative_duration(value: f64) -> Option<Duration> {
+    Duration::try_from_secs_f64(value).ok()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AckCode {
+    Ok,
+    Oops,
+}
+
+struct RpcAcknowledgement {
+    code: AckCode,
+    status_line: String,
+    body: Vec<u8>,
+    body_error: Option<anyhow::Error>,
+}
+
+impl RpcAcknowledgement {
+    fn body_text(&self) -> String {
+        String::from_utf8_lossy(&self.body).to_string()
+    }
+
+    fn control_message(&self) -> String {
+        let body = self.body_text();
+        if body.trim().is_empty() {
+            self.status_line.clone()
+        } else {
+            body
+        }
+    }
+
+    fn into_legacy_result(self) -> Result<String> {
+        if let Some(error) = self.body_error {
+            return Err(error);
+        }
+        let body = self.body_text();
+        match self.code {
+            AckCode::Ok => Ok(body),
+            AckCode::Oops if body.trim().is_empty() => Err(anyhow!(self.status_line)),
+            AckCode::Oops => Err(anyhow!(body)),
+        }
+    }
+}
+
+enum RpcRequestOutcome {
+    Acknowledgement(RpcAcknowledgement),
+    NotSent(anyhow::Error),
+    OutcomeUnknown(anyhow::Error),
 }
 
 impl FeelUOwnClient {
@@ -51,20 +172,39 @@ impl FeelUOwnClient {
     }
 
     pub fn request(&self, command: &str) -> Result<String> {
-        let mut stream = self.connect()?;
-        self.send_command(&mut stream, command)?;
-        let status_line = read_line(&mut stream).context("read FeelUOwn ACK")?;
-        let (ok, body_len) = parse_ack(&status_line)?;
-        let mut body = vec![0_u8; body_len];
-        stream.read_exact(&mut body).context("read FeelUOwn body")?;
-        let body = String::from_utf8_lossy(&body).to_string();
-        if ok {
-            Ok(body)
-        } else if body.trim().is_empty() {
-            bail!(status_line)
-        } else {
-            bail!(body)
+        match self.request_once(command) {
+            RpcRequestOutcome::Acknowledgement(acknowledgement) => {
+                acknowledgement.into_legacy_result()
+            }
+            RpcRequestOutcome::NotSent(error) | RpcRequestOutcome::OutcomeUnknown(error) => {
+                Err(error)
+            }
         }
+    }
+
+    fn request_once(&self, command: &str) -> RpcRequestOutcome {
+        let mut stream = match self.connect() {
+            Ok(stream) => stream,
+            Err(error) => return RpcRequestOutcome::NotSent(error),
+        };
+        if let Err(error) = self.send_command(&mut stream, command) {
+            return RpcRequestOutcome::OutcomeUnknown(error);
+        }
+        let status_line = match read_line(&mut stream).context("read FeelUOwn ACK") {
+            Ok(status_line) => status_line,
+            Err(error) => return RpcRequestOutcome::OutcomeUnknown(error),
+        };
+        let (code, body_len) = match parse_ack(&status_line) {
+            Ok(ack) => ack,
+            Err(error) => return RpcRequestOutcome::OutcomeUnknown(error),
+        };
+        let (body, body_error) = read_rpc_body(&mut stream, body_len);
+        RpcRequestOutcome::Acknowledgement(RpcAcknowledgement {
+            code,
+            status_line,
+            body,
+            body_error,
+        })
     }
 
     fn connect(&self) -> Result<TcpStream> {
@@ -109,6 +249,10 @@ impl FeelUOwnClient {
     }
 
     pub fn status(&self) -> Result<PlayerStatus> {
+        self.raw_status().map(PlayerStatus::from)
+    }
+
+    fn raw_status(&self) -> Result<RawPlayerStatus> {
         let json = parse_json_from_text(&self.exec(STATUS_SCRIPT)?)?;
         serde_json::from_str(&json).with_context(|| format!("parse FeelUOwn status: {}", json))
     }
@@ -188,6 +332,101 @@ impl FeelUOwnClient {
     }
 }
 
+impl PlayerControlPort for FeelUOwnClient {
+    fn dispatch(&mut self, control: &PlayerControl) -> ControlDispatchOutcome {
+        if matches!(control, PlayerControl::PlayUri(uri) if !uri.starts_with("fuo://")) {
+            return ControlDispatchOutcome::not_sent("只允许 fuo:// URI");
+        }
+        if matches!(control, PlayerControl::SetVolume(volume) if *volume > 100) {
+            return ControlDispatchOutcome::not_sent("volume 参数必须是 0-100");
+        }
+
+        let command = match control {
+            PlayerControl::PlayUri(uri) => format!("play {}", shell_quote(uri)),
+            PlayerControl::Pause => "pause".to_string(),
+            PlayerControl::Resume => "resume".to_string(),
+            PlayerControl::Next => "next".to_string(),
+            PlayerControl::Previous => "previous".to_string(),
+            PlayerControl::SetVolume(volume) => {
+                let target = map_input_volume(f64::from(*volume));
+                format!(
+                    "exec << EOF\n{}\nEOF\n",
+                    volume_smooth_script(target, self.volume_smooth_step_ms)
+                )
+            }
+        };
+        self.dispatch_control_command(&command)
+    }
+}
+
+impl PlayerObservationPort for FeelUOwnClient {
+    fn read_sample(&mut self) -> Result<RawPlayerSample, PlayerObservationReadError> {
+        self.raw_status()
+            .map(RawPlayerSample::from)
+            .map_err(|error| PlayerObservationReadError::new(error.to_string()))
+    }
+}
+
+impl PlayerSearchPort for FeelUOwnClient {
+    fn search_text(&mut self, keyword: &str, source: &str) -> Result<String, PlayerSearchError> {
+        self.search(keyword, source)
+            .map_err(|error| PlayerSearchError::new(error.to_string()))
+    }
+
+    fn search_candidates(
+        &mut self,
+        keyword: &str,
+        source: &str,
+    ) -> Result<Vec<RuntimeSearchCandidate>, PlayerSearchError> {
+        FeelUOwnClient::search_candidates(self, keyword, source)
+            .map(|candidates| {
+                candidates
+                    .into_iter()
+                    .map(|candidate| RuntimeSearchCandidate::new(candidate.text, candidate.uri))
+                    .collect()
+            })
+            .map_err(|error| PlayerSearchError::new(error.to_string()))
+    }
+
+    fn search_and_pick(
+        &mut self,
+        keyword: &str,
+        source: &str,
+        prefer_accompaniment: bool,
+    ) -> Result<Option<RuntimePickedCandidate>, PlayerSearchError> {
+        FeelUOwnClient::search_and_pick(self, keyword, source, prefer_accompaniment)
+            .map(|picked| {
+                picked.map(|(candidate, formatted_candidates)| {
+                    RuntimePickedCandidate::new(
+                        RuntimeSearchCandidate::new(candidate.text, candidate.uri),
+                        formatted_candidates,
+                    )
+                })
+            })
+            .map_err(|error| PlayerSearchError::new(error.to_string()))
+    }
+}
+
+impl FeelUOwnClient {
+    fn dispatch_control_command(&self, command: &str) -> ControlDispatchOutcome {
+        match self.request_once(command) {
+            RpcRequestOutcome::Acknowledgement(acknowledgement) => {
+                let message = acknowledgement.control_message();
+                match acknowledgement.code {
+                    AckCode::Ok => ControlDispatchOutcome::acknowledged(message),
+                    AckCode::Oops => ControlDispatchOutcome::rejected(message),
+                }
+            }
+            RpcRequestOutcome::NotSent(error) => {
+                ControlDispatchOutcome::not_sent(error.to_string())
+            }
+            RpcRequestOutcome::OutcomeUnknown(error) => {
+                ControlDispatchOutcome::outcome_unknown(error.to_string())
+            }
+        }
+    }
+}
+
 fn format_search_candidates(candidates: &[SearchCandidate]) -> String {
     candidates
         .iter()
@@ -237,16 +476,56 @@ fn read_line(stream: &mut TcpStream) -> Result<String> {
         .to_string())
 }
 
-fn parse_ack(line: &str) -> Result<(bool, usize)> {
+fn read_rpc_body(stream: &mut TcpStream, expected_len: usize) -> (Vec<u8>, Option<anyhow::Error>) {
+    let mut body = Vec::with_capacity(expected_len);
+    while body.len() < expected_len {
+        let remaining = expected_len - body.len();
+        let mut chunk = [0_u8; 8 * 1024];
+        let chunk_len = remaining.min(chunk.len());
+        match stream.read(&mut chunk[..chunk_len]) {
+            Ok(0) => {
+                let source = std::io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    format!(
+                        "FeelUOwn body ended after {} of {} bytes",
+                        body.len(),
+                        expected_len
+                    ),
+                );
+                return (
+                    body,
+                    Some(anyhow::Error::new(source).context("read FeelUOwn body")),
+                );
+            }
+            Ok(read) => body.extend_from_slice(&chunk[..read]),
+            Err(error) => {
+                return (
+                    body,
+                    Some(anyhow::Error::new(error).context("read FeelUOwn body")),
+                );
+            }
+        }
+    }
+    (body, None)
+}
+
+fn parse_ack(line: &str) -> Result<(AckCode, usize)> {
     let parts = line.split_whitespace().collect::<Vec<_>>();
-    if parts.len() < 3 || !parts[0].eq_ignore_ascii_case("ACK") {
+    let [protocol, code, body_len] = parts.as_slice() else {
+        bail!("无效的 FeelUOwn 响应: {}", line);
+    };
+    if *protocol != "ACK" {
         bail!("无效的 FeelUOwn 响应: {}", line);
     }
-    let ok = parts[1].eq_ignore_ascii_case("ok");
-    let len = parts[2]
+    let code = match *code {
+        "OK" => AckCode::Ok,
+        "Oops" => AckCode::Oops,
+        _ => bail!("无效的 FeelUOwn ACK 状态: {}", line),
+    };
+    let len = body_len
         .parse::<usize>()
         .context("parse FeelUOwn body length")?;
-    Ok((ok, len))
+    Ok((code, len))
 }
 
 fn parse_json_from_text(text: &str) -> Result<String> {
@@ -562,73 +841,79 @@ except Exception:
 
 VOLUME_CURVE_POWER = 0.5
 
-player = app.player
-playlist = app.playlist
-song = getattr(playlist, 'current_song', None)
-metadata = getattr(player, 'current_metadata', {}) or {}
-
-def meta_get(key, default=''):
+def attr(obj, name):
     try:
-        return metadata.get(key, default)
+        return getattr(obj, name) if obj is not None else None
     except Exception:
-        return default
+        return None
+
+def meta_get(metadata, key):
+    try:
+        return metadata.get(key) if metadata is not None else None
+    except Exception:
+        return None
 
 def text(value):
     if value is None:
-        return ''
-    if isinstance(value, (list, tuple)):
-        return ', '.join(str(item) for item in value)
-    return str(value)
-
-def attr(obj, name, default=''):
+        return None
     try:
-        return getattr(obj, name, default) if obj is not None else default
+        if isinstance(value, (list, tuple)):
+            return ', '.join(str(item) for item in value)
+        return str(value)
     except Exception:
-        return default
+        return None
 
 def model_uri(model):
     if model is None or reverse is None:
-        return ''
+        return None
     try:
         return reverse(model)
     except Exception:
-        return ''
+        return None
 
-def number(value, default=0):
+def number(value):
     try:
         if value is None:
-            return default
+            return None
         value = float(value)
         if math.isnan(value) or math.isinf(value):
-            return default
+            return None
         return value
     except Exception:
-        return default
+        return None
 
 def display_volume(value):
-    raw = max(0, min(100, number(value, 0)))
+    raw = number(value)
+    if raw is None:
+        return None
+    raw = max(0, min(100, raw))
     if raw <= 0:
         return 0
     return int(round(math.pow(raw / 100, 1 / VOLUME_CURVE_POWER) * 100))
 
-state = attr(attr(player, 'state', None), 'name', 'stopped')
-duration = number(attr(player, 'duration', 0), 0)
-if not duration and song is not None:
-    raw_duration = attr(song, 'duration', 0)
-    if raw_duration:
-        duration = number(raw_duration, 0) / 1000
+player = attr(app, 'player')
+playlist = attr(app, 'playlist')
+song = attr(playlist, 'current_song')
+metadata = attr(player, 'current_metadata')
+
+state = attr(attr(player, 'state'), 'name')
+duration = number(attr(player, 'duration'))
+if duration is None or duration == 0:
+    raw_duration = number(attr(song, 'duration'))
+    if raw_duration is not None and raw_duration > 0:
+        duration = raw_duration / 1000
 
 payload = {
     'status': state,
-    'currentUri': text(model_uri(song) or meta_get('uri', '')),
-    'name': text(attr(song, 'title', '') or meta_get('title', '')),
-    'singer': text(attr(song, 'artists_name', '') or meta_get('artists', '') or meta_get('artist', '')),
-    'albumName': text(attr(song, 'album_name', '') or meta_get('album', '')),
-    'lyricLineText': text(attr(app.live_lyric, 'current_sentence', '')),
+    'currentUri': text(model_uri(song) or meta_get(metadata, 'uri')),
+    'name': text(attr(song, 'title') or meta_get(metadata, 'title')),
+    'singer': text(attr(song, 'artists_name') or meta_get(metadata, 'artists') or meta_get(metadata, 'artist')),
+    'albumName': text(attr(song, 'album_name') or meta_get(metadata, 'album')),
+    'lyricLineText': text(attr(attr(app, 'live_lyric'), 'current_sentence')),
     'duration': duration,
-    'progress': number(attr(player, 'position', 0), 0),
-    'playbackRate': 1,
-    'volume': display_volume(attr(player, 'volume', 0))
+    'progress': number(attr(player, 'position')),
+    'playbackRate': number(attr(player, 'playback_rate')),
+    'volume': display_volume(attr(player, 'volume'))
 }
 print(json.dumps(payload, ensure_ascii=False))
 "#;
@@ -636,6 +921,470 @@ print(json.dumps(payload, ensure_ascii=False))
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpListener;
+    use std::sync::mpsc::{self, Receiver};
+    use std::thread::{self, JoinHandle};
+
+    use crate::runtime::player::{RawPlayerSample, TransportState};
+    use crate::runtime::player_io::{
+        ControlDispatchOutcome, PlayerControl, PlayerControlPort, PlayerObservationPort,
+        PlayerSearchPort,
+    };
+
+    fn test_client(port: u16) -> FeelUOwnClient {
+        FeelUOwnClient {
+            host: "127.0.0.1".to_string(),
+            port,
+            timeout: Duration::from_millis(500),
+            volume_smooth_step_ms: 0,
+        }
+    }
+
+    fn spawn_rpc_server(response: Vec<u8>) -> (u16, Receiver<String>, JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind fake FeelUOwn RPC");
+        let port = listener.local_addr().expect("fake RPC address").port();
+        let (command_tx, command_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept fake RPC client");
+            stream
+                .write_all(b"OK FeelUOwn RPC ready\n")
+                .expect("write fake RPC welcome");
+            let command = read_line(&mut stream).expect("read fake RPC command");
+            if command == "exec << EOF" {
+                loop {
+                    let line = read_line(&mut stream).expect("read fake RPC exec body");
+                    if line == "EOF" {
+                        break;
+                    }
+                }
+            }
+            command_tx.send(command).expect("record fake RPC command");
+            stream
+                .write_all(&response)
+                .expect("write fake RPC response");
+        });
+        (port, command_rx, handle)
+    }
+
+    #[test]
+    fn control_validation_failure_is_not_sent() {
+        let mut client = test_client(1);
+
+        let uri_outcome = PlayerControlPort::dispatch(
+            &mut client,
+            &PlayerControl::PlayUri("https://example.invalid/song".to_string()),
+        );
+        let volume_outcome =
+            PlayerControlPort::dispatch(&mut client, &PlayerControl::SetVolume(101));
+
+        assert!(matches!(
+            uri_outcome,
+            ControlDispatchOutcome::NotSent { .. }
+        ));
+        assert!(matches!(
+            volume_outcome,
+            ControlDispatchOutcome::NotSent { .. }
+        ));
+    }
+
+    #[test]
+    fn connection_and_welcome_failures_are_not_sent() {
+        let unused_listener = TcpListener::bind(("127.0.0.1", 0)).expect("reserve unused RPC port");
+        let unused_port = unused_listener.local_addr().unwrap().port();
+        drop(unused_listener);
+        let mut disconnected_client = test_client(unused_port);
+
+        let disconnected =
+            PlayerControlPort::dispatch(&mut disconnected_client, &PlayerControl::Pause);
+
+        assert!(matches!(
+            disconnected,
+            ControlDispatchOutcome::NotSent { .. }
+        ));
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind invalid welcome RPC");
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.write_all(b"ERROR not ready\n").unwrap();
+            let mut received = Vec::new();
+            stream.read_to_end(&mut received).unwrap();
+            assert!(
+                received.is_empty(),
+                "command must not precede a valid welcome"
+            );
+        });
+        let mut invalid_welcome_client = test_client(port);
+
+        let invalid_welcome =
+            PlayerControlPort::dispatch(&mut invalid_welcome_client, &PlayerControl::Pause);
+
+        assert!(matches!(
+            invalid_welcome,
+            ControlDispatchOutcome::NotSent { .. }
+        ));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn positive_control_ack_is_acknowledged() {
+        let body = "paused";
+        let response = format!("ACK OK {}\n{}", body.len(), body).into_bytes();
+        let (port, command_rx, server) = spawn_rpc_server(response);
+        let mut client = test_client(port);
+
+        let outcome = PlayerControlPort::dispatch(&mut client, &PlayerControl::Pause);
+
+        assert_eq!(outcome, ControlDispatchOutcome::acknowledged("paused"));
+        assert_eq!(command_rx.recv().unwrap(), "pause");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn negative_control_ack_is_rejected() {
+        let body = "permission denied";
+        let response = format!("ACK Oops {}\n{}", body.len(), body).into_bytes();
+        let (port, command_rx, server) = spawn_rpc_server(response);
+        let mut client = test_client(port);
+
+        let outcome = PlayerControlPort::dispatch(&mut client, &PlayerControl::Pause);
+
+        assert_eq!(
+            outcome,
+            ControlDispatchOutcome::rejected("permission denied")
+        );
+        assert_eq!(command_rx.recv().unwrap(), "pause");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn disconnect_after_control_write_has_unknown_outcome() {
+        let (port, command_rx, server) = spawn_rpc_server(Vec::new());
+        let mut client = test_client(port);
+
+        let outcome = PlayerControlPort::dispatch(&mut client, &PlayerControl::Pause);
+
+        assert!(matches!(
+            outcome,
+            ControlDispatchOutcome::OutcomeUnknown { .. }
+        ));
+        assert_eq!(command_rx.recv().unwrap(), "pause");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn malformed_control_response_has_unknown_outcome() {
+        let (port, command_rx, server) = spawn_rpc_server(b"this is not an ACK\n".to_vec());
+        let mut client = test_client(port);
+
+        let outcome = PlayerControlPort::dispatch(&mut client, &PlayerControl::Next);
+
+        assert!(matches!(
+            outcome,
+            ControlDispatchOutcome::OutcomeUnknown { .. }
+        ));
+        assert_eq!(command_rx.recv().unwrap(), "next");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn unknown_control_ack_code_has_unknown_outcome() {
+        let (port, command_rx, server) = spawn_rpc_server(b"ACK banana 0\n".to_vec());
+        let mut client = test_client(port);
+
+        let outcome = PlayerControlPort::dispatch(&mut client, &PlayerControl::Next);
+
+        assert!(matches!(
+            outcome,
+            ControlDispatchOutcome::OutcomeUnknown { .. }
+        ));
+        assert_eq!(command_rx.recv().unwrap(), "next");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn positive_control_ack_header_determines_outcome_when_body_is_truncated() {
+        let (port, command_rx, server) = spawn_rpc_server(b"ACK OK 12\npartial".to_vec());
+        let mut client = test_client(port);
+
+        let outcome = PlayerControlPort::dispatch(&mut client, &PlayerControl::Pause);
+
+        assert_eq!(outcome, ControlDispatchOutcome::acknowledged("partial"));
+        assert_eq!(command_rx.recv().unwrap(), "pause");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn negative_control_ack_header_determines_outcome_when_body_is_truncated() {
+        let (port, command_rx, server) = spawn_rpc_server(b"ACK Oops 12\ndenied".to_vec());
+        let mut client = test_client(port);
+
+        let outcome = PlayerControlPort::dispatch(&mut client, &PlayerControl::Pause);
+
+        assert_eq!(outcome, ControlDispatchOutcome::rejected("denied"));
+        assert_eq!(command_rx.recv().unwrap(), "pause");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn legacy_request_rejects_a_truncated_positive_body() {
+        let (port, command_rx, server) = spawn_rpc_server(b"ACK OK 12\npartial".to_vec());
+        let client = test_client(port);
+
+        let result = client.request("pause");
+
+        assert!(result.is_err());
+        assert_eq!(command_rx.recv().unwrap(), "pause");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn every_supported_control_is_dispatched_once() {
+        let cases = [
+            (
+                PlayerControl::PlayUri("fuo://netease/songs/123".to_string()),
+                "play 'fuo://netease/songs/123'",
+            ),
+            (PlayerControl::Pause, "pause"),
+            (PlayerControl::Resume, "resume"),
+            (PlayerControl::Next, "next"),
+            (PlayerControl::Previous, "previous"),
+            (PlayerControl::SetVolume(50), "exec << EOF"),
+        ];
+
+        for (control, expected_command) in cases {
+            let (port, command_rx, server) = spawn_rpc_server(b"ACK OK 2\nOK".to_vec());
+            let mut client = test_client(port);
+
+            let outcome = PlayerControlPort::dispatch(&mut client, &control);
+
+            assert_eq!(outcome, ControlDispatchOutcome::acknowledged("OK"));
+            assert_eq!(command_rx.recv().unwrap(), expected_command);
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn observation_port_returns_a_typed_raw_sample() {
+        let body = r#"{"status":"PLAYING","currentUri":" fuo://netease/songs/123 ","name":" Song ","singer":" Artist ","albumName":" Album ","lyricLineText":" lyric line ","duration":123.5,"progress":5.25,"playbackRate":1.25,"volume":80}"#;
+        let response = format!("ACK OK {}\n{}", body.len(), body).into_bytes();
+        let (port, command_rx, server) = spawn_rpc_server(response);
+        let mut client = test_client(port);
+
+        let sample = PlayerObservationPort::read_sample(&mut client).unwrap();
+
+        assert_eq!(
+            sample,
+            RawPlayerSample {
+                uri: Some("fuo://netease/songs/123".to_string()),
+                transport: Some(TransportState::Playing),
+                title: Some("Song".to_string()),
+                artist: Some("Artist".to_string()),
+                album_name: Some("Album".to_string()),
+                lyric_line_text: Some("lyric line".to_string()),
+                progress: Some(Duration::from_secs_f64(5.25)),
+                duration: Some(Duration::from_secs_f64(123.5)),
+                playback_rate: Some(1.25),
+                volume: Some(80),
+            }
+        );
+        assert_eq!(command_rx.recv().unwrap(), "exec << EOF");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn observation_port_preserves_null_status_fields_as_unknown() {
+        let body = r#"{"status":"playing","currentUri":"fuo://netease/songs/123","name":null,"singer":null,"albumName":null,"lyricLineText":"","duration":null,"progress":null,"playbackRate":null,"volume":null}"#;
+        let response = format!("ACK OK {}\n{}", body.len(), body).into_bytes();
+        let (port, command_rx, server) = spawn_rpc_server(response);
+        let mut client = test_client(port);
+
+        let sample = PlayerObservationPort::read_sample(&mut client).unwrap();
+
+        assert_eq!(sample.uri.as_deref(), Some("fuo://netease/songs/123"));
+        assert_eq!(sample.transport, Some(TransportState::Playing));
+        assert_eq!(sample.title, None);
+        assert_eq!(sample.artist, None);
+        assert_eq!(sample.album_name, None);
+        assert_eq!(sample.lyric_line_text.as_deref(), Some(""));
+        assert_eq!(sample.duration, None);
+        assert_eq!(sample.progress, None);
+        assert_eq!(sample.playback_rate, None);
+        assert_eq!(sample.volume, None);
+        assert_eq!(command_rx.recv().unwrap(), "exec << EOF");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn observation_port_preserves_missing_status_fields_as_unknown() {
+        let body = r#"{"currentUri":"fuo://netease/songs/123"}"#;
+        let response = format!("ACK OK {}\n{}", body.len(), body).into_bytes();
+        let (port, command_rx, server) = spawn_rpc_server(response);
+        let mut client = test_client(port);
+
+        let sample = PlayerObservationPort::read_sample(&mut client).unwrap();
+
+        assert_eq!(sample.uri.as_deref(), Some("fuo://netease/songs/123"));
+        assert_eq!(sample.transport, None);
+        assert_eq!(sample.title, None);
+        assert_eq!(sample.progress, None);
+        assert_eq!(sample.duration, None);
+        assert_eq!(sample.playback_rate, None);
+        assert_eq!(sample.volume, None);
+        assert_eq!(command_rx.recv().unwrap(), "exec << EOF");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn observation_getter_failures_do_not_become_stopped_or_zero() {
+        let body = r#"{"status":null,"currentUri":null,"progress":null}"#;
+        let response = format!("ACK OK {}\n{}", body.len(), body).into_bytes();
+        let (port, command_rx, server) = spawn_rpc_server(response);
+        let mut client = test_client(port);
+
+        let sample = PlayerObservationPort::read_sample(&mut client).unwrap();
+
+        assert_eq!(sample.transport, None);
+        assert_eq!(sample.uri, None);
+        assert_eq!(sample.progress, None);
+        assert_eq!(command_rx.recv().unwrap(), "exec << EOF");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn legacy_status_projects_missing_raw_fields_to_compatible_defaults() {
+        let body = "{}";
+        let response = format!("ACK OK {}\n{}", body.len(), body).into_bytes();
+        let (port, command_rx, server) = spawn_rpc_server(response);
+        let client = test_client(port);
+
+        let status = client.status().unwrap();
+
+        assert_eq!(status.status, "stopped");
+        assert_eq!(status.current_uri, "");
+        assert_eq!(status.name, "");
+        assert_eq!(status.singer, "");
+        assert_eq!(status.album_name, "");
+        assert_eq!(status.lyric_line_text, "");
+        assert_eq!(status.duration, 0.0);
+        assert_eq!(status.progress, 0.0);
+        assert_eq!(status.playback_rate, 1.0);
+        assert_eq!(status.volume, 0);
+        assert_eq!(command_rx.recv().unwrap(), "exec << EOF");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn raw_sample_rejects_invalid_numeric_values() {
+        let sample = RawPlayerSample::from(RawPlayerStatus {
+            duration: Some(-1.0),
+            progress: Some(f64::NAN),
+            playback_rate: Some(f64::INFINITY),
+            volume: Some(-1),
+            ..RawPlayerStatus::default()
+        });
+
+        assert_eq!(sample.duration, None);
+        assert_eq!(sample.progress, None);
+        assert_eq!(sample.playback_rate, None);
+        assert_eq!(sample.volume, None);
+
+        let overflow = RawPlayerSample::from(RawPlayerStatus {
+            duration: Some(f64::MAX),
+            progress: Some(f64::NEG_INFINITY),
+            playback_rate: Some(0.0),
+            volume: Some(101),
+            ..RawPlayerStatus::default()
+        });
+
+        assert_eq!(overflow.duration, None);
+        assert_eq!(overflow.progress, None);
+        assert_eq!(overflow.playback_rate, None);
+        assert_eq!(overflow.volume, None);
+    }
+
+    #[test]
+    fn raw_sample_accepts_legacy_stopped_and_rejects_unknown_transport() {
+        let legacy = RawPlayerSample::from(RawPlayerStatus {
+            status: Some(" stoped ".to_string()),
+            ..RawPlayerStatus::default()
+        });
+        let unknown = RawPlayerSample::from(RawPlayerStatus {
+            status: Some("buffering".to_string()),
+            ..RawPlayerStatus::default()
+        });
+
+        assert_eq!(legacy.transport, Some(TransportState::Stopped));
+        assert_eq!(unknown.transport, None);
+    }
+
+    #[test]
+    fn search_port_preserves_raw_search_text() {
+        let body = "raw FeelUOwn search output\nsecond line";
+        let response = format!("ACK OK {}\n{}", body.len(), body).into_bytes();
+        let (port, command_rx, server) = spawn_rpc_server(response);
+        let mut client = test_client(port);
+
+        let result = PlayerSearchPort::search_text(&mut client, "晴天", "netease").unwrap();
+
+        assert_eq!(result, body);
+        assert_eq!(
+            command_rx.recv().unwrap(),
+            "search '晴天' --source='netease'"
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn search_port_maps_structured_candidates() {
+        let body = r#"[{"songs":[{"uri":"fuo://netease/songs/123","title":"晴天","artists_name":"周杰伦"}]}]"#;
+        let response = format!("ACK OK {}\n{}", body.len(), body).into_bytes();
+        let (port, command_rx, server) = spawn_rpc_server(response);
+        let mut client = test_client(port);
+
+        let candidates =
+            PlayerSearchPort::search_candidates(&mut client, "晴天", "netease").unwrap();
+
+        assert_eq!(
+            candidates,
+            vec![crate::runtime::player_io::SearchCandidate::new(
+                "晴天 - 周杰伦",
+                "fuo://netease/songs/123"
+            )]
+        );
+        assert_eq!(
+            command_rx.recv().unwrap(),
+            "search '晴天' --source='netease' --format='json'"
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn search_port_maps_picked_candidate_and_formatted_list() {
+        let body = r#"[{"songs":[{"uri":"fuo://netease/songs/123","title":"晴天","artists_name":"周杰伦"}]}]"#;
+        let response = format!("ACK OK {}\n{}", body.len(), body).into_bytes();
+        let (port, command_rx, server) = spawn_rpc_server(response);
+        let mut client = test_client(port);
+
+        let picked =
+            PlayerSearchPort::search_and_pick(&mut client, "晴天", "netease", false).unwrap();
+
+        assert_eq!(
+            picked,
+            Some(crate::runtime::player_io::PickedCandidate::new(
+                crate::runtime::player_io::SearchCandidate::new(
+                    "晴天 - 周杰伦",
+                    "fuo://netease/songs/123"
+                ),
+                "fuo://netease/songs/123\t# 晴天 - 周杰伦"
+            ))
+        );
+        assert_eq!(
+            command_rx.recv().unwrap(),
+            "search '晴天' --source='netease' --format='json'"
+        );
+        server.join().unwrap();
+    }
 
     #[test]
     fn source_args_uses_repeated_rpc_options() {

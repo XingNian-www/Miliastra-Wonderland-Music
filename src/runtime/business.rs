@@ -14,11 +14,83 @@ use crate::observation::chat::{
     CompletionAdvance, ObservationCompletionEvent, ObservationWatermark,
 };
 use crate::observation::shared::ObservationGap;
+use crate::runtime::deadline::BusinessDeadlineEvent;
+use crate::runtime::timer::TimerRuntimeEvent;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BusinessEvent {
     CompletionAdvance(CompletionAdvance),
     CompletionGap(ObservationGap),
+    Timer(BusinessDeadlineEvent),
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BusinessTimerCounts {
+    card_game: u64,
+    undercover: u64,
+    turtle_soup: u64,
+    idiom_chain: u64,
+    command_completed: u64,
+    command_failed: u64,
+}
+
+impl BusinessTimerCounts {
+    pub const fn card_game(self) -> u64 {
+        self.card_game
+    }
+
+    pub const fn undercover(self) -> u64 {
+        self.undercover
+    }
+
+    pub const fn turtle_soup(self) -> u64 {
+        self.turtle_soup
+    }
+
+    pub const fn idiom_chain(self) -> u64 {
+        self.idiom_chain
+    }
+
+    pub const fn command_completed(self) -> u64 {
+        self.command_completed
+    }
+
+    pub const fn command_failed(self) -> u64 {
+        self.command_failed
+    }
+
+    fn record_ignored(&mut self, event: &BusinessDeadlineEvent) {
+        let (expiration_count, (is_completion, is_failure)) = match event {
+            BusinessDeadlineEvent::CardGame(event) => {
+                (&mut self.card_game, timer_event_facts(event))
+            }
+            BusinessDeadlineEvent::Undercover(event) => {
+                (&mut self.undercover, timer_event_facts(event))
+            }
+            BusinessDeadlineEvent::TurtleSoup(event) => {
+                (&mut self.turtle_soup, timer_event_facts(event))
+            }
+            BusinessDeadlineEvent::IdiomChain(event) => {
+                (&mut self.idiom_chain, timer_event_facts(event))
+            }
+        };
+        if !is_completion {
+            *expiration_count = expiration_count.saturating_add(1);
+        } else {
+            self.command_completed = self.command_completed.saturating_add(1);
+            if is_failure {
+                self.command_failed = self.command_failed.saturating_add(1);
+                log::warn!("计时运行时命令失败，尚未启用对应业务处理: {event:?}");
+            }
+        }
+    }
+}
+
+fn timer_event_facts<T>(event: &TimerRuntimeEvent<T>) -> (bool, bool) {
+    match event {
+        TimerRuntimeEvent::DeadlineExpired(_) => (false, false),
+        TimerRuntimeEvent::CommandCompleted(completed) => (true, completed.result().is_err()),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -26,6 +98,8 @@ pub struct BusinessRuntimeSnapshot {
     latest_watermark: Option<ObservationWatermark>,
     terminal_failure_count: u64,
     completion_gap_count: u64,
+    timer_counts: BusinessTimerCounts,
+    quiescing: bool,
 }
 
 impl BusinessRuntimeSnapshot {
@@ -39,6 +113,14 @@ impl BusinessRuntimeSnapshot {
 
     pub const fn completion_gap_count(self) -> u64 {
         self.completion_gap_count
+    }
+
+    pub const fn timer_counts(self) -> BusinessTimerCounts {
+        self.timer_counts
+    }
+
+    pub const fn is_quiescing(self) -> bool {
+        self.quiescing
     }
 
     fn apply(&mut self, event: BusinessEvent) {
@@ -60,6 +142,11 @@ impl BusinessRuntimeSnapshot {
             BusinessEvent::CompletionGap(_) => {
                 self.completion_gap_count = self.completion_gap_count.saturating_add(1);
             }
+            BusinessEvent::Timer(event) => {
+                // The routing foundation is observable before individual modules switch from
+                // polling. No existing gameplay deadline is driven by these events yet.
+                self.timer_counts.record_ignored(&event);
+            }
         }
     }
 }
@@ -67,6 +154,7 @@ impl BusinessRuntimeSnapshot {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BusinessRuntimeError {
     ZeroQueueCapacity,
+    Quiescing,
     RuntimeStopped,
     WorkerPanicked,
     IdiomChainOperationFailed(String),
@@ -79,6 +167,7 @@ impl Display for BusinessRuntimeError {
             Self::ZeroQueueCapacity => {
                 formatter.write_str("business runtime queue capacity must be greater than zero")
             }
+            Self::Quiescing => formatter.write_str("business runtime is quiescing"),
             Self::RuntimeStopped => formatter.write_str("business runtime is stopped"),
             Self::WorkerPanicked => formatter.write_str("business runtime worker panicked"),
             Self::IdiomChainOperationFailed(message) => {
@@ -109,6 +198,7 @@ enum RuntimeMessage {
     ExpireIdiomChain(SyncSender<Result<bool, BusinessRuntimeError>>),
     CardGame(CardGameRuntimeMessage),
     Snapshot(SyncSender<BusinessRuntimeSnapshot>),
+    PrepareShutdown(SyncSender<BusinessRuntimeSnapshot>),
     Shutdown(SyncSender<BusinessRuntimeSnapshot>),
 }
 
@@ -142,7 +232,14 @@ enum CardGameRuntimeMessage {
 
 struct RuntimeChannel {
     sender: SyncSender<RuntimeMessage>,
-    accepting: Mutex<bool>,
+    state: Mutex<RuntimeChannelState>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuntimeChannelState {
+    Running,
+    Quiescing,
+    Stopped,
 }
 
 #[derive(Clone)]
@@ -152,12 +249,12 @@ pub struct BusinessRuntimeHandle {
 
 impl BusinessRuntimeHandle {
     pub fn submit(&self, event: BusinessEvent) -> Result<(), BusinessRuntimeError> {
-        self.send(RuntimeMessage::Event(event))
+        self.send_request(RuntimeMessage::Event(event))
     }
 
     pub fn snapshot(&self) -> Result<BusinessRuntimeSnapshot, BusinessRuntimeError> {
         let (response, receiver) = mpsc::sync_channel(1);
-        self.send(RuntimeMessage::Snapshot(response))?;
+        self.send_query(RuntimeMessage::Snapshot(response))?;
         receiver
             .recv()
             .map_err(|_| BusinessRuntimeError::RuntimeStopped)
@@ -266,24 +363,63 @@ impl BusinessRuntimeHandle {
         message: impl FnOnce(SyncSender<Result<T, BusinessRuntimeError>>) -> RuntimeMessage,
     ) -> Result<T, BusinessRuntimeError> {
         let (response, receiver) = mpsc::sync_channel(1);
-        self.send(message(response))?;
+        self.send_request(message(response))?;
         receiver
             .recv()
             .map_err(|_| BusinessRuntimeError::RuntimeStopped)?
     }
 
-    fn send(&self, message: RuntimeMessage) -> Result<(), BusinessRuntimeError> {
-        let accepting = self
+    fn send_request(&self, message: RuntimeMessage) -> Result<(), BusinessRuntimeError> {
+        let state = self
             .channel
-            .accepting
+            .state
             .lock()
             .map_err(|_| BusinessRuntimeError::RuntimeStopped)?;
-        if !*accepting {
+        match *state {
+            RuntimeChannelState::Running => {}
+            RuntimeChannelState::Quiescing => return Err(BusinessRuntimeError::Quiescing),
+            RuntimeChannelState::Stopped => return Err(BusinessRuntimeError::RuntimeStopped),
+        }
+        self.channel
+            .sender
+            .send(message)
+            .map_err(|_| BusinessRuntimeError::RuntimeStopped)
+    }
+
+    fn send_query(&self, message: RuntimeMessage) -> Result<(), BusinessRuntimeError> {
+        let state = self
+            .channel
+            .state
+            .lock()
+            .map_err(|_| BusinessRuntimeError::RuntimeStopped)?;
+        if *state == RuntimeChannelState::Stopped {
             return Err(BusinessRuntimeError::RuntimeStopped);
         }
         self.channel
             .sender
             .send(message)
+            .map_err(|_| BusinessRuntimeError::RuntimeStopped)
+    }
+}
+
+#[derive(Clone)]
+pub struct BusinessRuntimeEventSink {
+    channel: Arc<RuntimeChannel>,
+}
+
+impl BusinessRuntimeEventSink {
+    pub fn submit(&self, event: BusinessEvent) -> Result<(), BusinessRuntimeError> {
+        let state = self
+            .channel
+            .state
+            .lock()
+            .map_err(|_| BusinessRuntimeError::RuntimeStopped)?;
+        if *state == RuntimeChannelState::Stopped {
+            return Err(BusinessRuntimeError::RuntimeStopped);
+        }
+        self.channel
+            .sender
+            .send(RuntimeMessage::Event(event))
             .map_err(|_| BusinessRuntimeError::RuntimeStopped)
     }
 }
@@ -305,7 +441,7 @@ impl BusinessRuntime {
         let (sender, receiver) = mpsc::sync_channel(queue_capacity);
         let channel = Arc::new(RuntimeChannel {
             sender,
-            accepting: Mutex::new(true),
+            state: Mutex::new(RuntimeChannelState::Running),
         });
         let worker = thread::Builder::new()
             .name("business-runtime".to_string())
@@ -321,6 +457,40 @@ impl BusinessRuntime {
         self.handle.clone()
     }
 
+    pub fn event_sink(&self) -> BusinessRuntimeEventSink {
+        BusinessRuntimeEventSink {
+            channel: self.handle.channel.clone(),
+        }
+    }
+
+    pub fn prepare_shutdown(&self) -> Result<BusinessRuntimeSnapshot, BusinessRuntimeError> {
+        let (response, receiver) = mpsc::sync_channel(1);
+        {
+            let mut state = self
+                .handle
+                .channel
+                .state
+                .lock()
+                .map_err(|_| BusinessRuntimeError::RuntimeStopped)?;
+            let message = match *state {
+                RuntimeChannelState::Running => {
+                    *state = RuntimeChannelState::Quiescing;
+                    RuntimeMessage::PrepareShutdown(response)
+                }
+                RuntimeChannelState::Quiescing => RuntimeMessage::Snapshot(response),
+                RuntimeChannelState::Stopped => return Err(BusinessRuntimeError::RuntimeStopped),
+            };
+            self.handle
+                .channel
+                .sender
+                .send(message)
+                .map_err(|_| BusinessRuntimeError::RuntimeStopped)?;
+        }
+        receiver
+            .recv()
+            .map_err(|_| BusinessRuntimeError::RuntimeStopped)
+    }
+
     pub fn shutdown(mut self) -> Result<BusinessRuntimeSnapshot, BusinessRuntimeError> {
         self.stop_worker()
     }
@@ -331,13 +501,16 @@ impl BusinessRuntime {
         };
         let (response, receiver) = mpsc::sync_channel(1);
         let sent = {
-            let mut accepting = self
+            let mut state = self
                 .handle
                 .channel
-                .accepting
+                .state
                 .lock()
                 .map_err(|_| BusinessRuntimeError::RuntimeStopped)?;
-            *accepting = false;
+            if *state == RuntimeChannelState::Stopped {
+                return Err(BusinessRuntimeError::RuntimeStopped);
+            }
+            *state = RuntimeChannelState::Stopped;
             self.handle
                 .channel
                 .sender
@@ -403,17 +576,26 @@ fn run_business_runtime(
             RuntimeMessage::Snapshot(response) => {
                 let _ = response.send(snapshot);
             }
+            RuntimeMessage::PrepareShutdown(response) => {
+                abort_business_modules(&mut idiom_chain, &mut card_games);
+                snapshot.quiescing = true;
+                let _ = response.send(snapshot);
+            }
             RuntimeMessage::Shutdown(response) => {
-                if let Err(error) = card_games.abort() {
-                    log::error!("业务运行时关闭时无法中止牌局: {error:#}");
-                }
-                if let Err(error) = idiom_chain.abort() {
-                    log::error!("业务运行时关闭时无法中止成语接龙: {error:#}");
-                }
+                abort_business_modules(&mut idiom_chain, &mut card_games);
                 let _ = response.send(snapshot);
                 break;
             }
         }
+    }
+}
+
+fn abort_business_modules(idiom_chain: &mut IdiomChainService, card_games: &mut CardGameService) {
+    if let Err(error) = card_games.abort() {
+        log::error!("业务运行时关闭时无法中止牌局: {error:#}");
+    }
+    if let Err(error) = idiom_chain.abort() {
+        log::error!("业务运行时关闭时无法中止成语接龙: {error:#}");
     }
 }
 
@@ -482,13 +664,20 @@ mod tests {
 
     use super::*;
     use crate::features::card_games::{
-        CardGameEffect, CardGameEffectLane, CardGameEffectRequest, CardGameLateResult,
-        LandlordConfig,
+        CardGameDeadlineKind, CardGameDeadlineToken, CardGameEffect, CardGameEffectLane,
+        CardGameEffectRequest, CardGameLateResult, LandlordConfig,
     };
     use crate::features::entertainment::{EntertainmentCoordinator, EntertainmentKind};
-    use crate::features::idiom_chain::IdiomChainMode;
+    use crate::features::idiom_chain::{
+        IdiomChainDeadlineKind, IdiomChainDeadlineToken, IdiomChainMode,
+    };
+    use crate::features::turtle_soup::{TurtleSoupDeadlineKind, TurtleSoupDeadlineToken};
+    use crate::features::undercover::{UndercoverDeadlineKind, UndercoverDeadlineToken};
     use crate::observation::chat::ChatObservationLedger;
     use crate::observation::shared::{ObservationGapKind, SharedObservationStream};
+    use crate::runtime::deadline::{BusinessDeadlineEvent, BusinessDeadlineToken};
+    use crate::runtime::identity::{BusinessOperationId, SessionGeneration};
+    use crate::runtime::timer::{DeadlineSchedule, TimerCore, TimerRuntimeEvent};
 
     fn idiom_service(
         entertainment: EntertainmentCoordinator,
@@ -573,6 +762,58 @@ mod tests {
     }
 
     #[test]
+    fn real_channel_counts_routed_deadlines_without_running_game_logic() {
+        let runtime = runtime(8);
+        let handle = runtime.handle();
+        let event_sink = runtime.event_sink();
+        let deadline = Instant::now();
+        let tokens = [
+            BusinessDeadlineToken::from(CardGameDeadlineToken::new(
+                1,
+                CardGameDeadlineKind::LobbyExpiry,
+            )),
+            BusinessDeadlineToken::from(UndercoverDeadlineToken::new(
+                2,
+                UndercoverDeadlineKind::LobbyIdle,
+            )),
+            BusinessDeadlineToken::from(TurtleSoupDeadlineToken::new(
+                3,
+                TurtleSoupDeadlineKind::SessionIdle,
+            )),
+            BusinessDeadlineToken::from(IdiomChainDeadlineToken::new(
+                4,
+                IdiomChainDeadlineKind::SessionIdle,
+            )),
+        ];
+        let mut timer = TimerCore::new();
+        for (index, token) in tokens.into_iter().enumerate() {
+            timer
+                .schedule(DeadlineSchedule::new(
+                    token,
+                    BusinessOperationId::new(index as u64 + 1),
+                    SessionGeneration::INITIAL,
+                    deadline,
+                ))
+                .unwrap();
+        }
+
+        for event in timer.drain_expired(deadline).unwrap() {
+            event_sink
+                .submit(BusinessEvent::Timer(BusinessDeadlineEvent::from(
+                    TimerRuntimeEvent::DeadlineExpired(event),
+                )))
+                .unwrap();
+        }
+        let snapshot = handle.snapshot().unwrap();
+
+        assert_eq!(snapshot.timer_counts().card_game(), 1);
+        assert_eq!(snapshot.timer_counts().undercover(), 1);
+        assert_eq!(snapshot.timer_counts().turtle_soup(), 1);
+        assert_eq!(snapshot.timer_counts().idiom_chain(), 1);
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
     fn shutdown_drains_prior_events_and_stops_cloned_handles() {
         let runtime = runtime(1);
         let handle = runtime.handle();
@@ -588,6 +829,72 @@ mod tests {
 
         assert_eq!(final_snapshot.terminal_failure_count(), 1);
         assert_eq!(handle.snapshot(), Err(BusinessRuntimeError::RuntimeStopped));
+    }
+
+    #[test]
+    fn prepare_shutdown_rejects_new_work_but_drains_internal_events_before_finish() {
+        let (runtime, entertainment) = runtime_with_entertainment(8);
+        let handle = runtime.handle();
+        let event_sink = runtime.event_sink();
+        handle
+            .handle_idiom_chain(
+                "Alice",
+                &IdiomChainCommand::Start {
+                    idiom: "画蛇添足".to_string(),
+                    mode: IdiomChainMode::Exact,
+                },
+            )
+            .unwrap();
+
+        let prepared = runtime.prepare_shutdown().unwrap();
+
+        assert!(prepared.is_quiescing());
+        assert_eq!(entertainment.active(), None);
+        assert_eq!(
+            handle.handle_idiom_chain("Bob", &IdiomChainCommand::Status),
+            Err(BusinessRuntimeError::Quiescing)
+        );
+        let mut stream = SharedObservationStream::<()>::new(NonZeroUsize::new(1).unwrap());
+        let gap = stream.mark_gap(ObservationGapKind::HistoryEvicted);
+        assert_eq!(
+            handle.submit(BusinessEvent::CompletionGap(gap.clone())),
+            Err(BusinessRuntimeError::Quiescing)
+        );
+        event_sink
+            .submit(BusinessEvent::CompletionGap(gap))
+            .unwrap();
+        let deadline = Instant::now();
+        let mut timer = TimerCore::new();
+        timer
+            .schedule(DeadlineSchedule::new(
+                BusinessDeadlineToken::from(IdiomChainDeadlineToken::new(
+                    1,
+                    IdiomChainDeadlineKind::SessionIdle,
+                )),
+                BusinessOperationId::new(1),
+                SessionGeneration::INITIAL,
+                deadline,
+            ))
+            .unwrap();
+        let expired = timer.drain_expired(deadline).unwrap().pop().unwrap();
+        event_sink
+            .submit(BusinessEvent::Timer(BusinessDeadlineEvent::from(
+                TimerRuntimeEvent::DeadlineExpired(expired),
+            )))
+            .unwrap();
+
+        let final_snapshot = runtime.shutdown().unwrap();
+
+        assert!(final_snapshot.is_quiescing());
+        assert_eq!(final_snapshot.completion_gap_count(), 1);
+        assert_eq!(final_snapshot.timer_counts().idiom_chain(), 1);
+        assert_eq!(
+            event_sink.submit(BusinessEvent::CompletionGap(
+                SharedObservationStream::<()>::new(NonZeroUsize::new(1).unwrap())
+                    .mark_gap(ObservationGapKind::HistoryEvicted),
+            )),
+            Err(BusinessRuntimeError::RuntimeStopped)
+        );
     }
 
     #[test]

@@ -5,6 +5,8 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::runtime::timer::{DeadlineKind, DeadlineModule, DeadlineToken};
+
 pub(crate) mod repository;
 mod service;
 
@@ -12,6 +14,25 @@ pub(crate) use service::{
     QuestionSubmitOutcome, SecondaryOcrObservation, SecondaryOcrStability, TurtleSoupCommand,
     TurtleSoupConfig, TurtleSoupQuestion, TurtleSoupService, parse_question_message,
 };
+
+#[derive(Debug)]
+pub struct TurtleSoupDeadlineModule;
+
+impl DeadlineModule for TurtleSoupDeadlineModule {
+    const NAME: &'static str = "turtle-soup";
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TurtleSoupDeadlineKind {
+    SessionMaximum,
+    SessionIdle,
+}
+
+impl DeadlineKind for TurtleSoupDeadlineKind {
+    type Module = TurtleSoupDeadlineModule;
+}
+
+pub type TurtleSoupDeadlineToken = DeadlineToken<TurtleSoupDeadlineKind>;
 
 const DELIVERY_ATTEMPTS: u8 = 3;
 

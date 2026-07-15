@@ -30,8 +30,10 @@ impl HotkeyRuntime {
         self.running.store(false, Ordering::SeqCst);
         if self.worker.is_some() {
             unsafe {
-                if !PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0)).as_bool() {
-                    log::warn!("发送热键线程退出消息失败");
+                if let Err(error) =
+                    PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0))
+                {
+                    log::warn!("发送热键线程退出消息失败: {error}");
                 }
             }
         }

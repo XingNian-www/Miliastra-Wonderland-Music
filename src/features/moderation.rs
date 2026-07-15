@@ -12,7 +12,17 @@ pub struct ModerationCommand {
     pub requester: String,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+impl ModerationCommand {
+    pub fn lock_key(&self) -> String {
+        format!("moderation:{}:{}", self.action.label(), self.uid)
+    }
+
+    fn same_request(&self, other: &Self) -> bool {
+        self.action == other.action && self.uid == other.uid
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum ModerationAction {
     Blacklist,
     BlockChat,
@@ -130,7 +140,7 @@ pub struct ModerationService {
 
 #[derive(Default)]
 struct ModerationState {
-    active_workflows: HashSet<String>,
+    active_workflows: HashSet<ModerationWorkflowKey>,
 }
 
 pub enum ModerationStart {
@@ -158,8 +168,14 @@ pub enum ModerationResultExecution {
 
 struct ModerationWorkflowLease {
     service: ModerationService,
-    key: String,
+    key: ModerationWorkflowKey,
     active: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ModerationWorkflowKey {
+    action: ModerationAction,
+    uid: String,
 }
 
 struct ModerationHoldLease {
@@ -405,7 +421,7 @@ impl ModerationService {
         }))
     }
 
-    fn release(&self, key: &str) -> Result<bool> {
+    fn release(&self, key: &ModerationWorkflowKey) -> Result<bool> {
         Ok(self.state()?.active_workflows.remove(key))
     }
 
@@ -463,7 +479,7 @@ impl ModerationResultTask {
     }
 
     pub fn matches(&self, command: &ModerationCommand) -> bool {
-        self.command.action == command.action && self.command.uid == command.uid
+        self.command.same_request(command)
     }
 
     pub fn cancel(&mut self) {
@@ -487,7 +503,11 @@ impl ModerationWorkflowLease {
         }
         self.active = false;
         if let Err(error) = self.service.release(&self.key) {
-            log::error!("无法释放管理工作流 {}: {error:#}", self.key);
+            log::error!(
+                "无法释放管理工作流 {}:{}: {error:#}",
+                self.key.action.label(),
+                self.key.uid
+            );
         }
     }
 }
@@ -517,8 +537,11 @@ impl Drop for ModerationWorkflowLease {
     }
 }
 
-fn workflow_key(command: &ModerationCommand) -> String {
-    format!("{}:{}", command.action.label(), command.uid)
+fn workflow_key(command: &ModerationCommand) -> ModerationWorkflowKey {
+    ModerationWorkflowKey {
+        action: command.action,
+        uid: command.uid.clone(),
+    }
 }
 
 fn parse_friend_moderation_vote(text: &str) -> Option<(String, bool)> {

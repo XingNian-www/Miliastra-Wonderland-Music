@@ -268,6 +268,14 @@ impl ActiveTimer {
         self.elapsed = Duration::ZERO;
         self.last_tick = now;
     }
+
+    fn elapsed_at(&self, now: Instant, active: bool) -> Duration {
+        self.elapsed.saturating_add(if active {
+            now.saturating_duration_since(self.last_tick)
+        } else {
+            Duration::ZERO
+        })
+    }
 }
 
 impl LandlordGame {
@@ -304,6 +312,71 @@ impl LandlordGame {
         } else {
             self.state = GameState::Idle;
             true
+        }
+    }
+
+    pub(crate) fn next_deadline(
+        &self,
+        now: Instant,
+        clock_active: bool,
+    ) -> Option<(CardGameDeadlineKind, Instant)> {
+        if !clock_active {
+            return None;
+        }
+        match &self.state {
+            GameState::Idle => None,
+            GameState::Lobby(lobby) => Some((
+                CardGameDeadlineKind::LobbyExpiry,
+                deadline_after(
+                    now,
+                    lobby.timer.elapsed_at(now, true),
+                    Duration::from_secs(self.config.lobby_timeout_seconds.max(1)),
+                ),
+            )),
+            GameState::Bidding(game) => {
+                let elapsed = game.timer.elapsed_at(now, true);
+                let timeout = Duration::from_secs(self.config.turn_timeout_seconds.max(1));
+                let warning_at = timeout.saturating_sub(Duration::from_secs(30));
+                let kind = if !game.warning_sent && elapsed < timeout {
+                    CardGameDeadlineKind::TurnWarning
+                } else {
+                    CardGameDeadlineKind::TurnExpiry
+                };
+                let target = if kind == CardGameDeadlineKind::TurnWarning {
+                    warning_at
+                } else {
+                    timeout
+                };
+                Some((kind, deadline_after(now, elapsed, target)))
+            }
+            GameState::Playing(game) => {
+                if forced_run_fast_action(game).is_some() || game.players[game.current].trustee {
+                    return Some((CardGameDeadlineKind::TurnExpiry, now));
+                }
+                let elapsed = game.timer.elapsed_at(now, true);
+                let timeout = Duration::from_secs(self.config.turn_timeout_seconds.max(1));
+                let warning_at = timeout.saturating_sub(Duration::from_secs(30));
+                let kind = if !game.warning_sent && elapsed < timeout {
+                    CardGameDeadlineKind::TurnWarning
+                } else {
+                    CardGameDeadlineKind::TurnExpiry
+                };
+                let target = if kind == CardGameDeadlineKind::TurnWarning {
+                    warning_at
+                } else {
+                    timeout
+                };
+                Some((kind, deadline_after(now, elapsed, target)))
+            }
+        }
+    }
+
+    pub(crate) fn sync_clock(&mut self, now: Instant, clock_active: bool) {
+        match &mut self.state {
+            GameState::Idle => {}
+            GameState::Lobby(lobby) => lobby.timer.tick(now, clock_active),
+            GameState::Bidding(game) => game.timer.tick(now, clock_active),
+            GameState::Playing(game) => game.timer.tick(now, clock_active),
         }
     }
 
@@ -1030,6 +1103,10 @@ impl LandlordGame {
             }
         }
     }
+}
+
+fn deadline_after(now: Instant, elapsed: Duration, target: Duration) -> Instant {
+    now + target.saturating_sub(elapsed)
 }
 
 fn report_one_largest_single(game: &Playing, player: usize) -> Option<Card> {
@@ -4528,6 +4605,41 @@ mod tests {
                 .is_some_and(|item| item.action == "turn-warning")
         );
         assert!(game.tick(now + Duration::from_secs(190), true).is_some());
+    }
+
+    #[test]
+    fn deadline_projection_uses_active_time_and_stops_while_paused() {
+        let now = Instant::now();
+        let config = LandlordConfig {
+            lobby_timeout_seconds: 10,
+            ..LandlordConfig::default()
+        };
+        let mut game = LandlordGame::with_seed(config, 19);
+        game.create("甲", now);
+
+        game.sync_clock(now + Duration::from_secs(3), true);
+        assert_eq!(
+            game.next_deadline(now + Duration::from_secs(3), true),
+            Some((
+                CardGameDeadlineKind::LobbyExpiry,
+                now + Duration::from_secs(10)
+            ))
+        );
+
+        game.sync_clock(now + Duration::from_secs(100), false);
+        assert_eq!(
+            game.next_deadline(now + Duration::from_secs(100), false),
+            None
+        );
+
+        game.sync_clock(now + Duration::from_secs(105), true);
+        assert_eq!(
+            game.next_deadline(now + Duration::from_secs(105), true),
+            Some((
+                CardGameDeadlineKind::LobbyExpiry,
+                now + Duration::from_secs(107)
+            ))
+        );
     }
 
     #[test]

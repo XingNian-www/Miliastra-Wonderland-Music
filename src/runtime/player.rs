@@ -117,6 +117,110 @@ impl PlayerObservation {
                 .zip(self.uri.as_deref())
                 .is_some_and(|(expected, actual)| expected == actual)
     }
+
+    /// Re-evaluates a cached snapshot without claiming that another player RPC occurred.
+    ///
+    /// Stable evidence older than `stale_timeout` is removed. A still-fresh playing snapshot
+    /// advances its displayed progress from the prior evaluation time, while stale or incomplete
+    /// observations keep their last sampled progress.
+    pub fn reevaluated_at(&self, now: Instant, stale_timeout: Duration) -> Self {
+        let mut reevaluated = self.clone();
+        reevaluated.evaluated_at = now;
+
+        let uri_expired = reevaluate_stable_field(
+            &mut reevaluated.uri,
+            &mut reevaluated.uri_freshness,
+            &mut reevaluated.uri_evidence,
+            now,
+            stale_timeout,
+        );
+        if uri_expired {
+            reevaluated.uri_candidate = None;
+        } else {
+            expire_candidate(&mut reevaluated.uri_candidate, now, stale_timeout);
+        }
+
+        let transport_expired = reevaluate_stable_field(
+            &mut reevaluated.transport,
+            &mut reevaluated.transport_freshness,
+            &mut reevaluated.transport_evidence,
+            now,
+            stale_timeout,
+        );
+        if transport_expired {
+            reevaluated.transport_candidate = None;
+        } else {
+            expire_candidate(&mut reevaluated.transport_candidate, now, stale_timeout);
+        }
+
+        if reevaluated.uri.is_none() {
+            reevaluated.playback_instance = None;
+            reevaluated.title = None;
+            reevaluated.artist = None;
+            reevaluated.album_name = None;
+            reevaluated.lyric_line_text = None;
+            reevaluated.progress = None;
+            reevaluated.duration = None;
+            reevaluated.playback_rate = None;
+            reevaluated.volume = None;
+            reevaluated.sampled_at = None;
+        } else if reevaluated.uri_freshness.is_fresh()
+            && reevaluated.transport_freshness.is_fresh()
+            && reevaluated.transport == Some(TransportState::Playing)
+            && let Some(progress) = reevaluated.progress
+        {
+            let elapsed = now.saturating_duration_since(self.evaluated_at);
+            let estimated = progress.saturating_add(saturating_duration_mul(
+                elapsed,
+                reevaluated.playback_rate.unwrap_or(1.0),
+            ));
+            reevaluated.progress = Some(
+                reevaluated
+                    .duration
+                    .map_or(estimated, |duration| estimated.min(duration)),
+            );
+        }
+
+        reevaluated
+    }
+}
+
+fn reevaluate_stable_field<T>(
+    value: &mut Option<T>,
+    freshness: &mut ObservationFreshness,
+    evidence: &mut Option<StabilityEvidence<T>>,
+    now: Instant,
+    stale_timeout: Duration,
+) -> bool {
+    let Some(last_sampled_at) = evidence.as_ref().map(|evidence| evidence.last_sampled_at) else {
+        let expired = value.is_some();
+        *value = None;
+        *freshness = ObservationFreshness::Unknown;
+        return expired;
+    };
+    let age = now.saturating_duration_since(last_sampled_at);
+    if age > stale_timeout {
+        *value = None;
+        *freshness = ObservationFreshness::Unknown;
+        *evidence = None;
+        return true;
+    }
+    if matches!(freshness, ObservationFreshness::Stale { .. }) {
+        *freshness = ObservationFreshness::Stale { age };
+    }
+    false
+}
+
+fn expire_candidate<T>(
+    candidate: &mut Option<StabilityEvidence<T>>,
+    now: Instant,
+    stale_timeout: Duration,
+) {
+    if candidate.as_ref().is_some_and(|candidate| {
+        now.saturating_duration_since(candidate.last_sampled_at) > stale_timeout
+    }) {
+        *candidate = None;
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -490,6 +594,17 @@ impl<C: Clock> PlayerObserver<C> {
     }
 
     fn expire_stale_fields(&mut self, now: Instant) {
+        if self.uri_candidate.as_ref().is_some_and(|candidate| {
+            now.saturating_duration_since(candidate.last_sampled_at) > self.config.stale_timeout
+        }) {
+            self.uri_candidate = None;
+        }
+        if self.transport_candidate.as_ref().is_some_and(|candidate| {
+            now.saturating_duration_since(candidate.last_sampled_at) > self.config.stale_timeout
+        }) {
+            self.transport_candidate = None;
+        }
+
         let uri_expired = self.stable_uri.as_ref().is_some_and(|stable| {
             now.saturating_duration_since(stable.last_sampled_at) > self.config.stale_timeout
         });
@@ -896,6 +1011,32 @@ mod tests {
     }
 
     #[test]
+    fn expired_pending_identity_and_transport_require_full_stability_again() {
+        let clock = ManualClock::new(Instant::now());
+        let mut observer = observer(&clock, PlayerObservationConfig::default());
+        observer.observe_sample(sample("fuo://song/pending", TransportState::Playing, 1));
+
+        clock.advance(Duration::from_secs(6)).unwrap();
+        let restarted =
+            observer.observe_sample(sample("fuo://song/pending", TransportState::Playing, 2));
+
+        assert_eq!(restarted.uri, None);
+        assert_eq!(restarted.transport, None);
+        assert_eq!(
+            restarted
+                .uri_candidate
+                .map(|evidence| evidence.consecutive_samples),
+            Some(1)
+        );
+        assert_eq!(
+            restarted
+                .transport_candidate
+                .map(|evidence| evidence.consecutive_samples),
+            Some(1)
+        );
+    }
+
+    #[test]
     fn stopped_to_playing_advances_the_instance_after_transport_is_stable() {
         let clock = ManualClock::new(Instant::now());
         let mut observer = observer(&clock, PlayerObservationConfig::default());
@@ -1244,6 +1385,96 @@ mod tests {
             candidate.last_sampled_at,
             started_at + Duration::from_secs(3)
         );
+    }
+
+    #[test]
+    fn cached_observation_reevaluation_advances_progress_without_forging_an_attempt() {
+        let started_at = Instant::now();
+        let clock = ManualClock::new(started_at);
+        let mut observer = observer(&clock, PlayerObservationConfig::default());
+        stabilize(&mut observer, "fuo://song/1", TransportState::Playing, 20);
+        let snapshot = observer.current();
+
+        let reevaluated =
+            snapshot.reevaluated_at(started_at + Duration::from_secs(2), Duration::from_secs(5));
+
+        assert_eq!(
+            reevaluated.evaluated_at,
+            started_at + Duration::from_secs(2)
+        );
+        assert_eq!(reevaluated.last_attempted_at, Some(started_at));
+        assert_eq!(reevaluated.last_successful_observed_at, Some(started_at));
+        assert_eq!(reevaluated.uri_freshness, ObservationFreshness::Fresh);
+        assert_eq!(reevaluated.transport_freshness, ObservationFreshness::Fresh);
+        assert_eq!(reevaluated.progress, Some(Duration::from_secs(22)));
+    }
+
+    #[test]
+    fn cached_observation_reevaluation_expires_identity_transport_and_track_evidence() {
+        let started_at = Instant::now();
+        let clock = ManualClock::new(started_at);
+        let mut observer = observer(&clock, PlayerObservationConfig::default());
+        let mut complete = sample("fuo://song/1", TransportState::Playing, 20);
+        complete.title = Some("title".to_owned());
+        complete.artist = Some("artist".to_owned());
+        complete.album_name = Some("album".to_owned());
+        complete.lyric_line_text = Some("lyric".to_owned());
+        complete.playback_rate = Some(1.25);
+        complete.volume = Some(70);
+        observer.observe_sample(complete.clone());
+        let snapshot = observer.observe_sample(complete);
+
+        let reevaluated =
+            snapshot.reevaluated_at(started_at + Duration::from_secs(6), Duration::from_secs(5));
+
+        assert_eq!(reevaluated.uri, None);
+        assert_eq!(reevaluated.uri_freshness, ObservationFreshness::Unknown);
+        assert_eq!(reevaluated.uri_evidence, None);
+        assert_eq!(reevaluated.uri_candidate, None);
+        assert_eq!(reevaluated.playback_instance, None);
+        assert_eq!(reevaluated.transport, None);
+        assert_eq!(
+            reevaluated.transport_freshness,
+            ObservationFreshness::Unknown
+        );
+        assert_eq!(reevaluated.transport_evidence, None);
+        assert_eq!(reevaluated.transport_candidate, None);
+        assert_eq!(reevaluated.title, None);
+        assert_eq!(reevaluated.artist, None);
+        assert_eq!(reevaluated.album_name, None);
+        assert_eq!(reevaluated.lyric_line_text, None);
+        assert_eq!(reevaluated.progress, None);
+        assert_eq!(reevaluated.duration, None);
+        assert_eq!(reevaluated.playback_rate, None);
+        assert_eq!(reevaluated.volume, None);
+        assert_eq!(reevaluated.sampled_at, None);
+    }
+
+    #[test]
+    fn cached_stale_observation_reevaluation_updates_age_without_advancing_progress() {
+        let started_at = Instant::now();
+        let clock = ManualClock::new(started_at);
+        let mut observer = observer(&clock, PlayerObservationConfig::default());
+        stabilize(&mut observer, "fuo://song/1", TransportState::Playing, 20);
+        clock.advance(Duration::from_secs(1)).unwrap();
+        let stale = observer.observe_failure();
+
+        let reevaluated =
+            stale.reevaluated_at(started_at + Duration::from_secs(3), Duration::from_secs(5));
+
+        assert_eq!(
+            reevaluated.uri_freshness,
+            ObservationFreshness::Stale {
+                age: Duration::from_secs(3)
+            }
+        );
+        assert_eq!(
+            reevaluated.transport_freshness,
+            ObservationFreshness::Stale {
+                age: Duration::from_secs(3)
+            }
+        );
+        assert_eq!(reevaluated.progress, Some(Duration::from_secs(20)));
     }
 
     #[test]

@@ -2,6 +2,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::fmt::{Debug, Display, Formatter};
 use std::hash::Hash;
+use std::sync::mpsc::{self, Receiver, RecvError, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 use super::identity::{BusinessOperationId, SessionGeneration};
@@ -302,13 +305,275 @@ impl<T: DeadlineIdentity> TimerCore<T> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimerSubmitError {
+    QueueFull,
+    RuntimeStopped,
+}
+
+impl Display for TimerSubmitError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::QueueFull => formatter.write_str("timer runtime queue is full"),
+            Self::RuntimeStopped => formatter.write_str("timer runtime is stopped"),
+        }
+    }
+}
+
+impl Error for TimerSubmitError {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimerReceiveError;
+
+impl Display for TimerReceiveError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("timer runtime stopped before returning a result")
+    }
+}
+
+impl Error for TimerReceiveError {}
+
+pub struct TimerOperation<R> {
+    response: Receiver<R>,
+}
+
+pub type TimerCoreOperation<R> = TimerOperation<Result<R, TimerCoreError>>;
+
+impl<R> TimerOperation<R> {
+    pub fn wait(self) -> Result<R, TimerReceiveError> {
+        self.response.recv().map_err(|_| TimerReceiveError)
+    }
+}
+
+enum TimerCommand<T: DeadlineIdentity> {
+    Schedule {
+        schedule: DeadlineSchedule<T>,
+        response: SyncSender<Result<(), TimerCoreError>>,
+    },
+    Reschedule {
+        schedule: DeadlineSchedule<T>,
+        response: SyncSender<Result<DeadlineSchedule<T>, TimerCoreError>>,
+    },
+    Cancel {
+        token: T,
+        response: SyncSender<Result<Option<DeadlineSchedule<T>>, TimerCoreError>>,
+    },
+    Shutdown,
+}
+
+struct TimerChannel<T: DeadlineIdentity> {
+    sender: SyncSender<TimerCommand<T>>,
+    accepting: Mutex<bool>,
+}
+
+#[derive(Clone)]
+pub struct TimerRuntimeHandle<T: DeadlineIdentity> {
+    channel: Arc<TimerChannel<T>>,
+}
+
+impl<T: DeadlineIdentity> TimerRuntimeHandle<T> {
+    pub fn schedule(
+        &self,
+        schedule: DeadlineSchedule<T>,
+    ) -> Result<TimerCoreOperation<()>, TimerSubmitError> {
+        self.submit(|response| TimerCommand::Schedule { schedule, response })
+    }
+
+    pub fn reschedule(
+        &self,
+        schedule: DeadlineSchedule<T>,
+    ) -> Result<TimerCoreOperation<DeadlineSchedule<T>>, TimerSubmitError> {
+        self.submit(|response| TimerCommand::Reschedule { schedule, response })
+    }
+
+    pub fn cancel(
+        &self,
+        token: T,
+    ) -> Result<TimerCoreOperation<Option<DeadlineSchedule<T>>>, TimerSubmitError> {
+        self.submit(|response| TimerCommand::Cancel { token, response })
+    }
+
+    fn submit<R>(
+        &self,
+        command: impl FnOnce(SyncSender<R>) -> TimerCommand<T>,
+    ) -> Result<TimerOperation<R>, TimerSubmitError> {
+        let accepting = self
+            .channel
+            .accepting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !*accepting {
+            return Err(TimerSubmitError::RuntimeStopped);
+        }
+        let (response, receiver) = mpsc::sync_channel(1);
+        match self.channel.sender.try_send(command(response)) {
+            Ok(()) => Ok(TimerOperation { response: receiver }),
+            Err(TrySendError::Full(_)) => Err(TimerSubmitError::QueueFull),
+            Err(TrySendError::Disconnected(_)) => Err(TimerSubmitError::RuntimeStopped),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum TimerRuntimeStartError {
+    ZeroQueueCapacity,
+    Spawn(std::io::Error),
+}
+
+impl Display for TimerRuntimeStartError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroQueueCapacity => {
+                formatter.write_str("timer runtime queue capacity must be greater than zero")
+            }
+            Self::Spawn(error) => write!(formatter, "failed to start timer runtime: {error}"),
+        }
+    }
+}
+
+impl Error for TimerRuntimeStartError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::ZeroQueueCapacity => None,
+            Self::Spawn(error) => Some(error),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimerShutdownError;
+
+impl Display for TimerShutdownError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("timer runtime worker panicked")
+    }
+}
+
+impl Error for TimerShutdownError {}
+
+pub struct TimerRuntime<T: DeadlineIdentity> {
+    handle: TimerRuntimeHandle<T>,
+    expired: Option<Receiver<DeadlineExpired<T>>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl<T: DeadlineIdentity> TimerRuntime<T> {
+    pub fn start(queue_capacity: usize) -> Result<Self, TimerRuntimeStartError> {
+        if queue_capacity == 0 {
+            return Err(TimerRuntimeStartError::ZeroQueueCapacity);
+        }
+        let (command_sender, command_receiver) = mpsc::sync_channel(queue_capacity);
+        let (expired_sender, expired_receiver) = mpsc::sync_channel(queue_capacity);
+        let channel = Arc::new(TimerChannel {
+            sender: command_sender,
+            accepting: Mutex::new(true),
+        });
+        let worker = thread::Builder::new()
+            .name("timer-runtime".to_string())
+            .spawn(move || run_timer_runtime(command_receiver, expired_sender))
+            .map_err(TimerRuntimeStartError::Spawn)?;
+        Ok(Self {
+            handle: TimerRuntimeHandle { channel },
+            expired: Some(expired_receiver),
+            worker: Some(worker),
+        })
+    }
+
+    pub fn handle(&self) -> TimerRuntimeHandle<T> {
+        self.handle.clone()
+    }
+
+    pub fn expired(&self) -> &Receiver<DeadlineExpired<T>> {
+        self.expired
+            .as_ref()
+            .expect("timer event receiver exists while runtime is active")
+    }
+
+    pub fn shutdown(mut self) -> Result<(), TimerShutdownError> {
+        self.stop_worker()
+    }
+
+    fn stop_worker(&mut self) -> Result<(), TimerShutdownError> {
+        let Some(worker) = self.worker.take() else {
+            return Ok(());
+        };
+        let mut accepting = self
+            .handle
+            .channel
+            .accepting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *accepting = false;
+        self.expired.take();
+        let _ = self.handle.channel.sender.send(TimerCommand::Shutdown);
+        drop(accepting);
+        worker.join().map_err(|_| TimerShutdownError)
+    }
+}
+
+impl<T: DeadlineIdentity> Drop for TimerRuntime<T> {
+    fn drop(&mut self) {
+        let _ = self.stop_worker();
+    }
+}
+
+fn run_timer_runtime<T: DeadlineIdentity>(
+    commands: Receiver<TimerCommand<T>>,
+    expired: SyncSender<DeadlineExpired<T>>,
+) {
+    let mut core = TimerCore::new();
+    loop {
+        let now = Instant::now();
+        let due = match core.drain_expired(now) {
+            Ok(due) => due,
+            Err(TimerCoreError::Closed) => break,
+            Err(_) => unreachable!("draining an open timer core cannot fail"),
+        };
+        for event in due {
+            if expired.send(event).is_err() {
+                core.close();
+                return;
+            }
+        }
+
+        let command = match core.next_deadline() {
+            Some(deadline) => {
+                match commands.recv_timeout(deadline.saturating_duration_since(now)) {
+                    Ok(command) => Some(command),
+                    Err(RecvTimeoutError::Timeout) => None,
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+            }
+            None => match commands.recv() {
+                Ok(command) => Some(command),
+                Err(RecvError) => break,
+            },
+        };
+        match command {
+            Some(TimerCommand::Schedule { schedule, response }) => {
+                let _ = response.send(core.schedule(schedule));
+            }
+            Some(TimerCommand::Reschedule { schedule, response }) => {
+                let _ = response.send(core.reschedule(schedule));
+            }
+            Some(TimerCommand::Cancel { token, response }) => {
+                let _ = response.send(core.cancel(&token));
+            }
+            Some(TimerCommand::Shutdown) => break,
+            None => {}
+        }
+    }
+    core.close();
+}
+
 #[cfg(test)]
 mod tests {
+    use std::thread;
     use std::time::{Duration, Instant};
 
     use super::{
         DeadlineIdentity, DeadlineKind, DeadlineModule, DeadlineSchedule, DeadlineToken, TimerCore,
-        TimerCoreError,
+        TimerCoreError, TimerRuntime, TimerSubmitError,
     };
     use crate::runtime::clock::{Clock, ManualClock};
     use crate::runtime::identity::{BusinessOperationId, SessionGeneration};
@@ -516,5 +781,170 @@ mod tests {
             .unwrap();
 
         assert_eq!(core.drain_expired(deadline).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn runtime_emits_equal_deadlines_in_schedule_order_without_dropping_events() {
+        let runtime = TimerRuntime::start(1).unwrap();
+        let handle = runtime.handle();
+        let deadline = Instant::now() + Duration::from_millis(60);
+        for id in [4, 1, 9] {
+            handle
+                .schedule(schedule(token(id), id, 0, deadline))
+                .unwrap()
+                .wait()
+                .unwrap()
+                .unwrap();
+        }
+
+        let expired = (0..3)
+            .map(|_| {
+                runtime
+                    .expired()
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            expired
+                .iter()
+                .map(|event| event.token().id())
+                .collect::<Vec<_>>(),
+            vec![4, 1, 9]
+        );
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn earlier_reschedule_wakes_a_worker_waiting_for_a_later_deadline() {
+        let runtime = TimerRuntime::start(2).unwrap();
+        let handle = runtime.handle();
+        let started = Instant::now();
+        handle
+            .schedule(schedule(
+                token(1),
+                1,
+                0,
+                started + Duration::from_millis(600),
+            ))
+            .unwrap()
+            .wait()
+            .unwrap()
+            .unwrap();
+        thread::sleep(Duration::from_millis(10));
+        let earlier = Instant::now() + Duration::from_millis(60);
+
+        handle
+            .reschedule(schedule(token(1), 2, 1, earlier))
+            .unwrap()
+            .wait()
+            .unwrap()
+            .unwrap();
+
+        let expired = runtime
+            .expired()
+            .recv_timeout(Duration::from_millis(300))
+            .unwrap();
+        assert_eq!(expired.token(), &token(1));
+        assert_eq!(expired.operation_id(), BusinessOperationId::new(2));
+        assert_eq!(expired.session_generation(), SessionGeneration::new(1));
+        assert!(expired.emitted_at() < started + Duration::from_millis(400));
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn runtime_cancel_prevents_the_deadline_event() {
+        let runtime = TimerRuntime::start(2).unwrap();
+        let handle = runtime.handle();
+        handle
+            .schedule(schedule(
+                token(1),
+                1,
+                0,
+                Instant::now() + Duration::from_millis(60),
+            ))
+            .unwrap()
+            .wait()
+            .unwrap()
+            .unwrap();
+
+        let cancelled = handle.cancel(token(1)).unwrap().wait().unwrap().unwrap();
+
+        assert!(cancelled.is_some());
+        assert!(
+            runtime
+                .expired()
+                .recv_timeout(Duration::from_millis(120))
+                .is_err()
+        );
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn shutdown_closes_handles_without_panicking() {
+        let runtime = TimerRuntime::<Token>::start(1).unwrap();
+        let handle = runtime.handle();
+
+        runtime.shutdown().unwrap();
+
+        assert!(matches!(
+            handle.schedule(schedule(token(1), 1, 0, Instant::now())),
+            Err(TimerSubmitError::RuntimeStopped)
+        ));
+    }
+
+    #[test]
+    fn full_command_queue_is_reported_while_expired_events_apply_backpressure() {
+        let runtime = TimerRuntime::start(1).unwrap();
+        let handle = runtime.handle();
+        handle
+            .schedule(schedule(token(1), 1, 0, Instant::now()))
+            .unwrap()
+            .wait()
+            .unwrap()
+            .unwrap();
+        handle
+            .schedule(schedule(token(2), 2, 0, Instant::now()))
+            .unwrap()
+            .wait()
+            .unwrap()
+            .unwrap();
+        let queued = handle
+            .schedule(schedule(
+                token(3),
+                3,
+                0,
+                Instant::now() + Duration::from_secs(1),
+            ))
+            .unwrap();
+
+        assert!(matches!(
+            handle.schedule(schedule(
+                token(4),
+                4,
+                0,
+                Instant::now() + Duration::from_secs(1)
+            )),
+            Err(TimerSubmitError::QueueFull)
+        ));
+        assert_eq!(
+            runtime
+                .expired()
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .token(),
+            &token(1)
+        );
+        assert_eq!(
+            runtime
+                .expired()
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .token(),
+            &token(2)
+        );
+        queued.wait().unwrap().unwrap();
+        runtime.shutdown().unwrap();
     }
 }

@@ -3654,6 +3654,36 @@ workflows:
     }
 
     #[test]
+    fn started_formal_task_returns_conflict_instead_of_being_canceled() {
+        let state = test_state();
+        let body = pause_route(&[], &state).expect("pause route");
+        let response: Value = serde_json::from_str(&body).expect("pause response json");
+        let task_id = response["taskId"].as_u64().expect("task id");
+        let (lock, _) = &*state.pending;
+        let started = lock
+            .lock()
+            .expect("pending queue")
+            .pop_front()
+            .expect("queued task");
+        assert_eq!(started.id, task_id);
+        state.task_tracker.mark_running(task_id);
+
+        let error = task_cancel_route(&[("id".to_string(), task_id.to_string())], &state)
+            .expect_err("started task must not be canceled");
+
+        assert_eq!(error.status, 409);
+        assert!(error.message.contains("不能撤销"));
+        let task = state
+            .task_tracker
+            .recent()
+            .expect("task snapshots")
+            .into_iter()
+            .find(|task| task.id == task_id)
+            .expect("running task");
+        assert_eq!(task.status, "running");
+    }
+
+    #[test]
     fn canceling_secondary_recovery_releases_unread_claim() {
         let state = test_state();
         state
@@ -3713,9 +3743,6 @@ workflows:
     fn canceling_card_game_timeout_releases_entertainment_session() {
         let state = test_state();
         let entertainment = EntertainmentCoordinator::new();
-        entertainment
-            .try_acquire(crate::features::entertainment::EntertainmentKind::Landlord)
-            .expect("acquire card game");
         let service = crate::features::card_games::CardGameService::new(
             crate::features::card_games::LandlordConfig {
                 lobby_timeout_seconds: 1,
@@ -3723,21 +3750,72 @@ workflows:
             },
             entertainment.clone(),
         );
+        let idiom_chain = crate::features::idiom_chain::IdiomChainService::from_entries_for_test(
+            &["画蛇添足", "足智多谋"],
+            entertainment.clone(),
+            None,
+        );
+        let runtime = crate::runtime::business::BusinessRuntime::start(8, idiom_chain, service)
+            .expect("start business runtime");
+        let business = runtime.handle();
         let started_at = std::time::Instant::now();
-        service
-            .handle(
+        let verification = match business
+            .begin_card_game(
                 "甲",
                 &crate::features::card_games::LandlordCommand::Start,
                 started_at,
             )
-            .expect("start card game");
-        let outcome = service
-            .tick(started_at + std::time::Duration::from_secs(2), true)
+            .expect("begin card game")
+        {
+            crate::features::card_games::CardGameCommandStart::Suspended(request) => request,
+            crate::features::card_games::CardGameCommandStart::Completed(_) => {
+                panic!("start should require verification")
+            }
+        };
+        assert!(matches!(
+            business
+                .claim_card_game_effect(verification.key)
+                .expect("claim verification"),
+            crate::features::card_games::CardGameEffectClaim::Claimed
+        ));
+        let hall = match business
+            .resume_card_game(
+                verification.key,
+                crate::features::card_games::CardGameEffectResult::FriendVerify(Ok(true)),
+            )
+            .expect("resume verification")
+        {
+            crate::features::card_games::CardGameResume::Suspended(request) => request,
+            other => panic!("verified start should announce lobby: {other:?}"),
+        };
+        assert!(matches!(
+            business
+                .claim_card_game_effect(hall.key)
+                .expect("claim hall announcement"),
+            crate::features::card_games::CardGameEffectClaim::Claimed
+        ));
+        assert!(matches!(
+            business
+                .resume_card_game(
+                    hall.key,
+                    crate::features::card_games::CardGameEffectResult::HallDelivery(Ok(())),
+                )
+                .expect("resume hall announcement"),
+            crate::features::card_games::CardGameResume::Completed(_)
+        ));
+        let outcome = business
+            .tick_card_game(started_at + std::time::Duration::from_secs(2), true)
             .expect("tick card game")
             .expect("lobby timeout");
+        let action = outcome.action();
+        let request = outcome.into_request();
         let receipt = enqueue_pending_task(
             &state,
-            super::super::PendingTask::CardGameDelivery(service.delivery_task(outcome)),
+            super::super::PendingTask::CardGameEffect(super::super::QueuedCardGameEffect::new(
+                business.clone(),
+                action,
+                request,
+            )),
         )
         .expect("enqueue card game delivery");
 
@@ -3745,7 +3823,8 @@ workflows:
             .expect("cancel card game delivery");
 
         assert_eq!(entertainment.active(), None);
-        assert!(!service.is_active().unwrap());
+        assert!(!business.abort_card_game().expect("query remaining game"));
+        runtime.shutdown().expect("shutdown business runtime");
     }
 
     #[test]

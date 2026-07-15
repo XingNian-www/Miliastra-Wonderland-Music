@@ -109,8 +109,12 @@ use self::ui_locator::UiLocator;
 use self::ui_state::{UiState, detect_ui_state};
 use self::web_tools::{WebToolRequest, WebToolShared, WebToolTask, WebToolTemplate};
 use crate::config::{AppConfig, PointConfig};
+#[cfg(test)]
+use crate::features::card_games::LandlordConfig;
 use crate::features::card_games::{
-    CardGameDeliveryPort, CardGameDeliveryTask, CardGameService, LandlordCommand,
+    CardGameCommandStart, CardGameDeliveryPort, CardGameEffect, CardGameEffectClaim,
+    CardGameEffectLane, CardGameEffectRequest, CardGameEffectResult, CardGameResume,
+    CardGameService, LandlordCommand,
 };
 use crate::features::chat_text::split_numbered_chat_message;
 use crate::features::custom_workflow::CustomWorkflowService;
@@ -139,7 +143,7 @@ use crate::runtime::player_io::{PlayerRuntime, PlayerSearchClient, PlayerSearchC
 use crate::runtime::ui::{
     FrameDemand, FrameDemandSubscription, FramePublication, UiRuntime, UiRuntimeHandle,
 };
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use enigo::Key;
 use image::DynamicImage;
 
@@ -403,7 +407,6 @@ pub(crate) struct AutomationApp {
     business_runtime: Option<BusinessRuntime>,
     runtime_state: Arc<Mutex<PersistentRuntimeState>>,
     entertainment: EntertainmentCoordinator,
-    landlord: CardGameService,
     undercover: UndercoverService,
     turtle_soup: TurtleSoupService,
     deferred_chat: DeferredChatQueue,
@@ -444,6 +447,127 @@ pub(crate) struct AutomationApp {
 
 struct DeferredCardGamePort<'a> {
     app: &'a AutomationApp,
+}
+
+struct QueuedCardGameEffect {
+    business: BusinessRuntimeHandle,
+    action: &'static str,
+    request: CardGameEffectRequest,
+}
+
+impl QueuedCardGameEffect {
+    fn new(
+        business: BusinessRuntimeHandle,
+        action: &'static str,
+        request: CardGameEffectRequest,
+    ) -> Self {
+        Self {
+            business,
+            action,
+            request,
+        }
+    }
+
+    fn label(&self) -> String {
+        format!("发送牌局计时结果({})", self.action)
+    }
+
+    fn execute(self, port: &dyn CardGameDeliveryPort) -> Result<()> {
+        drive_card_game_effect_chain(
+            &self.business,
+            self.request,
+            CardGameEffectLane::Formal,
+            CardGameLatePolicy::Ignore,
+            port,
+        )
+    }
+
+    fn cancel(&self) -> Result<()> {
+        let _ = self.business.cancel_card_game_effect(self.request.key)?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CardGameLatePolicy {
+    Error,
+    Ignore,
+}
+
+fn drive_card_game_start(
+    business: &BusinessRuntimeHandle,
+    start: CardGameCommandStart,
+    expected_lane: CardGameEffectLane,
+    port: &dyn CardGameDeliveryPort,
+) -> Result<()> {
+    match start {
+        CardGameCommandStart::Completed(_) => Ok(()),
+        CardGameCommandStart::Suspended(request) => drive_card_game_effect_chain(
+            business,
+            request,
+            expected_lane,
+            CardGameLatePolicy::Error,
+            port,
+        ),
+    }
+}
+
+fn drive_card_game_effect_chain(
+    business: &BusinessRuntimeHandle,
+    mut request: CardGameEffectRequest,
+    expected_lane: CardGameEffectLane,
+    late_policy: CardGameLatePolicy,
+    port: &dyn CardGameDeliveryPort,
+) -> Result<()> {
+    loop {
+        if request.lane != expected_lane {
+            let _ = business.cancel_card_game_effect(request.key);
+            bail!(
+                "牌局效果通道不一致: expected={expected_lane:?} actual={:?}",
+                request.lane
+            );
+        }
+        match business.claim_card_game_effect(request.key)? {
+            CardGameEffectClaim::Claimed => {}
+            CardGameEffectClaim::Late(_) => return handle_late_card_game_effect(late_policy),
+        }
+        let key = request.key;
+        let result = match request.effect {
+            CardGameEffect::FriendVerify { player, message } => {
+                CardGameEffectResult::FriendVerify(run_card_game_delivery("好友验证", || {
+                    port.verify_friend(&player, &message)
+                }))
+            }
+            CardGameEffect::PrivateDelivery { player, message } => {
+                CardGameEffectResult::PrivateDelivery(run_card_game_delivery(
+                    "好友消息发送",
+                    || port.send_friend(&player, &message),
+                ))
+            }
+            CardGameEffect::HallDelivery { message } => CardGameEffectResult::HallDelivery(
+                run_card_game_delivery("大厅消息发送", || port.send_hall(&message)),
+            ),
+        };
+        match business.resume_card_game(key, result)? {
+            CardGameResume::Completed(_) => return Ok(()),
+            CardGameResume::Suspended(next) => request = next,
+            CardGameResume::Late(_) => return handle_late_card_game_effect(late_policy),
+        }
+    }
+}
+
+fn run_card_game_delivery<T>(label: &str, delivery: impl FnOnce() -> Result<T>) -> Result<T> {
+    match catch_unwind(AssertUnwindSafe(delivery)) {
+        Ok(result) => result,
+        Err(_) => Err(anyhow!("牌局{label}发生未捕获异常")),
+    }
+}
+
+fn handle_late_card_game_effect(policy: CardGameLatePolicy) -> Result<()> {
+    match policy {
+        CardGameLatePolicy::Ignore => Ok(()),
+        CardGameLatePolicy::Error => bail!("牌局命令在效果链完成前已失效"),
+    }
 }
 
 impl CardGameDeliveryPort for DeferredCardGamePort<'_> {
@@ -556,7 +680,7 @@ enum PendingTask {
         discard_only: bool,
     },
     RestoreSecondaryHall,
-    CardGameDelivery(CardGameDeliveryTask),
+    CardGameEffect(QueuedCardGameEffect),
     UndercoverDelivery(UndercoverDeliveryTask),
 }
 
@@ -599,8 +723,8 @@ impl TrackedPendingTask {
                 task.cancel();
                 sync_listener = true;
             }
-            PendingTask::CardGameDelivery(delivery) => {
-                if let Err(error) = delivery.cancel() {
+            PendingTask::CardGameEffect(effect) => {
+                if let Err(error) = effect.cancel() {
                     log::error!("撤销牌局计时结果后无法清理牌局: {error:#}");
                 }
             }
@@ -635,7 +759,7 @@ impl PendingTask {
                 }
             }
             Self::RestoreSecondaryHall => "二级监听恢复当前大厅".to_string(),
-            Self::CardGameDelivery(delivery) => delivery.label(),
+            Self::CardGameEffect(effect) => effect.label(),
             Self::UndercoverDelivery(delivery) => delivery.label().to_string(),
         }
     }
@@ -657,7 +781,7 @@ impl PendingTask {
             Self::SetChatListenerMode { .. }
             | Self::SecondaryUnread { .. }
             | Self::RestoreSecondaryHall
-            | Self::CardGameDelivery(_)
+            | Self::CardGameEffect(_)
             | Self::UndercoverDelivery(_) => false,
         }
     }
@@ -681,7 +805,7 @@ impl PendingTask {
             | Self::SetChatListenerMode { .. }
             | Self::SecondaryUnread { .. }
             | Self::RestoreSecondaryHall
-            | Self::CardGameDelivery(_)
+            | Self::CardGameEffect(_)
             | Self::UndercoverDelivery(_) => false,
         }
     }
@@ -697,7 +821,7 @@ impl PendingTask {
             | Self::AdvanceQueue { .. }
             | Self::ConsoleChat { .. }
             | Self::ModerationResult(_)
-            | Self::CardGameDelivery(_)
+            | Self::CardGameEffect(_)
             | Self::UndercoverDelivery(_) => true,
         }
     }
@@ -975,7 +1099,7 @@ impl AutomationApp {
             config.ocr.change_pixel_threshold,
         );
         let business_runtime =
-            BusinessRuntime::start(BUSINESS_RUNTIME_QUEUE_CAPACITY, idiom_chain)?;
+            BusinessRuntime::start(BUSINESS_RUNTIME_QUEUE_CAPACITY, idiom_chain, landlord)?;
         let business = business_runtime.handle();
         let moderation = ModerationService::new(ModerationPolicy::new(
             Duration::from_millis(config.timing.moderation.vote_timeout_ms),
@@ -993,7 +1117,6 @@ impl AutomationApp {
             business_runtime: Some(business_runtime),
             runtime_state,
             entertainment,
-            landlord,
             undercover,
             turtle_soup,
             deferred_chat,
@@ -1334,7 +1457,6 @@ impl AutomationApp {
             business_runtime: None,
             runtime_state: self.runtime_state.clone(),
             entertainment: self.entertainment.clone(),
-            landlord: self.landlord.clone(),
             undercover: self.undercover.clone(),
             turtle_soup: self.turtle_soup.clone(),
             deferred_chat: self.deferred_chat.clone(),
@@ -2493,11 +2615,14 @@ impl AutomationApp {
         if command.requires_executor() {
             return Ok(false);
         }
-        self.landlord.execute(
-            &parsed.username,
-            command,
+        let start = self
+            .business
+            .begin_card_game(&parsed.username, command, Instant::now())?;
+        drive_card_game_start(
+            &self.business,
+            start,
+            CardGameEffectLane::Deferred,
             &DeferredCardGamePort { app: self },
-            Instant::now(),
         )?;
         log::info!(
             "牌局命令已处理: command={} user={}",
@@ -2569,7 +2694,7 @@ impl AutomationApp {
             Ok(false) => {}
             Err(error) => log::error!("无法中止旧谁是卧底牌局: {error:#}"),
         }
-        match self.landlord.abort() {
+        match self.business.abort_card_game() {
             Ok(true) => log::warn!("牌局已因聊天上下文变化中止: {}", reason),
             Ok(false) => {}
             Err(error) => log::error!("无法中止旧牌局: {error:#}"),
@@ -2585,7 +2710,7 @@ impl AutomationApp {
         self.turtle_soup.tick();
         let clock_active = !self.paused.load(AtomicOrdering::SeqCst)
             && !self.command_executing.load(AtomicOrdering::SeqCst);
-        let card_game_outcome = match self.landlord.tick(Instant::now(), clock_active) {
+        let card_game_outcome = match self.business.tick_card_game(Instant::now(), clock_active) {
             Ok(outcome) => outcome,
             Err(error) => {
                 log::error!("无法推进牌局回合计时: {error:#}");
@@ -2593,11 +2718,13 @@ impl AutomationApp {
             }
         };
         if let Some(outcome) = card_game_outcome {
-            let delivery = self.landlord.delivery_task(outcome);
-            let failed_delivery = delivery.clone();
-            if let Err(error) = self.push_pending_task(PendingTask::CardGameDelivery(delivery)) {
+            let action = outcome.action();
+            let request = outcome.into_request();
+            let key = request.key;
+            let effect = QueuedCardGameEffect::new(self.business.clone(), action, request);
+            if let Err(error) = self.push_pending_task(PendingTask::CardGameEffect(effect)) {
                 log::error!("牌局计时结果入队失败: {error:#}");
-                if let Err(cancel_error) = failed_delivery.cancel() {
+                if let Err(cancel_error) = self.business.cancel_card_game_effect(key) {
                     log::error!("牌局计时结果入队失败后无法清理牌局: {cancel_error:#}");
                 }
             }
@@ -2872,7 +2999,7 @@ impl AutomationApp {
             PendingTask::RestoreSecondaryHall => self
                 .execute_restore_secondary_hall_task()
                 .map(|_| PendingTaskExecution::Completed),
-            PendingTask::CardGameDelivery(delivery) => delivery
+            PendingTask::CardGameEffect(effect) => effect
                 .execute(self)
                 .map(|_| PendingTaskExecution::Completed),
             PendingTask::UndercoverDelivery(delivery) => delivery
@@ -5664,7 +5791,10 @@ impl AutomationApp {
     }
 
     fn execute_landlord_command(&self, player: &str, command: &LandlordCommand) -> Result<()> {
-        self.landlord.execute(player, command, self, Instant::now())
+        let start = self
+            .business
+            .begin_card_game(player, command, Instant::now())?;
+        drive_card_game_start(&self.business, start, CardGameEffectLane::Formal, self)
     }
 
     fn execute_undercover_command(
@@ -6786,6 +6916,153 @@ mod tests {
         assert!(LandlordCommand::Decline.requires_executor());
         assert!(!LandlordCommand::Play("3".to_string()).requires_executor());
         assert!(!LandlordCommand::Pass.requires_executor());
+    }
+
+    struct FailingCardGamePort;
+
+    impl CardGameDeliveryPort for FailingCardGamePort {
+        fn verify_friend(&self, _player: &str, _message: &str) -> Result<bool> {
+            Err(anyhow!("test verification failed"))
+        }
+
+        fn send_friend(&self, _player: &str, _message: &str) -> Result<bool> {
+            panic!("test should stop after verification")
+        }
+
+        fn send_hall(&self, _message: &str) -> Result<()> {
+            panic!("test should stop after verification")
+        }
+    }
+
+    struct NeverCalledCardGamePort;
+
+    impl CardGameDeliveryPort for NeverCalledCardGamePort {
+        fn verify_friend(&self, _player: &str, _message: &str) -> Result<bool> {
+            panic!("late effect must not reach UI")
+        }
+
+        fn send_friend(&self, _player: &str, _message: &str) -> Result<bool> {
+            panic!("late effect must not reach UI")
+        }
+
+        fn send_hall(&self, _message: &str) -> Result<()> {
+            panic!("late effect must not reach UI")
+        }
+    }
+
+    struct PanickingCardGamePort;
+
+    impl CardGameDeliveryPort for PanickingCardGamePort {
+        fn verify_friend(&self, _player: &str, _message: &str) -> Result<bool> {
+            panic!("test verification panic")
+        }
+
+        fn send_friend(&self, _player: &str, _message: &str) -> Result<bool> {
+            panic!("test friend delivery panic")
+        }
+
+        fn send_hall(&self, _message: &str) -> Result<()> {
+            panic!("test hall delivery panic")
+        }
+    }
+
+    fn card_game_runtime_for_test() -> (BusinessRuntime, EntertainmentCoordinator) {
+        let entertainment = EntertainmentCoordinator::new();
+        let idiom_chain = IdiomChainService::from_entries_for_test(
+            &["画蛇添足", "足智多谋"],
+            entertainment.clone(),
+            None,
+        );
+        let runtime = BusinessRuntime::start(
+            8,
+            idiom_chain,
+            CardGameService::new(LandlordConfig::default(), entertainment.clone()),
+        )
+        .unwrap();
+        (runtime, entertainment)
+    }
+
+    #[test]
+    fn formal_card_game_ui_errors_are_resumed_before_being_reported() {
+        let (runtime, entertainment) = card_game_runtime_for_test();
+        let business = runtime.handle();
+        let start = business
+            .begin_card_game("甲", &LandlordCommand::Start, Instant::now())
+            .unwrap();
+
+        let error = drive_card_game_start(
+            &business,
+            start,
+            CardGameEffectLane::Formal,
+            &FailingCardGamePort,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("test verification failed"));
+        assert_eq!(entertainment.active(), None);
+        let retry = business
+            .begin_card_game("乙", &LandlordCommand::Start, Instant::now())
+            .unwrap();
+        let CardGameCommandStart::Suspended(retry) = retry else {
+            panic!("failed verification should release the start reservation")
+        };
+        business.cancel_card_game_effect(retry.key).unwrap();
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn formal_card_game_ui_panics_are_resumed_before_being_reported() {
+        let (runtime, entertainment) = card_game_runtime_for_test();
+        let business = runtime.handle();
+        let start = business
+            .begin_card_game("甲", &LandlordCommand::Start, Instant::now())
+            .unwrap();
+
+        let error = drive_card_game_start(
+            &business,
+            start,
+            CardGameEffectLane::Formal,
+            &PanickingCardGamePort,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("牌局好友验证发生未捕获异常"));
+        assert_eq!(entertainment.active(), None);
+        let retry = business
+            .begin_card_game("乙", &LandlordCommand::Start, Instant::now())
+            .unwrap();
+        let CardGameCommandStart::Suspended(retry) = retry else {
+            panic!("panicking verification should release the start reservation")
+        };
+        business.cancel_card_game_effect(retry.key).unwrap();
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn formal_late_effects_error_but_timed_late_effects_are_idempotent() {
+        let (runtime, _) = card_game_runtime_for_test();
+        let business = runtime.handle();
+        let start = business
+            .begin_card_game("甲", &LandlordCommand::Start, Instant::now())
+            .unwrap();
+        let CardGameCommandStart::Suspended(request) = start else {
+            panic!("start should wait for verification")
+        };
+        business.cancel_card_game_effect(request.key).unwrap();
+
+        let formal_error = drive_card_game_start(
+            &business,
+            CardGameCommandStart::Suspended(request.clone()),
+            CardGameEffectLane::Formal,
+            &NeverCalledCardGamePort,
+        )
+        .unwrap_err();
+        assert!(formal_error.to_string().contains("已失效"));
+
+        QueuedCardGameEffect::new(business, "test-timeout", request)
+            .execute(&NeverCalledCardGamePort)
+            .unwrap();
+        runtime.shutdown().unwrap();
     }
 
     #[test]

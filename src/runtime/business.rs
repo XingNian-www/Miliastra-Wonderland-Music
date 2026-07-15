@@ -3,7 +3,12 @@ use std::fmt::{Display, Formatter};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Instant;
 
+use crate::features::card_games::{
+    CardGameCancel, CardGameCommandStart, CardGameEffectClaim, CardGameEffectKey,
+    CardGameEffectResult, CardGameResume, CardGameService, CardGameTimedOutcome, LandlordCommand,
+};
 use crate::features::idiom_chain::{IdiomChainCommand, IdiomChainOutcome, IdiomChainService};
 use crate::observation::chat::{
     CompletionAdvance, ObservationCompletionEvent, ObservationWatermark,
@@ -65,6 +70,7 @@ pub enum BusinessRuntimeError {
     RuntimeStopped,
     WorkerPanicked,
     IdiomChainOperationFailed(String),
+    CardGameOperationFailed(String),
 }
 
 impl Display for BusinessRuntimeError {
@@ -77,6 +83,9 @@ impl Display for BusinessRuntimeError {
             Self::WorkerPanicked => formatter.write_str("business runtime worker panicked"),
             Self::IdiomChainOperationFailed(message) => {
                 write!(formatter, "idiom chain operation failed: {message}")
+            }
+            Self::CardGameOperationFailed(message) => {
+                write!(formatter, "card game operation failed: {message}")
             }
         }
     }
@@ -98,8 +107,37 @@ enum RuntimeMessage {
     },
     AbortIdiomChain(SyncSender<Result<bool, BusinessRuntimeError>>),
     ExpireIdiomChain(SyncSender<Result<bool, BusinessRuntimeError>>),
+    CardGame(CardGameRuntimeMessage),
     Snapshot(SyncSender<BusinessRuntimeSnapshot>),
     Shutdown(SyncSender<BusinessRuntimeSnapshot>),
+}
+
+enum CardGameRuntimeMessage {
+    Begin {
+        player: String,
+        command: LandlordCommand,
+        now: Instant,
+        response: SyncSender<Result<CardGameCommandStart, BusinessRuntimeError>>,
+    },
+    Claim {
+        key: CardGameEffectKey,
+        response: SyncSender<Result<CardGameEffectClaim, BusinessRuntimeError>>,
+    },
+    Resume {
+        key: CardGameEffectKey,
+        result: CardGameEffectResult,
+        response: SyncSender<Result<CardGameResume, BusinessRuntimeError>>,
+    },
+    Cancel {
+        key: CardGameEffectKey,
+        response: SyncSender<Result<CardGameCancel, BusinessRuntimeError>>,
+    },
+    Tick {
+        now: Instant,
+        clock_active: bool,
+        response: SyncSender<Result<Option<CardGameTimedOutcome>, BusinessRuntimeError>>,
+    },
+    Abort(SyncSender<Result<bool, BusinessRuntimeError>>),
 }
 
 struct RuntimeChannel {
@@ -157,6 +195,72 @@ impl BusinessRuntimeHandle {
         self.request(RuntimeMessage::ExpireIdiomChain)
     }
 
+    pub fn begin_card_game(
+        &self,
+        player: &str,
+        command: &LandlordCommand,
+        now: Instant,
+    ) -> Result<CardGameCommandStart, BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::CardGame(CardGameRuntimeMessage::Begin {
+                player: player.to_string(),
+                command: command.clone(),
+                now,
+                response,
+            })
+        })
+    }
+
+    pub fn claim_card_game_effect(
+        &self,
+        key: CardGameEffectKey,
+    ) -> Result<CardGameEffectClaim, BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::CardGame(CardGameRuntimeMessage::Claim { key, response })
+        })
+    }
+
+    pub fn resume_card_game(
+        &self,
+        key: CardGameEffectKey,
+        result: CardGameEffectResult,
+    ) -> Result<CardGameResume, BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::CardGame(CardGameRuntimeMessage::Resume {
+                key,
+                result,
+                response,
+            })
+        })
+    }
+
+    pub fn cancel_card_game_effect(
+        &self,
+        key: CardGameEffectKey,
+    ) -> Result<CardGameCancel, BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::CardGame(CardGameRuntimeMessage::Cancel { key, response })
+        })
+    }
+
+    pub fn tick_card_game(
+        &self,
+        now: Instant,
+        clock_active: bool,
+    ) -> Result<Option<CardGameTimedOutcome>, BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::CardGame(CardGameRuntimeMessage::Tick {
+                now,
+                clock_active,
+                response,
+            })
+        })
+    }
+
+    pub fn abort_card_game(&self) -> Result<bool, BusinessRuntimeError> {
+        self.request(|response| RuntimeMessage::CardGame(CardGameRuntimeMessage::Abort(response)))
+    }
+
     fn request<T>(
         &self,
         message: impl FnOnce(SyncSender<Result<T, BusinessRuntimeError>>) -> RuntimeMessage,
@@ -193,6 +297,7 @@ impl BusinessRuntime {
     pub(crate) fn start(
         queue_capacity: usize,
         idiom_chain: IdiomChainService,
+        card_games: CardGameService,
     ) -> Result<Self, BusinessRuntimeError> {
         if queue_capacity == 0 {
             return Err(BusinessRuntimeError::ZeroQueueCapacity);
@@ -204,7 +309,7 @@ impl BusinessRuntime {
         });
         let worker = thread::Builder::new()
             .name("business-runtime".to_string())
-            .spawn(move || run_business_runtime(receiver, idiom_chain))
+            .spawn(move || run_business_runtime(receiver, idiom_chain, card_games))
             .map_err(|_| BusinessRuntimeError::RuntimeStopped)?;
         Ok(Self {
             handle: BusinessRuntimeHandle { channel },
@@ -253,7 +358,11 @@ impl Drop for BusinessRuntime {
     }
 }
 
-fn run_business_runtime(receiver: Receiver<RuntimeMessage>, mut idiom_chain: IdiomChainService) {
+fn run_business_runtime(
+    receiver: Receiver<RuntimeMessage>,
+    mut idiom_chain: IdiomChainService,
+    mut card_games: CardGameService,
+) {
     let mut snapshot = BusinessRuntimeSnapshot::default();
     while let Ok(message) = receiver.recv() {
         match message {
@@ -290,13 +399,68 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, mut idiom_chain: Idi
                         .map_err(idiom_chain_operation_failed),
                 );
             }
+            RuntimeMessage::CardGame(message) => handle_card_game_message(&mut card_games, message),
             RuntimeMessage::Snapshot(response) => {
                 let _ = response.send(snapshot);
             }
             RuntimeMessage::Shutdown(response) => {
+                if let Err(error) = card_games.abort() {
+                    log::error!("业务运行时关闭时无法中止牌局: {error:#}");
+                }
+                if let Err(error) = idiom_chain.abort() {
+                    log::error!("业务运行时关闭时无法中止成语接龙: {error:#}");
+                }
                 let _ = response.send(snapshot);
                 break;
             }
+        }
+    }
+}
+
+fn handle_card_game_message(card_games: &mut CardGameService, message: CardGameRuntimeMessage) {
+    match message {
+        CardGameRuntimeMessage::Begin {
+            player,
+            command,
+            now,
+            response,
+        } => {
+            let _ = response.send(
+                card_games
+                    .begin_command(&player, &command, now)
+                    .map_err(card_game_operation_failed),
+            );
+        }
+        CardGameRuntimeMessage::Claim { key, response } => {
+            let _ = response.send(card_games.claim(key).map_err(card_game_operation_failed));
+        }
+        CardGameRuntimeMessage::Resume {
+            key,
+            result,
+            response,
+        } => {
+            let _ = response.send(
+                card_games
+                    .resume(key, result)
+                    .map_err(card_game_operation_failed),
+            );
+        }
+        CardGameRuntimeMessage::Cancel { key, response } => {
+            let _ = response.send(card_games.cancel(key).map_err(card_game_operation_failed));
+        }
+        CardGameRuntimeMessage::Tick {
+            now,
+            clock_active,
+            response,
+        } => {
+            let _ = response.send(
+                card_games
+                    .tick(now, clock_active)
+                    .map_err(card_game_operation_failed),
+            );
+        }
+        CardGameRuntimeMessage::Abort(response) => {
+            let _ = response.send(card_games.abort().map_err(card_game_operation_failed));
         }
     }
 }
@@ -305,13 +469,23 @@ fn idiom_chain_operation_failed(error: anyhow::Error) -> BusinessRuntimeError {
     BusinessRuntimeError::IdiomChainOperationFailed(format!("{error:#}"))
 }
 
+fn card_game_operation_failed(error: anyhow::Error) -> BusinessRuntimeError {
+    BusinessRuntimeError::CardGameOperationFailed(format!("{error:#}"))
+}
+
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroUsize;
+    use std::sync::mpsc;
+    use std::thread;
     use std::time::{Duration, Instant};
 
     use super::*;
-    use crate::features::entertainment::EntertainmentCoordinator;
+    use crate::features::card_games::{
+        CardGameEffect, CardGameEffectLane, CardGameEffectRequest, CardGameLateResult,
+        LandlordConfig,
+    };
+    use crate::features::entertainment::{EntertainmentCoordinator, EntertainmentKind};
     use crate::features::idiom_chain::IdiomChainMode;
     use crate::observation::chat::ChatObservationLedger;
     use crate::observation::shared::{ObservationGapKind, SharedObservationStream};
@@ -328,14 +502,33 @@ mod tests {
     }
 
     fn runtime(queue_capacity: usize) -> BusinessRuntime {
+        let entertainment = EntertainmentCoordinator::new();
         BusinessRuntime::start(
             queue_capacity,
-            idiom_service(
-                EntertainmentCoordinator::new(),
-                Some(Duration::from_secs(300)),
-            ),
+            idiom_service(entertainment.clone(), Some(Duration::from_secs(300))),
+            CardGameService::new(LandlordConfig::default(), entertainment),
         )
         .unwrap()
+    }
+
+    fn runtime_with_entertainment(
+        queue_capacity: usize,
+    ) -> (BusinessRuntime, EntertainmentCoordinator) {
+        let entertainment = EntertainmentCoordinator::new();
+        let runtime = BusinessRuntime::start(
+            queue_capacity,
+            idiom_service(entertainment.clone(), Some(Duration::from_secs(300))),
+            CardGameService::new(LandlordConfig::default(), entertainment.clone()),
+        )
+        .unwrap();
+        (runtime, entertainment)
+    }
+
+    fn suspended(start: CardGameCommandStart) -> CardGameEffectRequest {
+        match start {
+            CardGameCommandStart::Suspended(request) => request,
+            CardGameCommandStart::Completed(_) => panic!("expected suspended card game effect"),
+        }
     }
 
     #[test]
@@ -398,11 +591,245 @@ mod tests {
     }
 
     #[test]
+    fn card_game_begin_claim_and_resume_share_worker_owned_state() {
+        let (runtime, entertainment) = runtime_with_entertainment(8);
+        let handle = runtime.handle();
+        let verification = suspended(
+            handle
+                .begin_card_game("甲", &LandlordCommand::Start, Instant::now())
+                .unwrap(),
+        );
+
+        assert_eq!(verification.lane, CardGameEffectLane::Formal);
+        assert!(matches!(
+            verification.effect,
+            CardGameEffect::FriendVerify { ref player, .. } if player == "甲"
+        ));
+        assert_eq!(
+            handle.claim_card_game_effect(verification.key).unwrap(),
+            CardGameEffectClaim::Claimed
+        );
+        let hall = match handle
+            .resume_card_game(
+                verification.key,
+                CardGameEffectResult::FriendVerify(Ok(true)),
+            )
+            .unwrap()
+        {
+            CardGameResume::Suspended(request) => request,
+            other => panic!("verified start should announce the lobby: {other:?}"),
+        };
+        assert_eq!(hall.lane, CardGameEffectLane::Formal);
+        assert_eq!(
+            handle.claim_card_game_effect(hall.key).unwrap(),
+            CardGameEffectClaim::Claimed
+        );
+        assert!(matches!(
+            handle
+                .resume_card_game(hall.key, CardGameEffectResult::HallDelivery(Ok(())))
+                .unwrap(),
+            CardGameResume::Completed(_)
+        ));
+        assert_eq!(entertainment.active(), Some(EntertainmentKind::Landlord));
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn card_game_claim_distinguishes_queued_cancel_from_claimed_work() {
+        let runtime = runtime(8);
+        let handle = runtime.handle();
+        let first = suspended(
+            handle
+                .begin_card_game("甲", &LandlordCommand::Start, Instant::now())
+                .unwrap(),
+        );
+
+        assert!(matches!(
+            handle.cancel_card_game_effect(first.key).unwrap(),
+            CardGameCancel::Cancelled(_)
+        ));
+        assert!(matches!(
+            handle.claim_card_game_effect(first.key).unwrap(),
+            CardGameEffectClaim::Late(CardGameLateResult { key }) if key == first.key
+        ));
+
+        let second = suspended(
+            handle
+                .begin_card_game("乙", &LandlordCommand::Start, Instant::now())
+                .unwrap(),
+        );
+        assert_eq!(
+            handle.claim_card_game_effect(second.key).unwrap(),
+            CardGameEffectClaim::Claimed
+        );
+        assert!(matches!(
+            handle.claim_card_game_effect(second.key).unwrap(),
+            CardGameEffectClaim::Late(_)
+        ));
+        assert!(matches!(
+            handle.cancel_card_game_effect(second.key).unwrap(),
+            CardGameCancel::Late(_)
+        ));
+        assert!(matches!(
+            handle
+                .resume_card_game(second.key, CardGameEffectResult::FriendVerify(Ok(false)),)
+                .unwrap(),
+            CardGameResume::Suspended(_)
+        ));
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn old_card_game_generation_is_late_without_exposing_ui_work() {
+        let runtime = runtime(8);
+        let handle = runtime.handle();
+        let old = suspended(
+            handle
+                .begin_card_game("甲", &LandlordCommand::Start, Instant::now())
+                .unwrap(),
+        );
+        assert!(handle.abort_card_game().unwrap());
+        let current = suspended(
+            handle
+                .begin_card_game("乙", &LandlordCommand::Start, Instant::now())
+                .unwrap(),
+        );
+
+        assert!(matches!(
+            handle.claim_card_game_effect(old.key).unwrap(),
+            CardGameEffectClaim::Late(_)
+        ));
+        assert_eq!(
+            handle.claim_card_game_effect(current.key).unwrap(),
+            CardGameEffectClaim::Claimed
+        );
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn abort_remains_responsive_while_claimed_ui_work_is_slow() {
+        let runtime = runtime(8);
+        let handle = runtime.handle();
+        let request = suspended(
+            handle
+                .begin_card_game("甲", &LandlordCommand::Start, Instant::now())
+                .unwrap(),
+        );
+        let worker_handle = handle.clone();
+        let (claimed_sender, claimed_receiver) = mpsc::sync_channel(1);
+        let (release_sender, release_receiver) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            assert_eq!(
+                worker_handle.claim_card_game_effect(request.key).unwrap(),
+                CardGameEffectClaim::Claimed
+            );
+            claimed_sender.send(()).unwrap();
+            release_receiver.recv().unwrap();
+            worker_handle
+                .resume_card_game(request.key, CardGameEffectResult::FriendVerify(Ok(true)))
+        });
+        claimed_receiver.recv().unwrap();
+
+        assert!(handle.abort_card_game().unwrap());
+        release_sender.send(()).unwrap();
+        assert!(matches!(
+            worker.join().unwrap().unwrap(),
+            CardGameResume::Late(_)
+        ));
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn card_game_effect_chains_preserve_their_scheduling_lane() {
+        let runtime = runtime(8);
+        let handle = runtime.handle();
+        let verification = suspended(
+            handle
+                .begin_card_game("甲", &LandlordCommand::Start, Instant::now())
+                .unwrap(),
+        );
+        handle.claim_card_game_effect(verification.key).unwrap();
+        let hall = match handle
+            .resume_card_game(
+                verification.key,
+                CardGameEffectResult::FriendVerify(Ok(true)),
+            )
+            .unwrap()
+        {
+            CardGameResume::Suspended(request) => request,
+            other => panic!("verified start should continue: {other:?}"),
+        };
+        assert_eq!(hall.lane, CardGameEffectLane::Formal);
+        handle.claim_card_game_effect(hall.key).unwrap();
+        handle
+            .resume_card_game(hall.key, CardGameEffectResult::HallDelivery(Ok(())))
+            .unwrap();
+
+        let status = suspended(
+            handle
+                .begin_card_game("甲", &LandlordCommand::Status, Instant::now())
+                .unwrap(),
+        );
+        assert_eq!(status.lane, CardGameEffectLane::Deferred);
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn shutdown_stops_card_game_requests_from_all_handle_clones() {
+        let (runtime, entertainment) = runtime_with_entertainment(4);
+        let first = runtime.handle();
+        let second = first.clone();
+        let request = suspended(
+            first
+                .begin_card_game("甲", &LandlordCommand::Start, Instant::now())
+                .unwrap(),
+        );
+
+        runtime.shutdown().unwrap();
+
+        assert_eq!(
+            first.claim_card_game_effect(request.key),
+            Err(BusinessRuntimeError::RuntimeStopped)
+        );
+        assert_eq!(
+            second.abort_card_game(),
+            Err(BusinessRuntimeError::RuntimeStopped)
+        );
+        assert_eq!(entertainment.active(), None);
+    }
+
+    #[test]
+    fn shutdown_aborts_active_idiom_chain_and_releases_entertainment() {
+        let entertainment = EntertainmentCoordinator::new();
+        let runtime = BusinessRuntime::start(
+            4,
+            idiom_service(entertainment.clone(), Some(Duration::from_secs(300))),
+            CardGameService::new(LandlordConfig::default(), entertainment.clone()),
+        )
+        .unwrap();
+        runtime
+            .handle()
+            .handle_idiom_chain(
+                "Alice",
+                &IdiomChainCommand::Start {
+                    idiom: "画蛇添足".to_string(),
+                    mode: IdiomChainMode::Exact,
+                },
+            )
+            .unwrap();
+
+        runtime.shutdown().unwrap();
+
+        assert_eq!(entertainment.active(), None);
+    }
+
+    #[test]
     fn idiom_chain_requests_share_worker_owned_state() {
         let entertainment = EntertainmentCoordinator::new();
         let runtime = BusinessRuntime::start(
             4,
             idiom_service(entertainment.clone(), Some(Duration::from_secs(300))),
+            CardGameService::new(LandlordConfig::default(), entertainment.clone()),
         )
         .unwrap();
         let handle = runtime.handle();
@@ -442,6 +869,7 @@ mod tests {
         let runtime = BusinessRuntime::start(
             2,
             idiom_service(entertainment.clone(), Some(Duration::ZERO)),
+            CardGameService::new(LandlordConfig::default(), entertainment.clone()),
         )
         .unwrap();
         let handle = runtime.handle();
@@ -465,7 +893,11 @@ mod tests {
     #[test]
     fn zero_capacity_is_rejected() {
         assert!(matches!(
-            BusinessRuntime::start(0, idiom_service(EntertainmentCoordinator::new(), None),),
+            BusinessRuntime::start(
+                0,
+                idiom_service(EntertainmentCoordinator::new(), None),
+                CardGameService::new(LandlordConfig::default(), EntertainmentCoordinator::new(),),
+            ),
             Err(BusinessRuntimeError::ZeroQueueCapacity)
         ));
     }

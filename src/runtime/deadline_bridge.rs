@@ -188,8 +188,7 @@ impl BusinessRuntimeGroupBuilder {
         })
     }
 
-    #[cfg(test)]
-    fn handle(&self) -> TimerRuntimeHandle<BusinessDeadlineToken> {
+    pub(crate) fn handle(&self) -> TimerRuntimeHandle<BusinessDeadlineToken> {
         self.timer
             .as_ref()
             .expect("deadline timer is active while borrowed")

@@ -14,7 +14,6 @@ use super::runtime_state::{
     PersistentRuntimeState, PlaybackObservation,
 };
 use super::song_dedup::{PersistentSongDedupHistory, SongDedupCandidate};
-use super::song_matcher;
 use crate::config::{MatchConfig, PlaybackTimingConfig, QueueConfig, SongDedupConfig};
 
 pub(super) trait MusicPlayerBackend: Clone + Send + Sync + 'static {
@@ -114,6 +113,7 @@ pub(super) struct PlaybackRequest {
 #[derive(Clone, Debug)]
 pub(super) struct PlaybackAttempt {
     pub(super) initial_song: String,
+    pub(super) initial_uri: String,
     pub(super) initial_progress: f64,
     pub(super) requested_uri: String,
     previous_playback: super::runtime_state::PlaybackRuntimeState,
@@ -145,10 +145,8 @@ pub(super) enum PlaybackOutcome {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum MismatchDecision {
-    Accept,
     NoSource,
     SwitchSource,
-    Error,
 }
 
 #[derive(Clone, Debug)]
@@ -287,9 +285,7 @@ impl<B: MusicPlayerBackend> PlayerController<B> {
         }
         if status.status == "paused"
             && (playback_remaining_seconds(status).is_some()
-                || !status.current_uri.trim().is_empty()
-                || !status.name.trim().is_empty()
-                || !status.singer.trim().is_empty())
+                || !status.current_uri.trim().is_empty())
         {
             return Ok(true);
         }
@@ -323,7 +319,13 @@ impl<B: MusicPlayerBackend> PlayerController<B> {
         let initial = self
             .backend
             .status()
-            .map(|status| (format!("{}{}", status.name, status.singer), status.progress))
+            .map(|status| {
+                (
+                    format!("{}{}", status.name, status.singer),
+                    status.current_uri,
+                    status.progress,
+                )
+            })
             .unwrap_or_default();
         self.with_playback_state(|state| {
             state.playback.state = ConfirmedPlaybackState::Starting;
@@ -343,7 +345,8 @@ impl<B: MusicPlayerBackend> PlayerController<B> {
         log::info!("播放器状态转移: Starting keyword={}", request.keyword);
         Ok(PlaybackAttempt {
             initial_song: initial.0,
-            initial_progress: initial.1,
+            initial_uri: initial.1,
+            initial_progress: initial.2,
             requested_uri: request.uri.clone(),
             previous_playback: previous_playback.clone(),
         })
@@ -393,74 +396,53 @@ impl<B: MusicPlayerBackend> PlayerController<B> {
 
             let current_uri = status.current_uri.trim();
             let requested_uri = attempt.requested_uri.trim();
-            let current_song = format!("{}{}", status.name, status.singer);
-            let uri_matched = !requested_uri.is_empty()
-                && !current_uri.is_empty()
-                && current_uri == requested_uri;
-
-            if !requested_uri.is_empty() && !current_uri.is_empty() && current_uri != requested_uri
-            {
+            if requested_uri.is_empty() {
                 log::info!(
-                    "URI 与请求资源不同，继续用歌曲信息确认: current={} requested={} ({}/{})",
+                    "播放请求缺少 URI，无法确认歌曲身份 ({}/{})",
+                    retry + 1,
+                    self.timing.status_retries
+                );
+                sleep(Duration::from_millis(self.timing.status_poll_ms));
+                continue;
+            }
+            if current_uri.is_empty() {
+                log::info!(
+                    "播放器观测缺少 URI，继续等待 ({}/{})",
+                    retry + 1,
+                    self.timing.status_retries
+                );
+                sleep(Duration::from_millis(self.timing.status_poll_ms));
+                continue;
+            }
+            if current_uri != requested_uri {
+                if !attempt.initial_uri.is_empty()
+                    && current_uri == attempt.initial_uri
+                    && !playback_progress_restarted(attempt.initial_progress, status.progress)
+                {
+                    log::info!(
+                        "歌曲 URI 尚未切换，继续等待播放请求生效 ({}/{})",
+                        retry + 1,
+                        self.timing.status_retries
+                    );
+                    sleep(Duration::from_millis(self.timing.status_poll_ms));
+                    continue;
+                }
+                log::info!(
+                    "URI 与请求资源不同，不能用歌曲信息兜底: current={} requested={} ({}/{})",
                     current_uri,
                     requested_uri,
                     retry + 1,
                     self.timing.status_retries
                 );
-            }
-            if current_song.is_empty() && current_uri.is_empty() {
-                log::info!(
-                    "播放状态缺少歌曲标识，继续等待 ({}/{})",
-                    retry + 1,
-                    self.timing.status_retries
-                );
-                sleep(Duration::from_millis(self.timing.status_poll_ms));
-                continue;
-            }
-            if request.skip_match_check
-                && !uri_matched
-                && !current_song.is_empty()
-                && current_song == attempt.initial_song
-                && !playback_progress_restarted(attempt.initial_progress, status.progress)
-            {
-                log::info!(
-                    "歌曲未变化，等待 URI 播放生效 ({}/{})",
-                    retry + 1,
-                    self.timing.status_retries
-                );
-                sleep(Duration::from_millis(self.timing.status_poll_ms));
-                continue;
-            }
-
-            if !request.skip_match_check && !uri_matched {
-                let local_match = song_matcher::match_song_query(
-                    &self.matching,
-                    &request.match_keyword,
-                    &status.name,
-                    &status.singer,
-                    request.prefer_accompaniment,
-                );
-                if !local_match.ok {
-                    log::info!("歌曲暂不匹配: {}", local_match.reason);
-                    if !current_song.is_empty() && current_song == attempt.initial_song {
-                        log::info!(
-                            "歌曲未变化，搜索可能尚未完成，继续等待 ({}/{})",
-                            retry + 1,
-                            self.timing.status_retries
-                        );
-                        sleep(Duration::from_millis(self.timing.status_poll_ms));
-                        continue;
-                    }
-                    if !current_song.is_empty() {
-                        attempt.initial_song = current_song;
-                    }
-                    return Ok(PlaybackVerification::MismatchedCandidate(
-                        PlaybackMismatch {
-                            status,
-                            local_reason: local_match.reason,
-                        },
-                    ));
-                }
+                return Ok(PlaybackVerification::MismatchedCandidate(
+                    PlaybackMismatch {
+                        status,
+                        local_reason: format!(
+                            "播放器 URI 与请求不一致: current={} requested={}",
+                            current_uri, requested_uri
+                        ),
+                    },
+                ));
             }
 
             let progress = format_time(status.progress);
@@ -496,6 +478,12 @@ impl<B: MusicPlayerBackend> PlayerController<B> {
         request: &PlaybackRequest,
         status: &PlayerStatus,
     ) -> Result<PlaybackVerification> {
+        if request.uri.trim().is_empty()
+            || status.current_uri.trim().is_empty()
+            || request.uri.trim() != status.current_uri.trim()
+        {
+            return Ok(PlaybackVerification::NoSource);
+        }
         if status.duration > 0.0 && status.duration < 20.0 {
             return Ok(PlaybackVerification::NoSource);
         }
@@ -835,17 +823,23 @@ impl<B: MusicPlayerBackend> PlayerController<B> {
         request: &PlaybackRequest,
         status: &PlayerStatus,
     ) -> Result<()> {
-        let confirmed_uri = if status.current_uri.trim().is_empty() {
-            request.uri.trim().to_string()
-        } else {
-            status.current_uri.trim().to_string()
-        };
+        let requested_uri = request.uri.trim();
+        let confirmed_uri = status.current_uri.trim();
+        if requested_uri.is_empty() {
+            return Err(anyhow!("播放请求缺少 URI，不能确认播放成功"));
+        }
+        if confirmed_uri.is_empty() {
+            return Err(anyhow!("播放器观测缺少 URI，不能确认播放成功"));
+        }
+        if confirmed_uri != requested_uri {
+            return Err(anyhow!("播放器观测 URI 与请求不一致，不能确认播放成功"));
+        }
         let active_request = ActivePlaybackRequest {
             keyword: request.keyword.clone(),
             source: request.source.clone(),
             prefer_accompaniment: request.prefer_accompaniment,
             requested_uri: request.uri.clone(),
-            confirmed_uri: confirmed_uri.clone(),
+            confirmed_uri: confirmed_uri.to_string(),
             song: format!("{}{}", status.name, status.singer),
             title: status.name.trim().to_string(),
             artist: status.singer.trim().to_string(),
@@ -856,7 +850,7 @@ impl<B: MusicPlayerBackend> PlayerController<B> {
             state.playback.pause_reason = PauseReason::None;
             state.playback.active_request = Some(active_request);
         })?;
-        self.record_song_dedup_playback(request, &confirmed_uri, status)?;
+        self.record_song_dedup_playback(request, confirmed_uri, status)?;
         log::info!("播放器状态转移: Starting -> RequestedSongPlaying reason=playback_confirmed");
         Ok(())
     }
@@ -1030,20 +1024,11 @@ fn external_playback_identity(status: &PlayerStatus) -> Option<String> {
         return None;
     }
     let uri = status.current_uri.trim();
-    if !uri.is_empty() {
-        return Some(format!("uri:{uri}"));
-    }
-    let title = status.name.trim();
-    let artist = status.singer.trim();
-    if title.is_empty() && artist.is_empty() {
-        None
-    } else {
-        Some(format!("song:{title}\u{1f}{artist}"))
-    }
+    (!uri.is_empty()).then(|| format!("uri:{uri}"))
 }
 
 fn status_matches_active_request(
-    matching: &MatchConfig,
+    _matching: &MatchConfig,
     active_request: Option<&ActivePlaybackRequest>,
     status: &PlayerStatus,
 ) -> bool {
@@ -1051,33 +1036,12 @@ fn status_matches_active_request(
         return false;
     };
     let current_uri = status.current_uri.trim();
-    let requested_uri = active_request.confirmed_uri.trim();
-    let fallback_uri = active_request.requested_uri.trim();
-    if !current_uri.is_empty()
-        && ((!requested_uri.is_empty() && current_uri == requested_uri)
-            || (!fallback_uri.is_empty() && current_uri == fallback_uri))
-    {
-        return true;
-    }
-    let current_song = format!("{}{}", status.name, status.singer);
-    if !current_song.is_empty()
-        && !active_request.song.is_empty()
-        && current_song == active_request.song
-    {
-        return true;
-    }
-    let keyword = active_request.keyword.trim();
-    if keyword.is_empty() {
-        return false;
-    }
-    song_matcher::match_song_query(
-        matching,
-        keyword,
-        &status.name,
-        &status.singer,
-        active_request.prefer_accompaniment,
-    )
-    .ok
+    let requested_uri = if active_request.confirmed_uri.trim().is_empty() {
+        active_request.requested_uri.trim()
+    } else {
+        active_request.confirmed_uri.trim()
+    };
+    !current_uri.is_empty() && !requested_uri.is_empty() && current_uri == requested_uri
 }
 
 fn active_request_guard_active(
@@ -1106,20 +1070,14 @@ fn active_request_track_changed(
     let Some(active_request) = active_request else {
         return false;
     };
-    let current_song = format!("{}{}", status.name, status.singer);
     let current_uri = status.current_uri.trim();
     let requested_uri = if active_request.confirmed_uri.trim().is_empty() {
         active_request.requested_uri.trim()
     } else {
         active_request.confirmed_uri.trim()
     };
-    let changed = if !current_uri.is_empty() && !requested_uri.is_empty() {
-        current_uri != requested_uri
-    } else {
-        !current_song.is_empty()
-            && !active_request.song.is_empty()
-            && current_song != active_request.song
-    };
+    let changed =
+        !current_uri.is_empty() && !requested_uri.is_empty() && current_uri != requested_uri;
     changed && !status_matches_active_request(matching, Some(active_request), status)
 }
 
@@ -1149,10 +1107,7 @@ fn classify_observation(status: &PlayerStatus) -> ObservationReliability {
     if status.status != "playing" && status.status != "paused" {
         return ObservationReliability::Stale;
     }
-    if status.current_uri.trim().is_empty()
-        && status.name.trim().is_empty()
-        && status.singer.trim().is_empty()
-    {
+    if status.current_uri.trim().is_empty() {
         return ObservationReliability::Incomplete;
     }
     ObservationReliability::Reliable
@@ -1385,6 +1340,53 @@ mod tests {
 
         assert!(matches!(result, PlaybackVerification::Success { .. }));
         assert_eq!(controller.snapshot().state, "requested_song_playing");
+    }
+
+    #[test]
+    fn verification_does_not_accept_matching_title_with_different_uri() {
+        let backend = FakeBackend::new(vec![
+            status("旧歌", "fuo://qqmusic/songs/old", 30.0, 180.0),
+            status("目标", "fuo://qqmusic/songs/other", 1.0, 180.0),
+        ]);
+        let controller = controller(backend);
+        let request = request();
+        let mut attempt = controller.play_request_uri(&request).unwrap();
+
+        let result = controller
+            .verify_playback_started(&request, &mut attempt)
+            .unwrap();
+
+        assert!(matches!(
+            result,
+            PlaybackVerification::MismatchedCandidate(PlaybackMismatch { .. })
+        ));
+        assert_eq!(controller.snapshot().state, "starting");
+    }
+
+    #[test]
+    fn verification_rejects_missing_uri_even_when_metadata_is_present() {
+        let backend = FakeBackend::new(vec![
+            status("旧歌", "fuo://qqmusic/songs/old", 30.0, 180.0),
+            status("目标", "", 1.0, 180.0),
+        ]);
+        let controller = controller(backend);
+        let request = request();
+        let mut attempt = controller.play_request_uri(&request).unwrap();
+
+        let result = controller
+            .verify_playback_started(&request, &mut attempt)
+            .unwrap();
+
+        assert!(matches!(result, PlaybackVerification::NoSource));
+        assert_eq!(controller.snapshot().state, "unknown");
+    }
+
+    #[test]
+    fn external_playback_without_uri_has_no_identity() {
+        assert_eq!(
+            external_playback_identity(&status("外部歌", "", 1.0, 180.0)),
+            None
+        );
     }
 
     #[test]

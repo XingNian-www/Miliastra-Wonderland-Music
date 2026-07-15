@@ -152,8 +152,8 @@ AI 点歌路径：
 2. `PlayerController::verify_playback_started()` 反复读取播放器状态。
 3. 播放状态必须是 `playing` 或 `paused`。
 4. 有 URI 时优先确认当前 URI 是否等于请求 URI。
-5. URI 不一致时，普通点歌会用本地歌曲匹配兜底。
-6. 匹配失败时，控制器返回 `MismatchedCandidate`；主流程再调用 AI 同曲判断或向用户询问 `@确认@跳过`，允许时还可以 `@换源`。
+5. URI 不一致或缺失时，普通点歌不会使用歌名和歌手兜底。
+6. URI 不一致时，控制器返回 `MismatchedCandidate`；主流程只能拒绝当前音源，或在允许时换源重试。
 7. 进度和时长不能是无效的 `0:00/0:00`。
 8. 时长过短会视为无音源。
 9. 成功后控制器写入 `RuntimeState.playback.activeRequest`，记录长时间同歌去重历史，并由主流程回复 `播放: 歌名 - 歌手 (进度/时长) 音量x`。

@@ -61,7 +61,7 @@ flowchart TD
 | 能力 | 函数 | 使用场景 |
 | --- | --- | --- |
 | 文本识别测试 | `recognize_with_query()` | Web 调试接口 `/ai/recognize`，用于测试提示词，不参与主聊天 OCR。 |
-| 同曲判断 | `match_same_song()` | 播放确认时，本地歌名匹配失败后，用 AI 判断用户点歌和当前播放器歌曲是否同一首。 |
+| 同曲判断 | `match_same_song()` | 仅保留为独立诊断接口；播放确认不再用 AI 或歌名歌手覆盖 URI 身份。 |
 | 候选选择 | `pick_song_candidate()` | AI 点歌时，从 FeelUOwn 搜索候选中选择一个 URI。 |
 
 候选选择有两个硬约束：
@@ -106,15 +106,15 @@ AI 点歌可以来自游戏聊天，也可以来自远程指挥台。
 
 同曲判断不是 AI 点歌的一部分，它发生在实际播放确认阶段。
 
-`PlayerController::verify_playback_started()` 会反复读取播放器状态。普通点歌如果 URI 不匹配，且本地 `song_matcher::match_song_query()` 判断当前播放不是目标歌曲，控制器会返回 `MismatchedCandidate`，再由主流程尝试调用 `ai.match_same_song()`。
+`PlayerController::verify_playback_started()` 会反复读取播放器状态。普通点歌只有在观测到的非空 URI 与请求 URI 逐字相等时才会确认成功；URI 缺失或不一致不会用本地匹配、AI 或歌名歌手兜底，控制器返回 `MismatchedCandidate` 后由主流程拒绝当前音源或换源重试。
 
-AI 返回 `match=true` 或 `decision=match` 时，程序会再走 `confirm_ai_auto_match()` 让用户确认这个自动判断。用户可以跳过或换源；如果没有否定，才把当前播放视为匹配成功。
+AI 返回 `match=true` 或 `decision=match` 时，只作为独立诊断结果展示，不会改变播放确认结果；当前播放仍必须通过 URI 逐字匹配。
 
 这个设计意味着：
 
-- AI 同曲判断是播放确认的兜底，不会替代候选歌曲审核。
+- AI 同曲接口只用于独立诊断，不参与播放确认，也不会替代候选歌曲审核。
 - AI 点歌返回的 URI 播放时通常会设置 `skip_match_check`，优先等待 URI 生效。
-- 普通点歌才更依赖本地匹配和 AI 同曲兜底。
+- 普通点歌的播放确认只依赖稳定 URI。
 - 同曲判断结果不会直接改播放器后端状态；最终仍由播放器控制器写入确认播放状态和活动播放请求。
 
 ## 候选歌曲审核 Provider

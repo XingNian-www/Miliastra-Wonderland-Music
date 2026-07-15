@@ -406,6 +406,7 @@ fn run_automation_with_watchdog(config_path: &Path) -> Result<()> {
 pub(crate) struct AutomationApp {
     config: AppConfig,
     http_server: Option<http_server::HttpServer>,
+    hotkeys: Option<hotkeys::HotkeyRuntime>,
     game_ui: GameUi,
     ui_runtime: Option<UiRuntime>,
     business: BusinessRuntimeHandle,
@@ -1132,6 +1133,7 @@ impl AutomationApp {
         Ok(Self {
             config,
             http_server: None,
+            hotkeys: None,
             game_ui,
             ui_runtime: Some(ui_runtime),
             business,
@@ -1189,7 +1191,7 @@ impl AutomationApp {
         // No fallible setup may follow start_hotkeys: later workers require the shared teardown.
         self.enqueue_startup_task_if_enabled()?;
         self.start_http_server()?;
-        self.start_hotkeys()?;
+        self.hotkeys = Some(self.start_hotkeys()?);
         self.turtle_soup.start_workers();
         let executor = self.start_command_executor();
         let deferred_chat_sender = self.start_deferred_chat_sender();
@@ -1197,6 +1199,11 @@ impl AutomationApp {
         let playback_monitor = self.start_playback_monitor();
         let result = self.run_scan_loop();
         self.running.store(false, AtomicOrdering::SeqCst);
+        if let Some(hotkeys) = self.hotkeys.take()
+            && let Err(error) = hotkeys.shutdown()
+        {
+            log::error!("全局热键线程关闭失败: {error:#}");
+        }
         if let Some(http_server) = self.http_server.take()
             && let Err(error) = http_server.shutdown()
         {
@@ -1488,6 +1495,7 @@ impl AutomationApp {
         Self {
             config: self.config.clone(),
             http_server: None,
+            hotkeys: None,
             game_ui: self.game_ui.clone(),
             ui_runtime: None,
             business: self.business.clone(),
@@ -1679,7 +1687,7 @@ impl AutomationApp {
         Ok(())
     }
 
-    fn start_hotkeys(&self) -> Result<()> {
+    fn start_hotkeys(&self) -> Result<hotkeys::HotkeyRuntime> {
         hotkeys::start(
             &self.config.hotkeys,
             Arc::clone(&self.running),

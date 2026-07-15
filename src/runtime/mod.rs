@@ -3,6 +3,7 @@ pub mod clock;
 pub(crate) mod deadline;
 pub(crate) mod deadline_bridge;
 pub mod identity;
+pub(crate) mod openai;
 pub mod player;
 pub mod player_io;
 pub mod timer;

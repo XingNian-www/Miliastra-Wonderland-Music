@@ -3,11 +3,11 @@
 本文专门梳理两套容易混淆的 AI 能力：
 
 - `src/app/ai.rs`：点歌 AI Provider，用于识别/匹配点歌意图、从搜索候选里选择 URI、辅助确认当前播放是否同一首。
-- `src/app/song_review.rs`：候选歌曲审核 Provider，用于在最终候选歌曲播放或入队前判断是否适合公开大厅播放；当前仅支持阿里云百炼 OpenAI 兼容接口。
+- `src/app/song_review.rs`：候选歌曲审核 Provider，用于在最终候选歌曲播放或入队前判断是否适合公开大厅播放；使用 OpenAI Responses API 的标准联网搜索能力。
 
 ## 核心结论
 
-点歌 AI 和候选歌曲审核是两条独立链路。点歌 AI 解决“用户想点哪首歌”，候选歌曲审核解决“这首最终候选是否适合舒缓、轻松、不吵闹的房间氛围”。两者使用不同配置；审核 Provider 当前固定面向阿里云百炼，因为请求体依赖百炼的 `enable_search` 和 `search_options.forced_search` 联网搜索参数。
+点歌 AI 和候选歌曲审核是两条独立链路。点歌 AI 解决“用户想点哪首歌”，候选歌曲审核解决“这首最终候选是否适合舒缓、轻松、不吵闹的房间氛围”。两者使用不同配置；点歌走标准 Chat Completions，审核走标准 Responses，并通过 `web_search` 工具联网。
 
 候选歌曲审核只审核最终候选歌曲和 URI，不审核原始点歌文本。普通点歌、AI 点歌、换源后的点歌，都会先收敛成 `ResolvedSongRequest`，然后才进入 `review_song_candidate()`。
 
@@ -52,7 +52,7 @@ flowchart TD
 | `deepseek` | `https://api.deepseek.com/chat/completions` | `deepseek-chat` | `Authorization: Bearer ...` |
 | `custom` | 必须配置 | 必须配置 | `Authorization: Bearer ...` |
 
-所有点歌 AI 请求都走 OpenAI-compatible Chat Completions 格式，要求模型返回 JSON object。请求超时使用 `timing.external.ai_request_timeout_ms`。
+所有点歌 AI 请求都走 OpenAI Chat Completions 标准格式，要求模型返回 JSON object，并固定发送 `stream: false`。请求超时使用 `timing.external.ai_request_timeout_ms`。`ai.extra_body` 只用于显式补充当前 Provider 的第三方兼容字段；默认是空对象，若与官方字段重名，代码生成的官方值优先。Web 调试接口通过 query 把 `provider` 改成与配置不同的 Provider 时会清空原 Provider 的 `extra_body`，避免把供应商私有字段带到另一家接口。
 
 ### 三种能力
 
@@ -132,7 +132,7 @@ AI 返回 `match=true` 或 `decision=match` 时，程序会再走 `confirm_ai_au
 | `message_type` | 命令来源，例如大厅、私聊、控制台。 |
 | `username` | 触发点歌的用户名；好友私聊优先使用好友名。 |
 
-审核请求会强制携带 `enable_search: true`、`search_options.forced_search: true` 和 `enable_thinking: false`。这些参数按阿里云百炼协议发送，不保证其他 OpenAI-compatible Provider 可用。审核模型应使用联网搜索得到的曲风标签、歌词摘要、歌曲介绍、版本说明和公开听感描述判断；联网信息不足时，再按候选歌曲名称、歌手、URI 和用户描述保守判断。
+审核请求使用 OpenAI Responses API 的 `web_search` 工具，并固定发送官方 `tool_choice: "required"`，要求模型至少调用一次联网搜索；请求固定为 `stream: false`，并通过严格 JSON Schema 要求返回 `level`、`reason` 和 `tags`。Provider endpoint 必须是完整的 `/responses` 地址；默认不发送 `enable_search`、`forced_search`、`enable_thinking` 等供应商私有字段。确有兼容需要时只能通过 `song_review.provider.extra_body` 显式补充；与 `tool_choice`、`stream` 等官方字段重名时官方值优先。审核模型应使用联网搜索得到的曲风标签、歌词摘要、歌曲介绍、版本说明和公开听感描述判断；联网信息不足时，再按候选歌曲名称、歌手、URI 和用户描述保守判断。
 
 审核口径来自配置：
 
@@ -159,7 +159,7 @@ AI 返回 `match=true` 或 `decision=match` 时，程序会再走 `confirm_ai_au
 
 - HTTP 请求失败或超时。
 - Provider 返回非成功状态码。
-- 响应缺少 `choices[0].message.content`。
+- Responses 响应未完成、包含拒绝，或缺少 `output_text`。
 - 模型内容不是合法 JSON object。
 - JSON 缺少 1 到 10 的有效 `level`。
 

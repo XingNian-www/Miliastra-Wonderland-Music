@@ -579,6 +579,8 @@ pub struct AiConfig {
     pub api_key: String,
     pub endpoint: String,
     pub model: String,
+    #[serde(default)]
+    pub extra_body: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -635,6 +637,7 @@ pub struct SongReviewProviderConfig {
     pub endpoint: String,
     pub api_key: String,
     pub model: String,
+    pub extra_body: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

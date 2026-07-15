@@ -453,6 +453,7 @@ pub struct HttpSharedState {
     web_tools: WebToolShared,
     latest_frame: Arc<Mutex<Option<Arc<image::DynamicImage>>>>,
     player_search: PlayerSearchClient,
+    ai: ai::AiClient,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -502,6 +503,7 @@ impl HttpSharedState {
         web_tools: WebToolShared,
         latest_frame: Arc<Mutex<Option<Arc<image::DynamicImage>>>>,
         player_search: PlayerSearchClient,
+        ai: ai::AiClient,
     ) -> Self {
         let turtle_soup_bank =
             TurtleSoupBankStore::new(config.turtle_soup.question_bank_path.clone());
@@ -524,6 +526,7 @@ impl HttpSharedState {
             web_tools,
             latest_frame,
             player_search,
+            ai,
         }
     }
 }
@@ -1313,21 +1316,21 @@ fn ai_recognize_route(
     query: &[(String, String)],
     state: &HttpSharedState,
 ) -> std::result::Result<String, AppError> {
-    ai::recognize_with_query(&state.config.ai, &state.config.timing, query).map_err(ai_route_error)
+    state.ai.recognize_with_query(query).map_err(ai_route_error)
 }
 
 fn ai_match_route(
     query: &[(String, String)],
     state: &HttpSharedState,
 ) -> std::result::Result<String, AppError> {
-    ai::match_with_query(&state.config.ai, &state.config.timing, query).map_err(ai_route_error)
+    state.ai.match_with_query(query).map_err(ai_route_error)
 }
 
 fn ai_pick_route(
     query: &[(String, String)],
     state: &HttpSharedState,
 ) -> std::result::Result<String, AppError> {
-    ai::pick_with_query(&state.config.ai, &state.config.timing, query).map_err(ai_route_error)
+    state.ai.pick_with_query(query).map_err(ai_route_error)
 }
 
 fn ai_search_route(
@@ -2967,6 +2970,7 @@ mod tests {
     struct HttpTestState {
         state: HttpSharedState,
         _player_runtime: PlayerRuntime,
+        _openai_runtime: crate::runtime::openai::OpenAiRuntime,
     }
 
     impl Deref for HttpTestState {
@@ -4119,10 +4123,14 @@ workflows:
             Condvar::new(),
         ));
         let monitor = MonitorShared::new(20);
+        let openai_runtime =
+            crate::runtime::openai::OpenAiRuntime::start().expect("test OpenAI runtime");
+        let openai = openai_runtime.handle();
         let turtle_soup = TurtleSoupService::new(
             config.turtle_soup.clone(),
             EntertainmentCoordinator::new(),
             DeferredChatQueue::new(32),
+            openai.clone(),
         );
         let undercover =
             UndercoverService::new(config.undercover.clone(), EntertainmentCoordinator::new());
@@ -4136,6 +4144,7 @@ workflows:
         .expect("player runtime");
         let player_search =
             PlayerSearchClient::new(player_runtime.handle(), BusinessOperationIdAllocator::new());
+        let ai = ai::AiClient::new(&config.ai, &config.timing, openai);
         HttpTestState {
             state: HttpSharedState::new(
                 config,
@@ -4151,8 +4160,10 @@ workflows:
                 WebToolShared::new(),
                 Arc::new(Mutex::new(None)),
                 player_search,
+                ai,
             ),
             _player_runtime: player_runtime,
+            _openai_runtime: openai_runtime,
         }
     }
 }

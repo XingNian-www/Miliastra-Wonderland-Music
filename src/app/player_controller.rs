@@ -515,7 +515,7 @@ impl<B: MusicPlayerBackend> PlayerController<B> {
                 continue;
             }
 
-            let current_uri = status.current_uri.trim();
+            let current_uri = status.current_uri.trim().to_string();
             let requested_uri = attempt.requested_uri.trim();
             if requested_uri.is_empty() {
                 log::info!(

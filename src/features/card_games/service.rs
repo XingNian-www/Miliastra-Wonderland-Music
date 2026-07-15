@@ -4,7 +4,8 @@ use std::time::Instant;
 use anyhow::{Result, anyhow, bail};
 
 use super::{
-    LandlordCommand, LandlordConfig, LandlordGame, LandlordOutcome, LandlordPrivateDelivery,
+    CardGameDeadlineKind, LandlordCommand, LandlordConfig, LandlordGame, LandlordOutcome,
+    LandlordPrivateDelivery,
 };
 use crate::features::entertainment::{AcquireOutcome, EntertainmentCoordinator, EntertainmentKind};
 use crate::runtime::identity::{BusinessOperationId, SessionGeneration};
@@ -855,6 +856,36 @@ impl CardGameService {
         }
         pending.claimed = true;
         Ok(CardGameEffectClaim::Claimed)
+    }
+
+    pub(crate) fn session_generation(&self) -> SessionGeneration {
+        self.state.session_generation
+    }
+
+    pub(crate) fn sync_clock(&mut self, now: Instant, clock_active: bool) {
+        self.state.game.sync_clock(now, clock_active);
+    }
+
+    pub(crate) fn next_deadline(
+        &self,
+        now: Instant,
+        clock_active: bool,
+    ) -> Option<(CardGameDeadlineKind, Instant)> {
+        self.state.game.next_deadline(now, clock_active)
+    }
+
+    pub(crate) fn handle_deadline(
+        &mut self,
+        kind: CardGameDeadlineKind,
+        now: Instant,
+    ) -> Result<Option<CardGameTimedOutcome>> {
+        let Some((expected, deadline)) = self.state.game.next_deadline(now, true) else {
+            return Ok(None);
+        };
+        if expected != kind || deadline > now {
+            return Ok(None);
+        }
+        self.tick(now, true)
     }
 
     #[cfg(test)]

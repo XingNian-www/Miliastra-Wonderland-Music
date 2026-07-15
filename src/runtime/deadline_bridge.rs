@@ -8,9 +8,9 @@ use super::business::{
     BusinessRuntimeHandle, BusinessRuntimeSnapshot,
 };
 use super::deadline::{BusinessDeadlineEvent, BusinessDeadlineToken};
-#[cfg(test)]
-use super::timer::TimerRuntimeHandle;
-use super::timer::{TimerRuntime, TimerRuntimeEvent, TimerRuntimeStartError, TimerShutdownError};
+use super::timer::{
+    TimerRuntime, TimerRuntimeEvent, TimerRuntimeHandle, TimerRuntimeStartError, TimerShutdownError,
+};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct BusinessDeadlineBridgeSnapshot {
@@ -440,7 +440,8 @@ mod tests {
 
     use super::*;
     use crate::features::card_games::{
-        CardGameDeadlineKind, CardGameDeadlineToken, CardGameService, LandlordConfig,
+        CardGameCommandStart, CardGameDeadlineKind, CardGameDeadlineToken, CardGameEffectClaim,
+        CardGameEffectResult, CardGameResume, CardGameService, LandlordCommand, LandlordConfig,
     };
     use crate::features::entertainment::EntertainmentCoordinator;
     use crate::features::idiom_chain::{
@@ -480,6 +481,92 @@ mod tests {
             SessionGeneration::INITIAL,
             Instant::now(),
         )
+    }
+
+    #[test]
+    fn real_timer_runtime_drives_card_game_timeout_into_a_business_effect() {
+        let entertainment = EntertainmentCoordinator::new();
+        let service = CardGameService::new(
+            LandlordConfig {
+                lobby_timeout_seconds: 1,
+                ..LandlordConfig::default()
+            },
+            entertainment.clone(),
+        );
+        let business_runtime = BusinessRuntime::start(
+            8,
+            IdiomChainService::from_entries_for_test(
+                &["画蛇添足", "足智多谋"],
+                entertainment.clone(),
+                None,
+            ),
+            service,
+        )
+        .unwrap();
+        let timer_owner = BusinessRuntimeGroupBuilder::start(8).unwrap();
+        let runtime_group = timer_owner.attach(business_runtime).unwrap();
+        let business = runtime_group.business_handle();
+        let started_at = Instant::now();
+        let verification = match business
+            .begin_card_game("甲", &LandlordCommand::Start, started_at)
+            .unwrap()
+        {
+            CardGameCommandStart::Suspended(request) => request,
+            CardGameCommandStart::Completed(_) => panic!("start should require verification"),
+        };
+        assert_eq!(
+            business.claim_card_game_effect(verification.key).unwrap(),
+            CardGameEffectClaim::Claimed
+        );
+        let hall = match business
+            .resume_card_game(
+                verification.key,
+                CardGameEffectResult::FriendVerify(Ok(true)),
+            )
+            .unwrap()
+        {
+            CardGameResume::Suspended(request) => request,
+            other => panic!("verified start should announce lobby: {other:?}"),
+        };
+        assert_eq!(
+            business.claim_card_game_effect(hall.key).unwrap(),
+            CardGameEffectClaim::Claimed
+        );
+        assert!(matches!(
+            business
+                .resume_card_game(hall.key, CardGameEffectResult::HallDelivery(Ok(())),)
+                .unwrap(),
+            CardGameResume::Completed(_)
+        ));
+
+        let wait_until = Instant::now() + Duration::from_secs(3);
+        let timed = loop {
+            if let Some(outcome) = business
+                .poll_card_game_timed_outcome(Instant::now(), true)
+                .unwrap()
+            {
+                break outcome;
+            }
+            assert!(
+                Instant::now() < wait_until,
+                "real card-game deadline did not expire"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(timed.action(), "lobby-timeout");
+        let request = timed.into_request();
+        assert_eq!(
+            business.claim_card_game_effect(request.key).unwrap(),
+            CardGameEffectClaim::Claimed
+        );
+        assert!(matches!(
+            business
+                .resume_card_game(request.key, CardGameEffectResult::HallDelivery(Ok(())))
+                .unwrap(),
+            CardGameResume::Completed(_)
+        ));
+        assert_eq!(entertainment.active(), None);
+        runtime_group.shutdown().unwrap();
     }
 
     #[test]

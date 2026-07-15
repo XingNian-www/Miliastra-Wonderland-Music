@@ -6,8 +6,9 @@ use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 use crate::features::card_games::{
-    CardGameCancel, CardGameCommandStart, CardGameEffectClaim, CardGameEffectKey,
-    CardGameEffectResult, CardGameResume, CardGameService, CardGameTimedOutcome, LandlordCommand,
+    CardGameCancel, CardGameCommandStart, CardGameDeadlineKind, CardGameDeadlineToken,
+    CardGameEffectClaim, CardGameEffectKey, CardGameEffectResult, CardGameResume, CardGameService,
+    CardGameTimedOutcome, LandlordCommand,
 };
 use crate::features::idiom_chain::{
     IdiomChainCommand, IdiomChainDeadlineKind, IdiomChainDeadlineToken, IdiomChainOutcome,
@@ -22,10 +23,11 @@ use crate::runtime::identity::{
     BusinessOperationId, BusinessOperationIdAllocator, SessionGeneration,
 };
 use crate::runtime::timer::{
-    DeadlineCancellation, DeadlineSchedule, TimerRuntimeEvent, TimerRuntimeHandle,
+    DeadlineCancellation, DeadlineSchedule, TimerCommandKind, TimerRuntimeEvent, TimerRuntimeHandle,
 };
 
 const IDIOM_DEADLINE_TOKEN_ID: u64 = 1;
+const CARD_GAME_DEADLINE_TOKEN_ID: u64 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BusinessEvent {
@@ -222,6 +224,14 @@ struct ActiveIdiomDeadline {
     deadline: Instant,
 }
 
+#[derive(Clone, Debug)]
+struct ActiveCardGameDeadline {
+    token: BusinessDeadlineToken,
+    operation_id: BusinessOperationId,
+    session_generation: SessionGeneration,
+    deadline: Instant,
+}
+
 enum CardGameRuntimeMessage {
     Begin {
         player: String,
@@ -360,7 +370,7 @@ impl BusinessRuntimeHandle {
         })
     }
 
-    pub fn tick_card_game(
+    pub fn poll_card_game_timed_outcome(
         &self,
         now: Instant,
         clock_active: bool,
@@ -387,6 +397,17 @@ impl BusinessRuntimeHandle {
         receiver
             .recv()
             .map_err(|_| BusinessRuntimeError::RuntimeStopped)?
+    }
+
+    #[deprecated(
+        note = "use poll_card_game_timed_outcome; retained for internal API compatibility"
+    )]
+    pub fn tick_card_game(
+        &self,
+        now: Instant,
+        clock_active: bool,
+    ) -> Result<Option<CardGameTimedOutcome>, BusinessRuntimeError> {
+        self.poll_card_game_timed_outcome(now, clock_active)
     }
 
     fn send_request(&self, message: RuntimeMessage) -> Result<(), BusinessRuntimeError> {
@@ -450,6 +471,7 @@ pub struct BusinessRuntime {
 }
 
 impl BusinessRuntime {
+    #[cfg(test)]
     pub(crate) fn start(
         queue_capacity: usize,
         idiom_chain: IdiomChainService,
@@ -652,14 +674,224 @@ fn sync_idiom_deadline(
     }
 }
 
+fn card_game_deadline_token(kind: CardGameDeadlineKind) -> BusinessDeadlineToken {
+    BusinessDeadlineToken::from(CardGameDeadlineToken::new(
+        CARD_GAME_DEADLINE_TOKEN_ID,
+        kind,
+    ))
+}
+
+fn sync_card_game_deadline(
+    card_games: &CardGameService,
+    timer: Option<&TimerRuntimeHandle<BusinessDeadlineToken>>,
+    active: &mut Option<ActiveCardGameDeadline>,
+    pending_cancellations: &mut Vec<ActiveCardGameDeadline>,
+    operation_ids: &BusinessOperationIdAllocator,
+    now: Instant,
+    clock_active: bool,
+) -> Result<(), BusinessRuntimeError> {
+    let Some(timer) = timer else {
+        *active = None;
+        pending_cancellations.clear();
+        return Ok(());
+    };
+    let desired = card_games.next_deadline(now, clock_active);
+    let Some((kind, deadline)) = desired else {
+        if let Some(previous) = active.take() {
+            let cancellation = DeadlineCancellation::new(
+                previous.token.clone(),
+                previous.operation_id,
+                previous.session_generation,
+            );
+            if let Err(error) = timer.cancel(cancellation) {
+                *active = Some(previous);
+                return Err(BusinessRuntimeError::TimerOperationFailed(
+                    error.to_string(),
+                ));
+            }
+            pending_cancellations.push(previous);
+        }
+        return Ok(());
+    };
+
+    let token = card_game_deadline_token(kind);
+    let session_generation = card_games.session_generation();
+    if let Some(previous) = active.as_ref() {
+        if previous.token == token
+            && previous.session_generation == session_generation
+            && previous.deadline == deadline
+        {
+            return Ok(());
+        }
+        if previous.token == token {
+            let previous_token = previous.token.clone();
+            let operation_id = operation_ids
+                .allocate()
+                .map_err(|error| BusinessRuntimeError::TimerOperationFailed(error.to_string()))?;
+            timer
+                .reschedule(DeadlineSchedule::new(
+                    previous_token,
+                    operation_id,
+                    session_generation,
+                    deadline,
+                ))
+                .map_err(|error| BusinessRuntimeError::TimerOperationFailed(error.to_string()))?;
+            let previous = active
+                .as_mut()
+                .expect("active card deadline remains while rescheduling");
+            previous.operation_id = operation_id;
+            previous.session_generation = session_generation;
+            previous.deadline = deadline;
+            return Ok(());
+        }
+        let previous = active
+            .take()
+            .expect("active card deadline exists while replacing its token");
+        let cancellation = DeadlineCancellation::new(
+            previous.token.clone(),
+            previous.operation_id,
+            previous.session_generation,
+        );
+        if let Err(error) = timer.cancel(cancellation) {
+            *active = Some(previous);
+            return Err(BusinessRuntimeError::TimerOperationFailed(
+                error.to_string(),
+            ));
+        }
+        pending_cancellations.push(previous);
+    }
+    schedule_card_game_deadline(
+        timer,
+        active,
+        operation_ids,
+        token,
+        session_generation,
+        deadline,
+    )
+}
+
+fn schedule_card_game_deadline(
+    timer: &TimerRuntimeHandle<BusinessDeadlineToken>,
+    active: &mut Option<ActiveCardGameDeadline>,
+    operation_ids: &BusinessOperationIdAllocator,
+    token: BusinessDeadlineToken,
+    session_generation: SessionGeneration,
+    deadline: Instant,
+) -> Result<(), BusinessRuntimeError> {
+    let operation_id = operation_ids
+        .allocate()
+        .map_err(|error| BusinessRuntimeError::TimerOperationFailed(error.to_string()))?;
+    timer
+        .schedule(DeadlineSchedule::new(
+            token.clone(),
+            operation_id,
+            session_generation,
+            deadline,
+        ))
+        .map_err(|error| BusinessRuntimeError::TimerOperationFailed(error.to_string()))?;
+    *active = Some(ActiveCardGameDeadline {
+        token,
+        operation_id,
+        session_generation,
+        deadline,
+    });
+    Ok(())
+}
+
 fn handle_business_timer(
     event: BusinessDeadlineEvent,
     idiom_chain: &mut IdiomChainService,
+    card_games: &mut CardGameService,
     timer: Option<&TimerRuntimeHandle<BusinessDeadlineToken>>,
     active_idiom_deadline: &mut Option<ActiveIdiomDeadline>,
+    active_card_game_deadline: &mut Option<ActiveCardGameDeadline>,
+    pending_card_game_cancellations: &mut Vec<ActiveCardGameDeadline>,
+    pending_card_game_outcomes: &mut std::collections::VecDeque<CardGameTimedOutcome>,
     operation_ids: &BusinessOperationIdAllocator,
     generation: &mut SessionGeneration,
+    clock_active: bool,
 ) -> Result<(), BusinessRuntimeError> {
+    if let BusinessDeadlineEvent::CardGame(timer_event) = &event {
+        match timer_event {
+            TimerRuntimeEvent::DeadlineExpired(expired) => {
+                let Some(previous) = active_card_game_deadline.take() else {
+                    return Ok(());
+                };
+                let token = BusinessDeadlineToken::from(expired.token().clone());
+                if previous.token != token
+                    || previous.operation_id != expired.operation_id()
+                    || previous.session_generation != expired.session_generation()
+                {
+                    *active_card_game_deadline = Some(previous);
+                    return Ok(());
+                }
+                let handled_at = Instant::now();
+                if let Some(outcome) = card_games
+                    .handle_deadline(*expired.token().kind(), handled_at)
+                    .map_err(card_game_operation_failed)?
+                {
+                    pending_card_game_outcomes.push_back(outcome);
+                }
+                return sync_card_game_deadline(
+                    card_games,
+                    timer,
+                    active_card_game_deadline,
+                    pending_card_game_cancellations,
+                    operation_ids,
+                    handled_at,
+                    clock_active,
+                );
+            }
+            TimerRuntimeEvent::CommandCompleted(completed) => {
+                let token = BusinessDeadlineToken::from(completed.token().clone());
+                if completed.command() == TimerCommandKind::Cancel {
+                    let Some(index) = pending_card_game_cancellations.iter().position(|pending| {
+                        pending.token == token
+                            && pending.operation_id == completed.operation_id()
+                            && pending.session_generation == completed.session_generation()
+                    }) else {
+                        return Ok(());
+                    };
+                    pending_card_game_cancellations.remove(index);
+                    if completed.result().is_err() {
+                        return sync_card_game_deadline(
+                            card_games,
+                            timer,
+                            active_card_game_deadline,
+                            pending_card_game_cancellations,
+                            operation_ids,
+                            Instant::now(),
+                            clock_active,
+                        );
+                    }
+                    return Ok(());
+                }
+
+                let Some(active) = active_card_game_deadline.as_ref() else {
+                    return Ok(());
+                };
+                if active.token != token
+                    || active.operation_id != completed.operation_id()
+                    || active.session_generation != completed.session_generation()
+                {
+                    return Ok(());
+                }
+                if completed.result().is_err() {
+                    *active_card_game_deadline = None;
+                    return sync_card_game_deadline(
+                        card_games,
+                        timer,
+                        active_card_game_deadline,
+                        pending_card_game_cancellations,
+                        operation_ids,
+                        Instant::now(),
+                        clock_active,
+                    );
+                }
+                return Ok(());
+            }
+        }
+    }
     let BusinessDeadlineEvent::IdiomChain(TimerRuntimeEvent::DeadlineExpired(expired)) = event
     else {
         return Ok(());
@@ -676,7 +908,10 @@ fn handle_business_timer(
     }
 
     *active_idiom_deadline = None;
-    if idiom_chain.expire_idle_at(expired.emitted_at())? {
+    if idiom_chain
+        .expire_idle_at(expired.emitted_at())
+        .map_err(idiom_chain_operation_failed)?
+    {
         log::info!("成语接龙已因计时运行时期限到期结束，娱乐互斥已释放");
     }
     sync_idiom_deadline(
@@ -696,6 +931,10 @@ fn run_business_runtime(
 ) {
     let mut snapshot = BusinessRuntimeSnapshot::default();
     let mut active_idiom_deadline = None;
+    let mut active_card_game_deadline = None;
+    let mut pending_card_game_cancellations = Vec::new();
+    let mut pending_card_game_outcomes = std::collections::VecDeque::new();
+    let mut card_game_clock_active = true;
     let operation_ids = BusinessOperationIdAllocator::new();
     let mut session_generation = SessionGeneration::INITIAL;
     while let Ok(message) = receiver.recv() {
@@ -706,10 +945,15 @@ fn run_business_runtime(
                     if let Err(error) = handle_business_timer(
                         timer_event.clone(),
                         &mut idiom_chain,
+                        &mut card_games,
                         timer.as_ref(),
                         &mut active_idiom_deadline,
+                        &mut active_card_game_deadline,
+                        &mut pending_card_game_cancellations,
+                        &mut pending_card_game_outcomes,
                         &operation_ids,
                         &mut session_generation,
+                        card_game_clock_active,
                     ) {
                         log::error!("业务运行时处理计时事件失败: {error}");
                     }
@@ -789,7 +1033,20 @@ fn run_business_runtime(
                     });
                 let _ = response.send(result);
             }
-            RuntimeMessage::CardGame(message) => handle_card_game_message(&mut card_games, message),
+            RuntimeMessage::CardGame(message) => {
+                if let Err(error) = handle_card_game_message(
+                    &mut card_games,
+                    message,
+                    timer.as_ref(),
+                    &mut active_card_game_deadline,
+                    &mut pending_card_game_cancellations,
+                    &operation_ids,
+                    &mut pending_card_game_outcomes,
+                    &mut card_game_clock_active,
+                ) {
+                    log::error!("业务运行时处理牌局消息失败: {error}");
+                }
+            }
             RuntimeMessage::Snapshot(response) => {
                 let _ = response.send(snapshot);
             }
@@ -799,8 +1056,12 @@ fn run_business_runtime(
                     &mut card_games,
                     timer.as_ref(),
                     &mut active_idiom_deadline,
+                    &mut active_card_game_deadline,
+                    &mut pending_card_game_cancellations,
                     &operation_ids,
                     &mut session_generation,
+                    &mut pending_card_game_outcomes,
+                    card_game_clock_active,
                 );
                 snapshot.quiescing = true;
                 let _ = response.send(snapshot);
@@ -811,8 +1072,12 @@ fn run_business_runtime(
                     &mut card_games,
                     timer.as_ref(),
                     &mut active_idiom_deadline,
+                    &mut active_card_game_deadline,
+                    &mut pending_card_game_cancellations,
                     &operation_ids,
                     &mut session_generation,
+                    &mut pending_card_game_outcomes,
+                    card_game_clock_active,
                 );
                 let _ = response.send(snapshot);
                 break;
@@ -826,8 +1091,12 @@ fn abort_business_modules(
     card_games: &mut CardGameService,
     timer: Option<&TimerRuntimeHandle<BusinessDeadlineToken>>,
     active_idiom_deadline: &mut Option<ActiveIdiomDeadline>,
+    active_card_game_deadline: &mut Option<ActiveCardGameDeadline>,
+    pending_card_game_cancellations: &mut Vec<ActiveCardGameDeadline>,
     operation_ids: &BusinessOperationIdAllocator,
     session_generation: &mut SessionGeneration,
+    pending_card_game_outcomes: &mut std::collections::VecDeque<CardGameTimedOutcome>,
+    clock_active: bool,
 ) {
     if let Err(error) = card_games.abort() {
         log::error!("业务运行时关闭时无法中止牌局: {error:#}");
@@ -844,9 +1113,31 @@ fn abort_business_modules(
     ) {
         log::error!("业务运行时关闭时无法撤销成语接龙期限: {error}");
     }
+    if let Err(error) = sync_card_game_deadline(
+        card_games,
+        timer,
+        active_card_game_deadline,
+        pending_card_game_cancellations,
+        operation_ids,
+        Instant::now(),
+        clock_active,
+    ) {
+        log::error!("业务运行时关闭时无法撤销牌局期限: {error}");
+    }
+    pending_card_game_outcomes.clear();
+    pending_card_game_cancellations.clear();
 }
 
-fn handle_card_game_message(card_games: &mut CardGameService, message: CardGameRuntimeMessage) {
+fn handle_card_game_message(
+    card_games: &mut CardGameService,
+    message: CardGameRuntimeMessage,
+    timer: Option<&TimerRuntimeHandle<BusinessDeadlineToken>>,
+    active_deadline: &mut Option<ActiveCardGameDeadline>,
+    pending_cancellations: &mut Vec<ActiveCardGameDeadline>,
+    operation_ids: &BusinessOperationIdAllocator,
+    pending_outcomes: &mut std::collections::VecDeque<CardGameTimedOutcome>,
+    clock_active: &mut bool,
+) -> Result<(), BusinessRuntimeError> {
     match message {
         CardGameRuntimeMessage::Begin {
             player,
@@ -854,44 +1145,138 @@ fn handle_card_game_message(card_games: &mut CardGameService, message: CardGameR
             now,
             response,
         } => {
-            let _ = response.send(
-                card_games
-                    .begin_command(&player, &command, now)
-                    .map_err(card_game_operation_failed),
-            );
+            let result = card_games
+                .begin_command(&player, &command, now)
+                .map_err(card_game_operation_failed)
+                .and_then(|result| {
+                    sync_card_game_deadline(
+                        card_games,
+                        timer,
+                        active_deadline,
+                        pending_cancellations,
+                        operation_ids,
+                        now,
+                        *clock_active,
+                    )?;
+                    Ok(result)
+                });
+            let _ = response.send(result);
         }
         CardGameRuntimeMessage::Claim { key, response } => {
-            let _ = response.send(card_games.claim(key).map_err(card_game_operation_failed));
+            let result = card_games
+                .claim(key)
+                .map_err(card_game_operation_failed)
+                .and_then(|result| {
+                    sync_card_game_deadline(
+                        card_games,
+                        timer,
+                        active_deadline,
+                        pending_cancellations,
+                        operation_ids,
+                        Instant::now(),
+                        *clock_active,
+                    )?;
+                    Ok(result)
+                });
+            let _ = response.send(result);
         }
         CardGameRuntimeMessage::Resume {
             key,
             result,
             response,
         } => {
-            let _ = response.send(
-                card_games
-                    .resume(key, result)
-                    .map_err(card_game_operation_failed),
-            );
+            let response_result = card_games
+                .resume(key, result)
+                .map_err(card_game_operation_failed)
+                .and_then(|result| {
+                    sync_card_game_deadline(
+                        card_games,
+                        timer,
+                        active_deadline,
+                        pending_cancellations,
+                        operation_ids,
+                        Instant::now(),
+                        *clock_active,
+                    )?;
+                    Ok(result)
+                });
+            let _ = response.send(response_result);
         }
         CardGameRuntimeMessage::Cancel { key, response } => {
-            let _ = response.send(card_games.cancel(key).map_err(card_game_operation_failed));
+            let result = card_games
+                .cancel(key)
+                .map_err(card_game_operation_failed)
+                .and_then(|result| {
+                    sync_card_game_deadline(
+                        card_games,
+                        timer,
+                        active_deadline,
+                        pending_cancellations,
+                        operation_ids,
+                        Instant::now(),
+                        *clock_active,
+                    )?;
+                    Ok(result)
+                });
+            let _ = response.send(result);
         }
         CardGameRuntimeMessage::Tick {
             now,
-            clock_active,
+            clock_active: requested_clock_active,
             response,
         } => {
-            let _ = response.send(
-                card_games
-                    .tick(now, clock_active)
-                    .map_err(card_game_operation_failed),
-            );
+            *clock_active = requested_clock_active;
+            let result = match timer {
+                Some(timer) => {
+                    card_games.sync_clock(now, requested_clock_active);
+                    sync_card_game_deadline(
+                        card_games,
+                        Some(timer),
+                        active_deadline,
+                        pending_cancellations,
+                        operation_ids,
+                        now,
+                        requested_clock_active,
+                    )
+                    .map(|()| pending_outcomes.pop_front())
+                }
+                None => {
+                    #[cfg(test)]
+                    {
+                        card_games
+                            .tick(now, requested_clock_active)
+                            .map_err(card_game_operation_failed)
+                    }
+                    #[cfg(not(test))]
+                    {
+                        Err(BusinessRuntimeError::TimerOperationFailed(
+                            "牌局运行时缺少业务计时器".to_string(),
+                        ))
+                    }
+                }
+            };
+            let _ = response.send(result);
         }
         CardGameRuntimeMessage::Abort(response) => {
-            let _ = response.send(card_games.abort().map_err(card_game_operation_failed));
+            let result = card_games
+                .abort()
+                .map_err(card_game_operation_failed)
+                .and_then(|result| {
+                    sync_card_game_deadline(
+                        card_games,
+                        timer,
+                        active_deadline,
+                        pending_cancellations,
+                        operation_ids,
+                        Instant::now(),
+                        *clock_active,
+                    )?;
+                    Ok(result)
+                });
+            let _ = response.send(result);
         }
     }
+    Ok(())
 }
 
 fn idiom_chain_operation_failed(error: anyhow::Error) -> BusinessRuntimeError {
@@ -1482,14 +1867,24 @@ mod tests {
         });
         let operation_ids = BusinessOperationIdAllocator::new();
         let mut next_generation = session_generation;
+        let mut card_games =
+            CardGameService::new(LandlordConfig::default(), EntertainmentCoordinator::new());
+        let mut card_active = None;
+        let mut pending_card_cancellations = Vec::new();
+        let mut pending_card_outcomes = std::collections::VecDeque::new();
 
         handle_business_timer(
             event,
             &mut idiom_chain,
+            &mut card_games,
             None,
             &mut active,
+            &mut card_active,
+            &mut pending_card_cancellations,
+            &mut pending_card_outcomes,
             &operation_ids,
             &mut next_generation,
+            true,
         )
         .unwrap();
 

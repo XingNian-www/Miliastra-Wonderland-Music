@@ -10,6 +10,37 @@ pub enum InviteDecision {
     Timeout,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InviteRequest {
+    pub username: String,
+    pub sequence: Option<u32>,
+    pub password: Option<String>,
+}
+
+impl InviteRequest {
+    pub fn new(
+        username: impl Into<String>,
+        sequence: Option<u32>,
+        password: Option<String>,
+    ) -> Self {
+        Self {
+            username: username.into(),
+            sequence,
+            password,
+        }
+    }
+}
+
+pub enum InviteStart {
+    Duplicate { sequence: u32 },
+    Ready(InviteExecution),
+}
+
+pub struct InviteExecution {
+    username: String,
+    password: Option<String>,
+}
+
 pub trait InviteExecutionPort {
     fn is_public_hall(&self) -> Result<bool>;
     fn notify_friend(&self, username: &str, message: &str, keep_chat_open: bool) -> bool;
@@ -33,37 +64,45 @@ impl InviteService {
         Self::default()
     }
 
-    pub fn was_executed(&self, sequence: u32) -> Result<bool> {
-        Ok(self
-            .executed_sequences
-            .lock()
-            .map_err(|_| anyhow!("invite execution ledger mutex poisoned"))?
-            .contains(&sequence))
+    pub fn should_accept(&self, sequence: Option<u32>) -> Result<bool> {
+        let Some(sequence) = sequence else {
+            return Ok(true);
+        };
+        Ok(!self.executed_sequences()?.contains(&sequence))
     }
 
-    pub fn reserve_execution(&self, sequence: u32) -> Result<bool> {
-        Ok(self
-            .executed_sequences
-            .lock()
-            .map_err(|_| anyhow!("invite execution ledger mutex poisoned"))?
-            .insert(sequence))
+    pub fn begin(&self, request: InviteRequest) -> Result<InviteStart> {
+        if let Some(sequence) = request.sequence
+            && !self.executed_sequences()?.insert(sequence)
+        {
+            return Ok(InviteStart::Duplicate { sequence });
+        }
+        Ok(InviteStart::Ready(InviteExecution {
+            username: request.username,
+            password: request.password,
+        }))
     }
 
-    pub fn execute(
-        &self,
-        username: &str,
-        password: Option<&str>,
-        port: &dyn InviteExecutionPort,
-    ) -> Result<bool> {
+    fn executed_sequences(&self) -> Result<std::sync::MutexGuard<'_, HashSet<u32>>> {
+        self.executed_sequences
+            .lock()
+            .map_err(|_| anyhow!("invite execution ledger mutex poisoned"))
+    }
+}
+
+impl InviteExecution {
+    pub fn run(self, port: &dyn InviteExecutionPort) -> Result<bool> {
+        let username = self.username;
+        let password = self.password;
         log::info!("邀请: 先检测是否公共大厅");
         if port.is_public_hall()? {
             log::info!("邀请: 当前在公共大厅，直接执行");
             let friend_chat_open = port.notify_friend(
-                username,
+                &username,
                 "已同意加入大厅,请等待BOT进入大厅并发送就绪信息后再开启麦克风",
                 true,
             );
-            return port.run_invite_ui(username, password, friend_chat_open);
+            return port.run_invite_ui(&username, password.as_deref(), friend_chat_open);
         }
         let announce = format!(
             "{}邀请BOT前往大厅,30s内@邀请确认@邀请拒绝,默认通过",
@@ -71,28 +110,28 @@ impl InviteService {
         );
         if let Err(error) = port.send_hall(&announce) {
             log::error!("邀请通告发送失败，直接执行邀请: {error:#}");
-            return port.run_invite_ui(username, password, false);
+            return port.run_invite_ui(&username, password.as_deref(), false);
         }
         match port.wait_for_decision()? {
             InviteDecision::Approve => {
                 let friend_chat_open = port.notify_friend(
-                    username,
+                    &username,
                     "已同意加入大厅,请等待BOT进入大厅并发送就绪信息后再开启麦克风",
                     true,
                 );
-                port.run_invite_ui(username, password, friend_chat_open)
+                port.run_invite_ui(&username, password.as_deref(), friend_chat_open)
             }
             InviteDecision::Timeout => {
                 let friend_chat_open = port.notify_friend(
-                    username,
+                    &username,
                     "已默认同意加入大厅,请等待BOT进入大厅并发送就绪信息后再开启麦克风",
                     true,
                 );
-                port.run_invite_ui(username, password, friend_chat_open)
+                port.run_invite_ui(&username, password.as_deref(), friend_chat_open)
             }
             InviteDecision::Reject => {
                 log::info!("收到邀请拒绝，取消邀请");
-                port.notify_friend(username, "大厅成员已拒绝邀请", false);
+                port.notify_friend(&username, "大厅成员已拒绝邀请", false);
                 Ok(false)
             }
         }
@@ -101,7 +140,8 @@ impl InviteService {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex as StdMutex;
+    use std::sync::{Barrier, Mutex as StdMutex};
+    use std::thread;
 
     use super::*;
 
@@ -155,14 +195,72 @@ mod tests {
         }
     }
 
+    fn begin_ready(
+        service: &InviteService,
+        username: &str,
+        sequence: Option<u32>,
+    ) -> InviteExecution {
+        let InviteStart::Ready(execution) = service
+            .begin(InviteRequest::new(username, sequence, None))
+            .unwrap()
+        else {
+            panic!("invite should be ready");
+        };
+        execution
+    }
+
     #[test]
     fn execution_ledger_accepts_each_sequence_once() {
         let service = InviteService::new();
 
-        assert!(!service.was_executed(7).unwrap());
-        assert!(service.reserve_execution(7).unwrap());
-        assert!(service.was_executed(7).unwrap());
-        assert!(!service.reserve_execution(7).unwrap());
+        assert!(service.should_accept(Some(7)).unwrap());
+        drop(begin_ready(&service, "甲", Some(7)));
+        assert!(!service.should_accept(Some(7)).unwrap());
+        assert!(matches!(
+            service
+                .begin(InviteRequest::new("乙", Some(7), None))
+                .unwrap(),
+            InviteStart::Duplicate { sequence: 7 }
+        ));
+    }
+
+    #[test]
+    fn concurrent_sequence_reservation_has_one_winner() {
+        let service = InviteService::new();
+        let barrier = Arc::new(Barrier::new(3));
+        let workers = ["甲", "乙"].map(|username| {
+            let service = service.clone();
+            let barrier = barrier.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                matches!(
+                    service
+                        .begin(InviteRequest::new(username, Some(9), None))
+                        .unwrap(),
+                    InviteStart::Ready(_)
+                )
+            })
+        });
+        barrier.wait();
+
+        let ready = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .filter(|ready| *ready)
+            .count();
+
+        assert_eq!(ready, 1);
+        assert!(!service.should_accept(Some(9)).unwrap());
+    }
+
+    #[test]
+    fn unsequenced_invites_can_start_repeatedly() {
+        let service = InviteService::new();
+
+        drop(begin_ready(&service, "甲", None));
+        drop(begin_ready(&service, "甲", None));
+
+        assert!(service.should_accept(None).unwrap());
     }
 
     #[test]
@@ -170,7 +268,7 @@ mod tests {
         let service = InviteService::new();
         let port = FakeInvitePort::new(true, InviteDecision::Reject);
 
-        assert!(service.execute("甲", None, &port).unwrap());
+        assert!(begin_ready(&service, "甲", None).run(&port).unwrap());
 
         assert_eq!(*port.runs.lock().unwrap(), vec![true]);
         let notifications = port.notifications.lock().unwrap();
@@ -184,12 +282,28 @@ mod tests {
         let service = InviteService::new();
         let port = FakeInvitePort::new(false, InviteDecision::Reject);
 
-        assert!(!service.execute("甲", None, &port).unwrap());
+        assert!(!begin_ready(&service, "甲", None).run(&port).unwrap());
 
         assert!(port.runs.lock().unwrap().is_empty());
         assert_eq!(
             *port.notifications.lock().unwrap(),
             vec![("大厅成员已拒绝邀请".to_string(), false)]
         );
+    }
+
+    #[test]
+    fn rejected_execution_does_not_release_its_sequence() {
+        let service = InviteService::new();
+        let port = FakeInvitePort::new(false, InviteDecision::Reject);
+
+        assert!(!begin_ready(&service, "甲", Some(11)).run(&port).unwrap());
+
+        assert!(!service.should_accept(Some(11)).unwrap());
+        assert!(matches!(
+            service
+                .begin(InviteRequest::new("甲", Some(11), None))
+                .unwrap(),
+            InviteStart::Duplicate { sequence: 11 }
+        ));
     }
 }

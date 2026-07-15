@@ -2183,26 +2183,6 @@ fn monitor_json(state: &HttpSharedState) -> std::result::Result<String, AppError
             serde_json::to_value(state.decision_control.snapshot().map_err(internal_error)?)
                 .map_err(internal_error)?,
         );
-        object.insert(
-            "turtleSoup".to_string(),
-            serde_json::to_value(
-                state
-                    .business
-                    .turtle_soup_snapshot()
-                    .map_err(internal_error)?,
-            )
-            .map_err(internal_error)?,
-        );
-        object.insert(
-            "undercover".to_string(),
-            serde_json::to_value(
-                state
-                    .business
-                    .undercover_snapshot()
-                    .map_err(internal_error)?,
-            )
-            .map_err(internal_error)?,
-        );
     }
     serde_json::to_string(&value).map_err(internal_error)
 }

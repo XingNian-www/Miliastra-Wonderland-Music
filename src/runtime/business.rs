@@ -15,9 +15,10 @@ use crate::features::idiom_chain::{
     IdiomChainService,
 };
 use crate::features::turtle_soup::{
-    QuestionSubmitOutcome, SecondaryOcrObservation, SecondaryOcrStability, TurtleSoupCommand,
+    QuestionSubmitOutcome, SecondaryOcrObservation, SecondaryOcrStability, TurtleSoupAiCompletion,
+    TurtleSoupAiCompletionPort, TurtleSoupAppendReceipt, TurtleSoupCommand,
     TurtleSoupCommandOutcome, TurtleSoupDeadlineKind, TurtleSoupDeadlineToken, TurtleSoupDelivery,
-    TurtleSoupQuestion, TurtleSoupService, TurtleSoupSnapshot,
+    TurtleSoupQuestion, TurtleSoupService, TurtleSoupSnapshot, TurtleSoupSubmission,
 };
 #[cfg(test)]
 use crate::features::undercover::UndercoverConfig;
@@ -43,11 +44,12 @@ const CARD_GAME_DEADLINE_TOKEN_ID: u64 = 1;
 const UNDERCOVER_DEADLINE_TOKEN_ID: u64 = 1;
 const TURTLE_SOUP_DEADLINE_TOKEN_ID: u64 = 1;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum BusinessEvent {
     CompletionAdvance(CompletionAdvance),
     CompletionGap(ObservationGap),
     Timer(BusinessDeadlineEvent),
+    TurtleSoupAiCompleted(TurtleSoupAiCompletion),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -171,6 +173,7 @@ impl BusinessRuntimeSnapshot {
             BusinessEvent::Timer(event) => {
                 self.timer_counts.record_timer_event(&event);
             }
+            BusinessEvent::TurtleSoupAiCompleted(_) => {}
         }
     }
 }
@@ -247,37 +250,18 @@ enum RuntimeMessage {
     Shutdown(SyncSender<BusinessRuntimeSnapshot>),
 }
 
-#[derive(Clone, Debug)]
-struct ActiveIdiomDeadline {
-    token: BusinessDeadlineToken,
-    operation_id: BusinessOperationId,
-    session_generation: SessionGeneration,
-    deadline: Instant,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct ActiveCardGameDeadline {
+struct ActiveDeadline {
     token: BusinessDeadlineToken,
     operation_id: BusinessOperationId,
     session_generation: SessionGeneration,
     deadline: Instant,
 }
 
-#[derive(Clone, Debug)]
-struct ActiveUndercoverDeadline {
-    token: BusinessDeadlineToken,
-    operation_id: BusinessOperationId,
-    session_generation: SessionGeneration,
-    deadline: Instant,
-}
-
-#[derive(Clone, Debug)]
-struct ActiveTurtleSoupDeadline {
-    token: BusinessDeadlineToken,
-    operation_id: BusinessOperationId,
-    session_generation: SessionGeneration,
-    deadline: Instant,
-}
+type ActiveIdiomDeadline = ActiveDeadline;
+type ActiveCardGameDeadline = ActiveDeadline;
+type ActiveUndercoverDeadline = ActiveDeadline;
+type ActiveTurtleSoupDeadline = ActiveDeadline;
 
 enum CardGameRuntimeMessage {
     Begin {
@@ -385,6 +369,10 @@ enum TurtleSoupRuntimeMessage {
     DeliveryFailure {
         delivery: TurtleSoupDelivery,
         error: String,
+    },
+    AppendPuzzle {
+        submission: TurtleSoupSubmission,
+        response: SyncSender<Result<TurtleSoupAppendReceipt, BusinessRuntimeError>>,
     },
 }
 
@@ -754,6 +742,18 @@ impl BusinessRuntimeHandle {
         ));
     }
 
+    pub(crate) fn append_turtle_soup_puzzle(
+        &self,
+        submission: TurtleSoupSubmission,
+    ) -> Result<TurtleSoupAppendReceipt, BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::TurtleSoup(TurtleSoupRuntimeMessage::AppendPuzzle {
+                submission,
+                response,
+            })
+        })
+    }
+
     fn request<T>(
         &self,
         message: impl FnOnce(SyncSender<Result<T, BusinessRuntimeError>>) -> RuntimeMessage,
@@ -842,9 +842,25 @@ impl BusinessRuntimeEventSink {
     }
 }
 
+struct TurtleSoupBusinessEventPort {
+    sink: BusinessRuntimeEventSink,
+}
+
+impl TurtleSoupAiCompletionPort for TurtleSoupBusinessEventPort {
+    fn submit(&self, completion: TurtleSoupAiCompletion) {
+        if let Err(error) = self
+            .sink
+            .submit(BusinessEvent::TurtleSoupAiCompleted(completion))
+        {
+            log::debug!("业务运行时已停止，丢弃海龟汤 AI 裁决结果: {error}");
+        }
+    }
+}
+
 pub struct BusinessRuntime {
     handle: BusinessRuntimeHandle,
     worker: Option<JoinHandle<()>>,
+    turtle_soup_workers: Option<TurtleSoupService>,
 }
 
 impl BusinessRuntime {
@@ -916,6 +932,15 @@ impl BusinessRuntime {
             sender,
             state: Mutex::new(RuntimeChannelState::Running),
         });
+        let event_sink = BusinessRuntimeEventSink {
+            channel: channel.clone(),
+        };
+        let turtle_soup_workers = turtle_soup.clone();
+        if let Some(service) = turtle_soup_workers.as_ref() {
+            service.start_workers_with_port(Arc::new(TurtleSoupBusinessEventPort {
+                sink: event_sink,
+            }));
+        }
         let worker = thread::Builder::new()
             .name("business-runtime".to_string())
             .spawn(move || {
@@ -928,10 +953,16 @@ impl BusinessRuntime {
                     timer,
                 )
             })
-            .map_err(|_| BusinessRuntimeError::RuntimeStopped)?;
+            .map_err(|_| {
+                if let Some(service) = turtle_soup_workers.as_ref() {
+                    service.shutdown();
+                }
+                BusinessRuntimeError::RuntimeStopped
+            })?;
         Ok(Self {
             handle: BusinessRuntimeHandle { channel },
             worker: Some(worker),
+            turtle_soup_workers,
         })
     }
 
@@ -979,6 +1010,9 @@ impl BusinessRuntime {
 
     fn stop_worker(&mut self) -> Result<BusinessRuntimeSnapshot, BusinessRuntimeError> {
         let Some(worker) = self.worker.take() else {
+            if let Some(service) = self.turtle_soup_workers.take() {
+                service.shutdown();
+            }
             return Err(BusinessRuntimeError::RuntimeStopped);
         };
         let (response, receiver) = mpsc::sync_channel(1);
@@ -1000,9 +1034,13 @@ impl BusinessRuntime {
                 .is_ok()
         };
         let snapshot = sent.then(|| receiver.recv().ok()).flatten();
-        worker
+        let worker_result = worker
             .join()
-            .map_err(|_| BusinessRuntimeError::WorkerPanicked)?;
+            .map_err(|_| BusinessRuntimeError::WorkerPanicked);
+        if let Some(service) = self.turtle_soup_workers.take() {
+            service.shutdown();
+        }
+        worker_result?;
         snapshot.ok_or(BusinessRuntimeError::RuntimeStopped)
     }
 }
@@ -1793,19 +1831,16 @@ fn run_business_runtime(
     let mut pending_turtle_soup_cancellations = Vec::new();
     let mut pending_card_game_outcomes = std::collections::VecDeque::new();
     let mut pending_undercover_outcomes = std::collections::VecDeque::new();
-    let mut card_game_clock_active = true;
+    let mut entertainment_clock_active = true;
     let operation_ids = BusinessOperationIdAllocator::new();
     let mut session_generation = SessionGeneration::INITIAL;
-    if let Some(service) = turtle_soup.as_ref() {
-        service.start_workers();
-    }
     while let Ok(message) = receiver.recv() {
         match message {
-            RuntimeMessage::Event(event) => {
-                if let BusinessEvent::Timer(timer_event) = &event {
+            RuntimeMessage::Event(event) => match event {
+                BusinessEvent::Timer(timer_event) => {
                     snapshot.apply(BusinessEvent::Timer(timer_event.clone()));
                     if let Err(error) = handle_business_timer(
-                        timer_event.clone(),
+                        timer_event,
                         &mut idiom_chain,
                         &mut card_games,
                         &mut undercover,
@@ -1822,14 +1857,29 @@ fn run_business_runtime(
                         &mut pending_undercover_outcomes,
                         &operation_ids,
                         &mut session_generation,
-                        card_game_clock_active,
+                        entertainment_clock_active,
                     ) {
                         log::error!("业务运行时处理计时事件失败: {error}");
                     }
-                } else {
-                    snapshot.apply(event);
                 }
-            }
+                BusinessEvent::TurtleSoupAiCompleted(completion) => {
+                    if let Some(service) = turtle_soup.as_ref() {
+                        service.apply_ai_completion(completion);
+                        if let Err(error) = sync_turtle_soup_deadline(
+                            Some(service),
+                            timer.as_ref(),
+                            &mut active_turtle_soup_deadline,
+                            &mut pending_turtle_soup_cancellations,
+                            &operation_ids,
+                            Instant::now(),
+                            entertainment_clock_active,
+                        ) {
+                            log::error!("处理海龟汤 AI 裁决后同步期限失败: {error}");
+                        }
+                    }
+                }
+                other => snapshot.apply(other),
+            },
             RuntimeMessage::HandleIdiomChain {
                 player,
                 command,
@@ -1911,7 +1961,7 @@ fn run_business_runtime(
                     &mut pending_card_game_cancellations,
                     &operation_ids,
                     &mut pending_card_game_outcomes,
-                    &mut card_game_clock_active,
+                    &mut entertainment_clock_active,
                 ) {
                     log::error!("业务运行时处理牌局消息失败: {error}");
                 }
@@ -1925,7 +1975,7 @@ fn run_business_runtime(
                     &mut pending_undercover_cancellations,
                     &operation_ids,
                     &mut pending_undercover_outcomes,
-                    &mut card_game_clock_active,
+                    &mut entertainment_clock_active,
                 ) {
                     log::error!("业务运行时处理谁是卧底消息失败: {error}");
                 }
@@ -1941,7 +1991,7 @@ fn run_business_runtime(
                     &mut active_turtle_soup_deadline,
                     &mut pending_turtle_soup_cancellations,
                     &operation_ids,
-                    card_game_clock_active,
+                    entertainment_clock_active,
                 ) {
                     log::error!("业务运行时处理海龟汤消息失败: {error}");
                 }
@@ -1990,7 +2040,7 @@ fn run_business_runtime(
                     &mut session_generation,
                     &mut pending_card_game_outcomes,
                     &mut pending_undercover_outcomes,
-                    card_game_clock_active,
+                    entertainment_clock_active,
                 );
                 snapshot.quiescing = true;
                 let _ = response.send(snapshot);
@@ -2013,7 +2063,7 @@ fn run_business_runtime(
                     &mut session_generation,
                     &mut pending_card_game_outcomes,
                     &mut pending_undercover_outcomes,
-                    card_game_clock_active,
+                    entertainment_clock_active,
                 );
                 let _ = response.send(snapshot);
                 break;
@@ -2051,7 +2101,6 @@ fn abort_business_modules(
     let _ = undercover.abort();
     if let Some(turtle_soup) = turtle_soup {
         turtle_soup.abort_for_context_loss("业务运行时关闭");
-        turtle_soup.shutdown();
     }
     if let Err(error) = sync_idiom_deadline(
         idiom_chain,
@@ -2289,6 +2338,9 @@ fn handle_turtle_soup_message(
             | TurtleSoupRuntimeMessage::Abort { .. }
             | TurtleSoupRuntimeMessage::DeliverySuccess { .. }
             | TurtleSoupRuntimeMessage::DeliveryFailure { .. } => {}
+            TurtleSoupRuntimeMessage::AppendPuzzle { response, .. } => {
+                let _ = response.send(Err(BusinessRuntimeError::RuntimeStopped));
+            }
             TurtleSoupRuntimeMessage::Accepts(response) => {
                 let _ = response.send(false);
             }
@@ -2467,6 +2519,15 @@ fn handle_turtle_soup_message(
                 Instant::now(),
                 clock_active,
             )?;
+        }
+        TurtleSoupRuntimeMessage::AppendPuzzle {
+            submission,
+            response,
+        } => {
+            let result = service
+                .append_puzzle(submission)
+                .map_err(turtle_soup_operation_failed);
+            let _ = response.send(result);
         }
     }
     Ok(())

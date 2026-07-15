@@ -50,7 +50,7 @@ use crate::features::moderation::{ModerationPolicy, ModerationService};
 use crate::features::startup::{StartupSource, StartupTask};
 #[cfg(test)]
 use crate::features::turtle_soup::TurtleSoupService;
-use crate::features::turtle_soup::repository::{TurtleSoupBankStore, TurtleSoupSubmission};
+use crate::features::turtle_soup::TurtleSoupSubmission;
 use crate::features::undercover::UndercoverCommand;
 #[cfg(test)]
 use crate::features::undercover::UndercoverRuntimeService;
@@ -450,7 +450,6 @@ pub struct HttpSharedState {
     pub runtime_state: Arc<Mutex<PersistentRuntimeState>>,
     pub monitor: MonitorShared,
     pub chat_listener: ChatListenerShared,
-    turtle_soup_bank: TurtleSoupBankStore,
     business: BusinessRuntimeHandle,
     custom_workflow: CustomWorkflowService,
     pub history: Arc<Mutex<VecDeque<HistoryItem>>>,
@@ -514,8 +513,6 @@ impl HttpSharedState {
         player_runtime: PlayerRuntimeHandle,
         ai: ai::AiClient,
     ) -> Self {
-        let turtle_soup_bank =
-            TurtleSoupBankStore::new(config.turtle_soup.question_bank_path.clone());
         let custom_workflow = custom_workflow::service_from_config(&config);
         Self {
             config,
@@ -523,7 +520,6 @@ impl HttpSharedState {
             runtime_state,
             monitor,
             chat_listener,
-            turtle_soup_bank,
             business,
             custom_workflow,
             history: Arc::new(Mutex::new(VecDeque::new())),
@@ -1436,8 +1432,8 @@ fn turtle_soup_questions_route(
         return Err(bad_request("海龟汤标题、汤面和汤底不能为空"));
     }
     let receipt = state
-        .turtle_soup_bank
-        .append(submission)
+        .business
+        .append_turtle_soup_puzzle(submission)
         .map_err(internal_error)?;
     serde_json::to_string(&receipt).map_err(internal_error)
 }

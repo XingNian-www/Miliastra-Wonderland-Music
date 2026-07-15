@@ -164,8 +164,8 @@ flowchart TD
 
 ## 监控快照
 
-`MonitorShared` 是监控投影的只读/发布句柄。生产代码只提交类型化的 `MonitorEvent`，由
-`MonitorProjection::apply` 统一更新内部状态；TUI/Web 只调用 `snapshot()`，不能直接修改投影。
+`MonitorShared` 是监控投影的只读/发布句柄。生产代码只提交类型化的 `MonitorEvent`，由独立
+监控投影线程顺序调用 `MonitorProjection::apply`；TUI/Web 的 `snapshot()` 请求也经过同一通道，不能直接修改投影。
 投影包含：
 
 - `logs`：最近事件日志。

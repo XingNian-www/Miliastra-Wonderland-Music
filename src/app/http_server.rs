@@ -42,6 +42,7 @@ use crate::config::AppConfig;
 use crate::features::entertainment::EntertainmentCoordinator;
 #[cfg(test)]
 use crate::features::moderation::{ModerationPolicy, ModerationService};
+use crate::features::startup::{StartupSource, StartupTask};
 use crate::features::turtle_soup::TurtleSoupService;
 use crate::features::turtle_soup::repository::{TurtleSoupBankStore, TurtleSoupSubmission};
 use crate::features::undercover::{UndercoverCommand, UndercoverService};
@@ -1756,9 +1757,9 @@ fn enqueue_startup_game(state: &HttpSharedState) -> std::result::Result<String, 
     enqueue_startup_task_response(
         state,
         "启动游戏",
-        [super::PendingTask::StartGame {
-            source: "远程指挥台",
-        }],
+        [super::PendingTask::Startup(StartupTask::start_game(
+            StartupSource::REMOTE_CONSOLE,
+        ))],
     )
 }
 
@@ -1766,9 +1767,9 @@ fn enqueue_enter_wonderland(state: &HttpSharedState) -> std::result::Result<Stri
     enqueue_startup_task_response(
         state,
         "进入千星",
-        [super::PendingTask::EnterWonderland {
-            source: "远程指挥台",
-        }],
+        [super::PendingTask::Startup(StartupTask::enter_wonderland(
+            StartupSource::REMOTE_CONSOLE,
+        ))],
     )
 }
 
@@ -1777,12 +1778,10 @@ fn enqueue_startup_wonderland(state: &HttpSharedState) -> std::result::Result<St
         state,
         "启动游戏并进入千星",
         [
-            super::PendingTask::StartGame {
-                source: "远程指挥台",
-            },
-            super::PendingTask::EnterWonderland {
-                source: "远程指挥台",
-            },
+            super::PendingTask::Startup(StartupTask::start_game(StartupSource::REMOTE_CONSOLE)),
+            super::PendingTask::Startup(StartupTask::enter_wonderland(
+                StartupSource::REMOTE_CONSOLE,
+            )),
         ],
     )
 }

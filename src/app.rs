@@ -97,7 +97,7 @@ use self::playback_format::{
 };
 use self::player_controller::{
     MismatchDecision, PlaybackAttempt, PlaybackOutcome, PlaybackRequest, PlaybackVerification,
-    PlayerController, QueueAdvanceContext, QueueAdvanceDecision,
+    PlayerController, PlayerRuntimeBackend, QueueAdvanceContext, QueueAdvanceDecision,
 };
 use self::queue::PersistentQueue;
 use self::runtime_state::{HALL_EXPIRING_WARNING_MINUTES, PersistentRuntimeState};
@@ -419,7 +419,7 @@ pub(crate) struct AutomationApp {
     deferred_chat: DeferredChatQueue,
     queue: Arc<Mutex<PersistentQueue>>,
     song_dedup_history: Arc<Mutex<PersistentSongDedupHistory>>,
-    player: PlayerController<FeelUOwnClient>,
+    player: PlayerController<PlayerRuntimeBackend>,
     player_search: PlayerSearchClient,
     player_runtime: Option<PlayerRuntime>,
     openai_runtime: Option<OpenAiRuntime>,
@@ -1056,8 +1056,11 @@ impl AutomationApp {
             player_runtime_config,
         )
         .context("启动播放器运行时")?;
-        let player_search =
-            PlayerSearchClient::new(player_runtime.handle(), BusinessOperationIdAllocator::new());
+        let player_runtime_handle = player_runtime.handle();
+        let player_search = PlayerSearchClient::new(
+            player_runtime_handle.clone(),
+            BusinessOperationIdAllocator::new(),
+        );
         let ui_runtime = UiRuntime::start(
             WindowsUiDevice::new(config.window.clone()),
             UI_RUNTIME_QUEUE_CAPACITY,
@@ -1100,7 +1103,7 @@ impl AutomationApp {
         let queue = Arc::new(Mutex::new(queue));
         let song_dedup_history = Arc::new(Mutex::new(song_dedup_history));
         let player = PlayerController::new(
-            feeluown,
+            PlayerRuntimeBackend::new(player_runtime_handle),
             runtime_state.clone(),
             song_dedup_history.clone(),
             &config.timing.playback,

@@ -11,7 +11,7 @@ use super::ui_locator::UiLocator;
 use super::workflow_actions::{self, HitAction, PixelStability, TemplateMode};
 use super::{AutomationApp, ChatDecisionScope, FrameArgs, UiResidency};
 use crate::config::{self, CustomWorkflowConfig, CustomWorkflowDefinition, PointConfig};
-use crate::features::invite::{InviteDecision, InviteExecutionPort};
+use crate::features::invite::{InviteDecision, InviteExecutionPort, InviteRequest, InviteStart};
 use anyhow::{Result, anyhow, bail};
 
 pub(super) fn parse_text(
@@ -360,7 +360,12 @@ impl AutomationApp {
                 if target.is_empty() {
                     return Err(anyhow!("custom workflow invite step missing target"));
                 }
-                self.invite.execute(&target, None, self).map(|_| ())
+                let InviteStart::Ready(execution) =
+                    self.invite.begin(InviteRequest::new(target, None, None))?
+                else {
+                    unreachable!("unsequenced custom workflow invites cannot be duplicates")
+                };
+                execution.run(self).map(|_| ())
             }
             "return_primary" | "ensure_primary" => {
                 self.ensure_ui_residency(UiResidency::Primary, "自定义流程要求一级界面")

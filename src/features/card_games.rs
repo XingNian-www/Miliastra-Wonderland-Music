@@ -4,6 +4,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use crate::runtime::timer::{DeadlineKind, DeadlineModule, DeadlineToken};
+
 mod service;
 
 #[cfg(test)]
@@ -16,6 +18,26 @@ pub use service::{
 #[cfg(test)]
 pub(crate) use service::{CardGameCompletion, CardGameLateResult};
 pub use service::{CardGameDeliveryPort, CardGameService};
+
+#[derive(Debug)]
+pub struct CardGameDeadlineModule;
+
+impl DeadlineModule for CardGameDeadlineModule {
+    const NAME: &'static str = "card-game";
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CardGameDeadlineKind {
+    LobbyExpiry,
+    TurnWarning,
+    TurnExpiry,
+}
+
+impl DeadlineKind for CardGameDeadlineKind {
+    type Module = CardGameDeadlineModule;
+}
+
+pub type CardGameDeadlineToken = DeadlineToken<CardGameDeadlineKind>;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]

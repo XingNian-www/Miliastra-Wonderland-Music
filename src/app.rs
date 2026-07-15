@@ -137,7 +137,10 @@ use crate::features::undercover::{
 };
 use crate::observation::chat::ObservedFrame;
 use crate::observation::shared::ObservationRead;
-use crate::runtime::business::{BusinessEvent, BusinessRuntime, BusinessRuntimeHandle};
+use crate::runtime::business::{
+    BusinessEvent, BusinessRuntime, BusinessRuntimeEventSink, BusinessRuntimeHandle,
+};
+use crate::runtime::deadline_bridge::{BusinessRuntimeGroup, BusinessRuntimeGroupBuilder};
 use crate::runtime::identity::BusinessOperationIdAllocator;
 use crate::runtime::player_io::{PlayerRuntime, PlayerSearchClient, PlayerSearchClientError};
 use crate::runtime::ui::{
@@ -153,6 +156,7 @@ const TARGET_MISSING_BACKOFF_MAX: Duration = Duration::from_secs(60);
 const UI_RUNTIME_QUEUE_CAPACITY: usize = 32;
 const OCR_RUNTIME_QUEUE_CAPACITY: usize = 64;
 const BUSINESS_RUNTIME_QUEUE_CAPACITY: usize = 64;
+const DEADLINE_RUNTIME_QUEUE_CAPACITY: usize = 64;
 
 fn receive_observation_frame(
     subscription: &FrameDemandSubscription,
@@ -404,7 +408,8 @@ pub(crate) struct AutomationApp {
     game_ui: GameUi,
     ui_runtime: Option<UiRuntime>,
     business: BusinessRuntimeHandle,
-    business_runtime: Option<BusinessRuntime>,
+    business_events: BusinessRuntimeEventSink,
+    business_runtime: Option<BusinessRuntimeGroup>,
     runtime_state: Arc<Mutex<PersistentRuntimeState>>,
     entertainment: EntertainmentCoordinator,
     undercover: UndercoverService,
@@ -1032,6 +1037,8 @@ impl AutomationApp {
         let player_runtime_config = config
             .player_runtime_config()
             .context("校验播放器运行时配置")?;
+        let business_runtime_builder =
+            BusinessRuntimeGroupBuilder::start(DEADLINE_RUNTIME_QUEUE_CAPACITY)?;
         let ocr_args = OcrArgs::default().resolve(&config);
         let ocr_runtime = OcrRuntime::start(
             ProductionOcrDevice::new(ocr_args)?,
@@ -1098,9 +1105,11 @@ impl AutomationApp {
             config.ocr.change_mean_threshold,
             config.ocr.change_pixel_threshold,
         );
-        let business_runtime =
-            BusinessRuntime::start(BUSINESS_RUNTIME_QUEUE_CAPACITY, idiom_chain, landlord)?;
-        let business = business_runtime.handle();
+        let business_runtime = business_runtime_builder.build_with(|| {
+            BusinessRuntime::start(BUSINESS_RUNTIME_QUEUE_CAPACITY, idiom_chain, landlord)
+        })?;
+        let business = business_runtime.business_handle();
+        let business_events = business_runtime.event_sink();
         let moderation = ModerationService::new(ModerationPolicy::new(
             Duration::from_millis(config.timing.moderation.vote_timeout_ms),
             Duration::from_millis(config.timing.moderation.vote_poll_ms),
@@ -1114,6 +1123,7 @@ impl AutomationApp {
             game_ui,
             ui_runtime: Some(ui_runtime),
             business,
+            business_events,
             business_runtime: Some(business_runtime),
             runtime_state,
             entertainment,
@@ -1194,10 +1204,20 @@ impl AutomationApp {
         if let Err(error) = playback_monitor.join() {
             log::error!("播放监控线程 panic: {error:?}");
         }
-        if let Some(business_runtime) = self.business_runtime.take()
-            && let Err(error) = business_runtime.shutdown()
-        {
-            log::error!("业务运行时关闭失败: {error}");
+        if let Some(business_runtime) = self.business_runtime.take() {
+            match business_runtime.shutdown() {
+                Ok(snapshot) => log::info!(
+                    "业务运行时组已关闭: deadline_forwarded={} business={:?}",
+                    snapshot.deadlines().forwarded_count(),
+                    snapshot.business()
+                ),
+                Err(error) => log::error!(
+                    "业务运行时组关闭失败: {error}; prepare={:?} deadlines={:?} finish={:?}",
+                    error.prepare_error(),
+                    error.deadline_error(),
+                    error.finish_error()
+                ),
+            }
         }
         if let Some(ui_runtime) = self.ui_runtime.take()
             && let Err(error) = ui_runtime.shutdown()
@@ -1454,6 +1474,7 @@ impl AutomationApp {
             game_ui: self.game_ui.clone(),
             ui_runtime: None,
             business: self.business.clone(),
+            business_events: self.business_events.clone(),
             business_runtime: None,
             runtime_state: self.runtime_state.clone(),
             entertainment: self.entertainment.clone(),
@@ -2125,13 +2146,13 @@ impl AutomationApp {
         loop {
             match self.chat_observations.read_completion_advance(subscriber)? {
                 Some(ObservationRead::Item { value, .. }) => self
-                    .business
+                    .business_events
                     .submit(BusinessEvent::CompletionAdvance(Arc::unwrap_or_clone(
                         value,
                     )))
                     .context("向业务运行时提交观察完成推进")?,
                 Some(ObservationRead::Gap(gap)) => self
-                    .business
+                    .business_events
                     .submit(BusinessEvent::CompletionGap(gap))
                     .context("向业务运行时提交观察完成流缺口")?,
                 None => return Ok(()),

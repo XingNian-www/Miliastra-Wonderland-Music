@@ -93,6 +93,49 @@ impl<T> DeadlineSchedule<T> {
     pub const fn deadline(&self) -> Instant {
         self.deadline
     }
+
+    fn map_token_with<U>(self, map: &mut impl FnMut(T) -> U) -> DeadlineSchedule<U> {
+        DeadlineSchedule {
+            token: map(self.token),
+            operation_id: self.operation_id,
+            session_generation: self.session_generation,
+            deadline: self.deadline,
+        }
+    }
+}
+
+/// A cancellation request has its own correlation identity, separate from the schedule it targets.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeadlineCancellation<T> {
+    token: T,
+    operation_id: BusinessOperationId,
+    session_generation: SessionGeneration,
+}
+
+impl<T> DeadlineCancellation<T> {
+    pub const fn new(
+        token: T,
+        operation_id: BusinessOperationId,
+        session_generation: SessionGeneration,
+    ) -> Self {
+        Self {
+            token,
+            operation_id,
+            session_generation,
+        }
+    }
+
+    pub const fn token(&self) -> &T {
+        &self.token
+    }
+
+    pub const fn operation_id(&self) -> BusinessOperationId {
+        self.operation_id
+    }
+
+    pub const fn session_generation(&self) -> SessionGeneration {
+        self.session_generation
+    }
 }
 
 /// A timer event. The timer reports timing facts and leaves all business decisions to the owner.
@@ -129,6 +172,114 @@ impl<T> DeadlineExpired<T> {
 
     pub fn into_schedule(self) -> DeadlineSchedule<T> {
         self.schedule
+    }
+
+    pub fn map_token<U>(self, map: impl FnOnce(T) -> U) -> DeadlineExpired<U> {
+        DeadlineExpired {
+            schedule: DeadlineSchedule {
+                token: map(self.schedule.token),
+                operation_id: self.schedule.operation_id,
+                session_generation: self.schedule.session_generation,
+                deadline: self.schedule.deadline,
+            },
+            emitted_at: self.emitted_at,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimerCommandKind {
+    Schedule,
+    Reschedule,
+    Cancel,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TimerCommandOutcome<T> {
+    Scheduled,
+    Rescheduled(DeadlineSchedule<T>),
+    Cancelled(Option<DeadlineSchedule<T>>),
+}
+
+impl<T> TimerCommandOutcome<T> {
+    fn map_token_with<U>(self, map: &mut impl FnMut(T) -> U) -> TimerCommandOutcome<U> {
+        match self {
+            Self::Scheduled => TimerCommandOutcome::Scheduled,
+            Self::Rescheduled(previous) => {
+                TimerCommandOutcome::Rescheduled(previous.map_token_with(map))
+            }
+            Self::Cancelled(previous) => {
+                TimerCommandOutcome::Cancelled(previous.map(|item| item.map_token_with(map)))
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TimerCommandCompleted<T> {
+    token: T,
+    operation_id: BusinessOperationId,
+    session_generation: SessionGeneration,
+    command: TimerCommandKind,
+    result: Result<TimerCommandOutcome<T>, TimerCoreError>,
+}
+
+impl<T> TimerCommandCompleted<T> {
+    pub const fn token(&self) -> &T {
+        &self.token
+    }
+
+    pub const fn operation_id(&self) -> BusinessOperationId {
+        self.operation_id
+    }
+
+    pub const fn session_generation(&self) -> SessionGeneration {
+        self.session_generation
+    }
+
+    pub const fn command(&self) -> TimerCommandKind {
+        self.command
+    }
+
+    pub const fn result(&self) -> &Result<TimerCommandOutcome<T>, TimerCoreError> {
+        &self.result
+    }
+
+    fn map_token<U>(self, mut map: impl FnMut(T) -> U) -> TimerCommandCompleted<U> {
+        TimerCommandCompleted {
+            token: map(self.token),
+            operation_id: self.operation_id,
+            session_generation: self.session_generation,
+            command: self.command,
+            result: self.result.map(|outcome| outcome.map_token_with(&mut map)),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TimerRuntimeEvent<T> {
+    DeadlineExpired(DeadlineExpired<T>),
+    CommandCompleted(TimerCommandCompleted<T>),
+}
+
+impl<T> TimerRuntimeEvent<T> {
+    pub const fn token(&self) -> &T {
+        match self {
+            Self::DeadlineExpired(event) => event.token(),
+            Self::CommandCompleted(event) => event.token(),
+        }
+    }
+
+    pub fn map_token<U>(self, map: impl FnMut(T) -> U) -> TimerRuntimeEvent<U> {
+        match self {
+            Self::DeadlineExpired(event) => {
+                let mut map = map;
+                TimerRuntimeEvent::DeadlineExpired(event.map_token(&mut map))
+            }
+            Self::CommandCompleted(event) => {
+                TimerRuntimeEvent::CommandCompleted(event.map_token(map))
+            }
+        }
     }
 }
 
@@ -322,42 +473,10 @@ impl Display for TimerSubmitError {
 
 impl Error for TimerSubmitError {}
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TimerReceiveError;
-
-impl Display for TimerReceiveError {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("timer runtime stopped before returning a result")
-    }
-}
-
-impl Error for TimerReceiveError {}
-
-pub struct TimerOperation<R> {
-    response: Receiver<R>,
-}
-
-pub type TimerCoreOperation<R> = TimerOperation<Result<R, TimerCoreError>>;
-
-impl<R> TimerOperation<R> {
-    pub fn wait(self) -> Result<R, TimerReceiveError> {
-        self.response.recv().map_err(|_| TimerReceiveError)
-    }
-}
-
 enum TimerCommand<T: DeadlineIdentity> {
-    Schedule {
-        schedule: DeadlineSchedule<T>,
-        response: SyncSender<Result<(), TimerCoreError>>,
-    },
-    Reschedule {
-        schedule: DeadlineSchedule<T>,
-        response: SyncSender<Result<DeadlineSchedule<T>, TimerCoreError>>,
-    },
-    Cancel {
-        token: T,
-        response: SyncSender<Result<Option<DeadlineSchedule<T>>, TimerCoreError>>,
-    },
+    Schedule(DeadlineSchedule<T>),
+    Reschedule(DeadlineSchedule<T>),
+    Cancel(DeadlineCancellation<T>),
     Shutdown,
 }
 
@@ -372,31 +491,19 @@ pub struct TimerRuntimeHandle<T: DeadlineIdentity> {
 }
 
 impl<T: DeadlineIdentity> TimerRuntimeHandle<T> {
-    pub fn schedule(
-        &self,
-        schedule: DeadlineSchedule<T>,
-    ) -> Result<TimerCoreOperation<()>, TimerSubmitError> {
-        self.submit(|response| TimerCommand::Schedule { schedule, response })
+    pub fn schedule(&self, schedule: DeadlineSchedule<T>) -> Result<(), TimerSubmitError> {
+        self.submit(TimerCommand::Schedule(schedule))
     }
 
-    pub fn reschedule(
-        &self,
-        schedule: DeadlineSchedule<T>,
-    ) -> Result<TimerCoreOperation<DeadlineSchedule<T>>, TimerSubmitError> {
-        self.submit(|response| TimerCommand::Reschedule { schedule, response })
+    pub fn reschedule(&self, schedule: DeadlineSchedule<T>) -> Result<(), TimerSubmitError> {
+        self.submit(TimerCommand::Reschedule(schedule))
     }
 
-    pub fn cancel(
-        &self,
-        token: T,
-    ) -> Result<TimerCoreOperation<Option<DeadlineSchedule<T>>>, TimerSubmitError> {
-        self.submit(|response| TimerCommand::Cancel { token, response })
+    pub fn cancel(&self, cancellation: DeadlineCancellation<T>) -> Result<(), TimerSubmitError> {
+        self.submit(TimerCommand::Cancel(cancellation))
     }
 
-    fn submit<R>(
-        &self,
-        command: impl FnOnce(SyncSender<R>) -> TimerCommand<T>,
-    ) -> Result<TimerOperation<R>, TimerSubmitError> {
+    fn submit(&self, command: TimerCommand<T>) -> Result<(), TimerSubmitError> {
         let accepting = self
             .channel
             .accepting
@@ -405,9 +512,8 @@ impl<T: DeadlineIdentity> TimerRuntimeHandle<T> {
         if !*accepting {
             return Err(TimerSubmitError::RuntimeStopped);
         }
-        let (response, receiver) = mpsc::sync_channel(1);
-        match self.channel.sender.try_send(command(response)) {
-            Ok(()) => Ok(TimerOperation { response: receiver }),
+        match self.channel.sender.try_send(command) {
+            Ok(()) => Ok(()),
             Err(TrySendError::Full(_)) => Err(TimerSubmitError::QueueFull),
             Err(TrySendError::Disconnected(_)) => Err(TimerSubmitError::RuntimeStopped),
         }
@@ -453,40 +559,34 @@ impl Error for TimerShutdownError {}
 
 pub struct TimerRuntime<T: DeadlineIdentity> {
     handle: TimerRuntimeHandle<T>,
-    expired: Option<Receiver<DeadlineExpired<T>>>,
     worker: Option<JoinHandle<()>>,
 }
 
 impl<T: DeadlineIdentity> TimerRuntime<T> {
-    pub fn start(queue_capacity: usize) -> Result<Self, TimerRuntimeStartError> {
+    pub(super) fn start(
+        queue_capacity: usize,
+        events: SyncSender<TimerRuntimeEvent<T>>,
+    ) -> Result<Self, TimerRuntimeStartError> {
         if queue_capacity == 0 {
             return Err(TimerRuntimeStartError::ZeroQueueCapacity);
         }
         let (command_sender, command_receiver) = mpsc::sync_channel(queue_capacity);
-        let (expired_sender, expired_receiver) = mpsc::sync_channel(queue_capacity);
         let channel = Arc::new(TimerChannel {
             sender: command_sender,
             accepting: Mutex::new(true),
         });
         let worker = thread::Builder::new()
             .name("timer-runtime".to_string())
-            .spawn(move || run_timer_runtime(command_receiver, expired_sender))
+            .spawn(move || run_timer_runtime(command_receiver, events))
             .map_err(TimerRuntimeStartError::Spawn)?;
         Ok(Self {
             handle: TimerRuntimeHandle { channel },
-            expired: Some(expired_receiver),
             worker: Some(worker),
         })
     }
 
     pub fn handle(&self) -> TimerRuntimeHandle<T> {
         self.handle.clone()
-    }
-
-    pub fn expired(&self) -> &Receiver<DeadlineExpired<T>> {
-        self.expired
-            .as_ref()
-            .expect("timer event receiver exists while runtime is active")
     }
 
     pub fn shutdown(mut self) -> Result<(), TimerShutdownError> {
@@ -504,7 +604,6 @@ impl<T: DeadlineIdentity> TimerRuntime<T> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *accepting = false;
-        self.expired.take();
         let _ = self.handle.channel.sender.send(TimerCommand::Shutdown);
         drop(accepting);
         worker.join().map_err(|_| TimerShutdownError)
@@ -519,7 +618,7 @@ impl<T: DeadlineIdentity> Drop for TimerRuntime<T> {
 
 fn run_timer_runtime<T: DeadlineIdentity>(
     commands: Receiver<TimerCommand<T>>,
-    expired: SyncSender<DeadlineExpired<T>>,
+    events: SyncSender<TimerRuntimeEvent<T>>,
 ) {
     let mut core = TimerCore::new();
     loop {
@@ -530,7 +629,10 @@ fn run_timer_runtime<T: DeadlineIdentity>(
             Err(_) => unreachable!("draining an open timer core cannot fail"),
         };
         for event in due {
-            if expired.send(event).is_err() {
+            if events
+                .send(TimerRuntimeEvent::DeadlineExpired(event))
+                .is_err()
+            {
                 core.close();
                 return;
             }
@@ -550,14 +652,68 @@ fn run_timer_runtime<T: DeadlineIdentity>(
             },
         };
         match command {
-            Some(TimerCommand::Schedule { schedule, response }) => {
-                let _ = response.send(core.schedule(schedule));
+            Some(TimerCommand::Schedule(schedule)) => {
+                let token = schedule.token().clone();
+                let operation_id = schedule.operation_id();
+                let session_generation = schedule.session_generation();
+                let result = core
+                    .schedule(schedule)
+                    .map(|()| TimerCommandOutcome::Scheduled);
+                let completed = TimerCommandCompleted {
+                    token,
+                    operation_id,
+                    session_generation,
+                    command: TimerCommandKind::Schedule,
+                    result,
+                };
+                if events
+                    .send(TimerRuntimeEvent::CommandCompleted(completed))
+                    .is_err()
+                {
+                    core.close();
+                    return;
+                }
             }
-            Some(TimerCommand::Reschedule { schedule, response }) => {
-                let _ = response.send(core.reschedule(schedule));
+            Some(TimerCommand::Reschedule(schedule)) => {
+                let token = schedule.token().clone();
+                let operation_id = schedule.operation_id();
+                let session_generation = schedule.session_generation();
+                let result = core
+                    .reschedule(schedule)
+                    .map(TimerCommandOutcome::Rescheduled);
+                let completed = TimerCommandCompleted {
+                    token,
+                    operation_id,
+                    session_generation,
+                    command: TimerCommandKind::Reschedule,
+                    result,
+                };
+                if events
+                    .send(TimerRuntimeEvent::CommandCompleted(completed))
+                    .is_err()
+                {
+                    core.close();
+                    return;
+                }
             }
-            Some(TimerCommand::Cancel { token, response }) => {
-                let _ = response.send(core.cancel(&token));
+            Some(TimerCommand::Cancel(cancellation)) => {
+                let result = core
+                    .cancel(cancellation.token())
+                    .map(TimerCommandOutcome::Cancelled);
+                let completed = TimerCommandCompleted {
+                    token: cancellation.token,
+                    operation_id: cancellation.operation_id,
+                    session_generation: cancellation.session_generation,
+                    command: TimerCommandKind::Cancel,
+                    result,
+                };
+                if events
+                    .send(TimerRuntimeEvent::CommandCompleted(completed))
+                    .is_err()
+                {
+                    core.close();
+                    return;
+                }
             }
             Some(TimerCommand::Shutdown) => break,
             None => {}
@@ -568,12 +724,14 @@ fn run_timer_runtime<T: DeadlineIdentity>(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc;
     use std::thread;
     use std::time::{Duration, Instant};
 
     use super::{
-        DeadlineIdentity, DeadlineKind, DeadlineModule, DeadlineSchedule, DeadlineToken, TimerCore,
-        TimerCoreError, TimerRuntime, TimerSubmitError,
+        DeadlineCancellation, DeadlineIdentity, DeadlineKind, DeadlineModule, DeadlineSchedule,
+        DeadlineToken, TimerCommandKind, TimerCommandOutcome, TimerCore, TimerCoreError,
+        TimerRuntime, TimerRuntimeEvent, TimerSubmitError,
     };
     use crate::runtime::clock::{Clock, ManualClock};
     use crate::runtime::identity::{BusinessOperationId, SessionGeneration};
@@ -616,6 +774,19 @@ mod tests {
             BusinessOperationId::new(operation),
             SessionGeneration::new(generation),
             deadline,
+        )
+    }
+
+    fn runtime(
+        queue_capacity: usize,
+    ) -> (
+        TimerRuntime<Token>,
+        mpsc::Receiver<TimerRuntimeEvent<Token>>,
+    ) {
+        let (event_sender, events) = mpsc::sync_channel(queue_capacity);
+        (
+            TimerRuntime::start(queue_capacity, event_sender).unwrap(),
+            events,
         )
     }
 
@@ -744,6 +915,18 @@ mod tests {
     }
 
     #[test]
+    fn stable_order_exhaustion_is_explicit_and_does_not_insert_the_schedule() {
+        let mut core = TimerCore::new();
+        core.next_order = u64::MAX;
+
+        assert_eq!(
+            core.schedule(schedule(token(1), 1, 0, Instant::now())),
+            Err(TimerCoreError::StableOrderExhausted)
+        );
+        assert!(core.is_empty());
+    }
+
+    #[test]
     fn close_returns_pending_in_due_order_and_rejects_further_work() {
         let start = Instant::now();
         let mut core = TimerCore::new();
@@ -785,24 +968,23 @@ mod tests {
 
     #[test]
     fn runtime_emits_equal_deadlines_in_schedule_order_without_dropping_events() {
-        let runtime = TimerRuntime::start(1).unwrap();
+        let (runtime, event_receiver) = runtime(8);
         let handle = runtime.handle();
         let deadline = Instant::now() + Duration::from_millis(60);
         for id in [4, 1, 9] {
             handle
                 .schedule(schedule(token(id), id, 0, deadline))
-                .unwrap()
-                .wait()
-                .unwrap()
                 .unwrap();
         }
 
-        let expired = (0..3)
-            .map(|_| {
-                runtime
-                    .expired()
-                    .recv_timeout(Duration::from_secs(1))
-                    .unwrap()
+        let events = (0..6)
+            .map(|_| event_receiver.recv_timeout(Duration::from_secs(1)).unwrap())
+            .collect::<Vec<_>>();
+        let expired = events
+            .iter()
+            .filter_map(|event| match event {
+                TimerRuntimeEvent::DeadlineExpired(event) => Some(event),
+                TimerRuntimeEvent::CommandCompleted(_) => None,
             })
             .collect::<Vec<_>>();
 
@@ -818,7 +1000,7 @@ mod tests {
 
     #[test]
     fn earlier_reschedule_wakes_a_worker_waiting_for_a_later_deadline() {
-        let runtime = TimerRuntime::start(2).unwrap();
+        let (runtime, event_receiver) = runtime(2);
         let handle = runtime.handle();
         let started = Instant::now();
         handle
@@ -828,24 +1010,41 @@ mod tests {
                 0,
                 started + Duration::from_millis(600),
             ))
-            .unwrap()
-            .wait()
-            .unwrap()
             .unwrap();
+        assert!(matches!(
+            event_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            TimerRuntimeEvent::CommandCompleted(completed)
+                if completed.result() == &Ok(TimerCommandOutcome::Scheduled)
+        ));
         thread::sleep(Duration::from_millis(10));
         let earlier = Instant::now() + Duration::from_millis(60);
 
         handle
             .reschedule(schedule(token(1), 2, 1, earlier))
-            .unwrap()
-            .wait()
-            .unwrap()
             .unwrap();
+        assert!(matches!(
+            event_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            TimerRuntimeEvent::CommandCompleted(completed)
+                if completed.operation_id() == BusinessOperationId::new(2)
+                    && completed.session_generation() == SessionGeneration::new(1)
+                    && matches!(
+                        completed.result(),
+                        Ok(TimerCommandOutcome::Rescheduled(previous))
+                            if previous.operation_id() == BusinessOperationId::new(1)
+                                && previous.session_generation() == SessionGeneration::INITIAL
+                    )
+        ));
 
-        let expired = runtime
-            .expired()
+        let TimerRuntimeEvent::DeadlineExpired(expired) = event_receiver
             .recv_timeout(Duration::from_millis(300))
-            .unwrap();
+            .unwrap()
+        else {
+            panic!("rescheduled deadline should expire after its completion event")
+        };
         assert_eq!(expired.token(), &token(1));
         assert_eq!(expired.operation_id(), BusinessOperationId::new(2));
         assert_eq!(expired.session_generation(), SessionGeneration::new(1));
@@ -855,7 +1054,7 @@ mod tests {
 
     #[test]
     fn runtime_cancel_prevents_the_deadline_event() {
-        let runtime = TimerRuntime::start(2).unwrap();
+        let (runtime, event_receiver) = runtime(2);
         let handle = runtime.handle();
         handle
             .schedule(schedule(
@@ -864,17 +1063,31 @@ mod tests {
                 0,
                 Instant::now() + Duration::from_millis(60),
             ))
-            .unwrap()
-            .wait()
-            .unwrap()
+            .unwrap();
+        handle
+            .cancel(DeadlineCancellation::new(
+                token(1),
+                BusinessOperationId::new(2),
+                SessionGeneration::INITIAL,
+            ))
             .unwrap();
 
-        let cancelled = handle.cancel(token(1)).unwrap().wait().unwrap().unwrap();
-
-        assert!(cancelled.is_some());
+        let events = (0..2)
+            .map(|_| event_receiver.recv_timeout(Duration::from_secs(1)).unwrap())
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            &events[1],
+            TimerRuntimeEvent::CommandCompleted(completed)
+                if completed.operation_id() == BusinessOperationId::new(2)
+                    && matches!(
+                        completed.result(),
+                        Ok(TimerCommandOutcome::Cancelled(Some(previous)))
+                            if previous.operation_id() == BusinessOperationId::new(1)
+                                && previous.session_generation() == SessionGeneration::INITIAL
+                    )
+        ));
         assert!(
-            runtime
-                .expired()
+            event_receiver
                 .recv_timeout(Duration::from_millis(120))
                 .is_err()
         );
@@ -883,7 +1096,7 @@ mod tests {
 
     #[test]
     fn shutdown_closes_handles_without_panicking() {
-        let runtime = TimerRuntime::<Token>::start(1).unwrap();
+        let (runtime, _events) = runtime(1);
         let handle = runtime.handle();
 
         runtime.shutdown().unwrap();
@@ -896,28 +1109,42 @@ mod tests {
 
     #[test]
     fn full_command_queue_is_reported_while_expired_events_apply_backpressure() {
-        let runtime = TimerRuntime::start(1).unwrap();
+        let (runtime, event_receiver) = runtime(1);
         let handle = runtime.handle();
         handle
             .schedule(schedule(token(1), 1, 0, Instant::now()))
-            .unwrap()
-            .wait()
-            .unwrap()
             .unwrap();
+        assert!(matches!(
+            event_receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            TimerRuntimeEvent::CommandCompleted(_)
+        ));
         handle
-            .schedule(schedule(token(2), 2, 0, Instant::now()))
-            .unwrap()
-            .wait()
-            .unwrap()
-            .unwrap();
-        let queued = handle
             .schedule(schedule(
-                token(3),
-                3,
+                token(2),
+                2,
                 0,
                 Instant::now() + Duration::from_secs(1),
             ))
             .unwrap();
+        let submit_by = Instant::now() + Duration::from_secs(1);
+        loop {
+            match handle.schedule(schedule(
+                token(3),
+                3,
+                0,
+                Instant::now() + Duration::from_secs(1),
+            )) {
+                Ok(()) => break,
+                Err(TimerSubmitError::QueueFull) => {
+                    assert!(
+                        Instant::now() < submit_by,
+                        "timer worker did not take token 2"
+                    );
+                    thread::yield_now();
+                }
+                Err(TimerSubmitError::RuntimeStopped) => panic!("timer stopped unexpectedly"),
+            }
+        }
 
         assert!(matches!(
             handle.schedule(schedule(
@@ -928,23 +1155,76 @@ mod tests {
             )),
             Err(TimerSubmitError::QueueFull)
         ));
-        assert_eq!(
-            runtime
-                .expired()
+        assert!(matches!(
+            event_receiver
                 .recv_timeout(Duration::from_secs(1))
-                .unwrap()
-                .token(),
-            &token(1)
-        );
-        assert_eq!(
-            runtime
-                .expired()
-                .recv_timeout(Duration::from_secs(1))
-                .unwrap()
-                .token(),
-            &token(2)
-        );
-        queued.wait().unwrap().unwrap();
+                .unwrap(),
+            TimerRuntimeEvent::DeadlineExpired(event) if event.token() == &token(1)
+        ));
+        for _ in 0..2 {
+            assert!(matches!(
+                event_receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+                TimerRuntimeEvent::CommandCompleted(_)
+            ));
+        }
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn runtime_core_errors_are_correlated_typed_events_instead_of_waitable_acks() {
+        let (runtime, event_receiver) = runtime(8);
+        let handle = runtime.handle();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        handle
+            .schedule(schedule(token(1), 11, 2, deadline))
+            .unwrap();
+        handle
+            .schedule(schedule(token(1), 12, 3, deadline))
+            .unwrap();
+        handle
+            .reschedule(schedule(token(2), 13, 4, deadline))
+            .unwrap();
+        handle
+            .cancel(DeadlineCancellation::new(
+                token(3),
+                BusinessOperationId::new(14),
+                SessionGeneration::new(5),
+            ))
+            .unwrap();
+
+        let completions = (0..4)
+            .map(|_| event_receiver.recv_timeout(Duration::from_secs(1)).unwrap())
+            .collect::<Vec<_>>();
+
+        assert!(matches!(
+            &completions[0],
+            TimerRuntimeEvent::CommandCompleted(completed)
+                if completed.command() == TimerCommandKind::Schedule
+                    && completed.operation_id() == BusinessOperationId::new(11)
+                    && completed.session_generation() == SessionGeneration::new(2)
+                    && completed.result() == &Ok(TimerCommandOutcome::Scheduled)
+        ));
+        assert!(matches!(
+            &completions[1],
+            TimerRuntimeEvent::CommandCompleted(completed)
+                if completed.operation_id() == BusinessOperationId::new(12)
+                    && completed.result() == &Err(TimerCoreError::TokenAlreadyScheduled)
+        ));
+        assert!(matches!(
+            &completions[2],
+            TimerRuntimeEvent::CommandCompleted(completed)
+                if completed.command() == TimerCommandKind::Reschedule
+                    && completed.operation_id() == BusinessOperationId::new(13)
+                    && completed.result() == &Err(TimerCoreError::TokenNotScheduled)
+        ));
+        assert!(matches!(
+            &completions[3],
+            TimerRuntimeEvent::CommandCompleted(completed)
+                if completed.command() == TimerCommandKind::Cancel
+                    && completed.operation_id() == BusinessOperationId::new(14)
+                    && completed.session_generation() == SessionGeneration::new(5)
+                    && completed.result() == &Ok(TimerCommandOutcome::Cancelled(None))
+        ));
         runtime.shutdown().unwrap();
     }
 }

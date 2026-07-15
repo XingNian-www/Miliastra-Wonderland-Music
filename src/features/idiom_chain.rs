@@ -8,8 +8,27 @@ use pinyin::ToPinyin;
 use serde::{Deserialize, Serialize};
 
 use super::entertainment::{AcquireOutcome, EntertainmentCoordinator, EntertainmentKind};
+use crate::runtime::timer::{DeadlineKind, DeadlineModule, DeadlineToken};
 
 const PROJECT_IDIOM_ASSET_PATH: &str = "assets/idioms.txt";
+
+#[derive(Debug)]
+pub struct IdiomChainDeadlineModule;
+
+impl DeadlineModule for IdiomChainDeadlineModule {
+    const NAME: &'static str = "idiom-chain";
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum IdiomChainDeadlineKind {
+    SessionIdle,
+}
+
+impl DeadlineKind for IdiomChainDeadlineKind {
+    type Module = IdiomChainDeadlineModule;
+}
+
+pub type IdiomChainDeadlineToken = DeadlineToken<IdiomChainDeadlineKind>;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]

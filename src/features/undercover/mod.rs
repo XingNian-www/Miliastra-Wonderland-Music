@@ -10,7 +10,8 @@ mod service;
 
 use super::chat_text::display_width;
 pub use service::{
-    UndercoverCommandContext, UndercoverCommandSource, UndercoverDeliveryPort, UndercoverService,
+    UndercoverCommandContext, UndercoverCommandSource, UndercoverDeliveryPort,
+    UndercoverDeliveryTask, UndercoverService,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

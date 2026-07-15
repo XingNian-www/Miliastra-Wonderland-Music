@@ -281,7 +281,7 @@ impl<B: MusicPlayerBackend> PlayerController<B> {
             return Ok(false);
         }
         if status.status == "playing" {
-            return Ok(true);
+            return Ok(!status.current_uri.trim().is_empty());
         }
         if status.status == "paused"
             && (playback_remaining_seconds(status).is_some()
@@ -293,9 +293,13 @@ impl<B: MusicPlayerBackend> PlayerController<B> {
         if playback.active_request.is_none() {
             return Ok(false);
         }
-        if status_matches_active_request(&self.matching, playback.active_request.as_ref(), status)
-            || active_request_guard_active(&self.timing, playback.active_request.as_ref())
-        {
+        if status_matches_active_request(&self.matching, playback.active_request.as_ref(), status) {
+            return Ok(true);
+        }
+        if status.current_uri.trim().is_empty() {
+            return Ok(false);
+        }
+        if active_request_guard_active(&self.timing, playback.active_request.as_ref()) {
             return Ok(true);
         }
         Ok(status.status != "stopped" && status.status != "stoped")
@@ -1386,6 +1390,21 @@ mod tests {
         assert_eq!(
             external_playback_identity(&status("外部歌", "", 1.0, 180.0)),
             None
+        );
+    }
+
+    #[test]
+    fn missing_uri_does_not_protect_the_current_song() {
+        let controller = controller(FakeBackend::new(vec![]));
+        let request = request();
+        controller
+            .accept_mismatch(&request, &status("目标", request.uri.as_str(), 1.0, 180.0))
+            .unwrap();
+
+        assert!(
+            !controller
+                .should_queue_until_current_song_finished(&status("目标", "", 10.0, 180.0))
+                .unwrap()
         );
     }
 

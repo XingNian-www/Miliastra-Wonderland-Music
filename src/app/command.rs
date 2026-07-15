@@ -113,6 +113,48 @@ pub struct PendingCommand {
     pub parsed: ParsedCommand,
 }
 
+/// A command submitted by a local control surface rather than read from chat.
+///
+/// Control surfaces should describe the business command and its display text; the chat-shaped
+/// envelope is created here at the command boundary so HTTP and other adapters do not fabricate
+/// `ParsedCommand` values independently.
+#[derive(Clone, Debug)]
+pub(crate) struct ConsoleCommandIntent {
+    matched: String,
+    raw: String,
+    command: UserCommand,
+}
+
+impl ConsoleCommandIntent {
+    pub(crate) fn new(
+        raw: impl Into<String>,
+        matched: impl Into<String>,
+        command: UserCommand,
+    ) -> Self {
+        Self {
+            matched: matched.into(),
+            raw: raw.into(),
+            command,
+        }
+    }
+
+    pub(crate) fn into_pending(self) -> PendingCommand {
+        let user_command = format!("@{}", self.raw);
+        let parsed = ParsedCommand {
+            matched: self.matched,
+            raw: self.raw,
+            user_command,
+            message_type: "控制台".to_string(),
+            username: "控制台".to_string(),
+            command: self.command,
+        };
+        PendingCommand {
+            lock_key: lock_key(&parsed),
+            parsed,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct CommandLock {
     command: ParsedCommand,

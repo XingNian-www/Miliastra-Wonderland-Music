@@ -2997,6 +2997,23 @@ mod tests {
     }
 
     fn http_get(address: SocketAddr, target: &str, access_token: Option<&str>) -> TestHttpResponse {
+        http_request(address, "GET", target, access_token)
+    }
+
+    fn http_post(
+        address: SocketAddr,
+        target: &str,
+        access_token: Option<&str>,
+    ) -> TestHttpResponse {
+        http_request(address, "POST", target, access_token)
+    }
+
+    fn http_request(
+        address: SocketAddr,
+        method: &str,
+        target: &str,
+        access_token: Option<&str>,
+    ) -> TestHttpResponse {
         let mut stream = TcpStream::connect(address).expect("connect to HTTP server");
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
@@ -3005,7 +3022,7 @@ mod tests {
             .map(|token| format!("X-Miliastra-Token: {token}\r\n"))
             .unwrap_or_default();
         let request = format!(
-            "GET {target} HTTP/1.1\r\nHost: localhost\r\n{token_header}Connection: close\r\n\r\n"
+            "{method} {target} HTTP/1.1\r\nHost: localhost\r\n{token_header}Content-Length: 0\r\nConnection: close\r\n\r\n"
         );
         stream
             .write_all(request.as_bytes())
@@ -3741,7 +3758,7 @@ workflows:
 
     #[test]
     fn canceling_card_game_timeout_releases_entertainment_session() {
-        let state = test_state();
+        let mut state = test_state();
         let entertainment = EntertainmentCoordinator::new();
         let service = crate::features::card_games::CardGameService::new(
             crate::features::card_games::LandlordConfig {
@@ -3818,12 +3835,37 @@ workflows:
             )),
         )
         .expect("enqueue card game delivery");
+        let server = start_test_http_server(&mut state, "secret");
+        let target = format!("/tasks/cancel?id={}", receipt.task_id);
 
-        task_cancel_route(&[("id".to_string(), receipt.task_id.to_string())], &state)
-            .expect("cancel card game delivery");
+        let unauthenticated = http_post(server.local_addr(), &target, None);
+        assert_eq!(unauthenticated.status_line, "HTTP/1.1 401 Unauthorized");
+        assert_eq!(
+            entertainment.active(),
+            Some(crate::features::entertainment::EntertainmentKind::Landlord)
+        );
+
+        let wrong_method = http_get(server.local_addr(), &target, Some("secret"));
+        assert_eq!(wrong_method.status_line, "HTTP/1.1 405 Method Not Allowed");
+        assert_eq!(
+            entertainment.active(),
+            Some(crate::features::entertainment::EntertainmentKind::Landlord)
+        );
+
+        let canceled = http_post(server.local_addr(), &target, Some("secret"));
+        assert_eq!(canceled.status_line, "HTTP/1.1 200 OK");
+        assert_eq!(
+            canceled.headers.get("content-type").map(String::as_str),
+            Some("application/json; charset=utf-8")
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&canceled.body).expect("cancel response JSON")["ok"],
+            true
+        );
 
         assert_eq!(entertainment.active(), None);
         assert!(!business.abort_card_game().expect("query remaining game"));
+        server.shutdown().expect("shutdown HTTP server");
         runtime.shutdown().expect("shutdown business runtime");
     }
 

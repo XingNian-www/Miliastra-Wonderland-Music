@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -93,14 +92,16 @@ pub struct IdiomChainGame {
     session: Option<IdiomChainSession>,
 }
 
-#[derive(Clone)]
-pub struct IdiomChainService {
-    game: Arc<Mutex<IdiomChainGame>>,
+pub(crate) struct IdiomChainService {
+    game: IdiomChainGame,
     entertainment: EntertainmentCoordinator,
 }
 
 impl IdiomChainService {
-    pub fn load(config: IdiomChainConfig, entertainment: EntertainmentCoordinator) -> Result<Self> {
+    pub(crate) fn load(
+        config: IdiomChainConfig,
+        entertainment: EntertainmentCoordinator,
+    ) -> Result<Self> {
         Ok(Self::from_game(
             IdiomChainGame::load(config)?,
             entertainment,
@@ -109,16 +110,20 @@ impl IdiomChainService {
 
     fn from_game(game: IdiomChainGame, entertainment: EntertainmentCoordinator) -> Self {
         Self {
-            game: Arc::new(Mutex::new(game)),
+            game,
             entertainment,
         }
     }
 
-    pub fn lexicon_len(&self) -> Result<usize> {
-        Ok(self.game()?.lexicon_len())
+    pub(crate) fn lexicon_len(&self) -> usize {
+        self.game.lexicon_len()
     }
 
-    pub fn handle(&self, player: &str, command: &IdiomChainCommand) -> Result<IdiomChainOutcome> {
+    pub(crate) fn handle(
+        &mut self,
+        player: &str,
+        command: &IdiomChainCommand,
+    ) -> Result<IdiomChainOutcome> {
         if self.entertainment.active() == Some(EntertainmentKind::TurtleSoup) {
             return Ok(outcome(
                 "occupied",
@@ -143,7 +148,7 @@ impl IdiomChainService {
             false
         };
 
-        let outcome = self.game()?.handle(player, command);
+        let outcome = self.game.handle(player, command);
         if acquired_for_start && outcome.action != "started" {
             self.entertainment.release(EntertainmentKind::IdiomChain);
         }
@@ -153,30 +158,49 @@ impl IdiomChainService {
         Ok(outcome)
     }
 
-    pub fn explain(&self, player: &str, command: &IdiomChainCommand) -> Result<IdiomChainOutcome> {
-        Ok(self.game()?.handle(player, command))
+    pub(crate) fn explain(
+        &mut self,
+        player: &str,
+        command: &IdiomChainCommand,
+    ) -> Result<IdiomChainOutcome> {
+        Ok(self.game.handle(player, command))
     }
 
-    pub fn abort(&self) -> Result<bool> {
-        let aborted = self.game()?.abort();
+    pub(crate) fn abort(&mut self) -> Result<bool> {
+        let aborted = self.game.abort();
         if aborted {
             self.entertainment.release(EntertainmentKind::IdiomChain);
         }
         Ok(aborted)
     }
 
-    pub fn expire_idle_now(&self) -> Result<bool> {
-        let expired = self.game()?.expire_idle_now();
+    pub(crate) fn expire_idle_now(&mut self) -> Result<bool> {
+        let expired = self.game.expire_idle_now();
         if expired {
             self.entertainment.release(EntertainmentKind::IdiomChain);
         }
         Ok(expired)
     }
 
-    fn game(&self) -> Result<std::sync::MutexGuard<'_, IdiomChainGame>> {
-        self.game
-            .lock()
-            .map_err(|_| anyhow::anyhow!("idiom chain mutex poisoned"))
+    #[cfg(test)]
+    pub(crate) fn from_entries_for_test(
+        entries: &[&str],
+        entertainment: EntertainmentCoordinator,
+        idle_timeout: Option<Duration>,
+    ) -> Self {
+        Self::from_game(
+            IdiomChainGame {
+                enabled: true,
+                lexicon: IdiomLexicon::from_entries(entries.iter().map(|entry| entry.to_string()))
+                    .expect("valid test lexicon"),
+                history_limit: 200,
+                idle_timeout,
+                allow_consecutive_player: false,
+                allow_anyone_stop: false,
+                session: None,
+            },
+            entertainment,
+        )
     }
 }
 
@@ -742,7 +766,7 @@ mod tests {
     #[test]
     fn application_service_releases_entertainment_after_an_invalid_start() {
         let entertainment = EntertainmentCoordinator::new();
-        let service =
+        let mut service =
             IdiomChainService::from_game(game(&["画蛇添足", "足智多谋"]), entertainment.clone());
 
         let outcome = service

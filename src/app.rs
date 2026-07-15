@@ -5160,23 +5160,6 @@ impl AutomationApp {
                             self.reply(&format!("当前正在播放: {}", request.keyword))?;
                             return Ok(());
                         }
-                        if !request.skip_match_check {
-                            let current_match = song_matcher::match_song_query(
-                                &self.config.matching,
-                                request.match_keyword(),
-                                &status.name,
-                                &status.singer,
-                                request.prefer_accompaniment,
-                            );
-                            if current_match.ok {
-                                self.log_executed_command(
-                                    parsed,
-                                    &final_song_command_text(&request, "already-playing"),
-                                )?;
-                                self.reply(&format!("当前正在播放: {}", request.keyword))?;
-                                return Ok(());
-                            }
-                        }
                         if self
                             .player
                             .should_queue_until_current_song_finished(&status)?
@@ -5971,36 +5954,6 @@ impl AutomationApp {
                     &mismatch.local_reason,
                     allow_switch_source,
                 )? {
-                    MismatchDecision::Accept => {
-                        match self.player.accept_mismatch(request, &mismatch.status)? {
-                            PlaybackVerification::Success { status, message } => {
-                                if confirm_after_switch {
-                                    match self.confirm_switched_source_result(&status)? {
-                                        UserDecision::Skip => {
-                                            self.player
-                                                .reject_mismatch_as_no_source(Some(&status))?;
-                                            self.report_no_source(Some(&status), false)?;
-                                            self.update_monitor_playback_controller();
-                                            return Ok(PlaybackOutcome::NoSource);
-                                        }
-                                        UserDecision::Stopped => {
-                                            return Ok(PlaybackOutcome::Error);
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                                self.reply(&message)?;
-                                self.update_monitor_playback_controller();
-                                Ok(PlaybackOutcome::Success)
-                            }
-                            PlaybackVerification::NoSource => {
-                                self.report_no_source(Some(&mismatch.status), true)?;
-                                self.update_monitor_playback_controller();
-                                Ok(PlaybackOutcome::NoSource)
-                            }
-                            _ => Ok(PlaybackOutcome::Error),
-                        }
-                    }
                     MismatchDecision::NoSource => {
                         self.player
                             .reject_mismatch_as_no_source(Some(&mismatch.status))?;
@@ -6013,7 +5966,6 @@ impl AutomationApp {
                         &request.source,
                         request.prefer_accompaniment,
                     ),
-                    MismatchDecision::Error => Ok(PlaybackOutcome::Error),
                 }
             }
         }
@@ -6027,45 +5979,15 @@ impl AutomationApp {
         allow_switch_source: bool,
     ) -> Result<MismatchDecision> {
         log::info!("歌曲暂不匹配: {}", local_reason);
-        if self.ai.enabled() {
-            match self
-                .ai
-                .match_same_song(&request.match_keyword, &status.name, &status.singer)
-            {
-                Ok(ai_match) if ai_match.matched => {
-                    log::info!(
-                        "AI自动匹配通过: {} score={}",
-                        ai_match.reason,
-                        ai_match.score
-                    );
-                    return Ok(
-                        match self.confirm_ai_auto_match(status, allow_switch_source)? {
-                            UserDecision::Skip => MismatchDecision::NoSource,
-                            UserDecision::SwitchSource if allow_switch_source => {
-                                MismatchDecision::SwitchSource
-                            }
-                            UserDecision::Stopped => MismatchDecision::Error,
-                            _ => MismatchDecision::Accept,
-                        },
-                    );
-                }
-                Ok(ai_match) => {
-                    log::info!("AI判断不是同一首: {}", ai_match.reason);
-                }
-                Err(error) => {
-                    log::info!("AI判断异常，回退到人工确认: {error:#}");
-                }
-            }
+        if request.uri.trim().is_empty() || status.current_uri.trim().is_empty() {
+            log::info!("播放确认缺少 URI，拒绝使用歌名或歌手兜底");
+            return Ok(MismatchDecision::NoSource);
         }
-
-        Ok(match self.confirm_song(status, allow_switch_source)? {
-            UserDecision::PromptFailed | UserDecision::Stopped => MismatchDecision::Error,
-            UserDecision::SwitchSource if allow_switch_source => MismatchDecision::SwitchSource,
-            UserDecision::Timeout => MismatchDecision::NoSource,
-            UserDecision::Confirm => MismatchDecision::Accept,
-            UserDecision::Skip => MismatchDecision::NoSource,
-            _ => MismatchDecision::NoSource,
-        })
+        if allow_switch_source {
+            Ok(MismatchDecision::SwitchSource)
+        } else {
+            Ok(MismatchDecision::NoSource)
+        }
     }
 
     fn switch_source_and_play(
@@ -6121,48 +6043,6 @@ impl AutomationApp {
             return Ok(UserDecision::Timeout);
         }
         self.wait_for_decision(false, false, true)
-    }
-
-    fn confirm_song(
-        &mut self,
-        status: &PlayerStatus,
-        allow_switch_source: bool,
-    ) -> Result<UserDecision> {
-        let actions = if allow_switch_source {
-            "@确认@跳过@换源"
-        } else {
-            "@确认@跳过"
-        };
-        let message = format!(
-            "匹配失败:{},{}",
-            song_title(&status.name, &status.singer),
-            actions
-        );
-        if self.reply(&message).is_err() {
-            return Ok(UserDecision::PromptFailed);
-        }
-        self.wait_for_decision(allow_switch_source, false, false)
-    }
-
-    fn confirm_ai_auto_match(
-        &mut self,
-        status: &PlayerStatus,
-        allow_switch_source: bool,
-    ) -> Result<UserDecision> {
-        let actions = if allow_switch_source {
-            "@跳过@换源"
-        } else {
-            "@跳过"
-        };
-        let message = format!(
-            "AI自动匹配:{},如非预期可{}",
-            song_title(&status.name, &status.singer),
-            actions
-        );
-        if self.reply(&message).is_err() {
-            return Ok(UserDecision::Timeout);
-        }
-        self.wait_for_decision(allow_switch_source, false, true)
     }
 
     fn wait_for_decision(

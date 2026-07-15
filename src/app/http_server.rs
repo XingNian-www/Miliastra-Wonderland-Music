@@ -25,9 +25,9 @@ use url::form_urlencoded;
 
 use super::ai;
 use super::chat_listener::{ChatListenerMode, ChatListenerShared};
-use super::command::{
-    self, ConsoleCommandIntent, PendingCommand, SongCommand, SongSource, UserCommand,
-};
+#[cfg(test)]
+use super::command;
+use super::command::{ConsoleCommandIntent, PendingCommand, SongCommand, SongSource, UserCommand};
 use super::custom_workflow;
 use super::decision_control::{DecisionAction, DecisionControlShared};
 #[cfg(test)]
@@ -3802,7 +3802,7 @@ workflows:
             crate::features::card_games::CardGameResume::Completed(_)
         ));
         let outcome = business
-            .tick_card_game(started_at + std::time::Duration::from_secs(2), true)
+            .poll_card_game_timed_outcome(started_at + std::time::Duration::from_secs(2), true)
             .expect("tick card game")
             .expect("lobby timeout");
         let action = outcome.action();

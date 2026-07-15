@@ -2767,7 +2767,10 @@ impl AutomationApp {
         self.turtle_soup.tick();
         let clock_active = !self.paused.load(AtomicOrdering::SeqCst)
             && !self.command_executing.load(AtomicOrdering::SeqCst);
-        let card_game_outcome = match self.business.tick_card_game(Instant::now(), clock_active) {
+        let card_game_outcome = match self
+            .business
+            .poll_card_game_timed_outcome(Instant::now(), clock_active)
+        {
             Ok(outcome) => outcome,
             Err(error) => {
                 log::error!("无法推进牌局回合计时: {error:#}");

@@ -49,13 +49,25 @@ pub(super) struct SecondaryChatObservation {
 
 #[derive(Clone)]
 enum ChatObservation {
-    Primary(Vec<PrimaryObservedMessage>),
-    Secondary(SecondaryChatObservation),
+    Primary {
+        frame: ObservedFrame,
+        messages: Vec<PrimaryObservedMessage>,
+    },
+    Secondary {
+        frame: ObservedFrame,
+        observation: SecondaryChatObservation,
+    },
 }
 
 pub(super) enum ChatObservationDispatch {
-    Primary(Vec<PrimaryObservedMessage>),
-    Secondary(SecondaryChatObservation),
+    Primary {
+        frame: ObservedFrame,
+        messages: Vec<PrimaryObservedMessage>,
+    },
+    Secondary {
+        frame: ObservedFrame,
+        observation: SecondaryChatObservation,
+    },
     Gap(ObservationGap),
 }
 
@@ -117,8 +129,13 @@ impl ChatObservationShared {
             .lock()
             .map_err(|_| anyhow!("聊天观察流状态锁已损坏"))?;
         if messages.is_empty() {
-            let dispatches =
-                Self::publish_locked(&mut state, ChatObservation::Primary(Vec::new()))?;
+            let dispatches = Self::publish_locked(
+                &mut state,
+                ChatObservation::Primary {
+                    frame,
+                    messages: Vec::new(),
+                },
+            )?;
             Self::complete_success(&mut state, frame.id())?;
             return Ok(dispatches);
         }
@@ -148,7 +165,13 @@ impl ChatObservationShared {
                 visual: observed.message.visual.clone(),
             })
             .collect();
-        let dispatches = Self::publish_locked(&mut state, ChatObservation::Primary(observed))?;
+        let dispatches = Self::publish_locked(
+            &mut state,
+            ChatObservation::Primary {
+                frame,
+                messages: observed,
+            },
+        )?;
         Self::complete_success(&mut state, frame.id())?;
         Ok(dispatches)
     }
@@ -189,12 +212,15 @@ impl ChatObservationShared {
         }
         let dispatches = Self::publish_locked(
             &mut state,
-            ChatObservation::Secondary(SecondaryChatObservation {
-                message_type: message_type.to_string(),
-                friend_name: friend_name.to_string(),
-                accepts_turtle_questions,
-                messages: observed,
-            }),
+            ChatObservation::Secondary {
+                frame,
+                observation: SecondaryChatObservation {
+                    message_type: message_type.to_string(),
+                    friend_name: friend_name.to_string(),
+                    accepts_turtle_questions,
+                    messages: observed,
+                },
+            },
         )?;
         Self::complete_success(&mut state, frame.id())?;
         Ok(dispatches)
@@ -219,11 +245,11 @@ impl ChatObservationShared {
             match router.read_next(business) {
                 Some(ObservationRead::Item { value, .. }) => {
                     dispatches.push(match Arc::unwrap_or_clone(value) {
-                        ChatObservation::Primary(messages) => {
-                            ChatObservationDispatch::Primary(messages)
+                        ChatObservation::Primary { frame, messages } => {
+                            ChatObservationDispatch::Primary { frame, messages }
                         }
-                        ChatObservation::Secondary(observation) => {
-                            ChatObservationDispatch::Secondary(observation)
+                        ChatObservation::Secondary { frame, observation } => {
+                            ChatObservationDispatch::Secondary { frame, observation }
                         }
                     });
                 }
@@ -572,7 +598,7 @@ mod tests {
     }
 
     fn primary_id(dispatches: &[ChatObservationDispatch]) -> ObservedChatMessageId {
-        let ChatObservationDispatch::Primary(messages) = &dispatches[0] else {
+        let ChatObservationDispatch::Primary { messages, .. } = &dispatches[0] else {
             panic!("primary observation was not dispatched");
         };
         messages[0].id.clone()

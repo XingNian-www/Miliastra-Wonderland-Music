@@ -22,15 +22,17 @@ flowchart TD
     D --> E["写 .bak-* 备份"]
     D --> F["写回新 config.yaml"]
     C -->|否| G["直接解析配置"]
-    F --> H["创建 MonitorShared"]
+    E --> H["AppConfig::validate"]
+    F --> H
     G --> H
-    H --> I["可选启动 TUI"]
-    H --> J["初始化 logger"]
-    J --> K["主日志"]
-    J --> L["性能日志"]
-    J --> M["MonitorShared.logs"]
-    H --> N["HTTP /monitor"]
-    H --> O["TUI 渲染"]
+    H --> I["创建 MonitorShared"]
+    I --> J["可选启动 TUI"]
+    I --> K["初始化 logger"]
+    K --> L["主日志"]
+    K --> M["性能日志"]
+    K --> N["MonitorShared.logs"]
+    I --> O["HTTP /monitor"]
+    I --> P["TUI 渲染"]
 ```
 
 ## 相关文件
@@ -50,16 +52,17 @@ flowchart TD
 常驻模式进入 `run_automation()` 后按顺序执行：
 
 1. `AppConfig::load_or_create(config_path)` 读取配置。
-2. 创建 `MonitorShared`，日志容量来自 `tui.log_lines`，最低保留 20 行。
-3. 如果 `tui.enabled = true` 且 stdout 是交互终端，启动 TUI。
-4. 初始化 logger，并把 `monitor.log_sink()` 传进去。
-5. 写启动日志：主日志路径、性能日志路径、配置路径、HTTP 面板、FeelUOwn 地址。
-6. 加载 `PersistentRuntimeState`。
-7. 启动时清理上次运行的大厅倒计时缓存。
-8. 加载 `PersistentQueue`。
-9. 加载 `PersistentSongDedupHistory`。
-10. 创建默认空闲的娱乐协调器、斗地主/谁是卧底状态和海龟汤服务；题库直到实际开局才读取。
-11. 创建 `AutomationApp` 并进入主运行逻辑。
+2. 调用 `AppConfig::validate()`，确认播放器运行时、队列容量、阈值、HTTP 监听和启用模块的必要配置有效。
+3. 创建 `MonitorShared`，日志容量来自 `tui.log_lines`，最低保留 20 行。
+4. 如果 `tui.enabled = true` 且 stdout 是交互终端，启动 TUI。
+5. 初始化 logger，并把 `monitor.log_sink()` 传进去。
+6. 写启动日志：主日志路径、性能日志路径、配置路径、HTTP 面板、FeelUOwn 地址。
+7. 加载 `PersistentRuntimeState`。
+8. 启动时清理上次运行的大厅倒计时缓存。
+9. 加载 `PersistentQueue`。
+10. 加载 `PersistentSongDedupHistory`。
+11. 创建默认空闲的娱乐协调器、斗地主/谁是卧底状态和海龟汤服务；题库直到实际开局才读取。
+12. 创建 `AutomationApp` 并进入主运行逻辑。
 
 如果 TUI 启动失败或当前不是交互终端，程序会回退到普通 stderr 日志输出。
 

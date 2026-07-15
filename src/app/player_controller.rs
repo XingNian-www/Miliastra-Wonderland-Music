@@ -4,7 +4,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow};
 
-use super::feeluown::{FeelUOwnClient, PlayerStatus, SearchCandidate};
+use super::feeluown::{FeelUOwnClient, PlayerStatus};
 use super::monitor::MonitorPlaybackController;
 use super::playback_format::{
     format_play_message, format_time, playback_progress_restarted, playback_remaining_seconds,
@@ -25,13 +25,6 @@ pub(super) trait MusicPlayerBackend: Clone + Send + Sync + 'static {
     fn next(&self) -> Result<String>;
     fn previous(&self) -> Result<String>;
     fn set_volume(&self, volume: &str) -> Result<String>;
-    fn search_candidates(&self, keyword: &str, source: &str) -> Result<Vec<SearchCandidate>>;
-    fn search_and_pick(
-        &self,
-        keyword: &str,
-        source: &str,
-        prefer_accompaniment: bool,
-    ) -> Result<Option<(SearchCandidate, String)>>;
 }
 
 impl MusicPlayerBackend for FeelUOwnClient {
@@ -61,19 +54,6 @@ impl MusicPlayerBackend for FeelUOwnClient {
 
     fn set_volume(&self, volume: &str) -> Result<String> {
         self.set_volume(volume)
-    }
-
-    fn search_candidates(&self, keyword: &str, source: &str) -> Result<Vec<SearchCandidate>> {
-        self.search_candidates(keyword, source)
-    }
-
-    fn search_and_pick(
-        &self,
-        keyword: &str,
-        source: &str,
-        prefer_accompaniment: bool,
-    ) -> Result<Option<(SearchCandidate, String)>> {
-        self.search_and_pick(keyword, source, prefer_accompaniment)
     }
 }
 
@@ -208,24 +188,6 @@ impl<B: MusicPlayerBackend> PlayerController<B> {
             song_dedup: song_dedup.clone(),
             external_playback_tracker: Arc::new(Mutex::new(ExternalPlaybackTracker::default())),
         }
-    }
-
-    pub(super) fn search_candidates(
-        &self,
-        keyword: &str,
-        source: &str,
-    ) -> Result<Vec<SearchCandidate>> {
-        self.backend.search_candidates(keyword, source)
-    }
-
-    pub(super) fn search_and_pick(
-        &self,
-        keyword: &str,
-        source: &str,
-        prefer_accompaniment: bool,
-    ) -> Result<Option<(SearchCandidate, String)>> {
-        self.backend
-            .search_and_pick(keyword, source, prefer_accompaniment)
     }
 
     pub(super) fn status(&self) -> Result<PlayerStatus> {
@@ -1322,19 +1284,6 @@ mod tests {
 
         fn set_volume(&self, _volume: &str) -> Result<String> {
             Ok(String::new())
-        }
-
-        fn search_candidates(&self, _keyword: &str, _source: &str) -> Result<Vec<SearchCandidate>> {
-            Ok(Vec::new())
-        }
-
-        fn search_and_pick(
-            &self,
-            _keyword: &str,
-            _source: &str,
-            _prefer_accompaniment: bool,
-        ) -> Result<Option<(SearchCandidate, String)>> {
-            Ok(None)
         }
     }
 

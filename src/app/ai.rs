@@ -7,8 +7,8 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, Header
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use super::feeluown::{FeelUOwnClient, SearchCandidate};
 use crate::config::{AiConfig, TimingConfig};
+use crate::runtime::player_io::SearchCandidate;
 
 const MIMO_ENDPOINT: &str = "https://api.xiaomimimo.com/v1/chat/completions";
 const MIMO_MODEL: &str = "mimo-v2.5";
@@ -37,13 +37,6 @@ pub struct AiCandidatePickResult {
     pub uri: String,
     pub reason: String,
     pub score: f64,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct AiSearchResult {
-    pub request: String,
-    pub candidates: Vec<SearchCandidate>,
-    pub pick: Option<AiCandidatePickResult>,
 }
 
 #[derive(Clone, Debug)]
@@ -128,28 +121,6 @@ impl AiClient {
         let json_text = model_reply_json_object(&reply)?;
         validate_candidate_pick_json(&json_text, &candidates)?;
         parse_candidate_pick_result(&json_text)
-    }
-
-    pub fn search_and_pick(
-        &self,
-        feeluown: &FeelUOwnClient,
-        keyword: &str,
-        prefer_accompaniment: bool,
-    ) -> Result<AiSearchResult> {
-        let candidates = feeluown.search_candidates(keyword, "")?;
-        if candidates.is_empty() {
-            return Ok(AiSearchResult {
-                request: keyword.to_string(),
-                candidates: Vec::new(),
-                pick: None,
-            });
-        }
-        let pick = self.pick_song_candidate(keyword, prefer_accompaniment, &candidates)?;
-        Ok(AiSearchResult {
-            request: keyword.to_string(),
-            candidates,
-            pick: Some(pick),
-        })
     }
 }
 

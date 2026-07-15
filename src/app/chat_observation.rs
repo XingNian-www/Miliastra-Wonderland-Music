@@ -7,13 +7,16 @@ use anyhow::{Result, anyhow};
 use super::change_detection::{ChangeFingerprint, change_stats};
 use super::chat_scan::ChatMessage;
 use crate::observation::chat::{
-    BubbleSequence, ChatIdentity, ChatObservationLedger, CompletionAdvance, FrameCompletionOutcome,
-    ObservationFrameId, ObservedChatMessageId, ObservedFrame, VisualSessionId,
+    BubbleSequence, ChatIdentity, ChatObservationLedger, CompletionAdvance,
+    ObservationCompletionEvent, ObservationFrameId, ObservedChatMessageId, ObservedFrame,
+    VisualSessionId,
 };
 use crate::observation::exclusive::{
     ExclusiveObservationRouter, ExclusiveSessionId, RoutedObservation,
 };
-use crate::observation::shared::{ObservationGap, ObservationRead, ObservationSubscriber};
+use crate::observation::shared::{
+    ObservationGap, ObservationRead, ObservationSubscriber, SharedObservationStream,
+};
 
 const SHARED_CHAT_HISTORY_CAPACITY: usize = 64;
 
@@ -65,6 +68,7 @@ struct ChatObservationState {
     change_mean_threshold: f32,
     change_pixel_threshold: f32,
     ledger: ChatObservationLedger,
+    completion_advances: SharedObservationStream<CompletionAdvance>,
 }
 
 struct PrimaryTrackedMessage {
@@ -95,6 +99,10 @@ impl ChatObservationShared {
                 change_mean_threshold,
                 change_pixel_threshold,
                 ledger: ChatObservationLedger::new(),
+                completion_advances: SharedObservationStream::new(
+                    NonZeroUsize::new(SHARED_CHAT_HISTORY_CAPACITY)
+                        .expect("shared chat history capacity is non-zero"),
+                ),
             })),
         }
     }
@@ -271,14 +279,35 @@ impl ChatObservationShared {
             .lock()
             .map_err(|_| anyhow!("聊天观察流状态锁已损坏"))?;
         let advance = state.ledger.complete_failure(frame.id(), reason)?;
-        log_completion_advance(&advance);
+        publish_completion_advance(&mut state, advance);
         Ok(())
     }
 
     fn complete_success(state: &mut ChatObservationState, frame: ObservationFrameId) -> Result<()> {
         let advance = state.ledger.complete_success(frame)?;
-        log_completion_advance(&advance);
+        publish_completion_advance(state, advance);
         Ok(())
+    }
+
+    pub(super) fn subscribe_completion_advances(&self) -> Result<CompletionAdvanceSubscriber> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("聊天观察流状态锁已损坏"))?;
+        Ok(CompletionAdvanceSubscriber {
+            inner: state.completion_advances.subscribe(),
+        })
+    }
+
+    pub(super) fn read_completion_advance(
+        &self,
+        subscriber: &mut CompletionAdvanceSubscriber,
+    ) -> Result<Option<ObservationRead<CompletionAdvance>>> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("聊天观察流状态锁已损坏"))?;
+        Ok(subscriber.inner.read_next(&state.completion_advances))
     }
 
     pub(super) fn begin_exclusive(&self) -> Result<ChatObservationExclusiveGuard> {
@@ -361,12 +390,12 @@ fn primary_visual_matches(
     stats.mean_abs_diff < mean_threshold && stats.changed_ratio < pixel_threshold
 }
 
-fn log_completion_advance(advance: &CompletionAdvance) {
-    for completed in advance.completed() {
-        if let FrameCompletionOutcome::TerminalFailure(reason) = completed.outcome() {
+fn publish_completion_advance(state: &mut ChatObservationState, advance: CompletionAdvance) {
+    for event in advance.events() {
+        if let ObservationCompletionEvent::TerminalFailure { frame, reason } = event {
             log::error!(
                 "聊天观察帧终止失败: frame={} reason={}",
-                completed.frame().id().get(),
+                frame.id().get(),
                 reason
             );
         }
@@ -377,7 +406,12 @@ fn log_completion_advance(advance: &CompletionAdvance) {
             watermark.completed_through.get(),
             watermark.captured_through.elapsed().as_millis()
         );
+        state.completion_advances.publish(advance);
     }
+}
+
+pub(super) struct CompletionAdvanceSubscriber {
+    inner: ObservationSubscriber,
 }
 
 pub(super) struct ChatObservationExclusiveGuard {
@@ -398,6 +432,8 @@ impl Drop for ChatObservationExclusiveGuard {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::app::change_detection::ChangeFingerprint;
     use crate::app::geometry::Rect;
@@ -419,6 +455,109 @@ mod tests {
         assert_eq!(primary_id(&revised), first_id);
     }
 
+    #[test]
+    fn completion_subscriber_receives_success_with_the_original_capture_time() {
+        let shared = ChatObservationShared::new(6.0, 0.03);
+        let mut subscriber = shared.subscribe_completion_advances().unwrap();
+        let captured_at = Instant::now();
+        let frame = shared.begin_frame(captured_at).unwrap();
+
+        shared.complete_without_messages(frame).unwrap();
+
+        let advance = next_completion_advance(&shared, &mut subscriber);
+        assert_eq!(advance.events().len(), 1);
+        assert_eq!(advance.events()[0].frame(), frame);
+        assert_eq!(advance.events()[0].captured_at(), captured_at);
+        assert!(matches!(
+            advance.events()[0],
+            ObservationCompletionEvent::Succeeded { .. }
+        ));
+    }
+
+    #[test]
+    fn completion_subscriber_receives_terminal_failure_without_a_message() {
+        let shared = ChatObservationShared::new(6.0, 0.03);
+        let mut subscriber = shared.subscribe_completion_advances().unwrap();
+        let frame = shared.begin_frame(Instant::now()).unwrap();
+
+        shared
+            .record_terminal_failure(frame, "OCR retry exhausted")
+            .unwrap();
+
+        let advance = next_completion_advance(&shared, &mut subscriber);
+        assert_eq!(advance.events().len(), 1);
+        assert!(matches!(
+            &advance.events()[0],
+            ObservationCompletionEvent::TerminalFailure {
+                frame: failed_frame,
+                reason,
+            } if *failed_frame == frame && reason.as_ref() == "OCR retry exhausted"
+        ));
+    }
+
+    #[test]
+    fn completion_subscriber_observes_watermark_advances_in_frame_order() {
+        let shared = ChatObservationShared::new(6.0, 0.03);
+        let mut subscriber = shared.subscribe_completion_advances().unwrap();
+        let started = Instant::now();
+        let first = shared.begin_frame(started).unwrap();
+        let second = shared
+            .begin_frame(started + Duration::from_millis(20))
+            .unwrap();
+
+        shared.complete_without_messages(second).unwrap();
+        assert!(
+            shared
+                .read_completion_advance(&mut subscriber)
+                .unwrap()
+                .is_none()
+        );
+
+        shared.record_terminal_failure(first, "failed").unwrap();
+        let advance = next_completion_advance(&shared, &mut subscriber);
+        assert_eq!(
+            advance
+                .events()
+                .iter()
+                .map(ObservationCompletionEvent::frame)
+                .collect::<Vec<_>>(),
+            vec![first, second]
+        );
+        assert_eq!(
+            advance.watermark(),
+            Some(crate::observation::chat::ObservationWatermark {
+                completed_through: second.id(),
+                captured_through: second.captured_at(),
+            })
+        );
+    }
+
+    #[test]
+    fn exclusive_chat_keeps_private_text_out_of_shared_dispatches() {
+        let shared = ChatObservationShared::new(6.0, 0.03);
+        let mut subscriber = shared.subscribe_completion_advances().unwrap();
+        let _exclusive = shared.begin_exclusive().unwrap();
+        let frame = shared.begin_frame(Instant::now()).unwrap();
+
+        let dispatches = shared
+            .publish_secondary(
+                frame,
+                "pink",
+                "private friend",
+                false,
+                vec![SecondaryRecognizedMessage {
+                    text: "private text".to_string(),
+                    sender: None,
+                }],
+            )
+            .unwrap();
+
+        assert!(dispatches.is_empty());
+        let advance = next_completion_advance(&shared, &mut subscriber);
+        assert_eq!(advance.events().len(), 1);
+        assert_eq!(advance.events()[0].frame(), frame);
+    }
+
     fn message(text: &str) -> ChatMessage {
         ChatMessage {
             message_type: "blue".to_string(),
@@ -437,5 +576,18 @@ mod tests {
             panic!("primary observation was not dispatched");
         };
         messages[0].id.clone()
+    }
+
+    fn next_completion_advance(
+        shared: &ChatObservationShared,
+        subscriber: &mut CompletionAdvanceSubscriber,
+    ) -> Arc<CompletionAdvance> {
+        let Some(ObservationRead::Item { value, .. }) = shared
+            .read_completion_advance(subscriber)
+            .expect("completion stream remains available")
+        else {
+            panic!("completion advance was not published");
+        };
+        value
     }
 }

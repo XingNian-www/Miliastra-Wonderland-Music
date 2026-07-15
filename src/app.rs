@@ -64,8 +64,8 @@ use self::chat_listener::{
 };
 use self::chat_observation::{
     ChatObservationDispatch, ChatObservationExclusiveGuard, ChatObservationShared,
-    PrimaryObservedMessage, SecondaryChatObservation, SecondaryObservedMessage,
-    SecondaryRecognizedMessage,
+    CompletionAdvanceSubscriber, PrimaryObservedMessage, SecondaryChatObservation,
+    SecondaryObservedMessage, SecondaryRecognizedMessage,
 };
 use self::chat_output::{
     ChatBatchSendOutcome, ChatBatchSendStatus, ChatOutput, redacted_chat_text,
@@ -132,6 +132,8 @@ use crate::features::undercover::{
     UndercoverDeliveryTask, UndercoverService,
 };
 use crate::observation::chat::ObservedFrame;
+use crate::observation::shared::ObservationRead;
+use crate::runtime::business::{BusinessEvent, BusinessRuntime, BusinessRuntimeHandle};
 use crate::runtime::ui::{
     FrameDemand, FrameDemandSubscription, FramePublication, UiRuntime, UiRuntimeHandle,
 };
@@ -144,6 +146,7 @@ const TARGET_MISSING_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const TARGET_MISSING_BACKOFF_MAX: Duration = Duration::from_secs(60);
 const UI_RUNTIME_QUEUE_CAPACITY: usize = 32;
 const OCR_RUNTIME_QUEUE_CAPACITY: usize = 64;
+const BUSINESS_RUNTIME_QUEUE_CAPACITY: usize = 64;
 
 fn receive_observation_frame(
     subscription: &FrameDemandSubscription,
@@ -365,6 +368,8 @@ pub(crate) struct AutomationApp {
     config: AppConfig,
     game_ui: GameUi,
     ui_runtime: Option<UiRuntime>,
+    business: BusinessRuntimeHandle,
+    business_runtime: Option<BusinessRuntime>,
     runtime_state: Arc<Mutex<PersistentRuntimeState>>,
     entertainment: EntertainmentCoordinator,
     idiom_chain: IdiomChainService,
@@ -925,6 +930,8 @@ impl AutomationApp {
             config.ocr.change_mean_threshold,
             config.ocr.change_pixel_threshold,
         );
+        let business_runtime = BusinessRuntime::start(BUSINESS_RUNTIME_QUEUE_CAPACITY)?;
+        let business = business_runtime.handle();
         let moderation = ModerationService::new(ModerationPolicy::new(
             Duration::from_millis(config.timing.moderation.vote_timeout_ms),
             Duration::from_millis(config.timing.moderation.vote_poll_ms),
@@ -936,6 +943,8 @@ impl AutomationApp {
             config,
             game_ui,
             ui_runtime: Some(ui_runtime),
+            business,
+            business_runtime: Some(business_runtime),
             runtime_state,
             entertainment,
             idiom_chain,
@@ -1008,6 +1017,11 @@ impl AutomationApp {
         }
         if let Err(error) = playback_monitor.join() {
             log::error!("播放监控线程 panic: {error:?}");
+        }
+        if let Some(business_runtime) = self.business_runtime.take()
+            && let Err(error) = business_runtime.shutdown()
+        {
+            log::error!("业务运行时关闭失败: {error}");
         }
         if let Some(ui_runtime) = self.ui_runtime.take()
             && let Err(error) = ui_runtime.shutdown()
@@ -1257,6 +1271,8 @@ impl AutomationApp {
             config: self.config.clone(),
             game_ui: self.game_ui.clone(),
             ui_runtime: None,
+            business: self.business.clone(),
+            business_runtime: None,
             runtime_state: self.runtime_state.clone(),
             entertainment: self.entertainment.clone(),
             idiom_chain: self.idiom_chain.clone(),
@@ -1444,6 +1460,27 @@ impl AutomationApp {
     }
 
     fn run_scan_loop(&mut self) -> Result<()> {
+        let mut completion_subscriber = self
+            .chat_observations
+            .subscribe_completion_advances()
+            .context("订阅聊天观察完成推进")?;
+        let scan_result = self.run_scan_loop_inner(&mut completion_subscriber);
+        let final_forward_result = self.forward_completion_advances(&mut completion_subscriber);
+        match scan_result {
+            Err(error) => {
+                if let Err(forward_error) = final_forward_result {
+                    log::error!("扫描循环退出时转发观察完成推进失败: {forward_error:#}");
+                }
+                Err(error)
+            }
+            Ok(()) => final_forward_result,
+        }
+    }
+
+    fn run_scan_loop_inner(
+        &mut self,
+        completion_subscriber: &mut CompletionAdvanceSubscriber,
+    ) -> Result<()> {
         let template_args = TemplateArgs::default().resolve(&self.config);
         let ui_template_args = UiTemplateArgs::default().resolve(&self.config);
         let canvas = Canvas {
@@ -1479,6 +1516,7 @@ impl AutomationApp {
 
         log::info!("自动化扫描已启动");
         while self.running.load(AtomicOrdering::SeqCst) {
+            self.forward_completion_advances(completion_subscriber)?;
             let loop_started = Instant::now();
             self.update_monitor_operational_state();
             self.tick_entertainment();
@@ -1876,6 +1914,7 @@ impl AutomationApp {
                 last_fingerprint = None;
                 last_ocr_at = Instant::now();
             }
+            self.forward_completion_advances(completion_subscriber)?;
             self.maybe_idle_exit()?;
             sleep(Duration::from_millis(self.config.timing.loop_idle_ms));
         }
@@ -1889,6 +1928,27 @@ impl AutomationApp {
         self.queue()?.save()?;
         self.runtime_state()?.save()?;
         Ok(())
+    }
+
+    fn forward_completion_advances(
+        &self,
+        subscriber: &mut CompletionAdvanceSubscriber,
+    ) -> Result<()> {
+        loop {
+            match self.chat_observations.read_completion_advance(subscriber)? {
+                Some(ObservationRead::Item { value, .. }) => self
+                    .business
+                    .submit(BusinessEvent::CompletionAdvance(Arc::unwrap_or_clone(
+                        value,
+                    )))
+                    .context("向业务运行时提交观察完成推进")?,
+                Some(ObservationRead::Gap(gap)) => self
+                    .business
+                    .submit(BusinessEvent::CompletionGap(gap))
+                    .context("向业务运行时提交观察完成流缺口")?,
+                None => return Ok(()),
+            }
+        }
     }
 
     fn run_secondary_listener_round(

@@ -795,9 +795,7 @@ fn command_lock_key(command: &UserCommand) -> String {
                 )
             }
         }
-        UserCommand::Moderation(command) => {
-            format!("moderation:{}:{}", command.action.label(), command.uid)
-        }
+        UserCommand::Moderation(command) => command.lock_key(),
         UserCommand::Microphone { username } => {
             format!("microphone:{}", identity_text(username))
         }

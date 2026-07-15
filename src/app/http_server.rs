@@ -1056,33 +1056,12 @@ fn task_cancel_route(
             message: "任务已开始、已结束或不存在，不能撤销".to_string(),
         });
     };
-    let mut task = pending
+    let task = pending
         .remove(index)
         .ok_or_else(|| internal_message("待处理任务撤销失败"))?;
     let label = task.label();
     drop(pending);
-    let mut sync_listener = false;
-    match &mut task.task {
-        super::PendingTask::SetChatListenerMode { target } => {
-            state.chat_listener.cancel_mode_request(*target);
-            sync_listener = true;
-        }
-        super::PendingTask::SecondaryUnread { .. } | super::PendingTask::RestoreSecondaryHall => {
-            state.chat_listener.release_unread_task();
-            sync_listener = true;
-        }
-        super::PendingTask::ModerationResult(task) => {
-            task.cancel();
-            sync_listener = true;
-        }
-        super::PendingTask::CardGameDelivery(delivery) => {
-            if let Err(error) = delivery.cancel() {
-                log::error!("撤销牌局计时结果后无法清理牌局: {error:#}");
-            }
-        }
-        _ => {}
-    }
-    drop(task);
+    let sync_listener = task.cancel(&state.chat_listener);
     if sync_listener {
         sync_chat_listener_monitor(state);
     }

@@ -6,6 +6,7 @@ use crate::features::card_games::LandlordCommand;
 use crate::features::chat_text::normalize_comparison_text;
 use crate::features::entertainment::EntertainmentKind;
 use crate::features::idiom_chain::{IdiomChainCommand, IdiomChainMode};
+use crate::features::moderation;
 pub use crate::features::moderation::{ModerationAction, ModerationCommand};
 use crate::features::turtle_soup::TurtleSoupCommand;
 use crate::features::undercover::UndercoverCommand;
@@ -819,39 +820,15 @@ fn parse_moderation_command(
     username: &str,
     user_command: &str,
 ) -> Option<ParsedCommand> {
-    for (prefix, action) in [
-        ("拉黑UID", ModerationAction::Blacklist),
-        ("屏蔽UID", ModerationAction::BlockChat),
-        ("拉黑", ModerationAction::Blacklist),
-        ("屏蔽", ModerationAction::BlockChat),
-    ] {
-        let Some(rest) = strip_ascii_case_prefix(command_text, prefix) else {
-            continue;
-        };
-        let digits = rest
-            .chars()
-            .take_while(|ch| ch.is_ascii_digit())
-            .collect::<String>();
-        if digits.len() != 9 {
-            return None;
-        }
-        if !command_boundary(rest[digits.len()..].chars().next()) {
-            return None;
-        }
-        return Some(ParsedCommand {
-            matched: prefix.to_string(),
-            raw: format!("{} {} {}", prefix, username, digits),
-            user_command: user_command.to_string(),
-            message_type: "pink".to_string(),
-            username: username.to_string(),
-            command: UserCommand::Moderation(ModerationCommand {
-                action,
-                uid: digits,
-                requester: username.to_string(),
-            }),
-        });
-    }
-    None
+    let parsed = moderation::parse_command(command_text, username)?;
+    Some(ParsedCommand {
+        matched: parsed.matched.to_string(),
+        raw: format!("{} {} {}", parsed.matched, username, parsed.command.uid),
+        user_command: user_command.to_string(),
+        message_type: "pink".to_string(),
+        username: username.to_string(),
+        command: UserCommand::Moderation(parsed.command),
+    })
 }
 
 fn identity_text(text: &str) -> String {

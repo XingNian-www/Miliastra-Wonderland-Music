@@ -40,7 +40,8 @@ use super::web_tools::{WebToolRequest, WebToolShared, WebToolTemplate};
 use crate::config::AppConfig;
 #[cfg(test)]
 use crate::features::entertainment::EntertainmentCoordinator;
-use crate::features::moderation::ModerationService;
+#[cfg(test)]
+use crate::features::moderation::{ModerationPolicy, ModerationService};
 use crate::features::turtle_soup::TurtleSoupService;
 use crate::features::turtle_soup::repository::{TurtleSoupBankStore, TurtleSoupSubmission};
 use crate::features::undercover::{UndercoverCommand, UndercoverService};
@@ -445,7 +446,6 @@ pub struct HttpSharedState {
     pending: Arc<(Mutex<VecDeque<super::TrackedPendingTask>>, Condvar)>,
     task_tracker: TaskTrackerShared,
     decision_control: DecisionControlShared,
-    moderation: ModerationService,
     web_tools: WebToolShared,
     latest_frame: Arc<Mutex<Option<Arc<image::DynamicImage>>>>,
 }
@@ -494,7 +494,6 @@ impl HttpSharedState {
         monitor: MonitorShared,
         task_tracker: TaskTrackerShared,
         decision_control: DecisionControlShared,
-        moderation: ModerationService,
         web_tools: WebToolShared,
         latest_frame: Arc<Mutex<Option<Arc<image::DynamicImage>>>>,
     ) -> Self {
@@ -514,7 +513,6 @@ impl HttpSharedState {
             pending,
             task_tracker,
             decision_control,
-            moderation,
             web_tools,
             latest_frame,
         }
@@ -1058,13 +1056,13 @@ fn task_cancel_route(
             message: "任务已开始、已结束或不存在，不能撤销".to_string(),
         });
     };
-    let task = pending
+    let mut task = pending
         .remove(index)
         .ok_or_else(|| internal_message("待处理任务撤销失败"))?;
     let label = task.label();
     drop(pending);
     let mut sync_listener = false;
-    match &task.task {
+    match &mut task.task {
         super::PendingTask::SetChatListenerMode { target } => {
             state.chat_listener.cancel_mode_request(*target);
             sync_listener = true;
@@ -1073,8 +1071,8 @@ fn task_cancel_route(
             state.chat_listener.release_unread_task();
             sync_listener = true;
         }
-        super::PendingTask::ModerationVoteResult { workflow_key, .. } => {
-            state.moderation.release_best_effort(workflow_key);
+        super::PendingTask::ModerationResult(task) => {
+            task.cancel();
             sync_listener = true;
         }
         super::PendingTask::CardGameDelivery(delivery) => {
@@ -2862,6 +2860,24 @@ fn turtle_soup_error(error: anyhow::Error) -> AppError {
 mod tests {
     use super::*;
 
+    struct TestModerationCommandPort {
+        listener: ChatListenerShared,
+    }
+
+    impl crate::features::moderation::ModerationCommandPort for TestModerationCommandPort {
+        fn send_hall(&mut self, _message: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn prepare_vote_hold(
+            &mut self,
+        ) -> Result<Box<dyn crate::features::moderation::ModerationPrimaryHold>> {
+            Ok(Box::new(super::super::TemporaryPrimaryHold::new(
+                self.listener.clone(),
+            )?))
+        }
+    }
+
     #[test]
     fn chat_send_requires_post() {
         assert!(is_mutating_route("/chat/send"));
@@ -3309,23 +3325,29 @@ mod tests {
         state
             .chat_listener
             .complete_mode_switch(ChatListenerMode::Secondary);
-        let workflow_key = "blacklist:123456789".to_string();
-        assert!(state.moderation.begin(&workflow_key).unwrap());
-        let temporary_primary_hold =
-            super::super::TemporaryPrimaryHold::new(state.chat_listener.clone())
-                .expect("temporary primary hold");
+        let command = command::ModerationCommand {
+            action: command::ModerationAction::Blacklist,
+            uid: "123456789".to_string(),
+            requester: "测试用户".to_string(),
+        };
+        let moderation = ModerationService::new(ModerationPolicy::new(
+            std::time::Duration::from_secs(120),
+            std::time::Duration::from_secs(2),
+            3,
+            3,
+        ));
+        let mut port = TestModerationCommandPort {
+            listener: state.chat_listener.clone(),
+        };
+        let crate::features::moderation::ModerationStart::Started(work) = moderation
+            .start(&command, &mut port)
+            .expect("start moderation")
+        else {
+            panic!("moderation should start");
+        };
         let receipt = enqueue_pending_task(
             &state,
-            super::super::PendingTask::ModerationVoteResult {
-                command: Box::new(command::ModerationCommand {
-                    action: command::ModerationAction::Blacklist,
-                    uid: "123456789".to_string(),
-                    requester: "测试用户".to_string(),
-                }),
-                approved: false,
-                workflow_key: workflow_key.clone(),
-                temporary_primary_hold,
-            },
+            super::super::PendingTask::ModerationResult(work.finish(false)),
         )
         .expect("enqueue moderation result");
         assert!(state.chat_listener.snapshot().temporary_primary);
@@ -3333,7 +3355,7 @@ mod tests {
         task_cancel_route(&[("id".to_string(), receipt.task_id.to_string())], &state)
             .expect("cancel moderation result");
 
-        assert!(!state.moderation.is_active(&workflow_key).unwrap());
+        assert!(!moderation.is_active(&command).unwrap());
         assert!(!state.chat_listener.snapshot().temporary_primary);
     }
 
@@ -3640,7 +3662,6 @@ mod tests {
             monitor,
             TaskTrackerShared::new(),
             DecisionControlShared::new(),
-            ModerationService::new(),
             WebToolShared::new(),
             Arc::new(Mutex::new(None)),
         )

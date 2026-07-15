@@ -372,7 +372,6 @@ pub(crate) struct AutomationApp {
     business_runtime: Option<BusinessRuntime>,
     runtime_state: Arc<Mutex<PersistentRuntimeState>>,
     entertainment: EntertainmentCoordinator,
-    idiom_chain: IdiomChainService,
     landlord: CardGameService,
     undercover: UndercoverService,
     turtle_soup: TurtleSoupService,
@@ -900,7 +899,7 @@ impl AutomationApp {
         let idiom_chain =
             IdiomChainService::load(config.idiom_chain.clone(), entertainment.clone())?;
         if config.idiom_chain.enabled {
-            log::info!("已加载成语接龙词库: {} 条", idiom_chain.lexicon_len()?);
+            log::info!("已加载成语接龙词库: {} 条", idiom_chain.lexicon_len());
         }
         let landlord = CardGameService::new(config.landlord.clone(), entertainment.clone());
         let undercover = UndercoverService::new(config.undercover.clone(), entertainment.clone());
@@ -930,7 +929,8 @@ impl AutomationApp {
             config.ocr.change_mean_threshold,
             config.ocr.change_pixel_threshold,
         );
-        let business_runtime = BusinessRuntime::start(BUSINESS_RUNTIME_QUEUE_CAPACITY)?;
+        let business_runtime =
+            BusinessRuntime::start(BUSINESS_RUNTIME_QUEUE_CAPACITY, idiom_chain)?;
         let business = business_runtime.handle();
         let moderation = ModerationService::new(ModerationPolicy::new(
             Duration::from_millis(config.timing.moderation.vote_timeout_ms),
@@ -947,7 +947,6 @@ impl AutomationApp {
             business_runtime: Some(business_runtime),
             runtime_state,
             entertainment,
-            idiom_chain,
             landlord,
             undercover,
             turtle_soup,
@@ -1275,7 +1274,6 @@ impl AutomationApp {
             business_runtime: None,
             runtime_state: self.runtime_state.clone(),
             entertainment: self.entertainment.clone(),
-            idiom_chain: self.idiom_chain.clone(),
             landlord: self.landlord.clone(),
             undercover: self.undercover.clone(),
             turtle_soup: self.turtle_soup.clone(),
@@ -2393,7 +2391,9 @@ impl AutomationApp {
         if idiom_command_requires_executor(command) {
             return Ok(false);
         }
-        let outcome = self.idiom_chain.handle(&parsed.username, command)?;
+        let outcome = self
+            .business
+            .handle_idiom_chain(&parsed.username, command)?;
         let target = match self.active_ui_residency() {
             UiResidency::Primary => DeferredChatTarget::Primary,
             UiResidency::SecondaryCurrentHall => DeferredChatTarget::SecondaryCurrentHall,
@@ -2506,7 +2506,7 @@ impl AutomationApp {
             Ok(false) => {}
             Err(error) => log::error!("无法中止旧牌局: {error:#}"),
         }
-        match self.idiom_chain.abort() {
+        match self.business.abort_idiom_chain() {
             Ok(true) => log::warn!("成语接龙已因聊天上下文变化中止: {}", reason),
             Ok(false) => {}
             Err(error) => log::error!("无法中止旧成语接龙会话: {error:#}"),
@@ -2546,7 +2546,7 @@ impl AutomationApp {
             }
             Err(error) => log::error!("无法推进谁是卧底计时: {error:#}"),
         }
-        match self.idiom_chain.expire_idle_now() {
+        match self.business.expire_idiom_chain() {
             Ok(true) => log::info!("成语接龙已因空闲超时结束，娱乐互斥已释放"),
             Ok(false) => {}
             Err(error) => log::error!("无法检查成语接龙空闲超时: {error:#}"),
@@ -5548,7 +5548,7 @@ impl AutomationApp {
         player: &str,
         command: &idiom_chain::IdiomChainCommand,
     ) -> Result<()> {
-        let outcome = self.idiom_chain.explain(player, command)?;
+        let outcome = self.business.explain_idiom_chain(player, command)?;
         let mut messages = vec![outcome.reply];
         if let Some(explanation) = outcome.explanation {
             messages.extend(split_numbered_chat_message("来源", &explanation.source));

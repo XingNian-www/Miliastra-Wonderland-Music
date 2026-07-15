@@ -19,19 +19,21 @@ use serde_json::{Value, json};
 #[cfg(test)]
 use super::parse_question_bank;
 use super::{
-    TurtleSoupDelivery, TurtleSoupDeliveryIntent, TurtleSoupDeliveryOutcome,
-    TurtleSoupDeliveryPort, TurtleSoupDeliveryPurpose, TurtleSoupPuzzle, load_question_bank,
+    TurtleSoupDeadlineKind, TurtleSoupDelivery, TurtleSoupDeliveryIntent,
+    TurtleSoupDeliveryOutcome, TurtleSoupDeliveryPort, TurtleSoupDeliveryPurpose, TurtleSoupPuzzle,
+    load_question_bank,
 };
 use crate::features::chat_text::{
     MAX_CHAT_WIDTH, display_width, normalize_comparison_text, split_numbered_chat_message,
 };
 use crate::features::entertainment::{AcquireOutcome, EntertainmentCoordinator, EntertainmentKind};
+use crate::runtime::identity::SessionGeneration;
 use crate::runtime::openai::{Authentication, OpenAiRuntimeHandle, Target};
 
 const RECENT_JUDGMENT_LIMIT: usize = 30;
-const DEEPSEEK_DEFAULT_ENDPOINT: &str = "https://api.deepseek.com/chat/completions";
-const DEEPSEEK_DEFAULT_MODEL: &str = "deepseek-v4-flash";
-const DEFAULT_AI_MAX_TOKENS: u32 = 256;
+const OPENAI_DEFAULT_ENDPOINT: &str = "https://api.openai.com/v1/chat/completions";
+const OPENAI_DEFAULT_MODEL: &str = "gpt-5.5";
+const DEFAULT_AI_MAX_TOKENS: u32 = 1_024;
 const DEFAULT_BATCH_MAX_PARTS: usize = 32;
 const DEFAULT_NICKNAME_STABLE_COUNT: usize = 0;
 const DEFAULT_CONTENT_STABLE_COUNT: usize = 0;
@@ -92,9 +94,9 @@ pub struct TurtleSoupAiConfig {
 impl Default for TurtleSoupAiConfig {
     fn default() -> Self {
         Self {
-            endpoint: DEEPSEEK_DEFAULT_ENDPOINT.to_string(),
+            endpoint: OPENAI_DEFAULT_ENDPOINT.to_string(),
             api_key: String::new(),
-            model: DEEPSEEK_DEFAULT_MODEL.to_string(),
+            model: OPENAI_DEFAULT_MODEL.to_string(),
             max_tokens: DEFAULT_AI_MAX_TOKENS,
             extra_body: HashMap::new(),
         }
@@ -721,6 +723,7 @@ impl TurtleSoupService {
 
     pub(crate) fn start_workers(&self) {
         if !self.config.enabled
+            || self.shutting_down.load(Ordering::SeqCst)
             || self
                 .workers_started
                 .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -743,7 +746,9 @@ impl TurtleSoupService {
     }
 
     pub(crate) fn shutdown(&self) {
-        self.shutting_down.store(true, Ordering::SeqCst);
+        if self.shutting_down.swap(true, Ordering::SeqCst) {
+            return;
+        }
         let (_, cvar) = &*self.work;
         cvar.notify_all();
         let workers = match self.workers.lock() {
@@ -810,6 +815,13 @@ impl TurtleSoupService {
             settlement_incomplete: state.settlement_incomplete,
             last_error: state.last_error.clone(),
         }
+    }
+
+    pub(crate) fn session_generation(&self) -> SessionGeneration {
+        self.state
+            .lock()
+            .map(|state| SessionGeneration::new(state.generation))
+            .unwrap_or(SessionGeneration::INITIAL)
     }
 
     pub(crate) fn handle_hall_command(
@@ -1084,7 +1096,39 @@ impl TurtleSoupService {
         Ok(QuestionSubmitOutcome::Queued { request_id })
     }
 
-    pub(crate) fn tick(&self) {
+    pub(crate) fn next_deadline(
+        &self,
+        _now: Instant,
+        clock_active: bool,
+    ) -> Option<(TurtleSoupDeadlineKind, Instant)> {
+        if !clock_active {
+            return None;
+        }
+        let state = self.state.lock().ok()?;
+        if state.phase != TurtleSoupPhase::Active {
+            return None;
+        }
+        let session = state.session.as_ref()?;
+        let active_at = session.active_at.unwrap_or(session.selected_at);
+        let last_question_at = session.last_question_at.unwrap_or(active_at);
+        let max_deadline = active_at
+            .checked_add(Duration::from_secs(self.config.max_session_seconds.max(1)))
+            .unwrap_or(active_at);
+        let idle_deadline = last_question_at
+            .checked_add(Duration::from_secs(self.config.idle_timeout_seconds.max(1)))
+            .unwrap_or(last_question_at);
+        if max_deadline <= idle_deadline {
+            Some((TurtleSoupDeadlineKind::SessionMaximum, max_deadline))
+        } else {
+            Some((TurtleSoupDeadlineKind::SessionIdle, idle_deadline))
+        }
+    }
+
+    pub(crate) fn handle_deadline(&self, _kind: TurtleSoupDeadlineKind, now: Instant) {
+        self.tick_at(now);
+    }
+
+    fn tick_at(&self, now: Instant) {
         let reason = {
             let Ok(state) = self.state.lock() else {
                 log::error!("海龟汤状态锁已损坏，无法检查超时");
@@ -1096,7 +1140,6 @@ impl TurtleSoupService {
             let Some(session) = state.session.as_ref() else {
                 return;
             };
-            let now = Instant::now();
             let max_duration = Duration::from_secs(self.config.max_session_seconds.max(1));
             let idle_timeout = Duration::from_secs(self.config.idle_timeout_seconds.max(1));
             let active_at = session.active_at.unwrap_or(session.selected_at);
@@ -2306,9 +2349,31 @@ mod tests {
         assert_eq!(config.batch_max_parts, DEFAULT_BATCH_MAX_PARTS);
         assert_eq!(config.request_timeout_seconds, 20);
         assert_eq!(config.retry_count, 2);
-        assert_eq!(config.ai.endpoint, DEEPSEEK_DEFAULT_ENDPOINT);
-        assert_eq!(config.ai.model, DEEPSEEK_DEFAULT_MODEL);
+        assert_eq!(config.ai.endpoint, OPENAI_DEFAULT_ENDPOINT);
+        assert_eq!(config.ai.model, OPENAI_DEFAULT_MODEL);
         assert_eq!(config.ai.max_tokens, DEFAULT_AI_MAX_TOKENS);
+    }
+
+    #[test]
+    fn worker_lifecycle_is_idempotent() {
+        let service = TurtleSoupService::new(
+            TurtleSoupConfig {
+                enabled: true,
+                max_concurrency: 1,
+                ..TurtleSoupConfig::default()
+            },
+            EntertainmentCoordinator::new(),
+            TestDeliveryPort,
+            test_openai(),
+        );
+
+        service.start_workers();
+        service.start_workers();
+        service.shutdown();
+        service.shutdown();
+
+        assert!(service.shutting_down.load(Ordering::SeqCst));
+        assert!(service.workers.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -2318,7 +2383,7 @@ mod tests {
             .expect("chat request");
         let body = serde_json::to_value(request).expect("request json");
 
-        assert_eq!(body["model"], DEEPSEEK_DEFAULT_MODEL);
+        assert_eq!(body["model"], OPENAI_DEFAULT_MODEL);
         assert_eq!(body["response_format"]["type"], "json_object");
         assert_eq!(body["temperature"].as_f64(), Some(0.0));
         assert_eq!(

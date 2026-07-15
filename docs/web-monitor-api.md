@@ -139,7 +139,7 @@ HTTP 层只接受 `GET`、`POST`、`OPTIONS`。
 
 ### 海龟汤控制
 
-海龟汤控制直接调用共享娱乐服务，不构造 `ParsedCommand`，也不直接操作游戏输入。服务只更新会话、题库使用记录和 AI 队列；汤面、裁决与结算仍进入低优先级延迟聊天队列，并等待正式任务空闲后发送。
+海龟汤控制向业务运行时提交类型化意图，不构造 `ParsedCommand`，也不直接操作游戏输入。业务运行时更新会话、题库使用记录和 AI 队列；汤面、裁决与结算仍进入低优先级延迟聊天队列，并等待正式任务空闲后发送。
 
 | 接口 | 行为 |
 | --- | --- |
@@ -250,11 +250,13 @@ undercover
 
 主要更新来源：
 
-- 聊天 OCR 完成时：`monitor.set_ocr()`。
-- 音乐播放队列变化时：`monitor.set_queue()`。
-- 命令执行记录时：`monitor.push_command()`。
-- 程序启动/退出时：`monitor.set_status()`。
-- 日志输出时：`MonitorLogSink` 把日志行推入 `logs`。
+- 聊天 OCR 完成时提交 `MonitorEvent::Ocr`。
+- 音乐播放队列变化时提交 `MonitorEvent::Queue`。
+- 命令执行记录时提交 `MonitorEvent::Command`。
+- 程序启动/退出时提交 `MonitorEvent::Status`。
+- 日志输出时由 `MonitorLogSink` 提交 `MonitorEvent::Log`。
+
+所有事件由 `MonitorProjection` 单一投影入口应用，生产模块不直接修改快照。
 
 HTTP 直接修改队列时会调用 `sync_monitor_queue()`，避免 Web 面板要等下一轮业务流程才看到队列变化。
 

@@ -220,16 +220,13 @@ impl ExternalPlaybackTracker {
 #[derive(Clone, Debug)]
 pub(super) struct PlaybackRequest {
     pub(super) keyword: String,
-    pub(super) match_keyword: String,
     pub(super) source: String,
     pub(super) prefer_accompaniment: bool,
     pub(super) uri: String,
-    pub(super) skip_match_check: bool,
 }
 
 #[derive(Clone, Debug)]
 pub(super) struct PlaybackAttempt {
-    pub(super) initial_song: String,
     pub(super) initial_uri: String,
     pub(super) initial_progress: f64,
     pub(super) requested_uri: String,
@@ -440,13 +437,7 @@ impl<B: MusicPlayerBackend> PlayerController<B> {
         let initial = self
             .backend
             .status()
-            .map(|status| {
-                (
-                    format!("{}{}", status.name, status.singer),
-                    status.current_uri,
-                    status.progress,
-                )
-            })
+            .map(|status| (status.current_uri, status.progress))
             .unwrap_or_default();
         self.with_playback_state(|state| {
             state.playback.state = ConfirmedPlaybackState::Starting;
@@ -465,9 +456,8 @@ impl<B: MusicPlayerBackend> PlayerController<B> {
         })?;
         log::info!("播放器状态转移: Starting keyword={}", request.keyword);
         Ok(PlaybackAttempt {
-            initial_song: initial.0,
-            initial_uri: initial.1,
-            initial_progress: initial.2,
+            initial_uri: initial.0,
+            initial_progress: initial.1,
             requested_uri: request.uri.clone(),
             previous_playback: previous_playback.clone(),
         })
@@ -592,29 +582,6 @@ impl<B: MusicPlayerBackend> PlayerController<B> {
         log::info!("超时未播放成功");
         self.restore_failed_attempt(attempt, "verification_failed")?;
         Ok(PlaybackVerification::NoSource)
-    }
-
-    pub(super) fn accept_mismatch(
-        &self,
-        request: &PlaybackRequest,
-        status: &PlayerStatus,
-    ) -> Result<PlaybackVerification> {
-        if request.uri.trim().is_empty()
-            || status.current_uri.trim().is_empty()
-            || request.uri.trim() != status.current_uri.trim()
-        {
-            return Ok(PlaybackVerification::NoSource);
-        }
-        if status.duration > 0.0 && status.duration < 20.0 {
-            return Ok(PlaybackVerification::NoSource);
-        }
-        let message = format_play_message(status);
-        self.confirm_playback_success(request, status)?;
-        log::info!("播放成功: {}", message);
-        Ok(PlaybackVerification::Success {
-            status: status.clone(),
-            message,
-        })
     }
 
     pub(super) fn reject_mismatch_as_no_source(&self, status: Option<&PlayerStatus>) -> Result<()> {
@@ -1427,11 +1394,9 @@ mod tests {
     fn playback_request(keyword: &str, uri: &str) -> PlaybackRequest {
         PlaybackRequest {
             keyword: keyword.to_string(),
-            match_keyword: keyword.to_string(),
             source: "qqmusic".to_string(),
             prefer_accompaniment: false,
             uri: uri.to_string(),
-            skip_match_check: false,
         }
     }
 
@@ -1515,7 +1480,7 @@ mod tests {
         let controller = controller(FakeBackend::new(vec![]));
         let request = request();
         controller
-            .accept_mismatch(&request, &status("目标", request.uri.as_str(), 1.0, 180.0))
+            .confirm_playback_success(&request, &status("目标", request.uri.as_str(), 1.0, 180.0))
             .unwrap();
 
         assert!(
@@ -1708,7 +1673,7 @@ mod tests {
         let old_request = playback_request("旧歌 - 歌手", "fuo://qqmusic/songs/old");
         let old_status = status("旧歌", "fuo://qqmusic/songs/old", 30.0, 180.0);
         controller
-            .accept_mismatch(&old_request, &old_status)
+            .confirm_playback_success(&old_request, &old_status)
             .unwrap();
 
         let result = controller.play_request_uri(&request());
@@ -1730,7 +1695,7 @@ mod tests {
         let old_request = playback_request("旧歌 - 歌手", "fuo://qqmusic/songs/old");
         let old_status = status("旧歌", "fuo://qqmusic/songs/old", 30.0, 180.0);
         controller
-            .accept_mismatch(&old_request, &old_status)
+            .confirm_playback_success(&old_request, &old_status)
             .unwrap();
         let request = request();
         let mut attempt = controller.play_request_uri(&request).unwrap();
@@ -1754,7 +1719,7 @@ mod tests {
         let old_request = playback_request("旧歌 - 歌手", "fuo://qqmusic/songs/old");
         let old_status = status("旧歌", "fuo://qqmusic/songs/old", 30.0, 180.0);
         controller
-            .accept_mismatch(&old_request, &old_status)
+            .confirm_playback_success(&old_request, &old_status)
             .unwrap();
         let request = request();
         let mut attempt = controller.play_request_uri(&request).unwrap();

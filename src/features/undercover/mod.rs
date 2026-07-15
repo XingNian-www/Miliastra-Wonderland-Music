@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -12,8 +12,9 @@ mod service;
 
 use super::chat_text::display_width;
 pub use service::{
-    UndercoverCommandContext, UndercoverCommandSource, UndercoverDeliveryPort,
-    UndercoverDeliveryTask, UndercoverService,
+    UndercoverCommandSource, UndercoverCommandStart, UndercoverDeliveryPort, UndercoverEffect,
+    UndercoverEffectClaim, UndercoverEffectKey, UndercoverEffectLane, UndercoverEffectRequest,
+    UndercoverEffectResult, UndercoverResume, UndercoverRuntimeService, UndercoverTimedOutcome,
 };
 
 #[derive(Debug)]
@@ -754,6 +755,53 @@ impl UndercoverGame {
         }
     }
 
+    pub(crate) fn next_deadline(
+        &self,
+        _now: Instant,
+        clock_active: bool,
+    ) -> Option<(UndercoverDeadlineKind, Instant)> {
+        if !clock_active {
+            return None;
+        }
+        match &self.state {
+            GameState::Idle => None,
+            GameState::Lobby(lobby) => Some((
+                UndercoverDeadlineKind::LobbyIdle,
+                lobby
+                    .last_activity
+                    .checked_add(Duration::from_secs(
+                        self.config.lobby_timeout_seconds.max(1),
+                    ))
+                    .unwrap_or(lobby.last_activity),
+            )),
+            GameState::Playing(game) => {
+                let phase_deadline = game
+                    .last_activity
+                    .checked_add(Duration::from_secs(
+                        self.config.phase_timeout_seconds.max(1),
+                    ))
+                    .unwrap_or(game.last_activity);
+                let reminder_deadline = match &game.phase {
+                    Phase::Voting { reminder, .. } | Phase::RunoffVoting { reminder, .. } => Some(
+                        reminder
+                            .last_announcement
+                            .checked_add(Duration::from_secs(
+                                self.config.progress_interval_seconds.max(1),
+                            ))
+                            .unwrap_or(reminder.last_announcement),
+                    ),
+                    _ => None,
+                };
+                match reminder_deadline {
+                    Some(deadline) if deadline <= phase_deadline => {
+                        Some((UndercoverDeadlineKind::VoteReminder, deadline))
+                    }
+                    _ => Some((UndercoverDeadlineKind::PhaseIdle, phase_deadline)),
+                }
+            }
+        }
+    }
+
     pub fn tick(&mut self, now: Instant) -> Vec<UndercoverDelivery> {
         let mut deliveries = Vec::new();
         match &mut self.state {
@@ -1217,171 +1265,9 @@ fn random_seed() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-    use std::sync::Mutex as StdMutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;
 
     use super::*;
-    use crate::features::entertainment::EntertainmentCoordinator;
-
-    struct FakeDeliveryPort {
-        verified: bool,
-        secret_succeeds: bool,
-        secret_attempts: AtomicUsize,
-        hall_messages: StdMutex<Vec<String>>,
-    }
-
-    impl FakeDeliveryPort {
-        fn new(verified: bool, secret_succeeds: bool) -> Self {
-            Self {
-                verified,
-                secret_succeeds,
-                secret_attempts: AtomicUsize::new(0),
-                hall_messages: StdMutex::new(Vec::new()),
-            }
-        }
-
-        fn hall_messages(&self) -> Vec<String> {
-            self.hall_messages.lock().unwrap().clone()
-        }
-    }
-
-    impl UndercoverDeliveryPort for FakeDeliveryPort {
-        fn verify_friend(&self, _player: &str, _message: &str) -> Result<bool> {
-            Ok(self.verified)
-        }
-
-        fn send_friend(&self, _player: &str, _message: &str) -> Result<bool> {
-            Ok(true)
-        }
-
-        fn send_secret_friend(&self, _player: &str, _message: &str) -> Result<bool> {
-            self.secret_attempts.fetch_add(1, Ordering::SeqCst);
-            Ok(self.secret_succeeds)
-        }
-
-        fn send_hall(&self, message: &str) -> Result<()> {
-            self.hall_messages.lock().unwrap().push(message.to_string());
-            Ok(())
-        }
-
-        fn send_hall_batch(&self, messages: &[String]) -> Result<()> {
-            self.hall_messages
-                .lock()
-                .unwrap()
-                .extend(messages.iter().cloned());
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn application_service_releases_signup_when_friend_verification_fails() {
-        let (config, directory) = service_config("verify-failure");
-        let entertainment = EntertainmentCoordinator::new();
-        let service = UndercoverService::new(config, entertainment.clone());
-        let port = FakeDeliveryPort::new(false, true);
-
-        service
-            .execute(
-                UndercoverCommandContext {
-                    player: "甲",
-                    source: UndercoverCommandSource::Hall,
-                },
-                &UndercoverCommand::CreateSingle,
-                &port,
-                Instant::now(),
-            )
-            .unwrap();
-
-        assert_eq!(entertainment.active(), None);
-        assert_eq!(service.snapshot(Instant::now()).unwrap().phase, "idle");
-        assert!(
-            port.hall_messages()
-                .iter()
-                .any(|message| message.contains("报名失败"))
-        );
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn application_service_retries_secret_delivery_once_then_cancels() {
-        let (config, directory) = service_config("delivery-failure");
-        let entertainment = EntertainmentCoordinator::new();
-        let service = UndercoverService::new(config, entertainment.clone());
-        let port = FakeDeliveryPort::new(true, false);
-        let now = Instant::now();
-
-        service
-            .execute(
-                UndercoverCommandContext {
-                    player: "甲",
-                    source: UndercoverCommandSource::Hall,
-                },
-                &UndercoverCommand::CreateSingle,
-                &port,
-                now,
-            )
-            .unwrap();
-        for player in ["乙", "丙", "丁"] {
-            service
-                .execute(
-                    UndercoverCommandContext {
-                        player,
-                        source: UndercoverCommandSource::Friend,
-                    },
-                    &UndercoverCommand::Join,
-                    &port,
-                    now,
-                )
-                .unwrap();
-        }
-        service
-            .execute(
-                UndercoverCommandContext {
-                    player: "甲",
-                    source: UndercoverCommandSource::Hall,
-                },
-                &UndercoverCommand::Start,
-                &port,
-                now,
-            )
-            .unwrap();
-
-        assert_eq!(port.secret_attempts.load(Ordering::SeqCst), 2);
-        assert_eq!(entertainment.active(), None);
-        assert_eq!(service.snapshot(Instant::now()).unwrap().phase, "idle");
-        assert!(
-            port.hall_messages()
-                .iter()
-                .any(|message| message.contains("发词失败"))
-        );
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    fn service_config(name: &str) -> (UndercoverConfig, PathBuf) {
-        let suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let directory = std::env::temp_dir().join(format!("mwm-undercover-{name}-{suffix}"));
-        std::fs::create_dir_all(&directory).unwrap();
-        let bank_path = directory.join("undercover.yaml");
-        std::fs::write(
-            &bank_path,
-            "词组:\n  - 平民词: 苹果\n    卧底词: 梨\n    启用: true\n",
-        )
-        .unwrap();
-        (
-            UndercoverConfig {
-                enabled: true,
-                word_bank_path: bank_path,
-                used_state_path: directory.join("used.yaml"),
-                ..UndercoverConfig::default()
-            },
-            directory,
-        )
-    }
 
     #[test]
     fn single_undercover_game_starts_with_four_players_and_hides_roles() {

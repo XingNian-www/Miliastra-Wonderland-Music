@@ -117,7 +117,7 @@ use crate::features::entertainment::EntertainmentCoordinator;
 use crate::features::entertainment::{AcquireOutcome, EntertainmentKind};
 use crate::features::idiom_chain;
 use crate::features::idiom_chain::IdiomChainService;
-use crate::features::invite::InviteService;
+use crate::features::invite::{InviteRequest, InviteService, InviteStart};
 use crate::features::moderation::{ModerationPolicy, ModerationResultTask, ModerationService};
 use crate::features::turtle_soup::{
     self, QuestionSubmitOutcome, SecondaryOcrObservation, SecondaryOcrStability, TurtleSoupService,
@@ -2194,9 +2194,9 @@ impl AutomationApp {
                 continue;
             }
             if let UserCommand::Invite(invite) = &parsed_command.command
-                && let Some(seq) = invite.seq
-                && self.invite.was_executed(seq)?
+                && !self.invite.should_accept(invite.seq)?
             {
+                let seq = invite.seq.expect("unsequenced invites are always accepted");
                 log::info!("邀请参数 {} 已执行过，跳过: {}", seq, parsed_command.raw);
                 continue;
             }
@@ -2513,9 +2513,9 @@ impl AutomationApp {
             return Ok(());
         }
         if let UserCommand::Invite(invite) = &parsed.command
-            && let Some(seq) = invite.seq
-            && self.invite.was_executed(seq)?
+            && !self.invite.should_accept(invite.seq)?
         {
+            let seq = invite.seq.expect("unsequenced invites are always accepted");
             log::info!("邀请参数 {} 已执行过，跳过: {}", seq, parsed.raw);
             return Ok(());
         }
@@ -5079,15 +5079,20 @@ impl AutomationApp {
                 self.execute_undercover_command(parsed, command)?;
             }
             UserCommand::Invite(invite) => {
-                if let Some(seq) = invite.seq
-                    && !self.invite.reserve_execution(seq)?
-                {
-                    log::info!("邀请参数 {} 已执行过，跳过", seq);
-                    return Ok(());
-                }
+                let request = InviteRequest::new(
+                    invite.username.clone(),
+                    invite.seq,
+                    invite.password.clone(),
+                );
+                let execution = match self.invite.begin(request)? {
+                    InviteStart::Duplicate { sequence } => {
+                        log::info!("邀请参数 {} 已执行过，跳过", sequence);
+                        return Ok(());
+                    }
+                    InviteStart::Ready(execution) => execution,
+                };
                 self.log_executed_command(parsed, &format!("invite {}", invite.username))?;
-                self.invite
-                    .execute(&invite.username, invite.password.as_deref(), self)?;
+                execution.run(self)?;
             }
             UserCommand::Moderation(command) => {
                 self.log_executed_command(

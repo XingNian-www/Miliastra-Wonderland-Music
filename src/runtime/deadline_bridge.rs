@@ -257,11 +257,11 @@ fn cleanup_failed_attach(timer: TimerRuntime<BusinessDeadlineToken>, business: B
     if let Err(error) = business.prepare_shutdown() {
         log::error!("业务期限 bridge 启动失败后的业务静默关闭失败: {error}");
     }
-    if let Err(error) = timer.shutdown() {
-        log::error!("业务期限 bridge 启动失败后的计时运行时关闭失败: {error}");
-    }
     if let Err(error) = business.shutdown() {
         log::error!("业务期限 bridge 启动失败后的业务运行时关闭失败: {error}");
+    }
+    if let Err(error) = timer.shutdown() {
+        log::error!("业务期限 bridge 启动失败后的计时运行时关闭失败: {error}");
     }
 }
 
@@ -272,13 +272,13 @@ struct BusinessDeadlineRuntime {
 }
 
 impl BusinessDeadlineRuntime {
-    fn shutdown(
-        mut self,
+    fn stop(
+        &mut self,
     ) -> Result<BusinessDeadlineBridgeSnapshot, BusinessDeadlineRuntimeShutdownError> {
-        self.stop()
+        self.stop_with()
     }
 
-    fn stop(
+    fn stop_with(
         &mut self,
     ) -> Result<BusinessDeadlineBridgeSnapshot, BusinessDeadlineRuntimeShutdownError> {
         let timer_result = self.timer.take().map(TimerRuntime::shutdown).transpose();
@@ -361,8 +361,8 @@ impl Display for BusinessRuntimeGroupShutdownError {
 
 impl Error for BusinessRuntimeGroupShutdownError {}
 
-/// Owns the business worker together with its sole timer and bridge. There is no public path that
-/// can stop the business destination before the timer event stream has been drained.
+/// Owns the business worker together with its sole timer and bridge. Shutdown first quiesces
+/// business state and stops external workers, drains the timer bridge, then exits the worker.
 pub(crate) struct BusinessRuntimeGroup {
     deadlines: Option<BusinessDeadlineRuntime>,
     business: Option<BusinessRuntime>,
@@ -394,10 +394,13 @@ impl BusinessRuntimeGroup {
             .business
             .as_ref()
             .and_then(|business| business.prepare_shutdown().err());
+        if let Some(business) = self.business.as_mut() {
+            business.stop_external_workers();
+        }
         let (deadline_snapshot, deadline_error) = match self
             .deadlines
             .take()
-            .map(BusinessDeadlineRuntime::shutdown)
+            .map(|mut deadlines| deadlines.stop_with())
             .transpose()
         {
             Ok(snapshot) => (snapshot.unwrap_or_default(), None),
@@ -782,7 +785,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_attach_cleanup_stops_timer_then_business_handles() {
+    fn failed_attach_cleanup_stops_business_then_timer_handles() {
         let timer_owner = BusinessRuntimeGroupBuilder::start(2).unwrap();
         let timer = timer_owner.handle();
         let business_runtime = business_runtime(2);

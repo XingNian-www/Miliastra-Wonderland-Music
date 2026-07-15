@@ -1,9 +1,14 @@
 use std::collections::VecDeque;
 use std::sync::mpsc::{self, Sender, SyncSender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
+
+use crate::features::turtle_soup::TurtleSoupSnapshot;
+use crate::features::undercover::UndercoverSnapshot;
+use crate::runtime::business::BusinessStateSink;
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -93,6 +98,8 @@ pub(super) struct MonitorSnapshot {
     pub(super) playback_controller: MonitorPlaybackController,
     pub(super) chat_listener: MonitorChatListener,
     pub(super) operational: MonitorOperationalState,
+    pub(super) turtle_soup: TurtleSoupSnapshot,
+    pub(super) undercover: UndercoverSnapshot,
 }
 
 #[derive(Debug)]
@@ -114,6 +121,8 @@ pub(super) enum MonitorEvent {
         hall_remaining_minutes: Option<u32>,
     },
     UiState(String),
+    TurtleSoup(TurtleSoupSnapshot),
+    Undercover(UndercoverSnapshot),
 }
 
 enum MonitorMessage {
@@ -122,11 +131,17 @@ enum MonitorMessage {
         applied: SyncSender<()>,
     },
     Snapshot(SyncSender<MonitorSnapshot>),
+    Shutdown(SyncSender<()>),
+}
+
+struct MonitorRuntime {
+    events: Sender<MonitorMessage>,
+    worker: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
 #[derive(Clone)]
 pub(crate) struct MonitorShared {
-    events: Sender<MonitorMessage>,
+    runtime: Arc<MonitorRuntime>,
 }
 
 #[derive(Clone)]
@@ -145,6 +160,8 @@ struct MonitorState {
     playback_controller: MonitorPlaybackController,
     chat_listener: MonitorChatListener,
     operational: MonitorOperationalState,
+    turtle_soup: TurtleSoupSnapshot,
+    undercover: UndercoverSnapshot,
 }
 
 struct MonitorProjection {
@@ -196,6 +213,8 @@ impl MonitorProjection {
                 state.operational.hall_remaining_minutes = hall_remaining_minutes;
             }
             MonitorEvent::UiState(ui_state) => state.operational.ui_state = ui_state,
+            MonitorEvent::TurtleSoup(snapshot) => state.turtle_soup = snapshot,
+            MonitorEvent::Undercover(snapshot) => state.undercover = snapshot,
         }
     }
 
@@ -210,6 +229,8 @@ impl MonitorProjection {
             playback_controller: state.playback_controller.clone(),
             chat_listener: state.chat_listener.clone(),
             operational: state.operational.clone(),
+            turtle_soup: state.turtle_soup.clone(),
+            undercover: state.undercover.clone(),
         }
     }
 }
@@ -230,10 +251,12 @@ impl MonitorShared {
                     commands_enabled: true,
                     ..MonitorOperationalState::default()
                 },
+                turtle_soup: TurtleSoupSnapshot::default(),
+                undercover: UndercoverSnapshot::default(),
             },
         };
         let (events, receiver) = mpsc::channel::<MonitorMessage>();
-        thread::Builder::new()
+        let worker = thread::Builder::new()
             .name("monitor-projection".to_string())
             .spawn(move || {
                 while let Ok(message) = receiver.recv() {
@@ -245,11 +268,20 @@ impl MonitorShared {
                         MonitorMessage::Snapshot(response) => {
                             let _ = response.send(projection.snapshot());
                         }
+                        MonitorMessage::Shutdown(response) => {
+                            let _ = response.send(());
+                            break;
+                        }
                     }
                 }
             })
-            .ok();
-        Self { events }
+            .expect("启动监控投影线程失败");
+        Self {
+            runtime: Arc::new(MonitorRuntime {
+                events,
+                worker: Mutex::new(Some(worker)),
+            }),
+        }
     }
 
     pub(crate) fn log_sink(&self) -> MonitorLogSink {
@@ -261,6 +293,7 @@ impl MonitorShared {
     pub(super) fn publish(&self, event: MonitorEvent) {
         let (applied, wait) = mpsc::sync_channel(0);
         if self
+            .runtime
             .events
             .send(MonitorMessage::Event {
                 event: Box::new(event),
@@ -272,9 +305,18 @@ impl MonitorShared {
         }
     }
 
+    pub(super) fn publish_async(&self, event: MonitorEvent) {
+        let (applied, _wait) = mpsc::sync_channel(0);
+        let _ = self.runtime.events.send(MonitorMessage::Event {
+            event: Box::new(event),
+            applied,
+        });
+    }
+
     pub(super) fn snapshot(&self) -> MonitorSnapshot {
         let (response, receiver) = mpsc::sync_channel(1);
         if self
+            .runtime
             .events
             .send(MonitorMessage::Snapshot(response))
             .is_err()
@@ -282,6 +324,46 @@ impl MonitorShared {
             return unavailable_snapshot();
         }
         receiver.recv().unwrap_or_else(|_| unavailable_snapshot())
+    }
+
+    pub(crate) fn shutdown(&self) {
+        self.runtime.shutdown();
+    }
+}
+
+impl MonitorRuntime {
+    fn shutdown(&self) {
+        let worker = self.worker.lock().ok().and_then(|mut worker| worker.take());
+        let Some(worker) = worker else {
+            return;
+        };
+        let (ack, done) = mpsc::sync_channel(0);
+        if self.runtime_send(MonitorMessage::Shutdown(ack)).is_ok() {
+            let _ = done.recv();
+        }
+        if worker.join().is_err() {
+            log::error!("监控投影线程退出时 panic");
+        }
+    }
+
+    fn runtime_send(&self, message: MonitorMessage) -> std::result::Result<(), ()> {
+        self.events.send(message).map_err(|_| ())
+    }
+}
+
+impl Drop for MonitorRuntime {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+impl BusinessStateSink for MonitorShared {
+    fn publish_turtle_soup(&self, snapshot: TurtleSoupSnapshot) {
+        self.publish_async(MonitorEvent::TurtleSoup(snapshot));
+    }
+
+    fn publish_undercover(&self, snapshot: UndercoverSnapshot) {
+        self.publish_async(MonitorEvent::Undercover(snapshot));
     }
 }
 
@@ -295,6 +377,8 @@ fn unavailable_snapshot() -> MonitorSnapshot {
         playback_controller: MonitorPlaybackController::default(),
         chat_listener: MonitorChatListener::default(),
         operational: MonitorOperationalState::default(),
+        turtle_soup: TurtleSoupSnapshot::default(),
+        undercover: UndercoverSnapshot::default(),
     }
 }
 
@@ -336,6 +420,15 @@ mod tests {
             hall_remaining_minutes: Some(8),
         });
         monitor.publish(MonitorEvent::UiState("secondary:chat".to_string()));
+        monitor.publish(MonitorEvent::TurtleSoup(TurtleSoupSnapshot {
+            enabled: true,
+            ..TurtleSoupSnapshot::default()
+        }));
+        monitor.publish(MonitorEvent::Undercover(UndercoverSnapshot {
+            enabled: true,
+            phase: "lobby",
+            ..UndercoverSnapshot::default()
+        }));
 
         let snapshot = monitor.snapshot();
         assert_eq!(snapshot.queue.len(), 1);
@@ -347,5 +440,8 @@ mod tests {
         assert_eq!(snapshot.operational.idle_exit_remaining_seconds, Some(12));
         assert_eq!(snapshot.operational.hall_remaining_minutes, Some(8));
         assert_eq!(snapshot.operational.ui_state, "secondary:chat");
+        assert!(snapshot.turtle_soup.enabled);
+        assert!(snapshot.undercover.enabled);
+        monitor.shutdown();
     }
 }

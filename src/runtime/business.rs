@@ -19,6 +19,7 @@ use crate::features::turtle_soup::{
     TurtleSoupAiCompletionPort, TurtleSoupAppendReceipt, TurtleSoupCommand,
     TurtleSoupCommandOutcome, TurtleSoupDeadlineKind, TurtleSoupDeadlineToken, TurtleSoupDelivery,
     TurtleSoupQuestion, TurtleSoupService, TurtleSoupSnapshot, TurtleSoupSubmission,
+    TurtleSoupWorkerRuntime,
 };
 #[cfg(test)]
 use crate::features::undercover::UndercoverConfig;
@@ -50,6 +51,13 @@ pub enum BusinessEvent {
     CompletionGap(ObservationGap),
     Timer(BusinessDeadlineEvent),
     TurtleSoupAiCompleted(TurtleSoupAiCompletion),
+}
+
+/// Narrow projection port for business-owned public state. Implementations must only retain
+/// the already-redacted snapshots; business internals never depend on the monitor shape.
+pub(crate) trait BusinessStateSink: Send + Sync {
+    fn publish_turtle_soup(&self, snapshot: TurtleSoupSnapshot);
+    fn publish_undercover(&self, snapshot: UndercoverSnapshot);
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -860,7 +868,7 @@ impl TurtleSoupAiCompletionPort for TurtleSoupBusinessEventPort {
 pub struct BusinessRuntime {
     handle: BusinessRuntimeHandle,
     worker: Option<JoinHandle<()>>,
-    turtle_soup_workers: Option<TurtleSoupService>,
+    turtle_soup_workers: Option<TurtleSoupWorkerRuntime>,
 }
 
 impl BusinessRuntime {
@@ -875,6 +883,7 @@ impl BusinessRuntime {
             idiom_chain,
             card_games,
             default_undercover_service(),
+            None,
             None,
             None,
         )
@@ -895,16 +904,18 @@ impl BusinessRuntime {
             undercover,
             Some(turtle_soup),
             None,
+            None,
         )
     }
 
-    pub(crate) fn start_with_timer_and_modules(
+    pub(crate) fn start_with_timer_and_modules_and_state_sink(
         queue_capacity: usize,
         idiom_chain: IdiomChainService,
         card_games: CardGameService,
         undercover: UndercoverRuntimeService,
         turtle_soup: TurtleSoupService,
         timer: TimerRuntimeHandle<BusinessDeadlineToken>,
+        state_sink: Arc<dyn BusinessStateSink>,
     ) -> Result<Self, BusinessRuntimeError> {
         Self::start_internal(
             queue_capacity,
@@ -913,6 +924,7 @@ impl BusinessRuntime {
             undercover,
             Some(turtle_soup),
             Some(timer),
+            Some(state_sink),
         )
     }
 
@@ -921,8 +933,9 @@ impl BusinessRuntime {
         idiom_chain: IdiomChainService,
         card_games: CardGameService,
         undercover: UndercoverRuntimeService,
-        turtle_soup: Option<TurtleSoupService>,
+        mut turtle_soup: Option<TurtleSoupService>,
         timer: Option<TimerRuntimeHandle<BusinessDeadlineToken>>,
+        state_sink: Option<Arc<dyn BusinessStateSink>>,
     ) -> Result<Self, BusinessRuntimeError> {
         if queue_capacity == 0 {
             return Err(BusinessRuntimeError::ZeroQueueCapacity);
@@ -935,12 +948,12 @@ impl BusinessRuntime {
         let event_sink = BusinessRuntimeEventSink {
             channel: channel.clone(),
         };
-        let turtle_soup_workers = turtle_soup.clone();
-        if let Some(service) = turtle_soup_workers.as_ref() {
-            service.start_workers_with_port(Arc::new(TurtleSoupBusinessEventPort {
-                sink: event_sink,
-            }));
-        }
+        let mut turtle_soup_workers = if let Some(service) = turtle_soup.as_mut() {
+            service
+                .start_workers_with_port(Arc::new(TurtleSoupBusinessEventPort { sink: event_sink }))
+        } else {
+            None
+        };
         let worker = thread::Builder::new()
             .name("business-runtime".to_string())
             .spawn(move || {
@@ -951,11 +964,12 @@ impl BusinessRuntime {
                     undercover,
                     turtle_soup,
                     timer,
+                    state_sink,
                 )
             })
             .map_err(|_| {
-                if let Some(service) = turtle_soup_workers.as_ref() {
-                    service.shutdown();
+                if let Some(workers) = turtle_soup_workers.as_mut() {
+                    workers.shutdown();
                 }
                 BusinessRuntimeError::RuntimeStopped
             })?;
@@ -1008,10 +1022,16 @@ impl BusinessRuntime {
         self.stop_worker()
     }
 
+    pub(crate) fn stop_external_workers(&mut self) {
+        if let Some(mut workers) = self.turtle_soup_workers.take() {
+            workers.shutdown();
+        }
+    }
+
     fn stop_worker(&mut self) -> Result<BusinessRuntimeSnapshot, BusinessRuntimeError> {
         let Some(worker) = self.worker.take() else {
-            if let Some(service) = self.turtle_soup_workers.take() {
-                service.shutdown();
+            if let Some(mut workers) = self.turtle_soup_workers.take() {
+                workers.shutdown();
             }
             return Err(BusinessRuntimeError::RuntimeStopped);
         };
@@ -1037,9 +1057,7 @@ impl BusinessRuntime {
         let worker_result = worker
             .join()
             .map_err(|_| BusinessRuntimeError::WorkerPanicked);
-        if let Some(service) = self.turtle_soup_workers.take() {
-            service.shutdown();
-        }
+        self.stop_external_workers();
         worker_result?;
         snapshot.ok_or(BusinessRuntimeError::RuntimeStopped)
     }
@@ -1476,7 +1494,7 @@ fn handle_business_timer(
     idiom_chain: &mut IdiomChainService,
     card_games: &mut CardGameService,
     undercover: &mut UndercoverRuntimeService,
-    turtle_soup: Option<&TurtleSoupService>,
+    mut turtle_soup: Option<&mut TurtleSoupService>,
     timer: Option<&TimerRuntimeHandle<BusinessDeadlineToken>>,
     active_idiom_deadline: &mut Option<ActiveIdiomDeadline>,
     active_card_game_deadline: &mut Option<ActiveCardGameDeadline>,
@@ -1505,11 +1523,11 @@ fn handle_business_timer(
                     *active_turtle_soup_deadline = Some(previous);
                     return Ok(());
                 }
-                if let Some(service) = turtle_soup {
+                if let Some(service) = turtle_soup.as_deref_mut() {
                     service.handle_deadline(*expired.token().kind(), Instant::now());
                 }
                 return sync_turtle_soup_deadline(
-                    turtle_soup,
+                    turtle_soup.as_deref(),
                     timer,
                     active_turtle_soup_deadline,
                     pending_turtle_soup_cancellations,
@@ -1553,7 +1571,7 @@ fn handle_business_timer(
                         }
                     }
                     return sync_turtle_soup_deadline(
-                        turtle_soup,
+                        turtle_soup.as_deref(),
                         timer,
                         active_turtle_soup_deadline,
                         pending_turtle_soup_cancellations,
@@ -1574,7 +1592,7 @@ fn handle_business_timer(
                 if completed.result().is_err() {
                     *active_turtle_soup_deadline = None;
                     return sync_turtle_soup_deadline(
-                        turtle_soup,
+                        turtle_soup.as_deref(),
                         timer,
                         active_turtle_soup_deadline,
                         pending_turtle_soup_cancellations,
@@ -1818,8 +1836,9 @@ fn run_business_runtime(
     mut idiom_chain: IdiomChainService,
     mut card_games: CardGameService,
     mut undercover: UndercoverRuntimeService,
-    turtle_soup: Option<TurtleSoupService>,
+    mut turtle_soup: Option<TurtleSoupService>,
     timer: Option<TimerRuntimeHandle<BusinessDeadlineToken>>,
+    state_sink: Option<Arc<dyn BusinessStateSink>>,
 ) {
     let mut snapshot = BusinessRuntimeSnapshot::default();
     let mut active_idiom_deadline = None;
@@ -1834,6 +1853,7 @@ fn run_business_runtime(
     let mut entertainment_clock_active = true;
     let operation_ids = BusinessOperationIdAllocator::new();
     let mut session_generation = SessionGeneration::INITIAL;
+    publish_business_state(&state_sink, turtle_soup.as_ref(), &undercover);
     while let Ok(message) = receiver.recv() {
         match message {
             RuntimeMessage::Event(event) => match event {
@@ -1844,7 +1864,7 @@ fn run_business_runtime(
                         &mut idiom_chain,
                         &mut card_games,
                         &mut undercover,
-                        turtle_soup.as_ref(),
+                        turtle_soup.as_mut(),
                         timer.as_ref(),
                         &mut active_idiom_deadline,
                         &mut active_card_game_deadline,
@@ -1863,10 +1883,10 @@ fn run_business_runtime(
                     }
                 }
                 BusinessEvent::TurtleSoupAiCompleted(completion) => {
-                    if let Some(service) = turtle_soup.as_ref() {
+                    if let Some(service) = turtle_soup.as_mut() {
                         service.apply_ai_completion(completion);
                         if let Err(error) = sync_turtle_soup_deadline(
-                            Some(service),
+                            Some(&*service),
                             timer.as_ref(),
                             &mut active_turtle_soup_deadline,
                             &mut pending_turtle_soup_cancellations,
@@ -1985,7 +2005,7 @@ fn run_business_runtime(
             }
             RuntimeMessage::TurtleSoup(message) => {
                 if let Err(error) = handle_turtle_soup_message(
-                    turtle_soup.as_ref(),
+                    turtle_soup.as_mut(),
                     message,
                     timer.as_ref(),
                     &mut active_turtle_soup_deadline,
@@ -2027,7 +2047,7 @@ fn run_business_runtime(
                     &mut idiom_chain,
                     &mut card_games,
                     &mut undercover,
-                    turtle_soup.as_ref(),
+                    turtle_soup.as_mut(),
                     timer.as_ref(),
                     &mut active_idiom_deadline,
                     &mut active_card_game_deadline,
@@ -2050,7 +2070,7 @@ fn run_business_runtime(
                     &mut idiom_chain,
                     &mut card_games,
                     &mut undercover,
-                    turtle_soup.as_ref(),
+                    turtle_soup.as_mut(),
                     timer.as_ref(),
                     &mut active_idiom_deadline,
                     &mut active_card_game_deadline,
@@ -2069,7 +2089,22 @@ fn run_business_runtime(
                 break;
             }
         }
+        publish_business_state(&state_sink, turtle_soup.as_ref(), &undercover);
     }
+}
+
+fn publish_business_state(
+    sink: &Option<Arc<dyn BusinessStateSink>>,
+    turtle_soup: Option<&TurtleSoupService>,
+    undercover: &UndercoverRuntimeService,
+) {
+    let Some(sink) = sink.as_ref() else {
+        return;
+    };
+    if let Some(turtle_soup) = turtle_soup {
+        sink.publish_turtle_soup(turtle_soup.snapshot());
+    }
+    sink.publish_undercover(undercover.snapshot(Instant::now()));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2077,7 +2112,7 @@ fn abort_business_modules(
     idiom_chain: &mut IdiomChainService,
     card_games: &mut CardGameService,
     undercover: &mut UndercoverRuntimeService,
-    turtle_soup: Option<&TurtleSoupService>,
+    mut turtle_soup: Option<&mut TurtleSoupService>,
     timer: Option<&TimerRuntimeHandle<BusinessDeadlineToken>>,
     active_idiom_deadline: &mut Option<ActiveIdiomDeadline>,
     active_card_game_deadline: &mut Option<ActiveCardGameDeadline>,
@@ -2099,7 +2134,7 @@ fn abort_business_modules(
         log::error!("业务运行时关闭时无法中止成语接龙: {error:#}");
     }
     let _ = undercover.abort();
-    if let Some(turtle_soup) = turtle_soup {
+    if let Some(turtle_soup) = turtle_soup.as_deref_mut() {
         turtle_soup.abort_for_context_loss("业务运行时关闭");
     }
     if let Err(error) = sync_idiom_deadline(
@@ -2134,7 +2169,7 @@ fn abort_business_modules(
         log::error!("业务运行时关闭时无法撤销谁是卧底期限: {error}");
     }
     if let Err(error) = sync_turtle_soup_deadline(
-        turtle_soup,
+        turtle_soup.as_deref(),
         timer,
         active_turtle_soup_deadline,
         pending_turtle_soup_cancellations,
@@ -2304,7 +2339,7 @@ fn handle_card_game_message(
 }
 
 fn handle_turtle_soup_message(
-    turtle_soup: Option<&TurtleSoupService>,
+    turtle_soup: Option<&mut TurtleSoupService>,
     message: TurtleSoupRuntimeMessage,
     timer: Option<&TimerRuntimeHandle<BusinessDeadlineToken>>,
     active_deadline: &mut Option<ActiveTurtleSoupDeadline>,
@@ -2362,7 +2397,7 @@ fn handle_turtle_soup_message(
         } => {
             let outcome = service.handle_hall_command(&player, &command);
             if let Err(error) = sync_turtle_soup_deadline(
-                Some(service),
+                Some(&*service),
                 timer,
                 active_deadline,
                 pending_cancellations,
@@ -2381,7 +2416,7 @@ fn handle_turtle_soup_message(
         } => {
             let outcome = service.handle_friend_command(&player, &command);
             if let Err(error) = sync_turtle_soup_deadline(
-                Some(service),
+                Some(&*service),
                 timer,
                 active_deadline,
                 pending_cancellations,
@@ -2399,7 +2434,7 @@ fn handle_turtle_soup_message(
                 .map_err(turtle_soup_operation_failed)
                 .and_then(|()| {
                     sync_turtle_soup_deadline(
-                        Some(service),
+                        Some(&*service),
                         timer,
                         active_deadline,
                         pending_cancellations,
@@ -2416,7 +2451,7 @@ fn handle_turtle_soup_message(
                 .map_err(turtle_soup_operation_failed)
                 .and_then(|()| {
                     sync_turtle_soup_deadline(
-                        Some(service),
+                        Some(&*service),
                         timer,
                         active_deadline,
                         pending_cancellations,
@@ -2433,7 +2468,7 @@ fn handle_turtle_soup_message(
                 .map_err(turtle_soup_operation_failed)
                 .and_then(|ended| {
                     sync_turtle_soup_deadline(
-                        Some(service),
+                        Some(&*service),
                         timer,
                         active_deadline,
                         pending_cancellations,
@@ -2468,7 +2503,7 @@ fn handle_turtle_soup_message(
                 .map_err(turtle_soup_operation_failed)
                 .and_then(|outcome| {
                     sync_turtle_soup_deadline(
-                        Some(service),
+                        Some(&*service),
                         timer,
                         active_deadline,
                         pending_cancellations,
@@ -2483,7 +2518,7 @@ fn handle_turtle_soup_message(
         TurtleSoupRuntimeMessage::Abort { reason } => {
             service.abort_for_context_loss(&reason);
             sync_turtle_soup_deadline(
-                Some(service),
+                Some(&*service),
                 timer,
                 active_deadline,
                 pending_cancellations,
@@ -2498,7 +2533,7 @@ fn handle_turtle_soup_message(
         TurtleSoupRuntimeMessage::DeliverySuccess { delivery } => {
             service.handle_delivery_success(delivery);
             sync_turtle_soup_deadline(
-                Some(service),
+                Some(&*service),
                 timer,
                 active_deadline,
                 pending_cancellations,
@@ -2511,7 +2546,7 @@ fn handle_turtle_soup_message(
             let error = anyhow::anyhow!(error);
             service.handle_delivery_failure(delivery, &error);
             sync_turtle_soup_deadline(
-                Some(service),
+                Some(&*service),
                 timer,
                 active_deadline,
                 pending_cancellations,

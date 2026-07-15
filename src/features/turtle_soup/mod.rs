@@ -14,7 +14,8 @@ pub(crate) use repository::{TurtleSoupAppendReceipt, TurtleSoupSubmission};
 pub(crate) use service::{
     QuestionSubmitOutcome, SecondaryOcrObservation, SecondaryOcrStability, TurtleSoupAiCompletion,
     TurtleSoupAiCompletionPort, TurtleSoupCommand, TurtleSoupCommandOutcome, TurtleSoupConfig,
-    TurtleSoupQuestion, TurtleSoupService, TurtleSoupSnapshot, parse_question_message,
+    TurtleSoupQuestion, TurtleSoupService, TurtleSoupSnapshot, TurtleSoupWorkerRuntime,
+    parse_question_message,
 };
 
 #[derive(Debug)]

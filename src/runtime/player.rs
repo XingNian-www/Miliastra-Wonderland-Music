@@ -59,6 +59,12 @@ impl PlaybackInstance {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct PlaybackIdentity {
+    pub uri: String,
+    pub instance: PlaybackInstance,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ObservationFreshness {
     Fresh,
@@ -103,19 +109,58 @@ pub struct PlayerObservation {
     pub artist: Option<String>,
     pub album_name: Option<String>,
     pub lyric_line_text: Option<String>,
+    pub lyric_line_sampled_at: Option<Instant>,
     pub progress: Option<Duration>,
     pub duration: Option<Duration>,
     pub playback_rate: Option<f64>,
     pub volume: Option<i64>,
+    pub volume_sampled_at: Option<Instant>,
     pub sampled_at: Option<Instant>,
 }
 
 impl PlayerObservation {
     pub fn confirms_uri(&self, expected: &str) -> bool {
-        self.uri_freshness.is_confirmable()
-            && normalized_uri(Some(expected))
-                .zip(self.uri.as_deref())
-                .is_some_and(|(expected, actual)| expected == actual)
+        normalized_uri(Some(expected)).is_some_and(|expected| {
+            self.fresh_identity()
+                .is_some_and(|identity| identity.uri == expected)
+        })
+    }
+
+    pub fn fresh_identity(&self) -> Option<PlaybackIdentity> {
+        if !self.uri_freshness.is_confirmable() {
+            return None;
+        }
+        let uri = normalized_uri(self.uri.as_deref())?;
+        let evidence = self.uri_evidence.as_ref()?;
+        let evidence_uri = normalized_uri(Some(&evidence.value))?;
+        if evidence.confirmed_at.is_none() || evidence_uri != uri {
+            return None;
+        }
+        Some(PlaybackIdentity {
+            uri: uri.to_owned(),
+            instance: self.playback_instance?,
+        })
+    }
+
+    /// Returns a fresh identity whose stable URI evidence was sampled at or after `not_before`.
+    pub fn fresh_identity_sampled_after(&self, not_before: Instant) -> Option<PlaybackIdentity> {
+        let identity = self.fresh_identity()?;
+        (self.uri_evidence.as_ref()?.last_sampled_at >= not_before).then_some(identity)
+    }
+
+    pub fn fresh_transport(&self) -> Option<TransportState> {
+        if !self.transport_freshness.is_confirmable() {
+            return None;
+        }
+        let transport = self.transport?;
+        let evidence = self.transport_evidence.as_ref()?;
+        (evidence.confirmed_at.is_some() && evidence.value == transport).then_some(transport)
+    }
+
+    /// Returns a fresh transport fact sampled at or after `not_before`.
+    pub fn fresh_transport_sampled_after(&self, not_before: Instant) -> Option<TransportState> {
+        let transport = self.fresh_transport()?;
+        (self.transport_evidence.as_ref()?.last_sampled_at >= not_before).then_some(transport)
     }
 
     /// Re-evaluates a cached snapshot without claiming that another player RPC occurred.
@@ -159,10 +204,12 @@ impl PlayerObservation {
             reevaluated.artist = None;
             reevaluated.album_name = None;
             reevaluated.lyric_line_text = None;
+            reevaluated.lyric_line_sampled_at = None;
             reevaluated.progress = None;
             reevaluated.duration = None;
             reevaluated.playback_rate = None;
             reevaluated.volume = None;
+            reevaluated.volume_sampled_at = None;
             reevaluated.sampled_at = None;
         } else if reevaluated.uri_freshness.is_fresh()
             && reevaluated.transport_freshness.is_fresh()
@@ -288,10 +335,12 @@ struct TrackEvidence {
     artist: Option<String>,
     album_name: Option<String>,
     lyric_line_text: Option<String>,
+    lyric_line_sampled_at: Option<Instant>,
     progress: Option<Duration>,
     duration: Option<Duration>,
     playback_rate: Option<f64>,
     volume: Option<i64>,
+    volume_sampled_at: Option<Instant>,
     sampled_at: Option<Instant>,
     progress_sampled_at: Option<Instant>,
 }
@@ -309,6 +358,7 @@ impl TrackEvidence {
         }
         if let Some(lyric_line_text) = sample.lyric_line_text.as_ref() {
             self.lyric_line_text = normalized_owned(Some(lyric_line_text.clone()));
+            self.lyric_line_sampled_at = Some(sampled_at);
         }
         if let Some(progress) = sample.progress {
             self.progress = Some(progress);
@@ -325,6 +375,7 @@ impl TrackEvidence {
         }
         if let Some(volume) = sample.volume {
             self.volume = Some(volume);
+            self.volume_sampled_at = Some(sampled_at);
         }
         self.sampled_at = Some(sampled_at);
     }
@@ -660,10 +711,12 @@ impl<C: Clock> PlayerObserver<C> {
             artist: self.evidence.artist.clone(),
             album_name: self.evidence.album_name.clone(),
             lyric_line_text: self.evidence.lyric_line_text.clone(),
+            lyric_line_sampled_at: self.evidence.lyric_line_sampled_at,
             progress,
             duration: self.evidence.duration,
             playback_rate: self.evidence.playback_rate,
             volume: self.evidence.volume,
+            volume_sampled_at: self.evidence.volume_sampled_at,
             sampled_at: self.evidence.sampled_at,
         }
     }
@@ -787,8 +840,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        ObservationFreshness, PlaybackInstance, PlayerObservationConfig, PlayerObserver,
-        RawPlayerSample, TransportState,
+        ObservationFreshness, PlaybackIdentity, PlaybackInstance, PlayerObservationConfig,
+        PlayerObserver, RawPlayerSample, TransportState,
     };
     use crate::runtime::clock::{Clock, ManualClock};
 
@@ -848,6 +901,85 @@ mod tests {
         assert_eq!(third.transport, Some(TransportState::Playing));
         assert_eq!(third.transport_freshness, ObservationFreshness::Fresh);
         assert_eq!(third.playback_instance, Some(PlaybackInstance::INITIAL));
+    }
+
+    #[test]
+    fn fresh_fact_helpers_require_current_stable_evidence() {
+        let started_at = Instant::now();
+        let clock = ManualClock::new(started_at);
+        let mut observer = observer(&clock, PlayerObservationConfig::default());
+
+        let unknown = observer.observe_sample(sample("fuo://song/1", TransportState::Playing, 1));
+        assert_eq!(unknown.fresh_identity(), None);
+        assert_eq!(unknown.fresh_transport(), None);
+
+        clock.advance(Duration::from_millis(100)).unwrap();
+        let fresh = observer.observe_sample(sample("fuo://song/1", TransportState::Playing, 2));
+        assert_eq!(
+            fresh.fresh_identity(),
+            Some(PlaybackIdentity {
+                uri: "fuo://song/1".to_string(),
+                instance: PlaybackInstance::INITIAL,
+            })
+        );
+        assert_eq!(fresh.fresh_transport(), Some(TransportState::Playing));
+
+        let mut missing_identity_evidence = fresh.clone();
+        missing_identity_evidence.uri_evidence = None;
+        assert_eq!(missing_identity_evidence.fresh_identity(), None);
+        let mut mismatched_identity_evidence = fresh.clone();
+        mismatched_identity_evidence
+            .uri_evidence
+            .as_mut()
+            .unwrap()
+            .value = "fuo://song/other".to_string();
+        assert_eq!(mismatched_identity_evidence.fresh_identity(), None);
+        let mut missing_instance = fresh.clone();
+        missing_instance.playback_instance = None;
+        assert_eq!(missing_instance.fresh_identity(), None);
+        let mut missing_transport = fresh.clone();
+        missing_transport.transport = None;
+        assert_eq!(missing_transport.fresh_transport(), None);
+        let mut missing_transport_evidence = fresh.clone();
+        missing_transport_evidence.transport_evidence = None;
+        assert_eq!(missing_transport_evidence.fresh_transport(), None);
+        let mut mismatched_transport_evidence = fresh.clone();
+        mismatched_transport_evidence
+            .transport_evidence
+            .as_mut()
+            .unwrap()
+            .value = TransportState::Paused;
+        assert_eq!(mismatched_transport_evidence.fresh_transport(), None);
+
+        assert_eq!(
+            fresh.fresh_identity_sampled_after(clock.now()),
+            fresh.fresh_identity()
+        );
+        assert_eq!(
+            fresh.fresh_transport_sampled_after(clock.now()),
+            Some(TransportState::Playing)
+        );
+        assert_eq!(
+            fresh.fresh_identity_sampled_after(clock.now() + Duration::from_millis(1)),
+            None
+        );
+        assert_eq!(
+            fresh.fresh_transport_sampled_after(clock.now() + Duration::from_millis(1)),
+            None
+        );
+
+        clock.advance(Duration::from_millis(100)).unwrap();
+        let stale = observer.observe_failure();
+        assert!(matches!(
+            stale.uri_freshness,
+            ObservationFreshness::Stale { .. }
+        ));
+        assert!(matches!(
+            stale.transport_freshness,
+            ObservationFreshness::Stale { .. }
+        ));
+        assert_eq!(stale.fresh_identity(), None);
+        assert_eq!(stale.fresh_transport(), None);
     }
 
     #[test]
@@ -1239,6 +1371,40 @@ mod tests {
     }
 
     #[test]
+    fn missing_volume_preserves_its_value_without_forging_field_sampling_time() {
+        let started_at = Instant::now();
+        let clock = ManualClock::new(started_at);
+        let mut observer = observer(&clock, PlayerObservationConfig::default());
+        let mut complete = sample("fuo://song/1", TransportState::Playing, 20);
+        complete.volume = Some(70);
+        observer.observe_sample(complete.clone());
+        let stable = observer.observe_sample(complete);
+        assert_eq!(stable.volume, Some(70));
+        assert_eq!(stable.volume_sampled_at, Some(started_at));
+
+        clock.advance(Duration::from_secs(1)).unwrap();
+        let missing = observer.observe_sample(RawPlayerSample {
+            uri: Some("fuo://song/1".to_owned()),
+            transport: Some(TransportState::Playing),
+            volume: None,
+            ..RawPlayerSample::default()
+        });
+        assert_eq!(missing.volume, Some(70));
+        assert_eq!(missing.sampled_at, Some(clock.now()));
+        assert_eq!(missing.volume_sampled_at, Some(started_at));
+
+        clock.advance(Duration::from_secs(1)).unwrap();
+        let updated = observer.observe_sample(RawPlayerSample {
+            uri: Some("fuo://song/1".to_owned()),
+            transport: Some(TransportState::Playing),
+            volume: Some(80),
+            ..RawPlayerSample::default()
+        });
+        assert_eq!(updated.volume, Some(80));
+        assert_eq!(updated.volume_sampled_at, Some(clock.now()));
+    }
+
+    #[test]
     fn huge_finite_playback_rate_saturates_progress_without_panicking() {
         let clock = ManualClock::new(Instant::now());
         let mut observer = observer(&clock, PlayerObservationConfig::default());
@@ -1443,10 +1609,12 @@ mod tests {
         assert_eq!(reevaluated.artist, None);
         assert_eq!(reevaluated.album_name, None);
         assert_eq!(reevaluated.lyric_line_text, None);
+        assert_eq!(reevaluated.lyric_line_sampled_at, None);
         assert_eq!(reevaluated.progress, None);
         assert_eq!(reevaluated.duration, None);
         assert_eq!(reevaluated.playback_rate, None);
         assert_eq!(reevaluated.volume, None);
+        assert_eq!(reevaluated.volume_sampled_at, None);
         assert_eq!(reevaluated.sampled_at, None);
     }
 
@@ -1500,10 +1668,12 @@ mod tests {
         assert_eq!(accepted.artist, None);
         assert_eq!(accepted.album_name, None);
         assert_eq!(accepted.lyric_line_text, None);
+        assert_eq!(accepted.lyric_line_sampled_at, None);
         assert_eq!(accepted.progress, None);
         assert_eq!(accepted.duration, None);
         assert_eq!(accepted.playback_rate, None);
         assert_eq!(accepted.volume, None);
+        assert_eq!(accepted.volume_sampled_at, None);
         assert_eq!(accepted.sampled_at, Some(clock.now()));
     }
 
@@ -1568,13 +1738,16 @@ mod tests {
 
     #[test]
     fn blank_lyric_explicitly_clears_it_while_missing_lyric_preserves_it() {
-        let clock = ManualClock::new(Instant::now());
+        let started_at = Instant::now();
+        let clock = ManualClock::new(started_at);
         let mut observer = observer(&clock, PlayerObservationConfig::default());
         let mut initial = sample("fuo://song/1", TransportState::Playing, 20);
         initial.lyric_line_text = Some("first line".to_owned());
         observer.observe_sample(initial.clone());
-        observer.observe_sample(initial);
+        let stable = observer.observe_sample(initial);
+        assert_eq!(stable.lyric_line_sampled_at, Some(started_at));
 
+        clock.advance(Duration::from_secs(1)).unwrap();
         let missing = observer.observe_sample(RawPlayerSample {
             uri: Some("fuo://song/1".to_owned()),
             transport: Some(TransportState::Playing),
@@ -1582,7 +1755,9 @@ mod tests {
             ..RawPlayerSample::default()
         });
         assert_eq!(missing.lyric_line_text.as_deref(), Some("first line"));
+        assert_eq!(missing.lyric_line_sampled_at, Some(started_at));
 
+        clock.advance(Duration::from_secs(1)).unwrap();
         let blank = observer.observe_sample(RawPlayerSample {
             uri: Some("fuo://song/1".to_owned()),
             transport: Some(TransportState::Playing),
@@ -1590,7 +1765,9 @@ mod tests {
             ..RawPlayerSample::default()
         });
         assert_eq!(blank.lyric_line_text, None);
+        assert_eq!(blank.lyric_line_sampled_at, Some(clock.now()));
 
+        clock.advance(Duration::from_secs(1)).unwrap();
         let updated = observer.observe_sample(RawPlayerSample {
             uri: Some("fuo://song/1".to_owned()),
             transport: Some(TransportState::Playing),
@@ -1598,5 +1775,6 @@ mod tests {
             ..RawPlayerSample::default()
         });
         assert_eq!(updated.lyric_line_text.as_deref(), Some("next line"));
+        assert_eq!(updated.lyric_line_sampled_at, Some(clock.now()));
     }
 }

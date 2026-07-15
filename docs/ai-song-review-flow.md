@@ -48,7 +48,7 @@ flowchart TD
 | Provider | 默认 endpoint | 默认 model | 鉴权方式 |
 | --- | --- | --- | --- |
 | `mimo` | `https://api.xiaomimimo.com/v1/chat/completions` | `mimo-v2.5` | `api-key` header |
-| `openai` | `https://api.openai.com/v1/chat/completions` | `gpt-5.4-mini` | `Authorization: Bearer ...` |
+| `openai` | `https://api.openai.com/v1/chat/completions` | `gpt-5.6-mini` | `Authorization: Bearer ...` |
 | `deepseek` | `https://api.deepseek.com/chat/completions` | `deepseek-chat` | `Authorization: Bearer ...` |
 | `custom` | 必须配置 | 必须配置 | `Authorization: Bearer ...` |
 

@@ -16,7 +16,7 @@ use crate::runtime::player_io::SearchCandidate;
 const MIMO_ENDPOINT: &str = "https://api.xiaomimimo.com/v1/chat/completions";
 const MIMO_MODEL: &str = "mimo-v2.5";
 const OPENAI_ENDPOINT: &str = "https://api.openai.com/v1/chat/completions";
-const OPENAI_MODEL: &str = "gpt-5.4-mini";
+const OPENAI_MODEL: &str = "gpt-5.6-mini";
 const DEEPSEEK_ENDPOINT: &str = "https://api.deepseek.com/chat/completions";
 const DEEPSEEK_MODEL: &str = "deepseek-chat";
 const CANDIDATE_PICK_LIMIT: usize = 30;

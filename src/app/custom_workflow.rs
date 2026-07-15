@@ -1,9 +1,11 @@
+#[cfg(test)]
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering as AtomicOrdering;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use super::chat_observation::ChatObservationExclusiveGuard;
 use super::command::{self, CustomWorkflowCommand, ModerationAction, ParsedCommand, UserCommand};
 use super::decision_lock::DecisionScreenLock;
 use super::frame_source::{Canvas, load_frame};
@@ -11,12 +13,17 @@ use super::ocr_runtime::OcrPriority;
 use super::ui_locator::UiLocator;
 use super::workflow_actions::{self, HitAction, PixelStability, TemplateMode};
 use super::{
-    AutomationApp, ChatDecisionScope, FrameArgs, PendingTask, PendingTaskExecution, TemplateArgs,
-    TemporaryPrimaryHold, TrackedPendingTask, UiResidency,
+    AutomationApp, ChatDecisionScope, FrameArgs, PendingTask, PendingTaskExecution,
+    ResolvedTemplateArgs, TemplateArgs, TemporaryPrimaryHold, TrackedPendingTask, UiResidency,
 };
 use crate::config::{self, CustomWorkflowConfig, CustomWorkflowDefinition, PointConfig};
 use crate::features::invite::{InviteDecision, InviteExecutionPort};
-use anyhow::{Result, anyhow, bail};
+use crate::features::moderation::{
+    ModerationCommandPort, ModerationExecutionPort, ModerationPrimaryHold,
+    ModerationResultExecution, ModerationResultPreparation, ModerationResultTask, ModerationStart,
+    ModerationTaskPort, ModerationVotePort, ModerationVoteWork, is_moderation_vote_message,
+};
+use anyhow::{Context, Result, anyhow, bail};
 
 pub(super) fn parse_text(
     config: &CustomWorkflowConfig,
@@ -131,6 +138,138 @@ enum ChatDecisionWait<T> {
     Found(T),
     Timeout,
     Stopped,
+}
+
+struct AppModerationVotePort {
+    worker: AutomationApp,
+    observation_session: Option<ChatObservationExclusiveGuard>,
+    screen_lock: DecisionScreenLock,
+    template_args: ResolvedTemplateArgs,
+    canvas: Canvas,
+}
+
+impl AppModerationVotePort {
+    fn new(worker: AutomationApp) -> Result<Self> {
+        let observation_session = worker.chat_observations.begin_exclusive()?;
+        let screen_lock = worker.collect_moderation_vote_screen_lock();
+        let template_args = TemplateArgs::default().resolve(&worker.config);
+        let canvas = Canvas {
+            width: worker.config.screen.expected_width,
+            height: worker.config.screen.expected_height,
+            resize: true,
+        };
+        Ok(Self {
+            worker,
+            observation_session: Some(observation_session),
+            screen_lock,
+            template_args,
+            canvas,
+        })
+    }
+}
+
+impl ModerationVotePort for AppModerationVotePort {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn wait(&mut self, duration: Duration) {
+        workflow_actions::wait(duration.as_millis().min(u128::from(u64::MAX)) as u64);
+    }
+
+    fn is_running(&self) -> bool {
+        self.worker.running.load(AtomicOrdering::SeqCst)
+    }
+
+    fn poll_visible_friend_messages(&mut self) -> Result<Vec<String>> {
+        let frame = load_frame(
+            &FrameArgs { image: None },
+            &self.canvas,
+            &self.worker.game_ui,
+        )
+        .context("管理投票截图失败")?;
+        let messages = self
+            .worker
+            .scan_chat_with_shared_ocr(&frame.image, &self.template_args)
+            .context("管理投票 OCR 失败")?;
+        Ok(messages
+            .into_iter()
+            .filter(|message| {
+                message.message_type == "pink" && !self.screen_lock.is_existing(message)
+            })
+            .map(|message| message.text)
+            .collect())
+    }
+
+    fn finish(&mut self) {
+        self.observation_session.take();
+    }
+}
+
+impl ModerationPrimaryHold for TemporaryPrimaryHold {
+    fn release(&mut self) {
+        TemporaryPrimaryHold::release(self);
+    }
+}
+
+impl ModerationCommandPort for AutomationApp {
+    fn send_hall(&mut self, message: &str) -> Result<()> {
+        self.reply(message)
+    }
+
+    fn prepare_vote_hold(&mut self) -> Result<Box<dyn ModerationPrimaryHold>> {
+        self.ensure_ui_residency(UiResidency::Primary, "管理投票等待前准备")?;
+        let hold = TemporaryPrimaryHold::new(self.chat_listener.clone())?;
+        self.update_monitor_chat_listener();
+        Ok(Box::new(hold))
+    }
+}
+
+impl ModerationTaskPort for AutomationApp {
+    fn is_running(&self) -> bool {
+        self.running.load(AtomicOrdering::SeqCst)
+    }
+
+    fn submit_result(&self, task: crate::features::moderation::ModerationResultTask) -> Result<()> {
+        self.push_pending_task(PendingTask::ModerationResult(task))
+    }
+
+    fn sync_listener_state(&self) {
+        self.update_monitor_chat_listener();
+    }
+}
+
+impl ModerationExecutionPort for AutomationApp {
+    fn prepare_result(&mut self, label: &str) -> Result<ModerationResultPreparation> {
+        match self.prepare_command_ui(label) {
+            Ok(true) => Ok(ModerationResultPreparation::Ready),
+            Ok(false) => {
+                log::info!("投票结果处理前未能回到一级界面，保留任务: {label}");
+                Ok(ModerationResultPreparation::Retry)
+            }
+            Err(error) if super::is_target_window_unavailable_error(&error) => Err(error),
+            Err(error) => {
+                log::error!("投票结果处理前准备界面失败，保留任务 {label}: {error:#}");
+                Ok(ModerationResultPreparation::Retry)
+            }
+        }
+    }
+
+    fn send_hall(&mut self, message: &str) -> Result<()> {
+        self.reply(message)
+    }
+
+    fn execute_action(&mut self, command: &command::ModerationCommand) -> Result<bool> {
+        self.execute_moderation_steps(command)
+    }
+
+    fn sync_listener_state(&mut self) {
+        self.update_monitor_chat_listener();
+    }
+
+    fn wait_after_action(&mut self) {
+        workflow_actions::wait(self.config.timing.command.return_retry_ms);
+    }
 }
 
 impl AutomationApp {
@@ -738,94 +877,32 @@ impl AutomationApp {
         &mut self,
         command: &command::ModerationCommand,
     ) -> Result<bool> {
-        let workflow_key = moderation_workflow_key(command);
-        if !self.moderation.begin(&workflow_key)? {
-            log::info!(
-                "{} UID{} 已有投票或执行流程，跳过重复请求",
-                command.action.label(),
-                command.uid
-            );
-            self.reply(&format!(
-                "@UID{}的{}请求正在处理中",
-                command.uid,
-                command.action.label()
-            ))?;
-            return Ok(false);
-        }
-        let vote_timeout_seconds = self
-            .config
-            .timing
-            .moderation
-            .vote_timeout_ms
-            .saturating_add(999)
-            / 1000;
-        let announce = format!(
-            "管理员发起了对@UID{}的{}请求,请好友{}s内使用@同意/不同意进行判决",
-            command.uid,
-            command.action.label(),
-            vote_timeout_seconds,
-        );
-        if let Err(error) = self.reply(&announce) {
-            self.release_moderation_workflow(&workflow_key);
-            return Err(error);
-        }
-        if let Err(error) = self.ensure_ui_residency(UiResidency::Primary, "管理投票等待前准备")
-        {
-            self.release_moderation_workflow(&workflow_key);
-            return Err(error);
-        }
-        let temporary_primary_hold = match TemporaryPrimaryHold::new(self.chat_listener.clone()) {
-            Ok(hold) => hold,
-            Err(error) => {
-                self.release_moderation_workflow(&workflow_key);
-                return Err(error);
+        let moderation = self.moderation.clone();
+        match moderation.start(command, self)? {
+            ModerationStart::Duplicate => Ok(false),
+            ModerationStart::Started(work) => {
+                self.spawn_moderation_vote(work);
+                Ok(true)
             }
-        };
-        self.update_monitor_chat_listener();
-        self.spawn_moderation_vote(command.clone(), workflow_key, temporary_primary_hold);
-        Ok(true)
+        }
     }
 
-    fn release_moderation_workflow(&self, key: &str) {
-        self.moderation.release_best_effort(key);
-    }
-
-    fn spawn_moderation_vote(
-        &self,
-        command: command::ModerationCommand,
-        workflow_key: String,
-        temporary_primary_hold: TemporaryPrimaryHold,
-    ) {
+    fn spawn_moderation_vote(&self, work: ModerationVoteWork) {
         let worker = self.clone_for_background_task();
+        let moderation = self.moderation.clone();
         thread::spawn(move || {
-            log::info!(
-                "{} UID{} 后台投票线程已启动",
-                command.action.label(),
-                command.uid
-            );
-            let approved = match worker.wait_for_moderation_votes(&command) {
-                Ok(approved) => approved,
+            let action = work.command().action;
+            let uid = work.command().uid.clone();
+            log::info!("{} UID{} 后台投票线程已启动", action.label(), uid);
+            let result = match AppModerationVotePort::new(worker.clone_for_background_task()) {
+                Ok(mut port) => moderation.run_vote(work, &mut port, &worker),
                 Err(error) => {
-                    log::error!("{}后台投票失败: {error:#}", command.action.label());
-                    false
+                    log::error!("{}后台投票失败: {error:#}", action.label());
+                    moderation.fail_vote(work, &worker)
                 }
             };
-            if !worker.running.load(AtomicOrdering::SeqCst) {
-                worker.release_moderation_workflow(&workflow_key);
-                drop(temporary_primary_hold);
-                worker.update_monitor_chat_listener();
-                return;
-            }
-            let task = PendingTask::ModerationVoteResult {
-                command: Box::new(command),
-                approved,
-                workflow_key: workflow_key.clone(),
-                temporary_primary_hold,
-            };
-            if let Err(error) = worker.push_pending_task(task) {
+            if let Err(error) = result {
                 log::error!("后台投票结果加入队列失败: {error:#}");
-                worker.release_moderation_workflow(&workflow_key);
-                worker.update_monitor_chat_listener();
             }
         });
     }
@@ -833,183 +910,22 @@ impl AutomationApp {
     pub(super) fn execute_moderation_vote_result(
         &mut self,
         task_id: u64,
-        command: command::ModerationCommand,
-        approved: bool,
-        workflow_key: String,
-        mut temporary_primary_hold: TemporaryPrimaryHold,
+        task: ModerationResultTask,
     ) -> Result<PendingTaskExecution> {
-        let task_label = format!("{} UID{} 投票结果", command.action.label(), command.uid);
-        match self.prepare_command_ui(&task_label) {
-            Ok(true) => {}
-            Ok(false) => {
-                log::info!("投票结果处理前未能回到一级界面，保留任务: {}", task_label);
-                let release_key = workflow_key.clone();
-                let task = TrackedPendingTask {
+        let moderation = self.moderation.clone();
+        match moderation.execute_result(task, self)? {
+            ModerationResultExecution::Completed => Ok(PendingTaskExecution::Completed),
+            ModerationResultExecution::Retry(task) => {
+                let tracked = TrackedPendingTask {
                     id: task_id,
-                    task: PendingTask::ModerationVoteResult {
-                        command: Box::new(command),
-                        approved,
-                        workflow_key,
-                        temporary_primary_hold,
-                    },
+                    task: PendingTask::ModerationResult(task),
                 };
-                if let Err(error) = self.push_pending_task_front(task) {
-                    self.release_moderation_workflow(&release_key);
+                if let Err(error) = self.push_pending_task_front(tracked) {
+                    self.update_monitor_chat_listener();
                     return Err(error);
                 }
-                return Ok(PendingTaskExecution::Requeued);
+                Ok(PendingTaskExecution::Requeued)
             }
-            Err(error) => {
-                if super::is_target_window_unavailable_error(&error) {
-                    self.release_moderation_workflow(&workflow_key);
-                    return Err(error);
-                }
-                log::error!(
-                    "投票结果处理前准备界面失败，保留任务 {}: {error:#}",
-                    task_label
-                );
-                let release_key = workflow_key.clone();
-                let task = TrackedPendingTask {
-                    id: task_id,
-                    task: PendingTask::ModerationVoteResult {
-                        command: Box::new(command),
-                        approved,
-                        workflow_key,
-                        temporary_primary_hold,
-                    },
-                };
-                if let Err(error) = self.push_pending_task_front(task) {
-                    self.release_moderation_workflow(&release_key);
-                    return Err(error);
-                }
-                return Ok(PendingTaskExecution::Requeued);
-            }
-        }
-
-        let _workflow_release = self.moderation.release_guard(workflow_key);
-        if !approved {
-            temporary_primary_hold.release();
-            self.update_monitor_chat_listener();
-            self.reply(&format!(
-                "@UID{}的{}请求未通过",
-                command.uid,
-                command.action.label()
-            ))?;
-            return Ok(PendingTaskExecution::Completed);
-        }
-        if let Err(error) = self.reply(&format!(
-            "@UID{}的{}请求已通过,开始执行",
-            command.uid,
-            command.action.label()
-        )) {
-            temporary_primary_hold.release();
-            self.update_monitor_chat_listener();
-            return Err(error);
-        }
-        let result = self.execute_moderation_steps(&command);
-        temporary_primary_hold.release();
-        self.update_monitor_chat_listener();
-        workflow_actions::wait(self.config.timing.command.return_retry_ms);
-        match &result {
-            Ok(true) => {
-                if let Err(error) = self.reply(&format!(
-                    "已对@UID{}执行{}",
-                    command.uid,
-                    command.action.label()
-                )) {
-                    log::error!("{}成功通告发送失败: {error:#}", command.action.label());
-                }
-            }
-            Ok(false) | Err(_) => {
-                let _ = self.reply(&format!(
-                    "@UID{}的{}流程出错",
-                    command.uid,
-                    command.action.label()
-                ));
-            }
-        }
-        result.map(|_| PendingTaskExecution::Completed)
-    }
-
-    fn wait_for_moderation_votes(&self, command: &command::ModerationCommand) -> Result<bool> {
-        let _observation_session = self.chat_observations.begin_exclusive()?;
-        let screen_lock = self.collect_moderation_vote_screen_lock();
-        let deadline =
-            Instant::now() + Duration::from_millis(self.config.timing.moderation.vote_timeout_ms);
-        let template_args = TemplateArgs::default().resolve(&self.config);
-        let canvas = Canvas {
-            width: self.config.screen.expected_width,
-            height: self.config.screen.expected_height,
-            resize: true,
-        };
-        let mut stable_votes: HashMap<String, bool> = HashMap::new();
-        let mut samples: HashMap<(String, bool), u32> = HashMap::new();
-        while self.running.load(AtomicOrdering::SeqCst) && Instant::now() < deadline {
-            workflow_actions::wait(self.config.timing.moderation.vote_poll_ms);
-            let frame = match load_frame(&FrameArgs { image: None }, &canvas, &self.game_ui) {
-                Ok(frame) => frame,
-                Err(error) => {
-                    log::error!("{}投票截图失败: {error:#}", command.action.label());
-                    continue;
-                }
-            };
-            let messages = match self.scan_chat_with_shared_ocr(&frame.image, &template_args) {
-                Ok(messages) => messages,
-                Err(error) => {
-                    log::error!("{}投票扫描失败: {error:#}", command.action.label());
-                    continue;
-                }
-            };
-            for message in messages {
-                if message.message_type != "pink" || screen_lock.is_existing(&message) {
-                    continue;
-                }
-                let Some((username, agreed)) = parse_friend_moderation_vote(&message.text) else {
-                    continue;
-                };
-                let key = (username.clone(), agreed);
-                let count = samples
-                    .entry(key)
-                    .and_modify(|value| *value += 1)
-                    .or_insert(1);
-                if *count >= self.config.moderation.stable_vote_samples {
-                    stable_votes.insert(username, agreed);
-                }
-            }
-            let agree = stable_votes.values().filter(|agreed| **agreed).count() as i32;
-            let disagree = stable_votes.values().filter(|agreed| !**agreed).count() as i32;
-            log::info!(
-                "{}投票: 同意={} 不同意={} 差值={} 目标差值={}",
-                command.action.label(),
-                agree,
-                disagree,
-                agree - disagree,
-                self.config.moderation.required_vote_margin,
-            );
-            if agree - disagree >= self.config.moderation.required_vote_margin {
-                return Ok(true);
-            }
-        }
-        if !self.running.load(AtomicOrdering::SeqCst) {
-            return Ok(false);
-        }
-        let agree = stable_votes.values().filter(|agreed| **agreed).count() as i32;
-        let disagree = stable_votes.values().filter(|agreed| !**agreed).count() as i32;
-        if disagree == 0 {
-            log::info!(
-                "{}投票超时: 同意={} 不同意=0，无反对，按通过处理",
-                command.action.label(),
-                agree,
-            );
-            Ok(true)
-        } else {
-            log::info!(
-                "{}投票超时: 同意={} 不同意={}，未达到目标差值，按未通过处理",
-                command.action.label(),
-                agree,
-                disagree,
-            );
-            Ok(false)
         }
     }
 
@@ -1029,7 +945,7 @@ impl AutomationApp {
         DecisionScreenLock::from_messages(
             &messages,
             &|message_type| message_type == "pink",
-            &|text| parse_friend_moderation_vote(text).is_some(),
+            &is_moderation_vote_message,
         )
     }
 
@@ -1625,34 +1541,6 @@ fn parse_custom_workflow_confirmation(text: &str) -> Option<bool> {
     }
 }
 
-fn parse_friend_moderation_vote(text: &str) -> Option<(String, bool)> {
-    let sep_index = text.find(['：', ':', ']', '】'])?;
-    let username = text[..sep_index]
-        .trim_matches(['[', '【', ']', '】', ' ', '\t'])
-        .to_string();
-    if username.trim().is_empty() {
-        return None;
-    }
-    let sep_len = text[sep_index..].chars().next()?.len_utf8();
-    let command_text = text[sep_index + sep_len..]
-        .trim_start_matches(['：', ':', ' ', '\t', ']', '】'])
-        .strip_prefix('@')?
-        .trim_start();
-    if command_text
-        .strip_prefix("不同意")
-        .is_some_and(|rest| decision_boundary(rest.chars().next()))
-    {
-        Some((username, false))
-    } else if command_text
-        .strip_prefix("同意")
-        .is_some_and(|rest| decision_boundary(rest.chars().next()))
-    {
-        Some((username, true))
-    } else {
-        None
-    }
-}
-
 fn decision_boundary(ch: Option<char>) -> bool {
     match ch {
         None => true,
@@ -1664,10 +1552,6 @@ fn decision_boundary(ch: Option<char>) -> bool {
                 )
         }
     }
-}
-
-fn moderation_workflow_key(command: &command::ModerationCommand) -> String {
-    format!("{}:{}", command.action.label(), command.uid)
 }
 
 fn custom_step_text(step: &config::CustomWorkflowStep, context: &WorkflowContext) -> String {

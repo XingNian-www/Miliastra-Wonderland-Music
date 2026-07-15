@@ -34,11 +34,11 @@ flowchart TD
 
 | 文件 | 职责 |
 | --- | --- |
-| `src/app/ai.rs` | 点歌 AI Provider、候选选择、同曲判断、Web AI 调试入口的核心实现。 |
+| `src/app/ai.rs` | 点歌 AI Provider、候选选择、同曲诊断和 Web AI 调试入口的核心实现。 |
 | `src/app/song_review.rs` | 候选歌曲审核 Provider、审核提示词、重试、失败策略、JSON 解析。 |
 | `src/main.rs` | 点歌执行主流程，连接候选解析、审核、入队、播放确认。 |
 | `src/app/http_server.rs` | 远程点歌、远程 AI 点歌、Web AI 调试路由。 |
-| `src/app/config.rs` | `ai` 和 `song_review` 配置结构。 |
+| `src/config/mod.rs` | `ai` 和 `song_review` 配置结构。 |
 | `config.yaml` | 默认配置和中文注释。 |
 
 ## 点歌 AI Provider
@@ -48,7 +48,7 @@ flowchart TD
 | Provider | 默认 endpoint | 默认 model | 鉴权方式 |
 | --- | --- | --- | --- |
 | `mimo` | `https://api.xiaomimimo.com/v1/chat/completions` | `mimo-v2.5` | `api-key` header |
-| `openai` | `https://api.openai.com/v1/chat/completions` | `gpt-4o-mini` | `Authorization: Bearer ...` |
+| `openai` | `https://api.openai.com/v1/chat/completions` | `gpt-5.4-mini` | `Authorization: Bearer ...` |
 | `deepseek` | `https://api.deepseek.com/chat/completions` | `deepseek-chat` | `Authorization: Bearer ...` |
 | `custom` | 必须配置 | 必须配置 | `Authorization: Bearer ...` |
 
@@ -61,7 +61,7 @@ flowchart TD
 | 能力 | 函数 | 使用场景 |
 | --- | --- | --- |
 | 文本识别测试 | `recognize_with_query()` | Web 调试接口 `/ai/recognize`，用于测试提示词，不参与主聊天 OCR。 |
-| 同曲判断 | `match_same_song()` | 仅保留为独立诊断接口；播放确认不再用 AI 或歌名歌手覆盖 URI 身份。 |
+| 同曲诊断 | `match_with_query()` | 仅供 Web 调试接口使用；播放确认不再用 AI 或歌名歌手覆盖 URI 身份。 |
 | 候选选择 | `pick_song_candidate()` | AI 点歌时，从 FeelUOwn 搜索候选中选择一个 URI。 |
 
 候选选择有两个硬约束：
@@ -112,7 +112,7 @@ AI 返回 `match=true` 或 `decision=match` 时，只作为独立诊断结果展
 
 这个设计意味着：
 
-- AI 同曲接口只用于独立诊断，不参与播放确认，也不会替代候选歌曲审核。
+- AI 同曲诊断接口只用于 Web 独立诊断，不参与播放确认，也不会替代候选歌曲审核。
 - AI 点歌返回的 URI 播放时通常会设置 `skip_match_check`，优先等待 URI 生效。
 - 普通点歌的播放确认只依赖稳定 URI。
 - 同曲判断结果不会直接改播放器后端状态；最终仍由播放器控制器写入确认播放状态和活动播放请求。
@@ -201,7 +201,7 @@ AI 返回 `match=true` 或 `decision=match` 时，只作为独立诊断结果展
 | `/searchSource` | 远程普通点歌 | 当前和 `/searchPlay` 一样走远程点歌入队。 |
 | `/ai/search` | 远程 AI 点歌 | 构造控制台 `@AI点歌`，进入待执行任务队列。 |
 | `/ai/recognize` | AI 调试 | 直接调用点歌 AI 文本识别测试，不入队。 |
-| `/ai/match` | AI 调试 | 直接调用点歌 AI 同曲判断测试，不入队。 |
+| `/ai/match` | AI 调试 | 直接调用点歌 AI 同曲诊断测试，不入队。 |
 | `/ai/pick` | AI 调试 | 直接调用点歌 AI 候选选择测试，不入队。 |
 | `/queue/add` | 直接队列写入 | 直接追加音乐播放队列，不走候选解析和候选审核。 |
 

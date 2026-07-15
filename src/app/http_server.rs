@@ -25,7 +25,9 @@ use url::form_urlencoded;
 
 use super::ai;
 use super::chat_listener::{ChatListenerMode, ChatListenerShared};
-use super::command::{self, ParsedCommand, PendingCommand, SongCommand, SongSource, UserCommand};
+use super::command::{
+    self, ConsoleCommandIntent, PendingCommand, SongCommand, SongSource, UserCommand,
+};
 use super::custom_workflow;
 use super::decision_control::{DecisionAction, DecisionControlShared};
 #[cfg(test)]
@@ -1768,8 +1770,9 @@ fn ai_route_error(error: anyhow::Error) -> AppError {
 
 fn enqueue_remote_command(
     state: &HttpSharedState,
-    pending: PendingCommand,
+    intent: ConsoleCommandIntent,
 ) -> std::result::Result<String, AppError> {
+    let pending = intent.into_pending();
     let command = pending.parsed.raw.clone();
     let queued = enqueue_pending_command(state, pending)?;
     let task_id = queued.map(|receipt| receipt.task_id);
@@ -1849,19 +1852,12 @@ fn enqueue_startup_task_response<const N: usize>(
     Ok(response.to_string())
 }
 
-fn remote_control_command(raw: String, matched: &str, command: UserCommand) -> PendingCommand {
-    let parsed = ParsedCommand {
-        matched: matched.to_string(),
-        user_command: format!("@{}", raw),
-        raw,
-        message_type: "控制台".to_string(),
-        username: "控制台".to_string(),
-        command,
-    };
-    PendingCommand {
-        lock_key: command::lock_key(&parsed),
-        parsed,
-    }
+fn remote_control_command(
+    raw: String,
+    matched: &str,
+    command: UserCommand,
+) -> ConsoleCommandIntent {
+    ConsoleCommandIntent::new(raw, matched, command)
 }
 
 fn enqueue_remote_song(
@@ -1876,20 +1872,10 @@ fn enqueue_remote_song(
         "preferAccompaniment",
         "accompaniment",
     ));
-    let pending = remote_song_command(keyword, source, prefer_accompaniment, ai_assisted)?;
-    let command = pending.parsed.raw.clone();
-    let queued = enqueue_pending_command(state, pending)?;
-    let task_id = queued.map(|receipt| receipt.task_id);
-    let position = queued.map_or(0, |receipt| receipt.position);
-    Ok(json!({
-        "ok": true,
-        "queued": queued.is_some(),
-        "duplicate": queued.is_none(),
-        "taskId": task_id,
-        "position": position,
-        "command": command,
-    })
-    .to_string())
+    enqueue_remote_command(
+        state,
+        remote_song_command(keyword, source, prefer_accompaniment, ai_assisted)?,
+    )
 }
 
 fn remote_song_command(
@@ -1897,7 +1883,7 @@ fn remote_song_command(
     source: String,
     prefer_accompaniment: bool,
     ai_assisted: bool,
-) -> std::result::Result<PendingCommand, AppError> {
+) -> std::result::Result<ConsoleCommandIntent, AppError> {
     let contains_accompaniment = keyword.contains("伴奏");
     let keyword = keyword
         .replace("伴奏", " ")
@@ -1923,35 +1909,20 @@ fn remote_song_command(
             }
         }
     };
-    let user_command = if prefer_accompaniment {
-        format!("@{} {} 伴奏", prefix, keyword)
-    } else {
-        format!("@{} {}", prefix, keyword)
-    };
     let raw = if prefer_accompaniment {
         format!("{} {} 伴奏", prefix, keyword)
     } else {
         format!("{} {}", prefix, keyword)
     };
-    let parsed = ParsedCommand {
-        matched: prefix.to_string(),
-        raw,
-        user_command,
-        message_type: "控制台".to_string(),
-        username: "控制台".to_string(),
-        command: UserCommand::Song(SongCommand {
-            keyword,
-            source: song_source,
-            prefix: prefix.to_string(),
-            prefer_accompaniment,
-            ai_assisted,
-            friend_username: String::new(),
-        }),
-    };
-    Ok(PendingCommand {
-        lock_key: command::lock_key(&parsed),
-        parsed,
-    })
+    let command = UserCommand::Song(SongCommand {
+        keyword,
+        source: song_source,
+        prefix: prefix.to_string(),
+        prefer_accompaniment,
+        ai_assisted,
+        friend_username: String::new(),
+    });
+    Ok(ConsoleCommandIntent::new(raw, prefix, command))
 }
 
 fn queue_json(state: &HttpSharedState) -> std::result::Result<String, AppError> {
@@ -3582,7 +3553,8 @@ workflows:
 
     #[test]
     fn remote_next_builds_console_game_command() {
-        let pending = remote_control_command("下一首".to_string(), "下一首", UserCommand::Next);
+        let pending = remote_control_command("下一首".to_string(), "下一首", UserCommand::Next)
+            .into_pending();
 
         assert_eq!(pending.parsed.message_type, "控制台");
         assert_eq!(pending.parsed.username, "控制台");
@@ -3597,7 +3569,8 @@ workflows:
             "音量 60".to_string(),
             "音量",
             UserCommand::Volume("60".to_string()),
-        );
+        )
+        .into_pending();
 
         assert_eq!(pending.parsed.raw, "音量 60");
         assert_eq!(pending.parsed.user_command, "@音量 60");
@@ -3964,7 +3937,8 @@ workflows:
     fn remote_song_command_builds_console_plain_song() {
         let pending =
             remote_song_command("晴天 伴奏".to_string(), "qqmusic".to_string(), false, false)
-                .expect("remote song command");
+                .expect("remote song command")
+                .into_pending();
 
         assert_eq!(pending.parsed.message_type, "控制台");
         assert_eq!(pending.parsed.username, "控制台");
@@ -3984,7 +3958,8 @@ workflows:
     #[test]
     fn remote_song_command_builds_console_ai_song() {
         let pending = remote_song_command("晴天".to_string(), "qqmusic".to_string(), false, true)
-            .expect("remote ai song command");
+            .expect("remote ai song command")
+            .into_pending();
 
         assert_eq!(pending.parsed.raw, "AI点歌 晴天");
         match pending.parsed.command {
@@ -4004,7 +3979,8 @@ workflows:
             false,
             false,
         )
-        .expect("remote bilibili song command");
+        .expect("remote bilibili song command")
+        .into_pending();
 
         assert_eq!(pending.parsed.raw, "B站点歌 耀斑 HOYO-MiX");
         match pending.parsed.command {

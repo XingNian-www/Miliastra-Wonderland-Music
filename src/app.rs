@@ -134,6 +134,8 @@ use crate::features::undercover::{
 use crate::observation::chat::ObservedFrame;
 use crate::observation::shared::ObservationRead;
 use crate::runtime::business::{BusinessEvent, BusinessRuntime, BusinessRuntimeHandle};
+use crate::runtime::identity::BusinessOperationIdAllocator;
+use crate::runtime::player_io::{PlayerRuntime, PlayerSearchClient, PlayerSearchClientError};
 use crate::runtime::ui::{
     FrameDemand, FrameDemandSubscription, FramePublication, UiRuntime, UiRuntimeHandle,
 };
@@ -334,6 +336,34 @@ enum UserDecision {
     PromptFailed,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum PlayerSearchResolution<T> {
+    Found(T),
+    NoSource,
+    Failed(PlayerSearchClientError),
+}
+
+fn classify_player_search<T>(
+    result: std::result::Result<Option<T>, PlayerSearchClientError>,
+) -> PlayerSearchResolution<T> {
+    match result {
+        Ok(Some(value)) => PlayerSearchResolution::Found(value),
+        Ok(None) => PlayerSearchResolution::NoSource,
+        Err(error) => PlayerSearchResolution::Failed(error),
+    }
+}
+
+fn player_search_failure_reply(error: &PlayerSearchClientError) -> &'static str {
+    match error {
+        PlayerSearchClientError::QueueFull => "歌曲搜索繁忙，请稍后再试",
+        PlayerSearchClientError::RuntimeStopped
+        | PlayerSearchClientError::OperationIdExhausted
+        | PlayerSearchClientError::NotRun { .. } => "歌曲搜索服务暂不可用，请稍后再试",
+        PlayerSearchClientError::Failed(_) => "歌曲搜索后端失败，请稍后再试",
+        PlayerSearchClientError::UnexpectedOutcome(_) => "歌曲搜索后端返回异常，请稍后再试",
+    }
+}
+
 pub fn run() -> Result<()> {
     dpi::set_process_dpi_awareness();
     run_automation_with_watchdog(Path::new("config.yaml"))
@@ -366,6 +396,7 @@ fn run_automation_with_watchdog(config_path: &Path) -> Result<()> {
 
 pub(crate) struct AutomationApp {
     config: AppConfig,
+    http_server: Option<http_server::HttpServer>,
     game_ui: GameUi,
     ui_runtime: Option<UiRuntime>,
     business: BusinessRuntimeHandle,
@@ -379,6 +410,8 @@ pub(crate) struct AutomationApp {
     queue: Arc<Mutex<PersistentQueue>>,
     song_dedup_history: Arc<Mutex<PersistentSongDedupHistory>>,
     player: PlayerController<FeelUOwnClient>,
+    player_search: PlayerSearchClient,
+    player_runtime: Option<PlayerRuntime>,
     ai: ai::AiClient,
     song_review: SongReviewClient,
     chat_output: ChatOutput,
@@ -872,11 +905,9 @@ impl AutomationApp {
         song_dedup_history: PersistentSongDedupHistory,
         monitor: MonitorShared,
     ) -> Result<Self> {
-        let ui_runtime = UiRuntime::start(
-            WindowsUiDevice::new(config.window.clone()),
-            UI_RUNTIME_QUEUE_CAPACITY,
-        )?;
-        let game_ui = GameUi::runtime(ui_runtime.handle());
+        let player_runtime_config = config
+            .player_runtime_config()
+            .context("校验播放器运行时配置")?;
         let ocr_args = OcrArgs::default().resolve(&config);
         let ocr_runtime = OcrRuntime::start(
             ProductionOcrDevice::new(ocr_args)?,
@@ -884,6 +915,20 @@ impl AutomationApp {
         )?;
         let ocr = ocr_runtime.handle();
         let feeluown = FeelUOwnClient::new(&config.feeluown, &config.timing);
+        let player_runtime = PlayerRuntime::start(
+            feeluown.clone(),
+            feeluown.clone(),
+            feeluown.clone(),
+            player_runtime_config,
+        )
+        .context("启动播放器运行时")?;
+        let player_search =
+            PlayerSearchClient::new(player_runtime.handle(), BusinessOperationIdAllocator::new());
+        let ui_runtime = UiRuntime::start(
+            WindowsUiDevice::new(config.window.clone()),
+            UI_RUNTIME_QUEUE_CAPACITY,
+        )?;
+        let game_ui = GameUi::runtime(ui_runtime.handle());
         let ai = ai::AiClient::new(&config.ai, &config.timing);
         let song_review = SongReviewClient::new(&config.song_review, &config.timing);
         let chat_output = ChatOutput::new(
@@ -941,6 +986,7 @@ impl AutomationApp {
         let custom_workflow = custom_workflow::service_from_config(&config);
         Ok(Self {
             config,
+            http_server: None,
             game_ui,
             ui_runtime: Some(ui_runtime),
             business,
@@ -954,6 +1000,8 @@ impl AutomationApp {
             queue,
             song_dedup_history,
             player,
+            player_search,
+            player_runtime: Some(player_runtime),
             ai,
             song_review,
             chat_output,
@@ -992,16 +1040,22 @@ impl AutomationApp {
         self.update_monitor_chat_listener();
         self.update_monitor_operational_state();
         self.warn_if_screen_size_mismatch()?;
+        // No fallible setup may follow start_hotkeys: later workers require the shared teardown.
+        self.enqueue_startup_task_if_enabled()?;
         self.start_http_server()?;
         self.start_hotkeys()?;
         self.turtle_soup.start_workers();
         let executor = self.start_command_executor();
         let deferred_chat_sender = self.start_deferred_chat_sender();
-        self.enqueue_startup_task_if_enabled()?;
         let web_tool_executor = self.start_web_tool_executor();
         let playback_monitor = self.start_playback_monitor();
         let result = self.run_scan_loop();
         self.running.store(false, AtomicOrdering::SeqCst);
+        if let Some(http_server) = self.http_server.take()
+            && let Err(error) = http_server.shutdown()
+        {
+            log::error!("HTTP/Web 面板关闭失败: {error:#}");
+        }
         self.turtle_soup.shutdown();
         self.notify_pending_executor();
         self.deferred_chat.notify_all();
@@ -1031,6 +1085,11 @@ impl AutomationApp {
             && let Err(error) = ocr_runtime.shutdown()
         {
             log::error!("OCR 运行时关闭失败: {error:#}");
+        }
+        if let Some(player_runtime) = self.player_runtime.take()
+            && let Err(error) = player_runtime.shutdown()
+        {
+            log::error!("播放器运行时关闭失败: {error}");
         }
         if let Err(error) = self.queue().and_then(|queue| queue.save()) {
             log::error!("退出前保存队列失败: {error:#}");
@@ -1268,6 +1327,7 @@ impl AutomationApp {
     fn clone_for_background_task(&self) -> Self {
         Self {
             config: self.config.clone(),
+            http_server: None,
             game_ui: self.game_ui.clone(),
             ui_runtime: None,
             business: self.business.clone(),
@@ -1281,6 +1341,8 @@ impl AutomationApp {
             queue: self.queue.clone(),
             song_dedup_history: self.song_dedup_history.clone(),
             player: self.player.clone(),
+            player_search: self.player_search.clone(),
+            player_runtime: None,
             ai: self.ai.clone(),
             song_review: self.song_review.clone(),
             chat_output: self.chat_output.clone(),
@@ -1429,11 +1491,14 @@ impl AutomationApp {
         Ok(())
     }
 
-    fn start_http_server(&self) -> Result<()> {
+    fn start_http_server(&mut self) -> Result<()> {
         if !self.config.http.enabled {
             return Ok(());
         }
-        http_server::start(http_server::HttpSharedState::new(
+        if self.http_server.is_some() {
+            return Err(anyhow!("HTTP/Web 面板已经启动"));
+        }
+        let server = http_server::start(http_server::HttpSharedState::new(
             self.config.clone(),
             Arc::clone(&self.queue),
             Arc::clone(&self.runtime_state),
@@ -1446,7 +1511,10 @@ impl AutomationApp {
             self.decision_control.clone(),
             self.web_tools.clone(),
             self.latest_frame.clone(),
-        ))
+            self.player_search.clone(),
+        ))?;
+        self.http_server = Some(server);
+        Ok(())
     }
 
     fn start_hotkeys(&self) -> Result<()> {
@@ -3074,24 +3142,24 @@ impl AutomationApp {
                 if !self.ai.enabled() {
                     return Err(anyhow!("AI 点歌未启用，请先配置 ai.api_key"));
                 }
-                let feeluown = FeelUOwnClient::new(&self.config.feeluown, &self.config.timing);
-                let result = self
-                    .ai
-                    .search_and_pick(&feeluown, &keyword, prefer_accompaniment)?;
+                let candidates = self.player_search.search_candidates(&keyword, "")?;
+                let pick = if candidates.is_empty() {
+                    None
+                } else {
+                    Some(self.ai.pick_song_candidate(
+                        &keyword,
+                        prefer_accompaniment,
+                        &candidates,
+                    )?)
+                };
                 let mut lines = vec![
-                    format!("用户请求: {}", result.request),
-                    format!("候选数量: {}", result.candidates.len()),
+                    format!("用户请求: {}", keyword),
+                    format!("候选数量: {}", candidates.len()),
                 ];
-                lines.extend(
-                    result
-                        .candidates
-                        .iter()
-                        .enumerate()
-                        .map(|(index, candidate)| {
-                            format!("{}. {} -> {}", index + 1, candidate.text, candidate.uri)
-                        }),
-                );
-                if let Some(pick) = result.pick {
+                lines.extend(candidates.iter().enumerate().map(|(index, candidate)| {
+                    format!("{}. {} -> {}", index + 1, candidate.text, candidate.uri)
+                }));
+                if let Some(pick) = pick {
                     lines.push(format!(
                         "AI 选择: {} score={:.2} reason={}",
                         pick.uri, pick.score, pick.reason
@@ -4328,6 +4396,16 @@ impl AutomationApp {
         Ok(cleared)
     }
 
+    fn report_player_search_failure(
+        &self,
+        label: &str,
+        context: &str,
+        error: &PlayerSearchClientError,
+    ) -> Result<()> {
+        log::error!("{context}: {error}");
+        self.reply(&format!("{}{}", label, player_search_failure_reply(error)))
+    }
+
     fn resolve_song_request(
         &mut self,
         song: &command::SongCommand,
@@ -4353,18 +4431,21 @@ impl AutomationApp {
         self.reply(&format!("{}AI匹配中", label))?;
 
         let search_source = ai_candidate_source(song);
-        let candidates = match self.player.search_candidates(&song.keyword, search_source) {
-            Ok(candidates) => candidates,
-            Err(error) => {
-                log::error!("AI点歌搜索候选失败: {error:#}");
+        let candidates = match classify_player_search(
+            self.player_search
+                .search_candidates(&song.keyword, search_source)
+                .map(|candidates| (!candidates.is_empty()).then_some(candidates)),
+        ) {
+            PlayerSearchResolution::Found(candidates) => candidates,
+            PlayerSearchResolution::NoSource => {
                 self.reply(&format!("{}平台无对应歌曲音源", label))?;
                 return Ok(None);
             }
+            PlayerSearchResolution::Failed(error) => {
+                self.report_player_search_failure(&label, "AI点歌搜索候选失败", &error)?;
+                return Ok(None);
+            }
         };
-        if candidates.is_empty() {
-            self.reply(&format!("{}平台无对应歌曲音源", label))?;
-            return Ok(None);
-        }
 
         let pick =
             match self
@@ -4427,42 +4508,51 @@ impl AutomationApp {
             } else {
                 &request.source
             };
-            let picked = match self.player.search_and_pick(
+            let picked = match classify_player_search(self.player_search.search_and_pick(
                 &request.keyword,
                 source,
                 request.prefer_accompaniment,
-            ) {
-                Ok(Some(picked)) => picked,
-                _ => {
-                    let actions = if self.ai.enabled() {
-                        "@换源@AI"
-                    } else {
-                        "@换源"
-                    };
-                    self.reply(&format!(
-                        "{}平台无对应歌曲音源,{}",
-                        request_label(&request),
-                        actions
-                    ))?;
-                    let decision = self.wait_for_decision(true, self.ai.enabled(), true)?;
-                    match decision {
-                        UserDecision::SwitchSource => {
-                            let next_source = if source == "netease" {
-                                "qqmusic"
-                            } else {
-                                "netease"
-                            };
-                            return self.resolve_and_confirm_song_with_source(song, next_source);
-                        }
-                        UserDecision::Ai if self.ai.enabled() => {
-                            return self.resolve_and_confirm_song_ai(song);
-                        }
-                        _ => return Ok(None),
-                    }
+            )) {
+                PlayerSearchResolution::Found(picked) => Some(picked),
+                PlayerSearchResolution::NoSource => None,
+                PlayerSearchResolution::Failed(error) => {
+                    self.report_player_search_failure(
+                        &request_label(&request),
+                        "点歌候选搜索失败",
+                        &error,
+                    )?;
+                    return Ok(None);
                 }
             };
-            let song_title = picked.0.text.clone();
-            let uri = picked.0.uri.clone();
+            let Some(picked) = picked else {
+                let actions = if self.ai.enabled() {
+                    "@换源@AI"
+                } else {
+                    "@换源"
+                };
+                self.reply(&format!(
+                    "{}平台无对应歌曲音源,{}",
+                    request_label(&request),
+                    actions
+                ))?;
+                let decision = self.wait_for_decision(true, self.ai.enabled(), true)?;
+                match decision {
+                    UserDecision::SwitchSource => {
+                        let next_source = if source == "netease" {
+                            "qqmusic"
+                        } else {
+                            "netease"
+                        };
+                        return self.resolve_and_confirm_song_with_source(song, next_source);
+                    }
+                    UserDecision::Ai if self.ai.enabled() => {
+                        return self.resolve_and_confirm_song_ai(song);
+                    }
+                    _ => return Ok(None),
+                }
+            };
+            let song_title = picked.candidate.text.clone();
+            let uri = picked.candidate.uri.clone();
             let actions = if self.ai.enabled() {
                 "@确认@跳过@换源@AI"
             } else {
@@ -4478,7 +4568,7 @@ impl AutomationApp {
             match decision {
                 UserDecision::Confirm | UserDecision::Timeout => {
                     return Ok(Some(ResolvedSongRequest {
-                        keyword: picked.0.text.clone(),
+                        keyword: picked.candidate.text.clone(),
                         source: source.to_string(),
                         prefer_accompaniment: request.prefer_accompaniment,
                         ai_original_text: String::new(),
@@ -4513,36 +4603,45 @@ impl AutomationApp {
         song: &command::SongCommand,
         source: &str,
     ) -> Result<Option<ResolvedSongRequest>> {
-        let picked =
-            match self
-                .player
-                .search_and_pick(&song.keyword, source, song.prefer_accompaniment)
-            {
-                Ok(Some(picked)) => picked,
-                _ => {
-                    let actions = if self.ai.enabled() {
-                        "@换源@AI"
-                    } else {
-                        "@换源"
-                    };
-                    self.reply(&format!("{}换源后仍无音源,{}", song_label(song), actions))?;
-                    let decision = self.wait_for_decision(true, self.ai.enabled(), true)?;
-                    match decision {
-                        UserDecision::SwitchSource => {
-                            let next_source = if source == "netease" {
-                                "qqmusic"
-                            } else {
-                                "netease"
-                            };
-                            return self.resolve_and_confirm_song_with_source(song, next_source);
-                        }
-                        UserDecision::Ai if self.ai.enabled() => {
-                            return self.resolve_and_confirm_song_ai(song);
-                        }
-                        _ => return Ok(None),
-                    }
-                }
+        let picked = match classify_player_search(self.player_search.search_and_pick(
+            &song.keyword,
+            source,
+            song.prefer_accompaniment,
+        )) {
+            PlayerSearchResolution::Found(picked) => Some(picked),
+            PlayerSearchResolution::NoSource => None,
+            PlayerSearchResolution::Failed(error) => {
+                self.report_player_search_failure(
+                    &song_label(song),
+                    "换源后的点歌候选搜索失败",
+                    &error,
+                )?;
+                return Ok(None);
+            }
+        };
+        let Some(picked) = picked else {
+            let actions = if self.ai.enabled() {
+                "@换源@AI"
+            } else {
+                "@换源"
             };
+            self.reply(&format!("{}换源后仍无音源,{}", song_label(song), actions))?;
+            let decision = self.wait_for_decision(true, self.ai.enabled(), true)?;
+            match decision {
+                UserDecision::SwitchSource => {
+                    let next_source = if source == "netease" {
+                        "qqmusic"
+                    } else {
+                        "netease"
+                    };
+                    return self.resolve_and_confirm_song_with_source(song, next_source);
+                }
+                UserDecision::Ai if self.ai.enabled() => {
+                    return self.resolve_and_confirm_song_ai(song);
+                }
+                _ => return Ok(None),
+            }
+        };
         let actions = if self.ai.enabled() {
             "@确认@跳过@换源@AI"
         } else {
@@ -4551,17 +4650,17 @@ impl AutomationApp {
         self.reply(&format!(
             "{}搜索到:{},{}",
             song_label(song),
-            picked.0.text,
+            picked.candidate.text,
             actions
         ))?;
         let decision = self.wait_for_decision(true, self.ai.enabled(), true)?;
         match decision {
             UserDecision::Confirm | UserDecision::Timeout => Ok(Some(ResolvedSongRequest {
-                keyword: picked.0.text.clone(),
+                keyword: picked.candidate.text.clone(),
                 source: source.to_string(),
                 prefer_accompaniment: song.prefer_accompaniment,
                 ai_original_text: String::new(),
-                uri: picked.0.uri.clone(),
+                uri: picked.candidate.uri.clone(),
                 skip_match_check: false,
                 friend_username: song.friend_username.clone(),
                 console_bypass_dedup: false,
@@ -4591,18 +4690,21 @@ impl AutomationApp {
         }
         self.reply(&format!("{}AI匹配中", label))?;
         let search_source = ai_candidate_source(song);
-        let candidates = match self.player.search_candidates(&song.keyword, search_source) {
-            Ok(candidates) => candidates,
-            Err(error) => {
-                log::error!("AI点歌搜索候选失败: {error:#}");
+        let candidates = match classify_player_search(
+            self.player_search
+                .search_candidates(&song.keyword, search_source)
+                .map(|candidates| (!candidates.is_empty()).then_some(candidates)),
+        ) {
+            PlayerSearchResolution::Found(candidates) => candidates,
+            PlayerSearchResolution::NoSource => {
                 self.reply(&format!("{}平台无对应歌曲音源", label))?;
                 return Ok(None);
             }
+            PlayerSearchResolution::Failed(error) => {
+                self.report_player_search_failure(&label, "AI点歌搜索候选失败", &error)?;
+                return Ok(None);
+            }
         };
-        if candidates.is_empty() {
-            self.reply(&format!("{}平台无对应歌曲音源", label))?;
-            return Ok(None);
-        }
         let pick =
             match self
                 .ai
@@ -5606,36 +5708,34 @@ impl AutomationApp {
             } else {
                 &request.source
             };
-            let picked = match self.player.search_and_pick(
+            let picked = match classify_player_search(self.player_search.search_and_pick(
                 &request.keyword,
                 source,
                 request.prefer_accompaniment,
-            ) {
-                Ok(Some(picked)) => picked,
-                Err(error) => {
-                    let message = error.to_string();
-                    log::error!("点歌搜索失败: {message}");
-                    self.reply(if message.trim().is_empty() {
-                        "平台无对应歌曲音源"
-                    } else {
-                        message.trim()
-                    })?;
-                    return Ok(if message.contains("平台无对应歌曲音源") {
-                        PlaybackOutcome::NoSource
-                    } else {
-                        PlaybackOutcome::Error
-                    });
+            )) {
+                PlayerSearchResolution::Found(picked) => picked,
+                PlayerSearchResolution::Failed(error) => {
+                    self.report_player_search_failure(
+                        &request_label(request),
+                        "点歌搜索失败",
+                        &error,
+                    )?;
+                    return Ok(PlaybackOutcome::Error);
                 }
-                Ok(None) => {
+                PlayerSearchResolution::NoSource => {
                     self.reply("平台无对应歌曲音源")?;
                     return Ok(PlaybackOutcome::NoSource);
                 }
             };
-            log::info!("播放器候选: {} -> {}", picked.0.text, picked.0.uri);
+            log::info!(
+                "播放器候选: {} -> {}",
+                picked.candidate.text,
+                picked.candidate.uri
+            );
             let mut resolved = request.clone();
-            resolved.keyword = picked.0.text;
+            resolved.keyword = picked.candidate.text;
             resolved.source = source.to_string();
-            resolved.uri = picked.0.uri;
+            resolved.uri = picked.candidate.uri;
             return self.play_request_confirmed(&resolved, allow_switch_source);
         }
         let playback_request = self.playback_request_from_resolved(request);
@@ -6544,6 +6644,82 @@ fn web_tool_panel_response_rect(config: &AppConfig) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn player_search_queue_full_aborts_without_no_source_follow_up() {
+        let resolution: PlayerSearchResolution<()> =
+            classify_player_search(Err(PlayerSearchClientError::QueueFull));
+
+        assert!(matches!(
+            resolution,
+            PlayerSearchResolution::Failed(PlayerSearchClientError::QueueFull)
+        ));
+        let reply = player_search_failure_reply(&PlayerSearchClientError::QueueFull);
+        assert_eq!(reply, "歌曲搜索繁忙，请稍后再试");
+        assert!(!reply.contains("无音源"));
+        assert!(!reply.contains("换源"));
+        assert!(!reply.contains("AI"));
+    }
+
+    #[test]
+    fn player_search_only_classifies_successful_empty_results_as_no_source() {
+        assert_eq!(
+            classify_player_search::<()>(Ok(None)),
+            PlayerSearchResolution::NoSource
+        );
+        assert_eq!(
+            classify_player_search(Ok(Some("candidate"))),
+            PlayerSearchResolution::Found("candidate")
+        );
+        let empty_candidates = Ok::<_, PlayerSearchClientError>(Vec::<u8>::new())
+            .map(|candidates| (!candidates.is_empty()).then_some(candidates));
+        assert_eq!(
+            classify_player_search(empty_candidates),
+            PlayerSearchResolution::NoSource
+        );
+    }
+
+    #[test]
+    fn player_search_failures_have_explicit_user_facing_categories() {
+        use crate::runtime::player_io::PlayerSearchError;
+
+        let cases = [
+            (
+                PlayerSearchClientError::QueueFull,
+                "歌曲搜索繁忙，请稍后再试",
+            ),
+            (
+                PlayerSearchClientError::RuntimeStopped,
+                "歌曲搜索服务暂不可用，请稍后再试",
+            ),
+            (
+                PlayerSearchClientError::OperationIdExhausted,
+                "歌曲搜索服务暂不可用，请稍后再试",
+            ),
+            (
+                PlayerSearchClientError::NotRun {
+                    reason: "shutdown".to_string(),
+                },
+                "歌曲搜索服务暂不可用，请稍后再试",
+            ),
+            (
+                PlayerSearchClientError::Failed(PlayerSearchError::new("backend failed")),
+                "歌曲搜索后端失败，请稍后再试",
+            ),
+            (
+                PlayerSearchClientError::UnexpectedOutcome("pick"),
+                "歌曲搜索后端返回异常，请稍后再试",
+            ),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(player_search_failure_reply(&error), expected);
+            assert!(matches!(
+                classify_player_search::<()>(Err(error)),
+                PlayerSearchResolution::Failed(_)
+            ));
+        }
+    }
 
     #[test]
     fn parses_ai_decision_case_insensitive() {

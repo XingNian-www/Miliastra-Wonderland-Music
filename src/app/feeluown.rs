@@ -11,7 +11,7 @@ use crate::runtime::player::{RawPlayerSample, TransportState};
 use crate::runtime::player_io::{
     ControlDispatchOutcome, PickedCandidate as RuntimePickedCandidate, PlayerControl,
     PlayerControlPort, PlayerObservationPort, PlayerObservationReadError, PlayerSearchError,
-    PlayerSearchPort, SearchCandidate as RuntimeSearchCandidate,
+    PlayerSearchPort, SearchCandidate,
 };
 
 const VOLUME_CURVE_POWER: f64 = 0.5;
@@ -53,12 +53,6 @@ struct RawPlayerStatus {
     progress: Option<f64>,
     playback_rate: Option<f64>,
     volume: Option<i64>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct SearchCandidate {
-    pub text: String,
-    pub uri: String,
 }
 
 impl From<RawPlayerStatus> for RawPlayerSample {
@@ -281,7 +275,7 @@ impl FeelUOwnClient {
         self.exec(&volume_smooth_script(target, self.volume_smooth_step_ms))
     }
 
-    pub fn search(&self, keyword: &str, source: &str) -> Result<String> {
+    fn search(&self, keyword: &str, source: &str) -> Result<String> {
         let command = search_command(keyword, source, None);
         self.request(&command)
     }
@@ -291,7 +285,7 @@ impl FeelUOwnClient {
         self.request(&command)
     }
 
-    pub fn search_candidates(&self, keyword: &str, source: &str) -> Result<Vec<SearchCandidate>> {
+    fn search_candidates(&self, keyword: &str, source: &str) -> Result<Vec<SearchCandidate>> {
         match self
             .search_json(keyword, source)
             .and_then(|text| extract_search_candidates_from_json(&text))
@@ -301,7 +295,7 @@ impl FeelUOwnClient {
         }
     }
 
-    pub fn search_and_pick(
+    fn search_and_pick(
         &self,
         keyword: &str,
         source: &str,
@@ -377,14 +371,8 @@ impl PlayerSearchPort for FeelUOwnClient {
         &mut self,
         keyword: &str,
         source: &str,
-    ) -> Result<Vec<RuntimeSearchCandidate>, PlayerSearchError> {
+    ) -> Result<Vec<SearchCandidate>, PlayerSearchError> {
         FeelUOwnClient::search_candidates(self, keyword, source)
-            .map(|candidates| {
-                candidates
-                    .into_iter()
-                    .map(|candidate| RuntimeSearchCandidate::new(candidate.text, candidate.uri))
-                    .collect()
-            })
             .map_err(|error| PlayerSearchError::new(error.to_string()))
     }
 
@@ -397,10 +385,7 @@ impl PlayerSearchPort for FeelUOwnClient {
         FeelUOwnClient::search_and_pick(self, keyword, source, prefer_accompaniment)
             .map(|picked| {
                 picked.map(|(candidate, formatted_candidates)| {
-                    RuntimePickedCandidate::new(
-                        RuntimeSearchCandidate::new(candidate.text, candidate.uri),
-                        formatted_candidates,
-                    )
+                    RuntimePickedCandidate::new(candidate, formatted_candidates)
                 })
             })
             .map_err(|error| PlayerSearchError::new(error.to_string()))
@@ -587,7 +572,7 @@ fn is_accompaniment_text(value: &str) -> bool {
         || lower.contains("karaoke")
 }
 
-pub fn extract_search_candidates(text: &str) -> Vec<SearchCandidate> {
+fn extract_search_candidates(text: &str) -> Vec<SearchCandidate> {
     let mut candidates = Vec::new();
     let mut block: Vec<String> = Vec::new();
     for line in text.lines() {

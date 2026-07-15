@@ -8,7 +8,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use super::clock::{Clock, SystemClock};
-use super::identity::BusinessOperationId;
+use super::identity::{BusinessOperationId, BusinessOperationIdAllocator};
 use super::player::{PlayerObservation, PlayerObservationConfig, PlayerObserver, RawPlayerSample};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -182,7 +182,7 @@ pub trait PlayerControlPort: Send + 'static {
     fn dispatch(&mut self, control: &PlayerControl) -> ControlDispatchOutcome;
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct SearchCandidate {
     pub text: String,
     pub uri: String,
@@ -918,6 +918,143 @@ impl PlayerRuntimeHandle {
     }
 }
 
+#[derive(Clone)]
+pub struct PlayerSearchClient {
+    runtime: PlayerRuntimeHandle,
+    operation_ids: BusinessOperationIdAllocator,
+}
+
+impl PlayerSearchClient {
+    pub fn new(runtime: PlayerRuntimeHandle, operation_ids: BusinessOperationIdAllocator) -> Self {
+        Self {
+            runtime,
+            operation_ids,
+        }
+    }
+
+    pub fn search_text(
+        &self,
+        keyword: &str,
+        source: &str,
+    ) -> Result<String, PlayerSearchClientError> {
+        match self.execute(PlayerSearch::text(keyword, source))? {
+            PlayerSearchOutcome::Text(text) => Ok(text),
+            _ => Err(PlayerSearchClientError::UnexpectedOutcome("text")),
+        }
+    }
+
+    pub fn search_candidates(
+        &self,
+        keyword: &str,
+        source: &str,
+    ) -> Result<Vec<SearchCandidate>, PlayerSearchClientError> {
+        match self.execute(PlayerSearch::candidates(keyword, source))? {
+            PlayerSearchOutcome::Candidates(candidates) => Ok(candidates),
+            _ => Err(PlayerSearchClientError::UnexpectedOutcome("candidates")),
+        }
+    }
+
+    pub fn search_and_pick(
+        &self,
+        keyword: &str,
+        source: &str,
+        prefer_accompaniment: bool,
+    ) -> Result<Option<PickedCandidate>, PlayerSearchClientError> {
+        match self.execute(PlayerSearch::pick(keyword, source, prefer_accompaniment))? {
+            PlayerSearchOutcome::Picked(candidate) => Ok(candidate),
+            _ => Err(PlayerSearchClientError::UnexpectedOutcome(
+                "picked candidate",
+            )),
+        }
+    }
+
+    fn execute(
+        &self,
+        search: PlayerSearch,
+    ) -> Result<PlayerSearchOutcome, PlayerSearchClientError> {
+        let operation_id = self
+            .operation_ids
+            .allocate()
+            .map_err(|_| PlayerSearchClientError::OperationIdExhausted)?;
+        let operation = self
+            .runtime
+            .submit_search(operation_id, search)
+            .map_err(PlayerSearchClientError::from_lane_error)?;
+        let result = operation
+            .wait()
+            .map_err(PlayerSearchClientError::from_receive_error)?;
+        match result.outcome {
+            PlayerSearchOutcome::Failed(error) => Err(PlayerSearchClientError::Failed(error)),
+            PlayerSearchOutcome::NotRun { reason } => {
+                Err(PlayerSearchClientError::NotRun { reason })
+            }
+            outcome => Ok(outcome),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PlayerSearchClientError {
+    OperationIdExhausted,
+    QueueFull,
+    RuntimeStopped,
+    Failed(PlayerSearchError),
+    NotRun { reason: String },
+    UnexpectedOutcome(&'static str),
+}
+
+impl PlayerSearchClientError {
+    fn from_lane_error(error: PlayerLaneError) -> Self {
+        match error {
+            PlayerLaneError::QueueFull(PlayerLane::Search) => Self::QueueFull,
+            PlayerLaneError::RuntimeStopped(PlayerLane::Search) => Self::RuntimeStopped,
+            PlayerLaneError::QueueFull(_) | PlayerLaneError::RuntimeStopped(_) => {
+                Self::UnexpectedOutcome("search lane")
+            }
+        }
+    }
+
+    fn from_receive_error(error: PlayerOperationReceiveError) -> Self {
+        match error {
+            PlayerOperationReceiveError::RuntimeStopped(PlayerLane::Search) => Self::RuntimeStopped,
+            PlayerOperationReceiveError::TimedOut(_)
+            | PlayerOperationReceiveError::RuntimeStopped(_)
+            | PlayerOperationReceiveError::AlreadyCompleted(_) => {
+                Self::UnexpectedOutcome("pending search result")
+            }
+        }
+    }
+}
+
+impl Display for PlayerSearchClientError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OperationIdExhausted => {
+                formatter.write_str("player operation identifiers are exhausted")
+            }
+            Self::QueueFull => formatter.write_str("player search lane queue is full"),
+            Self::RuntimeStopped => formatter.write_str("player search lane is stopped"),
+            Self::Failed(error) => write!(formatter, "player search failed: {error}"),
+            Self::NotRun { reason } => write!(formatter, "player search was not run: {reason}"),
+            Self::UnexpectedOutcome(expected) => {
+                write!(
+                    formatter,
+                    "player search returned an unexpected result; expected {expected}"
+                )
+            }
+        }
+    }
+}
+
+impl Error for PlayerSearchClientError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Failed(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum PlayerRuntimeStartError {
     InvalidConfig(PlayerRuntimeConfigError),
@@ -1452,10 +1589,11 @@ mod tests {
         ObservationWaitOutcome, PickedCandidate, PlayerControl, PlayerControlPort, PlayerLane,
         PlayerLaneError, PlayerObservationPort, PlayerObservationReadError,
         PlayerOperationReceiveError, PlayerRuntime, PlayerRuntimeConfig, PlayerRuntimeConfigError,
-        PlayerSearch, PlayerSearchError, PlayerSearchOutcome, PlayerSearchPort, SearchCandidate,
+        PlayerSearch, PlayerSearchClient, PlayerSearchClientError, PlayerSearchError,
+        PlayerSearchOutcome, PlayerSearchPort, SearchCandidate,
     };
     use crate::runtime::clock::{ManualClock, SystemClock};
-    use crate::runtime::identity::BusinessOperationId;
+    use crate::runtime::identity::{BusinessOperationId, BusinessOperationIdAllocator};
     use crate::runtime::player::PlayerObservationConfig;
     use crate::runtime::player::{
         ObservationFreshness, PlayerObserver, RawPlayerSample, TransportState,
@@ -1536,6 +1674,35 @@ mod tests {
             _prefer_accompaniment: bool,
         ) -> Result<Option<PickedCandidate>, PlayerSearchError> {
             Ok(None)
+        }
+    }
+
+    struct FailingSearchPort;
+
+    impl PlayerSearchPort for FailingSearchPort {
+        fn search_text(
+            &mut self,
+            _keyword: &str,
+            _source: &str,
+        ) -> Result<String, PlayerSearchError> {
+            Err(PlayerSearchError::new("backend failed"))
+        }
+
+        fn search_candidates(
+            &mut self,
+            _keyword: &str,
+            _source: &str,
+        ) -> Result<Vec<SearchCandidate>, PlayerSearchError> {
+            Err(PlayerSearchError::new("backend failed"))
+        }
+
+        fn search_and_pick(
+            &mut self,
+            _keyword: &str,
+            _source: &str,
+            _prefer_accompaniment: bool,
+        ) -> Result<Option<PickedCandidate>, PlayerSearchError> {
+            Err(PlayerSearchError::new("backend failed"))
         }
     }
 
@@ -2496,6 +2663,135 @@ mod tests {
             control_calls.lock().unwrap().as_slice(),
             &[PlayerControl::Pause]
         );
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn search_client_routes_every_search_shape_through_the_runtime_lane() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (started_sender, _started_receiver) = mpsc::sync_channel(1);
+        let (_release_sender, release_receiver) = mpsc::sync_channel(1);
+        let runtime = PlayerRuntime::start(
+            ConstantObservationPort,
+            RecordingControlPort {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                outcomes: VecDeque::new(),
+            },
+            BlockingSearchPort {
+                started: started_sender,
+                release: release_receiver,
+                block_next: false,
+                calls: Arc::clone(&calls),
+            },
+            config(),
+        )
+        .unwrap();
+        let client = PlayerSearchClient::new(runtime.handle(), BusinessOperationIdAllocator::new());
+
+        assert_eq!(
+            client.search_text("one", "source").unwrap(),
+            "raw search: one"
+        );
+        assert_eq!(
+            client.search_candidates("two", "source").unwrap(),
+            vec![SearchCandidate::new("two result", "fuo://song/result")]
+        );
+        assert_eq!(
+            client.search_and_pick("three", "source", true).unwrap(),
+            Some(PickedCandidate::new(
+                SearchCandidate::new("three picked", "fuo://song/picked"),
+                "candidate listing"
+            ))
+        );
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[
+                PlayerSearch::text("one", "source"),
+                PlayerSearch::candidates("two", "source"),
+                PlayerSearch::pick("three", "source", true),
+            ]
+        );
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn search_client_reports_backend_failure_and_runtime_shutdown_explicitly() {
+        let runtime = PlayerRuntime::start(
+            ConstantObservationPort,
+            RecordingControlPort {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                outcomes: VecDeque::new(),
+            },
+            FailingSearchPort,
+            config(),
+        )
+        .unwrap();
+        let client = PlayerSearchClient::new(runtime.handle(), BusinessOperationIdAllocator::new());
+
+        assert_eq!(
+            client.search_candidates("song", "source"),
+            Err(PlayerSearchClientError::Failed(PlayerSearchError::new(
+                "backend failed"
+            )))
+        );
+
+        runtime.shutdown().unwrap();
+        assert_eq!(
+            client.search_text("song", "source"),
+            Err(PlayerSearchClientError::RuntimeStopped)
+        );
+    }
+
+    #[test]
+    fn search_client_reports_a_full_runtime_queue_without_retrying() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (started_sender, started_receiver) = mpsc::sync_channel(1);
+        let (release_sender, release_receiver) = mpsc::sync_channel(1);
+        let release_sender = ReleaseOnDrop::new(release_sender);
+        let runtime = PlayerRuntime::start(
+            ConstantObservationPort,
+            RecordingControlPort {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                outcomes: VecDeque::new(),
+            },
+            BlockingSearchPort {
+                started: started_sender,
+                release: release_receiver,
+                block_next: true,
+                calls,
+            },
+            PlayerRuntimeConfig {
+                search_queue_capacity: 1,
+                ..config()
+            },
+        )
+        .unwrap();
+        let handle = runtime.handle();
+        let client = PlayerSearchClient::new(handle.clone(), BusinessOperationIdAllocator::new());
+        let in_flight = handle
+            .submit_search(
+                BusinessOperationId::new(61),
+                PlayerSearch::text("in-flight", "source"),
+            )
+            .unwrap();
+        started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first search started");
+        let queued = handle
+            .submit_search(
+                BusinessOperationId::new(62),
+                PlayerSearch::text("queued", "source"),
+            )
+            .unwrap();
+
+        assert_eq!(
+            client.search_text("rejected", "source"),
+            Err(PlayerSearchClientError::QueueFull)
+        );
+
+        release_sender.release();
+        in_flight.wait_timeout(Duration::from_secs(1)).unwrap();
+        queued.wait_timeout(Duration::from_secs(1)).unwrap();
         runtime.shutdown().unwrap();
     }
 

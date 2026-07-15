@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -10,6 +11,8 @@ use crate::features::card_games::LandlordConfig;
 use crate::features::idiom_chain::IdiomChainConfig;
 use crate::features::turtle_soup::TurtleSoupConfig;
 use crate::features::undercover::UndercoverConfig;
+use crate::runtime::player::PlayerObservationConfig;
+use crate::runtime::player_io::{PlayerRuntimeConfig, PlayerRuntimeConfigError};
 
 mod migration;
 
@@ -52,6 +55,11 @@ pub struct AppConfig {
 }
 
 const BUILTIN_STABILITY_COUNT: u32 = 2;
+const PLAYER_FAST_OBSERVATION_INTERVAL: Duration = Duration::from_millis(300);
+const PLAYER_OBSERVATION_COMMAND_CAPACITY: usize = 16;
+const PLAYER_ACTIVE_FAST_DEMAND_CAPACITY: usize = 16;
+const PLAYER_CONTROL_QUEUE_CAPACITY: usize = 16;
+const PLAYER_SEARCH_QUEUE_CAPACITY: usize = 16;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -103,6 +111,40 @@ impl AppConfig {
         } else {
             self.resolve_stability_count(local as u32) as usize
         }
+    }
+
+    pub(crate) fn player_runtime_config(
+        &self,
+    ) -> std::result::Result<PlayerRuntimeConfig, PlayerRuntimeConfigError> {
+        let normal_observation_interval =
+            Duration::from_millis(self.timing.playback.monitor_status_ms);
+        let fast_observation_interval =
+            if normal_observation_interval > PLAYER_FAST_OBSERVATION_INTERVAL {
+                PLAYER_FAST_OBSERVATION_INTERVAL
+            } else {
+                normal_observation_interval / 2
+            };
+        let defaults = PlayerObservationConfig::default();
+        let config = PlayerRuntimeConfig {
+            observation: PlayerObservationConfig {
+                uri_stable_samples: self
+                    .resolve_stability_count(self.timing.playback.uri_stable_samples)
+                    as usize,
+                transport_stable_samples: self
+                    .resolve_stability_count(self.timing.playback.transport_stable_samples)
+                    as usize,
+                stale_timeout: Duration::from_millis(self.timing.playback.stale_timeout_ms),
+                ..defaults
+            },
+            normal_observation_interval,
+            fast_observation_interval,
+            observation_command_capacity: PLAYER_OBSERVATION_COMMAND_CAPACITY,
+            active_fast_demand_capacity: PLAYER_ACTIVE_FAST_DEMAND_CAPACITY,
+            control_queue_capacity: PLAYER_CONTROL_QUEUE_CAPACITY,
+            search_queue_capacity: PLAYER_SEARCH_QUEUE_CAPACITY,
+        };
+        config.validate()?;
+        Ok(config)
     }
 
     pub fn load_or_create(path: &Path) -> Result<Self> {
@@ -829,6 +871,65 @@ stale_timeout_ms: 7500
             6
         );
         assert_eq!(resolve_stability_count(inherited.uri_stable_samples, 1), 2);
+    }
+
+    #[test]
+    fn app_config_builds_the_complete_player_runtime_config_once() {
+        let mut config: AppConfig =
+            serde_yaml::from_str(default_config_yaml()).expect("default app config");
+        config.stability.default_count = 6;
+        config.timing.playback.uri_stable_samples = 4;
+        config.timing.playback.transport_stable_samples = 1;
+        config.timing.playback.monitor_status_ms = 1_000;
+        config.timing.playback.stale_timeout_ms = 7_500;
+
+        let runtime = config
+            .player_runtime_config()
+            .expect("valid player runtime config");
+
+        assert_eq!(runtime.observation.uri_stable_samples, 4);
+        assert_eq!(runtime.observation.transport_stable_samples, 6);
+        assert_eq!(
+            runtime.observation.stale_timeout,
+            Duration::from_millis(7_500)
+        );
+        assert_eq!(runtime.normal_observation_interval, Duration::from_secs(1));
+        assert_eq!(
+            runtime.fast_observation_interval,
+            Duration::from_millis(300)
+        );
+        assert_eq!(runtime.observation_command_capacity, 16);
+        assert_eq!(runtime.active_fast_demand_capacity, 16);
+        assert_eq!(runtime.control_queue_capacity, 16);
+        assert_eq!(runtime.search_queue_capacity, 16);
+
+        config.stability.default_count = 1;
+        config.timing.playback.uri_stable_samples = 0;
+        config.timing.playback.transport_stable_samples = 1;
+        let runtime = config
+            .player_runtime_config()
+            .expect("invalid local and global counts use the built-in default");
+        assert_eq!(runtime.observation.uri_stable_samples, 2);
+        assert_eq!(runtime.observation.transport_stable_samples, 2);
+    }
+
+    #[test]
+    fn player_fast_observation_interval_stays_below_low_normal_intervals() {
+        let mut config: AppConfig =
+            serde_yaml::from_str(default_config_yaml()).expect("default app config");
+
+        for (normal_ms, expected_fast) in [
+            (300, Duration::from_millis(150)),
+            (50, Duration::from_millis(25)),
+            (1, Duration::from_micros(500)),
+        ] {
+            config.timing.playback.monitor_status_ms = normal_ms;
+            let runtime = config
+                .player_runtime_config()
+                .expect("low intervals remain valid");
+            assert_eq!(runtime.fast_observation_interval, expected_fast);
+            assert!(runtime.fast_observation_interval < runtime.normal_observation_interval);
+        }
     }
 
     #[test]

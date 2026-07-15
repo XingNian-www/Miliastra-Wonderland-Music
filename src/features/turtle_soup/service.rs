@@ -9,11 +9,12 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
-use reqwest::blocking::Client;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
+use async_openai::types::chat::{
+    ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
+    CreateChatCompletionRequest, CreateChatCompletionRequestArgs, ResponseFormat,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use url::Url;
 
 #[cfg(test)]
 use super::parse_question_bank;
@@ -25,6 +26,7 @@ use crate::features::chat_text::{
     MAX_CHAT_WIDTH, display_width, normalize_comparison_text, split_numbered_chat_message,
 };
 use crate::features::entertainment::{AcquireOutcome, EntertainmentCoordinator, EntertainmentKind};
+use crate::runtime::openai::{Authentication, OpenAiRuntimeHandle, Target};
 
 const RECENT_JUDGMENT_LIMIT: usize = 30;
 const DEEPSEEK_DEFAULT_ENDPOINT: &str = "https://api.deepseek.com/chat/completions";
@@ -83,8 +85,8 @@ pub struct TurtleSoupAiConfig {
     pub endpoint: String,
     pub api_key: String,
     pub model: String,
-    pub thinking_enabled: bool,
     pub max_tokens: u32,
+    pub extra_body: HashMap<String, Value>,
 }
 
 impl Default for TurtleSoupAiConfig {
@@ -93,8 +95,8 @@ impl Default for TurtleSoupAiConfig {
             endpoint: DEEPSEEK_DEFAULT_ENDPOINT.to_string(),
             api_key: String::new(),
             model: DEEPSEEK_DEFAULT_MODEL.to_string(),
-            thinking_enabled: false,
             max_tokens: DEFAULT_AI_MAX_TOKENS,
+            extra_body: HashMap::new(),
         }
     }
 }
@@ -296,6 +298,7 @@ pub(crate) struct TurtleSoupSnapshot {
 #[derive(Clone)]
 pub(crate) struct TurtleSoupService {
     config: TurtleSoupConfig,
+    openai: OpenAiRuntimeHandle,
     entertainment: EntertainmentCoordinator,
     delivery: Arc<dyn TurtleSoupDeliveryPort>,
     state: Arc<Mutex<TurtleSoupState>>,
@@ -303,6 +306,7 @@ pub(crate) struct TurtleSoupService {
     operation: Arc<Mutex<()>>,
     workers_started: Arc<AtomicBool>,
     shutting_down: Arc<AtomicBool>,
+    workers: Arc<Mutex<Vec<thread::JoinHandle<()>>>>,
 }
 
 struct TurtleSoupState {
@@ -692,6 +696,7 @@ impl TurtleSoupService {
         mut config: TurtleSoupConfig,
         entertainment: EntertainmentCoordinator,
         delivery: D,
+        openai: OpenAiRuntimeHandle,
     ) -> Self
     where
         D: TurtleSoupDeliveryPort + 'static,
@@ -702,6 +707,7 @@ impl TurtleSoupService {
         config.content_stable_count = config.content_stable_count.max(BUILTIN_OCR_STABILITY_COUNT);
         Self {
             config,
+            openai,
             entertainment,
             delivery: Arc::new(delivery),
             state: Arc::new(Mutex::new(TurtleSoupState::default())),
@@ -709,6 +715,7 @@ impl TurtleSoupService {
             operation: Arc::new(Mutex::new(())),
             workers_started: Arc::new(AtomicBool::new(false)),
             shutting_down: Arc::new(AtomicBool::new(false)),
+            workers: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -722,10 +729,16 @@ impl TurtleSoupService {
             return;
         }
         let worker_count = self.config.max_concurrency.max(1);
+        let Ok(mut workers) = self.workers.lock() else {
+            log::error!("海龟汤 AI Worker 句柄锁已损坏，无法启动");
+            self.shutting_down.store(true, Ordering::SeqCst);
+            return;
+        };
         for index in 0..worker_count {
             let worker = self.clone();
-            thread::spawn(move || worker.run_worker(index + 1));
+            workers.push(thread::spawn(move || worker.run_worker(index + 1)));
         }
+        drop(workers);
         log::info!("海龟汤 AI Worker 已启动: concurrency={}", worker_count);
     }
 
@@ -733,6 +746,18 @@ impl TurtleSoupService {
         self.shutting_down.store(true, Ordering::SeqCst);
         let (_, cvar) = &*self.work;
         cvar.notify_all();
+        let workers = match self.workers.lock() {
+            Ok(mut workers) => std::mem::take(&mut *workers),
+            Err(_) => {
+                log::error!("海龟汤 AI Worker 句柄锁已损坏，无法等待退出");
+                return;
+            }
+        };
+        for worker in workers {
+            if worker.join().is_err() {
+                log::error!("海龟汤 AI Worker 退出时 panic");
+            }
+        }
     }
 
     pub(crate) fn snapshot(&self) -> TurtleSoupSnapshot {
@@ -1613,7 +1638,7 @@ impl TurtleSoupService {
         verification: bool,
     ) -> Result<Judgment> {
         validate_provider_config(&self.config.ai)?;
-        let body = build_ai_request_body(
+        let request = build_ai_request(
             &self.config.ai,
             core_system_prompt(verification),
             build_review_prompt(
@@ -1622,24 +1647,23 @@ impl TurtleSoupService {
                 &self.config.custom_prompt,
                 verification,
             ),
-        );
-        let response = Client::builder()
-            .timeout(Duration::from_secs(
-                self.config.request_timeout_seconds.max(1),
-            ))
-            .build()
-            .context("创建海龟汤 AI HTTP 客户端失败")?
-            .post(self.config.ai.endpoint.trim())
-            .headers(provider_headers(&self.config.ai.api_key)?)
-            .json(&body)
-            .send()
+        )?;
+        let target = Target::chat(
+            &self.config.ai.endpoint,
+            &self.config.ai.api_key,
+            Authentication::Bearer,
+        )?;
+        let response = self
+            .openai
+            .chat_completion(
+                target,
+                request,
+                &self.config.ai.extra_body,
+                Duration::from_secs(self.config.request_timeout_seconds.max(1)),
+            )?
+            .wait()
             .context("海龟汤 AI 请求失败")?;
-        let status = response.status();
-        let text = response.text().context("读取海龟汤 AI 响应失败")?;
-        if !status.is_success() {
-            bail!("海龟汤 AI 响应失败 status={}", status);
-        }
-        let content = model_reply_content(&text)?;
+        let content = model_reply_content(&response)?;
         parse_judgment(&content)
     }
 
@@ -2062,49 +2086,32 @@ fn settlement_messages(session: &TurtleSoupSession, reason: &SettlementReason) -
     messages
 }
 
-fn build_ai_request_body(
+fn build_ai_request(
     config: &TurtleSoupAiConfig,
     system_prompt: &str,
     user_prompt: String,
-) -> Value {
-    let mut body = json!({
-        "model": config.model.as_str(),
-        "messages": [
-            {
-                "role": "system",
-                "content": system_prompt
-            },
-            {
-                "role": "user",
-                "content": user_prompt
-            }
-        ],
-        "response_format": { "type": "json_object" },
-        "stream": false,
-        "max_tokens": config.max_tokens
-    });
-    let deepseek_v4 = config
-        .model
-        .trim()
-        .to_ascii_lowercase()
-        .starts_with("deepseek-v4-");
-    if deepseek_v4 {
-        body["thinking"] = json!({
-            "type": if config.thinking_enabled {
-                "enabled"
-            } else {
-                "disabled"
-            }
-        });
-    }
-    if !deepseek_v4 || !config.thinking_enabled {
-        body["temperature"] = json!(0.0);
-    }
-    body
+) -> Result<CreateChatCompletionRequest> {
+    Ok(CreateChatCompletionRequestArgs::default()
+        .model(config.model.clone())
+        .messages(vec![
+            ChatCompletionRequestSystemMessageArgs::default()
+                .content(system_prompt)
+                .build()?
+                .into(),
+            ChatCompletionRequestUserMessageArgs::default()
+                .content(user_prompt)
+                .build()?
+                .into(),
+        ])
+        .response_format(ResponseFormat::JsonObject)
+        .stream(false)
+        .store(false)
+        .max_tokens(config.max_tokens)
+        .temperature(0.0)
+        .build()?)
 }
 
-fn model_reply_content(text: &str) -> Result<String> {
-    let value: Value = serde_json::from_str(text).context("解析海龟汤 AI 响应 JSON 失败")?;
+fn model_reply_content(value: &Value) -> Result<String> {
     if value
         .pointer("/choices/0/finish_reason")
         .and_then(Value::as_str)
@@ -2122,18 +2129,14 @@ fn model_reply_content(text: &str) -> Result<String> {
 }
 
 fn validate_provider_config(config: &TurtleSoupAiConfig) -> Result<()> {
-    let endpoint = config.endpoint.trim();
-    if endpoint.is_empty() {
+    if config.endpoint.trim().is_empty() {
         bail!("turtle_soup.ai.endpoint 未配置");
-    }
-    let endpoint = Url::parse(endpoint).context("turtle_soup.ai.endpoint 格式无效")?;
-    if !matches!(endpoint.scheme(), "http" | "https") || endpoint.host_str().is_none() {
-        bail!("turtle_soup.ai.endpoint 必须是完整的 HTTP(S) 地址");
     }
     if config.api_key.trim().is_empty() {
         bail!("turtle_soup.ai.api_key 未配置");
     }
-    provider_headers(&config.api_key)?;
+    Target::chat(&config.endpoint, &config.api_key, Authentication::Bearer)
+        .context("turtle_soup.ai Provider 配置无效")?;
     if config.model.trim().is_empty() {
         bail!("turtle_soup.ai.model 未配置");
     }
@@ -2141,17 +2144,6 @@ fn validate_provider_config(config: &TurtleSoupAiConfig) -> Result<()> {
         bail!("turtle_soup.ai.max_tokens 必须大于 0");
     }
     Ok(())
-}
-
-fn provider_headers(api_key: &str) -> Result<HeaderMap> {
-    let mut headers = HeaderMap::new();
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    headers.insert(
-        AUTHORIZATION,
-        HeaderValue::from_str(&format!("Bearer {}", api_key))
-            .context("turtle_soup.ai.api_key 不是有效 HTTP header")?,
-    );
-    Ok(headers)
 }
 
 fn core_system_prompt(verification: bool) -> &'static str {
@@ -2282,6 +2274,16 @@ fn unix_millis() -> u64 {
 mod tests {
     use super::*;
 
+    fn test_openai() -> OpenAiRuntimeHandle {
+        static RUNTIME: std::sync::OnceLock<crate::runtime::openai::OpenAiRuntime> =
+            std::sync::OnceLock::new();
+        RUNTIME
+            .get_or_init(|| {
+                crate::runtime::openai::OpenAiRuntime::start().expect("test OpenAI runtime")
+            })
+            .handle()
+    }
+
     #[derive(Clone, Copy)]
     struct TestDeliveryPort;
 
@@ -2306,17 +2308,17 @@ mod tests {
         assert_eq!(config.retry_count, 2);
         assert_eq!(config.ai.endpoint, DEEPSEEK_DEFAULT_ENDPOINT);
         assert_eq!(config.ai.model, DEEPSEEK_DEFAULT_MODEL);
-        assert!(!config.ai.thinking_enabled);
         assert_eq!(config.ai.max_tokens, DEFAULT_AI_MAX_TOKENS);
     }
 
     #[test]
-    fn deepseek_v4_request_uses_official_non_thinking_json_parameters() {
+    fn ai_request_uses_only_standard_chat_completion_parameters() {
         let config = TurtleSoupAiConfig::default();
-        let body = build_ai_request_body(&config, core_system_prompt(false), "输出 json".into());
+        let request = build_ai_request(&config, core_system_prompt(false), "输出 json".into())
+            .expect("chat request");
+        let body = serde_json::to_value(request).expect("request json");
 
         assert_eq!(body["model"], DEEPSEEK_DEFAULT_MODEL);
-        assert_eq!(body["thinking"]["type"], "disabled");
         assert_eq!(body["response_format"]["type"], "json_object");
         assert_eq!(body["temperature"].as_f64(), Some(0.0));
         assert_eq!(
@@ -2324,7 +2326,9 @@ mod tests {
             Some(DEFAULT_AI_MAX_TOKENS as u64)
         );
         assert_eq!(body["stream"], false);
+        assert_eq!(body["store"], false);
         assert!(body.get("max_completion_tokens").is_none());
+        assert!(body.get("thinking").is_none());
         assert!(body.get("top_p").is_none());
         assert!(
             body["messages"][0]["content"]
@@ -2334,46 +2338,45 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_v4_thinking_mode_uses_configured_token_limit_without_temperature() {
-        let config = TurtleSoupAiConfig {
-            thinking_enabled: true,
-            max_tokens: 2_048,
-            ..TurtleSoupAiConfig::default()
-        };
-        let body = build_ai_request_body(&config, "返回 json", "输出 json".into());
-
-        assert_eq!(body["thinking"]["type"], "enabled");
-        assert_eq!(body["max_tokens"].as_u64(), Some(2_048));
-        assert!(body.get("temperature").is_none());
-        assert!(body.get("top_p").is_none());
-    }
-
-    #[test]
-    fn non_deepseek_v4_request_omits_thinking_extension() {
+    fn ai_request_uses_configured_standard_token_limit_for_custom_models() {
         let config = TurtleSoupAiConfig {
             endpoint: "https://example.com/v1/chat/completions".to_string(),
             api_key: "test-key".to_string(),
             model: "custom-model".to_string(),
-            thinking_enabled: true,
-            max_tokens: 1_024,
+            max_tokens: 2_048,
+            extra_body: HashMap::new(),
         };
-        let body = build_ai_request_body(&config, "返回 json", "输出 json".into());
+        let request =
+            build_ai_request(&config, "返回 json", "输出 json".into()).expect("chat request");
+        let body = serde_json::to_value(request).expect("request json");
 
         assert!(body.get("thinking").is_none());
-        assert_eq!(body["max_tokens"].as_u64(), Some(1_024));
+        assert_eq!(body["max_tokens"].as_u64(), Some(2_048));
         assert_eq!(body["temperature"].as_f64(), Some(0.0));
     }
 
     #[test]
     fn model_reply_content_rejects_empty_or_truncated_json_output() {
-        let valid = r#"{"choices":[{"finish_reason":"stop","message":{"content":"{\"decision\":\"yes\"}"}}]}"#;
-        assert_eq!(model_reply_content(valid).unwrap(), r#"{"decision":"yes"}"#);
+        let valid = json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": { "content": "{\"decision\":\"yes\"}" }
+            }]
+        });
+        assert_eq!(
+            model_reply_content(&valid).unwrap(),
+            r#"{"decision":"yes"}"#
+        );
 
-        let truncated = r#"{"choices":[{"finish_reason":"length","message":{"content":"{}"}}]}"#;
-        assert!(model_reply_content(truncated).is_err());
+        let truncated = json!({
+            "choices": [{ "finish_reason": "length", "message": { "content": "{}" } }]
+        });
+        assert!(model_reply_content(&truncated).is_err());
 
-        let empty = r#"{"choices":[{"finish_reason":"stop","message":{"content":""}}]}"#;
-        assert!(model_reply_content(empty).is_err());
+        let empty = json!({
+            "choices": [{ "finish_reason": "stop", "message": { "content": "" } }]
+        });
+        assert!(model_reply_content(&empty).is_err());
     }
 
     #[test]
@@ -2710,6 +2713,7 @@ mod tests {
             TurtleSoupConfig::default(),
             EntertainmentCoordinator::new(),
             TestDeliveryPort,
+            test_openai(),
         );
         let visible = |text| vec![parse_question_message(text, None).expect("question")];
 
@@ -2784,6 +2788,7 @@ mod tests {
             TurtleSoupConfig::default(),
             EntertainmentCoordinator::new(),
             TestDeliveryPort,
+            test_openai(),
         );
         let visible = |text| vec![parse_question_message(text, None).expect("question")];
 
@@ -2817,6 +2822,7 @@ mod tests {
             TurtleSoupConfig::default(),
             EntertainmentCoordinator::new(),
             TestDeliveryPort,
+            test_openai(),
         );
         let visible = |player: &str, question: &str| {
             vec![
@@ -2857,6 +2863,7 @@ mod tests {
             TurtleSoupConfig::default(),
             EntertainmentCoordinator::new(),
             TestDeliveryPort,
+            test_openai(),
         );
         let visible = || {
             ["Alice", "Bob"]
@@ -2886,6 +2893,7 @@ mod tests {
             TurtleSoupConfig::default(),
             EntertainmentCoordinator::new(),
             TestDeliveryPort,
+            test_openai(),
         );
         let visible = || {
             ["星念BOT", "星念B0T"]
@@ -2915,6 +2923,7 @@ mod tests {
             TurtleSoupConfig::default(),
             EntertainmentCoordinator::new(),
             TestDeliveryPort,
+            test_openai(),
         );
         let observation = |player: &str, text: &str| {
             vec![SecondaryOcrObservation {
@@ -2951,6 +2960,7 @@ mod tests {
             TurtleSoupConfig::default(),
             EntertainmentCoordinator::new(),
             TestDeliveryPort,
+            test_openai(),
         );
         let observation = |player: &str| {
             vec![SecondaryOcrObservation {
@@ -2976,8 +2986,12 @@ mod tests {
             content_stable_count: 2,
             ..TurtleSoupConfig::default()
         };
-        let service =
-            TurtleSoupService::new(config, EntertainmentCoordinator::new(), TestDeliveryPort);
+        let service = TurtleSoupService::new(
+            config,
+            EntertainmentCoordinator::new(),
+            TestDeliveryPort,
+            test_openai(),
+        );
         let visible =
             || vec![parse_question_message("星念：# 他认识死者吗？", None).expect("question")];
 
@@ -3004,6 +3018,7 @@ mod tests {
             TurtleSoupConfig::default(),
             EntertainmentCoordinator::new(),
             TestDeliveryPort,
+            test_openai(),
         );
         let observation = vec![SecondaryOcrObservation {
             text: "@状态".to_string(),
@@ -3077,8 +3092,12 @@ mod tests {
             question_bank_path: PathBuf::from("missing-turtle-soup-bank.yaml"),
             ..TurtleSoupConfig::default()
         };
-        let service =
-            TurtleSoupService::new(config, EntertainmentCoordinator::new(), TestDeliveryPort);
+        let service = TurtleSoupService::new(
+            config,
+            EntertainmentCoordinator::new(),
+            TestDeliveryPort,
+            test_openai(),
+        );
 
         let error = service.start_random_from_web().unwrap_err();
 
@@ -3111,6 +3130,7 @@ mod tests {
             TurtleSoupConfig::default(),
             EntertainmentCoordinator::new(),
             TestDeliveryPort,
+            test_openai(),
         );
         {
             let mut state = service.state.lock().unwrap();
@@ -3146,8 +3166,12 @@ mod tests {
             enabled: true,
             ..TurtleSoupConfig::default()
         };
-        let service =
-            TurtleSoupService::new(config, EntertainmentCoordinator::new(), TestDeliveryPort);
+        let service = TurtleSoupService::new(
+            config,
+            EntertainmentCoordinator::new(),
+            TestDeliveryPort,
+            test_openai(),
+        );
         {
             let mut state = service.state.lock().unwrap();
             state.phase = TurtleSoupPhase::Active;

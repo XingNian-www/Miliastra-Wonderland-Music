@@ -142,6 +142,7 @@ use crate::runtime::business::{
 };
 use crate::runtime::deadline_bridge::{BusinessRuntimeGroup, BusinessRuntimeGroupBuilder};
 use crate::runtime::identity::BusinessOperationIdAllocator;
+use crate::runtime::openai::OpenAiRuntime;
 use crate::runtime::player_io::{PlayerRuntime, PlayerSearchClient, PlayerSearchClientError};
 use crate::runtime::ui::{
     FrameDemand, FrameDemandSubscription, FramePublication, UiRuntime, UiRuntimeHandle,
@@ -420,6 +421,7 @@ pub(crate) struct AutomationApp {
     player: PlayerController<FeelUOwnClient>,
     player_search: PlayerSearchClient,
     player_runtime: Option<PlayerRuntime>,
+    openai_runtime: Option<OpenAiRuntime>,
     ai: ai::AiClient,
     song_review: SongReviewClient,
     chat_output: ChatOutput,
@@ -1060,8 +1062,11 @@ impl AutomationApp {
             UI_RUNTIME_QUEUE_CAPACITY,
         )?;
         let game_ui = GameUi::runtime(ui_runtime.handle());
-        let ai = ai::AiClient::new(&config.ai, &config.timing);
-        let song_review = SongReviewClient::new(&config.song_review, &config.timing);
+        let openai_runtime = OpenAiRuntime::start().context("启动 OpenAI runtime")?;
+        let openai = openai_runtime.handle();
+        let ai = ai::AiClient::new(&config.ai, &config.timing, openai.clone());
+        let song_review =
+            SongReviewClient::new(&config.song_review, &config.timing, openai.clone());
         let chat_output = ChatOutput::new(
             &config.output,
             &config.timing,
@@ -1089,6 +1094,7 @@ impl AutomationApp {
             turtle_soup_config,
             entertainment.clone(),
             deferred_chat.clone(),
+            openai,
         );
         let queue = Arc::new(Mutex::new(queue));
         let song_dedup_history = Arc::new(Mutex::new(song_dedup_history));
@@ -1135,6 +1141,7 @@ impl AutomationApp {
             player,
             player_search,
             player_runtime: Some(player_runtime),
+            openai_runtime: Some(openai_runtime),
             ai,
             song_review,
             chat_output,
@@ -1233,6 +1240,10 @@ impl AutomationApp {
             && let Err(error) = player_runtime.shutdown()
         {
             log::error!("播放器运行时关闭失败: {error}");
+        }
+        if let Some(openai_runtime) = self.openai_runtime.take() {
+            openai_runtime.shutdown();
+            log::info!("OpenAI runtime 已关闭");
         }
         if let Err(error) = self.queue().and_then(|queue| queue.save()) {
             log::error!("退出前保存队列失败: {error:#}");
@@ -1486,6 +1497,7 @@ impl AutomationApp {
             player: self.player.clone(),
             player_search: self.player_search.clone(),
             player_runtime: None,
+            openai_runtime: None,
             ai: self.ai.clone(),
             song_review: self.song_review.clone(),
             chat_output: self.chat_output.clone(),
@@ -1655,6 +1667,7 @@ impl AutomationApp {
             self.web_tools.clone(),
             self.latest_frame.clone(),
             self.player_search.clone(),
+            self.ai.clone(),
         ))?;
         self.http_server = Some(server);
         Ok(())

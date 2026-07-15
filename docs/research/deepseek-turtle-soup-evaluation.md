@@ -1,5 +1,7 @@
 # DeepSeek 海龟汤裁决稳定性评测
 
+> 本文是旧版 DeepSeek 私有思考开关下的历史评测。当前默认请求不再自动发送 `thinking`，第三方兼容字段只能通过 `extra_body` 显式补充，因此这些结果不能直接外推到标准化后的请求。
+
 > 评测日期：2026-07-12  
 > 模型：`deepseek-v4-flash`  
 > 接口：DeepSeek 官方 Chat Completions  
@@ -7,15 +9,19 @@
 
 ## 结论
 
-最终推荐配置：
+按当前配置结构复现历史评测中“关闭思考”的推荐组合：
 
 ```yaml
 turtle_soup:
   ai:
     model: "deepseek-v4-flash"
-    thinking_enabled: false
     max_tokens: 256
+    extra_body:
+      thinking:
+        type: "disabled"
 ```
+
+`thinking` 是 DeepSeek 私有兼容字段，不是当前默认请求的一部分；只有需要复现本页历史评测条件时才显式配置。
 
 推荐使用“严格决策树”提示词，并让内置协议与追加规则采用相同定义：
 

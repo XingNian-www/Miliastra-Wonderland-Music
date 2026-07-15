@@ -2,7 +2,7 @@
 # 坐标沿用旧脚本习惯：以游戏客户区左上角为原点，按 1920x1080 有效画面写坐标
 
 # 配置版本；程序启动时会把旧版本配置迁移到当前模板
-config_version: 27
+config_version: 28
 
 window:
   # 目标游戏进程名，按进程文件名匹配，大小写不敏感；多个进程名可用逗号分隔
@@ -147,6 +147,12 @@ timing:
     monitor_tick_ms: 200
     # 播放结束监控向 FeelUOwn 校准状态的间隔，单位毫秒
     monitor_status_ms: 1000
+    # 播放 URI 连续确认次数；大于 1 时覆盖全局值，0 或 1 表示继承
+    uri_stable_samples: 0
+    # 播放状态连续确认次数；大于 1 时覆盖全局值，0 或 1 表示继承
+    transport_stable_samples: 0
+    # 播放器异常时保留上一条稳定观测的最长时间，必须为正整数，单位毫秒
+    stale_timeout_ms: 5000
   decision:
     # 匹配失败/AI 自动匹配后等待用户确认的最长时间，单位毫秒
     timeout_ms: 20000

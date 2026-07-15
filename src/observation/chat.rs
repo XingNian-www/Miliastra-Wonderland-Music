@@ -86,24 +86,25 @@ impl ObservedFrame {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum FrameCompletionOutcome {
-    Success,
-    TerminalFailure(Arc<str>),
+pub enum ObservationCompletionEvent {
+    Succeeded {
+        frame: ObservedFrame,
+    },
+    TerminalFailure {
+        frame: ObservedFrame,
+        reason: Arc<str>,
+    },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CompletedObservationFrame {
-    frame: ObservedFrame,
-    outcome: FrameCompletionOutcome,
-}
-
-impl CompletedObservationFrame {
+impl ObservationCompletionEvent {
     pub fn frame(&self) -> ObservedFrame {
-        self.frame
+        match self {
+            Self::Succeeded { frame } | Self::TerminalFailure { frame, .. } => *frame,
+        }
     }
 
-    pub fn outcome(&self) -> &FrameCompletionOutcome {
-        &self.outcome
+    pub fn captured_at(&self) -> Instant {
+        self.frame().captured_at()
     }
 }
 
@@ -115,13 +116,13 @@ pub struct ObservationWatermark {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CompletionAdvance {
-    completed: Vec<CompletedObservationFrame>,
+    events: Vec<ObservationCompletionEvent>,
     watermark: Option<ObservationWatermark>,
 }
 
 impl CompletionAdvance {
-    pub fn completed(&self) -> &[CompletedObservationFrame] {
-        &self.completed
+    pub fn events(&self) -> &[ObservationCompletionEvent] {
+        &self.events
     }
 
     pub fn watermark(&self) -> Option<ObservationWatermark> {
@@ -157,6 +158,11 @@ impl Error for ObservationLedgerError {}
 struct PendingFrame {
     frame: ObservedFrame,
     outcome: Option<FrameCompletionOutcome>,
+}
+
+enum FrameCompletionOutcome {
+    Success,
+    TerminalFailure(Arc<str>),
 }
 
 pub struct ChatObservationLedger {
@@ -229,7 +235,7 @@ impl ChatObservationLedger {
         }
         pending.outcome = Some(outcome);
 
-        let mut completed = Vec::new();
+        let mut events = Vec::new();
         loop {
             let id = ObservationFrameId(self.next_to_release);
             let is_complete = self
@@ -252,13 +258,20 @@ impl ChatObservationLedger {
                 completed_through: pending.frame.id,
                 captured_through: pending.frame.captured_at,
             });
-            completed.push(CompletedObservationFrame {
-                frame: pending.frame,
-                outcome,
+            events.push(match outcome {
+                FrameCompletionOutcome::Success => ObservationCompletionEvent::Succeeded {
+                    frame: pending.frame,
+                },
+                FrameCompletionOutcome::TerminalFailure(reason) => {
+                    ObservationCompletionEvent::TerminalFailure {
+                        frame: pending.frame,
+                        reason,
+                    }
+                }
             });
         }
 
-        let watermark = if completed.is_empty() {
+        let watermark = if events.is_empty() {
             None
         } else {
             Some(
@@ -266,10 +279,7 @@ impl ChatObservationLedger {
                     .expect("released frames always advance the watermark"),
             )
         };
-        Ok(CompletionAdvance {
-            completed,
-            watermark,
-        })
+        Ok(CompletionAdvance { events, watermark })
     }
 }
 
@@ -286,6 +296,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn successful_completion_emits_the_observed_frame_and_capture_time() {
+        let mut ledger = ChatObservationLedger::new();
+        let captured_at = Instant::now();
+        let frame = ledger.begin_frame(captured_at);
+
+        let advance = ledger.complete_success(frame.id()).unwrap();
+
+        assert_eq!(advance.events().len(), 1);
+        assert_eq!(advance.events()[0].frame(), frame);
+        assert_eq!(advance.events()[0].captured_at(), captured_at);
+        assert!(matches!(
+            advance.events()[0],
+            ObservationCompletionEvent::Succeeded { .. }
+        ));
+    }
+
+    #[test]
+    fn terminal_failure_emits_the_observed_frame_capture_time_and_reason() {
+        let mut ledger = ChatObservationLedger::new();
+        let captured_at = Instant::now();
+        let frame = ledger.begin_frame(captured_at);
+
+        let advance = ledger
+            .complete_failure(frame.id(), "OCR retry exhausted")
+            .unwrap();
+
+        assert_eq!(advance.events().len(), 1);
+        assert_eq!(advance.events()[0].frame(), frame);
+        assert_eq!(advance.events()[0].captured_at(), captured_at);
+        assert!(matches!(
+            &advance.events()[0],
+            ObservationCompletionEvent::TerminalFailure { reason, .. }
+                if reason.as_ref() == "OCR retry exhausted"
+        ));
+    }
+
+    #[test]
     fn terminal_failure_releases_the_completion_watermark_past_later_finished_frames() {
         let mut ledger = ChatObservationLedger::new();
         let started = Instant::now();
@@ -293,22 +340,24 @@ mod tests {
         let second = ledger.begin_frame(started + Duration::from_millis(20));
 
         let blocked = ledger.complete_success(second.id()).unwrap();
-        assert!(blocked.completed().is_empty());
+        assert!(blocked.events().is_empty());
         assert_eq!(blocked.watermark(), None);
 
         let released = ledger
             .complete_failure(first.id(), "OCR retry exhausted")
             .unwrap();
-        assert_eq!(released.completed().len(), 2);
+        assert_eq!(released.events().len(), 2);
         assert!(matches!(
-            released.completed()[0].outcome(),
-            FrameCompletionOutcome::TerminalFailure(reason)
+            &released.events()[0],
+            ObservationCompletionEvent::TerminalFailure { reason, .. }
                 if reason.as_ref() == "OCR retry exhausted"
         ));
-        assert_eq!(
-            released.completed()[1].outcome(),
-            &FrameCompletionOutcome::Success
-        );
+        assert!(matches!(
+            released.events()[1],
+            ObservationCompletionEvent::Succeeded { .. }
+        ));
+        assert_eq!(released.events()[0].frame(), first);
+        assert_eq!(released.events()[1].frame(), second);
         assert_eq!(
             released.watermark(),
             Some(ObservationWatermark {

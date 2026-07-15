@@ -1,4 +1,6 @@
 use std::collections::{HashMap, VecDeque};
+#[cfg(test)]
+use std::net::SocketAddr;
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -17,7 +19,8 @@ use image::ColorType;
 use image::codecs::jpeg::JpegEncoder;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::runtime::Builder;
+use tokio::runtime::{Builder, Runtime};
+use tokio::sync::oneshot;
 use url::form_urlencoded;
 
 use super::ai;
@@ -44,6 +47,7 @@ use crate::features::startup::{StartupSource, StartupTask};
 use crate::features::turtle_soup::TurtleSoupService;
 use crate::features::turtle_soup::repository::{TurtleSoupBankStore, TurtleSoupSubmission};
 use crate::features::undercover::{UndercoverCommand, UndercoverService};
+use crate::runtime::player_io::{PlayerSearchClient, PlayerSearchClientError};
 
 const MAX_ACTIVE_CONNECTIONS: usize = 32;
 const MAX_JSON_BODY_BYTES: usize = 64 * 1024;
@@ -448,6 +452,7 @@ pub struct HttpSharedState {
     decision_control: DecisionControlShared,
     web_tools: WebToolShared,
     latest_frame: Arc<Mutex<Option<Arc<image::DynamicImage>>>>,
+    player_search: PlayerSearchClient,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -496,6 +501,7 @@ impl HttpSharedState {
         decision_control: DecisionControlShared,
         web_tools: WebToolShared,
         latest_frame: Arc<Mutex<Option<Arc<image::DynamicImage>>>>,
+        player_search: PlayerSearchClient,
     ) -> Self {
         let turtle_soup_bank =
             TurtleSoupBankStore::new(config.turtle_soup.question_bank_path.clone());
@@ -517,11 +523,50 @@ impl HttpSharedState {
             decision_control,
             web_tools,
             latest_frame,
+            player_search,
         }
     }
 }
 
-pub fn start(state: HttpSharedState) -> Result<()> {
+pub struct HttpServer {
+    #[cfg(test)]
+    local_addr: SocketAddr,
+    shutdown: Option<oneshot::Sender<()>>,
+    worker: Option<thread::JoinHandle<Result<()>>>,
+}
+
+impl HttpServer {
+    #[cfg(test)]
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    pub fn shutdown(mut self) -> Result<()> {
+        self.shutdown_inner()
+    }
+
+    fn shutdown_inner(&mut self) -> Result<()> {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        let Some(worker) = self.worker.take() else {
+            return Ok(());
+        };
+        worker
+            .join()
+            .map_err(|_| anyhow!("HTTP server thread panicked"))?
+    }
+}
+
+impl Drop for HttpServer {
+    fn drop(&mut self) {
+        if let Err(error) = self.shutdown_inner() {
+            log::error!("HTTP/Web 面板关闭失败: {error:#}");
+        }
+    }
+}
+
+pub fn start(state: HttpSharedState) -> Result<HttpServer> {
     if !is_loopback_host(&state.config.http.host)
         && state.config.http.access_token.trim().is_empty()
     {
@@ -532,42 +577,53 @@ pub fn start(state: HttpSharedState) -> Result<()> {
     let bind_addr = format!("{}:{}", state.config.http.host, state.config.http.port);
     let listener = TcpListener::bind(&bind_addr)
         .with_context(|| format!("启动 HTTP/Web 面板失败: {}", bind_addr))?;
+    let local_addr = listener
+        .local_addr()
+        .context("read HTTP listener address")?;
     listener
         .set_nonblocking(true)
         .context("set HTTP listener nonblocking")?;
-    log::info!("HTTP/Web 面板已启动: http://{}", bind_addr);
-    thread::spawn(move || run_server(listener, state));
-    Ok(())
-}
-
-fn run_server(listener: TcpListener, state: HttpSharedState) {
-    let runtime = match Builder::new_multi_thread()
+    let runtime = Builder::new_multi_thread()
         .enable_io()
         .enable_time()
         .build()
-    {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            log::error!("HTTP runtime 启动失败: {error}");
-            return;
-        }
+        .context("启动 HTTP runtime")?;
+    let listener = {
+        let _runtime_guard = runtime.enter();
+        tokio::net::TcpListener::from_std(listener).context("初始化 HTTP listener")?
     };
+    let (shutdown, shutdown_receiver) = oneshot::channel();
+    let worker = thread::Builder::new()
+        .name("http-server".to_string())
+        .spawn(move || run_server(runtime, listener, state, shutdown_receiver))
+        .context("启动 HTTP server thread")?;
+    log::info!("HTTP/Web 面板已启动: http://{}", local_addr);
+    Ok(HttpServer {
+        #[cfg(test)]
+        local_addr,
+        shutdown: Some(shutdown),
+        worker: Some(worker),
+    })
+}
+
+fn run_server(
+    runtime: Runtime,
+    listener: tokio::net::TcpListener,
+    state: HttpSharedState,
+    shutdown: oneshot::Receiver<()>,
+) -> Result<()> {
     runtime.block_on(async move {
-        let listener = match tokio::net::TcpListener::from_std(listener) {
-            Ok(listener) => listener,
-            Err(error) => {
-                log::error!("HTTP listener 初始化失败: {error}");
-                return;
-            }
-        };
         let app = Router::new()
             .fallback(any(axum_entry))
             .layer(DefaultBodyLimit::max(MAX_JSON_BODY_BYTES))
             .with_state(Arc::new(state));
-        if let Err(error) = axum::serve(listener, app).await {
-            log::error!("HTTP/Web 面板运行失败: {error}");
-        }
-    });
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown.await;
+            })
+            .await
+            .context("HTTP/Web 面板运行失败")
+    })
 }
 
 async fn axum_entry(
@@ -871,8 +927,10 @@ fn search_route(
 ) -> std::result::Result<String, AppError> {
     let keyword = normalize_keyword(query_value(query, "keyword"))?;
     let source = normalize_optional_source(query_value(query, "source"))?;
-    let client = FeelUOwnClient::new(&state.config.feeluown, &state.config.timing);
-    client.search(&keyword, &source).map_err(internal_error)
+    state
+        .player_search
+        .search_text(&keyword, &source)
+        .map_err(player_search_error)
 }
 
 fn search_candidates_route(
@@ -881,11 +939,11 @@ fn search_candidates_route(
 ) -> std::result::Result<String, AppError> {
     let keyword = normalize_keyword(query_value(query, "keyword"))?;
     let source = normalize_optional_source(query_value(query, "source"))?;
-    let client = FeelUOwnClient::new(&state.config.feeluown, &state.config.timing);
     serde_json::to_string(
-        &client
+        &state
+            .player_search
             .search_candidates(&keyword, &source)
-            .map_err(internal_error)?,
+            .map_err(player_search_error)?,
     )
     .map_err(internal_error)
 }
@@ -2794,6 +2852,14 @@ fn internal_error(error: impl std::fmt::Display) -> AppError {
     }
 }
 
+fn player_search_error(error: PlayerSearchClientError) -> AppError {
+    let message = match error {
+        PlayerSearchClientError::Failed(source) => source.to_string(),
+        error => error.to_string(),
+    };
+    internal_message(&message)
+}
+
 fn internal_message(message: &str) -> AppError {
     internal_error(anyhow!(message.to_string()))
 }
@@ -2808,6 +2874,248 @@ fn turtle_soup_error(error: anyhow::Error) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::ops::{Deref, DerefMut};
+    use std::time::Duration;
+
+    use crate::runtime::identity::BusinessOperationIdAllocator;
+    use crate::runtime::player::RawPlayerSample;
+    use crate::runtime::player_io::{
+        ControlDispatchOutcome, PickedCandidate, PlayerControl, PlayerControlPort,
+        PlayerObservationPort, PlayerObservationReadError, PlayerRuntime, PlayerSearchClient,
+        PlayerSearchError, PlayerSearchPort, SearchCandidate,
+    };
+
+    struct HttpTestObservationPort;
+
+    impl PlayerObservationPort for HttpTestObservationPort {
+        fn read_sample(&mut self) -> Result<RawPlayerSample, PlayerObservationReadError> {
+            Ok(RawPlayerSample::default())
+        }
+    }
+
+    struct HttpTestControlPort;
+
+    impl PlayerControlPort for HttpTestControlPort {
+        fn dispatch(&mut self, _control: &PlayerControl) -> ControlDispatchOutcome {
+            ControlDispatchOutcome::acknowledged("ok")
+        }
+    }
+
+    struct HttpTestSearchPort {
+        fail: bool,
+    }
+
+    impl HttpTestSearchPort {
+        const fn successful() -> Self {
+            Self { fail: false }
+        }
+
+        const fn failing() -> Self {
+            Self { fail: true }
+        }
+
+        fn fail_if_requested(&self) -> Result<(), PlayerSearchError> {
+            if self.fail {
+                Err(PlayerSearchError::new("backend failed"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl PlayerSearchPort for HttpTestSearchPort {
+        fn search_text(
+            &mut self,
+            keyword: &str,
+            source: &str,
+        ) -> Result<String, PlayerSearchError> {
+            self.fail_if_requested()?;
+            Ok(format!("raw search: {keyword} [{source}]"))
+        }
+
+        fn search_candidates(
+            &mut self,
+            keyword: &str,
+            source: &str,
+        ) -> Result<Vec<SearchCandidate>, PlayerSearchError> {
+            self.fail_if_requested()?;
+            Ok(vec![SearchCandidate::new(
+                format!("{keyword} result"),
+                format!("fuo://{source}/songs/1"),
+            )])
+        }
+
+        fn search_and_pick(
+            &mut self,
+            keyword: &str,
+            source: &str,
+            _prefer_accompaniment: bool,
+        ) -> Result<Option<PickedCandidate>, PlayerSearchError> {
+            self.fail_if_requested()?;
+            Ok(Some(PickedCandidate::new(
+                SearchCandidate::new(
+                    format!("{keyword} result"),
+                    format!("fuo://{source}/songs/1"),
+                ),
+                "candidate listing",
+            )))
+        }
+    }
+
+    struct HttpTestState {
+        state: HttpSharedState,
+        _player_runtime: PlayerRuntime,
+    }
+
+    impl Deref for HttpTestState {
+        type Target = HttpSharedState;
+
+        fn deref(&self) -> &Self::Target {
+            &self.state
+        }
+    }
+
+    impl DerefMut for HttpTestState {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.state
+        }
+    }
+
+    struct TestHttpResponse {
+        status_line: String,
+        headers: HashMap<String, String>,
+        body: String,
+    }
+
+    fn start_test_http_server(state: &mut HttpTestState, access_token: &str) -> HttpServer {
+        state.config.http.host = "127.0.0.1".to_string();
+        state.config.http.port = 0;
+        state.config.http.access_token = access_token.to_string();
+        start(state.state.clone()).expect("start HTTP server")
+    }
+
+    fn http_get(address: SocketAddr, target: &str, access_token: Option<&str>) -> TestHttpResponse {
+        let mut stream = TcpStream::connect(address).expect("connect to HTTP server");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set read timeout");
+        let token_header = access_token
+            .map(|token| format!("X-Miliastra-Token: {token}\r\n"))
+            .unwrap_or_default();
+        let request = format!(
+            "GET {target} HTTP/1.1\r\nHost: localhost\r\n{token_header}Connection: close\r\n\r\n"
+        );
+        stream
+            .write_all(request.as_bytes())
+            .expect("write HTTP request");
+        let mut raw = String::new();
+        stream.read_to_string(&mut raw).expect("read HTTP response");
+        let (head, body) = raw.split_once("\r\n\r\n").expect("HTTP response head");
+        let mut lines = head.split("\r\n");
+        let status_line = lines.next().expect("HTTP status line").to_string();
+        let headers = lines
+            .map(|line| line.split_once(':').expect("HTTP response header"))
+            .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_string()))
+            .collect();
+        TestHttpResponse {
+            status_line,
+            headers,
+            body: body.to_string(),
+        }
+    }
+
+    #[test]
+    fn owned_http_server_serves_and_stops_on_an_ephemeral_port() {
+        let mut state = test_state();
+        let server = start_test_http_server(&mut state, "");
+        let address = server.local_addr();
+        let response = http_get(address, "/", None);
+
+        assert_eq!(response.status_line, "HTTP/1.1 200 OK");
+        server.shutdown().expect("shutdown HTTP server");
+        assert!(TcpStream::connect(address).is_err());
+    }
+
+    #[test]
+    fn search_routes_preserve_their_contract_over_real_http() {
+        let mut state = test_state();
+        let server = start_test_http_server(&mut state, "");
+        let address = server.local_addr();
+
+        let text = http_get(address, "/search?keyword=song&source=netease", None);
+        assert_eq!(text.status_line, "HTTP/1.1 200 OK");
+        assert_eq!(
+            text.headers.get("content-type").map(String::as_str),
+            Some("text/plain; charset=utf-8")
+        );
+        assert_eq!(text.body, "raw search: song [netease]");
+
+        let candidates = http_get(
+            address,
+            "/search/candidates?keyword=song&source=netease",
+            None,
+        );
+        assert_eq!(candidates.status_line, "HTTP/1.1 200 OK");
+        assert_eq!(
+            candidates.headers.get("content-type").map(String::as_str),
+            Some("application/json; charset=utf-8")
+        );
+        assert_eq!(
+            candidates.body,
+            r#"[{"text":"song result","uri":"fuo://netease/songs/1"}]"#
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&candidates.body).expect("candidate JSON"),
+            json!([{
+                "text": "song result",
+                "uri": "fuo://netease/songs/1"
+            }])
+        );
+
+        server.shutdown().expect("shutdown HTTP server");
+    }
+
+    #[test]
+    fn search_route_requires_the_configured_token_over_real_http() {
+        let mut state = test_state();
+        let server = start_test_http_server(&mut state, "secret");
+
+        let response = http_get(
+            server.local_addr(),
+            "/search?keyword=song&source=netease",
+            None,
+        );
+
+        assert_eq!(response.status_line, "HTTP/1.1 401 Unauthorized");
+        assert_eq!(
+            response.headers.get("content-type").map(String::as_str),
+            Some("text/plain; charset=utf-8")
+        );
+        assert_eq!(response.body, "错误: 需要有效的 Web 访问令牌");
+        server.shutdown().expect("shutdown HTTP server");
+    }
+
+    #[test]
+    fn search_backend_failure_keeps_the_http_error_contract() {
+        let mut state = test_state_with_search_port(HttpTestSearchPort::failing());
+        let server = start_test_http_server(&mut state, "");
+
+        let response = http_get(
+            server.local_addr(),
+            "/search?keyword=song&source=netease",
+            None,
+        );
+
+        assert_eq!(response.status_line, "HTTP/1.1 500 Internal Server Error");
+        assert_eq!(
+            response.headers.get("content-type").map(String::as_str),
+            Some("text/plain; charset=utf-8")
+        );
+        assert_eq!(response.body, "错误: backend failed");
+        server.shutdown().expect("shutdown HTTP server");
+    }
 
     struct TestModerationCommandPort {
         listener: ChatListenerShared,
@@ -3151,6 +3459,42 @@ workflows:
         assert!(is_mutating_route("/ai/search"));
         assert!(is_json_route("/searchPlay"));
         assert!(is_json_route("/ai/search"));
+    }
+
+    #[test]
+    fn search_routes_keep_their_existing_response_contracts() {
+        let state = test_state();
+        let query = [
+            ("keyword".to_string(), "晴天".to_string()),
+            ("source".to_string(), "netease".to_string()),
+        ];
+
+        assert_eq!(
+            search_route(&query, &state).unwrap(),
+            "raw search: 晴天 [netease]"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&search_candidates_route(&query, &state).unwrap())
+                .unwrap(),
+            json!([{
+                "text": "晴天 result",
+                "uri": "fuo://netease/songs/1"
+            }])
+        );
+    }
+
+    #[test]
+    fn search_route_preserves_backend_error_text() {
+        let error = player_search_error(PlayerSearchClientError::Failed(PlayerSearchError::new(
+            "backend failed",
+        )));
+
+        assert_eq!(error.status, 500);
+        assert_eq!(error.message, "backend failed");
+        assert_eq!(
+            player_search_error(PlayerSearchClientError::QueueFull).message,
+            "player search lane queue is full"
+        );
     }
 
     #[test]
@@ -3624,7 +3968,11 @@ workflows:
         );
     }
 
-    fn test_state() -> HttpSharedState {
+    fn test_state() -> HttpTestState {
+        test_state_with_search_port(HttpTestSearchPort::successful())
+    }
+
+    fn test_state_with_search_port(search_port: impl PlayerSearchPort) -> HttpTestState {
         let mut config: AppConfig =
             serde_yaml::from_str(include_str!("../../config.yaml")).expect("default config");
         let suffix = SystemTime::now()
@@ -3657,19 +4005,33 @@ workflows:
         );
         let undercover =
             UndercoverService::new(config.undercover.clone(), EntertainmentCoordinator::new());
-        HttpSharedState::new(
-            config,
-            queue,
-            runtime_state,
-            pending,
-            ChatListenerShared::new(),
-            turtle_soup,
-            undercover,
-            monitor,
-            TaskTrackerShared::new(),
-            DecisionControlShared::new(),
-            WebToolShared::new(),
-            Arc::new(Mutex::new(None)),
+        let player_runtime_config = config.player_runtime_config().expect("player config");
+        let player_runtime = PlayerRuntime::start(
+            HttpTestObservationPort,
+            HttpTestControlPort,
+            search_port,
+            player_runtime_config,
         )
+        .expect("player runtime");
+        let player_search =
+            PlayerSearchClient::new(player_runtime.handle(), BusinessOperationIdAllocator::new());
+        HttpTestState {
+            state: HttpSharedState::new(
+                config,
+                queue,
+                runtime_state,
+                pending,
+                ChatListenerShared::new(),
+                turtle_soup,
+                undercover,
+                monitor,
+                TaskTrackerShared::new(),
+                DecisionControlShared::new(),
+                WebToolShared::new(),
+                Arc::new(Mutex::new(None)),
+                player_search,
+            ),
+            _player_runtime: player_runtime,
+        }
     }
 }

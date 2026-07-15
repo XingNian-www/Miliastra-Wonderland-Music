@@ -32,9 +32,9 @@ use super::custom_workflow;
 use super::decision_control::{DecisionAction, DecisionControlShared};
 #[cfg(test)]
 use super::deferred_chat::DeferredChatQueue;
-use super::feeluown::FeelUOwnClient;
 use super::geometry::parse_rect;
 use super::monitor::{MonitorQueueItem, MonitorShared};
+use super::player_controller::{MusicPlayerBackend, PlayerRuntimeBackend};
 use super::queue::{PersistentQueue, QueueItem};
 use super::runtime_state::PersistentRuntimeState;
 use super::task_tracker::TaskTrackerShared;
@@ -49,6 +49,7 @@ use crate::features::startup::{StartupSource, StartupTask};
 use crate::features::turtle_soup::TurtleSoupService;
 use crate::features::turtle_soup::repository::{TurtleSoupBankStore, TurtleSoupSubmission};
 use crate::features::undercover::{UndercoverCommand, UndercoverService};
+use crate::runtime::player_io::PlayerRuntimeHandle;
 use crate::runtime::player_io::{PlayerSearchClient, PlayerSearchClientError};
 
 const MAX_ACTIVE_CONNECTIONS: usize = 32;
@@ -455,6 +456,7 @@ pub struct HttpSharedState {
     web_tools: WebToolShared,
     latest_frame: Arc<Mutex<Option<Arc<image::DynamicImage>>>>,
     player_search: PlayerSearchClient,
+    player_runtime: PlayerRuntimeHandle,
     ai: ai::AiClient,
 }
 
@@ -505,6 +507,7 @@ impl HttpSharedState {
         web_tools: WebToolShared,
         latest_frame: Arc<Mutex<Option<Arc<image::DynamicImage>>>>,
         player_search: PlayerSearchClient,
+        player_runtime: PlayerRuntimeHandle,
         ai: ai::AiClient,
     ) -> Self {
         let turtle_soup_bank =
@@ -528,6 +531,7 @@ impl HttpSharedState {
             web_tools,
             latest_frame,
             player_search,
+            player_runtime,
             ai,
         }
     }
@@ -828,8 +832,8 @@ fn status_route(
     _query: &[(String, String)],
     state: &HttpSharedState,
 ) -> std::result::Result<String, AppError> {
-    let client = FeelUOwnClient::new(&state.config.feeluown, &state.config.timing);
-    serde_json::to_string(&client.status().map_err(internal_error)?).map_err(internal_error)
+    let player = PlayerRuntimeBackend::new(state.player_runtime.clone());
+    serde_json::to_string(&player.status().map_err(internal_error)?).map_err(internal_error)
 }
 
 fn play_route(
@@ -4118,8 +4122,11 @@ workflows:
             player_runtime_config,
         )
         .expect("player runtime");
-        let player_search =
-            PlayerSearchClient::new(player_runtime.handle(), BusinessOperationIdAllocator::new());
+        let player_runtime_handle = player_runtime.handle();
+        let player_search = PlayerSearchClient::new(
+            player_runtime_handle.clone(),
+            BusinessOperationIdAllocator::new(),
+        );
         let ai = ai::AiClient::new(&config.ai, &config.timing, openai);
         HttpTestState {
             state: HttpSharedState::new(
@@ -4136,6 +4143,7 @@ workflows:
                 WebToolShared::new(),
                 Arc::new(Mutex::new(None)),
                 player_search,
+                player_runtime_handle,
                 ai,
             ),
             _player_runtime: player_runtime,

@@ -81,7 +81,7 @@ HTTP 层只接受 `GET`、`POST`、`OPTIONS`。
 
 | 接口 | 行为 |
 | --- | --- |
-| `/status` | 直接查询 FeelUOwn 当前状态。 |
+| `/status` | 查询播放器运行时最近的稳定观测。 |
 | `/search` | 直接调用 FeelUOwn 搜索，只返回搜索结果，不入队。 |
 | `/search/candidates` | 返回结构化候选歌曲和 URI，不入队。 |
 | `/queue` | 读取音乐播放队列。 |

@@ -1670,6 +1670,11 @@ impl AutomationApp {
         if self.http_server.is_some() {
             return Err(anyhow!("HTTP/Web 面板已经启动"));
         }
+        let player_runtime = self
+            .player_runtime
+            .as_ref()
+            .ok_or_else(|| anyhow!("播放器运行时尚未启动"))?
+            .handle();
         let server = http_server::start(http_server::HttpSharedState::new(
             self.config.clone(),
             Arc::clone(&self.queue),
@@ -1684,6 +1689,7 @@ impl AutomationApp {
             self.web_tools.clone(),
             self.latest_frame.clone(),
             self.player_search.clone(),
+            player_runtime,
             self.ai.clone(),
         ))?;
         self.http_server = Some(server);

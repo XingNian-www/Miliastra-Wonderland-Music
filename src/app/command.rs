@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::features::card_games::LandlordCommand;
 use crate::features::chat_text::normalize_comparison_text;
+pub use crate::features::custom_workflow::CustomWorkflowCommand;
 use crate::features::entertainment::EntertainmentKind;
 use crate::features::idiom_chain::{IdiomChainCommand, IdiomChainMode};
 use crate::features::moderation;
@@ -68,13 +69,6 @@ impl ChatListenerModeCommand {
             Self::Status => "状态",
         }
     }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CustomWorkflowCommand {
-    pub name: String,
-    pub workflow: String,
-    pub args: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -692,8 +686,7 @@ fn same_user_command(left: &UserCommand, right: &UserCommand) -> bool {
             left == right
         }
         (UserCommand::CustomWorkflow(left), UserCommand::CustomWorkflow(right)) => {
-            identity_text(&left.workflow) == identity_text(&right.workflow)
-                && identity_text(&left.args) == identity_text(&right.args)
+            left.same_request(right)
         }
         (UserCommand::Volume(left), UserCommand::Volume(right)) => {
             identity_text(left) == identity_text(right)
@@ -803,13 +796,7 @@ fn command_lock_key(command: &UserCommand) -> String {
         UserCommand::EnableCommands { username: _ } => "enable_commands".to_string(),
         UserCommand::IdleExit { minutes } => format!("idle_exit:{}", minutes),
         UserCommand::ChatListenerMode(mode) => format!("chat_listener:{}", mode.label()),
-        UserCommand::CustomWorkflow(command) => {
-            format!(
-                "custom_workflow:{}:{}",
-                identity_text(&command.workflow),
-                identity_text(&command.args)
-            )
-        }
+        UserCommand::CustomWorkflow(command) => command.lock_key(),
     }
 }
 

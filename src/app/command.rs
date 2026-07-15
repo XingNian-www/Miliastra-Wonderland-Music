@@ -6,6 +6,7 @@ use crate::features::card_games::LandlordCommand;
 use crate::features::chat_text::normalize_comparison_text;
 use crate::features::entertainment::EntertainmentKind;
 use crate::features::idiom_chain::{IdiomChainCommand, IdiomChainMode};
+pub use crate::features::moderation::{ModerationAction, ModerationCommand};
 use crate::features::turtle_soup::TurtleSoupCommand;
 use crate::features::undercover::UndercoverCommand;
 
@@ -80,28 +81,6 @@ pub struct InviteCommand {
     pub username: String,
     pub seq: Option<u32>,
     pub password: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ModerationCommand {
-    pub action: ModerationAction,
-    pub uid: String,
-    pub requester: String,
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub enum ModerationAction {
-    Blacklist,
-    BlockChat,
-}
-
-impl ModerationAction {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Blacklist => "拉黑",
-            Self::BlockChat => "屏蔽",
-        }
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

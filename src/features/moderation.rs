@@ -2,6 +2,29 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow};
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModerationCommand {
+    pub action: ModerationAction,
+    pub uid: String,
+    pub requester: String,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ModerationAction {
+    Blacklist,
+    BlockChat,
+}
+
+impl ModerationAction {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Blacklist => "拉黑",
+            Self::BlockChat => "屏蔽",
+        }
+    }
+}
 
 #[derive(Clone, Default)]
 pub struct ModerationService {

@@ -1,18 +1,23 @@
+use std::collections::HashMap;
 use std::thread::sleep;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
-use reqwest::blocking::Client;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
+use anyhow::{Result, bail};
+use async_openai::types::responses::{
+    CreateResponse, CreateResponseArgs, ResponseFormatJsonSchema, Tool, ToolChoiceOptions,
+    ToolChoiceParam, WebSearchTool,
+};
 use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::config::{SongReviewConfig, SongReviewFailurePolicy, TimingConfig};
+use crate::runtime::openai::{OpenAiRuntimeHandle, Target};
 
 #[derive(Clone)]
 pub(super) struct SongReviewClient {
     config: SongReviewConfig,
     timing: TimingConfig,
+    openai: OpenAiRuntimeHandle,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -44,10 +49,15 @@ struct SongReviewResult {
 }
 
 impl SongReviewClient {
-    pub(super) fn new(config: &SongReviewConfig, timing: &TimingConfig) -> Self {
+    pub(super) fn new(
+        config: &SongReviewConfig,
+        timing: &TimingConfig,
+        openai: OpenAiRuntimeHandle,
+    ) -> Self {
         Self {
             config: config.clone(),
             timing: timing.clone(),
+            openai,
         }
     }
 
@@ -136,48 +146,48 @@ impl SongReviewClient {
             bail!("song_review.provider.model 未配置");
         }
 
-        let body = json!({
-            "model": self.config.provider.model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "你是点歌审核助手，负责判断候选歌曲是否适合舒缓、轻松、不吵闹的房间氛围。必须只返回合法 JSON。"
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": build_review_prompt(
-                                candidate,
-                                &self.config.policy_prompt,
-                                &self.config.custom_prompt,
-                            )
-                        }
-                    ]
-                }
-            ],
-            "response_format": { "type": "json_object" },
-            "enable_search": true,
-            "search_options": {
-                "forced_search": true
-            },
-            "enable_thinking": false,
-            "temperature": 0.1,
-            "stream": false,
-            "max_completion_tokens": 512,
-            "top_p": 0.95
-        })
-        .to_string();
+        let request = build_review_request(&self.config, candidate)?;
         let reply = call_review_http(
+            &self.openai,
             &self.config.provider.endpoint,
             &self.config.provider.api_key,
-            &body,
+            request,
+            &self.config.provider.extra_body,
             &self.timing,
         )?;
         let json_text = model_reply_json_object(&reply)?;
         parse_review_result(&json_text)
     }
+}
+
+fn build_review_request(
+    config: &SongReviewConfig,
+    candidate: &SongReviewCandidate,
+) -> Result<CreateResponse> {
+    Ok(CreateResponseArgs::default()
+            .model(config.provider.model.clone())
+            .instructions(
+                "你是点歌审核助手，负责判断候选歌曲是否适合舒缓、轻松、不吵闹的房间氛围。必须只返回合法 JSON。",
+            )
+            .input(build_review_prompt(
+                candidate,
+                &config.policy_prompt,
+                &config.custom_prompt,
+            ))
+            .text(ResponseFormatJsonSchema {
+                description: Some("候选歌曲公开播放审核结果".to_string()),
+                name: "song_review".to_string(),
+                schema: review_schema(),
+                strict: Some(true),
+            })
+            .tools(vec![Tool::WebSearch(WebSearchTool::default())])
+            .tool_choice(ToolChoiceParam::Mode(ToolChoiceOptions::Required))
+            .temperature(0.1)
+            .top_p(0.95)
+            .max_output_tokens(512_u32)
+            .store(false)
+            .stream(false)
+            .build()?)
 }
 
 fn build_review_prompt(
@@ -213,52 +223,100 @@ fn build_review_prompt(
     .join("\n")
 }
 
-fn call_review_http(
-    endpoint: &str,
-    api_key: &str,
-    body: &str,
-    timing: &TimingConfig,
-) -> Result<String> {
-    let response = Client::builder()
-        .timeout(Duration::from_millis(timing.external.ai_request_timeout_ms))
-        .build()
-        .context("创建候选歌曲审核 HTTP 客户端失败")?
-        .post(endpoint)
-        .headers(review_headers(api_key)?)
-        .body(body.to_string())
-        .send()
-        .context("候选歌曲审核请求失败")?;
-    let status = response.status();
-    let text = response.text().context("读取候选歌曲审核响应失败")?;
-    if !status.is_success() {
-        bail!(
-            "候选歌曲审核响应失败 status={} body={}",
-            status,
-            error_excerpt(&text)
-        );
-    }
-    serde_json::from_str::<Value>(&text)
-        .ok()
-        .and_then(|value| {
-            value
-                .pointer("/choices/0/message/content")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|text| !text.is_empty())
-                .map(str::to_string)
-        })
-        .ok_or_else(|| anyhow::anyhow!("候选歌曲审核响应缺少 choices[0].message.content"))
+fn review_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "level": { "type": "integer", "minimum": 1, "maximum": 10 },
+            "reason": { "type": "string" },
+            "tags": { "type": "array", "items": { "type": "string" } }
+        },
+        "required": ["level", "reason", "tags"],
+        "additionalProperties": false
+    })
 }
 
-fn review_headers(api_key: &str) -> Result<HeaderMap> {
-    let mut headers = HeaderMap::new();
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    headers.insert(
-        AUTHORIZATION,
-        HeaderValue::from_str(&format!("Bearer {}", api_key))
-            .context("song_review.provider.api_key 不是有效 HTTP header")?,
-    );
-    Ok(headers)
+fn call_review_http(
+    openai: &OpenAiRuntimeHandle,
+    endpoint: &str,
+    api_key: &str,
+    request: CreateResponse,
+    extra_body: &HashMap<String, Value>,
+    timing: &TimingConfig,
+) -> Result<String> {
+    let target = Target::responses(endpoint, api_key)?;
+    let value = openai
+        .create_response(
+            target,
+            request,
+            extra_body,
+            Duration::from_millis(timing.external.ai_request_timeout_ms),
+        )?
+        .wait()?;
+    response_output_text(&value)
+}
+
+fn response_output_text(value: &Value) -> Result<String> {
+    if let Some(error) = value.get("error").filter(|error| !error.is_null()) {
+        let error_type = response_error_token(error.get("type").and_then(Value::as_str));
+        let code = response_error_token(error.get("code").and_then(Value::as_str));
+        bail!("候选歌曲审核响应失败 type={error_type} code={code}");
+    }
+    if value.get("status").and_then(Value::as_str) != Some("completed") {
+        let reason = value
+            .pointer("/incomplete_details/reason")
+            .and_then(Value::as_str)
+            .or_else(|| value.get("status").and_then(Value::as_str))
+            .map_or("unknown", |reason| response_error_token(Some(reason)));
+        bail!("候选歌曲审核响应未完成: {reason}");
+    }
+    let mut texts = Vec::new();
+    for output in value
+        .get("output")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        for content in output
+            .get("content")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            match content.get("type").and_then(Value::as_str) {
+                Some("refusal") => {
+                    bail!("候选歌曲审核拒绝处理");
+                }
+                Some("output_text") => {
+                    if let Some(text) = content
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|text| !text.is_empty())
+                    {
+                        texts.push(text);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if texts.is_empty() {
+        bail!("候选歌曲审核响应缺少 output_text");
+    }
+    Ok(texts.join(""))
+}
+
+fn response_error_token(value: Option<&str>) -> &str {
+    value
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        })
+        .unwrap_or("unknown")
 }
 
 fn model_reply_json_object(reply: &str) -> Result<String> {
@@ -314,22 +372,6 @@ fn parse_review_result(text: &str) -> Result<SongReviewResult> {
     })
 }
 
-fn error_excerpt(text: &str) -> String {
-    const MAX_ERROR_BODY_CHARS: usize = 500;
-    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if normalized.chars().count() <= MAX_ERROR_BODY_CHARS {
-        normalized
-    } else {
-        format!(
-            "{}...",
-            normalized
-                .chars()
-                .take(MAX_ERROR_BODY_CHARS)
-                .collect::<String>()
-        )
-    }
-}
-
 pub(super) fn split_candidate_title_artist(text: &str) -> (String, String) {
     let text = text.trim().trim_start_matches('#').trim();
     if let Some((title, artist)) = text.rsplit_once(" - ") {
@@ -365,5 +407,77 @@ mod tests {
 
         assert_eq!(title, "晴天");
         assert_eq!(artist, "周杰伦");
+    }
+
+    #[test]
+    fn response_output_text_handles_completed_refusal_and_incomplete_results() {
+        let completed = json!({
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "content": [{ "type": "output_text", "text": "{\"level\":2}" }]
+            }]
+        });
+        assert_eq!(
+            response_output_text(&completed).expect("completed output"),
+            "{\"level\":2}"
+        );
+
+        let refusal = json!({
+            "status": "completed",
+            "output": [{ "content": [{ "type": "refusal", "refusal": "blocked" }] }]
+        });
+        assert!(response_output_text(&refusal).is_err());
+
+        let incomplete = json!({
+            "status": "incomplete",
+            "incomplete_details": { "reason": "max_output_tokens" },
+            "output": []
+        });
+        assert!(response_output_text(&incomplete).is_err());
+
+        let sensitive_incomplete = json!({
+            "status": "provider private status",
+            "incomplete_details": { "reason": "provider private reason" },
+            "output": []
+        });
+        let error = response_output_text(&sensitive_incomplete)
+            .expect_err("sensitive status must still fail")
+            .to_string();
+        assert!(!error.contains("provider-private"));
+    }
+
+    #[test]
+    fn review_request_schema_is_strict() {
+        let schema = review_schema();
+
+        assert_eq!(schema["required"], json!(["level", "reason", "tags"]));
+        assert_eq!(schema["additionalProperties"], false);
+    }
+
+    #[test]
+    fn review_request_uses_standard_responses_web_search() {
+        let mut config = SongReviewConfig::default();
+        config.provider.model = "gpt-5-mini".to_string();
+        let candidate = SongReviewCandidate {
+            source: "qqmusic".to_string(),
+            title: "晴天".to_string(),
+            artist: "周杰伦".to_string(),
+            uri: "fuo://qqmusic/songs/1".to_string(),
+            message_type: "大厅".to_string(),
+            username: "测试".to_string(),
+        };
+        let request = build_review_request(&config, &candidate).expect("responses request");
+        let body = serde_json::to_value(request).expect("request json");
+
+        assert_eq!(body["tools"][0]["type"], "web_search");
+        assert_eq!(body["tool_choice"], "required");
+        assert_eq!(body["text"]["format"]["type"], "json_schema");
+        assert_eq!(body["text"]["format"]["strict"], true);
+        assert_eq!(body["store"], false);
+        assert_eq!(body["stream"], false);
+        assert!(body.get("enable_search").is_none());
+        assert!(body.get("search_options").is_none());
+        assert!(body.get("enable_thinking").is_none());
     }
 }

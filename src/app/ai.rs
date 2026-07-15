@@ -2,12 +2,15 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use reqwest::blocking::Client;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
+use async_openai::types::chat::{
+    ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
+    CreateChatCompletionRequest, CreateChatCompletionRequestArgs, ResponseFormat,
+};
 use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::config::{AiConfig, TimingConfig};
+use crate::runtime::openai::{Authentication, OpenAiRuntimeHandle, Target};
 use crate::runtime::player_io::SearchCandidate;
 
 const MIMO_ENDPOINT: &str = "https://api.xiaomimimo.com/v1/chat/completions";
@@ -23,6 +26,7 @@ const CANDIDATES_PER_SOURCE: usize = 5;
 pub struct AiClient {
     config: AiConfig,
     timing: TimingConfig,
+    openai: OpenAiRuntimeHandle,
 }
 
 #[derive(Clone, Debug)]
@@ -45,6 +49,7 @@ struct AiProviderConfig {
     endpoint: String,
     api_key: String,
     model: String,
+    extra_body: HashMap<String, Value>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,10 +61,11 @@ enum AiProvider {
 }
 
 impl AiClient {
-    pub fn new(config: &AiConfig, timing: &TimingConfig) -> Self {
+    pub fn new(config: &AiConfig, timing: &TimingConfig, openai: OpenAiRuntimeHandle) -> Self {
         Self {
             config: config.clone(),
             timing: timing.clone(),
+            openai,
         }
     }
 
@@ -80,6 +86,7 @@ impl AiClient {
             .trim()
             .to_string();
         let reply = call_ai(
+            &self.openai,
             &provider,
             &build_match_prompt(&request, &song_name, &song_singer),
             1024,
@@ -113,6 +120,7 @@ impl AiClient {
             bail!("缺少搜索候选");
         }
         let reply = call_ai(
+            &self.openai,
             &provider,
             &build_candidate_pick_prompt(&request, prefer_accompaniment, &candidates),
             2048,
@@ -152,60 +160,59 @@ fn candidate_source(uri: &str) -> String {
         .to_string()
 }
 
-pub fn recognize_with_query(
-    config: &AiConfig,
-    timing: &TimingConfig,
-    query: &[(String, String)],
-) -> Result<String> {
-    let provider = resolve_provider_config(config, Some(query))?;
-    let text = normalize_required(query_value(query, "text").unwrap_or(""), "text")?;
-    let reply = call_ai(&provider, &build_recognize_prompt(&text), 1024, timing)?;
-    let json = model_reply_json_object(&reply)?;
-    validate_recognize_json(&json)?;
-    Ok(json)
-}
+impl AiClient {
+    pub fn recognize_with_query(&self, query: &[(String, String)]) -> Result<String> {
+        let provider = resolve_provider_config(&self.config, Some(query))?;
+        let text = normalize_required(query_value(query, "text").unwrap_or(""), "text")?;
+        let reply = call_ai(
+            &self.openai,
+            &provider,
+            &build_recognize_prompt(&text),
+            1024,
+            &self.timing,
+        )?;
+        let json = model_reply_json_object(&reply)?;
+        validate_recognize_json(&json)?;
+        Ok(json)
+    }
 
-pub fn match_with_query(
-    config: &AiConfig,
-    timing: &TimingConfig,
-    query: &[(String, String)],
-) -> Result<String> {
-    let provider = resolve_provider_config(config, Some(query))?;
-    let request = normalize_required(query_value(query, "request").unwrap_or(""), "request")?;
-    let song_name = normalize_required(query_value(query, "songName").unwrap_or(""), "songName")?;
-    let song_singer =
-        assert_no_control_chars(query_value(query, "songSinger").unwrap_or(""), "songSinger")?
-            .trim()
-            .to_string();
-    let reply = call_ai(
-        &provider,
-        &build_match_prompt(&request, &song_name, &song_singer),
-        1024,
-        timing,
-    )?;
-    let json = model_reply_json_object(&reply)?;
-    validate_match_json(&json)?;
-    Ok(json)
-}
+    pub fn match_with_query(&self, query: &[(String, String)]) -> Result<String> {
+        let provider = resolve_provider_config(&self.config, Some(query))?;
+        let request = normalize_required(query_value(query, "request").unwrap_or(""), "request")?;
+        let song_name =
+            normalize_required(query_value(query, "songName").unwrap_or(""), "songName")?;
+        let song_singer =
+            assert_no_control_chars(query_value(query, "songSinger").unwrap_or(""), "songSinger")?
+                .trim()
+                .to_string();
+        let reply = call_ai(
+            &self.openai,
+            &provider,
+            &build_match_prompt(&request, &song_name, &song_singer),
+            1024,
+            &self.timing,
+        )?;
+        let json = model_reply_json_object(&reply)?;
+        validate_match_json(&json)?;
+        Ok(json)
+    }
 
-pub fn pick_with_query(
-    config: &AiConfig,
-    timing: &TimingConfig,
-    query: &[(String, String)],
-) -> Result<String> {
-    let provider = resolve_provider_config(config, Some(query))?;
-    let request = normalize_required(query_value(query, "request").unwrap_or(""), "request")?;
-    let prefer_accompaniment = parse_bool(query_value(query, "preferAccompaniment"));
-    let candidates = parse_query_candidates(query_value(query, "candidates").unwrap_or(""))?;
-    let reply = call_ai(
-        &provider,
-        &build_candidate_pick_prompt(&request, prefer_accompaniment, &candidates),
-        2048,
-        timing,
-    )?;
-    let json = model_reply_json_object(&reply)?;
-    validate_candidate_pick_json(&json, &candidates)?;
-    Ok(json)
+    pub fn pick_with_query(&self, query: &[(String, String)]) -> Result<String> {
+        let provider = resolve_provider_config(&self.config, Some(query))?;
+        let request = normalize_required(query_value(query, "request").unwrap_or(""), "request")?;
+        let prefer_accompaniment = parse_bool(query_value(query, "preferAccompaniment"));
+        let candidates = parse_query_candidates(query_value(query, "candidates").unwrap_or(""))?;
+        let reply = call_ai(
+            &self.openai,
+            &provider,
+            &build_candidate_pick_prompt(&request, prefer_accompaniment, &candidates),
+            2048,
+            &self.timing,
+        )?;
+        let json = model_reply_json_object(&reply)?;
+        validate_candidate_pick_json(&json, &candidates)?;
+        Ok(json)
+    }
 }
 
 fn query_value<'a>(query: &'a [(String, String)], key: &str) -> Option<&'a str> {
@@ -255,7 +262,8 @@ fn resolve_provider_config(
     query: Option<&[(String, String)]>,
 ) -> Result<AiProviderConfig> {
     let query_value = |key| query.and_then(|items| query_value(items, key));
-    let provider = parse_provider(query_value("provider").unwrap_or(&config.provider))?;
+    let provider_override = query_value("provider");
+    let provider = parse_provider(provider_override.unwrap_or(&config.provider))?;
     let api_key = normalize_api_key(
         query_value("apiKey")
             .or_else(|| query_value("api_key"))
@@ -274,6 +282,13 @@ fn resolve_provider_config(
         endpoint,
         api_key,
         model,
+        extra_body: if provider_override.is_none()
+            || parse_provider(&config.provider).is_ok_and(|configured| configured == provider)
+        {
+            config.extra_body.clone()
+        } else {
+            HashMap::new()
+        },
     })
 }
 
@@ -444,50 +459,63 @@ fn json_string(value: &Value, key: &str) -> String {
 }
 
 fn call_ai(
+    openai: &OpenAiRuntimeHandle,
     config: &AiProviderConfig,
     prompt: &str,
     max_tokens: usize,
     timing: &TimingConfig,
 ) -> Result<String> {
-    let body = json!({
-        "model": config.model,
-        "messages": [
-            { "role": "system", "content": "你是点歌 JSON 结构化输出助手。必须只返回合法 JSON。" },
-            { "role": "user", "content": [{ "type": "text", "text": prompt }] }
-        ],
-        "response_format": { "type": "json_object" },
-        "temperature": 0.1,
-        "stream": false,
-        "max_completion_tokens": max_tokens,
-        "top_p": 0.95,
-        "thinking": { "type": "disabled" }
-    })
-    .to_string();
-    call_ai_http(config, &body, timing)
+    let request = build_ai_request(config, prompt, max_tokens)?;
+    call_ai_http(openai, config, request, timing)
 }
 
-fn call_ai_http(config: &AiProviderConfig, body: &str, timing: &TimingConfig) -> Result<String> {
-    let response = Client::builder()
-        .timeout(Duration::from_millis(timing.external.ai_request_timeout_ms))
-        .build()
-        .context("创建AI HTTP客户端失败")?
-        .post(&config.endpoint)
-        .headers(ai_headers(config)?)
-        .body(body.to_string())
-        .send()
+fn build_ai_request(
+    config: &AiProviderConfig,
+    prompt: &str,
+    max_tokens: usize,
+) -> Result<CreateChatCompletionRequest> {
+    Ok(CreateChatCompletionRequestArgs::default()
+        .model(config.model.clone())
+        .messages(vec![
+            ChatCompletionRequestSystemMessageArgs::default()
+                .content("你是点歌 JSON 结构化输出助手。必须只返回合法 JSON。")
+                .build()?
+                .into(),
+            ChatCompletionRequestUserMessageArgs::default()
+                .content(prompt)
+                .build()?
+                .into(),
+        ])
+        .response_format(ResponseFormat::JsonObject)
+        .temperature(0.1)
+        .stream(false)
+        .store(false)
+        .max_completion_tokens(u32::try_from(max_tokens).context("AI max_tokens 超出范围")?)
+        .top_p(0.95)
+        .build()?)
+}
+
+fn call_ai_http(
+    openai: &OpenAiRuntimeHandle,
+    config: &AiProviderConfig,
+    request: CreateChatCompletionRequest,
+    timing: &TimingConfig,
+) -> Result<String> {
+    let auth = if config.provider == AiProvider::Mimo {
+        Authentication::ApiKey
+    } else {
+        Authentication::Bearer
+    };
+    let target = Target::chat(&config.endpoint, &config.api_key, auth)?;
+    let value = openai
+        .chat_completion(
+            target,
+            request,
+            &config.extra_body,
+            Duration::from_millis(timing.external.ai_request_timeout_ms),
+        )?
+        .wait()
         .with_context(|| format!("AI请求失败({:?})", config.provider))?;
-    let status = response.status();
-    let text = response.text().context("读取AI响应失败")?;
-    if !status.is_success() {
-        bail!(
-            "AI请求失败({:?}) status={}: {}",
-            config.provider,
-            status,
-            error_excerpt(&text)
-        );
-    }
-    let value: Value = serde_json::from_str(&text)
-        .with_context(|| format!("解析AI响应失败: {}", error_excerpt(&text)))?;
     value
         .pointer("/choices/0/message/content")
         .and_then(Value::as_str)
@@ -495,43 +523,6 @@ fn call_ai_http(config: &AiProviderConfig, body: &str, timing: &TimingConfig) ->
         .filter(|text| !text.is_empty())
         .map(str::to_string)
         .ok_or_else(|| anyhow::anyhow!("AI响应缺少choices[0].message.content"))
-}
-
-fn error_excerpt(text: &str) -> String {
-    const MAX_ERROR_BODY_CHARS: usize = 500;
-    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if normalized.chars().count() <= MAX_ERROR_BODY_CHARS {
-        normalized
-    } else {
-        format!(
-            "{}...",
-            normalized
-                .chars()
-                .take(MAX_ERROR_BODY_CHARS)
-                .collect::<String>()
-        )
-    }
-}
-
-fn ai_headers(config: &AiProviderConfig) -> Result<HeaderMap> {
-    let mut headers = HeaderMap::new();
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    match config.provider {
-        AiProvider::Mimo => {
-            headers.insert(
-                HeaderName::from_static("api-key"),
-                HeaderValue::from_str(&config.api_key).context("api_key不是有效HTTP header")?,
-            );
-        }
-        AiProvider::OpenAi | AiProvider::DeepSeek | AiProvider::Custom => {
-            headers.insert(
-                AUTHORIZATION,
-                HeaderValue::from_str(&format!("Bearer {}", config.api_key))
-                    .context("api_key不是有效HTTP header")?,
-            );
-        }
-    }
-    Ok(headers)
 }
 
 fn model_reply_json_object(reply: &str) -> Result<String> {
@@ -615,4 +606,51 @@ fn validate_match_json(text: &str) -> Result<()> {
         bail!("AI返回JSON字段无效: reason");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ai_request_contains_only_standard_chat_completion_fields() {
+        let config = AiProviderConfig {
+            provider: AiProvider::Mimo,
+            endpoint: MIMO_ENDPOINT.to_string(),
+            api_key: "secret".to_string(),
+            model: MIMO_MODEL.to_string(),
+            extra_body: HashMap::new(),
+        };
+        let request = build_ai_request(&config, "返回 JSON", 1_024).expect("chat request");
+        let body = serde_json::to_value(request).expect("request json");
+
+        assert_eq!(body["model"], MIMO_MODEL);
+        assert_eq!(body["response_format"]["type"], "json_object");
+        assert_eq!(body["max_completion_tokens"], 1_024);
+        assert_eq!(body["store"], false);
+        assert_eq!(body["stream"], false);
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("enable_thinking").is_none());
+    }
+
+    #[test]
+    fn provider_override_only_keeps_compatibility_fields_for_the_configured_provider() {
+        let compatibility_fields =
+            HashMap::from([("thinking".to_string(), json!({ "type": "disabled" }))]);
+        let config = AiConfig {
+            provider: "mimo".to_string(),
+            api_key: "secret".to_string(),
+            endpoint: MIMO_ENDPOINT.to_string(),
+            model: MIMO_MODEL.to_string(),
+            extra_body: compatibility_fields.clone(),
+        };
+
+        let configured = resolve_provider_config(&config, None).expect("configured provider");
+        assert_eq!(configured.extra_body, compatibility_fields);
+
+        let query = vec![("provider".to_string(), "openai".to_string())];
+        let overridden =
+            resolve_provider_config(&config, Some(&query)).expect("overridden provider");
+        assert!(overridden.extra_body.is_empty());
+    }
 }

@@ -101,6 +101,63 @@ fn default_window_focus_point() -> PointConfig {
 }
 
 impl AppConfig {
+    pub(crate) fn validate(&self) -> Result<()> {
+        self.player_runtime_config()
+            .context("校验播放器运行时配置")?;
+        if self.window.content_width == 0 || self.window.content_height == 0 {
+            bail!("window.content_width 和 window.content_height 必须大于 0");
+        }
+        if self.screen.expected_width == 0 || self.screen.expected_height == 0 {
+            bail!("screen.expected_width 和 screen.expected_height 必须大于 0");
+        }
+        if self.queue.max_size == 0 {
+            bail!("queue.max_size 必须大于 0");
+        }
+        if self.tui.enabled && self.tui.refresh_ms == 0 {
+            bail!("tui.refresh_ms 必须大于 0");
+        }
+        validate_unit_interval(
+            self.templates.marker_threshold,
+            "templates.marker_threshold",
+        )?;
+        validate_unit_interval(
+            self.custom_workflows.default_threshold,
+            "custom_workflows.default_threshold",
+        )?;
+        validate_unit_interval(
+            self.startup.template_threshold,
+            "startup.template_threshold",
+        )?;
+        validate_unit_interval(
+            self.startup.wonderland_enter_button_threshold,
+            "startup.wonderland_enter_button_threshold",
+        )?;
+        if self.http.enabled && self.http.host.trim().is_empty() {
+            bail!("http.host 不能为空");
+        }
+        if self.http.enabled
+            && !matches!(
+                self.http.host.trim().to_ascii_lowercase().as_str(),
+                "127.0.0.1" | "localhost" | "::1"
+            )
+            && self.http.access_token.trim().is_empty()
+        {
+            bail!("HTTP 监听非本机地址时必须设置 http.access_token");
+        }
+        if self.turtle_soup.enabled {
+            if self.turtle_soup.ai.endpoint.trim().is_empty() {
+                bail!("turtle_soup.ai.endpoint 未配置");
+            }
+            if self.turtle_soup.ai.api_key.trim().is_empty() {
+                bail!("turtle_soup.ai.api_key 未配置");
+            }
+            if self.turtle_soup.ai.model.trim().is_empty() {
+                bail!("turtle_soup.ai.model 未配置");
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn resolve_stability_count(&self, local: u32) -> u32 {
         resolve_stability_count(local, self.stability.default_count)
     }
@@ -188,6 +245,13 @@ impl AppConfig {
             path.display()
         )
     }
+}
+
+fn validate_unit_interval(value: f32, field: &str) -> Result<()> {
+    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+        bail!("{} 必须是 0 到 1 之间的有限小数", field);
+    }
+    Ok(())
 }
 
 fn default_config_yaml() -> &'static str {
@@ -914,6 +978,27 @@ stale_timeout_ms: 7500
             .expect("invalid local and global counts use the built-in default");
         assert_eq!(runtime.observation.uri_stable_samples, 2);
         assert_eq!(runtime.observation.transport_stable_samples, 2);
+    }
+
+    #[test]
+    fn default_app_config_passes_startup_validation() {
+        let config: AppConfig =
+            serde_yaml::from_str(default_config_yaml()).expect("default config");
+
+        config.validate().expect("default config is valid");
+    }
+
+    #[test]
+    fn startup_validation_rejects_invalid_thresholds_and_queue_capacity() {
+        let mut config: AppConfig =
+            serde_yaml::from_str(default_config_yaml()).expect("default config");
+
+        config.templates.marker_threshold = 1.1;
+        assert!(config.validate().is_err());
+
+        config.templates.marker_threshold = 0.9;
+        config.queue.max_size = 0;
+        assert!(config.validate().is_err());
     }
 
     #[test]

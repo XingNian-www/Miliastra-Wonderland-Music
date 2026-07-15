@@ -108,7 +108,7 @@ use self::ui_state::{UiState, detect_ui_state};
 use self::web_tools::{WebToolRequest, WebToolShared, WebToolTask, WebToolTemplate};
 use crate::config::{AppConfig, PointConfig};
 use crate::features::card_games::{
-    CardGameDeliveryPort, CardGameService, LandlordCommand, LandlordOutcome,
+    CardGameDeliveryPort, CardGameDeliveryTask, CardGameService, LandlordCommand,
 };
 use crate::features::chat_text::split_numbered_chat_message;
 use crate::features::entertainment::EntertainmentCoordinator;
@@ -523,9 +523,7 @@ enum PendingTask {
         discard_only: bool,
     },
     RestoreSecondaryHall,
-    CardGameOutcome {
-        outcome: LandlordOutcome,
-    },
+    CardGameDelivery(CardGameDeliveryTask),
     UndercoverDelivery {
         deliveries: Vec<UndercoverDelivery>,
     },
@@ -589,9 +587,7 @@ impl PendingTask {
                 }
             }
             Self::RestoreSecondaryHall => "二级监听恢复当前大厅".to_string(),
-            Self::CardGameOutcome { outcome } => {
-                format!("发送牌局计时结果({})", outcome.action)
-            }
+            Self::CardGameDelivery(delivery) => delivery.label(),
             Self::UndercoverDelivery { .. } => "发送谁是卧底阶段消息".to_string(),
         }
     }
@@ -614,7 +610,7 @@ impl PendingTask {
             Self::SetChatListenerMode { .. }
             | Self::SecondaryUnread { .. }
             | Self::RestoreSecondaryHall
-            | Self::CardGameOutcome { .. }
+            | Self::CardGameDelivery(_)
             | Self::UndercoverDelivery { .. } => false,
         }
     }
@@ -639,7 +635,7 @@ impl PendingTask {
             | Self::SetChatListenerMode { .. }
             | Self::SecondaryUnread { .. }
             | Self::RestoreSecondaryHall
-            | Self::CardGameOutcome { .. }
+            | Self::CardGameDelivery(_)
             | Self::UndercoverDelivery { .. } => false,
         }
     }
@@ -656,7 +652,7 @@ impl PendingTask {
             | Self::StartGame { .. }
             | Self::EnterWonderland { .. }
             | Self::ModerationVoteResult { .. }
-            | Self::CardGameOutcome { .. }
+            | Self::CardGameDelivery(_)
             | Self::UndercoverDelivery { .. } => true,
         }
     }
@@ -2453,14 +2449,12 @@ impl AutomationApp {
             }
         };
         if let Some(outcome) = card_game_outcome {
-            let should_abort_on_failure = !outcome.private_deliveries.is_empty();
-            let ended = outcome.ended;
-            if let Err(error) = self.push_pending_task(PendingTask::CardGameOutcome { outcome }) {
+            let delivery = self.landlord.delivery_task(outcome);
+            let failed_delivery = delivery.clone();
+            if let Err(error) = self.push_pending_task(PendingTask::CardGameDelivery(delivery)) {
                 log::error!("牌局计时结果入队失败: {error:#}");
-                if (ended || should_abort_on_failure)
-                    && let Err(abort_error) = self.landlord.abort()
-                {
-                    log::error!("牌局计时结果入队失败后无法中止牌局: {abort_error:#}");
+                if let Err(cancel_error) = failed_delivery.cancel() {
+                    log::error!("牌局计时结果入队失败后无法清理牌局: {cancel_error:#}");
                 }
             }
         }
@@ -2744,9 +2738,8 @@ impl AutomationApp {
             PendingTask::RestoreSecondaryHall => self
                 .execute_restore_secondary_hall_task()
                 .map(|_| PendingTaskExecution::Completed),
-            PendingTask::CardGameOutcome { outcome } => self
-                .landlord
-                .deliver(outcome, self)
+            PendingTask::CardGameDelivery(delivery) => delivery
+                .execute(self)
                 .map(|_| PendingTaskExecution::Completed),
             PendingTask::UndercoverDelivery { deliveries } => self
                 .undercover

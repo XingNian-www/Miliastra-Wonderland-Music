@@ -1111,8 +1111,14 @@ impl AutomationApp {
             config.ocr.change_mean_threshold,
             config.ocr.change_pixel_threshold,
         );
+        let business_timer = business_runtime_builder.handle();
         let business_runtime = business_runtime_builder.build_with(|| {
-            BusinessRuntime::start(BUSINESS_RUNTIME_QUEUE_CAPACITY, idiom_chain, landlord)
+            BusinessRuntime::start_with_timer(
+                BUSINESS_RUNTIME_QUEUE_CAPACITY,
+                idiom_chain,
+                landlord,
+                business_timer,
+            )
         })?;
         let business = business_runtime.business_handle();
         let business_events = business_runtime.event_sink();
@@ -2774,11 +2780,6 @@ impl AutomationApp {
                 }
             }
             Err(error) => log::error!("无法推进谁是卧底计时: {error:#}"),
-        }
-        match self.business.expire_idiom_chain() {
-            Ok(true) => log::info!("成语接龙已因空闲超时结束，娱乐互斥已释放"),
-            Ok(false) => {}
-            Err(error) => log::error!("无法检查成语接龙空闲超时: {error:#}"),
         }
     }
 

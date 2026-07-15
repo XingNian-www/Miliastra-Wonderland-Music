@@ -9,13 +9,23 @@ use crate::features::card_games::{
     CardGameCancel, CardGameCommandStart, CardGameEffectClaim, CardGameEffectKey,
     CardGameEffectResult, CardGameResume, CardGameService, CardGameTimedOutcome, LandlordCommand,
 };
-use crate::features::idiom_chain::{IdiomChainCommand, IdiomChainOutcome, IdiomChainService};
+use crate::features::idiom_chain::{
+    IdiomChainCommand, IdiomChainDeadlineKind, IdiomChainDeadlineToken, IdiomChainOutcome,
+    IdiomChainService,
+};
 use crate::observation::chat::{
     CompletionAdvance, ObservationCompletionEvent, ObservationWatermark,
 };
 use crate::observation::shared::ObservationGap;
-use crate::runtime::deadline::BusinessDeadlineEvent;
-use crate::runtime::timer::TimerRuntimeEvent;
+use crate::runtime::deadline::{BusinessDeadlineEvent, BusinessDeadlineToken};
+use crate::runtime::identity::{
+    BusinessOperationId, BusinessOperationIdAllocator, SessionGeneration,
+};
+use crate::runtime::timer::{
+    DeadlineCancellation, DeadlineSchedule, TimerRuntimeEvent, TimerRuntimeHandle,
+};
+
+const IDIOM_DEADLINE_TOKEN_ID: u64 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BusinessEvent {
@@ -59,7 +69,7 @@ impl BusinessTimerCounts {
         self.command_failed
     }
 
-    fn record_ignored(&mut self, event: &BusinessDeadlineEvent) {
+    fn record_timer_event(&mut self, event: &BusinessDeadlineEvent) {
         let (expiration_count, (is_completion, is_failure)) = match event {
             BusinessDeadlineEvent::CardGame(event) => {
                 (&mut self.card_game, timer_event_facts(event))
@@ -80,7 +90,7 @@ impl BusinessTimerCounts {
             self.command_completed = self.command_completed.saturating_add(1);
             if is_failure {
                 self.command_failed = self.command_failed.saturating_add(1);
-                log::warn!("计时运行时命令失败，尚未启用对应业务处理: {event:?}");
+                log::warn!("计时运行时命令失败: {event:?}");
             }
         }
     }
@@ -143,9 +153,7 @@ impl BusinessRuntimeSnapshot {
                 self.completion_gap_count = self.completion_gap_count.saturating_add(1);
             }
             BusinessEvent::Timer(event) => {
-                // The routing foundation is observable before individual modules switch from
-                // polling. No existing gameplay deadline is driven by these events yet.
-                self.timer_counts.record_ignored(&event);
+                self.timer_counts.record_timer_event(&event);
             }
         }
     }
@@ -159,6 +167,7 @@ pub enum BusinessRuntimeError {
     WorkerPanicked,
     IdiomChainOperationFailed(String),
     CardGameOperationFailed(String),
+    TimerOperationFailed(String),
 }
 
 impl Display for BusinessRuntimeError {
@@ -175,6 +184,9 @@ impl Display for BusinessRuntimeError {
             }
             Self::CardGameOperationFailed(message) => {
                 write!(formatter, "card game operation failed: {message}")
+            }
+            Self::TimerOperationFailed(message) => {
+                write!(formatter, "business timer operation failed: {message}")
             }
         }
     }
@@ -200,6 +212,14 @@ enum RuntimeMessage {
     Snapshot(SyncSender<BusinessRuntimeSnapshot>),
     PrepareShutdown(SyncSender<BusinessRuntimeSnapshot>),
     Shutdown(SyncSender<BusinessRuntimeSnapshot>),
+}
+
+#[derive(Clone, Debug)]
+struct ActiveIdiomDeadline {
+    token: BusinessDeadlineToken,
+    operation_id: BusinessOperationId,
+    session_generation: SessionGeneration,
+    deadline: Instant,
 }
 
 enum CardGameRuntimeMessage {
@@ -435,6 +455,24 @@ impl BusinessRuntime {
         idiom_chain: IdiomChainService,
         card_games: CardGameService,
     ) -> Result<Self, BusinessRuntimeError> {
+        Self::start_internal(queue_capacity, idiom_chain, card_games, None)
+    }
+
+    pub(crate) fn start_with_timer(
+        queue_capacity: usize,
+        idiom_chain: IdiomChainService,
+        card_games: CardGameService,
+        timer: TimerRuntimeHandle<BusinessDeadlineToken>,
+    ) -> Result<Self, BusinessRuntimeError> {
+        Self::start_internal(queue_capacity, idiom_chain, card_games, Some(timer))
+    }
+
+    fn start_internal(
+        queue_capacity: usize,
+        idiom_chain: IdiomChainService,
+        card_games: CardGameService,
+        timer: Option<TimerRuntimeHandle<BusinessDeadlineToken>>,
+    ) -> Result<Self, BusinessRuntimeError> {
         if queue_capacity == 0 {
             return Err(BusinessRuntimeError::ZeroQueueCapacity);
         }
@@ -445,7 +483,7 @@ impl BusinessRuntime {
         });
         let worker = thread::Builder::new()
             .name("business-runtime".to_string())
-            .spawn(move || run_business_runtime(receiver, idiom_chain, card_games))
+            .spawn(move || run_business_runtime(receiver, idiom_chain, card_games, timer))
             .map_err(|_| BusinessRuntimeError::RuntimeStopped)?;
         Ok(Self {
             handle: BusinessRuntimeHandle { channel },
@@ -531,58 +569,251 @@ impl Drop for BusinessRuntime {
     }
 }
 
+fn idiom_deadline_token() -> BusinessDeadlineToken {
+    BusinessDeadlineToken::from(IdiomChainDeadlineToken::new(
+        IDIOM_DEADLINE_TOKEN_ID,
+        IdiomChainDeadlineKind::SessionIdle,
+    ))
+}
+
+fn sync_idiom_deadline(
+    idiom_chain: &IdiomChainService,
+    timer: Option<&TimerRuntimeHandle<BusinessDeadlineToken>>,
+    active: &mut Option<ActiveIdiomDeadline>,
+    operation_ids: &BusinessOperationIdAllocator,
+    generation: &mut SessionGeneration,
+) -> Result<(), BusinessRuntimeError> {
+    let Some(timer) = timer else {
+        *active = None;
+        return Ok(());
+    };
+
+    match (idiom_chain.idle_deadline(), active.as_ref()) {
+        (None, None) => Ok(()),
+        (None, Some(previous)) => {
+            timer
+                .cancel(DeadlineCancellation::new(
+                    previous.token.clone(),
+                    previous.operation_id,
+                    previous.session_generation,
+                ))
+                .map_err(|error| BusinessRuntimeError::TimerOperationFailed(error.to_string()))?;
+            *active = None;
+            Ok(())
+        }
+        (Some(deadline), None) => {
+            let operation_id = operation_ids
+                .allocate()
+                .map_err(|error| BusinessRuntimeError::TimerOperationFailed(error.to_string()))?;
+            *generation = generation.checked_next().ok_or_else(|| {
+                BusinessRuntimeError::TimerOperationFailed(
+                    "idiom chain session generation exhausted".to_string(),
+                )
+            })?;
+            let token = idiom_deadline_token();
+            timer
+                .schedule(DeadlineSchedule::new(
+                    token.clone(),
+                    operation_id,
+                    *generation,
+                    deadline,
+                ))
+                .map_err(|error| BusinessRuntimeError::TimerOperationFailed(error.to_string()))?;
+            *active = Some(ActiveIdiomDeadline {
+                token,
+                operation_id,
+                session_generation: *generation,
+                deadline,
+            });
+            Ok(())
+        }
+        (Some(deadline), Some(previous)) if previous.deadline == deadline => Ok(()),
+        (Some(deadline), Some(previous)) => {
+            let operation_id = operation_ids
+                .allocate()
+                .map_err(|error| BusinessRuntimeError::TimerOperationFailed(error.to_string()))?;
+            let schedule = DeadlineSchedule::new(
+                previous.token.clone(),
+                operation_id,
+                previous.session_generation,
+                deadline,
+            );
+            timer
+                .reschedule(schedule)
+                .map_err(|error| BusinessRuntimeError::TimerOperationFailed(error.to_string()))?;
+            *active = Some(ActiveIdiomDeadline {
+                token: previous.token.clone(),
+                operation_id,
+                session_generation: previous.session_generation,
+                deadline,
+            });
+            Ok(())
+        }
+    }
+}
+
+fn handle_business_timer(
+    event: BusinessDeadlineEvent,
+    idiom_chain: &mut IdiomChainService,
+    timer: Option<&TimerRuntimeHandle<BusinessDeadlineToken>>,
+    active_idiom_deadline: &mut Option<ActiveIdiomDeadline>,
+    operation_ids: &BusinessOperationIdAllocator,
+    generation: &mut SessionGeneration,
+) -> Result<(), BusinessRuntimeError> {
+    let BusinessDeadlineEvent::IdiomChain(TimerRuntimeEvent::DeadlineExpired(expired)) = event
+    else {
+        return Ok(());
+    };
+    let Some(active) = active_idiom_deadline.as_ref() else {
+        return Ok(());
+    };
+    let token = BusinessDeadlineToken::IdiomChain(expired.token().clone());
+    if active.token != token
+        || active.operation_id != expired.operation_id()
+        || active.session_generation != expired.session_generation()
+    {
+        return Ok(());
+    }
+
+    *active_idiom_deadline = None;
+    if idiom_chain.expire_idle_at(expired.emitted_at())? {
+        log::info!("成语接龙已因计时运行时期限到期结束，娱乐互斥已释放");
+    }
+    sync_idiom_deadline(
+        idiom_chain,
+        timer,
+        active_idiom_deadline,
+        operation_ids,
+        generation,
+    )
+}
+
 fn run_business_runtime(
     receiver: Receiver<RuntimeMessage>,
     mut idiom_chain: IdiomChainService,
     mut card_games: CardGameService,
+    timer: Option<TimerRuntimeHandle<BusinessDeadlineToken>>,
 ) {
     let mut snapshot = BusinessRuntimeSnapshot::default();
+    let mut active_idiom_deadline = None;
+    let operation_ids = BusinessOperationIdAllocator::new();
+    let mut session_generation = SessionGeneration::INITIAL;
     while let Ok(message) = receiver.recv() {
         match message {
-            RuntimeMessage::Event(event) => snapshot.apply(event),
+            RuntimeMessage::Event(event) => {
+                if let BusinessEvent::Timer(timer_event) = &event {
+                    snapshot.apply(BusinessEvent::Timer(timer_event.clone()));
+                    if let Err(error) = handle_business_timer(
+                        timer_event.clone(),
+                        &mut idiom_chain,
+                        timer.as_ref(),
+                        &mut active_idiom_deadline,
+                        &operation_ids,
+                        &mut session_generation,
+                    ) {
+                        log::error!("业务运行时处理计时事件失败: {error}");
+                    }
+                } else {
+                    snapshot.apply(event);
+                }
+            }
             RuntimeMessage::HandleIdiomChain {
                 player,
                 command,
                 response,
             } => {
-                let _ = response.send(
-                    idiom_chain
-                        .handle(&player, &command)
-                        .map_err(idiom_chain_operation_failed),
-                );
+                let result = idiom_chain
+                    .handle(&player, &command)
+                    .map_err(idiom_chain_operation_failed)
+                    .and_then(|outcome| {
+                        sync_idiom_deadline(
+                            &idiom_chain,
+                            timer.as_ref(),
+                            &mut active_idiom_deadline,
+                            &operation_ids,
+                            &mut session_generation,
+                        )?;
+                        Ok(outcome)
+                    });
+                let _ = response.send(result);
             }
             RuntimeMessage::ExplainIdiomChain {
                 player,
                 command,
                 response,
             } => {
-                let _ = response.send(
-                    idiom_chain
-                        .explain(&player, &command)
-                        .map_err(idiom_chain_operation_failed),
-                );
+                let result = idiom_chain
+                    .explain(&player, &command)
+                    .map_err(idiom_chain_operation_failed)
+                    .and_then(|outcome| {
+                        sync_idiom_deadline(
+                            &idiom_chain,
+                            timer.as_ref(),
+                            &mut active_idiom_deadline,
+                            &operation_ids,
+                            &mut session_generation,
+                        )?;
+                        Ok(outcome)
+                    });
+                let _ = response.send(result);
             }
             RuntimeMessage::AbortIdiomChain(response) => {
-                let _ = response.send(idiom_chain.abort().map_err(idiom_chain_operation_failed));
+                let result = idiom_chain
+                    .abort()
+                    .map_err(idiom_chain_operation_failed)
+                    .and_then(|aborted| {
+                        sync_idiom_deadline(
+                            &idiom_chain,
+                            timer.as_ref(),
+                            &mut active_idiom_deadline,
+                            &operation_ids,
+                            &mut session_generation,
+                        )?;
+                        Ok(aborted)
+                    });
+                let _ = response.send(result);
             }
             RuntimeMessage::ExpireIdiomChain(response) => {
-                let _ = response.send(
-                    idiom_chain
-                        .expire_idle_now()
-                        .map_err(idiom_chain_operation_failed),
-                );
+                let result = idiom_chain
+                    .expire_idle_at(Instant::now())
+                    .map_err(idiom_chain_operation_failed)
+                    .and_then(|expired| {
+                        sync_idiom_deadline(
+                            &idiom_chain,
+                            timer.as_ref(),
+                            &mut active_idiom_deadline,
+                            &operation_ids,
+                            &mut session_generation,
+                        )?;
+                        Ok(expired)
+                    });
+                let _ = response.send(result);
             }
             RuntimeMessage::CardGame(message) => handle_card_game_message(&mut card_games, message),
             RuntimeMessage::Snapshot(response) => {
                 let _ = response.send(snapshot);
             }
             RuntimeMessage::PrepareShutdown(response) => {
-                abort_business_modules(&mut idiom_chain, &mut card_games);
+                abort_business_modules(
+                    &mut idiom_chain,
+                    &mut card_games,
+                    timer.as_ref(),
+                    &mut active_idiom_deadline,
+                    &operation_ids,
+                    &mut session_generation,
+                );
                 snapshot.quiescing = true;
                 let _ = response.send(snapshot);
             }
             RuntimeMessage::Shutdown(response) => {
-                abort_business_modules(&mut idiom_chain, &mut card_games);
+                abort_business_modules(
+                    &mut idiom_chain,
+                    &mut card_games,
+                    timer.as_ref(),
+                    &mut active_idiom_deadline,
+                    &operation_ids,
+                    &mut session_generation,
+                );
                 let _ = response.send(snapshot);
                 break;
             }
@@ -590,12 +821,28 @@ fn run_business_runtime(
     }
 }
 
-fn abort_business_modules(idiom_chain: &mut IdiomChainService, card_games: &mut CardGameService) {
+fn abort_business_modules(
+    idiom_chain: &mut IdiomChainService,
+    card_games: &mut CardGameService,
+    timer: Option<&TimerRuntimeHandle<BusinessDeadlineToken>>,
+    active_idiom_deadline: &mut Option<ActiveIdiomDeadline>,
+    operation_ids: &BusinessOperationIdAllocator,
+    session_generation: &mut SessionGeneration,
+) {
     if let Err(error) = card_games.abort() {
         log::error!("业务运行时关闭时无法中止牌局: {error:#}");
     }
     if let Err(error) = idiom_chain.abort() {
         log::error!("业务运行时关闭时无法中止成语接龙: {error:#}");
+    }
+    if let Err(error) = sync_idiom_deadline(
+        idiom_chain,
+        timer,
+        active_idiom_deadline,
+        operation_ids,
+        session_generation,
+    ) {
+        log::error!("业务运行时关闭时无法撤销成语接龙期限: {error}");
     }
 }
 
@@ -1195,6 +1442,60 @@ mod tests {
         assert!(handle.expire_idiom_chain().unwrap());
         assert_eq!(entertainment.active(), None);
         runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn matching_idiom_deadline_event_expires_the_owned_session() {
+        let entertainment = EntertainmentCoordinator::new();
+        let mut idiom_chain = idiom_service(entertainment.clone(), Some(Duration::ZERO));
+        let started = idiom_chain
+            .handle(
+                "Alice",
+                &IdiomChainCommand::Start {
+                    idiom: "画蛇添足".to_string(),
+                    mode: IdiomChainMode::Exact,
+                },
+            )
+            .unwrap();
+        assert_eq!(started.action, "started");
+
+        let deadline = idiom_chain.idle_deadline().unwrap();
+        let operation_id = BusinessOperationId::new(1);
+        let session_generation = SessionGeneration::new(1);
+        let token = idiom_deadline_token();
+        let mut timer = TimerCore::new();
+        timer
+            .schedule(DeadlineSchedule::new(
+                token.clone(),
+                operation_id,
+                session_generation,
+                deadline,
+            ))
+            .unwrap();
+        let expired = timer.drain_expired(deadline).unwrap().pop().unwrap();
+        let event = BusinessDeadlineEvent::from(TimerRuntimeEvent::DeadlineExpired(expired));
+        let mut active = Some(ActiveIdiomDeadline {
+            token,
+            operation_id,
+            session_generation,
+            deadline,
+        });
+        let operation_ids = BusinessOperationIdAllocator::new();
+        let mut next_generation = session_generation;
+
+        handle_business_timer(
+            event,
+            &mut idiom_chain,
+            None,
+            &mut active,
+            &operation_ids,
+            &mut next_generation,
+        )
+        .unwrap();
+
+        assert!(active.is_none());
+        assert_eq!(entertainment.active(), None);
+        assert_eq!(idiom_chain.idle_deadline(), None);
     }
 
     #[test]

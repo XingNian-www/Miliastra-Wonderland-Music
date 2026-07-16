@@ -391,7 +391,7 @@ fn run_automation_with_watchdog(config_path: &Path) -> Result<()> {
             return Ok(());
         }
 
-        let config = AppConfig::load_or_create(config_path)?;
+        let config = AppConfig::load(config_path)?;
         eprintln!(
             "监听子进程异常退出: status={}，{}ms 后重启",
             status, config.timing.watchdog_restart_ms

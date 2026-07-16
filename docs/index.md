@@ -41,7 +41,7 @@
 | --- | --- |
 | [启动游戏与进入千星](startup-wonderland-flow.md) | 启动游戏、开门、进入千星两个任务如何拆分与串联。 |
 | [Web 监控与 HTTP API](web-monitor-api.md) | 远程面板如何读监控、提交控制台发言、点歌和启动任务。 |
-| [配置迁移与观测](config-observability-flow.md) | 配置版本迁移、日志分流、Monitor、TUI 和状态文件如何组织。 |
+| [配置加载与观测](config-observability-flow.md) | 当前配置校验、日志分流、Monitor、TUI 和状态文件如何组织。 |
 
 ## 领域词汇
 

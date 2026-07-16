@@ -63,10 +63,6 @@ impl StartupTask {
             StartupTaskKind::EnterWonderland => format!("进入千星({})", self.source),
         }
     }
-
-    pub const fn restores_listener_residency(self) -> bool {
-        true
-    }
 }
 
 pub trait StartupExecutionPort {
@@ -78,8 +74,6 @@ pub trait StartupExecutionPort {
     -> Result<()>;
 
     fn run_enter_wonderland(&self) -> Result<()>;
-
-    fn return_to_primary(&self) -> bool;
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -120,12 +114,6 @@ impl StartupService {
         port.request_window_rescan(ENTER_WONDERLAND_RESCAN_REASON)?;
         port.run_enter_wonderland()?;
 
-        log::info!("进入千星完成信号已确认，执行返回一级界面");
-        let returned = port.return_to_primary();
-        log::info!(
-            "进入千星完成后返回一级界面结束，后续待处理任务将继续执行: returned_primary={}",
-            returned
-        );
         port.request_window_rescan(ENTER_WONDERLAND_COMPLETE_RESCAN_REASON)
     }
 }
@@ -144,7 +132,6 @@ mod tests {
         start_progress: Vec<&'static str>,
         fail_start: bool,
         fail_enter: bool,
-        returned_primary: bool,
     }
 
     impl Default for RecordingPort {
@@ -155,7 +142,6 @@ mod tests {
                 start_progress: Vec::new(),
                 fail_start: false,
                 fail_enter: false,
-                returned_primary: true,
             }
         }
     }
@@ -204,11 +190,6 @@ mod tests {
             }
             Ok(())
         }
-
-        fn return_to_primary(&self) -> bool {
-            self.record(format!("return-primary:{}", self.returned_primary));
-            self.returned_primary
-        }
     }
 
     #[test]
@@ -218,8 +199,6 @@ mod tests {
 
         assert_eq!(start.label(), "启动游戏(启动配置)");
         assert_eq!(enter.label(), "进入千星(远程指挥台)");
-        assert!(start.restores_listener_residency());
-        assert!(enter.restores_listener_residency());
     }
 
     #[test]
@@ -329,30 +308,6 @@ mod tests {
                 "invalidate:进入千星任务将切换大厅",
                 "rescan:进入千星任务开始",
                 "run:enter-wonderland",
-                "return-primary:true",
-                "rescan:进入千星任务完成",
-            ]
-        );
-    }
-
-    #[test]
-    fn enter_wonderland_treats_failed_primary_return_as_success() {
-        let port = RecordingPort {
-            returned_primary: false,
-            ..RecordingPort::default()
-        };
-
-        StartupService::new()
-            .execute(StartupTask::enter_wonderland("测试"), &port)
-            .unwrap();
-
-        assert_eq!(
-            port.events(),
-            [
-                "invalidate:进入千星任务将切换大厅",
-                "rescan:进入千星任务开始",
-                "run:enter-wonderland",
-                "return-primary:false",
                 "rescan:进入千星任务完成",
             ]
         );
@@ -398,7 +353,6 @@ mod tests {
                 "invalidate:进入千星任务将切换大厅",
                 "rescan:进入千星任务开始",
                 "run:enter-wonderland",
-                "return-primary:true",
                 "rescan:进入千星任务完成",
             ]
         );

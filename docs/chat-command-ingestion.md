@@ -56,7 +56,7 @@ flowchart TD
 
 ## 聊天区变化指纹
 
-变化检测在 `src/app/change_detection.rs`：
+变化检测在 `src/ui/change_detection.rs`：
 
 1. 裁剪聊天区。
 2. 缩放成 `104x36` 灰度图。
@@ -69,7 +69,7 @@ flowchart TD
 
 ## OCR 切块流程
 
-聊天扫描在 `src/app/chat_scan.rs` 分两段：
+聊天扫描在 `src/observation/chat/scan.rs` 分两段：
 
 ### prepare_chat_scan
 
@@ -105,7 +105,7 @@ flowchart TD
 - 黄字：不作为内置命令入口。
 - 机器人反馈文本会被过滤，避免把自己发出的回复重新解析成命令。
 
-自定义工作流也走同一条入口，但只有 `custom_workflows.enabled=true` 且命令匹配配置时才会生成 `UserCommand::CustomWorkflow`。
+自定义工作流也走同一条入口，但只有 `custom_workflows.enabled=true` 且命令匹配配置时才会生成 `BusinessIntent::CustomWorkflow`。
 
 ## 命令识别禁用
 
@@ -207,7 +207,7 @@ pending_contains_command(parsed)
 
 ## 确认屏幕锁
 
-确认屏幕锁在 `src/app/decision_lock.rs`。它不参与普通命令入队，只用于 `wait_for_decision()`。
+确认屏幕锁在 `src/observation/decision.rs`。它不参与普通命令入队，只用于 `wait_for_decision()`。
 
 流程是：
 

@@ -1,6 +1,6 @@
 # 命令模型、屏幕锁与确认锁
 
-本文专门梳理 `src/app/command.rs` 和 `src/app/decision_lock.rs`：OCR 文本怎样被解析成 `ParsedCommand`，命令屏幕锁怎样判断“同一条命令”，以及等待确认时怎样避免旧的 `@确认` 污染新的确认窗口。
+本文专门梳理 `src/interfaces/chat.rs` 和 `src/observation/decision.rs`：OCR 文本怎样被解析成 `ParsedCommand`，命令屏幕锁怎样判断“同一条命令”，以及等待确认时怎样避免旧的 `@确认` 污染新的确认窗口。
 
 如果想看扫描触发和 OCR 切块，见 `docs/ocr-ui-detection-flow.md`。如果想看命令最终怎样进入待执行任务队列，见 `docs/chat-command-ingestion.md` 和 `docs/executor-flow.md`。
 
@@ -38,10 +38,10 @@ flowchart TD
 
 | 文件 | 职责 |
 | --- | --- |
-| `src/app/command.rs` | 命令领域模型、蓝字/粉字解析、命令屏幕锁、同语义比较。 |
-| `src/app/decision_lock.rs` | 确认屏幕锁，按文本和位置过滤旧确认。 |
-| `src/main.rs` | `handle_scan_messages()`、`wait_for_decision()`、入队过滤和确认轮询。 |
-| `src/app/custom_workflow.rs` | 自定义工作流命令解析，和内置命令共用扫描入口。 |
+| `src/interfaces/chat.rs` | 命令领域模型、蓝字/粉字解析、命令屏幕锁、同语义比较。 |
+| `src/observation/decision.rs` | 确认屏幕锁，按文本和位置过滤旧确认。 |
+| `src/composition/application/listener.rs`、`src/composition/application/playback.rs` | `handle_scan_messages()`、确认读取、入队过滤和确认轮询。 |
+| `src/features/custom_workflow.rs` | 自定义工作流命令解析，和内置命令共用扫描入口。 |
 
 ## 命令领域模型
 
@@ -52,9 +52,9 @@ flowchart TD
 - `user_command`：用户原始命令文本。
 - `message_type`：消息来源颜色或控制台来源。
 - `username`：大厅用户名、好友名或控制台。
-- `command`：真正的 `UserCommand`。
+- `command`：真正的 `BusinessIntent`。
 
-`UserCommand` 覆盖当前所有内置业务：
+`BusinessIntent` 覆盖当前所有内置业务：
 
 - 点歌、暂停、继续、播放、上一首、下一首、音量、状态、歌词、队列。
 - 大厅检测、大厅时间、帮助。
@@ -150,7 +150,7 @@ flowchart TD
 
 命令屏幕锁比较的是同语义命令，不是 OCR 原文。
 
-`same_lock_command()` 最终比较 `UserCommand`：
+`same_lock_command()` 最终比较 `BusinessIntent`：
 
 | 命令 | 同语义判断 |
 | --- | --- |

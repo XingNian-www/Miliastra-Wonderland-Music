@@ -37,7 +37,7 @@ HTTP 层只入队并返回队列位置，不等待任务执行完成。
 
 ## StartGame 状态机
 
-实现位置：`src/app/game_startup.rs`。
+实现位置：`src/features/startup.rs`。
 
 ```mermaid
 stateDiagram-v2
@@ -112,7 +112,7 @@ stateDiagram-v2
 
 ## EnterWonderland 状态机
 
-实现位置：`src/app/startup_flow.rs`。
+实现位置：`src/ui/routines/startup.rs`。
 
 ```mermaid
 stateDiagram-v2

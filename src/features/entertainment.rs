@@ -1,6 +1,4 @@
-use std::sync::{Arc, Mutex};
-
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EntertainmentKind {
@@ -30,41 +28,35 @@ pub(crate) enum AcquireOutcome {
     Occupied(EntertainmentKind),
 }
 
-#[derive(Clone, Default)]
-pub(crate) struct EntertainmentCoordinator {
-    active: Arc<Mutex<Option<EntertainmentKind>>>,
+#[derive(Debug, Default)]
+pub(crate) struct EntertainmentState {
+    active: Option<EntertainmentKind>,
 }
 
-impl EntertainmentCoordinator {
+impl EntertainmentState {
     pub(crate) fn new() -> Self {
         Self::default()
     }
 
-    pub(crate) fn try_acquire(&self, kind: EntertainmentKind) -> Result<AcquireOutcome> {
-        let mut active = self
-            .active
-            .lock()
-            .map_err(|_| anyhow!("娱乐模块互斥锁已损坏"))?;
-        match *active {
-            None => {
-                *active = Some(kind);
-                Ok(AcquireOutcome::Acquired)
-            }
+    pub(crate) fn try_acquire(&mut self, kind: EntertainmentKind) -> Result<AcquireOutcome> {
+        match self.active {
             Some(current) if current == kind => Ok(AcquireOutcome::AlreadyOwned),
             Some(current) => Ok(AcquireOutcome::Occupied(current)),
+            None => {
+                self.active = Some(kind);
+                Ok(AcquireOutcome::Acquired)
+            }
         }
     }
 
-    pub(crate) fn release(&self, kind: EntertainmentKind) {
-        match self.active.lock() {
-            Ok(mut active) if *active == Some(kind) => *active = None,
-            Ok(_) => {}
-            Err(_) => log::error!("娱乐模块互斥锁已损坏"),
+    pub(crate) fn release(&mut self, kind: EntertainmentKind) {
+        if self.active == Some(kind) {
+            self.active = None;
         }
     }
 
     pub(crate) fn active(&self) -> Option<EntertainmentKind> {
-        self.active.lock().ok().and_then(|active| *active)
+        self.active
     }
 }
 
@@ -74,28 +66,22 @@ mod tests {
 
     #[test]
     fn only_one_entertainment_module_can_be_active() {
-        let coordinator = EntertainmentCoordinator::new();
+        let mut state = EntertainmentState::new();
 
         assert_eq!(
-            coordinator
-                .try_acquire(EntertainmentKind::IdiomChain)
-                .unwrap(),
+            state.try_acquire(EntertainmentKind::IdiomChain).unwrap(),
             AcquireOutcome::Acquired
         );
         assert_eq!(
-            coordinator
-                .try_acquire(EntertainmentKind::IdiomChain)
-                .unwrap(),
+            state.try_acquire(EntertainmentKind::IdiomChain).unwrap(),
             AcquireOutcome::AlreadyOwned
         );
         assert_eq!(
-            coordinator
-                .try_acquire(EntertainmentKind::TurtleSoup)
-                .unwrap(),
+            state.try_acquire(EntertainmentKind::TurtleSoup).unwrap(),
             AcquireOutcome::Occupied(EntertainmentKind::IdiomChain)
         );
 
-        coordinator.release(EntertainmentKind::IdiomChain);
-        assert_eq!(coordinator.active(), None);
+        state.release(EntertainmentKind::IdiomChain);
+        assert_eq!(state.active(), None);
     }
 }

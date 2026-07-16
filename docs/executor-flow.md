@@ -1,23 +1,23 @@
 # 主执行器梳理
 
-本文专门梳理 `AutomationApp` 和待执行任务队列。它回答一个核心问题：这个程序里谁可以操作游戏窗口，什么时候操作，怎样避免多个业务流程互相打架。
+本文专门梳理组合层协调器、业务运行时正式调度器和 UI 例程之间的边界。它回答一个核心问题：这个程序里谁可以操作游戏窗口，什么时候操作，怎样避免多个业务流程互相打架。
 
 ## 核心结论
 
-`PendingTask` 是普通高层业务流程进入游戏窗口操作层的统一入口。主扫描线程、Web 面板、播放监控线程和后台投票线程都可以提交任务，但只有命令执行线程会消费这些任务并真正操作游戏窗口。
+`PendingTask` 是组合层内部的正式工作描述；外部生产者不直接构造它，而是通过 `FormalTaskClient` 或 HTTP 的 `HttpTaskPort` 提交类型化请求。主扫描、Web、播放观察和后台投票都可以提交，但只有正式执行线程会消费任务并通过 UI 例程操作游戏窗口。
 
 成语接龙、牌类、谁是卧底和海龟汤的业务状态由同一个业务运行时线程串行拥有。聊天扫描线程把娱乐命令提交给业务运行时；需要等待 UI、AI 或玩家输入时只保存挂起效果，完成后再恢复。游戏内短回复进入独立延迟发送队列，不创建 `PendingTask`；成语 `#解释`、牌类效果和谁是卧底效果需要正式 UI 顺位时才进入主队列。所有玩法由共享娱乐协调器全局互斥。
 
 ```mermaid
 flowchart TD
-    A["主扫描线程<br/>聊天OCR"] -->|普通 ParsedCommand| P["待执行任务队列<br/>VecDeque<PendingTask>"]
+    A["聊天观察<br/>OCR"] -->|类型化业务意图| P["BusinessRuntime<br/>FormalScheduler"]
     A -->|#娱乐命令 / #提问| J["业务运行时 / AI Worker / 延迟回复队列"]
-    B["HTTP/Web 面板"] -->|远程任务| P
+    B["HTTP/Web 面板"] -->|HttpTaskPort| P
     B -->|海龟汤控制| J
     C["播放监控线程"] -->|AdvanceQueue| P
     D["管理投票后台线程"] -->|ModerationVoteResult| P
     E["启动配置"] -->|StartGame / EnterWonderland| P
-    P --> F["命令执行线程"]
+    P --> F["正式执行线程"]
     F --> G["execute_pending_task"]
     G --> H["动作阶段界面协调"]
     H --> I["游戏窗口输入 / FeelUOwn / 队列 / 聊天回复"]
@@ -47,28 +47,28 @@ flowchart TD
 
 ## 队列本体
 
-队列字段在 `AutomationApp`：
+调度器由 `src/runtime/business.rs` 的业务运行时线程拥有：
 
 ```rust
-pending: Arc<(Mutex<VecDeque<PendingTask>>, Condvar)>
+FormalScheduler + BusinessRuntimeHandle
 ```
 
 它有三个重要性质：
 
-1. `VecDeque` 表示先进先出。
-2. `Mutex` 允许多个线程安全提交任务。
-3. `Condvar` 让命令执行线程在队列为空时睡眠，有新任务时被唤醒。
+1. 调度器在线程内部顺序维护正式任务、活动车道、去重键和任务历史。
+2. 生产者只持有 `BusinessRuntimeHandle`，通过有界类型化通道提交请求。
+3. 执行线程取出 lease 后报告完成或失败，业务运行时负责更新监控投影。
 
 任务提交有两种方向：
 
-- `push_pending_task()`：追加到队尾，正常排队。
-- `push_pending_task_front()`：放回队首，用于“这次没准备好界面，稍后原任务优先重试”。
+- `FormalTaskClient::enqueue_*()`：把具体业务请求转换为正式任务提交。
+- `BusinessRuntimeHandle::restore_formal_task()`：界面暂未准备好时恢复原 lease，保留原顺序。
 
 ## 娱乐延迟回复队列
 
 `DeferredChatQueue` 独立于正式任务，普通回复总体按低优先级 FIFO 发送，容量为 32 条；`#接龙` 只把短回复和聊天目标放入队列。海龟汤的汤面、裁决和结算使用分段批次，其中开局汤面、汤面重发和结算是受保护批次，不会被普通回复淘汰。开局与结算属于关键批次，会从队首进入；队列满时还可以淘汰非关键批次。
 
-延迟聊天发送线程只在以下条件同时满足时取得输入权：主 `pending` 队列为空、没有命令或屏幕独占 Web 工具正在执行、未暂停，并且目标聊天可用。普通短回复仍使用单条接口；海龟汤分段批次使用返回发送进度的独占批量接口。海龟汤的“当前大厅”目标会按取得输入权时的监听驻留选择一级或二级接口。
+延迟聊天发送线程只在正式调度器空闲、没有独占诊断工作、未暂停且目标聊天可用时取得输入权。普通短回复仍使用单条接口；海龟汤分段批次使用返回发送进度的独占批量接口。海龟汤的“当前大厅”目标会按取得输入权时的监听驻留选择一级或二级接口。
 
 批量接口复用同一个窗口和输入对象，一级大厅只打开一次聊天。批次开始后不再检查正式任务或主动让行，直到全部完成或某条发送失败才释放输入权。失败会先提交部分成功进度，只重试首条未发送消息。全部内容已经发出但一级聊天收尾失败时只记录收尾错误，仍按投递成功处理，避免重复发送汤面或汤底。
 
@@ -91,19 +91,19 @@ pending: Arc<(Mutex<VecDeque<PendingTask>>, Condvar)>
 7. 程序刚启动时，第一批可见命令只用于初始化屏幕锁，不执行。
 8. 如果同语义命令已经在待执行任务队列中，跳过。
 
-普通命令通过后才变成 `PendingTask::Command`。接龙则在第 7 步之后被分流，不参与第 8 步或主命令队列。
+普通命令通过后由 `FormalTaskClient` 转成内部 `PendingTask::Command`。接龙则在第 7 步之后提交给业务运行时，不依赖 HTTP 或执行器内部枚举。
 
 ### HTTP/Web 面板
 
 Web 面板有两类行为：
 
-- 控制台命令：例如 `/play`、`/pause`、`/skip-next`、`/volume`、`/searchPlay`、`/ai/search`，会构造 `ParsedCommand { message_type: "控制台" }`，再入队为 `PendingTask::Command`。
-- 直接任务：例如 `/chat/send`、`/startup/game`、`/startup/enter-wonderland`、`/chat-listener/mode`，直接入队为对应 `PendingTask`。
+- 控制台命令：例如 `/play`、`/pause`、`/skip-next`、`/volume`、`/searchPlay`、`/ai/search`，构造带控制台来源的 `BusinessIntent`，再通过 `HttpTaskPort` 提交。
+- 直接任务：例如 `/chat/send`、`/startup/game`、`/startup/enter-wonderland`、`/chat-listener/mode`，通过对应的类型化提交方法入队。
 
 `/startup/wonderland` 不是一个单独大任务，而是顺序入队两个任务：
 
-1. `PendingTask::StartGame`
-2. `PendingTask::EnterWonderland`
+1. 启动游戏任务
+2. 进入千星任务
 
 Web 面板提交任务后只返回入队位置，不等待实际执行完成。
 
@@ -227,7 +227,7 @@ flowchart TD
 
 ### 待执行任务队列
 
-`pending: VecDeque<PendingTask>`。负责业务流程排队。
+`FormalScheduler` 中的正式任务记录。负责业务流程排队、活动状态、去重和完成记录。
 
 ### 音乐播放队列
 

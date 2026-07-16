@@ -1,6 +1,6 @@
 # 自定义工作流、邀请与管理流程梳理
 
-本文梳理 `src/app/custom_workflow.rs` 这一层。它不是单纯的原子动作文件，而是把聊天命令、自定义配置步骤、邀请确认、好友反馈和拉黑/屏蔽投票连接起来的业务流程层。
+本文梳理 `src/features/custom_workflow.rs` 这一层。它不是单纯的原子动作文件，而是把聊天命令、自定义配置步骤、邀请确认、好友反馈和拉黑/屏蔽投票连接起来的业务流程层。
 
 相关底层 UI 自动化动作见 `docs/ui-automation-atoms.md`。本文只描述业务流程如何组合这些动作。
 
@@ -28,13 +28,13 @@ flowchart TD
 
 | 文件 | 职责 |
 | --- | --- |
-| `src/app/custom_workflow.rs` | 自定义工作流解释器；邀请、好友发言、管理投票和管理执行。 |
-| `src/app/workflow_actions.rs` | 原子动作：等待、按键、点击、粘贴、模板等待、OCR 点击、像素稳定。 |
-| `src/app/ui_locator.rs` | 截图定位、模板匹配、OCR 文本定位和区域稳定等待。 |
-| `src/app/chat_output.rs` | 游戏内大厅聊天和当前聊天框发送。 |
-| `src/app/decision_lock.rs` | 确认窗口开始前收集已存在决策，避免旧消息误触发。 |
-| `src/app/command.rs` | `CustomWorkflowCommand`、`ModerationCommand` 等命令模型。 |
-| `src/main.rs` | 把解析出的命令和投票结果接入待执行任务队列。 |
+| `src/features/custom_workflow.rs` | 自定义工作流解释器；邀请、好友发言、管理投票和管理执行。 |
+| `src/ui/atoms.rs` | 原子动作：等待、按键、点击、粘贴、模板等待、OCR 点击、像素稳定。 |
+| `src/ui/locator.rs` | 截图定位、模板匹配、OCR 文本定位和区域稳定等待。 |
+| `src/ui/chat_output.rs` | 游戏内大厅聊天和当前聊天框发送。 |
+| `src/observation/decision.rs` | 确认窗口开始前收集已存在决策，避免旧消息误触发。 |
+| `src/interfaces/chat.rs` | `CustomWorkflowCommand`、`ModerationCommand` 等命令模型。 |
+| `src/composition/application/custom_workflow.rs`、`src/composition/application/moderation.rs` | 把解析出的命令和投票结果接入待执行任务队列。 |
 | `src/config/mod.rs` | `CustomWorkflowConfig`、`CustomWorkflowDefinition`、`CustomWorkflowStep` 配置结构。 |
 
 ## 自定义命令解析
@@ -51,7 +51,7 @@ flowchart TD
 - `allow_args = false` 时，触发词后不能附带参数。
 - `allow_args = true` 时，支持空格参数、紧贴参数和冒号参数。
 
-匹配成功后生成 `UserCommand::CustomWorkflow(CustomWorkflowCommand)`，包含：
+匹配成功后生成 `BusinessIntent::CustomWorkflow(CustomWorkflowCommand)`，包含：
 
 - `name`：实际匹配到的命令名。
 - `workflow`：要执行的工作流名。
@@ -79,7 +79,7 @@ flowchart TD
 
 ## 自定义工作流执行
 
-入口是 `AutomationApp::execute_custom_workflow(command, parsed)`。
+入口是 `ApplicationRuntime::execute_custom_workflow(command, parsed)`。
 
 执行顺序：
 

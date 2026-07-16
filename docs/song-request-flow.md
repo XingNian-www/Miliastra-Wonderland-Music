@@ -4,7 +4,7 @@
 
 ## 核心结论
 
-点歌不是 HTTP 或 OCR 入口直接播放。所有常规点歌都会先变成 `UserCommand::Song`，进入待执行任务队列，再由命令执行线程串行处理。处理过程中会先得到最终候选歌曲，再做候选歌曲审核，然后才决定直接播放还是加入音乐播放队列。长时间同歌去重会在入队前和播放前检查，但只在确认播放成功后记录历史。
+点歌不是 HTTP 或 OCR 入口直接播放。所有常规点歌都会先变成 `BusinessIntent::SongRequest`，进入待执行任务队列，再由命令执行线程串行处理。处理过程中会先得到最终候选歌曲，再做候选歌曲审核，然后才决定直接播放还是加入音乐播放队列。长时间同歌去重会在入队前和播放前检查，但只在确认播放成功后记录历史。
 
 控制台来源拥有最高权限，但只体现在“候选歌曲审核免审”。它仍然进入待执行任务队列，仍然参与点歌互斥，也仍然受当前歌曲保护和音乐播放队列规则约束。
 
@@ -31,9 +31,9 @@ flowchart TD
 
 | 对象 | 位置 | 含义 |
 | --- | --- | --- |
-| `SongCommand` | `src/app/command.rs` | 原始点歌命令。保存关键词、来源平台、是否伴奏优先、是否 AI 点歌、是否来自好友私聊。 |
-| `ResolvedSongRequest` | `src/main.rs` | 已经解析并确认的最终候选歌曲。此时通常已经有 URI，可以审核、入队或播放。 |
-| `QueueItem` | `src/app/queue.rs` | 写入音乐播放队列的持久化歌曲项。字段基本来自 `ResolvedSongRequest`。 |
+| `SongCommand` | `src/interfaces/chat.rs` | 原始点歌命令。保存关键词、来源平台、是否伴奏优先、是否 AI 点歌、是否来自好友私聊。 |
+| `ResolvedSongRequest` | `src/composition/application/song_request.rs` | 已经解析并确认的最终候选歌曲。此时通常已经有 URI，可以审核、入队或播放。 |
+| `QueueItem` | `src/features/playback/queue.rs` | 写入音乐播放队列的持久化歌曲项。字段基本来自 `ResolvedSongRequest`。 |
 
 `ResolvedSongRequest::match_keyword()` 会在 AI 点歌时优先用原始点歌意图做歌曲匹配；普通点歌则使用最终候选歌曲名。
 
@@ -65,13 +65,13 @@ flowchart TD
 
 - `message_type = "控制台"`
 - `username = "控制台"`
-- `command = UserCommand::Song(...)`
+- `command = BusinessIntent::SongRequest(...)`
 
 所以远程点歌和游戏内点歌共用主业务队列、点歌互斥、候选解析、播放保护和反馈流程。
 
 ## 候选解析与确认
 
-`execute_command()` 收到 `UserCommand::Song` 后，第一步是 `resolve_and_confirm_song()`。
+`execute_command()` 收到 `BusinessIntent::SongRequest` 后，第一步是 `resolve_and_confirm_song()`。
 
 普通点歌路径：
 
@@ -104,7 +104,7 @@ AI 点歌路径：
 4. 审核返回 1 到 10 的审核强度，强度小于或等于本地阈值则通过。
 5. 审核拒绝是硬拒绝：记录执行日志，回复 `点歌未通过审核: ...`，本次点歌结束，不播放、不入队。
 
-审核失败策略在 `src/app/song_review.rs` 内部处理：重试指定次数后，根据配置决定失败放行还是失败拒绝。
+审核失败策略在 `src/features/song_request/review.rs` 内部处理：重试指定次数后，根据配置决定失败放行还是失败拒绝。
 
 ## 入队或直接播放
 

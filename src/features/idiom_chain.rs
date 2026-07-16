@@ -7,7 +7,8 @@ use anyhow::{Context, Result, bail};
 use pinyin::ToPinyin;
 use serde::{Deserialize, Serialize};
 
-use super::entertainment::{AcquireOutcome, EntertainmentCoordinator, EntertainmentKind};
+use super::chat_text::{command_identity, compact_command, shortcut_argument};
+use super::entertainment::{AcquireOutcome, EntertainmentKind, EntertainmentState};
 use crate::runtime::timer::{DeadlineKind, DeadlineModule, DeadlineToken};
 
 const PROJECT_IDIOM_ASSET_PATH: &str = "assets/idioms.txt";
@@ -87,6 +88,58 @@ pub enum IdiomChainCommand {
     Stop,
 }
 
+impl IdiomChainCommand {
+    pub(crate) fn parse_start(payload: &str) -> Option<Self> {
+        if let Some(idiom) = shortcut_argument(payload, "同音接龙") {
+            return Some(Self::Start {
+                idiom: idiom.to_string(),
+                mode: IdiomChainMode::Homophone,
+            });
+        }
+        shortcut_argument(payload, "接龙").map(|idiom| Self::Start {
+            idiom: idiom.to_string(),
+            mode: IdiomChainMode::Exact,
+        })
+    }
+
+    pub(crate) fn parse_active(payload: &str) -> Self {
+        match compact_command(payload).as_str() {
+            "提示" => Self::Hint,
+            "状态" => Self::Status,
+            "结束" => Self::Stop,
+            "解释" => Self::Explain(None),
+            _ => shortcut_argument(payload, "解释")
+                .map(|idiom| Self::Explain(Some(idiom.to_string())))
+                .unwrap_or_else(|| Self::Submit(payload.to_string())),
+        }
+    }
+
+    pub(crate) fn lock_key(&self) -> String {
+        match self {
+            Self::Start { idiom, mode } => format!(
+                "idiom_chain:start:{}:{}",
+                command_identity(idiom),
+                match mode {
+                    IdiomChainMode::Exact => "exact",
+                    IdiomChainMode::Homophone => "homophone",
+                }
+            ),
+            Self::Submit(idiom) => format!("idiom_chain:submit:{}", command_identity(idiom)),
+            Self::Explain(idiom) => format!(
+                "idiom_chain:explain:{}",
+                idiom.as_deref().map(command_identity).unwrap_or_default()
+            ),
+            Self::Hint => "idiom_chain:hint".to_string(),
+            Self::Status => "idiom_chain:status".to_string(),
+            Self::Stop => "idiom_chain:stop".to_string(),
+        }
+    }
+
+    pub(crate) fn same_request(&self, other: &Self) -> bool {
+        self.lock_key() == other.lock_key()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IdiomChainOutcome {
     pub reply: String,
@@ -113,25 +166,15 @@ pub struct IdiomChainGame {
 
 pub(crate) struct IdiomChainService {
     game: IdiomChainGame,
-    entertainment: EntertainmentCoordinator,
 }
 
 impl IdiomChainService {
-    pub(crate) fn load(
-        config: IdiomChainConfig,
-        entertainment: EntertainmentCoordinator,
-    ) -> Result<Self> {
-        Ok(Self::from_game(
-            IdiomChainGame::load(config)?,
-            entertainment,
-        ))
+    pub(crate) fn load(config: IdiomChainConfig) -> Result<Self> {
+        Ok(Self::from_game(IdiomChainGame::load(config)?))
     }
 
-    fn from_game(game: IdiomChainGame, entertainment: EntertainmentCoordinator) -> Self {
-        Self {
-            game,
-            entertainment,
-        }
+    fn from_game(game: IdiomChainGame) -> Self {
+        Self { game }
     }
 
     pub(crate) fn lexicon_len(&self) -> usize {
@@ -140,20 +183,18 @@ impl IdiomChainService {
 
     pub(crate) fn handle(
         &mut self,
+        entertainment: &mut EntertainmentState,
         player: &str,
         command: &IdiomChainCommand,
     ) -> Result<IdiomChainOutcome> {
-        if self.entertainment.active() == Some(EntertainmentKind::TurtleSoup) {
+        if entertainment.active() == Some(EntertainmentKind::TurtleSoup) {
             return Ok(outcome(
                 "occupied",
                 "海龟汤正在进行，请结束后再开始成语接龙",
             ));
         }
         let acquired_for_start = if matches!(command, IdiomChainCommand::Start { .. }) {
-            match self
-                .entertainment
-                .try_acquire(EntertainmentKind::IdiomChain)?
-            {
+            match entertainment.try_acquire(EntertainmentKind::IdiomChain)? {
                 AcquireOutcome::Acquired => true,
                 AcquireOutcome::AlreadyOwned => false,
                 AcquireOutcome::Occupied(kind) => {
@@ -169,10 +210,10 @@ impl IdiomChainService {
 
         let outcome = self.game.handle(player, command);
         if acquired_for_start && outcome.action != "started" {
-            self.entertainment.release(EntertainmentKind::IdiomChain);
+            entertainment.release(EntertainmentKind::IdiomChain);
         }
         if matches!(outcome.action, "completed" | "stopped" | "expired") {
-            self.entertainment.release(EntertainmentKind::IdiomChain);
+            entertainment.release(EntertainmentKind::IdiomChain);
         }
         Ok(outcome)
     }
@@ -185,18 +226,22 @@ impl IdiomChainService {
         Ok(self.game.handle(player, command))
     }
 
-    pub(crate) fn abort(&mut self) -> Result<bool> {
+    pub(crate) fn abort(&mut self, entertainment: &mut EntertainmentState) -> Result<bool> {
         let aborted = self.game.abort();
         if aborted {
-            self.entertainment.release(EntertainmentKind::IdiomChain);
+            entertainment.release(EntertainmentKind::IdiomChain);
         }
         Ok(aborted)
     }
 
-    pub(crate) fn expire_idle_at(&mut self, now: Instant) -> Result<bool> {
+    pub(crate) fn expire_idle_at(
+        &mut self,
+        entertainment: &mut EntertainmentState,
+        now: Instant,
+    ) -> Result<bool> {
         let expired = self.game.expire_idle_at(now);
         if expired {
-            self.entertainment.release(EntertainmentKind::IdiomChain);
+            entertainment.release(EntertainmentKind::IdiomChain);
         }
         Ok(expired)
     }
@@ -206,24 +251,17 @@ impl IdiomChainService {
     }
 
     #[cfg(test)]
-    pub(crate) fn from_entries_for_test(
-        entries: &[&str],
-        entertainment: EntertainmentCoordinator,
-        idle_timeout: Option<Duration>,
-    ) -> Self {
-        Self::from_game(
-            IdiomChainGame {
-                enabled: true,
-                lexicon: IdiomLexicon::from_entries(entries.iter().map(|entry| entry.to_string()))
-                    .expect("valid test lexicon"),
-                history_limit: 200,
-                idle_timeout,
-                allow_consecutive_player: false,
-                allow_anyone_stop: false,
-                session: None,
-            },
-            entertainment,
-        )
+    pub(crate) fn from_entries_for_test(entries: &[&str], idle_timeout: Option<Duration>) -> Self {
+        Self::from_game(IdiomChainGame {
+            enabled: true,
+            lexicon: IdiomLexicon::from_entries(entries.iter().map(|entry| entry.to_string()))
+                .expect("valid test lexicon"),
+            history_limit: 200,
+            idle_timeout,
+            allow_consecutive_player: false,
+            allow_anyone_stop: false,
+            session: None,
+        })
     }
 }
 
@@ -755,7 +793,7 @@ fn outcome(action: &'static str, reply: impl Into<String>) -> IdiomChainOutcome 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::features::entertainment::EntertainmentCoordinator;
+    use crate::features::entertainment::EntertainmentState;
 
     fn game(entries: &[&str]) -> IdiomChainGame {
         IdiomChainGame {
@@ -794,12 +832,11 @@ mod tests {
 
     #[test]
     fn application_service_releases_entertainment_after_an_invalid_start() {
-        let entertainment = EntertainmentCoordinator::new();
-        let mut service =
-            IdiomChainService::from_game(game(&["画蛇添足", "足智多谋"]), entertainment.clone());
+        let mut entertainment = EntertainmentState::new();
+        let mut service = IdiomChainService::from_game(game(&["画蛇添足", "足智多谋"]));
 
         let outcome = service
-            .handle("Alice", &start_exact("不是成语"))
+            .handle(&mut entertainment, "Alice", &start_exact("不是成语"))
             .expect("service should handle invalid input");
 
         assert_eq!(outcome.action, "invalid-start");

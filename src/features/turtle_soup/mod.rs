@@ -18,6 +18,32 @@ pub(crate) use service::{
     parse_question_message,
 };
 
+impl TurtleSoupCommand {
+    pub(crate) fn parse_start(payload: &str) -> Option<Self> {
+        (crate::features::chat_text::compact_command(payload) == "海龟汤").then_some(Self::Start)
+    }
+
+    pub(crate) fn parse_hall(payload: &str) -> Option<Self> {
+        match crate::features::chat_text::compact_command(payload).as_str() {
+            "状态" => Some(Self::Status),
+            "结束" => Some(Self::End),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn lock_key(&self) -> &'static str {
+        match self {
+            Self::Start => "turtle_soup:start",
+            Self::Status => "turtle_soup:status",
+            Self::End => "turtle_soup:end",
+        }
+    }
+
+    pub(crate) fn same_request(&self, other: &Self) -> bool {
+        self == other
+    }
+}
+
 #[derive(Debug)]
 pub struct TurtleSoupDeadlineModule;
 
@@ -60,9 +86,9 @@ pub(crate) enum TurtleSoupDeliveryOutcome {
     Rejected,
 }
 
-pub(crate) trait TurtleSoupDeliveryPort: Send + Sync {
+pub(crate) trait TurtleSoupDeliveryPort {
     fn deliver_turtle_soup(
-        &self,
+        &mut self,
         intent: TurtleSoupDeliveryIntent,
     ) -> Result<TurtleSoupDeliveryOutcome>;
 }

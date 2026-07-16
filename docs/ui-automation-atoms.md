@@ -28,14 +28,14 @@ flowchart TD
 
 | 文件 | 职责 |
 | --- | --- |
-| `src/app/workflow_actions.rs` | 原子动作集合：等待、按键、按住按键、激活、聚焦、点击点、粘贴、模板等待/点击、文字等待/点击、像素稳定。 |
-| `src/app/ui_locator.rs` | 截图和区域定位封装。负责在指定区域里找模板、找 OCR 文本、等待像素稳定。 |
-| `src/app/input_actions.rs` | 把原子输入落到 Enigo：点击、激活、聚焦、粘贴、按键。 |
-| `src/app/window.rs` | Windows 窗口查找、激活、客户区坐标换算、前台校验、点击归属校验、截图。 |
-| `src/app/custom_workflow.rs` | 把配置里的工作流步骤执行成原子动作，也为内置邀请/管理流程提供 `*_atom` 封装。 |
-| `src/app/chat_output.rs` | 游戏聊天发送组合动作，内部使用点击、按键、粘贴和发送等待。 |
-| `src/app/ui_state.rs` | 一级/二级/未知界面检测，供命令前准备和返回一级界面使用。 |
-| `src/app/template_match.rs` | 模板匹配实现和模板缓存。小区域最佳命中走 CPU 灰度 SAD。 |
+| `src/ui/atoms.rs` | 原子动作集合：等待、按键、按住按键、激活、聚焦、点击点、粘贴、模板等待/点击、文字等待/点击、像素稳定。 |
+| `src/ui/locator.rs` | 截图和区域定位封装。负责在指定区域里找模板、找 OCR 文本、等待像素稳定。 |
+| `src/adapters/windows/input.rs` | 把原子输入落到 Enigo：点击、激活、聚焦、粘贴、按键。 |
+| `src/adapters/windows/window.rs` | Windows 窗口查找、激活、客户区坐标换算、前台校验、点击归属校验、截图。 |
+| `src/features/custom_workflow.rs` | 把配置里的工作流步骤执行成原子动作，也为内置邀请/管理流程提供 `*_atom` 封装。 |
+| `src/ui/chat_output.rs` | 游戏聊天发送组合动作，内部使用点击、按键、粘贴和发送等待。 |
+| `src/ui/state.rs` | 一级/二级/未知界面检测，供命令前准备和返回一级界面使用。 |
+| `src/ui/template.rs` | 模板匹配实现和模板缓存。小区域最佳命中走 CPU 灰度 SAD。 |
 
 ## 原子动作清单
 

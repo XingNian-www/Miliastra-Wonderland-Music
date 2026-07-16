@@ -1,8 +1,8 @@
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -17,7 +17,7 @@ impl ModerationCommand {
         format!("moderation:{}:{}", self.action.label(), self.uid)
     }
 
-    fn same_request(&self, other: &Self) -> bool {
+    pub(crate) fn same_request(&self, other: &Self) -> bool {
         self.action == other.action && self.uid == other.uid
     }
 }
@@ -118,29 +118,24 @@ pub trait ModerationTaskPort {
     fn sync_listener_state(&self);
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ModerationResultPreparation {
-    Ready,
-    Retry,
-}
-
 pub trait ModerationExecutionPort {
-    fn prepare_result(&mut self, label: &str) -> Result<ModerationResultPreparation>;
     fn send_hall(&mut self, message: &str) -> Result<()>;
     fn execute_action(&mut self, command: &ModerationCommand) -> Result<bool>;
     fn sync_listener_state(&mut self);
     fn wait_after_action(&mut self);
 }
 
-#[derive(Clone)]
-pub struct ModerationService {
-    state: Arc<Mutex<ModerationState>>,
-    policy: ModerationPolicy,
+pub(crate) trait ModerationWorkflowLedger: Send + Sync {
+    fn acquire(&self, key: ModerationWorkflowKey) -> Result<bool>;
+    fn release(&self, key: ModerationWorkflowKey) -> Result<bool>;
+    #[cfg(test)]
+    fn contains(&self, key: ModerationWorkflowKey) -> Result<bool>;
 }
 
-#[derive(Default)]
-struct ModerationState {
-    active_workflows: HashSet<ModerationWorkflowKey>,
+#[derive(Clone)]
+pub struct ModerationService {
+    ledger: Arc<dyn ModerationWorkflowLedger>,
+    policy: ModerationPolicy,
 }
 
 pub enum ModerationStart {
@@ -163,17 +158,16 @@ pub struct ModerationResultTask {
 
 pub enum ModerationResultExecution {
     Completed,
-    Retry(ModerationResultTask),
 }
 
 struct ModerationWorkflowLease {
-    service: ModerationService,
+    ledger: Arc<dyn ModerationWorkflowLedger>,
     key: ModerationWorkflowKey,
     active: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct ModerationWorkflowKey {
+pub(crate) struct ModerationWorkflowKey {
     action: ModerationAction,
     uid: String,
 }
@@ -184,11 +178,8 @@ struct ModerationHoldLease {
 }
 
 impl ModerationService {
-    pub fn new(policy: ModerationPolicy) -> Self {
-        Self {
-            state: Arc::new(Mutex::new(ModerationState::default())),
-            policy,
-        }
+    pub(crate) fn new(policy: ModerationPolicy, ledger: Arc<dyn ModerationWorkflowLedger>) -> Self {
+        Self { ledger, policy }
     }
 
     pub fn start(
@@ -265,19 +256,6 @@ impl ModerationService {
         mut task: ModerationResultTask,
         port: &mut dyn ModerationExecutionPort,
     ) -> Result<ModerationResultExecution> {
-        let label = task.result_label();
-        match port.prepare_result(&label) {
-            Ok(ModerationResultPreparation::Ready) => {}
-            Ok(ModerationResultPreparation::Retry) => {
-                return Ok(ModerationResultExecution::Retry(task));
-            }
-            Err(error) => {
-                task.cancel();
-                port.sync_listener_state();
-                return Err(error);
-            }
-        }
-
         if !task.approved {
             task.release_hold();
             port.sync_listener_state();
@@ -411,32 +389,19 @@ impl ModerationService {
 
     fn try_acquire(&self, command: &ModerationCommand) -> Result<Option<ModerationWorkflowLease>> {
         let key = workflow_key(command);
-        if !self.state()?.active_workflows.insert(key.clone()) {
+        if !self.ledger.acquire(key.clone())? {
             return Ok(None);
         }
         Ok(Some(ModerationWorkflowLease {
-            service: self.clone(),
+            ledger: self.ledger.clone(),
             key,
             active: true,
         }))
     }
 
-    fn release(&self, key: &ModerationWorkflowKey) -> Result<bool> {
-        Ok(self.state()?.active_workflows.remove(key))
-    }
-
-    fn state(&self) -> Result<MutexGuard<'_, ModerationState>> {
-        self.state
-            .lock()
-            .map_err(|_| anyhow!("moderation workflow state mutex poisoned"))
-    }
-
     #[cfg(test)]
     pub(crate) fn is_active(&self, command: &ModerationCommand) -> Result<bool> {
-        Ok(self
-            .state()?
-            .active_workflows
-            .contains(&workflow_key(command)))
+        self.ledger.contains(workflow_key(command))
     }
 }
 
@@ -470,16 +435,8 @@ impl ModerationResultTask {
         )
     }
 
-    pub fn result_label(&self) -> String {
-        format!(
-            "{} UID{} 投票结果",
-            self.command.action.label(),
-            self.command.uid
-        )
-    }
-
-    pub fn matches(&self, command: &ModerationCommand) -> bool {
-        self.command.same_request(command)
+    pub fn dedup_key(&self) -> String {
+        self.command.lock_key()
     }
 
     pub fn cancel(&mut self) {
@@ -502,7 +459,7 @@ impl ModerationWorkflowLease {
             return;
         }
         self.active = false;
-        if let Err(error) = self.service.release(&self.key) {
+        if let Err(error) = self.ledger.release(self.key.clone()) {
             log::error!(
                 "无法释放管理工作流 {}:{}: {error:#}",
                 self.key.action.label(),
@@ -601,10 +558,31 @@ fn strip_ascii_case_prefix<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::collections::{HashSet, VecDeque};
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use super::*;
+    use anyhow::anyhow;
+
+    #[derive(Default)]
+    struct TestLedger {
+        active: Mutex<HashSet<ModerationWorkflowKey>>,
+    }
+
+    impl ModerationWorkflowLedger for TestLedger {
+        fn acquire(&self, key: ModerationWorkflowKey) -> Result<bool> {
+            Ok(self.active.lock().unwrap().insert(key))
+        }
+
+        fn release(&self, key: ModerationWorkflowKey) -> Result<bool> {
+            Ok(self.active.lock().unwrap().remove(&key))
+        }
+
+        fn contains(&self, key: ModerationWorkflowKey) -> Result<bool> {
+            Ok(self.active.lock().unwrap().contains(&key))
+        }
+    }
 
     struct FakeHold {
         active: Arc<AtomicBool>,
@@ -732,7 +710,6 @@ mod tests {
     }
 
     struct FakeExecutionPort {
-        preparation: Option<Result<ModerationResultPreparation>>,
         action_result: Result<bool>,
         hold_active: Arc<AtomicBool>,
         events: Vec<String>,
@@ -741,7 +718,6 @@ mod tests {
     impl FakeExecutionPort {
         fn ready(hold_active: Arc<AtomicBool>, action_result: Result<bool>) -> Self {
             Self {
-                preparation: Some(Ok(ModerationResultPreparation::Ready)),
                 action_result,
                 hold_active,
                 events: Vec::new(),
@@ -750,11 +726,6 @@ mod tests {
     }
 
     impl ModerationExecutionPort for FakeExecutionPort {
-        fn prepare_result(&mut self, _label: &str) -> Result<ModerationResultPreparation> {
-            self.events.push("prepare".to_string());
-            self.preparation.take().expect("one preparation result")
-        }
-
         fn send_hall(&mut self, message: &str) -> Result<()> {
             self.events.push(format!(
                 "send:{}:{}",
@@ -786,12 +757,15 @@ mod tests {
     }
 
     fn service(samples: u32, margin: i32) -> ModerationService {
-        ModerationService::new(ModerationPolicy::new(
-            Duration::from_secs(4),
-            Duration::from_secs(1),
-            samples,
-            margin,
-        ))
+        ModerationService::new(
+            ModerationPolicy::new(
+                Duration::from_secs(4),
+                Duration::from_secs(1),
+                samples,
+                margin,
+            ),
+            Arc::new(TestLedger::default()),
+        )
     }
 
     fn command() -> ModerationCommand {
@@ -916,52 +890,6 @@ mod tests {
     }
 
     #[test]
-    fn recoverable_result_preparation_keeps_the_task_and_resources() {
-        let service = service(1, 1);
-        let mut command_port = FakeCommandPort::new();
-        let hold_active = command_port.hold_active.clone();
-        let task = start(&service, &mut command_port).finish(true);
-        let mut execution = FakeExecutionPort {
-            preparation: Some(Ok(ModerationResultPreparation::Retry)),
-            action_result: Ok(true),
-            hold_active: hold_active.clone(),
-            events: Vec::new(),
-        };
-
-        let ModerationResultExecution::Retry(mut task) = service
-            .execute_result(task, &mut execution)
-            .expect("retry result")
-        else {
-            panic!("result should be retried");
-        };
-
-        assert_eq!(execution.events, ["prepare"]);
-        assert!(service.is_active(&command()).unwrap());
-        assert!(hold_active.load(Ordering::SeqCst));
-        task.cancel();
-    }
-
-    #[test]
-    fn fatal_result_preparation_releases_the_task_and_resources() {
-        let service = service(1, 1);
-        let mut command_port = FakeCommandPort::new();
-        let hold_active = command_port.hold_active.clone();
-        let task = start(&service, &mut command_port).finish(true);
-        let mut execution = FakeExecutionPort {
-            preparation: Some(Err(anyhow!("window unavailable"))),
-            action_result: Ok(true),
-            hold_active: hold_active.clone(),
-            events: Vec::new(),
-        };
-
-        assert!(service.execute_result(task, &mut execution).is_err());
-
-        assert!(!service.is_active(&command()).unwrap());
-        assert!(!hold_active.load(Ordering::SeqCst));
-        assert_eq!(execution.events, ["prepare", "sync:false"]);
-    }
-
-    #[test]
     fn approved_result_keeps_primary_hold_through_action_then_releases_before_feedback() {
         let service = service(1, 1);
         let mut command_port = FakeCommandPort::new();
@@ -977,7 +905,6 @@ mod tests {
         assert_eq!(
             execution.events,
             [
-                "prepare",
                 "send:@UID123456789的拉黑请求已通过,开始执行:true",
                 "action:true",
                 "sync:false",
@@ -1004,11 +931,7 @@ mod tests {
 
         assert_eq!(
             execution.events,
-            [
-                "prepare",
-                "sync:false",
-                "send:@UID123456789的拉黑请求未通过:false",
-            ]
+            ["sync:false", "send:@UID123456789的拉黑请求未通过:false",]
         );
         assert!(!service.is_active(&command()).unwrap());
     }

@@ -1,9 +1,6 @@
 # Miliastra Wonderland Music 配置
 # 坐标沿用旧脚本习惯：以游戏客户区左上角为原点，按 1920x1080 有效画面写坐标
 
-# 配置版本；程序启动时会把旧版本配置迁移到当前模板
-config_version: 28
-
 window:
   # 目标游戏进程名，按进程文件名匹配，大小写不敏感；多个进程名可用逗号分隔
   target_process: yuanshen.exe,GenshinImpact.exe
@@ -612,7 +609,7 @@ startup:
   stable_changed_ratio_threshold: 0.01
   # 启动/千星模板匹配阈值；越高越严格
   template_threshold: 0.9
-  # 千星“前往大厅”按钮模板匹配阈值；旧配置中的 template_threshold 不影响该按钮
+  # 千星“前往大厅”按钮模板匹配阈值；越高越严格
   wonderland_enter_button_threshold: 0.9
   # 进入千星流程模板资源；启动游戏完成判断使用 paimon_menu
   templates:
@@ -626,7 +623,7 @@ startup:
     y: 1000
     width: 130
     height: 40
-  # 千星“前往大厅”按钮模板区域；旧配置中的 prompt_confirm_text_region 不影响该按钮
+  # 千星“前往大厅”按钮模板区域
   wonderland_enter_button_region:
     x: 1400
     y: 850

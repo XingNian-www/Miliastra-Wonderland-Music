@@ -42,7 +42,7 @@ const DEFAULT_CONTENT_STABLE_COUNT: usize = 0;
 const BUILTIN_OCR_STABILITY_COUNT: usize = 2;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct TurtleSoupConfig {
     pub enabled: bool,
     pub question_bank_path: PathBuf,
@@ -84,7 +84,7 @@ impl Default for TurtleSoupConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct TurtleSoupAiConfig {
     pub endpoint: String,
     pub api_key: String,

@@ -18,8 +18,8 @@ pub(super) struct SongDedupCandidate {
     pub(super) prefer_accompaniment: bool,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SongDedupEntry {
     uri: String,
     title: String,
@@ -29,8 +29,8 @@ struct SongDedupEntry {
     played_at: u64,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SongDedupHistoryFile {
     entries: Vec<SongDedupEntry>,
 }
@@ -113,10 +113,7 @@ fn parse_history_entries(text: &str) -> Result<Vec<SongDedupEntry>> {
     if text.trim().is_empty() {
         return Ok(Vec::new());
     }
-    if let Ok(file) = serde_json::from_str::<SongDedupHistoryFile>(text) {
-        return Ok(file.entries);
-    }
-    Ok(serde_json::from_str::<Vec<SongDedupEntry>>(text)?)
+    Ok(serde_json::from_str::<SongDedupHistoryFile>(text)?.entries)
 }
 
 fn same_song(

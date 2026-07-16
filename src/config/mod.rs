@@ -6,7 +6,6 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Deserializer, Serialize};
 
-use self::migration::CURRENT_CONFIG_VERSION;
 use crate::features::card_games::LandlordConfig;
 use crate::features::idiom_chain::IdiomChainConfig;
 use crate::features::turtle_soup::TurtleSoupConfig;
@@ -14,11 +13,9 @@ use crate::features::undercover::UndercoverConfig;
 use crate::runtime::player::PlayerObservationConfig;
 use crate::runtime::player_io::{PlayerRuntimeConfig, PlayerRuntimeConfigError};
 
-mod migration;
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AppConfig {
-    pub config_version: u32,
     pub window: WindowConfig,
     pub screen: ScreenConfig,
     #[serde(default)]
@@ -63,6 +60,7 @@ const PLAYER_SEARCH_QUEUE_CAPACITY: usize = 16;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct StabilityConfig {
     pub default_count: u32,
 }
@@ -86,6 +84,7 @@ pub(crate) fn resolve_stability_count(local: u32, global: u32) -> u32 {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WindowConfig {
     /// 支持逗号、分号、竖线或空白分隔的多个进程名。
     pub target_process: String,
@@ -204,46 +203,14 @@ impl AppConfig {
         Ok(config)
     }
 
-    pub fn load_or_create(path: &Path) -> Result<Self> {
-        if path.exists() {
-            let text = fs::read_to_string(path)
-                .with_context(|| format!("read config {}", path.display()))?;
-            if let Some(report) = migration::migrate_config_text(&text, default_config_yaml())? {
-                let config: Self = serde_yaml::from_str(&report.text)
-                    .with_context(|| format!("validate migrated config {}", path.display()))?;
-                let backup_path = migration::backup_path(path);
-                fs::write(&backup_path, &text)
-                    .with_context(|| format!("write config backup {}", backup_path.display()))?;
-                fs::write(path, &report.text)
-                    .with_context(|| format!("write migrated config {}", path.display()))?;
-                eprintln!(
-                    "配置已自动迁移: {} -> version {}，备份: {}，迁移 {} 项",
-                    report
-                        .old_version
-                        .map_or_else(|| "未标记".to_string(), |version| version.to_string()),
-                    CURRENT_CONFIG_VERSION,
-                    backup_path.display(),
-                    report.migrated_count
-                );
-                if !report.unmigrated.is_empty() {
-                    eprintln!(
-                        "有 {} 项配置未自动迁移，已追加到配置文件末尾的注释区，不影响运行",
-                        report.unmigrated.len()
-                    );
-                    for item in &report.unmigrated {
-                        eprintln!("未迁移配置: {} ({})", item.path, item.reason);
-                    }
-                }
-                return Ok(config);
-            }
-            return serde_yaml::from_str(&text)
-                .with_context(|| format!("parse config {}", path.display()));
-        }
-
-        bail!(
-            "配置文件不存在: {}。请将发布包中的 config.yaml 放在程序工作目录",
-            path.display()
-        )
+    pub fn load(path: &Path) -> Result<Self> {
+        let text = fs::read_to_string(path).with_context(|| {
+            format!(
+                "读取配置失败: {}。请将发布包中的 config.yaml 放在程序工作目录",
+                path.display()
+            )
+        })?;
+        serde_yaml::from_str(&text).with_context(|| format!("解析配置失败: {}", path.display()))
     }
 }
 
@@ -254,11 +221,13 @@ fn validate_unit_interval(value: f32, field: &str) -> Result<()> {
     Ok(())
 }
 
-fn default_config_yaml() -> &'static str {
+#[cfg(test)]
+fn bundled_config_yaml() -> &'static str {
     include_str!("../../config.yaml")
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RectConfig {
     pub x: i32,
     pub y: i32,
@@ -267,6 +236,7 @@ pub struct RectConfig {
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PointConfig {
     pub x: i32,
     pub y: i32,
@@ -279,12 +249,12 @@ impl PointConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScreenConfig {
     pub expected_width: u32,
     pub expected_height: u32,
     pub warn_on_size_mismatch: bool,
     pub chat_rect: RectConfig,
-    #[serde(alias = "enter_rect")]
     pub friend_rect: RectConfig,
     #[serde(default = "default_secondary_back_rect")]
     pub secondary_back_rect: RectConfig,
@@ -303,6 +273,7 @@ fn default_secondary_back_rect() -> RectConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TimingConfig {
     pub watchdog_restart_ms: u64,
     pub loop_idle_ms: u64,
@@ -319,6 +290,7 @@ pub struct TimingConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChatScanTimingConfig {
     pub fallback_ms: u64,
     pub change_debounce_ms: u64,
@@ -326,6 +298,7 @@ pub struct ChatScanTimingConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CommandTimingConfig {
     pub ui_timeout_ms: u64,
     pub return_retry_ms: u64,
@@ -334,6 +307,7 @@ pub struct CommandTimingConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InputTimingConfig {
     pub after_activate_ms: u64,
     pub focus_ms: u64,
@@ -344,6 +318,7 @@ pub struct InputTimingConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkflowTimingConfig {
     pub default_timeout_ms: u64,
     pub default_poll_ms: u64,
@@ -351,12 +326,14 @@ pub struct WorkflowTimingConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HallTimingConfig {
     pub page_settle_ms: u64,
     pub ocr_sample_interval_ms: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InviteTimingConfig {
     pub open_chat_ms: u64,
     pub step_ms: u64,
@@ -365,6 +342,7 @@ pub struct InviteTimingConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModerationTimingConfig {
     pub vote_timeout_ms: u64,
     pub vote_poll_ms: u64,
@@ -373,6 +351,7 @@ pub struct ModerationTimingConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PlaybackTimingConfig {
     pub search_settle_ms: u64,
     pub status_poll_ms: u64,
@@ -413,12 +392,14 @@ where
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DecisionTimingConfig {
     pub timeout_ms: u64,
     pub poll_ms: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExternalTimingConfig {
     pub feeluown_rpc_timeout_ms: u64,
     pub volume_smooth_step_ms: u64,
@@ -426,6 +407,7 @@ pub struct ExternalTimingConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OcrConfig {
     pub det_model: PathBuf,
     pub rec_model: PathBuf,
@@ -453,11 +435,11 @@ pub struct OcrConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TemplateConfig {
     pub blue_marker: PathBuf,
     pub yellow_marker: PathBuf,
     pub pink_marker: PathBuf,
-    #[serde(alias = "enter")]
     pub friend: PathBuf,
     #[serde(default = "default_secondary_back_template")]
     pub secondary_back: PathBuf,
@@ -479,6 +461,7 @@ fn default_secondary_back_template() -> PathBuf {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModerationConfig {
     pub stable_vote_samples: u32,
     pub required_vote_margin: i32,
@@ -493,6 +476,7 @@ pub struct ModerationConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OutputConfig {
     pub send_enabled: bool,
     pub focus_point: PointConfig,
@@ -500,12 +484,14 @@ pub struct OutputConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FeelUOwnConfig {
     pub host: String,
     pub port: u16,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HttpConfig {
     pub host: String,
     pub port: u16,
@@ -515,6 +501,7 @@ pub struct HttpConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LoggingConfig {
     pub dir: PathBuf,
     pub level: String,
@@ -533,6 +520,7 @@ fn default_log_retain_days() -> u32 {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TuiConfig {
     pub enabled: bool,
     pub refresh_ms: u64,
@@ -540,6 +528,7 @@ pub struct TuiConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StateConfig {
     pub runtime_state_path: PathBuf,
     pub queue_path: PathBuf,
@@ -547,6 +536,7 @@ pub struct StateConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QueueConfig {
     pub max_size: usize,
     pub auto_advance_seconds: u64,
@@ -561,6 +551,7 @@ fn default_external_playback_protect_after_seconds() -> u64 {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct SongDedupConfig {
     pub enabled: bool,
     pub window_seconds: u64,
@@ -582,6 +573,7 @@ impl Default for SongDedupConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CustomWorkflowConfig {
     pub enabled: bool,
     pub default_threshold: f32,
@@ -602,6 +594,7 @@ fn default_max_hold_key_seconds() -> u64 {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CustomWorkflowDefinition {
     pub enabled: bool,
     pub name: String,
@@ -618,6 +611,7 @@ pub struct CustomWorkflowDefinition {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CustomWorkflowStep {
     #[serde(rename = "type")]
     pub step_type: String,
@@ -638,6 +632,7 @@ pub struct CustomWorkflowStep {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AiConfig {
     pub provider: String,
     pub api_key: String,
@@ -649,6 +644,7 @@ pub struct AiConfig {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct SongReviewConfig {
     pub enabled: bool,
     pub max_allowed_level: u8,
@@ -697,6 +693,7 @@ pub enum SongReviewFailurePolicy {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct SongReviewProviderConfig {
     pub endpoint: String,
     pub api_key: String,
@@ -705,6 +702,7 @@ pub struct SongReviewProviderConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MatchConfig {
     pub min_song_name_score: f64,
     pub short_chinese_song_max_miss: usize,
@@ -734,6 +732,7 @@ impl Default for MatchConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HotkeyConfig {
     pub enabled: bool,
     pub pause_key: String,
@@ -741,6 +740,7 @@ pub struct HotkeyConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StartupConfig {
     pub enabled: bool,
     pub launch_game: bool,
@@ -818,6 +818,7 @@ fn default_wonderland_enter_button_region() -> RectConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StartupTemplateConfig {
     #[serde(default = "default_wonderland_enter_button_template")]
     pub wonderland_enter_button: PathBuf,
@@ -830,6 +831,7 @@ fn default_wonderland_enter_button_template() -> PathBuf {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InviteConfig {
     #[serde(default = "default_friend_name_stable_count")]
     pub friend_name_stable_count: u32,
@@ -943,7 +945,7 @@ stale_timeout_ms: 7500
     #[test]
     fn app_config_builds_the_complete_player_runtime_config_once() {
         let mut config: AppConfig =
-            serde_yaml::from_str(default_config_yaml()).expect("default app config");
+            serde_yaml::from_str(bundled_config_yaml()).expect("default app config");
         config.stability.default_count = 6;
         config.timing.playback.uri_stable_samples = 4;
         config.timing.playback.transport_stable_samples = 1;
@@ -983,7 +985,7 @@ stale_timeout_ms: 7500
     #[test]
     fn default_app_config_passes_startup_validation() {
         let config: AppConfig =
-            serde_yaml::from_str(default_config_yaml()).expect("default config");
+            serde_yaml::from_str(bundled_config_yaml()).expect("default config");
 
         config.validate().expect("default config is valid");
     }
@@ -991,7 +993,7 @@ stale_timeout_ms: 7500
     #[test]
     fn startup_validation_rejects_invalid_thresholds_and_queue_capacity() {
         let mut config: AppConfig =
-            serde_yaml::from_str(default_config_yaml()).expect("default config");
+            serde_yaml::from_str(bundled_config_yaml()).expect("default config");
 
         config.templates.marker_threshold = 1.1;
         assert!(config.validate().is_err());
@@ -1004,7 +1006,7 @@ stale_timeout_ms: 7500
     #[test]
     fn player_fast_observation_interval_stays_below_low_normal_intervals() {
         let mut config: AppConfig =
-            serde_yaml::from_str(default_config_yaml()).expect("default app config");
+            serde_yaml::from_str(bundled_config_yaml()).expect("default app config");
 
         for (normal_ms, expected_fast) in [
             (300, Duration::from_millis(150)),
@@ -1029,31 +1031,32 @@ stale_timeout_ms: 7500
     }
 
     #[test]
-    fn old_primary_anchor_config_names_deserialize_to_friend_names() {
-        let screen: ScreenConfig = serde_yaml::from_str(
+    fn removed_configuration_names_are_rejected() {
+        let screen = serde_yaml::from_str::<ScreenConfig>(
             r#"
 expected_width: 1920
 expected_height: 1080
 warn_on_size_mismatch: true
 chat_rect: { x: 0, y: 0, width: 1, height: 1 }
-enter_rect: { x: 115, y: 1018, width: 50, height: 40 }
+friend_rect: { x: 0, y: 0, width: 1, height: 1 }
+enter_rect: { x: 0, y: 0, width: 1, height: 1 }
+secondary_back_rect: { x: 0, y: 0, width: 1, height: 1 }
 secondary_hall_rect: { x: 0, y: 0, width: 1, height: 1 }
 hall_name_rect: { x: 0, y: 0, width: 1, height: 1 }
 hall_time_rect: { x: 0, y: 0, width: 1, height: 1 }
 "#,
         )
-        .expect("old screen config");
-        assert_eq!(screen.friend_rect.x, 115);
-        let serialized_screen = serde_yaml::to_string(&screen).expect("serialize screen config");
-        assert!(serialized_screen.contains("friend_rect:"));
-        assert!(!serialized_screen.contains("enter_rect:"));
+        .expect_err("removed screen alias must be rejected");
+        assert!(screen.to_string().contains("enter_rect"));
 
-        let templates: TemplateConfig = serde_yaml::from_str(
+        let templates = serde_yaml::from_str::<TemplateConfig>(
             r#"
 blue_marker: blue.png
 yellow_marker: yellow.png
 pink_marker: pink.png
+friend: friend.png
 enter: old-primary.png
+secondary_back: back.png
 secondary_hall: hall.png
 invite_view_star: view.png
 invite_goto_hall: goto.png
@@ -1067,81 +1070,7 @@ friend_confirm: confirm.png
 marker_threshold: 0.9
 "#,
         )
-        .expect("old template config");
-        assert_eq!(templates.friend, PathBuf::from("old-primary.png"));
-        let serialized_templates =
-            serde_yaml::to_string(&templates).expect("serialize template config");
-        assert!(serialized_templates.contains("friend: old-primary.png"));
-        assert!(!serialized_templates.contains("enter: old-primary.png"));
-    }
-
-    #[test]
-    fn old_startup_confirm_fields_do_not_override_wonderland_enter_button_defaults() {
-        let startup: StartupConfig = serde_yaml::from_str(
-            r#"
-enabled: true
-launch_game: true
-enter_game: true
-enter_wonderland: true
-exe_path: ""
-game_args: ""
-launch_wait_ms: 5000
-launch_retries: 12
-enter_game_timeout_ms: 60000
-enter_wonderland_timeout_ms: 300000
-entered_wonderland_confirm_timeout_ms: 20000
-final_primary_timeout_ms: 120000
-poll_ms: 1000
-f6_retry_ms: 2500
-stable_timeout_ms: 3000
-stable_mean_threshold: 2.0
-stable_changed_ratio_threshold: 0.01
-template_threshold: 0.8
-templates:
-  confirm_black: assets/old-confirm-black.png
-  paimon_menu: assets/startup-paimon-menu.png
-  wonderland_close: assets/startup-wonderland-close.png
-enter_game_text_region:
-  x: 900
-  y: 1000
-  width: 130
-  height: 40
-prompt_confirm_text_region:
-  x: 1400
-  y: 900
-  width: 100
-  height: 100
-entered_wonderland_confirm_region:
-  x: 1100
-  y: 900
-  width: 100
-  height: 100
-main_ui_region:
-  x: 0
-  y: 0
-  width: 480
-  height: 270
-wonderland_close_region:
-  x: 1780
-  y: 0
-  width: 140
-  height: 90
-wonderland_card_point:
-  x: 680
-  y: 310
-"#,
-        )
-        .expect("old startup config should load with new defaults");
-
-        assert_eq!(startup.template_threshold, 0.8);
-        assert_eq!(startup.wonderland_enter_button_threshold, 0.9);
-        assert_eq!(
-            startup.templates.wonderland_enter_button,
-            PathBuf::from("assets/startup-confirm-black.png")
-        );
-        assert_eq!(startup.wonderland_enter_button_region.x, 1400);
-        assert_eq!(startup.wonderland_enter_button_region.y, 850);
-        assert_eq!(startup.wonderland_enter_button_region.width, 360);
-        assert_eq!(startup.wonderland_enter_button_region.height, 150);
+        .expect_err("removed template alias must be rejected");
+        assert!(templates.to_string().contains("enter"));
     }
 }

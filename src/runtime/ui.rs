@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvError, RecvTimeoutError, SyncSender, TrySendError};
@@ -67,6 +68,10 @@ pub trait UiDevice: Send + 'static {
     fn close_window(&mut self) -> Result<()> {
         bail!("UI device does not support window closing")
     }
+
+    fn launch_game(&mut self, _executable: &Path, _args: &[String]) -> Result<()> {
+        bail!("UI device does not support game process launch")
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -77,7 +82,7 @@ pub enum InputCertainty {
     Cancelled,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UiRoutineFailure {
     certainty: InputCertainty,
     stage: &'static str,
@@ -204,6 +209,93 @@ impl Error for FrameDemandError {}
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CaptureFrame;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UiRoutineProgressStage {
+    NormalizingStart,
+    LocatingFriend {
+        recipient_index: usize,
+        recipient_count: usize,
+    },
+    SendingFriendMessage {
+        recipient_index: usize,
+        recipient_count: usize,
+        message_index: usize,
+        message_count: usize,
+    },
+    ExecutingCustomAction {
+        operation_index: usize,
+        operation_count: usize,
+    },
+    ConfirmingUi,
+    RecoveringResidency,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UiRoutineProgress {
+    operation_id: UiOperationId,
+    stage: UiRoutineProgressStage,
+}
+
+impl UiRoutineProgress {
+    pub fn new(operation_id: UiOperationId, stage: UiRoutineProgressStage) -> Self {
+        Self {
+            operation_id,
+            stage,
+        }
+    }
+
+    pub fn operation_id(&self) -> UiOperationId {
+        self.operation_id
+    }
+
+    pub fn stage(&self) -> &UiRoutineProgressStage {
+        &self.stage
+    }
+}
+
+pub trait UiRoutineProgressSink: Send + Sync + 'static {
+    fn publish(&self, progress: UiRoutineProgress);
+}
+
+struct DiscardUiRoutineProgress;
+
+impl UiRoutineProgressSink for DiscardUiRoutineProgress {
+    fn publish(&self, _progress: UiRoutineProgress) {}
+}
+
+pub struct UiRoutineContext<'a> {
+    operation_id: UiOperationId,
+    device: &'a mut dyn UiDevice,
+    progress: &'a dyn UiRoutineProgressSink,
+}
+
+impl<'a> UiRoutineContext<'a> {
+    fn new(
+        operation_id: UiOperationId,
+        device: &'a mut dyn UiDevice,
+        progress: &'a dyn UiRoutineProgressSink,
+    ) -> Self {
+        Self {
+            operation_id,
+            device,
+            progress,
+        }
+    }
+
+    pub fn operation_id(&self) -> UiOperationId {
+        self.operation_id
+    }
+
+    pub fn device(&mut self) -> &mut dyn UiDevice {
+        self.device
+    }
+
+    pub fn publish_progress(&self, stage: UiRoutineProgressStage) {
+        self.progress
+            .publish(UiRoutineProgress::new(self.operation_id, stage));
+    }
+}
+
 pub(crate) mod sealed {
     pub trait UiRoutineSealed {}
 }
@@ -211,7 +303,7 @@ pub(crate) mod sealed {
 pub trait UiRoutine: sealed::UiRoutineSealed + Send + 'static {
     type Output: Send + 'static;
 
-    fn execute(self, device: &mut dyn UiDevice) -> Self::Output;
+    fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output;
 
     fn frame_publication(_output: &Self::Output) -> Option<FramePublication> {
         None
@@ -223,8 +315,8 @@ impl sealed::UiRoutineSealed for CaptureFrame {}
 impl UiRoutine for CaptureFrame {
     type Output = Result<CapturedFrame, UiRoutineFailure>;
 
-    fn execute(self, device: &mut dyn UiDevice) -> Self::Output {
-        let image = device.capture().map_err(|error| {
+    fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
+        let image = context.device().capture().map_err(|error| {
             UiRoutineFailure::before_input("capture_frame", format!("{error:#}"))
         })?;
         Ok(CapturedFrame {
@@ -337,12 +429,14 @@ trait ErasedUiJob: Send {
     fn execute(
         self: Box<Self>,
         device: &mut dyn UiDevice,
+        progress: &dyn UiRoutineProgressSink,
         demands: &mut HashMap<u64, ActiveFrameDemand>,
         latest_frame: &Mutex<Option<Arc<CapturedFrame>>>,
     );
 }
 
 struct TypedUiJob<R: UiRoutine> {
+    operation_id: UiOperationId,
     routine: R,
     response: SyncSender<R::Output>,
 }
@@ -351,14 +445,21 @@ impl<R: UiRoutine> ErasedUiJob for TypedUiJob<R> {
     fn execute(
         self: Box<Self>,
         device: &mut dyn UiDevice,
+        progress: &dyn UiRoutineProgressSink,
         demands: &mut HashMap<u64, ActiveFrameDemand>,
         latest_frame: &Mutex<Option<Arc<CapturedFrame>>>,
     ) {
-        let output = self.routine.execute(device);
+        let Self {
+            operation_id,
+            routine,
+            response,
+        } = *self;
+        let mut context = UiRoutineContext::new(operation_id, device, progress);
+        let output = routine.execute(&mut context);
         if let Some(publication) = R::frame_publication(&output) {
             publish_frame(publication, demands, latest_frame);
         }
-        let _ = self.response.send(output);
+        let _ = response.send(output);
     }
 }
 
@@ -406,7 +507,11 @@ impl UiRuntimeHandle {
                 .wrapping_add(1),
         );
         let (response, receiver) = mpsc::sync_channel(1);
-        let message = RuntimeMessage::Execute(Box::new(TypedUiJob { routine, response }));
+        let message = RuntimeMessage::Execute(Box::new(TypedUiJob {
+            operation_id: id,
+            routine,
+            response,
+        }));
         match self.channel.sender.try_send(message) {
             Ok(()) => Ok(UiOperation {
                 id,
@@ -511,6 +616,14 @@ impl UiRuntime {
         device: impl UiDevice,
         queue_capacity: usize,
     ) -> Result<Self, UiRuntimeStartError> {
+        Self::start_with_progress(device, queue_capacity, Arc::new(DiscardUiRoutineProgress))
+    }
+
+    pub fn start_with_progress(
+        device: impl UiDevice,
+        queue_capacity: usize,
+        progress: Arc<dyn UiRoutineProgressSink>,
+    ) -> Result<Self, UiRuntimeStartError> {
         if queue_capacity == 0 {
             return Err(UiRuntimeStartError::ZeroQueueCapacity);
         }
@@ -524,7 +637,7 @@ impl UiRuntime {
         let worker_latest_frame = Arc::clone(&latest_frame);
         let worker = thread::Builder::new()
             .name("ui-runtime".to_string())
-            .spawn(move || run_ui_runtime(device, receiver, worker_latest_frame))
+            .spawn(move || run_ui_runtime(device, receiver, worker_latest_frame, progress))
             .map_err(UiRuntimeStartError::Spawn)?;
 
         Ok(Self {
@@ -574,6 +687,7 @@ fn run_ui_runtime(
     device: impl UiDevice,
     receiver: Receiver<RuntimeMessage>,
     latest_frame: Arc<Mutex<Option<Arc<CapturedFrame>>>>,
+    progress: Arc<dyn UiRoutineProgressSink>,
 ) {
     let mut device = device;
     let mut demands = HashMap::<u64, ActiveFrameDemand>::new();
@@ -591,7 +705,7 @@ fn run_ui_runtime(
         };
         match message {
             Some(RuntimeMessage::Execute(job)) => {
-                job.execute(&mut device, &mut demands, &latest_frame)
+                job.execute(&mut device, progress.as_ref(), &mut demands, &latest_frame)
             }
             Some(RuntimeMessage::AddFrameDemand { id, demand, sender }) => {
                 demands.insert(
@@ -681,5 +795,62 @@ fn publish_frame(
     }
     for id in disconnected {
         demands.remove(&id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct RecordingProgressSink {
+        events: Mutex<Vec<UiRoutineProgress>>,
+    }
+
+    impl UiRoutineProgressSink for RecordingProgressSink {
+        fn publish(&self, progress: UiRoutineProgress) {
+            self.events.lock().unwrap().push(progress);
+        }
+    }
+
+    struct ContextProbeRoutine;
+
+    impl sealed::UiRoutineSealed for ContextProbeRoutine {}
+
+    impl UiRoutine for ContextProbeRoutine {
+        type Output = UiOperationId;
+
+        fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
+            let operation_id = context.operation_id();
+            context.publish_progress(UiRoutineProgressStage::NormalizingStart);
+            operation_id
+        }
+    }
+
+    struct UnusedDevice;
+
+    impl UiDevice for UnusedDevice {
+        fn capture(&mut self) -> Result<DynamicImage> {
+            bail!("context probe should not capture")
+        }
+    }
+
+    #[test]
+    fn routine_context_correlates_redacted_progress_with_the_operation() {
+        let progress = Arc::new(RecordingProgressSink::default());
+        let runtime = UiRuntime::start_with_progress(UnusedDevice, 1, progress.clone()).unwrap();
+
+        let operation = runtime.handle().submit(ContextProbeRoutine).unwrap();
+        let operation_id = operation.id();
+
+        assert_eq!(operation.wait().unwrap(), operation_id);
+        assert_eq!(
+            *progress.events.lock().unwrap(),
+            vec![UiRoutineProgress::new(
+                operation_id,
+                UiRoutineProgressStage::NormalizingStart,
+            )]
+        );
+        runtime.shutdown().unwrap();
     }
 }

@@ -10,7 +10,7 @@ use crate::runtime::timer::{DeadlineKind, DeadlineModule, DeadlineToken};
 pub(crate) mod repository;
 mod service;
 
-use super::chat_text::display_width;
+use super::chat_text::{command_identity, compact_command, display_width};
 pub use service::{
     UndercoverCommandSource, UndercoverCommandStart, UndercoverDeliveryPort, UndercoverEffect,
     UndercoverEffectClaim, UndercoverEffectKey, UndercoverEffectLane, UndercoverEffectRequest,
@@ -46,8 +46,71 @@ pub enum UndercoverCommand {
     Status,
     Exit,
     End,
+    Retry,
     Describe(String),
     Vote(char),
+}
+
+impl UndercoverCommand {
+    pub(crate) fn parse_start(payload: &str) -> Option<Self> {
+        match compact_command(payload).as_str() {
+            "卧底" => Some(Self::CreateSingle),
+            "卧底双" => Some(Self::CreateDouble),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn parse_hall(payload: &str) -> Option<Self> {
+        let normalized = compact_command(payload);
+        Some(match normalized.as_str() {
+            "开局" => Self::Start,
+            "状态" => Self::Status,
+            "退出" => Self::Exit,
+            "结束" => Self::End,
+            "重试" => Self::Retry,
+            "加入" | "手牌" => return None,
+            _ if parse_vote_position(&normalized).is_some() => return None,
+            _ => Self::Describe(payload.to_string()),
+        })
+    }
+
+    pub(crate) fn parse_friend(payload: &str) -> Option<Self> {
+        let normalized = compact_command(payload);
+        Some(match normalized.as_str() {
+            "加入" => Self::Join,
+            "退出" => Self::Exit,
+            _ => Self::Vote(parse_vote_position(&normalized)?),
+        })
+    }
+
+    pub(crate) fn lock_key(&self) -> String {
+        match self {
+            Self::CreateSingle => "undercover:create:single".to_string(),
+            Self::CreateDouble => "undercover:create:double".to_string(),
+            Self::Join => "undercover:join".to_string(),
+            Self::Start => "undercover:start".to_string(),
+            Self::Status => "undercover:status".to_string(),
+            Self::Exit => "undercover:exit".to_string(),
+            Self::End => "undercover:end".to_string(),
+            Self::Retry => "undercover:retry".to_string(),
+            Self::Describe(text) => format!("undercover:describe:{}", command_identity(text)),
+            Self::Vote(position) => format!("undercover:vote:{position}"),
+        }
+    }
+
+    pub(crate) fn same_request(&self, other: &Self) -> bool {
+        self.lock_key() == other.lock_key()
+    }
+}
+
+fn parse_vote_position(value: &str) -> Option<char> {
+    let value = value
+        .strip_prefix('投')
+        .unwrap_or(value)
+        .to_ascii_uppercase();
+    let mut chars = value.chars();
+    let position = chars.next()?;
+    (chars.next().is_none() && ('A'..='K').contains(&position)).then_some(position)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

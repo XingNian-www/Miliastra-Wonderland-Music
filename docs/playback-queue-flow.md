@@ -30,14 +30,14 @@ flowchart TD
 
 | 文件 | 职责 |
 | --- | --- |
-| `src/app/player_controller.rs` | 播放器后端 trait、播放确认、活动播放请求、暂停原因、队列推进决策和同歌历史写入。 |
-| `src/main.rs` | 点歌决策、聊天确认、AI 同曲判断、自动出队任务编排、音乐播放队列消费和游戏内反馈。 |
-| `src/app/queue.rs` | 音乐播放队列的持久化、去重、追加、移除、清空。 |
-| `src/app/runtime_state.rs` | 运行状态持久化，包括 `playback` 状态和大厅倒计时缓存。 |
-| `src/app/feeluown.rs` | FeelUOwn TCP RPC、搜索候选、播放、暂停、状态查询；当前作为播放器后端适配器。 |
-| `src/app/playback_format.rs` | 播放状态估算、剩余时间、播放成功文案。 |
-| `src/app/song_matcher.rs` | 歌名/歌手匹配、队列去重和当前播放匹配。 |
-| `src/app/song_dedup.rs` | 长时间同歌去重历史、同歌判断和播放成功记录。 |
+| `src/features/playback/controller.rs` | 播放器后端 trait、播放确认、活动播放请求、暂停原因、队列推进决策和同歌历史写入。 |
+| `src/composition/application/song_request.rs`、`commands.rs`、`playback.rs` | 点歌决策、聊天确认、AI 判断、自动出队任务编排、音乐播放队列消费和游戏内反馈。 |
+| `src/features/playback/queue.rs` | 音乐播放队列的持久化、去重、追加、移除、清空。 |
+| `src/features/playback/state.rs` | 运行状态持久化，包括 `playback` 状态和大厅倒计时缓存。 |
+| `src/adapters/feeluown.rs` | FeelUOwn TCP RPC、搜索候选、播放、暂停、状态查询；当前作为播放器后端适配器。 |
+| `src/features/playback/format.rs` | 播放状态估算、剩余时间、播放成功文案。 |
+| `src/features/playback/matcher.rs` | 歌名/歌手匹配、队列去重和当前播放匹配。 |
+| `src/features/playback/dedup.rs` | 长时间同歌去重历史、同歌判断和播放成功记录。 |
 
 ## 三个状态容器
 

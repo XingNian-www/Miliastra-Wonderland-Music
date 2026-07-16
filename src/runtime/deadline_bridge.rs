@@ -446,7 +446,6 @@ mod tests {
         CardGameCommandStart, CardGameDeadlineKind, CardGameDeadlineToken, CardGameEffectClaim,
         CardGameEffectResult, CardGameResume, CardGameService, LandlordCommand, LandlordConfig,
     };
-    use crate::features::entertainment::EntertainmentCoordinator;
     use crate::features::idiom_chain::{
         IdiomChainDeadlineKind, IdiomChainDeadlineToken, IdiomChainService,
     };
@@ -461,15 +460,10 @@ mod tests {
     };
 
     fn business_runtime(queue_capacity: usize) -> BusinessRuntime {
-        let entertainment = EntertainmentCoordinator::new();
         BusinessRuntime::start(
             queue_capacity,
-            IdiomChainService::from_entries_for_test(
-                &["画蛇添足", "足智多谋"],
-                entertainment.clone(),
-                None,
-            ),
-            CardGameService::new(LandlordConfig::default(), entertainment),
+            IdiomChainService::from_entries_for_test(&["画蛇添足", "足智多谋"], None),
+            CardGameService::new(LandlordConfig::default()),
         )
         .unwrap()
     }
@@ -488,21 +482,13 @@ mod tests {
 
     #[test]
     fn real_timer_runtime_drives_card_game_timeout_into_a_business_effect() {
-        let entertainment = EntertainmentCoordinator::new();
-        let service = CardGameService::new(
-            LandlordConfig {
-                lobby_timeout_seconds: 1,
-                ..LandlordConfig::default()
-            },
-            entertainment.clone(),
-        );
+        let service = CardGameService::new(LandlordConfig {
+            lobby_timeout_seconds: 1,
+            ..LandlordConfig::default()
+        });
         let business_runtime = BusinessRuntime::start(
             8,
-            IdiomChainService::from_entries_for_test(
-                &["画蛇添足", "足智多谋"],
-                entertainment.clone(),
-                None,
-            ),
+            IdiomChainService::from_entries_for_test(&["画蛇添足", "足智多谋"], None),
             service,
         )
         .unwrap();
@@ -568,7 +554,7 @@ mod tests {
                 .unwrap(),
             CardGameResume::Completed(_)
         ));
-        assert_eq!(entertainment.active(), None);
+        assert_eq!(business.active_entertainment().unwrap(), None);
         runtime_group.shutdown().unwrap();
     }
 

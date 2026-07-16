@@ -48,6 +48,8 @@ pub struct AppConfig {
     pub hotkeys: HotkeyConfig,
     pub startup: StartupConfig,
     pub invite: InviteConfig,
+    #[serde(default)]
+    pub friend_delivery: FriendDeliveryConfig,
     pub custom_workflows: CustomWorkflowConfig,
 }
 
@@ -842,6 +844,14 @@ pub struct InviteConfig {
     pub view_star_region: RectConfig,
     pub goto_hall_region: RectConfig,
     pub enter_hall_region: RectConfig,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+#[serde(deny_unknown_fields)]
+pub struct FriendDeliveryConfig {
+    /// Maximum automatic retries for a message that is confirmed not to have been sent.
+    pub auto_retry_count: u32,
 }
 
 fn default_friend_name_stable_count() -> u32 {

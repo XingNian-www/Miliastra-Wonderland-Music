@@ -29,14 +29,14 @@ flowchart TD
 
 | 文件 | 职责 |
 | --- | --- |
-| `src/main.rs` | 主扫描循环、OCR 引擎共享锁、触发策略、耗时日志。 |
-| `src/app/frame_source.rs` | 截图来源、尺寸缩放、截图加载耗时。 |
-| `src/app/ui_state.rs` | 一级/二级/未知界面检测。 |
-| `src/app/change_detection.rs` | 聊天区变化指纹和像素差统计。 |
-| `src/app/chat_scan.rs` | 聊天标记匹配、消息块切分、OCR 调用和扫描结果日志。 |
-| `src/app/ocr.rs` | OCR 引擎初始化、后端选择、文本识别、行合并。 |
-| `src/app/ocr_batch.rs` | 实验性批量拼接 OCR。 |
-| `src/app/template_match.rs` | 彩色/灰度 SAD 模板匹配和模板缓存。 |
+| `src/composition/application/listener.rs` | 主扫描循环、聊天变化触发策略和耗时日志。 |
+| `src/ui/frame.rs` | 截图来源、尺寸缩放、截图加载耗时。 |
+| `src/ui/state.rs` | 一级/二级/未知界面检测。 |
+| `src/ui/change_detection.rs` | 聊天区变化指纹和像素差统计。 |
+| `src/observation/chat/scan.rs` | 聊天标记匹配、消息块切分、OCR 调用和扫描结果日志。 |
+| `src/runtime/ocr.rs` | OCR 运行时句柄、引擎初始化、后端选择、文本识别和行合并。 |
+| `src/runtime/ocr/batch.rs` | 实验性批量拼接 OCR。 |
+| `src/ui/template.rs` | 彩色/灰度 SAD 模板匹配和模板缓存。 |
 
 ## 截图加载
 
@@ -186,10 +186,10 @@ UI 状态检测耗时: total=... enter=... hall=... marker=... state=...
 
 ## OCR 引擎和全局互斥
 
-OCR 引擎在 `AutomationApp` 中以 `Arc<Mutex<OcrEngineState>>` 共享。`scan_chat_with_shared_ocr()` 的顺序是：
+OCR 引擎由 `OcrRuntime` 单一拥有，组合层只保存 `OcrRuntimeHandle`。`listener.rs` 的 `scan_chat_with_shared_ocr()` 顺序是：
 
 1. `prepare_chat_scan()`。
-2. 获取 OCR mutex。
+2. 通过 OCR runtime handle 提交识别请求（引擎内部负责互斥）。
 3. `recognize_prepared_chat()`。
 
 因此 OCR 全局互斥只串行化 OCR 识别和引擎状态访问，不串行化截图、UI 检测、聊天标记匹配、消息块计算。

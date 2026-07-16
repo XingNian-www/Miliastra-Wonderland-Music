@@ -31,7 +31,7 @@ impl DeadlineKind for IdiomChainDeadlineKind {
 pub type IdiomChainDeadlineToken = DeadlineToken<IdiomChainDeadlineKind>;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct IdiomChainConfig {
     pub enabled: bool,
     pub history_limit: usize,

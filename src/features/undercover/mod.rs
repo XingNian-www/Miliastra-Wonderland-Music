@@ -51,7 +51,7 @@ pub enum UndercoverCommand {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct UndercoverConfig {
     pub enabled: bool,
     pub word_bank_path: PathBuf,

@@ -4,11 +4,35 @@ use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{
-    CustomWorkflowConfig, CustomWorkflowDefinition, CustomWorkflowStep, PointConfig, RectConfig,
+    CustomWorkflowConfig, CustomWorkflowDefinition, CustomWorkflowStep, DecisionTimingConfig,
+    InputTimingConfig, OcrConfig, PointConfig, RectConfig, WorkflowTimingConfig,
 };
-use crate::features::chat_text::normalize_comparison_text;
+use crate::text::normalize_comparison_text;
 
 const MIN_POLL_MS: u64 = 50;
+
+pub(crate) fn service_from_config_parts(
+    config: &CustomWorkflowConfig,
+    workflow_timing: &WorkflowTimingConfig,
+    decision_timing: &DecisionTimingConfig,
+    input_timing: &InputTimingConfig,
+    ocr: &OcrConfig,
+) -> CustomWorkflowService {
+    CustomWorkflowService::new(
+        config.clone(),
+        WorkflowDefaults {
+            default_timeout_ms: workflow_timing.default_timeout_ms,
+            default_poll_ms: workflow_timing.default_poll_ms,
+            default_step_wait_ms: workflow_timing.default_step_wait_ms,
+            decision_timeout_ms: decision_timing.timeout_ms,
+            decision_poll_ms: decision_timing.poll_ms,
+            after_activate_ms: input_timing.after_activate_ms,
+            clipboard_hold_ms: input_timing.text_ms,
+            stability_mean_threshold: ocr.change_mean_threshold,
+            stability_changed_ratio_threshold: ocr.change_pixel_threshold,
+        },
+    )
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CustomWorkflowCommand {
@@ -102,7 +126,13 @@ pub trait CustomWorkflowExecutionPort {
         accepts_text: fn(&str) -> bool,
     ) -> Result<FreshMessageOutcome>;
 
-    fn execute_operation(&mut self, workflow: &str, operation: WorkflowOperation) -> Result<()>;
+    fn execute_action_plan(
+        &mut self,
+        workflow: &str,
+        operations: Vec<WorkflowOperation>,
+    ) -> Result<()>;
+
+    fn execute_capability(&mut self, workflow: &str, capability: WorkflowCapability) -> Result<()>;
 }
 
 #[derive(Clone, Debug)]
@@ -194,9 +224,9 @@ impl CustomWorkflowService {
     ) -> Result<WorkflowCompletion> {
         let plan = self.prepare(invocation)?;
         log::info!(
-            "执行自定义流程: {} operations={}",
+            "执行自定义流程: {} steps={}",
             plan.workflow,
-            plan.operations.len()
+            plan.steps.len()
         );
         if let Some(confirmation) = &plan.confirmation {
             port.send_hall(&confirmation.message)?;
@@ -215,15 +245,28 @@ impl CustomWorkflowService {
             }
         }
 
-        let operation_count = plan.operations.len();
-        for (index, operation) in plan.operations.into_iter().enumerate() {
-            log::info!(
-                "自定义流程步骤 {}/{}: {}",
-                index + 1,
-                operation_count,
-                operation_label(&operation)
-            );
-            port.execute_operation(&plan.workflow, operation)?;
+        let step_count = plan.steps.len();
+        for (index, step) in plan.steps.into_iter().enumerate() {
+            match step {
+                WorkflowPlanStep::ActionPlan(operations) => {
+                    log::info!(
+                        "自定义流程机械段 {}/{}: operations={}",
+                        index + 1,
+                        step_count,
+                        operations.len()
+                    );
+                    port.execute_action_plan(&plan.workflow, operations)?;
+                }
+                WorkflowPlanStep::Capability(capability) => {
+                    log::info!(
+                        "自定义流程能力步骤 {}/{}: {}",
+                        index + 1,
+                        step_count,
+                        capability_label(&capability)
+                    );
+                    port.execute_capability(&plan.workflow, capability)?;
+                }
+            }
         }
         if let Some(message) = plan.success_message {
             port.send_hall(&message)?;
@@ -246,16 +289,15 @@ impl CustomWorkflowService {
         let confirmation = workflow
             .confirm_before_run
             .then(|| self.prepare_confirmation(workflow, &context));
-        let mut operations = Vec::with_capacity(workflow.steps.len().saturating_mul(2));
+        let mut steps = Vec::with_capacity(workflow.steps.len().saturating_mul(2));
         for step in &workflow.steps {
-            let operation = self.prepare_step(step, &context)?;
-            operations.push(operation);
+            steps.push(self.prepare_step(step, &context)?);
             if !step_consumes_wait(step, self.config.wait_template_absent_stable_default) {
                 let wait_ms = step.wait_ms.unwrap_or(self.defaults.default_step_wait_ms);
                 if wait_ms > 0 {
-                    operations.push(WorkflowOperation::Wait {
+                    steps.push(PreparedWorkflowStep::Mechanical(WorkflowOperation::Wait {
                         duration_ms: wait_ms,
-                    });
+                    }));
                 }
             }
         }
@@ -266,7 +308,7 @@ impl CustomWorkflowService {
         Ok(WorkflowPlan {
             workflow: invocation.command.workflow.clone(),
             confirmation,
-            operations,
+            steps: compile_plan_steps(steps),
             success_message,
         })
     }
@@ -301,47 +343,57 @@ impl CustomWorkflowService {
         &self,
         step: &CustomWorkflowStep,
         context: &WorkflowContext,
-    ) -> Result<WorkflowOperation> {
+    ) -> Result<PreparedWorkflowStep> {
         match step.step_type.trim() {
-            "sleep" | "wait" => Ok(WorkflowOperation::Wait {
+            "sleep" | "wait" => Ok(PreparedWorkflowStep::Mechanical(WorkflowOperation::Wait {
                 duration_ms: step
                     .wait_ms
                     .or(step.timeout_ms)
                     .unwrap_or(self.defaults.default_step_wait_ms),
-            }),
+            })),
             "key" | "press_key" => {
                 let key = context.render(step.key.as_deref().unwrap_or("").trim());
                 if key.trim().is_empty() {
                     bail!("custom workflow step key is empty");
                 }
-                Ok(WorkflowOperation::PressKey { key })
+                Ok(PreparedWorkflowStep::Mechanical(
+                    WorkflowOperation::PressKey { key },
+                ))
             }
             "hold_key" => {
                 let key = context.render(step.key.as_deref().unwrap_or("").trim());
                 if key.trim().is_empty() {
                     bail!("自定义流程按住按键缺少 key");
                 }
-                Ok(WorkflowOperation::HoldKey {
-                    key,
-                    duration_seconds: custom_hold_key_seconds(
-                        step,
-                        context,
-                        self.config.max_hold_key_seconds,
-                    )?,
-                })
+                Ok(PreparedWorkflowStep::Mechanical(
+                    WorkflowOperation::HoldKey {
+                        key,
+                        duration_seconds: custom_hold_key_seconds(
+                            step,
+                            context,
+                            self.config.max_hold_key_seconds,
+                        )?,
+                    },
+                ))
             }
-            "activate_game" => Ok(WorkflowOperation::ActivateGame {
-                after_activate_ms: self.defaults.after_activate_ms,
-            }),
-            "focus_game" => Ok(WorkflowOperation::FocusGame {
-                after_activate_ms: self.defaults.after_activate_ms,
-            }),
-            "click" => Ok(WorkflowOperation::ClickPoint {
-                point: step
-                    .point
-                    .ok_or_else(|| anyhow!("custom workflow click step missing point"))?
-                    .into(),
-            }),
+            "activate_game" => Ok(PreparedWorkflowStep::Mechanical(
+                WorkflowOperation::ActivateGame {
+                    after_activate_ms: self.defaults.after_activate_ms,
+                },
+            )),
+            "focus_game" => Ok(PreparedWorkflowStep::Mechanical(
+                WorkflowOperation::FocusGame {
+                    after_activate_ms: self.defaults.after_activate_ms,
+                },
+            )),
+            "click" => Ok(PreparedWorkflowStep::Mechanical(
+                WorkflowOperation::ClickPoint {
+                    point: step
+                        .point
+                        .ok_or_else(|| anyhow!("custom workflow click step missing point"))?
+                        .into(),
+                },
+            )),
             "click_template" => self.prepare_template_step(step, context, true),
             "wait_template" => self.prepare_template_step(step, context, false),
             "wait_template_absent" => self.prepare_template_absent_step(step, context),
@@ -352,11 +404,13 @@ impl CustomWorkflowService {
                     .timeout_ms
                     .or(step.wait_ms)
                     .unwrap_or(self.defaults.default_timeout_ms);
-                Ok(WorkflowOperation::WaitPixelsStable {
-                    region,
-                    poll_ms: resolved_poll_ms(step, self.defaults.default_poll_ms),
-                    stability: self.pixel_stability(timeout_ms),
-                })
+                Ok(PreparedWorkflowStep::Mechanical(
+                    WorkflowOperation::WaitPixelsStable {
+                        region,
+                        poll_ms: resolved_poll_ms(step, self.defaults.default_poll_ms),
+                        stability: self.pixel_stability(timeout_ms),
+                    },
+                ))
             }
             "click_text" => self.prepare_text_step(step, context, true),
             "wait_text" => self.prepare_text_step(step, context, false),
@@ -365,24 +419,30 @@ impl CustomWorkflowService {
                 if text.is_empty() {
                     bail!("custom workflow paste step missing text");
                 }
-                Ok(WorkflowOperation::PasteText {
-                    text,
-                    clipboard_hold_ms: self.defaults.clipboard_hold_ms,
-                })
+                Ok(PreparedWorkflowStep::Mechanical(
+                    WorkflowOperation::PasteText {
+                        text,
+                        clipboard_hold_ms: self.defaults.clipboard_hold_ms,
+                    },
+                ))
             }
             "send_chat" | "reply" => {
                 let message = custom_step_message(step, context);
                 if message.is_empty() {
                     bail!("custom workflow send_chat step missing message");
                 }
-                Ok(WorkflowOperation::SendHall { message })
+                Ok(PreparedWorkflowStep::Capability(
+                    WorkflowCapability::SendHall { message },
+                ))
             }
             "send_current_chat" => {
                 let message = custom_step_message(step, context);
                 if message.is_empty() {
                     bail!("custom workflow send_current_chat step missing message");
                 }
-                Ok(WorkflowOperation::SendCurrentChat { message })
+                Ok(PreparedWorkflowStep::Capability(
+                    WorkflowCapability::SendCurrentChat { message },
+                ))
             }
             "send_friend_message" | "friend_reply" => {
                 let message = custom_step_message(step, context);
@@ -393,21 +453,29 @@ impl CustomWorkflowService {
                 if target.is_empty() {
                     bail!("custom workflow send_friend_message step missing target");
                 }
-                Ok(WorkflowOperation::SendFriendMessage { target, message })
+                Ok(PreparedWorkflowStep::Capability(
+                    WorkflowCapability::SendFriendMessage { target, message },
+                ))
             }
             "invite_user" | "invite_current_user" => {
                 let target = custom_step_target(step, context);
                 if target.is_empty() {
                     bail!("custom workflow invite step missing target");
                 }
-                Ok(WorkflowOperation::InviteUser { target })
+                Ok(PreparedWorkflowStep::Capability(
+                    WorkflowCapability::InviteUser { target },
+                ))
             }
-            "return_primary" | "ensure_primary" => Ok(WorkflowOperation::EnsureResidency {
-                target: WorkflowResidency::Primary,
-            }),
-            "ensure_current_hall" => Ok(WorkflowOperation::EnsureResidency {
-                target: WorkflowResidency::SecondaryCurrentHall,
-            }),
+            "return_primary" | "ensure_primary" => Ok(PreparedWorkflowStep::Capability(
+                WorkflowCapability::EnsureResidency {
+                    target: WorkflowResidency::Primary,
+                },
+            )),
+            "ensure_current_hall" => Ok(PreparedWorkflowStep::Capability(
+                WorkflowCapability::EnsureResidency {
+                    target: WorkflowResidency::SecondaryCurrentHall,
+                },
+            )),
             other => bail!("unsupported custom workflow step type: {}", other),
         }
     }
@@ -417,29 +485,33 @@ impl CustomWorkflowService {
         step: &CustomWorkflowStep,
         context: &WorkflowContext,
         click: bool,
-    ) -> Result<WorkflowOperation> {
+    ) -> Result<PreparedWorkflowStep> {
         let template = self.resolve_template(step, context)?;
         let region = required_region(step, "custom workflow template step missing region")?;
         let threshold = step.threshold.unwrap_or(self.config.default_threshold);
         let timeout_ms = step.timeout_ms.unwrap_or(self.defaults.default_timeout_ms);
         let poll_ms = resolved_poll_ms(step, self.defaults.default_poll_ms);
         if click {
-            Ok(WorkflowOperation::ClickTemplate {
-                template,
-                region,
-                threshold,
-                timeout_ms,
-                poll_ms,
-                offset: step.click_offset.unwrap_or(PointConfig::new(0, 0)).into(),
-            })
+            Ok(PreparedWorkflowStep::Mechanical(
+                WorkflowOperation::ClickTemplate {
+                    template,
+                    region,
+                    threshold,
+                    timeout_ms,
+                    poll_ms,
+                    offset: step.click_offset.unwrap_or(PointConfig::new(0, 0)).into(),
+                },
+            ))
         } else {
-            Ok(WorkflowOperation::WaitTemplate {
-                template,
-                region,
-                threshold,
-                timeout_ms,
-                poll_ms,
-            })
+            Ok(PreparedWorkflowStep::Mechanical(
+                WorkflowOperation::WaitTemplate {
+                    template,
+                    region,
+                    threshold,
+                    timeout_ms,
+                    poll_ms,
+                },
+            ))
         }
     }
 
@@ -447,7 +519,7 @@ impl CustomWorkflowService {
         &self,
         step: &CustomWorkflowStep,
         context: &WorkflowContext,
-    ) -> Result<WorkflowOperation> {
+    ) -> Result<PreparedWorkflowStep> {
         let template = self.resolve_template(step, context)?;
         let region = required_region(step, "custom workflow template step missing region")?;
         let poll_ms = resolved_poll_ms(step, self.defaults.default_poll_ms);
@@ -461,14 +533,16 @@ impl CustomWorkflowService {
                     .max(poll_ms),
             )
         });
-        Ok(WorkflowOperation::WaitTemplateAbsent {
-            template,
-            region,
-            threshold: step.threshold.unwrap_or(self.config.default_threshold),
-            timeout_ms: step.timeout_ms.unwrap_or(self.defaults.default_timeout_ms),
-            poll_ms,
-            stability,
-        })
+        Ok(PreparedWorkflowStep::Mechanical(
+            WorkflowOperation::WaitTemplateAbsent {
+                template,
+                region,
+                threshold: step.threshold.unwrap_or(self.config.default_threshold),
+                timeout_ms: step.timeout_ms.unwrap_or(self.defaults.default_timeout_ms),
+                poll_ms,
+                stability,
+            },
+        ))
     }
 
     fn prepare_text_step(
@@ -476,7 +550,7 @@ impl CustomWorkflowService {
         step: &CustomWorkflowStep,
         context: &WorkflowContext,
         click: bool,
-    ) -> Result<WorkflowOperation> {
+    ) -> Result<PreparedWorkflowStep> {
         let expected = custom_step_text(step, context);
         if expected.is_empty() {
             bail!("custom workflow text step missing text");
@@ -485,20 +559,24 @@ impl CustomWorkflowService {
         let timeout_ms = step.timeout_ms.unwrap_or(self.defaults.default_timeout_ms);
         let poll_ms = resolved_poll_ms(step, self.defaults.default_poll_ms);
         if click {
-            Ok(WorkflowOperation::ClickText {
-                expected,
-                region,
-                timeout_ms,
-                poll_ms,
-                offset: step.click_offset.unwrap_or(PointConfig::new(0, 0)).into(),
-            })
+            Ok(PreparedWorkflowStep::Mechanical(
+                WorkflowOperation::ClickText {
+                    expected,
+                    region,
+                    timeout_ms,
+                    poll_ms,
+                    offset: step.click_offset.unwrap_or(PointConfig::new(0, 0)).into(),
+                },
+            ))
         } else {
-            Ok(WorkflowOperation::WaitText {
-                expected,
-                region,
-                timeout_ms,
-                poll_ms,
-            })
+            Ok(PreparedWorkflowStep::Mechanical(
+                WorkflowOperation::WaitText {
+                    expected,
+                    region,
+                    timeout_ms,
+                    poll_ms,
+                },
+            ))
         }
     }
 
@@ -524,8 +602,42 @@ impl CustomWorkflowService {
 struct WorkflowPlan {
     workflow: String,
     confirmation: Option<WorkflowConfirmation>,
-    operations: Vec<WorkflowOperation>,
+    steps: Vec<WorkflowPlanStep>,
     success_message: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum PreparedWorkflowStep {
+    Mechanical(WorkflowOperation),
+    Capability(WorkflowCapability),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum WorkflowPlanStep {
+    ActionPlan(Vec<WorkflowOperation>),
+    Capability(WorkflowCapability),
+}
+
+fn compile_plan_steps(steps: Vec<PreparedWorkflowStep>) -> Vec<WorkflowPlanStep> {
+    let mut compiled = Vec::new();
+    let mut operations = Vec::new();
+    for step in steps {
+        match step {
+            PreparedWorkflowStep::Mechanical(operation) => operations.push(operation),
+            PreparedWorkflowStep::Capability(capability) => {
+                if !operations.is_empty() {
+                    compiled.push(WorkflowPlanStep::ActionPlan(std::mem::take(
+                        &mut operations,
+                    )));
+                }
+                compiled.push(WorkflowPlanStep::Capability(capability));
+            }
+        }
+    }
+    if !operations.is_empty() {
+        compiled.push(WorkflowPlanStep::ActionPlan(operations));
+    }
+    compiled
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -703,28 +815,22 @@ pub enum WorkflowOperation {
         text: String,
         clipboard_hold_ms: u64,
     },
-    SendHall {
-        message: String,
-    },
-    SendCurrentChat {
-        message: String,
-    },
-    SendFriendMessage {
-        target: String,
-        message: String,
-    },
-    InviteUser {
-        target: String,
-    },
-    EnsureResidency {
-        target: WorkflowResidency,
-    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum WorkflowCapability {
+    SendHall { message: String },
+    SendCurrentChat { message: String },
+    SendFriendMessage { target: String, message: String },
+    InviteUser { target: String },
+    EnsureResidency { target: WorkflowResidency },
 }
 
 fn is_confirmation_message(text: &str) -> bool {
     parse_confirmation(text).is_some()
 }
 
+#[cfg(test)]
 fn operation_label(operation: &WorkflowOperation) -> &'static str {
     match operation {
         WorkflowOperation::Wait { .. } => "wait",
@@ -740,14 +846,19 @@ fn operation_label(operation: &WorkflowOperation) -> &'static str {
         WorkflowOperation::WaitText { .. } => "wait_text",
         WorkflowOperation::ClickText { .. } => "click_text",
         WorkflowOperation::PasteText { .. } => "paste_text",
-        WorkflowOperation::SendHall { .. } => "send_chat",
-        WorkflowOperation::SendCurrentChat { .. } => "send_current_chat",
-        WorkflowOperation::SendFriendMessage { .. } => "send_friend_message",
-        WorkflowOperation::InviteUser { .. } => "invite_user",
-        WorkflowOperation::EnsureResidency {
+    }
+}
+
+fn capability_label(capability: &WorkflowCapability) -> &'static str {
+    match capability {
+        WorkflowCapability::SendHall { .. } => "send_chat",
+        WorkflowCapability::SendCurrentChat { .. } => "send_current_chat",
+        WorkflowCapability::SendFriendMessage { .. } => "send_friend_message",
+        WorkflowCapability::InviteUser { .. } => "invite_user",
+        WorkflowCapability::EnsureResidency {
             target: WorkflowResidency::Primary,
         } => "ensure_primary",
-        WorkflowOperation::EnsureResidency {
+        WorkflowCapability::EnsureResidency {
             target: WorkflowResidency::SecondaryCurrentHall,
         } => "ensure_current_hall",
     }
@@ -1143,14 +1254,30 @@ mod tests {
             Ok(self.confirmation.clone())
         }
 
-        fn execute_operation(
+        fn execute_action_plan(
             &mut self,
             workflow: &str,
-            operation: WorkflowOperation,
+            operations: Vec<WorkflowOperation>,
         ) -> Result<()> {
             self.events.push(format!(
-                "operation:{workflow}:{}",
-                operation_label(&operation)
+                "action-plan:{workflow}:{}",
+                operations
+                    .iter()
+                    .map(operation_label)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+            Ok(())
+        }
+
+        fn execute_capability(
+            &mut self,
+            workflow: &str,
+            capability: WorkflowCapability,
+        ) -> Result<()> {
+            self.events.push(format!(
+                "capability:{workflow}:{}",
+                capability_label(&capability)
             ));
             Ok(())
         }
@@ -1231,8 +1358,7 @@ mod tests {
         }
     }
 
-    fn prepared_operation(kind: &str) -> WorkflowOperation {
-        let mut workflow = workflow();
+    fn prepared_step(kind: &str) -> PreparedWorkflowStep {
         let mut value = step(kind);
         match kind {
             "sleep" | "wait" => value.wait_ms = Some(10),
@@ -1277,12 +1403,17 @@ mod tests {
             }
             _ => {}
         }
-        workflow.steps = vec![value];
-        CustomWorkflowService::new(config(workflow), defaults())
-            .prepare(&invocation("3"))
+        let service = CustomWorkflowService::new(config(workflow()), defaults());
+        service
+            .prepare_step(&value, &WorkflowContext::new(&invocation("3")))
             .unwrap()
-            .operations
-            .remove(0)
+    }
+
+    fn only_action_plan(plan: &WorkflowPlan) -> &[WorkflowOperation] {
+        match plan.steps.as_slice() {
+            [WorkflowPlanStep::ActionPlan(operations)] => operations,
+            steps => panic!("expected one action plan, got {steps:?}"),
+        }
     }
 
     #[test]
@@ -1302,8 +1433,7 @@ mod tests {
             [
                 "send:确认 用户",
                 "wait:20000:2000",
-                "operation:example:press_key",
-                "operation:example:wait",
+                "action-plan:example:press_key,wait",
                 "send:完成 3",
             ]
         );
@@ -1360,6 +1490,38 @@ mod tests {
 
         assert!(service.execute(&invocation(""), &mut port).is_err());
         assert!(port.events.is_empty());
+    }
+
+    #[test]
+    fn execute_groups_mechanical_steps_and_splits_them_at_typed_capabilities() {
+        let mut value = workflow();
+        let mut click = step("click");
+        click.point = Some(PointConfig::new(1, 2));
+        let mut friend = step("send_friend_message");
+        friend.target = Some("好友".to_string());
+        friend.message = Some("消息".to_string());
+        let mut paste = step("paste");
+        paste.text = Some("文本".to_string());
+        let mut invite = step("invite_user");
+        invite.target = Some("好友".to_string());
+        value.steps = vec![step("key"), click, friend, paste, invite];
+        let service = CustomWorkflowService::new(config(value), defaults());
+        let mut port = RecordingPort::new(FreshMessageOutcome::Stopped);
+
+        assert_eq!(
+            service.execute(&invocation(""), &mut port).unwrap(),
+            WorkflowCompletion::Completed
+        );
+        assert_eq!(
+            port.events,
+            [
+                "action-plan:example:press_key,wait,click,wait",
+                "capability:example:send_friend_message",
+                "action-plan:example:wait,paste_text,wait",
+                "capability:example:invite_user",
+                "action-plan:example:wait",
+            ]
+        );
     }
 
     #[test]
@@ -1530,7 +1692,7 @@ mod tests {
             ("invite_user", "invite_current_user"),
             ("return_primary", "ensure_primary"),
         ] {
-            assert_eq!(prepared_operation(left), prepared_operation(right));
+            assert_eq!(prepared_step(left), prepared_step(right));
         }
 
         for kind in [
@@ -1546,7 +1708,7 @@ mod tests {
             "send_current_chat",
             "ensure_current_hall",
         ] {
-            let _ = prepared_operation(kind);
+            let _ = prepared_step(kind);
         }
     }
 
@@ -1567,9 +1729,10 @@ mod tests {
             .prepare(&invocation(""))
             .unwrap();
 
-        assert_eq!(plan.operations.len(), 2);
+        let operations = only_action_plan(&plan);
+        assert_eq!(operations.len(), 2);
         assert!(matches!(
-            &plan.operations[0],
+            &operations[0],
             WorkflowOperation::ClickTemplate {
                 template,
                 threshold,
@@ -1578,10 +1741,7 @@ mod tests {
                 ..
             } if template == &PathBuf::from("assets/button.png") && *threshold == 0.9
         ));
-        assert_eq!(
-            plan.operations[1],
-            WorkflowOperation::Wait { duration_ms: 75 }
-        );
+        assert_eq!(operations[1], WorkflowOperation::Wait { duration_ms: 75 });
     }
 
     #[test]
@@ -1605,9 +1765,10 @@ mod tests {
         };
 
         let stable = make_plan(true);
-        assert_eq!(stable.operations.len(), 1);
+        let stable_operations = only_action_plan(&stable);
+        assert_eq!(stable_operations.len(), 1);
         assert!(matches!(
-            &stable.operations[0],
+            &stable_operations[0],
             WorkflowOperation::WaitTemplateAbsent {
                 stability: Some(WorkflowPixelStability { timeout_ms: 80, .. }),
                 ..
@@ -1615,16 +1776,17 @@ mod tests {
         ));
 
         let not_stable = make_plan(false);
-        assert_eq!(not_stable.operations.len(), 2);
+        let not_stable_operations = only_action_plan(&not_stable);
+        assert_eq!(not_stable_operations.len(), 2);
         assert!(matches!(
-            &not_stable.operations[0],
+            &not_stable_operations[0],
             WorkflowOperation::WaitTemplateAbsent {
                 stability: None,
                 ..
             }
         ));
         assert_eq!(
-            not_stable.operations[1],
+            not_stable_operations[1],
             WorkflowOperation::Wait { duration_ms: 80 }
         );
     }
@@ -1642,8 +1804,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            plan.operations,
-            vec![WorkflowOperation::HoldKey {
+            only_action_plan(&plan),
+            [WorkflowOperation::HoldKey {
                 key: "测试流程".to_string(),
                 duration_seconds: 7,
             }]
@@ -1661,14 +1823,17 @@ mod tests {
             .prepare(&invocation(""))
             .unwrap();
 
-        assert!(matches!(
-            &plan.operations[0],
-            WorkflowOperation::SendFriendMessage { target, message }
-                if target == "用户" && message == "你好 用户"
-        ));
-        assert!(plan.operations.iter().any(|operation| matches!(
-            operation,
-            WorkflowOperation::InviteUser { target } if target == "用户"
+        assert!(plan.steps.iter().any(|step| matches!(
+            step,
+            WorkflowPlanStep::Capability(WorkflowCapability::SendFriendMessage {
+                target,
+                message,
+            }) if target == "用户" && message == "你好 用户"
+        )));
+        assert!(plan.steps.iter().any(|step| matches!(
+            step,
+            WorkflowPlanStep::Capability(WorkflowCapability::InviteUser { target })
+                if target == "用户"
         )));
     }
 

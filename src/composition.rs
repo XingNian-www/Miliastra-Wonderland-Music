@@ -3,14 +3,16 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use crate::app::AutomationApp;
-use crate::app::logger;
-use crate::app::monitor::MonitorShared;
-use crate::app::queue::PersistentQueue;
-use crate::app::runtime_state::PersistentRuntimeState;
-use crate::app::song_dedup::PersistentSongDedupHistory;
-use crate::app::tui::TuiHandle;
+use crate::adapters::logging;
 use crate::config::AppConfig;
+use crate::features::playback::{
+    PersistentQueue, PersistentRuntimeState, PersistentSongDedupHistory,
+};
+use crate::interfaces::tui::TuiHandle;
+use crate::runtime::monitor::MonitorShared;
+
+pub(crate) mod application;
+use application::ApplicationRuntime;
 
 pub(crate) fn run(config_path: &Path) -> Result<()> {
     let config = AppConfig::load(config_path)?;
@@ -30,7 +32,7 @@ pub(crate) fn run(config_path: &Path) -> Result<()> {
     } else {
         None
     };
-    let log_paths = logger::init(
+    let log_paths = logging::init(
         &config.logging,
         Some(monitor.log_sink()),
         tui_handle.is_none(),
@@ -65,7 +67,7 @@ pub(crate) fn run(config_path: &Path) -> Result<()> {
         runtime_state.state().playback.state
     );
 
-    let mut app = AutomationApp::new(
+    let mut app = ApplicationRuntime::new(
         config,
         runtime_state,
         queue,

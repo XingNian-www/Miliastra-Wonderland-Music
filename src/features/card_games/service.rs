@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::time::Instant;
 
 use anyhow::{Result, anyhow, bail};
@@ -7,7 +7,10 @@ use super::{
     CardGameDeadlineKind, LandlordCommand, LandlordConfig, LandlordGame, LandlordOutcome,
     LandlordPrivateDelivery,
 };
-use crate::features::entertainment::{AcquireOutcome, EntertainmentCoordinator, EntertainmentKind};
+use crate::features::entertainment::{AcquireOutcome, EntertainmentKind, EntertainmentState};
+use crate::features::friend_delivery::{
+    FriendBatchFailure, FriendBatchFailureKind, FriendBatchOutcome, FriendMessage,
+};
 use crate::runtime::identity::{BusinessOperationId, SessionGeneration};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,9 +39,20 @@ pub enum CardGameEffectLane {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CardGameEffect {
-    FriendVerify { player: String, message: String },
-    PrivateDelivery { player: String, message: String },
-    HallDelivery { message: String },
+    FriendVerify {
+        player: String,
+        message: String,
+    },
+    PrivateDelivery {
+        player: String,
+        message: String,
+    },
+    PrivateBatch {
+        deliveries: Vec<LandlordPrivateDelivery>,
+    },
+    HallDelivery {
+        message: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -52,6 +66,7 @@ pub struct CardGameEffectRequest {
 pub enum CardGameEffectResult {
     FriendVerify(Result<bool>),
     PrivateDelivery(Result<bool>),
+    PrivateBatch(Result<FriendBatchOutcome>),
     HallDelivery(Result<()>),
 }
 
@@ -129,6 +144,10 @@ pub struct CardGameStartReservation {
 pub trait CardGameDeliveryPort {
     fn verify_friend(&self, player: &str, message: &str) -> Result<bool>;
     fn send_friend(&self, player: &str, message: &str) -> Result<bool>;
+    fn send_friend_batch(
+        &self,
+        deliveries: &[LandlordPrivateDelivery],
+    ) -> Result<FriendBatchOutcome>;
     fn send_hall(&self, message: &str) -> Result<()>;
 }
 
@@ -145,6 +164,23 @@ struct CardGameState {
     next_operation_id: u64,
     session_generation: SessionGeneration,
     pending_effects: BTreeMap<BusinessOperationId, PendingEffectState>,
+    pending_retry: Option<PendingCardGameRetry>,
+}
+
+#[derive(Clone)]
+struct PrivateDeliveryContinuation {
+    public_reply: Option<String>,
+    action: &'static str,
+    lane: CardGameEffectLane,
+    release_on_completion: bool,
+}
+
+#[derive(Clone)]
+struct PendingCardGameRetry {
+    session_generation: SessionGeneration,
+    deliveries: Vec<LandlordPrivateDelivery>,
+    continuation: PrivateDeliveryContinuation,
+    failure: FriendBatchFailure,
 }
 
 struct PendingEffectState {
@@ -166,12 +202,7 @@ enum PendingCardGameEffect {
         now: Instant,
     },
     DeliverOutcomePrivate {
-        player: String,
-        remaining: VecDeque<LandlordPrivateDelivery>,
-        public_reply: Option<String>,
-        action: &'static str,
-        lane: CardGameEffectLane,
-        release_on_completion: bool,
+        continuation: PrivateDeliveryContinuation,
     },
     DeliverHand {
         player: String,
@@ -195,7 +226,7 @@ impl PendingCardGameEffect {
                 CardGameEffectResult::FriendVerify(_)
             ) | (
                 Self::DeliverOutcomePrivate { .. },
-                CardGameEffectResult::PrivateDelivery(_)
+                CardGameEffectResult::PrivateBatch(_)
             ) | (
                 Self::DeliverHand { .. },
                 CardGameEffectResult::PrivateDelivery(_)
@@ -204,42 +235,31 @@ impl PendingCardGameEffect {
     }
 
     fn continues_after(&self, result: &CardGameEffectResult) -> bool {
-        match (self, result) {
-            (
-                Self::VerifyStart { .. } | Self::VerifyJoin { .. },
-                CardGameEffectResult::FriendVerify(Ok(_)),
-            ) => true,
-            (
-                Self::DeliverOutcomePrivate {
-                    remaining,
-                    public_reply,
-                    ..
-                },
-                CardGameEffectResult::PrivateDelivery(Ok(true)),
-            ) => !remaining.is_empty() || public_reply.is_some(),
-            _ => false,
-        }
-    }
-
-    fn aborts_after(&self, result: &CardGameEffectResult) -> bool {
         matches!(
             (self, result),
             (
+                Self::VerifyStart { .. } | Self::VerifyJoin { .. },
+                CardGameEffectResult::FriendVerify(Ok(_)),
+            ) | (
                 Self::DeliverOutcomePrivate { .. },
-                CardGameEffectResult::PrivateDelivery(Ok(false) | Err(_))
+                CardGameEffectResult::PrivateBatch(_)
             )
         )
+    }
+
+    fn aborts_after(&self, result: &CardGameEffectResult) -> bool {
+        let _ = result;
+        false
     }
 }
 
 pub struct CardGameService {
     state: CardGameState,
-    entertainment: EntertainmentCoordinator,
     enabled: bool,
 }
 
 impl CardGameService {
-    pub fn new(config: LandlordConfig, entertainment: EntertainmentCoordinator) -> Self {
+    pub fn new(config: LandlordConfig) -> Self {
         let enabled = config.enabled;
         Self {
             state: CardGameState {
@@ -249,27 +269,41 @@ impl CardGameService {
                 next_operation_id: 1,
                 session_generation: SessionGeneration::INITIAL,
                 pending_effects: BTreeMap::new(),
+                pending_retry: None,
             },
-            entertainment,
             enabled,
         }
     }
 
     pub fn begin_command(
         &mut self,
+        entertainment: &mut EntertainmentState,
         player: &str,
         command: &LandlordCommand,
         now: Instant,
     ) -> Result<CardGameCommandStart> {
+        if matches!(command, LandlordCommand::Retry) {
+            return self.begin_retry_delivery();
+        }
+        if self.private_delivery_is_pending() {
+            if matches!(command, LandlordCommand::Exit) {
+                self.abort(entertainment)?;
+                return self.begin_hall_reply("delivery-cancelled", "牌局已结束");
+            }
+            return self.begin_hall_reply(
+                "delivery-waiting",
+                "牌局私聊投递尚未完成，请使用#重试或#结束",
+            );
+        }
         let (start, release_now) = {
             ensure_operation_capacity(&self.state)?;
             match command {
-                LandlordCommand::Start | LandlordCommand::RunFastStart => {
-                    (self.begin_start_in_state(player, command, now)?, false)
-                }
+                LandlordCommand::Start | LandlordCommand::RunFastStart => (
+                    self.begin_start_in_state(entertainment, player, command, now)?,
+                    false,
+                ),
                 LandlordCommand::Join => {
-                    let kind = self
-                        .entertainment
+                    let kind = entertainment
                         .active()
                         .filter(|kind| is_card_game_kind(*kind));
                     if let Some(kind) = kind.filter(|_| {
@@ -293,6 +327,7 @@ impl CardGameService {
                         (CardGameCommandStart::Suspended(request), false)
                     } else {
                         self.begin_game_outcome_in_state(
+                            entertainment,
                             player,
                             command,
                             now,
@@ -303,7 +338,7 @@ impl CardGameService {
                 LandlordCommand::Hand => {
                     if let Err(error) = ensure_generation_capacity(&self.state) {
                         clear_session_without_generation(&mut self.state);
-                        self.release_active_card_game();
+                        Self::release_active_card_game(entertainment);
                         return Err(error);
                     }
                     let outcome = self.state.game.handle(player, command, now);
@@ -335,18 +370,86 @@ impl CardGameService {
                     } else {
                         CardGameEffectLane::Deferred
                     };
-                    self.begin_game_outcome_in_state(player, command, now, lane)?
+                    self.begin_game_outcome_in_state(entertainment, player, command, now, lane)?
                 }
             }
         };
         if release_now {
-            self.release_active_card_game();
+            Self::release_active_card_game(entertainment);
         }
         Ok(start)
     }
 
+    fn private_delivery_is_pending(&self) -> bool {
+        self.state.pending_retry.is_some()
+            || self.state.pending_effects.values().any(|pending| {
+                matches!(
+                    pending.effect,
+                    PendingCardGameEffect::DeliverOutcomePrivate { .. }
+                )
+            })
+    }
+
+    fn begin_retry_delivery(&mut self) -> Result<CardGameCommandStart> {
+        let Some(retry) = self.state.pending_retry.take() else {
+            return self.begin_hall_reply("retry-unavailable", "当前没有待重试的私聊投递");
+        };
+        if retry.session_generation != self.state.session_generation {
+            return self.begin_hall_reply("retry-expired", "待重试投递已失效");
+        }
+        if retry.deliveries.is_empty() {
+            let reason = retry.failure.reason().to_string();
+            self.state.pending_retry = Some(retry);
+            return self.begin_hall_reply(
+                "retry-unsafe",
+                format!("私聊投递结果未知，不能重试，请#结束：{reason}"),
+            );
+        }
+        let deliveries = retry.deliveries.clone();
+        let result = suspend_effect(
+            &mut self.state,
+            retry.session_generation,
+            CardGameEffectLane::Formal,
+            CardGameEffect::PrivateBatch {
+                deliveries: deliveries.clone(),
+            },
+            PendingCardGameEffect::DeliverOutcomePrivate {
+                continuation: retry.continuation.clone(),
+            },
+        );
+        match result {
+            Ok(request) => Ok(CardGameCommandStart::Suspended(request)),
+            Err(error) => {
+                self.state.pending_retry = Some(retry);
+                Err(error)
+            }
+        }
+    }
+
+    fn begin_hall_reply(
+        &mut self,
+        action: &'static str,
+        message: impl Into<String>,
+    ) -> Result<CardGameCommandStart> {
+        let generation = self.state.session_generation;
+        suspend_effect(
+            &mut self.state,
+            generation,
+            CardGameEffectLane::Formal,
+            CardGameEffect::HallDelivery {
+                message: message.into(),
+            },
+            PendingCardGameEffect::Hall {
+                action,
+                release_on_completion: false,
+            },
+        )
+        .map(CardGameCommandStart::Suspended)
+    }
+
     fn begin_start_in_state(
         &mut self,
+        entertainment: &mut EntertainmentState,
         player: &str,
         command: &LandlordCommand,
         now: Instant,
@@ -359,10 +462,11 @@ impl CardGameService {
             Some("已有牌局或房间进行中".to_string())
         } else {
             let next_generation = next_start_generation(&self.state)?;
-            match self.entertainment.try_acquire(kind)? {
+            match entertainment.try_acquire(kind)? {
                 AcquireOutcome::Acquired => {
                     self.state.session_generation = next_generation;
                     self.state.pending_effects.clear();
+                    self.state.pending_retry = None;
                     let reservation = CardGameStartReservation {
                         token: self.state.next_reservation_token,
                         kind,
@@ -414,13 +518,14 @@ impl CardGameService {
 
     fn begin_game_outcome_in_state(
         &mut self,
+        entertainment: &mut EntertainmentState,
         player: &str,
         command: &LandlordCommand,
         now: Instant,
         lane: CardGameEffectLane,
     ) -> Result<(CardGameCommandStart, bool)> {
         let outcome = if command.reports_entertainment_conflict()
-            && let Some(active) = self.entertainment.active()
+            && let Some(active) = entertainment.active()
             && !is_card_game_kind(active)
         {
             LandlordOutcome::public(
@@ -430,7 +535,7 @@ impl CardGameService {
         } else {
             if let Err(error) = ensure_generation_capacity(&self.state) {
                 clear_session_without_generation(&mut self.state);
-                self.release_active_card_game();
+                Self::release_active_card_game(entertainment);
                 return Err(error);
             }
             self.state.game.handle(player, command, now)
@@ -448,6 +553,7 @@ impl CardGameService {
 
     pub fn resume(
         &mut self,
+        entertainment: &mut EntertainmentState,
         key: CardGameEffectKey,
         result: CardGameEffectResult,
     ) -> Result<CardGameResume> {
@@ -471,12 +577,12 @@ impl CardGameService {
         let aborts = pending_state.effect.aborts_after(&result);
         if continues && let Err(error) = ensure_operation_capacity(&self.state) {
             clear_session_without_generation(&mut self.state);
-            self.release_active_card_game();
+            Self::release_active_card_game(entertainment);
             return Err(error);
         }
         if aborts && let Err(error) = ensure_generation_capacity(&self.state) {
             clear_session_without_generation(&mut self.state);
-            self.release_active_card_game();
+            Self::release_active_card_game(entertainment);
             return Err(error);
         }
         let pending = self
@@ -506,7 +612,7 @@ impl CardGameService {
                     self.state.pending_start = None;
                     let outcome = self.state.game.handle(&player, &command, now);
                     if outcome.action != "created" {
-                        self.entertainment.release(kind);
+                        entertainment.release(kind);
                     }
                     Self::begin_outcome_resume_in_state(
                         &mut self.state,
@@ -518,7 +624,7 @@ impl CardGameService {
                 Ok(false) => {
                     if self.state.pending_start == Some(reservation) {
                         self.state.pending_start = None;
-                        self.entertainment.release(reservation.kind);
+                        entertainment.release(reservation.kind);
                     }
                     suspend_effect(
                         &mut self.state,
@@ -540,7 +646,7 @@ impl CardGameService {
                 Err(error) => {
                     if self.state.pending_start == Some(reservation) {
                         self.state.pending_start = None;
-                        self.entertainment.release(reservation.kind);
+                        entertainment.release(reservation.kind);
                     }
                     Err(error)
                 }
@@ -567,7 +673,7 @@ impl CardGameService {
                     let outcome = self.state.game.handle(&player, &LandlordCommand::Join, now);
                     if outcome.ended {
                         advance_session_generation(&mut self.state)?;
-                        self.entertainment.release(kind);
+                        entertainment.release(kind);
                     }
                     let generation = self.state.session_generation;
                     Self::begin_outcome_resume_in_state(
@@ -593,41 +699,39 @@ impl CardGameService {
                 Err(error) => Err(error),
             },
             (
-                PendingCardGameEffect::DeliverOutcomePrivate {
-                    player,
-                    remaining,
-                    public_reply,
-                    action,
-                    lane,
-                    release_on_completion,
-                },
-                CardGameEffectResult::PrivateDelivery(result),
+                PendingCardGameEffect::DeliverOutcomePrivate { continuation },
+                CardGameEffectResult::PrivateBatch(result),
             ) => match result {
-                Ok(true) => {
+                Ok(FriendBatchOutcome::Complete) => {
+                    self.state.pending_retry = None;
                     let resumed = Self::continue_outcome_delivery_in_state(
                         &mut self.state,
                         key.session_generation,
-                        remaining,
-                        public_reply,
-                        action,
-                        lane,
-                        release_on_completion,
+                        continuation.clone(),
                     )?;
-                    if release_on_completion && matches!(resumed, CardGameResume::Completed(_)) {
-                        self.release_active_card_game();
+                    if continuation.release_on_completion
+                        && matches!(resumed, CardGameResume::Completed(_))
+                    {
+                        Self::release_active_card_game(entertainment);
                     }
                     Ok(resumed)
                 }
-                Ok(false) => {
-                    abort_state(&mut self.state)?;
-                    self.release_active_card_game();
-                    bail!("牌局发牌失败：好友列表未找到 {}", player)
-                }
-                Err(error) => {
-                    abort_state(&mut self.state)?;
-                    self.release_active_card_game();
-                    Err(error)
-                }
+                Ok(FriendBatchOutcome::Failed { retryable, failure }) => self
+                    .pause_private_delivery(
+                        key.session_generation,
+                        retryable,
+                        continuation,
+                        failure,
+                    ),
+                Err(error) => self.pause_private_delivery(
+                    key.session_generation,
+                    Vec::new(),
+                    continuation,
+                    FriendBatchFailure::new(
+                        FriendBatchFailureKind::ResultUnknown,
+                        format!("牌局私聊投递执行异常: {error:#}"),
+                    ),
+                ),
             },
             (
                 PendingCardGameEffect::Hall {
@@ -637,7 +741,7 @@ impl CardGameService {
                 CardGameEffectResult::HallDelivery(result),
             ) => {
                 if release_on_completion {
-                    self.release_active_card_game();
+                    Self::release_active_card_game(entertainment);
                 }
                 result?;
                 Ok(CardGameResume::Completed(CardGameCompletion { action }))
@@ -646,7 +750,62 @@ impl CardGameService {
         }
     }
 
-    pub fn cancel(&mut self, key: CardGameEffectKey) -> Result<CardGameCancel> {
+    fn pause_private_delivery(
+        &mut self,
+        session_generation: SessionGeneration,
+        retryable: Vec<FriendMessage>,
+        continuation: PrivateDeliveryContinuation,
+        failure: FriendBatchFailure,
+    ) -> Result<CardGameResume> {
+        let deliveries = retryable
+            .into_iter()
+            .map(|message| LandlordPrivateDelivery {
+                player: message.recipient().to_string(),
+                message: message.message().to_string(),
+            })
+            .collect::<Vec<_>>();
+        log::error!(
+            "牌局私聊投递暂停: retryable={} kind={:?} reason={}",
+            deliveries.len(),
+            failure.kind(),
+            failure.reason()
+        );
+        let message = if deliveries.is_empty() {
+            match failure.kind() {
+                FriendBatchFailureKind::ResultUnknown => "牌局私聊投递结果未知，不能重试，请#结束",
+                FriendBatchFailureKind::ConfirmedUnsent => {
+                    "牌局私聊投递失败且没有安全剩余项，请#结束"
+                }
+            }
+        } else {
+            "牌局私聊投递未完成，请#重试或#结束"
+        };
+        self.state.pending_retry = Some(PendingCardGameRetry {
+            session_generation,
+            deliveries,
+            continuation,
+            failure,
+        });
+        suspend_effect(
+            &mut self.state,
+            session_generation,
+            CardGameEffectLane::Formal,
+            CardGameEffect::HallDelivery {
+                message: message.to_string(),
+            },
+            PendingCardGameEffect::Hall {
+                action: "private-delivery-paused",
+                release_on_completion: false,
+            },
+        )
+        .map(CardGameResume::Suspended)
+    }
+
+    pub fn cancel(
+        &mut self,
+        entertainment: &mut EntertainmentState,
+        key: CardGameEffectKey,
+    ) -> Result<CardGameCancel> {
         let Some(pending_state) = self.state.pending_effects.get(&key.operation_id) else {
             return Ok(CardGameCancel::Late(CardGameLateResult { key }));
         };
@@ -666,7 +825,7 @@ impl CardGameService {
         ) && let Err(error) = ensure_generation_capacity(&self.state)
         {
             clear_session_without_generation(&mut self.state);
-            self.release_active_card_game();
+            Self::release_active_card_game(entertainment);
             return Err(error);
         }
         let pending = self
@@ -679,14 +838,14 @@ impl CardGameService {
             PendingCardGameEffect::VerifyStart { reservation, .. } => {
                 if self.state.pending_start == Some(reservation) {
                     self.state.pending_start = None;
-                    self.entertainment.release(reservation.kind);
+                    entertainment.release(reservation.kind);
                 }
                 "start-verification"
             }
             PendingCardGameEffect::VerifyJoin { .. } => "join-verification",
             PendingCardGameEffect::DeliverOutcomePrivate { .. } => {
                 abort_state(&mut self.state)?;
-                self.release_active_card_game();
+                Self::release_active_card_game(entertainment);
                 "private-delivery"
             }
             PendingCardGameEffect::DeliverHand { player, .. } => {
@@ -698,7 +857,7 @@ impl CardGameService {
                 release_on_completion,
             } => {
                 if release_on_completion {
-                    self.release_active_card_game();
+                    Self::release_active_card_game(entertainment);
                 }
                 action
             }
@@ -709,11 +868,12 @@ impl CardGameService {
     #[cfg(test)]
     fn begin_outcome_command(
         &mut self,
+        entertainment: &mut EntertainmentState,
         outcome: LandlordOutcome,
         lane: CardGameEffectLane,
         generation: SessionGeneration,
     ) -> Result<CardGameCommandStart> {
-        match self.begin_outcome_resume(outcome, lane, generation)? {
+        match self.begin_outcome_resume(entertainment, outcome, lane, generation)? {
             CardGameResume::Completed(completion) => {
                 Ok(CardGameCommandStart::Completed(completion))
             }
@@ -725,6 +885,7 @@ impl CardGameService {
     #[cfg(test)]
     fn begin_outcome_resume(
         &mut self,
+        entertainment: &mut EntertainmentState,
         outcome: LandlordOutcome,
         lane: CardGameEffectLane,
         generation: SessionGeneration,
@@ -733,7 +894,7 @@ impl CardGameService {
         let progress =
             Self::begin_outcome_resume_in_state(&mut self.state, generation, outcome, lane)?;
         if ended && matches!(progress, CardGameResume::Completed(_)) {
-            self.release_active_card_game();
+            Self::release_active_card_game(entertainment);
         }
         Ok(progress)
     }
@@ -749,27 +910,22 @@ impl CardGameService {
         }
         let action = outcome.action;
         let release_on_completion = outcome.ended;
-        let mut deliveries = outcome
-            .private_deliveries
-            .drain(..)
-            .collect::<VecDeque<_>>();
-        if let Some(delivery) = deliveries.pop_front() {
+        let deliveries = outcome.private_deliveries.drain(..).collect::<Vec<_>>();
+        if !deliveries.is_empty() {
+            let continuation = PrivateDeliveryContinuation {
+                public_reply: outcome.public_reply,
+                action,
+                lane,
+                release_on_completion,
+            };
             suspend_effect(
                 state,
                 generation,
                 lane,
-                CardGameEffect::PrivateDelivery {
-                    player: delivery.player.clone(),
-                    message: delivery.message,
+                CardGameEffect::PrivateBatch {
+                    deliveries: deliveries.clone(),
                 },
-                PendingCardGameEffect::DeliverOutcomePrivate {
-                    player: delivery.player,
-                    remaining: deliveries,
-                    public_reply: outcome.public_reply,
-                    action,
-                    lane,
-                    release_on_completion,
-                },
+                PendingCardGameEffect::DeliverOutcomePrivate { continuation },
             )
             .map(CardGameResume::Suspended)
         } else if let Some(message) = outcome.public_reply {
@@ -792,55 +948,39 @@ impl CardGameService {
     fn continue_outcome_delivery_in_state(
         state: &mut CardGameState,
         generation: SessionGeneration,
-        mut remaining: VecDeque<LandlordPrivateDelivery>,
-        public_reply: Option<String>,
-        action: &'static str,
-        lane: CardGameEffectLane,
-        release_on_completion: bool,
+        continuation: PrivateDeliveryContinuation,
     ) -> Result<CardGameResume> {
-        if let Some(delivery) = remaining.pop_front() {
+        if let Some(message) = continuation.public_reply {
             return suspend_effect(
                 state,
                 generation,
-                lane,
-                CardGameEffect::PrivateDelivery {
-                    player: delivery.player.clone(),
-                    message: delivery.message,
-                },
-                PendingCardGameEffect::DeliverOutcomePrivate {
-                    player: delivery.player,
-                    remaining,
-                    public_reply,
-                    action,
-                    lane,
-                    release_on_completion,
-                },
-            )
-            .map(CardGameResume::Suspended);
-        }
-        if let Some(message) = public_reply {
-            return suspend_effect(
-                state,
-                generation,
-                lane,
+                continuation.lane,
                 CardGameEffect::HallDelivery { message },
                 PendingCardGameEffect::Hall {
-                    action,
-                    release_on_completion,
+                    action: continuation.action,
+                    release_on_completion: continuation.release_on_completion,
                 },
             )
             .map(CardGameResume::Suspended);
         }
-        Ok(CardGameResume::Completed(CardGameCompletion { action }))
+        Ok(CardGameResume::Completed(CardGameCompletion {
+            action: continuation.action,
+        }))
     }
 
     #[cfg(test)]
     pub fn begin_delivery_outcome(
         &mut self,
+        entertainment: &mut EntertainmentState,
         outcome: LandlordOutcome,
     ) -> Result<CardGameCommandStart> {
         let generation = self.state.session_generation;
-        self.begin_outcome_command(outcome, CardGameEffectLane::Formal, generation)
+        self.begin_outcome_command(
+            entertainment,
+            outcome,
+            CardGameEffectLane::Formal,
+            generation,
+        )
     }
 
     pub fn claim(&mut self, key: CardGameEffectKey) -> Result<CardGameEffectClaim> {
@@ -876,6 +1016,7 @@ impl CardGameService {
 
     pub(crate) fn handle_deadline(
         &mut self,
+        entertainment: &mut EntertainmentState,
         kind: CardGameDeadlineKind,
         now: Instant,
     ) -> Result<Option<CardGameTimedOutcome>> {
@@ -885,24 +1026,32 @@ impl CardGameService {
         if expected != kind || deadline > now {
             return Ok(None);
         }
-        self.tick(now, true)
+        self.tick(entertainment, now, true)
     }
 
     #[cfg(test)]
-    pub fn prepare_start(&mut self, command: &LandlordCommand) -> Result<CardGameStartGate> {
+    pub fn prepare_start(
+        &mut self,
+        entertainment: &mut EntertainmentState,
+        command: &LandlordCommand,
+    ) -> Result<CardGameStartGate> {
         let kind = card_game_kind(command)?;
         let label = kind.label();
         if !self.enabled {
             return Ok(CardGameStartGate::Reply(format!("{}未启用", label)));
         }
-        if self.state.game.is_active() || self.state.pending_start.is_some() {
+        if self.state.game.is_active()
+            || self.state.pending_start.is_some()
+            || self.state.pending_retry.is_some()
+        {
             return Ok(CardGameStartGate::Reply("已有牌局或房间进行中".to_string()));
         }
         let next_generation = next_start_generation(&self.state)?;
-        match self.entertainment.try_acquire(kind)? {
+        match entertainment.try_acquire(kind)? {
             AcquireOutcome::Acquired => {
                 self.state.session_generation = next_generation;
                 self.state.pending_effects.clear();
+                self.state.pending_retry = None;
                 let reservation = CardGameStartReservation {
                     token: self.state.next_reservation_token,
                     kind,
@@ -925,7 +1074,11 @@ impl CardGameService {
     }
 
     #[cfg(test)]
-    pub fn cancel_start(&mut self, reservation: CardGameStartReservation) -> Result<bool> {
+    pub fn cancel_start(
+        &mut self,
+        entertainment: &mut EntertainmentState,
+        reservation: CardGameStartReservation,
+    ) -> Result<bool> {
         let cancelled = if self.state.pending_start == Some(reservation) {
             self.state.pending_start = None;
             true
@@ -933,7 +1086,7 @@ impl CardGameService {
             false
         };
         if cancelled {
-            self.entertainment.release(reservation.kind);
+            entertainment.release(reservation.kind);
         }
         Ok(cancelled)
     }
@@ -941,6 +1094,7 @@ impl CardGameService {
     #[cfg(test)]
     pub fn complete_start(
         &mut self,
+        entertainment: &mut EntertainmentState,
         player: &str,
         command: &LandlordCommand,
         reservation: CardGameStartReservation,
@@ -956,7 +1110,7 @@ impl CardGameService {
         self.state.pending_start = None;
         let outcome = self.state.game.handle(player, command, now);
         if outcome.action != "created" {
-            self.entertainment.release(kind);
+            entertainment.release(kind);
         }
         Ok(outcome)
     }
@@ -964,23 +1118,25 @@ impl CardGameService {
     #[cfg(test)]
     pub fn handle(
         &mut self,
+        entertainment: &mut EntertainmentState,
         player: &str,
         command: &LandlordCommand,
         now: Instant,
     ) -> Result<LandlordOutcome> {
-        self.handle_with_generation(player, command, now)
+        self.handle_with_generation(entertainment, player, command, now)
             .map(|(outcome, _)| outcome)
     }
 
     #[cfg(test)]
     fn handle_with_generation(
         &mut self,
+        entertainment: &mut EntertainmentState,
         player: &str,
         command: &LandlordCommand,
         now: Instant,
     ) -> Result<(LandlordOutcome, SessionGeneration)> {
         if command.reports_entertainment_conflict()
-            && let Some(active) = self.entertainment.active()
+            && let Some(active) = entertainment.active()
             && !is_card_game_kind(active)
         {
             let generation = self.state.session_generation;
@@ -1006,6 +1162,7 @@ impl CardGameService {
 
     pub fn tick(
         &mut self,
+        entertainment: &mut EntertainmentState,
         now: Instant,
         clock_active: bool,
     ) -> Result<Option<CardGameTimedOutcome>> {
@@ -1015,12 +1172,12 @@ impl CardGameService {
             }
             if let Err(error) = ensure_generation_capacity(&self.state) {
                 clear_session_without_generation(&mut self.state);
-                self.release_active_card_game();
+                Self::release_active_card_game(entertainment);
                 return Err(error);
             }
             if let Err(error) = ensure_operation_capacity(&self.state) {
                 clear_session_without_generation(&mut self.state);
-                self.release_active_card_game();
+                Self::release_active_card_game(entertainment);
                 return Err(error);
             }
             let Some(outcome) = self.state.game.tick(now, clock_active) else {
@@ -1049,40 +1206,44 @@ impl CardGameService {
             }
         };
         if release_now {
-            self.release_active_card_game();
+            Self::release_active_card_game(entertainment);
         }
         Ok(timed)
     }
 
-    pub fn abort(&mut self) -> Result<bool> {
-        let reserved = self.entertainment.active().is_some_and(is_card_game_kind);
+    pub fn abort(&mut self, entertainment: &mut EntertainmentState) -> Result<bool> {
+        let reserved = entertainment.active().is_some_and(is_card_game_kind);
         let aborted = {
             let had_pending_effects = !self.state.pending_effects.is_empty();
             let has_session = self.state.game.is_active()
                 || self.state.pending_start.is_some()
+                || self.state.pending_retry.is_some()
                 || had_pending_effects
                 || reserved;
             if has_session {
                 let Some(next_generation) = self.state.session_generation.checked_next() else {
                     clear_session_without_generation(&mut self.state);
-                    self.release_active_card_game();
+                    Self::release_active_card_game(entertainment);
                     bail!("card game session generation exhausted");
                 };
                 self.state.session_generation = next_generation;
             }
             let pending = self.state.pending_start.take().is_some();
             self.state.pending_effects.clear();
-            self.state.game.abort() || pending || had_pending_effects
+            let pending_retry = self.state.pending_retry.take().is_some();
+            self.state.game.abort() || pending || pending_retry || had_pending_effects
         };
         if aborted || reserved {
-            self.release_active_card_game();
+            Self::release_active_card_game(entertainment);
         }
         Ok(aborted || reserved)
     }
 
     #[cfg(test)]
     pub(crate) fn is_active(&self) -> Result<bool> {
-        Ok(self.state.game.is_active() || self.state.pending_start.is_some())
+        Ok(self.state.game.is_active()
+            || self.state.pending_start.is_some()
+            || self.state.pending_retry.is_some())
     }
 
     #[cfg(test)]
@@ -1100,13 +1261,12 @@ impl CardGameService {
         self.state.pending_effects.len()
     }
 
-    fn release_active_card_game(&self) {
-        if let Some(kind) = self
-            .entertainment
+    fn release_active_card_game(entertainment: &mut EntertainmentState) {
+        if let Some(kind) = entertainment
             .active()
             .filter(|kind| is_card_game_kind(*kind))
         {
-            self.entertainment.release(kind);
+            entertainment.release(kind);
         }
     }
 }
@@ -1182,17 +1342,21 @@ fn suspend_effect(
 
 fn abort_state(state: &mut CardGameState) -> Result<bool> {
     let had_pending_effects = !state.pending_effects.is_empty();
-    let has_session =
-        state.game.is_active() || state.pending_start.is_some() || had_pending_effects;
+    let has_session = state.game.is_active()
+        || state.pending_start.is_some()
+        || state.pending_retry.is_some()
+        || had_pending_effects;
     if has_session {
         advance_session_generation(state)?;
     }
     let pending = state.pending_start.take().is_some();
-    Ok(state.game.abort() || pending || had_pending_effects)
+    let pending_retry = state.pending_retry.take().is_some();
+    Ok(state.game.abort() || pending || pending_retry || had_pending_effects)
 }
 
 fn clear_session_without_generation(state: &mut CardGameState) {
     state.pending_start = None;
+    state.pending_retry = None;
     state.pending_effects.clear();
     state.game.abort();
 }
@@ -1204,6 +1368,7 @@ fn advance_session_generation(state: &mut CardGameState) -> Result<SessionGenera
         .ok_or_else(|| anyhow!("card game session generation exhausted"))?;
     state.session_generation = next;
     state.pending_effects.clear();
+    state.pending_retry = None;
     Ok(next)
 }
 

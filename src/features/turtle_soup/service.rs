@@ -1,7 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
-use std::ffi::OsString;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
@@ -25,12 +23,11 @@ use super::{
     TurtleSoupDeliveryOutcome, TurtleSoupDeliveryPort, TurtleSoupDeliveryPurpose, TurtleSoupPuzzle,
     TurtleSoupSubmission, load_question_bank,
 };
-use crate::features::chat_text::{
-    MAX_CHAT_WIDTH, display_width, normalize_comparison_text, split_numbered_chat_message,
-};
-use crate::features::entertainment::{AcquireOutcome, EntertainmentCoordinator, EntertainmentKind};
+use crate::features::chat_text::{MAX_CHAT_WIDTH, display_width, split_numbered_chat_message};
+use crate::features::entertainment::{AcquireOutcome, EntertainmentKind, EntertainmentState};
 use crate::runtime::identity::SessionGeneration;
 use crate::runtime::openai::{Authentication, OpenAiRuntimeHandle, Target};
+use crate::text::normalize_comparison_text;
 
 const RECENT_JUDGMENT_LIMIT: usize = 30;
 const OPENAI_DEFAULT_ENDPOINT: &str = "https://api.openai.com/v1/chat/completions";
@@ -323,12 +320,19 @@ impl Default for TurtleSoupSnapshot {
     }
 }
 
+impl TurtleSoupSnapshot {
+    pub(crate) fn redacted_for_monitor(mut self) -> Self {
+        for judgment in &mut self.recent_judgments {
+            judgment.question.clear();
+        }
+        self
+    }
+}
+
 pub(crate) struct TurtleSoupService {
     config: TurtleSoupConfig,
     bank: TurtleSoupBankStore,
     openai: OpenAiRuntimeHandle,
-    entertainment: EntertainmentCoordinator,
-    delivery: Arc<dyn TurtleSoupDeliveryPort>,
     state: TurtleSoupState,
     worker_sender: SyncSender<TurtleSoupJob>,
     worker_receiver: Option<Arc<Mutex<Receiver<TurtleSoupJob>>>>,
@@ -795,15 +799,7 @@ impl TurtleSoupAiCompletionPort for DiscardedAiCompletionPort {
 }
 
 impl TurtleSoupService {
-    pub(crate) fn new<D>(
-        mut config: TurtleSoupConfig,
-        entertainment: EntertainmentCoordinator,
-        delivery: D,
-        openai: OpenAiRuntimeHandle,
-    ) -> Self
-    where
-        D: TurtleSoupDeliveryPort + 'static,
-    {
+    pub(crate) fn new(mut config: TurtleSoupConfig, openai: OpenAiRuntimeHandle) -> Self {
         config.nickname_stable_count = config
             .nickname_stable_count
             .max(BUILTIN_OCR_STABILITY_COUNT);
@@ -814,8 +810,6 @@ impl TurtleSoupService {
             config,
             bank,
             openai,
-            entertainment,
-            delivery: Arc::new(delivery),
             state: TurtleSoupState::default(),
             worker_sender,
             worker_receiver: Some(Arc::new(Mutex::new(worker_receiver))),
@@ -890,11 +884,13 @@ impl TurtleSoupService {
 
     pub(crate) fn handle_hall_command(
         &mut self,
+        entertainment: &mut EntertainmentState,
         player: &str,
         command: &TurtleSoupCommand,
+        delivery: &mut dyn TurtleSoupDeliveryPort,
     ) -> TurtleSoupCommandOutcome {
         match command {
-            TurtleSoupCommand::Start => self.start_or_repeat(player),
+            TurtleSoupCommand::Start => self.start_or_repeat(entertainment, player, delivery),
             TurtleSoupCommand::Status => TurtleSoupCommandOutcome {
                 action: "status",
                 immediate_reply: Some(self.status_message()),
@@ -908,8 +904,10 @@ impl TurtleSoupService {
 
     pub(crate) fn handle_friend_command(
         &mut self,
+        entertainment: &mut EntertainmentState,
         player: &str,
         command: &TurtleSoupCommand,
+        delivery: &mut dyn TurtleSoupDeliveryPort,
     ) -> TurtleSoupCommandOutcome {
         if !matches!(command, TurtleSoupCommand::End) {
             return TurtleSoupCommandOutcome {
@@ -917,7 +915,10 @@ impl TurtleSoupService {
                 immediate_reply: None,
             };
         }
-        match self.begin_settlement(SettlementReason::Friend(normalize_player_display(player))) {
+        let outcome = match self.begin_settlement(
+            SettlementReason::Friend(normalize_player_display(player)),
+            delivery,
+        ) {
             Ok(true) => TurtleSoupCommandOutcome {
                 action: "friend-stopped",
                 immediate_reply: None,
@@ -930,23 +931,40 @@ impl TurtleSoupService {
                 action: "friend-stop-failed",
                 immediate_reply: Some(format!("海龟汤结束失败：{}", concise_error(&error))),
             },
-        }
+        };
+        self.reconcile_entertainment(entertainment);
+        outcome
     }
 
-    pub(crate) fn start_random_from_web(&mut self) -> Result<()> {
-        self.start_new("Web控制台", None)
+    pub(crate) fn start_random_from_web(
+        &mut self,
+        entertainment: &mut EntertainmentState,
+        delivery: &mut dyn TurtleSoupDeliveryPort,
+    ) -> Result<()> {
+        self.start_new(entertainment, "Web控制台", None, delivery)
     }
 
-    pub(crate) fn start_by_id_from_web(&mut self, id: &str) -> Result<()> {
+    pub(crate) fn start_by_id_from_web(
+        &mut self,
+        entertainment: &mut EntertainmentState,
+        id: &str,
+        delivery: &mut dyn TurtleSoupDeliveryPort,
+    ) -> Result<()> {
         let id = id.trim();
         if id.is_empty() {
             bail!("题目 ID 不能为空");
         }
-        self.start_new("Web控制台", Some(id))
+        self.start_new(entertainment, "Web控制台", Some(id), delivery)
     }
 
-    pub(crate) fn end_from_web(&mut self) -> Result<bool> {
-        self.begin_settlement(SettlementReason::Web)
+    pub(crate) fn end_from_web(
+        &mut self,
+        entertainment: &mut EntertainmentState,
+        delivery: &mut dyn TurtleSoupDeliveryPort,
+    ) -> Result<bool> {
+        let result = self.begin_settlement(SettlementReason::Web, delivery);
+        self.reconcile_entertainment(entertainment);
+        result
     }
 
     pub(crate) fn filter_new_primary_questions(
@@ -1176,17 +1194,24 @@ impl TurtleSoupService {
         }
     }
 
-    pub(crate) fn handle_deadline(&mut self, kind: TurtleSoupDeadlineKind, now: Instant) {
+    pub(crate) fn handle_deadline(
+        &mut self,
+        entertainment: &mut EntertainmentState,
+        kind: TurtleSoupDeadlineKind,
+        now: Instant,
+        delivery: &mut dyn TurtleSoupDeliveryPort,
+    ) {
         let Some((expected, deadline)) = self.next_deadline(now, true) else {
             return;
         };
         if expected != kind || deadline > now {
             return;
         }
-        self.tick_at(now);
+        self.tick_at(now, delivery);
+        self.reconcile_entertainment(entertainment);
     }
 
-    fn tick_at(&mut self, now: Instant) {
+    fn tick_at(&mut self, now: Instant, delivery: &mut dyn TurtleSoupDeliveryPort) {
         let reason = {
             let state = &self.state;
             if state.phase != TurtleSoupPhase::Active {
@@ -1208,13 +1233,17 @@ impl TurtleSoupService {
             }
         };
         if let Some(reason) = reason
-            && let Err(error) = self.begin_settlement(reason)
+            && let Err(error) = self.begin_settlement(reason, delivery)
         {
             log::error!("海龟汤自动结算失败: {error:#}");
         }
     }
 
-    pub(crate) fn abort_for_context_loss(&mut self, reason: &str) {
+    pub(crate) fn abort_for_context_loss(
+        &mut self,
+        entertainment: &mut EntertainmentState,
+        reason: &str,
+    ) {
         let _old_generation = {
             let state = &mut self.state;
             if state.phase == TurtleSoupPhase::Idle {
@@ -1231,7 +1260,7 @@ impl TurtleSoupService {
             old_generation
         };
         self.cancel_waiting_generation(_old_generation);
-        self.entertainment.release(EntertainmentKind::TurtleSoup);
+        entertainment.release(EntertainmentKind::TurtleSoup);
         log::warn!("海龟汤会话已中止且不公布汤底: {}", reason);
     }
 
@@ -1249,7 +1278,11 @@ impl TurtleSoupService {
         }
     }
 
-    pub(crate) fn handle_delivery_success(&mut self, delivery: TurtleSoupDelivery) {
+    pub(crate) fn handle_delivery_success(
+        &mut self,
+        entertainment: &mut EntertainmentState,
+        delivery: TurtleSoupDelivery,
+    ) {
         match delivery.purpose {
             TurtleSoupDeliveryPurpose::Opening => {
                 let state = &mut self.state;
@@ -1271,10 +1304,12 @@ impl TurtleSoupService {
             }
             TurtleSoupDeliveryPurpose::SurfaceRepeat | TurtleSoupDeliveryPurpose::Judgment => {}
         }
+        self.reconcile_entertainment(entertainment);
     }
 
     pub(crate) fn handle_delivery_failure(
         &mut self,
+        entertainment: &mut EntertainmentState,
         delivery: TurtleSoupDelivery,
         error: &anyhow::Error,
     ) {
@@ -1301,12 +1336,18 @@ impl TurtleSoupService {
                 log::error!("海龟汤普通裁决回复发送失败，已丢弃: {}", summary);
             }
         }
+        self.reconcile_entertainment(entertainment);
     }
 
-    fn start_or_repeat(&mut self, player: &str) -> TurtleSoupCommandOutcome {
+    fn start_or_repeat(
+        &mut self,
+        entertainment: &mut EntertainmentState,
+        player: &str,
+        delivery: &mut dyn TurtleSoupDeliveryPort,
+    ) -> TurtleSoupCommandOutcome {
         let phase = self.state.phase;
         match phase {
-            TurtleSoupPhase::Idle => match self.start_new(player, None) {
+            TurtleSoupPhase::Idle => match self.start_new(entertainment, player, None, delivery) {
                 Ok(()) => TurtleSoupCommandOutcome {
                     action: "started",
                     immediate_reply: None,
@@ -1324,7 +1365,7 @@ impl TurtleSoupService {
                 action: "settling",
                 immediate_reply: Some("海龟汤正在结算，请稍候".to_string()),
             },
-            TurtleSoupPhase::Active => match self.repeat_surface() {
+            TurtleSoupPhase::Active => match self.repeat_surface(delivery) {
                 Ok(()) => TurtleSoupCommandOutcome {
                     action: "surface-repeated",
                     immediate_reply: None,
@@ -1337,7 +1378,13 @@ impl TurtleSoupService {
         }
     }
 
-    fn start_new(&mut self, starter: &str, requested_id: Option<&str>) -> Result<()> {
+    fn start_new(
+        &mut self,
+        entertainment: &mut EntertainmentState,
+        starter: &str,
+        requested_id: Option<&str>,
+        delivery: &mut dyn TurtleSoupDeliveryPort,
+    ) -> Result<()> {
         if !self.config.enabled {
             bail!("海龟汤功能未启用");
         }
@@ -1345,10 +1392,7 @@ impl TurtleSoupService {
         if self.state.phase != TurtleSoupPhase::Idle {
             bail!("已有海龟汤正在进行");
         }
-        match self
-            .entertainment
-            .try_acquire(EntertainmentKind::TurtleSoup)?
-        {
+        match entertainment.try_acquire(EntertainmentKind::TurtleSoup)? {
             AcquireOutcome::Acquired => {}
             AcquireOutcome::AlreadyOwned => bail!("海龟汤娱乐占用尚未释放"),
             AcquireOutcome::Occupied(kind) => {
@@ -1402,7 +1446,12 @@ impl TurtleSoupService {
                 state.generation
             };
             let messages = split_numbered_chat_message("汤面", &puzzle.surface);
-            match self.enqueue_batch(messages, generation, TurtleSoupDeliveryPurpose::Opening)? {
+            match Self::enqueue_batch(
+                delivery,
+                messages,
+                generation,
+                TurtleSoupDeliveryPurpose::Opening,
+            )? {
                 TurtleSoupDeliveryOutcome::Rejected => {
                     bail!("延迟聊天队列已被受保护批次占满")
                 }
@@ -1425,13 +1474,13 @@ impl TurtleSoupService {
             self.state.pending_players.clear();
             self.state.batch_drafts.clear();
             self.state.last_error = Some(concise_error(&error));
-            self.entertainment.release(EntertainmentKind::TurtleSoup);
+            entertainment.release(EntertainmentKind::TurtleSoup);
             return Err(error);
         }
         Ok(())
     }
 
-    fn repeat_surface(&mut self) -> Result<()> {
+    fn repeat_surface(&mut self, delivery: &mut dyn TurtleSoupDeliveryPort) -> Result<()> {
         let (generation, surface) = {
             let state = &self.state;
             if state.phase != TurtleSoupPhase::Active {
@@ -1443,7 +1492,8 @@ impl TurtleSoupService {
                 .ok_or_else(|| anyhow!("海龟汤进行中但缺少会话"))?;
             (state.generation, session.puzzle.surface.clone())
         };
-        let outcome = self.enqueue_batch(
+        let outcome = Self::enqueue_batch(
+            delivery,
             split_numbered_chat_message("汤面", &surface),
             generation,
             TurtleSoupDeliveryPurpose::SurfaceRepeat,
@@ -1475,7 +1525,11 @@ impl TurtleSoupService {
         )
     }
 
-    fn begin_settlement(&mut self, reason: SettlementReason) -> Result<bool> {
+    fn begin_settlement(
+        &mut self,
+        reason: SettlementReason,
+        delivery: &mut dyn TurtleSoupDeliveryPort,
+    ) -> Result<bool> {
         let (generation, messages) = {
             let state = &mut self.state;
             if !matches!(
@@ -1496,18 +1550,22 @@ impl TurtleSoupService {
             (state.generation, messages)
         };
         self.cancel_waiting_generation(generation);
-        let outcome =
-            match self.enqueue_batch(messages, generation, TurtleSoupDeliveryPurpose::Settlement) {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    self.finish_settlement(
-                        generation,
-                        true,
-                        Some(format!("结算批次入队失败：{}", concise_error(&error))),
-                    );
-                    return Err(error);
-                }
-            };
+        let outcome = match Self::enqueue_batch(
+            delivery,
+            messages,
+            generation,
+            TurtleSoupDeliveryPurpose::Settlement,
+        ) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.finish_settlement(
+                    generation,
+                    true,
+                    Some(format!("结算批次入队失败：{}", concise_error(&error))),
+                );
+                return Err(error);
+            }
+        };
         if outcome == TurtleSoupDeliveryOutcome::Rejected {
             self.finish_settlement(
                 generation,
@@ -1538,7 +1596,6 @@ impl TurtleSoupService {
         };
         if finished {
             self.cancel_waiting_generation(generation);
-            self.entertainment.release(EntertainmentKind::TurtleSoup);
             if incomplete {
                 log::error!("海龟汤结算已结束，但游戏内消息发送不完整");
             } else {
@@ -1548,15 +1605,14 @@ impl TurtleSoupService {
     }
 
     fn enqueue_batch(
-        &self,
+        delivery: &mut dyn TurtleSoupDeliveryPort,
         messages: Vec<String>,
         generation: u64,
         purpose: TurtleSoupDeliveryPurpose,
     ) -> Result<TurtleSoupDeliveryOutcome> {
-        self.delivery
-            .deliver_turtle_soup(TurtleSoupDeliveryIntent::new(
-                messages, generation, purpose,
-            )?)
+        delivery.deliver_turtle_soup(TurtleSoupDeliveryIntent::new(
+            messages, generation, purpose,
+        )?)
     }
 
     fn cancel_waiting_generation(&self, generation: u64) {
@@ -1571,6 +1627,12 @@ impl TurtleSoupService {
                 Ok(_) => break,
                 Err(observed) => current = observed,
             }
+        }
+    }
+
+    fn reconcile_entertainment(&self, entertainment: &mut EntertainmentState) {
+        if self.state.phase == TurtleSoupPhase::Idle {
+            entertainment.release(EntertainmentKind::TurtleSoup);
         }
     }
 }
@@ -1718,7 +1780,12 @@ impl TurtleSoupWorker {
 }
 
 impl TurtleSoupService {
-    pub(crate) fn apply_ai_completion(&mut self, completion: TurtleSoupAiCompletion) {
+    pub(crate) fn apply_ai_completion(
+        &mut self,
+        entertainment: &mut EntertainmentState,
+        completion: TurtleSoupAiCompletion,
+        delivery: &mut dyn TurtleSoupDeliveryPort,
+    ) {
         let TurtleSoupAiCompletion { job, outcome } = completion;
         let log_error = outcome.error_summary.clone();
         log::info!(
@@ -1781,7 +1848,12 @@ impl TurtleSoupService {
 
         if let Some((generation, messages)) = settlement {
             self.cancel_waiting_generation(generation);
-            match self.enqueue_batch(messages, generation, TurtleSoupDeliveryPurpose::Settlement) {
+            match Self::enqueue_batch(
+                delivery,
+                messages,
+                generation,
+                TurtleSoupDeliveryPurpose::Settlement,
+            ) {
                 Ok(TurtleSoupDeliveryOutcome::Added) => {}
                 Ok(TurtleSoupDeliveryOutcome::DroppedEarlierMessage) => {
                     log::warn!("海龟汤获胜结算入队时淘汰了一条较早的非关键回复")
@@ -1793,7 +1865,12 @@ impl TurtleSoupService {
                 ),
             }
         } else if let Some((generation, reply)) = judgment_reply {
-            match self.enqueue_batch(vec![reply], generation, TurtleSoupDeliveryPurpose::Judgment) {
+            match Self::enqueue_batch(
+                delivery,
+                vec![reply],
+                generation,
+                TurtleSoupDeliveryPurpose::Judgment,
+            ) {
                 Ok(TurtleSoupDeliveryOutcome::Rejected) => {
                     log::warn!("海龟汤普通裁决回复队列已满，已丢弃")
                 }
@@ -1804,6 +1881,7 @@ impl TurtleSoupService {
                 Err(error) => log::error!("海龟汤普通裁决回复入队失败: {error:#}"),
             }
         }
+        self.reconcile_entertainment(entertainment);
     }
 }
 
@@ -2025,73 +2103,8 @@ fn load_used_state(path: &Path) -> Result<UsedQuestionState> {
 }
 
 fn save_used_state(path: &Path, state: &UsedQuestionState) -> Result<()> {
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("创建海龟汤使用记录目录失败: {}", parent.display()))?;
-    }
     let text = serde_json::to_string_pretty(state)?;
-    let temporary = temporary_path(path);
-    let mut file = fs::File::create(&temporary)
-        .with_context(|| format!("创建海龟汤使用记录临时文件失败: {}", temporary.display()))?;
-    file.write_all(text.as_bytes())
-        .with_context(|| format!("写入海龟汤使用记录临时文件失败: {}", temporary.display()))?;
-    file.sync_all()
-        .with_context(|| format!("同步海龟汤使用记录临时文件失败: {}", temporary.display()))?;
-    drop(file);
-    replace_file(&temporary, path)
-}
-
-fn temporary_path(path: &Path) -> PathBuf {
-    let mut name = OsString::from(".");
-    name.push(
-        path.file_name()
-            .unwrap_or_else(|| std::ffi::OsStr::new("turtle-soup-used")),
-    );
-    name.push(".tmp");
-    path.with_file_name(name)
-}
-
-#[cfg(windows)]
-fn replace_file(temporary: &Path, target: &Path) -> Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-
-    use windows::Win32::Storage::FileSystem::{
-        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-    };
-    use windows::core::PCWSTR;
-
-    let temporary = temporary
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect::<Vec<_>>();
-    let target = target
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect::<Vec<_>>();
-    unsafe {
-        MoveFileExW(
-            PCWSTR(temporary.as_ptr()),
-            PCWSTR(target.as_ptr()),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    }
-    .with_context(|| "替换海龟汤使用记录失败")
-}
-
-#[cfg(not(windows))]
-fn replace_file(temporary: &Path, target: &Path) -> Result<()> {
-    fs::rename(temporary, target).with_context(|| {
-        format!(
-            "替换海龟汤使用记录失败: {} -> {}",
-            temporary.display(),
-            target.display()
-        )
-    })
+    crate::adapters::file_store::write_atomic(path, text.as_bytes(), "海龟汤使用记录")
 }
 
 fn pseudo_random_index(len: usize) -> usize {
@@ -2325,7 +2338,7 @@ mod tests {
 
     impl TurtleSoupDeliveryPort for TestDeliveryPort {
         fn deliver_turtle_soup(
-            &self,
+            &mut self,
             _intent: TurtleSoupDeliveryIntent,
         ) -> Result<TurtleSoupDeliveryOutcome> {
             Ok(TurtleSoupDeliveryOutcome::Added)
@@ -2355,8 +2368,6 @@ mod tests {
                 max_concurrency: 1,
                 ..TurtleSoupConfig::default()
             },
-            EntertainmentCoordinator::new(),
-            TestDeliveryPort,
             test_openai(),
         );
 
@@ -2714,7 +2725,7 @@ mod tests {
             assert!(state.batch_drafts.contains_key("bob"));
         }
 
-        service.abort_for_context_loss("测试上下文丢失");
+        service.abort_for_context_loss(&mut EntertainmentState::new(), "测试上下文丢失");
 
         let state = &service.state;
         assert!(state.batch_drafts.is_empty());
@@ -2734,12 +2745,7 @@ mod tests {
 
     #[test]
     fn primary_question_ocr_requires_independently_stable_nickname_and_content() {
-        let mut service = TurtleSoupService::new(
-            TurtleSoupConfig::default(),
-            EntertainmentCoordinator::new(),
-            TestDeliveryPort,
-            test_openai(),
-        );
+        let mut service = TurtleSoupService::new(TurtleSoupConfig::default(), test_openai());
         let visible = |text| vec![parse_question_message(text, None).expect("question")];
 
         assert!(
@@ -2809,12 +2815,7 @@ mod tests {
 
     #[test]
     fn primary_question_content_ocr_resets_on_change_but_accepts_punctuation_variants() {
-        let mut service = TurtleSoupService::new(
-            TurtleSoupConfig::default(),
-            EntertainmentCoordinator::new(),
-            TestDeliveryPort,
-            test_openai(),
-        );
+        let mut service = TurtleSoupService::new(TurtleSoupConfig::default(), test_openai());
         let visible = |text| vec![parse_question_message(text, None).expect("question")];
 
         service.filter_new_primary_questions(Vec::new(), true);
@@ -2843,12 +2844,7 @@ mod tests {
 
     #[test]
     fn primary_question_uses_content_to_dedupe_nickname_ocr_variants() {
-        let mut service = TurtleSoupService::new(
-            TurtleSoupConfig::default(),
-            EntertainmentCoordinator::new(),
-            TestDeliveryPort,
-            test_openai(),
-        );
+        let mut service = TurtleSoupService::new(TurtleSoupConfig::default(), test_openai());
         let visible = |player: &str, question: &str| {
             vec![
                 parse_question_message(&format!("{}：# {}", player, question), None)
@@ -2884,12 +2880,7 @@ mod tests {
 
     #[test]
     fn identical_questions_from_distinct_players_remain_independent() {
-        let mut service = TurtleSoupService::new(
-            TurtleSoupConfig::default(),
-            EntertainmentCoordinator::new(),
-            TestDeliveryPort,
-            test_openai(),
-        );
+        let mut service = TurtleSoupService::new(TurtleSoupConfig::default(), test_openai());
         let visible = || {
             ["Alice", "Bob"]
                 .into_iter()
@@ -2914,12 +2905,7 @@ mod tests {
 
     #[test]
     fn same_scan_nickname_ocr_aliases_are_deduplicated_by_question() {
-        let mut service = TurtleSoupService::new(
-            TurtleSoupConfig::default(),
-            EntertainmentCoordinator::new(),
-            TestDeliveryPort,
-            test_openai(),
-        );
+        let mut service = TurtleSoupService::new(TurtleSoupConfig::default(), test_openai());
         let visible = || {
             ["星念BOT", "星念B0T"]
                 .into_iter()
@@ -2944,12 +2930,7 @@ mod tests {
 
     #[test]
     fn secondary_question_ocr_keeps_pending_until_content_and_nickname_are_stable() {
-        let mut service = TurtleSoupService::new(
-            TurtleSoupConfig::default(),
-            EntertainmentCoordinator::new(),
-            TestDeliveryPort,
-            test_openai(),
-        );
+        let mut service = TurtleSoupService::new(TurtleSoupConfig::default(), test_openai());
         let observation = |player: &str, text: &str| {
             vec![SecondaryOcrObservation {
                 text: text.to_string(),
@@ -2981,12 +2962,7 @@ mod tests {
 
     #[test]
     fn secondary_question_accepts_minor_nickname_ocr_variants_for_the_same_content() {
-        let mut service = TurtleSoupService::new(
-            TurtleSoupConfig::default(),
-            EntertainmentCoordinator::new(),
-            TestDeliveryPort,
-            test_openai(),
-        );
+        let mut service = TurtleSoupService::new(TurtleSoupConfig::default(), test_openai());
         let observation = |player: &str| {
             vec![SecondaryOcrObservation {
                 text: "# 男人是灯塔管理员吗？".to_string(),
@@ -3011,12 +2987,7 @@ mod tests {
             content_stable_count: 2,
             ..TurtleSoupConfig::default()
         };
-        let mut service = TurtleSoupService::new(
-            config,
-            EntertainmentCoordinator::new(),
-            TestDeliveryPort,
-            test_openai(),
-        );
+        let mut service = TurtleSoupService::new(config, test_openai());
         let visible =
             || vec![parse_question_message("星念：# 他认识死者吗？", None).expect("question")];
 
@@ -3039,12 +3010,7 @@ mod tests {
 
     #[test]
     fn secondary_non_question_content_does_not_wait_for_a_nickname() {
-        let mut service = TurtleSoupService::new(
-            TurtleSoupConfig::default(),
-            EntertainmentCoordinator::new(),
-            TestDeliveryPort,
-            test_openai(),
-        );
+        let mut service = TurtleSoupService::new(TurtleSoupConfig::default(), test_openai());
         let observation = vec![SecondaryOcrObservation {
             text: "@状态".to_string(),
             player: String::new(),
@@ -3117,14 +3083,11 @@ mod tests {
             question_bank_path: PathBuf::from("missing-turtle-soup-bank.yaml"),
             ..TurtleSoupConfig::default()
         };
-        let mut service = TurtleSoupService::new(
-            config,
-            EntertainmentCoordinator::new(),
-            TestDeliveryPort,
-            test_openai(),
-        );
+        let mut service = TurtleSoupService::new(config, test_openai());
 
-        let error = service.start_random_from_web().unwrap_err();
+        let error = service
+            .start_random_from_web(&mut EntertainmentState::new(), &mut TestDeliveryPort)
+            .unwrap_err();
 
         assert!(error.to_string().contains("turtle_soup.ai.api_key"));
         assert_eq!(service.snapshot().phase, TurtleSoupPhase::Idle);
@@ -3151,12 +3114,7 @@ mod tests {
 
     #[test]
     fn web_snapshot_never_contains_the_puzzle_bottom() {
-        let mut service = TurtleSoupService::new(
-            TurtleSoupConfig::default(),
-            EntertainmentCoordinator::new(),
-            TestDeliveryPort,
-            test_openai(),
-        );
+        let mut service = TurtleSoupService::new(TurtleSoupConfig::default(), test_openai());
         {
             let state = &mut service.state;
             state.phase = TurtleSoupPhase::Active;
@@ -3186,17 +3144,33 @@ mod tests {
         assert!(!json.contains("裁决备注"));
     }
 
+    #[test]
+    fn monitor_snapshot_keeps_shape_without_question_text() {
+        let mut snapshot = TurtleSoupSnapshot::default();
+        snapshot.recent_judgments.push(TurtleSoupJudgmentSnapshot {
+            request_id: 7,
+            player: "甲".to_string(),
+            question: "完整提问正文".to_string(),
+            judgment: Judgment::Yes,
+            judgment_label: "是".to_string(),
+            elapsed_ms: 12,
+            retries: 0,
+            completed_at_ms: 34,
+        });
+
+        let redacted = serde_json::to_value(snapshot.redacted_for_monitor()).unwrap();
+
+        assert_eq!(redacted["recentJudgments"][0]["requestId"], 7);
+        assert_eq!(redacted["recentJudgments"][0]["question"], "");
+        assert!(!redacted.to_string().contains("完整提问正文"));
+    }
+
     fn active_test_service() -> TurtleSoupService {
         let config = TurtleSoupConfig {
             enabled: true,
             ..TurtleSoupConfig::default()
         };
-        let mut service = TurtleSoupService::new(
-            config,
-            EntertainmentCoordinator::new(),
-            TestDeliveryPort,
-            test_openai(),
-        );
+        let mut service = TurtleSoupService::new(config, test_openai());
         {
             let state = &mut service.state;
             state.phase = TurtleSoupPhase::Active;

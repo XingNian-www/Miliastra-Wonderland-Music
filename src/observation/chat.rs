@@ -1,8 +1,28 @@
+mod scan;
+mod stream;
+mod visual;
+
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Instant;
+
+pub(crate) use scan::{
+    ChatMessage, ResolvedTemplateArgs, TemplateArgs, count_chat_markers, prepare_chat_scan,
+    recognize_prepared_chat,
+};
+pub(crate) use stream::{
+    ChatObservationDispatch, ChatObservationExclusiveGuard, ChatObservationShared,
+    CompletionAdvanceSubscriber, PrimaryObservedMessage, SecondaryChatObservation,
+    SecondaryObservedMessage, SecondaryRecognizedMessage,
+};
+pub(crate) use visual::{
+    SECONDARY_TITLE_RECT, SecondaryChatIdentity, SecondaryHallBubble, UnreadFriendHit,
+    classify_title, find_unread_friend_hits, hall_bubble_sequence_overlap,
+    latest_incoming_bubble_rect, latest_incoming_fingerprint, secondary_hall_bubbles,
+    unread_hit_still_visible,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct VisualSessionId(u64);

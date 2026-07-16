@@ -13,8 +13,8 @@ flowchart TD
     A["page.html<br/>远程指挥台"] --> B["HTTP 路由表 ROUTES"]
     B --> C{"接口类型"}
     C -->|只读| D["FeelUOwn / 队列 / 运行状态 / 监控快照"]
-    C -->|远程命令| E["ParsedCommand message_type=控制台"]
-    C -->|直接任务| F["PendingTask::ConsoleChat / StartGame / EnterWonderland"]
+    C -->|远程命令| E["BusinessIntent message_type=控制台"]
+    C -->|直接任务| F["HttpTaskPort 类型化提交"]
     C -->|直接队列/状态| G["PersistentQueue / RuntimeState"]
     E --> H["待执行任务队列"]
     F --> H
@@ -25,19 +25,19 @@ flowchart TD
 
 | 文件 | 职责 |
 | --- | --- |
-| `src/app/http_server.rs` | HTTP 服务、路由表、请求分发、参数校验、远程任务入队、队列/状态/截图接口。 |
-| `src/app/page.html` | 内嵌 Web 面板页面，负责调用 API 并渲染监控、点歌、队列、日志、截图和聊天监听状态。 |
-| `src/app/tools.html` | 内嵌高级控制页，提交诊断和人工输入工具任务并轮询结果。 |
-| `src/app/web_tools.rs` | 工具任务队列、状态记录、任务上限与输入独占分类。 |
-| `src/app/task_tracker.rs` | 正式业务任务 ID、生命周期、耗时和结果摘要。 |
-| `src/app/decision_control.rs` | 把 Web 候选决策送回正在等待的点歌确认流程。 |
-| `src/app/queue.rs` | 持久播放队列、稳定队列项 ID、旧文件补 ID 和原子保存。 |
-| `src/app/monitor.rs` | 内存态监控快照，供 TUI 和 Web 面板读取。 |
-| `src/main.rs` | 创建 `MonitorShared`，启动 HTTP 服务，并在业务流程中更新监控快照。 |
+| `src/interfaces/http/mod.rs` | HTTP 服务、路由表、请求分发、参数校验、远程任务入队、队列/状态/截图接口。 |
+| `src/interfaces/http/page.html` | 内嵌 Web 面板页面，负责调用 API 并渲染监控、点歌、队列、日志、截图和聊天监听状态。 |
+| `src/interfaces/http/tools.html` | 内嵌高级控制页，提交诊断和人工输入工具任务并轮询结果。 |
+| `src/interfaces/http/tools.rs` | 工具任务队列、状态记录、任务上限与输入独占分类。 |
+| `src/runtime/scheduler.rs` | 正式业务任务 ID、生命周期、耗时和结果摘要。 |
+| `src/runtime/decision.rs` | 把 Web 候选决策送回正在等待的点歌确认流程。 |
+| `src/features/playback/queue.rs` | 持久播放队列、稳定队列项 ID、旧文件补 ID 和原子保存。 |
+| `src/runtime/monitor.rs` | 内存态监控快照，供 TUI 和 Web 面板读取。 |
+| `src/composition.rs` | 创建 `MonitorShared`，组合并启动 HTTP 服务；业务运行时更新监控快照。 |
 
 ## 服务启动
 
-`AutomationApp::start_http_server()` 在 `http.enabled=true` 时调用 `http_server::start()`。
+组合层在 `http.enabled=true` 时调用 `interfaces::http::start()`，并只传入 HTTP 所需的配置切片和能力端口。
 
 启动流程：
 
@@ -98,7 +98,7 @@ HTTP 层只接受 `GET`、`POST`、`OPTIONS`。
 
 ### 远程命令入队
 
-这些接口会构造 `message_type = "控制台"` 的 `ParsedCommand`，再入队为 `PendingTask::Command`：
+这些接口会构造带 `message_type = "控制台"` 的 `BusinessIntent`，再通过 `HttpTaskPort` 提交：
 
 | 接口 | 映射命令 |
 | --- | --- |
@@ -124,16 +124,16 @@ HTTP 层只接受 `GET`、`POST`、`OPTIONS`。
 
 ### 直接任务入队
 
-这些接口直接入队 `PendingTask`，不是构造 `ParsedCommand`：
+这些接口不伪造聊天文本，而是通过对应的类型化任务提交方法入队：
 
 | 接口 | 入队任务 |
 | --- | --- |
-| `/chat/send` | `PendingTask::ConsoleChat`，执行时发送文本；默认前缀是 `[控制台]: `，可用 `usePrefix=0` 关闭，或用 `prefix=...` 自定义。 |
-| `/startup/game` | `PendingTask::StartGame`。 |
-| `/startup/enter-wonderland` | `PendingTask::EnterWonderland`。 |
-| `/startup/wonderland` | 依次入队 `StartGame` 和 `EnterWonderland`。 |
-| `/chat-listener/mode?mode=primary` / `secondary` | `PendingTask::SetChatListenerMode`。 |
-| `/operator/idle-exit?enabled=0` | `PendingTask::ClearIdleExit`。 |
+| `/chat/send` | 控制台发言任务；默认前缀是 `[控制台]: `，可用 `usePrefix=0` 关闭，或用 `prefix=...` 自定义。 |
+| `/startup/game` | 启动游戏任务。 |
+| `/startup/enter-wonderland` | 进入千星任务。 |
+| `/startup/wonderland` | 按顺序提交启动游戏和进入千星两个任务。 |
+| `/chat-listener/mode?mode=primary` / `secondary` | 监听模式切换任务。 |
+| `/operator/idle-exit?enabled=0` | 清除闲置退出计时任务。 |
 
 `/startup/wonderland` 只保证入队顺序，不同步等待两个任务完成。
 

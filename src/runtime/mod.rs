@@ -1,10 +1,16 @@
 pub mod business;
+pub(crate) mod chat_listener;
 pub mod clock;
 pub(crate) mod deadline;
 pub(crate) mod deadline_bridge;
+pub(crate) mod decision;
+pub(crate) mod deferred_chat;
 pub mod identity;
+pub(crate) mod monitor;
+pub(crate) mod ocr;
 pub(crate) mod openai;
 pub mod player;
 pub mod player_io;
+pub(crate) mod scheduler;
 pub mod timer;
 pub mod ui;

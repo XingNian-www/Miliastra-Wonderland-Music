@@ -4,7 +4,7 @@
 
 ## 核心结论
 
-播放器控制器负责把播放意图、播放观测、活动播放请求、暂停原因和队列推进决策收敛到一个状态机里。`main.rs` 只负责命令入口、聊天确认、AI 判断、音乐播放队列数据操作和待执行任务编排。
+播放器控制器负责把播放意图、播放观测、活动播放请求、暂停原因和队列推进决策收敛到一个状态机里。`src/composition/application/` 下的点歌、命令和播放组合模块只负责命令入口、聊天确认、AI 判断、音乐播放队列数据操作和待执行任务编排。
 
 生产环境通过 `PlayerRuntimeBackend` 使用播放器运行时的控制和稳定观测通道；FeelUOwn 只作为运行时底层端口。后续如果接入其他播放器，应替换运行时端口，而不是把新播放器逻辑写进点歌流程。
 
@@ -15,7 +15,7 @@
 | `player_controller` | 管理确认播放状态、活动播放请求、暂停原因、播放确认和队列推进决策。 |
 | `MusicPlayerBackend` | 播放器后端 trait，提供状态查询、播放 URI、暂停、恢复、上一首、下一首、音量和候选搜索。 |
 | `PlayerRuntimeBackend` | 把播放器运行时的稳定观测和控制结果适配为控制器接口。 |
-| `main.rs` | 命令入口、候选确认、聊天反馈、音乐播放队列持久化和待执行任务入队。 |
+| `src/composition/application/commands.rs`、`song_request.rs`、`playback.rs` | 命令入口、候选确认、聊天反馈、音乐播放队列操作和待执行任务入队。 |
 | `queue.rs` | 只保存音乐播放队列，不判断播放器状态。 |
 
 ## 状态模型
@@ -64,7 +64,7 @@
 | `PlaybackStateChanged` | 刷新监控里的播放器控制器状态。 |
 | `PauseForQueue` | 控制器暂停播放器并记录 `PausedWaitingForQueue`。 |
 | `ResumeIfIdle` | 只有暂停原因是 `PausedWaitingForQueue` 时恢复播放。 |
-| `AdvanceQueue(reason)` | `main.rs` 把 `PendingTask::AdvanceQueue` 放入待执行任务队列。 |
+| `AdvanceQueue(reason)` | `src/composition/application/playback.rs` 把 `PendingTask::AdvanceQueue` 放入待执行任务队列。 |
 
 用户主动暂停和系统临近结束暂停必须分开。用户暂停不会自动恢复；系统暂停只在等待队列接管时使用。
 

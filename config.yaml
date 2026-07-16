@@ -686,6 +686,10 @@ invite:
     width: 500
     height: 100
 
+friend_delivery:
+  # 好友投递中确认尚未发送项的自动重试次数；0 表示禁用
+  auto_retry_count: 0
+
 custom_workflows:
   # 是否启用配置驱动的自定义流程命令
   enabled: true

@@ -19,6 +19,13 @@ src/
 |- main.rs                         # Windows 入口与 watchdog
 |- lib.rs                          # 库公开入口
 |- composition.rs                  # 唯一应用组合入口
+|- composition/
+|  |- application.rs               # 组合对象、共享句柄和正式执行协调
+|  `- application/
+|     |- lifecycle.rs              # 启动、关闭和运行时生命周期
+|     |- workers.rs                # 后台任务、延迟聊天和诊断工作线程
+|     |- listener.rs               # 一级聊天观察、命令路由和娱乐触发
+|     `- secondary_chat.rs         # 二级聊天、好友未读和确认读取
 |- config/
 |  `- mod.rs                       # 根配置组合、加载与启动校验
 |- runtime/
@@ -83,7 +90,7 @@ flowchart LR
     C --> U
 ```
 
-- 业务模块不能依赖 `AutomationApp`、完整 `AppConfig` 或全局服务容器。
+- 业务模块不能依赖 `ApplicationRuntime`、完整 `AppConfig` 或全局服务容器。
 - UI 运行时不理解点歌、娱乐、控制台或 Web 工具。
 - OCR 不负责截图、区域选择、稳定策略或业务秘密。
 - HTTP 不直接修改业务状态，不伪造聊天命令。

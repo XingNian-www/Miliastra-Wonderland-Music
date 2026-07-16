@@ -1,7 +1,5 @@
 use std::collections::HashSet;
-use std::ffi::OsString;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -137,69 +135,7 @@ fn save_used_pairs(path: &Path, keys: &HashSet<String>) -> Result<()> {
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent().filter(|path| !path.as_os_str().is_empty()) {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("创建谁是卧底记录目录失败: {}", parent.display()))?;
-    }
-    let temporary = temporary_path(path);
-    let mut file = fs::File::create(&temporary)
-        .with_context(|| format!("创建谁是卧底临时文件失败: {}", temporary.display()))?;
-    file.write_all(bytes)
-        .with_context(|| format!("写入谁是卧底临时文件失败: {}", temporary.display()))?;
-    file.sync_all()
-        .with_context(|| format!("同步谁是卧底临时文件失败: {}", temporary.display()))?;
-    drop(file);
-    replace_file(&temporary, path)
-}
-
-fn temporary_path(path: &Path) -> PathBuf {
-    let mut name = OsString::from(".");
-    name.push(
-        path.file_name()
-            .unwrap_or_else(|| std::ffi::OsStr::new("undercover-used")),
-    );
-    name.push(".tmp");
-    path.with_file_name(name)
-}
-
-#[cfg(windows)]
-fn replace_file(temporary: &Path, target: &Path) -> Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-
-    use windows::Win32::Storage::FileSystem::{
-        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-    };
-    use windows::core::PCWSTR;
-
-    let temporary = temporary
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect::<Vec<_>>();
-    let target = target
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect::<Vec<_>>();
-    unsafe {
-        MoveFileExW(
-            PCWSTR(temporary.as_ptr()),
-            PCWSTR(target.as_ptr()),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    }
-    .context("替换谁是卧底永久使用记录失败")
-}
-
-#[cfg(not(windows))]
-fn replace_file(temporary: &Path, target: &Path) -> Result<()> {
-    fs::rename(temporary, target).with_context(|| {
-        format!(
-            "替换谁是卧底永久使用记录失败: {} -> {}",
-            temporary.display(),
-            target.display()
-        )
-    })
+    crate::adapters::file_store::write_atomic(path, bytes, "谁是卧底记录")
 }
 
 fn mix_seed(mut value: u64) -> u64 {

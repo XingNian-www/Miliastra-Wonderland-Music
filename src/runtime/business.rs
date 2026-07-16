@@ -784,17 +784,6 @@ impl BusinessRuntimeHandle {
             .map_err(|_| BusinessRuntimeError::RuntimeStopped)
     }
 
-    #[deprecated(
-        note = "use poll_card_game_timed_outcome; retained for internal API compatibility"
-    )]
-    pub fn tick_card_game(
-        &self,
-        now: Instant,
-        clock_active: bool,
-    ) -> Result<Option<CardGameTimedOutcome>, BusinessRuntimeError> {
-        self.poll_card_game_timed_outcome(now, clock_active)
-    }
-
     fn send_request(&self, message: RuntimeMessage) -> Result<(), BusinessRuntimeError> {
         let state = self
             .channel

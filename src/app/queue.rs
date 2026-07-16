@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use super::song_matcher;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default, rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct QueueItem {
     pub id: u64,
     pub keyword: String,
@@ -38,9 +38,8 @@ impl Default for QueueItem {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
-#[serde(default, rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct QueueFile {
-    #[serde(alias = "next_id")]
     next_id: u64,
     items: Vec<QueueItem>,
 }
@@ -59,7 +58,7 @@ impl PersistentQueue {
         let file = if file_exists {
             let text = fs::read_to_string(&path)
                 .with_context(|| format!("read queue state {}", path.display()))?;
-            parse_queue_file(&text)
+            serde_json::from_str(&text)
                 .with_context(|| format!("parse queue state {}", path.display()))?
         } else {
             QueueFile::default()
@@ -274,22 +273,6 @@ fn replace_file(temporary: &Path, target: &Path) -> Result<()> {
     .with_context(|| "move queue temp file over target")
 }
 
-fn parse_queue_file(text: &str) -> Result<QueueFile> {
-    let value: serde_json::Value = serde_json::from_str(text)?;
-    if value.is_array() {
-        let items = serde_json::from_value(value).context("解析旧版队列数组")?;
-        return Ok(QueueFile { next_id: 0, items });
-    }
-    if value.get("items").is_some() {
-        return serde_json::from_value(value).context("解析队列状态");
-    }
-    if let Some(queue) = value.get("queue") {
-        let items = serde_json::from_value(queue.clone()).context("解析旧版 queue 字段")?;
-        return Ok(QueueFile { next_id: 0, items });
-    }
-    anyhow::bail!("队列状态必须包含 items 或 queue 数组")
-}
-
 fn normalize_source(source: &str) -> String {
     if source.trim().is_empty() {
         String::new()
@@ -348,28 +331,17 @@ mod tests {
     }
 
     #[test]
-    fn load_legacy_array_queue_file() {
-        let path = temp_queue_path("legacy-array");
+    fn load_rejects_legacy_queue_shapes() {
+        let path = temp_queue_path("legacy-shape");
         let _ = fs::remove_file(&path);
         fs::write(
             &path,
-            r#"[{"keyword":"legacy","source":"qqmusic","preferAccompaniment":false,"aiOriginalText":"","uri":"","friendUsername":""}]"#,
+            r#"[{"id":1,"keyword":"legacy","source":"qqmusic","preferAccompaniment":false,"aiOriginalText":"","uri":"","friendUsername":"","dedupBypass":false}]"#,
         )
         .unwrap();
 
-        let loaded = PersistentQueue::load(path.clone(), 5).unwrap();
-        assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded.items()[0].keyword, "legacy");
-        let assigned_id = loaded.items()[0].id;
-        assert!(assigned_id > 0);
-
-        let reloaded = PersistentQueue::load(path.clone(), 5).unwrap();
-        assert_eq!(reloaded.items()[0].id, assigned_id);
-
-        let persisted: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(persisted["items"][0]["id"], assigned_id);
-        assert!(persisted["nextId"].as_u64().unwrap() > assigned_id);
+        let error = PersistentQueue::load(path.clone(), 5).expect_err("legacy array rejected");
+        assert!(error.to_string().contains("parse queue state"));
 
         let _ = fs::remove_file(path);
     }

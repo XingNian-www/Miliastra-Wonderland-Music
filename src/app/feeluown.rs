@@ -136,7 +136,7 @@ impl RpcAcknowledgement {
         }
     }
 
-    fn into_legacy_result(self) -> Result<String> {
+    fn into_result(self) -> Result<String> {
         if let Some(error) = self.body_error {
             return Err(error);
         }
@@ -167,9 +167,7 @@ impl FeelUOwnClient {
 
     pub fn request(&self, command: &str) -> Result<String> {
         match self.request_once(command) {
-            RpcRequestOutcome::Acknowledgement(acknowledgement) => {
-                acknowledgement.into_legacy_result()
-            }
+            RpcRequestOutcome::Acknowledgement(acknowledgement) => acknowledgement.into_result(),
             RpcRequestOutcome::NotSent(error) | RpcRequestOutcome::OutcomeUnknown(error) => {
                 Err(error)
             }

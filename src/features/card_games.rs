@@ -40,7 +40,7 @@ impl DeadlineKind for CardGameDeadlineKind {
 pub type CardGameDeadlineToken = DeadlineToken<CardGameDeadlineKind>;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct LandlordConfig {
     pub enabled: bool,
     pub lobby_timeout_seconds: u64,

@@ -1,19 +1,36 @@
+use std::collections::HashSet;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
+
+use crate::features::administration::AdministrationCommand;
 use crate::features::card_games::{
     CardGameCancel, CardGameCommandStart, CardGameDeadlineKind, CardGameDeadlineToken,
     CardGameEffectClaim, CardGameEffectKey, CardGameEffectResult, CardGameResume, CardGameService,
     CardGameTimedOutcome, LandlordCommand,
 };
+use crate::features::custom_workflow::CustomWorkflowCommand;
+use crate::features::entertainment::{EntertainmentKind, EntertainmentState};
+use crate::features::hall::HallCommand;
 use crate::features::idiom_chain::{
     IdiomChainCommand, IdiomChainDeadlineKind, IdiomChainDeadlineToken, IdiomChainOutcome,
     IdiomChainService,
 };
+use crate::features::invite::{InviteCommand, InviteRequest, InviteService, InviteStart};
+use crate::features::moderation::{
+    ModerationCommand, ModerationWorkflowKey, ModerationWorkflowLedger,
+};
+use crate::features::playback::{
+    ExternalPlaybackObservation, PlaybackCommand, PlaybackService, PlaybackStateUpdate, QueueItem,
+    QueuePushOutcome, QueueRemoval, QueueRemoveOutcome, RuntimeState, RuntimeStatePatch,
+    SongDedupCandidate,
+};
+use crate::features::song_request::SongCommand;
 use crate::features::turtle_soup::{
     QuestionSubmitOutcome, SecondaryOcrObservation, SecondaryOcrStability, TurtleSoupAiCompletion,
     TurtleSoupAiCompletionPort, TurtleSoupAppendReceipt, TurtleSoupCommand,
@@ -32,9 +49,20 @@ use crate::observation::chat::{
     CompletionAdvance, ObservationCompletionEvent, ObservationWatermark,
 };
 use crate::observation::shared::ObservationGap;
+use crate::runtime::chat_listener::{ChatListenerMode, ChatListenerSnapshot, ChatListenerState};
 use crate::runtime::deadline::{BusinessDeadlineEvent, BusinessDeadlineToken};
+use crate::runtime::decision::{DecisionAction, DecisionSnapshot, DecisionState};
+use crate::runtime::deferred_chat::{
+    DEFAULT_CAPACITY as DEFERRED_CHAT_CAPACITY, DeferredChatItem, DeferredChatQueue, EnqueueOutcome,
+};
 use crate::runtime::identity::{
     BusinessOperationId, BusinessOperationIdAllocator, SessionGeneration,
+};
+use crate::runtime::scheduler::{
+    DiagnosticTaskCompletion, DiagnosticTaskLease, DiagnosticTaskSnapshot,
+    DiagnosticTaskSubmission, FormalScheduler, FormalSchedulerSnapshot, FormalTaskCancelOutcome,
+    FormalTaskCompletion, FormalTaskDedupKey, FormalTaskEnqueueOutcome, FormalTaskLease,
+    FormalTaskSubmission, FormalTaskWork, SchedulerLane, SchedulerLaneLease,
 };
 use crate::runtime::timer::{
     DeadlineCancellation, DeadlineSchedule, TimerCommandKind, TimerRuntimeEvent, TimerRuntimeHandle,
@@ -53,11 +81,72 @@ pub enum BusinessEvent {
     TurtleSoupAiCompleted(TurtleSoupAiCompletion),
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) enum BusinessIntent {
+    SongRequest(SongCommand),
+    Playback(PlaybackCommand),
+    Hall(HallCommand),
+    Administration(AdministrationCommand),
+    IdiomChain(IdiomChainCommand),
+    CardGame(LandlordCommand),
+    TurtleSoup(TurtleSoupCommand),
+    Undercover(UndercoverCommand),
+    Invite(InviteCommand),
+    Moderation(ModerationCommand),
+    CustomWorkflow(CustomWorkflowCommand),
+}
+
+impl BusinessIntent {
+    pub(crate) fn lock_key(&self) -> String {
+        match self {
+            Self::SongRequest(command) => command.lock_key(),
+            Self::Playback(command) => command.lock_key(),
+            Self::Hall(command) => command.lock_key(),
+            Self::Administration(command) => command.lock_key(),
+            Self::IdiomChain(command) => command.lock_key(),
+            Self::CardGame(command) => command.lock_key(),
+            Self::TurtleSoup(command) => command.lock_key().to_string(),
+            Self::Undercover(command) => command.lock_key(),
+            Self::Invite(command) => command.lock_key(),
+            Self::Moderation(command) => command.lock_key(),
+            Self::CustomWorkflow(command) => command.lock_key(),
+        }
+    }
+
+    pub(crate) fn same_request(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::SongRequest(left), Self::SongRequest(right)) => left.same_request(right),
+            (Self::Playback(left), Self::Playback(right)) => left.same_request(right),
+            (Self::Hall(left), Self::Hall(right)) => left.same_request(right),
+            (Self::Administration(left), Self::Administration(right)) => left.same_request(right),
+            (Self::IdiomChain(left), Self::IdiomChain(right)) => left.same_request(right),
+            (Self::CardGame(left), Self::CardGame(right)) => left.same_request(right),
+            (Self::TurtleSoup(left), Self::TurtleSoup(right)) => left.same_request(right),
+            (Self::Undercover(left), Self::Undercover(right)) => left.same_request(right),
+            (Self::Invite(left), Self::Invite(right)) => left.same_request(right),
+            (Self::Moderation(left), Self::Moderation(right)) => left.same_request(right),
+            (Self::CustomWorkflow(left), Self::CustomWorkflow(right)) => left.same_request(right),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn scopes_lock_to_actor(&self) -> bool {
+        matches!(self, Self::CardGame(_) | Self::Undercover(_))
+    }
+}
+
 /// Narrow projection port for business-owned public state. Implementations must only retain
 /// the already-redacted snapshots; business internals never depend on the monitor shape.
 pub(crate) trait BusinessStateSink: Send + Sync {
     fn publish_turtle_soup(&self, snapshot: TurtleSoupSnapshot);
     fn publish_undercover(&self, snapshot: UndercoverSnapshot);
+    fn publish_playback_queue(&self, _queue: Vec<QueueItem>) {}
+    fn publish_hall_remaining_minutes(&self, _minutes: Option<u32>) {}
+    fn publish_scheduler(&self, _snapshot: FormalSchedulerSnapshot) {}
+    fn publish_chat_listener(&self, _snapshot: ChatListenerSnapshot) {}
+    fn publish_decision(&self, _snapshot: Option<DecisionSnapshot>) {}
+    fn publish_operational(&self, _snapshot: BusinessOperationalSnapshot) {}
+    fn publish_diagnostics(&self, _snapshot: Vec<DiagnosticTaskSnapshot>) {}
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -186,6 +275,94 @@ impl BusinessRuntimeSnapshot {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BusinessOperationalSnapshot {
+    commands_enabled: bool,
+    idle_exit_remaining_seconds: Option<u64>,
+}
+
+impl BusinessOperationalSnapshot {
+    #[cfg(test)]
+    pub(crate) const fn new(
+        commands_enabled: bool,
+        idle_exit_remaining_seconds: Option<u64>,
+    ) -> Self {
+        Self {
+            commands_enabled,
+            idle_exit_remaining_seconds,
+        }
+    }
+
+    pub(crate) const fn commands_enabled(self) -> bool {
+        self.commands_enabled
+    }
+
+    pub(crate) const fn idle_exit_remaining_seconds(self) -> Option<u64> {
+        self.idle_exit_remaining_seconds
+    }
+}
+
+struct IdleExitSchedule {
+    timeout: Duration,
+    last_command_at: Instant,
+}
+
+struct OperationalState {
+    commands_enabled: bool,
+    idle_exit: Option<IdleExitSchedule>,
+}
+
+impl OperationalState {
+    fn new() -> Self {
+        Self {
+            commands_enabled: true,
+            idle_exit: None,
+        }
+    }
+
+    fn snapshot(&self, now: Instant) -> BusinessOperationalSnapshot {
+        BusinessOperationalSnapshot {
+            commands_enabled: self.commands_enabled,
+            idle_exit_remaining_seconds: self.idle_exit.as_ref().map(|schedule| {
+                schedule
+                    .last_command_at
+                    .checked_add(schedule.timeout)
+                    .unwrap_or(schedule.last_command_at)
+                    .saturating_duration_since(now)
+                    .as_secs()
+            }),
+        }
+    }
+
+    fn configure_idle_exit(&mut self, timeout: Duration, now: Instant) {
+        self.idle_exit = Some(IdleExitSchedule {
+            timeout,
+            last_command_at: now,
+        });
+    }
+
+    fn record_command_activity(&mut self, now: Instant) {
+        if let Some(schedule) = self.idle_exit.as_mut() {
+            schedule.last_command_at = now;
+        }
+    }
+
+    fn claim_idle_exit(&mut self, now: Instant, scheduler_idle: bool) -> Option<Duration> {
+        if !scheduler_idle {
+            return None;
+        }
+        let schedule = self.idle_exit.as_ref()?;
+        let deadline = schedule
+            .last_command_at
+            .checked_add(schedule.timeout)
+            .unwrap_or(schedule.last_command_at);
+        if now < deadline {
+            return None;
+        }
+        self.idle_exit.take().map(|schedule| schedule.timeout)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BusinessRuntimeError {
     ZeroQueueCapacity,
@@ -196,7 +373,10 @@ pub enum BusinessRuntimeError {
     CardGameOperationFailed(String),
     UndercoverOperationFailed(String),
     TurtleSoupOperationFailed(String),
+    PlaybackOperationFailed(String),
     TimerOperationFailed(String),
+    SchedulerOperationFailed(String),
+    DecisionOperationFailed(String),
 }
 
 impl Display for BusinessRuntimeError {
@@ -220,8 +400,17 @@ impl Display for BusinessRuntimeError {
             Self::TurtleSoupOperationFailed(message) => {
                 write!(formatter, "turtle soup operation failed: {message}")
             }
+            Self::PlaybackOperationFailed(message) => {
+                write!(formatter, "playback operation failed: {message}")
+            }
             Self::TimerOperationFailed(message) => {
                 write!(formatter, "business timer operation failed: {message}")
+            }
+            Self::SchedulerOperationFailed(message) => {
+                write!(formatter, "business scheduler operation failed: {message}")
+            }
+            Self::DecisionOperationFailed(message) => {
+                write!(formatter, "business decision operation failed: {message}")
             }
         }
     }
@@ -231,6 +420,86 @@ impl Error for BusinessRuntimeError {}
 
 enum RuntimeMessage {
     Event(BusinessEvent),
+    EnqueueFormalTask {
+        submission: FormalTaskSubmission,
+        response: SyncSender<Result<FormalTaskEnqueueOutcome, BusinessRuntimeError>>,
+    },
+    FormalSchedulerSnapshot(SyncSender<Result<FormalSchedulerSnapshot, BusinessRuntimeError>>),
+    FormalTaskContainsDedupKey {
+        key: FormalTaskDedupKey,
+        response: SyncSender<Result<bool, BusinessRuntimeError>>,
+    },
+    TakeNextFormalTask(SyncSender<Result<Option<FormalTaskLease>, BusinessRuntimeError>>),
+    RestoreFormalTask {
+        lease: FormalTaskLease,
+        response: SyncSender<Result<(), BusinessRuntimeError>>,
+    },
+    CompleteFormalTask {
+        task_id: u64,
+        completion: FormalTaskCompletion,
+        response: SyncSender<Result<(), BusinessRuntimeError>>,
+    },
+    CancelFormalTask {
+        task_id: u64,
+        response: SyncSender<Result<Option<Box<dyn FormalTaskWork>>, BusinessRuntimeError>>,
+    },
+    ReleaseSchedulerLane {
+        lease: SchedulerLaneLease,
+        response: SyncSender<Result<(), BusinessRuntimeError>>,
+    },
+    EnqueueDeferredChat {
+        item: DeferredChatItem,
+        response: SyncSender<Result<EnqueueOutcome, BusinessRuntimeError>>,
+    },
+    RequeueDeferredChatFront {
+        item: DeferredChatItem,
+        response: SyncSender<Result<EnqueueOutcome, BusinessRuntimeError>>,
+    },
+    RequeueDeferredChatBack {
+        item: DeferredChatItem,
+        response: SyncSender<Result<EnqueueOutcome, BusinessRuntimeError>>,
+    },
+    TakeNextDeferredChat(
+        SyncSender<Result<Option<(DeferredChatItem, SchedulerLaneLease)>, BusinessRuntimeError>>,
+    ),
+    EnqueueDiagnosticTask {
+        submission: DiagnosticTaskSubmission,
+        response: SyncSender<Result<DiagnosticTaskSnapshot, BusinessRuntimeError>>,
+    },
+    TakeNextDiagnosticTask(SyncSender<Result<Option<DiagnosticTaskLease>, BusinessRuntimeError>>),
+    CompleteDiagnosticTask {
+        task_id: u64,
+        completion: DiagnosticTaskCompletion,
+        response: SyncSender<Result<(), BusinessRuntimeError>>,
+    },
+    DiagnosticTaskSnapshot {
+        id: u64,
+        response: SyncSender<Result<Option<DiagnosticTaskSnapshot>, BusinessRuntimeError>>,
+    },
+    OperationalSnapshot {
+        now: Instant,
+        response: SyncSender<Result<BusinessOperationalSnapshot, BusinessRuntimeError>>,
+    },
+    SetCommandsEnabled {
+        enabled: bool,
+        response: SyncSender<Result<(), BusinessRuntimeError>>,
+    },
+    ConfigureIdleExit {
+        timeout: Duration,
+        now: Instant,
+        response: SyncSender<Result<(), BusinessRuntimeError>>,
+    },
+    RecordCommandActivity {
+        now: Instant,
+        response: SyncSender<Result<(), BusinessRuntimeError>>,
+    },
+    ClaimIdleExit {
+        now: Instant,
+        response: SyncSender<Result<Option<Duration>, BusinessRuntimeError>>,
+    },
+    ClearIdleExit(SyncSender<Result<(), BusinessRuntimeError>>),
+    ChatListener(ChatListenerRuntimeMessage),
+    Decision(DecisionRuntimeMessage),
     HandleIdiomChain {
         player: String,
         command: IdiomChainCommand,
@@ -248,14 +517,137 @@ enum RuntimeMessage {
     UndercoverSnapshot(SyncSender<Result<UndercoverSnapshot, BusinessRuntimeError>>),
     TurtleSoup(TurtleSoupRuntimeMessage),
     TurtleSoupSnapshot(SyncSender<Result<TurtleSoupSnapshot, BusinessRuntimeError>>),
+    InviteShouldAccept {
+        sequence: Option<u32>,
+        response: SyncSender<bool>,
+    },
+    BeginInvite {
+        request: InviteRequest,
+        response: SyncSender<InviteStart>,
+    },
+    AcquireModerationWorkflow {
+        key: ModerationWorkflowKey,
+        response: SyncSender<bool>,
+    },
+    ReleaseModerationWorkflow {
+        key: ModerationWorkflowKey,
+        response: SyncSender<bool>,
+    },
+    #[cfg(test)]
+    ContainsModerationWorkflow {
+        key: ModerationWorkflowKey,
+        response: SyncSender<bool>,
+    },
+    Playback(PlaybackRuntimeMessage),
     RefreshTurtleSoup {
         now: Instant,
         clock_active: bool,
         response: SyncSender<Result<(), BusinessRuntimeError>>,
     },
+    ActiveEntertainment(SyncSender<Option<EntertainmentKind>>),
     Snapshot(SyncSender<BusinessRuntimeSnapshot>),
     PrepareShutdown(SyncSender<BusinessRuntimeSnapshot>),
     Shutdown(SyncSender<BusinessRuntimeSnapshot>),
+}
+
+enum PlaybackRuntimeMessage {
+    PushQueue {
+        item: QueueItem,
+        response: SyncSender<Result<QueuePushOutcome, BusinessRuntimeError>>,
+    },
+    RemoveQueue {
+        removal: QueueRemoval,
+        response: SyncSender<Result<QueueRemoveOutcome, BusinessRuntimeError>>,
+    },
+    RemoveQueueIndexes {
+        indexes: Vec<usize>,
+        response: SyncSender<Result<Vec<(usize, QueueItem)>, BusinessRuntimeError>>,
+    },
+    ClearQueue(SyncSender<Result<usize, BusinessRuntimeError>>),
+    QueueContains {
+        item: QueueItem,
+        response: SyncSender<Result<bool, BusinessRuntimeError>>,
+    },
+    QueueSnapshot(SyncSender<Result<Vec<QueueItem>, BusinessRuntimeError>>),
+    PatchRuntimeState {
+        patch: RuntimeStatePatch,
+        response: SyncSender<Result<(), BusinessRuntimeError>>,
+    },
+    RuntimeStateSnapshot(SyncSender<Result<RuntimeState, BusinessRuntimeError>>),
+    UpdateHallRemainingMinutes {
+        minutes: u32,
+        response: SyncSender<Result<(), BusinessRuntimeError>>,
+    },
+    ClearHallRemainingMinutes(SyncSender<Result<(), BusinessRuntimeError>>),
+    ClearHallCountdownCache(SyncSender<Result<bool, BusinessRuntimeError>>),
+    UpdatePlaybackState {
+        update: PlaybackStateUpdate,
+        response: SyncSender<Result<bool, BusinessRuntimeError>>,
+    },
+    CheckSongDedup {
+        candidate: SongDedupCandidate,
+        response: SyncSender<Result<bool, BusinessRuntimeError>>,
+    },
+    RecordSongDedup {
+        candidate: SongDedupCandidate,
+        response: SyncSender<Result<(), BusinessRuntimeError>>,
+    },
+    ObserveExternalPlayback {
+        identity: String,
+        now: Instant,
+        protect_after: Duration,
+        response: SyncSender<Result<ExternalPlaybackObservation, BusinessRuntimeError>>,
+    },
+    ClearExternalPlaybackTracker(SyncSender<Result<(), BusinessRuntimeError>>),
+}
+
+enum ChatListenerRuntimeMessage {
+    Snapshot(SyncSender<Result<ChatListenerSnapshot, BusinessRuntimeError>>),
+    RequestMode {
+        target: ChatListenerMode,
+        response: SyncSender<Result<bool, BusinessRuntimeError>>,
+    },
+    CompleteMode {
+        mode: ChatListenerMode,
+        response: SyncSender<Result<(), BusinessRuntimeError>>,
+    },
+    CancelModeRequest {
+        target: ChatListenerMode,
+        response: SyncSender<Result<(), BusinessRuntimeError>>,
+    },
+    FailModeSwitchToPrimary(SyncSender<Result<(), BusinessRuntimeError>>),
+    BeginTemporaryPrimary(SyncSender<Result<(), BusinessRuntimeError>>),
+    EndTemporaryPrimary(SyncSender<Result<(), BusinessRuntimeError>>),
+    ClaimUnreadTask(SyncSender<Result<bool, BusinessRuntimeError>>),
+    FinishUnreadTask {
+        processed_message: bool,
+        response: SyncSender<Result<(), BusinessRuntimeError>>,
+    },
+    ReleaseUnreadTask(SyncSender<Result<(), BusinessRuntimeError>>),
+    FinishInitialUnreadClear(SyncSender<Result<(), BusinessRuntimeError>>),
+    FinishHallRound(SyncSender<Result<(), BusinessRuntimeError>>),
+}
+
+enum DecisionRuntimeMessage {
+    Begin {
+        label: String,
+        allow_switch_source: bool,
+        allow_ai: bool,
+        timeout: Duration,
+        delivery: SyncSender<DecisionAction>,
+        response: SyncSender<Result<u64, BusinessRuntimeError>>,
+    },
+    #[cfg(test)]
+    Snapshot(SyncSender<Result<Option<DecisionSnapshot>, BusinessRuntimeError>>),
+    Submit {
+        id: u64,
+        action: DecisionAction,
+        response: SyncSender<Result<(), BusinessRuntimeError>>,
+    },
+    Finish {
+        id: u64,
+        response: SyncSender<Result<(), BusinessRuntimeError>>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -401,6 +793,53 @@ pub struct BusinessRuntimeHandle {
     channel: Arc<RuntimeChannel>,
 }
 
+pub(crate) struct SchedulerPermit {
+    handle: BusinessRuntimeHandle,
+    lease: Option<SchedulerLaneLease>,
+}
+
+pub(crate) struct DecisionSession {
+    handle: BusinessRuntimeHandle,
+    id: u64,
+    receiver: Receiver<DecisionAction>,
+}
+
+impl DecisionSession {
+    #[cfg(test)]
+    pub(crate) const fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub(crate) fn wait(
+        &self,
+        timeout: Duration,
+    ) -> Result<Option<DecisionAction>, BusinessRuntimeError> {
+        match self.receiver.recv_timeout(timeout) {
+            Ok(action) => Ok(Some(action)),
+            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => Ok(None),
+        }
+    }
+}
+
+impl Drop for DecisionSession {
+    fn drop(&mut self) {
+        if let Err(error) = self.handle.finish_decision(self.id) {
+            log::debug!("结束 Web 决策失败: {error}");
+        }
+    }
+}
+
+impl Drop for SchedulerPermit {
+    fn drop(&mut self) {
+        let Some(lease) = self.lease.take() else {
+            return;
+        };
+        if let Err(error) = self.handle.release_scheduler_lane(lease) {
+            log::debug!("释放调度通道租约失败: {error}");
+        }
+    }
+}
+
 impl BusinessRuntimeHandle {
     pub fn submit(&self, event: BusinessEvent) -> Result<(), BusinessRuntimeError> {
         self.send_request(RuntimeMessage::Event(event))
@@ -412,6 +851,540 @@ impl BusinessRuntimeHandle {
         receiver
             .recv()
             .map_err(|_| BusinessRuntimeError::RuntimeStopped)
+    }
+
+    pub(crate) fn enqueue_formal_task(
+        &self,
+        submission: FormalTaskSubmission,
+    ) -> Result<FormalTaskEnqueueOutcome, BusinessRuntimeError> {
+        self.request(|response| RuntimeMessage::EnqueueFormalTask {
+            submission,
+            response,
+        })
+    }
+
+    pub(crate) fn take_next_formal_task(
+        &self,
+    ) -> Result<Option<FormalTaskLease>, BusinessRuntimeError> {
+        self.request(RuntimeMessage::TakeNextFormalTask)
+    }
+
+    pub(crate) fn formal_task_contains_dedup_key(
+        &self,
+        key: FormalTaskDedupKey,
+    ) -> Result<bool, BusinessRuntimeError> {
+        self.request(|response| RuntimeMessage::FormalTaskContainsDedupKey { key, response })
+    }
+
+    pub(crate) fn restore_formal_task(
+        &self,
+        lease: FormalTaskLease,
+    ) -> Result<(), BusinessRuntimeError> {
+        self.request(|response| RuntimeMessage::RestoreFormalTask { lease, response })
+    }
+
+    pub(crate) fn complete_formal_task(
+        &self,
+        task_id: u64,
+        completion: FormalTaskCompletion,
+    ) -> Result<(), BusinessRuntimeError> {
+        self.request(|response| RuntimeMessage::CompleteFormalTask {
+            task_id,
+            completion,
+            response,
+        })
+    }
+
+    pub(crate) fn cancel_formal_task(
+        &self,
+        task_id: u64,
+    ) -> Result<FormalTaskCancelOutcome, BusinessRuntimeError> {
+        let work =
+            self.request(|response| RuntimeMessage::CancelFormalTask { task_id, response })?;
+        let Some(work) = work else {
+            return Ok(FormalTaskCancelOutcome::NotQueued);
+        };
+        work.cancel();
+        Ok(FormalTaskCancelOutcome::Canceled)
+    }
+
+    pub(crate) fn scheduler_snapshot(
+        &self,
+    ) -> Result<FormalSchedulerSnapshot, BusinessRuntimeError> {
+        self.request(RuntimeMessage::FormalSchedulerSnapshot)
+    }
+
+    fn release_scheduler_lane(
+        &self,
+        lease: SchedulerLaneLease,
+    ) -> Result<(), BusinessRuntimeError> {
+        self.request(|response| RuntimeMessage::ReleaseSchedulerLane { lease, response })
+    }
+
+    pub(crate) fn enqueue_deferred_chat(
+        &self,
+        item: impl Into<DeferredChatItem>,
+    ) -> Result<EnqueueOutcome, BusinessRuntimeError> {
+        let item = item.into();
+        self.request(|response| RuntimeMessage::EnqueueDeferredChat { item, response })
+    }
+
+    pub(crate) fn requeue_deferred_chat_front(
+        &self,
+        item: DeferredChatItem,
+    ) -> Result<EnqueueOutcome, BusinessRuntimeError> {
+        self.request(|response| RuntimeMessage::RequeueDeferredChatFront { item, response })
+    }
+
+    pub(crate) fn requeue_deferred_chat_back(
+        &self,
+        item: DeferredChatItem,
+    ) -> Result<EnqueueOutcome, BusinessRuntimeError> {
+        self.request(|response| RuntimeMessage::RequeueDeferredChatBack { item, response })
+    }
+
+    pub(crate) fn take_next_deferred_chat(
+        &self,
+    ) -> Result<Option<(DeferredChatItem, SchedulerPermit)>, BusinessRuntimeError> {
+        let item = self.request(RuntimeMessage::TakeNextDeferredChat)?;
+        Ok(item.map(|(item, lease)| {
+            (
+                item,
+                SchedulerPermit {
+                    handle: self.clone(),
+                    lease: Some(lease),
+                },
+            )
+        }))
+    }
+
+    pub(crate) fn enqueue_diagnostic_task(
+        &self,
+        submission: DiagnosticTaskSubmission,
+    ) -> Result<DiagnosticTaskSnapshot, BusinessRuntimeError> {
+        self.request(|response| RuntimeMessage::EnqueueDiagnosticTask {
+            submission,
+            response,
+        })
+    }
+
+    pub(crate) fn take_next_diagnostic_task(
+        &self,
+    ) -> Result<Option<DiagnosticTaskLease>, BusinessRuntimeError> {
+        self.request(RuntimeMessage::TakeNextDiagnosticTask)
+    }
+
+    pub(crate) fn complete_diagnostic_task(
+        &self,
+        task_id: u64,
+        completion: DiagnosticTaskCompletion,
+    ) -> Result<(), BusinessRuntimeError> {
+        self.request(|response| RuntimeMessage::CompleteDiagnosticTask {
+            task_id,
+            completion,
+            response,
+        })
+    }
+
+    pub(crate) fn diagnostic_task_snapshot(
+        &self,
+        id: u64,
+    ) -> Result<Option<DiagnosticTaskSnapshot>, BusinessRuntimeError> {
+        self.request(|response| RuntimeMessage::DiagnosticTaskSnapshot { id, response })
+    }
+
+    pub(crate) fn operational_snapshot(
+        &self,
+        now: Instant,
+    ) -> Result<BusinessOperationalSnapshot, BusinessRuntimeError> {
+        self.request(|response| RuntimeMessage::OperationalSnapshot { now, response })
+    }
+
+    pub(crate) fn set_commands_enabled(&self, enabled: bool) -> Result<(), BusinessRuntimeError> {
+        self.request(|response| RuntimeMessage::SetCommandsEnabled { enabled, response })
+    }
+
+    pub(crate) fn configure_idle_exit(
+        &self,
+        timeout: Duration,
+        now: Instant,
+    ) -> Result<(), BusinessRuntimeError> {
+        self.request(|response| RuntimeMessage::ConfigureIdleExit {
+            timeout,
+            now,
+            response,
+        })
+    }
+
+    pub(crate) fn record_command_activity(&self, now: Instant) -> Result<(), BusinessRuntimeError> {
+        self.request(|response| RuntimeMessage::RecordCommandActivity { now, response })
+    }
+
+    pub(crate) fn claim_idle_exit(
+        &self,
+        now: Instant,
+    ) -> Result<Option<Duration>, BusinessRuntimeError> {
+        self.request(|response| RuntimeMessage::ClaimIdleExit { now, response })
+    }
+
+    pub(crate) fn clear_idle_exit(&self) -> Result<(), BusinessRuntimeError> {
+        self.request(RuntimeMessage::ClearIdleExit)
+    }
+
+    pub(crate) fn chat_listener_snapshot(
+        &self,
+    ) -> Result<ChatListenerSnapshot, BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::ChatListener(ChatListenerRuntimeMessage::Snapshot(response))
+        })
+    }
+
+    pub(crate) fn request_chat_listener_mode(
+        &self,
+        target: ChatListenerMode,
+    ) -> Result<bool, BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::ChatListener(ChatListenerRuntimeMessage::RequestMode {
+                target,
+                response,
+            })
+        })
+    }
+
+    pub(crate) fn complete_chat_listener_mode(
+        &self,
+        mode: ChatListenerMode,
+    ) -> Result<(), BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::ChatListener(ChatListenerRuntimeMessage::CompleteMode {
+                mode,
+                response,
+            })
+        })
+    }
+
+    pub(crate) fn cancel_chat_listener_mode_request(
+        &self,
+        target: ChatListenerMode,
+    ) -> Result<(), BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::ChatListener(ChatListenerRuntimeMessage::CancelModeRequest {
+                target,
+                response,
+            })
+        })
+    }
+
+    pub(crate) fn fail_chat_listener_mode_to_primary(&self) -> Result<(), BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::ChatListener(ChatListenerRuntimeMessage::FailModeSwitchToPrimary(
+                response,
+            ))
+        })
+    }
+
+    pub(crate) fn begin_chat_listener_temporary_primary(&self) -> Result<(), BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::ChatListener(ChatListenerRuntimeMessage::BeginTemporaryPrimary(
+                response,
+            ))
+        })
+    }
+
+    pub(crate) fn end_chat_listener_temporary_primary(&self) -> Result<(), BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::ChatListener(ChatListenerRuntimeMessage::EndTemporaryPrimary(response))
+        })
+    }
+
+    pub(crate) fn claim_chat_listener_unread_task(&self) -> Result<bool, BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::ChatListener(ChatListenerRuntimeMessage::ClaimUnreadTask(response))
+        })
+    }
+
+    pub(crate) fn finish_chat_listener_unread_task(
+        &self,
+        processed_message: bool,
+    ) -> Result<(), BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::ChatListener(ChatListenerRuntimeMessage::FinishUnreadTask {
+                processed_message,
+                response,
+            })
+        })
+    }
+
+    pub(crate) fn release_chat_listener_unread_task(&self) -> Result<(), BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::ChatListener(ChatListenerRuntimeMessage::ReleaseUnreadTask(response))
+        })
+    }
+
+    pub(crate) fn finish_chat_listener_initial_unread_clear(
+        &self,
+    ) -> Result<(), BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::ChatListener(ChatListenerRuntimeMessage::FinishInitialUnreadClear(
+                response,
+            ))
+        })
+    }
+
+    pub(crate) fn finish_chat_listener_hall_round(&self) -> Result<(), BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::ChatListener(ChatListenerRuntimeMessage::FinishHallRound(response))
+        })
+    }
+
+    pub(crate) fn begin_decision(
+        &self,
+        label: impl Into<String>,
+        allow_switch_source: bool,
+        allow_ai: bool,
+        timeout: Duration,
+    ) -> Result<DecisionSession, BusinessRuntimeError> {
+        let (delivery, receiver) = mpsc::sync_channel(1);
+        let id = self.request(|response| {
+            RuntimeMessage::Decision(DecisionRuntimeMessage::Begin {
+                label: label.into(),
+                allow_switch_source,
+                allow_ai,
+                timeout,
+                delivery,
+                response,
+            })
+        })?;
+        Ok(DecisionSession {
+            handle: self.clone(),
+            id,
+            receiver,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn decision_snapshot(
+        &self,
+    ) -> Result<Option<DecisionSnapshot>, BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::Decision(DecisionRuntimeMessage::Snapshot(response))
+        })
+    }
+
+    pub(crate) fn submit_decision(
+        &self,
+        id: u64,
+        action: DecisionAction,
+    ) -> Result<(), BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::Decision(DecisionRuntimeMessage::Submit {
+                id,
+                action,
+                response,
+            })
+        })
+    }
+
+    fn finish_decision(&self, id: u64) -> Result<(), BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::Decision(DecisionRuntimeMessage::Finish { id, response })
+        })
+    }
+
+    pub(crate) fn push_playback_queue(
+        &self,
+        item: QueueItem,
+    ) -> Result<QueuePushOutcome, BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::Playback(PlaybackRuntimeMessage::PushQueue { item, response })
+        })
+    }
+
+    pub(crate) fn remove_playback_queue(
+        &self,
+        removal: QueueRemoval,
+    ) -> Result<QueueRemoveOutcome, BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::Playback(PlaybackRuntimeMessage::RemoveQueue { removal, response })
+        })
+    }
+
+    pub(crate) fn remove_playback_queue_indexes(
+        &self,
+        indexes: Vec<usize>,
+    ) -> Result<Vec<(usize, QueueItem)>, BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::Playback(PlaybackRuntimeMessage::RemoveQueueIndexes {
+                indexes,
+                response,
+            })
+        })
+    }
+
+    pub(crate) fn clear_playback_queue(&self) -> Result<usize, BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::Playback(PlaybackRuntimeMessage::ClearQueue(response))
+        })
+    }
+
+    pub(crate) fn playback_queue_snapshot(&self) -> Result<Vec<QueueItem>, BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::Playback(PlaybackRuntimeMessage::QueueSnapshot(response))
+        })
+    }
+
+    pub(crate) fn playback_queue_contains(
+        &self,
+        item: QueueItem,
+    ) -> Result<bool, BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::Playback(PlaybackRuntimeMessage::QueueContains { item, response })
+        })
+    }
+
+    pub(crate) fn patch_runtime_state(
+        &self,
+        patch: RuntimeStatePatch,
+    ) -> Result<(), BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::Playback(PlaybackRuntimeMessage::PatchRuntimeState { patch, response })
+        })
+    }
+
+    pub(crate) fn runtime_state_snapshot(&self) -> Result<RuntimeState, BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::Playback(PlaybackRuntimeMessage::RuntimeStateSnapshot(response))
+        })
+    }
+
+    pub(crate) fn update_hall_remaining_minutes(
+        &self,
+        minutes: u32,
+    ) -> Result<(), BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::Playback(PlaybackRuntimeMessage::UpdateHallRemainingMinutes {
+                minutes,
+                response,
+            })
+        })
+    }
+
+    pub(crate) fn clear_hall_remaining_minutes(&self) -> Result<(), BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::Playback(PlaybackRuntimeMessage::ClearHallRemainingMinutes(response))
+        })
+    }
+
+    pub(crate) fn clear_hall_countdown_cache(&self) -> Result<bool, BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::Playback(PlaybackRuntimeMessage::ClearHallCountdownCache(response))
+        })
+    }
+
+    pub(crate) fn update_playback_state(
+        &self,
+        update: PlaybackStateUpdate,
+    ) -> Result<bool, BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::Playback(PlaybackRuntimeMessage::UpdatePlaybackState {
+                update,
+                response,
+            })
+        })
+    }
+
+    pub(crate) fn song_dedup_limited(
+        &self,
+        candidate: SongDedupCandidate,
+    ) -> Result<bool, BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::Playback(PlaybackRuntimeMessage::CheckSongDedup {
+                candidate,
+                response,
+            })
+        })
+    }
+
+    pub(crate) fn record_song_dedup(
+        &self,
+        candidate: SongDedupCandidate,
+    ) -> Result<(), BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::Playback(PlaybackRuntimeMessage::RecordSongDedup {
+                candidate,
+                response,
+            })
+        })
+    }
+
+    pub(crate) fn observe_external_playback(
+        &self,
+        identity: String,
+        now: Instant,
+        protect_after: Duration,
+    ) -> Result<ExternalPlaybackObservation, BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::Playback(PlaybackRuntimeMessage::ObserveExternalPlayback {
+                identity,
+                now,
+                protect_after,
+                response,
+            })
+        })
+    }
+
+    pub(crate) fn clear_external_playback_tracker(&self) -> Result<(), BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::Playback(PlaybackRuntimeMessage::ClearExternalPlaybackTracker(
+                response,
+            ))
+        })
+    }
+
+    pub(crate) fn active_entertainment(
+        &self,
+    ) -> Result<Option<EntertainmentKind>, BusinessRuntimeError> {
+        let (response, receiver) = mpsc::sync_channel(1);
+        self.send_query(RuntimeMessage::ActiveEntertainment(response))?;
+        receiver
+            .recv()
+            .map_err(|_| BusinessRuntimeError::RuntimeStopped)
+    }
+
+    pub(crate) fn invite_should_accept(
+        &self,
+        sequence: Option<u32>,
+    ) -> Result<bool, BusinessRuntimeError> {
+        self.request_value(|response| RuntimeMessage::InviteShouldAccept { sequence, response })
+    }
+
+    pub(crate) fn begin_invite(
+        &self,
+        request: InviteRequest,
+    ) -> Result<InviteStart, BusinessRuntimeError> {
+        self.request_value(|response| RuntimeMessage::BeginInvite { request, response })
+    }
+
+    fn acquire_moderation_workflow(
+        &self,
+        key: ModerationWorkflowKey,
+    ) -> Result<bool, BusinessRuntimeError> {
+        self.request_value(|response| RuntimeMessage::AcquireModerationWorkflow { key, response })
+    }
+
+    fn release_moderation_workflow(
+        &self,
+        key: ModerationWorkflowKey,
+    ) -> Result<bool, BusinessRuntimeError> {
+        self.request_value(|response| RuntimeMessage::ReleaseModerationWorkflow { key, response })
+    }
+
+    #[cfg(test)]
+    fn contains_moderation_workflow(
+        &self,
+        key: ModerationWorkflowKey,
+    ) -> Result<bool, BusinessRuntimeError> {
+        self.request_value(|response| RuntimeMessage::ContainsModerationWorkflow { key, response })
     }
 
     pub fn handle_idiom_chain(
@@ -817,6 +1790,24 @@ impl BusinessRuntimeHandle {
     }
 }
 
+impl ModerationWorkflowLedger for BusinessRuntimeHandle {
+    fn acquire(&self, key: ModerationWorkflowKey) -> anyhow::Result<bool> {
+        self.acquire_moderation_workflow(key)
+            .map_err(anyhow::Error::from)
+    }
+
+    fn release(&self, key: ModerationWorkflowKey) -> anyhow::Result<bool> {
+        self.release_moderation_workflow(key)
+            .map_err(anyhow::Error::from)
+    }
+
+    #[cfg(test)]
+    fn contains(&self, key: ModerationWorkflowKey) -> anyhow::Result<bool> {
+        self.contains_moderation_workflow(key)
+            .map_err(anyhow::Error::from)
+    }
+}
+
 #[derive(Clone)]
 pub struct BusinessRuntimeEventSink {
     channel: Arc<RuntimeChannel>,
@@ -860,6 +1851,42 @@ pub struct BusinessRuntime {
     turtle_soup_workers: Option<TurtleSoupWorkerRuntime>,
 }
 
+pub(crate) struct BusinessRuntimeWorker {
+    idiom_chain: IdiomChainService,
+    card_games: CardGameService,
+    undercover: UndercoverRuntimeService,
+    turtle_soup: Option<TurtleSoupService>,
+    playback: Option<PlaybackService>,
+    invite: InviteService,
+    timer: Option<TimerRuntimeHandle<BusinessDeadlineToken>>,
+    state_sink: Option<Arc<dyn BusinessStateSink>>,
+}
+
+impl BusinessRuntimeWorker {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_parts(
+        idiom_chain: IdiomChainService,
+        card_games: CardGameService,
+        undercover: UndercoverRuntimeService,
+        turtle_soup: TurtleSoupService,
+        playback: PlaybackService,
+        invite: InviteService,
+        timer: TimerRuntimeHandle<BusinessDeadlineToken>,
+        state_sink: Arc<dyn BusinessStateSink>,
+    ) -> Self {
+        Self {
+            idiom_chain,
+            card_games,
+            undercover,
+            turtle_soup: Some(turtle_soup),
+            playback: Some(playback),
+            invite,
+            timer: Some(timer),
+            state_sink: Some(state_sink),
+        }
+    }
+}
+
 impl BusinessRuntime {
     #[cfg(test)]
     pub(crate) fn start(
@@ -869,12 +1896,38 @@ impl BusinessRuntime {
     ) -> Result<Self, BusinessRuntimeError> {
         Self::start_internal(
             queue_capacity,
-            idiom_chain,
-            card_games,
-            default_undercover_service(),
-            None,
-            None,
-            None,
+            BusinessRuntimeWorker {
+                idiom_chain,
+                card_games,
+                undercover: default_undercover_service(),
+                turtle_soup: None,
+                playback: None,
+                invite: InviteService::new(),
+                timer: None,
+                state_sink: None,
+            },
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn start_with_playback(
+        queue_capacity: usize,
+        idiom_chain: IdiomChainService,
+        card_games: CardGameService,
+        playback: PlaybackService,
+    ) -> Result<Self, BusinessRuntimeError> {
+        Self::start_internal(
+            queue_capacity,
+            BusinessRuntimeWorker {
+                idiom_chain,
+                card_games,
+                undercover: default_undercover_service(),
+                turtle_soup: None,
+                playback: Some(playback),
+                invite: InviteService::new(),
+                timer: None,
+                state_sink: None,
+            },
         )
     }
 
@@ -885,46 +1938,33 @@ impl BusinessRuntime {
         card_games: CardGameService,
         undercover: UndercoverRuntimeService,
         turtle_soup: TurtleSoupService,
+        playback: PlaybackService,
     ) -> Result<Self, BusinessRuntimeError> {
         Self::start_internal(
             queue_capacity,
-            idiom_chain,
-            card_games,
-            undercover,
-            Some(turtle_soup),
-            None,
-            None,
+            BusinessRuntimeWorker {
+                idiom_chain,
+                card_games,
+                undercover,
+                turtle_soup: Some(turtle_soup),
+                playback: Some(playback),
+                invite: InviteService::new(),
+                timer: None,
+                state_sink: None,
+            },
         )
     }
 
     pub(crate) fn start_with_timer_and_modules_and_state_sink(
         queue_capacity: usize,
-        idiom_chain: IdiomChainService,
-        card_games: CardGameService,
-        undercover: UndercoverRuntimeService,
-        turtle_soup: TurtleSoupService,
-        timer: TimerRuntimeHandle<BusinessDeadlineToken>,
-        state_sink: Arc<dyn BusinessStateSink>,
+        worker_config: BusinessRuntimeWorker,
     ) -> Result<Self, BusinessRuntimeError> {
-        Self::start_internal(
-            queue_capacity,
-            idiom_chain,
-            card_games,
-            undercover,
-            Some(turtle_soup),
-            Some(timer),
-            Some(state_sink),
-        )
+        Self::start_internal(queue_capacity, worker_config)
     }
 
     fn start_internal(
         queue_capacity: usize,
-        idiom_chain: IdiomChainService,
-        card_games: CardGameService,
-        undercover: UndercoverRuntimeService,
-        mut turtle_soup: Option<TurtleSoupService>,
-        timer: Option<TimerRuntimeHandle<BusinessDeadlineToken>>,
-        state_sink: Option<Arc<dyn BusinessStateSink>>,
+        mut worker_config: BusinessRuntimeWorker,
     ) -> Result<Self, BusinessRuntimeError> {
         if queue_capacity == 0 {
             return Err(BusinessRuntimeError::ZeroQueueCapacity);
@@ -937,7 +1977,7 @@ impl BusinessRuntime {
         let event_sink = BusinessRuntimeEventSink {
             channel: channel.clone(),
         };
-        let mut turtle_soup_workers = if let Some(service) = turtle_soup.as_mut() {
+        let mut turtle_soup_workers = if let Some(service) = worker_config.turtle_soup.as_mut() {
             service
                 .start_workers_with_port(Arc::new(TurtleSoupBusinessEventPort { sink: event_sink }))
         } else {
@@ -945,17 +1985,7 @@ impl BusinessRuntime {
         };
         let worker = thread::Builder::new()
             .name("business-runtime".to_string())
-            .spawn(move || {
-                run_business_runtime(
-                    receiver,
-                    idiom_chain,
-                    card_games,
-                    undercover,
-                    turtle_soup,
-                    timer,
-                    state_sink,
-                )
-            })
+            .spawn(move || run_business_runtime(receiver, worker_config))
             .map_err(|_| {
                 if let Some(workers) = turtle_soup_workers.as_mut() {
                     workers.shutdown();
@@ -1054,10 +2084,7 @@ impl BusinessRuntime {
 
 #[cfg(test)]
 fn default_undercover_service() -> UndercoverRuntimeService {
-    UndercoverRuntimeService::new(
-        UndercoverConfig::default(),
-        crate::features::entertainment::EntertainmentCoordinator::new(),
-    )
+    UndercoverRuntimeService::new(UndercoverConfig::default())
 }
 
 impl Drop for BusinessRuntime {
@@ -1480,10 +2507,12 @@ fn sync_undercover_deadline(
 #[allow(clippy::too_many_arguments)]
 fn handle_business_timer(
     event: BusinessDeadlineEvent,
+    entertainment: &mut EntertainmentState,
     idiom_chain: &mut IdiomChainService,
     card_games: &mut CardGameService,
     undercover: &mut UndercoverRuntimeService,
     mut turtle_soup: Option<&mut TurtleSoupService>,
+    deferred_chat: &mut DeferredChatQueue,
     timer: Option<&TimerRuntimeHandle<BusinessDeadlineToken>>,
     active_idiom_deadline: &mut Option<ActiveIdiomDeadline>,
     active_card_game_deadline: &mut Option<ActiveCardGameDeadline>,
@@ -1513,7 +2542,12 @@ fn handle_business_timer(
                     return Ok(());
                 }
                 if let Some(service) = turtle_soup.as_deref_mut() {
-                    service.handle_deadline(*expired.token().kind(), Instant::now());
+                    service.handle_deadline(
+                        entertainment,
+                        *expired.token().kind(),
+                        Instant::now(),
+                        deferred_chat,
+                    );
                 }
                 return sync_turtle_soup_deadline(
                     turtle_soup.as_deref(),
@@ -1612,7 +2646,12 @@ fn handle_business_timer(
                     BusinessRuntimeError::UndercoverOperationFailed(error.to_string())
                 })?;
                 if let Some(outcome) = undercover
-                    .handle_deadline(*expired.token().kind(), Instant::now(), outcome_operation)
+                    .handle_deadline(
+                        entertainment,
+                        *expired.token().kind(),
+                        Instant::now(),
+                        outcome_operation,
+                    )
                     .map_err(undercover_operation_failed)?
                 {
                     pending_undercover_outcomes.push_back(outcome);
@@ -1708,7 +2747,7 @@ fn handle_business_timer(
                 }
                 let handled_at = Instant::now();
                 if let Some(outcome) = card_games
-                    .handle_deadline(*expired.token().kind(), handled_at)
+                    .handle_deadline(entertainment, *expired.token().kind(), handled_at)
                     .map_err(card_game_operation_failed)?
                 {
                     pending_card_game_outcomes.push_back(outcome);
@@ -1806,7 +2845,7 @@ fn handle_business_timer(
 
     *active_idiom_deadline = None;
     if idiom_chain
-        .expire_idle_at(expired.emitted_at())
+        .expire_idle_at(entertainment, expired.emitted_at())
         .map_err(idiom_chain_operation_failed)?
     {
         log::info!("成语接龙已因计时运行时期限到期结束，娱乐互斥已释放");
@@ -1820,16 +2859,24 @@ fn handle_business_timer(
     )
 }
 
-fn run_business_runtime(
-    receiver: Receiver<RuntimeMessage>,
-    mut idiom_chain: IdiomChainService,
-    mut card_games: CardGameService,
-    mut undercover: UndercoverRuntimeService,
-    mut turtle_soup: Option<TurtleSoupService>,
-    timer: Option<TimerRuntimeHandle<BusinessDeadlineToken>>,
-    state_sink: Option<Arc<dyn BusinessStateSink>>,
-) {
+fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: BusinessRuntimeWorker) {
+    let BusinessRuntimeWorker {
+        mut idiom_chain,
+        mut card_games,
+        mut undercover,
+        mut turtle_soup,
+        mut playback,
+        mut invite,
+        timer,
+        state_sink,
+    } = worker_config;
     let mut snapshot = BusinessRuntimeSnapshot::default();
+    let mut entertainment = EntertainmentState::new();
+    let mut formal_scheduler = FormalScheduler::new();
+    let mut deferred_chat = DeferredChatQueue::new(DEFERRED_CHAT_CAPACITY);
+    let mut chat_listener = ChatListenerState::new();
+    let mut decision = DecisionState::new();
+    let mut operational = OperationalState::new();
     let mut active_idiom_deadline = None;
     let mut active_card_game_deadline = None;
     let mut active_undercover_deadline = None;
@@ -1840,20 +2887,212 @@ fn run_business_runtime(
     let mut pending_card_game_outcomes = std::collections::VecDeque::new();
     let mut pending_undercover_outcomes = std::collections::VecDeque::new();
     let mut entertainment_clock_active = true;
+    let mut moderation_workflows = HashSet::new();
     let operation_ids = BusinessOperationIdAllocator::new();
     let mut session_generation = SessionGeneration::INITIAL;
     publish_business_state(&state_sink, turtle_soup.as_ref(), &undercover);
+    publish_playback_queue(&state_sink, playback.as_ref());
+    publish_hall_state(&state_sink, playback.as_ref());
+    publish_scheduler_state(&state_sink, &formal_scheduler);
+    publish_diagnostic_state(&state_sink, &formal_scheduler);
+    publish_chat_listener_state(&state_sink, &chat_listener);
+    publish_decision_state(&state_sink, &mut decision);
+    publish_operational_state(&state_sink, &operational, Instant::now());
     while let Ok(message) = receiver.recv() {
         match message {
+            RuntimeMessage::EnqueueFormalTask {
+                submission,
+                response,
+            } => {
+                let outcome = formal_scheduler.enqueue(submission);
+                publish_scheduler_state(&state_sink, &formal_scheduler);
+                let _ = response.send(Ok(outcome));
+            }
+            RuntimeMessage::FormalSchedulerSnapshot(response) => {
+                let _ = response.send(Ok(formal_scheduler.snapshot()));
+            }
+            RuntimeMessage::FormalTaskContainsDedupKey { key, response } => {
+                let _ = response.send(Ok(formal_scheduler.contains_dedup_key(&key)));
+            }
+            RuntimeMessage::TakeNextFormalTask(response) => {
+                let task = formal_scheduler.take_next();
+                if task.is_some() {
+                    publish_scheduler_state(&state_sink, &formal_scheduler);
+                }
+                let _ = response.send(Ok(task));
+            }
+            RuntimeMessage::RestoreFormalTask { lease, response } => {
+                let result = formal_scheduler.restore(lease).map_err(|error| {
+                    BusinessRuntimeError::SchedulerOperationFailed(error.to_string())
+                });
+                if result.is_ok() {
+                    publish_scheduler_state(&state_sink, &formal_scheduler);
+                }
+                let _ = response.send(result);
+            }
+            RuntimeMessage::CompleteFormalTask {
+                task_id,
+                completion,
+                response,
+            } => {
+                let result = formal_scheduler
+                    .complete(task_id, completion)
+                    .map_err(|error| {
+                        BusinessRuntimeError::SchedulerOperationFailed(error.to_string())
+                    });
+                if result.is_ok() {
+                    publish_scheduler_state(&state_sink, &formal_scheduler);
+                }
+                let _ = response.send(result);
+            }
+            RuntimeMessage::CancelFormalTask { task_id, response } => {
+                let work = formal_scheduler.cancel_queued(task_id);
+                if work.is_some() {
+                    publish_scheduler_state(&state_sink, &formal_scheduler);
+                }
+                let _ = response.send(Ok(work));
+            }
+            RuntimeMessage::ReleaseSchedulerLane { lease, response } => {
+                let result = formal_scheduler.release_lane(lease).map_err(|error| {
+                    BusinessRuntimeError::SchedulerOperationFailed(error.to_string())
+                });
+                if result.is_ok() {
+                    publish_scheduler_state(&state_sink, &formal_scheduler);
+                }
+                let _ = response.send(result);
+            }
+            RuntimeMessage::EnqueueDeferredChat { item, response } => {
+                let result = deferred_chat.enqueue(item).map_err(|error| {
+                    BusinessRuntimeError::SchedulerOperationFailed(error.to_string())
+                });
+                let _ = response.send(result);
+            }
+            RuntimeMessage::RequeueDeferredChatFront { item, response } => {
+                let _ = response.send(Ok(deferred_chat.requeue_front(item)));
+            }
+            RuntimeMessage::RequeueDeferredChatBack { item, response } => {
+                let _ = response.send(Ok(deferred_chat.requeue_back(item)));
+            }
+            RuntimeMessage::TakeNextDeferredChat(response) => {
+                let result = if deferred_chat.is_empty() {
+                    Ok(None)
+                } else {
+                    formal_scheduler
+                        .try_acquire_lane(SchedulerLane::Deferred)
+                        .map_err(|error| {
+                            BusinessRuntimeError::SchedulerOperationFailed(error.to_string())
+                        })
+                        .map(|lease| {
+                            lease.map(|lease| {
+                                let item = deferred_chat
+                                    .take_next()
+                                    .expect("deferred queue was checked as non-empty");
+                                (item, lease)
+                            })
+                        })
+                };
+                if result.as_ref().is_ok_and(Option::is_some) {
+                    publish_scheduler_state(&state_sink, &formal_scheduler);
+                }
+                let _ = response.send(result);
+            }
+            RuntimeMessage::EnqueueDiagnosticTask {
+                submission,
+                response,
+            } => {
+                let result = formal_scheduler
+                    .enqueue_diagnostic(submission)
+                    .map_err(|error| {
+                        BusinessRuntimeError::SchedulerOperationFailed(error.to_string())
+                    });
+                if result.is_ok() {
+                    publish_diagnostic_state(&state_sink, &formal_scheduler);
+                }
+                let _ = response.send(result);
+            }
+            RuntimeMessage::TakeNextDiagnosticTask(response) => {
+                let task = if deferred_chat.is_empty() {
+                    formal_scheduler.take_next_diagnostic()
+                } else {
+                    None
+                };
+                if task.is_some() {
+                    publish_scheduler_state(&state_sink, &formal_scheduler);
+                    publish_diagnostic_state(&state_sink, &formal_scheduler);
+                }
+                let _ = response.send(Ok(task));
+            }
+            RuntimeMessage::CompleteDiagnosticTask {
+                task_id,
+                completion,
+                response,
+            } => {
+                let result = formal_scheduler
+                    .complete_diagnostic(task_id, completion)
+                    .map_err(|error| {
+                        BusinessRuntimeError::SchedulerOperationFailed(error.to_string())
+                    });
+                if result.is_ok() {
+                    publish_scheduler_state(&state_sink, &formal_scheduler);
+                    publish_diagnostic_state(&state_sink, &formal_scheduler);
+                }
+                let _ = response.send(result);
+            }
+            RuntimeMessage::DiagnosticTaskSnapshot { id, response } => {
+                let _ = response.send(Ok(formal_scheduler.diagnostic_task_snapshot(id)));
+            }
+            RuntimeMessage::OperationalSnapshot { now, response } => {
+                let _ = response.send(Ok(operational.snapshot(now)));
+            }
+            RuntimeMessage::SetCommandsEnabled { enabled, response } => {
+                operational.commands_enabled = enabled;
+                publish_operational_state(&state_sink, &operational, Instant::now());
+                let _ = response.send(Ok(()));
+            }
+            RuntimeMessage::ConfigureIdleExit {
+                timeout,
+                now,
+                response,
+            } => {
+                operational.configure_idle_exit(timeout, now);
+                publish_operational_state(&state_sink, &operational, now);
+                let _ = response.send(Ok(()));
+            }
+            RuntimeMessage::RecordCommandActivity { now, response } => {
+                operational.record_command_activity(now);
+                publish_operational_state(&state_sink, &operational, now);
+                let _ = response.send(Ok(()));
+            }
+            RuntimeMessage::ClaimIdleExit { now, response } => {
+                let claimed = operational.claim_idle_exit(
+                    now,
+                    formal_scheduler.snapshot().is_idle() && deferred_chat.is_empty(),
+                );
+                publish_operational_state(&state_sink, &operational, now);
+                let _ = response.send(Ok(claimed));
+            }
+            RuntimeMessage::ClearIdleExit(response) => {
+                operational.idle_exit = None;
+                publish_operational_state(&state_sink, &operational, Instant::now());
+                let _ = response.send(Ok(()));
+            }
+            RuntimeMessage::ChatListener(message) => {
+                handle_chat_listener_message(&mut chat_listener, message, &state_sink);
+            }
+            RuntimeMessage::Decision(message) => {
+                handle_decision_message(&mut decision, message, &state_sink);
+            }
             RuntimeMessage::Event(event) => match event {
                 BusinessEvent::Timer(timer_event) => {
                     snapshot.apply(BusinessEvent::Timer(timer_event.clone()));
                     if let Err(error) = handle_business_timer(
                         timer_event,
+                        &mut entertainment,
                         &mut idiom_chain,
                         &mut card_games,
                         &mut undercover,
                         turtle_soup.as_mut(),
+                        &mut deferred_chat,
                         timer.as_ref(),
                         &mut active_idiom_deadline,
                         &mut active_card_game_deadline,
@@ -1873,7 +3112,11 @@ fn run_business_runtime(
                 }
                 BusinessEvent::TurtleSoupAiCompleted(completion) => {
                     if let Some(service) = turtle_soup.as_mut() {
-                        service.apply_ai_completion(completion);
+                        service.apply_ai_completion(
+                            &mut entertainment,
+                            completion,
+                            &mut deferred_chat,
+                        );
                         if let Err(error) = sync_turtle_soup_deadline(
                             Some(&*service),
                             timer.as_ref(),
@@ -1895,7 +3138,7 @@ fn run_business_runtime(
                 response,
             } => {
                 let result = idiom_chain
-                    .handle(&player, &command)
+                    .handle(&mut entertainment, &player, &command)
                     .map_err(idiom_chain_operation_failed)
                     .and_then(|outcome| {
                         sync_idiom_deadline(
@@ -1931,7 +3174,7 @@ fn run_business_runtime(
             }
             RuntimeMessage::AbortIdiomChain(response) => {
                 let result = idiom_chain
-                    .abort()
+                    .abort(&mut entertainment)
                     .map_err(idiom_chain_operation_failed)
                     .and_then(|aborted| {
                         sync_idiom_deadline(
@@ -1947,7 +3190,7 @@ fn run_business_runtime(
             }
             RuntimeMessage::ExpireIdiomChain(response) => {
                 let result = idiom_chain
-                    .expire_idle_at(Instant::now())
+                    .expire_idle_at(&mut entertainment, Instant::now())
                     .map_err(idiom_chain_operation_failed)
                     .and_then(|expired| {
                         sync_idiom_deadline(
@@ -1964,6 +3207,7 @@ fn run_business_runtime(
             RuntimeMessage::CardGame(message) => {
                 if let Err(error) = handle_card_game_message(
                     &mut card_games,
+                    &mut entertainment,
                     message,
                     timer.as_ref(),
                     &mut active_card_game_deadline,
@@ -1978,6 +3222,7 @@ fn run_business_runtime(
             RuntimeMessage::Undercover(message) => {
                 if let Err(error) = handle_undercover_message(
                     &mut undercover,
+                    &mut entertainment,
                     message,
                     timer.as_ref(),
                     &mut active_undercover_deadline,
@@ -1994,13 +3239,17 @@ fn run_business_runtime(
             }
             RuntimeMessage::TurtleSoup(message) => {
                 if let Err(error) = handle_turtle_soup_message(
-                    turtle_soup.as_mut(),
+                    TurtleSoupHandlerContext {
+                        turtle_soup: turtle_soup.as_mut(),
+                        entertainment: &mut entertainment,
+                        deferred_chat: &mut deferred_chat,
+                        timer: timer.as_ref(),
+                        active_deadline: &mut active_turtle_soup_deadline,
+                        pending_cancellations: &mut pending_turtle_soup_cancellations,
+                        operation_ids: &operation_ids,
+                        clock_active: entertainment_clock_active,
+                    },
                     message,
-                    timer.as_ref(),
-                    &mut active_turtle_soup_deadline,
-                    &mut pending_turtle_soup_cancellations,
-                    &operation_ids,
-                    entertainment_clock_active,
                 ) {
                     log::error!("业务运行时处理海龟汤消息失败: {error}");
                 }
@@ -2028,11 +3277,218 @@ fn run_business_runtime(
                     .ok_or(BusinessRuntimeError::RuntimeStopped);
                 let _ = response.send(result);
             }
+            RuntimeMessage::InviteShouldAccept { sequence, response } => {
+                let _ = response.send(invite.should_accept(sequence));
+            }
+            RuntimeMessage::BeginInvite { request, response } => {
+                let _ = response.send(invite.begin(request));
+            }
+            RuntimeMessage::AcquireModerationWorkflow { key, response } => {
+                let _ = response.send(moderation_workflows.insert(key));
+            }
+            RuntimeMessage::ReleaseModerationWorkflow { key, response } => {
+                let _ = response.send(moderation_workflows.remove(&key));
+            }
+            #[cfg(test)]
+            RuntimeMessage::ContainsModerationWorkflow { key, response } => {
+                let _ = response.send(moderation_workflows.contains(&key));
+            }
+            RuntimeMessage::Playback(message) => match message {
+                PlaybackRuntimeMessage::PushQueue { item, response } => {
+                    let result = playback
+                        .as_mut()
+                        .ok_or(BusinessRuntimeError::RuntimeStopped)
+                        .and_then(|service| {
+                            service.push_queue(item).map_err(playback_operation_failed)
+                        });
+                    if result.is_ok() {
+                        publish_playback_queue(&state_sink, playback.as_ref());
+                    }
+                    let _ = response.send(result);
+                }
+                PlaybackRuntimeMessage::RemoveQueue { removal, response } => {
+                    let result = playback
+                        .as_mut()
+                        .ok_or(BusinessRuntimeError::RuntimeStopped)
+                        .and_then(|service| {
+                            service
+                                .remove_queue(removal)
+                                .map_err(playback_operation_failed)
+                        });
+                    if matches!(result, Ok(QueueRemoveOutcome::Removed { .. })) {
+                        publish_playback_queue(&state_sink, playback.as_ref());
+                    }
+                    let _ = response.send(result);
+                }
+                PlaybackRuntimeMessage::RemoveQueueIndexes { indexes, response } => {
+                    let result = playback
+                        .as_mut()
+                        .ok_or(BusinessRuntimeError::RuntimeStopped)
+                        .and_then(|service| {
+                            service
+                                .remove_queue_indexes(indexes)
+                                .map_err(playback_operation_failed)
+                        });
+                    if result.as_ref().is_ok_and(|removed| !removed.is_empty()) {
+                        publish_playback_queue(&state_sink, playback.as_ref());
+                    }
+                    let _ = response.send(result);
+                }
+                PlaybackRuntimeMessage::ClearQueue(response) => {
+                    let result = playback
+                        .as_mut()
+                        .ok_or(BusinessRuntimeError::RuntimeStopped)
+                        .and_then(|service| {
+                            service.clear_queue().map_err(playback_operation_failed)
+                        });
+                    if result.as_ref().is_ok_and(|count| *count > 0) {
+                        publish_playback_queue(&state_sink, playback.as_ref());
+                    }
+                    let _ = response.send(result);
+                }
+                PlaybackRuntimeMessage::QueueContains { item, response } => {
+                    let result = playback
+                        .as_ref()
+                        .map(|service| service.queue_contains(&item))
+                        .ok_or(BusinessRuntimeError::RuntimeStopped);
+                    let _ = response.send(result);
+                }
+                PlaybackRuntimeMessage::QueueSnapshot(response) => {
+                    let result = playback
+                        .as_ref()
+                        .map(PlaybackService::queue_snapshot)
+                        .ok_or(BusinessRuntimeError::RuntimeStopped);
+                    let _ = response.send(result);
+                }
+                PlaybackRuntimeMessage::PatchRuntimeState { patch, response } => {
+                    let result = playback
+                        .as_mut()
+                        .ok_or(BusinessRuntimeError::RuntimeStopped)
+                        .and_then(|service| {
+                            service
+                                .patch_runtime_state(patch)
+                                .map_err(playback_operation_failed)
+                        });
+                    if result.is_ok() {
+                        publish_hall_state(&state_sink, playback.as_ref());
+                    }
+                    let _ = response.send(result);
+                }
+                PlaybackRuntimeMessage::RuntimeStateSnapshot(response) => {
+                    let result = playback
+                        .as_ref()
+                        .map(PlaybackService::runtime_state_snapshot)
+                        .ok_or(BusinessRuntimeError::RuntimeStopped);
+                    let _ = response.send(result);
+                }
+                PlaybackRuntimeMessage::UpdateHallRemainingMinutes { minutes, response } => {
+                    let result = playback
+                        .as_mut()
+                        .ok_or(BusinessRuntimeError::RuntimeStopped)
+                        .and_then(|service| {
+                            service
+                                .update_hall_remaining_minutes(minutes)
+                                .map_err(playback_operation_failed)
+                        });
+                    if result.is_ok() {
+                        publish_hall_state(&state_sink, playback.as_ref());
+                    }
+                    let _ = response.send(result);
+                }
+                PlaybackRuntimeMessage::ClearHallRemainingMinutes(response) => {
+                    let result = playback
+                        .as_mut()
+                        .ok_or(BusinessRuntimeError::RuntimeStopped)
+                        .and_then(|service| {
+                            service
+                                .clear_hall_remaining_minutes()
+                                .map_err(playback_operation_failed)
+                        });
+                    if result.is_ok() {
+                        publish_hall_state(&state_sink, playback.as_ref());
+                    }
+                    let _ = response.send(result);
+                }
+                PlaybackRuntimeMessage::ClearHallCountdownCache(response) => {
+                    let result = playback
+                        .as_mut()
+                        .ok_or(BusinessRuntimeError::RuntimeStopped)
+                        .and_then(|service| {
+                            service
+                                .clear_hall_countdown_cache()
+                                .map_err(playback_operation_failed)
+                        });
+                    if result.as_ref().is_ok_and(|cleared| *cleared) {
+                        publish_hall_state(&state_sink, playback.as_ref());
+                    }
+                    let _ = response.send(result);
+                }
+                PlaybackRuntimeMessage::UpdatePlaybackState { update, response } => {
+                    let result = playback
+                        .as_mut()
+                        .ok_or(BusinessRuntimeError::RuntimeStopped)
+                        .and_then(|service| {
+                            service
+                                .apply_playback_state_update(update)
+                                .map_err(playback_operation_failed)
+                        });
+                    let _ = response.send(result);
+                }
+                PlaybackRuntimeMessage::CheckSongDedup {
+                    candidate,
+                    response,
+                } => {
+                    let result = playback
+                        .as_ref()
+                        .map(|service| service.song_dedup_limited(&candidate))
+                        .ok_or(BusinessRuntimeError::RuntimeStopped);
+                    let _ = response.send(result);
+                }
+                PlaybackRuntimeMessage::RecordSongDedup {
+                    candidate,
+                    response,
+                } => {
+                    let result = playback
+                        .as_mut()
+                        .ok_or(BusinessRuntimeError::RuntimeStopped)
+                        .and_then(|service| {
+                            service
+                                .record_song_dedup(candidate)
+                                .map_err(playback_operation_failed)
+                        });
+                    let _ = response.send(result);
+                }
+                PlaybackRuntimeMessage::ObserveExternalPlayback {
+                    identity,
+                    now,
+                    protect_after,
+                    response,
+                } => {
+                    let result = playback
+                        .as_mut()
+                        .map(|service| {
+                            service.observe_external_playback(&identity, now, protect_after)
+                        })
+                        .ok_or(BusinessRuntimeError::RuntimeStopped);
+                    let _ = response.send(result);
+                }
+                PlaybackRuntimeMessage::ClearExternalPlaybackTracker(response) => {
+                    let result = playback
+                        .as_mut()
+                        .map(|service| service.clear_external_playback_tracker())
+                        .ok_or(BusinessRuntimeError::RuntimeStopped);
+                    let _ = response.send(result);
+                }
+            },
+            RuntimeMessage::ActiveEntertainment(response) => {
+                let _ = response.send(entertainment.active());
+            }
             RuntimeMessage::Snapshot(response) => {
                 let _ = response.send(snapshot);
             }
             RuntimeMessage::PrepareShutdown(response) => {
                 abort_business_modules(
+                    &mut entertainment,
                     &mut idiom_chain,
                     &mut card_games,
                     &mut undercover,
@@ -2056,6 +3512,7 @@ fn run_business_runtime(
             }
             RuntimeMessage::Shutdown(response) => {
                 abort_business_modules(
+                    &mut entertainment,
                     &mut idiom_chain,
                     &mut card_games,
                     &mut undercover,
@@ -2091,13 +3548,14 @@ fn publish_business_state(
         return;
     };
     if let Some(turtle_soup) = turtle_soup {
-        sink.publish_turtle_soup(turtle_soup.snapshot());
+        sink.publish_turtle_soup(turtle_soup.snapshot().redacted_for_monitor());
     }
     sink.publish_undercover(undercover.snapshot(Instant::now()));
 }
 
 #[allow(clippy::too_many_arguments)]
 fn abort_business_modules(
+    entertainment: &mut EntertainmentState,
     idiom_chain: &mut IdiomChainService,
     card_games: &mut CardGameService,
     undercover: &mut UndercoverRuntimeService,
@@ -2116,15 +3574,15 @@ fn abort_business_modules(
     pending_undercover_outcomes: &mut std::collections::VecDeque<UndercoverTimedOutcome>,
     clock_active: bool,
 ) {
-    if let Err(error) = card_games.abort() {
+    if let Err(error) = card_games.abort(entertainment) {
         log::error!("业务运行时关闭时无法中止牌局: {error:#}");
     }
-    if let Err(error) = idiom_chain.abort() {
+    if let Err(error) = idiom_chain.abort(entertainment) {
         log::error!("业务运行时关闭时无法中止成语接龙: {error:#}");
     }
-    let _ = undercover.abort();
+    let _ = undercover.abort(entertainment);
     if let Some(turtle_soup) = turtle_soup.as_deref_mut() {
-        turtle_soup.abort_for_context_loss("业务运行时关闭");
+        turtle_soup.abort_for_context_loss(entertainment, "业务运行时关闭");
     }
     if let Err(error) = sync_idiom_deadline(
         idiom_chain,
@@ -2178,6 +3636,7 @@ fn abort_business_modules(
 #[allow(clippy::too_many_arguments)]
 fn handle_card_game_message(
     card_games: &mut CardGameService,
+    entertainment: &mut EntertainmentState,
     message: CardGameRuntimeMessage,
     timer: Option<&TimerRuntimeHandle<BusinessDeadlineToken>>,
     active_deadline: &mut Option<ActiveCardGameDeadline>,
@@ -2194,7 +3653,7 @@ fn handle_card_game_message(
             response,
         } => {
             let result = card_games
-                .begin_command(&player, &command, now)
+                .begin_command(entertainment, &player, &command, now)
                 .map_err(card_game_operation_failed)
                 .and_then(|result| {
                     sync_card_game_deadline(
@@ -2234,7 +3693,7 @@ fn handle_card_game_message(
             response,
         } => {
             let response_result = card_games
-                .resume(key, result)
+                .resume(entertainment, key, result)
                 .map_err(card_game_operation_failed)
                 .and_then(|result| {
                     sync_card_game_deadline(
@@ -2252,7 +3711,7 @@ fn handle_card_game_message(
         }
         CardGameRuntimeMessage::Cancel { key, response } => {
             let result = card_games
-                .cancel(key)
+                .cancel(entertainment, key)
                 .map_err(card_game_operation_failed)
                 .and_then(|result| {
                     sync_card_game_deadline(
@@ -2292,7 +3751,7 @@ fn handle_card_game_message(
                     #[cfg(test)]
                     {
                         card_games
-                            .tick(now, requested_clock_active)
+                            .tick(entertainment, now, requested_clock_active)
                             .map_err(card_game_operation_failed)
                     }
                     #[cfg(not(test))]
@@ -2307,7 +3766,7 @@ fn handle_card_game_message(
         }
         CardGameRuntimeMessage::Abort(response) => {
             let result = card_games
-                .abort()
+                .abort(entertainment)
                 .map_err(card_game_operation_failed)
                 .and_then(|result| {
                     sync_card_game_deadline(
@@ -2327,15 +3786,31 @@ fn handle_card_game_message(
     Ok(())
 }
 
-fn handle_turtle_soup_message(
-    turtle_soup: Option<&mut TurtleSoupService>,
-    message: TurtleSoupRuntimeMessage,
-    timer: Option<&TimerRuntimeHandle<BusinessDeadlineToken>>,
-    active_deadline: &mut Option<ActiveTurtleSoupDeadline>,
-    pending_cancellations: &mut Vec<ActiveTurtleSoupDeadline>,
-    operation_ids: &BusinessOperationIdAllocator,
+struct TurtleSoupHandlerContext<'a> {
+    turtle_soup: Option<&'a mut TurtleSoupService>,
+    entertainment: &'a mut EntertainmentState,
+    deferred_chat: &'a mut DeferredChatQueue,
+    timer: Option<&'a TimerRuntimeHandle<BusinessDeadlineToken>>,
+    active_deadline: &'a mut Option<ActiveTurtleSoupDeadline>,
+    pending_cancellations: &'a mut Vec<ActiveTurtleSoupDeadline>,
+    operation_ids: &'a BusinessOperationIdAllocator,
     clock_active: bool,
+}
+
+fn handle_turtle_soup_message(
+    context: TurtleSoupHandlerContext<'_>,
+    message: TurtleSoupRuntimeMessage,
 ) -> Result<(), BusinessRuntimeError> {
+    let TurtleSoupHandlerContext {
+        turtle_soup,
+        entertainment,
+        deferred_chat,
+        timer,
+        active_deadline,
+        pending_cancellations,
+        operation_ids,
+        clock_active,
+    } = context;
     let Some(service) = turtle_soup else {
         match message {
             TurtleSoupRuntimeMessage::HallCommand { response, .. }
@@ -2384,7 +3859,8 @@ fn handle_turtle_soup_message(
             command,
             response,
         } => {
-            let outcome = service.handle_hall_command(&player, &command);
+            let outcome =
+                service.handle_hall_command(entertainment, &player, &command, deferred_chat);
             if let Err(error) = sync_turtle_soup_deadline(
                 Some(&*service),
                 timer,
@@ -2403,7 +3879,8 @@ fn handle_turtle_soup_message(
             command,
             response,
         } => {
-            let outcome = service.handle_friend_command(&player, &command);
+            let outcome =
+                service.handle_friend_command(entertainment, &player, &command, deferred_chat);
             if let Err(error) = sync_turtle_soup_deadline(
                 Some(&*service),
                 timer,
@@ -2419,7 +3896,7 @@ fn handle_turtle_soup_message(
         }
         TurtleSoupRuntimeMessage::StartRandom { response } => {
             let result = service
-                .start_random_from_web()
+                .start_random_from_web(entertainment, deferred_chat)
                 .map_err(turtle_soup_operation_failed)
                 .and_then(|()| {
                     sync_turtle_soup_deadline(
@@ -2436,7 +3913,7 @@ fn handle_turtle_soup_message(
         }
         TurtleSoupRuntimeMessage::StartById { id, response } => {
             let result = service
-                .start_by_id_from_web(&id)
+                .start_by_id_from_web(entertainment, &id, deferred_chat)
                 .map_err(turtle_soup_operation_failed)
                 .and_then(|()| {
                     sync_turtle_soup_deadline(
@@ -2453,7 +3930,7 @@ fn handle_turtle_soup_message(
         }
         TurtleSoupRuntimeMessage::End { response } => {
             let result = service
-                .end_from_web()
+                .end_from_web(entertainment, deferred_chat)
                 .map_err(turtle_soup_operation_failed)
                 .and_then(|ended| {
                     sync_turtle_soup_deadline(
@@ -2505,7 +3982,7 @@ fn handle_turtle_soup_message(
             let _ = response.send(result);
         }
         TurtleSoupRuntimeMessage::Abort { reason } => {
-            service.abort_for_context_loss(&reason);
+            service.abort_for_context_loss(entertainment, &reason);
             sync_turtle_soup_deadline(
                 Some(&*service),
                 timer,
@@ -2520,7 +3997,7 @@ fn handle_turtle_soup_message(
             let _ = response.send(service.delivery_is_current(delivery));
         }
         TurtleSoupRuntimeMessage::DeliverySuccess { delivery } => {
-            service.handle_delivery_success(delivery);
+            service.handle_delivery_success(entertainment, delivery);
             sync_turtle_soup_deadline(
                 Some(&*service),
                 timer,
@@ -2533,7 +4010,7 @@ fn handle_turtle_soup_message(
         }
         TurtleSoupRuntimeMessage::DeliveryFailure { delivery, error } => {
             let error = anyhow::anyhow!(error);
-            service.handle_delivery_failure(delivery, &error);
+            service.handle_delivery_failure(entertainment, delivery, &error);
             sync_turtle_soup_deadline(
                 Some(&*service),
                 timer,
@@ -2560,6 +4037,7 @@ fn handle_turtle_soup_message(
 #[allow(clippy::too_many_arguments)]
 fn handle_undercover_message(
     undercover: &mut UndercoverRuntimeService,
+    entertainment: &mut EntertainmentState,
     message: UndercoverRuntimeMessage,
     timer: Option<&TimerRuntimeHandle<BusinessDeadlineToken>>,
     active_deadline: &mut Option<ActiveUndercoverDeadline>,
@@ -2580,7 +4058,7 @@ fn handle_undercover_message(
                 BusinessRuntimeError::UndercoverOperationFailed(error.to_string())
             })?;
             let result = undercover
-                .begin_command(&player, source, &command, now, operation_id)
+                .begin_command(entertainment, &player, source, &command, now, operation_id)
                 .map_err(undercover_operation_failed)
                 .and_then(|result| {
                     sync_undercover_deadline(
@@ -2620,7 +4098,7 @@ fn handle_undercover_message(
             response,
         } => {
             let result = undercover
-                .resume(key, effect_result)
+                .resume(entertainment, key, effect_result)
                 .map_err(undercover_operation_failed)
                 .and_then(|result| {
                     sync_undercover_deadline(
@@ -2638,7 +4116,7 @@ fn handle_undercover_message(
         }
         UndercoverRuntimeMessage::Cancel { key, response } => {
             let result = undercover
-                .cancel(key)
+                .cancel(entertainment, key)
                 .map_err(undercover_operation_failed)
                 .and_then(|result| {
                     sync_undercover_deadline(
@@ -2673,7 +4151,7 @@ fn handle_undercover_message(
             let _ = response.send(result);
         }
         UndercoverRuntimeMessage::Abort(response) => {
-            let aborted = undercover.abort();
+            let aborted = undercover.abort(entertainment);
             let result = sync_undercover_deadline(
                 undercover,
                 timer,
@@ -2706,9 +4184,198 @@ fn turtle_soup_operation_failed(error: anyhow::Error) -> BusinessRuntimeError {
     BusinessRuntimeError::TurtleSoupOperationFailed(format!("{error:#}"))
 }
 
+fn playback_operation_failed(error: anyhow::Error) -> BusinessRuntimeError {
+    BusinessRuntimeError::PlaybackOperationFailed(format!("{error:#}"))
+}
+
+fn publish_playback_queue(
+    state_sink: &Option<Arc<dyn BusinessStateSink>>,
+    playback: Option<&PlaybackService>,
+) {
+    if let (Some(state_sink), Some(playback)) = (state_sink, playback) {
+        state_sink.publish_playback_queue(playback.queue_snapshot());
+    }
+}
+
+fn publish_hall_state(
+    state_sink: &Option<Arc<dyn BusinessStateSink>>,
+    playback: Option<&PlaybackService>,
+) {
+    if let (Some(state_sink), Some(playback)) = (state_sink, playback) {
+        state_sink.publish_hall_remaining_minutes(
+            playback
+                .runtime_state_snapshot()
+                .hall_remaining_minutes_now(),
+        );
+    }
+}
+
+fn publish_scheduler_state(
+    state_sink: &Option<Arc<dyn BusinessStateSink>>,
+    scheduler: &FormalScheduler,
+) {
+    if let Some(state_sink) = state_sink {
+        state_sink.publish_scheduler(scheduler.snapshot());
+    }
+}
+
+fn publish_diagnostic_state(
+    state_sink: &Option<Arc<dyn BusinessStateSink>>,
+    scheduler: &FormalScheduler,
+) {
+    if let Some(state_sink) = state_sink {
+        state_sink.publish_diagnostics(scheduler.diagnostic_snapshot());
+    }
+}
+
+fn publish_operational_state(
+    state_sink: &Option<Arc<dyn BusinessStateSink>>,
+    operational: &OperationalState,
+    now: Instant,
+) {
+    if let Some(state_sink) = state_sink {
+        state_sink.publish_operational(operational.snapshot(now));
+    }
+}
+
+fn publish_chat_listener_state(
+    state_sink: &Option<Arc<dyn BusinessStateSink>>,
+    chat_listener: &ChatListenerState,
+) {
+    if let Some(state_sink) = state_sink {
+        state_sink.publish_chat_listener(chat_listener.snapshot());
+    }
+}
+
+fn handle_chat_listener_message(
+    state: &mut ChatListenerState,
+    message: ChatListenerRuntimeMessage,
+    state_sink: &Option<Arc<dyn BusinessStateSink>>,
+) {
+    let mutated = match message {
+        ChatListenerRuntimeMessage::Snapshot(response) => {
+            let _ = response.send(Ok(state.snapshot()));
+            false
+        }
+        ChatListenerRuntimeMessage::RequestMode { target, response } => {
+            let changed = state.request_mode(target);
+            let _ = response.send(Ok(changed));
+            changed
+        }
+        ChatListenerRuntimeMessage::CompleteMode { mode, response } => {
+            state.complete_mode_switch(mode);
+            let _ = response.send(Ok(()));
+            true
+        }
+        ChatListenerRuntimeMessage::CancelModeRequest { target, response } => {
+            state.cancel_mode_request(target);
+            let _ = response.send(Ok(()));
+            true
+        }
+        ChatListenerRuntimeMessage::FailModeSwitchToPrimary(response) => {
+            state.fail_mode_switch_to_primary();
+            let _ = response.send(Ok(()));
+            true
+        }
+        ChatListenerRuntimeMessage::BeginTemporaryPrimary(response) => {
+            state.begin_temporary_primary();
+            let _ = response.send(Ok(()));
+            true
+        }
+        ChatListenerRuntimeMessage::EndTemporaryPrimary(response) => {
+            state.end_temporary_primary();
+            let _ = response.send(Ok(()));
+            true
+        }
+        ChatListenerRuntimeMessage::ClaimUnreadTask(response) => {
+            let claimed = state.claim_unread_task();
+            let _ = response.send(Ok(claimed));
+            claimed
+        }
+        ChatListenerRuntimeMessage::FinishUnreadTask {
+            processed_message,
+            response,
+        } => {
+            state.finish_unread_task(processed_message);
+            let _ = response.send(Ok(()));
+            true
+        }
+        ChatListenerRuntimeMessage::ReleaseUnreadTask(response) => {
+            state.release_unread_task();
+            let _ = response.send(Ok(()));
+            true
+        }
+        ChatListenerRuntimeMessage::FinishInitialUnreadClear(response) => {
+            state.finish_initial_unread_clear();
+            let _ = response.send(Ok(()));
+            true
+        }
+        ChatListenerRuntimeMessage::FinishHallRound(response) => {
+            state.finish_hall_round();
+            let _ = response.send(Ok(()));
+            true
+        }
+    };
+    if mutated {
+        publish_chat_listener_state(state_sink, state);
+    }
+}
+
+fn publish_decision_state(
+    state_sink: &Option<Arc<dyn BusinessStateSink>>,
+    decision: &mut DecisionState,
+) {
+    if let Some(state_sink) = state_sink {
+        state_sink.publish_decision(decision.snapshot());
+    }
+}
+
+fn handle_decision_message(
+    state: &mut DecisionState,
+    message: DecisionRuntimeMessage,
+    state_sink: &Option<Arc<dyn BusinessStateSink>>,
+) {
+    match message {
+        DecisionRuntimeMessage::Begin {
+            label,
+            allow_switch_source,
+            allow_ai,
+            timeout,
+            delivery,
+            response,
+        } => {
+            let result = state
+                .begin(label, allow_switch_source, allow_ai, timeout, delivery)
+                .map_err(BusinessRuntimeError::DecisionOperationFailed);
+            let _ = response.send(result);
+        }
+        #[cfg(test)]
+        DecisionRuntimeMessage::Snapshot(response) => {
+            let _ = response.send(Ok(state.snapshot()));
+        }
+        DecisionRuntimeMessage::Submit {
+            id,
+            action,
+            response,
+        } => {
+            let result = state
+                .submit(id, action)
+                .map_err(BusinessRuntimeError::DecisionOperationFailed);
+            let _ = response.send(result);
+        }
+        DecisionRuntimeMessage::Finish { id, response } => {
+            state.finish(id);
+            let _ = response.send(Ok(()));
+        }
+    }
+    publish_decision_state(state_sink, state);
+}
+
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroUsize;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
     use std::thread;
     use std::time::{Duration, Instant};
@@ -2718,7 +4385,7 @@ mod tests {
         CardGameDeadlineKind, CardGameDeadlineToken, CardGameEffect, CardGameEffectLane,
         CardGameEffectRequest, CardGameLateResult, LandlordConfig,
     };
-    use crate::features::entertainment::{EntertainmentCoordinator, EntertainmentKind};
+    use crate::features::entertainment::{EntertainmentKind, EntertainmentState};
     use crate::features::idiom_chain::{
         IdiomChainDeadlineKind, IdiomChainDeadlineToken, IdiomChainMode,
     };
@@ -2727,41 +4394,427 @@ mod tests {
     use crate::observation::chat::ChatObservationLedger;
     use crate::observation::shared::{ObservationGapKind, SharedObservationStream};
     use crate::runtime::deadline::{BusinessDeadlineEvent, BusinessDeadlineToken};
+    use crate::runtime::deferred_chat::{DeferredChatMessage, DeferredChatTarget};
     use crate::runtime::identity::{BusinessOperationId, SessionGeneration};
+    use crate::runtime::scheduler::{
+        DiagnosticTaskCompletion, DiagnosticTaskSubmission, DiagnosticTaskWork, FormalTaskDedupKey,
+        FormalTaskReceipt,
+    };
     use crate::runtime::timer::{DeadlineSchedule, TimerCore, TimerRuntime, TimerRuntimeEvent};
 
-    fn idiom_service(
-        entertainment: EntertainmentCoordinator,
-        idle_timeout: Option<Duration>,
-    ) -> IdiomChainService {
+    struct TestFormalWork;
+
+    impl FormalTaskWork for TestFormalWork {
+        fn execute(self: Box<Self>) -> anyhow::Result<String> {
+            Ok("done".to_string())
+        }
+
+        fn cancel(self: Box<Self>) {}
+    }
+
+    struct CancelAwareFormalWork(Arc<AtomicBool>);
+
+    impl FormalTaskWork for CancelAwareFormalWork {
+        fn execute(self: Box<Self>) -> anyhow::Result<String> {
+            Ok("done".to_string())
+        }
+
+        fn cancel(self: Box<Self>) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    struct TestDiagnosticWork;
+
+    impl DiagnosticTaskWork for TestDiagnosticWork {
+        fn execute(self: Box<Self>) -> anyhow::Result<String> {
+            Ok("diagnostic-result".to_string())
+        }
+    }
+
+    fn formal_submission(label: &str, dedup_key: Option<&str>) -> FormalTaskSubmission {
+        FormalTaskSubmission::new(
+            label,
+            dedup_key.map(FormalTaskDedupKey::new),
+            false,
+            Box::new(TestFormalWork),
+        )
+    }
+
+    fn idiom_service(idle_timeout: Option<Duration>) -> IdiomChainService {
         IdiomChainService::from_entries_for_test(
             &["画蛇添足", "足智多谋", "谋事在人", "人山人海"],
-            entertainment,
             idle_timeout,
         )
     }
 
     fn runtime(queue_capacity: usize) -> BusinessRuntime {
-        let entertainment = EntertainmentCoordinator::new();
         BusinessRuntime::start(
             queue_capacity,
-            idiom_service(entertainment.clone(), Some(Duration::from_secs(300))),
-            CardGameService::new(LandlordConfig::default(), entertainment),
+            idiom_service(Some(Duration::from_secs(300))),
+            CardGameService::new(LandlordConfig::default()),
         )
         .unwrap()
     }
 
-    fn runtime_with_entertainment(
-        queue_capacity: usize,
-    ) -> (BusinessRuntime, EntertainmentCoordinator) {
-        let entertainment = EntertainmentCoordinator::new();
-        let runtime = BusinessRuntime::start(
+    fn runtime_with_entertainment(queue_capacity: usize) -> BusinessRuntime {
+        BusinessRuntime::start(
             queue_capacity,
-            idiom_service(entertainment.clone(), Some(Duration::from_secs(300))),
-            CardGameService::new(LandlordConfig::default(), entertainment.clone()),
+            idiom_service(Some(Duration::from_secs(300))),
+            CardGameService::new(LandlordConfig::default()),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn formal_scheduler_enqueues_in_order_and_rejects_queued_duplicate() {
+        let runtime = runtime(8);
+        let handle = runtime.handle();
+
+        let first = handle
+            .enqueue_formal_task(formal_submission("first", Some("same")))
+            .unwrap();
+        let second = handle
+            .enqueue_formal_task(formal_submission("second", Some("other")))
+            .unwrap();
+        let duplicate = handle
+            .enqueue_formal_task(formal_submission("duplicate", Some("same")))
+            .unwrap();
+
+        assert!(matches!(
+            first,
+            FormalTaskEnqueueOutcome::Queued(FormalTaskReceipt {
+                task_id: 1,
+                position: 1
+            })
+        ));
+        assert!(matches!(
+            second,
+            FormalTaskEnqueueOutcome::Queued(FormalTaskReceipt {
+                task_id: 2,
+                position: 2
+            })
+        ));
+        assert_eq!(duplicate, FormalTaskEnqueueOutcome::Duplicate);
+        assert_eq!(
+            handle.scheduler_snapshot().unwrap().pending_labels(),
+            &["first".to_string(), "second".to_string()]
+        );
+
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn formal_scheduler_restores_original_turn_and_cancels_only_queued_work() {
+        let runtime = runtime(8);
+        let handle = runtime.handle();
+        let canceled = Arc::new(AtomicBool::new(false));
+        let first = handle
+            .enqueue_formal_task(formal_submission("first", Some("first")))
+            .unwrap();
+        let second = handle
+            .enqueue_formal_task(FormalTaskSubmission::new(
+                "second",
+                Some(FormalTaskDedupKey::new("second")),
+                false,
+                Box::new(CancelAwareFormalWork(canceled.clone())),
+            ))
+            .unwrap();
+        let FormalTaskEnqueueOutcome::Queued(first) = first else {
+            panic!("first task should be queued");
+        };
+        let FormalTaskEnqueueOutcome::Queued(second) = second else {
+            panic!("second task should be queued");
+        };
+
+        let active = handle
+            .take_next_formal_task()
+            .unwrap()
+            .expect("first task should start");
+        assert_eq!(active.task_id(), first.task_id);
+        assert_eq!(
+            handle.cancel_formal_task(first.task_id).unwrap(),
+            FormalTaskCancelOutcome::NotQueued
+        );
+
+        handle.restore_formal_task(active).unwrap();
+        assert_eq!(
+            handle.scheduler_snapshot().unwrap().pending_labels(),
+            &["first".to_string(), "second".to_string()]
+        );
+
+        let active = handle
+            .take_next_formal_task()
+            .unwrap()
+            .expect("restored task should start first");
+        let task_id = active.task_id();
+        let result = active.execute().unwrap();
+        handle
+            .complete_formal_task(task_id, FormalTaskCompletion::Succeeded(result))
+            .unwrap();
+        assert_eq!(
+            handle.cancel_formal_task(second.task_id).unwrap(),
+            FormalTaskCancelOutcome::Canceled
+        );
+        assert!(canceled.load(Ordering::SeqCst));
+
+        let snapshot = handle.scheduler_snapshot().unwrap();
+        assert!(snapshot.pending_labels().is_empty());
+        assert_eq!(snapshot.tasks()[0].id, second.task_id);
+        assert_eq!(snapshot.tasks()[0].status, "canceled");
+        assert_eq!(snapshot.tasks()[1].id, first.task_id);
+        assert_eq!(snapshot.tasks()[1].status, "completed");
+
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn business_runtime_owns_command_availability_and_idle_exit_claiming() {
+        let runtime = runtime(8);
+        let handle = runtime.handle();
+        let started_at = Instant::now();
+
+        assert!(
+            handle
+                .operational_snapshot(started_at)
+                .unwrap()
+                .commands_enabled()
+        );
+        handle.set_commands_enabled(false).unwrap();
+        assert!(
+            !handle
+                .operational_snapshot(started_at)
+                .unwrap()
+                .commands_enabled()
+        );
+
+        handle
+            .configure_idle_exit(Duration::from_secs(120), started_at)
+            .unwrap();
+        handle
+            .record_command_activity(started_at + Duration::from_secs(30))
+            .unwrap();
+        assert_eq!(
+            handle
+                .operational_snapshot(started_at + Duration::from_secs(40))
+                .unwrap()
+                .idle_exit_remaining_seconds(),
+            Some(110)
+        );
+
+        let queued = handle
+            .enqueue_formal_task(formal_submission("busy", Some("busy")))
+            .unwrap();
+        assert_eq!(
+            handle
+                .claim_idle_exit(started_at + Duration::from_secs(151))
+                .unwrap(),
+            None
+        );
+        let FormalTaskEnqueueOutcome::Queued(receipt) = queued else {
+            panic!("formal task should be queued");
+        };
+        assert_eq!(
+            handle.cancel_formal_task(receipt.task_id).unwrap(),
+            FormalTaskCancelOutcome::Canceled
+        );
+        assert_eq!(
+            handle
+                .claim_idle_exit(started_at + Duration::from_secs(151))
+                .unwrap(),
+            Some(Duration::from_secs(120))
+        );
+        assert_eq!(
+            handle
+                .operational_snapshot(started_at + Duration::from_secs(151))
+                .unwrap()
+                .idle_exit_remaining_seconds(),
+            None
+        );
+
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn diagnostic_tasks_wait_behind_formal_tasks_and_keep_owned_history() {
+        let runtime = runtime(8);
+        let handle = runtime.handle();
+        let diagnostic = handle
+            .enqueue_diagnostic_task(DiagnosticTaskSubmission::new(
+                "OCR 诊断",
+                Box::new(TestDiagnosticWork),
+            ))
+            .unwrap();
+        handle
+            .enqueue_formal_task(formal_submission("formal", Some("formal")))
+            .unwrap();
+
+        assert!(handle.take_next_diagnostic_task().unwrap().is_none());
+        let formal = handle.take_next_formal_task().unwrap().unwrap();
+        let formal_id = formal.task_id();
+        let formal_result = formal.execute().unwrap();
+        handle
+            .complete_formal_task(formal_id, FormalTaskCompletion::Succeeded(formal_result))
+            .unwrap();
+
+        let task = handle.take_next_diagnostic_task().unwrap().unwrap();
+        assert_eq!(task.task_id(), diagnostic.id);
+        let task_id = task.task_id();
+        let result = task.execute().unwrap();
+        handle
+            .complete_diagnostic_task(task_id, DiagnosticTaskCompletion::Succeeded(result))
+            .unwrap();
+
+        let snapshot = handle
+            .diagnostic_task_snapshot(diagnostic.id)
+            .unwrap()
+            .expect("diagnostic history");
+        assert_eq!(snapshot.id, diagnostic.id);
+        assert_eq!(snapshot.status, "completed");
+        assert_eq!(snapshot.result.as_deref(), Some("diagnostic-result"));
+
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn deferred_chat_waits_behind_formal_work_and_ahead_of_diagnostics() {
+        let runtime = runtime(8);
+        let handle = runtime.handle();
+        handle
+            .enqueue_diagnostic_task(DiagnosticTaskSubmission::new(
+                "diagnostic",
+                Box::new(TestDiagnosticWork),
+            ))
+            .unwrap();
+        handle
+            .enqueue_deferred_chat(DeferredChatMessage {
+                text: "deferred".to_string(),
+                target: DeferredChatTarget::Primary,
+            })
+            .unwrap();
+        handle
+            .enqueue_formal_task(formal_submission("formal", Some("formal-priority")))
+            .unwrap();
+
+        assert!(handle.take_next_deferred_chat().unwrap().is_none());
+        assert!(handle.take_next_diagnostic_task().unwrap().is_none());
+        let formal = handle.take_next_formal_task().unwrap().unwrap();
+        let formal_id = formal.task_id();
+        handle
+            .complete_formal_task(
+                formal_id,
+                FormalTaskCompletion::Succeeded(formal.execute().unwrap()),
+            )
+            .unwrap();
+
+        assert!(handle.take_next_diagnostic_task().unwrap().is_none());
+        let (item, permit) = handle
+            .take_next_deferred_chat()
+            .unwrap()
+            .expect("deferred work");
+        assert!(matches!(
+            item,
+            crate::runtime::deferred_chat::DeferredChatItem::Message(_)
+        ));
+        drop(permit);
+        assert!(handle.take_next_diagnostic_task().unwrap().is_some());
+
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn business_runtime_owns_chat_listener_mode_holds_and_unread_claims() {
+        let runtime = runtime(16);
+        let handle = runtime.handle();
+
+        assert!(
+            handle
+                .request_chat_listener_mode(ChatListenerMode::Secondary)
+                .unwrap()
+        );
+        assert_eq!(
+            handle.chat_listener_snapshot().unwrap().pending_mode,
+            Some(ChatListenerMode::Secondary)
+        );
+        handle
+            .complete_chat_listener_mode(ChatListenerMode::Secondary)
+            .unwrap();
+        assert!(
+            handle
+                .chat_listener_snapshot()
+                .unwrap()
+                .initial_unread_clear
+        );
+        assert!(handle.claim_chat_listener_unread_task().unwrap());
+        assert!(!handle.claim_chat_listener_unread_task().unwrap());
+        handle.finish_chat_listener_unread_task(true).unwrap();
+        handle.finish_chat_listener_initial_unread_clear().unwrap();
+        assert!(handle.chat_listener_snapshot().unwrap().hall_round_required);
+
+        handle.begin_chat_listener_temporary_primary().unwrap();
+        handle.begin_chat_listener_temporary_primary().unwrap();
+        assert!(handle.chat_listener_snapshot().unwrap().temporary_primary);
+        handle.end_chat_listener_temporary_primary().unwrap();
+        assert!(handle.chat_listener_snapshot().unwrap().temporary_primary);
+        handle.end_chat_listener_temporary_primary().unwrap();
+        assert!(!handle.chat_listener_snapshot().unwrap().temporary_primary);
+
+        handle.finish_chat_listener_hall_round().unwrap();
+        assert!(!handle.chat_listener_snapshot().unwrap().hall_round_required);
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn business_runtime_owns_decision_validation_while_waiting_stays_external() {
+        let runtime = runtime(16);
+        let handle = runtime.handle();
+        let session = handle
+            .begin_decision("候选确认", true, false, Duration::from_secs(1))
+            .unwrap();
+        let snapshot = handle
+            .decision_snapshot()
+            .unwrap()
+            .expect("active decision");
+
+        assert_eq!(snapshot.id, session.id());
+        assert_eq!(
+            handle.submit_decision(snapshot.id, DecisionAction::Ai),
+            Err(BusinessRuntimeError::DecisionOperationFailed(
+                "当前决策不允许切换 AI".to_string()
+            ))
+        );
+        handle
+            .submit_decision(snapshot.id, DecisionAction::SwitchSource)
+            .unwrap();
+        assert_eq!(
+            session.wait(Duration::from_millis(10)).unwrap(),
+            Some(DecisionAction::SwitchSource)
+        );
+        drop(session);
+        assert!(handle.decision_snapshot().unwrap().is_none());
+
+        runtime.shutdown().unwrap();
+    }
+
+    fn playback_service(
+        queue: crate::features::playback::PersistentQueue,
+        runtime_state: crate::features::playback::PersistentRuntimeState,
+    ) -> crate::features::playback::PlaybackService {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let history = crate::features::playback::PersistentSongDedupHistory::load(
+            std::env::temp_dir().join(format!("mwm-business-dedup-{suffix}.json")),
         )
         .unwrap();
-        (runtime, entertainment)
+        crate::features::playback::PlaybackService::new(
+            queue,
+            runtime_state,
+            history,
+            crate::config::MatchConfig::default(),
+            crate::config::SongDedupConfig::default(),
+        )
     }
 
     fn suspended(start: CardGameCommandStart) -> CardGameEffectRequest {
@@ -2884,7 +4937,7 @@ mod tests {
 
     #[test]
     fn prepare_shutdown_rejects_new_work_but_drains_internal_events_before_finish() {
-        let (runtime, entertainment) = runtime_with_entertainment(8);
+        let runtime = runtime_with_entertainment(8);
         let handle = runtime.handle();
         let event_sink = runtime.event_sink();
         handle
@@ -2900,7 +4953,7 @@ mod tests {
         let prepared = runtime.prepare_shutdown().unwrap();
 
         assert!(prepared.is_quiescing());
-        assert_eq!(entertainment.active(), None);
+        assert_eq!(handle.active_entertainment().unwrap(), None);
         assert_eq!(
             handle.handle_idiom_chain("Bob", &IdiomChainCommand::Status),
             Err(BusinessRuntimeError::Quiescing)
@@ -2950,7 +5003,7 @@ mod tests {
 
     #[test]
     fn card_game_begin_claim_and_resume_share_worker_owned_state() {
-        let (runtime, entertainment) = runtime_with_entertainment(8);
+        let runtime = runtime_with_entertainment(8);
         let handle = runtime.handle();
         let verification = suspended(
             handle
@@ -2988,7 +5041,10 @@ mod tests {
                 .unwrap(),
             CardGameResume::Completed(_)
         ));
-        assert_eq!(entertainment.active(), Some(EntertainmentKind::Landlord));
+        assert_eq!(
+            handle.active_entertainment().unwrap(),
+            Some(EntertainmentKind::Landlord)
+        );
         runtime.shutdown().unwrap();
     }
 
@@ -3134,7 +5190,7 @@ mod tests {
 
     #[test]
     fn shutdown_stops_card_game_requests_from_all_handle_clones() {
-        let (runtime, entertainment) = runtime_with_entertainment(4);
+        let runtime = runtime_with_entertainment(4);
         let first = runtime.handle();
         let second = first.clone();
         let request = suspended(
@@ -3153,16 +5209,14 @@ mod tests {
             second.abort_card_game(),
             Err(BusinessRuntimeError::RuntimeStopped)
         );
-        assert_eq!(entertainment.active(), None);
     }
 
     #[test]
     fn shutdown_aborts_active_idiom_chain_and_releases_entertainment() {
-        let entertainment = EntertainmentCoordinator::new();
         let runtime = BusinessRuntime::start(
             4,
-            idiom_service(entertainment.clone(), Some(Duration::from_secs(300))),
-            CardGameService::new(LandlordConfig::default(), entertainment.clone()),
+            idiom_service(Some(Duration::from_secs(300))),
+            CardGameService::new(LandlordConfig::default()),
         )
         .unwrap();
         runtime
@@ -3176,18 +5230,17 @@ mod tests {
             )
             .unwrap();
 
+        runtime.prepare_shutdown().unwrap();
+        assert_eq!(runtime.handle().active_entertainment().unwrap(), None);
         runtime.shutdown().unwrap();
-
-        assert_eq!(entertainment.active(), None);
     }
 
     #[test]
     fn idiom_chain_requests_share_worker_owned_state() {
-        let entertainment = EntertainmentCoordinator::new();
         let runtime = BusinessRuntime::start(
             4,
-            idiom_service(entertainment.clone(), Some(Duration::from_secs(300))),
-            CardGameService::new(LandlordConfig::default(), entertainment.clone()),
+            idiom_service(Some(Duration::from_secs(300))),
+            CardGameService::new(LandlordConfig::default()),
         )
         .unwrap();
         let handle = runtime.handle();
@@ -3217,17 +5270,16 @@ mod tests {
         assert!(explained.explanation.is_none());
         assert!(!handle.expire_idiom_chain().unwrap());
         assert!(handle.abort_idiom_chain().unwrap());
-        assert_eq!(entertainment.active(), None);
+        assert_eq!(handle.active_entertainment().unwrap(), None);
         runtime.shutdown().unwrap();
     }
 
     #[test]
     fn idiom_chain_idle_expiration_runs_on_the_business_worker() {
-        let entertainment = EntertainmentCoordinator::new();
         let runtime = BusinessRuntime::start(
             2,
-            idiom_service(entertainment.clone(), Some(Duration::ZERO)),
-            CardGameService::new(LandlordConfig::default(), entertainment.clone()),
+            idiom_service(Some(Duration::ZERO)),
+            CardGameService::new(LandlordConfig::default()),
         )
         .unwrap();
         let handle = runtime.handle();
@@ -3244,16 +5296,17 @@ mod tests {
 
         assert_eq!(started.action, "started");
         assert!(handle.expire_idiom_chain().unwrap());
-        assert_eq!(entertainment.active(), None);
+        assert_eq!(handle.active_entertainment().unwrap(), None);
         runtime.shutdown().unwrap();
     }
 
     #[test]
     fn matching_idiom_deadline_event_expires_the_owned_session() {
-        let entertainment = EntertainmentCoordinator::new();
-        let mut idiom_chain = idiom_service(entertainment.clone(), Some(Duration::ZERO));
+        let mut entertainment = EntertainmentState::new();
+        let mut idiom_chain = idiom_service(Some(Duration::ZERO));
         let started = idiom_chain
             .handle(
+                &mut entertainment,
                 "Alice",
                 &IdiomChainCommand::Start {
                     idiom: "画蛇添足".to_string(),
@@ -3286,8 +5339,7 @@ mod tests {
         });
         let operation_ids = BusinessOperationIdAllocator::new();
         let mut next_generation = session_generation;
-        let mut card_games =
-            CardGameService::new(LandlordConfig::default(), EntertainmentCoordinator::new());
+        let mut card_games = CardGameService::new(LandlordConfig::default());
         let mut undercover = default_undercover_service();
         let mut turtle_active = None;
         let mut card_active = None;
@@ -3297,13 +5349,16 @@ mod tests {
         let mut pending_undercover_cancellations = Vec::new();
         let mut pending_card_outcomes = std::collections::VecDeque::new();
         let mut pending_undercover_outcomes = std::collections::VecDeque::new();
+        let mut deferred_chat = DeferredChatQueue::new(DEFERRED_CHAT_CAPACITY);
 
         handle_business_timer(
             event,
+            &mut entertainment,
             &mut idiom_chain,
             &mut card_games,
             &mut undercover,
             None,
+            &mut deferred_chat,
             None,
             &mut active,
             &mut card_active,
@@ -3330,8 +5385,7 @@ mod tests {
         let (event_sender, _event_receiver) = mpsc::sync_channel(4);
         let timer_runtime = TimerRuntime::start(4, event_sender).unwrap();
         let timer = timer_runtime.handle();
-        let entertainment = EntertainmentCoordinator::new();
-        let card_games = CardGameService::new(LandlordConfig::default(), entertainment);
+        let card_games = CardGameService::new(LandlordConfig::default());
         let previous = ActiveCardGameDeadline {
             token: card_game_deadline_token(CardGameDeadlineKind::LobbyExpiry),
             operation_id: BusinessOperationId::new(17),
@@ -3367,10 +5421,116 @@ mod tests {
         assert!(matches!(
             BusinessRuntime::start(
                 0,
-                idiom_service(EntertainmentCoordinator::new(), None),
-                CardGameService::new(LandlordConfig::default(), EntertainmentCoordinator::new(),),
+                idiom_service(None),
+                CardGameService::new(LandlordConfig::default()),
             ),
             Err(BusinessRuntimeError::ZeroQueueCapacity)
         ));
+    }
+
+    #[test]
+    fn playback_queue_mutations_run_on_the_business_owner() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("mwm-business-queue-{suffix}.json"));
+        let runtime_state_path = path.with_extension("runtime-state.json");
+        let queue = crate::features::playback::PersistentQueue::load(path, 4).unwrap();
+        let runtime_state =
+            crate::features::playback::PersistentRuntimeState::load(runtime_state_path).unwrap();
+        let runtime = BusinessRuntime::start_with_playback(
+            4,
+            idiom_service(None),
+            CardGameService::new(LandlordConfig::default()),
+            playback_service(queue, runtime_state),
+        )
+        .unwrap();
+        let handle = runtime.handle();
+
+        let pushed = handle
+            .push_playback_queue(QueueItem {
+                keyword: "晴天".to_string(),
+                source: "qqmusic".to_string(),
+                uri: "fuo://qqmusic/songs/1".to_string(),
+                ..QueueItem::default()
+            })
+            .unwrap();
+        let snapshot = handle.playback_queue_snapshot().unwrap();
+
+        assert!(pushed.accepted);
+        assert_eq!(pushed.size, 1);
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].keyword, "晴天");
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn runtime_state_patch_is_applied_by_the_business_owner() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("mwm-business-state-{suffix}"));
+        let queue =
+            crate::features::playback::PersistentQueue::load(directory.join("queue.json"), 4)
+                .unwrap();
+        let runtime_state = crate::features::playback::PersistentRuntimeState::load(
+            directory.join("runtime-state.json"),
+        )
+        .unwrap();
+        let runtime = BusinessRuntime::start_with_playback(
+            4,
+            idiom_service(None),
+            CardGameService::new(LandlordConfig::default()),
+            playback_service(queue, runtime_state),
+        )
+        .unwrap();
+        let handle = runtime.handle();
+
+        handle
+            .patch_runtime_state(crate::features::playback::RuntimeStatePatch {
+                hall_remaining_minutes: Some(Some(42)),
+                hall_remaining_updated_at: Some(Some(1234)),
+                hall_expiring_warning_sent: Some(true),
+            })
+            .unwrap();
+        let snapshot = handle.runtime_state_snapshot().unwrap();
+
+        assert_eq!(snapshot.hall_remaining_minutes, Some(42));
+        assert_eq!(snapshot.hall_remaining_updated_at, Some(1234));
+        assert!(snapshot.hall_expiring_warning_sent);
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn concurrent_invite_sequence_reservations_have_one_winner() {
+        let runtime = runtime(4);
+        let handle = runtime.handle();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let workers = ["甲", "乙"].map(|username| {
+            let handle = handle.clone();
+            let barrier = barrier.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                matches!(
+                    handle
+                        .begin_invite(InviteRequest::new(username, Some(9), None))
+                        .unwrap(),
+                    InviteStart::Ready(_)
+                )
+            })
+        });
+        barrier.wait();
+
+        let ready = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .filter(|ready| *ready)
+            .count();
+
+        assert_eq!(ready, 1);
+        assert!(!handle.invite_should_accept(Some(9)).unwrap());
+        runtime.shutdown().unwrap();
     }
 }

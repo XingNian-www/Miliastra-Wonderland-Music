@@ -219,4 +219,65 @@ mod tests {
         assert!(error.to_string().contains("无法唯一归属标识图块"));
         runtime.shutdown().unwrap();
     }
+
+    struct FixedFixtureBlockDevice;
+
+    impl OcrDevice for FixedFixtureBlockDevice {
+        fn recognize_lines(&mut self, image: &DynamicImage) -> Result<Vec<OcrLine>> {
+            assert_eq!((image.width(), image.height()), (480, 154));
+            Ok(vec![
+                OcrLine {
+                    text: "香菜".to_string(),
+                    confidence: 1.0,
+                    bbox: Rect::new(110, 20, 80, 24),
+                },
+                OcrLine {
+                    text: "破鹿子".to_string(),
+                    confidence: 1.0,
+                    bbox: Rect::new(0, 104, 100, 24),
+                },
+            ])
+        }
+    }
+
+    #[test]
+    fn fixed_secondary_chat_blocks_preserve_title_and_friend_row_ids() {
+        let image = image::open("tests/fixtures/ui/secondary-chat-scrolled-1920x1080.jpg")
+            .expect("open fixed secondary-chat screenshot");
+        let runtime = OcrRuntime::start(FixedFixtureBlockDevice, 1).unwrap();
+        let blocks = vec![
+            OcrImageBlock {
+                id: "title",
+                rect: Rect::new(600, 24, 480, 72),
+            },
+            OcrImageBlock {
+                id: "friend-row",
+                rect: Rect::new(80, 300, 170, 70),
+            },
+        ];
+
+        let results = batch_recognize_blocks(
+            &runtime.handle(),
+            &image,
+            &blocks,
+            12,
+            OcrPriority::UiConfirmation,
+        )
+        .expect("recognize fixed screenshot blocks");
+
+        assert_eq!(
+            results,
+            [
+                OcrBlockText {
+                    id: "title",
+                    text: "香菜".to_string(),
+                },
+                OcrBlockText {
+                    id: "friend-row",
+                    text: "破鹿子".to_string(),
+                },
+            ]
+        );
+        runtime.shutdown().unwrap();
+    }
 }

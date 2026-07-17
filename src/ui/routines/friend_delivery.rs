@@ -6,7 +6,12 @@ use enigo::Key;
 use image::DynamicImage;
 use image::imageops::FilterType;
 
-use crate::config::{AppConfig, PointConfig, ScreenConfig};
+#[cfg(test)]
+use crate::config::AppConfig;
+use crate::config::{
+    FriendDeliveryConfig, InputTimingConfig, OcrConfig, OutputConfig, PointConfig, ScreenConfig,
+    TemplateConfig,
+};
 use crate::observation::chat::{SECONDARY_TITLE_RECT, SecondaryChatIdentity, classify_title};
 use crate::runtime::ocr::{OcrPriority, OcrRuntimeHandle, merge_ocr_lines};
 use crate::runtime::ui::{
@@ -17,7 +22,9 @@ use crate::text::normalize_comparison_text as normalize_lock_text;
 use crate::ui::change_detection::{ChangeFingerprint, change_stats, rect_chat_change_fingerprint};
 use crate::ui::geometry::{Point, Rect, crop_canvas};
 use crate::ui::locator::secondary_hall_search_rect;
-use crate::ui::state::{ResolvedUiTemplateArgs, UiTemplateArgs, detect_ui_state};
+#[cfg(test)]
+use crate::ui::state::UiTemplateArgs;
+use crate::ui::state::{ResolvedUiTemplateArgs, detect_ui_state};
 use crate::ui::template::best_template_hit;
 
 const FRIEND_ROW_Y_TOLERANCE: i32 = 6;
@@ -200,11 +207,15 @@ pub(crate) struct ResidencyUi {
 }
 
 impl ResidencyUi {
-    pub(crate) fn new(runtime: UiRuntimeHandle, ocr: OcrRuntimeHandle, config: &AppConfig) -> Self {
+    pub(crate) fn new(
+        runtime: UiRuntimeHandle,
+        ocr: OcrRuntimeHandle,
+        config: FriendDeliveryRoutineConfig,
+    ) -> Self {
         Self {
             runtime,
             ocr,
-            config: FriendDeliveryRoutineConfig::from_app(config),
+            config,
         }
     }
 
@@ -214,6 +225,20 @@ impl ResidencyUi {
     ) -> std::result::Result<UiOperation<UiResidencyOutcome>, UiSubmitError> {
         self.runtime.submit(EstablishResidencyRoutine {
             request,
+            ocr: self.ocr.clone(),
+            config: self.config.clone(),
+        })
+    }
+
+    pub(crate) fn observe(
+        &self,
+        target: UiResidencyTarget,
+    ) -> std::result::Result<
+        UiOperation<std::result::Result<DynamicImage, UiRoutineFailure>>,
+        UiSubmitError,
+    > {
+        self.runtime.submit(ObserveResidencyRoutine {
+            target,
             ocr: self.ocr.clone(),
             config: self.config.clone(),
         })
@@ -240,6 +265,28 @@ impl UiRoutine for EstablishResidencyRoutine {
             Ok(()) => UiResidencyOutcome::Confirmed(self.request.target),
             Err(failure) => UiResidencyOutcome::Failed(failure),
         }
+    }
+}
+
+struct ObserveResidencyRoutine {
+    target: UiResidencyTarget,
+    ocr: OcrRuntimeHandle,
+    config: FriendDeliveryRoutineConfig,
+}
+
+impl sealed::UiRoutineSealed for ObserveResidencyRoutine {}
+
+impl UiRoutine for ObserveResidencyRoutine {
+    type Output = std::result::Result<DynamicImage, UiRoutineFailure>;
+
+    fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
+        context.publish_progress(UiRoutineProgressStage::NormalizingStart);
+        context
+            .device()
+            .ensure_ready(self.config.after_activate_ms)
+            .map_err(|error| before_input_failure("prepare_residency_observation", error))?;
+        restore_residency(context, &self.ocr, &self.config, self.target)?;
+        capture_normalized(context, &self.config, "capture_residency_observation")
     }
 }
 
@@ -299,11 +346,15 @@ pub(crate) struct HallBatchUi {
 }
 
 impl HallBatchUi {
-    pub(crate) fn new(runtime: UiRuntimeHandle, ocr: OcrRuntimeHandle, config: &AppConfig) -> Self {
+    pub(crate) fn new(
+        runtime: UiRuntimeHandle,
+        ocr: OcrRuntimeHandle,
+        config: FriendDeliveryRoutineConfig,
+    ) -> Self {
         Self {
             runtime,
             ocr,
-            config: FriendDeliveryRoutineConfig::from_app(config),
+            config,
         }
     }
 
@@ -336,11 +387,15 @@ impl UiRoutine for SendHallBatchRoutine {
 }
 
 impl FriendDeliveryUi {
-    pub(crate) fn new(runtime: UiRuntimeHandle, ocr: OcrRuntimeHandle, config: &AppConfig) -> Self {
+    pub(crate) fn new(
+        runtime: UiRuntimeHandle,
+        ocr: OcrRuntimeHandle,
+        config: FriendDeliveryRoutineConfig,
+    ) -> Self {
         Self {
             runtime,
             ocr,
-            config: FriendDeliveryRoutineConfig::from_app(config),
+            config,
         }
     }
 
@@ -357,7 +412,7 @@ impl FriendDeliveryUi {
 }
 
 #[derive(Clone)]
-pub(super) struct FriendDeliveryRoutineConfig {
+pub(crate) struct FriendDeliveryRoutineConfig {
     pub(super) screen: ScreenConfig,
     templates: ResolvedUiTemplateArgs,
     canvas_width: u32,
@@ -383,38 +438,73 @@ pub(super) struct FriendDeliveryRoutineConfig {
     template_threshold: f32,
 }
 
+pub(crate) struct FriendDeliveryRoutineConfigSource<'a> {
+    pub(crate) screen: &'a ScreenConfig,
+    pub(crate) ui_templates: ResolvedUiTemplateArgs,
+    pub(crate) templates: &'a TemplateConfig,
+    pub(crate) ocr: &'a OcrConfig,
+    pub(crate) output: &'a OutputConfig,
+    pub(crate) input_timing: &'a InputTimingConfig,
+    pub(crate) delivery: &'a FriendDeliveryConfig,
+    pub(crate) friend_list_region: Rect,
+    pub(crate) friend_chat_region: Rect,
+    pub(crate) friend_step_ms: u64,
+    pub(crate) timeout_ms: u64,
+    pub(crate) poll_ms: u64,
+    pub(crate) stable_count: u32,
+}
+
 impl FriendDeliveryRoutineConfig {
-    pub(super) fn from_app(config: &AppConfig) -> Self {
-        let hall_anchor: Rect = config.screen.secondary_hall_rect.into();
-        let friend_list_region: Rect = config.invite.friend_list_region.into();
+    pub(crate) fn resolve(source: FriendDeliveryRoutineConfigSource<'_>) -> Self {
+        let hall_anchor: Rect = source.screen.secondary_hall_rect.into();
+        let friend_list_region = source.friend_list_region;
         Self {
-            screen: config.screen.clone(),
-            templates: UiTemplateArgs::default().resolve(config),
-            canvas_width: config.screen.expected_width,
-            canvas_height: config.screen.expected_height,
+            screen: source.screen.clone(),
+            templates: source.ui_templates,
+            canvas_width: source.screen.expected_width,
+            canvas_height: source.screen.expected_height,
             friend_list_region,
-            friend_chat_region: config.invite.friend_chat_region.into(),
+            friend_chat_region: source.friend_chat_region,
             secondary_hall_search_region: secondary_hall_search_rect(
                 hall_anchor,
                 friend_list_region,
             ),
-            chat_click: config.output.chat_click_2,
-            send_enabled: config.output.send_enabled,
-            after_activate_ms: config.timing.input.after_activate_ms,
-            open_chat_ms: config.timing.input.open_chat_ms,
-            click_ms: config.timing.input.click_ms,
-            text_ms: config.timing.input.text_ms,
-            send_ms: config.timing.input.send_ms,
+            chat_click: source.output.chat_click_2,
+            send_enabled: source.output.send_enabled,
+            after_activate_ms: source.input_timing.after_activate_ms,
+            open_chat_ms: source.input_timing.open_chat_ms,
+            click_ms: source.input_timing.click_ms,
+            text_ms: source.input_timing.text_ms,
+            send_ms: source.input_timing.send_ms,
+            friend_step_ms: source.friend_step_ms,
+            timeout_ms: source.timeout_ms,
+            poll_ms: source.poll_ms.max(10),
+            stable_count: source.stable_count,
+            auto_retry_count: source.delivery.auto_retry_count,
+            stable_mean_threshold: source.ocr.change_mean_threshold,
+            stable_changed_ratio_threshold: source.ocr.change_pixel_threshold,
+            secondary_hall_template: source.templates.secondary_hall.clone(),
+            template_threshold: source.templates.marker_threshold,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_app(config: &AppConfig) -> Self {
+        Self::resolve(FriendDeliveryRoutineConfigSource {
+            screen: &config.screen,
+            ui_templates: UiTemplateArgs::default().resolve(&config.templates, &config.ocr),
+            templates: &config.templates,
+            ocr: &config.ocr,
+            output: &config.output,
+            input_timing: &config.timing.input,
+            delivery: &config.friend_delivery,
+            friend_list_region: config.invite.friend_list_region.into(),
+            friend_chat_region: config.invite.friend_chat_region.into(),
             friend_step_ms: config.timing.invite.step_ms,
             timeout_ms: config.timing.workflow.default_timeout_ms,
-            poll_ms: config.timing.workflow.default_poll_ms.max(10),
+            poll_ms: config.timing.workflow.default_poll_ms,
             stable_count: config.resolve_stability_count(config.invite.friend_name_stable_count),
-            auto_retry_count: config.friend_delivery.auto_retry_count,
-            stable_mean_threshold: config.ocr.change_mean_threshold,
-            stable_changed_ratio_threshold: config.ocr.change_pixel_threshold,
-            secondary_hall_template: config.templates.secondary_hall.clone(),
-            template_threshold: config.templates.marker_threshold,
-        }
+        })
     }
 }
 
@@ -448,6 +538,13 @@ enum PageSearch {
 enum TextMatchMode {
     Exact,
     ContainsCompleteTarget,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConversationIdentityEvidence {
+    Title,
+    ChatRegion,
+    Missing,
 }
 
 fn execute_friend_deliveries(
@@ -945,20 +1042,8 @@ fn confirm_friend_conversation(
     let mut streak = 0_u32;
     for attempt in 0..attempts {
         let image = capture_normalized(context, config, "confirm_friend_conversation")?;
-        let title = merged_text(ocr, &image, SECONDARY_TITLE_RECT)?;
-        let title_matches = text_contains_complete_target(&normalize_lock_text(&title), &target);
-        let found = if title_matches {
-            true
-        } else {
-            !matching_text_rows(
-                ocr,
-                &image,
-                config.friend_chat_region,
-                &target,
-                TextMatchMode::ContainsCompleteTarget,
-            )?
-            .is_empty()
-        };
+        let found = detect_conversation_identity(ocr, &image, config, &target)?
+            != ConversationIdentityEvidence::Missing;
         if found {
             streak = streak.saturating_add(1);
             if streak >= config.stable_count {
@@ -976,6 +1061,31 @@ fn confirm_friend_conversation(
         "confirm_friend_conversation",
         "selected conversation did not stably contain the complete friend name",
     ))
+}
+
+fn detect_conversation_identity(
+    ocr: &OcrRuntimeHandle,
+    image: &DynamicImage,
+    config: &FriendDeliveryRoutineConfig,
+    normalized_target: &str,
+) -> std::result::Result<ConversationIdentityEvidence, UiRoutineFailure> {
+    let title = merged_text(ocr, image, SECONDARY_TITLE_RECT)?;
+    if text_contains_complete_target(&normalize_lock_text(&title), normalized_target) {
+        return Ok(ConversationIdentityEvidence::Title);
+    }
+    if matching_text_rows(
+        ocr,
+        image,
+        config.friend_chat_region,
+        normalized_target,
+        TextMatchMode::ContainsCompleteTarget,
+    )?
+    .is_empty()
+    {
+        Ok(ConversationIdentityEvidence::Missing)
+    } else {
+        Ok(ConversationIdentityEvidence::ChatRegion)
+    }
 }
 
 pub(super) fn restore_residency(
@@ -1284,7 +1394,7 @@ mod tests {
         assert!(text_contains_complete_target("原昵称(萌萌)", "萌萌"));
     }
     use crate::config::AppConfig;
-    use crate::runtime::ocr::{OcrDevice, OcrLine, OcrRuntime};
+    use crate::runtime::ocr::{OcrArgs, OcrDevice, OcrLine, OcrRuntime, ProductionOcrDevice};
     use crate::runtime::ui::{UiDevice, UiRuntime};
     use crate::ui::geometry::Rect;
 
@@ -1292,6 +1402,100 @@ mod tests {
     enum Conversation {
         Hall,
         Friend(String),
+    }
+
+    #[test]
+    fn fixed_secondary_chat_fixture_proves_stable_friend_row_and_title_first_identity_fallback() {
+        let config = AppConfig::load(Path::new("config.yaml")).expect("load default config");
+        let args = OcrArgs::default().resolve(&config.ocr);
+        let runtime = OcrRuntime::start(
+            ProductionOcrDevice::new(args).expect("initialize OCR device"),
+            1,
+        )
+        .expect("start OCR runtime");
+        let image = image::open("tests/fixtures/ui/secondary-chat-scrolled-1920x1080.jpg")
+            .expect("open fixed secondary-chat screenshot");
+        let region: Rect = config.invite.friend_list_region.into();
+
+        let handle = runtime.handle();
+        let samples = (0..2)
+            .map(|_| {
+                matching_text_rows(
+                    &handle,
+                    &image,
+                    region,
+                    &normalize_lock_text("破鹿子"),
+                    TextMatchMode::Exact,
+                )
+                .expect("locate exact friend row")
+            })
+            .collect::<Vec<_>>();
+
+        assert!(samples.iter().all(|hits| hits.len() == 1));
+        assert_eq!(samples[0][0].y, samples[1][0].y);
+        assert!((region.x..region.right()).contains(&samples[0][0].x));
+        assert!((region.y..region.bottom()).contains(&samples[0][0].y));
+        assert!(
+            (320..=380).contains(&samples[0][0].y),
+            "unexpected row: {:?}",
+            samples[0][0]
+        );
+
+        let routine = FriendDeliveryRoutineConfig::from_app(&config);
+        assert_eq!(
+            detect_conversation_identity(&handle, &image, &routine, &normalize_lock_text("香菜"))
+                .expect("recognize title identity"),
+            ConversationIdentityEvidence::Title
+        );
+        assert_eq!(
+            detect_conversation_identity(&handle, &image, &routine, &normalize_lock_text("星念"))
+                .expect("recognize chat-region fallback identity"),
+            ConversationIdentityEvidence::ChatRegion
+        );
+
+        let state = Arc::new(Mutex::new(TestUiState {
+            conversation: Conversation::Hall,
+            pasted: Vec::new(),
+            selected_friends: Vec::new(),
+            hall_clicks: 0,
+            scrolls: 0,
+            send_attempts: 0,
+            fail_send_attempt: None,
+        }));
+        let ui_runtime = UiRuntime::start(
+            RecordingDevice {
+                frame: image,
+                state: Arc::clone(&state),
+                friend_rows: Vec::new(),
+                hall_point: (-1, -1),
+            },
+            1,
+        )
+        .expect("start fixed-fixture UI runtime");
+        let mut bounded_config = routine;
+        bounded_config.poll_ms = 1;
+        bounded_config.timeout_ms = 5;
+        bounded_config.stable_count = 2;
+        let failure = ui_runtime
+            .handle()
+            .submit(BoundedFixtureSearchRoutine {
+                ocr: handle,
+                config: bounded_config,
+                recipient: "绝不会存在的好友".to_string(),
+            })
+            .expect("submit bounded friend traversal")
+            .wait()
+            .expect("wait for bounded friend traversal")
+            .expect_err("missing friend must not be selected");
+        assert_eq!(failure.stage(), "locate_friend");
+        assert_eq!(failure.certainty(), InputCertainty::ConfirmedFailure);
+        let scrolls = state.lock().unwrap().scrolls;
+        assert!(scrolls > 0);
+        assert!(scrolls <= MAX_UPWARD_SCROLLS + MAX_DOWNWARD_SCROLLS);
+        ui_runtime
+            .shutdown()
+            .expect("shutdown fixed-fixture UI runtime");
+        runtime.shutdown().expect("shutdown OCR runtime");
     }
 
     struct TestUiState {
@@ -1309,6 +1513,22 @@ mod tests {
         state: Arc<Mutex<TestUiState>>,
         friend_rows: Vec<(i32, String)>,
         hall_point: (i32, i32),
+    }
+
+    struct BoundedFixtureSearchRoutine {
+        ocr: OcrRuntimeHandle,
+        config: FriendDeliveryRoutineConfig,
+        recipient: String,
+    }
+
+    impl sealed::UiRoutineSealed for BoundedFixtureSearchRoutine {}
+
+    impl UiRoutine for BoundedFixtureSearchRoutine {
+        type Output = std::result::Result<Point, UiRoutineFailure>;
+
+        fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
+            locate_stable_friend_row(context, &self.ocr, &self.config, &self.recipient)
+        }
     }
 
     impl UiDevice for RecordingDevice {
@@ -1406,6 +1626,50 @@ mod tests {
         }
     }
 
+    struct TitleFallbackOcrDevice {
+        state: Arc<Mutex<TestUiState>>,
+        friend_list_size: (u32, u32),
+        title_size: (u32, u32),
+        friend_chat_size: (u32, u32),
+    }
+
+    impl OcrDevice for TitleFallbackOcrDevice {
+        fn recognize_lines(&mut self, image: &DynamicImage) -> Result<Vec<OcrLine>> {
+            let size = (image.width(), image.height());
+            if size == self.friend_list_size {
+                return Ok(vec![OcrLine {
+                    text: "萌萌".to_string(),
+                    confidence: 1.0,
+                    bbox: Rect::new(5, 70, 80, 30),
+                }]);
+            }
+            if size == self.title_size {
+                let title = match &self.state.lock().unwrap().conversation {
+                    Conversation::Hall => "当前大厅",
+                    Conversation::Friend(_) => "备注未显示昵称",
+                };
+                return Ok(vec![OcrLine {
+                    text: title.to_string(),
+                    confidence: 1.0,
+                    bbox: Rect::new(0, 0, image.width(), image.height()),
+                }]);
+            }
+            if size == self.friend_chat_size
+                && matches!(
+                    self.state.lock().unwrap().conversation,
+                    Conversation::Friend(_)
+                )
+            {
+                return Ok(vec![OcrLine {
+                    text: "原昵称(萌萌)".to_string(),
+                    confidence: 1.0,
+                    bbox: Rect::new(20, 80, 180, 30),
+                }]);
+            }
+            Ok(Vec::new())
+        }
+    }
+
     #[test]
     fn ordered_batch_sends_every_message_before_restoring_secondary_hall_once() {
         let mut config = AppConfig::load(Path::new("config.yaml")).unwrap();
@@ -1453,7 +1717,11 @@ mod tests {
         )
         .unwrap();
         let ui_runtime = UiRuntime::start(device, 4).unwrap();
-        let friend_ui = FriendDeliveryUi::new(ui_runtime.handle(), ocr_runtime.handle(), &config);
+        let friend_ui = FriendDeliveryUi::new(
+            ui_runtime.handle(),
+            ocr_runtime.handle(),
+            FriendDeliveryRoutineConfig::from_app(&config),
+        );
 
         let operation = friend_ui
             .submit(SendFriendDeliveries::new(
@@ -1481,6 +1749,79 @@ mod tests {
         let state = state.lock().unwrap();
         assert_eq!(state.selected_friends, ["甲", "乙"]);
         assert_eq!(state.pasted, ["甲一", "乙一", "乙二"]);
+        assert_eq!(state.hall_clicks, 1);
+
+        ui_runtime.shutdown().unwrap();
+        ocr_runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn friend_conversation_falls_back_to_the_chat_region_when_title_has_no_name() {
+        let mut config = AppConfig::load(Path::new("config.yaml")).unwrap();
+        config.timing.input.after_activate_ms = 0;
+        config.timing.input.open_chat_ms = 0;
+        config.timing.input.click_ms = 0;
+        config.timing.input.text_ms = 0;
+        config.timing.input.send_ms = 0;
+        config.timing.invite.step_ms = 0;
+        config.timing.workflow.default_timeout_ms = 20;
+        config.timing.workflow.default_poll_ms = 1;
+        let state = Arc::new(Mutex::new(TestUiState {
+            conversation: Conversation::Hall,
+            pasted: Vec::new(),
+            selected_friends: Vec::new(),
+            hall_clicks: 0,
+            scrolls: 0,
+            send_attempts: 0,
+            fail_send_attempt: None,
+        }));
+        let friend_list = config.invite.friend_list_region;
+        let title = SECONDARY_TITLE_RECT;
+        let friend_chat = config.invite.friend_chat_region;
+        let hall_template = image::open(&config.templates.secondary_hall).unwrap();
+        let hall_point = (
+            config.screen.secondary_hall_rect.x + hall_template.width() as i32 / 2,
+            config.screen.secondary_hall_rect.y + hall_template.height() as i32 / 2,
+        );
+        let ui_runtime = UiRuntime::start(
+            RecordingDevice {
+                frame: secondary_frame(&config),
+                state: state.clone(),
+                friend_rows: vec![(friend_list.y + 85, "萌萌".to_string())],
+                hall_point,
+            },
+            4,
+        )
+        .unwrap();
+        let ocr_runtime = OcrRuntime::start(
+            TitleFallbackOcrDevice {
+                state: state.clone(),
+                friend_list_size: (friend_list.width, friend_list.height),
+                title_size: (title.width, title.height),
+                friend_chat_size: (friend_chat.width, friend_chat.height),
+            },
+            4,
+        )
+        .unwrap();
+        let friend_ui = FriendDeliveryUi::new(
+            ui_runtime.handle(),
+            ocr_runtime.handle(),
+            FriendDeliveryRoutineConfig::from_app(&config),
+        );
+
+        let outcome = friend_ui
+            .submit(SendFriendDeliveries::new(
+                vec![FriendDelivery::new("萌萌", ["报名成功"])],
+                UiResidencyTarget::SecondaryCurrentHall,
+            ))
+            .unwrap()
+            .wait()
+            .unwrap();
+
+        assert!(outcome.is_complete());
+        let state = state.lock().unwrap();
+        assert_eq!(state.selected_friends, ["萌萌"]);
+        assert_eq!(state.pasted, ["报名成功"]);
         assert_eq!(state.hall_clicks, 1);
 
         ui_runtime.shutdown().unwrap();
@@ -1532,7 +1873,11 @@ mod tests {
             4,
         )
         .unwrap();
-        let hall_ui = HallBatchUi::new(ui_runtime.handle(), ocr_runtime.handle(), &config);
+        let hall_ui = HallBatchUi::new(
+            ui_runtime.handle(),
+            ocr_runtime.handle(),
+            FriendDeliveryRoutineConfig::from_app(&config),
+        );
 
         let outcome = hall_ui
             .submit(SendHallBatch::new(
@@ -1633,7 +1978,11 @@ mod tests {
             4,
         )
         .unwrap();
-        let friend_ui = FriendDeliveryUi::new(ui_runtime.handle(), ocr_runtime.handle(), &config);
+        let friend_ui = FriendDeliveryUi::new(
+            ui_runtime.handle(),
+            ocr_runtime.handle(),
+            FriendDeliveryRoutineConfig::from_app(&config),
+        );
 
         let result = friend_ui
             .submit(SendFriendDeliveries::new(
@@ -1651,6 +2000,8 @@ mod tests {
         let state = state.lock().unwrap();
         assert!(state.selected_friends.is_empty());
         assert!(state.pasted.is_empty());
+        assert!(state.scrolls > 0);
+        assert!(state.scrolls <= MAX_UPWARD_SCROLLS + MAX_DOWNWARD_SCROLLS);
 
         ui_runtime.shutdown().unwrap();
         ocr_runtime.shutdown().unwrap();
@@ -1703,7 +2054,11 @@ mod tests {
             4,
         )
         .unwrap();
-        let friend_ui = FriendDeliveryUi::new(ui_runtime.handle(), ocr_runtime.handle(), &config);
+        let friend_ui = FriendDeliveryUi::new(
+            ui_runtime.handle(),
+            ocr_runtime.handle(),
+            FriendDeliveryRoutineConfig::from_app(&config),
+        );
         let request = SendFriendDeliveries::new(
             vec![FriendDelivery::new("甲", ["第一", "第二", "第三"])],
             UiResidencyTarget::SecondaryCurrentHall,

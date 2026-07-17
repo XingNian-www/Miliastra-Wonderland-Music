@@ -1,13 +1,18 @@
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 
 use crate::features::card_games::LandlordConfig;
+use crate::features::custom_workflow::{CustomWorkflowConfig, WorkflowTimingConfig};
 use crate::features::idiom_chain::IdiomChainConfig;
+use crate::features::invite::{InviteConfig, InviteTimingConfig};
+use crate::features::moderation::{ModerationConfig, ModerationTimingConfig};
+use crate::features::playback::{MatchConfig, PlaybackTimingConfig, QueueConfig, SongDedupConfig};
+use crate::features::song_request::{AiConfig, SongReviewConfig};
+use crate::features::startup::StartupConfig;
 use crate::features::turtle_soup::TurtleSoupConfig;
 use crate::features::undercover::UndercoverConfig;
 use crate::runtime::player::PlayerObservationConfig;
@@ -18,7 +23,6 @@ use crate::runtime::player_io::{PlayerRuntimeConfig, PlayerRuntimeConfigError};
 pub struct AppConfig {
     pub window: WindowConfig,
     pub screen: ScreenConfig,
-    #[serde(default)]
     pub stability: StabilityConfig,
     pub timing: TimingConfig,
     pub ocr: OcrConfig,
@@ -31,24 +35,17 @@ pub struct AppConfig {
     pub tui: TuiConfig,
     pub state: StateConfig,
     pub queue: QueueConfig,
-    #[serde(default)]
     pub song_dedup: SongDedupConfig,
-    #[serde(default)]
     pub idiom_chain: IdiomChainConfig,
-    #[serde(default)]
     pub landlord: LandlordConfig,
-    #[serde(default)]
     pub undercover: UndercoverConfig,
-    #[serde(default)]
     pub turtle_soup: TurtleSoupConfig,
     pub ai: AiConfig,
-    #[serde(default)]
     pub song_review: SongReviewConfig,
     pub matching: MatchConfig,
     pub hotkeys: HotkeyConfig,
     pub startup: StartupConfig,
     pub invite: InviteConfig,
-    #[serde(default)]
     pub friend_delivery: FriendDeliveryConfig,
     pub custom_workflows: CustomWorkflowConfig,
 }
@@ -61,18 +58,9 @@ const PLAYER_CONTROL_QUEUE_CAPACITY: usize = 16;
 const PLAYER_SEARCH_QUEUE_CAPACITY: usize = 16;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
-#[serde(default)]
 #[serde(deny_unknown_fields)]
 pub struct StabilityConfig {
     pub default_count: u32,
-}
-
-impl Default for StabilityConfig {
-    fn default() -> Self {
-        Self {
-            default_count: BUILTIN_STABILITY_COUNT,
-        }
-    }
 }
 
 pub(crate) fn resolve_stability_count(local: u32, global: u32) -> u32 {
@@ -93,67 +81,145 @@ pub struct WindowConfig {
     pub content_width: u32,
     pub content_height: u32,
     pub auto_activate_window: bool,
-    #[serde(default = "default_window_focus_point")]
     pub focus_point: PointConfig,
-}
-
-fn default_window_focus_point() -> PointConfig {
-    PointConfig::new(1919, 1000)
 }
 
 impl AppConfig {
     pub(crate) fn validate(&self) -> Result<()> {
+        self.timing.validate()?;
         self.player_runtime_config()
             .context("校验播放器运行时配置")?;
+        if self.window.target_process.trim().is_empty() {
+            bail!("window.target_process 不能为空");
+        }
         if self.window.content_width == 0 || self.window.content_height == 0 {
             bail!("window.content_width 和 window.content_height 必须大于 0");
         }
         if self.screen.expected_width == 0 || self.screen.expected_height == 0 {
             bail!("screen.expected_width 和 screen.expected_height 必须大于 0");
         }
-        if self.queue.max_size == 0 {
-            bail!("queue.max_size 必须大于 0");
-        }
-        if self.tui.enabled && self.tui.refresh_ms == 0 {
-            bail!("tui.refresh_ms 必须大于 0");
-        }
-        validate_unit_interval(
-            self.templates.marker_threshold,
-            "templates.marker_threshold",
-        )?;
-        validate_unit_interval(
-            self.custom_workflows.default_threshold,
-            "custom_workflows.default_threshold",
-        )?;
-        validate_unit_interval(
-            self.startup.template_threshold,
-            "startup.template_threshold",
-        )?;
-        validate_unit_interval(
-            self.startup.wonderland_enter_button_threshold,
-            "startup.wonderland_enter_button_threshold",
-        )?;
-        if self.http.enabled && self.http.host.trim().is_empty() {
-            bail!("http.host 不能为空");
-        }
-        if self.http.enabled
-            && !matches!(
-                self.http.host.trim().to_ascii_lowercase().as_str(),
-                "127.0.0.1" | "localhost" | "::1"
-            )
-            && self.http.access_token.trim().is_empty()
+        if self.window.content_width != self.screen.expected_width
+            || self.window.content_height != self.screen.expected_height
         {
-            bail!("HTTP 监听非本机地址时必须设置 http.access_token");
+            bail!(
+                "window.content_width/content_height 必须与 screen.expected_width/expected_height 一致"
+            );
         }
-        if self.turtle_soup.enabled {
-            if self.turtle_soup.ai.endpoint.trim().is_empty() {
-                bail!("turtle_soup.ai.endpoint 未配置");
-            }
-            if self.turtle_soup.ai.api_key.trim().is_empty() {
-                bail!("turtle_soup.ai.api_key 未配置");
-            }
-            if self.turtle_soup.ai.model.trim().is_empty() {
-                bail!("turtle_soup.ai.model 未配置");
+        self.screen.validate()?;
+        self.ocr.validate()?;
+        self.templates.validate()?;
+        self.feeluown.validate()?;
+        self.http.validate()?;
+        self.logging.validate()?;
+        self.tui.validate()?;
+        self.state.validate()?;
+        self.hotkeys.validate()?;
+        self.queue.validate()?;
+        self.song_dedup.validate()?;
+        self.matching.validate()?;
+        self.idiom_chain.validate()?;
+        self.landlord.validate()?;
+        self.undercover.validate()?;
+        self.invite.validate(&self.timing.invite)?;
+        self.moderation.validate(&self.timing.moderation)?;
+        self.custom_workflows.validate()?;
+        self.startup.validate()?;
+        self.ai.validate()?;
+        self.song_review.validate()?;
+        self.turtle_soup.validate()?;
+        self.validate_ui_geometry()?;
+        Ok(())
+    }
+
+    fn validate_ui_geometry(&self) -> Result<()> {
+        let canvas = (self.screen.expected_width, self.screen.expected_height);
+        for (rect, field) in [
+            (self.invite.friend_list_region, "invite.friend_list_region"),
+            (self.invite.friend_chat_region, "invite.friend_chat_region"),
+            (
+                self.invite.confirm_list_region,
+                "invite.confirm_list_region",
+            ),
+            (self.invite.view_star_region, "invite.view_star_region"),
+            (self.invite.goto_hall_region, "invite.goto_hall_region"),
+            (self.invite.enter_hall_region, "invite.enter_hall_region"),
+            (
+                self.moderation.friend_panel_region,
+                "moderation.friend_panel_region",
+            ),
+            (
+                self.moderation.search_panel_region,
+                "moderation.search_panel_region",
+            ),
+            (
+                self.moderation.more_settings_region,
+                "moderation.more_settings_region",
+            ),
+            (
+                self.moderation.block_chat_region,
+                "moderation.block_chat_region",
+            ),
+            (
+                self.moderation.blacklist_region,
+                "moderation.blacklist_region",
+            ),
+            (self.moderation.confirm_region, "moderation.confirm_region"),
+            (
+                self.startup.enter_game_text_region,
+                "startup.enter_game_text_region",
+            ),
+            (
+                self.startup.wonderland_enter_button_region,
+                "startup.wonderland_enter_button_region",
+            ),
+            (self.startup.main_ui_region, "startup.main_ui_region"),
+            (
+                self.startup.wonderland_close_region,
+                "startup.wonderland_close_region",
+            ),
+        ] {
+            validate_rect_in_canvas(rect, field, canvas)?;
+        }
+        for (point, field) in [
+            (self.window.focus_point, "window.focus_point"),
+            (self.output.focus_point, "output.focus_point"),
+            (self.output.chat_click_2, "output.chat_click_2"),
+            (
+                self.moderation.search_input_point,
+                "moderation.search_input_point",
+            ),
+            (
+                self.moderation.search_button_point,
+                "moderation.search_button_point",
+            ),
+            (
+                self.startup.wonderland_card_point,
+                "startup.wonderland_card_point",
+            ),
+        ] {
+            validate_point_in_canvas(point, field, canvas)?;
+        }
+        for workflow in self
+            .custom_workflows
+            .workflows
+            .iter()
+            .filter(|workflow| workflow.enabled)
+        {
+            for (index, step) in workflow.steps.iter().enumerate() {
+                if let Some(region) = step.region {
+                    validate_rect_in_canvas(
+                        region,
+                        &format!("custom_workflows.{}.steps[{index}].region", workflow.name),
+                        canvas,
+                    )?;
+                }
+                if let Some(point) = step.point {
+                    validate_point_in_canvas(
+                        point,
+                        &format!("custom_workflows.{}.steps[{index}].point", workflow.name),
+                        canvas,
+                    )?;
+                }
             }
         }
         Ok(())
@@ -223,6 +289,63 @@ fn validate_unit_interval(value: f32, field: &str) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn validate_rect(rect: RectConfig, field: &str) -> Result<()> {
+    if rect.width == 0 || rect.height == 0 {
+        bail!("{} 的 width 和 height 必须大于 0", field);
+    }
+    Ok(())
+}
+
+fn validate_rect_in_canvas(
+    rect: RectConfig,
+    field: &str,
+    (canvas_width, canvas_height): (u32, u32),
+) -> Result<()> {
+    validate_rect(rect, field)?;
+    let right = i64::from(rect.x) + i64::from(rect.width);
+    let bottom = i64::from(rect.y) + i64::from(rect.height);
+    if rect.x < 0
+        || rect.y < 0
+        || right > i64::from(canvas_width)
+        || bottom > i64::from(canvas_height)
+    {
+        bail!(
+            "{} 必须完整位于 {}x{} 画布内",
+            field,
+            canvas_width,
+            canvas_height
+        );
+    }
+    Ok(())
+}
+
+fn validate_point_in_canvas(
+    point: PointConfig,
+    field: &str,
+    (canvas_width, canvas_height): (u32, u32),
+) -> Result<()> {
+    if point.x < 0
+        || point.y < 0
+        || i64::from(point.x) >= i64::from(canvas_width)
+        || i64::from(point.y) >= i64::from(canvas_height)
+    {
+        bail!(
+            "{} 必须位于 {}x{} 画布内",
+            field,
+            canvas_width,
+            canvas_height
+        );
+    }
+    Ok(())
+}
+
+fn validate_nonempty_path(path: &Path, field: &str) -> Result<()> {
+    if path.as_os_str().is_empty() {
+        bail!("{} 不能为空", field);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 fn bundled_config_yaml() -> &'static str {
     include_str!("../../config.yaml")
@@ -258,19 +381,25 @@ pub struct ScreenConfig {
     pub warn_on_size_mismatch: bool,
     pub chat_rect: RectConfig,
     pub friend_rect: RectConfig,
-    #[serde(default = "default_secondary_back_rect")]
     pub secondary_back_rect: RectConfig,
     pub secondary_hall_rect: RectConfig,
     pub hall_name_rect: RectConfig,
     pub hall_time_rect: RectConfig,
 }
 
-fn default_secondary_back_rect() -> RectConfig {
-    RectConfig {
-        x: 15,
-        y: 15,
-        width: 65,
-        height: 65,
+impl ScreenConfig {
+    fn validate(&self) -> Result<()> {
+        for (rect, field) in [
+            (self.chat_rect, "screen.chat_rect"),
+            (self.friend_rect, "screen.friend_rect"),
+            (self.secondary_back_rect, "screen.secondary_back_rect"),
+            (self.secondary_hall_rect, "screen.secondary_hall_rect"),
+            (self.hall_name_rect, "screen.hall_name_rect"),
+            (self.hall_time_rect, "screen.hall_time_rect"),
+        ] {
+            validate_rect_in_canvas(rect, field, (self.expected_width, self.expected_height))?;
+        }
+        Ok(())
     }
 }
 
@@ -289,6 +418,66 @@ pub struct TimingConfig {
     pub playback: PlaybackTimingConfig,
     pub decision: DecisionTimingConfig,
     pub external: ExternalTimingConfig,
+}
+
+impl TimingConfig {
+    fn validate(&self) -> Result<()> {
+        for (value, field) in [
+            (self.watchdog_restart_ms, "timing.watchdog_restart_ms"),
+            (self.loop_idle_ms, "timing.loop_idle_ms"),
+            (self.chat_scan.fallback_ms, "timing.chat_scan.fallback_ms"),
+            (
+                self.chat_scan.change_debounce_ms,
+                "timing.chat_scan.change_debounce_ms",
+            ),
+            (
+                self.chat_scan.change_cooldown_ms,
+                "timing.chat_scan.change_cooldown_ms",
+            ),
+            (self.command.ui_timeout_ms, "timing.command.ui_timeout_ms"),
+            (
+                self.command.return_retry_ms,
+                "timing.command.return_retry_ms",
+            ),
+            (self.command.post_settle_ms, "timing.command.post_settle_ms"),
+            (self.command.help_batch_ms, "timing.command.help_batch_ms"),
+            (
+                self.input.after_activate_ms,
+                "timing.input.after_activate_ms",
+            ),
+            (self.input.focus_ms, "timing.input.focus_ms"),
+            (self.input.open_chat_ms, "timing.input.open_chat_ms"),
+            (self.input.click_ms, "timing.input.click_ms"),
+            (self.input.text_ms, "timing.input.text_ms"),
+            (self.input.send_ms, "timing.input.send_ms"),
+            (self.hall.page_settle_ms, "timing.hall.page_settle_ms"),
+            (
+                self.hall.ocr_sample_interval_ms,
+                "timing.hall.ocr_sample_interval_ms",
+            ),
+            (self.decision.timeout_ms, "timing.decision.timeout_ms"),
+            (self.decision.poll_ms, "timing.decision.poll_ms"),
+            (
+                self.external.feeluown_rpc_timeout_ms,
+                "timing.external.feeluown_rpc_timeout_ms",
+            ),
+            (
+                self.external.volume_smooth_step_ms,
+                "timing.external.volume_smooth_step_ms",
+            ),
+            (
+                self.external.ai_request_timeout_ms,
+                "timing.external.ai_request_timeout_ms",
+            ),
+        ] {
+            if value == 0 {
+                bail!("{} 必须大于 0", field);
+            }
+        }
+        self.workflow.validate()?;
+        self.playback.validate()?;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -321,76 +510,9 @@ pub struct InputTimingConfig {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct WorkflowTimingConfig {
-    pub default_timeout_ms: u64,
-    pub default_poll_ms: u64,
-    pub default_step_wait_ms: u64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct HallTimingConfig {
     pub page_settle_ms: u64,
     pub ocr_sample_interval_ms: u64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct InviteTimingConfig {
-    pub open_chat_ms: u64,
-    pub step_ms: u64,
-    pub confirm_timeout_ms: u64,
-    pub confirm_poll_ms: u64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ModerationTimingConfig {
-    pub vote_timeout_ms: u64,
-    pub vote_poll_ms: u64,
-    pub search_result_timeout_ms: u64,
-    pub confirm_wait_ms: u64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PlaybackTimingConfig {
-    pub search_settle_ms: u64,
-    pub status_poll_ms: u64,
-    pub status_retries: u32,
-    pub skip_status_initial_ms: u64,
-    pub skip_status_poll_ms: u64,
-    pub skip_status_retries: u32,
-    pub monitor_tick_ms: u64,
-    pub monitor_status_ms: u64,
-    #[serde(default = "default_player_stability_samples")]
-    pub uri_stable_samples: u32,
-    #[serde(default = "default_player_stability_samples")]
-    pub transport_stable_samples: u32,
-    #[serde(
-        default = "default_player_stale_timeout_ms",
-        deserialize_with = "deserialize_positive_u64"
-    )]
-    pub stale_timeout_ms: u64,
-}
-
-fn default_player_stability_samples() -> u32 {
-    0
-}
-
-fn default_player_stale_timeout_ms() -> u64 {
-    5000
-}
-
-fn deserialize_positive_u64<'de, D>(deserializer: D) -> std::result::Result<u64, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = u64::deserialize(deserializer)?;
-    if value == 0 {
-        return Err(serde::de::Error::custom("value must be a positive integer"));
-    }
-    Ok(value)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -436,6 +558,45 @@ pub struct OcrConfig {
     pub batch_recognize: bool,
 }
 
+impl OcrConfig {
+    fn validate(&self) -> Result<()> {
+        validate_unit_interval(self.min_confidence, "ocr.min_confidence")?;
+        validate_unit_interval(self.det_score_threshold, "ocr.det_score_threshold")?;
+        validate_unit_interval(self.change_pixel_threshold, "ocr.change_pixel_threshold")?;
+        if !self.change_mean_threshold.is_finite() || self.change_mean_threshold < 0.0 {
+            bail!("ocr.change_mean_threshold 必须是非负有限小数");
+        }
+        if self.threads <= 0 {
+            bail!("ocr.threads 必须大于 0");
+        }
+        if self.det_max_side_len == 0 || self.det_min_area == 0 || self.max_block_height <= 0 {
+            bail!("OCR 检测尺寸和文本块高度必须大于 0");
+        }
+        if !self.det_unclip_ratio.is_finite() || self.det_unclip_ratio <= 0.0 {
+            bail!("ocr.det_unclip_ratio 必须是正有限小数");
+        }
+        if self.backend_priority.is_empty() {
+            bail!("ocr.backend_priority 不能为空");
+        }
+        for backend in &self.backend_priority {
+            if !matches!(
+                backend.trim().to_ascii_lowercase().as_str(),
+                "cuda" | "vulkan" | "opencl" | "open-cl" | "cpu"
+            ) {
+                bail!("ocr.backend_priority 包含不支持的后端: {}", backend);
+            }
+        }
+        for (path, field) in [
+            (&self.det_model, "ocr.det_model"),
+            (&self.rec_model, "ocr.rec_model"),
+            (&self.charset, "ocr.charset"),
+        ] {
+            validate_nonempty_path(path, field)?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TemplateConfig {
@@ -443,7 +604,6 @@ pub struct TemplateConfig {
     pub yellow_marker: PathBuf,
     pub pink_marker: PathBuf,
     pub friend: PathBuf,
-    #[serde(default = "default_secondary_back_template")]
     pub secondary_back: PathBuf,
     pub secondary_hall: PathBuf,
     pub invite_view_star: PathBuf,
@@ -458,23 +618,30 @@ pub struct TemplateConfig {
     pub marker_threshold: f32,
 }
 
-fn default_secondary_back_template() -> PathBuf {
-    PathBuf::from("assets/ui-secondary-back.png")
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ModerationConfig {
-    pub stable_vote_samples: u32,
-    pub required_vote_margin: i32,
-    pub friend_panel_region: RectConfig,
-    pub search_panel_region: RectConfig,
-    pub search_input_point: PointConfig,
-    pub search_button_point: PointConfig,
-    pub more_settings_region: RectConfig,
-    pub block_chat_region: RectConfig,
-    pub blacklist_region: RectConfig,
-    pub confirm_region: RectConfig,
+impl TemplateConfig {
+    fn validate(&self) -> Result<()> {
+        validate_unit_interval(self.marker_threshold, "templates.marker_threshold")?;
+        for (path, field) in [
+            (&self.blue_marker, "templates.blue_marker"),
+            (&self.yellow_marker, "templates.yellow_marker"),
+            (&self.pink_marker, "templates.pink_marker"),
+            (&self.friend, "templates.friend"),
+            (&self.secondary_back, "templates.secondary_back"),
+            (&self.secondary_hall, "templates.secondary_hall"),
+            (&self.invite_view_star, "templates.invite_view_star"),
+            (&self.invite_goto_hall, "templates.invite_goto_hall"),
+            (&self.invite_enter_hall, "templates.invite_enter_hall"),
+            (&self.friend_panel, "templates.friend_panel"),
+            (&self.friend_search_panel, "templates.friend_search_panel"),
+            (&self.friend_more_settings, "templates.friend_more_settings"),
+            (&self.friend_block_chat, "templates.friend_block_chat"),
+            (&self.friend_blacklist, "templates.friend_blacklist"),
+            (&self.friend_confirm, "templates.friend_confirm"),
+        ] {
+            validate_nonempty_path(path, field)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -492,14 +659,47 @@ pub struct FeelUOwnConfig {
     pub port: u16,
 }
 
+impl FeelUOwnConfig {
+    fn validate(&self) -> Result<()> {
+        if self.host.trim().is_empty() {
+            bail!("feeluown.host 不能为空");
+        }
+        if self.port == 0 {
+            bail!("feeluown.port 必须大于 0");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HttpConfig {
     pub host: String,
     pub port: u16,
     pub enabled: bool,
-    #[serde(default)]
     pub access_token: String,
+}
+
+impl HttpConfig {
+    fn validate(&self) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.host.trim().is_empty() {
+            bail!("http.host 不能为空");
+        }
+        if self.port == 0 {
+            bail!("http.port 必须大于 0");
+        }
+        if !matches!(
+            self.host.trim().to_ascii_lowercase().as_str(),
+            "127.0.0.1" | "localhost" | "::1"
+        ) && self.access_token.trim().is_empty()
+        {
+            bail!("HTTP 监听非本机地址时必须设置 http.access_token");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -507,18 +707,21 @@ pub struct HttpConfig {
 pub struct LoggingConfig {
     pub dir: PathBuf,
     pub level: String,
-    #[serde(default = "default_log_rotate_daily")]
     pub rotate_daily: bool,
-    #[serde(default = "default_log_retain_days")]
     pub retain_days: u32,
 }
 
-fn default_log_rotate_daily() -> bool {
-    true
-}
-
-fn default_log_retain_days() -> u32 {
-    7
+impl LoggingConfig {
+    fn validate(&self) -> Result<()> {
+        validate_nonempty_path(&self.dir, "logging.dir")?;
+        if !matches!(
+            self.level.trim().to_ascii_lowercase().as_str(),
+            "error" | "warn" | "info" | "debug" | "trace"
+        ) {
+            bail!("logging.level 必须是 error/warn/info/debug/trace 之一");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -529,207 +732,38 @@ pub struct TuiConfig {
     pub log_lines: usize,
 }
 
+impl TuiConfig {
+    fn validate(&self) -> Result<()> {
+        if self.enabled && (self.refresh_ms == 0 || self.log_lines == 0) {
+            bail!("tui.refresh_ms 和 tui.log_lines 必须大于 0");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StateConfig {
-    pub runtime_state_path: PathBuf,
+    pub playback_state_path: PathBuf,
+    pub hall_state_path: PathBuf,
     pub queue_path: PathBuf,
     pub executed_commands_log_path: PathBuf,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct QueueConfig {
-    pub max_size: usize,
-    pub auto_advance_seconds: u64,
-    pub protect_current_song_until_finished: bool,
-    #[serde(default = "default_external_playback_protect_after_seconds")]
-    pub external_playback_protect_after_seconds: u64,
-}
-
-fn default_external_playback_protect_after_seconds() -> u64 {
-    20
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default)]
-#[serde(deny_unknown_fields)]
-pub struct SongDedupConfig {
-    pub enabled: bool,
-    pub window_seconds: u64,
-    pub max_count: u32,
-    pub console_bypass: bool,
-    pub history_path: PathBuf,
-}
-
-impl Default for SongDedupConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            window_seconds: 3600,
-            max_count: 1,
-            console_bypass: true,
-            history_path: PathBuf::from("data/song-dedup-history.json"),
+impl StateConfig {
+    fn validate(&self) -> Result<()> {
+        for (path, field) in [
+            (&self.playback_state_path, "state.playback_state_path"),
+            (&self.hall_state_path, "state.hall_state_path"),
+            (&self.queue_path, "state.queue_path"),
+            (
+                &self.executed_commands_log_path,
+                "state.executed_commands_log_path",
+            ),
+        ] {
+            validate_nonempty_path(path, field)?;
         }
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CustomWorkflowConfig {
-    pub enabled: bool,
-    pub default_threshold: f32,
-    #[serde(default = "default_wait_template_absent_stable")]
-    pub wait_template_absent_stable_default: bool,
-    #[serde(default = "default_max_hold_key_seconds")]
-    pub max_hold_key_seconds: u64,
-    pub templates: HashMap<String, PathBuf>,
-    pub workflows: Vec<CustomWorkflowDefinition>,
-}
-
-fn default_wait_template_absent_stable() -> bool {
-    true
-}
-
-fn default_max_hold_key_seconds() -> u64 {
-    10
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CustomWorkflowDefinition {
-    pub enabled: bool,
-    pub name: String,
-    pub commands: Vec<String>,
-    pub allow_args: bool,
-    pub message_types: Vec<String>,
-    pub confirm_before_run: bool,
-    pub confirm_message: String,
-    pub confirm_message_types: Vec<String>,
-    pub confirm_timeout_ms: Option<u64>,
-    pub confirm_poll_ms: Option<u64>,
-    pub steps: Vec<CustomWorkflowStep>,
-    pub success_message: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CustomWorkflowStep {
-    #[serde(rename = "type")]
-    pub step_type: String,
-    pub template: Option<String>,
-    pub region: Option<RectConfig>,
-    pub point: Option<PointConfig>,
-    pub click_offset: Option<PointConfig>,
-    pub key: Option<String>,
-    pub target: Option<String>,
-    pub text: Option<String>,
-    pub message: Option<String>,
-    pub threshold: Option<f32>,
-    pub timeout_ms: Option<u64>,
-    pub poll_ms: Option<u64>,
-    pub wait_ms: Option<u64>,
-    pub hold_seconds_arg: Option<usize>,
-    pub stable_after_absent: Option<bool>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AiConfig {
-    pub provider: String,
-    pub api_key: String,
-    pub endpoint: String,
-    pub model: String,
-    #[serde(default)]
-    pub extra_body: HashMap<String, serde_json::Value>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default)]
-#[serde(deny_unknown_fields)]
-pub struct SongReviewConfig {
-    pub enabled: bool,
-    pub max_allowed_level: u8,
-    pub failure_policy: SongReviewFailurePolicy,
-    pub retry_count: u32,
-    pub retry_delay_ms: u64,
-    pub reply_reason_max_chars: usize,
-    #[serde(default = "default_song_review_policy_prompt")]
-    pub policy_prompt: String,
-    pub custom_prompt: String,
-    pub provider: SongReviewProviderConfig,
-}
-
-impl Default for SongReviewConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            max_allowed_level: 4,
-            failure_policy: SongReviewFailurePolicy::Reject,
-            retry_count: 2,
-            retry_delay_ms: 500,
-            reply_reason_max_chars: 40,
-            policy_prompt: default_song_review_policy_prompt(),
-            custom_prompt: String::new(),
-            provider: SongReviewProviderConfig::default(),
-        }
-    }
-}
-
-fn default_song_review_policy_prompt() -> String {
-    [
-        "审核目标：只通过整体听感偏舒缓、柔和、轻松、安静、治愈、抒情、慢节奏或中低强度的歌曲。",
-        "拒绝明显炸场、吵闹、压迫感强、节奏过快、情绪过激、强烈电子噪音、重金属、硬核、鬼畜、洗脑循环、尖锐喊叫、强烈攻击性或明显破坏房间氛围的歌曲。",
-        "请尽量使用联网搜索得到的曲风、歌词摘要、歌曲介绍和公开听感描述判断。",
-        "如果信息不足，请保守判断；不确定时应给较高强度等级，而不是因为歌曲热门、用户喜欢或歌手知名就放宽标准。",
-    ]
-    .join("\n")
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum SongReviewFailurePolicy {
-    Reject,
-    Allow,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(default)]
-#[serde(deny_unknown_fields)]
-pub struct SongReviewProviderConfig {
-    pub endpoint: String,
-    pub api_key: String,
-    pub model: String,
-    pub extra_body: HashMap<String, serde_json::Value>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MatchConfig {
-    pub min_song_name_score: f64,
-    pub short_chinese_song_max_miss: usize,
-    pub long_chinese_song_min_score: f64,
-    pub max_ocr_noise_chars: usize,
-    pub enable_fuzzy_singer: bool,
-    pub short_chinese_singer_max_miss: usize,
-    pub long_chinese_singer_min_score: f64,
-    pub en_max_edit_fraction: f64,
-    pub en_singer_max_edit_fraction: f64,
-}
-
-impl Default for MatchConfig {
-    fn default() -> Self {
-        Self {
-            min_song_name_score: 0.5,
-            short_chinese_song_max_miss: 1,
-            long_chinese_song_min_score: 0.5,
-            max_ocr_noise_chars: 1,
-            enable_fuzzy_singer: true,
-            short_chinese_singer_max_miss: 1,
-            long_chinese_singer_min_score: 0.8,
-            en_max_edit_fraction: 0.3,
-            en_singer_max_edit_fraction: 0.35,
-        }
+        Ok(())
     }
 }
 
@@ -741,142 +775,40 @@ pub struct HotkeyConfig {
     pub exit_key: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct StartupConfig {
-    pub enabled: bool,
-    pub launch_game: bool,
-    pub enter_game: bool,
-    pub enter_wonderland: bool,
-    pub exe_path: PathBuf,
-    pub game_args: String,
-    pub launch_wait_ms: u64,
-    pub launch_retries: u32,
-    pub enter_game_timeout_ms: u64,
-    pub enter_wonderland_timeout_ms: u64,
-    #[serde(default = "default_wonderland_home_retries")]
-    pub wonderland_home_retries: u32,
-    #[serde(default = "default_wonderland_home_retry_ms")]
-    pub wonderland_home_retry_ms: u64,
-    #[serde(default = "default_wonderland_card_retries")]
-    pub wonderland_card_retries: u32,
-    #[serde(default = "default_wonderland_card_retry_ms")]
-    pub wonderland_card_retry_ms: u64,
-    #[serde(default = "default_wonderland_confirm_absent_timeout_ms")]
-    pub wonderland_confirm_absent_timeout_ms: u64,
-    #[serde(default = "default_wonderland_confirm_stable_timeout_ms")]
-    pub wonderland_confirm_stable_timeout_ms: u64,
-    pub final_primary_timeout_ms: u64,
-    pub poll_ms: u64,
-    pub stable_mean_threshold: f32,
-    pub stable_changed_ratio_threshold: f32,
-    pub template_threshold: f32,
-    #[serde(default = "default_wonderland_enter_button_threshold")]
-    pub wonderland_enter_button_threshold: f32,
-    pub templates: StartupTemplateConfig,
-    pub enter_game_text_region: RectConfig,
-    #[serde(default = "default_wonderland_enter_button_region")]
-    pub wonderland_enter_button_region: RectConfig,
-    pub main_ui_region: RectConfig,
-    pub wonderland_close_region: RectConfig,
-    pub wonderland_card_point: PointConfig,
-}
-
-fn default_wonderland_home_retries() -> u32 {
-    120
-}
-
-fn default_wonderland_home_retry_ms() -> u64 {
-    2500
-}
-
-fn default_wonderland_card_retries() -> u32 {
-    90
-}
-
-fn default_wonderland_card_retry_ms() -> u64 {
-    2000
-}
-
-fn default_wonderland_confirm_absent_timeout_ms() -> u64 {
-    60000
-}
-
-fn default_wonderland_confirm_stable_timeout_ms() -> u64 {
-    60000
-}
-
-fn default_wonderland_enter_button_threshold() -> f32 {
-    0.9
-}
-
-fn default_wonderland_enter_button_region() -> RectConfig {
-    RectConfig {
-        x: 1400,
-        y: 850,
-        width: 360,
-        height: 150,
+impl HotkeyConfig {
+    fn validate(&self) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.pause_key.trim().is_empty() || self.exit_key.trim().is_empty() {
+            bail!("hotkeys.pause_key 和 hotkeys.exit_key 不能为空");
+        }
+        if self.pause_key.eq_ignore_ascii_case(&self.exit_key) {
+            bail!("hotkeys.pause_key 和 hotkeys.exit_key 不能相同");
+        }
+        Ok(())
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct StartupTemplateConfig {
-    #[serde(default = "default_wonderland_enter_button_template")]
-    pub wonderland_enter_button: PathBuf,
-    pub paimon_menu: PathBuf,
-    pub wonderland_close: PathBuf,
-}
-
-fn default_wonderland_enter_button_template() -> PathBuf {
-    PathBuf::from("assets/startup-confirm-black.png")
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct InviteConfig {
-    #[serde(default = "default_friend_name_stable_count")]
-    pub friend_name_stable_count: u32,
-    pub friend_list_region: RectConfig,
-    #[serde(default = "default_friend_chat_region")]
-    pub friend_chat_region: RectConfig,
-    pub confirm_list_region: RectConfig,
-    pub view_star_region: RectConfig,
-    pub goto_hall_region: RectConfig,
-    pub enter_hall_region: RectConfig,
-}
-
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(default)]
 #[serde(deny_unknown_fields)]
 pub struct FriendDeliveryConfig {
     /// Maximum automatic retries for a message that is confirmed not to have been sent.
     pub auto_retry_count: u32,
 }
 
-fn default_friend_name_stable_count() -> u32 {
-    0
-}
-
-fn default_friend_chat_region() -> RectConfig {
-    RectConfig {
-        x: 260,
-        y: 100,
-        width: 920,
-        height: 850,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    type ConfigMutation = (&'static str, fn(&mut AppConfig));
 
     fn playback_timing(yaml: &str) -> PlaybackTimingConfig {
         serde_yaml::from_str(yaml).expect("valid playback timing config")
     }
 
     #[test]
-    fn playback_observation_fields_default_to_global_inheritance_and_five_seconds() {
+    fn playback_observation_fields_accept_explicit_inheritance_and_stale_timeout() {
         let playback = playback_timing(
             r#"
 search_settle_ms: 2000
@@ -887,6 +819,9 @@ skip_status_poll_ms: 300
 skip_status_retries: 5
 monitor_tick_ms: 200
 monitor_status_ms: 1000
+uri_stable_samples: 0
+transport_stable_samples: 0
+stale_timeout_ms: 5000
 "#,
         );
 
@@ -907,6 +842,8 @@ skip_status_poll_ms: 300
 skip_status_retries: 5
 monitor_tick_ms: 200
 monitor_status_ms: 1000
+uri_stable_samples: 0
+transport_stable_samples: 0
 stale_timeout_ms: 0
 "#,
         )
@@ -1001,6 +938,198 @@ stale_timeout_ms: 7500
     }
 
     #[test]
+    fn startup_validation_rejects_an_empty_target_process() {
+        let mut config: AppConfig =
+            serde_yaml::from_str(bundled_config_yaml()).expect("default config");
+        config.window.target_process = " \t ".to_string();
+
+        let error = config
+            .validate()
+            .expect_err("an empty target process must fail before runtime startup");
+
+        assert!(error.to_string().contains("window.target_process"));
+    }
+
+    #[test]
+    fn startup_validation_rejects_a_zero_ai_request_timeout() {
+        let mut config: AppConfig =
+            serde_yaml::from_str(bundled_config_yaml()).expect("default config");
+        config.timing.external.ai_request_timeout_ms = 0;
+
+        let error = config
+            .validate()
+            .expect_err("a zero AI timeout must fail before runtime startup");
+
+        assert!(
+            error
+                .to_string()
+                .contains("timing.external.ai_request_timeout_ms")
+        );
+    }
+
+    #[test]
+    fn startup_validation_rejects_zero_runtime_intervals_timeouts_and_retries() {
+        let invalid_fields: [ConfigMutation; 14] = [
+            ("timing.watchdog_restart_ms", |config| {
+                config.timing.watchdog_restart_ms = 0;
+            }),
+            ("timing.loop_idle_ms", |config| {
+                config.timing.loop_idle_ms = 0;
+            }),
+            ("timing.chat_scan.fallback_ms", |config| {
+                config.timing.chat_scan.fallback_ms = 0;
+            }),
+            ("timing.command.ui_timeout_ms", |config| {
+                config.timing.command.ui_timeout_ms = 0;
+            }),
+            ("timing.workflow.default_timeout_ms", |config| {
+                config.timing.workflow.default_timeout_ms = 0;
+            }),
+            ("timing.workflow.default_poll_ms", |config| {
+                config.timing.workflow.default_poll_ms = 0;
+            }),
+            ("timing.hall.ocr_sample_interval_ms", |config| {
+                config.timing.hall.ocr_sample_interval_ms = 0;
+            }),
+            ("timing.playback.status_poll_ms", |config| {
+                config.timing.playback.status_poll_ms = 0;
+            }),
+            ("timing.playback.status_retries", |config| {
+                config.timing.playback.status_retries = 0;
+            }),
+            ("timing.playback.monitor_tick_ms", |config| {
+                config.timing.playback.monitor_tick_ms = 0;
+            }),
+            ("timing.decision.timeout_ms", |config| {
+                config.timing.decision.timeout_ms = 0;
+            }),
+            ("timing.decision.poll_ms", |config| {
+                config.timing.decision.poll_ms = 0;
+            }),
+            ("timing.external.feeluown_rpc_timeout_ms", |config| {
+                config.timing.external.feeluown_rpc_timeout_ms = 0;
+            }),
+            ("timing.external.ai_request_timeout_ms", |config| {
+                config.timing.external.ai_request_timeout_ms = 0;
+            }),
+        ];
+
+        for (field, invalidate) in invalid_fields {
+            let mut config: AppConfig =
+                serde_yaml::from_str(bundled_config_yaml()).expect("default config");
+            invalidate(&mut config);
+
+            let error = config
+                .validate()
+                .expect_err("zero runtime control value must fail before startup");
+
+            assert!(
+                error.to_string().contains(field),
+                "field={field} error={error}"
+            );
+        }
+    }
+
+    #[test]
+    fn startup_validation_rejects_invalid_required_runtime_resources() {
+        let invalid_fields: [ConfigMutation; 13] = [
+            ("ocr.det_model", |config| {
+                config.ocr.det_model = PathBuf::new();
+            }),
+            ("ocr.backend_priority", |config| {
+                config.ocr.backend_priority = vec!["metal".to_string()];
+            }),
+            ("templates.friend", |config| {
+                config.templates.friend = PathBuf::new();
+            }),
+            ("feeluown.host", |config| {
+                config.feeluown.host.clear();
+            }),
+            ("feeluown.port", |config| {
+                config.feeluown.port = 0;
+            }),
+            ("http.port", |config| {
+                config.http.port = 0;
+            }),
+            ("logging.dir", |config| {
+                config.logging.dir = PathBuf::new();
+            }),
+            ("logging.level", |config| {
+                config.logging.level = "verbose".to_string();
+            }),
+            ("tui.refresh_ms", |config| {
+                config.tui.refresh_ms = 0;
+            }),
+            ("tui.log_lines", |config| {
+                config.tui.log_lines = 0;
+            }),
+            ("state.queue_path", |config| {
+                config.state.queue_path = PathBuf::new();
+            }),
+            ("hotkeys.pause_key", |config| {
+                config.hotkeys.pause_key.clear();
+            }),
+            ("window.content_width", |config| {
+                config.window.content_width -= 1;
+            }),
+        ];
+
+        for (field, invalidate) in invalid_fields {
+            let mut config: AppConfig =
+                serde_yaml::from_str(bundled_config_yaml()).expect("default config");
+            invalidate(&mut config);
+
+            let error = config
+                .validate()
+                .expect_err("invalid runtime resource must fail before startup");
+
+            assert!(
+                error.to_string().contains(field),
+                "field={field} error={error}"
+            );
+        }
+    }
+
+    #[test]
+    fn startup_validation_rejects_ui_geometry_outside_the_normalized_canvas() {
+        let mut config: AppConfig =
+            serde_yaml::from_str(bundled_config_yaml()).expect("default config");
+        config.invite.friend_chat_region.x = config.screen.expected_width as i32;
+
+        let error = config
+            .validate()
+            .expect_err("out-of-canvas UI region must fail before startup");
+
+        assert!(error.to_string().contains("invite.friend_chat_region"));
+    }
+
+    #[test]
+    fn startup_validation_rejects_an_empty_screen_region() {
+        let mut config: AppConfig =
+            serde_yaml::from_str(bundled_config_yaml()).expect("default config");
+        config.screen.chat_rect.width = 0;
+
+        let error = config
+            .validate()
+            .expect_err("an empty chat region must fail before runtime startup");
+
+        assert!(error.to_string().contains("screen.chat_rect"));
+    }
+
+    #[test]
+    fn startup_validation_rejects_a_zero_startup_poll_interval() {
+        let mut config: AppConfig =
+            serde_yaml::from_str(bundled_config_yaml()).expect("default config");
+        config.startup.poll_ms = 0;
+
+        let error = config
+            .validate()
+            .expect_err("a zero startup poll interval must fail before runtime startup");
+
+        assert!(error.to_string().contains("startup.poll_ms"));
+    }
+
+    #[test]
     fn startup_validation_rejects_invalid_thresholds_and_queue_capacity() {
         let mut config: AppConfig =
             serde_yaml::from_str(bundled_config_yaml()).expect("default config");
@@ -1011,6 +1140,113 @@ stale_timeout_ms: 7500
         config.templates.marker_threshold = 0.9;
         config.queue.max_size = 0;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn startup_validation_rejects_cross_field_feature_invariants() {
+        let mut config: AppConfig =
+            serde_yaml::from_str(bundled_config_yaml()).expect("default config");
+        config.undercover.enabled = true;
+        config.undercover.min_players = 10;
+        config.undercover.max_players = 8;
+
+        let error = config.validate().unwrap_err();
+
+        assert!(error.to_string().contains("undercover.min_players"));
+    }
+
+    #[test]
+    fn current_config_requires_every_top_level_module_section() {
+        for section in [
+            "stability",
+            "song_dedup",
+            "idiom_chain",
+            "landlord",
+            "undercover",
+            "turtle_soup",
+            "song_review",
+            "friend_delivery",
+        ] {
+            let mut value: serde_yaml::Value =
+                serde_yaml::from_str(bundled_config_yaml()).expect("default config value");
+            value
+                .as_mapping_mut()
+                .expect("root mapping")
+                .remove(serde_yaml::Value::String(section.to_string()));
+
+            let error = serde_yaml::from_value::<AppConfig>(value)
+                .expect_err("current top-level section must be required");
+
+            assert!(
+                error.to_string().contains(section),
+                "section={section} error={error}"
+            );
+        }
+    }
+
+    #[test]
+    fn current_config_requires_every_explicit_field() {
+        for path in [
+            "stability.default_count",
+            "window.focus_point",
+            "screen.secondary_back_rect",
+            "templates.secondary_back",
+            "http.access_token",
+            "logging.rotate_daily",
+            "logging.retain_days",
+            "friend_delivery.auto_retry_count",
+            "custom_workflows.wait_template_absent_stable_default",
+            "custom_workflows.max_hold_key_seconds",
+            "invite.friend_name_stable_count",
+            "invite.friend_chat_region",
+            "timing.playback.uri_stable_samples",
+            "timing.playback.transport_stable_samples",
+            "timing.playback.stale_timeout_ms",
+            "queue.external_playback_protect_after_seconds",
+            "song_dedup.enabled",
+            "idiom_chain.enabled",
+            "landlord.enabled",
+            "undercover.enabled",
+            "song_review.policy_prompt",
+            "song_review.provider.extra_body",
+            "ai.extra_body",
+            "turtle_soup.batch_max_parts",
+            "turtle_soup.ai.extra_body",
+            "startup.wonderland_home_retries",
+            "startup.wonderland_home_retry_ms",
+            "startup.wonderland_card_retries",
+            "startup.wonderland_card_retry_ms",
+            "startup.wonderland_confirm_absent_timeout_ms",
+            "startup.wonderland_confirm_stable_timeout_ms",
+            "startup.wonderland_enter_button_threshold",
+            "startup.wonderland_enter_button_region",
+            "startup.templates.wonderland_enter_button",
+        ] {
+            let mut value: serde_yaml::Value =
+                serde_yaml::from_str(bundled_config_yaml()).expect("default config value");
+            let segments = path.split('.').collect::<Vec<_>>();
+            let mut parent = &mut value;
+            for segment in &segments[..segments.len() - 1] {
+                parent = parent
+                    .as_mapping_mut()
+                    .expect("configuration path mapping")
+                    .get_mut(serde_yaml::Value::String((*segment).to_string()))
+                    .expect("configuration path segment");
+            }
+            let field = segments.last().expect("configuration field");
+            parent
+                .as_mapping_mut()
+                .expect("configuration field parent")
+                .remove(serde_yaml::Value::String((*field).to_string()));
+
+            let error = serde_yaml::from_value::<AppConfig>(value)
+                .expect_err("current configuration field must be required");
+
+            assert!(
+                error.to_string().contains(field),
+                "path={path} error={error}"
+            );
+        }
     }
 
     #[test]

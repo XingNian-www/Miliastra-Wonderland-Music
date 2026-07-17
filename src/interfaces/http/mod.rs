@@ -18,52 +18,51 @@ use axum::routing::any;
 use image::ColorType;
 use image::codecs::jpeg::JpegEncoder;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+#[cfg(test)]
+use serde_json::Value;
+use serde_json::json;
 use tokio::runtime::{Builder, Runtime};
 use tokio::sync::oneshot;
 use url::form_urlencoded;
 
 mod tools;
 
+use crate::adapters::player::PlayerRuntimeBackend;
 #[cfg(test)]
 use crate::config::AppConfig;
-use crate::config::{
-    CustomWorkflowConfig, HttpConfig, InviteConfig, ModerationConfig, ScreenConfig, StartupConfig,
-    TemplateConfig, TimingConfig,
+#[cfg(test)]
+use crate::config::OcrConfig;
+use crate::config::{HttpConfig, ScreenConfig, TemplateConfig, TimingConfig};
+use crate::features::administration::{
+    AdministrationCommand, AdministrationMutationIntent, AdministrationMutationOutcome,
 };
-use crate::features::administration::AdministrationCommand;
+use crate::features::command::ModuleCommand;
 #[cfg(test)]
-use crate::features::card_games::{CardGameService, LandlordConfig};
-use crate::features::custom_workflow::CustomWorkflowService;
-#[cfg(test)]
-use crate::features::custom_workflow::service_from_config_parts;
-use crate::features::hall::HallCommand;
-#[cfg(test)]
-use crate::features::moderation::{ModerationPolicy, ModerationService};
-#[cfg(test)]
-use crate::features::playback::PlaybackService;
+use crate::features::custom_workflow::WorkflowDefaults;
+use crate::features::custom_workflow::{CustomWorkflowConfig, CustomWorkflowService};
+use crate::features::hall::{
+    HallCommand, HallMutationIntent, HallMutationOutcome, HallRuntimeState, HallStatePatch,
+};
+use crate::features::invite::InviteConfig;
+use crate::features::moderation::ModerationConfig;
 use crate::features::playback::{
-    MusicPlayerBackend, PlaybackCommand, PlayerRuntimeBackend, QueueItem, QueueRemoval,
-    QueueRemoveOutcome, RuntimeStatePatch,
+    MusicPlayerBackend, PlaybackCommand, PlaybackMutationIntent, PlaybackMutationOutcome,
+    PlaybackRuntimeState, QueueItem, QueueRemoval, QueueRemoveOutcome,
 };
 use crate::features::song_request::AiClient;
 use crate::features::song_request::{SongCommand, SongSource};
-use crate::features::startup::{StartupSource, StartupTask};
-#[cfg(test)]
-use crate::features::turtle_soup::TurtleSoupService;
-use crate::features::turtle_soup::TurtleSoupSubmission;
-use crate::features::undercover::UndercoverCommand;
-#[cfg(test)]
-use crate::features::undercover::UndercoverRuntimeService;
-#[cfg(test)]
-use crate::interfaces::chat as command;
+use crate::features::startup::{StartupConfig, StartupSource, StartupTask};
+use crate::features::turtle_soup::{
+    TurtleSoupMutationIntent, TurtleSoupMutationOutcome, TurtleSoupSnapshot, TurtleSoupSubmission,
+};
+use crate::features::undercover::{UndercoverCommand, UndercoverSnapshot};
 use crate::interfaces::chat::{ConsoleCommandIntent, PendingCommand};
-use crate::runtime::business::{BusinessIntent, BusinessRuntimeHandle};
+use crate::runtime::business::{BusinessMutationIntent, BusinessMutationOutcome};
 use crate::runtime::chat_listener::ChatListenerMode;
 use crate::runtime::decision::DecisionAction;
 use crate::runtime::monitor::MonitorShared;
 use crate::runtime::player_io::PlayerRuntimeHandle;
-use crate::runtime::player_io::{PlayerSearchClient, PlayerSearchClientError};
+use crate::runtime::player_io::{PlayerSearchClient, PlayerSearchClientError, SearchCandidate};
 use crate::runtime::scheduler::{
     DiagnosticTaskSnapshot, FormalTaskCancelOutcome, FormalTaskEnqueueOutcome,
 };
@@ -71,6 +70,8 @@ use crate::ui::geometry::parse_rect;
 pub(crate) use tools::{WebToolRequest, WebToolTemplate};
 
 pub(crate) trait HttpTaskPort: Send + Sync {
+    fn apply_mutation(&self, intent: BusinessMutationIntent) -> Result<BusinessMutationOutcome>;
+
     fn enqueue_command(&self, pending: PendingCommand) -> Result<FormalTaskEnqueueOutcome>;
 
     fn enqueue_startup(&self, task: StartupTask) -> Result<FormalTaskEnqueueOutcome>;
@@ -86,6 +87,88 @@ pub(crate) trait HttpTaskPort: Send + Sync {
     fn enqueue_clear_idle_exit(&self) -> Result<FormalTaskEnqueueOutcome>;
 
     fn enqueue_diagnostic(&self, request: WebToolRequest) -> Result<DiagnosticTaskSnapshot>;
+
+    fn cancel_task(&self, task_id: u64) -> Result<FormalTaskCancelOutcome>;
+
+    fn submit_decision(&self, id: u64, action: DecisionAction) -> Result<()>;
+}
+
+pub(crate) trait HttpQueryPort: Send + Sync {
+    fn turtle_soup_snapshot(&self) -> Result<TurtleSoupSnapshot>;
+
+    fn undercover_snapshot(&self) -> Result<UndercoverSnapshot>;
+
+    fn diagnostic_task_snapshot(&self, id: u64) -> Result<Option<DiagnosticTaskSnapshot>>;
+
+    fn playback_queue_snapshot(&self) -> Result<Vec<QueueItem>>;
+
+    fn playback_state_snapshot(&self) -> Result<PlaybackRuntimeState>;
+
+    fn hall_state_snapshot(&self) -> Result<HallRuntimeState>;
+}
+
+pub(crate) trait HttpPlayerPort: Send + Sync {
+    fn status(&self) -> Result<crate::features::playback::PlayerStatus>;
+
+    fn search_text(
+        &self,
+        keyword: &str,
+        source: &str,
+    ) -> std::result::Result<String, PlayerSearchClientError>;
+
+    fn search_candidates(
+        &self,
+        keyword: &str,
+        source: &str,
+    ) -> std::result::Result<Vec<SearchCandidate>, PlayerSearchClientError>;
+}
+
+pub(crate) trait HttpAiPort: Send + Sync {
+    fn recognize(&self, query: &[(String, String)]) -> Result<String>;
+    fn match_song(&self, query: &[(String, String)]) -> Result<String>;
+    fn pick(&self, query: &[(String, String)]) -> Result<String>;
+}
+
+#[derive(Clone)]
+struct RuntimeHttpPlayerPort {
+    backend: PlayerRuntimeBackend,
+    search: PlayerSearchClient,
+}
+
+impl HttpPlayerPort for RuntimeHttpPlayerPort {
+    fn status(&self) -> Result<crate::features::playback::PlayerStatus> {
+        self.backend.status()
+    }
+
+    fn search_text(
+        &self,
+        keyword: &str,
+        source: &str,
+    ) -> std::result::Result<String, PlayerSearchClientError> {
+        self.search.search_text(keyword, source)
+    }
+
+    fn search_candidates(
+        &self,
+        keyword: &str,
+        source: &str,
+    ) -> std::result::Result<Vec<SearchCandidate>, PlayerSearchClientError> {
+        self.search.search_candidates(keyword, source)
+    }
+}
+
+impl HttpAiPort for AiClient {
+    fn recognize(&self, query: &[(String, String)]) -> Result<String> {
+        self.recognize_with_query(query)
+    }
+
+    fn match_song(&self, query: &[(String, String)]) -> Result<String> {
+        self.match_with_query(query)
+    }
+
+    fn pick(&self, query: &[(String, String)]) -> Result<String> {
+        self.pick_with_query(query)
+    }
 }
 
 const MAX_ACTIVE_CONNECTIONS: usize = 32;
@@ -477,15 +560,14 @@ const ROUTES: &[RouteSpec] = &[
 pub struct HttpSharedState {
     config: HttpInterfaceConfig,
     pub monitor: MonitorShared,
-    business: BusinessRuntimeHandle,
     custom_workflow: CustomWorkflowService,
     pub history: Arc<Mutex<VecDeque<HistoryItem>>>,
     pub active_connections: Arc<AtomicUsize>,
     formal_tasks: Arc<dyn HttpTaskPort>,
+    queries: Arc<dyn HttpQueryPort>,
     latest_frame: Arc<Mutex<Option<Arc<image::DynamicImage>>>>,
-    player_search: PlayerSearchClient,
-    player_runtime: PlayerRuntimeHandle,
-    ai: AiClient,
+    player: Arc<dyn HttpPlayerPort>,
+    ai: Arc<dyn HttpAiPort>,
 }
 
 #[derive(Clone)]
@@ -562,24 +644,50 @@ impl HttpSharedState {
         config: HttpInterfaceConfig,
         custom_workflow: CustomWorkflowService,
         formal_tasks: Arc<dyn HttpTaskPort>,
-        business: BusinessRuntimeHandle,
+        queries: Arc<dyn HttpQueryPort>,
         monitor: MonitorShared,
         latest_frame: Arc<Mutex<Option<Arc<image::DynamicImage>>>>,
         player_search: PlayerSearchClient,
         player_runtime: PlayerRuntimeHandle,
         ai: AiClient,
     ) -> Self {
+        let player = Arc::new(RuntimeHttpPlayerPort {
+            backend: PlayerRuntimeBackend::new(player_runtime),
+            search: player_search,
+        });
+        Self::new_with_ports(
+            config,
+            custom_workflow,
+            formal_tasks,
+            queries,
+            monitor,
+            latest_frame,
+            player,
+            Arc::new(ai),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_ports(
+        config: HttpInterfaceConfig,
+        custom_workflow: CustomWorkflowService,
+        formal_tasks: Arc<dyn HttpTaskPort>,
+        queries: Arc<dyn HttpQueryPort>,
+        monitor: MonitorShared,
+        latest_frame: Arc<Mutex<Option<Arc<image::DynamicImage>>>>,
+        player: Arc<dyn HttpPlayerPort>,
+        ai: Arc<dyn HttpAiPort>,
+    ) -> Self {
         Self {
             config,
             monitor,
-            business,
             custom_workflow,
             history: Arc::new(Mutex::new(VecDeque::new())),
             active_connections: Arc::new(AtomicUsize::new(0)),
             formal_tasks,
+            queries,
             latest_frame,
-            player_search,
-            player_runtime,
+            player,
             ai,
         }
     }
@@ -880,8 +988,7 @@ fn status_route(
     _query: &[(String, String)],
     state: &HttpSharedState,
 ) -> std::result::Result<String, AppError> {
-    let player = PlayerRuntimeBackend::new(state.player_runtime.clone());
-    serde_json::to_string(&player.status().map_err(internal_error)?).map_err(internal_error)
+    serde_json::to_string(&state.player.status().map_err(internal_error)?).map_err(internal_error)
 }
 
 fn play_route(
@@ -893,7 +1000,7 @@ fn play_route(
         remote_control_command(
             "继续".to_string(),
             "继续",
-            BusinessIntent::Playback(PlaybackCommand::Resume),
+            ModuleCommand::Playback(PlaybackCommand::Resume),
         ),
     )
 }
@@ -907,7 +1014,7 @@ fn pause_route(
         remote_control_command(
             "暂停".to_string(),
             "暂停",
-            BusinessIntent::Playback(PlaybackCommand::Pause),
+            ModuleCommand::Playback(PlaybackCommand::Pause),
         ),
     )
 }
@@ -921,7 +1028,7 @@ fn skip_next_route(
         remote_control_command(
             "下一首".to_string(),
             "下一首",
-            BusinessIntent::Playback(PlaybackCommand::Next),
+            ModuleCommand::Playback(PlaybackCommand::Next),
         ),
     )
 }
@@ -935,7 +1042,7 @@ fn skip_prev_route(
         remote_control_command(
             "上一首".to_string(),
             "上一首",
-            BusinessIntent::Playback(PlaybackCommand::Previous),
+            ModuleCommand::Playback(PlaybackCommand::Previous),
         ),
     )
 }
@@ -954,7 +1061,7 @@ fn volume_route(
         remote_control_command(
             format!("音量 {}", volume),
             "音量",
-            BusinessIntent::Playback(PlaybackCommand::Volume(volume.to_string())),
+            ModuleCommand::Playback(PlaybackCommand::Volume(volume.to_string())),
         ),
     )
 }
@@ -1001,7 +1108,7 @@ fn search_route(
     let keyword = normalize_keyword(query_value(query, "keyword"))?;
     let source = normalize_optional_source(query_value(query, "source"))?;
     state
-        .player_search
+        .player
         .search_text(&keyword, &source)
         .map_err(player_search_error)
 }
@@ -1014,7 +1121,7 @@ fn search_candidates_route(
     let source = normalize_optional_source(query_value(query, "source"))?;
     serde_json::to_string(
         &state
-            .player_search
+            .player
             .search_candidates(&keyword, &source)
             .map_err(player_search_error)?,
     )
@@ -1044,19 +1151,24 @@ fn player_play_uri_route(
         "preferAccompaniment",
         "accompaniment",
     ));
-    let pushed = state
-        .business
-        .push_playback_queue(QueueItem {
-            id: 0,
-            keyword: keyword.clone(),
-            source,
-            prefer_accompaniment,
-            ai_original_text: String::new(),
-            uri: uri.trim().to_string(),
-            friend_username: String::new(),
-            dedup_bypass: true,
-        })
-        .map_err(internal_error)?;
+    let BusinessMutationOutcome::Playback(PlaybackMutationOutcome::Pushed(pushed)) = state
+        .formal_tasks
+        .apply_mutation(BusinessMutationIntent::Playback(
+            PlaybackMutationIntent::Push(QueueItem {
+                id: 0,
+                keyword: keyword.clone(),
+                source,
+                prefer_accompaniment,
+                ai_original_text: String::new(),
+                uri: uri.trim().to_string(),
+                friend_username: String::new(),
+                dedup_bypass: true,
+            }),
+        ))
+        .map_err(internal_error)?
+    else {
+        unreachable!("playback queue push intent returned a different outcome")
+    };
     if !pushed.accepted {
         return Err(AppError {
             status: 400,
@@ -1132,14 +1244,17 @@ fn chat_listener_mode_route(
             });
         }
     };
-    let queued = state
-        .business
-        .request_chat_listener_mode(mode)
-        .map_err(internal_error)?;
-    let snapshot = state
-        .business
-        .chat_listener_snapshot()
-        .map_err(internal_error)?;
+    let BusinessMutationOutcome::Administration(
+        AdministrationMutationOutcome::ChatListenerModeRequested { queued, snapshot },
+    ) = state
+        .formal_tasks
+        .apply_mutation(BusinessMutationIntent::Administration(
+            AdministrationMutationIntent::RequestChatListenerMode(mode),
+        ))
+        .map_err(internal_error)?
+    else {
+        unreachable!("chat listener mode intent returned a different outcome")
+    };
     if !queued {
         return Ok(json!({
             "ok": true,
@@ -1152,7 +1267,11 @@ fn chat_listener_mode_route(
     let receipt = match required_enqueue_receipt(state.formal_tasks.enqueue_listener_mode(mode)) {
         Ok(receipt) => receipt,
         Err(error) => {
-            let _ = state.business.cancel_chat_listener_mode_request(mode);
+            let _ = state
+                .formal_tasks
+                .apply_mutation(BusinessMutationIntent::Administration(
+                    AdministrationMutationIntent::CancelChatListenerModeRequest(mode),
+                ));
             return Err(error);
         }
     };
@@ -1177,8 +1296,8 @@ fn task_cancel_route(
         .filter(|id| *id > 0)
         .ok_or_else(|| bad_request("无效的任务ID"))?;
     if state
-        .business
-        .cancel_formal_task(task_id)
+        .formal_tasks
+        .cancel_task(task_id)
         .map_err(internal_error)?
         == FormalTaskCancelOutcome::NotQueued
     {
@@ -1203,7 +1322,7 @@ fn decision_submit_route(
     let action = DecisionAction::parse(&action_text)
         .ok_or_else(|| bad_request("action仅支持confirm、skip、switch_source或ai"))?;
     state
-        .business
+        .formal_tasks
         .submit_decision(id, action)
         .map_err(|error| AppError {
             status: 409,
@@ -1221,7 +1340,7 @@ fn operator_lyrics_route(
         remote_control_command(
             "歌词".to_string(),
             "歌词",
-            BusinessIntent::Playback(PlaybackCommand::Lyrics),
+            ModuleCommand::Playback(PlaybackCommand::Lyrics),
         ),
     )
 }
@@ -1235,7 +1354,7 @@ fn operator_hall_detect_route(
         remote_control_command(
             "大厅检测".to_string(),
             "大厅检测",
-            BusinessIntent::Hall(HallCommand::Detect),
+            ModuleCommand::Hall(HallCommand::Detect),
         ),
     )
 }
@@ -1249,7 +1368,7 @@ fn operator_hall_time_route(
         remote_control_command(
             "大厅时间".to_string(),
             "大厅时间",
-            BusinessIntent::Hall(HallCommand::Time),
+            ModuleCommand::Hall(HallCommand::Time),
         ),
     )
 }
@@ -1263,7 +1382,7 @@ fn operator_microphone_route(
         remote_control_command(
             "麦克风".to_string(),
             "麦克风",
-            BusinessIntent::Hall(HallCommand::ToggleMicrophone {
+            ModuleCommand::Hall(HallCommand::ToggleMicrophone {
                 username: "控制台".to_string(),
             }),
         ),
@@ -1285,7 +1404,7 @@ fn operator_commands_route(
     let (raw, command) = if enabled {
         (
             "启用".to_string(),
-            BusinessIntent::Administration(AdministrationCommand::SetCommandsEnabled {
+            ModuleCommand::Administration(AdministrationCommand::SetCommandsEnabled {
                 enabled: true,
                 username: "控制台".to_string(),
             }),
@@ -1293,7 +1412,7 @@ fn operator_commands_route(
     } else {
         (
             "禁用".to_string(),
-            BusinessIntent::Administration(AdministrationCommand::SetCommandsEnabled {
+            ModuleCommand::Administration(AdministrationCommand::SetCommandsEnabled {
                 enabled: false,
                 username: "控制台".to_string(),
             }),
@@ -1334,7 +1453,7 @@ fn operator_idle_exit_route(
         remote_control_command(
             format!("闲置退出 {minutes}"),
             "闲置退出",
-            BusinessIntent::Administration(AdministrationCommand::IdleExit { minutes }),
+            ModuleCommand::Administration(AdministrationCommand::IdleExit { minutes }),
         ),
     )
 }
@@ -1377,7 +1496,7 @@ fn operator_workflow_run_route(
         remote_control_command(
             prepared.raw,
             &prepared.matched,
-            BusinessIntent::CustomWorkflow(prepared.command),
+            ModuleCommand::CustomWorkflow(prepared.command),
         ),
     )
 }
@@ -1386,21 +1505,21 @@ fn ai_recognize_route(
     query: &[(String, String)],
     state: &HttpSharedState,
 ) -> std::result::Result<String, AppError> {
-    state.ai.recognize_with_query(query).map_err(ai_route_error)
+    state.ai.recognize(query).map_err(ai_route_error)
 }
 
 fn ai_match_route(
     query: &[(String, String)],
     state: &HttpSharedState,
 ) -> std::result::Result<String, AppError> {
-    state.ai.match_with_query(query).map_err(ai_route_error)
+    state.ai.match_song(query).map_err(ai_route_error)
 }
 
 fn ai_pick_route(
     query: &[(String, String)],
     state: &HttpSharedState,
 ) -> std::result::Result<String, AppError> {
-    state.ai.pick_with_query(query).map_err(ai_route_error)
+    state.ai.pick(query).map_err(ai_route_error)
 }
 
 fn ai_search_route(
@@ -1437,7 +1556,7 @@ fn turtle_soup_route(
 ) -> std::result::Result<String, AppError> {
     serde_json::to_string(
         &state
-            .business
+            .queries
             .turtle_soup_snapshot()
             .map_err(internal_error)?,
     )
@@ -1448,17 +1567,22 @@ fn turtle_soup_start_route(
     query: &[(String, String)],
     state: &HttpSharedState,
 ) -> std::result::Result<String, AppError> {
-    match query_value(query, "id")
+    let puzzle_id = query_value(query, "id")
         .map(str::trim)
         .filter(|id| !id.is_empty())
-    {
-        Some(id) => state.business.start_turtle_soup_by_id(id),
-        None => state.business.start_turtle_soup_random(),
-    }
-    .map_err(internal_error)?;
+        .map(str::to_string);
+    let BusinessMutationOutcome::TurtleSoup(TurtleSoupMutationOutcome::Started(snapshot)) = state
+        .formal_tasks
+        .apply_mutation(BusinessMutationIntent::TurtleSoup(
+            TurtleSoupMutationIntent::Start { puzzle_id },
+        ))
+        .map_err(internal_error)?
+    else {
+        unreachable!("turtle soup start intent returned a different outcome")
+    };
     serde_json::to_string(&json!({
         "ok": true,
-        "turtleSoup": state.business.turtle_soup_snapshot().map_err(internal_error)?,
+        "turtleSoup": snapshot,
     }))
     .map_err(internal_error)
 }
@@ -1467,7 +1591,16 @@ fn turtle_soup_end_route(
     _query: &[(String, String)],
     state: &HttpSharedState,
 ) -> std::result::Result<String, AppError> {
-    let ended = state.business.end_turtle_soup().map_err(internal_error)?;
+    let BusinessMutationOutcome::TurtleSoup(TurtleSoupMutationOutcome::Ended { ended, snapshot }) =
+        state
+            .formal_tasks
+            .apply_mutation(BusinessMutationIntent::TurtleSoup(
+                TurtleSoupMutationIntent::End,
+            ))
+            .map_err(internal_error)?
+    else {
+        unreachable!("turtle soup end intent returned a different outcome")
+    };
     if !ended {
         return Err(AppError {
             status: 409,
@@ -1476,7 +1609,7 @@ fn turtle_soup_end_route(
     }
     serde_json::to_string(&json!({
         "ok": true,
-        "turtleSoup": state.business.turtle_soup_snapshot().map_err(internal_error)?,
+        "turtleSoup": snapshot,
     }))
     .map_err(internal_error)
 }
@@ -1496,10 +1629,16 @@ fn turtle_soup_questions_route(
     {
         return Err(bad_request("海龟汤标题、汤面和汤底不能为空"));
     }
-    let receipt = state
-        .business
-        .append_turtle_soup_puzzle(submission)
-        .map_err(internal_error)?;
+    let BusinessMutationOutcome::TurtleSoup(TurtleSoupMutationOutcome::PuzzleAppended(receipt)) =
+        state
+            .formal_tasks
+            .apply_mutation(BusinessMutationIntent::TurtleSoup(
+                TurtleSoupMutationIntent::AppendPuzzle(submission),
+            ))
+            .map_err(internal_error)?
+    else {
+        unreachable!("turtle soup append intent returned a different outcome")
+    };
     serde_json::to_string(&receipt).map_err(internal_error)
 }
 
@@ -1508,7 +1647,7 @@ fn undercover_route(
     state: &HttpSharedState,
 ) -> std::result::Result<String, AppError> {
     let snapshot = state
-        .business
+        .queries
         .undercover_snapshot()
         .map_err(internal_error)?;
     serde_json::to_string(&snapshot).map_err(internal_error)
@@ -1523,7 +1662,7 @@ fn undercover_start_route(
         remote_control_command(
             "卧底开局".to_string(),
             "卧底",
-            BusinessIntent::Undercover(UndercoverCommand::Start),
+            ModuleCommand::Undercover(UndercoverCommand::Start),
         ),
     )
 }
@@ -1537,7 +1676,7 @@ fn undercover_end_route(
         remote_control_command(
             "卧底结束".to_string(),
             "卧底",
-            BusinessIntent::Undercover(UndercoverCommand::End),
+            ModuleCommand::Undercover(UndercoverCommand::End),
         ),
     )
 }
@@ -1548,7 +1687,7 @@ fn tool_task_route(
 ) -> std::result::Result<String, AppError> {
     let id = parse_tool_id(query)?;
     let snapshot = state
-        .business
+        .queries
         .diagnostic_task_snapshot(id)
         .map_err(internal_error)?
         .ok_or_else(|| AppError {
@@ -1845,7 +1984,7 @@ fn enqueue_remote_command(
     intent: ConsoleCommandIntent,
 ) -> std::result::Result<String, AppError> {
     let pending = intent.into_pending();
-    let command = pending.parsed.raw.clone();
+    let command = pending.routed.raw.clone();
     let queued = enqueue_pending_command(state, pending)?;
     let task_id = queued.map(|receipt| receipt.task_id);
     let position = queued.map_or(0, |receipt| receipt.position);
@@ -1926,7 +2065,7 @@ fn enqueue_startup_task_response<const N: usize>(
 fn remote_control_command(
     raw: String,
     matched: &str,
-    command: BusinessIntent,
+    command: ModuleCommand,
 ) -> ConsoleCommandIntent {
     ConsoleCommandIntent::new(raw, matched, command)
 }
@@ -1985,7 +2124,7 @@ fn remote_song_command(
     } else {
         format!("{} {}", prefix, keyword)
     };
-    let command = BusinessIntent::SongRequest(SongCommand {
+    let command = ModuleCommand::SongRequest(SongCommand {
         keyword,
         source: song_source,
         prefix: prefix.to_string(),
@@ -1999,7 +2138,7 @@ fn remote_song_command(
 fn queue_json(state: &HttpSharedState) -> std::result::Result<String, AppError> {
     serde_json::to_string(
         &state
-            .business
+            .queries
             .playback_queue_snapshot()
             .map_err(internal_error)?,
     )
@@ -2020,19 +2159,24 @@ fn queue_add(
     let ai_original_text =
         normalize_optional_text(query_value(query, "aiOriginalText"), "aiOriginalText")?;
     let uri = normalize_optional_text(query_value(query, "uri"), "uri")?;
-    let pushed = state
-        .business
-        .push_playback_queue(QueueItem {
-            id: 0,
-            keyword,
-            source,
-            prefer_accompaniment: prefer,
-            ai_original_text,
-            uri,
-            friend_username: String::new(),
-            dedup_bypass: true,
-        })
-        .map_err(internal_error)?;
+    let BusinessMutationOutcome::Playback(PlaybackMutationOutcome::Pushed(pushed)) = state
+        .formal_tasks
+        .apply_mutation(BusinessMutationIntent::Playback(
+            PlaybackMutationIntent::Push(QueueItem {
+                id: 0,
+                keyword,
+                source,
+                prefer_accompaniment: prefer,
+                ai_original_text,
+                uri,
+                friend_username: String::new(),
+                dedup_bypass: true,
+            }),
+        ))
+        .map_err(internal_error)?
+    else {
+        unreachable!("playback queue push intent returned a different outcome")
+    };
     if !pushed.accepted {
         return Err(AppError {
             status: 400,
@@ -2066,10 +2210,15 @@ fn queue_remove(
     } else {
         QueueRemoval::Front
     };
-    let removed = state
-        .business
-        .remove_playback_queue(removal)
-        .map_err(internal_error)?;
+    let BusinessMutationOutcome::Playback(PlaybackMutationOutcome::Removed(removed)) = state
+        .formal_tasks
+        .apply_mutation(BusinessMutationIntent::Playback(
+            PlaybackMutationIntent::Remove(removal),
+        ))
+        .map_err(internal_error)?
+    else {
+        unreachable!("playback queue remove intent returned a different outcome")
+    };
     let QueueRemoveOutcome::Removed { index, item, size } = removed else {
         return Err(match removed {
             QueueRemoveOutcome::MissingId => AppError {
@@ -2094,29 +2243,35 @@ fn queue_remove(
 }
 
 fn queue_clear(state: &HttpSharedState) -> std::result::Result<String, AppError> {
-    state
-        .business
-        .clear_playback_queue()
-        .map_err(internal_error)?;
+    let BusinessMutationOutcome::Playback(PlaybackMutationOutcome::Cleared) = state
+        .formal_tasks
+        .apply_mutation(BusinessMutationIntent::Playback(
+            PlaybackMutationIntent::Clear,
+        ))
+        .map_err(internal_error)?
+    else {
+        unreachable!("playback queue clear intent returned a different outcome")
+    };
     Ok(json!({ "ok": true }).to_string())
 }
 
 fn state_json(state: &HttpSharedState) -> std::result::Result<String, AppError> {
-    let runtime = state
-        .business
-        .runtime_state_snapshot()
+    let playback = state
+        .queries
+        .playback_state_snapshot()
         .map_err(internal_error)?;
-    let mut value = serde_json::to_value(&runtime).map_err(internal_error)?;
-    if let Value::Object(object) = &mut value {
-        object.insert(
-            "hallRemainingMinutesNow".to_string(),
-            runtime
-                .hall_remaining_minutes_now()
-                .map(Value::from)
-                .unwrap_or(Value::Null),
-        );
-    }
-    serde_json::to_string(&value).map_err(internal_error)
+    let hall = state
+        .queries
+        .hall_state_snapshot()
+        .map_err(internal_error)?;
+    serde_json::to_string(&json!({
+        "playback": playback,
+        "hallRemainingMinutes": hall.remaining_minutes,
+        "hallRemainingUpdatedAt": hall.remaining_updated_at,
+        "hallExpiringWarningSent": hall.expiring_warning_sent,
+        "hallRemainingMinutesNow": hall.remaining_minutes_now(),
+    }))
+    .map_err(internal_error)
 }
 
 fn state_save(
@@ -2129,10 +2284,15 @@ fn state_save(
             status: 400,
             message: format!("json参数无效: {}", error),
         })?;
-    state
-        .business
-        .patch_runtime_state(runtime_state_patch(&patch))
-        .map_err(internal_error)?;
+    let BusinessMutationOutcome::Hall(HallMutationOutcome::StatePatched) = state
+        .formal_tasks
+        .apply_mutation(BusinessMutationIntent::Hall(
+            HallMutationIntent::PatchState(hall_state_patch(&patch)),
+        ))
+        .map_err(internal_error)?
+    else {
+        unreachable!("runtime state patch intent returned a different outcome")
+    };
     Ok(json!({ "ok": true }).to_string())
 }
 
@@ -2216,16 +2376,6 @@ fn chat_send(
     .to_string())
 }
 
-#[cfg(test)]
-fn pending_task_labels(state: &HttpSharedState) -> std::result::Result<Vec<String>, AppError> {
-    Ok(state
-        .business
-        .scheduler_snapshot()
-        .map_err(internal_error)?
-        .pending_labels()
-        .to_vec())
-}
-
 fn required_enqueue_receipt(
     outcome: Result<FormalTaskEnqueueOutcome, impl std::fmt::Display>,
 ) -> std::result::Result<EnqueueReceipt, AppError> {
@@ -2282,23 +2432,23 @@ fn push_history(request: &Request, result: &str, ok: bool, state: &HttpSharedSta
     }
 }
 
-fn runtime_state_patch(patch: &HashMap<String, serde_json::Value>) -> RuntimeStatePatch {
-    RuntimeStatePatch {
-        hall_remaining_minutes: patch.get("hallRemainingMinutes").and_then(|value| {
+fn hall_state_patch(patch: &HashMap<String, serde_json::Value>) -> HallStatePatch {
+    HallStatePatch {
+        remaining_minutes: patch.get("hallRemainingMinutes").and_then(|value| {
             if value.is_null() {
                 Some(None)
             } else {
                 value.as_u64().map(|minutes| u32::try_from(minutes).ok())
             }
         }),
-        hall_remaining_updated_at: patch.get("hallRemainingUpdatedAt").and_then(|value| {
+        remaining_updated_at: patch.get("hallRemainingUpdatedAt").and_then(|value| {
             if value.is_null() {
                 Some(None)
             } else {
                 value.as_u64().map(Some)
             }
         }),
-        hall_expiring_warning_sent: patch
+        expiring_warning_sent: patch
             .get("hallExpiringWarningSent")
             .and_then(serde_json::Value::as_bool),
     }
@@ -2782,84 +2932,350 @@ mod tests {
     use std::ops::{Deref, DerefMut};
     use std::time::Duration;
 
-    use crate::runtime::identity::BusinessOperationIdAllocator;
-    use crate::runtime::player::RawPlayerSample;
-    use crate::runtime::player_io::{
-        ControlDispatchOutcome, PickedCandidate, PlayerControl, PlayerControlPort,
-        PlayerObservationPort, PlayerObservationReadError, PlayerRuntime, PlayerSearchClient,
-        PlayerSearchError, PlayerSearchPort, SearchCandidate,
-    };
-    use crate::runtime::scheduler::{
-        DiagnosticTaskSubmission, DiagnosticTaskWork, FormalTaskDedupKey, FormalTaskSubmission,
-        FormalTaskWork,
-    };
+    use crate::features::turtle_soup::TurtleSoupAppendReceipt;
+    use crate::runtime::chat_listener::ChatListenerState;
+    use crate::runtime::player_io::PlayerSearchError;
+    use crate::runtime::scheduler::FormalTaskReceipt;
 
-    struct TestFormalWork {
-        cancel_action: Option<Box<dyn FnOnce() + Send>>,
+    fn custom_workflow_service_from_config_parts(
+        config: &CustomWorkflowConfig,
+        timing: &TimingConfig,
+        ocr: &OcrConfig,
+    ) -> CustomWorkflowService {
+        CustomWorkflowService::new(
+            config.clone(),
+            WorkflowDefaults {
+                default_timeout_ms: timing.workflow.default_timeout_ms,
+                default_poll_ms: timing.workflow.default_poll_ms,
+                default_step_wait_ms: timing.workflow.default_step_wait_ms,
+                decision_timeout_ms: timing.decision.timeout_ms,
+                decision_poll_ms: timing.decision.poll_ms,
+                after_activate_ms: timing.input.after_activate_ms,
+                clipboard_hold_ms: timing.input.text_ms,
+                stability_mean_threshold: ocr.change_mean_threshold,
+                stability_changed_ratio_threshold: ocr.change_pixel_threshold,
+            },
+        )
     }
 
-    impl FormalTaskWork for TestFormalWork {
-        fn execute(self: Box<Self>) -> Result<String> {
-            Ok("test task".to_string())
-        }
+    #[derive(Clone, Debug)]
+    struct RecordedFormalTask {
+        id: u64,
+        kind: RecordedFormalTaskKind,
+        queued: bool,
+    }
 
-        fn cancel(mut self: Box<Self>) {
-            if let Some(action) = self.cancel_action.take() {
-                action();
+    #[allow(dead_code)]
+    #[derive(Clone, Debug)]
+    enum RecordedFormalTaskKind {
+        Command(Box<PendingCommand>),
+        Startup(StartupTask),
+        ConsoleChat { text: String, prefix: String },
+        ListenerMode(ChatListenerMode),
+        ClearIdleExit,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum RecordedMutation {
+        PlaybackPush(QueueItem),
+        PlaybackRemove(QueueRemoval),
+        PlaybackClear,
+        HallPatch(HallStatePatch),
+        TurtleSoupStart(Option<String>),
+        TurtleSoupEnd,
+        TurtleSoupAppend {
+            title: String,
+            surface: String,
+            bottom: String,
+            adjudication_notes: String,
+            enabled: bool,
+        },
+        ChatListenerModeRequest(ChatListenerMode),
+        ChatListenerModeCancel(ChatListenerMode),
+    }
+
+    struct RecordingHttpState {
+        next_id: u64,
+        next_queue_id: u64,
+        formal_tasks: Vec<RecordedFormalTask>,
+        diagnostic_tasks: HashMap<u64, DiagnosticTaskSnapshot>,
+        diagnostic_requests: Vec<(u64, WebToolRequest)>,
+        cancellation_requests: Vec<u64>,
+        decisions: Vec<(u64, DecisionAction)>,
+        mutations: Vec<RecordedMutation>,
+        queue: Vec<QueueItem>,
+        playback: PlaybackRuntimeState,
+        hall: HallRuntimeState,
+        turtle_soup: TurtleSoupSnapshot,
+        turtle_soup_submissions: Vec<TurtleSoupSubmission>,
+        undercover: UndercoverSnapshot,
+        listener: ChatListenerState,
+    }
+
+    impl RecordingHttpState {
+        fn new() -> Self {
+            Self {
+                next_id: 1,
+                next_queue_id: 1,
+                formal_tasks: Vec::new(),
+                diagnostic_tasks: HashMap::new(),
+                diagnostic_requests: Vec::new(),
+                cancellation_requests: Vec::new(),
+                decisions: Vec::new(),
+                mutations: Vec::new(),
+                queue: Vec::new(),
+                playback: PlaybackRuntimeState::default(),
+                hall: HallRuntimeState::default(),
+                turtle_soup: TurtleSoupSnapshot::default(),
+                turtle_soup_submissions: Vec::new(),
+                undercover: UndercoverSnapshot::default(),
+                listener: ChatListenerState::new(),
             }
         }
-    }
 
-    struct TestDiagnosticWork;
-
-    impl DiagnosticTaskWork for TestDiagnosticWork {
-        fn execute(self: Box<Self>) -> Result<String> {
-            Ok("test diagnostic".to_string())
+        fn allocate_id(&mut self) -> u64 {
+            let id = self.next_id;
+            self.next_id = self.next_id.wrapping_add(1).max(1);
+            id
         }
     }
 
-    #[derive(Clone)]
-    struct TestHttpTaskPort {
-        business: BusinessRuntimeHandle,
+    struct RecordingHttpPort {
+        state: Mutex<RecordingHttpState>,
     }
 
-    impl TestHttpTaskPort {
-        fn enqueue(
+    impl RecordingHttpPort {
+        fn new() -> Self {
+            Self {
+                state: Mutex::new(RecordingHttpState::new()),
+            }
+        }
+
+        fn enqueue_kind(&self, kind: RecordedFormalTaskKind) -> Result<FormalTaskEnqueueOutcome> {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow!("recording HTTP port lock poisoned"))?;
+            let id = state.allocate_id();
+            let position = state.formal_tasks.iter().filter(|task| task.queued).count() + 1;
+            state.formal_tasks.push(RecordedFormalTask {
+                id,
+                kind,
+                queued: true,
+            });
+            Ok(FormalTaskEnqueueOutcome::Queued(FormalTaskReceipt {
+                task_id: id,
+                position,
+            }))
+        }
+
+        fn formal_tasks(&self) -> Vec<RecordedFormalTask> {
+            self.state
+                .lock()
+                .expect("recording port")
+                .formal_tasks
+                .clone()
+        }
+
+        fn mutations(&self) -> Vec<RecordedMutation> {
+            self.state.lock().expect("recording port").mutations.clone()
+        }
+
+        fn diagnostic_requests(&self) -> Vec<(u64, WebToolRequest)> {
+            self.state
+                .lock()
+                .expect("recording port")
+                .diagnostic_requests
+                .clone()
+        }
+
+        fn decisions(&self) -> Vec<(u64, DecisionAction)> {
+            self.state.lock().expect("recording port").decisions.clone()
+        }
+
+        fn cancellation_requests(&self) -> Vec<u64> {
+            self.state
+                .lock()
+                .expect("recording port")
+                .cancellation_requests
+                .clone()
+        }
+
+        fn mark_started(&self, id: u64) {
+            let mut state = self.state.lock().expect("recording port");
+            let task = state
+                .formal_tasks
+                .iter_mut()
+                .find(|task| task.id == id)
+                .expect("recorded task");
+            task.queued = false;
+        }
+    }
+
+    impl HttpTaskPort for RecordingHttpPort {
+        fn apply_mutation(
             &self,
-            label: impl Into<String>,
-            dedup_key: Option<String>,
-            cancel_action: Option<Box<dyn FnOnce() + Send>>,
-        ) -> Result<FormalTaskEnqueueOutcome> {
-            Ok(self
-                .business
-                .enqueue_formal_task(FormalTaskSubmission::new(
-                    label,
-                    dedup_key.map(FormalTaskDedupKey::new),
-                    false,
-                    Box::new(TestFormalWork { cancel_action }),
-                ))?)
+            intent: BusinessMutationIntent,
+        ) -> Result<BusinessMutationOutcome> {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow!("recording HTTP port lock poisoned"))?;
+            Ok(match intent {
+                BusinessMutationIntent::Administration(
+                    AdministrationMutationIntent::RequestChatListenerMode(mode),
+                ) => {
+                    state
+                        .mutations
+                        .push(RecordedMutation::ChatListenerModeRequest(mode));
+                    let queued = state.listener.request_mode(mode);
+                    BusinessMutationOutcome::Administration(
+                        AdministrationMutationOutcome::ChatListenerModeRequested {
+                            queued,
+                            snapshot: state.listener.snapshot(),
+                        },
+                    )
+                }
+                BusinessMutationIntent::Administration(
+                    AdministrationMutationIntent::CancelChatListenerModeRequest(mode),
+                ) => {
+                    state
+                        .mutations
+                        .push(RecordedMutation::ChatListenerModeCancel(mode));
+                    state.listener.cancel_mode_request(mode);
+                    BusinessMutationOutcome::Administration(
+                        AdministrationMutationOutcome::ChatListenerModeRequestCancelled,
+                    )
+                }
+                BusinessMutationIntent::Playback(PlaybackMutationIntent::Push(mut item)) => {
+                    if item.id == 0 {
+                        item.id = state.next_queue_id;
+                        state.next_queue_id = state.next_queue_id.wrapping_add(1).max(1);
+                    }
+                    state
+                        .mutations
+                        .push(RecordedMutation::PlaybackPush(item.clone()));
+                    state.queue.push(item);
+                    BusinessMutationOutcome::Playback(PlaybackMutationOutcome::Pushed(
+                        crate::features::playback::QueuePushOutcome {
+                            accepted: true,
+                            size: state.queue.len(),
+                        },
+                    ))
+                }
+                BusinessMutationIntent::Playback(PlaybackMutationIntent::Remove(removal)) => {
+                    state
+                        .mutations
+                        .push(RecordedMutation::PlaybackRemove(removal));
+                    let index = match removal {
+                        QueueRemoval::Id(id) => state.queue.iter().position(|item| item.id == id),
+                        QueueRemoval::Index(index) => {
+                            Some(index).filter(|index| *index < state.queue.len())
+                        }
+                        QueueRemoval::Front => (!state.queue.is_empty()).then_some(0),
+                    };
+                    let removed = match index {
+                        Some(index) => {
+                            let item = state.queue.remove(index);
+                            QueueRemoveOutcome::Removed {
+                                index,
+                                item,
+                                size: state.queue.len(),
+                            }
+                        }
+                        None => match removal {
+                            QueueRemoval::Id(_) => QueueRemoveOutcome::MissingId,
+                            QueueRemoval::Index(_) => QueueRemoveOutcome::InvalidIndex,
+                            QueueRemoval::Front => QueueRemoveOutcome::Empty,
+                        },
+                    };
+                    BusinessMutationOutcome::Playback(PlaybackMutationOutcome::Removed(removed))
+                }
+                BusinessMutationIntent::Playback(PlaybackMutationIntent::Clear) => {
+                    state.mutations.push(RecordedMutation::PlaybackClear);
+                    state.queue.clear();
+                    BusinessMutationOutcome::Playback(PlaybackMutationOutcome::Cleared)
+                }
+                BusinessMutationIntent::Hall(HallMutationIntent::PatchState(patch)) => {
+                    state
+                        .mutations
+                        .push(RecordedMutation::HallPatch(patch.clone()));
+                    if let Some(value) = patch.remaining_minutes {
+                        state.hall.remaining_minutes = value;
+                    }
+                    if let Some(value) = patch.remaining_updated_at {
+                        state.hall.remaining_updated_at = value;
+                    }
+                    if let Some(value) = patch.expiring_warning_sent {
+                        state.hall.expiring_warning_sent = value;
+                    }
+                    BusinessMutationOutcome::Hall(HallMutationOutcome::StatePatched)
+                }
+                BusinessMutationIntent::TurtleSoup(TurtleSoupMutationIntent::Start {
+                    puzzle_id,
+                }) => {
+                    state
+                        .mutations
+                        .push(RecordedMutation::TurtleSoupStart(puzzle_id));
+                    state.turtle_soup.enabled = true;
+                    BusinessMutationOutcome::TurtleSoup(TurtleSoupMutationOutcome::Started(
+                        state.turtle_soup.clone(),
+                    ))
+                }
+                BusinessMutationIntent::TurtleSoup(TurtleSoupMutationIntent::End) => {
+                    state.mutations.push(RecordedMutation::TurtleSoupEnd);
+                    let ended = state.turtle_soup.enabled;
+                    state.turtle_soup = TurtleSoupSnapshot::default();
+                    BusinessMutationOutcome::TurtleSoup(TurtleSoupMutationOutcome::Ended {
+                        ended,
+                        snapshot: state.turtle_soup.clone(),
+                    })
+                }
+                BusinessMutationIntent::TurtleSoup(TurtleSoupMutationIntent::AppendPuzzle(
+                    submission,
+                )) => {
+                    state.mutations.push(RecordedMutation::TurtleSoupAppend {
+                        title: submission.title.clone(),
+                        surface: submission.surface.clone(),
+                        bottom: submission.bottom.clone(),
+                        adjudication_notes: submission.adjudication_notes.clone(),
+                        enabled: submission.enabled,
+                    });
+                    state.turtle_soup_submissions.push(submission);
+                    let position = state.turtle_soup_submissions.len();
+                    BusinessMutationOutcome::TurtleSoup(TurtleSoupMutationOutcome::PuzzleAppended(
+                        TurtleSoupAppendReceipt {
+                            id: format!("soup-{position:04}"),
+                            position,
+                            total: position,
+                        },
+                    ))
+                }
+            })
         }
 
-        fn enqueue_callback(
-            &self,
-            label: impl Into<String>,
-            cancel_action: impl FnOnce() + Send + 'static,
-        ) -> Result<FormalTaskEnqueueOutcome> {
-            self.enqueue(label, None, Some(Box::new(cancel_action)))
-        }
-    }
-
-    impl HttpTaskPort for TestHttpTaskPort {
         fn enqueue_command(&self, pending: PendingCommand) -> Result<FormalTaskEnqueueOutcome> {
-            self.enqueue(
-                format!("控制台命令: {}", pending.parsed.raw),
-                Some(pending.lock_key),
-                None,
-            )
+            {
+                let state = self
+                    .state
+                    .lock()
+                    .map_err(|_| anyhow!("recording HTTP port lock poisoned"))?;
+                if state.formal_tasks.iter().any(|task| {
+                    task.queued
+                        && matches!(
+                            &task.kind,
+                            RecordedFormalTaskKind::Command(command)
+                                if command.lock_key == pending.lock_key
+                        )
+                }) {
+                    return Ok(FormalTaskEnqueueOutcome::Duplicate);
+                }
+            }
+            self.enqueue_kind(RecordedFormalTaskKind::Command(Box::new(pending)))
         }
 
-        fn enqueue_startup(&self, _task: StartupTask) -> Result<FormalTaskEnqueueOutcome> {
-            self.enqueue("启动任务", None, None)
+        fn enqueue_startup(&self, task: StartupTask) -> Result<FormalTaskEnqueueOutcome> {
+            self.enqueue_kind(RecordedFormalTaskKind::Startup(task))
         }
 
         fn enqueue_console_chat(
@@ -2867,65 +3283,126 @@ mod tests {
             text: String,
             prefix: String,
         ) -> Result<FormalTaskEnqueueOutcome> {
-            self.enqueue(format!("控制台发言: {prefix}{text}"), None, None)
+            self.enqueue_kind(RecordedFormalTaskKind::ConsoleChat { text, prefix })
         }
 
         fn enqueue_listener_mode(
             &self,
             target: ChatListenerMode,
         ) -> Result<FormalTaskEnqueueOutcome> {
-            self.enqueue(format!("切换{}", target.label()), None, None)
+            self.enqueue_kind(RecordedFormalTaskKind::ListenerMode(target))
         }
 
         fn enqueue_clear_idle_exit(&self) -> Result<FormalTaskEnqueueOutcome> {
-            self.enqueue("取消闲置退出", None, None)
+            self.enqueue_kind(RecordedFormalTaskKind::ClearIdleExit)
         }
 
         fn enqueue_diagnostic(&self, request: WebToolRequest) -> Result<DiagnosticTaskSnapshot> {
-            self.business
-                .enqueue_diagnostic_task(DiagnosticTaskSubmission::new(
-                    request.label(),
-                    Box::new(TestDiagnosticWork),
-                ))
-                .map_err(anyhow::Error::from)
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow!("recording HTTP port lock poisoned"))?;
+            let id = state.allocate_id();
+            let snapshot = DiagnosticTaskSnapshot {
+                id,
+                label: request.label(),
+                status: "queued".to_string(),
+                result: None,
+            };
+            state.diagnostic_requests.push((id, request));
+            state.diagnostic_tasks.insert(id, snapshot.clone());
+            Ok(snapshot)
+        }
+
+        fn cancel_task(&self, task_id: u64) -> Result<FormalTaskCancelOutcome> {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow!("recording HTTP port lock poisoned"))?;
+            state.cancellation_requests.push(task_id);
+            let Some(task) = state
+                .formal_tasks
+                .iter_mut()
+                .find(|task| task.id == task_id && task.queued)
+            else {
+                return Ok(FormalTaskCancelOutcome::NotQueued);
+            };
+            task.queued = false;
+            Ok(FormalTaskCancelOutcome::Canceled)
+        }
+
+        fn submit_decision(&self, id: u64, action: DecisionAction) -> Result<()> {
+            self.state
+                .lock()
+                .map_err(|_| anyhow!("recording HTTP port lock poisoned"))?
+                .decisions
+                .push((id, action));
+            Ok(())
         }
     }
 
-    struct TestPrimaryHold {
-        business: BusinessRuntimeHandle,
-        active: bool,
-    }
+    impl HttpQueryPort for RecordingHttpPort {
+        fn turtle_soup_snapshot(&self) -> Result<TurtleSoupSnapshot> {
+            Ok(self
+                .state
+                .lock()
+                .map_err(|_| anyhow!("recording HTTP port lock poisoned"))?
+                .turtle_soup
+                .clone())
+        }
 
-    impl crate::features::moderation::ModerationPrimaryHold for TestPrimaryHold {
-        fn release(&mut self) {
-            if self.active {
-                let _ = self.business.end_chat_listener_temporary_primary();
-                self.active = false;
-            }
+        fn undercover_snapshot(&self) -> Result<UndercoverSnapshot> {
+            Ok(self
+                .state
+                .lock()
+                .map_err(|_| anyhow!("recording HTTP port lock poisoned"))?
+                .undercover
+                .clone())
+        }
+
+        fn diagnostic_task_snapshot(&self, id: u64) -> Result<Option<DiagnosticTaskSnapshot>> {
+            Ok(self
+                .state
+                .lock()
+                .map_err(|_| anyhow!("recording HTTP port lock poisoned"))?
+                .diagnostic_tasks
+                .get(&id)
+                .cloned())
+        }
+
+        fn playback_queue_snapshot(&self) -> Result<Vec<QueueItem>> {
+            Ok(self
+                .state
+                .lock()
+                .map_err(|_| anyhow!("recording HTTP port lock poisoned"))?
+                .queue
+                .clone())
+        }
+
+        fn playback_state_snapshot(&self) -> Result<PlaybackRuntimeState> {
+            Ok(self
+                .state
+                .lock()
+                .map_err(|_| anyhow!("recording HTTP port lock poisoned"))?
+                .playback
+                .clone())
+        }
+
+        fn hall_state_snapshot(&self) -> Result<HallRuntimeState> {
+            Ok(self
+                .state
+                .lock()
+                .map_err(|_| anyhow!("recording HTTP port lock poisoned"))?
+                .hall
+                .clone())
         }
     }
 
-    struct HttpTestObservationPort;
-
-    impl PlayerObservationPort for HttpTestObservationPort {
-        fn read_sample(&mut self) -> Result<RawPlayerSample, PlayerObservationReadError> {
-            Ok(RawPlayerSample::default())
-        }
-    }
-
-    struct HttpTestControlPort;
-
-    impl PlayerControlPort for HttpTestControlPort {
-        fn dispatch(&mut self, _control: &PlayerControl) -> ControlDispatchOutcome {
-            ControlDispatchOutcome::acknowledged("ok")
-        }
-    }
-
-    struct HttpTestSearchPort {
+    struct HttpTestPlayerPort {
         fail: bool,
     }
 
-    impl HttpTestSearchPort {
+    impl HttpTestPlayerPort {
         const fn successful() -> Self {
             Self { fail: false }
         }
@@ -2934,61 +3411,63 @@ mod tests {
             Self { fail: true }
         }
 
-        fn fail_if_requested(&self) -> Result<(), PlayerSearchError> {
+        fn fail_if_requested(&self) -> std::result::Result<(), PlayerSearchClientError> {
             if self.fail {
-                Err(PlayerSearchError::new("backend failed"))
+                Err(PlayerSearchClientError::Failed(PlayerSearchError::new(
+                    "backend failed",
+                )))
             } else {
                 Ok(())
             }
         }
     }
 
-    impl PlayerSearchPort for HttpTestSearchPort {
+    impl HttpPlayerPort for HttpTestPlayerPort {
+        fn status(&self) -> Result<crate::features::playback::PlayerStatus> {
+            Ok(crate::features::playback::PlayerStatus::default())
+        }
+
         fn search_text(
-            &mut self,
+            &self,
             keyword: &str,
             source: &str,
-        ) -> Result<String, PlayerSearchError> {
+        ) -> std::result::Result<String, PlayerSearchClientError> {
             self.fail_if_requested()?;
             Ok(format!("raw search: {keyword} [{source}]"))
         }
 
         fn search_candidates(
-            &mut self,
+            &self,
             keyword: &str,
             source: &str,
-        ) -> Result<Vec<SearchCandidate>, PlayerSearchError> {
+        ) -> std::result::Result<Vec<SearchCandidate>, PlayerSearchClientError> {
             self.fail_if_requested()?;
             Ok(vec![SearchCandidate::new(
                 format!("{keyword} result"),
                 format!("fuo://{source}/songs/1"),
             )])
         }
+    }
 
-        fn search_and_pick(
-            &mut self,
-            keyword: &str,
-            source: &str,
-            _prefer_accompaniment: bool,
-        ) -> Result<Option<PickedCandidate>, PlayerSearchError> {
-            self.fail_if_requested()?;
-            Ok(Some(PickedCandidate::new(
-                SearchCandidate::new(
-                    format!("{keyword} result"),
-                    format!("fuo://{source}/songs/1"),
-                ),
-                "candidate listing",
-            )))
+    struct HttpTestAiPort;
+
+    impl HttpAiPort for HttpTestAiPort {
+        fn recognize(&self, _query: &[(String, String)]) -> Result<String> {
+            Ok("test recognition".to_string())
+        }
+
+        fn match_song(&self, _query: &[(String, String)]) -> Result<String> {
+            Ok("test match".to_string())
+        }
+
+        fn pick(&self, _query: &[(String, String)]) -> Result<String> {
+            Ok("test pick".to_string())
         }
     }
 
     struct HttpTestState {
         state: HttpSharedState,
-        turtle_soup_question_bank_path: std::path::PathBuf,
-        test_tasks: Arc<TestHttpTaskPort>,
-        _player_runtime: PlayerRuntime,
-        _openai_runtime: crate::runtime::openai::OpenAiRuntime,
-        _business_runtime: crate::runtime::business::BusinessRuntime,
+        recording: Arc<RecordingHttpPort>,
     }
 
     impl Deref for HttpTestState {
@@ -3138,7 +3617,7 @@ mod tests {
 
     #[test]
     fn search_backend_failure_keeps_the_http_error_contract() {
-        let mut state = test_state_with_search_port(HttpTestSearchPort::failing());
+        let mut state = test_state_with_player_port(HttpTestPlayerPort::failing());
         let server = start_test_http_server(&mut state, "");
 
         let response = http_get(
@@ -3154,26 +3633,6 @@ mod tests {
         );
         assert_eq!(response.body, "错误: backend failed");
         server.shutdown().expect("shutdown HTTP server");
-    }
-
-    struct TestModerationCommandPort {
-        business: BusinessRuntimeHandle,
-    }
-
-    impl crate::features::moderation::ModerationCommandPort for TestModerationCommandPort {
-        fn send_hall(&mut self, _message: &str) -> Result<()> {
-            Ok(())
-        }
-
-        fn prepare_vote_hold(
-            &mut self,
-        ) -> Result<Box<dyn crate::features::moderation::ModerationPrimaryHold>> {
-            self.business.begin_chat_listener_temporary_primary()?;
-            Ok(Box::new(TestPrimaryHold {
-                business: self.business.clone(),
-                active: true,
-            }))
-        }
     }
 
     #[test]
@@ -3245,11 +3704,9 @@ workflows:
         .expect("custom workflow config");
         let default_config: AppConfig =
             serde_yaml::from_str(include_str!("../../../config.yaml")).expect("default config");
-        state.custom_workflow = service_from_config_parts(
+        state.custom_workflow = custom_workflow_service_from_config_parts(
             &state.config.custom_workflows,
-            &state.config.timing.workflow,
-            &state.config.timing.decision,
-            &state.config.timing.input,
+            &state.config.timing,
             &default_config.ocr,
         );
 
@@ -3277,7 +3734,18 @@ workflows:
         assert_eq!(response["position"], 1);
         assert_eq!(response["command"], "入口 5");
         assert!(response["taskId"].as_u64().is_some());
-        assert_eq!(pending_task_labels(&state).unwrap(), ["控制台命令: 入口 5"]);
+        let tasks = state.recording.formal_tasks();
+        assert_eq!(tasks.len(), 1);
+        assert!(matches!(
+            tasks[0].kind,
+            RecordedFormalTaskKind::Command(ref pending)
+                if pending.routed.raw == "入口 5"
+                    && matches!(
+                        pending.routed.command,
+                        ModuleCommand::CustomWorkflow(ref command)
+                            if command.workflow == "example" && command.args == "5"
+                    )
+        ));
     }
 
     #[test]
@@ -3309,7 +3777,7 @@ workflows:
             .expect_err("invalid submission");
 
         assert_eq!(error.status, 400);
-        assert!(!state.turtle_soup_question_bank_path.exists());
+        assert!(state.recording.mutations().is_empty());
     }
 
     #[test]
@@ -3343,14 +3811,14 @@ workflows:
         let id = ticket["id"].as_u64().expect("tool id");
 
         assert_eq!(ticket["status"], "queued");
-        assert!(
-            pending_task_labels(&state)
-                .expect("pending labels")
-                .is_empty()
-        );
+        assert!(state.recording.formal_tasks().is_empty());
+        let requests = state.recording.diagnostic_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0, id);
+        assert!(matches!(requests[0].1, WebToolRequest::UiState));
         assert_eq!(
             state
-                .business
+                .queries
                 .diagnostic_task_snapshot(id)
                 .expect("tool snapshot")
                 .expect("queued tool")
@@ -3587,7 +4055,7 @@ workflows:
         assert_eq!(value["uri"], "fuo://netease/songs/123");
 
         let queue = state
-            .business
+            .queries
             .playback_queue_snapshot()
             .expect("queue snapshot");
         let item = queue.first().expect("queued item");
@@ -3616,17 +4084,17 @@ workflows:
         let pending = remote_control_command(
             "下一首".to_string(),
             "下一首",
-            BusinessIntent::Playback(PlaybackCommand::Next),
+            ModuleCommand::Playback(PlaybackCommand::Next),
         )
         .into_pending();
 
-        assert_eq!(pending.parsed.message_type, "控制台");
-        assert_eq!(pending.parsed.username, "控制台");
-        assert_eq!(pending.parsed.raw, "下一首");
-        assert_eq!(pending.parsed.user_command, "@下一首");
+        assert_eq!(pending.routed.message_type, "控制台");
+        assert_eq!(pending.routed.username, "控制台");
+        assert_eq!(pending.routed.raw, "下一首");
+        assert_eq!(pending.routed.user_command, "@下一首");
         assert!(matches!(
-            pending.parsed.command,
-            BusinessIntent::Playback(PlaybackCommand::Next)
+            pending.routed.command,
+            ModuleCommand::Playback(PlaybackCommand::Next)
         ));
     }
 
@@ -3635,15 +4103,15 @@ workflows:
         let pending = remote_control_command(
             "音量 60".to_string(),
             "音量",
-            BusinessIntent::Playback(PlaybackCommand::Volume("60".to_string())),
+            ModuleCommand::Playback(PlaybackCommand::Volume("60".to_string())),
         )
         .into_pending();
 
-        assert_eq!(pending.parsed.raw, "音量 60");
-        assert_eq!(pending.parsed.user_command, "@音量 60");
+        assert_eq!(pending.routed.raw, "音量 60");
+        assert_eq!(pending.routed.user_command, "@音量 60");
         assert!(matches!(
-            pending.parsed.command,
-            BusinessIntent::Playback(PlaybackCommand::Volume(ref volume)) if volume == "60"
+            pending.routed.command,
+            ModuleCommand::Playback(PlaybackCommand::Volume(ref volume)) if volume == "60"
         ));
     }
 
@@ -3677,17 +4145,17 @@ workflows:
 
         assert_eq!(response["queued"], true);
         assert_eq!(response["position"], 1);
-        assert_eq!(
-            pending_task_labels(&state).expect("pending labels"),
-            vec!["控制台命令: 继续"]
-        );
-        let tasks = state
-            .business
-            .scheduler_snapshot()
-            .expect("scheduler snapshot");
-        let tasks = tasks.tasks();
+        let tasks = state.recording.formal_tasks();
+        assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].id, task_id);
-        assert_eq!(tasks[0].status, "queued");
+        assert!(matches!(
+            tasks[0].kind,
+            RecordedFormalTaskKind::Command(ref pending)
+                if matches!(
+                    pending.routed.command,
+                    ModuleCommand::Playback(PlaybackCommand::Resume)
+                )
+        ));
     }
 
     #[test]
@@ -3702,27 +4170,10 @@ workflows:
         let canceled: Value = serde_json::from_str(&cancel_body).expect("cancel response json");
 
         assert_eq!(canceled["canceled"], true);
-        assert!(
-            pending_task_labels(&state)
-                .expect("pending labels")
-                .is_empty()
-        );
-        let snapshot = state
-            .business
-            .scheduler_snapshot()
-            .expect("scheduler snapshot");
-        let task = snapshot
-            .tasks()
-            .iter()
-            .find(|task| task.id == task_id)
-            .expect("canceled task");
-        assert_eq!(task.status, "canceled");
-        assert!(
-            task.result
-                .as_deref()
-                .expect("cancel result")
-                .contains("执行前取消")
-        );
+        assert_eq!(state.recording.cancellation_requests(), [task_id]);
+        let tasks = state.recording.formal_tasks();
+        assert_eq!(tasks.len(), 1);
+        assert!(!tasks[0].queued);
     }
 
     #[test]
@@ -3731,213 +4182,32 @@ workflows:
         let body = pause_route(&[], &state).expect("pause route");
         let response: Value = serde_json::from_str(&body).expect("pause response json");
         let task_id = response["taskId"].as_u64().expect("task id");
-        let started = state
-            .business
-            .take_next_formal_task()
-            .expect("take formal task")
-            .expect("queued task");
-        assert_eq!(started.task_id(), task_id);
+        state.recording.mark_started(task_id);
 
         let error = task_cancel_route(&[("id".to_string(), task_id.to_string())], &state)
             .expect_err("started task must not be canceled");
 
         assert_eq!(error.status, 409);
         assert!(error.message.contains("不能撤销"));
-        let snapshot = state
-            .business
-            .scheduler_snapshot()
-            .expect("scheduler snapshot");
-        let task = snapshot
-            .tasks()
-            .iter()
-            .find(|task| task.id == task_id)
-            .expect("running task");
-        assert_eq!(task.status, "running");
-        state
-            .business
-            .restore_formal_task(started)
-            .expect("restore started task");
+        assert_eq!(state.recording.cancellation_requests(), [task_id]);
     }
 
     #[test]
-    fn canceling_secondary_recovery_releases_unread_claim() {
-        let state = test_state();
-        state
-            .business
-            .complete_chat_listener_mode(ChatListenerMode::Secondary)
-            .unwrap();
-        assert!(state.business.claim_chat_listener_unread_task().unwrap());
-        let business = state.business.clone();
-        let receipt = required_enqueue_receipt(state.test_tasks.enqueue_callback(
-            "二级监听恢复当前大厅",
-            move || {
-                let _ = business.release_chat_listener_unread_task();
-            },
-        ))
-        .expect("enqueue recovery");
-
-        task_cancel_route(&[("id".to_string(), receipt.task_id.to_string())], &state)
-            .expect("cancel recovery");
-
-        assert!(
-            !state
-                .business
-                .chat_listener_snapshot()
-                .unwrap()
-                .unread_task_pending
-        );
-    }
-
-    #[test]
-    fn canceling_moderation_result_releases_workflow_and_listener_hold() {
-        let state = test_state();
-        state
-            .business
-            .complete_chat_listener_mode(ChatListenerMode::Secondary)
-            .unwrap();
-        let command = command::ModerationCommand {
-            action: command::ModerationAction::Blacklist,
-            uid: "123456789".to_string(),
-            requester: "测试用户".to_string(),
-        };
-        let moderation = ModerationService::new(
-            ModerationPolicy::new(
-                std::time::Duration::from_secs(120),
-                std::time::Duration::from_secs(2),
-                3,
-                3,
-            ),
-            Arc::new(state.business.clone()),
-        );
-        let mut port = TestModerationCommandPort {
-            business: state.business.clone(),
-        };
-        let crate::features::moderation::ModerationStart::Started(work) = moderation
-            .start(&command, &mut port)
-            .expect("start moderation")
-        else {
-            panic!("moderation should start");
-        };
-        let mut result_task = work.finish(false);
-        let receipt = required_enqueue_receipt(
-            state
-                .test_tasks
-                .enqueue_callback("管理投票结果", move || result_task.cancel()),
-        )
-        .expect("enqueue moderation result");
-        assert!(
-            state
-                .business
-                .chat_listener_snapshot()
-                .unwrap()
-                .temporary_primary
-        );
-
-        task_cancel_route(&[("id".to_string(), receipt.task_id.to_string())], &state)
-            .expect("cancel moderation result");
-
-        assert!(!moderation.is_active(&command).unwrap());
-        assert!(
-            !state
-                .business
-                .chat_listener_snapshot()
-                .unwrap()
-                .temporary_primary
-        );
-    }
-
-    #[test]
-    fn canceling_card_game_timeout_releases_entertainment_session() {
+    fn task_cancel_contract_requires_authentication_and_post_before_submitting_id() {
         let mut state = test_state();
-        let service = crate::features::card_games::CardGameService::new(
-            crate::features::card_games::LandlordConfig {
-                lobby_timeout_seconds: 1,
-                ..crate::features::card_games::LandlordConfig::default()
-            },
-        );
-        let idiom_chain = crate::features::idiom_chain::IdiomChainService::from_entries_for_test(
-            &["画蛇添足", "足智多谋"],
-            None,
-        );
-        let runtime = crate::runtime::business::BusinessRuntime::start(8, idiom_chain, service)
-            .expect("start business runtime");
-        let business = runtime.handle();
-        let started_at = std::time::Instant::now();
-        let verification = match business
-            .begin_card_game(
-                "甲",
-                &crate::features::card_games::LandlordCommand::Start,
-                started_at,
-            )
-            .expect("begin card game")
-        {
-            crate::features::card_games::CardGameCommandStart::Suspended(request) => request,
-            crate::features::card_games::CardGameCommandStart::Completed(_) => {
-                panic!("start should require verification")
-            }
-        };
-        assert!(matches!(
-            business
-                .claim_card_game_effect(verification.key)
-                .expect("claim verification"),
-            crate::features::card_games::CardGameEffectClaim::Claimed
-        ));
-        let hall = match business
-            .resume_card_game(
-                verification.key,
-                crate::features::card_games::CardGameEffectResult::FriendVerify(Ok(true)),
-            )
-            .expect("resume verification")
-        {
-            crate::features::card_games::CardGameResume::Suspended(request) => request,
-            other => panic!("verified start should announce lobby: {other:?}"),
-        };
-        assert!(matches!(
-            business
-                .claim_card_game_effect(hall.key)
-                .expect("claim hall announcement"),
-            crate::features::card_games::CardGameEffectClaim::Claimed
-        ));
-        assert!(matches!(
-            business
-                .resume_card_game(
-                    hall.key,
-                    crate::features::card_games::CardGameEffectResult::HallDelivery(Ok(())),
-                )
-                .expect("resume hall announcement"),
-            crate::features::card_games::CardGameResume::Completed(_)
-        ));
-        let outcome = business
-            .poll_card_game_timed_outcome(started_at + std::time::Duration::from_secs(2), true)
-            .expect("tick card game")
-            .expect("lobby timeout");
-        let action = outcome.action();
-        let request = outcome.into_request();
-        let key = request.key;
-        let business_for_cancel = business.clone();
-        let receipt = required_enqueue_receipt(state.test_tasks.enqueue_callback(
-            format!("发送牌局计时结果({action})"),
-            move || {
-                let _ = business_for_cancel.cancel_card_game_effect(key);
-            },
-        ))
-        .expect("enqueue card game delivery");
+        let queued: Value = serde_json::from_str(&pause_route(&[], &state).expect("pause route"))
+            .expect("pause response");
+        let task_id = queued["taskId"].as_u64().expect("task id");
         let server = start_test_http_server(&mut state, "secret");
-        let target = format!("/tasks/cancel?id={}", receipt.task_id);
+        let target = format!("/tasks/cancel?id={task_id}");
 
         let unauthenticated = http_post(server.local_addr(), &target, None);
         assert_eq!(unauthenticated.status_line, "HTTP/1.1 401 Unauthorized");
-        assert_eq!(
-            business.active_entertainment().unwrap(),
-            Some(crate::features::entertainment::EntertainmentKind::Landlord)
-        );
+        assert!(state.recording.cancellation_requests().is_empty());
 
         let wrong_method = http_get(server.local_addr(), &target, Some("secret"));
         assert_eq!(wrong_method.status_line, "HTTP/1.1 405 Method Not Allowed");
-        assert_eq!(
-            business.active_entertainment().unwrap(),
-            Some(crate::features::entertainment::EntertainmentKind::Landlord)
-        );
+        assert!(state.recording.cancellation_requests().is_empty());
 
         let canceled = http_post(server.local_addr(), &target, Some("secret"));
         assert_eq!(canceled.status_line, "HTTP/1.1 200 OK");
@@ -3949,33 +4219,17 @@ workflows:
             serde_json::from_str::<Value>(&canceled.body).expect("cancel response JSON")["ok"],
             true
         );
+        assert_eq!(state.recording.cancellation_requests(), [task_id]);
 
-        assert_eq!(business.active_entertainment().unwrap(), None);
-        assert!(!business.abort_card_game().expect("query remaining game"));
         server.shutdown().expect("shutdown HTTP server");
-        runtime.shutdown().expect("shutdown business runtime");
     }
 
     #[test]
     fn web_decision_submission_reaches_active_song_decision() {
         let state = test_state();
-        let session = state
-            .business
-            .begin_decision(
-                "点歌候选确认",
-                true,
-                false,
-                std::time::Duration::from_secs(1),
-            )
-            .expect("decision session");
-        let id = state
-            .business
-            .decision_snapshot()
-            .expect("decision snapshot")
-            .expect("active decision")
-            .id;
+        let id = 42;
 
-        decision_submit_route(
+        let body = decision_submit_route(
             &[
                 ("id".to_string(), id.to_string()),
                 ("action".to_string(), "switch_source".to_string()),
@@ -3984,11 +4238,12 @@ workflows:
         )
         .expect("decision route");
 
+        let response: Value = serde_json::from_str(&body).expect("decision response");
+        assert_eq!(response["decisionId"], id);
+        assert_eq!(response["submitted"], "switch_source");
         assert_eq!(
-            session
-                .wait(std::time::Duration::from_millis(1))
-                .expect("decision wait"),
-            Some(DecisionAction::SwitchSource)
+            state.recording.decisions(),
+            [(id, DecisionAction::SwitchSource)]
         );
     }
 
@@ -4024,15 +4279,17 @@ workflows:
         let raw_value: Value = serde_json::from_str(&raw_body).expect("json response");
         assert_eq!(raw_value["message"], "你好");
 
-        let labels = pending_task_labels(&state).expect("pending labels");
-        assert_eq!(
-            labels,
-            vec![
-                "控制台发言: [控制台]: 你好",
-                "控制台发言: [远程] 你好",
-                "控制台发言: 你好",
-            ]
-        );
+        let tasks = state.recording.formal_tasks();
+        let messages = tasks
+            .iter()
+            .map(|task| match &task.kind {
+                RecordedFormalTaskKind::ConsoleChat { text, prefix } => {
+                    format!("{prefix}{text}")
+                }
+                other => panic!("unexpected task: {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(messages, ["[控制台]: 你好", "[远程] 你好", "你好"]);
     }
 
     #[test]
@@ -4050,11 +4307,11 @@ workflows:
                 .expect("remote song command")
                 .into_pending();
 
-        assert_eq!(pending.parsed.message_type, "控制台");
-        assert_eq!(pending.parsed.username, "控制台");
-        assert_eq!(pending.parsed.raw, "点歌 晴天 伴奏");
-        match pending.parsed.command {
-            BusinessIntent::SongRequest(song) => {
+        assert_eq!(pending.routed.message_type, "控制台");
+        assert_eq!(pending.routed.username, "控制台");
+        assert_eq!(pending.routed.raw, "点歌 晴天 伴奏");
+        match pending.routed.command {
+            ModuleCommand::SongRequest(song) => {
                 assert_eq!(song.keyword, "晴天");
                 assert_eq!(song.source, SongSource::QqMusic);
                 assert!(song.prefer_accompaniment);
@@ -4071,9 +4328,9 @@ workflows:
             .expect("remote ai song command")
             .into_pending();
 
-        assert_eq!(pending.parsed.raw, "AI点歌 晴天");
-        match pending.parsed.command {
-            BusinessIntent::SongRequest(song) => {
+        assert_eq!(pending.routed.raw, "AI点歌 晴天");
+        match pending.routed.command {
+            ModuleCommand::SongRequest(song) => {
                 assert_eq!(song.source, SongSource::All);
                 assert!(song.ai_assisted);
             }
@@ -4092,9 +4349,9 @@ workflows:
         .expect("remote bilibili song command")
         .into_pending();
 
-        assert_eq!(pending.parsed.raw, "B站点歌 耀斑 HOYO-MiX");
-        match pending.parsed.command {
-            BusinessIntent::SongRequest(song) => {
+        assert_eq!(pending.routed.raw, "B站点歌 耀斑 HOYO-MiX");
+        match pending.routed.command {
+            ModuleCommand::SongRequest(song) => {
                 assert_eq!(song.source, SongSource::Bilibili);
                 assert_eq!(song.prefix, "B站点歌");
             }
@@ -4106,27 +4363,23 @@ workflows:
     fn queue_removal_by_id_survives_automatic_front_shift() {
         let state = test_state();
         for keyword in ["第一首", "第二首", "第三首"] {
-            state
-                .business
-                .push_playback_queue(QueueItem {
-                    keyword: keyword.to_string(),
-                    ..QueueItem::default()
-                })
-                .expect("queue push");
+            queue_add(
+                &[
+                    ("keyword".to_string(), keyword.to_string()),
+                    ("source".to_string(), "qqmusic".to_string()),
+                ],
+                &state,
+            )
+            .expect("queue push");
         }
         let third_id = state
-            .business
+            .queries
             .playback_queue_snapshot()
             .expect("queue snapshot")[2]
             .id;
-        let removed = state
-            .business
-            .remove_playback_queue(QueueRemoval::Front)
-            .expect("queue shift");
-        assert!(matches!(
-            removed,
-            QueueRemoveOutcome::Removed { item, .. } if item.keyword == "第一首"
-        ));
+        let removed = queue_remove(&[], &state).expect("queue shift");
+        let removed: Value = serde_json::from_str(&removed).expect("remove response");
+        assert_eq!(removed["removed"]["keyword"], "第一首");
 
         let body = queue_remove(&[("id".to_string(), third_id.to_string())], &state)
             .expect("remove by id");
@@ -4135,7 +4388,7 @@ workflows:
         assert_eq!(response["removed"]["id"], third_id);
         assert_eq!(response["removed"]["keyword"], "第三首");
         let queue = state
-            .business
+            .queries
             .playback_queue_snapshot()
             .expect("queue snapshot");
         assert_eq!(queue.len(), 1);
@@ -4209,109 +4462,38 @@ workflows:
         let response: Value = serde_json::from_str(&response).expect("listener response json");
 
         assert_eq!(response["queued"], true);
+        assert_eq!(response["mode"], "primary");
+        assert_eq!(response["pendingMode"], "secondary");
         assert_eq!(
-            state.business.chat_listener_snapshot().unwrap().mode,
-            ChatListenerMode::Primary
+            state.recording.mutations(),
+            [RecordedMutation::ChatListenerModeRequest(
+                ChatListenerMode::Secondary
+            )]
         );
-        assert_eq!(
-            state
-                .business
-                .chat_listener_snapshot()
-                .unwrap()
-                .pending_mode,
-            Some(ChatListenerMode::Secondary)
-        );
-        assert_eq!(
-            pending_task_labels(&state).expect("pending labels"),
-            vec!["切换二级监听"]
-        );
+        let tasks = state.recording.formal_tasks();
+        assert_eq!(tasks.len(), 1);
+        assert!(matches!(
+            tasks[0].kind,
+            RecordedFormalTaskKind::ListenerMode(ChatListenerMode::Secondary)
+        ));
     }
 
     fn test_state() -> HttpTestState {
-        test_state_with_search_port(HttpTestSearchPort::successful())
+        test_state_with_player_port(HttpTestPlayerPort::successful())
     }
 
-    fn test_state_with_search_port(search_port: impl PlayerSearchPort) -> HttpTestState {
-        let mut config: AppConfig =
+    fn test_state_with_player_port(player: impl HttpPlayerPort + 'static) -> HttpTestState {
+        let config: AppConfig =
             serde_yaml::from_str(include_str!("../../../config.yaml")).expect("default config");
-        let suffix = SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time")
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("mwm-http-test-{suffix}"));
-        std::fs::create_dir_all(&dir).expect("test dir");
-        config.state.queue_path = dir.join("queue.json");
-        config.state.runtime_state_path = dir.join("runtime-state.json");
-        config.song_dedup.history_path = dir.join("song-dedup.json");
-        config.turtle_soup.question_bank_path = dir.join("turtle-soup.yaml");
-
-        let queue = crate::features::playback::PersistentQueue::load(
-            config.state.queue_path.clone(),
-            config.queue.max_size,
-        )
-        .expect("queue");
-        let runtime_state = crate::features::playback::PersistentRuntimeState::load(
-            config.state.runtime_state_path.clone(),
-        )
-        .expect("runtime state");
-        let song_dedup = crate::features::playback::PersistentSongDedupHistory::load(
-            config.song_dedup.history_path.clone(),
-        )
-        .expect("song dedup");
         let monitor = MonitorShared::new(20);
-        let openai_runtime =
-            crate::runtime::openai::OpenAiRuntime::start().expect("test OpenAI runtime");
-        let openai = openai_runtime.handle();
-        let turtle_soup = TurtleSoupService::new(config.turtle_soup.clone(), openai.clone());
-        let undercover = UndercoverRuntimeService::new(config.undercover.clone());
-        let idiom_chain = crate::features::idiom_chain::IdiomChainService::from_entries_for_test(
-            &["画蛇添足", "足智多谋"],
-            None,
-        );
-        let business_runtime = crate::runtime::business::BusinessRuntime::start_with_undercover(
-            16,
-            idiom_chain,
-            CardGameService::new(LandlordConfig::default()),
-            undercover,
-            turtle_soup,
-            PlaybackService::new(
-                queue,
-                runtime_state,
-                song_dedup,
-                config.matching.clone(),
-                config.song_dedup.clone(),
-            ),
-        )
-        .expect("business runtime");
-        let business = business_runtime.handle();
-        let player_runtime_config = config.player_runtime_config().expect("player config");
-        let player_runtime = PlayerRuntime::start(
-            HttpTestObservationPort,
-            HttpTestControlPort,
-            search_port,
-            player_runtime_config,
-        )
-        .expect("player runtime");
-        let player_runtime_handle = player_runtime.handle();
-        let player_search = PlayerSearchClient::new(
-            player_runtime_handle.clone(),
-            BusinessOperationIdAllocator::new(),
-        );
-        let ai = AiClient::new(&config.ai, &config.timing, openai);
-        let custom_workflow = service_from_config_parts(
+        let custom_workflow = custom_workflow_service_from_config_parts(
             &config.custom_workflows,
-            &config.timing.workflow,
-            &config.timing.decision,
-            &config.timing.input,
+            &config.timing,
             &config.ocr,
         );
-        let test_tasks = Arc::new(TestHttpTaskPort {
-            business: business.clone(),
-        });
+        let recording = Arc::new(RecordingHttpPort::new());
         HttpTestState {
-            turtle_soup_question_bank_path: config.turtle_soup.question_bank_path.clone(),
-            test_tasks: Arc::clone(&test_tasks),
-            state: HttpSharedState::new(
+            state: HttpSharedState::new_with_ports(
                 HttpInterfaceConfig::new(
                     config.http.clone(),
                     config.screen.clone(),
@@ -4323,17 +4505,14 @@ workflows:
                     config.custom_workflows.clone(),
                 ),
                 custom_workflow,
-                test_tasks,
-                business,
+                recording.clone(),
+                recording.clone(),
                 monitor,
                 Arc::new(Mutex::new(None)),
-                player_search,
-                player_runtime_handle,
-                ai,
+                Arc::new(player),
+                Arc::new(HttpTestAiPort),
             ),
-            _player_runtime: player_runtime,
-            _openai_runtime: openai_runtime,
-            _business_runtime: business_runtime,
+            recording,
         }
     }
 }

@@ -2,11 +2,11 @@ use std::sync::atomic::Ordering as AtomicOrdering;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use super::{ApplicationRuntime, ChatDecisionScope, ResidencyPurpose, UiResidency};
+use super::{ApplicationRuntime, ChatDecisionScope};
+use crate::features::command::RoutedCommand;
 use crate::features::custom_workflow::{
     CustomWorkflowCommand, CustomWorkflowExecutionPort, CustomWorkflowInvocation,
     FreshMessageOutcome, WorkflowCapability, WorkflowConfirmation, WorkflowOperation,
-    WorkflowResidency,
 };
 use crate::features::friend_delivery::{
     FriendBatchFailure, FriendBatchFailureKind, FriendBatchOutcome, FriendMessage,
@@ -15,7 +15,6 @@ use crate::features::invite::{
     InviteDecision, InviteExecutionPort, InviteRequest, InviteStart,
     InviteUiOutcome as BusinessInviteUiOutcome,
 };
-use crate::interfaces::chat::ParsedCommand;
 use crate::ui::chat_output::fit_chat_message;
 use crate::ui::routines::{
     CustomActionPlan, ExecuteInvite, FriendDelivery, FriendDeliveryMessageStatus, InviteEffect,
@@ -33,7 +32,7 @@ impl ApplicationRuntime {
     pub(super) fn execute_custom_workflow(
         &mut self,
         command: &CustomWorkflowCommand,
-        parsed: &ParsedCommand,
+        parsed: &RoutedCommand,
     ) -> Result<()> {
         let invocation = CustomWorkflowInvocation {
             command: command.clone(),
@@ -234,6 +233,16 @@ impl ApplicationRuntime {
                     "好友消息已全部发送，但监听驻留恢复失败: {:?}",
                     outcome.residency()
                 );
+                return Ok(FriendBatchOutcome::Failed {
+                    retryable: Vec::new(),
+                    failure: FriendBatchFailure::new(
+                        FriendBatchFailureKind::ResultUnknown,
+                        format!(
+                            "好友消息已发送，但监听驻留恢复失败: {:?}",
+                            outcome.residency()
+                        ),
+                    ),
+                });
             }
             return Ok(FriendBatchOutcome::Complete);
         }
@@ -369,16 +378,6 @@ impl CustomWorkflowExecutionPort for ApplicationRuntime {
                 };
                 execution.run(self).map(|_| ())
             }
-            WorkflowCapability::EnsureResidency { target } => match target {
-                WorkflowResidency::Primary => self.establish_ui_residency(
-                    UiResidency::Primary,
-                    ResidencyPurpose::CustomWorkflowStep,
-                ),
-                WorkflowResidency::SecondaryCurrentHall => self.establish_ui_residency(
-                    UiResidency::SecondaryCurrentHall,
-                    ResidencyPurpose::CustomWorkflowStep,
-                ),
-            },
         }
     }
 }
@@ -431,16 +430,26 @@ impl InviteExecutionPort for ApplicationRuntime {
             }
             InviteNotificationOutcome::NotAttempted | InviteNotificationOutcome::Sent => None,
         };
+        let residency_failure = match outcome.residency() {
+            crate::ui::routines::UiResidencyOutcome::Confirmed(_) => None,
+            crate::ui::routines::UiResidencyOutcome::Failed(failure) => Some(failure.to_string()),
+        };
         match outcome.effect() {
             InviteEffect::Entered => {
-                if !outcome.residency_confirmed() {
+                self.on_entered_new_hall()?;
+                if residency_failure.is_none() {
+                    if let Err(error) = self.reply("BOT已经就绪,可以使用@麦克风指令了")
+                    {
+                        log::error!("邀请就绪消息发送失败: {error:#}");
+                    }
+                } else {
                     log::error!("邀请已经进入目标大厅，但未能确认最终监听驻留界面");
                 }
-                self.on_entered_new_hall()?;
-                if let Err(error) = self.reply("BOT已经就绪,可以使用@麦克风指令了") {
-                    log::error!("邀请就绪消息发送失败: {error:#}");
-                }
-                Ok(BusinessInviteUiOutcome::new(true, notification_warning))
+                Ok(BusinessInviteUiOutcome::new(
+                    true,
+                    residency_failure,
+                    notification_warning,
+                ))
             }
             InviteEffect::ResultUnknown => Err(anyhow!(
                 "邀请进入结果未知，禁止自动重试: {}",
@@ -450,10 +459,18 @@ impl InviteExecutionPort for ApplicationRuntime {
             )),
             InviteEffect::NotAttempted => {
                 let Some(failure) = outcome.failure() else {
-                    return Ok(BusinessInviteUiOutcome::new(false, notification_warning));
+                    return Ok(BusinessInviteUiOutcome::new(
+                        false,
+                        residency_failure,
+                        notification_warning,
+                    ));
                 };
                 if failure.certainty() == crate::runtime::ui::InputCertainty::ConfirmedFailure {
-                    Ok(BusinessInviteUiOutcome::new(false, notification_warning))
+                    Ok(BusinessInviteUiOutcome::new(
+                        false,
+                        residency_failure,
+                        notification_warning,
+                    ))
                 } else {
                     Err(anyhow!(failure.to_string()))
                 }

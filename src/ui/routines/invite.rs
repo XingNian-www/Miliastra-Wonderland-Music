@@ -7,6 +7,7 @@ use super::friend_delivery::{
     capture_normalized, current_ui_is_primary, locate_stable_exact_text, open_friend_conversation,
     restore_residency, send_current_chat_message, sleep_ms,
 };
+#[cfg(test)]
 use crate::config::AppConfig;
 use crate::runtime::ocr::OcrRuntimeHandle;
 use crate::runtime::ui::{
@@ -75,8 +76,8 @@ impl ExecuteInviteOutcome {
         self.failure.as_ref()
     }
 
-    pub(crate) fn residency_confirmed(&self) -> bool {
-        matches!(self.residency, UiResidencyOutcome::Confirmed(_))
+    pub(crate) fn residency(&self) -> &UiResidencyOutcome {
+        &self.residency
     }
 }
 
@@ -88,11 +89,15 @@ pub(crate) struct InviteUi {
 }
 
 impl InviteUi {
-    pub(crate) fn new(runtime: UiRuntimeHandle, ocr: OcrRuntimeHandle, config: &AppConfig) -> Self {
+    pub(crate) fn new(
+        runtime: UiRuntimeHandle,
+        ocr: OcrRuntimeHandle,
+        config: InviteRoutineConfig,
+    ) -> Self {
         Self {
             runtime,
             ocr,
-            config: InviteRoutineConfig::from_app(config),
+            config,
         }
     }
 
@@ -109,7 +114,7 @@ impl InviteUi {
 }
 
 #[derive(Clone)]
-struct InviteRoutineConfig {
+pub(crate) struct InviteRoutineConfig {
     friend: FriendDeliveryRoutineConfig,
     confirm_list_region: Rect,
     view_star: InviteButton,
@@ -125,35 +130,76 @@ struct InviteRoutineConfig {
     password_digit_ms: u64,
 }
 
+pub(crate) struct InviteRoutineConfigSource {
+    pub(crate) friend: FriendDeliveryRoutineConfig,
+    pub(crate) confirm_list_region: Rect,
+    pub(crate) view_star_template: PathBuf,
+    pub(crate) view_star_region: Rect,
+    pub(crate) goto_hall_template: PathBuf,
+    pub(crate) goto_hall_region: Rect,
+    pub(crate) enter_hall_template: PathBuf,
+    pub(crate) enter_hall_region: Rect,
+    pub(crate) template_threshold: f32,
+    pub(crate) button_timeout_ms: u64,
+    pub(crate) completion_timeout_ms: u64,
+    pub(crate) poll_ms: u64,
+    pub(crate) stable_count: u32,
+    pub(crate) click_ms: u64,
+    pub(crate) password_step_ms: u64,
+    pub(crate) password_digit_ms: u64,
+}
+
 impl InviteRoutineConfig {
-    fn from_app(config: &AppConfig) -> Self {
+    pub(crate) fn resolve(source: InviteRoutineConfigSource) -> Self {
         Self {
-            friend: FriendDeliveryRoutineConfig::from_app(config),
-            confirm_list_region: config.invite.confirm_list_region.into(),
+            friend: source.friend,
+            confirm_list_region: source.confirm_list_region,
             view_star: InviteButton {
-                path: config.templates.invite_view_star.clone(),
-                region: config.invite.view_star_region.into(),
+                path: source.view_star_template,
+                region: source.view_star_region,
                 stage: "select_wonderland_profile",
             },
             goto_hall: InviteButton {
-                path: config.templates.invite_goto_hall.clone(),
-                region: config.invite.goto_hall_region.into(),
+                path: source.goto_hall_template,
+                region: source.goto_hall_region,
                 stage: "select_friend_hall",
             },
             enter_hall: InviteButton {
-                path: config.templates.invite_enter_hall.clone(),
-                region: config.invite.enter_hall_region.into(),
+                path: source.enter_hall_template,
+                region: source.enter_hall_region,
                 stage: "enter_friend_hall",
             },
+            template_threshold: source.template_threshold,
+            button_timeout_ms: source.button_timeout_ms,
+            completion_timeout_ms: source.completion_timeout_ms,
+            poll_ms: source.poll_ms.max(10),
+            stable_count: source.stable_count,
+            click_ms: source.click_ms,
+            password_step_ms: source.password_step_ms,
+            password_digit_ms: source.password_digit_ms,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_app(config: &AppConfig) -> Self {
+        Self::resolve(InviteRoutineConfigSource {
+            friend: FriendDeliveryRoutineConfig::from_app(config),
+            confirm_list_region: config.invite.confirm_list_region.into(),
+            view_star_template: config.templates.invite_view_star.clone(),
+            view_star_region: config.invite.view_star_region.into(),
+            goto_hall_template: config.templates.invite_goto_hall.clone(),
+            goto_hall_region: config.invite.goto_hall_region.into(),
+            enter_hall_template: config.templates.invite_enter_hall.clone(),
+            enter_hall_region: config.invite.enter_hall_region.into(),
             template_threshold: config.templates.marker_threshold,
             button_timeout_ms: config.timing.workflow.default_timeout_ms,
             completion_timeout_ms: config.timing.command.ui_timeout_ms,
-            poll_ms: config.timing.workflow.default_poll_ms.max(10),
+            poll_ms: config.timing.workflow.default_poll_ms,
             stable_count: config.resolve_stability_count(config.invite.friend_name_stable_count),
             click_ms: config.timing.input.click_ms,
             password_step_ms: config.timing.invite.step_ms,
             password_digit_ms: config.timing.input.text_ms,
-        }
+        })
     }
 }
 
@@ -542,7 +588,11 @@ mod tests {
             4,
         )
         .unwrap();
-        let invite_ui = InviteUi::new(ui_runtime.handle(), ocr_runtime.handle(), &config);
+        let invite_ui = InviteUi::new(
+            ui_runtime.handle(),
+            ocr_runtime.handle(),
+            InviteRoutineConfig::from_app(&config),
+        );
 
         let outcome = invite_ui
             .submit(ExecuteInvite::new(
@@ -557,7 +607,10 @@ mod tests {
 
         assert_eq!(outcome.effect(), InviteEffect::Entered);
         assert_eq!(outcome.notification(), &InviteNotificationOutcome::Sent);
-        assert!(outcome.residency_confirmed());
+        assert!(matches!(
+            outcome.residency(),
+            UiResidencyOutcome::Confirmed(UiResidencyTarget::Primary)
+        ));
         let state = state.lock().unwrap();
         assert_eq!(state.pasted, ["已同意加入大厅"]);
         assert_eq!(

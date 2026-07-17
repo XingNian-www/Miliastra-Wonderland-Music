@@ -1,412 +1,238 @@
-# 代码梳理
+# 当前代码导航
 
-这份文档按运行路径梳理当前代码：程序如何启动、如何观察游戏聊天、如何把命令放入待执行任务队列、如何串行执行游戏操作，以及 Web 面板、点歌、审核、启动游戏和进入千星各自落在哪些模块。
+本文按运行路径说明迁移后的代码结构。更细的协议和业务流程以各专题文档及 `docs/adr/` 为准。
 
-## 一句话结构
+## 总体结构
 
-项目是一个 Windows-only Rust 单二进制程序。`main.rs` 只负责进程入口与 watchdog；`composition` 负责组合并启动各独立运行时；UI 运行时是游戏窗口输入的唯一所有者，业务运行时拥有调度和娱乐状态，HTTP/Web 面板只提交类型化任务或读取监控状态。
+项目是 Windows-only Rust 单二进制程序。入口、组合、业务、运行时、观察、UI 和适配器之间的依赖方向如下：
 
 ```mermaid
 flowchart TD
-    A["main.rs / watchdog"] --> B["miliastra_wonderland_music::run"]
-    B --> C["composition::run"]
-    C --> D["composition/application：组合协调"]
-    D --> E["聊天观察：截图 + UI检测 + OCR"]
-    D --> F["FormalScheduler：正式任务顺序"]
-    D --> G["播放器观察：状态 + 自动出队意图"]
-    D --> H["HTTP/Web：类型化意图 + 监控读取"]
-    E --> I["ParsedCommand"]
-    I --> J["PendingTask::Command"]
-    H --> J
-    G --> K["PendingTask::AdvanceQueue"]
-    J --> F
-    K --> F
+    A["main.rs / lib.rs"] --> B["composition"]
+    B --> C["interfaces：聊天 / HTTP / TUI / 热键"]
+    B --> D["features：纵向业务模块"]
+    B --> E["runtime：状态所有者与执行器"]
+    B --> F["observation：聊天观察"]
+    D --> G["窄端口"]
+    G --> H["adapters：Windows / FeelUOwn / OpenAI / 文件"]
+    D --> I["类型化 UI 请求"]
+    I --> J["单一 UiRuntime"]
 ```
 
-## 入口层
+关键所有权：
 
-`src/main.rs` 顶部用 `#[cfg(target_os = "windows")]` 把整个应用限制在 Windows。`main()` 只负责 watchdog；真正的库入口 `run()` 位于 `src/lib.rs`。
+- `BusinessRuntime` 独占正式调度器、娱乐状态、播放/大厅状态、播放队列、监听状态和延迟发送队列。
+- `FormalTaskExecutionRuntime` 独占一个 `ApplicationRuntime`，顺序执行应用服务。
+- `UiRuntime` 独占游戏输入设备。
+- `OcrRuntime` 独占 OCR 引擎。
+- `PlayerRuntime` 独占播放器连接与 I/O。
+- `OpenAiRuntime` 执行统一 OpenAI 协议请求。
 
-`run()` 做两类事情：
+## 入口与组合
 
-- 程序启动后固定进入常驻自动化模式。
-- 不再提供命令行子命令；OCR、模板匹配和手动输入等诊断能力统一由 `/tools` Web 高级控制页提供。
+`src/main.rs` 负责 watchdog，子进程调用 `src/lib.rs::run()`。`src/composition.rs`：
 
-常驻模式由 `main()` 通过 `MILIASTRA_WATCHDOG_CHILD=1` 环境变量区分父子进程；子进程调用 `lib::run()`，父进程在异常退出后按配置延迟重启。真正的业务组合入口是 `composition::run()`，并固定读取工作目录中的 `config.yaml`。
+1. 从工作目录读取 `config.yaml`。
+2. 完整反序列化并执行根配置和各 feature 的 fail-fast 校验。
+3. 加载播放状态、大厅状态、播放队列、去重历史和词库等持久数据。
+4. 构造 Windows、文件、播放器、AI、OCR 与 UI 适配器。
+5. 按依赖顺序启动各 runtime、HTTP/TUI/热键和观察循环。
+6. 关闭时有序停止线程并保存持久状态。
 
-`composition::run()` 负责：
+组合层可以连接端口，但不能重新实现 feature 规则。
 
-- 读取并校验当前版本的 `config.yaml`。
-- 启动 TUI 或普通日志。
-- 初始化运行状态 `PersistentRuntimeState`、点歌队列 `PersistentQueue` 和长时间同歌去重历史 `PersistentSongDedupHistory`。
-- 创建并校验组合配置。
-- 启动 `composition::application::ApplicationRuntime`，由它协调运行时生命周期。
+## 配置
 
-## 配置层
+`src/config/mod.rs` 聚合共享配置和 feature 自有配置。配置只接受当前结构，不迁移旧字段；未知字段、空必填值、零超时、非法阈值、无效区域和不支持的工作流步骤在启动线程前失败。
 
-`src/config/mod.rs` 是配置结构的中心。`AppConfig` 聚合所有配置分组：
+UI/OCR 构造器接收经过解析的窄配置，而不是在执行期间读取完整 `AppConfig`。测试中的 `from_app` 辅助方法仅用于构造 fixture。
 
-更完整的配置加载、日志分流和监控快照说明见 `docs/config-observability-flow.md`。
+持久状态路径明确分开：
 
-- `window`：目标进程、窗口尺寸、安全聚焦点。
-- `screen`：聊天区、好友按钮模板区、大厅 OCR 区域等固定坐标。
-- `timing`：按领域分组的延迟和超时。
-- `ocr`：OCR 模型、后端优先级、聊天块切分参数。
-- `templates`：聊天标记、好友按钮、邀请/管理按钮模板。
-- `output`：游戏内发言点击点。
-- `feeluown`：播放器 RPC 地址。
-- `http` / `tui` / `logging`：监控和日志外壳。
-- `state` / `queue`：持久状态和音乐播放队列。
-- `song_dedup`：长时间同歌去重窗口、允许次数、控制台豁免和历史路径。
-- `idiom_chain`：成语接龙词库、历史和超时。
-- `undercover`：谁是卧底开关、词库、永久使用记录、人数和阶段计时。
-- `turtle_soup`：海龟汤题库、永久使用记录、昵称与正文 OCR 稳定次数、批量答案段数、AI 并发、超时和独立 Provider。
-- `ai`：点歌 AI Provider。
-- `song_review`：候选歌曲审核 Provider。
-- `startup`：启动游戏和进入千星配置。
-- `custom_workflows`：自定义工作流配置。
+- `state.playback_state_path`
+- `state.hall_state_path`
+- `queue.path`
+- 各娱乐模块自己的历史或永久使用记录路径
 
-配置只接受当前 `AppConfig` 结构。启动时会读取工作目录的 `config.yaml`，拒绝必填字段缺失、未知或类型不匹配的字段；显式默认字段按当前代码处理，不会自动改写用户文件。
+HTTP `/state` 会把多个内部状态投影组合成兼容的外部 JSON，但内部不再让 Hall 状态寄生于 Playback。
 
-## 主对象 ApplicationRuntime
+## 命令模型
 
-`src/composition/application.rs` 及其 `application/` 子模块是组合层协调器。主文件负责对象组装；`workers.rs` 管理后台线程，`listener.rs` 管理一级监听，`secondary_chat.rs` 管理二级聊天与确认读取。它们只连接运行时和纵向执行端口，不把业务状态放在共享锁里。它持有：
+命令类型位于 `src/features/command.rs`：
 
-- 各运行时的拥有者句柄和组合配置。
-- 播放器控制器、当前 FeelUOwn 后端、点歌 AI 客户端、候选歌曲审核客户端。
-- 游戏聊天输出器。
-- 共享 OCR 引擎。
-- 命令屏幕锁、待执行任务队列、窗口检测重置信号。
-- 业务运行时句柄、正式/延迟/诊断调度端口；成语接龙、牌类、谁是卧底和海龟汤状态由业务运行时线程串行拥有。
-- 热键暂停/退出状态、命令执行状态、点歌执行状态。
-- TUI/Web 监控共享状态。
+- `CommandEnvelope`：原文、命令正文、昵称、来源、前缀、权限和观察身份。
+- `ModuleCommand`：只按模块分支的小型顶层枚举，每个变体包装模块自己的命令类型。
+- `RoutedCommand`：命令信封元数据加已解析模块命令。
 
-组合协调器按依赖顺序启动：
+聊天入口位于 `src/interfaces/chat.rs`，静态路由器位于 `src/interfaces/chat/router.rs`：
 
-- HTTP/Web 面板。
-- 热键监听。
-- 业务运行时，以及在其外部运行、通过完成事件回传裁决结果的海龟汤 AI Worker。
-- 命令执行线程。
-- 延迟聊天发送线程。
-- 启动配置任务入队。
-- 播放监控线程。
-- 主扫描循环。
+```text
+聊天观察
+→ parse_command_envelope
+→ ChatCommandRouter 选择唯一 feature
+→ feature::claims_chat / parse_chat
+→ RoutedCommand
+```
 
-延迟聊天发送线程会在正式任务空闲时处理普通娱乐回复和海龟汤分段批次。普通回复仍逐条发送；海龟汤会把全部剩余分段交给独占批量接口，复用一次聊天打开和输入初始化。批次开始后不会被新到达的正式任务打断；发送失败仍返回精确的已发送数量，并只从第一条未发送消息重试，因此不会重复已经发出的汤面或汤底。
+中央聊天层不解析所有业务参数。点歌、播放、大厅、管理、邀请、自定义工作流和娱乐玩法分别拥有自己的语法。
 
-斗地主和跑得快的期限由业务计时运行时发出；扫描循环只同步暂停/执行期间的活动时钟并取出已经形成的牌局效果，不在自身线程推进牌局计时。海龟汤 AI worker 只调用模型并回传带会话代数的完成事件，业务线程负责应用裁决和投递消息。
+HTTP 不拼接伪聊天文本。远程播放和点歌构造 `ConsoleCommandIntent`；其他路由调用各自的类型化任务、查询或业务变更端口。
 
-退出时保存音乐播放队列和运行状态。
+## 聊天观察
 
-## 主扫描循环
+一级和二级聊天观察位于：
 
-聊天观察循环目前由组合层协调器驱动，核心观察能力位于 `src/observation/chat/`，UI/OCR 所有权分别位于 `src/runtime/ui.rs` 和 `src/runtime/ocr.rs`。
+- `src/composition/application/listener.rs`
+- `src/composition/application/secondary_chat.rs`
+- `src/observation/chat/`
 
-更完整的截图、UI 检测、聊天区变化指纹、OCR 切块和性能日志说明见 `docs/ocr-ui-detection-flow.md`。
+一级路径使用聊天区变化摘要、debounce 和 fallback 触发 OCR。`prepare_chat_scan()` 先做模板切块，`recognize_prepared_chat()` 再向共享 OCR runtime 提交识别。
 
-它每轮做：
+二级路径使用未读红点、最新气泡身份和受控好友会话事务。它直接用结构化昵称、消息来源和正文创建 `CommandEnvelope`，不再格式化成伪聊天行再解析。
 
-1. 截取目标游戏窗口。
-2. 检测当前 UI 状态。
-3. 只有处于一级聊天界面时，才对聊天区域做变化检测。
-4. 如果聊天区域像素变化超过阈值，等待 debounce 后重新截图并 OCR。
-5. 如果长时间无变化，按 fallback 间隔做兜底 OCR。
-6. OCR 到的聊天消息交给 `handle_scan_messages()`。
-7. 当前大厅正文以 `#` 开头时，先分别等待昵称与正文连续 OCR 一致，再使用独立屏幕锁去重；普通问题直接投递海龟汤 AI 队列，`##编号内容` 暂存并短回复确认，`##提交` 校验并合并为一个问题后再投递。二级监听未确认稳定前不会推进新增气泡基线。
+`CommandObservation` 保存帧号、捕获时间和消息身份。`CommandLockState` 只防止仍在画面中的同语义命令重复入队；它不是业务互斥锁。
 
-窗口丢失时不会忙等，而是按退避时间重试，同时中止旧大厅的娱乐会话。启动游戏任务、进入千星任务等会通过 `WindowDetectionSignal` 重置退避，让刚启动的窗口能更快被重新检测。
+## 模板与 OCR 关联
 
-## 聊天扫描
+模板检测和 OCR 是两种观察能力：
 
-`src/observation/chat/scan.rs` 把聊天扫描拆成两段：
+- `src/ui/template.rs` 负责彩色/灰度模板匹配及模板缓存。
+- `src/ui/state.rs` 使用可靠锚点判断一级、二级和未知界面。
+- `src/runtime/ocr/batch.rs` 用调用方 ID 保持拼接 OCR block 与结果的稳定关联。
+- `src/runtime/ocr/engine.rs` 拥有 Paddle OCR 模型与后端选择。
 
-更完整的 OCR 和 UI 检测性能链路见 `docs/ocr-ui-detection-flow.md`；更完整的聊天消息到命令入队链路见 `docs/chat-command-ingestion.md`。
+当前真实 1920×1080 fixture `tests/fixtures/ui/secondary-chat-scrolled-1920x1080.jpg` 覆盖：
 
-- `prepare_chat_scan()`：裁剪聊天区、匹配蓝/黄/粉聊天标记、按标记切出每条消息的 OCR block。
-- `recognize_prepared_chat()`：对每个 block 做 OCR，并生成 `ChatMessage`。
+- 好友列表滚动后大厅行消失，但左上返回模板仍能判定二级界面；
+- 标题和严格好友列表区域的真实 OCR；
+- 批量 OCR 后标题/好友行 ID 不串位；
+- 严格区域内唯一好友行连续稳定定位；
+- 标题优先确认、聊天内容区完整昵称兜底，以及缺失好友在真实画面上的有界滚动停止。
 
-聊天标记模板使用彩色 SAD 匹配，消息文本走 OCR。`batch_recognize` 可以把多个块批量识别，但当前实际性能上不一定更快。
+坐标只用于项目规定的 1920×1080 逻辑画布；测试不会把比例错误的历史截图当成分辨率依据。
 
-扫描结果会同时写：
+## 正式任务
 
-- `chat_scan_result` 日志：只保留扫描结果。
-- `timing` 日志：记录 crop、marker、block、ocr 等阶段耗时。
-- `MonitorShared`：供 TUI/Web 面板显示最新 OCR 内容。
+`src/runtime/business.rs` 中的 `FormalScheduler` 负责排序、去重、活动车道、取消和历史。组合层通过 `FormalTaskClient` 提交私有 `PendingTask`：
 
-## 命令解析和屏幕锁
+- feature 命令
+- 自动出队
+- 控制台发言
+- 启动任务
+- 管理投票结果
+- 监听模式/二级未读事务
+- 牌局和谁是卧底效果
 
-`src/interfaces/chat.rs` 定义命令领域模型：
+正式任务的执行路径见 `docs/executor-flow.md`。重要边界是：正式任务负责业务顺序，但真正游戏输入仍必须提交给 `UiRuntime`。
 
-更完整的聊天扫描、命令屏幕锁和入队过滤链路见 `docs/chat-command-ingestion.md`。
+## UI runtime
 
-更完整的命令模型、同语义比较、启动屏幕锁和确认屏幕锁说明见 `docs/command-model-locks.md`。
+`src/runtime/ui.rs` 定义密封 `UiRoutine`、类型化 `UiOperation`、进度事件和输入确定性。只有 runtime 内的 `UiRoutineContext` 能取得 `UiDevice`。
 
-- `ParsedCommand`：OCR 文本解析后的统一命令。
-- `BusinessIntent`：点歌、暂停、下一首、队列、邀请、拉黑/屏蔽、麦克风、娱乐和自定义工作流等业务命令。
-- `CommandLockState`：屏幕锁。
+业务级例程位于 `src/ui/routines/`：
 
-命令来源：
+- `hall.rs`：大厅发送、批量发送、驻留和麦克风。
+- `friend_delivery.rs`：唯一好友识别、目标验证、投递与驻留恢复。
+- `secondary_unread.rs`：未读好友处理。
+- `invite.rs`：邀请事务。
+- `moderation.rs`：管理事务。
+- `startup.rs`：启动与进入千星事务。
+- `custom_action.rs`：自定义工作流机械动作计划。
 
-- 蓝色聊天：大厅内普通命令。
-- 粉色聊天：好友私聊命令。
-- 控制台：Web 面板构造的远程命令。
+`src/ui/atoms.rs::GameUi` 是兼容观察/简单操作的门面，其生产实现同样把每次操作提交给 UI runtime；它不是第二个输入所有者。`src/ui/locator.rs` 目前只保留无 I/O 的大厅信息解析与区域计算。
 
-屏幕锁的目标是防止同一条还停留在游戏屏幕上的命令被重复执行。它按命令语义生成 lock key，而不是简单按 OCR 原文。比如 `@点歌` 和 `@AI点歌` 在合适情况下共享点歌互斥语义。
+## 好友投递和邀请
 
-主扫描循环只负责把解析出的命令交给 `CommandLockState`。普通命令和谁是卧底命令通过屏幕锁后进入待执行任务队列；成语接龙和海龟汤命令通常直接进入娱乐模块，只有需要稳定批量发送来源和解释的 `#解释` 会进入正式任务队列。海龟汤的普通 `#问题` 不构造 `ParsedCommand`，精确的 `#状态/#结束` 则先按控制命令处理。谁是卧底发词内容和私聊投票会在日志与监控 OCR 中隐藏，公屏描述只记录完成状态，不隐藏玩家原本可见的正文。
+好友投递使用一个完整 `SendFriendDeliveries` 事务：
 
-## 待执行任务队列
+1. 识别或打开二级聊天。
+2. 优先校验标题，未命中才 OCR 严格好友列表区域。
+3. 唯一命中后点击目标行。
+4. 再用标题或聊天内容验证目标，避免点击自己或错误会话。
+5. 发送消息并恢复请求指定的监听驻留。
 
-正式任务队列由 `src/runtime/business.rs` 内的 `FormalScheduler` 拥有，组合层通过 `FormalTaskClient` 提交 `PendingTask` 工作项。它不是音乐播放队列，也不由 HTTP 直接持有。
+邀请模块先由 `InviteService` 处理公共大厅判断和成员决策，再提交 `ExecuteInvite`。邀请结果、好友通知结果和最终驻留分别报告；已确认进入新大厅后不得因收尾失败重放。
 
-`PendingTask` 包括：
+## 娱乐模块
 
-- `Command`：游戏内或控制台业务命令。
-- `AdvanceQueue`：自动出队。
-- `ConsoleChat`：Web 面板发出的控制台发言。
-- `StartGame`：启动游戏任务。
-- `EnterWonderland`：进入千星任务。
-- `ModerationVoteResult`：后台投票结束后的管理动作。
-- `UndercoverEffect`：谁是卧底命令或计时触发的阶段公告、私聊和结算效果。
+成语接龙、斗地主/跑得快、谁是卧底和海龟汤均为纵向模块，状态由 `BusinessRuntime` 串行拥有，并通过共享娱乐协调器互斥。
 
-正式任务执行线程一次只取一个任务执行。所有会操作游戏窗口的高层业务都经过 UI 例程和正式调度边界，避免多个流程同时点击、按键、粘贴；业务等待不占用 UI 所有权。
+- 即时聊天输入只更新业务状态或产生效果，不直接操作 UI。
+- 短回复进入 `DeferredChatQueue`。
+- 牌局与谁是卧底的阶段效果进入正式任务。
+- 海龟汤 AI worker 只调用模型并回传带会话代数的结果；业务 runtime 决定是否仍可应用。
+- 娱乐期限使用共享 `Clock`/deadline 语义，测试通过 `ManualClock` 推进，不依赖真实睡眠。
 
-普通命令开始时只激活并聚焦游戏窗口，不再统一返回一级。每个动作阶段声明自己的目标界面：大厅 OCR、麦克风和管理面板要求一级；大厅回复要求当前监听驻留界面；好友回复要求二级好友会话。任务真正结束后再校验并恢复当前监听模式的驻留目标。
+## 播放器与点歌
 
-`prepare_command_ui()` 现在只是“确保一级界面”的状态转换，由确实依赖一级布局的动作调用。目标窗口不可用时立即中止当前业务，不继续按 `Esc` 或发送其他输入。
+`src/runtime/player.rs` 和 `src/runtime/player_io.rs` 拥有播放器 I/O 调度；`src/adapters/feeluown.rs` 实现 TCP RPC；`src/adapters/player.rs` 提供窄适配边界。
 
-## 播放监控和自动出队
+`src/features/playback/` 拥有：
 
-播放监控线程在 `run_playback_monitor_loop()`。
+- `PlaybackApplication`：播放业务用例。
+- `PlayerController`：稳定 URI 观察、播放确认和暂停原因。
+- `PersistentQueue`：待播放歌曲。
+- `PersistentPlaybackState`：确认播放状态。
+- 去重、匹配和格式化规则。
 
-更完整的音乐播放队列、播放器控制器、临近结束暂停和自动出队链路见 `docs/playback-queue-flow.md`。
+`src/features/hall/state.rs` 独立拥有大厅名称与剩余时间状态。
 
-它定期查询播放器状态，并调用 `PlayerController::maybe_advance_queue()`。核心策略：
+点歌由 `src/features/song_request/application.rs::SongRequestApplication` 执行：候选搜索、确认、AI 选择、审核、去重、入队或直接播放都通过窄端口完成。播放成功的唯一稳定身份是非空 URI 精确一致；歌名、歌手或 AI 判断不能替代 URI。
 
-- 如果用户主动暂停，则不自动处理。
-- 如果当前歌曲即将结束且有待执行点歌或队列，先暂停播放，避免当前歌结束后播放器自己继续。
-- 如果队列非空且没有命令正在执行，把 `PendingTask::AdvanceQueue` 放入待执行任务队列。
-- 如果之前因为待执行播放而暂停，但后来没有任务了，只有暂停原因仍是系统等待队列时才恢复播放。
+## OpenAI 能力
 
-自动出队真正播放前仍会检查长时间同歌去重。近期已播放过的队首会被移除并在大厅回复“已跳过”，然后继续尝试下一项。
+所有 AI 调用通过 `OpenAiRuntime` 和标准 OpenAI 请求格式：
 
-自动出队最终仍由命令执行线程执行 `consume_queue()`，不是播放监控线程直接播放。
+- 点歌 AI 使用 Chat Completions。
+- 歌曲审核使用 Responses API 与官方 `web_search` 工具。
+- 海龟汤使用独立 Provider 配置。
+- 云崽插件也使用 OpenAI 标准字段。
 
-## 点歌流程
+代码生成的官方字段优先；第三方私有字段只能通过显式 `extra_body` 兼容。密钥只从配置读取，不能写入源码、测试 fixture 或提交历史。
 
-点歌命令进入 `execute_command()` 的 `BusinessIntent::SongRequest` 分支。
+## HTTP 和监控
 
-更完整的端到端链路见 `docs/song-request-flow.md`。
+`src/interfaces/http/mod.rs` 是协议适配器。它依赖窄端口：
 
-流程是：
+- `HttpTaskPort`：任务、取消和决策。
+- `HttpQueryPort`：业务快照。
+- `HttpPlayerPort`：播放器查询/调试。
+- `HttpAiPort`：AI 调试能力。
 
-1. `resolve_song_request()` 解析普通点歌或 AI 点歌。
-2. `resolve_and_confirm_song()` 搜索候选，需要时向聊天发确认提示。
-3. 得到最终候选歌曲和 URI 后，执行候选歌曲审核。
-4. 控制台来源最高权限免审；游戏内大厅和好友私聊会审核。
-5. 检查队列重复和当前播放状态。
-6. 如果队列已有歌、当前歌受保护、状态未知或即将结束，则入音乐播放队列。
-7. 否则直接播放。
+HTTP 测试使用记录型窄端口，验证鉴权、方法、参数、外部 JSON 和类型化提交，不启动真实业务、播放器或 OpenAI runtime。
 
-`ResolvedSongRequest` 是执行前的统一候选歌曲结构，包含 keyword、source、uri、是否伴奏、AI 原始文本、好友来源等。
+`src/runtime/monitor.rs` 汇总日志、OCR、调度、播放和程序状态供 TUI/Web 读取。HTTP 协议尽量保持兼容，但内部类型、旧配置和旧命令实现不作为兼容面。
 
-## 候选歌曲审核
+## 持久化
 
-`src/features/song_request/review.rs` 是独立的审核 Provider。
+持久数据由 feature 自己拥有结构，由文件适配器执行原子写入：
 
-更完整的 AI 点歌、同曲判断和候选歌曲审核链路见 `docs/ai-song-review-flow.md`。
+- 播放队列和播放状态
+- 大厅状态
+- 长时间同歌去重历史
+- 成语历史
+- 谁是卧底永久词组使用记录
+- 海龟汤永久题目使用记录
 
-它审核的是最终候选歌曲，不审核原始点歌意图。请求内容包括：
+海龟汤和谁是卧底的活动会话不跨进程恢复，永久排除记录会保留。
 
-- 音源。
-- 歌名。
-- 歌手。
-- URI。
-- 消息类型。
-- 用户名。
+## 失败语义
 
-审核模型必须返回 JSON，包含 1-10 的 `level`、`reason` 和 `tags`。程序用本地 `max_allowed_level` 判断是否通过。
+外部动作不能只用 `Result<()>` 表示全部事实。UI 结果区分：
 
-审核失败会按 `retry_count` 重试；仍失败后按 `failure_policy` 决定拒绝或放行。放行会写警告日志。
+- 输入前失败；
+- 已确认没有生效；
+- 输入后结果未知；
+- 业务效果已发生但最终驻留恢复失败。
 
-## FeelUOwn 和点歌 AI
+只有确认未执行的动作才可能按配置重试。结果未知、已发送、已邀请进入或已应用管理动作都禁止自动重放。
 
-`src/adapters/feeluown.rs` 封装 FeelUOwn TCP RPC：
+## 当前主边界
 
-更完整的点歌 AI Provider、远程 AI 点歌和 Web AI 调试接口说明见 `docs/ai-song-review-flow.md`。
-
-- 播放 URI、暂停、上一首、下一首、音量。
-- 查询播放状态。
-- 搜索候选，并按当前后端规则挑选候选。
-
-`src/features/playback/controller.rs` 包装当前 FeelUOwn 后端，负责确认播放状态、活动播放请求、暂停原因、播放确认和队列推进决策。点歌流程不再直接把一次 FeelUOwn 状态读取当作业务事实。
-
-`src/features/song_request/ai.rs` 是点歌 AI Provider：
-
-- 判断当前播放是否和请求相同。
-- 从候选列表里选择最符合原始点歌意图的 URI。
-- 给 Web 面板提供 AI 测试路由。
-
-审核 AI 和点歌 AI 是两套配置，避免把点歌推荐和内容风控绑死。
-
-## 聊天输出和输入安全
-
-`src/ui/chat_output.rs` 负责游戏内回复。它会：
-
-- 限制聊天消息长度。
-- 为海龟汤汤面和汤底按实际显示宽度生成完整编号分段，不截断原文。
-- 用 Enter 打开聊天。
-- 点击配置的聊天输入点。
-- 粘贴或逐字输入文本。
-- 发送后关闭聊天。
-
-`src/adapters/windows/input.rs` 是底层输入包装：
-
-- 点击游戏点。
-- 激活游戏窗口。
-- 聚焦游戏窗口。
-- 粘贴文本。
-- 按键。
-
-`src/adapters/windows/window.rs` 是 Windows 窗口边界：
-
-- 按目标进程找游戏窗口。
-- 把 1920x1080 逻辑坐标映射到实际客户区。
-- 截图客户区。
-- 激活窗口，并用 `AttachThreadInput` 兜底提高拿焦点成功率。
-- 点击前校验目标点确实属于游戏窗口。
-- 按键/粘贴前校验前台窗口属于目标进程。
-- 用 `TargetWindowUnavailable` 表达“目标窗口不可用”的可分类错误。
-
-`src/adapters/windows/clipboard.rs` 实现文本剪贴板临时占用：写入文本前读取原文本，粘贴结束后尽量恢复；如果原来没有文本则清空。
-
-## 原子动作和自定义工作流
-
-`src/ui/atoms.rs` 是原子动作层：
-
-更完整的 UI 自动化层说明见 `docs/ui-automation-atoms.md`。
-自定义工作流、邀请、好友反馈和管理投票的业务层说明见 `docs/custom-workflow-moderation-flow.md`。
-
-- `wait`
-- `press_key_text`
-- `activate`
-- `focus`
-- `click_point`
-- `paste`
-- `wait_pixels_stable`
-- `wait_or_click_template`
-- `wait_or_click_text`
-
-原子动作只做机械操作和耗时日志，不承载业务含义。
-
-`src/features/custom_workflow.rs` 把配置里的工作流步骤映射到原子动作。它还承载几个内建业务流程：
-
-- 邀请用户。
-- 好友消息反馈。
-- 拉黑/屏蔽投票与执行。
-
-邀请流程会先判断是否公共大厅；非公共大厅会在大厅聊天里发起确认/拒绝提示，再根据结果给好友发反馈。
-
-管理流程会先发起投票，后台线程只等待投票结果，真正的 UI 操作结果仍回到待执行任务队列处理。
-
-## 启动游戏任务
-
-`src/features/startup.rs` 是启动游戏任务状态机：
-
-更完整的启动和进入千星状态机见 `docs/startup-wonderland-flow.md`。
-
-1. `EnsureGameWindow`：查找游戏窗口；找不到且允许启动时启动配置的 exe。
-2. `FocusGameWindow`：聚焦游戏。
-3. `ClickEnterGameText`：在配置区域 OCR “点击进入”，点击文本框中心。
-4. `WaitEnterGameTextGone`：如果文字仍存在就继续点击，直到文字消失。
-5. `WaitPaimonMenuTemplate`：等待派蒙菜单模板出现，认为开门完成。
-
-启动路径优先使用 `startup.exe_path`；如果为空，会尝试从官服/国际服启动器注册表里找安装路径。窗口和候选 exe 同时考虑 `YuanShen.exe` 与 `GenshinImpact.exe`。
-
-## 进入千星任务
-
-`src/ui/routines/startup.rs` 是进入千星任务状态机：
-
-1. `OpenWonderlandHome`：按阶段重试配置按 F6，等待右上角千星关闭按钮模板稳定出现。
-2. `ClickWonderlandCard`：按阶段重试配置点击千星卡片点，在 `(1400,850,360,150)` 快速匹配“前往大厅”按钮后只点击一次。
-3. `WaitConfirmGone`：继续快速轮询同一区域；模板消失且区域像素稳定后认为进入千星。
-
-任务成功后由调用方执行返回一级界面。它不会清空后续待执行任务；返回一级后队列继续执行。
-
-## Web 面板
-
-`src/interfaces/http/mod.rs` 启动一个 axum HTTP 服务，`page.html` 内嵌为静态页面。
-
-更完整的 Web 面板、HTTP API 和监控状态说明见 `docs/web-monitor-api.md`。
-
-路由集中在 `ROUTES` 表里，每个路由标记：
-
-- 是否 JSON 响应。
-- 是否 mutating，mutating 路由必须用 POST。
-- handler 函数。
-
-重要边界：
-
-- `/play`、`/pause`、`/skip-next`、`/skip-prev`、`/volume` 会构造控制台命令进入待执行任务队列。
-- `/searchPlay`、`/searchSource`、`/ai/search` 会构造控制台点歌命令进入待执行任务队列。
-- `/chat/send` 通过 HTTP 的 `HttpTaskPort` 提交控制台发言意图，最终在游戏聊天里发送文本；默认带 `[控制台]: ` 前缀，控制面板可以关闭或自定义前缀。
-- `/startup/game` 入队启动游戏任务。
-- `/startup/enter-wonderland` 入队进入千星任务。
-- `/startup/wonderland` 按顺序入队启动游戏任务和进入千星任务。
-- `/queue/add` 是控制台最高权限直接写音乐播放队列，不走审核。
-- `/monitor` 读取 `MonitorShared`。
-- `/turtle-soup/start` 和 `/turtle-soup/end` 向业务运行时提交类型化意图；实际游戏回复仍等待延迟发送线程。
-- `/screenshot` 手动截一次游戏图并返回 JPEG，不常驻推流。
-
-HTTP 层只负责验证参数、入队或读取状态。除少数只读/播放器调试接口外，不应该直接做游戏窗口输入。
-
-## UI 检测和模板匹配
-
-`src/ui/state.rs` 根据模板和聊天标记判断当前界面状态，例如一级聊天界面、二级大厅、未知界面。
-
-更完整的 UI 状态检测顺序、模板匹配缓存和耗时日志说明见 `docs/ocr-ui-detection-flow.md`。
-
-`src/ui/template.rs` 提供两类模板匹配：
-
-- 彩色 SAD 匹配，用于聊天标记等彩色小模板。
-- 灰度 SAD 匹配，用于小区域 best hit，并缓存灰度模板，避免反复初始化重型匹配器。
-
-`src/ui/locator.rs` 把截图、区域裁剪、模板等待、OCR 文本点击、像素稳定等待封成可复用定位器。启动游戏、进入千星和自定义工作流都复用它。
-
-## 持久化和监控
-
-`src/features/playback/queue.rs` 持久化音乐播放队列，写入时使用临时文件替换。
-
-`src/features/turtle_soup/repository.rs` 把选中的题目 ID 原子写入独立使用记录。正式题库只读，会话不持久化，程序重启不会续局。
-
-更完整的配置加载、运行日志、性能日志、TUI 和 Web 监控外壳见 `docs/config-observability-flow.md`。
-调试子命令、热键、图像坐标支撑、OCR 底层、Monitor、TUI 和持久化小模块见 `docs/supporting-runtime-modules.md`。
-
-`src/features/playback/state.rs` 持久化运行状态：
-
-- `playback.state`：确认播放状态。
-- `playback.pauseReason`：暂停原因。
-- `playback.activeRequest`：当前确认中的活动播放请求。
-- `playback.lastObservation`：最近一次播放器观测和可靠性。
-- 大厅剩余时间缓存。
-
-`src/runtime/monitor.rs` 是 TUI/Web 共用的内存快照：
-
-- 最近日志。
-- 最新 OCR 扫描摘要。
-- 当前音乐播放队列。
-- 最近执行命令。
-- 程序状态。
-- 播放器控制器快照。
-
-`src/interfaces/tui.rs` 从 `MonitorShared` 渲染本地终端面板；Web 面板通过 `/monitor` 渲染远程监控。
-
-## 当前主设计边界
-
-- 聊天扫描和业务执行分离：主线程只观察和入队，命令执行线程才操作游戏。
-- 待执行任务队列和音乐播放队列分离：一个是业务任务，一个是歌曲列表。
-- 控制台是最高权限来源：仍进主业务队列和点歌互斥，但无视候选歌曲审核。
-- 播放器后端状态只是观测：播放确认、暂停原因和队列推进都通过播放器控制器收敛。
-- 原子动作不自动聚焦：业务流程负责聚焦前置条件，原子动作负责机械操作和校验。
-- 点击前做归属校验，按键/粘贴前做前台校验。
-- 启动游戏任务和进入千星任务拆分；组合 API 只负责顺序入队。
+- feature 拥有语法、规则和状态转换；组合层只连接端口。
+- HTTP 和聊天是适配器，不实现业务规则。
+- `BusinessRuntime` 是业务状态唯一所有者。
+- `FormalTaskExecutionRuntime` 是应用服务顺序执行边界。
+- `UiRuntime` 是游戏输入唯一所有者。
+- `OcrRuntime`、`PlayerRuntime` 和 `OpenAiRuntime` 分别拥有重型或外部 I/O 能力。
+- 内部旧配置和旧命令不兼容；对外 HTTP 契约通过协议测试维持。

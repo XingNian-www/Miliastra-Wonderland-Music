@@ -7,7 +7,7 @@ use image::DynamicImage;
 use ocr_rs::{Backend, DetOptions, OcrEngine, OcrEngineConfig};
 use serde::Serialize;
 
-use crate::config::AppConfig;
+use crate::config::OcrConfig;
 use crate::ui::geometry::Rect;
 
 #[derive(Clone, Debug, Default)]
@@ -36,32 +36,32 @@ pub(crate) struct ResolvedOcrArgs {
 }
 
 impl OcrArgs {
-    pub(crate) fn resolve(&self, config: &AppConfig) -> ResolvedOcrArgs {
+    pub(crate) fn resolve(&self, config: &OcrConfig) -> ResolvedOcrArgs {
         ResolvedOcrArgs {
             det_model: self
                 .det_model
                 .clone()
-                .unwrap_or_else(|| config.ocr.det_model.clone()),
+                .unwrap_or_else(|| config.det_model.clone()),
             rec_model: self
                 .rec_model
                 .clone()
-                .unwrap_or_else(|| config.ocr.rec_model.clone()),
+                .unwrap_or_else(|| config.rec_model.clone()),
             charset: self
                 .charset
                 .clone()
-                .unwrap_or_else(|| config.ocr.charset.clone()),
-            min_confidence: self.min_confidence.unwrap_or(config.ocr.min_confidence),
-            threads: self.threads.unwrap_or(config.ocr.threads),
+                .unwrap_or_else(|| config.charset.clone()),
+            min_confidence: self.min_confidence.unwrap_or(config.min_confidence),
+            threads: self.threads.unwrap_or(config.threads),
             backend_priority: self
                 .backend_priority
                 .clone()
                 .filter(|backends| !backends.is_empty())
-                .unwrap_or_else(|| config.ocr.backend_priority.clone()),
-            det_max_side_len: config.ocr.det_max_side_len,
-            det_score_threshold: config.ocr.det_score_threshold,
-            det_unclip_ratio: config.ocr.det_unclip_ratio,
-            det_min_area: config.ocr.det_min_area,
-            det_box_border: config.ocr.det_box_border,
+                .unwrap_or_else(|| config.backend_priority.clone()),
+            det_max_side_len: config.det_max_side_len,
+            det_score_threshold: config.det_score_threshold,
+            det_unclip_ratio: config.det_unclip_ratio,
+            det_min_area: config.det_min_area,
+            det_box_border: config.det_box_border,
         }
     }
 }
@@ -422,7 +422,11 @@ fn elapsed_ms(started: Instant) -> u128 {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
+    use crate::config::AppConfig;
+    use crate::observation::chat::SECONDARY_TITLE_RECT;
 
     fn backend_values(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()
@@ -445,6 +449,43 @@ mod tests {
                 OcrBackendChoice::OpenCl,
                 OcrBackendChoice::Cpu
             ]
+        );
+    }
+
+    #[test]
+    fn fixed_secondary_chat_fixture_recognizes_title_and_strict_friend_list() {
+        let config = AppConfig::load(Path::new("config.yaml")).expect("load default config");
+        let args = OcrArgs::default().resolve(&config.ocr);
+        let engine = make_ocr_engine(&args).expect("initialize OCR engine");
+        let image = image::open("tests/fixtures/ui/secondary-chat-scrolled-1920x1080.jpg")
+            .expect("open fixed secondary-chat screenshot");
+
+        let title = image.crop_imm(
+            SECONDARY_TITLE_RECT.x as u32,
+            SECONDARY_TITLE_RECT.y as u32,
+            SECONDARY_TITLE_RECT.width,
+            SECONDARY_TITLE_RECT.height,
+        );
+        let title = merge_ocr_lines(
+            recognize_lines(&engine, &title).expect("recognize title"),
+            12,
+        );
+        assert!(title.contains("香菜"), "unexpected title OCR: {title}");
+
+        let friend_rect: Rect = config.invite.friend_list_region.into();
+        let friend_list = image.crop_imm(
+            friend_rect.x as u32,
+            friend_rect.y as u32,
+            friend_rect.width,
+            friend_rect.height,
+        );
+        let friend_text = merge_ocr_lines(
+            recognize_lines(&engine, &friend_list).expect("recognize friend list"),
+            12,
+        );
+        assert!(
+            friend_text.contains("破鹿子") && friend_text.contains("银河乐子人"),
+            "unexpected friend-list OCR: {friend_text}"
         );
     }
 }

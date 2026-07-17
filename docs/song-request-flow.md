@@ -4,25 +4,27 @@
 
 ## 核心结论
 
-点歌不是 HTTP 或 OCR 入口直接播放。所有常规点歌都会先变成 `BusinessIntent::SongRequest`，进入待执行任务队列，再由命令执行线程串行处理。处理过程中会先得到最终候选歌曲，再做候选歌曲审核，然后才决定直接播放还是加入音乐播放队列。长时间同歌去重会在入队前和播放前检查，但只在确认播放成功后记录历史。
+点歌不是 HTTP 或 OCR 入口直接播放。聊天入口先生成命令信封，由点歌模块自己解析成 `SongCommand`；HTTP 直接构造同一个 `SongCommand`。两者都包装为 `ModuleCommand::SongRequest` 进入正式任务调度通道，再交给 `SongRequestApplication`。处理过程中会先得到最终候选歌曲，再做候选歌曲审核，然后才决定直接播放还是加入音乐播放队列。长时间同歌去重会在入队前和播放前检查，但只在确认播放成功后记录历史。
 
 控制台来源拥有最高权限，但只体现在“候选歌曲审核免审”。它仍然进入待执行任务队列，仍然参与点歌互斥，也仍然受当前歌曲保护和音乐播放队列规则约束。
 
 ```mermaid
 flowchart TD
-    A["游戏聊天 OCR<br/>蓝字大厅 / 粉字私聊"] --> B["ParsedCommand"]
-    C["Web 远程点歌"] --> B
-    B --> D["PendingTask::Command"]
-    D --> E["命令执行线程"]
-    E --> F["resolve_and_confirm_song<br/>得到最终候选歌曲"]
-    F --> G["review_song_candidate<br/>候选歌曲审核"]
-    G --> H{"音乐播放队列<br/>或当前歌曲保护"}
-    H -->|需要等待| I["PersistentQueue"]
-    H -->|可以立即播放| M["song_dedup_limited<br/>实际播放前检查"]
-    M --> J["PlayerController<br/>播放 URI + 确认播放"]
-    I --> K["播放监控线程"]
-    K --> L["PendingTask::AdvanceQueue"]
-    L --> E
+    A["游戏聊天 OCR<br/>蓝字大厅 / 粉字私聊"] --> B["CommandEnvelope"]
+    B --> C["SongCommand::parse_chat"]
+    D["Web 远程点歌"] --> E["ConsoleCommandIntent"]
+    C --> F["ModuleCommand::SongRequest"]
+    E --> F
+    F --> G["正式任务调度通道"]
+    G --> H["SongRequestApplication<br/>得到最终候选歌曲"]
+    H --> I["候选歌曲审核网关"]
+    I --> J{"音乐播放队列<br/>或当前歌曲保护"}
+    J -->|需要等待| K["PersistentQueue"]
+    J -->|可以立即播放| L["长时间同歌去重检查"]
+    L --> M["PlayerController<br/>播放 URI + 稳定观测确认"]
+    K --> N["播放监控应用服务"]
+    N --> O["AdvanceQueue 正式任务"]
+    O --> G
 ```
 
 ## 三个数据形态
@@ -31,17 +33,17 @@ flowchart TD
 
 | 对象 | 位置 | 含义 |
 | --- | --- | --- |
-| `SongCommand` | `src/interfaces/chat.rs` | 原始点歌命令。保存关键词、来源平台、是否伴奏优先、是否 AI 点歌、是否来自好友私聊。 |
-| `ResolvedSongRequest` | `src/composition/application/song_request.rs` | 已经解析并确认的最终候选歌曲。此时通常已经有 URI，可以审核、入队或播放。 |
+| `SongCommand` | `src/features/song_request/mod.rs` | 原始点歌命令。保存关键词、来源平台、是否伴奏优先、是否 AI 点歌、是否来自好友私聊。 |
+| `ResolvedSongRequest` | `src/features/song_request/application.rs` | 已经解析并确认的最终候选歌曲。此时通常已经有 URI，可以审核、入队或播放。 |
 | `QueueItem` | `src/features/playback/queue.rs` | 写入音乐播放队列的持久化歌曲项。字段基本来自 `ResolvedSongRequest`。 |
 
-`ResolvedSongRequest::match_keyword()` 会在 AI 点歌时优先用原始点歌意图做歌曲匹配；普通点歌则使用最终候选歌曲名。
+`ResolvedSongRequest` 同时保留最终候选、URI、原始 AI 文本和好友来源，用于审核、去重、执行日志和播放请求转换。
 
 ## 入口来源
 
 ### 大厅蓝字命令
 
-`parse_text()` 只处理 `message_type == "blue"` 的普通命令。点歌相关前缀包括：
+聊天入口先构造蓝字 `CommandEnvelope`，静态路由器选中点歌模块后，由 `SongCommand::parse_chat()` 解析。点歌相关前缀包括：
 
 - `@点歌` / `@搜索`：默认 QQ 音乐。
 - `@QQ点歌` / `@QQ搜索`：QQ 音乐。
@@ -52,7 +54,7 @@ flowchart TD
 
 ### 好友粉字命令
 
-`parse_pink_text()` 会从粉字中提取好友名，再调用私聊点歌解析。私聊比大厅多两个差异：
+聊天入口从粉字中提取好友名并写入命令信封，点歌模块再按好友权限解析。私聊比大厅多两个差异：
 
 - `@AI点歌` / `@AI搜索` 的解析来源是 `All`，执行层会让 FeelUOwn 做全来源搜索。
 - 支持 `@B站点歌` / `@B站搜索`。
@@ -61,17 +63,16 @@ flowchart TD
 
 ### Web 远程点歌
 
-`/searchPlay`、`/searchSource`、`/ai/search` 最终都会调用 `remote_song_command()`，构造：
+`/searchPlay`、`/searchSource`、`/ai/search` 最终都会调用 `remote_song_command()`，直接构造：
 
-- `message_type = "控制台"`
-- `username = "控制台"`
-- `command = BusinessIntent::SongRequest(...)`
+- 控制台来源的 `ConsoleCommandIntent`
+- `ModuleCommand::SongRequest(SongCommand)`
 
 所以远程点歌和游戏内点歌共用主业务队列、点歌互斥、候选解析、播放保护和反馈流程。
 
 ## 候选解析与确认
 
-`execute_command()` 收到 `BusinessIntent::SongRequest` 后，第一步是 `resolve_and_confirm_song()`。
+业务运行时从正式任务通道取出 `ModuleCommand::SongRequest` 后，把命令上下文交给 `SongRequestApplication`；应用服务第一步是解析并确认最终候选。
 
 普通点歌路径：
 
@@ -90,7 +91,7 @@ AI 点歌路径：
 3. `ai.pick_song_candidate()` 从候选列表里选择最符合原始意图的 URI。
 4. 回复 `AI匹配:候选,@确认@跳过`。
 5. `@确认` 或超时表示接受；`@跳过` 取消。
-6. 返回带 URI 的 `ResolvedSongRequest`，并设置 `skip_match_check = true`。
+6. 返回带 URI 的 `ResolvedSongRequest`，并保留原始 AI 点歌文本用于执行日志。
 
 这里的“超时默认接受”只用于候选确认，不代表审核通过。审核发生在下一步。
 
@@ -130,16 +131,16 @@ AI 点歌路径：
 
 第四层是播放器状态：
 
-- 当前已经在播放同一 URI，或普通点歌能匹配到同一歌名/歌手，回复 `当前正在播放`。
+- 当前已经在播放同一非空 URI 时，回复 `当前正在播放`。
 - 当前歌曲应该受保护时，把新请求加入音乐播放队列。
 - 播放器状态未知时，为了避免误切歌，把请求加入音乐播放队列并回复状态未知。
 - 没有保护条件且可以立即播放时，先检查长时间同歌去重，通过后把最终候选转成 `PlaybackRequest` 交给播放器控制器。
 
-当前歌曲保护由 `PlayerController::should_queue_until_current_song_finished()` 判断。配置关闭时可以更积极地直接播放；机器人确认播放的歌曲会优先保留。非点歌歌曲必须连续正常播放达到 `queue.external_playback_protect_after_seconds`，才会加入保护；切歌、暂停、停止和歌曲变化会重新计时。
+当前歌曲保护由 `PlayerController::should_queue_until_current_song_finished()` 判断。配置关闭时可以更积极地直接播放；机器人确认播放的歌曲会优先保留。非点歌歌曲必须以同一非空 URI 连续正常播放达到 `queue.external_playback_protect_after_seconds`，才会加入保护；URI 缺失时身份未知，切歌、暂停、停止和 URI 变化会重新计时。
 
 ## 实际播放确认
 
-直接播放前会先调用 `PlayerController::song_dedup_limited()` 检查近期实际播放历史。控制台来源在 `song_dedup.console_bypass = true` 时跳过这一步；其他来源超限会回复 `歌曲名近期已播放过,请稍后再点`，本次点歌结束。
+直接播放前会先调用 `PlayerController::song_dedup_limited()` 检查近期实际播放历史。历史只比较非空 URI，不使用歌名或歌手兜底。控制台来源在 `song_dedup.console_bypass = true` 时跳过这一步；其他来源超限会回复 `歌曲名近期已播放过,请稍后再点`，本次点歌结束。
 
 通过长时间同歌去重后，主流程确保请求有稳定 URI：
 
@@ -156,7 +157,7 @@ AI 点歌路径：
 6. URI 不一致时，控制器返回 `MismatchedCandidate`；主流程只能拒绝当前音源，或在允许时换源重试。
 7. 进度和时长不能是无效的 `0:00/0:00`。
 8. 时长过短会视为无音源。
-9. 成功后控制器写入 `RuntimeState.playback.activeRequest`，记录长时间同歌去重历史，并由主流程回复 `播放: 歌名 - 歌手 (进度/时长) 音量x`。
+9. 成功后控制器写入 `PlaybackRuntimeState.activeRequest`，记录长时间同歌去重历史，并由主流程回复 `播放: 歌名 - 歌手 (进度/时长) 音量x`。
 
 只有确认播放成功后才会写入同歌历史。搜索失败、入队、审核拒绝、候选取消、播放确认失败都不会污染历史。
 
@@ -168,7 +169,7 @@ AI 点歌路径：
 - 播放器暂停并接近结束，且音乐播放队列非空。
 - 播放器正在播放并接近结束，且存在待执行播放工作；此时控制器可能先标记 `paused_waiting_for_queue` 并暂停，避免播放器自然跳到非队列歌曲。
 
-`AdvanceQueue` 仍由命令执行线程处理，但播放器与队列操作没有页面依赖，因此直接调用 `consume_queue()` 取队首播放；只有回复和任务结束时才按监听驻留目标协调游戏界面：
+`AdvanceQueue` 仍由正式任务执行边界处理，但播放器与队列操作没有页面依赖，因此交给 `PlaybackApplication::consume_queue()` 取队首播放；只有回复和任务结束时才按监听驻留目标提交类型化 UI 事务：
 
 - 播放成功：移除队首。
 - 近期已播放过：移除队首，回复 `歌曲名近期已播放过,已跳过`，继续尝试下一项。
@@ -195,7 +196,7 @@ AI 点歌路径：
 sequenceDiagram
     participant User as 游戏/远程用户
     participant Pending as 待执行任务队列
-    participant Exec as 命令执行线程
+    participant Exec as 业务运行时 / 点歌应用服务
     participant Fuo as FeelUOwn
     participant Review as 候选歌曲审核
     participant Queue as 音乐播放队列

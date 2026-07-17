@@ -1,25 +1,83 @@
 use super::*;
 
+use crate::features::administration::{
+    AdministrationCommandContext, AdministrationDispatch, ImmediateAdministrationOutcome,
+};
+use crate::features::turtle_soup::{
+    QuestionSubmitOutcome, TurtleSoupApplicationPort, TurtleSoupCommandOutcome,
+};
+
+struct TurtleSoupCommandPort {
+    business: BusinessRuntimeHandle,
+}
+
+impl TurtleSoupApplicationPort for TurtleSoupCommandPort {
+    fn handle_hall_command(
+        &mut self,
+        player: &str,
+        command: &turtle_soup::TurtleSoupCommand,
+    ) -> Result<TurtleSoupCommandOutcome> {
+        self.business
+            .handle_turtle_soup_hall_command(player, command)
+            .map_err(anyhow::Error::from)
+    }
+
+    fn handle_friend_command(
+        &mut self,
+        player: &str,
+        command: &turtle_soup::TurtleSoupCommand,
+    ) -> Result<TurtleSoupCommandOutcome> {
+        self.business
+            .handle_turtle_soup_friend_command(player, command)
+            .map_err(anyhow::Error::from)
+    }
+
+    fn submit_question(
+        &mut self,
+        question: turtle_soup::TurtleSoupQuestion,
+    ) -> Result<QuestionSubmitOutcome> {
+        self.business
+            .submit_turtle_soup_question(question)
+            .map_err(anyhow::Error::from)
+    }
+
+    fn send_current_hall(&mut self, message: &str) -> Result<()> {
+        enqueue_current_hall_reply(&self.business, message)
+    }
+}
+
 impl ApplicationRuntime {
+    fn turtle_soup_command_port(&self) -> TurtleSoupCommandPort {
+        TurtleSoupCommandPort {
+            business: self.business.clone(),
+        }
+    }
+
+    pub(super) fn clear_hall_countdown_cache_for_new_visual_session(
+        &self,
+        reason: &str,
+    ) -> Result<bool> {
+        let cleared = self.business.clear_hall_countdown_cache()?;
+        let visual_session = self.chat_observations.begin_visual_session()?;
+        if cleared {
+            log::info!("{reason}，已清理大厅倒计时缓存，等待本次大厅检测重新确认");
+        }
+        log::info!("{reason}，聊天观察进入新视觉会话: {}", visual_session.get());
+        Ok(cleared)
+    }
+
     pub(super) fn scan_chat_with_shared_ocr(
         &self,
         image: &DynamicImage,
         templates: &ResolvedTemplateArgs,
     ) -> Result<Vec<ChatMessage>> {
-        let total_started = Instant::now();
-        let prepared = prepare_chat_scan(image, templates, self.config.screen.chat_rect.into())?;
-        let messages = recognize_prepared_chat(
+        scan_chat_with_shared_ocr(
             &self.ocr,
-            OcrPriority::ChatObservation,
+            &self.monitor,
+            self.config.screen.chat_rect.into(),
+            image,
             templates,
-            prepared,
-            Some(&self.monitor),
-        );
-        log::info!(target: "timing",
-            "聊天扫描端到端耗时: total={}ms",
-            elapsed_ms(total_started)
-        );
-        messages
+        )
     }
 
     pub(super) fn warn_if_screen_size_mismatch(&self) -> Result<()> {
@@ -57,6 +115,11 @@ impl ApplicationRuntime {
             .as_ref()
             .ok_or_else(|| anyhow!("播放器运行时尚未启动"))?
             .handle();
+        let formal_tasks = Arc::new(
+            self.formal_tasks
+                .clone()
+                .ok_or_else(|| anyhow!("正式任务执行运行时尚未启动"))?,
+        );
         let server = http::start(http::HttpSharedState::new(
             http::HttpInterfaceConfig::new(
                 self.config.http.clone(),
@@ -69,12 +132,8 @@ impl ApplicationRuntime {
                 self.config.custom_workflows.clone(),
             ),
             self.custom_workflow.clone(),
-            Arc::new(
-                self.formal_tasks
-                    .clone()
-                    .ok_or_else(|| anyhow!("正式任务执行运行时尚未启动"))?,
-            ),
-            self.business.clone(),
+            formal_tasks.clone(),
+            formal_tasks,
             self.monitor.clone(),
             self.latest_frame.clone(),
             self.player_search.clone(),
@@ -115,8 +174,8 @@ impl ApplicationRuntime {
         &mut self,
         completion_subscriber: &mut CompletionAdvanceSubscriber,
     ) -> Result<()> {
-        let template_args = TemplateArgs::default().resolve(&self.config);
-        let ui_template_args = UiTemplateArgs::default().resolve(&self.config);
+        let template_args = self.chat_templates.clone();
+        let ui_template_args = self.ui_templates.clone();
         let canvas = Canvas {
             width: self.config.screen.expected_width,
             height: self.config.screen.expected_height,
@@ -647,16 +706,19 @@ impl ApplicationRuntime {
             log::info!("已重置命令屏幕锁");
         }
         let active_entertainment = self.business.active_entertainment()?;
+        let command_router = ChatCommandRouter::new(&self.custom_workflow);
         let visible_turtle_questions = if self.business.turtle_soup_accepts_questions()? {
             messages
                 .iter()
                 .filter(|message| message.message_type == "blue" && !message.text.is_empty())
                 .filter(|message| {
-                    command::parse_entertainment_shortcut(
+                    command::parse_command_envelope(
                         &message.text,
                         &message.message_type,
-                        active_entertainment,
+                        CommandObservation::default(),
                     )
+                    .filter(|envelope| envelope.prefix() == CommandPrefix::Hash)
+                    .and_then(|envelope| command_router.route(&envelope, active_entertainment))
                     .is_none()
                 })
                 .filter_map(|message| turtle_soup::parse_question_message(&message.text, None))
@@ -684,24 +746,24 @@ impl ApplicationRuntime {
                 message.message_type,
                 redacted_chat_text(&message.text)
             );
-            let Some(parsed_command) = command::parse_entertainment_shortcut(
-                &message.text,
-                &message.message_type,
-                active_entertainment,
-            )
-            .or_else(|| command::parse_text(&message.text, &message.message_type))
-            .or_else(|| {
-                self.custom_workflow
-                    .parse_chat(&message.text, &message.message_type)
-                    .map(from_custom_workflow_match)
-            }) else {
+            let observation = CommandObservation {
+                frame_id: Some(frame.id()),
+                captured_at: Some(frame.captured_at()),
+                message_id: Some(observed.id.clone()),
+            };
+            let Some(envelope) =
+                command::parse_command_envelope(&message.text, &message.message_type, observation)
+            else {
+                continue;
+            };
+            let Some(parsed_command) = command_router.route(&envelope, active_entertainment) else {
                 continue;
             };
             if !self.commands_enabled()? && message.message_type != "pink" {
                 log::info!("命令识别已禁用，跳过: {}", parsed_command.raw);
                 continue;
             }
-            if let BusinessIntent::Invite(invite) = &parsed_command.command
+            if let ModuleCommand::Invite(invite) = &parsed_command.command
                 && !self.business.invite_should_accept(invite.seq)?
             {
                 let seq = invite.seq.expect("unsequenced invites are always accepted");
@@ -710,38 +772,18 @@ impl ApplicationRuntime {
             }
             if parsed
                 .iter()
-                .any(|(existing, _)| command::same_lock_command(existing, &parsed_command))
+                .any(|existing| command::same_lock_command(existing, &parsed_command))
             {
                 log::info!("同轮重复识别命令，已合并: {}", parsed_command.raw);
                 continue;
             }
             log::debug!("解析命令: {}", parsed_command.raw);
-            parsed.push((
-                parsed_command,
-                CommandObservation {
-                    frame_id: Some(frame.id()),
-                    captured_at: Some(frame.captured_at()),
-                    message_id: Some(observed.id.clone()),
-                },
-            ));
+            parsed.push(parsed_command);
         }
 
-        let visible_commands = parsed
-            .iter()
-            .map(|(parsed, _)| parsed.clone())
-            .collect::<Vec<_>>();
-        let mut update = self.locks.update(
-            &visible_commands,
-            self.business.scheduler_snapshot()?.is_busy(),
-        );
-        for pending in &mut update.accepted {
-            if let Some((_, observation)) = parsed
-                .iter()
-                .find(|(parsed, _)| command::same_lock_command(parsed, &pending.parsed))
-            {
-                pending.observation = observation.clone();
-            }
-        }
+        let update = self
+            .locks
+            .update(&parsed, self.business.scheduler_snapshot()?.is_busy());
         for command in update.unlocked {
             log::info!("解锁: {}", command);
         }
@@ -758,7 +800,7 @@ impl ApplicationRuntime {
             for pending in update.accepted {
                 log::info!(
                     "启动屏幕锁已记录当前可见命令，不执行: {}",
-                    pending.parsed.raw
+                    pending.routed.raw
                 );
             }
             return Ok(());
@@ -769,52 +811,37 @@ impl ApplicationRuntime {
             }
         }
         for pending in update.accepted {
-            if self.handle_turtle_soup_command(&pending.parsed)? {
+            if self.handle_turtle_soup_command(&pending.routed)? {
                 continue;
             }
-            if self.handle_idiom_chain_command(&pending.parsed)? {
+            if self.handle_idiom_chain_command(&pending.routed)? {
                 continue;
             }
-            if self.handle_landlord_command(&pending.parsed)? {
+            if self.handle_landlord_command(&pending.routed)? {
                 continue;
             }
-            if self.enqueue_chat_listener_command(&pending.parsed)? {
+            if self.enqueue_chat_listener_command(&pending.routed)? {
                 continue;
             }
-            if self.pending_contains_command(&pending.parsed)? {
-                log::info!("命令已在待处理队列，本轮跳过: {}", pending.parsed.raw);
+            if self.pending_contains_command(&pending.routed)? {
+                log::info!("命令已在待处理队列，本轮跳过: {}", pending.routed.raw);
                 continue;
             }
-            match &pending.parsed.command {
-                BusinessIntent::Administration(AdministrationCommand::SetCommandsEnabled {
-                    enabled,
-                    ..
-                }) => {
-                    self.business.set_commands_enabled(*enabled)?;
-                }
-                BusinessIntent::Administration(AdministrationCommand::IdleExit { minutes }) => {
-                    self.record_command_activity()?;
-                    self.configure_idle_exit(*minutes)?;
-                    if let Err(error) = self
-                        .log_executed_command(&pending.parsed, &format!("idle exit {}", minutes))
-                    {
-                        log::error!("写入执行命令日志失败: {error:#}");
-                    }
-                    continue;
-                }
-                _ => {}
+            if self.apply_immediate_administration(&pending.routed, false)? {
+                continue;
             }
-            log::info!("命令已加入待处理队列: {}", pending.parsed.raw);
+            log::info!("命令已加入待处理队列: {}", pending.routed.raw);
             self.record_command_activity()?;
             self.push_pending_task(PendingTask::Command(Box::new(pending)))?;
         }
         Ok(())
     }
 
-    fn enqueue_chat_listener_command(&self, parsed: &ParsedCommand) -> Result<bool> {
-        let BusinessIntent::Administration(AdministrationCommand::ChatListenerMode(command)) =
-            &parsed.command
-        else {
+    fn enqueue_chat_listener_command(&self, parsed: &RoutedCommand) -> Result<bool> {
+        let ModuleCommand::Administration(command) = &parsed.command else {
+            return Ok(false);
+        };
+        let AdministrationDispatch::ChatListenerMode(command) = command.dispatch() else {
             return Ok(false);
         };
         match command {
@@ -859,53 +886,34 @@ impl ApplicationRuntime {
         Ok(true)
     }
 
-    pub(super) fn handle_idiom_chain_command(&self, parsed: &ParsedCommand) -> Result<bool> {
-        let BusinessIntent::IdiomChain(command) = &parsed.command else {
-            return Ok(false);
-        };
-        if idiom_command_requires_executor(command) {
-            return Ok(false);
-        }
-        let outcome = self
-            .business
-            .handle_idiom_chain(&parsed.username, command)?;
-        let target = match self.active_ui_residency()? {
-            UiResidency::Primary => DeferredChatTarget::Primary,
-            UiResidency::SecondaryCurrentHall => DeferredChatTarget::SecondaryCurrentHall,
-        };
-        let action = outcome.action;
-        debug_assert!(outcome.explanation.is_none());
-        let queue_outcome = self.business.enqueue_deferred_chat(DeferredChatMessage {
-            text: outcome.reply,
-            target,
-        })?;
-        log::info!(
-            "成语接龙已处理，回复进入延迟发送队列: command={} action={}",
-            parsed.raw,
-            action
-        );
-        if queue_outcome == EnqueueOutcome::DroppedMessage {
-            log::warn!("延迟聊天发送队列已满，已丢弃一条较早的回复");
-        }
-        if queue_outcome == EnqueueOutcome::Rejected {
-            log::warn!("延迟聊天发送队列已被受保护批次占满，成语接龙回复已丢弃");
-        }
-        Ok(true)
-    }
-
-    fn handle_landlord_command(&self, parsed: &ParsedCommand) -> Result<bool> {
-        let BusinessIntent::CardGame(command) = &parsed.command else {
+    pub(super) fn handle_idiom_chain_command(&self, parsed: &RoutedCommand) -> Result<bool> {
+        let ModuleCommand::IdiomChain(command) = &parsed.command else {
             return Ok(false);
         };
         if command.requires_executor() {
             return Ok(false);
         }
-        let start = self
-            .business
-            .begin_card_game(&parsed.username, command, Instant::now())?;
-        drive_card_game_start(
-            &self.business,
-            start,
+        let mut port = self.deferred_idiom_chain_port();
+        self.idiom_chain_application.execute_deferred(
+            &parsed.raw,
+            &parsed.username,
+            command,
+            &mut port,
+        )?;
+        Ok(true)
+    }
+
+    fn handle_landlord_command(&self, parsed: &RoutedCommand) -> Result<bool> {
+        let ModuleCommand::CardGame(command) = &parsed.command else {
+            return Ok(false);
+        };
+        if command.requires_executor() {
+            return Ok(false);
+        }
+        self.card_games.execute_command(
+            &parsed.username,
+            command,
+            Instant::now(),
             CardGameEffectLane::Deferred,
             &DeferredCardGamePort { app: self },
         )?;
@@ -917,25 +925,18 @@ impl ApplicationRuntime {
         Ok(true)
     }
 
-    pub(super) fn handle_turtle_soup_command(&self, parsed: &ParsedCommand) -> Result<bool> {
-        let BusinessIntent::TurtleSoup(command) = &parsed.command else {
+    pub(super) fn handle_turtle_soup_command(&self, parsed: &RoutedCommand) -> Result<bool> {
+        let ModuleCommand::TurtleSoup(command) = &parsed.command else {
             return Ok(false);
         };
-        let outcome = if parsed.message_type == "pink" {
-            self.business
-                .handle_turtle_soup_friend_command(&parsed.username, command)?
-        } else {
-            self.business
-                .handle_turtle_soup_hall_command(&parsed.username, command)?
-        };
-        if let Some(reply) = outcome.immediate_reply {
-            self.enqueue_current_hall_reply(&reply)?;
-        }
-        log::info!(
-            "海龟汤命令已处理: command={} action={}",
-            parsed.raw,
-            outcome.action
-        );
+        let mut port = self.turtle_soup_command_port();
+        self.turtle_soup_application.execute_command(
+            &parsed.raw,
+            &parsed.username,
+            parsed.message_type == "pink",
+            command,
+            &mut port,
+        )?;
         Ok(true)
     }
 
@@ -943,45 +944,25 @@ impl ApplicationRuntime {
         &self,
         question: turtle_soup::TurtleSoupQuestion,
     ) -> Result<bool> {
-        match self.business.submit_turtle_soup_question(question)? {
-            QuestionSubmitOutcome::Ignored => Ok(false),
-            QuestionSubmitOutcome::Queued { request_id } => {
-                log::info!("海龟汤提问已进入 AI 队列: request_id={}", request_id);
-                Ok(true)
-            }
-            QuestionSubmitOutcome::Reply(reply) => {
-                self.enqueue_current_hall_reply(&reply)?;
-                Ok(true)
-            }
-        }
+        let mut port = self.turtle_soup_command_port();
+        self.turtle_soup_application
+            .submit_question(question, &mut port)
     }
 
     pub(super) fn enqueue_current_hall_reply(&self, text: &str) -> Result<()> {
-        match self.business.enqueue_deferred_chat(DeferredChatMessage {
-            text: text.to_string(),
-            target: DeferredChatTarget::CurrentHall,
-        })? {
-            EnqueueOutcome::Added => {}
-            EnqueueOutcome::DroppedMessage => {
-                log::warn!("大厅延迟回复入队时淘汰了一条较早的普通回复")
-            }
-            EnqueueOutcome::Rejected => {
-                log::warn!("大厅延迟回复队列已被受保护批次占满，当前回复已丢弃")
-            }
-        }
-        Ok(())
+        enqueue_current_hall_reply(&self.business, text)
     }
 
     pub(super) fn abort_entertainment_for_context_loss(&self, reason: &str) {
         if let Err(error) = self.business.abort_turtle_soup(reason) {
             log::error!("无法中止海龟汤会话: {error:#}");
         }
-        match self.business.abort_undercover() {
+        match self.undercover_game.abort() {
             Ok(true) => log::warn!("谁是卧底已因聊天上下文变化中止: {}", reason),
             Ok(false) => {}
             Err(error) => log::error!("无法中止旧谁是卧底牌局: {error:#}"),
         }
-        match self.business.abort_card_game() {
+        match self.card_games.abort() {
             Ok(true) => log::warn!("牌局已因聊天上下文变化中止: {}", reason),
             Ok(false) => {}
             Err(error) => log::error!("无法中止旧牌局: {error:#}"),
@@ -1009,8 +990,8 @@ impl ApplicationRuntime {
             log::error!("无法同步海龟汤期限: {error:#}");
         }
         let card_game_outcome = match self
-            .business
-            .poll_card_game_timed_outcome(Instant::now(), clock_active)
+            .card_games
+            .poll_timed_outcome(Instant::now(), clock_active)
         {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -1019,20 +1000,18 @@ impl ApplicationRuntime {
             }
         };
         if let Some(outcome) = card_game_outcome {
-            let action = outcome.action();
-            let request = outcome.into_request();
-            let key = request.key;
-            let effect = QueuedCardGameEffect::new(self.business.clone(), action, request);
+            let key = outcome.key();
+            let effect = self.card_games.timed_effect(outcome);
             if let Err(error) = self.push_pending_task(PendingTask::CardGameEffect(effect)) {
                 log::error!("牌局计时结果入队失败: {error:#}");
-                if let Err(cancel_error) = self.business.cancel_card_game_effect(key) {
+                if let Err(cancel_error) = self.card_games.cancel_effect(key) {
                     log::error!("牌局计时结果入队失败后无法清理牌局: {cancel_error:#}");
                 }
             }
         }
         let undercover_outcome = match self
-            .business
-            .poll_undercover_timed_outcome(Instant::now(), clock_active)
+            .undercover_game
+            .poll_timed_outcome(Instant::now(), clock_active)
         {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -1041,24 +1020,18 @@ impl ApplicationRuntime {
             }
         };
         if let Some(outcome) = undercover_outcome {
-            let action = outcome.action();
-            let request = outcome.into_request();
-            let key = request.key;
-            let effect = QueuedUndercoverEffect::new(self.business.clone(), action, request);
+            let key = outcome.key();
+            let effect = self.undercover_game.timed_effect(outcome);
             if let Err(error) = self.push_pending_task(PendingTask::UndercoverEffect(effect)) {
                 log::error!("谁是卧底计时消息入队失败: {error:#}");
-                if let Err(cancel_error) = self.business.cancel_undercover_effect(key) {
+                if let Err(cancel_error) = self.undercover_game.cancel_effect(key) {
                     log::error!("谁是卧底计时消息入队失败后无法清理牌局: {cancel_error:#}");
                 }
             }
         }
     }
 
-    pub(super) fn submit_secondary_command(
-        &self,
-        parsed: ParsedCommand,
-        observation: CommandObservation,
-    ) -> Result<()> {
+    pub(super) fn submit_secondary_command(&self, parsed: RoutedCommand) -> Result<()> {
         if self.enqueue_chat_listener_command(&parsed)? {
             return Ok(());
         }
@@ -1075,7 +1048,7 @@ impl ApplicationRuntime {
         if self.handle_landlord_command(&parsed)? {
             return Ok(());
         }
-        if let BusinessIntent::Invite(invite) = &parsed.command
+        if let ModuleCommand::Invite(invite) = &parsed.command
             && !self.business.invite_should_accept(invite.seq)?
         {
             let seq = invite.seq.expect("unsequenced invites are always accepted");
@@ -1086,28 +1059,40 @@ impl ApplicationRuntime {
             log::info!("二级监听命令已在待处理队列，跳过: {}", parsed.raw);
             return Ok(());
         }
-        match &parsed.command {
-            BusinessIntent::Administration(AdministrationCommand::SetCommandsEnabled {
-                enabled,
-                ..
-            }) => {
-                self.business.set_commands_enabled(*enabled)?;
-            }
-            BusinessIntent::Administration(AdministrationCommand::IdleExit { minutes }) => {
-                self.record_command_activity()?;
-                self.configure_idle_exit(*minutes)?;
-                self.log_executed_command(&parsed, &format!("idle exit {}", minutes))?;
-                return Ok(());
-            }
-            _ => {}
+        if self.apply_immediate_administration(&parsed, true)? {
+            return Ok(());
         }
         self.record_command_activity()?;
         log::info!("二级监听命令已加入待处理队列: {}", parsed.raw);
         self.push_pending_task(PendingTask::Command(Box::new(PendingCommand {
             lock_key: command::lock_key(&parsed),
-            parsed,
-            observation,
+            routed: parsed,
         })))
+    }
+
+    fn apply_immediate_administration(
+        &self,
+        parsed: &RoutedCommand,
+        propagate_log_error: bool,
+    ) -> Result<bool> {
+        let ModuleCommand::Administration(command) = &parsed.command else {
+            return Ok(false);
+        };
+        let context = AdministrationCommandContext {
+            message_type: parsed.message_type.clone(),
+            username: command_username(parsed).to_string(),
+            user_command: parsed.user_command.clone(),
+        };
+        let mut port = self.immediate_administration_port();
+        Ok(matches!(
+            self.administration_application.apply_immediate(
+                &context,
+                command,
+                propagate_log_error,
+                &mut port,
+            )?,
+            ImmediateAdministrationOutcome::Handled
+        ))
     }
 
     pub(super) fn execute_console_chat_task(&mut self, text: String, prefix: String) -> Result<()> {
@@ -1140,4 +1125,43 @@ impl ApplicationRuntime {
         );
         Err(anyhow!("切换{}失败，已回退一级监听", target.label()))
     }
+}
+
+pub(super) fn scan_chat_with_shared_ocr(
+    ocr: &OcrRuntimeHandle,
+    monitor: &MonitorShared,
+    chat_rect: Rect,
+    image: &DynamicImage,
+    templates: &ResolvedTemplateArgs,
+) -> Result<Vec<ChatMessage>> {
+    let total_started = Instant::now();
+    let prepared = prepare_chat_scan(image, templates, chat_rect)?;
+    let messages = recognize_prepared_chat(
+        ocr,
+        OcrPriority::ChatObservation,
+        templates,
+        prepared,
+        Some(monitor),
+    );
+    log::info!(target: "timing",
+        "聊天扫描端到端耗时: total={}ms",
+        elapsed_ms(total_started)
+    );
+    messages
+}
+
+fn enqueue_current_hall_reply(business: &BusinessRuntimeHandle, text: &str) -> Result<()> {
+    match business.enqueue_deferred_chat(DeferredChatMessage {
+        text: text.to_string(),
+        target: DeferredChatTarget::CurrentHall,
+    })? {
+        EnqueueOutcome::Added => {}
+        EnqueueOutcome::DroppedMessage => {
+            log::warn!("大厅延迟回复入队时淘汰了一条较早的普通回复")
+        }
+        EnqueueOutcome::Rejected => {
+            log::warn!("大厅延迟回复队列已被受保护批次占满，当前回复已丢弃")
+        }
+    }
+    Ok(())
 }

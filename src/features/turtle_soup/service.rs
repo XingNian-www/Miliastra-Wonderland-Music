@@ -25,6 +25,7 @@ use super::{
 };
 use crate::features::chat_text::{MAX_CHAT_WIDTH, display_width, split_numbered_chat_message};
 use crate::features::entertainment::{AcquireOutcome, EntertainmentKind, EntertainmentState};
+use crate::runtime::clock::{Clock, Delay};
 use crate::runtime::identity::SessionGeneration;
 use crate::runtime::openai::{Authentication, OpenAiRuntimeHandle, Target};
 use crate::text::normalize_comparison_text;
@@ -39,7 +40,7 @@ const DEFAULT_CONTENT_STABLE_COUNT: usize = 0;
 const BUILTIN_OCR_STABILITY_COUNT: usize = 2;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 pub struct TurtleSoupConfig {
     pub enabled: bool,
     pub question_bank_path: PathBuf,
@@ -80,8 +81,31 @@ impl Default for TurtleSoupConfig {
     }
 }
 
+impl TurtleSoupConfig {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.enabled {
+            if self.idle_timeout_seconds == 0
+                || self.max_session_seconds == 0
+                || self.max_concurrency == 0
+                || self.max_pending == 0
+                || self.batch_max_parts == 0
+                || self.request_timeout_seconds == 0
+            {
+                bail!("海龟汤会话、并发、排队、分段和请求限制必须大于 0");
+            }
+            if self.question_bank_path.as_os_str().is_empty()
+                || self.used_state_path.as_os_str().is_empty()
+            {
+                bail!("海龟汤题库和使用记录路径不能为空");
+            }
+            validate_provider_config(&self.ai)?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 pub struct TurtleSoupAiConfig {
     pub endpoint: String,
     pub api_key: String,
@@ -337,6 +361,8 @@ pub(crate) struct TurtleSoupService {
     worker_sender: SyncSender<TurtleSoupJob>,
     worker_receiver: Option<Arc<Mutex<Receiver<TurtleSoupJob>>>>,
     cancelled_through: Arc<AtomicU64>,
+    clock: Arc<dyn Clock>,
+    retry_delay: Arc<dyn Delay>,
 }
 
 pub(crate) struct TurtleSoupWorkerRuntime {
@@ -350,6 +376,8 @@ struct TurtleSoupWorker {
     receiver: Arc<Mutex<Receiver<TurtleSoupJob>>>,
     shutting_down: Arc<AtomicBool>,
     cancelled_through: Arc<AtomicU64>,
+    clock: Arc<dyn Clock>,
+    retry_delay: Arc<dyn Delay>,
 }
 
 impl TurtleSoupWorkerRuntime {
@@ -358,6 +386,8 @@ impl TurtleSoupWorkerRuntime {
         openai: OpenAiRuntimeHandle,
         receiver: Arc<Mutex<Receiver<TurtleSoupJob>>>,
         cancelled_through: Arc<AtomicU64>,
+        clock: Arc<dyn Clock>,
+        retry_delay: Arc<dyn Delay>,
         completion_port: Arc<dyn TurtleSoupAiCompletionPort>,
     ) -> Self {
         let worker_count = config.max_concurrency.max(1);
@@ -370,6 +400,8 @@ impl TurtleSoupWorkerRuntime {
                 receiver: receiver.clone(),
                 shutting_down: shutting_down.clone(),
                 cancelled_through: cancelled_through.clone(),
+                clock: clock.clone(),
+                retry_delay: retry_delay.clone(),
             };
             let completion_port = completion_port.clone();
             workers.push(thread::spawn(move || {
@@ -461,7 +493,7 @@ struct TurtleSoupJob {
 }
 
 #[derive(Default, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct UsedQuestionState {
     used_ids: BTreeSet<String>,
 }
@@ -799,7 +831,12 @@ impl TurtleSoupAiCompletionPort for DiscardedAiCompletionPort {
 }
 
 impl TurtleSoupService {
-    pub(crate) fn new(mut config: TurtleSoupConfig, openai: OpenAiRuntimeHandle) -> Self {
+    pub(crate) fn new(
+        mut config: TurtleSoupConfig,
+        openai: OpenAiRuntimeHandle,
+        clock: Arc<dyn Clock>,
+        retry_delay: Arc<dyn Delay>,
+    ) -> Self {
         config.nickname_stable_count = config
             .nickname_stable_count
             .max(BUILTIN_OCR_STABILITY_COUNT);
@@ -814,6 +851,8 @@ impl TurtleSoupService {
             worker_sender,
             worker_receiver: Some(Arc::new(Mutex::new(worker_receiver))),
             cancelled_through: Arc::new(AtomicU64::new(0)),
+            clock,
+            retry_delay,
         }
     }
 
@@ -842,6 +881,8 @@ impl TurtleSoupService {
             self.openai.clone(),
             receiver,
             self.cancelled_through.clone(),
+            self.clock.clone(),
+            self.retry_delay.clone(),
             completion_port,
         ))
     }
@@ -851,7 +892,12 @@ impl TurtleSoupService {
         let session = state.session.as_ref();
         let elapsed_seconds = session
             .and_then(|session| session.active_at.or(Some(session.selected_at)))
-            .map(|started| started.elapsed().as_secs())
+            .map(|started| {
+                self.clock
+                    .now()
+                    .saturating_duration_since(started)
+                    .as_secs()
+            })
             .unwrap_or(0);
         let mut participants = session
             .map(|session| session.participants.values().cloned().collect::<Vec<_>>())
@@ -1051,7 +1097,7 @@ impl TurtleSoupService {
                     .participants
                     .entry(question.player_key)
                     .or_insert_with(|| question.player.clone());
-                session.last_question_at = Some(Instant::now());
+                session.last_question_at = Some(self.clock.now());
                 log::info!(
                     "海龟汤批量答案已暂存: nickname={} part={} stored={}",
                     normalize_log_text(&question.player),
@@ -1157,7 +1203,7 @@ impl TurtleSoupService {
             .entry(job.player_key.clone())
             .or_insert_with(|| job.player.clone());
         session.question_count = session.question_count.saturating_add(1);
-        session.last_question_at = Some(Instant::now());
+        session.last_question_at = Some(self.clock.now());
         log::info!(
             "海龟汤 AI 请求已排队: request_id={} nickname={}",
             request_id,
@@ -1291,7 +1337,7 @@ impl TurtleSoupService {
                 {
                     return;
                 }
-                let now = Instant::now();
+                let now = self.clock.now();
                 if let Some(session) = state.session.as_mut() {
                     session.active_at = Some(now);
                     session.last_question_at = Some(now);
@@ -1430,7 +1476,7 @@ impl TurtleSoupService {
                 state.session = Some(TurtleSoupSession {
                     puzzle: puzzle.clone(),
                     starter: normalize_player_display(starter),
-                    selected_at: Instant::now(),
+                    selected_at: self.clock.now(),
                     active_at: None,
                     last_question_at: None,
                     participants: HashMap::new(),
@@ -1519,7 +1565,10 @@ impl TurtleSoupService {
         format!(
             "海龟汤{}，已进行{}秒，{}人参与，{}个有效提问",
             state.phase.label(),
-            started.elapsed().as_secs(),
+            self.clock
+                .now()
+                .saturating_duration_since(started)
+                .as_secs(),
             session.participants.len(),
             session.question_count
         )
@@ -1674,13 +1723,17 @@ impl TurtleSoupWorker {
     }
 
     fn adjudicate(&self, job: &TurtleSoupJob, context: &ReviewContext) -> ReviewOutcome {
-        let started = Instant::now();
+        let started = self.clock.now();
         let (first, first_retries) = match self.call_with_retries(job, context, false) {
             Ok(result) => result,
             Err((error, retries)) => {
                 return ReviewOutcome {
                     judgment: Judgment::ReviewFailed,
-                    elapsed_ms: started.elapsed().as_millis(),
+                    elapsed_ms: self
+                        .clock
+                        .now()
+                        .saturating_duration_since(started)
+                        .as_millis(),
                     retries,
                     error_summary: Some(concise_error(&error)),
                 };
@@ -1689,7 +1742,11 @@ impl TurtleSoupWorker {
         if first != Judgment::Complete {
             return ReviewOutcome {
                 judgment: first,
-                elapsed_ms: started.elapsed().as_millis(),
+                elapsed_ms: self
+                    .clock
+                    .now()
+                    .saturating_duration_since(started)
+                    .as_millis(),
                 retries: first_retries,
                 error_summary: None,
             };
@@ -1698,19 +1755,31 @@ impl TurtleSoupWorker {
         match self.call_with_retries(job, context, true) {
             Ok((Judgment::Complete, second_retries)) => ReviewOutcome {
                 judgment: Judgment::Complete,
-                elapsed_ms: started.elapsed().as_millis(),
+                elapsed_ms: self
+                    .clock
+                    .now()
+                    .saturating_duration_since(started)
+                    .as_millis(),
                 retries: first_retries.saturating_add(second_retries),
                 error_summary: None,
             },
             Ok((_, second_retries)) => ReviewOutcome {
                 judgment: Judgment::Partial,
-                elapsed_ms: started.elapsed().as_millis(),
+                elapsed_ms: self
+                    .clock
+                    .now()
+                    .saturating_duration_since(started)
+                    .as_millis(),
                 retries: first_retries.saturating_add(second_retries),
                 error_summary: None,
             },
             Err((error, second_retries)) => ReviewOutcome {
                 judgment: Judgment::ReviewFailed,
-                elapsed_ms: started.elapsed().as_millis(),
+                elapsed_ms: self
+                    .clock
+                    .now()
+                    .saturating_duration_since(started)
+                    .as_millis(),
                 retries: first_retries.saturating_add(second_retries),
                 error_summary: Some(concise_error(&error)),
             },
@@ -1731,7 +1800,8 @@ impl TurtleSoupWorker {
                 Err(error) => {
                     last_error = Some(error);
                     if attempt < max_attempts {
-                        thread::sleep(Duration::from_millis(self.config.retry_delay_ms));
+                        self.retry_delay
+                            .wait(Duration::from_millis(self.config.retry_delay_ms));
                     }
                 }
             }
@@ -2322,6 +2392,7 @@ fn unix_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::clock::{Clock, ManualClock};
 
     fn test_openai() -> OpenAiRuntimeHandle {
         static RUNTIME: std::sync::OnceLock<crate::runtime::openai::OpenAiRuntime> =
@@ -2331,6 +2402,11 @@ mod tests {
                 crate::runtime::openai::OpenAiRuntime::start().expect("test OpenAI runtime")
             })
             .handle()
+    }
+
+    fn test_service(config: TurtleSoupConfig) -> TurtleSoupService {
+        let clock = Arc::new(ManualClock::new(Instant::now()));
+        TurtleSoupService::new(config, test_openai(), clock.clone(), clock)
     }
 
     #[derive(Clone, Copy)]
@@ -2361,15 +2437,31 @@ mod tests {
     }
 
     #[test]
+    fn module_configuration_validates_its_own_provider_before_startup() {
+        let disabled = TurtleSoupConfig::default();
+        disabled.validate().expect("disabled configuration");
+
+        let mut enabled = TurtleSoupConfig {
+            enabled: true,
+            ..TurtleSoupConfig::default()
+        };
+        assert!(enabled.validate().is_err());
+
+        enabled.ai.api_key = "key".to_string();
+        enabled.ai.endpoint = "not-a-url".to_string();
+        assert!(enabled.validate().is_err());
+
+        enabled.ai.endpoint = "https://example.com/v1/chat/completions".to_string();
+        enabled.validate().expect("valid enabled configuration");
+    }
+
+    #[test]
     fn worker_lifecycle_is_idempotent() {
-        let mut service = TurtleSoupService::new(
-            TurtleSoupConfig {
-                enabled: true,
-                max_concurrency: 1,
-                ..TurtleSoupConfig::default()
-            },
-            test_openai(),
-        );
+        let mut service = test_service(TurtleSoupConfig {
+            enabled: true,
+            max_concurrency: 1,
+            ..TurtleSoupConfig::default()
+        });
 
         let mut workers = service.start_workers().expect("workers start");
         assert!(service.start_workers().is_none());
@@ -2745,7 +2837,7 @@ mod tests {
 
     #[test]
     fn primary_question_ocr_requires_independently_stable_nickname_and_content() {
-        let mut service = TurtleSoupService::new(TurtleSoupConfig::default(), test_openai());
+        let mut service = test_service(TurtleSoupConfig::default());
         let visible = |text| vec![parse_question_message(text, None).expect("question")];
 
         assert!(
@@ -2815,7 +2907,7 @@ mod tests {
 
     #[test]
     fn primary_question_content_ocr_resets_on_change_but_accepts_punctuation_variants() {
-        let mut service = TurtleSoupService::new(TurtleSoupConfig::default(), test_openai());
+        let mut service = test_service(TurtleSoupConfig::default());
         let visible = |text| vec![parse_question_message(text, None).expect("question")];
 
         service.filter_new_primary_questions(Vec::new(), true);
@@ -2844,7 +2936,7 @@ mod tests {
 
     #[test]
     fn primary_question_uses_content_to_dedupe_nickname_ocr_variants() {
-        let mut service = TurtleSoupService::new(TurtleSoupConfig::default(), test_openai());
+        let mut service = test_service(TurtleSoupConfig::default());
         let visible = |player: &str, question: &str| {
             vec![
                 parse_question_message(&format!("{}：# {}", player, question), None)
@@ -2880,7 +2972,7 @@ mod tests {
 
     #[test]
     fn identical_questions_from_distinct_players_remain_independent() {
-        let mut service = TurtleSoupService::new(TurtleSoupConfig::default(), test_openai());
+        let mut service = test_service(TurtleSoupConfig::default());
         let visible = || {
             ["Alice", "Bob"]
                 .into_iter()
@@ -2905,7 +2997,7 @@ mod tests {
 
     #[test]
     fn same_scan_nickname_ocr_aliases_are_deduplicated_by_question() {
-        let mut service = TurtleSoupService::new(TurtleSoupConfig::default(), test_openai());
+        let mut service = test_service(TurtleSoupConfig::default());
         let visible = || {
             ["星念BOT", "星念B0T"]
                 .into_iter()
@@ -2930,7 +3022,7 @@ mod tests {
 
     #[test]
     fn secondary_question_ocr_keeps_pending_until_content_and_nickname_are_stable() {
-        let mut service = TurtleSoupService::new(TurtleSoupConfig::default(), test_openai());
+        let mut service = test_service(TurtleSoupConfig::default());
         let observation = |player: &str, text: &str| {
             vec![SecondaryOcrObservation {
                 text: text.to_string(),
@@ -2962,7 +3054,7 @@ mod tests {
 
     #[test]
     fn secondary_question_accepts_minor_nickname_ocr_variants_for_the_same_content() {
-        let mut service = TurtleSoupService::new(TurtleSoupConfig::default(), test_openai());
+        let mut service = test_service(TurtleSoupConfig::default());
         let observation = |player: &str| {
             vec![SecondaryOcrObservation {
                 text: "# 男人是灯塔管理员吗？".to_string(),
@@ -2987,7 +3079,7 @@ mod tests {
             content_stable_count: 2,
             ..TurtleSoupConfig::default()
         };
-        let mut service = TurtleSoupService::new(config, test_openai());
+        let mut service = test_service(config);
         let visible =
             || vec![parse_question_message("星念：# 他认识死者吗？", None).expect("question")];
 
@@ -3010,7 +3102,7 @@ mod tests {
 
     #[test]
     fn secondary_non_question_content_does_not_wait_for_a_nickname() {
-        let mut service = TurtleSoupService::new(TurtleSoupConfig::default(), test_openai());
+        let mut service = test_service(TurtleSoupConfig::default());
         let observation = vec![SecondaryOcrObservation {
             text: "@状态".to_string(),
             player: String::new(),
@@ -3083,7 +3175,7 @@ mod tests {
             question_bank_path: PathBuf::from("missing-turtle-soup-bank.yaml"),
             ..TurtleSoupConfig::default()
         };
-        let mut service = TurtleSoupService::new(config, test_openai());
+        let mut service = test_service(config);
 
         let error = service
             .start_random_from_web(&mut EntertainmentState::new(), &mut TestDeliveryPort)
@@ -3091,6 +3183,48 @@ mod tests {
 
         assert!(error.to_string().contains("turtle_soup.ai.api_key"));
         assert_eq!(service.snapshot().phase, TurtleSoupPhase::Idle);
+    }
+
+    #[test]
+    fn incomplete_used_question_record_fails_closed_without_overwriting_it() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("mwm-turtle-used-{suffix}"));
+        fs::create_dir_all(&dir).unwrap();
+        let bank_path = dir.join("turtle-soup.yaml");
+        let used_path = dir.join("used.json");
+        fs::write(
+            &bank_path,
+            r#"
+题目:
+  - id: test-001
+    标题: 测试
+    汤面: 测试汤面
+    汤底: 测试汤底
+    裁决备注: 测试备注
+    启用: true
+"#,
+        )
+        .unwrap();
+        fs::write(&used_path, "{}").unwrap();
+        let mut config = TurtleSoupConfig {
+            enabled: true,
+            question_bank_path: bank_path,
+            used_state_path: used_path.clone(),
+            ..TurtleSoupConfig::default()
+        };
+        config.ai.api_key = "test-key".to_string();
+        let mut service = test_service(config);
+
+        let error = service
+            .start_random_from_web(&mut EntertainmentState::new(), &mut TestDeliveryPort)
+            .expect_err("incomplete used-question state must fail closed");
+
+        assert!(error.to_string().contains("解析海龟汤使用记录失败"));
+        assert_eq!(fs::read_to_string(&used_path).unwrap(), "{}");
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -3114,7 +3248,7 @@ mod tests {
 
     #[test]
     fn web_snapshot_never_contains_the_puzzle_bottom() {
-        let mut service = TurtleSoupService::new(TurtleSoupConfig::default(), test_openai());
+        let mut service = test_service(TurtleSoupConfig::default());
         {
             let state = &mut service.state;
             state.phase = TurtleSoupPhase::Active;
@@ -3145,6 +3279,39 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_elapsed_time_uses_the_injected_clock() {
+        let started_at = Instant::now();
+        let clock = Arc::new(ManualClock::new(started_at));
+        let mut service = TurtleSoupService::new(
+            TurtleSoupConfig::default(),
+            test_openai(),
+            clock.clone(),
+            clock.clone(),
+        );
+        service.state.phase = TurtleSoupPhase::Active;
+        service.state.session = Some(TurtleSoupSession {
+            puzzle: TurtleSoupPuzzle {
+                id: "clock-test".to_string(),
+                title: "时钟测试".to_string(),
+                surface: "汤面".to_string(),
+                bottom: "汤底".to_string(),
+                adjudication_notes: String::new(),
+                enabled: true,
+            },
+            starter: "测试者".to_string(),
+            selected_at: started_at,
+            active_at: Some(started_at),
+            last_question_at: Some(started_at),
+            participants: HashMap::new(),
+            question_count: 0,
+        });
+
+        clock.advance(Duration::from_secs(7)).unwrap();
+
+        assert_eq!(service.snapshot().elapsed_seconds, 7);
+    }
+
+    #[test]
     fn monitor_snapshot_keeps_shape_without_question_text() {
         let mut snapshot = TurtleSoupSnapshot::default();
         snapshot.recent_judgments.push(TurtleSoupJudgmentSnapshot {
@@ -3165,12 +3332,40 @@ mod tests {
         assert!(!redacted.to_string().contains("完整提问正文"));
     }
 
+    #[test]
+    fn idle_settlement_is_driven_by_a_manual_clock() {
+        let clock = ManualClock::new(Instant::now());
+        let mut service = active_test_service();
+        service.config.idle_timeout_seconds = 30;
+        service.config.max_session_seconds = 600;
+        let session = service.state.session.as_mut().expect("active session");
+        session.selected_at = clock.now();
+        session.active_at = Some(clock.now());
+        session.last_question_at = Some(clock.now());
+        let mut entertainment = EntertainmentState::new();
+        let mut delivery = TestDeliveryPort;
+
+        let (kind, deadline) = service
+            .next_deadline(clock.now(), true)
+            .expect("idle deadline");
+        assert_eq!(kind, TurtleSoupDeadlineKind::SessionIdle);
+        assert_eq!(deadline, clock.now() + Duration::from_secs(30));
+
+        clock.advance(Duration::from_secs(29)).unwrap();
+        service.handle_deadline(&mut entertainment, kind, clock.now(), &mut delivery);
+        assert_eq!(service.snapshot().phase, TurtleSoupPhase::Active);
+
+        clock.advance(Duration::from_secs(1)).unwrap();
+        service.handle_deadline(&mut entertainment, kind, clock.now(), &mut delivery);
+        assert_eq!(service.snapshot().phase, TurtleSoupPhase::Settling);
+    }
+
     fn active_test_service() -> TurtleSoupService {
         let config = TurtleSoupConfig {
             enabled: true,
             ..TurtleSoupConfig::default()
         };
-        let mut service = TurtleSoupService::new(config, test_openai());
+        let mut service = test_service(config);
         {
             let state = &mut service.state;
             state.phase = TurtleSoupPhase::Active;

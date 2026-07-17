@@ -1,15 +1,28 @@
 mod ai;
+mod application;
 mod review;
+mod search;
 
 use serde::{Deserialize, Serialize};
 
 use crate::features::chat_text::{
     CommandSyntax, command_identity, parse_prefixed_command, strip_ascii_case_prefix,
 };
+use crate::features::command::{
+    CommandAuthority, CommandEnvelope, CommandPrefix, FeatureCommandMatch,
+};
 use crate::text::normalize_comparison_text;
 
-pub(crate) use ai::AiClient;
-pub(crate) use review::{SongReviewCandidate, SongReviewClient, split_candidate_title_artist};
+pub(crate) use ai::{AiCandidatePickResult, AiClient, AiConfig};
+pub(crate) use application::{
+    ResolvedSongRequest, SongRequestApplication, SongRequestContext, SongRequestDecision,
+    SongRequestPort, SongSearchFailure,
+};
+pub(crate) use review::{
+    SongReviewCandidate, SongReviewClient, SongReviewConfig, SongReviewDecision,
+    split_candidate_title_artist,
+};
+pub use search::{PickedCandidate, SearchCandidate};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct SongCommand {
@@ -41,6 +54,50 @@ impl SongSource {
 }
 
 impl SongCommand {
+    pub(crate) fn claims_chat(envelope: &CommandEnvelope) -> bool {
+        if envelope.prefix() != CommandPrefix::At {
+            return false;
+        }
+        let commands = match envelope.authority() {
+            CommandAuthority::HallMember => HALL_COMMANDS,
+            CommandAuthority::Friend => FRIEND_COMMANDS,
+        };
+        commands.iter().any(|(prefix, _, _)| {
+            strip_ascii_case_prefix(envelope.command_text(), prefix).is_some()
+        })
+    }
+
+    pub(crate) fn parse_chat(envelope: &CommandEnvelope) -> Option<FeatureCommandMatch<Self>> {
+        if !Self::claims_chat(envelope) {
+            return None;
+        }
+        match envelope.authority() {
+            CommandAuthority::HallMember => {
+                let parsed = parse_hall_syntax(envelope.command_text())?;
+                let raw = joined_command(parsed.matched, parsed.argument);
+                Some(FeatureCommandMatch::new(
+                    parsed.matched,
+                    raw,
+                    parsed.command,
+                ))
+            }
+            CommandAuthority::Friend => {
+                let command = parse_friend_command(envelope.command_text(), envelope.username())?;
+                let raw = format!(
+                    "{} {} {}",
+                    envelope.username(),
+                    command.prefix,
+                    command.keyword
+                );
+                Some(FeatureCommandMatch::new(
+                    command.prefix.clone(),
+                    raw,
+                    command,
+                ))
+            }
+        }
+    }
+
     pub(crate) fn lock_key(&self) -> String {
         format!(
             "song:{}:{}:{}:{}",
@@ -56,6 +113,14 @@ impl SongCommand {
             && self.source == other.source
             && self.prefer_accompaniment == other.prefer_accompaniment
             && same_lock_keyword(&self.keyword, &other.keyword)
+    }
+}
+
+fn joined_command(matched: &str, argument: &str) -> String {
+    if argument.is_empty() {
+        matched.to_string()
+    } else {
+        format!("{matched} {argument}")
     }
 }
 

@@ -2,8 +2,8 @@ use anyhow::{Result, anyhow};
 
 use crate::config::OutputConfig;
 #[cfg(test)]
-use crate::features::chat_text::split_numbered_chat_message;
-use crate::features::chat_text::{MAX_CHAT_WIDTH, char_width, display_width};
+use crate::text::split_numbered_chat_message;
+use crate::text::{MAX_CHAT_WIDTH, char_width, display_width};
 use crate::ui::routines::{
     HallBatchStatus, HallBatchUi, SendHallBatch, UiResidencyOutcome, UiResidencyTarget,
 };

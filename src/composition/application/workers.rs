@@ -1,12 +1,74 @@
 use super::*;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+
+use crate::features::playback::{
+    PlaybackMonitorPort, PlaybackWorkload, QueueAdvanceContext, QueueAdvanceDecision,
+};
+
+struct FormalTaskDispatcher {
+    business: BusinessRuntimeHandle,
+    running: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
+    loop_idle: Duration,
+    post_settle: Duration,
+}
+
+impl FormalTaskDispatcher {
+    fn run(self) -> Result<()> {
+        while self.running.load(AtomicOrdering::SeqCst) {
+            if self.paused.load(AtomicOrdering::SeqCst) {
+                sleep(self.loop_idle);
+                continue;
+            }
+            let Some(task) = self.business.take_next_formal_task()? else {
+                sleep(self.loop_idle.max(Duration::from_millis(20)));
+                continue;
+            };
+            if self.paused.load(AtomicOrdering::SeqCst) {
+                self.business.restore_formal_task(task)?;
+                sleep(self.loop_idle);
+                continue;
+            }
+            let task_id = task.task_id();
+            let task_label = task.label().to_string();
+            log::info!("待处理任务开始: {}", task_label);
+            let result = match catch_unwind(AssertUnwindSafe(|| task.execute())) {
+                Ok(result) => result,
+                Err(_) => Err(anyhow!("待处理任务执行发生未捕获异常")),
+            };
+            match result {
+                Ok(result) => {
+                    self.business
+                        .complete_formal_task(task_id, FormalTaskCompletion::Succeeded(result))?;
+                    log::info!("待处理任务完成: {}", task_label);
+                    sleep(self.post_settle);
+                }
+                Err(error) => {
+                    self.business.complete_formal_task(
+                        task_id,
+                        FormalTaskCompletion::Failed(format!("错误: {error:#}")),
+                    )?;
+                    log::error!("待处理任务执行异常: {error:#}");
+                }
+            }
+        }
+        Ok(())
+    }
+}
 
 impl ApplicationRuntime {
-    pub(super) fn start_command_executor(&self) -> thread::JoinHandle<()> {
-        let mut executor = self.clone_for_background_task();
+    pub(super) fn start_formal_task_dispatcher(&self) -> thread::JoinHandle<()> {
+        let dispatcher = FormalTaskDispatcher {
+            business: self.business.clone(),
+            running: Arc::clone(&self.running),
+            paused: Arc::clone(&self.paused),
+            loop_idle: Duration::from_millis(self.config.timing.loop_idle_ms),
+            post_settle: Duration::from_millis(self.config.timing.command.post_settle_ms),
+        };
         thread::spawn(move || {
-            log::info!("命令执行线程已启动");
-            if let Err(error) = executor.run_pending_command_loop() {
-                log::error!("命令执行线程异常退出: {error:#}");
+            log::info!("正式任务调度线程已启动");
+            if let Err(error) = dispatcher.run() {
+                log::error!("正式任务调度线程异常退出: {error:#}");
             }
         })
     }
@@ -16,7 +78,7 @@ impl ApplicationRuntime {
             return Ok(());
         }
         let runtime = FormalTaskExecutionRuntime::start(|handle| {
-            let mut app = self.clone_for_background_task();
+            let mut app = self.clone_for_formal_task_execution();
             app.formal_tasks = Some(FormalTaskClient::new(handle, app.business.clone()));
             app
         })?;
@@ -29,17 +91,33 @@ impl ApplicationRuntime {
     }
 
     pub(super) fn start_deferred_chat_sender(&self) -> thread::JoinHandle<()> {
-        let mut sender = self.clone_for_background_task();
+        let sender = DeferredChatSender {
+            retry_delay: Duration::from_millis(self.config.timing.loop_idle_ms.max(50)),
+            running: Arc::clone(&self.running),
+            paused: Arc::clone(&self.paused),
+            business: self.business.clone(),
+            chat_output: self.chat_output.clone(),
+        };
         thread::spawn(move || {
             log::info!("延迟聊天发送线程已启动");
-            if let Err(error) = sender.run_deferred_chat_sender_loop() {
+            if let Err(error) = sender.run() {
                 log::error!("延迟聊天发送线程异常退出: {error:#}");
             }
         })
     }
+}
 
-    fn run_deferred_chat_sender_loop(&mut self) -> Result<()> {
-        let retry_delay = Duration::from_millis(self.config.timing.loop_idle_ms.max(50));
+struct DeferredChatSender {
+    retry_delay: Duration,
+    running: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
+    business: BusinessRuntimeHandle,
+    chat_output: ChatOutput,
+}
+
+impl DeferredChatSender {
+    fn run(self) -> Result<()> {
+        let retry_delay = self.retry_delay;
         while self.running.load(AtomicOrdering::SeqCst) {
             if self.paused.load(AtomicOrdering::SeqCst) {
                 sleep(retry_delay);
@@ -215,25 +293,63 @@ impl ApplicationRuntime {
         Ok(())
     }
 
+    fn active_ui_residency(&self) -> Result<UiResidency> {
+        let snapshot = self.business.chat_listener_snapshot()?;
+        Ok(listener_residency(
+            snapshot.mode,
+            snapshot.temporary_primary,
+        ))
+    }
+
+    fn deferred_chat_target_is_active(&self, target: DeferredChatTarget) -> Result<bool> {
+        Ok(matches!(
+            (target, self.active_ui_residency()?),
+            (DeferredChatTarget::Primary, UiResidency::Primary)
+                | (
+                    DeferredChatTarget::SecondaryCurrentHall,
+                    UiResidency::SecondaryCurrentHall
+                )
+                | (DeferredChatTarget::CurrentHall, _)
+        ))
+    }
+}
+
+impl ApplicationRuntime {
     pub(super) fn start_web_tool_executor(&self) -> thread::JoinHandle<()> {
-        let mut worker = self.clone_for_background_task();
+        let worker = DiagnosticExecutor {
+            business: self.business.clone(),
+            running: Arc::clone(&self.running),
+        };
         thread::spawn(move || {
             log::info!("Web 工具执行线程已启动");
-            worker.run_web_tool_loop();
+            worker.run();
         })
     }
 
     pub(super) fn start_playback_monitor(&self) -> thread::JoinHandle<()> {
-        let mut monitor = self.clone_for_background_task();
+        let monitor = PlaybackMonitorWorker {
+            application: self.playback_application.clone(),
+            player: self.player.clone(),
+            business: self.business.clone(),
+            formal_tasks: self.formal_tasks.clone(),
+            running: Arc::clone(&self.running),
+            paused: Arc::clone(&self.paused),
+            monitor: self.monitor.clone(),
+        };
         thread::spawn(move || {
             log::info!("播放监控线程已启动");
-            monitor.run_playback_monitor_loop();
+            monitor.run();
         })
     }
 
-    pub(super) fn clone_for_background_task(&self) -> Self {
+    // The formal executor is the only worker that may dispatch every vertical module.
+    // All long-lived background workers use the narrow contexts defined in this file.
+    fn clone_for_formal_task_execution(&self) -> Self {
         Self {
             config: self.config.clone(),
+            ocr_args: self.ocr_args.clone(),
+            chat_templates: self.chat_templates.clone(),
+            ui_templates: self.ui_templates.clone(),
             http_server: None,
             hotkeys: None,
             game_ui: self.game_ui.clone(),
@@ -252,11 +368,12 @@ impl ApplicationRuntime {
             formal_task_execution: None,
             formal_tasks: self.formal_tasks.clone(),
             player: self.player.clone(),
+            playback_application: self.playback_application.clone(),
             player_search: self.player_search.clone(),
             player_runtime: None,
             openai_runtime: None,
             ai: self.ai.clone(),
-            song_review: self.song_review.clone(),
+            song_requests: self.song_requests.clone(),
             chat_output: self.chat_output.clone(),
             ocr: self.ocr.clone(),
             ocr_runtime: None,
@@ -265,7 +382,14 @@ impl ApplicationRuntime {
             window_detection_signal: self.window_detection_signal.clone(),
             screen_lock_primed: self.screen_lock_primed.clone(),
             reset_locks_requested: self.reset_locks_requested.clone(),
+            card_games: self.card_games.clone(),
+            administration_application: self.administration_application,
+            hall_application: self.hall_application,
+            idiom_chain_application: self.idiom_chain_application,
+            turtle_soup_application: self.turtle_soup_application,
+            undercover_game: self.undercover_game.clone(),
             moderation: self.moderation.clone(),
+            moderation_workers: self.moderation_workers.clone(),
             startup: self.startup,
             custom_workflow: self.custom_workflow.clone(),
             running: self.running.clone(),
@@ -289,8 +413,95 @@ impl ApplicationRuntime {
             .clone()
             .ok_or_else(|| anyhow!("尚未获取主扫描画面，请稍后重试"))
     }
+}
 
-    fn run_web_tool_loop(&mut self) {
+struct PlaybackMonitorWorker {
+    application: PlaybackApplication,
+    player: PlayerController<PlayerRuntimeBackend, BusinessPlaybackStateAdapter>,
+    business: BusinessRuntimeHandle,
+    formal_tasks: Option<FormalTaskClient>,
+    running: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
+    monitor: MonitorShared,
+}
+
+impl PlaybackMonitorWorker {
+    fn run(mut self) {
+        self.application.clone().run_monitor_loop(&mut self);
+    }
+}
+
+impl PlaybackMonitorPort for PlaybackMonitorWorker {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn is_running(&self) -> bool {
+        self.running.load(AtomicOrdering::SeqCst)
+    }
+
+    fn is_paused(&self) -> bool {
+        self.paused.load(AtomicOrdering::SeqCst)
+    }
+
+    fn wait(&mut self, duration: Duration) {
+        sleep(duration);
+    }
+
+    fn player_status(&mut self) -> Result<PlayerStatus> {
+        self.player.status()
+    }
+
+    fn playback_queue(&mut self) -> Result<Vec<QueueItem>> {
+        self.business
+            .playback_queue_snapshot()
+            .map_err(anyhow::Error::from)
+    }
+
+    fn workload(&mut self) -> Result<PlaybackWorkload> {
+        let scheduler = self.business.scheduler_snapshot()?;
+        Ok(PlaybackWorkload {
+            has_pending_playback_task: scheduler.pending_playback_related(),
+            command_executing: scheduler.is_busy(),
+            song_command_executing: scheduler.active_playback_related(),
+        })
+    }
+
+    fn maybe_advance_queue(
+        &mut self,
+        status: PlayerStatus,
+        context: QueueAdvanceContext,
+    ) -> Result<QueueAdvanceDecision> {
+        self.player.maybe_advance_queue(status, context)
+    }
+
+    fn enqueue_advance_queue(&mut self, reason: &'static str) -> Result<()> {
+        let tasks = self
+            .formal_tasks
+            .clone()
+            .ok_or_else(|| anyhow!("正式任务执行运行时尚未启动"))?;
+        match tasks.enqueue(PendingTask::AdvanceQueue { reason })? {
+            FormalTaskEnqueueOutcome::Queued(_) => Ok(()),
+            FormalTaskEnqueueOutcome::Duplicate => {
+                log::info!("播放队列推进任务已在待执行范围内，跳过重复入队");
+                Ok(())
+            }
+        }
+    }
+
+    fn update_monitor(&mut self) {
+        self.monitor
+            .publish(MonitorEvent::PlaybackController(self.player.snapshot()));
+    }
+}
+
+struct DiagnosticExecutor {
+    business: BusinessRuntimeHandle,
+    running: Arc<AtomicBool>,
+}
+
+impl DiagnosticExecutor {
+    fn run(self) {
         while self.running.load(AtomicOrdering::SeqCst) {
             match self.business.take_next_diagnostic_task() {
                 Ok(Some(task)) => {

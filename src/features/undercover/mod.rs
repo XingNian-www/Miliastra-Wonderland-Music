@@ -5,6 +5,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::features::command::{
+    CommandAuthority, CommandEnvelope, CommandPrefix, FeatureCommandMatch,
+};
 use crate::runtime::timer::{DeadlineKind, DeadlineModule, DeadlineToken};
 
 pub(crate) mod repository;
@@ -12,9 +15,9 @@ mod service;
 
 use super::chat_text::{command_identity, compact_command, display_width};
 pub use service::{
-    UndercoverCommandSource, UndercoverCommandStart, UndercoverDeliveryPort, UndercoverEffect,
-    UndercoverEffectClaim, UndercoverEffectKey, UndercoverEffectLane, UndercoverEffectRequest,
-    UndercoverEffectResult, UndercoverResume, UndercoverRuntimeService, UndercoverTimedOutcome,
+    UndercoverApplication, UndercoverCommandSource, UndercoverCommandStart, UndercoverDeliveryPort,
+    UndercoverEffectClaim, UndercoverEffectKey, UndercoverEffectResult, UndercoverEffectTask,
+    UndercoverResume, UndercoverRuntimePort, UndercoverRuntimeService, UndercoverTimedOutcome,
 };
 
 #[derive(Debug)]
@@ -52,6 +55,55 @@ pub enum UndercoverCommand {
 }
 
 impl UndercoverCommand {
+    pub(crate) fn claims_start_chat(envelope: &CommandEnvelope) -> bool {
+        envelope.prefix() == CommandPrefix::Hash
+            && envelope.authority() == CommandAuthority::HallMember
+            && matches!(
+                compact_command(envelope.command_text()).as_str(),
+                "卧底" | "卧底双"
+            )
+    }
+
+    pub(crate) fn claims_active_chat(envelope: &CommandEnvelope) -> bool {
+        envelope.prefix() == CommandPrefix::Hash
+            && match envelope.authority() {
+                CommandAuthority::HallMember => true,
+                CommandAuthority::Friend => {
+                    let compact = compact_command(envelope.command_text());
+                    matches!(compact.as_str(), "加入" | "退出")
+                        || parse_vote_position(&compact).is_some()
+                }
+            }
+    }
+
+    pub(crate) fn parse_start_chat(
+        envelope: &CommandEnvelope,
+    ) -> Option<FeatureCommandMatch<Self>> {
+        if !Self::claims_start_chat(envelope) {
+            return None;
+        }
+        Self::parse_start(envelope.command_text())
+            .map(|command| FeatureCommandMatch::new("#", envelope.command_text(), command))
+    }
+
+    pub(crate) fn parse_active_chat(
+        envelope: &CommandEnvelope,
+    ) -> Option<FeatureCommandMatch<Self>> {
+        if !Self::claims_active_chat(envelope) {
+            return None;
+        }
+        let command = match envelope.authority() {
+            CommandAuthority::HallMember => Self::parse_hall(envelope.command_text())?,
+            CommandAuthority::Friend => Self::parse_friend(envelope.command_text())?,
+        };
+        let raw = match &command {
+            Self::Vote(_) => "投票".to_string(),
+            Self::Describe(_) => "卧底描述".to_string(),
+            _ => envelope.command_text().to_string(),
+        };
+        Some(FeatureCommandMatch::new("#", raw, command))
+    }
+
     pub(crate) fn parse_start(payload: &str) -> Option<Self> {
         match compact_command(payload).as_str() {
             "卧底" => Some(Self::CreateSingle),
@@ -114,7 +166,7 @@ fn parse_vote_position(value: &str) -> Option<char> {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 pub struct UndercoverConfig {
     pub enabled: bool,
     pub word_bank_path: PathBuf,
@@ -142,6 +194,37 @@ impl Default for UndercoverConfig {
             progress_interval_seconds: 20,
             description_max_width: 70,
         }
+    }
+}
+
+impl UndercoverConfig {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if !(4..=11).contains(&self.max_players) {
+            bail!("undercover.max_players 必须在 4 到 11 之间");
+        }
+        if !(4..=self.max_players).contains(&self.min_players) {
+            bail!("undercover.min_players 必须在 4 到 max_players 之间");
+        }
+        if !(6..=self.max_players).contains(&self.double_min_players) {
+            bail!("undercover.double_min_players 必须在 6 到 max_players 之间");
+        }
+        if self.lobby_timeout_seconds == 0
+            || self.phase_timeout_seconds == 0
+            || self.progress_interval_seconds == 0
+        {
+            bail!("谁是卧底的大厅、阶段和进度间隔必须大于 0 秒");
+        }
+        if self.description_max_width == 0 {
+            bail!("undercover.description_max_width 必须大于 0");
+        }
+        if self.word_bank_path.as_os_str().is_empty() || self.used_state_path.as_os_str().is_empty()
+        {
+            bail!("谁是卧底词库和使用记录路径不能为空");
+        }
+        Ok(())
     }
 }
 

@@ -15,9 +15,10 @@
 
 ```mermaid
 flowchart TD
-    A["点歌命令<br/>游戏聊天 / 远程指挥台"] --> B["BusinessIntent::SongRequest"]
-    B --> C["resolve_and_confirm_song"]
-    C --> D{"是否 AI 点歌<br/>或用户选择 @AI"}
+    A["游戏聊天 CommandEnvelope<br/>或 HTTP ConsoleCommandIntent"] --> B["ModuleCommand::SongRequest"]
+    B --> C["SongRequestApplication::execute"]
+    C --> D0["resolve_and_confirm_song"]
+    D0 --> D{"是否 AI 点歌<br/>或用户选择 @AI"}
     D -->|否| E["FeelUOwn search_and_pick"]
     D -->|是| F["FeelUOwn search_candidates"]
     F --> G["ai.pick_song_candidate<br/>从候选里选择 URI"]
@@ -36,9 +37,10 @@ flowchart TD
 | --- | --- |
 | `src/features/song_request/ai.rs` | 点歌 AI Provider、候选选择、同曲诊断和 Web AI 调试入口的核心实现。 |
 | `src/features/song_request/review.rs` | 候选歌曲审核 Provider、审核提示词、重试、失败策略、JSON 解析。 |
-| `src/composition/application/song_request.rs` | 点歌候选解析、审核、入队和播放确认的组合流程。 |
+| `src/features/song_request/application.rs` | 点歌候选解析、审核、去重和入队/播放决策。 |
+| `src/composition/application/song_request_port.rs` | 搜索、聊天、决策、队列和播放器能力适配。 |
 | `src/interfaces/http/mod.rs` | 远程点歌、远程 AI 点歌、Web AI 调试路由。 |
-| `src/config/mod.rs` | `ai` 和 `song_review` 配置结构。 |
+| `src/features/song_request/ai.rs`、`review.rs` | `ai` 和 `song_review` 模块配置结构与校验。 |
 | `config.yaml` | 默认配置和中文注释。 |
 
 ## 点歌 AI Provider
@@ -83,11 +85,11 @@ AI 点歌可以来自游戏聊天，也可以来自远程指挥台。
 - 非好友来源会通过 `ai_candidate_source()` 搜索 `qqmusic,netease`。
 - 好友来源使用命令里的 `song.source.as_str()`；好友 `SongSource::All` 的字符串为空，表示交给 FeelUOwn 做全来源搜索。
 
-远程 `/ai/search` 会构造 `message_type = "控制台"` 的 `BusinessIntent::SongRequest`，并设置 `ai_assisted = true`。它不是 Web 调试接口，而是远程 AI 点歌入口。
+远程 `/ai/search` 直接构造 `ConsoleCommandIntent`，其中包装 `ModuleCommand::SongRequest` 并设置 `ai_assisted = true`。它保留控制台来源上下文，但不会伪造聊天文本或再次经过聊天解析器。它不是 Web 调试接口，而是远程 AI 点歌入口。
 
 完整时序：
 
-1. `execute_command()` 收到 `BusinessIntent::SongRequest`。
+1. 正式任务把 `ModuleCommand::SongRequest` 交给 `SongRequestApplication::execute()`。
 2. `resolve_and_confirm_song()` 进入候选解析。
 3. 如果命令本身是 AI 点歌，或用户在普通点歌候选确认里选择 `@AI`，进入 AI 点歌路径。
 4. 回复 `AI匹配中`。
@@ -100,7 +102,7 @@ AI 点歌可以来自游戏聊天，也可以来自远程指挥台。
     - `keyword` 是最终候选文本。
     - `uri` 是最终候选 URI。
     - `ai_original_text` 是用户原始点歌意图。
-    - `skip_match_check = true`，避免后续播放确认重复做普通歌名匹配。
+    - 播放确认仍要求稳定观测到相同的非空 URI。
 
 ## 同曲判断
 
@@ -113,7 +115,7 @@ AI 返回 `match=true` 或 `decision=match` 时，只作为独立诊断结果展
 这个设计意味着：
 
 - AI 同曲诊断接口只用于 Web 独立诊断，不参与播放确认，也不会替代候选歌曲审核。
-- AI 点歌返回的 URI 播放时通常会设置 `skip_match_check`，优先等待 URI 生效。
+- AI 点歌和普通点歌使用同一套稳定 URI 播放确认规则。
 - 普通点歌的播放确认只依赖稳定 URI。
 - 同曲判断结果不会直接改播放器后端状态；最终仍由播放器控制器写入确认播放状态和活动播放请求。
 
@@ -184,7 +186,7 @@ AI 返回 `match=true` 或 `decision=match` 时，只作为独立诊断结果展
 
 ## 控制台免审边界
 
-`review_song_candidate()` 里只有一个免审条件：`parsed.message_type == "控制台"`。
+`review_song_candidate()` 里只有一个来源免审条件：`SongRequestContext.message_type == "控制台"`。这个上下文由类型化 HTTP 意图创建，不代表 HTTP 层伪造了聊天命令。
 
 这意味着：
 
@@ -197,15 +199,15 @@ AI 返回 `match=true` 或 `decision=match` 时，只作为独立诊断结果展
 
 | 路由 | 类型 | 行为 |
 | --- | --- | --- |
-| `/searchPlay` | 远程普通点歌 | 构造控制台 `@点歌` 或 `@网易点歌`，进入待执行任务队列。 |
-| `/searchSource` | 远程普通点歌 | 当前和 `/searchPlay` 一样走远程点歌入队。 |
-| `/ai/search` | 远程 AI 点歌 | 构造控制台 `@AI点歌`，进入待执行任务队列。 |
+| `/searchPlay` | 远程普通点歌 | 构造类型化 `SongCommand`，进入正式任务队列。 |
+| `/searchSource` | 远程普通点歌 | 当前和 `/searchPlay` 一样提交类型化远程点歌。 |
+| `/ai/search` | 远程 AI 点歌 | 构造 `ai_assisted=true` 的 `SongCommand`，进入正式任务队列。 |
 | `/ai/recognize` | AI 调试 | 直接调用点歌 AI 文本识别测试，不入队。 |
 | `/ai/match` | AI 调试 | 直接调用点歌 AI 同曲诊断测试，不入队。 |
 | `/ai/pick` | AI 调试 | 直接调用点歌 AI 候选选择测试，不入队。 |
 | `/queue/add` | 直接队列写入 | 直接追加音乐播放队列，不走候选解析和候选审核。 |
 
-HTTP 层只传递原始远程意图。真正搜索、确认、审核、播放保护，都在命令执行线程里完成。
+HTTP 层只验证协议并构造 `ConsoleCommandIntent`。真正搜索、确认、审核和播放保护都由正式任务中的 `SongRequestApplication` 完成。
 
 ## 关键日志
 
@@ -233,14 +235,14 @@ HTTP 层只传递原始远程意图。真正搜索、确认、审核、播放保
 
 想看 AI 点歌：
 
-1. `src/interfaces/chat.rs`：确认 `@AI点歌` 如何变成 `SongCommand`。
-2. `src/composition/application/song_request.rs`：读 `resolve_and_confirm_song()` 和 `resolve_and_confirm_song_ai()`。
+1. `src/features/song_request/mod.rs` 与 `src/interfaces/chat/router.rs`：确认点歌 feature 如何认领并解析 `@AI点歌`。
+2. `src/features/song_request/application.rs`：读候选确认和 AI 分支。
 3. `src/features/song_request/ai.rs`：读 `pick_song_candidate()` 和候选 JSON 校验。
-4. `src/composition/application/commands.rs`：回到 `execute_command()` 看审核、入队和播放。
+4. `src/composition/application/song_request_port.rs`：查看点歌应用服务如何连接播放器、队列、聊天和执行日志端口。
 
 想看候选歌曲审核：
 
-1. `src/composition/application/song_request.rs`：读 `review_song_candidate()` 的调用位置和免审条件。
+1. `src/features/song_request/application.rs`：读 `review_song_candidate()` 的调用位置和免审条件。
 2. `src/features/song_request/review.rs`：读 `review()`、`review_once()`、`build_review_prompt()`。
 3. `config.yaml`：读 `song_review` 默认配置。
 4. `README.md`：读面向用户的审核配置说明。

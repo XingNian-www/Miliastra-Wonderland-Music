@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Result, anyhow, bail};
@@ -149,6 +151,197 @@ pub trait CardGameDeliveryPort {
         deliveries: &[LandlordPrivateDelivery],
     ) -> Result<FriendBatchOutcome>;
     fn send_hall(&self, message: &str) -> Result<()>;
+}
+
+pub trait CardGameRuntimePort: Send + Sync {
+    fn begin(
+        &self,
+        player: &str,
+        command: &LandlordCommand,
+        now: Instant,
+    ) -> Result<CardGameCommandStart>;
+
+    fn claim(&self, key: CardGameEffectKey) -> Result<CardGameEffectClaim>;
+
+    fn resume(
+        &self,
+        key: CardGameEffectKey,
+        result: CardGameEffectResult,
+    ) -> Result<CardGameResume>;
+
+    fn cancel(&self, key: CardGameEffectKey) -> Result<()>;
+
+    fn poll_timed_outcome(
+        &self,
+        now: Instant,
+        clock_active: bool,
+    ) -> Result<Option<CardGameTimedOutcome>>;
+
+    fn abort(&self) -> Result<bool>;
+}
+
+#[derive(Clone)]
+pub struct CardGameApplication {
+    runtime: Arc<dyn CardGameRuntimePort>,
+}
+
+impl CardGameApplication {
+    pub fn new(runtime: Arc<dyn CardGameRuntimePort>) -> Self {
+        Self { runtime }
+    }
+
+    pub fn execute_command(
+        &self,
+        player: &str,
+        command: &LandlordCommand,
+        now: Instant,
+        lane: CardGameEffectLane,
+        delivery: &dyn CardGameDeliveryPort,
+    ) -> Result<()> {
+        let start = self.runtime.begin(player, command, now)?;
+        self.drive_start(start, lane, delivery)
+    }
+
+    pub fn drive_start(
+        &self,
+        start: CardGameCommandStart,
+        expected_lane: CardGameEffectLane,
+        delivery: &dyn CardGameDeliveryPort,
+    ) -> Result<()> {
+        match start {
+            CardGameCommandStart::Completed(_) => Ok(()),
+            CardGameCommandStart::Suspended(request) => {
+                self.drive_effect_chain(request, expected_lane, CardGameLatePolicy::Error, delivery)
+            }
+        }
+    }
+
+    pub fn poll_timed_outcome(
+        &self,
+        now: Instant,
+        clock_active: bool,
+    ) -> Result<Option<CardGameTimedOutcome>> {
+        self.runtime.poll_timed_outcome(now, clock_active)
+    }
+
+    pub fn timed_effect(&self, outcome: CardGameTimedOutcome) -> CardGameEffectTask {
+        self.effect_task(outcome.action(), outcome.into_request())
+    }
+
+    pub fn effect_task(
+        &self,
+        action: &'static str,
+        request: CardGameEffectRequest,
+    ) -> CardGameEffectTask {
+        CardGameEffectTask {
+            application: self.clone(),
+            action,
+            request,
+        }
+    }
+
+    pub fn cancel_effect(&self, key: CardGameEffectKey) -> Result<()> {
+        self.runtime.cancel(key)
+    }
+
+    pub fn abort(&self) -> Result<bool> {
+        self.runtime.abort()
+    }
+
+    fn drive_effect_chain(
+        &self,
+        mut request: CardGameEffectRequest,
+        expected_lane: CardGameEffectLane,
+        late_policy: CardGameLatePolicy,
+        delivery: &dyn CardGameDeliveryPort,
+    ) -> Result<()> {
+        loop {
+            if request.lane != expected_lane {
+                let _ = self.runtime.cancel(request.key);
+                bail!(
+                    "牌局效果通道不一致: expected={expected_lane:?} actual={:?}",
+                    request.lane
+                );
+            }
+            match self.runtime.claim(request.key)? {
+                CardGameEffectClaim::Claimed => {}
+                CardGameEffectClaim::Late(_) => return handle_late_card_game_effect(late_policy),
+            }
+            let key = request.key;
+            let result = match request.effect {
+                CardGameEffect::FriendVerify { player, message } => {
+                    CardGameEffectResult::FriendVerify(run_card_game_delivery(
+                        "好友验证",
+                        || delivery.verify_friend(&player, &message),
+                    ))
+                }
+                CardGameEffect::PrivateDelivery { player, message } => {
+                    CardGameEffectResult::PrivateDelivery(run_card_game_delivery(
+                        "好友消息发送",
+                        || delivery.send_friend(&player, &message),
+                    ))
+                }
+                CardGameEffect::PrivateBatch { deliveries } => CardGameEffectResult::PrivateBatch(
+                    run_card_game_delivery("好友批量消息发送", || {
+                        delivery.send_friend_batch(&deliveries)
+                    }),
+                ),
+                CardGameEffect::HallDelivery { message } => CardGameEffectResult::HallDelivery(
+                    run_card_game_delivery("大厅消息发送", || delivery.send_hall(&message)),
+                ),
+            };
+            match self.runtime.resume(key, result)? {
+                CardGameResume::Completed(_) => return Ok(()),
+                CardGameResume::Suspended(next) => request = next,
+                CardGameResume::Late(_) => return handle_late_card_game_effect(late_policy),
+            }
+        }
+    }
+}
+
+pub struct CardGameEffectTask {
+    application: CardGameApplication,
+    action: &'static str,
+    request: CardGameEffectRequest,
+}
+
+impl CardGameEffectTask {
+    pub fn label(&self) -> String {
+        format!("发送牌局计时结果({})", self.action)
+    }
+
+    pub fn execute(self, delivery: &dyn CardGameDeliveryPort) -> Result<()> {
+        self.application.drive_effect_chain(
+            self.request,
+            CardGameEffectLane::Formal,
+            CardGameLatePolicy::Ignore,
+            delivery,
+        )
+    }
+
+    pub fn cancel(&self) -> Result<()> {
+        self.application.cancel_effect(self.request.key)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CardGameLatePolicy {
+    Error,
+    Ignore,
+}
+
+fn run_card_game_delivery<T>(label: &str, delivery: impl FnOnce() -> Result<T>) -> Result<T> {
+    match catch_unwind(AssertUnwindSafe(delivery)) {
+        Ok(result) => result,
+        Err(_) => Err(anyhow!("牌局{label}发生未捕获异常")),
+    }
+}
+
+fn handle_late_card_game_effect(policy: CardGameLatePolicy) -> Result<()> {
+    match policy {
+        CardGameLatePolicy::Ignore => Ok(()),
+        CardGameLatePolicy::Error => bail!("牌局命令在效果链完成前已失效"),
+    }
 }
 
 impl CardGameStartReservation {

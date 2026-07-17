@@ -27,7 +27,7 @@ pub fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
 
 #[cfg(target_os = "windows")]
 pub fn watchdog_restart_ms(config_path: &std::path::Path) -> anyhow::Result<u64> {
-    Ok(config::AppConfig::load(config_path)?
-        .timing
-        .watchdog_restart_ms)
+    let config = config::AppConfig::load(config_path)?;
+    config.validate()?;
+    Ok(config.timing.watchdog_restart_ms)
 }

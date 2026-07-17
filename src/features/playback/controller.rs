@@ -1,5 +1,5 @@
-use std::thread::sleep;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 
@@ -9,17 +9,13 @@ use super::format::{
 };
 use super::state::{
     ActivePlaybackRequest, ConfirmedPlaybackState, ObservationReliability, PauseReason,
-    PlaybackObservation, PlaybackRuntimeState, RuntimeState,
+    PlaybackObservation, PlaybackRuntimeState,
 };
-use crate::config::{MatchConfig, PlaybackTimingConfig, QueueConfig};
-use crate::features::playback::{PlaybackControllerSnapshot, PlaybackStateUpdate, PlayerStatus};
-use crate::runtime::business::BusinessRuntimeHandle;
-use crate::runtime::identity::BusinessOperationIdAllocator;
-use crate::runtime::player::TransportState;
-use crate::runtime::player_io::{
-    ControlDispatchOutcome, ObservationWaitOutcome, PlayerControl, PlayerObservationRevision,
-    PlayerOperationReceiveError, PlayerRuntimeHandle,
+use crate::features::playback::{
+    MatchConfig, PlaybackControllerSnapshot, PlaybackStateUpdate, PlaybackTimingConfig,
+    PlayerStatus, QueueConfig,
 };
+use crate::runtime::clock::{Clock, Delay, WallClock};
 
 pub(crate) trait MusicPlayerBackend: Clone + Send + Sync + 'static {
     fn status(&self) -> Result<PlayerStatus>;
@@ -32,7 +28,7 @@ pub(crate) trait MusicPlayerBackend: Clone + Send + Sync + 'static {
 }
 
 pub(crate) trait PlaybackStatePort: Clone + Send + Sync + 'static {
-    fn snapshot(&self) -> Result<RuntimeState>;
+    fn snapshot(&self) -> Result<PlaybackRuntimeState>;
     fn update(&self, update: PlaybackStateUpdate) -> Result<bool>;
     fn song_dedup_limited(&self, candidate: SongDedupCandidate) -> Result<bool>;
     fn record_song_dedup(&self, candidate: SongDedupCandidate) -> Result<()>;
@@ -45,163 +41,37 @@ pub(crate) trait PlaybackStatePort: Clone + Send + Sync + 'static {
     fn clear_external_playback_tracker(&self) -> Result<()>;
 }
 
-impl PlaybackStatePort for BusinessRuntimeHandle {
-    fn snapshot(&self) -> Result<RuntimeState> {
-        self.runtime_state_snapshot().map_err(anyhow::Error::from)
-    }
-
-    fn update(&self, update: PlaybackStateUpdate) -> Result<bool> {
-        self.update_playback_state(update)
-            .map_err(anyhow::Error::from)
-    }
-
-    fn song_dedup_limited(&self, candidate: SongDedupCandidate) -> Result<bool> {
-        self.song_dedup_limited(candidate)
-            .map_err(anyhow::Error::from)
-    }
-
-    fn record_song_dedup(&self, candidate: SongDedupCandidate) -> Result<()> {
-        self.record_song_dedup(candidate)
-            .map_err(anyhow::Error::from)
-    }
-
-    fn observe_external_playback(
-        &self,
-        identity: String,
-        now: Instant,
-        protect_after: Duration,
-    ) -> Result<super::ExternalPlaybackObservation> {
-        self.observe_external_playback(identity, now, protect_after)
-            .map_err(anyhow::Error::from)
-    }
-
-    fn clear_external_playback_tracker(&self) -> Result<()> {
-        self.clear_external_playback_tracker()
-            .map_err(anyhow::Error::from)
-    }
-}
-
 #[derive(Clone)]
-pub(crate) struct PlayerRuntimeBackend {
-    runtime: PlayerRuntimeHandle,
-    operation_ids: BusinessOperationIdAllocator,
-}
-
-impl PlayerRuntimeBackend {
-    pub(crate) fn new(runtime: PlayerRuntimeHandle) -> Self {
-        Self {
-            runtime,
-            operation_ids: BusinessOperationIdAllocator::new(),
-        }
-    }
-
-    fn dispatch(&self, control: PlayerControl) -> Result<String> {
-        let operation_id = self
-            .operation_ids
-            .allocate()
-            .map_err(|error| anyhow!("播放器控制操作编号耗尽: {error}"))?;
-        let operation = self
-            .runtime
-            .submit_control(operation_id, control)
-            .map_err(|error| anyhow!("提交播放器控制操作失败: {error}"))?;
-        let result = operation
-            .wait()
-            .map_err(|error: PlayerOperationReceiveError| {
-                anyhow!("等待播放器控制结果失败: {error}")
-            })?;
-        match result.outcome {
-            ControlDispatchOutcome::Acknowledged { response } => Ok(response),
-            ControlDispatchOutcome::Rejected { reason }
-            | ControlDispatchOutcome::NotSent { reason }
-            | ControlDispatchOutcome::OutcomeUnknown { reason } => {
-                Err(anyhow!("播放器控制未确认: {reason}"))
-            }
-        }
-    }
-}
-
-impl MusicPlayerBackend for PlayerRuntimeBackend {
-    fn status(&self) -> Result<PlayerStatus> {
-        let observation = self.runtime.latest_observation().or_else(|| {
-            match self.runtime.wait_for_observation_after(
-                PlayerObservationRevision::INITIAL,
-                Duration::from_secs(1),
-            ) {
-                ObservationWaitOutcome::Advanced(observation) => Some(observation),
-                ObservationWaitOutcome::TimedOut | ObservationWaitOutcome::RuntimeStopped => None,
-            }
-        });
-        let observation = observation.ok_or_else(|| anyhow!("播放器运行时尚未发布观测"))?;
-        let observation = observation.observation();
-        let transport = observation
-            .fresh_transport()
-            .or(observation.transport)
-            .map(|transport| match transport {
-                TransportState::Playing => "playing",
-                TransportState::Paused => "paused",
-                TransportState::Stopped => "stopped",
-            })
-            .unwrap_or("unknown");
-        Ok(PlayerStatus {
-            status: transport.to_string(),
-            current_uri: observation
-                .fresh_identity()
-                .map(|identity| identity.uri)
-                .unwrap_or_default(),
-            name: observation.title.clone().unwrap_or_default(),
-            singer: observation.artist.clone().unwrap_or_default(),
-            album_name: observation.album_name.clone().unwrap_or_default(),
-            lyric_line_text: observation.lyric_line_text.clone().unwrap_or_default(),
-            duration: observation
-                .duration
-                .map_or(0.0, |duration| duration.as_secs_f64()),
-            progress: observation
-                .progress
-                .map_or(0.0, |progress| progress.as_secs_f64()),
-            playback_rate: observation.playback_rate.unwrap_or(1.0),
-            volume: observation.volume.unwrap_or_default(),
-        })
-    }
-
-    fn play_uri(&self, uri: &str) -> Result<String> {
-        self.dispatch(PlayerControl::PlayUri(uri.to_string()))
-    }
-
-    fn pause(&self) -> Result<String> {
-        self.dispatch(PlayerControl::Pause)
-    }
-
-    fn resume(&self) -> Result<String> {
-        self.dispatch(PlayerControl::Resume)
-    }
-
-    fn next(&self) -> Result<String> {
-        self.dispatch(PlayerControl::Next)
-    }
-
-    fn previous(&self) -> Result<String> {
-        self.dispatch(PlayerControl::Previous)
-    }
-
-    fn set_volume(&self, volume: &str) -> Result<String> {
-        let volume = volume
-            .trim()
-            .parse::<u8>()
-            .map_err(|_| anyhow!("播放器音量不是有效的 0-100 数字"))?;
-        self.dispatch(PlayerControl::SetVolume(volume))
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct PlayerController<
-    B: MusicPlayerBackend,
-    S: PlaybackStatePort = BusinessRuntimeHandle,
-> {
+pub(crate) struct PlayerController<B: MusicPlayerBackend, S: PlaybackStatePort> {
     backend: B,
     playback_state: S,
     timing: PlaybackTimingConfig,
     queue: QueueConfig,
     matching: MatchConfig,
+    clock: Arc<dyn Clock>,
+    wall_clock: Arc<dyn WallClock>,
+    delay: Arc<dyn Delay>,
+}
+
+#[derive(Clone)]
+pub(crate) struct PlaybackTimePorts {
+    clock: Arc<dyn Clock>,
+    wall_clock: Arc<dyn WallClock>,
+    delay: Arc<dyn Delay>,
+}
+
+impl PlaybackTimePorts {
+    pub(crate) fn new(
+        clock: Arc<dyn Clock>,
+        wall_clock: Arc<dyn WallClock>,
+        delay: Arc<dyn Delay>,
+    ) -> Self {
+        Self {
+            clock,
+            wall_clock,
+            delay,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -255,6 +125,18 @@ pub(crate) struct PlaybackAttempt {
     pub(crate) initial_progress: f64,
     pub(crate) requested_uri: String,
     previous_playback: PlaybackRuntimeState,
+}
+
+#[cfg(test)]
+impl PlaybackAttempt {
+    pub(super) fn for_test(requested_uri: impl Into<String>) -> Self {
+        Self {
+            initial_uri: String::new(),
+            initial_progress: 0.0,
+            requested_uri: requested_uri.into(),
+            previous_playback: PlaybackRuntimeState::default(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -311,6 +193,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         timing: &PlaybackTimingConfig,
         queue: &QueueConfig,
         matching: &MatchConfig,
+        time: PlaybackTimePorts,
     ) -> Self {
         Self {
             backend,
@@ -318,6 +201,9 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             timing: timing.clone(),
             queue: queue.clone(),
             matching: matching.clone(),
+            clock: time.clock,
+            wall_clock: time.wall_clock,
+            delay: time.delay,
         }
     }
 
@@ -380,7 +266,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         let runtime = self.playback_state.snapshot()?;
         Ok(status_matches_active_request(
             &self.matching,
-            runtime.playback.active_request.as_ref(),
+            runtime.active_request.as_ref(),
             status,
         ))
     }
@@ -396,7 +282,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             return Ok(protected);
         }
         let runtime = self.playback_state.snapshot()?;
-        let playback = &runtime.playback;
+        let playback = &runtime;
         if playback.active_request.is_none() {
             return Ok(false);
         }
@@ -422,7 +308,11 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         if status.current_uri.trim().is_empty() {
             return Ok(false);
         }
-        if active_request_guard_active(&self.timing, playback.active_request.as_ref()) {
+        if active_request_guard_active(
+            &self.timing,
+            playback.active_request.as_ref(),
+            self.clock.now(),
+        ) {
             return Ok(true);
         }
         Ok(status.status != "stopped" && status.status != "stoped")
@@ -454,7 +344,8 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
                 song: String::new(),
                 title: String::new(),
                 artist: String::new(),
-                started_at_ms: current_unix_millis(),
+                started_at_ms: self.wall_clock.unix_millis(),
+                guard_started_at: Some(self.clock.now()),
             }))?;
         log::info!("播放器状态转移: Starting keyword={}", request.keyword);
         Ok(PlaybackAttempt {
@@ -479,7 +370,8 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         request: &PlaybackRequest,
         attempt: &mut PlaybackAttempt,
     ) -> Result<PlaybackVerification> {
-        sleep(Duration::from_millis(self.timing.search_settle_ms));
+        self.delay
+            .wait(Duration::from_millis(self.timing.search_settle_ms));
 
         for retry in 0..self.timing.status_retries {
             let status = match self.backend.status() {
@@ -487,7 +379,8 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
                 Err(error) => {
                     log::error!("查询播放状态失败: {error:#}");
                     self.mark_unknown()?;
-                    sleep(Duration::from_millis(self.timing.status_poll_ms));
+                    self.delay
+                        .wait(Duration::from_millis(self.timing.status_poll_ms));
                     continue;
                 }
             };
@@ -503,7 +396,8 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             );
 
             if status.status != "playing" && status.status != "paused" {
-                sleep(Duration::from_millis(self.timing.status_poll_ms));
+                self.delay
+                    .wait(Duration::from_millis(self.timing.status_poll_ms));
                 continue;
             }
 
@@ -515,7 +409,8 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
                     retry + 1,
                     self.timing.status_retries
                 );
-                sleep(Duration::from_millis(self.timing.status_poll_ms));
+                self.delay
+                    .wait(Duration::from_millis(self.timing.status_poll_ms));
                 continue;
             }
             if current_uri.is_empty() {
@@ -524,7 +419,8 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
                     retry + 1,
                     self.timing.status_retries
                 );
-                sleep(Duration::from_millis(self.timing.status_poll_ms));
+                self.delay
+                    .wait(Duration::from_millis(self.timing.status_poll_ms));
                 continue;
             }
             if current_uri != requested_uri {
@@ -537,7 +433,8 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
                         retry + 1,
                         self.timing.status_retries
                     );
-                    sleep(Duration::from_millis(self.timing.status_poll_ms));
+                    self.delay
+                        .wait(Duration::from_millis(self.timing.status_poll_ms));
                     continue;
                 }
                 log::info!(
@@ -566,7 +463,8 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
                     retry + 1,
                     self.timing.status_retries
                 );
-                sleep(Duration::from_millis(self.timing.status_poll_ms));
+                self.delay
+                    .wait(Duration::from_millis(self.timing.status_poll_ms));
                 continue;
             }
             if status.duration > 0.0 && status.duration < 20.0 {
@@ -600,12 +498,15 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
     ) -> Result<QueueAdvanceDecision> {
         let mut status = snapshot_status;
         let external_playback_protected = self.observe_external_playback(&status)?.unwrap_or(false);
-        let runtime_snapshot = self.playback_state.snapshot()?.playback;
+        let runtime_snapshot = self.playback_state.snapshot()?;
         if runtime_snapshot.state == ConfirmedPlaybackState::Unknown {
             return Ok(QueueAdvanceDecision::None);
         }
-        let guard_active =
-            active_request_guard_active(&self.timing, runtime_snapshot.active_request.as_ref());
+        let guard_active = active_request_guard_active(
+            &self.timing,
+            runtime_snapshot.active_request.as_ref(),
+            self.clock.now(),
+        );
 
         if runtime_snapshot.active_request.is_some()
             && !status_matches_active_request(
@@ -681,7 +582,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             || context.has_pending_playback_task
             || context.song_command_executing;
 
-        let pause_reason = self.playback_state.snapshot()?.playback.pause_reason;
+        let pause_reason = self.playback_state.snapshot()?.pause_reason;
 
         if pause_reason == PauseReason::User {
             return Ok(QueueAdvanceDecision::None);
@@ -798,7 +699,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
                 observed_at_ms: 0,
             },
             |runtime| {
-                let playback = &runtime.playback;
+                let playback = &runtime;
                 let observation = playback.last_observation.as_ref();
                 PlaybackControllerSnapshot {
                     state: format_state(playback.state),
@@ -846,7 +747,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
 
     fn pause_for_queue(&self) -> Result<bool> {
         let already_waiting =
-            self.playback_state.snapshot()?.playback.pause_reason == PauseReason::WaitingForQueue;
+            self.playback_state.snapshot()?.pause_reason == PauseReason::WaitingForQueue;
         if already_waiting {
             return Ok(false);
         }
@@ -859,7 +760,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
 
     fn resume_waiting_for_queue_if_idle(&self) -> Result<QueueAdvanceDecision> {
         let should_resume =
-            self.playback_state.snapshot()?.playback.pause_reason == PauseReason::WaitingForQueue;
+            self.playback_state.snapshot()?.pause_reason == PauseReason::WaitingForQueue;
         if !should_resume {
             return Ok(QueueAdvanceDecision::None);
         }
@@ -895,7 +796,8 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             song: format!("{}{}", status.name, status.singer),
             title: status.name.trim().to_string(),
             artist: status.singer.trim().to_string(),
-            started_at_ms: current_unix_millis(),
+            started_at_ms: self.wall_clock.unix_millis(),
+            guard_started_at: Some(self.clock.now()),
         };
         self.playback_state
             .update(PlaybackStateUpdate::Confirmed(active_request))?;
@@ -943,7 +845,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             artist: status.singer.clone(),
             progress: status.progress,
             duration: status.duration,
-            captured_at_ms: current_unix_millis(),
+            captured_at_ms: self.wall_clock.unix_millis(),
             reliability,
         };
         self.playback_state
@@ -961,7 +863,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
     fn observe_external_playback(&self, status: &PlayerStatus) -> Result<Option<bool>> {
         let (is_external, should_mark_external) = {
             let runtime = self.playback_state.snapshot()?;
-            let playback = &runtime.playback;
+            let playback = &runtime;
             let is_external = playback.active_request.is_none()
                 && playback.state != ConfirmedPlaybackState::Unknown
                 && playback.pause_reason != PauseReason::WaitingForQueue;
@@ -979,7 +881,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         let protect_after = Duration::from_secs(self.queue.external_playback_protect_after_seconds);
         let observation = self.playback_state.observe_external_playback(
             identity.clone(),
-            Instant::now(),
+            self.clock.now(),
             protect_after,
         )?;
         if should_mark_external {
@@ -1000,7 +902,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
     }
 
     fn playback_snapshot(&self) -> Result<PlaybackRuntimeState> {
-        Ok(self.playback_state.snapshot()?.playback)
+        self.playback_state.snapshot()
     }
 
     fn restore_playback_state(&self, playback: PlaybackRuntimeState) -> Result<()> {
@@ -1049,19 +951,20 @@ fn status_matches_active_request(
 fn active_request_guard_active(
     timing: &PlaybackTimingConfig,
     active_request: Option<&ActivePlaybackRequest>,
+    now: Instant,
 ) -> bool {
     let Some(active_request) = active_request else {
         return false;
     };
-    if active_request.started_at_ms == 0 {
+    let Some(started_at) = active_request.guard_started_at else {
         return false;
-    }
+    };
     let guard_ms = timing
         .monitor_status_ms
         .max(timing.status_poll_ms)
         .saturating_mul(3)
         .max(3000);
-    current_unix_millis() < active_request.started_at_ms.saturating_add(guard_ms)
+    now.saturating_duration_since(started_at) < Duration::from_millis(guard_ms)
 }
 
 fn active_request_track_changed(
@@ -1148,18 +1051,12 @@ fn format_reliability(reliability: ObservationReliability) -> String {
     .to_string()
 }
 
-fn current_unix_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::super::{PersistentRuntimeState, PersistentSongDedupHistory};
+    use super::super::{PersistentPlaybackState, PersistentSongDedupHistory};
     use super::*;
-    use crate::config::SongDedupConfig;
+    use crate::features::playback::SongDedupConfig;
+    use crate::runtime::clock::{Clock, Delay, ManualClock, SystemClock, WallClock};
     use std::collections::VecDeque;
     use std::fs;
     use std::path::PathBuf;
@@ -1170,21 +1067,20 @@ mod tests {
 
     #[derive(Clone)]
     struct TestPlaybackState {
-        runtime: Arc<Mutex<PersistentRuntimeState>>,
+        runtime: Arc<Mutex<PersistentPlaybackState>>,
         history: Arc<Mutex<PersistentSongDedupHistory>>,
         external_playback_tracker: Arc<Mutex<ExternalPlaybackTracker>>,
-        matching: MatchConfig,
         song_dedup: SongDedupConfig,
     }
 
     impl PlaybackStatePort for TestPlaybackState {
-        fn snapshot(&self) -> Result<RuntimeState> {
+        fn snapshot(&self) -> Result<PlaybackRuntimeState> {
             Ok(self.runtime.lock().unwrap().state().clone())
         }
 
         fn update(&self, update: PlaybackStateUpdate) -> Result<bool> {
             let mut runtime = self.runtime.lock().unwrap();
-            let changed = update.apply(&mut runtime.state_mut().playback);
+            let changed = update.apply(runtime.state_mut());
             if changed {
                 runtime.save()?;
             }
@@ -1192,11 +1088,11 @@ mod tests {
         }
 
         fn song_dedup_limited(&self, candidate: SongDedupCandidate) -> Result<bool> {
-            Ok(self.history.lock().unwrap().is_limited(
-                &self.song_dedup,
-                &self.matching,
-                &candidate,
-            ))
+            Ok(self
+                .history
+                .lock()
+                .unwrap()
+                .is_limited(&self.song_dedup, &candidate))
         }
 
         fn record_song_dedup(&self, candidate: SongDedupCandidate) -> Result<()> {
@@ -1311,12 +1207,27 @@ mod tests {
     }
 
     fn controller(backend: FakeBackend) -> PlayerController<FakeBackend, TestPlaybackState> {
+        let system_time = Arc::new(SystemClock);
+        controller_with_time(
+            backend,
+            system_time.clone(),
+            system_time.clone(),
+            system_time,
+        )
+    }
+
+    fn controller_with_time(
+        backend: FakeBackend,
+        clock: Arc<dyn Clock>,
+        wall_clock: Arc<dyn WallClock>,
+        delay: Arc<dyn Delay>,
+    ) -> PlayerController<FakeBackend, TestPlaybackState> {
         let runtime_path = temp_path("runtime");
         let history_path = temp_path("dedup");
         let _ = fs::remove_file(&runtime_path);
         let _ = fs::remove_file(&history_path);
-        let runtime = PersistentRuntimeState::load(runtime_path).unwrap();
-        let history = PersistentSongDedupHistory::load(history_path).unwrap();
+        let runtime = PersistentPlaybackState::load(runtime_path).unwrap();
+        let history = PersistentSongDedupHistory::load(history_path, wall_clock.clone()).unwrap();
         let matching = MatchConfig::default();
         let song_dedup = SongDedupConfig {
             history_path: temp_path("dedup-config"),
@@ -1328,22 +1239,9 @@ mod tests {
                 runtime: Arc::new(Mutex::new(runtime)),
                 history: Arc::new(Mutex::new(history)),
                 external_playback_tracker: Arc::new(Mutex::new(ExternalPlaybackTracker::default())),
-                matching: matching.clone(),
                 song_dedup,
             },
-            &PlaybackTimingConfig {
-                search_settle_ms: 0,
-                status_poll_ms: 0,
-                status_retries: 3,
-                skip_status_initial_ms: 0,
-                skip_status_poll_ms: 0,
-                skip_status_retries: 1,
-                monitor_tick_ms: 50,
-                monitor_status_ms: 50,
-                uri_stable_samples: 0,
-                transport_stable_samples: 0,
-                stale_timeout_ms: 5000,
-            },
+            &test_timing(),
             &QueueConfig {
                 max_size: 10,
                 auto_advance_seconds: 2,
@@ -1351,7 +1249,24 @@ mod tests {
                 external_playback_protect_after_seconds: 20,
             },
             &matching,
+            PlaybackTimePorts::new(clock, wall_clock, delay),
         )
+    }
+
+    fn test_timing() -> PlaybackTimingConfig {
+        PlaybackTimingConfig {
+            search_settle_ms: 0,
+            status_poll_ms: 0,
+            status_retries: 3,
+            skip_status_initial_ms: 0,
+            skip_status_poll_ms: 0,
+            skip_status_retries: 1,
+            monitor_tick_ms: 50,
+            monitor_status_ms: 50,
+            uri_stable_samples: 0,
+            transport_stable_samples: 0,
+            stale_timeout_ms: 5000,
+        }
     }
 
     fn request() -> PlaybackRequest {
@@ -1487,8 +1402,9 @@ mod tests {
         ]);
         let controller = controller(backend);
         controller.begin_playback_attempt(&request()).unwrap();
-        let mut playback = controller.playback_state.snapshot().unwrap().playback;
-        playback.active_request.as_mut().unwrap().started_at_ms = 1;
+        let mut playback = controller.playback_state.snapshot().unwrap();
+        playback.active_request.as_mut().unwrap().guard_started_at =
+            Some(Instant::now() - Duration::from_secs(60));
         controller
             .playback_state
             .update(PlaybackStateUpdate::Restore(playback))
@@ -1585,6 +1501,72 @@ mod tests {
             "uri:fuo://qqmusic/songs/next",
             now + Duration::from_secs(21),
             delay
+        ));
+    }
+
+    #[test]
+    fn external_playback_protection_uses_the_injected_clock() {
+        let clock = Arc::new(ManualClock::new(Instant::now()));
+        let controller = controller_with_time(
+            FakeBackend::new(vec![]),
+            clock.clone(),
+            clock.clone(),
+            clock.clone(),
+        );
+        let external = status("外部歌", "fuo://qqmusic/songs/external", 30.0, 180.0);
+        controller.mark_external_playback().unwrap();
+
+        assert!(
+            !controller
+                .should_queue_until_current_song_finished(&external)
+                .unwrap()
+        );
+        clock.advance(Duration::from_secs(20)).unwrap();
+        assert!(
+            controller
+                .should_queue_until_current_song_finished(&external)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn active_request_guard_uses_only_the_injected_monotonic_anchor() {
+        let started_at = Instant::now();
+        let clock = ManualClock::with_unix_seconds(started_at, 10);
+        let timing = test_timing();
+        let active_request = ActivePlaybackRequest {
+            // Deliberately unrelated wall-clock metadata: changing it must not affect the guard.
+            started_at_ms: u64::MAX,
+            guard_started_at: Some(started_at),
+            ..ActivePlaybackRequest::default()
+        };
+        let guard_ms = timing
+            .monitor_status_ms
+            .max(timing.status_poll_ms)
+            .saturating_mul(3)
+            .max(3000);
+
+        assert!(active_request_guard_active(
+            &timing,
+            Some(&active_request),
+            clock.now(),
+        ));
+        clock.advance(Duration::from_millis(guard_ms)).unwrap();
+        assert!(!active_request_guard_active(
+            &timing,
+            Some(&active_request),
+            clock.now(),
+        ));
+
+        let restored_request = ActivePlaybackRequest {
+            started_at_ms: clock.unix_millis(),
+            guard_started_at: None,
+            ..ActivePlaybackRequest::default()
+        };
+        assert!(!active_request_guard_active(
+            &timing,
+            Some(&restored_request),
+            clock.now(),
         ));
     }
 

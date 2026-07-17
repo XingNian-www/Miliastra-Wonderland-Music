@@ -26,28 +26,6 @@ impl ApplicationRuntime {
         }
     }
 
-    pub(super) fn log_queue(&self) -> Result<()> {
-        let (len, entries) = {
-            let queue = self.playback_queue()?;
-            let entries = queue
-                .iter()
-                .enumerate()
-                .map(|(index, item)| format!("{}.{}", index + 1, item.keyword))
-                .collect::<Vec<_>>()
-                .join(", ");
-            (queue.len(), entries)
-        };
-        if len == 0 {
-            self.reply("队列为空")?;
-        } else {
-            self.reply(&format!(
-                "队列({}/{}): {}",
-                len, self.config.queue.max_size, entries
-            ))?;
-        }
-        Ok(())
-    }
-
     pub(super) fn update_monitor_playback_controller(&self) {
         self.monitor
             .publish(MonitorEvent::PlaybackController(self.player.snapshot()));

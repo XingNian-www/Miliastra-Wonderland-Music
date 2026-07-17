@@ -99,9 +99,9 @@ fn load_candidates(path: &Path) -> Result<Vec<UndercoverWordPair>> {
     Ok(candidates)
 }
 
-#[derive(Default, Deserialize, Serialize)]
+#[derive(Deserialize, Serialize)]
 struct UsedPairFile {
-    #[serde(rename = "已用词对", default)]
+    #[serde(rename = "已用词对")]
     pairs: Vec<[String; 2]>,
 }
 
@@ -198,7 +198,7 @@ mod tests {
     }
 
     #[test]
-    fn corrupted_usage_record_fails_closed_without_overwriting_it() {
+    fn invalid_or_incomplete_usage_record_fails_closed_without_overwriting_it() {
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -212,12 +212,14 @@ mod tests {
             "词组:\n  - 平民词: 苹果\n    卧底词: 梨\n    启用: true\n",
         )
         .unwrap();
-        fs::write(&used_path, "已用词对: [").unwrap();
         let store = UndercoverBankStore::new(bank_path, used_path.clone());
 
-        let error = store.consume_random(1).unwrap_err();
+        for invalid in ["{}", "已用词对: ["] {
+            fs::write(&used_path, invalid).unwrap();
+            let error = store.consume_random(1).unwrap_err();
 
-        assert!(error.to_string().contains("解析谁是卧底永久使用记录失败"));
-        assert_eq!(fs::read_to_string(used_path).unwrap(), "已用词对: [");
+            assert!(error.to_string().contains("解析谁是卧底永久使用记录失败"));
+            assert_eq!(fs::read_to_string(&used_path).unwrap(), invalid);
+        }
     }
 }

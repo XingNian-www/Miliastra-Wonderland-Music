@@ -8,16 +8,31 @@
 - 通过蓝色、黄色、粉色聊天标志切分聊天块；命令只处理蓝色大厅消息和粉色好友私聊
 - 支持大厅点歌、AI 点歌、搜索确认、队列、播放控制、音量、状态、歌词、大厅检测和大厅剩余时间
 - 支持好友私聊点歌、邀请、麦克风切换、非粉色命令开关、闲置退出、UID 拉黑和 UID 屏蔽聊天
+- 支持运行期切换一级/二级聊天监听；二级监听会监听当前大厅气泡，并通过好友未读红点处理最新私聊命令
 - 点歌会先搜索候选，再等待 `@确认`、`@跳过`、`@换源`、`@AI`；超时按确认处理
 - 播放统一走搜索结果 URI，减少播放器内部模糊搜索选错歌的情况
 - AI 点歌会先从音乐源搜索候选，再让 AI 从候选里选择，不让 AI 直接编歌曲 URI
-- 队列会持久化，当前歌曲接近结束、暂停或停止时可以自动播放下一首
-- 命令执行在后台任务里跑，聊天扫描会持续运行
+- 可选启用候选歌曲 AI 审核，按最终候选歌曲/URI 的风险强度决定是否允许点歌
+- 队列会持久化，当前歌曲接近结束、暂停或停止时可以自动播放下一首，并可按实际播放历史限制短期重复点同一首歌
+- 命令由单一业务运行时调度；UI、OCR 和播放器分别由独立运行时拥有，等待外部结果时聊天观察仍会持续运行
 - 支持启动时自动启动官服/国际服游戏、自动开门，并进入千星奇域大厅后停止，不自动返回提瓦特
 - 提供本地网页和 HTTP 接口，初始监听 `127.0.0.1:18888`
 - 提供终端 TUI，显示日志、OCR 和队列状态
-- 提供手动调试工具，用于截图、OCR、聊天扫描、UI 状态、模板匹配、发送测试和 AI 搜索测试
+- 提供 Web 二级高级控制页，用于截图、OCR、聊天扫描、UI 状态、命名模板匹配、输入测试和 AI 候选诊断
 - 支持全局热键：`F7` 暂停/恢复扫描，`F12` 退出程序
+
+## 代码与流程文档导航
+
+代码梳理文档入口见 [docs/index.md](docs/index.md)。常用阅读路径：
+
+- 想理解整体架构，先看 [代码梳理](docs/code-walkthrough.md)
+- 想排查命令重复、锁失效或入队问题，看 [聊天命令进入队列](docs/chat-command-ingestion.md) 和 [命令模型与屏幕锁](docs/command-model-locks.md)
+- 想了解二级聊天界面、好友未读红点和回退规则，看 [二级聊天监听](docs/secondary-chat-listener.md)
+- 想排查 OCR、UI 检测或性能耗时，看 [OCR 与 UI 检测](docs/ocr-ui-detection-flow.md)
+- 想调整点击、模板、像素稳定或自定义步骤，看 [UI 自动化与原子动作](docs/ui-automation-atoms.md)
+- 想看邀请、好友反馈、拉黑/屏蔽投票，看 [自定义工作流、邀请与管理流程](docs/custom-workflow-moderation-flow.md)
+- 想看启动游戏、开门和进入千星，看 [启动游戏与进入千星](docs/startup-wonderland-flow.md)
+- 想看 Web 面板和 HTTP 接口，看 [Web 监控与 HTTP API](docs/web-monitor-api.md)；高级控制规则见 [Web 高级控制](docs/web-tools.md)
 
 ## 发布包
 
@@ -47,7 +62,8 @@ miliastra-wonderland-music-windows-x64/
 ├── config.yaml
 ├── assets/
 ├── models/
-└── README.md
+├── README.md
+└── THIRD_PARTY_NOTICES.md
 ```
 
 `config.yaml` 是运行必需文件。程序不会在运行时创建新配置文件
@@ -89,34 +105,9 @@ cargo check --target x86_64-pc-windows-gnu --features ocr-rs/docsrs
 miliastra-wonderland-music.exe
 ```
 
-指定配置文件运行：
+程序固定从启动工作目录读取 `config.yaml` 并进入常驻监听模式。不再提供命令行子命令、手动菜单或通过参数切换配置文件的运行方式。
 
-```powershell
-miliastra-wonderland-music.exe --config config.yaml run
-```
-
-启动手动工具：
-
-```powershell
-miliastra-wonderland-music.exe --config config.yaml manual
-```
-
-常用离线调试子命令：
-
-```text
-ocr-image --image path.png
-ocr-region --image path.png --rect x,y,w,h
-scan-chat --image path.png
-ui-state --image path.png
-hall-name --image path.png
-match-template --image path.png --template assets/xxx.png --rect x,y,w,h
-click-template --template assets/xxx.png --rect x,y,w,h --execute
-click --x 100 --y 100 --execute
-key --key Enter --execute
-send-chat --message 测试 --execute
-```
-
-`--execute` 才会真的点击、按键或发送聊天。没有 `--execute` 时只做检测或打印结果
+OCR、模板、坐标点击、按键和 AI 候选诊断请在 `http://127.0.0.1:18888/tools` 的高级控制页执行。工具任务只会在正式业务队列为空时启动；失败只显示在工具结果中，不会退出程序或中断监听。
 
 ## 运行要求
 
@@ -130,30 +121,39 @@ send-chat --message 测试 --execute
 - 已安装 Microsoft Visual C++ Redistributable 2015-2022 x64
 - 游戏画面、配置坐标和模板素材需要对应同一套分辨率，初始配置按 1920x1080 客户区写坐标
 
-## 启动并进入千星
+## 启动游戏与进入千星
 
-默认配置会在程序启动后排队执行一次“启动游戏并进入千星奇域”任务。这个任务和点歌、邀请、控制台发言共用主业务队列，不会在 HTTP 线程直接操作窗口。
+默认配置会在程序启动后按顺序排队执行“启动游戏”和“进入千星”两个任务。它们和点歌、邀请、控制台发言共用主业务队列，不会在 HTTP 线程直接操作窗口。
 
-流程：
+启动游戏任务流程：
 
 1. 查找 `window.target_process` 中的官服/国际服游戏窗口
 2. 找不到窗口时按 `startup.exe_path` 或注册表路径启动游戏
-3. 聚焦游戏窗口一次
-4. 按 BetterGI 开门流程优先用模板处理二次进入游戏、进入游戏、确认按钮、月卡和原石弹窗，OCR 只作为兜底
-5. 周期性按 `F6`，直到检测到千星奇域主页的 `wonderland_close` 模板，OCR 标题检测作为兜底
-6. 点击配置的第一个奇域卡片坐标，或点击检测到的公共大厅入口模板
-7. 等待黑色确认按钮模板出现后点击，并等待确认按钮消失
-8. 等待派蒙菜单模板或一级聊天回车模板出现，确认已经进入千星大厅
+3. 检测到游戏窗口后聚焦游戏窗口一次
+4. 每轮先匹配 `startup.templates.paimon_menu` 在 `startup.main_ui_region` 中是否已出现；出现即认为已经进入一级界面并完成任务
+5. 未出现时才在 `startup.enter_game_text_region` 循环 OCR，最多 60 秒等待“点击进入”四个字
+6. 识别到“点击进入”后点击文本框中心，并持续点击直到该文字不再出现
+7. 文字消失后等待 `startup.templates.paimon_menu` 出现，出现后认为启动游戏任务完成
 
-进入千星大厅后流程结束，不执行 BetterGI 原流程里的返回提瓦特步骤。
+进入千星任务流程：
 
-远程面板里的“启动并进入千星”按钮会调用：
+1. 查找并聚焦已有游戏窗口；找不到窗口时直接失败，需要先执行启动游戏任务
+2. 按 `startup.wonderland_home_retries` 和 `startup.wonderland_home_retry_ms` 周期性按 `F6`，直到在右上角区域检测到千星奇域主页的 `wonderland_close` 模板
+3. 按 `startup.wonderland_card_retries` 和 `startup.wonderland_card_retry_ms` 点击配置的第一个奇域卡片坐标，在 `(1400,850,360,150)` 快速轮询并匹配“前往大厅”按钮模板
+4. 匹配成功后只点击一次“前往大厅”按钮
+5. 点击后继续快速轮询同一区域，最多等待 `startup.wonderland_confirm_absent_timeout_ms` 让模板消失，再最多等待 `startup.wonderland_confirm_stable_timeout_ms` 让区域像素稳定
+6. 进入千星后执行返回一级界面流程，然后任务完成，后续点歌、邀请等任务可以继续执行
+
+返回一级界面只回到千星内可操作的主界面，不自动退出千星。
+
+远程面板里的两个按钮分别调用：
 
 ```text
+POST /startup/game
 POST /startup/wonderland
 ```
 
-它只会把同一个任务加入待执行队列。执行结果通过事件日志、待执行任务和 TUI 查看。
+它们只会把对应任务加入待执行队列。执行结果通过事件日志、待执行任务和 TUI 查看。
 
 ## 聊天命令规则
 
@@ -167,11 +167,18 @@ POST /startup/wonderland
 好友私聊命令来自粉色聊天消息，用户名需要能从中括号里识别：
 
 ```text
-[好友名]：@过来
 [好友名]：@麦克风
 ```
 
-黄色聊天标志只用于辅助切分聊天块，不作为命令来源。`@帮助` 只展示基础命令，不展示隐藏命令和管理命令
+黄色聊天标志只用于辅助切分聊天块，不作为命令来源。`@帮助` 只展示点歌帮助；`@娱乐` 或 `@娱乐帮助` 展示娱乐玩法命令。
+
+## 二级聊天监听
+
+`@监听模式 二级` 仅接受好友私聊，或由 Web 面板/API 发起。切换任务会进入待执行任务队列：程序按 `Enter → 点击当前大厅模板 → OCR 确认当前大厅` 打开二级界面，最多尝试两次；第二次前会先用 `Esc` 回到一级界面。失败后自动回退一级监听。
+
+二级监听不使用一级聊天的命令屏幕锁。当前大厅映射为 `blue`，通过可见气泡序列重叠识别并按顺序处理本轮全部新增的他人深色气泡；好友会话映射为 `pink`，每个未读好友只读取最下方最新消息。左侧好友未读红点只扫描当前可见区域；首次进入会逐个清掉可见旧红点而不执行命令，之后每次只处理一位好友并返回当前大厅监听一轮。陌生人消息不会触发命令；公开频道会尝试切回当前大厅，失败后退回一级监听。
+
+`@监听模式 一级` 切回原有一级监听，`@监听模式 状态` 只记录当前模式和等待切换状态。普通命令不再统一先回一级：每个动作只在需要时转换界面，任务完成后恢复当前监听驻留目标。点歌和邀请确认可直接读取二级当前大厅的新气泡；管理投票仅在等待多位好友表决期间显示为“二级监听（临时一级阶段）”，最后一个投票结束后恢复当前大厅。
 
 ## 大厅命令
 
@@ -193,7 +200,16 @@ POST /startup/wonderland
 | `@队列清空` | 清空队列 |
 | `@大厅检测` | 打开 F2 大厅页识别当前大厅 |
 | `@大厅时间` | 回复已识别到的大厅剩余时间 |
-| `@帮助` | 发送基础帮助 |
+| `#接龙 开始 成语` / `#接龙 成语` | 开始或继续严格同字成语接龙 |
+| `#同音接龙 开始 成语` | 开始忽略声调的同音接龙，后续仍可用 `#接龙 成语` |
+| `#提示` / `#解释 [成语]` | 推荐不会立即封龙的可接成语；查看指定成语或当前成语的来源与解释 |
+| `#海龟汤` / `#海龟汤状态` | 开始海龟汤、重发汤面或查看对局状态 |
+| `#问题` | 在进行中的海龟汤里提交 AI 裁决问题 |
+| `##编号内容` / `##提交` | 按编号暂存超过聊天长度的海龟汤答案，完整合并后只裁决一次 |
+| `#卧底` / `#卧底双` | 创建单卧底或双卧底报名房间 |
+| `#加入` / `#开局` / `#状态` / `#退出` | 报名、开局、查看状态或退出谁是卧底；`#加入` 和 `#退出` 仅好友私聊有效 |
+| `@娱乐` / `@娱乐帮助` | 发送娱乐玩法帮助 |
+| `@帮助` | 只发送点歌帮助 |
 
 点歌说明：
 
@@ -201,6 +217,47 @@ POST /startup/wonderland
 - `@点歌`、`@搜索`、`@AI点歌`、`@AI搜索` 在大厅里不接受 B 站源
 - `@B站点歌` 和 `@B站搜索` 只在粉色好友私聊里生效
 - AI 功能需要配置 `ai.api_key`，留空时 AI 命令会回复未启用
+
+## 海龟汤
+
+海龟汤默认关闭，只在当前大厅接收 `#` 提问，并与成语接龙全局互斥。题目选中后会先永久写入已使用记录，再分段发送汤面；汤面全部发完后才开始计时和接收提问。完整还原需要两次独立 AI 裁决都返回“完全正确”。长答案可以依次发送 `##1第一段`、`##2第二段`，最后发送 `##提交`；机器人只短回复 `暂存[昵称]:##编号`，提交时按编号合并成一次 AI 裁决。普通裁决会附带问题摘要，例如 `[星念]的男人是灯....理员吗？回复：否`。昵称和正文分别需要连续 OCR 一致后才会处理，默认各为 2 次，可通过 `turtle_soup.nickname_stable_count` 和 `turtle_soup.content_stable_count` 调整；问题相同且昵称只有一个规范化字符差异时按同一条 OCR 消息去重。
+
+正式题库使用被 Git 忽略的 `turtle_soup.yaml`，格式参考 `turtle_soup.example.yaml`。Web 面板可以随机开局、按未使用 ID 开局、查看状态和主动结束，但不能查看进行中的汤底、编辑题库或重置使用记录。详细规则见 [海龟汤](docs/turtle-soup.md)。
+
+## 谁是卧底
+
+谁是卧底默认关闭，支持 4-11 人单卧底和 6-11 人双卧底。创建房间和开始对局使用公屏，其他玩家只能通过好友私聊报名；机器人通过好友私聊发送位置和词语，描述使用公屏 `#内容`。投票时请好友私聊怀疑对象编号，例如 `#A`，也可以发送 `#弃权`。词对会在发词前永久标记为已用，Web 只提供脱敏状态、开始当前房间和结束控制。完整玩法见 [谁是卧底](docs/undercover.md)。
+
+## 长时间同歌去重
+
+`song_dedup` 用实际播放历史保护同一首歌的短时间重复播放。它按最终候选歌曲判断，不按原始点歌文本判断；URI 相同一定视为同一首歌，跨平台歌曲会用歌名和歌手相似度兜底。伴奏和原唱默认视为不同歌曲。
+
+去重会在直接播放前、加入音乐播放队列前、音乐播放队列出队准备播放前检查。入队前检查只负责拒绝确定的近期重复歌曲，不会写入历史；只有确认播放开始成功后才会写入 `history_path`，所以搜索失败、入队、审核拒绝、取消确认都不会污染历史。
+
+超出限制时，直接播放或入队会在大厅回复 `歌曲名近期已播放过,请稍后再点`；队列出队会移除该项并回复 `歌曲名近期已播放过,已跳过`，然后继续尝试下一首。控制台来源默认豁免，可以通过 `song_dedup.console_bypass` 关闭。
+
+## 候选歌曲审核
+
+`song_review` 是独立于 `ai` 的候选歌曲审核 Provider，使用标准 OpenAI Responses API、`web_search` 工具和严格 JSON Schema。它审核的是已经搜索、确认或 AI 选出的最终候选歌曲和 URI，不审核原始点歌意图；请求固定使用 `tool_choice: "required"` 和 `stream: false`，不自动发送第三方的 `enable_search`、`forced_search` 或 `enable_thinking` 字段。确有兼容需要时可通过 `song_review.provider.extra_body` 补充第三方字段，但与官方字段同名时官方值优先。控制台是最高权限入口：远程点歌、远程 AI 点歌、控制台发言和直接队列接口都无视审核；游戏内大厅和好友私聊点歌会在播放或入队前审核。
+
+审核模型必须返回 JSON：
+
+```json
+{"level":4,"reason":"整体偏舒缓，适合当前房间氛围","tags":["calm","soft"]}
+```
+
+`level` 是 1-10 的打扰强度，1 表示很安静很舒缓，10 表示极端吵闹混乱。程序用 `song_review.max_allowed_level` 做本地阈值判断，`level <= max_allowed_level` 通过，超过阈值会拒绝本次点歌并在游戏内回复简短原因。审核请求失败会按 `retry_count` 重试，仍失败时按 `failure_policy` 决定拒绝或放行。
+
+审核条件可以直接改 `song_review.policy_prompt`，但不要在里面要求模型改变 JSON 输出格式：
+
+```text
+审核目标：只通过整体听感偏舒缓、柔和、轻松、安静、治愈、抒情、慢节奏或中低强度的歌曲。
+拒绝明显炸场、吵闹、压迫感强、节奏过快、情绪过激、强烈电子噪音、重金属、硬核、鬼畜、洗脑循环、尖锐喊叫、强烈攻击性或明显破坏房间氛围的歌曲。
+尽量使用联网搜索得到的曲风、歌词摘要、歌曲介绍和公开听感描述判断。
+如果信息不足，请保守判断；不确定时应给较高强度等级，而不是因为歌曲热门、用户喜欢或歌手知名就放宽标准。
+```
+
+`song_review.custom_prompt` 会附加在审核条件后面，适合临时补充房间口径。
 
 ## 点歌确认命令
 
@@ -232,9 +289,10 @@ POST /startup/wonderland
 | `@QQ点歌 歌名 歌手` / `@QQ搜索 歌名 歌手` | 好友私聊 QQ 音乐点歌 |
 | `@网易点歌 歌名 歌手` / `@网易搜索 歌名 歌手` | 好友私聊网易云音乐点歌 |
 | `@B站点歌 关键词` / `@B站搜索 关键词` | 好友私聊 B 站源点歌 |
-| `@邀请1` | 邀请机器人前往该好友大厅，数字范围 `1-1000`，用于防止同屏重复执行 |
-| `@过来` | 配置里的自定义流程参考命令，效果等同邀请机器人前往该好友大厅 |
+| `@邀请1` / `@邀请654321` | 邀请机器人前往该好友大厅；1-3 位数字表示防冲突序号，6 位数字表示大厅密码并会在最后一步键盘输入 |
 | `@麦克风` | 按 `N` 切换麦克风状态；当前在公共大厅时跳过 |
+| `@监听模式 一级` / `@监听模式 二级` / `@监听模式 状态` | 切换或查询聊天监听模式；大厅蓝色消息不能使用 |
+| `#结束` | 以好友权限主动结束当前海龟汤；结算和汤底统一发往当前大厅 |
 
 邀请确认命令在蓝色大厅消息里发送：
 
@@ -244,6 +302,10 @@ POST /startup/wonderland
 | `@邀请拒绝` / `@拒绝邀请` | 拒绝好友邀请 |
 
 邀请流程会先检测当前是否公共大厅。当前是公共大厅时直接执行；不是公共大厅时会在大厅发起确认，30 秒内无人回复则按同意处理
+
+同意或默认同意时，机器人会把发起者昵称、私聊反馈、可选密码和最终驻留目标一次提交给完整邀请事务。该事务在同一次 UI 独占期间确认唯一好友和当前会话、发送反馈、稳定点击当前会话中最下方的左侧好友头像，再依次匹配邀请页面按钮并恢复监听驻留；反馈失败会作为警告保留并继续邀请，已经确认进入大厅的邀请不会因收尾恢复失败而重放。拒绝邀请使用普通好友投递事务发送反馈。
+
+`friend_delivery.fast_match: true` 会在左侧唯一完整昵称稳定匹配并点击后，单次确认顶部标题属于好友会话，不再到聊天内容区二次查找目标昵称；“当前大厅”“公共大厅/公开频道”“陌生人消息”和空标题均不会放行。左侧未找到目标时，从最底部头像向最顶部头像拖动后重试，最多拖动两次；恢复当前大厅时使用相同头像位置反向向下拖动，最多两次回到列表顶部。设为 `false` 可恢复标题及聊天区目标昵称确认。
 
 ## 隐藏命令
 
@@ -258,7 +320,7 @@ POST /startup/wonderland
 | `@拉黑UID123456789` / `@拉黑123456789` | 发起 UID 拉黑投票，UID 必须是 9 位数字 |
 | `@屏蔽UID123456789` / `@屏蔽123456789` | 发起 UID 屏蔽聊天投票，UID 必须是 9 位数字 |
 
-`@禁用` 不会影响粉色私聊里的 `@启用`、`@过来`、`@麦克风`、UID 操作等命令。进入新大厅后程序会重置命令识别状态
+`@禁用` 不会影响粉色私聊里的 `@启用`、`@麦克风`、UID 操作等命令。进入新大厅后程序会重置命令识别状态
 
 ## UID 拉黑和屏蔽聊天
 
@@ -359,9 +421,10 @@ moderation:
 | `paste` / `paste_text` | 把 `text` 粘贴到当前焦点 |
 | `send_chat` / `reply` | 按普通大厅回复流程发送 `message` |
 | `send_current_chat` | 向当前已打开的聊天输入框发送 `message`，不会重新激活窗口或点击全局聚焦点 |
-| `send_friend_message` / `friend_reply` | 通过 ESC 回到一级界面，打开好友聊天，发送 `message`，然后再通过 ESC 返回一级界面 |
+| `send_friend_message` / `friend_reply` | 复用或打开二级好友会话，发送 `message`，然后恢复当前监听驻留界面 |
 | `invite_user` / `invite_current_user` | 调用内置邀请流程，目标为触发命令的好友，也可用 `target` 指定 |
-| `return_primary` | 通过 ESC 逐级返回一级界面 |
+| `ensure_primary` / `return_primary` | 检测并通过 ESC 逐级到达一级界面 |
+| `ensure_current_hall` | 检测并到达二级当前大厅 |
 
 变量：
 
@@ -375,36 +438,13 @@ moderation:
 | `{{message_type}}` | 消息类型，例如 `blue` 或 `pink` |
 | `{{user_command}}` | 用户原始命令文本 |
 
-`config.yaml` 自带一个参考流程：好友私聊 `@过来`，执行 `invite_user`
+原子动作只供自定义工作流机械段和 UI 内核内部组合。内置好友投递、邀请和 UID 管理分别使用独立的类型化 UI 事务；每个事务会在同一次 UI 独占期间观察并归一化起点、完成目标动作、确认结果并恢复请求指定的监听驻留。OCR、模板和像素稳定等待都在事务内部完成，结果会分别报告目标动作效果和最终驻留状态，避免收尾失败导致重复发送、重复邀请或重复管理操作。
 
-内置好友发言、邀请和 UID 管理流程也使用同一套原子动作：任务入口会显式激活并聚焦游戏一次，后续点击、按键、粘贴默认游戏已经可接收输入；返回一级界面只使用 ESC 逐级返回。等待 OCR 文字时会轮询到超时，等待模板时会轮询到出现或消失，打开好友聊天后会等待聊天区域像素稳定再发送文本。
+## 高级控制
 
-## 手动调试工具
+主面板为 `http://127.0.0.1:18888/`，高级控制页为 `http://127.0.0.1:18888/tools`。高级页提供截图、OCR、聊天扫描、UI/大厅识别、配置内命名模板匹配、坐标点击、按键、OCR 后端探测和 AI 候选诊断。
 
-启动：
-
-```powershell
-miliastra-wonderland-music.exe --config config.yaml manual
-```
-
-菜单内容：
-
-| 选项 | 功能 |
-| --- | --- |
-| `1` | 截图保存 |
-| `2` | OCR 识别 |
-| `3` | 扫描聊天区 |
-| `4` | 检测 UI 状态 |
-| `5` | 模板匹配 |
-| `6` | 点击坐标 |
-| `7` | 按键 |
-| `8` | 发送聊天 |
-| `9` | OCR GPU 支持检测 |
-| `10` | 监测聊天区变动 |
-| `11` | 检测面板响应速度 |
-| `12` | AI 点歌搜索测试 |
-
-面板响应速度测试会按 `Enter` 打开聊天，再按 `Esc` 关闭聊天，采样配置中的检测区域，输出首次变化耗时、稳定耗时、平均值、最大值和失败次数
+只有坐标点击、按键和模板点击会短暂占用游戏输入；其余工具在后台执行，不占用主业务执行状态。详情见 [Web 高级控制](docs/web-tools.md)。
 
 ## 本地网页和接口
 
@@ -414,7 +454,9 @@ miliastra-wonderland-music.exe --config config.yaml manual
 http://127.0.0.1:18888
 ```
 
-会拒绝跨站控制请求。会改变播放、队列或状态的接口只接受本机或同源请求
+会拒绝跨站控制请求。会改变播放、队列或状态的接口只接受本机或同源请求。主面板为 `/`，高级控制页为 `/tools`。
+
+如将 `http.host` 改为非本机地址，必须设置非空的 `http.access_token`，否则 HTTP 服务不会启动。页面中的访问令牌仅保存于当前浏览器会话，并通过请求头发送。
 
 接口列表：
 
@@ -429,17 +471,35 @@ http://127.0.0.1:18888
 | `/searchPlay?keyword=...&source=qqmusic` | 远程点歌入主业务队列 |
 | `/searchSource?keyword=...&source=netease` | 指定源远程点歌入主业务队列 |
 | `/search?keyword=...&source=qqmusic` | 搜索歌曲 |
-| `/open-scheme?uri=fuo://...` | 播放 FeelUOwn URI |
+| `/search/candidates?keyword=...&source=qqmusic` | 返回结构化候选歌曲和 URI，供 Web 面板选择后入队 |
+| `/player/play-uri?uri=fuo://...` | FeelUOwn URI 作为控制台高权限项加入音乐播放队列 |
 | `/queue` | 查看队列 |
-| `/queue/add?keyword=...` | 加入队列 |
-| `/queue/remove?index=0` | 删除队列项，索引从 0 开始 |
+| `/queue/add?keyword=...` | 控制台最高权限直接加入队列，不经过候选歌曲审核 |
+| `/queue/remove?id=...` | 按持久队列项 ID 删除；旧的 `index=0` 形式仍可用 |
 | `/queue/clear` | 清空队列 |
 | `/state` | 查看运行状态 |
 | `/state/save` | 保存运行状态字段 |
 | `/history` | 查看最近 30 条接口调用记录 |
 | `/clear-history` | 清空接口调用记录 |
 | `/monitor` | 查看监控面板数据 |
-| `/chat/send?text=...` | 控制台发言入主业务队列 |
+| `/turtle-soup` | 查看海龟汤状态；不返回进行中的汤底 |
+| `/turtle-soup/start` / `/turtle-soup/start?id=...` | 随机或按未使用题目 ID 开局，只接受 POST |
+| `/turtle-soup/end` | 主动结束并在当前大厅公布结算与汤底，只接受 POST |
+| `/undercover` | 查看脱敏的谁是卧底状态 |
+| `/undercover/start` | 开始当前已满足人数的报名房间，只接受 POST |
+| `/undercover/end` | 结束当前谁是卧底房间或对局，只接受 POST |
+| `/chat/send?text=...&usePrefix=1&prefix=...` | 控制台发言入主业务队列；默认带 `[控制台]: ` 前缀，可关闭或自定义 |
+| `/chat-listener/mode?mode=primary` / `secondary` | 切换聊天监听模式，任务进入主业务队列 |
+| `/tasks/cancel?id=...` | 撤销尚未开始的正式任务 |
+| `/decisions/submit?id=...&action=confirm` | 提交当前点歌候选决策，支持 `confirm`、`skip`、`switch_source`、`ai` |
+| `/operator/lyrics` | 发送歌词命令入主业务队列 |
+| `/operator/hall-detect` | 大厅检测命令入主业务队列 |
+| `/operator/hall-time` | 大厅时间命令入主业务队列 |
+| `/operator/microphone` | 麦克风命令入主业务队列 |
+| `/operator/commands?enabled=1` | 启用或禁用游戏内命令识别 |
+| `/operator/idle-exit?minutes=30` | 设置闲置退出；`enabled=0` 表示取消 |
+| `/operator/workflows` | 查看已启用的自定义工作流 |
+| `/operator/workflows/run?name=...&args=...` | 以控制台权限执行自定义工作流 |
 | `/screenshot?quality=88` | 手动获取一次游戏截图，返回 JPEG |
 | `/health` | 健康检查 |
 | `/ai/recognize` | AI 文本识别测试 |
@@ -447,13 +507,13 @@ http://127.0.0.1:18888
 | `/ai/pick` | AI 候选选择测试 |
 | `/ai/search?keyword=...` | 远程 AI 点歌入主业务队列 |
 
-远程播放控制、远程点歌、远程 AI 点歌和控制台发言只返回入队结果，具体搜索、AI 匹配、播放、出队和游戏内反馈由主业务线程串行执行。程序必须以管理员权限启动，Web 面板不提供管理员状态或窗口状态诊断。
+正式业务接口会返回 `taskId`；组合启动流程返回 `taskIds`。`/monitor.tasks` 可查看等待、执行中、完成、失败和已撤销状态，只有尚未开始的任务允许撤销。远程播放控制、远程点歌、远程 AI 点歌和控制台发言由单一业务运行时保持顺序，再交给正式任务执行运行时完成搜索、AI、播放、出队和游戏内反馈。控制台来源拥有最高权限，不受候选歌曲审核限制。程序必须以管理员权限启动，Web 面板不提供管理员状态或窗口状态诊断。
 
 ## 配置说明
 
-`config.yaml` 包含 `config_version`。启动时如果检测到旧配置，程序会用当前发布包里的 `config.yaml` 模板重写配置，把旧值迁移到新位置，创建带时间戳的 `.bak-*` 备份，并把无法自动迁移的旧字段追加到文件末尾作为注释。追加的注释字段不会影响运行
+程序只读取当前版本的 `config.yaml`，不会自动迁移、改写或备份配置。所有当前配置段和字段都必须显式存在；配置文件不存在、字段缺失、字段未知、类型不匹配或模块校验失败时，会在启动任何运行时、监听端口或游戏输入前直接报错退出。只有自定义工作流步骤中类型明确为可选的参数可以省略。请把与当前发布包匹配的 `config.yaml` 放在程序启动工作目录。
 
-如果配置文件不存在，程序会报错退出。请把发布包里的 `config.yaml` 放在程序工作目录，或用 `--config` 指定配置文件
+本次清理也收紧了本地持久化队列：只接受包含 `nextId` 和 `items` 的当前 JSON 格式，不再自动转换旧数组、`queue` 包装或 `next_id` 字段。
 
 主要配置段：
 
@@ -465,6 +525,7 @@ http://127.0.0.1:18888
 | `ocr` | OCR 模型、置信度、文本框参数、聊天变化检测参数 |
 | `templates` | 聊天标志、UI、邀请、好友 UID 操作模板 |
 | `output` | 游戏内回复开关和聊天输入坐标 |
+| `friend_delivery` | 好友快速匹配和确认未发送消息的自动重试参数 |
 | `moderation` | UID 拉黑/屏蔽投票参数和按钮搜索区域 |
 | `feeluown` | FeelUOwn TCP RPC 地址 |
 | `http` | 本地网页和接口监听配置 |
@@ -472,13 +533,18 @@ http://127.0.0.1:18888
 | `tui` | 终端 TUI 开关和刷新参数 |
 | `state` | 运行状态、队列和已执行命令记录路径 |
 | `queue` | 队列长度、自动出队和当前歌曲保护 |
-| `ai` | AI 供应商、API Key、模型和 OpenAI-compatible 地址 |
+| `song_dedup` | 长时间同歌去重开关、统计窗口、允许次数、控制台豁免和历史路径 |
+| `idiom_chain` | 成语接龙词库、历史、超时和结束权限 |
+| `undercover` | 谁是卧底开关、词库、永久使用记录、人数和阶段计时 |
+| `turtle_soup` | 海龟汤题库、永久使用记录、OCR 稳定次数、超时、批量答案段数、AI 并发、独立 Provider 和追加提示词 |
+| `ai` | AI 供应商、API Key、模型、OpenAI Chat Completions 地址和第三方兼容字段 |
+| `song_review` | 候选歌曲审核开关、Responses Provider、联网搜索、打扰强度阈值、失败策略和审核条件 |
 | `matching` | 歌名、歌手和 OCR 噪声匹配阈值 |
 | `hotkeys` | 全局热键开关和按键 |
 | `invite` | 好友列表 OCR 区域和邀请按钮模板搜索区域 |
 | `custom_workflows` | 配置驱动的自定义命令流程 |
 
-`timing` 已按业务场景分组，旧版本的扁平字段会在启动时自动迁移到新位置：
+`timing` 按业务场景分组：
 
 | 分组 | 说明 |
 | --- | --- |
@@ -502,8 +568,15 @@ screen:
 queue:
   max_size: 5
   auto_advance_seconds: 1
-  protect_auto_played_songs: true
   protect_current_song_until_finished: true
+  external_playback_protect_after_seconds: 20
+
+song_dedup:
+  enabled: true
+  window_seconds: 3600
+  max_count: 1
+  console_bypass: true
+  history_path: data/song-dedup-history.json
 
 http:
   host: 127.0.0.1
@@ -515,7 +588,7 @@ hotkeys:
   exit_key: F12
 ```
 
-`protect_current_song_until_finished` 只限制新点歌打断当前歌曲；队列自动出队仍由 `auto_advance_seconds` 控制，`@下一首` 仍会立即消费队列
+`protect_current_song_until_finished` 保护已确认的机器人点歌；队列自动出队仍由 `auto_advance_seconds` 控制，`@下一首` 仍会立即消费队列。`external_playback_protect_after_seconds` 用于非点歌歌曲：只有同一首外部歌曲保持可识别的 `playing` 状态达到配置秒数后，才加入当前歌曲保护；切歌瞬态、暂停、停止、歌曲身份变化和程序重启都会重新计时。设为 `0` 时，外部播放永不保护，音乐播放队列可以直接接管；未知状态只观察，不自动出队。
 
 游戏内回复会限制显示宽度为 80，约等于 40 个全角中文字符或 80 个半角字符
 
@@ -523,10 +596,14 @@ hotkeys:
 
 | 文件 | 说明 |
 | --- | --- |
-| `logs/miliastra-wonderland-music.log` | 程序日志，记录业务事件、扫描结果、错误和状态变化 |
-| `logs/miliastra-wonderland-music-timing.log` | 阶段耗时和性能诊断日志，包含 UI 检测、OCR、主循环、原子动作和输入阶段耗时 |
-| `data/runtime-state.json` | 运行状态 |
+| `logs/miliastra-wonderland-music-YYYY-MM-DD.log` | 程序日志，记录业务事件、扫描结果、错误和状态变化 |
+| `logs/miliastra-wonderland-music-timing-YYYY-MM-DD.log` | 阶段耗时和性能诊断日志，包含 UI 检测、OCR、主循环、原子动作和输入阶段耗时 |
+
+默认按日期每天分文件，并保留最近 `7` 个自然日；可通过 `logging.rotate_daily` 和 `logging.retain_days` 调整。日志轮转或清理失败不会中断监听。
+| `data/playback-state.json` | 播放器确认状态 |
+| `data/hall-state.json` | 大厅倒计时和到期提醒状态 |
 | `data/queue.json` | 点歌队列 |
+| `data/song-dedup-history.json` | 长时间同歌去重历史，只记录确认播放成功的歌曲 |
 | `data/executed-commands.log` | 已执行命令记录 |
 
 日志前缀格式：

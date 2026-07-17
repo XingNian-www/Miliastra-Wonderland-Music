@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Miliastra 高级控制</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#101211;color:#e7ece9;font-family:"Microsoft YaHei",system-ui,sans-serif}button,input,select{font:inherit}.shell{max-width:1120px;margin:0 auto;padding:10px}.top{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px}.title{font-size:18px;margin:0}.hint{margin:3px 0 0;color:#98a79e;font-size:12px}.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.panel{border:1px solid #2d3530;background:#171b19;border-radius:8px;min-width:0}.wide{grid-column:span 2}.head{height:34px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #2d3530;padding:0 8px;gap:8px}.head h2{margin:0;font-size:14px;color:#86efac}.body{padding:8px}.row{display:flex;gap:6px;align-items:center}.row+.row{margin-top:7px}.two{display:grid;grid-template-columns:1fr 1fr;gap:6px}.three{display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px}.stretch{width:100%}input,select{width:100%;border:1px solid #3a4540;background:#101211;color:#f3f6f4;border-radius:7px;padding:7px 8px;outline:none;min-height:34px}input:focus,select:focus{border-color:#2dd4bf}.btn{border:1px solid #3a4540;background:#222821;color:#f3f6f4;border-radius:7px;padding:7px 9px;cursor:pointer;min-height:34px}.btn:hover{background:#2b332d}.btn:disabled{opacity:.55;cursor:wait}a.btn{display:inline-flex;align-items:center;text-decoration:none}.primary{background:#0f766e;border-color:#14b8a6;color:#fff}.warn{background:#7c2d12;border-color:#9a3412;color:#fff}.output{margin:0;min-height:280px;max-height:560px;overflow:auto;white-space:pre-wrap;word-break:break-word;background:#101211;color:#d6ddd9;padding:9px;font:12px/1.42 ui-monospace,SFMono-Regular,Consolas,monospace}.task-list{display:flex;flex-direction:column;gap:5px;max-height:180px;overflow:auto}.task{width:100%;border:1px solid #323b36;background:#111412;color:#e7ece9;border-radius:7px;padding:6px 7px;font-size:12px;text-align:left;cursor:pointer}.task:hover{background:#1b211d}.state{color:#9aa6a0;float:right}.ok{color:#86efac}.err{color:#fca5a5}.checkbox{display:flex;align-items:center;gap:6px;color:#aab5af;font-size:12px}.checkbox input{width:auto;min-height:0}.top .row{flex-wrap:wrap}.access-token{width:148px}@media(max-width:900px){.grid{grid-template-columns:1fr 1fr}.wide{grid-column:span 2}}@media(max-width:620px){.grid{grid-template-columns:1fr}.wide{grid-column:auto}.three{grid-template-columns:1fr}.top{align-items:flex-start;flex-direction:column}}
+</style>
+</head>
+<body>
+<div class="shell">
+  <header class="top">
+    <div><h1 class="title">Miliastra 高级控制</h1><p class="hint" id="state">等待任务</p></div>
+    <div class="row"><input class="access-token" id="accessToken" type="password" placeholder="访问令牌" oninput="storeAccessToken()" onchange="loadTemplates()"><a class="btn" href="/">监控面板</a><button class="btn" onclick="loadTools()">刷新任务</button></div>
+  </header>
+  <main class="grid">
+    <section class="panel">
+      <div class="head"><h2>画面与识别</h2></div>
+      <div class="body">
+        <div class="two"><button class="btn primary" onclick="run('/tools/ocr')">全屏 OCR</button><button class="btn" onclick="run('/tools/scan-chat')">扫描聊天</button></div>
+        <div class="row"><input id="ocrRect" placeholder="OCR 区域 x,y,width,height"><button class="btn" onclick="run('/tools/ocr',{rect:val('ocrRect')})">区域 OCR</button></div>
+        <div class="two"><button class="btn" onclick="run('/tools/ui-state')">检测 UI</button><button class="btn" onclick="run('/tools/hall-name')">大厅名称</button></div>
+        <div class="row"><button class="btn stretch" onclick="openScreenshot()">获取截图</button></div>
+      </div>
+    </section>
+    <section class="panel">
+      <div class="head"><h2>模板</h2></div>
+      <div class="body">
+        <div class="row"><select id="template"><option value="blue-marker">蓝色聊天标志</option><option value="yellow-marker">黄色聊天标志</option><option value="pink-marker">粉色聊天标志</option><option value="friend">好友按钮</option><option value="secondary-back">二级聊天返回按钮</option><option value="secondary-hall">二级当前大厅</option></select></div>
+        <div class="row"><input id="templateRect" placeholder="匹配区域 x,y,width,height，留空全屏"><button class="btn" onclick="useConfiguredTemplateRegion()">读取配置区域</button></div>
+        <div class="row"><input id="threshold" placeholder="阈值，留空使用配置" inputmode="decimal"></div>
+        <div class="two"><button class="btn" onclick="matchTemplate(false)">匹配</button><button class="btn warn" onclick="matchTemplate(true)">匹配并点击</button></div>
+      </div>
+    </section>
+    <section class="panel">
+      <div class="head"><h2>手动输入</h2></div>
+      <div class="body">
+        <div class="row"><input id="x" placeholder="x" inputmode="numeric"><input id="y" placeholder="y" inputmode="numeric"><button class="btn warn" onclick="clickPoint()">点击</button></div>
+        <div class="row"><input id="key" placeholder="按键，如 Escape / Return / F2"><button class="btn warn" onclick="sendKey()">发送</button></div>
+      </div>
+    </section>
+    <section class="panel">
+      <div class="head"><h2>诊断</h2></div>
+      <div class="body">
+        <button class="btn stretch" onclick="run('/tools/ocr-backends')">OCR 后端探测</button>
+        <div class="row"><input id="changeSamples" value="10" inputmode="numeric" placeholder="变化采样次数"><button class="btn" onclick="sampleChatChanges()">聊天变化</button></div>
+        <div class="row"><input id="benchmarkRounds" value="3" inputmode="numeric" placeholder="面板基准轮数"><button class="btn warn" onclick="panelBenchmark()">面板基准</button></div>
+        <div class="row"><input id="aiKeyword" placeholder="AI 候选诊断关键词"><button class="btn" onclick="aiPreview()">诊断</button></div>
+        <label class="checkbox"><input id="aiAccompaniment" type="checkbox">优先伴奏</label>
+      </div>
+    </section>
+    <section class="panel wide">
+      <div class="head"><h2>任务结果</h2><span id="taskId" class="hint"></span></div>
+      <pre class="output" id="result">等待任务</pre>
+    </section>
+    <section class="panel">
+      <div class="head"><h2>最近任务</h2></div>
+      <div class="body"><div class="task-list" id="tasks">暂无任务</div></div>
+    </section>
+  </main>
+</div>
+<script>
+const $=id=>document.getElementById(id)
+const val=id=>$(id).value.trim()
+const esc=s=>String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')
+let activeId=0
+let busy=false
+let templateItems=[]
+const taskStatusLabel={queued:'等待业务空闲',running:'执行中',completed:'已完成',failed:'失败'}
+function accessToken(){return sessionStorage.getItem('miliastraAccessToken')||''}
+function storeAccessToken(){sessionStorage.setItem('miliastraAccessToken',$('accessToken').value)}
+function requestHeaders(){const token=accessToken();return token?{'X-Miliastra-Token':token}:{}}
+async function request(url,method='GET'){
+  const r=await fetch(url,{method,cache:'no-store',headers:requestHeaders()})
+  const text=await r.text()
+  if(!r.ok)throw new Error(text||('HTTP '+r.status))
+  try{return JSON.parse(text)}catch{return text}
+}
+function setResult(text){$('result').textContent=typeof text==='string'?text:JSON.stringify(text,null,2)}
+function setBusy(value){busy=value;document.querySelectorAll('button').forEach(button=>button.disabled=value)}
+function params(values){const p=new URLSearchParams();for(const [k,v] of Object.entries(values||{})){if(v!==undefined&&v!==null&&String(v)!=='')p.set(k,v)}const s=p.toString();return s?'?'+s:''}
+async function run(path,values){
+  if(busy)return
+  setBusy(true);setResult('任务已提交...')
+  try{const task=await request(path+params(values),'POST');activeId=task.id;$('taskId').textContent='任务 #'+task.id;await pollTask()}
+  catch(error){setResult('错误: '+error.message);setBusy(false)}
+  await loadTools()
+}
+async function pollTask(){
+  try{
+    const task=await request('/tools/task?id='+encodeURIComponent(activeId))
+    $('state').textContent='任务 #'+task.id+' '+(taskStatusLabel[task.status]||task.status)
+    setResult(task.result||'等待执行...')
+    if(task.status==='queued'||task.status==='running'){setTimeout(pollTask,500);return}
+  }catch(error){setResult('读取任务失败: '+error.message)}
+  setBusy(false);loadTools()
+}
+function matchTemplate(click){run('/tools/template',{template:val('template'),rect:val('templateRect'),threshold:val('threshold'),click:click?'1':''})}
+function clickPoint(){run('/tools/click',{x:val('x'),y:val('y')})}
+function sendKey(){run('/tools/key',{key:val('key')})}
+function aiPreview(){run('/tools/ai-preview',{keyword:val('aiKeyword'),preferAccompaniment:$('aiAccompaniment').checked?'1':''})}
+function sampleChatChanges(){run('/tools/chat-change-samples',{samples:val('changeSamples')})}
+function panelBenchmark(){run('/tools/panel-benchmark',{rounds:val('benchmarkRounds')})}
+async function openScreenshot(){
+  if(busy)return
+  const preview=window.open('about:blank','_blank')
+  if(!preview){setResult('浏览器阻止了截图预览窗口');return}
+  setBusy(true);setResult('截图中...')
+  try{const r=await fetch('/screenshot?quality=88',{cache:'no-store',headers:requestHeaders()});if(!r.ok)throw new Error(await r.text()||('HTTP '+r.status));const url=URL.createObjectURL(await r.blob());preview.location.replace(url);setResult('截图已获取');setTimeout(()=>URL.revokeObjectURL(url),60000)}
+  catch(error){preview.close();setResult('错误: '+error.message)}
+  setBusy(false)
+}
+function renderTasks(items){const el=$('tasks');if(!Array.isArray(items)||!items.length){el.textContent='暂无任务';return}el.innerHTML=items.map(item=>'<button class="task" onclick="inspectTask('+Number(item.id)+')"><span class="state '+(item.status==='failed'?'err':item.status==='completed'?'ok':'')+'">'+esc(taskStatusLabel[item.status]||item.status)+'</span>#'+item.id+' '+esc(item.label)+'</button>').join('')}
+function inspectTask(id){if(busy)return;activeId=id;$('taskId').textContent='任务 #'+id;setBusy(true);pollTask()}
+async function loadTemplates(){try{const items=await request('/tools/templates');templateItems=Array.isArray(items)?items:[];const selected=val('template');$('template').innerHTML=templateItems.map(item=>'<option value="'+esc(item.name)+'">'+esc(item.label)+'</option>').join('');if([...$('template').options].some(option=>option.value===selected))$('template').value=selected;return templateItems}catch(error){$('state').textContent='模板读取失败: '+error.message;return []}}
+async function useConfiguredTemplateRegion(){
+  try{
+    const items=await loadTemplates()
+    const item=items.find(item=>item.name===val('template'))
+    const region=item&&item.region
+    if(!region||!Number.isInteger(region.x)||!Number.isInteger(region.y)||!Number.isInteger(region.width)||!Number.isInteger(region.height)){throw new Error('所选模板没有配置固定匹配区域，请手动填写')}
+    $('templateRect').value=[region.x,region.y,region.width,region.height].join(',')
+    if(Number.isFinite(Number(item.threshold)))$('threshold').value=String(item.threshold)
+    setResult('已读取 '+item.label+' 的配置区域')
+  }catch(error){setResult('错误: '+error.message)}
+}
+async function loadTools(){try{const monitor=await request('/monitor');renderTasks(monitor.webTools)}catch(error){$('state').textContent='任务读取失败: '+error.message}}
+document.addEventListener('keydown',event=>{if(event.key==='Enter'&&!event.isComposing&&event.target.tagName==='INPUT'){const map={ocrRect:()=>run('/tools/ocr',{rect:val('ocrRect')}),x:clickPoint,y:clickPoint,key:sendKey,aiKeyword:aiPreview,threshold:()=>matchTemplate(false),templateRect:()=>matchTemplate(false),changeSamples:sampleChatChanges,benchmarkRounds:panelBenchmark};const action=map[event.target.id];if(action){event.preventDefault();action()}}})
+$('accessToken').value=accessToken()
+loadTemplates()
+loadTools()
+</script>
+</body>
+</html>

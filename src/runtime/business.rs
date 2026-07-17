@@ -6,50 +6,52 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use serde::{Deserialize, Serialize};
-
-use crate::features::administration::AdministrationCommand;
+use crate::features::administration::{
+    AdministrationMutationIntent, AdministrationMutationOutcome,
+};
 use crate::features::card_games::{
     CardGameCancel, CardGameCommandStart, CardGameDeadlineKind, CardGameDeadlineToken,
-    CardGameEffectClaim, CardGameEffectKey, CardGameEffectResult, CardGameResume, CardGameService,
-    CardGameTimedOutcome, LandlordCommand,
+    CardGameEffectClaim, CardGameEffectKey, CardGameEffectResult, CardGameResume,
+    CardGameRuntimePort, CardGameService, CardGameTimedOutcome, LandlordCommand,
 };
-use crate::features::custom_workflow::CustomWorkflowCommand;
 use crate::features::entertainment::{EntertainmentKind, EntertainmentState};
-use crate::features::hall::HallCommand;
+use crate::features::hall::{
+    HallMutationIntent, HallMutationOutcome, HallRuntimeState, HallStatePatch, HallStateService,
+};
 use crate::features::idiom_chain::{
     IdiomChainCommand, IdiomChainDeadlineKind, IdiomChainDeadlineToken, IdiomChainOutcome,
     IdiomChainService,
 };
-use crate::features::invite::{InviteCommand, InviteRequest, InviteService, InviteStart};
-use crate::features::moderation::{
-    ModerationCommand, ModerationWorkflowKey, ModerationWorkflowLedger,
-};
+use crate::features::invite::{InviteRequest, InviteService, InviteStart};
+use crate::features::moderation::{ModerationWorkflowKey, ModerationWorkflowLedger};
 use crate::features::playback::{
-    ExternalPlaybackObservation, PlaybackCommand, PlaybackService, PlaybackStateUpdate, QueueItem,
-    QueuePushOutcome, QueueRemoval, QueueRemoveOutcome, RuntimeState, RuntimeStatePatch,
-    SongDedupCandidate,
+    ExternalPlaybackObservation, PlaybackMutationIntent, PlaybackMutationOutcome,
+    PlaybackRuntimeState, PlaybackService, PlaybackStateUpdate, QueueItem, QueuePushOutcome,
+    QueueRemoval, QueueRemoveOutcome, SongDedupCandidate,
 };
-use crate::features::song_request::SongCommand;
 use crate::features::turtle_soup::{
     QuestionSubmitOutcome, SecondaryOcrObservation, SecondaryOcrStability, TurtleSoupAiCompletion,
     TurtleSoupAiCompletionPort, TurtleSoupAppendReceipt, TurtleSoupCommand,
     TurtleSoupCommandOutcome, TurtleSoupDeadlineKind, TurtleSoupDeadlineToken, TurtleSoupDelivery,
-    TurtleSoupQuestion, TurtleSoupService, TurtleSoupSnapshot, TurtleSoupSubmission,
-    TurtleSoupWorkerRuntime,
+    TurtleSoupMutationIntent, TurtleSoupMutationOutcome, TurtleSoupQuestion, TurtleSoupService,
+    TurtleSoupSnapshot, TurtleSoupSubmission, TurtleSoupWorkerRuntime,
 };
 #[cfg(test)]
 use crate::features::undercover::UndercoverConfig;
 use crate::features::undercover::{
     UndercoverCommand, UndercoverCommandSource, UndercoverCommandStart, UndercoverDeadlineKind,
     UndercoverDeadlineToken, UndercoverEffectClaim, UndercoverEffectKey, UndercoverEffectResult,
-    UndercoverResume, UndercoverRuntimeService, UndercoverSnapshot, UndercoverTimedOutcome,
+    UndercoverResume, UndercoverRuntimePort, UndercoverRuntimeService, UndercoverSnapshot,
+    UndercoverTimedOutcome,
 };
 use crate::observation::chat::{
     CompletionAdvance, ObservationCompletionEvent, ObservationWatermark,
 };
 use crate::observation::shared::ObservationGap;
 use crate::runtime::chat_listener::{ChatListenerMode, ChatListenerSnapshot, ChatListenerState};
+use crate::runtime::clock::Clock;
+#[cfg(test)]
+use crate::runtime::clock::SystemClock;
 use crate::runtime::deadline::{BusinessDeadlineEvent, BusinessDeadlineToken};
 use crate::runtime::decision::{DecisionAction, DecisionSnapshot, DecisionState};
 use crate::runtime::deferred_chat::{
@@ -81,58 +83,18 @@ pub enum BusinessEvent {
     TurtleSoupAiCompleted(TurtleSoupAiCompletion),
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) enum BusinessIntent {
-    SongRequest(SongCommand),
-    Playback(PlaybackCommand),
-    Hall(HallCommand),
-    Administration(AdministrationCommand),
-    IdiomChain(IdiomChainCommand),
-    CardGame(LandlordCommand),
-    TurtleSoup(TurtleSoupCommand),
-    Undercover(UndercoverCommand),
-    Invite(InviteCommand),
-    Moderation(ModerationCommand),
-    CustomWorkflow(CustomWorkflowCommand),
+pub(crate) enum BusinessMutationIntent {
+    Administration(AdministrationMutationIntent),
+    Hall(HallMutationIntent),
+    Playback(PlaybackMutationIntent),
+    TurtleSoup(TurtleSoupMutationIntent),
 }
 
-impl BusinessIntent {
-    pub(crate) fn lock_key(&self) -> String {
-        match self {
-            Self::SongRequest(command) => command.lock_key(),
-            Self::Playback(command) => command.lock_key(),
-            Self::Hall(command) => command.lock_key(),
-            Self::Administration(command) => command.lock_key(),
-            Self::IdiomChain(command) => command.lock_key(),
-            Self::CardGame(command) => command.lock_key(),
-            Self::TurtleSoup(command) => command.lock_key().to_string(),
-            Self::Undercover(command) => command.lock_key(),
-            Self::Invite(command) => command.lock_key(),
-            Self::Moderation(command) => command.lock_key(),
-            Self::CustomWorkflow(command) => command.lock_key(),
-        }
-    }
-
-    pub(crate) fn same_request(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::SongRequest(left), Self::SongRequest(right)) => left.same_request(right),
-            (Self::Playback(left), Self::Playback(right)) => left.same_request(right),
-            (Self::Hall(left), Self::Hall(right)) => left.same_request(right),
-            (Self::Administration(left), Self::Administration(right)) => left.same_request(right),
-            (Self::IdiomChain(left), Self::IdiomChain(right)) => left.same_request(right),
-            (Self::CardGame(left), Self::CardGame(right)) => left.same_request(right),
-            (Self::TurtleSoup(left), Self::TurtleSoup(right)) => left.same_request(right),
-            (Self::Undercover(left), Self::Undercover(right)) => left.same_request(right),
-            (Self::Invite(left), Self::Invite(right)) => left.same_request(right),
-            (Self::Moderation(left), Self::Moderation(right)) => left.same_request(right),
-            (Self::CustomWorkflow(left), Self::CustomWorkflow(right)) => left.same_request(right),
-            _ => false,
-        }
-    }
-
-    pub(crate) fn scopes_lock_to_actor(&self) -> bool {
-        matches!(self, Self::CardGame(_) | Self::Undercover(_))
-    }
+pub(crate) enum BusinessMutationOutcome {
+    Administration(AdministrationMutationOutcome),
+    Hall(HallMutationOutcome),
+    Playback(PlaybackMutationOutcome),
+    TurtleSoup(TurtleSoupMutationOutcome),
 }
 
 /// Narrow projection port for business-owned public state. Implementations must only retain
@@ -373,6 +335,7 @@ pub enum BusinessRuntimeError {
     CardGameOperationFailed(String),
     UndercoverOperationFailed(String),
     TurtleSoupOperationFailed(String),
+    HallOperationFailed(String),
     PlaybackOperationFailed(String),
     TimerOperationFailed(String),
     SchedulerOperationFailed(String),
@@ -399,6 +362,9 @@ impl Display for BusinessRuntimeError {
             }
             Self::TurtleSoupOperationFailed(message) => {
                 write!(formatter, "turtle soup operation failed: {message}")
+            }
+            Self::HallOperationFailed(message) => {
+                write!(formatter, "hall operation failed: {message}")
             }
             Self::PlaybackOperationFailed(message) => {
                 write!(formatter, "playback operation failed: {message}")
@@ -538,6 +504,7 @@ enum RuntimeMessage {
         key: ModerationWorkflowKey,
         response: SyncSender<bool>,
     },
+    Hall(HallRuntimeMessage),
     Playback(PlaybackRuntimeMessage),
     RefreshTurtleSoup {
         now: Instant,
@@ -548,6 +515,20 @@ enum RuntimeMessage {
     Snapshot(SyncSender<BusinessRuntimeSnapshot>),
     PrepareShutdown(SyncSender<BusinessRuntimeSnapshot>),
     Shutdown(SyncSender<BusinessRuntimeSnapshot>),
+}
+
+enum HallRuntimeMessage {
+    PatchState {
+        patch: HallStatePatch,
+        response: SyncSender<Result<(), BusinessRuntimeError>>,
+    },
+    StateSnapshot(SyncSender<Result<HallRuntimeState, BusinessRuntimeError>>),
+    UpdateRemainingMinutes {
+        minutes: u32,
+        response: SyncSender<Result<(), BusinessRuntimeError>>,
+    },
+    ClearRemainingMinutes(SyncSender<Result<(), BusinessRuntimeError>>),
+    ClearCountdownCache(SyncSender<Result<bool, BusinessRuntimeError>>),
 }
 
 enum PlaybackRuntimeMessage {
@@ -569,17 +550,7 @@ enum PlaybackRuntimeMessage {
         response: SyncSender<Result<bool, BusinessRuntimeError>>,
     },
     QueueSnapshot(SyncSender<Result<Vec<QueueItem>, BusinessRuntimeError>>),
-    PatchRuntimeState {
-        patch: RuntimeStatePatch,
-        response: SyncSender<Result<(), BusinessRuntimeError>>,
-    },
-    RuntimeStateSnapshot(SyncSender<Result<RuntimeState, BusinessRuntimeError>>),
-    UpdateHallRemainingMinutes {
-        minutes: u32,
-        response: SyncSender<Result<(), BusinessRuntimeError>>,
-    },
-    ClearHallRemainingMinutes(SyncSender<Result<(), BusinessRuntimeError>>),
-    ClearHallCountdownCache(SyncSender<Result<bool, BusinessRuntimeError>>),
+    StateSnapshot(SyncSender<Result<PlaybackRuntimeState, BusinessRuntimeError>>),
     UpdatePlaybackState {
         update: PlaybackStateUpdate,
         response: SyncSender<Result<bool, BusinessRuntimeError>>,
@@ -840,6 +811,86 @@ impl Drop for SchedulerPermit {
     }
 }
 
+impl CardGameRuntimePort for BusinessRuntimeHandle {
+    fn begin(
+        &self,
+        player: &str,
+        command: &LandlordCommand,
+        now: Instant,
+    ) -> anyhow::Result<CardGameCommandStart> {
+        Ok(self.begin_card_game(player, command, now)?)
+    }
+
+    fn claim(&self, key: CardGameEffectKey) -> anyhow::Result<CardGameEffectClaim> {
+        Ok(self.claim_card_game_effect(key)?)
+    }
+
+    fn resume(
+        &self,
+        key: CardGameEffectKey,
+        result: CardGameEffectResult,
+    ) -> anyhow::Result<CardGameResume> {
+        Ok(self.resume_card_game(key, result)?)
+    }
+
+    fn cancel(&self, key: CardGameEffectKey) -> anyhow::Result<()> {
+        let _ = self.cancel_card_game_effect(key)?;
+        Ok(())
+    }
+
+    fn poll_timed_outcome(
+        &self,
+        now: Instant,
+        clock_active: bool,
+    ) -> anyhow::Result<Option<CardGameTimedOutcome>> {
+        Ok(self.poll_card_game_timed_outcome(now, clock_active)?)
+    }
+
+    fn abort(&self) -> anyhow::Result<bool> {
+        Ok(self.abort_card_game()?)
+    }
+}
+
+impl UndercoverRuntimePort for BusinessRuntimeHandle {
+    fn begin(
+        &self,
+        player: &str,
+        source: UndercoverCommandSource,
+        command: &UndercoverCommand,
+        now: Instant,
+    ) -> anyhow::Result<UndercoverCommandStart> {
+        Ok(self.begin_undercover(player, source, command, now)?)
+    }
+
+    fn claim(&self, key: UndercoverEffectKey) -> anyhow::Result<UndercoverEffectClaim> {
+        Ok(self.claim_undercover_effect(key)?)
+    }
+
+    fn resume(
+        &self,
+        key: UndercoverEffectKey,
+        result: UndercoverEffectResult,
+    ) -> anyhow::Result<UndercoverResume> {
+        Ok(self.resume_undercover(key, result)?)
+    }
+
+    fn cancel(&self, key: UndercoverEffectKey) -> anyhow::Result<()> {
+        Ok(self.cancel_undercover_effect(key)?)
+    }
+
+    fn poll_timed_outcome(
+        &self,
+        now: Instant,
+        clock_active: bool,
+    ) -> anyhow::Result<Option<UndercoverTimedOutcome>> {
+        Ok(self.poll_undercover_timed_outcome(now, clock_active)?)
+    }
+
+    fn abort(&self) -> anyhow::Result<bool> {
+        Ok(self.abort_undercover()?)
+    }
+}
+
 impl BusinessRuntimeHandle {
     pub fn submit(&self, event: BusinessEvent) -> Result<(), BusinessRuntimeError> {
         self.send_request(RuntimeMessage::Event(event))
@@ -851,6 +902,99 @@ impl BusinessRuntimeHandle {
         receiver
             .recv()
             .map_err(|_| BusinessRuntimeError::RuntimeStopped)
+    }
+
+    pub(crate) fn apply_mutation(
+        &self,
+        intent: BusinessMutationIntent,
+    ) -> Result<BusinessMutationOutcome, BusinessRuntimeError> {
+        Ok(match intent {
+            BusinessMutationIntent::Administration(intent) => {
+                BusinessMutationOutcome::Administration(self.apply_administration_mutation(intent)?)
+            }
+            BusinessMutationIntent::Hall(intent) => {
+                BusinessMutationOutcome::Hall(self.apply_hall_mutation(intent)?)
+            }
+            BusinessMutationIntent::Playback(intent) => {
+                BusinessMutationOutcome::Playback(self.apply_playback_mutation(intent)?)
+            }
+            BusinessMutationIntent::TurtleSoup(intent) => {
+                BusinessMutationOutcome::TurtleSoup(self.apply_turtle_soup_mutation(intent)?)
+            }
+        })
+    }
+
+    fn apply_administration_mutation(
+        &self,
+        intent: AdministrationMutationIntent,
+    ) -> Result<AdministrationMutationOutcome, BusinessRuntimeError> {
+        Ok(match intent {
+            AdministrationMutationIntent::RequestChatListenerMode(target) => {
+                let queued = self.request_chat_listener_mode(target)?;
+                let snapshot = self.chat_listener_snapshot()?;
+                AdministrationMutationOutcome::ChatListenerModeRequested { queued, snapshot }
+            }
+            AdministrationMutationIntent::CancelChatListenerModeRequest(target) => {
+                self.cancel_chat_listener_mode_request(target)?;
+                AdministrationMutationOutcome::ChatListenerModeRequestCancelled
+            }
+        })
+    }
+
+    fn apply_playback_mutation(
+        &self,
+        intent: PlaybackMutationIntent,
+    ) -> Result<PlaybackMutationOutcome, BusinessRuntimeError> {
+        Ok(match intent {
+            PlaybackMutationIntent::Push(item) => {
+                PlaybackMutationOutcome::Pushed(self.push_playback_queue(item)?)
+            }
+            PlaybackMutationIntent::Remove(removal) => {
+                PlaybackMutationOutcome::Removed(self.remove_playback_queue(removal)?)
+            }
+            PlaybackMutationIntent::Clear => {
+                self.clear_playback_queue()?;
+                PlaybackMutationOutcome::Cleared
+            }
+        })
+    }
+
+    fn apply_hall_mutation(
+        &self,
+        intent: HallMutationIntent,
+    ) -> Result<HallMutationOutcome, BusinessRuntimeError> {
+        Ok(match intent {
+            HallMutationIntent::PatchState(patch) => {
+                self.patch_hall_state(patch)?;
+                HallMutationOutcome::StatePatched
+            }
+        })
+    }
+
+    fn apply_turtle_soup_mutation(
+        &self,
+        intent: TurtleSoupMutationIntent,
+    ) -> Result<TurtleSoupMutationOutcome, BusinessRuntimeError> {
+        Ok(match intent {
+            TurtleSoupMutationIntent::Start { puzzle_id } => {
+                if let Some(id) = puzzle_id {
+                    self.start_turtle_soup_by_id(&id)?;
+                } else {
+                    self.start_turtle_soup_random()?;
+                }
+                TurtleSoupMutationOutcome::Started(self.turtle_soup_snapshot()?)
+            }
+            TurtleSoupMutationIntent::End => {
+                let ended = self.end_turtle_soup()?;
+                let snapshot = self.turtle_soup_snapshot()?;
+                TurtleSoupMutationOutcome::Ended { ended, snapshot }
+            }
+            TurtleSoupMutationIntent::AppendPuzzle(submission) => {
+                TurtleSoupMutationOutcome::PuzzleAppended(
+                    self.append_turtle_soup_puzzle(submission)?,
+                )
+            }
+        })
     }
 
     pub(crate) fn enqueue_formal_task(
@@ -1242,19 +1386,17 @@ impl BusinessRuntimeHandle {
         })
     }
 
-    pub(crate) fn patch_runtime_state(
+    pub(crate) fn patch_hall_state(
         &self,
-        patch: RuntimeStatePatch,
+        patch: HallStatePatch,
     ) -> Result<(), BusinessRuntimeError> {
         self.request(|response| {
-            RuntimeMessage::Playback(PlaybackRuntimeMessage::PatchRuntimeState { patch, response })
+            RuntimeMessage::Hall(HallRuntimeMessage::PatchState { patch, response })
         })
     }
 
-    pub(crate) fn runtime_state_snapshot(&self) -> Result<RuntimeState, BusinessRuntimeError> {
-        self.request(|response| {
-            RuntimeMessage::Playback(PlaybackRuntimeMessage::RuntimeStateSnapshot(response))
-        })
+    pub(crate) fn hall_state_snapshot(&self) -> Result<HallRuntimeState, BusinessRuntimeError> {
+        self.request(|response| RuntimeMessage::Hall(HallRuntimeMessage::StateSnapshot(response)))
     }
 
     pub(crate) fn update_hall_remaining_minutes(
@@ -1262,22 +1404,27 @@ impl BusinessRuntimeHandle {
         minutes: u32,
     ) -> Result<(), BusinessRuntimeError> {
         self.request(|response| {
-            RuntimeMessage::Playback(PlaybackRuntimeMessage::UpdateHallRemainingMinutes {
-                minutes,
-                response,
-            })
+            RuntimeMessage::Hall(HallRuntimeMessage::UpdateRemainingMinutes { minutes, response })
         })
     }
 
     pub(crate) fn clear_hall_remaining_minutes(&self) -> Result<(), BusinessRuntimeError> {
         self.request(|response| {
-            RuntimeMessage::Playback(PlaybackRuntimeMessage::ClearHallRemainingMinutes(response))
+            RuntimeMessage::Hall(HallRuntimeMessage::ClearRemainingMinutes(response))
         })
     }
 
     pub(crate) fn clear_hall_countdown_cache(&self) -> Result<bool, BusinessRuntimeError> {
         self.request(|response| {
-            RuntimeMessage::Playback(PlaybackRuntimeMessage::ClearHallCountdownCache(response))
+            RuntimeMessage::Hall(HallRuntimeMessage::ClearCountdownCache(response))
+        })
+    }
+
+    pub(crate) fn playback_state_snapshot(
+        &self,
+    ) -> Result<PlaybackRuntimeState, BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::Playback(PlaybackRuntimeMessage::StateSnapshot(response))
         })
     }
 
@@ -1856,10 +2003,12 @@ pub(crate) struct BusinessRuntimeWorker {
     card_games: CardGameService,
     undercover: UndercoverRuntimeService,
     turtle_soup: Option<TurtleSoupService>,
+    hall: Option<HallStateService>,
     playback: Option<PlaybackService>,
     invite: InviteService,
     timer: Option<TimerRuntimeHandle<BusinessDeadlineToken>>,
     state_sink: Option<Arc<dyn BusinessStateSink>>,
+    clock: Arc<dyn Clock>,
 }
 
 impl BusinessRuntimeWorker {
@@ -1869,21 +2018,31 @@ impl BusinessRuntimeWorker {
         card_games: CardGameService,
         undercover: UndercoverRuntimeService,
         turtle_soup: TurtleSoupService,
+        hall: HallStateService,
         playback: PlaybackService,
         invite: InviteService,
         timer: TimerRuntimeHandle<BusinessDeadlineToken>,
         state_sink: Arc<dyn BusinessStateSink>,
+        clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
             idiom_chain,
             card_games,
             undercover,
             turtle_soup: Some(turtle_soup),
+            hall: Some(hall),
             playback: Some(playback),
             invite,
             timer: Some(timer),
             state_sink: Some(state_sink),
+            clock,
         }
+    }
+
+    #[cfg(test)]
+    fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
     }
 }
 
@@ -1894,6 +2053,21 @@ impl BusinessRuntime {
         idiom_chain: IdiomChainService,
         card_games: CardGameService,
     ) -> Result<Self, BusinessRuntimeError> {
+        Self::start_with_clock(
+            queue_capacity,
+            idiom_chain,
+            card_games,
+            Arc::new(SystemClock),
+        )
+    }
+
+    #[cfg(test)]
+    fn start_with_clock(
+        queue_capacity: usize,
+        idiom_chain: IdiomChainService,
+        card_games: CardGameService,
+        clock: Arc<dyn Clock>,
+    ) -> Result<Self, BusinessRuntimeError> {
         Self::start_internal(
             queue_capacity,
             BusinessRuntimeWorker {
@@ -1901,11 +2075,14 @@ impl BusinessRuntime {
                 card_games,
                 undercover: default_undercover_service(),
                 turtle_soup: None,
+                hall: None,
                 playback: None,
                 invite: InviteService::new(),
                 timer: None,
                 state_sink: None,
-            },
+                clock: Arc::new(SystemClock),
+            }
+            .with_clock(clock),
         )
     }
 
@@ -1914,6 +2091,7 @@ impl BusinessRuntime {
         queue_capacity: usize,
         idiom_chain: IdiomChainService,
         card_games: CardGameService,
+        hall: HallStateService,
         playback: PlaybackService,
     ) -> Result<Self, BusinessRuntimeError> {
         Self::start_internal(
@@ -1923,34 +2101,12 @@ impl BusinessRuntime {
                 card_games,
                 undercover: default_undercover_service(),
                 turtle_soup: None,
+                hall: Some(hall),
                 playback: Some(playback),
                 invite: InviteService::new(),
                 timer: None,
                 state_sink: None,
-            },
-        )
-    }
-
-    #[cfg(test)]
-    pub(crate) fn start_with_undercover(
-        queue_capacity: usize,
-        idiom_chain: IdiomChainService,
-        card_games: CardGameService,
-        undercover: UndercoverRuntimeService,
-        turtle_soup: TurtleSoupService,
-        playback: PlaybackService,
-    ) -> Result<Self, BusinessRuntimeError> {
-        Self::start_internal(
-            queue_capacity,
-            BusinessRuntimeWorker {
-                idiom_chain,
-                card_games,
-                undercover,
-                turtle_soup: Some(turtle_soup),
-                playback: Some(playback),
-                invite: InviteService::new(),
-                timer: None,
-                state_sink: None,
+                clock: Arc::new(SystemClock),
             },
         )
     }
@@ -2526,6 +2682,7 @@ fn handle_business_timer(
     operation_ids: &BusinessOperationIdAllocator,
     generation: &mut SessionGeneration,
     clock_active: bool,
+    clock: &dyn Clock,
 ) -> Result<(), BusinessRuntimeError> {
     if let BusinessDeadlineEvent::TurtleSoup(timer_event) = &event {
         match timer_event {
@@ -2545,7 +2702,7 @@ fn handle_business_timer(
                     service.handle_deadline(
                         entertainment,
                         *expired.token().kind(),
-                        Instant::now(),
+                        clock.now(),
                         deferred_chat,
                     );
                 }
@@ -2555,7 +2712,7 @@ fn handle_business_timer(
                     active_turtle_soup_deadline,
                     pending_turtle_soup_cancellations,
                     operation_ids,
-                    Instant::now(),
+                    clock.now(),
                     clock_active,
                 );
             }
@@ -2599,7 +2756,7 @@ fn handle_business_timer(
                         active_turtle_soup_deadline,
                         pending_turtle_soup_cancellations,
                         operation_ids,
-                        Instant::now(),
+                        clock.now(),
                         clock_active,
                     );
                 }
@@ -2620,7 +2777,7 @@ fn handle_business_timer(
                         active_turtle_soup_deadline,
                         pending_turtle_soup_cancellations,
                         operation_ids,
-                        Instant::now(),
+                        clock.now(),
                         clock_active,
                     );
                 }
@@ -2649,7 +2806,7 @@ fn handle_business_timer(
                     .handle_deadline(
                         entertainment,
                         *expired.token().kind(),
-                        Instant::now(),
+                        clock.now(),
                         outcome_operation,
                     )
                     .map_err(undercover_operation_failed)?
@@ -2662,7 +2819,7 @@ fn handle_business_timer(
                     active_undercover_deadline,
                     pending_undercover_cancellations,
                     operation_ids,
-                    Instant::now(),
+                    clock.now(),
                     clock_active,
                 );
             }
@@ -2702,7 +2859,7 @@ fn handle_business_timer(
                         active_undercover_deadline,
                         pending_undercover_cancellations,
                         operation_ids,
-                        Instant::now(),
+                        clock.now(),
                         clock_active,
                     );
                 }
@@ -2723,7 +2880,7 @@ fn handle_business_timer(
                         active_undercover_deadline,
                         pending_undercover_cancellations,
                         operation_ids,
-                        Instant::now(),
+                        clock.now(),
                         clock_active,
                     );
                 }
@@ -2745,7 +2902,7 @@ fn handle_business_timer(
                     *active_card_game_deadline = Some(previous);
                     return Ok(());
                 }
-                let handled_at = Instant::now();
+                let handled_at = clock.now();
                 if let Some(outcome) = card_games
                     .handle_deadline(entertainment, *expired.token().kind(), handled_at)
                     .map_err(card_game_operation_failed)?
@@ -2798,7 +2955,7 @@ fn handle_business_timer(
                         active_card_game_deadline,
                         pending_card_game_cancellations,
                         operation_ids,
-                        Instant::now(),
+                        clock.now(),
                         clock_active,
                     );
                 }
@@ -2820,7 +2977,7 @@ fn handle_business_timer(
                         active_card_game_deadline,
                         pending_card_game_cancellations,
                         operation_ids,
-                        Instant::now(),
+                        clock.now(),
                         clock_active,
                     );
                 }
@@ -2865,10 +3022,12 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
         mut card_games,
         mut undercover,
         mut turtle_soup,
+        mut hall,
         mut playback,
         mut invite,
         timer,
         state_sink,
+        clock,
     } = worker_config;
     let mut snapshot = BusinessRuntimeSnapshot::default();
     let mut entertainment = EntertainmentState::new();
@@ -2890,14 +3049,19 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
     let mut moderation_workflows = HashSet::new();
     let operation_ids = BusinessOperationIdAllocator::new();
     let mut session_generation = SessionGeneration::INITIAL;
-    publish_business_state(&state_sink, turtle_soup.as_ref(), &undercover);
+    publish_business_state(
+        &state_sink,
+        turtle_soup.as_ref(),
+        &undercover,
+        clock.as_ref(),
+    );
     publish_playback_queue(&state_sink, playback.as_ref());
-    publish_hall_state(&state_sink, playback.as_ref());
+    publish_hall_state(&state_sink, hall.as_ref());
     publish_scheduler_state(&state_sink, &formal_scheduler);
     publish_diagnostic_state(&state_sink, &formal_scheduler);
     publish_chat_listener_state(&state_sink, &chat_listener);
     publish_decision_state(&state_sink, &mut decision);
-    publish_operational_state(&state_sink, &operational, Instant::now());
+    publish_operational_state(&state_sink, &operational, clock.now());
     while let Ok(message) = receiver.recv() {
         match message {
             RuntimeMessage::EnqueueFormalTask {
@@ -3046,7 +3210,7 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
             }
             RuntimeMessage::SetCommandsEnabled { enabled, response } => {
                 operational.commands_enabled = enabled;
-                publish_operational_state(&state_sink, &operational, Instant::now());
+                publish_operational_state(&state_sink, &operational, clock.now());
                 let _ = response.send(Ok(()));
             }
             RuntimeMessage::ConfigureIdleExit {
@@ -3073,7 +3237,7 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
             }
             RuntimeMessage::ClearIdleExit(response) => {
                 operational.idle_exit = None;
-                publish_operational_state(&state_sink, &operational, Instant::now());
+                publish_operational_state(&state_sink, &operational, clock.now());
                 let _ = response.send(Ok(()));
             }
             RuntimeMessage::ChatListener(message) => {
@@ -3106,6 +3270,7 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
                         &operation_ids,
                         &mut session_generation,
                         entertainment_clock_active,
+                        clock.as_ref(),
                     ) {
                         log::error!("业务运行时处理计时事件失败: {error}");
                     }
@@ -3123,7 +3288,7 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
                             &mut active_turtle_soup_deadline,
                             &mut pending_turtle_soup_cancellations,
                             &operation_ids,
-                            Instant::now(),
+                            clock.now(),
                             entertainment_clock_active,
                         ) {
                             log::error!("处理海龟汤 AI 裁决后同步期限失败: {error}");
@@ -3138,7 +3303,7 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
                 response,
             } => {
                 let result = idiom_chain
-                    .handle(&mut entertainment, &player, &command)
+                    .handle_at(&mut entertainment, &player, &command, clock.now())
                     .map_err(idiom_chain_operation_failed)
                     .and_then(|outcome| {
                         sync_idiom_deadline(
@@ -3158,7 +3323,7 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
                 response,
             } => {
                 let result = idiom_chain
-                    .explain(&player, &command)
+                    .explain_at(&player, &command, clock.now())
                     .map_err(idiom_chain_operation_failed)
                     .and_then(|outcome| {
                         sync_idiom_deadline(
@@ -3190,7 +3355,7 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
             }
             RuntimeMessage::ExpireIdiomChain(response) => {
                 let result = idiom_chain
-                    .expire_idle_at(&mut entertainment, Instant::now())
+                    .expire_idle_at(&mut entertainment, clock.now())
                     .map_err(idiom_chain_operation_failed)
                     .and_then(|expired| {
                         sync_idiom_deadline(
@@ -3215,6 +3380,7 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
                     &operation_ids,
                     &mut pending_card_game_outcomes,
                     &mut entertainment_clock_active,
+                    clock.as_ref(),
                 ) {
                     log::error!("业务运行时处理牌局消息失败: {error}");
                 }
@@ -3230,12 +3396,13 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
                     &operation_ids,
                     &mut pending_undercover_outcomes,
                     &mut entertainment_clock_active,
+                    clock.as_ref(),
                 ) {
                     log::error!("业务运行时处理谁是卧底消息失败: {error}");
                 }
             }
             RuntimeMessage::UndercoverSnapshot(response) => {
-                let _ = response.send(Ok(undercover.snapshot(Instant::now())));
+                let _ = response.send(Ok(undercover.snapshot(clock.now())));
             }
             RuntimeMessage::TurtleSoup(message) => {
                 if let Err(error) = handle_turtle_soup_message(
@@ -3248,6 +3415,7 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
                         pending_cancellations: &mut pending_turtle_soup_cancellations,
                         operation_ids: &operation_ids,
                         clock_active: entertainment_clock_active,
+                        clock: clock.as_ref(),
                     },
                     message,
                 ) {
@@ -3293,6 +3461,67 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
             RuntimeMessage::ContainsModerationWorkflow { key, response } => {
                 let _ = response.send(moderation_workflows.contains(&key));
             }
+            RuntimeMessage::Hall(message) => match message {
+                HallRuntimeMessage::PatchState { patch, response } => {
+                    let result = hall
+                        .as_mut()
+                        .ok_or(BusinessRuntimeError::RuntimeStopped)
+                        .and_then(|service| service.patch(patch).map_err(hall_operation_failed));
+                    if result.is_ok() {
+                        publish_hall_state(&state_sink, hall.as_ref());
+                    }
+                    let _ = response.send(result);
+                }
+                HallRuntimeMessage::StateSnapshot(response) => {
+                    let result = hall
+                        .as_ref()
+                        .map(HallStateService::snapshot)
+                        .ok_or(BusinessRuntimeError::RuntimeStopped);
+                    let _ = response.send(result);
+                }
+                HallRuntimeMessage::UpdateRemainingMinutes { minutes, response } => {
+                    let result = hall
+                        .as_mut()
+                        .ok_or(BusinessRuntimeError::RuntimeStopped)
+                        .and_then(|service| {
+                            service
+                                .update_remaining_minutes(minutes)
+                                .map_err(hall_operation_failed)
+                        });
+                    if result.is_ok() {
+                        publish_hall_state(&state_sink, hall.as_ref());
+                    }
+                    let _ = response.send(result);
+                }
+                HallRuntimeMessage::ClearRemainingMinutes(response) => {
+                    let result = hall
+                        .as_mut()
+                        .ok_or(BusinessRuntimeError::RuntimeStopped)
+                        .and_then(|service| {
+                            service
+                                .clear_remaining_minutes()
+                                .map_err(hall_operation_failed)
+                        });
+                    if result.is_ok() {
+                        publish_hall_state(&state_sink, hall.as_ref());
+                    }
+                    let _ = response.send(result);
+                }
+                HallRuntimeMessage::ClearCountdownCache(response) => {
+                    let result = hall
+                        .as_mut()
+                        .ok_or(BusinessRuntimeError::RuntimeStopped)
+                        .and_then(|service| {
+                            service
+                                .clear_countdown_cache()
+                                .map_err(hall_operation_failed)
+                        });
+                    if result.as_ref().is_ok_and(|cleared| *cleared) {
+                        publish_hall_state(&state_sink, hall.as_ref());
+                    }
+                    let _ = response.send(result);
+                }
+            },
             RuntimeMessage::Playback(message) => match message {
                 PlaybackRuntimeMessage::PushQueue { item, response } => {
                     let result = playback
@@ -3360,67 +3589,11 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
                         .ok_or(BusinessRuntimeError::RuntimeStopped);
                     let _ = response.send(result);
                 }
-                PlaybackRuntimeMessage::PatchRuntimeState { patch, response } => {
-                    let result = playback
-                        .as_mut()
-                        .ok_or(BusinessRuntimeError::RuntimeStopped)
-                        .and_then(|service| {
-                            service
-                                .patch_runtime_state(patch)
-                                .map_err(playback_operation_failed)
-                        });
-                    if result.is_ok() {
-                        publish_hall_state(&state_sink, playback.as_ref());
-                    }
-                    let _ = response.send(result);
-                }
-                PlaybackRuntimeMessage::RuntimeStateSnapshot(response) => {
+                PlaybackRuntimeMessage::StateSnapshot(response) => {
                     let result = playback
                         .as_ref()
-                        .map(PlaybackService::runtime_state_snapshot)
+                        .map(PlaybackService::playback_state_snapshot)
                         .ok_or(BusinessRuntimeError::RuntimeStopped);
-                    let _ = response.send(result);
-                }
-                PlaybackRuntimeMessage::UpdateHallRemainingMinutes { minutes, response } => {
-                    let result = playback
-                        .as_mut()
-                        .ok_or(BusinessRuntimeError::RuntimeStopped)
-                        .and_then(|service| {
-                            service
-                                .update_hall_remaining_minutes(minutes)
-                                .map_err(playback_operation_failed)
-                        });
-                    if result.is_ok() {
-                        publish_hall_state(&state_sink, playback.as_ref());
-                    }
-                    let _ = response.send(result);
-                }
-                PlaybackRuntimeMessage::ClearHallRemainingMinutes(response) => {
-                    let result = playback
-                        .as_mut()
-                        .ok_or(BusinessRuntimeError::RuntimeStopped)
-                        .and_then(|service| {
-                            service
-                                .clear_hall_remaining_minutes()
-                                .map_err(playback_operation_failed)
-                        });
-                    if result.is_ok() {
-                        publish_hall_state(&state_sink, playback.as_ref());
-                    }
-                    let _ = response.send(result);
-                }
-                PlaybackRuntimeMessage::ClearHallCountdownCache(response) => {
-                    let result = playback
-                        .as_mut()
-                        .ok_or(BusinessRuntimeError::RuntimeStopped)
-                        .and_then(|service| {
-                            service
-                                .clear_hall_countdown_cache()
-                                .map_err(playback_operation_failed)
-                        });
-                    if result.as_ref().is_ok_and(|cleared| *cleared) {
-                        publish_hall_state(&state_sink, playback.as_ref());
-                    }
                     let _ = response.send(result);
                 }
                 PlaybackRuntimeMessage::UpdatePlaybackState { update, response } => {
@@ -3506,6 +3679,7 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
                     &mut pending_card_game_outcomes,
                     &mut pending_undercover_outcomes,
                     entertainment_clock_active,
+                    clock.as_ref(),
                 );
                 snapshot.quiescing = true;
                 let _ = response.send(snapshot);
@@ -3530,12 +3704,18 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
                     &mut pending_card_game_outcomes,
                     &mut pending_undercover_outcomes,
                     entertainment_clock_active,
+                    clock.as_ref(),
                 );
                 let _ = response.send(snapshot);
                 break;
             }
         }
-        publish_business_state(&state_sink, turtle_soup.as_ref(), &undercover);
+        publish_business_state(
+            &state_sink,
+            turtle_soup.as_ref(),
+            &undercover,
+            clock.as_ref(),
+        );
     }
 }
 
@@ -3543,6 +3723,7 @@ fn publish_business_state(
     sink: &Option<Arc<dyn BusinessStateSink>>,
     turtle_soup: Option<&TurtleSoupService>,
     undercover: &UndercoverRuntimeService,
+    clock: &dyn Clock,
 ) {
     let Some(sink) = sink.as_ref() else {
         return;
@@ -3550,7 +3731,7 @@ fn publish_business_state(
     if let Some(turtle_soup) = turtle_soup {
         sink.publish_turtle_soup(turtle_soup.snapshot().redacted_for_monitor());
     }
-    sink.publish_undercover(undercover.snapshot(Instant::now()));
+    sink.publish_undercover(undercover.snapshot(clock.now()));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3573,6 +3754,7 @@ fn abort_business_modules(
     pending_card_game_outcomes: &mut std::collections::VecDeque<CardGameTimedOutcome>,
     pending_undercover_outcomes: &mut std::collections::VecDeque<UndercoverTimedOutcome>,
     clock_active: bool,
+    clock: &dyn Clock,
 ) {
     if let Err(error) = card_games.abort(entertainment) {
         log::error!("业务运行时关闭时无法中止牌局: {error:#}");
@@ -3599,7 +3781,7 @@ fn abort_business_modules(
         active_card_game_deadline,
         pending_card_game_cancellations,
         operation_ids,
-        Instant::now(),
+        clock.now(),
         clock_active,
     ) {
         log::error!("业务运行时关闭时无法撤销牌局期限: {error}");
@@ -3610,7 +3792,7 @@ fn abort_business_modules(
         active_undercover_deadline,
         pending_undercover_cancellations,
         operation_ids,
-        Instant::now(),
+        clock.now(),
         clock_active,
     ) {
         log::error!("业务运行时关闭时无法撤销谁是卧底期限: {error}");
@@ -3621,7 +3803,7 @@ fn abort_business_modules(
         active_turtle_soup_deadline,
         pending_turtle_soup_cancellations,
         operation_ids,
-        Instant::now(),
+        clock.now(),
         clock_active,
     ) {
         log::error!("业务运行时关闭时无法撤销海龟汤期限: {error}");
@@ -3644,6 +3826,7 @@ fn handle_card_game_message(
     operation_ids: &BusinessOperationIdAllocator,
     pending_outcomes: &mut std::collections::VecDeque<CardGameTimedOutcome>,
     clock_active: &mut bool,
+    clock: &dyn Clock,
 ) -> Result<(), BusinessRuntimeError> {
     match message {
         CardGameRuntimeMessage::Begin {
@@ -3680,7 +3863,7 @@ fn handle_card_game_message(
                         active_deadline,
                         pending_cancellations,
                         operation_ids,
-                        Instant::now(),
+                        clock.now(),
                         *clock_active,
                     )?;
                     Ok(result)
@@ -3702,7 +3885,7 @@ fn handle_card_game_message(
                         active_deadline,
                         pending_cancellations,
                         operation_ids,
-                        Instant::now(),
+                        clock.now(),
                         *clock_active,
                     )?;
                     Ok(result)
@@ -3720,7 +3903,7 @@ fn handle_card_game_message(
                         active_deadline,
                         pending_cancellations,
                         operation_ids,
-                        Instant::now(),
+                        clock.now(),
                         *clock_active,
                     )?;
                     Ok(result)
@@ -3775,7 +3958,7 @@ fn handle_card_game_message(
                         active_deadline,
                         pending_cancellations,
                         operation_ids,
-                        Instant::now(),
+                        clock.now(),
                         *clock_active,
                     )?;
                     Ok(result)
@@ -3795,6 +3978,7 @@ struct TurtleSoupHandlerContext<'a> {
     pending_cancellations: &'a mut Vec<ActiveTurtleSoupDeadline>,
     operation_ids: &'a BusinessOperationIdAllocator,
     clock_active: bool,
+    clock: &'a dyn Clock,
 }
 
 fn handle_turtle_soup_message(
@@ -3810,6 +3994,7 @@ fn handle_turtle_soup_message(
         pending_cancellations,
         operation_ids,
         clock_active,
+        clock,
     } = context;
     let Some(service) = turtle_soup else {
         match message {
@@ -3867,7 +4052,7 @@ fn handle_turtle_soup_message(
                 active_deadline,
                 pending_cancellations,
                 operation_ids,
-                Instant::now(),
+                clock.now(),
                 clock_active,
             ) {
                 log::error!("处理海龟汤大厅命令后同步期限失败: {error}");
@@ -3887,7 +4072,7 @@ fn handle_turtle_soup_message(
                 active_deadline,
                 pending_cancellations,
                 operation_ids,
-                Instant::now(),
+                clock.now(),
                 clock_active,
             ) {
                 log::error!("处理海龟汤好友命令后同步期限失败: {error}");
@@ -3905,7 +4090,7 @@ fn handle_turtle_soup_message(
                         active_deadline,
                         pending_cancellations,
                         operation_ids,
-                        Instant::now(),
+                        clock.now(),
                         clock_active,
                     )
                 });
@@ -3922,7 +4107,7 @@ fn handle_turtle_soup_message(
                         active_deadline,
                         pending_cancellations,
                         operation_ids,
-                        Instant::now(),
+                        clock.now(),
                         clock_active,
                     )
                 });
@@ -3939,7 +4124,7 @@ fn handle_turtle_soup_message(
                         active_deadline,
                         pending_cancellations,
                         operation_ids,
-                        Instant::now(),
+                        clock.now(),
                         clock_active,
                     )?;
                     Ok(ended)
@@ -3974,7 +4159,7 @@ fn handle_turtle_soup_message(
                         active_deadline,
                         pending_cancellations,
                         operation_ids,
-                        Instant::now(),
+                        clock.now(),
                         clock_active,
                     )?;
                     Ok(outcome)
@@ -3989,7 +4174,7 @@ fn handle_turtle_soup_message(
                 active_deadline,
                 pending_cancellations,
                 operation_ids,
-                Instant::now(),
+                clock.now(),
                 clock_active,
             )?;
         }
@@ -4004,7 +4189,7 @@ fn handle_turtle_soup_message(
                 active_deadline,
                 pending_cancellations,
                 operation_ids,
-                Instant::now(),
+                clock.now(),
                 clock_active,
             )?;
         }
@@ -4017,7 +4202,7 @@ fn handle_turtle_soup_message(
                 active_deadline,
                 pending_cancellations,
                 operation_ids,
-                Instant::now(),
+                clock.now(),
                 clock_active,
             )?;
         }
@@ -4045,6 +4230,7 @@ fn handle_undercover_message(
     operation_ids: &BusinessOperationIdAllocator,
     pending_outcomes: &mut std::collections::VecDeque<UndercoverTimedOutcome>,
     clock_active: &mut bool,
+    clock: &dyn Clock,
 ) -> Result<(), BusinessRuntimeError> {
     match message {
         UndercoverRuntimeMessage::Begin {
@@ -4085,7 +4271,7 @@ fn handle_undercover_message(
                         active_deadline,
                         pending_cancellations,
                         operation_ids,
-                        Instant::now(),
+                        clock.now(),
                         *clock_active,
                     )?;
                     Ok(result)
@@ -4107,7 +4293,7 @@ fn handle_undercover_message(
                         active_deadline,
                         pending_cancellations,
                         operation_ids,
-                        Instant::now(),
+                        clock.now(),
                         *clock_active,
                     )?;
                     Ok(result)
@@ -4125,7 +4311,7 @@ fn handle_undercover_message(
                         active_deadline,
                         pending_cancellations,
                         operation_ids,
-                        Instant::now(),
+                        clock.now(),
                         *clock_active,
                     )?;
                     Ok(result)
@@ -4158,7 +4344,7 @@ fn handle_undercover_message(
                 active_deadline,
                 pending_cancellations,
                 operation_ids,
-                Instant::now(),
+                clock.now(),
                 *clock_active,
             )
             .map(|()| aborted);
@@ -4184,6 +4370,10 @@ fn turtle_soup_operation_failed(error: anyhow::Error) -> BusinessRuntimeError {
     BusinessRuntimeError::TurtleSoupOperationFailed(format!("{error:#}"))
 }
 
+fn hall_operation_failed(error: anyhow::Error) -> BusinessRuntimeError {
+    BusinessRuntimeError::HallOperationFailed(format!("{error:#}"))
+}
+
 fn playback_operation_failed(error: anyhow::Error) -> BusinessRuntimeError {
     BusinessRuntimeError::PlaybackOperationFailed(format!("{error:#}"))
 }
@@ -4199,14 +4389,10 @@ fn publish_playback_queue(
 
 fn publish_hall_state(
     state_sink: &Option<Arc<dyn BusinessStateSink>>,
-    playback: Option<&PlaybackService>,
+    hall: Option<&HallStateService>,
 ) {
-    if let (Some(state_sink), Some(playback)) = (state_sink, playback) {
-        state_sink.publish_hall_remaining_minutes(
-            playback
-                .runtime_state_snapshot()
-                .hall_remaining_minutes_now(),
-        );
+    if let (Some(state_sink), Some(hall)) = (state_sink, hall) {
+        state_sink.publish_hall_remaining_minutes(hall.snapshot().remaining_minutes_now());
     }
 }
 
@@ -4393,6 +4579,7 @@ mod tests {
     use crate::features::undercover::{UndercoverDeadlineKind, UndercoverDeadlineToken};
     use crate::observation::chat::ChatObservationLedger;
     use crate::observation::shared::{ObservationGapKind, SharedObservationStream};
+    use crate::runtime::clock::ManualClock;
     use crate::runtime::deadline::{BusinessDeadlineEvent, BusinessDeadlineToken};
     use crate::runtime::deferred_chat::{DeferredChatMessage, DeferredChatTarget};
     use crate::runtime::identity::{BusinessOperationId, SessionGeneration};
@@ -4798,7 +4985,7 @@ mod tests {
 
     fn playback_service(
         queue: crate::features::playback::PersistentQueue,
-        runtime_state: crate::features::playback::PersistentRuntimeState,
+        playback_state: crate::features::playback::PersistentPlaybackState,
     ) -> crate::features::playback::PlaybackService {
         let suffix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -4806,14 +4993,23 @@ mod tests {
             .as_nanos();
         let history = crate::features::playback::PersistentSongDedupHistory::load(
             std::env::temp_dir().join(format!("mwm-business-dedup-{suffix}.json")),
+            Arc::new(SystemClock),
         )
         .unwrap();
         crate::features::playback::PlaybackService::new(
             queue,
-            runtime_state,
+            playback_state,
             history,
-            crate::config::MatchConfig::default(),
-            crate::config::SongDedupConfig::default(),
+            crate::features::playback::SongDedupConfig::default(),
+        )
+    }
+
+    fn hall_service(path: std::path::PathBuf) -> HallStateService {
+        let clock = Arc::new(SystemClock);
+        HallStateService::new_with_time(
+            crate::features::hall::PersistentHallState::load(path).expect("hall state"),
+            clock.clone(),
+            clock,
         )
     }
 
@@ -5301,6 +5497,35 @@ mod tests {
     }
 
     #[test]
+    fn worker_owned_idiom_time_uses_the_injected_clock() {
+        let clock = Arc::new(ManualClock::new(Instant::now()));
+        let runtime = BusinessRuntime::start_with_clock(
+            2,
+            idiom_service(Some(Duration::from_secs(30))),
+            CardGameService::new(LandlordConfig::default()),
+            clock.clone(),
+        )
+        .unwrap();
+        let handle = runtime.handle();
+        handle
+            .handle_idiom_chain(
+                "Alice",
+                &IdiomChainCommand::Start {
+                    idiom: "画蛇添足".to_string(),
+                    mode: IdiomChainMode::Exact,
+                },
+            )
+            .unwrap();
+
+        clock.advance(Duration::from_secs(29)).unwrap();
+        assert!(!handle.expire_idiom_chain().unwrap());
+        clock.advance(Duration::from_secs(1)).unwrap();
+        assert!(handle.expire_idiom_chain().unwrap());
+
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
     fn matching_idiom_deadline_event_expires_the_owned_session() {
         let mut entertainment = EntertainmentState::new();
         let mut idiom_chain = idiom_service(Some(Duration::ZERO));
@@ -5372,6 +5597,7 @@ mod tests {
             &operation_ids,
             &mut next_generation,
             true,
+            &SystemClock,
         )
         .unwrap();
 
@@ -5435,15 +5661,17 @@ mod tests {
             .unwrap()
             .as_nanos();
         let path = std::env::temp_dir().join(format!("mwm-business-queue-{suffix}.json"));
-        let runtime_state_path = path.with_extension("runtime-state.json");
+        let playback_state_path = path.with_extension("playback-state.json");
+        let hall_state_path = path.with_extension("hall-state.json");
         let queue = crate::features::playback::PersistentQueue::load(path, 4).unwrap();
-        let runtime_state =
-            crate::features::playback::PersistentRuntimeState::load(runtime_state_path).unwrap();
+        let playback_state =
+            crate::features::playback::PersistentPlaybackState::load(playback_state_path).unwrap();
         let runtime = BusinessRuntime::start_with_playback(
             4,
             idiom_service(None),
             CardGameService::new(LandlordConfig::default()),
-            playback_service(queue, runtime_state),
+            hall_service(hall_state_path),
+            playback_service(queue, playback_state),
         )
         .unwrap();
         let handle = runtime.handle();
@@ -5466,7 +5694,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_state_patch_is_applied_by_the_business_owner() {
+    fn hall_state_patch_is_applied_by_the_business_owner() {
         let suffix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -5475,31 +5703,32 @@ mod tests {
         let queue =
             crate::features::playback::PersistentQueue::load(directory.join("queue.json"), 4)
                 .unwrap();
-        let runtime_state = crate::features::playback::PersistentRuntimeState::load(
-            directory.join("runtime-state.json"),
+        let playback_state = crate::features::playback::PersistentPlaybackState::load(
+            directory.join("playback-state.json"),
         )
         .unwrap();
         let runtime = BusinessRuntime::start_with_playback(
             4,
             idiom_service(None),
             CardGameService::new(LandlordConfig::default()),
-            playback_service(queue, runtime_state),
+            hall_service(directory.join("hall-state.json")),
+            playback_service(queue, playback_state),
         )
         .unwrap();
         let handle = runtime.handle();
 
         handle
-            .patch_runtime_state(crate::features::playback::RuntimeStatePatch {
-                hall_remaining_minutes: Some(Some(42)),
-                hall_remaining_updated_at: Some(Some(1234)),
-                hall_expiring_warning_sent: Some(true),
+            .patch_hall_state(HallStatePatch {
+                remaining_minutes: Some(Some(42)),
+                remaining_updated_at: Some(Some(1234)),
+                expiring_warning_sent: Some(true),
             })
             .unwrap();
-        let snapshot = handle.runtime_state_snapshot().unwrap();
+        let snapshot = handle.hall_state_snapshot().unwrap();
 
-        assert_eq!(snapshot.hall_remaining_minutes, Some(42));
-        assert_eq!(snapshot.hall_remaining_updated_at, Some(1234));
-        assert!(snapshot.hall_expiring_warning_sent);
+        assert_eq!(snapshot.remaining_minutes, Some(42));
+        assert_eq!(snapshot.remaining_updated_at, Some(1234));
+        assert!(snapshot.expiring_warning_sent);
         runtime.shutdown().unwrap();
     }
 

@@ -1,38 +1,4 @@
-use serde::{Deserialize, Serialize};
-
-use crate::features::chat_text::{CommandSyntax, parse_prefixed_command};
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) enum ChatListenerModeCommand {
-    Primary,
-    Secondary,
-    Status,
-}
-
-impl ChatListenerModeCommand {
-    pub(crate) const fn label(self) -> &'static str {
-        match self {
-            Self::Primary => "一级",
-            Self::Secondary => "二级",
-            Self::Status => "状态",
-        }
-    }
-
-    pub(crate) fn parse(text: &str) -> Option<CommandSyntax<'_, Self>> {
-        let argument = parse_prefixed_command(text, "监听模式", true)?;
-        let command = match argument {
-            "一级" => Self::Primary,
-            "二级" => Self::Secondary,
-            "状态" => Self::Status,
-            _ => return None,
-        };
-        Some(CommandSyntax {
-            matched: "监听模式",
-            argument,
-            command,
-        })
-    }
-}
+use serde::Serialize;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]

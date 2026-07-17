@@ -5,7 +5,7 @@ use anyhow::Result;
 use image::DynamicImage;
 use serde::Serialize;
 
-use crate::config::{self, AppConfig};
+use crate::config::{self, OcrConfig, TemplateConfig};
 use crate::observation::chat::{ResolvedTemplateArgs, TemplateArgs, count_chat_markers};
 use crate::ui::template::best_template_hit;
 
@@ -24,17 +24,21 @@ pub(crate) struct ResolvedUiTemplateArgs {
 }
 
 impl UiTemplateArgs {
-    pub(crate) fn resolve(&self, config: &AppConfig) -> ResolvedUiTemplateArgs {
+    pub(crate) fn resolve(
+        &self,
+        templates: &TemplateConfig,
+        ocr: &OcrConfig,
+    ) -> ResolvedUiTemplateArgs {
         ResolvedUiTemplateArgs {
             friend_template: self
                 .friend_template
                 .clone()
-                .unwrap_or_else(|| config.templates.friend.clone()),
+                .unwrap_or_else(|| templates.friend.clone()),
             secondary_back_template: self
                 .secondary_back_template
                 .clone()
-                .unwrap_or_else(|| config.templates.secondary_back.clone()),
-            chat_templates: self.chat_templates.resolve(config),
+                .unwrap_or_else(|| templates.secondary_back.clone()),
+            chat_templates: self.chat_templates.resolve(templates, ocr),
         }
     }
 }
@@ -212,7 +216,10 @@ fn elapsed_ms(started: Instant) -> u128 {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
+    use crate::config::AppConfig;
 
     #[test]
     fn friend_anchor_uses_primary_friend_status() {
@@ -230,5 +237,46 @@ mod tests {
         assert_eq!(state.to_string(), "secondary:chat");
         assert!(state.secondary_visible);
         assert_eq!(state.source, "back");
+    }
+
+    #[test]
+    fn fixed_scrolled_friend_list_uses_the_back_anchor_for_secondary_state() {
+        let config = AppConfig::load(Path::new("config.yaml")).expect("load default config");
+        let image = image::open("tests/fixtures/ui/secondary-chat-scrolled-1920x1080.jpg")
+            .expect("open fixed secondary-chat screenshot");
+        assert_eq!((image.width(), image.height()), (1920, 1080));
+
+        let hall_hit = best_template_hit(
+            &image,
+            Some(config.screen.secondary_hall_rect.into()),
+            &config.templates.secondary_hall,
+            config.templates.marker_threshold,
+        )
+        .expect("match hall template");
+        assert!(
+            hall_hit.is_none(),
+            "scrolled list must not depend on the hall row"
+        );
+
+        let back_hit = best_template_hit(
+            &image,
+            Some(config.screen.secondary_back_rect.into()),
+            &config.templates.secondary_back,
+            config.templates.marker_threshold,
+        )
+        .expect("match secondary back template");
+        assert!(
+            back_hit.is_some(),
+            "secondary state requires the fixed back anchor"
+        );
+
+        let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
+        for _ in 0..2 {
+            let state = detect_ui_state(&image, &templates, &config.screen)
+                .expect("detect fixed secondary-chat screenshot");
+
+            assert_eq!(state.to_string(), "secondary:chat");
+            assert!(state.is_secondary());
+        }
     }
 }

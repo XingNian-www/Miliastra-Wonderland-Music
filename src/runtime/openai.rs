@@ -330,7 +330,7 @@ mod tests {
     fn sdk_transport_uses_exact_endpoint_and_api_key_header() {
         let runtime = OpenAiRuntime::start().expect("OpenAI runtime");
         let (origin, requests, server) =
-            mock_server(200, r#"{"choices":[]}"#, Duration::from_millis(300));
+            mock_server(200, r#"{"choices":[]}"#, Duration::from_millis(300), 32);
         let target = Target::chat(
             &format!("{origin}/custom/v1/chat/completions?tenant=a"),
             "secret",
@@ -367,6 +367,7 @@ mod tests {
             500,
             r#"{"error":{"message":"retry forbidden","type":"server_error"}}"#,
             Duration::from_millis(900),
+            32,
         );
         let target = Target::chat(
             &format!("{origin}/v1/chat/completions?tenant=sensitive-query"),
@@ -397,12 +398,36 @@ mod tests {
     fn sdk_transport_applies_the_per_call_timeout() {
         let runtime = OpenAiRuntime::start().expect("OpenAI runtime");
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind slow server");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking slow server");
         let address = listener.local_addr().expect("slow server address");
         let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept slow request");
-            let mut buffer = [0_u8; 16 * 1024];
-            let _ = stream.read(&mut buffer);
-            thread::sleep(Duration::from_millis(150));
+            let deadline = Instant::now() + Duration::from_millis(300);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream
+                            .set_nonblocking(false)
+                            .expect("blocking slow connection");
+                        stream
+                            .set_read_timeout(Some(Duration::from_millis(100)))
+                            .expect("slow connection read timeout");
+                        let mut buffer = [0_u8; 16 * 1024];
+                        let _ = stream.read(&mut buffer);
+                        thread::sleep(Duration::from_millis(150));
+                        break;
+                    }
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) => panic!("slow server failed: {error}"),
+                }
+            }
         });
         let target = Target::chat(
             &format!("http://{address}/v1/chat/completions"),
@@ -527,6 +552,7 @@ mod tests {
         status: u16,
         body: &'static str,
         lifetime: Duration,
+        read_chunk_size: usize,
     ) -> (String, Arc<Mutex<Vec<String>>>, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
         listener.set_nonblocking(true).expect("nonblocking server");
@@ -538,12 +564,17 @@ mod tests {
             while Instant::now() < deadline {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        let mut buffer = [0_u8; 16 * 1024];
-                        let read = stream.read(&mut buffer).unwrap_or(0);
+                        stream
+                            .set_nonblocking(false)
+                            .expect("blocking mock connection");
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(2)))
+                            .expect("mock read timeout");
+                        let request = read_http_request(&mut stream, read_chunk_size);
                         captured
                             .lock()
                             .expect("capture request")
-                            .push(String::from_utf8_lossy(&buffer[..read]).into_owned());
+                            .push(String::from_utf8_lossy(&request).into_owned());
                         let reason = if status == 200 {
                             "OK"
                         } else {
@@ -565,5 +596,45 @@ mod tests {
             }
         });
         (format!("http://{address}"), requests, server)
+    }
+
+    fn read_http_request(stream: &mut impl Read, read_chunk_size: usize) -> Vec<u8> {
+        assert!(read_chunk_size > 0, "mock read chunk must be non-zero");
+        let mut request = Vec::new();
+        let mut chunk = vec![0_u8; read_chunk_size];
+        loop {
+            let read = stream.read(&mut chunk).expect("read mock request");
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..read]);
+            if let Some(expected_len) = http_request_len(&request)
+                && request.len() >= expected_len
+            {
+                request.truncate(expected_len);
+                break;
+            }
+        }
+        request
+    }
+
+    fn http_request_len(request: &[u8]) -> Option<usize> {
+        let header_end = request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")?;
+        let headers = std::str::from_utf8(&request[..header_end]).expect("ASCII request headers");
+        let body_len = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length").then(|| {
+                    value
+                        .trim()
+                        .parse::<usize>()
+                        .expect("numeric content length")
+                })
+            })
+            .unwrap_or(0);
+        Some(header_end + 4 + body_len)
     }
 }

@@ -1,87 +1,90 @@
-use std::collections::HashMap;
-use std::time::Instant;
-
-use serde::{Deserialize, Serialize};
-
+#[cfg(test)]
 use crate::features::administration::AdministrationCommand;
+#[cfg(test)]
+use crate::features::administration::ChatListenerModeCommand;
+#[cfg(test)]
 use crate::features::card_games::LandlordCommand;
-use crate::features::chat_text::{CommandSyntax, command_identity};
-use crate::features::custom_workflow::CustomWorkflowMatch;
+use crate::features::chat_text::command_identity;
+use crate::features::command::{CommandEnvelope, CommandObservation, ModuleCommand, RoutedCommand};
+#[cfg(test)]
 use crate::features::entertainment::EntertainmentKind;
+#[cfg(test)]
 use crate::features::hall::HallCommand;
+#[cfg(test)]
 use crate::features::idiom_chain::IdiomChainCommand;
 #[cfg(test)]
 use crate::features::idiom_chain::IdiomChainMode;
+#[cfg(test)]
 use crate::features::invite::InviteCommand;
-use crate::features::moderation;
 pub use crate::features::moderation::{ModerationAction, ModerationCommand};
-use crate::features::playback::PlaybackCommand;
-use crate::features::song_request;
 #[cfg(test)]
 use crate::features::song_request::{SongCommand, SongSource};
-use crate::features::turtle_soup::TurtleSoupCommand;
-use crate::features::undercover::UndercoverCommand;
-use crate::observation::chat::{ObservationFrameId, ObservedChatMessageId};
-use crate::runtime::business::BusinessIntent;
 #[cfg(test)]
-use crate::runtime::chat_listener::ChatListenerModeCommand;
+use crate::features::turtle_soup::TurtleSoupCommand;
+#[cfg(test)]
+use crate::features::undercover::UndercoverCommand;
+use std::collections::HashMap;
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ParsedCommand {
-    pub matched: String,
-    pub raw: String,
-    pub user_command: String,
-    pub message_type: String,
-    pub username: String,
-    pub command: BusinessIntent,
-}
+mod router;
+
+pub(crate) use router::ChatCommandRouter;
 
 #[derive(Clone, Debug)]
 pub struct PendingCommand {
     pub lock_key: String,
-    pub parsed: ParsedCommand,
-    pub observation: CommandObservation,
-}
-
-pub(crate) fn from_custom_workflow_match(matched: CustomWorkflowMatch) -> ParsedCommand {
-    ParsedCommand {
-        matched: matched.matched,
-        raw: matched.raw,
-        user_command: matched.user_command,
-        message_type: matched.message_type,
-        username: matched.username,
-        command: BusinessIntent::CustomWorkflow(matched.command),
-    }
+    pub routed: RoutedCommand,
 }
 
 /// Observation context retained when a chat message becomes a queued command.
 ///
 /// This is deliberately runtime-only metadata. It is useful for correlating execution with
 /// the frame and message that produced it, but it is not part of the external command protocol.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct CommandObservation {
-    pub(crate) frame_id: Option<ObservationFrameId>,
-    pub(crate) captured_at: Option<Instant>,
-    pub(crate) message_id: Option<ObservedChatMessageId>,
+pub(crate) fn parse_command_envelope(
+    text: &str,
+    message_type: &str,
+    observation: CommandObservation,
+) -> Option<CommandEnvelope> {
+    if !matches!(message_type, "blue" | "pink") || is_feedback_text(text) {
+        return None;
+    }
+    if message_type == "blue" && text.starts_with("播放") && text.contains(" - ") {
+        return None;
+    }
+
+    let separator_index = text.find(['：', ':', ']', '】'])?;
+    let username = if message_type == "pink" {
+        extract_bracket_username(text)?
+    } else {
+        text[..separator_index]
+            .trim_matches(['[', '【', ']', '】', ' ', '\t'])
+            .to_string()
+    };
+    if username.is_empty() {
+        return None;
+    }
+    let separator_len = text[separator_index..].chars().next()?.len_utf8();
+    let raw_command_text = text[separator_index + separator_len..]
+        .trim_start_matches(['：', ':', ' ', '\t', ']', '】']);
+    CommandEnvelope::new(text, username, message_type, raw_command_text, observation)
 }
 
 /// A command submitted by a local control surface rather than read from chat.
 ///
 /// Control surfaces should describe the business command and its display text; the chat-shaped
 /// envelope is created here at the command boundary so HTTP and other adapters do not fabricate
-/// `ParsedCommand` values independently.
+/// `RoutedCommand` values independently.
 #[derive(Clone, Debug)]
 pub(crate) struct ConsoleCommandIntent {
     matched: String,
     raw: String,
-    command: BusinessIntent,
+    command: ModuleCommand,
 }
 
 impl ConsoleCommandIntent {
     pub(crate) fn new(
         raw: impl Into<String>,
         matched: impl Into<String>,
-        command: BusinessIntent,
+        command: ModuleCommand,
     ) -> Self {
         Self {
             matched: matched.into(),
@@ -91,26 +94,17 @@ impl ConsoleCommandIntent {
     }
 
     pub(crate) fn into_pending(self) -> PendingCommand {
-        let user_command = format!("@{}", self.raw);
-        let parsed = ParsedCommand {
-            matched: self.matched,
-            raw: self.raw,
-            user_command,
-            message_type: "控制台".to_string(),
-            username: "控制台".to_string(),
-            command: self.command,
-        };
+        let routed = RoutedCommand::console(self.matched, self.raw, self.command);
         PendingCommand {
-            lock_key: lock_key(&parsed),
-            parsed,
-            observation: CommandObservation::default(),
+            lock_key: lock_key(&routed),
+            routed,
         }
     }
 }
 
 #[derive(Clone, Debug)]
 struct CommandLock {
-    command: ParsedCommand,
+    command: RoutedCommand,
 }
 
 #[derive(Default, Debug)]
@@ -123,193 +117,6 @@ pub struct LockUpdate {
     pub accepted: Vec<PendingCommand>,
     pub skipped: Vec<String>,
     pub unlocked: Vec<String>,
-}
-
-pub fn parse_text(text: &str, message_type: &str) -> Option<ParsedCommand> {
-    if message_type == "pink" {
-        return parse_pink_text(text);
-    }
-    if message_type != "blue" {
-        return None;
-    }
-
-    let sep_index = text.find(['：', ':', ']', '】'])?;
-    if text.starts_with("播放") && text.contains(" - ") {
-        return None;
-    }
-    if is_feedback_text(text) {
-        return None;
-    }
-
-    let after_sep = &text[sep_index + text[sep_index..].chars().next()?.len_utf8()..];
-    let raw_command_text = after_sep.trim_start_matches(['：', ':', ' ', '\t', ']', '】']);
-    let user_command = user_command_text(raw_command_text);
-    let command_text = raw_command_text.strip_prefix('@')?.trim_start();
-    let parsed = parse_hall_command(command_text)?;
-    let matched = parsed.matched;
-    let after_match = parsed.argument;
-
-    let username = text[..sep_index]
-        .trim_matches(['[', '【', ']', '】', ' ', '\t'])
-        .to_string();
-    let raw = if after_match.is_empty() {
-        matched.to_string()
-    } else {
-        format!("{} {}", matched, after_match)
-    };
-    Some(ParsedCommand {
-        matched: matched.to_string(),
-        raw,
-        user_command,
-        message_type: message_type.to_string(),
-        username,
-        command: parsed.command,
-    })
-}
-
-pub(crate) fn parse_entertainment_shortcut(
-    text: &str,
-    message_type: &str,
-    active: Option<EntertainmentKind>,
-) -> Option<ParsedCommand> {
-    if !matches!(message_type, "blue" | "pink") || is_feedback_text(text) {
-        return None;
-    }
-    let username = if message_type == "pink" {
-        extract_bracket_username(text)?
-    } else {
-        let sep_index = text.find(['：', ':', ']', '】'])?;
-        text[..sep_index]
-            .trim_matches(['[', '【', ']', '】', ' ', '\t'])
-            .to_string()
-    };
-    let sep_index = text.find(['：', ':', ']', '】'])?;
-    let separator_len = text[sep_index..].chars().next()?.len_utf8();
-    let raw_command_text =
-        text[sep_index + separator_len..].trim_start_matches(['：', ':', ' ', '\t', ']', '】']);
-    let payload = raw_command_text
-        .strip_prefix('#')
-        .or_else(|| raw_command_text.strip_prefix('＃'))?
-        .trim_end_matches([']', '】'])
-        .trim();
-    if payload.is_empty() {
-        return None;
-    }
-    let command = if message_type == "blue" {
-        parse_entertainment_start(payload).or_else(|| match active {
-            Some(EntertainmentKind::IdiomChain) => Some(BusinessIntent::IdiomChain(
-                IdiomChainCommand::parse_active(payload),
-            )),
-            Some(EntertainmentKind::Landlord | EntertainmentKind::RunFast) => {
-                LandlordCommand::parse_hall(payload).map(BusinessIntent::CardGame)
-            }
-            Some(EntertainmentKind::TurtleSoup) => {
-                TurtleSoupCommand::parse_hall(payload).map(BusinessIntent::TurtleSoup)
-            }
-            Some(EntertainmentKind::Undercover) => {
-                UndercoverCommand::parse_hall(payload).map(BusinessIntent::Undercover)
-            }
-            None => None,
-        })?
-    } else {
-        match active {
-            Some(EntertainmentKind::Landlord | EntertainmentKind::RunFast) => {
-                BusinessIntent::CardGame(LandlordCommand::parse_friend(payload)?)
-            }
-            Some(EntertainmentKind::Undercover) => {
-                BusinessIntent::Undercover(UndercoverCommand::parse_friend(payload)?)
-            }
-            _ => return None,
-        }
-    };
-    let raw = match &command {
-        BusinessIntent::Undercover(UndercoverCommand::Vote(_)) => "投票".to_string(),
-        BusinessIntent::Undercover(UndercoverCommand::Describe(_)) => "卧底描述".to_string(),
-        _ => payload.to_string(),
-    };
-    Some(ParsedCommand {
-        matched: "#".to_string(),
-        raw,
-        user_command: user_command_text(raw_command_text),
-        message_type: message_type.to_string(),
-        username,
-        command,
-    })
-}
-
-fn parse_entertainment_start(payload: &str) -> Option<BusinessIntent> {
-    IdiomChainCommand::parse_start(payload)
-        .map(BusinessIntent::IdiomChain)
-        .or_else(|| LandlordCommand::parse_start(payload).map(BusinessIntent::CardGame))
-        .or_else(|| TurtleSoupCommand::parse_start(payload).map(BusinessIntent::TurtleSoup))
-        .or_else(|| UndercoverCommand::parse_start(payload).map(BusinessIntent::Undercover))
-        .or_else(|| {
-            AdministrationCommand::parse_entertainment_start(payload)
-                .map(BusinessIntent::Administration)
-        })
-}
-
-fn parse_pink_text(text: &str) -> Option<ParsedCommand> {
-    if is_feedback_text(text) {
-        return None;
-    }
-    let username = extract_bracket_username(text)?;
-    let sep_index = text.find(['：', ':', ']', '】'])?;
-    let after_sep = &text[sep_index + text[sep_index..].chars().next()?.len_utf8()..];
-    let raw_command_text = after_sep.trim_start_matches(['：', ':', ' ', '\t', ']', '】']);
-    let user_command = user_command_text(raw_command_text);
-    let command_text = raw_command_text.strip_prefix('@')?.trim_start();
-    if let Some(parsed) = AdministrationCommand::parse_friend(command_text, &username) {
-        return Some(ParsedCommand {
-            matched: parsed.matched.to_string(),
-            raw: parsed.raw,
-            user_command,
-            message_type: "pink".to_string(),
-            username,
-            command: BusinessIntent::Administration(parsed.command),
-        });
-    }
-    if let Some(song) = song_request::parse_friend_command(command_text, &username) {
-        return Some(ParsedCommand {
-            matched: song.prefix.clone(),
-            raw: format!("{} {} {}", username, song.prefix, song.keyword),
-            user_command,
-            message_type: "pink".to_string(),
-            username,
-            command: BusinessIntent::SongRequest(song),
-        });
-    }
-    if let Some(parsed) = InviteCommand::parse_friend(command_text, &username) {
-        return Some(ParsedCommand {
-            matched: "邀请".to_string(),
-            raw: format!("邀请 {} {}", username, parsed.raw_parameter),
-            user_command,
-            message_type: "pink".to_string(),
-            username,
-            command: BusinessIntent::Invite(parsed.command),
-        });
-    }
-    if let Some(command) = parse_moderation_command(command_text, &username, &user_command) {
-        return Some(command);
-    }
-    if let Some(command) = HallCommand::parse_friend(command_text, &username) {
-        return Some(ParsedCommand {
-            matched: "麦克风".to_string(),
-            raw: format!("麦克风 {}", username),
-            user_command,
-            message_type: "pink".to_string(),
-            username,
-            command: BusinessIntent::Hall(command),
-        });
-    }
-    None
-}
-
-fn user_command_text(text: &str) -> String {
-    text.trim()
-        .trim_end_matches([']', '】'])
-        .trim_end()
-        .to_string()
 }
 
 fn extract_bracket_username(text: &str) -> Option<String> {
@@ -330,7 +137,7 @@ fn extract_bracket_username(text: &str) -> Option<String> {
 impl CommandLockState {
     pub fn update(
         &mut self,
-        visible_commands: &[ParsedCommand],
+        visible_commands: &[RoutedCommand],
         command_executing: bool,
     ) -> LockUpdate {
         let mut update = LockUpdate::default();
@@ -369,15 +176,14 @@ impl CommandLockState {
             );
             update.accepted.push(PendingCommand {
                 lock_key,
-                parsed: parsed.clone(),
-                observation: CommandObservation::default(),
+                routed: parsed.clone(),
             });
         }
 
         update
     }
 
-    fn find_locked_command(&self, command: &ParsedCommand) -> Option<&ParsedCommand> {
+    fn find_locked_command(&self, command: &RoutedCommand) -> Option<&RoutedCommand> {
         self.locks
             .values()
             .find(|lock| same_lock_command(&lock.command, command))
@@ -385,7 +191,7 @@ impl CommandLockState {
     }
 }
 
-pub fn lock_key(command: &ParsedCommand) -> String {
+pub fn lock_key(command: &RoutedCommand) -> String {
     let key = command.command.lock_key();
     if command.command.scopes_lock_to_actor() {
         format!("{}:{}", key, command_identity(&command.username))
@@ -394,7 +200,7 @@ pub fn lock_key(command: &ParsedCommand) -> String {
     }
 }
 
-pub fn same_lock_command(left: &ParsedCommand, right: &ParsedCommand) -> bool {
+pub fn same_lock_command(left: &RoutedCommand, right: &RoutedCommand) -> bool {
     if left.command.scopes_lock_to_actor()
         && right.command.scopes_lock_to_actor()
         && command_identity(&left.username) != command_identity(&right.username)
@@ -402,60 +208,6 @@ pub fn same_lock_command(left: &ParsedCommand, right: &ParsedCommand) -> bool {
         return false;
     }
     left.command.same_request(&right.command)
-}
-
-fn parse_moderation_command(
-    command_text: &str,
-    username: &str,
-    user_command: &str,
-) -> Option<ParsedCommand> {
-    let parsed = moderation::parse_command(command_text, username)?;
-    Some(ParsedCommand {
-        matched: parsed.matched.to_string(),
-        raw: format!("{} {} {}", parsed.matched, username, parsed.command.uid),
-        user_command: user_command.to_string(),
-        message_type: "pink".to_string(),
-        username: username.to_string(),
-        command: BusinessIntent::Moderation(parsed.command),
-    })
-}
-
-pub(crate) fn strip_ascii_case_prefix<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
-    let head = text.get(..prefix.len())?;
-    if head.eq_ignore_ascii_case(prefix) {
-        Some(&text[prefix.len()..])
-    } else {
-        None
-    }
-}
-
-fn parse_hall_command(text: &str) -> Option<CommandSyntax<'_, BusinessIntent>> {
-    if let Some(parsed) = song_request::parse_hall_syntax(text) {
-        return Some(CommandSyntax {
-            matched: parsed.matched,
-            argument: parsed.argument,
-            command: BusinessIntent::SongRequest(parsed.command),
-        });
-    }
-    if let Some(parsed) = PlaybackCommand::parse_hall(text) {
-        return Some(CommandSyntax {
-            matched: parsed.matched,
-            argument: parsed.argument,
-            command: BusinessIntent::Playback(parsed.command),
-        });
-    }
-    if let Some(parsed) = HallCommand::parse_hall(text) {
-        return Some(CommandSyntax {
-            matched: parsed.matched,
-            argument: parsed.argument,
-            command: BusinessIntent::Hall(parsed.command),
-        });
-    }
-    AdministrationCommand::parse_hall(text).map(|parsed| CommandSyntax {
-        matched: parsed.matched,
-        argument: parsed.argument,
-        command: BusinessIntent::Administration(parsed.command),
-    })
 }
 
 fn is_feedback_text(text: &str) -> bool {
@@ -496,7 +248,76 @@ const FEEDBACK_TEXT_PATTERNS: &[&str] = &[
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
+    use crate::features::command::{CommandAuthority, CommandPrefix};
+    use crate::observation::chat::ObservedChatMessageId;
+
+    fn parse_text(text: &str, message_type: &str) -> Option<RoutedCommand> {
+        let envelope = parse_command_envelope(text, message_type, CommandObservation::default())?;
+        (envelope.prefix() == CommandPrefix::At).then_some(())?;
+        ChatCommandRouter::without_custom_workflow().route(&envelope, None)
+    }
+
+    fn parse_entertainment_shortcut(
+        text: &str,
+        message_type: &str,
+        active: Option<EntertainmentKind>,
+    ) -> Option<RoutedCommand> {
+        let envelope = parse_command_envelope(text, message_type, CommandObservation::default())?;
+        (envelope.prefix() == CommandPrefix::Hash).then_some(())?;
+        ChatCommandRouter::without_custom_workflow().route(&envelope, active)
+    }
+
+    #[test]
+    fn chat_ingress_produces_an_unparsed_command_envelope() {
+        let envelope = parse_command_envelope(
+            "用户：@点歌 晴天 周杰伦",
+            "blue",
+            CommandObservation::default(),
+        )
+        .expect("command envelope");
+
+        assert_eq!(envelope.username(), "用户");
+        assert_eq!(envelope.user_command(), "@点歌 晴天 周杰伦");
+        assert_eq!(envelope.command_text(), "点歌 晴天 周杰伦");
+        assert_eq!(envelope.prefix(), CommandPrefix::At);
+        assert_eq!(envelope.authority(), CommandAuthority::HallMember);
+    }
+
+    #[test]
+    fn structured_secondary_friend_input_routes_without_fabricating_chat_text() {
+        let message_id = ObservedChatMessageId::new(
+            crate::observation::chat::VisualSessionId::new(9),
+            crate::observation::chat::ChatIdentity::Friend(std::sync::Arc::from("芦荟")),
+            crate::observation::chat::BubbleSequence::new(4),
+        );
+        let observation = CommandObservation {
+            frame_id: None,
+            captured_at: Some(Instant::now()),
+            message_id: Some(message_id.clone()),
+        };
+        let envelope =
+            CommandEnvelope::new("@邀请2", "芦荟", "pink", "@邀请2", observation.clone())
+                .expect("structured secondary envelope");
+
+        let routed = ChatCommandRouter::without_custom_workflow()
+            .route(&envelope, None)
+            .expect("route secondary friend command");
+
+        assert_eq!(routed.username, "芦荟");
+        assert_eq!(routed.message_type, "pink");
+        assert_eq!(routed.observation, observation);
+        assert_eq!(
+            routed.command,
+            ModuleCommand::Invite(InviteCommand {
+                username: "芦荟".to_string(),
+                seq: Some(2),
+                password: None,
+            })
+        );
+    }
 
     #[test]
     fn parses_hash_idiom_chain_commands_by_active_game() {
@@ -504,7 +325,7 @@ mod tests {
             .expect("parse idiom chain start");
         assert_eq!(
             started.command,
-            BusinessIntent::IdiomChain(IdiomChainCommand::Start {
+            ModuleCommand::IdiomChain(IdiomChainCommand::Start {
                 idiom: "画蛇添足".to_string(),
                 mode: IdiomChainMode::Exact,
             })
@@ -514,7 +335,7 @@ mod tests {
             .expect("parse homophone idiom chain start");
         assert_eq!(
             homophone.command,
-            BusinessIntent::IdiomChain(IdiomChainCommand::Start {
+            ModuleCommand::IdiomChain(IdiomChainCommand::Start {
                 idiom: "画蛇添足".to_string(),
                 mode: IdiomChainMode::Homophone,
             })
@@ -528,7 +349,7 @@ mod tests {
         .expect("parse idiom chain submit");
         assert_eq!(
             submitted.command,
-            BusinessIntent::IdiomChain(IdiomChainCommand::Submit("足智多谋".to_string()))
+            ModuleCommand::IdiomChain(IdiomChainCommand::Submit("足智多谋".to_string()))
         );
 
         let explained = parse_entertainment_shortcut(
@@ -539,7 +360,7 @@ mod tests {
         .expect("parse idiom explanation command");
         assert_eq!(
             explained.command,
-            BusinessIntent::IdiomChain(IdiomChainCommand::Explain(Some("画蛇添足".to_string())))
+            ModuleCommand::IdiomChain(IdiomChainCommand::Explain(Some("画蛇添足".to_string())))
         );
         let hint = parse_entertainment_shortcut(
             "用户：#提示",
@@ -549,7 +370,7 @@ mod tests {
         .expect("parse idiom hint command");
         assert_eq!(
             hint.command,
-            BusinessIntent::IdiomChain(IdiomChainCommand::Hint)
+            ModuleCommand::IdiomChain(IdiomChainCommand::Hint)
         );
     }
 
@@ -558,31 +379,31 @@ mod tests {
         for (text, expected) in [
             (
                 "用户：#斗地主",
-                BusinessIntent::CardGame(LandlordCommand::Start),
+                ModuleCommand::CardGame(LandlordCommand::Start),
             ),
             (
                 "用户：#跑得快",
-                BusinessIntent::CardGame(LandlordCommand::RunFastStart),
+                ModuleCommand::CardGame(LandlordCommand::RunFastStart),
             ),
             (
                 "用户：#海龟汤",
-                BusinessIntent::TurtleSoup(TurtleSoupCommand::Start),
+                ModuleCommand::TurtleSoup(TurtleSoupCommand::Start),
             ),
             (
                 "用户：#卧底",
-                BusinessIntent::Undercover(UndercoverCommand::CreateSingle),
+                ModuleCommand::Undercover(UndercoverCommand::CreateSingle),
             ),
             (
                 "用户：# 卧 底 双",
-                BusinessIntent::Undercover(UndercoverCommand::CreateDouble),
+                ModuleCommand::Undercover(UndercoverCommand::CreateDouble),
             ),
             (
                 "用户：#娱乐",
-                BusinessIntent::Administration(AdministrationCommand::EntertainmentHelp),
+                ModuleCommand::Administration(AdministrationCommand::EntertainmentHelp),
             ),
             (
                 "用户：＃帮助",
-                BusinessIntent::Administration(AdministrationCommand::EntertainmentHelp),
+                ModuleCommand::Administration(AdministrationCommand::EntertainmentHelp),
             ),
         ] {
             assert_eq!(
@@ -595,7 +416,7 @@ mod tests {
         }
         assert_eq!(
             parse_text("用户：@娱乐帮助", "blue").unwrap().command,
-            BusinessIntent::Administration(AdministrationCommand::EntertainmentHelp)
+            ModuleCommand::Administration(AdministrationCommand::EntertainmentHelp)
         );
         assert!(parse_text("用户：@娱乐", "blue").is_none());
     }
@@ -617,16 +438,13 @@ mod tests {
             let parsed =
                 parse_entertainment_shortcut(text, "blue", Some(EntertainmentKind::Landlord))
                     .expect("parse landlord hall command");
-            assert_eq!(parsed.command, BusinessIntent::CardGame(expected), "{text}");
+            assert_eq!(parsed.command, ModuleCommand::CardGame(expected), "{text}");
         }
 
         let hand =
             parse_entertainment_shortcut("[用户]：#手牌", "pink", Some(EntertainmentKind::RunFast))
                 .expect("parse private hand command");
-        assert_eq!(
-            hand.command,
-            BusinessIntent::CardGame(LandlordCommand::Hand)
-        );
+        assert_eq!(hand.command, ModuleCommand::CardGame(LandlordCommand::Hand));
         assert!(
             parse_entertainment_shortcut("用户：#手牌", "blue", Some(EntertainmentKind::Landlord))
                 .is_none()
@@ -649,7 +467,7 @@ mod tests {
             let parsed =
                 parse_entertainment_shortcut(text, "blue", Some(EntertainmentKind::Undercover))
                     .unwrap_or_else(|| panic!("parse {text}"));
-            assert_eq!(parsed.command, BusinessIntent::Undercover(expected));
+            assert_eq!(parsed.command, ModuleCommand::Undercover(expected));
         }
         assert!(
             parse_entertainment_shortcut(
@@ -668,7 +486,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             join.command,
-            BusinessIntent::Undercover(UndercoverCommand::Join)
+            ModuleCommand::Undercover(UndercoverCommand::Join)
         );
 
         for text in ["[用户]：#c", "[用户]：＃投 C"] {
@@ -677,7 +495,7 @@ mod tests {
                     .unwrap();
             assert_eq!(
                 vote.command,
-                BusinessIntent::Undercover(UndercoverCommand::Vote('C'))
+                ModuleCommand::Undercover(UndercoverCommand::Vote('C'))
             );
             assert_eq!(vote.raw, "投票");
         }
@@ -706,7 +524,7 @@ mod tests {
         .expect("parse turtle soup status");
         assert_eq!(
             status.command,
-            BusinessIntent::TurtleSoup(TurtleSoupCommand::Status)
+            ModuleCommand::TurtleSoup(TurtleSoupCommand::Status)
         );
         let stop = parse_entertainment_shortcut(
             "用户：#结束",
@@ -716,7 +534,7 @@ mod tests {
         .expect("parse turtle soup stop");
         assert_eq!(
             stop.command,
-            BusinessIntent::TurtleSoup(TurtleSoupCommand::End)
+            ModuleCommand::TurtleSoup(TurtleSoupCommand::End)
         );
         assert!(
             parse_entertainment_shortcut(
@@ -766,7 +584,7 @@ mod tests {
         let parsed = parse_text("[Alice]：@麦克风", "pink").expect("parse microphone");
         assert_eq!(
             parsed.command,
-            BusinessIntent::Hall(HallCommand::ToggleMicrophone {
+            ModuleCommand::Hall(HallCommand::ToggleMicrophone {
                 username: "Alice".to_string(),
             })
         );
@@ -783,7 +601,7 @@ mod tests {
         let parsed = parse_text("[Alice]：@禁用", "pink").expect("parse disable");
         assert_eq!(
             parsed.command,
-            BusinessIntent::Administration(AdministrationCommand::SetCommandsEnabled {
+            ModuleCommand::Administration(AdministrationCommand::SetCommandsEnabled {
                 enabled: false,
                 username: "Alice".to_string(),
             })
@@ -795,7 +613,7 @@ mod tests {
         let parsed = parse_text("[Alice]：@启用", "pink").expect("parse enable");
         assert_eq!(
             parsed.command,
-            BusinessIntent::Administration(AdministrationCommand::SetCommandsEnabled {
+            ModuleCommand::Administration(AdministrationCommand::SetCommandsEnabled {
                 enabled: true,
                 username: "Alice".to_string(),
             })
@@ -812,7 +630,7 @@ mod tests {
         let parsed = parse_text("[Alice]：@邀请2", "pink").expect("parse invite");
         assert_eq!(
             parsed.command,
-            BusinessIntent::Invite(InviteCommand {
+            ModuleCommand::Invite(InviteCommand {
                 username: "Alice".to_string(),
                 seq: Some(2),
                 password: None,
@@ -822,13 +640,13 @@ mod tests {
 
     #[test]
     fn parses_invite_command_with_password_as_only_argument() {
-        let parsed = parse_text("[Alice]：@邀请123456", "pink").expect("parse invite password");
+        let parsed = parse_text("[Alice]：@邀请654321", "pink").expect("parse invite password");
         assert_eq!(
             parsed.command,
-            BusinessIntent::Invite(InviteCommand {
+            ModuleCommand::Invite(InviteCommand {
                 username: "Alice".to_string(),
                 seq: None,
-                password: Some("123456".to_string()),
+                password: Some("654321".to_string()),
             })
         );
     }
@@ -836,7 +654,7 @@ mod tests {
     #[test]
     fn rejects_invite_command_with_invalid_password() {
         assert!(parse_text("[Alice]：@邀请2 12345", "pink").is_none());
-        assert!(parse_text("[Alice]：@邀请2 123456", "pink").is_none());
+        assert!(parse_text("[Alice]：@邀请2 654321", "pink").is_none());
         assert!(parse_text("[Alice]：@邀请2 1234567", "pink").is_none());
         assert!(parse_text("[Alice]：@邀请2 abcdef", "pink").is_none());
         assert!(parse_text("[Alice]：@邀请1000", "pink").is_none());
@@ -847,7 +665,7 @@ mod tests {
         let parsed = parse_text("[Alice]：@闲置退出", "pink").expect("parse idle exit");
         assert_eq!(
             parsed.command,
-            BusinessIntent::Administration(AdministrationCommand::IdleExit { minutes: 30 })
+            ModuleCommand::Administration(AdministrationCommand::IdleExit { minutes: 30 })
         );
     }
 
@@ -856,7 +674,7 @@ mod tests {
         let parsed = parse_text("[Alice]：@闲置退出 5", "pink").expect("parse idle exit");
         assert_eq!(
             parsed.command,
-            BusinessIntent::Administration(AdministrationCommand::IdleExit { minutes: 15 })
+            ModuleCommand::Administration(AdministrationCommand::IdleExit { minutes: 15 })
         );
     }
 
@@ -865,7 +683,7 @@ mod tests {
         let parsed = parse_text("[Alice]：@闲置退出 20分钟", "pink").expect("parse idle exit");
         assert_eq!(
             parsed.command,
-            BusinessIntent::Administration(AdministrationCommand::IdleExit { minutes: 20 })
+            ModuleCommand::Administration(AdministrationCommand::IdleExit { minutes: 20 })
         );
     }
 
@@ -874,7 +692,7 @@ mod tests {
         let parsed = parse_text("[Alice]：@拉黑UID123456789", "pink").expect("parse blacklist uid");
         assert_eq!(
             parsed.command,
-            BusinessIntent::Moderation(ModerationCommand {
+            ModuleCommand::Moderation(ModerationCommand {
                 action: ModerationAction::Blacklist,
                 uid: "123456789".to_string(),
                 requester: "Alice".to_string(),
@@ -888,7 +706,7 @@ mod tests {
             .expect("parse blacklist uid case insensitive");
         assert_eq!(
             parsed.command,
-            BusinessIntent::Moderation(ModerationCommand {
+            ModuleCommand::Moderation(ModerationCommand {
                 action: ModerationAction::Blacklist,
                 uid: "123456789".to_string(),
                 requester: "Alice".to_string(),
@@ -901,7 +719,7 @@ mod tests {
         let parsed = parse_text("[Alice]：@屏蔽UID123456789", "pink").expect("parse block uid");
         assert_eq!(
             parsed.command,
-            BusinessIntent::Moderation(ModerationCommand {
+            ModuleCommand::Moderation(ModerationCommand {
                 action: ModerationAction::BlockChat,
                 uid: "123456789".to_string(),
                 requester: "Alice".to_string(),
@@ -922,7 +740,7 @@ mod tests {
         let parsed = parse_text("[Alice]：@拉黑123456789", "pink").expect("parse blacklist alias");
         assert_eq!(
             parsed.command,
-            BusinessIntent::Moderation(ModerationCommand {
+            ModuleCommand::Moderation(ModerationCommand {
                 action: ModerationAction::Blacklist,
                 uid: "123456789".to_string(),
                 requester: "Alice".to_string(),
@@ -935,7 +753,7 @@ mod tests {
         let parsed = parse_text("[Alice]：@屏蔽123456789", "pink").expect("parse block alias");
         assert_eq!(
             parsed.command,
-            BusinessIntent::Moderation(ModerationCommand {
+            ModuleCommand::Moderation(ModerationCommand {
                 action: ModerationAction::BlockChat,
                 uid: "123456789".to_string(),
                 requester: "Alice".to_string(),
@@ -949,7 +767,7 @@ mod tests {
         assert_eq!(parsed.user_command, "@AI点歌 晴天 周杰伦");
         assert_eq!(
             parsed.command,
-            BusinessIntent::SongRequest(SongCommand {
+            ModuleCommand::SongRequest(SongCommand {
                 keyword: "晴天 周杰伦".to_string(),
                 source: SongSource::QqMusic,
                 prefix: "AI点歌".to_string(),
@@ -967,7 +785,7 @@ mod tests {
         assert_eq!(parsed.user_command, "@ai点歌 晴天 周杰伦");
         assert_eq!(
             parsed.command,
-            BusinessIntent::SongRequest(SongCommand {
+            ModuleCommand::SongRequest(SongCommand {
                 keyword: "晴天 周杰伦".to_string(),
                 source: SongSource::QqMusic,
                 prefix: "AI点歌".to_string(),
@@ -988,7 +806,7 @@ mod tests {
         let parsed = parse_text("用户：@点歌 晴天 周杰伦", "blue").expect("parse default song");
         assert_eq!(
             parsed.command,
-            BusinessIntent::SongRequest(SongCommand {
+            ModuleCommand::SongRequest(SongCommand {
                 keyword: "晴天 周杰伦".to_string(),
                 source: SongSource::QqMusic,
                 prefix: "点歌".to_string(),
@@ -1051,13 +869,21 @@ mod tests {
         };
         let pending = PendingCommand {
             lock_key: lock_key(&parsed),
-            parsed,
-            observation: observation.clone(),
+            routed: RoutedCommand {
+                observation: observation.clone(),
+                ..parsed
+            },
         };
 
-        assert_eq!(pending.observation.frame_id, observation.frame_id);
-        assert_eq!(pending.observation.captured_at, observation.captured_at);
-        assert_eq!(pending.observation.message_id, observation.message_id);
+        assert_eq!(pending.routed.observation.frame_id, observation.frame_id);
+        assert_eq!(
+            pending.routed.observation.captured_at,
+            observation.captured_at
+        );
+        assert_eq!(
+            pending.routed.observation.message_id,
+            observation.message_id
+        );
     }
 
     #[test]
@@ -1080,7 +906,7 @@ mod tests {
             .expect("parse friend bilibili song");
         assert_eq!(
             parsed.command,
-            BusinessIntent::SongRequest(SongCommand {
+            ModuleCommand::SongRequest(SongCommand {
                 keyword: "晴天 周杰伦".to_string(),
                 source: SongSource::Bilibili,
                 prefix: "B站点歌".to_string(),
@@ -1100,7 +926,7 @@ mod tests {
             .expect("parse friend bilibili song case insensitive");
         assert_eq!(
             parsed.command,
-            BusinessIntent::SongRequest(SongCommand {
+            ModuleCommand::SongRequest(SongCommand {
                 keyword: "晴天 周杰伦".to_string(),
                 source: SongSource::Bilibili,
                 prefix: "B站点歌".to_string(),
@@ -1119,19 +945,19 @@ mod tests {
 
         assert_eq!(
             primary.command,
-            BusinessIntent::Administration(AdministrationCommand::ChatListenerMode(
+            ModuleCommand::Administration(AdministrationCommand::ChatListenerMode(
                 ChatListenerModeCommand::Primary,
             ))
         );
         assert_eq!(
             secondary.command,
-            BusinessIntent::Administration(AdministrationCommand::ChatListenerMode(
+            ModuleCommand::Administration(AdministrationCommand::ChatListenerMode(
                 ChatListenerModeCommand::Secondary,
             ))
         );
         assert_eq!(
             status.command,
-            BusinessIntent::Administration(AdministrationCommand::ChatListenerMode(
+            ModuleCommand::Administration(AdministrationCommand::ChatListenerMode(
                 ChatListenerModeCommand::Status,
             ))
         );
@@ -1144,7 +970,7 @@ mod tests {
             parse_text("[Alice]：@AI点歌 晴天 周杰伦", "pink").expect("parse friend ai song");
         assert_eq!(
             parsed.command,
-            BusinessIntent::SongRequest(SongCommand {
+            ModuleCommand::SongRequest(SongCommand {
                 keyword: "晴天 周杰伦".to_string(),
                 source: SongSource::All,
                 prefix: "AI点歌".to_string(),

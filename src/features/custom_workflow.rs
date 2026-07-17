@@ -1,37 +1,226 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{
-    CustomWorkflowConfig, CustomWorkflowDefinition, CustomWorkflowStep, DecisionTimingConfig,
-    InputTimingConfig, OcrConfig, PointConfig, RectConfig, WorkflowTimingConfig,
+use crate::config::{PointConfig, RectConfig};
+use crate::features::command::{CommandEnvelope, CommandPrefix, FeatureCommandMatch};
+pub use crate::interfaces::ui_plan::{
+    WorkflowOperation, WorkflowPixelStability, WorkflowPoint, WorkflowRect, WorkflowResidency,
 };
 use crate::text::normalize_comparison_text;
 
 const MIN_POLL_MS: u64 = 50;
 
-pub(crate) fn service_from_config_parts(
-    config: &CustomWorkflowConfig,
-    workflow_timing: &WorkflowTimingConfig,
-    decision_timing: &DecisionTimingConfig,
-    input_timing: &InputTimingConfig,
-    ocr: &OcrConfig,
-) -> CustomWorkflowService {
-    CustomWorkflowService::new(
-        config.clone(),
-        WorkflowDefaults {
-            default_timeout_ms: workflow_timing.default_timeout_ms,
-            default_poll_ms: workflow_timing.default_poll_ms,
-            default_step_wait_ms: workflow_timing.default_step_wait_ms,
-            decision_timeout_ms: decision_timing.timeout_ms,
-            decision_poll_ms: decision_timing.poll_ms,
-            after_activate_ms: input_timing.after_activate_ms,
-            clipboard_hold_ms: input_timing.text_ms,
-            stability_mean_threshold: ocr.change_mean_threshold,
-            stability_changed_ratio_threshold: ocr.change_pixel_threshold,
-        },
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CustomWorkflowConfig {
+    pub enabled: bool,
+    pub default_threshold: f32,
+    pub wait_template_absent_stable_default: bool,
+    pub max_hold_key_seconds: u64,
+    pub templates: HashMap<String, PathBuf>,
+    pub workflows: Vec<CustomWorkflowDefinition>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowTimingConfig {
+    pub default_timeout_ms: u64,
+    pub default_poll_ms: u64,
+    pub default_step_wait_ms: u64,
+}
+
+impl WorkflowTimingConfig {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.default_timeout_ms == 0 {
+            bail!("timing.workflow.default_timeout_ms 必须大于 0");
+        }
+        if self.default_poll_ms == 0 {
+            bail!("timing.workflow.default_poll_ms 必须大于 0");
+        }
+        Ok(())
+    }
+}
+
+impl CustomWorkflowConfig {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if !self.default_threshold.is_finite() || !(0.0..=1.0).contains(&self.default_threshold) {
+            bail!("custom_workflows.default_threshold 必须是 0 到 1 之间的有限小数");
+        }
+        if self.max_hold_key_seconds == 0 {
+            bail!("custom_workflows.max_hold_key_seconds 必须大于 0");
+        }
+        for workflow in self.workflows.iter().filter(|workflow| workflow.enabled) {
+            if workflow.steps.is_empty() {
+                bail!("custom workflow has no steps: {}", workflow.name.trim());
+            }
+            for step in &workflow.steps {
+                validate_configured_step(step)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_configured_step(step: &CustomWorkflowStep) -> Result<()> {
+    let step_type = step.step_type.trim();
+    if !supported_step_type(step_type) {
+        bail!("unsupported custom workflow step type: {}", step_type);
+    }
+    if let Some(threshold) = step.threshold
+        && (!threshold.is_finite() || !(0.0..=1.0).contains(&threshold))
+    {
+        bail!("custom workflow step threshold must be between 0 and 1");
+    }
+
+    match step_type {
+        "key" | "press_key" if configured_text(step.key.as_deref()).is_empty() => {
+            bail!("custom workflow step key is empty")
+        }
+        "hold_key" => {
+            if configured_text(step.key.as_deref()).is_empty() {
+                bail!("自定义流程按住按键缺少 key");
+            }
+            if step.hold_seconds_arg == Some(0) {
+                bail!("hold_seconds_arg 必须从 1 开始");
+            }
+        }
+        "click" if step.point.is_none() => {
+            bail!("custom workflow click step missing point")
+        }
+        "click_template" | "wait_template" | "wait_template_absent" => {
+            if configured_text(step.template.as_deref()).is_empty() {
+                bail!("custom workflow template is empty");
+            }
+            validate_configured_region(step, "custom workflow template step missing region")?;
+        }
+        "wait_stable" | "wait_pixels_stable" => {
+            validate_configured_region(step, "custom workflow wait_stable step missing region")?;
+        }
+        "click_text" | "wait_text" if configured_step_text(step).is_empty() => {
+            bail!("custom workflow text step missing text")
+        }
+        "click_text" | "wait_text" => {
+            validate_configured_region(step, "custom workflow text step missing region")?;
+        }
+        "paste" | "paste_text" if configured_step_text(step).is_empty() => {
+            bail!("custom workflow paste step missing text")
+        }
+        "send_chat" | "reply" if configured_step_message(step).is_empty() => {
+            bail!("custom workflow send_chat step missing message")
+        }
+        "send_current_chat" if configured_step_message(step).is_empty() => {
+            bail!("custom workflow send_current_chat step missing message")
+        }
+        "send_friend_message" | "friend_reply" if configured_step_message(step).is_empty() => {
+            bail!("custom workflow send_friend_message step missing message")
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_configured_region(step: &CustomWorkflowStep, missing: &str) -> Result<()> {
+    let region = step.region.ok_or_else(|| anyhow!(missing.to_string()))?;
+    if region.width == 0 || region.height == 0 {
+        bail!("custom workflow step region must have positive width and height");
+    }
+    Ok(())
+}
+
+fn configured_text(value: Option<&str>) -> &str {
+    value.unwrap_or("").trim()
+}
+
+fn configured_step_text(step: &CustomWorkflowStep) -> &str {
+    let text = configured_text(step.text.as_deref());
+    if text.is_empty() {
+        configured_text(step.message.as_deref())
+    } else {
+        text
+    }
+}
+
+fn configured_step_message(step: &CustomWorkflowStep) -> &str {
+    let message = configured_text(step.message.as_deref());
+    if message.is_empty() {
+        configured_text(step.text.as_deref())
+    } else {
+        message
+    }
+}
+
+fn supported_step_type(step_type: &str) -> bool {
+    matches!(
+        step_type,
+        "sleep"
+            | "wait"
+            | "key"
+            | "press_key"
+            | "hold_key"
+            | "activate_game"
+            | "focus_game"
+            | "click"
+            | "click_template"
+            | "wait_template"
+            | "wait_template_absent"
+            | "wait_stable"
+            | "wait_pixels_stable"
+            | "click_text"
+            | "wait_text"
+            | "paste"
+            | "paste_text"
+            | "send_chat"
+            | "reply"
+            | "send_current_chat"
+            | "send_friend_message"
+            | "friend_reply"
+            | "invite_user"
+            | "invite_current_user"
+            | "return_primary"
+            | "ensure_primary"
+            | "ensure_current_hall"
     )
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CustomWorkflowDefinition {
+    pub enabled: bool,
+    pub name: String,
+    pub commands: Vec<String>,
+    pub allow_args: bool,
+    pub message_types: Vec<String>,
+    pub confirm_before_run: bool,
+    pub confirm_message: String,
+    pub confirm_message_types: Vec<String>,
+    pub confirm_timeout_ms: Option<u64>,
+    pub confirm_poll_ms: Option<u64>,
+    pub steps: Vec<CustomWorkflowStep>,
+    pub success_message: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CustomWorkflowStep {
+    #[serde(rename = "type")]
+    pub step_type: String,
+    pub template: Option<String>,
+    pub region: Option<RectConfig>,
+    pub point: Option<PointConfig>,
+    pub click_offset: Option<PointConfig>,
+    pub key: Option<String>,
+    pub target: Option<String>,
+    pub text: Option<String>,
+    pub message: Option<String>,
+    pub threshold: Option<f32>,
+    pub timeout_ms: Option<u64>,
+    pub poll_ms: Option<u64>,
+    pub wait_ms: Option<u64>,
+    pub hold_seconds_arg: Option<usize>,
+    pub stable_after_absent: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -65,15 +254,7 @@ pub struct WorkflowLockIdentity {
     pub args: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CustomWorkflowMatch {
-    pub matched: String,
-    pub raw: String,
-    pub user_command: String,
-    pub message_type: String,
-    pub username: String,
-    pub command: CustomWorkflowCommand,
-}
+pub type CustomWorkflowMatch = FeatureCommandMatch<CustomWorkflowCommand>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CustomWorkflowInvocation {
@@ -150,8 +331,37 @@ impl CustomWorkflowService {
         self.config.enabled
     }
 
-    pub fn parse_chat(&self, text: &str, message_type: &str) -> Option<CustomWorkflowMatch> {
-        parse_text(&self.config, text, message_type)
+    pub fn claims_chat(&self, envelope: &CommandEnvelope) -> bool {
+        if !self.config.enabled || envelope.prefix() != CommandPrefix::At {
+            return false;
+        }
+        find_command_workflow(
+            &self.config,
+            envelope.command_text(),
+            envelope.message_type(),
+        )
+        .is_some()
+    }
+
+    pub fn parse_chat(&self, envelope: &CommandEnvelope) -> Option<CustomWorkflowMatch> {
+        if !self.config.enabled || envelope.prefix() != CommandPrefix::At {
+            return None;
+        }
+        let (workflow, matched, args) = find_command_workflow(
+            &self.config,
+            envelope.command_text(),
+            envelope.message_type(),
+        )?;
+        let workflow_name = workflow_name(workflow, matched);
+        Some(FeatureCommandMatch::new(
+            matched,
+            joined_command(matched, &args),
+            CustomWorkflowCommand {
+                name: matched.to_string(),
+                workflow: workflow_name,
+                args,
+            },
+        ))
     }
 
     fn find(&self, name: &str) -> Option<&CustomWorkflowDefinition> {
@@ -203,18 +413,15 @@ impl CustomWorkflowService {
             .to_string();
         let workflow_name = workflow_name(workflow, &command_name);
         let raw = joined_command(&command_name, args);
-        Ok(CustomWorkflowMatch {
-            matched: command_name.clone(),
-            user_command: format!("@{raw}"),
+        Ok(FeatureCommandMatch::new(
+            command_name.clone(),
             raw,
-            message_type: "控制台".to_string(),
-            username: "控制台".to_string(),
-            command: CustomWorkflowCommand {
+            CustomWorkflowCommand {
                 name: command_name,
                 workflow: workflow_name,
                 args: args.to_string(),
             },
-        })
+        ))
     }
 
     pub fn execute(
@@ -466,13 +673,13 @@ impl CustomWorkflowService {
                     WorkflowCapability::InviteUser { target },
                 ))
             }
-            "return_primary" | "ensure_primary" => Ok(PreparedWorkflowStep::Capability(
-                WorkflowCapability::EnsureResidency {
+            "return_primary" | "ensure_primary" => Ok(PreparedWorkflowStep::Mechanical(
+                WorkflowOperation::EnsureResidency {
                     target: WorkflowResidency::Primary,
                 },
             )),
-            "ensure_current_hall" => Ok(PreparedWorkflowStep::Capability(
-                WorkflowCapability::EnsureResidency {
+            "ensure_current_hall" => Ok(PreparedWorkflowStep::Mechanical(
+                WorkflowOperation::EnsureResidency {
                     target: WorkflowResidency::SecondaryCurrentHall,
                 },
             )),
@@ -702,12 +909,6 @@ enum WorkflowConfirmationDecision {
     Skip,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct WorkflowPoint {
-    pub x: i32,
-    pub y: i32,
-}
-
 impl From<PointConfig> for WorkflowPoint {
     fn from(value: PointConfig) -> Self {
         Self {
@@ -715,14 +916,6 @@ impl From<PointConfig> for WorkflowPoint {
             y: value.y,
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct WorkflowRect {
-    pub x: i32,
-    pub y: i32,
-    pub width: u32,
-    pub height: u32,
 }
 
 impl From<RectConfig> for WorkflowRect {
@@ -736,94 +929,12 @@ impl From<RectConfig> for WorkflowRect {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct WorkflowPixelStability {
-    pub timeout_ms: u64,
-    pub mean_threshold: f32,
-    pub changed_ratio_threshold: f32,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WorkflowResidency {
-    Primary,
-    SecondaryCurrentHall,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum WorkflowOperation {
-    Wait {
-        duration_ms: u64,
-    },
-    PressKey {
-        key: String,
-    },
-    HoldKey {
-        key: String,
-        duration_seconds: u64,
-    },
-    ActivateGame {
-        after_activate_ms: u64,
-    },
-    FocusGame {
-        after_activate_ms: u64,
-    },
-    ClickPoint {
-        point: WorkflowPoint,
-    },
-    WaitTemplate {
-        template: PathBuf,
-        region: WorkflowRect,
-        threshold: f32,
-        timeout_ms: u64,
-        poll_ms: u64,
-    },
-    ClickTemplate {
-        template: PathBuf,
-        region: WorkflowRect,
-        threshold: f32,
-        timeout_ms: u64,
-        poll_ms: u64,
-        offset: WorkflowPoint,
-    },
-    WaitTemplateAbsent {
-        template: PathBuf,
-        region: WorkflowRect,
-        threshold: f32,
-        timeout_ms: u64,
-        poll_ms: u64,
-        stability: Option<WorkflowPixelStability>,
-    },
-    WaitPixelsStable {
-        region: WorkflowRect,
-        poll_ms: u64,
-        stability: WorkflowPixelStability,
-    },
-    WaitText {
-        expected: String,
-        region: WorkflowRect,
-        timeout_ms: u64,
-        poll_ms: u64,
-    },
-    ClickText {
-        expected: String,
-        region: WorkflowRect,
-        timeout_ms: u64,
-        poll_ms: u64,
-        offset: WorkflowPoint,
-    },
-    PasteText {
-        text: String,
-        clipboard_hold_ms: u64,
-    },
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub enum WorkflowCapability {
     SendHall { message: String },
     SendCurrentChat { message: String },
     SendFriendMessage { target: String, message: String },
     InviteUser { target: String },
-    EnsureResidency { target: WorkflowResidency },
 }
 
 fn is_confirmation_message(text: &str) -> bool {
@@ -838,6 +949,7 @@ fn operation_label(operation: &WorkflowOperation) -> &'static str {
         WorkflowOperation::HoldKey { .. } => "hold_key",
         WorkflowOperation::ActivateGame { .. } => "activate_game",
         WorkflowOperation::FocusGame { .. } => "focus_game",
+        WorkflowOperation::EnsureResidency { .. } => "ensure_residency",
         WorkflowOperation::ClickPoint { .. } => "click",
         WorkflowOperation::WaitTemplate { .. } => "wait_template",
         WorkflowOperation::ClickTemplate { .. } => "click_template",
@@ -855,38 +967,7 @@ fn capability_label(capability: &WorkflowCapability) -> &'static str {
         WorkflowCapability::SendCurrentChat { .. } => "send_current_chat",
         WorkflowCapability::SendFriendMessage { .. } => "send_friend_message",
         WorkflowCapability::InviteUser { .. } => "invite_user",
-        WorkflowCapability::EnsureResidency {
-            target: WorkflowResidency::Primary,
-        } => "ensure_primary",
-        WorkflowCapability::EnsureResidency {
-            target: WorkflowResidency::SecondaryCurrentHall,
-        } => "ensure_current_hall",
     }
-}
-
-fn parse_text(
-    config: &CustomWorkflowConfig,
-    text: &str,
-    message_type: &str,
-) -> Option<CustomWorkflowMatch> {
-    if !config.enabled {
-        return None;
-    }
-    let (username, command_text, user_command) = chat_command_parts(text, message_type)?;
-    let (workflow, matched, args) = find_command_workflow(config, command_text, message_type)?;
-    let workflow_name = workflow_name(workflow, matched);
-    Some(CustomWorkflowMatch {
-        matched: matched.to_string(),
-        raw: joined_command(matched, &args),
-        user_command,
-        message_type: message_type.to_string(),
-        username,
-        command: CustomWorkflowCommand {
-            name: matched.to_string(),
-            workflow: workflow_name,
-            args,
-        },
-    })
 }
 
 fn find_workflow<'a>(
@@ -1086,60 +1167,6 @@ fn command_args(rest: &str) -> &str {
         .trim()
 }
 
-fn chat_command_parts<'a>(text: &'a str, message_type: &str) -> Option<(String, &'a str, String)> {
-    match message_type {
-        "blue" => blue_command_parts(text),
-        "pink" => pink_command_parts(text),
-        _ => None,
-    }
-}
-
-fn blue_command_parts(text: &str) -> Option<(String, &str, String)> {
-    let separator_index = text.find(['：', ':', ']', '】'])?;
-    let username = text[..separator_index]
-        .trim_matches(['[', '【', ']', '】', ' ', '\t'])
-        .to_string();
-    let raw_command_text = after_separator(text, separator_index)?;
-    let user_command = user_command_text(raw_command_text);
-    let command_text = raw_command_text.strip_prefix('@')?.trim_start();
-    Some((username, command_text, user_command))
-}
-
-fn pink_command_parts(text: &str) -> Option<(String, &str, String)> {
-    let username = extract_bracket_username(text)?;
-    let separator_index = text.find(['：', ':', ']', '】'])?;
-    let raw_command_text = after_separator(text, separator_index)?;
-    let user_command = user_command_text(raw_command_text);
-    let command_text = raw_command_text.strip_prefix('@')?.trim_start();
-    Some((username, command_text, user_command))
-}
-
-fn after_separator(text: &str, separator_index: usize) -> Option<&str> {
-    let separator_len = text[separator_index..].chars().next()?.len_utf8();
-    Some(
-        text[separator_index + separator_len..]
-            .trim_start_matches(['：', ':', ' ', '\t', ']', '】']),
-    )
-}
-
-fn extract_bracket_username(text: &str) -> Option<String> {
-    let (start, close) = if let Some(start) = text.find('[') {
-        (start, ']')
-    } else {
-        (text.find('【')?, '】')
-    };
-    let end = text[start + 1..].find(close)? + start + 1;
-    let username = text[start + 1..end].trim();
-    (!username.is_empty()).then(|| username.to_string())
-}
-
-fn user_command_text(text: &str) -> String {
-    text.trim()
-        .trim_end_matches([']', '】'])
-        .trim_end()
-        .to_string()
-}
-
 fn workflow_name(workflow: &CustomWorkflowDefinition, fallback: &str) -> String {
     let name = workflow.name.trim();
     if name.is_empty() {
@@ -1218,6 +1245,18 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+    use crate::features::command::CommandObservation;
+
+    fn envelope(username: &str, message_type: &str, command: &str) -> CommandEnvelope {
+        CommandEnvelope::new(
+            command,
+            username,
+            message_type,
+            command,
+            CommandObservation::default(),
+        )
+        .expect("command envelope")
+    }
 
     struct RecordingPort {
         events: Vec<String>,
@@ -1322,6 +1361,46 @@ mod tests {
             max_hold_key_seconds: 10,
             templates: HashMap::from([("button".to_string(), PathBuf::from("assets/button.png"))]),
             workflows: vec![workflow],
+        }
+    }
+
+    #[test]
+    fn configuration_rejects_unsupported_steps_before_runtime_startup() {
+        let mut value = workflow();
+        value.steps = vec![step("unsupported")];
+
+        let error = config(value).validate().unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported custom workflow step type: unsupported")
+        );
+    }
+
+    #[test]
+    fn configuration_rejects_missing_step_fields_before_runtime_startup() {
+        for (kind, expected) in [
+            ("key", "step key is empty"),
+            ("click", "missing point"),
+            ("wait_template", "template is empty"),
+            ("wait_text", "missing text"),
+            ("paste", "missing text"),
+            ("send_chat", "missing message"),
+            ("send_current_chat", "missing message"),
+            ("send_friend_message", "missing message"),
+        ] {
+            let mut value = workflow();
+            let mut invalid = step(kind);
+            invalid.key = None;
+            value.steps = vec![invalid];
+
+            let error = config(value).validate().unwrap_err();
+
+            assert!(
+                error.to_string().contains(expected),
+                "kind={kind} error={error:#}"
+            );
         }
     }
 
@@ -1527,12 +1606,14 @@ mod tests {
     #[test]
     fn parses_chat_commands_with_all_supported_argument_layouts() {
         let service = CustomWorkflowService::new(config(workflow()), defaults());
-        for (text, expected) in [
-            ("用户：@测试流程 123 abc", "123 abc"),
-            ("用户：@测试流程123 abc", "123 abc"),
-            ("用户：@测试流程：123 abc", "123 abc"),
+        for (command, expected) in [
+            ("@测试流程 123 abc", "123 abc"),
+            ("@测试流程123 abc", "123 abc"),
+            ("@测试流程：123 abc", "123 abc"),
         ] {
-            let parsed = service.parse_chat(text, "blue").unwrap();
+            let parsed = service
+                .parse_chat(&envelope("用户", "blue", command))
+                .unwrap();
             assert_eq!(parsed.command.args, expected);
             assert_eq!(parsed.raw, "测试流程 123 abc");
         }
@@ -1543,15 +1624,31 @@ mod tests {
         let mut value = workflow();
         value.allow_args = false;
         let service = CustomWorkflowService::new(config(value.clone()), defaults());
-        assert!(service.parse_chat("用户：@测试流程", "blue").is_some());
-        assert!(service.parse_chat("用户：@测试流程参数", "blue").is_none());
-        assert!(service.parse_chat("[用户]：@测试流程", "pink").is_none());
+        assert!(
+            service
+                .parse_chat(&envelope("用户", "blue", "@测试流程"))
+                .is_some()
+        );
+        assert!(
+            service
+                .parse_chat(&envelope("用户", "blue", "@测试流程参数"))
+                .is_none()
+        );
+        assert!(
+            service
+                .parse_chat(&envelope("用户", "pink", "@测试流程"))
+                .is_none()
+        );
 
         value.message_types.clear();
         let mut disabled = config(value);
         disabled.enabled = false;
         let service = CustomWorkflowService::new(disabled, defaults());
-        assert!(service.parse_chat("用户：@测试流程", "blue").is_none());
+        assert!(
+            service
+                .parse_chat(&envelope("用户", "blue", "@测试流程"))
+                .is_none()
+        );
     }
 
     #[test]
@@ -1564,8 +1661,7 @@ mod tests {
         let prepared = service.prepare_remote("example", "5").unwrap();
 
         assert_eq!(prepared.raw, "入口 5");
-        assert_eq!(prepared.user_command, "@入口 5");
-        assert_eq!(prepared.message_type, "控制台");
+        assert_eq!(prepared.matched, "入口");
         assert_eq!(prepared.command.workflow, "example");
     }
 

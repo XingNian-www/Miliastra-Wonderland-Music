@@ -184,10 +184,7 @@ pub(crate) enum MonitorEvent {
 }
 
 enum MonitorMessage {
-    Event {
-        event: Box<MonitorEvent>,
-        applied: SyncSender<()>,
-    },
+    Event(Box<MonitorEvent>),
     Snapshot(SyncSender<MonitorSnapshot>),
     Shutdown(SyncSender<()>),
 }
@@ -342,10 +339,7 @@ impl MonitorShared {
             .spawn(move || {
                 while let Ok(message) = receiver.recv() {
                     match message {
-                        MonitorMessage::Event { event, applied } => {
-                            projection.apply(*event);
-                            let _ = applied.send(());
-                        }
+                        MonitorMessage::Event(event) => projection.apply(*event),
                         MonitorMessage::Snapshot(response) => {
                             let _ = response.send(projection.snapshot());
                         }
@@ -372,26 +366,14 @@ impl MonitorShared {
     }
 
     pub(crate) fn publish(&self, event: MonitorEvent) {
-        let (applied, wait) = mpsc::sync_channel(0);
-        if self
-            .runtime
-            .events
-            .send(MonitorMessage::Event {
-                event: Box::new(event),
-                applied,
-            })
-            .is_ok()
-        {
-            let _ = wait.recv();
-        }
+        self.publish_async(event);
     }
 
     pub(crate) fn publish_async(&self, event: MonitorEvent) {
-        let (applied, _wait) = mpsc::sync_channel(0);
-        let _ = self.runtime.events.send(MonitorMessage::Event {
-            event: Box::new(event),
-            applied,
-        });
+        let _ = self
+            .runtime
+            .events
+            .send(MonitorMessage::Event(Box::new(event)));
     }
 
     pub(crate) fn snapshot(&self) -> MonitorSnapshot {

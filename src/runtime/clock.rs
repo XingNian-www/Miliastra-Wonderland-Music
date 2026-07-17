@@ -1,16 +1,43 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Supplies monotonic business time without coupling domain code to the system clock.
 pub trait Clock: Send + Sync + 'static {
     fn now(&self) -> Instant;
 }
 
+/// Waits without forcing a business gateway to depend directly on the system scheduler.
+pub trait Delay: Send + Sync + 'static {
+    fn wait(&self, duration: Duration);
+}
+
+/// Supplies wall-clock metadata without using it to judge business deadlines.
+pub trait WallClock: Send + Sync + 'static {
+    fn unix_seconds(&self) -> u64;
+
+    fn unix_millis(&self) -> u64 {
+        self.unix_seconds().saturating_mul(1_000)
+    }
+}
+
 impl<C: Clock + ?Sized> Clock for Arc<C> {
     fn now(&self) -> Instant {
         C::now(self)
+    }
+}
+
+impl<D: Delay + ?Sized> Delay for Arc<D> {
+    fn wait(&self, duration: Duration) {
+        D::wait(self, duration);
+    }
+}
+
+impl<W: WallClock + ?Sized> WallClock for Arc<W> {
+    fn unix_seconds(&self) -> u64 {
+        W::unix_seconds(self)
     }
 }
 
@@ -23,42 +50,80 @@ impl Clock for SystemClock {
     }
 }
 
+impl Delay for SystemClock {
+    fn wait(&self, duration: Duration) {
+        thread::sleep(duration);
+    }
+}
+
+impl WallClock for SystemClock {
+    fn unix_seconds(&self) -> u64 {
+        self.unix_millis() / 1_000
+    }
+
+    fn unix_millis(&self) -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
+            .unwrap_or(0)
+    }
+}
+
 /// A cloneable monotonic clock for deterministic tests.
 ///
 /// Clones observe and advance the same instant. The mutex makes concurrent advances additive
 /// rather than allowing one test driver to overwrite another driver's progress.
 #[derive(Clone, Debug)]
 pub struct ManualClock {
-    now: Arc<Mutex<Instant>>,
+    time: Arc<Mutex<ManualTime>>,
+}
+
+#[derive(Debug)]
+struct ManualTime {
+    monotonic: Instant,
+    unix_millis: u64,
 }
 
 impl ManualClock {
     pub fn new(now: Instant) -> Self {
+        Self::with_unix_seconds(now, 0)
+    }
+
+    pub fn with_unix_seconds(now: Instant, unix_seconds: u64) -> Self {
         Self {
-            now: Arc::new(Mutex::new(now)),
+            time: Arc::new(Mutex::new(ManualTime {
+                monotonic: now,
+                unix_millis: unix_seconds.saturating_mul(1_000),
+            })),
         }
     }
 
     pub fn advance(&self, duration: Duration) -> Result<Instant, ManualClockError> {
-        let mut now = self.lock();
-        let advanced = now
+        let mut time = self.lock();
+        let advanced = time
+            .monotonic
             .checked_add(duration)
             .ok_or(ManualClockError::InstantOverflow)?;
-        *now = advanced;
+        time.monotonic = advanced;
+        let elapsed_ms = duration.as_millis().min(u64::MAX as u128) as u64;
+        time.unix_millis = time.unix_millis.saturating_add(elapsed_ms);
         Ok(advanced)
     }
 
     pub fn advance_to(&self, target: Instant) -> Result<Instant, ManualClockError> {
-        let mut now = self.lock();
-        if target < *now {
+        let mut time = self.lock();
+        if target < time.monotonic {
             return Err(ManualClockError::WouldMoveBackwards);
         }
-        *now = target;
+        let elapsed = target.duration_since(time.monotonic);
+        time.monotonic = target;
+        let elapsed_ms = elapsed.as_millis().min(u64::MAX as u128) as u64;
+        time.unix_millis = time.unix_millis.saturating_add(elapsed_ms);
         Ok(target)
     }
 
-    fn lock(&self) -> MutexGuard<'_, Instant> {
-        self.now
+    fn lock(&self) -> MutexGuard<'_, ManualTime> {
+        self.time
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -66,7 +131,23 @@ impl ManualClock {
 
 impl Clock for ManualClock {
     fn now(&self) -> Instant {
-        *self.lock()
+        self.lock().monotonic
+    }
+}
+
+impl WallClock for ManualClock {
+    fn unix_seconds(&self) -> u64 {
+        self.lock().unix_millis / 1_000
+    }
+
+    fn unix_millis(&self) -> u64 {
+        self.lock().unix_millis
+    }
+}
+
+impl Delay for ManualClock {
+    fn wait(&self, duration: Duration) {
+        let _ = self.advance(duration);
     }
 }
 
@@ -93,7 +174,7 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use super::{Clock, ManualClock, ManualClockError};
+    use super::{Clock, ManualClock, ManualClockError, WallClock};
 
     #[test]
     fn clones_share_monotonic_time() {
@@ -139,5 +220,15 @@ mod tests {
         }
 
         assert_eq!(clock.now(), initial + Duration::from_millis(800));
+    }
+
+    #[test]
+    fn manual_wall_clock_preserves_subsecond_metadata() {
+        let clock = ManualClock::with_unix_seconds(Instant::now(), 100);
+
+        clock.advance(Duration::from_millis(1_500)).unwrap();
+
+        assert_eq!(clock.unix_millis(), 101_500);
+        assert_eq!(clock.unix_seconds(), 101);
     }
 }

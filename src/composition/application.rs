@@ -8,14 +8,13 @@ mod listener;
 mod moderation;
 mod playback;
 mod secondary_chat;
-mod song_request;
+mod song_request_port;
 mod startup;
 mod tasks;
 mod workers;
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, sleep};
@@ -23,67 +22,70 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use self::formal_task::{FormalTaskClient, FormalTaskExecutionRuntime};
 use crate::adapters::feeluown::FeelUOwnClient;
+use crate::adapters::player::PlayerRuntimeBackend;
 use crate::adapters::windows::{WindowsUiDevice, parse_key};
 use crate::config::{AppConfig, PointConfig};
-use crate::features::administration::AdministrationCommand;
-#[cfg(test)]
-use crate::features::card_games::LandlordConfig;
+use crate::features::administration::{
+    AdministrationApplication, AdministrationCommand, ChatListenerModeCommand,
+};
 use crate::features::card_games::{
-    CardGameCommandStart, CardGameDeliveryPort, CardGameEffect, CardGameEffectClaim,
-    CardGameEffectLane, CardGameEffectRequest, CardGameEffectResult, CardGameResume,
+    CardGameApplication, CardGameDeliveryPort, CardGameEffectLane, CardGameEffectTask,
     CardGameService, LandlordCommand, LandlordPrivateDelivery,
 };
-use crate::features::chat_text::split_numbered_chat_message;
-use crate::features::custom_workflow::{CustomWorkflowService, service_from_config_parts};
+#[cfg(test)]
+use crate::features::card_games::{CardGameCommandStart, LandlordConfig};
+use crate::features::command::{
+    CommandEnvelope, CommandObservation, CommandPrefix, ModuleCommand, RoutedCommand,
+};
+use crate::features::custom_workflow::{CustomWorkflowService, WorkflowDefaults};
 use crate::features::friend_delivery::{FriendBatchOutcome, FriendMessage};
-use crate::features::hall::HallCommand;
+use crate::features::hall::{HallApplication, HallCommand, HallStateService};
 use crate::features::idiom_chain;
-use crate::features::idiom_chain::IdiomChainService;
+use crate::features::idiom_chain::{IdiomChainApplication, IdiomChainService};
 use crate::features::invite::{InviteRequest, InviteService, InviteStart};
 use crate::features::moderation::{ModerationPolicy, ModerationResultTask, ModerationService};
 use crate::features::playback::{
-    HALL_EXPIRING_WARNING_MINUTES, MismatchDecision, PersistentQueue, PersistentRuntimeState,
-    PersistentSongDedupHistory, PlaybackAttempt, PlaybackCommand, PlaybackOutcome, PlaybackRequest,
-    PlaybackService, PlaybackSnapshot, PlaybackVerification, PlayerController,
-    PlayerRuntimeBackend, PlayerStatus, QueueAdvanceContext, QueueAdvanceDecision, QueueItem,
-    QueueRemoval, estimated_player_status, format_lyrics, format_play_message, format_status,
-    is_playing, song_title,
+    ExternalPlaybackObservation, PlaybackApplication, PlaybackApplicationConfig, PlaybackCommand,
+    PlaybackRequest, PlaybackRuntimeState, PlaybackService, PlaybackStatePort, PlaybackStateUpdate,
+    PlaybackTimePorts, PlayerController, PlayerStatus, QueueItem, SongDedupCandidate,
 };
 use crate::features::song_request::{
-    AiClient, SongCommand, SongReviewCandidate, SongReviewClient, split_candidate_title_artist,
+    AiClient, ResolvedSongRequest, SongRequestApplication, SongRequestContext, SongRequestDecision,
+    SongReviewClient,
 };
 use crate::features::startup::{StartupService, StartupSource, StartupTask};
 use crate::features::turtle_soup::{
-    self, QuestionSubmitOutcome, SecondaryOcrObservation, SecondaryOcrStability, TurtleSoupService,
+    self, SecondaryOcrObservation, SecondaryOcrStability, TurtleSoupApplication, TurtleSoupConfig,
+    TurtleSoupService,
 };
 use crate::features::undercover::{
-    UndercoverCommand, UndercoverCommandSource, UndercoverCommandStart, UndercoverDeliveryPort,
-    UndercoverEffect, UndercoverEffectClaim, UndercoverEffectLane, UndercoverEffectRequest,
-    UndercoverEffectResult, UndercoverResume, UndercoverRuntimeService,
+    UndercoverApplication, UndercoverCommand, UndercoverCommandSource, UndercoverDeliveryPort,
+    UndercoverEffectTask, UndercoverRuntimeService,
 };
 use crate::interfaces::chat::{
-    self as command, CommandLockState, CommandObservation, ParsedCommand, PendingCommand,
-    from_custom_workflow_match,
+    self as command, ChatCommandRouter, CommandLockState, PendingCommand,
 };
 use crate::interfaces::hotkeys;
 use crate::interfaces::http::{self, WebToolRequest, WebToolTemplate};
 use crate::observation::chat::{
     ChatMessage, ChatObservationDispatch, ChatObservationExclusiveGuard, ChatObservationShared,
-    CompletionAdvanceSubscriber, ObservedFrame, PrimaryObservedMessage, ResolvedTemplateArgs,
-    SECONDARY_TITLE_RECT, SecondaryChatIdentity, SecondaryChatObservation, SecondaryHallBubble,
-    SecondaryObservedMessage, SecondaryRecognizedMessage, TemplateArgs, UnreadFriendHit,
-    classify_title, count_chat_markers, find_unread_friend_hits, hall_bubble_sequence_overlap,
-    latest_incoming_bubble_rect, latest_incoming_fingerprint, prepare_chat_scan,
-    recognize_prepared_chat, secondary_hall_bubbles,
+    ChatScanTelemetry, ChatScanTelemetrySink, CompletionAdvanceSubscriber, ObservedFrame,
+    PrimaryObservedMessage, ResolvedTemplateArgs, SECONDARY_TITLE_RECT, SecondaryChatIdentity,
+    SecondaryChatObservation, SecondaryHallBubble, SecondaryObservedMessage,
+    SecondaryRecognizedMessage, TemplateArgs, UnreadFriendHit, classify_title, count_chat_markers,
+    find_unread_friend_hits, hall_bubble_sequence_overlap, latest_incoming_bubble_rect,
+    latest_incoming_fingerprint, prepare_chat_scan, recognize_prepared_chat,
+    secondary_hall_bubbles,
 };
 use crate::observation::decision::DecisionScreenLock;
 use crate::observation::shared::ObservationRead;
 use crate::privacy::redacted_chat_text;
 use crate::runtime::business::{
-    BusinessEvent, BusinessIntent, BusinessRuntime, BusinessRuntimeEventSink,
-    BusinessRuntimeHandle, BusinessRuntimeWorker,
+    BusinessEvent, BusinessRuntime, BusinessRuntimeEventSink, BusinessRuntimeHandle,
+    BusinessRuntimeWorker,
 };
-use crate::runtime::chat_listener::{ChatListenerMode, ChatListenerModeCommand};
+use crate::runtime::chat_listener::ChatListenerMode;
+use crate::runtime::clock::SystemClock;
 use crate::runtime::deadline_bridge::{BusinessRuntimeGroup, BusinessRuntimeGroupBuilder};
 use crate::runtime::decision::DecisionAction;
 use crate::runtime::deferred_chat::{
@@ -93,17 +95,18 @@ use crate::runtime::identity::BusinessOperationIdAllocator;
 use crate::runtime::monitor::{MonitorEvent, MonitorShared, OcrSnapshot};
 use crate::runtime::ocr::{
     OcrArgs, OcrBackendProbeStatus, OcrPriority, OcrRuntime, OcrRuntimeHandle, ProductionOcrDevice,
-    probe_ocr_backend_support,
+    ResolvedOcrArgs, probe_ocr_backend_support,
 };
 use crate::runtime::openai::OpenAiRuntime;
-use crate::runtime::player_io::{PlayerRuntime, PlayerSearchClient, PlayerSearchClientError};
+use crate::runtime::player_io::{
+    PlayerRuntime, PlayerRuntimeConfig, PlayerSearchClient, PlayerSearchClientError,
+};
 use crate::runtime::scheduler::{
     DiagnosticTaskCompletion, FormalTaskCompletion, FormalTaskEnqueueOutcome,
 };
 use crate::runtime::ui::{
     FrameDemand, FrameDemandSubscription, FramePublication, UiRuntime, UiRuntimeHandle,
 };
-use crate::text::normalize_comparison_text;
 use crate::ui::atoms::GameUi;
 use crate::ui::change_detection::{ChangeFingerprint, change_stats, rect_chat_change_fingerprint};
 use crate::ui::chat_output::{ChatBatchSendOutcome, ChatBatchSendStatus, ChatOutput};
@@ -111,26 +114,216 @@ use crate::ui::frame::{Canvas, Frame, from_captured_frame, load_frame};
 use crate::ui::geometry::{Rect, crop_canvas};
 #[cfg(test)]
 use crate::ui::locator::secondary_hall_search_rect;
-use crate::ui::locator::{HallInfo, format_hall_remaining_suffix};
 use crate::ui::routines::{
-    CustomActionUi, DetectPublicHall, DetectPublicHallEffect, EstablishResidency, FriendDeliveryUi,
-    HallBatchUi, HallUi, InviteUi, ModerationUi, ProcessSecondaryUnread, ReadHallInfo,
-    ReadHallInfoEffect, ResidencyUi, SecondaryUnreadEffect, SecondaryUnreadUi, StartupUi,
-    ToggleMicrophone, ToggleMicrophoneEffect, UiResidencyOutcome, UiResidencyTarget,
+    CustomActionUi, DetectPublicHall, DetectPublicHallEffect, EstablishResidency,
+    FriendDeliveryRoutineConfig, FriendDeliveryRoutineConfigSource, FriendDeliveryUi, HallBatchUi,
+    HallRoutineConfig, HallUi, InviteRoutineConfig, InviteRoutineConfigSource, InviteUi,
+    ModerationRoutineConfig, ModerationRoutineConfigSource, ModerationUi, ProcessSecondaryUnread,
+    ReadHallInfo, ReadHallInfoEffect, ResidencyUi, SecondaryUnreadEffect,
+    SecondaryUnreadRoutineConfig, SecondaryUnreadUi, StartupRoutineConfig, StartupUi,
+    StartupUiConfig, StartupUiTemplates, ToggleMicrophone, ToggleMicrophoneEffect,
+    UiResidencyOutcome, UiResidencyTarget,
 };
-use crate::ui::state::{UiTemplateArgs, detect_ui_state};
+use crate::ui::state::{ResolvedUiTemplateArgs, UiTemplateArgs, detect_ui_state};
 use crate::ui::template::{best_template_hit, find_template_hits};
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use enigo::Key;
 use image::DynamicImage;
 
-const IDLE_EXIT_MIN_MINUTES: u32 = 15;
 const TARGET_MISSING_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const TARGET_MISSING_BACKOFF_MAX: Duration = Duration::from_secs(60);
 const UI_RUNTIME_QUEUE_CAPACITY: usize = 32;
 const OCR_RUNTIME_QUEUE_CAPACITY: usize = 64;
 const BUSINESS_RUNTIME_QUEUE_CAPACITY: usize = 64;
 const DEADLINE_RUNTIME_QUEUE_CAPACITY: usize = 64;
+
+impl ChatScanTelemetrySink for MonitorShared {
+    fn publish_chat_scan(&self, telemetry: ChatScanTelemetry) {
+        self.publish(MonitorEvent::Ocr(OcrSnapshot::new(
+            telemetry.marker_count,
+            telemetry.lines,
+            telemetry.marker_ms,
+            telemetry.ocr_ms,
+            telemetry.total_ms,
+            telemetry.scope,
+        )));
+    }
+}
+
+pub(crate) struct ResolvedApplicationConfig {
+    app: AppConfig,
+    player_runtime: PlayerRuntimeConfig,
+    ocr: ResolvedOcrArgs,
+    chat_templates: ResolvedTemplateArgs,
+    ui_templates: ResolvedUiTemplateArgs,
+    friend_delivery: FriendDeliveryRoutineConfig,
+    hall: HallRoutineConfig,
+    moderation: ModerationRoutineConfig,
+    startup: StartupRoutineConfig,
+    secondary_unread: SecondaryUnreadRoutineConfig,
+    invite: InviteRoutineConfig,
+    turtle_soup: TurtleSoupConfig,
+    ai_request_timeout: Duration,
+}
+
+impl ResolvedApplicationConfig {
+    pub(crate) fn resolve(app: AppConfig) -> Result<Self> {
+        app.validate().context("启动前校验组合配置")?;
+
+        let player_runtime = app
+            .player_runtime_config()
+            .context("校验播放器运行时配置")?;
+        let ocr = OcrArgs::default().resolve(&app.ocr);
+        let chat_templates = TemplateArgs::default().resolve(&app.templates, &app.ocr);
+        let ui_templates = UiTemplateArgs::default().resolve(&app.templates, &app.ocr);
+        let friend_delivery =
+            FriendDeliveryRoutineConfig::resolve(FriendDeliveryRoutineConfigSource {
+                screen: &app.screen,
+                ui_templates: ui_templates.clone(),
+                templates: &app.templates,
+                ocr: &app.ocr,
+                output: &app.output,
+                input_timing: &app.timing.input,
+                delivery: &app.friend_delivery,
+                friend_list_region: app.invite.friend_list_region.into(),
+                friend_chat_region: app.invite.friend_chat_region.into(),
+                friend_step_ms: app.timing.invite.step_ms,
+                timeout_ms: app.timing.workflow.default_timeout_ms,
+                poll_ms: app.timing.workflow.default_poll_ms,
+                stable_count: app.resolve_stability_count(app.invite.friend_name_stable_count),
+            });
+        let hall = HallRoutineConfig::resolve(
+            friend_delivery.clone(),
+            &app.screen,
+            &app.timing.hall,
+            &app.ocr,
+        );
+        let moderation = ModerationRoutineConfig::resolve(ModerationRoutineConfigSource {
+            residency: friend_delivery.clone(),
+            ui_templates: ui_templates.clone(),
+            friend_panel_template: app.templates.friend_panel.clone(),
+            search_panel_template: app.templates.friend_search_panel.clone(),
+            more_settings_template: app.templates.friend_more_settings.clone(),
+            blacklist_template: app.templates.friend_blacklist.clone(),
+            block_chat_template: app.templates.friend_block_chat.clone(),
+            confirm_template: app.templates.friend_confirm.clone(),
+            friend_panel_region: app.moderation.friend_panel_region.into(),
+            search_panel_region: app.moderation.search_panel_region.into(),
+            more_settings_region: app.moderation.more_settings_region.into(),
+            blacklist_region: app.moderation.blacklist_region.into(),
+            block_chat_region: app.moderation.block_chat_region.into(),
+            confirm_region: app.moderation.confirm_region.into(),
+            search_input: crate::ui::geometry::Point::new(
+                app.moderation.search_input_point.x,
+                app.moderation.search_input_point.y,
+            ),
+            search_button: crate::ui::geometry::Point::new(
+                app.moderation.search_button_point.x,
+                app.moderation.search_button_point.y,
+            ),
+            marker_threshold: app.templates.marker_threshold,
+            ui_timeout_ms: app.timing.command.ui_timeout_ms,
+            search_timeout_ms: app.timing.moderation.search_result_timeout_ms,
+            confirm_wait_ms: app.timing.moderation.confirm_wait_ms,
+            step_ms: app.timing.invite.step_ms,
+            text_ms: app.timing.input.text_ms,
+            return_retry_ms: app.timing.command.return_retry_ms,
+        });
+        let startup = StartupRoutineConfig::resolve(
+            StartupUiConfig {
+                launch_game: app.startup.launch_game,
+                enter_game: app.startup.enter_game,
+                exe_path: app.startup.exe_path.clone(),
+                game_args: app.startup.game_args.clone(),
+                launch_wait_ms: app.startup.launch_wait_ms,
+                launch_retries: app.startup.launch_retries,
+                enter_game_timeout_ms: app.startup.enter_game_timeout_ms,
+                enter_wonderland_timeout_ms: app.startup.enter_wonderland_timeout_ms,
+                wonderland_home_retries: app.startup.wonderland_home_retries,
+                wonderland_home_retry_ms: app.startup.wonderland_home_retry_ms,
+                wonderland_card_retries: app.startup.wonderland_card_retries,
+                wonderland_card_retry_ms: app.startup.wonderland_card_retry_ms,
+                wonderland_confirm_absent_timeout_ms: app
+                    .startup
+                    .wonderland_confirm_absent_timeout_ms,
+                wonderland_confirm_stable_timeout_ms: app
+                    .startup
+                    .wonderland_confirm_stable_timeout_ms,
+                final_primary_timeout_ms: app.startup.final_primary_timeout_ms,
+                poll_ms: app.startup.poll_ms,
+                stable_mean_threshold: app.startup.stable_mean_threshold,
+                stable_changed_ratio_threshold: app.startup.stable_changed_ratio_threshold,
+                template_threshold: app.startup.template_threshold,
+                wonderland_enter_button_threshold: app.startup.wonderland_enter_button_threshold,
+                templates: StartupUiTemplates {
+                    wonderland_enter_button: app.startup.templates.wonderland_enter_button.clone(),
+                    paimon_menu: app.startup.templates.paimon_menu.clone(),
+                    wonderland_close: app.startup.templates.wonderland_close.clone(),
+                },
+                enter_game_text_region: app.startup.enter_game_text_region.into(),
+                wonderland_enter_button_region: app.startup.wonderland_enter_button_region.into(),
+                main_ui_region: app.startup.main_ui_region.into(),
+                wonderland_close_region: app.startup.wonderland_close_region.into(),
+                wonderland_card_point: crate::ui::geometry::Point::new(
+                    app.startup.wonderland_card_point.x,
+                    app.startup.wonderland_card_point.y,
+                ),
+            },
+            friend_delivery.clone(),
+            ui_templates.clone(),
+            app.window.target_process.clone(),
+        );
+        let secondary_unread = SecondaryUnreadRoutineConfig::resolve(
+            friend_delivery.clone(),
+            app.ocr.same_line_y_tolerance,
+            app.timing.chat_scan.change_debounce_ms,
+        );
+        let invite = InviteRoutineConfig::resolve(InviteRoutineConfigSource {
+            friend: friend_delivery.clone(),
+            confirm_list_region: app.invite.confirm_list_region.into(),
+            view_star_template: app.templates.invite_view_star.clone(),
+            view_star_region: app.invite.view_star_region.into(),
+            goto_hall_template: app.templates.invite_goto_hall.clone(),
+            goto_hall_region: app.invite.goto_hall_region.into(),
+            enter_hall_template: app.templates.invite_enter_hall.clone(),
+            enter_hall_region: app.invite.enter_hall_region.into(),
+            template_threshold: app.templates.marker_threshold,
+            button_timeout_ms: app.timing.workflow.default_timeout_ms,
+            completion_timeout_ms: app.timing.command.ui_timeout_ms,
+            poll_ms: app.timing.workflow.default_poll_ms,
+            stable_count: app.resolve_stability_count(app.invite.friend_name_stable_count),
+            click_ms: app.timing.input.click_ms,
+            password_step_ms: app.timing.invite.step_ms,
+            password_digit_ms: app.timing.input.text_ms,
+        });
+        let mut turtle_soup = app.turtle_soup.clone();
+        turtle_soup.nickname_stable_count =
+            app.resolve_stability_count_usize(turtle_soup.nickname_stable_count);
+        turtle_soup.content_stable_count =
+            app.resolve_stability_count_usize(turtle_soup.content_stable_count);
+        let ai_request_timeout = Duration::from_millis(app.timing.external.ai_request_timeout_ms);
+
+        Ok(Self {
+            app,
+            player_runtime,
+            ocr,
+            chat_templates,
+            ui_templates,
+            friend_delivery,
+            hall,
+            moderation,
+            startup,
+            secondary_unread,
+            invite,
+            turtle_soup,
+            ai_request_timeout,
+        })
+    }
+
+    pub(crate) const fn app(&self) -> &AppConfig {
+        &self.app
+    }
+}
 
 fn receive_observation_frame(
     subscription: &FrameDemandSubscription,
@@ -167,75 +360,11 @@ struct SecondaryBubbleProcessOutcome {
     ocr_pending: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum QueuePushOutcome {
-    Added(usize),
-    Full,
-    DedupLimited,
-}
-
-#[derive(Clone, Copy)]
-struct QueuePushFeedback {
-    queued_action: &'static str,
-    full_action: &'static str,
-    queued_prefix: &'static str,
-    full_reply: &'static str,
-}
-
-const QUEUE_PUSH_FEEDBACK: QueuePushFeedback = QueuePushFeedback {
-    queued_action: "queue",
-    full_action: "queue-full",
-    queued_prefix: "队列已加入",
-    full_reply: "队列已满，请稍后再试",
-};
-
-const UNKNOWN_STATUS_QUEUE_PUSH_FEEDBACK: QueuePushFeedback = QueuePushFeedback {
-    queued_action: "queue-status-unknown",
-    full_action: "queue-full-status-unknown",
-    queued_prefix: "状态未知，队列已加入",
-    full_reply: "状态未知且队列已满，请稍后再试",
-};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum UserDecision {
-    Confirm,
-    Skip,
-    SwitchSource,
-    Ai,
-    Timeout,
-    Stopped,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum PlayerSearchResolution<T> {
-    Found(T),
-    NoSource,
-    Failed(PlayerSearchClientError),
-}
-
-fn classify_player_search<T>(
-    result: std::result::Result<Option<T>, PlayerSearchClientError>,
-) -> PlayerSearchResolution<T> {
-    match result {
-        Ok(Some(value)) => PlayerSearchResolution::Found(value),
-        Ok(None) => PlayerSearchResolution::NoSource,
-        Err(error) => PlayerSearchResolution::Failed(error),
-    }
-}
-
-fn player_search_failure_reply(error: &PlayerSearchClientError) -> &'static str {
-    match error {
-        PlayerSearchClientError::QueueFull => "歌曲搜索繁忙，请稍后再试",
-        PlayerSearchClientError::RuntimeStopped
-        | PlayerSearchClientError::OperationIdExhausted
-        | PlayerSearchClientError::NotRun { .. } => "歌曲搜索服务暂不可用，请稍后再试",
-        PlayerSearchClientError::Failed(_) => "歌曲搜索后端失败，请稍后再试",
-        PlayerSearchClientError::UnexpectedOutcome(_) => "歌曲搜索后端返回异常，请稍后再试",
-    }
-}
-
 pub(crate) struct ApplicationRuntime {
     config: AppConfig,
+    ocr_args: ResolvedOcrArgs,
+    chat_templates: ResolvedTemplateArgs,
+    ui_templates: ResolvedUiTemplateArgs,
     http_server: Option<http::HttpServer>,
     hotkeys: Option<hotkeys::HotkeyRuntime>,
     game_ui: GameUi,
@@ -253,12 +382,13 @@ pub(crate) struct ApplicationRuntime {
     business_runtime: Option<BusinessRuntimeGroup>,
     formal_task_execution: Option<FormalTaskExecutionRuntime>,
     formal_tasks: Option<FormalTaskClient>,
-    player: PlayerController<PlayerRuntimeBackend>,
+    player: PlayerController<PlayerRuntimeBackend, BusinessPlaybackStateAdapter>,
+    playback_application: PlaybackApplication,
     player_search: PlayerSearchClient,
     player_runtime: Option<PlayerRuntime>,
     openai_runtime: Option<OpenAiRuntime>,
     ai: AiClient,
-    song_review: SongReviewClient,
+    song_requests: SongRequestApplication,
     chat_output: ChatOutput,
     ocr: OcrRuntimeHandle,
     ocr_runtime: Option<OcrRuntime>,
@@ -267,7 +397,14 @@ pub(crate) struct ApplicationRuntime {
     window_detection_signal: WindowDetectionSignal,
     screen_lock_primed: Arc<AtomicBool>,
     reset_locks_requested: Arc<AtomicBool>,
+    card_games: CardGameApplication,
+    administration_application: AdministrationApplication,
+    hall_application: HallApplication,
+    idiom_chain_application: IdiomChainApplication,
+    turtle_soup_application: TurtleSoupApplication,
+    undercover_game: UndercoverApplication,
     moderation: ModerationService,
+    moderation_workers: Arc<Mutex<Vec<thread::JoinHandle<()>>>>,
     startup: StartupService,
     custom_workflow: CustomWorkflowService,
     running: Arc<AtomicBool>,
@@ -277,260 +414,62 @@ pub(crate) struct ApplicationRuntime {
     monitor: MonitorShared,
 }
 
+#[derive(Clone)]
+struct BusinessPlaybackStateAdapter {
+    business: BusinessRuntimeHandle,
+}
+
+impl BusinessPlaybackStateAdapter {
+    fn new(business: BusinessRuntimeHandle) -> Self {
+        Self { business }
+    }
+}
+
+impl PlaybackStatePort for BusinessPlaybackStateAdapter {
+    fn snapshot(&self) -> Result<PlaybackRuntimeState> {
+        self.business
+            .playback_state_snapshot()
+            .map_err(anyhow::Error::from)
+    }
+
+    fn update(&self, update: PlaybackStateUpdate) -> Result<bool> {
+        self.business
+            .update_playback_state(update)
+            .map_err(anyhow::Error::from)
+    }
+
+    fn song_dedup_limited(&self, candidate: SongDedupCandidate) -> Result<bool> {
+        self.business
+            .song_dedup_limited(candidate)
+            .map_err(anyhow::Error::from)
+    }
+
+    fn record_song_dedup(&self, candidate: SongDedupCandidate) -> Result<()> {
+        self.business
+            .record_song_dedup(candidate)
+            .map_err(anyhow::Error::from)
+    }
+
+    fn observe_external_playback(
+        &self,
+        identity: String,
+        now: Instant,
+        protect_after: Duration,
+    ) -> Result<ExternalPlaybackObservation> {
+        self.business
+            .observe_external_playback(identity, now, protect_after)
+            .map_err(anyhow::Error::from)
+    }
+
+    fn clear_external_playback_tracker(&self) -> Result<()> {
+        self.business
+            .clear_external_playback_tracker()
+            .map_err(anyhow::Error::from)
+    }
+}
+
 struct DeferredCardGamePort<'a> {
     app: &'a ApplicationRuntime,
-}
-
-pub(crate) struct QueuedCardGameEffect {
-    business: BusinessRuntimeHandle,
-    action: &'static str,
-    request: CardGameEffectRequest,
-}
-
-impl QueuedCardGameEffect {
-    pub(crate) fn new(
-        business: BusinessRuntimeHandle,
-        action: &'static str,
-        request: CardGameEffectRequest,
-    ) -> Self {
-        Self {
-            business,
-            action,
-            request,
-        }
-    }
-
-    fn label(&self) -> String {
-        format!("发送牌局计时结果({})", self.action)
-    }
-
-    fn execute(self, port: &dyn CardGameDeliveryPort) -> Result<()> {
-        drive_card_game_effect_chain(
-            &self.business,
-            self.request,
-            CardGameEffectLane::Formal,
-            CardGameLatePolicy::Ignore,
-            port,
-        )
-    }
-
-    fn cancel(&self) -> Result<()> {
-        let _ = self.business.cancel_card_game_effect(self.request.key)?;
-        Ok(())
-    }
-}
-
-#[derive(Clone, Copy)]
-enum CardGameLatePolicy {
-    Error,
-    Ignore,
-}
-
-fn drive_card_game_start(
-    business: &BusinessRuntimeHandle,
-    start: CardGameCommandStart,
-    expected_lane: CardGameEffectLane,
-    port: &dyn CardGameDeliveryPort,
-) -> Result<()> {
-    match start {
-        CardGameCommandStart::Completed(_) => Ok(()),
-        CardGameCommandStart::Suspended(request) => drive_card_game_effect_chain(
-            business,
-            request,
-            expected_lane,
-            CardGameLatePolicy::Error,
-            port,
-        ),
-    }
-}
-
-fn drive_card_game_effect_chain(
-    business: &BusinessRuntimeHandle,
-    mut request: CardGameEffectRequest,
-    expected_lane: CardGameEffectLane,
-    late_policy: CardGameLatePolicy,
-    port: &dyn CardGameDeliveryPort,
-) -> Result<()> {
-    loop {
-        if request.lane != expected_lane {
-            let _ = business.cancel_card_game_effect(request.key);
-            bail!(
-                "牌局效果通道不一致: expected={expected_lane:?} actual={:?}",
-                request.lane
-            );
-        }
-        match business.claim_card_game_effect(request.key)? {
-            CardGameEffectClaim::Claimed => {}
-            CardGameEffectClaim::Late(_) => return handle_late_card_game_effect(late_policy),
-        }
-        let key = request.key;
-        let result = match request.effect {
-            CardGameEffect::FriendVerify { player, message } => {
-                CardGameEffectResult::FriendVerify(run_card_game_delivery("好友验证", || {
-                    port.verify_friend(&player, &message)
-                }))
-            }
-            CardGameEffect::PrivateDelivery { player, message } => {
-                CardGameEffectResult::PrivateDelivery(run_card_game_delivery(
-                    "好友消息发送",
-                    || port.send_friend(&player, &message),
-                ))
-            }
-            CardGameEffect::PrivateBatch { deliveries } => CardGameEffectResult::PrivateBatch(
-                run_card_game_delivery("好友批量消息发送", || {
-                    port.send_friend_batch(&deliveries)
-                }),
-            ),
-            CardGameEffect::HallDelivery { message } => CardGameEffectResult::HallDelivery(
-                run_card_game_delivery("大厅消息发送", || port.send_hall(&message)),
-            ),
-        };
-        match business.resume_card_game(key, result)? {
-            CardGameResume::Completed(_) => return Ok(()),
-            CardGameResume::Suspended(next) => request = next,
-            CardGameResume::Late(_) => return handle_late_card_game_effect(late_policy),
-        }
-    }
-}
-
-fn run_card_game_delivery<T>(label: &str, delivery: impl FnOnce() -> Result<T>) -> Result<T> {
-    match catch_unwind(AssertUnwindSafe(delivery)) {
-        Ok(result) => result,
-        Err(_) => Err(anyhow!("牌局{label}发生未捕获异常")),
-    }
-}
-
-fn handle_late_card_game_effect(policy: CardGameLatePolicy) -> Result<()> {
-    match policy {
-        CardGameLatePolicy::Ignore => Ok(()),
-        CardGameLatePolicy::Error => bail!("牌局命令在效果链完成前已失效"),
-    }
-}
-
-pub(crate) struct QueuedUndercoverEffect {
-    business: BusinessRuntimeHandle,
-    action: &'static str,
-    request: UndercoverEffectRequest,
-}
-
-impl QueuedUndercoverEffect {
-    fn new(
-        business: BusinessRuntimeHandle,
-        action: &'static str,
-        request: UndercoverEffectRequest,
-    ) -> Self {
-        Self {
-            business,
-            action,
-            request,
-        }
-    }
-
-    fn label(&self) -> String {
-        format!("发送谁是卧底效果({})", self.action)
-    }
-
-    fn execute(self, port: &dyn UndercoverDeliveryPort) -> Result<()> {
-        drive_undercover_effect_chain(
-            &self.business,
-            self.request,
-            UndercoverEffectLane::Deferred,
-            UndercoverLatePolicy::Ignore,
-            port,
-        )
-    }
-
-    fn cancel(&self) -> Result<()> {
-        Ok(self.business.cancel_undercover_effect(self.request.key)?)
-    }
-}
-
-#[derive(Clone, Copy)]
-enum UndercoverLatePolicy {
-    Error,
-    Ignore,
-}
-
-fn drive_undercover_start(
-    business: &BusinessRuntimeHandle,
-    start: UndercoverCommandStart,
-    port: &dyn UndercoverDeliveryPort,
-) -> Result<()> {
-    match start {
-        UndercoverCommandStart::Completed(_) => Ok(()),
-        UndercoverCommandStart::Suspended(request) => drive_undercover_effect_chain(
-            business,
-            request,
-            UndercoverEffectLane::Formal,
-            UndercoverLatePolicy::Error,
-            port,
-        ),
-    }
-}
-
-fn drive_undercover_effect_chain(
-    business: &BusinessRuntimeHandle,
-    mut request: UndercoverEffectRequest,
-    expected_lane: UndercoverEffectLane,
-    late_policy: UndercoverLatePolicy,
-    port: &dyn UndercoverDeliveryPort,
-) -> Result<()> {
-    loop {
-        if request.lane != expected_lane {
-            let _ = business.cancel_undercover_effect(request.key);
-            bail!(
-                "谁是卧底效果通道不一致: expected={expected_lane:?} actual={:?}",
-                request.lane
-            );
-        }
-        match business.claim_undercover_effect(request.key)? {
-            UndercoverEffectClaim::Claimed => {}
-            UndercoverEffectClaim::Late(_) => return handle_late_undercover_effect(late_policy),
-        }
-        let key = request.key;
-        let result = match request.effect {
-            UndercoverEffect::FriendVerify { player, message } => {
-                UndercoverEffectResult::FriendVerify(run_undercover_delivery(
-                    "好友验证",
-                    || port.verify_friend(&player, &message),
-                ))
-            }
-            UndercoverEffect::FriendBatch { deliveries } => UndercoverEffectResult::FriendBatch(
-                run_undercover_delivery("好友私密批次发送", || {
-                    port.send_friend_batch(&deliveries)
-                }),
-            ),
-            UndercoverEffect::Hall { message } => {
-                UndercoverEffectResult::Hall(run_undercover_delivery("大厅消息发送", || {
-                    port.send_hall(&message)
-                }))
-            }
-            UndercoverEffect::HallBatch { messages } => UndercoverEffectResult::HallBatch(
-                run_undercover_delivery("大厅批量消息发送", || {
-                    port.send_hall_batch(&messages)
-                }),
-            ),
-        };
-        match business.resume_undercover(key, result)? {
-            UndercoverResume::Completed(_) => return Ok(()),
-            UndercoverResume::Suspended(next) => request = next,
-            UndercoverResume::Late(_) => return handle_late_undercover_effect(late_policy),
-        }
-    }
-}
-
-fn run_undercover_delivery<T>(label: &str, delivery: impl FnOnce() -> Result<T>) -> Result<T> {
-    match catch_unwind(AssertUnwindSafe(delivery)) {
-        Ok(result) => result,
-        Err(_) => Err(anyhow!("谁是卧底{label}发生未捕获异常")),
-    }
-}
-
-fn handle_late_undercover_effect(policy: UndercoverLatePolicy) -> Result<()> {
-    match policy {
-        UndercoverLatePolicy::Ignore => Ok(()),
-        UndercoverLatePolicy::Error => bail!("谁是卧底命令在效果链完成前已失效"),
-    }
 }
 
 impl CardGameDeliveryPort for DeferredCardGamePort<'_> {
@@ -602,17 +541,6 @@ impl WindowDetectionSignal {
     }
 }
 
-#[derive(Clone, Debug)]
-struct ResolvedSongRequest {
-    keyword: String,
-    source: String,
-    prefer_accompaniment: bool,
-    ai_original_text: String,
-    uri: String,
-    friend_username: String,
-    console_bypass_dedup: bool,
-}
-
 pub(crate) enum PendingTask {
     Command(Box<PendingCommand>),
     AdvanceQueue {
@@ -633,8 +561,8 @@ pub(crate) enum PendingTask {
         discard_only: bool,
     },
     RestoreSecondaryHall,
-    CardGameEffect(QueuedCardGameEffect),
-    UndercoverEffect(QueuedUndercoverEffect),
+    CardGameEffect(CardGameEffectTask),
+    UndercoverEffect(UndercoverEffectTask),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -674,10 +602,10 @@ impl PendingTask {
 
     fn label(&self) -> String {
         match self {
-            Self::Command(pending) if pending.parsed.message_type == "控制台" => {
-                format!("控制台命令: {}", pending.parsed.raw)
+            Self::Command(pending) if pending.routed.message_type == "控制台" => {
+                format!("控制台命令: {}", pending.routed.raw)
             }
-            Self::Command(pending) => pending.parsed.raw.clone(),
+            Self::Command(pending) => pending.routed.raw.clone(),
             Self::AdvanceQueue { reason } => format!("自动出队({})", reason),
             Self::ConsoleChat { text, prefix } => {
                 format!("控制台发言: {}{}", prefix, text)
@@ -721,9 +649,9 @@ impl PendingTask {
         match self {
             Self::AdvanceQueue { .. } => true,
             Self::Command(pending) => matches!(
-                &pending.parsed.command,
-                BusinessIntent::SongRequest(_)
-                    | BusinessIntent::Playback(
+                &pending.routed.command,
+                ModuleCommand::SongRequest(_)
+                    | ModuleCommand::Playback(
                         PlaybackCommand::Pause
                             | PlaybackCommand::Resume
                             | PlaybackCommand::Play
@@ -754,16 +682,13 @@ enum UiResidency {
 enum ResidencyPurpose {
     ListenerModeSwitch,
     IndependentRecovery(&'static str),
-    DecisionObservation(&'static str),
-    CustomWorkflowStep,
 }
 
 impl ResidencyPurpose {
     const fn label(self) -> &'static str {
         match self {
             Self::ListenerModeSwitch => "切换聊天监听模式",
-            Self::IndependentRecovery(context) | Self::DecisionObservation(context) => context,
-            Self::CustomWorkflowStep => "自定义流程显式驻留步骤",
+            Self::IndependentRecovery(context) => context,
         }
     }
 }
@@ -774,10 +699,6 @@ fn listener_residency(mode: ChatListenerMode, temporary_primary: bool) -> UiResi
     } else {
         UiResidency::Primary
     }
-}
-
-fn idiom_command_requires_executor(command: &idiom_chain::IdiomChainCommand) -> bool {
-    matches!(command, idiom_chain::IdiomChainCommand::Explain(_))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -859,25 +780,73 @@ impl Drop for ConsoleReplyContextGuard {
 }
 
 impl ApplicationRuntime {
-    pub(crate) fn new(
-        config: AppConfig,
-        runtime_state: PersistentRuntimeState,
-        queue: PersistentQueue,
-        song_dedup_history: PersistentSongDedupHistory,
-        monitor: MonitorShared,
-    ) -> Result<Self> {
-        let player_runtime_config = config
-            .player_runtime_config()
-            .context("校验播放器运行时配置")?;
+    pub(crate) fn new(config: ResolvedApplicationConfig, monitor: MonitorShared) -> Result<Self> {
+        let ResolvedApplicationConfig {
+            app: config,
+            player_runtime: player_runtime_config,
+            ocr: ocr_args,
+            chat_templates,
+            ui_templates,
+            friend_delivery: friend_delivery_config,
+            hall: hall_config,
+            moderation: moderation_config,
+            startup: startup_config,
+            secondary_unread: secondary_unread_config,
+            invite: invite_config,
+            turtle_soup: turtle_soup_config,
+            ai_request_timeout,
+        } = config;
+        let system_clock = Arc::new(SystemClock);
+        let ocr_device = ProductionOcrDevice::new(ocr_args.clone())?;
+        let feeluown = FeelUOwnClient::new(&config.feeluown, &config.timing);
+        let idiom_chain = IdiomChainService::load(config.idiom_chain.clone())?;
+        if config.idiom_chain.enabled {
+            log::info!("已加载成语接龙词库: {} 条", idiom_chain.lexicon_len());
+        }
+        let landlord = CardGameService::new(config.landlord.clone());
+        let undercover = UndercoverRuntimeService::new(config.undercover.clone());
+        let hall = HallStateService::load(
+            config.state.hall_state_path.clone(),
+            system_clock.clone(),
+            system_clock.clone(),
+        )?;
+        let playback = PlaybackService::load(
+            config.state.queue_path.clone(),
+            config.state.playback_state_path.clone(),
+            config.song_dedup.history_path.clone(),
+            config.queue.max_size,
+            config.song_dedup.clone(),
+            system_clock.clone(),
+        )?;
+        let moderation_policy = ModerationPolicy::new(
+            Duration::from_millis(config.timing.moderation.vote_timeout_ms),
+            Duration::from_millis(config.timing.moderation.vote_poll_ms),
+            config.moderation.stable_vote_samples,
+            config.moderation.required_vote_margin,
+        );
+        let custom_workflow = CustomWorkflowService::new(
+            config.custom_workflows.clone(),
+            WorkflowDefaults {
+                default_timeout_ms: config.timing.workflow.default_timeout_ms,
+                default_poll_ms: config.timing.workflow.default_poll_ms,
+                default_step_wait_ms: config.timing.workflow.default_step_wait_ms,
+                decision_timeout_ms: config.timing.decision.timeout_ms,
+                decision_poll_ms: config.timing.decision.poll_ms,
+                after_activate_ms: config.timing.input.after_activate_ms,
+                clipboard_hold_ms: config.timing.input.text_ms,
+                stability_mean_threshold: config.ocr.change_mean_threshold,
+                stability_changed_ratio_threshold: config.ocr.change_pixel_threshold,
+            },
+        );
+        let chat_observations = ChatObservationShared::new(
+            config.ocr.change_mean_threshold,
+            config.ocr.change_pixel_threshold,
+        );
+        let running = Arc::new(AtomicBool::new(true));
         let business_runtime_builder =
             BusinessRuntimeGroupBuilder::start(DEADLINE_RUNTIME_QUEUE_CAPACITY)?;
-        let ocr_args = OcrArgs::default().resolve(&config);
-        let ocr_runtime = OcrRuntime::start(
-            ProductionOcrDevice::new(ocr_args)?,
-            OCR_RUNTIME_QUEUE_CAPACITY,
-        )?;
+        let ocr_runtime = OcrRuntime::start(ocr_device, OCR_RUNTIME_QUEUE_CAPACITY)?;
         let ocr = ocr_runtime.handle();
-        let feeluown = FeelUOwnClient::new(&config.feeluown, &config.timing);
         let player_runtime = PlayerRuntime::start(
             feeluown.clone(),
             feeluown.clone(),
@@ -890,7 +859,6 @@ impl ApplicationRuntime {
             player_runtime_handle.clone(),
             BusinessOperationIdAllocator::new(),
         );
-        let running = Arc::new(AtomicBool::new(true));
         let ui_runtime = UiRuntime::start_with_progress(
             WindowsUiDevice::new(config.window.clone()),
             UI_RUNTIME_QUEUE_CAPACITY,
@@ -898,46 +866,58 @@ impl ApplicationRuntime {
         )?;
         let ui_handle = ui_runtime.handle();
         let game_ui = GameUi::runtime(ui_handle.clone());
-        let residency_ui = ResidencyUi::new(ui_handle.clone(), ocr.clone(), &config);
-        let hall_ui = HallUi::new(ui_handle.clone(), ocr.clone(), &config);
-        let moderation_ui = ModerationUi::new(ui_handle.clone(), &config);
-        let startup_ui = StartupUi::new(ui_handle.clone(), ocr.clone(), &config);
-        let secondary_unread_ui = SecondaryUnreadUi::new(ui_handle.clone(), ocr.clone(), &config);
-        let friend_delivery_ui = FriendDeliveryUi::new(ui_handle.clone(), ocr.clone(), &config);
-        let hall_batch_ui = HallBatchUi::new(ui_handle.clone(), ocr.clone(), &config);
-        let invite_ui = InviteUi::new(ui_handle.clone(), ocr.clone(), &config);
-        let custom_action_ui =
-            CustomActionUi::new(ui_handle, ocr.clone(), running.clone(), &config);
+        let residency_ui = ResidencyUi::new(
+            ui_handle.clone(),
+            ocr.clone(),
+            friend_delivery_config.clone(),
+        );
+        let hall_ui = HallUi::new(ui_handle.clone(), ocr.clone(), hall_config);
+        let moderation_ui = ModerationUi::new(ui_handle.clone(), moderation_config);
+        let startup_ui = StartupUi::new(ui_handle.clone(), ocr.clone(), startup_config);
+        let secondary_unread_ui =
+            SecondaryUnreadUi::new(ui_handle.clone(), ocr.clone(), secondary_unread_config);
+        let friend_delivery_ui = FriendDeliveryUi::new(
+            ui_handle.clone(),
+            ocr.clone(),
+            friend_delivery_config.clone(),
+        );
+        let hall_batch_ui = HallBatchUi::new(
+            ui_handle.clone(),
+            ocr.clone(),
+            friend_delivery_config.clone(),
+        );
+        let invite_ui = InviteUi::new(ui_handle.clone(), ocr.clone(), invite_config);
+        let custom_action_ui = CustomActionUi::new(
+            ui_handle,
+            ocr.clone(),
+            running.clone(),
+            config.screen.expected_width,
+            config.screen.expected_height,
+            friend_delivery_config,
+        );
         let openai_runtime = OpenAiRuntime::start().context("启动 OpenAI runtime")?;
         let openai = openai_runtime.handle();
-        let ai = AiClient::new(&config.ai, &config.timing, openai.clone());
-        let song_review =
-            SongReviewClient::new(&config.song_review, &config.timing, openai.clone());
+        let ai = AiClient::new(&config.ai, ai_request_timeout, openai.clone());
+        let song_review = SongReviewClient::new(
+            &config.song_review,
+            ai_request_timeout,
+            openai.clone(),
+            system_clock.clone(),
+        );
+        let song_requests = SongRequestApplication::new(
+            ai.clone(),
+            song_review,
+            config.queue.max_size,
+            config.song_dedup.console_bypass,
+        );
         let chat_output = ChatOutput::new(&config.output, hall_batch_ui);
-        let idiom_chain = IdiomChainService::load(config.idiom_chain.clone())?;
-        if config.idiom_chain.enabled {
-            log::info!("已加载成语接龙词库: {} 条", idiom_chain.lexicon_len());
-        }
-        let landlord = CardGameService::new(config.landlord.clone());
-        let undercover = UndercoverRuntimeService::new(config.undercover.clone());
-        let mut turtle_soup_config = config.turtle_soup.clone();
-        turtle_soup_config.nickname_stable_count =
-            config.resolve_stability_count_usize(turtle_soup_config.nickname_stable_count);
-        turtle_soup_config.content_stable_count =
-            config.resolve_stability_count_usize(turtle_soup_config.content_stable_count);
-        let turtle_soup = TurtleSoupService::new(turtle_soup_config, openai);
-        let chat_observations = ChatObservationShared::new(
-            config.ocr.change_mean_threshold,
-            config.ocr.change_pixel_threshold,
+        let turtle_soup = TurtleSoupService::new(
+            turtle_soup_config,
+            openai,
+            system_clock.clone(),
+            system_clock.clone(),
         );
         let business_timer = business_runtime_builder.handle();
-        let playback = PlaybackService::new(
-            queue,
-            runtime_state,
-            song_dedup_history,
-            config.matching.clone(),
-            config.song_dedup.clone(),
-        );
         let business_runtime = business_runtime_builder.build_with(|| {
             BusinessRuntime::start_with_timer_and_modules_and_state_sink(
                 BUSINESS_RUNTIME_QUEUE_CAPACITY,
@@ -946,40 +926,46 @@ impl ApplicationRuntime {
                     landlord,
                     undercover,
                     turtle_soup,
+                    hall,
                     playback,
                     InviteService::new(),
                     business_timer,
                     Arc::new(monitor.clone()),
+                    system_clock.clone(),
                 ),
             )
         })?;
         let business = business_runtime.business_handle();
         let business_events = business_runtime.event_sink();
+        let card_games = CardGameApplication::new(Arc::new(business.clone()));
+        let undercover_game = UndercoverApplication::new(Arc::new(business.clone()));
         let player = PlayerController::new(
             PlayerRuntimeBackend::new(player_runtime_handle),
-            business.clone(),
+            BusinessPlaybackStateAdapter::new(business.clone()),
             &config.timing.playback,
             &config.queue,
             &config.matching,
+            PlaybackTimePorts::new(system_clock.clone(), system_clock.clone(), system_clock),
         );
-        let moderation = ModerationService::new(
-            ModerationPolicy::new(
-                Duration::from_millis(config.timing.moderation.vote_timeout_ms),
-                Duration::from_millis(config.timing.moderation.vote_poll_ms),
-                config.moderation.stable_vote_samples,
-                config.moderation.required_vote_margin,
-            ),
-            Arc::new(business.clone()),
-        );
-        let custom_workflow = service_from_config_parts(
-            &config.custom_workflows,
-            &config.timing.workflow,
-            &config.timing.decision,
-            &config.timing.input,
-            &config.ocr,
-        );
+        let playback_application = PlaybackApplication::new(PlaybackApplicationConfig {
+            console_bypass_dedup: config.song_dedup.console_bypass,
+            queue_max_size: config.queue.max_size,
+            skip_status_initial_ms: config.timing.playback.skip_status_initial_ms,
+            skip_status_poll_ms: config.timing.playback.skip_status_poll_ms,
+            skip_status_retries: config.timing.playback.skip_status_retries,
+            monitor_tick_ms: config.timing.playback.monitor_tick_ms,
+            monitor_status_ms: config.timing.playback.monitor_status_ms,
+        });
+        let administration_application =
+            AdministrationApplication::new(config.timing.command.help_batch_ms);
+        let idiom_chain_application =
+            IdiomChainApplication::new(config.timing.command.help_batch_ms);
+        let moderation = ModerationService::new(moderation_policy, Arc::new(business.clone()));
         Ok(Self {
             config,
+            ocr_args,
+            chat_templates,
+            ui_templates,
             http_server: None,
             hotkeys: None,
             game_ui,
@@ -998,11 +984,12 @@ impl ApplicationRuntime {
             formal_task_execution: None,
             formal_tasks: None,
             player,
+            playback_application,
             player_search,
             player_runtime: Some(player_runtime),
             openai_runtime: Some(openai_runtime),
             ai,
-            song_review,
+            song_requests,
             chat_output,
             ocr,
             ocr_runtime: Some(ocr_runtime),
@@ -1011,7 +998,14 @@ impl ApplicationRuntime {
             window_detection_signal: WindowDetectionSignal::new(),
             screen_lock_primed: Arc::new(AtomicBool::new(false)),
             reset_locks_requested: Arc::new(AtomicBool::new(false)),
+            card_games,
+            administration_application,
+            hall_application: HallApplication,
+            idiom_chain_application,
+            turtle_soup_application: TurtleSoupApplication,
+            undercover_game,
             moderation,
+            moderation_workers: Arc::new(Mutex::new(Vec::new())),
             startup: StartupService::new(),
             custom_workflow,
             running,
@@ -1020,31 +1014,6 @@ impl ApplicationRuntime {
             chat_observations,
             monitor,
         })
-    }
-}
-
-fn ai_candidate_source(song: &SongCommand) -> &'static str {
-    if song.friend_username.trim().is_empty() {
-        "qqmusic,netease"
-    } else {
-        song.source.as_str()
-    }
-}
-
-fn song_label(song: &SongCommand) -> String {
-    source_label(&song.friend_username)
-}
-
-fn request_label(request: &ResolvedSongRequest) -> String {
-    source_label(&request.friend_username)
-}
-
-fn source_label(username: &str) -> String {
-    let username = username.trim();
-    if username.is_empty() {
-        String::new()
-    } else {
-        format!("好友{}:", username)
     }
 }
 
@@ -1076,25 +1045,25 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (year, month as u32, day as u32)
 }
 
-fn command_username(parsed: &ParsedCommand) -> &str {
+fn command_username(parsed: &RoutedCommand) -> &str {
     match &parsed.command {
-        BusinessIntent::SongRequest(song) if !song.friend_username.trim().is_empty() => {
+        ModuleCommand::SongRequest(song) if !song.friend_username.trim().is_empty() => {
             &song.friend_username
         }
         _ => &parsed.username,
     }
 }
 
-fn is_private_undercover_input(parsed: &ParsedCommand) -> bool {
+fn is_private_undercover_input(parsed: &RoutedCommand) -> bool {
     matches!(
         &parsed.command,
-        BusinessIntent::Undercover(UndercoverCommand::Vote(_))
+        ModuleCommand::Undercover(UndercoverCommand::Vote(_))
     )
 }
 
-fn private_safe_command_log(parsed: &ParsedCommand) -> &str {
+fn private_safe_command_log(parsed: &RoutedCommand) -> &str {
     match &parsed.command {
-        BusinessIntent::Undercover(UndercoverCommand::Vote(_)) => "谁是卧底投票",
+        ModuleCommand::Undercover(UndercoverCommand::Vote(_)) => "谁是卧底投票",
         _ => &parsed.raw,
     }
 }
@@ -1113,107 +1082,6 @@ fn command_log_field(value: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ")
         .replace('-', "_")
-}
-
-fn song_review_level_text(level: Option<u8>) -> String {
-    level
-        .map(|level| level.to_string())
-        .unwrap_or_else(|| "无".to_string())
-}
-
-fn normalized_review_reason(reason: &str) -> String {
-    let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
-    if reason.trim().is_empty() {
-        "审核服务未给出原因".to_string()
-    } else {
-        reason
-    }
-}
-
-fn review_reject_reply(reason: &str, max_chars: usize) -> String {
-    let reason = normalized_review_reason(reason);
-    let max_chars = max_chars.max(1);
-    let shortened = if reason.chars().count() > max_chars {
-        format!("{}...", reason.chars().take(max_chars).collect::<String>())
-    } else {
-        reason
-    };
-    format!("点歌未通过审核: {shortened}")
-}
-
-fn final_song_command_text(request: &ResolvedSongRequest, action: &str) -> String {
-    let source = if request.source.trim().is_empty() {
-        "all"
-    } else {
-        request.source.trim()
-    };
-    format!(
-        "{} keyword={} source={} uri={} aiOriginal={}",
-        action, request.keyword, source, request.uri, request.ai_original_text,
-    )
-}
-
-fn parse_decision_command(text: &str) -> Option<UserDecision> {
-    let raw = text.trim();
-    let command_text = if let Some(index) = raw.find(['：', ':', ']', '】']) {
-        let sep_len = raw[index..].chars().next().map(char::len_utf8).unwrap_or(1);
-        &raw[index + sep_len..]
-    } else {
-        raw
-    }
-    .trim_start_matches(['：', ':', ' ', '\t', ']', '】']);
-    if command::strip_ascii_case_prefix(command_text, "@确认")
-        .is_some_and(|rest| decision_boundary(rest.chars().next()))
-    {
-        Some(UserDecision::Confirm)
-    } else if command::strip_ascii_case_prefix(command_text, "@跳过")
-        .is_some_and(|rest| decision_boundary(rest.chars().next()))
-    {
-        Some(UserDecision::Skip)
-    } else if command::strip_ascii_case_prefix(command_text, "@换源")
-        .is_some_and(|rest| decision_boundary(rest.chars().next()))
-    {
-        Some(UserDecision::SwitchSource)
-    } else if command::strip_ascii_case_prefix(command_text, "@AI")
-        .is_some_and(|rest| decision_boundary(rest.chars().next()))
-    {
-        Some(UserDecision::Ai)
-    } else {
-        None
-    }
-}
-
-fn is_decision_feedback_text(text: &str) -> bool {
-    [
-        "匹配失败",
-        "AI自动匹配",
-        "换源结果",
-        "换源到",
-        "换源后仍无音源",
-        "下次可以尝试",
-        "如非预期",
-        "命令已超时",
-        "搜索到:",
-        "AI匹配:",
-        "AI匹配中",
-        "AI点歌未启用",
-        "AI点歌识别失败",
-    ]
-    .iter()
-    .any(|pattern| text.contains(pattern))
-}
-
-fn decision_boundary(ch: Option<char>) -> bool {
-    match ch {
-        None => true,
-        Some(ch) => {
-            ch.is_whitespace()
-                || matches!(
-                    ch,
-                    '，' | ',' | '。' | '.' | '!' | '！' | '?' | '？' | ']' | '】'
-                )
-        }
-    }
 }
 
 fn elapsed_ms(started: Instant) -> u128 {
@@ -1303,87 +1171,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn player_search_queue_full_aborts_without_no_source_follow_up() {
-        let resolution: PlayerSearchResolution<()> =
-            classify_player_search(Err(PlayerSearchClientError::QueueFull));
-
-        assert!(matches!(
-            resolution,
-            PlayerSearchResolution::Failed(PlayerSearchClientError::QueueFull)
-        ));
-        let reply = player_search_failure_reply(&PlayerSearchClientError::QueueFull);
-        assert_eq!(reply, "歌曲搜索繁忙，请稍后再试");
-        assert!(!reply.contains("无音源"));
-        assert!(!reply.contains("换源"));
-        assert!(!reply.contains("AI"));
-    }
-
-    #[test]
-    fn player_search_only_classifies_successful_empty_results_as_no_source() {
-        assert_eq!(
-            classify_player_search::<()>(Ok(None)),
-            PlayerSearchResolution::NoSource
-        );
-        assert_eq!(
-            classify_player_search(Ok(Some("candidate"))),
-            PlayerSearchResolution::Found("candidate")
-        );
-        let empty_candidates = Ok::<_, PlayerSearchClientError>(Vec::<u8>::new())
-            .map(|candidates| (!candidates.is_empty()).then_some(candidates));
-        assert_eq!(
-            classify_player_search(empty_candidates),
-            PlayerSearchResolution::NoSource
-        );
-    }
-
-    #[test]
-    fn player_search_failures_have_explicit_user_facing_categories() {
-        use crate::runtime::player_io::PlayerSearchError;
-
-        let cases = [
-            (
-                PlayerSearchClientError::QueueFull,
-                "歌曲搜索繁忙，请稍后再试",
-            ),
-            (
-                PlayerSearchClientError::RuntimeStopped,
-                "歌曲搜索服务暂不可用，请稍后再试",
-            ),
-            (
-                PlayerSearchClientError::OperationIdExhausted,
-                "歌曲搜索服务暂不可用，请稍后再试",
-            ),
-            (
-                PlayerSearchClientError::NotRun {
-                    reason: "shutdown".to_string(),
-                },
-                "歌曲搜索服务暂不可用，请稍后再试",
-            ),
-            (
-                PlayerSearchClientError::Failed(PlayerSearchError::new("backend failed")),
-                "歌曲搜索后端失败，请稍后再试",
-            ),
-            (
-                PlayerSearchClientError::UnexpectedOutcome("pick"),
-                "歌曲搜索后端返回异常，请稍后再试",
-            ),
-        ];
-
-        for (error, expected) in cases {
-            assert_eq!(player_search_failure_reply(&error), expected);
-            assert!(matches!(
-                classify_player_search::<()>(Err(error)),
-                PlayerSearchResolution::Failed(_)
-            ));
-        }
-    }
-
-    #[test]
-    fn parses_ai_decision_case_insensitive() {
-        assert_eq!(parse_decision_command("用户：@ai"), Some(UserDecision::Ai));
-    }
-
-    #[test]
     fn secondary_listener_resides_in_current_hall() {
         assert_eq!(
             listener_residency(ChatListenerMode::Secondary, false),
@@ -1422,15 +1209,14 @@ mod tests {
 
     #[test]
     fn idiom_explanation_uses_the_exclusive_command_executor() {
-        assert!(idiom_command_requires_executor(
-            &idiom_chain::IdiomChainCommand::Explain(Some("画蛇添足".to_string()))
-        ));
-        assert!(!idiom_command_requires_executor(
-            &idiom_chain::IdiomChainCommand::Hint
-        ));
-        assert!(!idiom_command_requires_executor(
-            &idiom_chain::IdiomChainCommand::Submit("足智多谋".to_string())
-        ));
+        assert!(
+            idiom_chain::IdiomChainCommand::Explain(Some("画蛇添足".to_string()))
+                .requires_executor()
+        );
+        assert!(!idiom_chain::IdiomChainCommand::Hint.requires_executor());
+        assert!(
+            !idiom_chain::IdiomChainCommand::Submit("足智多谋".to_string()).requires_executor()
+        );
     }
 
     #[test]
@@ -1533,13 +1319,10 @@ mod tests {
             .begin_card_game("甲", &LandlordCommand::Start, Instant::now())
             .unwrap();
 
-        let error = drive_card_game_start(
-            &business,
-            start,
-            CardGameEffectLane::Formal,
-            &FailingCardGamePort,
-        )
-        .unwrap_err();
+        let card_games = CardGameApplication::new(Arc::new(business.clone()));
+        let error = card_games
+            .drive_start(start, CardGameEffectLane::Formal, &FailingCardGamePort)
+            .unwrap_err();
 
         assert!(error.to_string().contains("test verification failed"));
         assert_eq!(business.active_entertainment().unwrap(), None);
@@ -1561,13 +1344,10 @@ mod tests {
             .begin_card_game("甲", &LandlordCommand::Start, Instant::now())
             .unwrap();
 
-        let error = drive_card_game_start(
-            &business,
-            start,
-            CardGameEffectLane::Formal,
-            &PanickingCardGamePort,
-        )
-        .unwrap_err();
+        let card_games = CardGameApplication::new(Arc::new(business.clone()));
+        let error = card_games
+            .drive_start(start, CardGameEffectLane::Formal, &PanickingCardGamePort)
+            .unwrap_err();
 
         assert!(error.to_string().contains("牌局好友验证发生未捕获异常"));
         assert_eq!(business.active_entertainment().unwrap(), None);
@@ -1593,16 +1373,18 @@ mod tests {
         };
         business.cancel_card_game_effect(request.key).unwrap();
 
-        let formal_error = drive_card_game_start(
-            &business,
-            CardGameCommandStart::Suspended(request.clone()),
-            CardGameEffectLane::Formal,
-            &NeverCalledCardGamePort,
-        )
-        .unwrap_err();
+        let card_games = CardGameApplication::new(Arc::new(business.clone()));
+        let formal_error = card_games
+            .drive_start(
+                CardGameCommandStart::Suspended(request.clone()),
+                CardGameEffectLane::Formal,
+                &NeverCalledCardGamePort,
+            )
+            .unwrap_err();
         assert!(formal_error.to_string().contains("已失效"));
 
-        QueuedCardGameEffect::new(business, "test-timeout", request)
+        card_games
+            .effect_task("test-timeout", request)
             .execute(&NeverCalledCardGamePort)
             .unwrap();
         runtime.shutdown().unwrap();

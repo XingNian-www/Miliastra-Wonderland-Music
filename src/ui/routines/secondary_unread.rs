@@ -168,6 +168,7 @@ fn process_unread(
             context,
             &config.residency,
             "confirm_secondary_unread_opened",
+            InputCertainty::AfterInputUnknown,
         )?;
         if !unread_hit_still_visible(&image, request.hit) {
             opened = true;
@@ -207,7 +208,12 @@ fn wait_bubble_stable(
     context: &mut UiRoutineContext<'_>,
     config: &SecondaryUnreadRoutineConfig,
 ) -> Result<(image::DynamicImage, Instant), UiRoutineFailure> {
-    let first = capture_normalized(context, &config.residency, "observe_secondary_bubble")?;
+    let first = capture_normalized(
+        context,
+        &config.residency,
+        "observe_secondary_bubble",
+        InputCertainty::AfterInputUnknown,
+    )?;
     let mut previous = latest_incoming_fingerprint(&first)
         .map_err(|error| before_input_failure("observe_secondary_bubble", error))?;
     let mut latest = first;
@@ -215,7 +221,12 @@ fn wait_bubble_stable(
     let deadline = Instant::now() + Duration::from_millis(BUBBLE_STABILITY_TIMEOUT_MS);
     while Instant::now() < deadline {
         sleep_ms(config.bubble_poll_ms);
-        let image = capture_normalized(context, &config.residency, "confirm_secondary_bubble")?;
+        let image = capture_normalized(
+            context,
+            &config.residency,
+            "confirm_secondary_bubble",
+            InputCertainty::AfterInputUnknown,
+        )?;
         let current = latest_incoming_fingerprint(&image)
             .map_err(|error| before_input_failure("confirm_secondary_bubble", error))?;
         captured_at = Instant::now();

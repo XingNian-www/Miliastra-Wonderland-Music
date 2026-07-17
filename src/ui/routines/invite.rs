@@ -4,11 +4,12 @@ use enigo::Key;
 
 use super::friend_delivery::{
     FriendDeliveryRoutineConfig, UiResidencyOutcome, UiResidencyTarget, before_input_failure,
-    capture_normalized, current_ui_is_primary, locate_stable_exact_text, open_friend_conversation,
-    restore_residency, send_current_chat_message, sleep_ms,
+    capture_normalized, current_ui_is_primary, open_friend_conversation, restore_residency,
+    send_current_chat_message, sleep_ms,
 };
 #[cfg(test)]
 use crate::config::AppConfig;
+use crate::observation::chat::secondary_hall_bubbles;
 use crate::runtime::ocr::OcrRuntimeHandle;
 use crate::runtime::ui::{
     InputCertainty, UiOperation, UiRoutine, UiRoutineContext, UiRoutineFailure, UiRuntimeHandle,
@@ -116,7 +117,6 @@ impl InviteUi {
 #[derive(Clone)]
 pub(crate) struct InviteRoutineConfig {
     friend: FriendDeliveryRoutineConfig,
-    confirm_list_region: Rect,
     view_star: InviteButton,
     goto_hall: InviteButton,
     enter_hall: InviteButton,
@@ -132,7 +132,6 @@ pub(crate) struct InviteRoutineConfig {
 
 pub(crate) struct InviteRoutineConfigSource {
     pub(crate) friend: FriendDeliveryRoutineConfig,
-    pub(crate) confirm_list_region: Rect,
     pub(crate) view_star_template: PathBuf,
     pub(crate) view_star_region: Rect,
     pub(crate) goto_hall_template: PathBuf,
@@ -153,7 +152,6 @@ impl InviteRoutineConfig {
     pub(crate) fn resolve(source: InviteRoutineConfigSource) -> Self {
         Self {
             friend: source.friend,
-            confirm_list_region: source.confirm_list_region,
             view_star: InviteButton {
                 path: source.view_star_template,
                 region: source.view_star_region,
@@ -173,7 +171,7 @@ impl InviteRoutineConfig {
             button_timeout_ms: source.button_timeout_ms,
             completion_timeout_ms: source.completion_timeout_ms,
             poll_ms: source.poll_ms.max(10),
-            stable_count: source.stable_count,
+            stable_count: source.stable_count.max(1),
             click_ms: source.click_ms,
             password_step_ms: source.password_step_ms,
             password_digit_ms: source.password_digit_ms,
@@ -184,7 +182,6 @@ impl InviteRoutineConfig {
     pub(crate) fn from_app(config: &AppConfig) -> Self {
         Self::resolve(InviteRoutineConfigSource {
             friend: FriendDeliveryRoutineConfig::from_app(config),
-            confirm_list_region: config.invite.confirm_list_region.into(),
             view_star_template: config.templates.invite_view_star.clone(),
             view_star_region: config.invite.view_star_region.into(),
             goto_hall_template: config.templates.invite_goto_hall.clone(),
@@ -259,13 +256,8 @@ fn execute_invite(
             failure = Some(error);
         }
         if failure.is_none()
-            && let Err(error) = execute_invite_navigation(
-                context,
-                ocr,
-                config,
-                &request.username,
-                request.password.as_deref(),
-            )
+            && let Err(error) =
+                execute_invite_navigation(context, config, request.password.as_deref())
         {
             if error.certainty() == InputCertainty::AfterInputUnknown {
                 effect = InviteEffect::ResultUnknown;
@@ -290,24 +282,10 @@ fn execute_invite(
 
 fn execute_invite_navigation(
     context: &mut UiRoutineContext<'_>,
-    ocr: &OcrRuntimeHandle,
     config: &InviteRoutineConfig,
-    username: &str,
     password: Option<&str>,
 ) -> std::result::Result<(), UiRoutineFailure> {
-    let target = locate_stable_exact_text(
-        context,
-        ocr,
-        &config.friend,
-        config.confirm_list_region,
-        username,
-        "confirm_invite_target",
-    )?;
-    context
-        .device()
-        .click_point(target.x, target.y)
-        .map_err(|error| before_input_failure("confirm_invite_target", error))?;
-    sleep_ms(config.click_ms);
+    click_current_friend_avatar(context, config)?;
 
     click_invite_button(
         context,
@@ -347,15 +325,88 @@ fn execute_invite_navigation(
     confirm_entered_hall(context, config)
 }
 
+fn click_current_friend_avatar(
+    context: &mut UiRoutineContext<'_>,
+    config: &InviteRoutineConfig,
+) -> std::result::Result<(), UiRoutineFailure> {
+    let total_attempts = attempts(
+        config.button_timeout_ms,
+        config.poll_ms,
+        config.stable_count,
+    );
+    let mut stable_point = None;
+    let mut streak = 0_u32;
+    for attempt in 0..total_attempts {
+        let image = capture_normalized(
+            context,
+            &config.friend,
+            "select_invite_avatar",
+            InputCertainty::BeforeInput,
+        )?;
+        let point = secondary_hall_bubbles(&image)
+            .map_err(|error| before_input_failure("select_invite_avatar", error))?
+            .into_iter()
+            .max_by_key(|bubble| bubble.avatar_rect().y)
+            .map(|bubble| bubble.avatar_rect().center());
+        match point {
+            Some(point)
+                if stable_point.is_some_and(|previous: (i32, i32)| {
+                    previous.0.abs_diff(point.x) <= 4 && previous.1.abs_diff(point.y) <= 4
+                }) =>
+            {
+                streak = streak.saturating_add(1);
+                stable_point = Some((point.x, point.y));
+            }
+            Some(point) => {
+                stable_point = Some((point.x, point.y));
+                streak = 1;
+            }
+            None => {
+                stable_point = None;
+                streak = 0;
+            }
+        }
+        if streak >= config.stable_count {
+            let (x, y) = stable_point.expect("stable invite avatar point exists");
+            context
+                .device()
+                .click_point(x, y)
+                .map_err(|error| before_input_failure("select_invite_avatar", error))?;
+            log::info!(
+                "邀请: 当前好友会话的左侧头像稳定确认，点击 samples={} x={} y={}",
+                config.stable_count,
+                x,
+                y
+            );
+            sleep_ms(config.click_ms);
+            return Ok(());
+        }
+        if attempt + 1 < total_attempts {
+            sleep_ms(config.poll_ms);
+        }
+    }
+    Err(UiRoutineFailure::new(
+        InputCertainty::ConfirmedFailure,
+        "select_invite_avatar",
+        "a stable incoming avatar was not found in the confirmed friend conversation",
+    ))
+}
+
 fn click_invite_button(
     context: &mut UiRoutineContext<'_>,
     config: &InviteRoutineConfig,
     button: &InviteButton,
     click_certainty: InputCertainty,
 ) -> std::result::Result<(), UiRoutineFailure> {
-    let attempts = attempts(config.button_timeout_ms, config.poll_ms, 1);
-    for attempt in 0..attempts {
-        let image = capture_normalized(context, &config.friend, button.stage)?;
+    let total_attempts = attempts(
+        config.button_timeout_ms,
+        config.poll_ms,
+        config.stable_count,
+    );
+    let mut stable_point = None;
+    let mut streak = 0_u32;
+    for attempt in 0..total_attempts {
+        let image = capture_normalized(context, &config.friend, button.stage, click_certainty)?;
         let hit = best_template_hit(
             &image,
             Some(button.region),
@@ -363,18 +414,34 @@ fn click_invite_button(
             config.template_threshold,
         )
         .map_err(|error| before_input_failure(button.stage, error))?;
-        if let Some(hit) = hit {
-            let point = hit.center();
-            context
-                .device()
-                .click_point(point.x, point.y)
-                .map_err(|error| {
-                    UiRoutineFailure::new(click_certainty, button.stage, format!("{error:#}"))
-                })?;
+        let point = hit.map(|hit| hit.center());
+        match point {
+            Some(point)
+                if stable_point.is_some_and(|previous: (i32, i32)| {
+                    previous.0.abs_diff(point.x) <= 4 && previous.1.abs_diff(point.y) <= 4
+                }) =>
+            {
+                streak = streak.saturating_add(1);
+                stable_point = Some((point.x, point.y));
+            }
+            Some(point) => {
+                stable_point = Some((point.x, point.y));
+                streak = 1;
+            }
+            None => {
+                stable_point = None;
+                streak = 0;
+            }
+        }
+        if streak >= config.stable_count {
+            let (x, y) = stable_point.expect("stable invite template point exists");
+            context.device().click_point(x, y).map_err(|error| {
+                UiRoutineFailure::new(click_certainty, button.stage, format!("{error:#}"))
+            })?;
             sleep_ms(config.click_ms);
             return Ok(());
         }
-        if attempt + 1 < attempts {
+        if attempt + 1 < total_attempts {
             sleep_ms(config.poll_ms);
         }
     }
@@ -429,7 +496,7 @@ mod tests {
 
     use anyhow::{Result, bail};
     use enigo::Key;
-    use image::{DynamicImage, GenericImage};
+    use image::{DynamicImage, GenericImage, Rgba};
 
     use super::*;
     use crate::config::{AppConfig, RectConfig};
@@ -437,6 +504,7 @@ mod tests {
     use crate::runtime::ocr::{OcrDevice, OcrLine, OcrRuntime};
     use crate::runtime::ui::{UiDevice, UiRuntime};
     use crate::ui::geometry::Rect;
+    use crate::ui::state::{TemplateUiStateClassifier, UiTemplateArgs};
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     enum InvitePhase {
@@ -458,7 +526,7 @@ mod tests {
         state: Arc<Mutex<InviteTestState>>,
         frames: HashMap<InvitePhase, DynamicImage>,
         friend_row: (i32, i32),
-        invite_target: (i32, i32),
+        friend_avatar: (i32, i32),
         view_star: (i32, i32),
         goto_hall: (i32, i32),
         enter_hall: (i32, i32),
@@ -483,9 +551,9 @@ mod tests {
             if near(point, self.friend_row) {
                 state.phase = InvitePhase::Friend;
                 state.clicks.push("friend");
-            } else if near(point, self.invite_target) {
+            } else if near(point, self.friend_avatar) {
                 state.phase = InvitePhase::ViewStar;
-                state.clicks.push("invite_target");
+                state.clicks.push("friend_avatar");
             } else if point == self.view_star {
                 state.phase = InvitePhase::GotoHall;
                 state.clicks.push("view_star");
@@ -521,7 +589,6 @@ mod tests {
         state: Arc<Mutex<InviteTestState>>,
         friend_list_size: (u32, u32),
         title_size: (u32, u32),
-        confirm_list_size: (u32, u32),
     }
 
     impl OcrDevice for InviteOcrDevice {
@@ -529,9 +596,6 @@ mod tests {
             let size = (image.width(), image.height());
             if size == self.friend_list_size {
                 return Ok(vec![line("甲", 5, 70, 80, 30)]);
-            }
-            if size == self.confirm_list_size {
-                return Ok(vec![line("甲", 5, 100, 80, 30)]);
             }
             if size == self.title_size {
                 let title = match self.state.lock().unwrap().phase {
@@ -561,21 +625,25 @@ mod tests {
             pasted: Vec::new(),
             clicks: Vec::new(),
         }));
-        let (frames, view_star, goto_hall, enter_hall) = invite_frames(&config);
+        let (frames, friend_avatar, view_star, goto_hall, enter_hall) = invite_frames(&config);
         let friend_list = config.invite.friend_list_region;
-        let confirm_list = config.invite.confirm_list_region;
         let title = SECONDARY_TITLE_RECT;
-        let ui_runtime = UiRuntime::start(
+        let ui_runtime = UiRuntime::start_with_state_classifier(
             InviteDevice {
                 state: state.clone(),
                 frames,
                 friend_row: (friend_list.x + 45, friend_list.y + 85),
-                invite_target: (confirm_list.x + 45, confirm_list.y + 115),
+                friend_avatar,
                 view_star,
                 goto_hall,
                 enter_hall,
             },
             2,
+            TemplateUiStateClassifier::new(
+                UiTemplateArgs::default().resolve(&config.templates, &config.ocr),
+                config.screen.clone(),
+            ),
+            config.resolve_stability_count(0),
         )
         .unwrap();
         let ocr_runtime = OcrRuntime::start(
@@ -583,7 +651,6 @@ mod tests {
                 state: state.clone(),
                 friend_list_size: (friend_list.width, friend_list.height),
                 title_size: (title.width, title.height),
-                confirm_list_size: (confirm_list.width, confirm_list.height),
             },
             4,
         )
@@ -617,7 +684,7 @@ mod tests {
             state.clicks,
             [
                 "friend",
-                "invite_target",
+                "friend_avatar",
                 "view_star",
                 "goto_hall",
                 "enter_hall",
@@ -633,10 +700,11 @@ mod tests {
         (i32, i32),
         (i32, i32),
         (i32, i32),
+        (i32, i32),
     );
 
     fn invite_frames(config: &AppConfig) -> InviteFrameSet {
-        let secondary = secondary_frame(config);
+        let (secondary, friend_avatar) = secondary_frame(config);
         let mut view_frame = secondary.clone();
         let view_star = place_template(
             &mut view_frame,
@@ -670,10 +738,10 @@ mod tests {
             (InvitePhase::EnterHall, enter_frame),
             (InvitePhase::Primary, primary),
         ]);
-        (frames, view_star, goto_hall, enter_hall)
+        (frames, friend_avatar, view_star, goto_hall, enter_hall)
     }
 
-    fn secondary_frame(config: &AppConfig) -> DynamicImage {
+    fn secondary_frame(config: &AppConfig) -> (DynamicImage, (i32, i32)) {
         let mut frame =
             DynamicImage::new_rgba8(config.screen.expected_width, config.screen.expected_height);
         place_template(
@@ -681,7 +749,37 @@ mod tests {
             &config.templates.secondary_back,
             config.screen.secondary_back_rect,
         );
-        frame
+        let avatar = Rect::new(302, 204, 88, 88);
+        let center = avatar.center();
+        draw_avatar(&mut frame, avatar);
+        fill_rect(
+            &mut frame,
+            Rect::new(410, 240, 190, 60),
+            Rgba([62, 71, 89, 255]),
+        );
+        (frame, (center.x, center.y))
+    }
+
+    fn draw_avatar(frame: &mut DynamicImage, rect: Rect) {
+        let center = rect.center();
+        let radius_squared = (rect.width as i32 / 2 - 4).pow(2);
+        for y in rect.y..rect.bottom() {
+            for x in rect.x..rect.right() {
+                let dx = x - center.x;
+                let dy = y - center.y;
+                if dx * dx + dy * dy <= radius_squared {
+                    frame.put_pixel(x as u32, y as u32, Rgba([220, 220, 220, 255]));
+                }
+            }
+        }
+    }
+
+    fn fill_rect(frame: &mut DynamicImage, rect: Rect, color: Rgba<u8>) {
+        for y in rect.y..rect.bottom() {
+            for x in rect.x..rect.right() {
+                frame.put_pixel(x as u32, y as u32, color);
+            }
+        }
     }
 
     fn place_template(frame: &mut DynamicImage, path: &Path, region: RectConfig) -> (i32, i32) {

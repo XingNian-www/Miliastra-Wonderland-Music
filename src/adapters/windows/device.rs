@@ -40,6 +40,14 @@ impl UiDevice for WindowsUiDevice {
         input::scroll_game_point(PointConfig::new(x, y), length, &self.window)
     }
 
+    fn drag_point(&mut self, from_x: i32, from_y: i32, to_x: i32, to_y: i32) -> Result<()> {
+        input::drag_game_point(
+            PointConfig::new(from_x, from_y),
+            PointConfig::new(to_x, to_y),
+            &self.window,
+        )
+    }
+
     fn activate(&mut self, after_activate_ms: u64) -> Result<()> {
         input::activate_game(&self.window, after_activate_ms)
     }

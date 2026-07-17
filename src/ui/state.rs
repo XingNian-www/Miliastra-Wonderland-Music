@@ -3,11 +3,19 @@ use std::time::Instant;
 
 use anyhow::Result;
 use image::DynamicImage;
+use image::imageops::FilterType;
 use serde::Serialize;
 
 use crate::config::{self, OcrConfig, TemplateConfig};
 use crate::observation::chat::{ResolvedTemplateArgs, TemplateArgs, count_chat_markers};
+use crate::runtime::ui::{
+    UiEvidenceRect, UiMarkerProbeEvidence, UiStateClassification, UiStateClassifier,
+    UiStateEvidence, UiStateKind as RuntimeUiStateKind, UiTemplateProbeEvidence,
+};
+use crate::ui::geometry::Rect;
+#[cfg(test)]
 use crate::ui::template::best_template_hit;
+use crate::ui::template::{TemplateHit, best_template_candidate};
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct UiTemplateArgs {
@@ -111,12 +119,12 @@ impl UiState {
         }
     }
 
-    pub(crate) fn is_primary(&self) -> bool {
-        self.state == UiStateKind::Primary
-    }
-
-    pub(crate) fn is_secondary(&self) -> bool {
-        self.state == UiStateKind::Secondary
+    fn runtime_kind(&self) -> RuntimeUiStateKind {
+        match self.state {
+            UiStateKind::Primary => RuntimeUiStateKind::Primary,
+            UiStateKind::Secondary => RuntimeUiStateKind::Secondary,
+            UiStateKind::Unknown => RuntimeUiStateKind::Unknown,
+        }
     }
 }
 
@@ -137,40 +145,98 @@ impl std::fmt::Display for UiState {
     }
 }
 
-pub(crate) fn detect_ui_state(
+#[derive(Clone)]
+pub(crate) struct TemplateUiStateClassifier {
+    templates: ResolvedUiTemplateArgs,
+    screen: config::ScreenConfig,
+}
+
+impl TemplateUiStateClassifier {
+    pub(crate) fn new(templates: ResolvedUiTemplateArgs, screen: config::ScreenConfig) -> Self {
+        Self { templates, screen }
+    }
+}
+
+impl UiStateClassifier for TemplateUiStateClassifier {
+    fn classify(&mut self, image: &DynamicImage) -> Result<UiStateClassification> {
+        let normalized;
+        let image = if image.width() == self.screen.expected_width
+            && image.height() == self.screen.expected_height
+        {
+            image
+        } else {
+            normalized = image.resize_exact(
+                self.screen.expected_width,
+                self.screen.expected_height,
+                FilterType::Triangle,
+            );
+            &normalized
+        };
+        let (state, evidence) =
+            detect_ui_state_with_evidence(image, &self.templates, &self.screen)?;
+        Ok(UiStateClassification::with_evidence(
+            state.runtime_kind(),
+            state.to_string(),
+            evidence,
+        ))
+    }
+}
+
+#[cfg(test)]
+fn detect_ui_state(
     image: &DynamicImage,
     templates: &ResolvedUiTemplateArgs,
     screen: &config::ScreenConfig,
 ) -> Result<UiState> {
+    Ok(detect_ui_state_with_evidence(image, templates, screen)?.0)
+}
+
+fn detect_ui_state_with_evidence(
+    image: &DynamicImage,
+    templates: &ResolvedUiTemplateArgs,
+    screen: &config::ScreenConfig,
+) -> Result<(UiState, UiStateEvidence)> {
     let started = Instant::now();
+    let threshold = templates.chat_templates.marker_threshold;
+    let mut template_probes = Vec::with_capacity(2);
+
     let friend_started = Instant::now();
-    if best_template_hit(
-        image,
-        Some(screen.friend_rect.into()),
+    let friend_region: Rect = screen.friend_rect.into();
+    let friend_candidate =
+        best_template_candidate(image, Some(friend_region), &templates.friend_template)?;
+    let friend_visible = candidate_matches(&friend_candidate, threshold);
+    template_probes.push(template_probe(
         &templates.friend_template,
-        templates.chat_templates.marker_threshold,
-    )?
-    .is_some()
-    {
+        friend_region,
+        threshold,
+        friend_candidate.as_ref(),
+    ));
+    if friend_visible {
         let friend_ms = elapsed_ms(friend_started);
         log::info!(target: "timing",
             "UI 状态检测耗时: total={}ms friend={}ms back=0ms marker=0ms state=primary_friend",
             elapsed_ms(started),
             friend_ms
         );
-        return Ok(UiState::primary_friend());
+        return Ok((
+            UiState::primary_friend(),
+            UiStateEvidence::new(template_probes, None, "primary_friend_template"),
+        ));
     }
     let friend_ms = elapsed_ms(friend_started);
 
     let back_started = Instant::now();
-    if best_template_hit(
-        image,
-        Some(screen.secondary_back_rect.into()),
+    let back_region: Rect = screen.secondary_back_rect.into();
+    let back_candidate =
+        best_template_candidate(image, Some(back_region), &templates.secondary_back_template)?;
+    let back_visible = candidate_matches(&back_candidate, threshold);
+    template_probes.push(template_probe(
         &templates.secondary_back_template,
-        templates.chat_templates.marker_threshold,
-    )?
-    .is_some()
-    {
+        back_region,
+        threshold,
+        back_candidate.as_ref(),
+    ));
+    if back_visible {
         let back_ms = elapsed_ms(back_started);
         log::info!(target: "timing",
             "UI 状态检测耗时: total={}ms friend={}ms back={}ms marker=0ms state=secondary_chat",
@@ -178,7 +244,10 @@ pub(crate) fn detect_ui_state(
             friend_ms,
             back_ms
         );
-        return Ok(UiState::secondary_chat());
+        return Ok((
+            UiState::secondary_chat(),
+            UiStateEvidence::new(template_probes, None, "secondary_back_template"),
+        ));
     }
     let back_ms = elapsed_ms(back_started);
 
@@ -186,6 +255,8 @@ pub(crate) fn detect_ui_state(
     let (blue, yellow, pink) =
         count_chat_markers(image, &templates.chat_templates, screen.chat_rect)?;
     let marker_ms = elapsed_ms(marker_started);
+    let marker_probe =
+        UiMarkerProbeEvidence::new(evidence_rect(screen.chat_rect.into()), blue, yellow, pink);
     if blue + yellow + pink > 0 {
         log::info!(target: "timing",
             "UI 状态检测耗时: total={}ms friend={}ms back={}ms marker={}ms state=primary_marker blue={} yellow={} pink={}",
@@ -197,7 +268,10 @@ pub(crate) fn detect_ui_state(
             yellow,
             pink
         );
-        return Ok(UiState::primary_marker(blue, yellow, pink));
+        return Ok((
+            UiState::primary_marker(blue, yellow, pink),
+            UiStateEvidence::new(template_probes, Some(marker_probe), "primary_chat_markers"),
+        ));
     }
 
     log::info!(target: "timing",
@@ -207,7 +281,42 @@ pub(crate) fn detect_ui_state(
         back_ms,
         marker_ms
     );
-    Ok(UiState::unknown())
+    Ok((
+        UiState::unknown(),
+        UiStateEvidence::new(template_probes, Some(marker_probe), "no_reliable_anchor"),
+    ))
+}
+
+fn candidate_matches(candidate: &Option<TemplateHit>, threshold: f32) -> bool {
+    candidate
+        .as_ref()
+        .is_some_and(|candidate| candidate.score >= threshold)
+}
+
+fn template_probe(
+    template: &std::path::Path,
+    search_rect: Rect,
+    threshold: f32,
+    candidate: Option<&TemplateHit>,
+) -> UiTemplateProbeEvidence {
+    let hit = candidate.filter(|candidate| candidate.score >= threshold);
+    let outcome = match (candidate, hit) {
+        (_, Some(_)) => "matched",
+        (Some(_), None) => "below_threshold",
+        (None, None) => "template_not_comparable",
+    };
+    UiTemplateProbeEvidence::new(
+        template.display().to_string(),
+        evidence_rect(search_rect),
+        candidate.map(|candidate| candidate.score),
+        threshold,
+        hit.map(|hit| evidence_rect(hit.rect())),
+        outcome,
+    )
+}
+
+fn evidence_rect(rect: Rect) -> UiEvidenceRect {
+    UiEvidenceRect::new(rect.x, rect.y, rect.width, rect.height)
 }
 
 fn elapsed_ms(started: Instant) -> u128 {
@@ -276,7 +385,23 @@ mod tests {
                 .expect("detect fixed secondary-chat screenshot");
 
             assert_eq!(state.to_string(), "secondary:chat");
-            assert!(state.is_secondary());
+            assert_eq!(state.runtime_kind(), RuntimeUiStateKind::Secondary);
         }
+
+        let mut classifier = TemplateUiStateClassifier::new(templates, config.screen.clone());
+        let classification = classifier
+            .classify(&image)
+            .expect("classify fixed secondary-chat screenshot");
+        let evidence = classification.evidence();
+        assert_eq!(evidence.final_rule(), "secondary_back_template");
+        assert_eq!(evidence.template_probes().len(), 2);
+        assert!(
+            evidence
+                .template_probes()
+                .iter()
+                .all(|probe| probe.best_score().is_some())
+        );
+        assert!(evidence.template_probes()[0].hit_rect().is_none());
+        assert!(evidence.template_probes()[1].hit_rect().is_some());
     }
 }

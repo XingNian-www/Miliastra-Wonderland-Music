@@ -4,7 +4,6 @@ use std::time::Duration;
 
 use enigo::Key;
 use image::DynamicImage;
-use image::imageops::FilterType;
 
 #[cfg(test)]
 use crate::config::AppConfig;
@@ -16,21 +15,23 @@ use crate::observation::chat::{SECONDARY_TITLE_RECT, SecondaryChatIdentity, clas
 use crate::runtime::ocr::{OcrPriority, OcrRuntimeHandle, merge_ocr_lines};
 use crate::runtime::ui::{
     InputCertainty, UiOperation, UiRoutine, UiRoutineContext, UiRoutineFailure,
-    UiRoutineProgressStage, UiRuntimeHandle, UiSubmitError, sealed,
+    UiRoutineProgressStage, UiRuntimeHandle, UiStateKind, UiStateObservation, UiSubmitError,
+    sealed,
 };
 use crate::text::normalize_comparison_text as normalize_lock_text;
 use crate::ui::change_detection::{ChangeFingerprint, change_stats, rect_chat_change_fingerprint};
 use crate::ui::geometry::{Point, Rect, crop_canvas};
 use crate::ui::locator::secondary_hall_search_rect;
-#[cfg(test)]
-use crate::ui::state::UiTemplateArgs;
-use crate::ui::state::{ResolvedUiTemplateArgs, detect_ui_state};
 use crate::ui::template::best_template_hit;
 
+use super::state_observation::{
+    UiStateObservationConfig, capture_normalized_ui_state, wait_for_stable_ui_kind,
+};
+
 const FRIEND_ROW_Y_TOLERANCE: i32 = 6;
-const MAX_UPWARD_SCROLLS: usize = 6;
-const MAX_DOWNWARD_SCROLLS: usize = MAX_UPWARD_SCROLLS * 2;
-const FRIEND_SCROLL_LENGTH: i32 = 8;
+const MAX_FRIEND_LIST_DRAGS: usize = 2;
+const FRIEND_AVATAR_TEXT_OFFSET_X: i32 = 40;
+const FRIEND_DRAG_MAX_EDGE_INSET: i32 = 50;
 const PRIMARY_STABILITY_POLL_MS: u64 = 100;
 const PRIMARY_STABILITY_TIMEOUT_MS: u64 = 1_000;
 
@@ -286,7 +287,12 @@ impl UiRoutine for ObserveResidencyRoutine {
             .ensure_ready(self.config.after_activate_ms)
             .map_err(|error| before_input_failure("prepare_residency_observation", error))?;
         restore_residency(context, &self.ocr, &self.config, self.target)?;
-        capture_normalized(context, &self.config, "capture_residency_observation")
+        capture_normalized(
+            context,
+            &self.config,
+            "capture_residency_observation",
+            InputCertainty::AfterInputUnknown,
+        )
     }
 }
 
@@ -414,9 +420,6 @@ impl FriendDeliveryUi {
 #[derive(Clone)]
 pub(crate) struct FriendDeliveryRoutineConfig {
     pub(super) screen: ScreenConfig,
-    templates: ResolvedUiTemplateArgs,
-    canvas_width: u32,
-    canvas_height: u32,
     friend_list_region: Rect,
     friend_chat_region: Rect,
     secondary_hall_search_region: Rect,
@@ -432,6 +435,7 @@ pub(crate) struct FriendDeliveryRoutineConfig {
     pub(super) poll_ms: u64,
     pub(super) stable_count: u32,
     auto_retry_count: u32,
+    fast_match: bool,
     stable_mean_threshold: f32,
     stable_changed_ratio_threshold: f32,
     secondary_hall_template: PathBuf,
@@ -440,7 +444,6 @@ pub(crate) struct FriendDeliveryRoutineConfig {
 
 pub(crate) struct FriendDeliveryRoutineConfigSource<'a> {
     pub(crate) screen: &'a ScreenConfig,
-    pub(crate) ui_templates: ResolvedUiTemplateArgs,
     pub(crate) templates: &'a TemplateConfig,
     pub(crate) ocr: &'a OcrConfig,
     pub(crate) output: &'a OutputConfig,
@@ -460,9 +463,6 @@ impl FriendDeliveryRoutineConfig {
         let friend_list_region = source.friend_list_region;
         Self {
             screen: source.screen.clone(),
-            templates: source.ui_templates,
-            canvas_width: source.screen.expected_width,
-            canvas_height: source.screen.expected_height,
             friend_list_region,
             friend_chat_region: source.friend_chat_region,
             secondary_hall_search_region: secondary_hall_search_rect(
@@ -481,6 +481,7 @@ impl FriendDeliveryRoutineConfig {
             poll_ms: source.poll_ms.max(10),
             stable_count: source.stable_count,
             auto_retry_count: source.delivery.auto_retry_count,
+            fast_match: source.delivery.fast_match,
             stable_mean_threshold: source.ocr.change_mean_threshold,
             stable_changed_ratio_threshold: source.ocr.change_pixel_threshold,
             secondary_hall_template: source.templates.secondary_hall.clone(),
@@ -492,7 +493,6 @@ impl FriendDeliveryRoutineConfig {
     pub(crate) fn from_app(config: &AppConfig) -> Self {
         Self::resolve(FriendDeliveryRoutineConfigSource {
             screen: &config.screen,
-            ui_templates: UiTemplateArgs::default().resolve(&config.templates, &config.ocr),
             templates: &config.templates,
             ocr: &config.ocr,
             output: &config.output,
@@ -505,6 +505,14 @@ impl FriendDeliveryRoutineConfig {
             poll_ms: config.timing.workflow.default_poll_ms,
             stable_count: config.resolve_stability_count(config.invite.friend_name_stable_count),
         })
+    }
+
+    pub(super) fn state_observation(&self) -> UiStateObservationConfig {
+        UiStateObservationConfig::new(
+            self.screen.expected_width,
+            self.screen.expected_height,
+            self.poll_ms,
+        )
     }
 }
 
@@ -839,35 +847,31 @@ fn ensure_secondary_chat(
         .device()
         .ensure_ready(config.after_activate_ms)
         .map_err(|error| before_input_failure("prepare_friend_delivery", error))?;
-    for attempt in 0..2 {
-        let image = capture_normalized(context, config, "observe_friend_delivery_start")?;
-        let state = detect_ui_state(&image, &config.templates, &config.screen)
-            .map_err(|error| before_input_failure("classify_friend_delivery_start", error))?;
-        if state.is_secondary() {
-            return Ok(());
-        }
-        if state.is_primary() {
-            context
-                .device()
-                .press_key(Key::Return)
-                .map_err(|error| before_input_failure("open_secondary_chat", error))?;
-            sleep_ms(config.open_chat_ms);
-            let opened = capture_normalized(context, config, "confirm_secondary_chat")?;
-            let state = detect_ui_state(&opened, &config.templates, &config.screen)
-                .map_err(|error| before_input_failure("confirm_secondary_chat", error))?;
-            if state.is_secondary() {
-                return Ok(());
-            }
-        }
-        if attempt == 0 {
-            sleep_ms(config.poll_ms);
-        }
-    }
-    Err(UiRoutineFailure::new(
+    let state = wait_for_stable_ui_kind(
+        context,
+        config.state_observation(),
+        None,
+        config.timeout_ms,
+        "observe_friend_delivery_start",
         InputCertainty::BeforeInput,
-        "normalize_friend_delivery_start",
-        "current UI is not a supported stable primary or secondary state",
-    ))
+    )?;
+    if state == UiStateKind::Secondary {
+        return Ok(());
+    }
+    context
+        .device()
+        .press_key(Key::Return)
+        .map_err(|error| before_input_failure("open_secondary_chat", error))?;
+    sleep_ms(config.open_chat_ms);
+    wait_for_stable_ui_kind(
+        context,
+        config.state_observation(),
+        Some(UiStateKind::Secondary),
+        config.timeout_ms,
+        "confirm_secondary_chat",
+        InputCertainty::AfterInputUnknown,
+    )?;
+    Ok(())
 }
 
 fn locate_stable_friend_row(
@@ -876,42 +880,56 @@ fn locate_stable_friend_row(
     config: &FriendDeliveryRoutineConfig,
     recipient: &str,
 ) -> std::result::Result<Point, UiRoutineFailure> {
-    for (scroll_length, max_scrolls) in [
-        (-FRIEND_SCROLL_LENGTH, MAX_UPWARD_SCROLLS),
-        (FRIEND_SCROLL_LENGTH, MAX_DOWNWARD_SCROLLS),
-    ] {
-        let mut pages = Vec::<ChangeFingerprint>::new();
-        for scroll_index in 0..=max_scrolls {
-            match search_current_friend_page(context, ocr, config, recipient)? {
-                PageSearch::Found(point) => return Ok(point),
-                PageSearch::Missing => {}
-            }
-            let image = capture_normalized(context, config, "fingerprint_friend_list")?;
-            let fingerprint = rect_chat_change_fingerprint(&image, config.friend_list_region)
-                .map_err(|error| before_input_failure("fingerprint_friend_list", error))?;
-            if pages
-                .iter()
-                .any(|page| page_matches(page, &fingerprint, config))
-            {
-                break;
-            }
-            pages.push(fingerprint);
-            if scroll_index == max_scrolls {
-                break;
-            }
-            let point = config.friend_list_region.center();
-            context
-                .device()
-                .scroll_point(point.x, point.y, scroll_length)
-                .map_err(|error| before_input_failure("scroll_friend_list", error))?;
-            wait_friend_list_stable(context, config)?;
+    let mut pages = Vec::<ChangeFingerprint>::new();
+    for drag_index in 0..=MAX_FRIEND_LIST_DRAGS {
+        match search_current_friend_page(context, ocr, config, recipient)? {
+            PageSearch::Found(point) => return Ok(point),
+            PageSearch::Missing => {}
         }
+        let image = capture_normalized(
+            context,
+            config,
+            "fingerprint_friend_list",
+            InputCertainty::AfterInputUnknown,
+        )?;
+        let fingerprint = rect_chat_change_fingerprint(&image, config.friend_list_region)
+            .map_err(|error| before_input_failure("fingerprint_friend_list", error))?;
+        if pages
+            .iter()
+            .any(|page| page_matches(page, &fingerprint, config))
+        {
+            break;
+        }
+        pages.push(fingerprint);
+        if drag_index == MAX_FRIEND_LIST_DRAGS {
+            break;
+        }
+        let (from, to) = friend_list_drag_points(config.friend_list_region);
+        context
+            .device()
+            .drag_point(from.x, from.y, to.x, to.y)
+            .map_err(|error| before_input_failure("drag_friend_list", error))?;
+        wait_friend_list_stable(context, config)?;
     }
     Err(UiRoutineFailure::new(
         InputCertainty::ConfirmedFailure,
         "locate_friend",
-        "no unique stable friend row was found within the bounded list traversal",
+        "no unique stable friend row was found within two list drags",
     ))
+}
+
+fn friend_list_drag_points(region: Rect) -> (Point, Point) {
+    let avatar_x = region.x.saturating_sub(FRIEND_AVATAR_TEXT_OFFSET_X).max(0);
+    let edge_inset = (region.height as i32 / 12).min(FRIEND_DRAG_MAX_EDGE_INSET);
+    (
+        Point::new(avatar_x, region.bottom() - edge_inset),
+        Point::new(avatar_x, region.y + edge_inset),
+    )
+}
+
+fn current_hall_restore_drag_points(region: Rect) -> (Point, Point) {
+    let (bottom, top) = friend_list_drag_points(region);
+    (top, bottom)
 }
 
 fn search_current_friend_page(
@@ -931,7 +949,12 @@ fn search_current_friend_page(
     let mut stable_y = None;
     let mut streak = 0_u32;
     for sample in 0..config.stable_count {
-        let image = capture_normalized(context, config, "capture_friend_list")?;
+        let image = capture_normalized(
+            context,
+            config,
+            "capture_friend_list",
+            InputCertainty::AfterInputUnknown,
+        )?;
         let hits = matching_text_rows(
             ocr,
             &image,
@@ -972,64 +995,6 @@ fn search_current_friend_page(
     Ok(PageSearch::Missing)
 }
 
-pub(super) fn locate_stable_exact_text(
-    context: &mut UiRoutineContext<'_>,
-    ocr: &OcrRuntimeHandle,
-    config: &FriendDeliveryRoutineConfig,
-    region: Rect,
-    expected: &str,
-    stage: &'static str,
-) -> std::result::Result<Point, UiRoutineFailure> {
-    let target = normalize_lock_text(expected);
-    if target.is_empty() {
-        return Err(UiRoutineFailure::new(
-            InputCertainty::ConfirmedFailure,
-            stage,
-            "normalized target text is empty",
-        ));
-    }
-    let mut stable_y = None;
-    let mut streak = 0_u32;
-    for attempt in 0..confirmation_attempts(config) {
-        let image = capture_normalized(context, config, stage)?;
-        let hits = matching_text_rows(ocr, &image, region, &target, TextMatchMode::Exact)?;
-        match hits.as_slice() {
-            [point] => {
-                if stable_y
-                    .is_some_and(|y: i32| y.abs_diff(point.y) <= FRIEND_ROW_Y_TOLERANCE as u32)
-                {
-                    streak = streak.saturating_add(1);
-                } else {
-                    stable_y = Some(point.y);
-                    streak = 1;
-                }
-                if streak >= config.stable_count {
-                    return Ok(*point);
-                }
-            }
-            [] => {
-                stable_y = None;
-                streak = 0;
-            }
-            _ => {
-                return Err(UiRoutineFailure::new(
-                    InputCertainty::ConfirmedFailure,
-                    stage,
-                    "multiple exact text matches were visible in the requested region",
-                ));
-            }
-        }
-        if attempt + 1 < confirmation_attempts(config) {
-            sleep_ms(config.poll_ms);
-        }
-    }
-    Err(UiRoutineFailure::new(
-        InputCertainty::ConfirmedFailure,
-        stage,
-        "the exact text did not become unique and row-stable before timeout",
-    ))
-}
-
 fn confirm_friend_conversation(
     context: &mut UiRoutineContext<'_>,
     ocr: &OcrRuntimeHandle,
@@ -1039,17 +1004,27 @@ fn confirm_friend_conversation(
     context.publish_progress(UiRoutineProgressStage::ConfirmingUi);
     let target = normalize_lock_text(recipient);
     let attempts = confirmation_attempts(config);
+    let mut stable_key = None;
     let mut streak = 0_u32;
     for attempt in 0..attempts {
-        let image = capture_normalized(context, config, "confirm_friend_conversation")?;
-        let found = detect_conversation_identity(ocr, &image, config, &target)?
-            != ConversationIdentityEvidence::Missing;
-        if found {
-            streak = streak.saturating_add(1);
+        let image = capture_normalized(
+            context,
+            config,
+            "confirm_friend_conversation",
+            InputCertainty::AfterInputUnknown,
+        )?;
+        if let Some(key) = conversation_confirmation_key(ocr, &image, config, &target)? {
+            if stable_key.as_deref() == Some(key.as_str()) {
+                streak = streak.saturating_add(1);
+            } else {
+                stable_key = Some(key);
+                streak = 1;
+            }
             if streak >= config.stable_count {
                 return Ok(());
             }
         } else {
+            stable_key = None;
             streak = 0;
         }
         if attempt + 1 < attempts {
@@ -1059,8 +1034,35 @@ fn confirm_friend_conversation(
     Err(UiRoutineFailure::new(
         InputCertainty::ConfirmedFailure,
         "confirm_friend_conversation",
-        "selected conversation did not stably contain the complete friend name",
+        if config.fast_match {
+            "selected conversation title did not stably identify a private friend chat"
+        } else {
+            "selected conversation did not stably contain the complete friend name"
+        },
     ))
+}
+
+fn conversation_confirmation_key(
+    ocr: &OcrRuntimeHandle,
+    image: &DynamicImage,
+    config: &FriendDeliveryRoutineConfig,
+    normalized_target: &str,
+) -> std::result::Result<Option<String>, UiRoutineFailure> {
+    if config.fast_match {
+        let title = merged_text(ocr, image, SECONDARY_TITLE_RECT)?;
+        return Ok(match classify_title(&title) {
+            SecondaryChatIdentity::Friend(title) => {
+                let title = normalize_lock_text(&title);
+                (!title.is_empty()).then_some(title)
+            }
+            _ => None,
+        });
+    }
+    Ok(
+        (detect_conversation_identity(ocr, image, config, normalized_target)?
+            != ConversationIdentityEvidence::Missing)
+            .then(|| normalized_target.to_string()),
+    )
 }
 
 fn detect_conversation_identity(
@@ -1104,53 +1106,105 @@ fn restore_primary(
     context: &mut UiRoutineContext<'_>,
     config: &FriendDeliveryRoutineConfig,
 ) -> std::result::Result<(), UiRoutineFailure> {
-    let image = capture_normalized(context, config, "observe_primary_residency")?;
-    let state = detect_ui_state(&image, &config.templates, &config.screen)
-        .map_err(|error| before_input_failure("observe_primary_residency", error))?;
-    if state.is_primary() {
+    let state = wait_for_stable_ui_kind(
+        context,
+        config.state_observation(),
+        None,
+        config.timeout_ms,
+        "observe_primary_residency",
+        InputCertainty::ConfirmedFailure,
+    )?;
+    if state == UiStateKind::Primary {
         return Ok(());
-    }
-    if !state.is_secondary() {
-        return Err(UiRoutineFailure::new(
-            InputCertainty::ConfirmedFailure,
-            "restore_primary_residency",
-            "cannot recover primary residency from an unknown UI state",
-        ));
     }
     context
         .device()
         .press_key(Key::Escape)
         .map_err(|error| before_input_failure("restore_primary_residency", error))?;
-    sleep_ms(config.open_chat_ms);
+    confirm_primary_residency(context, config)
+}
+
+pub(super) fn confirm_primary_residency(
+    context: &mut UiRoutineContext<'_>,
+    config: &FriendDeliveryRoutineConfig,
+) -> std::result::Result<(), UiRoutineFailure> {
+    wait_for_stable_ui_kind(
+        context,
+        config.state_observation(),
+        Some(UiStateKind::Primary),
+        config.timeout_ms,
+        "confirm_primary_residency",
+        InputCertainty::AfterInputUnknown,
+    )?;
+    confirm_primary_visual_stability(context, config)
+}
+
+fn confirm_primary_visual_stability(
+    context: &mut UiRoutineContext<'_>,
+    config: &FriendDeliveryRoutineConfig,
+) -> std::result::Result<(), UiRoutineFailure> {
     let started = std::time::Instant::now();
     let mut previous = None;
+    let mut confirmed_primary = false;
     loop {
-        let image = capture_normalized(context, config, "confirm_primary_residency")?;
-        let state = detect_ui_state(&image, &config.templates, &config.screen)
-            .map_err(|error| before_input_failure("confirm_primary_residency", error))?;
-        if !state.is_primary() {
-            return Err(UiRoutineFailure::new(
-                InputCertainty::ConfirmedFailure,
+        let image = capture_normalized(
+            context,
+            config,
+            "confirm_primary_residency",
+            InputCertainty::AfterInputUnknown,
+        )?;
+        let observation = context.latest_ui_state().ok_or_else(|| {
+            UiRoutineFailure::new(
+                InputCertainty::AfterInputUnknown,
                 "confirm_primary_residency",
-                "primary residency did not become stable",
-            ));
-        }
-        let current = rect_chat_change_fingerprint(&image, config.screen.friend_rect.into())
-            .map_err(|error| before_input_failure("confirm_primary_stability", error))?;
-        if previous
-            .as_ref()
-            .is_some_and(|previous| page_matches(previous, &current, config))
-        {
-            return Ok(());
+                "UI runtime has no configured template state classifier",
+            )
+        })?;
+        match observation {
+            UiStateObservation::Classified(state)
+                if state.stable_kind() == Some(UiStateKind::Primary) =>
+            {
+                confirmed_primary = true;
+                let current =
+                    rect_chat_change_fingerprint(&image, config.screen.friend_rect.into())
+                        .map_err(|error| {
+                            UiRoutineFailure::new(
+                                InputCertainty::AfterInputUnknown,
+                                "confirm_primary_stability",
+                                format!("{error:#}"),
+                            )
+                        })?;
+                if previous
+                    .as_ref()
+                    .is_some_and(|previous| page_matches(previous, &current, config))
+                {
+                    return Ok(());
+                }
+                previous = Some(current);
+            }
+            UiStateObservation::Classified(_) => previous = None,
+            UiStateObservation::Failed { reason, .. } => {
+                return Err(UiRoutineFailure::new(
+                    InputCertainty::AfterInputUnknown,
+                    "confirm_primary_residency",
+                    format!("template UI state classification failed: {reason}"),
+                ));
+            }
         }
         if started.elapsed() >= Duration::from_millis(PRIMARY_STABILITY_TIMEOUT_MS) {
+            if !confirmed_primary {
+                return Err(UiRoutineFailure::new(
+                    InputCertainty::AfterInputUnknown,
+                    "confirm_primary_residency",
+                    "primary residency did not become stable",
+                ));
+            }
             log::warn!(
                 "好友按钮区域持续变化 {}ms，按已确认的一级界面继续",
                 PRIMARY_STABILITY_TIMEOUT_MS
             );
             return Ok(());
         }
-        previous = Some(current);
         sleep_ms(PRIMARY_STABILITY_POLL_MS);
     }
 }
@@ -1165,8 +1219,13 @@ fn restore_secondary_hall(
         return confirm_current_hall(context, ocr, config);
     }
     let mut pages = Vec::<ChangeFingerprint>::new();
-    for scroll_index in 0..=MAX_UPWARD_SCROLLS {
-        let image = capture_normalized(context, config, "locate_secondary_hall")?;
+    for drag_index in 0..=MAX_FRIEND_LIST_DRAGS {
+        let image = capture_normalized(
+            context,
+            config,
+            "locate_secondary_hall",
+            InputCertainty::AfterInputUnknown,
+        )?;
         if let Some(hit) = best_template_hit(
             &image,
             Some(config.secondary_hall_search_region),
@@ -1192,20 +1251,20 @@ fn restore_secondary_hall(
             break;
         }
         pages.push(fingerprint);
-        if scroll_index == MAX_UPWARD_SCROLLS {
+        if drag_index == MAX_FRIEND_LIST_DRAGS {
             break;
         }
-        let point = config.friend_list_region.center();
+        let (from, to) = current_hall_restore_drag_points(config.friend_list_region);
         context
             .device()
-            .scroll_point(point.x, point.y, -FRIEND_SCROLL_LENGTH)
-            .map_err(|error| before_input_failure("scroll_to_secondary_hall", error))?;
+            .drag_point(from.x, from.y, to.x, to.y)
+            .map_err(|error| before_input_failure("drag_to_secondary_hall", error))?;
         wait_friend_list_stable(context, config)?;
     }
     Err(UiRoutineFailure::new(
         InputCertainty::ConfirmedFailure,
         "restore_secondary_hall",
-        "current-hall template was not found within the bounded list traversal",
+        "current-hall template was not found after two downward avatar drags",
     ))
 }
 
@@ -1214,7 +1273,12 @@ fn current_title_is_hall(
     ocr: &OcrRuntimeHandle,
     config: &FriendDeliveryRoutineConfig,
 ) -> std::result::Result<bool, UiRoutineFailure> {
-    let image = capture_normalized(context, config, "observe_secondary_title")?;
+    let image = capture_normalized(
+        context,
+        config,
+        "observe_secondary_title",
+        InputCertainty::AfterInputUnknown,
+    )?;
     let title = merged_text(ocr, &image, SECONDARY_TITLE_RECT)?;
     Ok(matches!(
         classify_title(&title),
@@ -1297,20 +1361,9 @@ pub(super) fn capture_normalized(
     context: &mut UiRoutineContext<'_>,
     config: &FriendDeliveryRoutineConfig,
     stage: &'static str,
+    certainty: InputCertainty,
 ) -> std::result::Result<DynamicImage, UiRoutineFailure> {
-    let image = context
-        .device()
-        .capture()
-        .map_err(|error| before_input_failure(stage, error))?;
-    if image.width() == config.canvas_width && image.height() == config.canvas_height {
-        Ok(image)
-    } else {
-        Ok(image.resize_exact(
-            config.canvas_width,
-            config.canvas_height,
-            FilterType::Triangle,
-        ))
-    }
+    capture_normalized_ui_state(context, &config.state_observation(), stage, certainty)
 }
 
 pub(super) fn current_ui_is_primary(
@@ -1318,10 +1371,14 @@ pub(super) fn current_ui_is_primary(
     config: &FriendDeliveryRoutineConfig,
     stage: &'static str,
 ) -> std::result::Result<bool, UiRoutineFailure> {
-    let image = capture_normalized(context, config, stage)?;
-    let state = detect_ui_state(&image, &config.templates, &config.screen)
-        .map_err(|error| before_input_failure(stage, error))?;
-    Ok(state.is_primary())
+    Ok(wait_for_stable_ui_kind(
+        context,
+        config.state_observation(),
+        None,
+        config.timeout_ms,
+        stage,
+        InputCertainty::ConfirmedFailure,
+    )? == UiStateKind::Primary)
 }
 
 fn wait_friend_list_stable(
@@ -1329,14 +1386,24 @@ fn wait_friend_list_stable(
     config: &FriendDeliveryRoutineConfig,
 ) -> std::result::Result<(), UiRoutineFailure> {
     let mut previous = rect_chat_change_fingerprint(
-        &capture_normalized(context, config, "observe_scrolled_friend_list")?,
+        &capture_normalized(
+            context,
+            config,
+            "observe_scrolled_friend_list",
+            InputCertainty::AfterInputUnknown,
+        )?,
         config.friend_list_region,
     )
     .map_err(|error| before_input_failure("observe_scrolled_friend_list", error))?;
     for _ in 0..confirmation_attempts(config) {
         sleep_ms(config.poll_ms);
         let current = rect_chat_change_fingerprint(
-            &capture_normalized(context, config, "confirm_scrolled_friend_list")?,
+            &capture_normalized(
+                context,
+                config,
+                "confirm_scrolled_friend_list",
+                InputCertainty::AfterInputUnknown,
+            )?,
             config.friend_list_region,
         )
         .map_err(|error| before_input_failure("confirm_scrolled_friend_list", error))?;
@@ -1393,10 +1460,47 @@ mod tests {
         assert!(!text_contains_complete_target("萌", "萌萌"));
         assert!(text_contains_complete_target("原昵称(萌萌)", "萌萌"));
     }
+
+    #[test]
+    fn friend_list_drag_runs_from_the_lowest_avatar_to_the_highest_avatar() {
+        let (from, to) = friend_list_drag_points(Rect::new(80, 280, 170, 600));
+
+        assert_eq!((from.x, from.y), (40, 830));
+        assert_eq!((to.x, to.y), (40, 330));
+        assert!(from.y > to.y);
+    }
+
+    #[test]
+    fn current_hall_restore_drags_the_highest_avatar_downward() {
+        let (from, to) = current_hall_restore_drag_points(Rect::new(80, 280, 170, 600));
+
+        assert_eq!((from.x, from.y), (40, 330));
+        assert_eq!((to.x, to.y), (40, 830));
+        assert!(from.y < to.y);
+        assert_eq!(MAX_FRIEND_LIST_DRAGS, 2);
+    }
     use crate::config::AppConfig;
     use crate::runtime::ocr::{OcrArgs, OcrDevice, OcrLine, OcrRuntime, ProductionOcrDevice};
-    use crate::runtime::ui::{UiDevice, UiRuntime};
+    use crate::runtime::ui::{FrameDemand, FramePublication, UiDevice, UiRuntime};
     use crate::ui::geometry::Rect;
+    use crate::ui::state::{TemplateUiStateClassifier, UiTemplateArgs};
+
+    fn start_test_ui_runtime(
+        device: impl UiDevice,
+        config: &AppConfig,
+        queue_capacity: usize,
+    ) -> UiRuntime {
+        UiRuntime::start_with_state_classifier(
+            device,
+            queue_capacity,
+            TemplateUiStateClassifier::new(
+                UiTemplateArgs::default().resolve(&config.templates, &config.ocr),
+                config.screen.clone(),
+            ),
+            config.resolve_stability_count(0),
+        )
+        .unwrap()
+    }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     enum Conversation {
@@ -1452,6 +1556,29 @@ mod tests {
                 .expect("recognize chat-region fallback identity"),
             ConversationIdentityEvidence::ChatRegion
         );
+        let mut fast_routine = routine.clone();
+        fast_routine.fast_match = true;
+        assert_eq!(
+            conversation_confirmation_key(
+                &handle,
+                &image,
+                &fast_routine,
+                &normalize_lock_text("不存在的好友")
+            )
+            .expect("accept any stable private-chat title in fast mode"),
+            Some(normalize_lock_text("香菜"))
+        );
+        fast_routine.fast_match = false;
+        assert_eq!(
+            conversation_confirmation_key(
+                &handle,
+                &image,
+                &fast_routine,
+                &normalize_lock_text("不存在的好友")
+            )
+            .expect("strict mode still requires the target identity"),
+            None
+        );
 
         let state = Arc::new(Mutex::new(TestUiState {
             conversation: Conversation::Hall,
@@ -1462,16 +1589,16 @@ mod tests {
             send_attempts: 0,
             fail_send_attempt: None,
         }));
-        let ui_runtime = UiRuntime::start(
+        let ui_runtime = start_test_ui_runtime(
             RecordingDevice {
                 frame: image,
                 state: Arc::clone(&state),
                 friend_rows: Vec::new(),
                 hall_point: (-1, -1),
             },
+            &config,
             1,
-        )
-        .expect("start fixed-fixture UI runtime");
+        );
         let mut bounded_config = routine;
         bounded_config.poll_ms = 1;
         bounded_config.timeout_ms = 5;
@@ -1491,7 +1618,7 @@ mod tests {
         assert_eq!(failure.certainty(), InputCertainty::ConfirmedFailure);
         let scrolls = state.lock().unwrap().scrolls;
         assert!(scrolls > 0);
-        assert!(scrolls <= MAX_UPWARD_SCROLLS + MAX_DOWNWARD_SCROLLS);
+        assert!(scrolls <= MAX_FRIEND_LIST_DRAGS);
         ui_runtime
             .shutdown()
             .expect("shutdown fixed-fixture UI runtime");
@@ -1583,6 +1710,11 @@ mod tests {
         }
 
         fn scroll_point(&mut self, _x: i32, _y: i32, _length: i32) -> Result<()> {
+            self.state.lock().unwrap().scrolls += 1;
+            Ok(())
+        }
+
+        fn drag_point(&mut self, _from_x: i32, _from_y: i32, _to_x: i32, _to_y: i32) -> Result<()> {
             self.state.lock().unwrap().scrolls += 1;
             Ok(())
         }
@@ -1716,7 +1848,7 @@ mod tests {
             4,
         )
         .unwrap();
-        let ui_runtime = UiRuntime::start(device, 4).unwrap();
+        let ui_runtime = start_test_ui_runtime(device, &config, 4);
         let friend_ui = FriendDeliveryUi::new(
             ui_runtime.handle(),
             ocr_runtime.handle(),
@@ -1758,6 +1890,7 @@ mod tests {
     #[test]
     fn friend_conversation_falls_back_to_the_chat_region_when_title_has_no_name() {
         let mut config = AppConfig::load(Path::new("config.yaml")).unwrap();
+        config.friend_delivery.fast_match = false;
         config.timing.input.after_activate_ms = 0;
         config.timing.input.open_chat_ms = 0;
         config.timing.input.click_ms = 0;
@@ -1783,16 +1916,16 @@ mod tests {
             config.screen.secondary_hall_rect.x + hall_template.width() as i32 / 2,
             config.screen.secondary_hall_rect.y + hall_template.height() as i32 / 2,
         );
-        let ui_runtime = UiRuntime::start(
+        let ui_runtime = start_test_ui_runtime(
             RecordingDevice {
                 frame: secondary_frame(&config),
                 state: state.clone(),
                 friend_rows: vec![(friend_list.y + 85, "萌萌".to_string())],
                 hall_point,
             },
+            &config,
             4,
-        )
-        .unwrap();
+        );
         let ocr_runtime = OcrRuntime::start(
             TitleFallbackOcrDevice {
                 state: state.clone(),
@@ -1854,16 +1987,16 @@ mod tests {
             config.screen.secondary_hall_rect.x + hall_template.width() as i32 / 2,
             config.screen.secondary_hall_rect.y + hall_template.height() as i32 / 2,
         );
-        let ui_runtime = UiRuntime::start(
+        let ui_runtime = start_test_ui_runtime(
             RecordingDevice {
                 frame: secondary_frame(&config),
                 state: state.clone(),
                 friend_rows: Vec::new(),
                 hall_point,
             },
+            &config,
             4,
-        )
-        .unwrap();
+        );
         let ocr_runtime = OcrRuntime::start(
             FriendOcrDevice {
                 state: state.clone(),
@@ -1959,16 +2092,16 @@ mod tests {
             config.screen.secondary_hall_rect.x + hall_template.width() as i32 / 2,
             config.screen.secondary_hall_rect.y + hall_template.height() as i32 / 2,
         );
-        let ui_runtime = UiRuntime::start(
+        let ui_runtime = start_test_ui_runtime(
             RecordingDevice {
                 frame: secondary_frame(&config),
                 state: state.clone(),
                 friend_rows: vec![(friend_list.y + 85, "甲".to_string())],
                 hall_point,
             },
+            &config,
             4,
-        )
-        .unwrap();
+        );
         let ocr_runtime = OcrRuntime::start(
             SubstringFriendOcrDevice {
                 state: state.clone(),
@@ -2001,7 +2134,7 @@ mod tests {
         assert!(state.selected_friends.is_empty());
         assert!(state.pasted.is_empty());
         assert!(state.scrolls > 0);
-        assert!(state.scrolls <= MAX_UPWARD_SCROLLS + MAX_DOWNWARD_SCROLLS);
+        assert!(state.scrolls <= MAX_FRIEND_LIST_DRAGS);
 
         ui_runtime.shutdown().unwrap();
         ocr_runtime.shutdown().unwrap();
@@ -2035,16 +2168,16 @@ mod tests {
             config.screen.secondary_hall_rect.x + hall_template.width() as i32 / 2,
             config.screen.secondary_hall_rect.y + hall_template.height() as i32 / 2,
         );
-        let ui_runtime = UiRuntime::start(
+        let ui_runtime = start_test_ui_runtime(
             RecordingDevice {
                 frame: secondary_frame(&config),
                 state: state.clone(),
                 friend_rows: vec![(friend_list.y + 85, "甲".to_string())],
                 hall_point,
             },
+            &config,
             4,
-        )
-        .unwrap();
+        );
         let ocr_runtime = OcrRuntime::start(
             FriendOcrDevice {
                 state: state.clone(),
@@ -2111,6 +2244,308 @@ mod tests {
         };
 
         assert!(outcome.safe_retry_request(&request).is_none());
+    }
+
+    struct RestorePrimaryRoutine {
+        config: FriendDeliveryRoutineConfig,
+    }
+
+    impl sealed::UiRoutineSealed for RestorePrimaryRoutine {}
+
+    impl UiRoutine for RestorePrimaryRoutine {
+        type Output = std::result::Result<(), UiRoutineFailure>;
+
+        fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
+            restore_primary(context, &self.config)
+        }
+    }
+
+    struct UnknownResidencyDevice {
+        frame: DynamicImage,
+        keys: Arc<Mutex<Vec<Key>>>,
+    }
+
+    impl UiDevice for UnknownResidencyDevice {
+        fn capture(&mut self) -> Result<DynamicImage> {
+            Ok(self.frame.clone())
+        }
+
+        fn press_key(&mut self, key: Key) -> Result<()> {
+            self.keys.lock().unwrap().push(key);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn persistent_unknown_residency_never_authorizes_escape() {
+        let config = AppConfig::load(Path::new("config.yaml")).unwrap();
+        let keys = Arc::new(Mutex::new(Vec::new()));
+        let ui_runtime = start_test_ui_runtime(
+            UnknownResidencyDevice {
+                frame: DynamicImage::new_rgba8(
+                    config.screen.expected_width,
+                    config.screen.expected_height,
+                ),
+                keys: keys.clone(),
+            },
+            &config,
+            2,
+        );
+        let mut routine_config = FriendDeliveryRoutineConfig::from_app(&config);
+        routine_config.timeout_ms = 100;
+        routine_config.poll_ms = 1;
+
+        let failure = ui_runtime
+            .handle()
+            .submit(RestorePrimaryRoutine {
+                config: routine_config,
+            })
+            .unwrap()
+            .wait()
+            .unwrap()
+            .expect_err("persistent unknown must time out without input");
+
+        assert_eq!(failure.stage(), "observe_primary_residency");
+        assert_eq!(failure.certainty(), InputCertainty::ConfirmedFailure);
+        assert!(keys.lock().unwrap().is_empty());
+        ui_runtime.shutdown().unwrap();
+    }
+
+    struct TransitionResidencyDevice {
+        secondary: DynamicImage,
+        primary: DynamicImage,
+        keys: Arc<Mutex<Vec<Key>>>,
+        escaped: bool,
+        captures_after_escape: usize,
+    }
+
+    impl UiDevice for TransitionResidencyDevice {
+        fn capture(&mut self) -> Result<DynamicImage> {
+            if !self.escaped {
+                return Ok(self.secondary.clone());
+            }
+            self.captures_after_escape += 1;
+            if self.captures_after_escape <= 2 {
+                return Ok(DynamicImage::new_rgba8(
+                    self.primary.width(),
+                    self.primary.height(),
+                ));
+            }
+            Ok(self.primary.clone())
+        }
+
+        fn press_key(&mut self, key: Key) -> Result<()> {
+            self.keys.lock().unwrap().push(key);
+            if key == Key::Escape {
+                self.escaped = true;
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn secondary_residency_escapes_once_then_waits_through_unknown_transition() {
+        let config = AppConfig::load(Path::new("config.yaml")).unwrap();
+        let keys = Arc::new(Mutex::new(Vec::new()));
+        let ui_runtime = start_test_ui_runtime(
+            TransitionResidencyDevice {
+                secondary: secondary_frame(&config),
+                primary: primary_frame(&config),
+                keys: keys.clone(),
+                escaped: false,
+                captures_after_escape: 0,
+            },
+            &config,
+            2,
+        );
+        let mut routine_config = FriendDeliveryRoutineConfig::from_app(&config);
+        routine_config.timeout_ms = 500;
+        routine_config.poll_ms = 1;
+
+        ui_runtime
+            .handle()
+            .submit(RestorePrimaryRoutine {
+                config: routine_config,
+            })
+            .unwrap()
+            .wait()
+            .unwrap()
+            .expect("transition must settle back to primary");
+
+        assert_eq!(*keys.lock().unwrap(), [Key::Escape]);
+        ui_runtime.shutdown().unwrap();
+    }
+
+    #[derive(Default)]
+    struct PreStabilizedRecoveryState {
+        recovery_started: bool,
+        captures_since_recovery: usize,
+        captures_after_escape: usize,
+        premature_escape: bool,
+        escaped: bool,
+        keys: Vec<Key>,
+    }
+
+    struct PreStabilizedRecoveryDevice {
+        secondary: DynamicImage,
+        primary: DynamicImage,
+        state: Arc<Mutex<PreStabilizedRecoveryState>>,
+    }
+
+    impl UiDevice for PreStabilizedRecoveryDevice {
+        fn capture(&mut self) -> Result<DynamicImage> {
+            let mut state = self.state.lock().unwrap();
+            if state.escaped {
+                if state.premature_escape {
+                    return Ok(self.secondary.clone());
+                }
+                state.captures_after_escape += 1;
+                if state.captures_after_escape <= 2 {
+                    return Ok(DynamicImage::new_rgba8(
+                        self.primary.width(),
+                        self.primary.height(),
+                    ));
+                }
+                return Ok(self.primary.clone());
+            }
+            if state.recovery_started {
+                state.captures_since_recovery += 1;
+            }
+            Ok(self.secondary.clone())
+        }
+
+        fn press_key(&mut self, key: Key) -> Result<()> {
+            let mut state = self.state.lock().unwrap();
+            state.keys.push(key);
+            if key == Key::Escape {
+                state.premature_escape = state.captures_since_recovery < 2;
+                state.escaped = true;
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn recovery_requires_fresh_stability_after_a_pre_stabilized_secondary_state() {
+        let config = AppConfig::load(Path::new("config.yaml")).unwrap();
+        let state = Arc::new(Mutex::new(PreStabilizedRecoveryState::default()));
+        let ui_runtime = start_test_ui_runtime(
+            PreStabilizedRecoveryDevice {
+                secondary: secondary_frame(&config),
+                primary: primary_frame(&config),
+                state: Arc::clone(&state),
+            },
+            &config,
+            4,
+        );
+        let handle = ui_runtime.handle();
+        let subscription = handle
+            .declare_frame_demand(FrameDemand::new(Duration::from_millis(1)).unwrap())
+            .unwrap();
+        loop {
+            let publication = subscription.recv().unwrap();
+            let FramePublication::Captured(frame) = publication else {
+                panic!("pre-stabilization capture failed");
+            };
+            if frame
+                .ui_state()
+                .and_then(|observation| observation.classified())
+                .and_then(|tracked| tracked.stable_kind())
+                == Some(UiStateKind::Secondary)
+            {
+                break;
+            }
+        }
+        subscription.cancel().unwrap();
+        {
+            let mut state = state.lock().unwrap();
+            state.recovery_started = true;
+            state.captures_since_recovery = 0;
+        }
+
+        let mut routine_config = FriendDeliveryRoutineConfig::from_app(&config);
+        routine_config.timeout_ms = 300;
+        routine_config.poll_ms = 1;
+        handle
+            .submit(RestorePrimaryRoutine {
+                config: routine_config,
+            })
+            .unwrap()
+            .wait()
+            .unwrap()
+            .expect("recovery must wait for fresh stable evidence before Escape");
+
+        let state = state.lock().unwrap();
+        assert!(!state.premature_escape);
+        assert!(state.captures_since_recovery >= 2);
+        assert_eq!(state.keys, [Key::Escape]);
+        drop(state);
+        ui_runtime.shutdown().unwrap();
+    }
+
+    struct CaptureFailsAfterEscapeDevice {
+        secondary: DynamicImage,
+        escaped: bool,
+    }
+
+    impl UiDevice for CaptureFailsAfterEscapeDevice {
+        fn capture(&mut self) -> Result<DynamicImage> {
+            if self.escaped {
+                bail!("capture unavailable after escape");
+            }
+            Ok(self.secondary.clone())
+        }
+
+        fn press_key(&mut self, key: Key) -> Result<()> {
+            if key == Key::Escape {
+                self.escaped = true;
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn capture_failure_after_escape_is_reported_as_input_result_unknown() {
+        let config = AppConfig::load(Path::new("config.yaml")).unwrap();
+        let ui_runtime = start_test_ui_runtime(
+            CaptureFailsAfterEscapeDevice {
+                secondary: secondary_frame(&config),
+                escaped: false,
+            },
+            &config,
+            4,
+        );
+        let mut routine_config = FriendDeliveryRoutineConfig::from_app(&config);
+        routine_config.timeout_ms = 300;
+        routine_config.poll_ms = 1;
+
+        let failure = ui_runtime
+            .handle()
+            .submit(RestorePrimaryRoutine {
+                config: routine_config,
+            })
+            .unwrap()
+            .wait()
+            .unwrap()
+            .expect_err("capture after Escape must remain result-unknown");
+
+        assert_eq!(failure.stage(), "confirm_primary_residency");
+        assert_eq!(failure.certainty(), InputCertainty::AfterInputUnknown);
+        ui_runtime.shutdown().unwrap();
+    }
+
+    fn primary_frame(config: &AppConfig) -> DynamicImage {
+        let mut frame =
+            DynamicImage::new_rgba8(config.screen.expected_width, config.screen.expected_height);
+        let friend = image::open(&config.templates.friend).unwrap();
+        frame
+            .copy_from(
+                &friend,
+                config.screen.friend_rect.x as u32,
+                config.screen.friend_rect.y as u32,
+            )
+            .unwrap();
+        frame
     }
 
     fn secondary_frame(config: &AppConfig) -> DynamicImage {

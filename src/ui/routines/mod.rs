@@ -5,6 +5,7 @@ mod invite;
 mod moderation;
 mod secondary_unread;
 mod startup;
+mod state_observation;
 
 pub(crate) use custom_action::{CustomActionPlan, CustomActionUi};
 pub(crate) use friend_delivery::{

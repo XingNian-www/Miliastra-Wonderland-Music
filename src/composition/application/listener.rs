@@ -175,7 +175,6 @@ impl ApplicationRuntime {
         completion_subscriber: &mut CompletionAdvanceSubscriber,
     ) -> Result<()> {
         let template_args = self.chat_templates.clone();
-        let ui_template_args = self.ui_templates.clone();
         let canvas = Canvas {
             width: self.config.screen.expected_width,
             height: self.config.screen.expected_height,
@@ -201,7 +200,7 @@ impl ApplicationRuntime {
         let mut force_scan_reason: Option<&'static str> = None;
         let mut primary_visible = false;
         let mut secondary_friend_bubble_fingerprint: Option<ChangeFingerprint> = None;
-        let mut secondary_hall_bubble_sequence: Vec<SecondaryHallBubble> = Vec::new();
+        let mut secondary_hall_bubble_sequence: Option<Vec<SecondaryHallBubble>> = None;
         let mut secondary_title_fingerprint: Option<ChangeFingerprint> = None;
         let mut secondary_identity: Option<SecondaryChatIdentity> = None;
         let mut target_missing_backoff = TARGET_MISSING_BACKOFF_INITIAL;
@@ -237,7 +236,6 @@ impl ApplicationRuntime {
                 frame_subscription
                     .as_ref()
                     .expect("frame subscription initialized above"),
-                &ui_handle,
                 &canvas,
             ) {
                 Ok(frame) => {
@@ -259,12 +257,22 @@ impl ApplicationRuntime {
                     }
                     target_missing_backoff = TARGET_MISSING_BACKOFF_INITIAL;
                     let ui_started = Instant::now();
-                    let ui_state_result =
-                        detect_ui_state(&frame.image, &ui_template_args, &self.config.screen);
+                    let ui_state_result: Result<(String, Option<UiStateKind>)> =
+                        match frame.ui_state.clone() {
+                            Some(UiStateObservation::Classified(state)) => {
+                                Ok((state.to_string(), state.stable_kind()))
+                            }
+                            Some(UiStateObservation::Failed { reason, .. }) => {
+                                Err(anyhow!(reason.to_string()))
+                            }
+                            None => Err(anyhow!(
+                                "UI runtime 未附带统一模板状态观察，拒绝局部重复判定"
+                            )),
+                        };
                     match &ui_state_result {
-                        Ok(ui_state) => self
+                        Ok((ui_state, _)) => self
                             .monitor
-                            .publish(MonitorEvent::UiState(ui_state.to_string())),
+                            .publish(MonitorEvent::UiState(ui_state.clone())),
                         Err(_) => self
                             .monitor
                             .publish(MonitorEvent::UiState("界面检测失败".to_string())),
@@ -273,14 +281,24 @@ impl ApplicationRuntime {
                     let listener_snapshot = self.business.chat_listener_snapshot()?;
                     let command_executing = self.business.scheduler_snapshot()?.is_busy();
                     match ui_state_result {
-                        Ok(ui_state)
+                        Ok((ui_state, None)) => {
+                            log::debug!("界面仍在过渡，暂停聊天扫描: {}", ui_state);
+                            log::info!(target: "timing",
+                                "主循环阶段耗时: total={}ms frame={}ms ui={}ms state={} scanned=false",
+                                elapsed_ms(loop_started),
+                                frame_ms,
+                                ui_ms,
+                                ui_state
+                            );
+                        }
+                        Ok((ui_state, Some(ui_kind)))
                             if listener_snapshot.mode == ChatListenerMode::Secondary
                                 && !listener_snapshot.temporary_primary =>
                         {
                             primary_visible = false;
                             last_fingerprint = None;
                             let secondary_started = Instant::now();
-                            let scanned = if ui_state.is_secondary() {
+                            let scanned = if ui_kind == UiStateKind::Secondary {
                                 self.run_secondary_listener_round(
                                     &frame.image,
                                     &mut secondary_friend_bubble_fingerprint,
@@ -301,7 +319,7 @@ impl ApplicationRuntime {
                                 );
                                 self.business.fail_chat_listener_mode_to_primary()?;
                                 secondary_friend_bubble_fingerprint = None;
-                                secondary_hall_bubble_sequence.clear();
+                                secondary_hall_bubble_sequence = None;
                                 secondary_title_fingerprint = None;
                                 secondary_identity = None;
                                 false
@@ -316,10 +334,10 @@ impl ApplicationRuntime {
                                 scanned
                             );
                         }
-                        Ok(ui_state) if ui_state.is_primary() => {
+                        Ok((_ui_state, Some(UiStateKind::Primary))) => {
                             if listener_snapshot.mode == ChatListenerMode::Primary {
                                 secondary_friend_bubble_fingerprint = None;
-                                secondary_hall_bubble_sequence.clear();
+                                secondary_hall_bubble_sequence = None;
                                 secondary_title_fingerprint = None;
                                 secondary_identity = None;
                             }
@@ -406,7 +424,6 @@ impl ApplicationRuntime {
                                     frame_subscription
                                         .as_ref()
                                         .expect("frame subscription initialized above"),
-                                    &ui_handle,
                                     &canvas,
                                 ) {
                                     Ok(frame) => {
@@ -530,10 +547,10 @@ impl ApplicationRuntime {
                                 }
                             }
                         }
-                        Ok(ui_state) => {
+                        Ok((ui_state, Some(UiStateKind::Secondary))) => {
                             primary_visible = false;
                             secondary_friend_bubble_fingerprint = None;
-                            secondary_hall_bubble_sequence.clear();
+                            secondary_hall_bubble_sequence = None;
                             secondary_title_fingerprint = None;
                             secondary_identity = None;
                             log::debug!("当前不是一级聊天界面，跳过聊天扫描: {}", ui_state);
@@ -545,6 +562,11 @@ impl ApplicationRuntime {
                                 ui_state
                             );
                             last_fingerprint = None;
+                        }
+                        Ok((ui_state, Some(UiStateKind::Unknown))) => {
+                            primary_visible = false;
+                            last_fingerprint = None;
+                            log::debug!("界面状态仍为过渡态，暂停聊天扫描: {}", ui_state);
                         }
                         Err(error) => {
                             primary_visible = false;
@@ -573,7 +595,7 @@ impl ApplicationRuntime {
                     primary_visible = false;
                     last_fingerprint = None;
                     secondary_friend_bubble_fingerprint = None;
-                    secondary_hall_bubble_sequence.clear();
+                    secondary_hall_bubble_sequence = None;
                     secondary_title_fingerprint = None;
                     secondary_identity = None;
                     let observed_window_detection_generation =

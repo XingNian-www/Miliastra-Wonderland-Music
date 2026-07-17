@@ -73,9 +73,9 @@ use crate::observation::chat::{
     PrimaryObservedMessage, ResolvedTemplateArgs, SECONDARY_TITLE_RECT, SecondaryChatIdentity,
     SecondaryChatObservation, SecondaryHallBubble, SecondaryObservedMessage,
     SecondaryRecognizedMessage, TemplateArgs, UnreadFriendHit, classify_title, count_chat_markers,
-    find_unread_friend_hits, hall_bubble_sequence_overlap, latest_incoming_bubble_rect,
-    latest_incoming_fingerprint, prepare_chat_scan, recognize_prepared_chat,
-    secondary_hall_bubbles,
+    find_unread_friend_hits, hall_bubble_sequence_is_retained_prefix, hall_bubble_sequence_overlap,
+    hall_bubble_sequences_stable, latest_incoming_bubble_rect, latest_incoming_fingerprint,
+    prepare_chat_scan, recognize_prepared_chat, secondary_hall_bubbles,
 };
 use crate::observation::decision::DecisionScreenLock;
 use crate::observation::shared::ObservationRead;
@@ -105,7 +105,8 @@ use crate::runtime::scheduler::{
     DiagnosticTaskCompletion, FormalTaskCompletion, FormalTaskEnqueueOutcome,
 };
 use crate::runtime::ui::{
-    FrameDemand, FrameDemandSubscription, FramePublication, UiRuntime, UiRuntimeHandle,
+    FrameDemand, FrameDemandSubscription, FramePublication, UiRuntime, UiStateKind,
+    UiStateObservation,
 };
 use crate::ui::atoms::GameUi;
 use crate::ui::change_detection::{ChangeFingerprint, change_stats, rect_chat_change_fingerprint};
@@ -124,7 +125,7 @@ use crate::ui::routines::{
     StartupUiConfig, StartupUiTemplates, ToggleMicrophone, ToggleMicrophoneEffect,
     UiResidencyOutcome, UiResidencyTarget,
 };
-use crate::ui::state::{ResolvedUiTemplateArgs, UiTemplateArgs, detect_ui_state};
+use crate::ui::state::{ResolvedUiTemplateArgs, TemplateUiStateClassifier, UiTemplateArgs};
 use crate::ui::template::{best_template_hit, find_template_hits};
 use anyhow::{Context, Result, anyhow};
 use enigo::Key;
@@ -179,7 +180,6 @@ impl ResolvedApplicationConfig {
         let friend_delivery =
             FriendDeliveryRoutineConfig::resolve(FriendDeliveryRoutineConfigSource {
                 screen: &app.screen,
-                ui_templates: ui_templates.clone(),
                 templates: &app.templates,
                 ocr: &app.ocr,
                 output: &app.output,
@@ -200,7 +200,6 @@ impl ResolvedApplicationConfig {
         );
         let moderation = ModerationRoutineConfig::resolve(ModerationRoutineConfigSource {
             residency: friend_delivery.clone(),
-            ui_templates: ui_templates.clone(),
             friend_panel_template: app.templates.friend_panel.clone(),
             search_panel_template: app.templates.friend_search_panel.clone(),
             more_settings_template: app.templates.friend_more_settings.clone(),
@@ -270,7 +269,6 @@ impl ResolvedApplicationConfig {
                 ),
             },
             friend_delivery.clone(),
-            ui_templates.clone(),
             app.window.target_process.clone(),
         );
         let secondary_unread = SecondaryUnreadRoutineConfig::resolve(
@@ -280,7 +278,6 @@ impl ResolvedApplicationConfig {
         );
         let invite = InviteRoutineConfig::resolve(InviteRoutineConfigSource {
             friend: friend_delivery.clone(),
-            confirm_list_region: app.invite.confirm_list_region.into(),
             view_star_template: app.templates.invite_view_star.clone(),
             view_star_region: app.invite.view_star_region.into(),
             goto_hall_template: app.templates.invite_goto_hall.clone(),
@@ -327,44 +324,28 @@ impl ResolvedApplicationConfig {
 
 fn receive_observation_frame(
     subscription: &FrameDemandSubscription,
-    ui: &UiRuntimeHandle,
     canvas: &Canvas,
 ) -> Result<Frame> {
     match subscription.recv().context("等待 UI runtime 发布观察帧")? {
-        FramePublication::Captured(published) => {
-            let frame = ui
-                .latest_frame()
-                .filter(|latest| latest.captured_at() >= published.captured_at())
-                .unwrap_or(published);
-            Ok(from_captured_frame(&frame, canvas))
-        }
-        FramePublication::Failed(failure) => {
-            if let Some(latest) = ui
-                .latest_frame()
-                .filter(|latest| latest.captured_at() >= failure.failed_at())
-            {
-                return Ok(from_captured_frame(&latest, canvas));
-            }
-            Err(anyhow!(
-                "UI runtime 观察帧截图失败 at {:?}: {}",
-                failure.failed_at(),
-                failure.reason()
-            ))
-        }
+        FramePublication::Captured(published) => Ok(from_captured_frame(&published, canvas)),
+        FramePublication::Failed(failure) => Err(anyhow!(
+            "UI runtime 观察帧截图失败 at {:?}: {}",
+            failure.failed_at(),
+            failure.reason()
+        )),
     }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 struct SecondaryBubbleProcessOutcome {
     processed: bool,
-    ocr_pending: bool,
+    confirmation_pending: bool,
 }
 
 pub(crate) struct ApplicationRuntime {
     config: AppConfig,
     ocr_args: ResolvedOcrArgs,
     chat_templates: ResolvedTemplateArgs,
-    ui_templates: ResolvedUiTemplateArgs,
     http_server: Option<http::HttpServer>,
     hotkeys: Option<hotkeys::HotkeyRuntime>,
     game_ui: GameUi,
@@ -859,10 +840,15 @@ impl ApplicationRuntime {
             player_runtime_handle.clone(),
             BusinessOperationIdAllocator::new(),
         );
-        let ui_runtime = UiRuntime::start_with_progress(
+        let ui_state_stable_count = config.resolve_stability_count(config.stability.ui_state_count);
+        let ui_state_classifier =
+            TemplateUiStateClassifier::new(ui_templates.clone(), config.screen.clone());
+        let ui_runtime = UiRuntime::start_with_progress_and_state_classifier(
             WindowsUiDevice::new(config.window.clone()),
             UI_RUNTIME_QUEUE_CAPACITY,
             Arc::new(monitor.clone()),
+            ui_state_classifier,
+            ui_state_stable_count,
         )?;
         let ui_handle = ui_runtime.handle();
         let game_ui = GameUi::runtime(ui_handle.clone());
@@ -965,7 +951,6 @@ impl ApplicationRuntime {
             config,
             ocr_args,
             chat_templates,
-            ui_templates,
             http_server: None,
             hotkeys: None,
             game_ui,
@@ -1057,13 +1042,15 @@ fn command_username(parsed: &RoutedCommand) -> &str {
 fn is_private_undercover_input(parsed: &RoutedCommand) -> bool {
     matches!(
         &parsed.command,
-        ModuleCommand::Undercover(UndercoverCommand::Vote(_))
+        ModuleCommand::Undercover(UndercoverCommand::Vote(_) | UndercoverCommand::Abstain)
     )
 }
 
 fn private_safe_command_log(parsed: &RoutedCommand) -> &str {
     match &parsed.command {
-        ModuleCommand::Undercover(UndercoverCommand::Vote(_)) => "谁是卧底投票",
+        ModuleCommand::Undercover(UndercoverCommand::Vote(_) | UndercoverCommand::Abstain) => {
+            "谁是卧底投票"
+        }
         _ => &parsed.raw,
     }
 }
@@ -1096,28 +1083,114 @@ fn secondary_fingerprint_changed(
     stats.mean_abs_diff >= 0.8 || stats.changed_ratio >= 0.01
 }
 
-fn secondary_new_bubble_start(
-    previous: &[SecondaryHallBubble],
-    current: &[SecondaryHallBubble],
-) -> Option<usize> {
-    if previous.is_empty() {
-        return Some(0);
-    }
-    let overlap = hall_bubble_sequence_overlap(previous, current);
-    (overlap > 0).then_some(overlap)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SecondaryHallSequenceDelta {
+    EstablishBaseline,
+    RetainedPrefix,
+    NoChange,
+    LostOverlap,
+    NewFrom(usize),
 }
 
-fn secondary_message_sender_rect(image: &DynamicImage, bubble: Rect) -> Rect {
-    let left = (bubble.x - 20).max(0);
-    let top = (bubble.y - 48).max(0);
-    let right = (bubble.right() + 20).min(image.width() as i32);
-    let bottom = bubble.y.min(image.height() as i32);
-    Rect::new(
-        left,
-        top,
-        (right - left).max(1) as u32,
-        (bottom - top).max(1) as u32,
-    )
+fn secondary_hall_sequence_delta(
+    previous: Option<&[SecondaryHallBubble]>,
+    current: &[SecondaryHallBubble],
+) -> SecondaryHallSequenceDelta {
+    let Some(previous) = previous else {
+        return SecondaryHallSequenceDelta::EstablishBaseline;
+    };
+    if previous.is_empty() {
+        return if current.is_empty() {
+            SecondaryHallSequenceDelta::NoChange
+        } else {
+            SecondaryHallSequenceDelta::NewFrom(0)
+        };
+    }
+    if hall_bubble_sequence_is_retained_prefix(previous, current) {
+        return SecondaryHallSequenceDelta::RetainedPrefix;
+    }
+    let overlap = hall_bubble_sequence_overlap(previous, current);
+    if overlap == 0 {
+        SecondaryHallSequenceDelta::LostOverlap
+    } else if overlap == current.len() {
+        SecondaryHallSequenceDelta::NoChange
+    } else {
+        SecondaryHallSequenceDelta::NewFrom(overlap)
+    }
+}
+
+const SECONDARY_HALL_FALLBACK_SENDER: &str = "二级大厅";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SecondaryHallMessageKind {
+    Ignored,
+    Command,
+    TurtleQuestion,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SecondaryHallMessageClassification {
+    kind: SecondaryHallMessageKind,
+    requires_sender: bool,
+}
+
+fn secondary_hall_command_text(text: &str) -> Option<&str> {
+    let trimmed = text.trim();
+    if trimmed.starts_with('#') || trimmed.starts_with('＃') {
+        return Some(trimmed);
+    }
+    text.find('@').map(|index| text[index..].trim())
+}
+
+fn classify_secondary_hall_message(
+    text: &str,
+    command: Option<&ModuleCommand>,
+    accepts_turtle_questions: bool,
+) -> SecondaryHallMessageClassification {
+    if let Some(command) = command {
+        return SecondaryHallMessageClassification {
+            kind: SecondaryHallMessageKind::Command,
+            requires_sender: command.requires_hall_sender(),
+        };
+    }
+    if accepts_turtle_questions
+        && turtle_soup::parse_question_message(text, Some(SECONDARY_HALL_FALLBACK_SENDER)).is_some()
+    {
+        return SecondaryHallMessageClassification {
+            kind: SecondaryHallMessageKind::TurtleQuestion,
+            requires_sender: true,
+        };
+    }
+    SecondaryHallMessageClassification {
+        kind: SecondaryHallMessageKind::Ignored,
+        requires_sender: false,
+    }
+}
+
+fn normalize_secondary_sender_name(value: &str) -> String {
+    let value = value.trim();
+    let mut rightmost_pair = None;
+    for (open, close) in [('(', ')'), ('（', '）')] {
+        let Some(close_index) = value.rfind(close) else {
+            continue;
+        };
+        let Some(open_index) = value[..close_index].rfind(open) else {
+            continue;
+        };
+        if rightmost_pair
+            .as_ref()
+            .is_none_or(|(best_close, _, _)| close_index > *best_close)
+        {
+            rightmost_pair = Some((close_index, open_index, open.len_utf8()));
+        }
+    }
+    if let Some((close_index, open_index, open_len)) = rightmost_pair {
+        let remark = value[open_index + open_len..close_index].trim();
+        if !remark.is_empty() {
+            return remark.to_string();
+        }
+    }
+    value.to_string()
 }
 
 fn secondary_optional_fingerprint_changed(
@@ -1169,6 +1242,103 @@ fn web_tool_panel_response_rect(config: &AppConfig) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secondary_sender_uses_the_rightmost_parenthesized_name() {
+        assert_eq!(
+            normalize_secondary_sender_name("玩家(自带内容)(大厅备注)"),
+            "大厅备注"
+        );
+        assert_eq!(
+            normalize_secondary_sender_name("玩家（自带内容）（大厅备注）"),
+            "大厅备注"
+        );
+        assert_eq!(normalize_secondary_sender_name("普通昵称"), "普通昵称");
+        assert_eq!(
+            normalize_secondary_sender_name("玩家(未闭合"),
+            "玩家(未闭合"
+        );
+    }
+
+    #[test]
+    fn secondary_hall_extracts_only_supported_command_prefixes() {
+        assert_eq!(secondary_hall_command_text(" #状态 "), Some("#状态"));
+        assert_eq!(secondary_hall_command_text("＃状态"), Some("＃状态"));
+        assert_eq!(
+            secondary_hall_command_text("聊天内容 @点歌 测试"),
+            Some("@点歌 测试")
+        );
+        assert_eq!(secondary_hall_command_text("普通聊天"), None);
+    }
+
+    #[test]
+    fn secondary_hall_scans_sender_only_for_actor_dependent_inputs() {
+        for command in [
+            ModuleCommand::Playback(PlaybackCommand::Status),
+            ModuleCommand::Administration(AdministrationCommand::Help),
+            ModuleCommand::IdiomChain(idiom_chain::IdiomChainCommand::Hint),
+            ModuleCommand::CardGame(LandlordCommand::Status),
+            ModuleCommand::TurtleSoup(turtle_soup::TurtleSoupCommand::Status),
+            ModuleCommand::Undercover(UndercoverCommand::Retry),
+        ] {
+            let classification = classify_secondary_hall_message("#状态", Some(&command), true);
+            assert_eq!(classification.kind, SecondaryHallMessageKind::Command);
+            assert!(!classification.requires_sender, "command={command:?}");
+        }
+
+        for command in [
+            ModuleCommand::IdiomChain(idiom_chain::IdiomChainCommand::Submit(
+                "画蛇添足".to_string(),
+            )),
+            ModuleCommand::CardGame(LandlordCommand::Play("3".to_string())),
+            ModuleCommand::TurtleSoup(turtle_soup::TurtleSoupCommand::Start),
+            ModuleCommand::Undercover(UndercoverCommand::Describe("描述".to_string())),
+        ] {
+            let classification = classify_secondary_hall_message("#输入", Some(&command), false);
+            assert_eq!(classification.kind, SecondaryHallMessageKind::Command);
+            assert!(classification.requires_sender, "command={command:?}");
+        }
+
+        let question = classify_secondary_hall_message("#男人是管理员吗", None, true);
+        assert_eq!(question.kind, SecondaryHallMessageKind::TurtleQuestion);
+        assert!(question.requires_sender);
+
+        let ignored = classify_secondary_hall_message("普通聊天", None, true);
+        assert_eq!(ignored.kind, SecondaryHallMessageKind::Ignored);
+        assert!(!ignored.requires_sender);
+    }
+
+    #[test]
+    fn secondary_hall_routes_common_commands_before_deciding_sender_ocr() {
+        use crate::features::entertainment::EntertainmentKind;
+
+        let classify = |text, active| {
+            let command_text = secondary_hall_command_text(text).expect("command prefix");
+            let envelope = CommandEnvelope::new(
+                text,
+                SECONDARY_HALL_FALLBACK_SENDER,
+                "blue",
+                command_text,
+                CommandObservation::default(),
+            )
+            .expect("hall command envelope");
+            let routed = ChatCommandRouter::without_custom_workflow()
+                .route(&envelope, active)
+                .expect("routed hall command");
+            classify_secondary_hall_message(text, Some(&routed.command), false)
+        };
+
+        assert!(!classify("@点歌 测试", None).requires_sender);
+        assert!(!classify("@帮助", None).requires_sender);
+        assert!(classify("#斗地主", None).requires_sender);
+        assert!(!classify("#状态", Some(EntertainmentKind::Landlord)).requires_sender);
+        assert!(classify("#出3", Some(EntertainmentKind::Landlord)).requires_sender);
+        assert!(!classify("#提示", Some(EntertainmentKind::IdiomChain)).requires_sender);
+        assert!(classify("#画蛇添足", Some(EntertainmentKind::IdiomChain)).requires_sender);
+        assert!(classify("#状态", Some(EntertainmentKind::Undercover)).requires_sender);
+        assert!(!classify("#重试", Some(EntertainmentKind::Undercover)).requires_sender);
+        assert!(!classify("#状态", Some(EntertainmentKind::TurtleSoup)).requires_sender);
+    }
 
     #[test]
     fn secondary_listener_resides_in_current_hall() {
@@ -1393,6 +1563,23 @@ mod tests {
     #[test]
     fn secondary_decision_reader_accepts_first_bubble_after_empty_baseline() {
         let mut image = image::RgbaImage::new(1920, 1080);
+        for y in 260..278 {
+            for x in 418..479 {
+                image.put_pixel(x, y, image::Rgba([195, 193, 185, 255]));
+            }
+        }
+        let center_x = 346_i32;
+        let center_y = 308_i32;
+        let radius_squared = 40_i32.pow(2);
+        for y in 264_i32..352 {
+            for x in 302_i32..390 {
+                let dx = x - center_x;
+                let dy = y - center_y;
+                if dx * dx + dy * dy <= radius_squared {
+                    image.put_pixel(x as u32, y as u32, image::Rgba([220, 220, 220, 255]));
+                }
+            }
+        }
         for y in 300..354 {
             for x in 415..700 {
                 image.put_pixel(x, y, image::Rgba([62, 71, 89, 255]));
@@ -1402,7 +1589,30 @@ mod tests {
             secondary_hall_bubbles(&DynamicImage::ImageRgba8(image)).expect("secondary bubbles");
 
         assert!(!current.is_empty());
-        assert_eq!(secondary_new_bubble_start(&[], &current), Some(0));
+        assert_eq!(
+            secondary_hall_sequence_delta(None, &current),
+            SecondaryHallSequenceDelta::EstablishBaseline
+        );
+        assert_eq!(
+            secondary_hall_sequence_delta(Some(&[]), &current),
+            SecondaryHallSequenceDelta::NewFrom(0)
+        );
+        assert_eq!(
+            secondary_hall_sequence_delta(Some(&current), &[]),
+            SecondaryHallSequenceDelta::LostOverlap
+        );
+    }
+
+    #[test]
+    fn secondary_hall_listener_distinguishes_uninitialized_from_empty_baseline() {
+        assert_eq!(
+            secondary_hall_sequence_delta(None, &[]),
+            SecondaryHallSequenceDelta::EstablishBaseline
+        );
+        assert_eq!(
+            secondary_hall_sequence_delta(Some(&[]), &[]),
+            SecondaryHallSequenceDelta::NoChange
+        );
     }
 
     #[test]

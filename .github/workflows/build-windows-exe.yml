@@ -11,6 +11,7 @@ on:
     branches:
       - main
       - dev
+      - v2
     paths:
       - .cargo/**
       - .github/workflows/build-windows-exe.yml

@@ -1003,6 +1003,23 @@ fn confirm_friend_conversation(
 ) -> std::result::Result<(), UiRoutineFailure> {
     context.publish_progress(UiRoutineProgressStage::ConfirmingUi);
     let target = normalize_lock_text(recipient);
+    if config.fast_match {
+        let image = capture_normalized(
+            context,
+            config,
+            "confirm_friend_conversation",
+            InputCertainty::AfterInputUnknown,
+        )?;
+        if conversation_confirmation_key(ocr, &image, config, &target)?.is_some() {
+            return Ok(());
+        }
+        return Err(UiRoutineFailure::new(
+            InputCertainty::ConfirmedFailure,
+            "confirm_friend_conversation",
+            "selected conversation title did not identify a private friend chat",
+        ));
+    }
+
     let attempts = confirmation_attempts(config);
     let mut stable_key = None;
     let mut streak = 0_u32;
@@ -1034,11 +1051,7 @@ fn confirm_friend_conversation(
     Err(UiRoutineFailure::new(
         InputCertainty::ConfirmedFailure,
         "confirm_friend_conversation",
-        if config.fast_match {
-            "selected conversation title did not stably identify a private friend chat"
-        } else {
-            "selected conversation did not stably contain the complete friend name"
-        },
+        "selected conversation did not stably contain the complete friend name",
     ))
 }
 
@@ -1565,7 +1578,7 @@ mod tests {
                 &fast_routine,
                 &normalize_lock_text("不存在的好友")
             )
-            .expect("accept any stable private-chat title in fast mode"),
+            .expect("accept any private-chat title in fast mode"),
             Some(normalize_lock_text("香菜"))
         );
         fast_routine.fast_match = false;
@@ -1655,6 +1668,22 @@ mod tests {
 
         fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
             locate_stable_friend_row(context, &self.ocr, &self.config, &self.recipient)
+        }
+    }
+
+    struct ConfirmFriendConversationRoutine {
+        ocr: OcrRuntimeHandle,
+        config: FriendDeliveryRoutineConfig,
+        recipient: String,
+    }
+
+    impl sealed::UiRoutineSealed for ConfirmFriendConversationRoutine {}
+
+    impl UiRoutine for ConfirmFriendConversationRoutine {
+        type Output = std::result::Result<(), UiRoutineFailure>;
+
+        fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
+            confirm_friend_conversation(context, &self.ocr, &self.config, &self.recipient)
         }
     }
 
@@ -1756,6 +1785,83 @@ mod tests {
             }
             Ok(Vec::new())
         }
+    }
+
+    struct OneShotFriendTitleOcrDevice {
+        title_size: (u32, u32),
+        title_reads: Arc<Mutex<usize>>,
+    }
+
+    impl OcrDevice for OneShotFriendTitleOcrDevice {
+        fn recognize_lines(&mut self, image: &DynamicImage) -> Result<Vec<OcrLine>> {
+            if (image.width(), image.height()) != self.title_size {
+                return Ok(Vec::new());
+            }
+            let mut title_reads = self.title_reads.lock().unwrap();
+            *title_reads += 1;
+            if *title_reads > 1 {
+                return Ok(Vec::new());
+            }
+            Ok(vec![OcrLine {
+                text: "原昵称".to_string(),
+                confidence: 1.0,
+                bbox: Rect::new(0, 0, image.width(), image.height()),
+            }])
+        }
+    }
+
+    #[test]
+    fn fast_match_accepts_a_private_title_after_one_ocr_read() {
+        let mut config = AppConfig::load(Path::new("config.yaml")).unwrap();
+        config.friend_delivery.fast_match = true;
+        config.timing.workflow.default_timeout_ms = 20;
+        config.timing.workflow.default_poll_ms = 1;
+        let state = Arc::new(Mutex::new(TestUiState {
+            conversation: Conversation::Friend("原昵称".to_string()),
+            pasted: Vec::new(),
+            selected_friends: Vec::new(),
+            hall_clicks: 0,
+            scrolls: 0,
+            send_attempts: 0,
+            fail_send_attempt: None,
+        }));
+        let ui_runtime = start_test_ui_runtime(
+            RecordingDevice {
+                frame: secondary_frame(&config),
+                state,
+                friend_rows: Vec::new(),
+                hall_point: (-1, -1),
+            },
+            &config,
+            1,
+        );
+        let title_reads = Arc::new(Mutex::new(0));
+        let ocr_runtime = OcrRuntime::start(
+            OneShotFriendTitleOcrDevice {
+                title_size: (SECONDARY_TITLE_RECT.width, SECONDARY_TITLE_RECT.height),
+                title_reads: title_reads.clone(),
+            },
+            1,
+        )
+        .unwrap();
+        let mut routine_config = FriendDeliveryRoutineConfig::from_app(&config);
+        routine_config.stable_count = 2;
+
+        ui_runtime
+            .handle()
+            .submit(ConfirmFriendConversationRoutine {
+                ocr: ocr_runtime.handle(),
+                config: routine_config,
+                recipient: "萌萌萌萌".to_string(),
+            })
+            .unwrap()
+            .wait()
+            .unwrap()
+            .expect("one private title observation must confirm fast match");
+
+        assert_eq!(*title_reads.lock().unwrap(), 1);
+        ui_runtime.shutdown().unwrap();
+        ocr_runtime.shutdown().unwrap();
     }
 
     struct TitleFallbackOcrDevice {

@@ -61,6 +61,8 @@ const PLAYER_SEARCH_QUEUE_CAPACITY: usize = 16;
 #[serde(deny_unknown_fields)]
 pub struct StabilityConfig {
     pub default_count: u32,
+    pub ui_state_count: u32,
+    pub secondary_hall_count: u32,
 }
 
 pub(crate) fn resolve_stability_count(local: u32, global: u32) -> u32 {
@@ -136,10 +138,6 @@ impl AppConfig {
         for (rect, field) in [
             (self.invite.friend_list_region, "invite.friend_list_region"),
             (self.invite.friend_chat_region, "invite.friend_chat_region"),
-            (
-                self.invite.confirm_list_region,
-                "invite.confirm_list_region",
-            ),
             (self.invite.view_star_region, "invite.view_star_region"),
             (self.invite.goto_hall_region, "invite.goto_hall_region"),
             (self.invite.enter_hall_region, "invite.enter_hall_region"),
@@ -795,6 +793,8 @@ impl HotkeyConfig {
 pub struct FriendDeliveryConfig {
     /// Maximum automatic retries for a message that is confirmed not to have been sent.
     pub auto_retry_count: u32,
+    /// Skip the second target-name match after a unique friend row has been selected.
+    pub fast_match: bool,
 }
 
 #[cfg(test)]
@@ -1195,6 +1195,7 @@ stale_timeout_ms: 7500
             "logging.rotate_daily",
             "logging.retain_days",
             "friend_delivery.auto_retry_count",
+            "friend_delivery.fast_match",
             "custom_workflows.wait_template_absent_stable_default",
             "custom_workflows.max_hold_key_seconds",
             "invite.friend_name_stable_count",
@@ -1274,6 +1275,19 @@ stale_timeout_ms: 7500
         assert_eq!(resolve_stability_count(1, 3), 3);
         assert_eq!(resolve_stability_count(0, 3), 3);
         assert_eq!(resolve_stability_count(1, 1), 2);
+
+        let config: AppConfig =
+            serde_yaml::from_str(bundled_config_yaml()).expect("default app config");
+        assert_eq!(config.stability.ui_state_count, 0);
+        assert_eq!(config.stability.secondary_hall_count, 0);
+        assert_eq!(
+            config.resolve_stability_count(config.stability.ui_state_count),
+            config.stability.default_count
+        );
+        assert_eq!(
+            config.resolve_stability_count(config.stability.secondary_hall_count),
+            config.stability.default_count
+        );
     }
 
     #[test]

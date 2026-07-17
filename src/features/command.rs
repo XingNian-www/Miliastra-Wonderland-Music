@@ -253,4 +253,31 @@ impl ModuleCommand {
     pub(crate) fn scopes_lock_to_actor(&self) -> bool {
         matches!(self, Self::CardGame(_) | Self::Undercover(_))
     }
+
+    /// Whether a command observed in the current hall needs the actual speaker identity.
+    ///
+    /// Logging and audit metadata do not count as an identity dependency. This is reserved for
+    /// commands whose business result, authorization, turn ownership, or delivery target changes
+    /// with the speaker.
+    pub(crate) fn requires_hall_sender(&self) -> bool {
+        match self {
+            Self::SongRequest(_) | Self::Playback(_) | Self::Hall(_) | Self::Administration(_) => {
+                false
+            }
+            Self::IdiomChain(command) => matches!(
+                command,
+                IdiomChainCommand::Start { .. }
+                    | IdiomChainCommand::Submit(_)
+                    | IdiomChainCommand::Stop
+            ),
+            Self::CardGame(command) => {
+                !matches!(command, LandlordCommand::Status | LandlordCommand::Retry)
+            }
+            Self::TurtleSoup(command) => matches!(command, TurtleSoupCommand::Start),
+            Self::Undercover(command) => !matches!(command, UndercoverCommand::Retry),
+            // These modules are friend-only today, or expose the triggering user as part of their
+            // execution contract. Keep them conservative if a hall route is added later.
+            Self::Invite(_) | Self::Moderation(_) | Self::CustomWorkflow(_) => true,
+        }
+    }
 }

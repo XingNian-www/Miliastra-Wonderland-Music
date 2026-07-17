@@ -5,16 +5,16 @@ use super::friend_delivery::{
     FriendDeliveryRoutineConfig, UiResidencyOutcome, UiResidencyTarget, before_input_failure,
     capture_normalized, restore_residency, sleep_ms,
 };
+use super::state_observation::wait_for_stable_ui_kind;
 use crate::adapters::windows::resolve_game_executable;
 use crate::runtime::ocr::{OcrPriority, OcrRuntimeHandle};
 use crate::runtime::ui::{
     InputCertainty, UiOperation, UiRoutine, UiRoutineContext, UiRoutineFailure, UiRuntimeHandle,
-    UiSubmitError, sealed,
+    UiStateKind, UiSubmitError, sealed,
 };
 use crate::text::normalize_comparison_text as normalize_lock_text;
 use crate::ui::change_detection::{change_stats, rect_chat_change_fingerprint};
 use crate::ui::geometry::{Point, Rect, crop_canvas};
-use crate::ui::state::{ResolvedUiTemplateArgs, detect_ui_state};
 use crate::ui::template::best_template_hit;
 use enigo::Key;
 
@@ -119,7 +119,6 @@ impl StartupUi {
 pub(crate) struct StartupRoutineConfig {
     startup: StartupUiConfig,
     residency: FriendDeliveryRoutineConfig,
-    templates: ResolvedUiTemplateArgs,
     target_process: String,
 }
 
@@ -164,13 +163,11 @@ impl StartupRoutineConfig {
     pub(crate) fn resolve(
         startup: StartupUiConfig,
         residency: FriendDeliveryRoutineConfig,
-        templates: ResolvedUiTemplateArgs,
         target_process: String,
     ) -> Self {
         Self {
             startup,
             residency,
-            templates,
             target_process,
         }
     }
@@ -248,7 +245,16 @@ fn execute_enter_game(
     let mut paimon_streak = 0_u32;
     let mut clicked = false;
     while Instant::now() < deadline {
-        let image = capture_normalized(context, &config.residency, "observe_enter_game")?;
+        let image = capture_normalized(
+            context,
+            &config.residency,
+            "observe_enter_game",
+            if clicked {
+                InputCertainty::AfterInputUnknown
+            } else {
+                InputCertainty::BeforeInput
+            },
+        )?;
         if template_visible(
             &image,
             config.startup.main_ui_region,
@@ -434,7 +440,12 @@ fn confirm_wonderland_transition(
     let deadline =
         Instant::now() + Duration::from_millis(config.startup.wonderland_confirm_absent_timeout_ms);
     while Instant::now() < deadline {
-        let image = capture_normalized(context, &config.residency, "confirm_wonderland_absent")?;
+        let image = capture_normalized(
+            context,
+            &config.residency,
+            "confirm_wonderland_absent",
+            InputCertainty::AfterInputUnknown,
+        )?;
         if !template_visible(
             &image,
             region,
@@ -459,12 +470,22 @@ fn wait_region_stable(
 ) -> Result<(), UiRoutineFailure> {
     let deadline =
         Instant::now() + Duration::from_millis(config.startup.wonderland_confirm_stable_timeout_ms);
-    let image = capture_normalized(context, &config.residency, "observe_wonderland_transition")?;
+    let image = capture_normalized(
+        context,
+        &config.residency,
+        "observe_wonderland_transition",
+        InputCertainty::AfterInputUnknown,
+    )?;
     let mut previous = rect_chat_change_fingerprint(&image, region)
         .map_err(|error| before_input_failure("observe_wonderland_transition", error))?;
     while Instant::now() < deadline {
         sleep_ms(config.startup.poll_ms);
-        let image = capture_normalized(context, &config.residency, "confirm_wonderland_stable")?;
+        let image = capture_normalized(
+            context,
+            &config.residency,
+            "confirm_wonderland_stable",
+            InputCertainty::AfterInputUnknown,
+        )?;
         let current = rect_chat_change_fingerprint(&image, region)
             .map_err(|error| before_input_failure("confirm_wonderland_stable", error))?;
         let stats = change_stats(&previous, &current);
@@ -488,70 +509,68 @@ fn wait_for_primary(
     allow_escape: bool,
     timeout_ms: u64,
 ) -> UiResidencyOutcome {
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-    let mut streak = 0_u32;
-    while Instant::now() < deadline {
-        let image = match capture_normalized(context, &config.residency, "confirm_startup_primary")
-        {
-            Ok(image) => image,
-            Err(failure) => return UiResidencyOutcome::Failed(failure),
-        };
-        let state = match detect_ui_state(&image, &config.templates, &config.residency.screen) {
-            Ok(state) => state,
-            Err(error) => {
-                return UiResidencyOutcome::Failed(before_input_failure(
+    let result = if allow_escape {
+        match wait_for_stable_ui_kind(
+            context,
+            config.residency.state_observation(),
+            None,
+            timeout_ms,
+            "confirm_startup_primary",
+            InputCertainty::ConfirmedFailure,
+        ) {
+            Ok(UiStateKind::Primary) => Ok(UiStateKind::Primary),
+            Ok(UiStateKind::Secondary) => {
+                if let Err(error) = context.device().press_key(Key::Escape) {
+                    return UiResidencyOutcome::Failed(UiRoutineFailure::new(
+                        InputCertainty::AfterInputUnknown,
+                        "recover_startup_primary",
+                        format!("{error:#}"),
+                    ));
+                }
+                wait_for_stable_ui_kind(
+                    context,
+                    config.residency.state_observation(),
+                    Some(UiStateKind::Primary),
+                    timeout_ms,
                     "confirm_startup_primary",
-                    error,
-                ));
-            }
-        };
-        if state.is_primary() {
-            streak = streak.saturating_add(1);
-            if streak >= config.residency.stable_count {
-                return UiResidencyOutcome::Confirmed(UiResidencyTarget::Primary);
-            }
-        } else {
-            streak = 0;
-            if allow_escape
-                && state.is_secondary()
-                && let Err(error) = context.device().press_key(Key::Escape)
-            {
-                return UiResidencyOutcome::Failed(UiRoutineFailure::new(
                     InputCertainty::AfterInputUnknown,
-                    "recover_startup_primary",
-                    format!("{error:#}"),
-                ));
+                )
             }
+            Ok(UiStateKind::Unknown) => unreachable!("unknown UI state is never stable"),
+            Err(failure) => Err(failure),
         }
-        sleep_ms(config.startup.poll_ms);
+    } else {
+        wait_for_stable_ui_kind(
+            context,
+            config.residency.state_observation(),
+            Some(UiStateKind::Primary),
+            timeout_ms,
+            "confirm_startup_primary",
+            InputCertainty::AfterInputUnknown,
+        )
+    };
+    match result {
+        Ok(UiStateKind::Primary) => UiResidencyOutcome::Confirmed(UiResidencyTarget::Primary),
+        Ok(_) => unreachable!("primary wait returned a non-primary state"),
+        Err(failure) => UiResidencyOutcome::Failed(failure),
     }
-    UiResidencyOutcome::Failed(UiRoutineFailure::new(
-        InputCertainty::ConfirmedFailure,
-        "confirm_startup_primary",
-        "primary UI did not become stable before timeout",
-    ))
 }
 
 fn observe_primary(
     context: &mut UiRoutineContext<'_>,
     config: &StartupRoutineConfig,
 ) -> UiResidencyOutcome {
-    let image = match capture_normalized(context, &config.residency, "observe_startup_residency") {
-        Ok(image) => image,
-        Err(failure) => return UiResidencyOutcome::Failed(failure),
-    };
-    match detect_ui_state(&image, &config.templates, &config.residency.screen) {
-        Ok(state) if state.is_primary() => {
-            UiResidencyOutcome::Confirmed(UiResidencyTarget::Primary)
-        }
-        Ok(_) => UiResidencyOutcome::Failed(UiRoutineFailure::new(
-            InputCertainty::ConfirmedFailure,
-            "observe_startup_residency",
-            "startup completed without a confirmed primary residency",
-        )),
-        Err(error) => {
-            UiResidencyOutcome::Failed(before_input_failure("observe_startup_residency", error))
-        }
+    match wait_for_stable_ui_kind(
+        context,
+        config.residency.state_observation(),
+        Some(UiStateKind::Primary),
+        config.startup.final_primary_timeout_ms,
+        "observe_startup_residency",
+        InputCertainty::ConfirmedFailure,
+    ) {
+        Ok(UiStateKind::Primary) => UiResidencyOutcome::Confirmed(UiResidencyTarget::Primary),
+        Ok(_) => unreachable!("primary wait returned a non-primary state"),
+        Err(failure) => UiResidencyOutcome::Failed(failure),
     }
 }
 
@@ -586,7 +605,12 @@ fn stable_template_visible(
     threshold: f32,
 ) -> Result<bool, UiRoutineFailure> {
     for _ in 0..TEMPLATE_STABLE_HITS {
-        let image = capture_normalized(context, &config.residency, "confirm_startup_template")?;
+        let image = capture_normalized(
+            context,
+            &config.residency,
+            "confirm_startup_template",
+            InputCertainty::AfterInputUnknown,
+        )?;
         if !template_visible(&image, region, template, threshold)? {
             return Ok(false);
         }
@@ -605,7 +629,12 @@ fn wait_template_hit(
 ) -> Result<Option<Point>, UiRoutineFailure> {
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     while Instant::now() < deadline {
-        let image = capture_normalized(context, &config.residency, "locate_startup_template")?;
+        let image = capture_normalized(
+            context,
+            &config.residency,
+            "locate_startup_template",
+            InputCertainty::AfterInputUnknown,
+        )?;
         if let Some(hit) = best_template_hit(&image, Some(region), template, threshold)
             .map_err(|error| before_input_failure("locate_startup_template", error))?
         {

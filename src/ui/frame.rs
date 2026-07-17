@@ -6,7 +6,7 @@ use image::DynamicImage;
 use image::GenericImageView;
 use image::imageops::FilterType;
 
-use crate::runtime::ui::CapturedFrame;
+use crate::runtime::ui::{CapturedFrame, UiStateObservation};
 use crate::ui::atoms::GameUi;
 
 #[derive(Clone, Debug)]
@@ -20,6 +20,7 @@ pub(crate) struct Canvas {
 pub(crate) struct Frame {
     pub(crate) image: Arc<DynamicImage>,
     pub(crate) captured_at: Instant,
+    pub(crate) ui_state: Option<UiStateObservation>,
 }
 
 pub(crate) fn load_frame(canvas: &Canvas, game_ui: &GameUi) -> Result<Frame> {
@@ -27,7 +28,11 @@ pub(crate) fn load_frame(canvas: &Canvas, game_ui: &GameUi) -> Result<Frame> {
     let image = Arc::new(game_ui.capture()?);
     let captured_at = Instant::now();
     let image = normalize_frame(image, canvas, started);
-    Ok(Frame { image, captured_at })
+    Ok(Frame {
+        image,
+        captured_at,
+        ui_state: None,
+    })
 }
 
 pub(crate) fn from_captured_frame(frame: &CapturedFrame, canvas: &Canvas) -> Frame {
@@ -35,6 +40,7 @@ pub(crate) fn from_captured_frame(frame: &CapturedFrame, canvas: &Canvas) -> Fra
     Frame {
         image: normalize_frame(frame.image_arc(), canvas, started),
         captured_at: frame.captured_at(),
+        ui_state: frame.ui_state().cloned(),
     }
 }
 

@@ -2,7 +2,7 @@ use enigo::Key;
 
 use super::friend_delivery::{
     FriendDeliveryRoutineConfig, UiResidencyOutcome, UiResidencyTarget, before_input_failure,
-    capture_normalized, restore_residency, sleep_ms,
+    capture_normalized, confirm_primary_residency, restore_residency, sleep_ms,
 };
 #[cfg(test)]
 use crate::config::AppConfig;
@@ -311,7 +311,12 @@ fn read_hall_info_transaction(
         if index > 0 {
             sleep_ms(config.sample_interval_ms);
         }
-        let image = capture_normalized(context, &config.residency, "capture_hall_info")?;
+        let image = capture_normalized(
+            context,
+            &config.residency,
+            "capture_hall_info",
+            InputCertainty::AfterInputUnknown,
+        )?;
         let sample = read_hall_sample(ocr, &image, config)?;
         log::info!(
             "大厅检测 OCR 采样: {}/{} name={} time={} minutes={}",
@@ -373,7 +378,10 @@ fn finish_hall_page(
                 format!("{error:#}"),
             ));
         }
-        sleep_ms(config.residency.click_ms);
+        return match confirm_primary_residency(context, &config.residency) {
+            Ok(()) => UiResidencyOutcome::Confirmed(UiResidencyTarget::Primary),
+            Err(failure) => UiResidencyOutcome::Failed(failure),
+        };
     }
     match restore_residency(context, ocr, &config.residency, UiResidencyTarget::Primary) {
         Ok(()) => UiResidencyOutcome::Confirmed(UiResidencyTarget::Primary),
@@ -393,6 +401,7 @@ mod tests {
     use crate::runtime::ocr::{OcrDevice, OcrLine, OcrRuntime};
     use crate::runtime::ui::{UiDevice, UiRuntime};
     use crate::ui::geometry::Rect;
+    use crate::ui::state::{TemplateUiStateClassifier, UiTemplateArgs};
 
     struct HallDevice {
         frame: DynamicImage,
@@ -414,8 +423,60 @@ mod tests {
         }
     }
 
+    struct TransitionHallDevice {
+        primary: DynamicImage,
+        keys: Arc<Mutex<Vec<Key>>>,
+        captures_after_escape: usize,
+    }
+
+    impl UiDevice for TransitionHallDevice {
+        fn capture(&mut self) -> Result<DynamicImage> {
+            let last_key = self.keys.lock().unwrap().last().cloned();
+            match last_key {
+                None => Ok(self.primary.clone()),
+                Some(Key::Escape) => {
+                    self.captures_after_escape += 1;
+                    if self.captures_after_escape <= 2 {
+                        Ok(DynamicImage::new_rgba8(
+                            self.primary.width(),
+                            self.primary.height(),
+                        ))
+                    } else {
+                        Ok(self.primary.clone())
+                    }
+                }
+                Some(_) => Ok(DynamicImage::new_rgba8(
+                    self.primary.width(),
+                    self.primary.height(),
+                )),
+            }
+        }
+
+        fn ensure_ready(&mut self, _after_activate_ms: u64) -> Result<()> {
+            Ok(())
+        }
+
+        fn press_key(&mut self, key: Key) -> Result<()> {
+            self.keys.lock().unwrap().push(key);
+            Ok(())
+        }
+    }
+
     struct HallOcrDevice {
         calls: usize,
+    }
+
+    fn start_test_ui_runtime(device: impl UiDevice, config: &AppConfig) -> UiRuntime {
+        UiRuntime::start_with_state_classifier(
+            device,
+            2,
+            TemplateUiStateClassifier::new(
+                UiTemplateArgs::default().resolve(&config.templates, &config.ocr),
+                config.screen.clone(),
+            ),
+            config.resolve_stability_count(0),
+        )
+        .unwrap()
     }
 
     impl OcrDevice for HallOcrDevice {
@@ -444,14 +505,13 @@ mod tests {
         config.timing.workflow.default_timeout_ms = 20;
         config.timing.workflow.default_poll_ms = 1;
         let keys = Arc::new(Mutex::new(Vec::new()));
-        let ui_runtime = UiRuntime::start(
+        let ui_runtime = start_test_ui_runtime(
             HallDevice {
                 frame: primary_frame(&config),
                 keys: keys.clone(),
             },
-            2,
-        )
-        .unwrap();
+            &config,
+        );
         let ocr_runtime = OcrRuntime::start(HallOcrDevice { calls: 0 }, 4).unwrap();
         let hall_ui = HallUi::new(
             ui_runtime.handle(),
@@ -472,10 +532,63 @@ mod tests {
                 ..
             }
         ));
+        assert!(
+            matches!(
+                outcome.residency(),
+                UiResidencyOutcome::Confirmed(UiResidencyTarget::Primary)
+            ),
+            "{:?}",
+            outcome.residency()
+        );
+        assert_eq!(*keys.lock().unwrap(), [Key::F2, Key::Escape]);
+
+        ui_runtime.shutdown().unwrap();
+        ocr_runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn hall_exit_treats_unknown_frames_as_transition_until_primary_is_stable() {
+        let mut config = AppConfig::load(Path::new("config.yaml")).unwrap();
+        config.timing.input.after_activate_ms = 0;
+        config.timing.input.click_ms = 0;
+        config.timing.hall.page_settle_ms = 0;
+        config.timing.hall.ocr_sample_interval_ms = 0;
+        config.timing.workflow.default_timeout_ms = 300;
+        config.timing.workflow.default_poll_ms = 1;
+        let keys = Arc::new(Mutex::new(Vec::new()));
+        let ui_runtime = start_test_ui_runtime(
+            TransitionHallDevice {
+                primary: primary_frame(&config),
+                keys: keys.clone(),
+                captures_after_escape: 0,
+            },
+            &config,
+        );
+        let ocr_runtime = OcrRuntime::start(HallOcrDevice { calls: 0 }, 4).unwrap();
+        let hall_ui = HallUi::new(
+            ui_runtime.handle(),
+            ocr_runtime.handle(),
+            HallRoutineConfig::from_app(&config),
+        );
+
+        let outcome = hall_ui
+            .submit_detect(DetectPublicHall)
+            .unwrap()
+            .wait()
+            .unwrap();
+
         assert!(matches!(
-            outcome.residency(),
-            UiResidencyOutcome::Confirmed(UiResidencyTarget::Primary)
+            outcome.effect(),
+            DetectPublicHallEffect::Detected { .. }
         ));
+        assert!(
+            matches!(
+                outcome.residency(),
+                UiResidencyOutcome::Confirmed(UiResidencyTarget::Primary)
+            ),
+            "{:?}",
+            outcome.residency()
+        );
         assert_eq!(*keys.lock().unwrap(), [Key::F2, Key::Escape]);
 
         ui_runtime.shutdown().unwrap();

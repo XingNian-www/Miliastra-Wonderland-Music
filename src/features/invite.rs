@@ -16,7 +16,6 @@ pub struct InviteConfig {
     pub friend_name_stable_count: u32,
     pub friend_list_region: RectConfig,
     pub friend_chat_region: RectConfig,
-    pub confirm_list_region: RectConfig,
     pub view_star_region: RectConfig,
     pub goto_hall_region: RectConfig,
     pub enter_hall_region: RectConfig,
@@ -36,7 +35,6 @@ impl InviteConfig {
         for (rect, field) in [
             (self.friend_list_region, "invite.friend_list_region"),
             (self.friend_chat_region, "invite.friend_chat_region"),
-            (self.confirm_list_region, "invite.confirm_list_region"),
             (self.view_star_region, "invite.view_star_region"),
             (self.goto_hall_region, "invite.goto_hall_region"),
             (self.enter_hall_region, "invite.enter_hall_region"),

@@ -480,6 +480,19 @@ impl UndercoverRuntimeService {
                 }
                 Err(error) => self.begin_error(key, source, player, error.to_string()),
             },
+            UndercoverCommand::Abstain => match self.game.abstain(player, now) {
+                Ok(deliveries) => {
+                    let ended = !self.game.is_active();
+                    Ok(self.begin_deliveries(
+                        key,
+                        UndercoverEffectLane::Formal,
+                        deliveries,
+                        "abstained",
+                        ended,
+                    ))
+                }
+                Err(error) => self.begin_error(key, source, player, error.to_string()),
+            },
         };
         self.reconcile_entertainment(entertainment);
         result

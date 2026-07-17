@@ -7,12 +7,12 @@ use super::friend_delivery::{
     FriendDeliveryRoutineConfig, UiResidencyOutcome, UiResidencyTarget, before_input_failure,
     capture_normalized, sleep_ms,
 };
+use super::state_observation::wait_for_stable_ui_kind;
 use crate::runtime::ui::{
     InputCertainty, UiOperation, UiRoutine, UiRoutineContext, UiRoutineFailure, UiRuntimeHandle,
-    UiSubmitError, sealed,
+    UiStateKind, UiStateObservation, UiSubmitError, sealed,
 };
 use crate::ui::geometry::{Point, Rect};
-use crate::ui::state::{ResolvedUiTemplateArgs, detect_ui_state};
 use crate::ui::template::best_template_hit;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,7 +83,6 @@ impl ModerationUi {
 #[derive(Clone)]
 pub(crate) struct ModerationRoutineConfig {
     residency: FriendDeliveryRoutineConfig,
-    templates: ResolvedUiTemplateArgs,
     friend_panel_template: PathBuf,
     search_panel_template: PathBuf,
     more_settings_template: PathBuf,
@@ -109,7 +108,6 @@ pub(crate) struct ModerationRoutineConfig {
 
 pub(crate) struct ModerationRoutineConfigSource {
     pub(crate) residency: FriendDeliveryRoutineConfig,
-    pub(crate) ui_templates: ResolvedUiTemplateArgs,
     pub(crate) friend_panel_template: PathBuf,
     pub(crate) search_panel_template: PathBuf,
     pub(crate) more_settings_template: PathBuf,
@@ -137,7 +135,6 @@ impl ModerationRoutineConfig {
     pub(crate) fn resolve(source: ModerationRoutineConfigSource) -> Self {
         Self {
             residency: source.residency,
-            templates: source.ui_templates,
             friend_panel_template: source.friend_panel_template,
             search_panel_template: source.search_panel_template,
             more_settings_template: source.more_settings_template,
@@ -278,10 +275,15 @@ fn normalize_primary(
         .device()
         .ensure_ready(config.residency.after_activate_ms)
         .map_err(|error| before_input_failure("prepare_moderation", error))?;
-    let image = capture_normalized(context, &config.residency, "observe_moderation_start")?;
-    let state = detect_ui_state(&image, &config.templates, &config.residency.screen)
-        .map_err(|error| before_input_failure("classify_moderation_start", error))?;
-    if state.is_primary() {
+    let state = wait_for_stable_ui_kind(
+        context,
+        config.residency.state_observation(),
+        None,
+        config.ui_timeout_ms,
+        "observe_moderation_start",
+        InputCertainty::BeforeInput,
+    )?;
+    if state == UiStateKind::Primary {
         Ok(())
     } else {
         Err(UiRoutineFailure::new(
@@ -304,7 +306,12 @@ fn wait_template(
 ) -> Result<(), UiRoutineFailure> {
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     loop {
-        let image = capture_normalized(context, &config.residency, stage)?;
+        let image = capture_normalized(
+            context,
+            &config.residency,
+            stage,
+            InputCertainty::AfterInputUnknown,
+        )?;
         if let Some(hit) =
             best_template_hit(&image, Some(region), template, config.marker_threshold)
                 .map_err(|error| before_input_failure(stage, error))?
@@ -337,7 +344,12 @@ fn confirm_template_absent(
     let deadline = Instant::now() + Duration::from_millis(config.confirm_wait_ms);
     let mut absent_streak = 0_u32;
     while Instant::now() < deadline {
-        let image = capture_normalized(context, &config.residency, "confirm_action_applied")?;
+        let image = capture_normalized(
+            context,
+            &config.residency,
+            "confirm_action_applied",
+            InputCertainty::AfterInputUnknown,
+        )?;
         let present = best_template_hit(
             &image,
             Some(config.confirm_region),
@@ -373,22 +385,54 @@ fn recover_primary(
     context: &mut UiRoutineContext<'_>,
     config: &ModerationRoutineConfig,
 ) -> UiResidencyOutcome {
-    for _ in 0..6 {
-        let image = match capture_normalized(context, &config.residency, "recover_moderation") {
+    let deadline = Instant::now() + Duration::from_millis(config.ui_timeout_ms);
+    let mut escape_count = 0_u32;
+    let mut panel_stability = PanelStability::default();
+    while Instant::now() < deadline {
+        let image = match capture_normalized(
+            context,
+            &config.residency,
+            "recover_moderation",
+            InputCertainty::AfterInputUnknown,
+        ) {
             Ok(image) => image,
             Err(failure) => return UiResidencyOutcome::Failed(failure),
         };
-        let state = match detect_ui_state(&image, &config.templates, &config.residency.screen) {
-            Ok(state) => state,
-            Err(error) => {
-                return UiResidencyOutcome::Failed(before_input_failure(
+        let observation = match context.latest_ui_state() {
+            Some(observation) => observation,
+            None => {
+                return UiResidencyOutcome::Failed(UiRoutineFailure::new(
+                    InputCertainty::ConfirmedFailure,
                     "recover_moderation",
-                    error,
+                    "UI runtime has no configured template state classifier",
                 ));
             }
         };
-        if state.is_primary() {
+        let stable_kind = match observation {
+            UiStateObservation::Classified(state) => state.stable_kind(),
+            UiStateObservation::Failed { reason, .. } => {
+                return UiResidencyOutcome::Failed(UiRoutineFailure::new(
+                    InputCertainty::ConfirmedFailure,
+                    "recover_moderation",
+                    format!("template UI state classification failed: {reason}"),
+                ));
+            }
+        };
+        if stable_kind == Some(UiStateKind::Primary) {
             return UiResidencyOutcome::Confirmed(UiResidencyTarget::Primary);
+        }
+        let panel_candidate = match recoverable_panel_candidate(&image, config) {
+            Ok(candidate) => candidate,
+            Err(failure) => return UiResidencyOutcome::Failed(failure),
+        };
+        let escape_authorized = stable_kind == Some(UiStateKind::Secondary)
+            || panel_stability.observe(panel_candidate, config.residency.stable_count);
+        if !escape_authorized {
+            sleep_ms(config.residency.poll_ms);
+            continue;
+        }
+        if escape_count >= 6 {
+            break;
         }
         if let Err(error) = context.device().press_key(Key::Escape) {
             return UiResidencyOutcome::Failed(UiRoutineFailure::new(
@@ -397,6 +441,8 @@ fn recover_primary(
                 format!("{error:#}"),
             ));
         }
+        escape_count += 1;
+        panel_stability = PanelStability::default();
         sleep_ms(config.return_retry_ms);
     }
     UiResidencyOutcome::Failed(UiRoutineFailure::new(
@@ -404,4 +450,68 @@ fn recover_primary(
         "recover_moderation",
         "primary UI was not reached after bounded recovery",
     ))
+}
+
+#[derive(Default)]
+struct PanelStability {
+    candidate: Option<usize>,
+    samples: u32,
+}
+
+impl PanelStability {
+    fn observe(&mut self, candidate: Option<usize>, required_samples: u32) -> bool {
+        let Some(candidate) = candidate else {
+            self.candidate = None;
+            self.samples = 0;
+            return false;
+        };
+        if self.candidate == Some(candidate) {
+            self.samples = self.samples.saturating_add(1);
+        } else {
+            self.candidate = Some(candidate);
+            self.samples = 1;
+        }
+        self.samples >= required_samples.max(2)
+    }
+}
+
+fn recoverable_panel_candidate(
+    image: &image::DynamicImage,
+    config: &ModerationRoutineConfig,
+) -> Result<Option<usize>, UiRoutineFailure> {
+    for (index, (template, region)) in [
+        (&config.friend_panel_template, config.friend_panel_region),
+        (&config.search_panel_template, config.search_panel_region),
+        (&config.more_settings_template, config.more_settings_region),
+        (&config.blacklist_template, config.blacklist_region),
+        (&config.block_chat_template, config.block_chat_region),
+        (&config.confirm_template, config.confirm_region),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if best_template_hit(image, Some(region), template, config.marker_threshold)
+            .map_err(|error| before_input_failure("recover_moderation", error))?
+            .is_some()
+        {
+            return Ok(Some(index));
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PanelStability;
+
+    #[test]
+    fn recoverable_panel_requires_consecutive_matching_samples_before_escape() {
+        let mut stability = PanelStability::default();
+
+        assert!(!stability.observe(Some(1), 2));
+        assert!(!stability.observe(Some(2), 2));
+        assert!(!stability.observe(None, 2));
+        assert!(!stability.observe(Some(2), 2));
+        assert!(stability.observe(Some(2), 2));
+    }
 }

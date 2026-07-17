@@ -67,9 +67,9 @@
 
 ## AI 裁决
 
-海龟汤使用独立的 `turtle_soup.ai` Provider，不复用点歌 AI 或候选歌曲审核，也不启用联网搜索。默认配置使用 DeepSeek 官方 `https://api.deepseek.com/chat/completions` 和 `deepseek-v4-flash`。默认请求只包含 OpenAI Chat Completions 标准字段，不发送 DeepSeek 私有 `thinking` 参数；确有兼容需要时可通过 `turtle_soup.ai.extra_body` 显式补充第三方字段，与官方字段重名时官方值优先。`deepseek-chat` 与 `deepseek-reasoner` 兼容别名将在 2026-07-24 15:59 UTC 弃用，不应作为新配置。其他兼容标准 Chat Completions 的 Provider 仍可通过修改 endpoint 和 model 使用。
+海龟汤使用独立的 `turtle_soup.ai` Provider，不复用点歌 AI 或候选歌曲审核，也不启用联网搜索。当前配置模板使用 OpenAI 官方 `https://api.openai.com/v1/chat/completions` 和 `gpt-5.6`。请求只包含 OpenAI Chat Completions 标准字段；确有兼容需要时可通过 `turtle_soup.ai.extra_body` 显式补充第三方字段，与官方字段重名时官方值优先。其他兼容标准 Chat Completions 的 Provider 仍可通过显式修改 endpoint、model 和 `extra_body` 使用。
 
-`max_tokens` 可省略且默认 `256`，直接控制单次裁决最大输出 Token。请求固定使用 `temperature: 0.0`、`response_format: json_object`、`stream: false` 和 `store: false`，不设置 `top_p`。固定核心提示词明确要求合法 json 并提供输出示例；空内容、非法 JSON、非法裁决以及 `finish_reason=length` 都按请求失败进入重试。DeepSeek 的历史调研与迁移差异见 [海龟汤 AI 接入 DeepSeek 官方 API 的推荐配置](research/deepseek-turtle-soup-api.md)。
+`max_tokens` 是当前配置必填字段，模板值为 `1024`，直接控制单次裁决最大输出 Token。请求固定使用 `temperature: 0.0`、`response_format: json_object`、`stream: false` 和 `store: false`，不设置 `top_p`。固定核心提示词明确要求合法 JSON 并提供输出示例；空内容、非法 JSON、非法裁决以及 `finish_reason=length` 都按请求失败进入重试。DeepSeek 的历史调研见 [海龟汤 AI 接入 DeepSeek 官方 API 的推荐配置](research/deepseek-turtle-soup-api.md)。
 
 旧版私有关闭思考参数、`max_tokens=256` 和基础决策树曾经过 553 次 DeepSeek 官方 API 请求验证。当前标准化请求不再发送私有思考参数，因此该历史结果不能直接证明当前模型行为；详细数据和适用范围见 [DeepSeek 海龟汤裁决稳定性评测](research/deepseek-turtle-soup-evaluation.md)。
 

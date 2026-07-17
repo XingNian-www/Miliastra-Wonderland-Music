@@ -7,7 +7,10 @@ use anyhow::{Context, Result, bail};
 use pinyin::ToPinyin;
 use serde::{Deserialize, Serialize};
 
-use super::chat_text::{command_identity, compact_command, shortcut_argument};
+use super::chat_text::{
+    command_identity, compact_command, shortcut_argument, split_numbered_chat_message,
+};
+use super::command::{CommandAuthority, CommandEnvelope, CommandPrefix, FeatureCommandMatch};
 use super::entertainment::{AcquireOutcome, EntertainmentKind, EntertainmentState};
 use crate::runtime::timer::{DeadlineKind, DeadlineModule, DeadlineToken};
 
@@ -32,7 +35,7 @@ impl DeadlineKind for IdiomChainDeadlineKind {
 pub type IdiomChainDeadlineToken = DeadlineToken<IdiomChainDeadlineKind>;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 pub struct IdiomChainConfig {
     pub enabled: bool,
     pub history_limit: usize,
@@ -50,6 +53,15 @@ impl Default for IdiomChainConfig {
             allow_consecutive_player: false,
             allow_anyone_stop: false,
         }
+    }
+}
+
+impl IdiomChainConfig {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.enabled && (self.history_limit == 0 || self.idle_timeout_seconds == 0) {
+            bail!("成语接龙历史上限和空闲超时必须大于 0");
+        }
+        Ok(())
     }
 }
 
@@ -89,6 +101,41 @@ pub enum IdiomChainCommand {
 }
 
 impl IdiomChainCommand {
+    pub(crate) fn claims_start_chat(envelope: &CommandEnvelope) -> bool {
+        envelope.prefix() == CommandPrefix::Hash
+            && envelope.authority() == CommandAuthority::HallMember
+            && (shortcut_argument(envelope.command_text(), "同音接龙").is_some()
+                || shortcut_argument(envelope.command_text(), "接龙").is_some())
+    }
+
+    pub(crate) fn claims_active_chat(envelope: &CommandEnvelope) -> bool {
+        envelope.prefix() == CommandPrefix::Hash
+            && envelope.authority() == CommandAuthority::HallMember
+    }
+
+    pub(crate) fn parse_start_chat(
+        envelope: &CommandEnvelope,
+    ) -> Option<FeatureCommandMatch<Self>> {
+        if !Self::claims_start_chat(envelope) {
+            return None;
+        }
+        Self::parse_start(envelope.command_text())
+            .map(|command| FeatureCommandMatch::new("#", envelope.command_text(), command))
+    }
+
+    pub(crate) fn parse_active_chat(
+        envelope: &CommandEnvelope,
+    ) -> Option<FeatureCommandMatch<Self>> {
+        if !Self::claims_active_chat(envelope) {
+            return None;
+        }
+        Some(FeatureCommandMatch::new(
+            "#",
+            envelope.command_text(),
+            Self::parse_active(envelope.command_text()),
+        ))
+    }
+
     pub(crate) fn parse_start(payload: &str) -> Option<Self> {
         if let Some(idiom) = shortcut_argument(payload, "同音接龙") {
             return Some(Self::Start {
@@ -138,6 +185,10 @@ impl IdiomChainCommand {
     pub(crate) fn same_request(&self, other: &Self) -> bool {
         self.lock_key() == other.lock_key()
     }
+
+    pub(crate) const fn requires_executor(&self) -> bool {
+        matches!(self, Self::Explain(_))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -152,6 +203,83 @@ pub struct IdiomExplanation {
     pub idiom: String,
     pub source: String,
     pub explanation: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IdiomDeliveryOutcome {
+    Added,
+    DroppedEarlierMessage,
+    Rejected,
+}
+
+pub(crate) trait IdiomChainDeferredPort {
+    fn handle_command(
+        &mut self,
+        player: &str,
+        command: &IdiomChainCommand,
+    ) -> Result<IdiomChainOutcome>;
+    fn send_deferred(&mut self, message: String) -> Result<IdiomDeliveryOutcome>;
+}
+
+pub(crate) trait IdiomChainExplanationPort {
+    fn explain(&mut self, player: &str, command: &IdiomChainCommand) -> Result<IdiomChainOutcome>;
+    fn send_batch(&mut self, messages: &[String], delay_ms: u64) -> Result<()>;
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct IdiomChainApplication {
+    batch_delay_ms: u64,
+}
+
+impl IdiomChainApplication {
+    pub(crate) const fn new(batch_delay_ms: u64) -> Self {
+        Self { batch_delay_ms }
+    }
+
+    pub(crate) fn execute_deferred<P: IdiomChainDeferredPort + ?Sized>(
+        &self,
+        raw_command: &str,
+        player: &str,
+        command: &IdiomChainCommand,
+        port: &mut P,
+    ) -> Result<()> {
+        let outcome = port.handle_command(player, command)?;
+        let action = outcome.action;
+        debug_assert!(outcome.explanation.is_none());
+        match port.send_deferred(outcome.reply)? {
+            IdiomDeliveryOutcome::Added => {}
+            IdiomDeliveryOutcome::DroppedEarlierMessage => {
+                log::warn!("延迟聊天发送队列已满，已丢弃一条较早的回复");
+            }
+            IdiomDeliveryOutcome::Rejected => {
+                log::warn!("延迟聊天发送队列已被受保护批次占满，成语接龙回复已丢弃");
+            }
+        }
+        log::info!(
+            "成语接龙已处理，回复进入延迟发送队列: command={} action={}",
+            raw_command,
+            action
+        );
+        Ok(())
+    }
+
+    pub(crate) fn execute_explanation<P: IdiomChainExplanationPort + ?Sized>(
+        &self,
+        player: &str,
+        command: &IdiomChainCommand,
+        port: &mut P,
+    ) -> Result<()> {
+        let outcome = port.explain(player, command)?;
+        let mut messages = vec![outcome.reply];
+        if let Some(explanation) = outcome.explanation {
+            messages.extend(split_numbered_chat_message("来源", &explanation.source));
+            messages.extend(split_numbered_chat_message(
+                "解释",
+                &explanation.explanation,
+            ));
+        }
+        port.send_batch(&messages, self.batch_delay_ms)
+    }
 }
 
 pub struct IdiomChainGame {
@@ -181,11 +309,22 @@ impl IdiomChainService {
         self.game.lexicon_len()
     }
 
+    #[cfg(test)]
     pub(crate) fn handle(
         &mut self,
         entertainment: &mut EntertainmentState,
         player: &str,
         command: &IdiomChainCommand,
+    ) -> Result<IdiomChainOutcome> {
+        self.handle_at(entertainment, player, command, Instant::now())
+    }
+
+    pub(crate) fn handle_at(
+        &mut self,
+        entertainment: &mut EntertainmentState,
+        player: &str,
+        command: &IdiomChainCommand,
+        now: Instant,
     ) -> Result<IdiomChainOutcome> {
         if entertainment.active() == Some(EntertainmentKind::TurtleSoup) {
             return Ok(outcome(
@@ -208,7 +347,7 @@ impl IdiomChainService {
             false
         };
 
-        let outcome = self.game.handle(player, command);
+        let outcome = self.game.handle_at(player, command, now);
         if acquired_for_start && outcome.action != "started" {
             entertainment.release(EntertainmentKind::IdiomChain);
         }
@@ -218,12 +357,13 @@ impl IdiomChainService {
         Ok(outcome)
     }
 
-    pub(crate) fn explain(
+    pub(crate) fn explain_at(
         &mut self,
         player: &str,
         command: &IdiomChainCommand,
+        now: Instant,
     ) -> Result<IdiomChainOutcome> {
-        Ok(self.game.handle(player, command))
+        Ok(self.game.handle_at(player, command, now))
     }
 
     pub(crate) fn abort(&mut self, entertainment: &mut EntertainmentState) -> Result<bool> {
@@ -302,6 +442,7 @@ impl IdiomChainGame {
         Some(session.last_activity + timeout)
     }
 
+    #[cfg(test)]
     pub fn handle(&mut self, player: &str, command: &IdiomChainCommand) -> IdiomChainOutcome {
         self.handle_at(player, command, Instant::now())
     }
@@ -794,6 +935,7 @@ fn outcome(action: &'static str, reply: impl Into<String>) -> IdiomChainOutcome 
 mod tests {
     use super::*;
     use crate::features::entertainment::EntertainmentState;
+    use crate::runtime::clock::{Clock, ManualClock};
 
     fn game(entries: &[&str]) -> IdiomChainGame {
         IdiomChainGame {
@@ -813,6 +955,58 @@ mod tests {
             idiom: idiom.to_string(),
             mode: IdiomChainMode::Exact,
         }
+    }
+
+    struct ExplanationPort {
+        batches: Vec<Vec<String>>,
+    }
+
+    impl IdiomChainExplanationPort for ExplanationPort {
+        fn explain(
+            &mut self,
+            _player: &str,
+            _command: &IdiomChainCommand,
+        ) -> Result<IdiomChainOutcome> {
+            Ok(IdiomChainOutcome {
+                reply: "成语：画蛇添足".to_string(),
+                action: "explained",
+                explanation: Some(IdiomExplanation {
+                    idiom: "画蛇添足".to_string(),
+                    source: "故事来源".to_string(),
+                    explanation: "比喻多此一举".to_string(),
+                }),
+            })
+        }
+
+        fn send_batch(&mut self, messages: &[String], _delay_ms: u64) -> Result<()> {
+            self.batches.push(messages.to_vec());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn explanation_application_sends_reply_source_and_explanation_as_one_batch() {
+        let mut port = ExplanationPort {
+            batches: Vec::new(),
+        };
+
+        IdiomChainApplication::new(100)
+            .execute_explanation(
+                "Alice",
+                &IdiomChainCommand::Explain(Some("画蛇添足".to_string())),
+                &mut port,
+            )
+            .expect("explanation delivery");
+
+        assert_eq!(port.batches.len(), 1);
+        assert_eq!(
+            port.batches[0],
+            [
+                "成语：画蛇添足",
+                "来源1/1：故事来源",
+                "解释1/1：比喻多此一举"
+            ]
+        );
     }
 
     #[test]
@@ -1037,5 +1231,21 @@ mod tests {
             game.handle("Alice", &IdiomChainCommand::Status).action,
             "no-session"
         );
+    }
+
+    #[test]
+    fn idle_timeout_is_driven_by_a_manual_clock() {
+        let clock = ManualClock::new(Instant::now());
+        let mut game = game(&["画蛇添足", "足智多谋"]);
+        assert_eq!(
+            game.handle_at("Alice", &start_exact("画蛇添足"), clock.now())
+                .action,
+            "started"
+        );
+
+        clock.advance(Duration::from_secs(299)).unwrap();
+        assert!(!game.expire_idle_at(clock.now()));
+        clock.advance(Duration::from_secs(1)).unwrap();
+        assert!(game.expire_idle_at(clock.now()));
     }
 }

@@ -23,15 +23,19 @@ flowchart TD
     C --> E["scan_chat_with_shared_ocr"]
     D --> F["仅 OCR 最新气泡"]
     E --> G["handle_scan_messages"]
-    F --> H["submit_secondary_command"]
-    G --> I["parse_text / custom_workflow::parse_text"]
-    I --> J["同轮合并 / CommandLockState / 启动屏幕锁"]
-    J --> K["pending_contains_command"]
-    H --> K
-    K --> L["PendingTask::Command"]
+    F --> H["结构化 CommandEnvelope"]
+    G --> I["CommandEnvelope"]
+    H --> J["ChatCommandRouter"]
+    I --> J
+    J --> K["feature 自有 parse_chat"]
+    K --> L["RoutedCommand / ModuleCommand"]
+    L --> M["同轮合并 / CommandLockState / 启动屏幕锁"]
+    M --> N{"模块执行策略"}
+    N -->|需要正式排序| O["PendingTask::Command"]
+    N -->|娱乐即时输入| P["模块服务处理并提交后续 effect"]
 ```
 
-只有 `PendingTask::Command` 进入待执行任务队列后，命令执行线程才会真正执行业务。
+扫描层只负责形成带观察身份的命令信封、选择模块和交付命令。需要游戏输入或完整顺序边界的命令进入 `FormalScheduler`；允许即时处理的娱乐输入由对应 feature 服务更新状态，产生的发送等副作用仍作为正式 effect 排队，不能直接操作 UI。
 
 ## 扫描循环什么时候 OCR
 
@@ -93,10 +97,7 @@ flowchart TD
 
 ## 命令解析
 
-`handle_scan_messages()` 会遍历非空 OCR 文本，优先调用：
-
-1. `command::parse_text()`
-2. `custom_workflow::parse_text()`
+`handle_scan_messages()` 会遍历非空 OCR 文本。`parse_command_envelope()` 只提取昵称、消息来源、原始正文、前缀和观察身份，生成 `CommandEnvelope`。随后 `ChatCommandRouter` 根据静态优先级与当前娱乐占用状态选择唯一模块，再调用该 feature 的 `claims_chat()` / `parse_chat()` 解析参数。
 
 普通命令解析规则：
 
@@ -105,17 +106,17 @@ flowchart TD
 - 黄字：不作为内置命令入口。
 - 机器人反馈文本会被过滤，避免把自己发出的回复重新解析成命令。
 
-自定义工作流也走同一条入口，但只有 `custom_workflows.enabled=true` 且命令匹配配置时才会生成 `BusinessIntent::CustomWorkflow`。
+自定义工作流也走同一入口，但只有 `custom_workflows.enabled=true` 且 `CustomWorkflowService` 认领命令时，才会生成 `ModuleCommand::CustomWorkflow`。中央聊天层不包含自定义工作流参数语法。
 
 ## 命令识别禁用
 
 `commands_enabled=false` 时，非粉色消息都会跳过。粉色私聊仍然允许进入解析链路，所以管理员可以通过粉字命令恢复或执行管理类动作。
 
-海龟汤输入不属于 `ParsedCommand`。当前大厅蓝字正文以 `#` 开头时，会进入独立提问解析器：普通 `#问题` 直接进入 AI 队列，`##编号内容` 按昵称和编号暂存并发送短确认，`##提交` 校验连续编号后合并为一个问题。命令识别关闭时不接收新输入，但现有对局仍继续计时并可自动结算。
+海龟汤控制命令同样由命令信封路由到 `TurtleSoupCommand`。进行中的普通 `#问题` 不是控制命令：它通过海龟汤模块的稳定提问观察路径进入 AI 队列；`##编号内容` 按昵称和编号暂存，`##提交` 校验连续编号后合并。命令识别关闭时不接收新输入，但现有对局仍继续计时并可自动结算。
 
 收到 `DisableCommands` / `EnableCommands` 后，扫描线程会立即更新 `commands_enabled`，同时命令本身仍会入队执行，以便发送游戏内反馈并写执行日志。
 
-`IdleExit` 是例外：它在扫描线程内立即配置闲置退出并写日志，不进入待执行任务队列。
+`IdleExit` 是例外：它作为 `AdministrationCommand` 在扫描侧应用即时状态变更并写日志，不进入正式任务队列。
 
 `@监听模式 一级/二级` 也是例外：它不作为普通业务命令执行，而是直接提交监听模式切换任务；`@监听模式 状态` 只记录当前模式和等待目标。
 
@@ -185,13 +186,13 @@ flowchart TD
 
 - 扫描阶段发现邀请序号已经执行过，会直接跳过。
 - 执行阶段再次插入序号，如果已存在也会跳过。
-- 邀请命令只接受一个数字参数：1-3 位数字是防冲突序号，例如 `@邀请2`；6 位数字是大厅密码，例如 `@邀请123456`，会在进入大厅最后一步使用键盘输入。
+- 邀请命令只接受一个数字参数：1-3 位数字是防冲突序号，例如 `@邀请2`；6 位数字是大厅密码，例如 `@邀请654321`，会在进入大厅最后一步使用键盘输入。
 
 这层保护独立于命令屏幕锁，用于处理邀请命令在跨界面、跨聊天状态下重复出现的问题。
 
 ## 待执行队列去重
 
-命令屏幕锁接受后，还会检查待执行任务队列：
+命令屏幕锁接受后，需要正式排队的命令还会检查待执行任务队列：
 
 ```text
 pending_contains_command(parsed)
@@ -240,4 +241,4 @@ pending_contains_command(parsed)
 - 命令屏幕锁防重复入队，不保证业务互斥。
 - 待执行任务队列负责业务串行，不等于命令屏幕锁。
 - 确认屏幕锁只服务当前确认窗口，不影响普通命令。
-- `message_type=控制台` 的远程命令不来自 OCR，因此不经过聊天扫描和命令屏幕锁，但会进入同一个待执行任务队列。
+- HTTP 远程命令直接构造模块自己的类型化意图，不伪造聊天文本，也不经过聊天扫描和命令屏幕锁；需要排序的动作仍进入同一个正式任务调度器。

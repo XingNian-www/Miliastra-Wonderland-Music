@@ -4,7 +4,9 @@ use super::friend_delivery::{
     FriendDeliveryRoutineConfig, UiResidencyOutcome, UiResidencyTarget, before_input_failure,
     capture_normalized, restore_residency, sleep_ms,
 };
+#[cfg(test)]
 use crate::config::AppConfig;
+use crate::config::{HallTimingConfig, OcrConfig, ScreenConfig};
 use crate::runtime::ocr::{OcrPriority, OcrRuntimeHandle};
 use crate::runtime::ui::{
     InputCertainty, UiOperation, UiRoutine, UiRoutineContext, UiRoutineFailure, UiRuntimeHandle,
@@ -100,11 +102,15 @@ pub(crate) struct HallUi {
 }
 
 impl HallUi {
-    pub(crate) fn new(runtime: UiRuntimeHandle, ocr: OcrRuntimeHandle, config: &AppConfig) -> Self {
+    pub(crate) fn new(
+        runtime: UiRuntimeHandle,
+        ocr: OcrRuntimeHandle,
+        config: HallRoutineConfig,
+    ) -> Self {
         Self {
             runtime,
             ocr,
-            config: HallRoutineConfig::from_app(config),
+            config,
         }
     }
 
@@ -143,7 +149,7 @@ impl HallUi {
 }
 
 #[derive(Clone)]
-struct HallRoutineConfig {
+pub(crate) struct HallRoutineConfig {
     residency: FriendDeliveryRoutineConfig,
     hall_name_region: Rect,
     hall_time_region: Rect,
@@ -153,15 +159,30 @@ struct HallRoutineConfig {
 }
 
 impl HallRoutineConfig {
-    fn from_app(config: &AppConfig) -> Self {
+    pub(crate) fn resolve(
+        residency: FriendDeliveryRoutineConfig,
+        screen: &ScreenConfig,
+        timing: &HallTimingConfig,
+        ocr: &OcrConfig,
+    ) -> Self {
         Self {
-            residency: FriendDeliveryRoutineConfig::from_app(config),
-            hall_name_region: config.screen.hall_name_rect.into(),
-            hall_time_region: config.screen.hall_time_rect.into(),
-            page_settle_ms: config.timing.hall.page_settle_ms,
-            sample_interval_ms: config.timing.hall.ocr_sample_interval_ms,
-            same_line_y_tolerance: config.ocr.same_line_y_tolerance,
+            residency,
+            hall_name_region: screen.hall_name_rect.into(),
+            hall_time_region: screen.hall_time_rect.into(),
+            page_settle_ms: timing.page_settle_ms,
+            sample_interval_ms: timing.ocr_sample_interval_ms,
+            same_line_y_tolerance: ocr.same_line_y_tolerance,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_app(config: &AppConfig) -> Self {
+        Self::resolve(
+            FriendDeliveryRoutineConfig::from_app(config),
+            &config.screen,
+            &config.timing.hall,
+            &config.ocr,
+        )
     }
 }
 
@@ -432,7 +453,11 @@ mod tests {
         )
         .unwrap();
         let ocr_runtime = OcrRuntime::start(HallOcrDevice { calls: 0 }, 4).unwrap();
-        let hall_ui = HallUi::new(ui_runtime.handle(), ocr_runtime.handle(), &config);
+        let hall_ui = HallUi::new(
+            ui_runtime.handle(),
+            ocr_runtime.handle(),
+            HallRoutineConfig::from_app(&config),
+        );
 
         let outcome = hall_ui
             .submit_detect(DetectPublicHall)

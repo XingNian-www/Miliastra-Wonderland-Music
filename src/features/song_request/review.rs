@@ -1,23 +1,106 @@
 use std::collections::HashMap;
-use std::thread::sleep;
+use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use async_openai::types::responses::{
     CreateResponse, CreateResponseArgs, ResponseFormatJsonSchema, Tool, ToolChoiceOptions,
     ToolChoiceParam, WebSearchTool,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::config::{SongReviewConfig, SongReviewFailurePolicy, TimingConfig};
+use crate::runtime::clock::Delay;
 use crate::runtime::openai::{OpenAiRuntimeHandle, Target};
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SongReviewConfig {
+    pub enabled: bool,
+    pub max_allowed_level: u8,
+    pub failure_policy: SongReviewFailurePolicy,
+    pub retry_count: u32,
+    pub retry_delay_ms: u64,
+    pub reply_reason_max_chars: usize,
+    pub policy_prompt: String,
+    pub custom_prompt: String,
+    pub provider: SongReviewProviderConfig,
+}
+
+impl Default for SongReviewConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_allowed_level: 4,
+            failure_policy: SongReviewFailurePolicy::Reject,
+            retry_count: 2,
+            retry_delay_ms: 500,
+            reply_reason_max_chars: 40,
+            policy_prompt: default_song_review_policy_prompt(),
+            custom_prompt: String::new(),
+            provider: SongReviewProviderConfig::default(),
+        }
+    }
+}
+
+impl SongReviewConfig {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if !(1..=10).contains(&self.max_allowed_level) {
+            bail!("song_review.max_allowed_level 必须在 1 到 10 之间");
+        }
+        if self.reply_reason_max_chars == 0 {
+            bail!("song_review.reply_reason_max_chars 必须大于 0");
+        }
+        if self.provider.endpoint.trim().is_empty() {
+            bail!("song_review.provider.endpoint 未配置");
+        }
+        if self.provider.api_key.trim().is_empty() {
+            bail!("song_review.provider.api_key 未配置");
+        }
+        if self.provider.model.trim().is_empty() {
+            bail!("song_review.provider.model 未配置");
+        }
+        Target::responses(&self.provider.endpoint, &self.provider.api_key)
+            .context("song_review.provider 配置无效")?;
+        Ok(())
+    }
+}
+
+fn default_song_review_policy_prompt() -> String {
+    [
+        "审核目标：只通过整体听感偏舒缓、柔和、轻松、安静、治愈、抒情、慢节奏或中低强度的歌曲。",
+        "拒绝明显炸场、吵闹、压迫感强、节奏过快、情绪过激、强烈电子噪音、重金属、硬核、鬼畜、洗脑循环、尖锐喊叫、强烈攻击性或明显破坏房间氛围的歌曲。",
+        "请尽量使用联网搜索得到的曲风、歌词摘要、歌曲介绍和公开听感描述判断。",
+        "如果信息不足，请保守判断；不确定时应给较高强度等级，而不是因为歌曲热门、用户喜欢或歌手知名就放宽标准。",
+    ]
+    .join("\n")
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum SongReviewFailurePolicy {
+    Reject,
+    Allow,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SongReviewProviderConfig {
+    pub endpoint: String,
+    pub api_key: String,
+    pub model: String,
+    pub extra_body: HashMap<String, Value>,
+}
 
 #[derive(Clone)]
 pub(crate) struct SongReviewClient {
     config: SongReviewConfig,
-    timing: TimingConfig,
+    request_timeout: Duration,
     openai: OpenAiRuntimeHandle,
+    retry_delay: Arc<dyn Delay>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -51,13 +134,15 @@ struct SongReviewResult {
 impl SongReviewClient {
     pub(crate) fn new(
         config: &SongReviewConfig,
-        timing: &TimingConfig,
+        request_timeout: Duration,
         openai: OpenAiRuntimeHandle,
+        retry_delay: Arc<dyn Delay>,
     ) -> Self {
         Self {
             config: config.clone(),
-            timing: timing.clone(),
+            request_timeout,
             openai,
+            retry_delay,
         }
     }
 
@@ -107,7 +192,8 @@ impl SongReviewClient {
                     );
                     last_error = Some(error.to_string());
                     if attempt < max_attempts {
-                        sleep(Duration::from_millis(self.config.retry_delay_ms));
+                        self.retry_delay
+                            .wait(Duration::from_millis(self.config.retry_delay_ms));
                     }
                 }
             }
@@ -153,7 +239,7 @@ impl SongReviewClient {
             &self.config.provider.api_key,
             request,
             &self.config.provider.extra_body,
-            &self.timing,
+            self.request_timeout,
         )?;
         let json_text = model_reply_json_object(&reply)?;
         parse_review_result(&json_text)
@@ -242,16 +328,11 @@ fn call_review_http(
     api_key: &str,
     request: CreateResponse,
     extra_body: &HashMap<String, Value>,
-    timing: &TimingConfig,
+    request_timeout: Duration,
 ) -> Result<String> {
     let target = Target::responses(endpoint, api_key)?;
     let value = openai
-        .create_response(
-            target,
-            request,
-            extra_body,
-            Duration::from_millis(timing.external.ai_request_timeout_ms),
-        )?
+        .create_response(target, request, extra_body, request_timeout)?
         .wait()?;
     response_output_text(&value)
 }
@@ -382,7 +463,74 @@ pub(crate) fn split_candidate_title_artist(text: &str) -> (String, String) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::time::Instant;
+
     use super::*;
+    use crate::runtime::clock::{Clock, ManualClock};
+
+    fn test_openai() -> OpenAiRuntimeHandle {
+        static RUNTIME: std::sync::OnceLock<crate::runtime::openai::OpenAiRuntime> =
+            std::sync::OnceLock::new();
+        RUNTIME
+            .get_or_init(|| {
+                crate::runtime::openai::OpenAiRuntime::start().expect("test OpenAI runtime")
+            })
+            .handle()
+    }
+
+    #[test]
+    fn retry_waits_use_the_injected_delay() {
+        let clock = Arc::new(ManualClock::new(Instant::now()));
+        let started_at = clock.now();
+        let config = SongReviewConfig {
+            enabled: true,
+            retry_count: 2,
+            retry_delay_ms: 500,
+            provider: SongReviewProviderConfig {
+                endpoint: "https://example.com/v1/responses".to_string(),
+                api_key: "key".to_string(),
+                model: "gpt-5.6".to_string(),
+                extra_body: HashMap::new(),
+            },
+            ..SongReviewConfig::default()
+        };
+        let client = SongReviewClient::new(
+            &config,
+            Duration::from_secs(1),
+            test_openai(),
+            clock.clone(),
+        );
+        let candidate = SongReviewCandidate {
+            source: "qqmusic".to_string(),
+            title: "测试".to_string(),
+            artist: "歌手".to_string(),
+            uri: String::new(),
+            message_type: "大厅".to_string(),
+            username: "测试者".to_string(),
+        };
+
+        let decision = client.review(&candidate);
+
+        assert_eq!(decision.attempts, 3);
+        assert_eq!(clock.now(), started_at + Duration::from_secs(1));
+    }
+
+    #[test]
+    fn enabled_review_configuration_requires_a_valid_responses_endpoint() {
+        let mut config = SongReviewConfig {
+            enabled: true,
+            ..SongReviewConfig::default()
+        };
+        config.provider.api_key = "key".to_string();
+        config.provider.model = "gpt-5.6".to_string();
+        config.provider.endpoint = "https://example.com/v1/chat/completions".to_string();
+
+        assert!(config.validate().is_err());
+
+        config.provider.endpoint = "https://example.com/v1/responses".to_string();
+        config.validate().expect("valid Responses provider");
+    }
 
     #[test]
     fn parses_review_level_and_tags() {

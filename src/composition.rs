@@ -1,39 +1,37 @@
 use std::io::IsTerminal;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 use crate::adapters::logging;
 use crate::config::AppConfig;
-use crate::features::playback::{
-    PersistentQueue, PersistentRuntimeState, PersistentSongDedupHistory,
-};
 use crate::interfaces::tui::TuiHandle;
 use crate::runtime::monitor::MonitorShared;
 
 pub(crate) mod application;
-use application::ApplicationRuntime;
+use application::{ApplicationRuntime, ResolvedApplicationConfig};
 
 pub(crate) fn run(config_path: &Path) -> Result<()> {
     let config = AppConfig::load(config_path)?;
-    config.validate().context("启动前校验组合配置")?;
-    let monitor = MonitorShared::new(config.tui.log_lines);
-    let tui_handle = if config.tui.enabled && std::io::stdout().is_terminal() {
-        match TuiHandle::start(&config.tui, monitor.clone()) {
+    let config = ResolvedApplicationConfig::resolve(config)?;
+    let app_config = config.app();
+    let monitor = MonitorShared::new(app_config.tui.log_lines);
+    let tui_handle = if app_config.tui.enabled && std::io::stdout().is_terminal() {
+        match TuiHandle::start(&app_config.tui, monitor.clone()) {
             Ok(handle) => Some(handle),
             Err(error) => {
                 eprintln!("TUI 启动失败，回退普通日志输出: {error:#}");
                 None
             }
         }
-    } else if config.tui.enabled {
+    } else if app_config.tui.enabled {
         eprintln!("检测到非交互终端，已关闭 TUI");
         None
     } else {
         None
     };
     let log_paths = logging::init(
-        &config.logging,
+        &app_config.logging,
         Some(monitor.log_sink()),
         tui_handle.is_none(),
     )?;
@@ -42,40 +40,34 @@ pub(crate) fn run(config_path: &Path) -> Result<()> {
     log::info!("配置文件: {}", config_path.display());
     log::info!(
         "HTTP/Web 面板: {}:{} enabled={}",
-        config.http.host,
-        config.http.port,
-        config.http.enabled
+        app_config.http.host,
+        app_config.http.port,
+        app_config.http.enabled
     );
     log::info!(
         "FeelUOwn: {}:{}",
-        config.feeluown.host,
-        config.feeluown.port
+        app_config.feeluown.host,
+        app_config.feeluown.port
     );
 
-    let mut runtime_state = PersistentRuntimeState::load(config.state.runtime_state_path.clone())?;
-    if runtime_state.state_mut().clear_hall_countdown_cache() {
-        runtime_state.save()?;
-        log::info!("启动时已清理上次运行的大厅倒计时缓存，等待本次大厅检测重新确认");
-    }
-    let queue = PersistentQueue::load(config.state.queue_path.clone(), config.queue.max_size)?;
-    let song_dedup_history =
-        PersistentSongDedupHistory::load(config.song_dedup.history_path.clone())?;
-    log::info!("已加载队列: {} 首", queue.len());
-    log::info!("已加载长时间同歌去重历史: {} 条", song_dedup_history.len());
-    log::info!(
-        "已加载运行时状态: playback_state={:?}",
-        runtime_state.state().playback.state
-    );
-
-    let mut app = ApplicationRuntime::new(
-        config,
-        runtime_state,
-        queue,
-        song_dedup_history,
-        monitor.clone(),
-    )?;
+    let mut app = ApplicationRuntime::new(config, monitor.clone())?;
     let result = app.run();
     drop(tui_handle);
     monitor.shutdown();
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bundled_configuration_resolves_before_runtime_construction() {
+        let config = AppConfig::load(Path::new("config.yaml")).expect("load bundled config");
+
+        let resolved = ResolvedApplicationConfig::resolve(config)
+            .expect("resolve all module configuration before runtime construction");
+
+        assert!(!resolved.app().window.target_process.trim().is_empty());
+    }
 }

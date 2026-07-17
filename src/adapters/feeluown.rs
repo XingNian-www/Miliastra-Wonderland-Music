@@ -1081,7 +1081,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_request_rejects_a_truncated_positive_body() {
+    fn rpc_request_rejects_a_truncated_positive_body() {
         let (port, command_rx, server) = spawn_rpc_server(b"ACK OK 12\npartial".to_vec());
         let client = test_client(port);
 
@@ -1206,7 +1206,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_status_projects_missing_raw_fields_to_compatible_defaults() {
+    fn status_projection_uses_safe_values_for_missing_raw_fields() {
         let body = "{}";
         let response = format!("ACK OK {}\n{}", body.len(), body).into_bytes();
         let (port, command_rx, server) = spawn_rpc_server(response);
@@ -1258,8 +1258,8 @@ mod tests {
     }
 
     #[test]
-    fn raw_sample_accepts_legacy_stopped_and_rejects_unknown_transport() {
-        let legacy = RawPlayerSample::from(RawPlayerStatus {
+    fn raw_sample_accepts_feeluown_stoped_and_rejects_unknown_transport() {
+        let misspelled_stopped = RawPlayerSample::from(RawPlayerStatus {
             status: Some(" stoped ".to_string()),
             ..RawPlayerStatus::default()
         });
@@ -1268,7 +1268,7 @@ mod tests {
             ..RawPlayerStatus::default()
         });
 
-        assert_eq!(legacy.transport, Some(TransportState::Stopped));
+        assert_eq!(misspelled_stopped.transport, Some(TransportState::Stopped));
         assert_eq!(unknown.transport, None);
     }
 

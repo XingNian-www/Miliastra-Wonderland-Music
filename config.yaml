@@ -342,8 +342,10 @@ tui:
   log_lines: 200
 
 state:
-  # 运行时状态持久化路径
-  runtime_state_path: data/runtime-state.json
+  # 播放器确认状态持久化路径
+  playback_state_path: data/playback-state.json
+  # 大厅倒计时状态持久化路径
+  hall_state_path: data/hall-state.json
   # 点歌队列持久化路径
   queue_path: data/queue.json
   # 最终执行命令记录路径
@@ -476,10 +478,6 @@ ai:
   # 非 custom Provider 留空时使用上面列出的默认 endpoint；custom 必填。
   # 可包含网关要求的查询参数，例如：
   #   https://gateway.example/v1/chat/completions?api-version=2026-07-15
-  # 你测试过的临时网关示例（只填地址，不要把密钥写入配置）：
-  #   provider: custom
-  #   endpoint: https://api.777358.xyz/v1/chat/completions
-  #   model: gpt-5.6-mini
   endpoint: ""
   # 模型名；点歌默认使用低延迟模型，custom 必须填写。
   # 网关可用模型以其 /v1/models 返回结果为准。

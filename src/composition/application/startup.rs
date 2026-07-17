@@ -30,7 +30,7 @@ impl StartupExecutionPort for ApplicationRuntime {
             EnterGameEffect::Failed(failure) => return Err(anyhow!(failure.to_string())),
         }
         if let UiResidencyOutcome::Failed(failure) = outcome.residency() {
-            log::warn!("启动游戏目标已完成，但一级驻留未确认: {failure}");
+            return Err(anyhow!("启动游戏目标已完成，但一级驻留未确认: {failure}"));
         }
         on_window_detection_reset("启动游戏 UI 事务已完成");
         Ok(())

@@ -7,13 +7,12 @@ use super::friend_delivery::{
     FriendDeliveryRoutineConfig, UiResidencyOutcome, UiResidencyTarget, before_input_failure,
     capture_normalized, sleep_ms,
 };
-use crate::config::AppConfig;
 use crate::runtime::ui::{
     InputCertainty, UiOperation, UiRoutine, UiRoutineContext, UiRoutineFailure, UiRuntimeHandle,
     UiSubmitError, sealed,
 };
 use crate::ui::geometry::{Point, Rect};
-use crate::ui::state::{ResolvedUiTemplateArgs, UiTemplateArgs, detect_ui_state};
+use crate::ui::state::{ResolvedUiTemplateArgs, detect_ui_state};
 use crate::ui::template::best_template_hit;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,11 +65,8 @@ pub(crate) struct ModerationUi {
 }
 
 impl ModerationUi {
-    pub(crate) fn new(runtime: UiRuntimeHandle, config: &AppConfig) -> Self {
-        Self {
-            runtime,
-            config: ModerationRoutineConfig::from_app(config),
-        }
+    pub(crate) fn new(runtime: UiRuntimeHandle, config: ModerationRoutineConfig) -> Self {
+        Self { runtime, config }
     }
 
     pub(crate) fn submit(
@@ -85,7 +81,7 @@ impl ModerationUi {
 }
 
 #[derive(Clone)]
-struct ModerationRoutineConfig {
+pub(crate) struct ModerationRoutineConfig {
     residency: FriendDeliveryRoutineConfig,
     templates: ResolvedUiTemplateArgs,
     friend_panel_template: PathBuf,
@@ -111,38 +107,58 @@ struct ModerationRoutineConfig {
     return_retry_ms: u64,
 }
 
+pub(crate) struct ModerationRoutineConfigSource {
+    pub(crate) residency: FriendDeliveryRoutineConfig,
+    pub(crate) ui_templates: ResolvedUiTemplateArgs,
+    pub(crate) friend_panel_template: PathBuf,
+    pub(crate) search_panel_template: PathBuf,
+    pub(crate) more_settings_template: PathBuf,
+    pub(crate) blacklist_template: PathBuf,
+    pub(crate) block_chat_template: PathBuf,
+    pub(crate) confirm_template: PathBuf,
+    pub(crate) friend_panel_region: Rect,
+    pub(crate) search_panel_region: Rect,
+    pub(crate) more_settings_region: Rect,
+    pub(crate) blacklist_region: Rect,
+    pub(crate) block_chat_region: Rect,
+    pub(crate) confirm_region: Rect,
+    pub(crate) search_input: Point,
+    pub(crate) search_button: Point,
+    pub(crate) marker_threshold: f32,
+    pub(crate) ui_timeout_ms: u64,
+    pub(crate) search_timeout_ms: u64,
+    pub(crate) confirm_wait_ms: u64,
+    pub(crate) step_ms: u64,
+    pub(crate) text_ms: u64,
+    pub(crate) return_retry_ms: u64,
+}
+
 impl ModerationRoutineConfig {
-    fn from_app(config: &AppConfig) -> Self {
+    pub(crate) fn resolve(source: ModerationRoutineConfigSource) -> Self {
         Self {
-            residency: FriendDeliveryRoutineConfig::from_app(config),
-            templates: UiTemplateArgs::default().resolve(config),
-            friend_panel_template: config.templates.friend_panel.clone(),
-            search_panel_template: config.templates.friend_search_panel.clone(),
-            more_settings_template: config.templates.friend_more_settings.clone(),
-            blacklist_template: config.templates.friend_blacklist.clone(),
-            block_chat_template: config.templates.friend_block_chat.clone(),
-            confirm_template: config.templates.friend_confirm.clone(),
-            friend_panel_region: config.moderation.friend_panel_region.into(),
-            search_panel_region: config.moderation.search_panel_region.into(),
-            more_settings_region: config.moderation.more_settings_region.into(),
-            blacklist_region: config.moderation.blacklist_region.into(),
-            block_chat_region: config.moderation.block_chat_region.into(),
-            confirm_region: config.moderation.confirm_region.into(),
-            search_input: Point::new(
-                config.moderation.search_input_point.x,
-                config.moderation.search_input_point.y,
-            ),
-            search_button: Point::new(
-                config.moderation.search_button_point.x,
-                config.moderation.search_button_point.y,
-            ),
-            marker_threshold: config.templates.marker_threshold,
-            ui_timeout_ms: config.timing.command.ui_timeout_ms,
-            search_timeout_ms: config.timing.moderation.search_result_timeout_ms,
-            confirm_wait_ms: config.timing.moderation.confirm_wait_ms,
-            step_ms: config.timing.invite.step_ms,
-            text_ms: config.timing.input.text_ms,
-            return_retry_ms: config.timing.command.return_retry_ms,
+            residency: source.residency,
+            templates: source.ui_templates,
+            friend_panel_template: source.friend_panel_template,
+            search_panel_template: source.search_panel_template,
+            more_settings_template: source.more_settings_template,
+            blacklist_template: source.blacklist_template,
+            block_chat_template: source.block_chat_template,
+            confirm_template: source.confirm_template,
+            friend_panel_region: source.friend_panel_region,
+            search_panel_region: source.search_panel_region,
+            more_settings_region: source.more_settings_region,
+            blacklist_region: source.blacklist_region,
+            block_chat_region: source.block_chat_region,
+            confirm_region: source.confirm_region,
+            search_input: source.search_input,
+            search_button: source.search_button,
+            marker_threshold: source.marker_threshold,
+            ui_timeout_ms: source.ui_timeout_ms,
+            search_timeout_ms: source.search_timeout_ms,
+            confirm_wait_ms: source.confirm_wait_ms,
+            step_ms: source.step_ms,
+            text_ms: source.text_ms,
+            return_retry_ms: source.return_retry_ms,
         }
     }
 }

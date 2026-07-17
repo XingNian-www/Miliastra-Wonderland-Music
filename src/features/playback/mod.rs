@@ -1,7 +1,10 @@
-use anyhow::Result;
-use serde::{Deserialize, Serialize};
+use anyhow::{Result, bail};
+use serde::{Deserialize, Deserializer, Serialize};
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+mod application;
 mod controller;
 mod dedup;
 mod format;
@@ -9,12 +12,15 @@ mod matcher;
 mod queue;
 mod state;
 
-use crate::config::{MatchConfig, SongDedupConfig};
 use crate::features::chat_text::{CommandSyntax, command_identity, parse_prefixed_command};
+use crate::features::command::{
+    CommandAuthority, CommandEnvelope, CommandPrefix, FeatureCommandMatch,
+};
+use crate::runtime::clock::WallClock;
 pub(crate) use controller::{
     MismatchDecision, MusicPlayerBackend, PlaybackAttempt, PlaybackOutcome, PlaybackRequest,
-    PlaybackVerification, PlayerController, PlayerRuntimeBackend, QueueAdvanceContext,
-    QueueAdvanceDecision,
+    PlaybackStatePort, PlaybackTimePorts, PlaybackVerification, PlayerController,
+    QueueAdvanceContext, QueueAdvanceDecision,
 };
 pub(crate) use dedup::{PersistentSongDedupHistory, SongDedupCandidate};
 pub(crate) use format::{
@@ -23,9 +29,176 @@ pub(crate) use format::{
 };
 pub(crate) use queue::{PersistentQueue, QueueItem};
 pub(crate) use state::{
-    ActivePlaybackRequest, ConfirmedPlaybackState, HALL_EXPIRING_WARNING_MINUTES, PauseReason,
-    PersistentRuntimeState, PlaybackObservation, PlaybackRuntimeState, RuntimeState,
+    ActivePlaybackRequest, ConfirmedPlaybackState, PauseReason, PersistentPlaybackState,
+    PlaybackObservation, PlaybackRuntimeState,
 };
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlaybackTimingConfig {
+    pub search_settle_ms: u64,
+    pub status_poll_ms: u64,
+    pub status_retries: u32,
+    pub skip_status_initial_ms: u64,
+    pub skip_status_poll_ms: u64,
+    pub skip_status_retries: u32,
+    pub monitor_tick_ms: u64,
+    pub monitor_status_ms: u64,
+    pub uri_stable_samples: u32,
+    pub transport_stable_samples: u32,
+    #[serde(deserialize_with = "deserialize_positive_u64")]
+    pub stale_timeout_ms: u64,
+}
+
+impl PlaybackTimingConfig {
+    pub(crate) fn validate(&self) -> Result<()> {
+        for (value, field) in [
+            (self.status_poll_ms, "timing.playback.status_poll_ms"),
+            (
+                self.skip_status_poll_ms,
+                "timing.playback.skip_status_poll_ms",
+            ),
+            (self.monitor_tick_ms, "timing.playback.monitor_tick_ms"),
+            (self.monitor_status_ms, "timing.playback.monitor_status_ms"),
+            (self.stale_timeout_ms, "timing.playback.stale_timeout_ms"),
+        ] {
+            if value == 0 {
+                bail!("{} 必须大于 0", field);
+            }
+        }
+        for (value, field) in [
+            (self.status_retries, "timing.playback.status_retries"),
+            (
+                self.skip_status_retries,
+                "timing.playback.skip_status_retries",
+            ),
+        ] {
+            if value == 0 {
+                bail!("{} 必须大于 0", field);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn deserialize_positive_u64<'de, D>(deserializer: D) -> std::result::Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = u64::deserialize(deserializer)?;
+    if value == 0 {
+        return Err(serde::de::Error::custom("value must be a positive integer"));
+    }
+    Ok(value)
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueueConfig {
+    pub max_size: usize,
+    pub auto_advance_seconds: u64,
+    pub protect_current_song_until_finished: bool,
+    pub external_playback_protect_after_seconds: u64,
+}
+
+impl QueueConfig {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.max_size == 0 {
+            bail!("queue.max_size 必须大于 0");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SongDedupConfig {
+    pub enabled: bool,
+    pub window_seconds: u64,
+    pub max_count: u32,
+    pub console_bypass: bool,
+    pub history_path: PathBuf,
+}
+
+impl Default for SongDedupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            window_seconds: 3600,
+            max_count: 1,
+            console_bypass: true,
+            history_path: PathBuf::from("data/song-dedup-history.json"),
+        }
+    }
+}
+
+impl SongDedupConfig {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.enabled && (self.window_seconds == 0 || self.max_count == 0) {
+            bail!("song_dedup.window_seconds 和 max_count 必须大于 0");
+        }
+        if self.enabled && self.history_path.as_os_str().is_empty() {
+            bail!("song_dedup.history_path 不能为空");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MatchConfig {
+    pub min_song_name_score: f64,
+    pub short_chinese_song_max_miss: usize,
+    pub long_chinese_song_min_score: f64,
+    pub max_ocr_noise_chars: usize,
+    pub enable_fuzzy_singer: bool,
+    pub short_chinese_singer_max_miss: usize,
+    pub long_chinese_singer_min_score: f64,
+    pub en_max_edit_fraction: f64,
+    pub en_singer_max_edit_fraction: f64,
+}
+
+impl Default for MatchConfig {
+    fn default() -> Self {
+        Self {
+            min_song_name_score: 0.5,
+            short_chinese_song_max_miss: 1,
+            long_chinese_song_min_score: 0.5,
+            max_ocr_noise_chars: 1,
+            enable_fuzzy_singer: true,
+            short_chinese_singer_max_miss: 1,
+            long_chinese_singer_min_score: 0.8,
+            en_max_edit_fraction: 0.3,
+            en_singer_max_edit_fraction: 0.35,
+        }
+    }
+}
+
+impl MatchConfig {
+    pub(crate) fn validate(&self) -> Result<()> {
+        for (value, field) in [
+            (self.min_song_name_score, "matching.min_song_name_score"),
+            (
+                self.long_chinese_song_min_score,
+                "matching.long_chinese_song_min_score",
+            ),
+            (
+                self.long_chinese_singer_min_score,
+                "matching.long_chinese_singer_min_score",
+            ),
+            (self.en_max_edit_fraction, "matching.en_max_edit_fraction"),
+            (
+                self.en_singer_max_edit_fraction,
+                "matching.en_singer_max_edit_fraction",
+            ),
+        ] {
+            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                bail!("{} 必须是 0 到 1 之间的有限小数", field);
+            }
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum PlaybackCommand {
@@ -75,6 +248,31 @@ pub(crate) struct PlaybackControllerSnapshot {
 }
 
 impl PlaybackCommand {
+    pub(crate) fn claims_chat(envelope: &CommandEnvelope) -> bool {
+        envelope.prefix() == CommandPrefix::At
+            && envelope.authority() == CommandAuthority::HallMember
+            && PLAYBACK_COMMAND_PREFIXES
+                .iter()
+                .any(|prefix| envelope.command_text().starts_with(prefix))
+    }
+
+    pub(crate) fn parse_chat(envelope: &CommandEnvelope) -> Option<FeatureCommandMatch<Self>> {
+        if !Self::claims_chat(envelope) {
+            return None;
+        }
+        let parsed = Self::parse_hall(envelope.command_text())?;
+        let raw = if parsed.argument.is_empty() {
+            parsed.matched.to_string()
+        } else {
+            format!("{} {}", parsed.matched, parsed.argument)
+        };
+        Some(FeatureCommandMatch::new(
+            parsed.matched,
+            raw,
+            parsed.command,
+        ))
+    }
+
     pub(crate) fn parse_hall(text: &str) -> Option<CommandSyntax<'_, Self>> {
         for (prefix, allows_argument) in [
             ("队列删除", true),
@@ -152,6 +350,24 @@ impl PlaybackCommand {
     }
 }
 
+const PLAYBACK_COMMAND_PREFIXES: &[&str] = &[
+    "队列删除",
+    "队列清空",
+    "下一首",
+    "下一曲",
+    "上一首",
+    "上一曲",
+    "暂停",
+    "继续",
+    "恢复",
+    "播放",
+    "音量",
+    "状态",
+    "歌词",
+    "队列",
+    "列表",
+];
+
 fn parse_queue_indexes(argument: &str) -> Vec<usize> {
     argument
         .chars()
@@ -165,6 +381,18 @@ fn parse_queue_indexes(argument: &str) -> Vec<usize> {
 pub(crate) struct QueuePushOutcome {
     pub(crate) accepted: bool,
     pub(crate) size: usize,
+}
+
+pub(crate) enum PlaybackMutationIntent {
+    Push(QueueItem),
+    Remove(QueueRemoval),
+    Clear,
+}
+
+pub(crate) enum PlaybackMutationOutcome {
+    Pushed(QueuePushOutcome),
+    Removed(QueueRemoveOutcome),
+    Cleared,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -184,13 +412,6 @@ pub(crate) enum QueueRemoveOutcome {
     MissingId,
     InvalidIndex,
     Empty,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct RuntimeStatePatch {
-    pub(crate) hall_remaining_minutes: Option<Option<u32>>,
-    pub(crate) hall_remaining_updated_at: Option<Option<u64>>,
-    pub(crate) hall_expiring_warning_sent: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -298,26 +519,49 @@ impl PlaybackStateUpdate {
 
 pub(crate) struct PlaybackService {
     queue: PersistentQueue,
-    runtime_state: PersistentRuntimeState,
+    playback_state: PersistentPlaybackState,
     song_dedup_history: PersistentSongDedupHistory,
-    matching: MatchConfig,
     song_dedup: SongDedupConfig,
     external_playback_tracker: controller::ExternalPlaybackTracker,
 }
 
 impl PlaybackService {
+    pub(crate) fn load(
+        queue_path: PathBuf,
+        playback_state_path: PathBuf,
+        song_dedup_history_path: PathBuf,
+        queue_max_size: usize,
+        song_dedup: SongDedupConfig,
+        wall_clock: Arc<dyn WallClock>,
+    ) -> Result<Self> {
+        let queue = PersistentQueue::load(queue_path, queue_max_size)?;
+        let playback_state = PersistentPlaybackState::load(playback_state_path)?;
+        let song_dedup_history =
+            PersistentSongDedupHistory::load(song_dedup_history_path, wall_clock)?;
+        log::info!("已加载队列: {} 首", queue.len());
+        log::info!("已加载长时间同歌去重历史: {} 条", song_dedup_history.len());
+        log::info!(
+            "已加载播放状态: playback_state={:?}",
+            playback_state.state().state
+        );
+        Ok(Self::new(
+            queue,
+            playback_state,
+            song_dedup_history,
+            song_dedup,
+        ))
+    }
+
     pub(crate) fn new(
         queue: PersistentQueue,
-        runtime_state: PersistentRuntimeState,
+        playback_state: PersistentPlaybackState,
         song_dedup_history: PersistentSongDedupHistory,
-        matching: MatchConfig,
         song_dedup: SongDedupConfig,
     ) -> Self {
         Self {
             queue,
-            runtime_state,
+            playback_state,
             song_dedup_history,
-            matching,
             song_dedup,
             external_playback_tracker: controller::ExternalPlaybackTracker::default(),
         }
@@ -390,49 +634,13 @@ impl PlaybackService {
         self.queue.clear()
     }
 
-    pub(crate) fn runtime_state_snapshot(&self) -> RuntimeState {
-        self.runtime_state.state().clone()
-    }
-
-    pub(crate) fn patch_runtime_state(&mut self, patch: RuntimeStatePatch) -> Result<()> {
-        let state = self.runtime_state.state_mut();
-        if let Some(value) = patch.hall_remaining_minutes {
-            state.hall_remaining_minutes = value;
-        }
-        if let Some(value) = patch.hall_remaining_updated_at {
-            state.hall_remaining_updated_at = value;
-        }
-        if let Some(value) = patch.hall_expiring_warning_sent {
-            state.hall_expiring_warning_sent = value;
-        }
-        self.runtime_state.save()
-    }
-
-    pub(crate) fn update_hall_remaining_minutes(&mut self, minutes: u32) -> Result<()> {
-        self.runtime_state
-            .state_mut()
-            .update_hall_remaining_minutes(minutes);
-        self.runtime_state.save()
-    }
-
-    pub(crate) fn clear_hall_remaining_minutes(&mut self) -> Result<()> {
-        self.runtime_state
-            .state_mut()
-            .clear_hall_remaining_minutes();
-        self.runtime_state.save()
-    }
-
-    pub(crate) fn clear_hall_countdown_cache(&mut self) -> Result<bool> {
-        let cleared = self.runtime_state.state_mut().clear_hall_countdown_cache();
-        if cleared {
-            self.runtime_state.save()?;
-        }
-        Ok(cleared)
+    pub(crate) fn playback_state_snapshot(&self) -> PlaybackRuntimeState {
+        self.playback_state.state().clone()
     }
 
     pub(crate) fn song_dedup_limited(&self, candidate: &SongDedupCandidate) -> bool {
         self.song_dedup_history
-            .is_limited(&self.song_dedup, &self.matching, candidate)
+            .is_limited(&self.song_dedup, candidate)
     }
 
     pub(crate) fn record_song_dedup(&mut self, candidate: SongDedupCandidate) -> Result<()> {
@@ -464,10 +672,9 @@ impl PlaybackService {
         &mut self,
         update: PlaybackStateUpdate,
     ) -> Result<bool> {
-        let playback = &mut self.runtime_state.state_mut().playback;
-        let changed = update.apply(playback);
+        let changed = update.apply(self.playback_state.state_mut());
         if changed {
-            self.runtime_state.save()?;
+            self.playback_state.save()?;
         }
         Ok(changed)
     }
@@ -486,3 +693,8 @@ fn observation_identity_changed(
         || previous.artist != current.artist
         || previous.reliability != current.reliability
 }
+pub(crate) use application::{
+    PlaybackApplication, PlaybackApplicationConfig, PlaybackCommandContext, PlaybackCommandPort,
+    PlaybackDecision, PlaybackExecutionPort, PlaybackMonitorPort, PlaybackPickedCandidate,
+    PlaybackSearchFailure, PlaybackSelection, PlaybackWorkload,
+};

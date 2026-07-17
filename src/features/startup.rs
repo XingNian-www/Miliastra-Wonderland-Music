@@ -1,6 +1,156 @@
 use std::fmt::{Display, Formatter};
+use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
+use serde::{Deserialize, Serialize};
+
+use crate::config::{PointConfig, RectConfig, validate_rect};
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StartupConfig {
+    pub enabled: bool,
+    pub launch_game: bool,
+    pub enter_game: bool,
+    pub enter_wonderland: bool,
+    pub exe_path: PathBuf,
+    pub game_args: String,
+    pub launch_wait_ms: u64,
+    pub launch_retries: u32,
+    pub enter_game_timeout_ms: u64,
+    pub enter_wonderland_timeout_ms: u64,
+    pub wonderland_home_retries: u32,
+    pub wonderland_home_retry_ms: u64,
+    pub wonderland_card_retries: u32,
+    pub wonderland_card_retry_ms: u64,
+    pub wonderland_confirm_absent_timeout_ms: u64,
+    pub wonderland_confirm_stable_timeout_ms: u64,
+    pub final_primary_timeout_ms: u64,
+    pub poll_ms: u64,
+    pub stable_mean_threshold: f32,
+    pub stable_changed_ratio_threshold: f32,
+    pub template_threshold: f32,
+    pub wonderland_enter_button_threshold: f32,
+    pub templates: StartupTemplateConfig,
+    pub enter_game_text_region: RectConfig,
+    pub wonderland_enter_button_region: RectConfig,
+    pub main_ui_region: RectConfig,
+    pub wonderland_close_region: RectConfig,
+    pub wonderland_card_point: PointConfig,
+}
+
+impl StartupConfig {
+    pub(crate) fn validate(&self) -> Result<()> {
+        validate_threshold(self.template_threshold, "startup.template_threshold")?;
+        validate_threshold(
+            self.wonderland_enter_button_threshold,
+            "startup.wonderland_enter_button_threshold",
+        )?;
+        if !self.stable_mean_threshold.is_finite() || self.stable_mean_threshold < 0.0 {
+            bail!("startup.stable_mean_threshold 必须是非负有限小数");
+        }
+        validate_threshold(
+            self.stable_changed_ratio_threshold,
+            "startup.stable_changed_ratio_threshold",
+        )?;
+        for (value, field) in [
+            (self.launch_wait_ms, "startup.launch_wait_ms"),
+            (self.enter_game_timeout_ms, "startup.enter_game_timeout_ms"),
+            (
+                self.enter_wonderland_timeout_ms,
+                "startup.enter_wonderland_timeout_ms",
+            ),
+            (
+                self.wonderland_home_retry_ms,
+                "startup.wonderland_home_retry_ms",
+            ),
+            (
+                self.wonderland_card_retry_ms,
+                "startup.wonderland_card_retry_ms",
+            ),
+            (
+                self.wonderland_confirm_absent_timeout_ms,
+                "startup.wonderland_confirm_absent_timeout_ms",
+            ),
+            (
+                self.wonderland_confirm_stable_timeout_ms,
+                "startup.wonderland_confirm_stable_timeout_ms",
+            ),
+            (
+                self.final_primary_timeout_ms,
+                "startup.final_primary_timeout_ms",
+            ),
+            (self.poll_ms, "startup.poll_ms"),
+        ] {
+            if value == 0 {
+                bail!("{} 必须大于 0", field);
+            }
+        }
+        for (value, field) in [
+            (self.launch_retries, "startup.launch_retries"),
+            (
+                self.wonderland_home_retries,
+                "startup.wonderland_home_retries",
+            ),
+            (
+                self.wonderland_card_retries,
+                "startup.wonderland_card_retries",
+            ),
+        ] {
+            if value == 0 {
+                bail!("{} 必须大于 0", field);
+            }
+        }
+        for (rect, field) in [
+            (
+                self.enter_game_text_region,
+                "startup.enter_game_text_region",
+            ),
+            (
+                self.wonderland_enter_button_region,
+                "startup.wonderland_enter_button_region",
+            ),
+            (self.main_ui_region, "startup.main_ui_region"),
+            (
+                self.wonderland_close_region,
+                "startup.wonderland_close_region",
+            ),
+        ] {
+            validate_rect(rect, field)?;
+        }
+        for (path, field) in [
+            (
+                &self.templates.wonderland_enter_button,
+                "startup.templates.wonderland_enter_button",
+            ),
+            (&self.templates.paimon_menu, "startup.templates.paimon_menu"),
+            (
+                &self.templates.wonderland_close,
+                "startup.templates.wonderland_close",
+            ),
+        ] {
+            if path.as_os_str().is_empty() {
+                bail!("{} 不能为空", field);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_threshold(value: f32, field: &str) -> Result<()> {
+    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+        anyhow::bail!("{} 必须是 0 到 1 之间的有限小数", field);
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StartupTemplateConfig {
+    pub wonderland_enter_button: PathBuf,
+    pub paimon_menu: PathBuf,
+    pub wonderland_close: PathBuf,
+}
 
 const START_GAME_CONTEXT_LOSS_REASON: &str = "启动游戏任务将重建聊天上下文";
 const START_GAME_RESCAN_REASON: &str = "启动游戏任务开始";

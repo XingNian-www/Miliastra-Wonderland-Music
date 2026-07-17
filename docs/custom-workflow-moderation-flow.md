@@ -1,277 +1,189 @@
-# 自定义工作流、邀请与管理流程梳理
+# 自定义工作流、邀请与管理流程
 
-本文梳理 `src/features/custom_workflow.rs` 这一层。它不是单纯的原子动作文件，而是把聊天命令、自定义配置步骤、邀请确认、好友反馈和拉黑/屏蔽投票连接起来的业务流程层。
+本文说明三个相邻但彼此独立的纵向模块：自定义工作流、邀请和管理投票。它们共享聊天观察、好友投递和单一 UI runtime，但各自拥有命令语法、业务状态与类型化 UI 事务。
 
-相关底层 UI 自动化动作见 `docs/ui-automation-atoms.md`。本文只描述业务流程如何组合这些动作。
+相关底层 UI 边界见 `docs/ui-automation-atoms.md`。
 
-## 核心结论
-
-`custom_workflow.rs` 同时承担两类职责：
-
-- 自定义工作流解释器：把配置中的 `custom_workflows.workflows` 解析成可执行步骤，并提供变量渲染、确认窗口和成功反馈。
-- 内建社交流程：邀请用户、向好友发反馈、拉黑/屏蔽投票和最终 UI 执行。
-
-这些流程最终仍要经过待执行任务队列串行执行。后台线程可以等待投票结果，但不能直接操作游戏 UI；真正会点击、按键、粘贴的部分仍回到主业务队列。
+## 总体边界
 
 ```mermaid
 flowchart TD
-    A["聊天 OCR / Web 控制台"] --> B["命令解析"]
-    B --> C["PendingTask 队列"]
-    C --> D["命令执行线程"]
-    D --> E["custom_workflow.rs"]
-    E --> F["workflow_actions 原子动作"]
-    E --> G["chat_output 聊天输出"]
-    E --> H["ui_locator 模板 / OCR / 像素稳定"]
+    A["聊天观察"] --> B["CommandEnvelope"]
+    B --> C["ChatCommandRouter 选择模块"]
+    C --> D["模块自有 parse_chat"]
+    D --> E["RoutedCommand / ModuleCommand"]
+    E --> F["FormalScheduler"]
+    F --> G["对应业务应用服务"]
+    G --> H["类型化 UI 事务"]
+    H --> I["单一 UiRuntime"]
 ```
+
+- 聊天入口只创建 `CommandEnvelope`，不解释所有业务参数。
+- `ChatCommandRouter` 只选择一个模块；被选中的 feature 自己解析语法。
+- `FormalScheduler` 保证需要游戏输入的正式任务有序执行。
+- 自定义机械步骤会合并成 `CustomActionPlan`；邀请、好友投递和管理动作使用各自的类型化 UI 事务。
+- 只有 `UiRuntime` 可以执行截图、点击、按键和粘贴。
 
 ## 文件职责
 
 | 文件 | 职责 |
 | --- | --- |
-| `src/features/custom_workflow.rs` | 自定义工作流解释器；邀请、好友发言、管理投票和管理执行。 |
-| `src/ui/atoms.rs` | 原子动作：等待、按键、点击、粘贴、模板等待、OCR 点击、像素稳定。 |
-| `src/ui/locator.rs` | 截图定位、模板匹配、OCR 文本定位和区域稳定等待。 |
-| `src/ui/chat_output.rs` | 游戏内大厅聊天和当前聊天框发送。 |
-| `src/observation/decision.rs` | 确认窗口开始前收集已存在决策，避免旧消息误触发。 |
-| `src/interfaces/chat.rs` | `CustomWorkflowCommand`、`ModerationCommand` 等命令模型。 |
-| `src/composition/application/custom_workflow.rs`、`src/composition/application/moderation.rs` | 把解析出的命令和投票结果接入待执行任务队列。 |
-| `src/config/mod.rs` | `CustomWorkflowConfig`、`CustomWorkflowDefinition`、`CustomWorkflowStep` 配置结构。 |
+| `src/features/custom_workflow.rs` | 自定义命令匹配、变量渲染、步骤编译、确认规则和执行顺序。 |
+| `src/features/invite.rs` | 邀请命令、确认决策和邀请业务规则。 |
+| `src/features/moderation.rs` | 管理命令、投票策略、流程租约和结果执行规则。 |
+| `src/composition/application/custom_workflow.rs` | 为工作流和邀请实现聊天、决策、好友投递与 UI 能力端口。 |
+| `src/composition/application/moderation.rs` | 连接管理投票观察、正式任务队列和管理 UI 事务。 |
+| `src/ui/routines/custom_action.rs` | 顺序执行一组机械 `WorkflowOperation`。 |
+| `src/ui/routines/friend_delivery.rs` | 唯一好友定位、消息投递及最终监听驻留恢复。 |
+| `src/ui/routines/invite.rs` | 在一个不可交错事务内完成邀请导航和结果确认。 |
+| `src/ui/routines/moderation.rs` | 在一个不可交错事务内完成 UID 搜索和管理动作。 |
+| `src/runtime/ui.rs` | 串行执行所有类型化 UI 事务。 |
 
 ## 自定义命令解析
 
-入口是 `custom_workflow::parse_text(config, text, message_type)`。主命令解析没有命中时，会尝试这里的自定义工作流解析。
+`CustomWorkflowService::claims_chat()` 判断当前命令信封是否属于自定义工作流；路由选中后，`parse_chat()` 生成 `CustomWorkflowCommand`。解析规则包括：
 
-解析规则：
+- `custom_workflows.enabled = false` 时不认领命令。
+- 按配置顺序匹配已启用工作流。
+- `message_types` 限制允许的聊天来源。
+- `commands` 定义触发词，可写带或不带 `@` 的形式。
+- `allow_args = false` 时触发词后不能带参数。
+- `allow_args = true` 时接受空格、紧贴或冒号参数。
 
-- `custom_workflows.enabled = false` 时直接忽略。
-- 只接受能拆出用户名和命令体的聊天文本。
-- 按 `workflows` 顺序查找已启用的工作流。
-- `message_types` 限制来源，例如大厅蓝字或好友粉字。
-- `commands` 是触发词，配置里可以写带 `@` 或不带 `@` 的形式。
-- `allow_args = false` 时，触发词后不能附带参数。
-- `allow_args = true` 时，支持空格参数、紧贴参数和冒号参数。
-
-匹配成功后生成 `BusinessIntent::CustomWorkflow(CustomWorkflowCommand)`，包含：
-
-- `name`：实际匹配到的命令名。
-- `workflow`：要执行的工作流名。
-- `args`：原始参数字符串。
-
-这里仍只是命令解析，不执行任何 UI 操作。真正执行发生在命令执行线程。
+解析结果由 `ModuleCommand::CustomWorkflow` 包装。中央路由不读取工作流参数，也不执行 UI。
 
 ## 工作流上下文
 
-`WorkflowContext` 是自定义步骤渲染变量时使用的上下文。它来自当前 `CustomWorkflowCommand` 和 `ParsedCommand`。
-
-可用变量：
+组合层用 `CustomWorkflowCommand` 和 `RoutedCommand` 创建 `CustomWorkflowInvocation`。`WorkflowContext` 从该调用对象派生，支持：
 
 | 变量 | 含义 |
 | --- | --- |
-| `{{workflow}}` / `{{workflow_name}}` | 当前工作流名。 |
-| `{{command}}` / `{{command_name}}` | 用户触发的命令名。 |
-| `{{args}}` / `{{param}}` / `{{params}}` | 完整参数字符串。 |
-| `{{arg1}}`, `{{arg2}}` | 按空白切分后的第 N 个参数。 |
-| `{{username}}` / `{{user}}` | 触发命令的用户名。 |
-| `{{message_type}}` | 消息来源类型。 |
-| `{{user_command}}` | 用户原始命令文本。 |
+| `{{workflow}}` / `{{workflow_name}}` | 工作流名。 |
+| `{{command}}` / `{{command_name}}` | 实际触发命令。 |
+| `{{args}}` / `{{param}}` / `{{params}}` | 完整参数。 |
+| `{{arg1}}`, `{{arg2}}` | 按空白拆分后的第 N 个参数。 |
+| `{{username}}` / `{{user}}` | 触发者昵称。 |
+| `{{message_type}}` | 消息来源。 |
+| `{{user_command}}` | 原始命令正文。 |
 
-未知变量会原样保留，避免配置写错时静默变成空字符串。
+未知变量保持原样，防止配置错误被静默替换为空字符串。
 
-## 自定义工作流执行
+## 工作流执行
 
-入口是 `ApplicationRuntime::execute_custom_workflow(command, parsed)`。
+`CustomWorkflowService::execute()` 的顺序为：
 
-执行顺序：
+1. 校验并编译目标工作流。
+2. 如配置 `confirm_before_run`，建立新消息基线并等待确认。
+3. 把连续机械步骤编译成一个 `CustomActionPlan`，一次提交给 UI runtime。
+4. 遇到业务能力步骤时，调用 `WorkflowCapability` 对应端口。
+5. 所有步骤成功后发送可选的 `success_message`。
 
-1. 按 `command.workflow` 找到启用的工作流。
-2. 校验 `steps` 非空。
-3. 创建 `WorkflowContext`。
-4. 如果 `confirm_before_run = true`，先进入自定义确认窗口。
-5. 逐个执行 `steps`。
-6. 步骤结束后按 `timing.workflow.default_step_wait_ms` 或步骤自己的 `wait_ms` 等待。
-7. 如果配置了 `success_message`，执行完成后向大厅回复成功消息。
+机械动作与业务能力分开，避免自定义工作流通过公共接口任意组合邀请或好友投递内部步骤。
 
-有些步骤本身已经消费等待时间，因此不会再追加默认步骤等待：
+### 机械步骤
 
-- `sleep` / `wait`
-- `wait_template_absent` 且启用了消失后稳定等待
-- `wait_stable` / `wait_pixels_stable`
-
-## 步骤到动作的映射
-
-| 步骤类型 | 落地行为 |
+| 配置步骤 | `WorkflowOperation` 行为 |
 | --- | --- |
 | `sleep` / `wait` | 固定等待。 |
-| `key` / `press_key` | 发送键盘按键。 |
-| `hold_key` | 在限定秒数内按住键盘按键。 |
+| `key` / `press_key` | 按键。 |
+| `hold_key` | 限时按住按键。 |
 | `activate_game` | 激活游戏窗口。 |
-| `focus_game` | 激活并点击安全聚焦点。 |
+| `focus_game` | 激活并聚焦游戏。 |
 | `click` | 点击固定坐标。 |
 | `wait_template` | 等待模板出现。 |
-| `click_template` | 等待模板出现并点击中心，可加偏移。 |
-| `wait_template_absent` | 等待模板消失，可继续等待区域像素稳定。 |
-| `wait_stable` / `wait_pixels_stable` | 等待指定区域像素稳定。 |
-| `wait_text` | OCR 等待文本出现。 |
-| `click_text` | OCR 找到文本后点击文本框中心，可加偏移。 |
-| `paste` / `paste_text` | 临时占用文本剪贴板并粘贴。 |
-| `send_chat` / `reply` | 发送大厅聊天回复。 |
-| `send_current_chat` | 假设当前聊天框已打开，直接发送当前聊天。 |
-| `send_friend_message` / `friend_reply` | 打开好友聊天并发送反馈。 |
-| `invite_user` / `invite_current_user` | 执行邀请流程。 |
-| `ensure_primary` / `return_primary` | 检测并到达一级界面；已在一级时不发送 `Esc`。 |
-| `ensure_current_hall` | 检测并到达二级当前大厅。 |
+| `click_template` | 等待并点击模板中心。 |
+| `wait_template_absent` | 等待模板消失，可继续等待像素稳定。 |
+| `wait_stable` / `wait_pixels_stable` | 等待区域像素稳定。 |
+| `wait_text` / `click_text` | 使用 OCR 等待或点击文本。 |
+| `paste` / `paste_text` | 粘贴文本。 |
+| `ensure_primary` / `return_primary` | 到达一级监听驻留。 |
+| `ensure_current_hall` | 到达当前大厅二级监听驻留。 |
 
-需要注意：配置步骤不全是原子动作。`send_friend_message`、`invite_user`、`return_primary` 这些是业务组合流程。
+### 业务能力步骤
 
-默认按键工作流包括 `@W/@S/@A/@D`、`@F` 和 `@X`，仅接受粉色好友私聊。`@X` 的步骤是先确保一级界面，再单击一次 `X`，不接受参数；命令结束后由统一执行器恢复监听驻留界面。
+| 配置步骤 | `WorkflowCapability` |
+| --- | --- |
+| `send_chat` / `reply` | `SendHall`。 |
+| `send_current_chat` | `SendCurrentChat`。 |
+| `send_friend_message` / `friend_reply` | `SendFriendMessage`。 |
+| `invite_user` / `invite_current_user` | `InviteUser`，进入邀请业务服务。 |
+
+配置加载时会拒绝未知步骤、缺失坐标或区域、空按键、空文本、非法阈值和零秒按键等错误，不把这些问题推迟到运行时。
 
 ## 自定义确认窗口
 
-工作流可以设置 `confirm_before_run = true`。执行前会先向大厅发送确认提示。
+确认窗口使用共享聊天观察能力建立基线，只接受开始等待之后出现的新消息：
 
-默认提示是：
+1. 根据 `confirm_message_types` 决定只观察当前大厅，还是观察多个好友会话。
+2. 记录等待开始前已经存在的消息。
+3. 在超时前轮询新观察结果。
+4. `@确认` 继续，`@跳过` 或超时取消。
 
-```text
-{username} 请求执行 {command},@确认@跳过
-```
+确认读取不会直接操作游戏输入；需要切换观察界面时仍通过受控的驻留协调完成。
 
-确认等待使用通用 `wait_for_chat_decision()`：
+## 好友投递
 
-1. 仅接受大厅消息且处于二级监听时，记录当前大厅现有深色气泡序列。
-2. 允许粉色好友消息时，临时进入一级界面并用 `DecisionScreenLock` 记录已有确认。
-3. 在超时时间内循环读取所选消息来源。
-4. 只接受 `confirm_message_types` 允许的消息来源。
-5. 新出现的 `@确认` 返回通过，新出现的 `@跳过` 返回取消。
-6. 超时后发送“自定义流程确认超时,已取消”。
+`SendFriendDeliveries` 是完整的类型化 UI 事务，而不是“先定位、再由业务层点击”的松散步骤：
 
-这里的屏幕锁只保护当前确认窗口，不会影响普通命令入队。
+1. 从当前已知驻留界面开始。
+2. 打开或复用二级聊天界面。
+3. 先识别标题；未命中时在严格好友列表区域 OCR 查找唯一昵称。
+4. 点击目标行后再次用标题或聊天区域内容验证目标。
+5. 发送该好友的全部消息。
+6. 恢复事务请求指定的最终监听驻留。
 
-## 好友发言
-
-标准好友发言入口是 `send_friend_message(username, message)`。它用于拒绝邀请反馈，也可以被自定义工作流步骤调用。
-
-流程：
-
-1. 检测当前界面；已在二级聊天时不发送 `Esc` 或 `Enter`。
-2. 如果顶部标题已经是目标好友，直接复用当前会话。
-3. 否则打开二级聊天，在好友列表区域 OCR 查找并点击目标用户名。
-4. 等待输入框接管焦点。
-5. 调用 `chat_output.send_current_chat(message)` 发送当前聊天。
-6. 普通好友反馈结束后恢复当前监听驻留界面；邀请同意反馈可以保留好友会话供下一阶段复用。
-
-这个流程要求游戏窗口已经处于可输入状态。它不会把好友反馈伪装成玩家命令，也不参与普通聊天命令解析。邀请同意和默认同意使用内部的保留会话变体：私聊反馈成功后不返回一级，立即复用同一好友会话继续邀请；私聊失败时回退到上述标准流程。
+结果区分“确认未发送”和“发送结果未知”。只有确认未发送的消息可以由上层安全重试；结果未知时禁止自动重放，避免重复发送。
 
 ## 邀请流程
 
-入口是 `execute_invite_with_announce(username, password)`。
+`InviteService` 先处理业务决策，再把一次完整邀请交给 `ExecuteInvite`：
 
-整体规则：
+1. 检查是否已经位于公共大厅。
+2. 必要时向大厅发起 `@邀请确认` / `@邀请拒绝` 决策窗口；超时按配置的默认规则处理。
+3. 将对好友的通知文本、目标昵称、可选密码和最终驻留目标一起提交给邀请 UI 事务。
+4. 邀请 UI 事务定位唯一好友、发送通知、进入大厅并确认结果。
+5. 确认进入新大厅后，业务层重置命令观察状态、娱乐上下文和大厅倒计时缓存。
 
-- 如果当前已经是公共大厅，直接通知好友“已同意加入大厅,请等待BOT进入大厅并发送就绪信息后再开启麦克风”，然后执行邀请。
-- 如果不是公共大厅，先在大厅聊天发起确认公告。
-- 公告后等待大厅成员回复 `@邀请确认` 或 `@邀请拒绝`。
-- 超时默认同意。
-- 拒绝时只给好友反馈“大厅成员已拒绝邀请”，不执行邀请 UI。
-
-非公共大厅公告格式：
-
-```text
-{username}邀请BOT前往大厅,30s内@邀请确认@邀请拒绝,默认通过
-```
-
-决策命令支持：
-
-| 文本 | 结果 |
-| --- | --- |
-| `@邀请确认` | 同意邀请。 |
-| `@同意邀请` | 同意邀请。 |
-| `@邀请拒绝` | 拒绝邀请。 |
-| `@拒绝邀请` | 拒绝邀请。 |
-
-等待邀请决策同样使用 `DecisionScreenLock`，不会吃到等待开始前已经存在的旧确认或旧拒绝。
-
-## 邀请 UI 执行
-
-真正邀请用户的流程在 `execute_invite(username, password, friend_chat_open)` 和 `execute_invite_steps(username, password, friend_chat_open)`。
-
-同意或默认同意的私聊反馈发送成功时，`friend_chat_open` 为真：流程直接复用当前目标好友会话。其余情况也只保证二级聊天已打开，不再固定先回一级。点击邀请入口时优先查找最下方深色好友会话框；未找到时才回退 OCR 查找目标用户名。若邀请命令带有 6 位密码，会在点击“进入大厅”后等待一次邀请步骤延迟，然后逐位键盘输入密码。公共大厅检测的 `F2` 动作仍显式要求一级界面；邀请成功后的加载收尾也会先确认一级，再按监听模式发送就绪信息并恢复驻留界面。
-
-邀请流程的重点边界是：
-
-- 先做公共大厅判断，避免重复询问。
-- 同意反馈发送成功时只复用该次已打开的目标好友会话；反馈失败不会阻塞邀请，会按普通路径重新打开好友聊天。
-- 拒绝分支不会执行邀请 UI。
+`ExecuteInviteOutcome` 分别报告邀请效果、好友通知结果和最终驻留结果。已确认进入大厅后，即使驻留恢复失败也不会重放邀请。
 
 ## 管理投票
 
-管理命令包括拉黑和屏蔽聊天。它们先进入投票流程，再根据投票结果决定是否执行 UI 操作。
+拉黑和屏蔽聊天由 `ModerationService` 管理。每个“动作 + UID”拥有唯一流程租约，重复命令不会开启第二场投票。
 
-入口是 `execute_moderation_with_vote(command)`。
+1. 正式任务发送投票公告并建立临时一级监听驻留。
+2. 专用投票工作线程取得聊天观察独占权，只读取粉色好友消息；它不会操作游戏输入。
+3. `DecisionScreenLock` 排除投票开始前已经存在的旧消息。
+4. 同一用户同一方向达到 `stable_vote_samples` 后才计票。
+5. 投票线程把 `ModerationResultTask` 放回正式任务队列。
+6. 正式任务根据结果发送拒绝反馈，或提交 `ExecuteModeration` UI 事务。
+7. 流程租约和临时驻留租约通过所有成功、失败和停止路径释放。
 
-流程：
+通过规则保持为：
 
-1. 为当前动作和 UID 生成管理工作流 key。
-2. 如果同一个动作和 UID 已经在投票或执行中，直接跳过。
-3. 发送投票公告。
-4. 建立可嵌套的“临时一级阶段”，后台线程等待好友私聊投票。
-5. 投票结束后把 `PendingTask::ModerationVoteResult` 放回待执行任务队列。
-6. 命令执行线程取到投票结果后，再执行或拒绝管理动作，并释放该次临时一级阶段。
-7. 最后一个并行投票结束后，二级监听才恢复当前大厅。
+- 同意数减不同意数达到 `required_vote_margin` 时立即通过。
+- 超时且没有反对票时通过。
+- 超时存在反对票且差值不足时拒绝。
+- 程序停止时拒绝。
 
-`moderation_workflows` 是防并发集合。`ModerationWorkflowRelease` 用 RAII 在流程结束时释放 key，避免异常返回后永久锁住同一个 UID。
+## 管理 UI 事务
 
-## 投票统计规则
+`ExecuteModeration` 在单一 UI runtime 中连续完成：
 
-投票只接受粉色好友私聊消息。
+1. 验证当前处于稳定一级界面。
+2. 打开好友面板并等待模板。
+3. 打开 UID 搜索面板并等待模板。
+4. 输入 UID、搜索并等待更多设置模板。
+5. 点击拉黑或屏蔽聊天模板。
+6. 点击确认并等待确认模板稳定消失。
+7. 有界恢复一级监听驻留。
 
-`parse_friend_moderation_vote()` 识别好友发来的同意或不同意。为了降低 OCR 抖动影响，同一用户同一投票方向需要达到 `stable_vote_samples` 次采样，才进入稳定投票集合。
+结果同时包含 `ModerationEffect` 与 `UiResidencyOutcome`。动作已确认应用但驻留恢复失败时只记录故障，不得重放管理动作；输入前失败或确认未执行可以报告失败；输入后的未知结果禁止自动重试。
 
-通过条件：
+## 不变量
 
-- 同意数减去不同意数达到 `required_vote_margin`，立即通过。
-- 超时后如果没有任何不同意票，则按通过处理。
-- 超时后存在不同意票且未达到目标差值，则按未通过处理。
-- 程序停止时按未通过处理。
-
-这套规则表达的是“无反对默认通过”，不是简单多数票。
-
-## 管理执行状态机
-
-投票通过后，最终 UI 执行在 `execute_moderation_steps_inner(command)`，状态机是 `ModerationUiState`。
-
-| 状态 | 行为 |
-| --- | --- |
-| `OpenFriendPanel` | 按键打开好友面板，并等待好友界面模板。 |
-| `OpenSearchPanel` | 打开 UID 搜索面板，并等待搜索界面模板。 |
-| `EnterUid` | 点击 UID 输入框，粘贴 UID，点击搜索。 |
-| `WaitSearchResult` | 等待并点击更多设置模板。 |
-| `ClickAction` | 根据动作点击拉黑或屏蔽聊天按钮。 |
-| `ConfirmAction` | 点击确认按钮。 |
-| `WaitActionApplied` | 等待确认按钮消失或结果生效。 |
-| `Done` | 执行完成。 |
-
-打开好友管理面板这一动作会显式确保一级界面，其余状态依赖前一状态的模板成功。状态机失败时返回未执行；结束后先释放临时一级阶段，再按监听驻留目标发送反馈。
-
-## 关键日志
-
-常见日志可以按这些前缀理解：
-
-| 日志 | 含义 |
-| --- | --- |
-| `执行自定义流程` | 自定义工作流开始执行。 |
-| `自定义流程步骤` | 当前执行到哪个配置步骤。 |
-| `自定义流程确认` | 正在等待 `@确认` 或 `@跳过`。 |
-| `好友发言` | 准备向某个好友发送反馈。 |
-| `邀请: 先检测是否公共大厅` | 邀请流程进入前置大厅判断。 |
-| `收到邀请拒绝，取消邀请` | 邀请确认窗口收到拒绝。 |
-| `投票` | 管理投票统计进度。 |
-| `开始执行拉黑/屏蔽聊天` | 投票结果已回到主业务队列并开始 UI 操作。 |
-
-## 设计边界
-
-- 自定义工作流是业务层解释器，不是新增原子动作的地方。
-- 原子动作默认游戏已经聚焦；自定义流程通过显式界面步骤建立页面前置条件。
-- 后台投票线程只等待和入队，不直接操作游戏窗口。
-- 标准好友发言复用当前二级界面；只有当前不在二级聊天时才打开，邀请同意反馈成功后可继续复用目标好友会话。
-- 邀请拒绝分支只反馈好友，不继续执行邀请 UI。
-- 控制台命令和 OCR 命令入口不同，但会游戏输入的任务最终都进待执行任务队列串行执行。
+- feature 拥有命令语法和业务状态，中央层只路由模块。
+- 等待线程可以观察和提交结果，不能点击、按键或粘贴。
+- 所有游戏输入只能由单一 UI runtime 串行执行。
+- 好友投递、邀请和管理动作均返回“效果 + 最终驻留”，不能用流程函数正常返回推断成功。
+- 结果未知的外部动作禁止自动重放。
+- 自定义工作流只能组合公开机械动作和类型化业务能力，不能绕过业务模块内部规则。

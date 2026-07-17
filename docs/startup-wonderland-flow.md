@@ -1,229 +1,131 @@
-# 启动游戏与进入千星流程梳理
+# 启动游戏与进入千星
 
-本文专门梳理“启动游戏任务”和“进入千星任务”。当前实现已经删除 BGI 复刻式大流程，改成两个独立状态机：
+启动能力拆成两个独立正式任务：
 
-- `StartGame`：确保游戏进程和窗口存在，完成开门，直到派蒙菜单模板出现。
-- `EnterWonderland`：在已有游戏主界面中打开千星奇域，进入大厅后返回一级界面。
+- 启动游戏任务：找到或启动游戏，完成“点击进入”，以派蒙菜单模板稳定出现作为进入游戏的唯一完成信号。
+- 进入千星任务：从一级界面进入千星大厅，并在同一个 UI 事务内确认最终一级驻留。
 
-`/startup/wonderland` 和启动配置里的“启动并进入千星”都只是把这两个任务按顺序放入待执行任务队列，不是一个绕过主执行器的同步流程。
+远程“启动并进入千星”只是按顺序提交这两个任务，不存在第三个把全部逻辑揉在一起的启动流程。
 
-## 总体入口
+## 模块边界
 
 ```mermaid
 flowchart TD
-    A["启动配置 startup.enabled"] --> B["enqueue_startup_task_if_enabled"]
-    C["Web /startup/game"] --> D["PendingTask::StartGame"]
-    E["Web /startup/enter-wonderland"] --> F["PendingTask::EnterWonderland"]
-    G["Web /startup/wonderland"] --> D
-    G --> F
-    B -->|launch_game 或 enter_game| D
-    B -->|enter_wonderland| F
-    D --> H["命令执行线程"]
-    F --> H
-    H --> I["execute_start_game_task"]
-    H --> J["execute_enter_wonderland_task"]
+    A["启动配置 / HTTP"] --> B["StartupTask"]
+    B --> C["StartupService"]
+    C --> D["StartupExecutionPort"]
+    D --> E["StartupUi"]
+    E --> F["UiRuntime 独占事务"]
+    F --> G["EnterGameOutcome / EnterWonderlandOutcome"]
+    C --> H["窗口重扫信号"]
+    C --> I["聊天上下文失效"]
 ```
 
-任务来源：
-
-| 来源 | 入队内容 |
+| 文件 | 职责 |
 | --- | --- |
-| 程序启动配置 | `startup.launch_game || startup.enter_game` 时入队 `StartGame`；`startup.enter_wonderland` 时入队 `EnterWonderland`。 |
-| `/startup/game` | 只入队 `StartGame`。 |
-| `/startup/enter-wonderland` | 只入队 `EnterWonderland`。 |
-| `/startup/wonderland` | 依次入队 `StartGame` 和 `EnterWonderland`。 |
+| `src/features/startup.rs` | 启动配置校验、任务类型、业务执行顺序和窄执行端口。 |
+| `src/ui/routines/startup.rs` | 启动游戏与进入千星的完整 UI 例程契约。 |
+| `src/composition/application/startup.rs` | 把业务端口接到 `StartupUi` 和窗口重扫信号。 |
+| `src/adapters/windows/device.rs` | 查找/启动游戏进程以及实际窗口输入。 |
 
-HTTP 层只入队并返回队列位置，不等待任务执行完成。
+应用启动前会先解析并校验完整启动配置；进程名、模板路径、区域、阈值、重试次数和超时无效时，任何运行时线程都不会启动。
 
-## StartGame 状态机
+## 启动游戏任务
 
-实现位置：`src/features/startup.rs`。
+`StartupService` 的业务顺序是：
 
-```mermaid
-stateDiagram-v2
-    [*] --> EnsureGameWindow
-    EnsureGameWindow --> FocusGameWindow: 找到或启动游戏窗口
-    FocusGameWindow --> ClickEnterGameText: startup.enter_game=true
-    FocusGameWindow --> Done: startup.enter_game=false
-    ClickEnterGameText --> Done: 派蒙菜单模板已出现
-    ClickEnterGameText --> WaitEnterGameTextGone: 点击 OCR “点击进入”
-    WaitEnterGameTextGone --> WaitPaimonMenuTemplate: “点击进入”消失
-    WaitPaimonMenuTemplate --> Done: 派蒙菜单模板出现
-    Done --> [*]
-```
+1. 使当前聊天与娱乐上下文失效。
+2. 请求窗口扫描立即重试。
+3. 提交一个 `EnterGame` UI 事务。
+4. UI 事务完成后再次请求窗口扫描。
 
-### 确保游戏窗口（EnsureGameWindow）
+`EnterGame` UI 事务内部执行：
 
-这一步负责确保游戏窗口存在：
+1. 检查目标窗口是否存在。
+2. 如果窗口不存在且 `startup.launch_game=true`，解析游戏路径和参数并启动进程。
+3. 按 `startup.launch_retries` 和 `startup.launch_wait_ms` 有界等待窗口出现。
+4. 聚焦游戏窗口。
+5. 如果 `startup.enter_game=false`，只返回 `WindowReady`。
+6. 否则循环截图：
+   - 在 `startup.main_ui_region` 检测 `startup.templates.paimon_menu`。
+   - 派蒙模板连续稳定命中两次时返回 `Entered`。
+   - 未进入主界面时，在 `startup.enter_game_text_region` OCR“点击进入”并点击识别框中心。
+7. 超过 `startup.enter_game_timeout_ms` 仍未稳定看到派蒙模板时失败。
 
-1. 先用 `window.target_process` 查找游戏窗口。
-2. 如果已找到，跳过启动。
-3. 如果没找到且 `startup.launch_game=false`，直接失败。
-4. 如果允许启动，解析启动路径。
-5. 启动 exe 后按 `startup.launch_wait_ms` 间隔等待窗口出现，最多 `startup.launch_retries` 次。
+“点击进入”只是动作线索，不是完成依据。派蒙模板稳定出现才证明游戏主界面可用。
 
-启动路径解析顺序：
+## 游戏路径
 
-1. `startup.exe_path` 非空且是文件：直接启动该文件。
-2. `startup.exe_path` 非空且是目录：在目录下按目标进程候选查找 exe。
-3. `startup.exe_path` 为空：从官服/国际服启动器注册表查找安装路径。
+当 `startup.exe_path` 指向文件时直接使用；指向目录时按配置的目标进程名和官服/国际服候选查找可执行文件。路径为空时再尝试启动器注册表路径。
 
-候选 exe 会同时考虑配置里的目标进程，以及 `YuanShen.exe`、`GenshinImpact.exe`。
+当前通用候选覆盖：
 
-### 聚焦游戏窗口（FocusGameWindow）
+- `YuanShen.exe`
+- `GenshinImpact.exe`
 
-找到窗口后调用 `workflow_actions::focus()`：
+不处理 B 服登录窗口。解析不到路径、文件不存在或启动参数引号未闭合都会在输入前失败。
 
-1. 激活游戏窗口。
-2. 点击 `window.focus_point`。
-3. 确认前台窗口属于游戏进程。
+## 进入千星任务
 
-这是启动任务里唯一主动使用 `focus_point` 的阶段。
+`StartupService` 的业务顺序是：
 
-### 点击进入文字（ClickEnterGameText）
+1. 使当前聊天与娱乐上下文失效。
+2. 请求窗口扫描立即重试。
+3. 提交一个 `EnterWonderland` UI 事务。
+4. 目标效果与一级驻留都确认后，再请求一次完成重扫。
 
-如果 `startup.enter_game=true`，进入开门流程：
+`EnterWonderland` UI 事务独占完成以下机械事务：
 
-1. 每轮先在 `startup.main_ui_region` 匹配 `startup.templates.paimon_menu`。
-2. 若命中派蒙菜单模板，直接认为已经进入主界面并完成任务。
-3. 未命中时，才在 `startup.enter_game_text_region` 中 OCR 固定文本 `点击进入`。
-4. 找到后点击 OCR 文本框中心。
-5. 最长等待 `startup.enter_game_timeout_ms`。
+1. 确认窗口存在并聚焦。
+2. 在同一事务内归一化到一级界面。
+3. 按 `F6` 打开千星主页。
+4. 在 `startup.wonderland_close_region` 连续稳定确认 `startup.templates.wonderland_close`。
+5. 点击 `startup.wonderland_card_point`。
+6. 在 `startup.wonderland_enter_button_region` 查找 `startup.templates.wonderland_enter_button`。
+7. 命中后点击模板中心，并把目标动作标记为已经尝试。
+8. 等待确认按钮消失。
+9. 按像素均值差和变化比例等待同一区域稳定。
+10. 在 `startup.final_primary_timeout_ms` 内连续稳定确认一级界面。
 
-当前默认区域是 `900,1000,130,40`，默认超时 60 秒。
+步骤 2 到步骤 10 都属于一个 UI 例程，其他键鼠输入不能插入。业务层不会先调用独立“界面准备”任务，也不会在例程外盲按 `Esc`。
 
-### 等待进入文字消失（WaitEnterGameTextGone）
+## 最终驻留与失败语义
 
-点击后并不立即认为成功，而是继续 OCR 同一区域：
+`EnterWonderlandOutcome` 分别包含：
 
-- 如果仍识别到 `点击进入`，继续点击文本框中心。
-- 如果不再识别到 `点击进入`，进入下一步。
-- 如果一直存在直到开门超时，任务失败。
+- `effect`：进入千星目标是否确认。
+- `residency`：最终一级界面是否稳定确认。
 
-这个设计对应“先识别到文字，点击后文字消失，才说明点击进入动作被接受”。
+只有两者都成功，进入千星任务才成功。目标已确认但一级驻留失败会作为任务失败返回，不再沿用旧的“只记日志、仍算成功”行为。
 
-### 等待派蒙菜单模板（WaitPaimonMenuTemplate）
+点击确认按钮以后，失败确定性是 `AfterInputUnknown`；程序不会自动重放整次进入流程。若目标输入尚未发生，例程可以从明确的二级状态有限按 `Esc` 收敛到一级，但未知画面不会盲目输入。
 
-文字消失后继续等待 `startup.templates.paimon_menu` 在 `startup.main_ui_region` 出现。检测到派蒙菜单模板后，认为启动游戏任务完成。
+## HTTP 入口
 
-启动时若游戏已跳过“点击进入”阶段并直接进入一级界面，`ClickEnterGameText` 里的模板检测会先命中，任务不会等待 OCR 超时。
-
-这里不判断白屏本身。白屏只是加载过程中的中间状态；成功条件是最终回到可聊天的一级界面信号。
-
-## EnterWonderland 状态机
-
-实现位置：`src/ui/routines/startup.rs`。
-
-```mermaid
-stateDiagram-v2
-    [*] --> OpenWonderlandHome
-    OpenWonderlandHome --> ClickWonderlandCard: 千星主页关闭按钮稳定出现
-    ClickWonderlandCard --> WaitConfirmGone: 快速匹配前往大厅按钮并点击一次
-    WaitConfirmGone --> [*]: 模板消失且区域像素稳定
-```
-
-进入千星任务前置条件更严格：
-
-1. 必须已经能找到游戏窗口。
-2. 找不到窗口会直接失败，并提示先执行启动游戏任务。
-3. 任务开始时会激活并聚焦游戏窗口。
-
-### 打开千星主页（OpenWonderlandHome）
-
-循环执行：
-
-1. 按 `F6`。
-2. 等待 `startup.wonderland_home_retry_ms`。
-3. 在 `startup.wonderland_close_region` 检测 `startup.templates.wonderland_close`。
-4. 连续稳定命中 2 次后，认为千星奇域主页已打开。
-5. 未命中则继续按 F6，直到达到 `startup.wonderland_home_retries`，同时受 `startup.enter_wonderland_timeout_ms` 兜底限制。
-
-默认关闭按钮区域是右上角 `1780,0,140,90`。
-
-### 点击千星卡片（ClickWonderlandCard）
-
-打开主页后循环点击 `startup.wonderland_card_point`，默认是第一个奇域卡片坐标 `680,310`。
-
-点击后在 `startup.wonderland_enter_button_region` 检测 `startup.templates.wonderland_enter_button`。首次命中后立刻点击一次。
-
-默认匹配区域是 `1400,850,360,150`，复用缓存灰度 SAD 匹配，阈值严格使用 `startup.wonderland_enter_button_threshold`，默认 `0.9`。
-
-该阶段按 `startup.wonderland_card_retries` 重试，每次点击卡片后最多等待 `startup.wonderland_card_retry_ms`。模板检测仍使用 `timing.input.click_ms`（默认 `150ms`）作为内部快速轮询间隔。
-
-### 等待确认按钮消失（WaitConfirmGone）
-
-点击“前往大厅”按钮后，不固定等待；改为按 `timing.input.click_ms`（默认 `150ms`）轮询同一区域：
-
-- 模板消失后，继续等待该区域像素稳定。
-- 模板消失且区域稳定后，直接认为已进入千星内部。
-- 模板消失超过 `startup.wonderland_confirm_absent_timeout_ms`，或区域稳定超过 `startup.wonderland_confirm_stable_timeout_ms` 时，任务失败。
-
-这里是进入千星任务的最终成功条件。后续不再继续 BGI 原流程，也不会自动退出千星。
-
-## 进入千星后的返回一级
-
-`startup_flow::enter_wonderland()` 成功返回后，调用方 `execute_enter_wonderland_task()` 会执行：
-
-1. 记录“进入千星完成信号已确认”。
-2. 调用 `return_to_primary_fixed()`。
-3. 记录返回结果。
-4. 请求重置窗口检测退避。
-5. 任务完成，待执行任务队列继续执行后续任务。
-
-返回一级失败不会清空后续任务，也不会把进入千星任务改成失败。它只记录返回结果，让后续业务仍按队列继续推进。
-
-## 窗口检测退避重置
-
-主扫描线程在游戏窗口不可用时会进入退避等待。启动相关任务会通过 `WindowDetectionSignal` 通知扫描线程尽快重试：
-
-- 启动游戏任务开始。
-- 发现已有游戏窗口。
-- 已创建游戏进程。
-- 检测到游戏窗口。
-- 已聚焦游戏窗口。
-- 进入游戏完成。
-- 进入千星任务开始。
-- 进入千星任务完成。
-
-这样通过命令启动游戏后，主扫描线程不必等完整退避时间才重新截图。
-
-## 失败处理
-
-启动和进入千星任务都由命令执行线程消费。如果任务返回错误：
-
-- 目标窗口不可用类错误：记录错误并跳过返回一级界面。
-- 其他错误：调用 `return_to_primary_after_command_failure()`，尝试用 ESC 回到一级界面。
-
-准备界面阶段不同：`StartGame` 和 `EnterWonderland` 是直接任务，由各自状态机负责窗口检查、聚焦和页面转换。普通命令同样不再统一调用 `prepare_command_ui()`；只有明确要求一级布局的动作才调用一级界面转换。
-
-## 配置面
-
-关键配置：
-
-| 配置 | 作用 |
+| 路径 | 提交内容 |
 | --- | --- |
-| `startup.enabled` | 程序启动后是否自动入队启动相关任务。 |
-| `startup.launch_game` | 找不到窗口时是否启动游戏。 |
-| `startup.enter_game` | 是否执行 OCR “点击进入”开门。 |
-| `startup.enter_wonderland` | 是否自动入队进入千星任务。 |
-| `startup.exe_path` | 启动 exe 文件或所在目录。 |
-| `startup.enter_game_text_region` | OCR “点击进入”的区域。 |
-| `startup.main_ui_region` / `startup.templates.paimon_menu` | 启动游戏完成信号。 |
-| `startup.wonderland_close_region` | 千星主页右上角关闭按钮搜索区域。 |
-| `startup.templates.wonderland_enter_button` | “前往大厅”按钮模板。 |
-| `startup.wonderland_enter_button_region` | “前往大厅”按钮搜索区域。 |
-| `startup.wonderland_enter_button_threshold` | “前往大厅”按钮模板匹配阈值。 |
-| `startup.wonderland_home_retries` / `startup.wonderland_home_retry_ms` | 打开千星主页阶段的 F6 重试次数和每次等待时间。 |
-| `startup.wonderland_card_retries` / `startup.wonderland_card_retry_ms` | 点击奇域卡片阶段的重试次数和每次等待“前往大厅”按钮时间。 |
-| `startup.wonderland_confirm_absent_timeout_ms` | 点击“前往大厅”后等待按钮模板消失的最长时间。 |
-| `startup.wonderland_confirm_stable_timeout_ms` | 按钮消失后等待原区域像素稳定的最长时间。 |
-| `startup.template_threshold` | 启动流程和千星主页关闭按钮模板匹配阈值。 |
+| `POST /startup/game` | 一个启动游戏任务。 |
+| `POST /startup/enter-wonderland` | 一个进入千星任务。 |
+| `POST /startup/wonderland` | 按顺序提交启动游戏和进入千星两个任务。 |
 
-## 关键边界
+HTTP 只返回排队回执和任务 ID，不直接操作窗口。任务进入正式调度通道，与其他游戏输入共享同一个 UI 所有者。
 
-- 启动游戏任务不负责进入千星。
-- 进入千星任务不负责启动游戏；找不到窗口时直接失败。
-- `/startup/wonderland` 只是顺序入队两个任务。
-- 开门成功条件不是白屏结束，而是派蒙菜单模板出现。
-- 进入千星成功条件是点击“前往大厅”按钮后，该按钮消失且原区域像素稳定。
-- 进入千星完成后只返回千星内一级界面，不自动退出千星，不清空后续待执行任务。
+## 关键配置
+
+- `startup.launch_game`：窗口不存在时是否允许启动进程。
+- `startup.enter_game`：是否继续执行“点击进入”。
+- `startup.exe_path` / `startup.game_args`：可执行文件与启动参数。
+- `startup.main_ui_region` / `startup.templates.paimon_menu`：游戏启动完成检测。
+- `startup.enter_game_text_region`：OCR“点击进入”的区域。
+- `startup.wonderland_close_region`：千星主页稳定确认区域。
+- `startup.wonderland_card_point`：千星卡片点击点。
+- `startup.wonderland_enter_button_region`：确认按钮匹配和过渡稳定区域。
+- `startup.final_primary_timeout_ms`：最终一级驻留确认期限。
+
+## 关键不变量
+
+- 启动游戏和进入千星是两个可独立观察、取消排队的正式任务。
+- 派蒙菜单模板是启动游戏完成的唯一视觉指标。
+- 进入千星的目标动作与最终驻留必须分别确认。
+- 所有机械输入都在一个 UI 运行时中串行执行。
+- 请求窗口重扫只影响观察退避，不代替 UI 成功确认。

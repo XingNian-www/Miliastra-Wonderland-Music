@@ -4,7 +4,6 @@ use super::friend_delivery::{
     FriendDeliveryRoutineConfig, UiResidencyOutcome, UiResidencyTarget, before_input_failure,
     capture_normalized, restore_residency, sleep_ms,
 };
-use crate::config::AppConfig;
 use crate::observation::chat::{
     SECONDARY_TITLE_RECT, SecondaryChatIdentity, UnreadFriendHit, classify_title,
     latest_incoming_bubble_rect, latest_incoming_fingerprint, unread_hit_still_visible,
@@ -67,15 +66,15 @@ pub(crate) struct SecondaryUnreadUi {
 }
 
 impl SecondaryUnreadUi {
-    pub(crate) fn new(runtime: UiRuntimeHandle, ocr: OcrRuntimeHandle, config: &AppConfig) -> Self {
+    pub(crate) fn new(
+        runtime: UiRuntimeHandle,
+        ocr: OcrRuntimeHandle,
+        config: SecondaryUnreadRoutineConfig,
+    ) -> Self {
         Self {
             runtime,
             ocr,
-            config: SecondaryUnreadRoutineConfig {
-                residency: FriendDeliveryRoutineConfig::from_app(config),
-                same_line_y_tolerance: config.ocr.same_line_y_tolerance,
-                bubble_poll_ms: config.timing.chat_scan.change_debounce_ms.clamp(100, 200),
-            },
+            config,
         }
     }
 
@@ -92,10 +91,24 @@ impl SecondaryUnreadUi {
 }
 
 #[derive(Clone)]
-struct SecondaryUnreadRoutineConfig {
+pub(crate) struct SecondaryUnreadRoutineConfig {
     residency: FriendDeliveryRoutineConfig,
     same_line_y_tolerance: i32,
     bubble_poll_ms: u64,
+}
+
+impl SecondaryUnreadRoutineConfig {
+    pub(crate) fn resolve(
+        residency: FriendDeliveryRoutineConfig,
+        same_line_y_tolerance: i32,
+        change_debounce_ms: u64,
+    ) -> Self {
+        Self {
+            residency,
+            same_line_y_tolerance,
+            bubble_poll_ms: change_debounce_ms.clamp(100, 200),
+        }
+    }
 }
 
 struct ProcessSecondaryUnreadRoutine {

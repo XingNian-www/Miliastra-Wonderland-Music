@@ -9,8 +9,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 pub(crate) use scan::{
-    ChatMessage, ResolvedTemplateArgs, TemplateArgs, count_chat_markers, prepare_chat_scan,
-    recognize_prepared_chat,
+    ChatMessage, ChatScanTelemetry, ChatScanTelemetrySink, ResolvedTemplateArgs, TemplateArgs,
+    count_chat_markers, prepare_chat_scan, recognize_prepared_chat,
 };
 pub(crate) use stream::{
     ChatObservationDispatch, ChatObservationExclusiveGuard, ChatObservationShared,

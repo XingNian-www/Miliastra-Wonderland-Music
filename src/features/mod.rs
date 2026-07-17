@@ -1,6 +1,7 @@
 pub(crate) mod administration;
 pub(crate) mod card_games;
 pub(crate) mod chat_text;
+pub(crate) mod command;
 pub(crate) mod custom_workflow;
 pub(crate) mod entertainment;
 pub(crate) mod friend_delivery;

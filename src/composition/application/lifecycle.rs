@@ -12,7 +12,7 @@ impl ApplicationRuntime {
         self.enqueue_startup_task_if_enabled()?;
         self.start_http_server()?;
         self.hotkeys = Some(self.start_hotkeys()?);
-        let executor = self.start_command_executor();
+        let formal_dispatcher = self.start_formal_task_dispatcher();
         let deferred_chat_sender = self.start_deferred_chat_sender();
         let web_tool_executor = self.start_web_tool_executor();
         let playback_monitor = self.start_playback_monitor();
@@ -28,8 +28,8 @@ impl ApplicationRuntime {
         {
             log::error!("HTTP/Web 面板关闭失败: {error:#}");
         }
-        if let Err(error) = executor.join() {
-            log::error!("命令执行线程 panic: {error:?}");
+        if let Err(error) = formal_dispatcher.join() {
+            log::error!("正式任务调度线程 panic: {error:?}");
         }
         if let Err(error) = deferred_chat_sender.join() {
             log::error!("延迟聊天发送线程 panic: {error:?}");
@@ -40,6 +40,7 @@ impl ApplicationRuntime {
         if let Err(error) = playback_monitor.join() {
             log::error!("播放监控线程 panic: {error:?}");
         }
+        self.join_moderation_workers();
         if let Some(runtime) = self.formal_task_execution.take()
             && let Err(error) = runtime.shutdown()
         {

@@ -1,17 +1,11 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use enigo::Key;
-use windows::Win32::System::Registry::{
-    HKEY_CURRENT_USER, REG_VALUE_TYPE, RRF_RT_REG_SZ, RegGetValueW,
-};
-use windows::core::w;
-
 use super::friend_delivery::{
     FriendDeliveryRoutineConfig, UiResidencyOutcome, UiResidencyTarget, before_input_failure,
     capture_normalized, restore_residency, sleep_ms,
 };
-use crate::config::{AppConfig, StartupConfig};
+use crate::adapters::windows::resolve_game_executable;
 use crate::runtime::ocr::{OcrPriority, OcrRuntimeHandle};
 use crate::runtime::ui::{
     InputCertainty, UiOperation, UiRoutine, UiRoutineContext, UiRoutineFailure, UiRuntimeHandle,
@@ -20,8 +14,9 @@ use crate::runtime::ui::{
 use crate::text::normalize_comparison_text as normalize_lock_text;
 use crate::ui::change_detection::{change_stats, rect_chat_change_fingerprint};
 use crate::ui::geometry::{Point, Rect, crop_canvas};
-use crate::ui::state::{ResolvedUiTemplateArgs, UiTemplateArgs, detect_ui_state};
+use crate::ui::state::{ResolvedUiTemplateArgs, detect_ui_state};
 use crate::ui::template::best_template_hit;
+use enigo::Key;
 
 const ENTER_GAME_TEXT: &str = "点击进入";
 const TEMPLATE_STABLE_HITS: u32 = 2;
@@ -85,11 +80,15 @@ pub(crate) struct StartupUi {
 }
 
 impl StartupUi {
-    pub(crate) fn new(runtime: UiRuntimeHandle, ocr: OcrRuntimeHandle, config: &AppConfig) -> Self {
+    pub(crate) fn new(
+        runtime: UiRuntimeHandle,
+        ocr: OcrRuntimeHandle,
+        config: StartupRoutineConfig,
+    ) -> Self {
         Self {
             runtime,
             ocr,
-            config: StartupRoutineConfig::from_app(config),
+            config,
         }
     }
 
@@ -117,20 +116,62 @@ impl StartupUi {
 }
 
 #[derive(Clone)]
-struct StartupRoutineConfig {
-    startup: StartupConfig,
+pub(crate) struct StartupRoutineConfig {
+    startup: StartupUiConfig,
     residency: FriendDeliveryRoutineConfig,
     templates: ResolvedUiTemplateArgs,
     target_process: String,
 }
 
+#[derive(Clone)]
+pub(crate) struct StartupUiConfig {
+    pub(crate) launch_game: bool,
+    pub(crate) enter_game: bool,
+    pub(crate) exe_path: PathBuf,
+    pub(crate) game_args: String,
+    pub(crate) launch_wait_ms: u64,
+    pub(crate) launch_retries: u32,
+    pub(crate) enter_game_timeout_ms: u64,
+    pub(crate) enter_wonderland_timeout_ms: u64,
+    pub(crate) wonderland_home_retries: u32,
+    pub(crate) wonderland_home_retry_ms: u64,
+    pub(crate) wonderland_card_retries: u32,
+    pub(crate) wonderland_card_retry_ms: u64,
+    pub(crate) wonderland_confirm_absent_timeout_ms: u64,
+    pub(crate) wonderland_confirm_stable_timeout_ms: u64,
+    pub(crate) final_primary_timeout_ms: u64,
+    pub(crate) poll_ms: u64,
+    pub(crate) stable_mean_threshold: f32,
+    pub(crate) stable_changed_ratio_threshold: f32,
+    pub(crate) template_threshold: f32,
+    pub(crate) wonderland_enter_button_threshold: f32,
+    pub(crate) templates: StartupUiTemplates,
+    pub(crate) enter_game_text_region: Rect,
+    pub(crate) wonderland_enter_button_region: Rect,
+    pub(crate) main_ui_region: Rect,
+    pub(crate) wonderland_close_region: Rect,
+    pub(crate) wonderland_card_point: Point,
+}
+
+#[derive(Clone)]
+pub(crate) struct StartupUiTemplates {
+    pub(crate) wonderland_enter_button: PathBuf,
+    pub(crate) paimon_menu: PathBuf,
+    pub(crate) wonderland_close: PathBuf,
+}
+
 impl StartupRoutineConfig {
-    fn from_app(config: &AppConfig) -> Self {
+    pub(crate) fn resolve(
+        startup: StartupUiConfig,
+        residency: FriendDeliveryRoutineConfig,
+        templates: ResolvedUiTemplateArgs,
+        target_process: String,
+    ) -> Self {
         Self {
-            startup: config.startup.clone(),
-            residency: FriendDeliveryRoutineConfig::from_app(config),
-            templates: UiTemplateArgs::default().resolve(config),
-            target_process: config.window.target_process.clone(),
+            startup,
+            residency,
+            templates,
+            target_process,
         }
     }
 }
@@ -210,7 +251,7 @@ fn execute_enter_game(
         let image = capture_normalized(context, &config.residency, "observe_enter_game")?;
         if template_visible(
             &image,
-            config.startup.main_ui_region.into(),
+            config.startup.main_ui_region,
             &config.startup.templates.paimon_menu,
             config.startup.template_threshold,
         )? {
@@ -262,7 +303,7 @@ fn ensure_game_window(
             "game window is missing and startup.launch_game is false",
         ));
     }
-    let executable = resolve_game_path(&config.startup, &config.target_process)
+    let executable = resolve_game_executable(&config.startup.exe_path, &config.target_process)
         .map_err(|error| before_input_failure("resolve_game_path", error))?;
     if !executable.exists() {
         return Err(UiRoutineFailure::new(
@@ -328,7 +369,7 @@ fn execute_enter_wonderland(
             context,
             config,
             &config.startup.templates.wonderland_close,
-            config.startup.wonderland_close_region.into(),
+            config.startup.wonderland_close_region,
             config.startup.template_threshold,
         )? {
             home_ready = true;
@@ -360,7 +401,7 @@ fn execute_enter_wonderland(
             context,
             config,
             &config.startup.templates.wonderland_enter_button,
-            config.startup.wonderland_enter_button_region.into(),
+            config.startup.wonderland_enter_button_region,
             config.startup.wonderland_enter_button_threshold,
             config.startup.wonderland_card_retry_ms.max(100),
         )? {
@@ -389,7 +430,7 @@ fn confirm_wonderland_transition(
     context: &mut UiRoutineContext<'_>,
     config: &StartupRoutineConfig,
 ) -> Result<(), UiRoutineFailure> {
-    let region: Rect = config.startup.wonderland_enter_button_region.into();
+    let region = config.startup.wonderland_enter_button_region;
     let deadline =
         Instant::now() + Duration::from_millis(config.startup.wonderland_confirm_absent_timeout_ms);
     while Instant::now() < deadline {
@@ -519,7 +560,7 @@ fn find_enter_game_text(
     image: &image::DynamicImage,
     config: &StartupRoutineConfig,
 ) -> Result<Option<Point>, UiRoutineFailure> {
-    let region: Rect = config.startup.enter_game_text_region.into();
+    let region = config.startup.enter_game_text_region;
     let crop = crop_canvas(image, region)
         .map_err(|error| before_input_failure("crop_enter_game_text", error))?;
     let target = normalize_lock_text(ENTER_GAME_TEXT);
@@ -586,110 +627,6 @@ fn template_visible(
         .map_err(|error| before_input_failure("match_startup_template", error))
 }
 
-fn resolve_game_path(startup: &StartupConfig, target_process: &str) -> anyhow::Result<PathBuf> {
-    if !startup.exe_path.as_os_str().is_empty() {
-        if startup.exe_path.is_dir() {
-            return resolve_game_path_from_dir(&startup.exe_path, target_process);
-        }
-        return Ok(startup.exe_path.clone());
-    }
-    registry_game_path().ok_or_else(|| {
-        anyhow::anyhow!("startup.exe_path is empty and no launcher registry path was found")
-    })
-}
-
-fn resolve_game_path_from_dir(dir: &Path, target_process: &str) -> anyhow::Result<PathBuf> {
-    for candidate in startup_exe_candidates(target_process) {
-        let path = dir.join(candidate);
-        if path.exists() {
-            return Ok(path);
-        }
-    }
-    anyhow::bail!("no target game executable exists in {}", dir.display())
-}
-
-fn startup_exe_candidates(target_process: &str) -> Vec<String> {
-    let mut candidates = target_process
-        .split(|ch: char| ch == ',' || ch == ';' || ch == '|' || ch.is_whitespace())
-        .map(str::trim)
-        .filter(|item| !item.is_empty())
-        .map(|item| {
-            if item.to_ascii_lowercase().ends_with(".exe") {
-                item.to_string()
-            } else {
-                format!("{item}.exe")
-            }
-        })
-        .collect::<Vec<_>>();
-    for fallback in ["YuanShen.exe", "GenshinImpact.exe"] {
-        if !candidates
-            .iter()
-            .any(|item| item.eq_ignore_ascii_case(fallback))
-        {
-            candidates.push(fallback.to_string());
-        }
-    }
-    candidates
-}
-
-fn registry_game_path() -> Option<PathBuf> {
-    for (key, exe) in [
-        (w!("Software\\miHoYo\\HYP\\1_1\\hk4e_cn"), "YuanShen.exe"),
-        (
-            w!("Software\\Cognosphere\\HYP\\1_0\\hk4e_global"),
-            "GenshinImpact.exe",
-        ),
-    ] {
-        let Some(dir) = registry_string(key, w!("GameInstallPath")) else {
-            continue;
-        };
-        let path = Path::new(dir.trim()).join(exe);
-        if path.exists() {
-            return Some(path);
-        }
-    }
-    None
-}
-
-fn registry_string(key: windows::core::PCWSTR, value: windows::core::PCWSTR) -> Option<String> {
-    let mut value_type = REG_VALUE_TYPE::default();
-    let mut byte_len = 0_u32;
-    let status = unsafe {
-        RegGetValueW(
-            HKEY_CURRENT_USER,
-            key,
-            value,
-            RRF_RT_REG_SZ,
-            Some(&mut value_type),
-            None,
-            Some(&mut byte_len),
-        )
-    };
-    if status.0 != 0 || byte_len == 0 {
-        return None;
-    }
-    let mut buffer = vec![0_u16; (byte_len as usize).div_ceil(2)];
-    let status = unsafe {
-        RegGetValueW(
-            HKEY_CURRENT_USER,
-            key,
-            value,
-            RRF_RT_REG_SZ,
-            Some(&mut value_type),
-            Some(buffer.as_mut_ptr().cast()),
-            Some(&mut byte_len),
-        )
-    };
-    if status.0 != 0 {
-        return None;
-    }
-    let len = buffer
-        .iter()
-        .position(|ch| *ch == 0)
-        .unwrap_or(buffer.len());
-    Some(String::from_utf16_lossy(&buffer[..len]))
-}
-
 fn split_command_args(value: &str) -> anyhow::Result<Vec<String>> {
     let mut args = Vec::new();
     let mut current = String::new();
@@ -745,17 +682,5 @@ mod tests {
     #[test]
     fn split_command_args_rejects_unclosed_quote() {
         assert!(split_command_args(r#""abc"#).is_err());
-    }
-
-    #[test]
-    fn startup_exe_candidates_adds_suffix_and_fallbacks() {
-        let candidates = startup_exe_candidates("yuanshen.exe, GenshinImpact");
-        assert_eq!(candidates[0], "yuanshen.exe");
-        assert_eq!(candidates[1], "GenshinImpact.exe");
-        assert!(
-            candidates
-                .iter()
-                .any(|candidate| candidate.eq_ignore_ascii_case("YuanShen.exe"))
-        );
     }
 }

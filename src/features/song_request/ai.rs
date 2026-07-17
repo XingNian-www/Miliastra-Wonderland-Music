@@ -6,12 +6,11 @@ use async_openai::types::chat::{
     ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
     CreateChatCompletionRequest, CreateChatCompletionRequestArgs, ResponseFormat,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::config::{AiConfig, TimingConfig};
+use super::SearchCandidate;
 use crate::runtime::openai::{Authentication, OpenAiRuntimeHandle, Target};
-use crate::runtime::player_io::SearchCandidate;
 
 const MIMO_ENDPOINT: &str = "https://api.xiaomimimo.com/v1/chat/completions";
 const MIMO_MODEL: &str = "mimo-v2.5";
@@ -22,10 +21,29 @@ const DEEPSEEK_MODEL: &str = "deepseek-chat";
 const CANDIDATE_PICK_LIMIT: usize = 30;
 const CANDIDATES_PER_SOURCE: usize = 5;
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AiConfig {
+    pub provider: String,
+    pub api_key: String,
+    pub endpoint: String,
+    pub model: String,
+    pub extra_body: HashMap<String, Value>,
+}
+
+impl AiConfig {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.api_key.trim().is_empty() {
+            return Ok(());
+        }
+        resolve_provider_config(self, None).map(|_| ())
+    }
+}
+
 #[derive(Clone)]
 pub struct AiClient {
     config: AiConfig,
-    timing: TimingConfig,
+    request_timeout: Duration,
     openai: OpenAiRuntimeHandle,
 }
 
@@ -54,10 +72,10 @@ enum AiProvider {
 }
 
 impl AiClient {
-    pub fn new(config: &AiConfig, timing: &TimingConfig, openai: OpenAiRuntimeHandle) -> Self {
+    pub fn new(config: &AiConfig, request_timeout: Duration, openai: OpenAiRuntimeHandle) -> Self {
         Self {
             config: config.clone(),
-            timing: timing.clone(),
+            request_timeout,
             openai,
         }
     }
@@ -83,7 +101,7 @@ impl AiClient {
             &provider,
             &build_candidate_pick_prompt(&request, prefer_accompaniment, &candidates),
             2048,
-            &self.timing,
+            self.request_timeout,
         )?;
         let json_text = model_reply_json_object(&reply)?;
         validate_candidate_pick_json(&json_text, &candidates)?;
@@ -128,7 +146,7 @@ impl AiClient {
             &provider,
             &build_recognize_prompt(&text),
             1024,
-            &self.timing,
+            self.request_timeout,
         )?;
         let json = model_reply_json_object(&reply)?;
         validate_recognize_json(&json)?;
@@ -149,7 +167,7 @@ impl AiClient {
             &provider,
             &build_match_prompt(&request, &song_name, &song_singer),
             1024,
-            &self.timing,
+            self.request_timeout,
         )?;
         let json = model_reply_json_object(&reply)?;
         validate_match_json(&json)?;
@@ -166,7 +184,7 @@ impl AiClient {
             &provider,
             &build_candidate_pick_prompt(&request, prefer_accompaniment, &candidates),
             2048,
-            &self.timing,
+            self.request_timeout,
         )?;
         let json = model_reply_json_object(&reply)?;
         validate_candidate_pick_json(&json, &candidates)?;
@@ -256,10 +274,10 @@ fn parse_provider(value: &str) -> Result<AiProvider> {
         .to_ascii_lowercase()
         .as_str()
     {
-        "" | "mimo" => Ok(AiProvider::Mimo),
+        "mimo" => Ok(AiProvider::Mimo),
         "openai" => Ok(AiProvider::OpenAi),
         "deepseek" => Ok(AiProvider::DeepSeek),
-        "custom" | "openai-compatible" | "openai_compatible" => Ok(AiProvider::Custom),
+        "custom" => Ok(AiProvider::Custom),
         _ => bail!("provider只允许mimo/openai/deepseek/custom"),
     }
 }
@@ -422,10 +440,10 @@ fn call_ai(
     config: &AiProviderConfig,
     prompt: &str,
     max_tokens: usize,
-    timing: &TimingConfig,
+    request_timeout: Duration,
 ) -> Result<String> {
     let request = build_ai_request(config, prompt, max_tokens)?;
-    call_ai_http(openai, config, request, timing)
+    call_ai_http(openai, config, request, request_timeout)
 }
 
 fn build_ai_request(
@@ -458,7 +476,7 @@ fn call_ai_http(
     openai: &OpenAiRuntimeHandle,
     config: &AiProviderConfig,
     request: CreateChatCompletionRequest,
-    timing: &TimingConfig,
+    request_timeout: Duration,
 ) -> Result<String> {
     let auth = if config.provider == AiProvider::Mimo {
         Authentication::ApiKey
@@ -467,12 +485,7 @@ fn call_ai_http(
     };
     let target = Target::chat(&config.endpoint, &config.api_key, auth)?;
     let value = openai
-        .chat_completion(
-            target,
-            request,
-            &config.extra_body,
-            Duration::from_millis(timing.external.ai_request_timeout_ms),
-        )?
+        .chat_completion(target, request, &config.extra_body, request_timeout)?
         .wait()
         .with_context(|| format!("AI请求失败({:?})", config.provider))?;
     value
@@ -570,6 +583,23 @@ fn validate_match_json(text: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn current_provider_names_require_an_explicit_supported_value() {
+        for provider in ["", "openai-compatible", "openai_compatible"] {
+            let config = AiConfig {
+                provider: provider.to_string(),
+                api_key: "secret".to_string(),
+                endpoint: "https://gateway.example/v1/chat/completions".to_string(),
+                model: "test-model".to_string(),
+                extra_body: HashMap::new(),
+            };
+
+            let error = config.validate().expect_err("removed provider alias");
+
+            assert!(error.to_string().contains("provider只允许"));
+        }
+    }
 
     #[test]
     fn ai_request_contains_only_standard_chat_completion_fields() {

@@ -1,22 +1,16 @@
+#[cfg(test)]
+use std::path::Path;
+
 use anyhow::Result;
 use image::{DynamicImage, GenericImageView};
 
+use super::secondary_hall_vision::confirmed_secondary_hall_bubbles;
 use crate::ui::change_detection::{ChangeFingerprint, change_stats, rect_chat_change_fingerprint};
-use crate::ui::geometry::{Point, Rect};
+use crate::ui::geometry::Rect;
 
 // 坐标沿用项目固定的 1920x1080 游戏画布；监听模式本身仍是运行期状态。
 pub(crate) const SECONDARY_TITLE_RECT: Rect = Rect::new(600, 24, 480, 72);
-const FRIEND_UNREAD_RECT: Rect = Rect::new(46, 250, 48, 650);
 const MESSAGE_RECT: Rect = Rect::new(250, 90, 1_020, 850);
-const HALL_BUBBLE_SEARCH_RECT: Rect = Rect::new(390, 87, 790, 870);
-const HALL_BUBBLE_ANCHOR_LEFT: i32 = 415;
-const HALL_BUBBLE_ANCHOR_RIGHT: i32 = 470;
-const MIN_HALL_BUBBLE_ANCHOR_PIXELS_PER_ROW: usize = 10;
-const MIN_HALL_BUBBLE_HEIGHT: i32 = 45;
-const MAX_HALL_BUBBLE_HEIGHT: i32 = 180;
-const MIN_HALL_BUBBLE_WIDTH: i32 = 60;
-const MAX_HALL_BUBBLE_WIDTH: i32 = 750;
-const MIN_RED_PIXELS_PER_ROW: usize = 2;
 const MIN_BUBBLE_PIXELS_PER_ROW: usize = 20;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -36,7 +30,7 @@ pub(crate) fn classify_title(text: &str) -> SecondaryChatIdentity {
     if text.contains("当前大厅") {
         return SecondaryChatIdentity::CurrentHall;
     }
-    if text.contains("公开频道") {
+    if text.contains("公开频道") || text.contains("公共大厅") {
         return SecondaryChatIdentity::PublicChannel;
     }
     if text.contains("陌生人消息") {
@@ -45,87 +39,23 @@ pub(crate) fn classify_title(text: &str) -> SecondaryChatIdentity {
     SecondaryChatIdentity::Friend(text.to_string())
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct UnreadFriendHit {
-    pub(crate) indicator: Point,
-    pub(crate) row_click: Point,
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct SecondaryHallBubble {
     pub(crate) rect: Rect,
+    avatar_rect: Rect,
+    sender_rect: Rect,
+    sender_fingerprint: ChangeFingerprint,
     fingerprint: ChangeFingerprint,
 }
 
-pub(crate) fn find_unread_friend_hits(image: &DynamicImage) -> Vec<UnreadFriendHit> {
-    let Some(region) = bounded_rect(image, FRIEND_UNREAD_RECT) else {
-        return Vec::new();
-    };
-    let mut groups = Vec::new();
-    let mut active_start = None;
-    let mut active_end = 0_i32;
-    let mut active_pixels = 0usize;
-    let mut active_x_total = 0_i64;
+impl SecondaryHallBubble {
+    pub(crate) fn avatar_rect(&self) -> Rect {
+        self.avatar_rect
+    }
 
-    for y in region.y..region.bottom() {
-        let mut pixels = 0usize;
-        let mut x_total = 0_i64;
-        for x in region.x..region.right() {
-            let pixel = image.get_pixel(x as u32, y as u32).0;
-            if is_unread_red(pixel[0], pixel[1], pixel[2]) {
-                pixels += 1;
-                x_total += i64::from(x);
-            }
-        }
-        if pixels >= MIN_RED_PIXELS_PER_ROW {
-            if active_start.is_none() {
-                active_start = Some(y);
-            }
-            active_end = y;
-            active_pixels += pixels;
-            active_x_total += x_total;
-            continue;
-        }
-        if let Some(start) = active_start.take() {
-            push_unread_group(
-                &mut groups,
-                start,
-                active_end,
-                active_pixels,
-                active_x_total,
-            );
-            active_pixels = 0;
-            active_x_total = 0;
-        }
+    pub(crate) fn sender_rect(&self) -> Rect {
+        self.sender_rect
     }
-    if let Some(start) = active_start {
-        push_unread_group(
-            &mut groups,
-            start,
-            active_end,
-            active_pixels,
-            active_x_total,
-        );
-    }
-    groups
-}
-
-pub(crate) fn unread_hit_still_visible(image: &DynamicImage, hit: UnreadFriendHit) -> bool {
-    let radius = 14_i32;
-    let left = (hit.indicator.x - radius).max(0);
-    let top = (hit.indicator.y - radius).max(0);
-    let right = (hit.indicator.x + radius).min(image.width() as i32 - 1);
-    let bottom = (hit.indicator.y + radius).min(image.height() as i32 - 1);
-    let mut red_pixels = 0usize;
-    for y in top..=bottom {
-        for x in left..=right {
-            let pixel = image.get_pixel(x as u32, y as u32).0;
-            if is_unread_red(pixel[0], pixel[1], pixel[2]) {
-                red_pixels += 1;
-            }
-        }
-    }
-    red_pixels >= 20
 }
 
 pub(crate) fn latest_incoming_bubble_rect(image: &DynamicImage) -> Option<Rect> {
@@ -180,44 +110,15 @@ pub(crate) fn latest_incoming_fingerprint(
 }
 
 pub(crate) fn secondary_hall_bubbles(image: &DynamicImage) -> Result<Vec<SecondaryHallBubble>> {
-    let Some(region) = bounded_rect(image, HALL_BUBBLE_SEARCH_RECT) else {
-        return Ok(Vec::new());
-    };
-    let anchor_left = HALL_BUBBLE_ANCHOR_LEFT.max(region.x);
-    let anchor_right = HALL_BUBBLE_ANCHOR_RIGHT.min(region.right());
-    if anchor_right <= anchor_left {
-        return Ok(Vec::new());
-    }
-
-    let mut groups = Vec::new();
-    let mut start = None;
-    let mut end = region.y;
-    for y in region.y..region.bottom() {
-        let anchor_pixels = (anchor_left..anchor_right)
-            .filter(|x| {
-                let pixel = image.get_pixel(*x as u32, y as u32).0;
-                is_incoming_bubble(pixel[0], pixel[1], pixel[2])
-            })
-            .count();
-        if anchor_pixels >= MIN_HALL_BUBBLE_ANCHOR_PIXELS_PER_ROW {
-            if start.is_none() {
-                start = Some(y);
-            }
-            end = y;
-        } else if let Some(top) = start.take() {
-            push_hall_bubble_group(&mut groups, image, region, top, end);
-        }
-    }
-    if let Some(top) = start {
-        push_hall_bubble_group(&mut groups, image, region, top, end);
-    }
-
-    groups
+    confirmed_secondary_hall_bubbles(image)
         .into_iter()
-        .map(|rect| {
+        .map(|bubble| {
             Ok(SecondaryHallBubble {
-                fingerprint: rect_chat_change_fingerprint(image, rect)?,
-                rect,
+                fingerprint: rect_chat_change_fingerprint(image, bubble.rect)?,
+                sender_fingerprint: rect_chat_change_fingerprint(image, bubble.sender_rect)?,
+                rect: bubble.rect,
+                avatar_rect: bubble.avatar_rect,
+                sender_rect: bubble.sender_rect,
             })
         })
         .collect()
@@ -242,75 +143,42 @@ pub(crate) fn hall_bubble_sequence_overlap(
     0
 }
 
-fn push_hall_bubble_group(
-    groups: &mut Vec<Rect>,
-    image: &DynamicImage,
-    region: Rect,
-    top: i32,
-    bottom: i32,
-) {
-    let height = bottom - top + 1;
-    if !(MIN_HALL_BUBBLE_HEIGHT..=MAX_HALL_BUBBLE_HEIGHT).contains(&height) {
-        return;
-    }
+pub(crate) fn hall_bubble_sequence_is_retained_prefix(
+    previous: &[SecondaryHallBubble],
+    current: &[SecondaryHallBubble],
+) -> bool {
+    !current.is_empty()
+        && current.len() < previous.len()
+        && previous[..current.len()]
+            .iter()
+            .zip(current)
+            .all(|(left, right)| same_hall_bubble(left, right))
+}
 
-    let anchor_left = HALL_BUBBLE_ANCHOR_LEFT.max(region.x);
-    let anchor_right = HALL_BUBBLE_ANCHOR_RIGHT.min(region.right());
-    let mut right_edges = Vec::new();
-    for y in top..=bottom {
-        let anchor_pixels = (anchor_left..anchor_right)
-            .filter(|x| {
-                let pixel = image.get_pixel(*x as u32, y as u32).0;
-                is_incoming_bubble(pixel[0], pixel[1], pixel[2])
-            })
-            .count();
-        if anchor_pixels < MIN_HALL_BUBBLE_ANCHOR_PIXELS_PER_ROW {
-            continue;
-        }
-        let right = (anchor_right..region.right()).rev().find(|x| {
-            let pixel = image.get_pixel(*x as u32, y as u32).0;
-            is_incoming_bubble(pixel[0], pixel[1], pixel[2])
-        });
-        if let Some(right) = right {
-            right_edges.push(right);
-        }
-    }
-    if right_edges.is_empty() {
-        return;
-    }
-    right_edges.sort_unstable();
-    let percentile_index = (right_edges.len() - 1) * 9 / 10;
-    let right = right_edges[percentile_index];
-    let left = (HALL_BUBBLE_ANCHOR_LEFT - 5).max(region.x);
-    let width = right - left + 1;
-    if !(MIN_HALL_BUBBLE_WIDTH..=MAX_HALL_BUBBLE_WIDTH).contains(&width) {
-        return;
-    }
-    groups.push(Rect::new(left, top, width as u32, height as u32));
+pub(crate) fn hall_bubble_sequences_stable(
+    previous: &[SecondaryHallBubble],
+    current: &[SecondaryHallBubble],
+) -> bool {
+    previous.len() == current.len()
+        && previous
+            .iter()
+            .zip(current)
+            .all(|(left, right)| same_hall_bubble(left, right))
+}
+
+fn rect_identity(rect: Rect) -> (i32, i32, u32, u32) {
+    (rect.x, rect.y, rect.width, rect.height)
 }
 
 fn same_hall_bubble(left: &SecondaryHallBubble, right: &SecondaryHallBubble) -> bool {
-    let stats = change_stats(&left.fingerprint, &right.fingerprint);
-    stats.mean_abs_diff < 0.8 && stats.changed_ratio < 0.01
+    rect_identity(left.sender_rect) == rect_identity(right.sender_rect)
+        && fingerprints_match(&left.fingerprint, &right.fingerprint)
+        && fingerprints_match(&left.sender_fingerprint, &right.sender_fingerprint)
 }
 
-fn push_unread_group(
-    groups: &mut Vec<UnreadFriendHit>,
-    start: i32,
-    end: i32,
-    pixels: usize,
-    x_total: i64,
-) {
-    let height = end - start + 1;
-    if !(5..=30).contains(&height) || !(20..=500).contains(&pixels) {
-        return;
-    }
-    let center_y = start + height / 2;
-    let center_x = (x_total / pixels.max(1) as i64) as i32;
-    groups.push(UnreadFriendHit {
-        indicator: Point::new(center_x, center_y),
-        row_click: Point::new(150, center_y),
-    });
+fn fingerprints_match(left: &ChangeFingerprint, right: &ChangeFingerprint) -> bool {
+    let stats = change_stats(left, right);
+    stats.mean_abs_diff < 0.8 && stats.changed_ratio < 0.01
 }
 
 fn bounded_rect(image: &DynamicImage, rect: Rect) -> Option<Rect> {
@@ -325,10 +193,6 @@ fn bounded_rect(image: &DynamicImage, rect: Rect) -> Option<Rect> {
         (right - rect.x) as u32,
         (bottom - rect.y) as u32,
     ))
-}
-
-fn is_unread_red(red: u8, green: u8, blue: u8) -> bool {
-    red >= 175 && green <= 125 && blue <= 135 && red >= green.saturating_add(65)
 }
 
 fn is_incoming_bubble(red: u8, green: u8, blue: u8) -> bool {
@@ -355,6 +219,10 @@ mod tests {
             SecondaryChatIdentity::PublicChannel
         );
         assert_eq!(
+            classify_title("公共大厅"),
+            SecondaryChatIdentity::PublicChannel
+        );
+        assert_eq!(
             classify_title("陌生人消息"),
             SecondaryChatIdentity::StrangerMessages
         );
@@ -362,19 +230,6 @@ mod tests {
             classify_title("难以识别的昵称"),
             SecondaryChatIdentity::Friend("难以识别的昵称".to_string())
         );
-    }
-
-    #[test]
-    fn finds_red_unread_indicator_in_friend_column() {
-        let mut image = RgbaImage::new(1920, 1080);
-        for y in 300..314 {
-            for x in 60..74 {
-                image.put_pixel(x, y, Rgba([230, 62, 80, 255]));
-            }
-        }
-        let hits = find_unread_friend_hits(&DynamicImage::ImageRgba8(image));
-        assert_eq!(hits.len(), 1);
-        assert!((hits[0].row_click.y - 306).abs() <= 1);
     }
 
     #[test]
@@ -396,6 +251,12 @@ mod tests {
     #[test]
     fn finds_each_complete_hall_bubble_without_title_space() {
         let mut image = RgbaImage::new(1920, 1080);
+        fill_rect(
+            &mut image,
+            Rect::new(418, 260, 61, 18),
+            Rgba([195, 193, 185, 255]),
+        );
+        draw_avatar(&mut image, 260);
         for (top, bottom, right) in [(300, 354, 760), (380, 434, 680), (460, 514, 820)] {
             for y in top..bottom {
                 for x in 415..right {
@@ -418,10 +279,161 @@ mod tests {
     }
 
     #[test]
+    fn fixed_sender_region_is_attached_to_an_incoming_hall_bubble() {
+        let mut image = RgbaImage::new(1920, 1080);
+        fill_rect(
+            &mut image,
+            Rect::new(418, 200, 61, 18),
+            Rgba([195, 193, 185, 255]),
+        );
+        draw_avatar(&mut image, 200);
+        fill_rect(
+            &mut image,
+            Rect::new(410, 240, 190, 60),
+            Rgba([62, 71, 89, 255]),
+        );
+
+        let bubbles = secondary_hall_bubbles(&DynamicImage::ImageRgba8(image))
+            .expect("hall bubble observation");
+
+        assert_eq!(bubbles.len(), 1);
+        let sender = bubbles[0].sender_rect();
+        assert_eq!((sender.x, sender.width, sender.height), (410, 394, 36));
+        assert!(sender.y <= 200);
+        assert!(sender.bottom() >= 218);
+    }
+
+    #[test]
+    fn real_secondary_chat_only_exposes_left_incoming_avatars() {
+        let image = image::open(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/ui/secondary-chat-scrolled-1920x1080.jpg"),
+        )
+        .expect("load secondary chat fixture");
+
+        let bubbles = secondary_hall_bubbles(&image).expect("detect incoming avatar anchors");
+
+        assert!(!bubbles.is_empty());
+        assert!(bubbles.iter().all(|bubble| {
+            let avatar = bubble.avatar_rect();
+            avatar.x == 302 && avatar.right() <= 390
+        }));
+    }
+
+    #[test]
+    fn sender_label_loading_changes_the_fixed_region_fingerprint() {
+        let mut image = RgbaImage::new(1920, 1080);
+        draw_avatar(&mut image, 200);
+        fill_rect(
+            &mut image,
+            Rect::new(410, 240, 190, 60),
+            Rgba([62, 71, 89, 255]),
+        );
+
+        let without_label = secondary_hall_bubbles(&DynamicImage::ImageRgba8(image.clone()))
+            .expect("hall bubble observation without sender label");
+        assert_eq!(without_label.len(), 1);
+
+        fill_rect(
+            &mut image,
+            Rect::new(418, 200, 61, 18),
+            Rgba([195, 193, 185, 255]),
+        );
+        let with_label = secondary_hall_bubbles(&DynamicImage::ImageRgba8(image))
+            .expect("hall bubble observation with sender label");
+        assert_eq!(with_label.len(), 1);
+        assert!(!hall_bubble_sequences_stable(&without_label, &with_label));
+    }
+
+    #[test]
+    fn each_avatar_starts_a_sender_group_without_scanning_label_pixels() {
+        let mut image = RgbaImage::new(1920, 1080);
+        fill_rect(
+            &mut image,
+            Rect::new(418, 200, 61, 18),
+            Rgba([195, 193, 185, 255]),
+        );
+        draw_avatar(&mut image, 200);
+        fill_rect(
+            &mut image,
+            Rect::new(410, 240, 190, 60),
+            Rgba([62, 71, 89, 255]),
+        );
+        draw_avatar(&mut image, 400);
+        fill_rect(
+            &mut image,
+            Rect::new(410, 500, 190, 60),
+            Rgba([62, 71, 89, 255]),
+        );
+
+        let bubbles = secondary_hall_bubbles(&DynamicImage::ImageRgba8(image))
+            .expect("hall bubble observation");
+
+        assert_eq!(bubbles.len(), 2);
+        assert_eq!(bubbles[0].rect.y, 240);
+        assert_eq!(bubbles[1].rect.y, 500);
+        assert_ne!(bubbles[0].sender_rect().y, bubbles[1].sender_rect().y);
+    }
+
+    #[test]
+    fn fixed_sender_region_covers_remark_and_is_shared_by_continuation_bubbles() {
+        let mut image = RgbaImage::new(1920, 1080);
+        fill_rect(
+            &mut image,
+            Rect::new(418, 200, 55, 18),
+            Rgba([195, 193, 185, 255]),
+        );
+        fill_rect(
+            &mut image,
+            Rect::new(482, 200, 6, 18),
+            Rgba([195, 193, 185, 255]),
+        );
+        fill_rect(
+            &mut image,
+            Rect::new(495, 200, 80, 18),
+            Rgba([108, 146, 211, 255]),
+        );
+        fill_rect(
+            &mut image,
+            Rect::new(582, 200, 6, 18),
+            Rgba([195, 193, 185, 255]),
+        );
+        draw_avatar(&mut image, 200);
+        fill_rect(
+            &mut image,
+            Rect::new(410, 240, 190, 60),
+            Rgba([62, 71, 89, 255]),
+        );
+        fill_rect(
+            &mut image,
+            Rect::new(410, 306, 220, 60),
+            Rgba([62, 71, 89, 255]),
+        );
+
+        let bubbles = secondary_hall_bubbles(&DynamicImage::ImageRgba8(image))
+            .expect("hall bubble observation");
+
+        assert_eq!(bubbles.len(), 2);
+        for bubble in bubbles {
+            let sender = bubble.sender_rect();
+            assert_eq!((sender.x, sender.width, sender.height), (410, 394, 36));
+            assert!(sender.y <= 200);
+            assert!(sender.right() >= 588);
+        }
+    }
+
+    #[test]
     fn finds_new_hall_bubbles_by_suffix_prefix_overlap() {
         fn bubble(value: u8) -> SecondaryHallBubble {
             SecondaryHallBubble {
                 rect: Rect::new(415, 300, 200, 54),
+                avatar_rect: Rect::new(302, 264, 88, 88),
+                sender_rect: Rect::new(418, 260, 61, 18),
+                sender_fingerprint: ChangeFingerprint {
+                    pixels: vec![25; 104 * 36],
+                    width: 104,
+                    height: 36,
+                },
                 fingerprint: ChangeFingerprint {
                     pixels: vec![value; 104 * 36],
                     width: 104,
@@ -433,5 +445,102 @@ mod tests {
         let previous = vec![bubble(10), bubble(30), bubble(50), bubble(70)];
         let current = vec![bubble(50), bubble(70), bubble(90), bubble(110)];
         assert_eq!(hall_bubble_sequence_overlap(&previous, &current), 2);
+    }
+
+    #[test]
+    fn sender_region_change_keeps_the_hall_observation_unstable() {
+        let fingerprint = ChangeFingerprint {
+            pixels: vec![42; 104 * 36],
+            width: 104,
+            height: 36,
+        };
+        let sender_fingerprint = ChangeFingerprint {
+            pixels: vec![25; 104 * 36],
+            width: 104,
+            height: 36,
+        };
+        let first_sender_region = vec![SecondaryHallBubble {
+            rect: Rect::new(410, 240, 190, 60),
+            avatar_rect: Rect::new(302, 204, 88, 88),
+            sender_rect: Rect::new(418, 200, 61, 18),
+            sender_fingerprint: sender_fingerprint.clone(),
+            fingerprint: fingerprint.clone(),
+        }];
+        let changed_sender_region = vec![SecondaryHallBubble {
+            rect: Rect::new(410, 240, 190, 60),
+            avatar_rect: Rect::new(302, 204, 88, 88),
+            sender_rect: Rect::new(490, 200, 90, 18),
+            sender_fingerprint,
+            fingerprint,
+        }];
+
+        assert!(!hall_bubble_sequences_stable(
+            &first_sender_region,
+            &changed_sender_region
+        ));
+        assert!(hall_bubble_sequences_stable(
+            &changed_sender_region,
+            &changed_sender_region
+        ));
+    }
+
+    #[test]
+    fn sender_pixels_are_part_of_hall_message_identity_and_stability() {
+        let bubble_fingerprint = ChangeFingerprint {
+            pixels: vec![42; 104 * 36],
+            width: 104,
+            height: 36,
+        };
+        let first = vec![SecondaryHallBubble {
+            rect: Rect::new(410, 240, 190, 60),
+            avatar_rect: Rect::new(302, 204, 88, 88),
+            sender_rect: Rect::new(418, 200, 61, 18),
+            sender_fingerprint: ChangeFingerprint {
+                pixels: vec![10; 104 * 36],
+                width: 104,
+                height: 36,
+            },
+            fingerprint: bubble_fingerprint.clone(),
+        }];
+        let changed_sender = vec![SecondaryHallBubble {
+            rect: Rect::new(410, 240, 190, 60),
+            avatar_rect: Rect::new(302, 204, 88, 88),
+            sender_rect: Rect::new(418, 200, 61, 18),
+            sender_fingerprint: ChangeFingerprint {
+                pixels: vec![240; 104 * 36],
+                width: 104,
+                height: 36,
+            },
+            fingerprint: bubble_fingerprint,
+        }];
+
+        assert!(!hall_bubble_sequences_stable(&first, &changed_sender));
+        assert_eq!(hall_bubble_sequence_overlap(&first, &changed_sender), 0);
+    }
+
+    fn fill_rect(image: &mut RgbaImage, rect: Rect, color: Rgba<u8>) {
+        for y in rect.y..rect.bottom() {
+            for x in rect.x..rect.right() {
+                image.put_pixel(x as u32, y as u32, color);
+            }
+        }
+    }
+
+    fn draw_avatar(image: &mut RgbaImage, label_y: i32) {
+        let left = 302_i32;
+        let top = label_y + 4;
+        let size = 88_i32;
+        let center_x = left + size / 2;
+        let center_y = top + size / 2;
+        let radius_squared = (size / 2 - 4).pow(2);
+        for y in top..top + size {
+            for x in left..left + size {
+                let dx = x - center_x;
+                let dy = y - center_y;
+                if dx * dx + dy * dy <= radius_squared {
+                    image.put_pixel(x as u32, y as u32, Rgba([220, 220, 220, 255]));
+                }
+            }
+        }
     }
 }

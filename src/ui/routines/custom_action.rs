@@ -558,9 +558,9 @@ fn capture_normalized(
     input_performed: bool,
 ) -> Result<image::DynamicImage, UiRoutineFailure> {
     let image = context
-        .device()
-        .capture()
+        .capture_frame()
         .map_err(|error| observation_failure(input_performed, "capture_custom_action", error))?;
+    let image = image.into_image();
     if image.width() == canvas.width && image.height() == canvas.height {
         Ok(image)
     } else {

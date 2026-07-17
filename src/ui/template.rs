@@ -212,6 +212,15 @@ pub(crate) fn best_template_hit(
     template_path: &Path,
     threshold: f32,
 ) -> Result<Option<TemplateHit>> {
+    Ok(best_template_candidate(image, search_rect, template_path)?
+        .filter(|candidate| candidate.score >= threshold))
+}
+
+pub(crate) fn best_template_candidate(
+    image: &DynamicImage,
+    search_rect: Option<Rect>,
+    template_path: &Path,
+) -> Result<Option<TemplateHit>> {
     let haystack = match search_rect {
         Some(rect) => crop_canvas(image, rect)?,
         None => image.clone(),
@@ -226,8 +235,7 @@ pub(crate) fn best_template_hit(
     if max_sad == 0 {
         return Ok(None);
     }
-    let max_allowed_sad = ((1.0 - threshold).clamp(0.0, 1.0) * max_sad as f32) as u64;
-    let mut best_sad = max_allowed_sad.saturating_add(1);
+    let mut best_sad = max_sad.saturating_add(1);
     let mut best_x = 0;
     let mut best_y = 0;
 
@@ -243,9 +251,6 @@ pub(crate) fn best_template_hit(
     }
 
     let score = 1.0 - best_sad as f32 / max_sad as f32;
-    if score < threshold {
-        return Ok(None);
-    }
     let base_x = search_rect.map(|rect| rect.x).unwrap_or(0);
     let base_y = search_rect.map(|rect| rect.y).unwrap_or(0);
     Ok(Some(TemplateHit {
@@ -360,10 +365,18 @@ mod tests {
         let hit = best_template_hit(&DynamicImage::ImageLuma8(haystack), None, &path, 0.99)
             .expect("match template")
             .expect("template hit");
+        let below_threshold = DynamicImage::ImageLuma8(GrayImage::from_pixel(3, 3, Luma([0])));
+        let candidate = best_template_candidate(&below_threshold, None, &path)
+            .expect("inspect candidate")
+            .expect("best candidate even below threshold");
+        let rejected =
+            best_template_hit(&below_threshold, None, &path, 0.99).expect("thresholded candidate");
         let _ = fs::remove_file(&path);
 
         assert_eq!((hit.x, hit.y), (3, 2));
         assert_eq!((hit.width, hit.height), (2, 2));
         assert!(hit.score > 0.999);
+        assert!(candidate.score < 0.99);
+        assert!(rejected.is_none());
     }
 }

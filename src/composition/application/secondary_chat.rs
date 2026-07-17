@@ -1,11 +1,18 @@
 use super::*;
 
+struct SecondaryOcrMessage {
+    text: String,
+    sender: Option<String>,
+    kind: SecondaryHallMessageKind,
+    requires_sender: bool,
+}
+
 impl ApplicationRuntime {
     pub(super) fn run_secondary_listener_round(
         &mut self,
         image: &DynamicImage,
         last_friend_bubble: &mut Option<ChangeFingerprint>,
-        hall_bubble_sequence: &mut Vec<SecondaryHallBubble>,
+        hall_bubble_sequence: &mut Option<Vec<SecondaryHallBubble>>,
         last_title: &mut Option<ChangeFingerprint>,
         identity: &mut Option<SecondaryChatIdentity>,
     ) -> Result<bool> {
@@ -33,7 +40,7 @@ impl ApplicationRuntime {
                 return self.queue_secondary_unread_task(hit, true);
             }
             *last_friend_bubble = latest_incoming_fingerprint(image)?;
-            *hall_bubble_sequence = secondary_hall_bubbles(image)?;
+            *hall_bubble_sequence = Some(secondary_hall_bubbles(image)?);
             self.business.finish_chat_listener_initial_unread_clear()?;
             log::info!("二级监听初始未读清场完成，当前大厅已建立消息基线");
             return Ok(false);
@@ -132,61 +139,70 @@ impl ApplicationRuntime {
     fn scan_secondary_hall_if_changed(
         &mut self,
         image: &DynamicImage,
-        previous: &mut Vec<SecondaryHallBubble>,
+        previous: &mut Option<Vec<SecondaryHallBubble>>,
     ) -> Result<bool> {
         let current = secondary_hall_bubbles(image)?;
-        if previous.is_empty() {
-            self.business.clear_turtle_soup_secondary_stability()?;
-            *previous = current;
-            log::debug!("二级大厅气泡序列尚未建立，当前仅记录基线");
-            return Ok(false);
+        match secondary_hall_sequence_delta(previous.as_deref(), &current) {
+            SecondaryHallSequenceDelta::EstablishBaseline => {
+                self.business.clear_turtle_soup_secondary_stability()?;
+                *previous = Some(current);
+                log::debug!("二级大厅气泡序列尚未建立，当前仅记录基线");
+                return Ok(false);
+            }
+            SecondaryHallSequenceDelta::RetainedPrefix => {
+                log::debug!("二级大厅当前只显示旧序列前缀，保留原基线等待完整观测");
+                return Ok(false);
+            }
+            SecondaryHallSequenceDelta::NoChange => {
+                self.business.clear_turtle_soup_secondary_stability()?;
+                return Ok(false);
+            }
+            SecondaryHallSequenceDelta::LostOverlap | SecondaryHallSequenceDelta::NewFrom(_) => {}
         }
 
-        let overlap = hall_bubble_sequence_overlap(previous, &current);
-        if overlap == 0 {
-            self.business.clear_turtle_soup_secondary_stability()?;
-            *previous = current;
-            log::debug!("二级大厅气泡序列没有可靠重叠，已重建基线，不处理当前可见历史消息");
+        let Some((refreshed, refreshed_bubbles)) = self.wait_for_secondary_hall_stability()? else {
+            log::debug!("二级大厅新增消息尚未稳定，保留旧基线等待下一轮");
             return Ok(false);
-        }
-        if overlap == current.len() {
-            self.business.clear_turtle_soup_secondary_stability()?;
-            *previous = current;
-            return Ok(false);
-        }
-
-        let refreshed = self.wait_for_secondary_bubble_stability()?;
-        let refreshed_bubbles = secondary_hall_bubbles(&refreshed.image)?;
-        let refreshed_overlap = hall_bubble_sequence_overlap(previous, &refreshed_bubbles);
-        if refreshed_overlap == 0 {
-            self.business.clear_turtle_soup_secondary_stability()?;
-            *previous = refreshed_bubbles;
-            log::debug!("二级大厅气泡稳定后没有可靠重叠，已重建基线，不处理当前可见历史消息");
-            return Ok(false);
-        }
-        let new_bubbles = &refreshed_bubbles[refreshed_overlap..];
-        if new_bubbles.is_empty() {
-            self.business.clear_turtle_soup_secondary_stability()?;
-            *previous = refreshed_bubbles;
-            return Ok(false);
-        }
+        };
+        let start = match secondary_hall_sequence_delta(previous.as_deref(), &refreshed_bubbles) {
+            SecondaryHallSequenceDelta::NewFrom(start) => start,
+            SecondaryHallSequenceDelta::RetainedPrefix => {
+                log::debug!("二级大厅稳定观测仍只是旧序列前缀，保留原基线");
+                return Ok(false);
+            }
+            SecondaryHallSequenceDelta::EstablishBaseline
+            | SecondaryHallSequenceDelta::LostOverlap => {
+                self.business.clear_turtle_soup_secondary_stability()?;
+                *previous = Some(refreshed_bubbles);
+                log::debug!("二级大厅气泡稳定后没有可靠重叠，已重建基线，不处理当前可见历史消息");
+                return Ok(false);
+            }
+            SecondaryHallSequenceDelta::NoChange => {
+                self.business.clear_turtle_soup_secondary_stability()?;
+                *previous = Some(refreshed_bubbles);
+                return Ok(false);
+            }
+        };
+        let new_bubbles = &refreshed_bubbles[start..];
 
         log::info!(
-            "二级大厅检测到 {} 条新增气泡，按显示顺序 OCR",
+            "二级大厅检测到 {} 条结构稳定的新增气泡，按显示顺序 OCR 正文",
             new_bubbles.len()
         );
         let outcome = self.process_secondary_bubble_rects(
             &refreshed.image,
             refreshed.captured_at,
-            new_bubbles.iter().map(|bubble| bubble.rect),
+            new_bubbles
+                .iter()
+                .map(|bubble| (bubble.rect, Some(bubble.sender_rect()))),
             "blue",
             "",
         )?;
-        if outcome.ocr_pending {
-            log::debug!("二级大厅新增气泡的海龟汤 OCR 尚未稳定，保留旧气泡基线等待下轮复核");
+        if outcome.confirmation_pending {
+            log::debug!("二级大厅身份相关输入或海龟汤 OCR 尚未稳定，保留旧气泡基线等待下轮复核");
             return Ok(false);
         }
-        *previous = refreshed_bubbles;
+        *previous = Some(refreshed_bubbles);
         Ok(outcome.processed)
     }
 
@@ -370,28 +386,36 @@ impl ApplicationRuntime {
         };
         let frame = load_frame(&canvas, &self.game_ui)?;
         let current = secondary_hall_bubbles(&frame.image)?;
-        let Some(start) = secondary_new_bubble_start(previous, &current) else {
-            *previous = current;
-            log::debug!("二级确认气泡序列失去重叠，已重建基线");
-            return Ok(Vec::new());
-        };
-        if start >= current.len() {
-            *previous = current;
-            return Ok(Vec::new());
+        match secondary_hall_sequence_delta(Some(previous), &current) {
+            SecondaryHallSequenceDelta::RetainedPrefix => {
+                log::debug!("二级确认当前只显示旧序列前缀，保留原基线");
+                return Ok(Vec::new());
+            }
+            SecondaryHallSequenceDelta::NoChange => return Ok(Vec::new()),
+            SecondaryHallSequenceDelta::EstablishBaseline => unreachable!("baseline is present"),
+            SecondaryHallSequenceDelta::LostOverlap | SecondaryHallSequenceDelta::NewFrom(_) => {}
         }
 
-        let refreshed = self.wait_for_secondary_bubble_stability()?;
-        let refreshed_bubbles = secondary_hall_bubbles(&refreshed.image)?;
-        let Some(start) = secondary_new_bubble_start(previous, &refreshed_bubbles) else {
-            *previous = refreshed_bubbles;
-            log::debug!("二级确认气泡稳定后失去重叠，已重建基线");
+        let Some((refreshed, refreshed_bubbles)) = self.wait_for_secondary_hall_stability()? else {
+            log::debug!("二级确认消息尚未稳定，保留旧基线等待下一轮");
             return Ok(Vec::new());
         };
-        let rects = refreshed_bubbles[start..]
-            .iter()
-            .map(|bubble| bubble.rect)
-            .collect::<Vec<_>>();
-        let messages = self.recognize_secondary_hall_messages(&refreshed.image, &rects)?;
+        let start = match secondary_hall_sequence_delta(Some(previous), &refreshed_bubbles) {
+            SecondaryHallSequenceDelta::NewFrom(start) => start,
+            SecondaryHallSequenceDelta::RetainedPrefix => {
+                log::debug!("二级确认稳定观测仍只是旧序列前缀，保留原基线");
+                return Ok(Vec::new());
+            }
+            SecondaryHallSequenceDelta::NoChange => return Ok(Vec::new()),
+            SecondaryHallSequenceDelta::EstablishBaseline => unreachable!("baseline is present"),
+            SecondaryHallSequenceDelta::LostOverlap => {
+                *previous = refreshed_bubbles;
+                log::debug!("二级确认气泡稳定后失去重叠，已重建基线");
+                return Ok(Vec::new());
+            }
+        };
+        let messages =
+            self.recognize_secondary_hall_messages(&refreshed.image, &refreshed_bubbles[start..])?;
         *previous = refreshed_bubbles;
         Ok(messages)
     }
@@ -399,12 +423,12 @@ impl ApplicationRuntime {
     fn recognize_secondary_hall_messages(
         &self,
         image: &DynamicImage,
-        rects: &[Rect],
+        bubbles: &[SecondaryHallBubble],
     ) -> Result<Vec<ChatMessage>> {
         let started = Instant::now();
-        let mut messages = Vec::with_capacity(rects.len());
-        for rect in rects {
-            let crop = crop_canvas(image, *rect)?;
+        let mut messages = Vec::with_capacity(bubbles.len());
+        for bubble in bubbles {
+            let crop = crop_canvas(image, bubble.rect)?;
             let text = self.ocr.merged_text(
                 crop,
                 self.config.ocr.same_line_y_tolerance,
@@ -412,9 +436,9 @@ impl ApplicationRuntime {
             )?;
             messages.push(ChatMessage {
                 message_type: "blue".to_string(),
-                block: *rect,
+                block: bubble.rect,
                 text,
-                visual: rect_chat_change_fingerprint(image, *rect)?,
+                visual: rect_chat_change_fingerprint(image, bubble.rect)?,
             });
         }
         let ocr_ms = elapsed_ms(started);
@@ -446,7 +470,7 @@ impl ApplicationRuntime {
             .process_secondary_bubble_rects(
                 image,
                 captured_at,
-                std::iter::once(rect),
+                std::iter::once((rect, None)),
                 message_type,
                 friend_name,
             )?
@@ -457,7 +481,7 @@ impl ApplicationRuntime {
         &mut self,
         image: &DynamicImage,
         captured_at: Instant,
-        rects: impl IntoIterator<Item = Rect>,
+        regions: impl IntoIterator<Item = (Rect, Option<Rect>)>,
         message_type: &str,
         friend_name: &str,
     ) -> Result<SecondaryBubbleProcessOutcome> {
@@ -468,31 +492,68 @@ impl ApplicationRuntime {
         let accepts_turtle_questions = message_type == "blue"
             && commands_enabled
             && self.business.turtle_soup_accepts_questions()?;
-        let captures_hash_sender = message_type == "blue" && commands_enabled;
-        let texts = (|| -> Result<Vec<(Rect, String, Option<String>)>> {
+        let active_entertainment = if commands_enabled {
+            self.business.active_entertainment()?
+        } else {
+            None
+        };
+        let observes_hall = message_type == "blue";
+        let command_router = ChatCommandRouter::new(&self.custom_workflow);
+        let texts = (|| -> Result<Vec<SecondaryOcrMessage>> {
             let mut texts = Vec::new();
-            for rect in rects {
+            for (rect, sender_rect) in regions {
                 let crop = crop_canvas(image, rect)?;
                 let text = self.ocr.merged_text(
                     crop,
                     self.config.ocr.same_line_y_tolerance,
                     OcrPriority::ChatObservation,
                 )?;
-                let trimmed_text = text.trim_start();
-                let starts_with_hash =
-                    trimmed_text.starts_with('#') || trimmed_text.starts_with('＃');
-                let message_sender = if captures_hash_sender && starts_with_hash {
-                    let sender_rect = secondary_message_sender_rect(image, rect);
+                let classification = if observes_hall && commands_enabled {
+                    let routed = secondary_hall_command_text(&text)
+                        .and_then(|command_text| {
+                            CommandEnvelope::new(
+                                &text,
+                                SECONDARY_HALL_FALLBACK_SENDER,
+                                "blue",
+                                command_text,
+                                CommandObservation::default(),
+                            )
+                        })
+                        .and_then(|envelope| command_router.route(&envelope, active_entertainment));
+                    classify_secondary_hall_message(
+                        &text,
+                        routed.as_ref().map(|command| &command.command),
+                        accepts_turtle_questions,
+                    )
+                } else if observes_hall {
+                    SecondaryHallMessageClassification {
+                        kind: SecondaryHallMessageKind::Ignored,
+                        requires_sender: false,
+                    }
+                } else {
+                    SecondaryHallMessageClassification {
+                        kind: SecondaryHallMessageKind::Command,
+                        requires_sender: false,
+                    }
+                };
+                let message_sender = if classification.requires_sender
+                    && let Some(sender_rect) = sender_rect
+                {
                     let crop = crop_canvas(image, sender_rect)?;
-                    Some(self.ocr.merged_text(
+                    Some(normalize_secondary_sender_name(&self.ocr.merged_text(
                         crop,
                         self.config.ocr.same_line_y_tolerance,
                         OcrPriority::ChatObservation,
-                    )?)
+                    )?))
                 } else {
                     None
                 };
-                texts.push((rect, text, message_sender));
+                texts.push(SecondaryOcrMessage {
+                    text,
+                    sender: message_sender,
+                    kind: classification.kind,
+                    requires_sender: classification.requires_sender,
+                });
             }
             Ok(texts)
         })();
@@ -513,7 +574,7 @@ impl ApplicationRuntime {
             texts.len(),
             texts
                 .iter()
-                .map(|(_, text, _)| format!("[{}] {}", message_type, redacted_chat_text(text)))
+                .map(|message| format!("[{}] {}", message_type, redacted_chat_text(&message.text)))
                 .collect(),
             0,
             ocr_ms,
@@ -525,14 +586,43 @@ impl ApplicationRuntime {
             },
         )));
 
-        let texts = if accepts_turtle_questions {
-            let observations = texts
-                .into_iter()
-                .map(|(_, text, message_sender)| SecondaryOcrObservation {
-                    text,
-                    player: message_sender.unwrap_or_default(),
+        if texts.iter().any(|message| {
+            message.requires_sender
+                && message
+                    .sender
+                    .as_deref()
+                    .is_none_or(|sender| sender.trim().is_empty())
+        }) {
+            self.chat_observations
+                .complete_without_messages(observation_frame)?;
+            log::debug!("二级大厅身份相关输入的固定发送者区域 OCR 为空，本轮等待昵称加载");
+            return Ok(SecondaryBubbleProcessOutcome {
+                processed: false,
+                confirmation_pending: true,
+            });
+        }
+
+        let mut texts = texts
+            .into_iter()
+            .filter(|message| {
+                message_type != "blue" || message.kind != SecondaryHallMessageKind::Ignored
+            })
+            .collect::<Vec<_>>();
+        let turtle_question_indexes = texts
+            .iter()
+            .enumerate()
+            .filter_map(|(index, message)| {
+                (message.kind == SecondaryHallMessageKind::TurtleQuestion).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        if !turtle_question_indexes.is_empty() {
+            let observations = turtle_question_indexes
+                .iter()
+                .map(|index| SecondaryOcrObservation {
+                    text: texts[*index].text.clone(),
+                    player: texts[*index].sender.clone().unwrap_or_default(),
                 })
-                .collect::<Vec<_>>();
+                .collect();
             match self
                 .business
                 .stabilize_turtle_soup_secondary(observations)?
@@ -542,25 +632,35 @@ impl ApplicationRuntime {
                         .complete_without_messages(observation_frame)?;
                     return Ok(SecondaryBubbleProcessOutcome {
                         processed: false,
-                        ocr_pending: true,
+                        confirmation_pending: true,
                     });
                 }
-                SecondaryOcrStability::Stable(observations) => observations
-                    .into_iter()
-                    .map(|observation| (observation.text, Some(observation.player)))
-                    .collect::<Vec<_>>(),
+                SecondaryOcrStability::Stable(observations) => {
+                    if observations.len() != turtle_question_indexes.len() {
+                        return Err(anyhow!(
+                            "二级海龟汤 OCR 稳定结果数量不一致: expected={} actual={}",
+                            turtle_question_indexes.len(),
+                            observations.len()
+                        ));
+                    }
+                    for (index, observation) in
+                        turtle_question_indexes.into_iter().zip(observations)
+                    {
+                        texts[index].text = observation.text;
+                        texts[index].sender = Some(observation.player);
+                    }
+                }
             }
         } else {
             self.business.clear_turtle_soup_secondary_stability()?;
-            texts
-                .into_iter()
-                .map(|(_, text, message_sender)| (text, message_sender))
-                .collect::<Vec<_>>()
-        };
+        }
 
         let messages = texts
             .into_iter()
-            .map(|(text, sender)| SecondaryRecognizedMessage { text, sender })
+            .map(|message| SecondaryRecognizedMessage {
+                text: message.text,
+                sender: message.sender,
+            })
             .collect();
         let dispatches = self.chat_observations.publish_secondary(
             observation_frame,
@@ -572,7 +672,7 @@ impl ApplicationRuntime {
         let processed = self.dispatch_chat_observations(dispatches)?;
         Ok(SecondaryBubbleProcessOutcome {
             processed,
-            ocr_pending: false,
+            confirmation_pending: false,
         })
     }
 
@@ -603,17 +703,19 @@ impl ApplicationRuntime {
             let shortcut_player = if message_type == "pink" {
                 friend_name.trim()
             } else {
-                message_sender.as_deref().map(str::trim).unwrap_or_default()
+                message_sender
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|sender| !sender.is_empty())
+                    .unwrap_or(SECONDARY_HALL_FALLBACK_SENDER)
             };
-            if !shortcut_player.is_empty()
-                && let Some(envelope) = CommandEnvelope::new(
-                    &text,
-                    shortcut_player,
-                    &message_type,
-                    text.trim(),
-                    command_observation.clone(),
-                )
-                && envelope.prefix() == CommandPrefix::Hash
+            if let Some(envelope) = CommandEnvelope::new(
+                &text,
+                shortcut_player,
+                &message_type,
+                text.trim(),
+                command_observation.clone(),
+            ) && envelope.prefix() == CommandPrefix::Hash
             {
                 let router = ChatCommandRouter::new(&self.custom_workflow);
                 if let Some(parsed) = router.route(&envelope, self.business.active_entertainment()?)
@@ -650,7 +752,7 @@ impl ApplicationRuntime {
                     .as_deref()
                     .map(str::trim)
                     .filter(|sender| !sender.is_empty())
-                    .unwrap_or("二级大厅")
+                    .unwrap_or(SECONDARY_HALL_FALLBACK_SENDER)
             };
             let Some(envelope) = CommandEnvelope::new(
                 &text,
@@ -704,5 +806,53 @@ impl ApplicationRuntime {
         }
         log::debug!("二级监听气泡稳定等待超时，按当前画面继续 OCR");
         Ok(latest_frame)
+    }
+
+    fn wait_for_secondary_hall_stability(
+        &self,
+    ) -> Result<Option<(Frame, Vec<SecondaryHallBubble>)>> {
+        let canvas = Canvas {
+            width: self.config.screen.expected_width,
+            height: self.config.screen.expected_height,
+            resize: true,
+        };
+        let first = load_frame(&canvas, &self.game_ui)?;
+        let mut previous = secondary_hall_bubbles(&first.image)?;
+        let poll_ms = self
+            .config
+            .timing
+            .chat_scan
+            .change_debounce_ms
+            .clamp(100, 200);
+        let required_samples = self
+            .config
+            .resolve_stability_count(self.config.stability.secondary_hall_count);
+        let mut stable_samples = 1_u32;
+        let timeout_ms = poll_ms
+            .saturating_mul(u64::from(required_samples.saturating_add(1)))
+            .max(500);
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+
+        while Instant::now() < deadline {
+            sleep(Duration::from_millis(poll_ms));
+            let frame = load_frame(&canvas, &self.game_ui)?;
+            let current = secondary_hall_bubbles(&frame.image)?;
+            if hall_bubble_sequences_stable(&previous, &current) {
+                stable_samples = stable_samples.saturating_add(1);
+            } else {
+                stable_samples = 1;
+            }
+            if stable_samples >= required_samples {
+                return Ok(Some((frame, current)));
+            }
+            previous = current;
+        }
+        log::debug!(
+            "二级大厅气泡及关联区域稳定等待超时，本轮不进入 OCR: samples={}/{} timeout={}ms",
+            stable_samples,
+            required_samples,
+            timeout_ms
+        );
+        Ok(None)
     }
 }

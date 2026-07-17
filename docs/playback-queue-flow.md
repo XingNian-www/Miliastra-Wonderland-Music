@@ -4,11 +4,11 @@
 
 ## 核心结论
 
-音乐播放队列只保存已经确定的歌曲，不保存待执行的游戏操作。真正执行播放、回复游戏聊天、返回一级界面，仍然由命令执行线程完成。
+音乐播放队列只保存已经确定的歌曲，不保存待执行的游戏操作。播放应用服务负责解释播放决策和消费队列；真正触发播放器、回复游戏聊天和提交后续任务的能力由组合层窄端口实现。
 
-播放器后端状态被当作“不稳定观测”，不会直接作为业务事实。`player_controller` 把播放意图、播放观测、活动播放请求、暂停原因和队列推进决策收敛成一个状态机。主流程只负责候选确认、AI/聊天二次判断、音乐播放队列数据操作和待执行任务编排。
+播放器后端状态被当作“不稳定观测”，不会直接作为业务事实。`player_controller` 把播放意图、播放观测、活动播放请求、暂停原因和队列推进决策收敛成一个状态机。`SongRequestApplication` 负责候选确认、AI、审核和入队决策；`PlaybackApplication` 负责播放命令、队列消费和监控决策。
 
-播放监控线程不会直接消费音乐播放队列。它读取播放器状态后调用 `PlayerController::maybe_advance_queue()`，控制器返回结构化决策；只有需要出队时，主流程才提交 `PendingTask::AdvanceQueue`，再由命令执行线程串行处理。临近结束暂停只会因为队列、待执行点歌、播放 URI、播放控制或自动出队这类播放任务触发，不会因为普通控制台发言、启动游戏或管理投票触发。
+播放监控线程不会直接消费音乐播放队列。它读取播放器状态后调用 `PlayerController::maybe_advance_queue()`，控制器返回结构化决策；只有需要出队时，播放应用服务才通过组合端口提交 `PendingTask::AdvanceQueue`，再由正式任务执行边界交给 `PlaybackApplication`。临近结束暂停只会因为队列、待执行点歌、播放 URI、播放控制或自动出队这类播放任务触发，不会因为普通控制台发言、启动游戏或管理投票触发。
 
 ```mermaid
 flowchart TD
@@ -17,12 +17,12 @@ flowchart TD
     C --> D["PersistentQueue<br/>音乐播放队列"]
     B -->|可立即播放| E["PlaybackRequest"]
     E --> F["PlayerController<br/>播放 URI + 确认播放"]
-    F --> G["RuntimeState.playback<br/>确认状态 / 活动请求 / 暂停原因"]
+    F --> G["PlaybackRuntimeState<br/>确认状态 / 活动请求 / 暂停原因"]
     H["播放监控线程"] --> I["PlayerController<br/>maybe_advance_queue"]
     I -->|PauseWaitingForQueue| J["暂停等待队列接管"]
     I -->|AdvanceQueue| K["PendingTask::AdvanceQueue"]
-    K --> L["命令执行线程"]
-    L --> M["consume_queue"]
+    K --> L["正式任务执行"]
+    L --> M["PlaybackApplication::consume_queue"]
     M --> E
 ```
 
@@ -31,19 +31,23 @@ flowchart TD
 | 文件 | 职责 |
 | --- | --- |
 | `src/features/playback/controller.rs` | 播放器后端 trait、播放确认、活动播放请求、暂停原因、队列推进决策和同歌历史写入。 |
-| `src/composition/application/song_request.rs`、`commands.rs`、`playback.rs` | 点歌决策、聊天确认、AI 判断、自动出队任务编排、音乐播放队列消费和游戏内反馈。 |
+| `src/features/song_request/application.rs` | 点歌候选确认、AI、审核、去重和入队决策。 |
+| `src/features/playback/application.rs` | 播放命令、播放确认、自动出队决策和音乐播放队列消费。 |
+| `src/features/hall.rs` | 大厅命令、大厅状态解释和到期提醒决策。 |
+| `src/composition/application/song_request_port.rs`、`commands.rs`、`playback.rs` | 播放器、队列、聊天、决策和正式任务能力适配。 |
 | `src/features/playback/queue.rs` | 音乐播放队列的持久化、去重、追加、移除、清空。 |
-| `src/features/playback/state.rs` | 运行状态持久化，包括 `playback` 状态和大厅倒计时缓存。 |
+| `src/features/playback/state.rs` | 播放确认状态持久化。 |
+| `src/features/hall/state.rs` | 大厅倒计时与到期提醒状态持久化。 |
 | `src/adapters/feeluown.rs` | FeelUOwn TCP RPC、搜索候选、播放、暂停、状态查询；当前作为播放器后端适配器。 |
 | `src/features/playback/format.rs` | 播放状态估算、剩余时间、播放成功文案。 |
-| `src/features/playback/matcher.rs` | 歌名/歌手匹配、队列去重和当前播放匹配。 |
-| `src/features/playback/dedup.rs` | 长时间同歌去重历史、同歌判断和播放成功记录。 |
+| `src/features/playback/matcher.rs` | 队列关键词的规范化与包含关系去重。 |
+| `src/features/playback/dedup.rs` | 只按非空 URI 判断的长时间同歌历史和播放成功记录。 |
 
-## 三个状态容器
+## 四个状态容器
 
 ### 待执行任务队列
 
-`PendingTask` 存在于内存里的 `VecDeque`，用于串行执行会影响游戏窗口或业务状态的高层任务。自动出队在这里表现为 `PendingTask::AdvanceQueue`。远程播放 URI 不再进入待执行任务队列，而是作为控制台高权限项直接写入音乐播放队列。
+`PendingTask` 用于串行执行会影响游戏窗口或业务状态的高层任务。自动出队在这里表现为 `PendingTask::AdvanceQueue`。远程播放 URI 不进入游戏 UI 待执行任务，而是转换为类型化播放队列变更意图，由业务运行时写入音乐播放队列。
 
 它不是音乐播放队列。
 
@@ -63,14 +67,16 @@ flowchart TD
 
 ### 播放器运行状态
 
-`RuntimeState.playback` 是播放器控制器的持久状态：
+`PlaybackRuntimeState` 是播放器控制器的持久状态：
 
 - `state`：确认播放状态，例如 `idle`、`starting`、`requested_song_playing`、`paused_by_user`、`paused_waiting_for_queue`、`external_playback`、`unknown`。
 - `pauseReason`：暂停原因，区分 `user` 和 `waiting_for_queue`。
 - `activeRequest`：本项目已经确认的活动播放请求，保存关键词、来源、请求 URI、确认 URI、歌名歌手和开始时间。
 - `lastObservation`：最近一次播放器观测，保存原始状态、URI、歌名歌手、进度、时长、观测时间和可靠性。
 
-大厅倒计时缓存仍在 `RuntimeState` 顶层。旧的点歌播放散字段和两个暂停布尔值已经不再作为业务接口使用。
+### 大厅运行状态
+
+`HallRuntimeState` 由 Hall 模块独立持久化，保存大厅剩余分钟数、更新时间和到期提醒是否已经发送。业务运行时分别查询播放状态与大厅状态，HTTP `/state` 只在协议边界把两份快照组合成原有字段，不让 Playback 重新拥有大厅数据。
 
 ## 点歌通过审核后的播放决策
 
@@ -84,6 +90,7 @@ flowchart TD
 第二步是长时间同歌去重的入队前检查：
 
 - 如果最终候选近期已经成功播放过，直接拒绝本次点歌并回复 `歌曲名近期已播放过,请稍后再点`。
+- 长时间历史只比较双方都存在的非空 URI；URI 缺失时不会按歌名或歌手兜底。
 - 这一步只拒绝确定的近期重复歌曲，不写入历史。
 - 控制台来源在 `song_dedup.console_bypass = true` 时仍然豁免。
 
@@ -94,12 +101,12 @@ flowchart TD
 
 第四步看播放器状态：
 
-- 当前已经在播放同一 URI，或本地匹配认为是同一首，回复 `当前正在播放`。
+- 当前已经在播放同一非空 URI 时，回复 `当前正在播放`。
 - 当前歌曲应该受保护时，加入音乐播放队列。
 - 播放器状态查询失败时，为了避免误切歌，加入音乐播放队列并回复状态未知。
 - 不需要保护时，构造 `PlaybackRequest` 交给播放器控制器立即播放。
 
-当前歌曲保护由 `PlayerController::should_queue_until_current_song_finished()` 判断。配置关闭时可以更积极地直接播放；机器人确认的歌曲在播放或可识别暂停时会优先保留。非点歌歌曲必须以同一 URI 或歌名歌手连续保持 `playing` 达到 `queue.external_playback_protect_after_seconds`，才会加入保护；在此之前新点歌可以直接接管。
+当前歌曲保护由 `PlayerController::should_queue_until_current_song_finished()` 判断。配置关闭时可以更积极地直接播放；机器人确认的歌曲在播放或可识别暂停时会优先保留。非点歌歌曲必须以同一非空 URI 连续保持 `playing` 达到 `queue.external_playback_protect_after_seconds`，才会加入保护；URI 缺失时身份未知，在此之前新点歌可以直接接管。
 
 ## 实际播放确认
 
@@ -121,7 +128,7 @@ flowchart TD
 - 进度和时长不能是无效的 `0:00/0:00`。
 - 时长过短会视为无音源。
 
-确认成功后，控制器写入 `RuntimeState.playback.activeRequest`，状态变为 `requested_song_playing`，并写入长时间同歌去重历史。只有这个时刻才算实际播放成功。
+确认成功后，控制器写入 `PlaybackRuntimeState.activeRequest`，状态变为 `requested_song_playing`，并写入长时间同歌去重历史。只有这个时刻才算实际播放成功。
 
 ## 播放监控线程
 
@@ -145,7 +152,7 @@ flowchart TD
 外部播放首次被观测到后只进入稳定观察，不立即保护。观察器只用非空 URI 识别同一首歌曲；URI 缺失时身份未知，不能保护当前歌或自动推进队列。URI 变化、暂停、停止、开始机器人点歌和程序重启都会重置计时。连续正常播放达到 `queue.external_playback_protect_after_seconds` 后，外部歌曲才和机器人点歌一样受当前歌曲保护。稳定期未满时，只要音乐播放队列非空且没有其他播放任务执行，监控线程可以提交自动出队。`unknown` 表示控制器无法确认播放器现实状态，只允许继续观测，不自动推进队列。
 8. 如果播放器正在播放且接近结束，并且存在队列或待执行播放任务，先暂停等待队列接管。
 
-控制器只返回决策。真正入队 `PendingTask::AdvanceQueue`、更新监控快照和后续消费队列仍由 `main.rs` 执行。
+控制器只返回决策。`src/features/playback/application.rs` 负责解释决策和消费队列；组合层播放端口只负责把 `PendingTask::AdvanceQueue` 提交到正式任务队列并连接播放器与监控能力。
 
 ## 临近结束暂停
 

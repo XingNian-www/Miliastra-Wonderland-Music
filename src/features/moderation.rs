@@ -2,8 +2,63 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
+
+use crate::config::{PointConfig, RectConfig, validate_rect};
+use crate::features::command::{
+    CommandAuthority, CommandEnvelope, CommandPrefix, FeatureCommandMatch,
+};
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModerationConfig {
+    pub stable_vote_samples: u32,
+    pub required_vote_margin: i32,
+    pub friend_panel_region: RectConfig,
+    pub search_panel_region: RectConfig,
+    pub search_input_point: PointConfig,
+    pub search_button_point: PointConfig,
+    pub more_settings_region: RectConfig,
+    pub block_chat_region: RectConfig,
+    pub blacklist_region: RectConfig,
+    pub confirm_region: RectConfig,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModerationTimingConfig {
+    pub vote_timeout_ms: u64,
+    pub vote_poll_ms: u64,
+    pub search_result_timeout_ms: u64,
+    pub confirm_wait_ms: u64,
+}
+
+impl ModerationConfig {
+    pub(crate) fn validate(&self, timing: &ModerationTimingConfig) -> Result<()> {
+        if self.stable_vote_samples == 0 || self.required_vote_margin <= 0 {
+            bail!("管理投票稳定次数和通过票差必须大于 0");
+        }
+        for (rect, field) in [
+            (self.friend_panel_region, "moderation.friend_panel_region"),
+            (self.search_panel_region, "moderation.search_panel_region"),
+            (self.more_settings_region, "moderation.more_settings_region"),
+            (self.block_chat_region, "moderation.block_chat_region"),
+            (self.blacklist_region, "moderation.blacklist_region"),
+            (self.confirm_region, "moderation.confirm_region"),
+        ] {
+            validate_rect(rect, field)?;
+        }
+        if timing.vote_timeout_ms == 0
+            || timing.vote_poll_ms == 0
+            || timing.search_result_timeout_ms == 0
+            || timing.confirm_wait_ms == 0
+        {
+            bail!("管理投票和执行超时必须大于 0");
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModerationCommand {
@@ -13,6 +68,32 @@ pub struct ModerationCommand {
 }
 
 impl ModerationCommand {
+    pub(crate) fn claims_chat(envelope: &CommandEnvelope) -> bool {
+        envelope.prefix() == CommandPrefix::At
+            && envelope.authority() == CommandAuthority::Friend
+            && ["拉黑UID", "屏蔽UID", "拉黑", "屏蔽"]
+                .iter()
+                .any(|prefix| strip_ascii_case_prefix(envelope.command_text(), prefix).is_some())
+    }
+
+    pub(crate) fn parse_chat(envelope: &CommandEnvelope) -> Option<FeatureCommandMatch<Self>> {
+        if !Self::claims_chat(envelope) {
+            return None;
+        }
+        let parsed = parse_command(envelope.command_text(), envelope.username())?;
+        let raw = format!(
+            "{} {} {}",
+            parsed.matched,
+            envelope.username(),
+            parsed.command.uid
+        );
+        Some(FeatureCommandMatch::new(
+            parsed.matched,
+            raw,
+            parsed.command,
+        ))
+    }
+
     pub fn lock_key(&self) -> String {
         format!("moderation:{}:{}", self.action.label(), self.uid)
     }
@@ -294,9 +375,20 @@ impl ModerationService {
                     log::error!("{}成功通告发送失败: {error:#}", task.command.action.label());
                 }
             }
-            Ok(false) | Err(_) => {
+            Ok(false) => {
                 let _ = port.send_hall(&format!(
                     "@UID{}的{}流程出错",
+                    task.command.uid,
+                    task.command.action.label()
+                ));
+            }
+            Err(error) => {
+                log::error!(
+                    "{}执行结果未知，禁止重放: {error:#}",
+                    task.command.action.label()
+                );
+                let _ = port.send_hall(&format!(
+                    "@UID{}的{}执行结果未知,请勿重复操作",
                     task.command.uid,
                     task.command.action.label()
                 ));
@@ -934,6 +1026,31 @@ mod tests {
             ["sync:false", "send:@UID123456789的拉黑请求未通过:false",]
         );
         assert!(!service.is_active(&command()).unwrap());
+    }
+
+    #[test]
+    fn unknown_action_result_warns_against_repeating_the_operation() {
+        let service = service(1, 1);
+        let mut command_port = FakeCommandPort::new();
+        let hold_active = command_port.hold_active.clone();
+        let task = start(&service, &mut command_port).finish(true);
+        let mut execution =
+            FakeExecutionPort::ready(hold_active.clone(), Err(anyhow!("result unknown")));
+
+        assert!(service.execute_result(task, &mut execution).is_err());
+
+        assert_eq!(
+            execution.events,
+            [
+                "send:@UID123456789的拉黑请求已通过,开始执行:true",
+                "action:true",
+                "sync:false",
+                "wait",
+                "send:@UID123456789的拉黑执行结果未知,请勿重复操作:false",
+            ]
+        );
+        assert!(!service.is_active(&command()).unwrap());
+        assert!(!hold_active.load(Ordering::SeqCst));
     }
 
     #[test]

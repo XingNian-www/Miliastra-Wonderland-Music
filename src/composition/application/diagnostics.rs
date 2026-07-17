@@ -16,13 +16,15 @@ impl ApplicationRuntime {
             }
             WebToolRequest::ScanChat => {
                 let frame = self.latest_frame()?;
-                let templates = TemplateArgs::default().resolve(&self.config);
-                let prepared =
-                    prepare_chat_scan(&frame, &templates, self.config.screen.chat_rect.into())?;
+                let prepared = prepare_chat_scan(
+                    &frame,
+                    &self.chat_templates,
+                    self.config.screen.chat_rect.into(),
+                )?;
                 serde_json::to_string_pretty(&recognize_prepared_chat(
                     &self.ocr,
                     OcrPriority::Diagnostic,
-                    &templates,
+                    &self.chat_templates,
                     prepared,
                     None,
                 )?)
@@ -30,8 +32,7 @@ impl ApplicationRuntime {
             }
             WebToolRequest::UiState => {
                 let frame = self.latest_frame()?;
-                let templates = UiTemplateArgs::default().resolve(&self.config);
-                Ok(detect_ui_state(&frame, &templates, &self.config.screen)?.to_string())
+                Ok(detect_ui_state(&frame, &self.ui_templates, &self.config.screen)?.to_string())
             }
             WebToolRequest::HallName => {
                 let frame = self.latest_frame()?;
@@ -165,8 +166,7 @@ impl ApplicationRuntime {
                 self.run_web_tool_panel_benchmark(rounds)
             }
             WebToolRequest::OcrBackendProbe => {
-                let args = OcrArgs::default().resolve(&self.config);
-                let result = probe_ocr_backend_support(&args)
+                let result = probe_ocr_backend_support(&self.ocr_args)
                     .into_iter()
                     .map(|probe| match probe.status {
                         OcrBackendProbeStatus::Available {
@@ -231,7 +231,6 @@ impl ApplicationRuntime {
         let baseline = self.latest_frame()?;
         let mut previous =
             rect_chat_change_fingerprint(&baseline, self.config.screen.chat_rect.into())?;
-        let templates = TemplateArgs::default().resolve(&self.config);
         let mut lines = vec![format!(
             "采样次数={} 间隔={}ms，区域为一级聊天区",
             samples, interval_ms
@@ -247,7 +246,7 @@ impl ApplicationRuntime {
                 || stats.changed_ratio >= self.config.ocr.change_pixel_threshold;
             let markers = if changed {
                 let (blue, yellow, pink) =
-                    count_chat_markers(&frame, &templates, self.config.screen.chat_rect)?;
+                    count_chat_markers(&frame, &self.chat_templates, self.config.screen.chat_rect)?;
                 format!(" 蓝={} 黄={} 粉={}", blue, yellow, pink)
             } else {
                 String::new()

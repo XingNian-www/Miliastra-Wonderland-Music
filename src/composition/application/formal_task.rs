@@ -5,14 +5,21 @@ use std::thread::{self, JoinHandle};
 use anyhow::{Result, anyhow};
 
 use super::{ApplicationRuntime, PendingTask, PendingTaskExecution};
+use crate::features::hall::HallRuntimeState;
+use crate::features::playback::{PlaybackRuntimeState, QueueItem};
 use crate::features::startup::StartupTask;
+use crate::features::turtle_soup::TurtleSoupSnapshot;
+use crate::features::undercover::UndercoverSnapshot;
 use crate::interfaces::chat::PendingCommand;
-use crate::interfaces::http::{HttpTaskPort, WebToolRequest};
-use crate::runtime::business::{BusinessRuntimeError, BusinessRuntimeHandle};
+use crate::interfaces::http::{HttpQueryPort, HttpTaskPort, WebToolRequest};
+use crate::runtime::business::{
+    BusinessMutationIntent, BusinessMutationOutcome, BusinessRuntimeError, BusinessRuntimeHandle,
+};
 use crate::runtime::chat_listener::ChatListenerMode;
+use crate::runtime::decision::DecisionAction;
 use crate::runtime::scheduler::{
-    DiagnosticTaskSnapshot, DiagnosticTaskSubmission, DiagnosticTaskWork, FormalTaskDedupKey,
-    FormalTaskEnqueueOutcome, FormalTaskSubmission, FormalTaskWork,
+    DiagnosticTaskSnapshot, DiagnosticTaskSubmission, DiagnosticTaskWork, FormalTaskCancelOutcome,
+    FormalTaskDedupKey, FormalTaskEnqueueOutcome, FormalTaskSubmission, FormalTaskWork,
 };
 
 const EXECUTION_QUEUE_CAPACITY: usize = 8;
@@ -132,6 +139,10 @@ impl FormalTaskClient {
 }
 
 impl HttpTaskPort for FormalTaskClient {
+    fn apply_mutation(&self, intent: BusinessMutationIntent) -> Result<BusinessMutationOutcome> {
+        Ok(self.business.apply_mutation(intent)?)
+    }
+
     fn enqueue_command(&self, pending: PendingCommand) -> Result<FormalTaskEnqueueOutcome> {
         Ok(FormalTaskClient::enqueue_command(self, pending)?)
     }
@@ -158,6 +169,40 @@ impl HttpTaskPort for FormalTaskClient {
 
     fn enqueue_diagnostic(&self, request: WebToolRequest) -> Result<DiagnosticTaskSnapshot> {
         Ok(FormalTaskClient::enqueue_diagnostic(self, request)?)
+    }
+
+    fn cancel_task(&self, task_id: u64) -> Result<FormalTaskCancelOutcome> {
+        Ok(self.business.cancel_formal_task(task_id)?)
+    }
+
+    fn submit_decision(&self, id: u64, action: DecisionAction) -> Result<()> {
+        Ok(self.business.submit_decision(id, action)?)
+    }
+}
+
+impl HttpQueryPort for FormalTaskClient {
+    fn turtle_soup_snapshot(&self) -> Result<TurtleSoupSnapshot> {
+        Ok(self.business.turtle_soup_snapshot()?)
+    }
+
+    fn undercover_snapshot(&self) -> Result<UndercoverSnapshot> {
+        Ok(self.business.undercover_snapshot()?)
+    }
+
+    fn diagnostic_task_snapshot(&self, id: u64) -> Result<Option<DiagnosticTaskSnapshot>> {
+        Ok(self.business.diagnostic_task_snapshot(id)?)
+    }
+
+    fn playback_queue_snapshot(&self) -> Result<Vec<QueueItem>> {
+        Ok(self.business.playback_queue_snapshot()?)
+    }
+
+    fn playback_state_snapshot(&self) -> Result<PlaybackRuntimeState> {
+        Ok(self.business.playback_state_snapshot()?)
+    }
+
+    fn hall_state_snapshot(&self) -> Result<HallRuntimeState> {
+        Ok(self.business.hall_state_snapshot()?)
     }
 }
 

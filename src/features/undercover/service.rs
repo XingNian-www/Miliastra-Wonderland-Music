@@ -1,4 +1,6 @@
 use std::collections::VecDeque;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Result, anyhow, bail};
@@ -103,6 +105,10 @@ impl UndercoverTimedOutcome {
         self.action
     }
 
+    pub const fn key(&self) -> UndercoverEffectKey {
+        self.request.key
+    }
+
     pub fn into_request(self) -> UndercoverEffectRequest {
         self.request
     }
@@ -120,6 +126,194 @@ pub trait UndercoverDeliveryPort {
     fn send_friend_batch(&self, deliveries: &[FriendMessage]) -> Result<FriendBatchOutcome>;
     fn send_hall(&self, message: &str) -> Result<()>;
     fn send_hall_batch(&self, messages: &[String]) -> Result<()>;
+}
+
+pub trait UndercoverRuntimePort: Send + Sync {
+    fn begin(
+        &self,
+        player: &str,
+        source: UndercoverCommandSource,
+        command: &UndercoverCommand,
+        now: Instant,
+    ) -> Result<UndercoverCommandStart>;
+
+    fn claim(&self, key: UndercoverEffectKey) -> Result<UndercoverEffectClaim>;
+
+    fn resume(
+        &self,
+        key: UndercoverEffectKey,
+        result: UndercoverEffectResult,
+    ) -> Result<UndercoverResume>;
+
+    fn cancel(&self, key: UndercoverEffectKey) -> Result<()>;
+
+    fn poll_timed_outcome(
+        &self,
+        now: Instant,
+        clock_active: bool,
+    ) -> Result<Option<UndercoverTimedOutcome>>;
+
+    fn abort(&self) -> Result<bool>;
+}
+
+#[derive(Clone)]
+pub struct UndercoverApplication {
+    runtime: Arc<dyn UndercoverRuntimePort>,
+}
+
+impl UndercoverApplication {
+    pub fn new(runtime: Arc<dyn UndercoverRuntimePort>) -> Self {
+        Self { runtime }
+    }
+
+    pub fn execute_command(
+        &self,
+        player: &str,
+        source: UndercoverCommandSource,
+        command: &UndercoverCommand,
+        now: Instant,
+        delivery: &dyn UndercoverDeliveryPort,
+    ) -> Result<()> {
+        let start = self.runtime.begin(player, source, command, now)?;
+        self.drive_start(start, delivery)
+    }
+
+    pub fn drive_start(
+        &self,
+        start: UndercoverCommandStart,
+        delivery: &dyn UndercoverDeliveryPort,
+    ) -> Result<()> {
+        match start {
+            UndercoverCommandStart::Completed(_) => Ok(()),
+            UndercoverCommandStart::Suspended(request) => self.drive_effect_chain(
+                request,
+                UndercoverEffectLane::Formal,
+                UndercoverLatePolicy::Error,
+                delivery,
+            ),
+        }
+    }
+
+    pub fn poll_timed_outcome(
+        &self,
+        now: Instant,
+        clock_active: bool,
+    ) -> Result<Option<UndercoverTimedOutcome>> {
+        self.runtime.poll_timed_outcome(now, clock_active)
+    }
+
+    pub fn timed_effect(&self, outcome: UndercoverTimedOutcome) -> UndercoverEffectTask {
+        UndercoverEffectTask {
+            application: self.clone(),
+            action: outcome.action(),
+            request: outcome.into_request(),
+        }
+    }
+
+    pub fn cancel_effect(&self, key: UndercoverEffectKey) -> Result<()> {
+        self.runtime.cancel(key)
+    }
+
+    pub fn abort(&self) -> Result<bool> {
+        self.runtime.abort()
+    }
+
+    fn drive_effect_chain(
+        &self,
+        mut request: UndercoverEffectRequest,
+        expected_lane: UndercoverEffectLane,
+        late_policy: UndercoverLatePolicy,
+        delivery: &dyn UndercoverDeliveryPort,
+    ) -> Result<()> {
+        loop {
+            if request.lane != expected_lane {
+                let _ = self.runtime.cancel(request.key);
+                bail!(
+                    "谁是卧底效果通道不一致: expected={expected_lane:?} actual={:?}",
+                    request.lane
+                );
+            }
+            match self.runtime.claim(request.key)? {
+                UndercoverEffectClaim::Claimed => {}
+                UndercoverEffectClaim::Late(_) => {
+                    return handle_late_undercover_effect(late_policy);
+                }
+            }
+            let key = request.key;
+            let result = match request.effect {
+                UndercoverEffect::FriendVerify { player, message } => {
+                    UndercoverEffectResult::FriendVerify(run_undercover_delivery(
+                        "好友验证",
+                        || delivery.verify_friend(&player, &message),
+                    ))
+                }
+                UndercoverEffect::FriendBatch { deliveries } => {
+                    UndercoverEffectResult::FriendBatch(run_undercover_delivery(
+                        "好友私密批次发送",
+                        || delivery.send_friend_batch(&deliveries),
+                    ))
+                }
+                UndercoverEffect::Hall { message } => UndercoverEffectResult::Hall(
+                    run_undercover_delivery("大厅消息发送", || delivery.send_hall(&message)),
+                ),
+                UndercoverEffect::HallBatch { messages } => UndercoverEffectResult::HallBatch(
+                    run_undercover_delivery("大厅批量消息发送", || {
+                        delivery.send_hall_batch(&messages)
+                    }),
+                ),
+            };
+            match self.runtime.resume(key, result)? {
+                UndercoverResume::Completed(_) => return Ok(()),
+                UndercoverResume::Suspended(next) => request = next,
+                UndercoverResume::Late(_) => return handle_late_undercover_effect(late_policy),
+            }
+        }
+    }
+}
+
+pub struct UndercoverEffectTask {
+    application: UndercoverApplication,
+    action: &'static str,
+    request: UndercoverEffectRequest,
+}
+
+impl UndercoverEffectTask {
+    pub fn label(&self) -> String {
+        format!("发送谁是卧底效果({})", self.action)
+    }
+
+    pub fn execute(self, delivery: &dyn UndercoverDeliveryPort) -> Result<()> {
+        self.application.drive_effect_chain(
+            self.request,
+            UndercoverEffectLane::Deferred,
+            UndercoverLatePolicy::Ignore,
+            delivery,
+        )
+    }
+
+    pub fn cancel(&self) -> Result<()> {
+        self.application.cancel_effect(self.request.key)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum UndercoverLatePolicy {
+    Error,
+    Ignore,
+}
+
+fn run_undercover_delivery<T>(label: &str, delivery: impl FnOnce() -> Result<T>) -> Result<T> {
+    match catch_unwind(AssertUnwindSafe(delivery)) {
+        Ok(result) => result,
+        Err(_) => Err(anyhow!("谁是卧底{label}发生未捕获异常")),
+    }
+}
+
+fn handle_late_undercover_effect(policy: UndercoverLatePolicy) -> Result<()> {
+    match policy {
+        UndercoverLatePolicy::Ignore => Ok(()),
+        UndercoverLatePolicy::Error => bail!("谁是卧底命令在效果链完成前已失效"),
+    }
 }
 
 /// Runtime-owned undercover application service.
@@ -1017,6 +1211,7 @@ mod runtime_tests {
 
     use super::*;
     use crate::features::entertainment::EntertainmentState;
+    use crate::runtime::clock::{Clock, ManualClock};
     use crate::runtime::identity::BusinessOperationId;
 
     fn service(timeout: u64) -> (UndercoverRuntimeService, EntertainmentState) {
@@ -1325,7 +1520,8 @@ mod runtime_tests {
     #[test]
     fn timer_deadline_turns_lobby_timeout_into_a_deferred_effect() {
         let (mut service, mut entertainment) = service(1);
-        let now = Instant::now();
+        let clock = ManualClock::new(Instant::now());
+        let now = clock.now();
         let start = service
             .begin_command(
                 &mut entertainment,
@@ -1363,11 +1559,12 @@ mod runtime_tests {
         let (kind, deadline) = service.next_deadline(now, true).expect("lobby deadline");
         assert_eq!(kind, super::super::UndercoverDeadlineKind::LobbyIdle);
         assert!(deadline <= now + Duration::from_secs(1));
+        clock.advance(Duration::from_secs(2)).unwrap();
         let outcome = service
             .handle_deadline(
                 &mut entertainment,
                 kind,
-                now + Duration::from_secs(2),
+                clock.now(),
                 BusinessOperationId::new(2),
             )
             .expect("handle timeout")

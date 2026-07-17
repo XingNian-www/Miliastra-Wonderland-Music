@@ -114,12 +114,6 @@ fn normalize_ascii_digit(ch: char) -> Option<char> {
     None
 }
 
-pub(crate) fn format_hall_remaining_suffix(minutes: Option<u32>) -> String {
-    minutes
-        .map(|value| format!("，剩余{}分钟", value))
-        .unwrap_or_default()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

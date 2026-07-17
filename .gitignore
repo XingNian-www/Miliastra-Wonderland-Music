@@ -1,8 +1,8 @@
 /target
 /logs
 /data
+/turtle_soup.yaml
 /models
 /.build
 /dist
-/CONTEXT.md
-/docs/adr/
+/docs

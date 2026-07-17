@@ -1,0 +1,11 @@
+# 复制为 undercover.yaml 后启用 config.yaml 中的 undercover.enabled。
+# A:B 与 B:A 会被视为同一组；坏记录会跳过，不影响其他有效词组。
+词组:
+  - 平民词: 苹果
+    卧底词: 梨
+    分类: 水果
+    启用: true
+  - 平民词: 咖啡
+    卧底词: 奶茶
+    分类: 饮品
+    启用: true

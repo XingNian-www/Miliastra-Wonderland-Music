@@ -31,8 +31,12 @@ impl ApplicationRuntime {
                 .map_err(|error| anyhow!(error))
             }
             WebToolRequest::UiState => {
-                let frame = self.latest_frame()?;
-                Ok(detect_ui_state(&frame, &self.ui_templates, &self.config.screen)?.to_string())
+                self.game_ui.capture()?;
+                self.ui_runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.handle().latest_ui_state())
+                    .map(|state| state.diagnostic())
+                    .ok_or_else(|| anyhow!("UI runtime 尚未产生模板状态观察"))
             }
             WebToolRequest::HallName => {
                 let frame = self.latest_frame()?;

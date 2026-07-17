@@ -349,7 +349,6 @@ impl ApplicationRuntime {
             config: self.config.clone(),
             ocr_args: self.ocr_args.clone(),
             chat_templates: self.chat_templates.clone(),
-            ui_templates: self.ui_templates.clone(),
             http_server: None,
             hotkeys: None,
             game_ui: self.game_ui.clone(),

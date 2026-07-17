@@ -1,4 +1,6 @@
 mod scan;
+mod secondary_hall_vision;
+mod secondary_unread_vision;
 mod stream;
 mod visual;
 
@@ -12,16 +14,19 @@ pub(crate) use scan::{
     ChatMessage, ChatScanTelemetry, ChatScanTelemetrySink, ResolvedTemplateArgs, TemplateArgs,
     count_chat_markers, prepare_chat_scan, recognize_prepared_chat,
 };
+pub(crate) use secondary_unread_vision::{
+    UnreadFriendHit, find_unread_friend_hits, unread_hit_still_visible,
+};
 pub(crate) use stream::{
     ChatObservationDispatch, ChatObservationExclusiveGuard, ChatObservationShared,
     CompletionAdvanceSubscriber, PrimaryObservedMessage, SecondaryChatObservation,
     SecondaryObservedMessage, SecondaryRecognizedMessage,
 };
 pub(crate) use visual::{
-    SECONDARY_TITLE_RECT, SecondaryChatIdentity, SecondaryHallBubble, UnreadFriendHit,
-    classify_title, find_unread_friend_hits, hall_bubble_sequence_overlap,
-    latest_incoming_bubble_rect, latest_incoming_fingerprint, secondary_hall_bubbles,
-    unread_hit_still_visible,
+    SECONDARY_TITLE_RECT, SecondaryChatIdentity, SecondaryHallBubble, classify_title,
+    hall_bubble_sequence_is_retained_prefix, hall_bubble_sequence_overlap,
+    hall_bubble_sequences_stable, latest_incoming_bubble_rect, latest_incoming_fingerprint,
+    secondary_hall_bubbles,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

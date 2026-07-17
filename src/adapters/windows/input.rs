@@ -115,6 +115,16 @@ pub(super) fn scroll_game_point(
     window.scroll(&mut enigo, point, length, Axis::Vertical)
 }
 
+pub(super) fn drag_game_point(
+    from: PointConfig,
+    to: PointConfig,
+    window_config: &config::WindowConfig,
+) -> Result<()> {
+    let mut enigo = Enigo::new(&Settings::default()).context("create enigo")?;
+    let mut window = window::GameWindow::find(window_config)?;
+    window.drag(&mut enigo, from, to)
+}
+
 pub(super) fn hold_key<F>(
     key: Key,
     duration: Duration,

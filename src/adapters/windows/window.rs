@@ -28,6 +28,9 @@ use windows::core::BOOL;
 
 use crate::config::{PointConfig, WindowConfig};
 
+const DRAG_STEPS: i32 = 8;
+const DRAG_STEP_MS: u64 = 5;
+
 #[derive(Clone, Debug)]
 pub struct TargetWindowUnavailable {
     message: String,
@@ -118,6 +121,37 @@ impl GameWindow {
             .move_mouse(screen.x, screen.y, Coordinate::Abs)
             .context("move mouse for scroll")?;
         enigo.scroll(length, axis).context("scroll mouse")
+    }
+
+    pub fn drag(&mut self, enigo: &mut Enigo, from: PointConfig, to: PointConfig) -> Result<()> {
+        self.refresh_client_area_for_click()?;
+        let from = self.screen_point(from);
+        let to = self.screen_point(to);
+        self.ensure_point_targets_window(from)?;
+        self.ensure_point_targets_window(to)?;
+        enigo
+            .move_mouse(from.x, from.y, Coordinate::Abs)
+            .context("move mouse to drag start")?;
+        enigo
+            .button(Button::Left, Direction::Press)
+            .context("press mouse for drag")?;
+
+        let drag_result = (|| -> Result<()> {
+            for step in 1..=DRAG_STEPS {
+                let x = from.x + (to.x - from.x) * step / DRAG_STEPS;
+                let y = from.y + (to.y - from.y) * step / DRAG_STEPS;
+                enigo
+                    .move_mouse(x, y, Coordinate::Abs)
+                    .context("move pressed mouse during drag")?;
+                sleep(Duration::from_millis(DRAG_STEP_MS));
+            }
+            Ok(())
+        })();
+        let release_result = enigo
+            .button(Button::Left, Direction::Release)
+            .context("release mouse after drag");
+        drag_result?;
+        release_result
     }
 
     pub fn activate(&mut self, after_activate_ms: u64) -> Result<()> {

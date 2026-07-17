@@ -685,7 +685,7 @@ invite:
 friend_delivery:
   # 好友投递中确认尚未发送项的自动重试次数；0 表示禁用
   auto_retry_count: 0
-  # 快速匹配：左侧唯一昵称点击后，只稳定确认顶部为好友会话，不再二次 OCR 匹配目标昵称
+  # 快速匹配：左侧唯一昵称点击后，只单次确认顶部为好友会话，不再二次 OCR 匹配目标昵称
   fast_match: true
 
 custom_workflows:

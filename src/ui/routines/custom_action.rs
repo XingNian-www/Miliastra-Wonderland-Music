@@ -6,10 +6,12 @@ use std::time::{Duration, Instant};
 
 use image::imageops::FilterType;
 
+use super::friend_delivery::{
+    FriendDeliveryRoutineConfig, UiResidencyTarget, before_input_failure, restore_residency,
+};
 use crate::adapters::windows::parse_key;
-use crate::config::AppConfig;
-use crate::features::custom_workflow::{
-    WorkflowOperation, WorkflowPixelStability, WorkflowPoint, WorkflowRect,
+use crate::interfaces::ui_plan::{
+    WorkflowOperation, WorkflowPixelStability, WorkflowPoint, WorkflowRect, WorkflowResidency,
 };
 use crate::runtime::ocr::{OcrPriority, OcrRuntimeHandle};
 use crate::runtime::ui::{
@@ -62,6 +64,7 @@ pub(crate) struct CustomActionUi {
     ocr: OcrRuntimeHandle,
     running: Arc<AtomicBool>,
     canvas: CustomActionCanvas,
+    residency: FriendDeliveryRoutineConfig,
 }
 
 impl CustomActionUi {
@@ -69,16 +72,19 @@ impl CustomActionUi {
         runtime: UiRuntimeHandle,
         ocr: OcrRuntimeHandle,
         running: Arc<AtomicBool>,
-        config: &AppConfig,
+        canvas_width: u32,
+        canvas_height: u32,
+        residency: FriendDeliveryRoutineConfig,
     ) -> Self {
         Self {
             runtime,
             ocr,
             running,
             canvas: CustomActionCanvas {
-                width: config.screen.expected_width,
-                height: config.screen.expected_height,
+                width: canvas_width,
+                height: canvas_height,
             },
+            residency,
         }
     }
 
@@ -91,6 +97,7 @@ impl CustomActionUi {
             ocr: self.ocr.clone(),
             running: Arc::clone(&self.running),
             canvas: self.canvas,
+            residency: self.residency.clone(),
         })
     }
 }
@@ -106,6 +113,7 @@ struct CustomActionRoutine {
     ocr: OcrRuntimeHandle,
     running: Arc<AtomicBool>,
     canvas: CustomActionCanvas,
+    residency: FriendDeliveryRoutineConfig,
 }
 
 impl sealed::UiRoutineSealed for CustomActionRoutine {}
@@ -127,6 +135,7 @@ impl UiRoutine for CustomActionRoutine {
                 &self.ocr,
                 &self.running,
                 self.canvas,
+                &self.residency,
                 operation,
                 input_performed,
             ) {
@@ -162,6 +171,7 @@ fn execute_operation(
     ocr: &OcrRuntimeHandle,
     running: &Arc<AtomicBool>,
     canvas: CustomActionCanvas,
+    residency: &FriendDeliveryRoutineConfig,
     operation: WorkflowOperation,
     input_performed: bool,
 ) -> Result<bool, UiRoutineFailure> {
@@ -211,6 +221,18 @@ fn execute_operation(
                 .device()
                 .focus(after_activate_ms)
                 .map_err(|error| input_failure("focus_custom_game", error))?;
+            Ok(true)
+        }
+        WorkflowOperation::EnsureResidency { target } => {
+            context
+                .device()
+                .ensure_ready(residency.after_activate_ms)
+                .map_err(|error| before_input_failure("prepare_custom_residency", error))?;
+            let target = match target {
+                WorkflowResidency::Primary => UiResidencyTarget::Primary,
+                WorkflowResidency::SecondaryCurrentHall => UiResidencyTarget::SecondaryCurrentHall,
+            };
+            restore_residency(context, ocr, residency, target)?;
             Ok(true)
         }
         WorkflowOperation::ClickPoint { point } => {
@@ -615,6 +637,7 @@ mod tests {
     use image::DynamicImage;
 
     use super::*;
+    use crate::config::AppConfig;
     use crate::runtime::ocr::{OcrDevice, OcrLine, OcrRuntime};
     use crate::runtime::ui::{UiDevice, UiRuntime};
 
@@ -672,7 +695,9 @@ mod tests {
             ui_runtime.handle(),
             ocr_runtime.handle(),
             Arc::new(AtomicBool::new(true)),
-            &config,
+            config.screen.expected_width,
+            config.screen.expected_height,
+            FriendDeliveryRoutineConfig::from_app(&config),
         );
 
         let action = action_ui

@@ -303,17 +303,14 @@ impl ApplicationRuntime {
         let use_secondary = scope == ChatDecisionScope::CurrentHall
             && self.active_ui_residency()? == UiResidency::SecondaryCurrentHall;
         if use_secondary {
-            self.establish_ui_residency(
-                UiResidency::SecondaryCurrentHall,
-                ResidencyPurpose::DecisionObservation("建立二级当前大厅确认基线"),
-            )?;
-            let canvas = Canvas {
-                width: self.config.screen.expected_width,
-                height: self.config.screen.expected_height,
-                resize: true,
-            };
-            let frame = load_frame(&canvas, &self.game_ui)?;
-            let previous = secondary_hall_bubbles(&frame.image)?;
+            let image = self
+                .residency_ui
+                .observe(UiResidencyTarget::SecondaryCurrentHall)
+                .context("提交二级当前大厅确认基线观察")?
+                .wait()
+                .context("等待二级当前大厅确认基线观察")?
+                .map_err(|failure| anyhow!("建立二级当前大厅确认基线失败：{failure}"))?;
+            let previous = secondary_hall_bubbles(&image)?;
             return Ok(ChatDecisionReader {
                 kind: ChatDecisionReaderKind::SecondaryCurrentHall { previous },
                 screen_lock: DecisionScreenLock::default(),
@@ -321,18 +318,15 @@ impl ApplicationRuntime {
             });
         }
 
-        self.establish_ui_residency(
-            UiResidency::Primary,
-            ResidencyPurpose::DecisionObservation("建立一级聊天确认基线"),
-        )?;
-        let template_args = TemplateArgs::default().resolve(&self.config);
-        let canvas = Canvas {
-            width: self.config.screen.expected_width,
-            height: self.config.screen.expected_height,
-            resize: true,
-        };
-        let frame = load_frame(&canvas, &self.game_ui)?;
-        let messages = self.scan_chat_with_shared_ocr(&frame.image, &template_args)?;
+        let image = self
+            .residency_ui
+            .observe(UiResidencyTarget::Primary)
+            .context("提交一级聊天确认基线观察")?
+            .wait()
+            .context("等待一级聊天确认基线观察")?
+            .map_err(|failure| anyhow!("建立一级聊天确认基线失败：{failure}"))?;
+        let template_args = self.chat_templates.clone();
+        let messages = self.scan_chat_with_shared_ocr(&image, &template_args)?;
         Ok(ChatDecisionReader {
             kind: ChatDecisionReaderKind::Primary,
             screen_lock: DecisionScreenLock::from_messages(
@@ -350,7 +344,7 @@ impl ApplicationRuntime {
     ) -> Result<Vec<ChatMessage>> {
         match &mut reader.kind {
             ChatDecisionReaderKind::Primary => {
-                let template_args = TemplateArgs::default().resolve(&self.config);
+                let template_args = self.chat_templates.clone();
                 let canvas = Canvas {
                     width: self.config.screen.expected_width,
                     height: self.config.screen.expected_height,
@@ -611,18 +605,20 @@ impl ApplicationRuntime {
             } else {
                 message_sender.as_deref().map(str::trim).unwrap_or_default()
             };
-            if !shortcut_player.is_empty() {
-                let synthetic = if message_type == "pink" {
-                    format!("[{}]：{}", shortcut_player, text.trim())
-                } else {
-                    format!("{}：{}", shortcut_player, text.trim())
-                };
-                if let Some(parsed) = command::parse_entertainment_shortcut(
-                    &synthetic,
+            if !shortcut_player.is_empty()
+                && let Some(envelope) = CommandEnvelope::new(
+                    &text,
+                    shortcut_player,
                     &message_type,
-                    self.business.active_entertainment()?,
-                ) {
-                    self.submit_secondary_command(parsed, command_observation.clone())?;
+                    text.trim(),
+                    command_observation.clone(),
+                )
+                && envelope.prefix() == CommandPrefix::Hash
+            {
+                let router = ChatCommandRouter::new(&self.custom_workflow);
+                if let Some(parsed) = router.route(&envelope, self.business.active_entertainment()?)
+                {
+                    self.submit_secondary_command(parsed)?;
                     processed = true;
                     continue;
                 }
@@ -642,27 +638,36 @@ impl ApplicationRuntime {
                 log::debug!("二级监听气泡不是命令: {}", redacted_chat_text(&text));
                 continue;
             };
-            let command_text = text[index..].trim();
-            let synthetic = if message_type == "pink" {
-                let username = if friend_name.trim().is_empty() {
+            let command_text = text[index..].trim().to_string();
+            let username = if message_type == "pink" {
+                if friend_name.trim().is_empty() {
                     "二级好友"
                 } else {
                     friend_name.trim()
-                };
-                format!("[{}]：{}", username, command_text)
+                }
             } else {
-                format!("二级大厅：{}", command_text)
+                message_sender
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|sender| !sender.is_empty())
+                    .unwrap_or("二级大厅")
             };
-            let parsed = command::parse_text(&synthetic, &message_type).or_else(|| {
-                self.custom_workflow
-                    .parse_chat(&synthetic, &message_type)
-                    .map(from_custom_workflow_match)
-            });
-            let Some(parsed) = parsed else {
+            let Some(envelope) = CommandEnvelope::new(
+                &text,
+                username,
+                &message_type,
+                command_text,
+                command_observation,
+            ) else {
+                continue;
+            };
+            let router = ChatCommandRouter::new(&self.custom_workflow);
+            let Some(parsed) = router.route(&envelope, self.business.active_entertainment()?)
+            else {
                 log::debug!("二级监听气泡未解析为命令");
                 continue;
             };
-            self.submit_secondary_command(parsed, command_observation)?;
+            self.submit_secondary_command(parsed)?;
             processed = true;
         }
         Ok(processed)

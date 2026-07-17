@@ -5,9 +5,8 @@ use anyhow::Result;
 use image::DynamicImage;
 use serde::Serialize;
 
-use crate::config::{AppConfig, RectConfig};
+use crate::config::{OcrConfig, RectConfig, TemplateConfig};
 use crate::privacy::redacted_chat_text;
-use crate::runtime::monitor::{MonitorEvent, MonitorShared, OcrSnapshot};
 use crate::runtime::ocr::{OcrImageBlock, OcrPriority, OcrRuntimeHandle, batch_recognize_blocks};
 use crate::ui::change_detection::{ChangeFingerprint, rect_chat_change_fingerprint};
 use crate::ui::geometry::{Rect, clamp_i32, crop_canvas};
@@ -43,33 +42,35 @@ pub(crate) struct ResolvedTemplateArgs {
 }
 
 impl TemplateArgs {
-    pub(crate) fn resolve(&self, config: &AppConfig) -> ResolvedTemplateArgs {
+    pub(crate) fn resolve(
+        &self,
+        templates: &TemplateConfig,
+        ocr: &OcrConfig,
+    ) -> ResolvedTemplateArgs {
         ResolvedTemplateArgs {
             blue_template: self
                 .blue_template
                 .clone()
-                .unwrap_or_else(|| config.templates.blue_marker.clone()),
+                .unwrap_or_else(|| templates.blue_marker.clone()),
             yellow_template: self
                 .yellow_template
                 .clone()
-                .unwrap_or_else(|| config.templates.yellow_marker.clone()),
+                .unwrap_or_else(|| templates.yellow_marker.clone()),
             pink_template: self
                 .pink_template
                 .clone()
-                .unwrap_or_else(|| config.templates.pink_marker.clone()),
-            marker_threshold: self
-                .marker_threshold
-                .unwrap_or(config.templates.marker_threshold),
-            marker_dedupe_x: config.ocr.marker_dedupe_x,
-            marker_dedupe_y: config.ocr.marker_dedupe_y,
-            text_left_gap: config.ocr.text_left_gap,
-            block_top_padding: config.ocr.block_top_padding,
-            block_bottom_padding: config.ocr.block_bottom_padding,
-            max_block_height: config.ocr.max_block_height,
-            next_marker_min_gap: config.ocr.next_marker_min_gap,
-            right_padding: config.ocr.right_padding,
-            same_line_y_tolerance: config.ocr.same_line_y_tolerance,
-            batch_recognize: config.ocr.batch_recognize,
+                .unwrap_or_else(|| templates.pink_marker.clone()),
+            marker_threshold: self.marker_threshold.unwrap_or(templates.marker_threshold),
+            marker_dedupe_x: ocr.marker_dedupe_x,
+            marker_dedupe_y: ocr.marker_dedupe_y,
+            text_left_gap: ocr.text_left_gap,
+            block_top_padding: ocr.block_top_padding,
+            block_bottom_padding: ocr.block_bottom_padding,
+            max_block_height: ocr.max_block_height,
+            next_marker_min_gap: ocr.next_marker_min_gap,
+            right_padding: ocr.right_padding,
+            same_line_y_tolerance: ocr.same_line_y_tolerance,
+            batch_recognize: ocr.batch_recognize,
         }
     }
 }
@@ -81,6 +82,20 @@ pub(crate) struct ChatMessage {
     pub(crate) text: String,
     #[serde(skip)]
     pub(crate) visual: ChangeFingerprint,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ChatScanTelemetry {
+    pub(crate) marker_count: usize,
+    pub(crate) lines: Vec<String>,
+    pub(crate) marker_ms: u128,
+    pub(crate) ocr_ms: u128,
+    pub(crate) total_ms: u128,
+    pub(crate) scope: &'static str,
+}
+
+pub(crate) trait ChatScanTelemetrySink {
+    fn publish_chat_scan(&self, telemetry: ChatScanTelemetry);
 }
 
 pub(crate) struct PreparedChatScan {
@@ -140,7 +155,7 @@ pub(crate) fn recognize_prepared_chat(
     priority: OcrPriority,
     templates: &ResolvedTemplateArgs,
     prepared: PreparedChatScan,
-    monitor: Option<&MonitorShared>,
+    telemetry_sink: Option<&dyn ChatScanTelemetrySink>,
 ) -> Result<Vec<ChatMessage>> {
     let mut messages = Vec::new();
     let ocr_started = Instant::now();
@@ -181,10 +196,10 @@ pub(crate) fn recognize_prepared_chat(
     }
     let ocr_ms = elapsed_ms(ocr_started);
     let total_ms = elapsed_ms(prepared.started);
-    if let Some(monitor) = monitor {
-        monitor.publish(MonitorEvent::Ocr(OcrSnapshot::new(
-            prepared.markers.len(),
-            messages
+    if let Some(sink) = telemetry_sink {
+        sink.publish_chat_scan(ChatScanTelemetry {
+            marker_count: prepared.markers.len(),
+            lines: messages
                 .iter()
                 .map(|message| {
                     format!(
@@ -194,11 +209,11 @@ pub(crate) fn recognize_prepared_chat(
                     )
                 })
                 .collect(),
-            prepared.marker_ms,
+            marker_ms: prepared.marker_ms,
             ocr_ms,
             total_ms,
-            "一级聊天",
-        )));
+            scope: "一级聊天",
+        });
     }
     log::info!(target: CHAT_SCAN_RESULT_LOG_TARGET,
         "聊天扫描结果: markers={} messages={} {}",

@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use super::matcher;
@@ -35,7 +35,7 @@ impl Default for QueueItem {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct QueueFile {
     next_id: u64,
@@ -59,34 +59,30 @@ impl PersistentQueue {
             serde_json::from_str(&text)
                 .with_context(|| format!("parse queue state {}", path.display()))?
         } else {
-            QueueFile::default()
+            QueueFile {
+                next_id: 1,
+                items: Vec::new(),
+            }
         };
-        let mut items = file.items;
-        let mut seen = HashSet::new();
-        let max_existing_id = items.iter().map(|item| item.id).max().unwrap_or(0);
-        let mut next_id = file.next_id.max(max_existing_id.saturating_add(1)).max(1);
-        let mut assigned_ids = false;
-        for item in &mut items {
-            if item.id == 0 || !seen.insert(item.id) {
-                while next_id == 0 || seen.contains(&next_id) {
-                    next_id = next_id.wrapping_add(1).max(1);
-                }
-                item.id = next_id;
-                seen.insert(item.id);
-                next_id = next_id.wrapping_add(1).max(1);
-                assigned_ids = true;
+        if file_exists && file.items.iter().any(|item| item.id == 0) {
+            bail!("播放队列当前格式要求每个 items[].id 大于 0");
+        }
+        if file_exists {
+            let mut persisted_ids = HashSet::new();
+            if file.items.iter().any(|item| !persisted_ids.insert(item.id)) {
+                bail!("播放队列当前格式不允许重复的 items[].id");
+            }
+            let max_item_id = file.items.iter().map(|item| item.id).max().unwrap_or(0);
+            if file.next_id == 0 || file.next_id <= max_item_id {
+                bail!("播放队列当前格式要求 nextId 大于所有 items[].id");
             }
         }
-        let queue = Self {
+        Ok(Self {
             path,
             max_size,
-            next_id,
-            items,
-        };
-        if file_exists && assigned_ids {
-            queue.save()?;
-        }
-        Ok(queue)
+            next_id: file.next_id,
+            items: file.items,
+        })
     }
 
     pub fn items(&self) -> &[QueueItem] {
@@ -183,10 +179,6 @@ impl PersistentQueue {
         Ok(count)
     }
 
-    pub fn save(&self) -> Result<()> {
-        self.save_state(&self.items, self.next_id)
-    }
-
     fn save_state(&self, items: &[QueueItem], next_id: u64) -> Result<()> {
         ensure_parent(&self.path)?;
         let text = serde_json::to_string_pretty(&QueueFile {
@@ -271,6 +263,86 @@ mod tests {
         let error = PersistentQueue::load(path.clone(), 5).expect_err("legacy array rejected");
         assert!(error.to_string().contains("parse queue state"));
 
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_rejects_current_queue_files_without_stable_item_ids() {
+        let path = temp_queue_path("missing-stable-id");
+        let _ = fs::remove_file(&path);
+        fs::write(
+            &path,
+            r#"{
+                "nextId": 1,
+                "items": [{
+                    "id": 0,
+                    "keyword": "song",
+                    "source": "qqmusic",
+                    "preferAccompaniment": false,
+                    "aiOriginalText": "",
+                    "uri": "",
+                    "friendUsername": "",
+                    "dedupBypass": false
+                }]
+            }"#,
+        )
+        .unwrap();
+
+        let error = PersistentQueue::load(path.clone(), 5)
+            .expect_err("current queue items must already have stable ids");
+
+        assert!(error.to_string().contains("id"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_rejects_duplicate_current_queue_item_ids() {
+        let path = temp_queue_path("duplicate-stable-id");
+        let _ = fs::remove_file(&path);
+        let item = |keyword: &str| QueueItem {
+            id: 1,
+            keyword: keyword.to_string(),
+            ..QueueItem::default()
+        };
+        fs::write(
+            &path,
+            serde_json::to_string(&QueueFile {
+                next_id: 2,
+                items: vec![item("first"), item("second")],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let error = PersistentQueue::load(path.clone(), 5)
+            .expect_err("current queue item ids must be unique");
+
+        assert!(error.to_string().contains("重复"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_rejects_current_queue_files_with_a_stale_next_id() {
+        let path = temp_queue_path("stale-next-id");
+        let _ = fs::remove_file(&path);
+        fs::write(
+            &path,
+            serde_json::to_string(&QueueFile {
+                next_id: 3,
+                items: vec![QueueItem {
+                    id: 3,
+                    keyword: "song".to_string(),
+                    ..QueueItem::default()
+                }],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let error = PersistentQueue::load(path.clone(), 5)
+            .expect_err("nextId must be greater than every persisted item id");
+
+        assert!(error.to_string().contains("nextId"));
         let _ = fs::remove_file(path);
     }
 

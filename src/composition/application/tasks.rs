@@ -26,66 +26,6 @@ impl ApplicationRuntime {
         self.business.clear_idle_exit().map_err(anyhow::Error::from)
     }
 
-    pub(super) fn run_pending_command_loop(&mut self) -> Result<()> {
-        while self.running.load(AtomicOrdering::SeqCst) {
-            if self.paused.load(AtomicOrdering::SeqCst) {
-                sleep(Duration::from_millis(self.config.timing.loop_idle_ms));
-                continue;
-            }
-            let Some(task) = self.business.take_next_formal_task()? else {
-                sleep(Duration::from_millis(
-                    self.config.timing.loop_idle_ms.max(20),
-                ));
-                continue;
-            };
-            if self.paused.load(AtomicOrdering::SeqCst) {
-                self.business.restore_formal_task(task)?;
-                sleep(Duration::from_millis(self.config.timing.loop_idle_ms));
-                continue;
-            }
-            let task_id = task.task_id();
-            let task_label = task.label().to_string();
-            log::info!("待处理任务开始: {}", task_label);
-            let result = match catch_unwind(AssertUnwindSafe(|| task.execute())) {
-                Ok(result) => result,
-                Err(_) => Err(anyhow!("待处理任务执行发生未捕获异常")),
-            };
-            match result {
-                Ok(result) => {
-                    self.business
-                        .complete_formal_task(task_id, FormalTaskCompletion::Succeeded(result))?;
-                    log::info!("待处理任务完成: {}", task_label);
-                    sleep(Duration::from_millis(
-                        self.config.timing.command.post_settle_ms,
-                    ));
-                }
-                Err(error) => {
-                    self.business.complete_formal_task(
-                        task_id,
-                        FormalTaskCompletion::Failed(format!("错误: {error:#}")),
-                    )?;
-                    log::error!("待处理任务执行异常: {error:#}");
-                }
-            }
-        }
-        Ok(())
-    }
-
-    pub(super) fn deferred_chat_target_is_active(
-        &self,
-        target: DeferredChatTarget,
-    ) -> Result<bool> {
-        Ok(matches!(
-            (target, self.active_ui_residency()?),
-            (DeferredChatTarget::Primary, UiResidency::Primary)
-                | (
-                    DeferredChatTarget::SecondaryCurrentHall,
-                    UiResidency::SecondaryCurrentHall
-                )
-                | (DeferredChatTarget::CurrentHall, _)
-        ))
-    }
-
     pub(super) fn execute_pending_task(
         &mut self,
         task: PendingTask,
@@ -138,17 +78,17 @@ impl ApplicationRuntime {
     }
 
     pub(super) fn execute_pending_command(&mut self, pending: PendingCommand) -> Result<()> {
-        let command_log = private_safe_command_log(&pending.parsed);
+        let command_log = private_safe_command_log(&pending.routed);
         log::info!(
             "执行待处理命令: {} lock={}",
             command_log,
-            if is_private_undercover_input(&pending.parsed) {
+            if is_private_undercover_input(&pending.routed) {
                 "[hidden]"
             } else {
                 pending.lock_key.as_str()
             }
         );
-        let _console_reply_context = if pending.parsed.message_type == "控制台" {
+        let _console_reply_context = if pending.routed.message_type == "控制台" {
             Some(ConsoleReplyContextGuard::new(Arc::clone(
                 &self.console_reply_context,
             )))
@@ -156,7 +96,7 @@ impl ApplicationRuntime {
             None
         };
         let command_started = Instant::now();
-        match self.execute_command(&pending.parsed) {
+        match self.execute_command(&pending.routed) {
             Ok(()) => {
                 let command_ms = elapsed_ms(command_started);
                 log::info!("命令执行完成: {}", command_log);
@@ -182,39 +122,35 @@ impl ApplicationRuntime {
 
     pub(super) fn log_executed_command(
         &self,
-        parsed: &ParsedCommand,
+        parsed: &RoutedCommand,
         final_command: &str,
     ) -> Result<()> {
-        self.monitor.publish(MonitorEvent::Command(format!(
-            "{} -> {}",
-            parsed.user_command, final_command
-        )));
-        let path = &self.config.state.executed_commands_log_path;
-        if let Some(parent) = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("create command log directory {}", parent.display()))?;
-        }
-        let line = format!(
-            "{}-{}-{}-{}-{}\n",
-            command_log_timestamp(),
-            command_log_field(command_location(&parsed.message_type)),
-            command_log_field(command_username(parsed)),
-            command_log_field(&parsed.user_command),
-            command_log_field(final_command),
-        );
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .with_context(|| format!("open command log {}", path.display()))?;
-        file.write_all(line.as_bytes())
-            .with_context(|| format!("write command log {}", path.display()))
+        self.log_executed_command_fields(
+            &parsed.message_type,
+            command_username(parsed),
+            &parsed.user_command,
+            final_command,
+        )
     }
 
-    pub(super) fn pending_contains_command(&self, parsed: &ParsedCommand) -> Result<bool> {
+    pub(super) fn log_executed_command_fields(
+        &self,
+        message_type: &str,
+        username: &str,
+        user_command: &str,
+        final_command: &str,
+    ) -> Result<()> {
+        write_executed_command_fields(
+            &self.monitor,
+            &self.config.state.executed_commands_log_path,
+            message_type,
+            username,
+            user_command,
+            final_command,
+        )
+    }
+
+    pub(super) fn pending_contains_command(&self, parsed: &RoutedCommand) -> Result<bool> {
         self.business
             .formal_task_contains_dedup_key(crate::runtime::scheduler::FormalTaskDedupKey::new(
                 command::lock_key(parsed),
@@ -291,4 +227,40 @@ impl ApplicationRuntime {
             }
         }
     }
+}
+
+pub(super) fn write_executed_command_fields(
+    monitor: &MonitorShared,
+    path: &std::path::Path,
+    message_type: &str,
+    username: &str,
+    user_command: &str,
+    final_command: &str,
+) -> Result<()> {
+    monitor.publish(MonitorEvent::Command(format!(
+        "{} -> {}",
+        user_command, final_command
+    )));
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create command log directory {}", parent.display()))?;
+    }
+    let line = format!(
+        "{}-{}-{}-{}-{}\n",
+        command_log_timestamp(),
+        command_log_field(command_location(message_type)),
+        command_log_field(username),
+        command_log_field(user_command),
+        command_log_field(final_command),
+    );
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("open command log {}", path.display()))?;
+    file.write_all(line.as_bytes())
+        .with_context(|| format!("write command log {}", path.display()))
 }

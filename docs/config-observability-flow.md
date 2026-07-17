@@ -4,7 +4,7 @@
 
 ## 核心结论
 
-配置只接受当前 `AppConfig` 结构。程序不会迁移、改写或备份旧配置；文件不存在、必填字段缺失、字段未知或类型不匹配时，启动会直接失败。显式标记为可选的配置段和带默认值的字段仍可省略。
+配置只接受当前 `AppConfig` 结构。程序不会迁移、改写或备份旧配置；文件不存在、当前模板中的区块或字段缺失、字段未知或类型不匹配时，启动会直接失败。只有类型本身明确为 `Option` 的工作流步骤参数可以省略。
 
 日志分成三类：
 
@@ -33,7 +33,8 @@ flowchart TD
 
 | 文件 | 职责 |
 | --- | --- |
-| `src/config/mod.rs` | 当前配置结构、配置加载和启动校验。 |
+| `src/config/mod.rs` | 根配置组合、配置加载和跨模块启动校验。 |
+| `src/features/*` | 各纵向模块自己的配置结构和模块校验；业务测试仍可使用模块 `Default`，配置反序列化不会隐式调用它。 |
 | `src/adapters/logging.rs` | 主日志、性能日志、监控日志分流。 |
 | `src/runtime/monitor.rs` | TUI/Web 共用的内存监控快照。 |
 | `src/interfaces/tui.rs` | 本地终端监控界面。 |
@@ -50,18 +51,17 @@ flowchart TD
 4. 如果 `tui.enabled = true` 且 stdout 是交互终端，启动 TUI。
 5. 初始化 logger，并把 `monitor.log_sink()` 传进去。
 6. 写启动日志：主日志路径、性能日志路径、配置路径、HTTP 面板、FeelUOwn 地址。
-7. 加载 `PersistentRuntimeState`。
-8. 启动时清理上次运行的大厅倒计时缓存。
-9. 加载 `PersistentQueue`。
-10. 加载 `PersistentSongDedupHistory`。
-11. 创建默认空闲的娱乐协调器和各纵向业务服务；牌局、谁是卧底和海龟汤状态随后交给业务运行时线程拥有，题库直到实际开局才读取。
-12. 创建 `ApplicationRuntime` 并进入主运行逻辑。
+7. 在启动任何运行时线程前构造 OCR 设备，并加载成语词库、`PersistentPlaybackState`、`PersistentHallState`、`PersistentQueue` 和 `PersistentSongDedupHistory`。
+8. 解析各纵向模块的不可变配置，创建尚未依赖运行时句柄的应用服务。
+9. 按依赖顺序启动计时、OCR、播放器、UI、OpenAI 和业务运行时。
+10. 组装点歌、牌局、卧底、管理和自定义工作流的窄能力端口。
+11. 创建 `ApplicationRuntime` 并进入主运行逻辑；HTTP 和热键只在运行阶段启动。
 
 如果 TUI 启动失败或当前不是交互终端，程序会回退到普通 stderr 日志输出。
 
 ## 配置加载和校验
 
-`AppConfig::load()` 只读取指定路径并反序列化当前结构。配置结构使用 `deny_unknown_fields`，因此旧字段和未来字段都会明确报错；各模块的必填字段缺失或类型错误也会在解析阶段报错，显式默认字段按当前代码的内置默认值处理。解析成功后由 `AppConfig::validate()` 检查跨模块约束，任何错误都会在启动线程、监听端口或操作游戏窗口前返回。
+`AppConfig::load()` 只读取指定路径并反序列化当前结构。根配置组合共享基础配置和各 feature 自己定义的模块配置；结构统一使用 `deny_unknown_fields`。解析成功后，`AppConfig::validate()` 调用模块校验并检查跨模块约束；OCR 设备和必需持久文件也会在首个运行时线程启动前完成构造或加载。
 
 ## 日志分流
 

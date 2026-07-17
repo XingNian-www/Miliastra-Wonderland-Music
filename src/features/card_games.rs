@@ -1,10 +1,13 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::features::chat_text::{command_identity, compact_command};
+use crate::features::command::{
+    CommandAuthority, CommandEnvelope, CommandPrefix, FeatureCommandMatch,
+};
 #[cfg(test)]
 use crate::features::friend_delivery::{
     FriendBatchFailure, FriendBatchFailureKind, FriendBatchOutcome, FriendMessage,
@@ -16,12 +19,15 @@ mod service;
 #[cfg(test)]
 use service::CardGameStartGate;
 pub use service::{
-    CardGameCancel, CardGameCommandStart, CardGameEffect, CardGameEffectClaim, CardGameEffectKey,
-    CardGameEffectLane, CardGameEffectRequest, CardGameEffectResult, CardGameResume,
-    CardGameTimedOutcome,
+    CardGameApplication, CardGameCancel, CardGameCommandStart, CardGameEffectClaim,
+    CardGameEffectKey, CardGameEffectLane, CardGameEffectResult, CardGameEffectTask,
+    CardGameResume, CardGameRuntimePort, CardGameTimedOutcome,
 };
 #[cfg(test)]
-pub(crate) use service::{CardGameCompletion, CardGameLateResult, CardGameStartReservation};
+pub(crate) use service::{
+    CardGameCompletion, CardGameEffect, CardGameEffectRequest, CardGameLateResult,
+    CardGameStartReservation,
+};
 pub use service::{CardGameDeliveryPort, CardGameService};
 
 #[derive(Debug)]
@@ -45,7 +51,7 @@ impl DeadlineKind for CardGameDeadlineKind {
 pub type CardGameDeadlineToken = DeadlineToken<CardGameDeadlineKind>;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 pub struct LandlordConfig {
     pub enabled: bool,
     pub lobby_timeout_seconds: u64,
@@ -66,6 +72,19 @@ impl Default for LandlordConfig {
     }
 }
 
+impl LandlordConfig {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.enabled
+            && (self.lobby_timeout_seconds == 0
+                || self.turn_timeout_seconds == 0
+                || self.trustee_after_timeouts == 0)
+        {
+            bail!("牌局大厅、回合超时和托管触发次数必须大于 0");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum LandlordCommand {
     Start,
@@ -82,6 +101,50 @@ pub enum LandlordCommand {
 }
 
 impl LandlordCommand {
+    pub(crate) fn claims_start_chat(envelope: &CommandEnvelope) -> bool {
+        envelope.prefix() == CommandPrefix::Hash
+            && envelope.authority() == CommandAuthority::HallMember
+            && matches!(
+                compact_command(envelope.command_text()).as_str(),
+                "斗地主" | "跑得快"
+            )
+    }
+
+    pub(crate) fn claims_active_chat(envelope: &CommandEnvelope) -> bool {
+        envelope.prefix() == CommandPrefix::Hash
+            && match envelope.authority() {
+                CommandAuthority::HallMember => true,
+                CommandAuthority::Friend => compact_command(envelope.command_text()) == "手牌",
+            }
+    }
+
+    pub(crate) fn parse_start_chat(
+        envelope: &CommandEnvelope,
+    ) -> Option<FeatureCommandMatch<Self>> {
+        if !Self::claims_start_chat(envelope) {
+            return None;
+        }
+        Self::parse_start(envelope.command_text())
+            .map(|command| FeatureCommandMatch::new("#", envelope.command_text(), command))
+    }
+
+    pub(crate) fn parse_active_chat(
+        envelope: &CommandEnvelope,
+    ) -> Option<FeatureCommandMatch<Self>> {
+        if !Self::claims_active_chat(envelope) {
+            return None;
+        }
+        let command = match envelope.authority() {
+            CommandAuthority::HallMember => Self::parse_hall(envelope.command_text())?,
+            CommandAuthority::Friend => Self::parse_friend(envelope.command_text())?,
+        };
+        Some(FeatureCommandMatch::new(
+            "#",
+            envelope.command_text(),
+            command,
+        ))
+    }
+
     pub(crate) fn parse_start(payload: &str) -> Option<Self> {
         match compact_command(payload).as_str() {
             "斗地主" => Some(Self::Start),
@@ -2158,6 +2221,7 @@ mod tests {
     use super::*;
     use crate::features::chat_text::{MAX_CHAT_WIDTH, display_width};
     use crate::features::entertainment::{AcquireOutcome, EntertainmentKind, EntertainmentState};
+    use crate::runtime::clock::{Clock, ManualClock};
 
     struct TestCardGameService {
         inner: CardGameService,
@@ -2571,7 +2635,7 @@ mod tests {
     }
 
     #[test]
-    fn formal_compatibility_driver_rejects_a_cancelled_queued_effect() {
+    fn formal_effect_driver_rejects_a_cancelled_queued_effect() {
         let mut service = TestCardGameService::new(LandlordConfig::default());
         let request = suspended(
             service
@@ -4830,7 +4894,8 @@ mod tests {
 
     #[test]
     fn clock_pauses_while_ui_is_busy_and_times_out_when_active() {
-        let now = Instant::now();
+        let clock = ManualClock::new(Instant::now());
+        let now = clock.now();
         let config = LandlordConfig {
             turn_timeout_seconds: 90,
             ..LandlordConfig::default()
@@ -4840,17 +4905,21 @@ mod tests {
         game.join("乙", now);
         game.join("丙", now);
         finish_bidding_with_all_players_robbing(&mut game, now);
-        assert!(game.tick(now + Duration::from_secs(100), false).is_none());
+        clock.advance(Duration::from_secs(100)).unwrap();
+        assert!(game.tick(clock.now(), false).is_none());
+        clock.advance(Duration::from_secs(89)).unwrap();
         assert!(
-            game.tick(now + Duration::from_secs(189), true)
+            game.tick(clock.now(), true)
                 .is_some_and(|item| item.action == "turn-warning")
         );
-        assert!(game.tick(now + Duration::from_secs(190), true).is_some());
+        clock.advance(Duration::from_secs(1)).unwrap();
+        assert!(game.tick(clock.now(), true).is_some());
     }
 
     #[test]
     fn deadline_projection_uses_active_time_and_stops_while_paused() {
-        let now = Instant::now();
+        let clock = ManualClock::new(Instant::now());
+        let now = clock.now();
         let config = LandlordConfig {
             lobby_timeout_seconds: 10,
             ..LandlordConfig::default()
@@ -4858,24 +4927,24 @@ mod tests {
         let mut game = LandlordGame::with_seed(config, 19);
         game.create("甲", now);
 
-        game.sync_clock(now + Duration::from_secs(3), true);
+        clock.advance(Duration::from_secs(3)).unwrap();
+        game.sync_clock(clock.now(), true);
         assert_eq!(
-            game.next_deadline(now + Duration::from_secs(3), true),
+            game.next_deadline(clock.now(), true),
             Some((
                 CardGameDeadlineKind::LobbyExpiry,
                 now + Duration::from_secs(10)
             ))
         );
 
-        game.sync_clock(now + Duration::from_secs(100), false);
-        assert_eq!(
-            game.next_deadline(now + Duration::from_secs(100), false),
-            None
-        );
+        clock.advance(Duration::from_secs(97)).unwrap();
+        game.sync_clock(clock.now(), false);
+        assert_eq!(game.next_deadline(clock.now(), false), None);
 
-        game.sync_clock(now + Duration::from_secs(105), true);
+        clock.advance(Duration::from_secs(5)).unwrap();
+        game.sync_clock(clock.now(), true);
         assert_eq!(
-            game.next_deadline(now + Duration::from_secs(105), true),
+            game.next_deadline(clock.now(), true),
             Some((
                 CardGameDeadlineKind::LobbyExpiry,
                 now + Duration::from_secs(107)

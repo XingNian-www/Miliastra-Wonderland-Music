@@ -514,6 +514,10 @@ impl FriendDeliveryRoutineConfig {
             self.poll_ms,
         )
     }
+
+    pub(super) fn timeout_ms(&self) -> u64 {
+        self.timeout_ms
+    }
 }
 
 struct SendFriendDeliveriesRoutine {

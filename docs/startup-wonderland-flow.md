@@ -77,7 +77,7 @@ flowchart TD
 `EnterWonderland` UI 事务独占完成以下机械事务：
 
 1. 确认窗口存在并聚焦。
-2. 在同一事务内归一化到一级界面。
+2. 在 `startup.main_ui_region` 连续稳定确认 `startup.templates.paimon_menu`，确保当前是主游戏大厅；这里不使用聊天界面的好友/返回模板。
 3. 按 `F6` 打开千星主页。
 4. 在 `startup.wonderland_close_region` 连续稳定确认 `startup.templates.wonderland_close`。
 5. 点击 `startup.wonderland_card_point`。

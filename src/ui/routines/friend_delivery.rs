@@ -1054,12 +1054,17 @@ fn conversation_confirmation_key(
 ) -> std::result::Result<Option<String>, UiRoutineFailure> {
     if config.fast_match {
         let title = merged_text(ocr, image, SECONDARY_TITLE_RECT)?;
+        let normalized_title = normalize_lock_text(&title);
         return Ok(match classify_title(&title) {
+            SecondaryChatIdentity::CurrentHall | SecondaryChatIdentity::PublicChannel => None,
             SecondaryChatIdentity::Friend(title) => {
                 let title = normalize_lock_text(&title);
                 (!title.is_empty()).then_some(title)
             }
-            _ => None,
+            SecondaryChatIdentity::StrangerMessages => {
+                (!normalized_title.is_empty()).then_some(normalized_title)
+            }
+            SecondaryChatIdentity::Unknown => None,
         });
     }
     Ok(

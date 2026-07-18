@@ -87,31 +87,12 @@ pub(crate) fn batch_recognize_blocks<Id: Clone>(
 
     let mut block_lines: Vec<Vec<OcrLine>> = vec![Vec::new(); blocks.len()];
     for mut line in lines {
-        let mut owner = None;
-        for (i, &offset) in y_offsets.iter().enumerate() {
-            let block_h = crops[i].height() as i32;
-            let block_w = crops[i].width() as i32;
-            let top = line.bbox.y;
-            let bottom = line.bbox.bottom();
-            let left = line.bbox.x;
-            let right = line.bbox.right();
-            if top >= offset as i32
-                && bottom <= offset as i32 + block_h
-                && left >= 0
-                && right <= block_w
-                && owner.replace(i).is_some()
-            {
-                return Err(anyhow!("OCR 识别框同时归属于多个标识图块"));
-            }
-        }
-        let Some(owner) = owner else {
-            return Err(anyhow!(
-                "OCR 识别框无法唯一归属标识图块: {},{},{},{}",
-                line.bbox.x,
-                line.bbox.y,
-                line.bbox.width,
-                line.bbox.height
-            ));
+        // PaddleOCR expands detection boxes (especially with unclip_ratio=2.0),
+        // so a valid line can cross a block edge or the gray separator.  The
+        // center is stable enough to assign it without rejecting the message.
+        let Some(owner) = center_owner(line.bbox, &y_offsets, &crops)? else {
+            // A center in the separator is stitching noise, not a message.
+            continue;
         };
         line.bbox.y -= y_offsets[owner] as i32;
         block_lines[owner].push(line);
@@ -125,6 +106,25 @@ pub(crate) fn batch_recognize_blocks<Id: Clone>(
             text: merge_ocr_lines(lines, same_line_y_tolerance),
         })
         .collect())
+}
+
+fn center_owner(bbox: Rect, y_offsets: &[u32], crops: &[DynamicImage]) -> Result<Option<usize>> {
+    let center_x = bbox.x + bbox.width as i32 / 2;
+    let center_y = bbox.y + bbox.height as i32 / 2;
+    let mut owner = None;
+    for (i, &offset) in y_offsets.iter().enumerate() {
+        let block_h = crops[i].height() as i32;
+        let block_w = crops[i].width() as i32;
+        if center_y >= offset as i32
+            && center_y < offset as i32 + block_h
+            && center_x >= 0
+            && center_x < block_w
+            && owner.replace(i).is_some()
+        {
+            return Err(anyhow!("OCR 识别框同时归属于多个标识图块"));
+        }
+    }
+    Ok(owner)
 }
 
 #[cfg(test)]
@@ -188,35 +188,76 @@ mod tests {
             Ok(vec![OcrLine {
                 text: "跨界".to_string(),
                 confidence: 1.0,
-                bbox: Rect::new(0, 4, 5, 15),
+                bbox: Rect::new(0, 37, 104, 27),
             }])
         }
     }
 
     #[test]
-    fn combined_ocr_rejects_a_line_without_one_unambiguous_block() {
+    fn combined_ocr_assigns_a_border_crossing_line_by_center() {
         let runtime = OcrRuntime::start(CrossingBlockDevice, 1).unwrap();
         let blocks = vec![
             OcrImageBlock {
                 id: 1,
-                rect: Rect::new(0, 0, 10, 5),
+                rect: Rect::new(0, 0, 110, 55),
             },
             OcrImageBlock {
                 id: 2,
-                rect: Rect::new(0, 10, 10, 5),
+                rect: Rect::new(0, 60, 110, 10),
             },
         ];
 
-        let error = batch_recognize_blocks(
+        let results = batch_recognize_blocks(
             &runtime.handle(),
-            &DynamicImage::new_rgba8(20, 20),
+            &DynamicImage::new_rgba8(120, 100),
             &blocks,
             2,
             OcrPriority::ChatObservation,
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(error.to_string().contains("无法唯一归属标识图块"));
+        assert_eq!(results[0].text, "跨界");
+        assert_eq!(results[1].text, "");
+        runtime.shutdown().unwrap();
+    }
+
+    struct SeparatorNoiseDevice;
+
+    impl OcrDevice for SeparatorNoiseDevice {
+        fn recognize_lines(&mut self, _image: &DynamicImage) -> Result<Vec<OcrLine>> {
+            Ok(vec![OcrLine {
+                text: "间隔噪声".to_string(),
+                confidence: 1.0,
+                bbox: Rect::new(0, 56, 104, 10),
+            }])
+        }
+    }
+
+    #[test]
+    fn combined_ocr_ignores_lines_centered_in_the_separator() {
+        let runtime = OcrRuntime::start(SeparatorNoiseDevice, 1).unwrap();
+        let blocks = vec![
+            OcrImageBlock {
+                id: 1,
+                rect: Rect::new(0, 0, 110, 55),
+            },
+            OcrImageBlock {
+                id: 2,
+                rect: Rect::new(0, 60, 110, 10),
+            },
+        ];
+
+        let results = batch_recognize_blocks(
+            &runtime.handle(),
+            &DynamicImage::new_rgba8(120, 100),
+            &blocks,
+            2,
+            OcrPriority::ChatObservation,
+        )
+        .unwrap();
+
+        assert_eq!(results[0].text, "");
+        assert_eq!(results[1].text, "");
         runtime.shutdown().unwrap();
     }
 

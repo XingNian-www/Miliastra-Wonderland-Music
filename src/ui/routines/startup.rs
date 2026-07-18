@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use super::friend_delivery::{
     FriendDeliveryRoutineConfig, UiResidencyOutcome, UiResidencyTarget, before_input_failure,
-    capture_normalized, restore_residency, sleep_ms,
+    capture_normalized, sleep_ms,
 };
 use super::state_observation::wait_for_stable_ui_kind;
 use crate::adapters::windows::resolve_game_executable;
@@ -109,7 +109,6 @@ impl StartupUi {
     ) -> Result<UiOperation<EnterWonderlandOutcome>, UiSubmitError> {
         self.runtime.submit(EnterWonderlandRoutine {
             request,
-            ocr: self.ocr.clone(),
             config: self.config.clone(),
         })
     }
@@ -200,7 +199,6 @@ impl UiRoutine for EnterGameRoutine {
 
 struct EnterWonderlandRoutine {
     request: EnterWonderland,
-    ocr: OcrRuntimeHandle,
     config: StartupRoutineConfig,
 }
 
@@ -212,11 +210,10 @@ impl UiRoutine for EnterWonderlandRoutine {
     fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
         let _ = self.request;
         let mut goal_attempted = false;
-        let effect =
-            match execute_enter_wonderland(context, &self.ocr, &self.config, &mut goal_attempted) {
-                Ok(()) => EnterWonderlandEffect::Entered,
-                Err(failure) => EnterWonderlandEffect::Failed(failure),
-            };
+        let effect = match execute_enter_wonderland(context, &self.config, &mut goal_attempted) {
+            Ok(()) => EnterWonderlandEffect::Entered,
+            Err(failure) => EnterWonderlandEffect::Failed(failure),
+        };
         let residency = wait_for_primary(
             context,
             &self.config,
@@ -345,7 +342,6 @@ fn ensure_game_window(
 
 fn execute_enter_wonderland(
     context: &mut UiRoutineContext<'_>,
-    ocr: &OcrRuntimeHandle,
     config: &StartupRoutineConfig,
     goal_attempted: &mut bool,
 ) -> Result<(), UiRoutineFailure> {
@@ -357,7 +353,7 @@ fn execute_enter_wonderland(
         .device()
         .focus(config.residency.after_activate_ms)
         .map_err(|error| before_input_failure("focus_wonderland_window", error))?;
-    restore_residency(context, ocr, &config.residency, UiResidencyTarget::Primary)?;
+    wait_for_paimon_menu(context, config)?;
 
     let home_attempts = capped_attempts(
         config.startup.wonderland_home_retries,
@@ -429,6 +425,41 @@ fn execute_enter_wonderland(
         InputCertainty::ConfirmedFailure,
         "locate_wonderland_confirmation",
         "wonderland confirmation template was not found",
+    ))
+}
+
+fn wait_for_paimon_menu(
+    context: &mut UiRoutineContext<'_>,
+    config: &StartupRoutineConfig,
+) -> Result<(), UiRoutineFailure> {
+    let deadline = Instant::now() + Duration::from_millis(config.residency.timeout_ms());
+    let mut streak = 0_u32;
+    while Instant::now() < deadline {
+        let image = capture_normalized(
+            context,
+            &config.residency,
+            "observe_wonderland_primary",
+            InputCertainty::ConfirmedFailure,
+        )?;
+        if template_visible(
+            &image,
+            config.startup.main_ui_region,
+            &config.startup.templates.paimon_menu,
+            config.startup.template_threshold,
+        )? {
+            streak = streak.saturating_add(1);
+            if streak >= TEMPLATE_STABLE_HITS {
+                return Ok(());
+            }
+        } else {
+            streak = 0;
+        }
+        sleep_ms(config.startup.poll_ms);
+    }
+    Err(UiRoutineFailure::new(
+        InputCertainty::ConfirmedFailure,
+        "observe_wonderland_primary",
+        "paimon menu template did not become stable before timeout",
     ))
 }
 
@@ -698,7 +729,124 @@ fn capped_attempts(configured_retries: u32, timeout_ms: u64, interval_ms: u64) -
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+
+    use crate::config::AppConfig;
+    use crate::runtime::ui::{UiDevice, UiRuntime};
+    use anyhow::Result;
+    use image::{DynamicImage, GenericImage};
+
     use super::*;
+
+    struct PaimonOnlyDevice {
+        frame: DynamicImage,
+        keys: Arc<Mutex<Vec<Key>>>,
+    }
+
+    impl UiDevice for PaimonOnlyDevice {
+        fn capture(&mut self) -> Result<DynamicImage> {
+            Ok(self.frame.clone())
+        }
+
+        fn press_key(&mut self, key: Key) -> Result<()> {
+            self.keys.lock().unwrap().push(key);
+            Ok(())
+        }
+
+        fn ensure_window(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn focus(&mut self, _after_activate_ms: u64) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn test_startup_config(app: &AppConfig) -> StartupRoutineConfig {
+        let startup = &app.startup;
+        StartupRoutineConfig::resolve(
+            StartupUiConfig {
+                launch_game: startup.launch_game,
+                enter_game: startup.enter_game,
+                exe_path: startup.exe_path.clone(),
+                game_args: startup.game_args.clone(),
+                launch_wait_ms: startup.launch_wait_ms,
+                launch_retries: startup.launch_retries,
+                enter_game_timeout_ms: startup.enter_game_timeout_ms,
+                enter_wonderland_timeout_ms: startup.enter_wonderland_timeout_ms,
+                wonderland_home_retries: startup.wonderland_home_retries,
+                wonderland_home_retry_ms: startup.wonderland_home_retry_ms,
+                wonderland_card_retries: startup.wonderland_card_retries,
+                wonderland_card_retry_ms: startup.wonderland_card_retry_ms,
+                wonderland_confirm_absent_timeout_ms: startup.wonderland_confirm_absent_timeout_ms,
+                wonderland_confirm_stable_timeout_ms: startup.wonderland_confirm_stable_timeout_ms,
+                final_primary_timeout_ms: startup.final_primary_timeout_ms,
+                poll_ms: 1,
+                stable_mean_threshold: startup.stable_mean_threshold,
+                stable_changed_ratio_threshold: startup.stable_changed_ratio_threshold,
+                template_threshold: startup.template_threshold,
+                wonderland_enter_button_threshold: startup.wonderland_enter_button_threshold,
+                templates: StartupUiTemplates {
+                    wonderland_enter_button: startup.templates.wonderland_enter_button.clone(),
+                    paimon_menu: startup.templates.paimon_menu.clone(),
+                    wonderland_close: startup.templates.wonderland_close.clone(),
+                },
+                enter_game_text_region: startup.enter_game_text_region.into(),
+                wonderland_enter_button_region: startup.wonderland_enter_button_region.into(),
+                main_ui_region: startup.main_ui_region.into(),
+                wonderland_close_region: startup.wonderland_close_region.into(),
+                wonderland_card_point: Point::new(
+                    startup.wonderland_card_point.x,
+                    startup.wonderland_card_point.y,
+                ),
+            },
+            FriendDeliveryRoutineConfig::from_app(app),
+            app.window.target_process.clone(),
+        )
+    }
+
+    #[test]
+    fn enter_wonderland_accepts_a_paimon_only_primary_screen() {
+        let app = AppConfig::load(Path::new("config.yaml")).unwrap();
+        let mut config = test_startup_config(&app);
+        config.startup.enter_wonderland_timeout_ms = 1;
+        config.startup.wonderland_home_retries = 1;
+        config.startup.wonderland_home_retry_ms = 1;
+
+        let mut frame = DynamicImage::new_rgba8(1920, 1080);
+        let paimon = image::open(&config.startup.templates.paimon_menu).unwrap();
+        frame
+            .copy_from(&paimon, 0, 0)
+            .expect("paimon template should fit in the primary region");
+
+        let keys = Arc::new(Mutex::new(Vec::new()));
+        let ui_runtime = UiRuntime::start(
+            PaimonOnlyDevice {
+                frame,
+                keys: keys.clone(),
+            },
+            4,
+        )
+        .unwrap();
+        config.startup.final_primary_timeout_ms = 1;
+        let outcome = ui_runtime
+            .handle()
+            .submit(EnterWonderlandRoutine {
+                request: EnterWonderland,
+                config,
+            })
+            .unwrap()
+            .wait()
+            .unwrap();
+
+        let EnterWonderlandEffect::Failed(failure) = outcome.effect() else {
+            panic!("the fixture intentionally has no wonderland home template");
+        };
+        assert_eq!(failure.stage(), "open_wonderland_home");
+        assert_eq!(keys.lock().unwrap().as_slice(), &[Key::F6]);
+        ui_runtime.shutdown().unwrap();
+    }
 
     #[test]
     fn split_command_args_keeps_quoted_text() {

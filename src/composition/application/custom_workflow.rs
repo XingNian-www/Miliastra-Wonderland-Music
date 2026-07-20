@@ -15,6 +15,7 @@ use crate::features::invite::{
     InviteDecision, InviteExecutionPort, InviteRequest, InviteStart,
     InviteUiOutcome as BusinessInviteUiOutcome,
 };
+use crate::privacy::redacted_chat_text;
 use crate::ui::chat_output::fit_chat_message;
 use crate::ui::routines::{
     CustomActionPlan, ExecuteInvite, FriendDelivery, FriendDeliveryMessageStatus, InviteEffect,
@@ -134,7 +135,7 @@ impl ApplicationRuntime {
     }
 
     pub(super) fn send_friend_message(&self, username: &str, message: &str) -> Result<bool> {
-        log::info!("好友发言: {} -> {}", username, message);
+        log::info!("好友发言: {} -> {}", username, redacted_chat_text(message));
         self.send_friend_delivery_routine(username, message)
     }
 
@@ -321,6 +322,8 @@ impl CustomWorkflowExecutionPort for ApplicationRuntime {
         workflow: &str,
         operations: Vec<WorkflowOperation>,
     ) -> Result<()> {
+        let operations =
+            super::resolve_workflow_listener_residency(operations, self.active_ui_residency()?);
         let expected = operations.len();
         if expected == 0 {
             return Err(anyhow!("custom action plan must not be empty"));

@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 use crate::config::{PointConfig, RectConfig};
 use crate::features::command::{CommandEnvelope, CommandPrefix, FeatureCommandMatch};
 pub use crate::interfaces::ui_plan::{
-    WorkflowOperation, WorkflowPixelStability, WorkflowPoint, WorkflowRect, WorkflowResidency,
+    WorkflowMouseButton, WorkflowOperation, WorkflowPixelStability, WorkflowPoint, WorkflowRect,
+    WorkflowResidency,
 };
 use crate::text::normalize_comparison_text;
 
@@ -90,6 +91,9 @@ fn validate_configured_step(step: &CustomWorkflowStep) -> Result<()> {
         "click" if step.point.is_none() => {
             bail!("custom workflow click step missing point")
         }
+        "mouse_button" => {
+            parse_mouse_button(configured_text(step.button.as_deref()))?;
+        }
         "click_template" | "wait_template" | "wait_template_absent" => {
             if configured_text(step.template.as_deref()).is_empty() {
                 bail!("custom workflow template is empty");
@@ -163,6 +167,7 @@ fn supported_step_type(step_type: &str) -> bool {
             | "activate_game"
             | "focus_game"
             | "click"
+            | "mouse_button"
             | "click_template"
             | "wait_template"
             | "wait_template_absent"
@@ -212,6 +217,7 @@ pub struct CustomWorkflowStep {
     pub point: Option<PointConfig>,
     pub click_offset: Option<PointConfig>,
     pub key: Option<String>,
+    pub button: Option<String>,
     pub target: Option<String>,
     pub text: Option<String>,
     pub message: Option<String>,
@@ -601,6 +607,11 @@ impl CustomWorkflowService {
                         .into(),
                 },
             )),
+            "mouse_button" => Ok(PreparedWorkflowStep::Mechanical(
+                WorkflowOperation::ClickMouseButton {
+                    button: parse_mouse_button(configured_text(step.button.as_deref()))?,
+                },
+            )),
             "click_template" => self.prepare_template_step(step, context, true),
             "wait_template" => self.prepare_template_step(step, context, false),
             "wait_template_absent" => self.prepare_template_absent_step(step, context),
@@ -673,10 +684,13 @@ impl CustomWorkflowService {
                     WorkflowCapability::InviteUser { target },
                 ))
             }
-            "return_primary" | "ensure_primary" => Ok(PreparedWorkflowStep::Mechanical(
+            "ensure_primary" => Ok(PreparedWorkflowStep::Mechanical(
                 WorkflowOperation::EnsureResidency {
                     target: WorkflowResidency::Primary,
                 },
+            )),
+            "return_primary" => Ok(PreparedWorkflowStep::Mechanical(
+                WorkflowOperation::ReturnListenerResidency,
             )),
             "ensure_current_hall" => Ok(PreparedWorkflowStep::Mechanical(
                 WorkflowOperation::EnsureResidency {
@@ -950,7 +964,9 @@ fn operation_label(operation: &WorkflowOperation) -> &'static str {
         WorkflowOperation::ActivateGame { .. } => "activate_game",
         WorkflowOperation::FocusGame { .. } => "focus_game",
         WorkflowOperation::EnsureResidency { .. } => "ensure_residency",
+        WorkflowOperation::ReturnListenerResidency => "return_listener_residency",
         WorkflowOperation::ClickPoint { .. } => "click",
+        WorkflowOperation::ClickMouseButton { .. } => "mouse_button",
         WorkflowOperation::WaitTemplate { .. } => "wait_template",
         WorkflowOperation::ClickTemplate { .. } => "click_template",
         WorkflowOperation::WaitTemplateAbsent { .. } => "wait_template_absent",
@@ -1116,6 +1132,16 @@ fn step_consumes_wait(step: &CustomWorkflowStep, stable_absent_default: bool) ->
     }
 }
 
+fn parse_mouse_button(value: &str) -> Result<WorkflowMouseButton> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "left" => Ok(WorkflowMouseButton::Left),
+        "middle" => Ok(WorkflowMouseButton::Middle),
+        "right" => Ok(WorkflowMouseButton::Right),
+        "" => bail!("custom workflow mouse_button step missing button"),
+        value => bail!("unsupported custom workflow mouse button: {value}"),
+    }
+}
+
 fn workflow_variable(key: &str, context: &WorkflowContext) -> Option<String> {
     match key {
         "workflow" | "workflow_name" => Some(context.workflow.clone()),
@@ -1243,8 +1269,10 @@ fn joined_command(command: &str, args: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::path::Path;
 
     use super::*;
+    use crate::config::AppConfig;
     use crate::features::command::CommandObservation;
 
     fn envelope(username: &str, message_type: &str, command: &str) -> CommandEnvelope {
@@ -1383,6 +1411,7 @@ mod tests {
         for (kind, expected) in [
             ("key", "step key is empty"),
             ("click", "missing point"),
+            ("mouse_button", "missing button"),
             ("wait_template", "template is empty"),
             ("wait_text", "missing text"),
             ("paste", "missing text"),
@@ -1412,6 +1441,7 @@ mod tests {
             point: None,
             click_offset: None,
             key: Some("F".to_string()),
+            button: None,
             target: None,
             text: None,
             message: None,
@@ -1442,6 +1472,7 @@ mod tests {
         match kind {
             "sleep" | "wait" => value.wait_ms = Some(10),
             "click" => value.point = Some(PointConfig::new(1, 2)),
+            "mouse_button" => value.button = Some("middle".to_string()),
             "click_template" | "wait_template" | "wait_template_absent" => {
                 value.template = Some("button".to_string());
                 value.region = Some(RectConfig {
@@ -1666,6 +1697,55 @@ mod tests {
     }
 
     #[test]
+    fn workflow_without_commands_is_remote_only() {
+        let mut value = workflow();
+        value.name = "鼠标中键".to_string();
+        value.commands.clear();
+        value.allow_args = false;
+        value.message_types = vec!["pink".to_string()];
+        let service = CustomWorkflowService::new(config(value), defaults());
+        let chat = envelope("用户", "pink", "@鼠标中键");
+
+        assert!(!service.claims_chat(&chat));
+        assert!(service.parse_chat(&chat).is_none());
+
+        let prepared = service.prepare_remote("鼠标中键", "").unwrap();
+        assert_eq!(prepared.raw, "鼠标中键");
+        assert_eq!(prepared.matched, "鼠标中键");
+        assert_eq!(prepared.command.workflow, "鼠标中键");
+    }
+
+    #[test]
+    fn default_control_commands_resolve_shared_prefixes_and_duration_arguments() {
+        let app = AppConfig::load(Path::new("config.yaml")).expect("default config");
+        let service = CustomWorkflowService::new(app.custom_workflows, defaults());
+
+        for (text, workflow, args) in [
+            ("@C", "press-control", ""),
+            ("@CW 3", "control-hold-w", "3"),
+            ("@CS 2", "control-hold-s", "2"),
+            ("@CA", "control-hold-a", ""),
+            ("@CD 10", "control-hold-d", "10"),
+        ] {
+            let chat = envelope("用户", "pink", text);
+            assert!(
+                service.claims_chat(&chat),
+                "command was not claimed: {text}"
+            );
+            let parsed = service
+                .parse_chat(&chat)
+                .unwrap_or_else(|| panic!("command was not parsed: {text}"));
+            assert_eq!(parsed.command.workflow, workflow);
+            assert_eq!(parsed.command.args, args);
+        }
+
+        let middle = envelope("用户", "pink", "@鼠标中键");
+        assert!(!service.claims_chat(&middle));
+        assert!(service.parse_chat(&middle).is_none());
+        assert!(service.prepare_remote("鼠标中键", "").is_ok());
+    }
+
+    #[test]
     fn list_keeps_enabled_definitions_even_when_global_switch_is_off() {
         let mut first = workflow();
         first.name.clear();
@@ -1755,6 +1835,7 @@ mod tests {
         for (kind, expected) in [
             ("key", "step key is empty"),
             ("click", "missing point"),
+            ("mouse_button", "missing button"),
             ("wait_template", "template is empty"),
             ("wait_text", "missing text"),
             ("paste", "missing text"),
@@ -1786,16 +1867,27 @@ mod tests {
             ("send_chat", "reply"),
             ("send_friend_message", "friend_reply"),
             ("invite_user", "invite_current_user"),
-            ("return_primary", "ensure_primary"),
         ] {
             assert_eq!(prepared_step(left), prepared_step(right));
         }
+
+        assert_eq!(
+            prepared_step("return_primary"),
+            PreparedWorkflowStep::Mechanical(WorkflowOperation::ReturnListenerResidency)
+        );
+        assert_eq!(
+            prepared_step("ensure_primary"),
+            PreparedWorkflowStep::Mechanical(WorkflowOperation::EnsureResidency {
+                target: WorkflowResidency::Primary,
+            })
+        );
 
         for kind in [
             "hold_key",
             "activate_game",
             "focus_game",
             "click",
+            "mouse_button",
             "click_template",
             "wait_template",
             "wait_template_absent",
@@ -1806,6 +1898,37 @@ mod tests {
         ] {
             let _ = prepared_step(kind);
         }
+    }
+
+    #[test]
+    fn mouse_button_accepts_only_named_primary_buttons() {
+        for (configured, expected) in [
+            ("left", WorkflowMouseButton::Left),
+            ("MIDDLE", WorkflowMouseButton::Middle),
+            ("right", WorkflowMouseButton::Right),
+        ] {
+            let mut value = step("mouse_button");
+            value.button = Some(configured.to_string());
+            assert_eq!(
+                CustomWorkflowService::new(config(workflow()), defaults())
+                    .prepare_step(&value, &WorkflowContext::new(&invocation("")))
+                    .unwrap(),
+                PreparedWorkflowStep::Mechanical(WorkflowOperation::ClickMouseButton {
+                    button: expected,
+                })
+            );
+        }
+
+        let mut value = workflow();
+        let mut invalid = step("mouse_button");
+        invalid.button = Some("back".to_string());
+        value.steps = vec![invalid];
+        let error = config(value).validate().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported custom workflow mouse button: back")
+        );
     }
 
     #[test]

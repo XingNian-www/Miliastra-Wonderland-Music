@@ -392,6 +392,11 @@ impl UndercoverRuntimeService {
         if matches!(command, UndercoverCommand::Retry) {
             return Ok(self.begin_retry_delivery(key));
         }
+        if matches!(command, UndercoverCommand::Reveal) {
+            let result = self.begin_reveal(key, player, source);
+            self.reconcile_entertainment(entertainment);
+            return result;
+        }
         if self.pending_retry.is_some() {
             if matches!(command, UndercoverCommand::End) {
                 self.pending_retry = None;
@@ -455,6 +460,7 @@ impl UndercoverRuntimeService {
                 }
             }
             UndercoverCommand::Retry => unreachable!("retry handled before command dispatch"),
+            UndercoverCommand::Reveal => unreachable!("reveal handled before command dispatch"),
             UndercoverCommand::Describe(description) => {
                 match self.game.describe(player, description, now) {
                     Ok(deliveries) => Ok(self.begin_deliveries(
@@ -771,6 +777,21 @@ impl UndercoverRuntimeService {
         Ok(UndercoverCommandStart::Suspended(request))
     }
 
+    fn begin_reveal(
+        &mut self,
+        key: UndercoverEffectKey,
+        player: &str,
+        source: UndercoverCommandSource,
+    ) -> Result<UndercoverCommandStart> {
+        if source != UndercoverCommandSource::Friend {
+            return self.begin_error(key, source, player, "#谜底只能通过好友私聊使用".to_string());
+        }
+        match self.game.reveal(player) {
+            Ok(lines) => Ok(self.begin_friend_batch(key, player, lines, "revealed")),
+            Err(error) => self.begin_error(key, source, player, error.to_string()),
+        }
+    }
+
     fn resume_pending(
         &mut self,
         key: UndercoverEffectKey,
@@ -1007,6 +1028,37 @@ impl UndercoverRuntimeService {
                 lane,
                 action,
                 ended,
+            },
+        );
+        UndercoverCommandStart::Suspended(request)
+    }
+
+    fn begin_friend_batch(
+        &mut self,
+        key: UndercoverEffectKey,
+        player: &str,
+        messages: Vec<String>,
+        action: &'static str,
+    ) -> UndercoverCommandStart {
+        let deliveries = messages
+            .into_iter()
+            .map(|message| FriendMessage::new(player.trim(), message))
+            .collect::<Vec<_>>();
+        if deliveries.is_empty() {
+            return UndercoverCommandStart::Completed(UndercoverCompletion {
+                action,
+                ended: false,
+            });
+        }
+        let request = self.insert_effect(
+            key,
+            UndercoverEffectLane::Formal,
+            UndercoverEffect::FriendBatch { deliveries },
+            UndercoverContinuation::Deliveries {
+                remaining: VecDeque::new(),
+                lane: UndercoverEffectLane::Formal,
+                action,
+                ended: false,
             },
         );
         UndercoverCommandStart::Suspended(request)
@@ -1468,11 +1520,171 @@ mod runtime_tests {
         };
 
         assert!(matches!(
-            request.effect,
+        request.effect,
+        UndercoverEffect::FriendBatch { ref deliveries }
+            if deliveries.len() == 1
+                && deliveries[0].recipient() == "甲"
+                && deliveries[0].message().contains("当前没有谁是卧底报名房间")
+        ));
+    }
+
+    #[test]
+    fn friend_reveal_is_private_read_only_and_rejects_game_members() {
+        let (mut service, mut entertainment) = service(60);
+        let now = Instant::now();
+        complete_membership(
+            &mut service,
+            &mut entertainment,
+            "甲",
+            UndercoverCommand::CreateSingle,
+            now,
+            1,
+        );
+        for (operation_id, player) in [(2, "乙"), (3, "丙"), (4, "丁")] {
+            complete_membership(
+                &mut service,
+                &mut entertainment,
+                player,
+                UndercoverCommand::Join,
+                now,
+                operation_id,
+            );
+        }
+
+        let start = service
+            .begin_command(
+                &mut entertainment,
+                "甲",
+                UndercoverCommandSource::Hall,
+                &UndercoverCommand::Start,
+                now,
+                BusinessOperationId::new(5),
+            )
+            .expect("start game");
+        let UndercoverCommandStart::Suspended(secret_batch) = start else {
+            panic!("start should wait for secret delivery");
+        };
+        service.claim(secret_batch.key).expect("claim secret batch");
+        let opening = match service
+            .resume(
+                &mut entertainment,
+                secret_batch.key,
+                UndercoverEffectResult::FriendBatch(Ok(FriendBatchOutcome::Complete)),
+            )
+            .expect("resume secret batch")
+        {
+            UndercoverResume::Suspended(request) => request,
+            other => panic!("expected opening announcement, got {other:?}"),
+        };
+        service
+            .claim(opening.key)
+            .expect("claim opening announcement");
+        assert!(matches!(
+            service
+                .resume(
+                    &mut entertainment,
+                    opening.key,
+                    UndercoverEffectResult::HallBatch(Ok(())),
+                )
+                .expect("resume opening announcement"),
+            UndercoverResume::Completed(_)
+        ));
+
+        let before_snapshot = serde_json::to_string(&service.snapshot(now)).unwrap();
+        let before_deadline = service.next_deadline(now, true);
+        let reveal = service
+            .begin_command(
+                &mut entertainment,
+                "旁观者",
+                UndercoverCommandSource::Friend,
+                &UndercoverCommand::Reveal,
+                now,
+                BusinessOperationId::new(6),
+            )
+            .expect("begin reveal");
+        let UndercoverCommandStart::Suspended(reveal_request) = reveal else {
+            panic!("reveal should wait for friend delivery");
+        };
+        let UndercoverEffect::FriendBatch { deliveries } = &reveal_request.effect else {
+            panic!("reveal must use a friend batch");
+        };
+        assert_eq!(deliveries.len(), 1);
+        assert!(
+            deliveries
+                .iter()
+                .all(|delivery| delivery.recipient() == "旁观者")
+        );
+        let reveal_text = deliveries
+            .iter()
+            .map(|delivery| delivery.message())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(reveal_text.contains("平民词:苹果"));
+        assert!(reveal_text.contains("卧底词:梨"));
+        assert!(reveal_text.contains("卧底:"));
+        assert!(!reveal_text.contains("内鬼位置"));
+        assert!(!reveal_text.contains("仅私聊"));
+        assert_eq!(
+            before_snapshot,
+            serde_json::to_string(&service.snapshot(now)).unwrap()
+        );
+        assert_eq!(before_deadline, service.next_deadline(now, true));
+
+        service
+            .claim(reveal_request.key)
+            .expect("claim reveal delivery");
+        assert!(matches!(
+            service
+                .resume(
+                    &mut entertainment,
+                    reveal_request.key,
+                    UndercoverEffectResult::FriendBatch(Ok(FriendBatchOutcome::Complete)),
+                )
+                .expect("resume reveal delivery"),
+            UndercoverResume::Completed(UndercoverCompletion {
+                action: "revealed",
+                ended: false
+            })
+        ));
+
+        let member_reveal = service
+            .begin_command(
+                &mut entertainment,
+                "甲",
+                UndercoverCommandSource::Friend,
+                &UndercoverCommand::Reveal,
+                now,
+                BusinessOperationId::new(7),
+            )
+            .expect("begin member reveal");
+        let UndercoverCommandStart::Suspended(member_error) = member_reveal else {
+            panic!("member reveal should return a private error");
+        };
+        assert!(matches!(
+            member_error.effect,
             UndercoverEffect::FriendBatch { ref deliveries }
                 if deliveries.len() == 1
                     && deliveries[0].recipient() == "甲"
-                    && deliveries[0].message().contains("当前没有谁是卧底报名房间")
+                    && deliveries[0].message().contains("对局玩家不能使用#谜底")
+        ));
+
+        let hall_reveal = service
+            .begin_command(
+                &mut entertainment,
+                "旁观者",
+                UndercoverCommandSource::Hall,
+                &UndercoverCommand::Reveal,
+                now,
+                BusinessOperationId::new(8),
+            )
+            .expect("begin hall reveal");
+        let UndercoverCommandStart::Suspended(hall_error) = hall_reveal else {
+            panic!("hall reveal should be rejected");
+        };
+        assert!(matches!(
+            hall_error.effect,
+            UndercoverEffect::Hall { ref message }
+                if message.contains("只能通过好友私聊使用")
         ));
     }
 

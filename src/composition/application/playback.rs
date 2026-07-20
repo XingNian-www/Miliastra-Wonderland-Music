@@ -237,6 +237,12 @@ impl PlaybackCommandPort for ApplicationRuntime {
         self.player.resume_by_user()
     }
 
+    fn previous_playback_request(
+        &mut self,
+    ) -> Result<Option<crate::features::playback::PlaybackRequest>> {
+        self.player.previous_playback_request()
+    }
+
     fn next_external(&mut self) -> Result<String> {
         self.player.next_external()
     }

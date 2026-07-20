@@ -5,13 +5,23 @@ pub(crate) const REDACTED_UNDERCOVER_INPUT: &str = "[谁是卧底私聊内容已
 pub(crate) fn redacted_chat_text(message: &str) -> &str {
     if contains_turtle_soup_bottom_marker(message) {
         REDACTED_TURTLE_SOUP_BOTTOM
-    } else if message.contains("你的位置：") && message.contains("你的词语：") {
+    } else if (message.contains("你的位置：") && message.contains("你的词语："))
+        || message.contains("谁是卧底谜底")
+        || contains_undercover_secret_summary(message)
+    {
         REDACTED_UNDERCOVER_SECRET
     } else if contains_undercover_private_input(message) {
         REDACTED_UNDERCOVER_INPUT
     } else {
         message
     }
+}
+
+fn contains_undercover_secret_summary(message: &str) -> bool {
+    let has_civilian_word = message.contains("平民词:") || message.contains("平民词：");
+    let has_undercover_word = message.contains("卧底词:") || message.contains("卧底词：");
+    let has_undercover_positions = message.contains("卧底:") || message.contains("卧底：");
+    has_civilian_word && has_undercover_word && has_undercover_positions
 }
 
 fn contains_undercover_private_input(message: &str) -> bool {

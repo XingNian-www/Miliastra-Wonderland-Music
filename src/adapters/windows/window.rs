@@ -20,16 +20,21 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput, SetFocus, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, EnumWindows, GA_ROOT, GetAncestor, GetClientRect, GetForegroundWindow,
-    GetWindowThreadProcessId, IsIconic, IsWindowVisible, PostMessageW, SW_RESTORE,
-    SetForegroundWindow, ShowWindow, WM_CLOSE, WindowFromPoint,
+    BringWindowToTop, EnumWindows, GA_ROOT, GetAncestor, GetClientRect, GetCursorPos,
+    GetForegroundWindow, GetWindowThreadProcessId, IsIconic, IsWindowVisible, PostMessageW,
+    SW_RESTORE, SetForegroundWindow, ShowWindow, WM_CLOSE, WindowFromPoint,
 };
 use windows::core::BOOL;
 
 use crate::config::{PointConfig, WindowConfig};
 
+// BGI keeps the pointer at the drag origin and each interpolated point long
+// enough for the game's UI event loop to observe the pressed state.
+const DRAG_START_SETTLE_MS: u64 = 100;
+const DRAG_PRESS_SETTLE_MS: u64 = 100;
 const DRAG_STEPS: i32 = 8;
-const DRAG_STEP_MS: u64 = 5;
+const DRAG_STEP_MS: u64 = 30;
+const DRAG_RELEASE_SETTLE_MS: u64 = 500;
 
 #[derive(Clone, Debug)]
 pub struct TargetWindowUnavailable {
@@ -107,6 +112,25 @@ impl GameWindow {
         self.click_screen(enigo, screen)
     }
 
+    pub fn click_button(&self, enigo: &mut Enigo, button: Button) -> Result<()> {
+        let started = Instant::now();
+        self.ensure_foreground()?;
+        let mut cursor = POINT::default();
+        unsafe { GetCursorPos(&mut cursor) }.context("read mouse position")?;
+        self.ensure_point_targets_window(ScreenPoint {
+            x: cursor.x,
+            y: cursor.y,
+        })?;
+        enigo
+            .button(button, Direction::Click)
+            .context("click mouse button")?;
+        log::info!(target: "timing",
+            "鼠标按钮输入耗时: total={}ms button={button:?}",
+            elapsed_ms(started)
+        );
+        Ok(())
+    }
+
     pub fn scroll(
         &mut self,
         enigo: &mut Enigo,
@@ -132,9 +156,11 @@ impl GameWindow {
         enigo
             .move_mouse(from.x, from.y, Coordinate::Abs)
             .context("move mouse to drag start")?;
+        sleep(Duration::from_millis(DRAG_START_SETTLE_MS));
         enigo
             .button(Button::Left, Direction::Press)
             .context("press mouse for drag")?;
+        sleep(Duration::from_millis(DRAG_PRESS_SETTLE_MS));
 
         let drag_result = (|| -> Result<()> {
             for step in 1..=DRAG_STEPS {
@@ -151,7 +177,9 @@ impl GameWindow {
             .button(Button::Left, Direction::Release)
             .context("release mouse after drag");
         drag_result?;
-        release_result
+        release_result?;
+        sleep(Duration::from_millis(DRAG_RELEASE_SETTLE_MS));
+        Ok(())
     }
 
     pub fn activate(&mut self, after_activate_ms: u64) -> Result<()> {

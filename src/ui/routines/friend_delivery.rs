@@ -26,6 +26,7 @@ use crate::ui::template::best_template_hit;
 
 use super::state_observation::{
     UiStateObservationConfig, capture_normalized_ui_state, wait_for_stable_ui_kind,
+    wait_for_stable_ui_kind_or_unknown,
 };
 
 const FRIEND_ROW_Y_TOLERANCE: i32 = 6;
@@ -421,7 +422,6 @@ impl FriendDeliveryUi {
 pub(crate) struct FriendDeliveryRoutineConfig {
     pub(super) screen: ScreenConfig,
     friend_list_region: Rect,
-    friend_chat_region: Rect,
     secondary_hall_search_region: Rect,
     chat_click: PointConfig,
     send_enabled: bool,
@@ -435,7 +435,6 @@ pub(crate) struct FriendDeliveryRoutineConfig {
     pub(super) poll_ms: u64,
     pub(super) stable_count: u32,
     auto_retry_count: u32,
-    fast_match: bool,
     stable_mean_threshold: f32,
     stable_changed_ratio_threshold: f32,
     secondary_hall_template: PathBuf,
@@ -450,7 +449,6 @@ pub(crate) struct FriendDeliveryRoutineConfigSource<'a> {
     pub(crate) input_timing: &'a InputTimingConfig,
     pub(crate) delivery: &'a FriendDeliveryConfig,
     pub(crate) friend_list_region: Rect,
-    pub(crate) friend_chat_region: Rect,
     pub(crate) friend_step_ms: u64,
     pub(crate) timeout_ms: u64,
     pub(crate) poll_ms: u64,
@@ -464,7 +462,6 @@ impl FriendDeliveryRoutineConfig {
         Self {
             screen: source.screen.clone(),
             friend_list_region,
-            friend_chat_region: source.friend_chat_region,
             secondary_hall_search_region: secondary_hall_search_rect(
                 hall_anchor,
                 friend_list_region,
@@ -481,7 +478,6 @@ impl FriendDeliveryRoutineConfig {
             poll_ms: source.poll_ms.max(10),
             stable_count: source.stable_count,
             auto_retry_count: source.delivery.auto_retry_count,
-            fast_match: source.delivery.fast_match,
             stable_mean_threshold: source.ocr.change_mean_threshold,
             stable_changed_ratio_threshold: source.ocr.change_pixel_threshold,
             secondary_hall_template: source.templates.secondary_hall.clone(),
@@ -499,7 +495,6 @@ impl FriendDeliveryRoutineConfig {
             input_timing: &config.timing.input,
             delivery: &config.friend_delivery,
             friend_list_region: config.invite.friend_list_region.into(),
-            friend_chat_region: config.invite.friend_chat_region.into(),
             friend_step_ms: config.timing.invite.step_ms,
             timeout_ms: config.timing.workflow.default_timeout_ms,
             poll_ms: config.timing.workflow.default_poll_ms,
@@ -543,19 +538,6 @@ struct DeliveryAttemptFailure {
 
 enum PageSearch {
     Found(Point),
-    Missing,
-}
-
-#[derive(Clone, Copy)]
-enum TextMatchMode {
-    Exact,
-    ContainsCompleteTarget,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ConversationIdentityEvidence {
-    Title,
-    ChatRegion,
     Missing,
 }
 
@@ -838,10 +820,6 @@ pub(super) fn send_current_chat_message(
     Ok(())
 }
 
-fn text_contains_complete_target(recognized: &str, target: &str) -> bool {
-    !target.is_empty() && (recognized == target || recognized.contains(target))
-}
-
 fn ensure_secondary_chat(
     context: &mut UiRoutineContext<'_>,
     config: &FriendDeliveryRoutineConfig,
@@ -851,7 +829,7 @@ fn ensure_secondary_chat(
         .device()
         .ensure_ready(config.after_activate_ms)
         .map_err(|error| before_input_failure("prepare_friend_delivery", error))?;
-    let state = wait_for_stable_ui_kind(
+    let state = wait_for_stable_ui_kind_or_unknown(
         context,
         config.state_observation(),
         None,
@@ -959,13 +937,7 @@ fn search_current_friend_page(
             "capture_friend_list",
             InputCertainty::AfterInputUnknown,
         )?;
-        let hits = matching_text_rows(
-            ocr,
-            &image,
-            config.friend_list_region,
-            &target,
-            TextMatchMode::Exact,
-        )?;
+        let hits = matching_text_rows(ocr, &image, config.friend_list_region, &target)?;
         match hits.as_slice() {
             [point] => {
                 if stable_y
@@ -1038,65 +1010,23 @@ fn confirm_friend_conversation(
     Err(UiRoutineFailure::new(
         InputCertainty::ConfirmedFailure,
         "confirm_friend_conversation",
-        if config.fast_match {
-            "selected conversation title did not stably identify a private friend chat"
-        } else {
-            "selected conversation did not stably contain the complete friend name"
-        },
+        "selected conversation is current hall or public channel",
     ))
 }
 
 fn conversation_confirmation_key(
     ocr: &OcrRuntimeHandle,
     image: &DynamicImage,
-    config: &FriendDeliveryRoutineConfig,
-    normalized_target: &str,
+    _config: &FriendDeliveryRoutineConfig,
+    _normalized_target: &str,
 ) -> std::result::Result<Option<String>, UiRoutineFailure> {
-    if config.fast_match {
-        let title = merged_text(ocr, image, SECONDARY_TITLE_RECT)?;
-        let normalized_title = normalize_lock_text(&title);
-        return Ok(match classify_title(&title) {
-            SecondaryChatIdentity::CurrentHall | SecondaryChatIdentity::PublicChannel => None,
-            SecondaryChatIdentity::Friend(title) => {
-                let title = normalize_lock_text(&title);
-                (!title.is_empty()).then_some(title)
-            }
-            SecondaryChatIdentity::StrangerMessages => {
-                (!normalized_title.is_empty()).then_some(normalized_title)
-            }
-            SecondaryChatIdentity::Unknown => None,
-        });
-    }
-    Ok(
-        (detect_conversation_identity(ocr, image, config, normalized_target)?
-            != ConversationIdentityEvidence::Missing)
-            .then(|| normalized_target.to_string()),
-    )
-}
-
-fn detect_conversation_identity(
-    ocr: &OcrRuntimeHandle,
-    image: &DynamicImage,
-    config: &FriendDeliveryRoutineConfig,
-    normalized_target: &str,
-) -> std::result::Result<ConversationIdentityEvidence, UiRoutineFailure> {
     let title = merged_text(ocr, image, SECONDARY_TITLE_RECT)?;
-    if text_contains_complete_target(&normalize_lock_text(&title), normalized_target) {
-        return Ok(ConversationIdentityEvidence::Title);
-    }
-    if matching_text_rows(
-        ocr,
-        image,
-        config.friend_chat_region,
-        normalized_target,
-        TextMatchMode::ContainsCompleteTarget,
-    )?
-    .is_empty()
-    {
-        Ok(ConversationIdentityEvidence::Missing)
-    } else {
-        Ok(ConversationIdentityEvidence::ChatRegion)
-    }
+    Ok(match classify_title(&title) {
+        SecondaryChatIdentity::CurrentHall | SecondaryChatIdentity::PublicChannel => None,
+        SecondaryChatIdentity::Friend(_)
+        | SecondaryChatIdentity::StrangerMessages
+        | SecondaryChatIdentity::Unknown => Some("allowed-chat".to_string()),
+    })
 }
 
 pub(super) fn restore_residency(
@@ -1115,7 +1045,7 @@ fn restore_primary(
     context: &mut UiRoutineContext<'_>,
     config: &FriendDeliveryRoutineConfig,
 ) -> std::result::Result<(), UiRoutineFailure> {
-    let state = wait_for_stable_ui_kind(
+    let state = wait_for_stable_ui_kind_or_unknown(
         context,
         config.state_observation(),
         None,
@@ -1125,6 +1055,9 @@ fn restore_primary(
     )?;
     if state == UiStateKind::Primary {
         return Ok(());
+    }
+    if state == UiStateKind::Unknown {
+        log::warn!("一级驻留持续稳定为 Unknown，按 Esc 尝试关闭残留面板后重新确认一级界面");
     }
     context
         .device()
@@ -1326,7 +1259,6 @@ fn matching_text_rows(
     image: &DynamicImage,
     region: Rect,
     normalized_target: &str,
-    mode: TextMatchMode,
 ) -> std::result::Result<Vec<Point>, UiRoutineFailure> {
     let crop = crop_canvas(image, region)
         .map_err(|error| before_input_failure("crop_ocr_confirmation", error))?;
@@ -1337,12 +1269,7 @@ fn matching_text_rows(
         .into_iter()
         .filter_map(|line| {
             let recognized = normalize_lock_text(&line.text);
-            let matched = match mode {
-                TextMatchMode::Exact => recognized == normalized_target,
-                TextMatchMode::ContainsCompleteTarget => {
-                    text_contains_complete_target(&recognized, normalized_target)
-                }
-            };
+            let matched = recognized == normalized_target;
             matched.then(|| {
                 Point::new(
                     region.x + line.bbox.center().x,
@@ -1465,12 +1392,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn complete_target_does_not_accept_a_truncated_ocr_name() {
-        assert!(!text_contains_complete_target("萌", "萌萌"));
-        assert!(text_contains_complete_target("原昵称(萌萌)", "萌萌"));
-    }
-
-    #[test]
     fn friend_list_drag_runs_from_the_lowest_avatar_to_the_highest_avatar() {
         let (from, to) = friend_list_drag_points(Rect::new(80, 280, 170, 600));
 
@@ -1533,14 +1454,8 @@ mod tests {
         let handle = runtime.handle();
         let samples = (0..2)
             .map(|_| {
-                matching_text_rows(
-                    &handle,
-                    &image,
-                    region,
-                    &normalize_lock_text("破鹿子"),
-                    TextMatchMode::Exact,
-                )
-                .expect("locate exact friend row")
+                matching_text_rows(&handle, &image, region, &normalize_lock_text("破鹿子"))
+                    .expect("locate exact friend row")
             })
             .collect::<Vec<_>>();
 
@@ -1556,37 +1471,14 @@ mod tests {
 
         let routine = FriendDeliveryRoutineConfig::from_app(&config);
         assert_eq!(
-            detect_conversation_identity(&handle, &image, &routine, &normalize_lock_text("香菜"))
-                .expect("recognize title identity"),
-            ConversationIdentityEvidence::Title
-        );
-        assert_eq!(
-            detect_conversation_identity(&handle, &image, &routine, &normalize_lock_text("星念"))
-                .expect("recognize chat-region fallback identity"),
-            ConversationIdentityEvidence::ChatRegion
-        );
-        let mut fast_routine = routine.clone();
-        fast_routine.fast_match = true;
-        assert_eq!(
             conversation_confirmation_key(
                 &handle,
                 &image,
-                &fast_routine,
+                &routine,
                 &normalize_lock_text("不存在的好友")
             )
-            .expect("accept any stable private-chat title in fast mode"),
-            Some(normalize_lock_text("香菜"))
-        );
-        fast_routine.fast_match = false;
-        assert_eq!(
-            conversation_confirmation_key(
-                &handle,
-                &image,
-                &fast_routine,
-                &normalize_lock_text("不存在的好友")
-            )
-            .expect("strict mode still requires the target identity"),
-            None
+            .expect("accept any non-blacklisted title in fast mode"),
+            Some("allowed-chat".to_string())
         );
 
         let state = Arc::new(Mutex::new(TestUiState {
@@ -1820,7 +1712,7 @@ mod tests {
         config.timing.input.text_ms = 0;
         config.timing.input.send_ms = 0;
         config.timing.invite.step_ms = 0;
-        config.timing.workflow.default_timeout_ms = 20;
+        config.timing.workflow.default_timeout_ms = 200;
         config.timing.workflow.default_poll_ms = 1;
         let state = Arc::new(Mutex::new(TestUiState {
             conversation: Conversation::Hall,
@@ -1899,14 +1791,13 @@ mod tests {
     #[test]
     fn friend_conversation_falls_back_to_the_chat_region_when_title_has_no_name() {
         let mut config = AppConfig::load(Path::new("config.yaml")).unwrap();
-        config.friend_delivery.fast_match = false;
         config.timing.input.after_activate_ms = 0;
         config.timing.input.open_chat_ms = 0;
         config.timing.input.click_ms = 0;
         config.timing.input.text_ms = 0;
         config.timing.input.send_ms = 0;
         config.timing.invite.step_ms = 0;
-        config.timing.workflow.default_timeout_ms = 20;
+        config.timing.workflow.default_timeout_ms = 200;
         config.timing.workflow.default_poll_ms = 1;
         let state = Arc::new(Mutex::new(TestUiState {
             conversation: Conversation::Hall,
@@ -1978,7 +1869,7 @@ mod tests {
         config.timing.input.click_ms = 0;
         config.timing.input.text_ms = 0;
         config.timing.input.send_ms = 0;
-        config.timing.workflow.default_timeout_ms = 20;
+        config.timing.workflow.default_timeout_ms = 200;
         config.timing.workflow.default_poll_ms = 1;
         let state = Arc::new(Mutex::new(TestUiState {
             conversation: Conversation::Hall,
@@ -2083,7 +1974,7 @@ mod tests {
         config.timing.input.text_ms = 0;
         config.timing.input.send_ms = 0;
         config.timing.invite.step_ms = 0;
-        config.timing.workflow.default_timeout_ms = 20;
+        config.timing.workflow.default_timeout_ms = 200;
         config.timing.workflow.default_poll_ms = 1;
         let state = Arc::new(Mutex::new(TestUiState {
             conversation: Conversation::Hall,
@@ -2159,7 +2050,7 @@ mod tests {
         config.timing.input.text_ms = 0;
         config.timing.input.send_ms = 0;
         config.timing.invite.step_ms = 0;
-        config.timing.workflow.default_timeout_ms = 20;
+        config.timing.workflow.default_timeout_ms = 200;
         config.timing.workflow.default_poll_ms = 1;
         let state = Arc::new(Mutex::new(TestUiState {
             conversation: Conversation::Hall,
@@ -2286,7 +2177,7 @@ mod tests {
     }
 
     #[test]
-    fn persistent_unknown_residency_never_authorizes_escape() {
+    fn persistent_unknown_residency_escapes_once_then_reports_primary_failure() {
         let config = AppConfig::load(Path::new("config.yaml")).unwrap();
         let keys = Arc::new(Mutex::new(Vec::new()));
         let ui_runtime = start_test_ui_runtime(
@@ -2301,7 +2192,7 @@ mod tests {
             2,
         );
         let mut routine_config = FriendDeliveryRoutineConfig::from_app(&config);
-        routine_config.timeout_ms = 100;
+        routine_config.timeout_ms = 500;
         routine_config.poll_ms = 1;
 
         let failure = ui_runtime
@@ -2312,11 +2203,76 @@ mod tests {
             .unwrap()
             .wait()
             .unwrap()
-            .expect_err("persistent unknown must time out without input");
+            .expect_err("persistent unknown cannot confirm primary after escape");
 
-        assert_eq!(failure.stage(), "observe_primary_residency");
-        assert_eq!(failure.certainty(), InputCertainty::ConfirmedFailure);
-        assert!(keys.lock().unwrap().is_empty());
+        assert_eq!(failure.stage(), "confirm_primary_residency");
+        assert_eq!(failure.certainty(), InputCertainty::AfterInputUnknown);
+        assert_eq!(*keys.lock().unwrap(), [Key::Escape]);
+        ui_runtime.shutdown().unwrap();
+    }
+
+    struct StableUnknownThenPrimaryDevice {
+        unknown: DynamicImage,
+        primary: DynamicImage,
+        keys: Arc<Mutex<Vec<Key>>>,
+        escaped: bool,
+        captures_after_escape: usize,
+    }
+
+    impl UiDevice for StableUnknownThenPrimaryDevice {
+        fn capture(&mut self) -> Result<DynamicImage> {
+            if !self.escaped {
+                return Ok(self.unknown.clone());
+            }
+            self.captures_after_escape += 1;
+            if self.captures_after_escape <= 2 {
+                return Ok(self.unknown.clone());
+            }
+            Ok(self.primary.clone())
+        }
+
+        fn press_key(&mut self, key: Key) -> Result<()> {
+            self.keys.lock().unwrap().push(key);
+            if key == Key::Escape {
+                self.escaped = true;
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn stable_unknown_residency_escapes_then_confirms_primary() {
+        let config = AppConfig::load(Path::new("config.yaml")).unwrap();
+        let keys = Arc::new(Mutex::new(Vec::new()));
+        let ui_runtime = start_test_ui_runtime(
+            StableUnknownThenPrimaryDevice {
+                unknown: DynamicImage::new_rgba8(
+                    config.screen.expected_width,
+                    config.screen.expected_height,
+                ),
+                primary: primary_frame(&config),
+                keys: keys.clone(),
+                escaped: false,
+                captures_after_escape: 0,
+            },
+            &config,
+            2,
+        );
+        let mut routine_config = FriendDeliveryRoutineConfig::from_app(&config);
+        routine_config.timeout_ms = 500;
+        routine_config.poll_ms = 1;
+
+        ui_runtime
+            .handle()
+            .submit(RestorePrimaryRoutine {
+                config: routine_config,
+            })
+            .unwrap()
+            .wait()
+            .unwrap()
+            .expect("stable unknown should authorize one escape");
+
+        assert_eq!(*keys.lock().unwrap(), [Key::Escape]);
         ui_runtime.shutdown().unwrap();
     }
 

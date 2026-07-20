@@ -217,12 +217,18 @@ pub(crate) trait IdiomChainDeferredPort {
         &mut self,
         player: &str,
         command: &IdiomChainCommand,
+        observed_at: Instant,
     ) -> Result<IdiomChainOutcome>;
     fn send_deferred(&mut self, message: String) -> Result<IdiomDeliveryOutcome>;
 }
 
 pub(crate) trait IdiomChainExplanationPort {
-    fn explain(&mut self, player: &str, command: &IdiomChainCommand) -> Result<IdiomChainOutcome>;
+    fn explain(
+        &mut self,
+        player: &str,
+        command: &IdiomChainCommand,
+        observed_at: Instant,
+    ) -> Result<IdiomChainOutcome>;
     fn send_batch(&mut self, messages: &[String], delay_ms: u64) -> Result<()>;
 }
 
@@ -241,9 +247,10 @@ impl IdiomChainApplication {
         raw_command: &str,
         player: &str,
         command: &IdiomChainCommand,
+        observed_at: Instant,
         port: &mut P,
     ) -> Result<()> {
-        let outcome = port.handle_command(player, command)?;
+        let outcome = port.handle_command(player, command, observed_at)?;
         let action = outcome.action;
         debug_assert!(outcome.explanation.is_none());
         match port.send_deferred(outcome.reply)? {
@@ -267,9 +274,10 @@ impl IdiomChainApplication {
         &self,
         player: &str,
         command: &IdiomChainCommand,
+        observed_at: Instant,
         port: &mut P,
     ) -> Result<()> {
-        let outcome = port.explain(player, command)?;
+        let outcome = port.explain(player, command, observed_at)?;
         let mut messages = vec![outcome.reply];
         if let Some(explanation) = outcome.explanation {
             messages.extend(split_numbered_chat_message("来源", &explanation.source));
@@ -966,6 +974,7 @@ mod tests {
             &mut self,
             _player: &str,
             _command: &IdiomChainCommand,
+            _observed_at: Instant,
         ) -> Result<IdiomChainOutcome> {
             Ok(IdiomChainOutcome {
                 reply: "成语：画蛇添足".to_string(),
@@ -994,6 +1003,7 @@ mod tests {
             .execute_explanation(
                 "Alice",
                 &IdiomChainCommand::Explain(Some("画蛇添足".to_string())),
+                Instant::now(),
                 &mut port,
             )
             .expect("explanation delivery");

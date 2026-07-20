@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -52,6 +52,7 @@ pub enum UndercoverCommand {
     Exit,
     End,
     Retry,
+    Reveal,
     Describe(String),
     Vote(char),
     Abstain,
@@ -73,7 +74,7 @@ impl UndercoverCommand {
                 CommandAuthority::HallMember => true,
                 CommandAuthority::Friend => {
                     let compact = compact_command(envelope.command_text());
-                    matches!(compact.as_str(), "加入" | "退出" | "弃权")
+                    matches!(compact.as_str(), "加入" | "退出" | "弃权" | "谜底")
                         || parse_vote_position(&compact).is_some()
                 }
             }
@@ -101,6 +102,7 @@ impl UndercoverCommand {
         };
         let raw = match &command {
             Self::Vote(_) | Self::Abstain => "投票".to_string(),
+            Self::Reveal => "谜底".to_string(),
             Self::Describe(_) => "卧底描述".to_string(),
             _ => envelope.command_text().to_string(),
         };
@@ -135,6 +137,7 @@ impl UndercoverCommand {
             "加入" => Self::Join,
             "退出" => Self::Exit,
             "弃权" => Self::Abstain,
+            "谜底" => Self::Reveal,
             _ => Self::Vote(parse_vote_position(&normalized)?),
         })
     }
@@ -149,6 +152,7 @@ impl UndercoverCommand {
             Self::Exit => "undercover:exit".to_string(),
             Self::End => "undercover:end".to_string(),
             Self::Retry => "undercover:retry".to_string(),
+            Self::Reveal => "undercover:reveal".to_string(),
             Self::Describe(text) => format!("undercover:describe:{}", command_identity(text)),
             Self::Vote(position) => format!("undercover:vote:{position}"),
             Self::Abstain => "undercover:vote:abstain".to_string(),
@@ -613,14 +617,23 @@ impl UndercoverGame {
         if completed == total {
             descriptions.clear();
             if let Some(candidates) = runoff_candidates {
-                game.phase = Phase::RunoffVoting {
-                    candidates,
-                    votes: BTreeMap::new(),
-                    reminder: VoteReminder::new(now),
-                };
-                deliveries.push(UndercoverDelivery::Hall(format!(
-                    "并列玩家已完成公屏描述，其他存活玩家{VOTE_INSTRUCTION}"
-                )));
+                let voter_count = alive_count(&game.players).saturating_sub(candidates.len());
+                if voter_count == 0 {
+                    start_next_round(game);
+                    deliveries.push(UndercoverDelivery::Hall(format!(
+                        "并列玩家无人可投票，本轮无人淘汰；第{}轮开始，请在公屏发送 #内容",
+                        game.round
+                    )));
+                } else {
+                    game.phase = Phase::RunoffVoting {
+                        candidates,
+                        votes: BTreeMap::new(),
+                        reminder: VoteReminder::new(now),
+                    };
+                    deliveries.push(UndercoverDelivery::Hall(format!(
+                        "并列玩家已完成公屏描述，其他存活玩家{VOTE_INSTRUCTION}"
+                    )));
+                }
             } else {
                 game.phase = Phase::Voting {
                     votes: BTreeMap::new(),
@@ -765,24 +778,35 @@ impl UndercoverGame {
                         .join("、")
                 )
             }
-            GameState::Playing(game) => {
-                let snapshot = playing_progress(game);
-                format!(
-                    "谁是卧底：{}，第{}轮，阶段：{}，存活：{}，进度：{}/{}",
-                    game.mode.label(),
-                    game.round,
-                    snapshot.0,
-                    game.players
-                        .iter()
-                        .filter(|player| player.alive)
-                        .map(|player| player.position.to_string())
-                        .collect::<Vec<_>>()
-                        .join("、"),
-                    snapshot.1,
-                    snapshot.2
-                )
-            }
+            GameState::Playing(game) => compact_status(game),
         }
+    }
+
+    /// Return the current game's private answer without changing any game activity.
+    pub fn reveal(&self, requester: &str) -> Result<Vec<String>> {
+        let GameState::Playing(game) = &self.state else {
+            bail!("当前没有正在进行的谁是卧底牌局");
+        };
+        let requester = player_key(requester);
+        if game.players.iter().any(|player| player.key == requester) {
+            bail!("对局玩家不能使用#谜底");
+        }
+
+        let undercover_positions = game
+            .players
+            .iter()
+            .filter(|player| player.role == Role::Undercover)
+            .map(|player| player.position.to_string())
+            .collect::<Vec<_>>();
+        let undercover_positions = if undercover_positions.is_empty() {
+            "无".to_string()
+        } else {
+            undercover_positions.join("")
+        };
+        Ok(vec![format!(
+            "平民词:{},卧底词:{},卧底:{}",
+            game.words.civilian, game.words.undercover, undercover_positions
+        )])
     }
 
     pub fn exit(&mut self, player: &str, now: Instant) -> Result<Vec<UndercoverDelivery>> {
@@ -1109,6 +1133,68 @@ fn playing_progress(game: &Playing) -> (&'static str, usize, usize) {
             alive.saturating_sub(candidates.len()),
         ),
     }
+}
+
+fn compact_status(game: &Playing) -> String {
+    let (phase, eligible, completed) = match &game.phase {
+        Phase::AwaitingDelivery => ("发言", alive_indices(&game.players), BTreeSet::new()),
+        Phase::Describing { descriptions } => (
+            "发言",
+            alive_indices(&game.players),
+            descriptions.keys().copied().collect(),
+        ),
+        Phase::Voting { .. } => {
+            let eligible = alive_indices(&game.players);
+            let completed = eligible.iter().copied().collect();
+            ("投票", eligible, completed)
+        }
+        Phase::RunoffDescribing {
+            candidates,
+            descriptions,
+        } => (
+            "发言",
+            candidates
+                .iter()
+                .copied()
+                .filter(|index| game.players[*index].alive)
+                .collect(),
+            descriptions.keys().copied().collect(),
+        ),
+        Phase::RunoffVoting { candidates, .. } => {
+            let eligible = alive_indices(&game.players)
+                .into_iter()
+                .filter(|index| !candidates.contains(index))
+                .collect::<Vec<_>>();
+            let completed = eligible.iter().copied().collect();
+            ("投票", eligible, completed)
+        }
+    };
+    let positions = eligible
+        .iter()
+        .map(|index| {
+            let position = game.players[*index].position;
+            if completed.contains(index) {
+                position
+            } else {
+                position.to_ascii_lowercase()
+            }
+        })
+        .collect::<String>();
+    format!(
+        "{},第{}轮,{},{}",
+        game.mode.label(),
+        game.round,
+        phase,
+        positions
+    )
+}
+
+fn alive_indices(players: &[Player]) -> Vec<usize> {
+    players
+        .iter()
+        .enumerate()
+        .filter_map(|(index, player)| player.alive.then_some(index))
+        .collect()
 }
 
 fn remaining_seconds(started: Instant, timeout_seconds: u64, now: Instant) -> u64 {
@@ -1460,6 +1546,10 @@ mod tests {
             UndercoverCommand::parse_friend("弃 权"),
             Some(UndercoverCommand::Abstain)
         );
+        assert_eq!(
+            UndercoverCommand::parse_friend("谜 底"),
+            Some(UndercoverCommand::Reveal)
+        );
         assert_eq!(UndercoverCommand::parse_hall("弃权"), None);
     }
 
@@ -1491,6 +1581,49 @@ mod tests {
                     && !message.contains("平民")
                     && !message.contains("卧底")
         )));
+    }
+
+    #[test]
+    fn status_uses_compact_phase_and_speech_case_markers() {
+        let now = Instant::now();
+        let mut game = enabled_game(11);
+        game.create("甲", UndercoverMode::Single, now).unwrap();
+        for player in ["乙", "丙", "丁"] {
+            game.join(player, now).unwrap();
+        }
+        let players = game
+            .start(UndercoverWordPair::new("苹果", "梨"), now)
+            .unwrap()
+            .into_iter()
+            .filter_map(|delivery| match delivery {
+                UndercoverDelivery::Friend { player, message } => {
+                    Some((player, message_position(&message)))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(game.status("旁观者", now), "单卧底,第1轮,发言,abcd");
+        game.complete_delivery(now).unwrap();
+
+        let player_a = players
+            .iter()
+            .find(|(_, position)| *position == 'A')
+            .map(|(player, _)| player.clone())
+            .expect("position A");
+        game.describe(&player_a, "第一条描述", now).unwrap();
+        assert_eq!(game.status("旁观者", now), "单卧底,第1轮,发言,Abcd");
+
+        for (index, (player, _)) in players.iter().enumerate() {
+            if player != &player_a {
+                game.describe(player, &format!("描述{}", index), now)
+                    .unwrap();
+            }
+        }
+        assert_eq!(game.status("旁观者", now), "单卧底,第1轮,投票,ABCD");
+
+        game.vote(&player_a, 'B', now).unwrap();
+        assert_eq!(game.status("旁观者", now), "单卧底,第1轮,投票,ABCD");
     }
 
     #[test]
@@ -1615,6 +1748,70 @@ mod tests {
         assert!(tied.iter().any(|delivery| matches!(delivery,
             UndercoverDelivery::Hall(message)
                 if message.contains("加赛仍并列") && message.contains("第2轮"))));
+    }
+
+    #[test]
+    fn runoff_with_no_eligible_voters_advances_to_next_round() {
+        let now = Instant::now();
+        let mut game = enabled_game(19);
+        game.create("甲", UndercoverMode::Single, now).unwrap();
+        for player in ["乙", "丙", "丁"] {
+            game.join(player, now).unwrap();
+        }
+        let deliveries = game
+            .start(UndercoverWordPair::new("苹果", "梨"), now)
+            .unwrap();
+        let players = deliveries
+            .iter()
+            .filter_map(|delivery| match delivery {
+                UndercoverDelivery::Friend { player, message } => {
+                    Some((player.clone(), message_position(message)))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        game.complete_delivery(now).unwrap();
+        for (index, (player, _)) in players.iter().enumerate() {
+            game.describe(player, &format!("描述{index}"), now).unwrap();
+        }
+
+        let first = players[0].1;
+        let second = players[1].1;
+        for ((player, _), target) in players.iter().zip([second, first, first, second]) {
+            game.vote(player, target, now).unwrap();
+        }
+
+        let (first_name, second_name) = {
+            let GameState::Playing(playing) = &mut game.state else {
+                panic!("tie should enter runoff description");
+            };
+            playing.players[2].alive = false;
+            playing.players[3].alive = false;
+            let candidates = match &playing.phase {
+                Phase::RunoffDescribing { candidates, .. } => candidates.clone(),
+                _ => panic!("tie should enter runoff description"),
+            };
+            let first_candidate = candidates[0];
+            let second_candidate = candidates[1];
+            (
+                playing.players[first_candidate].name.clone(),
+                playing.players[second_candidate].name.clone(),
+            )
+        };
+        game.describe(&first_name, "补充描述一", now).unwrap();
+        let result = game.describe(&second_name, "补充描述二", now).unwrap();
+
+        assert!(result.iter().any(|delivery| matches!(delivery,
+            UndercoverDelivery::Hall(message)
+                if message.contains("无人可投票") && message.contains("第2轮"))));
+        assert!(matches!(
+            game.state,
+            GameState::Playing(Playing {
+                phase: Phase::Describing { .. },
+                round: 2,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -1873,6 +2070,46 @@ mod tests {
         assert!(!json.contains("绝密卧底词"));
         assert!(!json.contains("civilian"));
         assert!(!json.contains("role"));
+    }
+
+    #[test]
+    fn reveal_is_read_only_and_rejects_current_or_eliminated_players() {
+        let now = Instant::now();
+        let mut game = enabled_game(43);
+        game.create("甲", UndercoverMode::Single, now).unwrap();
+        for player in ["乙", "丙", "丁"] {
+            game.join(player, now).unwrap();
+        }
+        game.start(UndercoverWordPair::new("绝密平民词", "绝密卧底词"), now)
+            .unwrap();
+        game.complete_delivery(now).unwrap();
+
+        let before = serde_json::to_string(&game.snapshot(now)).unwrap();
+        let deadline = game.next_deadline(now, true);
+        let lines = game.reveal("旁观者").unwrap();
+        let answer = lines.join("\n");
+        assert_eq!(lines.len(), 1);
+        assert!(answer.starts_with("平民词:绝密平民词,卧底词:绝密卧底词,卧底:"));
+        assert!(!answer.contains("内鬼位置"));
+        assert!(!answer.contains("仅私聊"));
+        assert!(!answer.contains("存活"));
+        assert!(!answer.contains("淘汰"));
+        assert!(!answer.contains('='));
+        assert_eq!(before, serde_json::to_string(&game.snapshot(now)).unwrap());
+        assert_eq!(deadline, game.next_deadline(now, true));
+
+        assert!(game.reveal("甲").is_err());
+        if let GameState::Playing(playing) = &mut game.state {
+            playing
+                .players
+                .iter_mut()
+                .find(|player| player.name == "甲")
+                .expect("creator remains in the game roster")
+                .alive = false;
+        } else {
+            panic!("game should still be playing");
+        }
+        assert!(game.reveal("甲").is_err());
     }
 
     fn enabled_game(seed: u64) -> UndercoverGame {

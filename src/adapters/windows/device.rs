@@ -6,7 +6,7 @@ use std::thread::sleep;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use enigo::{Enigo, Key, Keyboard, Settings};
+use enigo::{Button, Enigo, Key, Keyboard, Settings};
 use image::DynamicImage;
 
 use super::{input, window};
@@ -34,6 +34,10 @@ impl UiDevice for WindowsUiDevice {
 
     fn click_point(&mut self, x: i32, y: i32) -> Result<()> {
         input::click_game_point(PointConfig::new(x, y), &self.window)
+    }
+
+    fn click_button(&mut self, button: Button) -> Result<()> {
+        input::click_game_button(button, &self.window)
     }
 
     fn scroll_point(&mut self, x: i32, y: i32, length: i32) -> Result<()> {

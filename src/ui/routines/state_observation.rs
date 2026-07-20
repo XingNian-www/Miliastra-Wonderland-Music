@@ -53,6 +53,33 @@ pub(super) fn wait_for_stable_ui_kind(
     stage: &'static str,
     certainty: InputCertainty,
 ) -> Result<UiStateKind, UiRoutineFailure> {
+    wait_for_stable_ui_kind_internal(
+        context, config, expected, timeout_ms, stage, certainty, false,
+    )
+}
+
+pub(super) fn wait_for_stable_ui_kind_or_unknown(
+    context: &mut UiRoutineContext<'_>,
+    config: UiStateObservationConfig,
+    expected: Option<UiStateKind>,
+    timeout_ms: u64,
+    stage: &'static str,
+    certainty: InputCertainty,
+) -> Result<UiStateKind, UiRoutineFailure> {
+    wait_for_stable_ui_kind_internal(
+        context, config, expected, timeout_ms, stage, certainty, true,
+    )
+}
+
+fn wait_for_stable_ui_kind_internal(
+    context: &mut UiRoutineContext<'_>,
+    config: UiStateObservationConfig,
+    expected: Option<UiStateKind>,
+    timeout_ms: u64,
+    stage: &'static str,
+    certainty: InputCertainty,
+    allow_stable_unknown: bool,
+) -> Result<UiStateKind, UiRoutineFailure> {
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     let mut fresh_candidate: Option<(UiStateKind, String)> = None;
     let mut fresh_samples = 0_u32;
@@ -68,8 +95,8 @@ pub(super) fn wait_for_stable_ui_kind(
         match &observation {
             UiStateObservation::Classified(state) => {
                 let kind = state.classification().kind();
-                if kind == UiStateKind::Unknown || expected.is_some_and(|expected| expected != kind)
-                {
+                let expected_mismatch = expected.is_some_and(|expected| expected != kind);
+                if expected_mismatch || (kind == UiStateKind::Unknown && !allow_stable_unknown) {
                     fresh_candidate = None;
                     fresh_samples = 0;
                 } else {
@@ -80,8 +107,12 @@ pub(super) fn wait_for_stable_ui_kind(
                         fresh_candidate = Some(candidate);
                         fresh_samples = 1;
                     }
-                    if state.stable_kind() == Some(kind) && fresh_samples >= state.required_count()
-                    {
+                    let runtime_stable = if kind == UiStateKind::Unknown {
+                        allow_stable_unknown
+                    } else {
+                        state.stable_kind() == Some(kind)
+                    };
+                    if runtime_stable && fresh_samples >= state.required_count() {
                         return Ok(kind);
                     }
                 }

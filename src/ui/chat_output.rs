@@ -513,6 +513,14 @@ mod tests {
         );
         assert_eq!(redacted_chat_text("[玩家]：＃c"), REDACTED_UNDERCOVER_INPUT);
         assert_eq!(
+            redacted_chat_text("【谁是卧底谜底·仅私聊】平民词：苹果"),
+            "[谁是卧底秘密内容已隐藏]"
+        );
+        assert_eq!(
+            redacted_chat_text("平民词:苹果,卧底词:梨,卧底:B"),
+            "[谁是卧底秘密内容已隐藏]"
+        );
+        assert_eq!(
             redacted_chat_text("请存活玩家好友私聊 #A"),
             "请存活玩家好友私聊 #A"
         );

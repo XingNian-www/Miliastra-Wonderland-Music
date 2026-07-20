@@ -454,6 +454,8 @@ turtle_soup:
     api_key: ""
     # 高能力模型；请求只发送 OpenAI 标准 Chat Completions 字段
     model: "gpt-5.6"
+    # 可选的独立 HTTP(S) 代理；留空时沿用环境代理设置
+    http_proxy: ""
     # 单次裁决允许生成的最大 Token；复杂裁决使用更充足的 JSON 输出空间
     # 程序按 OpenAI Chat Completions 的 max_tokens 字段发送
     max_tokens: 1024
@@ -486,6 +488,8 @@ ai:
   # 模型名；点歌默认使用低延迟模型，custom 必须填写。
   # 网关可用模型以其 /v1/models 返回结果为准。
   model: "gpt-5.6-mini"
+  # 可选的独立 HTTP(S) 代理；只作用于点歌 AI，留空时沿用环境代理设置
+  http_proxy: ""
   # 第三方兼容字段。必须是 JSON object；默认空对象。
   # 程序会自动生成官方 Chat Completions 字段：model、messages、response_format、
   # temperature、stream=false、store=false、max_completion_tokens、top_p。
@@ -533,6 +537,8 @@ song_review:
     api_key: ""
     # 高能力审核模型；启用审核时必须同时填写 api_key。
     model: "gpt-5.6"
+    # 可选的独立 HTTP(S) 代理；只作用于歌曲审核，留空时沿用环境代理设置
+    http_proxy: ""
     # 第三方兼容字段；必须是 JSON object，默认空对象。
     # 程序会自动生成官方 Responses 字段：model、instructions、input、text、tools、
     # tool_choice、temperature、top_p、max_output_tokens、store、stream。

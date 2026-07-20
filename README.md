@@ -240,7 +240,7 @@ POST /startup/wonderland
 
 ## 候选歌曲审核
 
-`song_review` 是独立于 `ai` 的候选歌曲审核 Provider，使用标准 OpenAI Responses API、`web_search` 工具和严格 JSON Schema。它审核的是已经搜索、确认或 AI 选出的最终候选歌曲和 URI，不审核原始点歌意图；请求固定使用 `tool_choice: "required"` 和 `stream: false`，不自动发送第三方的 `enable_search`、`forced_search` 或 `enable_thinking` 字段。确有兼容需要时可通过 `song_review.provider.extra_body` 补充第三方字段，但与官方字段同名时官方值优先。控制台是最高权限入口：远程点歌、远程 AI 点歌、控制台发言和直接队列接口都无视审核；游戏内大厅和好友私聊点歌会在播放或入队前审核。
+`song_review` 是独立于 `ai` 的候选歌曲审核 Provider，使用标准 OpenAI Responses API、`web_search` 工具和严格 JSON Schema。它审核的是已经搜索、确认或 AI 选出的最终候选歌曲和 URI，不审核原始点歌意图；请求固定使用 `tool_choice: "required"` 和 `stream: false`，不自动发送第三方的 `enable_search`、`forced_search` 或 `enable_thinking` 字段。`song_review.provider.http_proxy` 可以单独指定 HTTP(S) 代理，留空时沿用环境代理设置。确有兼容需要时可通过 `song_review.provider.extra_body` 补充第三方字段，但与官方字段同名时官方值优先。控制台是最高权限入口：远程点歌、远程 AI 点歌、控制台发言和直接队列接口都无视审核；游戏内大厅和好友私聊点歌会在播放或入队前审核。
 
 审核模型必须返回 JSON：
 
@@ -546,8 +546,8 @@ http://127.0.0.1:18888
 | `idiom_chain` | 成语接龙词库、历史、超时和结束权限 |
 | `undercover` | 谁是卧底开关、词库、永久使用记录、人数和阶段计时 |
 | `turtle_soup` | 海龟汤题库、永久使用记录、OCR 稳定次数、超时、批量答案段数、AI 并发、独立 Provider 和追加提示词 |
-| `ai` | AI 供应商、API Key、模型、OpenAI Chat Completions 地址和第三方兼容字段 |
-| `song_review` | 候选歌曲审核开关、Responses Provider、联网搜索、打扰强度阈值、失败策略和审核条件 |
+| `ai` | AI 供应商、API Key、模型、OpenAI Chat Completions 地址、独立 HTTP(S) 代理和第三方兼容字段 |
+| `song_review` | 候选歌曲审核开关、Responses Provider、独立 HTTP(S) 代理、联网搜索、打扰强度阈值、失败策略和审核条件 |
 | `matching` | 歌名、歌手和 OCR 噪声匹配阈值 |
 | `hotkeys` | 全局热键开关和按键 |
 | `invite` | 好友列表 OCR 区域和邀请按钮模板搜索区域 |

@@ -1344,6 +1344,39 @@ stale_timeout_ms: 7500
     }
 
     #[test]
+    fn http_proxy_fields_default_when_omitted_from_existing_config() {
+        let mut value: serde_yaml::Value =
+            serde_yaml::from_str(bundled_config_yaml()).expect("default config value");
+        for path in [
+            "song_review.provider.http_proxy",
+            "ai.http_proxy",
+            "turtle_soup.ai.http_proxy",
+        ] {
+            let segments = path.split('.').collect::<Vec<_>>();
+            let mut parent = &mut value;
+            for segment in &segments[..segments.len() - 1] {
+                parent = parent
+                    .as_mapping_mut()
+                    .expect("configuration path mapping")
+                    .get_mut(serde_yaml::Value::String((*segment).to_string()))
+                    .expect("configuration path segment");
+            }
+            let field = segments.last().expect("configuration field");
+            parent
+                .as_mapping_mut()
+                .expect("configuration field parent")
+                .remove(serde_yaml::Value::String((*field).to_string()));
+        }
+
+        let config: AppConfig = serde_yaml::from_value(value)
+            .expect("proxy fields are optional for existing configurations");
+
+        assert!(config.ai.http_proxy.is_empty());
+        assert!(config.song_review.provider.http_proxy.is_empty());
+        assert!(config.turtle_soup.ai.http_proxy.is_empty());
+    }
+
+    #[test]
     fn player_fast_observation_interval_stays_below_low_normal_intervals() {
         let mut config: AppConfig =
             serde_yaml::from_str(bundled_config_yaml()).expect("default app config");

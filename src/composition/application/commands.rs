@@ -10,6 +10,9 @@ use crate::features::hall::{
 use crate::features::idiom_chain::{
     IdiomChainDeferredPort, IdiomChainExplanationPort, IdiomChainOutcome, IdiomDeliveryOutcome,
 };
+use crate::features::turtle_soup::{
+    QuestionSubmitOutcome, TurtleSoupApplicationPort, TurtleSoupCommandOutcome,
+};
 
 pub(super) struct ImmediateAdministrationPort {
     business: BusinessRuntimeHandle,
@@ -18,6 +21,14 @@ pub(super) struct ImmediateAdministrationPort {
 }
 
 pub(super) struct DeferredIdiomChainPort {
+    business: BusinessRuntimeHandle,
+}
+
+struct DeferredCardGamePort {
+    business: BusinessRuntimeHandle,
+}
+
+struct TurtleSoupCommandPort {
     business: BusinessRuntimeHandle,
 }
 
@@ -49,9 +60,10 @@ impl IdiomChainDeferredPort for DeferredIdiomChainPort {
         &mut self,
         player: &str,
         command: &idiom_chain::IdiomChainCommand,
+        observed_at: Instant,
     ) -> Result<IdiomChainOutcome> {
         self.business
-            .handle_idiom_chain(player, command)
+            .handle_idiom_chain_at(player, command, observed_at)
             .map_err(anyhow::Error::from)
     }
 
@@ -71,6 +83,63 @@ impl IdiomChainDeferredPort for DeferredIdiomChainPort {
                 EnqueueOutcome::Rejected => IdiomDeliveryOutcome::Rejected,
             },
         )
+    }
+}
+
+impl CardGameDeliveryPort for DeferredCardGamePort {
+    fn verify_friend(&self, _player: &str, _message: &str) -> Result<bool> {
+        Err(anyhow!("延迟牌类端口不能执行好友验证"))
+    }
+
+    fn send_friend(&self, _player: &str, _message: &str) -> Result<bool> {
+        Err(anyhow!("延迟牌类端口不能发送好友消息"))
+    }
+
+    fn send_friend_batch(
+        &self,
+        _deliveries: &[LandlordPrivateDelivery],
+    ) -> Result<FriendBatchOutcome> {
+        Err(anyhow!("延迟牌类端口不能发送好友批次"))
+    }
+
+    fn send_hall(&self, message: &str) -> Result<()> {
+        enqueue_current_hall_reply(&self.business, message)
+    }
+}
+
+impl TurtleSoupApplicationPort for TurtleSoupCommandPort {
+    fn handle_hall_command(
+        &mut self,
+        player: &str,
+        command: &turtle_soup::TurtleSoupCommand,
+    ) -> Result<TurtleSoupCommandOutcome> {
+        self.business
+            .handle_turtle_soup_hall_command(player, command)
+            .map_err(anyhow::Error::from)
+    }
+
+    fn handle_friend_command(
+        &mut self,
+        player: &str,
+        command: &turtle_soup::TurtleSoupCommand,
+    ) -> Result<TurtleSoupCommandOutcome> {
+        self.business
+            .handle_turtle_soup_friend_command(player, command)
+            .map_err(anyhow::Error::from)
+    }
+
+    fn submit_question(
+        &mut self,
+        question: turtle_soup::TurtleSoupQuestion,
+        observed_at: Instant,
+    ) -> Result<QuestionSubmitOutcome> {
+        self.business
+            .submit_turtle_soup_question_at(question, observed_at)
+            .map_err(anyhow::Error::from)
+    }
+
+    fn send_current_hall(&mut self, message: &str) -> Result<()> {
+        enqueue_current_hall_reply(&self.business, message)
     }
 }
 
@@ -110,6 +179,12 @@ impl AdministrationImmediatePort for ImmediateAdministrationPort {
 impl ApplicationRuntime {
     pub(super) fn deferred_idiom_chain_port(&self) -> DeferredIdiomChainPort {
         DeferredIdiomChainPort {
+            business: self.business.clone(),
+        }
+    }
+
+    fn turtle_soup_command_port(&self) -> TurtleSoupCommandPort {
+        TurtleSoupCommandPort {
             business: self.business.clone(),
         }
     }
@@ -184,12 +259,20 @@ impl ApplicationRuntime {
         parsed: &RoutedCommand,
         command: &idiom_chain::IdiomChainCommand,
     ) -> Result<()> {
+        let observed_at = command_observed_at(parsed);
         if command.requires_executor() {
             let application = self.idiom_chain_application;
-            application.execute_explanation(&parsed.username, command, self)
+            application.execute_explanation(&parsed.username, command, observed_at, self)
         } else {
-            log::warn!("成语接龙命令错误进入主执行器，改由延迟聊天队列处理");
-            self.handle_idiom_chain_command(parsed).map(|_| ())
+            log::debug!("成语接龙命令已按正式队列顺序处理，回复进入延迟聊天队列");
+            let mut port = self.deferred_idiom_chain_port();
+            self.idiom_chain_application.execute_deferred(
+                &parsed.raw,
+                &parsed.username,
+                command,
+                observed_at,
+                &mut port,
+            )
         }
     }
 
@@ -198,16 +281,44 @@ impl ApplicationRuntime {
         parsed: &RoutedCommand,
         command: &LandlordCommand,
     ) -> Result<()> {
-        self.execute_landlord_command(&parsed.username, command)
+        let observed_at = command_observed_at(parsed);
+        match card_game_effect_lane(command) {
+            CardGameEffectLane::Formal => self.card_games.execute_command(
+                &parsed.username,
+                command,
+                observed_at,
+                CardGameEffectLane::Formal,
+                self,
+            ),
+            CardGameEffectLane::Deferred => {
+                let port = DeferredCardGamePort {
+                    business: self.business.clone(),
+                };
+                self.card_games.execute_command(
+                    &parsed.username,
+                    command,
+                    observed_at,
+                    CardGameEffectLane::Deferred,
+                    &port,
+                )
+            }
+        }
     }
 
     fn execute_turtle_soup_intent(
         &mut self,
         parsed: &RoutedCommand,
-        _command: &turtle_soup::TurtleSoupCommand,
+        command: &turtle_soup::TurtleSoupCommand,
     ) -> Result<()> {
-        log::warn!("海龟汤命令错误进入主执行器，改由娱乐模块处理");
-        self.handle_turtle_soup_command(parsed).map(|_| ())
+        log::debug!("海龟汤控制命令已按正式队列顺序处理，回复进入延迟聊天队列");
+        let mut port = self.turtle_soup_command_port();
+        self.turtle_soup_application.execute_command(
+            &parsed.raw,
+            &parsed.username,
+            parsed.message_type == "pink",
+            command,
+            &mut port,
+        )
     }
 
     fn execute_undercover_intent(
@@ -276,16 +387,6 @@ impl ApplicationRuntime {
         self.hall_application.check_public_hall(&mut port)
     }
 
-    fn execute_landlord_command(&self, player: &str, command: &LandlordCommand) -> Result<()> {
-        self.card_games.execute_command(
-            player,
-            command,
-            Instant::now(),
-            CardGameEffectLane::Formal,
-            self,
-        )
-    }
-
     fn execute_undercover_command(
         &self,
         parsed: &RoutedCommand,
@@ -300,9 +401,27 @@ impl ApplicationRuntime {
             &parsed.username,
             source,
             command,
-            Instant::now(),
+            command_observed_at(parsed),
             self,
         )
+    }
+
+    pub(super) fn execute_turtle_soup_question(
+        &self,
+        question: turtle_soup::TurtleSoupQuestion,
+        observed_at: Instant,
+    ) -> Result<bool> {
+        let mut port = self.turtle_soup_command_port();
+        self.turtle_soup_application
+            .submit_question(question, observed_at, &mut port)
+    }
+}
+
+fn card_game_effect_lane(command: &LandlordCommand) -> CardGameEffectLane {
+    if command.requires_executor() {
+        CardGameEffectLane::Formal
+    } else {
+        CardGameEffectLane::Deferred
     }
 }
 
@@ -320,9 +439,10 @@ impl IdiomChainExplanationPort for ApplicationRuntime {
         &mut self,
         player: &str,
         command: &idiom_chain::IdiomChainCommand,
+        observed_at: Instant,
     ) -> Result<IdiomChainOutcome> {
         self.business
-            .explain_idiom_chain(player, command)
+            .explain_idiom_chain_at(player, command, observed_at)
             .map_err(anyhow::Error::from)
     }
 
@@ -344,7 +464,7 @@ impl AdministrationImmediatePort for ApplicationRuntime {
     }
 
     fn record_command_activity(&mut self) -> Result<()> {
-        ApplicationRuntime::record_command_activity(self)
+        ApplicationRuntime::record_command_activity(self, Instant::now())
     }
 
     fn log_executed(
@@ -495,5 +615,61 @@ impl HallMaintenancePort for ApplicationRuntime {
                 ..HallStatePatch::default()
             })
             .map_err(anyhow::Error::from)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn card_game_lane_matches_the_effects_required_by_each_command() {
+        for command in [
+            LandlordCommand::Start,
+            LandlordCommand::RunFastStart,
+            LandlordCommand::Join,
+            LandlordCommand::Rob,
+            LandlordCommand::Decline,
+            LandlordCommand::Hand,
+            LandlordCommand::Retry,
+        ] {
+            assert_eq!(
+                card_game_effect_lane(&command),
+                CardGameEffectLane::Formal,
+                "command={command:?}"
+            );
+        }
+
+        for command in [
+            LandlordCommand::Status,
+            LandlordCommand::Play("3".to_string()),
+            LandlordCommand::Pass,
+            LandlordCommand::Exit,
+        ] {
+            assert_eq!(
+                card_game_effect_lane(&command),
+                CardGameEffectLane::Deferred,
+                "command={command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn queued_command_uses_its_frame_capture_time() {
+        let captured_at = Instant::now() - Duration::from_secs(30);
+        let parsed = RoutedCommand {
+            matched: "#".to_string(),
+            raw: "状态".to_string(),
+            user_command: "#状态".to_string(),
+            message_type: "blue".to_string(),
+            username: "测试玩家".to_string(),
+            command: ModuleCommand::CardGame(LandlordCommand::Status),
+            observation: CommandObservation {
+                captured_at: Some(captured_at),
+                ..CommandObservation::default()
+            },
+        };
+
+        assert_eq!(command_observed_at(&parsed), captured_at);
     }
 }

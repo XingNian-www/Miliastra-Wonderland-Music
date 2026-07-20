@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -32,7 +33,11 @@ pub(crate) trait TurtleSoupApplicationPort {
         player: &str,
         command: &TurtleSoupCommand,
     ) -> Result<TurtleSoupCommandOutcome>;
-    fn submit_question(&mut self, question: TurtleSoupQuestion) -> Result<QuestionSubmitOutcome>;
+    fn submit_question(
+        &mut self,
+        question: TurtleSoupQuestion,
+        observed_at: Instant,
+    ) -> Result<QuestionSubmitOutcome>;
     fn send_current_hall(&mut self, message: &str) -> Result<()>;
 }
 
@@ -67,9 +72,10 @@ impl TurtleSoupApplication {
     pub(crate) fn submit_question<P: TurtleSoupApplicationPort + ?Sized>(
         &self,
         question: TurtleSoupQuestion,
+        observed_at: Instant,
         port: &mut P,
     ) -> Result<bool> {
-        match port.submit_question(question)? {
+        match port.submit_question(question, observed_at)? {
             QuestionSubmitOutcome::Ignored => Ok(false),
             QuestionSubmitOutcome::Queued { request_id } => {
                 log::info!("海龟汤提问已进入 AI 队列: request_id={}", request_id);
@@ -366,6 +372,7 @@ mod tests {
         fn submit_question(
             &mut self,
             _question: TurtleSoupQuestion,
+            _observed_at: Instant,
         ) -> Result<QuestionSubmitOutcome> {
             unreachable!("command test")
         }

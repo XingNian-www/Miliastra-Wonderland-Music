@@ -14,6 +14,8 @@ pub struct PlaybackRuntimeState {
     pub active_request: Option<ActivePlaybackRequest>,
     #[serde(deserialize_with = "deserialize_required_option")]
     pub last_observation: Option<PlaybackObservation>,
+    #[serde(default)]
+    pub previous_requests: Vec<ActivePlaybackRequest>,
 }
 
 fn deserialize_required_option<'de, D, T>(
@@ -33,6 +35,7 @@ impl Default for PlaybackRuntimeState {
             pause_reason: PauseReason::None,
             active_request: None,
             last_observation: None,
+            previous_requests: Vec::new(),
         }
     }
 }
@@ -104,6 +107,8 @@ pub struct PlaybackObservation {
 }
 
 impl PlaybackRuntimeState {
+    const MAX_PREVIOUS_REQUESTS: usize = 32;
+
     fn load(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
@@ -164,6 +169,128 @@ impl PlaybackRuntimeState {
             ConfirmedPlaybackState::ExternalPlayback
         };
     }
+
+    pub(crate) fn remember_active_request(&mut self) {
+        if !matches!(
+            self.state,
+            ConfirmedPlaybackState::RequestedSongPlaying
+                | ConfirmedPlaybackState::PausedByUser
+                | ConfirmedPlaybackState::PausedWaitingForQueue
+        ) {
+            return;
+        }
+        let Some(active) = self.active_request.clone() else {
+            return;
+        };
+        self.push_previous_request(active);
+    }
+
+    pub(crate) fn remember_current_playback(&mut self) {
+        if self.active_request.is_some() {
+            self.remember_active_request();
+            return;
+        }
+        if self.state != ConfirmedPlaybackState::ExternalPlayback {
+            return;
+        }
+        let Some(observation) = self.last_observation.clone() else {
+            return;
+        };
+        if observation.reliability != ObservationReliability::Reliable {
+            return;
+        }
+        if observation.status != "playing" && observation.status != "paused" {
+            return;
+        }
+        let uri = observation.uri.trim();
+        if uri.is_empty() {
+            return;
+        }
+        let request = ActivePlaybackRequest {
+            keyword: if observation.title.trim().is_empty() {
+                observation.uri.clone()
+            } else if observation.artist.trim().is_empty() {
+                observation.title.clone()
+            } else {
+                format!(
+                    "{} - {}",
+                    observation.title.trim(),
+                    observation.artist.trim()
+                )
+            },
+            source: source_from_uri(uri),
+            prefer_accompaniment: false,
+            requested_uri: uri.to_string(),
+            confirmed_uri: uri.to_string(),
+            song: format!("{}{}", observation.title, observation.artist),
+            title: observation.title,
+            artist: observation.artist,
+            started_at_ms: observation.captured_at_ms,
+            guard_started_at: None,
+        };
+        self.push_previous_request(request);
+    }
+
+    pub(crate) fn remove_previous_request(&mut self, request: &ActivePlaybackRequest) {
+        let identity = playback_identity(request);
+        if identity.is_empty() {
+            return;
+        }
+        if self
+            .previous_requests
+            .last()
+            .is_some_and(|previous| playback_identity(previous) == identity)
+        {
+            self.previous_requests.pop();
+            return;
+        }
+        if let Some(index) = self
+            .previous_requests
+            .iter()
+            .rposition(|previous| playback_identity(previous) == identity)
+        {
+            self.previous_requests.remove(index);
+        }
+    }
+
+    fn push_previous_request(&mut self, active: ActivePlaybackRequest) {
+        let identity = playback_identity(&active);
+        if identity.is_empty() {
+            return;
+        }
+        if self
+            .previous_requests
+            .last()
+            .is_some_and(|previous| playback_identity(previous) == identity)
+        {
+            return;
+        }
+        self.previous_requests.push(active);
+        if self.previous_requests.len() > Self::MAX_PREVIOUS_REQUESTS {
+            let excess = self.previous_requests.len() - Self::MAX_PREVIOUS_REQUESTS;
+            self.previous_requests.drain(..excess);
+        }
+    }
+}
+
+fn playback_identity(request: &ActivePlaybackRequest) -> String {
+    let uri = if request.confirmed_uri.trim().is_empty() {
+        request.requested_uri.trim()
+    } else {
+        request.confirmed_uri.trim()
+    };
+    if uri.is_empty() {
+        String::new()
+    } else {
+        format!("{}:{uri}", request.source.trim())
+    }
+}
+
+fn source_from_uri(uri: &str) -> String {
+    uri.strip_prefix("fuo://")
+        .and_then(|rest| rest.split('/').next())
+        .unwrap_or_default()
+        .to_string()
 }
 
 #[cfg(test)]
@@ -190,6 +317,21 @@ mod tests {
         .expect_err("persisted playback state must not infer missing current fields");
 
         assert!(error.to_string().contains("lastObservation"));
+    }
+
+    #[test]
+    fn persisted_state_without_navigation_history_restores_an_empty_history() {
+        let restored: PlaybackRuntimeState = serde_json::from_str(
+            r#"{
+                "state": "idle",
+                "pauseReason": "none",
+                "activeRequest": null,
+                "lastObservation": null
+            }"#,
+        )
+        .expect("older playback state remains readable");
+
+        assert!(restored.previous_requests.is_empty());
     }
 
     #[test]

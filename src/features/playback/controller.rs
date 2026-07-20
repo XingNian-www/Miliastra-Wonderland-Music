@@ -117,6 +117,14 @@ pub(crate) struct PlaybackRequest {
     pub(crate) source: String,
     pub(crate) prefer_accompaniment: bool,
     pub(crate) uri: String,
+    pub(crate) navigation: PlaybackNavigation,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum PlaybackNavigation {
+    #[default]
+    Normal,
+    Previous,
 }
 
 #[derive(Clone, Debug)]
@@ -271,6 +279,32 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         ))
     }
 
+    pub(crate) fn previous_playback_request(&self) -> Result<Option<PlaybackRequest>> {
+        let runtime = self.playback_state.snapshot()?;
+        let Some(previous) = runtime.previous_requests.last() else {
+            return Ok(None);
+        };
+        let uri = if previous.confirmed_uri.trim().is_empty() {
+            previous.requested_uri.trim()
+        } else {
+            previous.confirmed_uri.trim()
+        };
+        if uri.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(PlaybackRequest {
+            keyword: if previous.keyword.trim().is_empty() {
+                previous.song.clone()
+            } else {
+                previous.keyword.clone()
+            },
+            source: previous.source.clone(),
+            prefer_accompaniment: previous.prefer_accompaniment,
+            uri: uri.to_string(),
+            navigation: PlaybackNavigation::Previous,
+        }))
+    }
+
     pub(crate) fn should_queue_until_current_song_finished(
         &self,
         status: &PlayerStatus,
@@ -334,8 +368,8 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             .status()
             .map(|status| (status.current_uri, status.progress))
             .unwrap_or_default();
-        self.playback_state
-            .update(PlaybackStateUpdate::Starting(ActivePlaybackRequest {
+        self.playback_state.update(PlaybackStateUpdate::Starting {
+            request: ActivePlaybackRequest {
                 keyword: request.keyword.clone(),
                 source: request.source.clone(),
                 prefer_accompaniment: request.prefer_accompaniment,
@@ -346,7 +380,9 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
                 artist: String::new(),
                 started_at_ms: self.wall_clock.unix_millis(),
                 guard_started_at: Some(self.clock.now()),
-            }))?;
+            },
+            navigation: request.navigation,
+        })?;
         log::info!("播放器状态转移: Starting keyword={}", request.keyword);
         Ok(PlaybackAttempt {
             initial_uri: initial.0,
@@ -552,7 +588,6 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
                 &self.matching,
             )
         {
-            self.clear_active_request()?;
             log::info!(
                 "播放器状态转移: RequestedSongPlaying -> ExternalPlayback reason=track_changed"
             );
@@ -799,8 +834,10 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             started_at_ms: self.wall_clock.unix_millis(),
             guard_started_at: Some(self.clock.now()),
         };
-        self.playback_state
-            .update(PlaybackStateUpdate::Confirmed(active_request))?;
+        self.playback_state.update(PlaybackStateUpdate::Confirmed {
+            request: active_request,
+            navigation: request.navigation,
+        })?;
         self.record_song_dedup_playback(request, confirmed_uri, status)?;
         log::info!("播放器状态转移: Starting -> RequestedSongPlaying reason=playback_confirmed");
         Ok(())
@@ -907,7 +944,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
 
     fn restore_playback_state(&self, playback: PlaybackRuntimeState) -> Result<()> {
         self.playback_state
-            .update(PlaybackStateUpdate::Restore(playback))
+            .update(PlaybackStateUpdate::Restore(Box::new(playback)))
             .map(|_| ())
     }
 
@@ -1279,6 +1316,7 @@ mod tests {
             source: "qqmusic".to_string(),
             prefer_accompaniment: false,
             uri: uri.to_string(),
+            navigation: PlaybackNavigation::Normal,
         }
     }
 
@@ -1308,6 +1346,86 @@ mod tests {
 
         assert!(matches!(result, PlaybackVerification::Success { .. }));
         assert_eq!(controller.snapshot().state, "requested_song_playing");
+    }
+
+    #[test]
+    fn confirmed_playback_keeps_previous_uri_for_direct_previous() {
+        let uri_a = "fuo://qqmusic/songs/a";
+        let uri_b = "fuo://qqmusic/songs/b";
+        let backend = FakeBackend::new(vec![
+            stopped_status(),
+            status("歌曲A", uri_a, 1.0, 180.0),
+            status("歌曲A", uri_a, 2.0, 180.0),
+            status("歌曲B", uri_b, 1.0, 180.0),
+            status("歌曲B", uri_b, 2.0, 180.0),
+            status("歌曲A", uri_a, 3.0, 180.0),
+        ]);
+        let controller = controller(backend);
+
+        let first = playback_request("歌曲A", uri_a);
+        let mut attempt = controller.play_request_uri(&first).unwrap();
+        assert!(matches!(
+            controller.verify_playback_started(&first, &mut attempt),
+            Ok(PlaybackVerification::Success { .. })
+        ));
+
+        let second = playback_request("歌曲B", uri_b);
+        let mut attempt = controller.play_request_uri(&second).unwrap();
+        assert!(matches!(
+            controller.verify_playback_started(&second, &mut attempt),
+            Ok(PlaybackVerification::Success { .. })
+        ));
+
+        let previous = controller
+            .previous_playback_request()
+            .unwrap()
+            .expect("confirmed previous URI");
+        assert_eq!(previous.uri, uri_a);
+        assert_eq!(previous.navigation, PlaybackNavigation::Previous);
+
+        let mut previous_attempt = controller.play_request_uri(&previous).unwrap();
+        assert!(matches!(
+            controller.verify_playback_started(&previous, &mut previous_attempt),
+            Ok(PlaybackVerification::Success { .. })
+        ));
+        assert!(controller.previous_playback_request().unwrap().is_none());
+    }
+
+    #[test]
+    fn stable_external_observation_becomes_previous_uri_before_new_playback() {
+        let external_uri = "fuo://netease/songs/external";
+        let backend = FakeBackend::new(vec![
+            status("外部歌曲", external_uri, 20.0, 180.0),
+            status("新歌曲", "fuo://qqmusic/songs/new", 1.0, 180.0),
+        ]);
+        let controller = controller(backend);
+        controller
+            .playback_state
+            .update(PlaybackStateUpdate::External)
+            .unwrap();
+        controller
+            .playback_state
+            .update(PlaybackStateUpdate::Observation(PlaybackObservation {
+                status: "playing".to_string(),
+                uri: external_uri.to_string(),
+                title: "外部歌曲".to_string(),
+                artist: "歌手".to_string(),
+                progress: 20.0,
+                duration: 180.0,
+                captured_at_ms: 1,
+                reliability: ObservationReliability::Reliable,
+            }))
+            .unwrap();
+
+        let request = playback_request("新歌曲", "fuo://qqmusic/songs/new");
+        let _attempt = controller.play_request_uri(&request).unwrap();
+        let previous = controller
+            .previous_playback_request()
+            .unwrap()
+            .expect("external URI should be retained");
+
+        assert_eq!(previous.uri, external_uri);
+        assert_eq!(previous.source, "netease");
     }
 
     #[test]
@@ -1407,7 +1525,7 @@ mod tests {
             Some(Instant::now() - Duration::from_secs(60));
         controller
             .playback_state
-            .update(PlaybackStateUpdate::Restore(playback))
+            .update(PlaybackStateUpdate::Restore(Box::new(playback)))
             .unwrap();
 
         let decision = controller

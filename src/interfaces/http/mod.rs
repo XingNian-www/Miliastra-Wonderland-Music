@@ -2256,10 +2256,16 @@ fn queue_clear(state: &HttpSharedState) -> std::result::Result<String, AppError>
 }
 
 fn state_json(state: &HttpSharedState) -> std::result::Result<String, AppError> {
-    let playback = state
-        .queries
-        .playback_state_snapshot()
-        .map_err(internal_error)?;
+    let mut playback = serde_json::to_value(
+        state
+            .queries
+            .playback_state_snapshot()
+            .map_err(internal_error)?,
+    )
+    .map_err(internal_error)?;
+    if let Some(object) = playback.as_object_mut() {
+        object.remove("previousRequests");
+    }
     let hall = state
         .queries
         .hall_state_snapshot()
@@ -4416,6 +4422,7 @@ workflows:
         assert_eq!(snapshot["hallRemainingUpdatedAt"], 1234);
         assert_eq!(snapshot["hallExpiringWarningSent"], true);
         assert!(snapshot.get("hallRemainingMinutesNow").is_some());
+        assert!(snapshot["playback"].get("previousRequests").is_none());
 
         state_save(
             &[(

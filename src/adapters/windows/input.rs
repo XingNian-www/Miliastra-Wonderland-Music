@@ -2,7 +2,7 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use enigo::{Axis, Direction, Enigo, Key, Keyboard, Settings};
+use enigo::{Axis, Button, Direction, Enigo, Key, Keyboard, Settings};
 
 use super::clipboard;
 use super::window;
@@ -17,6 +17,15 @@ pub(super) fn click_game_point(
     let mut window = window::GameWindow::find(window_config)?;
     window.click(&mut enigo, point)?;
     Ok(())
+}
+
+pub(super) fn click_game_button(
+    button: Button,
+    window_config: &config::WindowConfig,
+) -> Result<()> {
+    let mut enigo = Enigo::new(&Settings::default()).context("create enigo")?;
+    let window = window::GameWindow::find(window_config)?;
+    window.click_button(&mut enigo, button)
 }
 
 pub(super) fn activate_game(
@@ -224,6 +233,7 @@ pub(crate) fn parse_key(value: &str) -> Result<Key> {
     let key = match normalized.as_str() {
         "return" | "enter" => Key::Return,
         "escape" | "esc" => Key::Escape,
+        "control" | "ctrl" => Key::Control,
         "f1" => Key::F1,
         "f2" => Key::F2,
         "f3" => Key::F3,

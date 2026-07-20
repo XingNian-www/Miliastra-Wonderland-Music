@@ -3,56 +3,47 @@ use super::*;
 use crate::features::administration::{
     AdministrationCommandContext, AdministrationDispatch, ImmediateAdministrationOutcome,
 };
-use crate::features::turtle_soup::{
-    QuestionSubmitOutcome, TurtleSoupApplicationPort, TurtleSoupCommandOutcome,
-};
 
-struct TurtleSoupCommandPort {
-    business: BusinessRuntimeHandle,
+enum ObservedInput<C, Q> {
+    Command(C),
+    Question(Q),
 }
 
-impl TurtleSoupApplicationPort for TurtleSoupCommandPort {
-    fn handle_hall_command(
-        &mut self,
-        player: &str,
-        command: &turtle_soup::TurtleSoupCommand,
-    ) -> Result<TurtleSoupCommandOutcome> {
-        self.business
-            .handle_turtle_soup_hall_command(player, command)
-            .map_err(anyhow::Error::from)
-    }
+fn merge_observed_inputs<C, Q>(
+    commands: Vec<(usize, C)>,
+    questions: Vec<(usize, Q)>,
+) -> Vec<ObservedInput<C, Q>> {
+    let mut inputs = commands
+        .into_iter()
+        .map(|(order, command)| (order, ObservedInput::Command(command)))
+        .chain(
+            questions
+                .into_iter()
+                .map(|(order, question)| (order, ObservedInput::Question(question))),
+        )
+        .collect::<Vec<_>>();
+    inputs.sort_by_key(|(order, _)| *order);
+    inputs.into_iter().map(|(_, input)| input).collect()
+}
 
-    fn handle_friend_command(
-        &mut self,
-        player: &str,
-        command: &turtle_soup::TurtleSoupCommand,
-    ) -> Result<TurtleSoupCommandOutcome> {
-        self.business
-            .handle_turtle_soup_friend_command(player, command)
-            .map_err(anyhow::Error::from)
-    }
-
-    fn submit_question(
-        &mut self,
-        question: turtle_soup::TurtleSoupQuestion,
-    ) -> Result<QuestionSubmitOutcome> {
-        self.business
-            .submit_turtle_soup_question(question)
-            .map_err(anyhow::Error::from)
-    }
-
-    fn send_current_hall(&mut self, message: &str) -> Result<()> {
-        enqueue_current_hall_reply(&self.business, message)
-    }
+fn attach_question_orders<Q: PartialEq>(
+    mut visible: Vec<(usize, Q)>,
+    accepted: Vec<Q>,
+) -> Result<Vec<(usize, Q)>> {
+    accepted
+        .into_iter()
+        .map(|question| {
+            let order = visible
+                .iter()
+                .position(|(_, candidate)| candidate == &question)
+                .map(|index| visible.remove(index).0)
+                .ok_or_else(|| anyhow!("稳定海龟汤提问无法映射回当前观察帧"))?;
+            Ok((order, question))
+        })
+        .collect()
 }
 
 impl ApplicationRuntime {
-    fn turtle_soup_command_port(&self) -> TurtleSoupCommandPort {
-        TurtleSoupCommandPort {
-            business: self.business.clone(),
-        }
-    }
-
     pub(super) fn clear_hall_countdown_cache_for_new_visual_session(
         &self,
         reason: &str,
@@ -732,8 +723,9 @@ impl ApplicationRuntime {
         let visible_turtle_questions = if self.business.turtle_soup_accepts_questions()? {
             messages
                 .iter()
-                .filter(|message| message.message_type == "blue" && !message.text.is_empty())
-                .filter(|message| {
+                .enumerate()
+                .filter(|(_, message)| message.message_type == "blue" && !message.text.is_empty())
+                .filter(|(_, message)| {
                     command::parse_command_envelope(
                         &message.text,
                         &message.message_type,
@@ -743,14 +735,20 @@ impl ApplicationRuntime {
                     .and_then(|envelope| command_router.route(&envelope, active_entertainment))
                     .is_none()
                 })
-                .filter_map(|message| turtle_soup::parse_question_message(&message.text, None))
+                .filter_map(|(order, message)| {
+                    turtle_soup::parse_question_message(&message.text, None)
+                        .map(|question| (order, question))
+                })
                 .collect::<Vec<_>>()
         } else {
             Vec::new()
         };
         let suppress_new_turtle_questions = !self.screen_lock_primed.load(AtomicOrdering::SeqCst);
         let new_turtle_questions = self.business.filter_turtle_soup_primary_questions(
-            visible_turtle_questions,
+            visible_turtle_questions
+                .iter()
+                .map(|(_, question)| question.clone())
+                .collect(),
             suppress_new_turtle_questions,
         )?;
         if messages.is_empty() {
@@ -827,34 +825,45 @@ impl ApplicationRuntime {
             }
             return Ok(());
         }
-        if self.commands_enabled()? {
-            for question in new_turtle_questions {
-                self.handle_turtle_soup_question(question)?;
+        let questions = if self.commands_enabled()? {
+            attach_question_orders(visible_turtle_questions, new_turtle_questions)?
+        } else {
+            Vec::new()
+        };
+        let commands = update
+            .accepted
+            .into_iter()
+            .map(|pending| {
+                let order = pending
+                    .routed
+                    .observation
+                    .message_id
+                    .as_ref()
+                    .and_then(|message_id| {
+                        observed_messages
+                            .iter()
+                            .position(|observed| &observed.id == message_id)
+                    })
+                    .unwrap_or(usize::MAX);
+                (order, pending)
+            })
+            .collect();
+
+        for input in merge_observed_inputs(commands, questions) {
+            match input {
+                ObservedInput::Question(question) => {
+                    self.enqueue_turtle_soup_question(question, frame.captured_at())?;
+                }
+                ObservedInput::Command(pending) => {
+                    if self.enqueue_chat_listener_command(&pending.routed)? {
+                        continue;
+                    }
+                    if self.apply_immediate_administration(&pending.routed, false)? {
+                        continue;
+                    }
+                    self.enqueue_pending_command(pending)?;
+                }
             }
-        }
-        for pending in update.accepted {
-            if self.handle_turtle_soup_command(&pending.routed)? {
-                continue;
-            }
-            if self.handle_idiom_chain_command(&pending.routed)? {
-                continue;
-            }
-            if self.handle_landlord_command(&pending.routed)? {
-                continue;
-            }
-            if self.enqueue_chat_listener_command(&pending.routed)? {
-                continue;
-            }
-            if self.pending_contains_command(&pending.routed)? {
-                log::info!("命令已在待处理队列，本轮跳过: {}", pending.routed.raw);
-                continue;
-            }
-            if self.apply_immediate_administration(&pending.routed, false)? {
-                continue;
-            }
-            log::info!("命令已加入待处理队列: {}", pending.routed.raw);
-            self.record_command_activity()?;
-            self.push_pending_task(PendingTask::Command(Box::new(pending)))?;
         }
         Ok(())
     }
@@ -895,7 +904,7 @@ impl ApplicationRuntime {
                     );
                     return Ok(true);
                 }
-                self.record_command_activity()?;
+                self.record_command_activity(command_observed_at(parsed))?;
                 if let Err(error) =
                     self.push_pending_task(PendingTask::SetChatListenerMode { target })
                 {
@@ -908,71 +917,17 @@ impl ApplicationRuntime {
         Ok(true)
     }
 
-    pub(super) fn handle_idiom_chain_command(&self, parsed: &RoutedCommand) -> Result<bool> {
-        let ModuleCommand::IdiomChain(command) = &parsed.command else {
-            return Ok(false);
-        };
-        if command.requires_executor() {
-            return Ok(false);
-        }
-        let mut port = self.deferred_idiom_chain_port();
-        self.idiom_chain_application.execute_deferred(
-            &parsed.raw,
-            &parsed.username,
-            command,
-            &mut port,
-        )?;
-        Ok(true)
-    }
-
-    fn handle_landlord_command(&self, parsed: &RoutedCommand) -> Result<bool> {
-        let ModuleCommand::CardGame(command) = &parsed.command else {
-            return Ok(false);
-        };
-        if command.requires_executor() {
-            return Ok(false);
-        }
-        self.card_games.execute_command(
-            &parsed.username,
-            command,
-            Instant::now(),
-            CardGameEffectLane::Deferred,
-            &DeferredCardGamePort { app: self },
-        )?;
-        log::info!(
-            "牌局命令已处理: command={} user={}",
-            parsed.raw,
-            parsed.username
-        );
-        Ok(true)
-    }
-
-    pub(super) fn handle_turtle_soup_command(&self, parsed: &RoutedCommand) -> Result<bool> {
-        let ModuleCommand::TurtleSoup(command) = &parsed.command else {
-            return Ok(false);
-        };
-        let mut port = self.turtle_soup_command_port();
-        self.turtle_soup_application.execute_command(
-            &parsed.raw,
-            &parsed.username,
-            parsed.message_type == "pink",
-            command,
-            &mut port,
-        )?;
-        Ok(true)
-    }
-
-    pub(super) fn handle_turtle_soup_question(
+    pub(super) fn enqueue_turtle_soup_question(
         &self,
         question: turtle_soup::TurtleSoupQuestion,
-    ) -> Result<bool> {
-        let mut port = self.turtle_soup_command_port();
-        self.turtle_soup_application
-            .submit_question(question, &mut port)
-    }
-
-    pub(super) fn enqueue_current_hall_reply(&self, text: &str) -> Result<()> {
-        enqueue_current_hall_reply(&self.business, text)
+        observed_at: Instant,
+    ) -> Result<()> {
+        self.record_command_activity(observed_at)?;
+        log::info!("海龟汤提问已加入正式输入队列: nickname={}", question.player);
+        self.push_pending_task(PendingTask::TurtleSoupQuestion {
+            question: Box::new(question),
+            observed_at,
+        })
     }
 
     pub(super) fn abort_entertainment_for_context_loss(&self, reason: &str) {
@@ -1061,15 +1016,6 @@ impl ApplicationRuntime {
             log::info!("命令识别已禁用，跳过二级大厅命令: {}", parsed.raw);
             return Ok(());
         }
-        if self.handle_turtle_soup_command(&parsed)? {
-            return Ok(());
-        }
-        if self.handle_idiom_chain_command(&parsed)? {
-            return Ok(());
-        }
-        if self.handle_landlord_command(&parsed)? {
-            return Ok(());
-        }
         if let ModuleCommand::Invite(invite) = &parsed.command
             && !self.business.invite_should_accept(invite.seq)?
         {
@@ -1077,19 +1023,23 @@ impl ApplicationRuntime {
             log::info!("邀请参数 {} 已执行过，跳过: {}", seq, parsed.raw);
             return Ok(());
         }
-        if self.pending_contains_command(&parsed)? {
-            log::info!("二级监听命令已在待处理队列，跳过: {}", parsed.raw);
-            return Ok(());
-        }
         if self.apply_immediate_administration(&parsed, true)? {
             return Ok(());
         }
-        self.record_command_activity()?;
-        log::info!("二级监听命令已加入待处理队列: {}", parsed.raw);
-        self.push_pending_task(PendingTask::Command(Box::new(PendingCommand {
+        self.enqueue_pending_command(PendingCommand {
             lock_key: command::lock_key(&parsed),
             routed: parsed,
-        })))
+        })
+    }
+
+    fn enqueue_pending_command(&self, pending: PendingCommand) -> Result<()> {
+        if self.pending_contains_command(&pending.routed)? {
+            log::info!("命令已在待处理队列，本轮跳过: {}", pending.routed.raw);
+            return Ok(());
+        }
+        self.record_command_activity(command_observed_at(&pending.routed))?;
+        log::info!("命令已加入待处理队列: {}", pending.routed.raw);
+        self.push_pending_task(PendingTask::Command(Box::new(pending)))
     }
 
     fn apply_immediate_administration(
@@ -1172,18 +1122,40 @@ pub(super) fn scan_chat_with_shared_ocr(
     messages
 }
 
-fn enqueue_current_hall_reply(business: &BusinessRuntimeHandle, text: &str) -> Result<()> {
-    match business.enqueue_deferred_chat(DeferredChatMessage {
-        text: text.to_string(),
-        target: DeferredChatTarget::CurrentHall,
-    })? {
-        EnqueueOutcome::Added => {}
-        EnqueueOutcome::DroppedMessage => {
-            log::warn!("大厅延迟回复入队时淘汰了一条较早的普通回复")
-        }
-        EnqueueOutcome::Rejected => {
-            log::warn!("大厅延迟回复队列已被受保护批次占满，当前回复已丢弃")
-        }
+#[cfg(test)]
+mod tests {
+    use super::{ObservedInput, attach_question_orders, merge_observed_inputs};
+
+    fn labels(inputs: Vec<ObservedInput<&'static str, &'static str>>) -> Vec<&'static str> {
+        inputs
+            .into_iter()
+            .map(|input| match input {
+                ObservedInput::Command(label) | ObservedInput::Question(label) => label,
+            })
+            .collect()
     }
-    Ok(())
+
+    #[test]
+    fn observed_commands_and_questions_keep_screen_order() {
+        let inputs = merge_observed_inputs(
+            vec![(1, "control"), (3, "later-control")],
+            vec![(0, "earlier-question"), (2, "question")],
+        );
+
+        assert_eq!(
+            labels(inputs),
+            ["earlier-question", "control", "question", "later-control"]
+        );
+    }
+
+    #[test]
+    fn accepted_equal_questions_retain_distinct_screen_positions() {
+        let ordered = attach_question_orders(
+            vec![(2, "same-question"), (5, "same-question")],
+            vec!["same-question", "same-question"],
+        )
+        .expect("question orders");
+
+        assert_eq!(ordered, [(2, "same-question"), (5, "same-question")]);
+    }
 }

@@ -732,7 +732,8 @@ impl ApplicationRuntime {
                     .filter(|player| !player.is_empty())
                     .and_then(|player| turtle_soup::parse_question_message(&text, Some(player)));
                 if let Some(question) = question {
-                    processed |= self.handle_turtle_soup_question(question)?;
+                    self.enqueue_turtle_soup_question(question, frame.captured_at())?;
+                    processed = true;
                     continue;
                 }
             }

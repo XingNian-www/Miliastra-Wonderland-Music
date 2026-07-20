@@ -1,9 +1,9 @@
 use super::*;
 
 impl ApplicationRuntime {
-    pub(super) fn record_command_activity(&self) -> Result<()> {
+    pub(super) fn record_command_activity(&self, observed_at: Instant) -> Result<()> {
         self.business
-            .record_command_activity(Instant::now())
+            .record_command_activity(observed_at)
             .map_err(anyhow::Error::from)
     }
 
@@ -57,6 +57,12 @@ impl ApplicationRuntime {
                 .map(|_| PendingTaskExecution::Completed),
             PendingTask::RestoreSecondaryHall => self
                 .execute_restore_secondary_hall_task()
+                .map(|_| PendingTaskExecution::Completed),
+            PendingTask::TurtleSoupQuestion {
+                question,
+                observed_at,
+            } => self
+                .execute_turtle_soup_question(*question, observed_at)
                 .map(|_| PendingTaskExecution::Completed),
             PendingTask::CardGameEffect(effect) => effect
                 .execute(self)

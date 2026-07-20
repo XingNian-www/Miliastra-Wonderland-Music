@@ -67,6 +67,7 @@ use crate::interfaces::chat::{
 };
 use crate::interfaces::hotkeys;
 use crate::interfaces::http::{self, WebToolRequest, WebToolTemplate};
+use crate::interfaces::ui_plan::{WorkflowOperation, WorkflowResidency};
 use crate::observation::chat::{
     ChatMessage, ChatObservationDispatch, ChatObservationExclusiveGuard, ChatObservationShared,
     ChatScanTelemetry, ChatScanTelemetrySink, CompletionAdvanceSubscriber, ObservedFrame,
@@ -186,7 +187,6 @@ impl ResolvedApplicationConfig {
                 input_timing: &app.timing.input,
                 delivery: &app.friend_delivery,
                 friend_list_region: app.invite.friend_list_region.into(),
-                friend_chat_region: app.invite.friend_chat_region.into(),
                 friend_step_ms: app.timing.invite.step_ms,
                 timeout_ms: app.timing.workflow.default_timeout_ms,
                 poll_ms: app.timing.workflow.default_poll_ms,
@@ -449,31 +449,6 @@ impl PlaybackStatePort for BusinessPlaybackStateAdapter {
     }
 }
 
-struct DeferredCardGamePort<'a> {
-    app: &'a ApplicationRuntime,
-}
-
-impl CardGameDeliveryPort for DeferredCardGamePort<'_> {
-    fn verify_friend(&self, _player: &str, _message: &str) -> Result<bool> {
-        Err(anyhow!("延迟牌类端口不能执行好友验证"))
-    }
-
-    fn send_friend(&self, _player: &str, _message: &str) -> Result<bool> {
-        Err(anyhow!("延迟牌类端口不能发送好友消息"))
-    }
-
-    fn send_friend_batch(
-        &self,
-        _deliveries: &[LandlordPrivateDelivery],
-    ) -> Result<FriendBatchOutcome> {
-        Err(anyhow!("延迟牌类端口不能发送好友批次"))
-    }
-
-    fn send_hall(&self, message: &str) -> Result<()> {
-        self.app.enqueue_current_hall_reply(message)
-    }
-}
-
 #[derive(Clone)]
 struct WindowDetectionSignal {
     inner: Arc<(Mutex<u64>, Condvar)>,
@@ -542,6 +517,10 @@ pub(crate) enum PendingTask {
         discard_only: bool,
     },
     RestoreSecondaryHall,
+    TurtleSoupQuestion {
+        question: Box<turtle_soup::TurtleSoupQuestion>,
+        observed_at: Instant,
+    },
     CardGameEffect(CardGameEffectTask),
     UndercoverEffect(UndercoverEffectTask),
 }
@@ -605,6 +584,7 @@ impl PendingTask {
                 }
             }
             Self::RestoreSecondaryHall => "二级监听恢复当前大厅".to_string(),
+            Self::TurtleSoupQuestion { .. } => "海龟汤提问".to_string(),
             Self::CardGameEffect(effect) => effect.label(),
             Self::UndercoverEffect(effect) => effect.label(),
         }
@@ -621,6 +601,7 @@ impl PendingTask {
             | Self::SetChatListenerMode { .. }
             | Self::SecondaryUnread { .. }
             | Self::RestoreSecondaryHall
+            | Self::TurtleSoupQuestion { .. }
             | Self::CardGameEffect(_)
             | Self::UndercoverEffect(_) => None,
         }
@@ -647,6 +628,7 @@ impl PendingTask {
             | Self::SetChatListenerMode { .. }
             | Self::SecondaryUnread { .. }
             | Self::RestoreSecondaryHall
+            | Self::TurtleSoupQuestion { .. }
             | Self::CardGameEffect(_)
             | Self::UndercoverEffect(_) => false,
         }
@@ -680,6 +662,41 @@ fn listener_residency(mode: ChatListenerMode, temporary_primary: bool) -> UiResi
     } else {
         UiResidency::Primary
     }
+}
+
+fn resolve_workflow_listener_residency(
+    operations: Vec<WorkflowOperation>,
+    target: UiResidency,
+) -> Vec<WorkflowOperation> {
+    let target = match target {
+        UiResidency::Primary => WorkflowResidency::Primary,
+        UiResidency::SecondaryCurrentHall => WorkflowResidency::SecondaryCurrentHall,
+    };
+    operations
+        .into_iter()
+        .map(|operation| match operation {
+            WorkflowOperation::ReturnListenerResidency => {
+                WorkflowOperation::EnsureResidency { target }
+            }
+            operation => operation,
+        })
+        .collect()
+}
+
+fn enqueue_current_hall_reply(business: &BusinessRuntimeHandle, text: &str) -> Result<()> {
+    match business.enqueue_deferred_chat(DeferredChatMessage {
+        text: text.to_string(),
+        target: DeferredChatTarget::CurrentHall,
+    })? {
+        EnqueueOutcome::Added => {}
+        EnqueueOutcome::DroppedMessage => {
+            log::warn!("大厅延迟回复入队时淘汰了一条较早的普通回复")
+        }
+        EnqueueOutcome::Rejected => {
+            log::warn!("大厅延迟回复队列已被受保护批次占满，当前回复已丢弃")
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1039,10 +1056,16 @@ fn command_username(parsed: &RoutedCommand) -> &str {
     }
 }
 
+fn command_observed_at(parsed: &RoutedCommand) -> Instant {
+    parsed.observation.captured_at.unwrap_or_else(Instant::now)
+}
+
 fn is_private_undercover_input(parsed: &RoutedCommand) -> bool {
     matches!(
         &parsed.command,
-        ModuleCommand::Undercover(UndercoverCommand::Vote(_) | UndercoverCommand::Abstain)
+        ModuleCommand::Undercover(
+            UndercoverCommand::Vote(_) | UndercoverCommand::Abstain | UndercoverCommand::Reveal,
+        )
     )
 }
 
@@ -1051,6 +1074,7 @@ fn private_safe_command_log(parsed: &RoutedCommand) -> &str {
         ModuleCommand::Undercover(UndercoverCommand::Vote(_) | UndercoverCommand::Abstain) => {
             "谁是卧底投票"
         }
+        ModuleCommand::Undercover(UndercoverCommand::Reveal) => "谁是卧底谜底查询",
         _ => &parsed.raw,
     }
 }
@@ -1349,6 +1373,39 @@ mod tests {
     }
 
     #[test]
+    fn return_primary_resolves_to_the_active_listener_residency() {
+        let operations = vec![
+            WorkflowOperation::PressKey {
+                key: "F".to_string(),
+            },
+            WorkflowOperation::ReturnListenerResidency,
+        ];
+
+        assert_eq!(
+            resolve_workflow_listener_residency(operations.clone(), UiResidency::Primary),
+            vec![
+                WorkflowOperation::PressKey {
+                    key: "F".to_string(),
+                },
+                WorkflowOperation::EnsureResidency {
+                    target: WorkflowResidency::Primary,
+                },
+            ]
+        );
+        assert_eq!(
+            resolve_workflow_listener_residency(operations, UiResidency::SecondaryCurrentHall,),
+            vec![
+                WorkflowOperation::PressKey {
+                    key: "F".to_string(),
+                },
+                WorkflowOperation::EnsureResidency {
+                    target: WorkflowResidency::SecondaryCurrentHall,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn secondary_hall_search_covers_the_scrollable_friend_list() {
         let anchor = Rect::new(10, 190, 65, 55);
         let friend_list = Rect::new(80, 280, 170, 600);
@@ -1375,6 +1432,22 @@ mod tests {
             listener_residency(ChatListenerMode::Primary, false),
             UiResidency::Primary
         );
+    }
+
+    #[test]
+    fn turtle_soup_question_task_label_does_not_expose_question_text() {
+        let question = turtle_soup::parse_question_message(
+            "测试玩家：# 这段敏感提问不应出现在任务标签中？",
+            None,
+        )
+        .expect("question");
+        let task = PendingTask::TurtleSoupQuestion {
+            question: Box::new(question),
+            observed_at: Instant::now(),
+        };
+
+        assert_eq!(task.label(), "海龟汤提问");
+        assert!(!task.label().contains("敏感提问"));
     }
 
     #[test]
@@ -1471,6 +1544,36 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RecordingCardGamePort {
+        hall_messages: Mutex<Vec<String>>,
+    }
+
+    impl CardGameDeliveryPort for RecordingCardGamePort {
+        fn verify_friend(&self, _player: &str, _message: &str) -> Result<bool> {
+            Ok(true)
+        }
+
+        fn send_friend(&self, _player: &str, _message: &str) -> Result<bool> {
+            Ok(true)
+        }
+
+        fn send_friend_batch(
+            &self,
+            _deliveries: &[LandlordPrivateDelivery],
+        ) -> Result<FriendBatchOutcome> {
+            Ok(FriendBatchOutcome::Complete)
+        }
+
+        fn send_hall(&self, message: &str) -> Result<()> {
+            self.hall_messages
+                .lock()
+                .expect("hall messages")
+                .push(message.to_string());
+            Ok(())
+        }
+    }
+
     fn card_game_runtime_for_test() -> BusinessRuntime {
         let idiom_chain = IdiomChainService::from_entries_for_test(&["画蛇添足", "足智多谋"], None);
         BusinessRuntime::start(
@@ -1503,6 +1606,36 @@ mod tests {
             panic!("failed verification should release the start reservation")
         };
         business.cancel_card_game_effect(retry.key).unwrap();
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn deferred_card_game_query_drives_the_real_effect_chain_without_lane_mismatch() {
+        let runtime = card_game_runtime_for_test();
+        let business = runtime.handle();
+        let card_games = CardGameApplication::new(Arc::new(business.clone()));
+        let delivery = RecordingCardGamePort::default();
+
+        card_games
+            .execute_command(
+                "甲",
+                &LandlordCommand::Start,
+                Instant::now(),
+                CardGameEffectLane::Formal,
+                &delivery,
+            )
+            .expect("formal start");
+        card_games
+            .execute_command(
+                "甲",
+                &LandlordCommand::Status,
+                Instant::now(),
+                CardGameEffectLane::Deferred,
+                &delivery,
+            )
+            .expect("deferred status");
+
+        assert_eq!(delivery.hall_messages.lock().unwrap().len(), 2);
         runtime.shutdown().unwrap();
     }
 

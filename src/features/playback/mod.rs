@@ -18,8 +18,8 @@ use crate::features::command::{
 };
 use crate::runtime::clock::WallClock;
 pub(crate) use controller::{
-    MismatchDecision, MusicPlayerBackend, PlaybackAttempt, PlaybackOutcome, PlaybackRequest,
-    PlaybackStatePort, PlaybackTimePorts, PlaybackVerification, PlayerController,
+    MismatchDecision, MusicPlayerBackend, PlaybackAttempt, PlaybackNavigation, PlaybackOutcome,
+    PlaybackRequest, PlaybackStatePort, PlaybackTimePorts, PlaybackVerification, PlayerController,
     QueueAdvanceContext, QueueAdvanceDecision,
 };
 pub(crate) use dedup::{PersistentSongDedupHistory, SongDedupCandidate};
@@ -426,15 +426,21 @@ pub(crate) enum PlaybackStateUpdate {
     UserResumed,
     ClearActiveRequest,
     External,
-    Starting(ActivePlaybackRequest),
+    Starting {
+        request: ActivePlaybackRequest,
+        navigation: PlaybackNavigation,
+    },
     ClearPauseReason,
     MarkRequestedPlayingIfActive,
     PauseWaitingForQueue,
     ResumeWaitingForQueue,
-    Confirmed(ActivePlaybackRequest),
+    Confirmed {
+        request: ActivePlaybackRequest,
+        navigation: PlaybackNavigation,
+    },
     Observation(PlaybackObservation),
     Unknown,
-    Restore(PlaybackRuntimeState),
+    Restore(Box<PlaybackRuntimeState>),
 }
 
 impl PlaybackStateUpdate {
@@ -453,12 +459,19 @@ impl PlaybackStateUpdate {
                 true
             }
             Self::External => {
+                playback.remember_current_playback();
                 playback.state = ConfirmedPlaybackState::ExternalPlayback;
                 playback.pause_reason = PauseReason::None;
                 playback.active_request = None;
                 true
             }
-            Self::Starting(request) => {
+            Self::Starting {
+                request,
+                navigation,
+            } => {
+                if navigation == PlaybackNavigation::Normal {
+                    playback.remember_current_playback();
+                }
                 playback.state = ConfirmedPlaybackState::Starting;
                 playback.pause_reason = PauseReason::None;
                 playback.active_request = Some(request);
@@ -489,7 +502,15 @@ impl PlaybackStateUpdate {
                 };
                 true
             }
-            Self::Confirmed(request) => {
+            Self::Confirmed {
+                request,
+                navigation,
+            } => {
+                if navigation == PlaybackNavigation::Previous {
+                    playback.remove_previous_request(&request);
+                } else {
+                    playback.remember_current_playback();
+                }
                 playback.state = ConfirmedPlaybackState::RequestedSongPlaying;
                 playback.pause_reason = PauseReason::None;
                 playback.active_request = Some(request);
@@ -510,7 +531,7 @@ impl PlaybackStateUpdate {
                 true
             }
             Self::Restore(previous) => {
-                *playback = previous;
+                *playback = *previous;
                 true
             }
         }

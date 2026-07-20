@@ -238,6 +238,7 @@ impl ResolvedSongRequest {
             source: self.source.clone(),
             prefer_accompaniment: self.prefer_accompaniment,
             uri: self.uri.clone(),
+            navigation: crate::features::playback::PlaybackNavigation::Normal,
         }
     }
 

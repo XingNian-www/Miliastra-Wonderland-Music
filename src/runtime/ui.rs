@@ -10,7 +10,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
-use enigo::Key;
+use enigo::{Button, Key};
 use image::DynamicImage;
 
 pub trait UiDevice: Send + 'static {
@@ -22,6 +22,10 @@ pub trait UiDevice: Send + 'static {
 
     fn click_point(&mut self, _x: i32, _y: i32) -> Result<()> {
         bail!("UI device does not support mouse input")
+    }
+
+    fn click_button(&mut self, _button: Button) -> Result<()> {
+        bail!("UI device does not support mouse button input")
     }
 
     fn scroll_point(&mut self, _x: i32, _y: i32, _length: i32) -> Result<()> {

@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 
 use super::{
-    MismatchDecision, PlaybackAttempt, PlaybackCommand, PlaybackOutcome, PlaybackRequest,
-    PlaybackSnapshot, PlaybackVerification, PlayerStatus, QueueAdvanceContext,
+    MismatchDecision, PlaybackAttempt, PlaybackCommand, PlaybackNavigation, PlaybackOutcome,
+    PlaybackRequest, PlaybackSnapshot, PlaybackVerification, PlayerStatus, QueueAdvanceContext,
     QueueAdvanceDecision, QueueItem, QueueRemoval, estimated_player_status, format_lyrics,
     format_play_message, format_status, song_title,
 };
@@ -113,6 +113,7 @@ impl PlaybackSelection {
             source: self.source.clone(),
             prefer_accompaniment: self.prefer_accompaniment,
             uri: self.uri.clone(),
+            navigation: PlaybackNavigation::Normal,
         }
     }
 
@@ -167,6 +168,9 @@ pub(crate) trait PlaybackCommandPort: PlaybackExecutionPort {
     -> Result<()>;
     fn pause_by_user(&mut self) -> Result<String>;
     fn resume_by_user(&mut self) -> Result<String>;
+    fn previous_playback_request(&mut self) -> Result<Option<PlaybackRequest>> {
+        Ok(None)
+    }
     fn next_external(&mut self) -> Result<String>;
     fn previous_external(&mut self) -> Result<String>;
     fn set_volume(&mut self, volume: &str) -> Result<()>;
@@ -262,10 +266,15 @@ impl PlaybackApplication {
                 }
             }
             PlaybackCommand::Previous => {
-                let message = port.previous_external()?;
-                port.update_monitor();
-                port.log_executed(context, "previous")?;
-                self.reply_player_status_after_skip(message.trim(), port)?;
+                if let Some(request) = port.previous_playback_request()? {
+                    self.play_request(&request, false, false, port)?;
+                    port.log_executed(context, "previous uri")?;
+                } else {
+                    let message = port.previous_external()?;
+                    port.update_monitor();
+                    port.log_executed(context, "previous")?;
+                    self.reply_player_status_after_skip(message.trim(), port)?;
+                }
             }
             PlaybackCommand::Volume(volume) => {
                 port.set_volume(volume)?;
@@ -463,7 +472,8 @@ impl PlaybackApplication {
                 port.reply(&request.dedup_skip_message())?;
                 continue;
             }
-            let outcome = self.play_confirmed(&request, true, port)?;
+            let allow_switch_source = request.uri.trim().is_empty();
+            let outcome = self.play_confirmed(&request, allow_switch_source, port)?;
             match outcome {
                 PlaybackOutcome::Success => {
                     port.remove_playback_queue(QueueRemoval::Id(item.id))?;
@@ -715,6 +725,7 @@ mod tests {
 
     use anyhow::{Result, bail};
 
+    use super::super::controller::PlaybackMismatch;
     use super::*;
     use crate::runtime::clock::{Clock, ManualClock};
 
@@ -792,6 +803,7 @@ mod tests {
         verifications: VecDeque<PlaybackVerification>,
         removed_ids: Vec<u64>,
         replies: Vec<String>,
+        decision_calls: usize,
     }
 
     #[test]
@@ -878,6 +890,7 @@ mod tests {
             _allow_ai: bool,
             _timeout_confirms: bool,
         ) -> Result<PlaybackDecision> {
+            self.decision_calls += 1;
             Ok(PlaybackDecision::Confirm)
         }
 
@@ -1022,6 +1035,7 @@ mod tests {
             ]),
             removed_ids: Vec::new(),
             replies: Vec::new(),
+            decision_calls: 0,
         };
         let application = PlaybackApplication::new(PlaybackApplicationConfig {
             console_bypass_dedup: true,
@@ -1040,5 +1054,225 @@ mod tests {
         assert!(port.queue.is_empty());
         assert_eq!(port.removed_ids, [1, 2]);
         assert_eq!(port.replies, ["平台无对应歌曲音源", "开始播放: 可播放歌曲"]);
+    }
+
+    #[test]
+    fn known_queue_uri_does_not_trigger_source_switch_on_mismatch() {
+        let item = QueueItem {
+            id: 9,
+            keyword: "队列歌曲".to_string(),
+            source: "qqmusic".to_string(),
+            uri: "fuo://qqmusic/songs/requested".to_string(),
+            ..QueueItem::default()
+        };
+        let mut port = VerifyingPlaybackPort {
+            queue: vec![item],
+            verifications: VecDeque::from([PlaybackVerification::MismatchedCandidate(
+                PlaybackMismatch {
+                    status: PlayerStatus {
+                        status: "playing".to_string(),
+                        current_uri: "fuo://netease/songs/other".to_string(),
+                        ..PlayerStatus::default()
+                    },
+                    local_reason: "URI不一致".to_string(),
+                },
+            )]),
+            removed_ids: Vec::new(),
+            replies: Vec::new(),
+            decision_calls: 0,
+        };
+        let application = PlaybackApplication::new(PlaybackApplicationConfig {
+            console_bypass_dedup: true,
+            queue_max_size: 20,
+            skip_status_initial_ms: 0,
+            skip_status_poll_ms: 0,
+            skip_status_retries: 0,
+            monitor_tick_ms: 50,
+            monitor_status_ms: 50,
+        });
+
+        application
+            .consume_queue("test", &mut port)
+            .expect("queue mismatch should be handled");
+
+        assert_eq!(port.decision_calls, 0);
+        assert_eq!(port.removed_ids, [9]);
+    }
+
+    struct NavigationCommandPort {
+        previous_request: Option<PlaybackRequest>,
+        played_uris: Vec<String>,
+        previous_calls: usize,
+        verifications: VecDeque<PlaybackVerification>,
+        replies: Vec<String>,
+        status: PlayerStatus,
+    }
+
+    impl PlaybackExecutionPort for NavigationCommandPort {
+        fn reply(&mut self, message: &str) -> Result<()> {
+            self.replies.push(message.to_string());
+            Ok(())
+        }
+
+        fn update_monitor(&mut self) {}
+
+        fn search_and_pick(
+            &mut self,
+            _keyword: &str,
+            _source: &str,
+            _prefer_accompaniment: bool,
+        ) -> std::result::Result<Option<PlaybackPickedCandidate>, PlaybackSearchFailure> {
+            unreachable!("navigation target already has a URI")
+        }
+
+        fn song_dedup_limited(&mut self, _request: &PlaybackRequest) -> Result<bool> {
+            Ok(false)
+        }
+
+        fn play_request_uri(&mut self, request: &PlaybackRequest) -> Result<PlaybackAttempt> {
+            self.played_uris.push(request.uri.clone());
+            Ok(PlaybackAttempt::for_test(&request.uri))
+        }
+
+        fn verify_playback_started(
+            &mut self,
+            _request: &PlaybackRequest,
+            _attempt: &mut PlaybackAttempt,
+        ) -> Result<PlaybackVerification> {
+            Ok(self
+                .verifications
+                .pop_front()
+                .expect("verification outcome"))
+        }
+
+        fn reject_mismatch_as_no_source(&mut self, _status: Option<&PlayerStatus>) -> Result<()> {
+            Ok(())
+        }
+
+        fn player_status(&mut self) -> Result<PlayerStatus> {
+            Ok(self.status.clone())
+        }
+
+        fn wait_for_decision(
+            &mut self,
+            _allow_switch_source: bool,
+            _allow_ai: bool,
+            _timeout_confirms: bool,
+        ) -> Result<PlaybackDecision> {
+            Ok(PlaybackDecision::Confirm)
+        }
+
+        fn playback_queue(&mut self) -> Result<Vec<QueueItem>> {
+            Ok(Vec::new())
+        }
+
+        fn remove_playback_queue(&mut self, _removal: QueueRemoval) -> Result<()> {
+            unreachable!("navigation does not consume the queue")
+        }
+    }
+
+    impl PlaybackCommandPort for NavigationCommandPort {
+        fn log_executed(
+            &mut self,
+            _context: &PlaybackCommandContext,
+            _final_command: &str,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn pause_by_user(&mut self) -> Result<String> {
+            Ok(String::new())
+        }
+
+        fn resume_by_user(&mut self) -> Result<String> {
+            Ok(String::new())
+        }
+
+        fn previous_playback_request(&mut self) -> Result<Option<PlaybackRequest>> {
+            Ok(self.previous_request.clone())
+        }
+
+        fn next_external(&mut self) -> Result<String> {
+            unreachable!("known previous URI should avoid native navigation")
+        }
+
+        fn previous_external(&mut self) -> Result<String> {
+            self.previous_calls += 1;
+            Ok(String::new())
+        }
+
+        fn set_volume(&mut self, _volume: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn remove_playback_queue_indexes(
+            &mut self,
+            _indexes: Vec<usize>,
+        ) -> Result<Vec<(usize, QueueItem)>> {
+            Ok(Vec::new())
+        }
+
+        fn clear_playback_queue(&mut self) -> Result<usize> {
+            Ok(0)
+        }
+
+        fn wait(&mut self, _duration: Duration) {}
+    }
+
+    #[test]
+    fn previous_prefers_known_uri_over_native_navigation() {
+        let previous_uri = "fuo://qqmusic/songs/previous";
+        let mut port = NavigationCommandPort {
+            previous_request: Some(PlaybackRequest {
+                keyword: "上一首歌曲".to_string(),
+                source: "qqmusic".to_string(),
+                prefer_accompaniment: false,
+                uri: previous_uri.to_string(),
+                navigation: PlaybackNavigation::Previous,
+            }),
+            played_uris: Vec::new(),
+            previous_calls: 0,
+            verifications: VecDeque::from([PlaybackVerification::Success {
+                status: PlayerStatus {
+                    status: "playing".to_string(),
+                    current_uri: previous_uri.to_string(),
+                    name: "上一首歌曲".to_string(),
+                    duration: 180.0,
+                    progress: 1.0,
+                    ..PlayerStatus::default()
+                },
+                message: "开始播放: 上一首歌曲".to_string(),
+            }]),
+            replies: Vec::new(),
+            status: PlayerStatus {
+                status: "playing".to_string(),
+                current_uri: previous_uri.to_string(),
+                name: "上一首歌曲".to_string(),
+                duration: 180.0,
+                progress: 1.0,
+                ..PlayerStatus::default()
+            },
+        };
+        let application = PlaybackApplication::new(PlaybackApplicationConfig {
+            console_bypass_dedup: true,
+            queue_max_size: 20,
+            skip_status_initial_ms: 0,
+            skip_status_poll_ms: 0,
+            skip_status_retries: 1,
+            monitor_tick_ms: 50,
+            monitor_status_ms: 50,
+        });
+        let context = PlaybackCommandContext {
+            message_type: "blue".to_string(),
+            username: "tester".to_string(),
+            user_command: "@上一首".to_string(),
+        };
+
+        application
+            .execute_command(&context, &PlaybackCommand::Previous, &mut port)
+            .expect("previous command");
+
+        assert_eq!(port.played_uris, [previous_uri]);
+        assert_eq!(port.previous_calls, 0);
     }
 }

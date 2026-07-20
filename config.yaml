@@ -28,9 +28,9 @@ screen:
     y: 879
     width: 416
     height: 143
-  # 一级聊天界面左下角好友按钮模板检测区域（游戏客户区坐标，不含标题栏）
+  # 一级聊天界面无聊天内容时好友按钮模板检测区域；有聊天内容时由蓝/黄/粉标识判定（游戏客户区坐标，不含标题栏）
   friend_rect:
-    x: 115
+    x: 170
     y: 1018
     width: 50
     height: 40
@@ -685,8 +685,6 @@ invite:
 friend_delivery:
   # 好友投递中确认尚未发送项的自动重试次数；0 表示禁用
   auto_retry_count: 0
-  # 快速匹配：左侧唯一昵称点击后，只稳定确认顶部为好友会话，不再二次 OCR 匹配目标昵称
-  fast_match: true
 
 custom_workflows:
   # 是否启用配置驱动的自定义流程命令
@@ -699,7 +697,8 @@ custom_workflows:
   # 自定义流程默认超时、轮询和步骤等待统一在 timing.workflow 中配置
   # 自定义模板名到图片路径的映射，步骤里通过 template 引用这里的名字
   templates: {}
-  # 支持的步骤：activate_game/focus_game/key/hold_key/click/click_template/wait_template/wait_template_absent/wait_stable/click_text/wait_text/paste/send_chat/send_current_chat/send_friend_message/invite_user/ensure_primary/ensure_current_hall/return_primary/sleep
+  # 支持的步骤：activate_game/focus_game/key/hold_key/click/mouse_button/click_template/wait_template/wait_template_absent/wait_stable/click_text/wait_text/paste/send_chat/send_current_chat/send_friend_message/invite_user/ensure_primary/ensure_current_hall/return_primary/sleep
+  # ensure_primary 固定返回一级；return_primary 按当前监听模式自动返回一级或二级当前大厅
   # wait_template_absent 默认在模板消失后继续等待像素稳定；可在步骤上设置 stable_after_absent: false 关闭
   # wait_stable 会等待 region 内像素变化稳定，适合点击后等待面板动画结束
   # 支持变量：{{username}}、{{args}}、{{arg1}}、{{arg2}}、{{command}}、{{workflow}}、{{message_type}}
@@ -732,7 +731,21 @@ custom_workflows:
   #         message: "{{username}} 触发了测试流程 {{args}}"
   #       - type: return_primary
   workflows:
-    # 好友私聊 @W/@S/@A/@D [秒数]，例如 @W 默认按住 1 秒、@W 10 按住 10 秒；指定秒数必须在 1 到 max_hold_key_seconds 之间
+    # WSAD 前的独立按钮；只允许从 Web 工作流列表选择“鼠标中键”，不提供聊天命令
+    - name: 鼠标中键
+      enabled: true
+      commands: []
+      allow_args: false
+      message_types: [pink]
+      confirm_before_run: false
+      confirm_message: ""
+      confirm_message_types: []
+      success_message: ""
+      steps:
+        - type: ensure_primary
+        - type: mouse_button
+          button: middle
+    # 好友私聊 @W/@S/@A/@D [秒数]：先按一下中键，再按住方向键；例如 @W 默认按住 1 秒、@W 10 按住 10 秒
     - name: hold-w
       enabled: true
       commands: [W]
@@ -744,6 +757,8 @@ custom_workflows:
       success_message: ""
       steps:
         - type: ensure_primary
+        - type: mouse_button
+          button: middle
         - type: hold_key
           key: W
           hold_seconds_arg: 1
@@ -758,6 +773,8 @@ custom_workflows:
       success_message: ""
       steps:
         - type: ensure_primary
+        - type: mouse_button
+          button: middle
         - type: hold_key
           key: S
           hold_seconds_arg: 1
@@ -772,6 +789,8 @@ custom_workflows:
       success_message: ""
       steps:
         - type: ensure_primary
+        - type: mouse_button
+          button: middle
         - type: hold_key
           key: A
           hold_seconds_arg: 1
@@ -786,9 +805,106 @@ custom_workflows:
       success_message: ""
       steps:
         - type: ensure_primary
+        - type: mouse_button
+          button: middle
         - type: hold_key
           key: D
           hold_seconds_arg: 1
+    # 好友私聊 @C：先确保一级界面，再按一次 Ctrl
+    - name: press-control
+      enabled: true
+      commands: [C]
+      allow_args: false
+      message_types: [pink]
+      confirm_before_run: false
+      confirm_message: ""
+      confirm_message_types: []
+      success_message: ""
+      steps:
+        - type: ensure_primary
+        - type: key
+          key: Ctrl
+    # 好友私聊 @CW/@CS/@CA/@CD [秒数]：Ctrl、中键、按住方向键、Ctrl；时长规则与 @W/@S/@A/@D 相同
+    - name: control-hold-w
+      enabled: true
+      commands: [CW]
+      allow_args: true
+      message_types: [pink]
+      confirm_before_run: false
+      confirm_message: ""
+      confirm_message_types: []
+      success_message: ""
+      steps:
+        - type: ensure_primary
+        - type: key
+          key: Ctrl
+        - type: mouse_button
+          button: middle
+        - type: hold_key
+          key: W
+          hold_seconds_arg: 1
+        - type: key
+          key: Ctrl
+    - name: control-hold-s
+      enabled: true
+      commands: [CS]
+      allow_args: true
+      message_types: [pink]
+      confirm_before_run: false
+      confirm_message: ""
+      confirm_message_types: []
+      success_message: ""
+      steps:
+        - type: ensure_primary
+        - type: key
+          key: Ctrl
+        - type: mouse_button
+          button: middle
+        - type: hold_key
+          key: S
+          hold_seconds_arg: 1
+        - type: key
+          key: Ctrl
+    - name: control-hold-a
+      enabled: true
+      commands: [CA]
+      allow_args: true
+      message_types: [pink]
+      confirm_before_run: false
+      confirm_message: ""
+      confirm_message_types: []
+      success_message: ""
+      steps:
+        - type: ensure_primary
+        - type: key
+          key: Ctrl
+        - type: mouse_button
+          button: middle
+        - type: hold_key
+          key: A
+          hold_seconds_arg: 1
+        - type: key
+          key: Ctrl
+    - name: control-hold-d
+      enabled: true
+      commands: [CD]
+      allow_args: true
+      message_types: [pink]
+      confirm_before_run: false
+      confirm_message: ""
+      confirm_message_types: []
+      success_message: ""
+      steps:
+        - type: ensure_primary
+        - type: key
+          key: Ctrl
+        - type: mouse_button
+          button: middle
+        - type: hold_key
+          key: D
+          hold_seconds_arg: 1
+        - type: key
+          key: Ctrl
     # 好友私聊 @F：先确保一级界面，再发送一次 F；任务结束后按监听模式恢复驻留界面
     - name: press-f
       enabled: true

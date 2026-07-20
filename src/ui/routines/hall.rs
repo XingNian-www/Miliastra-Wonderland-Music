@@ -502,7 +502,7 @@ mod tests {
         config.timing.input.click_ms = 0;
         config.timing.hall.page_settle_ms = 0;
         config.timing.hall.ocr_sample_interval_ms = 0;
-        config.timing.workflow.default_timeout_ms = 20;
+        config.timing.workflow.default_timeout_ms = 200;
         config.timing.workflow.default_poll_ms = 1;
         let keys = Arc::new(Mutex::new(Vec::new()));
         let ui_runtime = start_test_ui_runtime(

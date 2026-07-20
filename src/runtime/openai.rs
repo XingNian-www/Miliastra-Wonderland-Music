@@ -12,6 +12,7 @@ use async_openai::types::responses::CreateResponse;
 use serde::Serialize;
 use serde_json::Value;
 use tokio::runtime::{Builder, Runtime};
+use url::Url;
 
 pub(crate) use crate::adapters::ai_http::{Authentication, Target};
 
@@ -93,6 +94,21 @@ impl Drop for OpenAiRuntime {
 }
 
 impl OpenAiRuntimeHandle {
+    pub(crate) fn with_http_proxy(&self, proxy: &str) -> Result<Self> {
+        let Some(proxy) = build_http_proxy(proxy)? else {
+            return Ok(self.clone());
+        };
+        let http = reqwest::Client::builder()
+            .proxy(proxy)
+            .build()
+            .context("创建带代理的 AI HTTP 客户端失败")?;
+        Ok(Self {
+            runtime: self.runtime.clone(),
+            http,
+            state: Arc::clone(&self.state),
+        })
+    }
+
     pub(crate) fn chat_completion(
         &self,
         target: Target,
@@ -203,6 +219,26 @@ fn validate_timeout(timeout: Duration) -> Result<Duration> {
         bail!("OpenAI 请求超时必须大于 0");
     }
     Ok(timeout)
+}
+
+pub(crate) fn validate_http_proxy(proxy: &str) -> Result<()> {
+    build_http_proxy(proxy).map(|_| ())
+}
+
+fn build_http_proxy(proxy: &str) -> Result<Option<reqwest::Proxy>> {
+    let proxy = proxy.trim();
+    if proxy.is_empty() {
+        return Ok(None);
+    }
+    let url = Url::parse(proxy).context("AI HTTP 代理地址格式无效")?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        bail!("AI HTTP 代理必须是完整的 http:// 或 https:// 地址");
+    }
+    if url.fragment().is_some() {
+        bail!("AI HTTP 代理地址不能包含 fragment");
+    }
+    let proxy = reqwest::Proxy::all(proxy).context("AI HTTP 代理地址无效")?;
+    Ok(Some(proxy))
 }
 
 fn merge_extra_body<T: Serialize>(
@@ -327,6 +363,16 @@ mod tests {
     }
 
     #[test]
+    fn http_proxy_validation_accepts_http_urls_and_rejects_other_schemes() {
+        validate_http_proxy("").expect("empty proxy is allowed");
+        validate_http_proxy("http://127.0.0.1:7890").expect("HTTP proxy");
+        validate_http_proxy("https://proxy.example:8443").expect("HTTPS proxy");
+        assert!(validate_http_proxy("socks5://127.0.0.1:1080").is_err());
+        assert!(validate_http_proxy("not-a-url").is_err());
+        assert!(validate_http_proxy("http://proxy.example#fragment").is_err());
+    }
+
+    #[test]
     fn sdk_transport_uses_exact_endpoint_and_api_key_header() {
         let runtime = OpenAiRuntime::start().expect("OpenAI runtime");
         let (origin, requests, server) =
@@ -358,6 +404,67 @@ mod tests {
         assert!(request.starts_with("post /custom/v1/chat/completions?tenant=a http/1.1"));
         assert!(request.contains("\r\napi-key: secret\r\n"));
         assert!(!request.contains("\r\nauthorization:"));
+    }
+
+    #[test]
+    fn provider_handles_use_independent_http_proxies() {
+        let runtime = OpenAiRuntime::start().expect("OpenAI runtime");
+        let (proxy_a, requests_a, server_a) =
+            mock_server(200, r#"{"choices":[]}"#, Duration::from_secs(2), 32);
+        let (proxy_b, requests_b, server_b) =
+            mock_server(200, r#"{"choices":[]}"#, Duration::from_secs(2), 32);
+        let handle_a = runtime
+            .handle()
+            .with_http_proxy(&proxy_a)
+            .expect("proxy A handle");
+        let handle_b = runtime
+            .handle()
+            .with_http_proxy(&proxy_b)
+            .expect("proxy B handle");
+
+        let target_a = Target::chat(
+            "http://provider-a.invalid/v1/chat/completions",
+            "secret-a",
+            Authentication::Bearer,
+        )
+        .expect("target A");
+        let target_b = Target::chat(
+            "http://provider-b.invalid/v1/chat/completions",
+            "secret-b",
+            Authentication::Bearer,
+        )
+        .expect("target B");
+
+        handle_a
+            .chat_completion(
+                target_a,
+                chat_request(),
+                &HashMap::new(),
+                Duration::from_secs(1),
+            )
+            .expect("submit request A")
+            .wait()
+            .expect("response A");
+        handle_b
+            .chat_completion(
+                target_b,
+                chat_request(),
+                &HashMap::new(),
+                Duration::from_secs(1),
+            )
+            .expect("submit request B")
+            .wait()
+            .expect("response B");
+
+        server_a.join().expect("proxy A server");
+        server_b.join().expect("proxy B server");
+
+        let requests_a = requests_a.lock().expect("proxy A requests");
+        let requests_b = requests_b.lock().expect("proxy B requests");
+        assert_eq!(requests_a.len(), 1);
+        assert_eq!(requests_b.len(), 1);
+        assert!(requests_a[0].starts_with("POST http://provider-a.invalid/v1/chat/completions"));
+        assert!(requests_b[0].starts_with("POST http://provider-b.invalid/v1/chat/completions"));
     }
 
     #[test]

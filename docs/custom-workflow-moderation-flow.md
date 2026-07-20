@@ -47,6 +47,7 @@ flowchart TD
 - 按配置顺序匹配已启用工作流。
 - `message_types` 限制允许的聊天来源。
 - `commands` 定义触发词，可写带或不带 `@` 的形式。
+- `commands = []` 时没有聊天入口，但仍可按工作流 `name` 从 Web 执行。
 - `allow_args = false` 时触发词后不能带参数。
 - `allow_args = true` 时接受空格、紧贴或冒号参数。
 
@@ -87,6 +88,7 @@ flowchart TD
 | `sleep` / `wait` | 固定等待。 |
 | `key` / `press_key` | 按键。 |
 | `hold_key` | 限时按住按键。 |
+| `mouse_button` | 在当前鼠标位置点击受限的左、中或右键；输入前确认目标游戏仍在前台且鼠标位于游戏窗口内。 |
 | `activate_game` | 激活游戏窗口。 |
 | `focus_game` | 激活并聚焦游戏。 |
 | `click` | 点击固定坐标。 |
@@ -96,7 +98,8 @@ flowchart TD
 | `wait_stable` / `wait_pixels_stable` | 等待区域像素稳定。 |
 | `wait_text` / `click_text` | 使用 OCR 等待或点击文本。 |
 | `paste` / `paste_text` | 粘贴文本。 |
-| `ensure_primary` / `return_primary` | 到达一级监听驻留。 |
+| `ensure_primary` | 到达一级监听驻留。 |
+| `return_primary` | 按当前监听模式恢复驻留：一级监听回一级，二级监听回当前大厅。 |
 | `ensure_current_hall` | 到达当前大厅二级监听驻留。 |
 
 ### 业务能力步骤

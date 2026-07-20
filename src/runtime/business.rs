@@ -305,7 +305,7 @@ impl OperationalState {
 
     fn record_command_activity(&mut self, now: Instant) {
         if let Some(schedule) = self.idle_exit.as_mut() {
-            schedule.last_command_at = now;
+            schedule.last_command_at = schedule.last_command_at.max(now);
         }
     }
 
@@ -469,11 +469,13 @@ enum RuntimeMessage {
     HandleIdiomChain {
         player: String,
         command: IdiomChainCommand,
+        observed_at: Option<Instant>,
         response: SyncSender<Result<IdiomChainOutcome, BusinessRuntimeError>>,
     },
     ExplainIdiomChain {
         player: String,
         command: IdiomChainCommand,
+        observed_at: Option<Instant>,
         response: SyncSender<Result<IdiomChainOutcome, BusinessRuntimeError>>,
     },
     AbortIdiomChain(SyncSender<Result<bool, BusinessRuntimeError>>),
@@ -725,6 +727,7 @@ enum TurtleSoupRuntimeMessage {
     Accepts(SyncSender<bool>),
     Submit {
         question: TurtleSoupQuestion,
+        observed_at: Instant,
         response: SyncSender<Result<QuestionSubmitOutcome, BusinessRuntimeError>>,
     },
     Abort {
@@ -1539,9 +1542,28 @@ impl BusinessRuntimeHandle {
         player: &str,
         command: &IdiomChainCommand,
     ) -> Result<IdiomChainOutcome, BusinessRuntimeError> {
+        self.handle_idiom_chain_with_time(player, command, None)
+    }
+
+    pub fn handle_idiom_chain_at(
+        &self,
+        player: &str,
+        command: &IdiomChainCommand,
+        observed_at: Instant,
+    ) -> Result<IdiomChainOutcome, BusinessRuntimeError> {
+        self.handle_idiom_chain_with_time(player, command, Some(observed_at))
+    }
+
+    fn handle_idiom_chain_with_time(
+        &self,
+        player: &str,
+        command: &IdiomChainCommand,
+        observed_at: Option<Instant>,
+    ) -> Result<IdiomChainOutcome, BusinessRuntimeError> {
         self.request(|response| RuntimeMessage::HandleIdiomChain {
             player: player.to_string(),
             command: command.clone(),
+            observed_at,
             response,
         })
     }
@@ -1551,9 +1573,28 @@ impl BusinessRuntimeHandle {
         player: &str,
         command: &IdiomChainCommand,
     ) -> Result<IdiomChainOutcome, BusinessRuntimeError> {
+        self.explain_idiom_chain_with_time(player, command, None)
+    }
+
+    pub fn explain_idiom_chain_at(
+        &self,
+        player: &str,
+        command: &IdiomChainCommand,
+        observed_at: Instant,
+    ) -> Result<IdiomChainOutcome, BusinessRuntimeError> {
+        self.explain_idiom_chain_with_time(player, command, Some(observed_at))
+    }
+
+    fn explain_idiom_chain_with_time(
+        &self,
+        player: &str,
+        command: &IdiomChainCommand,
+        observed_at: Option<Instant>,
+    ) -> Result<IdiomChainOutcome, BusinessRuntimeError> {
         self.request(|response| RuntimeMessage::ExplainIdiomChain {
             player: player.to_string(),
             command: command.clone(),
+            observed_at,
             response,
         })
     }
@@ -1821,12 +1862,17 @@ impl BusinessRuntimeHandle {
             .map_err(|_| BusinessRuntimeError::RuntimeStopped)
     }
 
-    pub(crate) fn submit_turtle_soup_question(
+    pub(crate) fn submit_turtle_soup_question_at(
         &self,
         question: TurtleSoupQuestion,
+        observed_at: Instant,
     ) -> Result<QuestionSubmitOutcome, BusinessRuntimeError> {
         self.request(|response| {
-            RuntimeMessage::TurtleSoup(TurtleSoupRuntimeMessage::Submit { question, response })
+            RuntimeMessage::TurtleSoup(TurtleSoupRuntimeMessage::Submit {
+                question,
+                observed_at,
+                response,
+            })
         })
     }
 
@@ -3224,7 +3270,7 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
             }
             RuntimeMessage::RecordCommandActivity { now, response } => {
                 operational.record_command_activity(now);
-                publish_operational_state(&state_sink, &operational, now);
+                publish_operational_state(&state_sink, &operational, clock.now());
                 let _ = response.send(Ok(()));
             }
             RuntimeMessage::ClaimIdleExit { now, response } => {
@@ -3300,10 +3346,12 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
             RuntimeMessage::HandleIdiomChain {
                 player,
                 command,
+                observed_at,
                 response,
             } => {
+                let observed_at = observed_at.unwrap_or_else(|| clock.now());
                 let result = idiom_chain
-                    .handle_at(&mut entertainment, &player, &command, clock.now())
+                    .handle_at(&mut entertainment, &player, &command, observed_at)
                     .map_err(idiom_chain_operation_failed)
                     .and_then(|outcome| {
                         sync_idiom_deadline(
@@ -3320,10 +3368,12 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
             RuntimeMessage::ExplainIdiomChain {
                 player,
                 command,
+                observed_at,
                 response,
             } => {
+                let observed_at = observed_at.unwrap_or_else(|| clock.now());
                 let result = idiom_chain
-                    .explain_at(&player, &command, clock.now())
+                    .explain_at(&player, &command, observed_at)
                     .map_err(idiom_chain_operation_failed)
                     .and_then(|outcome| {
                         sync_idiom_deadline(
@@ -4148,9 +4198,13 @@ fn handle_turtle_soup_message(
         TurtleSoupRuntimeMessage::Accepts(response) => {
             let _ = response.send(service.accepts_questions());
         }
-        TurtleSoupRuntimeMessage::Submit { question, response } => {
+        TurtleSoupRuntimeMessage::Submit {
+            question,
+            observed_at,
+            response,
+        } => {
             let result = service
-                .submit_question(question)
+                .submit_question_at(question, observed_at)
                 .map_err(turtle_soup_operation_failed)
                 .and_then(|outcome| {
                     sync_turtle_soup_deadline(
@@ -4780,6 +4834,9 @@ mod tests {
             .unwrap();
         handle
             .record_command_activity(started_at + Duration::from_secs(30))
+            .unwrap();
+        handle
+            .record_command_activity(started_at + Duration::from_secs(20))
             .unwrap();
         assert_eq!(
             handle
@@ -5522,6 +5579,35 @@ mod tests {
         clock.advance(Duration::from_secs(1)).unwrap();
         assert!(handle.expire_idiom_chain().unwrap());
 
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn queued_idiom_input_uses_observation_time_instead_of_execution_time() {
+        let observed_at = Instant::now();
+        let clock = Arc::new(ManualClock::new(observed_at));
+        clock.advance(Duration::from_secs(31)).unwrap();
+        let runtime = BusinessRuntime::start_with_clock(
+            2,
+            idiom_service(Some(Duration::from_secs(30))),
+            CardGameService::new(LandlordConfig::default()),
+            clock,
+        )
+        .unwrap();
+        let handle = runtime.handle();
+
+        handle
+            .handle_idiom_chain_at(
+                "Alice",
+                &IdiomChainCommand::Start {
+                    idiom: "画蛇添足".to_string(),
+                    mode: IdiomChainMode::Exact,
+                },
+                observed_at,
+            )
+            .unwrap();
+
+        assert!(handle.expire_idiom_chain().unwrap());
         runtime.shutdown().unwrap();
     }
 

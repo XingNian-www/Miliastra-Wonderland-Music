@@ -27,6 +27,13 @@ pub enum WorkflowResidency {
     SecondaryCurrentHall,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkflowMouseButton {
+    Left,
+    Middle,
+    Right,
+}
+
 /// A feature-owned workflow can request only these mechanical UI operations.
 /// The UI runtime owns their execution semantics and never sees feature configuration.
 #[derive(Clone, Debug, PartialEq)]
@@ -50,8 +57,13 @@ pub enum WorkflowOperation {
     EnsureResidency {
         target: WorkflowResidency,
     },
+    /// Restore the active chat-listener residency; resolved by the application layer.
+    ReturnListenerResidency,
     ClickPoint {
         point: WorkflowPoint,
+    },
+    ClickMouseButton {
+        button: WorkflowMouseButton,
     },
     WaitTemplate {
         template: PathBuf,

@@ -211,7 +211,10 @@ impl RoutedCommand {
             message_type: "控制台".to_string(),
             username: "控制台".to_string(),
             command,
-            observation: CommandObservation::default(),
+            observation: CommandObservation {
+                captured_at: Some(Instant::now()),
+                ..CommandObservation::default()
+            },
         }
     }
 }

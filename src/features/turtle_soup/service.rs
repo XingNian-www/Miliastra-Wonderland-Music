@@ -1048,9 +1048,18 @@ impl TurtleSoupService {
         self.state.phase == TurtleSoupPhase::Active
     }
 
+    #[cfg(test)]
     pub(crate) fn submit_question(
         &mut self,
+        question: TurtleSoupQuestion,
+    ) -> Result<QuestionSubmitOutcome> {
+        self.submit_question_at(question, self.clock.now())
+    }
+
+    pub(crate) fn submit_question_at(
+        &mut self,
         mut question: TurtleSoupQuestion,
+        observed_at: Instant,
     ) -> Result<QuestionSubmitOutcome> {
         if !self.config.enabled {
             return Ok(QuestionSubmitOutcome::Ignored);
@@ -1097,7 +1106,7 @@ impl TurtleSoupService {
                     .participants
                     .entry(question.player_key)
                     .or_insert_with(|| question.player.clone());
-                session.last_question_at = Some(self.clock.now());
+                record_question_activity(session, observed_at);
                 log::info!(
                     "海龟汤批量答案已暂存: nickname={} part={} stored={}",
                     normalize_log_text(&question.player),
@@ -1203,7 +1212,7 @@ impl TurtleSoupService {
             .entry(job.player_key.clone())
             .or_insert_with(|| job.player.clone());
         session.question_count = session.question_count.saturating_add(1);
-        session.last_question_at = Some(self.clock.now());
+        record_question_activity(session, observed_at);
         log::info!(
             "海龟汤 AI 请求已排队: request_id={} nickname={}",
             request_id,
@@ -1684,6 +1693,14 @@ impl TurtleSoupService {
             entertainment.release(EntertainmentKind::TurtleSoup);
         }
     }
+}
+
+fn record_question_activity(session: &mut TurtleSoupSession, observed_at: Instant) {
+    session.last_question_at = Some(
+        session
+            .last_question_at
+            .map_or(observed_at, |previous| previous.max(observed_at)),
+    );
 }
 
 impl TurtleSoupWorker {
@@ -3358,6 +3375,62 @@ mod tests {
         clock.advance(Duration::from_secs(1)).unwrap();
         service.handle_deadline(&mut entertainment, kind, clock.now(), &mut delivery);
         assert_eq!(service.snapshot().phase, TurtleSoupPhase::Settling);
+    }
+
+    #[test]
+    fn queued_question_refreshes_idle_time_from_its_observation() {
+        let active_at = Instant::now();
+        let observed_at = active_at + Duration::from_secs(7);
+        let mut service = active_test_service();
+        service.config.idle_timeout_seconds = 30;
+        service.config.max_session_seconds = 600;
+        let session = service.state.session.as_mut().expect("active session");
+        session.selected_at = active_at;
+        session.active_at = Some(active_at);
+        session.last_question_at = Some(active_at);
+
+        service
+            .submit_question_at(
+                parse_question_message("Alice：# 他认识死者吗？", None).expect("question"),
+                observed_at,
+            )
+            .unwrap();
+
+        assert_eq!(
+            service.next_deadline(observed_at, true),
+            Some((
+                TurtleSoupDeadlineKind::SessionIdle,
+                observed_at + Duration::from_secs(30)
+            ))
+        );
+    }
+
+    #[test]
+    fn late_processing_cannot_move_question_activity_backwards() {
+        let active_at = Instant::now();
+        let latest_activity = active_at + Duration::from_secs(10);
+        let mut service = active_test_service();
+        service.config.idle_timeout_seconds = 30;
+        service.config.max_session_seconds = 600;
+        let session = service.state.session.as_mut().expect("active session");
+        session.selected_at = active_at;
+        session.active_at = Some(active_at);
+        session.last_question_at = Some(latest_activity);
+
+        service
+            .submit_question_at(
+                parse_question_message("Alice：##1 较早观察到的内容", None).expect("batch part"),
+                active_at + Duration::from_secs(5),
+            )
+            .unwrap();
+
+        assert_eq!(
+            service.next_deadline(latest_activity, true),
+            Some((
+                TurtleSoupDeadlineKind::SessionIdle,
+                latest_activity + Duration::from_secs(30)
+            ))
+        );
     }
 
     fn active_test_service() -> TurtleSoupService {

@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::runtime::clock::Delay;
-use crate::runtime::openai::{OpenAiRuntimeHandle, Target};
+use crate::runtime::openai::{OpenAiRuntimeHandle, Target, validate_http_proxy};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -45,6 +45,8 @@ impl Default for SongReviewConfig {
 
 impl SongReviewConfig {
     pub(crate) fn validate(&self) -> Result<()> {
+        validate_http_proxy(&self.provider.http_proxy)
+            .context("song_review.provider.http_proxy 配置无效")?;
         if !self.enabled {
             return Ok(());
         }
@@ -92,6 +94,8 @@ pub(crate) struct SongReviewProviderConfig {
     pub endpoint: String,
     pub api_key: String,
     pub model: String,
+    #[serde(default)]
+    pub http_proxy: String,
     pub extra_body: HashMap<String, Value>,
 }
 
@@ -491,6 +495,7 @@ mod tests {
                 endpoint: "https://example.com/v1/responses".to_string(),
                 api_key: "key".to_string(),
                 model: "gpt-5.6".to_string(),
+                http_proxy: String::new(),
                 extra_body: HashMap::new(),
             },
             ..SongReviewConfig::default()
@@ -530,6 +535,28 @@ mod tests {
 
         config.provider.endpoint = "https://example.com/v1/responses".to_string();
         config.validate().expect("valid Responses provider");
+    }
+
+    #[test]
+    fn enabled_review_configuration_rejects_an_unsupported_http_proxy() {
+        let mut config = SongReviewConfig {
+            enabled: true,
+            ..SongReviewConfig::default()
+        };
+        config.provider.api_key = "key".to_string();
+        config.provider.model = "gpt-5.6".to_string();
+        config.provider.endpoint = "https://example.com/v1/responses".to_string();
+        config.provider.http_proxy = "socks5://127.0.0.1:1080".to_string();
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn disabled_review_configuration_still_rejects_an_unsupported_http_proxy() {
+        let mut config = SongReviewConfig::default();
+        config.provider.http_proxy = "socks5://127.0.0.1:1080".to_string();
+
+        assert!(config.validate().is_err());
     }
 
     #[test]

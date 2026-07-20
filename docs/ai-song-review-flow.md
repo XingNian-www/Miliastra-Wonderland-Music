@@ -54,7 +54,7 @@ flowchart TD
 | `deepseek` | `https://api.deepseek.com/chat/completions` | `deepseek-chat` | `Authorization: Bearer ...` |
 | `custom` | 必须配置 | 必须配置 | `Authorization: Bearer ...` |
 
-所有点歌 AI 请求都走 OpenAI Chat Completions 标准格式，要求模型返回 JSON object，并固定发送 `stream: false`。请求超时使用 `timing.external.ai_request_timeout_ms`。`ai.extra_body` 只用于显式补充当前 Provider 的第三方兼容字段；默认是空对象，若与官方字段重名，代码生成的官方值优先。Web 调试接口通过 query 把 `provider` 改成与配置不同的 Provider 时会清空原 Provider 的 `extra_body`，避免把供应商私有字段带到另一家接口。
+所有点歌 AI 请求都走 OpenAI Chat Completions 标准格式，要求模型返回 JSON object，并固定发送 `stream: false`。请求超时使用 `timing.external.ai_request_timeout_ms`。`ai.http_proxy` 可为点歌 AI 单独指定 HTTP(S) 代理，留空时沿用环境代理设置；歌曲审核使用自己的 `song_review.provider.http_proxy`，两者不会共享显式代理。`ai.extra_body` 只用于显式补充当前 Provider 的第三方兼容字段；默认是空对象，若与官方字段重名，代码生成的官方值优先。Web 调试接口通过 query 把 `provider` 改成与配置不同的 Provider 时会清空原 Provider 的 `extra_body`，避免把供应商私有字段带到另一家接口。
 
 ### 三种能力
 
@@ -134,7 +134,7 @@ AI 返回 `match=true` 或 `decision=match` 时，只作为独立诊断结果展
 | `message_type` | 命令来源，例如大厅、私聊、控制台。 |
 | `username` | 触发点歌的用户名；好友私聊优先使用好友名。 |
 
-审核请求使用 OpenAI Responses API 的 `web_search` 工具，并固定发送官方 `tool_choice: "required"`，要求模型至少调用一次联网搜索；请求固定为 `stream: false`，并通过严格 JSON Schema 要求返回 `level`、`reason` 和 `tags`。Provider endpoint 必须是完整的 `/responses` 地址；默认不发送 `enable_search`、`forced_search`、`enable_thinking` 等供应商私有字段。确有兼容需要时只能通过 `song_review.provider.extra_body` 显式补充；与 `tool_choice`、`stream` 等官方字段重名时官方值优先。审核模型应使用联网搜索得到的曲风标签、歌词摘要、歌曲介绍、版本说明和公开听感描述判断；联网信息不足时，再按候选歌曲名称、歌手、URI 和用户描述保守判断。
+审核请求使用 OpenAI Responses API 的 `web_search` 工具，并固定发送官方 `tool_choice: "required"`，要求模型至少调用一次联网搜索；请求固定为 `stream: false`，并通过严格 JSON Schema 要求返回 `level`、`reason` 和 `tags`。Provider endpoint 必须是完整的 `/responses` 地址；`song_review.provider.http_proxy` 可单独指定 HTTP(S) 代理，留空时沿用环境代理设置。默认不发送 `enable_search`、`forced_search`、`enable_thinking` 等供应商私有字段。确有兼容需要时只能通过 `song_review.provider.extra_body` 显式补充；与 `tool_choice`、`stream` 等官方字段重名时官方值优先。审核模型应使用联网搜索得到的曲风标签、歌词摘要、歌曲介绍、版本说明和公开听感描述判断；联网信息不足时，再按候选歌曲名称、歌手、URI 和用户描述保守判断。
 
 审核口径来自配置：
 

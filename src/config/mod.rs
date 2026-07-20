@@ -793,8 +793,6 @@ impl HotkeyConfig {
 pub struct FriendDeliveryConfig {
     /// Maximum automatic retries for a message that is confirmed not to have been sent.
     pub auto_retry_count: u32,
-    /// Skip the second target-name match after a unique friend row has been selected.
-    pub fast_match: bool,
 }
 
 #[cfg(test)]
@@ -935,6 +933,102 @@ stale_timeout_ms: 7500
             serde_yaml::from_str(bundled_config_yaml()).expect("default config");
 
         config.validate().expect("default config is valid");
+    }
+
+    #[test]
+    fn default_direction_workflows_click_middle_before_every_direction_key() {
+        let config: AppConfig =
+            serde_yaml::from_str(bundled_config_yaml()).expect("default config");
+
+        let workflows = &config.custom_workflows.workflows;
+        let direction_start = workflows
+            .iter()
+            .position(|workflow| workflow.name == "hold-w")
+            .expect("missing default hold-w workflow");
+        let mouse = direction_start
+            .checked_sub(1)
+            .and_then(|index| workflows.get(index))
+            .expect("middle mouse workflow must precede WSAD");
+        assert_eq!(mouse.name, "鼠标中键");
+        assert!(mouse.commands.is_empty());
+        assert_eq!(mouse.message_types, ["pink"]);
+        assert!(!mouse.allow_args);
+        assert_eq!(
+            mouse
+                .steps
+                .iter()
+                .map(|step| step.step_type.as_str())
+                .collect::<Vec<_>>(),
+            ["ensure_primary", "mouse_button"]
+        );
+        assert_eq!(mouse.steps[1].button.as_deref(), Some("middle"));
+
+        for (name, key) in [
+            ("hold-w", "W"),
+            ("hold-s", "S"),
+            ("hold-a", "A"),
+            ("hold-d", "D"),
+        ] {
+            let workflow = workflows
+                .iter()
+                .find(|workflow| workflow.name == name)
+                .unwrap_or_else(|| panic!("missing default workflow {name}"));
+            assert_eq!(
+                workflow
+                    .steps
+                    .iter()
+                    .map(|step| step.step_type.as_str())
+                    .collect::<Vec<_>>(),
+                ["ensure_primary", "mouse_button", "hold_key"]
+            );
+            assert_eq!(workflow.steps[1].button.as_deref(), Some("middle"));
+            assert_eq!(workflow.steps[2].key.as_deref(), Some(key));
+            assert_eq!(workflow.steps[2].hold_seconds_arg, Some(1));
+        }
+
+        let control = workflows
+            .iter()
+            .find(|workflow| workflow.name == "press-control")
+            .expect("missing default press-control workflow");
+        assert_eq!(control.commands, ["C"]);
+        assert!(!control.allow_args);
+        assert_eq!(
+            control
+                .steps
+                .iter()
+                .map(|step| step.step_type.as_str())
+                .collect::<Vec<_>>(),
+            ["ensure_primary", "key"]
+        );
+        assert_eq!(control.steps[1].key.as_deref(), Some("Ctrl"));
+
+        for (name, command, key) in [
+            ("control-hold-w", "CW", "W"),
+            ("control-hold-s", "CS", "S"),
+            ("control-hold-a", "CA", "A"),
+            ("control-hold-d", "CD", "D"),
+        ] {
+            let workflow = workflows
+                .iter()
+                .find(|workflow| workflow.name == name)
+                .unwrap_or_else(|| panic!("missing default workflow {name}"));
+            assert_eq!(workflow.commands, [command]);
+            assert!(workflow.allow_args);
+            assert_eq!(workflow.message_types, ["pink"]);
+            assert_eq!(
+                workflow
+                    .steps
+                    .iter()
+                    .map(|step| step.step_type.as_str())
+                    .collect::<Vec<_>>(),
+                ["ensure_primary", "key", "mouse_button", "hold_key", "key"]
+            );
+            assert_eq!(workflow.steps[1].key.as_deref(), Some("Ctrl"));
+            assert_eq!(workflow.steps[2].button.as_deref(), Some("middle"));
+            assert_eq!(workflow.steps[3].key.as_deref(), Some(key));
+            assert_eq!(workflow.steps[3].hold_seconds_arg, Some(1));
+            assert_eq!(workflow.steps[4].key.as_deref(), Some("Ctrl"));
+        }
     }
 
     #[test]
@@ -1195,7 +1289,6 @@ stale_timeout_ms: 7500
             "logging.rotate_daily",
             "logging.retain_days",
             "friend_delivery.auto_retry_count",
-            "friend_delivery.fast_match",
             "custom_workflows.wait_template_absent_stable_default",
             "custom_workflows.max_hold_key_seconds",
             "invite.friend_name_stable_count",

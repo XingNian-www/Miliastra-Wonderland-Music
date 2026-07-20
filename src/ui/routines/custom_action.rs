@@ -11,7 +11,8 @@ use super::friend_delivery::{
 };
 use crate::adapters::windows::parse_key;
 use crate::interfaces::ui_plan::{
-    WorkflowOperation, WorkflowPixelStability, WorkflowPoint, WorkflowRect, WorkflowResidency,
+    WorkflowMouseButton, WorkflowOperation, WorkflowPixelStability, WorkflowPoint, WorkflowRect,
+    WorkflowResidency,
 };
 use crate::runtime::ocr::{OcrPriority, OcrRuntimeHandle};
 use crate::runtime::ui::{
@@ -235,8 +236,25 @@ fn execute_operation(
             restore_residency(context, ocr, residency, target)?;
             Ok(true)
         }
+        WorkflowOperation::ReturnListenerResidency => Err(observation_reason(
+            input_performed,
+            "resolve_custom_listener_residency",
+            "return_primary was not resolved by the application layer",
+        )),
         WorkflowOperation::ClickPoint { point } => {
             click(context, point).map_err(|error| input_failure("click_custom_point", error))?;
+            Ok(true)
+        }
+        WorkflowOperation::ClickMouseButton { button } => {
+            let button = match button {
+                WorkflowMouseButton::Left => enigo::Button::Left,
+                WorkflowMouseButton::Middle => enigo::Button::Middle,
+                WorkflowMouseButton::Right => enigo::Button::Right,
+            };
+            context
+                .device()
+                .click_button(button)
+                .map_err(|error| input_failure("click_custom_mouse_button", error))?;
             Ok(true)
         }
         WorkflowOperation::WaitTemplate {
@@ -633,7 +651,7 @@ mod tests {
     use std::sync::Mutex;
 
     use anyhow::Result;
-    use enigo::Key;
+    use enigo::{Button, Key};
     use image::DynamicImage;
 
     use super::*;
@@ -685,6 +703,52 @@ mod tests {
         }
     }
 
+    #[derive(Debug, PartialEq)]
+    enum OrderedInputEvent {
+        Key(Key),
+        Hold(Key, u64),
+        Mouse(Button),
+    }
+
+    struct OrderedInputDevice {
+        events: Arc<Mutex<Vec<OrderedInputEvent>>>,
+    }
+
+    impl UiDevice for OrderedInputDevice {
+        fn capture(&mut self) -> Result<DynamicImage> {
+            Ok(DynamicImage::new_rgba8(1920, 1080))
+        }
+
+        fn press_key(&mut self, key: Key) -> Result<()> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(OrderedInputEvent::Key(key));
+            Ok(())
+        }
+
+        fn hold_key(
+            &mut self,
+            key: Key,
+            duration: Duration,
+            _running: Arc<AtomicBool>,
+        ) -> Result<()> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(OrderedInputEvent::Hold(key, duration.as_secs()));
+            Ok(())
+        }
+
+        fn click_button(&mut self, button: Button) -> Result<()> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(OrderedInputEvent::Mouse(button));
+            Ok(())
+        }
+    }
+
     #[test]
     fn action_plan_finishes_before_the_next_ui_job_can_run() {
         let keys = Arc::new(Mutex::new(Vec::new()));
@@ -724,6 +788,107 @@ mod tests {
         assert_eq!(
             *keys.lock().unwrap(),
             vec![Key::Unicode('a'), Key::Unicode('b'), Key::Unicode('c')]
+        );
+        ocr_runtime.shutdown().unwrap();
+        ui_runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn mouse_button_operation_clicks_middle_button() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let ui_runtime = UiRuntime::start(
+            OrderedInputDevice {
+                events: events.clone(),
+            },
+            2,
+        )
+        .unwrap();
+        let ocr_runtime = OcrRuntime::start(EmptyOcr, 1).unwrap();
+        let config = AppConfig::load(Path::new("config.yaml")).unwrap();
+        let action_ui = CustomActionUi::new(
+            ui_runtime.handle(),
+            ocr_runtime.handle(),
+            Arc::new(AtomicBool::new(true)),
+            config.screen.expected_width,
+            config.screen.expected_height,
+            FriendDeliveryRoutineConfig::from_app(&config),
+        );
+
+        let outcome = action_ui
+            .submit(CustomActionPlan::new(
+                "direction-and-middle-click",
+                vec![WorkflowOperation::ClickMouseButton {
+                    button: WorkflowMouseButton::Middle,
+                }],
+            ))
+            .unwrap()
+            .wait()
+            .unwrap();
+
+        assert!(outcome.is_complete());
+        assert_eq!(outcome.completed(), 1);
+        assert_eq!(
+            *events.lock().unwrap(),
+            [OrderedInputEvent::Mouse(Button::Middle)]
+        );
+        ocr_runtime.shutdown().unwrap();
+        ui_runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn control_direction_workflow_preserves_input_order() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let ui_runtime = UiRuntime::start(
+            OrderedInputDevice {
+                events: events.clone(),
+            },
+            2,
+        )
+        .unwrap();
+        let ocr_runtime = OcrRuntime::start(EmptyOcr, 1).unwrap();
+        let config = AppConfig::load(Path::new("config.yaml")).unwrap();
+        let action_ui = CustomActionUi::new(
+            ui_runtime.handle(),
+            ocr_runtime.handle(),
+            Arc::new(AtomicBool::new(true)),
+            config.screen.expected_width,
+            config.screen.expected_height,
+            FriendDeliveryRoutineConfig::from_app(&config),
+        );
+
+        let outcome = action_ui
+            .submit(CustomActionPlan::new(
+                "control-hold-w",
+                vec![
+                    WorkflowOperation::PressKey {
+                        key: "Ctrl".to_string(),
+                    },
+                    WorkflowOperation::ClickMouseButton {
+                        button: WorkflowMouseButton::Middle,
+                    },
+                    WorkflowOperation::HoldKey {
+                        key: "W".to_string(),
+                        duration_seconds: 3,
+                    },
+                    WorkflowOperation::PressKey {
+                        key: "Ctrl".to_string(),
+                    },
+                ],
+            ))
+            .unwrap()
+            .wait()
+            .unwrap();
+
+        assert!(outcome.is_complete());
+        assert_eq!(outcome.completed(), 4);
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                OrderedInputEvent::Key(Key::Control),
+                OrderedInputEvent::Mouse(Button::Middle),
+                OrderedInputEvent::Hold(Key::Unicode('w'), 3),
+                OrderedInputEvent::Key(Key::Control),
+            ]
         );
         ocr_runtime.shutdown().unwrap();
         ui_runtime.shutdown().unwrap();

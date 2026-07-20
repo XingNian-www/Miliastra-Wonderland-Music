@@ -489,6 +489,29 @@ mod tests {
             ModuleCommand::Undercover(UndercoverCommand::Join)
         );
 
+        let reveal = parse_entertainment_shortcut(
+            "[用户]：#谜底",
+            "pink",
+            Some(EntertainmentKind::Undercover),
+        )
+        .expect("parse private reveal command");
+        assert_eq!(
+            reveal.command,
+            ModuleCommand::Undercover(UndercoverCommand::Reveal)
+        );
+        assert_eq!(reveal.raw, "谜底");
+
+        let public_reveal = parse_entertainment_shortcut(
+            "用户：#谜底",
+            "blue",
+            Some(EntertainmentKind::Undercover),
+        )
+        .expect("public answer word remains a description payload");
+        assert_eq!(
+            public_reveal.command,
+            ModuleCommand::Undercover(UndercoverCommand::Describe("谜底".to_string()))
+        );
+
         for text in ["[用户]：#c", "[用户]：＃投 C"] {
             let vote =
                 parse_entertainment_shortcut(text, "pink", Some(EntertainmentKind::Undercover))

@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::SearchCandidate;
-use crate::runtime::openai::{Authentication, OpenAiRuntimeHandle, Target};
+use crate::runtime::openai::{Authentication, OpenAiRuntimeHandle, Target, validate_http_proxy};
 
 const MIMO_ENDPOINT: &str = "https://api.xiaomimimo.com/v1/chat/completions";
 const MIMO_MODEL: &str = "mimo-v2.5";
@@ -28,11 +28,14 @@ pub struct AiConfig {
     pub api_key: String,
     pub endpoint: String,
     pub model: String,
+    #[serde(default)]
+    pub http_proxy: String,
     pub extra_body: HashMap<String, Value>,
 }
 
 impl AiConfig {
     pub(crate) fn validate(&self) -> Result<()> {
+        validate_http_proxy(&self.http_proxy).context("ai.http_proxy 配置无效")?;
         if self.api_key.trim().is_empty() {
             return Ok(());
         }
@@ -592,6 +595,7 @@ mod tests {
                 api_key: "secret".to_string(),
                 endpoint: "https://gateway.example/v1/chat/completions".to_string(),
                 model: "test-model".to_string(),
+                http_proxy: String::new(),
                 extra_body: HashMap::new(),
             };
 
@@ -599,6 +603,34 @@ mod tests {
 
             assert!(error.to_string().contains("provider只允许"));
         }
+    }
+
+    #[test]
+    fn provider_rejects_an_unsupported_http_proxy() {
+        let config = AiConfig {
+            provider: "openai".to_string(),
+            api_key: "secret".to_string(),
+            endpoint: "https://gateway.example/v1/chat/completions".to_string(),
+            model: "test-model".to_string(),
+            http_proxy: "socks5://127.0.0.1:1080".to_string(),
+            extra_body: HashMap::new(),
+        };
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn disabled_provider_still_rejects_an_unsupported_http_proxy() {
+        let config = AiConfig {
+            provider: "openai".to_string(),
+            api_key: String::new(),
+            endpoint: String::new(),
+            model: String::new(),
+            http_proxy: "socks5://127.0.0.1:1080".to_string(),
+            extra_body: HashMap::new(),
+        };
+
+        assert!(config.validate().is_err());
     }
 
     #[test]
@@ -631,6 +663,7 @@ mod tests {
             api_key: "secret".to_string(),
             endpoint: MIMO_ENDPOINT.to_string(),
             model: MIMO_MODEL.to_string(),
+            http_proxy: String::new(),
             extra_body: compatibility_fields.clone(),
         };
 

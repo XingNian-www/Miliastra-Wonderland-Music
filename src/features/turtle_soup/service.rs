@@ -27,7 +27,7 @@ use crate::features::chat_text::{MAX_CHAT_WIDTH, display_width, split_numbered_c
 use crate::features::entertainment::{AcquireOutcome, EntertainmentKind, EntertainmentState};
 use crate::runtime::clock::{Clock, Delay};
 use crate::runtime::identity::SessionGeneration;
-use crate::runtime::openai::{Authentication, OpenAiRuntimeHandle, Target};
+use crate::runtime::openai::{Authentication, OpenAiRuntimeHandle, Target, validate_http_proxy};
 use crate::text::normalize_comparison_text;
 
 const RECENT_JUDGMENT_LIMIT: usize = 30;
@@ -99,6 +99,9 @@ impl TurtleSoupConfig {
                 bail!("海龟汤题库和使用记录路径不能为空");
             }
             validate_provider_config(&self.ai)?;
+        } else {
+            validate_http_proxy(&self.ai.http_proxy)
+                .context("turtle_soup.ai.http_proxy 配置无效")?;
         }
         Ok(())
     }
@@ -110,6 +113,8 @@ pub struct TurtleSoupAiConfig {
     pub endpoint: String,
     pub api_key: String,
     pub model: String,
+    #[serde(default)]
+    pub http_proxy: String,
     pub max_tokens: u32,
     pub extra_body: HashMap<String, Value>,
 }
@@ -120,6 +125,7 @@ impl Default for TurtleSoupAiConfig {
             endpoint: OPENAI_DEFAULT_ENDPOINT.to_string(),
             api_key: String::new(),
             model: OPENAI_DEFAULT_MODEL.to_string(),
+            http_proxy: String::new(),
             max_tokens: DEFAULT_AI_MAX_TOKENS,
             extra_body: HashMap::new(),
         }
@@ -2271,6 +2277,7 @@ fn validate_provider_config(config: &TurtleSoupAiConfig) -> Result<()> {
     if config.api_key.trim().is_empty() {
         bail!("turtle_soup.ai.api_key 未配置");
     }
+    validate_http_proxy(&config.http_proxy).context("turtle_soup.ai.http_proxy 配置无效")?;
     Target::chat(&config.endpoint, &config.api_key, Authentication::Bearer)
         .context("turtle_soup.ai Provider 配置无效")?;
     if config.model.trim().is_empty() {
@@ -2518,6 +2525,7 @@ mod tests {
             endpoint: "https://example.com/v1/chat/completions".to_string(),
             api_key: "test-key".to_string(),
             model: "custom-model".to_string(),
+            http_proxy: String::new(),
             max_tokens: 2_048,
             extra_body: HashMap::new(),
         };
@@ -3261,6 +3269,27 @@ mod tests {
         config.api_key = "key".to_string();
         config.max_tokens = 0;
         assert!(validate_provider_config(&config).is_err());
+    }
+
+    #[test]
+    fn provider_validation_rejects_an_unsupported_http_proxy() {
+        let config = TurtleSoupAiConfig {
+            endpoint: "https://example.com/v1/chat/completions".to_string(),
+            api_key: "key".to_string(),
+            model: "model".to_string(),
+            http_proxy: "socks5://127.0.0.1:1080".to_string(),
+            ..TurtleSoupAiConfig::default()
+        };
+
+        assert!(validate_provider_config(&config).is_err());
+    }
+
+    #[test]
+    fn disabled_configuration_still_rejects_an_unsupported_http_proxy() {
+        let mut config = TurtleSoupConfig::default();
+        config.ai.http_proxy = "socks5://127.0.0.1:1080".to_string();
+
+        assert!(config.validate().is_err());
     }
 
     #[test]

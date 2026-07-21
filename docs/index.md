@@ -8,14 +8,14 @@
 | --- | --- |
 | [代码梳理](code-walkthrough.md) | 程序整体如何启动、扫描、入队、执行、播放、监控。 |
 | [执行器流程](executor-flow.md) | 待执行任务队列如何串行执行游戏操作。 |
-| [命令模型与屏幕锁](command-model-locks.md) | 命令如何去重、屏幕锁如何避免同屏重复执行。 |
+| [命令模型与屏幕锁](command-model-locks.md) | 命令如何去重，以及普通命令如何与独占决策并行。 |
 | [支撑运行模块](supporting-runtime-modules.md) | 调试工具、热键、截图、OCR 底层、日志、TUI 和持久化分别在哪里。 |
 
 ## 聊天、OCR 与 UI
 
 | 文档 | 适合回答的问题 |
 | --- | --- |
-| [聊天命令进入队列](chat-command-ingestion.md) | OCR 消息如何变成命令，哪些来源能触发业务。 |
+| [聊天命令进入队列](chat-command-ingestion.md) | OCR 消息如何变成命令，确认等待期间普通命令如何继续入队。 |
 | [成语接龙](idiom-chain.md) | 成语词库、合法性规则、命令和配置如何工作。 |
 | [谁是卧底](undercover.md) | 报名、描述、投票、平票、胜负、词库和 Web 控制规则。 |
 | [海龟汤](turtle-soup.md) | 题库、永久使用记录、AI 裁决、分段发送和 Web 控制如何工作。 |

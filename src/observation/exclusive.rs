@@ -3,8 +3,7 @@ use std::fmt;
 use std::num::NonZeroUsize;
 
 use super::shared::{
-    ObservationGapKind, ObservationRead, ObservationSequence, ObservationSubscriber,
-    SharedObservationStream,
+    ObservationRead, ObservationSequence, ObservationSubscriber, SharedObservationStream,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,10 +62,9 @@ impl<T> ExclusiveObservationRouter<T> {
     }
 
     pub fn route(&mut self, value: T) -> RoutedObservation<T> {
-        match self.active {
-            Some(session) => RoutedObservation::Exclusive { session, value },
-            None => RoutedObservation::Shared(self.shared.publish(value)),
-        }
+        // An exclusive reader owns its decision baseline, but ordinary chat
+        // commands must continue through the shared stream while it waits.
+        RoutedObservation::Shared(self.shared.publish(value))
     }
 
     pub fn begin_exclusive(&mut self) -> Result<ExclusiveSessionId, ExclusiveSessionError> {
@@ -92,7 +90,6 @@ impl<T> ExclusiveObservationRouter<T> {
             Some(_) => {}
         }
         self.active = None;
-        self.shared.mark_gap(ObservationGapKind::ExclusiveSession);
         Ok(())
     }
 }
@@ -102,7 +99,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn exclusive_session_keeps_private_text_out_of_the_shared_stream_and_leaves_a_gap() {
+    fn exclusive_session_keeps_shared_stream_live_without_a_gap() {
         let mut router = ExclusiveObservationRouter::new(NonZeroUsize::new(4).unwrap());
         let mut subscriber = router.subscribe();
 
@@ -116,20 +113,17 @@ mod tests {
         );
 
         let session = router.begin_exclusive().unwrap();
+        let private_sequence = match router.route("private") {
+            RoutedObservation::Shared(sequence) => sequence,
+            RoutedObservation::Exclusive { .. } => panic!("shared observation was isolated"),
+        };
         assert_eq!(
-            router.route("private"),
-            RoutedObservation::Exclusive {
-                session,
-                value: "private",
-            }
+            router.read_next(&mut subscriber),
+            Some(ObservationRead::item(private_sequence, "private"))
         );
-        assert_eq!(router.read_next(&mut subscriber), None);
 
         router.finish_exclusive(session).unwrap();
-        let Some(ObservationRead::Gap(gap)) = router.read_next(&mut subscriber) else {
-            panic!("exclusive session did not produce a shared observation gap");
-        };
-        assert_eq!(gap.kind, ObservationGapKind::ExclusiveSession);
+        assert_eq!(router.read_next(&mut subscriber), None);
 
         let after = match router.route("shared-after") {
             RoutedObservation::Shared(sequence) => sequence,

@@ -110,6 +110,7 @@ flowchart TD
 - 机器人反馈文本会被过滤，避免把自己发出的回复重新解析成命令。
 
 自定义工作流也走同一入口，但只有 `custom_workflows.enabled=true` 且 `CustomWorkflowService` 认领命令时，才会生成 `ModuleCommand::CustomWorkflow`。中央聊天层不包含自定义工作流参数语法。
+确认、跳过、换源、邀请确认/拒绝和管理投票的回复语法由决策读者保留，不会被自定义工作流抢占；其他普通命令仍按同一入口路由。
 
 ## 命令识别禁用
 
@@ -215,7 +216,7 @@ pending_contains_command(parsed)
 
 ## 确认屏幕锁
 
-确认屏幕锁在 `src/observation/decision.rs`。它不参与普通命令入队，只用于 `wait_for_decision()`。
+确认屏幕锁在 `src/observation/decision.rs`。它不参与普通命令入队，只用于 `wait_for_decision()`。确认窗口的聊天观察不会暂停共享命令流；普通命令仍按观察顺序进入待执行队列，确认读者只处理匹配当前等待条件的决策文本。
 
 流程是：
 
@@ -224,7 +225,7 @@ pending_contains_command(parsed)
 3. 后续轮询中，如果同样文本的位置还在旧消息附近，就忽略。
 4. 新出现的决策消息只接受一次。
 
-这避免旧的确认消息影响新的候选确认、邀请确认或换源确认。
+这避免旧的确认消息影响新的候选确认、邀请确认或换源确认。独占确认结束后不再产生 `ExclusiveSession` 观察缺口；普通命令使用观察消息 ID、命令屏幕锁和待执行队列去重，因此确认读者和普通监听不会重复执行同一条命令。
 
 ## 日志怎么看
 

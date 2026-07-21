@@ -688,7 +688,7 @@ impl ApplicationRuntime {
                     self.locks = CommandLockState::default();
                     self.screen_lock_primed.store(false, AtomicOrdering::SeqCst);
                     log::warn!(
-                        "一级聊天观察出现缺口，下一屏仅重建命令基线: kind={:?} missing={:?}..={:?}",
+                        "聊天观察流出现缺口，下一屏仅重建命令基线: kind={:?} missing={:?}..={:?}",
                         gap.kind,
                         gap.missing_from,
                         gap.missing_through

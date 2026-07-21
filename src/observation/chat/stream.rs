@@ -10,9 +10,7 @@ use crate::observation::chat::{
     ObservationCompletionEvent, ObservationFrameId, ObservedChatMessageId, ObservedFrame,
     VisualSessionId,
 };
-use crate::observation::exclusive::{
-    ExclusiveObservationRouter, ExclusiveSessionId, RoutedObservation,
-};
+use crate::observation::exclusive::{ExclusiveObservationRouter, ExclusiveSessionId};
 use crate::observation::shared::{
     ObservationGap, ObservationRead, ObservationSubscriber, SharedObservationStream,
 };
@@ -230,12 +228,7 @@ impl ChatObservationShared {
         state: &mut ChatObservationState,
         observation: ChatObservation,
     ) -> Result<Vec<ChatObservationDispatch>> {
-        if matches!(
-            state.router.route(observation),
-            RoutedObservation::Exclusive { .. }
-        ) {
-            return Ok(Vec::new());
-        }
+        state.router.route(observation);
 
         let mut dispatches = Vec::new();
         loop {
@@ -559,7 +552,7 @@ mod tests {
     }
 
     #[test]
-    fn exclusive_chat_keeps_private_text_out_of_shared_dispatches() {
+    fn exclusive_chat_still_publishes_shared_dispatches() {
         let shared = ChatObservationShared::new(6.0, 0.03);
         let mut subscriber = shared.subscribe_completion_advances().unwrap();
         let _exclusive = shared.begin_exclusive().unwrap();
@@ -578,7 +571,11 @@ mod tests {
             )
             .unwrap();
 
-        assert!(dispatches.is_empty());
+        let [ChatObservationDispatch::Secondary { observation, .. }] = dispatches.as_slice() else {
+            panic!("exclusive observation was not published to the shared stream");
+        };
+        assert_eq!(observation.messages.len(), 1);
+        assert_eq!(observation.messages[0].text, "private text");
         let advance = next_completion_advance(&shared, &mut subscriber);
         assert_eq!(advance.events().len(), 1);
         assert_eq!(advance.events()[0].frame(), frame);

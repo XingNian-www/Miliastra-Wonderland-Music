@@ -409,8 +409,16 @@ impl ApplicationRuntime {
         self.latest_frame
             .lock()
             .map_err(|_| anyhow!("主扫描画面缓存锁已损坏"))?
-            .clone()
+            .image()
             .ok_or_else(|| anyhow!("尚未获取主扫描画面，请稍后重试"))
+    }
+
+    pub(super) fn invalidate_latest_frame(&self) {
+        if let Ok(mut latest_frame) = self.latest_frame.lock() {
+            latest_frame.invalidate();
+        } else {
+            log::error!("主扫描画面缓存锁已损坏");
+        }
     }
 }
 

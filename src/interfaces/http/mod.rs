@@ -66,6 +66,7 @@ use crate::runtime::player_io::{PlayerSearchClient, PlayerSearchClientError, Sea
 use crate::runtime::scheduler::{
     DiagnosticTaskSnapshot, FormalTaskCancelOutcome, FormalTaskEnqueueOutcome,
 };
+use crate::ui::frame::LatestFrameCache;
 use crate::ui::geometry::parse_rect;
 pub(crate) use tools::{WebToolRequest, WebToolTemplate};
 
@@ -565,7 +566,7 @@ pub struct HttpSharedState {
     pub active_connections: Arc<AtomicUsize>,
     formal_tasks: Arc<dyn HttpTaskPort>,
     queries: Arc<dyn HttpQueryPort>,
-    latest_frame: Arc<Mutex<Option<Arc<image::DynamicImage>>>>,
+    latest_frame: Arc<Mutex<LatestFrameCache>>,
     player: Arc<dyn HttpPlayerPort>,
     ai: Arc<dyn HttpAiPort>,
 }
@@ -646,7 +647,7 @@ impl HttpSharedState {
         formal_tasks: Arc<dyn HttpTaskPort>,
         queries: Arc<dyn HttpQueryPort>,
         monitor: MonitorShared,
-        latest_frame: Arc<Mutex<Option<Arc<image::DynamicImage>>>>,
+        latest_frame: Arc<Mutex<LatestFrameCache>>,
         player_search: PlayerSearchClient,
         player_runtime: PlayerRuntimeHandle,
         ai: AiClient,
@@ -674,7 +675,7 @@ impl HttpSharedState {
         formal_tasks: Arc<dyn HttpTaskPort>,
         queries: Arc<dyn HttpQueryPort>,
         monitor: MonitorShared,
-        latest_frame: Arc<Mutex<Option<Arc<image::DynamicImage>>>>,
+        latest_frame: Arc<Mutex<LatestFrameCache>>,
         player: Arc<dyn HttpPlayerPort>,
         ai: Arc<dyn HttpAiPort>,
     ) -> Self {
@@ -2328,7 +2329,7 @@ fn screenshot_response(
         .latest_frame
         .lock()
         .map_err(|_| internal_message("主扫描画面缓存锁已损坏"))?
-        .clone()
+        .image()
         .ok_or_else(|| AppError {
             status: 503,
             message: "尚未获取主扫描画面，请稍后重试".to_string(),
@@ -3563,6 +3564,29 @@ mod tests {
     }
 
     #[test]
+    fn screenshot_rejects_an_invalidated_frame_cache() {
+        let state = test_state();
+        {
+            let mut cache = state.latest_frame.lock().expect("frame cache");
+            cache.store(Arc::new(image::DynamicImage::new_rgb8(2, 2)));
+            cache.invalidate();
+        }
+        let request = Request {
+            method: "GET".to_string(),
+            path: "/screenshot".to_string(),
+            query: Vec::new(),
+            headers: HeaderMap::new(),
+            body: Vec::new(),
+        };
+
+        let error = match screenshot_response(&request, &state) {
+            Ok(_) => panic!("invalidated frame must not be served"),
+            Err(error) => error,
+        };
+        assert_eq!(error.status, 503);
+    }
+
+    #[test]
     fn search_routes_preserve_their_contract_over_real_http() {
         let mut state = test_state();
         let server = start_test_http_server(&mut state, "");
@@ -4515,7 +4539,7 @@ workflows:
                 recording.clone(),
                 recording.clone(),
                 monitor,
-                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(LatestFrameCache::default())),
                 Arc::new(player),
                 Arc::new(HttpTestAiPort),
             ),

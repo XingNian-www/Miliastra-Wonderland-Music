@@ -231,7 +231,7 @@ impl ApplicationRuntime {
             ) {
                 Ok(frame) => {
                     if let Ok(mut latest_frame) = self.latest_frame.lock() {
-                        *latest_frame = Some(Arc::clone(&frame.image));
+                        latest_frame.store(Arc::clone(&frame.image));
                     } else {
                         log::error!("主扫描画面缓存锁已损坏");
                     }
@@ -572,6 +572,7 @@ impl ApplicationRuntime {
                     }
                 }
                 Err(error) => {
+                    self.invalidate_latest_frame();
                     if let Some(subscription) = frame_subscription.take()
                         && let Err(cancel_error) = subscription.cancel()
                     {

@@ -12,10 +12,16 @@ impl ApplicationRuntime {
             return Ok(());
         };
         log::info!(
-            "闲置退出触发: {}分钟无新命令，关闭目标游戏进程并保留软件进程",
+            "闲置退出触发: {}分钟无新命令，自动暂停播放器并关闭目标游戏进程，保留软件进程",
             timeout.as_secs() / 60
         );
         self.abort_entertainment_for_context_loss("闲置退出即将关闭游戏");
+        if let Err(error) = self.player.pause_for_idle_exit() {
+            log::error!("闲置退出自动暂停播放器失败: {error:#}");
+        } else {
+            log::info!("闲置退出已自动暂停播放器，防止退出后自动恢复或出队");
+        }
+        self.update_monitor_playback_controller();
         if let Err(error) = self.game_ui.close_window() {
             log::error!("关闭目标窗口失败: {error:#}");
         }

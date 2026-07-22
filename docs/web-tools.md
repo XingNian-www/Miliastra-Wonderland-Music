@@ -32,13 +32,15 @@
 
 模板接口允许以下命名模板，不能由 Web 请求传入任意本地路径：
 
-- 聊天与界面：`blue-marker`、`yellow-marker`、`pink-marker`、`enter`、`secondary-hall`。
+- 聊天与界面：`blue-marker`、`yellow-marker`、`pink-marker`、`friend`、`secondary-back`、`secondary-hall`。
 - 邀请：`invite-view-star`、`invite-goto-hall`、`invite-enter-hall`。
 - 好友管理：`friend-panel`、`friend-search-panel`、`friend-more-settings`、`friend-block-chat`、`friend-blacklist`、`friend-confirm`。
 - 启动与千星：`wonderland-enter-button`、`paimon-menu`、`wonderland-close`。
 - `custom_workflows.templates` 中已配置的自定义模板名称。
 
 `GET /tools/templates` 返回每个模板的显示名称、默认匹配区域和默认阈值。高级页的“读取配置区域”按钮会把这些值回填到表单；自定义模板只有文件路径映射，没有固定区域时需要手动填写。
+
+模板名称必须与代码中的白名单完全一致：一级大厅锚点是 `friend`，二级返回和当前大厅锚点分别是 `secondary-back`、`secondary-hall`；不存在通用的 `enter` 模板。`friend` 只用于一级聊天驻留判断，不代表启动游戏或进入千星成功。
 
 面板响应基准覆盖聊天区与聊天输入区附近的联合检测区域，完成或失败时会额外发送一次 `Esc` 尝试收起聊天面板。
 

@@ -22,8 +22,11 @@ impl ApplicationRuntime {
             log::info!("闲置退出已自动暂停播放器，防止退出后自动恢复或出队");
         }
         self.update_monitor_playback_controller();
-        if let Err(error) = self.game_ui.close_window() {
-            log::error!("关闭目标窗口失败: {error:#}");
+        match self.game_ui.close_window() {
+            Ok(()) => self.invalidate_latest_frame(),
+            Err(error) => {
+                log::error!("关闭目标窗口失败: {error:#}");
+            }
         }
         Ok(())
     }

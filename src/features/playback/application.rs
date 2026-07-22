@@ -161,6 +161,9 @@ pub(crate) trait PlaybackExecutionPort {
     ) -> Result<PlaybackDecision>;
     fn playback_queue(&mut self) -> Result<Vec<QueueItem>>;
     fn remove_playback_queue(&mut self, removal: QueueRemoval) -> Result<()>;
+    fn user_pause_active(&mut self) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 pub(crate) trait PlaybackCommandPort: PlaybackExecutionPort {
@@ -267,7 +270,7 @@ impl PlaybackApplication {
             }
             PlaybackCommand::Previous => {
                 if let Some(request) = port.previous_playback_request()? {
-                    self.play_request(&request, false, false, port)?;
+                    self.play_request(&request, false, false, false, port)?;
                     port.log_executed(context, "previous uri")?;
                 } else {
                     let message = port.previous_external()?;
@@ -452,7 +455,28 @@ impl PlaybackApplication {
         reason: &str,
         port: &mut P,
     ) -> Result<()> {
+        self.consume_queue_inner(reason, false, port)
+    }
+
+    pub(crate) fn consume_queue_after_monitor<P: PlaybackExecutionPort + ?Sized>(
+        &self,
+        reason: &str,
+        port: &mut P,
+    ) -> Result<()> {
+        self.consume_queue_inner(reason, true, port)
+    }
+
+    fn consume_queue_inner<P: PlaybackExecutionPort + ?Sized>(
+        &self,
+        reason: &str,
+        guard_user_pause: bool,
+        port: &mut P,
+    ) -> Result<()> {
         loop {
+            if guard_user_pause && port.user_pause_active()? {
+                log::info!("自动出队已跳过: 播放器处于用户暂停状态");
+                return Ok(());
+            }
             let Some(item) = port.playback_queue()?.into_iter().next() else {
                 return Ok(());
             };
@@ -473,7 +497,8 @@ impl PlaybackApplication {
                 continue;
             }
             let allow_switch_source = request.uri.trim().is_empty();
-            let outcome = self.play_confirmed(&request, allow_switch_source, port)?;
+            let outcome =
+                self.play_confirmed_inner(&request, allow_switch_source, guard_user_pause, port)?;
             match outcome {
                 PlaybackOutcome::Success => {
                     port.remove_playback_queue(QueueRemoval::Id(item.id))?;
@@ -501,6 +526,20 @@ impl PlaybackApplication {
         allow_switch_source: bool,
         port: &mut P,
     ) -> Result<PlaybackOutcome> {
+        self.play_confirmed_inner(request, allow_switch_source, false, port)
+    }
+
+    fn play_confirmed_inner<P: PlaybackExecutionPort + ?Sized>(
+        &self,
+        request: &PlaybackSelection,
+        allow_switch_source: bool,
+        guard_user_pause: bool,
+        port: &mut P,
+    ) -> Result<PlaybackOutcome> {
+        if guard_user_pause && port.user_pause_active()? {
+            log::info!("自动出队已跳过: 用户暂停状态在播放前生效");
+            return Ok(PlaybackOutcome::Error);
+        }
         if self.selection_dedup_limited(request, port)? {
             log::info!(
                 "长时间同歌去重拦截: keyword={} uri={}",
@@ -537,9 +576,20 @@ impl PlaybackApplication {
             resolved.keyword = picked.text;
             resolved.source = source.to_string();
             resolved.uri = picked.uri;
-            return self.play_confirmed(&resolved, allow_switch_source, port);
+            return self.play_confirmed_inner(
+                &resolved,
+                allow_switch_source,
+                guard_user_pause,
+                port,
+            );
         }
-        self.play_request(&request.request(), allow_switch_source, false, port)
+        self.play_request(
+            &request.request(),
+            allow_switch_source,
+            false,
+            guard_user_pause,
+            port,
+        )
     }
 
     fn selection_dedup_limited<P: PlaybackExecutionPort + ?Sized>(
@@ -558,8 +608,13 @@ impl PlaybackApplication {
         request: &PlaybackRequest,
         allow_switch_source: bool,
         confirm_after_switch: bool,
+        guard_user_pause: bool,
         port: &mut P,
     ) -> Result<PlaybackOutcome> {
+        if guard_user_pause && port.user_pause_active()? {
+            log::info!("自动出队已跳过: 用户暂停状态在播放请求发送前生效");
+            return Ok(PlaybackOutcome::Error);
+        }
         let mut attempt = match port.play_request_uri(request) {
             Ok(attempt) => attempt,
             Err(error) => {
@@ -578,6 +633,7 @@ impl PlaybackApplication {
             &mut attempt,
             allow_switch_source,
             confirm_after_switch,
+            guard_user_pause,
             port,
         )
     }
@@ -588,6 +644,7 @@ impl PlaybackApplication {
         attempt: &mut PlaybackAttempt,
         allow_switch_source: bool,
         confirm_after_switch: bool,
+        guard_user_pause: bool,
         port: &mut P,
     ) -> Result<PlaybackOutcome> {
         match port.verify_playback_started(request, attempt)? {
@@ -630,6 +687,7 @@ impl PlaybackApplication {
                         &request.keyword,
                         &request.source,
                         request.prefer_accompaniment,
+                        guard_user_pause,
                         port,
                     ),
                 }
@@ -661,6 +719,7 @@ impl PlaybackApplication {
         keyword: &str,
         current_source: &str,
         prefer_accompaniment: bool,
+        guard_user_pause: bool,
         port: &mut P,
     ) -> Result<PlaybackOutcome> {
         let next_source = AlternatePlaybackSource::other_than(current_source);
@@ -674,7 +733,7 @@ impl PlaybackApplication {
             friend_username: String::new(),
             console_bypass_dedup: false,
         };
-        let outcome = self.play_confirmed(&request, false, port)?;
+        let outcome = self.play_confirmed_inner(&request, false, guard_user_pause, port)?;
         if outcome == PlaybackOutcome::Success
             && let Ok(status) = port.player_status()
             && matches!(
@@ -804,6 +863,7 @@ mod tests {
         removed_ids: Vec<u64>,
         replies: Vec<String>,
         decision_calls: usize,
+        user_paused: bool,
     }
 
     #[test]
@@ -906,6 +966,10 @@ mod tests {
             self.queue.retain(|item| item.id != id);
             Ok(())
         }
+
+        fn user_pause_active(&mut self) -> Result<bool> {
+            Ok(self.user_paused)
+        }
     }
 
     impl PlaybackExecutionPort for FailingPlaybackPort {
@@ -1000,6 +1064,41 @@ mod tests {
     }
 
     #[test]
+    fn automatic_queue_keeps_items_when_user_pause_is_active() {
+        let item = QueueItem {
+            id: 8,
+            keyword: "暂停期间歌曲".to_string(),
+            uri: "fuo://qqmusic/songs/8".to_string(),
+            ..QueueItem::default()
+        };
+        let mut port = VerifyingPlaybackPort {
+            queue: vec![item],
+            verifications: VecDeque::new(),
+            removed_ids: Vec::new(),
+            replies: Vec::new(),
+            decision_calls: 0,
+            user_paused: true,
+        };
+        let application = PlaybackApplication::new(PlaybackApplicationConfig {
+            console_bypass_dedup: true,
+            queue_max_size: 20,
+            skip_status_initial_ms: 0,
+            skip_status_poll_ms: 0,
+            skip_status_retries: 0,
+            monitor_tick_ms: 50,
+            monitor_status_ms: 50,
+        });
+
+        application
+            .consume_queue_after_monitor("闲置退出", &mut port)
+            .expect("automatic queue consumption should be gated");
+
+        assert!(port.removed_ids.is_empty());
+        assert!(port.replies.is_empty());
+        assert_eq!(port.queue.len(), 1);
+    }
+
+    #[test]
     fn no_source_item_is_removed_before_the_next_item_plays() {
         let first = QueueItem {
             id: 1,
@@ -1036,6 +1135,7 @@ mod tests {
             removed_ids: Vec::new(),
             replies: Vec::new(),
             decision_calls: 0,
+            user_paused: false,
         };
         let application = PlaybackApplication::new(PlaybackApplicationConfig {
             console_bypass_dedup: true,
@@ -1080,6 +1180,7 @@ mod tests {
             removed_ids: Vec::new(),
             replies: Vec::new(),
             decision_calls: 0,
+            user_paused: false,
         };
         let application = PlaybackApplication::new(PlaybackApplicationConfig {
             console_bypass_dedup: true,

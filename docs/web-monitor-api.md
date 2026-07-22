@@ -116,7 +116,7 @@ HTTP 层只接受 `GET`、`POST`、`OPTIONS`。
 | `/operator/hall-time` | `大厅时间` |
 | `/operator/microphone` | `麦克风` |
 | `/operator/commands` | `启用`或`禁用`命令识别 |
-| `/operator/idle-exit?minutes=...` | `闲置退出 n` |
+| `/operator/idle-exit?minutes=...` | `闲置退出 n`；触发时自动暂停播放器后关闭目标游戏窗口 |
 | `/operator/workflows/run` | 指定自定义工作流 |
 
 入队前会检查待执行任务队列里是否已有同语义命令。已有则返回 `queued=false` 和 `duplicate=true`。
@@ -134,7 +134,7 @@ HTTP 层只接受 `GET`、`POST`、`OPTIONS`。
 | `/startup/enter-wonderland` | 进入千星任务。 |
 | `/startup/wonderland` | 按顺序提交启动游戏和进入千星两个任务。 |
 | `/chat-listener/mode?mode=primary` / `secondary` | 监听模式切换任务。 |
-| `/operator/idle-exit?enabled=0` | 清除闲置退出计时任务。 |
+| `/operator/idle-exit?enabled=0` | 清除闲置退出计时任务；不会改变当前播放器状态。 |
 
 `/startup/wonderland` 只保证入队顺序，不同步等待两个任务完成。
 

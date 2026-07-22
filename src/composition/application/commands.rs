@@ -428,7 +428,7 @@ fn card_game_effect_lane(command: &LandlordCommand) -> CardGameEffectLane {
 fn configure_idle_exit(business: &BusinessRuntimeHandle, minutes: u32) -> Result<()> {
     business.configure_idle_exit(Duration::from_secs(u64::from(minutes) * 60), Instant::now())?;
     log::info!(
-        "已设置闲置退出: {}分钟无新命令后关闭目标游戏进程，软件主进程继续运行",
+        "已设置闲置退出: {}分钟无新命令后暂停播放器、关闭目标游戏进程，软件主进程和播放器运行时继续运行",
         minutes
     );
     Ok(())

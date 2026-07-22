@@ -112,7 +112,7 @@ use crate::runtime::ui::{
 use crate::ui::atoms::GameUi;
 use crate::ui::change_detection::{ChangeFingerprint, change_stats, rect_chat_change_fingerprint};
 use crate::ui::chat_output::{ChatBatchSendOutcome, ChatBatchSendStatus, ChatOutput};
-use crate::ui::frame::{Canvas, Frame, from_captured_frame, load_frame};
+use crate::ui::frame::{Canvas, Frame, LatestFrameCache, from_captured_frame, load_frame};
 use crate::ui::geometry::{Rect, crop_canvas};
 #[cfg(test)]
 use crate::ui::locator::secondary_hall_search_rect;
@@ -373,7 +373,7 @@ pub(crate) struct ApplicationRuntime {
     chat_output: ChatOutput,
     ocr: OcrRuntimeHandle,
     ocr_runtime: Option<OcrRuntime>,
-    latest_frame: Arc<Mutex<Option<Arc<DynamicImage>>>>,
+    latest_frame: Arc<Mutex<LatestFrameCache>>,
     locks: CommandLockState,
     window_detection_signal: WindowDetectionSignal,
     screen_lock_primed: Arc<AtomicBool>,
@@ -1007,7 +1007,7 @@ impl ApplicationRuntime {
             chat_output,
             ocr,
             ocr_runtime: Some(ocr_runtime),
-            latest_frame: Arc::new(Mutex::new(None)),
+            latest_frame: Arc::new(Mutex::new(LatestFrameCache::default())),
             locks: CommandLockState::default(),
             window_detection_signal: WindowDetectionSignal::new(),
             screen_lock_primed: Arc::new(AtomicBool::new(false)),

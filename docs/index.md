@@ -6,7 +6,7 @@
 
 | 文档 | 适合回答的问题 |
 | --- | --- |
-| [代码梳理](code-walkthrough.md) | 程序整体如何启动、扫描、入队、执行、播放、监控。 |
+| [代码梳理](code-walkthrough.md) | 程序整体如何解析配置、启动 runtime、扫描、入队、执行、播放、监控。 |
 | [执行器流程](executor-flow.md) | 待执行任务队列如何串行执行游戏操作。 |
 | [命令模型与屏幕锁](command-model-locks.md) | 命令如何去重，以及普通命令如何与独占决策并行。 |
 | [支撑运行模块](supporting-runtime-modules.md) | 调试工具、热键、截图、OCR 底层、日志、TUI 和持久化分别在哪里。 |
@@ -41,7 +41,7 @@
 | --- | --- |
 | [启动游戏与进入千星](startup-wonderland-flow.md) | 启动游戏、开门、进入千星两个任务如何拆分与串联。 |
 | [Web 监控与 HTTP API](web-monitor-api.md) | 远程面板如何读监控、提交控制台发言、点歌和启动任务。 |
-| [配置加载与观测](config-observability-flow.md) | 当前配置校验、日志分流、Monitor、TUI 和状态文件如何组织。 |
+| [配置加载与观测](config-observability-flow.md) | 当前配置解析/校验、日志分流、Monitor 投影、TUI 和状态文件如何组织。 |
 
 ## 领域词汇
 

@@ -91,7 +91,7 @@ flowchart TD
 
 这一步需要 OCR 引擎：
 
-1. 如果 `templates.batch_recognize=true`，把多个 block 拼成一张图识别，再按 y 偏移拆回消息。
+1. 如果 `ocr.batch_recognize=true`，把多个 block 拼成一张图识别，再按识别框中心和 y 偏移拆回消息；中心在分隔带会被丢弃，归属重叠会终止本次批量识别。
 2. 如果关闭 batch，则逐个 block OCR。
 3. 生成 `ChatMessage { message_type, block, text }`。
 4. 写入 `chat_scan_result` 日志、`timing` 耗时日志和监控快照。
@@ -100,7 +100,7 @@ flowchart TD
 
 ## 命令解析
 
-`handle_scan_messages()` 会遍历非空 OCR 文本。`parse_command_envelope()` 只提取昵称、消息来源、原始正文、前缀和观察身份，生成 `CommandEnvelope`。随后 `ChatCommandRouter` 根据静态优先级与当前娱乐占用状态选择唯一模块，再调用该 feature 的 `claims_chat()` / `parse_chat()` 解析参数。
+`handle_scan_messages()` 会遍历非空 OCR 文本。`parse_command_envelope()` 只提取昵称、消息来源、原始正文、前缀和观察身份，生成 `CommandEnvelope`。随后 `ChatCommandRouter` 根据静态优先级与当前娱乐占用状态选择唯一模块，再调用该 feature 的 `claims_chat()` / `parse_chat()` 解析参数；二级结构化消息直接构造信封，不重新拼接伪聊天文本。
 
 普通命令解析规则：
 
@@ -216,7 +216,7 @@ pending_contains_command(parsed)
 
 ## 确认屏幕锁
 
-确认屏幕锁在 `src/observation/decision.rs`。它不参与普通命令入队，只用于 `wait_for_decision()`。确认窗口的聊天观察不会暂停共享命令流；普通命令仍按观察顺序进入待执行队列，确认读者只处理匹配当前等待条件的决策文本。
+确认屏幕锁在 `src/observation/decision.rs`。它不参与普通命令入队，只用于候选确认、邀请确认、换源/AI 选择和管理投票的决策读取。确认窗口的聊天观察不会暂停共享命令流；普通命令仍按观察顺序进入待执行队列，确认读者只处理匹配当前等待条件的决策文本。
 
 流程是：
 

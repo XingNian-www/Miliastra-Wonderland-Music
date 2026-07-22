@@ -37,12 +37,12 @@ flowchart TD
 1. 使当前聊天与娱乐上下文失效。
 2. 请求窗口扫描立即重试。
 3. 提交一个 `EnterGame` UI 事务。
-4. UI 事务完成后再次请求窗口扫描。
+4. UI 事务完成后再次请求窗口扫描；窗口创建/识别过程中的进度重扫失败只记录错误，不改变 UI 事务结果。
 
 `EnterGame` UI 事务内部执行：
 
 1. 检查目标窗口是否存在。
-2. 如果窗口不存在且 `startup.launch_game=true`，解析游戏路径和参数并启动进程。
+2. 如果窗口不存在且 `startup.launch_game=true`，解析游戏路径和参数并启动进程；窗口缺失且该开关关闭时在输入前失败。
 3. 按 `startup.launch_retries` 和 `startup.launch_wait_ms` 有界等待窗口出现。
 4. 聚焦游戏窗口。
 5. 如果 `startup.enter_game=false`，只返回 `WindowReady`。
@@ -82,7 +82,7 @@ flowchart TD
 4. 在 `startup.wonderland_close_region` 连续稳定确认 `startup.templates.wonderland_close`。
 5. 点击 `startup.wonderland_card_point`。
 6. 在 `startup.wonderland_enter_button_region` 查找 `startup.templates.wonderland_enter_button`。
-7. 命中后点击模板中心，并把目标动作标记为已经尝试。
+7. 命中后点击模板中心，并把目标动作标记为已经尝试；点击确认后的任何失败都按 `AfterInputUnknown` 处理。
 8. 等待确认按钮消失。
 9. 按像素均值差和变化比例等待同一区域稳定。
 10. 在 `startup.final_primary_timeout_ms` 内连续稳定确认一级界面。
@@ -128,4 +128,4 @@ HTTP 只返回排队回执和任务 ID，不直接操作窗口。任务进入正
 - 派蒙菜单模板是启动游戏完成的唯一视觉指标。
 - 进入千星的目标动作与最终驻留必须分别确认。
 - 所有机械输入都在一个 UI 运行时中串行执行。
-- 请求窗口重扫只影响观察退避，不代替 UI 成功确认。
+- 请求窗口重扫只影响观察退避，不代替 UI 成功确认；进入千星的完成信号仍是目标效果和一级驻留分别确认。

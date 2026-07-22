@@ -34,7 +34,7 @@ flowchart TD
 | --- | --- |
 | `src/composition/application/listener.rs` | 主扫描循环、聊天变化触发策略和耗时日志。 |
 | `src/ui/frame.rs` | 截图来源、尺寸缩放、截图加载耗时。 |
-| `src/ui/state.rs` | 无状态的一级/二级/未知单帧模板判定。 |
+| `src/ui/state.rs` | 无状态的一级/二级/未知单帧模板判定和诊断证据构造。 |
 | `src/runtime/ui.rs` | 独占截图、公共状态稳定跟踪和观察帧发布。 |
 | `src/ui/change_detection.rs` | 聊天区变化指纹和像素差统计。 |
 | `src/observation/chat/scan.rs` | 聊天标记匹配、消息块切分、OCR 调用和扫描结果日志。 |
@@ -58,7 +58,7 @@ flowchart TD
 
 ## UI 状态检测
 
-`detect_ui_state()` 按短路顺序检测：
+`TemplateUiStateClassifier::classify()` 对规范化后的截图调用 `detect_ui_state_with_evidence()`，按短路顺序检测：
 
 1. 在 `screen.friend_rect` 里找好友按钮模板。
 2. 在 `screen.secondary_back_rect` 里找左上角返回按钮模板。
@@ -69,7 +69,7 @@ flowchart TD
 - `primary:friend`：左下角好友按钮模板可见，认为在一级聊天界面。
 - `primary:marker blue=… yellow=… pink=…`：聊天标记可见，也认为在一级聊天界面。
 - `secondary:chat`：固定的左上返回按钮可见，认为在二级聊天界面；好友列表滚动不影响它。
-- `transition:unknown`：本帧没有可靠锚点，只表示动画或尚未确认的中间态。
+- `unknown`（日志诊断中显示为 `transition:unknown`）：本帧没有可靠锚点，只表示动画或尚未确认的中间态。
 
 单帧结果不能直接授权按键。UI 运行时要求同一个具体状态标签连续达到稳定次数；`stability.ui_state_count` 大于 1 时覆盖，否则继承 `stability.default_count`。不同一级标签之间不会共用计数，同一帧也不能被重复累计。`unknown` 会清空当前候选进度，但只用于等待和诊断，不会触发 Enter、Esc、模式回退，也不会把上一稳定状态冒充为当前状态。过渡持续超过具体例程的超时后才返回失败。
 
@@ -95,7 +95,7 @@ UI 状态检测耗时: total=... friend=... back=... marker=... state=...
 
 ### 灰度 best hit
 
-`best_template_hit()` 用于好友按钮、二级返回按钮等小区域“是否出现”的检测。
+`best_template_candidate()` 用于好友按钮、二级返回按钮等小区域“是否出现”的检测；测试和部分诊断路径使用 `best_template_hit()` 做阈值过滤。
 
 特点：
 
@@ -179,7 +179,7 @@ UI 状态检测耗时: total=... friend=... back=... marker=... state=...
 `recognize_prepared_chat()` 负责调用 OCR：
 
 - `batch_recognize=false`：逐个消息块裁剪并调用 `merged_ocr_text()`。
-- `batch_recognize=true`：把多个消息块用灰色间隔拼成一张图，OCR 一次后按 y 偏移拆回各块。
+- `batch_recognize=true`：把多个消息块用灰色间隔拼成一张图，OCR 一次后按识别框中心和各 block 的 y 偏移归属并拆回各块；中心落在间隔会被丢弃，归属重叠会返回错误。
 
 当前默认关闭 batch。代码保留它是为了实验，但在实际项目经验里，批量拼接不一定更快，尤其在 CPU 后端下可能因为更大的检测图和拆分成本变慢。
 
@@ -194,8 +194,8 @@ UI 状态检测耗时: total=... friend=... back=... marker=... state=...
 OCR 引擎由 `OcrRuntime` 单一拥有，组合层只保存 `OcrRuntimeHandle`。`listener.rs` 的 `scan_chat_with_shared_ocr()` 顺序是：
 
 1. `prepare_chat_scan()`。
-2. 通过 OCR runtime handle 提交识别请求（引擎内部负责互斥）。
-3. `recognize_prepared_chat()`。
+2. 通过 OCR runtime handle 提交识别请求（引擎 runtime 串行处理队列并记录等待时间）。
+3. `recognize_prepared_chat()`，按 `ocr.batch_recognize` 选择逐块或批量识别。
 
 因此 OCR 全局互斥只串行化 OCR 识别和引擎状态访问，不串行化截图、UI 检测、聊天标记匹配、消息块计算。
 

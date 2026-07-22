@@ -19,7 +19,7 @@ flowchart TD
 
 | 所有者 | 独占状态 | 不负责 |
 | --- | --- | --- |
-| `BusinessRuntime` | `FormalScheduler`、娱乐状态、播放队列、播放状态、大厅状态、监听状态、延迟发送队列和监控投影。 | 不执行 UI、OCR、HTTP 或播放器 I/O。 |
+| `BusinessRuntime` | `FormalScheduler`、娱乐状态、播放队列、播放状态、大厅状态、监听状态和延迟发送队列。 | 不执行 UI、OCR、HTTP 或播放器 I/O；监控事件交给 `MonitorShared` 投影。 |
 | `FormalTaskExecutionRuntime` | 一个 `ApplicationRuntime` 实例，顺序调用 feature 应用服务和外部端口。 | 不决定调度顺序，也不能绕过 UI runtime 直接输入。 |
 | `UiRuntime` | 唯一 `UiDevice`，顺序执行密封的类型化 `UiRoutine`。 | 不拥有业务状态，不解析聊天命令。 |
 

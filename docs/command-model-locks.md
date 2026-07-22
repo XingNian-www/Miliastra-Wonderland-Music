@@ -34,7 +34,7 @@ flowchart TD
 | `src/features/*` | 每个业务模块自己声明命令、解析参数、生成锁键并判断同语义请求。 |
 | `src/observation/decision.rs` | 决策屏幕锁。 |
 | `src/runtime/decision.rs` | 决策会话和类型化 `DecisionAction`。 |
-| `src/composition/application/listener.rs` | 消费共享观察流、应用屏幕锁并提交正式任务。 |
+| `src/composition/application/listener.rs` | 消费共享一级观察流、应用一级屏幕锁并提交正式任务；二级提交路径位于 `secondary_chat.rs`。 |
 
 ## 命令信封
 
@@ -109,7 +109,7 @@ flowchart TD
 - 一级监听按当前可见命令更新命令屏幕锁。
 - 二级当前大厅通过气泡序列最长重叠确定新增消息；找不到可靠重叠时只重建基线。
 - 二级好友未读只处理刚打开会话的最下方新气泡。
-- 二级消息锁解决会话切换和历史气泡重复，之后仍会经过模块路由和待执行范围去重。
+- 二级消息基线解决会话切换和历史气泡重复，之后仍会经过模块路由和正式任务待执行范围去重；它不是 `CommandLockState` 的另一份共享实例。
 
 ## 决策屏幕锁
 

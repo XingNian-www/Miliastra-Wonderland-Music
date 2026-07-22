@@ -51,6 +51,8 @@ flowchart TD
 
 它不是音乐播放队列。
 
+正式任务调度器会在入队时用 `FormalTaskDedupKey` 检查仍排队中的同语义任务。该检查只约束正式业务任务的排队，不影响已经开始的任务，也不判断歌曲是否重复；歌曲重复分别由音乐播放队列匹配和只按非空 URI 的长时间同歌历史处理。
+
 ### 音乐播放队列
 
 `PersistentQueue` 保存已经确定的歌曲项，落盘为 JSON。每个 `QueueItem` 包含：
@@ -206,6 +208,8 @@ flowchart TD
 - 队列为空时，调用 `PlayerController::next_external()`，并标记为外部播放。
 
 这保证“下一首”会优先执行项目自己的音乐播放队列，而不是让播放器跳到它内部的下一首。
+
+`/player/play-uri` 和 `/queue/add` 属于控制台高权限队列 mutation。它们只把明确的歌曲项写入 `PersistentQueue`，不会同步调用 FeelUOwn、改变 `PlaybackRuntimeState`，也不会跳过出队时的 URI 播放确认；`dedup_bypass` 只表示该队列项可按控制台规则豁免长时间同歌限制。
 
 ## 关键日志
 

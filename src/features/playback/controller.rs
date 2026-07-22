@@ -230,6 +230,36 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         Ok(message)
     }
 
+    /// Arm the user-pause state before attempting the backend RPC.
+    ///
+    /// Idle exit must prevent an already-queued automatic advance even when the
+    /// player backend is unavailable. The state transition is therefore kept as
+    /// the first operation; the backend pause remains best effort and its error
+    /// is returned to the caller for logging.
+    pub(crate) fn pause_for_idle_exit(&self) -> Result<String> {
+        self.playback_state
+            .update(PlaybackStateUpdate::UserPaused)?;
+        let tracker_result = self.clear_external_playback_tracker();
+        let pause_result = self.backend.pause();
+        match (tracker_result, pause_result) {
+            (Ok(()), Ok(message)) => {
+                log::info!("播放器状态转移: pause_reason=user reason=idle_exit");
+                Ok(message)
+            }
+            (Err(tracker_error), Ok(_)) => Err(anyhow!(
+                "闲置退出暂停成功，但清理外部播放追踪失败: {tracker_error:#}"
+            )),
+            (Ok(()), Err(pause_error)) => Err(pause_error),
+            (Err(tracker_error), Err(pause_error)) => Err(anyhow!(
+                "闲置退出清理外部播放追踪失败: {tracker_error:#}; 暂停播放器失败: {pause_error:#}"
+            )),
+        }
+    }
+
+    pub(crate) fn user_pause_active(&self) -> Result<bool> {
+        Ok(self.playback_state.snapshot()?.pause_reason == PauseReason::User)
+    }
+
     pub(crate) fn resume_by_user(&self) -> Result<String> {
         let message = self.backend.resume()?;
         self.playback_state
@@ -903,7 +933,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             let playback = &runtime;
             let is_external = playback.active_request.is_none()
                 && playback.state != ConfirmedPlaybackState::Unknown
-                && playback.pause_reason != PauseReason::WaitingForQueue;
+                && playback.pause_reason == PauseReason::None;
             (
                 is_external,
                 is_external
@@ -1166,6 +1196,7 @@ mod tests {
         paused: Arc<Mutex<u32>>,
         resumed: Arc<Mutex<u32>>,
         play_error: bool,
+        pause_error: bool,
     }
 
     impl FakeBackend {
@@ -1175,11 +1206,17 @@ mod tests {
                 paused: Arc::new(Mutex::new(0)),
                 resumed: Arc::new(Mutex::new(0)),
                 play_error: false,
+                pause_error: false,
             }
         }
 
         fn with_play_error(mut self) -> Self {
             self.play_error = true;
+            self
+        }
+
+        fn with_pause_error(mut self) -> Self {
+            self.pause_error = true;
             self
         }
     }
@@ -1203,6 +1240,9 @@ mod tests {
 
         fn pause(&self) -> Result<String> {
             *self.paused.lock().unwrap() += 1;
+            if self.pause_error {
+                return Err(anyhow!("pause failed"));
+            }
             Ok("paused".to_string())
         }
 
@@ -1904,5 +1944,15 @@ mod tests {
 
         assert_eq!(decision, QueueAdvanceDecision::None);
         assert_eq!(*backend.resumed.lock().unwrap(), 0);
+        assert!(controller.user_pause_active().unwrap());
+    }
+
+    #[test]
+    fn idle_pause_keeps_the_auto_advance_gate_when_backend_pause_fails() {
+        let backend = FakeBackend::new(vec![]).with_pause_error();
+        let controller = controller(backend);
+
+        assert!(controller.pause_for_idle_exit().is_err());
+        assert!(controller.user_pause_active().unwrap());
     }
 }

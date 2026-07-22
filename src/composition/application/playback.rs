@@ -25,7 +25,7 @@ impl ApplicationRuntime {
     pub(super) fn execute_advance_queue_task(&mut self, reason: &'static str) -> Result<()> {
         self.playback_application
             .clone()
-            .consume_queue(reason, self)
+            .consume_queue_after_monitor(reason, self)
     }
 
     pub(super) fn play_request_confirmed(
@@ -212,6 +212,10 @@ impl PlaybackExecutionPort for ApplicationRuntime {
             .remove_playback_queue(removal)
             .map(|_| ())
             .map_err(anyhow::Error::from)
+    }
+
+    fn user_pause_active(&mut self) -> Result<bool> {
+        self.player.user_pause_active()
     }
 }
 

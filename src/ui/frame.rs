@@ -23,6 +23,27 @@ pub(crate) struct Frame {
     pub(crate) ui_state: Option<UiStateObservation>,
 }
 
+#[derive(Default)]
+pub(crate) struct LatestFrameCache {
+    image: Option<Arc<DynamicImage>>,
+    valid: bool,
+}
+
+impl LatestFrameCache {
+    pub(crate) fn store(&mut self, image: Arc<DynamicImage>) {
+        self.image = Some(image);
+        self.valid = true;
+    }
+
+    pub(crate) fn invalidate(&mut self) {
+        self.valid = false;
+    }
+
+    pub(crate) fn image(&self) -> Option<Arc<DynamicImage>> {
+        self.valid.then(|| self.image.clone()).flatten()
+    }
+}
+
 pub(crate) fn load_frame(canvas: &Canvas, game_ui: &GameUi) -> Result<Frame> {
     let started = Instant::now();
     let image = Arc::new(game_ui.capture()?);

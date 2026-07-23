@@ -168,9 +168,9 @@ timing:
     ai_request_timeout_ms: 35000
 
 ocr:
-  # PaddleOCR 检测模型路径
+  # MNN/PaddleOCR 检测模型路径；OpenVINO-only 配置可设为 null 或省略
   det_model: models/PP-OCRv6_small_det.mnn
-  # PaddleOCR 识别模型路径
+  # MNN/PaddleOCR 识别模型路径；OpenVINO-only 配置可设为 null 或省略
   rec_model: models/PP-OCRv6_small_rec.mnn
   # PaddleOCR 字符集路径
   charset: models/ppocr_keys_v6_small.txt
@@ -178,9 +178,17 @@ ocr:
   min_confidence: 0.9
   # OCR 线程数
   threads: 4
-  # OCR 后端优先级；可用值: cuda, vulkan, opencl, cpu。默认只使用 CPU OCR
+  # OCR 后端优先级；可用值: cuda, vulkan, opencl, openvino, cpu。默认只使用 CPU OCR
   backend_priority:
     - cpu
+  # 可选 OpenVINO IR 模型配置。使用前请用 --features ocr-openvino 编译，
+  # 并准备每个 XML 对应的 BIN 权重文件；未把 openvino 放入 backend_priority 时不会读取。
+  openvino:
+    det_model: null
+    det_weights: null
+    rec_model: null
+    rec_weights: null
+    device: CPU
   # 检测模型最长边限制；保持 960 与 PaddleOCR/BetterGI 常用配置一致
   det_max_side_len: 960
   # 检测分割阈值；越低越容易检出细小文字，也更容易产生噪声框

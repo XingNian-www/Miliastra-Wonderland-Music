@@ -89,6 +89,20 @@ vendor/mnn/3.6.0/windows-x64/bin/MNN.dll
 
 EXE 与 `MNN.dll` 分开编译。普通发布包默认使用 CPU OCR；CUDA MNN 运行时包可以单独构建，使用时把其中的 `MNN.dll` 和 CUDA runtime DLL 放到 EXE 旁边，并把 `config.yaml` 中的 `ocr.backend_priority` 改为先 `cuda` 后 `cpu`。默认的 CUDA 12.4.1 运行时面向 P100/Pascal，要求 Windows NVIDIA 驱动 551.78 或更新版本
 
+OpenVINO 是独立的可选 OCR 后端，不会替换默认 MNN 路径。启用它需要使用 OpenVINO IR（每个模型一对 XML/BIN 文件）导出的 PP-OCR 检测和识别模型。PaddleOCR 可以作为模型来源或转换工具，但 OpenVINO 运行时不调用 PaddleOCR/Python 的预处理、后处理或模型代码：
+
+```powershell
+# 混合构建：保留默认 MNN，OpenVINO 失败时可显式配置 CPU fallback
+cargo build --release --features ocr-openvino
+
+# 独立构建：不编译 ocr-rs/MNN，只使用 OpenVINO 后端
+cargo build --release --no-default-features --features ocr-openvino
+```
+
+发布机还需要安装 OpenVINO >= 2025.1，并把 `runtime/bin/intel64/Release` 和同一安装包中的 `runtime/3rdparty/tbb/bin` 加入 `PATH`；也可以设置 `OPENVINO_INSTALL_DIR` 帮助定位主 DLL，但 TBB 目录仍必须能被 Windows DLL 搜索到。OpenVINO-only 配置把 `ocr.backend_priority` 设为只含 `openvino`，在 `ocr.openvino` 下填写四个模型路径；此时 `ocr.det_model`/`ocr.rec_model` 可以省略或设为 `null`，不会追加 CPU fallback，也不需要 MNN 模型或 `MNN.dll`。混合配置可以显式加入 `cpu`（或其他 MNN 后端）作为 fallback，此时才需要对应 MNN 模型。OpenVINO 的模型转换、输入形状和输出节点必须保持 PaddleOCR DB 检测与 CTC 识别约定，静态输入形状不适合作为当前聊天小图后端。
+
+只有默认/混合构建需要从源码生成 `ocr-rs`/MNN 绑定，并按该依赖的要求安装 `libclang`；这是 MNN 构建条件，不是 OpenVINO IR 运行条件。OpenVINO-only 运行机只需要 OpenVINO runtime、对应 IR/BIN、字符集和本项目二进制，不需要 PaddleOCR、Python、MNN 模型或 Rust 工具链。
+
 运行机器还需要安装 Microsoft Visual C++ Redistributable 2015-2022 x64，因为官方 MNN 动态库依赖 `MSVCP140.dll`、`VCRUNTIME140.dll` 和 `VCRUNTIME140_1.dll`
 
 Linux 可以用来做 Windows GNU 目标检查，但这不是正式发布构建路径：

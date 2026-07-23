@@ -63,13 +63,13 @@ flowchart TD
 
 - 从配置解析 OCR 模型路径、线程数和后端优先级。
 - 按优先级尝试创建 OCR 引擎。
-- 探测 CPU、OpenCL、Vulkan、CUDA 等后端可用性。
+- 探测 CPU、OpenCL、Vulkan、CUDA 等 MNN 后端，以及编译 feature 后的 OpenVINO 后端可用性。默认启用 `ocr-mnn`；OpenVINO-only 构建可用 `--no-default-features --features ocr-openvino` 排除 PaddleOCR/MNN。
 - 把 OCR 行按位置合并成更接近聊天文本的字符串。
 - 归一化中英文间距和标点附近空格。
 
 `src/runtime/ocr/batch.rs` 是批量识别包装。它只负责把多个聊天切块送入 OCR，并把结果按原 block 顺序放回。是否开启 batch 是性能策略，不改变聊天语义。
 
-当前项目里 OCR 引擎是共享资源；识别阶段通过全局互斥串行化推理。这个互斥只包住 OCR 推理，不包住截图、聊天切块或模板匹配。
+当前项目里 OCR 引擎是共享资源；识别阶段通过 `OcrRuntime` 的单一 worker 串行化推理。启用对应 feature 的 MNN 或 OpenVINO 模型都在该 worker 内常驻；OpenVINO 通过独立 `InferRequest` 调用检测和识别图。这个边界只包住 OCR 推理，不包住截图、聊天切块或模板匹配。
 
 ## 大厅信息
 

@@ -87,7 +87,7 @@ pub(crate) fn batch_recognize_blocks<Id: Clone>(
 
     let mut block_lines: Vec<Vec<OcrLine>> = vec![Vec::new(); blocks.len()];
     for mut line in lines {
-        // PaddleOCR expands detection boxes (especially with unclip_ratio=2.0),
+        // The DB detector expands detection boxes (especially with unclip_ratio=2.0),
         // so a valid line can cross a block edge or the gray separator.  The
         // center is stable enough to assign it without rejecting the message.
         let Some(owner) = center_owner(line.bbox, &y_offsets, &crops)? else {

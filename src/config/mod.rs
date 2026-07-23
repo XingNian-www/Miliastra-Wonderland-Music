@@ -531,12 +531,22 @@ pub struct ExternalTimingConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OcrConfig {
-    pub det_model: PathBuf,
-    pub rec_model: PathBuf,
+    /// MNN/PaddleOCR detection model. It is only required when an MNN backend
+    /// is selected; OpenVINO-only deployments can omit it.
+    #[serde(default)]
+    pub det_model: Option<PathBuf>,
+    /// MNN/PaddleOCR recognition model. It is only required when an MNN backend
+    /// is selected; OpenVINO-only deployments can omit it.
+    #[serde(default)]
+    pub rec_model: Option<PathBuf>,
     pub charset: PathBuf,
     pub min_confidence: f32,
     pub threads: i32,
     pub backend_priority: Vec<String>,
+    /// Optional OpenVINO IR model configuration. This is ignored unless
+    /// `openvino` appears in `backend_priority`.
+    #[serde(default)]
+    pub openvino: OpenVinoConfig,
     pub det_max_side_len: u32,
     pub det_score_threshold: f32,
     pub det_unclip_ratio: f32,
@@ -554,6 +564,62 @@ pub struct OcrConfig {
     pub next_marker_min_gap: i32,
     pub right_padding: i32,
     pub batch_recognize: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenVinoConfig {
+    /// Detection model XML file exported as OpenVINO IR.
+    #[serde(default)]
+    pub det_model: Option<PathBuf>,
+    /// Detection model weights file paired with `det_model`.
+    #[serde(default)]
+    pub det_weights: Option<PathBuf>,
+    /// Recognition model XML file exported as OpenVINO IR.
+    #[serde(default)]
+    pub rec_model: Option<PathBuf>,
+    /// Recognition model weights file paired with `rec_model`.
+    #[serde(default)]
+    pub rec_weights: Option<PathBuf>,
+    /// OpenVINO device name, normally `CPU` (also `GPU`/`NPU` when installed).
+    #[serde(default = "default_openvino_device")]
+    pub device: String,
+}
+
+impl Default for OpenVinoConfig {
+    fn default() -> Self {
+        Self {
+            det_model: None,
+            det_weights: None,
+            rec_model: None,
+            rec_weights: None,
+            device: default_openvino_device(),
+        }
+    }
+}
+
+fn default_openvino_device() -> String {
+    "CPU".to_string()
+}
+
+impl OpenVinoConfig {
+    fn validate(&self) -> Result<()> {
+        for (path, field) in [
+            (&self.det_model, "ocr.openvino.det_model"),
+            (&self.det_weights, "ocr.openvino.det_weights"),
+            (&self.rec_model, "ocr.openvino.rec_model"),
+            (&self.rec_weights, "ocr.openvino.rec_weights"),
+        ] {
+            let Some(path) = path else {
+                bail!("{field} 在启用 OpenVINO 后端时不能为空");
+            };
+            validate_nonempty_path(path, field)?;
+        }
+        if self.device.trim().is_empty() {
+            bail!("ocr.openvino.device 不能为空");
+        }
+        Ok(())
+    }
 }
 
 impl OcrConfig {
@@ -579,18 +645,34 @@ impl OcrConfig {
         for backend in &self.backend_priority {
             if !matches!(
                 backend.trim().to_ascii_lowercase().as_str(),
-                "cuda" | "vulkan" | "opencl" | "open-cl" | "cpu"
+                "cuda" | "vulkan" | "opencl" | "open-cl" | "openvino" | "cpu"
             ) {
                 bail!("ocr.backend_priority 包含不支持的后端: {}", backend);
             }
         }
-        for (path, field) in [
-            (&self.det_model, "ocr.det_model"),
-            (&self.rec_model, "ocr.rec_model"),
-            (&self.charset, "ocr.charset"),
-        ] {
-            validate_nonempty_path(path, field)?;
+        let openvino_selected = self
+            .backend_priority
+            .iter()
+            .any(|backend| backend.trim().eq_ignore_ascii_case("openvino"));
+        if openvino_selected {
+            self.openvino.validate()?;
         }
+        let mnn_selected = self
+            .backend_priority
+            .iter()
+            .any(|backend| !backend.trim().eq_ignore_ascii_case("openvino"));
+        if mnn_selected {
+            for (path, field) in [
+                (&self.det_model, "ocr.det_model"),
+                (&self.rec_model, "ocr.rec_model"),
+            ] {
+                let Some(path) = path else {
+                    bail!("{field} 在启用 MNN 后端时不能为空");
+                };
+                validate_nonempty_path(path, field)?;
+            }
+        }
+        validate_nonempty_path(&self.charset, "ocr.charset")?;
         Ok(())
     }
 }
@@ -1128,7 +1210,7 @@ stale_timeout_ms: 7500
     fn startup_validation_rejects_invalid_required_runtime_resources() {
         let invalid_fields: [ConfigMutation; 13] = [
             ("ocr.det_model", |config| {
-                config.ocr.det_model = PathBuf::new();
+                config.ocr.det_model = Some(PathBuf::new());
             }),
             ("ocr.backend_priority", |config| {
                 config.ocr.backend_priority = vec!["metal".to_string()];
@@ -1182,6 +1264,50 @@ stale_timeout_ms: 7500
                 "field={field} error={error}"
             );
         }
+    }
+
+    #[test]
+    fn startup_validation_requires_openvino_ir_paths_when_selected() {
+        let mut config: AppConfig =
+            serde_yaml::from_str(bundled_config_yaml()).expect("default config");
+        config.ocr.backend_priority = vec!["openvino".to_string()];
+        config.ocr.det_model = None;
+        config.ocr.rec_model = None;
+
+        let error = config
+            .validate()
+            .expect_err("OpenVINO selection without IR paths must fail");
+        assert!(error.to_string().contains("ocr.openvino.det_model"));
+
+        config.ocr.openvino.det_model = Some(PathBuf::from("det.xml"));
+        config.ocr.openvino.det_weights = Some(PathBuf::from("det.bin"));
+        config.ocr.openvino.rec_model = Some(PathBuf::from("rec.xml"));
+        config.ocr.openvino.rec_weights = Some(PathBuf::from("rec.bin"));
+        config
+            .validate()
+            .expect("complete OpenVINO IR configuration should validate");
+    }
+
+    #[test]
+    fn startup_validation_requires_mnn_models_only_for_mnn_backends() {
+        let mut config: AppConfig =
+            serde_yaml::from_str(bundled_config_yaml()).expect("default config");
+        config.ocr.backend_priority = vec!["openvino".to_string()];
+        config.ocr.det_model = None;
+        config.ocr.rec_model = None;
+        config.ocr.openvino.det_model = Some(PathBuf::from("det.xml"));
+        config.ocr.openvino.det_weights = Some(PathBuf::from("det.bin"));
+        config.ocr.openvino.rec_model = Some(PathBuf::from("rec.xml"));
+        config.ocr.openvino.rec_weights = Some(PathBuf::from("rec.bin"));
+        config
+            .validate()
+            .expect("OpenVINO-only configuration must not require MNN models");
+
+        config.ocr.backend_priority = vec!["openvino".to_string(), "cpu".to_string()];
+        let error = config
+            .validate()
+            .expect_err("a mixed OpenVINO/MNN configuration must require MNN models");
+        assert!(error.to_string().contains("ocr.det_model"));
     }
 
     #[test]

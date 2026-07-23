@@ -103,7 +103,7 @@ HTTP 不拼接伪聊天文本。远程播放和点歌构造 `ConsoleCommandInten
 - `src/ui/template.rs` 负责彩色/灰度模板匹配及模板缓存。
 - `src/ui/state.rs` 使用可靠锚点判断一级、二级和未知界面。
 - `src/runtime/ocr/batch.rs` 用调用方 ID 保持拼接 OCR block 与结果的稳定关联。
-- `src/runtime/ocr/engine.rs` 拥有 Paddle OCR 模型与后端选择。
+- `src/runtime/ocr/engine.rs` 拥有 OCR 模型与后端选择；默认使用 MNN，编译 `ocr-openvino` feature 后可按优先级选择独立的 OpenVINO IR 适配器。`ocr-mnn` 是默认 feature；用 `--no-default-features --features ocr-openvino` 可构建不包含 PaddleOCR/MNN 代码的 OpenVINO-only 二进制。
 
 当前真实 1920×1080 fixture `tests/fixtures/ui/secondary-chat-scrolled-1920x1080.jpg` 覆盖：
 

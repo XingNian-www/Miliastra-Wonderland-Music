@@ -99,5 +99,12 @@ ocr:
 
 - OpenVINO runtime：2026.2.1 Windows x64（官方包）。
 - 转换结果：det XML 约 252 KB/BIN 约 9.8 MB；rec XML 约 239 KB/BIN 约 21.1 MB。
-- 本地 smoke test：两张零图均成功 `compile_model` 和 CPU infer；输出类型为 F32。
-- 尚未完成：在真实聊天截图上与 MNN 逐行比对，以及在目标 CPU 上测量 10--30 ms 目标是否可达。
+- 本地 smoke test：两张零图均成功 `compile_model` 和 CPU infer；输出类型为 F32，det 输出 `[1,1,96,320]`，rec 输出 `[1,24,18710]`。
+- Rust 适配层还提供可选真实截图测试。设置 `OPENVINO_OCR_IR_ROOT`（指向四个 IR 文件目录）并准备好 OpenVINO DLL 后运行：
+
+  ```powershell
+  cargo test --no-default-features --features ocr-openvino configured_ir_models_recognize_fixture -- --nocapture
+  ```
+
+  未设置该环境变量时测试会跳过，不影响普通 CI；本地 2026.2.1 runtime 已通过该测试。
+- 尚未完成：在目标 CPU 上测量 10--30 ms 目标是否可达，以及把真实截图逐行结果与 MNN 做系统性比对。

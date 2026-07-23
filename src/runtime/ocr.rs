@@ -9,12 +9,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use image::DynamicImage;
-use ocr_rs::OcrEngine;
 
 pub(crate) use batch::{OcrImageBlock, batch_recognize_blocks};
 pub(crate) use engine::{
-    OcrArgs, OcrBackendProbeStatus, OcrLine, ResolvedOcrArgs, make_ocr_engine, merge_ocr_lines,
-    probe_ocr_backend_support, recognize_lines,
+    OcrArgs, OcrBackendProbeStatus, OcrEngineBackend, OcrLine, ResolvedOcrArgs, make_ocr_engine,
+    merge_ocr_lines, probe_ocr_backend_support, recognize_lines,
 };
 
 const OCR_REBUILD_INTERVAL: Duration = Duration::from_secs(60 * 60);
@@ -104,7 +103,7 @@ impl OcrRuntimeHandle {
 
 pub(crate) struct ProductionOcrDevice {
     args: ResolvedOcrArgs,
-    engine: OcrEngine,
+    engine: OcrEngineBackend,
     rebuild_due_at: Instant,
 }
 
@@ -142,7 +141,7 @@ impl ProductionOcrDevice {
 impl OcrDevice for ProductionOcrDevice {
     fn recognize_lines(&mut self, image: &DynamicImage) -> Result<Vec<OcrLine>> {
         self.rebuild_if_due();
-        recognize_lines(&self.engine, image)
+        recognize_lines(&mut self.engine, image)
     }
 }
 

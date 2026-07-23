@@ -1410,7 +1410,9 @@ mod tests {
         assert_eq!(MAX_FRIEND_LIST_DRAGS, 2);
     }
     use crate::config::AppConfig;
-    use crate::runtime::ocr::{OcrArgs, OcrDevice, OcrLine, OcrRuntime, ProductionOcrDevice};
+    #[cfg(feature = "ocr-mnn")]
+    use crate::runtime::ocr::{OcrArgs, ProductionOcrDevice};
+    use crate::runtime::ocr::{OcrDevice, OcrLine, OcrRuntime};
     use crate::runtime::ui::{FrameDemand, FramePublication, UiDevice, UiRuntime};
     use crate::ui::geometry::Rect;
     use crate::ui::state::{TemplateUiStateClassifier, UiTemplateArgs};
@@ -1439,6 +1441,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "ocr-mnn")]
     fn fixed_secondary_chat_fixture_proves_stable_friend_row_and_title_first_identity_fallback() {
         let config = AppConfig::load(Path::new("config.yaml")).expect("load default config");
         let args = OcrArgs::default().resolve(&config.ocr);
@@ -1543,14 +1546,17 @@ mod tests {
         hall_point: (i32, i32),
     }
 
+    #[cfg(feature = "ocr-mnn")]
     struct BoundedFixtureSearchRoutine {
         ocr: OcrRuntimeHandle,
         config: FriendDeliveryRoutineConfig,
         recipient: String,
     }
 
+    #[cfg(feature = "ocr-mnn")]
     impl sealed::UiRoutineSealed for BoundedFixtureSearchRoutine {}
 
+    #[cfg(feature = "ocr-mnn")]
     impl UiRoutine for BoundedFixtureSearchRoutine {
         type Output = std::result::Result<Point, UiRoutineFailure>;
 

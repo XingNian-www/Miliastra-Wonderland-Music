@@ -223,7 +223,7 @@ OCR 引擎运行超过 1 小时会尝试重建。重建成功或失败都会写�
 
 OpenVINO-only 配置不要求 `ocr.det_model`/`ocr.rec_model`，并且 `backend_priority` 只含 `openvino` 时不会自动追加 CPU。若要保留回退，必须显式加入 `cpu` 或其他 MNN 后端，同时提供对应 MNN 模型。
 
-OpenVINO 运行库通过 runtime linking 只在选择 `openvino` 后端并创建适配器时加载，不随仓库中的 MNN DLL 一起提供。运行机必须安装 OpenVINO >= 2025.1，并让 `runtime/bin/intel64/Release` 与 `runtime/3rdparty/tbb/bin` 都能被 `PATH` 找到；`OPENVINO_INSTALL_DIR` 可用于帮助定位主 DLL，但不能代替 TBB DLL 的搜索路径。不同 OpenVINO 发行包的插件发现文件名可能不同，不应把 `plugins.xml` 作为固定文件名依赖。IR 模型应使用动态的 `[1,3,H,W]` 输入；固定输入尺寸会在请求张量形状不匹配时失败。检测输出必须是单 batch/单 channel 且空间尺寸与输入相同的 F32 DB 概率图，否则后端会拒绝该模型。后端初始化时会对检测和识别图各做一次 warm-up，之后仍由单一 `OcrRuntime` worker 串行创建独立推理请求。`ocr.openvino.cache_dir` 默认写入 `data/openvino-cache`，并使用 `CACHE_MODE=OPTIMIZE_SPEED`；核显首次编译仍可能较慢，但后续启动会复用缓存结果。设置为 `null` 可关闭，目录不可写时只记录 warning，不影响后端继续初始化。
+OpenVINO 运行库通过 runtime linking 只在选择 `openvino` 后端并创建适配器时加载，不随仓库中的 MNN DLL 一起提供。运行机必须安装 OpenVINO >= 2025.1；Windows 下适配器会优先尝试 EXE 所在目录、其 `openvino/runtime` 子目录和当前工作目录，并自动把发现的 runtime/TBB 目录加入进程 DLL 搜索路径，然后才使用 `OPENVINO_INSTALL_DIR`、`PATH` 和系统位置。若本地 runtime 不存在或加载失败，仍会回到原有环境变量查找链路。不同 OpenVINO 发行包的插件发现文件名可能不同，不应把 `plugins.xml` 作为固定文件名依赖。IR 模型仍使用动态的 `[1,3,H,W]` 输入，但适配器会将默认聊天检测请求归一化到 `416×128`（逐块）或 `416×256`（批量拼接），将识别宽度归入 `96/128/192/256/384/512/768/1024` 桶，并在启动阶段预热全部这些形状；补齐区域使用均值背景，检测坐标仍按有效宽高映射，CTC 解码只读取有效时间步。超出默认聊天范围时使用 32 像素对齐的安全兜底。检测输出必须是单 batch/单 channel 且空间尺寸与输入相同的 F32 DB 概率图，否则后端会拒绝该模型。后端初始化会预热全部固定形状，之后仍由单一 `OcrRuntime` worker 串行创建独立推理请求。`ocr.openvino.cache_dir` 默认写入 `data/openvino-cache`，并使用 `CACHE_MODE=OPTIMIZE_SPEED`；首次启动会承担全部形状预热时间，后续启动会复用缓存结果。设置为 `null` 可关闭，目录不可写时只记录 warning，不影响后端继续初始化。
 
 每个后端初始化成功会写：
 

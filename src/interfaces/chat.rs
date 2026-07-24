@@ -919,6 +919,32 @@ mod tests {
     }
 
     #[test]
+    fn parses_netease_cloud_song_alias_in_hall_and_friend_chat() {
+        let hall = parse_text("用户：@网易云点歌 晴天 周杰伦", "blue")
+            .expect("parse hall netease cloud alias");
+        let friend = parse_text("[Alice]：@网易云点歌 晴天 周杰伦", "pink")
+            .expect("parse friend netease cloud alias");
+
+        for parsed in [hall, friend] {
+            assert_eq!(
+                parsed.command,
+                ModuleCommand::SongRequest(SongCommand {
+                    keyword: "晴天 周杰伦".to_string(),
+                    source: SongSource::Netease,
+                    prefix: "网易云点歌".to_string(),
+                    prefer_accompaniment: false,
+                    ai_assisted: false,
+                    friend_username: if parsed.message_type == "pink" {
+                        "Alice".to_string()
+                    } else {
+                        String::new()
+                    },
+                })
+            );
+        }
+    }
+
+    #[test]
     fn rejects_blue_bilibili_song_command() {
         assert!(parse_text("用户：@B站点歌 晴天 周杰伦", "blue").is_none());
     }

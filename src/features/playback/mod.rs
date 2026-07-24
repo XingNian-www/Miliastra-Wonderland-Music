@@ -230,6 +230,7 @@ pub(crate) enum PlaybackCommand {
     Volume(String),
     Status,
     Lyrics,
+    LyricsFor(u8),
     Queue,
     QueueFull,
     QueueDelete(Vec<usize>),
@@ -308,7 +309,7 @@ impl PlaybackCommand {
             ("播放", false),
             ("音量", true),
             ("状态", false),
-            ("歌词", false),
+            ("歌词", true),
             ("完整队列", false),
             ("完整列表", false),
             ("队列", false),
@@ -325,7 +326,8 @@ impl PlaybackCommand {
                 "上一首" | "上一曲" => Self::Previous,
                 "音量" => Self::Volume(argument.to_string()),
                 "状态" => Self::Status,
-                "歌词" => Self::Lyrics,
+                "歌词" if argument.is_empty() => Self::Lyrics,
+                "歌词" => Self::LyricsFor(parse_lyrics_duration(argument)?),
                 "完整队列" | "完整列表" => Self::QueueFull,
                 "队列" | "列表" => Self::Queue,
                 "队列删除" => Self::QueueDelete(parse_queue_indexes(argument)),
@@ -349,7 +351,7 @@ impl PlaybackCommand {
             Self::Previous => "previous".to_string(),
             Self::Volume(volume) => format!("volume:{}", command_identity(volume)),
             Self::Status => "status".to_string(),
-            Self::Lyrics => "lyrics".to_string(),
+            Self::Lyrics | Self::LyricsFor(_) => "lyrics".to_string(),
             Self::Queue => "queue".to_string(),
             Self::QueueFull => "queue_full".to_string(),
             Self::QueueDelete(indexes) => format!(
@@ -402,6 +404,15 @@ fn parse_queue_indexes(argument: &str) -> Vec<usize> {
         .filter(|value| (1..=9).contains(value))
         .map(|value| value as usize - 1)
         .collect()
+}
+
+fn parse_lyrics_duration(argument: &str) -> Option<u8> {
+    let argument = argument.trim();
+    if argument.is_empty() || !argument.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    let seconds = argument.parse::<u8>().ok()?;
+    (1..=10).contains(&seconds).then_some(seconds)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -758,6 +769,25 @@ mod tests {
             PlaybackCommand::Queue.lock_key(),
             PlaybackCommand::QueueFull.lock_key()
         );
+    }
+
+    #[test]
+    fn lyrics_command_accepts_only_a_duration_from_one_to_ten_seconds() {
+        assert_eq!(
+            PlaybackCommand::parse_hall("歌词")
+                .expect("one-shot lyrics command")
+                .command,
+            PlaybackCommand::Lyrics
+        );
+        assert_eq!(
+            PlaybackCommand::parse_hall("歌词 5")
+                .expect("timed lyrics command")
+                .command,
+            PlaybackCommand::LyricsFor(5)
+        );
+        assert_eq!(PlaybackCommand::parse_hall("歌词 0"), None);
+        assert_eq!(PlaybackCommand::parse_hall("歌词 11"), None);
+        assert_eq!(PlaybackCommand::parse_hall("歌词 5秒"), None);
     }
 }
 

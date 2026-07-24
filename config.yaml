@@ -181,14 +181,17 @@ ocr:
   # OCR 后端优先级；可用值: cuda, vulkan, opencl, openvino, cpu。默认只使用 CPU OCR
   backend_priority:
     - cpu
-  # 可选 OpenVINO IR 模型配置。使用前请用 --features ocr-openvino 编译，
-  # 并准备每个 XML 对应的 BIN 权重文件；未把 openvino 放入 backend_priority 时不会读取。
+  # OpenVINO IR 模型配置。默认 EXE 已包含 OpenVINO 适配器，但只在
+  # backend_priority 选择 openvino 时检查运行时 DLL 和这些模型文件。
   openvino:
     det_model: null
     det_weights: null
     rec_model: null
     rec_weights: null
     device: CPU
+    # OpenVINO GPU/CPU 编译缓存；首次运行生成，后续启动可避免重复编译。
+    # 设置为 null 可关闭缓存。
+    cache_dir: data/openvino-cache
   # 检测模型最长边限制；保持 960 与 PaddleOCR/BetterGI 常用配置一致
   det_max_side_len: 960
   # 检测分割阈值；越低越容易检出细小文字，也更容易产生噪声框

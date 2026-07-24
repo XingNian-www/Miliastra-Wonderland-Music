@@ -5,12 +5,13 @@ edition = "2024"
 license = "MIT"
 
 [features]
-default = ["ocr-mnn"]
-# Default PaddleOCR/MNN backend. Keep this feature enabled for the existing
-# release path; it can be disabled for an OpenVINO-only build.
+# Build one EXE containing both runtime-discoverable OCR adapters. The optional
+# DLLs are still loaded only when their backend is selected at runtime.
+default = ["ocr-mnn", "ocr-openvino"]
+# PaddleOCR/MNN backend. It can be disabled for an OpenVINO-only build.
 ocr-mnn = ["dep:ocr-rs"]
-# Optional OpenVINO OCR backend. The runtime is loaded dynamically at startup;
-# install OpenVINO separately and keep this feature disabled for the default MNN build.
+# OpenVINO OCR adapter. The OpenVINO runtime is loaded dynamically only when
+# `backend_priority` selects `openvino`.
 ocr-openvino = ["dep:imageproc", "dep:openvino"]
 
 [dependencies]

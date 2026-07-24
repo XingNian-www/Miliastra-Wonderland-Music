@@ -39,7 +39,7 @@ env:
   OPENVINO_ARCHIVE_SHA256_URL: https://storage.openvinotoolkit.org/repositories/openvino/packages/2026.2.1/windows_vc_mt/openvino_toolkit_windows_vc_mt_2026.2.1.21919.ede283a88e3_x86_64.zip.sha256
   PP_OCR_DET_ONNX_URL: https://huggingface.co/PaddlePaddle/PP-OCRv6_small_det_onnx/resolve/5994b4f1a827310b6d38f6b13716af6381847be0/inference.onnx?download=true
   PP_OCR_REC_ONNX_URL: https://huggingface.co/PaddlePaddle/PP-OCRv6_small_rec_onnx/resolve/3d2d345e6a299891174f1397a72cdd81331359c7/inference.onnx?download=true
-  PP_OCR_CHARSET_URL: https://raw.githubusercontent.com/zibo-chen/rust-paddle-ocr/next/models/ppocr_keys_v6_small.txt
+  PP_OCR_CHARSET_URL: https://raw.githubusercontent.com/zibo-chen/rust-paddle-ocr/7368dfa292ab988e8431de4ec952f015bec40635/models/ppocr_keys_v6_small.txt
 
 jobs:
   build-windows-openvino:
@@ -309,6 +309,39 @@ jobs:
           }
           $tbbDlls | Copy-Item -Destination $tbbTarget -Force
 
+          # Rust MSVC and the OpenVINO binaries use the x64 Microsoft CRT. Pick the
+          # regular VC143/VC144/VC145 redist directory from the runner and ship its
+          # DLLs beside the EXE so a clean Windows host does not need an installer.
+          $vcRuntime = Get-ChildItem `
+              -Path "$env:ProgramFiles\Microsoft Visual Studio" `
+              -Recurse `
+              -File `
+              -Filter 'vcruntime140.dll' `
+              -ErrorAction SilentlyContinue |
+            Where-Object {
+              $_.FullName -match '\\x64\\Microsoft\.VC\d+\.CRT\\vcruntime140\.dll$' -and
+              $_.FullName -notmatch '\\onecore\\'
+            } |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+          if (-not $vcRuntime) {
+            throw 'Cannot find the x64 Microsoft Visual C++ runtime on the Windows runner'
+          }
+          $vcRuntimeDlls = Get-ChildItem -LiteralPath $vcRuntime.DirectoryName -Filter '*.dll' -File
+          if (-not $vcRuntimeDlls) {
+            throw "No Microsoft Visual C++ runtime DLLs found in $($vcRuntime.DirectoryName)"
+          }
+          $vcRuntimeDlls | Copy-Item -Destination $dist -Force
+          $vcNotice = @'
+          Microsoft Visual C++ Runtime
+
+          This package includes the x64 Microsoft Visual C++ runtime DLLs required by the
+          application and OpenVINO. They are redistributed under the Microsoft Visual C++
+          Redistributable for Visual Studio 2015-2022 license:
+          https://aka.ms/vs/17/release/VC_redist.x64.exe
+          '@
+          Set-Content -LiteralPath (Join-Path $dist 'VC-REDIST-NOTICE.txt') -Value $vcNotice -Encoding ascii
+
           $licenseFiles = @{
             'OPENVINO-LICENSE.txt' = Join-Path $env:OPENVINO_ROOT 'docs\licensing\LICENSE'
             'OPENVINO-THIRD-PARTY-NOTICES.txt' = Join-Path $env:OPENVINO_ROOT 'docs\licensing\onetbb_third-party-programs.txt'
@@ -344,7 +377,11 @@ jobs:
             'models\PP-OCRv6_small_rec.bin',
             'openvino\runtime\bin\intel64\Release\openvino_c.dll',
             'openvino\runtime\bin\intel64\Release\openvino_intel_cpu_plugin.dll',
-            'openvino\runtime\3rdparty\tbb\bin\tbb12.dll'
+            'openvino\runtime\3rdparty\tbb\bin\tbb12.dll',
+            'vcruntime140.dll',
+            'vcruntime140_1.dll',
+            'msvcp140.dll',
+            'VC-REDIST-NOTICE.txt'
           )
           foreach ($relativePath in $required) {
             if (-not (Test-Path -LiteralPath (Join-Path $dist $relativePath))) {

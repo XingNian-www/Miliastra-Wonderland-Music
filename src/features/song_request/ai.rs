@@ -58,6 +58,13 @@ pub struct AiCandidatePickResult {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct AiSongIdentityResult {
+    pub(crate) matched: bool,
+    pub(crate) score: f64,
+    pub(crate) reason: String,
+}
+
+#[derive(Clone, Debug)]
 struct AiProviderConfig {
     provider: AiProvider,
     endpoint: String,
@@ -85,6 +92,55 @@ impl AiClient {
 
     pub fn enabled(&self) -> bool {
         !self.config.api_key.trim().is_empty()
+    }
+
+    pub(crate) fn judge_song_identity(
+        &self,
+        request: &str,
+        song_name: &str,
+        song_singer: &str,
+    ) -> Result<AiSongIdentityResult> {
+        let provider = resolve_provider_config(&self.config, None)?;
+        let json = self.match_song_identity_json(&provider, request, song_name, song_singer)?;
+        let value: Value = serde_json::from_str(&json)?;
+        Ok(AiSongIdentityResult {
+            matched: value.get("match").and_then(Value::as_bool).unwrap_or(false)
+                && value
+                    .get("decision")
+                    .and_then(Value::as_str)
+                    .is_some_and(|decision| decision == "match"),
+            score: value.get("score").and_then(Value::as_f64).unwrap_or(0.0),
+            reason: value
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("AI未提供判断理由")
+                .trim()
+                .to_string(),
+        })
+    }
+
+    fn match_song_identity_json(
+        &self,
+        provider: &AiProviderConfig,
+        request: &str,
+        song_name: &str,
+        song_singer: &str,
+    ) -> Result<String> {
+        let request = normalize_required(request, "request")?;
+        let song_name = normalize_required(song_name, "songName")?;
+        let song_singer = assert_no_control_chars(song_singer, "songSinger")?
+            .trim()
+            .to_string();
+        let reply = call_ai(
+            &self.openai,
+            provider,
+            &build_match_prompt(&request, &song_name, &song_singer),
+            1024,
+            self.request_timeout,
+        )?;
+        let json = model_reply_json_object(&reply)?;
+        validate_match_json(&json)?;
+        Ok(json)
     }
 
     pub fn pick_song_candidate(
@@ -158,23 +214,12 @@ impl AiClient {
 
     pub fn match_with_query(&self, query: &[(String, String)]) -> Result<String> {
         let provider = resolve_provider_config(&self.config, Some(query))?;
-        let request = normalize_required(query_value(query, "request").unwrap_or(""), "request")?;
-        let song_name =
-            normalize_required(query_value(query, "songName").unwrap_or(""), "songName")?;
-        let song_singer =
-            assert_no_control_chars(query_value(query, "songSinger").unwrap_or(""), "songSinger")?
-                .trim()
-                .to_string();
-        let reply = call_ai(
-            &self.openai,
+        self.match_song_identity_json(
             &provider,
-            &build_match_prompt(&request, &song_name, &song_singer),
-            1024,
-            self.request_timeout,
-        )?;
-        let json = model_reply_json_object(&reply)?;
-        validate_match_json(&json)?;
-        Ok(json)
+            query_value(query, "request").unwrap_or(""),
+            query_value(query, "songName").unwrap_or(""),
+            query_value(query, "songSinger").unwrap_or(""),
+        )
     }
 
     pub fn pick_with_query(&self, query: &[(String, String)]) -> Result<String> {

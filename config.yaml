@@ -152,6 +152,8 @@ timing:
     uri_stable_samples: 0
     # 播放状态连续确认次数；大于 1 时覆盖全局值，0 或 1 表示继承
     transport_stable_samples: 0
+    # 播放器跨源自动换源后，备用 URI/标题/歌手需要连续稳定的确认次数
+    fallback_identity_stable_samples: 2
     # 播放器异常时保留上一条稳定观测的最长时间，必须为正整数，单位毫秒
     stale_timeout_ms: 5000
   decision:

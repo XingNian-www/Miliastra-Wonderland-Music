@@ -125,8 +125,10 @@ flowchart TD
 
 - 状态必须是 `playing` 或 `paused`。
 - 有请求 URI 时优先确认当前 URI。
-- URI 缺失或不一致时，普通点歌不能用歌名歌手匹配兜底。
-- 仍不匹配时，控制器返回 `MismatchedCandidate`，由主流程拒绝当前音源或在允许时换源重试。
+- 跨音源 URI 不一致时，先按 `timing.playback.fallback_identity_stable_samples` 确认备用 URI、歌名和歌手连续稳定。
+- 稳定备用观测先通过 `MatchConfig::match_song_identity()` 做整段字段归一化匹配；本地不确定时调用点歌 AI 的同曲判断，并复用 `timing.external.ai_request_timeout_ms`。
+- 跨源同曲确认成功时，活动请求保留原始 `requested_uri`，并把实际备用 URI 写入 `confirmed_uri`；同歌历史按实际 URI 记录。
+- URI 缺失、同源 URI 不一致、稳定性不足或判断失败时，控制器返回 `MismatchedCandidate`，由主流程拒绝当前音源或在允许时换源重试。
 - 进度和时长不能是无效的 `0:00/0:00`。
 - 时长过短会视为无音源。
 
@@ -230,12 +232,15 @@ flowchart TD
 
 - `播放器状态转移: Starting keyword=...`
 - `播放器观测: raw=... reliability=...`
+- `跨源同曲本地判断不确定`
+- `跨源同曲判断不匹配` / `跨源同曲判断不可用`
+- `跨源同曲确认成功`
 - `URI 与请求资源不同，不能用歌曲信息兜底`
 - `歌曲 URI 尚未切换，继续等待播放请求生效`
 - `歌曲暂不匹配`
 - `0:00/0:00，等待后重试`
 - `歌曲时长过短`
-- `播放器状态转移: Starting -> RequestedSongPlaying reason=playback_confirmed`
+- `播放器状态转移: Starting -> RequestedSongPlaying reason=playback_confirmed` 或跨源同曲理由
 - `播放成功`
 
 排查当前歌保护时重点看：

@@ -287,11 +287,10 @@ jobs:
           Installation:
           1. Extract this directory next to the normal EXE package, preserving paths.
           2. Merge config-openvino.example.yaml into config.yaml.
-          3. Before starting the EXE, set OPENVINO_INSTALL_DIR to the included
-             openvino directory, set OPENVINO_LIB_PATHS to the two DLL directories,
-             and prepend those directories to PATH:
-             openvino\runtime\bin\intel64\Release
-             openvino\runtime\3rdparty\tbb\bin
+          3. Start the EXE from the extracted package. It automatically prefers the
+             included openvino\runtime\bin\intel64\Release and
+             openvino\runtime\3rdparty\tbb\bin directories. OPENVINO_INSTALL_DIR
+             or PATH may still be set when using a different runtime installation.
           4. Keep backend_priority as openvino, cpu when CPU/MNN fallback is wanted.
 
           The normal package must provide MNN models and MNN.dll when CPU fallback is used.

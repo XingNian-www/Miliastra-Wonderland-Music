@@ -73,7 +73,7 @@ miliastra-wonderland-music-windows-x64/
 
 普通发布包中的 EXE 已包含 MNN 与 OpenVINO 两个 OCR 适配器，但只随包提供默认所需的 `MNN.dll`。未把 `openvino` 放入 `ocr.backend_priority` 时不检查 OpenVINO DLL；需要启用时，再把 OpenVINO runtime、IR 模型和对应配置放到运行目录即可，无需替换 EXE。
 
-手动执行 OpenVINO 依赖工作流会下载 OpenVINO 2026.2.1 Windows x64 runtime、PP-OCRv6 small ONNX 模型和字符集，把模型转换为 FP32 IR，并运行真实截图 smoke test。它只生成运行时依赖包，不编译 EXE，不包含完整应用资源、`MNN.dll`、PaddleOCR 或 Python。使用时把依赖包内容解压到普通 Windows x64 EXE 包旁边，并按 `README-OPENVINO.txt` 合并配置、设置 DLL 搜索路径：
+手动执行 OpenVINO 依赖工作流会下载 OpenVINO 2026.2.1 Windows x64 runtime、PP-OCRv6 small ONNX 模型和字符集，把模型转换为 FP32 IR，并运行真实截图 smoke test。它只生成运行时依赖包，不编译 EXE，不包含完整应用资源、`MNN.dll`、PaddleOCR 或 Python。使用时把依赖包内容解压到普通 Windows x64 EXE 包旁边，并按 `README-OPENVINO.txt` 合并配置；程序会自动优先从 EXE 所在目录及其 `openvino/runtime` 子目录加载 DLL，无需手动设置 DLL 搜索路径：
 
 ```text
 miliastra-wonderland-music-openvino-runtime-windows-x64/
@@ -130,7 +130,7 @@ cargo build --release --no-default-features --features ocr-openvino
 cargo build --release --no-default-features --features ocr-mnn
 ```
 
-发布机还需要安装 OpenVINO >= 2025.1，并把 `runtime/bin/intel64/Release` 和同一安装包中的 `runtime/3rdparty/tbb/bin` 加入 `PATH`；依赖包中的 `README-OPENVINO.txt` 给出相同的目录结构和环境变量设置，也可以设置 `OPENVINO_INSTALL_DIR` 帮助定位主 DLL，但 TBB 目录仍必须能被 Windows DLL 搜索到。OpenVINO-only 配置把 `ocr.backend_priority` 设为只含 `openvino`，在 `ocr.openvino` 下填写四个模型路径；此时 `ocr.det_model`/`ocr.rec_model` 可以省略或设为 `null`，不会追加 CPU fallback，也不需要 MNN 模型或 `MNN.dll`。混合配置可以显式加入 `cpu`（或其他 MNN 后端）作为 fallback，此时才需要对应 MNN 模型。OpenVINO 的模型转换、输入形状和输出节点必须保持 PaddleOCR DB 检测与 CTC 识别约定，静态输入形状不适合作为当前聊天小图后端。`ocr.openvino.cache_dir` 默认是 `data/openvino-cache`，用于持久化设备插件和模型编译结果；核显首次启动仍需完成一次编译，后续启动会直接复用缓存。将它设为 `null` 可以关闭缓存，缓存目录不可写时程序会记录警告并继续运行。
+发布机还需要安装 OpenVINO >= 2025.1；程序启动 OpenVINO 后端时会按“EXE 所在目录、EXE 所在目录下的 `openvino/runtime`、当前工作目录、已有 `PATH`/`OPENVINO_INSTALL_DIR`”的顺序查找，并自动把本地 runtime 与 TBB 目录加入进程 DLL 搜索路径。若使用其他安装位置，也可以设置 `OPENVINO_INSTALL_DIR` 或 `PATH`；显式环境变量仍会作为 fallback。OpenVINO-only 配置把 `ocr.backend_priority` 设为只含 `openvino`，在 `ocr.openvino` 下填写四个模型路径；此时 `ocr.det_model`/`ocr.rec_model` 可以省略或设为 `null`，不会追加 CPU fallback，也不需要 MNN 模型或 `MNN.dll`。混合配置可以显式加入 `cpu`（或其他 MNN 后端）作为 fallback，此时才需要对应 MNN 模型。OpenVINO 的模型转换、输入形状和输出节点必须保持 PaddleOCR DB 检测与 CTC 识别约定。为避免核显 GPU 对动态聊天尺寸反复编译，适配器会把默认聊天块补齐到 `416×128` 或批量拼接用的 `416×256` 检测画布，并把识别宽度归入 `96/128/192/256/384/512/768/1024` 桶；启动时会预热这些形状，超出默认聊天范围时才使用 32 像素对齐的安全兜底。`ocr.openvino.cache_dir` 默认是 `data/openvino-cache`，用于持久化设备插件和模型编译结果；首次启动会承担全部桶的预热时间，后续启动会直接复用缓存。将它设为 `null` 可以关闭缓存，缓存目录不可写时程序会记录警告并继续运行。
 
 只有默认/混合构建需要从源码生成 `ocr-rs`/MNN 绑定，并按该依赖的要求安装 `libclang`；这是 MNN 构建条件，不是 OpenVINO IR 运行条件。OpenVINO 依赖包只提供 runtime、对应 IR/BIN、字符集和配置示例，运行时仍使用普通通用 EXE，不需要在目标机安装 PaddleOCR、Python 或 Rust 工具链。
 

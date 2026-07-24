@@ -1,5 +1,7 @@
 use std::cmp::Ordering;
 use std::path::Path;
+#[cfg(windows)]
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail};
 use image::{DynamicImage, GenericImageView, GrayImage};
@@ -13,6 +15,17 @@ use crate::ui::geometry::Rect;
 
 const RECOGNITION_HEIGHT: u32 = 48;
 const RECOGNITION_CHARACTER_THRESHOLD: f32 = 0.3;
+// The default chat region is 416x143 and individual blocks are capped at 120px.  Keep
+// detection shapes finite so the GPU plugin does not compile a new graph for every small
+// change in block height.  The second canvas covers the stitched batch-OCR path.
+const CHAT_DETECTION_CANVAS_WIDTH: u32 = 416;
+// At most nine marker rows can survive the source dedupe rules in the 143px chat region;
+// 143px of non-overlapping blocks plus eight 12px separators is 239px, so 256px covers the
+// entire batch-concatenation path after the next 32px alignment.
+const CHAT_DETECTION_CANVAS_HEIGHTS: &[u32] = &[128, 256];
+// Recognition width is proportional to the text crop aspect ratio.  These buckets cover
+// normal chat lines while keeping the number of GPU shape specializations bounded.
+const RECOGNITION_WIDTH_BUCKETS: &[u32] = &[96, 128, 192, 256, 384, 512, 768, 1024];
 const DETECTION_CHANNEL_MEAN: [f32; 3] = [0.485, 0.456, 0.406];
 const DETECTION_CHANNEL_STD: [f32; 3] = [0.229, 0.224, 0.225];
 const RECOGNITION_CHANNEL_MEAN: [f32; 3] = [0.5, 0.5, 0.5];
@@ -79,11 +92,13 @@ impl OpenVinoEngine {
         let rec_model = required_path(&config.rec_model, "ocr.openvino.rec_model")?;
         let rec_weights = required_path(&config.rec_weights, "ocr.openvino.rec_weights")?;
 
+        prepare_local_runtime_loading();
         let mut core = Core::new().map_err(|error| {
             anyhow!(
                 "OpenVINO 运行时依赖不可用，初始化 Core 失败: {error:#}; 请安装 OpenVINO >= 2025.1，\
-                 并把 runtime/bin/intel64/Release 与 runtime/3rdparty/tbb/bin 加入 PATH，\
-                 或设置 OPENVINO_INSTALL_DIR 以定位主 DLL；当前后端会按配置继续尝试下一个 fallback"
+                 程序会先尝试 EXE 目录下的 runtime；使用外部安装时请把 runtime/bin/intel64/Release \
+                 与 runtime/3rdparty/tbb/bin 加入 PATH，或设置 OPENVINO_INSTALL_DIR；\
+                 当前后端会按配置继续尝试下一个 fallback"
             )
         })?;
         let device = device_type(&config.device);
@@ -159,10 +174,24 @@ impl OpenVinoEngine {
     }
 
     fn warm_up(&mut self) -> Result<()> {
-        self.probe_detect(&DynamicImage::new_rgb8(320, 96))
-            .context("OpenVINO 检测模型 warm-up 失败")?;
-        self.probe_recognize(&DynamicImage::new_rgb8(192, RECOGNITION_HEIGHT))
-            .context("OpenVINO 识别模型 warm-up 失败")?;
+        for &height in CHAT_DETECTION_CANVAS_HEIGHTS {
+            self.probe_detect(&DynamicImage::new_rgb8(CHAT_DETECTION_CANVAS_WIDTH, height))
+                .with_context(|| {
+                    format!(
+                        "OpenVINO 检测模型 warm-up 失败: shape=[1,3,{},{}]",
+                        height, CHAT_DETECTION_CANVAS_WIDTH
+                    )
+                })?;
+        }
+        for &width in RECOGNITION_WIDTH_BUCKETS {
+            self.probe_recognize(&DynamicImage::new_rgb8(width, RECOGNITION_HEIGHT))
+                .with_context(|| {
+                    format!(
+                        "OpenVINO 识别模型 warm-up 失败: shape=[1,3,{},{}]",
+                        RECOGNITION_HEIGHT, width
+                    )
+                })?;
+        }
         Ok(())
     }
 
@@ -226,7 +255,16 @@ impl OpenVinoEngine {
         let input =
             preprocess_for_rec(image, RECOGNITION_HEIGHT).context("OpenVINO 识别图像预处理失败")?;
         let (output_data, output_shape) = self.recognizer.run(&input.data, &input.shape)?;
-        decode_ctc(&output_data, &output_shape, &self.charset)
+        let (sequence_length, _) = ctc_output_dimensions(&output_shape)?;
+        let valid_sequence_length =
+            ((sequence_length as u64 * input.valid_width as u64 + input.shape[3] as u64 - 1)
+                / input.shape[3] as u64) as usize;
+        decode_ctc(
+            &output_data,
+            &output_shape,
+            &self.charset,
+            Some(valid_sequence_length),
+        )
     }
 }
 
@@ -323,13 +361,34 @@ fn padded_size(size: u32) -> u32 {
     size.saturating_add(31) / 32 * 32
 }
 
+fn detection_canvas_size(width: u32, height: u32) -> (u32, u32) {
+    if width <= CHAT_DETECTION_CANVAS_WIDTH {
+        if let Some(&canvas_height) = CHAT_DETECTION_CANVAS_HEIGHTS
+            .iter()
+            .find(|&&canvas_height| height <= canvas_height)
+        {
+            return (CHAT_DETECTION_CANVAS_WIDTH, canvas_height);
+        }
+    }
+    (padded_size(width).max(32), padded_size(height).max(32))
+}
+
+fn recognition_width_bucket(width: u32) -> u32 {
+    RECOGNITION_WIDTH_BUCKETS
+        .iter()
+        .copied()
+        .find(|&bucket| width <= bucket)
+        .unwrap_or_else(|| padded_size(width).max(32))
+}
+
 fn preprocess_for_det(image: &DynamicImage) -> Result<PreprocessedTensor> {
     let (width, height) = image.dimensions();
     if width == 0 || height == 0 {
         bail!("OpenVINO 检测输入图像尺寸不能为空");
     }
-    let padded_width = padded_size(width).max(32) as usize;
-    let padded_height = padded_size(height).max(32) as usize;
+    let (padded_width, padded_height) = detection_canvas_size(width, height);
+    let padded_width = padded_width as usize;
+    let padded_height = padded_height as usize;
     let plane = padded_width
         .checked_mul(padded_height)
         .ok_or_else(|| anyhow!("OpenVINO 检测输入尺寸溢出"))?;
@@ -358,17 +417,17 @@ fn preprocess_for_rec(image: &DynamicImage, target_height: u32) -> Result<Prepro
         bail!("OpenVINO 识别输入图像尺寸不能为空");
     }
     let scale = target_height as f64 / height as f64;
-    let target_width = ((width as f64 * scale).round() as u32).max(1);
-    let resized = if width == target_width && height == target_height {
+    let valid_width = ((width as f64 * scale).round() as u32).max(1);
+    let resized = if width == valid_width && height == target_height {
         image.clone()
     } else {
         image.resize_exact(
-            target_width,
+            valid_width,
             target_height,
             image::imageops::FilterType::Lanczos3,
         )
     };
-    let target_width = target_width as usize;
+    let target_width = recognition_width_bucket(valid_width) as usize;
     let target_height = target_height as usize;
     let plane = target_width
         .checked_mul(target_height)
@@ -387,7 +446,7 @@ fn preprocess_for_rec(image: &DynamicImage, target_height: u32) -> Result<Prepro
     Ok(PreprocessedTensor {
         data,
         shape: vec![1, 3, target_height, target_width],
-        valid_width: target_width as u32,
+        valid_width,
         valid_height: target_height as u32,
     })
 }
@@ -678,7 +737,7 @@ fn rect_from_ordered_points(
     Some(ImageRect::at(min_x as i32, min_y as i32).of_size(max_x - min_x, max_y - min_y))
 }
 
-fn decode_ctc(data: &[f32], shape: &[usize], charset: &[char]) -> Result<(String, f32)> {
+fn ctc_output_dimensions(shape: &[usize]) -> Result<(usize, usize)> {
     let (sequence_length, class_count) = match shape.len() {
         2 => (shape[0], shape[1]),
         3 => (shape[1], shape[2]),
@@ -692,6 +751,19 @@ fn decode_ctc(data: &[f32], shape: &[usize], charset: &[char]) -> Result<(String
     if batch != 1 {
         bail!("OpenVINO 识别输出必须是单 batch: shape={shape:?}");
     }
+    Ok((sequence_length, class_count))
+}
+
+fn decode_ctc(
+    data: &[f32],
+    shape: &[usize],
+    charset: &[char],
+    valid_sequence_length: Option<usize>,
+) -> Result<(String, f32)> {
+    let (full_sequence_length, class_count) = ctc_output_dimensions(shape)?;
+    let sequence_length = valid_sequence_length
+        .unwrap_or(full_sequence_length)
+        .min(full_sequence_length);
     if class_count == 0 || sequence_length == 0 {
         return Ok((String::new(), 0.0));
     }
@@ -702,7 +774,7 @@ fn decode_ctc(data: &[f32], shape: &[usize], charset: &[char]) -> Result<(String
             charset.len()
         );
     }
-    let required = sequence_length
+    let required = full_sequence_length
         .checked_mul(class_count)
         .ok_or_else(|| anyhow!("OpenVINO 识别输出尺寸溢出"))?;
     if data.len() < required {
@@ -761,6 +833,127 @@ fn required_path<'a>(path: &'a Option<std::path::PathBuf>, field: &str) -> Resul
     path.as_deref()
         .filter(|path| !path.as_os_str().is_empty())
         .ok_or_else(|| anyhow!("{field} 未配置"))
+}
+
+/// Prefer a runtime shipped beside the application before falling back to the normal
+/// `openvino-finder` environment and system search paths.
+///
+/// The dependency package keeps OpenVINO in `openvino/runtime/...`, while a local developer
+/// build may put `openvino_c.dll` directly beside the executable.  `openvino-sys` only searches
+/// environment variables and known system locations, so make the local layout visible before
+/// `Core::new()` asks it to load the library.  A failed local load is deliberately non-fatal: the
+/// existing `PATH`/`OPENVINO_INSTALL_DIR` fallback remains available.
+fn prepare_local_runtime_loading() {
+    static PREPARE: std::sync::Once = std::sync::Once::new();
+    PREPARE.call_once(|| {
+        #[cfg(windows)]
+        {
+            let Some(executable_dir) = std::env::current_exe()
+                .ok()
+                .and_then(|path| path.parent().map(Path::to_path_buf))
+            else {
+                log::debug!("无法定位 EXE 目录，继续使用 OpenVINO 环境变量查找");
+                return;
+            };
+            let working_dir = std::env::current_dir().ok();
+            let roots = local_runtime_roots(&executable_dir, working_dir.as_deref());
+            let search_paths = local_runtime_search_paths(&roots);
+            let Some(library) = search_paths
+                .iter()
+                .map(|directory| directory.join("openvino_c.dll"))
+                .find(|path| path.is_file())
+            else {
+                log::debug!(
+                    "EXE 目录未发现本地 OpenVINO runtime，继续使用环境变量查找: {}",
+                    executable_dir.display()
+                );
+                return;
+            };
+
+            prepend_process_path(&search_paths);
+            match openvino_sys::library::load_from(&library) {
+                Ok(()) => log::info!(
+                    "已优先加载 EXE 目录中的 OpenVINO runtime: {}",
+                    library.display()
+                ),
+                Err(error) => log::warn!(
+                    "加载 EXE 目录中的 OpenVINO runtime 失败，继续使用环境变量查找: path={} error={error}",
+                    library.display()
+                ),
+            }
+        }
+    });
+}
+
+#[cfg(windows)]
+fn local_runtime_roots(executable_dir: &Path, working_dir: Option<&Path>) -> Vec<PathBuf> {
+    let mut roots = Vec::with_capacity(2);
+    push_unique_path(&mut roots, executable_dir.to_path_buf());
+    if let Some(working_dir) = working_dir {
+        push_unique_path(&mut roots, working_dir.to_path_buf());
+    }
+    roots
+}
+
+#[cfg(windows)]
+fn local_runtime_search_paths(roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut paths = Vec::with_capacity(roots.len() * 8);
+    for root in roots {
+        for install_root in [root.clone(), root.join("openvino")] {
+            push_unique_path(&mut paths, install_root.clone());
+            push_unique_path(
+                &mut paths,
+                install_root
+                    .join("runtime")
+                    .join("bin")
+                    .join("intel64")
+                    .join("Release"),
+            );
+            push_unique_path(
+                &mut paths,
+                install_root.join("runtime").join("bin").join("intel64"),
+            );
+            push_unique_path(
+                &mut paths,
+                install_root
+                    .join("runtime")
+                    .join("3rdparty")
+                    .join("tbb")
+                    .join("bin"),
+            );
+        }
+    }
+    paths
+}
+
+#[cfg(windows)]
+fn prepend_process_path(paths: &[PathBuf]) {
+    let mut ordered = Vec::with_capacity(paths.len());
+    for path in paths.iter().filter(|path| path.is_dir()) {
+        push_unique_path(&mut ordered, path.clone());
+    }
+    if ordered.is_empty() {
+        return;
+    }
+    if let Some(existing) = std::env::var_os("PATH") {
+        for path in std::env::split_paths(&existing) {
+            push_unique_path(&mut ordered, path);
+        }
+    }
+    let Ok(path) = std::env::join_paths(ordered) else {
+        log::warn!("无法拼接 OpenVINO 本地 DLL 搜索路径，继续使用原 PATH");
+        return;
+    };
+    // The runtime is initialized once during application startup, before OCR workers are
+    // spawned.  Updating PATH here lets Windows resolve OpenVINO's TBB/plugin dependencies.
+    unsafe { std::env::set_var("PATH", path) };
+}
+
+#[cfg(windows)]
+fn push_unique_path(paths: &mut Vec<PathBuf>, candidate: PathBuf) {
+    if !paths.iter().any(|path| path == &candidate) {
+        paths.push(candidate);
+    }
 }
 
 fn path_string(path: &Path) -> Result<&str> {
@@ -824,6 +1017,22 @@ mod tests {
 
     use super::*;
 
+    #[cfg(windows)]
+    #[test]
+    fn local_runtime_search_paths_prioritize_executable_directory() {
+        let executable_dir = Path::new(r"C:\app");
+        let roots = local_runtime_roots(executable_dir, Some(executable_dir));
+        assert_eq!(roots, vec![PathBuf::from(r"C:\app")]);
+
+        let paths = local_runtime_search_paths(&roots);
+        assert_eq!(paths[0], PathBuf::from(r"C:\app"));
+        assert_eq!(
+            paths[1],
+            PathBuf::from(r"C:\app\runtime\bin\intel64\Release")
+        );
+        assert_eq!(paths[4], PathBuf::from(r"C:\app\openvino"));
+    }
+
     /// Run a real IR + runtime smoke only when the local model directory is supplied.
     ///
     /// This keeps normal CI independent from the separately installed OpenVINO runtime while
@@ -878,10 +1087,10 @@ mod tests {
         let image =
             DynamicImage::ImageRgb8(image::RgbImage::from_pixel(1, 1, image::Rgb([255, 0, 0])));
         let tensor = preprocess_for_det(&image).unwrap();
-        assert_eq!(tensor.shape, vec![1, 3, 32, 32]);
+        assert_eq!(tensor.shape, vec![1, 3, 128, 416]);
         assert_eq!(tensor.valid_width, 1);
         assert_eq!(tensor.valid_height, 1);
-        let plane = 32 * 32;
+        let plane = 128 * 416;
         assert!((tensor.data[0] - (1.0 - 0.485) / 0.229).abs() < 1e-6);
         assert!((tensor.data[plane] - (0.0 - 0.456) / 0.224).abs() < 1e-6);
         assert!((tensor.data[plane * 2] - (0.0 - 0.406) / 0.225).abs() < 1e-6);
@@ -890,13 +1099,36 @@ mod tests {
     }
 
     #[test]
+    fn detection_preprocessing_uses_fixed_chat_canvas_buckets() {
+        assert_eq!(detection_canvas_size(320, 72), (416, 128));
+        assert_eq!(detection_canvas_size(400, 200), (416, 256));
+        assert_eq!(detection_canvas_size(480, 72), (480, 96));
+    }
+
+    #[test]
     fn recognition_preprocessing_scales_height_and_uses_minus_one_to_one_range() {
         let image =
             DynamicImage::ImageRgb8(image::RgbImage::from_pixel(2, 1, image::Rgb([255, 0, 128])));
         let tensor = preprocess_for_rec(&image, 48).unwrap();
         assert_eq!(tensor.shape, vec![1, 3, 48, 96]);
+        assert_eq!(tensor.valid_width, 96);
         assert!((tensor.data[0] - 1.0).abs() < 1e-6);
         assert!((tensor.data[96 * 48] + 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn recognition_preprocessing_selects_buckets_and_keeps_valid_width() {
+        let image = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            3,
+            1,
+            image::Rgb([255, 255, 255]),
+        ));
+        let tensor = preprocess_for_rec(&image, 48).unwrap();
+        assert_eq!(tensor.shape, vec![1, 3, 48, 192]);
+        assert_eq!(tensor.valid_width, 144);
+        let plane = 48 * 192;
+        assert_eq!(tensor.data[plane - 1], 0.0);
+        assert_eq!(tensor.data[plane + 192 - 1], 0.0);
     }
 
     #[test]
@@ -937,16 +1169,24 @@ mod tests {
             0.05, 0.9, 0.05, 0.0, 0.1, 0.85, 0.05, 0.0, 0.95, 0.02, 0.02, 0.01, 0.05, 0.05, 0.85,
             0.05,
         ];
-        let (text, confidence) = decode_ctc(&data, &[1, 4, 4], &charset).unwrap();
+        let (text, confidence) = decode_ctc(&data, &[1, 4, 4], &charset, None).unwrap();
         assert_eq!(text, "甲乙");
         assert!(confidence > 0.8);
+    }
+
+    #[test]
+    fn decodes_ctc_only_within_valid_sequence_length() {
+        let charset = vec![' ', '甲', '乙'];
+        let data = [0.05, 0.9, 0.05, 0.9, 0.05, 0.05, 0.05, 0.05, 0.9];
+        let (text, _) = decode_ctc(&data, &[3, 3], &charset, Some(2)).unwrap();
+        assert_eq!(text, "甲");
     }
 
     #[test]
     fn decodes_logit_output() {
         let charset = vec![' ', '甲', '乙'];
         let data = [0.0, 4.0, 0.0, 4.0, 0.0, 0.0];
-        let (text, confidence) = decode_ctc(&data, &[2, 3], &charset).unwrap();
+        let (text, confidence) = decode_ctc(&data, &[2, 3], &charset, None).unwrap();
         assert_eq!(text, "甲");
         assert!(confidence > 0.9);
     }
@@ -954,11 +1194,11 @@ mod tests {
     #[test]
     fn rejects_ctc_contract_mismatches_instead_of_dropping_classes() {
         let charset = vec![' ', '甲', '乙'];
-        let class_mismatch = decode_ctc(&[0.0; 8], &[2, 4], &charset)
+        let class_mismatch = decode_ctc(&[0.0; 8], &[2, 4], &charset, None)
             .expect_err("class-count mismatch must be rejected");
         assert!(class_mismatch.to_string().contains("类别数"));
 
-        let batch_mismatch = decode_ctc(&[0.0; 6], &[2, 1, 3], &charset)
+        let batch_mismatch = decode_ctc(&[0.0; 6], &[2, 1, 3], &charset, None)
             .expect_err("multi-batch output must be rejected");
         assert!(batch_mismatch.to_string().contains("单 batch"));
     }

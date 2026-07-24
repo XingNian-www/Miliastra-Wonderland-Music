@@ -63,7 +63,7 @@ flowchart TD
 | 能力 | 函数 | 使用场景 |
 | --- | --- | --- |
 | 文本识别测试 | `recognize_with_query()` | Web 调试接口 `/ai/recognize`，用于测试提示词，不参与主聊天 OCR。 |
-| 同曲诊断 | `match_with_query()` | 仅供 Web 调试接口使用；播放确认不再用 AI 或歌名歌手覆盖 URI 身份。 |
+| 同曲诊断 | `match_with_query()` / `judge_song_identity()` | Web 调试接口和 FeelUOwn 跨源自动换源确认共用同一套 Chat Completions 判断；播放确认仍优先要求稳定 URI。 |
 | 候选选择 | `pick_song_candidate()` | AI 点歌时，从 FeelUOwn 搜索候选中选择一个 URI。 |
 
 候选选择有两个硬约束：
@@ -108,19 +108,19 @@ AI 点歌可以来自游戏聊天，也可以来自远程指挥台。
 
 ## 同曲判断
 
-同曲判断不是 AI 点歌的一部分，它发生在实际播放确认阶段。
+同曲判断不是候选搜索的一部分，它发生在实际播放确认阶段的跨源备用分支。
 
-`PlayerController::verify_playback_started()` 会反复读取播放器状态。普通点歌只有在观测到的非空 URI 与请求 URI 逐字相等时才会确认成功；URI 缺失或不一致不会用本地匹配、AI 或歌名歌手兜底，控制器返回 `MismatchedCandidate` 后由主流程拒绝当前音源或换源重试。
+`PlayerController::verify_playback_started()` 会反复读取播放器状态。普通点歌仍优先要求观测到的非空 URI 与请求 URI 逐字相等；如果 FeelUOwn 已快速切换到不同音源，控制器会按 `timing.playback.fallback_identity_stable_samples` 连续确认备用 URI、歌名和歌手稳定，再直接调用 `MatchConfig::match_song_identity()` 做整段字段的归一化/包含匹配。这个本地判断不做逐字符编辑距离；歌曲名或歌手存在别名、合作艺人或版本差异时，才进入 `judge_song_identity()`。
 
-AI 返回 `match=true` 或 `decision=match` 时，只作为独立诊断结果展示，不会改变播放确认结果；当前播放仍必须通过 URI 逐字匹配。
+AI 返回 `match=true` 且 `decision=match`、分数达到控制器阈值时，跨源备用 URI 才会被接受。AI 请求复用 `timing.external.ai_request_timeout_ms`，不会为这条低频分支增加更短的超时。AI 不可用、判断不匹配、URI 不稳定或仍缺少身份信息时，控制器返回 `MismatchedCandidate`，由主流程拒绝当前音源或换源重试。
 
-同样，AI 诊断结果不会写入 `song_dedup` 历史，也不会把歌名、歌手或跨音源的相似候选转换成同一首歌。长时间同歌限制只在实际播放确认成功后记录，并只比较双方都存在且逐字相等的非空 URI。
+跨源确认成功后，`ActivePlaybackRequest.requested_uri` 仍保留用户请求的 URI，`confirmed_uri` 保存实际播放 URI；`song_dedup` 也只记录实际确认的非空 URI。因此 AI 结果不会单独写入历史，也不会把未确认的相似候选当成已播放歌曲。
 
 这个设计意味着：
 
-- AI 同曲诊断接口只用于 Web 独立诊断，不参与播放确认，也不会替代候选歌曲审核。
+- AI 同曲诊断接口可用于 Web 独立诊断，也可由播放器控制器在跨源备用确认时调用；它不会替代候选歌曲审核。
 - AI 点歌和普通点歌使用同一套稳定 URI 播放确认规则。
-- 普通点歌的播放确认只依赖稳定 URI。
+- 普通点歌的播放确认优先依赖稳定 URI；只有跨源自动换源分支允许在稳定观测后使用本地 `MatchConfig` 和 AI 同曲判断。
 - 同曲判断结果不会直接改播放器后端状态；最终仍由播放器控制器写入确认播放状态和活动播放请求。
 
 ## 候选歌曲审核 Provider

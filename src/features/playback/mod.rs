@@ -18,9 +18,10 @@ use crate::features::command::{
 };
 use crate::runtime::clock::WallClock;
 pub(crate) use controller::{
-    MismatchDecision, MusicPlayerBackend, PlaybackAttempt, PlaybackNavigation, PlaybackOutcome,
-    PlaybackRequest, PlaybackStatePort, PlaybackTimePorts, PlaybackVerification, PlayerController,
-    QueueAdvanceContext, QueueAdvanceDecision,
+    MismatchDecision, MusicPlayerBackend, PlaybackAttempt, PlaybackIdentityDecision,
+    PlaybackIdentityJudge, PlaybackNavigation, PlaybackOutcome, PlaybackRequest, PlaybackStatePort,
+    PlaybackTimePorts, PlaybackVerification, PlayerController, QueueAdvanceContext,
+    QueueAdvanceDecision,
 };
 pub(crate) use dedup::{PersistentSongDedupHistory, SongDedupCandidate};
 pub(crate) use format::{
@@ -46,8 +47,14 @@ pub struct PlaybackTimingConfig {
     pub monitor_status_ms: u64,
     pub uri_stable_samples: u32,
     pub transport_stable_samples: u32,
+    #[serde(default = "default_fallback_identity_stable_samples")]
+    pub fallback_identity_stable_samples: u32,
     #[serde(deserialize_with = "deserialize_positive_u64")]
     pub stale_timeout_ms: u64,
+}
+
+fn default_fallback_identity_stable_samples() -> u32 {
+    2
 }
 
 impl PlaybackTimingConfig {
@@ -71,6 +78,10 @@ impl PlaybackTimingConfig {
             (
                 self.skip_status_retries,
                 "timing.playback.skip_status_retries",
+            ),
+            (
+                self.fallback_identity_stable_samples,
+                "timing.playback.fallback_identity_stable_samples",
             ),
         ] {
             if value == 0 {
@@ -175,6 +186,15 @@ impl Default for MatchConfig {
 }
 
 impl MatchConfig {
+    pub(crate) fn match_song_identity(
+        &self,
+        request: &str,
+        observed_title: &str,
+        observed_artist: &str,
+    ) -> matcher::SongIdentityMatch {
+        matcher::match_song_identity(self, request, observed_title, observed_artist)
+    }
+
     pub(crate) fn validate(&self) -> Result<()> {
         for (value, field) in [
             (self.min_song_name_score, "matching.min_song_name_score"),

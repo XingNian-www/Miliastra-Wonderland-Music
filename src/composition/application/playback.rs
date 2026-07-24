@@ -220,6 +220,11 @@ impl PlaybackExecutionPort for ApplicationRuntime {
 }
 
 impl PlaybackCommandPort for ApplicationRuntime {
+    fn reply_batch(&mut self, messages: &[String], delay_ms: u64) -> Result<()> {
+        let refs = messages.iter().map(String::as_str).collect::<Vec<_>>();
+        ApplicationRuntime::reply_batch(self, &refs, delay_ms)
+    }
+
     fn log_executed(
         &mut self,
         context: &PlaybackCommandContext,

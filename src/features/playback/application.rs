@@ -3,6 +3,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
+use crate::text::{MAX_CHAT_WIDTH, char_width, display_width};
+
 use super::{
     MismatchDecision, PlaybackAttempt, PlaybackCommand, PlaybackNavigation, PlaybackOutcome,
     PlaybackRequest, PlaybackSnapshot, PlaybackVerification, PlayerStatus, QueueAdvanceContext,
@@ -167,6 +169,7 @@ pub(crate) trait PlaybackExecutionPort {
 }
 
 pub(crate) trait PlaybackCommandPort: PlaybackExecutionPort {
+    fn reply_batch(&mut self, messages: &[String], delay_ms: u64) -> Result<()>;
     fn log_executed(&mut self, context: &PlaybackCommandContext, final_command: &str)
     -> Result<()>;
     fn pause_by_user(&mut self) -> Result<String>;
@@ -218,6 +221,7 @@ pub(crate) struct PlaybackApplicationConfig {
     pub(crate) skip_status_retries: u32,
     pub(crate) monitor_tick_ms: u64,
     pub(crate) monitor_status_ms: u64,
+    pub(crate) help_batch_ms: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -298,6 +302,10 @@ impl PlaybackApplication {
                 port.log_executed(context, "queue list")?;
                 self.reply_queue(port)?;
             }
+            PlaybackCommand::QueueFull => {
+                port.log_executed(context, "queue list full")?;
+                self.reply_full_queue(port)?;
+            }
             PlaybackCommand::QueueDelete(indexes) => {
                 if indexes.is_empty() {
                     port.log_executed(context, "queue delete invalid")?;
@@ -349,6 +357,16 @@ impl PlaybackApplication {
                 entries
             ))
         }
+    }
+
+    fn reply_full_queue<P: PlaybackCommandPort + ?Sized>(&self, port: &mut P) -> Result<()> {
+        let queue = port.playback_queue()?;
+        if queue.is_empty() {
+            return port.reply("队列为空");
+        }
+
+        let messages = split_full_queue_messages(&queue, self.config.queue_max_size);
+        port.reply_batch(&messages, self.config.help_batch_ms)
     }
 
     fn reply_player_status_after_skip<P: PlaybackCommandPort + ?Sized>(
@@ -777,6 +795,74 @@ impl PlaybackApplication {
     }
 }
 
+fn split_full_queue_messages(queue: &[QueueItem], queue_max_size: usize) -> Vec<String> {
+    let header = format!("完整队列({}/{}): ", queue.len(), queue_max_size);
+    let mut messages = Vec::new();
+    let mut current = header;
+    let mut has_entry = false;
+
+    for (index, item) in queue.iter().enumerate() {
+        let entry = format!("{}.{}", index + 1, item.keyword);
+        let entry_width = display_width(&entry);
+
+        if entry_width > MAX_CHAT_WIDTH {
+            if has_entry || !current.is_empty() {
+                messages.push(std::mem::take(&mut current));
+            }
+            has_entry = false;
+            messages.extend(split_display_width(&entry, MAX_CHAT_WIDTH));
+            continue;
+        }
+
+        let separator = if has_entry { ", " } else { "" };
+        if display_width(&current) + display_width(separator) + entry_width <= MAX_CHAT_WIDTH {
+            current.push_str(separator);
+            current.push_str(&entry);
+            has_entry = true;
+            continue;
+        }
+
+        if !current.is_empty() {
+            messages.push(std::mem::take(&mut current));
+        }
+        current.push_str(&entry);
+        has_entry = true;
+    }
+
+    if !current.is_empty() {
+        messages.push(current);
+    }
+    messages
+}
+
+fn split_display_width(value: &str, max_width: usize) -> Vec<String> {
+    let max_width = max_width.max(1);
+    let mut pieces = Vec::new();
+    let mut remaining = value;
+    while !remaining.is_empty() {
+        let mut width = 0;
+        let mut end = 0;
+        for (index, ch) in remaining.char_indices() {
+            let next_width = char_width(ch);
+            if end != 0 && width + next_width > max_width {
+                break;
+            }
+            width += next_width;
+            end = index + ch.len_utf8();
+            if width >= max_width {
+                break;
+            }
+        }
+        if end == 0 {
+            let ch = remaining.chars().next().expect("remaining is not empty");
+            end = ch.len_utf8();
+        }
+        pieces.push(remaining[..end].to_string());
+        remaining = &remaining[end..];
+    }
+    pieces
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
@@ -882,6 +968,7 @@ mod tests {
             skip_status_retries: 0,
             monitor_tick_ms: 50,
             monitor_status_ms: 100,
+            help_batch_ms: 0,
         });
 
         application.run_monitor_loop(&mut port);
@@ -1053,6 +1140,7 @@ mod tests {
             skip_status_retries: 0,
             monitor_tick_ms: 50,
             monitor_status_ms: 50,
+            help_batch_ms: 0,
         });
 
         application
@@ -1087,6 +1175,7 @@ mod tests {
             skip_status_retries: 0,
             monitor_tick_ms: 50,
             monitor_status_ms: 50,
+            help_batch_ms: 0,
         });
 
         application
@@ -1145,6 +1234,7 @@ mod tests {
             skip_status_retries: 0,
             monitor_tick_ms: 50,
             monitor_status_ms: 50,
+            help_batch_ms: 0,
         });
 
         application
@@ -1190,6 +1280,7 @@ mod tests {
             skip_status_retries: 0,
             monitor_tick_ms: 50,
             monitor_status_ms: 50,
+            help_batch_ms: 0,
         });
 
         application
@@ -1206,6 +1297,9 @@ mod tests {
         previous_calls: usize,
         verifications: VecDeque<PlaybackVerification>,
         replies: Vec<String>,
+        batch_replies: Vec<Vec<String>>,
+        batch_delays: Vec<u64>,
+        queue: Vec<QueueItem>,
         status: PlayerStatus,
     }
 
@@ -1264,7 +1358,7 @@ mod tests {
         }
 
         fn playback_queue(&mut self) -> Result<Vec<QueueItem>> {
-            Ok(Vec::new())
+            Ok(self.queue.clone())
         }
 
         fn remove_playback_queue(&mut self, _removal: QueueRemoval) -> Result<()> {
@@ -1273,6 +1367,12 @@ mod tests {
     }
 
     impl PlaybackCommandPort for NavigationCommandPort {
+        fn reply_batch(&mut self, messages: &[String], delay_ms: u64) -> Result<()> {
+            self.batch_replies.push(messages.to_vec());
+            self.batch_delays.push(delay_ms);
+            Ok(())
+        }
+
         fn log_executed(
             &mut self,
             _context: &PlaybackCommandContext,
@@ -1321,6 +1421,82 @@ mod tests {
     }
 
     #[test]
+    fn full_queue_command_uses_batch_delivery_without_compressing_entries() {
+        let mut port = NavigationCommandPort {
+            previous_request: None,
+            played_uris: Vec::new(),
+            previous_calls: 0,
+            verifications: VecDeque::new(),
+            replies: Vec::new(),
+            batch_replies: Vec::new(),
+            batch_delays: Vec::new(),
+            queue: vec![
+                QueueItem {
+                    keyword: "晴天".to_string(),
+                    ..QueueItem::default()
+                },
+                QueueItem {
+                    keyword: "青花瓷".to_string(),
+                    ..QueueItem::default()
+                },
+            ],
+            status: PlayerStatus::default(),
+        };
+        let application = PlaybackApplication::new(PlaybackApplicationConfig {
+            console_bypass_dedup: true,
+            queue_max_size: 20,
+            skip_status_initial_ms: 0,
+            skip_status_poll_ms: 0,
+            skip_status_retries: 0,
+            monitor_tick_ms: 50,
+            monitor_status_ms: 50,
+            help_batch_ms: 321,
+        });
+        let context = PlaybackCommandContext {
+            message_type: "blue".to_string(),
+            username: "tester".to_string(),
+            user_command: "@完整队列".to_string(),
+        };
+
+        application
+            .execute_command(&context, &PlaybackCommand::QueueFull, &mut port)
+            .expect("full queue command");
+
+        assert!(port.replies.is_empty());
+        assert_eq!(port.batch_delays, [321]);
+        assert_eq!(
+            port.batch_replies,
+            vec![vec!["完整队列(2/20): 1.晴天, 2.青花瓷".to_string()]]
+        );
+    }
+
+    #[test]
+    fn full_queue_messages_split_without_dropping_long_entries() {
+        let queue = [
+            QueueItem {
+                keyword: "甲".repeat(30),
+                ..QueueItem::default()
+            },
+            QueueItem {
+                keyword: "乙".repeat(30),
+                ..QueueItem::default()
+            },
+        ];
+
+        let messages = split_full_queue_messages(&queue, 20);
+        let combined = messages.join(" ");
+
+        assert!(messages.len() > 1);
+        assert!(
+            messages
+                .iter()
+                .all(|message| display_width(message) <= MAX_CHAT_WIDTH)
+        );
+        assert!(combined.contains(&format!("1.{}", "甲".repeat(30))));
+        assert!(combined.contains(&format!("2.{}", "乙".repeat(30))));
+    }
+
+    #[test]
     fn previous_prefers_known_uri_over_native_navigation() {
         let previous_uri = "fuo://qqmusic/songs/previous";
         let mut port = NavigationCommandPort {
@@ -1345,6 +1521,9 @@ mod tests {
                 message: "开始播放: 上一首歌曲".to_string(),
             }]),
             replies: Vec::new(),
+            batch_replies: Vec::new(),
+            batch_delays: Vec::new(),
+            queue: Vec::new(),
             status: PlayerStatus {
                 status: "playing".to_string(),
                 current_uri: previous_uri.to_string(),
@@ -1362,6 +1541,7 @@ mod tests {
             skip_status_retries: 1,
             monitor_tick_ms: 50,
             monitor_status_ms: 50,
+            help_batch_ms: 0,
         });
         let context = PlaybackCommandContext {
             message_type: "blue".to_string(),

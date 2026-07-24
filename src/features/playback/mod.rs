@@ -231,6 +231,7 @@ pub(crate) enum PlaybackCommand {
     Status,
     Lyrics,
     Queue,
+    QueueFull,
     QueueDelete(Vec<usize>),
     QueueClear,
 }
@@ -308,6 +309,8 @@ impl PlaybackCommand {
             ("音量", true),
             ("状态", false),
             ("歌词", false),
+            ("完整队列", false),
+            ("完整列表", false),
             ("队列", false),
             ("列表", false),
         ] {
@@ -323,6 +326,7 @@ impl PlaybackCommand {
                 "音量" => Self::Volume(argument.to_string()),
                 "状态" => Self::Status,
                 "歌词" => Self::Lyrics,
+                "完整队列" | "完整列表" => Self::QueueFull,
                 "队列" | "列表" => Self::Queue,
                 "队列删除" => Self::QueueDelete(parse_queue_indexes(argument)),
                 "队列清空" => Self::QueueClear,
@@ -347,6 +351,7 @@ impl PlaybackCommand {
             Self::Status => "status".to_string(),
             Self::Lyrics => "lyrics".to_string(),
             Self::Queue => "queue".to_string(),
+            Self::QueueFull => "queue_full".to_string(),
             Self::QueueDelete(indexes) => format!(
                 "queue_delete:{}",
                 indexes
@@ -384,6 +389,8 @@ const PLAYBACK_COMMAND_PREFIXES: &[&str] = &[
     "音量",
     "状态",
     "歌词",
+    "完整队列",
+    "完整列表",
     "队列",
     "列表",
 ];
@@ -734,6 +741,26 @@ fn observation_identity_changed(
         || previous.artist != current.artist
         || previous.reliability != current.reliability
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn full_queue_aliases_parse_as_a_distinct_command() {
+        for text in ["完整队列", "完整列表"] {
+            let parsed = PlaybackCommand::parse_hall(text).expect("full queue command");
+            assert_eq!(parsed.command, PlaybackCommand::QueueFull);
+            assert_eq!(parsed.argument, "");
+        }
+
+        assert_ne!(
+            PlaybackCommand::Queue.lock_key(),
+            PlaybackCommand::QueueFull.lock_key()
+        );
+    }
+}
+
 pub(crate) use application::{
     PlaybackApplication, PlaybackApplicationConfig, PlaybackCommandContext, PlaybackCommandPort,
     PlaybackDecision, PlaybackExecutionPort, PlaybackMonitorPort, PlaybackPickedCandidate,

@@ -1005,6 +1005,7 @@ impl ApplicationRuntime {
             skip_status_retries: config.timing.playback.skip_status_retries,
             monitor_tick_ms: config.timing.playback.monitor_tick_ms,
             monitor_status_ms: config.timing.playback.monitor_status_ms,
+            help_batch_ms: config.timing.command.help_batch_ms,
         });
         let administration_application =
             AdministrationApplication::new(config.timing.command.help_batch_ms);

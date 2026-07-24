@@ -67,6 +67,10 @@ flowchart TD
 
 保存时使用临时文件替换。Windows 下用 `MoveFileExW` 搭配 `MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH`，减少队列文件半写入的风险。
 
+### 队列查询命令
+
+大厅成员可以使用 `@队列` 或 `@列表` 查看压缩摘要；它只发送一条普通回复。`@完整队列` 和 `@完整列表` 是独立命令，会保留队列中的每个歌曲项，优先按 `MAX_CHAT_WIDTH` 在歌曲项边界分组后通过批量发送输出。能放进同一条聊天消息的歌曲会合并发送，超出宽度时继续发送后续消息；单个标题过长时再按字符拆分，始终不会把队列尾部静默截断。批量消息之间沿用 `timing.command.help_batch_ms` 间隔。
+
 ### 播放器运行状态
 
 `PlaybackRuntimeState` 是播放器控制器的持久状态：

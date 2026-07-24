@@ -1,0 +1,377 @@
+name: 构建 Windows OpenVINO OCR
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 发布版本，例如 v4.1.0。留空时使用 Cargo.toml 版本。
+        required: false
+        type: string
+      create_release:
+        description: 是否创建或更新 OpenVINO-only GitHub Release。
+        required: false
+        default: true
+        type: boolean
+  push:
+    branches:
+      - main
+      - dev
+    paths:
+      - .cargo/**
+      - .github/workflows/build-windows-openvino.yml
+      - Cargo.toml
+      - Cargo.lock
+      - README.md
+      - THIRD_PARTY_NOTICES.md
+      - assets/**
+      - config.yaml
+      - turtle_soup.example.yaml
+      - src/**
+      - tests/**
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  OPENVINO_VERSION: 2026.2.1
+  OPENVINO_ARCHIVE_URL: https://storage.openvinotoolkit.org/repositories/openvino/packages/2026.2.1/windows_vc_mt/openvino_toolkit_windows_vc_mt_2026.2.1.21919.ede283a88e3_x86_64.zip
+  OPENVINO_ARCHIVE_SHA256_URL: https://storage.openvinotoolkit.org/repositories/openvino/packages/2026.2.1/windows_vc_mt/openvino_toolkit_windows_vc_mt_2026.2.1.21919.ede283a88e3_x86_64.zip.sha256
+  PP_OCR_DET_ONNX_URL: https://huggingface.co/PaddlePaddle/PP-OCRv6_small_det_onnx/resolve/5994b4f1a827310b6d38f6b13716af6381847be0/inference.onnx?download=true
+  PP_OCR_REC_ONNX_URL: https://huggingface.co/PaddlePaddle/PP-OCRv6_small_rec_onnx/resolve/3d2d345e6a299891174f1397a72cdd81331359c7/inference.onnx?download=true
+  PP_OCR_CHARSET_URL: https://raw.githubusercontent.com/zibo-chen/rust-paddle-ocr/next/models/ppocr_keys_v6_small.txt
+
+jobs:
+  build-windows-openvino:
+    name: 构建 Windows x64 OpenVINO-only 运行包
+    runs-on: windows-2022
+    timeout-minutes: 240
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: 缓存 Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-msvc-openvino-release
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 下载 OpenVINO runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = Join-Path $env:GITHUB_WORKSPACE ".build\openvino-$env:OPENVINO_VERSION.zip"
+          $extract = Join-Path $env:GITHUB_WORKSPACE '.build\openvino'
+          New-Item -ItemType Directory -Force -Path (Split-Path -Parent $archive) | Out-Null
+
+          if (-not (Test-Path -LiteralPath $archive)) {
+            Invoke-WebRequest `
+              -Uri $env:OPENVINO_ARCHIVE_URL `
+              -OutFile $archive `
+              -MaximumRedirection 10
+          }
+          if ((Get-Item -LiteralPath $archive).Length -lt 1000000) {
+            throw "OpenVINO archive is unexpectedly small: $archive"
+          }
+
+          $checksumPath = "$archive.sha256"
+          Invoke-WebRequest `
+            -Uri $env:OPENVINO_ARCHIVE_SHA256_URL `
+            -OutFile $checksumPath `
+            -MaximumRedirection 10
+          $expectedHash = (Get-Content -LiteralPath $checksumPath -Raw).Trim().Split()[0].ToLowerInvariant()
+          $actualHash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($expectedHash -ne $actualHash) {
+            throw "OpenVINO archive SHA-256 mismatch: expected $expectedHash, got $actualHash"
+          }
+
+          if (Test-Path -LiteralPath $extract) {
+            Remove-Item -LiteralPath $extract -Recurse -Force
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath $extract -Force
+
+          $candidates = @($extract)
+          $candidates += Get-ChildItem -LiteralPath $extract -Directory -Recurse |
+            ForEach-Object { $_.FullName }
+          $openvinoRoot = $candidates |
+            Where-Object {
+              Test-Path -LiteralPath (Join-Path $_ 'runtime\bin\intel64\Release\openvino_c.dll')
+            } |
+            Select-Object -First 1
+          if (-not $openvinoRoot) {
+            throw "Cannot find an OpenVINO Windows x64 runtime in $extract"
+          }
+
+          $runtimeBin = Join-Path $openvinoRoot 'runtime\bin\intel64\Release'
+          $tbbBin = Join-Path $openvinoRoot 'runtime\3rdparty\tbb\bin'
+          if (-not (Test-Path -LiteralPath $tbbBin)) {
+            throw "Cannot find the bundled oneTBB runtime: $tbbBin"
+          }
+          $envPath = "$runtimeBin;$tbbBin;$env:PATH"
+          "OPENVINO_ROOT=$openvinoRoot" >> $env:GITHUB_ENV
+          "OPENVINO_INSTALL_DIR=$openvinoRoot" >> $env:GITHUB_ENV
+          "INTEL_OPENVINO_DIR=$openvinoRoot" >> $env:GITHUB_ENV
+          "OPENVINO_LIB_PATHS=$runtimeBin;$tbbBin" >> $env:GITHUB_ENV
+          "PATH=$envPath" >> $env:GITHUB_ENV
+
+      - name: 下载 PP-OCRv6 small ONNX 与字符集
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (Test-Path -LiteralPath 'models') {
+            Remove-Item -LiteralPath 'models' -Recurse -Force
+          }
+          New-Item -ItemType Directory -Force -Path 'models' | Out-Null
+
+          $downloads = [ordered]@{
+            'models\PP-OCRv6_small_det.onnx' = $env:PP_OCR_DET_ONNX_URL
+            'models\PP-OCRv6_small_rec.onnx' = $env:PP_OCR_REC_ONNX_URL
+            'models\ppocr_keys_v6_small.txt' = $env:PP_OCR_CHARSET_URL
+          }
+          foreach ($entry in $downloads.GetEnumerator()) {
+            Invoke-WebRequest `
+              -Uri $entry.Value `
+              -OutFile $entry.Key `
+              -MaximumRedirection 10
+            $size = (Get-Item -LiteralPath $entry.Key).Length
+            if ($size -lt 1024) {
+              throw "Downloaded file is unexpectedly small: $($entry.Key) ($size bytes)"
+            }
+          }
+
+      - name: 安装 OpenVINO Python 转换依赖
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:PYTHONPATH = "$env:OPENVINO_ROOT\python"
+          python -m pip install --disable-pip-version-check --no-input `
+            -r "$env:OPENVINO_ROOT\python\requirements.txt"
+          python -c "import openvino as ov; print('OpenVINO Python', ov.__version__)"
+
+      - name: 将 PP-OCRv6 ONNX 转换为 FP32 OpenVINO IR
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:PYTHONPATH = "$env:OPENVINO_ROOT\python"
+          $script = @'
+          from pathlib import Path
+
+          import openvino as ov
+
+          models = Path("models")
+          conversions = (
+              (models / "PP-OCRv6_small_det.onnx", models / "PP-OCRv6_small_det.xml"),
+              (models / "PP-OCRv6_small_rec.onnx", models / "PP-OCRv6_small_rec.xml"),
+          )
+          for source, destination in conversions:
+              if not source.is_file():
+                  raise FileNotFoundError(source)
+              model = ov.convert_model(str(source))
+              ov.save_model(model, str(destination), compress_to_fp16=False)
+              weights = destination.with_suffix(".bin")
+              if not destination.is_file() or destination.stat().st_size == 0:
+                  raise RuntimeError(f"missing IR model: {destination}")
+              if not weights.is_file() or weights.stat().st_size == 0:
+                  raise RuntimeError(f"missing IR weights: {weights}")
+              print(f"converted {source.name} -> {destination.name} ({weights.stat().st_size} bytes)")
+          '@
+          $script | python -
+          Remove-Item -LiteralPath 'models\PP-OCRv6_small_det.onnx', 'models\PP-OCRv6_small_rec.onnx' -Force
+
+      - name: OpenVINO IR 真实截图 smoke test
+        shell: pwsh
+        env:
+          OPENVINO_OCR_IR_ROOT: ${{ github.workspace }}\models
+          OPENVINO_OCR_CHARSET: ${{ github.workspace }}\models\ppocr_keys_v6_small.txt
+        run: cargo test --locked --no-default-features --features ocr-openvino configured_ir_models_recognize_fixture -- --nocapture
+
+      - name: 编译 OpenVINO-only Release EXE
+        shell: pwsh
+        run: cargo build --release --target x86_64-pc-windows-msvc --locked --no-default-features --features ocr-openvino
+
+      - name: 解析发布版本
+        id: version
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Read-PackageVersion($text) {
+            $content = if ($text -is [array]) { $text -join "`n" } else { [string]$text }
+            if ($content -notmatch '(?ms)^\[package\].*?^version\s*=\s*"([^"]+)"') {
+              throw '无法从 Cargo.toml 读取包版本'
+            }
+            return $Matches[1]
+          }
+
+          $inputVersion = '${{ inputs.version }}'.Trim()
+          $cargoToml = Get-Content -LiteralPath 'Cargo.toml' -Raw
+          $packageVersion = Read-PackageVersion $cargoToml
+          if ($inputVersion) {
+            $version = $inputVersion
+          } else {
+            $version = "v$packageVersion"
+          }
+          if (-not $version.StartsWith('v')) {
+            $version = "v$version"
+          }
+
+          $createRelease = '${{ inputs.create_release }}' -eq 'true'
+          if ('${{ github.event_name }}' -eq 'push') {
+            $createRelease = $false
+            $before = '${{ github.event.before }}'
+            if (-not $before -or $before -match '^0+$') {
+              $createRelease = $true
+            } else {
+              $oldCargo = git show "$($before):Cargo.toml"
+              $oldVersion = Read-PackageVersion $oldCargo
+              if ($oldVersion -ne $packageVersion) {
+                $createRelease = $true
+              }
+            }
+          }
+
+          $artifact = 'miliastra-wonderland-music-openvino-windows-x64'
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "release_tag=$version-openvino" >> $env:GITHUB_OUTPUT
+          "artifact=$artifact" >> $env:GITHUB_OUTPUT
+          "zip=$artifact-$version.zip" >> $env:GITHUB_OUTPUT
+          "create_release=$($createRelease.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+
+      - name: 准备 OpenVINO-only 运行包
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $artifact = '${{ steps.version.outputs.artifact }}'
+          $dist = Join-Path 'dist' $artifact
+          if (Test-Path -LiteralPath $dist) {
+            Remove-Item -LiteralPath $dist -Recurse -Force
+          }
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+
+          Copy-Item -LiteralPath 'target\x86_64-pc-windows-msvc\release\miliastra-wonderland-music.exe' -Destination $dist
+          Copy-Item -LiteralPath 'assets' -Destination $dist -Recurse
+          Copy-Item -LiteralPath 'README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md', 'turtle_soup.example.yaml' -Destination $dist
+
+          $config = Get-Content -LiteralPath 'config.yaml' -Raw
+          $newline = [Environment]::NewLine
+          $config = [regex]::Replace($config, '(?m)^  det_model:[^\r\n]*', '  det_model: null')
+          $config = [regex]::Replace($config, '(?m)^  rec_model:[^\r\n]*', '  rec_model: null')
+          $config = [regex]::Replace(
+            $config,
+            '(?ms)^  backend_priority:\r?\n(?:    - [^\r\n]*\r?\n)+',
+            "  backend_priority:$newline    - openvino$newline"
+          )
+          $config = [regex]::Replace($config, '(?m)^    det_model:[^\r\n]*', '    det_model: models/PP-OCRv6_small_det.xml')
+          $config = [regex]::Replace($config, '(?m)^    det_weights:[^\r\n]*', '    det_weights: models/PP-OCRv6_small_det.bin')
+          $config = [regex]::Replace($config, '(?m)^    rec_model:[^\r\n]*', '    rec_model: models/PP-OCRv6_small_rec.xml')
+          $config = [regex]::Replace($config, '(?m)^    rec_weights:[^\r\n]*', '    rec_weights: models/PP-OCRv6_small_rec.bin')
+          if ($config -notmatch '(?m)^    - openvino\s*$' -or
+              $config -notmatch '(?m)^    det_model: models/PP-OCRv6_small_det\.xml\s*$' -or
+              $config -notmatch '(?m)^    rec_model: models/PP-OCRv6_small_rec\.xml\s*$') {
+            throw 'Failed to generate the OpenVINO-only OCR configuration'
+          }
+          Set-Content -LiteralPath (Join-Path $dist 'config.yaml') -Value $config -Encoding utf8
+
+          $distModels = Join-Path $dist 'models'
+          New-Item -ItemType Directory -Force -Path $distModels | Out-Null
+          Copy-Item -LiteralPath 'models\PP-OCRv6_small_det.xml', 'models\PP-OCRv6_small_det.bin', `
+            'models\PP-OCRv6_small_rec.xml', 'models\PP-OCRv6_small_rec.bin', `
+            'models\ppocr_keys_v6_small.txt' -Destination $distModels
+
+          $runtimeSource = Join-Path $env:OPENVINO_ROOT 'runtime\bin\intel64\Release'
+          $runtimeTarget = Join-Path $dist 'openvino\runtime\bin\intel64\Release'
+          New-Item -ItemType Directory -Force -Path $runtimeTarget | Out-Null
+          $runtimeDlls = Get-ChildItem -LiteralPath $runtimeSource -Filter '*.dll' -File |
+            Where-Object { $_.Name -notmatch '_debug\.dll$' }
+          if (-not $runtimeDlls) {
+            throw "No OpenVINO runtime DLLs found in $runtimeSource"
+          }
+          $runtimeDlls | Copy-Item -Destination $runtimeTarget -Force
+
+          $tbbSource = Join-Path $env:OPENVINO_ROOT 'runtime\3rdparty\tbb\bin'
+          $tbbTarget = Join-Path $dist 'openvino\runtime\3rdparty\tbb\bin'
+          New-Item -ItemType Directory -Force -Path $tbbTarget | Out-Null
+          $tbbDlls = Get-ChildItem -LiteralPath $tbbSource -Filter '*.dll' -File |
+            Where-Object { $_.Name -notmatch '_debug\.dll$' }
+          if (-not $tbbDlls) {
+            throw "No oneTBB runtime DLLs found in $tbbSource"
+          }
+          $tbbDlls | Copy-Item -Destination $tbbTarget -Force
+
+          $licenseFiles = @{
+            'OPENVINO-LICENSE.txt' = Join-Path $env:OPENVINO_ROOT 'docs\licensing\LICENSE'
+            'OPENVINO-THIRD-PARTY-NOTICES.txt' = Join-Path $env:OPENVINO_ROOT 'docs\licensing\onetbb_third-party-programs.txt'
+            'TBB-LICENSE.txt' = Join-Path $env:OPENVINO_ROOT 'runtime\3rdparty\tbb\TBB-LICENSE'
+          }
+          foreach ($entry in $licenseFiles.GetEnumerator()) {
+            if (-not (Test-Path -LiteralPath $entry.Value)) {
+              throw "Missing runtime license file: $($entry.Value)"
+            }
+            Copy-Item -LiteralPath $entry.Value -Destination (Join-Path $dist $entry.Key)
+          }
+
+          $launcher = @'
+          @echo off
+          setlocal
+          set "ROOT=%~dp0"
+          set "OPENVINO_INSTALL_DIR=%ROOT%openvino"
+          set "OPENVINO_LIB_PATHS=%ROOT%openvino\runtime\bin\intel64\Release;%ROOT%openvino\runtime\3rdparty\tbb\bin"
+          set "PATH=%OPENVINO_LIB_PATHS%;%PATH%"
+          cd /d "%ROOT%"
+          "%ROOT%miliastra-wonderland-music.exe" %*
+          exit /b %ERRORLEVEL%
+          '@
+          Set-Content -LiteralPath (Join-Path $dist 'run-openvino.cmd') -Value $launcher -Encoding ascii
+
+          $required = @(
+            'miliastra-wonderland-music.exe',
+            'run-openvino.cmd',
+            'config.yaml',
+            'models\PP-OCRv6_small_det.xml',
+            'models\PP-OCRv6_small_det.bin',
+            'models\PP-OCRv6_small_rec.xml',
+            'models\PP-OCRv6_small_rec.bin',
+            'openvino\runtime\bin\intel64\Release\openvino_c.dll',
+            'openvino\runtime\bin\intel64\Release\openvino_intel_cpu_plugin.dll',
+            'openvino\runtime\3rdparty\tbb\bin\tbb12.dll'
+          )
+          foreach ($relativePath in $required) {
+            if (-not (Test-Path -LiteralPath (Join-Path $dist $relativePath))) {
+              throw "Missing package file: $relativePath"
+            }
+          }
+
+      - name: 打包 OpenVINO-only zip
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Compress-Archive `
+            -Path 'dist/${{ steps.version.outputs.artifact }}' `
+            -DestinationPath 'dist/${{ steps.version.outputs.zip }}' `
+            -Force
+
+      - name: 上传 OpenVINO-only 产物
+        uses: actions/upload-artifact@v5
+        with:
+          name: ${{ steps.version.outputs.artifact }}
+          path: dist/${{ steps.version.outputs.artifact }}
+
+      - name: 创建 OpenVINO-only GitHub Release
+        if: steps.version.outputs.create_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.release_tag }}
+          name: Miliastra Wonderland Music ${{ steps.version.outputs.version }} OpenVINO-only
+          files: dist/${{ steps.version.outputs.zip }}
+          generate_release_notes: true

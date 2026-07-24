@@ -351,7 +351,8 @@ impl PlaybackCommand {
             Self::Previous => "previous".to_string(),
             Self::Volume(volume) => format!("volume:{}", command_identity(volume)),
             Self::Status => "status".to_string(),
-            Self::Lyrics | Self::LyricsFor(_) => "lyrics".to_string(),
+            Self::Lyrics => "lyrics".to_string(),
+            Self::LyricsFor(_) => "lyrics_for".to_string(),
             Self::Queue => "queue".to_string(),
             Self::QueueFull => "queue_full".to_string(),
             Self::QueueDelete(indexes) => format!(
@@ -412,7 +413,7 @@ fn parse_lyrics_duration(argument: &str) -> Option<u8> {
         return None;
     }
     let seconds = argument.parse::<u8>().ok()?;
-    (1..=10).contains(&seconds).then_some(seconds)
+    (1..=30).contains(&seconds).then_some(seconds)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -782,7 +783,7 @@ mod tests {
     }
 
     #[test]
-    fn lyrics_command_accepts_only_a_duration_from_one_to_ten_seconds() {
+    fn lyrics_command_accepts_a_duration_from_one_to_thirty_seconds() {
         assert_eq!(
             PlaybackCommand::parse_hall("歌词")
                 .expect("one-shot lyrics command")
@@ -795,9 +796,25 @@ mod tests {
                 .command,
             PlaybackCommand::LyricsFor(5)
         );
+        assert_eq!(
+            PlaybackCommand::parse_hall("歌词 30")
+                .expect("maximum timed lyrics command")
+                .command,
+            PlaybackCommand::LyricsFor(30)
+        );
         assert_eq!(PlaybackCommand::parse_hall("歌词 0"), None);
-        assert_eq!(PlaybackCommand::parse_hall("歌词 11"), None);
+        assert_eq!(PlaybackCommand::parse_hall("歌词 31"), None);
         assert_eq!(PlaybackCommand::parse_hall("歌词 5秒"), None);
+    }
+
+    #[test]
+    fn timed_lyrics_uses_a_different_lock_from_one_shot_lyrics() {
+        assert_ne!(
+            PlaybackCommand::Lyrics.lock_key(),
+            PlaybackCommand::LyricsFor(5).lock_key()
+        );
+        assert!(!PlaybackCommand::Lyrics.same_request(&PlaybackCommand::LyricsFor(5)));
+        assert!(PlaybackCommand::LyricsFor(5).same_request(&PlaybackCommand::LyricsFor(30)));
     }
 }
 

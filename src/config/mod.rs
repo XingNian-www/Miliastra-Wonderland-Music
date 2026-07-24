@@ -584,6 +584,9 @@ pub struct OpenVinoConfig {
     /// OpenVINO device name, normally `CPU` (also `GPU`/`NPU` when installed).
     #[serde(default = "default_openvino_device")]
     pub device: String,
+    /// Persistent OpenVINO plugin/model cache. Set to null to disable caching.
+    #[serde(default = "default_openvino_cache_dir")]
+    pub cache_dir: Option<PathBuf>,
 }
 
 impl Default for OpenVinoConfig {
@@ -594,12 +597,17 @@ impl Default for OpenVinoConfig {
             rec_model: None,
             rec_weights: None,
             device: default_openvino_device(),
+            cache_dir: default_openvino_cache_dir(),
         }
     }
 }
 
 fn default_openvino_device() -> String {
     "CPU".to_string()
+}
+
+fn default_openvino_cache_dir() -> Option<PathBuf> {
+    Some(PathBuf::from("data/openvino-cache"))
 }
 
 impl OpenVinoConfig {
@@ -617,6 +625,9 @@ impl OpenVinoConfig {
         }
         if self.device.trim().is_empty() {
             bail!("ocr.openvino.device 不能为空");
+        }
+        if let Some(path) = &self.cache_dir {
+            validate_nonempty_path(path, "ocr.openvino.cache_dir")?;
         }
         Ok(())
     }

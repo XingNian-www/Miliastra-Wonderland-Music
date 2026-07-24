@@ -1,4 +1,4 @@
-name: 构建 Windows OpenVINO OCR
+name: 打包 Windows OpenVINO OCR 运行时依赖
 
 on:
   workflow_dispatch:
@@ -8,26 +8,10 @@ on:
         required: false
         type: string
       create_release:
-        description: 是否创建或更新 OpenVINO-only GitHub Release。
+        description: 是否为 OpenVINO 依赖包创建 GitHub Release。
         required: false
-        default: true
+        default: false
         type: boolean
-  push:
-    branches:
-      - main
-      - dev
-    paths:
-      - .cargo/**
-      - .github/workflows/build-windows-openvino.yml
-      - Cargo.toml
-      - Cargo.lock
-      - README.md
-      - THIRD_PARTY_NOTICES.md
-      - assets/**
-      - config.yaml
-      - turtle_soup.example.yaml
-      - src/**
-      - tests/**
 
 permissions:
   contents: write
@@ -43,15 +27,13 @@ env:
 
 jobs:
   build-windows-openvino:
-    name: 构建 Windows x64 OpenVINO-only 运行包
+    name: 构建 Windows x64 OpenVINO 运行时依赖
     runs-on: windows-2022
     timeout-minutes: 240
 
     steps:
       - name: 检出代码
         uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
 
       - name: 安装 Rust
         uses: dtolnay/rust-toolchain@stable
@@ -197,10 +179,6 @@ jobs:
           OPENVINO_OCR_CHARSET: ${{ github.workspace }}\models\ppocr_keys_v6_small.txt
         run: cargo test --locked --no-default-features --features ocr-openvino configured_ir_models_recognize_fixture -- --nocapture
 
-      - name: 编译 OpenVINO-only Release EXE
-        shell: pwsh
-        run: cargo build --release --target x86_64-pc-windows-msvc --locked --no-default-features --features ocr-openvino
-
       - name: 解析发布版本
         id: version
         shell: pwsh
@@ -227,28 +205,14 @@ jobs:
           }
 
           $createRelease = '${{ inputs.create_release }}' -eq 'true'
-          if ('${{ github.event_name }}' -eq 'push') {
-            $createRelease = $false
-            $before = '${{ github.event.before }}'
-            if (-not $before -or $before -match '^0+$') {
-              $createRelease = $true
-            } else {
-              $oldCargo = git show "$($before):Cargo.toml"
-              $oldVersion = Read-PackageVersion $oldCargo
-              if ($oldVersion -ne $packageVersion) {
-                $createRelease = $true
-              }
-            }
-          }
-
-          $artifact = 'miliastra-wonderland-music-openvino-windows-x64'
+          $artifact = 'miliastra-wonderland-music-openvino-runtime-windows-x64'
           "version=$version" >> $env:GITHUB_OUTPUT
           "release_tag=$version-openvino" >> $env:GITHUB_OUTPUT
           "artifact=$artifact" >> $env:GITHUB_OUTPUT
           "zip=$artifact-$version.zip" >> $env:GITHUB_OUTPUT
           "create_release=$($createRelease.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
 
-      - name: 准备 OpenVINO-only 运行包
+      - name: 准备 OpenVINO 运行时依赖包
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -258,30 +222,6 @@ jobs:
             Remove-Item -LiteralPath $dist -Recurse -Force
           }
           New-Item -ItemType Directory -Force -Path $dist | Out-Null
-
-          Copy-Item -LiteralPath 'target\x86_64-pc-windows-msvc\release\miliastra-wonderland-music.exe' -Destination $dist
-          Copy-Item -LiteralPath 'assets' -Destination $dist -Recurse
-          Copy-Item -LiteralPath 'README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md', 'turtle_soup.example.yaml' -Destination $dist
-
-          $config = Get-Content -LiteralPath 'config.yaml' -Raw
-          $newline = [Environment]::NewLine
-          $config = [regex]::Replace($config, '(?m)^  det_model:[^\r\n]*', '  det_model: null')
-          $config = [regex]::Replace($config, '(?m)^  rec_model:[^\r\n]*', '  rec_model: null')
-          $config = [regex]::Replace(
-            $config,
-            '(?ms)^  backend_priority:\r?\n(?:    - [^\r\n]*\r?\n)+',
-            "  backend_priority:$newline    - openvino$newline"
-          )
-          $config = [regex]::Replace($config, '(?m)^    det_model:[^\r\n]*', '    det_model: models/PP-OCRv6_small_det.xml')
-          $config = [regex]::Replace($config, '(?m)^    det_weights:[^\r\n]*', '    det_weights: models/PP-OCRv6_small_det.bin')
-          $config = [regex]::Replace($config, '(?m)^    rec_model:[^\r\n]*', '    rec_model: models/PP-OCRv6_small_rec.xml')
-          $config = [regex]::Replace($config, '(?m)^    rec_weights:[^\r\n]*', '    rec_weights: models/PP-OCRv6_small_rec.bin')
-          if ($config -notmatch '(?m)^    - openvino\s*$' -or
-              $config -notmatch '(?m)^    det_model: models/PP-OCRv6_small_det\.xml\s*$' -or
-              $config -notmatch '(?m)^    rec_model: models/PP-OCRv6_small_rec\.xml\s*$') {
-            throw 'Failed to generate the OpenVINO-only OCR configuration'
-          }
-          Set-Content -LiteralPath (Join-Path $dist 'config.yaml') -Value $config -Encoding utf8
 
           $distModels = Join-Path $dist 'models'
           New-Item -ItemType Directory -Force -Path $distModels | Out-Null
@@ -309,39 +249,6 @@ jobs:
           }
           $tbbDlls | Copy-Item -Destination $tbbTarget -Force
 
-          # Rust MSVC and the OpenVINO binaries use the x64 Microsoft CRT. Pick the
-          # regular VC143/VC144/VC145 redist directory from the runner and ship its
-          # DLLs beside the EXE so a clean Windows host does not need an installer.
-          $vcRuntime = Get-ChildItem `
-              -Path "$env:ProgramFiles\Microsoft Visual Studio" `
-              -Recurse `
-              -File `
-              -Filter 'vcruntime140.dll' `
-              -ErrorAction SilentlyContinue |
-            Where-Object {
-              $_.FullName -match '\\x64\\Microsoft\.VC\d+\.CRT\\vcruntime140\.dll$' -and
-              $_.FullName -notmatch '\\onecore\\'
-            } |
-            Sort-Object LastWriteTime -Descending |
-            Select-Object -First 1
-          if (-not $vcRuntime) {
-            throw 'Cannot find the x64 Microsoft Visual C++ runtime on the Windows runner'
-          }
-          $vcRuntimeDlls = Get-ChildItem -LiteralPath $vcRuntime.DirectoryName -Filter '*.dll' -File
-          if (-not $vcRuntimeDlls) {
-            throw "No Microsoft Visual C++ runtime DLLs found in $($vcRuntime.DirectoryName)"
-          }
-          $vcRuntimeDlls | Copy-Item -Destination $dist -Force
-          $vcNotice = @'
-          Microsoft Visual C++ Runtime
-
-          This package includes the x64 Microsoft Visual C++ runtime DLLs required by the
-          application and OpenVINO. They are redistributed under the Microsoft Visual C++
-          Redistributable for Visual Studio 2015-2022 license:
-          https://aka.ms/vs/17/release/VC_redist.x64.exe
-          '@
-          Set-Content -LiteralPath (Join-Path $dist 'VC-REDIST-NOTICE.txt') -Value $vcNotice -Encoding ascii
-
           $licenseFiles = @{
             'OPENVINO-LICENSE.txt' = Join-Path $env:OPENVINO_ROOT 'docs\licensing\LICENSE'
             'OPENVINO-THIRD-PARTY-NOTICES.txt' = Join-Path $env:OPENVINO_ROOT 'docs\licensing\onetbb_third-party-programs.txt'
@@ -354,23 +261,45 @@ jobs:
             Copy-Item -LiteralPath $entry.Value -Destination (Join-Path $dist $entry.Key)
           }
 
-          $launcher = @'
-          @echo off
-          setlocal
-          set "ROOT=%~dp0"
-          set "OPENVINO_INSTALL_DIR=%ROOT%openvino"
-          set "OPENVINO_LIB_PATHS=%ROOT%openvino\runtime\bin\intel64\Release;%ROOT%openvino\runtime\3rdparty\tbb\bin"
-          set "PATH=%OPENVINO_LIB_PATHS%;%PATH%"
-          cd /d "%ROOT%"
-          "%ROOT%miliastra-wonderland-music.exe" %*
-          exit /b %ERRORLEVEL%
+          $configExample = @'
+          # Merge these values into the normal universal EXE package config.yaml.
+          # Keep the existing MNN paths when retaining CPU fallback.
+          ocr:
+            backend_priority:
+              - openvino
+              - cpu
+            openvino:
+              det_model: models/PP-OCRv6_small_det.xml
+              det_weights: models/PP-OCRv6_small_det.bin
+              rec_model: models/PP-OCRv6_small_rec.xml
+              rec_weights: models/PP-OCRv6_small_rec.bin
+              device: CPU
+              cache_dir: data/openvino-cache
           '@
-          Set-Content -LiteralPath (Join-Path $dist 'run-openvino.cmd') -Value $launcher -Encoding ascii
+          Set-Content -LiteralPath (Join-Path $dist 'config-openvino.example.yaml') -Value $configExample -Encoding utf8
+
+          $readme = @'
+          OpenVINO OCR runtime dependency package
+
+          This package does not contain the application EXE. Use it with the normal
+          Windows x64 package, whose EXE already contains the OpenVINO adapter.
+
+          Installation:
+          1. Extract this directory next to the normal EXE package, preserving paths.
+          2. Merge config-openvino.example.yaml into config.yaml.
+          3. Before starting the EXE, set OPENVINO_INSTALL_DIR to the included
+             openvino directory, set OPENVINO_LIB_PATHS to the two DLL directories,
+             and prepend those directories to PATH:
+             openvino\runtime\bin\intel64\Release
+             openvino\runtime\3rdparty\tbb\bin
+          4. Keep backend_priority as openvino, cpu when CPU/MNN fallback is wanted.
+
+          The normal package must provide MNN models and MNN.dll when CPU fallback is used.
+          The target machine still needs the x64 Microsoft Visual C++ Redistributable.
+          '@
+          Set-Content -LiteralPath (Join-Path $dist 'README-OPENVINO.txt') -Value $readme -Encoding utf8
 
           $required = @(
-            'miliastra-wonderland-music.exe',
-            'run-openvino.cmd',
-            'config.yaml',
             'models\PP-OCRv6_small_det.xml',
             'models\PP-OCRv6_small_det.bin',
             'models\PP-OCRv6_small_rec.xml',
@@ -378,10 +307,11 @@ jobs:
             'openvino\runtime\bin\intel64\Release\openvino_c.dll',
             'openvino\runtime\bin\intel64\Release\openvino_intel_cpu_plugin.dll',
             'openvino\runtime\3rdparty\tbb\bin\tbb12.dll',
-            'vcruntime140.dll',
-            'vcruntime140_1.dll',
-            'msvcp140.dll',
-            'VC-REDIST-NOTICE.txt'
+            'config-openvino.example.yaml',
+            'README-OPENVINO.txt',
+            'OPENVINO-LICENSE.txt',
+            'OPENVINO-THIRD-PARTY-NOTICES.txt',
+            'TBB-LICENSE.txt'
           )
           foreach ($relativePath in $required) {
             if (-not (Test-Path -LiteralPath (Join-Path $dist $relativePath))) {
@@ -389,7 +319,7 @@ jobs:
             }
           }
 
-      - name: 打包 OpenVINO-only zip
+      - name: 打包 OpenVINO 运行时依赖 zip
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -398,17 +328,17 @@ jobs:
             -DestinationPath 'dist/${{ steps.version.outputs.zip }}' `
             -Force
 
-      - name: 上传 OpenVINO-only 产物
+      - name: 上传 OpenVINO 运行时依赖产物
         uses: actions/upload-artifact@v5
         with:
           name: ${{ steps.version.outputs.artifact }}
           path: dist/${{ steps.version.outputs.artifact }}
 
-      - name: 创建 OpenVINO-only GitHub Release
+      - name: 创建 OpenVINO 运行时依赖 GitHub Release
         if: steps.version.outputs.create_release == 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.release_tag }}
-          name: Miliastra Wonderland Music ${{ steps.version.outputs.version }} OpenVINO-only
+          name: Miliastra Wonderland Music ${{ steps.version.outputs.version }} OpenVINO runtime
           files: dist/${{ steps.version.outputs.zip }}
           generate_release_notes: true

@@ -182,7 +182,7 @@ HTTP 不拼接伪聊天文本。远程播放和点歌构造 `ConsoleCommandInten
 
 `src/features/hall/state.rs` 独立拥有大厅名称与剩余时间状态。
 
-点歌由 `src/features/song_request/application.rs::SongRequestApplication` 执行：候选搜索、确认、AI 选择、审核、去重、入队或直接播放都通过窄端口完成。播放成功的唯一稳定身份是非空 URI 精确一致；歌名、歌手或 AI 判断不能替代 URI。
+点歌由 `src/features/song_request/application.rs::SongRequestApplication` 执行：候选搜索、确认、AI 选择、审核、去重、入队或直接播放都通过窄端口完成。普通播放优先要求非空 URI 精确一致；FeelUOwn 跨源自动换源时，播放器控制器会先确认备用 URI 稳定，再用 `MatchConfig` 的整段歌曲名/歌手匹配，必要时复用点歌 AI 的既有超时进行同曲判断。确认状态同时保留原始请求 URI 和实际确认 URI。
 
 ## OpenAI 能力
 

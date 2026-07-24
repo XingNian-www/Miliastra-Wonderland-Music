@@ -46,8 +46,9 @@ use crate::features::invite::{InviteRequest, InviteService, InviteStart};
 use crate::features::moderation::{ModerationPolicy, ModerationResultTask, ModerationService};
 use crate::features::playback::{
     ExternalPlaybackObservation, PlaybackApplication, PlaybackApplicationConfig, PlaybackCommand,
-    PlaybackRequest, PlaybackRuntimeState, PlaybackService, PlaybackStatePort, PlaybackStateUpdate,
-    PlaybackTimePorts, PlayerController, PlayerStatus, QueueItem, SongDedupCandidate,
+    PlaybackIdentityDecision, PlaybackIdentityJudge, PlaybackRequest, PlaybackRuntimeState,
+    PlaybackService, PlaybackStatePort, PlaybackStateUpdate, PlaybackTimePorts, PlayerController,
+    PlayerStatus, QueueItem, SongDedupCandidate,
 };
 use crate::features::song_request::{
     AiClient, ResolvedSongRequest, SongRequestApplication, SongRequestContext, SongRequestDecision,
@@ -398,6 +399,39 @@ pub(crate) struct ApplicationRuntime {
 #[derive(Clone)]
 struct BusinessPlaybackStateAdapter {
     business: BusinessRuntimeHandle,
+}
+
+#[derive(Clone)]
+struct AiPlaybackIdentityJudge {
+    ai: AiClient,
+}
+
+impl PlaybackIdentityJudge for AiPlaybackIdentityJudge {
+    fn judge(&self, request: &PlaybackRequest, status: &PlayerStatus) -> PlaybackIdentityDecision {
+        if !self.ai.enabled() {
+            return PlaybackIdentityDecision::Unavailable {
+                reason: "点歌 AI 未启用".to_string(),
+            };
+        }
+        match self
+            .ai
+            .judge_song_identity(&request.keyword, &status.name, &status.singer)
+        {
+            Ok(result) if result.matched && result.score >= 0.85 => {
+                PlaybackIdentityDecision::Match {
+                    score: result.score,
+                    reason: result.reason,
+                }
+            }
+            Ok(result) => PlaybackIdentityDecision::NoMatch {
+                score: result.score,
+                reason: result.reason,
+            },
+            Err(error) => PlaybackIdentityDecision::Unavailable {
+                reason: format!("AI 判断失败: {error:#}"),
+            },
+        }
+    }
 }
 
 impl BusinessPlaybackStateAdapter {
@@ -960,6 +994,7 @@ impl ApplicationRuntime {
             &config.timing.playback,
             &config.queue,
             &config.matching,
+            Arc::new(AiPlaybackIdentityJudge { ai: ai.clone() }),
             PlaybackTimePorts::new(system_clock.clone(), system_clock.clone(), system_clock),
         );
         let playback_application = PlaybackApplication::new(PlaybackApplicationConfig {

@@ -918,6 +918,7 @@ stale_timeout_ms: 5000
 
         assert_eq!(playback.uri_stable_samples, 0);
         assert_eq!(playback.transport_stable_samples, 0);
+        assert_eq!(playback.fallback_identity_stable_samples, 2);
         assert_eq!(playback.stale_timeout_ms, 5000);
     }
 
@@ -935,6 +936,7 @@ monitor_tick_ms: 200
 monitor_status_ms: 1000
 uri_stable_samples: 0
 transport_stable_samples: 0
+fallback_identity_stable_samples: 2
 stale_timeout_ms: 0
 "#,
         )
@@ -957,6 +959,7 @@ monitor_tick_ms: 200
 monitor_status_ms: 1000
 uri_stable_samples: 4
 transport_stable_samples: 3
+fallback_identity_stable_samples: 2
 stale_timeout_ms: 7500
 "#,
         );
@@ -970,6 +973,7 @@ stale_timeout_ms: 7500
         let inherited = PlaybackTimingConfig {
             uri_stable_samples: 1,
             transport_stable_samples: 0,
+            fallback_identity_stable_samples: 2,
             ..local
         };
         assert_eq!(resolve_stability_count(inherited.uri_stable_samples, 6), 6);
@@ -1156,7 +1160,7 @@ stale_timeout_ms: 7500
 
     #[test]
     fn startup_validation_rejects_zero_runtime_intervals_timeouts_and_retries() {
-        let invalid_fields: [ConfigMutation; 14] = [
+        let invalid_fields: [ConfigMutation; 15] = [
             ("timing.watchdog_restart_ms", |config| {
                 config.timing.watchdog_restart_ms = 0;
             }),
@@ -1184,6 +1188,12 @@ stale_timeout_ms: 7500
             ("timing.playback.status_retries", |config| {
                 config.timing.playback.status_retries = 0;
             }),
+            (
+                "timing.playback.fallback_identity_stable_samples",
+                |config| {
+                    config.timing.playback.fallback_identity_stable_samples = 0;
+                },
+            ),
             ("timing.playback.monitor_tick_ms", |config| {
                 config.timing.playback.monitor_tick_ms = 0;
             }),

@@ -36,7 +36,7 @@
 
 ## 发布包
 
-GitHub Actions 工作流在 `.github/workflows/build-windows-exe.yml`
+GitHub Actions 工作流在 `.github/workflows/build-windows-exe.yml`。如果需要不依赖 MNN/PaddleOCR 的 CPU OCR，使用独立的 `.github/workflows/build-windows-openvino.yml`。
 
 触发方式：
 
@@ -67,6 +67,30 @@ miliastra-wonderland-music-windows-x64/
 ```
 
 `config.yaml` 是运行必需文件。程序不会在运行时创建新配置文件
+
+OpenVINO-only 工作流会自动下载 OpenVINO 2026.2.1 Windows x64 runtime、PP-OCRv6 small ONNX 模型和字符集，把模型转换为 FP32 IR，并运行真实截图 smoke test 后再编译。发布包包含 OpenVINO/TBB DLL、四个 IR/BIN 文件、字符集、配置、资源和对应许可证，不包含 `MNN.dll`、PaddleOCR 或 Python。运行包应使用 `run-openvino.cmd` 启动，以便自动设置 `OPENVINO_INSTALL_DIR` 和 DLL 搜索路径：
+
+```text
+miliastra-wonderland-music-openvino-windows-x64/
+├── miliastra-wonderland-music.exe
+├── run-openvino.cmd
+├── config.yaml
+├── assets/
+├── models/
+│   ├── PP-OCRv6_small_det.xml
+│   ├── PP-OCRv6_small_det.bin
+│   ├── PP-OCRv6_small_rec.xml
+│   ├── PP-OCRv6_small_rec.bin
+│   └── ppocr_keys_v6_small.txt
+├── openvino/runtime/
+│   ├── bin/intel64/Release/*.dll
+│   └── 3rdparty/tbb/bin/*.dll
+├── OPENVINO-LICENSE.txt
+├── OPENVINO-THIRD-PARTY-NOTICES.txt
+└── TBB-LICENSE.txt
+```
+
+推送到 `main` 或 `dev` 会上传 OpenVINO-only artifact；手动执行时可以选择创建 GitHub Release，版本变更推送会自动创建带 `-openvino` 后缀的 Release 标签。该包仍需要 Windows x64 的 Microsoft Visual C++ Redistributable 2015-2022。
 
 ## 本地构建
 

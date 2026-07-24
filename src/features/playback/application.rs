@@ -169,6 +169,10 @@ pub(crate) trait PlaybackExecutionPort {
 }
 
 pub(crate) trait PlaybackCommandPort: PlaybackExecutionPort {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
     fn reply_batch(&mut self, messages: &[String], delay_ms: u64) -> Result<()>;
     fn log_executed(&mut self, context: &PlaybackCommandContext, final_command: &str)
     -> Result<()>;
@@ -298,6 +302,10 @@ impl PlaybackApplication {
                 port.log_executed(context, "lyrics")?;
                 port.reply(&format_lyrics(&status))?;
             }
+            PlaybackCommand::LyricsFor(seconds) => {
+                port.log_executed(context, &format!("lyrics {}s", seconds))?;
+                self.reply_lyrics_for(*seconds, port)?;
+            }
             PlaybackCommand::Queue => {
                 port.log_executed(context, "queue list")?;
                 self.reply_queue(port)?;
@@ -367,6 +375,55 @@ impl PlaybackApplication {
 
         let messages = split_full_queue_messages(&queue, self.config.queue_max_size);
         port.reply_batch(&messages, self.config.help_batch_ms)
+    }
+
+    fn reply_lyrics_for<P: PlaybackCommandPort + ?Sized>(
+        &self,
+        seconds: u8,
+        port: &mut P,
+    ) -> Result<()> {
+        let deadline = port.now() + Duration::from_secs(u64::from(seconds));
+        let poll = Duration::from_millis(self.config.monitor_status_ms.max(1));
+        let mut first_uri = None::<String>;
+        let mut previous_lyric = None::<String>;
+
+        while port.now() < deadline {
+            match port.player_status() {
+                Ok(status) => {
+                    if port.now() >= deadline {
+                        break;
+                    }
+                    let uri = status.current_uri.trim();
+                    if !uri.is_empty() {
+                        if let Some(first_uri) = first_uri.as_deref()
+                            && first_uri != uri
+                        {
+                            log::info!("歌词输出因歌曲切换结束");
+                            break;
+                        }
+                        first_uri.get_or_insert_with(|| uri.to_string());
+                    }
+
+                    let lyric = status.lyric_line_text.trim();
+                    if lyric.is_empty() {
+                        previous_lyric = None;
+                    } else if previous_lyric.as_deref() != Some(lyric) {
+                        port.reply(&format_lyrics(&status))?;
+                        previous_lyric = Some(lyric.to_string());
+                    }
+                }
+                Err(error) => {
+                    log::warn!("持续歌词读取播放器状态失败: {error:#}");
+                }
+            }
+
+            let remaining = deadline.saturating_duration_since(port.now());
+            if remaining.is_zero() {
+                break;
+            }
+            port.wait(poll.min(remaining));
+        }
+        Ok(())
     }
 
     fn reply_player_status_after_skip<P: PlaybackCommandPort + ?Sized>(
@@ -1300,6 +1357,8 @@ mod tests {
         batch_replies: Vec<Vec<String>>,
         batch_delays: Vec<u64>,
         queue: Vec<QueueItem>,
+        status_updates: VecDeque<PlayerStatus>,
+        clock: Option<Arc<ManualClock>>,
         status: PlayerStatus,
     }
 
@@ -1345,6 +1404,9 @@ mod tests {
         }
 
         fn player_status(&mut self) -> Result<PlayerStatus> {
+            if let Some(status) = self.status_updates.pop_front() {
+                self.status = status;
+            }
             Ok(self.status.clone())
         }
 
@@ -1367,6 +1429,12 @@ mod tests {
     }
 
     impl PlaybackCommandPort for NavigationCommandPort {
+        fn now(&self) -> Instant {
+            self.clock
+                .as_ref()
+                .map_or_else(Instant::now, |clock| clock.now())
+        }
+
         fn reply_batch(&mut self, messages: &[String], delay_ms: u64) -> Result<()> {
             self.batch_replies.push(messages.to_vec());
             self.batch_delays.push(delay_ms);
@@ -1417,7 +1485,11 @@ mod tests {
             Ok(0)
         }
 
-        fn wait(&mut self, _duration: Duration) {}
+        fn wait(&mut self, duration: Duration) {
+            if let Some(clock) = &self.clock {
+                clock.advance(duration).expect("advance test clock");
+            }
+        }
     }
 
     #[test]
@@ -1440,6 +1512,8 @@ mod tests {
                     ..QueueItem::default()
                 },
             ],
+            status_updates: VecDeque::new(),
+            clock: None,
             status: PlayerStatus::default(),
         };
         let application = PlaybackApplication::new(PlaybackApplicationConfig {
@@ -1468,6 +1542,58 @@ mod tests {
             port.batch_replies,
             vec![vec!["完整队列(2/20): 1.晴天, 2.青花瓷".to_string()]]
         );
+    }
+
+    #[test]
+    fn timed_lyrics_sends_changed_lines_and_stops_after_song_switch() {
+        let start = Instant::now();
+        let clock = Arc::new(ManualClock::new(start));
+        let playing = |uri: &str, lyric: &str| PlayerStatus {
+            status: "playing".to_string(),
+            current_uri: uri.to_string(),
+            lyric_line_text: lyric.to_string(),
+            ..PlayerStatus::default()
+        };
+        let mut port = NavigationCommandPort {
+            previous_request: None,
+            played_uris: Vec::new(),
+            previous_calls: 0,
+            verifications: VecDeque::new(),
+            replies: Vec::new(),
+            batch_replies: Vec::new(),
+            batch_delays: Vec::new(),
+            queue: Vec::new(),
+            status_updates: VecDeque::from([
+                playing("fuo://song/1", "第一句"),
+                playing("fuo://song/1", "第一句"),
+                playing("fuo://song/1", "第二句"),
+                playing("fuo://song/2", "第三句"),
+            ]),
+            clock: Some(Arc::clone(&clock)),
+            status: PlayerStatus::default(),
+        };
+        let application = PlaybackApplication::new(PlaybackApplicationConfig {
+            console_bypass_dedup: true,
+            queue_max_size: 20,
+            skip_status_initial_ms: 0,
+            skip_status_poll_ms: 0,
+            skip_status_retries: 0,
+            monitor_tick_ms: 50,
+            monitor_status_ms: 1_000,
+            help_batch_ms: 0,
+        });
+        let context = PlaybackCommandContext {
+            message_type: "blue".to_string(),
+            username: "tester".to_string(),
+            user_command: "@歌词 5".to_string(),
+        };
+
+        application
+            .execute_command(&context, &PlaybackCommand::LyricsFor(5), &mut port)
+            .expect("timed lyrics command");
+
+        assert_eq!(port.replies, ["歌词: 第一句", "歌词: 第二句"]);
+        assert_eq!(clock.now(), start + Duration::from_secs(3));
     }
 
     #[test]
@@ -1524,6 +1650,8 @@ mod tests {
             batch_replies: Vec::new(),
             batch_delays: Vec::new(),
             queue: Vec::new(),
+            status_updates: VecDeque::new(),
+            clock: None,
             status: PlayerStatus {
                 status: "playing".to_string(),
                 current_uri: previous_uri.to_string(),

@@ -476,6 +476,9 @@ pub(crate) enum PlaybackStateUpdate {
         request: ActivePlaybackRequest,
         navigation: PlaybackNavigation,
     },
+    Reconciled {
+        request: ActivePlaybackRequest,
+    },
     Observation(PlaybackObservation),
     Unknown,
     Restore(Box<PlaybackRuntimeState>),
@@ -551,6 +554,13 @@ impl PlaybackStateUpdate {
                 }
                 playback.state = ConfirmedPlaybackState::RequestedSongPlaying;
                 playback.pause_reason = PauseReason::None;
+                playback.active_request = Some(request);
+                true
+            }
+            Self::Reconciled { request } => {
+                if playback.active_request.is_none() {
+                    return false;
+                }
                 playback.active_request = Some(request);
                 true
             }

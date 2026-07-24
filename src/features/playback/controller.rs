@@ -48,6 +48,24 @@ pub(crate) enum PlaybackIdentityDecision {
     Unavailable { reason: String },
 }
 
+enum CrossSourceReconciliation {
+    Pending,
+    Match {
+        status: PlayerStatus,
+        score: f64,
+        reason: String,
+    },
+    NoMatch {
+        status: PlayerStatus,
+        score: f64,
+        reason: String,
+    },
+    Unavailable {
+        status: PlayerStatus,
+        reason: String,
+    },
+}
+
 pub(crate) trait PlaybackIdentityJudge: Send + Sync {
     fn judge(&self, request: &PlaybackRequest, status: &PlayerStatus) -> PlaybackIdentityDecision;
 }
@@ -534,66 +552,56 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
                     continue;
                 }
                 if is_cross_source_uri(requested_uri, &current_uri) {
-                    if let Some(stable_status) = self.observe_stable_fallback(&status)? {
-                        if fallback_status_is_playable(&stable_status) {
-                            let local_match = self.matching.match_song_identity(
-                                &request.keyword,
-                                &stable_status.name,
-                                &stable_status.singer,
+                    match self.reconcile_cross_source_status(request, &status)? {
+                        CrossSourceReconciliation::Match {
+                            status: stable_status,
+                            score,
+                            reason,
+                        } => {
+                            self.confirm_playback_fallback(request, &stable_status, &reason)?;
+                            let message = format_play_message(&stable_status);
+                            log::info!(
+                                "跨源同曲确认成功: requested={} confirmed={} score={:.2} reason={}",
+                                requested_uri,
+                                stable_status.current_uri,
+                                score,
+                                reason
                             );
-                            let decision = match local_match {
-                                super::matcher::SongIdentityMatch::Match { score, reason } => {
-                                    Some(PlaybackIdentityDecision::Match { score, reason })
-                                }
-                                super::matcher::SongIdentityMatch::Unknown { reason } => {
-                                    log::debug!(
-                                        "跨源同曲本地判断不确定: current={} requested={} reason={}",
-                                        current_uri,
-                                        requested_uri,
-                                        reason
-                                    );
-                                    Some(self.identity_judge.judge(request, &stable_status))
-                                }
-                            };
-                            match decision {
-                                Some(PlaybackIdentityDecision::Match { score, reason }) => {
-                                    self.confirm_playback_fallback(
-                                        request,
-                                        &stable_status,
-                                        &reason,
-                                    )?;
-                                    let message = format_play_message(&stable_status);
-                                    log::info!(
-                                        "跨源同曲确认成功: requested={} confirmed={} score={:.2} reason={}",
-                                        requested_uri,
-                                        stable_status.current_uri,
-                                        score,
-                                        reason
-                                    );
-                                    return Ok(PlaybackVerification::Success {
-                                        status: stable_status,
-                                        message,
-                                    });
-                                }
-                                Some(PlaybackIdentityDecision::NoMatch { score, reason }) => {
-                                    log::info!(
-                                        "跨源同曲判断不匹配: requested={} confirmed={} score={:.2} reason={}",
-                                        requested_uri,
-                                        stable_status.current_uri,
-                                        score,
-                                        reason
-                                    );
-                                }
-                                Some(PlaybackIdentityDecision::Unavailable { reason }) => {
-                                    log::info!(
-                                        "跨源同曲判断不可用: requested={} confirmed={} reason={}",
-                                        requested_uri,
-                                        stable_status.current_uri,
-                                        reason
-                                    );
-                                }
-                                None => {}
-                            }
+                            return Ok(PlaybackVerification::Success {
+                                status: stable_status,
+                                message,
+                            });
+                        }
+                        CrossSourceReconciliation::NoMatch {
+                            status: stable_status,
+                            score,
+                            reason,
+                        } => {
+                            log::info!(
+                                "跨源同曲判断不匹配: requested={} confirmed={} score={:.2} reason={}",
+                                requested_uri,
+                                stable_status.current_uri,
+                                score,
+                                reason
+                            );
+                        }
+                        CrossSourceReconciliation::Unavailable {
+                            status: stable_status,
+                            reason,
+                        } => {
+                            log::info!(
+                                "跨源同曲判断不可用: requested={} confirmed={} reason={}",
+                                requested_uri,
+                                stable_status.current_uri,
+                                reason
+                            );
+                        }
+                        CrossSourceReconciliation::Pending => {
+                            log::debug!(
+                                "跨源同曲确认尚未稳定: requested={} current={}",
+                                requested_uri,
+                                current_uri
+                            );
                         }
                     }
                 }
@@ -664,6 +672,61 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         Ok(Some(stable))
     }
 
+    fn reconcile_cross_source_status(
+        &self,
+        request: &PlaybackRequest,
+        first: &PlayerStatus,
+    ) -> Result<CrossSourceReconciliation> {
+        let Some(status) = self.observe_stable_fallback(first)? else {
+            return Ok(CrossSourceReconciliation::Pending);
+        };
+        if !fallback_status_is_playable(&status) {
+            return Ok(CrossSourceReconciliation::Pending);
+        }
+        let decision = self.judge_cross_source_identity(request, &status);
+        Ok(match decision {
+            PlaybackIdentityDecision::Match { score, reason } => CrossSourceReconciliation::Match {
+                status,
+                score,
+                reason,
+            },
+            PlaybackIdentityDecision::NoMatch { score, reason } => {
+                CrossSourceReconciliation::NoMatch {
+                    status,
+                    score,
+                    reason,
+                }
+            }
+            PlaybackIdentityDecision::Unavailable { reason } => {
+                CrossSourceReconciliation::Unavailable { status, reason }
+            }
+        })
+    }
+
+    fn judge_cross_source_identity(
+        &self,
+        request: &PlaybackRequest,
+        status: &PlayerStatus,
+    ) -> PlaybackIdentityDecision {
+        match self
+            .matching
+            .match_song_identity(&request.keyword, &status.name, &status.singer)
+        {
+            super::matcher::SongIdentityMatch::Match { score, reason } => {
+                PlaybackIdentityDecision::Match { score, reason }
+            }
+            super::matcher::SongIdentityMatch::Unknown { reason } => {
+                log::debug!(
+                    "跨源同曲本地判断不确定: current={} requested={} reason={}",
+                    status.current_uri,
+                    request.uri,
+                    reason
+                );
+                self.identity_judge.judge(request, status)
+            }
+        }
+    }
+
     pub(crate) fn reject_mismatch_as_no_source(&self, status: Option<&PlayerStatus>) -> Result<()> {
         if status.is_some_and(|status| status.status == "playing") {
             let _ = self.backend.pause();
@@ -726,12 +789,76 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         }
 
         if runtime_snapshot.active_request.is_some()
+            && matches!(status.status.as_str(), "playing" | "paused")
             && active_request_track_changed(
                 runtime_snapshot.active_request.as_ref(),
                 &status,
                 &self.matching,
             )
         {
+            if let Some(active_request) = runtime_snapshot.active_request.as_ref()
+                && is_cross_source_uri(
+                    active_request_expected_uri(active_request),
+                    status.current_uri.trim(),
+                )
+            {
+                let request = playback_request_from_active(active_request);
+                match self.reconcile_cross_source_status(&request, &status)? {
+                    CrossSourceReconciliation::Match {
+                        status: stable_status,
+                        score,
+                        reason,
+                    } => {
+                        self.confirm_playback_reconciliation(
+                            active_request,
+                            &stable_status,
+                            &reason,
+                        )?;
+                        log::info!(
+                            "跨源换源同曲确认成功，保留点歌状态: requested={} confirmed={} score={:.2} reason={}",
+                            active_request_expected_uri(active_request),
+                            stable_status.current_uri,
+                            score,
+                            reason
+                        );
+                        return Ok(QueueAdvanceDecision::PlaybackStateChanged);
+                    }
+                    CrossSourceReconciliation::Pending => {
+                        log::debug!(
+                            "跨源换源尚未稳定，暂不转为外部播放: requested={} current={}",
+                            active_request_expected_uri(active_request),
+                            status.current_uri
+                        );
+                        return Ok(QueueAdvanceDecision::None);
+                    }
+                    CrossSourceReconciliation::NoMatch {
+                        status: stable_status,
+                        score,
+                        reason,
+                    } => {
+                        log::info!(
+                            "跨源换源判断为不同歌曲: requested={} confirmed={} score={:.2} reason={}",
+                            active_request_expected_uri(active_request),
+                            stable_status.current_uri,
+                            score,
+                            reason
+                        );
+                    }
+                    CrossSourceReconciliation::Unavailable {
+                        status: stable_status,
+                        reason,
+                    } => {
+                        log::warn!(
+                            "跨源换源无法确认歌曲身份，暂停并进入 Unknown: requested={} current={} reason={}",
+                            active_request_expected_uri(active_request),
+                            stable_status.current_uri,
+                            reason
+                        );
+                        self.reject_mismatch_as_no_source(Some(&stable_status))?;
+                        return Ok(QueueAdvanceDecision::PlaybackStateChanged);
+                    }
+                }
+            }
             log::info!(
                 "播放器状态转移: RequestedSongPlaying -> ExternalPlayback reason=track_changed"
             );
@@ -967,6 +1094,36 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         self.confirm_playback_success_with_uri(request, status, false, reason)
     }
 
+    fn confirm_playback_reconciliation(
+        &self,
+        active_request: &ActivePlaybackRequest,
+        status: &PlayerStatus,
+        reason: &str,
+    ) -> Result<()> {
+        let confirmed_uri = status.current_uri.trim();
+        if confirmed_uri.is_empty() {
+            return Err(anyhow!("跨源换源确认缺少 URI"));
+        }
+        let mut reconciled = active_request.clone();
+        reconciled.confirmed_uri = confirmed_uri.to_string();
+        reconciled.song = format!("{}{}", status.name, status.singer);
+        reconciled.title = status.name.trim().to_string();
+        reconciled.artist = status.singer.trim().to_string();
+        reconciled.guard_started_at = None;
+        self.playback_state
+            .update(PlaybackStateUpdate::Reconciled {
+                request: reconciled,
+            })?;
+        let request = playback_request_from_active(active_request);
+        self.record_song_dedup_playback(&request, confirmed_uri, status)?;
+        log::info!(
+            "播放器状态保持 RequestedSongPlaying reason={} confirmed_uri={}",
+            reason,
+            confirmed_uri
+        );
+        Ok(())
+    }
+
     fn confirm_playback_success_with_uri(
         &self,
         request: &PlaybackRequest,
@@ -1170,12 +1327,26 @@ fn status_matches_active_request(
         return false;
     };
     let current_uri = status.current_uri.trim();
-    let requested_uri = if active_request.confirmed_uri.trim().is_empty() {
+    let requested_uri = active_request_expected_uri(active_request);
+    !current_uri.is_empty() && !requested_uri.is_empty() && current_uri == requested_uri
+}
+
+fn active_request_expected_uri(active_request: &ActivePlaybackRequest) -> &str {
+    if active_request.confirmed_uri.trim().is_empty() {
         active_request.requested_uri.trim()
     } else {
         active_request.confirmed_uri.trim()
-    };
-    !current_uri.is_empty() && !requested_uri.is_empty() && current_uri == requested_uri
+    }
+}
+
+fn playback_request_from_active(active_request: &ActivePlaybackRequest) -> PlaybackRequest {
+    PlaybackRequest {
+        keyword: active_request.keyword.clone(),
+        source: active_request.source.clone(),
+        prefer_accompaniment: active_request.prefer_accompaniment,
+        uri: active_request_expected_uri(active_request).to_string(),
+        navigation: PlaybackNavigation::Normal,
+    }
 }
 
 fn active_request_guard_active(
@@ -1206,11 +1377,7 @@ fn active_request_track_changed(
         return false;
     };
     let current_uri = status.current_uri.trim();
-    let requested_uri = if active_request.confirmed_uri.trim().is_empty() {
-        active_request.requested_uri.trim()
-    } else {
-        active_request.confirmed_uri.trim()
-    };
+    let requested_uri = active_request_expected_uri(active_request);
     let changed =
         !current_uri.is_empty() && !requested_uri.is_empty() && current_uri != requested_uri;
     changed && !status_matches_active_request(matching, Some(active_request), status)
@@ -1446,6 +1613,14 @@ mod tests {
         }
     }
 
+    fn stopped_status_with_uri(uri: &str) -> PlayerStatus {
+        PlayerStatus {
+            status: "stopped".to_string(),
+            current_uri: uri.to_string(),
+            ..PlayerStatus::default()
+        }
+    }
+
     fn controller(backend: FakeBackend) -> PlayerController<FakeBackend, TestPlaybackState> {
         let system_time = Arc::new(SystemClock);
         controller_with_time(
@@ -1468,6 +1643,22 @@ mod tests {
             PlaybackIdentityDecision::Match {
                 score: 0.99,
                 reason: "测试同曲".to_string(),
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct NonMatchingIdentityJudge;
+
+    impl PlaybackIdentityJudge for NonMatchingIdentityJudge {
+        fn judge(
+            &self,
+            _request: &PlaybackRequest,
+            _status: &PlayerStatus,
+        ) -> PlaybackIdentityDecision {
+            PlaybackIdentityDecision::NoMatch {
+                score: 0.1,
+                reason: "测试不同曲".to_string(),
             }
         }
     }
@@ -1714,6 +1905,201 @@ mod tests {
         assert_eq!(snapshot.state, "requested_song_playing");
         assert_eq!(snapshot.current_uri, fallback_uri);
         assert_eq!(snapshot.active_uri, fallback_uri);
+    }
+
+    #[test]
+    fn post_confirmation_cross_source_switch_rechecks_identity_before_external_transition() {
+        let fallback_uri = "fuo://netease/songs/fallback";
+        let backend = FakeBackend::new(vec![status("目标", fallback_uri, 12.0, 180.0)]);
+        let manual_clock = Arc::new(ManualClock::new(Instant::now()));
+        let controller = controller_with_time_and_judge(
+            backend,
+            manual_clock.clone(),
+            manual_clock.clone(),
+            manual_clock.clone(),
+            Arc::new(MatchingIdentityJudge),
+        );
+        let request = request();
+        controller
+            .confirm_playback_success(&request, &status("目标", request.uri.as_str(), 1.0, 180.0))
+            .unwrap();
+        manual_clock.advance(Duration::from_secs(10)).unwrap();
+
+        let decision = controller
+            .maybe_advance_queue(
+                status("目标", fallback_uri, 12.0, 180.0),
+                QueueAdvanceContext {
+                    queue_empty: true,
+                    has_pending_playback_task: false,
+                    command_executing: false,
+                    song_command_executing: false,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(decision, QueueAdvanceDecision::PlaybackStateChanged);
+        let snapshot = controller.snapshot();
+        assert_eq!(snapshot.state, "requested_song_playing");
+        assert_eq!(snapshot.active_uri, fallback_uri);
+        assert!(
+            controller
+                .playback_state
+                .snapshot()
+                .unwrap()
+                .previous_requests
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn post_confirmation_cross_source_switch_waits_for_stable_identity() {
+        let fallback_uri = "fuo://netease/songs/fallback";
+        let other_uri = "fuo://netease/songs/other";
+        let backend = FakeBackend::new(vec![
+            status("目标", fallback_uri, 12.0, 180.0),
+            status("目标", other_uri, 13.0, 180.0),
+        ]);
+        let manual_clock = Arc::new(ManualClock::new(Instant::now()));
+        let mut controller = controller_with_time_and_judge(
+            backend,
+            manual_clock.clone(),
+            manual_clock.clone(),
+            manual_clock.clone(),
+            Arc::new(MatchingIdentityJudge),
+        );
+        controller.timing.fallback_identity_stable_samples = 2;
+        let request = request();
+        controller
+            .confirm_playback_success(&request, &status("目标", request.uri.as_str(), 1.0, 180.0))
+            .unwrap();
+        manual_clock.advance(Duration::from_secs(10)).unwrap();
+
+        let decision = controller
+            .maybe_advance_queue(
+                status("目标", fallback_uri, 12.0, 180.0),
+                QueueAdvanceContext {
+                    queue_empty: true,
+                    has_pending_playback_task: false,
+                    command_executing: false,
+                    song_command_executing: false,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(decision, QueueAdvanceDecision::None);
+        let snapshot = controller.snapshot();
+        assert_eq!(snapshot.state, "requested_song_playing");
+        assert_eq!(snapshot.active_uri, request.uri);
+    }
+
+    #[test]
+    fn post_confirmation_cross_source_switch_with_unavailable_identity_enters_unknown() {
+        let fallback_uri = "fuo://netease/songs/fallback";
+        let backend = FakeBackend::new(vec![status("别名版本", fallback_uri, 12.0, 180.0)]);
+        let backend_probe = backend.clone();
+        let manual_clock = Arc::new(ManualClock::new(Instant::now()));
+        let controller = controller_with_time(
+            backend,
+            manual_clock.clone(),
+            manual_clock.clone(),
+            manual_clock.clone(),
+        );
+        let request = request();
+        controller
+            .confirm_playback_success(&request, &status("目标", request.uri.as_str(), 1.0, 180.0))
+            .unwrap();
+        manual_clock.advance(Duration::from_secs(10)).unwrap();
+
+        let decision = controller
+            .maybe_advance_queue(
+                status("别名版本", fallback_uri, 12.0, 180.0),
+                QueueAdvanceContext {
+                    queue_empty: true,
+                    has_pending_playback_task: false,
+                    command_executing: false,
+                    song_command_executing: false,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(decision, QueueAdvanceDecision::PlaybackStateChanged);
+        let snapshot = controller.snapshot();
+        assert_eq!(snapshot.state, "unknown");
+        assert!(snapshot.active_uri.is_empty());
+        assert_eq!(*backend_probe.paused.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn post_confirmation_cross_source_switch_with_different_identity_becomes_external() {
+        let fallback_uri = "fuo://netease/songs/fallback";
+        let backend = FakeBackend::new(vec![status("别名版本", fallback_uri, 12.0, 180.0)]);
+        let manual_clock = Arc::new(ManualClock::new(Instant::now()));
+        let controller = controller_with_time_and_judge(
+            backend,
+            manual_clock.clone(),
+            manual_clock.clone(),
+            manual_clock.clone(),
+            Arc::new(NonMatchingIdentityJudge),
+        );
+        let request = request();
+        controller
+            .confirm_playback_success(&request, &status("目标", request.uri.as_str(), 1.0, 180.0))
+            .unwrap();
+        manual_clock.advance(Duration::from_secs(10)).unwrap();
+
+        let decision = controller
+            .maybe_advance_queue(
+                status("别名版本", fallback_uri, 12.0, 180.0),
+                QueueAdvanceContext {
+                    queue_empty: true,
+                    has_pending_playback_task: false,
+                    command_executing: false,
+                    song_command_executing: false,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(decision, QueueAdvanceDecision::PlaybackStateChanged);
+        let snapshot = controller.snapshot();
+        assert_eq!(snapshot.state, "external_playback");
+        assert!(snapshot.active_uri.is_empty());
+    }
+
+    #[test]
+    fn stopped_cross_source_observation_clears_active_request_without_reconciliation() {
+        let fallback_uri = "fuo://netease/songs/fallback";
+        let backend = FakeBackend::new(vec![stopped_status_with_uri(fallback_uri)]);
+        let manual_clock = Arc::new(ManualClock::new(Instant::now()));
+        let controller = controller_with_time_and_judge(
+            backend,
+            manual_clock.clone(),
+            manual_clock.clone(),
+            manual_clock.clone(),
+            Arc::new(MatchingIdentityJudge),
+        );
+        let request = request();
+        controller
+            .confirm_playback_success(&request, &status("目标", request.uri.as_str(), 1.0, 180.0))
+            .unwrap();
+        manual_clock.advance(Duration::from_secs(10)).unwrap();
+
+        let stopped = stopped_status_with_uri(fallback_uri);
+        let decision = controller
+            .maybe_advance_queue(
+                stopped,
+                QueueAdvanceContext {
+                    queue_empty: true,
+                    has_pending_playback_task: false,
+                    command_executing: false,
+                    song_command_executing: false,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(decision, QueueAdvanceDecision::PlaybackStateChanged);
+        let snapshot = controller.snapshot();
+        assert_eq!(snapshot.state, "idle");
+        assert!(snapshot.active_uri.is_empty());
     }
 
     #[test]

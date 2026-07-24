@@ -63,7 +63,7 @@ flowchart TD
 
 - 从配置解析 OCR 模型路径、线程数和后端优先级。
 - 按优先级尝试创建 OCR 引擎。
-- 探测 CPU、OpenCL、Vulkan、CUDA 等 MNN 后端，以及编译 feature 后的 OpenVINO 后端可用性。默认启用 `ocr-mnn`；OpenVINO-only 构建可用 `--no-default-features --features ocr-openvino` 排除 PaddleOCR/MNN。
+- 探测 CPU、OpenCL、Vulkan、CUDA 等 MNN 后端，以及默认 EXE 内置的 OpenVINO 后端可用性。OpenVINO runtime DLL 只在选择该后端时加载；OpenVINO-only 构建可用 `--no-default-features --features ocr-openvino` 排除 PaddleOCR/MNN。
 - 把 OCR 行按位置合并成更接近聊天文本的字符串。
 - 归一化中英文间距和标点附近空格。
 

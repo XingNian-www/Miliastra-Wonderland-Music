@@ -36,14 +36,17 @@
 
 ## 发布包
 
-GitHub Actions 工作流在 `.github/workflows/build-windows-exe.yml`。如果需要不依赖 MNN/PaddleOCR 的 CPU OCR，使用独立的 `.github/workflows/build-windows-openvino.yml`。
+GitHub Actions 工作流在 `.github/workflows/build-windows-exe.yml`。普通 EXE 是同时包含 MNN 与 OpenVINO 适配器的通用版本；`.github/workflows/build-windows-openvino.yml` 只负责手动生成 OpenVINO 运行时依赖包，类似 CUDA MNN 运行时工作流，不会生成或替换 EXE。
 
 触发方式：
 
-- 在 GitHub Actions 页面手动执行 `workflow_dispatch`
-- 推送到 `main` 或 `dev`，并且本次推送包含 EXE 构建相关文件
+- `build-windows-exe.yml`：在 GitHub Actions 页面手动执行 `workflow_dispatch`
+- `build-windows-exe.yml`：推送到 `main` 或 `dev`，并且本次推送包含 EXE 构建相关文件
+- `build-windows-openvino.yml`：仅在 GitHub Actions 页面手动执行 `workflow_dispatch`
 
-推送触发时会自动构建并上传可运行构建产物。创建 GitHub Release 仍然只在手动执行工作流，或 `Cargo.toml` 的 `[package].version` 发生变化时进行
+OpenVINO 依赖工作流不会因推送代码自动运行。手动执行时可以填写版本，并按需勾选 `create_release` 创建带 `-openvino` 后缀的依赖包 Release。
+
+通用 EXE 工作流在推送触发时会自动构建并上传可运行构建产物；它的 GitHub Release 仍然只在手动执行工作流，或 `Cargo.toml` 的 `[package].version` 发生变化时进行。
 
 构建产物是 `x86_64-pc-windows-msvc`，会下载 PP-OCRv6 小模型：
 
@@ -68,14 +71,12 @@ miliastra-wonderland-music-windows-x64/
 
 `config.yaml` 是运行必需文件。程序不会在运行时创建新配置文件
 
-OpenVINO-only 工作流会自动下载 OpenVINO 2026.2.1 Windows x64 runtime、PP-OCRv6 small ONNX 模型和字符集，把模型转换为 FP32 IR，并运行真实截图 smoke test 后再编译。发布包包含 OpenVINO/TBB DLL、四个 IR/BIN 文件、字符集、配置、资源和对应许可证，不包含 `MNN.dll`、PaddleOCR 或 Python。运行包应使用 `run-openvino.cmd` 启动，以便自动设置 `OPENVINO_INSTALL_DIR` 和 DLL 搜索路径：
+普通发布包中的 EXE 已包含 MNN 与 OpenVINO 两个 OCR 适配器，但只随包提供默认所需的 `MNN.dll`。未把 `openvino` 放入 `ocr.backend_priority` 时不检查 OpenVINO DLL；需要启用时，再把 OpenVINO runtime、IR 模型和对应配置放到运行目录即可，无需替换 EXE。
+
+手动执行 OpenVINO 依赖工作流会下载 OpenVINO 2026.2.1 Windows x64 runtime、PP-OCRv6 small ONNX 模型和字符集，把模型转换为 FP32 IR，并运行真实截图 smoke test。它只生成运行时依赖包，不编译 EXE，不包含完整应用资源、`MNN.dll`、PaddleOCR 或 Python。使用时把依赖包内容解压到普通 Windows x64 EXE 包旁边，并按 `README-OPENVINO.txt` 合并配置、设置 DLL 搜索路径：
 
 ```text
-miliastra-wonderland-music-openvino-windows-x64/
-├── miliastra-wonderland-music.exe
-├── run-openvino.cmd
-├── config.yaml
-├── assets/
+miliastra-wonderland-music-openvino-runtime-windows-x64/
 ├── models/
 │   ├── PP-OCRv6_small_det.xml
 │   ├── PP-OCRv6_small_det.bin
@@ -85,14 +86,14 @@ miliastra-wonderland-music-openvino-windows-x64/
 ├── openvino/runtime/
 │   ├── bin/intel64/Release/*.dll
 │   └── 3rdparty/tbb/bin/*.dll
+├── config-openvino.example.yaml
+├── README-OPENVINO.txt
 ├── OPENVINO-LICENSE.txt
 ├── OPENVINO-THIRD-PARTY-NOTICES.txt
-├── TBB-LICENSE.txt
-├── vcruntime140.dll / msvcp140*.dll
-└── VC-REDIST-NOTICE.txt
+└── TBB-LICENSE.txt
 ```
 
-推送到 `main` 或 `dev` 会上传 OpenVINO-only artifact；手动执行时可以选择创建 GitHub Release，版本变更推送会自动创建带 `-openvino` 后缀的 Release 标签。工作流还会从 Windows runner 自动复制 x64 MSVC CRT DLL，因此不要求目标机预装 Microsoft Visual C++ Redistributable；Windows 自带的 UCRT 等系统组件仍由操作系统提供。
+依赖包不携带 EXE 或 Microsoft Visual C++ CRT；普通 EXE 包仍按原发布流程提供 `MNN.dll`，目标机也仍需安装 x64 Microsoft Visual C++ Redistributable。OpenVINO 工作流上传的 artifact 默认只在本次手动运行中保存；只有勾选 `create_release` 才会创建 GitHub Release。
 
 ## 本地构建
 
@@ -115,19 +116,23 @@ vendor/mnn/3.6.0/windows-x64/bin/MNN.dll
 
 EXE 与 `MNN.dll` 分开编译。普通发布包默认使用 CPU OCR；CUDA MNN 运行时包可以单独构建，使用时把其中的 `MNN.dll` 和 CUDA runtime DLL 放到 EXE 旁边，并把 `config.yaml` 中的 `ocr.backend_priority` 改为先 `cuda` 后 `cpu`。默认的 CUDA 12.4.1 运行时面向 P100/Pascal，要求 Windows NVIDIA 驱动 551.78 或更新版本
 
-OpenVINO 是独立的可选 OCR 后端，不会替换默认 MNN 路径。启用它需要使用 OpenVINO IR（每个模型一对 XML/BIN 文件）导出的 PP-OCR 检测和识别模型。PaddleOCR 可以作为模型来源或转换工具，但 OpenVINO 运行时不调用 PaddleOCR/Python 的预处理、后处理或模型代码：
+OpenVINO 是与 MNN 并列的可选 OCR 后端。默认 EXE 已同时编译两个适配器，但 OpenVINO runtime DLL 只会在 `backend_priority` 选择 `openvino` 时动态加载；没有 DLL 时不会影响默认 CPU/MNN 路径。启用 OpenVINO 还需要准备 OpenVINO IR（每个模型一对 XML/BIN 文件）导出的 PP-OCR 检测和识别模型。PaddleOCR 可以作为模型来源或转换工具，但 OpenVINO 运行时不调用 PaddleOCR/Python 的预处理、后处理或模型代码：
 
 ```powershell
-# 混合构建：保留默认 MNN，OpenVINO 失败时可显式配置 CPU fallback
-cargo build --release --features ocr-openvino
+# 标准构建：一个 EXE 同时包含 MNN 与 OpenVINO 适配器。
+# 不选择 openvino 时不要求安装 OpenVINO runtime。
+cargo build --release
 
-# 独立构建：不编译 ocr-rs/MNN，只使用 OpenVINO 后端
+# 可选的最小 OpenVINO-only 本地构建：不编译 ocr-rs/MNN；发布工作流不使用此构建产出 EXE。
 cargo build --release --no-default-features --features ocr-openvino
+
+# 可选的旧式 MNN-only 构建：排除 OpenVINO 适配器。
+cargo build --release --no-default-features --features ocr-mnn
 ```
 
-发布机还需要安装 OpenVINO >= 2025.1，并把 `runtime/bin/intel64/Release` 和同一安装包中的 `runtime/3rdparty/tbb/bin` 加入 `PATH`；也可以设置 `OPENVINO_INSTALL_DIR` 帮助定位主 DLL，但 TBB 目录仍必须能被 Windows DLL 搜索到。OpenVINO-only 配置把 `ocr.backend_priority` 设为只含 `openvino`，在 `ocr.openvino` 下填写四个模型路径；此时 `ocr.det_model`/`ocr.rec_model` 可以省略或设为 `null`，不会追加 CPU fallback，也不需要 MNN 模型或 `MNN.dll`。混合配置可以显式加入 `cpu`（或其他 MNN 后端）作为 fallback，此时才需要对应 MNN 模型。OpenVINO 的模型转换、输入形状和输出节点必须保持 PaddleOCR DB 检测与 CTC 识别约定，静态输入形状不适合作为当前聊天小图后端。
+发布机还需要安装 OpenVINO >= 2025.1，并把 `runtime/bin/intel64/Release` 和同一安装包中的 `runtime/3rdparty/tbb/bin` 加入 `PATH`；依赖包中的 `README-OPENVINO.txt` 给出相同的目录结构和环境变量设置，也可以设置 `OPENVINO_INSTALL_DIR` 帮助定位主 DLL，但 TBB 目录仍必须能被 Windows DLL 搜索到。OpenVINO-only 配置把 `ocr.backend_priority` 设为只含 `openvino`，在 `ocr.openvino` 下填写四个模型路径；此时 `ocr.det_model`/`ocr.rec_model` 可以省略或设为 `null`，不会追加 CPU fallback，也不需要 MNN 模型或 `MNN.dll`。混合配置可以显式加入 `cpu`（或其他 MNN 后端）作为 fallback，此时才需要对应 MNN 模型。OpenVINO 的模型转换、输入形状和输出节点必须保持 PaddleOCR DB 检测与 CTC 识别约定，静态输入形状不适合作为当前聊天小图后端。`ocr.openvino.cache_dir` 默认是 `data/openvino-cache`，用于持久化设备插件和模型编译结果；核显首次启动仍需完成一次编译，后续启动会直接复用缓存。将它设为 `null` 可以关闭缓存，缓存目录不可写时程序会记录警告并继续运行。
 
-只有默认/混合构建需要从源码生成 `ocr-rs`/MNN 绑定，并按该依赖的要求安装 `libclang`；这是 MNN 构建条件，不是 OpenVINO IR 运行条件。OpenVINO-only 运行机只需要 OpenVINO runtime、对应 IR/BIN、字符集和本项目二进制，不需要 PaddleOCR、Python、MNN 模型或 Rust 工具链。
+只有默认/混合构建需要从源码生成 `ocr-rs`/MNN 绑定，并按该依赖的要求安装 `libclang`；这是 MNN 构建条件，不是 OpenVINO IR 运行条件。OpenVINO 依赖包只提供 runtime、对应 IR/BIN、字符集和配置示例，运行时仍使用普通通用 EXE，不需要在目标机安装 PaddleOCR、Python 或 Rust 工具链。
 
 运行机器还需要安装 Microsoft Visual C++ Redistributable 2015-2022 x64，因为官方 MNN 动态库依赖 `MSVCP140.dll`、`VCRUNTIME140.dll` 和 `VCRUNTIME140_1.dll`
 

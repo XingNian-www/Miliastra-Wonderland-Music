@@ -23,7 +23,7 @@
 | [DeepSeek 海龟汤稳定性评测](research/deepseek-turtle-soup-evaluation.md) | 553 次真实请求如何筛选提示词、思考模式和最大输出 Token。 |
 | [二级聊天监听](secondary-chat-listener.md) | 二级界面如何监听大厅和好友私聊，红点、气泡、恢复与回退如何协作。 |
 | [OCR 与 UI 检测](ocr-ui-detection-flow.md) | 主扫描循环、聊天切块、OCR、模板匹配和耗时日志如何工作。 |
-| [OpenVINO OCR 模型调研](research/openvino-ocr-models.md) | OpenVINO-only 模型契约、IR 转换、运行库和发布配置。 |
+| [OpenVINO OCR 模型调研](research/openvino-ocr-models.md) | OpenVINO 模型契约、IR 转换、运行库依赖包和发布配置。 |
 | [UI 自动化与原子动作](ui-automation-atoms.md) | 点击、按键、粘贴、模板等待、OCR 点击和像素稳定如何组合。 |
 | [自定义工作流、邀请与管理流程](custom-workflow-moderation-flow.md) | 自定义流程、好友发言、邀请确认、拉黑/屏蔽投票如何执行。 |
 

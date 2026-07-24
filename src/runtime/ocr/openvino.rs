@@ -6,7 +6,7 @@ use image::{DynamicImage, GenericImageView, GrayImage};
 use imageproc::contours::{Contour, find_contours};
 use imageproc::point::Point;
 use imageproc::rect::Rect as ImageRect;
-use openvino::{CompiledModel, Core, DeviceType, ElementType, Shape, Tensor};
+use openvino::{CompiledModel, Core, DeviceType, ElementType, RwPropertyKey, Shape, Tensor};
 
 use super::{OcrLine, ResolvedOcrArgs, compare_rect_top_left, normalize_ocr_text};
 use crate::ui::geometry::Rect;
@@ -81,25 +81,21 @@ impl OpenVinoEngine {
 
         let mut core = Core::new().map_err(|error| {
             anyhow!(
-                "初始化 OpenVINO Core 失败: {error:#}; 请安装 OpenVINO >= 2025.1，\
+                "OpenVINO 运行时依赖不可用，初始化 Core 失败: {error:#}; 请安装 OpenVINO >= 2025.1，\
                  并把 runtime/bin/intel64/Release 与 runtime/3rdparty/tbb/bin 加入 PATH，\
-                 或设置 OPENVINO_INSTALL_DIR 以定位主 DLL"
+                 或设置 OPENVINO_INSTALL_DIR 以定位主 DLL；当前后端会按配置继续尝试下一个 fallback"
             )
         })?;
+        let device = device_type(&config.device);
+        configure_cache(&mut core, &device, config.cache_dir.as_deref());
         let det_ir = core
             .read_model_from_file(path_string(det_model)?, path_string(det_weights)?)
             .with_context(|| format!("读取 OpenVINO 检测模型失败: {}", det_model.display()))?;
         let rec_ir = core
             .read_model_from_file(path_string(rec_model)?, path_string(rec_weights)?)
             .with_context(|| format!("读取 OpenVINO 识别模型失败: {}", rec_model.display()))?;
-        let detector =
-            OpenVinoModel::compile(&mut core, &det_ir, device_type(&config.device), "detector")?;
-        let recognizer = OpenVinoModel::compile(
-            &mut core,
-            &rec_ir,
-            device_type(&config.device),
-            "recognizer",
-        )?;
+        let detector = OpenVinoModel::compile(&mut core, &det_ir, device.to_owned(), "detector")?;
+        let recognizer = OpenVinoModel::compile(&mut core, &rec_ir, device, "recognizer")?;
 
         let charset = load_charset(&args.charset)?;
         let mut engine = Self {
@@ -776,6 +772,40 @@ fn device_type(value: &str) -> DeviceType<'static> {
     DeviceType::from(value.trim().to_ascii_uppercase().as_str()).to_owned()
 }
 
+fn configure_cache(core: &mut Core, device: &DeviceType<'static>, cache_dir: Option<&Path>) {
+    let Some(cache_dir) = cache_dir else {
+        return;
+    };
+    if let Err(error) = std::fs::create_dir_all(cache_dir) {
+        log::warn!(
+            "创建 OpenVINO 缓存目录失败，继续无持久化缓存: {} error={error:#}",
+            cache_dir.display()
+        );
+        return;
+    }
+    let cache_path = cache_dir.to_string_lossy();
+    if let Err(error) = core.set_properties(
+        device,
+        [
+            (RwPropertyKey::CacheDir, cache_path.as_ref()),
+            // Larger cache blobs avoid recompiling GPU kernels on the next launch.
+            (RwPropertyKey::CacheMode, "OPTIMIZE_SPEED"),
+        ],
+    ) {
+        log::warn!(
+            "配置 OpenVINO 持久化缓存失败，继续无持久化缓存: device={} dir={} error={error:#}",
+            device,
+            cache_dir.display()
+        );
+    } else {
+        log::info!(
+            "已启用 OpenVINO 持久化缓存: device={} dir={}",
+            device,
+            cache_dir.display()
+        );
+    }
+}
+
 fn load_charset(path: &Path) -> Result<Vec<char>> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("读取 OCR 字符集失败: {}", path.display()))?;
@@ -822,6 +852,7 @@ mod tests {
                 rec_model: Some(model_root.join("PP-OCRv6_small_rec.xml")),
                 rec_weights: Some(model_root.join("PP-OCRv6_small_rec.bin")),
                 device: "CPU".to_string(),
+                cache_dir: None,
             },
             det_max_side_len: 960,
             det_score_threshold: 0.3,

@@ -87,10 +87,12 @@ miliastra-wonderland-music-openvino-windows-x64/
 │   └── 3rdparty/tbb/bin/*.dll
 ├── OPENVINO-LICENSE.txt
 ├── OPENVINO-THIRD-PARTY-NOTICES.txt
-└── TBB-LICENSE.txt
+├── TBB-LICENSE.txt
+├── vcruntime140.dll / msvcp140*.dll
+└── VC-REDIST-NOTICE.txt
 ```
 
-推送到 `main` 或 `dev` 会上传 OpenVINO-only artifact；手动执行时可以选择创建 GitHub Release，版本变更推送会自动创建带 `-openvino` 后缀的 Release 标签。该包仍需要 Windows x64 的 Microsoft Visual C++ Redistributable 2015-2022。
+推送到 `main` 或 `dev` 会上传 OpenVINO-only artifact；手动执行时可以选择创建 GitHub Release，版本变更推送会自动创建带 `-openvino` 后缀的 Release 标签。工作流还会从 Windows runner 自动复制 x64 MSVC CRT DLL，因此不要求目标机预装 Microsoft Visual C++ Redistributable；Windows 自带的 UCRT 等系统组件仍由操作系统提供。
 
 ## 本地构建
 

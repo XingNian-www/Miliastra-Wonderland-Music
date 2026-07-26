@@ -368,10 +368,6 @@ impl PlaybackApplication {
             }
             PlaybackCommand::Queue => {
                 port.log_executed(context, "queue list")?;
-                self.reply_queue(port)?;
-            }
-            PlaybackCommand::QueueFull => {
-                port.log_executed(context, "queue list full")?;
                 self.reply_full_queue(port)?;
             }
             PlaybackCommand::QueueDelete(indexes) => {
@@ -405,26 +401,6 @@ impl PlaybackApplication {
             }
         }
         Ok(())
-    }
-
-    fn reply_queue<P: PlaybackCommandPort + ?Sized>(&self, port: &mut P) -> Result<()> {
-        let queue = port.playback_queue()?;
-        if queue.is_empty() {
-            port.reply("队列为空")
-        } else {
-            let entries = queue
-                .iter()
-                .enumerate()
-                .map(|(index, item)| format!("{}.{}", index + 1, item.keyword))
-                .collect::<Vec<_>>()
-                .join(", ");
-            port.reply(&format!(
-                "队列({}/{}): {}",
-                queue.len(),
-                self.config.queue_max_size,
-                entries
-            ))
-        }
     }
 
     fn reply_full_queue<P: PlaybackCommandPort + ?Sized>(&self, port: &mut P) -> Result<()> {
@@ -1626,11 +1602,11 @@ mod tests {
         let context = PlaybackCommandContext {
             message_type: "blue".to_string(),
             username: "tester".to_string(),
-            user_command: "@完整队列".to_string(),
+            user_command: "@队列".to_string(),
         };
 
         application
-            .execute_command(&context, &PlaybackCommand::QueueFull, &mut port)
+            .execute_command(&context, &PlaybackCommand::Queue, &mut port)
             .expect("full queue command");
 
         assert!(port.replies.is_empty());

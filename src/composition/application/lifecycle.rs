@@ -18,6 +18,9 @@ impl ApplicationRuntime {
         let playback_monitor = self.start_playback_monitor();
         let result = self.run_scan_loop();
         self.running.store(false, AtomicOrdering::SeqCst);
+        if let Err(error) = self.background_commands.stop_all() {
+            log::error!("后台命令线程关闭失败: {error:#}");
+        }
         if let Some(hotkeys) = self.hotkeys.take()
             && let Err(error) = hotkeys.shutdown()
         {

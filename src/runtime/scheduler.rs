@@ -130,6 +130,7 @@ pub(crate) struct FormalSchedulerSnapshot {
     pending_labels: Vec<String>,
     tasks: Vec<FormalTaskSnapshot>,
     active_lane: Option<SchedulerLane>,
+    formal_epoch: u64,
     active_playback_related: bool,
     pending_playback_related: bool,
     pending_diagnostic: bool,
@@ -146,6 +147,14 @@ impl FormalSchedulerSnapshot {
 
     pub(crate) const fn is_busy(&self) -> bool {
         self.active_lane.is_some()
+    }
+
+    pub(crate) const fn formal_epoch(&self) -> u64 {
+        self.formal_epoch
+    }
+
+    pub(crate) const fn formal_busy(&self) -> bool {
+        matches!(self.active_lane, Some(SchedulerLane::Formal)) || !self.pending_labels.is_empty()
     }
 
     pub(crate) const fn is_idle(&self) -> bool {
@@ -264,6 +273,7 @@ impl std::fmt::Display for FormalSchedulerError {
 pub(crate) struct FormalScheduler {
     next_id: u64,
     next_lane_lease_id: u64,
+    formal_epoch: u64,
     queued: VecDeque<QueuedFormalTask>,
     active: Option<ActiveSchedulerWork>,
     records: VecDeque<FormalTaskRecord>,
@@ -276,6 +286,7 @@ impl FormalScheduler {
         Self {
             next_id: 1,
             next_lane_lease_id: 1,
+            formal_epoch: 0,
             queued: VecDeque::new(),
             active: None,
             records: VecDeque::new(),
@@ -416,6 +427,7 @@ impl FormalScheduler {
 
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1).max(1);
+        self.formal_epoch = self.formal_epoch.wrapping_add(1).max(1);
         let label = submission.label;
         self.queued.push_back(QueuedFormalTask {
             id,
@@ -455,6 +467,7 @@ impl FormalScheduler {
                 ActiveSchedulerWork::External(lease) => lease.lane,
                 ActiveSchedulerWork::Diagnostic { .. } => SchedulerLane::Diagnostic,
             }),
+            formal_epoch: self.formal_epoch,
             active_playback_related: matches!(
                 self.active.as_ref(),
                 Some(&ActiveSchedulerWork::Formal {

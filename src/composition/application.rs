@@ -364,6 +364,7 @@ pub(crate) struct ApplicationRuntime {
     business_runtime: Option<BusinessRuntimeGroup>,
     formal_task_execution: Option<FormalTaskExecutionRuntime>,
     formal_tasks: Option<FormalTaskClient>,
+    background_commands: workers::BackgroundCommandManager,
     player: PlayerController<PlayerRuntimeBackend, BusinessPlaybackStateAdapter>,
     playback_application: PlaybackApplication,
     player_search: PlayerSearchClient,
@@ -721,6 +722,8 @@ fn enqueue_current_hall_reply(business: &BusinessRuntimeHandle, text: &str) -> R
     match business.enqueue_deferred_chat(DeferredChatMessage {
         text: text.to_string(),
         target: DeferredChatTarget::CurrentHall,
+        background_key: None,
+        formal_epoch: None,
     })? {
         EnqueueOutcome::Added => {}
         EnqueueOutcome::DroppedMessage => {
@@ -1033,6 +1036,7 @@ impl ApplicationRuntime {
             business_runtime: Some(business_runtime),
             formal_task_execution: None,
             formal_tasks: None,
+            background_commands: workers::BackgroundCommandManager::new(),
             player,
             playback_application,
             player_search,

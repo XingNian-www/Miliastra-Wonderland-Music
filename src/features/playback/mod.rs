@@ -235,7 +235,6 @@ pub(crate) enum PlaybackCommand {
     BackgroundLyrics,
     StopBackgroundLyrics,
     Queue,
-    QueueFull,
     QueueDelete(Vec<usize>),
     QueueClear,
 }
@@ -316,8 +315,6 @@ impl PlaybackCommand {
             ("后台歌词", false),
             ("持续歌词", false),
             ("歌词", true),
-            ("完整队列", false),
-            ("完整列表", false),
             ("队列", false),
             ("列表", false),
         ] {
@@ -337,7 +334,6 @@ impl PlaybackCommand {
                 "持续歌词" => Self::ContinuousLyrics,
                 "歌词" if argument.is_empty() => Self::Lyrics,
                 "歌词" => Self::LyricsFor(parse_lyrics_duration(argument)?),
-                "完整队列" | "完整列表" => Self::QueueFull,
                 "队列" | "列表" => Self::Queue,
                 "队列删除" => Self::QueueDelete(parse_queue_indexes(argument)),
                 "队列清空" => Self::QueueClear,
@@ -366,7 +362,6 @@ impl PlaybackCommand {
             Self::BackgroundLyrics => "lyrics_background".to_string(),
             Self::StopBackgroundLyrics => "lyrics_background_stop".to_string(),
             Self::Queue => "queue".to_string(),
-            Self::QueueFull => "queue_full".to_string(),
             Self::QueueDelete(indexes) => format!(
                 "queue_delete:{}",
                 indexes
@@ -407,8 +402,6 @@ const PLAYBACK_COMMAND_PREFIXES: &[&str] = &[
     "后台歌词",
     "持续歌词",
     "歌词",
-    "完整队列",
-    "完整列表",
     "队列",
     "列表",
 ];
@@ -784,17 +777,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn full_queue_aliases_parse_as_a_distinct_command() {
-        for text in ["完整队列", "完整列表"] {
-            let parsed = PlaybackCommand::parse_hall(text).expect("full queue command");
-            assert_eq!(parsed.command, PlaybackCommand::QueueFull);
+    fn queue_aliases_parse_as_the_full_queue_command() {
+        for text in ["队列", "列表"] {
+            let parsed = PlaybackCommand::parse_hall(text).expect("queue command");
+            assert_eq!(parsed.command, PlaybackCommand::Queue);
             assert_eq!(parsed.argument, "");
         }
-
-        assert_ne!(
-            PlaybackCommand::Queue.lock_key(),
-            PlaybackCommand::QueueFull.lock_key()
-        );
+        assert_eq!(PlaybackCommand::parse_hall("完整队列"), None);
+        assert_eq!(PlaybackCommand::parse_hall("完整列表"), None);
     }
 
     #[test]

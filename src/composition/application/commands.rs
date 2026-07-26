@@ -77,6 +77,8 @@ impl IdiomChainDeferredPort for DeferredIdiomChainPort {
             match self.business.enqueue_deferred_chat(DeferredChatMessage {
                 text: message,
                 target,
+                background_key: None,
+                formal_epoch: None,
             })? {
                 EnqueueOutcome::Added => IdiomDeliveryOutcome::Added,
                 EnqueueOutcome::DroppedMessage => IdiomDeliveryOutcome::DroppedEarlierMessage,

@@ -1,9 +1,202 @@
 use super::*;
+use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use crate::features::playback::{
-    PlaybackMonitorPort, PlaybackWorkload, QueueAdvanceContext, QueueAdvanceDecision,
+    LyricTracker, PlaybackMonitorPort, PlaybackWorkload, QueueAdvanceContext, QueueAdvanceDecision,
 };
+
+pub(super) struct BackgroundCommandManager {
+    inner: Arc<BackgroundCommandManagerInner>,
+}
+
+struct BackgroundCommandManagerInner {
+    state: Mutex<HashMap<String, BackgroundCommandState>>,
+}
+
+struct BackgroundCommandState {
+    stop: Arc<AtomicBool>,
+    worker: thread::JoinHandle<()>,
+}
+
+impl BackgroundCommandManager {
+    pub(super) fn new() -> Self {
+        Self {
+            inner: Arc::new(BackgroundCommandManagerInner {
+                state: Mutex::new(HashMap::new()),
+            }),
+        }
+    }
+
+    pub(super) fn start<F>(&self, name: &str, worker: F) -> Result<bool>
+    where
+        F: FnOnce(Arc<AtomicBool>) + Send + 'static,
+    {
+        {
+            let state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| anyhow!("后台命令状态锁已损坏"))?;
+            if state.contains_key(name) {
+                return Ok(false);
+            }
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let thread_name = format!("background-command-{name}");
+        let worker = thread::Builder::new()
+            .name(thread_name)
+            .spawn(move || worker(thread_stop))
+            .map_err(|error| anyhow!("启动后台命令线程失败: {error}"))?;
+
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| anyhow!("后台命令状态锁已损坏"))?;
+        if state.contains_key(name) {
+            stop.store(true, AtomicOrdering::SeqCst);
+            drop(state);
+            let _ = worker.join();
+            return Ok(false);
+        }
+        state.insert(name.to_string(), BackgroundCommandState { stop, worker });
+        log::info!("后台命令已启动: {name}");
+        Ok(true)
+    }
+
+    pub(super) fn stop(&self, name: &str) -> Result<bool> {
+        let Some(command) = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| anyhow!("后台命令状态锁已损坏"))?
+            .remove(name)
+        else {
+            return Ok(false);
+        };
+        command.stop.store(true, AtomicOrdering::SeqCst);
+        command
+            .worker
+            .join()
+            .map_err(|_| anyhow!("后台命令线程 panic: {name}"))?;
+        log::info!("后台命令已停止: {name}");
+        Ok(true)
+    }
+
+    pub(super) fn stop_all(&self) -> Result<()> {
+        let commands = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| anyhow!("后台命令状态锁已损坏"))?
+            .drain()
+            .collect::<Vec<_>>();
+        let mut first_error = None;
+        for (name, command) in commands {
+            command.stop.store(true, AtomicOrdering::SeqCst);
+            if command.worker.join().is_err() && first_error.is_none() {
+                first_error = Some(anyhow!("后台命令线程 panic: {name}"));
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+}
+
+impl Clone for BackgroundCommandManager {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl Drop for BackgroundCommandManagerInner {
+    fn drop(&mut self) {
+        let state = match self.state.get_mut() {
+            Ok(state) => state,
+            Err(error) => {
+                log::error!("后台命令状态锁已损坏，仍尝试关闭后台线程");
+                error.into_inner()
+            }
+        };
+        for (name, command) in state.drain() {
+            command.stop.store(true, AtomicOrdering::SeqCst);
+            if command.worker.join().is_err() {
+                log::error!("后台命令线程关闭时 panic: {name}");
+            }
+        }
+    }
+}
+
+pub(super) fn start_background_lyrics(
+    manager: &BackgroundCommandManager,
+    player: PlayerController<PlayerRuntimeBackend, BusinessPlaybackStateAdapter>,
+    business: BusinessRuntimeHandle,
+    running: Arc<AtomicBool>,
+    poll: Duration,
+) -> Result<bool> {
+    manager.start("lyrics", move |stop| {
+        run_background_lyrics(player, business, running, stop, poll);
+    })
+}
+
+fn run_background_lyrics(
+    player: PlayerController<PlayerRuntimeBackend, BusinessPlaybackStateAdapter>,
+    business: BusinessRuntimeHandle,
+    running: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    poll: Duration,
+) {
+    let poll = poll.max(Duration::from_millis(1));
+    let mut lyric_tracker = LyricTracker::default();
+
+    while running.load(AtomicOrdering::SeqCst) && !stop.load(AtomicOrdering::SeqCst) {
+        let scheduler = match business.scheduler_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                log::warn!("后台歌词查询正式任务状态失败，暂缓发送: {error}");
+                sleep(poll);
+                continue;
+            }
+        };
+        if scheduler.formal_busy() {
+            sleep(poll);
+            continue;
+        }
+
+        match player.status() {
+            Ok(status) => {
+                if lyric_tracker.observe(&status) {
+                    let message = DeferredChatMessage {
+                        text: crate::features::playback::format_lyrics(&status),
+                        target: DeferredChatTarget::CurrentHall,
+                        background_key: Some("lyrics".to_string()),
+                        formal_epoch: Some(scheduler.formal_epoch()),
+                    };
+                    match business.enqueue_deferred_chat(message) {
+                        Ok(EnqueueOutcome::Added) => {}
+                        Ok(EnqueueOutcome::DroppedMessage) => {
+                            log::debug!("后台歌词输出淘汰了一条较早的普通回复");
+                        }
+                        Ok(EnqueueOutcome::Rejected) => {
+                            log::debug!("后台歌词输出因延迟回复队列受保护而跳过");
+                        }
+                        Err(error) => {
+                            log::warn!("后台歌词输出入队失败: {error}");
+                        }
+                    }
+                }
+            }
+            Err(error) => log::debug!("后台歌词读取播放器状态失败: {error:#}"),
+        }
+
+        sleep(poll);
+    }
+    log::info!("后台歌词监听线程已退出");
+}
 
 struct FormalTaskDispatcher {
     business: BusinessRuntimeHandle,
@@ -136,6 +329,29 @@ impl DeferredChatSender {
                 let _ = self.business.requeue_deferred_chat_front(item)?;
                 sleep(retry_delay);
                 continue;
+            }
+
+            if let DeferredChatItem::Message(message) = &item
+                && let Some(epoch) = message.formal_epoch
+            {
+                match self.business.scheduler_snapshot() {
+                    Ok(snapshot) if snapshot.formal_busy() || snapshot.formal_epoch() != epoch => {
+                        log::debug!("后台歌词已跨越正式任务，丢弃过期输出");
+                        drop(sending);
+                        continue;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        log::warn!("后台歌词校验正式任务代际失败，暂缓发送: {error}");
+                        drop(sending);
+                        if let Err(requeue_error) = self.business.requeue_deferred_chat_front(item)
+                        {
+                            log::warn!("后台歌词重新入队失败: {requeue_error}");
+                        }
+                        sleep(retry_delay);
+                        continue;
+                    }
+                }
             }
 
             if let DeferredChatItem::Batch(batch) = &item
@@ -366,6 +582,7 @@ impl ApplicationRuntime {
             business_runtime: None,
             formal_task_execution: None,
             formal_tasks: self.formal_tasks.clone(),
+            background_commands: self.background_commands.clone(),
             player: self.player.clone(),
             playback_application: self.playback_application.clone(),
             player_search: self.player_search.clone(),

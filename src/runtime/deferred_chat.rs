@@ -27,6 +27,8 @@ pub(crate) enum DeferredChatTarget {
 pub(crate) struct DeferredChatMessage {
     pub(crate) text: String,
     pub(crate) target: DeferredChatTarget,
+    pub(crate) background_key: Option<String>,
+    pub(crate) formal_epoch: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -121,6 +123,17 @@ impl DeferredChatItem {
         matches!(self, Self::Batch(batch) if batch.protected)
     }
 
+    fn background_key(&self) -> Option<&str> {
+        match self {
+            Self::Message(message) => message.background_key.as_deref(),
+            Self::Batch(_) => None,
+        }
+    }
+
+    fn is_background_message(&self) -> bool {
+        self.background_key().is_some()
+    }
+
     fn critical(&self) -> bool {
         matches!(self, Self::Batch(batch) if matches!(
             batch.turtle_soup.purpose,
@@ -160,9 +173,18 @@ impl DeferredChatQueue {
 
     pub(crate) fn enqueue(&mut self, item: impl Into<DeferredChatItem>) -> Result<EnqueueOutcome> {
         let item = item.into();
+        if let Some(background_key) = item.background_key() {
+            self.queue
+                .retain(|queued| queued.background_key() != Some(background_key));
+            if self.queue.len() >= self.capacity {
+                return Ok(EnqueueOutcome::Rejected);
+            }
+            self.queue.push_back(item);
+            return Ok(EnqueueOutcome::Added);
+        }
         let outcome = make_room_for_enqueue(&mut self.queue, self.capacity, item.critical())?;
         if outcome != EnqueueOutcome::Rejected {
-            self.queue.push_back(item);
+            self.push_normal_with_background_priority(item);
         }
         Ok(outcome)
     }
@@ -198,6 +220,30 @@ impl DeferredChatQueue {
 
     pub(crate) fn take_next(&mut self) -> Option<DeferredChatItem> {
         self.queue.pop_front()
+    }
+
+    fn push_normal_with_background_priority(&mut self, item: DeferredChatItem) {
+        if !self
+            .queue
+            .iter()
+            .any(DeferredChatItem::is_background_message)
+        {
+            self.queue.push_back(item);
+            return;
+        }
+
+        let mut prioritized = VecDeque::with_capacity(self.queue.len() + 1);
+        let mut background = VecDeque::new();
+        while let Some(queued) = self.queue.pop_front() {
+            if queued.is_background_message() {
+                background.push_back(queued);
+            } else {
+                prioritized.push_back(queued);
+            }
+        }
+        prioritized.push_back(item);
+        prioritized.extend(background);
+        self.queue = prioritized;
     }
 
     fn enqueue_turtle_soup(
@@ -245,11 +291,15 @@ fn make_room_for_enqueue(
     if queue.len() < capacity {
         return Ok(EnqueueOutcome::Added);
     }
-    let index = queue.iter().position(|item| !item.protected()).or_else(|| {
-        incoming_critical
-            .then(|| queue.iter().position(|item| !item.critical()))
-            .flatten()
-    });
+    let index = queue
+        .iter()
+        .position(DeferredChatItem::is_background_message)
+        .or_else(|| queue.iter().position(|item| !item.protected()))
+        .or_else(|| {
+            incoming_critical
+                .then(|| queue.iter().position(|item| !item.critical()))
+                .flatten()
+        });
     let Some(index) = index else {
         return Ok(EnqueueOutcome::Rejected);
     };
@@ -291,11 +341,22 @@ mod tests {
         DeferredChatMessage {
             text: text.to_string(),
             target: DeferredChatTarget::Primary,
+            background_key: None,
+            formal_epoch: None,
         }
     }
 
     fn item(text: &str) -> DeferredChatItem {
         message(text).into()
+    }
+
+    fn background_message(text: &str, epoch: u64) -> DeferredChatMessage {
+        DeferredChatMessage {
+            text: text.to_string(),
+            target: DeferredChatTarget::CurrentHall,
+            background_key: Some("lyrics".to_string()),
+            formal_epoch: Some(epoch),
+        }
     }
 
     fn batch(purpose: TurtleSoupDeliveryPurpose, text: &str) -> DeferredChatBatch {
@@ -351,6 +412,56 @@ mod tests {
     }
 
     #[test]
+    fn background_lyrics_are_coalesced_and_never_evict_normal_replies() {
+        let mut queue = DeferredChatQueue::new(3);
+        queue.enqueue(message("normal-1")).unwrap();
+        queue.enqueue(background_message("lyric-1", 1)).unwrap();
+        queue.enqueue(message("normal-2")).unwrap();
+
+        assert_eq!(
+            queue.enqueue(background_message("lyric-2", 1)).unwrap(),
+            EnqueueOutcome::Added
+        );
+        assert_eq!(queue.take_next(), Some(item("normal-1")));
+        assert_eq!(queue.take_next(), Some(item("normal-2")));
+        assert_eq!(
+            queue.take_next(),
+            Some(background_message("lyric-2", 1).into())
+        );
+
+        let mut full = DeferredChatQueue::new(2);
+        full.enqueue(message("normal-1")).unwrap();
+        full.enqueue(message("normal-2")).unwrap();
+        assert_eq!(
+            full.enqueue(background_message("lyric", 1)).unwrap(),
+            EnqueueOutcome::Rejected
+        );
+        assert_eq!(full.take_next(), Some(item("normal-1")));
+        assert_eq!(full.take_next(), Some(item("normal-2")));
+
+        let mut mixed = DeferredChatQueue::new(2);
+        mixed.enqueue(background_message("old lyric", 1)).unwrap();
+        mixed.enqueue(message("normal-1")).unwrap();
+        assert_eq!(
+            mixed.enqueue(message("normal-2")).unwrap(),
+            EnqueueOutcome::DroppedMessage
+        );
+        assert_eq!(mixed.take_next(), Some(item("normal-1")));
+        assert_eq!(mixed.take_next(), Some(item("normal-2")));
+
+        let mut ordered = DeferredChatQueue::new(4);
+        ordered.enqueue(background_message("lyric", 1)).unwrap();
+        ordered.enqueue(message("normal-1")).unwrap();
+        ordered.enqueue(message("normal-2")).unwrap();
+        assert_eq!(ordered.take_next(), Some(item("normal-1")));
+        assert_eq!(ordered.take_next(), Some(item("normal-2")));
+        assert_eq!(
+            ordered.take_next(),
+            Some(background_message("lyric", 1).into())
+        );
+    }
+
+    #[test]
     fn requeue_direction_preserves_retry_priority_or_yields_to_an_active_target() {
         let mut queue = DeferredChatQueue::new(3);
         queue.enqueue(message("later")).unwrap();
@@ -361,6 +472,8 @@ mod tests {
         let secondary = DeferredChatMessage {
             text: "secondary".to_string(),
             target: DeferredChatTarget::SecondaryCurrentHall,
+            background_key: None,
+            formal_epoch: None,
         };
         queue.enqueue(secondary.clone()).unwrap();
         queue.enqueue(message("primary")).unwrap();

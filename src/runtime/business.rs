@@ -4934,6 +4934,8 @@ mod tests {
             .enqueue_deferred_chat(DeferredChatMessage {
                 text: "deferred".to_string(),
                 target: DeferredChatTarget::Primary,
+                background_key: None,
+                formal_epoch: None,
             })
             .unwrap();
         handle

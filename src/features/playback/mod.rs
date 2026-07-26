@@ -231,6 +231,9 @@ pub(crate) enum PlaybackCommand {
     Status,
     Lyrics,
     LyricsFor(u8),
+    ContinuousLyrics,
+    BackgroundLyrics,
+    StopBackgroundLyrics,
     Queue,
     QueueFull,
     QueueDelete(Vec<usize>),
@@ -309,6 +312,9 @@ impl PlaybackCommand {
             ("播放", false),
             ("音量", true),
             ("状态", false),
+            ("停止歌词", false),
+            ("后台歌词", false),
+            ("持续歌词", false),
             ("歌词", true),
             ("完整队列", false),
             ("完整列表", false),
@@ -326,6 +332,9 @@ impl PlaybackCommand {
                 "上一首" | "上一曲" => Self::Previous,
                 "音量" => Self::Volume(argument.to_string()),
                 "状态" => Self::Status,
+                "停止歌词" => Self::StopBackgroundLyrics,
+                "后台歌词" => Self::BackgroundLyrics,
+                "持续歌词" => Self::ContinuousLyrics,
                 "歌词" if argument.is_empty() => Self::Lyrics,
                 "歌词" => Self::LyricsFor(parse_lyrics_duration(argument)?),
                 "完整队列" | "完整列表" => Self::QueueFull,
@@ -353,6 +362,9 @@ impl PlaybackCommand {
             Self::Status => "status".to_string(),
             Self::Lyrics => "lyrics".to_string(),
             Self::LyricsFor(_) => "lyrics_for".to_string(),
+            Self::ContinuousLyrics => "lyrics_continuous".to_string(),
+            Self::BackgroundLyrics => "lyrics_background".to_string(),
+            Self::StopBackgroundLyrics => "lyrics_background_stop".to_string(),
             Self::Queue => "queue".to_string(),
             Self::QueueFull => "queue_full".to_string(),
             Self::QueueDelete(indexes) => format!(
@@ -391,6 +403,9 @@ const PLAYBACK_COMMAND_PREFIXES: &[&str] = &[
     "播放",
     "音量",
     "状态",
+    "停止歌词",
+    "后台歌词",
+    "持续歌词",
     "歌词",
     "完整队列",
     "完整列表",
@@ -816,10 +831,47 @@ mod tests {
         assert!(!PlaybackCommand::Lyrics.same_request(&PlaybackCommand::LyricsFor(5)));
         assert!(PlaybackCommand::LyricsFor(5).same_request(&PlaybackCommand::LyricsFor(30)));
     }
+
+    #[test]
+    fn continuous_lyrics_has_a_dedicated_command_and_lock() {
+        let parsed = PlaybackCommand::parse_hall("持续歌词").expect("continuous lyrics command");
+        assert_eq!(parsed.command, PlaybackCommand::ContinuousLyrics);
+        assert_eq!(parsed.argument, "");
+        assert_eq!(parsed.matched, "持续歌词");
+        assert_eq!(
+            PlaybackCommand::ContinuousLyrics.lock_key(),
+            "lyrics_continuous"
+        );
+        assert_ne!(
+            PlaybackCommand::ContinuousLyrics.lock_key(),
+            PlaybackCommand::LyricsFor(30).lock_key()
+        );
+        assert_eq!(PlaybackCommand::parse_hall("持续歌词 1"), None);
+    }
+
+    #[test]
+    fn background_lyrics_commands_have_distinct_lifecycle_locks() {
+        assert_eq!(
+            PlaybackCommand::parse_hall("后台歌词")
+                .expect("background lyrics command")
+                .command,
+            PlaybackCommand::BackgroundLyrics
+        );
+        assert_eq!(
+            PlaybackCommand::parse_hall("停止歌词")
+                .expect("stop background lyrics command")
+                .command,
+            PlaybackCommand::StopBackgroundLyrics
+        );
+        assert_ne!(
+            PlaybackCommand::BackgroundLyrics.lock_key(),
+            PlaybackCommand::StopBackgroundLyrics.lock_key()
+        );
+    }
 }
 
 pub(crate) use application::{
-    PlaybackApplication, PlaybackApplicationConfig, PlaybackCommandContext, PlaybackCommandPort,
-    PlaybackDecision, PlaybackExecutionPort, PlaybackMonitorPort, PlaybackPickedCandidate,
-    PlaybackSearchFailure, PlaybackSelection, PlaybackWorkload,
+    LyricTracker, PlaybackApplication, PlaybackApplicationConfig, PlaybackCommandContext,
+    PlaybackCommandPort, PlaybackDecision, PlaybackExecutionPort, PlaybackMonitorPort,
+    PlaybackPickedCandidate, PlaybackSearchFailure, PlaybackSelection, PlaybackWorkload,
 };

@@ -279,6 +279,32 @@ impl PlaybackCommandPort for ApplicationRuntime {
             .map_err(anyhow::Error::from)
     }
 
+    fn should_stop_continuous_lyrics(&mut self) -> Result<bool> {
+        if !self.running.load(AtomicOrdering::SeqCst) {
+            return Ok(true);
+        }
+        Ok(!self
+            .business
+            .scheduler_snapshot()
+            .map_err(anyhow::Error::from)?
+            .pending_labels()
+            .is_empty())
+    }
+
+    fn start_background_lyrics(&mut self) -> Result<bool> {
+        workers::start_background_lyrics(
+            &self.background_commands,
+            self.player.clone(),
+            self.business.clone(),
+            self.running.clone(),
+            Duration::from_millis(self.config.timing.playback.monitor_status_ms),
+        )
+    }
+
+    fn stop_background_lyrics(&mut self) -> Result<bool> {
+        self.background_commands.stop("lyrics")
+    }
+
     fn wait(&mut self, duration: Duration) {
         sleep(duration);
     }

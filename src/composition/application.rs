@@ -34,6 +34,7 @@ use crate::features::card_games::{
 };
 #[cfg(test)]
 use crate::features::card_games::{CardGameCommandStart, LandlordConfig};
+use crate::features::chat_text::command_identity;
 use crate::features::command::{
     CommandEnvelope, CommandObservation, CommandPrefix, ModuleCommand, RoutedCommand,
 };
@@ -75,8 +76,8 @@ use crate::observation::chat::{
     PrimaryObservedMessage, ResolvedTemplateArgs, SECONDARY_TITLE_RECT, SecondaryChatIdentity,
     SecondaryChatObservation, SecondaryHallBubble, SecondaryObservedMessage,
     SecondaryRecognizedMessage, TemplateArgs, UnreadFriendHit, classify_title, count_chat_markers,
-    find_unread_friend_hits, hall_bubble_sequence_is_retained_prefix, hall_bubble_sequence_overlap,
-    hall_bubble_sequences_stable, latest_incoming_bubble_rect, latest_incoming_fingerprint,
+    find_unread_friend_hits, hall_bubble_layout_is_stable, hall_bubble_sequence_is_retained_prefix,
+    hall_bubble_sequence_overlap, latest_incoming_bubble_rect, latest_incoming_fingerprint,
     prepare_chat_scan, recognize_prepared_chat, secondary_hall_bubbles,
 };
 use crate::observation::decision::DecisionScreenLock;
@@ -1204,6 +1205,21 @@ enum SecondaryHallMessageKind {
     TurtleQuestion,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct SecondarySenderIdentity {
+    pub(super) nickname: String,
+    pub(super) remark: Option<String>,
+}
+
+impl SecondarySenderIdentity {
+    pub(super) fn effective_name(&self) -> &str {
+        self.remark
+            .as_deref()
+            .filter(|remark| !remark.trim().is_empty())
+            .unwrap_or(&self.nickname)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SecondaryHallMessageClassification {
     kind: SecondaryHallMessageKind,
@@ -1243,7 +1259,14 @@ fn classify_secondary_hall_message(
     }
 }
 
+#[cfg(test)]
 fn normalize_secondary_sender_name(value: &str) -> String {
+    parse_secondary_sender_identity(value)
+        .effective_name()
+        .to_string()
+}
+
+fn parse_secondary_sender_identity(value: &str) -> SecondarySenderIdentity {
     let value = value.trim();
     let mut rightmost_pair = None;
     for (open, close) in [('(', ')'), ('（', '）')] {
@@ -1263,10 +1286,16 @@ fn normalize_secondary_sender_name(value: &str) -> String {
     if let Some((close_index, open_index, open_len)) = rightmost_pair {
         let remark = value[open_index + open_len..close_index].trim();
         if !remark.is_empty() {
-            return remark.to_string();
+            return SecondarySenderIdentity {
+                nickname: value[..open_index].trim().to_string(),
+                remark: Some(remark.to_string()),
+            };
         }
     }
-    value.to_string()
+    SecondarySenderIdentity {
+        nickname: value.to_string(),
+        remark: None,
+    }
 }
 
 fn secondary_optional_fingerprint_changed(
@@ -1321,6 +1350,10 @@ mod tests {
 
     #[test]
     fn secondary_sender_uses_the_rightmost_parenthesized_name() {
+        let identity = parse_secondary_sender_identity("玩家(自带内容)(大厅备注)");
+        assert_eq!(identity.nickname, "玩家(自带内容)");
+        assert_eq!(identity.remark.as_deref(), Some("大厅备注"));
+        assert_eq!(identity.effective_name(), "大厅备注");
         assert_eq!(
             normalize_secondary_sender_name("玩家(自带内容)(大厅备注)"),
             "大厅备注"

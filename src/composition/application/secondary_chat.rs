@@ -1,11 +1,204 @@
 use super::*;
 
+#[derive(Clone, Debug)]
 struct SecondaryOcrMessage {
     text: String,
     sender: Option<String>,
+    sender_identity: Option<SecondarySenderIdentity>,
     kind: SecondaryHallMessageKind,
     requires_sender: bool,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SecondaryHallActorObservation {
+    nickname: String,
+    remark: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SecondaryHallCommandObservation {
+    command_key: String,
+    actor: Option<SecondaryHallActorObservation>,
+    requires_sender: bool,
+    row_from_bottom: usize,
+}
+
+impl SecondaryHallCommandObservation {
+    fn stable_with(&self, other: &Self) -> bool {
+        if self.command_key != other.command_key || self.requires_sender != other.requires_sender {
+            return false;
+        }
+        if !self.requires_sender {
+            return true;
+        }
+        if self.actor.is_none() || other.actor.is_none() {
+            return self.actor.is_none() && other.actor.is_none();
+        }
+        self.matches(other)
+    }
+
+    fn matches(&self, other: &Self) -> bool {
+        if self.command_key != other.command_key || self.requires_sender != other.requires_sender {
+            return false;
+        }
+        if !self.requires_sender {
+            return true;
+        }
+        let (Some(left), Some(right)) = (&self.actor, &other.actor) else {
+            return false;
+        };
+        let left_effective = left.remark.as_deref().unwrap_or(&left.nickname);
+        let right_effective = right.remark.as_deref().unwrap_or(&right.nickname);
+        left_effective == right_effective
+            || (left.nickname == right.nickname
+                && (left.remark.is_none() || right.remark.is_none() || left.remark == right.remark))
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct SecondaryHallCommandTracker {
+    visible: Vec<SecondaryHallCommandObservation>,
+    initialized: bool,
+    last_scan_at: Option<Instant>,
+    visible_bubble_count: usize,
+}
+
+impl SecondaryHallCommandTracker {
+    pub(super) fn reset(&mut self) {
+        self.visible.clear();
+        self.initialized = false;
+        self.last_scan_at = None;
+        self.visible_bubble_count = 0;
+    }
+
+    fn scan_due(&self, now: Instant, fallback_ms: u64) -> bool {
+        self.last_scan_at.is_none_or(|last| {
+            now.saturating_duration_since(last) >= Duration::from_millis(fallback_ms.max(1))
+        })
+    }
+
+    fn begin_scan(&mut self, now: Instant) {
+        self.last_scan_at = Some(now);
+    }
+
+    fn snapshot(messages: &[SecondaryOcrMessage]) -> Vec<SecondaryHallCommandObservation> {
+        messages
+            .iter()
+            .enumerate()
+            .filter_map(|(index, message)| {
+                secondary_hall_command_observation(message, messages.len() - 1 - index)
+            })
+            .collect()
+    }
+
+    fn snapshots_match(previous: &[SecondaryOcrMessage], current: &[SecondaryOcrMessage]) -> bool {
+        let previous = Self::snapshot(previous);
+        let current = Self::snapshot(current);
+        previous.len() == current.len()
+            && previous
+                .iter()
+                .zip(current.iter())
+                .all(|(left, right)| left.stable_with(right))
+    }
+
+    fn preview_new_indexes(&self, messages: &[SecondaryOcrMessage]) -> Vec<usize> {
+        if !self.initialized {
+            return Vec::new();
+        }
+
+        let mut matched = vec![false; self.visible.len()];
+        let mut new_indexes = Vec::new();
+        for (index, message) in messages.iter().enumerate() {
+            let Some(current) =
+                secondary_hall_command_observation(message, messages.len() - 1 - index)
+            else {
+                continue;
+            };
+            let candidate = self
+                .visible
+                .iter()
+                .enumerate()
+                .filter(|(previous_index, previous)| {
+                    !matched[*previous_index] && previous.matches(&current)
+                })
+                .min_by_key(|(_, previous)| {
+                    previous.row_from_bottom.abs_diff(current.row_from_bottom)
+                })
+                .map(|(previous_index, _)| previous_index);
+            if let Some(previous_index) = candidate {
+                matched[previous_index] = true;
+            } else {
+                new_indexes.push(index);
+            }
+        }
+        new_indexes
+    }
+
+    fn commit(&mut self, messages: &[SecondaryOcrMessage]) {
+        self.visible = Self::snapshot(messages);
+        self.initialized = true;
+        self.visible_bubble_count = messages.len();
+    }
+
+    fn should_hold_incomplete(&self, messages: &[SecondaryOcrMessage], same_layout: bool) -> bool {
+        self.initialized
+            && same_layout
+            && messages.len() == self.visible_bubble_count
+            && Self::snapshot(messages).len() < self.visible.len()
+    }
+}
+
+fn secondary_hall_command_observation(
+    message: &SecondaryOcrMessage,
+    row_from_bottom: usize,
+) -> Option<SecondaryHallCommandObservation> {
+    let command = secondary_hall_command_text(&message.text)?;
+    let command = command.trim();
+    let (prefix, payload) = if let Some(payload) = command.strip_prefix('@') {
+        ('@', payload)
+    } else if let Some(payload) = command.strip_prefix('#') {
+        ('#', payload)
+    } else if let Some(payload) = command.strip_prefix('＃') {
+        ('#', payload)
+    } else {
+        return None;
+    };
+    let command_key = format!("{prefix}:{}", command_identity(payload));
+    let actor = if message.requires_sender {
+        message
+            .sender_identity
+            .as_ref()
+            .map(|identity| SecondaryHallActorObservation {
+                nickname: command_identity(&identity.nickname),
+                remark: identity
+                    .remark
+                    .as_deref()
+                    .map(command_identity)
+                    .filter(|remark| !remark.is_empty()),
+            })
+            .or_else(|| {
+                message
+                    .sender
+                    .as_deref()
+                    .filter(|sender| !sender.trim().is_empty())
+                    .map(|sender| SecondaryHallActorObservation {
+                        nickname: command_identity(sender),
+                        remark: None,
+                    })
+            })
+    } else {
+        None
+    };
+    Some(SecondaryHallCommandObservation {
+        command_key,
+        actor,
+        requires_sender: message.requires_sender,
+        row_from_bottom,
+    })
+}
+
+type SecondaryHallCommandStability =
+    Option<(Frame, Vec<SecondaryHallBubble>, Vec<SecondaryOcrMessage>)>;
 
 impl ApplicationRuntime {
     pub(super) fn run_secondary_listener_round(
@@ -13,6 +206,7 @@ impl ApplicationRuntime {
         image: &DynamicImage,
         last_friend_bubble: &mut Option<ChangeFingerprint>,
         hall_bubble_sequence: &mut Option<Vec<SecondaryHallBubble>>,
+        hall_command_tracker: &mut SecondaryHallCommandTracker,
         last_title: &mut Option<ChangeFingerprint>,
         identity: &mut Option<SecondaryChatIdentity>,
     ) -> Result<bool> {
@@ -25,7 +219,12 @@ impl ApplicationRuntime {
                 .as_ref()
                 .is_none_or(|previous| secondary_fingerprint_changed(previous, &title_fingerprint));
         if title_changed {
-            *identity = Some(self.secondary_identity_from_frame(image)?);
+            let observed_identity = self.secondary_identity_from_frame(image)?;
+            if identity.as_ref() != Some(&observed_identity) {
+                hall_bubble_sequence.take();
+                hall_command_tracker.reset();
+            }
+            *identity = Some(observed_identity);
         }
         *last_title = Some(title_fingerprint);
 
@@ -40,7 +239,16 @@ impl ApplicationRuntime {
                 return self.queue_secondary_unread_task(hit, true);
             }
             *last_friend_bubble = latest_incoming_fingerprint(image)?;
-            *hall_bubble_sequence = Some(secondary_hall_bubbles(image)?);
+            let bubbles = secondary_hall_bubbles(image)?;
+            *hall_bubble_sequence = Some(bubbles.clone());
+            let messages = self.recognize_secondary_bubble_rects(
+                image,
+                bubbles
+                    .iter()
+                    .map(|bubble| (bubble.rect, Some(bubble.sender_rect()))),
+                "blue",
+            )?;
+            hall_command_tracker.commit(&messages);
             self.business.finish_chat_listener_initial_unread_clear()?;
             log::info!("二级监听初始未读清场完成，当前大厅已建立消息基线");
             return Ok(false);
@@ -49,15 +257,22 @@ impl ApplicationRuntime {
         match current_identity {
             SecondaryChatIdentity::CurrentHall => {
                 if state.hall_round_required {
-                    let scanned =
-                        self.scan_secondary_hall_if_changed(image, hall_bubble_sequence)?;
+                    let scanned = self.scan_secondary_hall_if_changed(
+                        image,
+                        hall_bubble_sequence,
+                        hall_command_tracker,
+                    )?;
                     self.business.finish_chat_listener_hall_round()?;
                     return Ok(scanned);
                 }
                 if let Some(hit) = find_unread_friend_hits(image).into_iter().next() {
                     return self.queue_secondary_unread_task(hit, false);
                 }
-                self.scan_secondary_hall_if_changed(image, hall_bubble_sequence)
+                self.scan_secondary_hall_if_changed(
+                    image,
+                    hall_bubble_sequence,
+                    hall_command_tracker,
+                )
             }
             SecondaryChatIdentity::Friend(name) => {
                 if title_changed {
@@ -140,68 +355,90 @@ impl ApplicationRuntime {
         &mut self,
         image: &DynamicImage,
         previous: &mut Option<Vec<SecondaryHallBubble>>,
+        tracker: &mut SecondaryHallCommandTracker,
     ) -> Result<bool> {
         let current = secondary_hall_bubbles(image)?;
-        match secondary_hall_sequence_delta(previous.as_deref(), &current) {
+        let delta = secondary_hall_sequence_delta(previous.as_deref(), &current);
+        match delta {
             SecondaryHallSequenceDelta::EstablishBaseline => {
                 self.business.clear_turtle_soup_secondary_stability()?;
+                tracker.begin_scan(Instant::now());
+                let messages = self.recognize_secondary_bubble_rects(
+                    image,
+                    current
+                        .iter()
+                        .map(|bubble| (bubble.rect, Some(bubble.sender_rect()))),
+                    "blue",
+                )?;
+                tracker.commit(&messages);
                 *previous = Some(current);
                 log::debug!("二级大厅气泡序列尚未建立，当前仅记录基线");
                 return Ok(false);
             }
             SecondaryHallSequenceDelta::RetainedPrefix => {
-                log::debug!("二级大厅当前只显示旧序列前缀，保留原基线等待完整观测");
-                return Ok(false);
+                if !tracker.scan_due(Instant::now(), self.config.timing.chat_scan.fallback_ms) {
+                    log::debug!("二级大厅当前只显示旧序列前缀，保留原基线等待完整观测");
+                    return Ok(false);
+                }
             }
             SecondaryHallSequenceDelta::NoChange => {
-                self.business.clear_turtle_soup_secondary_stability()?;
-                return Ok(false);
+                if !tracker.scan_due(Instant::now(), self.config.timing.chat_scan.fallback_ms) {
+                    self.business.clear_turtle_soup_secondary_stability()?;
+                    return Ok(false);
+                }
             }
             SecondaryHallSequenceDelta::LostOverlap | SecondaryHallSequenceDelta::NewFrom(_) => {}
         }
 
-        let Some((refreshed, refreshed_bubbles)) = self.wait_for_secondary_hall_stability()? else {
+        tracker.begin_scan(Instant::now());
+
+        let Some((refreshed, refreshed_bubbles, messages)) =
+            self.wait_for_secondary_hall_command_stability()?
+        else {
             log::debug!("二级大厅新增消息尚未稳定，保留旧基线等待下一轮");
             return Ok(false);
         };
-        let start = match secondary_hall_sequence_delta(previous.as_deref(), &refreshed_bubbles) {
-            SecondaryHallSequenceDelta::NewFrom(start) => start,
-            SecondaryHallSequenceDelta::RetainedPrefix => {
-                log::debug!("二级大厅稳定观测仍只是旧序列前缀，保留原基线");
-                return Ok(false);
-            }
-            SecondaryHallSequenceDelta::EstablishBaseline
-            | SecondaryHallSequenceDelta::LostOverlap => {
-                self.business.clear_turtle_soup_secondary_stability()?;
-                *previous = Some(refreshed_bubbles);
-                log::debug!("二级大厅气泡稳定后没有可靠重叠，已重建基线，不处理当前可见历史消息");
-                return Ok(false);
-            }
-            SecondaryHallSequenceDelta::NoChange => {
-                self.business.clear_turtle_soup_secondary_stability()?;
-                *previous = Some(refreshed_bubbles);
-                return Ok(false);
-            }
-        };
-        let new_bubbles = &refreshed_bubbles[start..];
-
-        log::info!(
-            "二级大厅检测到 {} 条结构稳定的新增气泡，按显示顺序 OCR 正文",
-            new_bubbles.len()
-        );
-        let outcome = self.process_secondary_bubble_rects(
-            &refreshed.image,
-            refreshed.captured_at,
-            new_bubbles
-                .iter()
-                .map(|bubble| (bubble.rect, Some(bubble.sender_rect()))),
-            "blue",
-            "",
-        )?;
-        if outcome.confirmation_pending {
-            log::debug!("二级大厅身份相关输入或海龟汤 OCR 尚未稳定，保留旧气泡基线等待下轮复核");
+        let same_layout = previous
+            .as_deref()
+            .is_some_and(|previous| hall_bubble_layout_is_stable(previous, &refreshed_bubbles));
+        if tracker.should_hold_incomplete(&messages, same_layout) {
+            *previous = Some(refreshed_bubbles);
+            log::debug!("二级大厅 OCR 候选数量减少但布局未变，保留命令基线等待重试");
             return Ok(false);
         }
+        let new_indexes = tracker.preview_new_indexes(&messages);
+        if new_indexes.is_empty() {
+            self.business.clear_turtle_soup_secondary_stability()?;
+            tracker.commit(&messages);
+            *previous = Some(refreshed_bubbles);
+            log::debug!("二级大厅命令形式未发现新增，已更新相对位置基线");
+            return Ok(false);
+        }
+        let new_messages = messages
+            .iter()
+            .enumerate()
+            .filter_map(|(index, message)| new_indexes.contains(&index).then_some(message.clone()))
+            .collect::<Vec<_>>();
+        log::info!(
+            "二级大厅命令形式检测到 {} 条新增候选，按相对顺序 OCR 结果处理",
+            new_messages.len()
+        );
+        let observation_frame = self.chat_observations.begin_frame(refreshed.captured_at)?;
+        let accepts_turtle_questions =
+            self.commands_enabled()? && self.business.turtle_soup_accepts_questions()?;
+        let outcome = self.process_secondary_recognized_messages(
+            observation_frame,
+            "blue",
+            "",
+            accepts_turtle_questions,
+            new_messages,
+        )?;
+        if outcome.confirmation_pending {
+            log::debug!("二级大厅身份相关输入或海龟汤 OCR 尚未稳定，保留命令形式基线等待下轮复核");
+            *previous = Some(refreshed_bubbles);
+            return Ok(false);
+        }
+        tracker.commit(&messages);
         *previous = Some(refreshed_bubbles);
         Ok(outcome.processed)
     }
@@ -485,78 +722,8 @@ impl ApplicationRuntime {
         message_type: &str,
         friend_name: &str,
     ) -> Result<SecondaryBubbleProcessOutcome> {
-        let started = Instant::now();
         let observation_frame = self.chat_observations.begin_frame(captured_at)?;
-        let ocr_started = Instant::now();
-        let commands_enabled = self.commands_enabled()?;
-        let accepts_turtle_questions = message_type == "blue"
-            && commands_enabled
-            && self.business.turtle_soup_accepts_questions()?;
-        let active_entertainment = if commands_enabled {
-            self.business.active_entertainment()?
-        } else {
-            None
-        };
-        let observes_hall = message_type == "blue";
-        let command_router = ChatCommandRouter::new(&self.custom_workflow);
-        let texts = (|| -> Result<Vec<SecondaryOcrMessage>> {
-            let mut texts = Vec::new();
-            for (rect, sender_rect) in regions {
-                let crop = crop_canvas(image, rect)?;
-                let text = self.ocr.merged_text(
-                    crop,
-                    self.config.ocr.same_line_y_tolerance,
-                    OcrPriority::ChatObservation,
-                )?;
-                let classification = if observes_hall && commands_enabled {
-                    let routed = secondary_hall_command_text(&text)
-                        .and_then(|command_text| {
-                            CommandEnvelope::new(
-                                &text,
-                                SECONDARY_HALL_FALLBACK_SENDER,
-                                "blue",
-                                command_text,
-                                CommandObservation::default(),
-                            )
-                        })
-                        .and_then(|envelope| command_router.route(&envelope, active_entertainment));
-                    classify_secondary_hall_message(
-                        &text,
-                        routed.as_ref().map(|command| &command.command),
-                        accepts_turtle_questions,
-                    )
-                } else if observes_hall {
-                    SecondaryHallMessageClassification {
-                        kind: SecondaryHallMessageKind::Ignored,
-                        requires_sender: false,
-                    }
-                } else {
-                    SecondaryHallMessageClassification {
-                        kind: SecondaryHallMessageKind::Command,
-                        requires_sender: false,
-                    }
-                };
-                let message_sender = if classification.requires_sender
-                    && let Some(sender_rect) = sender_rect
-                {
-                    let crop = crop_canvas(image, sender_rect)?;
-                    Some(normalize_secondary_sender_name(&self.ocr.merged_text(
-                        crop,
-                        self.config.ocr.same_line_y_tolerance,
-                        OcrPriority::ChatObservation,
-                    )?))
-                } else {
-                    None
-                };
-                texts.push(SecondaryOcrMessage {
-                    text,
-                    sender: message_sender,
-                    kind: classification.kind,
-                    requires_sender: classification.requires_sender,
-                });
-            }
-            Ok(texts)
-        })();
+        let texts = self.recognize_secondary_bubble_rects(image, regions, message_type);
         let texts = match texts {
             Ok(texts) => texts,
             Err(error) => {
@@ -569,6 +736,98 @@ impl ApplicationRuntime {
                 return Err(error);
             }
         };
+        let accepts_turtle_questions = message_type == "blue"
+            && self.commands_enabled()?
+            && self.business.turtle_soup_accepts_questions()?;
+        self.process_secondary_recognized_messages(
+            observation_frame,
+            message_type,
+            friend_name,
+            accepts_turtle_questions,
+            texts,
+        )
+    }
+
+    fn recognize_secondary_bubble_rects(
+        &self,
+        image: &DynamicImage,
+        regions: impl IntoIterator<Item = (Rect, Option<Rect>)>,
+        message_type: &str,
+    ) -> Result<Vec<SecondaryOcrMessage>> {
+        let started = Instant::now();
+        let ocr_started = Instant::now();
+        let commands_enabled = self.commands_enabled()?;
+        let accepts_turtle_questions = message_type == "blue"
+            && commands_enabled
+            && self.business.turtle_soup_accepts_questions()?;
+        let active_entertainment = if commands_enabled {
+            self.business.active_entertainment()?
+        } else {
+            None
+        };
+        let observes_hall = message_type == "blue";
+        let command_router = ChatCommandRouter::new(&self.custom_workflow);
+        let mut texts = Vec::new();
+        for (rect, sender_rect) in regions {
+            let crop = crop_canvas(image, rect)?;
+            let text = self.ocr.merged_text(
+                crop,
+                self.config.ocr.same_line_y_tolerance,
+                OcrPriority::ChatObservation,
+            )?;
+            let classification = if observes_hall && commands_enabled {
+                let routed = secondary_hall_command_text(&text)
+                    .and_then(|command_text| {
+                        CommandEnvelope::new(
+                            &text,
+                            SECONDARY_HALL_FALLBACK_SENDER,
+                            "blue",
+                            command_text,
+                            CommandObservation::default(),
+                        )
+                    })
+                    .and_then(|envelope| command_router.route(&envelope, active_entertainment));
+                classify_secondary_hall_message(
+                    &text,
+                    routed.as_ref().map(|command| &command.command),
+                    accepts_turtle_questions,
+                )
+            } else if observes_hall {
+                SecondaryHallMessageClassification {
+                    kind: SecondaryHallMessageKind::Ignored,
+                    requires_sender: false,
+                }
+            } else {
+                SecondaryHallMessageClassification {
+                    kind: SecondaryHallMessageKind::Command,
+                    requires_sender: false,
+                }
+            };
+            let sender_identity = if classification.requires_sender
+                && let Some(sender_rect) = sender_rect
+            {
+                let crop = crop_canvas(image, sender_rect)?;
+                let raw_sender = self.ocr.merged_text(
+                    crop,
+                    self.config.ocr.same_line_y_tolerance,
+                    OcrPriority::ChatObservation,
+                )?;
+                let identity = parse_secondary_sender_identity(&raw_sender);
+                (!identity.effective_name().trim().is_empty()).then_some(identity)
+            } else {
+                None
+            };
+            let sender = sender_identity
+                .as_ref()
+                .map(|identity| identity.effective_name().to_string());
+            texts.push(SecondaryOcrMessage {
+                text,
+                sender,
+                sender_identity,
+                kind: classification.kind,
+                requires_sender: classification.requires_sender,
+            });
+        }
         let ocr_ms = elapsed_ms(ocr_started);
         self.monitor.publish(MonitorEvent::Ocr(OcrSnapshot::new(
             texts.len(),
@@ -585,7 +844,17 @@ impl ApplicationRuntime {
                 "二级当前大厅"
             },
         )));
+        Ok(texts)
+    }
 
+    fn process_secondary_recognized_messages(
+        &mut self,
+        observation_frame: ObservedFrame,
+        message_type: &str,
+        friend_name: &str,
+        accepts_turtle_questions: bool,
+        texts: Vec<SecondaryOcrMessage>,
+    ) -> Result<SecondaryBubbleProcessOutcome> {
         if texts.iter().any(|message| {
             message.requires_sender
                 && message
@@ -838,7 +1107,7 @@ impl ApplicationRuntime {
             sleep(Duration::from_millis(poll_ms));
             let frame = load_frame(&canvas, &self.game_ui)?;
             let current = secondary_hall_bubbles(&frame.image)?;
-            if hall_bubble_sequences_stable(&previous, &current) {
+            if hall_bubble_layout_is_stable(&previous, &current) {
                 stable_samples = stable_samples.saturating_add(1);
             } else {
                 stable_samples = 1;
@@ -849,11 +1118,151 @@ impl ApplicationRuntime {
             previous = current;
         }
         log::debug!(
-            "二级大厅气泡及关联区域稳定等待超时，本轮不进入 OCR: samples={}/{} timeout={}ms",
+            "二级大厅气泡相对布局稳定等待超时，本轮不进入 OCR: samples={}/{} timeout={}ms",
             stable_samples,
             required_samples,
             timeout_ms
         );
         Ok(None)
+    }
+
+    fn wait_for_secondary_hall_command_stability(&self) -> Result<SecondaryHallCommandStability> {
+        let canvas = Canvas {
+            width: self.config.screen.expected_width,
+            height: self.config.screen.expected_height,
+            resize: true,
+        };
+        let first = load_frame(&canvas, &self.game_ui)?;
+        let first_bubbles = secondary_hall_bubbles(&first.image)?;
+        let first_messages = self.recognize_secondary_bubble_rects(
+            &first.image,
+            first_bubbles
+                .iter()
+                .map(|bubble| (bubble.rect, Some(bubble.sender_rect()))),
+            "blue",
+        )?;
+        let mut previous_bubbles = first_bubbles;
+        let mut previous_messages = first_messages;
+        let poll_ms = self
+            .config
+            .timing
+            .chat_scan
+            .change_debounce_ms
+            .clamp(100, 200);
+        let required_samples = self
+            .config
+            .resolve_stability_count(self.config.stability.secondary_hall_count);
+        let mut stable_samples = 1_u32;
+        let timeout_ms = poll_ms
+            .saturating_mul(u64::from(required_samples.saturating_add(1)))
+            .max(500);
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+
+        while Instant::now() < deadline {
+            sleep(Duration::from_millis(poll_ms));
+            let frame = load_frame(&canvas, &self.game_ui)?;
+            let bubbles = secondary_hall_bubbles(&frame.image)?;
+            let messages = self.recognize_secondary_bubble_rects(
+                &frame.image,
+                bubbles
+                    .iter()
+                    .map(|bubble| (bubble.rect, Some(bubble.sender_rect()))),
+                "blue",
+            )?;
+            if hall_bubble_layout_is_stable(&previous_bubbles, &bubbles)
+                && SecondaryHallCommandTracker::snapshots_match(&previous_messages, &messages)
+            {
+                stable_samples = stable_samples.saturating_add(1);
+            } else {
+                stable_samples = 1;
+            }
+            if stable_samples >= required_samples {
+                return Ok(Some((frame, bubbles, messages)));
+            }
+            previous_bubbles = bubbles;
+            previous_messages = messages;
+        }
+        log::debug!(
+            "二级大厅命令形式稳定等待超时，本轮不处理: samples={}/{} timeout={}ms",
+            stable_samples,
+            required_samples,
+            timeout_ms
+        );
+        Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn command(text: &str) -> SecondaryOcrMessage {
+        SecondaryOcrMessage {
+            text: text.to_string(),
+            sender: None,
+            sender_identity: None,
+            kind: SecondaryHallMessageKind::Command,
+            requires_sender: false,
+        }
+    }
+
+    fn actor_command(text: &str, nickname: &str, remark: Option<&str>) -> SecondaryOcrMessage {
+        let identity = SecondarySenderIdentity {
+            nickname: nickname.to_string(),
+            remark: remark.map(str::to_string),
+        };
+        SecondaryOcrMessage {
+            text: text.to_string(),
+            sender: Some(identity.effective_name().to_string()),
+            sender_identity: Some(identity),
+            kind: SecondaryHallMessageKind::Command,
+            requires_sender: true,
+        }
+    }
+
+    #[test]
+    fn command_tracker_matches_scroll_and_keeps_new_bottom_command() {
+        let mut tracker = SecondaryHallCommandTracker::default();
+        let previous = vec![command("@帮助"), command("@点歌 测试")];
+        tracker.commit(&previous);
+
+        let current = vec![command("@点歌 测试"), command("@状态")];
+        assert_eq!(tracker.preview_new_indexes(&current), vec![1]);
+        tracker.commit(&current);
+
+        let scrolled = vec![command("@状态")];
+        assert!(tracker.preview_new_indexes(&scrolled).is_empty());
+    }
+
+    #[test]
+    fn command_tracker_uses_remark_for_actor_dependent_command_identity() {
+        let mut tracker = SecondaryHallCommandTracker::default();
+        let previous = vec![actor_command("#出 3", "昵称", Some("备注"))];
+        tracker.commit(&previous);
+
+        let same_actor = vec![actor_command("＃出 3", "昵称", Some("备注"))];
+        assert!(tracker.preview_new_indexes(&same_actor).is_empty());
+
+        tracker.commit(&[actor_command("#出 3", "昵称", None)]);
+        let remark_loaded = vec![actor_command("#出 3", "昵称", Some("备注"))];
+        assert!(tracker.preview_new_indexes(&remark_loaded).is_empty());
+        tracker.commit(&remark_loaded);
+
+        let different_actor = vec![actor_command("#出 3", "昵称", Some("另一备注"))];
+        assert_eq!(tracker.preview_new_indexes(&different_actor), vec![0]);
+    }
+
+    #[test]
+    fn command_tracker_keeps_a_sender_pending_candidate_visible_for_retry() {
+        let mut tracker = SecondaryHallCommandTracker::default();
+        tracker.commit(&[]);
+        let pending = vec![SecondaryOcrMessage {
+            text: "#出 3".to_string(),
+            sender: None,
+            sender_identity: None,
+            kind: SecondaryHallMessageKind::Command,
+            requires_sender: true,
+        }];
+        assert_eq!(tracker.preview_new_indexes(&pending), vec![0]);
     }
 }

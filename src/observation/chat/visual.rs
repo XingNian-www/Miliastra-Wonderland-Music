@@ -155,6 +155,7 @@ pub(crate) fn hall_bubble_sequence_is_retained_prefix(
             .all(|(left, right)| same_hall_bubble(left, right))
 }
 
+#[cfg(test)]
 pub(crate) fn hall_bubble_sequences_stable(
     previous: &[SecondaryHallBubble],
     current: &[SecondaryHallBubble],
@@ -164,6 +165,35 @@ pub(crate) fn hall_bubble_sequences_stable(
             .iter()
             .zip(current)
             .all(|(left, right)| same_hall_bubble(left, right))
+}
+
+/// Checks only the relative geometry of the visible hall bubbles.
+///
+/// Absolute y coordinates are intentionally ignored because the chat panel scrolls as new
+/// messages arrive. This is a settle check, not a message identity check.
+pub(crate) fn hall_bubble_layout_is_stable(
+    previous: &[SecondaryHallBubble],
+    current: &[SecondaryHallBubble],
+) -> bool {
+    if previous.len() != current.len() {
+        return false;
+    }
+    previous
+        .iter()
+        .zip(current)
+        .enumerate()
+        .all(|(index, (left, right))| {
+            left.rect.x == right.rect.x
+                && left.rect.width == right.rect.width
+                && left.rect.height == right.rect.height
+                && left.sender_rect.x == right.sender_rect.x
+                && left.sender_rect.width == right.sender_rect.width
+                && left.sender_rect.height == right.sender_rect.height
+                && left.rect.y.abs_diff(right.rect.y) <= 12
+                && (index == 0
+                    || left.rect.y - previous[index - 1].rect.y
+                        == right.rect.y - current[index - 1].rect.y)
+        })
 }
 
 fn rect_identity(rect: Rect) -> (i32, i32, u32, u32) {
@@ -516,6 +546,45 @@ mod tests {
 
         assert!(!hall_bubble_sequences_stable(&first, &changed_sender));
         assert_eq!(hall_bubble_sequence_overlap(&first, &changed_sender), 0);
+    }
+
+    #[test]
+    fn relative_layout_stays_stable_when_the_chat_scrolls() {
+        let make = |first_y: i32| {
+            vec![
+                SecondaryHallBubble {
+                    rect: Rect::new(410, first_y, 190, 60),
+                    avatar_rect: Rect::new(302, first_y - 36, 88, 88),
+                    sender_rect: Rect::new(418, first_y - 40, 61, 18),
+                    sender_fingerprint: ChangeFingerprint {
+                        pixels: vec![25; 104 * 36],
+                        width: 104,
+                        height: 36,
+                    },
+                    fingerprint: ChangeFingerprint {
+                        pixels: vec![42; 104 * 36],
+                        width: 104,
+                        height: 36,
+                    },
+                },
+                SecondaryHallBubble {
+                    rect: Rect::new(410, first_y + 80, 190, 60),
+                    avatar_rect: Rect::new(302, first_y + 44, 88, 88),
+                    sender_rect: Rect::new(418, first_y + 40, 61, 18),
+                    sender_fingerprint: ChangeFingerprint {
+                        pixels: vec![25; 104 * 36],
+                        width: 104,
+                        height: 36,
+                    },
+                    fingerprint: ChangeFingerprint {
+                        pixels: vec![42; 104 * 36],
+                        width: 104,
+                        height: 36,
+                    },
+                },
+            ]
+        };
+        assert!(hall_bubble_layout_is_stable(&make(300), &make(310)));
     }
 
     fn fill_rect(image: &mut RgbaImage, rect: Rect, color: Rgba<u8>) {

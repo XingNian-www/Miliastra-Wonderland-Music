@@ -24,8 +24,8 @@ pub(crate) use stream::{
 };
 pub(crate) use visual::{
     SECONDARY_TITLE_RECT, SecondaryChatIdentity, SecondaryHallBubble, classify_title,
-    hall_bubble_sequence_is_retained_prefix, hall_bubble_sequence_overlap,
-    hall_bubble_sequences_stable, latest_incoming_bubble_rect, latest_incoming_fingerprint,
+    hall_bubble_layout_is_stable, hall_bubble_sequence_is_retained_prefix,
+    hall_bubble_sequence_overlap, latest_incoming_bubble_rect, latest_incoming_fingerprint,
     secondary_hall_bubbles,
 };
 

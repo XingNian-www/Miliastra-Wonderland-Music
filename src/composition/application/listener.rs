@@ -1,3 +1,4 @@
+use super::secondary_chat::SecondaryHallCommandTracker;
 use super::*;
 
 use crate::features::administration::{
@@ -192,6 +193,7 @@ impl ApplicationRuntime {
         let mut primary_visible = false;
         let mut secondary_friend_bubble_fingerprint: Option<ChangeFingerprint> = None;
         let mut secondary_hall_bubble_sequence: Option<Vec<SecondaryHallBubble>> = None;
+        let mut secondary_hall_command_tracker = SecondaryHallCommandTracker::default();
         let mut secondary_title_fingerprint: Option<ChangeFingerprint> = None;
         let mut secondary_identity: Option<SecondaryChatIdentity> = None;
         let mut target_missing_backoff = TARGET_MISSING_BACKOFF_INITIAL;
@@ -294,6 +296,7 @@ impl ApplicationRuntime {
                                     &frame.image,
                                     &mut secondary_friend_bubble_fingerprint,
                                     &mut secondary_hall_bubble_sequence,
+                                    &mut secondary_hall_command_tracker,
                                     &mut secondary_title_fingerprint,
                                     &mut secondary_identity,
                                 )?
@@ -311,6 +314,7 @@ impl ApplicationRuntime {
                                 self.business.fail_chat_listener_mode_to_primary()?;
                                 secondary_friend_bubble_fingerprint = None;
                                 secondary_hall_bubble_sequence = None;
+                                secondary_hall_command_tracker.reset();
                                 secondary_title_fingerprint = None;
                                 secondary_identity = None;
                                 false
@@ -329,6 +333,7 @@ impl ApplicationRuntime {
                             if listener_snapshot.mode == ChatListenerMode::Primary {
                                 secondary_friend_bubble_fingerprint = None;
                                 secondary_hall_bubble_sequence = None;
+                                secondary_hall_command_tracker.reset();
                                 secondary_title_fingerprint = None;
                                 secondary_identity = None;
                             }
@@ -542,6 +547,7 @@ impl ApplicationRuntime {
                             primary_visible = false;
                             secondary_friend_bubble_fingerprint = None;
                             secondary_hall_bubble_sequence = None;
+                            secondary_hall_command_tracker.reset();
                             secondary_title_fingerprint = None;
                             secondary_identity = None;
                             log::debug!("当前不是一级聊天界面，跳过聊天扫描: {}", ui_state);
@@ -588,6 +594,7 @@ impl ApplicationRuntime {
                     last_fingerprint = None;
                     secondary_friend_bubble_fingerprint = None;
                     secondary_hall_bubble_sequence = None;
+                    secondary_hall_command_tracker.reset();
                     secondary_title_fingerprint = None;
                     secondary_identity = None;
                     let observed_window_detection_generation =

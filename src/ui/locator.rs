@@ -44,7 +44,7 @@ pub(crate) fn parse_hall_remaining_minutes(text: &str) -> Option<u32> {
 }
 
 pub(crate) fn parse_hall_member_count(text: &str) -> Option<u32> {
-    let separator = text.find(|ch| matches!(ch, '/' | '／' | '|' | '丨'))?;
+    let separator = text.find(['/', '／', '|', '丨'])?;
     let current = &text[..separator];
     let digits = current
         .chars()

@@ -233,7 +233,8 @@ fn execute_operation(
                 WorkflowResidency::Primary => UiResidencyTarget::Primary,
                 WorkflowResidency::SecondaryCurrentHall => UiResidencyTarget::SecondaryCurrentHall,
             };
-            restore_residency(context, ocr, residency, target)?;
+            restore_residency(context, ocr, residency, target)
+                .map_err(|failure| preserve_input_certainty(input_performed, failure))?;
             Ok(true)
         }
         WorkflowOperation::ReturnListenerResidency => Err(observation_reason(
@@ -635,6 +636,23 @@ fn observation_reason(
         stage,
         reason,
     )
+}
+
+fn preserve_input_certainty(input_performed: bool, failure: UiRoutineFailure) -> UiRoutineFailure {
+    if input_performed
+        && matches!(
+            failure.certainty(),
+            InputCertainty::BeforeInput | InputCertainty::ConfirmedFailure
+        )
+    {
+        UiRoutineFailure::new(
+            InputCertainty::AfterInputUnknown,
+            failure.stage(),
+            failure.reason(),
+        )
+    } else {
+        failure
+    }
 }
 
 fn input_failure(stage: &'static str, error: anyhow::Error) -> UiRoutineFailure {

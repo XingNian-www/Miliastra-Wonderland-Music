@@ -894,7 +894,7 @@ fn locate_stable_friend_row(
         wait_friend_list_stable(context, config)?;
     }
     Err(UiRoutineFailure::new(
-        InputCertainty::ConfirmedFailure,
+        InputCertainty::AfterInputUnknown,
         "locate_friend",
         "no unique stable friend row was found within two list drags",
     ))
@@ -958,7 +958,7 @@ fn search_current_friend_page(
             }
             _ => {
                 return Err(UiRoutineFailure::new(
-                    InputCertainty::ConfirmedFailure,
+                    InputCertainty::AfterInputUnknown,
                     "locate_friend",
                     "multiple complete friend-name matches were visible in the strict list region",
                 ));
@@ -1008,7 +1008,7 @@ fn confirm_friend_conversation(
         }
     }
     Err(UiRoutineFailure::new(
-        InputCertainty::ConfirmedFailure,
+        InputCertainty::AfterInputUnknown,
         "confirm_friend_conversation",
         "selected conversation is current hall or public channel",
     ))
@@ -1204,7 +1204,7 @@ fn restore_secondary_hall(
         wait_friend_list_stable(context, config)?;
     }
     Err(UiRoutineFailure::new(
-        InputCertainty::ConfirmedFailure,
+        InputCertainty::AfterInputUnknown,
         "restore_secondary_hall",
         "current-hall template was not found after two downward avatar drags",
     ))
@@ -1248,7 +1248,7 @@ fn confirm_current_hall(
         }
     }
     Err(UiRoutineFailure::new(
-        InputCertainty::ConfirmedFailure,
+        InputCertainty::AfterInputUnknown,
         "confirm_secondary_hall",
         "current-hall title did not become stable",
     ))
@@ -1306,6 +1306,7 @@ pub(super) fn current_ui_is_primary(
     context: &mut UiRoutineContext<'_>,
     config: &FriendDeliveryRoutineConfig,
     stage: &'static str,
+    certainty: InputCertainty,
 ) -> std::result::Result<bool, UiRoutineFailure> {
     Ok(wait_for_stable_ui_kind(
         context,
@@ -1313,7 +1314,7 @@ pub(super) fn current_ui_is_primary(
         None,
         config.timeout_ms,
         stage,
-        InputCertainty::ConfirmedFailure,
+        certainty,
     )? == UiStateKind::Primary)
 }
 
@@ -1349,7 +1350,7 @@ fn wait_friend_list_stable(
         previous = current;
     }
     Err(UiRoutineFailure::new(
-        InputCertainty::BeforeInput,
+        InputCertainty::AfterInputUnknown,
         "confirm_scrolled_friend_list",
         "friend list did not become stable after scrolling",
     ))
@@ -1527,7 +1528,7 @@ mod tests {
             .expect("wait for bounded friend traversal")
             .expect_err("missing friend must not be selected");
         assert_eq!(failure.stage(), "locate_friend");
-        assert_eq!(failure.certainty(), InputCertainty::ConfirmedFailure);
+        assert_eq!(failure.certainty(), InputCertainty::AfterInputUnknown);
         let scrolls = state.lock().unwrap().scrolls;
         assert!(scrolls > 0);
         assert!(scrolls <= MAX_FRIEND_LIST_DRAGS);

@@ -205,11 +205,10 @@ impl<'a> ChatCommandRouter<'a> {
 
 fn is_reserved_decision_command(envelope: &CommandEnvelope) -> bool {
     let command = envelope.command_text();
-    if ["确认", "跳过", "换源", "AI"].iter().any(|prefix| {
-        command
-            .strip_prefix(prefix)
-            .is_some_and(|rest| decision_boundary(rest))
-    }) {
+    if ["确认", "跳过", "换源", "AI"]
+        .iter()
+        .any(|prefix| command.strip_prefix(prefix).is_some_and(decision_boundary))
+    {
         return true;
     }
 
@@ -223,11 +222,7 @@ fn is_reserved_decision_command(envelope: &CommandEnvelope) -> bool {
             "不同意",
         ]
         .iter()
-        .any(|prefix| {
-            command
-                .strip_prefix(prefix)
-                .is_some_and(|rest| decision_boundary(rest))
-        })
+        .any(|prefix| command.strip_prefix(prefix).is_some_and(decision_boundary))
 }
 
 fn decision_boundary(rest: &str) -> bool {

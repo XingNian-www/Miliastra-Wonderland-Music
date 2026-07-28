@@ -21,6 +21,15 @@ use enigo::Key;
 const ENTER_GAME_TEXT: &str = "点击进入";
 const TEMPLATE_STABLE_HITS: u32 = 2;
 
+struct TemplateAbsence<'a> {
+    template: &'a Path,
+    region: Rect,
+    threshold: f32,
+    timeout_ms: u64,
+    stage: &'static str,
+    failure_message: &'static str,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct EnterGame;
 
@@ -405,12 +414,14 @@ fn execute_enter_wonderland(
     wait_template_absent(
         context,
         config,
-        &config.startup.templates.wonderland_map_star,
-        config.startup.wonderland_map_star_region,
-        config.startup.template_threshold,
-        config.startup.wonderland_transition_timeout_ms,
-        "confirm_wonderland_map_star_absent",
-        "wonderland map star template did not disappear",
+        TemplateAbsence {
+            template: &config.startup.templates.wonderland_map_star,
+            region: config.startup.wonderland_map_star_region,
+            threshold: config.startup.template_threshold,
+            timeout_ms: config.startup.wonderland_transition_timeout_ms,
+            stage: "confirm_wonderland_map_star_absent",
+            failure_message: "wonderland map star template did not disappear",
+        },
     )?;
 
     let hall_attempts = capped_attempts(
@@ -667,30 +678,25 @@ fn find_enter_game_text(
 fn wait_template_absent(
     context: &mut UiRoutineContext<'_>,
     config: &StartupRoutineConfig,
-    template: &Path,
-    region: Rect,
-    threshold: f32,
-    timeout_ms: u64,
-    stage: &'static str,
-    failure_message: &'static str,
+    wait: TemplateAbsence<'_>,
 ) -> Result<(), UiRoutineFailure> {
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
+    let deadline = Instant::now() + Duration::from_millis(wait.timeout_ms.max(1));
     while Instant::now() < deadline {
         let image = capture_normalized(
             context,
             &config.residency,
-            stage,
+            wait.stage,
             InputCertainty::AfterInputUnknown,
         )?;
-        if !template_visible(&image, region, template, threshold)? {
+        if !template_visible(&image, wait.region, wait.template, wait.threshold)? {
             return Ok(());
         }
         sleep_ms(config.startup.poll_ms);
     }
     Err(UiRoutineFailure::new(
         InputCertainty::AfterInputUnknown,
-        stage,
-        failure_message,
+        wait.stage,
+        wait.failure_message,
     ))
 }
 

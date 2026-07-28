@@ -691,7 +691,7 @@ fn normalize_hall_batch_start(
             context
                 .device()
                 .press_key(Key::Return)
-                .map_err(|error| before_input_failure("open_primary_chat", error))?;
+                .map_err(|error| after_input_failure("open_primary_chat", error))?;
             *primary_chat_opened = true;
             sleep_ms(config.open_chat_ms);
             restore_secondary_hall(context, ocr, config)
@@ -711,7 +711,7 @@ fn finish_hall_batch_residency(
         context
             .device()
             .press_key(Key::Escape)
-            .map_err(|error| before_input_failure("close_primary_chat", error))?;
+            .map_err(|error| after_input_failure("close_primary_chat", error))?;
         sleep_ms(config.click_ms);
     }
     restore_residency(context, ocr, config, target)
@@ -782,7 +782,7 @@ pub(super) fn open_friend_conversation(
     context
         .device()
         .click_point(point.x, point.y)
-        .map_err(|error| before_input_failure("select_friend", error))?;
+        .map_err(|error| after_input_failure("select_friend", error))?;
     sleep_ms(config.friend_step_ms);
     confirm_friend_conversation(context, ocr, config, recipient)
 }
@@ -798,7 +798,7 @@ pub(super) fn send_current_chat_message(
     context
         .device()
         .click_point(config.chat_click.x, config.chat_click.y)
-        .map_err(|error| before_input_failure("focus_friend_message", error))?;
+        .map_err(|error| after_input_failure("focus_friend_message", error))?;
     sleep_ms(config.click_ms);
     if let Err(paste_error) = context.device().paste_text(message, config.text_ms)
         && let Err(input_error) = context.device().input_text(message, config.text_ms)
@@ -843,7 +843,7 @@ fn ensure_secondary_chat(
     context
         .device()
         .press_key(Key::Return)
-        .map_err(|error| before_input_failure("open_secondary_chat", error))?;
+        .map_err(|error| after_input_failure("open_secondary_chat", error))?;
     sleep_ms(config.open_chat_ms);
     wait_for_stable_ui_kind(
         context,
@@ -875,7 +875,7 @@ fn locate_stable_friend_row(
             InputCertainty::AfterInputUnknown,
         )?;
         let fingerprint = rect_chat_change_fingerprint(&image, config.friend_list_region)
-            .map_err(|error| before_input_failure("fingerprint_friend_list", error))?;
+            .map_err(|error| after_input_failure("fingerprint_friend_list", error))?;
         if pages
             .iter()
             .any(|page| page_matches(page, &fingerprint, config))
@@ -890,7 +890,7 @@ fn locate_stable_friend_row(
         context
             .device()
             .drag_point(from.x, from.y, to.x, to.y)
-            .map_err(|error| before_input_failure("drag_friend_list", error))?;
+            .map_err(|error| after_input_failure("drag_friend_list", error))?;
         wait_friend_list_stable(context, config)?;
     }
     Err(UiRoutineFailure::new(
@@ -1062,7 +1062,7 @@ fn restore_primary(
     context
         .device()
         .press_key(Key::Escape)
-        .map_err(|error| before_input_failure("restore_primary_residency", error))?;
+        .map_err(|error| after_input_failure("restore_primary_residency", error))?;
     confirm_primary_residency(context, config)
 }
 
@@ -1174,18 +1174,18 @@ fn restore_secondary_hall(
             &config.secondary_hall_template,
             config.template_threshold,
         )
-        .map_err(|error| before_input_failure("locate_secondary_hall", error))?
+        .map_err(|error| after_input_failure("locate_secondary_hall", error))?
         {
             let point = hit.center();
             context
                 .device()
                 .click_point(point.x, point.y)
-                .map_err(|error| before_input_failure("select_secondary_hall", error))?;
+                .map_err(|error| after_input_failure("select_secondary_hall", error))?;
             sleep_ms(config.click_ms);
             return confirm_current_hall(context, ocr, config);
         }
         let fingerprint = rect_chat_change_fingerprint(&image, config.friend_list_region)
-            .map_err(|error| before_input_failure("fingerprint_secondary_hall_list", error))?;
+            .map_err(|error| after_input_failure("fingerprint_secondary_hall_list", error))?;
         if pages
             .iter()
             .any(|page| page_matches(page, &fingerprint, config))
@@ -1200,7 +1200,7 @@ fn restore_secondary_hall(
         context
             .device()
             .drag_point(from.x, from.y, to.x, to.y)
-            .map_err(|error| before_input_failure("drag_to_secondary_hall", error))?;
+            .map_err(|error| after_input_failure("drag_to_secondary_hall", error))?;
         wait_friend_list_stable(context, config)?;
     }
     Err(UiRoutineFailure::new(
@@ -1261,10 +1261,10 @@ fn matching_text_rows(
     normalized_target: &str,
 ) -> std::result::Result<Vec<Point>, UiRoutineFailure> {
     let crop = crop_canvas(image, region)
-        .map_err(|error| before_input_failure("crop_ocr_confirmation", error))?;
+        .map_err(|error| after_input_failure("crop_ocr_confirmation", error))?;
     let lines = ocr
         .recognize_lines(crop, OcrPriority::UiConfirmation)
-        .map_err(|error| before_input_failure("ocr_confirmation", error))?;
+        .map_err(|error| after_input_failure("ocr_confirmation", error))?;
     Ok(lines
         .into_iter()
         .filter_map(|line| {
@@ -1286,10 +1286,10 @@ fn merged_text(
     region: Rect,
 ) -> std::result::Result<String, UiRoutineFailure> {
     let crop = crop_canvas(image, region)
-        .map_err(|error| before_input_failure("crop_ocr_confirmation", error))?;
+        .map_err(|error| after_input_failure("crop_ocr_confirmation", error))?;
     let lines = ocr
         .recognize_lines(crop, OcrPriority::UiConfirmation)
-        .map_err(|error| before_input_failure("ocr_confirmation", error))?;
+        .map_err(|error| after_input_failure("ocr_confirmation", error))?;
     Ok(merge_ocr_lines(lines, 12))
 }
 
@@ -1330,7 +1330,7 @@ fn wait_friend_list_stable(
         )?,
         config.friend_list_region,
     )
-    .map_err(|error| before_input_failure("observe_scrolled_friend_list", error))?;
+    .map_err(|error| after_input_failure("observe_scrolled_friend_list", error))?;
     for _ in 0..confirmation_attempts(config) {
         sleep_ms(config.poll_ms);
         let current = rect_chat_change_fingerprint(
@@ -1342,7 +1342,7 @@ fn wait_friend_list_stable(
             )?,
             config.friend_list_region,
         )
-        .map_err(|error| before_input_failure("confirm_scrolled_friend_list", error))?;
+        .map_err(|error| after_input_failure("confirm_scrolled_friend_list", error))?;
         if page_matches(&previous, &current, config) {
             return Ok(());
         }
@@ -1372,6 +1372,14 @@ fn confirmation_attempts(config: &FriendDeliveryRoutineConfig) -> u32 {
 
 pub(super) fn before_input_failure(stage: &'static str, error: anyhow::Error) -> UiRoutineFailure {
     UiRoutineFailure::new(InputCertainty::BeforeInput, stage, format!("{error:#}"))
+}
+
+pub(super) fn after_input_failure(stage: &'static str, error: anyhow::Error) -> UiRoutineFailure {
+    UiRoutineFailure::new(
+        InputCertainty::AfterInputUnknown,
+        stage,
+        format!("{error:#}"),
+    )
 }
 
 pub(super) fn sleep_ms(ms: u64) {

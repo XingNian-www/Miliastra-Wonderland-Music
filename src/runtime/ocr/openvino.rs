@@ -256,9 +256,8 @@ impl OpenVinoEngine {
             preprocess_for_rec(image, RECOGNITION_HEIGHT).context("OpenVINO 识别图像预处理失败")?;
         let (output_data, output_shape) = self.recognizer.run(&input.data, &input.shape)?;
         let (sequence_length, _) = ctc_output_dimensions(&output_shape)?;
-        let valid_sequence_length =
-            ((sequence_length as u64 * input.valid_width as u64 + input.shape[3] as u64 - 1)
-                / input.shape[3] as u64) as usize;
+        let valid_sequence_length = (sequence_length as u64 * input.valid_width as u64)
+            .div_ceil(input.shape[3] as u64) as usize;
         decode_ctc(
             &output_data,
             &output_shape,
@@ -362,13 +361,12 @@ fn padded_size(size: u32) -> u32 {
 }
 
 fn detection_canvas_size(width: u32, height: u32) -> (u32, u32) {
-    if width <= CHAT_DETECTION_CANVAS_WIDTH {
-        if let Some(&canvas_height) = CHAT_DETECTION_CANVAS_HEIGHTS
+    if width <= CHAT_DETECTION_CANVAS_WIDTH
+        && let Some(&canvas_height) = CHAT_DETECTION_CANVAS_HEIGHTS
             .iter()
             .find(|&&canvas_height| height <= canvas_height)
-        {
-            return (CHAT_DETECTION_CANVAS_WIDTH, canvas_height);
-        }
+    {
+        return (CHAT_DETECTION_CANVAS_WIDTH, canvas_height);
     }
     (padded_size(width).max(32), padded_size(height).max(32))
 }

@@ -772,6 +772,12 @@ fn observation_identity_changed(
         || previous.reliability != current.reliability
 }
 
+pub(crate) use application::{
+    LyricTracker, PlaybackApplication, PlaybackApplicationConfig, PlaybackCommandContext,
+    PlaybackCommandPort, PlaybackDecision, PlaybackExecutionPort, PlaybackMonitorPort,
+    PlaybackPickedCandidate, PlaybackSearchFailure, PlaybackSelection, PlaybackWorkload,
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -859,9 +865,3 @@ mod tests {
         );
     }
 }
-
-pub(crate) use application::{
-    LyricTracker, PlaybackApplication, PlaybackApplicationConfig, PlaybackCommandContext,
-    PlaybackCommandPort, PlaybackDecision, PlaybackExecutionPort, PlaybackMonitorPort,
-    PlaybackPickedCandidate, PlaybackSearchFailure, PlaybackSelection, PlaybackWorkload,
-};

@@ -1,5 +1,5 @@
 use enigo::Key;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use super::friend_delivery::{
     FriendDeliveryRoutineConfig, UiResidencyOutcome, UiResidencyTarget, before_input_failure,
@@ -15,7 +15,6 @@ use crate::runtime::ui::{
     UiSubmitError, sealed,
 };
 use crate::text::normalize_comparison_text as normalize_lock_text;
-use crate::ui::frame::LatestFrameCache;
 use crate::ui::geometry::{Rect, crop_canvas};
 use crate::ui::locator::{
     HALL_INFO_OCR_SAMPLES, HallInfo, HallInfoSample, display_or_empty, merge_hall_info_samples,
@@ -43,6 +42,7 @@ pub(crate) enum ReadHallInfoEffect {
 pub(crate) struct ReadHallInfoOutcome {
     effect: ReadHallInfoEffect,
     residency: UiResidencyOutcome,
+    screenshot: Option<Arc<image::DynamicImage>>,
 }
 
 impl ReadHallInfoOutcome {
@@ -52,6 +52,10 @@ impl ReadHallInfoOutcome {
 
     pub(crate) fn residency(&self) -> &UiResidencyOutcome {
         &self.residency
+    }
+
+    pub(crate) fn screenshot(&self) -> Option<Arc<image::DynamicImage>> {
+        self.screenshot.clone()
     }
 }
 
@@ -104,7 +108,6 @@ pub(crate) struct HallUi {
     runtime: UiRuntimeHandle,
     ocr: OcrRuntimeHandle,
     config: HallRoutineConfig,
-    hall_screenshot: Arc<Mutex<LatestFrameCache>>,
 }
 
 impl HallUi {
@@ -112,13 +115,11 @@ impl HallUi {
         runtime: UiRuntimeHandle,
         ocr: OcrRuntimeHandle,
         config: HallRoutineConfig,
-        hall_screenshot: Arc<Mutex<LatestFrameCache>>,
     ) -> Self {
         Self {
             runtime,
             ocr,
             config,
-            hall_screenshot,
         }
     }
 
@@ -130,7 +131,6 @@ impl HallUi {
             request,
             ocr: self.ocr.clone(),
             config: self.config.clone(),
-            hall_screenshot: Arc::clone(&self.hall_screenshot),
         })
     }
 
@@ -142,7 +142,6 @@ impl HallUi {
             request,
             ocr: self.ocr.clone(),
             config: self.config.clone(),
-            hall_screenshot: Arc::clone(&self.hall_screenshot),
         })
     }
 
@@ -204,7 +203,6 @@ struct ReadHallInfoRoutine {
     request: ReadHallInfo,
     ocr: OcrRuntimeHandle,
     config: HallRoutineConfig,
-    hall_screenshot: Arc<Mutex<LatestFrameCache>>,
 }
 
 impl sealed::UiRoutineSealed for ReadHallInfoRoutine {}
@@ -215,18 +213,17 @@ impl UiRoutine for ReadHallInfoRoutine {
     fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
         let _ = self.request;
         let mut opened = false;
-        let effect = match read_hall_info_transaction(
-            context,
-            &self.ocr,
-            &self.config,
-            &self.hall_screenshot,
-            &mut opened,
-        ) {
-            Ok(info) => ReadHallInfoEffect::Read(info),
-            Err(failure) => ReadHallInfoEffect::Failed(failure),
-        };
+        let (effect, screenshot) =
+            match read_hall_info_transaction(context, &self.ocr, &self.config, &mut opened) {
+                Ok((info, screenshot)) => (ReadHallInfoEffect::Read(info), Some(screenshot)),
+                Err(failure) => (ReadHallInfoEffect::Failed(failure), None),
+            };
         let residency = finish_hall_page(context, &self.ocr, &self.config, opened);
-        ReadHallInfoOutcome { effect, residency }
+        ReadHallInfoOutcome {
+            effect,
+            residency,
+            screenshot,
+        }
     }
 }
 
@@ -234,7 +231,6 @@ struct DetectPublicHallRoutine {
     request: DetectPublicHall,
     ocr: OcrRuntimeHandle,
     config: HallRoutineConfig,
-    hall_screenshot: Arc<Mutex<LatestFrameCache>>,
 }
 
 impl sealed::UiRoutineSealed for DetectPublicHallRoutine {}
@@ -245,14 +241,9 @@ impl UiRoutine for DetectPublicHallRoutine {
     fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
         let _ = self.request;
         let mut opened = false;
-        let effect = match read_hall_info_transaction(
-            context,
-            &self.ocr,
-            &self.config,
-            &self.hall_screenshot,
-            &mut opened,
-        ) {
-            Ok(info) => {
+        let effect = match read_hall_info_transaction(context, &self.ocr, &self.config, &mut opened)
+        {
+            Ok((info, _screenshot)) => {
                 let is_public = normalize_lock_text(&info.name) == normalize_lock_text("公共大厅");
                 DetectPublicHallEffect::Detected { is_public, info }
             }
@@ -319,9 +310,8 @@ fn read_hall_info_transaction(
     context: &mut UiRoutineContext<'_>,
     ocr: &OcrRuntimeHandle,
     config: &HallRoutineConfig,
-    hall_screenshot: &Arc<Mutex<LatestFrameCache>>,
     opened: &mut bool,
-) -> Result<HallInfo, UiRoutineFailure> {
+) -> Result<(HallInfo, Arc<image::DynamicImage>), UiRoutineFailure> {
     prepare_primary(context, ocr, config)?;
     context.device().press_key(Key::F2).map_err(|error| {
         UiRoutineFailure::new(
@@ -339,7 +329,8 @@ fn read_hall_info_transaction(
         "capture_hall_screenshot",
         InputCertainty::AfterInputUnknown,
     )?;
-    store_hall_screenshot(hall_screenshot, &detection_image);
+    let first_image = detection_image.clone();
+    let mut screenshot = first_image.clone();
     match read_hall_member_count(ocr, &detection_image, config) {
         Ok(Some(member_count)) => {
             log::info!(
@@ -360,13 +351,13 @@ fn read_hall_info_transaction(
                     "capture_scrolled_hall_screenshot",
                     InputCertainty::AfterInputUnknown,
                 )?;
-                store_hall_screenshot(hall_screenshot, &detection_image);
+                screenshot = merge_hall_screenshots(&first_image, &detection_image);
             }
         }
         Ok(None) => log::debug!("大厅成员人数 OCR 未识别，跳过成员列表滚动"),
         Err(failure) => log::warn!("大厅成员人数 OCR 失败，跳过成员列表滚动: {failure}"),
     }
-
+    let screenshot = Arc::new(screenshot);
     let mut samples = Vec::with_capacity(HALL_INFO_OCR_SAMPLES);
     for index in 0..HALL_INFO_OCR_SAMPLES {
         if index > 0 {
@@ -381,7 +372,6 @@ fn read_hall_info_transaction(
                 "capture_hall_info",
                 InputCertainty::AfterInputUnknown,
             )?;
-            store_hall_screenshot(hall_screenshot, &detection_image);
             &detection_image
         };
         let sample = read_hall_sample(ocr, &image, config)?;
@@ -398,7 +388,7 @@ fn read_hall_info_transaction(
         );
         samples.push(sample);
     }
-    Ok(merge_hall_info_samples(&samples))
+    Ok((merge_hall_info_samples(&samples), screenshot))
 }
 
 fn read_hall_member_count(
@@ -418,11 +408,18 @@ fn read_hall_member_count(
     Ok(parse_hall_member_count(&count_text))
 }
 
-fn store_hall_screenshot(cache: &Arc<Mutex<LatestFrameCache>>, image: &image::DynamicImage) {
-    match cache.lock() {
-        Ok(mut cache) => cache.store(Arc::new(image.clone())),
-        Err(_) => log::error!("大厅截图缓存锁已损坏"),
-    }
+fn merge_hall_screenshots(
+    first: &image::DynamicImage,
+    scrolled: &image::DynamicImage,
+) -> image::DynamicImage {
+    let first = first.to_rgba8();
+    let scrolled = scrolled.to_rgba8();
+    let width = first.width().max(scrolled.width());
+    let height = first.height().saturating_add(scrolled.height());
+    let mut merged = image::RgbaImage::new(width, height);
+    image::imageops::overlay(&mut merged, &first, 0, 0);
+    image::imageops::overlay(&mut merged, &scrolled, 0, i64::from(first.height()));
+    image::DynamicImage::ImageRgba8(merged)
 }
 
 fn read_hall_sample(
@@ -486,7 +483,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use anyhow::Result;
-    use image::{DynamicImage, GenericImage};
+    use image::{DynamicImage, GenericImage, Rgba};
 
     use super::*;
     use crate::runtime::ocr::{OcrDevice, OcrLine, OcrRuntime};
@@ -620,12 +617,10 @@ mod tests {
             4,
         )
         .unwrap();
-        let hall_screenshot = Arc::new(Mutex::new(LatestFrameCache::default()));
         let hall_ui = HallUi::new(
             ui_runtime.handle(),
             ocr_runtime.handle(),
             HallRoutineConfig::from_app(&config),
-            hall_screenshot.clone(),
         );
 
         let outcome = hall_ui
@@ -651,7 +646,6 @@ mod tests {
         );
         assert_eq!(*keys.lock().unwrap(), [Key::F2, Key::Escape]);
         assert_eq!(*drags.lock().unwrap(), [(1240, 910, 1240, 160)]);
-        assert!(hall_screenshot.lock().unwrap().image().is_some());
 
         ui_runtime.shutdown().unwrap();
         ocr_runtime.shutdown().unwrap();
@@ -686,7 +680,6 @@ mod tests {
             ui_runtime.handle(),
             ocr_runtime.handle(),
             HallRoutineConfig::from_app(&config),
-            Arc::new(Mutex::new(LatestFrameCache::default())),
         );
 
         let outcome = hall_ui
@@ -711,6 +704,21 @@ mod tests {
 
         ui_runtime.shutdown().unwrap();
         ocr_runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn hall_screenshot_merge_stacks_before_and_after_scroll_frames() {
+        let mut first = DynamicImage::new_rgba8(3, 2);
+        first.put_pixel(0, 0, Rgba([255, 0, 0, 255]));
+        let mut scrolled = DynamicImage::new_rgba8(3, 4);
+        scrolled.put_pixel(0, 0, Rgba([0, 255, 0, 255]));
+
+        let merged = merge_hall_screenshots(&first, &scrolled);
+        let merged = merged.to_rgba8();
+
+        assert_eq!((merged.width(), merged.height()), (3, 6));
+        assert_eq!(*merged.get_pixel(0, 0), Rgba([255, 0, 0, 255]));
+        assert_eq!(*merged.get_pixel(0, 2), Rgba([0, 255, 0, 255]));
     }
 
     fn primary_frame(config: &AppConfig) -> DynamicImage {

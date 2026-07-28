@@ -6,9 +6,7 @@ use std::time::{Duration, Instant};
 
 use image::imageops::FilterType;
 
-use super::friend_delivery::{
-    FriendDeliveryRoutineConfig, UiResidencyTarget, before_input_failure, restore_residency,
-};
+use super::friend_delivery::{FriendDeliveryRoutineConfig, UiResidencyTarget, restore_residency};
 use crate::adapters::windows::parse_key;
 use crate::interfaces::ui_plan::{
     WorkflowMouseButton, WorkflowOperation, WorkflowPixelStability, WorkflowPoint, WorkflowRect,
@@ -228,7 +226,9 @@ fn execute_operation(
             context
                 .device()
                 .ensure_ready(residency.after_activate_ms)
-                .map_err(|error| before_input_failure("prepare_custom_residency", error))?;
+                .map_err(|error| {
+                    observation_failure(input_performed, "prepare_custom_residency", error)
+                })?;
             let target = match target {
                 WorkflowResidency::Primary => UiResidencyTarget::Primary,
                 WorkflowResidency::SecondaryCurrentHall => UiResidencyTarget::SecondaryCurrentHall,
@@ -789,6 +789,47 @@ mod tests {
             *keys.lock().unwrap(),
             vec![Key::Unicode('a'), Key::Unicode('b'), Key::Unicode('c')]
         );
+        ocr_runtime.shutdown().unwrap();
+        ui_runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn residency_failure_after_a_prior_input_is_result_unknown() {
+        let keys = Arc::new(Mutex::new(Vec::new()));
+        let ui_runtime = UiRuntime::start(RecordingDevice { keys: keys.clone() }, 2).unwrap();
+        let ocr_runtime = OcrRuntime::start(EmptyOcr, 1).unwrap();
+        let config = AppConfig::load(Path::new("config.yaml")).unwrap();
+        let action_ui = CustomActionUi::new(
+            ui_runtime.handle(),
+            ocr_runtime.handle(),
+            Arc::new(AtomicBool::new(true)),
+            config.screen.expected_width,
+            config.screen.expected_height,
+            FriendDeliveryRoutineConfig::from_app(&config),
+        );
+
+        let outcome = action_ui
+            .submit(CustomActionPlan::new(
+                "input-then-residency",
+                vec![
+                    WorkflowOperation::PressKey {
+                        key: "a".to_string(),
+                    },
+                    WorkflowOperation::EnsureResidency {
+                        target: WorkflowResidency::Primary,
+                    },
+                ],
+            ))
+            .unwrap()
+            .wait()
+            .unwrap();
+
+        let failure = outcome.failure().expect("residency preparation must fail");
+        assert_eq!(outcome.completed(), 1);
+        assert_eq!(failure.stage(), "prepare_custom_residency");
+        assert_eq!(failure.certainty(), InputCertainty::AfterInputUnknown);
+        assert_eq!(*keys.lock().unwrap(), [Key::Unicode('a')]);
+
         ocr_runtime.shutdown().unwrap();
         ui_runtime.shutdown().unwrap();
     }

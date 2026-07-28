@@ -17,6 +17,7 @@ use crate::features::idiom_chain::IdiomChainMode;
 #[cfg(test)]
 use crate::features::invite::InviteCommand;
 pub use crate::features::moderation::{ModerationAction, ModerationCommand};
+use crate::features::song_request::parse_structured_song_text;
 #[cfg(test)]
 use crate::features::song_request::{SongCommand, SongSource};
 #[cfg(test)]
@@ -51,6 +52,19 @@ pub(crate) fn parse_command_envelope(
         return None;
     }
 
+    if text.trim_start().starts_with("歌曲名") {
+        return parse_structured_song_envelope(
+            text,
+            if message_type == "pink" {
+                "二级好友"
+            } else {
+                "一级大厅"
+            },
+            message_type,
+            observation,
+        );
+    }
+
     let separator_index = text.find(['：', ':', ']', '】'])?;
     let username = if message_type == "pink" {
         extract_bracket_username(text)?
@@ -65,7 +79,37 @@ pub(crate) fn parse_command_envelope(
     let separator_len = text[separator_index..].chars().next()?.len_utf8();
     let raw_command_text = text[separator_index + separator_len..]
         .trim_start_matches(['：', ':', ' ', '\t', ']', '】']);
-    CommandEnvelope::new(text, username, message_type, raw_command_text, observation)
+    CommandEnvelope::new(
+        text,
+        username.clone(),
+        message_type,
+        raw_command_text,
+        observation.clone(),
+    )
+    .or_else(|| {
+        parse_structured_song_envelope(raw_command_text, &username, message_type, observation)
+    })
+}
+
+/// Creates the normal point-song envelope for a metadata line that came from OCR.
+///
+/// Keeping this at the chat boundary means primary and secondary listeners can feed structured
+/// text through the same router, lock state, and song-request application as an explicit `@点歌`
+/// command. The original OCR text remains attached to the envelope for observation correlation.
+pub(crate) fn parse_structured_song_envelope(
+    text: &str,
+    username: &str,
+    message_type: &str,
+    observation: CommandObservation,
+) -> Option<CommandEnvelope> {
+    let input = parse_structured_song_text(text)?;
+    CommandEnvelope::new(
+        text,
+        username,
+        message_type,
+        format!("@点歌 {}", input.keyword()),
+        observation,
+    )
 }
 
 /// A command submitted by a local control surface rather than read from chat.
@@ -284,6 +328,38 @@ mod tests {
         assert_eq!(envelope.command_text(), "点歌 晴天 周杰伦");
         assert_eq!(envelope.prefix(), CommandPrefix::At);
         assert_eq!(envelope.authority(), CommandAuthority::HallMember);
+    }
+
+    #[test]
+    fn structured_song_ocr_routes_through_normal_song_request_module() {
+        let routed = parse_text(
+            "用户：歌曲名：醉，歌手名：三无Marblue，专辑名：三无Marblue（170509更新）",
+            "blue",
+        )
+        .expect("structured song OCR should route");
+
+        assert_eq!(routed.username, "用户");
+        assert_eq!(routed.user_command, "@点歌 醉 三无Marblue");
+        assert_eq!(
+            routed.command,
+            ModuleCommand::SongRequest(SongCommand {
+                keyword: "醉 三无Marblue".to_string(),
+                source: SongSource::QqMusic,
+                prefix: "点歌".to_string(),
+                prefer_accompaniment: false,
+                ai_assisted: false,
+                friend_username: String::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn structured_song_ocr_without_sender_uses_hall_fallback_identity() {
+        let routed = parse_text("歌曲名:流月人间,歌手名:泠鸢yousa", "blue")
+            .expect("structured song OCR should route without sender prefix");
+
+        assert_eq!(routed.username, "一级大厅");
+        assert_eq!(routed.user_command, "@点歌 流月人间 泠鸢yousa");
     }
 
     #[test]

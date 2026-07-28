@@ -1,8 +1,10 @@
 use enigo::Key;
+use std::sync::{Arc, Mutex};
 
 use super::friend_delivery::{
     FriendDeliveryRoutineConfig, UiResidencyOutcome, UiResidencyTarget, before_input_failure,
-    capture_normalized, confirm_primary_residency, restore_residency, sleep_ms,
+    capture_normalized, confirm_primary_residency, friend_list_drag_points, restore_residency,
+    sleep_ms,
 };
 #[cfg(test)]
 use crate::config::AppConfig;
@@ -13,11 +15,14 @@ use crate::runtime::ui::{
     UiSubmitError, sealed,
 };
 use crate::text::normalize_comparison_text as normalize_lock_text;
+use crate::ui::frame::LatestFrameCache;
 use crate::ui::geometry::{Rect, crop_canvas};
 use crate::ui::locator::{
     HALL_INFO_OCR_SAMPLES, HallInfo, HallInfoSample, display_or_empty, merge_hall_info_samples,
-    parse_hall_remaining_minutes,
+    parse_hall_member_count, parse_hall_remaining_minutes,
 };
+
+const HALL_MEMBER_SCROLL_THRESHOLD: u32 = 7;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ReadHallInfo;
@@ -99,6 +104,7 @@ pub(crate) struct HallUi {
     runtime: UiRuntimeHandle,
     ocr: OcrRuntimeHandle,
     config: HallRoutineConfig,
+    hall_screenshot: Arc<Mutex<LatestFrameCache>>,
 }
 
 impl HallUi {
@@ -106,11 +112,13 @@ impl HallUi {
         runtime: UiRuntimeHandle,
         ocr: OcrRuntimeHandle,
         config: HallRoutineConfig,
+        hall_screenshot: Arc<Mutex<LatestFrameCache>>,
     ) -> Self {
         Self {
             runtime,
             ocr,
             config,
+            hall_screenshot,
         }
     }
 
@@ -122,6 +130,7 @@ impl HallUi {
             request,
             ocr: self.ocr.clone(),
             config: self.config.clone(),
+            hall_screenshot: Arc::clone(&self.hall_screenshot),
         })
     }
 
@@ -133,6 +142,7 @@ impl HallUi {
             request,
             ocr: self.ocr.clone(),
             config: self.config.clone(),
+            hall_screenshot: Arc::clone(&self.hall_screenshot),
         })
     }
 
@@ -152,7 +162,9 @@ impl HallUi {
 pub(crate) struct HallRoutineConfig {
     residency: FriendDeliveryRoutineConfig,
     hall_name_region: Rect,
+    hall_member_count_region: Rect,
     hall_time_region: Rect,
+    hall_member_list_region: Rect,
     page_settle_ms: u64,
     sample_interval_ms: u64,
     same_line_y_tolerance: i32,
@@ -168,7 +180,9 @@ impl HallRoutineConfig {
         Self {
             residency,
             hall_name_region: screen.hall_name_rect.into(),
+            hall_member_count_region: screen.hall_member_count_rect.into(),
             hall_time_region: screen.hall_time_rect.into(),
+            hall_member_list_region: screen.hall_member_list_rect.into(),
             page_settle_ms: timing.page_settle_ms,
             sample_interval_ms: timing.ocr_sample_interval_ms,
             same_line_y_tolerance: ocr.same_line_y_tolerance,
@@ -190,6 +204,7 @@ struct ReadHallInfoRoutine {
     request: ReadHallInfo,
     ocr: OcrRuntimeHandle,
     config: HallRoutineConfig,
+    hall_screenshot: Arc<Mutex<LatestFrameCache>>,
 }
 
 impl sealed::UiRoutineSealed for ReadHallInfoRoutine {}
@@ -200,8 +215,13 @@ impl UiRoutine for ReadHallInfoRoutine {
     fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
         let _ = self.request;
         let mut opened = false;
-        let effect = match read_hall_info_transaction(context, &self.ocr, &self.config, &mut opened)
-        {
+        let effect = match read_hall_info_transaction(
+            context,
+            &self.ocr,
+            &self.config,
+            &self.hall_screenshot,
+            &mut opened,
+        ) {
             Ok(info) => ReadHallInfoEffect::Read(info),
             Err(failure) => ReadHallInfoEffect::Failed(failure),
         };
@@ -214,6 +234,7 @@ struct DetectPublicHallRoutine {
     request: DetectPublicHall,
     ocr: OcrRuntimeHandle,
     config: HallRoutineConfig,
+    hall_screenshot: Arc<Mutex<LatestFrameCache>>,
 }
 
 impl sealed::UiRoutineSealed for DetectPublicHallRoutine {}
@@ -224,8 +245,13 @@ impl UiRoutine for DetectPublicHallRoutine {
     fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
         let _ = self.request;
         let mut opened = false;
-        let effect = match read_hall_info_transaction(context, &self.ocr, &self.config, &mut opened)
-        {
+        let effect = match read_hall_info_transaction(
+            context,
+            &self.ocr,
+            &self.config,
+            &self.hall_screenshot,
+            &mut opened,
+        ) {
             Ok(info) => {
                 let is_public = normalize_lock_text(&info.name) == normalize_lock_text("公共大厅");
                 DetectPublicHallEffect::Detected { is_public, info }
@@ -293,6 +319,7 @@ fn read_hall_info_transaction(
     context: &mut UiRoutineContext<'_>,
     ocr: &OcrRuntimeHandle,
     config: &HallRoutineConfig,
+    hall_screenshot: &Arc<Mutex<LatestFrameCache>>,
     opened: &mut bool,
 ) -> Result<HallInfo, UiRoutineFailure> {
     prepare_primary(context, ocr, config)?;
@@ -306,17 +333,57 @@ fn read_hall_info_transaction(
     *opened = true;
     sleep_ms(config.page_settle_ms);
 
+    let mut detection_image = capture_normalized(
+        context,
+        &config.residency,
+        "capture_hall_screenshot",
+        InputCertainty::AfterInputUnknown,
+    )?;
+    store_hall_screenshot(hall_screenshot, &detection_image);
+    match read_hall_member_count(ocr, &detection_image, config) {
+        Ok(Some(member_count)) => {
+            log::info!(
+                "大厅成员人数 OCR 结果: {}，滚动阈值={}",
+                member_count,
+                HALL_MEMBER_SCROLL_THRESHOLD
+            );
+            if member_count > HALL_MEMBER_SCROLL_THRESHOLD {
+                let (from, to) = friend_list_drag_points(config.hall_member_list_region);
+                context
+                    .device()
+                    .drag_point(from.x, from.y, to.x, to.y)
+                    .map_err(|error| before_input_failure("drag_hall_member_list", error))?;
+                sleep_ms(config.page_settle_ms);
+                detection_image = capture_normalized(
+                    context,
+                    &config.residency,
+                    "capture_scrolled_hall_screenshot",
+                    InputCertainty::AfterInputUnknown,
+                )?;
+                store_hall_screenshot(hall_screenshot, &detection_image);
+            }
+        }
+        Ok(None) => log::debug!("大厅成员人数 OCR 未识别，跳过成员列表滚动"),
+        Err(failure) => log::warn!("大厅成员人数 OCR 失败，跳过成员列表滚动: {failure}"),
+    }
+
     let mut samples = Vec::with_capacity(HALL_INFO_OCR_SAMPLES);
     for index in 0..HALL_INFO_OCR_SAMPLES {
         if index > 0 {
             sleep_ms(config.sample_interval_ms);
         }
-        let image = capture_normalized(
-            context,
-            &config.residency,
-            "capture_hall_info",
-            InputCertainty::AfterInputUnknown,
-        )?;
+        let image = if index == 0 {
+            &detection_image
+        } else {
+            detection_image = capture_normalized(
+                context,
+                &config.residency,
+                "capture_hall_info",
+                InputCertainty::AfterInputUnknown,
+            )?;
+            store_hall_screenshot(hall_screenshot, &detection_image);
+            &detection_image
+        };
         let sample = read_hall_sample(ocr, &image, config)?;
         log::info!(
             "大厅检测 OCR 采样: {}/{} name={} time={} minutes={}",
@@ -332,6 +399,30 @@ fn read_hall_info_transaction(
         samples.push(sample);
     }
     Ok(merge_hall_info_samples(&samples))
+}
+
+fn read_hall_member_count(
+    ocr: &OcrRuntimeHandle,
+    image: &image::DynamicImage,
+    config: &HallRoutineConfig,
+) -> Result<Option<u32>, UiRoutineFailure> {
+    let count_crop = crop_canvas(image, config.hall_member_count_region)
+        .map_err(|error| before_input_failure("crop_hall_member_count", error))?;
+    let count_text = ocr
+        .merged_text(
+            count_crop,
+            config.same_line_y_tolerance,
+            OcrPriority::UiConfirmation,
+        )
+        .map_err(|error| before_input_failure("ocr_hall_member_count", error))?;
+    Ok(parse_hall_member_count(&count_text))
+}
+
+fn store_hall_screenshot(cache: &Arc<Mutex<LatestFrameCache>>, image: &image::DynamicImage) {
+    match cache.lock() {
+        Ok(mut cache) => cache.store(Arc::new(image.clone())),
+        Err(_) => log::error!("大厅截图缓存锁已损坏"),
+    }
 }
 
 fn read_hall_sample(
@@ -406,6 +497,7 @@ mod tests {
     struct HallDevice {
         frame: DynamicImage,
         keys: Arc<Mutex<Vec<Key>>>,
+        drags: Arc<Mutex<Vec<(i32, i32, i32, i32)>>>,
     }
 
     impl UiDevice for HallDevice {
@@ -419,6 +511,14 @@ mod tests {
 
         fn press_key(&mut self, key: Key) -> Result<()> {
             self.keys.lock().unwrap().push(key);
+            Ok(())
+        }
+
+        fn drag_point(&mut self, from_x: i32, from_y: i32, to_x: i32, to_y: i32) -> Result<()> {
+            self.drags
+                .lock()
+                .unwrap()
+                .push((from_x, from_y, to_x, to_y));
             Ok(())
         }
     }
@@ -463,7 +563,7 @@ mod tests {
     }
 
     struct HallOcrDevice {
-        calls: usize,
+        member_count: &'static str,
     }
 
     fn start_test_ui_runtime(device: impl UiDevice, config: &AppConfig) -> UiRuntime {
@@ -481,12 +581,11 @@ mod tests {
 
     impl OcrDevice for HallOcrDevice {
         fn recognize_lines(&mut self, image: &DynamicImage) -> Result<Vec<OcrLine>> {
-            let text = if self.calls.is_multiple_of(2) {
-                "公共大厅"
-            } else {
-                ""
+            let text = match (image.width(), image.height()) {
+                (450, 50) => self.member_count,
+                (325, 40) => "公共大厅",
+                _ => "",
             };
-            self.calls += 1;
             Ok(vec![OcrLine {
                 text: text.to_string(),
                 confidence: 1.0,
@@ -505,18 +604,28 @@ mod tests {
         config.timing.workflow.default_timeout_ms = 200;
         config.timing.workflow.default_poll_ms = 1;
         let keys = Arc::new(Mutex::new(Vec::new()));
+        let drags = Arc::new(Mutex::new(Vec::new()));
         let ui_runtime = start_test_ui_runtime(
             HallDevice {
                 frame: primary_frame(&config),
                 keys: keys.clone(),
+                drags: drags.clone(),
             },
             &config,
         );
-        let ocr_runtime = OcrRuntime::start(HallOcrDevice { calls: 0 }, 4).unwrap();
+        let ocr_runtime = OcrRuntime::start(
+            HallOcrDevice {
+                member_count: "大厅人数 8/12",
+            },
+            4,
+        )
+        .unwrap();
+        let hall_screenshot = Arc::new(Mutex::new(LatestFrameCache::default()));
         let hall_ui = HallUi::new(
             ui_runtime.handle(),
             ocr_runtime.handle(),
             HallRoutineConfig::from_app(&config),
+            hall_screenshot.clone(),
         );
 
         let outcome = hall_ui
@@ -541,6 +650,8 @@ mod tests {
             outcome.residency()
         );
         assert_eq!(*keys.lock().unwrap(), [Key::F2, Key::Escape]);
+        assert_eq!(*drags.lock().unwrap(), [(1240, 910, 1240, 160)]);
+        assert!(hall_screenshot.lock().unwrap().image().is_some());
 
         ui_runtime.shutdown().unwrap();
         ocr_runtime.shutdown().unwrap();
@@ -564,11 +675,18 @@ mod tests {
             },
             &config,
         );
-        let ocr_runtime = OcrRuntime::start(HallOcrDevice { calls: 0 }, 4).unwrap();
+        let ocr_runtime = OcrRuntime::start(
+            HallOcrDevice {
+                member_count: "大厅人数 3/12",
+            },
+            4,
+        )
+        .unwrap();
         let hall_ui = HallUi::new(
             ui_runtime.handle(),
             ocr_runtime.handle(),
             HallRoutineConfig::from_app(&config),
+            Arc::new(Mutex::new(LatestFrameCache::default())),
         );
 
         let outcome = hall_ui

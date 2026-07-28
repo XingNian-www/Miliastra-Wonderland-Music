@@ -152,18 +152,22 @@ fn secondary_hall_command_observation(
     message: &SecondaryOcrMessage,
     row_from_bottom: usize,
 ) -> Option<SecondaryHallCommandObservation> {
-    let command = secondary_hall_command_text(&message.text)?;
-    let command = command.trim();
-    let (prefix, payload) = if let Some(payload) = command.strip_prefix('@') {
-        ('@', payload)
-    } else if let Some(payload) = command.strip_prefix('#') {
-        ('#', payload)
-    } else if let Some(payload) = command.strip_prefix('＃') {
-        ('#', payload)
+    let command_key = if let Some(command) = secondary_hall_command_text(&message.text) {
+        let command = command.trim();
+        let (prefix, payload) = if let Some(payload) = command.strip_prefix('@') {
+            ('@', payload)
+        } else if let Some(payload) = command.strip_prefix('#') {
+            ('#', payload)
+        } else if let Some(payload) = command.strip_prefix('＃') {
+            ('#', payload)
+        } else {
+            return None;
+        };
+        format!("{prefix}:{}", command_identity(payload))
     } else {
-        return None;
+        let input = crate::features::song_request::parse_structured_song_text(&message.text)?;
+        format!("@:{}", command_identity(&input.keyword()))
     };
-    let command_key = format!("{prefix}:{}", command_identity(payload));
     let actor = if message.requires_sender {
         message
             .sender_identity
@@ -1285,5 +1289,18 @@ mod tests {
             requires_sender: true,
         }];
         assert_eq!(tracker.preview_new_indexes(&pending), vec![0]);
+    }
+
+    #[test]
+    fn command_tracker_detects_structured_song_ocr_as_a_new_command() {
+        let mut tracker = SecondaryHallCommandTracker::default();
+        let previous = vec![command("@帮助")];
+        tracker.commit(&previous);
+
+        let current = vec![command("歌曲名：醉，歌手名：三无Marblue，专辑名：")];
+        assert_eq!(tracker.preview_new_indexes(&current), vec![0]);
+
+        tracker.commit(&current);
+        assert!(tracker.preview_new_indexes(&current).is_empty());
     }
 }

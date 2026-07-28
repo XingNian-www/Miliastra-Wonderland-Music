@@ -606,7 +606,7 @@ startup:
   launch_game: true
   # 是否处理“点击进入”等开门按钮
   enter_game: true
-  # 是否按 F6 打开千星奇域，并进入大厅后停止
+  # 是否按 M 打开地图，进入千星奇域大厅后停止
   enter_wonderland: true
   # 启动 EXE 路径；可填完整 exe 文件路径，也可填 exe 所在目录；留空时自动从米哈游启动器注册表查找官服/国际服
   exe_path: ""
@@ -620,17 +620,17 @@ startup:
   enter_game_timeout_ms: 60000
   # 等待千星奇域界面/大厅确认的最长时间，单位毫秒
   enter_wonderland_timeout_ms: 300000
-  # 打开千星主页阶段最多按 F6 次数
-  wonderland_home_retries: 120
-  # 打开千星主页阶段每次按 F6 后等待时间，单位毫秒
-  wonderland_home_retry_ms: 2500
-  # 点击奇域卡片阶段最多重试次数
-  wonderland_card_retries: 90
-  # 每次点击奇域卡片后等待“前往大厅”按钮出现的时间，单位毫秒
-  wonderland_card_retry_ms: 2000
-  # 点击“前往大厅”后等待按钮消失的最长时间，单位毫秒
-  wonderland_confirm_absent_timeout_ms: 60000
-  # “前往大厅”按钮消失后等待该区域像素稳定的最长时间，单位毫秒
+  # 地图星型入口阶段最多匹配次数
+  wonderland_map_star_retries: 120
+  # 地图星型入口匹配轮询间隔，单位毫秒
+  wonderland_map_star_retry_ms: 2500
+  # 千星大厅 OCR 阶段最多重试次数
+  wonderland_hall_retries: 90
+  # 千星大厅 OCR 轮询间隔，单位毫秒
+  wonderland_hall_retry_ms: 2000
+  # 千星入口和确认弹窗各阶段过渡等待的最长时间，单位毫秒
+  wonderland_transition_timeout_ms: 60000
+  # 确认按钮消失后等待该区域像素稳定的最长时间，单位毫秒
   wonderland_confirm_stable_timeout_ms: 60000
   # 启动游戏结束时等待派蒙菜单模板的最长时间，单位毫秒
   final_primary_timeout_ms: 120000
@@ -640,45 +640,47 @@ startup:
   stable_mean_threshold: 2.0
   # 像素稳定变化比例阈值
   stable_changed_ratio_threshold: 0.01
-  # 启动/千星模板匹配阈值；越高越严格
+  # 启动界面模板匹配阈值（例如派蒙菜单）；越高越严格
   template_threshold: 0.9
-  # 千星“前往大厅”按钮模板匹配阈值；越高越严格
-  wonderland_enter_button_threshold: 0.9
+  # 千星确认按钮模板匹配阈值；越高越严格
+  wonderland_confirm_threshold: 0.9
   # 进入千星流程模板资源；启动游戏完成判断使用 paimon_menu
   templates:
-    # 千星“前往大厅”按钮模板
-    wonderland_enter_button: assets/startup-confirm-black.png
+    # 地图右下角星型入口模板
+    wonderland_map_star: assets/startup-wonderland-map-star.png
+    # 千星弹窗“确认”按钮模板
+    wonderland_confirm: assets/startup-wonderland-confirm.png
     paimon_menu: assets/startup-paimon-menu.png
-    wonderland_close: assets/startup-wonderland-close.png
   # “点击进入”按钮 OCR 区域
   enter_game_text_region:
     x: 900
     y: 1000
     width: 130
     height: 40
-  # 千星“前往大厅”按钮模板区域
-  wonderland_enter_button_region:
-    x: 1400
-    y: 850
-    width: 360
-    height: 150
+  # 右侧千星大厅选项 OCR 区域
+  wonderland_hall_ocr_region:
+    x: 1280
+    y: 0
+    width: 640
+    height: 1040
+  # 千星确认按钮模板区域
+  wonderland_confirm_region:
+    x: 450
+    y: 650
+    width: 1050
+    height: 250
   # 派蒙菜单/主界面模板区域
   main_ui_region:
     x: 0
     y: 0
     width: 480
     height: 270
-  # F6 打开的千星奇域主页右上角关闭/返回模板区域
-  wonderland_close_region:
-    x: 1780
-    y: 0
-    width: 140
-    height: 90
-  # 默认点击第一个奇域卡片的位置，按 1920x1080 坐标
-  wonderland_card_point:
-    x: 680
-    y: 310
-
+  # 地图右下角星型入口模板区域
+  wonderland_map_star_region:
+    x: 1700
+    y: 850
+    width: 220
+    height: 230
 invite:
   # 好友备注连续完整匹配次数；大于 1 时覆盖全局值，0 或 1 表示继承
   friend_name_stable_count: 0

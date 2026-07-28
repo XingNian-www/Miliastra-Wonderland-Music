@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{PointConfig, RectConfig, validate_rect};
+use crate::config::{RectConfig, validate_rect};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -19,32 +19,32 @@ pub struct StartupConfig {
     pub launch_retries: u32,
     pub enter_game_timeout_ms: u64,
     pub enter_wonderland_timeout_ms: u64,
-    pub wonderland_home_retries: u32,
-    pub wonderland_home_retry_ms: u64,
-    pub wonderland_card_retries: u32,
-    pub wonderland_card_retry_ms: u64,
-    pub wonderland_confirm_absent_timeout_ms: u64,
+    pub wonderland_map_star_retries: u32,
+    pub wonderland_map_star_retry_ms: u64,
+    pub wonderland_hall_retries: u32,
+    pub wonderland_hall_retry_ms: u64,
+    pub wonderland_transition_timeout_ms: u64,
     pub wonderland_confirm_stable_timeout_ms: u64,
     pub final_primary_timeout_ms: u64,
     pub poll_ms: u64,
     pub stable_mean_threshold: f32,
     pub stable_changed_ratio_threshold: f32,
     pub template_threshold: f32,
-    pub wonderland_enter_button_threshold: f32,
+    pub wonderland_confirm_threshold: f32,
     pub templates: StartupTemplateConfig,
     pub enter_game_text_region: RectConfig,
-    pub wonderland_enter_button_region: RectConfig,
+    pub wonderland_hall_ocr_region: RectConfig,
+    pub wonderland_confirm_region: RectConfig,
     pub main_ui_region: RectConfig,
-    pub wonderland_close_region: RectConfig,
-    pub wonderland_card_point: PointConfig,
+    pub wonderland_map_star_region: RectConfig,
 }
 
 impl StartupConfig {
     pub(crate) fn validate(&self) -> Result<()> {
         validate_threshold(self.template_threshold, "startup.template_threshold")?;
         validate_threshold(
-            self.wonderland_enter_button_threshold,
-            "startup.wonderland_enter_button_threshold",
+            self.wonderland_confirm_threshold,
+            "startup.wonderland_confirm_threshold",
         )?;
         if !self.stable_mean_threshold.is_finite() || self.stable_mean_threshold < 0.0 {
             bail!("startup.stable_mean_threshold 必须是非负有限小数");
@@ -61,16 +61,16 @@ impl StartupConfig {
                 "startup.enter_wonderland_timeout_ms",
             ),
             (
-                self.wonderland_home_retry_ms,
-                "startup.wonderland_home_retry_ms",
+                self.wonderland_map_star_retry_ms,
+                "startup.wonderland_map_star_retry_ms",
             ),
             (
-                self.wonderland_card_retry_ms,
-                "startup.wonderland_card_retry_ms",
+                self.wonderland_hall_retry_ms,
+                "startup.wonderland_hall_retry_ms",
             ),
             (
-                self.wonderland_confirm_absent_timeout_ms,
-                "startup.wonderland_confirm_absent_timeout_ms",
+                self.wonderland_transition_timeout_ms,
+                "startup.wonderland_transition_timeout_ms",
             ),
             (
                 self.wonderland_confirm_stable_timeout_ms,
@@ -89,12 +89,12 @@ impl StartupConfig {
         for (value, field) in [
             (self.launch_retries, "startup.launch_retries"),
             (
-                self.wonderland_home_retries,
-                "startup.wonderland_home_retries",
+                self.wonderland_map_star_retries,
+                "startup.wonderland_map_star_retries",
             ),
             (
-                self.wonderland_card_retries,
-                "startup.wonderland_card_retries",
+                self.wonderland_hall_retries,
+                "startup.wonderland_hall_retries",
             ),
         ] {
             if value == 0 {
@@ -107,26 +107,30 @@ impl StartupConfig {
                 "startup.enter_game_text_region",
             ),
             (
-                self.wonderland_enter_button_region,
-                "startup.wonderland_enter_button_region",
+                self.wonderland_confirm_region,
+                "startup.wonderland_confirm_region",
+            ),
+            (
+                self.wonderland_hall_ocr_region,
+                "startup.wonderland_hall_ocr_region",
             ),
             (self.main_ui_region, "startup.main_ui_region"),
             (
-                self.wonderland_close_region,
-                "startup.wonderland_close_region",
+                self.wonderland_map_star_region,
+                "startup.wonderland_map_star_region",
             ),
         ] {
             validate_rect(rect, field)?;
         }
         for (path, field) in [
             (
-                &self.templates.wonderland_enter_button,
-                "startup.templates.wonderland_enter_button",
+                &self.templates.wonderland_confirm,
+                "startup.templates.wonderland_confirm",
             ),
             (&self.templates.paimon_menu, "startup.templates.paimon_menu"),
             (
-                &self.templates.wonderland_close,
-                "startup.templates.wonderland_close",
+                &self.templates.wonderland_map_star,
+                "startup.templates.wonderland_map_star",
             ),
         ] {
             if path.as_os_str().is_empty() {
@@ -147,9 +151,9 @@ fn validate_threshold(value: f32, field: &str) -> Result<()> {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StartupTemplateConfig {
-    pub wonderland_enter_button: PathBuf,
+    pub wonderland_map_star: PathBuf,
+    pub wonderland_confirm: PathBuf,
     pub paimon_menu: PathBuf,
-    pub wonderland_close: PathBuf,
 }
 
 const START_GAME_CONTEXT_LOSS_REASON: &str = "启动游戏任务将重建聊天上下文";

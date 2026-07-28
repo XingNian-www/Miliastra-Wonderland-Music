@@ -24,6 +24,70 @@ pub(crate) use review::{
 };
 pub use search::{PickedCandidate, SearchCandidate};
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StructuredSongInput {
+    pub(crate) title: String,
+    pub(crate) artist: String,
+    pub(crate) album: String,
+}
+
+impl StructuredSongInput {
+    pub(crate) fn keyword(&self) -> String {
+        [self.title.as_str(), self.artist.as_str()]
+            .into_iter()
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+/// Parses the metadata format emitted by the song-list OCR source.
+///
+/// The album field is accepted (and may be empty) so that a partially populated metadata line
+/// still becomes a song request. FeelUOwn's search endpoint accepts a title/artist query more
+/// reliably than an album suffix, so the album is retained for diagnostics but is not appended to
+/// the search keyword.
+pub(crate) fn parse_structured_song_text(text: &str) -> Option<StructuredSongInput> {
+    let text = text.trim();
+    let title_start = text.find("歌曲名")?;
+    let title_label_end = title_start + "歌曲名".len();
+    let artist_start = text[title_label_end..].find("歌手名")? + title_label_end;
+    let artist_label_end = artist_start + "歌手名".len();
+    let album_start = text[artist_label_end..]
+        .find("专辑名")
+        .map(|offset| offset + artist_label_end);
+
+    let title = structured_song_field(&text[title_label_end..artist_start])?;
+    let artist_end = album_start.unwrap_or(text.len());
+    let artist = structured_song_field(&text[artist_label_end..artist_end])?;
+    let album = album_start
+        .and_then(|start| structured_song_field(&text[start + "专辑名".len()..]))
+        .unwrap_or_default();
+    if title.is_empty() || artist.is_empty() {
+        return None;
+    }
+
+    Some(StructuredSongInput {
+        title,
+        artist,
+        album,
+    })
+}
+
+fn structured_song_field(value: &str) -> Option<String> {
+    let value = value
+        .trim()
+        .strip_prefix(':')
+        .or_else(|| value.trim().strip_prefix('：'))?
+        .trim_matches(|ch: char| {
+            ch.is_whitespace() || matches!(ch, ',' | '，' | ';' | '；' | '。' | '.')
+        })
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some(value)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct SongCommand {
     pub(crate) keyword: String,
@@ -251,3 +315,37 @@ const FRIEND_COMMANDS: &[(&str, SongSource, bool)] = &[
     ("点歌", SongSource::QqMusic, false),
     ("搜索", SongSource::QqMusic, false),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_structured_song_metadata_and_ignores_album_in_keyword() {
+        let input = parse_structured_song_text(
+            "歌曲名：醉，歌手名：三无Marblue，专辑名：三无Marblue（170509更新）",
+        )
+        .expect("structured song input");
+
+        assert_eq!(input.title, "醉");
+        assert_eq!(input.artist, "三无Marblue");
+        assert_eq!(input.album, "三无Marblue（170509更新）");
+        assert_eq!(input.keyword(), "醉 三无Marblue");
+    }
+
+    #[test]
+    fn accepts_ascii_colons_and_missing_album_field() {
+        let input = parse_structured_song_text("歌曲名:流月人间,歌手名:泠鸢yousa")
+            .expect("structured song input");
+
+        assert_eq!(input.keyword(), "流月人间 泠鸢yousa");
+        assert!(input.album.is_empty());
+    }
+
+    #[test]
+    fn rejects_incomplete_structured_song_metadata() {
+        assert!(parse_structured_song_text("歌曲名：醉，专辑名：专辑").is_none());
+        assert!(parse_structured_song_text("歌手名：三无，专辑名：专辑").is_none());
+        assert!(parse_structured_song_text("歌曲名：，歌手名：三无").is_none());
+    }
+}

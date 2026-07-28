@@ -786,6 +786,14 @@ impl ApplicationRuntime {
                             CommandObservation::default(),
                         )
                     })
+                    .or_else(|| {
+                        command::parse_structured_song_envelope(
+                            &text,
+                            SECONDARY_HALL_FALLBACK_SENDER,
+                            "blue",
+                            CommandObservation::default(),
+                        )
+                    })
                     .and_then(|envelope| command_router.route(&envelope, active_entertainment));
                 classify_secondary_hall_message(
                     &text,
@@ -970,7 +978,11 @@ impl ApplicationRuntime {
                 message_id: Some(message_id.clone()),
             };
             let shortcut_player = if message_type == "pink" {
-                friend_name.trim()
+                if friend_name.trim().is_empty() {
+                    "二级好友"
+                } else {
+                    friend_name.trim()
+                }
             } else {
                 message_sender
                     .as_deref()
@@ -978,6 +990,19 @@ impl ApplicationRuntime {
                     .filter(|sender| !sender.is_empty())
                     .unwrap_or(SECONDARY_HALL_FALLBACK_SENDER)
             };
+            let router = ChatCommandRouter::new(&self.custom_workflow);
+            if let Some(envelope) = command::parse_structured_song_envelope(
+                &text,
+                shortcut_player,
+                &message_type,
+                command_observation.clone(),
+            ) && let Some(parsed) =
+                router.route(&envelope, self.business.active_entertainment()?)
+            {
+                self.submit_secondary_command(parsed)?;
+                processed = true;
+                continue;
+            }
             if let Some(envelope) = CommandEnvelope::new(
                 &text,
                 shortcut_player,
@@ -985,14 +1010,11 @@ impl ApplicationRuntime {
                 text.trim(),
                 command_observation.clone(),
             ) && envelope.prefix() == CommandPrefix::Hash
+                && let Some(parsed) = router.route(&envelope, self.business.active_entertainment()?)
             {
-                let router = ChatCommandRouter::new(&self.custom_workflow);
-                if let Some(parsed) = router.route(&envelope, self.business.active_entertainment()?)
-                {
-                    self.submit_secondary_command(parsed)?;
-                    processed = true;
-                    continue;
-                }
+                self.submit_secondary_command(parsed)?;
+                processed = true;
+                continue;
             }
             if accepts_turtle_questions {
                 let question = message_sender
@@ -1033,7 +1055,6 @@ impl ApplicationRuntime {
             ) else {
                 continue;
             };
-            let router = ChatCommandRouter::new(&self.custom_workflow);
             let Some(parsed) = router.route(&envelope, self.business.active_entertainment()?)
             else {
                 log::debug!("二级监听气泡未解析为命令");

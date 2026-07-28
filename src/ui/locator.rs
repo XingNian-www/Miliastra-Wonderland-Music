@@ -43,6 +43,17 @@ pub(crate) fn parse_hall_remaining_minutes(text: &str) -> Option<u32> {
     }
 }
 
+pub(crate) fn parse_hall_member_count(text: &str) -> Option<u32> {
+    let separator = text.find(|ch| matches!(ch, '/' | '／' | '|' | '丨'))?;
+    let current = &text[..separator];
+    let digits = current
+        .chars()
+        .filter_map(normalize_ascii_digit)
+        .collect::<String>();
+    let count = digits.parse::<u32>().ok()?;
+    (count <= 12).then_some(count)
+}
+
 pub(crate) fn merge_hall_info_samples(samples: &[HallInfoSample]) -> HallInfo {
     let name = most_frequent_hall_name(samples).unwrap_or_else(|| {
         samples
@@ -129,5 +140,13 @@ mod tests {
     fn rejects_invalid_hall_remaining_minutes() {
         assert_eq!(parse_hall_remaining_minutes("公共大厅"), None);
         assert_eq!(parse_hall_remaining_minutes("剩余181分钟"), None);
+    }
+
+    #[test]
+    fn parses_hall_member_count_before_capacity_separator() {
+        assert_eq!(parse_hall_member_count("大厅人数 3/12"), Some(3));
+        assert_eq!(parse_hall_member_count("大厅人数７／１２"), Some(7));
+        assert_eq!(parse_hall_member_count("大厅人数 13/12"), None);
+        assert_eq!(parse_hall_member_count("公共大厅"), None);
     }
 }

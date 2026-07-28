@@ -128,6 +128,7 @@ impl ApplicationRuntime {
             formal_tasks,
             self.monitor.clone(),
             self.latest_frame.clone(),
+            self.hall_screenshot.clone(),
             self.player_search.clone(),
             player_runtime,
             self.ai.clone(),

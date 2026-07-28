@@ -2,9 +2,9 @@ use enigo::Key;
 use std::sync::Arc;
 
 use super::friend_delivery::{
-    FriendDeliveryRoutineConfig, UiResidencyOutcome, UiResidencyTarget, before_input_failure,
-    capture_normalized, confirm_primary_residency, friend_list_drag_points, restore_residency,
-    sleep_ms,
+    FriendDeliveryRoutineConfig, UiResidencyOutcome, UiResidencyTarget, after_input_failure,
+    before_input_failure, capture_normalized, confirm_primary_residency, friend_list_drag_points,
+    restore_residency, sleep_ms,
 };
 #[cfg(test)]
 use crate::config::AppConfig;
@@ -343,7 +343,7 @@ fn read_hall_info_transaction(
                 context
                     .device()
                     .drag_point(from.x, from.y, to.x, to.y)
-                    .map_err(|error| before_input_failure("drag_hall_member_list", error))?;
+                    .map_err(|error| after_input_failure("drag_hall_member_list", error))?;
                 sleep_ms(config.page_settle_ms);
                 detection_image = capture_normalized(
                     context,
@@ -397,14 +397,14 @@ fn read_hall_member_count(
     config: &HallRoutineConfig,
 ) -> Result<Option<u32>, UiRoutineFailure> {
     let count_crop = crop_canvas(image, config.hall_member_count_region)
-        .map_err(|error| before_input_failure("crop_hall_member_count", error))?;
+        .map_err(|error| after_input_failure("crop_hall_member_count", error))?;
     let count_text = ocr
         .merged_text(
             count_crop,
             config.same_line_y_tolerance,
             OcrPriority::UiConfirmation,
         )
-        .map_err(|error| before_input_failure("ocr_hall_member_count", error))?;
+        .map_err(|error| after_input_failure("ocr_hall_member_count", error))?;
     Ok(parse_hall_member_count(&count_text))
 }
 
@@ -428,23 +428,23 @@ fn read_hall_sample(
     config: &HallRoutineConfig,
 ) -> Result<HallInfoSample, UiRoutineFailure> {
     let name_crop = crop_canvas(image, config.hall_name_region)
-        .map_err(|error| before_input_failure("crop_hall_name", error))?;
+        .map_err(|error| after_input_failure("crop_hall_name", error))?;
     let name = ocr
         .merged_text(
             name_crop,
             config.same_line_y_tolerance,
             OcrPriority::UiConfirmation,
         )
-        .map_err(|error| before_input_failure("ocr_hall_name", error))?;
+        .map_err(|error| after_input_failure("ocr_hall_name", error))?;
     let time_crop = crop_canvas(image, config.hall_time_region)
-        .map_err(|error| before_input_failure("crop_hall_time", error))?;
+        .map_err(|error| after_input_failure("crop_hall_time", error))?;
     let time_text = ocr
         .merged_text(
             time_crop,
             config.same_line_y_tolerance,
             OcrPriority::UiConfirmation,
         )
-        .map_err(|error| before_input_failure("ocr_hall_time", error))?;
+        .map_err(|error| after_input_failure("ocr_hall_time", error))?;
     Ok(HallInfoSample {
         name,
         remaining_minutes: parse_hall_remaining_minutes(&time_text),

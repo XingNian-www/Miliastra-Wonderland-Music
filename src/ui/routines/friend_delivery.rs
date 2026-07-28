@@ -900,7 +900,7 @@ fn locate_stable_friend_row(
     ))
 }
 
-fn friend_list_drag_points(region: Rect) -> (Point, Point) {
+pub(super) fn friend_list_drag_points(region: Rect) -> (Point, Point) {
     let avatar_x = region.x.saturating_sub(FRIEND_AVATAR_TEXT_OFFSET_X).max(0);
     let edge_inset = (region.height as i32 / 12).min(FRIEND_DRAG_MAX_EDGE_INSET);
     (

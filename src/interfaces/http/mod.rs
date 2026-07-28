@@ -199,7 +199,7 @@ const BODY_ROUTES: &[BodyRouteSpec] = &[BodyRouteSpec {
     handler: turtle_soup_questions_route,
 }];
 
-const SPECIAL_ROUTES: &[&str] = &["/screenshot"];
+const SPECIAL_ROUTES: &[&str] = &["/screenshot", "/hall-screenshot"];
 const ROUTES: &[RouteSpec] = &[
     RouteSpec {
         path: "/status",
@@ -567,6 +567,7 @@ pub struct HttpSharedState {
     formal_tasks: Arc<dyn HttpTaskPort>,
     queries: Arc<dyn HttpQueryPort>,
     latest_frame: Arc<Mutex<LatestFrameCache>>,
+    hall_screenshot: Arc<Mutex<LatestFrameCache>>,
     player: Arc<dyn HttpPlayerPort>,
     ai: Arc<dyn HttpAiPort>,
 }
@@ -648,6 +649,7 @@ impl HttpSharedState {
         queries: Arc<dyn HttpQueryPort>,
         monitor: MonitorShared,
         latest_frame: Arc<Mutex<LatestFrameCache>>,
+        hall_screenshot: Arc<Mutex<LatestFrameCache>>,
         player_search: PlayerSearchClient,
         player_runtime: PlayerRuntimeHandle,
         ai: AiClient,
@@ -663,6 +665,7 @@ impl HttpSharedState {
             queries,
             monitor,
             latest_frame,
+            hall_screenshot,
             player,
             Arc::new(ai),
         )
@@ -676,6 +679,7 @@ impl HttpSharedState {
         queries: Arc<dyn HttpQueryPort>,
         monitor: MonitorShared,
         latest_frame: Arc<Mutex<LatestFrameCache>>,
+        hall_screenshot: Arc<Mutex<LatestFrameCache>>,
         player: Arc<dyn HttpPlayerPort>,
         ai: Arc<dyn HttpAiPort>,
     ) -> Self {
@@ -688,6 +692,7 @@ impl HttpSharedState {
             formal_tasks,
             queries,
             latest_frame,
+            hall_screenshot,
             player,
             ai,
         }
@@ -913,6 +918,9 @@ fn handle_request(
     }
     if request.path == "/screenshot" {
         return screenshot_response(&request, state);
+    }
+    if request.path == "/hall-screenshot" {
+        return hall_screenshot_response(&request, state);
     }
 
     let routed = if let Some(spec) = body_route_spec(&request.path) {
@@ -2324,15 +2332,43 @@ fn screenshot_response(
     request: &Request,
     state: &HttpSharedState,
 ) -> std::result::Result<Response, AppError> {
+    cached_screenshot_response(
+        request,
+        &state.latest_frame,
+        "尚未获取主扫描画面，请稍后重试",
+        &state.config.http.host,
+        state.config.http.port,
+    )
+}
+
+fn hall_screenshot_response(
+    request: &Request,
+    state: &HttpSharedState,
+) -> std::result::Result<Response, AppError> {
+    cached_screenshot_response(
+        request,
+        &state.hall_screenshot,
+        "尚未执行大厅检测，请先运行大厅检测命令",
+        &state.config.http.host,
+        state.config.http.port,
+    )
+}
+
+fn cached_screenshot_response(
+    request: &Request,
+    cache: &Arc<Mutex<LatestFrameCache>>,
+    unavailable_message: &str,
+    host: &str,
+    port: u16,
+) -> std::result::Result<Response, AppError> {
     let quality = parse_jpeg_quality(query_value(&request.query, "quality"))?;
-    let image = state
-        .latest_frame
+    let image = cache
         .lock()
-        .map_err(|_| internal_message("主扫描画面缓存锁已损坏"))?
+        .map_err(|_| internal_message("截图缓存锁已损坏"))?
         .image()
         .ok_or_else(|| AppError {
             status: 503,
-            message: "尚未获取主扫描画面，请稍后重试".to_string(),
+            message: unavailable_message.to_string(),
         })?;
     let rgb = image.to_rgb8();
     let mut bytes = Vec::new();
@@ -2344,7 +2380,7 @@ fn screenshot_response(
         StatusCode::OK,
         "image/jpeg",
         bytes,
-        cors_headers(request, &state.config.http.host, state.config.http.port),
+        cors_headers(request, host, port),
     ))
 }
 
@@ -2420,7 +2456,12 @@ fn push_history(request: &Request, result: &str, ok: bool, state: &HttpSharedSta
     if request.path.starts_with("/tools/")
         || matches!(
             request.path.as_str(),
-            "/history" | "/clear-history" | "/monitor" | "/screenshot" | "/favicon.ico"
+            "/history"
+                | "/clear-history"
+                | "/monitor"
+                | "/screenshot"
+                | "/hall-screenshot"
+                | "/favicon.ico"
         )
     {
         return;
@@ -2666,7 +2707,7 @@ fn enforce_method(
     }
     if matches!(
         request.path.as_str(),
-        "/" | "/tools" | "/screenshot" | "/favicon.ico"
+        "/" | "/tools" | "/screenshot" | "/hall-screenshot" | "/favicon.ico"
     ) && request.method != "GET"
     {
         return Err(method_not_allowed("该资源仅支持GET请求"));
@@ -3584,6 +3625,27 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.status, 503);
+    }
+
+    #[test]
+    fn hall_screenshot_serves_the_last_detection_frame() {
+        let state = test_state();
+        state
+            .hall_screenshot
+            .lock()
+            .expect("hall screenshot cache")
+            .store(Arc::new(image::DynamicImage::new_rgb8(2, 2)));
+        let request = Request {
+            method: "GET".to_string(),
+            path: "/hall-screenshot".to_string(),
+            query: vec![("quality".to_string(), "88".to_string())],
+            headers: HeaderMap::new(),
+            body: Vec::new(),
+        };
+
+        let response = hall_screenshot_response(&request, &state).expect("hall screenshot");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[CONTENT_TYPE], "image/jpeg");
     }
 
     #[test]
@@ -4539,6 +4601,7 @@ workflows:
                 recording.clone(),
                 recording.clone(),
                 monitor,
+                Arc::new(Mutex::new(LatestFrameCache::default())),
                 Arc::new(Mutex::new(LatestFrameCache::default())),
                 Arc::new(player),
                 Arc::new(HttpTestAiPort),

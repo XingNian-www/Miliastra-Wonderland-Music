@@ -328,7 +328,7 @@ fn wait_template(
         }
         if Instant::now() >= deadline {
             return Err(UiRoutineFailure::new(
-                InputCertainty::ConfirmedFailure,
+                InputCertainty::AfterInputUnknown,
                 stage,
                 "required moderation template was not found before timeout",
             ));
@@ -402,7 +402,7 @@ fn recover_primary(
             Some(observation) => observation,
             None => {
                 return UiResidencyOutcome::Failed(UiRoutineFailure::new(
-                    InputCertainty::ConfirmedFailure,
+                    InputCertainty::AfterInputUnknown,
                     "recover_moderation",
                     "UI runtime has no configured template state classifier",
                 ));
@@ -412,7 +412,7 @@ fn recover_primary(
             UiStateObservation::Classified(state) => state.stable_kind(),
             UiStateObservation::Failed { reason, .. } => {
                 return UiResidencyOutcome::Failed(UiRoutineFailure::new(
-                    InputCertainty::ConfirmedFailure,
+                    InputCertainty::AfterInputUnknown,
                     "recover_moderation",
                     format!("template UI state classification failed: {reason}"),
                 ));
@@ -446,7 +446,7 @@ fn recover_primary(
         sleep_ms(config.return_retry_ms);
     }
     UiResidencyOutcome::Failed(UiRoutineFailure::new(
-        InputCertainty::ConfirmedFailure,
+        InputCertainty::AfterInputUnknown,
         "recover_moderation",
         "primary UI was not reached after bounded recovery",
     ))

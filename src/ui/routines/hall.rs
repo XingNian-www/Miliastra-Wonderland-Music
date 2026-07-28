@@ -345,12 +345,18 @@ fn read_hall_info_transaction(
                     .drag_point(from.x, from.y, to.x, to.y)
                     .map_err(|error| after_input_failure("drag_hall_member_list", error))?;
                 sleep_ms(config.page_settle_ms);
-                detection_image = capture_normalized(
+                let scrolled_image = capture_normalized(
                     context,
                     &config.residency,
                     "capture_scrolled_hall_screenshot",
                     InputCertainty::AfterInputUnknown,
-                )?;
+                );
+                context
+                    .device()
+                    .drag_point(to.x, to.y, from.x, from.y)
+                    .map_err(|error| after_input_failure("restore_hall_member_list", error))?;
+                sleep_ms(config.page_settle_ms);
+                detection_image = scrolled_image?;
                 screenshot = merge_hall_screenshots(&first_image, &detection_image);
             }
         }
@@ -647,7 +653,10 @@ mod tests {
             outcome.residency()
         );
         assert_eq!(*keys.lock().unwrap(), [Key::F2, Key::Escape]);
-        assert_eq!(*drags.lock().unwrap(), [(1240, 910, 1240, 160)]);
+        assert_eq!(
+            *drags.lock().unwrap(),
+            [(1240, 910, 1240, 160), (1240, 160, 1240, 910)]
+        );
 
         ui_runtime.shutdown().unwrap();
         ocr_runtime.shutdown().unwrap();

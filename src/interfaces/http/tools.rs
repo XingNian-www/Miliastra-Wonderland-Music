@@ -57,9 +57,9 @@ pub(crate) enum WebToolTemplate {
     FriendBlockChat,
     FriendBlacklist,
     FriendConfirm,
-    WonderlandEnterButton,
+    WonderlandConfirm,
     PaimonMenu,
-    WonderlandClose,
+    WonderlandMapStar,
     Custom(String),
 }
 
@@ -81,9 +81,9 @@ impl WebToolTemplate {
             "friend-block-chat" => Ok(Self::FriendBlockChat),
             "friend-blacklist" => Ok(Self::FriendBlacklist),
             "friend-confirm" => Ok(Self::FriendConfirm),
-            "wonderland-enter-button" => Ok(Self::WonderlandEnterButton),
+            "wonderland-confirm" => Ok(Self::WonderlandConfirm),
             "paimon-menu" => Ok(Self::PaimonMenu),
-            "wonderland-close" => Ok(Self::WonderlandClose),
+            "wonderland-map-star" => Ok(Self::WonderlandMapStar),
             custom if custom_templates.contains_key(custom) => Ok(Self::Custom(custom.to_string())),
             _ => Err(anyhow!("template不是已配置的命名模板")),
         }
@@ -106,9 +106,9 @@ impl WebToolTemplate {
             Self::FriendBlockChat => "屏蔽聊天".to_string(),
             Self::FriendBlacklist => "拉黑".to_string(),
             Self::FriendConfirm => "好友操作确认".to_string(),
-            Self::WonderlandEnterButton => "千星前往大厅".to_string(),
+            Self::WonderlandConfirm => "千星确认按钮".to_string(),
             Self::PaimonMenu => "派蒙主界面".to_string(),
-            Self::WonderlandClose => "千星主页关闭按钮".to_string(),
+            Self::WonderlandMapStar => "千星地图入口".to_string(),
             Self::Custom(name) => format!("自定义模板: {name}"),
         }
     }

@@ -382,7 +382,9 @@ pub struct ScreenConfig {
     pub secondary_back_rect: RectConfig,
     pub secondary_hall_rect: RectConfig,
     pub hall_name_rect: RectConfig,
+    pub hall_member_count_rect: RectConfig,
     pub hall_time_rect: RectConfig,
+    pub hall_member_list_rect: RectConfig,
 }
 
 impl ScreenConfig {
@@ -393,7 +395,9 @@ impl ScreenConfig {
             (self.secondary_back_rect, "screen.secondary_back_rect"),
             (self.secondary_hall_rect, "screen.secondary_hall_rect"),
             (self.hall_name_rect, "screen.hall_name_rect"),
+            (self.hall_member_count_rect, "screen.hall_member_count_rect"),
             (self.hall_time_rect, "screen.hall_time_rect"),
+            (self.hall_member_list_rect, "screen.hall_member_list_rect"),
         ] {
             validate_rect_in_canvas(rect, field, (self.expected_width, self.expected_height))?;
         }
@@ -1576,7 +1580,9 @@ enter_rect: { x: 0, y: 0, width: 1, height: 1 }
 secondary_back_rect: { x: 0, y: 0, width: 1, height: 1 }
 secondary_hall_rect: { x: 0, y: 0, width: 1, height: 1 }
 hall_name_rect: { x: 0, y: 0, width: 1, height: 1 }
+hall_member_count_rect: { x: 0, y: 0, width: 1, height: 1 }
 hall_time_rect: { x: 0, y: 0, width: 1, height: 1 }
+hall_member_list_rect: { x: 0, y: 0, width: 1, height: 1 }
 "#,
         )
         .expect_err("removed screen alias must be rejected");

@@ -1315,7 +1315,7 @@ fn playback_status_has_no_timing(status: &PlayerStatus) -> bool {
 }
 
 fn fallback_status_is_playable(status: &PlayerStatus) -> bool {
-    !playback_status_has_no_timing(status) && !(status.duration > 0.0 && status.duration < 20.0)
+    !(playback_status_has_no_timing(status) || status.duration > 0.0 && status.duration < 20.0)
 }
 
 fn status_matches_active_request(

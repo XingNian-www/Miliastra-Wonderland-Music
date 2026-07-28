@@ -1,0 +1,41 @@
+name: Rust CI
+
+on:
+  pull_request:
+    branches: [main, dev]
+  push:
+    branches: [main, dev]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality:
+    name: Windows quality gate
+    runs-on: windows-2022
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v5
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+          components: rustfmt, clippy
+
+      - name: 缓存 Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-msvc-quality
+
+      - name: 检查格式
+        run: cargo fmt --all -- --check
+
+      - name: 运行 Clippy 严格检查
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: 运行测试
+        run: cargo test --all-targets --locked

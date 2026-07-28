@@ -30,6 +30,15 @@ struct TemplateAbsence<'a> {
     failure_message: &'static str,
 }
 
+struct TemplateHit<'a> {
+    template: &'a Path,
+    region: Rect,
+    threshold: f32,
+    timeout_ms: u64,
+    poll_ms: u64,
+    certainty: InputCertainty,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct EnterGame;
 
@@ -402,11 +411,14 @@ fn execute_enter_wonderland(
     let map_star = wait_template_hit(
         context,
         config,
-        &config.startup.templates.wonderland_map_star,
-        config.startup.wonderland_map_star_region,
-        config.startup.template_threshold,
-        map_timeout_ms,
-        InputCertainty::AfterInputUnknown,
+        TemplateHit {
+            template: &config.startup.templates.wonderland_map_star,
+            region: config.startup.wonderland_map_star_region,
+            threshold: config.startup.template_threshold,
+            timeout_ms: map_timeout_ms,
+            poll_ms: map_interval_ms,
+            certainty: InputCertainty::AfterInputUnknown,
+        },
     )?;
     let Some(map_star) = map_star else {
         return Err(UiRoutineFailure::new(
@@ -465,11 +477,14 @@ fn execute_enter_wonderland(
     let Some(confirm_point) = wait_template_hit(
         context,
         config,
-        &config.startup.templates.wonderland_confirm,
-        config.startup.wonderland_confirm_region,
-        config.startup.wonderland_confirm_threshold,
-        config.startup.wonderland_transition_timeout_ms,
-        InputCertainty::AfterInputUnknown,
+        TemplateHit {
+            template: &config.startup.templates.wonderland_confirm,
+            region: config.startup.wonderland_confirm_region,
+            threshold: config.startup.wonderland_confirm_threshold,
+            timeout_ms: config.startup.wonderland_transition_timeout_ms,
+            poll_ms: config.startup.poll_ms,
+            certainty: InputCertainty::AfterInputUnknown,
+        },
     )?
     else {
         return Err(UiRoutineFailure::new(
@@ -778,28 +793,30 @@ fn is_wonderland_hall_text(text: &str) -> bool {
 fn wait_template_hit(
     context: &mut UiRoutineContext<'_>,
     config: &StartupRoutineConfig,
-    template: &Path,
-    region: Rect,
-    threshold: f32,
-    timeout_ms: u64,
-    certainty: InputCertainty,
+    wait: TemplateHit<'_>,
 ) -> Result<Option<Point>, UiRoutineFailure> {
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    let deadline = Instant::now() + Duration::from_millis(wait.timeout_ms);
     while Instant::now() < deadline {
         let image = capture_normalized(
             context,
             &config.residency,
             "locate_startup_template",
-            InputCertainty::AfterInputUnknown,
+            wait.certainty,
         )?;
         if let Some(hit) =
-            best_template_hit(&image, Some(region), template, threshold).map_err(|error| {
-                UiRoutineFailure::new(certainty, "locate_startup_template", format!("{error:#}"))
-            })?
+            best_template_hit(&image, Some(wait.region), wait.template, wait.threshold).map_err(
+                |error| {
+                    UiRoutineFailure::new(
+                        wait.certainty,
+                        "locate_startup_template",
+                        format!("{error:#}"),
+                    )
+                },
+            )?
         {
             return Ok(Some(hit.center()));
         }
-        sleep_ms(config.startup.poll_ms);
+        sleep_ms(wait.poll_ms.max(1));
     }
     Ok(None)
 }

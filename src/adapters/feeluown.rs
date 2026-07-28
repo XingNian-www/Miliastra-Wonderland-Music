@@ -35,6 +35,7 @@ struct RawPlayerStatus {
     singer: Option<String>,
     album_name: Option<String>,
     lyric_line_text: Option<String>,
+    lyric_line_translation: Option<String>,
     duration: Option<f64>,
     progress: Option<f64>,
     playback_rate: Option<f64>,
@@ -49,7 +50,10 @@ impl From<RawPlayerStatus> for RawPlayerSample {
             title: status.name.and_then(nonempty_text),
             artist: status.singer.and_then(nonempty_text),
             album_name: status.album_name.and_then(nonempty_text),
-            lyric_line_text: status.lyric_line_text.map(|line| line.trim().to_string()),
+            lyric_line_text: preferred_lyric_line(
+                status.lyric_line_text,
+                status.lyric_line_translation,
+            ),
             progress: status.progress.and_then(nonnegative_duration),
             duration: status.duration.and_then(nonnegative_duration),
             playback_rate: status
@@ -68,7 +72,11 @@ impl From<RawPlayerStatus> for PlayerStatus {
             name: status.name.unwrap_or_default(),
             singer: status.singer.unwrap_or_default(),
             album_name: status.album_name.unwrap_or_default(),
-            lyric_line_text: status.lyric_line_text.unwrap_or_default(),
+            lyric_line_text: preferred_lyric_line(
+                status.lyric_line_text,
+                status.lyric_line_translation,
+            )
+            .unwrap_or_default(),
             duration: status.duration.unwrap_or(0.0),
             progress: status.progress.unwrap_or(0.0),
             playback_rate: status.playback_rate.unwrap_or(1.0),
@@ -80,6 +88,16 @@ impl From<RawPlayerStatus> for PlayerStatus {
 fn nonempty_text(value: String) -> Option<String> {
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_string())
+}
+
+fn preferred_lyric_line(original: Option<String>, translation: Option<String>) -> Option<String> {
+    if translation
+        .as_deref()
+        .is_some_and(|line| !line.trim().is_empty())
+    {
+        return translation.map(|line| line.trim().to_string());
+    }
+    original.map(|line| line.trim().to_string())
 }
 
 fn parse_transport_state(value: &str) -> Option<TransportState> {
@@ -845,9 +863,36 @@ def display_volume(value):
         return 0
     return int(round(math.pow(raw / 100, 1 / VOLUME_CURVE_POWER) * 100))
 
+def clean_text(value):
+    if callable(value):
+        return None
+    value = text(value)
+    if value is None:
+        return None
+    value = value.strip()
+    return value if value else None
+
+def is_netease_song(song):
+    source = clean_text(attr(song, 'source'))
+    if source is not None and source.lower() == 'netease':
+        return True
+    uri = clean_text(model_uri(song))
+    return uri is not None and '://netease/' in uri.lower()
+
+def netease_translation(song, live_lyric):
+    if not is_netease_song(song):
+        return None
+    # FeelUOwn keeps the translation on the already selected lyric line. Read
+    # that value directly so status polling never performs network I/O or
+    # changes the timing of playback controls.
+    current_line = attr(live_lyric, 'current_line')
+    return clean_text(attr(current_line, 'trans'))
+
 player = attr(app, 'player')
 playlist = attr(app, 'playlist')
 song = attr(playlist, 'current_song')
+live_lyric = attr(app, 'live_lyric')
+current_sentence = text(attr(live_lyric, 'current_sentence'))
 metadata = attr(player, 'current_metadata')
 
 state = attr(attr(player, 'state'), 'name')
@@ -863,7 +908,8 @@ payload = {
     'name': text(attr(song, 'title') or meta_get(metadata, 'title')),
     'singer': text(attr(song, 'artists_name') or meta_get(metadata, 'artists') or meta_get(metadata, 'artist')),
     'albumName': text(attr(song, 'album_name') or meta_get(metadata, 'album')),
-    'lyricLineText': text(attr(attr(app, 'live_lyric'), 'current_sentence')),
+    'lyricLineText': current_sentence,
+    'lyricLineTranslation': netease_translation(song, live_lyric),
     'duration': duration,
     'progress': number(attr(player, 'position')),
     'playbackRate': number(attr(player, 'playback_rate')),
@@ -1147,6 +1193,20 @@ mod tests {
     }
 
     #[test]
+    fn observation_port_prefers_translated_lyric_from_status() {
+        let body = r#"{"status":"PLAYING","currentUri":"fuo://netease/songs/123","lyricLineText":"original","lyricLineTranslation":" translated "}"#;
+        let response = format!("ACK OK {}\n{}", body.len(), body).into_bytes();
+        let (port, command_rx, server) = spawn_rpc_server(response);
+        let mut client = test_client(port);
+
+        let sample = PlayerObservationPort::read_sample(&mut client).unwrap();
+
+        assert_eq!(sample.lyric_line_text.as_deref(), Some("translated"));
+        assert_eq!(command_rx.recv().unwrap(), "exec << EOF");
+        server.join().unwrap();
+    }
+
+    #[test]
     fn observation_port_preserves_null_status_fields_as_unknown() {
         let body = r#"{"status":"playing","currentUri":"fuo://netease/songs/123","name":null,"singer":null,"albumName":null,"lyricLineText":"","duration":null,"progress":null,"playbackRate":null,"volume":null}"#;
         let response = format!("ACK OK {}\n{}", body.len(), body).into_bytes();
@@ -1255,6 +1315,35 @@ mod tests {
         assert_eq!(overflow.progress, None);
         assert_eq!(overflow.playback_rate, None);
         assert_eq!(overflow.volume, None);
+    }
+
+    #[test]
+    fn translated_lyric_line_takes_precedence_when_present() {
+        let raw = RawPlayerStatus {
+            lyric_line_text: Some(" original ".to_string()),
+            lyric_line_translation: Some(" translated ".to_string()),
+            ..RawPlayerStatus::default()
+        };
+
+        let sample = RawPlayerSample::from(raw.clone());
+        let status = PlayerStatus::from(raw);
+
+        assert_eq!(sample.lyric_line_text.as_deref(), Some("translated"));
+        assert_eq!(status.lyric_line_text, "translated");
+    }
+
+    #[test]
+    fn empty_translated_lyric_line_falls_back_to_original() {
+        let raw = RawPlayerStatus {
+            lyric_line_text: Some(" original ".to_string()),
+            lyric_line_translation: Some("  ".to_string()),
+            ..RawPlayerStatus::default()
+        };
+
+        assert_eq!(
+            RawPlayerSample::from(raw).lyric_line_text.as_deref(),
+            Some("original")
+        );
     }
 
     #[test]

@@ -31,7 +31,9 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   LIBCLANG_PATH: C:\Program Files\LLVM\bin
-  OCR_MODEL_BASE_URL: https://raw.githubusercontent.com/zibo-chen/rust-paddle-ocr/next/models
+  # v2.3.1 resolves to commit 14ac4de60307e7674c9023a9f226dd89ca907171.
+  # The download step below also verifies SHA-256 so a retagged release fails closed.
+  OCR_MODEL_BASE_URL: https://raw.githubusercontent.com/zibo-chen/rust-paddle-ocr/v2.3.1/models
 
 jobs:
   build-windows-exe:
@@ -56,21 +58,39 @@ jobs:
         uses: actions/cache@v4
         with:
           path: models
-          key: pp-ocrv6-small-models-v1
+          key: pp-ocrv6-small-models-v2.3.1-sha256-2c6277ab-ed59cc29-b5f2bfe2
 
       - name: 下载 PP-OCRv6 small 模型
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Force -Path models | Out-Null
           $files = @(
             'PP-OCRv6_small_det.mnn',
             'PP-OCRv6_small_rec.mnn',
             'ppocr_keys_v6_small.txt'
           )
+          $expectedHashes = @{
+            'PP-OCRv6_small_det.mnn' = '2c6277abbbddb4c77a790f4650cdd7f8ab33512db38fac372ed5471538070619'
+            'PP-OCRv6_small_rec.mnn' = 'ed59cc294fe2d564bd64f929b5356b70abd0977f99e7e60e3b08cfeef4ef72be'
+            'ppocr_keys_v6_small.txt' = 'b5f2bfe2bdd9448429e3e82b51c789775d9b42f2403d082b00662eb77e401c5d'
+          }
           foreach ($file in $files) {
             $path = "models/$file"
-            if (-not (Test-Path $path)) {
+            if (Test-Path -LiteralPath $path -PathType Container) {
+              Remove-Item -LiteralPath $path -Recurse -Force
+            }
+            $needsDownload = $true
+            if (Test-Path -LiteralPath $path -PathType Leaf) {
+              $actualHash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+              $needsDownload = $actualHash -ne $expectedHashes[$file]
+            }
+            if ($needsDownload) {
               Invoke-WebRequest -Uri "$env:OCR_MODEL_BASE_URL/$file" -OutFile $path
+            }
+            $actualHash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actualHash -ne $expectedHashes[$file]) {
+              throw "OCR 模型 SHA-256 校验失败: file=$file expected=$($expectedHashes[$file]) actual=$actualHash"
             }
           }
 

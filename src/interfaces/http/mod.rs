@@ -15,8 +15,8 @@ use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use axum::response::Response;
 use axum::routing::any;
-use image::ColorType;
 use image::codecs::jpeg::JpegEncoder;
+use image::{ColorType, DynamicImage};
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use serde_json::Value;
@@ -106,6 +106,10 @@ pub(crate) trait HttpQueryPort: Send + Sync {
     fn playback_state_snapshot(&self) -> Result<PlaybackRuntimeState>;
 
     fn hall_state_snapshot(&self) -> Result<HallRuntimeState>;
+}
+
+pub(crate) trait HttpHallPort: Send + Sync {
+    fn capture_hall_screenshot(&self) -> Result<Arc<DynamicImage>>;
 }
 
 pub(crate) trait HttpPlayerPort: Send + Sync {
@@ -566,8 +570,8 @@ pub struct HttpSharedState {
     pub active_connections: Arc<AtomicUsize>,
     formal_tasks: Arc<dyn HttpTaskPort>,
     queries: Arc<dyn HttpQueryPort>,
+    hall: Arc<dyn HttpHallPort>,
     latest_frame: Arc<Mutex<LatestFrameCache>>,
-    hall_screenshot: Arc<Mutex<LatestFrameCache>>,
     player: Arc<dyn HttpPlayerPort>,
     ai: Arc<dyn HttpAiPort>,
 }
@@ -648,8 +652,8 @@ impl HttpSharedState {
         formal_tasks: Arc<dyn HttpTaskPort>,
         queries: Arc<dyn HttpQueryPort>,
         monitor: MonitorShared,
+        hall: Arc<dyn HttpHallPort>,
         latest_frame: Arc<Mutex<LatestFrameCache>>,
-        hall_screenshot: Arc<Mutex<LatestFrameCache>>,
         player_search: PlayerSearchClient,
         player_runtime: PlayerRuntimeHandle,
         ai: AiClient,
@@ -664,8 +668,8 @@ impl HttpSharedState {
             formal_tasks,
             queries,
             monitor,
+            hall,
             latest_frame,
-            hall_screenshot,
             player,
             Arc::new(ai),
         )
@@ -678,8 +682,8 @@ impl HttpSharedState {
         formal_tasks: Arc<dyn HttpTaskPort>,
         queries: Arc<dyn HttpQueryPort>,
         monitor: MonitorShared,
+        hall: Arc<dyn HttpHallPort>,
         latest_frame: Arc<Mutex<LatestFrameCache>>,
-        hall_screenshot: Arc<Mutex<LatestFrameCache>>,
         player: Arc<dyn HttpPlayerPort>,
         ai: Arc<dyn HttpAiPort>,
     ) -> Self {
@@ -691,8 +695,8 @@ impl HttpSharedState {
             active_connections: Arc::new(AtomicUsize::new(0)),
             formal_tasks,
             queries,
+            hall,
             latest_frame,
-            hall_screenshot,
             player,
             ai,
         }
@@ -2332,8 +2336,10 @@ fn screenshot_response(
     request: &Request,
     state: &HttpSharedState,
 ) -> std::result::Result<Response, AppError> {
+    let quality = parse_jpeg_quality(query_value(&request.query, "quality"))?;
     cached_screenshot_response(
         request,
+        quality,
         &state.latest_frame,
         "尚未获取主扫描画面，请稍后重试",
         &state.config.http.host,
@@ -2345,10 +2351,18 @@ fn hall_screenshot_response(
     request: &Request,
     state: &HttpSharedState,
 ) -> std::result::Result<Response, AppError> {
-    cached_screenshot_response(
+    let quality = parse_jpeg_quality(query_value(&request.query, "quality"))?;
+    let image = state
+        .hall
+        .capture_hall_screenshot()
+        .map_err(|error| AppError {
+            status: 503,
+            message: format!("主动检测大厅失败: {error:#}"),
+        })?;
+    encoded_screenshot_response(
         request,
-        &state.hall_screenshot,
-        "尚未执行大厅检测，请先运行大厅检测命令",
+        quality,
+        &image,
         &state.config.http.host,
         state.config.http.port,
     )
@@ -2356,12 +2370,12 @@ fn hall_screenshot_response(
 
 fn cached_screenshot_response(
     request: &Request,
+    quality: u8,
     cache: &Arc<Mutex<LatestFrameCache>>,
     unavailable_message: &str,
     host: &str,
     port: u16,
 ) -> std::result::Result<Response, AppError> {
-    let quality = parse_jpeg_quality(query_value(&request.query, "quality"))?;
     let image = cache
         .lock()
         .map_err(|_| internal_message("截图缓存锁已损坏"))?
@@ -2370,6 +2384,16 @@ fn cached_screenshot_response(
             status: 503,
             message: unavailable_message.to_string(),
         })?;
+    encoded_screenshot_response(request, quality, &image, host, port)
+}
+
+fn encoded_screenshot_response(
+    request: &Request,
+    quality: u8,
+    image: &DynamicImage,
+    host: &str,
+    port: u16,
+) -> std::result::Result<Response, AppError> {
     let rgb = image.to_rgb8();
     let mut bytes = Vec::new();
     let mut encoder = JpegEncoder::new_with_quality(&mut bytes, quality);
@@ -3054,6 +3078,8 @@ mod tests {
         queue: Vec<QueueItem>,
         playback: PlaybackRuntimeState,
         hall: HallRuntimeState,
+        hall_screenshot_requests: usize,
+        hall_screenshot_error: bool,
         turtle_soup: TurtleSoupSnapshot,
         turtle_soup_submissions: Vec<TurtleSoupSubmission>,
         undercover: UndercoverSnapshot,
@@ -3074,6 +3100,8 @@ mod tests {
                 queue: Vec::new(),
                 playback: PlaybackRuntimeState::default(),
                 hall: HallRuntimeState::default(),
+                hall_screenshot_requests: 0,
+                hall_screenshot_error: false,
                 turtle_soup: TurtleSoupSnapshot::default(),
                 turtle_soup_submissions: Vec::new(),
                 undercover: UndercoverSnapshot::default(),
@@ -3157,6 +3185,20 @@ mod tests {
                 .find(|task| task.id == id)
                 .expect("recorded task");
             task.queued = false;
+        }
+
+        fn hall_screenshot_requests(&self) -> usize {
+            self.state
+                .lock()
+                .expect("recording port")
+                .hall_screenshot_requests
+        }
+
+        fn fail_hall_screenshot(&self) {
+            self.state
+                .lock()
+                .expect("recording port")
+                .hall_screenshot_error = true;
         }
     }
 
@@ -3446,6 +3488,20 @@ mod tests {
         }
     }
 
+    impl HttpHallPort for RecordingHttpPort {
+        fn capture_hall_screenshot(&self) -> Result<Arc<DynamicImage>> {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow!("recording HTTP port lock poisoned"))?;
+            state.hall_screenshot_requests += 1;
+            if state.hall_screenshot_error {
+                return Err(anyhow!("目标游戏窗口不可用"));
+            }
+            Ok(Arc::new(DynamicImage::new_rgb8(2, 2)))
+        }
+    }
+
     struct HttpTestPlayerPort {
         fail: bool,
     }
@@ -3628,13 +3684,8 @@ mod tests {
     }
 
     #[test]
-    fn hall_screenshot_serves_the_last_detection_frame() {
+    fn hall_screenshot_triggers_detection_and_serves_captured_frame() {
         let state = test_state();
-        state
-            .hall_screenshot
-            .lock()
-            .expect("hall screenshot cache")
-            .store(Arc::new(image::DynamicImage::new_rgb8(2, 2)));
         let request = Request {
             method: "GET".to_string(),
             path: "/hall-screenshot".to_string(),
@@ -3646,6 +3697,41 @@ mod tests {
         let response = hall_screenshot_response(&request, &state).expect("hall screenshot");
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()[CONTENT_TYPE], "image/jpeg");
+        assert_eq!(state.recording.hall_screenshot_requests(), 1);
+    }
+
+    #[test]
+    fn hall_screenshot_maps_detection_failure_to_service_unavailable() {
+        let state = test_state();
+        state.recording.fail_hall_screenshot();
+        let request = Request {
+            method: "GET".to_string(),
+            path: "/hall-screenshot".to_string(),
+            query: Vec::new(),
+            headers: HeaderMap::new(),
+            body: Vec::new(),
+        };
+
+        let error = hall_screenshot_response(&request, &state.state).unwrap_err();
+
+        assert_eq!(error.status, 503);
+    }
+
+    #[test]
+    fn hall_screenshot_rejects_invalid_quality_before_touching_the_game() {
+        let state = test_state();
+        let request = Request {
+            method: "GET".to_string(),
+            path: "/hall-screenshot".to_string(),
+            query: vec![("quality".to_string(), "79".to_string())],
+            headers: HeaderMap::new(),
+            body: Vec::new(),
+        };
+
+        let error = hall_screenshot_response(&request, &state.state).unwrap_err();
+
+        assert_eq!(error.status, 400);
+        assert_eq!(state.recording.hall_screenshot_requests(), 0);
     }
 
     #[test]
@@ -4601,7 +4687,7 @@ workflows:
                 recording.clone(),
                 recording.clone(),
                 monitor,
-                Arc::new(Mutex::new(LatestFrameCache::default())),
+                recording.clone(),
                 Arc::new(Mutex::new(LatestFrameCache::default())),
                 Arc::new(player),
                 Arc::new(HttpTestAiPort),

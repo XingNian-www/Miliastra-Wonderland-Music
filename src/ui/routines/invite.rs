@@ -4,8 +4,8 @@ use enigo::Key;
 
 use super::friend_delivery::{
     FriendDeliveryRoutineConfig, UiResidencyOutcome, UiResidencyTarget, after_input_failure,
-    before_input_failure, capture_normalized, current_ui_is_primary, open_friend_conversation,
-    restore_residency, send_current_chat_message, sleep_ms,
+    capture_normalized, current_ui_is_primary, open_friend_conversation, restore_residency,
+    send_current_chat_message, sleep_ms,
 };
 #[cfg(test)]
 use crate::config::AppConfig;
@@ -341,10 +341,10 @@ fn click_current_friend_avatar(
             context,
             &config.friend,
             "select_invite_avatar",
-            InputCertainty::BeforeInput,
+            InputCertainty::AfterInputUnknown,
         )?;
         let point = secondary_hall_bubbles(&image)
-            .map_err(|error| before_input_failure("select_invite_avatar", error))?
+            .map_err(|error| after_input_failure("select_invite_avatar", error))?
             .into_iter()
             .max_by_key(|bubble| bubble.avatar_rect().y)
             .map(|bubble| bubble.avatar_rect().center());
@@ -386,7 +386,7 @@ fn click_current_friend_avatar(
         }
     }
     Err(UiRoutineFailure::new(
-        InputCertainty::ConfirmedFailure,
+        InputCertainty::AfterInputUnknown,
         "select_invite_avatar",
         "a stable incoming avatar was not found in the confirmed friend conversation",
     ))
@@ -450,7 +450,7 @@ fn click_invite_button(
         }
     }
     Err(UiRoutineFailure::new(
-        InputCertainty::ConfirmedFailure,
+        click_certainty,
         button.stage,
         format!("template was not found: {}", button.path.display()),
     ))
@@ -467,7 +467,12 @@ fn confirm_entered_hall(
     );
     let mut streak = 0_u32;
     for attempt in 0..attempts {
-        if current_ui_is_primary(context, &config.friend, "confirm_entered_hall")? {
+        if current_ui_is_primary(
+            context,
+            &config.friend,
+            "confirm_entered_hall",
+            InputCertainty::AfterInputUnknown,
+        )? {
             streak = streak.saturating_add(1);
             if streak >= config.stable_count {
                 return Ok(());

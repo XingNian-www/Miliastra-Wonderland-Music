@@ -594,7 +594,6 @@ impl ApplicationRuntime {
             ocr: self.ocr.clone(),
             ocr_runtime: None,
             latest_frame: self.latest_frame.clone(),
-            hall_screenshot: self.hall_screenshot.clone(),
             locks: CommandLockState::default(),
             window_detection_signal: self.window_detection_signal.clone(),
             screen_lock_primed: self.screen_lock_primed.clone(),
@@ -636,11 +635,6 @@ impl ApplicationRuntime {
             latest_frame.invalidate();
         } else {
             log::error!("主扫描画面缓存锁已损坏");
-        }
-        if let Ok(mut hall_screenshot) = self.hall_screenshot.lock() {
-            hall_screenshot.invalidate();
-        } else {
-            log::error!("大厅截图缓存锁已损坏");
         }
     }
 }

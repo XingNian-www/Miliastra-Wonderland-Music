@@ -265,7 +265,7 @@ fn merged_text(
         .recognize_lines(crop, OcrPriority::ChatObservation)
         .map_err(|error| {
             UiRoutineFailure::new(
-                InputCertainty::ConfirmedFailure,
+                InputCertainty::AfterInputUnknown,
                 "ocr_secondary_unread",
                 format!("{error:#}"),
             )

@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use super::friend_delivery::{
-    FriendDeliveryRoutineConfig, UiResidencyOutcome, UiResidencyTarget, before_input_failure,
-    capture_normalized, sleep_ms,
+    FriendDeliveryRoutineConfig, UiResidencyOutcome, UiResidencyTarget, after_input_failure,
+    before_input_failure, capture_normalized, sleep_ms,
 };
 use super::state_observation::wait_for_stable_ui_kind;
 use crate::adapters::windows::resolve_game_executable;
@@ -269,6 +269,11 @@ fn execute_enter_game(
             config.startup.main_ui_region,
             &config.startup.templates.paimon_menu,
             config.startup.template_threshold,
+            if clicked {
+                InputCertainty::AfterInputUnknown
+            } else {
+                InputCertainty::BeforeInput
+            },
         )? {
             paimon_streak = paimon_streak.saturating_add(1);
             if paimon_streak >= TEMPLATE_STABLE_HITS {
@@ -278,7 +283,16 @@ fn execute_enter_game(
             paimon_streak = 0;
         }
 
-        if let Some(point) = find_enter_game_text(ocr, &image, config)? {
+        if let Some(point) = find_enter_game_text(
+            ocr,
+            &image,
+            config,
+            if clicked {
+                InputCertainty::AfterInputUnknown
+            } else {
+                InputCertainty::BeforeInput
+            },
+        )? {
             context
                 .device()
                 .click_point(point.x, point.y)
@@ -371,7 +385,7 @@ fn execute_enter_wonderland(
     context
         .device()
         .press_key(Key::M)
-        .map_err(|error| before_input_failure("open_wonderland_map", error))?;
+        .map_err(|error| after_input_failure("open_wonderland_map", error))?;
 
     let map_attempts = capped_attempts(
         config.startup.wonderland_map_star_retries,
@@ -392,10 +406,11 @@ fn execute_enter_wonderland(
         config.startup.wonderland_map_star_region,
         config.startup.template_threshold,
         map_timeout_ms,
+        InputCertainty::AfterInputUnknown,
     )?;
     let Some(map_star) = map_star else {
         return Err(UiRoutineFailure::new(
-            InputCertainty::ConfirmedFailure,
+            InputCertainty::AfterInputUnknown,
             "locate_wonderland_map_star",
             "wonderland map star template was not found",
         ));
@@ -454,6 +469,7 @@ fn execute_enter_wonderland(
         config.startup.wonderland_confirm_region,
         config.startup.wonderland_confirm_threshold,
         config.startup.wonderland_transition_timeout_ms,
+        InputCertainty::AfterInputUnknown,
     )?
     else {
         return Err(UiRoutineFailure::new(
@@ -493,6 +509,7 @@ fn wait_for_paimon_menu(
             config.startup.main_ui_region,
             &config.startup.templates.paimon_menu,
             config.startup.template_threshold,
+            InputCertainty::BeforeInput,
         )? {
             streak = streak.saturating_add(1);
             if streak >= TEMPLATE_STABLE_HITS {
@@ -529,6 +546,7 @@ fn confirm_wonderland_transition(
             region,
             &config.startup.templates.wonderland_confirm,
             config.startup.wonderland_confirm_threshold,
+            InputCertainty::AfterInputUnknown,
         )? {
             return wait_region_stable(context, config, region);
         }
@@ -555,7 +573,7 @@ fn wait_region_stable(
         InputCertainty::AfterInputUnknown,
     )?;
     let mut previous = rect_chat_change_fingerprint(&image, region)
-        .map_err(|error| before_input_failure("observe_wonderland_transition", error))?;
+        .map_err(|error| after_input_failure("observe_wonderland_transition", error))?;
     while Instant::now() < deadline {
         sleep_ms(config.startup.poll_ms);
         let image = capture_normalized(
@@ -565,7 +583,7 @@ fn wait_region_stable(
             InputCertainty::AfterInputUnknown,
         )?;
         let current = rect_chat_change_fingerprint(&image, region)
-            .map_err(|error| before_input_failure("confirm_wonderland_stable", error))?;
+            .map_err(|error| after_input_failure("confirm_wonderland_stable", error))?;
         let stats = change_stats(&previous, &current);
         if stats.mean_abs_diff <= config.startup.stable_mean_threshold
             && stats.changed_ratio <= config.startup.stable_changed_ratio_threshold
@@ -656,14 +674,18 @@ fn find_enter_game_text(
     ocr: &OcrRuntimeHandle,
     image: &image::DynamicImage,
     config: &StartupRoutineConfig,
+    certainty: InputCertainty,
 ) -> Result<Option<Point>, UiRoutineFailure> {
     let region = config.startup.enter_game_text_region;
-    let crop = crop_canvas(image, region)
-        .map_err(|error| before_input_failure("crop_enter_game_text", error))?;
+    let crop = crop_canvas(image, region).map_err(|error| {
+        UiRoutineFailure::new(certainty, "crop_enter_game_text", format!("{error:#}"))
+    })?;
     let target = normalize_lock_text(ENTER_GAME_TEXT);
     let lines = ocr
         .recognize_lines(crop, OcrPriority::UiConfirmation)
-        .map_err(|error| before_input_failure("ocr_enter_game_text", error))?;
+        .map_err(|error| {
+            UiRoutineFailure::new(certainty, "ocr_enter_game_text", format!("{error:#}"))
+        })?;
     Ok(lines.into_iter().find_map(|line| {
         let recognized = normalize_lock_text(&line.text);
         (recognized == target || recognized.contains(&target)).then(|| {
@@ -688,7 +710,13 @@ fn wait_template_absent(
             wait.stage,
             InputCertainty::AfterInputUnknown,
         )?;
-        if !template_visible(&image, wait.region, wait.template, wait.threshold)? {
+        if !template_visible(
+            &image,
+            wait.region,
+            wait.template,
+            wait.threshold,
+            InputCertainty::AfterInputUnknown,
+        )? {
             return Ok(());
         }
         sleep_ms(config.startup.poll_ms);
@@ -728,10 +756,10 @@ fn find_wonderland_hall_text(
 ) -> Result<Option<Point>, UiRoutineFailure> {
     let region = config.startup.wonderland_hall_ocr_region;
     let crop = crop_canvas(image, region)
-        .map_err(|error| before_input_failure("crop_wonderland_hall", error))?;
+        .map_err(|error| after_input_failure("crop_wonderland_hall", error))?;
     let lines = ocr
         .recognize_lines(crop, OcrPriority::UiConfirmation)
-        .map_err(|error| before_input_failure("ocr_wonderland_hall", error))?;
+        .map_err(|error| after_input_failure("ocr_wonderland_hall", error))?;
     Ok(lines.into_iter().find_map(|line| {
         is_wonderland_hall_text(&line.text).then(|| {
             Point::new(
@@ -754,6 +782,7 @@ fn wait_template_hit(
     region: Rect,
     threshold: f32,
     timeout_ms: u64,
+    certainty: InputCertainty,
 ) -> Result<Option<Point>, UiRoutineFailure> {
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     while Instant::now() < deadline {
@@ -763,8 +792,10 @@ fn wait_template_hit(
             "locate_startup_template",
             InputCertainty::AfterInputUnknown,
         )?;
-        if let Some(hit) = best_template_hit(&image, Some(region), template, threshold)
-            .map_err(|error| before_input_failure("locate_startup_template", error))?
+        if let Some(hit) =
+            best_template_hit(&image, Some(region), template, threshold).map_err(|error| {
+                UiRoutineFailure::new(certainty, "locate_startup_template", format!("{error:#}"))
+            })?
         {
             return Ok(Some(hit.center()));
         }
@@ -778,10 +809,13 @@ fn template_visible(
     region: Rect,
     template: &Path,
     threshold: f32,
+    certainty: InputCertainty,
 ) -> Result<bool, UiRoutineFailure> {
     best_template_hit(image, Some(region), template, threshold)
         .map(|hit| hit.is_some())
-        .map_err(|error| before_input_failure("match_startup_template", error))
+        .map_err(|error| {
+            UiRoutineFailure::new(certainty, "match_startup_template", format!("{error:#}"))
+        })
 }
 
 fn split_command_args(value: &str) -> anyhow::Result<Vec<String>> {
@@ -949,6 +983,7 @@ mod tests {
             panic!("the fixture intentionally has no wonderland home template");
         };
         assert_eq!(failure.stage(), "locate_wonderland_map_star");
+        assert_eq!(failure.certainty(), InputCertainty::AfterInputUnknown);
         assert_eq!(keys.lock().unwrap().as_slice(), &[Key::M]);
         ui_runtime.shutdown().unwrap();
         ocr_runtime.shutdown().unwrap();

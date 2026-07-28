@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 use enigo::Key;
 
 use super::friend_delivery::{
-    FriendDeliveryRoutineConfig, UiResidencyOutcome, UiResidencyTarget, before_input_failure,
-    capture_normalized, sleep_ms,
+    FriendDeliveryRoutineConfig, UiResidencyOutcome, UiResidencyTarget, after_input_failure,
+    before_input_failure, capture_normalized, sleep_ms,
 };
 use super::state_observation::wait_for_stable_ui_kind;
 use crate::runtime::ui::{
@@ -189,7 +189,7 @@ fn execute_moderation(
     context
         .device()
         .press_key(Key::Unicode('o'))
-        .map_err(|error| before_input_failure("open_friend_panel", error))?;
+        .map_err(|error| after_input_failure("open_friend_panel", error))?;
     wait_template(
         context,
         config,
@@ -203,12 +203,12 @@ fn execute_moderation(
     context
         .device()
         .press_key(Key::Unicode('e'))
-        .map_err(|error| before_input_failure("open_friend_search", error))?;
+        .map_err(|error| after_input_failure("open_friend_search", error))?;
     sleep_ms(config.step_ms);
     context
         .device()
         .press_key(Key::Unicode('e'))
-        .map_err(|error| before_input_failure("open_friend_search", error))?;
+        .map_err(|error| after_input_failure("open_friend_search", error))?;
     wait_template(
         context,
         config,
@@ -222,16 +222,16 @@ fn execute_moderation(
     context
         .device()
         .click_point(config.search_input.x, config.search_input.y)
-        .map_err(|error| before_input_failure("focus_uid_input", error))?;
+        .map_err(|error| after_input_failure("focus_uid_input", error))?;
     sleep_ms(config.residency.click_ms);
     context
         .device()
         .paste_text(&request.uid, config.text_ms)
-        .map_err(|error| before_input_failure("input_uid", error))?;
+        .map_err(|error| after_input_failure("input_uid", error))?;
     context
         .device()
         .click_point(config.search_button.x, config.search_button.y)
-        .map_err(|error| before_input_failure("submit_uid_search", error))?;
+        .map_err(|error| after_input_failure("submit_uid_search", error))?;
     wait_template(
         context,
         config,
@@ -314,14 +314,14 @@ fn wait_template(
         )?;
         if let Some(hit) =
             best_template_hit(&image, Some(region), template, config.marker_threshold)
-                .map_err(|error| before_input_failure(stage, error))?
+                .map_err(|error| after_input_failure(stage, error))?
         {
             if click {
                 let point = hit.center();
                 context
                     .device()
                     .click_point(point.x, point.y)
-                    .map_err(|error| before_input_failure(stage, error))?;
+                    .map_err(|error| after_input_failure(stage, error))?;
                 sleep_ms(config.residency.click_ms);
             }
             return Ok(());
@@ -491,7 +491,7 @@ fn recoverable_panel_candidate(
     .enumerate()
     {
         if best_template_hit(image, Some(region), template, config.marker_threshold)
-            .map_err(|error| before_input_failure("recover_moderation", error))?
+            .map_err(|error| after_input_failure("recover_moderation", error))?
             .is_some()
         {
             return Ok(Some(index));

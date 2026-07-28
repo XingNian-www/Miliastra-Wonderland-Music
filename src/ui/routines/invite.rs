@@ -3,9 +3,9 @@ use std::path::PathBuf;
 use enigo::Key;
 
 use super::friend_delivery::{
-    FriendDeliveryRoutineConfig, UiResidencyOutcome, UiResidencyTarget, before_input_failure,
-    capture_normalized, current_ui_is_primary, open_friend_conversation, restore_residency,
-    send_current_chat_message, sleep_ms,
+    FriendDeliveryRoutineConfig, UiResidencyOutcome, UiResidencyTarget, after_input_failure,
+    before_input_failure, capture_normalized, current_ui_is_primary, open_friend_conversation,
+    restore_residency, send_current_chat_message, sleep_ms,
 };
 #[cfg(test)]
 use crate::config::AppConfig;
@@ -291,13 +291,13 @@ fn execute_invite_navigation(
         context,
         config,
         &config.view_star,
-        InputCertainty::BeforeInput,
+        InputCertainty::AfterInputUnknown,
     )?;
     click_invite_button(
         context,
         config,
         &config.goto_hall,
-        InputCertainty::BeforeInput,
+        InputCertainty::AfterInputUnknown,
     )?;
     click_invite_button(
         context,
@@ -371,7 +371,7 @@ fn click_current_friend_avatar(
             context
                 .device()
                 .click_point(x, y)
-                .map_err(|error| before_input_failure("select_invite_avatar", error))?;
+                .map_err(|error| after_input_failure("select_invite_avatar", error))?;
             log::info!(
                 "邀请: 当前好友会话的左侧头像稳定确认，点击 samples={} x={} y={}",
                 config.stable_count,
@@ -413,7 +413,7 @@ fn click_invite_button(
             &button.path,
             config.template_threshold,
         )
-        .map_err(|error| before_input_failure(button.stage, error))?;
+        .map_err(|error| after_input_failure(button.stage, error))?;
         let point = hit.map(|hit| hit.center());
         match point {
             Some(point)
@@ -436,7 +436,11 @@ fn click_invite_button(
         if streak >= config.stable_count {
             let (x, y) = stable_point.expect("stable invite template point exists");
             context.device().click_point(x, y).map_err(|error| {
-                UiRoutineFailure::new(click_certainty, button.stage, format!("{error:#}"))
+                UiRoutineFailure::new(
+                    InputCertainty::AfterInputUnknown,
+                    button.stage,
+                    format!("{error:#}"),
+                )
             })?;
             sleep_ms(config.click_ms);
             return Ok(());

@@ -1,8 +1,8 @@
 use std::time::{Duration, Instant};
 
 use super::friend_delivery::{
-    FriendDeliveryRoutineConfig, UiResidencyOutcome, UiResidencyTarget, before_input_failure,
-    capture_normalized, restore_residency, sleep_ms,
+    FriendDeliveryRoutineConfig, UiResidencyOutcome, UiResidencyTarget, after_input_failure,
+    before_input_failure, capture_normalized, restore_residency, sleep_ms,
 };
 use crate::observation::chat::{
     SECONDARY_TITLE_RECT, SecondaryChatIdentity, UnreadFriendHit, classify_title,
@@ -162,7 +162,7 @@ fn process_unread(
         context
             .device()
             .click_point(request.hit.row_click.x, request.hit.row_click.y)
-            .map_err(|error| before_input_failure("open_secondary_unread", error))?;
+            .map_err(|error| after_input_failure("open_secondary_unread", error))?;
         sleep_ms(config.residency.click_ms);
         let image = capture_normalized(
             context,
@@ -215,7 +215,7 @@ fn wait_bubble_stable(
         InputCertainty::AfterInputUnknown,
     )?;
     let mut previous = latest_incoming_fingerprint(&first)
-        .map_err(|error| before_input_failure("observe_secondary_bubble", error))?;
+        .map_err(|error| after_input_failure("observe_secondary_bubble", error))?;
     let mut latest = first;
     let mut captured_at = Instant::now();
     let deadline = Instant::now() + Duration::from_millis(BUBBLE_STABILITY_TIMEOUT_MS);
@@ -228,7 +228,7 @@ fn wait_bubble_stable(
             InputCertainty::AfterInputUnknown,
         )?;
         let current = latest_incoming_fingerprint(&image)
-            .map_err(|error| before_input_failure("confirm_secondary_bubble", error))?;
+            .map_err(|error| after_input_failure("confirm_secondary_bubble", error))?;
         captured_at = Instant::now();
         if !optional_fingerprint_changed(previous.as_ref(), current.as_ref()) {
             return Ok((image, captured_at));
@@ -260,7 +260,7 @@ fn merged_text(
     config: &SecondaryUnreadRoutineConfig,
 ) -> Result<String, UiRoutineFailure> {
     let crop = crop_canvas(image, region)
-        .map_err(|error| before_input_failure("crop_secondary_unread", error))?;
+        .map_err(|error| after_input_failure("crop_secondary_unread", error))?;
     let lines = ocr
         .recognize_lines(crop, OcrPriority::ChatObservation)
         .map_err(|error| {

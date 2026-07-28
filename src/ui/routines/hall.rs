@@ -374,7 +374,7 @@ fn read_hall_info_transaction(
             )?;
             &detection_image
         };
-        let sample = read_hall_sample(ocr, &image, config)?;
+        let sample = read_hall_sample(ocr, image, config)?;
         log::info!(
             "大厅检测 OCR 采样: {}/{} name={} time={} minutes={}",
             index + 1,
@@ -491,10 +491,12 @@ mod tests {
     use crate::ui::geometry::Rect;
     use crate::ui::state::{TemplateUiStateClassifier, UiTemplateArgs};
 
+    type DragRecord = (i32, i32, i32, i32);
+
     struct HallDevice {
         frame: DynamicImage,
         keys: Arc<Mutex<Vec<Key>>>,
-        drags: Arc<Mutex<Vec<(i32, i32, i32, i32)>>>,
+        drags: Arc<Mutex<Vec<DragRecord>>>,
     }
 
     impl UiDevice for HallDevice {

@@ -377,7 +377,6 @@ pub(crate) struct ApplicationRuntime {
     ocr: OcrRuntimeHandle,
     ocr_runtime: Option<OcrRuntime>,
     latest_frame: Arc<Mutex<LatestFrameCache>>,
-    hall_screenshot: Arc<Mutex<LatestFrameCache>>,
     locks: CommandLockState,
     window_detection_signal: WindowDetectionSignal,
     screen_lock_primed: Arc<AtomicBool>,
@@ -913,13 +912,7 @@ impl ApplicationRuntime {
             ocr.clone(),
             friend_delivery_config.clone(),
         );
-        let hall_screenshot = Arc::new(Mutex::new(LatestFrameCache::default()));
-        let hall_ui = HallUi::new(
-            ui_handle.clone(),
-            ocr.clone(),
-            hall_config,
-            hall_screenshot.clone(),
-        );
+        let hall_ui = HallUi::new(ui_handle.clone(), ocr.clone(), hall_config);
         let moderation_ui = ModerationUi::new(ui_handle.clone(), moderation_config);
         let startup_ui = StartupUi::new(ui_handle.clone(), ocr.clone(), startup_config);
         let secondary_unread_ui =
@@ -1056,7 +1049,6 @@ impl ApplicationRuntime {
             ocr,
             ocr_runtime: Some(ocr_runtime),
             latest_frame: Arc::new(Mutex::new(LatestFrameCache::default())),
-            hall_screenshot,
             locks: CommandLockState::default(),
             window_detection_signal: WindowDetectionSignal::new(),
             screen_lock_primed: Arc::new(AtomicBool::new(false)),

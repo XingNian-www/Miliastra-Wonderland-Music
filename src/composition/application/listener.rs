@@ -10,6 +10,30 @@ enum ObservedInput<C, Q> {
     Question(Q),
 }
 
+struct HttpHallDetector {
+    hall_ui: HallUi,
+}
+
+impl http::HttpHallPort for HttpHallDetector {
+    fn capture_hall_screenshot(&self) -> Result<Arc<DynamicImage>> {
+        let outcome = self
+            .hall_ui
+            .submit_read(ReadHallInfo)
+            .context("提交大厅截图检测 UI 事务")?
+            .wait()
+            .context("等待大厅截图检测 UI 事务")?;
+        if let ReadHallInfoEffect::Failed(failure) = outcome.effect() {
+            return Err(anyhow!("大厅截图检测失败：{failure}"));
+        }
+        if let UiResidencyOutcome::Failed(failure) = outcome.residency() {
+            return Err(anyhow!("大厅截图已生成，但一级驻留恢复失败：{failure}"));
+        }
+        outcome
+            .screenshot()
+            .ok_or_else(|| anyhow!("大厅检测未返回截图"))
+    }
+}
+
 fn merge_observed_inputs<C, Q>(
     commands: Vec<(usize, C)>,
     questions: Vec<(usize, Q)>,
@@ -127,8 +151,10 @@ impl ApplicationRuntime {
             formal_tasks.clone(),
             formal_tasks,
             self.monitor.clone(),
+            Arc::new(HttpHallDetector {
+                hall_ui: self.hall_ui.clone(),
+            }),
             self.latest_frame.clone(),
-            self.hall_screenshot.clone(),
             self.player_search.clone(),
             player_runtime,
             self.ai.clone(),

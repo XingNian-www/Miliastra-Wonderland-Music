@@ -167,13 +167,17 @@ impl AppConfig {
                 "startup.enter_game_text_region",
             ),
             (
-                self.startup.wonderland_enter_button_region,
-                "startup.wonderland_enter_button_region",
+                self.startup.wonderland_hall_ocr_region,
+                "startup.wonderland_hall_ocr_region",
+            ),
+            (
+                self.startup.wonderland_confirm_region,
+                "startup.wonderland_confirm_region",
             ),
             (self.startup.main_ui_region, "startup.main_ui_region"),
             (
-                self.startup.wonderland_close_region,
-                "startup.wonderland_close_region",
+                self.startup.wonderland_map_star_region,
+                "startup.wonderland_map_star_region",
             ),
         ] {
             validate_rect_in_canvas(rect, field, canvas)?;
@@ -189,10 +193,6 @@ impl AppConfig {
             (
                 self.moderation.search_button_point,
                 "moderation.search_button_point",
-            ),
-            (
-                self.startup.wonderland_card_point,
-                "startup.wonderland_card_point",
             ),
         ] {
             validate_point_in_canvas(point, field, canvas)?;
@@ -1457,15 +1457,18 @@ stale_timeout_ms: 7500
             "ai.extra_body",
             "turtle_soup.batch_max_parts",
             "turtle_soup.ai.extra_body",
-            "startup.wonderland_home_retries",
-            "startup.wonderland_home_retry_ms",
-            "startup.wonderland_card_retries",
-            "startup.wonderland_card_retry_ms",
-            "startup.wonderland_confirm_absent_timeout_ms",
+            "startup.wonderland_map_star_retries",
+            "startup.wonderland_map_star_retry_ms",
+            "startup.wonderland_hall_retries",
+            "startup.wonderland_hall_retry_ms",
+            "startup.wonderland_transition_timeout_ms",
             "startup.wonderland_confirm_stable_timeout_ms",
-            "startup.wonderland_enter_button_threshold",
-            "startup.wonderland_enter_button_region",
-            "startup.templates.wonderland_enter_button",
+            "startup.wonderland_confirm_threshold",
+            "startup.wonderland_hall_ocr_region",
+            "startup.wonderland_confirm_region",
+            "startup.wonderland_map_star_region",
+            "startup.templates.wonderland_map_star",
+            "startup.templates.wonderland_confirm",
         ] {
             let mut value: serde_yaml::Value =
                 serde_yaml::from_str(bundled_config_yaml()).expect("default config value");
@@ -1611,5 +1614,26 @@ marker_threshold: 0.9
         )
         .expect_err("removed template alias must be rejected");
         assert!(templates.to_string().contains("enter"));
+
+        let mut startup_value: serde_yaml::Value =
+            serde_yaml::from_str(bundled_config_yaml()).expect("default config value");
+        let startup = startup_value
+            .get_mut("startup")
+            .and_then(serde_yaml::Value::as_mapping_mut)
+            .expect("startup mapping");
+        startup.remove(serde_yaml::Value::String(
+            "wonderland_map_star_retries".to_string(),
+        ));
+        startup.insert(
+            serde_yaml::Value::String("wonderland_home_retries".to_string()),
+            serde_yaml::Value::Number(120.into()),
+        );
+        let startup_error = serde_yaml::from_value::<AppConfig>(startup_value)
+            .expect_err("removed Wonderland startup aliases must be rejected");
+        assert!(
+            startup_error
+                .to_string()
+                .contains("wonderland_home_retries")
+        );
     }
 }

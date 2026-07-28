@@ -55,12 +55,11 @@ impl ApplicationRuntime {
             } => {
                 let frame = self.latest_frame()?;
                 let default_threshold = match &template {
-                    WebToolTemplate::WonderlandEnterButton => {
-                        self.config.startup.wonderland_enter_button_threshold
+                    WebToolTemplate::WonderlandConfirm => {
+                        self.config.startup.wonderland_confirm_threshold
                     }
-                    WebToolTemplate::PaimonMenu | WebToolTemplate::WonderlandClose => {
-                        self.config.startup.template_threshold
-                    }
+                    WebToolTemplate::PaimonMenu => self.config.startup.template_threshold,
+                    WebToolTemplate::WonderlandMapStar => self.config.startup.template_threshold,
                     WebToolTemplate::Custom(_) => self.config.custom_workflows.default_threshold,
                     _ => self.config.templates.marker_threshold,
                 };
@@ -94,17 +93,14 @@ impl ApplicationRuntime {
                         self.config.templates.friend_blacklist.clone()
                     }
                     WebToolTemplate::FriendConfirm => self.config.templates.friend_confirm.clone(),
-                    WebToolTemplate::WonderlandEnterButton => self
-                        .config
-                        .startup
-                        .templates
-                        .wonderland_enter_button
-                        .clone(),
+                    WebToolTemplate::WonderlandConfirm => {
+                        self.config.startup.templates.wonderland_confirm.clone()
+                    }
                     WebToolTemplate::PaimonMenu => {
                         self.config.startup.templates.paimon_menu.clone()
                     }
-                    WebToolTemplate::WonderlandClose => {
-                        self.config.startup.templates.wonderland_close.clone()
+                    WebToolTemplate::WonderlandMapStar => {
+                        self.config.startup.templates.wonderland_map_star.clone()
                     }
                     WebToolTemplate::Custom(name) => self
                         .config

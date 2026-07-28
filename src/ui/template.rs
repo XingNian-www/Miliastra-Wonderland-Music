@@ -11,7 +11,14 @@ use template_matching::{Image as MatchImage, MatchTemplateMethod, match_template
 use super::geometry::{Point, Rect, crop_canvas};
 
 static RGB_TEMPLATE_CACHE: OnceLock<Mutex<HashMap<PathBuf, RgbImage>>> = OnceLock::new();
-static GRAY_TEMPLATE_CACHE: OnceLock<Mutex<HashMap<PathBuf, GrayImage>>> = OnceLock::new();
+static GRAY_TEMPLATE_CACHE: OnceLock<Mutex<HashMap<PathBuf, GrayTemplate>>> = OnceLock::new();
+
+#[derive(Clone)]
+struct GrayTemplate {
+    gray: GrayImage,
+    alpha: GrayImage,
+    alpha_sum: u64,
+}
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct TemplateHit {
@@ -48,6 +55,14 @@ pub(crate) fn find_template_hits(
 
     if template.width() > haystack.width() || template.height() > haystack.height() {
         return Ok(Vec::new());
+    }
+
+    if template.to_rgba8().pixels().any(|pixel| pixel[3] < 255) {
+        return Ok(
+            best_template_hit(image, search_rect, template_path, threshold)?
+                .into_iter()
+                .collect(),
+        );
     }
 
     let haystack_gray = haystack.to_luma8();
@@ -161,19 +176,34 @@ fn cached_rgb_template(template_path: &Path) -> Result<RgbImage> {
     Ok(image)
 }
 
-fn cached_gray_template(template_path: &Path) -> Result<GrayImage> {
+fn cached_gray_template(template_path: &Path) -> Result<GrayTemplate> {
     let cache = GRAY_TEMPLATE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut cache = cache
         .lock()
         .map_err(|_| anyhow!("template cache mutex poisoned"))?;
-    if let Some(image) = cache.get(template_path) {
-        return Ok(image.clone());
+    if let Some(template) = cache.get(template_path) {
+        return Ok(template.clone());
     }
-    let image = image::open(template_path)
+    let rgba = image::open(template_path)
         .with_context(|| format!("open template {}", template_path.display()))?
-        .to_luma8();
-    cache.insert(template_path.to_path_buf(), image.clone());
-    Ok(image)
+        .to_rgba8();
+    let gray = DynamicImage::ImageRgba8(rgba.clone()).to_luma8();
+    let alpha = GrayImage::from_raw(
+        rgba.width(),
+        rgba.height(),
+        rgba.pixels().map(|pixel| pixel[3]).collect(),
+    )
+    .expect("RGBA alpha plane must have the same dimensions");
+    // Transparent PNG margins must not be compared against the live screen:
+    // those pixels are placeholders, not part of the visual anchor.
+    let alpha_sum = alpha.as_raw().iter().map(|value| *value as u64).sum();
+    let template = GrayTemplate {
+        gray,
+        alpha,
+        alpha_sum,
+    };
+    cache.insert(template_path.to_path_buf(), template.clone());
+    Ok(template)
 }
 
 fn color_sad_at(
@@ -225,13 +255,13 @@ pub(crate) fn best_template_candidate(
         Some(rect) => crop_canvas(image, rect)?,
         None => image.clone(),
     };
-    let template_gray = cached_gray_template(template_path)?;
-    if template_gray.width() > haystack.width() || template_gray.height() > haystack.height() {
+    let template = cached_gray_template(template_path)?;
+    if template.gray.width() > haystack.width() || template.gray.height() > haystack.height() {
         return Ok(None);
     }
 
     let haystack_gray = haystack.to_luma8();
-    let max_sad = template_gray.width() as u64 * template_gray.height() as u64 * 255;
+    let max_sad = template.alpha_sum;
     if max_sad == 0 {
         return Ok(None);
     }
@@ -239,9 +269,16 @@ pub(crate) fn best_template_candidate(
     let mut best_x = 0;
     let mut best_y = 0;
 
-    for y in 0..=(haystack_gray.height() - template_gray.height()) {
-        for x in 0..=(haystack_gray.width() - template_gray.width()) {
-            let sad = gray_sad_at(&haystack_gray, &template_gray, x, y, best_sad);
+    for y in 0..=(haystack_gray.height() - template.gray.height()) {
+        for x in 0..=(haystack_gray.width() - template.gray.width()) {
+            let sad = gray_sad_at(
+                &haystack_gray,
+                &template.gray,
+                &template.alpha,
+                x,
+                y,
+                best_sad,
+            );
             if sad < best_sad {
                 best_sad = sad;
                 best_x = x;
@@ -257,8 +294,8 @@ pub(crate) fn best_template_candidate(
         kind: "template".to_string(),
         x: base_x + best_x as i32,
         y: base_y + best_y as i32,
-        width: template_gray.width(),
-        height: template_gray.height(),
+        width: template.gray.width(),
+        height: template.gray.height(),
         score,
     }))
 }
@@ -266,6 +303,7 @@ pub(crate) fn best_template_candidate(
 fn gray_sad_at(
     haystack: &GrayImage,
     template: &GrayImage,
+    alpha: &GrayImage,
     x: u32,
     y: u32,
     max_allowed_sad: u64,
@@ -283,8 +321,14 @@ fn gray_sad_at(
         let haystack_offset = (y + row) * haystack_width + x;
         let template_offset = row * template_width;
         for column in 0..template_width {
+            let alpha = alpha.as_raw()[template_offset + column] as u64;
+            if alpha == 0 {
+                continue;
+            }
             sad += haystack_data[haystack_offset + column]
-                .abs_diff(template_data[template_offset + column]) as u64;
+                .abs_diff(template_data[template_offset + column]) as u64
+                * alpha
+                / 255;
             if sad > max_allowed_sad {
                 return sad;
             }
@@ -333,7 +377,7 @@ mod tests {
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use image::{DynamicImage, Luma};
+    use image::{DynamicImage, Luma, Rgb, RgbImage, Rgba, RgbaImage};
 
     use super::*;
 
@@ -378,5 +422,42 @@ mod tests {
         assert!(hit.score > 0.999);
         assert!(candidate.score < 0.99);
         assert!(rejected.is_none());
+    }
+
+    #[test]
+    fn best_template_hit_ignores_transparent_template_background() {
+        let mut haystack = RgbImage::from_pixel(8, 7, Rgb([24, 96, 160]));
+        let mut template = RgbaImage::from_pixel(3, 3, Rgba([0, 0, 0, 0]));
+        template.put_pixel(1, 0, Rgba([255, 255, 255, 255]));
+        template.put_pixel(0, 1, Rgba([220, 220, 220, 255]));
+        template.put_pixel(1, 1, Rgba([255, 255, 255, 255]));
+        template.put_pixel(2, 1, Rgba([220, 220, 220, 255]));
+        template.put_pixel(1, 2, Rgba([255, 255, 255, 255]));
+        for (x, y, pixel) in [
+            (1, 0, [255, 255, 255]),
+            (0, 1, [220, 220, 220]),
+            (1, 1, [255, 255, 255]),
+            (2, 1, [220, 220, 220]),
+            (1, 2, [255, 255, 255]),
+        ] {
+            haystack.put_pixel(3 + x, 2 + y, Rgb(pixel));
+        }
+
+        let path = std::env::temp_dir().join(format!(
+            "miliastra-transparent-template-test-{}-{}.png",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        template.save(&path).expect("save transparent template");
+        let hit = best_template_hit(&DynamicImage::ImageRgb8(haystack), None, &path, 0.99)
+            .expect("match transparent template")
+            .expect("transparent template should match");
+        let _ = fs::remove_file(&path);
+
+        assert_eq!((hit.x, hit.y), (3, 2));
+        assert!(hit.score > 0.999);
     }
 }

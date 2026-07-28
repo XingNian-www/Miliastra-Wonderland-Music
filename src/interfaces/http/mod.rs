@@ -1731,9 +1731,9 @@ fn tool_templates_route(
         json!({ "name": "friend-block-chat", "label": "屏蔽聊天", "region": state.config.moderation.block_chat_region, "threshold": marker_threshold }),
         json!({ "name": "friend-blacklist", "label": "拉黑", "region": state.config.moderation.blacklist_region, "threshold": marker_threshold }),
         json!({ "name": "friend-confirm", "label": "好友操作确认", "region": state.config.moderation.confirm_region, "threshold": marker_threshold }),
-        json!({ "name": "wonderland-enter-button", "label": "千星前往大厅", "region": state.config.startup.wonderland_enter_button_region, "threshold": state.config.startup.wonderland_enter_button_threshold }),
+        json!({ "name": "wonderland-confirm", "label": "千星确认按钮", "region": state.config.startup.wonderland_confirm_region, "threshold": state.config.startup.wonderland_confirm_threshold }),
         json!({ "name": "paimon-menu", "label": "派蒙主界面", "region": state.config.startup.main_ui_region, "threshold": state.config.startup.template_threshold }),
-        json!({ "name": "wonderland-close", "label": "千星主页关闭按钮", "region": state.config.startup.wonderland_close_region, "threshold": state.config.startup.template_threshold }),
+        json!({ "name": "wonderland-map-star", "label": "千星地图入口", "region": state.config.startup.wonderland_map_star_region, "threshold": state.config.startup.template_threshold }),
     ];
     let mut custom = state
         .config
@@ -4094,9 +4094,9 @@ workflows:
                 marker_threshold,
             ),
             (
-                "wonderland-enter-button",
-                state.config.startup.wonderland_enter_button_region,
-                state.config.startup.wonderland_enter_button_threshold,
+                "wonderland-confirm",
+                state.config.startup.wonderland_confirm_region,
+                state.config.startup.wonderland_confirm_threshold,
             ),
             (
                 "paimon-menu",
@@ -4104,8 +4104,8 @@ workflows:
                 state.config.startup.template_threshold,
             ),
             (
-                "wonderland-close",
-                state.config.startup.wonderland_close_region,
+                "wonderland-map-star",
+                state.config.startup.wonderland_map_star_region,
                 state.config.startup.template_threshold,
             ),
         ];

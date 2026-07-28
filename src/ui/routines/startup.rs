@@ -109,6 +109,7 @@ impl StartupUi {
     ) -> Result<UiOperation<EnterWonderlandOutcome>, UiSubmitError> {
         self.runtime.submit(EnterWonderlandRoutine {
             request,
+            ocr: self.ocr.clone(),
             config: self.config.clone(),
         })
     }
@@ -131,31 +132,31 @@ pub(crate) struct StartupUiConfig {
     pub(crate) launch_retries: u32,
     pub(crate) enter_game_timeout_ms: u64,
     pub(crate) enter_wonderland_timeout_ms: u64,
-    pub(crate) wonderland_home_retries: u32,
-    pub(crate) wonderland_home_retry_ms: u64,
-    pub(crate) wonderland_card_retries: u32,
-    pub(crate) wonderland_card_retry_ms: u64,
-    pub(crate) wonderland_confirm_absent_timeout_ms: u64,
+    pub(crate) wonderland_map_star_retries: u32,
+    pub(crate) wonderland_map_star_retry_ms: u64,
+    pub(crate) wonderland_hall_retries: u32,
+    pub(crate) wonderland_hall_retry_ms: u64,
+    pub(crate) wonderland_transition_timeout_ms: u64,
     pub(crate) wonderland_confirm_stable_timeout_ms: u64,
     pub(crate) final_primary_timeout_ms: u64,
     pub(crate) poll_ms: u64,
     pub(crate) stable_mean_threshold: f32,
     pub(crate) stable_changed_ratio_threshold: f32,
     pub(crate) template_threshold: f32,
-    pub(crate) wonderland_enter_button_threshold: f32,
+    pub(crate) wonderland_confirm_threshold: f32,
     pub(crate) templates: StartupUiTemplates,
     pub(crate) enter_game_text_region: Rect,
-    pub(crate) wonderland_enter_button_region: Rect,
+    pub(crate) wonderland_hall_ocr_region: Rect,
+    pub(crate) wonderland_confirm_region: Rect,
     pub(crate) main_ui_region: Rect,
-    pub(crate) wonderland_close_region: Rect,
-    pub(crate) wonderland_card_point: Point,
+    pub(crate) wonderland_map_star_region: Rect,
 }
 
 #[derive(Clone)]
 pub(crate) struct StartupUiTemplates {
-    pub(crate) wonderland_enter_button: PathBuf,
+    pub(crate) wonderland_map_star: PathBuf,
+    pub(crate) wonderland_confirm: PathBuf,
     pub(crate) paimon_menu: PathBuf,
-    pub(crate) wonderland_close: PathBuf,
 }
 
 impl StartupRoutineConfig {
@@ -199,6 +200,7 @@ impl UiRoutine for EnterGameRoutine {
 
 struct EnterWonderlandRoutine {
     request: EnterWonderland,
+    ocr: OcrRuntimeHandle,
     config: StartupRoutineConfig,
 }
 
@@ -210,10 +212,11 @@ impl UiRoutine for EnterWonderlandRoutine {
     fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
         let _ = self.request;
         let mut goal_attempted = false;
-        let effect = match execute_enter_wonderland(context, &self.config, &mut goal_attempted) {
-            Ok(()) => EnterWonderlandEffect::Entered,
-            Err(failure) => EnterWonderlandEffect::Failed(failure),
-        };
+        let effect =
+            match execute_enter_wonderland(context, &self.ocr, &self.config, &mut goal_attempted) {
+                Ok(()) => EnterWonderlandEffect::Entered,
+                Err(failure) => EnterWonderlandEffect::Failed(failure),
+            };
         let residency = wait_for_primary(
             context,
             &self.config,
@@ -342,6 +345,7 @@ fn ensure_game_window(
 
 fn execute_enter_wonderland(
     context: &mut UiRoutineContext<'_>,
+    ocr: &OcrRuntimeHandle,
     config: &StartupRoutineConfig,
     goal_attempted: &mut bool,
 ) -> Result<(), UiRoutineFailure> {
@@ -355,77 +359,109 @@ fn execute_enter_wonderland(
         .map_err(|error| before_input_failure("focus_wonderland_window", error))?;
     wait_for_paimon_menu(context, config)?;
 
-    let home_attempts = capped_attempts(
-        config.startup.wonderland_home_retries,
+    context
+        .device()
+        .press_key(Key::M)
+        .map_err(|error| before_input_failure("open_wonderland_map", error))?;
+
+    let map_attempts = capped_attempts(
+        config.startup.wonderland_map_star_retries,
         config.startup.enter_wonderland_timeout_ms,
-        config.startup.wonderland_home_retry_ms,
+        config.startup.wonderland_map_star_retry_ms,
     );
-    let mut home_ready = false;
-    for _ in 0..home_attempts {
-        context
-            .device()
-            .press_key(Key::F6)
-            .map_err(|error| before_input_failure("open_wonderland_home", error))?;
-        sleep_ms(config.startup.wonderland_home_retry_ms.max(100));
-        if stable_template_visible(
-            context,
-            config,
-            &config.startup.templates.wonderland_close,
-            config.startup.wonderland_close_region,
-            config.startup.template_threshold,
-        )? {
-            home_ready = true;
-            break;
-        }
-    }
-    if !home_ready {
+    let map_interval_ms = config.startup.wonderland_map_star_retry_ms.max(100);
+    let map_timeout_ms = (map_attempts as u64).saturating_mul(map_interval_ms).min(
+        config
+            .startup
+            .enter_wonderland_timeout_ms
+            .max(map_interval_ms),
+    );
+    let map_star = wait_template_hit(
+        context,
+        config,
+        &config.startup.templates.wonderland_map_star,
+        config.startup.wonderland_map_star_region,
+        config.startup.template_threshold,
+        map_timeout_ms,
+    )?;
+    let Some(map_star) = map_star else {
         return Err(UiRoutineFailure::new(
             InputCertainty::ConfirmedFailure,
-            "open_wonderland_home",
-            "wonderland home template did not become stable",
+            "locate_wonderland_map_star",
+            "wonderland map star template was not found",
         ));
-    }
-
-    let card_attempts = capped_attempts(
-        config.startup.wonderland_card_retries,
-        config.startup.enter_wonderland_timeout_ms,
-        config.startup.wonderland_card_retry_ms,
-    );
-    for _ in 0..card_attempts {
-        context
-            .device()
-            .click_point(
-                config.startup.wonderland_card_point.x,
-                config.startup.wonderland_card_point.y,
+    };
+    context
+        .device()
+        .click_point(map_star.x, map_star.y)
+        .map_err(|error| {
+            UiRoutineFailure::new(
+                InputCertainty::AfterInputUnknown,
+                "click_wonderland_map_star",
+                format!("{error:#}"),
             )
-            .map_err(|error| before_input_failure("select_wonderland_card", error))?;
-        if let Some(point) = wait_template_hit(
-            context,
-            config,
-            &config.startup.templates.wonderland_enter_button,
-            config.startup.wonderland_enter_button_region,
-            config.startup.wonderland_enter_button_threshold,
-            config.startup.wonderland_card_retry_ms.max(100),
-        )? {
-            context
-                .device()
-                .click_point(point.x, point.y)
-                .map_err(|error| {
-                    UiRoutineFailure::new(
-                        InputCertainty::AfterInputUnknown,
-                        "confirm_enter_wonderland",
-                        format!("{error:#}"),
-                    )
-                })?;
-            *goal_attempted = true;
-            return confirm_wonderland_transition(context, config);
-        }
-    }
-    Err(UiRoutineFailure::new(
-        InputCertainty::ConfirmedFailure,
-        "locate_wonderland_confirmation",
-        "wonderland confirmation template was not found",
-    ))
+        })?;
+    *goal_attempted = true;
+    wait_template_absent(
+        context,
+        config,
+        &config.startup.templates.wonderland_map_star,
+        config.startup.wonderland_map_star_region,
+        config.startup.template_threshold,
+        config.startup.wonderland_transition_timeout_ms,
+        "confirm_wonderland_map_star_absent",
+        "wonderland map star template did not disappear",
+    )?;
+
+    let hall_attempts = capped_attempts(
+        config.startup.wonderland_hall_retries,
+        config.startup.enter_wonderland_timeout_ms,
+        config.startup.wonderland_hall_retry_ms,
+    );
+    let Some(hall_point) = wait_wonderland_hall_text(context, ocr, config, hall_attempts)? else {
+        return Err(UiRoutineFailure::new(
+            InputCertainty::AfterInputUnknown,
+            "locate_wonderland_hall",
+            "OCR did not find a 千星奇域/大厅 option",
+        ));
+    };
+    context
+        .device()
+        .click_point(hall_point.x, hall_point.y)
+        .map_err(|error| {
+            UiRoutineFailure::new(
+                InputCertainty::AfterInputUnknown,
+                "select_wonderland_hall",
+                format!("{error:#}"),
+            )
+        })?;
+
+    let Some(confirm_point) = wait_template_hit(
+        context,
+        config,
+        &config.startup.templates.wonderland_confirm,
+        config.startup.wonderland_confirm_region,
+        config.startup.wonderland_confirm_threshold,
+        config.startup.wonderland_transition_timeout_ms,
+    )?
+    else {
+        return Err(UiRoutineFailure::new(
+            InputCertainty::AfterInputUnknown,
+            "locate_wonderland_confirm",
+            "wonderland confirm template was not found",
+        ));
+    };
+    context
+        .device()
+        .click_point(confirm_point.x, confirm_point.y)
+        .map_err(|error| {
+            UiRoutineFailure::new(
+                InputCertainty::AfterInputUnknown,
+                "confirm_enter_wonderland",
+                format!("{error:#}"),
+            )
+        })?;
+    confirm_wonderland_transition(context, config)
 }
 
 fn wait_for_paimon_menu(
@@ -467,9 +503,9 @@ fn confirm_wonderland_transition(
     context: &mut UiRoutineContext<'_>,
     config: &StartupRoutineConfig,
 ) -> Result<(), UiRoutineFailure> {
-    let region = config.startup.wonderland_enter_button_region;
+    let region = config.startup.wonderland_confirm_region;
     let deadline =
-        Instant::now() + Duration::from_millis(config.startup.wonderland_confirm_absent_timeout_ms);
+        Instant::now() + Duration::from_millis(config.startup.wonderland_transition_timeout_ms);
     while Instant::now() < deadline {
         let image = capture_normalized(
             context,
@@ -480,8 +516,8 @@ fn confirm_wonderland_transition(
         if !template_visible(
             &image,
             region,
-            &config.startup.templates.wonderland_enter_button,
-            config.startup.wonderland_enter_button_threshold,
+            &config.startup.templates.wonderland_confirm,
+            config.startup.wonderland_confirm_threshold,
         )? {
             return wait_region_stable(context, config, region);
         }
@@ -628,26 +664,81 @@ fn find_enter_game_text(
     }))
 }
 
-fn stable_template_visible(
+fn wait_template_absent(
     context: &mut UiRoutineContext<'_>,
     config: &StartupRoutineConfig,
     template: &Path,
     region: Rect,
     threshold: f32,
-) -> Result<bool, UiRoutineFailure> {
-    for _ in 0..TEMPLATE_STABLE_HITS {
+    timeout_ms: u64,
+    stage: &'static str,
+    failure_message: &'static str,
+) -> Result<(), UiRoutineFailure> {
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
+    while Instant::now() < deadline {
         let image = capture_normalized(
             context,
             &config.residency,
-            "confirm_startup_template",
+            stage,
             InputCertainty::AfterInputUnknown,
         )?;
         if !template_visible(&image, region, template, threshold)? {
-            return Ok(false);
+            return Ok(());
         }
         sleep_ms(config.startup.poll_ms);
     }
-    Ok(true)
+    Err(UiRoutineFailure::new(
+        InputCertainty::AfterInputUnknown,
+        stage,
+        failure_message,
+    ))
+}
+
+fn wait_wonderland_hall_text(
+    context: &mut UiRoutineContext<'_>,
+    ocr: &OcrRuntimeHandle,
+    config: &StartupRoutineConfig,
+    attempts: u32,
+) -> Result<Option<Point>, UiRoutineFailure> {
+    for _ in 0..attempts.max(1) {
+        let image = capture_normalized(
+            context,
+            &config.residency,
+            "locate_wonderland_hall",
+            InputCertainty::AfterInputUnknown,
+        )?;
+        if let Some(point) = find_wonderland_hall_text(ocr, &image, config)? {
+            return Ok(Some(point));
+        }
+        sleep_ms(config.startup.wonderland_hall_retry_ms.max(100));
+    }
+    Ok(None)
+}
+
+fn find_wonderland_hall_text(
+    ocr: &OcrRuntimeHandle,
+    image: &image::DynamicImage,
+    config: &StartupRoutineConfig,
+) -> Result<Option<Point>, UiRoutineFailure> {
+    let region = config.startup.wonderland_hall_ocr_region;
+    let crop = crop_canvas(image, region)
+        .map_err(|error| before_input_failure("crop_wonderland_hall", error))?;
+    let lines = ocr
+        .recognize_lines(crop, OcrPriority::UiConfirmation)
+        .map_err(|error| before_input_failure("ocr_wonderland_hall", error))?;
+    Ok(lines.into_iter().find_map(|line| {
+        is_wonderland_hall_text(&line.text).then(|| {
+            Point::new(
+                region.x + line.bbox.center().x,
+                region.y + line.bbox.center().y,
+            )
+        })
+    }))
+}
+
+fn is_wonderland_hall_text(text: &str) -> bool {
+    let normalized = normalize_lock_text(text);
+    normalized.contains("千星奇域") || normalized.contains("大厅")
 }
 
 fn wait_template_hit(
@@ -733,6 +824,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use crate::config::AppConfig;
+    use crate::runtime::ocr::{OcrDevice, OcrLine, OcrRuntime};
     use crate::runtime::ui::{UiDevice, UiRuntime};
     use anyhow::Result;
     use image::{DynamicImage, GenericImage};
@@ -742,6 +834,14 @@ mod tests {
     struct PaimonOnlyDevice {
         frame: DynamicImage,
         keys: Arc<Mutex<Vec<Key>>>,
+    }
+
+    struct EmptyOcr;
+
+    impl OcrDevice for EmptyOcr {
+        fn recognize_lines(&mut self, _image: &DynamicImage) -> Result<Vec<OcrLine>> {
+            Ok(Vec::new())
+        }
     }
 
     impl UiDevice for PaimonOnlyDevice {
@@ -775,31 +875,28 @@ mod tests {
                 launch_retries: startup.launch_retries,
                 enter_game_timeout_ms: startup.enter_game_timeout_ms,
                 enter_wonderland_timeout_ms: startup.enter_wonderland_timeout_ms,
-                wonderland_home_retries: startup.wonderland_home_retries,
-                wonderland_home_retry_ms: startup.wonderland_home_retry_ms,
-                wonderland_card_retries: startup.wonderland_card_retries,
-                wonderland_card_retry_ms: startup.wonderland_card_retry_ms,
-                wonderland_confirm_absent_timeout_ms: startup.wonderland_confirm_absent_timeout_ms,
+                wonderland_map_star_retries: startup.wonderland_map_star_retries,
+                wonderland_map_star_retry_ms: startup.wonderland_map_star_retry_ms,
+                wonderland_hall_retries: startup.wonderland_hall_retries,
+                wonderland_hall_retry_ms: startup.wonderland_hall_retry_ms,
+                wonderland_transition_timeout_ms: startup.wonderland_transition_timeout_ms,
                 wonderland_confirm_stable_timeout_ms: startup.wonderland_confirm_stable_timeout_ms,
                 final_primary_timeout_ms: startup.final_primary_timeout_ms,
                 poll_ms: 1,
                 stable_mean_threshold: startup.stable_mean_threshold,
                 stable_changed_ratio_threshold: startup.stable_changed_ratio_threshold,
                 template_threshold: startup.template_threshold,
-                wonderland_enter_button_threshold: startup.wonderland_enter_button_threshold,
+                wonderland_confirm_threshold: startup.wonderland_confirm_threshold,
                 templates: StartupUiTemplates {
-                    wonderland_enter_button: startup.templates.wonderland_enter_button.clone(),
+                    wonderland_map_star: startup.templates.wonderland_map_star.clone(),
+                    wonderland_confirm: startup.templates.wonderland_confirm.clone(),
                     paimon_menu: startup.templates.paimon_menu.clone(),
-                    wonderland_close: startup.templates.wonderland_close.clone(),
                 },
                 enter_game_text_region: startup.enter_game_text_region.into(),
-                wonderland_enter_button_region: startup.wonderland_enter_button_region.into(),
+                wonderland_hall_ocr_region: startup.wonderland_hall_ocr_region.into(),
+                wonderland_confirm_region: startup.wonderland_confirm_region.into(),
                 main_ui_region: startup.main_ui_region.into(),
-                wonderland_close_region: startup.wonderland_close_region.into(),
-                wonderland_card_point: Point::new(
-                    startup.wonderland_card_point.x,
-                    startup.wonderland_card_point.y,
-                ),
+                wonderland_map_star_region: startup.wonderland_map_star_region.into(),
             },
             FriendDeliveryRoutineConfig::from_app(app),
             app.window.target_process.clone(),
@@ -811,8 +908,8 @@ mod tests {
         let app = AppConfig::load(Path::new("config.yaml")).unwrap();
         let mut config = test_startup_config(&app);
         config.startup.enter_wonderland_timeout_ms = 1;
-        config.startup.wonderland_home_retries = 1;
-        config.startup.wonderland_home_retry_ms = 1;
+        config.startup.wonderland_map_star_retries = 1;
+        config.startup.wonderland_map_star_retry_ms = 1;
 
         let mut frame = DynamicImage::new_rgba8(1920, 1080);
         let paimon = image::open(&config.startup.templates.paimon_menu).unwrap();
@@ -829,11 +926,13 @@ mod tests {
             4,
         )
         .unwrap();
+        let ocr_runtime = OcrRuntime::start(EmptyOcr, 1).unwrap();
         config.startup.final_primary_timeout_ms = 1;
         let outcome = ui_runtime
             .handle()
             .submit(EnterWonderlandRoutine {
                 request: EnterWonderland,
+                ocr: ocr_runtime.handle(),
                 config,
             })
             .unwrap()
@@ -843,9 +942,18 @@ mod tests {
         let EnterWonderlandEffect::Failed(failure) = outcome.effect() else {
             panic!("the fixture intentionally has no wonderland home template");
         };
-        assert_eq!(failure.stage(), "open_wonderland_home");
-        assert_eq!(keys.lock().unwrap().as_slice(), &[Key::F6]);
+        assert_eq!(failure.stage(), "locate_wonderland_map_star");
+        assert_eq!(keys.lock().unwrap().as_slice(), &[Key::M]);
         ui_runtime.shutdown().unwrap();
+        ocr_runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn wonderland_hall_text_accepts_either_marker() {
+        assert!(is_wonderland_hall_text("千星奇域·大厅"));
+        assert!(is_wonderland_hall_text("千星奇域"));
+        assert!(is_wonderland_hall_text("大厅"));
+        assert!(!is_wonderland_hall_text("千星"));
     }
 
     #[test]

@@ -323,15 +323,15 @@ fn read_hall_info_transaction(
     *opened = true;
     sleep_ms(config.page_settle_ms);
 
-    let mut detection_image = capture_normalized(
+    let initial_image = capture_normalized(
         context,
         &config.residency,
         "capture_hall_screenshot",
         InputCertainty::AfterInputUnknown,
     )?;
-    let first_image = detection_image.clone();
-    let mut screenshot = first_image.clone();
-    match read_hall_member_count(ocr, &detection_image, config) {
+    let mut detection_image = initial_image.clone();
+    let mut screenshot = initial_image.clone();
+    match read_hall_member_count(ocr, &initial_image, config) {
         Ok(Some(member_count)) => {
             log::info!(
                 "大厅成员人数 OCR 结果: {}，滚动阈值={}",
@@ -345,10 +345,10 @@ fn read_hall_info_transaction(
                     .drag_point(from.x, from.y, to.x, to.y)
                     .map_err(|error| after_input_failure("drag_hall_member_list", error))?;
                 sleep_ms(config.page_settle_ms);
-                let scrolled_image = capture_normalized(
+                let top_image = capture_normalized(
                     context,
                     &config.residency,
-                    "capture_scrolled_hall_screenshot",
+                    "capture_top_hall_screenshot",
                     InputCertainty::AfterInputUnknown,
                 );
                 context
@@ -356,8 +356,15 @@ fn read_hall_info_transaction(
                     .drag_point(to.x, to.y, from.x, from.y)
                     .map_err(|error| after_input_failure("restore_hall_member_list", error))?;
                 sleep_ms(config.page_settle_ms);
-                detection_image = scrolled_image?;
-                screenshot = merge_hall_screenshots(&first_image, &detection_image);
+                let bottom_image = capture_normalized(
+                    context,
+                    &config.residency,
+                    "capture_bottom_hall_screenshot",
+                    InputCertainty::AfterInputUnknown,
+                )?;
+                let top_image = top_image?;
+                detection_image = bottom_image.clone();
+                screenshot = merge_hall_screenshots(&top_image, &bottom_image);
             }
         }
         Ok(None) => log::debug!("大厅成员人数 OCR 未识别，跳过成员列表滚动"),
@@ -524,6 +531,12 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((from_x, from_y, to_x, to_y));
+            let color = if from_y > to_y {
+                Rgba([255, 0, 0, 255])
+            } else {
+                Rgba([0, 255, 0, 255])
+            };
+            self.frame.put_pixel(0, 0, color);
             Ok(())
         }
     }
@@ -653,6 +666,55 @@ mod tests {
             outcome.residency()
         );
         assert_eq!(*keys.lock().unwrap(), [Key::F2, Key::Escape]);
+        assert_eq!(
+            *drags.lock().unwrap(),
+            [(1240, 910, 1240, 160), (1240, 160, 1240, 910)]
+        );
+
+        ui_runtime.shutdown().unwrap();
+        ocr_runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn hall_screenshot_captures_top_then_bottom_after_scroll() {
+        let mut config = AppConfig::load(Path::new("config.yaml")).unwrap();
+        config.timing.input.after_activate_ms = 0;
+        config.timing.input.click_ms = 0;
+        config.timing.hall.page_settle_ms = 0;
+        config.timing.hall.ocr_sample_interval_ms = 0;
+        config.timing.workflow.default_timeout_ms = 200;
+        config.timing.workflow.default_poll_ms = 1;
+        let keys = Arc::new(Mutex::new(Vec::new()));
+        let drags = Arc::new(Mutex::new(Vec::new()));
+        let ui_runtime = start_test_ui_runtime(
+            HallDevice {
+                frame: primary_frame(&config),
+                keys,
+                drags: drags.clone(),
+            },
+            &config,
+        );
+        let ocr_runtime = OcrRuntime::start(
+            HallOcrDevice {
+                member_count: "大厅人数 8/12",
+            },
+            4,
+        )
+        .unwrap();
+        let hall_ui = HallUi::new(
+            ui_runtime.handle(),
+            ocr_runtime.handle(),
+            HallRoutineConfig::from_app(&config),
+        );
+
+        let outcome = hall_ui.submit_read(ReadHallInfo).unwrap().wait().unwrap();
+        let screenshot = outcome.screenshot().expect("hall screenshot").to_rgba8();
+
+        assert_eq!(*screenshot.get_pixel(0, 0), Rgba([255, 0, 0, 255]));
+        assert_eq!(
+            *screenshot.get_pixel(0, config.screen.expected_height),
+            Rgba([0, 255, 0, 255])
+        );
         assert_eq!(
             *drags.lock().unwrap(),
             [(1240, 910, 1240, 160), (1240, 160, 1240, 910)]

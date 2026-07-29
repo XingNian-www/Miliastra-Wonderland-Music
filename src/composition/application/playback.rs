@@ -1,9 +1,9 @@
 use super::*;
 
 use crate::features::playback::{
-    PlaybackAttempt, PlaybackCommandContext, PlaybackCommandPort, PlaybackDecision,
-    PlaybackExecutionPort, PlaybackPickedCandidate, PlaybackSearchFailure, PlaybackSelection,
-    PlaybackVerification, QueueRemoval,
+    BackgroundLyricsScope, PlaybackAttempt, PlaybackCommandContext, PlaybackCommandPort,
+    PlaybackDecision, PlaybackExecutionPort, PlaybackPickedCandidate, PlaybackSearchFailure,
+    PlaybackSelection, PlaybackVerification, QueueRemoval,
 };
 
 impl ApplicationRuntime {
@@ -291,7 +291,11 @@ impl PlaybackCommandPort for ApplicationRuntime {
             .is_empty())
     }
 
-    fn start_background_lyrics(&mut self, duration: Option<Duration>) -> Result<bool> {
+    fn start_background_lyrics(
+        &mut self,
+        duration: Option<Duration>,
+        scope: BackgroundLyricsScope,
+    ) -> Result<bool> {
         workers::start_background_lyrics(
             &self.background_commands,
             self.player.clone(),
@@ -299,6 +303,7 @@ impl PlaybackCommandPort for ApplicationRuntime {
             self.running.clone(),
             Duration::from_millis(self.config.timing.playback.monitor_status_ms),
             duration,
+            scope,
         )
     }
 

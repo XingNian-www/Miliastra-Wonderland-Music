@@ -291,13 +291,14 @@ impl PlaybackCommandPort for ApplicationRuntime {
             .is_empty())
     }
 
-    fn start_background_lyrics(&mut self) -> Result<bool> {
+    fn start_background_lyrics(&mut self, duration: Option<Duration>) -> Result<bool> {
         workers::start_background_lyrics(
             &self.background_commands,
             self.player.clone(),
             self.business.clone(),
             self.running.clone(),
             Duration::from_millis(self.config.timing.playback.monitor_status_ms),
+            duration,
         )
     }
 

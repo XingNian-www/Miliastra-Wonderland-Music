@@ -169,10 +169,6 @@ pub(crate) trait PlaybackExecutionPort {
 }
 
 pub(crate) trait PlaybackCommandPort: PlaybackExecutionPort {
-    fn now(&self) -> Instant {
-        Instant::now()
-    }
-
     fn reply_batch(&mut self, messages: &[String], delay_ms: u64) -> Result<()>;
     fn log_executed(&mut self, context: &PlaybackCommandContext, final_command: &str)
     -> Result<()>;
@@ -193,7 +189,7 @@ pub(crate) trait PlaybackCommandPort: PlaybackExecutionPort {
     fn should_stop_continuous_lyrics(&mut self) -> Result<bool> {
         Ok(false)
     }
-    fn start_background_lyrics(&mut self) -> Result<bool> {
+    fn start_background_lyrics(&mut self, _duration: Option<Duration>) -> Result<bool> {
         Ok(false)
     }
     fn stop_background_lyrics(&mut self) -> Result<bool> {
@@ -340,8 +336,18 @@ impl PlaybackApplication {
                 port.reply(&format_lyrics(&status))?;
             }
             PlaybackCommand::LyricsFor(seconds) => {
+                let started =
+                    port.start_background_lyrics(Some(Duration::from_secs(u64::from(*seconds))))?;
                 port.log_executed(context, &format!("lyrics {}s", seconds))?;
-                self.reply_lyrics_for(*seconds, port)?;
+                let message = if started {
+                    format!(
+                        "限时歌词已开启，将持续{}秒；正式命令执行期间暂不发送，完成后自动继续",
+                        seconds
+                    )
+                } else {
+                    "后台歌词已经在运行".to_string()
+                };
+                port.reply(&message)?;
             }
             PlaybackCommand::ContinuousLyrics => {
                 port.stop_background_lyrics()?;
@@ -349,7 +355,7 @@ impl PlaybackApplication {
                 self.reply_continuous_lyrics(port)?;
             }
             PlaybackCommand::BackgroundLyrics => {
-                let started = port.start_background_lyrics()?;
+                let started = port.start_background_lyrics(None)?;
                 port.log_executed(context, "lyrics background")?;
                 port.reply(if started {
                     "后台歌词已开启，正式命令执行期间暂不发送，完成后自动继续"
@@ -411,55 +417,6 @@ impl PlaybackApplication {
 
         let messages = split_full_queue_messages(&queue, self.config.queue_max_size);
         port.reply_batch(&messages, self.config.help_batch_ms)
-    }
-
-    fn reply_lyrics_for<P: PlaybackCommandPort + ?Sized>(
-        &self,
-        seconds: u8,
-        port: &mut P,
-    ) -> Result<()> {
-        let deadline = port.now() + Duration::from_secs(u64::from(seconds));
-        let poll = Duration::from_millis(self.config.monitor_status_ms.max(1));
-        let mut first_uri = None::<String>;
-        let mut previous_lyric = None::<String>;
-
-        while port.now() < deadline {
-            match port.player_status() {
-                Ok(status) => {
-                    if port.now() >= deadline {
-                        break;
-                    }
-                    let uri = status.current_uri.trim();
-                    if !uri.is_empty() {
-                        if let Some(first_uri) = first_uri.as_deref()
-                            && first_uri != uri
-                        {
-                            log::info!("歌词输出因歌曲切换结束");
-                            break;
-                        }
-                        first_uri.get_or_insert_with(|| uri.to_string());
-                    }
-
-                    let lyric = status.lyric_line_text.trim();
-                    if lyric.is_empty() {
-                        previous_lyric = None;
-                    } else if previous_lyric.as_deref() != Some(lyric) {
-                        port.reply(&format_lyrics(&status))?;
-                        previous_lyric = Some(lyric.to_string());
-                    }
-                }
-                Err(error) => {
-                    log::warn!("持续歌词读取播放器状态失败: {error:#}");
-                }
-            }
-
-            let remaining = deadline.saturating_duration_since(port.now());
-            if remaining.is_zero() {
-                break;
-            }
-            port.wait(poll.min(remaining));
-        }
-        Ok(())
     }
 
     fn reply_continuous_lyrics<P: PlaybackCommandPort + ?Sized>(&self, port: &mut P) -> Result<()> {
@@ -1424,6 +1381,7 @@ mod tests {
         status: PlayerStatus,
         stop_continuous_lyrics_after_statuses: Option<usize>,
         status_calls: usize,
+        background_lyrics_starts: Vec<Option<Duration>>,
     }
 
     impl PlaybackExecutionPort for NavigationCommandPort {
@@ -1494,12 +1452,6 @@ mod tests {
     }
 
     impl PlaybackCommandPort for NavigationCommandPort {
-        fn now(&self) -> Instant {
-            self.clock
-                .as_ref()
-                .map_or_else(Instant::now, |clock| clock.now())
-        }
-
         fn reply_batch(&mut self, messages: &[String], delay_ms: u64) -> Result<()> {
             self.batch_replies.push(messages.to_vec());
             self.batch_delays.push(delay_ms);
@@ -1556,6 +1508,11 @@ mod tests {
                 .is_some_and(|limit| self.status_calls >= limit))
         }
 
+        fn start_background_lyrics(&mut self, duration: Option<Duration>) -> Result<bool> {
+            self.background_lyrics_starts.push(duration);
+            Ok(true)
+        }
+
         fn wait(&mut self, duration: Duration) {
             if let Some(clock) = &self.clock {
                 clock.advance(duration).expect("advance test clock");
@@ -1588,6 +1545,7 @@ mod tests {
             status: PlayerStatus::default(),
             stop_continuous_lyrics_after_statuses: None,
             status_calls: 0,
+            background_lyrics_starts: Vec::new(),
         };
         let application = PlaybackApplication::new(PlaybackApplicationConfig {
             console_bypass_dedup: true,
@@ -1618,15 +1576,7 @@ mod tests {
     }
 
     #[test]
-    fn timed_lyrics_sends_changed_lines_and_stops_after_song_switch() {
-        let start = Instant::now();
-        let clock = Arc::new(ManualClock::new(start));
-        let playing = |uri: &str, lyric: &str| PlayerStatus {
-            status: "playing".to_string(),
-            current_uri: uri.to_string(),
-            lyric_line_text: lyric.to_string(),
-            ..PlayerStatus::default()
-        };
+    fn timed_lyrics_starts_the_background_monitor_for_the_requested_duration() {
         let mut port = NavigationCommandPort {
             previous_request: None,
             played_uris: Vec::new(),
@@ -1636,16 +1586,12 @@ mod tests {
             batch_replies: Vec::new(),
             batch_delays: Vec::new(),
             queue: Vec::new(),
-            status_updates: VecDeque::from([
-                playing("fuo://song/1", "第一句"),
-                playing("fuo://song/1", "第一句"),
-                playing("fuo://song/1", "第二句"),
-                playing("fuo://song/2", "第三句"),
-            ]),
-            clock: Some(Arc::clone(&clock)),
+            status_updates: VecDeque::new(),
+            clock: None,
             status: PlayerStatus::default(),
             stop_continuous_lyrics_after_statuses: None,
             status_calls: 0,
+            background_lyrics_starts: Vec::new(),
         };
         let application = PlaybackApplication::new(PlaybackApplicationConfig {
             console_bypass_dedup: true,
@@ -1667,8 +1613,14 @@ mod tests {
             .execute_command(&context, &PlaybackCommand::LyricsFor(5), &mut port)
             .expect("timed lyrics command");
 
-        assert_eq!(port.replies, ["歌词: 第一句", "歌词: 第二句"]);
-        assert_eq!(clock.now(), start + Duration::from_secs(3));
+        assert_eq!(
+            port.background_lyrics_starts,
+            [Some(Duration::from_secs(5))]
+        );
+        assert_eq!(
+            port.replies,
+            ["限时歌词已开启，将持续5秒；正式命令执行期间暂不发送，完成后自动继续"]
+        );
     }
 
     #[test]
@@ -1699,6 +1651,7 @@ mod tests {
             status: PlayerStatus::default(),
             stop_continuous_lyrics_after_statuses: Some(3),
             status_calls: 0,
+            background_lyrics_starts: Vec::new(),
         };
         let application = PlaybackApplication::new(PlaybackApplicationConfig {
             console_bypass_dedup: true,
@@ -1790,6 +1743,7 @@ mod tests {
             },
             stop_continuous_lyrics_after_statuses: None,
             status_calls: 0,
+            background_lyrics_starts: Vec::new(),
         };
         let application = PlaybackApplication::new(PlaybackApplicationConfig {
             console_bypass_dedup: true,

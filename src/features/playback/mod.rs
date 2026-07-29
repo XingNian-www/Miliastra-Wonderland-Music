@@ -230,7 +230,7 @@ pub(crate) enum PlaybackCommand {
     Volume(String),
     Status,
     Lyrics,
-    LyricsFor(u8),
+    LyricsFor(u16),
     ContinuousLyrics,
     BackgroundLyrics,
     StopBackgroundLyrics,
@@ -415,13 +415,17 @@ fn parse_queue_indexes(argument: &str) -> Vec<usize> {
         .collect()
 }
 
-fn parse_lyrics_duration(argument: &str) -> Option<u8> {
+const MAX_TIMED_LYRICS_SECONDS: u16 = 300;
+
+fn parse_lyrics_duration(argument: &str) -> Option<u16> {
     let argument = argument.trim();
     if argument.is_empty() || !argument.chars().all(|ch| ch.is_ascii_digit()) {
         return None;
     }
-    let seconds = argument.parse::<u8>().ok()?;
-    (1..=30).contains(&seconds).then_some(seconds)
+    let seconds = argument.parse::<u16>().ok()?;
+    (1..=MAX_TIMED_LYRICS_SECONDS)
+        .contains(&seconds)
+        .then_some(seconds)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -794,7 +798,7 @@ mod tests {
     }
 
     #[test]
-    fn lyrics_command_accepts_a_duration_from_one_to_thirty_seconds() {
+    fn lyrics_command_accepts_a_duration_from_one_to_three_hundred_seconds() {
         assert_eq!(
             PlaybackCommand::parse_hall("歌词")
                 .expect("one-shot lyrics command")
@@ -808,13 +812,13 @@ mod tests {
             PlaybackCommand::LyricsFor(5)
         );
         assert_eq!(
-            PlaybackCommand::parse_hall("歌词 30")
+            PlaybackCommand::parse_hall("歌词 300")
                 .expect("maximum timed lyrics command")
                 .command,
-            PlaybackCommand::LyricsFor(30)
+            PlaybackCommand::LyricsFor(300)
         );
         assert_eq!(PlaybackCommand::parse_hall("歌词 0"), None);
-        assert_eq!(PlaybackCommand::parse_hall("歌词 31"), None);
+        assert_eq!(PlaybackCommand::parse_hall("歌词 301"), None);
         assert_eq!(PlaybackCommand::parse_hall("歌词 5秒"), None);
     }
 
@@ -825,7 +829,7 @@ mod tests {
             PlaybackCommand::LyricsFor(5).lock_key()
         );
         assert!(!PlaybackCommand::Lyrics.same_request(&PlaybackCommand::LyricsFor(5)));
-        assert!(PlaybackCommand::LyricsFor(5).same_request(&PlaybackCommand::LyricsFor(30)));
+        assert!(PlaybackCommand::LyricsFor(5).same_request(&PlaybackCommand::LyricsFor(300)));
     }
 
     #[test]
@@ -840,7 +844,7 @@ mod tests {
         );
         assert_ne!(
             PlaybackCommand::ContinuousLyrics.lock_key(),
-            PlaybackCommand::LyricsFor(30).lock_key()
+            PlaybackCommand::LyricsFor(300).lock_key()
         );
         assert_eq!(PlaybackCommand::parse_hall("持续歌词 1"), None);
     }

@@ -233,10 +233,17 @@ pub(crate) enum PlaybackCommand {
     LyricsFor(u16),
     ContinuousLyrics,
     BackgroundLyrics,
+    SingleSongLyrics,
     StopBackgroundLyrics,
     Queue,
     QueueDelete(Vec<usize>),
     QueueClear,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BackgroundLyricsScope {
+    AllSongs,
+    CurrentSong,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -313,6 +320,7 @@ impl PlaybackCommand {
             ("状态", false),
             ("停止歌词", false),
             ("后台歌词", false),
+            ("单曲歌词", false),
             ("持续歌词", false),
             ("歌词", true),
             ("队列", false),
@@ -331,6 +339,7 @@ impl PlaybackCommand {
                 "状态" => Self::Status,
                 "停止歌词" => Self::StopBackgroundLyrics,
                 "后台歌词" => Self::BackgroundLyrics,
+                "单曲歌词" => Self::SingleSongLyrics,
                 "持续歌词" => Self::ContinuousLyrics,
                 "歌词" if argument.is_empty() => Self::Lyrics,
                 "歌词" => Self::LyricsFor(parse_lyrics_duration(argument)?),
@@ -360,6 +369,7 @@ impl PlaybackCommand {
             Self::LyricsFor(_) => "lyrics_for".to_string(),
             Self::ContinuousLyrics => "lyrics_continuous".to_string(),
             Self::BackgroundLyrics => "lyrics_background".to_string(),
+            Self::SingleSongLyrics => "lyrics_single_song".to_string(),
             Self::StopBackgroundLyrics => "lyrics_background_stop".to_string(),
             Self::Queue => "queue".to_string(),
             Self::QueueDelete(indexes) => format!(
@@ -400,6 +410,7 @@ const PLAYBACK_COMMAND_PREFIXES: &[&str] = &[
     "状态",
     "停止歌词",
     "后台歌词",
+    "单曲歌词",
     "持续歌词",
     "歌词",
     "队列",
@@ -867,5 +878,22 @@ mod tests {
             PlaybackCommand::BackgroundLyrics.lock_key(),
             PlaybackCommand::StopBackgroundLyrics.lock_key()
         );
+    }
+
+    #[test]
+    fn single_song_lyrics_command_is_easy_to_distinguish_from_background_lyrics() {
+        let parsed = PlaybackCommand::parse_hall("单曲歌词").expect("single-song lyrics command");
+        assert_eq!(parsed.command, PlaybackCommand::SingleSongLyrics);
+        assert_eq!(parsed.argument, "");
+        assert_eq!(parsed.matched, "单曲歌词");
+        assert_eq!(
+            PlaybackCommand::SingleSongLyrics.lock_key(),
+            "lyrics_single_song"
+        );
+        assert_ne!(
+            PlaybackCommand::SingleSongLyrics.lock_key(),
+            PlaybackCommand::BackgroundLyrics.lock_key()
+        );
+        assert_eq!(PlaybackCommand::parse_hall("单曲歌词 1"), None);
     }
 }

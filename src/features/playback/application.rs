@@ -6,10 +6,10 @@ use anyhow::Result;
 use crate::text::{MAX_CHAT_WIDTH, char_width, display_width};
 
 use super::{
-    MismatchDecision, PlaybackAttempt, PlaybackCommand, PlaybackNavigation, PlaybackOutcome,
-    PlaybackRequest, PlaybackSnapshot, PlaybackVerification, PlayerStatus, QueueAdvanceContext,
-    QueueAdvanceDecision, QueueItem, QueueRemoval, estimated_player_status, format_lyrics,
-    format_play_message, format_status, song_title,
+    BackgroundLyricsScope, MismatchDecision, PlaybackAttempt, PlaybackCommand, PlaybackNavigation,
+    PlaybackOutcome, PlaybackRequest, PlaybackSnapshot, PlaybackVerification, PlayerStatus,
+    QueueAdvanceContext, QueueAdvanceDecision, QueueItem, QueueRemoval, estimated_player_status,
+    format_lyrics, format_play_message, format_status, song_title,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -189,7 +189,11 @@ pub(crate) trait PlaybackCommandPort: PlaybackExecutionPort {
     fn should_stop_continuous_lyrics(&mut self) -> Result<bool> {
         Ok(false)
     }
-    fn start_background_lyrics(&mut self, _duration: Option<Duration>) -> Result<bool> {
+    fn start_background_lyrics(
+        &mut self,
+        _duration: Option<Duration>,
+        _scope: BackgroundLyricsScope,
+    ) -> Result<bool> {
         Ok(false)
     }
     fn stop_background_lyrics(&mut self) -> Result<bool> {
@@ -336,8 +340,10 @@ impl PlaybackApplication {
                 port.reply(&format_lyrics(&status))?;
             }
             PlaybackCommand::LyricsFor(seconds) => {
-                let started =
-                    port.start_background_lyrics(Some(Duration::from_secs(u64::from(*seconds))))?;
+                let started = port.start_background_lyrics(
+                    Some(Duration::from_secs(u64::from(*seconds))),
+                    BackgroundLyricsScope::AllSongs,
+                )?;
                 port.log_executed(context, &format!("lyrics {}s", seconds))?;
                 let message = if started {
                     format!(
@@ -355,10 +361,21 @@ impl PlaybackApplication {
                 self.reply_continuous_lyrics(port)?;
             }
             PlaybackCommand::BackgroundLyrics => {
-                let started = port.start_background_lyrics(None)?;
+                let started =
+                    port.start_background_lyrics(None, BackgroundLyricsScope::AllSongs)?;
                 port.log_executed(context, "lyrics background")?;
                 port.reply(if started {
                     "后台歌词已开启，正式命令执行期间暂不发送，完成后自动继续"
+                } else {
+                    "后台歌词已经在运行"
+                })?;
+            }
+            PlaybackCommand::SingleSongLyrics => {
+                let started =
+                    port.start_background_lyrics(None, BackgroundLyricsScope::CurrentSong)?;
+                port.log_executed(context, "lyrics single song")?;
+                port.reply(if started {
+                    "单曲后台歌词已开启，切歌后自动停止"
                 } else {
                     "后台歌词已经在运行"
                 })?;
@@ -1381,7 +1398,7 @@ mod tests {
         status: PlayerStatus,
         stop_continuous_lyrics_after_statuses: Option<usize>,
         status_calls: usize,
-        background_lyrics_starts: Vec<Option<Duration>>,
+        background_lyrics_starts: Vec<(Option<Duration>, BackgroundLyricsScope)>,
     }
 
     impl PlaybackExecutionPort for NavigationCommandPort {
@@ -1508,8 +1525,12 @@ mod tests {
                 .is_some_and(|limit| self.status_calls >= limit))
         }
 
-        fn start_background_lyrics(&mut self, duration: Option<Duration>) -> Result<bool> {
-            self.background_lyrics_starts.push(duration);
+        fn start_background_lyrics(
+            &mut self,
+            duration: Option<Duration>,
+            scope: BackgroundLyricsScope,
+        ) -> Result<bool> {
+            self.background_lyrics_starts.push((duration, scope));
             Ok(true)
         }
 
@@ -1615,12 +1636,60 @@ mod tests {
 
         assert_eq!(
             port.background_lyrics_starts,
-            [Some(Duration::from_secs(5))]
+            [(
+                Some(Duration::from_secs(5)),
+                BackgroundLyricsScope::AllSongs
+            )]
         );
         assert_eq!(
             port.replies,
             ["限时歌词已开启，将持续5秒；正式命令执行期间暂不发送，完成后自动继续"]
         );
+    }
+
+    #[test]
+    fn single_song_lyrics_starts_the_current_song_background_monitor() {
+        let mut port = NavigationCommandPort {
+            previous_request: None,
+            played_uris: Vec::new(),
+            previous_calls: 0,
+            verifications: VecDeque::new(),
+            replies: Vec::new(),
+            batch_replies: Vec::new(),
+            batch_delays: Vec::new(),
+            queue: Vec::new(),
+            status_updates: VecDeque::new(),
+            clock: None,
+            status: PlayerStatus::default(),
+            stop_continuous_lyrics_after_statuses: None,
+            status_calls: 0,
+            background_lyrics_starts: Vec::new(),
+        };
+        let application = PlaybackApplication::new(PlaybackApplicationConfig {
+            console_bypass_dedup: true,
+            queue_max_size: 20,
+            skip_status_initial_ms: 0,
+            skip_status_poll_ms: 0,
+            skip_status_retries: 0,
+            monitor_tick_ms: 50,
+            monitor_status_ms: 1_000,
+            help_batch_ms: 0,
+        });
+        let context = PlaybackCommandContext {
+            message_type: "blue".to_string(),
+            username: "tester".to_string(),
+            user_command: "@单曲歌词".to_string(),
+        };
+
+        application
+            .execute_command(&context, &PlaybackCommand::SingleSongLyrics, &mut port)
+            .expect("single-song lyrics command");
+
+        assert_eq!(
+            port.background_lyrics_starts,
+            [(None, BackgroundLyricsScope::CurrentSong)]
+        );
+        assert_eq!(port.replies, ["单曲后台歌词已开启，切歌后自动停止"]);
     }
 
     #[test]

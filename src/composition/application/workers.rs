@@ -3,7 +3,8 @@ use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use crate::features::playback::{
-    LyricTracker, PlaybackMonitorPort, PlaybackWorkload, QueueAdvanceContext, QueueAdvanceDecision,
+    BackgroundLyricsScope, LyricTracker, PlaybackMonitorPort, PlaybackWorkload, PlayerStatus,
+    QueueAdvanceContext, QueueAdvanceDecision,
 };
 
 pub(super) struct BackgroundCommandManager {
@@ -166,9 +167,10 @@ pub(super) fn start_background_lyrics(
     running: Arc<AtomicBool>,
     poll: Duration,
     duration: Option<Duration>,
+    scope: BackgroundLyricsScope,
 ) -> Result<bool> {
     manager.start("lyrics", move |stop| {
-        run_background_lyrics(player, business, running, stop, poll, duration);
+        run_background_lyrics(player, business, running, stop, poll, duration, scope);
     })
 }
 
@@ -179,10 +181,12 @@ fn run_background_lyrics(
     stop: Arc<AtomicBool>,
     poll: Duration,
     duration: Option<Duration>,
+    scope: BackgroundLyricsScope,
 ) {
     let poll = poll.max(Duration::from_millis(1));
     let deadline = duration.map(|duration| Instant::now() + duration);
     let mut lyric_tracker = LyricTracker::default();
+    let mut first_uri = None::<String>;
 
     while running.load(AtomicOrdering::SeqCst)
         && !stop.load(AtomicOrdering::SeqCst)
@@ -207,6 +211,12 @@ fn run_background_lyrics(
 
         match player.status() {
             Ok(status) => {
+                if matches!(scope, BackgroundLyricsScope::CurrentSong)
+                    && current_song_has_switched(&mut first_uri, &status)
+                {
+                    log::info!("单曲后台歌词因歌曲切换结束");
+                    break;
+                }
                 if lyric_tracker.observe(&status) {
                     let message = DeferredChatMessage {
                         text: crate::features::playback::format_lyrics(&status),
@@ -236,6 +246,20 @@ fn run_background_lyrics(
         }
     }
     log::info!("后台歌词监听线程已退出");
+}
+
+fn current_song_has_switched(first_uri: &mut Option<String>, status: &PlayerStatus) -> bool {
+    let uri = status.current_uri.trim();
+    if uri.is_empty() {
+        return false;
+    }
+    if let Some(first_uri) = first_uri.as_deref()
+        && first_uri != uri
+    {
+        return true;
+    }
+    first_uri.get_or_insert_with(|| uri.to_string());
+    false
 }
 
 fn sleep_background_lyrics_poll(poll: Duration, deadline: Option<Instant>) -> bool {
@@ -838,5 +862,28 @@ mod tests {
         });
         assert!(restarted.is_some());
         manager.stop("timed-lyrics").expect("stop restarted worker");
+    }
+
+    #[test]
+    fn current_song_scope_stops_when_the_player_uri_changes() {
+        let mut first_uri = None;
+        let status = |uri: &str| PlayerStatus {
+            current_uri: uri.to_string(),
+            ..PlayerStatus::default()
+        };
+
+        assert!(!current_song_has_switched(
+            &mut first_uri,
+            &status("fuo://song/1")
+        ));
+        assert_eq!(first_uri.as_deref(), Some("fuo://song/1"));
+        assert!(!current_song_has_switched(
+            &mut first_uri,
+            &status("fuo://song/1")
+        ));
+        assert!(current_song_has_switched(
+            &mut first_uri,
+            &status("fuo://song/2")
+        ));
     }
 }

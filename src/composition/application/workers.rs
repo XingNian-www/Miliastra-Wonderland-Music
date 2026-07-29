@@ -32,6 +32,7 @@ impl BackgroundCommandManager {
     where
         F: FnOnce(Arc<AtomicBool>) + Send + 'static,
     {
+        self.reap_finished()?;
         {
             let state = self
                 .inner
@@ -65,6 +66,33 @@ impl BackgroundCommandManager {
         state.insert(name.to_string(), BackgroundCommandState { stop, worker });
         log::info!("后台命令已启动: {name}");
         Ok(true)
+    }
+
+    fn reap_finished(&self) -> Result<()> {
+        let finished = {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| anyhow!("后台命令状态锁已损坏"))?;
+            let finished_names = state
+                .iter()
+                .filter(|(_, command)| command.worker.is_finished())
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>();
+            finished_names
+                .into_iter()
+                .filter_map(|name| state.remove(&name).map(|command| (name, command)))
+                .collect::<Vec<_>>()
+        };
+        for (name, command) in finished {
+            command
+                .worker
+                .join()
+                .map_err(|_| anyhow!("后台命令线程 panic: {name}"))?;
+            log::info!("后台命令已自然结束: {name}");
+        }
+        Ok(())
     }
 
     pub(super) fn stop(&self, name: &str) -> Result<bool> {
@@ -137,9 +165,10 @@ pub(super) fn start_background_lyrics(
     business: BusinessRuntimeHandle,
     running: Arc<AtomicBool>,
     poll: Duration,
+    duration: Option<Duration>,
 ) -> Result<bool> {
     manager.start("lyrics", move |stop| {
-        run_background_lyrics(player, business, running, stop, poll);
+        run_background_lyrics(player, business, running, stop, poll, duration);
     })
 }
 
@@ -149,21 +178,30 @@ fn run_background_lyrics(
     running: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     poll: Duration,
+    duration: Option<Duration>,
 ) {
     let poll = poll.max(Duration::from_millis(1));
+    let deadline = duration.map(|duration| Instant::now() + duration);
     let mut lyric_tracker = LyricTracker::default();
 
-    while running.load(AtomicOrdering::SeqCst) && !stop.load(AtomicOrdering::SeqCst) {
+    while running.load(AtomicOrdering::SeqCst)
+        && !stop.load(AtomicOrdering::SeqCst)
+        && deadline.is_none_or(|deadline| Instant::now() < deadline)
+    {
         let scheduler = match business.scheduler_snapshot() {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 log::warn!("后台歌词查询正式任务状态失败，暂缓发送: {error}");
-                sleep(poll);
+                if !sleep_background_lyrics_poll(poll, deadline) {
+                    break;
+                }
                 continue;
             }
         };
         if scheduler.formal_busy() {
-            sleep(poll);
+            if !sleep_background_lyrics_poll(poll, deadline) {
+                break;
+            }
             continue;
         }
 
@@ -193,9 +231,22 @@ fn run_background_lyrics(
             Err(error) => log::debug!("后台歌词读取播放器状态失败: {error:#}"),
         }
 
-        sleep(poll);
+        if !sleep_background_lyrics_poll(poll, deadline) {
+            break;
+        }
     }
     log::info!("后台歌词监听线程已退出");
+}
+
+fn sleep_background_lyrics_poll(poll: Duration, deadline: Option<Instant>) -> bool {
+    let sleep_for = deadline.map_or(poll, |deadline| {
+        poll.min(deadline.saturating_duration_since(Instant::now()))
+    });
+    if sleep_for.is_zero() {
+        return false;
+    }
+    sleep(sleep_for);
+    true
 }
 
 struct FormalTaskDispatcher {
@@ -749,5 +800,43 @@ impl DiagnosticExecutor {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finished_background_workers_are_reaped_before_restarting_same_name() {
+        let manager = BackgroundCommandManager::new();
+        let finished = Arc::new(AtomicBool::new(false));
+        let worker_finished = Arc::clone(&finished);
+
+        assert!(
+            manager
+                .start("timed-lyrics", move |_| {
+                    worker_finished.store(true, AtomicOrdering::SeqCst);
+                })
+                .expect("start timed worker")
+        );
+
+        while !finished.load(AtomicOrdering::SeqCst) {
+            thread::yield_now();
+        }
+
+        let restarted = (0..100).find_map(|_| {
+            let started = manager
+                .start("timed-lyrics", |_| {})
+                .expect("restart after timed worker");
+            if started {
+                Some(())
+            } else {
+                thread::yield_now();
+                None
+            }
+        });
+        assert!(restarted.is_some());
+        manager.stop("timed-lyrics").expect("stop restarted worker");
     }
 }

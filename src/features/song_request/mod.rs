@@ -16,7 +16,7 @@ use crate::text::normalize_comparison_text;
 pub(crate) use ai::{AiCandidatePickResult, AiClient, AiConfig};
 pub(crate) use application::{
     ResolvedSongRequest, SongRequestApplication, SongRequestContext, SongRequestDecision,
-    SongRequestPort, SongSearchFailure,
+    SongRequestPort, SongSearchFailure, select_ai_candidate,
 };
 pub(crate) use review::{
     SongReviewCandidate, SongReviewClient, SongReviewConfig, SongReviewDecision,

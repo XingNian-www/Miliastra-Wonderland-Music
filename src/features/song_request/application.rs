@@ -1,7 +1,7 @@
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 
 use super::{
     AiCandidatePickResult, AiClient, SongCommand, SongReviewCandidate, SongReviewClient,
@@ -179,6 +179,21 @@ pub(crate) trait SongRequestAiGateway: Send + Sync {
         prefer_accompaniment: bool,
         candidates: &[SearchCandidate],
     ) -> Result<AiCandidatePickResult>;
+}
+
+pub(crate) fn select_ai_candidate(
+    ai: &dyn SongRequestAiGateway,
+    request: &str,
+    prefer_accompaniment: bool,
+    candidates: &[SearchCandidate],
+) -> Result<(SearchCandidate, AiCandidatePickResult)> {
+    let pick = ai.pick_song_candidate(request, prefer_accompaniment, candidates)?;
+    let candidate = candidates
+        .iter()
+        .find(|candidate| candidate.uri == pick.uri)
+        .cloned()
+        .ok_or_else(|| anyhow!("AI 返回未知歌曲候选: {}", pick.uri))?;
+    Ok((candidate, pick))
 }
 
 impl SongRequestAiGateway for AiClient {
@@ -502,25 +517,18 @@ impl SongRequestExecution<'_> {
             }
         };
 
-        let pick =
-            match self
-                .ai
-                .pick_song_candidate(&song.keyword, song.prefer_accompaniment, &candidates)
-            {
-                Ok(pick) => pick,
-                Err(error) => {
-                    log::error!("AI点歌选择候选失败: {error:#}");
-                    self.reply(&format!("{}AI点歌识别失败", label))?;
-                    return Ok(None);
-                }
-            };
-        let Some(candidate) = candidates
-            .iter()
-            .find(|candidate| candidate.uri == pick.uri)
-        else {
-            log::error!("AI点歌返回未知候选: {}", pick.uri);
-            self.reply(&format!("{}AI点歌识别失败", label))?;
-            return Ok(None);
+        let (candidate, pick) = match select_ai_candidate(
+            self.ai,
+            &song.keyword,
+            song.prefer_accompaniment,
+            &candidates,
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                log::error!("AI点歌选择候选失败: {error:#}");
+                self.reply(&format!("{}AI点歌识别失败", label))?;
+                return Ok(None);
+            }
         };
         log::info!(
             "AI点歌候选: raw={} pick={} uri={} score={:.2} reason={}",

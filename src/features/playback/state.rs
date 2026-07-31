@@ -84,6 +84,8 @@ pub struct ActivePlaybackRequest {
     pub song: String,
     pub title: String,
     pub artist: String,
+    #[serde(default)]
+    pub requester: String,
     pub started_at_ms: u64,
     /// Runtime-only monotonic anchor for the short playback-start guard.
     ///
@@ -225,6 +227,7 @@ impl PlaybackRuntimeState {
             song: format!("{}{}", observation.title, observation.artist),
             title: observation.title,
             artist: observation.artist,
+            requester: String::new(),
             started_at_ms: observation.captured_at_ms,
             guard_started_at: None,
         };

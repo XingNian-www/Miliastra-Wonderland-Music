@@ -55,6 +55,7 @@ pub(crate) struct MonitorQueueItem {
     pub(crate) source: String,
     pub(crate) prefer_accompaniment: bool,
     pub(crate) friend_username: String,
+    pub(crate) requester: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -439,6 +440,7 @@ impl BusinessStateSink for MonitorShared {
                     source: item.source,
                     prefer_accompaniment: item.prefer_accompaniment,
                     friend_username: item.friend_username,
+                    requester: item.requester,
                 })
                 .collect(),
         ));
@@ -561,6 +563,7 @@ mod tests {
             source: "qqmusic".to_string(),
             prefer_accompaniment: false,
             friend_username: String::new(),
+            requester: String::new(),
         }]));
         monitor.publish(MonitorEvent::ChatListener {
             mode: "二级".to_string(),

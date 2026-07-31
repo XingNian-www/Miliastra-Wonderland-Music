@@ -45,6 +45,8 @@ use crate::features::hall::{
 };
 use crate::features::invite::InviteConfig;
 use crate::features::moderation::ModerationConfig;
+#[cfg(test)]
+use crate::features::playback::{ActivePlaybackRequest, PlayerStatus};
 use crate::features::playback::{
     MusicPlayerBackend, PlaybackCommand, PlaybackMutationIntent, PlaybackMutationOutcome,
     PlaybackRuntimeState, QueueItem, QueueRemoval, QueueRemoveOutcome,
@@ -1001,7 +1003,23 @@ fn status_route(
     _query: &[(String, String)],
     state: &HttpSharedState,
 ) -> std::result::Result<String, AppError> {
-    serde_json::to_string(&state.player.status().map_err(internal_error)?).map_err(internal_error)
+    let mut status = state.player.status().map_err(internal_error)?;
+    if let Ok(playback) = state.queries.playback_state_snapshot()
+        && let Some(request) = playback.active_request
+    {
+        let active_uri = if request.confirmed_uri.trim().is_empty() {
+            request.requested_uri.trim()
+        } else {
+            request.confirmed_uri.trim()
+        };
+        if !status.current_uri.trim().is_empty()
+            && !active_uri.is_empty()
+            && status.current_uri.trim() == active_uri
+        {
+            status.requester = request.requester;
+        }
+    }
+    serde_json::to_string(&status).map_err(internal_error)
 }
 
 fn play_route(
@@ -1164,6 +1182,7 @@ fn player_play_uri_route(
         "preferAccompaniment",
         "accompaniment",
     ));
+    let requester = requester_from_query(query)?;
     let BusinessMutationOutcome::Playback(PlaybackMutationOutcome::Pushed(pushed)) = state
         .formal_tasks
         .apply_mutation(BusinessMutationIntent::Playback(
@@ -1175,6 +1194,7 @@ fn player_play_uri_route(
                 ai_original_text: String::new(),
                 uri: uri.trim().to_string(),
                 friend_username: String::new(),
+                requester,
                 dedup_bypass: true,
             }),
         ))
@@ -2172,6 +2192,7 @@ fn queue_add(
     let ai_original_text =
         normalize_optional_text(query_value(query, "aiOriginalText"), "aiOriginalText")?;
     let uri = normalize_optional_text(query_value(query, "uri"), "uri")?;
+    let requester = requester_from_query(query)?;
     let BusinessMutationOutcome::Playback(PlaybackMutationOutcome::Pushed(pushed)) = state
         .formal_tasks
         .apply_mutation(BusinessMutationIntent::Playback(
@@ -2183,6 +2204,7 @@ fn queue_add(
                 ai_original_text,
                 uri,
                 friend_username: String::new(),
+                requester,
                 dedup_bypass: true,
             }),
         ))
@@ -2197,6 +2219,15 @@ fn queue_add(
         });
     }
     Ok(json!({ "ok": true, "size": pushed.size }).to_string())
+}
+
+fn requester_from_query(query: &[(String, String)]) -> std::result::Result<String, AppError> {
+    let requester = normalize_optional_text(query_value(query, "requester"), "requester")?;
+    Ok(if requester.is_empty() {
+        "WEB/API".to_string()
+    } else {
+        requester
+    })
 }
 
 fn queue_remove(
@@ -3504,15 +3535,41 @@ mod tests {
 
     struct HttpTestPlayerPort {
         fail: bool,
+        status: PlayerStatus,
     }
 
     impl HttpTestPlayerPort {
-        const fn successful() -> Self {
-            Self { fail: false }
+        fn successful() -> Self {
+            Self {
+                fail: false,
+                status: PlayerStatus {
+                    status: String::new(),
+                    current_uri: String::new(),
+                    name: String::new(),
+                    singer: String::new(),
+                    album_name: String::new(),
+                    lyric_line_text: String::new(),
+                    duration: 0.0,
+                    progress: 0.0,
+                    playback_rate: 1.0,
+                    volume: 0,
+                    requester: String::new(),
+                },
+            }
         }
 
-        const fn failing() -> Self {
-            Self { fail: true }
+        fn failing() -> Self {
+            Self {
+                fail: true,
+                ..Self::successful()
+            }
+        }
+
+        fn with_status(status: PlayerStatus) -> Self {
+            Self {
+                fail: false,
+                status,
+            }
         }
 
         fn fail_if_requested(&self) -> std::result::Result<(), PlayerSearchClientError> {
@@ -3528,7 +3585,7 @@ mod tests {
 
     impl HttpPlayerPort for HttpTestPlayerPort {
         fn status(&self) -> Result<crate::features::playback::PlayerStatus> {
-            Ok(crate::features::playback::PlayerStatus::default())
+            Ok(self.status.clone())
         }
 
         fn search_text(
@@ -4149,6 +4206,32 @@ workflows:
     }
 
     #[test]
+    fn status_route_includes_requester_for_the_matching_active_song() {
+        let status = PlayerStatus {
+            status: "playing".to_string(),
+            current_uri: "fuo://qqmusic/songs/1".to_string(),
+            name: "晴天".to_string(),
+            ..PlayerStatus::default()
+        };
+        let state = test_state_with_player_port(HttpTestPlayerPort::with_status(status));
+        state
+            .recording
+            .state
+            .lock()
+            .expect("recording state")
+            .playback
+            .active_request = Some(ActivePlaybackRequest {
+            confirmed_uri: "fuo://qqmusic/songs/1".to_string(),
+            requester: "Alice".to_string(),
+            ..ActivePlaybackRequest::default()
+        });
+
+        let value: Value = serde_json::from_str(&status_route(&[], &state).expect("status route"))
+            .expect("status JSON");
+        assert_eq!(value["requester"], "Alice");
+    }
+
+    #[test]
     fn remote_song_routes_are_queued_json_post_routes() {
         assert!(is_mutating_route("/searchPlay"));
         assert!(is_mutating_route("/ai/search"));
@@ -4220,6 +4303,7 @@ workflows:
             &[
                 ("uri".to_string(), "fuo://netease/songs/123".to_string()),
                 ("title".to_string(), "测试歌曲".to_string()),
+                ("requester".to_string(), "Alice".to_string()),
             ],
             &state,
         )
@@ -4240,8 +4324,35 @@ workflows:
         assert_eq!(item.keyword, "测试歌曲");
         assert_eq!(item.source, "netease");
         assert_eq!(item.uri, "fuo://netease/songs/123");
+        assert_eq!(item.requester, "Alice");
         assert!(item.dedup_bypass);
         assert!(item.friend_username.is_empty());
+    }
+
+    #[test]
+    fn queue_add_defaults_api_requester_when_not_provided() {
+        let state = test_state();
+        queue_add(
+            &[
+                ("keyword".to_string(), "测试歌曲".to_string()),
+                ("source".to_string(), "qqmusic".to_string()),
+            ],
+            &state,
+        )
+        .expect("queue add succeeds");
+
+        let queue = state
+            .queries
+            .playback_queue_snapshot()
+            .expect("playback queue snapshot");
+        assert_eq!(queue[0].requester, "WEB/API");
+    }
+
+    #[test]
+    fn page_displays_song_requester() {
+        assert!(PAGE.contains("点歌人"));
+        assert!(PAGE.contains("it.requester||it.friendUsername"));
+        assert!(PAGE.contains("pc.requester"));
     }
 
     #[test]

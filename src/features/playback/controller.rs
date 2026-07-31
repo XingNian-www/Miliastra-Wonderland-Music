@@ -163,6 +163,7 @@ pub(crate) struct PlaybackRequest {
     pub(crate) source: String,
     pub(crate) prefer_accompaniment: bool,
     pub(crate) uri: String,
+    pub(crate) requester: String,
     pub(crate) navigation: PlaybackNavigation,
 }
 
@@ -379,6 +380,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             source: previous.source.clone(),
             prefer_accompaniment: previous.prefer_accompaniment,
             uri: uri.to_string(),
+            requester: previous.requester.clone(),
             navigation: PlaybackNavigation::Previous,
         }))
     }
@@ -456,6 +458,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
                 song: String::new(),
                 title: String::new(),
                 artist: String::new(),
+                requester: request.requester.clone(),
                 started_at_ms: self.wall_clock.unix_millis(),
                 guard_started_at: Some(self.clock.now()),
             },
@@ -1000,6 +1003,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
                 current_uri: String::new(),
                 title: String::new(),
                 artist: String::new(),
+                requester: String::new(),
                 progress: 0.0,
                 duration: 0.0,
                 observed_at_ms: 0,
@@ -1042,6 +1046,11 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
                         .unwrap_or_default(),
                     artist: observation
                         .map(|observation| observation.artist.clone())
+                        .unwrap_or_default(),
+                    requester: playback
+                        .active_request
+                        .as_ref()
+                        .map(|request| request.requester.clone())
                         .unwrap_or_default(),
                     progress: observation.map_or(0.0, |observation| observation.progress),
                     duration: observation.map_or(0.0, |observation| observation.duration),
@@ -1151,6 +1160,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             song: format!("{}{}", status.name, status.singer),
             title: status.name.trim().to_string(),
             artist: status.singer.trim().to_string(),
+            requester: request.requester.clone(),
             started_at_ms: self.wall_clock.unix_millis(),
             guard_started_at: Some(self.clock.now()),
         };
@@ -1345,6 +1355,7 @@ fn playback_request_from_active(active_request: &ActivePlaybackRequest) -> Playb
         source: active_request.source.clone(),
         prefer_accompaniment: active_request.prefer_accompaniment,
         uri: active_request_expected_uri(active_request).to_string(),
+        requester: active_request.requester.clone(),
         navigation: PlaybackNavigation::Normal,
     }
 }
@@ -1744,6 +1755,7 @@ mod tests {
             source: "qqmusic".to_string(),
             prefer_accompaniment: false,
             uri: uri.to_string(),
+            requester: String::new(),
             navigation: PlaybackNavigation::Normal,
         }
     }

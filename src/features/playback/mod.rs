@@ -259,6 +259,7 @@ pub(crate) struct PlayerStatus {
     pub(crate) progress: f64,
     pub(crate) playback_rate: f64,
     pub(crate) volume: i64,
+    pub(crate) requester: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -273,6 +274,7 @@ pub(crate) struct PlaybackControllerSnapshot {
     pub(crate) current_uri: String,
     pub(crate) title: String,
     pub(crate) artist: String,
+    pub(crate) requester: String,
     pub(crate) progress: f64,
     pub(crate) duration: f64,
     pub(crate) observed_at_ms: u64,

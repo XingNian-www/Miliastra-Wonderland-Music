@@ -224,6 +224,7 @@ pub(crate) struct ResolvedSongRequest {
     pub(crate) ai_original_text: String,
     pub(crate) uri: String,
     pub(crate) friend_username: String,
+    pub(crate) requester: String,
     pub(crate) console_bypass_dedup: bool,
 }
 
@@ -238,6 +239,7 @@ impl ResolvedSongRequest {
             source: self.source.clone(),
             prefer_accompaniment: self.prefer_accompaniment,
             uri: self.uri.clone(),
+            requester: self.requester.clone(),
             navigation: crate::features::playback::PlaybackNavigation::Normal,
         }
     }
@@ -360,6 +362,7 @@ impl SongRequestExecution<'_> {
         let Some(mut request) = self.resolve_and_confirm_song(song)? else {
             return Ok(());
         };
+        request.requester = context.username.clone();
         request.console_bypass_dedup = context.message_type == "控制台";
         if !self.review_song_candidate(context, &request)? {
             return Ok(());
@@ -458,6 +461,7 @@ impl SongRequestExecution<'_> {
                 ai_original_text: String::new(),
                 uri: String::new(),
                 friend_username: song.friend_username.clone(),
+                requester: String::new(),
                 console_bypass_dedup: false,
             }));
         }
@@ -541,6 +545,7 @@ impl SongRequestExecution<'_> {
             ai_original_text: song.keyword.clone(),
             uri: candidate.uri.clone(),
             friend_username: song.friend_username.clone(),
+            requester: String::new(),
             console_bypass_dedup: false,
         }))
     }
@@ -623,6 +628,7 @@ impl SongRequestExecution<'_> {
                         ai_original_text: String::new(),
                         uri,
                         friend_username: request.friend_username.clone(),
+                        requester: request.requester.clone(),
                         console_bypass_dedup: request.console_bypass_dedup,
                     }));
                 }
@@ -706,6 +712,7 @@ impl SongRequestExecution<'_> {
                     ai_original_text: String::new(),
                     uri: picked.candidate.uri.clone(),
                     friend_username: song.friend_username.clone(),
+                    requester: String::new(),
                     console_bypass_dedup: false,
                 }))
             }
@@ -753,6 +760,7 @@ impl SongRequestExecution<'_> {
             ai_original_text: request.ai_original_text.clone(),
             uri: request.uri.clone(),
             friend_username: request.friend_username.clone(),
+            requester: request.requester.clone(),
             dedup_bypass: request.console_bypass_dedup,
         })?;
         if pushed.accepted {
@@ -1107,6 +1115,7 @@ mod tests {
             progress: 0.0,
             playback_rate: 1.0,
             volume: 50,
+            requester: String::new(),
         }
     }
 
@@ -1261,6 +1270,7 @@ mod tests {
 
         assert_eq!(port.played.borrow().len(), 1);
         assert_eq!(port.played.borrow()[0].uri, "fuo://qqmusic/songs/1");
+        assert_eq!(port.played.borrow()[0].requester, "Alice");
         assert!(port.logs.borrow()[0].starts_with("play keyword=晴天 - 周杰伦"));
     }
 
@@ -1275,6 +1285,7 @@ mod tests {
 
         assert!(port.played.borrow().is_empty());
         assert_eq!(port.queue.borrow().len(), 1);
+        assert_eq!(port.queue.borrow()[0].requester, "Alice");
         assert_eq!(
             port.replies.borrow().last().map(String::as_str),
             Some("状态未知，队列已加入(1/20): 晴天 - 周杰伦")

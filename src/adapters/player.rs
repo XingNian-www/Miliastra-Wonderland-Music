@@ -89,6 +89,7 @@ impl MusicPlayerBackend for PlayerRuntimeBackend {
                 .map_or(0.0, |progress| progress.as_secs_f64()),
             playback_rate: observation.playback_rate.unwrap_or(1.0),
             volume: observation.volume.unwrap_or_default(),
+            requester: String::new(),
         })
     }
 

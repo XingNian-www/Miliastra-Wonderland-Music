@@ -81,6 +81,7 @@ impl From<RawPlayerStatus> for PlayerStatus {
             progress: status.progress.unwrap_or(0.0),
             playback_rate: status.playback_rate.unwrap_or(1.0),
             volume: status.volume.unwrap_or(0),
+            requester: String::new(),
         }
     }
 }

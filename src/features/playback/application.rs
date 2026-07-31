@@ -105,6 +105,7 @@ pub(crate) struct PlaybackSelection {
     pub(crate) ai_original_text: String,
     pub(crate) uri: String,
     pub(crate) friend_username: String,
+    pub(crate) requester: String,
     pub(crate) console_bypass_dedup: bool,
 }
 
@@ -115,6 +116,7 @@ impl PlaybackSelection {
             source: self.source.clone(),
             prefer_accompaniment: self.prefer_accompaniment,
             uri: self.uri.clone(),
+            requester: self.requester.clone(),
             navigation: PlaybackNavigation::Normal,
         }
     }
@@ -599,6 +601,7 @@ impl PlaybackApplication {
                 ai_original_text: item.ai_original_text.clone(),
                 uri: item.uri.clone(),
                 friend_username: item.friend_username.clone(),
+                requester: item.requester.clone(),
                 console_bypass_dedup: item.dedup_bypass,
             };
             if self.selection_dedup_limited(&request, port)? {
@@ -842,6 +845,7 @@ impl PlaybackApplication {
             ai_original_text: String::new(),
             uri: String::new(),
             friend_username: String::new(),
+            requester: String::new(),
             console_bypass_dedup: false,
         };
         let outcome = self.play_confirmed_inner(&request, false, guard_user_pause, port)?;
@@ -1121,6 +1125,7 @@ mod tests {
                 progress: 10.0,
                 playback_rate: 1.0,
                 volume: 50,
+                requester: String::new(),
             })
         }
 
@@ -1310,6 +1315,7 @@ mod tests {
                         progress: 0.0,
                         playback_rate: 1.0,
                         volume: 50,
+                        requester: String::new(),
                     },
                     message: "开始播放: 可播放歌曲".to_string(),
                 },
@@ -1781,6 +1787,7 @@ mod tests {
                 source: "qqmusic".to_string(),
                 prefer_accompaniment: false,
                 uri: previous_uri.to_string(),
+                requester: String::new(),
                 navigation: PlaybackNavigation::Previous,
             }),
             played_uris: Vec::new(),

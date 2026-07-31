@@ -36,6 +36,17 @@ http://127.0.0.1:18888/
 
 需要鉴权时，在页面的“访问令牌”输入框填写 `http.access_token`。令牌只保存在当前浏览器会话中。
 
+## 歌曲信息中的点歌人
+
+歌曲信息会包含统一的 `requester` 字段：
+
+- `/status`：当前播放歌曲的点歌人。
+- `/queue`：每个待播歌曲的点歌人。
+- `/monitor`：当前歌曲和待播队列会包含点歌人。
+- `/state`：`playback.activeRequest.requester` 包含当前活动歌曲的点歌人。
+
+聊天点歌会记录发起点歌的聊天用户名。直接调用 `/queue/add` 或 `/player/play-uri` 时，可以通过 `requester` 参数指定点歌人；未指定时使用 `WEB/API`。原有的 `friendUsername` 字段仍会保留，用于兼容旧客户端。
+
 ## 高级工具页
 
 高级页用于人工确认当前画面和配置：

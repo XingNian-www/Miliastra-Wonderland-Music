@@ -423,8 +423,9 @@ async function call(url,method){
 }
 function renderPlayer(d){
   const title=[d.name,d.singer].filter(Boolean).join(' - ')
+  const songText=title+(d.requester?' · 点歌人：'+d.requester:'')
   $('playerState').textContent=stMap[d.status]||d.status||'未知'
-  $('songState').textContent=title||'无歌曲'
+  $('songState').textContent=songText||'无歌曲'
   return title
 }
 async function refreshPlayer(){
@@ -564,7 +565,7 @@ function renderHistory(items){
   el.innerHTML=items.map((it)=>'<div class="history-item '+(it.ok?'':'err')+'"><div><span class="history-time">'+esc(it.time)+'</span><b>'+esc(commandLabels[it.command]||it.command)+'</b>'+esc(queryText(it.query))+'</div><div class="history-result">'+esc(it.result)+'</div></div>').join('')
 }
 function queueLine(it,i){
-  const meta=[it.friendUsername,sourceLabel(it.source),it.preferAccompaniment?'伴奏':''].filter(Boolean).join(' / ')
+  const meta=[it.requester||it.friendUsername,sourceLabel(it.source),it.preferAccompaniment?'伴奏':''].filter(Boolean).join(' / ')
   return '<div class="queue-item"><div class="queue-index">'+(i+1)+'</div><div><div class="queue-title">'+esc(it.keyword||'未命名')+'</div><div class="queue-meta">'+esc(meta||'普通点歌')+'</div></div><button class="btn small ghost" onclick="removeQueueId('+Number(it.id||0)+')">删除</button></div>'
 }
 function taskLine(task){
@@ -675,10 +676,12 @@ function renderMonitor(d){
   const pc=d.playbackController||{}
   const backendStatus=pc.backendStatus||''
   $('playerState').textContent=stMap[backendStatus]||controllerStateMap[pc.state]||pc.state||'未知'
-  $('songState').textContent=[pc.title,pc.artist].filter(Boolean).join(' - ')||pc.activeKeyword||'无歌曲'
+  const currentTitle=[pc.title,pc.artist].filter(Boolean).join(' - ')||pc.activeKeyword||'无歌曲'
+  $('songState').textContent=currentTitle+(pc.requester?' · 点歌人：'+pc.requester:'')
   $('playbackDetail').textContent=[
     '控制器: '+(controllerStateMap[pc.state]||pc.state||'未知'),
     '暂停原因: '+(pauseReasonMap[pc.pauseReason]||pc.pauseReason||'无'),
+    '点歌人: '+(pc.requester||'未知'),
     '进度: '+fmt(pc.progress)+' / '+fmt(pc.duration),
     '观测: '+(reliabilityMap[pc.lastObservationReliability]||pc.lastObservationReliability||'未知')+' / '+ageText(pc.observedAtMs)
   ].join('\n')

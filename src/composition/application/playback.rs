@@ -40,6 +40,7 @@ impl ApplicationRuntime {
             ai_original_text: request.ai_original_text.clone(),
             uri: request.uri.clone(),
             friend_username: request.friend_username.clone(),
+            requester: request.requester.clone(),
             console_bypass_dedup: request.console_bypass_dedup,
         };
         self.playback_application

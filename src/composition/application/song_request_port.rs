@@ -27,15 +27,6 @@ impl SongRequestPort for ApplicationRuntime {
         )
     }
 
-    fn wait_for_decision(
-        &mut self,
-        allow_switch_source: bool,
-        allow_ai: bool,
-        default_confirm: bool,
-    ) -> Result<SongRequestDecision> {
-        ApplicationRuntime::wait_for_decision(self, allow_switch_source, allow_ai, default_confirm)
-    }
-
     fn search_candidates(
         &self,
         keyword: &str,

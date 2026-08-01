@@ -54,13 +54,39 @@ impl ApplicationRuntime {
         allow_ai: bool,
         timeout_confirms: bool,
     ) -> Result<SongRequestDecision> {
+        let reader = self.begin_song_decision_reader()?;
+        self.wait_for_decision_with_reader(reader, allow_switch_source, allow_ai, timeout_confirms)
+    }
+
+    pub(super) fn prompt_and_wait_for_decision(
+        &mut self,
+        message: &str,
+        allow_switch_source: bool,
+        allow_ai: bool,
+        timeout_confirms: bool,
+    ) -> Result<SongRequestDecision> {
+        let reader = self.begin_song_decision_reader()?;
+        self.reply(message)?;
+        self.wait_for_decision_with_reader(reader, allow_switch_source, allow_ai, timeout_confirms)
+    }
+
+    fn begin_song_decision_reader(&self) -> Result<ChatDecisionReader> {
         let accepts_message_type = |message_type: &str| message_type == "blue";
         let is_decision = |text: &str| SongRequestDecision::parse(text).is_some();
-        let mut reader = self.begin_chat_decision_reader(
+        self.begin_chat_decision_reader(
             ChatDecisionScope::CurrentHall,
             &accepts_message_type,
             &is_decision,
-        )?;
+        )
+    }
+
+    fn wait_for_decision_with_reader(
+        &mut self,
+        mut reader: ChatDecisionReader,
+        allow_switch_source: bool,
+        allow_ai: bool,
+        timeout_confirms: bool,
+    ) -> Result<SongRequestDecision> {
         let timeout = Duration::from_millis(self.config.timing.decision.timeout_ms);
         let map_web_decision = |decision| match decision {
             DecisionAction::Confirm => SongRequestDecision::Confirm,

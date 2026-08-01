@@ -568,9 +568,14 @@ impl ApplicationRuntime {
                 .context("等待二级当前大厅确认基线观察")?
                 .map_err(|failure| anyhow!("建立二级当前大厅确认基线失败：{failure}"))?;
             let previous = secondary_hall_bubbles(&image)?;
+            let messages = self.recognize_secondary_hall_messages(&image, &previous)?;
             return Ok(ChatDecisionReader {
                 kind: ChatDecisionReaderKind::SecondaryCurrentHall { previous },
-                screen_lock: DecisionScreenLock::default(),
+                screen_lock: DecisionScreenLock::from_messages(
+                    &messages,
+                    accepts_message_type,
+                    is_decision,
+                ),
                 _observation_session: observation_session,
             });
         }
@@ -650,9 +655,11 @@ impl ApplicationRuntime {
             SecondaryHallSequenceDelta::NoChange => return Ok(Vec::new()),
             SecondaryHallSequenceDelta::EstablishBaseline => unreachable!("baseline is present"),
             SecondaryHallSequenceDelta::LostOverlap => {
+                let messages =
+                    self.recognize_secondary_hall_messages(&refreshed.image, &refreshed_bubbles)?;
                 *previous = refreshed_bubbles;
-                log::debug!("二级确认气泡稳定后失去重叠，已重建基线");
-                return Ok(Vec::new());
+                log::debug!("二级确认气泡稳定后失去重叠，重新检查当前可见决策命令");
+                return Ok(messages);
             }
         };
         let messages =

@@ -11,6 +11,22 @@ impl SongRequestPort for ApplicationRuntime {
         ApplicationRuntime::reply(self, message)
     }
 
+    fn prompt_and_wait_for_decision(
+        &mut self,
+        message: &str,
+        allow_switch_source: bool,
+        allow_ai: bool,
+        default_confirm: bool,
+    ) -> Result<SongRequestDecision> {
+        ApplicationRuntime::prompt_and_wait_for_decision(
+            self,
+            message,
+            allow_switch_source,
+            allow_ai,
+            default_confirm,
+        )
+    }
+
     fn wait_for_decision(
         &mut self,
         allow_switch_source: bool,

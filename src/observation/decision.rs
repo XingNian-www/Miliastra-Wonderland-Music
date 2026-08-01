@@ -12,7 +12,7 @@ struct DecisionMessageKey {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DecisionScreenLock {
-    existing_bottoms: HashMap<DecisionMessageKey, i32>,
+    existing_y_positions: HashMap<DecisionMessageKey, i32>,
     consumed_bottoms: HashMap<DecisionMessageKey, i32>,
 }
 
@@ -36,11 +36,13 @@ impl DecisionScreenLock {
     }
 
     pub(crate) fn is_existing(&self, message: &ChatMessage) -> bool {
-        self.has_record(&self.existing_bottoms, message)
+        self.existing_y_positions
+            .get(&message_key(message))
+            .is_some_and(|existing_y| message.block.y <= *existing_y)
     }
 
     pub(crate) fn accept_once(&mut self, message: &ChatMessage) -> bool {
-        if self.is_existing(message) || self.has_record(&self.consumed_bottoms, message) {
+        if self.is_existing(message) || self.has_consumed_record(message) {
             return false;
         }
         self.record_consumed(message);
@@ -48,20 +50,20 @@ impl DecisionScreenLock {
     }
 
     fn record_existing(&mut self, message: &ChatMessage) {
-        record_bottom(&mut self.existing_bottoms, message);
+        let y = message.block.y;
+        self.existing_y_positions
+            .entry(message_key(message))
+            .and_modify(|value| *value = (*value).max(y))
+            .or_insert(y);
     }
 
     fn record_consumed(&mut self, message: &ChatMessage) {
         record_bottom(&mut self.consumed_bottoms, message);
     }
 
-    fn has_record(
-        &self,
-        records: &HashMap<DecisionMessageKey, i32>,
-        message: &ChatMessage,
-    ) -> bool {
+    fn has_consumed_record(&self, message: &ChatMessage) -> bool {
         let bottom = message.block.bottom();
-        records
+        self.consumed_bottoms
             .get(&message_key(message))
             .is_some_and(|existing_bottom| bottom <= existing_bottom + BOTTOM_TOLERANCE_PX)
     }
@@ -102,7 +104,7 @@ mod tests {
     }
 
     #[test]
-    fn locks_existing_decision_with_small_ocr_position_jitter() {
+    fn locks_existing_decision_when_ocr_moves_upward() {
         let existing = [message("blue", 100, "用户：@确认")];
         let lock = DecisionScreenLock::from_messages(
             &existing,
@@ -110,8 +112,21 @@ mod tests {
             &|text| text.contains("@确认"),
         );
 
-        assert!(lock.is_existing(&message("blue", 107, "用户：@确认")));
+        assert!(lock.is_existing(&message("blue", 93, "用户：@确认")));
         assert!(!lock.is_existing(&message("blue", 140, "用户：@确认")));
+    }
+
+    #[test]
+    fn accepts_existing_decision_as_new_when_its_position_moves_down() {
+        let existing = [message("blue", 100, "用户：@确认")];
+        let mut lock = DecisionScreenLock::from_messages(
+            &existing,
+            &|message_type| message_type == "blue",
+            &|text| text.contains("@确认"),
+        );
+
+        assert!(lock.accept_once(&message("blue", 101, "用户：@确认")));
+        assert!(!lock.accept_once(&message("blue", 104, "用户：@确认")));
     }
 
     #[test]

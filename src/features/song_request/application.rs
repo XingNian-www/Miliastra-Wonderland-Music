@@ -142,16 +142,6 @@ pub(crate) trait SongRequestPort {
         allow_switch_source: bool,
         allow_ai: bool,
         default_confirm: bool,
-    ) -> Result<SongRequestDecision> {
-        self.reply(message)?;
-        self.wait_for_decision(allow_switch_source, allow_ai, default_confirm)
-    }
-
-    fn wait_for_decision(
-        &mut self,
-        allow_switch_source: bool,
-        allow_ai: bool,
-        default_confirm: bool,
     ) -> Result<SongRequestDecision>;
 
     fn search_candidates(
@@ -1186,21 +1176,12 @@ mod tests {
         fn prompt_and_wait_for_decision(
             &mut self,
             message: &str,
-            allow_switch_source: bool,
-            allow_ai: bool,
-            default_confirm: bool,
-        ) -> Result<SongRequestDecision> {
-            self.decision_prompts.borrow_mut().push(message.to_string());
-            self.reply(message)?;
-            self.wait_for_decision(allow_switch_source, allow_ai, default_confirm)
-        }
-
-        fn wait_for_decision(
-            &mut self,
             _allow_switch_source: bool,
             _allow_ai: bool,
             _default_confirm: bool,
         ) -> Result<SongRequestDecision> {
+            self.decision_prompts.borrow_mut().push(message.to_string());
+            self.reply(message)?;
             Ok(self
                 .decisions
                 .pop_front()

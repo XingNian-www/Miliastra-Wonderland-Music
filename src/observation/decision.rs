@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::observation::chat::ChatMessage;
 
-const BOTTOM_TOLERANCE_PX: i32 = 8;
+const POSITION_TOLERANCE_PX: i32 = 8;
 
 #[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
 struct DecisionMessageKey {
@@ -38,7 +38,7 @@ impl DecisionScreenLock {
     pub(crate) fn is_existing(&self, message: &ChatMessage) -> bool {
         self.existing_y_positions
             .get(&message_key(message))
-            .is_some_and(|existing_y| message.block.y <= *existing_y)
+            .is_some_and(|existing_y| message.block.y <= *existing_y + POSITION_TOLERANCE_PX)
     }
 
     pub(crate) fn accept_once(&mut self, message: &ChatMessage) -> bool {
@@ -65,7 +65,7 @@ impl DecisionScreenLock {
         let bottom = message.block.bottom();
         self.consumed_bottoms
             .get(&message_key(message))
-            .is_some_and(|existing_bottom| bottom <= existing_bottom + BOTTOM_TOLERANCE_PX)
+            .is_some_and(|existing_bottom| bottom <= existing_bottom + POSITION_TOLERANCE_PX)
     }
 }
 
@@ -117,7 +117,7 @@ mod tests {
     }
 
     #[test]
-    fn accepts_existing_decision_as_new_when_its_position_moves_down() {
+    fn accepts_existing_decision_as_new_only_beyond_ocr_position_tolerance() {
         let existing = [message("blue", 100, "用户：@确认")];
         let mut lock = DecisionScreenLock::from_messages(
             &existing,
@@ -125,8 +125,8 @@ mod tests {
             &|text| text.contains("@确认"),
         );
 
-        assert!(lock.accept_once(&message("blue", 101, "用户：@确认")));
-        assert!(!lock.accept_once(&message("blue", 104, "用户：@确认")));
+        assert!(!lock.accept_once(&message("blue", 108, "用户：@确认")));
+        assert!(lock.accept_once(&message("blue", 109, "用户：@确认")));
     }
 
     #[test]

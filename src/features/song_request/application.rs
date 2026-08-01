@@ -136,6 +136,17 @@ impl Display for SongSearchFailure {
 pub(crate) trait SongRequestPort {
     fn reply(&self, message: &str) -> Result<()>;
 
+    fn prompt_and_wait_for_decision(
+        &mut self,
+        message: &str,
+        allow_switch_source: bool,
+        allow_ai: bool,
+        default_confirm: bool,
+    ) -> Result<SongRequestDecision> {
+        self.reply(message)?;
+        self.wait_for_decision(allow_switch_source, allow_ai, default_confirm)
+    }
+
     fn wait_for_decision(
         &mut self,
         allow_switch_source: bool,
@@ -539,8 +550,7 @@ impl SongRequestExecution<'_> {
             pick.reason
         );
         let message = format!("{}AI匹配:{},@确认@跳过", label, candidate.text);
-        self.reply(&message)?;
-        match self.wait_for_decision(false, false, true)? {
+        match self.prompt_and_wait_for_decision(&message, false, false, true)? {
             SongRequestDecision::Confirm | SongRequestDecision::Timeout => {}
             SongRequestDecision::Skip => return Ok(None),
             SongRequestDecision::Stopped => return Ok(None),
@@ -592,12 +602,9 @@ impl SongRequestExecution<'_> {
                 } else {
                     "@换源"
                 };
-                self.reply(&format!(
-                    "{}平台无对应歌曲音源,{}",
-                    request.label(),
-                    actions
-                ))?;
-                let decision = self.wait_for_decision(true, self.ai.enabled(), true)?;
+                let prompt = format!("{}平台无对应歌曲音源,{}", request.label(), actions);
+                let decision =
+                    self.prompt_and_wait_for_decision(&prompt, true, self.ai.enabled(), true)?;
                 match decision {
                     SongRequestDecision::SwitchSource => {
                         let next_source = alternate_music_source(source);
@@ -620,13 +627,9 @@ impl SongRequestExecution<'_> {
             } else {
                 "@确认@跳过@换源"
             };
-            self.reply(&format!(
-                "{}搜索到:{},{}",
-                request.label(),
-                song_title,
-                actions
-            ))?;
-            let decision = self.wait_for_decision(true, self.ai.enabled(), true)?;
+            let prompt = format!("{}搜索到:{},{}", request.label(), song_title, actions);
+            let decision =
+                self.prompt_and_wait_for_decision(&prompt, true, self.ai.enabled(), true)?;
             match decision {
                 SongRequestDecision::Confirm | SongRequestDecision::Timeout => {
                     return Ok(Some(ResolvedSongRequest {
@@ -682,8 +685,9 @@ impl SongRequestExecution<'_> {
             } else {
                 "@换源"
             };
-            self.reply(&format!("{}换源后仍无音源,{}", song_label(song), actions))?;
-            let decision = self.wait_for_decision(true, self.ai.enabled(), true)?;
+            let prompt = format!("{}换源后仍无音源,{}", song_label(song), actions);
+            let decision =
+                self.prompt_and_wait_for_decision(&prompt, true, self.ai.enabled(), true)?;
             match decision {
                 SongRequestDecision::SwitchSource => {
                     let next_source = alternate_music_source(source);
@@ -704,13 +708,13 @@ impl SongRequestExecution<'_> {
         } else {
             "@确认@跳过@换源"
         };
-        self.reply(&format!(
+        let prompt = format!(
             "{}搜索到:{},{}",
             song_label(song),
             picked.candidate.text,
             actions
-        ))?;
-        let decision = self.wait_for_decision(true, self.ai.enabled(), true)?;
+        );
+        let decision = self.prompt_and_wait_for_decision(&prompt, true, self.ai.enabled(), true)?;
         match decision {
             SongRequestDecision::Confirm | SongRequestDecision::Timeout => {
                 Ok(Some(ResolvedSongRequest {
@@ -922,14 +926,19 @@ impl SongRequestExecution<'_> {
         self.port.reply(message)
     }
 
-    fn wait_for_decision(
+    fn prompt_and_wait_for_decision(
         &mut self,
+        message: &str,
         allow_switch_source: bool,
         allow_ai: bool,
         default_confirm: bool,
     ) -> Result<SongRequestDecision> {
-        self.port
-            .wait_for_decision(allow_switch_source, allow_ai, default_confirm)
+        self.port.prompt_and_wait_for_decision(
+            message,
+            allow_switch_source,
+            allow_ai,
+            default_confirm,
+        )
     }
 
     fn playback_queue(&self) -> Result<Vec<QueueItem>> {
@@ -1134,6 +1143,7 @@ mod tests {
 
     struct FakePort {
         replies: RefCell<Vec<String>>,
+        decision_prompts: RefCell<Vec<String>>,
         decisions: VecDeque<SongRequestDecision>,
         searches: RefCell<VecDeque<Option<PickedCandidate>>>,
         search_sources: RefCell<Vec<String>>,
@@ -1151,6 +1161,7 @@ mod tests {
         fn idle(searches: impl IntoIterator<Item = Option<PickedCandidate>>) -> Self {
             Self {
                 replies: RefCell::new(Vec::new()),
+                decision_prompts: RefCell::new(Vec::new()),
                 decisions: VecDeque::from([SongRequestDecision::Confirm]),
                 searches: RefCell::new(searches.into_iter().collect()),
                 search_sources: RefCell::new(Vec::new()),
@@ -1170,6 +1181,18 @@ mod tests {
         fn reply(&self, message: &str) -> Result<()> {
             self.replies.borrow_mut().push(message.to_string());
             Ok(())
+        }
+
+        fn prompt_and_wait_for_decision(
+            &mut self,
+            message: &str,
+            allow_switch_source: bool,
+            allow_ai: bool,
+            default_confirm: bool,
+        ) -> Result<SongRequestDecision> {
+            self.decision_prompts.borrow_mut().push(message.to_string());
+            self.reply(message)?;
+            self.wait_for_decision(allow_switch_source, allow_ai, default_confirm)
         }
 
         fn wait_for_decision(
@@ -1280,6 +1303,20 @@ mod tests {
         assert_eq!(port.played.borrow()[0].uri, "fuo://qqmusic/songs/1");
         assert_eq!(port.played.borrow()[0].requester, "Alice");
         assert!(port.logs.borrow()[0].starts_with("play keyword=晴天 - 周杰伦"));
+    }
+
+    #[test]
+    fn candidate_prompt_uses_one_prompt_and_decision_operation() {
+        let mut port = FakePort::idle([Some(picked("晴天 - 周杰伦", "fuo://qqmusic/songs/1"))]);
+
+        application()
+            .execute(&context(), &command(), &mut port)
+            .expect("song request");
+
+        assert_eq!(
+            port.decision_prompts.borrow().as_slice(),
+            ["搜索到:晴天 - 周杰伦,@确认@跳过@换源"]
+        );
     }
 
     #[test]

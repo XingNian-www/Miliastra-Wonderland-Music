@@ -546,6 +546,8 @@ pub struct OcrConfig {
     pub charset: PathBuf,
     pub min_confidence: f32,
     pub threads: i32,
+    pub request_timeout_ms: u64,
+    pub shutdown_timeout_ms: u64,
     pub backend_priority: Vec<String>,
     /// Optional OpenVINO IR model configuration. This is ignored unless
     /// `openvino` appears in `backend_priority`.
@@ -639,6 +641,14 @@ impl OpenVinoConfig {
 
 impl OcrConfig {
     fn validate(&self) -> Result<()> {
+        for (value, field) in [
+            (self.request_timeout_ms, "ocr.request_timeout_ms"),
+            (self.shutdown_timeout_ms, "ocr.shutdown_timeout_ms"),
+        ] {
+            if value == 0 {
+                bail!("{} 必须大于 0", field);
+            }
+        }
         validate_unit_interval(self.min_confidence, "ocr.min_confidence")?;
         validate_unit_interval(self.det_score_threshold, "ocr.det_score_threshold")?;
         validate_unit_interval(self.change_pixel_threshold, "ocr.change_pixel_threshold")?;
@@ -1164,7 +1174,7 @@ stale_timeout_ms: 7500
 
     #[test]
     fn startup_validation_rejects_zero_runtime_intervals_timeouts_and_retries() {
-        let invalid_fields: [ConfigMutation; 15] = [
+        let invalid_fields: [ConfigMutation; 17] = [
             ("timing.watchdog_restart_ms", |config| {
                 config.timing.watchdog_restart_ms = 0;
             }),
@@ -1212,6 +1222,12 @@ stale_timeout_ms: 7500
             }),
             ("timing.external.ai_request_timeout_ms", |config| {
                 config.timing.external.ai_request_timeout_ms = 0;
+            }),
+            ("ocr.request_timeout_ms", |config| {
+                config.ocr.request_timeout_ms = 0;
+            }),
+            ("ocr.shutdown_timeout_ms", |config| {
+                config.ocr.shutdown_timeout_ms = 0;
             }),
         ];
 
@@ -1447,6 +1463,8 @@ stale_timeout_ms: 7500
             "timing.playback.uri_stable_samples",
             "timing.playback.transport_stable_samples",
             "timing.playback.stale_timeout_ms",
+            "ocr.request_timeout_ms",
+            "ocr.shutdown_timeout_ms",
             "queue.external_playback_protect_after_seconds",
             "song_dedup.enabled",
             "idiom_chain.enabled",

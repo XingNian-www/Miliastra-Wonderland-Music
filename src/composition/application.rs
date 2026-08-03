@@ -95,8 +95,8 @@ use crate::runtime::deferred_chat::{
 use crate::runtime::identity::BusinessOperationIdAllocator;
 use crate::runtime::monitor::{MonitorEvent, MonitorShared, OcrSnapshot};
 use crate::runtime::ocr::{
-    OcrArgs, OcrBackendProbeStatus, OcrPriority, OcrRuntime, OcrRuntimeHandle, ProductionOcrDevice,
-    ResolvedOcrArgs, probe_ocr_backend_support,
+    OcrArgs, OcrBackendProbeStatus, OcrPriority, OcrRuntime, OcrRuntimeConfig, OcrRuntimeHandle,
+    ProductionOcrDevice, ResolvedOcrArgs, probe_ocr_backend_support,
 };
 use crate::runtime::openai::OpenAiRuntime;
 use crate::runtime::player_io::{
@@ -875,7 +875,14 @@ impl ApplicationRuntime {
         let task_engine = TaskEngineHandle::new(Some(Arc::new(monitor.clone())));
         let business_runtime_builder =
             BusinessRuntimeGroupBuilder::start(DEADLINE_RUNTIME_QUEUE_CAPACITY)?;
-        let ocr_runtime = OcrRuntime::start(ocr_device, OCR_RUNTIME_QUEUE_CAPACITY)?;
+        let ocr_runtime = OcrRuntime::start_configured(
+            ocr_device,
+            OcrRuntimeConfig {
+                queue_capacity: OCR_RUNTIME_QUEUE_CAPACITY,
+                request_timeout: Duration::from_millis(config.ocr.request_timeout_ms),
+                shutdown_timeout: Duration::from_millis(config.ocr.shutdown_timeout_ms),
+            },
+        )?;
         let ocr = ocr_runtime.handle();
         let player_runtime = PlayerRuntime::start(
             feeluown.clone(),

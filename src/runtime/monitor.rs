@@ -12,6 +12,7 @@ use crate::features::undercover::UndercoverSnapshot;
 use crate::runtime::business::{BusinessOperationalSnapshot, BusinessStateSink};
 use crate::runtime::decision::DecisionSnapshot;
 use crate::runtime::scheduler::{DiagnosticTaskSnapshot, FormalTaskSnapshot};
+use crate::runtime::task_engine::TaskEngineStateSink;
 use crate::runtime::ui::{UiRoutineProgress, UiRoutineProgressSink, UiRoutineProgressStage};
 
 #[derive(Clone, Debug, Serialize)]
@@ -450,13 +451,6 @@ impl BusinessStateSink for MonitorShared {
         self.publish_async(MonitorEvent::HallRemainingMinutes(minutes));
     }
 
-    fn publish_scheduler(&self, snapshot: crate::runtime::scheduler::FormalSchedulerSnapshot) {
-        self.publish_async(MonitorEvent::Scheduler {
-            pending_tasks: snapshot.pending_labels().to_vec(),
-            tasks: snapshot.tasks().to_vec(),
-        });
-    }
-
     fn publish_chat_listener(&self, snapshot: crate::runtime::chat_listener::ChatListenerSnapshot) {
         self.publish_async(MonitorEvent::ChatListener {
             mode: snapshot.display_mode(),
@@ -473,6 +467,15 @@ impl BusinessStateSink for MonitorShared {
 
     fn publish_operational(&self, snapshot: BusinessOperationalSnapshot) {
         self.publish_async(MonitorEvent::BusinessOperational(snapshot));
+    }
+}
+
+impl TaskEngineStateSink for MonitorShared {
+    fn publish_scheduler(&self, snapshot: crate::runtime::scheduler::FormalSchedulerSnapshot) {
+        self.publish_async(MonitorEvent::Scheduler {
+            pending_tasks: snapshot.pending_labels().to_vec(),
+            tasks: snapshot.tasks().to_vec(),
+        });
     }
 
     fn publish_diagnostics(&self, snapshot: Vec<DiagnosticTaskSnapshot>) {

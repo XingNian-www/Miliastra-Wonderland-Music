@@ -173,12 +173,16 @@ impl ApplicationRuntime {
     }
 
     pub(super) fn start_hotkeys(&self) -> Result<hotkeys::HotkeyRuntime> {
-        let business = self.business.clone();
+        let task_engine = self.task_engine.clone();
         hotkeys::start(
             &self.config.hotkeys,
             Arc::clone(&self.running),
             Arc::clone(&self.paused),
-            Arc::new(move || business.wake_scheduler()),
+            Arc::new(move || {
+                if let Err(error) = task_engine.wake() {
+                    log::debug!("热键切换暂停状态后唤醒任务引擎失败: {error}");
+                }
+            }),
         )
     }
 
@@ -310,7 +314,7 @@ impl ApplicationRuntime {
                     }
                     let ui_ms = elapsed_ms(ui_started);
                     let listener_snapshot = self.business.chat_listener_snapshot()?;
-                    let command_executing = self.business.scheduler_snapshot()?.is_busy();
+                    let command_executing = self.task_engine.snapshot()?.is_busy();
                     match ui_state_result {
                         Ok((ui_state, None)) => {
                             log::debug!("界面仍在过渡，暂停聊天扫描: {}", ui_state);
@@ -999,7 +1003,7 @@ impl ApplicationRuntime {
     }
 
     fn tick_entertainment(&self) {
-        let scheduler_idle = match self.business.scheduler_snapshot() {
+        let scheduler_idle = match self.task_engine.snapshot() {
             Ok(snapshot) => snapshot.is_idle(),
             Err(error) => {
                 log::error!("无法读取业务调度状态，娱乐计时保持暂停: {error}");

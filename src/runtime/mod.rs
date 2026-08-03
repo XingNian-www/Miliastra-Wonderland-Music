@@ -12,5 +12,6 @@ pub(crate) mod openai;
 pub mod player;
 pub mod player_io;
 pub(crate) mod scheduler;
+pub(crate) mod task_engine;
 pub mod timer;
 pub mod ui;

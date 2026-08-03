@@ -22,14 +22,16 @@ pub(super) struct ImmediateAdministrationPort {
 
 pub(super) struct DeferredIdiomChainPort {
     business: BusinessRuntimeHandle,
+    task_engine: TaskEngineHandle,
 }
 
 struct DeferredCardGamePort {
-    business: BusinessRuntimeHandle,
+    task_engine: TaskEngineHandle,
 }
 
 struct TurtleSoupCommandPort {
     business: BusinessRuntimeHandle,
+    task_engine: TaskEngineHandle,
 }
 
 struct PublicHallDetectionPort {
@@ -74,7 +76,7 @@ impl IdiomChainDeferredPort for DeferredIdiomChainPort {
             UiResidency::SecondaryCurrentHall => DeferredChatTarget::SecondaryCurrentHall,
         };
         Ok(
-            match self.business.enqueue_deferred_chat(DeferredChatMessage {
+            match self.task_engine.enqueue_deferred(DeferredChatMessage {
                 text: message,
                 target,
                 background_key: None,
@@ -105,7 +107,7 @@ impl CardGameDeliveryPort for DeferredCardGamePort {
     }
 
     fn send_hall(&self, message: &str) -> Result<()> {
-        enqueue_current_hall_reply(&self.business, message)
+        enqueue_current_hall_reply(&self.task_engine, message)
     }
 }
 
@@ -141,7 +143,7 @@ impl TurtleSoupApplicationPort for TurtleSoupCommandPort {
     }
 
     fn send_current_hall(&mut self, message: &str) -> Result<()> {
-        enqueue_current_hall_reply(&self.business, message)
+        enqueue_current_hall_reply(&self.task_engine, message)
     }
 }
 
@@ -182,12 +184,14 @@ impl ApplicationRuntime {
     pub(super) fn deferred_idiom_chain_port(&self) -> DeferredIdiomChainPort {
         DeferredIdiomChainPort {
             business: self.business.clone(),
+            task_engine: self.task_engine.clone(),
         }
     }
 
     fn turtle_soup_command_port(&self) -> TurtleSoupCommandPort {
         TurtleSoupCommandPort {
             business: self.business.clone(),
+            task_engine: self.task_engine.clone(),
         }
     }
 
@@ -294,7 +298,7 @@ impl ApplicationRuntime {
             ),
             CardGameEffectLane::Deferred => {
                 let port = DeferredCardGamePort {
-                    business: self.business.clone(),
+                    task_engine: self.task_engine.clone(),
                 };
                 self.card_games.execute_command(
                     &parsed.username,

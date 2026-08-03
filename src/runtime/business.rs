@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -54,19 +54,10 @@ use crate::runtime::clock::Clock;
 use crate::runtime::clock::SystemClock;
 use crate::runtime::deadline::{BusinessDeadlineEvent, BusinessDeadlineToken};
 use crate::runtime::decision::{DecisionAction, DecisionSnapshot, DecisionState};
-use crate::runtime::deferred_chat::{
-    DEFAULT_CAPACITY as DEFERRED_CHAT_CAPACITY, DeferredChatItem, DeferredChatQueue, EnqueueOutcome,
-};
 use crate::runtime::identity::{
     BusinessOperationId, BusinessOperationIdAllocator, SessionGeneration,
 };
-use crate::runtime::scheduler::{
-    DiagnosticTaskCompletion, DiagnosticTaskLease, DiagnosticTaskSnapshot,
-    DiagnosticTaskSubmission, FormalScheduler, FormalSchedulerSnapshot, FormalTaskCancelAction,
-    FormalTaskCancelOutcome, FormalTaskCompletion, FormalTaskDedupKey, FormalTaskEnqueueOutcome,
-    FormalTaskLease, FormalTaskShutdownPlan, FormalTaskSubmission, SchedulerLane,
-    SchedulerLaneLease,
-};
+use crate::runtime::task_engine::TaskEngineHandle;
 use crate::runtime::timer::{
     DeadlineCancellation, DeadlineSchedule, TimerCommandKind, TimerRuntimeEvent, TimerRuntimeHandle,
 };
@@ -105,11 +96,9 @@ pub(crate) trait BusinessStateSink: Send + Sync {
     fn publish_undercover(&self, snapshot: UndercoverSnapshot);
     fn publish_playback_queue(&self, _queue: Vec<QueueItem>) {}
     fn publish_hall_remaining_minutes(&self, _minutes: Option<u32>) {}
-    fn publish_scheduler(&self, _snapshot: FormalSchedulerSnapshot) {}
     fn publish_chat_listener(&self, _snapshot: ChatListenerSnapshot) {}
     fn publish_decision(&self, _snapshot: Option<DecisionSnapshot>) {}
     fn publish_operational(&self, _snapshot: BusinessOperationalSnapshot) {}
-    fn publish_diagnostics(&self, _snapshot: Vec<DiagnosticTaskSnapshot>) {}
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -339,7 +328,7 @@ pub enum BusinessRuntimeError {
     HallOperationFailed(String),
     PlaybackOperationFailed(String),
     TimerOperationFailed(String),
-    SchedulerOperationFailed(String),
+    TaskEngineOperationFailed(String),
     DecisionOperationFailed(String),
 }
 
@@ -373,8 +362,8 @@ impl Display for BusinessRuntimeError {
             Self::TimerOperationFailed(message) => {
                 write!(formatter, "business timer operation failed: {message}")
             }
-            Self::SchedulerOperationFailed(message) => {
-                write!(formatter, "business scheduler operation failed: {message}")
+            Self::TaskEngineOperationFailed(message) => {
+                write!(formatter, "task engine operation failed: {message}")
             }
             Self::DecisionOperationFailed(message) => {
                 write!(formatter, "business decision operation failed: {message}")
@@ -387,63 +376,6 @@ impl Error for BusinessRuntimeError {}
 
 enum RuntimeMessage {
     Event(BusinessEvent),
-    EnqueueFormalTask {
-        submission: FormalTaskSubmission,
-        response: SyncSender<Result<FormalTaskEnqueueOutcome, BusinessRuntimeError>>,
-    },
-    FormalSchedulerSnapshot(SyncSender<Result<FormalSchedulerSnapshot, BusinessRuntimeError>>),
-    FormalTaskContainsDedupKey {
-        key: FormalTaskDedupKey,
-        response: SyncSender<Result<bool, BusinessRuntimeError>>,
-    },
-    TakeNextFormalTask(SyncSender<Result<Option<FormalTaskLease>, BusinessRuntimeError>>),
-    RestoreFormalTask {
-        lease: FormalTaskLease,
-        response: SyncSender<Result<(), BusinessRuntimeError>>,
-    },
-    CompleteFormalTask {
-        task_id: u64,
-        completion: FormalTaskCompletion,
-        response: SyncSender<Result<(), BusinessRuntimeError>>,
-    },
-    CancelFormalTask {
-        task_id: u64,
-        response: SyncSender<Result<FormalTaskCancelAction, BusinessRuntimeError>>,
-    },
-    BeginFormalTaskShutdown(SyncSender<Result<FormalTaskShutdownPlan, BusinessRuntimeError>>),
-    ReleaseSchedulerLane {
-        lease: SchedulerLaneLease,
-        response: SyncSender<Result<(), BusinessRuntimeError>>,
-    },
-    EnqueueDeferredChat {
-        item: DeferredChatItem,
-        response: SyncSender<Result<EnqueueOutcome, BusinessRuntimeError>>,
-    },
-    RequeueDeferredChatFront {
-        item: DeferredChatItem,
-        response: SyncSender<Result<EnqueueOutcome, BusinessRuntimeError>>,
-    },
-    RequeueDeferredChatBack {
-        item: DeferredChatItem,
-        response: SyncSender<Result<EnqueueOutcome, BusinessRuntimeError>>,
-    },
-    TakeNextDeferredChat(
-        SyncSender<Result<Option<(DeferredChatItem, SchedulerLaneLease)>, BusinessRuntimeError>>,
-    ),
-    EnqueueDiagnosticTask {
-        submission: DiagnosticTaskSubmission,
-        response: SyncSender<Result<DiagnosticTaskSnapshot, BusinessRuntimeError>>,
-    },
-    TakeNextDiagnosticTask(SyncSender<Result<Option<DiagnosticTaskLease>, BusinessRuntimeError>>),
-    CompleteDiagnosticTask {
-        task_id: u64,
-        completion: DiagnosticTaskCompletion,
-        response: SyncSender<Result<(), BusinessRuntimeError>>,
-    },
-    DiagnosticTaskSnapshot {
-        id: u64,
-        response: SyncSender<Result<Option<DiagnosticTaskSnapshot>, BusinessRuntimeError>>,
-    },
     OperationalSnapshot {
         now: Instant,
         response: SyncSender<Result<BusinessOperationalSnapshot, BusinessRuntimeError>>,
@@ -755,73 +687,6 @@ enum TurtleSoupRuntimeMessage {
 struct RuntimeChannel {
     sender: SyncSender<RuntimeMessage>,
     state: Mutex<RuntimeChannelState>,
-    scheduler_signal: SchedulerSignal,
-}
-
-struct SchedulerSignal {
-    generation: Mutex<u64>,
-    changed: Condvar,
-}
-
-impl SchedulerSignal {
-    fn new() -> Self {
-        Self {
-            generation: Mutex::new(0),
-            changed: Condvar::new(),
-        }
-    }
-
-    fn generation(&self) -> Result<u64, BusinessRuntimeError> {
-        self.generation
-            .lock()
-            .map(|generation| *generation)
-            .map_err(|_| BusinessRuntimeError::RuntimeStopped)
-    }
-
-    fn wait_for_change(&self, observed_generation: u64) -> Result<u64, BusinessRuntimeError> {
-        let generation = self
-            .generation
-            .lock()
-            .map_err(|_| BusinessRuntimeError::RuntimeStopped)?;
-        if *generation != observed_generation {
-            return Ok(*generation);
-        }
-        let generation = self
-            .changed
-            .wait_while(generation, |current| *current == observed_generation)
-            .map_err(|_| BusinessRuntimeError::RuntimeStopped)?;
-        Ok(*generation)
-    }
-
-    fn wait_for_change_timeout(
-        &self,
-        observed_generation: u64,
-        timeout: Duration,
-    ) -> Result<u64, BusinessRuntimeError> {
-        let generation = self
-            .generation
-            .lock()
-            .map_err(|_| BusinessRuntimeError::RuntimeStopped)?;
-        if *generation != observed_generation {
-            return Ok(*generation);
-        }
-        let (generation, _) = self
-            .changed
-            .wait_timeout_while(generation, timeout, |current| {
-                *current == observed_generation
-            })
-            .map_err(|_| BusinessRuntimeError::RuntimeStopped)?;
-        Ok(*generation)
-    }
-
-    fn notify(&self) {
-        let Ok(mut generation) = self.generation.lock() else {
-            log::error!("正式任务唤醒状态锁已损坏");
-            return;
-        };
-        *generation = generation.wrapping_add(1);
-        self.changed.notify_all();
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -834,11 +699,6 @@ enum RuntimeChannelState {
 #[derive(Clone)]
 pub struct BusinessRuntimeHandle {
     channel: Arc<RuntimeChannel>,
-}
-
-pub(crate) struct SchedulerPermit {
-    handle: BusinessRuntimeHandle,
-    lease: Option<SchedulerLaneLease>,
 }
 
 pub(crate) struct DecisionSession {
@@ -868,17 +728,6 @@ impl Drop for DecisionSession {
     fn drop(&mut self) {
         if let Err(error) = self.handle.finish_decision(self.id) {
             log::debug!("结束 Web 决策失败: {error}");
-        }
-    }
-}
-
-impl Drop for SchedulerPermit {
-    fn drop(&mut self) {
-        let Some(lease) = self.lease.take() else {
-            return;
-        };
-        if let Err(error) = self.handle.release_scheduler_lane(lease) {
-            log::debug!("释放调度通道租约失败: {error}");
         }
     }
 }
@@ -1067,209 +916,6 @@ impl BusinessRuntimeHandle {
                 )
             }
         })
-    }
-
-    pub(crate) fn enqueue_formal_task(
-        &self,
-        submission: FormalTaskSubmission,
-    ) -> Result<FormalTaskEnqueueOutcome, BusinessRuntimeError> {
-        let outcome = self.request(|response| RuntimeMessage::EnqueueFormalTask {
-            submission,
-            response,
-        })?;
-        self.wake_scheduler();
-        Ok(outcome)
-    }
-
-    pub(crate) fn scheduler_generation(&self) -> Result<u64, BusinessRuntimeError> {
-        self.channel.scheduler_signal.generation()
-    }
-
-    pub(crate) fn wait_for_scheduler_change(
-        &self,
-        observed_generation: u64,
-    ) -> Result<u64, BusinessRuntimeError> {
-        self.channel
-            .scheduler_signal
-            .wait_for_change(observed_generation)
-    }
-
-    pub(crate) fn wait_for_scheduler_change_timeout(
-        &self,
-        observed_generation: u64,
-        timeout: Duration,
-    ) -> Result<u64, BusinessRuntimeError> {
-        self.channel
-            .scheduler_signal
-            .wait_for_change_timeout(observed_generation, timeout)
-    }
-
-    pub(crate) fn wake_scheduler(&self) {
-        self.channel.scheduler_signal.notify();
-    }
-
-    pub(crate) fn take_next_formal_task(
-        &self,
-    ) -> Result<Option<FormalTaskLease>, BusinessRuntimeError> {
-        self.request(RuntimeMessage::TakeNextFormalTask)
-    }
-
-    pub(crate) fn formal_task_contains_dedup_key(
-        &self,
-        key: FormalTaskDedupKey,
-    ) -> Result<bool, BusinessRuntimeError> {
-        self.request(|response| RuntimeMessage::FormalTaskContainsDedupKey { key, response })
-    }
-
-    pub(crate) fn restore_formal_task(
-        &self,
-        lease: FormalTaskLease,
-    ) -> Result<(), BusinessRuntimeError> {
-        self.request(|response| RuntimeMessage::RestoreFormalTask { lease, response })?;
-        self.wake_scheduler();
-        Ok(())
-    }
-
-    pub(crate) fn complete_formal_task(
-        &self,
-        task_id: u64,
-        completion: FormalTaskCompletion,
-    ) -> Result<(), BusinessRuntimeError> {
-        self.request(|response| RuntimeMessage::CompleteFormalTask {
-            task_id,
-            completion,
-            response,
-        })?;
-        self.wake_scheduler();
-        Ok(())
-    }
-
-    pub(crate) fn cancel_formal_task(
-        &self,
-        task_id: u64,
-    ) -> Result<FormalTaskCancelOutcome, BusinessRuntimeError> {
-        let action =
-            self.request(|response| RuntimeMessage::CancelFormalTask { task_id, response })?;
-        self.wake_scheduler();
-        Ok(match action {
-            FormalTaskCancelAction::CanceledBeforeStart(work) => {
-                work.cancel();
-                FormalTaskCancelOutcome::CanceledBeforeStart
-            }
-            FormalTaskCancelAction::CancellationRequested => {
-                FormalTaskCancelOutcome::CancellationRequested
-            }
-            FormalTaskCancelAction::AlreadyFinished => FormalTaskCancelOutcome::AlreadyFinished,
-            FormalTaskCancelAction::NotFound => FormalTaskCancelOutcome::NotFound,
-        })
-    }
-
-    pub(crate) fn begin_formal_task_shutdown(&self) -> Result<Option<u64>, BusinessRuntimeError> {
-        let plan = self.request(RuntimeMessage::BeginFormalTaskShutdown)?;
-        let active_task_id = plan.active_task_id();
-        plan.cancel_queued();
-        self.wake_scheduler();
-        Ok(active_task_id)
-    }
-
-    pub(crate) fn scheduler_snapshot(
-        &self,
-    ) -> Result<FormalSchedulerSnapshot, BusinessRuntimeError> {
-        self.request(RuntimeMessage::FormalSchedulerSnapshot)
-    }
-
-    fn release_scheduler_lane(
-        &self,
-        lease: SchedulerLaneLease,
-    ) -> Result<(), BusinessRuntimeError> {
-        self.request(|response| RuntimeMessage::ReleaseSchedulerLane { lease, response })?;
-        self.wake_scheduler();
-        Ok(())
-    }
-
-    pub(crate) fn enqueue_deferred_chat(
-        &self,
-        item: impl Into<DeferredChatItem>,
-    ) -> Result<EnqueueOutcome, BusinessRuntimeError> {
-        let item = item.into();
-        let outcome =
-            self.request(|response| RuntimeMessage::EnqueueDeferredChat { item, response })?;
-        self.wake_scheduler();
-        Ok(outcome)
-    }
-
-    pub(crate) fn requeue_deferred_chat_front(
-        &self,
-        item: DeferredChatItem,
-    ) -> Result<EnqueueOutcome, BusinessRuntimeError> {
-        let outcome =
-            self.request(|response| RuntimeMessage::RequeueDeferredChatFront { item, response })?;
-        self.wake_scheduler();
-        Ok(outcome)
-    }
-
-    pub(crate) fn requeue_deferred_chat_back(
-        &self,
-        item: DeferredChatItem,
-    ) -> Result<EnqueueOutcome, BusinessRuntimeError> {
-        let outcome =
-            self.request(|response| RuntimeMessage::RequeueDeferredChatBack { item, response })?;
-        self.wake_scheduler();
-        Ok(outcome)
-    }
-
-    pub(crate) fn take_next_deferred_chat(
-        &self,
-    ) -> Result<Option<(DeferredChatItem, SchedulerPermit)>, BusinessRuntimeError> {
-        let item = self.request(RuntimeMessage::TakeNextDeferredChat)?;
-        Ok(item.map(|(item, lease)| {
-            (
-                item,
-                SchedulerPermit {
-                    handle: self.clone(),
-                    lease: Some(lease),
-                },
-            )
-        }))
-    }
-
-    pub(crate) fn enqueue_diagnostic_task(
-        &self,
-        submission: DiagnosticTaskSubmission,
-    ) -> Result<DiagnosticTaskSnapshot, BusinessRuntimeError> {
-        let snapshot = self.request(|response| RuntimeMessage::EnqueueDiagnosticTask {
-            submission,
-            response,
-        })?;
-        self.wake_scheduler();
-        Ok(snapshot)
-    }
-
-    pub(crate) fn take_next_diagnostic_task(
-        &self,
-    ) -> Result<Option<DiagnosticTaskLease>, BusinessRuntimeError> {
-        self.request(RuntimeMessage::TakeNextDiagnosticTask)
-    }
-
-    pub(crate) fn complete_diagnostic_task(
-        &self,
-        task_id: u64,
-        completion: DiagnosticTaskCompletion,
-    ) -> Result<(), BusinessRuntimeError> {
-        self.request(|response| RuntimeMessage::CompleteDiagnosticTask {
-            task_id,
-            completion,
-            response,
-        })?;
-        self.wake_scheduler();
-        Ok(())
-    }
-
-    pub(crate) fn diagnostic_task_snapshot(
-        &self,
-        id: u64,
-    ) -> Result<Option<DiagnosticTaskSnapshot>, BusinessRuntimeError> {
-        self.request(|response| RuntimeMessage::DiagnosticTaskSnapshot { id, response })
     }
 
     pub(crate) fn operational_snapshot(
@@ -2172,6 +1818,8 @@ impl TurtleSoupAiCompletionPort for TurtleSoupBusinessEventPort {
 
 pub struct BusinessRuntime {
     handle: BusinessRuntimeHandle,
+    #[cfg(test)]
+    task_engine: TaskEngineHandle,
     worker: Option<JoinHandle<()>>,
     turtle_soup_workers: Option<TurtleSoupWorkerRuntime>,
 }
@@ -2184,6 +1832,7 @@ pub(crate) struct BusinessRuntimeWorker {
     hall: Option<HallStateService>,
     playback: Option<PlaybackService>,
     invite: InviteService,
+    task_engine: TaskEngineHandle,
     timer: Option<TimerRuntimeHandle<BusinessDeadlineToken>>,
     state_sink: Option<Arc<dyn BusinessStateSink>>,
     clock: Arc<dyn Clock>,
@@ -2199,6 +1848,7 @@ impl BusinessRuntimeWorker {
         hall: HallStateService,
         playback: PlaybackService,
         invite: InviteService,
+        task_engine: TaskEngineHandle,
         timer: TimerRuntimeHandle<BusinessDeadlineToken>,
         state_sink: Arc<dyn BusinessStateSink>,
         clock: Arc<dyn Clock>,
@@ -2211,6 +1861,7 @@ impl BusinessRuntimeWorker {
             hall: Some(hall),
             playback: Some(playback),
             invite,
+            task_engine,
             timer: Some(timer),
             state_sink: Some(state_sink),
             clock,
@@ -2256,6 +1907,7 @@ impl BusinessRuntime {
                 hall: None,
                 playback: None,
                 invite: InviteService::new(),
+                task_engine: TaskEngineHandle::new(None),
                 timer: None,
                 state_sink: None,
                 clock: Arc::new(SystemClock),
@@ -2282,6 +1934,7 @@ impl BusinessRuntime {
                 hall: Some(hall),
                 playback: Some(playback),
                 invite: InviteService::new(),
+                task_engine: TaskEngineHandle::new(None),
                 timer: None,
                 state_sink: None,
                 clock: Arc::new(SystemClock),
@@ -2304,10 +1957,11 @@ impl BusinessRuntime {
             return Err(BusinessRuntimeError::ZeroQueueCapacity);
         }
         let (sender, receiver) = mpsc::sync_channel(queue_capacity);
+        #[cfg(test)]
+        let task_engine = worker_config.task_engine.clone();
         let channel = Arc::new(RuntimeChannel {
             sender,
             state: Mutex::new(RuntimeChannelState::Running),
-            scheduler_signal: SchedulerSignal::new(),
         });
         let event_sink = BusinessRuntimeEventSink {
             channel: channel.clone(),
@@ -2329,6 +1983,8 @@ impl BusinessRuntime {
             })?;
         Ok(Self {
             handle: BusinessRuntimeHandle { channel },
+            #[cfg(test)]
+            task_engine,
             worker: Some(worker),
             turtle_soup_workers,
         })
@@ -2344,8 +2000,12 @@ impl BusinessRuntime {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn task_engine(&self) -> TaskEngineHandle {
+        self.task_engine.clone()
+    }
+
     pub fn prepare_shutdown(&self) -> Result<BusinessRuntimeSnapshot, BusinessRuntimeError> {
-        self.prepare_formal_tasks_for_shutdown()?;
         let (response, receiver) = mpsc::sync_channel(1);
         {
             let mut state = self
@@ -2384,7 +2044,6 @@ impl BusinessRuntime {
     }
 
     fn stop_worker(&mut self) -> Result<BusinessRuntimeSnapshot, BusinessRuntimeError> {
-        self.prepare_formal_tasks_for_shutdown()?;
         let Some(worker) = self.worker.take() else {
             if let Some(mut workers) = self.turtle_soup_workers.take() {
                 workers.shutdown();
@@ -2416,20 +2075,6 @@ impl BusinessRuntime {
         self.stop_external_workers();
         worker_result?;
         snapshot.ok_or(BusinessRuntimeError::RuntimeStopped)
-    }
-
-    fn prepare_formal_tasks_for_shutdown(&self) -> Result<(), BusinessRuntimeError> {
-        let running = *self
-            .handle
-            .channel
-            .state
-            .lock()
-            .map_err(|_| BusinessRuntimeError::RuntimeStopped)?
-            == RuntimeChannelState::Running;
-        if running {
-            let _ = self.handle.begin_formal_task_shutdown()?;
-        }
-        Ok(())
     }
 }
 
@@ -2863,7 +2508,7 @@ fn handle_business_timer(
     card_games: &mut CardGameService,
     undercover: &mut UndercoverRuntimeService,
     mut turtle_soup: Option<&mut TurtleSoupService>,
-    deferred_chat: &mut DeferredChatQueue,
+    task_engine: &mut TaskEngineHandle,
     timer: Option<&TimerRuntimeHandle<BusinessDeadlineToken>>,
     active_idiom_deadline: &mut Option<ActiveIdiomDeadline>,
     active_card_game_deadline: &mut Option<ActiveCardGameDeadline>,
@@ -2898,7 +2543,7 @@ fn handle_business_timer(
                         entertainment,
                         *expired.token().kind(),
                         clock.now(),
-                        deferred_chat,
+                        task_engine,
                     );
                 }
                 return sync_turtle_soup_deadline(
@@ -3220,14 +2865,13 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
         mut hall,
         mut playback,
         mut invite,
+        mut task_engine,
         timer,
         state_sink,
         clock,
     } = worker_config;
     let mut snapshot = BusinessRuntimeSnapshot::default();
     let mut entertainment = EntertainmentState::new();
-    let mut formal_scheduler = FormalScheduler::new();
-    let mut deferred_chat = DeferredChatQueue::new(DEFERRED_CHAT_CAPACITY);
     let mut chat_listener = ChatListenerState::new();
     let mut decision = DecisionState::new();
     let mut operational = OperationalState::new();
@@ -3252,164 +2896,11 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
     );
     publish_playback_queue(&state_sink, playback.as_ref());
     publish_hall_state(&state_sink, hall.as_ref());
-    publish_scheduler_state(&state_sink, &formal_scheduler);
-    publish_diagnostic_state(&state_sink, &formal_scheduler);
     publish_chat_listener_state(&state_sink, &chat_listener);
     publish_decision_state(&state_sink, &mut decision);
     publish_operational_state(&state_sink, &operational, clock.now());
     while let Ok(message) = receiver.recv() {
         match message {
-            RuntimeMessage::EnqueueFormalTask {
-                submission,
-                response,
-            } => {
-                let outcome = formal_scheduler.enqueue(submission).map_err(|error| {
-                    BusinessRuntimeError::SchedulerOperationFailed(error.to_string())
-                });
-                if outcome.is_ok() {
-                    publish_scheduler_state(&state_sink, &formal_scheduler);
-                }
-                let _ = response.send(outcome);
-            }
-            RuntimeMessage::FormalSchedulerSnapshot(response) => {
-                let _ = response.send(Ok(formal_scheduler.snapshot()));
-            }
-            RuntimeMessage::FormalTaskContainsDedupKey { key, response } => {
-                let _ = response.send(Ok(formal_scheduler.contains_dedup_key(&key)));
-            }
-            RuntimeMessage::TakeNextFormalTask(response) => {
-                let task = formal_scheduler.take_next();
-                if task.is_some() {
-                    publish_scheduler_state(&state_sink, &formal_scheduler);
-                }
-                let _ = response.send(Ok(task));
-            }
-            RuntimeMessage::RestoreFormalTask { lease, response } => {
-                let result = formal_scheduler.restore(lease).map_err(|error| {
-                    BusinessRuntimeError::SchedulerOperationFailed(error.to_string())
-                });
-                if result.is_ok() {
-                    publish_scheduler_state(&state_sink, &formal_scheduler);
-                }
-                let _ = response.send(result);
-            }
-            RuntimeMessage::CompleteFormalTask {
-                task_id,
-                completion,
-                response,
-            } => {
-                let result = formal_scheduler
-                    .complete(task_id, completion)
-                    .map_err(|error| {
-                        BusinessRuntimeError::SchedulerOperationFailed(error.to_string())
-                    });
-                if result.is_ok() {
-                    publish_scheduler_state(&state_sink, &formal_scheduler);
-                }
-                let _ = response.send(result);
-            }
-            RuntimeMessage::CancelFormalTask { task_id, response } => {
-                let action = formal_scheduler.cancel(task_id);
-                if !matches!(action, FormalTaskCancelAction::NotFound) {
-                    publish_scheduler_state(&state_sink, &formal_scheduler);
-                }
-                let _ = response.send(Ok(action));
-            }
-            RuntimeMessage::BeginFormalTaskShutdown(response) => {
-                let plan = formal_scheduler.begin_shutdown();
-                publish_scheduler_state(&state_sink, &formal_scheduler);
-                publish_diagnostic_state(&state_sink, &formal_scheduler);
-                let _ = response.send(Ok(plan));
-            }
-            RuntimeMessage::ReleaseSchedulerLane { lease, response } => {
-                let result = formal_scheduler.release_lane(lease).map_err(|error| {
-                    BusinessRuntimeError::SchedulerOperationFailed(error.to_string())
-                });
-                if result.is_ok() {
-                    publish_scheduler_state(&state_sink, &formal_scheduler);
-                }
-                let _ = response.send(result);
-            }
-            RuntimeMessage::EnqueueDeferredChat { item, response } => {
-                let result = deferred_chat.enqueue(item).map_err(|error| {
-                    BusinessRuntimeError::SchedulerOperationFailed(error.to_string())
-                });
-                let _ = response.send(result);
-            }
-            RuntimeMessage::RequeueDeferredChatFront { item, response } => {
-                let _ = response.send(Ok(deferred_chat.requeue_front(item)));
-            }
-            RuntimeMessage::RequeueDeferredChatBack { item, response } => {
-                let _ = response.send(Ok(deferred_chat.requeue_back(item)));
-            }
-            RuntimeMessage::TakeNextDeferredChat(response) => {
-                let result = if deferred_chat.is_empty() {
-                    Ok(None)
-                } else {
-                    formal_scheduler
-                        .try_acquire_lane(SchedulerLane::Deferred)
-                        .map_err(|error| {
-                            BusinessRuntimeError::SchedulerOperationFailed(error.to_string())
-                        })
-                        .map(|lease| {
-                            lease.map(|lease| {
-                                let item = deferred_chat
-                                    .take_next()
-                                    .expect("deferred queue was checked as non-empty");
-                                (item, lease)
-                            })
-                        })
-                };
-                if result.as_ref().is_ok_and(Option::is_some) {
-                    publish_scheduler_state(&state_sink, &formal_scheduler);
-                }
-                let _ = response.send(result);
-            }
-            RuntimeMessage::EnqueueDiagnosticTask {
-                submission,
-                response,
-            } => {
-                let result = formal_scheduler
-                    .enqueue_diagnostic(submission)
-                    .map_err(|error| {
-                        BusinessRuntimeError::SchedulerOperationFailed(error.to_string())
-                    });
-                if result.is_ok() {
-                    publish_diagnostic_state(&state_sink, &formal_scheduler);
-                }
-                let _ = response.send(result);
-            }
-            RuntimeMessage::TakeNextDiagnosticTask(response) => {
-                let task = if deferred_chat.is_empty() {
-                    formal_scheduler.take_next_diagnostic()
-                } else {
-                    None
-                };
-                if task.is_some() {
-                    publish_scheduler_state(&state_sink, &formal_scheduler);
-                    publish_diagnostic_state(&state_sink, &formal_scheduler);
-                }
-                let _ = response.send(Ok(task));
-            }
-            RuntimeMessage::CompleteDiagnosticTask {
-                task_id,
-                completion,
-                response,
-            } => {
-                let result = formal_scheduler
-                    .complete_diagnostic(task_id, completion)
-                    .map_err(|error| {
-                        BusinessRuntimeError::SchedulerOperationFailed(error.to_string())
-                    });
-                if result.is_ok() {
-                    publish_scheduler_state(&state_sink, &formal_scheduler);
-                    publish_diagnostic_state(&state_sink, &formal_scheduler);
-                }
-                let _ = response.send(result);
-            }
-            RuntimeMessage::DiagnosticTaskSnapshot { id, response } => {
-                let _ = response.send(Ok(formal_scheduler.diagnostic_task_snapshot(id)));
-            }
             RuntimeMessage::OperationalSnapshot { now, response } => {
                 let _ = response.send(Ok(operational.snapshot(now)));
             }
@@ -3433,12 +2924,14 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
                 let _ = response.send(Ok(()));
             }
             RuntimeMessage::ClaimIdleExit { now, response } => {
-                let claimed = operational.claim_idle_exit(
-                    now,
-                    formal_scheduler.snapshot().is_idle() && deferred_chat.is_empty(),
-                );
+                let claimed = task_engine
+                    .is_idle()
+                    .map(|scheduler_idle| operational.claim_idle_exit(now, scheduler_idle))
+                    .map_err(|error| {
+                        BusinessRuntimeError::TaskEngineOperationFailed(error.to_string())
+                    });
                 publish_operational_state(&state_sink, &operational, now);
-                let _ = response.send(Ok(claimed));
+                let _ = response.send(claimed);
             }
             RuntimeMessage::ClearIdleExit(response) => {
                 operational.idle_exit = None;
@@ -3461,7 +2954,7 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
                         &mut card_games,
                         &mut undercover,
                         turtle_soup.as_mut(),
-                        &mut deferred_chat,
+                        &mut task_engine,
                         timer.as_ref(),
                         &mut active_idiom_deadline,
                         &mut active_card_game_deadline,
@@ -3485,7 +2978,7 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
                         service.apply_ai_completion(
                             &mut entertainment,
                             completion,
-                            &mut deferred_chat,
+                            &mut task_engine,
                         );
                         if let Err(error) = sync_turtle_soup_deadline(
                             Some(&*service),
@@ -3618,7 +3111,7 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
                     TurtleSoupHandlerContext {
                         turtle_soup: turtle_soup.as_mut(),
                         entertainment: &mut entertainment,
-                        deferred_chat: &mut deferred_chat,
+                        task_engine: &mut task_engine,
                         timer: timer.as_ref(),
                         active_deadline: &mut active_turtle_soup_deadline,
                         pending_cancellations: &mut pending_turtle_soup_cancellations,
@@ -4181,7 +3674,7 @@ fn handle_card_game_message(
 struct TurtleSoupHandlerContext<'a> {
     turtle_soup: Option<&'a mut TurtleSoupService>,
     entertainment: &'a mut EntertainmentState,
-    deferred_chat: &'a mut DeferredChatQueue,
+    task_engine: &'a mut TaskEngineHandle,
     timer: Option<&'a TimerRuntimeHandle<BusinessDeadlineToken>>,
     active_deadline: &'a mut Option<ActiveTurtleSoupDeadline>,
     pending_cancellations: &'a mut Vec<ActiveTurtleSoupDeadline>,
@@ -4197,7 +3690,7 @@ fn handle_turtle_soup_message(
     let TurtleSoupHandlerContext {
         turtle_soup,
         entertainment,
-        deferred_chat,
+        task_engine,
         timer,
         active_deadline,
         pending_cancellations,
@@ -4254,7 +3747,7 @@ fn handle_turtle_soup_message(
             response,
         } => {
             let outcome =
-                service.handle_hall_command(entertainment, &player, &command, deferred_chat);
+                service.handle_hall_command(entertainment, &player, &command, task_engine);
             if let Err(error) = sync_turtle_soup_deadline(
                 Some(&*service),
                 timer,
@@ -4274,7 +3767,7 @@ fn handle_turtle_soup_message(
             response,
         } => {
             let outcome =
-                service.handle_friend_command(entertainment, &player, &command, deferred_chat);
+                service.handle_friend_command(entertainment, &player, &command, task_engine);
             if let Err(error) = sync_turtle_soup_deadline(
                 Some(&*service),
                 timer,
@@ -4290,7 +3783,7 @@ fn handle_turtle_soup_message(
         }
         TurtleSoupRuntimeMessage::StartRandom { response } => {
             let result = service
-                .start_random_from_web(entertainment, deferred_chat)
+                .start_random_from_web(entertainment, task_engine)
                 .map_err(turtle_soup_operation_failed)
                 .and_then(|()| {
                     sync_turtle_soup_deadline(
@@ -4307,7 +3800,7 @@ fn handle_turtle_soup_message(
         }
         TurtleSoupRuntimeMessage::StartById { id, response } => {
             let result = service
-                .start_by_id_from_web(entertainment, &id, deferred_chat)
+                .start_by_id_from_web(entertainment, &id, task_engine)
                 .map_err(turtle_soup_operation_failed)
                 .and_then(|()| {
                     sync_turtle_soup_deadline(
@@ -4324,7 +3817,7 @@ fn handle_turtle_soup_message(
         }
         TurtleSoupRuntimeMessage::End { response } => {
             let result = service
-                .end_from_web(entertainment, deferred_chat)
+                .end_from_web(entertainment, task_engine)
                 .map_err(turtle_soup_operation_failed)
                 .and_then(|ended| {
                     sync_turtle_soup_deadline(
@@ -4609,24 +4102,6 @@ fn publish_hall_state(
     }
 }
 
-fn publish_scheduler_state(
-    state_sink: &Option<Arc<dyn BusinessStateSink>>,
-    scheduler: &FormalScheduler,
-) {
-    if let Some(state_sink) = state_sink {
-        state_sink.publish_scheduler(scheduler.snapshot());
-    }
-}
-
-fn publish_diagnostic_state(
-    state_sink: &Option<Arc<dyn BusinessStateSink>>,
-    scheduler: &FormalScheduler,
-) {
-    if let Some(state_sink) = state_sink {
-        state_sink.publish_diagnostics(scheduler.diagnostic_snapshot());
-    }
-}
-
 fn publish_operational_state(
     state_sink: &Option<Arc<dyn BusinessStateSink>>,
     operational: &OperationalState,
@@ -4798,8 +4273,9 @@ mod tests {
     use crate::runtime::identity::{BusinessOperationId, SessionGeneration};
     use crate::runtime::scheduler::{
         DiagnosticTaskCompletion, DiagnosticTaskSubmission, DiagnosticTaskWork,
-        FormalTaskCancellationToken, FormalTaskDedupKey, FormalTaskExecutionOutcome,
-        FormalTaskReceipt, FormalTaskWork,
+        FormalTaskCancelOutcome, FormalTaskCancellationToken, FormalTaskCompletion,
+        FormalTaskDedupKey, FormalTaskEnqueueOutcome, FormalTaskExecutionOutcome, FormalTaskLease,
+        FormalTaskReceipt, FormalTaskSubmission, FormalTaskWork,
     };
     use crate::runtime::timer::{DeadlineSchedule, TimerCore, TimerRuntime, TimerRuntimeEvent};
 
@@ -4903,16 +4379,16 @@ mod tests {
     #[test]
     fn formal_scheduler_enqueues_in_order_and_rejects_queued_duplicate() {
         let runtime = runtime(8);
-        let handle = runtime.handle();
+        let handle = runtime.task_engine();
 
         let first = handle
-            .enqueue_formal_task(formal_submission("first", Some("same")))
+            .enqueue_formal(formal_submission("first", Some("same")))
             .unwrap();
         let second = handle
-            .enqueue_formal_task(formal_submission("second", Some("other")))
+            .enqueue_formal(formal_submission("second", Some("other")))
             .unwrap();
         let duplicate = handle
-            .enqueue_formal_task(formal_submission("duplicate", Some("same")))
+            .enqueue_formal(formal_submission("duplicate", Some("same")))
             .unwrap();
 
         assert!(matches!(
@@ -4931,7 +4407,7 @@ mod tests {
         ));
         assert_eq!(duplicate, FormalTaskEnqueueOutcome::Duplicate);
         assert_eq!(
-            handle.scheduler_snapshot().unwrap().pending_labels(),
+            handle.snapshot().unwrap().pending_labels(),
             &["first".to_string(), "second".to_string()]
         );
 
@@ -4941,13 +4417,13 @@ mod tests {
     #[test]
     fn formal_scheduler_restores_original_turn_and_cancels_only_queued_work() {
         let runtime = runtime(8);
-        let handle = runtime.handle();
+        let handle = runtime.task_engine();
         let canceled = Arc::new(AtomicBool::new(false));
         let first = handle
-            .enqueue_formal_task(formal_submission("first", Some("first")))
+            .enqueue_formal(formal_submission("first", Some("first")))
             .unwrap();
         let second = handle
-            .enqueue_formal_task(FormalTaskSubmission::new(
+            .enqueue_formal(FormalTaskSubmission::new(
                 "second",
                 Some(FormalTaskDedupKey::new("second")),
                 false,
@@ -4962,32 +4438,32 @@ mod tests {
         };
 
         let active = handle
-            .take_next_formal_task()
+            .take_next_formal()
             .unwrap()
             .expect("first task should start");
         assert_eq!(active.task_id(), first.task_id);
-        handle.restore_formal_task(active).unwrap();
+        handle.restore_formal(active).unwrap();
         assert_eq!(
-            handle.scheduler_snapshot().unwrap().pending_labels(),
+            handle.snapshot().unwrap().pending_labels(),
             &["first".to_string(), "second".to_string()]
         );
 
         let active = handle
-            .take_next_formal_task()
+            .take_next_formal()
             .unwrap()
             .expect("restored task should start first");
         let task_id = active.task_id();
         let result = execute_formal(active);
         handle
-            .complete_formal_task(task_id, FormalTaskCompletion::Succeeded(result))
+            .complete_formal(task_id, FormalTaskCompletion::Succeeded(result))
             .unwrap();
         assert_eq!(
-            handle.cancel_formal_task(second.task_id).unwrap(),
+            handle.cancel_formal(second.task_id).unwrap(),
             FormalTaskCancelOutcome::CanceledBeforeStart
         );
         assert!(canceled.load(Ordering::SeqCst));
 
-        let snapshot = handle.scheduler_snapshot().unwrap();
+        let snapshot = handle.snapshot().unwrap();
         assert!(snapshot.pending_labels().is_empty());
         assert_eq!(snapshot.tasks()[0].id, second.task_id);
         assert_eq!(snapshot.tasks()[0].status, "canceled");
@@ -5000,23 +4476,23 @@ mod tests {
     #[test]
     fn running_formal_task_accepts_a_cancellation_request_without_claiming_it_stopped() {
         let runtime = runtime(8);
-        let handle = runtime.handle();
+        let handle = runtime.task_engine();
         let queued = handle
-            .enqueue_formal_task(formal_submission("running", Some("running")))
+            .enqueue_formal(formal_submission("running", Some("running")))
             .unwrap();
         let FormalTaskEnqueueOutcome::Queued(receipt) = queued else {
             panic!("formal task should be queued");
         };
         let active = handle
-            .take_next_formal_task()
+            .take_next_formal()
             .unwrap()
             .expect("formal task should start");
 
         assert_eq!(
-            handle.cancel_formal_task(receipt.task_id).unwrap(),
+            handle.cancel_formal(receipt.task_id).unwrap(),
             FormalTaskCancelOutcome::CancellationRequested
         );
-        let snapshot = handle.scheduler_snapshot().unwrap();
+        let snapshot = handle.snapshot().unwrap();
         let task = snapshot
             .tasks()
             .iter()
@@ -5033,7 +4509,7 @@ mod tests {
             }
         };
         handle
-            .complete_formal_task(task_id, FormalTaskCompletion::Canceled(reason))
+            .complete_formal(task_id, FormalTaskCompletion::Canceled(reason))
             .unwrap();
         runtime.shutdown().unwrap();
     }
@@ -5041,24 +4517,24 @@ mod tests {
     #[test]
     fn finished_formal_task_reports_that_its_result_is_already_final() {
         let runtime = runtime(8);
-        let handle = runtime.handle();
+        let handle = runtime.task_engine();
         let queued = handle
-            .enqueue_formal_task(formal_submission("finished", Some("finished")))
+            .enqueue_formal(formal_submission("finished", Some("finished")))
             .unwrap();
         let FormalTaskEnqueueOutcome::Queued(receipt) = queued else {
             panic!("formal task should be queued");
         };
         let active = handle
-            .take_next_formal_task()
+            .take_next_formal()
             .unwrap()
             .expect("formal task should start");
         let result = execute_formal(active);
         handle
-            .complete_formal_task(receipt.task_id, FormalTaskCompletion::Succeeded(result))
+            .complete_formal(receipt.task_id, FormalTaskCompletion::Succeeded(result))
             .unwrap();
 
         assert_eq!(
-            handle.cancel_formal_task(receipt.task_id).unwrap(),
+            handle.cancel_formal(receipt.task_id).unwrap(),
             FormalTaskCancelOutcome::AlreadyFinished
         );
 
@@ -5068,10 +4544,10 @@ mod tests {
     #[test]
     fn unknown_formal_task_id_is_reported_as_not_found() {
         let runtime = runtime(8);
-        let handle = runtime.handle();
+        let handle = runtime.task_engine();
 
         assert_eq!(
-            handle.cancel_formal_task(99_999).unwrap(),
+            handle.cancel_formal(99_999).unwrap(),
             FormalTaskCancelOutcome::NotFound
         );
 
@@ -5082,6 +4558,7 @@ mod tests {
     fn business_runtime_owns_command_availability_and_idle_exit_claiming() {
         let runtime = runtime(8);
         let handle = runtime.handle();
+        let task_engine = runtime.task_engine();
         let started_at = Instant::now();
 
         assert!(
@@ -5115,8 +4592,8 @@ mod tests {
             Some(110)
         );
 
-        let queued = handle
-            .enqueue_formal_task(formal_submission("busy", Some("busy")))
+        let queued = task_engine
+            .enqueue_formal(formal_submission("busy", Some("busy")))
             .unwrap();
         assert_eq!(
             handle
@@ -5128,7 +4605,7 @@ mod tests {
             panic!("formal task should be queued");
         };
         assert_eq!(
-            handle.cancel_formal_task(receipt.task_id).unwrap(),
+            task_engine.cancel_formal(receipt.task_id).unwrap(),
             FormalTaskCancelOutcome::CanceledBeforeStart
         );
         assert_eq!(
@@ -5151,31 +4628,31 @@ mod tests {
     #[test]
     fn diagnostic_tasks_wait_behind_formal_tasks_and_keep_owned_history() {
         let runtime = runtime(8);
-        let handle = runtime.handle();
+        let handle = runtime.task_engine();
         let diagnostic = handle
-            .enqueue_diagnostic_task(DiagnosticTaskSubmission::new(
+            .enqueue_diagnostic(DiagnosticTaskSubmission::new(
                 "OCR 诊断",
                 Box::new(TestDiagnosticWork),
             ))
             .unwrap();
         handle
-            .enqueue_formal_task(formal_submission("formal", Some("formal")))
+            .enqueue_formal(formal_submission("formal", Some("formal")))
             .unwrap();
 
-        assert!(handle.take_next_diagnostic_task().unwrap().is_none());
-        let formal = handle.take_next_formal_task().unwrap().unwrap();
+        assert!(handle.take_next_diagnostic().unwrap().is_none());
+        let formal = handle.take_next_formal().unwrap().unwrap();
         let formal_id = formal.task_id();
         let formal_result = execute_formal(formal);
         handle
-            .complete_formal_task(formal_id, FormalTaskCompletion::Succeeded(formal_result))
+            .complete_formal(formal_id, FormalTaskCompletion::Succeeded(formal_result))
             .unwrap();
 
-        let task = handle.take_next_diagnostic_task().unwrap().unwrap();
+        let task = handle.take_next_diagnostic().unwrap().unwrap();
         assert_eq!(task.task_id(), diagnostic.id);
         let task_id = task.task_id();
         let result = task.execute().unwrap();
         handle
-            .complete_diagnostic_task(task_id, DiagnosticTaskCompletion::Succeeded(result))
+            .complete_diagnostic(task_id, DiagnosticTaskCompletion::Succeeded(result))
             .unwrap();
 
         let snapshot = handle
@@ -5192,15 +4669,15 @@ mod tests {
     #[test]
     fn deferred_chat_waits_behind_formal_work_and_ahead_of_diagnostics() {
         let runtime = runtime(8);
-        let handle = runtime.handle();
+        let handle = runtime.task_engine();
         handle
-            .enqueue_diagnostic_task(DiagnosticTaskSubmission::new(
+            .enqueue_diagnostic(DiagnosticTaskSubmission::new(
                 "diagnostic",
                 Box::new(TestDiagnosticWork),
             ))
             .unwrap();
         handle
-            .enqueue_deferred_chat(DeferredChatMessage {
+            .enqueue_deferred(DeferredChatMessage {
                 text: "deferred".to_string(),
                 target: DeferredChatTarget::Primary,
                 background_key: None,
@@ -5208,31 +4685,28 @@ mod tests {
             })
             .unwrap();
         handle
-            .enqueue_formal_task(formal_submission("formal", Some("formal-priority")))
+            .enqueue_formal(formal_submission("formal", Some("formal-priority")))
             .unwrap();
 
-        assert!(handle.take_next_deferred_chat().unwrap().is_none());
-        assert!(handle.take_next_diagnostic_task().unwrap().is_none());
-        let formal = handle.take_next_formal_task().unwrap().unwrap();
+        assert!(handle.take_next_deferred().unwrap().is_none());
+        assert!(handle.take_next_diagnostic().unwrap().is_none());
+        let formal = handle.take_next_formal().unwrap().unwrap();
         let formal_id = formal.task_id();
         handle
-            .complete_formal_task(
+            .complete_formal(
                 formal_id,
                 FormalTaskCompletion::Succeeded(execute_formal(formal)),
             )
             .unwrap();
 
-        assert!(handle.take_next_diagnostic_task().unwrap().is_none());
-        let (item, permit) = handle
-            .take_next_deferred_chat()
-            .unwrap()
-            .expect("deferred work");
+        assert!(handle.take_next_diagnostic().unwrap().is_none());
+        let (item, permit) = handle.take_next_deferred().unwrap().expect("deferred work");
         assert!(matches!(
             item,
             crate::runtime::deferred_chat::DeferredChatItem::Message(_)
         ));
         drop(permit);
-        assert!(handle.take_next_diagnostic_task().unwrap().is_some());
+        assert!(handle.take_next_diagnostic().unwrap().is_some());
 
         runtime.shutdown().unwrap();
     }
@@ -5526,12 +5000,12 @@ mod tests {
     }
 
     #[test]
-    fn prepare_shutdown_cleans_each_queued_formal_task_exactly_once() {
+    fn task_engine_shutdown_cleans_each_queued_formal_task_exactly_once() {
         let runtime = runtime(8);
-        let handle = runtime.handle();
+        let task_engine = runtime.task_engine();
         let cancellations = Arc::new(AtomicUsize::new(0));
-        handle
-            .enqueue_formal_task(FormalTaskSubmission::new(
+        task_engine
+            .enqueue_formal(FormalTaskSubmission::new(
                 "queued during shutdown",
                 None,
                 false,
@@ -5539,9 +5013,10 @@ mod tests {
             ))
             .unwrap();
 
-        runtime.prepare_shutdown().unwrap();
+        task_engine.begin_shutdown().unwrap();
 
         assert_eq!(cancellations.load(Ordering::SeqCst), 1);
+        task_engine.begin_shutdown().unwrap();
         runtime.shutdown().unwrap();
         assert_eq!(cancellations.load(Ordering::SeqCst), 1);
     }
@@ -5952,7 +5427,7 @@ mod tests {
         let mut pending_undercover_cancellations = Vec::new();
         let mut pending_card_outcomes = std::collections::VecDeque::new();
         let mut pending_undercover_outcomes = std::collections::VecDeque::new();
-        let mut deferred_chat = DeferredChatQueue::new(DEFERRED_CHAT_CAPACITY);
+        let mut task_engine = TaskEngineHandle::new(None);
 
         handle_business_timer(
             event,
@@ -5961,7 +5436,7 @@ mod tests {
             &mut card_games,
             &mut undercover,
             None,
-            &mut deferred_chat,
+            &mut task_engine,
             None,
             &mut active,
             &mut card_active,

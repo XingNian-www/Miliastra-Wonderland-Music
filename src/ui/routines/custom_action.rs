@@ -535,7 +535,9 @@ fn wait_text(
             .map_err(|error| observation_failure(input_performed, "crop_custom_text", error))?;
         let lines = ocr
             .recognize_lines(crop, OcrPriority::UiConfirmation)
-            .map_err(|error| observation_failure(input_performed, "ocr_custom_text", error))?;
+            .map_err(|error| {
+                observation_failure(input_performed, "ocr_custom_text", error.into())
+            })?;
         let mut fallback = None;
         for line in lines {
             let normalized = normalize_lock_text(&line.text);

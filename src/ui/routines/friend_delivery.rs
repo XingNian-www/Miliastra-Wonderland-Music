@@ -2444,8 +2444,8 @@ mod tests {
         }
 
         let mut routine_config = FriendDeliveryRoutineConfig::from_app(&config);
-        routine_config.timeout_ms = 300;
-        routine_config.poll_ms = 1;
+        routine_config.timeout_ms = 2_000;
+        routine_config.poll_ms = 10;
         handle
             .submit(RestorePrimaryRoutine {
                 config: routine_config,

@@ -11,6 +11,7 @@ use crate::features::chat_text::{
 use crate::features::command::{
     CommandAuthority, CommandEnvelope, CommandPrefix, FeatureCommandMatch,
 };
+#[cfg(test)]
 use crate::text::normalize_comparison_text;
 
 pub(crate) use ai::{AiCandidatePickResult, AiClient, AiConfig};
@@ -172,6 +173,7 @@ impl SongCommand {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn same_request(&self, other: &Self) -> bool {
         command_identity(&self.friend_username) == command_identity(&other.friend_username)
             && self.source == other.source
@@ -188,6 +190,7 @@ fn joined_command(matched: &str, argument: &str) -> String {
     }
 }
 
+#[cfg(test)]
 fn same_lock_keyword(left: &str, right: &str) -> bool {
     let left = normalize_comparison_text(left);
     let right = normalize_comparison_text(right);
@@ -210,6 +213,7 @@ fn same_lock_keyword(left: &str, right: &str) -> bool {
     levenshtein_distance(&left_prefix, &right_prefix) <= 1.max(prefix_length / 4)
 }
 
+#[cfg(test)]
 fn levenshtein_distance(left: &str, right: &str) -> usize {
     let right_chars = right.chars().collect::<Vec<_>>();
     let mut costs = (0..=right_chars.len()).collect::<Vec<_>>();

@@ -8,7 +8,6 @@ use serde::Serialize;
 use crate::config::{OcrConfig, RectConfig, TemplateConfig};
 use crate::privacy::redacted_chat_text;
 use crate::runtime::ocr::{OcrImageBlock, OcrPriority, OcrRuntimeHandle, batch_recognize_blocks};
-use crate::ui::change_detection::{ChangeFingerprint, rect_chat_change_fingerprint};
 use crate::ui::geometry::{Rect, clamp_i32, crop_canvas};
 use crate::ui::template::{TemplateHit, dedupe_hits, find_color_template_hits};
 
@@ -80,8 +79,6 @@ pub(crate) struct ChatMessage {
     pub(crate) message_type: String,
     pub(crate) block: Rect,
     pub(crate) text: String,
-    #[serde(skip)]
-    pub(crate) visual: ChangeFingerprint,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -179,7 +176,6 @@ pub(crate) fn recognize_prepared_chat(
                 message_type: marker_type(marker).to_string(),
                 block: *block,
                 text: text.text,
-                visual: rect_chat_change_fingerprint(&prepared.chat, *block)?,
             });
         }
     } else {
@@ -190,7 +186,6 @@ pub(crate) fn recognize_prepared_chat(
                 message_type: marker_type(marker).to_string(),
                 block: *block,
                 text,
-                visual: rect_chat_change_fingerprint(&prepared.chat, *block)?,
             });
         }
     }

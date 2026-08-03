@@ -198,6 +198,7 @@ impl LandlordCommand {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn same_request(&self, other: &Self) -> bool {
         self.lock_key() == other.lock_key()
     }

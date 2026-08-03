@@ -1328,18 +1328,34 @@ fn task_cancel_route(
         .ok()
         .filter(|id| *id > 0)
         .ok_or_else(|| bad_request("无效的任务ID"))?;
-    if state
+    let outcome = state
         .formal_tasks
         .cancel_task(task_id)
-        .map_err(internal_error)?
-        == FormalTaskCancelOutcome::NotQueued
-    {
-        return Err(AppError {
+        .map_err(internal_error)?;
+    match outcome {
+        FormalTaskCancelOutcome::CanceledBeforeStart => Ok(json!({
+            "ok": true,
+            "taskId": task_id,
+            "canceled": true,
+            "cancellationRequested": false,
+        })
+        .to_string()),
+        FormalTaskCancelOutcome::CancellationRequested => Ok(json!({
+            "ok": true,
+            "taskId": task_id,
+            "canceled": false,
+            "cancellationRequested": true,
+        })
+        .to_string()),
+        FormalTaskCancelOutcome::AlreadyFinished => Err(AppError {
             status: 409,
-            message: "任务已开始、已结束或不存在，不能撤销".to_string(),
-        });
+            message: "任务已经结束，最终结果不会再改变".to_string(),
+        }),
+        FormalTaskCancelOutcome::NotFound => Err(AppError {
+            status: 404,
+            message: "没有找到该任务".to_string(),
+        }),
     }
-    Ok(json!({ "ok": true, "taskId": task_id, "canceled": true }).to_string())
 }
 
 fn decision_submit_route(
@@ -3066,6 +3082,7 @@ mod tests {
         id: u64,
         kind: RecordedFormalTaskKind,
         queued: bool,
+        running: bool,
     }
 
     #[allow(dead_code)]
@@ -3169,6 +3186,7 @@ mod tests {
                 id,
                 kind,
                 queued: true,
+                running: false,
             });
             Ok(FormalTaskEnqueueOutcome::Queued(FormalTaskReceipt {
                 task_id: id,
@@ -3216,6 +3234,7 @@ mod tests {
                 .find(|task| task.id == id)
                 .expect("recorded task");
             task.queued = false;
+            task.running = true;
         }
 
         fn hall_screenshot_requests(&self) -> usize {
@@ -3444,12 +3463,18 @@ mod tests {
             let Some(task) = state
                 .formal_tasks
                 .iter_mut()
-                .find(|task| task.id == task_id && task.queued)
+                .find(|task| task.id == task_id)
             else {
-                return Ok(FormalTaskCancelOutcome::NotQueued);
+                return Ok(FormalTaskCancelOutcome::NotFound);
             };
+            if task.running {
+                return Ok(FormalTaskCancelOutcome::CancellationRequested);
+            }
+            if !task.queued {
+                return Ok(FormalTaskCancelOutcome::AlreadyFinished);
+            }
             task.queued = false;
-            Ok(FormalTaskCancelOutcome::Canceled)
+            Ok(FormalTaskCancelOutcome::CanceledBeforeStart)
         }
 
         fn submit_decision(&self, id: u64, action: DecisionAction) -> Result<()> {
@@ -4405,10 +4430,13 @@ workflows:
     }
 
     #[test]
-    fn refresh_button_runs_full_uncached_refresh() {
-        assert!(PAGE.contains("onclick=\"refreshAll()\""));
+    fn refresh_toggle_runs_full_uncached_refresh_when_resumed() {
+        assert!(PAGE.contains("id=\"refreshToggle\""));
+        assert!(PAGE.contains("onclick=\"toggleRefresh()\""));
+        assert!(PAGE.contains("function toggleRefresh()"));
+        assert!(PAGE.contains("if(!refreshPaused)refreshAll()"));
         assert!(PAGE.contains("async function refreshAll()"));
-        assert!(PAGE.contains("refreshPlayer()"));
+        assert!(PAGE.contains("Promise.allSettled([loadMonitor(),loadHistory(),refreshPlayer()])"));
         assert!(PAGE.contains("cache:'no-store'"));
         assert!(!PAGE.contains("onclick=\"loadMonitor()\""));
     }
@@ -4466,18 +4494,19 @@ workflows:
     }
 
     #[test]
-    fn started_formal_task_returns_conflict_instead_of_being_canceled() {
+    fn started_formal_task_accepts_a_cancellation_request() {
         let state = test_state();
         let body = pause_route(&[], &state).expect("pause route");
         let response: Value = serde_json::from_str(&body).expect("pause response json");
         let task_id = response["taskId"].as_u64().expect("task id");
         state.recording.mark_started(task_id);
 
-        let error = task_cancel_route(&[("id".to_string(), task_id.to_string())], &state)
-            .expect_err("started task must not be canceled");
+        let body = task_cancel_route(&[("id".to_string(), task_id.to_string())], &state)
+            .expect("running task cancellation request");
+        let response: Value = serde_json::from_str(&body).expect("cancel response json");
 
-        assert_eq!(error.status, 409);
-        assert!(error.message.contains("不能撤销"));
+        assert_eq!(response["canceled"], false);
+        assert_eq!(response["cancellationRequested"], true);
         assert_eq!(state.recording.cancellation_requests(), [task_id]);
     }
 

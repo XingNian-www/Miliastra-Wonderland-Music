@@ -1488,11 +1488,7 @@ mod tests {
 
         fn update(&self, update: PlaybackStateUpdate) -> Result<bool> {
             let mut runtime = self.runtime.lock().unwrap();
-            let changed = update.apply(runtime.state_mut());
-            if changed {
-                runtime.save()?;
-            }
-            Ok(changed)
+            runtime.update(|playback| update.apply(playback))
         }
 
         fn song_dedup_limited(&self, candidate: SongDedupCandidate) -> Result<bool> {

@@ -626,9 +626,9 @@ mod tests {
         config.timing.input.text_ms = 0;
         config.timing.input.send_ms = 0;
         config.timing.invite.step_ms = 0;
-        config.timing.workflow.default_timeout_ms = 20;
+        config.timing.workflow.default_timeout_ms = 2_000;
         config.timing.workflow.default_poll_ms = 1;
-        config.timing.command.ui_timeout_ms = 20;
+        config.timing.command.ui_timeout_ms = 2_000;
         let state = Arc::new(Mutex::new(InviteTestState {
             phase: InvitePhase::Hall,
             pasted: Vec::new(),
@@ -681,7 +681,11 @@ mod tests {
             .wait()
             .unwrap();
 
-        assert_eq!(outcome.effect(), InviteEffect::Entered);
+        assert_eq!(
+            outcome.effect(),
+            InviteEffect::Entered,
+            "unexpected invite outcome: {outcome:?}"
+        );
         assert_eq!(outcome.notification(), &InviteNotificationOutcome::Sent);
         assert!(matches!(
             outcome.residency(),

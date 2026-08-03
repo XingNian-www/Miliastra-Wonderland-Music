@@ -91,34 +91,38 @@ impl HallStateService {
     pub(crate) fn patch(&mut self, patch: HallStatePatch) -> Result<()> {
         let countdown_changed =
             patch.remaining_minutes.is_some() || patch.remaining_updated_at.is_some();
-        self.state.state_mut().apply_patch(patch);
+        self.state.update(|state| {
+            state.apply_patch(patch);
+            true
+        })?;
         if countdown_changed {
             self.refresh_countdown_anchor();
         }
-        self.state.save()
+        Ok(())
     }
 
     pub(crate) fn update_remaining_minutes(&mut self, minutes: u32) -> Result<()> {
         let updated_at = self.wall_clock.unix_seconds();
-        self.state
-            .state_mut()
-            .update_remaining_minutes(minutes, updated_at);
+        self.state.update(|state| {
+            state.update_remaining_minutes(minutes, updated_at);
+            true
+        })?;
         self.countdown_updated_at = (minutes > 0).then(|| self.clock.now());
-        self.state.save()
+        Ok(())
     }
 
     pub(crate) fn clear_remaining_minutes(&mut self) -> Result<()> {
-        self.state.state_mut().clear_remaining_minutes();
+        self.state.update(|state| {
+            state.clear_remaining_minutes();
+            true
+        })?;
         self.countdown_updated_at = None;
-        self.state.save()
+        Ok(())
     }
 
     pub(crate) fn clear_countdown_cache(&mut self) -> Result<bool> {
-        let cleared = self.state.state_mut().clear_countdown_cache();
+        let cleared = self.state.update(HallRuntimeState::clear_countdown_cache)?;
         self.countdown_updated_at = None;
-        if cleared {
-            self.state.save()?;
-        }
         Ok(cleared)
     }
 
@@ -402,6 +406,7 @@ impl HallCommand {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn same_request(&self, other: &Self) -> bool {
         match (self, other) {
             (
@@ -416,8 +421,9 @@ impl HallCommand {
 #[cfg(test)]
 mod tests {
     use anyhow::Result;
+    use std::fs;
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use super::*;
     use crate::runtime::clock::ManualClock;
@@ -483,6 +489,32 @@ mod tests {
         assert_eq!(snapshot.remaining_minutes_now(), Some(4));
         assert_eq!(snapshot.remaining_updated_at, Some(1_234));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn failed_hall_state_write_keeps_the_previous_runtime_state() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let blocker = std::env::temp_dir().join(format!(
+            "miliastra-hall-write-blocker-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::write(&blocker, "not a directory").unwrap();
+        let path = blocker.join("hall-state.json");
+        let clock = Arc::new(ManualClock::with_unix_seconds(Instant::now(), 1_234));
+        let state = PersistentHallState::load(path).expect("load hall state");
+        let mut service = HallStateService::new_with_time(state, clock.clone(), clock.clone());
+
+        let error = service
+            .update_remaining_minutes(5)
+            .expect_err("blocked parent must reject the state write");
+        clock.advance(Duration::from_secs(61)).unwrap();
+
+        assert!(error.to_string().contains("大厅状态目录"));
+        assert_eq!(service.snapshot(), HallRuntimeState::default());
+        fs::remove_file(blocker).unwrap();
     }
 
     struct PublicHallPort {

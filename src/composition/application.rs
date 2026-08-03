@@ -103,6 +103,7 @@ use crate::runtime::player_io::{
     PlayerRuntime, PlayerRuntimeConfig, PlayerSearchClient, PlayerSearchClientError,
 };
 use crate::runtime::scheduler::FormalTaskEnqueueOutcome;
+use crate::runtime::task_engine::TaskEngineHandle;
 use crate::runtime::ui::{
     FrameDemand, FrameDemandSubscription, FramePublication, UiRuntime, UiStateKind,
     UiStateObservation,
@@ -352,6 +353,7 @@ pub(crate) struct ApplicationRuntime {
     custom_action_ui: CustomActionUi,
     ui_runtime: Option<UiRuntime>,
     business: BusinessRuntimeHandle,
+    task_engine: TaskEngineHandle,
     business_events: BusinessRuntimeEventSink,
     business_runtime: Option<BusinessRuntimeGroup>,
     formal_task_runtime: Option<FormalTaskRuntime>,
@@ -708,8 +710,8 @@ fn resolve_workflow_listener_residency(
         .collect()
 }
 
-fn enqueue_current_hall_reply(business: &BusinessRuntimeHandle, text: &str) -> Result<()> {
-    match business.enqueue_deferred_chat(DeferredChatMessage {
+fn enqueue_current_hall_reply(task_engine: &TaskEngineHandle, text: &str) -> Result<()> {
+    match task_engine.enqueue_deferred(DeferredChatMessage {
         text: text.to_string(),
         target: DeferredChatTarget::CurrentHall,
         background_key: None,
@@ -870,6 +872,7 @@ impl ApplicationRuntime {
         );
         let chat_observations = ChatObservationShared::new();
         let running = Arc::new(AtomicBool::new(true));
+        let task_engine = TaskEngineHandle::new(Some(Arc::new(monitor.clone())));
         let business_runtime_builder =
             BusinessRuntimeGroupBuilder::start(DEADLINE_RUNTIME_QUEUE_CAPACITY)?;
         let ocr_runtime = OcrRuntime::start(ocr_device, OCR_RUNTIME_QUEUE_CAPACITY)?;
@@ -973,6 +976,7 @@ impl ApplicationRuntime {
                     hall,
                     playback,
                     InviteService::new(),
+                    task_engine.clone(),
                     business_timer,
                     Arc::new(monitor.clone()),
                     system_clock.clone(),
@@ -1024,6 +1028,7 @@ impl ApplicationRuntime {
             custom_action_ui,
             ui_runtime: Some(ui_runtime),
             business,
+            task_engine,
             business_events,
             business_runtime: Some(business_runtime),
             formal_task_runtime: None,

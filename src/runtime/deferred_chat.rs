@@ -171,6 +171,10 @@ impl DeferredChatQueue {
         self.queue.is_empty()
     }
 
+    pub(crate) fn clear(&mut self) {
+        self.queue.clear();
+    }
+
     pub(crate) fn enqueue(&mut self, item: impl Into<DeferredChatItem>) -> Result<EnqueueOutcome> {
         let item = item.into();
         if let Some(background_key) = item.background_key() {

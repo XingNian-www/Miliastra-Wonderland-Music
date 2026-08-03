@@ -1,4 +1,6 @@
 use std::collections::VecDeque;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -19,9 +21,17 @@ impl FormalTaskDedupKey {
 }
 
 pub(crate) trait FormalTaskWork: Send {
-    fn execute(self: Box<Self>) -> anyhow::Result<String>;
+    fn execute(
+        self: Box<Self>,
+        cancellation: FormalTaskCancellationToken,
+    ) -> FormalTaskExecutionOutcome;
 
     fn cancel(self: Box<Self>);
+}
+
+pub(crate) enum FormalTaskExecutionOutcome {
+    Completed(anyhow::Result<String>),
+    Canceled(String),
 }
 
 pub(crate) trait DiagnosticTaskWork: Send {
@@ -180,6 +190,7 @@ pub(crate) struct FormalTaskSnapshot {
     pub(crate) started_at_ms: Option<u64>,
     pub(crate) finished_at_ms: Option<u64>,
     pub(crate) elapsed_ms: u64,
+    pub(crate) cancellation_requested: bool,
     pub(crate) result: Option<String>,
 }
 
@@ -191,7 +202,23 @@ struct FormalTaskRecord {
     queued_at_ms: u64,
     started_at_ms: Option<u64>,
     finished_at_ms: Option<u64>,
+    cancellation_requested: bool,
     result: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FormalTaskCancellationToken {
+    requested: Arc<AtomicBool>,
+}
+
+impl FormalTaskCancellationToken {
+    pub(crate) fn request(&self) {
+        self.requested.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::SeqCst)
+    }
 }
 
 struct QueuedFormalTask {
@@ -199,6 +226,7 @@ struct QueuedFormalTask {
     label: String,
     dedup_key: Option<FormalTaskDedupKey>,
     playback_related: bool,
+    cancellation: FormalTaskCancellationToken,
     work: Box<dyn FormalTaskWork>,
 }
 
@@ -207,6 +235,7 @@ pub(crate) struct FormalTaskLease {
     label: String,
     dedup_key: Option<FormalTaskDedupKey>,
     playback_related: bool,
+    cancellation: FormalTaskCancellationToken,
     work: Box<dyn FormalTaskWork>,
 }
 
@@ -228,6 +257,7 @@ enum ActiveSchedulerWork {
         id: u64,
         label: String,
         playback_related: bool,
+        cancellation: FormalTaskCancellationToken,
     },
     External(SchedulerLaneLease),
     Diagnostic {
@@ -244,8 +274,14 @@ impl FormalTaskLease {
         &self.label
     }
 
-    pub(crate) fn execute(self) -> anyhow::Result<String> {
-        self.work.execute()
+    pub(crate) fn execute(self) -> FormalTaskExecutionOutcome {
+        if self.cancellation.is_requested() {
+            self.work.cancel();
+            return FormalTaskExecutionOutcome::Canceled(
+                "任务在开始执行前收到取消请求".to_string(),
+            );
+        }
+        self.work.execute(self.cancellation)
     }
 }
 
@@ -253,12 +289,39 @@ impl FormalTaskLease {
 pub(crate) enum FormalTaskCompletion {
     Succeeded(String),
     Failed(String),
+    Canceled(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FormalTaskCancelOutcome {
-    Canceled,
-    NotQueued,
+    CanceledBeforeStart,
+    CancellationRequested,
+    AlreadyFinished,
+    NotFound,
+}
+
+pub(crate) enum FormalTaskCancelAction {
+    CanceledBeforeStart(Box<dyn FormalTaskWork>),
+    CancellationRequested,
+    AlreadyFinished,
+    NotFound,
+}
+
+pub(crate) struct FormalTaskShutdownPlan {
+    queued: Vec<Box<dyn FormalTaskWork>>,
+    active_task_id: Option<u64>,
+}
+
+impl FormalTaskShutdownPlan {
+    pub(crate) fn cancel_queued(self) {
+        for work in self.queued {
+            work.cancel();
+        }
+    }
+
+    pub(crate) const fn active_task_id(&self) -> Option<u64> {
+        self.active_task_id
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -279,6 +342,7 @@ pub(crate) struct FormalScheduler {
     records: VecDeque<FormalTaskRecord>,
     diagnostic_queued: VecDeque<QueuedDiagnosticTask>,
     diagnostic_records: VecDeque<DiagnosticTaskRecord>,
+    accepting: bool,
 }
 
 impl FormalScheduler {
@@ -292,6 +356,7 @@ impl FormalScheduler {
             records: VecDeque::new(),
             diagnostic_queued: VecDeque::new(),
             diagnostic_records: VecDeque::new(),
+            accepting: true,
         }
     }
 
@@ -299,6 +364,11 @@ impl FormalScheduler {
         &mut self,
         submission: DiagnosticTaskSubmission,
     ) -> Result<DiagnosticTaskSnapshot, FormalSchedulerError> {
+        if !self.accepting {
+            return Err(FormalSchedulerError(
+                "正式任务运行时正在关闭，不能再接收 Web 工具任务".to_string(),
+            ));
+        }
         if self.diagnostic_queued.len() >= MAX_QUEUED_DIAGNOSTICS {
             return Err(FormalSchedulerError(
                 "Web 工具任务过多，请等待现有任务完成".to_string(),
@@ -416,13 +486,21 @@ impl FormalScheduler {
             })
     }
 
-    pub(crate) fn enqueue(&mut self, submission: FormalTaskSubmission) -> FormalTaskEnqueueOutcome {
+    pub(crate) fn enqueue(
+        &mut self,
+        submission: FormalTaskSubmission,
+    ) -> Result<FormalTaskEnqueueOutcome, FormalSchedulerError> {
+        if !self.accepting {
+            return Err(FormalSchedulerError(
+                "正式任务运行时正在关闭，不能再接收任务".to_string(),
+            ));
+        }
         if submission.dedup_key.as_ref().is_some_and(|key| {
             self.queued
                 .iter()
                 .any(|task| task.dedup_key.as_ref() == Some(key))
         }) {
-            return FormalTaskEnqueueOutcome::Duplicate;
+            return Ok(FormalTaskEnqueueOutcome::Duplicate);
         }
 
         let id = self.next_id;
@@ -434,6 +512,7 @@ impl FormalScheduler {
             label: label.clone(),
             dedup_key: submission.dedup_key,
             playback_related: submission.playback_related,
+            cancellation: FormalTaskCancellationToken::default(),
             work: submission.work,
         });
         self.records.push_front(FormalTaskRecord {
@@ -443,13 +522,14 @@ impl FormalScheduler {
             queued_at_ms: current_unix_millis(),
             started_at_ms: None,
             finished_at_ms: None,
+            cancellation_requested: false,
             result: None,
         });
         trim_records(&mut self.records);
-        FormalTaskEnqueueOutcome::Queued(FormalTaskReceipt {
+        Ok(FormalTaskEnqueueOutcome::Queued(FormalTaskReceipt {
             task_id: id,
             position: self.queued.len(),
-        })
+        }))
     }
 
     pub(crate) fn snapshot(&self) -> FormalSchedulerSnapshot {
@@ -495,6 +575,7 @@ impl FormalScheduler {
             id: queued.id,
             label: queued.label.clone(),
             playback_related: queued.playback_related,
+            cancellation: queued.cancellation.clone(),
         });
         self.update_record(queued.id, |record| {
             record.status = "running";
@@ -507,6 +588,7 @@ impl FormalScheduler {
             label: queued.label,
             dedup_key: queued.dedup_key,
             playback_related: queued.playback_related,
+            cancellation: queued.cancellation,
             work: queued.work,
         })
     }
@@ -525,6 +607,7 @@ impl FormalScheduler {
             label: lease.label,
             dedup_key: lease.dedup_key,
             playback_related: lease.playback_related,
+            cancellation: lease.cancellation,
             work: lease.work,
         });
         Ok(())
@@ -548,23 +631,84 @@ impl FormalScheduler {
                     record.status = "failed";
                     record.result = Some(limit_result(error));
                 }
+                FormalTaskCompletion::Canceled(reason) => {
+                    record.status = "canceled";
+                    record.result = Some(limit_result(reason));
+                }
             }
         });
         Ok(())
     }
 
-    pub(crate) fn cancel_queued(&mut self, task_id: u64) -> Option<Box<dyn FormalTaskWork>> {
-        let index = self.queued.iter().position(|task| task.id == task_id)?;
-        let task = self
-            .queued
-            .remove(index)
-            .expect("queued task index was found");
-        self.update_record(task_id, |record| {
-            record.status = "canceled";
-            record.finished_at_ms = Some(current_unix_millis());
-            record.result = Some("任务已在执行前取消".to_string());
-        });
-        Some(task.work)
+    pub(crate) fn cancel(&mut self, task_id: u64) -> FormalTaskCancelAction {
+        if let Some(index) = self.queued.iter().position(|task| task.id == task_id) {
+            let task = self
+                .queued
+                .remove(index)
+                .expect("queued task index was found");
+            self.update_record(task_id, |record| {
+                record.status = "canceled";
+                record.finished_at_ms = Some(current_unix_millis());
+                record.result = Some("任务已在执行前取消".to_string());
+            });
+            return FormalTaskCancelAction::CanceledBeforeStart(task.work);
+        }
+        if let Some(ActiveSchedulerWork::Formal {
+            id, cancellation, ..
+        }) = self.active.as_ref()
+            && *id == task_id
+        {
+            cancellation.request();
+            self.update_record(task_id, |record| {
+                record.cancellation_requested = true;
+            });
+            return FormalTaskCancelAction::CancellationRequested;
+        }
+        if self.records.iter().any(|record| record.id == task_id) {
+            FormalTaskCancelAction::AlreadyFinished
+        } else {
+            FormalTaskCancelAction::NotFound
+        }
+    }
+
+    pub(crate) fn begin_shutdown(&mut self) -> FormalTaskShutdownPlan {
+        self.accepting = false;
+        let mut queued = Vec::with_capacity(self.queued.len());
+        while let Some(task) = self.queued.pop_front() {
+            self.update_record(task.id, |record| {
+                record.status = "canceled";
+                record.finished_at_ms = Some(current_unix_millis());
+                record.result = Some("应用关闭，任务已在执行前取消".to_string());
+            });
+            queued.push(task.work);
+        }
+        let active_task_id = match self.active.as_ref() {
+            Some(ActiveSchedulerWork::Formal {
+                id, cancellation, ..
+            }) => {
+                let id = *id;
+                cancellation.request();
+                self.update_record(id, |record| {
+                    record.cancellation_requested = true;
+                });
+                Some(id)
+            }
+            _ => None,
+        };
+        while let Some(task) = self.diagnostic_queued.pop_front() {
+            if let Some(record) = self
+                .diagnostic_records
+                .iter_mut()
+                .find(|record| record.id == task.id)
+            {
+                record.status = "canceled";
+                record.result = Some("应用关闭，任务未执行".to_string());
+            }
+        }
+        FormalTaskShutdownPlan {
+            queued,
+            active_task_id,
+        }
     }
 
     pub(crate) fn try_acquire_lane(
@@ -659,6 +803,7 @@ fn record_snapshot(record: &FormalTaskRecord, now: u64) -> FormalTaskSnapshot {
         started_at_ms: record.started_at_ms,
         finished_at_ms: record.finished_at_ms,
         elapsed_ms,
+        cancellation_requested: record.cancellation_requested,
         result: record.result.clone(),
     }
 }

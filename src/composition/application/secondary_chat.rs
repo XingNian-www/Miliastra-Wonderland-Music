@@ -1,5 +1,16 @@
 use super::*;
 
+fn primary_messages_after_cursor(
+    messages: Vec<PrimaryObservedMessage>,
+    cursor: PrimaryObservationCursor,
+) -> Vec<ChatMessage> {
+    messages
+        .into_iter()
+        .filter(|message| cursor.is_before(&message.id))
+        .map(|message| message.message)
+        .collect()
+}
+
 #[derive(Clone, Debug)]
 struct SecondaryOcrMessage {
     text: String,
@@ -580,6 +591,7 @@ impl ApplicationRuntime {
             });
         }
 
+        let cursor_before_scan = self.chat_observations.primary_cursor()?;
         let image = self
             .residency_ui
             .observe(UiResidencyTarget::Primary)
@@ -589,13 +601,17 @@ impl ApplicationRuntime {
             .map_err(|failure| anyhow!("建立一级聊天确认基线失败：{failure}"))?;
         let template_args = self.chat_templates.clone();
         let messages = self.scan_chat_with_shared_ocr(&image, &template_args)?;
+        let observed = self.chat_observations.observe_primary(messages)?;
+        let cursor = match cursor_before_scan {
+            Some(cursor) => Some(cursor),
+            None => self.chat_observations.primary_cursor()?,
+        };
+        let pending = cursor_before_scan
+            .map(|cursor| primary_messages_after_cursor(observed, cursor))
+            .unwrap_or_default();
         Ok(ChatDecisionReader {
-            kind: ChatDecisionReaderKind::Primary,
-            screen_lock: DecisionScreenLock::from_messages(
-                &messages,
-                accepts_message_type,
-                is_decision,
-            ),
+            kind: ChatDecisionReaderKind::Primary { cursor, pending },
+            screen_lock: DecisionScreenLock::default(),
             _observation_session: observation_session,
         })
     }
@@ -605,7 +621,10 @@ impl ApplicationRuntime {
         reader: &mut ChatDecisionReader,
     ) -> Result<Vec<ChatMessage>> {
         match &mut reader.kind {
-            ChatDecisionReaderKind::Primary => {
+            ChatDecisionReaderKind::Primary { cursor, pending } => {
+                if !pending.is_empty() {
+                    return Ok(std::mem::take(pending));
+                }
                 let template_args = self.chat_templates.clone();
                 let canvas = Canvas {
                     width: self.config.screen.expected_width,
@@ -613,7 +632,13 @@ impl ApplicationRuntime {
                     resize: true,
                 };
                 let frame = load_frame(&canvas, &self.game_ui)?;
-                self.scan_chat_with_shared_ocr(&frame.image, &template_args)
+                let messages = self.scan_chat_with_shared_ocr(&frame.image, &template_args)?;
+                let observed = self.chat_observations.observe_primary(messages)?;
+                let Some(current_cursor) = *cursor else {
+                    *cursor = self.chat_observations.primary_cursor()?;
+                    return Ok(Vec::new());
+                };
+                Ok(primary_messages_after_cursor(observed, current_cursor))
             }
             ChatDecisionReaderKind::SecondaryCurrentHall { previous } => {
                 self.scan_secondary_decision_messages(previous)
@@ -686,7 +711,6 @@ impl ApplicationRuntime {
                 message_type: "blue".to_string(),
                 block: bubble.rect,
                 text,
-                visual: rect_chat_change_fingerprint(image, bubble.rect)?,
             });
         }
         let ocr_ms = elapsed_ms(started);
@@ -1228,6 +1252,14 @@ impl ApplicationRuntime {
 mod tests {
     use super::*;
 
+    fn primary_message(text: &str, y: i32) -> ChatMessage {
+        ChatMessage {
+            message_type: "blue".to_string(),
+            block: Rect::new(0, y, 100, 20),
+            text: text.to_string(),
+        }
+    }
+
     fn command(text: &str) -> SecondaryOcrMessage {
         SecondaryOcrMessage {
             text: text.to_string(),
@@ -1309,5 +1341,30 @@ mod tests {
 
         tracker.commit(&current);
         assert!(tracker.preview_new_indexes(&current).is_empty());
+    }
+
+    #[test]
+    fn primary_decision_reader_uses_messages_after_the_shared_ocr_cursor() {
+        let shared = ChatObservationShared::new();
+        shared
+            .observe_primary(vec![
+                primary_message("消息1", 0),
+                primary_message("消息2", 20),
+            ])
+            .unwrap();
+        let cursor = shared.primary_cursor().unwrap().expect("primary cursor");
+        let observed = shared
+            .observe_primary(vec![
+                primary_message("消息2", 0),
+                primary_message("玩家：@确认", 20),
+            ])
+            .unwrap();
+
+        let decisions = primary_messages_after_cursor(observed, cursor)
+            .into_iter()
+            .map(|message| message.text)
+            .collect::<Vec<_>>();
+
+        assert_eq!(decisions, ["玩家：@确认"]);
     }
 }

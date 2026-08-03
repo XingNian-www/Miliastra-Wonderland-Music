@@ -108,12 +108,17 @@ impl PersistentHallState {
         &self.state
     }
 
-    pub(crate) fn state_mut(&mut self) -> &mut HallRuntimeState {
-        &mut self.state
-    }
-
-    pub(crate) fn save(&self) -> Result<()> {
-        self.state.save(&self.path)
+    pub(crate) fn update(
+        &mut self,
+        mutation: impl FnOnce(&mut HallRuntimeState) -> bool,
+    ) -> Result<bool> {
+        let mut next = self.state.clone();
+        let changed = mutation(&mut next);
+        if changed {
+            next.save(&self.path)?;
+            self.state = next;
+        }
+        Ok(changed)
     }
 }
 

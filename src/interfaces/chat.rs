@@ -24,6 +24,7 @@ use crate::features::song_request::{SongCommand, SongSource};
 use crate::features::turtle_soup::TurtleSoupCommand;
 #[cfg(test)]
 use crate::features::undercover::UndercoverCommand;
+#[cfg(test)]
 use std::collections::HashMap;
 
 mod router;
@@ -147,16 +148,19 @@ impl ConsoleCommandIntent {
 }
 
 #[derive(Clone, Debug)]
+#[cfg(test)]
 struct CommandLock {
     command: RoutedCommand,
 }
 
 #[derive(Default, Debug)]
+#[cfg(test)]
 pub struct CommandLockState {
     locks: HashMap<String, CommandLock>,
 }
 
 #[derive(Default, Debug)]
+#[cfg(test)]
 pub struct LockUpdate {
     pub accepted: Vec<PendingCommand>,
     pub skipped: Vec<String>,
@@ -178,6 +182,7 @@ fn extract_bracket_username(text: &str) -> Option<String> {
     }
 }
 
+#[cfg(test)]
 impl CommandLockState {
     pub fn update(
         &mut self,
@@ -244,6 +249,7 @@ pub fn lock_key(command: &RoutedCommand) -> String {
     }
 }
 
+#[cfg(test)]
 pub fn same_lock_command(left: &RoutedCommand, right: &RoutedCommand) -> bool {
     if left.command.scopes_lock_to_actor()
         && right.command.scopes_lock_to_actor()

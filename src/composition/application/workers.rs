@@ -1,6 +1,5 @@
 use super::*;
 use std::collections::HashMap;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use crate::features::playback::{
     BackgroundLyricsScope, LyricTracker, PlaybackMonitorPort, PlaybackWorkload, PlayerStatus,
@@ -273,88 +272,24 @@ fn sleep_background_lyrics_poll(poll: Duration, deadline: Option<Instant>) -> bo
     true
 }
 
-struct FormalTaskDispatcher {
-    business: BusinessRuntimeHandle,
-    running: Arc<AtomicBool>,
-    paused: Arc<AtomicBool>,
-    loop_idle: Duration,
-    post_settle: Duration,
-}
-
-impl FormalTaskDispatcher {
-    fn run(self) -> Result<()> {
-        while self.running.load(AtomicOrdering::SeqCst) {
-            if self.paused.load(AtomicOrdering::SeqCst) {
-                sleep(self.loop_idle);
-                continue;
-            }
-            let Some(task) = self.business.take_next_formal_task()? else {
-                sleep(self.loop_idle.max(Duration::from_millis(20)));
-                continue;
-            };
-            if self.paused.load(AtomicOrdering::SeqCst) {
-                self.business.restore_formal_task(task)?;
-                sleep(self.loop_idle);
-                continue;
-            }
-            let task_id = task.task_id();
-            let task_label = task.label().to_string();
-            log::info!("待处理任务开始: {}", task_label);
-            let result = match catch_unwind(AssertUnwindSafe(|| task.execute())) {
-                Ok(result) => result,
-                Err(_) => Err(anyhow!("待处理任务执行发生未捕获异常")),
-            };
-            match result {
-                Ok(result) => {
-                    self.business
-                        .complete_formal_task(task_id, FormalTaskCompletion::Succeeded(result))?;
-                    log::info!("待处理任务完成: {}", task_label);
-                    sleep(self.post_settle);
-                }
-                Err(error) => {
-                    self.business.complete_formal_task(
-                        task_id,
-                        FormalTaskCompletion::Failed(format!("错误: {error:#}")),
-                    )?;
-                    log::error!("待处理任务执行异常: {error:#}");
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
 impl ApplicationRuntime {
-    pub(super) fn start_formal_task_dispatcher(&self) -> thread::JoinHandle<()> {
-        let dispatcher = FormalTaskDispatcher {
-            business: self.business.clone(),
-            running: Arc::clone(&self.running),
-            paused: Arc::clone(&self.paused),
-            loop_idle: Duration::from_millis(self.config.timing.loop_idle_ms),
-            post_settle: Duration::from_millis(self.config.timing.command.post_settle_ms),
-        };
-        thread::spawn(move || {
-            log::info!("正式任务调度线程已启动");
-            if let Err(error) = dispatcher.run() {
-                log::error!("正式任务调度线程异常退出: {error:#}");
-            }
-        })
-    }
-
-    pub(super) fn start_formal_task_execution_runtime(&mut self) -> Result<()> {
-        if self.formal_task_execution.is_some() {
+    pub(super) fn start_formal_task_runtime(&mut self) -> Result<()> {
+        if self.formal_task_runtime.is_some() {
             return Ok(());
         }
-        let runtime = FormalTaskExecutionRuntime::start(|handle| {
-            let mut app = self.clone_for_formal_task_execution();
-            app.formal_tasks = Some(FormalTaskClient::new(handle, app.business.clone()));
-            app
-        })?;
-        self.formal_tasks = Some(FormalTaskClient::new(
-            runtime.handle(),
+        let runtime = FormalTaskRuntime::start(
             self.business.clone(),
-        ));
-        self.formal_task_execution = Some(runtime);
+            Arc::clone(&self.running),
+            Arc::clone(&self.paused),
+            Duration::from_millis(self.config.timing.command.post_settle_ms),
+            |client| {
+                let mut app = self.clone_for_formal_task_execution();
+                app.formal_tasks = Some(client);
+                app
+            },
+        )?;
+        self.formal_tasks = Some(runtime.client());
+        self.formal_task_runtime = Some(runtime);
         Ok(())
     }
 
@@ -606,17 +541,6 @@ impl DeferredChatSender {
 }
 
 impl ApplicationRuntime {
-    pub(super) fn start_web_tool_executor(&self) -> thread::JoinHandle<()> {
-        let worker = DiagnosticExecutor {
-            business: self.business.clone(),
-            running: Arc::clone(&self.running),
-        };
-        thread::spawn(move || {
-            log::info!("Web 工具执行线程已启动");
-            worker.run();
-        })
-    }
-
     pub(super) fn start_playback_monitor(&self) -> thread::JoinHandle<()> {
         let monitor = PlaybackMonitorWorker {
             application: self.playback_application.clone(),
@@ -655,7 +579,7 @@ impl ApplicationRuntime {
             business: self.business.clone(),
             business_events: self.business_events.clone(),
             business_runtime: None,
-            formal_task_execution: None,
+            formal_task_runtime: None,
             formal_tasks: self.formal_tasks.clone(),
             background_commands: self.background_commands.clone(),
             player: self.player.clone(),
@@ -669,10 +593,8 @@ impl ApplicationRuntime {
             ocr: self.ocr.clone(),
             ocr_runtime: None,
             latest_frame: self.latest_frame.clone(),
-            locks: CommandLockState::default(),
             window_detection_signal: self.window_detection_signal.clone(),
-            screen_lock_primed: self.screen_lock_primed.clone(),
-            reset_locks_requested: self.reset_locks_requested.clone(),
+            chat_baseline_primed: self.chat_baseline_primed.clone(),
             card_games: self.card_games.clone(),
             administration_application: self.administration_application,
             hall_application: self.hall_application,
@@ -791,39 +713,6 @@ impl PlaybackMonitorPort for PlaybackMonitorWorker {
     fn update_monitor(&mut self) {
         self.monitor
             .publish(MonitorEvent::PlaybackController(self.player.snapshot()));
-    }
-}
-
-struct DiagnosticExecutor {
-    business: BusinessRuntimeHandle,
-    running: Arc<AtomicBool>,
-}
-
-impl DiagnosticExecutor {
-    fn run(self) {
-        while self.running.load(AtomicOrdering::SeqCst) {
-            match self.business.take_next_diagnostic_task() {
-                Ok(Some(task)) => {
-                    let id = task.task_id();
-                    let label = task.label().to_string();
-                    let completion = match task.execute() {
-                        Ok(result) => DiagnosticTaskCompletion::Succeeded(result),
-                        Err(error) => {
-                            log::error!("Web 工具执行失败 {label}: {error:#}");
-                            DiagnosticTaskCompletion::Failed(format!("{error:#}"))
-                        }
-                    };
-                    if let Err(error) = self.business.complete_diagnostic_task(id, completion) {
-                        log::error!("Web 工具任务收尾异常: {error}");
-                    }
-                }
-                Ok(None) => sleep(Duration::from_millis(100)),
-                Err(error) => {
-                    log::error!("Web 工具任务调度异常: {error:#}");
-                    sleep(Duration::from_millis(250));
-                }
-            }
-        }
     }
 }
 

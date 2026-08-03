@@ -142,12 +142,17 @@ impl PersistentPlaybackState {
         &self.state
     }
 
-    pub fn state_mut(&mut self) -> &mut PlaybackRuntimeState {
-        &mut self.state
-    }
-
-    pub fn save(&self) -> Result<()> {
-        self.state.save(&self.path)
+    pub(crate) fn update(
+        &mut self,
+        mutation: impl FnOnce(&mut PlaybackRuntimeState) -> bool,
+    ) -> Result<bool> {
+        let mut next = self.state.clone();
+        let changed = mutation(&mut next);
+        if changed {
+            next.save(&self.path)?;
+            self.state = next;
+        }
+        Ok(changed)
     }
 }
 

@@ -774,7 +774,7 @@ fn find_wonderland_hall_text(
         .map_err(|error| after_input_failure("crop_wonderland_hall", error))?;
     let lines = ocr
         .recognize_lines(crop, OcrPriority::UiConfirmation)
-        .map_err(|error| after_input_failure("ocr_wonderland_hall", error))?;
+        .map_err(|error| after_input_failure("ocr_wonderland_hall", error.into()))?;
     Ok(lines.into_iter().find_map(|line| {
         is_wonderland_hall_text(&line.text).then(|| {
             Point::new(

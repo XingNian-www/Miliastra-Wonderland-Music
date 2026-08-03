@@ -2,7 +2,7 @@ use super::*;
 
 impl ApplicationRuntime {
     pub(crate) fn run(&mut self) -> Result<()> {
-        self.start_formal_task_execution_runtime()?;
+        self.start_formal_task_runtime()?;
         self.monitor
             .publish(MonitorEvent::Status("运行中".to_string()));
         self.update_monitor_playback_controller();
@@ -12,9 +12,7 @@ impl ApplicationRuntime {
         self.enqueue_startup_task_if_enabled()?;
         self.start_http_server()?;
         self.hotkeys = Some(self.start_hotkeys()?);
-        let formal_dispatcher = self.start_formal_task_dispatcher();
         let deferred_chat_sender = self.start_deferred_chat_sender();
-        let web_tool_executor = self.start_web_tool_executor();
         let playback_monitor = self.start_playback_monitor();
         let result = self.run_scan_loop();
         self.running.store(false, AtomicOrdering::SeqCst);
@@ -31,24 +29,23 @@ impl ApplicationRuntime {
         {
             log::error!("HTTP/Web 面板关闭失败: {error:#}");
         }
-        if let Err(error) = formal_dispatcher.join() {
-            log::error!("正式任务调度线程 panic: {error:?}");
+        if let Some(runtime) = self.formal_task_runtime.take() {
+            match runtime.shutdown() {
+                Ok(report) if report.timed_out() => log::error!(
+                    "正式任务未在关闭宽限期内结束，停止等待并继续关闭其他运行时: active_task_id={:?}",
+                    report.active_task_id()
+                ),
+                Ok(_) => log::info!("正式任务运行时已关闭"),
+                Err(error) => log::error!("正式任务运行时关闭失败: {error:#}"),
+            }
         }
         if let Err(error) = deferred_chat_sender.join() {
             log::error!("延迟聊天发送线程 panic: {error:?}");
-        }
-        if let Err(error) = web_tool_executor.join() {
-            log::error!("Web 工具执行线程 panic: {error:?}");
         }
         if let Err(error) = playback_monitor.join() {
             log::error!("播放监控线程 panic: {error:?}");
         }
         self.join_moderation_workers();
-        if let Some(runtime) = self.formal_task_execution.take()
-            && let Err(error) = runtime.shutdown()
-        {
-            log::error!("正式任务执行运行时关闭失败: {error:#}");
-        }
         if let Some(business_runtime) = self.business_runtime.take() {
             match business_runtime.shutdown() {
                 Ok(snapshot) => log::info!(

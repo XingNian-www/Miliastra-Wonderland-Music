@@ -665,9 +665,9 @@ startup:
     height: 1040
   # 千星确认按钮模板区域
   wonderland_confirm_region:
-    x: 450
+    x: 900
     y: 650
-    width: 1050
+    width: 500
     height: 250
   # 派蒙菜单/主界面模板区域
   main_ui_region:

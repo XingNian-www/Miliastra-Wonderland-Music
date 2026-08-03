@@ -162,20 +162,20 @@ impl Drop for BackgroundCommandManagerInner {
 pub(super) fn start_background_lyrics(
     manager: &BackgroundCommandManager,
     player: PlayerController<PlayerRuntimeBackend, BusinessPlaybackStateAdapter>,
-    business: BusinessRuntimeHandle,
+    task_engine: TaskEngineHandle,
     running: Arc<AtomicBool>,
     poll: Duration,
     duration: Option<Duration>,
     scope: BackgroundLyricsScope,
 ) -> Result<bool> {
     manager.start("lyrics", move |stop| {
-        run_background_lyrics(player, business, running, stop, poll, duration, scope);
+        run_background_lyrics(player, task_engine, running, stop, poll, duration, scope);
     })
 }
 
 fn run_background_lyrics(
     player: PlayerController<PlayerRuntimeBackend, BusinessPlaybackStateAdapter>,
-    business: BusinessRuntimeHandle,
+    task_engine: TaskEngineHandle,
     running: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     poll: Duration,
@@ -191,7 +191,7 @@ fn run_background_lyrics(
         && !stop.load(AtomicOrdering::SeqCst)
         && deadline.is_none_or(|deadline| Instant::now() < deadline)
     {
-        let scheduler = match business.scheduler_snapshot() {
+        let scheduler = match task_engine.snapshot() {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 log::warn!("后台歌词查询正式任务状态失败，暂缓发送: {error}");
@@ -223,7 +223,7 @@ fn run_background_lyrics(
                         background_key: Some("lyrics".to_string()),
                         formal_epoch: Some(scheduler.formal_epoch()),
                     };
-                    match business.enqueue_deferred_chat(message) {
+                    match task_engine.enqueue_deferred(message) {
                         Ok(EnqueueOutcome::Added) => {}
                         Ok(EnqueueOutcome::DroppedMessage) => {
                             log::debug!("后台歌词输出淘汰了一条较早的普通回复");
@@ -279,6 +279,7 @@ impl ApplicationRuntime {
         }
         let runtime = FormalTaskRuntime::start(
             self.business.clone(),
+            self.task_engine.clone(),
             Arc::clone(&self.running),
             Arc::clone(&self.paused),
             Duration::from_millis(self.config.timing.command.post_settle_ms),
@@ -298,6 +299,7 @@ impl ApplicationRuntime {
             retry_delay: Duration::from_millis(self.config.timing.loop_idle_ms.max(50)),
             running: Arc::clone(&self.running),
             paused: Arc::clone(&self.paused),
+            task_engine: self.task_engine.clone(),
             business: self.business.clone(),
             chat_output: self.chat_output.clone(),
         };
@@ -314,6 +316,7 @@ struct DeferredChatSender {
     retry_delay: Duration,
     running: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
+    task_engine: TaskEngineHandle,
     business: BusinessRuntimeHandle,
     chat_output: ChatOutput,
 }
@@ -326,7 +329,7 @@ impl DeferredChatSender {
                 sleep(retry_delay);
                 continue;
             }
-            let Some((item, sending)) = self.business.take_next_deferred_chat()? else {
+            let Some((item, sending)) = self.task_engine.take_next_deferred()? else {
                 sleep(retry_delay);
                 continue;
             };
@@ -336,7 +339,7 @@ impl DeferredChatSender {
             }
             if self.paused.load(AtomicOrdering::SeqCst) {
                 drop(sending);
-                let _ = self.business.requeue_deferred_chat_front(item)?;
+                let _ = self.task_engine.requeue_deferred_front(item)?;
                 sleep(retry_delay);
                 continue;
             }
@@ -344,7 +347,7 @@ impl DeferredChatSender {
             if let DeferredChatItem::Message(message) = &item
                 && let Some(epoch) = message.formal_epoch
             {
-                match self.business.scheduler_snapshot() {
+                match self.task_engine.snapshot() {
                     Ok(snapshot) if snapshot.formal_busy() || snapshot.formal_epoch() != epoch => {
                         log::debug!("后台歌词已跨越正式任务，丢弃过期输出");
                         drop(sending);
@@ -354,8 +357,7 @@ impl DeferredChatSender {
                     Err(error) => {
                         log::warn!("后台歌词校验正式任务代际失败，暂缓发送: {error}");
                         drop(sending);
-                        if let Err(requeue_error) = self.business.requeue_deferred_chat_front(item)
-                        {
+                        if let Err(requeue_error) = self.task_engine.requeue_deferred_front(item) {
                             log::warn!("后台歌词重新入队失败: {requeue_error}");
                         }
                         sleep(retry_delay);
@@ -381,7 +383,7 @@ impl DeferredChatSender {
 
             if !self.deferred_chat_target_is_active(target)? {
                 drop(sending);
-                match self.business.requeue_deferred_chat_back(item)? {
+                match self.task_engine.requeue_deferred_back(item)? {
                     EnqueueOutcome::DroppedMessage => {
                         log::warn!("延迟聊天发送队列已满，已丢弃一条较早的普通回复")
                     }
@@ -481,9 +483,10 @@ impl DeferredChatSender {
                                         sent,
                                         error
                                     );
-                                    match self.business.requeue_deferred_chat_front(
-                                        DeferredChatItem::Batch(batch),
-                                    )? {
+                                    match self
+                                        .task_engine
+                                        .requeue_deferred_front(DeferredChatItem::Batch(batch))?
+                                    {
                                         EnqueueOutcome::Added => {}
                                         EnqueueOutcome::DroppedMessage => {
                                             log::warn!("海龟汤批量重试入队时淘汰了一条普通回复")
@@ -546,6 +549,7 @@ impl ApplicationRuntime {
             application: self.playback_application.clone(),
             player: self.player.clone(),
             business: self.business.clone(),
+            task_engine: self.task_engine.clone(),
             formal_tasks: self.formal_tasks.clone(),
             running: Arc::clone(&self.running),
             paused: Arc::clone(&self.paused),
@@ -577,6 +581,7 @@ impl ApplicationRuntime {
             custom_action_ui: self.custom_action_ui.clone(),
             ui_runtime: None,
             business: self.business.clone(),
+            task_engine: self.task_engine.clone(),
             business_events: self.business_events.clone(),
             business_runtime: None,
             formal_task_runtime: None,
@@ -640,6 +645,7 @@ struct PlaybackMonitorWorker {
     application: PlaybackApplication,
     player: PlayerController<PlayerRuntimeBackend, BusinessPlaybackStateAdapter>,
     business: BusinessRuntimeHandle,
+    task_engine: TaskEngineHandle,
     formal_tasks: Option<FormalTaskClient>,
     running: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
@@ -680,7 +686,7 @@ impl PlaybackMonitorPort for PlaybackMonitorWorker {
     }
 
     fn workload(&mut self) -> Result<PlaybackWorkload> {
-        let scheduler = self.business.scheduler_snapshot()?;
+        let scheduler = self.task_engine.snapshot()?;
         Ok(PlaybackWorkload {
             has_pending_playback_task: scheduler.pending_playback_related(),
             command_executing: scheduler.is_busy(),

@@ -325,12 +325,7 @@ impl ApplicationRuntime {
     }
 
     fn ensure_web_tool_input_still_idle(&self) -> Result<()> {
-        if self
-            .business
-            .scheduler_snapshot()?
-            .pending_labels()
-            .is_empty()
-        {
+        if self.task_engine.snapshot()?.pending_labels().is_empty() {
             Ok(())
         } else {
             Err(anyhow!("正式任务已进入队列，已取消 Web 工具输入"))

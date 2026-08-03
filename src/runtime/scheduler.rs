@@ -144,6 +144,7 @@ pub(crate) struct FormalSchedulerSnapshot {
     active_playback_related: bool,
     pending_playback_related: bool,
     pending_diagnostic: bool,
+    pending_deferred: bool,
 }
 
 impl FormalSchedulerSnapshot {
@@ -168,7 +169,10 @@ impl FormalSchedulerSnapshot {
     }
 
     pub(crate) const fn is_idle(&self) -> bool {
-        self.active_lane.is_none() && self.pending_labels.is_empty() && !self.pending_diagnostic
+        self.active_lane.is_none()
+            && self.pending_labels.is_empty()
+            && !self.pending_diagnostic
+            && !self.pending_deferred
     }
 
     pub(crate) const fn active_playback_related(&self) -> bool {
@@ -177,6 +181,11 @@ impl FormalSchedulerSnapshot {
 
     pub(crate) const fn pending_playback_related(&self) -> bool {
         self.pending_playback_related
+    }
+
+    pub(crate) const fn with_pending_deferred(mut self, pending: bool) -> Self {
+        self.pending_deferred = pending;
+        self
     }
 }
 
@@ -557,6 +566,7 @@ impl FormalScheduler {
             ),
             pending_playback_related: self.queued.iter().any(|task| task.playback_related),
             pending_diagnostic: !self.diagnostic_queued.is_empty(),
+            pending_deferred: false,
         }
     }
 

@@ -166,15 +166,15 @@ impl ApplicationRuntime {
     }
 
     pub(super) fn pending_contains_command(&self, parsed: &RoutedCommand) -> Result<bool> {
-        self.business
-            .formal_task_contains_dedup_key(crate::runtime::scheduler::FormalTaskDedupKey::new(
+        self.task_engine
+            .contains_formal_dedup_key(&crate::runtime::scheduler::FormalTaskDedupKey::new(
                 command::lock_key(parsed),
             ))
             .map_err(anyhow::Error::from)
     }
 
     pub(super) fn executor_is_idle(&self) -> Result<bool> {
-        Ok(self.business.scheduler_snapshot()?.is_idle())
+        Ok(self.task_engine.snapshot()?.is_idle())
     }
 
     pub(super) fn push_pending_task(&self, task: PendingTask) -> Result<()> {

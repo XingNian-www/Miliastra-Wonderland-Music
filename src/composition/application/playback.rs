@@ -1,9 +1,9 @@
 use super::*;
 
 use crate::features::playback::{
-    BackgroundLyricsScope, PlaybackAttempt, PlaybackCommandContext, PlaybackCommandPort,
-    PlaybackDecision, PlaybackExecutionPort, PlaybackPickedCandidate, PlaybackSearchFailure,
-    PlaybackSelection, PlaybackVerification, QueueRemoval,
+    BackgroundLyricsScope, PlaybackCommandContext, PlaybackCommandPort, PlaybackExecutionPort,
+    PlaybackPickedCandidate, PlaybackResult, PlaybackSearchFailure, PlaybackVerification,
+    QueueRemoval,
 };
 
 impl ApplicationRuntime {
@@ -31,31 +31,25 @@ impl ApplicationRuntime {
     pub(super) fn play_request_confirmed(
         &mut self,
         request: &ResolvedSongRequest,
-        allow_switch_source: bool,
-    ) -> Result<crate::features::playback::PlaybackOutcome> {
-        let selection = PlaybackSelection {
-            keyword: request.keyword.clone(),
-            source: request.source.clone(),
-            prefer_accompaniment: request.prefer_accompaniment,
-            ai_original_text: request.ai_original_text.clone(),
-            uri: request.uri.clone(),
-            friend_username: request.friend_username.clone(),
-            requester: request.requester.clone(),
-            console_bypass_dedup: request.console_bypass_dedup,
-        };
-        self.playback_application
+    ) -> Result<PlaybackResult> {
+        let selection = request.playback_selection();
+        let result: PlaybackResult = self
+            .playback_application
             .clone()
-            .play_confirmed(&selection, allow_switch_source, self)
-    }
-
-    pub(super) fn wait_for_decision(
-        &mut self,
-        allow_switch_source: bool,
-        allow_ai: bool,
-        timeout_confirms: bool,
-    ) -> Result<SongRequestDecision> {
-        let reader = self.begin_song_decision_reader()?;
-        self.wait_for_decision_with_reader(reader, allow_switch_source, allow_ai, timeout_confirms)
+            .play_confirmed(&selection, self)?;
+        log::info!(
+            "播放流程完成: outcome={:?} requested_uri={} final_uri={} actual_uri={} source_switched={} reason={}",
+            result.outcome(),
+            result.requested().uri,
+            result.final_request().uri,
+            result
+                .status()
+                .map(|status| status.current_uri.as_str())
+                .unwrap_or_default(),
+            result.source_switched(),
+            result.failure_reason().unwrap_or_default()
+        );
+        Ok(result)
     }
 
     pub(super) fn prompt_and_wait_for_decision(
@@ -214,16 +208,8 @@ impl PlaybackExecutionPort for ApplicationRuntime {
         self.player.song_dedup_limited(request)
     }
 
-    fn play_request_uri(&mut self, request: &PlaybackRequest) -> Result<PlaybackAttempt> {
-        self.player.play_request_uri(request)
-    }
-
-    fn verify_playback_started(
-        &mut self,
-        request: &PlaybackRequest,
-        attempt: &mut PlaybackAttempt,
-    ) -> Result<PlaybackVerification> {
-        self.player.verify_playback_started(request, attempt)
+    fn play_and_verify(&mut self, request: &PlaybackRequest) -> Result<PlaybackVerification> {
+        self.player.play_and_verify(request)
     }
 
     fn reject_mismatch_as_no_source(&mut self, status: Option<&PlayerStatus>) -> Result<()> {
@@ -232,29 +218,6 @@ impl PlaybackExecutionPort for ApplicationRuntime {
 
     fn player_status(&mut self) -> Result<PlayerStatus> {
         self.player.status()
-    }
-
-    fn wait_for_decision(
-        &mut self,
-        allow_switch_source: bool,
-        allow_ai: bool,
-        timeout_confirms: bool,
-    ) -> Result<PlaybackDecision> {
-        Ok(
-            match ApplicationRuntime::wait_for_decision(
-                self,
-                allow_switch_source,
-                allow_ai,
-                timeout_confirms,
-            )? {
-                SongRequestDecision::Confirm => PlaybackDecision::Confirm,
-                SongRequestDecision::Skip => PlaybackDecision::Skip,
-                SongRequestDecision::SwitchSource => PlaybackDecision::SwitchSource,
-                SongRequestDecision::Ai => PlaybackDecision::Ai,
-                SongRequestDecision::Timeout => PlaybackDecision::Timeout,
-                SongRequestDecision::Stopped => PlaybackDecision::Stopped,
-            },
-        )
     }
 
     fn playback_queue(&mut self) -> Result<Vec<QueueItem>> {

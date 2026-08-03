@@ -18,15 +18,14 @@ use crate::features::command::{
 };
 use crate::runtime::clock::WallClock;
 pub(crate) use controller::{
-    MismatchDecision, MusicPlayerBackend, PlaybackAttempt, PlaybackIdentityDecision,
-    PlaybackIdentityJudge, PlaybackNavigation, PlaybackOutcome, PlaybackRequest, PlaybackStatePort,
-    PlaybackTimePorts, PlaybackVerification, PlayerController, QueueAdvanceContext,
-    QueueAdvanceDecision,
+    MismatchDecision, MusicPlayerBackend, PlaybackIdentityDecision, PlaybackIdentityJudge,
+    PlaybackNavigation, PlaybackOutcome, PlaybackRequest, PlaybackStatePort, PlaybackTimePorts,
+    PlaybackVerification, PlayerController, QueueAdvanceContext, QueueAdvanceDecision,
 };
 pub(crate) use dedup::{PersistentSongDedupHistory, SongDedupCandidate};
 pub(crate) use format::{
     PlaybackSnapshot, estimated_player_status, format_lyrics, format_play_message, format_status,
-    is_playing, song_title,
+    is_playing,
 };
 pub(crate) use queue::{PersistentQueue, QueueItem};
 pub(crate) use state::{
@@ -789,8 +788,8 @@ fn observation_identity_changed(
 
 pub(crate) use application::{
     LyricTracker, PlaybackApplication, PlaybackApplicationConfig, PlaybackCommandContext,
-    PlaybackCommandPort, PlaybackDecision, PlaybackExecutionPort, PlaybackMonitorPort,
-    PlaybackPickedCandidate, PlaybackSearchFailure, PlaybackSelection, PlaybackWorkload,
+    PlaybackCommandPort, PlaybackExecutionPort, PlaybackMonitorPort, PlaybackPickedCandidate,
+    PlaybackResult, PlaybackSearchFailure, PlaybackSelection, PlaybackWorkload,
 };
 
 #[cfg(test)]

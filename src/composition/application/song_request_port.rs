@@ -1,6 +1,6 @@
 use super::*;
 
-use crate::features::playback::{PlaybackOutcome, QueuePushOutcome};
+use crate::features::playback::{PlaybackResult, QueuePushOutcome};
 use crate::features::song_request::{PickedCandidate, SearchCandidate};
 use crate::features::song_request::{
     SongRequestContext, SongRequestDecision, SongRequestPort, SongSearchFailure,
@@ -77,12 +77,8 @@ impl SongRequestPort for ApplicationRuntime {
         self.player.current_status_matches_request(status)
     }
 
-    fn play_confirmed(
-        &mut self,
-        request: &ResolvedSongRequest,
-        allow_switch_source: bool,
-    ) -> Result<PlaybackOutcome> {
-        self.play_request_confirmed(request, allow_switch_source)
+    fn play_confirmed(&mut self, request: &ResolvedSongRequest) -> Result<PlaybackResult> {
+        self.play_request_confirmed(request)
     }
 
     fn song_dedup_limited(&self, request: &PlaybackRequest) -> Result<bool> {

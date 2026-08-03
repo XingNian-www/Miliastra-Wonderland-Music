@@ -6,10 +6,10 @@ use anyhow::Result;
 use crate::text::{MAX_CHAT_WIDTH, char_width, display_width};
 
 use super::{
-    BackgroundLyricsScope, MismatchDecision, PlaybackAttempt, PlaybackCommand, PlaybackNavigation,
-    PlaybackOutcome, PlaybackRequest, PlaybackSnapshot, PlaybackVerification, PlayerStatus,
-    QueueAdvanceContext, QueueAdvanceDecision, QueueItem, QueueRemoval, estimated_player_status,
-    format_lyrics, format_play_message, format_status, song_title,
+    BackgroundLyricsScope, MismatchDecision, PlaybackCommand, PlaybackNavigation, PlaybackOutcome,
+    PlaybackRequest, PlaybackSnapshot, PlaybackVerification, PlayerStatus, QueueAdvanceContext,
+    QueueAdvanceDecision, QueueItem, QueueRemoval, estimated_player_status, format_lyrics,
+    format_play_message, format_status,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -17,16 +17,6 @@ pub(crate) struct PlaybackCommandContext {
     pub(crate) message_type: String,
     pub(crate) username: String,
     pub(crate) user_command: String,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PlaybackDecision {
-    Confirm,
-    Skip,
-    SwitchSource,
-    Ai,
-    Timeout,
-    Stopped,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -132,6 +122,177 @@ impl PlaybackSelection {
     }
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct PlaybackResult {
+    outcome: PlaybackOutcome,
+    requested: PlaybackRequest,
+    final_request: PlaybackRequest,
+    status: Option<PlayerStatus>,
+    source_switched: bool,
+    failure_reason: Option<String>,
+}
+
+impl PlaybackResult {
+    fn success(
+        requested: &PlaybackRequest,
+        final_request: &PlaybackRequest,
+        status: PlayerStatus,
+        source_switched: bool,
+    ) -> Self {
+        Self {
+            outcome: PlaybackOutcome::Success,
+            requested: requested.clone(),
+            final_request: final_request.clone(),
+            status: Some(status),
+            source_switched,
+            failure_reason: None,
+        }
+    }
+
+    fn no_source(
+        requested: &PlaybackRequest,
+        final_request: &PlaybackRequest,
+        status: Option<PlayerStatus>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            outcome: PlaybackOutcome::NoSource,
+            requested: requested.clone(),
+            final_request: final_request.clone(),
+            status,
+            source_switched: false,
+            failure_reason: Some(reason.into()),
+        }
+    }
+
+    fn error(
+        requested: &PlaybackRequest,
+        final_request: &PlaybackRequest,
+        status: Option<PlayerStatus>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            outcome: PlaybackOutcome::Error,
+            requested: requested.clone(),
+            final_request: final_request.clone(),
+            status,
+            source_switched: false,
+            failure_reason: Some(reason.into()),
+        }
+    }
+
+    fn dedup_limited(request: &PlaybackRequest) -> Self {
+        Self {
+            outcome: PlaybackOutcome::DedupLimited,
+            requested: request.clone(),
+            final_request: request.clone(),
+            status: None,
+            source_switched: false,
+            failure_reason: Some("近期已播放过".to_string()),
+        }
+    }
+
+    pub(crate) const fn outcome(&self) -> PlaybackOutcome {
+        self.outcome
+    }
+
+    pub(crate) const fn requested(&self) -> &PlaybackRequest {
+        &self.requested
+    }
+
+    pub(crate) const fn final_request(&self) -> &PlaybackRequest {
+        &self.final_request
+    }
+
+    pub(crate) const fn status(&self) -> Option<&PlayerStatus> {
+        self.status.as_ref()
+    }
+
+    pub(crate) const fn source_switched(&self) -> bool {
+        self.source_switched
+    }
+
+    pub(crate) fn failure_reason(&self) -> Option<&str> {
+        self.failure_reason.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        outcome: PlaybackOutcome,
+        requested: &PlaybackRequest,
+        final_request: &PlaybackRequest,
+    ) -> Self {
+        Self {
+            outcome,
+            requested: requested.clone(),
+            final_request: final_request.clone(),
+            status: None,
+            source_switched: outcome == PlaybackOutcome::Success
+                && requested.uri != final_request.uri,
+            failure_reason: (outcome != PlaybackOutcome::Success)
+                .then(|| format!("test outcome: {outcome:?}")),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlaybackPurpose {
+    Requested,
+    Queue { stop_when_user_paused: bool },
+    Previous,
+    SourceRetry { stop_when_user_paused: bool },
+}
+
+impl PlaybackPurpose {
+    const fn stop_when_user_paused(self) -> bool {
+        match self {
+            Self::Queue {
+                stop_when_user_paused,
+            }
+            | Self::SourceRetry {
+                stop_when_user_paused,
+            } => stop_when_user_paused,
+            Self::Requested | Self::Previous => false,
+        }
+    }
+
+    const fn checks_dedup(self) -> bool {
+        matches!(self, Self::Requested | Self::Queue { .. })
+    }
+
+    const fn allows_source_switch(self) -> bool {
+        matches!(self, Self::Requested | Self::Queue { .. })
+    }
+
+    const fn replies_with_play_message(self) -> bool {
+        !matches!(self, Self::SourceRetry { .. })
+    }
+
+    fn dedup_reply(self, selection: &PlaybackSelection) -> Option<String> {
+        match self {
+            Self::Requested => Some(selection.dedup_reject_message()),
+            Self::Queue { .. } => Some(selection.dedup_skip_message()),
+            Self::Previous | Self::SourceRetry { .. } => None,
+        }
+    }
+}
+
+struct PlaybackCompletion {
+    result: PlaybackResult,
+    reply: Option<String>,
+    update_monitor: bool,
+}
+
+impl PlaybackCompletion {
+    fn new(result: PlaybackResult, reply: Option<String>, update_monitor: bool) -> Self {
+        Self {
+            result,
+            reply,
+            update_monitor,
+        }
+    }
+}
+
 pub(crate) trait PlaybackExecutionPort {
     fn reply(&mut self, message: &str) -> Result<()>;
     fn update_monitor(&mut self);
@@ -152,20 +313,9 @@ pub(crate) trait PlaybackExecutionPort {
         ))
     }
     fn song_dedup_limited(&mut self, request: &PlaybackRequest) -> Result<bool>;
-    fn play_request_uri(&mut self, request: &PlaybackRequest) -> Result<PlaybackAttempt>;
-    fn verify_playback_started(
-        &mut self,
-        request: &PlaybackRequest,
-        attempt: &mut PlaybackAttempt,
-    ) -> Result<PlaybackVerification>;
+    fn play_and_verify(&mut self, request: &PlaybackRequest) -> Result<PlaybackVerification>;
     fn reject_mismatch_as_no_source(&mut self, status: Option<&PlayerStatus>) -> Result<()>;
     fn player_status(&mut self) -> Result<PlayerStatus>;
-    fn wait_for_decision(
-        &mut self,
-        allow_switch_source: bool,
-        allow_ai: bool,
-        timeout_confirms: bool,
-    ) -> Result<PlaybackDecision>;
     fn playback_queue(&mut self) -> Result<Vec<QueueItem>>;
     fn remove_playback_queue(&mut self, removal: QueueRemoval) -> Result<()>;
     fn user_pause_active(&mut self) -> Result<bool> {
@@ -320,7 +470,9 @@ impl PlaybackApplication {
             }
             PlaybackCommand::Previous => {
                 if let Some(request) = port.previous_playback_request()? {
-                    self.play_request(&request, false, false, false, true, port)?;
+                    let completion =
+                        self.run_request(&request, &request, PlaybackPurpose::Previous, port)?;
+                    self.finish_playback(completion, port)?;
                     port.log_executed(context, "previous uri")?;
                 } else {
                     let message = port.previous_external()?;
@@ -571,7 +723,13 @@ impl PlaybackApplication {
         reason: &str,
         port: &mut P,
     ) -> Result<()> {
-        self.consume_queue_inner(reason, false, port)
+        self.consume_queue_inner(
+            reason,
+            PlaybackPurpose::Queue {
+                stop_when_user_paused: false,
+            },
+            port,
+        )
     }
 
     pub(crate) fn consume_queue_after_monitor<P: PlaybackExecutionPort + ?Sized>(
@@ -579,17 +737,23 @@ impl PlaybackApplication {
         reason: &str,
         port: &mut P,
     ) -> Result<()> {
-        self.consume_queue_inner(reason, true, port)
+        self.consume_queue_inner(
+            reason,
+            PlaybackPurpose::Queue {
+                stop_when_user_paused: true,
+            },
+            port,
+        )
     }
 
     fn consume_queue_inner<P: PlaybackExecutionPort + ?Sized>(
         &self,
         reason: &str,
-        guard_user_pause: bool,
+        purpose: PlaybackPurpose,
         port: &mut P,
     ) -> Result<()> {
         loop {
-            if guard_user_pause && port.user_pause_active()? {
+            if purpose.stop_when_user_paused() && port.user_pause_active()? {
                 log::info!("自动出队已跳过: 播放器处于用户暂停状态");
                 return Ok(());
             }
@@ -607,22 +771,20 @@ impl PlaybackApplication {
                 requester: item.requester.clone(),
                 console_bypass_dedup: item.dedup_bypass,
             };
-            if self.selection_dedup_limited(&request, port)? {
+            let completion = self.run_selection(&request, purpose, port)?;
+            let outcome = completion.result.outcome();
+            if matches!(
+                outcome,
+                PlaybackOutcome::Success
+                    | PlaybackOutcome::NoSource
+                    | PlaybackOutcome::DedupLimited
+            ) {
                 port.remove_playback_queue(QueueRemoval::Id(item.id))?;
-                log::info!("队列项近期已播放过，已跳过: {}", item.keyword);
-                port.reply(&request.dedup_skip_message())?;
-                continue;
             }
-            let allow_switch_source = true;
-            let outcome =
-                self.play_confirmed_inner(&request, allow_switch_source, guard_user_pause, port)?;
-            match outcome {
-                PlaybackOutcome::Success => {
-                    port.remove_playback_queue(QueueRemoval::Id(item.id))?;
-                    return Ok(());
-                }
+            let result = self.finish_playback(completion, port)?;
+            match result.outcome() {
+                PlaybackOutcome::Success => return Ok(()),
                 PlaybackOutcome::NoSource => {
-                    port.remove_playback_queue(QueueRemoval::Id(item.id))?;
                     log::error!("队列项无音源，已丢弃: {}", item.keyword);
                 }
                 PlaybackOutcome::Error => {
@@ -630,7 +792,6 @@ impl PlaybackApplication {
                     return Ok(());
                 }
                 PlaybackOutcome::DedupLimited => {
-                    port.remove_playback_queue(QueueRemoval::Id(item.id))?;
                     log::info!("队列项近期已播放过，已跳过: {}", item.keyword);
                 }
             }
@@ -640,74 +801,80 @@ impl PlaybackApplication {
     pub(crate) fn play_confirmed<P: PlaybackExecutionPort + ?Sized>(
         &self,
         request: &PlaybackSelection,
-        allow_switch_source: bool,
         port: &mut P,
-    ) -> Result<PlaybackOutcome> {
-        self.play_confirmed_inner(request, allow_switch_source, false, port)
+    ) -> Result<PlaybackResult> {
+        let completion = self.run_selection(request, PlaybackPurpose::Requested, port)?;
+        self.finish_playback(completion, port)
     }
 
-    fn play_confirmed_inner<P: PlaybackExecutionPort + ?Sized>(
+    fn run_selection<P: PlaybackExecutionPort + ?Sized>(
         &self,
-        request: &PlaybackSelection,
-        allow_switch_source: bool,
-        guard_user_pause: bool,
+        selection: &PlaybackSelection,
+        purpose: PlaybackPurpose,
         port: &mut P,
-    ) -> Result<PlaybackOutcome> {
-        if guard_user_pause && port.user_pause_active()? {
+    ) -> Result<PlaybackCompletion> {
+        let requested = selection.request();
+        if purpose.stop_when_user_paused() && port.user_pause_active()? {
             log::info!("自动出队已跳过: 用户暂停状态在播放前生效");
-            return Ok(PlaybackOutcome::Error);
+            return Ok(PlaybackCompletion::new(
+                PlaybackResult::error(&requested, &requested, None, "用户暂停"),
+                None,
+                false,
+            ));
         }
-        if self.selection_dedup_limited(request, port)? {
+        if purpose.checks_dedup() && self.selection_dedup_limited(selection, port)? {
             log::info!(
                 "长时间同歌去重拦截: keyword={} uri={}",
-                request.keyword,
-                request.uri
+                selection.keyword,
+                selection.uri
             );
-            port.reply(&request.dedup_reject_message())?;
-            return Ok(PlaybackOutcome::DedupLimited);
+            return Ok(PlaybackCompletion::new(
+                PlaybackResult::dedup_limited(&requested),
+                purpose.dedup_reply(selection),
+                false,
+            ));
         }
-        if request.uri.trim().is_empty() {
-            let source = if request.source.trim().is_empty() {
+        if selection.uri.trim().is_empty() {
+            let source = if selection.source.trim().is_empty() {
                 "qqmusic"
             } else {
-                &request.source
+                &selection.source
             };
             let picked = match port.search_and_pick(
-                &request.keyword,
+                &selection.keyword,
                 source,
-                request.prefer_accompaniment,
+                selection.prefer_accompaniment,
             ) {
                 Ok(Some(picked)) => picked,
                 Ok(None) => {
-                    port.reply("平台无对应歌曲音源")?;
-                    return Ok(PlaybackOutcome::NoSource);
+                    return Ok(PlaybackCompletion::new(
+                        PlaybackResult::no_source(
+                            &requested,
+                            &requested,
+                            None,
+                            "平台无对应歌曲音源",
+                        ),
+                        Some("平台无对应歌曲音源".to_string()),
+                        false,
+                    ));
                 }
                 Err(error) => {
                     log::error!("点歌搜索失败: {error}");
-                    port.reply(&format!("{}{}", request.label(), error.user_message()))?;
-                    return Ok(PlaybackOutcome::Error);
+                    return Ok(PlaybackCompletion::new(
+                        PlaybackResult::error(&requested, &requested, None, error.to_string()),
+                        Some(format!("{}{}", selection.label(), error.user_message())),
+                        false,
+                    ));
                 }
             };
             log::info!("播放器候选: {} -> {}", picked.text, picked.uri);
-            let mut resolved = request.clone();
+            let mut resolved = selection.clone();
             resolved.keyword = picked.text;
             resolved.source = source.to_string();
             resolved.uri = picked.uri;
-            return self.play_confirmed_inner(
-                &resolved,
-                allow_switch_source,
-                guard_user_pause,
-                port,
-            );
+            return self.run_request(&requested, &resolved.request(), purpose, port);
         }
-        self.play_request(
-            &request.request(),
-            allow_switch_source,
-            false,
-            guard_user_pause,
-            true,
-            port,
-        )
+        self.run_request(&requested, &requested, purpose, port)
     }
 
     fn selection_dedup_limited<P: PlaybackExecutionPort + ?Sized>(
@@ -721,95 +888,90 @@ impl PlaybackApplication {
         port.song_dedup_limited(&request.request())
     }
 
-    fn play_request<P: PlaybackExecutionPort + ?Sized>(
+    fn run_request<P: PlaybackExecutionPort + ?Sized>(
         &self,
+        requested: &PlaybackRequest,
         request: &PlaybackRequest,
-        allow_switch_source: bool,
-        confirm_after_switch: bool,
-        guard_user_pause: bool,
-        reply_success: bool,
+        purpose: PlaybackPurpose,
         port: &mut P,
-    ) -> Result<PlaybackOutcome> {
-        if guard_user_pause && port.user_pause_active()? {
+    ) -> Result<PlaybackCompletion> {
+        if purpose.stop_when_user_paused() && port.user_pause_active()? {
             log::info!("自动出队已跳过: 用户暂停状态在播放请求发送前生效");
-            return Ok(PlaybackOutcome::Error);
+            return Ok(PlaybackCompletion::new(
+                PlaybackResult::error(requested, request, None, "用户暂停"),
+                None,
+                false,
+            ));
         }
-        let mut attempt = match port.play_request_uri(request) {
-            Ok(attempt) => attempt,
+        let verification = match port.play_and_verify(request) {
+            Ok(verification) => verification,
             Err(error) => {
                 let message = error.to_string();
-                log::error!("播放候选失败: {message}");
-                port.reply(if message.trim().is_empty() {
-                    "平台无对应歌曲音源"
+                let reply = if message.trim().is_empty() {
+                    "平台无对应歌曲音源".to_string()
                 } else {
-                    message.trim()
-                })?;
-                return Ok(PlaybackOutcome::Error);
+                    message.trim().to_string()
+                };
+                log::error!("播放候选失败: {reply}");
+                return Ok(PlaybackCompletion::new(
+                    PlaybackResult::error(requested, request, None, reply.clone()),
+                    Some(reply),
+                    false,
+                ));
             }
         };
-        self.complete_verification(
-            request,
-            &mut attempt,
-            allow_switch_source,
-            confirm_after_switch,
-            guard_user_pause,
-            reply_success,
-            port,
-        )
+        self.complete_verification(requested, request, verification, purpose, port)
     }
 
     fn complete_verification<P: PlaybackExecutionPort + ?Sized>(
         &self,
+        requested: &PlaybackRequest,
         request: &PlaybackRequest,
-        attempt: &mut PlaybackAttempt,
-        allow_switch_source: bool,
-        confirm_after_switch: bool,
-        guard_user_pause: bool,
-        reply_success: bool,
+        verification: PlaybackVerification,
+        purpose: PlaybackPurpose,
         port: &mut P,
-    ) -> Result<PlaybackOutcome> {
-        match port.verify_playback_started(request, attempt)? {
-            PlaybackVerification::Success { status, message } => {
-                if confirm_after_switch {
-                    match self.confirm_switched_source_result(&status, port)? {
-                        PlaybackDecision::Skip => {
-                            port.reject_mismatch_as_no_source(Some(&status))?;
-                            self.report_no_source(Some(&status), false, port)?;
-                            port.update_monitor();
-                            return Ok(PlaybackOutcome::NoSource);
-                        }
-                        PlaybackDecision::Stopped => return Ok(PlaybackOutcome::Error),
-                        _ => {}
-                    }
-                }
-                if reply_success {
-                    port.reply(&message)?;
-                }
-                port.update_monitor();
-                Ok(PlaybackOutcome::Success)
-            }
-            PlaybackVerification::NoSource => {
-                self.report_no_source(None, false, port)?;
-                port.update_monitor();
-                Ok(PlaybackOutcome::NoSource)
-            }
+    ) -> Result<PlaybackCompletion> {
+        match verification {
+            PlaybackVerification::Success { status, message } => Ok(PlaybackCompletion::new(
+                PlaybackResult::success(
+                    requested,
+                    request,
+                    status,
+                    matches!(purpose, PlaybackPurpose::SourceRetry { .. }),
+                ),
+                purpose.replies_with_play_message().then_some(message),
+                true,
+            )),
+            PlaybackVerification::NoSource { status, reason } => Ok(PlaybackCompletion::new(
+                PlaybackResult::no_source(requested, request, status, reason),
+                Some("平台无对应歌曲音源".to_string()),
+                true,
+            )),
             PlaybackVerification::MismatchedCandidate(mismatch) => {
                 match self.handle_mismatch(
                     request,
                     &mismatch.status,
                     &mismatch.local_reason,
-                    allow_switch_source,
+                    purpose,
                 ) {
                     MismatchDecision::NoSource => {
                         port.reject_mismatch_as_no_source(Some(&mismatch.status))?;
-                        self.report_no_source(Some(&mismatch.status), false, port)?;
-                        port.update_monitor();
-                        Ok(PlaybackOutcome::NoSource)
+                        Ok(PlaybackCompletion::new(
+                            PlaybackResult::no_source(
+                                requested,
+                                request,
+                                Some(mismatch.status),
+                                mismatch.local_reason,
+                            ),
+                            Some("平台无对应歌曲音源".to_string()),
+                            true,
+                        ))
                     }
                     MismatchDecision::SwitchSource => self.switch_source_and_play(
+                        requested,
                         request,
                         &mismatch.status,
-                        guard_user_pause,
+                        purpose,
                         port,
                     ),
                 }
@@ -822,7 +984,7 @@ impl PlaybackApplication {
         request: &PlaybackRequest,
         status: &PlayerStatus,
         local_reason: &str,
-        allow_switch_source: bool,
+        purpose: PlaybackPurpose,
     ) -> MismatchDecision {
         log::info!("歌曲暂不匹配: {}", local_reason);
         if !local_reason.starts_with("播放器 URI 与请求不一致:") {
@@ -833,7 +995,7 @@ impl PlaybackApplication {
             log::info!("播放确认缺少 URI，拒绝使用歌名或歌手兜底");
             return MismatchDecision::NoSource;
         }
-        if allow_switch_source {
+        if purpose.allows_source_switch() {
             MismatchDecision::SwitchSource
         } else {
             MismatchDecision::NoSource
@@ -842,11 +1004,12 @@ impl PlaybackApplication {
 
     fn switch_source_and_play<P: PlaybackExecutionPort + ?Sized>(
         &self,
+        requested: &PlaybackRequest,
         request: &PlaybackRequest,
         mismatch_status: &PlayerStatus,
-        guard_user_pause: bool,
+        purpose: PlaybackPurpose,
         port: &mut P,
-    ) -> Result<PlaybackOutcome> {
+    ) -> Result<PlaybackCompletion> {
         let current_source = request_source(request);
         let next_source = AlternatePlaybackSource::other_than(current_source);
         let picked = match port.ai_search_and_pick(
@@ -857,9 +1020,16 @@ impl PlaybackApplication {
             Ok(Some(picked)) => picked,
             Ok(None) => {
                 port.reject_mismatch_as_no_source(Some(mismatch_status))?;
-                self.report_no_source(Some(mismatch_status), false, port)?;
-                port.update_monitor();
-                return Ok(PlaybackOutcome::NoSource);
+                return Ok(PlaybackCompletion::new(
+                    PlaybackResult::no_source(
+                        requested,
+                        request,
+                        Some(mismatch_status.clone()),
+                        format!("{} 平台无对应歌曲音源", next_source.id()),
+                    ),
+                    Some("平台无对应歌曲音源".to_string()),
+                    true,
+                ));
             }
             Err(error) => {
                 log::error!(
@@ -869,9 +1039,16 @@ impl PlaybackApplication {
                     error
                 );
                 port.reject_mismatch_as_no_source(Some(mismatch_status))?;
-                self.report_no_source(Some(mismatch_status), false, port)?;
-                port.update_monitor();
-                return Ok(PlaybackOutcome::NoSource);
+                return Ok(PlaybackCompletion::new(
+                    PlaybackResult::error(
+                        requested,
+                        request,
+                        Some(mismatch_status.clone()),
+                        error.to_string(),
+                    ),
+                    Some(error.user_message().to_string()),
+                    true,
+                ));
             }
         };
         log::info!(
@@ -891,49 +1068,35 @@ impl PlaybackApplication {
             requester: request.requester.clone(),
             console_bypass_dedup: false,
         };
-        let outcome = self.play_request(
+        let mut completion = self.run_request(
+            requested,
             &resolved.request(),
-            false,
-            false,
-            guard_user_pause,
-            false,
+            PlaybackPurpose::SourceRetry {
+                stop_when_user_paused: purpose.stop_when_user_paused(),
+            },
             port,
         )?;
-        if outcome == PlaybackOutcome::Success {
-            port.reply(&format!(
+        if completion.result.outcome() == PlaybackOutcome::Success {
+            completion.reply = Some(format!(
                 "因平台无音源,已由AI自动切换至:{}",
                 compact_candidate_title(&resolved.keyword)
-            ))?;
+            ));
         }
-        Ok(outcome)
+        Ok(completion)
     }
 
-    fn confirm_switched_source_result<P: PlaybackExecutionPort + ?Sized>(
+    fn finish_playback<P: PlaybackExecutionPort + ?Sized>(
         &self,
-        status: &PlayerStatus,
+        completion: PlaybackCompletion,
         port: &mut P,
-    ) -> Result<PlaybackDecision> {
-        let message = format!(
-            "换源结果:{},@确认@跳过",
-            song_title(&status.name, &status.singer)
-        );
-        if port.reply(&message).is_err() {
-            return Ok(PlaybackDecision::Timeout);
-        }
-        port.wait_for_decision(false, false, true)
-    }
-
-    fn report_no_source<P: PlaybackExecutionPort + ?Sized>(
-        &self,
-        status: Option<&PlayerStatus>,
-        pause_playback: bool,
-        port: &mut P,
-    ) -> Result<()> {
-        if pause_playback && status.is_some_and(|status| status.status == "playing") {
-            let _ = port.reject_mismatch_as_no_source(status);
+    ) -> Result<PlaybackResult> {
+        if completion.update_monitor {
             port.update_monitor();
         }
-        port.reply("平台无对应歌曲音源")
+        if let Some(reply) = completion.reply {
+            port.reply(&reply)?;
+        }
+        Ok(completion.result)
     }
 }
 
@@ -1107,10 +1270,11 @@ mod tests {
         verifications: VecDeque<PlaybackVerification>,
         removed_ids: Vec<u64>,
         replies: Vec<String>,
-        ai_candidate: Option<PlaybackPickedCandidate>,
+        reply_error: bool,
+        ai_search_result:
+            std::result::Result<Option<PlaybackPickedCandidate>, PlaybackSearchFailure>,
         ai_search_requests: Vec<(String, String, bool)>,
         played_uris: Vec<String>,
-        decision_calls: usize,
         user_paused: bool,
     }
 
@@ -1141,6 +1305,9 @@ mod tests {
     impl PlaybackExecutionPort for VerifyingPlaybackPort {
         fn reply(&mut self, message: &str) -> Result<()> {
             self.replies.push(message.to_string());
+            if self.reply_error {
+                bail!("reply failed");
+            }
             Ok(())
         }
 
@@ -1166,23 +1333,15 @@ mod tests {
                 source.to_string(),
                 prefer_accompaniment,
             ));
-            Ok(self.ai_candidate.clone())
+            self.ai_search_result.clone()
         }
 
         fn song_dedup_limited(&mut self, _request: &PlaybackRequest) -> Result<bool> {
             Ok(false)
         }
 
-        fn play_request_uri(&mut self, request: &PlaybackRequest) -> Result<PlaybackAttempt> {
+        fn play_and_verify(&mut self, request: &PlaybackRequest) -> Result<PlaybackVerification> {
             self.played_uris.push(request.uri.clone());
-            Ok(PlaybackAttempt::for_test(&request.uri))
-        }
-
-        fn verify_playback_started(
-            &mut self,
-            _request: &PlaybackRequest,
-            _attempt: &mut PlaybackAttempt,
-        ) -> Result<PlaybackVerification> {
             Ok(self
                 .verifications
                 .pop_front()
@@ -1207,16 +1366,6 @@ mod tests {
                 volume: 50,
                 requester: String::new(),
             })
-        }
-
-        fn wait_for_decision(
-            &mut self,
-            _allow_switch_source: bool,
-            _allow_ai: bool,
-            _timeout_confirms: bool,
-        ) -> Result<PlaybackDecision> {
-            self.decision_calls += 1;
-            Ok(PlaybackDecision::Confirm)
         }
 
         fn playback_queue(&mut self) -> Result<Vec<QueueItem>> {
@@ -1258,16 +1407,8 @@ mod tests {
             Ok(false)
         }
 
-        fn play_request_uri(&mut self, _request: &PlaybackRequest) -> Result<PlaybackAttempt> {
+        fn play_and_verify(&mut self, _request: &PlaybackRequest) -> Result<PlaybackVerification> {
             bail!("player unavailable")
-        }
-
-        fn verify_playback_started(
-            &mut self,
-            _request: &PlaybackRequest,
-            _attempt: &mut PlaybackAttempt,
-        ) -> Result<PlaybackVerification> {
-            unreachable!("playback never started")
         }
 
         fn reject_mismatch_as_no_source(&mut self, _status: Option<&PlayerStatus>) -> Result<()> {
@@ -1275,15 +1416,6 @@ mod tests {
         }
 
         fn player_status(&mut self) -> Result<PlayerStatus> {
-            unreachable!("playback never started")
-        }
-
-        fn wait_for_decision(
-            &mut self,
-            _allow_switch_source: bool,
-            _allow_ai: bool,
-            _timeout_confirms: bool,
-        ) -> Result<PlaybackDecision> {
             unreachable!("playback never started")
         }
 
@@ -1330,6 +1462,52 @@ mod tests {
     }
 
     #[test]
+    fn successful_queue_item_is_removed_before_reply_failure_is_reported() {
+        let item = QueueItem {
+            id: 13,
+            keyword: "已成功播放".to_string(),
+            uri: "fuo://qqmusic/songs/13".to_string(),
+            ..QueueItem::default()
+        };
+        let mut port = VerifyingPlaybackPort {
+            queue: vec![item],
+            verifications: VecDeque::from([PlaybackVerification::Success {
+                status: PlayerStatus {
+                    status: "playing".to_string(),
+                    current_uri: "fuo://qqmusic/songs/13".to_string(),
+                    ..PlayerStatus::default()
+                },
+                message: "开始播放: 已成功播放".to_string(),
+            }]),
+            removed_ids: Vec::new(),
+            replies: Vec::new(),
+            reply_error: true,
+            ai_search_result: Ok(None),
+            ai_search_requests: Vec::new(),
+            played_uris: Vec::new(),
+            user_paused: false,
+        };
+        let application = PlaybackApplication::new(PlaybackApplicationConfig {
+            console_bypass_dedup: true,
+            queue_max_size: 20,
+            skip_status_initial_ms: 0,
+            skip_status_poll_ms: 0,
+            skip_status_retries: 0,
+            monitor_tick_ms: 50,
+            monitor_status_ms: 50,
+            help_batch_ms: 0,
+        });
+
+        let error = application
+            .consume_queue("test", &mut port)
+            .expect_err("reply failure should still be reported");
+
+        assert_eq!(error.to_string(), "reply failed");
+        assert!(port.queue.is_empty());
+        assert_eq!(port.removed_ids, [13]);
+    }
+
+    #[test]
     fn automatic_queue_keeps_items_when_user_pause_is_active() {
         let item = QueueItem {
             id: 8,
@@ -1342,10 +1520,10 @@ mod tests {
             verifications: VecDeque::new(),
             removed_ids: Vec::new(),
             replies: Vec::new(),
-            ai_candidate: None,
+            reply_error: false,
+            ai_search_result: Ok(None),
             ai_search_requests: Vec::new(),
             played_uris: Vec::new(),
-            decision_calls: 0,
             user_paused: true,
         };
         let application = PlaybackApplication::new(PlaybackApplicationConfig {
@@ -1385,7 +1563,10 @@ mod tests {
         let mut port = VerifyingPlaybackPort {
             queue: vec![first, second],
             verifications: VecDeque::from([
-                PlaybackVerification::NoSource,
+                PlaybackVerification::NoSource {
+                    status: None,
+                    reason: "平台无对应歌曲音源".to_string(),
+                },
                 PlaybackVerification::Success {
                     status: PlayerStatus {
                         status: "playing".to_string(),
@@ -1405,10 +1586,10 @@ mod tests {
             ]),
             removed_ids: Vec::new(),
             replies: Vec::new(),
-            ai_candidate: None,
+            reply_error: false,
+            ai_search_result: Ok(None),
             ai_search_requests: Vec::new(),
             played_uris: Vec::new(),
-            decision_calls: 0,
             user_paused: false,
         };
         let application = PlaybackApplication::new(PlaybackApplicationConfig {
@@ -1462,13 +1643,13 @@ mod tests {
             ]),
             removed_ids: Vec::new(),
             replies: Vec::new(),
-            ai_candidate: Some(PlaybackPickedCandidate {
+            reply_error: false,
+            ai_search_result: Ok(Some(PlaybackPickedCandidate {
                 text: "备用歌曲 - 备用歌手".to_string(),
                 uri: "fuo://netease/songs/backup".to_string(),
-            }),
+            })),
             ai_search_requests: Vec::new(),
             played_uris: Vec::new(),
-            decision_calls: 0,
             user_paused: false,
         };
         let application = PlaybackApplication::new(PlaybackApplicationConfig {
@@ -1486,7 +1667,6 @@ mod tests {
             .consume_queue("test", &mut port)
             .expect("queue mismatch should be handled");
 
-        assert_eq!(port.decision_calls, 0);
         assert_eq!(port.removed_ids, [9]);
         assert_eq!(
             port.ai_search_requests,
@@ -1502,6 +1682,128 @@ mod tests {
         assert_eq!(
             port.replies,
             ["因平台无音源,已由AI自动切换至:备用歌曲-备用歌手"]
+        );
+    }
+
+    #[test]
+    fn queue_keeps_the_song_when_ai_source_search_temporarily_fails() {
+        let item = QueueItem {
+            id: 10,
+            keyword: "等待重试歌曲".to_string(),
+            source: "qqmusic".to_string(),
+            uri: "fuo://qqmusic/songs/requested".to_string(),
+            ..QueueItem::default()
+        };
+        let mut port = VerifyingPlaybackPort {
+            queue: vec![item],
+            verifications: VecDeque::from([PlaybackVerification::MismatchedCandidate(
+                PlaybackMismatch {
+                    status: PlayerStatus {
+                        status: "playing".to_string(),
+                        current_uri: "fuo://qqmusic/songs/other".to_string(),
+                        ..PlayerStatus::default()
+                    },
+                    local_reason: "播放器 URI 与请求不一致: current=other".to_string(),
+                },
+            )]),
+            removed_ids: Vec::new(),
+            replies: Vec::new(),
+            reply_error: false,
+            ai_search_result: Err(PlaybackSearchFailure::Backend(
+                "request timeout".to_string(),
+            )),
+            ai_search_requests: Vec::new(),
+            played_uris: Vec::new(),
+            user_paused: false,
+        };
+        let application = PlaybackApplication::new(PlaybackApplicationConfig {
+            console_bypass_dedup: true,
+            queue_max_size: 20,
+            skip_status_initial_ms: 0,
+            skip_status_poll_ms: 0,
+            skip_status_retries: 0,
+            monitor_tick_ms: 50,
+            monitor_status_ms: 50,
+            help_batch_ms: 0,
+        });
+
+        application
+            .consume_queue("test", &mut port)
+            .expect("temporary AI search failure should be reported without dropping the song");
+
+        assert_eq!(port.queue.len(), 1);
+        assert!(port.removed_ids.is_empty());
+        assert_eq!(port.replies, ["歌曲搜索后端失败，请稍后再试"]);
+    }
+
+    #[test]
+    fn queue_drops_a_song_only_after_the_alternate_source_has_no_candidate() {
+        let first = QueueItem {
+            id: 11,
+            keyword: "两个平台都无音源".to_string(),
+            source: "qqmusic".to_string(),
+            uri: "fuo://qqmusic/songs/missing".to_string(),
+            ..QueueItem::default()
+        };
+        let second = QueueItem {
+            id: 12,
+            keyword: "下一首可播放".to_string(),
+            source: "qqmusic".to_string(),
+            uri: "fuo://qqmusic/songs/next".to_string(),
+            ..QueueItem::default()
+        };
+        let mut port = VerifyingPlaybackPort {
+            queue: vec![first, second],
+            verifications: VecDeque::from([
+                PlaybackVerification::MismatchedCandidate(PlaybackMismatch {
+                    status: PlayerStatus {
+                        status: "playing".to_string(),
+                        current_uri: "fuo://qqmusic/songs/other".to_string(),
+                        ..PlayerStatus::default()
+                    },
+                    local_reason: "播放器 URI 与请求不一致: current=other".to_string(),
+                }),
+                PlaybackVerification::Success {
+                    status: PlayerStatus {
+                        status: "playing".to_string(),
+                        current_uri: "fuo://qqmusic/songs/next".to_string(),
+                        ..PlayerStatus::default()
+                    },
+                    message: "开始播放: 下一首可播放".to_string(),
+                },
+            ]),
+            removed_ids: Vec::new(),
+            replies: Vec::new(),
+            reply_error: false,
+            ai_search_result: Ok(None),
+            ai_search_requests: Vec::new(),
+            played_uris: Vec::new(),
+            user_paused: false,
+        };
+        let application = PlaybackApplication::new(PlaybackApplicationConfig {
+            console_bypass_dedup: true,
+            queue_max_size: 20,
+            skip_status_initial_ms: 0,
+            skip_status_poll_ms: 0,
+            skip_status_retries: 0,
+            monitor_tick_ms: 50,
+            monitor_status_ms: 50,
+            help_batch_ms: 0,
+        });
+
+        application
+            .consume_queue("test", &mut port)
+            .expect("confirmed no-source item should be dropped before the next song");
+
+        assert!(port.queue.is_empty());
+        assert_eq!(port.removed_ids, [11, 12]);
+        assert_eq!(
+            port.played_uris,
+            ["fuo://qqmusic/songs/missing", "fuo://qqmusic/songs/next"]
+        );
+        assert_eq!(
+            port.replies,
+            ["平台无对应歌曲音源", "开始播放: 下一首可播放"]
         );
     }
 
@@ -1539,13 +1841,13 @@ mod tests {
             ]),
             removed_ids: Vec::new(),
             replies: Vec::new(),
-            ai_candidate: Some(PlaybackPickedCandidate {
+            reply_error: false,
+            ai_search_result: Ok(Some(PlaybackPickedCandidate {
                 text: "备用歌曲 - 备用歌手".to_string(),
                 uri: "fuo://netease/songs/ai".to_string(),
-            }),
+            })),
             ai_search_requests: Vec::new(),
             played_uris: Vec::new(),
-            decision_calls: 0,
             user_paused: false,
         };
         let application = PlaybackApplication::new(PlaybackApplicationConfig {
@@ -1559,11 +1861,18 @@ mod tests {
             help_batch_ms: 0,
         });
 
-        let outcome = application
-            .play_confirmed(&request, true, &mut port)
+        let result = application
+            .play_confirmed(&request, &mut port)
             .expect("mismatched playback should switch source automatically");
 
-        assert_eq!(outcome, PlaybackOutcome::Success);
+        assert_eq!(result.outcome(), PlaybackOutcome::Success);
+        assert_eq!(result.requested().uri, "fuo://qqmusic/songs/requested");
+        assert_eq!(result.final_request().uri, "fuo://netease/songs/ai");
+        assert_eq!(
+            result.status().map(|status| status.current_uri.as_str()),
+            Some("fuo://netease/songs/ai")
+        );
+        assert!(result.source_switched());
         assert_eq!(
             port.ai_search_requests,
             [(
@@ -1576,7 +1885,6 @@ mod tests {
             port.played_uris,
             ["fuo://qqmusic/songs/requested", "fuo://netease/songs/ai"]
         );
-        assert_eq!(port.decision_calls, 0);
         assert_eq!(
             port.replies,
             ["因平台无音源,已由AI自动切换至:备用歌曲-备用歌手"]
@@ -1609,13 +1917,13 @@ mod tests {
             )]),
             removed_ids: Vec::new(),
             replies: Vec::new(),
-            ai_candidate: Some(PlaybackPickedCandidate {
+            reply_error: false,
+            ai_search_result: Ok(Some(PlaybackPickedCandidate {
                 text: "不应播放 - 不应播放".to_string(),
                 uri: "fuo://netease/songs/ai".to_string(),
-            }),
+            })),
             ai_search_requests: Vec::new(),
             played_uris: Vec::new(),
-            decision_calls: 0,
             user_paused: false,
         };
         let application = PlaybackApplication::new(PlaybackApplicationConfig {
@@ -1629,11 +1937,11 @@ mod tests {
             help_batch_ms: 0,
         });
 
-        let outcome = application
-            .play_confirmed(&request, true, &mut port)
+        let result = application
+            .play_confirmed(&request, &mut port)
             .expect("non-URI mismatch should be handled");
 
-        assert_eq!(outcome, PlaybackOutcome::NoSource);
+        assert_eq!(result.outcome(), PlaybackOutcome::NoSource);
         assert!(port.ai_search_requests.is_empty());
         assert_eq!(port.played_uris, ["fuo://qqmusic/songs/requested"]);
         assert_eq!(port.replies, ["平台无对应歌曲音源"]);
@@ -1677,16 +1985,8 @@ mod tests {
             Ok(false)
         }
 
-        fn play_request_uri(&mut self, request: &PlaybackRequest) -> Result<PlaybackAttempt> {
+        fn play_and_verify(&mut self, request: &PlaybackRequest) -> Result<PlaybackVerification> {
             self.played_uris.push(request.uri.clone());
-            Ok(PlaybackAttempt::for_test(&request.uri))
-        }
-
-        fn verify_playback_started(
-            &mut self,
-            _request: &PlaybackRequest,
-            _attempt: &mut PlaybackAttempt,
-        ) -> Result<PlaybackVerification> {
             Ok(self
                 .verifications
                 .pop_front()
@@ -1703,15 +2003,6 @@ mod tests {
                 self.status = status;
             }
             Ok(self.status.clone())
-        }
-
-        fn wait_for_decision(
-            &mut self,
-            _allow_switch_source: bool,
-            _allow_ai: bool,
-            _timeout_confirms: bool,
-        ) -> Result<PlaybackDecision> {
-            Ok(PlaybackDecision::Confirm)
         }
 
         fn playback_queue(&mut self) -> Result<Vec<QueueItem>> {

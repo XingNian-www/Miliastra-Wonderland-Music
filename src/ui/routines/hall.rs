@@ -417,7 +417,7 @@ fn read_hall_member_count(
             config.same_line_y_tolerance,
             OcrPriority::UiConfirmation,
         )
-        .map_err(|error| after_input_failure("ocr_hall_member_count", error))?;
+        .map_err(|error| after_input_failure("ocr_hall_member_count", error.into()))?;
     Ok(parse_hall_member_count(&count_text))
 }
 
@@ -448,7 +448,7 @@ fn read_hall_sample(
             config.same_line_y_tolerance,
             OcrPriority::UiConfirmation,
         )
-        .map_err(|error| after_input_failure("ocr_hall_name", error))?;
+        .map_err(|error| after_input_failure("ocr_hall_name", error.into()))?;
     let time_crop = crop_canvas(image, config.hall_time_region)
         .map_err(|error| after_input_failure("crop_hall_time", error))?;
     let time_text = ocr
@@ -457,7 +457,7 @@ fn read_hall_sample(
             config.same_line_y_tolerance,
             OcrPriority::UiConfirmation,
         )
-        .map_err(|error| after_input_failure("ocr_hall_time", error))?;
+        .map_err(|error| after_input_failure("ocr_hall_time", error.into()))?;
     Ok(HallInfoSample {
         name,
         remaining_minutes: parse_hall_remaining_minutes(&time_text),

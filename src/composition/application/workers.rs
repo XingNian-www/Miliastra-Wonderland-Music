@@ -323,16 +323,17 @@ struct DeferredChatSender {
 
 impl DeferredChatSender {
     fn run(self) -> Result<()> {
-        let retry_delay = self.retry_delay;
+        let mut generation = self.task_engine.generation()?;
         while self.running.load(AtomicOrdering::SeqCst) {
             if self.paused.load(AtomicOrdering::SeqCst) {
-                sleep(retry_delay);
+                generation = self.task_engine.wait_for_change(generation)?;
                 continue;
             }
             let Some((item, sending)) = self.task_engine.take_next_deferred()? else {
-                sleep(retry_delay);
+                generation = self.task_engine.wait_for_change(generation)?;
                 continue;
             };
+            generation = self.task_engine.generation()?;
             if !self.running.load(AtomicOrdering::SeqCst) {
                 drop(sending);
                 break;
@@ -340,7 +341,7 @@ impl DeferredChatSender {
             if self.paused.load(AtomicOrdering::SeqCst) {
                 drop(sending);
                 let _ = self.task_engine.requeue_deferred_front(item)?;
-                sleep(retry_delay);
+                generation = self.task_engine.generation()?;
                 continue;
             }
 
@@ -360,7 +361,7 @@ impl DeferredChatSender {
                         if let Err(requeue_error) = self.task_engine.requeue_deferred_front(item) {
                             log::warn!("后台歌词重新入队失败: {requeue_error}");
                         }
-                        sleep(retry_delay);
+                        self.wait_for_retry(&mut generation)?;
                         continue;
                     }
                 }
@@ -392,7 +393,7 @@ impl DeferredChatSender {
                     }
                     EnqueueOutcome::Added => {}
                 }
-                sleep(retry_delay);
+                self.wait_for_retry(&mut generation)?;
                 continue;
             }
 
@@ -501,7 +502,7 @@ impl DeferredChatSender {
                                             );
                                         }
                                     }
-                                    sleep(retry_delay);
+                                    self.wait_for_retry(&mut generation)?;
                                 }
                                 BatchFailureOutcome::Exhausted => {
                                     log::error!(
@@ -519,6 +520,14 @@ impl DeferredChatSender {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn wait_for_retry(&self, generation: &mut u64) -> Result<()> {
+        *generation = self.task_engine.generation()?;
+        *generation = self
+            .task_engine
+            .wait_for_change_timeout(*generation, self.retry_delay)?;
         Ok(())
     }
 

@@ -50,6 +50,7 @@ pub fn start(
     config: &HotkeyConfig,
     running: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
+    wake_tasks: Arc<dyn Fn() + Send + Sync>,
 ) -> Result<HotkeyRuntime> {
     if !config.enabled {
         return Ok(HotkeyRuntime {
@@ -68,7 +69,14 @@ pub fn start(
     let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
     let worker_running = Arc::clone(&running);
     let worker = thread::spawn(move || {
-        hotkey_loop(pause_key, exit_key, worker_running, paused, ready_sender)
+        hotkey_loop(
+            pause_key,
+            exit_key,
+            worker_running,
+            paused,
+            wake_tasks,
+            ready_sender,
+        )
     });
     let thread_id = ready_receiver
         .recv()
@@ -85,6 +93,7 @@ fn hotkey_loop(
     exit_key: VIRTUAL_KEY,
     running: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
+    wake_tasks: Arc<dyn Fn() + Send + Sync>,
     ready: SyncSender<u32>,
 ) {
     unsafe {
@@ -111,11 +120,13 @@ fn hotkey_loop(
                     PAUSE_ID => {
                         let now_paused = !paused.load(Ordering::SeqCst);
                         paused.store(now_paused, Ordering::SeqCst);
+                        wake_tasks();
                         log::info!("脚本{}", if now_paused { "已暂停" } else { "已恢复" });
                     }
                     EXIT_ID => {
                         log::info!("收到退出热键");
                         running.store(false, Ordering::SeqCst);
+                        wake_tasks();
                         break;
                     }
                     _ => {}

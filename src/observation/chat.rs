@@ -19,8 +19,8 @@ pub(crate) use secondary_unread_vision::{
 };
 pub(crate) use stream::{
     ChatObservationDispatch, ChatObservationExclusiveGuard, ChatObservationShared,
-    CompletionAdvanceSubscriber, PrimaryObservedMessage, SecondaryChatObservation,
-    SecondaryObservedMessage, SecondaryRecognizedMessage,
+    CompletionAdvanceSubscriber, PrimaryObservationCursor, PrimaryObservedMessage,
+    SecondaryChatObservation, SecondaryObservedMessage, SecondaryRecognizedMessage,
 };
 pub(crate) use visual::{
     SECONDARY_TITLE_RECT, SecondaryChatIdentity, SecondaryHallBubble, classify_title,

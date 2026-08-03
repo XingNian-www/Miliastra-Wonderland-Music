@@ -160,6 +160,7 @@ impl TurtleSoupCommand {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn same_request(&self, other: &Self) -> bool {
         self == other
     }

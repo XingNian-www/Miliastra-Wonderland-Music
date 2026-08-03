@@ -338,8 +338,8 @@ impl PlaybackCommandPort for ApplicationRuntime {
             return Ok(true);
         }
         Ok(!self
-            .business
-            .scheduler_snapshot()
+            .task_engine
+            .snapshot()
             .map_err(anyhow::Error::from)?
             .pending_labels()
             .is_empty())
@@ -353,7 +353,7 @@ impl PlaybackCommandPort for ApplicationRuntime {
         workers::start_background_lyrics(
             &self.background_commands,
             self.player.clone(),
-            self.business.clone(),
+            self.task_engine.clone(),
             self.running.clone(),
             Duration::from_millis(self.config.timing.playback.monitor_status_ms),
             duration,

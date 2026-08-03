@@ -225,7 +225,7 @@ impl ApplicationRuntime {
         last_title: &mut Option<ChangeFingerprint>,
         identity: &mut Option<SecondaryChatIdentity>,
     ) -> Result<bool> {
-        if self.business.scheduler_snapshot()?.is_busy() {
+        if self.task_engine.snapshot()?.is_busy() {
             return Ok(false);
         }
         let title_fingerprint = rect_chat_change_fingerprint(image, SECONDARY_TITLE_RECT)?;

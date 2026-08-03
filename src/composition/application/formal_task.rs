@@ -663,23 +663,25 @@ mod tests {
         fn cancel(self: Box<Self>) {}
     }
 
-    fn business_runtime() -> BusinessRuntime {
-        BusinessRuntime::start(
+    fn business_runtime() -> (BusinessRuntime, TaskEngineHandle) {
+        let task_engine = TaskEngineHandle::new(None);
+        let runtime = BusinessRuntime::start_with_task_engine(
             8,
             IdiomChainService::from_entries_for_test(
                 &["画蛇添足", "足智多谋", "谋事在人", "人山人海"],
                 Some(Duration::from_secs(300)),
             ),
             CardGameService::new(LandlordConfig::default()),
+            task_engine.clone(),
         )
-        .expect("business runtime")
+        .expect("business runtime");
+        (runtime, task_engine)
     }
 
     #[test]
     fn enqueued_formal_task_starts_without_a_polling_interval() {
-        let business_runtime = business_runtime();
+        let (business_runtime, task_engine) = business_runtime();
         let business = business_runtime.handle();
-        let task_engine = business_runtime.task_engine();
         let task_runtime = FormalTaskRuntime::start_without_application(
             business.clone(),
             task_engine.clone(),
@@ -711,9 +713,8 @@ mod tests {
 
     #[test]
     fn formal_task_runtime_requests_cancellation_from_the_running_task_on_shutdown() {
-        let business_runtime = business_runtime();
+        let (business_runtime, task_engine) = business_runtime();
         let business = business_runtime.handle();
-        let task_engine = business_runtime.task_engine();
         let task_runtime = FormalTaskRuntime::start_without_application(
             business.clone(),
             task_engine.clone(),
@@ -749,9 +750,8 @@ mod tests {
 
     #[test]
     fn formal_task_runtime_shutdown_has_a_time_limit_when_work_ignores_cancellation() {
-        let business_runtime = business_runtime();
+        let (business_runtime, task_engine) = business_runtime();
         let business = business_runtime.handle();
-        let task_engine = business_runtime.task_engine();
         let task_runtime = FormalTaskRuntime::start_without_application(
             business.clone(),
             task_engine.clone(),

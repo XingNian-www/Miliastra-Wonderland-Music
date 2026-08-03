@@ -12,7 +12,7 @@ use crate::features::undercover::UndercoverSnapshot;
 use crate::runtime::business::{BusinessOperationalSnapshot, BusinessStateSink};
 use crate::runtime::decision::DecisionSnapshot;
 use crate::runtime::scheduler::{DiagnosticTaskSnapshot, FormalTaskSnapshot};
-use crate::runtime::task_engine::TaskEngineStateSink;
+use crate::runtime::task_engine::{TaskEngineProjection, TaskEngineStateSink};
 use crate::runtime::ui::{UiRoutineProgress, UiRoutineProgressSink, UiRoutineProgressStage};
 
 #[derive(Clone, Debug, Serialize)]
@@ -166,19 +166,12 @@ pub(crate) enum MonitorEvent {
     Command(String),
     Status(String),
     PlaybackController(MonitorPlaybackController),
-    ChatListener {
-        mode: String,
-        pending_mode: String,
-    },
+    ChatListener { mode: String, pending_mode: String },
     ScannerPaused(bool),
     BusinessOperational(BusinessOperationalSnapshot),
     UiState(String),
     UiRoutineProgress(MonitorUiRoutineProgress),
-    Scheduler {
-        pending_tasks: Vec<String>,
-        tasks: Vec<FormalTaskSnapshot>,
-    },
-    Diagnostics(Vec<DiagnosticTaskSnapshot>),
+    TaskEngine(TaskEngineProjection),
     Decision(Option<DecisionSnapshot>),
     TurtleSoup(TurtleSoupSnapshot),
     Undercover(UndercoverSnapshot),
@@ -219,8 +212,9 @@ struct MonitorState {
     operational: MonitorOperationalState,
     ui_routine: Option<MonitorUiRoutineProgress>,
     pending_tasks: Vec<String>,
-    web_tools: Vec<DiagnosticTaskSnapshot>,
+    web_tools: Arc<[DiagnosticTaskSnapshot]>,
     tasks: Vec<FormalTaskSnapshot>,
+    task_engine_generation: Option<u64>,
     decision: Option<DecisionSnapshot>,
     turtle_soup: TurtleSoupSnapshot,
     undercover: UndercoverSnapshot,
@@ -271,14 +265,18 @@ impl MonitorProjection {
             }
             MonitorEvent::UiState(ui_state) => state.operational.ui_state = ui_state,
             MonitorEvent::UiRoutineProgress(progress) => state.ui_routine = Some(progress),
-            MonitorEvent::Scheduler {
-                pending_tasks,
-                tasks,
-            } => {
-                state.pending_tasks = pending_tasks;
-                state.tasks = tasks;
+            MonitorEvent::TaskEngine(projection) => {
+                let is_newer = state
+                    .task_engine_generation
+                    .map(|generation| projection.generation > generation)
+                    .unwrap_or(true);
+                if is_newer {
+                    state.task_engine_generation = Some(projection.generation);
+                    state.pending_tasks = projection.scheduler.pending_labels().to_vec();
+                    state.tasks = projection.scheduler.tasks().to_vec();
+                    state.web_tools = projection.diagnostics;
+                }
             }
-            MonitorEvent::Diagnostics(web_tools) => state.web_tools = web_tools,
             MonitorEvent::Decision(decision) => state.decision = decision,
             MonitorEvent::TurtleSoup(snapshot) => state.turtle_soup = snapshot,
             MonitorEvent::Undercover(snapshot) => state.undercover = snapshot,
@@ -301,7 +299,7 @@ impl MonitorProjection {
             operational: state.operational.clone(),
             ui_routine: state.ui_routine.clone(),
             pending_tasks: state.pending_tasks.clone(),
-            web_tools: state.web_tools.clone(),
+            web_tools: state.web_tools.as_ref().to_vec(),
             tasks: state.tasks.clone(),
             decision: state.decision.clone(),
             turtle_soup: state.turtle_soup.clone(),
@@ -328,8 +326,9 @@ impl MonitorShared {
                 },
                 ui_routine: None,
                 pending_tasks: Vec::new(),
-                web_tools: Vec::new(),
+                web_tools: Arc::from(Vec::<DiagnosticTaskSnapshot>::new()),
                 tasks: Vec::new(),
+                task_engine_generation: None,
                 decision: None,
                 turtle_soup: TurtleSoupSnapshot::default(),
                 undercover: UndercoverSnapshot::default(),
@@ -471,15 +470,8 @@ impl BusinessStateSink for MonitorShared {
 }
 
 impl TaskEngineStateSink for MonitorShared {
-    fn publish_scheduler(&self, snapshot: crate::runtime::scheduler::FormalSchedulerSnapshot) {
-        self.publish_async(MonitorEvent::Scheduler {
-            pending_tasks: snapshot.pending_labels().to_vec(),
-            tasks: snapshot.tasks().to_vec(),
-        });
-    }
-
-    fn publish_diagnostics(&self, snapshot: Vec<DiagnosticTaskSnapshot>) {
-        self.publish_async(MonitorEvent::Diagnostics(snapshot));
+    fn publish_task_engine(&self, projection: TaskEngineProjection) {
+        self.publish_async(MonitorEvent::TaskEngine(projection));
     }
 }
 
@@ -524,6 +516,9 @@ fn current_unix_millis() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc;
+    use std::thread;
+
     use anyhow::{Result, bail};
     use image::DynamicImage;
 
@@ -620,6 +615,56 @@ mod tests {
         assert!(snapshot.operational.scanner_paused);
         assert!(!snapshot.operational.commands_enabled);
         assert_eq!(snapshot.operational.idle_exit_remaining_seconds, Some(12));
+        monitor.shutdown();
+    }
+
+    #[test]
+    fn concurrent_older_task_engine_projection_cannot_overwrite_newer_state() {
+        let monitor = MonitorShared::new(20);
+        let older_monitor = monitor.clone();
+        let newer_monitor = monitor.clone();
+        let (newer_published, release_older) = mpsc::channel();
+        let older = thread::spawn(move || {
+            release_older.recv().unwrap();
+            TaskEngineStateSink::publish_task_engine(
+                &older_monitor,
+                TaskEngineProjection {
+                    generation: 1,
+                    scheduler: crate::runtime::scheduler::FormalSchedulerSnapshot::default(),
+                    diagnostics: vec![DiagnosticTaskSnapshot {
+                        id: 1,
+                        label: "older".to_string(),
+                        status: "queued".to_string(),
+                        result: None,
+                    }]
+                    .into(),
+                },
+            );
+        });
+        let newer = thread::spawn(move || {
+            TaskEngineStateSink::publish_task_engine(
+                &newer_monitor,
+                TaskEngineProjection {
+                    generation: 2,
+                    scheduler: crate::runtime::scheduler::FormalSchedulerSnapshot::default(),
+                    diagnostics: vec![DiagnosticTaskSnapshot {
+                        id: 2,
+                        label: "newer".to_string(),
+                        status: "completed".to_string(),
+                        result: None,
+                    }]
+                    .into(),
+                },
+            );
+            newer_published.send(()).unwrap();
+        });
+        newer.join().unwrap();
+        older.join().unwrap();
+
+        let snapshot = monitor.snapshot();
+        assert_eq!(snapshot.web_tools.len(), 1);
+        assert_eq!(snapshot.web_tools[0].id, 2);
+        assert_eq!(snapshot.web_tools[0].label, "newer");
         monitor.shutdown();
     }
 

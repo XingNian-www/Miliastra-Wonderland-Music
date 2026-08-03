@@ -236,6 +236,7 @@ impl ModuleCommand {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn same_request(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::SongRequest(left), Self::SongRequest(right)) => left.same_request(right),

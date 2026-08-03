@@ -68,6 +68,15 @@ fn attach_question_orders<Q: PartialEq>(
         .collect()
 }
 
+fn primary_command_candidates(
+    messages: &[PrimaryObservedMessage],
+) -> impl Iterator<Item = (usize, &PrimaryObservedMessage)> {
+    messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| message.is_new)
+}
+
 impl ApplicationRuntime {
     pub(super) fn clear_hall_countdown_cache_for_new_visual_session(
         &self,
@@ -164,10 +173,12 @@ impl ApplicationRuntime {
     }
 
     pub(super) fn start_hotkeys(&self) -> Result<hotkeys::HotkeyRuntime> {
+        let business = self.business.clone();
         hotkeys::start(
             &self.config.hotkeys,
             Arc::clone(&self.running),
             Arc::clone(&self.paused),
+            Arc::new(move || business.wake_scheduler()),
         )
     }
 
@@ -720,8 +731,8 @@ impl ApplicationRuntime {
                         self.process_secondary_chat_observation(frame, observation)?;
                 }
                 ChatObservationDispatch::Gap(gap) => {
-                    self.locks = CommandLockState::default();
-                    self.screen_lock_primed.store(false, AtomicOrdering::SeqCst);
+                    self.chat_baseline_primed
+                        .store(false, AtomicOrdering::SeqCst);
                     log::warn!(
                         "聊天观察流出现缺口，下一屏仅重建命令基线: kind={:?} missing={:?}..={:?}",
                         gap.kind,
@@ -746,13 +757,6 @@ impl ApplicationRuntime {
                 &observed.message
             })
             .collect::<Vec<_>>();
-        if self
-            .reset_locks_requested
-            .swap(false, AtomicOrdering::SeqCst)
-        {
-            self.locks = CommandLockState::default();
-            log::info!("已重置命令屏幕锁");
-        }
         let active_entertainment = self.business.active_entertainment()?;
         let command_router = ChatCommandRouter::new(&self.custom_workflow);
         let visible_turtle_questions = if self.business.turtle_soup_accepts_questions()? {
@@ -778,7 +782,7 @@ impl ApplicationRuntime {
         } else {
             Vec::new()
         };
-        let suppress_new_turtle_questions = !self.screen_lock_primed.load(AtomicOrdering::SeqCst);
+        let suppress_new_turtle_questions = !self.chat_baseline_primed.load(AtomicOrdering::SeqCst);
         let new_turtle_questions = self.business.filter_turtle_soup_primary_questions(
             visible_turtle_questions
                 .iter()
@@ -792,7 +796,8 @@ impl ApplicationRuntime {
         }
 
         let mut parsed = Vec::new();
-        for (observed, message) in observed_messages.iter().zip(messages) {
+        for (_, observed) in primary_command_candidates(&observed_messages) {
+            let message = &observed.message;
             if message.text.is_empty() {
                 continue;
             }
@@ -816,6 +821,7 @@ impl ApplicationRuntime {
             };
             if !self.commands_enabled()? && message.message_type != "pink" {
                 log::info!("命令识别已禁用，跳过: {}", parsed_command.raw);
+                self.chat_observations.acknowledge_primary(&observed.id)?;
                 continue;
             }
             if let ModuleCommand::Invite(invite) = &parsed_command.command
@@ -823,40 +829,33 @@ impl ApplicationRuntime {
             {
                 let seq = invite.seq.expect("unsequenced invites are always accepted");
                 log::info!("邀请参数 {} 已执行过，跳过: {}", seq, parsed_command.raw);
-                continue;
-            }
-            if parsed
-                .iter()
-                .any(|existing| command::same_lock_command(existing, &parsed_command))
-            {
-                log::info!("同轮重复识别命令，已合并: {}", parsed_command.raw);
+                self.chat_observations.acknowledge_primary(&observed.id)?;
                 continue;
             }
             log::debug!("解析命令: {}", parsed_command.raw);
             parsed.push(parsed_command);
         }
 
-        let update = self
-            .locks
-            .update(&parsed, self.business.scheduler_snapshot()?.is_busy());
-        for command in update.unlocked {
-            log::info!("解锁: {}", command);
-        }
-        for command in update.skipped {
-            log::info!("命令仍在屏幕内，本轮跳过: {}", command);
-        }
-        if !self.screen_lock_primed.swap(true, AtomicOrdering::SeqCst) {
+        let accepted = parsed
+            .into_iter()
+            .map(|routed| PendingCommand {
+                lock_key: command::lock_key(&routed),
+                routed,
+            })
+            .collect::<Vec<_>>();
+        if !self.chat_baseline_primed.swap(true, AtomicOrdering::SeqCst) {
             for question in new_turtle_questions {
                 log::info!(
                     "启动屏幕锁已记录当前可见海龟汤提问，不执行: nickname={}",
                     question.player
                 );
             }
-            for pending in update.accepted {
+            for pending in accepted {
                 log::info!(
-                    "启动屏幕锁已记录当前可见命令，不执行: {}",
+                    "聊天观察基线已记录当前可见命令，不执行: {}",
                     pending.routed.raw
                 );
+                self.acknowledge_primary_command(&pending.routed)?;
             }
             return Ok(());
         }
@@ -865,8 +864,7 @@ impl ApplicationRuntime {
         } else {
             Vec::new()
         };
-        let commands = update
-            .accepted
+        let commands = accepted
             .into_iter()
             .map(|pending| {
                 let order = pending
@@ -891,14 +889,28 @@ impl ApplicationRuntime {
                 }
                 ObservedInput::Command(pending) => {
                     if self.enqueue_chat_listener_command(&pending.routed)? {
+                        self.acknowledge_primary_command(&pending.routed)?;
                         continue;
                     }
                     if self.apply_immediate_administration(&pending.routed, false)? {
+                        self.acknowledge_primary_command(&pending.routed)?;
                         continue;
                     }
+                    let routed = pending.routed.clone();
                     self.enqueue_pending_command(pending)?;
+                    self.acknowledge_primary_command(&routed)?;
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn acknowledge_primary_command(&self, command: &RoutedCommand) -> Result<()> {
+        let Some(message_id) = command.observation.message_id.as_ref() else {
+            return Ok(());
+        };
+        if !self.chat_observations.acknowledge_primary(message_id)? {
+            log::debug!("一级命令完成处理时消息已滚出当前画面: id={message_id:?}");
         }
         Ok(())
     }
@@ -1159,7 +1171,14 @@ pub(super) fn scan_chat_with_shared_ocr(
 
 #[cfg(test)]
 mod tests {
-    use super::{ObservedInput, attach_question_orders, merge_observed_inputs};
+    use super::{
+        ObservedInput, attach_question_orders, merge_observed_inputs, primary_command_candidates,
+    };
+    use crate::observation::chat::{
+        BubbleSequence, ChatIdentity, ChatMessage, ObservedChatMessageId, PrimaryObservedMessage,
+        VisualSessionId,
+    };
+    use crate::ui::geometry::Rect;
 
     fn labels(inputs: Vec<ObservedInput<&'static str, &'static str>>) -> Vec<&'static str> {
         inputs
@@ -1192,5 +1211,42 @@ mod tests {
         .expect("question orders");
 
         assert_eq!(ordered, [(2, "same-question"), (5, "same-question")]);
+    }
+
+    #[test]
+    fn primary_command_parsing_receives_only_unhandled_new_message_ids() {
+        let messages = vec![
+            observed_message(1, "@状态", false),
+            observed_message(2, "状态消息", false),
+            observed_message(3, "@状态", true),
+        ];
+
+        let candidates = primary_command_candidates(&messages)
+            .map(|(order, message)| {
+                (
+                    order,
+                    message.id.bubble_sequence.get(),
+                    message.message.text.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(candidates, [(2, 3, "@状态")]);
+    }
+
+    fn observed_message(sequence: u64, text: &str, is_new: bool) -> PrimaryObservedMessage {
+        PrimaryObservedMessage {
+            id: ObservedChatMessageId::new(
+                VisualSessionId::new(1),
+                ChatIdentity::PrimaryHall,
+                BubbleSequence::new(sequence),
+            ),
+            message: ChatMessage {
+                message_type: "blue".to_string(),
+                block: Rect::new(0, sequence as i32 * 20, 10, 10),
+                text: text.to_string(),
+            },
+            is_new,
+        }
     }
 }

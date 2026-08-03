@@ -20,7 +20,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, sleep};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use self::formal_task::{FormalTaskClient, FormalTaskExecutionRuntime};
+use self::formal_task::{FormalTaskClient, FormalTaskRuntime};
 use crate::adapters::feeluown::FeelUOwnClient;
 use crate::adapters::player::PlayerRuntimeBackend;
 use crate::adapters::windows::{WindowsUiDevice, parse_key};
@@ -64,17 +64,15 @@ use crate::features::undercover::{
     UndercoverApplication, UndercoverCommand, UndercoverCommandSource, UndercoverDeliveryPort,
     UndercoverEffectTask, UndercoverRuntimeService,
 };
-use crate::interfaces::chat::{
-    self as command, ChatCommandRouter, CommandLockState, PendingCommand,
-};
+use crate::interfaces::chat::{self as command, ChatCommandRouter, PendingCommand};
 use crate::interfaces::hotkeys;
 use crate::interfaces::http::{self, WebToolRequest, WebToolTemplate};
 use crate::interfaces::ui_plan::{WorkflowOperation, WorkflowResidency};
 use crate::observation::chat::{
     ChatMessage, ChatObservationDispatch, ChatObservationExclusiveGuard, ChatObservationShared,
     ChatScanTelemetry, ChatScanTelemetrySink, CompletionAdvanceSubscriber, ObservedFrame,
-    PrimaryObservedMessage, ResolvedTemplateArgs, SECONDARY_TITLE_RECT, SecondaryChatIdentity,
-    SecondaryChatObservation, SecondaryHallBubble, SecondaryObservedMessage,
+    PrimaryObservationCursor, PrimaryObservedMessage, ResolvedTemplateArgs, SECONDARY_TITLE_RECT,
+    SecondaryChatIdentity, SecondaryChatObservation, SecondaryHallBubble, SecondaryObservedMessage,
     SecondaryRecognizedMessage, TemplateArgs, UnreadFriendHit, classify_title, count_chat_markers,
     find_unread_friend_hits, hall_bubble_layout_is_stable, hall_bubble_sequence_is_retained_prefix,
     hall_bubble_sequence_overlap, latest_incoming_bubble_rect, latest_incoming_fingerprint,
@@ -104,9 +102,7 @@ use crate::runtime::openai::OpenAiRuntime;
 use crate::runtime::player_io::{
     PlayerRuntime, PlayerRuntimeConfig, PlayerSearchClient, PlayerSearchClientError,
 };
-use crate::runtime::scheduler::{
-    DiagnosticTaskCompletion, FormalTaskCompletion, FormalTaskEnqueueOutcome,
-};
+use crate::runtime::scheduler::FormalTaskEnqueueOutcome;
 use crate::runtime::ui::{
     FrameDemand, FrameDemandSubscription, FramePublication, UiRuntime, UiStateKind,
     UiStateObservation,
@@ -358,7 +354,7 @@ pub(crate) struct ApplicationRuntime {
     business: BusinessRuntimeHandle,
     business_events: BusinessRuntimeEventSink,
     business_runtime: Option<BusinessRuntimeGroup>,
-    formal_task_execution: Option<FormalTaskExecutionRuntime>,
+    formal_task_runtime: Option<FormalTaskRuntime>,
     formal_tasks: Option<FormalTaskClient>,
     background_commands: workers::BackgroundCommandManager,
     player: PlayerController<PlayerRuntimeBackend, BusinessPlaybackStateAdapter>,
@@ -372,10 +368,8 @@ pub(crate) struct ApplicationRuntime {
     ocr: OcrRuntimeHandle,
     ocr_runtime: Option<OcrRuntime>,
     latest_frame: Arc<Mutex<LatestFrameCache>>,
-    locks: CommandLockState,
     window_detection_signal: WindowDetectionSignal,
-    screen_lock_primed: Arc<AtomicBool>,
-    reset_locks_requested: Arc<AtomicBool>,
+    chat_baseline_primed: Arc<AtomicBool>,
     card_games: CardGameApplication,
     administration_application: AdministrationApplication,
     hall_application: HallApplication,
@@ -739,8 +733,13 @@ enum ChatDecisionScope {
 }
 
 enum ChatDecisionReaderKind {
-    Primary,
-    SecondaryCurrentHall { previous: Vec<SecondaryHallBubble> },
+    Primary {
+        cursor: Option<PrimaryObservationCursor>,
+        pending: Vec<ChatMessage>,
+    },
+    SecondaryCurrentHall {
+        previous: Vec<SecondaryHallBubble>,
+    },
 }
 
 struct ChatDecisionReader {
@@ -756,7 +755,7 @@ impl ChatDecisionReader {
 
     fn poll_interval_ms(&self, configured_ms: u64) -> u64 {
         match &self.kind {
-            ChatDecisionReaderKind::Primary => configured_ms.max(50),
+            ChatDecisionReaderKind::Primary { .. } => configured_ms.max(50),
             ChatDecisionReaderKind::SecondaryCurrentHall { .. } => configured_ms.clamp(100, 500),
         }
     }
@@ -869,10 +868,7 @@ impl ApplicationRuntime {
                 stability_changed_ratio_threshold: config.ocr.change_pixel_threshold,
             },
         );
-        let chat_observations = ChatObservationShared::new(
-            config.ocr.change_mean_threshold,
-            config.ocr.change_pixel_threshold,
-        );
+        let chat_observations = ChatObservationShared::new();
         let running = Arc::new(AtomicBool::new(true));
         let business_runtime_builder =
             BusinessRuntimeGroupBuilder::start(DEADLINE_RUNTIME_QUEUE_CAPACITY)?;
@@ -1030,7 +1026,7 @@ impl ApplicationRuntime {
             business,
             business_events,
             business_runtime: Some(business_runtime),
-            formal_task_execution: None,
+            formal_task_runtime: None,
             formal_tasks: None,
             background_commands: workers::BackgroundCommandManager::new(),
             player,
@@ -1044,10 +1040,8 @@ impl ApplicationRuntime {
             ocr,
             ocr_runtime: Some(ocr_runtime),
             latest_frame: Arc::new(Mutex::new(LatestFrameCache::default())),
-            locks: CommandLockState::default(),
             window_detection_signal: WindowDetectionSignal::new(),
-            screen_lock_primed: Arc::new(AtomicBool::new(false)),
-            reset_locks_requested: Arc::new(AtomicBool::new(false)),
+            chat_baseline_primed: Arc::new(AtomicBool::new(false)),
             card_games,
             administration_application,
             hall_application: HallApplication,

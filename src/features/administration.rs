@@ -380,6 +380,7 @@ impl AdministrationCommand {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn same_request(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::IdleExit { minutes: left }, Self::IdleExit { minutes: right }) => left == right,

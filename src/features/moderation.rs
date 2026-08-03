@@ -98,6 +98,7 @@ impl ModerationCommand {
         format!("moderation:{}:{}", self.action.label(), self.uid)
     }
 
+    #[cfg(test)]
     pub(crate) fn same_request(&self, other: &Self) -> bool {
         self.action == other.action && self.uid == other.uid
     }

@@ -1,6 +1,9 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 
@@ -18,50 +21,80 @@ use crate::runtime::business::{
 use crate::runtime::chat_listener::ChatListenerMode;
 use crate::runtime::decision::DecisionAction;
 use crate::runtime::scheduler::{
-    DiagnosticTaskSnapshot, DiagnosticTaskSubmission, DiagnosticTaskWork, FormalTaskCancelOutcome,
-    FormalTaskDedupKey, FormalTaskEnqueueOutcome, FormalTaskSubmission, FormalTaskWork,
+    DiagnosticTaskCompletion, DiagnosticTaskSnapshot, DiagnosticTaskSubmission, DiagnosticTaskWork,
+    FormalTaskCancelOutcome, FormalTaskCancellationToken, FormalTaskCompletion, FormalTaskDedupKey,
+    FormalTaskEnqueueOutcome, FormalTaskExecutionOutcome, FormalTaskSubmission, FormalTaskWork,
 };
 
-const EXECUTION_QUEUE_CAPACITY: usize = 8;
+const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
-enum ExecutionMessage {
-    Execute {
-        task: PendingTask,
-        response: SyncSender<Result<String, String>>,
-    },
-    ExecuteDiagnostic {
-        request: WebToolRequest,
-        response: SyncSender<Result<String, String>>,
-    },
-    Shutdown(SyncSender<()>),
+struct ApplicationExecutionState {
+    application: Mutex<Option<ApplicationRuntime>>,
 }
 
 #[derive(Clone)]
 pub(crate) struct FormalTaskExecutionHandle {
-    sender: SyncSender<ExecutionMessage>,
+    application: Weak<ApplicationExecutionState>,
 }
 
 impl FormalTaskExecutionHandle {
-    fn execute(&self, task: PendingTask) -> Result<String> {
-        let (response, receiver) = mpsc::sync_channel(1);
-        self.sender
-            .send(ExecutionMessage::Execute { task, response })
-            .map_err(|_| anyhow!("正式任务执行运行时已停止"))?;
-        receiver
-            .recv()
-            .map_err(|_| anyhow!("正式任务执行运行时未返回结果"))?
-            .map_err(anyhow::Error::msg)
+    fn execute(
+        &self,
+        mut task: PendingTask,
+        cancellation: FormalTaskCancellationToken,
+    ) -> FormalTaskExecutionOutcome {
+        let Some(state) = self.application.upgrade() else {
+            return FormalTaskExecutionOutcome::Completed(Err(anyhow!("正式任务执行上下文已停止")));
+        };
+        let mut application = match state.application.lock() {
+            Ok(application) => application,
+            Err(poisoned) => {
+                log::error!("正式任务执行上下文锁曾发生异常，继续使用已恢复状态");
+                poisoned.into_inner()
+            }
+        };
+        let Some(application) = application.as_mut() else {
+            return FormalTaskExecutionOutcome::Completed(Err(anyhow!(
+                "正式任务执行上下文尚未初始化"
+            )));
+        };
+        if cancellation.is_requested() {
+            task.cancel(&application.business);
+            return FormalTaskExecutionOutcome::Canceled(
+                "任务在开始执行前收到取消请求".to_string(),
+            );
+        }
+        let label = task.label();
+        let result = match catch_unwind(AssertUnwindSafe(|| application.execute_pending_task(task)))
+        {
+            Ok(Ok(PendingTaskExecution::Completed)) => Ok(format!("{label}执行完成")),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(anyhow!("待处理任务执行发生未捕获异常")),
+        };
+        FormalTaskExecutionOutcome::Completed(result)
     }
 
     fn execute_diagnostic(&self, request: WebToolRequest) -> Result<String> {
-        let (response, receiver) = mpsc::sync_channel(1);
-        self.sender
-            .send(ExecutionMessage::ExecuteDiagnostic { request, response })
-            .map_err(|_| anyhow!("应用执行运行时已停止"))?;
-        receiver
-            .recv()
-            .map_err(|_| anyhow!("应用执行运行时未返回诊断结果"))?
-            .map_err(anyhow::Error::msg)
+        let state = self
+            .application
+            .upgrade()
+            .ok_or_else(|| anyhow!("应用执行上下文已停止"))?;
+        let mut application = match state.application.lock() {
+            Ok(application) => application,
+            Err(poisoned) => {
+                log::error!("应用执行上下文锁曾发生异常，继续使用已恢复状态");
+                poisoned.into_inner()
+            }
+        };
+        let application = application
+            .as_mut()
+            .ok_or_else(|| anyhow!("应用执行上下文尚未初始化"))?;
+        match catch_unwind(AssertUnwindSafe(|| {
+            application.execute_web_tool_request(request)
+        })) {
+            Ok(result) => result,
+            Err(_) => Err(anyhow!("Web 工具执行发生未捕获异常")),
+        }
     }
 }
 
@@ -206,58 +239,282 @@ impl HttpQueryPort for FormalTaskClient {
     }
 }
 
-pub(crate) struct FormalTaskExecutionRuntime {
-    handle: FormalTaskExecutionHandle,
-    worker: Option<JoinHandle<()>>,
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FormalTaskShutdownReport {
+    timed_out: bool,
+    active_task_id: Option<u64>,
 }
 
-impl FormalTaskExecutionRuntime {
+impl FormalTaskShutdownReport {
+    pub(crate) const fn timed_out(self) -> bool {
+        self.timed_out
+    }
+
+    pub(crate) const fn active_task_id(self) -> Option<u64> {
+        self.active_task_id
+    }
+}
+
+/// Owns the one task worker and the application execution context.
+/// Queue order and shared-lane state remain in `BusinessRuntime`, which is the
+/// single source of truth used by formal, deferred-chat and diagnostic work.
+pub(crate) struct FormalTaskRuntime {
+    client: FormalTaskClient,
+    application: Option<Arc<ApplicationExecutionState>>,
+    business: BusinessRuntimeHandle,
+    stop_requested: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
+    finished: Receiver<()>,
+}
+
+impl FormalTaskRuntime {
     pub(crate) fn start(
-        build_app: impl FnOnce(FormalTaskExecutionHandle) -> ApplicationRuntime,
+        business: BusinessRuntimeHandle,
+        running: Arc<AtomicBool>,
+        paused: Arc<AtomicBool>,
+        post_settle: Duration,
+        build_app: impl FnOnce(FormalTaskClient) -> ApplicationRuntime,
     ) -> Result<Self> {
-        let (sender, receiver) = mpsc::sync_channel(EXECUTION_QUEUE_CAPACITY);
-        let handle = FormalTaskExecutionHandle { sender };
-        let app = build_app(handle.clone());
+        let application = Arc::new(ApplicationExecutionState {
+            application: Mutex::new(None),
+        });
+        let handle = FormalTaskExecutionHandle {
+            application: Arc::downgrade(&application),
+        };
+        let client = FormalTaskClient::new(handle, business.clone());
+        let app = build_app(client.clone());
+        *application
+            .application
+            .lock()
+            .map_err(|_| anyhow!("初始化正式任务执行上下文失败"))? = Some(app);
+        Self::start_worker(
+            business,
+            running,
+            paused,
+            post_settle,
+            client,
+            Some(application),
+        )
+    }
+
+    #[cfg(test)]
+    fn start_without_application(
+        business: BusinessRuntimeHandle,
+        running: Arc<AtomicBool>,
+        paused: Arc<AtomicBool>,
+        post_settle: Duration,
+    ) -> Result<Self> {
+        let client = FormalTaskClient::new(
+            FormalTaskExecutionHandle {
+                application: Weak::new(),
+            },
+            business.clone(),
+        );
+        Self::start_worker(business, running, paused, post_settle, client, None)
+    }
+
+    fn start_worker(
+        business: BusinessRuntimeHandle,
+        running: Arc<AtomicBool>,
+        paused: Arc<AtomicBool>,
+        post_settle: Duration,
+        client: FormalTaskClient,
+        application: Option<Arc<ApplicationExecutionState>>,
+    ) -> Result<Self> {
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let worker_business = business.clone();
+        let worker_stop = Arc::clone(&stop_requested);
+        let (finished_sender, finished) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
-            .name("formal-task-execution".to_string())
-            .spawn(move || run_execution_loop(app, receiver))
-            .map_err(|error| anyhow!("启动正式任务执行运行时失败: {error}"))?;
+            .name("formal-task-runtime".to_string())
+            .spawn(move || {
+                log::info!("正式任务运行时已启动");
+                if let Err(error) =
+                    run_task_loop(worker_business, running, paused, worker_stop, post_settle)
+                {
+                    log::error!("正式任务运行时异常退出: {error:#}");
+                }
+                let _ = finished_sender.send(());
+            })
+            .map_err(|error| anyhow!("启动正式任务运行时失败: {error}"))?;
         Ok(Self {
-            handle,
+            client,
+            application,
+            business,
+            stop_requested,
             worker: Some(worker),
+            finished,
         })
     }
 
-    pub(crate) fn handle(&self) -> FormalTaskExecutionHandle {
-        self.handle.clone()
+    pub(crate) fn client(&self) -> FormalTaskClient {
+        self.client.clone()
     }
 
-    pub(crate) fn shutdown(mut self) -> Result<()> {
-        self.stop()
+    pub(crate) fn shutdown(mut self) -> Result<FormalTaskShutdownReport> {
+        self.stop(DEFAULT_SHUTDOWN_GRACE)
     }
 
-    fn stop(&mut self) -> Result<()> {
+    #[cfg(test)]
+    fn shutdown_with_timeout(mut self, timeout: Duration) -> Result<FormalTaskShutdownReport> {
+        self.stop(timeout)
+    }
+
+    fn stop(&mut self, timeout: Duration) -> Result<FormalTaskShutdownReport> {
         let Some(worker) = self.worker.take() else {
-            return Ok(());
+            return Ok(FormalTaskShutdownReport::default());
         };
-        let (response, receiver) = mpsc::sync_channel(0);
-        let _ = self
-            .handle
-            .sender
-            .send(ExecutionMessage::Shutdown(response));
-        let _ = receiver.recv();
-        worker
-            .join()
-            .map_err(|_| anyhow!("正式任务执行运行时线程 panic"))
+        let prepare_result = self.business.begin_formal_task_shutdown();
+        let active_task_id = prepare_result.as_ref().ok().copied().flatten();
+        self.stop_requested.store(true, AtomicOrdering::SeqCst);
+        self.business.wake_scheduler();
+        let timed_out = match self.finished.recv_timeout(timeout) {
+            Ok(()) => {
+                worker
+                    .join()
+                    .map_err(|_| anyhow!("正式任务运行时线程 panic"))?;
+                false
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                worker
+                    .join()
+                    .map_err(|_| anyhow!("正式任务运行时线程 panic"))?;
+                false
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                drop(worker);
+                true
+            }
+        };
+        self.application.take();
+        prepare_result?;
+        Ok(FormalTaskShutdownReport {
+            timed_out,
+            active_task_id,
+        })
     }
 }
 
-impl Drop for FormalTaskExecutionRuntime {
+impl Drop for FormalTaskRuntime {
     fn drop(&mut self) {
-        if let Err(error) = self.stop() {
-            log::error!("正式任务执行运行时关闭失败: {error:#}");
+        if let Err(error) = self.stop(Duration::ZERO) {
+            log::error!("正式任务运行时关闭失败: {error:#}");
         }
     }
+}
+
+fn run_task_loop(
+    business: BusinessRuntimeHandle,
+    running: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
+    stop_requested: Arc<AtomicBool>,
+    post_settle: Duration,
+) -> Result<()> {
+    let mut generation = business.scheduler_generation()?;
+    while running.load(AtomicOrdering::SeqCst) && !stop_requested.load(AtomicOrdering::SeqCst) {
+        if !paused.load(AtomicOrdering::SeqCst)
+            && let Some(task) = business.take_next_formal_task()?
+        {
+            if paused.load(AtomicOrdering::SeqCst) {
+                business.restore_formal_task(task)?;
+            } else {
+                let succeeded = execute_formal_task(&business, task)?;
+                generation = business.scheduler_generation()?;
+                if succeeded {
+                    wait_for_post_settle(
+                        &business,
+                        &running,
+                        &stop_requested,
+                        &mut generation,
+                        post_settle,
+                    )?;
+                }
+            }
+            continue;
+        }
+        if let Some(task) = business.take_next_diagnostic_task()? {
+            execute_diagnostic_task(&business, task)?;
+            generation = business.scheduler_generation()?;
+            continue;
+        }
+        generation = business.wait_for_scheduler_change(generation)?;
+    }
+    Ok(())
+}
+
+fn execute_formal_task(
+    business: &BusinessRuntimeHandle,
+    task: crate::runtime::scheduler::FormalTaskLease,
+) -> Result<bool> {
+    let task_id = task.task_id();
+    let task_label = task.label().to_string();
+    log::info!("待处理任务开始: {task_label}");
+    let outcome = match catch_unwind(AssertUnwindSafe(|| task.execute())) {
+        Ok(outcome) => outcome,
+        Err(_) => {
+            FormalTaskExecutionOutcome::Completed(Err(anyhow!("待处理任务执行发生未捕获异常")))
+        }
+    };
+    match outcome {
+        FormalTaskExecutionOutcome::Completed(Ok(result)) => {
+            business.complete_formal_task(task_id, FormalTaskCompletion::Succeeded(result))?;
+            log::info!("待处理任务完成: {task_label}");
+            Ok(true)
+        }
+        FormalTaskExecutionOutcome::Completed(Err(error)) => {
+            business.complete_formal_task(
+                task_id,
+                FormalTaskCompletion::Failed(format!("错误: {error:#}")),
+            )?;
+            log::error!("待处理任务执行异常: {error:#}");
+            Ok(false)
+        }
+        FormalTaskExecutionOutcome::Canceled(reason) => {
+            business
+                .complete_formal_task(task_id, FormalTaskCompletion::Canceled(reason.clone()))?;
+            log::info!("待处理任务已取消: {task_label}; {reason}");
+            Ok(false)
+        }
+    }
+}
+
+fn execute_diagnostic_task(
+    business: &BusinessRuntimeHandle,
+    task: crate::runtime::scheduler::DiagnosticTaskLease,
+) -> Result<()> {
+    let task_id = task.task_id();
+    let label = task.label().to_string();
+    let completion = match catch_unwind(AssertUnwindSafe(|| task.execute())) {
+        Ok(Ok(result)) => DiagnosticTaskCompletion::Succeeded(result),
+        Ok(Err(error)) => {
+            log::error!("Web 工具执行失败 {label}: {error:#}");
+            DiagnosticTaskCompletion::Failed(format!("{error:#}"))
+        }
+        Err(_) => {
+            log::error!("Web 工具执行发生未捕获异常: {label}");
+            DiagnosticTaskCompletion::Failed("Web 工具执行发生未捕获异常".to_string())
+        }
+    };
+    business.complete_diagnostic_task(task_id, completion)?;
+    Ok(())
+}
+
+fn wait_for_post_settle(
+    business: &BusinessRuntimeHandle,
+    running: &AtomicBool,
+    stop_requested: &AtomicBool,
+    generation: &mut u64,
+    duration: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + duration;
+    while running.load(AtomicOrdering::SeqCst) && !stop_requested.load(AtomicOrdering::SeqCst) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        *generation = business.wait_for_scheduler_change_timeout(*generation, remaining)?;
+    }
+    Ok(())
 }
 
 struct AppFormalTaskWork {
@@ -278,8 +535,11 @@ impl DiagnosticTaskWork for AppDiagnosticTaskWork {
 }
 
 impl FormalTaskWork for AppFormalTaskWork {
-    fn execute(self: Box<Self>) -> Result<String> {
-        self.executor.execute(self.task)
+    fn execute(
+        self: Box<Self>,
+        cancellation: FormalTaskCancellationToken,
+    ) -> FormalTaskExecutionOutcome {
+        self.executor.execute(self.task, cancellation)
     }
 
     fn cancel(self: Box<Self>) {
@@ -316,33 +576,194 @@ pub(crate) fn diagnostic_task_submission(
     DiagnosticTaskSubmission::new(label, Box::new(AppDiagnosticTaskWork { executor, request }))
 }
 
-fn run_execution_loop(mut app: ApplicationRuntime, receiver: Receiver<ExecutionMessage>) {
-    while let Ok(message) = receiver.recv() {
-        match message {
-            ExecutionMessage::Execute { task, response } => {
-                let label = task.label();
-                let result = match catch_unwind(AssertUnwindSafe(|| app.execute_pending_task(task)))
-                {
-                    Ok(Ok(PendingTaskExecution::Completed)) => Ok(format!("{label}执行完成")),
-                    Ok(Err(error)) => Err(format!("{error:#}")),
-                    Err(_) => Err("待处理任务执行发生未捕获异常".to_string()),
-                };
-                let _ = response.send(result);
-            }
-            ExecutionMessage::ExecuteDiagnostic { request, response } => {
-                let result = match catch_unwind(AssertUnwindSafe(|| {
-                    app.execute_web_tool_request(request)
-                })) {
-                    Ok(Ok(result)) => Ok(result),
-                    Ok(Err(error)) => Err(format!("{error:#}")),
-                    Err(_) => Err("Web 工具执行发生未捕获异常".to_string()),
-                };
-                let _ = response.send(result);
-            }
-            ExecutionMessage::Shutdown(response) => {
-                let _ = response.send(());
-                break;
-            }
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use super::*;
+    use crate::features::card_games::{CardGameService, LandlordConfig};
+    use crate::features::idiom_chain::IdiomChainService;
+    use crate::runtime::business::BusinessRuntime;
+    use crate::runtime::scheduler::{
+        FormalTaskCancellationToken, FormalTaskExecutionOutcome, FormalTaskSubmission,
+        FormalTaskWork,
+    };
+
+    struct NotifyWork(mpsc::Sender<()>);
+
+    impl FormalTaskWork for NotifyWork {
+        fn execute(
+            self: Box<Self>,
+            _cancellation: FormalTaskCancellationToken,
+        ) -> FormalTaskExecutionOutcome {
+            self.0.send(()).expect("execution observer");
+            FormalTaskExecutionOutcome::Completed(Ok("done".to_string()))
         }
+
+        fn cancel(self: Box<Self>) {}
+    }
+
+    struct ObserveShutdownCancellation {
+        started: mpsc::Sender<()>,
+        observed: Arc<AtomicBool>,
+    }
+
+    struct IgnoreShutdownCancellation {
+        started: mpsc::Sender<()>,
+    }
+
+    impl FormalTaskWork for IgnoreShutdownCancellation {
+        fn execute(
+            self: Box<Self>,
+            _cancellation: FormalTaskCancellationToken,
+        ) -> FormalTaskExecutionOutcome {
+            self.started.send(()).expect("start observer");
+            thread::sleep(Duration::from_millis(500));
+            FormalTaskExecutionOutcome::Completed(Ok("late completion".to_string()))
+        }
+
+        fn cancel(self: Box<Self>) {}
+    }
+
+    impl FormalTaskWork for ObserveShutdownCancellation {
+        fn execute(
+            self: Box<Self>,
+            cancellation: FormalTaskCancellationToken,
+        ) -> FormalTaskExecutionOutcome {
+            self.started.send(()).expect("start observer");
+            let deadline = Instant::now() + Duration::from_millis(250);
+            while Instant::now() < deadline {
+                if cancellation.is_requested() {
+                    self.observed.store(true, Ordering::SeqCst);
+                    return FormalTaskExecutionOutcome::Canceled(
+                        "shutdown cancellation observed".to_string(),
+                    );
+                }
+                thread::yield_now();
+            }
+            FormalTaskExecutionOutcome::Completed(Err(anyhow!(
+                "shutdown cancellation was not observed"
+            )))
+        }
+
+        fn cancel(self: Box<Self>) {}
+    }
+
+    fn business_runtime() -> BusinessRuntime {
+        BusinessRuntime::start(
+            8,
+            IdiomChainService::from_entries_for_test(
+                &["画蛇添足", "足智多谋", "谋事在人", "人山人海"],
+                Some(Duration::from_secs(300)),
+            ),
+            CardGameService::new(LandlordConfig::default()),
+        )
+        .expect("business runtime")
+    }
+
+    #[test]
+    fn enqueued_formal_task_starts_without_a_polling_interval() {
+        let business_runtime = business_runtime();
+        let business = business_runtime.handle();
+        let task_runtime = FormalTaskRuntime::start_without_application(
+            business.clone(),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+            Duration::ZERO,
+        )
+        .expect("formal task runtime");
+        let (executed, execution) = mpsc::channel();
+
+        business
+            .enqueue_formal_task(FormalTaskSubmission::new(
+                "event-driven",
+                None,
+                false,
+                Box::new(NotifyWork(executed)),
+            ))
+            .expect("enqueue formal task");
+
+        execution
+            .recv_timeout(Duration::from_secs(1))
+            .expect("formal task should start directly after enqueue");
+
+        task_runtime
+            .shutdown()
+            .expect("formal task runtime shutdown");
+        business_runtime.shutdown().expect("business shutdown");
+    }
+
+    #[test]
+    fn formal_task_runtime_requests_cancellation_from_the_running_task_on_shutdown() {
+        let business_runtime = business_runtime();
+        let business = business_runtime.handle();
+        let task_runtime = FormalTaskRuntime::start_without_application(
+            business.clone(),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+            Duration::ZERO,
+        )
+        .expect("formal task runtime");
+        let (started, start) = mpsc::channel();
+        let observed = Arc::new(AtomicBool::new(false));
+        business
+            .enqueue_formal_task(FormalTaskSubmission::new(
+                "cancel on shutdown",
+                None,
+                false,
+                Box::new(ObserveShutdownCancellation {
+                    started,
+                    observed: observed.clone(),
+                }),
+            ))
+            .expect("enqueue formal task");
+        start
+            .recv_timeout(Duration::from_secs(1))
+            .expect("formal task start");
+
+        task_runtime
+            .shutdown()
+            .expect("formal task runtime shutdown");
+
+        assert!(observed.load(Ordering::SeqCst));
+        business_runtime.shutdown().expect("business shutdown");
+    }
+
+    #[test]
+    fn formal_task_runtime_shutdown_has_a_time_limit_when_work_ignores_cancellation() {
+        let business_runtime = business_runtime();
+        let business = business_runtime.handle();
+        let task_runtime = FormalTaskRuntime::start_without_application(
+            business.clone(),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+            Duration::ZERO,
+        )
+        .expect("formal task runtime");
+        let (started, start) = mpsc::channel();
+        business
+            .enqueue_formal_task(FormalTaskSubmission::new(
+                "ignore shutdown",
+                None,
+                false,
+                Box::new(IgnoreShutdownCancellation { started }),
+            ))
+            .expect("enqueue formal task");
+        start
+            .recv_timeout(Duration::from_secs(1))
+            .expect("formal task start");
+        let shutdown_started = Instant::now();
+
+        let report = task_runtime
+            .shutdown_with_timeout(Duration::from_millis(20))
+            .expect("bounded formal task runtime shutdown");
+
+        assert!(report.timed_out());
+        assert!(shutdown_started.elapsed() < Duration::from_millis(200));
+        business_runtime.shutdown().expect("business shutdown");
     }
 }

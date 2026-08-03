@@ -114,6 +114,7 @@ impl InviteCommand {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn same_request(&self, other: &Self) -> bool {
         match (self.seq, other.seq) {
             (Some(left), Some(right)) => left == right,

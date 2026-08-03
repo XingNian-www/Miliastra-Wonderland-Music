@@ -41,11 +41,11 @@ impl ApplicationRuntime {
             WebToolRequest::HallName => {
                 let frame = self.latest_frame()?;
                 let image = crop_canvas(&frame, self.config.screen.hall_name_rect.into())?;
-                self.ocr.merged_text(
+                Ok(self.ocr.merged_text(
                     image,
                     self.config.ocr.same_line_y_tolerance,
                     OcrPriority::Diagnostic,
-                )
+                )?)
             }
             WebToolRequest::MatchTemplate {
                 template,

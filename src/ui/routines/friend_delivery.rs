@@ -1264,7 +1264,7 @@ fn matching_text_rows(
         .map_err(|error| after_input_failure("crop_ocr_confirmation", error))?;
     let lines = ocr
         .recognize_lines(crop, OcrPriority::UiConfirmation)
-        .map_err(|error| after_input_failure("ocr_confirmation", error))?;
+        .map_err(|error| after_input_failure("ocr_confirmation", error.into()))?;
     Ok(lines
         .into_iter()
         .filter_map(|line| {
@@ -1289,7 +1289,7 @@ fn merged_text(
         .map_err(|error| after_input_failure("crop_ocr_confirmation", error))?;
     let lines = ocr
         .recognize_lines(crop, OcrPriority::UiConfirmation)
-        .map_err(|error| after_input_failure("ocr_confirmation", error))?;
+        .map_err(|error| after_input_failure("ocr_confirmation", error.into()))?;
     Ok(merge_ocr_lines(lines, 12))
 }
 

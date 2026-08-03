@@ -66,10 +66,14 @@ impl ApplicationRuntime {
         {
             log::error!("UI 运行时关闭失败: {error}");
         }
-        if let Some(ocr_runtime) = self.ocr_runtime.take()
-            && let Err(error) = ocr_runtime.shutdown()
-        {
-            log::error!("OCR 运行时关闭失败: {error:#}");
+        if let Some(ocr_runtime) = self.ocr_runtime.take() {
+            match ocr_runtime.shutdown() {
+                Ok(report) if report.timed_out => {
+                    log::warn!("OCR 运行时关闭等待超时，底层推理线程已脱离");
+                }
+                Err(error) => log::error!("OCR 运行时关闭失败: {error:#}"),
+                _ => {}
+            }
         }
         if let Some(player_runtime) = self.player_runtime.take()
             && let Err(error) = player_runtime.shutdown()

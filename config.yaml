@@ -192,6 +192,10 @@ ocr:
   min_confidence: 0.9
   # OCR 线程数
   threads: 4
+  # 单次 OCR 请求从入队到返回的最长时间，单位毫秒
+  request_timeout_ms: 10000
+  # 关闭时等待底层 OCR 推理退出的最长时间，单位毫秒
+  shutdown_timeout_ms: 5000
   # OCR 后端优先级；可用值: cuda, vulkan, opencl, openvino, cpu。默认只使用 CPU OCR
   backend_priority:
     - cpu

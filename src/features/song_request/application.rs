@@ -9,7 +9,8 @@ use super::{
 };
 use super::{PickedCandidate, SearchCandidate};
 use crate::features::playback::{
-    PlaybackOutcome, PlaybackRequest, PlayerStatus, QueueItem, QueuePushOutcome, is_playing,
+    PlaybackOutcome, PlaybackRequest, PlaybackResult, PlaybackSelection, PlayerStatus, QueueItem,
+    QueuePushOutcome, is_playing,
 };
 
 #[derive(Clone, Debug)]
@@ -163,11 +164,7 @@ pub(crate) trait SongRequestPort {
     fn player_status(&self) -> Result<PlayerStatus>;
     fn should_queue_until_current_song_finished(&self, status: &PlayerStatus) -> Result<bool>;
     fn current_status_matches_request(&self, status: &PlayerStatus) -> Result<bool>;
-    fn play_confirmed(
-        &mut self,
-        request: &ResolvedSongRequest,
-        allow_switch_source: bool,
-    ) -> Result<PlaybackOutcome>;
+    fn play_confirmed(&mut self, request: &ResolvedSongRequest) -> Result<PlaybackResult>;
     fn song_dedup_limited(&self, request: &PlaybackRequest) -> Result<bool>;
     fn log_executed(&self, context: &SongRequestContext, final_command: &str) -> Result<()>;
 }
@@ -250,13 +247,19 @@ impl ResolvedSongRequest {
     }
 
     pub(crate) fn playback_request(&self) -> PlaybackRequest {
-        PlaybackRequest {
+        self.playback_selection().request()
+    }
+
+    pub(crate) fn playback_selection(&self) -> PlaybackSelection {
+        PlaybackSelection {
             keyword: self.keyword.clone(),
             source: self.source.clone(),
             prefer_accompaniment: self.prefer_accompaniment,
+            ai_original_text: self.ai_original_text.clone(),
             uri: self.uri.clone(),
+            friend_username: self.friend_username.clone(),
             requester: self.requester.clone(),
-            navigation: crate::features::playback::PlaybackNavigation::Normal,
+            console_bypass_dedup: self.console_bypass_dedup,
         }
     }
 
@@ -265,14 +268,22 @@ impl ResolvedSongRequest {
     }
 
     fn final_command(&self, action: &str) -> String {
-        let source = if self.source.trim().is_empty() {
+        self.final_command_for_playback(action, &self.playback_request())
+    }
+
+    fn final_command_for_playback(
+        &self,
+        action: &str,
+        playback_request: &PlaybackRequest,
+    ) -> String {
+        let source = if playback_request.source.trim().is_empty() {
             "all"
         } else {
-            self.source.trim()
+            playback_request.source.trim()
         };
         format!(
             "{} keyword={} source={} uri={} aiOriginal={}",
-            action, self.keyword, source, self.uri, self.ai_original_text,
+            action, playback_request.keyword, source, playback_request.uri, self.ai_original_text,
         )
     }
 }
@@ -418,8 +429,8 @@ impl SongRequestExecution<'_> {
                     return Ok(());
                 }
                 if !self.port.current_status_matches_request(&status)? {
-                    let outcome = self.play_request_confirmed(&request, true)?;
-                    self.log_play_request_outcome(context, &request, outcome)?;
+                    let result = self.play_request_confirmed(&request)?;
+                    self.log_play_request_outcome(context, &request, &result)?;
                     return Ok(());
                 }
                 let outcome = self.push_queue_request(&request)?;
@@ -454,8 +465,8 @@ impl SongRequestExecution<'_> {
             }
         }
 
-        let outcome = self.play_request_confirmed(&request, true)?;
-        self.log_play_request_outcome(context, &request, outcome)
+        let result = self.play_request_confirmed(&request)?;
+        self.log_play_request_outcome(context, &request, &result)
     }
 
     fn report_player_search_failure(
@@ -803,15 +814,18 @@ impl SongRequestExecution<'_> {
         &self,
         context: &SongRequestContext,
         request: &ResolvedSongRequest,
-        outcome: PlaybackOutcome,
+        result: &PlaybackResult,
     ) -> Result<()> {
-        let action = match outcome {
+        let action = match result.outcome() {
             PlaybackOutcome::Success => "play",
             PlaybackOutcome::NoSource => "no-source",
             PlaybackOutcome::Error => "play-error",
             PlaybackOutcome::DedupLimited => "dedup-limited",
         };
-        self.log_executed_command(context, &request.final_command(action))
+        self.log_executed_command(
+            context,
+            &request.final_command_for_playback(action, result.final_request()),
+        )
     }
 
     fn song_dedup_limited(&self, request: &ResolvedSongRequest) -> Result<bool> {
@@ -935,12 +949,8 @@ impl SongRequestExecution<'_> {
         self.port.playback_queue()
     }
 
-    fn play_request_confirmed(
-        &mut self,
-        request: &ResolvedSongRequest,
-        allow_switch_source: bool,
-    ) -> Result<PlaybackOutcome> {
-        self.port.play_confirmed(request, allow_switch_source)
+    fn play_request_confirmed(&mut self, request: &ResolvedSongRequest) -> Result<PlaybackResult> {
+        self.port.play_confirmed(request)
     }
 
     fn log_executed_command(
@@ -1142,6 +1152,7 @@ mod tests {
         should_queue: bool,
         status_matches: bool,
         play_outcome: PlaybackOutcome,
+        play_final_request: Option<PlaybackRequest>,
         played: RefCell<Vec<ResolvedSongRequest>>,
         dedup_limited: Cell<bool>,
         logs: RefCell<Vec<String>>,
@@ -1160,6 +1171,7 @@ mod tests {
                 should_queue: false,
                 status_matches: false,
                 play_outcome: PlaybackOutcome::Success,
+                play_final_request: None,
                 played: RefCell::new(Vec::new()),
                 dedup_limited: Cell::new(false),
                 logs: RefCell::new(Vec::new()),
@@ -1243,13 +1255,15 @@ mod tests {
             Ok(self.status_matches)
         }
 
-        fn play_confirmed(
-            &mut self,
-            request: &ResolvedSongRequest,
-            _allow_switch_source: bool,
-        ) -> Result<PlaybackOutcome> {
+        fn play_confirmed(&mut self, request: &ResolvedSongRequest) -> Result<PlaybackResult> {
             self.played.borrow_mut().push(request.clone());
-            Ok(self.play_outcome)
+            let requested = request.playback_request();
+            let final_request = self.play_final_request.as_ref().unwrap_or(&requested);
+            Ok(PlaybackResult::for_test(
+                self.play_outcome,
+                &requested,
+                final_request,
+            ))
         }
 
         fn song_dedup_limited(&self, _request: &PlaybackRequest) -> Result<bool> {
@@ -1284,6 +1298,28 @@ mod tests {
         assert_eq!(port.played.borrow()[0].uri, "fuo://qqmusic/songs/1");
         assert_eq!(port.played.borrow()[0].requester, "Alice");
         assert!(port.logs.borrow()[0].starts_with("play keyword=晴天 - 周杰伦"));
+    }
+
+    #[test]
+    fn execution_log_uses_the_final_source_switched_request() {
+        let mut port = FakePort::idle([Some(picked("晴天 - 周杰伦", "fuo://qqmusic/songs/1"))]);
+        port.play_final_request = Some(PlaybackRequest {
+            keyword: "晴天 - 周杰伦".to_string(),
+            source: "netease".to_string(),
+            prefer_accompaniment: false,
+            uri: "fuo://netease/songs/2".to_string(),
+            requester: "Alice".to_string(),
+            navigation: crate::features::playback::PlaybackNavigation::Normal,
+        });
+
+        application()
+            .execute(&context(), &command(), &mut port)
+            .expect("song request");
+
+        assert_eq!(
+            port.logs.borrow().as_slice(),
+            ["play keyword=晴天 - 周杰伦 source=netease uri=fuo://netease/songs/2 aiOriginal="]
+        );
     }
 
     #[test]

@@ -175,23 +175,11 @@ pub(crate) enum PlaybackNavigation {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct PlaybackAttempt {
-    pub(crate) initial_uri: String,
-    pub(crate) initial_progress: f64,
-    pub(crate) requested_uri: String,
+struct PlaybackAttempt {
+    initial_uri: String,
+    initial_progress: f64,
+    requested_uri: String,
     previous_playback: PlaybackRuntimeState,
-}
-
-#[cfg(test)]
-impl PlaybackAttempt {
-    pub(super) fn for_test(requested_uri: impl Into<String>) -> Self {
-        Self {
-            initial_uri: String::new(),
-            initial_progress: 0.0,
-            requested_uri: requested_uri.into(),
-            previous_playback: PlaybackRuntimeState::default(),
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -206,7 +194,10 @@ pub(crate) enum PlaybackVerification {
         status: PlayerStatus,
         message: String,
     },
-    NoSource,
+    NoSource {
+        status: Option<PlayerStatus>,
+        reason: String,
+    },
     MismatchedCandidate(PlaybackMismatch),
 }
 
@@ -437,10 +428,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         self.playback_state.song_dedup_limited(candidate)
     }
 
-    pub(crate) fn begin_playback_attempt(
-        &self,
-        request: &PlaybackRequest,
-    ) -> Result<PlaybackAttempt> {
+    fn begin_playback_attempt(&self, request: &PlaybackRequest) -> Result<PlaybackAttempt> {
         self.clear_external_playback_tracker()?;
         let previous_playback = self.playback_snapshot()?;
         let initial = self
@@ -469,11 +457,11 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             initial_uri: initial.0,
             initial_progress: initial.1,
             requested_uri: request.uri.clone(),
-            previous_playback: previous_playback.clone(),
+            previous_playback,
         })
     }
 
-    pub(crate) fn play_request_uri(&self, request: &PlaybackRequest) -> Result<PlaybackAttempt> {
+    fn play_request_uri(&self, request: &PlaybackRequest) -> Result<PlaybackAttempt> {
         let attempt = self.begin_playback_attempt(request)?;
         if let Err(error) = self.backend.play_uri(&request.uri) {
             let _ = self.restore_failed_attempt(&attempt, "dispatch_failed");
@@ -482,7 +470,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         Ok(attempt)
     }
 
-    pub(crate) fn verify_playback_started(
+    fn verify_playback_started(
         &self,
         request: &PlaybackRequest,
         attempt: &mut PlaybackAttempt,
@@ -490,17 +478,22 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         self.delay
             .wait(Duration::from_millis(self.timing.search_settle_ms));
 
+        let mut last_status = None;
+        let mut last_status_error = None;
         for retry in 0..self.timing.status_retries {
             let status = match self.backend.status() {
                 Ok(status) => status,
                 Err(error) => {
                     log::error!("查询播放状态失败: {error:#}");
+                    last_status_error = Some(error.to_string());
                     self.mark_unknown()?;
                     self.delay
                         .wait(Duration::from_millis(self.timing.status_poll_ms));
                     continue;
                 }
             };
+            last_status_error = None;
+            last_status = Some(status.clone());
             let reliability = classify_observation(&status);
             self.record_observation(&status, reliability)?;
             log::debug!(
@@ -639,7 +632,11 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             if status.duration > 0.0 && status.duration < 20.0 {
                 log::info!("歌曲时长过短 ({:.1}s)，视为无音源", status.duration);
                 self.restore_failed_attempt(attempt, "verification_failed")?;
-                return Ok(PlaybackVerification::NoSource);
+                let reason = format!("歌曲时长过短: {:.1}s", status.duration);
+                return Ok(PlaybackVerification::NoSource {
+                    status: Some(status),
+                    reason,
+                });
             }
 
             let message = format_play_message(&status);
@@ -650,7 +647,22 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
 
         log::info!("超时未播放成功");
         self.restore_failed_attempt(attempt, "verification_failed")?;
-        Ok(PlaybackVerification::NoSource)
+        if let Some(error) = last_status_error {
+            log::error!("播放确认结束时播放器状态接口不可用: {error}");
+            return Err(anyhow!("播放器状态暂不可用，请稍后再试"));
+        }
+        Ok(PlaybackVerification::NoSource {
+            status: last_status,
+            reason: "超时未播放成功".to_string(),
+        })
+    }
+
+    pub(crate) fn play_and_verify(
+        &self,
+        request: &PlaybackRequest,
+    ) -> Result<PlaybackVerification> {
+        let mut attempt = self.play_request_uri(request)?;
+        self.verify_playback_started(request, &mut attempt)
     }
 
     fn observe_stable_fallback(&self, first: &PlayerStatus) -> Result<Option<PlayerStatus>> {
@@ -1530,6 +1542,8 @@ mod tests {
     #[derive(Clone)]
     struct FakeBackend {
         statuses: Arc<Mutex<VecDeque<PlayerStatus>>>,
+        status_calls: Arc<Mutex<usize>>,
+        status_error_after: Option<usize>,
         paused: Arc<Mutex<u32>>,
         resumed: Arc<Mutex<u32>>,
         play_error: bool,
@@ -1540,11 +1554,23 @@ mod tests {
         fn new(statuses: Vec<PlayerStatus>) -> Self {
             Self {
                 statuses: Arc::new(Mutex::new(statuses.into())),
+                status_calls: Arc::new(Mutex::new(0)),
+                status_error_after: None,
                 paused: Arc::new(Mutex::new(0)),
                 resumed: Arc::new(Mutex::new(0)),
                 play_error: false,
                 pause_error: false,
             }
+        }
+
+        fn with_status_error(mut self) -> Self {
+            self.status_error_after = Some(0);
+            self
+        }
+
+        fn with_status_error_after(mut self, successful_reads: usize) -> Self {
+            self.status_error_after = Some(successful_reads);
+            self
         }
 
         fn with_play_error(mut self) -> Self {
@@ -1560,6 +1586,15 @@ mod tests {
 
     impl MusicPlayerBackend for FakeBackend {
         fn status(&self) -> Result<PlayerStatus> {
+            let mut calls = self.status_calls.lock().unwrap();
+            if self
+                .status_error_after
+                .is_some_and(|successful_reads| *calls >= successful_reads)
+            {
+                *calls += 1;
+                return Err(anyhow!("status failed"));
+            }
+            *calls += 1;
             Ok(self
                 .statuses
                 .lock()
@@ -2124,7 +2159,7 @@ mod tests {
             .verify_playback_started(&request, &mut attempt)
             .unwrap();
 
-        assert!(matches!(result, PlaybackVerification::NoSource));
+        assert!(matches!(result, PlaybackVerification::NoSource { .. }));
         assert_eq!(controller.snapshot().state, "unknown");
     }
 
@@ -2409,6 +2444,36 @@ mod tests {
     }
 
     #[test]
+    fn status_backend_failure_is_not_reported_as_confirmed_no_source() {
+        let controller = controller(FakeBackend::new(Vec::new()).with_status_error());
+
+        let error = controller
+            .play_and_verify(&request())
+            .expect_err("status backend failure must remain retryable");
+
+        assert_eq!(error.to_string(), "播放器状态暂不可用，请稍后再试");
+        assert_eq!(controller.snapshot().state, "unknown");
+    }
+
+    #[test]
+    fn later_status_backend_failures_keep_the_playback_attempt_retryable() {
+        let controller = controller(
+            FakeBackend::new(vec![
+                status("旧歌", "fuo://qqmusic/songs/old", 30.0, 180.0),
+                stopped_status(),
+            ])
+            .with_status_error_after(2),
+        );
+
+        let error = controller
+            .play_and_verify(&request())
+            .expect_err("final status failures must not become confirmed no-source");
+
+        assert_eq!(error.to_string(), "播放器状态暂不可用，请稍后再试");
+        assert_eq!(controller.snapshot().state, "unknown");
+    }
+
+    #[test]
     fn verification_no_source_marks_state_unknown_after_dispatch() {
         let backend = FakeBackend::new(vec![
             status("旧歌", "fuo://qqmusic/songs/old", 30.0, 180.0),
@@ -2427,7 +2492,16 @@ mod tests {
             .verify_playback_started(&request, &mut attempt)
             .unwrap();
 
-        assert!(matches!(result, PlaybackVerification::NoSource));
+        let PlaybackVerification::NoSource {
+            status: Some(status),
+            reason,
+        } = result
+        else {
+            panic!("short playback should report its observed no-source evidence");
+        };
+        assert_eq!(status.current_uri, "fuo://qqmusic/songs/1");
+        assert_eq!(status.duration, 10.0);
+        assert_eq!(reason, "歌曲时长过短: 10.0s");
         let snapshot = controller.snapshot();
         assert_eq!(snapshot.state, "unknown");
         assert!(snapshot.active_keyword.is_empty());
@@ -2451,7 +2525,7 @@ mod tests {
             .verify_playback_started(&request, &mut attempt)
             .unwrap();
 
-        assert!(matches!(result, PlaybackVerification::NoSource));
+        assert!(matches!(result, PlaybackVerification::NoSource { .. }));
         let snapshot = controller.snapshot();
         assert_eq!(snapshot.state, "unknown");
         assert!(snapshot.active_keyword.is_empty());

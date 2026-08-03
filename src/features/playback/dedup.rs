@@ -90,8 +90,9 @@ impl PersistentSongDedupHistory {
         }
         let now = self.clock.unix_seconds();
         let window_start = now.saturating_sub(config.window_seconds);
-        self.entries.retain(|entry| entry.played_at >= window_start);
-        self.entries.push(SongDedupEntry {
+        let mut entries = self.entries.clone();
+        entries.retain(|entry| entry.played_at >= window_start);
+        entries.push(SongDedupEntry {
             uri: candidate.uri,
             title: candidate.title,
             artist: candidate.artist,
@@ -99,12 +100,14 @@ impl PersistentSongDedupHistory {
             prefer_accompaniment: candidate.prefer_accompaniment,
             played_at: now,
         });
-        self.save()
+        self.save_entries(&entries)?;
+        self.entries = entries;
+        Ok(())
     }
 
-    fn save(&self) -> Result<()> {
+    fn save_entries(&self, entries: &[SongDedupEntry]) -> Result<()> {
         let file = SongDedupHistoryFile {
-            entries: self.entries.clone(),
+            entries: entries.to_vec(),
         };
         let text = serde_json::to_string_pretty(&file)?;
         write_atomic(&self.path, &text)
@@ -252,5 +255,40 @@ mod tests {
             prefer_accompaniment: false,
         };
         assert!(!history.is_limited(&SongDedupConfig::default(), &candidate));
+    }
+
+    #[test]
+    fn failed_dedup_history_write_keeps_the_previous_runtime_entries() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let blocker = std::env::temp_dir().join(format!(
+            "miliastra-dedup-write-blocker-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::write(&blocker, "not a directory").unwrap();
+        let path = blocker.join("dedup-history.json");
+        let clock = Arc::new(ManualClock::with_unix_seconds(Instant::now(), 1_000));
+        let mut history = PersistentSongDedupHistory::load(path, clock).unwrap();
+        let candidate = SongDedupCandidate {
+            uri: "fuo://qqmusic/songs/1".to_string(),
+            title: "晴天".to_string(),
+            artist: "周杰伦".to_string(),
+            source: "qqmusic".to_string(),
+            prefer_accompaniment: false,
+        };
+        let config = SongDedupConfig {
+            max_count: 1,
+            ..SongDedupConfig::default()
+        };
+
+        let error = history
+            .record_playback(&config, candidate.clone())
+            .expect_err("blocked parent must reject the history write");
+
+        assert!(error.to_string().contains("长时间同歌去重历史目录"));
+        assert!(!history.is_limited(&config, &candidate));
+        fs::remove_file(blocker).unwrap();
     }
 }

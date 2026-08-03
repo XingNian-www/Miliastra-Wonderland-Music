@@ -249,6 +249,7 @@ impl CustomWorkflowCommand {
         format!("custom_workflow:{}:{}", identity.workflow, identity.args)
     }
 
+    #[cfg(test)]
     pub fn same_request(&self, other: &Self) -> bool {
         self.lock_identity() == other.lock_identity()
     }

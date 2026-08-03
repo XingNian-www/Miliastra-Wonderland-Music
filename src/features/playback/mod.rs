@@ -386,6 +386,7 @@ impl PlaybackCommand {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn same_request(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Volume(left), Self::Volume(right)) => {
@@ -767,11 +768,8 @@ impl PlaybackService {
         &mut self,
         update: PlaybackStateUpdate,
     ) -> Result<bool> {
-        let changed = update.apply(self.playback_state.state_mut());
-        if changed {
-            self.playback_state.save()?;
-        }
-        Ok(changed)
+        self.playback_state
+            .update(|playback| update.apply(playback))
     }
 }
 
@@ -798,6 +796,9 @@ pub(crate) use application::{
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::clock::SystemClock;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn queue_aliases_parse_as_the_full_queue_command() {
@@ -897,5 +898,43 @@ mod tests {
             PlaybackCommand::BackgroundLyrics.lock_key()
         );
         assert_eq!(PlaybackCommand::parse_hall("单曲歌词 1"), None);
+    }
+
+    #[test]
+    fn failed_playback_state_write_keeps_the_previous_runtime_state() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let blocker = std::env::temp_dir().join(format!(
+            "miliastra-playback-write-blocker-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::write(&blocker, "not a directory").unwrap();
+        let state_path = blocker.join("playback-state.json");
+        let queue_path = std::env::temp_dir().join(format!(
+            "miliastra-playback-queue-unused-{}-{suffix}.json",
+            std::process::id()
+        ));
+        let history_path = std::env::temp_dir().join(format!(
+            "miliastra-playback-history-unused-{}-{suffix}.json",
+            std::process::id()
+        ));
+        let mut service = PlaybackService::new(
+            PersistentQueue::load(queue_path, 10).unwrap(),
+            PersistentPlaybackState::load(state_path).unwrap(),
+            PersistentSongDedupHistory::load(history_path, Arc::new(SystemClock)).unwrap(),
+            SongDedupConfig::default(),
+        );
+
+        let error = service
+            .apply_playback_state_update(PlaybackStateUpdate::UserPaused)
+            .expect_err("blocked parent must reject the state write");
+        let snapshot = service.playback_state_snapshot();
+
+        assert!(error.to_string().contains("播放状态目录"));
+        assert_eq!(snapshot.state, ConfirmedPlaybackState::Idle);
+        assert_eq!(snapshot.pause_reason, PauseReason::None);
+        fs::remove_file(blocker).unwrap();
     }
 }

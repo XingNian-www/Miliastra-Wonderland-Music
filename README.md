@@ -1,6 +1,6 @@
 # Miliastra Wonderland Music
 
-Miliastra Wonderland Music 是一个面向 Windows 的原神/千星奇域点歌与聊天自动化工具。它读取游戏聊天中的命令，调用 FeelUOwn 播放音乐，并提供歌词、队列、好友操作和多人娱乐玩法。
+Miliastra Wonderland Music 是一个面向 Windows 的原神/千星奇域点歌与聊天自动化工具。它读取游戏聊天中的命令，通过同目录的无 GUI `miliastra-playerd` 播放音乐，并提供歌词、队列、好友操作和多人娱乐玩法。FeelUOwn 仅作为历史协议和行为参考，不是运行时依赖。
 
 ## 功能概览
 
@@ -11,6 +11,10 @@ Miliastra Wonderland Music 是一个面向 Windows 的原神/千星奇域点歌�
 - 本地 Web 面板、远程控制和高级诊断工具。
 
 运行与配置方法见 [用户使用指南](docs/user-guide.md)。
+
+无 GUI 播放器、登录辅助器、凭据文件和 `libmpv-2.dll` 的部署说明见
+[`miliastra-playerd/README.md`](../miliastra-playerd/README.md) 与
+[`miliastra-playerd/ARCHITECTURE.md`](../miliastra-playerd/ARCHITECTURE.md)。
 
 ## 用户文档
 

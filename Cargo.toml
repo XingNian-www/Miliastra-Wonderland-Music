@@ -28,7 +28,7 @@ ocr-rs = { git = "https://github.com/zibo-chen/rust-paddle-ocr.git", tag = "v2.3
 openvino = { version = "0.11.0", optional = true, default-features = false, features = ["runtime-linking"] }
 # Low-level runtime loader used to prefer a bundled OpenVINO DLL before environment search paths.
 openvino-sys = { version = "0.11.0", optional = true, default-features = false, features = ["runtime-linking"] }
-reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"] }
 secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

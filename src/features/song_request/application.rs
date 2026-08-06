@@ -239,6 +239,7 @@ pub(crate) struct ResolvedSongRequest {
     pub(crate) friend_username: String,
     pub(crate) requester: String,
     pub(crate) console_bypass_dedup: bool,
+    pub(crate) candidate_snapshot: Vec<SearchCandidate>,
 }
 
 impl ResolvedSongRequest {
@@ -260,6 +261,7 @@ impl ResolvedSongRequest {
             friend_username: self.friend_username.clone(),
             requester: self.requester.clone(),
             console_bypass_dedup: self.console_bypass_dedup,
+            candidate_snapshot: self.candidate_snapshot.clone(),
         }
     }
 
@@ -490,6 +492,7 @@ impl SongRequestExecution<'_> {
                 friend_username: song.friend_username.clone(),
                 requester: String::new(),
                 console_bypass_dedup: false,
+                candidate_snapshot: Vec::new(),
             }));
         }
         self.resolve_ai_song_request(song, true)
@@ -566,6 +569,7 @@ impl SongRequestExecution<'_> {
             friend_username: song.friend_username.clone(),
             requester: String::new(),
             console_bypass_dedup: false,
+            candidate_snapshot: candidates,
         }))
     }
 
@@ -642,6 +646,7 @@ impl SongRequestExecution<'_> {
                         friend_username: request.friend_username.clone(),
                         requester: request.requester.clone(),
                         console_bypass_dedup: request.console_bypass_dedup,
+                        candidate_snapshot: picked.candidate_snapshot,
                     }));
                 }
                 SongRequestDecision::Skip => {
@@ -727,6 +732,7 @@ impl SongRequestExecution<'_> {
                     friend_username: song.friend_username.clone(),
                     requester: String::new(),
                     console_bypass_dedup: false,
+                    candidate_snapshot: picked.candidate_snapshot,
                 }))
             }
             SongRequestDecision::Skip => Ok(None),
@@ -775,6 +781,7 @@ impl SongRequestExecution<'_> {
             friend_username: request.friend_username.clone(),
             requester: request.requester.clone(),
             dedup_bypass: request.console_bypass_dedup,
+            candidate_snapshot: request.candidate_snapshot.clone(),
         })?;
         if pushed.accepted {
             Ok(SongQueuePushOutcome::Added(pushed.size))
@@ -818,8 +825,8 @@ impl SongRequestExecution<'_> {
     ) -> Result<()> {
         let action = match result.outcome() {
             PlaybackOutcome::Success => "play",
-            PlaybackOutcome::NoSource => "no-source",
-            PlaybackOutcome::Error => "play-error",
+            PlaybackOutcome::ItemScopedFailure => "no-source",
+            PlaybackOutcome::QueueBlockingFailure => "play-blocked",
             PlaybackOutcome::DedupLimited => "dedup-limited",
         };
         self.log_executed_command(
@@ -1133,6 +1140,7 @@ mod tests {
             playback_rate: 1.0,
             volume: 50,
             requester: String::new(),
+            ..PlayerStatus::default()
         }
     }
 
@@ -1277,11 +1285,10 @@ mod tests {
     }
 
     fn picked(text: &str, uri: &str) -> PickedCandidate {
+        let candidate = SearchCandidate::new(text, uri);
         PickedCandidate {
-            candidate: SearchCandidate {
-                text: text.to_string(),
-                uri: uri.to_string(),
-            },
+            candidate_snapshot: vec![candidate.clone()],
+            candidate,
             formatted_candidates: text.to_string(),
         }
     }
@@ -1297,6 +1304,15 @@ mod tests {
         assert_eq!(port.played.borrow().len(), 1);
         assert_eq!(port.played.borrow()[0].uri, "fuo://qqmusic/songs/1");
         assert_eq!(port.played.borrow()[0].requester, "Alice");
+        assert_eq!(
+            port.played.borrow()[0]
+                .playback_request()
+                .candidate_snapshot,
+            vec![SearchCandidate::new(
+                "晴天 - 周杰伦",
+                "fuo://qqmusic/songs/1"
+            )]
+        );
         assert!(port.logs.borrow()[0].starts_with("play keyword=晴天 - 周杰伦"));
     }
 
@@ -1310,6 +1326,7 @@ mod tests {
             uri: "fuo://netease/songs/2".to_string(),
             requester: "Alice".to_string(),
             navigation: crate::features::playback::PlaybackNavigation::Normal,
+            candidate_snapshot: Vec::new(),
         });
 
         application()

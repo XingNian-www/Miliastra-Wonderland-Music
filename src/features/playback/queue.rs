@@ -5,7 +5,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::features::song_request::SearchCandidate;
+
 use super::matcher;
+use super::state::SharedRequestStateStore;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -20,6 +23,8 @@ pub struct QueueItem {
     #[serde(default)]
     pub requester: String,
     pub dedup_bypass: bool,
+    #[serde(default)]
+    pub candidate_snapshot: Vec<SearchCandidate>,
 }
 
 impl Default for QueueItem {
@@ -34,13 +39,14 @@ impl Default for QueueItem {
             friend_username: String::new(),
             requester: String::new(),
             dedup_bypass: false,
+            candidate_snapshot: Vec::new(),
         }
     }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct QueueFile {
+pub(crate) struct QueueFile {
     next_id: u64,
     items: Vec<QueueItem>,
 }
@@ -51,9 +57,11 @@ pub struct PersistentQueue {
     max_size: usize,
     next_id: u64,
     items: Vec<QueueItem>,
+    request_store: Option<SharedRequestStateStore>,
 }
 
 impl PersistentQueue {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn load(path: PathBuf, max_size: usize) -> Result<Self> {
         let file_exists = path.exists();
         let file = if file_exists {
@@ -67,24 +75,32 @@ impl PersistentQueue {
                 items: Vec::new(),
             }
         };
-        if file_exists && file.items.iter().any(|item| item.id == 0) {
-            bail!("播放队列当前格式要求每个 items[].id 大于 0");
-        }
         if file_exists {
-            let mut persisted_ids = HashSet::new();
-            if file.items.iter().any(|item| !persisted_ids.insert(item.id)) {
-                bail!("播放队列当前格式不允许重复的 items[].id");
-            }
-            let max_item_id = file.items.iter().map(|item| item.id).max().unwrap_or(0);
-            if file.next_id == 0 || file.next_id <= max_item_id {
-                bail!("播放队列当前格式要求 nextId 大于所有 items[].id");
-            }
+            validate_queue_file(&file)?;
         }
         Ok(Self {
             path,
             max_size,
             next_id: file.next_id,
             items: file.items,
+            request_store: None,
+        })
+    }
+
+    pub(crate) fn from_request_store(
+        request_store: SharedRequestStateStore,
+        max_size: usize,
+    ) -> Result<Self> {
+        let (next_id, items) = request_store
+            .lock()
+            .map_err(|_| anyhow::anyhow!("请求状态存储锁已中毒"))?
+            .queue_snapshot();
+        Ok(Self {
+            path: PathBuf::new(),
+            max_size,
+            next_id,
+            items,
+            request_store: Some(request_store),
         })
     }
 
@@ -136,6 +152,7 @@ impl PersistentQueue {
             friend_username: item.friend_username,
             requester: item.requester,
             dedup_bypass: item.dedup_bypass,
+            candidate_snapshot: item.candidate_snapshot,
         });
         self.save_state(&items, next_id)?;
         self.items = items;
@@ -184,6 +201,17 @@ impl PersistentQueue {
     }
 
     fn save_state(&self, items: &[QueueItem], next_id: u64) -> Result<()> {
+        if let Some(store) = &self.request_store {
+            return store
+                .lock()
+                .map_err(|_| anyhow::anyhow!("请求状态存储锁已中毒"))?
+                .update(|snapshot| {
+                    snapshot.queue = items.to_vec();
+                    snapshot.next_queue_item_id = next_id;
+                    true
+                })
+                .map(|_| ());
+        }
         ensure_parent(&self.path)?;
         let text = serde_json::to_string_pretty(&QueueFile {
             next_id,
@@ -191,6 +219,35 @@ impl PersistentQueue {
         })?;
         write_atomic(&self.path, &text)
     }
+}
+
+/// Reads the pre-ADR-0010 queue file.  It is intentionally retained only for one-way import
+/// into [`RequestStateStore`](super::state::RequestStateStore); new services never write it.
+pub(crate) fn load_legacy_queue_state(path: &Path) -> Result<(u64, Vec<QueueItem>)> {
+    if !path.exists() {
+        return Ok((1, Vec::new()));
+    }
+    let text =
+        fs::read_to_string(path).with_context(|| format!("read queue state {}", path.display()))?;
+    let file: QueueFile = serde_json::from_str(&text)
+        .with_context(|| format!("parse queue state {}", path.display()))?;
+    validate_queue_file(&file)?;
+    Ok((file.next_id, file.items))
+}
+
+fn validate_queue_file(file: &QueueFile) -> Result<()> {
+    if file.items.iter().any(|item| item.id == 0) {
+        bail!("播放队列当前格式要求每个 items[].id 大于 0");
+    }
+    let mut persisted_ids = HashSet::new();
+    if file.items.iter().any(|item| !persisted_ids.insert(item.id)) {
+        bail!("播放队列当前格式不允许重复的 items[].id");
+    }
+    let max_item_id = file.items.iter().map(|item| item.id).max().unwrap_or(0);
+    if file.next_id == 0 || file.next_id <= max_item_id {
+        bail!("播放队列当前格式要求 nextId 大于所有 items[].id");
+    }
+    Ok(())
 }
 
 fn write_atomic(path: &Path, text: &str) -> Result<()> {
@@ -234,6 +291,10 @@ mod tests {
             .push(QueueItem {
                 keyword: "song name".to_string(),
                 source: "netease".to_string(),
+                candidate_snapshot: vec![SearchCandidate::new(
+                    "song name - artist",
+                    "miliastra://track/netease/42",
+                )],
                 ..QueueItem::default()
             })
             .unwrap();
@@ -250,6 +311,13 @@ mod tests {
         assert!(loaded.items()[0].id > 0);
         assert_eq!(loaded.items()[0].keyword, "song name");
         assert_eq!(loaded.items()[0].source, "netease");
+        assert_eq!(
+            loaded.items()[0].candidate_snapshot,
+            vec![SearchCandidate::new(
+                "song name - artist",
+                "miliastra://track/netease/42",
+            )]
+        );
 
         let _ = fs::remove_file(path);
     }

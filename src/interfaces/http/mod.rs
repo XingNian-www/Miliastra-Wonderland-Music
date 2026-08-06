@@ -1196,6 +1196,7 @@ fn player_play_uri_route(
                 friend_username: String::new(),
                 requester,
                 dedup_bypass: true,
+                candidate_snapshot: Vec::new(),
             }),
         ))
         .map_err(internal_error)?
@@ -2222,6 +2223,7 @@ fn queue_add(
                 friend_username: String::new(),
                 requester,
                 dedup_bypass: true,
+                candidate_snapshot: Vec::new(),
             }),
         ))
         .map_err(internal_error)?
@@ -2633,14 +2635,16 @@ fn normalize_fuo_uri(value: Option<&str>) -> std::result::Result<String, AppErro
     if uri.is_empty() {
         return Err(bad_request("缺少url或uri参数"));
     }
-    if !uri.starts_with("fuo://") {
-        return Err(bad_request("只允许打开fuo://链接"));
+    if !uri.starts_with("miliastra://track/") && !uri.starts_with("fuo://") {
+        return Err(bad_request("只允许打开miliastra://track/<source>/<id>链接"));
     }
     Ok(uri)
 }
 
 fn source_from_fuo_uri(uri: &str) -> Option<&'static str> {
-    let rest = uri.strip_prefix("fuo://")?;
+    let rest = uri
+        .strip_prefix("miliastra://track/")
+        .or_else(|| uri.strip_prefix("fuo://"))?;
     let source = rest.split('/').next().unwrap_or("");
     match source {
         "qqmusic" => Some("qqmusic"),
@@ -3579,6 +3583,7 @@ mod tests {
                     playback_rate: 1.0,
                     volume: 0,
                     requester: String::new(),
+                    ..PlayerStatus::default()
                 },
             }
         }

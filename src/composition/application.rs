@@ -21,8 +21,8 @@ use std::thread::{self, sleep};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use self::formal_task::{FormalTaskClient, FormalTaskRuntime};
-use crate::adapters::feeluown::FeelUOwnClient;
 use crate::adapters::player::PlayerRuntimeBackend;
+use crate::adapters::playerd::{PlayerdClient, PlayerdSupervisor};
 use crate::adapters::windows::{WindowsUiDevice, parse_key};
 use crate::config::{AppConfig, PointConfig};
 use crate::features::administration::{
@@ -363,6 +363,7 @@ pub(crate) struct ApplicationRuntime {
     playback_application: PlaybackApplication,
     player_search: PlayerSearchClient,
     player_runtime: Option<PlayerRuntime>,
+    playerd_supervisor: Option<PlayerdSupervisor>,
     openai_runtime: Option<OpenAiRuntime>,
     ai: AiClient,
     song_requests: SongRequestApplication,
@@ -472,6 +473,49 @@ impl PlaybackStatePort for BusinessPlaybackStateAdapter {
     fn clear_external_playback_tracker(&self) -> Result<()> {
         self.business
             .clear_external_playback_tracker()
+            .map_err(anyhow::Error::from)
+    }
+
+    fn reconcile_player_session(
+        &self,
+        binding: Option<crate::features::playback::PlaybackSessionBinding>,
+    ) -> Result<crate::features::playback::SessionReconciliation> {
+        self.business
+            .reconcile_player_session(binding)
+            .map_err(anyhow::Error::from)
+    }
+
+    fn claim_terminal_outcome(
+        &self,
+        request_id: u64,
+        outcome: String,
+        handled_at_ms: u64,
+    ) -> Result<bool> {
+        self.business
+            .claim_terminal_outcome(request_id, outcome, handled_at_ms)
+            .map_err(anyhow::Error::from)
+    }
+
+    fn record_playback_attempt(
+        &self,
+        provider: String,
+        locator: String,
+        started_at_ms: u64,
+        result: String,
+    ) -> Result<()> {
+        self.business
+            .record_playback_attempt(provider, locator, started_at_ms, result)
+            .map_err(anyhow::Error::from)
+    }
+
+    fn record_control_operation(
+        &self,
+        operation: String,
+        requested_at_ms: u64,
+        completed: bool,
+    ) -> Result<()> {
+        self.business
+            .record_control_operation(operation, requested_at_ms, completed)
             .map_err(anyhow::Error::from)
     }
 }
@@ -830,7 +874,10 @@ impl ApplicationRuntime {
         } = config;
         let system_clock = Arc::new(SystemClock);
         let ocr_device = ProductionOcrDevice::new(ocr_args.clone())?;
-        let feeluown = FeelUOwnClient::new(&config.feeluown, &config.timing);
+        let playerd_supervisor =
+            PlayerdSupervisor::start(&config.playerd).context("启动或连接 miliastra-playerd")?;
+        let playerd =
+            PlayerdClient::connect(&config.playerd).context("连接 miliastra-playerd HTTP API")?;
         let idiom_chain = IdiomChainService::load(config.idiom_chain.clone())?;
         if config.idiom_chain.enabled {
             log::info!("已加载成语接龙词库: {} 条", idiom_chain.lexicon_len());
@@ -885,9 +932,9 @@ impl ApplicationRuntime {
         )?;
         let ocr = ocr_runtime.handle();
         let player_runtime = PlayerRuntime::start(
-            feeluown.clone(),
-            feeluown.clone(),
-            feeluown.clone(),
+            playerd.clone(),
+            playerd.clone(),
+            playerd.clone(),
             player_runtime_config,
         )
         .context("启动播放器运行时")?;
@@ -1045,6 +1092,7 @@ impl ApplicationRuntime {
             playback_application,
             player_search,
             player_runtime: Some(player_runtime),
+            playerd_supervisor: Some(playerd_supervisor),
             openai_runtime: Some(openai_runtime),
             ai,
             song_requests,

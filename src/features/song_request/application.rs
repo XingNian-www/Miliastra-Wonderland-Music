@@ -971,7 +971,7 @@ impl SongRequestExecution<'_> {
 
 fn ai_candidate_source(song: &SongCommand) -> &'static str {
     if song.friend_username.trim().is_empty() {
-        "qqmusic,netease"
+        "qqmusic,netease,bilibili"
     } else {
         song.source.as_str()
     }

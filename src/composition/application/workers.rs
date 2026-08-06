@@ -600,6 +600,7 @@ impl ApplicationRuntime {
             playback_application: self.playback_application.clone(),
             player_search: self.player_search.clone(),
             player_runtime: None,
+            playerd_supervisor: None,
             openai_runtime: None,
             ai: self.ai.clone(),
             song_requests: self.song_requests.clone(),

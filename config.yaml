@@ -158,7 +158,7 @@ timing:
     skip_status_retries: 5
     # 播放监控线程循环间隔，单位毫秒
     monitor_tick_ms: 200
-    # 播放结束监控向 FeelUOwn 校准状态的间隔，单位毫秒
+    # 播放结束监控向 playerd 校准状态的间隔，单位毫秒
     monitor_status_ms: 1000
     # 播放 URI 连续确认次数；大于 1 时覆盖全局值，0 或 1 表示继承
     uri_stable_samples: 0
@@ -174,8 +174,6 @@ timing:
     # 匹配失败/AI 自动匹配期间扫描确认命令的间隔，单位毫秒
     poll_ms: 2000
   external:
-    # FeelUOwn TCP RPC 读写超时，单位毫秒
-    feeluown_rpc_timeout_ms: 10000
     # 调整音量时每个平滑步进之间的等待时间，单位毫秒
     volume_smooth_step_ms: 300
     # AI HTTP 请求超时，单位毫秒
@@ -340,11 +338,27 @@ moderation:
     y: 700
     width: 500
     height: 100
-feeluown:
-  # FeelUOwn TCP RPC 地址
+playerd:
+  # 无 GUI 播放器 HTTP 地址
   host: 127.0.0.1
-  # FeelUOwn TCP RPC 端口
-  port: 23333
+  # 无 GUI 播放器 HTTP 端口
+  port: 17854
+  # playerd 可执行文件；auto_start=true 时由主线托管
+  executable: miliastra-playerd.exe
+  # playerd 工作目录，决定其数据目录和 libmpv 相对路径
+  working_dir: .
+  # playerd API capability token
+  token_path: data/api-token
+  # 候选 resolver locator 持久化文件
+  resolver_locator_path: data/playerd-resolver-locators.json
+  # 主线启动时自动拉起 playerd
+  auto_start: true
+  # 等待 playerd health 的最长时间，单位毫秒
+  startup_timeout_ms: 10000
+  # 每次 playerd HTTP 请求超时，单位毫秒
+  request_timeout_ms: 10000
+  # playerd 异常退出后最多自动重启次数；0 表示不重启
+  restart_limit: 1
 
 http:
   # Web/API 面板监听地址

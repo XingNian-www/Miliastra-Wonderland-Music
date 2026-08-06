@@ -80,6 +80,11 @@ impl ApplicationRuntime {
         {
             log::error!("播放器运行时关闭失败: {error}");
         }
+        if let Some(playerd_supervisor) = self.playerd_supervisor.take()
+            && let Err(error) = playerd_supervisor.shutdown()
+        {
+            log::error!("miliastra-playerd 关闭失败: {error:#}");
+        }
         if let Some(openai_runtime) = self.openai_runtime.take() {
             openai_runtime.shutdown();
             log::info!("OpenAI runtime 已关闭");

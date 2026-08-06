@@ -172,6 +172,7 @@ impl PlaybackExecutionPort for ApplicationRuntime {
                 picked.map(|picked| PlaybackPickedCandidate {
                     text: picked.candidate.text,
                     uri: picked.candidate.uri,
+                    candidate_snapshot: picked.candidate_snapshot,
                 })
             })
             .map_err(playback_search_failure)
@@ -201,6 +202,7 @@ impl PlaybackExecutionPort for ApplicationRuntime {
         Ok(Some(PlaybackPickedCandidate {
             text: candidate.text,
             uri: candidate.uri,
+            candidate_snapshot: candidates,
         }))
     }
 
@@ -210,6 +212,10 @@ impl PlaybackExecutionPort for ApplicationRuntime {
 
     fn play_and_verify(&mut self, request: &PlaybackRequest) -> Result<PlaybackVerification> {
         self.player.play_and_verify(request)
+    }
+
+    fn is_track_unavailable_error(&self, error: &anyhow::Error) -> bool {
+        self.player.is_track_unavailable_error(error)
     }
 
     fn reject_mismatch_as_no_source(&mut self, status: Option<&PlayerStatus>) -> Result<()> {

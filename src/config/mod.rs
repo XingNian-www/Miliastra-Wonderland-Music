@@ -29,7 +29,7 @@ pub struct AppConfig {
     pub templates: TemplateConfig,
     pub output: OutputConfig,
     pub moderation: ModerationConfig,
-    pub feeluown: FeelUOwnConfig,
+    pub playerd: PlayerdConfig,
     pub http: HttpConfig,
     pub logging: LoggingConfig,
     pub tui: TuiConfig,
@@ -110,7 +110,7 @@ impl AppConfig {
         self.screen.validate()?;
         self.ocr.validate()?;
         self.templates.validate()?;
-        self.feeluown.validate()?;
+        self.playerd.validate()?;
         self.http.validate()?;
         self.logging.validate()?;
         self.tui.validate()?;
@@ -460,10 +460,6 @@ impl TimingConfig {
             (self.decision.timeout_ms, "timing.decision.timeout_ms"),
             (self.decision.poll_ms, "timing.decision.poll_ms"),
             (
-                self.external.feeluown_rpc_timeout_ms,
-                "timing.external.feeluown_rpc_timeout_ms",
-            ),
-            (
                 self.external.volume_smooth_step_ms,
                 "timing.external.volume_smooth_step_ms",
             ),
@@ -527,7 +523,6 @@ pub struct DecisionTimingConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExternalTimingConfig {
-    pub feeluown_rpc_timeout_ms: u64,
     pub volume_smooth_step_ms: u64,
     pub ai_request_timeout_ms: u64,
 }
@@ -759,18 +754,41 @@ pub struct OutputConfig {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct FeelUOwnConfig {
+pub struct PlayerdConfig {
     pub host: String,
     pub port: u16,
+    pub executable: PathBuf,
+    pub working_dir: PathBuf,
+    pub token_path: PathBuf,
+    pub resolver_locator_path: PathBuf,
+    pub auto_start: bool,
+    pub startup_timeout_ms: u64,
+    pub request_timeout_ms: u64,
+    pub restart_limit: u32,
 }
 
-impl FeelUOwnConfig {
+impl PlayerdConfig {
     fn validate(&self) -> Result<()> {
         if self.host.trim().is_empty() {
-            bail!("feeluown.host 不能为空");
+            bail!("playerd.host 不能为空");
         }
         if self.port == 0 {
-            bail!("feeluown.port 必须大于 0");
+            bail!("playerd.port 必须大于 0");
+        }
+        if self.executable.as_os_str().is_empty() {
+            bail!("playerd.executable 不能为空");
+        }
+        if self.working_dir.as_os_str().is_empty() {
+            bail!("playerd.working_dir 不能为空");
+        }
+        if self.token_path.as_os_str().is_empty() {
+            bail!("playerd.token_path 不能为空");
+        }
+        if self.resolver_locator_path.as_os_str().is_empty() {
+            bail!("playerd.resolver_locator_path 不能为空");
+        }
+        if self.startup_timeout_ms == 0 || self.request_timeout_ms == 0 {
+            bail!("playerd 启动和请求超时必须大于 0");
         }
         Ok(())
     }
@@ -1174,7 +1192,7 @@ stale_timeout_ms: 7500
 
     #[test]
     fn startup_validation_rejects_zero_runtime_intervals_timeouts_and_retries() {
-        let invalid_fields: [ConfigMutation; 17] = [
+        let invalid_fields: [ConfigMutation; 16] = [
             ("timing.watchdog_restart_ms", |config| {
                 config.timing.watchdog_restart_ms = 0;
             }),
@@ -1217,9 +1235,6 @@ stale_timeout_ms: 7500
             ("timing.decision.poll_ms", |config| {
                 config.timing.decision.poll_ms = 0;
             }),
-            ("timing.external.feeluown_rpc_timeout_ms", |config| {
-                config.timing.external.feeluown_rpc_timeout_ms = 0;
-            }),
             ("timing.external.ai_request_timeout_ms", |config| {
                 config.timing.external.ai_request_timeout_ms = 0;
             }),
@@ -1259,11 +1274,11 @@ stale_timeout_ms: 7500
             ("templates.friend", |config| {
                 config.templates.friend = PathBuf::new();
             }),
-            ("feeluown.host", |config| {
-                config.feeluown.host.clear();
+            ("playerd.host", |config| {
+                config.playerd.host.clear();
             }),
-            ("feeluown.port", |config| {
-                config.feeluown.port = 0;
+            ("playerd.port", |config| {
+                config.playerd.port = 0;
             }),
             ("http.port", |config| {
                 config.http.port = 0;
@@ -1427,6 +1442,7 @@ stale_timeout_ms: 7500
             "turtle_soup",
             "song_review",
             "friend_delivery",
+            "playerd",
         ] {
             let mut value: serde_yaml::Value =
                 serde_yaml::from_str(bundled_config_yaml()).expect("default config value");

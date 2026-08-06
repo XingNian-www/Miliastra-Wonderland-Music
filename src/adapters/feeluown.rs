@@ -601,6 +601,8 @@ fn extract_search_candidates(text: &str) -> Vec<SearchCandidate> {
                 candidates.push(SearchCandidate {
                     text: candidate_text.clone(),
                     uri,
+                    eligibility: crate::features::song_request::CandidateEligibility::Unknown,
+                    resolver_locator: None,
                 });
             }
             block.clear();
@@ -611,6 +613,8 @@ fn extract_search_candidates(text: &str) -> Vec<SearchCandidate> {
             candidates.push(SearchCandidate {
                 text: String::new(),
                 uri,
+                eligibility: crate::features::song_request::CandidateEligibility::Unknown,
+                resolver_locator: None,
             });
         }
     }
@@ -654,6 +658,8 @@ fn json_song_candidate(value: &Value) -> Option<SearchCandidate> {
     Some(SearchCandidate {
         text: json_song_text(value).unwrap_or_else(|| uri.clone()),
         uri,
+        eligibility: crate::features::song_request::CandidateEligibility::Unknown,
+        resolver_locator: None,
     })
 }
 

@@ -146,10 +146,23 @@ pub enum PlayerControl {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ControlDispatchOutcome {
-    Acknowledged { response: String },
-    Rejected { reason: String },
-    NotSent { reason: String },
-    OutcomeUnknown { reason: String },
+    Acknowledged {
+        response: String,
+    },
+    Rejected {
+        reason: String,
+        /// Stable backend failure code, when the control port has one.
+        ///
+        /// This keeps provider-level failures distinguishable after a
+        /// control request crosses the player runtime thread boundary.
+        code: Option<String>,
+    },
+    NotSent {
+        reason: String,
+    },
+    OutcomeUnknown {
+        reason: String,
+    },
 }
 
 impl ControlDispatchOutcome {
@@ -162,6 +175,14 @@ impl ControlDispatchOutcome {
     pub fn rejected(reason: impl Into<String>) -> Self {
         Self::Rejected {
             reason: reason.into(),
+            code: None,
+        }
+    }
+
+    pub fn rejected_with_code(reason: impl Into<String>, code: impl Into<String>) -> Self {
+        Self::Rejected {
+            reason: reason.into(),
+            code: Some(code.into()),
         }
     }
 

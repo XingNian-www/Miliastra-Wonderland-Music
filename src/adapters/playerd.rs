@@ -25,7 +25,7 @@ use crate::runtime::player_io::{
     PlayerSearchPort, SearchCandidate,
 };
 
-const PROVIDERS: [&str; 2] = ["qqmusic", "netease"];
+const PROVIDERS: [&str; 3] = ["qqmusic", "netease", "bilibili"];
 
 #[derive(Clone, Debug)]
 struct TrackMetadata {

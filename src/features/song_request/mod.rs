@@ -23,7 +23,7 @@ pub(crate) use review::{
     SongReviewCandidate, SongReviewClient, SongReviewConfig, SongReviewDecision,
     split_candidate_title_artist,
 };
-pub use search::{PickedCandidate, SearchCandidate};
+pub use search::{CandidateEligibility, PickedCandidate, SearchCandidate};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StructuredSongInput {
@@ -45,7 +45,7 @@ impl StructuredSongInput {
 /// Parses the metadata format emitted by the song-list OCR source.
 ///
 /// The album field is accepted (and may be empty) so that a partially populated metadata line
-/// still becomes a song request. FeelUOwn's search endpoint accepts a title/artist query more
+/// still becomes a song request. The player daemon search endpoint accepts a title/artist query more
 /// reliably than an album suffix, so the album is retained for diagnostics but is not appended to
 /// the search keyword.
 pub(crate) fn parse_structured_song_text(text: &str) -> Option<StructuredSongInput> {

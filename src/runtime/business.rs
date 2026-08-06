@@ -26,8 +26,8 @@ use crate::features::invite::{InviteRequest, InviteService, InviteStart};
 use crate::features::moderation::{ModerationWorkflowKey, ModerationWorkflowLedger};
 use crate::features::playback::{
     ExternalPlaybackObservation, PlaybackMutationIntent, PlaybackMutationOutcome,
-    PlaybackRuntimeState, PlaybackService, PlaybackStateUpdate, QueueItem, QueuePushOutcome,
-    QueueRemoval, QueueRemoveOutcome, SongDedupCandidate,
+    PlaybackRuntimeState, PlaybackService, PlaybackSessionBinding, PlaybackStateUpdate, QueueItem,
+    QueuePushOutcome, QueueRemoval, QueueRemoveOutcome, SessionReconciliation, SongDedupCandidate,
 };
 use crate::features::turtle_soup::{
     QuestionSubmitOutcome, SecondaryOcrObservation, SecondaryOcrStability, TurtleSoupAiCompletion,
@@ -508,6 +508,29 @@ enum PlaybackRuntimeMessage {
         response: SyncSender<Result<ExternalPlaybackObservation, BusinessRuntimeError>>,
     },
     ClearExternalPlaybackTracker(SyncSender<Result<(), BusinessRuntimeError>>),
+    ReconcilePlayerSession {
+        binding: Option<PlaybackSessionBinding>,
+        response: SyncSender<Result<SessionReconciliation, BusinessRuntimeError>>,
+    },
+    ClaimTerminalOutcome {
+        request_id: u64,
+        outcome: String,
+        handled_at_ms: u64,
+        response: SyncSender<Result<bool, BusinessRuntimeError>>,
+    },
+    RecordPlaybackAttempt {
+        provider: String,
+        locator: String,
+        started_at_ms: u64,
+        result: String,
+        response: SyncSender<Result<(), BusinessRuntimeError>>,
+    },
+    RecordControlOperation {
+        operation: String,
+        requested_at_ms: u64,
+        completed: bool,
+        response: SyncSender<Result<(), BusinessRuntimeError>>,
+    },
 }
 
 enum ChatListenerRuntimeMessage {
@@ -1268,6 +1291,68 @@ impl BusinessRuntimeHandle {
             RuntimeMessage::Playback(PlaybackRuntimeMessage::ClearExternalPlaybackTracker(
                 response,
             ))
+        })
+    }
+
+    pub(crate) fn reconcile_player_session(
+        &self,
+        binding: Option<PlaybackSessionBinding>,
+    ) -> Result<SessionReconciliation, BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::Playback(PlaybackRuntimeMessage::ReconcilePlayerSession {
+                binding,
+                response,
+            })
+        })
+    }
+
+    pub(crate) fn claim_terminal_outcome(
+        &self,
+        request_id: u64,
+        outcome: String,
+        handled_at_ms: u64,
+    ) -> Result<bool, BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::Playback(PlaybackRuntimeMessage::ClaimTerminalOutcome {
+                request_id,
+                outcome,
+                handled_at_ms,
+                response,
+            })
+        })
+    }
+
+    pub(crate) fn record_playback_attempt(
+        &self,
+        provider: String,
+        locator: String,
+        started_at_ms: u64,
+        result: String,
+    ) -> Result<(), BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::Playback(PlaybackRuntimeMessage::RecordPlaybackAttempt {
+                provider,
+                locator,
+                started_at_ms,
+                result,
+                response,
+            })
+        })
+    }
+
+    pub(crate) fn record_control_operation(
+        &self,
+        operation: String,
+        requested_at_ms: u64,
+        completed: bool,
+    ) -> Result<(), BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::Playback(PlaybackRuntimeMessage::RecordControlOperation {
+                operation,
+                requested_at_ms,
+                completed,
+                response,
+            })
         })
     }
 
@@ -3372,6 +3457,71 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
                         .as_mut()
                         .map(|service| service.clear_external_playback_tracker())
                         .ok_or(BusinessRuntimeError::RuntimeStopped);
+                    let _ = response.send(result);
+                }
+                PlaybackRuntimeMessage::ReconcilePlayerSession { binding, response } => {
+                    let result = playback
+                        .as_mut()
+                        .ok_or(BusinessRuntimeError::RuntimeStopped)
+                        .and_then(|service| {
+                            service
+                                .reconcile_player_session(binding)
+                                .map_err(playback_operation_failed)
+                        });
+                    let _ = response.send(result);
+                }
+                PlaybackRuntimeMessage::ClaimTerminalOutcome {
+                    request_id,
+                    outcome,
+                    handled_at_ms,
+                    response,
+                } => {
+                    let result = playback
+                        .as_mut()
+                        .ok_or(BusinessRuntimeError::RuntimeStopped)
+                        .and_then(|service| {
+                            service
+                                .claim_terminal_outcome(request_id, outcome, handled_at_ms)
+                                .map_err(playback_operation_failed)
+                        });
+                    let _ = response.send(result);
+                }
+                PlaybackRuntimeMessage::RecordPlaybackAttempt {
+                    provider,
+                    locator,
+                    started_at_ms,
+                    result: attempt_result,
+                    response,
+                } => {
+                    let result = playback
+                        .as_mut()
+                        .ok_or(BusinessRuntimeError::RuntimeStopped)
+                        .and_then(|service| {
+                            service
+                                .record_playback_attempt(
+                                    provider,
+                                    locator,
+                                    started_at_ms,
+                                    attempt_result,
+                                )
+                                .map_err(playback_operation_failed)
+                        });
+                    let _ = response.send(result);
+                }
+                PlaybackRuntimeMessage::RecordControlOperation {
+                    operation,
+                    requested_at_ms,
+                    completed,
+                    response,
+                } => {
+                    let result = playback
+                        .as_mut()
+                        .ok_or(BusinessRuntimeError::RuntimeStopped)
+                        .and_then(|service| {
+                            service
+                                .record_control_operation(operation, requested_at_ms, completed)
+                                .map_err(playback_operation_failed)
+                        });
                     let _ = response.send(result);
                 }
             },

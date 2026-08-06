@@ -190,7 +190,8 @@ fn truncate_candidates_per_source(
 }
 
 fn candidate_source(uri: &str) -> String {
-    uri.strip_prefix("fuo://")
+    uri.strip_prefix("miliastra://track/")
+        .or_else(|| uri.strip_prefix("fuo://"))
         .and_then(|rest| rest.split('/').next())
         .unwrap_or("unknown")
         .to_string()
@@ -274,6 +275,8 @@ fn parse_query_candidates(text: &str) -> Result<Vec<SearchCandidate>> {
                 .unwrap_or("")
                 .trim()
                 .to_string(),
+            eligibility: super::CandidateEligibility::Unknown,
+            resolver_locator: None,
         });
     }
     if candidates.is_empty() {
@@ -442,7 +445,7 @@ fn build_candidate_pick_prompt(
         })
         .collect::<Vec<_>>();
     [
-        "任务：从 FeelUOwn 搜索候选中选出最适合用户点歌的一首。".to_string(),
+        "任务：从播放器搜索候选中选出最适合用户点歌的一首。".to_string(),
         "只返回 JSON，不要解释、不要注释、不要 Markdown 代码块。".to_string(),
         "必须输出结构：{\"uri\":string,\"score\":number,\"reason\":string}。".to_string(),
         "uri 必须逐字等于候选列表中的一个 uri，不能编造，不能改写。".to_string(),

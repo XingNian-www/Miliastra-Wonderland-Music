@@ -45,9 +45,10 @@ pub(crate) fn run(config_path: &Path) -> Result<()> {
         app_config.http.enabled
     );
     log::info!(
-        "FeelUOwn: {}:{}",
-        app_config.feeluown.host,
-        app_config.feeluown.port
+        "miliastra-playerd: {}:{} auto_start={}",
+        app_config.playerd.host,
+        app_config.playerd.port,
+        app_config.playerd.auto_start
     );
 
     let mut app = ApplicationRuntime::new(config, monitor.clone())?;

@@ -18,9 +18,9 @@ use crate::features::command::{
 };
 use crate::runtime::clock::WallClock;
 pub(crate) use controller::{
-    MismatchDecision, MusicPlayerBackend, PlaybackIdentityDecision, PlaybackIdentityJudge,
-    PlaybackNavigation, PlaybackOutcome, PlaybackRequest, PlaybackStatePort, PlaybackTimePorts,
-    PlaybackVerification, PlayerController, QueueAdvanceContext, QueueAdvanceDecision,
+    MusicPlayerBackend, PlaybackIdentityDecision, PlaybackIdentityJudge, PlaybackNavigation,
+    PlaybackOutcome, PlaybackRequest, PlaybackStatePort, PlaybackTimePorts, PlaybackVerification,
+    PlayerController, QueueAdvanceContext, QueueAdvanceDecision,
 };
 pub(crate) use dedup::{PersistentSongDedupHistory, SongDedupCandidate};
 pub(crate) use format::{
@@ -29,8 +29,9 @@ pub(crate) use format::{
 };
 pub(crate) use queue::{PersistentQueue, QueueItem};
 pub(crate) use state::{
-    ActivePlaybackRequest, ConfirmedPlaybackState, PauseReason, PersistentPlaybackState,
-    PlaybackObservation, PlaybackRuntimeState,
+    ActivePlaybackRequest, ConfirmedPlaybackState, ControlOperationRecord, PauseReason,
+    PersistentPlaybackState, PlaybackAttemptRecord, PlaybackObservation, PlaybackRuntimeState,
+    PlaybackSessionBinding, RequestStateStore, SessionReconciliation,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -259,6 +260,20 @@ pub(crate) struct PlayerStatus {
     pub(crate) playback_rate: f64,
     pub(crate) volume: i64,
     pub(crate) requester: String,
+    /// The player runtime which produced this observation, when the backend
+    /// exposes a stable process identity.
+    pub(crate) runtime_identity: String,
+    /// Session reference carried by playerd terminal outcomes.
+    pub(crate) session_id: String,
+    pub(crate) generation: u64,
+    /// Playerd end behavior and durable terminal outcome metadata.
+    pub(crate) end_behavior: String,
+    pub(crate) last_end_cause: String,
+    pub(crate) failure_code: String,
+    pub(crate) failure_message: String,
+    pub(crate) failure_retryable: bool,
+    pub(crate) failure_provider: String,
+    pub(crate) failure_retry_after_ms: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -615,6 +630,7 @@ impl PlaybackStateUpdate {
 pub(crate) struct PlaybackService {
     queue: PersistentQueue,
     playback_state: PersistentPlaybackState,
+    request_state: Option<state::SharedRequestStateStore>,
     song_dedup_history: PersistentSongDedupHistory,
     song_dedup: SongDedupConfig,
     external_playback_tracker: controller::ExternalPlaybackTracker,
@@ -629,8 +645,9 @@ impl PlaybackService {
         song_dedup: SongDedupConfig,
         wall_clock: Arc<dyn WallClock>,
     ) -> Result<Self> {
-        let queue = PersistentQueue::load(queue_path, queue_max_size)?;
-        let playback_state = PersistentPlaybackState::load(playback_state_path)?;
+        let request_state = RequestStateStore::load(playback_state_path, &queue_path)?;
+        let queue = PersistentQueue::from_request_store(request_state.clone(), queue_max_size)?;
+        let playback_state = PersistentPlaybackState::from_request_store(request_state.clone())?;
         let song_dedup_history =
             PersistentSongDedupHistory::load(song_dedup_history_path, wall_clock)?;
         log::info!("已加载队列: {} 首", queue.len());
@@ -639,12 +656,9 @@ impl PlaybackService {
             "已加载播放状态: playback_state={:?}",
             playback_state.state().state
         );
-        Ok(Self::new(
-            queue,
-            playback_state,
-            song_dedup_history,
-            song_dedup,
-        ))
+        let mut service = Self::new(queue, playback_state, song_dedup_history, song_dedup);
+        service.request_state = Some(request_state);
+        Ok(service)
     }
 
     pub(crate) fn new(
@@ -656,6 +670,7 @@ impl PlaybackService {
         Self {
             queue,
             playback_state,
+            request_state: None,
             song_dedup_history,
             song_dedup,
             external_playback_tracker: controller::ExternalPlaybackTracker::default(),
@@ -769,6 +784,78 @@ impl PlaybackService {
     ) -> Result<bool> {
         self.playback_state
             .update(|playback| update.apply(playback))
+    }
+
+    pub(crate) fn reconcile_player_session(
+        &mut self,
+        binding: Option<PlaybackSessionBinding>,
+    ) -> Result<SessionReconciliation> {
+        let Some(store) = &self.request_state else {
+            return Ok(SessionReconciliation::Unknown);
+        };
+        store
+            .lock()
+            .map_err(|_| anyhow::anyhow!("请求状态存储锁已中毒"))?
+            .reconcile_player_session(binding)
+    }
+
+    pub(crate) fn claim_terminal_outcome(
+        &mut self,
+        request_id: u64,
+        outcome: impl Into<String>,
+        handled_at_ms: u64,
+    ) -> Result<bool> {
+        let Some(store) = &self.request_state else {
+            return Ok(false);
+        };
+        store
+            .lock()
+            .map_err(|_| anyhow::anyhow!("请求状态存储锁已中毒"))?
+            .claim_terminal_outcome(request_id, outcome, handled_at_ms)
+    }
+
+    pub(crate) fn record_playback_attempt(
+        &mut self,
+        provider: String,
+        locator: String,
+        started_at_ms: u64,
+        result: String,
+    ) -> Result<()> {
+        let Some(store) = &self.request_state else {
+            return Ok(());
+        };
+        store
+            .lock()
+            .map_err(|_| anyhow::anyhow!("请求状态存储锁已中毒"))?
+            .record_attempt(PlaybackAttemptRecord {
+                request_id: 0,
+                provider,
+                locator,
+                started_at_ms,
+                result,
+            })
+            .map(|_| ())
+    }
+
+    pub(crate) fn record_control_operation(
+        &mut self,
+        operation: String,
+        requested_at_ms: u64,
+        completed: bool,
+    ) -> Result<()> {
+        let Some(store) = &self.request_state else {
+            return Ok(());
+        };
+        store
+            .lock()
+            .map_err(|_| anyhow::anyhow!("请求状态存储锁已中毒"))?
+            .record_control_operation(ControlOperationRecord {
+                operation_id: 0,
+                operation,
+                requested_at_ms,
+                completed,
+            })
+            .map(|_| ())
     }
 }
 

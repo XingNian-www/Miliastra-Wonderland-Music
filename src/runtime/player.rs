@@ -28,6 +28,24 @@ pub struct RawPlayerSample {
     pub duration: Option<Duration>,
     pub playback_rate: Option<f64>,
     pub volume: Option<i64>,
+    /// Opaque playerd process/session data. Keeping it adjacent to the raw
+    /// transport sample lets the controller distinguish a durable terminal
+    /// outcome from a generic stopped observation.
+    pub runtime: PlayerRuntimeMetadata,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PlayerRuntimeMetadata {
+    pub runtime_identity: String,
+    pub session_id: String,
+    pub generation: u64,
+    pub end_behavior: String,
+    pub last_end_cause: String,
+    pub failure_code: String,
+    pub failure_message: String,
+    pub failure_retryable: bool,
+    pub failure_provider: String,
+    pub failure_retry_after_ms: u64,
 }
 
 impl RawPlayerSample {
@@ -116,6 +134,7 @@ pub struct PlayerObservation {
     pub volume: Option<i64>,
     pub volume_sampled_at: Option<Instant>,
     pub sampled_at: Option<Instant>,
+    pub runtime: PlayerRuntimeMetadata,
 }
 
 impl PlayerObservation {
@@ -393,6 +412,7 @@ pub struct PlayerObserver<C> {
     stable_transport: Option<StableField<TransportState>>,
     transport_candidate: Option<Candidate<TransportState>>,
     evidence: TrackEvidence,
+    runtime: PlayerRuntimeMetadata,
     playback_instance: Option<PlaybackInstance>,
     last_identity_uri: Option<String>,
     last_transport: Option<TransportState>,
@@ -412,6 +432,7 @@ impl<C: Clock> PlayerObserver<C> {
             stable_transport: None,
             transport_candidate: None,
             evidence: TrackEvidence::default(),
+            runtime: PlayerRuntimeMetadata::default(),
             playback_instance: None,
             last_identity_uri: None,
             last_transport: None,
@@ -427,6 +448,7 @@ impl<C: Clock> PlayerObserver<C> {
         self.expire_stale_fields(now);
         self.last_attempted_at = Some(now);
         self.last_successful_observed_at = Some(now);
+        self.runtime = sample.runtime.clone();
 
         let raw_uri = normalized_uri(sample.uri.as_deref()).map(str::to_owned);
         let prior_progress = raw_uri
@@ -718,6 +740,7 @@ impl<C: Clock> PlayerObserver<C> {
             volume: self.evidence.volume,
             volume_sampled_at: self.evidence.volume_sampled_at,
             sampled_at: self.evidence.sampled_at,
+            runtime: self.runtime.clone(),
         }
     }
 
@@ -841,9 +864,33 @@ mod tests {
 
     use super::{
         ObservationFreshness, PlaybackIdentity, PlaybackInstance, PlayerObservationConfig,
-        PlayerObserver, RawPlayerSample, TransportState,
+        PlayerObserver, PlayerRuntimeMetadata, RawPlayerSample, TransportState,
     };
     use crate::runtime::clock::{Clock, ManualClock};
+
+    #[test]
+    fn raw_runtime_metadata_survives_observation_stabilization() {
+        let clock = ManualClock::new(Instant::now());
+        let mut observer = PlayerObserver::new(clock, PlayerObservationConfig::default());
+        let mut sample =
+            RawPlayerSample::new("miliastra://track/netease/123", TransportState::Stopped);
+        sample.runtime = PlayerRuntimeMetadata {
+            runtime_identity: "runtime-a".to_string(),
+            session_id: "session-a".to_string(),
+            generation: 12,
+            end_behavior: "notify_controller".to_string(),
+            last_end_cause: "natural_end".to_string(),
+            ..PlayerRuntimeMetadata::default()
+        };
+
+        let first = observer.observe_sample(sample.clone());
+        let second = observer.observe_sample(sample);
+
+        assert_eq!(first.runtime.runtime_identity, "runtime-a");
+        assert_eq!(second.runtime.session_id, "session-a");
+        assert_eq!(second.runtime.generation, 12);
+        assert_eq!(second.runtime.last_end_cause, "natural_end");
+    }
 
     fn observer(
         clock: &ManualClock,

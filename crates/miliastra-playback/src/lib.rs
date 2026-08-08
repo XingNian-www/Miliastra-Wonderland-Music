@@ -4,6 +4,7 @@ mod daemon;
 mod domain;
 mod engine;
 mod login;
+mod lyrics;
 mod model;
 mod runtime;
 
@@ -12,6 +13,7 @@ pub use credentials::{CredentialError, CredentialStatus, ProviderCredential};
 pub use domain::{
     EndBehavior, EndCause, EngineState, Failure, ResolverLocator, ResolverLocatorError,
 };
+pub use lyrics::{LyricsParseError, TimedLyricLine, TimedLyrics, parse_lrc_pair};
 pub use model::{
     PlayableTrack, SearchCandidate, SearchQuery, TrackKey, TrackKeyError, TrackMetadata, TrackRef,
 };

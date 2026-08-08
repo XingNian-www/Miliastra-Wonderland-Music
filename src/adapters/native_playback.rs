@@ -39,7 +39,7 @@ impl PlayerObservationPort for NativePlaybackAdapter {
             title: metadata.map(|metadata| metadata.title.clone()),
             artist: metadata.map(|metadata| metadata.artists.join(" / ")),
             album_name: metadata.and_then(|metadata| metadata.album.clone()),
-            lyric_line_text: None,
+            lyric_line_text: snapshot.lyric_line_text,
             progress: snapshot.position_seconds.map(Duration::from_secs_f64),
             duration: snapshot
                 .duration_seconds

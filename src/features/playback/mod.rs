@@ -1,4 +1,9 @@
 use anyhow::{Result, bail};
+use miliastra_playback::PlayableTrack;
+#[cfg(test)]
+use miliastra_playback::{
+    PlaybackEligibility, ProviderId, SearchCandidate, TrackKey, TrackMetadata, TrackRef,
+};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -11,6 +16,43 @@ mod format;
 mod matcher;
 mod queue;
 mod state;
+
+#[cfg(test)]
+pub(crate) fn test_track(uri: &str, text: &str) -> PlayableTrack {
+    let locator = uri
+        .strip_prefix("miliastra://track/")
+        .expect("test URI uses the canonical track scheme");
+    let (provider, id) = locator
+        .split_once('/')
+        .expect("test URI contains provider and id");
+    let provider = provider.parse::<ProviderId>().expect("known test provider");
+    let (title, artist) = text
+        .split_once(" - ")
+        .map_or((text, "测试歌手"), |(title, artist)| (title, artist));
+    PlayableTrack {
+        track_ref: TrackRef {
+            key: TrackKey::new(provider, id).expect("valid test track key"),
+            resolver_locator: None,
+        },
+        metadata: TrackMetadata {
+            title: title.to_string(),
+            artists: vec![artist.to_string()],
+            album: None,
+            duration_ms: Some(180_000),
+        },
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_candidate(text: &str, uri: &str) -> SearchCandidate {
+    let track = test_track(uri, text);
+    SearchCandidate {
+        track_ref: track.track_ref,
+        metadata: track.metadata,
+        eligibility: PlaybackEligibility::Unknown,
+        text: text.to_string(),
+    }
+}
 
 use crate::features::chat_text::{CommandSyntax, command_identity, parse_prefixed_command};
 use crate::features::command::{
@@ -250,6 +292,8 @@ pub(crate) enum BackgroundLyricsScope {
 #[serde(default, rename_all = "camelCase")]
 pub(crate) struct PlayerStatus {
     pub(crate) status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) current_track: Option<PlayableTrack>,
     pub(crate) current_uri: String,
     pub(crate) name: String,
     pub(crate) singer: String,
@@ -463,7 +507,7 @@ pub(crate) struct QueuePushOutcome {
 }
 
 pub(crate) enum PlaybackMutationIntent {
-    Push(QueueItem),
+    Push(Box<QueueItem>),
     Remove(QueueRemoval),
     Clear,
 }
@@ -485,7 +529,7 @@ pub(crate) enum QueueRemoval {
 pub(crate) enum QueueRemoveOutcome {
     Removed {
         index: usize,
-        item: QueueItem,
+        item: Box<QueueItem>,
         size: usize,
     },
     MissingId,
@@ -638,14 +682,13 @@ pub(crate) struct PlaybackService {
 
 impl PlaybackService {
     pub(crate) fn load(
-        queue_path: PathBuf,
         playback_state_path: PathBuf,
         song_dedup_history_path: PathBuf,
         queue_max_size: usize,
         song_dedup: SongDedupConfig,
         wall_clock: Arc<dyn WallClock>,
     ) -> Result<Self> {
-        let request_state = RequestStateStore::load(playback_state_path, &queue_path)?;
+        let request_state = RequestStateStore::load(playback_state_path)?;
         let queue = PersistentQueue::from_request_store(request_state.clone(), queue_max_size)?;
         let playback_state = PersistentPlaybackState::from_request_store(request_state.clone())?;
         let song_dedup_history =
@@ -682,8 +725,8 @@ impl PlaybackService {
     }
 
     pub(crate) fn queue_contains(&self, item: &QueueItem) -> bool {
-        if !item.uri.trim().is_empty() {
-            return self.queue.has_duplicate_uri(&item.uri);
+        if let Some(track) = item.track.as_ref() {
+            return self.queue.has_duplicate_track(&track.track_ref.key);
         }
         self.queue
             .has_duplicate(&item.keyword, &item.source, item.prefer_accompaniment)
@@ -728,7 +771,7 @@ impl PlaybackService {
         };
         Ok(QueueRemoveOutcome::Removed {
             index: removed.0,
-            item: removed.1,
+            item: Box::new(removed.1),
             size: self.queue.len(),
         })
     }
@@ -867,7 +910,7 @@ fn observation_identity_changed(
         return true;
     };
     previous.status != current.status
-        || previous.uri != current.uri
+        || previous.track != current.track
         || previous.title != current.title
         || previous.artist != current.artist
         || previous.reliability != current.reliability

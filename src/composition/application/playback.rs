@@ -40,8 +40,8 @@ impl ApplicationRuntime {
         log::info!(
             "播放流程完成: outcome={:?} requested_uri={} final_uri={} actual_uri={} source_switched={} reason={}",
             result.outcome(),
-            result.requested().uri,
-            result.final_request().uri,
+            result.requested().uri(),
+            result.final_request().uri(),
             result
                 .status()
                 .map(|status| status.current_uri.as_str())
@@ -170,8 +170,8 @@ impl PlaybackExecutionPort for ApplicationRuntime {
             .search_and_pick(keyword, source, prefer_accompaniment)
             .map(|picked| {
                 picked.map(|picked| PlaybackPickedCandidate {
+                    track: picked.candidate.playable_track(),
                     text: picked.candidate.text,
-                    uri: picked.candidate.uri,
                     candidate_snapshot: picked.candidate_snapshot,
                 })
             })
@@ -200,8 +200,8 @@ impl PlaybackExecutionPort for ApplicationRuntime {
             select_ai_candidate(&self.ai, keyword, prefer_accompaniment, &candidates)
                 .map_err(|error| PlaybackSearchFailure::Backend(error.to_string()))?;
         Ok(Some(PlaybackPickedCandidate {
+            track: candidate.playable_track(),
             text: candidate.text,
-            uri: candidate.uri,
             candidate_snapshot: candidates,
         }))
     }

@@ -10,6 +10,7 @@ use async_trait::async_trait;
 
 use crate::credentials::ProviderCredential;
 use crate::domain::{ResolverLocator, SearchSpec, Song, SongKey, StreamSource};
+use crate::lyrics::TimedLyrics;
 
 pub use crate::domain::Failure;
 pub use bilibili::BilibiliAdapter;
@@ -115,6 +116,13 @@ pub trait SourceAdapter: Send + Sync + 'static {
         key: &SongKey,
         locator: Option<&ResolverLocator>,
     ) -> Result<StreamSource, CatalogError>;
+    async fn lyrics(
+        &self,
+        _key: &SongKey,
+        _locator: Option<&ResolverLocator>,
+    ) -> Result<Option<TimedLyrics>, CatalogError> {
+        Ok(None)
+    }
 }
 
 #[derive(Clone, Default)]

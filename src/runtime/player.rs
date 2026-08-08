@@ -31,7 +31,7 @@ pub struct RawPlayerSample {
     pub duration: Option<Duration>,
     pub playback_rate: Option<f64>,
     pub volume: Option<i64>,
-    /// Opaque playerd process/session data. Keeping it adjacent to the raw
+    /// Opaque native playback runtime/session data. Keeping it adjacent to the raw
     /// transport sample lets the controller distinguish a durable terminal
     /// outcome from a generic stopped observation.
     pub runtime: PlayerRuntimeMetadata,

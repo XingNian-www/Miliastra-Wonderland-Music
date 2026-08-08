@@ -20,10 +20,15 @@ on:
       - THIRD_PARTY_NOTICES.md
       - assets/**
       - config.yaml
+      - crates/**
+      - docs/**
+      - scripts/**
       - turtle_soup.example.yaml
       - undercover.example.yaml
       - src/**
+      - vendor/ffmpeg/8.1/windows-x64/**
       - vendor/mnn/3.6.0/windows-x64/**
+      - vendor/webview2/1.0.4129.50/x64/**
 
 permissions:
   contents: write
@@ -53,6 +58,13 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: windows-msvc-release
+
+      - name: 安装 PE 导入表检查工具
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: mingw-w64-x86_64-binutils
 
       - name: 缓存 OCR 模型
         uses: actions/cache@v4
@@ -95,7 +107,7 @@ jobs:
           }
 
       - name: 编译 Release EXE
-        run: cargo build --release --target x86_64-pc-windows-msvc --locked
+        run: cargo build --workspace --release --target x86_64-pc-windows-msvc --locked
 
       - name: 解析发布版本
         id: version
@@ -120,8 +132,8 @@ jobs:
           if (-not $version.StartsWith('v')) {
             $version = "v$version"
           }
-          $createRelease = 'true'
-          if ('${{ github.event_name }}' -eq 'push') {
+          $createRelease = '${{ github.event_name }}' -eq 'workflow_dispatch'
+          if ('${{ github.event_name }}' -eq 'push' -and '${{ github.ref_name }}' -eq 'main') {
             $createRelease = 'false'
             $before = '${{ github.event.before }}'
             if (-not $before -or $before -match '^0+$') {
@@ -137,15 +149,20 @@ jobs:
           }
           "version=$version" >> $env:GITHUB_OUTPUT
           "zip=miliastra-wonderland-music-windows-x64-$version.zip" >> $env:GITHUB_OUTPUT
-          "create_release=$createRelease" >> $env:GITHUB_OUTPUT
+          "create_release=$($createRelease.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
 
       - name: 准备产物
         shell: pwsh
         run: |
           $dist = 'dist/miliastra-wonderland-music-windows-x64'
-          New-Item -ItemType Directory -Force -Path $dist | Out-Null
-          Copy-Item 'target/x86_64-pc-windows-msvc/release/miliastra-wonderland-music.exe' $dist
-          Copy-Item 'vendor/mnn/3.6.0/windows-x64/bin/MNN.dll' $dist
+          & ./scripts/package-ffmpeg-runtime.ps1 `
+            -FfmpegRoot 'vendor/ffmpeg/8.1/windows-x64' `
+            -MinGwRuntime 'vendor/ffmpeg/8.1/windows-x64/bin/libwinpthread-1.dll' `
+            -Executable 'target/x86_64-pc-windows-msvc/release/miliastra-wonderland-music.exe' `
+            -LoginHelper 'target/x86_64-pc-windows-msvc/release/miliastra-login-helper.exe' `
+            -Mnn 'vendor/mnn/3.6.0/windows-x64/bin/MNN.dll' `
+            -Destination $dist `
+            -Objdump 'C:\msys64\mingw64\bin\objdump.exe'
           Copy-Item 'assets' $dist -Recurse
           Copy-Item 'models' $dist -Recurse
           Copy-Item 'config.yaml' $dist
@@ -166,7 +183,13 @@ jobs:
 
           $requiredFiles = @(
             'miliastra-wonderland-music.exe',
+            'miliastra-login-helper.exe',
             'MNN.dll',
+            'avformat-62.dll',
+            'avcodec-62.dll',
+            'avutil-60.dll',
+            'swresample-6.dll',
+            'libwinpthread-1.dll',
             'assets\idioms.txt',
             'config.yaml',
             'models\PP-OCRv6_small_det.mnn',
@@ -198,7 +221,7 @@ jobs:
           path: dist/miliastra-wonderland-music-windows-x64
 
       - name: 创建 GitHub Release
-        if: steps.version.outputs.create_release == 'true'
+        if: github.ref_name != 'dev' && steps.version.outputs.create_release == 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.version }}

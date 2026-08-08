@@ -20,7 +20,7 @@ use crate::login::LoginCoordinator;
 use crate::lyrics::TimedLyrics;
 
 #[derive(Clone)]
-pub struct PlayerDaemon {
+pub struct PlaybackCore {
     catalog: SourceCatalog,
     registry: Option<ProviderRegistry>,
     engine: Arc<dyn AudioEngine>,
@@ -30,7 +30,7 @@ pub struct PlayerDaemon {
     login: LoginCoordinator,
 }
 
-impl PlayerDaemon {
+impl PlaybackCore {
     #[cfg(test)]
     pub fn new(
         catalog: SourceCatalog,
@@ -65,15 +65,15 @@ impl PlayerDaemon {
         }
     }
 
-    pub async fn search(&self, spec: SearchSpec) -> Result<CatalogSearchResult, DaemonError> {
+    pub async fn search(&self, spec: SearchSpec) -> Result<CatalogSearchResult, PlaybackCoreError> {
         let keyword = spec.keyword.trim();
         if keyword.is_empty() {
-            return Err(DaemonError::InvalidRequest(
+            return Err(PlaybackCoreError::InvalidRequest(
                 "keyword must not be empty".to_owned(),
             ));
         }
         if spec.limit == 0 || spec.limit > 50 {
-            return Err(DaemonError::InvalidRequest(
+            return Err(PlaybackCoreError::InvalidRequest(
                 "limit must be between 1 and 50".to_owned(),
             ));
         }
@@ -131,7 +131,7 @@ impl PlayerDaemon {
             .filter(|outcome| outcome.is_success())
             .count();
         if self.registry.is_some() && successful == 0 {
-            return Err(DaemonError::SearchFailed { outcomes });
+            return Err(PlaybackCoreError::SearchFailed { outcomes });
         }
         let songs = outcomes
             .iter()
@@ -164,15 +164,15 @@ impl PlayerDaemon {
         song_key: SongKey,
         resolver_locator: Option<ResolverLocator>,
         end_behavior: EndBehavior,
-    ) -> Result<StartReceipt, DaemonError> {
+    ) -> Result<StartReceipt, PlaybackCoreError> {
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let session_id = Uuid::new_v4();
         if let Some(registry) = self.registry.as_ref() {
             let provider = registry
                 .require_enabled(&song_key.source)
-                .map_err(DaemonError::Failure)?;
+                .map_err(PlaybackCoreError::Failure)?;
             if provider.as_str() != song_key.source {
-                return Err(DaemonError::Failure(
+                return Err(PlaybackCoreError::Failure(
                     Failure::new("invalid_request", "song key provider is not canonical")
                         .with_provider(song_key.source.clone()),
                 ));
@@ -181,16 +181,18 @@ impl PlayerDaemon {
         let adapter = self
             .catalog
             .get(&song_key.source)
-            .ok_or_else(|| DaemonError::UnknownSource(song_key.source.clone()))?;
+            .ok_or_else(|| PlaybackCoreError::UnknownSource(song_key.source.clone()))?;
         let stream = timeout(
             self.source_timeout,
             adapter.resolve(&song_key, resolver_locator.as_ref()),
         )
         .await
-        .map_err(|_| DaemonError::Catalog(CatalogError::TimedOut(song_key.source.clone())))??;
+        .map_err(|_| {
+            PlaybackCoreError::Catalog(CatalogError::TimedOut(song_key.source.clone()))
+        })??;
 
         if self.generation.load(Ordering::SeqCst) != generation {
-            return Err(DaemonError::Engine(EngineError::Rejected(
+            return Err(PlaybackCoreError::Engine(EngineError::Rejected(
                 "play request was superseded by a newer request".to_owned(),
             )));
         }
@@ -217,47 +219,47 @@ impl PlayerDaemon {
         &self,
         song_key: SongKey,
         resolver_locator: Option<ResolverLocator>,
-    ) -> Result<Option<TimedLyrics>, DaemonError> {
+    ) -> Result<Option<TimedLyrics>, PlaybackCoreError> {
         if let Some(registry) = self.registry.as_ref() {
             registry
                 .require_enabled(&song_key.source)
-                .map_err(DaemonError::Failure)?;
+                .map_err(PlaybackCoreError::Failure)?;
         }
         let adapter = self
             .catalog
             .get(&song_key.source)
-            .ok_or_else(|| DaemonError::UnknownSource(song_key.source.clone()))?;
+            .ok_or_else(|| PlaybackCoreError::UnknownSource(song_key.source.clone()))?;
         timeout(
             self.source_timeout,
             adapter.lyrics(&song_key, resolver_locator.as_ref()),
         )
         .await
-        .map_err(|_| DaemonError::Catalog(CatalogError::TimedOut(song_key.source)))?
-        .map_err(DaemonError::Catalog)
+        .map_err(|_| PlaybackCoreError::Catalog(CatalogError::TimedOut(song_key.source)))?
+        .map_err(PlaybackCoreError::Catalog)
     }
 
-    pub async fn pause(&self, session: SessionRef) -> Result<(), DaemonError> {
+    pub async fn pause(&self, session: SessionRef) -> Result<(), PlaybackCoreError> {
         self.engine
             .command(EngineCommand::Pause { session })
             .await?;
         Ok(())
     }
 
-    pub async fn resume(&self, session: SessionRef) -> Result<(), DaemonError> {
+    pub async fn resume(&self, session: SessionRef) -> Result<(), PlaybackCoreError> {
         self.engine
             .command(EngineCommand::Resume { session })
             .await?;
         Ok(())
     }
 
-    pub async fn stop(&self, session: SessionRef) -> Result<(), DaemonError> {
+    pub async fn stop(&self, session: SessionRef) -> Result<(), PlaybackCoreError> {
         self.engine.command(EngineCommand::Stop { session }).await?;
         Ok(())
     }
 
-    pub async fn set_volume(&self, volume: u8) -> Result<(), DaemonError> {
+    pub async fn set_volume(&self, volume: u8) -> Result<(), PlaybackCoreError> {
         if volume > 100 {
-            return Err(DaemonError::InvalidRequest(
+            return Err(PlaybackCoreError::InvalidRequest(
                 "volume must be between 0 and 100".to_owned(),
             ));
         }
@@ -300,9 +302,9 @@ impl PlayerDaemon {
         &self,
         provider: crate::catalog::ProviderId,
         candidate: &ProviderCredential,
-    ) -> Result<(), DaemonError> {
+    ) -> Result<(), PlaybackCoreError> {
         if candidate.provider() != provider.as_str() {
-            return Err(DaemonError::Failure(
+            return Err(PlaybackCoreError::Failure(
                 Failure::new(
                     "invalid_request",
                     "credential candidate provider does not match requested provider",
@@ -313,18 +315,20 @@ impl PlayerDaemon {
         let adapter = self
             .catalog
             .get(provider.as_str())
-            .ok_or_else(|| DaemonError::UnknownSource(provider.to_string()))?;
+            .ok_or_else(|| PlaybackCoreError::UnknownSource(provider.to_string()))?;
         timeout(self.source_timeout, adapter.validate_credential(candidate))
             .await
-            .map_err(|_| DaemonError::Catalog(CatalogError::TimedOut(provider.to_string())))??;
+            .map_err(|_| {
+                PlaybackCoreError::Catalog(CatalogError::TimedOut(provider.to_string()))
+            })??;
         Ok(())
     }
 
-    fn requested_sources(&self, requested: Vec<String>) -> Result<Vec<String>, DaemonError> {
+    fn requested_sources(&self, requested: Vec<String>) -> Result<Vec<String>, PlaybackCoreError> {
         if let Some(registry) = self.registry.as_ref() {
             for source in &requested {
                 if !registry.known(source) {
-                    return Err(DaemonError::Failure(
+                    return Err(PlaybackCoreError::Failure(
                         Failure::new("unknown_provider", "provider identifier is unknown")
                             .with_provider(source.clone()),
                     ));
@@ -492,7 +496,7 @@ impl StartReceipt {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum DaemonError {
+pub(crate) enum PlaybackCoreError {
     #[error("invalid request: {0}")]
     InvalidRequest(String),
     #[error("unknown source: {0}")]
@@ -585,7 +589,7 @@ mod tests {
         }
     }
 
-    fn daemon(adapters: Vec<Arc<dyn SourceAdapter>>) -> (PlayerDaemon, Arc<RecordingEngine>) {
+    fn core(adapters: Vec<Arc<dyn SourceAdapter>>) -> (PlaybackCore, Arc<RecordingEngine>) {
         let (snapshot_tx, snapshot) = watch::channel(PlaybackSnapshot::default());
         let engine = Arc::new(RecordingEngine {
             commands: Mutex::new(Vec::new()),
@@ -593,7 +597,7 @@ mod tests {
             snapshot,
         });
         (
-            PlayerDaemon::new(
+            PlaybackCore::new(
                 SourceCatalog::new(adapters),
                 engine.clone(),
                 Duration::from_secs(1),
@@ -604,10 +608,10 @@ mod tests {
 
     #[test]
     fn snapshot_exposes_a_nonempty_process_runtime_identity() {
-        let (daemon, _) = daemon(Vec::new());
+        let (core, _) = core(Vec::new());
 
-        let first = daemon.snapshot().runtime_identity;
-        let second = daemon.snapshot().runtime_identity;
+        let first = core.snapshot().runtime_identity;
+        let second = core.snapshot().runtime_identity;
 
         assert!(!first.is_empty());
         assert_eq!(first, second);
@@ -615,7 +619,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_keeps_successful_sources_and_reports_failed_sources() {
-        let (daemon, _) = daemon(vec![
+        let (core, _) = core(vec![
             Arc::new(FakeSource {
                 source: "qq",
                 songs: vec![song("qq", "q1"), song("qq", "q2")],
@@ -628,7 +632,7 @@ mod tests {
             }),
         ]);
 
-        let response = daemon
+        let response = core
             .search(SearchSpec {
                 keyword: "song".to_owned(),
                 sources: vec!["qq".to_owned(), "wy".to_owned()],
@@ -644,13 +648,13 @@ mod tests {
 
     #[tokio::test]
     async fn play_resolves_media_just_in_time_and_dispatches_generation() {
-        let (daemon, engine) = daemon(vec![Arc::new(FakeSource {
+        let (core, engine) = core(vec![Arc::new(FakeSource {
             source: "qq",
             songs: Vec::new(),
             fail_search: false,
         })]);
 
-        let receipt = daemon
+        let receipt = core
             .play(
                 SongKey::new("qq", "song-1").unwrap(),
                 None,
@@ -704,10 +708,10 @@ mod tests {
             resolve_count: AtomicUsize::new(0),
             seen_locators: Mutex::new(Vec::new()),
         });
-        let (daemon, engine) = daemon(vec![source.clone()]);
+        let (core, engine) = core(vec![source.clone()]);
         let song_key = SongKey::new("tx", "song-1").unwrap();
         let resolver_locator = ResolverLocator::new("test-v1:persisted").unwrap();
-        let receipt = daemon
+        let receipt = core
             .play(
                 song_key.clone(),
                 Some(resolver_locator.clone()),
@@ -845,15 +849,15 @@ mod tests {
             snapshot_tx,
             snapshot,
         });
-        let daemon = PlayerDaemon::new(
+        let core = PlaybackCore::new(
             SourceCatalog::new([source.clone() as Arc<dyn SourceAdapter>]),
             engine.clone(),
             Duration::from_secs(1),
         );
 
-        let old_daemon = daemon.clone();
+        let old_core = core.clone();
         let old = tokio::spawn(async move {
-            old_daemon
+            old_core
                 .play(
                     SongKey::new("tx", "old").unwrap(),
                     None,
@@ -863,7 +867,7 @@ mod tests {
         });
         source.old_started.notified().await;
 
-        let newer = daemon
+        let newer = core
             .play(
                 SongKey::new("tx", "new").unwrap(),
                 None,
@@ -877,7 +881,7 @@ mod tests {
         assert_eq!(newer.generation, 2);
         assert!(matches!(
             older_result,
-            Err(DaemonError::Engine(EngineError::Rejected(_)))
+            Err(PlaybackCoreError::Engine(EngineError::Rejected(_)))
         ));
         assert_eq!(engine.snapshot.borrow().generation, 2);
         assert_eq!(
@@ -928,11 +932,11 @@ mod tests {
             old_started: Notify::new(),
             release_old: Notify::new(),
         });
-        let (daemon, engine) = daemon(vec![source.clone()]);
+        let (core, engine) = core(vec![source.clone()]);
 
-        let older_daemon = daemon.clone();
+        let older_core = core.clone();
         let older = tokio::spawn(async move {
-            older_daemon
+            older_core
                 .play(
                     SongKey::new("tx", "old").unwrap(),
                     None,
@@ -942,7 +946,7 @@ mod tests {
         });
         source.old_started.notified().await;
 
-        let newer = daemon
+        let newer = core
             .play(
                 SongKey::new("tx", "new").unwrap(),
                 None,
@@ -951,7 +955,7 @@ mod tests {
             .await;
         assert!(matches!(
             newer,
-            Err(DaemonError::Catalog(CatalogError::Transient(_)))
+            Err(PlaybackCoreError::Catalog(CatalogError::Transient(_)))
         ));
 
         source.release_old.notify_one();
@@ -959,7 +963,7 @@ mod tests {
 
         assert!(matches!(
             older,
-            Err(DaemonError::Engine(EngineError::Rejected(message)))
+            Err(PlaybackCoreError::Engine(EngineError::Rejected(message)))
                 if message.contains("superseded")
         ));
         assert!(engine.commands.lock().unwrap().is_empty());
@@ -1013,9 +1017,9 @@ mod tests {
             retry_started: Notify::new(),
             release_retry: Notify::new(),
         });
-        let (daemon, engine) = daemon(vec![source.clone()]);
+        let (core, engine) = core(vec![source.clone()]);
         let old_song = SongKey::new("tx", "old").unwrap();
-        let old = daemon
+        let old = core
             .play(old_song.clone(), None, EndBehavior::NotifyController)
             .await
             .unwrap();
@@ -1030,14 +1034,13 @@ mod tests {
         });
         source.retry_started.notified().await;
 
-        daemon
-            .play(
-                SongKey::new("tx", "new").unwrap(),
-                None,
-                EndBehavior::NotifyController,
-            )
-            .await
-            .unwrap();
+        core.play(
+            SongKey::new("tx", "new").unwrap(),
+            None,
+            EndBehavior::NotifyController,
+        )
+        .await
+        .unwrap();
         source.release_retry.notify_one();
         tokio::time::sleep(Duration::from_millis(75)).await;
 

@@ -1,14 +1,12 @@
-use std::collections::HashSet;
-use std::fs;
-use std::path::{Path, PathBuf};
-
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, anyhow};
 use miliastra_playback::{PlayableTrack, TrackKey};
 use serde::{Deserialize, Serialize};
 
 use crate::features::song_request::SearchCandidate;
 
 use super::matcher;
+#[cfg(test)]
+use super::state::RequestStateStore;
 use super::state::SharedRequestStateStore;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -46,49 +44,15 @@ impl Default for QueueItem {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct QueueFile {
-    next_id: u64,
-    items: Vec<QueueItem>,
-}
-
 #[derive(Debug)]
 pub struct PersistentQueue {
-    path: PathBuf,
     max_size: usize,
     next_id: u64,
     items: Vec<QueueItem>,
-    request_store: Option<SharedRequestStateStore>,
+    request_store: SharedRequestStateStore,
 }
 
 impl PersistentQueue {
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn load(path: PathBuf, max_size: usize) -> Result<Self> {
-        let file_exists = path.exists();
-        let file = if file_exists {
-            let text = fs::read_to_string(&path)
-                .with_context(|| format!("read queue state {}", path.display()))?;
-            serde_json::from_str(&text)
-                .with_context(|| format!("parse queue state {}", path.display()))?
-        } else {
-            QueueFile {
-                next_id: 1,
-                items: Vec::new(),
-            }
-        };
-        if file_exists {
-            validate_queue_file(&file)?;
-        }
-        Ok(Self {
-            path,
-            max_size,
-            next_id: file.next_id,
-            items: file.items,
-            request_store: None,
-        })
-    }
-
     pub(crate) fn from_request_store(
         request_store: SharedRequestStateStore,
         max_size: usize,
@@ -98,12 +62,16 @@ impl PersistentQueue {
             .map_err(|_| anyhow::anyhow!("请求状态存储锁已中毒"))?
             .queue_snapshot();
         Ok(Self {
-            path: PathBuf::new(),
             max_size,
             next_id,
             items,
-            request_store: Some(request_store),
+            request_store,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(max_size: usize) -> Result<Self> {
+        Self::from_request_store(RequestStateStore::new_for_test(), max_size)
     }
 
     pub fn items(&self) -> &[QueueItem] {
@@ -206,43 +174,16 @@ impl PersistentQueue {
     }
 
     fn save_state(&self, items: &[QueueItem], next_id: u64) -> Result<()> {
-        if let Some(store) = &self.request_store {
-            return store
-                .lock()
-                .map_err(|_| anyhow::anyhow!("请求状态存储锁已中毒"))?
-                .update(|snapshot| {
-                    snapshot.queue = items.to_vec();
-                    snapshot.next_queue_item_id = next_id;
-                    true
-                })
-                .map(|_| ());
-        }
-        ensure_parent(&self.path)?;
-        let text = serde_json::to_string_pretty(&QueueFile {
-            next_id,
-            items: items.to_vec(),
-        })?;
-        write_atomic(&self.path, &text)
+        self.request_store
+            .lock()
+            .map_err(|_| anyhow!("请求状态存储锁已中毒"))?
+            .update(|snapshot| {
+                snapshot.queue = items.to_vec();
+                snapshot.next_queue_item_id = next_id;
+                true
+            })
+            .map(|_| ())
     }
-}
-
-fn validate_queue_file(file: &QueueFile) -> Result<()> {
-    if file.items.iter().any(|item| item.id == 0) {
-        bail!("播放队列当前格式要求每个 items[].id 大于 0");
-    }
-    let mut persisted_ids = HashSet::new();
-    if file.items.iter().any(|item| !persisted_ids.insert(item.id)) {
-        bail!("播放队列当前格式不允许重复的 items[].id");
-    }
-    let max_item_id = file.items.iter().map(|item| item.id).max().unwrap_or(0);
-    if file.next_id == 0 || file.next_id <= max_item_id {
-        bail!("播放队列当前格式要求 nextId 大于所有 items[].id");
-    }
-    Ok(())
-}
-
-fn write_atomic(path: &Path, text: &str) -> Result<()> {
-    crate::adapters::file_store::write_atomic(path, text.as_bytes(), "播放队列")
 }
 
 fn normalize_source(source: &str) -> String {
@@ -255,30 +196,14 @@ fn normalize_source(source: &str) -> String {
     }
 }
 
-fn ensure_parent(path: &Path) -> Result<()> {
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create state directory {}", parent.display()))?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
     use super::*;
     use crate::features::playback::test_candidate;
 
     #[test]
-    fn push_persists_wrapped_queue_file() {
-        let path = temp_queue_path("wrapped");
-        let _ = fs::remove_file(&path);
-
-        let mut queue = PersistentQueue::load(path.clone(), 5).unwrap();
+    fn push_assigns_stable_ids_and_normalizes_source() {
+        let mut queue = PersistentQueue::new_for_test(5).unwrap();
         let added = queue
             .push(QueueItem {
                 keyword: "song name".to_string(),
@@ -293,128 +218,21 @@ mod tests {
 
         assert!(added);
         assert_eq!(queue.len(), 1);
-
-        let text = fs::read_to_string(&path).unwrap();
-        assert!(text.contains("\"items\""));
-        assert!(text.contains("\"nextId\""));
-
-        let loaded = PersistentQueue::load(path.clone(), 5).unwrap();
-        assert_eq!(loaded.len(), 1);
-        assert!(loaded.items()[0].id > 0);
-        assert_eq!(loaded.items()[0].keyword, "song name");
-        assert_eq!(loaded.items()[0].source, "netease");
+        assert_eq!(queue.items()[0].id, 1);
+        assert_eq!(queue.items()[0].keyword, "song name");
+        assert_eq!(queue.items()[0].source, "netease");
         assert_eq!(
-            loaded.items()[0].candidate_snapshot,
+            queue.items()[0].candidate_snapshot,
             vec![test_candidate(
                 "song name - artist",
                 "miliastra://track/netease/42",
             )]
         );
-
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn load_rejects_legacy_queue_shapes() {
-        let path = temp_queue_path("legacy-shape");
-        let _ = fs::remove_file(&path);
-        fs::write(
-            &path,
-            r#"[{"id":1,"keyword":"legacy","source":"qqmusic","preferAccompaniment":false,"aiOriginalText":"","uri":"","friendUsername":"","dedupBypass":false}]"#,
-        )
-        .unwrap();
-
-        let error = PersistentQueue::load(path.clone(), 5).expect_err("legacy array rejected");
-        assert!(error.to_string().contains("parse queue state"));
-
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn load_rejects_current_queue_files_without_stable_item_ids() {
-        let path = temp_queue_path("missing-stable-id");
-        let _ = fs::remove_file(&path);
-        fs::write(
-            &path,
-            r#"{
-                "nextId": 1,
-                "items": [{
-                    "id": 0,
-                    "keyword": "song",
-                    "source": "qqmusic",
-                    "preferAccompaniment": false,
-                    "aiOriginalText": "",
-                    "uri": "",
-                    "friendUsername": "",
-                    "dedupBypass": false
-                }]
-            }"#,
-        )
-        .unwrap();
-
-        let error = PersistentQueue::load(path.clone(), 5)
-            .expect_err("current queue items must already have stable ids");
-
-        assert!(error.to_string().contains("id"));
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn load_rejects_duplicate_current_queue_item_ids() {
-        let path = temp_queue_path("duplicate-stable-id");
-        let _ = fs::remove_file(&path);
-        let item = |keyword: &str| QueueItem {
-            id: 1,
-            keyword: keyword.to_string(),
-            ..QueueItem::default()
-        };
-        fs::write(
-            &path,
-            serde_json::to_string(&QueueFile {
-                next_id: 2,
-                items: vec![item("first"), item("second")],
-            })
-            .unwrap(),
-        )
-        .unwrap();
-
-        let error = PersistentQueue::load(path.clone(), 5)
-            .expect_err("current queue item ids must be unique");
-
-        assert!(error.to_string().contains("重复"));
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn load_rejects_current_queue_files_with_a_stale_next_id() {
-        let path = temp_queue_path("stale-next-id");
-        let _ = fs::remove_file(&path);
-        fs::write(
-            &path,
-            serde_json::to_string(&QueueFile {
-                next_id: 3,
-                items: vec![QueueItem {
-                    id: 3,
-                    keyword: "song".to_string(),
-                    ..QueueItem::default()
-                }],
-            })
-            .unwrap(),
-        )
-        .unwrap();
-
-        let error = PersistentQueue::load(path.clone(), 5)
-            .expect_err("nextId must be greater than every persisted item id");
-
-        assert!(error.to_string().contains("nextId"));
-        let _ = fs::remove_file(path);
     }
 
     #[test]
     fn remove_by_id_is_stable_after_front_item_is_shifted() {
-        let path = temp_queue_path("stable-id-remove");
-        let _ = fs::remove_file(&path);
-        let mut queue = PersistentQueue::load(path.clone(), 5).unwrap();
+        let mut queue = PersistentQueue::new_for_test(5).unwrap();
 
         for keyword in ["first", "second", "third"] {
             queue
@@ -433,20 +251,5 @@ mod tests {
         assert_eq!(removed.1.keyword, "third");
         assert_eq!(queue.items().len(), 1);
         assert_eq!(queue.items()[0].keyword, "second");
-
-        let _ = fs::remove_file(path);
-    }
-
-    fn temp_queue_path(name: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "miliastra-queue-test-{}-{}-{}.json",
-            std::process::id(),
-            name,
-            nanos
-        ))
     }
 }

@@ -45,7 +45,9 @@ http://127.0.0.1:18888/
 - `/monitor`：当前歌曲和待播队列会包含点歌人。
 - `/state`：`playback.activeRequest.requester` 包含当前活动歌曲的点歌人。
 
-聊天点歌会记录发起点歌的聊天用户名。直接调用 `/queue/add` 或 `/player/play-uri` 时，可以通过 `requester` 参数指定点歌人；未指定时使用 `WEB/API`。原有的 `friendUsername` 字段仍会保留，用于兼容旧客户端。
+聊天点歌会记录发起点歌的聊天用户名。直接调用 `/queue/add` 或
+`/player/play-track` 时，可以通过 `requester` 参数指定点歌人；未指定时使用
+`WEB/API`。播放请求必须提交结构化 `trackRef` 和 `metadata`，不能提交旧 URI。
 
 ## 高级工具页
 

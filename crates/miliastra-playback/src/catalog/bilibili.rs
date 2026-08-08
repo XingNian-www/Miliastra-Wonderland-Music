@@ -22,6 +22,7 @@ use url::Url;
 use crate::catalog::{CatalogError, PlaybackEligibility, ProviderSearchCandidate, SourceAdapter};
 use crate::credentials::{CredentialStore, ProviderCredential};
 use crate::domain::{ResolverLocator, SearchSpec, Song, SongKey, StreamSource};
+use crate::lyrics::TimedLyrics;
 
 const SEARCH_URL: &str = "https://api.bilibili.com/x/web-interface/wbi/search/type";
 const NAV_URL: &str = "https://api.bilibili.com/x/web-interface/nav";
@@ -472,6 +473,20 @@ impl SourceAdapter for BilibiliAdapter {
             expires_at_epoch_ms: None,
         })
     }
+
+    async fn lyrics(
+        &self,
+        key: &SongKey,
+        locator: Option<&ResolverLocator>,
+    ) -> Result<Option<TimedLyrics>, CatalogError> {
+        if key.source != self.source_code() {
+            return Err(CatalogError::InvalidResponse(
+                "song key provider does not match Bilibili adapter".to_owned(),
+            ));
+        }
+        bilibili_resolver_bvid(key, locator)?;
+        Ok(None)
+    }
 }
 
 pub(crate) fn parse_search_candidates(
@@ -915,6 +930,22 @@ mod tests {
         assert_eq!(parse_duration_ms(&json!("1:02:03")), Some(3_723_000));
         assert_eq!(parse_duration_ms(&json!(180)), Some(180_000));
         assert_eq!(parse_duration_ms(&json!("bad")), None);
+    }
+
+    #[tokio::test]
+    async fn bilibili_lyrics_are_explicitly_absent() {
+        let adapter =
+            BilibiliAdapter::new(CredentialStore::memory(), Duration::from_secs(2)).unwrap();
+        let key = SongKey::new("bilibili", "BV1us411d75p").unwrap();
+        let locator = ResolverLocator::new("bilibili:v1:BV1us411d75p").unwrap();
+
+        assert!(
+            adapter
+                .lyrics(&key, Some(&locator))
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle as TokioJoinHandle;
 use uuid::Uuid;
 
 use crate::catalog::{
@@ -19,6 +20,7 @@ use crate::domain::{
     SessionRef,
 };
 use crate::engine::{FfmpegConfig, FfmpegEngine};
+use crate::lyrics::TimedLyrics;
 use crate::model::{PlayableTrack, SearchCandidate, SearchQuery};
 
 const COMMAND_CAPACITY: usize = 32;
@@ -47,6 +49,8 @@ pub struct PlaybackSnapshot {
     pub track: Option<PlayableTrack>,
     pub position_seconds: Option<f64>,
     pub duration_seconds: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lyric_line_text: Option<String>,
     pub volume: u8,
     pub last_end_cause: Option<EndCause>,
     pub end_behavior: Option<EndBehavior>,
@@ -128,6 +132,31 @@ enum Command {
     CompleteLogin(Uuid, ProviderCredential, Reply<CredentialStatus>),
     CancelLogin(Uuid, Reply<()>),
     Shutdown(Reply<()>),
+}
+
+enum LyricState {
+    Loading {
+        generation: u64,
+        task: TokioJoinHandle<Result<Option<TimedLyrics>, DaemonError>>,
+    },
+    Ready {
+        generation: u64,
+        lyrics: Option<TimedLyrics>,
+    },
+}
+
+impl LyricState {
+    fn generation(&self) -> u64 {
+        match self {
+            Self::Loading { generation, .. } | Self::Ready { generation, .. } => *generation,
+        }
+    }
+
+    fn abort(self) {
+        if let Self::Loading { task, .. } = self {
+            task.abort();
+        }
+    }
 }
 
 impl PlaybackRuntime {
@@ -353,6 +382,7 @@ async fn run_commands(
 ) -> Option<Reply<()>> {
     let mut active_session: Option<SessionRef> = None;
     let mut active_track: Option<PlayableTrack> = None;
+    let mut lyric_state: Option<LyricState> = None;
     while let Some(command) = commands.recv().await {
         match command {
             Command::Search(query, reply) => {
@@ -360,20 +390,33 @@ async fn run_commands(
                 let _ = reply.send(result);
             }
             Command::Play(track, reply) => {
+                clear_lyric_state(&mut lyric_state);
                 let key = track.track_ref.key.to_song_key();
                 let result = match key {
-                    Ok(key) => daemon
-                        .play(
-                            key,
-                            track.track_ref.resolver_locator.clone(),
-                            EndBehavior::NotifyController,
-                        )
-                        .await
-                        .map(|receipt| {
-                            active_session = Some(receipt.session_ref());
-                            active_track = Some(track);
-                        })
-                        .map_err(PlaybackError::from),
+                    Ok(key) => {
+                        let resolver_locator = track.track_ref.resolver_locator.clone();
+                        let result = daemon
+                            .play(
+                                key.clone(),
+                                resolver_locator.clone(),
+                                EndBehavior::NotifyController,
+                            )
+                            .await;
+                        result
+                            .map(|receipt| {
+                                let lyric_daemon = daemon.clone();
+                                let generation = receipt.generation;
+                                lyric_state = Some(LyricState::Loading {
+                                    generation,
+                                    task: tokio::spawn(async move {
+                                        lyric_daemon.lyrics(key, resolver_locator).await
+                                    }),
+                                });
+                                active_session = Some(receipt.session_ref());
+                                active_track = Some(track);
+                            })
+                            .map_err(PlaybackError::from)
+                    }
                     Err(error) => Err(PlaybackError::Internal(error.to_string())),
                 };
                 let _ = reply.send(result);
@@ -397,13 +440,20 @@ async fn run_commands(
                     Some(session) => block_result(daemon.stop(session).await),
                     None => Err(PlaybackError::NoActiveSession),
                 };
+                if result.is_ok() {
+                    clear_lyric_state(&mut lyric_state);
+                }
                 let _ = reply.send(result);
             }
             Command::SetVolume(volume, reply) => {
                 let _ = reply.send(block_result(daemon.set_volume(volume).await));
             }
             Command::Snapshot(reply) => {
-                let snapshot = public_snapshot(daemon.snapshot(), active_track.as_ref());
+                let engine_snapshot = daemon.snapshot();
+                let lyric_line_text =
+                    lyric_line_for_snapshot(&mut lyric_state, &engine_snapshot).await;
+                let snapshot =
+                    public_snapshot(engine_snapshot, active_track.as_ref(), lyric_line_text);
                 let _ = reply.send(Ok(snapshot));
             }
             Command::Providers(reply) => {
@@ -472,11 +522,62 @@ async fn run_commands(
                 let _ = reply.send(Ok(()));
             }
             Command::Shutdown(reply) => {
+                clear_lyric_state(&mut lyric_state);
                 return Some(reply);
             }
         }
     }
     None
+}
+
+fn clear_lyric_state(state: &mut Option<LyricState>) {
+    if let Some(state) = state.take() {
+        state.abort();
+    }
+}
+
+async fn lyric_line_for_snapshot(
+    state: &mut Option<LyricState>,
+    snapshot: &EngineSnapshot,
+) -> Option<String> {
+    if state
+        .as_ref()
+        .is_some_and(|state| state.generation() != snapshot.generation)
+    {
+        clear_lyric_state(state);
+        return None;
+    }
+
+    let finished = matches!(
+        state.as_ref(),
+        Some(LyricState::Loading { task, .. }) if task.is_finished()
+    );
+    if finished && let Some(LyricState::Loading { generation, task }) = state.take() {
+        let lyrics = match task.await {
+            Ok(Ok(lyrics)) => lyrics,
+            Ok(Err(error)) => {
+                tracing::warn!(generation, %error, "timed lyric loading failed");
+                None
+            }
+            Err(error) if error.is_cancelled() => None,
+            Err(error) => {
+                tracing::warn!(generation, %error, "timed lyric task failed");
+                None
+            }
+        };
+        if snapshot.generation == generation {
+            *state = Some(LyricState::Ready { generation, lyrics });
+        }
+    }
+
+    let position_seconds = snapshot.position_seconds?;
+    match state.as_ref()? {
+        LyricState::Ready { lyrics, .. } => lyrics
+            .as_ref()?
+            .line_at_seconds(position_seconds)
+            .map(str::to_owned),
+        LyricState::Loading { .. } => None,
+    }
 }
 
 async fn search(
@@ -511,6 +612,7 @@ async fn search(
 fn public_snapshot(
     snapshot: EngineSnapshot,
     active_track: Option<&PlayableTrack>,
+    lyric_line_text: Option<String>,
 ) -> PlaybackSnapshot {
     let track = snapshot.song_key.as_ref().and_then(|song_key| {
         active_track
@@ -528,6 +630,7 @@ fn public_snapshot(
         track,
         position_seconds: snapshot.position_seconds,
         duration_seconds: snapshot.duration_seconds,
+        lyric_line_text,
         volume: snapshot.volume,
         last_end_cause: snapshot.last_end_cause,
         end_behavior: snapshot.end_behavior,
@@ -582,6 +685,7 @@ mod tests {
     use crate::catalog::CatalogError;
     use crate::domain::{PlaybackSnapshot as EngineSnapshot, Song, SongKey, StreamSource};
     use crate::engine::{AudioEngine, EngineCommand, EngineError};
+    use crate::lyrics::{TimedLyricLine, TimedLyrics};
 
     struct FakeSource;
 
@@ -612,6 +716,21 @@ mod tests {
                 headers: BTreeMap::new(),
                 expires_at_epoch_ms: None,
             })
+        }
+
+        async fn lyrics(
+            &self,
+            key: &SongKey,
+            _locator: Option<&crate::domain::ResolverLocator>,
+        ) -> Result<Option<TimedLyrics>, CatalogError> {
+            if key.id == "track-1" {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Ok(TimedLyrics::new(vec![TimedLyricLine {
+                start_ms: 1_000,
+                text: key.id.clone(),
+                translation: Some(format!("translated-{}", key.id)),
+            }]))
         }
     }
 
@@ -648,6 +767,7 @@ mod tests {
                     snapshot.session_id = Some(*session_id);
                     snapshot.song_key = Some(song_key.clone());
                     snapshot.end_behavior = Some(*end_behavior);
+                    snapshot.position_seconds = Some(1.5);
                     snapshot.state = EngineState::Playing;
                 }
                 EngineCommand::Pause { .. } => snapshot.state = EngineState::Paused,
@@ -750,5 +870,49 @@ mod tests {
             handle.snapshot(),
             Err(PlaybackError::RuntimeStopped)
         ));
+    }
+
+    #[test]
+    fn timed_lyrics_are_fenced_when_a_new_generation_replaces_a_track() {
+        let runtime = test_runtime();
+        let handle = runtime.handle();
+        let first = PlayableTrack {
+            track_ref: crate::model::TrackRef {
+                key: crate::model::TrackKey::new(ProviderId::QqMusic, "track-1").unwrap(),
+                resolver_locator: None,
+            },
+            metadata: crate::model::TrackMetadata {
+                title: "first".to_owned(),
+                artists: vec!["artist".to_owned()],
+                album: None,
+                duration_ms: Some(10_000),
+            },
+        };
+        let second = PlayableTrack {
+            track_ref: crate::model::TrackRef {
+                key: crate::model::TrackKey::new(ProviderId::QqMusic, "track-2").unwrap(),
+                resolver_locator: None,
+            },
+            metadata: crate::model::TrackMetadata {
+                title: "second".to_owned(),
+                artists: vec!["artist".to_owned()],
+                album: None,
+                duration_ms: Some(10_000),
+            },
+        };
+
+        handle.play(first).unwrap();
+        handle.play(second).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let mut line = None;
+        while std::time::Instant::now() < deadline {
+            line = handle.snapshot().unwrap().lyric_line_text;
+            if line.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(line.as_deref(), Some("translated-track-2"));
+        runtime.shutdown().unwrap();
     }
 }

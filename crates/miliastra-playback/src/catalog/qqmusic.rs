@@ -1,7 +1,7 @@
 //! Minimal native QQ Music protocol adapter.
 //!
 //! The adapter deliberately owns the provider-specific JSON shape and rights
-//! flags. The daemon only sees canonical Song values and three-state
+//! flags. The playback core only sees canonical Song values and three-state
 //! PlaybackEligibility.
 
 use std::collections::BTreeMap;
@@ -42,7 +42,7 @@ impl QqMusicAdapter {
     pub fn new(credentials: CredentialStore, timeout: Duration) -> Result<Self, CatalogError> {
         let client = Client::builder()
             .timeout(timeout)
-            .user_agent("miliastra-playerd/0.1")
+            .user_agent("miliastra-wonderland-music/0.1")
             .build()
             .map_err(|error| CatalogError::Transient(error.to_string()))?;
         Ok(Self {

@@ -473,7 +473,7 @@ impl PlaybackApplication {
                 } else {
                     let message = port.next_external()?;
                     port.update_monitor();
-                    port.log_executed(context, "next playerd")?;
+                    port.log_executed(context, "next native playback")?;
                     self.reply_player_status_after_skip(message.trim(), port)?;
                 }
             }

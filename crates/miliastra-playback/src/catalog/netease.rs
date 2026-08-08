@@ -40,19 +40,6 @@ impl NeteaseAdapter {
         })
     }
 
-    #[cfg(test)]
-    pub fn with_endpoints(
-        credentials: CredentialStore,
-        timeout: Duration,
-        search_url: Url,
-        media_url: Url,
-    ) -> Result<Self, CatalogError> {
-        let mut adapter = Self::new(credentials, timeout)?;
-        adapter.search_url = search_url;
-        adapter.media_url = media_url;
-        Ok(adapter)
-    }
-
     fn credential(&self) -> Result<ProviderCredential, CatalogError> {
         self.credentials
             .get("netease")

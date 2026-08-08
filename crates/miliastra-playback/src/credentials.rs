@@ -9,6 +9,14 @@ use thiserror::Error;
 
 pub const SUPPORTED_PROVIDERS: &[&str] = &["qqmusic", "netease", "bilibili"];
 const MAX_SECRET_BYTES: usize = 64 * 1024;
+const CREDENTIAL_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CredentialEnvelope {
+    schema_version: u32,
+    credential: ProviderCredential,
+}
 
 /// Plaintext account state captured by the provider login helper. The store
 /// never exposes secret values through its status APIs; native adapters read a
@@ -238,10 +246,25 @@ impl CredentialStore {
                 path: path.clone(),
                 error: error.to_string(),
             })?;
-            let credential =
-                serde_json::from_str::<ProviderCredential>(&text).map_err(|error| {
+            let value = serde_json::from_str::<serde_json::Value>(&text).map_err(|error| {
+                CredentialError::Invalid(format!("{}: {error}", path.display()))
+            })?;
+            let schema_version = value
+                .get("schemaVersion")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|version| u32::try_from(version).ok());
+            if schema_version != Some(CREDENTIAL_SCHEMA_VERSION) {
+                return Err(CredentialError::UnsupportedSchema {
+                    path,
+                    expected: CREDENTIAL_SCHEMA_VERSION,
+                    actual: schema_version,
+                });
+            }
+            let envelope =
+                serde_json::from_value::<CredentialEnvelope>(value).map_err(|error| {
                     CredentialError::Invalid(format!("{}: {error}", path.display()))
                 })?;
+            let credential = envelope.credential;
             validate_source(provider, &credential)?;
             credential.validate()?;
             credentials.insert(*provider, credential);
@@ -252,6 +275,7 @@ impl CredentialStore {
         })
     }
 
+    #[cfg(test)]
     pub fn memory() -> Self {
         Self {
             directory: None,
@@ -326,13 +350,7 @@ fn canonical_provider(provider: &str) -> Result<&'static str, CredentialError> {
         .iter()
         .copied()
         .find(|candidate| *candidate == provider)
-        .ok_or_else(|| {
-            if matches!(provider, "kuwo" | "kugou") {
-                CredentialError::ProviderNotCompiled(provider.to_owned())
-            } else {
-                CredentialError::UnknownProvider(provider.to_owned())
-            }
-        })
+        .ok_or_else(|| CredentialError::UnknownProvider(provider.to_owned()))
 }
 
 fn validate_source(
@@ -392,8 +410,11 @@ fn persist_credential(path: &Path, credential: &ProviderCredential) -> Result<()
     if let Some(parent) = path.parent() {
         ensure_credential_directory(parent)?;
     }
-    let content = serde_json::to_vec_pretty(credential)
-        .map_err(|error| CredentialError::Invalid(error.to_string()))?;
+    let content = serde_json::to_vec_pretty(&CredentialEnvelope {
+        schema_version: CREDENTIAL_SCHEMA_VERSION,
+        credential: credential.clone(),
+    })
+    .map_err(|error| CredentialError::Invalid(error.to_string()))?;
     write_atomic(path, &content)
 }
 
@@ -520,8 +541,12 @@ fn remove_credential_file(path: &Path) -> Result<(), CredentialError> {
 pub enum CredentialError {
     #[error("unknown provider credential: {0}")]
     UnknownProvider(String),
-    #[error("provider credential adapter is not compiled: {0}")]
-    ProviderNotCompiled(String),
+    #[error("unsupported credential schema in {path}: expected {expected}, got {actual:?}")]
+    UnsupportedSchema {
+        path: PathBuf,
+        expected: u32,
+        actual: Option<u32>,
+    },
     #[error("credential kind does not match provider {requested}: got {actual}")]
     ProviderMismatch { requested: String, actual: String },
     #[error("invalid provider credential: {0}")]
@@ -554,7 +579,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
 
-    use super::{CredentialStore, ProviderCredential};
+    use super::{CredentialError, CredentialStore, ProviderCredential};
 
     #[test]
     fn providers_are_saved_in_independent_plaintext_files() {
@@ -591,6 +616,11 @@ mod tests {
         assert!(directory.join("qqmusic.json").exists());
         assert!(directory.join("netease.json").exists());
         assert!(directory.join("bilibili.json").exists());
+        let persisted: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(directory.join("qqmusic.json")).unwrap())
+                .unwrap();
+        assert_eq!(persisted["schemaVersion"], 1);
+        assert_eq!(persisted["credential"]["kind"], "qqMusic");
         assert!(
             !serde_json::to_string(&store.status("qqmusic").unwrap())
                 .unwrap()
@@ -605,6 +635,28 @@ mod tests {
         let store = CredentialStore::memory();
         assert!(store.status("tx").is_err());
         assert!(store.status("kuwo").is_err());
+    }
+
+    #[test]
+    fn unversioned_credential_files_are_rejected_without_migration() {
+        let directory =
+            std::env::temp_dir().join(format!("miliastra-credentials-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("netease.json"),
+            r#"{"kind":"netease","cookies":{"MUSIC_U":"secret"}}"#,
+        )
+        .unwrap();
+
+        let error = match CredentialStore::open(directory.clone()) {
+            Ok(_) => panic!("unversioned credential file must be rejected"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            CredentialError::UnsupportedSchema { actual: None, .. }
+        ));
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::features::command::{
     CommandAuthority, CommandEnvelope, CommandPrefix, FeatureCommandMatch,
 };
-use crate::runtime::timer::{DeadlineKind, DeadlineModule, DeadlineToken};
+use miliastra_kernel::timer::{DeadlineKind, DeadlineModule, DeadlineToken};
 
 pub(crate) mod repository;
 mod service;

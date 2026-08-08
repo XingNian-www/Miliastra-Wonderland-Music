@@ -563,7 +563,7 @@ pub struct TimerRuntime<T: DeadlineIdentity> {
 }
 
 impl<T: DeadlineIdentity> TimerRuntime<T> {
-    pub(super) fn start(
+    pub fn start(
         queue_capacity: usize,
         events: SyncSender<TimerRuntimeEvent<T>>,
     ) -> Result<Self, TimerRuntimeStartError> {
@@ -733,8 +733,8 @@ mod tests {
         DeadlineToken, TimerCommandKind, TimerCommandOutcome, TimerCore, TimerCoreError,
         TimerRuntime, TimerRuntimeEvent, TimerSubmitError,
     };
-    use crate::runtime::clock::{Clock, ManualClock};
-    use crate::runtime::identity::{BusinessOperationId, SessionGeneration};
+    use crate::clock::{Clock, ManualClock};
+    use crate::identity::{BusinessOperationId, SessionGeneration};
 
     #[derive(Debug)]
     struct TestModule;

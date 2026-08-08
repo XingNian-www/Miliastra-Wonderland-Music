@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::fs;
 use std::path::Path;
 use std::time::Instant;
 
@@ -9,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::features::command::{
     CommandAuthority, CommandEnvelope, CommandPrefix, FeatureCommandMatch,
 };
-use crate::runtime::timer::{DeadlineKind, DeadlineModule, DeadlineToken};
+use miliastra_kernel::timer::{DeadlineKind, DeadlineModule, DeadlineToken};
 
 pub(crate) mod repository;
 mod service;
@@ -285,12 +284,6 @@ pub(crate) struct TurtleSoupPuzzle {
 struct WrappedQuestionBank {
     #[serde(rename = "题目")]
     questions: Vec<TurtleSoupPuzzle>,
-}
-
-pub(crate) fn load_question_bank(path: &Path) -> Result<Vec<TurtleSoupPuzzle>> {
-    let text = fs::read_to_string(path)
-        .with_context(|| format!("读取海龟汤题库失败: {}", path.display()))?;
-    parse_question_bank(&text, path)
 }
 
 pub(crate) fn parse_question_bank(text: &str, path: &Path) -> Result<Vec<TurtleSoupPuzzle>> {

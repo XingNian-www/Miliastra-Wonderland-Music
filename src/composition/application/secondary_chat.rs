@@ -225,7 +225,7 @@ impl ApplicationRuntime {
         last_title: &mut Option<ChangeFingerprint>,
         identity: &mut Option<SecondaryChatIdentity>,
     ) -> Result<bool> {
-        if self.task_engine.snapshot()?.is_busy() {
+        if self.business.task_engine.snapshot()?.is_busy() {
             return Ok(false);
         }
         let title_fingerprint = rect_chat_change_fingerprint(image, SECONDARY_TITLE_RECT)?;
@@ -243,7 +243,7 @@ impl ApplicationRuntime {
         }
         *last_title = Some(title_fingerprint);
 
-        let state = self.business.chat_listener_snapshot()?;
+        let state = self.business.business.chat_listener_snapshot()?;
         if state.unread_task_pending {
             return Ok(false);
         }
@@ -264,7 +264,9 @@ impl ApplicationRuntime {
                 "blue",
             )?;
             hall_command_tracker.commit(&messages);
-            self.business.finish_chat_listener_initial_unread_clear()?;
+            self.business
+                .business
+                .finish_chat_listener_initial_unread_clear()?;
             log::info!("二级监听初始未读清场完成，当前大厅已建立消息基线");
             return Ok(false);
         }
@@ -277,7 +279,7 @@ impl ApplicationRuntime {
                         hall_bubble_sequence,
                         hall_command_tracker,
                     )?;
-                    self.business.finish_chat_listener_hall_round()?;
+                    self.business.business.finish_chat_listener_hall_round()?;
                     return Ok(scanned);
                 }
                 if let Some(hit) = find_unread_friend_hits(image).into_iter().next() {
@@ -307,13 +309,13 @@ impl ApplicationRuntime {
         hit: UnreadFriendHit,
         discard_only: bool,
     ) -> Result<bool> {
-        if !self.business.claim_chat_listener_unread_task()? {
+        if !self.business.business.claim_chat_listener_unread_task()? {
             return Ok(false);
         }
         if let Err(error) =
             self.push_pending_task(PendingTask::SecondaryUnread { hit, discard_only })
         {
-            self.business.release_chat_listener_unread_task()?;
+            self.business.business.release_chat_listener_unread_task()?;
             return Err(error);
         }
         log::info!(
@@ -325,11 +327,11 @@ impl ApplicationRuntime {
     }
 
     fn queue_secondary_hall_recovery(&self) -> Result<bool> {
-        if !self.business.claim_chat_listener_unread_task()? {
+        if !self.business.business.claim_chat_listener_unread_task()? {
             return Ok(false);
         }
         if let Err(error) = self.push_pending_task(PendingTask::RestoreSecondaryHall) {
-            self.business.release_chat_listener_unread_task()?;
+            self.business.business.release_chat_listener_unread_task()?;
             return Err(error);
         }
         log::info!("二级监听检测到不可执行会话，已加入恢复当前大厅任务");
@@ -376,7 +378,9 @@ impl ApplicationRuntime {
         let delta = secondary_hall_sequence_delta(previous.as_deref(), &current);
         match delta {
             SecondaryHallSequenceDelta::EstablishBaseline => {
-                self.business.clear_turtle_soup_secondary_stability()?;
+                self.business
+                    .business
+                    .clear_turtle_soup_secondary_stability()?;
                 tracker.begin_scan(Instant::now());
                 let messages = self.recognize_secondary_bubble_rects(
                     image,
@@ -391,14 +395,22 @@ impl ApplicationRuntime {
                 return Ok(false);
             }
             SecondaryHallSequenceDelta::RetainedPrefix => {
-                if !tracker.scan_due(Instant::now(), self.config.timing.chat_scan.fallback_ms) {
+                if !tracker.scan_due(
+                    Instant::now(),
+                    self.lifecycle.config.timing.chat_scan.fallback_ms,
+                ) {
                     log::debug!("二级大厅当前只显示旧序列前缀，保留原基线等待完整观测");
                     return Ok(false);
                 }
             }
             SecondaryHallSequenceDelta::NoChange => {
-                if !tracker.scan_due(Instant::now(), self.config.timing.chat_scan.fallback_ms) {
-                    self.business.clear_turtle_soup_secondary_stability()?;
+                if !tracker.scan_due(
+                    Instant::now(),
+                    self.lifecycle.config.timing.chat_scan.fallback_ms,
+                ) {
+                    self.business
+                        .business
+                        .clear_turtle_soup_secondary_stability()?;
                     return Ok(false);
                 }
             }
@@ -423,7 +435,9 @@ impl ApplicationRuntime {
         }
         let new_indexes = tracker.preview_new_indexes(&messages);
         if new_indexes.is_empty() {
-            self.business.clear_turtle_soup_secondary_stability()?;
+            self.business
+                .business
+                .clear_turtle_soup_secondary_stability()?;
             tracker.commit(&messages);
             *previous = Some(refreshed_bubbles);
             log::debug!("二级大厅命令形式未发现新增，已更新相对位置基线");
@@ -438,9 +452,12 @@ impl ApplicationRuntime {
             "二级大厅命令形式检测到 {} 条新增候选，按相对顺序 OCR 结果处理",
             new_messages.len()
         );
-        let observation_frame = self.chat_observations.begin_frame(refreshed.captured_at)?;
+        let observation_frame = self
+            .ui
+            .chat_observations
+            .begin_frame(refreshed.captured_at)?;
         let accepts_turtle_questions =
-            self.commands_enabled()? && self.business.turtle_soup_accepts_questions()?;
+            self.commands_enabled()? && self.business.business.turtle_soup_accepts_questions()?;
         let outcome = self.process_secondary_recognized_messages(
             observation_frame,
             "blue",
@@ -464,6 +481,7 @@ impl ApplicationRuntime {
         discard_only: bool,
     ) -> Result<()> {
         let outcome = self
+            .ui
             .secondary_unread_ui
             .submit(ProcessSecondaryUnread::new(hit, discard_only))
             .context("提交二级好友未读 UI 事务")?
@@ -475,16 +493,18 @@ impl ApplicationRuntime {
                 friend_name,
                 text,
             } => {
-                let frame = self.chat_observations.begin_frame(*captured_at)?;
-                self.monitor.publish(MonitorEvent::Ocr(OcrSnapshot::new(
-                    1,
-                    vec![format!("[pink] {}", redacted_chat_text(text))],
-                    0,
-                    0,
-                    0,
-                    "二级好友私聊",
-                )));
-                let dispatches = self.chat_observations.publish_secondary(
+                let frame = self.ui.chat_observations.begin_frame(*captured_at)?;
+                self.lifecycle
+                    .monitor
+                    .publish(MonitorEvent::Ocr(OcrSnapshot::new(
+                        1,
+                        vec![format!("[pink] {}", redacted_chat_text(text))],
+                        0,
+                        0,
+                        0,
+                        "二级好友私聊",
+                    )));
+                let dispatches = self.ui.chat_observations.publish_secondary(
                     frame,
                     "pink",
                     friend_name,
@@ -516,9 +536,12 @@ impl ApplicationRuntime {
         });
 
         self.business
+            .business
             .finish_chat_listener_unread_task(!discard_only)?;
         if result.is_err() {
-            self.business.fail_chat_listener_mode_to_primary()?;
+            self.business
+                .business
+                .fail_chat_listener_mode_to_primary()?;
             let _ = self.establish_ui_residency(
                 UiResidency::Primary,
                 ResidencyPurpose::IndependentRecovery("二级未读失败回退一级"),
@@ -532,11 +555,15 @@ impl ApplicationRuntime {
             UiResidency::SecondaryCurrentHall,
             ResidencyPurpose::IndependentRecovery("恢复二级当前大厅任务"),
         );
-        self.business.finish_chat_listener_unread_task(false)?;
+        self.business
+            .business
+            .finish_chat_listener_unread_task(false)?;
         match result {
             Ok(()) => Ok(()),
             Err(_) => {
-                self.business.fail_chat_listener_mode_to_primary()?;
+                self.business
+                    .business
+                    .fail_chat_listener_mode_to_primary()?;
                 let _ = self.establish_ui_residency(
                     UiResidency::Primary,
                     ResidencyPurpose::IndependentRecovery("二级大厅恢复失败回退一级"),
@@ -548,9 +575,9 @@ impl ApplicationRuntime {
 
     fn secondary_identity_from_frame(&self, image: &DynamicImage) -> Result<SecondaryChatIdentity> {
         let crop = crop_canvas(image, SECONDARY_TITLE_RECT)?;
-        let title = self.ocr.merged_text(
+        let title = self.ui.ocr.merged_text(
             crop,
-            self.config.ocr.same_line_y_tolerance,
+            self.lifecycle.config.ocr.same_line_y_tolerance,
             OcrPriority::ChatObservation,
         )?;
         log::debug!("二级监听顶部标题 OCR: {}", title);
@@ -567,11 +594,12 @@ impl ApplicationRuntime {
         A: Fn(&str) -> bool,
         P: Fn(&str) -> bool,
     {
-        let observation_session = self.chat_observations.begin_exclusive()?;
+        let observation_session = self.ui.chat_observations.begin_exclusive()?;
         let use_secondary = scope == ChatDecisionScope::CurrentHall
             && self.active_ui_residency()? == UiResidency::SecondaryCurrentHall;
         if use_secondary {
             let image = self
+                .ui
                 .residency_ui
                 .observe(UiResidencyTarget::SecondaryCurrentHall)
                 .context("提交二级当前大厅确认基线观察")?
@@ -591,20 +619,21 @@ impl ApplicationRuntime {
             });
         }
 
-        let cursor_before_scan = self.chat_observations.primary_cursor()?;
+        let cursor_before_scan = self.ui.chat_observations.primary_cursor()?;
         let image = self
+            .ui
             .residency_ui
             .observe(UiResidencyTarget::Primary)
             .context("提交一级聊天确认基线观察")?
             .wait()
             .context("等待一级聊天确认基线观察")?
             .map_err(|failure| anyhow!("建立一级聊天确认基线失败：{failure}"))?;
-        let template_args = self.chat_templates.clone();
+        let template_args = self.ui.chat_templates.clone();
         let messages = self.scan_chat_with_shared_ocr(&image, &template_args)?;
-        let observed = self.chat_observations.observe_primary(messages)?;
+        let observed = self.ui.chat_observations.observe_primary(messages)?;
         let cursor = match cursor_before_scan {
             Some(cursor) => Some(cursor),
-            None => self.chat_observations.primary_cursor()?,
+            None => self.ui.chat_observations.primary_cursor()?,
         };
         let pending = cursor_before_scan
             .map(|cursor| primary_messages_after_cursor(observed, cursor))
@@ -625,17 +654,17 @@ impl ApplicationRuntime {
                 if !pending.is_empty() {
                     return Ok(std::mem::take(pending));
                 }
-                let template_args = self.chat_templates.clone();
+                let template_args = self.ui.chat_templates.clone();
                 let canvas = Canvas {
-                    width: self.config.screen.expected_width,
-                    height: self.config.screen.expected_height,
+                    width: self.lifecycle.config.screen.expected_width,
+                    height: self.lifecycle.config.screen.expected_height,
                     resize: true,
                 };
-                let frame = load_frame(&canvas, &self.game_ui)?;
+                let frame = load_frame(&canvas, &self.ui.game_ui)?;
                 let messages = self.scan_chat_with_shared_ocr(&frame.image, &template_args)?;
-                let observed = self.chat_observations.observe_primary(messages)?;
+                let observed = self.ui.chat_observations.observe_primary(messages)?;
                 let Some(current_cursor) = *cursor else {
-                    *cursor = self.chat_observations.primary_cursor()?;
+                    *cursor = self.ui.chat_observations.primary_cursor()?;
                     return Ok(Vec::new());
                 };
                 Ok(primary_messages_after_cursor(observed, current_cursor))
@@ -651,11 +680,11 @@ impl ApplicationRuntime {
         previous: &mut Vec<SecondaryHallBubble>,
     ) -> Result<Vec<ChatMessage>> {
         let canvas = Canvas {
-            width: self.config.screen.expected_width,
-            height: self.config.screen.expected_height,
+            width: self.lifecycle.config.screen.expected_width,
+            height: self.lifecycle.config.screen.expected_height,
             resize: true,
         };
-        let frame = load_frame(&canvas, &self.game_ui)?;
+        let frame = load_frame(&canvas, &self.ui.game_ui)?;
         let current = secondary_hall_bubbles(&frame.image)?;
         match secondary_hall_sequence_delta(Some(previous), &current) {
             SecondaryHallSequenceDelta::RetainedPrefix => {
@@ -702,9 +731,9 @@ impl ApplicationRuntime {
         let mut messages = Vec::with_capacity(bubbles.len());
         for bubble in bubbles {
             let crop = crop_canvas(image, bubble.rect)?;
-            let text = self.ocr.merged_text(
+            let text = self.ui.ocr.merged_text(
                 crop,
-                self.config.ocr.same_line_y_tolerance,
+                self.lifecycle.config.ocr.same_line_y_tolerance,
                 OcrPriority::ChatObservation,
             )?;
             messages.push(ChatMessage {
@@ -714,17 +743,19 @@ impl ApplicationRuntime {
             });
         }
         let ocr_ms = elapsed_ms(started);
-        self.monitor.publish(MonitorEvent::Ocr(OcrSnapshot::new(
-            messages.len(),
-            messages
-                .iter()
-                .map(|message| format!("[blue] {}", redacted_chat_text(&message.text)))
-                .collect(),
-            0,
-            ocr_ms,
-            ocr_ms,
-            "二级当前大厅",
-        )));
+        self.lifecycle
+            .monitor
+            .publish(MonitorEvent::Ocr(OcrSnapshot::new(
+                messages.len(),
+                messages
+                    .iter()
+                    .map(|message| format!("[blue] {}", redacted_chat_text(&message.text)))
+                    .collect(),
+                0,
+                ocr_ms,
+                ocr_ms,
+                "二级当前大厅",
+            )));
         Ok(messages)
     }
 
@@ -757,12 +788,13 @@ impl ApplicationRuntime {
         message_type: &str,
         friend_name: &str,
     ) -> Result<SecondaryBubbleProcessOutcome> {
-        let observation_frame = self.chat_observations.begin_frame(captured_at)?;
+        let observation_frame = self.ui.chat_observations.begin_frame(captured_at)?;
         let texts = self.recognize_secondary_bubble_rects(image, regions, message_type);
         let texts = match texts {
             Ok(texts) => texts,
             Err(error) => {
                 if let Err(record_error) = self
+                    .ui
                     .chat_observations
                     .record_terminal_failure(observation_frame, format!("{error:#}"))
                 {
@@ -773,7 +805,7 @@ impl ApplicationRuntime {
         };
         let accepts_turtle_questions = message_type == "blue"
             && self.commands_enabled()?
-            && self.business.turtle_soup_accepts_questions()?;
+            && self.business.business.turtle_soup_accepts_questions()?;
         self.process_secondary_recognized_messages(
             observation_frame,
             message_type,
@@ -794,20 +826,20 @@ impl ApplicationRuntime {
         let commands_enabled = self.commands_enabled()?;
         let accepts_turtle_questions = message_type == "blue"
             && commands_enabled
-            && self.business.turtle_soup_accepts_questions()?;
+            && self.business.business.turtle_soup_accepts_questions()?;
         let active_entertainment = if commands_enabled {
-            self.business.active_entertainment()?
+            self.business.business.active_entertainment()?
         } else {
             None
         };
         let observes_hall = message_type == "blue";
-        let command_router = ChatCommandRouter::new(&self.custom_workflow);
+        let command_router = ChatCommandRouter::new(&self.business.custom_workflow);
         let mut texts = Vec::new();
         for (rect, sender_rect) in regions {
             let crop = crop_canvas(image, rect)?;
-            let text = self.ocr.merged_text(
+            let text = self.ui.ocr.merged_text(
                 crop,
-                self.config.ocr.same_line_y_tolerance,
+                self.lifecycle.config.ocr.same_line_y_tolerance,
                 OcrPriority::ChatObservation,
             )?;
             let classification = if observes_hall && commands_enabled {
@@ -850,9 +882,9 @@ impl ApplicationRuntime {
                 && let Some(sender_rect) = sender_rect
             {
                 let crop = crop_canvas(image, sender_rect)?;
-                let raw_sender = self.ocr.merged_text(
+                let raw_sender = self.ui.ocr.merged_text(
                     crop,
-                    self.config.ocr.same_line_y_tolerance,
+                    self.lifecycle.config.ocr.same_line_y_tolerance,
                     OcrPriority::ChatObservation,
                 )?;
                 let identity = parse_secondary_sender_identity(&raw_sender);
@@ -872,21 +904,25 @@ impl ApplicationRuntime {
             });
         }
         let ocr_ms = elapsed_ms(ocr_started);
-        self.monitor.publish(MonitorEvent::Ocr(OcrSnapshot::new(
-            texts.len(),
-            texts
-                .iter()
-                .map(|message| format!("[{}] {}", message_type, redacted_chat_text(&message.text)))
-                .collect(),
-            0,
-            ocr_ms,
-            elapsed_ms(started),
-            if message_type == "pink" {
-                "二级好友私聊"
-            } else {
-                "二级当前大厅"
-            },
-        )));
+        self.lifecycle
+            .monitor
+            .publish(MonitorEvent::Ocr(OcrSnapshot::new(
+                texts.len(),
+                texts
+                    .iter()
+                    .map(|message| {
+                        format!("[{}] {}", message_type, redacted_chat_text(&message.text))
+                    })
+                    .collect(),
+                0,
+                ocr_ms,
+                elapsed_ms(started),
+                if message_type == "pink" {
+                    "二级好友私聊"
+                } else {
+                    "二级当前大厅"
+                },
+            )));
         Ok(texts)
     }
 
@@ -905,7 +941,8 @@ impl ApplicationRuntime {
                     .as_deref()
                     .is_none_or(|sender| sender.trim().is_empty())
         }) {
-            self.chat_observations
+            self.ui
+                .chat_observations
                 .complete_without_messages(observation_frame)?;
             log::debug!("二级大厅身份相关输入的固定发送者区域 OCR 为空，本轮等待昵称加载");
             return Ok(SecondaryBubbleProcessOutcome {
@@ -937,10 +974,12 @@ impl ApplicationRuntime {
                 .collect();
             match self
                 .business
+                .business
                 .stabilize_turtle_soup_secondary(observations)?
             {
                 SecondaryOcrStability::Pending => {
-                    self.chat_observations
+                    self.ui
+                        .chat_observations
                         .complete_without_messages(observation_frame)?;
                     return Ok(SecondaryBubbleProcessOutcome {
                         processed: false,
@@ -964,7 +1003,9 @@ impl ApplicationRuntime {
                 }
             }
         } else {
-            self.business.clear_turtle_soup_secondary_stability()?;
+            self.business
+                .business
+                .clear_turtle_soup_secondary_stability()?;
         }
 
         let messages = texts
@@ -974,7 +1015,7 @@ impl ApplicationRuntime {
                 sender: message.sender,
             })
             .collect();
-        let dispatches = self.chat_observations.publish_secondary(
+        let dispatches = self.ui.chat_observations.publish_secondary(
             observation_frame,
             message_type,
             friend_name,
@@ -1025,14 +1066,14 @@ impl ApplicationRuntime {
                     .filter(|sender| !sender.is_empty())
                     .unwrap_or(SECONDARY_HALL_FALLBACK_SENDER)
             };
-            let router = ChatCommandRouter::new(&self.custom_workflow);
+            let router = ChatCommandRouter::new(&self.business.custom_workflow);
             if let Some(envelope) = command::parse_structured_song_envelope(
                 &text,
                 shortcut_player,
                 &message_type,
                 command_observation.clone(),
             ) && let Some(parsed) =
-                router.route(&envelope, self.business.active_entertainment()?)
+                router.route(&envelope, self.business.business.active_entertainment()?)
             {
                 self.submit_secondary_command(parsed)?;
                 processed = true;
@@ -1045,7 +1086,8 @@ impl ApplicationRuntime {
                 text.trim(),
                 command_observation.clone(),
             ) && envelope.prefix() == CommandPrefix::Hash
-                && let Some(parsed) = router.route(&envelope, self.business.active_entertainment()?)
+                && let Some(parsed) =
+                    router.route(&envelope, self.business.business.active_entertainment()?)
             {
                 self.submit_secondary_command(parsed)?;
                 processed = true;
@@ -1090,7 +1132,8 @@ impl ApplicationRuntime {
             ) else {
                 continue;
             };
-            let Some(parsed) = router.route(&envelope, self.business.active_entertainment()?)
+            let Some(parsed) =
+                router.route(&envelope, self.business.business.active_entertainment()?)
             else {
                 log::debug!("二级监听气泡未解析为命令");
                 continue;
@@ -1105,14 +1148,15 @@ impl ApplicationRuntime {
         const STABILITY_TIMEOUT_MS: u64 = 500;
 
         let canvas = Canvas {
-            width: self.config.screen.expected_width,
-            height: self.config.screen.expected_height,
+            width: self.lifecycle.config.screen.expected_width,
+            height: self.lifecycle.config.screen.expected_height,
             resize: true,
         };
-        let first = load_frame(&canvas, &self.game_ui)?;
+        let first = load_frame(&canvas, &self.ui.game_ui)?;
         let mut previous = latest_incoming_fingerprint(&first.image)?;
         let mut latest_frame = first;
         let poll_ms = self
+            .lifecycle
             .config
             .timing
             .chat_scan
@@ -1122,7 +1166,7 @@ impl ApplicationRuntime {
 
         while Instant::now() < deadline {
             sleep(Duration::from_millis(poll_ms));
-            let frame = load_frame(&canvas, &self.game_ui)?;
+            let frame = load_frame(&canvas, &self.ui.game_ui)?;
             let current = latest_incoming_fingerprint(&frame.image)?;
             if !secondary_optional_fingerprint_changed(previous.as_ref(), current.as_ref()) {
                 return Ok(frame);
@@ -1138,21 +1182,23 @@ impl ApplicationRuntime {
         &self,
     ) -> Result<Option<(Frame, Vec<SecondaryHallBubble>)>> {
         let canvas = Canvas {
-            width: self.config.screen.expected_width,
-            height: self.config.screen.expected_height,
+            width: self.lifecycle.config.screen.expected_width,
+            height: self.lifecycle.config.screen.expected_height,
             resize: true,
         };
-        let first = load_frame(&canvas, &self.game_ui)?;
+        let first = load_frame(&canvas, &self.ui.game_ui)?;
         let mut previous = secondary_hall_bubbles(&first.image)?;
         let poll_ms = self
+            .lifecycle
             .config
             .timing
             .chat_scan
             .change_debounce_ms
             .clamp(100, 200);
         let required_samples = self
+            .lifecycle
             .config
-            .resolve_stability_count(self.config.stability.secondary_hall_count);
+            .resolve_stability_count(self.lifecycle.config.stability.secondary_hall_count);
         let mut stable_samples = 1_u32;
         let timeout_ms = poll_ms
             .saturating_mul(u64::from(required_samples.saturating_add(1)))
@@ -1161,7 +1207,7 @@ impl ApplicationRuntime {
 
         while Instant::now() < deadline {
             sleep(Duration::from_millis(poll_ms));
-            let frame = load_frame(&canvas, &self.game_ui)?;
+            let frame = load_frame(&canvas, &self.ui.game_ui)?;
             let current = secondary_hall_bubbles(&frame.image)?;
             if hall_bubble_layout_is_stable(&previous, &current) {
                 stable_samples = stable_samples.saturating_add(1);
@@ -1184,11 +1230,11 @@ impl ApplicationRuntime {
 
     fn wait_for_secondary_hall_command_stability(&self) -> Result<SecondaryHallCommandStability> {
         let canvas = Canvas {
-            width: self.config.screen.expected_width,
-            height: self.config.screen.expected_height,
+            width: self.lifecycle.config.screen.expected_width,
+            height: self.lifecycle.config.screen.expected_height,
             resize: true,
         };
-        let first = load_frame(&canvas, &self.game_ui)?;
+        let first = load_frame(&canvas, &self.ui.game_ui)?;
         let first_bubbles = secondary_hall_bubbles(&first.image)?;
         let first_messages = self.recognize_secondary_bubble_rects(
             &first.image,
@@ -1200,14 +1246,16 @@ impl ApplicationRuntime {
         let mut previous_bubbles = first_bubbles;
         let mut previous_messages = first_messages;
         let poll_ms = self
+            .lifecycle
             .config
             .timing
             .chat_scan
             .change_debounce_ms
             .clamp(100, 200);
         let required_samples = self
+            .lifecycle
             .config
-            .resolve_stability_count(self.config.stability.secondary_hall_count);
+            .resolve_stability_count(self.lifecycle.config.stability.secondary_hall_count);
         let mut stable_samples = 1_u32;
         let timeout_ms = poll_ms
             .saturating_mul(u64::from(required_samples.saturating_add(1)))
@@ -1216,7 +1264,7 @@ impl ApplicationRuntime {
 
         while Instant::now() < deadline {
             sleep(Duration::from_millis(poll_ms));
-            let frame = load_frame(&canvas, &self.game_ui)?;
+            let frame = load_frame(&canvas, &self.ui.game_ui)?;
             let bubbles = secondary_hall_bubbles(&frame.image)?;
             let messages = self.recognize_secondary_bubble_rects(
                 &frame.image,

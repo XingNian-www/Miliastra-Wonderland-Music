@@ -17,13 +17,15 @@ impl ApplicationRuntime {
             username: command_username(parsed).to_string(),
             user_command: parsed.user_command.clone(),
         };
-        self.playback_application
+        self.playback
+            .playback_application
             .clone()
             .execute_command(&context, command, self)
     }
 
     pub(super) fn execute_advance_queue_task(&mut self, reason: &'static str) -> Result<()> {
-        self.playback_application
+        self.playback
+            .playback_application
             .clone()
             .consume_queue_after_monitor(reason, self)
     }
@@ -34,6 +36,7 @@ impl ApplicationRuntime {
     ) -> Result<PlaybackResult> {
         let selection = request.playback_selection();
         let result: PlaybackResult = self
+            .playback
             .playback_application
             .clone()
             .play_confirmed(&selection, self)?;
@@ -81,21 +84,25 @@ impl ApplicationRuntime {
         allow_ai: bool,
         timeout_confirms: bool,
     ) -> Result<SongRequestDecision> {
-        let timeout = Duration::from_millis(self.config.timing.decision.timeout_ms);
+        let timeout = Duration::from_millis(self.lifecycle.config.timing.decision.timeout_ms);
         let map_web_decision = |decision| match decision {
             DecisionAction::Confirm => SongRequestDecision::Confirm,
             DecisionAction::Skip => SongRequestDecision::Skip,
             DecisionAction::SwitchSource => SongRequestDecision::SwitchSource,
             DecisionAction::Ai => SongRequestDecision::Ai,
         };
-        let web_decision =
-            self.business
-                .begin_decision("点歌候选确认", allow_switch_source, allow_ai, timeout)?;
+        let web_decision = self.business.business.begin_decision(
+            "点歌候选确认",
+            allow_switch_source,
+            allow_ai,
+            timeout,
+        )?;
         let deadline = Instant::now() + timeout;
-        while self.running.load(AtomicOrdering::SeqCst) && Instant::now() < deadline {
-            let wait =
-                Duration::from_millis(reader.poll_interval_ms(self.config.timing.decision.poll_ms))
-                    .min(deadline.saturating_duration_since(Instant::now()));
+        while self.lifecycle.running.load(AtomicOrdering::SeqCst) && Instant::now() < deadline {
+            let wait = Duration::from_millis(
+                reader.poll_interval_ms(self.lifecycle.config.timing.decision.poll_ms),
+            )
+            .min(deadline.saturating_duration_since(Instant::now()));
             if let Some(decision) = web_decision.wait(wait)? {
                 return Ok(map_web_decision(decision));
             }
@@ -133,7 +140,7 @@ impl ApplicationRuntime {
         if let Some(decision) = web_decision.wait(Duration::from_millis(0))? {
             return Ok(map_web_decision(decision));
         }
-        if !self.running.load(AtomicOrdering::SeqCst) {
+        if !self.lifecycle.running.load(AtomicOrdering::SeqCst) {
             Ok(SongRequestDecision::Stopped)
         } else if timeout_confirms {
             Ok(SongRequestDecision::Timeout)
@@ -166,7 +173,8 @@ impl PlaybackExecutionPort for ApplicationRuntime {
         source: &str,
         prefer_accompaniment: bool,
     ) -> std::result::Result<Option<PlaybackPickedCandidate>, PlaybackSearchFailure> {
-        self.player_search
+        self.playback
+            .player_search
             .search_and_pick(keyword, source, prefer_accompaniment)
             .map(|picked| {
                 picked.map(|picked| PlaybackPickedCandidate {
@@ -184,21 +192,26 @@ impl PlaybackExecutionPort for ApplicationRuntime {
         source: &str,
         prefer_accompaniment: bool,
     ) -> std::result::Result<Option<PlaybackPickedCandidate>, PlaybackSearchFailure> {
-        if !self.ai.enabled() {
+        if !self.business.ai.enabled() {
             return Err(PlaybackSearchFailure::Unavailable(
                 "点歌 AI 未启用".to_string(),
             ));
         }
         let candidates = self
+            .playback
             .player_search
             .search_candidates(keyword, source)
             .map_err(playback_search_failure)?;
         if candidates.is_empty() {
             return Ok(None);
         }
-        let (candidate, _pick) =
-            select_ai_candidate(&self.ai, keyword, prefer_accompaniment, &candidates)
-                .map_err(|error| PlaybackSearchFailure::Backend(error.to_string()))?;
+        let (candidate, _pick) = select_ai_candidate(
+            &self.business.ai,
+            keyword,
+            prefer_accompaniment,
+            &candidates,
+        )
+        .map_err(|error| PlaybackSearchFailure::Backend(error.to_string()))?;
         Ok(Some(PlaybackPickedCandidate {
             track: candidate.playable_track(),
             text: candidate.text,
@@ -207,23 +220,23 @@ impl PlaybackExecutionPort for ApplicationRuntime {
     }
 
     fn song_dedup_limited(&mut self, request: &PlaybackRequest) -> Result<bool> {
-        self.player.song_dedup_limited(request)
+        self.playback.player.song_dedup_limited(request)
     }
 
     fn play_and_verify(&mut self, request: &PlaybackRequest) -> Result<PlaybackVerification> {
-        self.player.play_and_verify(request)
+        self.playback.player.play_and_verify(request)
     }
 
     fn is_track_unavailable_error(&self, error: &anyhow::Error) -> bool {
-        self.player.is_track_unavailable_error(error)
+        self.playback.player.is_track_unavailable_error(error)
     }
 
     fn reject_mismatch_as_no_source(&mut self, status: Option<&PlayerStatus>) -> Result<()> {
-        self.player.reject_mismatch_as_no_source(status)
+        self.playback.player.reject_mismatch_as_no_source(status)
     }
 
     fn player_status(&mut self) -> Result<PlayerStatus> {
-        self.player.status()
+        self.playback.player.status()
     }
 
     fn playback_queue(&mut self) -> Result<Vec<QueueItem>> {
@@ -232,13 +245,14 @@ impl PlaybackExecutionPort for ApplicationRuntime {
 
     fn remove_playback_queue(&mut self, removal: QueueRemoval) -> Result<()> {
         self.business
+            .business
             .remove_playback_queue(removal)
             .map(|_| ())
             .map_err(anyhow::Error::from)
     }
 
     fn user_pause_active(&mut self) -> Result<bool> {
-        self.player.user_pause_active()
+        self.playback.player.user_pause_active()
     }
 }
 
@@ -262,29 +276,29 @@ impl PlaybackCommandPort for ApplicationRuntime {
     }
 
     fn pause_by_user(&mut self) -> Result<String> {
-        self.player.pause_by_user()
+        self.playback.player.pause_by_user()
     }
 
     fn resume_by_user(&mut self) -> Result<String> {
-        self.player.resume_by_user()
+        self.playback.player.resume_by_user()
     }
 
     fn previous_playback_request(
         &mut self,
     ) -> Result<Option<crate::features::playback::PlaybackRequest>> {
-        self.player.previous_playback_request()
+        self.playback.player.previous_playback_request()
     }
 
     fn next_external(&mut self) -> Result<String> {
-        self.player.next_external()
+        self.playback.player.next_external()
     }
 
     fn previous_external(&mut self) -> Result<String> {
-        self.player.previous_external()
+        self.playback.player.previous_external()
     }
 
     fn set_volume(&mut self, volume: &str) -> Result<()> {
-        self.player.set_volume(volume).map(|_| ())
+        self.playback.player.set_volume(volume).map(|_| ())
     }
 
     fn remove_playback_queue_indexes(
@@ -292,21 +306,24 @@ impl PlaybackCommandPort for ApplicationRuntime {
         indexes: Vec<usize>,
     ) -> Result<Vec<(usize, QueueItem)>> {
         self.business
+            .business
             .remove_playback_queue_indexes(indexes)
             .map_err(anyhow::Error::from)
     }
 
     fn clear_playback_queue(&mut self) -> Result<usize> {
         self.business
+            .business
             .clear_playback_queue()
             .map_err(anyhow::Error::from)
     }
 
     fn should_stop_continuous_lyrics(&mut self) -> Result<bool> {
-        if !self.running.load(AtomicOrdering::SeqCst) {
+        if !self.lifecycle.running.load(AtomicOrdering::SeqCst) {
             return Ok(true);
         }
         Ok(!self
+            .business
             .task_engine
             .snapshot()
             .map_err(anyhow::Error::from)?
@@ -320,18 +337,18 @@ impl PlaybackCommandPort for ApplicationRuntime {
         scope: BackgroundLyricsScope,
     ) -> Result<bool> {
         workers::start_background_lyrics(
-            &self.background_commands,
-            self.player.clone(),
-            self.task_engine.clone(),
-            self.running.clone(),
-            Duration::from_millis(self.config.timing.playback.monitor_status_ms),
+            &self.business.background_commands,
+            self.playback.player.clone(),
+            self.business.task_engine.clone(),
+            self.lifecycle.running.clone(),
+            Duration::from_millis(self.lifecycle.config.timing.playback.monitor_status_ms),
             duration,
             scope,
         )
     }
 
     fn stop_background_lyrics(&mut self) -> Result<bool> {
-        self.background_commands.stop("lyrics")
+        self.business.background_commands.stop("lyrics")
     }
 
     fn wait(&mut self, duration: Duration) {

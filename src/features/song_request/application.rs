@@ -187,11 +187,12 @@ pub(crate) fn select_ai_candidate(
     candidates: &[SearchCandidate],
 ) -> Result<(SearchCandidate, AiCandidatePickResult)> {
     let pick = ai.pick_song_candidate(request, prefer_accompaniment, candidates)?;
-    let candidate = candidates
-        .iter()
-        .find(|candidate| candidate.track_ref.key.to_string() == pick.uri)
+    let candidate = pick
+        .index
+        .checked_sub(1)
+        .and_then(|index| candidates.get(index))
         .cloned()
-        .ok_or_else(|| anyhow!("AI 返回未知歌曲候选: {}", pick.uri))?;
+        .ok_or_else(|| anyhow!("AI 返回未知歌曲候选索引: {}", pick.index))?;
     Ok((candidate, pick))
 }
 
@@ -555,9 +556,10 @@ impl SongRequestExecution<'_> {
             }
         };
         log::info!(
-            "AI点歌候选: raw={} pick={} uri={} score={:.2} reason={}",
+            "AI点歌候选: raw={} pick={} index={} uri={} score={:.2} reason={}",
             song.keyword,
             candidate.text,
+            pick.index,
             candidate.track_ref.key,
             pick.score,
             pick.reason
@@ -877,15 +879,16 @@ impl SongRequestExecution<'_> {
         }
 
         let (title, artist) = split_candidate_title_artist(&request.keyword);
+        let track_key = request
+            .track
+            .as_ref()
+            .map(|track| track.track_ref.key.clone())
+            .ok_or_else(|| anyhow!("候选歌曲审核缺少结构化曲目"))?;
         let candidate = SongReviewCandidate {
             source: request.source.clone(),
             title,
             artist,
-            uri: request
-                .track
-                .as_ref()
-                .map(|track| track.track_ref.key.to_string())
-                .unwrap_or_default(),
+            track_key,
             message_type: context.message_type.clone(),
             username: context.username.clone(),
         };
@@ -908,7 +911,7 @@ impl SongRequestExecution<'_> {
                     candidate.title,
                     candidate.artist,
                     candidate.source,
-                    candidate.uri,
+                    candidate.track_key,
                     reason
                 );
             } else {
@@ -921,7 +924,7 @@ impl SongRequestExecution<'_> {
                     candidate.title,
                     candidate.artist,
                     candidate.source,
-                    candidate.uri,
+                    candidate.track_key,
                     reason,
                     tags
                 );
@@ -938,7 +941,7 @@ impl SongRequestExecution<'_> {
             candidate.title,
             candidate.artist,
             candidate.source,
-            candidate.uri,
+            candidate.track_key,
             reason,
             tags
         );
@@ -1067,6 +1070,29 @@ mod tests {
     }
 
     struct DisabledAiGateway;
+
+    struct IndexedAiGateway {
+        index: usize,
+    }
+
+    impl SongRequestAiGateway for IndexedAiGateway {
+        fn enabled(&self) -> bool {
+            true
+        }
+
+        fn pick_song_candidate(
+            &self,
+            _request: &str,
+            _prefer_accompaniment: bool,
+            _candidates: &[SearchCandidate],
+        ) -> Result<AiCandidatePickResult> {
+            Ok(AiCandidatePickResult {
+                index: self.index,
+                reason: "test selection".to_string(),
+                score: 0.9,
+            })
+        }
+    }
 
     impl SongRequestAiGateway for DisabledAiGateway {
         fn enabled(&self) -> bool {
@@ -1313,6 +1339,43 @@ mod tests {
             candidate,
             formatted_candidates: text.to_string(),
         }
+    }
+
+    #[test]
+    fn ai_candidate_selection_uses_the_returned_index() {
+        let candidates = vec![
+            test_candidate("same title", "miliastra://track/qqmusic/first"),
+            test_candidate("same title", "miliastra://track/netease/second"),
+        ];
+
+        let (selected, pick) = select_ai_candidate(
+            &IndexedAiGateway { index: 2 },
+            "same title",
+            false,
+            &candidates,
+        )
+        .expect("indexed selection");
+
+        assert_eq!(pick.index, 2);
+        assert_eq!(selected.track_ref.key, candidates[1].track_ref.key);
+    }
+
+    #[test]
+    fn ai_candidate_selection_rejects_an_out_of_range_index() {
+        let candidates = vec![test_candidate(
+            "only candidate",
+            "miliastra://track/qqmusic/only",
+        )];
+
+        let error = select_ai_candidate(
+            &IndexedAiGateway { index: 0 },
+            "only candidate",
+            false,
+            &candidates,
+        )
+        .expect_err("zero is not a one-based candidate index");
+
+        assert!(error.to_string().contains("候选索引: 0"));
     }
 
     #[test]

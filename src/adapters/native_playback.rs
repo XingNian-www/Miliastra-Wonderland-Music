@@ -8,8 +8,8 @@ use miliastra_playback::{
 use crate::features::song_request::PickedCandidate;
 use crate::runtime::player::{PlayerRuntimeMetadata, RawPlayerSample, TransportState};
 use crate::runtime::player_io::{
-    ControlDispatchOutcome, PlayerControl, PlayerControlPort, PlayerObservationPort,
-    PlayerObservationReadError, PlayerSearchError, PlayerSearchPort,
+    ControlDispatch, ControlDispatchOutcome, PlayerControl, PlayerControlPort,
+    PlayerObservationPort, PlayerObservationReadError, PlayerSearchError, PlayerSearchPort,
 };
 
 #[derive(Clone)]
@@ -33,7 +33,6 @@ impl PlayerObservationPort for NativePlaybackAdapter {
         let metadata = track.as_ref().map(|track| &track.metadata);
         let failure = snapshot.failure.as_ref();
         Ok(RawPlayerSample {
-            uri: track.as_ref().map(|track| track.track_ref.key.to_string()),
             track: track.clone(),
             transport: transport_state(snapshot.state),
             title: metadata.map(|metadata| metadata.title.clone()),
@@ -87,22 +86,39 @@ impl PlayerObservationPort for NativePlaybackAdapter {
 }
 
 impl PlayerControlPort for NativePlaybackAdapter {
-    fn dispatch(&mut self, control: &PlayerControl) -> ControlDispatchOutcome {
+    fn dispatch(&mut self, control: &PlayerControl) -> ControlDispatch {
+        if let PlayerControl::Play(track) = control {
+            return match self.playback.play(track.clone()) {
+                Ok(operation) => {
+                    let cancellation = self.playback.clone();
+                    ControlDispatch::deferred_with_cancel(
+                        move || match operation.wait() {
+                            Ok(()) => ControlDispatchOutcome::acknowledged("ok"),
+                            Err(error) => dispatch_error(error),
+                        },
+                        move || {
+                            let _ = cancellation.stop();
+                        },
+                    )
+                }
+                Err(error) => ControlDispatch::immediate(dispatch_error(error)),
+            };
+        }
         let result = match control {
-            PlayerControl::Play(track) => self.playback.play(track.clone()),
             PlayerControl::Pause => self.playback.pause(),
             PlayerControl::Resume => self.playback.resume(),
             PlayerControl::SetVolume(volume) => self.playback.set_volume(*volume),
             PlayerControl::Next | PlayerControl::Previous => {
-                return ControlDispatchOutcome::not_sent(
+                return ControlDispatch::immediate(ControlDispatchOutcome::not_sent(
                     "native playback queue navigation is owned by the application",
-                );
+                ));
             }
+            PlayerControl::Play(_) => unreachable!("play control handled above"),
         };
-        match result {
+        ControlDispatch::immediate(match result {
             Ok(()) => ControlDispatchOutcome::acknowledged("ok"),
             Err(error) => dispatch_error(error),
-        }
+        })
     }
 }
 
@@ -159,10 +175,21 @@ fn providers(source: &str) -> Result<Vec<ProviderId>, PlayerSearchError> {
     if source.is_empty() {
         return Ok(Vec::new());
     }
-    source
-        .parse::<ProviderId>()
-        .map(|provider| vec![provider])
-        .map_err(|_| PlayerSearchError::new(format!("unknown provider: {source}")))
+    let mut providers = Vec::new();
+    for value in source.split(',').map(str::trim) {
+        if value.is_empty() {
+            return Err(PlayerSearchError::new(
+                "provider list contains an empty value",
+            ));
+        }
+        let provider = value
+            .parse::<ProviderId>()
+            .map_err(|_| PlayerSearchError::new(format!("unknown provider: {value}")))?;
+        if !providers.contains(&provider) {
+            providers.push(provider);
+        }
+    }
+    Ok(providers)
 }
 
 fn format_candidates(candidates: &[SearchCandidate]) -> String {
@@ -217,5 +244,33 @@ fn dispatch_error(error: PlaybackError) -> ControlDispatchOutcome {
             ControlDispatchOutcome::not_sent(error.to_string())
         }
         _ => ControlDispatchOutcome::rejected_with_code(error.to_string(), code),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::providers;
+    use miliastra_playback::ProviderId;
+
+    #[test]
+    fn provider_list_accepts_the_ai_multi_platform_source() {
+        assert_eq!(
+            providers("qqmusic,netease,bilibili").unwrap(),
+            vec![
+                ProviderId::QqMusic,
+                ProviderId::Netease,
+                ProviderId::Bilibili,
+            ]
+        );
+    }
+
+    #[test]
+    fn provider_list_deduplicates_and_rejects_unknown_values() {
+        assert_eq!(
+            providers(" qqmusic,netease,qqmusic ").unwrap(),
+            vec![ProviderId::QqMusic, ProviderId::Netease]
+        );
+        assert!(providers("qqmusic,unknown").is_err());
+        assert!(providers("qqmusic,,netease").is_err());
     }
 }

@@ -73,7 +73,7 @@ use crate::runtime::scheduler::{
 };
 use crate::ui::frame::LatestFrameCache;
 use crate::ui::geometry::parse_rect;
-use miliastra_playback::{LoginSession, PlayableTrack, PlaybackError, PlaybackHandle, ProviderId};
+use miliastra_playback::{LoginSession, PlayableTrack, ProviderId, TrackMetadata, TrackRef};
 pub(crate) use tools::{WebToolRequest, WebToolTemplate};
 use uuid::Uuid;
 
@@ -133,16 +133,6 @@ pub(crate) trait HttpPlayerPort: Send + Sync {
         keyword: &str,
         source: &str,
     ) -> std::result::Result<Vec<SearchCandidate>, PlayerSearchClientError>;
-}
-
-trait HttpNativePlaybackPort: Send + Sync {
-    fn play_track(&self, track: PlayableTrack) -> Result<(), PlaybackError>;
-}
-
-impl HttpNativePlaybackPort for PlaybackHandle {
-    fn play_track(&self, track: PlayableTrack) -> Result<(), PlaybackError> {
-        PlaybackHandle::play(self, track)
-    }
 }
 
 trait HttpLoginPort: Send + Sync {
@@ -650,7 +640,6 @@ pub struct HttpSharedState {
     hall: Arc<dyn HttpHallPort>,
     latest_frame: Arc<Mutex<LatestFrameCache>>,
     player: Arc<dyn HttpPlayerPort>,
-    native_playback: Arc<dyn HttpNativePlaybackPort>,
     login: Arc<dyn HttpLoginPort>,
     ai: Arc<dyn HttpAiPort>,
 }
@@ -735,7 +724,6 @@ impl HttpSharedState {
         latest_frame: Arc<Mutex<LatestFrameCache>>,
         player_search: PlayerSearchClient,
         player_runtime: PlayerRuntimeHandle,
-        native_playback: PlaybackHandle,
         login: LoginHelperManager,
         ai: AiClient,
     ) -> Self {
@@ -752,7 +740,6 @@ impl HttpSharedState {
             hall,
             latest_frame,
             player,
-            Arc::new(native_playback),
             Arc::new(login),
             Arc::new(ai),
         )
@@ -768,7 +755,6 @@ impl HttpSharedState {
         hall: Arc<dyn HttpHallPort>,
         latest_frame: Arc<Mutex<LatestFrameCache>>,
         player: Arc<dyn HttpPlayerPort>,
-        native_playback: Arc<dyn HttpNativePlaybackPort>,
         login: Arc<dyn HttpLoginPort>,
         ai: Arc<dyn HttpAiPort>,
     ) -> Self {
@@ -783,7 +769,6 @@ impl HttpSharedState {
             hall,
             latest_frame,
             player,
-            native_playback,
             login,
             ai,
         }
@@ -1092,15 +1077,12 @@ fn status_route(
     if let Ok(playback) = state.queries.playback_state_snapshot()
         && let Some(request) = playback.active_request
     {
-        let active_uri = request
-            .track
+        let active_key = request.track.as_ref().map(|track| &track.track_ref.key);
+        let current_key = status
+            .current_track
             .as_ref()
-            .map(|track| track.track_ref.key.to_string())
-            .unwrap_or_default();
-        if !status.current_uri.trim().is_empty()
-            && !active_uri.is_empty()
-            && status.current_uri.trim() == active_uri
-        {
+            .map(|track| &track.track_ref.key);
+        if current_key.is_some() && current_key == active_key {
             status.requester = request.requester;
         }
     }
@@ -1271,20 +1253,59 @@ struct LoginCancelRequest {
     session_id: Uuid,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PlayTrackRequest {
+    track_ref: TrackRef,
+    metadata: TrackMetadata,
+    #[serde(default)]
+    requester: String,
+}
+
 fn player_play_track_body_route(
     body: &[u8],
     state: &HttpSharedState,
 ) -> std::result::Result<String, AppError> {
-    let track = parse_json_body::<PlayableTrack>(body, "结构化曲目")?;
+    let request = parse_json_body::<PlayTrackRequest>(body, "结构化曲目")?;
+    let requester = normalize_optional_text(Some(&request.requester), "requester")?;
+    let requester = if requester.is_empty() {
+        "WEB/API".to_owned()
+    } else {
+        requester
+    };
+    let track = PlayableTrack {
+        track_ref: request.track_ref,
+        metadata: request.metadata,
+    };
     validate_playable_track(&track)?;
     let current_uri = track.track_ref.key.to_string();
-    state
-        .native_playback
-        .play_track(track.clone())
-        .map_err(playback_http_error)?;
+    let BusinessMutationOutcome::Playback(PlaybackMutationOutcome::Pushed(pushed)) = state
+        .formal_tasks
+        .apply_mutation(BusinessMutationIntent::Playback(
+            PlaybackMutationIntent::Push(Box::new(QueueItem {
+                id: 0,
+                keyword: track.metadata.title.clone(),
+                source: track.track_ref.key.provider.to_string(),
+                prefer_accompaniment: false,
+                ai_original_text: String::new(),
+                track: Some(track.clone()),
+                friend_username: String::new(),
+                requester,
+                dedup_bypass: true,
+                candidate_snapshot: Vec::new(),
+            })),
+        ))
+        .map_err(internal_error)?
+    else {
+        unreachable!("playback queue push intent returned a different outcome")
+    };
+    if !pushed.accepted {
+        return Err(bad_request("音乐播放队列已满"));
+    }
     Ok(json!({
         "ok": true,
-        "played": true,
+        "queued": true,
+        "size": pushed.size,
         "currentUri": current_uri,
         "track": track,
     })
@@ -1379,9 +1400,15 @@ fn validate_playable_track(track: &PlayableTrack) -> std::result::Result<(), App
     {
         return Err(bad_request("metadata.durationMs字段无效"));
     }
-    if let Some(locator) = track.track_ref.resolver_locator.as_ref() {
-        validate_locator_identity(track.track_ref.key.provider, id, locator.as_str())?;
-    }
+    validate_track_identity(
+        track.track_ref.key.provider,
+        id,
+        track
+            .track_ref
+            .resolver_locator
+            .as_ref()
+            .map(|locator| locator.as_str()),
+    )?;
     Ok(())
 }
 
@@ -1401,25 +1428,85 @@ fn validate_track_text(
     Ok(())
 }
 
-fn validate_locator_identity(
+fn validate_track_identity(
     provider: ProviderId,
     track_id: &str,
-    locator: &str,
+    locator: Option<&str>,
 ) -> std::result::Result<(), AppError> {
-    let mut parts = locator.split(':');
-    let locator_provider = parts.next().unwrap_or_default();
-    let version = parts.next().unwrap_or_default();
-    let locator_track = parts.next().unwrap_or_default();
-    if locator_provider != provider.as_str() {
-        return Err(bad_request("resolverLocator平台与trackRef不一致"));
+    match provider {
+        ProviderId::QqMusic => {
+            if !is_ascii_alphanumeric(track_id) {
+                return Err(bad_request("trackRef.key.id不是有效的QQ音乐MID"));
+            }
+            let Some(locator) = locator else {
+                return Ok(());
+            };
+            if let Some(locator_track) = locator.strip_prefix("qqmusic:v1:") {
+                if !is_ascii_alphanumeric(locator_track) {
+                    return Err(bad_request("resolverLocator格式无效"));
+                }
+                return validate_locator_track(track_id, locator_track);
+            }
+            let Some(value) = locator.strip_prefix("qqmusic:v2:") else {
+                return Err(bad_request("resolverLocator格式无效"));
+            };
+            let Some((locator_track, media_mid)) = value.split_once(':') else {
+                return Err(bad_request("resolverLocator格式无效"));
+            };
+            if !is_ascii_alphanumeric(locator_track) || !is_ascii_alphanumeric(media_mid) {
+                return Err(bad_request("resolverLocator格式无效"));
+            }
+            validate_locator_track(track_id, locator_track)
+        }
+        ProviderId::Netease => {
+            if !track_id.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(bad_request("trackRef.key.id不是有效的网易云歌曲ID"));
+            }
+            let Some(locator) = locator else {
+                return Ok(());
+            };
+            let Some(locator_track) = locator.strip_prefix("netease:v1:") else {
+                return Err(bad_request("resolverLocator格式无效"));
+            };
+            if !locator_track.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(bad_request("resolverLocator格式无效"));
+            }
+            validate_locator_track(track_id, locator_track)
+        }
+        ProviderId::Bilibili => {
+            if !is_bilibili_bvid(track_id) {
+                return Err(bad_request("trackRef.key.id不是有效的B站BV号"));
+            }
+            let Some(locator) = locator else {
+                return Ok(());
+            };
+            let Some(locator_track) = locator.strip_prefix("bilibili:v1:") else {
+                return Err(bad_request("resolverLocator格式无效"));
+            };
+            if !is_bilibili_bvid(locator_track) {
+                return Err(bad_request("resolverLocator格式无效"));
+            }
+            validate_locator_track(track_id, locator_track)
+        }
     }
-    if !matches!(version, "v1" | "v2") || locator_track.is_empty() {
-        return Err(bad_request("resolverLocator格式无效"));
-    }
+}
+
+fn validate_locator_track(
+    track_id: &str,
+    locator_track: &str,
+) -> std::result::Result<(), AppError> {
     if locator_track != track_id {
         return Err(bad_request("resolverLocator曲目与trackRef不一致"));
     }
     Ok(())
+}
+
+fn is_ascii_alphanumeric(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
+
+fn is_bilibili_bvid(value: &str) -> bool {
+    value.starts_with("BV") && (8..=32).contains(&value.len()) && is_ascii_alphanumeric(value)
 }
 
 fn queue_route(
@@ -3230,25 +3317,6 @@ fn player_search_error(error: PlayerSearchClientError) -> AppError {
     internal_message(&message)
 }
 
-fn playback_http_error(error: PlaybackError) -> AppError {
-    let code = error.code();
-    let (status, message) = match code {
-        "track_unavailable" => (409, "曲目当前不可播放"),
-        "provider_auth_required" => (401, "该平台尚未登录"),
-        "relogin_required" => (401, "登录凭据已失效，请重新登录"),
-        "provider_rate_limited" => (429, "平台请求过于频繁"),
-        "provider_timeout" => (504, "平台请求超时"),
-        "unknown_provider" | "invalid_request" => (400, "曲目请求无效"),
-        "playback_busy" => (429, "播放器正忙"),
-        "playback_runtime_stopped" => (503, "播放器未运行"),
-        _ => (500, "播放操作失败"),
-    };
-    AppError {
-        status,
-        message: format!("{code}: {message}"),
-    }
-}
-
 fn login_http_error(error: LoginHelperFailure) -> AppError {
     let status = match error.code {
         "unsupported_provider" | "invalid_helper_provider" | "invalid_helper_credential" => 400,
@@ -3865,18 +3933,6 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct HttpTestNativePlaybackPort {
-        played: Mutex<Vec<PlayableTrack>>,
-    }
-
-    impl HttpNativePlaybackPort for HttpTestNativePlaybackPort {
-        fn play_track(&self, track: PlayableTrack) -> Result<(), PlaybackError> {
-            self.played.lock().unwrap().push(track);
-            Ok(())
-        }
-    }
-
-    #[derive(Default)]
     struct HttpTestLoginPort {
         active: Mutex<Option<LoginSession>>,
     }
@@ -3969,7 +4025,6 @@ mod tests {
     struct HttpTestState {
         state: HttpSharedState,
         recording: Arc<RecordingHttpPort>,
-        native_playback: Arc<HttpTestNativePlaybackPort>,
     }
 
     impl Deref for HttpTestState {
@@ -4221,13 +4276,32 @@ mod tests {
                 "artists": ["测试歌手"],
                 "album": "测试专辑",
                 "durationMs": 180000
-            }
+            },
+            "requester": "Alice"
         });
         let played = http_post_json(address, "/player/play-track", &track.to_string(), None);
         assert_eq!(played.status_line, "HTTP/1.1 200 OK");
         let played: Value = serde_json::from_str(&played.body).expect("play response JSON");
         assert_eq!(played["currentUri"], "miliastra://track/netease/123");
-        assert_eq!(state.native_playback.played.lock().unwrap().len(), 1);
+        assert_eq!(played["queued"], true);
+        assert_eq!(played["size"], 1);
+        let queue = state
+            .queries
+            .playback_queue_snapshot()
+            .expect("playback queue snapshot");
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].keyword, "结构化歌曲");
+        assert_eq!(queue[0].source, "netease");
+        assert_eq!(queue[0].requester, "Alice");
+        assert!(queue[0].dedup_bypass);
+        assert_eq!(
+            queue[0]
+                .track
+                .as_ref()
+                .map(|track| track.track_ref.key.to_string())
+                .as_deref(),
+            Some("miliastra://track/netease/123")
+        );
 
         let mismatch = json!({
             "trackRef": {
@@ -4239,7 +4313,24 @@ mod tests {
         let mismatch = http_post_json(address, "/player/play-track", &mismatch.to_string(), None);
         assert_eq!(mismatch.status_line, "HTTP/1.1 400 Bad Request");
         assert!(mismatch.body.contains("resolverLocator"));
-        assert_eq!(state.native_playback.played.lock().unwrap().len(), 1);
+        assert_eq!(state.queries.playback_queue_snapshot().unwrap().len(), 1);
+
+        let unsupported_version = json!({
+            "trackRef": {
+                "key": {"provider": "netease", "id": "123"},
+                "resolverLocator": "netease:v2:123"
+            },
+            "metadata": {"title": "坏曲目", "artists": []}
+        });
+        let unsupported_version = http_post_json(
+            address,
+            "/player/play-track",
+            &unsupported_version.to_string(),
+            None,
+        );
+        assert_eq!(unsupported_version.status_line, "HTTP/1.1 400 Bad Request");
+        assert!(unsupported_version.body.contains("resolverLocator"));
+        assert_eq!(state.queries.playback_queue_snapshot().unwrap().len(), 1);
 
         let session = http_post_json(
             address,
@@ -4284,7 +4375,7 @@ mod tests {
             None,
         );
         assert_eq!(response.status_line, "HTTP/1.1 400 Bad Request");
-        assert_eq!(state.native_playback.played.lock().unwrap().len(), 0);
+        assert!(state.queries.playback_queue_snapshot().unwrap().is_empty());
         server.shutdown().expect("shutdown HTTP server");
     }
 
@@ -4667,6 +4758,7 @@ workflows:
     fn status_route_includes_requester_for_the_matching_active_song() {
         let status = PlayerStatus {
             status: "playing".to_string(),
+            current_track: Some(test_track("miliastra://track/qqmusic/1", "晴天 - 周杰伦")),
             current_uri: "miliastra://track/qqmusic/1".to_string(),
             name: "晴天".to_string(),
             ..PlayerStatus::default()
@@ -5206,7 +5298,6 @@ workflows:
             &config.ocr,
         );
         let recording = Arc::new(RecordingHttpPort::new());
-        let native_playback = Arc::new(HttpTestNativePlaybackPort::default());
         let login = Arc::new(HttpTestLoginPort::default());
         HttpTestState {
             state: HttpSharedState::new_with_ports(
@@ -5227,12 +5318,10 @@ workflows:
                 recording.clone(),
                 Arc::new(Mutex::new(LatestFrameCache::default())),
                 Arc::new(player),
-                native_playback.clone(),
                 login.clone(),
                 Arc::new(HttpTestAiPort),
             ),
             recording,
-            native_playback,
         }
     }
 }

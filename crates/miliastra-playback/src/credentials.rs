@@ -437,7 +437,15 @@ fn ensure_credential_directory(path: &Path) -> Result<(), CredentialError> {
             }
         })
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        fs::create_dir_all(path).map_err(|error| CredentialError::Write {
+            path: path.to_path_buf(),
+            error: error.to_string(),
+        })?;
+        secure_windows_path(path)
+    }
+    #[cfg(all(not(unix), not(windows)))]
     {
         fs::create_dir_all(path).map_err(|error| CredentialError::Write {
             path: path.to_path_buf(),
@@ -457,11 +465,137 @@ fn secure_credential_file(path: &Path) -> Result<(), CredentialError> {
             }
         })
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        secure_windows_path(path)
+    }
+    #[cfg(all(not(unix), not(windows)))]
     {
         let _ = path;
         Ok(())
     }
+}
+
+#[cfg(windows)]
+fn secure_windows_path(path: &Path) -> Result<(), CredentialError> {
+    use std::ffi::c_void;
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr::null_mut;
+
+    use windows::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, HANDLE, HLOCAL, LocalFree};
+    use windows::Win32::Security::Authorization::{
+        EXPLICIT_ACCESS_W, GRANT_ACCESS, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT, SetEntriesInAclW,
+        SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_W,
+    };
+    use windows::Win32::Security::{
+        DACL_SECURITY_INFORMATION, GetTokenInformation, NO_INHERITANCE,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSID, SUB_CONTAINERS_AND_OBJECTS_INHERIT, TOKEN_QUERY,
+        TOKEN_USER, TokenUser,
+    };
+    use windows::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    use windows::core::{PCWSTR, PWSTR};
+
+    fn write_error(path: &Path, operation: &str, error: impl std::fmt::Display) -> CredentialError {
+        CredentialError::Write {
+            path: path.to_path_buf(),
+            error: format!("{operation}: {error}"),
+        }
+    }
+
+    let mut token = HANDLE::default();
+    // The SID buffer remains alive until SetNamedSecurityInfoW has copied the ACL.
+    let result = (|| -> Result<(), CredentialError> {
+        unsafe {
+            OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)
+                .map_err(|error| write_error(path, "open current process token", error))?;
+
+            let mut token_bytes = 0;
+            let _ = GetTokenInformation(token, TokenUser, None, 0, &mut token_bytes);
+            if token_bytes == 0 {
+                return Err(write_error(
+                    path,
+                    "measure current user token",
+                    "Windows returned an empty TOKEN_USER buffer",
+                ));
+            }
+            let mut token_buffer = vec![0u8; token_bytes as usize];
+            GetTokenInformation(
+                token,
+                TokenUser,
+                Some(token_buffer.as_mut_ptr().cast::<c_void>()),
+                token_bytes,
+                &mut token_bytes,
+            )
+            .map_err(|error| write_error(path, "read current user token", error))?;
+            let token_user = &*token_buffer.as_ptr().cast::<TOKEN_USER>();
+            let sid: PSID = token_user.User.Sid;
+            if sid.is_invalid() {
+                return Err(write_error(
+                    path,
+                    "read current user SID",
+                    "Windows returned a null SID",
+                ));
+            }
+
+            let access = EXPLICIT_ACCESS_W {
+                grfAccessPermissions: FILE_ALL_ACCESS.0,
+                grfAccessMode: GRANT_ACCESS,
+                grfInheritance: if path.is_dir() {
+                    SUB_CONTAINERS_AND_OBJECTS_INHERIT
+                } else {
+                    NO_INHERITANCE
+                },
+                Trustee: TRUSTEE_W {
+                    pMultipleTrustee: null_mut(),
+                    MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+                    TrusteeForm: TRUSTEE_IS_SID,
+                    TrusteeType: TRUSTEE_IS_USER,
+                    ptstrName: PWSTR(sid.0.cast::<u16>()),
+                },
+            };
+            let mut acl = null_mut();
+            let acl_status = SetEntriesInAclW(Some(&[access]), None, &mut acl);
+            if acl_status != ERROR_SUCCESS {
+                return Err(write_error(
+                    path,
+                    "build current-user credential ACL",
+                    format!("Win32 error {}", acl_status.0),
+                ));
+            }
+
+            let wide_path = path
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect::<Vec<_>>();
+            let status = SetNamedSecurityInfoW(
+                PCWSTR(wide_path.as_ptr()),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(acl.cast_const()),
+                None,
+            );
+            let _ = LocalFree(Some(HLOCAL(acl.cast())));
+            if status != ERROR_SUCCESS {
+                Err(write_error(
+                    path,
+                    "set current-user credential ACL",
+                    format!("Win32 error {}", status.0),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    })();
+    if !token.is_invalid() {
+        unsafe {
+            let _ = CloseHandle(token);
+        }
+    }
+    result
 }
 
 fn write_atomic(path: &Path, content: &[u8]) -> Result<(), CredentialError> {
@@ -578,6 +712,8 @@ pub enum CredentialError {
 mod tests {
     use std::collections::BTreeMap;
     use std::fs;
+    #[cfg(windows)]
+    use std::path::Path;
 
     use super::{CredentialError, CredentialStore, ProviderCredential};
 
@@ -628,6 +764,120 @@ mod tests {
         );
         assert_eq!(store.statuses().unwrap().len(), 3);
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn credential_directory_and_files_are_restricted_to_the_current_user() {
+        let directory =
+            std::env::temp_dir().join(format!("miliastra-credentials-{}", uuid::Uuid::new_v4()));
+        let store = CredentialStore::open(directory.clone()).unwrap();
+        store
+            .save(
+                "netease",
+                ProviderCredential::Netease {
+                    cookies: BTreeMap::from([("MUSIC_U".to_owned(), "secret".to_owned())]),
+                },
+            )
+            .unwrap();
+
+        assert_private_windows_acl(&directory);
+        assert_private_windows_acl(&directory.join("netease.json"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(windows)]
+    fn assert_private_windows_acl(path: &Path) {
+        use std::ffi::c_void;
+        use std::mem::size_of;
+        use std::os::windows::ffi::OsStrExt;
+        use std::ptr::null_mut;
+
+        use windows::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, HANDLE, HLOCAL, LocalFree};
+        use windows::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+        use windows::Win32::Security::{
+            ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
+            DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation,
+            GetSecurityDescriptorControl, GetTokenInformation, PSECURITY_DESCRIPTOR, PSID,
+            SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER, TokenUser,
+        };
+        use windows::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+        use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+        use windows::core::PCWSTR;
+
+        let wide_path = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let mut dacl: *mut ACL = null_mut();
+        let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        let status = unsafe {
+            GetNamedSecurityInfoW(
+                PCWSTR(wide_path.as_ptr()),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(&mut dacl),
+                None,
+                &mut descriptor,
+            )
+        };
+        assert_eq!(status, ERROR_SUCCESS, "{}", path.display());
+        assert!(!dacl.is_null(), "{}", path.display());
+
+        let mut control = 0u16;
+        let mut revision = 0u32;
+        unsafe {
+            GetSecurityDescriptorControl(descriptor, &mut control, &mut revision).unwrap();
+        }
+        assert_ne!(control & SE_DACL_PROTECTED.0, 0, "{}", path.display());
+
+        let mut acl_info = ACL_SIZE_INFORMATION::default();
+        unsafe {
+            GetAclInformation(
+                dacl,
+                (&mut acl_info as *mut ACL_SIZE_INFORMATION).cast::<c_void>(),
+                size_of::<ACL_SIZE_INFORMATION>() as u32,
+                AclSizeInformation,
+            )
+            .unwrap();
+        }
+        assert_eq!(acl_info.AceCount, 1, "{}", path.display());
+        let mut ace_pointer = null_mut();
+        unsafe {
+            GetAce(dacl, 0, &mut ace_pointer).unwrap();
+        }
+        let ace = unsafe { &*ace_pointer.cast::<ACCESS_ALLOWED_ACE>() };
+        assert_eq!(ace.Mask, FILE_ALL_ACCESS.0, "{}", path.display());
+        let ace_sid = PSID((&ace.SidStart as *const u32).cast_mut().cast::<c_void>());
+
+        let mut token = HANDLE::default();
+        unsafe {
+            OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).unwrap();
+        }
+        let mut token_bytes = 0;
+        unsafe {
+            let _ = GetTokenInformation(token, TokenUser, None, 0, &mut token_bytes);
+        }
+        let mut token_buffer = vec![0u8; token_bytes as usize];
+        unsafe {
+            GetTokenInformation(
+                token,
+                TokenUser,
+                Some(token_buffer.as_mut_ptr().cast::<c_void>()),
+                token_bytes,
+                &mut token_bytes,
+            )
+            .unwrap();
+        }
+        let token_user = unsafe { &*token_buffer.as_ptr().cast::<TOKEN_USER>() };
+        unsafe {
+            EqualSid(ace_sid, token_user.User.Sid).unwrap();
+            CloseHandle(token).unwrap();
+            let _ = LocalFree(Some(HLOCAL(descriptor.0)));
+        }
     }
 
     #[test]

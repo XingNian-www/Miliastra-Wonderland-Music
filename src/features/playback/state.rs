@@ -15,6 +15,25 @@ use super::queue::QueueItem;
 const REQUEST_STATE_SCHEMA_VERSION: u32 = 2;
 const MAX_HISTORY_ENTRIES: usize = 64;
 
+#[derive(Debug)]
+struct UnsupportedRequestStateSchema {
+    actual: Option<u64>,
+    path: PathBuf,
+}
+
+impl std::fmt::Display for UnsupportedRequestStateSchema {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "不支持的请求状态 schemaVersion {:?}，请删除状态文件 {} 后重启",
+            self.actual,
+            self.path.display()
+        )
+    }
+}
+
+impl std::error::Error for UnsupportedRequestStateSchema {}
+
 fn default_history_id() -> u64 {
     1
 }
@@ -276,6 +295,13 @@ impl RequestStateStore {
     fn read_current_or_recover(path: &Path) -> Result<RequestStateSnapshot> {
         match Self::read_snapshot(path) {
             Ok(snapshot) => Ok(snapshot),
+            Err(error)
+                if error
+                    .downcast_ref::<UnsupportedRequestStateSchema>()
+                    .is_some() =>
+            {
+                Err(error)
+            }
             Err(primary_error) => {
                 let backup = backup_path(path);
                 if !backup.exists() {
@@ -307,11 +333,11 @@ impl RequestStateStore {
             .get("schemaVersion")
             .and_then(serde_json::Value::as_u64);
         if schema_version != Some(u64::from(REQUEST_STATE_SCHEMA_VERSION)) {
-            bail!(
-                "不支持的请求状态 schemaVersion {:?}，请删除状态文件 {} 后重启",
-                schema_version,
-                path.display()
-            );
+            return Err(UnsupportedRequestStateSchema {
+                actual: schema_version,
+                path: path.to_path_buf(),
+            }
+            .into());
         }
         let snapshot: RequestStateSnapshot = serde_json::from_value(value)
             .with_context(|| format!("parse request state {}", path.display()))?;
@@ -652,7 +678,7 @@ impl PlaybackRuntimeState {
 
     pub(crate) fn remove_previous_request(&mut self, request: &ActivePlaybackRequest) {
         let identity = playback_identity(request);
-        if identity.is_empty() {
+        if identity.is_none() {
             return;
         }
         if self
@@ -674,7 +700,7 @@ impl PlaybackRuntimeState {
 
     fn push_previous_request(&mut self, active: ActivePlaybackRequest) {
         let identity = playback_identity(&active);
-        if identity.is_empty() {
+        if identity.is_none() {
             return;
         }
         if self
@@ -692,12 +718,8 @@ impl PlaybackRuntimeState {
     }
 }
 
-fn playback_identity(request: &ActivePlaybackRequest) -> String {
-    request
-        .track
-        .as_ref()
-        .map(|track| track.track_ref.key.to_string())
-        .unwrap_or_default()
+fn playback_identity(request: &ActivePlaybackRequest) -> Option<&miliastra_playback::TrackKey> {
+    request.track.as_ref().map(|track| &track.track_ref.key)
 }
 
 #[cfg(test)]
@@ -827,6 +849,28 @@ mod tests {
 
         assert!(error.to_string().contains("schemaVersion Some(1)"));
         assert!(error.to_string().contains("请删除状态文件"));
+        remove_request_state_path(state_path);
+    }
+
+    #[test]
+    fn unsupported_primary_schema_never_falls_back_to_a_valid_backup() {
+        let state_path = temp_request_state_path("v1-with-v2-backup");
+        let mut legacy = serde_json::to_value(RequestStateSnapshot::default()).unwrap();
+        legacy["schemaVersion"] = serde_json::json!(1);
+        fs::write(&state_path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+        fs::write(
+            backup_path(&state_path),
+            serde_json::to_vec_pretty(&RequestStateSnapshot::default()).unwrap(),
+        )
+        .unwrap();
+
+        let error = RequestStateStore::load(state_path.clone())
+            .expect_err("unsupported primary schema must not use the backup");
+
+        assert!(error.to_string().contains("schemaVersion Some(1)"));
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(persisted["schemaVersion"], 1);
         remove_request_state_path(state_path);
     }
 

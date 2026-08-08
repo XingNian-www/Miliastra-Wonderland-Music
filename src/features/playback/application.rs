@@ -2,11 +2,12 @@ use std::fmt::{Display, Formatter};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use miliastra_playback::PlayableTrack;
+use miliastra_playback::{PlayableTrack, TrackKey};
 
 use crate::features::song_request::SearchCandidate;
 use crate::text::{MAX_CHAT_WIDTH, char_width, display_width};
 
+use super::matcher::same_song_query;
 use super::{
     BackgroundLyricsScope, PlaybackCommand, PlaybackNavigation, PlaybackOutcome, PlaybackRequest,
     PlaybackSnapshot, PlaybackVerification, PlayerStatus, QueueAdvanceContext,
@@ -404,15 +405,20 @@ pub(crate) struct PlaybackApplicationConfig {
 
 #[derive(Default)]
 pub(crate) struct LyricTracker {
-    current_uri: Option<String>,
+    current_key: Option<TrackKey>,
     previous_lyric: Option<String>,
 }
 
 impl LyricTracker {
     pub(crate) fn observe(&mut self, status: &PlayerStatus) -> bool {
-        let uri = status.current_uri.trim();
-        if !uri.is_empty() && self.current_uri.as_deref() != Some(uri) {
-            self.current_uri = Some(uri.to_string());
+        let key = status
+            .current_track
+            .as_ref()
+            .map(|track| &track.track_ref.key);
+        if let Some(key) = key
+            && self.current_key.as_ref() != Some(key)
+        {
+            self.current_key = Some(key.clone());
             self.previous_lyric = None;
         }
 
@@ -1019,11 +1025,15 @@ impl PlaybackApplication {
     ) -> Result<PlaybackCompletion> {
         let current_source = request_source(request);
         let next_source = AlternatePlaybackSource::other_than(current_source);
-        let Some(candidate) = select_snapshot_candidate(
-            &request.candidate_snapshot,
-            next_source.id(),
-            request.prefer_accompaniment,
-        ) else {
+        let candidate = request.track.as_ref().and_then(|reference| {
+            select_snapshot_candidate(
+                &request.candidate_snapshot,
+                next_source.id(),
+                request.prefer_accompaniment,
+                reference,
+            )
+        });
+        let Some(candidate) = candidate else {
             return Ok(PlaybackCompletion::new(
                 PlaybackResult::no_source(
                     requested,
@@ -1093,6 +1103,7 @@ fn select_snapshot_candidate(
     candidates: &[SearchCandidate],
     source: &str,
     prefer_accompaniment: bool,
+    reference: &PlayableTrack,
 ) -> Option<SearchCandidate> {
     let source_candidates = candidates
         .iter()
@@ -1100,6 +1111,7 @@ fn select_snapshot_candidate(
         .filter(|candidate| {
             candidate.eligibility != crate::features::song_request::CandidateEligibility::Ineligible
         })
+        .filter(|candidate| candidate_matches_reference(candidate, reference))
         .cloned()
         .collect::<Vec<_>>();
     if source_candidates.is_empty() {
@@ -1115,7 +1127,37 @@ fn select_snapshot_candidate(
     } else {
         source_candidates
     };
-    SearchCandidate::select_preferred_equivalent(&comparable)
+    comparable
+        .into_iter()
+        .max_by_key(|candidate| candidate.eligibility.preference_rank())
+}
+
+fn candidate_matches_reference(candidate: &SearchCandidate, reference: &PlayableTrack) -> bool {
+    if !same_song_query(&candidate.metadata.title, &reference.metadata.title) {
+        return false;
+    }
+    if candidate.metadata.artists.is_empty() || reference.metadata.artists.is_empty() {
+        return false;
+    }
+    if !candidate.metadata.artists.iter().any(|candidate_artist| {
+        reference
+            .metadata
+            .artists
+            .iter()
+            .any(|reference_artist| same_song_query(candidate_artist, reference_artist))
+    }) {
+        return false;
+    }
+    match (
+        candidate.metadata.duration_ms,
+        reference.metadata.duration_ms,
+    ) {
+        (Some(candidate_ms), Some(reference_ms)) => {
+            let tolerance_ms = (reference_ms / 20).max(5_000);
+            candidate_ms.abs_diff(reference_ms) <= tolerance_ms
+        }
+        _ => true,
+    }
 }
 
 fn is_accompaniment_candidate(text: &str) -> bool {
@@ -1549,7 +1591,7 @@ mod tests {
                 "不可用候选 - 测试歌手",
             )),
             candidate_snapshot: vec![test_candidate(
-                "备用歌曲 - 歌手",
+                "不可用候选 - 测试歌手",
                 "miliastra://track/netease/backup",
             )],
             ..QueueItem::default()
@@ -1584,8 +1626,22 @@ mod tests {
         assert_eq!(port.play_attempts, 2);
         assert_eq!(
             port.replies,
-            ["因平台无音源,已由AI自动切换至:备用歌曲-歌手"]
+            ["因平台无音源,已由AI自动切换至:不可用候选-测试歌手"]
         );
+    }
+
+    #[test]
+    fn alternate_source_selection_skips_an_unrelated_first_result() {
+        let reference = test_track("miliastra://track/qqmusic/original", "目标歌曲 - 原歌手");
+        let candidates = vec![
+            test_candidate("无关歌曲 - 其他歌手", "miliastra://track/netease/wrong"),
+            test_candidate("目标歌曲 - 原歌手", "miliastra://track/netease/right"),
+        ];
+
+        let selected = select_snapshot_candidate(&candidates, "netease", false, &reference)
+            .expect("matching structured candidate");
+
+        assert_eq!(selected.track_ref.key.id, "right");
     }
 
     #[test]
@@ -1598,7 +1654,7 @@ mod tests {
                 "持续不可用候选 - 测试歌手",
             )),
             candidate_snapshot: vec![test_candidate(
-                "备用歌曲 - 歌手",
+                "持续不可用候选 - 测试歌手",
                 "miliastra://track/netease/backup",
             )],
             ..QueueItem::default()
@@ -2422,6 +2478,7 @@ mod tests {
         let clock = Arc::new(ManualClock::new(start));
         let playing = |uri: &str, lyric: &str| PlayerStatus {
             status: "playing".to_string(),
+            current_track: Some(test_track(uri, "lyrics test - test artist")),
             current_uri: uri.to_string(),
             lyric_line_text: lyric.to_string(),
             ..PlayerStatus::default()

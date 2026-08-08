@@ -85,6 +85,14 @@ impl MusicPlayerBackend for PlayerRuntimeBackend {
         });
         let observation = observation.ok_or_else(|| anyhow!("播放器运行时尚未发布观测"))?;
         let observation = observation.observation();
+        let identity = observation.fresh_identity();
+        let current_track = identity.as_ref().and_then(|identity| {
+            observation
+                .track
+                .as_ref()
+                .filter(|track| track.track_ref.key == identity.key)
+                .cloned()
+        });
         let transport = observation
             .fresh_transport()
             .or(observation.transport)
@@ -96,10 +104,9 @@ impl MusicPlayerBackend for PlayerRuntimeBackend {
             .unwrap_or("unknown");
         Ok(PlayerStatus {
             status: transport.to_string(),
-            current_track: observation.track.clone(),
-            current_uri: observation
-                .fresh_identity()
-                .map(|identity| identity.uri)
+            current_track,
+            current_uri: identity
+                .map(|identity| identity.key.to_string())
                 .unwrap_or_default(),
             name: observation.title.clone().unwrap_or_default(),
             singer: observation.artist.clone().unwrap_or_default(),
@@ -165,13 +172,15 @@ impl MusicPlayerBackend for PlayerRuntimeBackend {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::PlayerRuntimeBackend;
     use crate::features::playback::MusicPlayerBackend;
-    use crate::runtime::player::RawPlayerSample;
+    use crate::runtime::player::{RawPlayerSample, TransportState};
     use crate::runtime::player_io::{
-        ControlDispatchOutcome, PickedCandidate, PlayerControl, PlayerControlPort,
-        PlayerObservationPort, PlayerObservationReadError, PlayerRuntime, PlayerRuntimeConfig,
-        PlayerSearchError, PlayerSearchPort, SearchCandidate,
+        ControlDispatch, ControlDispatchOutcome, ObservationWaitOutcome, PickedCandidate,
+        PlayerControl, PlayerControlPort, PlayerObservationPort, PlayerObservationReadError,
+        PlayerRuntime, PlayerRuntimeConfig, PlayerSearchError, PlayerSearchPort, SearchCandidate,
     };
 
     struct FailingObservationPort;
@@ -186,12 +195,22 @@ mod tests {
 
     struct TrackUnavailableControlPort;
 
+    struct ConstantObservationPort {
+        sample: RawPlayerSample,
+    }
+
+    impl PlayerObservationPort for ConstantObservationPort {
+        fn read_sample(&mut self) -> Result<RawPlayerSample, PlayerObservationReadError> {
+            Ok(self.sample.clone())
+        }
+    }
+
     impl PlayerControlPort for TrackUnavailableControlPort {
-        fn dispatch(&mut self, _control: &PlayerControl) -> ControlDispatchOutcome {
-            ControlDispatchOutcome::rejected_with_code(
+        fn dispatch(&mut self, _control: &PlayerControl) -> ControlDispatch {
+            ControlDispatch::immediate(ControlDispatchOutcome::rejected_with_code(
                 "playback failure [track_unavailable]: no playable URL",
                 "track_unavailable",
-            )
+            ))
         }
     }
 
@@ -248,6 +267,48 @@ mod tests {
             error.to_string(),
             "播放器控制未确认: playback failure [track_unavailable]: no playable URL"
         );
+        runtime.shutdown().expect("player runtime should shut down");
+    }
+
+    #[test]
+    fn runtime_backend_derives_the_display_uri_from_the_stable_track_key() {
+        let track = crate::features::playback::test_track(
+            "miliastra://track/netease/track-2",
+            "测试歌曲 - 测试歌手",
+        );
+        let config = PlayerRuntimeConfig {
+            normal_observation_interval: Duration::from_millis(2),
+            fast_observation_interval: Duration::from_millis(1),
+            ..PlayerRuntimeConfig::default()
+        };
+        let runtime = PlayerRuntime::start(
+            ConstantObservationPort {
+                sample: RawPlayerSample::new(track.clone(), TransportState::Playing),
+            },
+            TrackUnavailableControlPort,
+            EmptySearchPort,
+            config,
+        )
+        .expect("player runtime should start");
+        let handle = runtime.handle();
+        let first = match handle.wait_for_observation_after(
+            crate::runtime::player_io::PlayerObservationRevision::INITIAL,
+            Duration::from_secs(1),
+        ) {
+            ObservationWaitOutcome::Advanced(observation) => observation,
+            _ => panic!("first observation should arrive"),
+        };
+        match handle.wait_for_observation_after(first.revision(), Duration::from_secs(1)) {
+            ObservationWaitOutcome::Advanced(_) => {}
+            _ => panic!("stable observation should arrive"),
+        }
+
+        let status = PlayerRuntimeBackend::new(handle)
+            .status()
+            .expect("player status");
+
+        assert_eq!(status.current_track, Some(track));
+        assert_eq!(status.current_uri, "miliastra://track/netease/track-2");
         runtime.shutdown().expect("player runtime should shut down");
     }
 }

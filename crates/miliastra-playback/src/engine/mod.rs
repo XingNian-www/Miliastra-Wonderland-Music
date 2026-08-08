@@ -31,6 +31,7 @@ pub(crate) enum EngineCommand {
     Stop {
         session: SessionRef,
     },
+    #[cfg(test)]
     Seek {
         session: SessionRef,
         position_seconds: f64,

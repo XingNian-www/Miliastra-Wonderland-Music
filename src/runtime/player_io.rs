@@ -136,7 +136,7 @@ pub trait PlayerObservationPort: Send + 'static {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PlayerControl {
-    PlayUri(String),
+    Play(miliastra_playback::PlayableTrack),
     Pause,
     Resume,
     Next,
@@ -1585,6 +1585,7 @@ mod tests {
         PlayerSearch, PlayerSearchClient, PlayerSearchClientError, PlayerSearchError,
         PlayerSearchOutcome, PlayerSearchPort, SearchCandidate,
     };
+    use crate::features::playback::test_candidate;
     use crate::runtime::clock::{ManualClock, SystemClock};
     use crate::runtime::identity::{BusinessOperationId, BusinessOperationIdAllocator};
     use crate::runtime::player::PlayerObservationConfig;
@@ -1621,7 +1622,7 @@ mod tests {
     impl PlayerObservationPort for ConstantObservationPort {
         fn read_sample(&mut self) -> Result<RawPlayerSample, PlayerObservationReadError> {
             Ok(RawPlayerSample::new(
-                "fuo://song/observation",
+                "miliastra://track/qqmusic/observation",
                 TransportState::Playing,
             ))
         }
@@ -1737,8 +1738,10 @@ mod tests {
                     .recv_timeout(FAKE_PORT_BLOCK_TIMEOUT)
                     .expect("test observation port release timed out");
             }
-            let mut sample =
-                RawPlayerSample::new("fuo://song/observation", TransportState::Playing);
+            let mut sample = RawPlayerSample::new(
+                "miliastra://track/qqmusic/observation",
+                TransportState::Playing,
+            );
             sample.title = Some("cached title".to_string());
             sample.progress = Some(Duration::from_secs(20));
             sample.duration = Some(Duration::from_secs(180));
@@ -1756,7 +1759,7 @@ mod tests {
                     .expect("test observation port release timed out");
             }
             Ok(RawPlayerSample::new(
-                "fuo://song/observation",
+                "miliastra://track/qqmusic/observation",
                 TransportState::Playing,
             ))
         }
@@ -1814,9 +1817,9 @@ mod tests {
                 .unwrap()
                 .push(PlayerSearch::candidates(keyword, source));
             self.block_if_requested();
-            Ok(vec![SearchCandidate::new(
-                format!("{keyword} result"),
-                "fuo://song/result",
+            Ok(vec![test_candidate(
+                &format!("{keyword} result"),
+                "miliastra://track/qqmusic/result",
             )])
         }
 
@@ -1833,7 +1836,10 @@ mod tests {
             ));
             self.block_if_requested();
             Ok(Some(PickedCandidate::new(
-                SearchCandidate::new(format!("{keyword} picked"), "fuo://song/picked"),
+                test_candidate(
+                    &format!("{keyword} picked"),
+                    "miliastra://track/qqmusic/picked",
+                ),
                 "candidate listing",
             )))
         }
@@ -2005,7 +2011,7 @@ mod tests {
             ScriptedObservationPort {
                 samples: VecDeque::from([
                     Ok(RawPlayerSample::new(
-                        "fuo://song/one",
+                        "miliastra://track/qqmusic/one",
                         TransportState::Playing,
                     )),
                     Err(PlayerObservationReadError::new("status RPC failed")),
@@ -2148,11 +2154,11 @@ mod tests {
         let clock = ManualClock::new(now);
         let mut observer = PlayerObserver::new(clock, PlayerObservationConfig::default());
         observer.observe_sample(RawPlayerSample::new(
-            "fuo://song/seed",
+            "miliastra://track/qqmusic/seed",
             TransportState::Playing,
         ));
         let observation = observer.observe_sample(RawPlayerSample::new(
-            "fuo://song/seed",
+            "miliastra://track/qqmusic/seed",
             TransportState::Playing,
         ));
         let latest = Arc::new(super::LatestObservationStore::new(
@@ -2687,12 +2693,15 @@ mod tests {
         );
         assert_eq!(
             client.search_candidates("two", "source").unwrap(),
-            vec![SearchCandidate::new("two result", "fuo://song/result")]
+            vec![test_candidate(
+                "two result",
+                "miliastra://track/qqmusic/result"
+            )]
         );
         assert_eq!(
             client.search_and_pick("three", "source", true).unwrap(),
             Some(PickedCandidate::new(
-                SearchCandidate::new("three picked", "fuo://song/picked"),
+                test_candidate("three picked", "miliastra://track/qqmusic/picked"),
                 "candidate listing"
             ))
         );

@@ -21,8 +21,8 @@ use std::thread::{self, sleep};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use self::formal_task::{FormalTaskClient, FormalTaskRuntime};
+use crate::adapters::native_playback::NativePlaybackAdapter;
 use crate::adapters::player::PlayerRuntimeBackend;
-use crate::adapters::playerd::{PlayerdClient, PlayerdSupervisor};
 use crate::adapters::windows::{WindowsUiDevice, parse_key};
 use crate::config::{AppConfig, PointConfig};
 use crate::features::administration::{
@@ -130,6 +130,7 @@ use crate::ui::template::{best_template_hit, find_template_hits};
 use anyhow::{Context, Result, anyhow};
 use enigo::Key;
 use image::DynamicImage;
+use miliastra_playback::{PlaybackHandle, PlaybackRuntime as NativePlaybackRuntime};
 
 const TARGET_MISSING_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const TARGET_MISSING_BACKOFF_MAX: Duration = Duration::from_secs(60);
@@ -363,7 +364,8 @@ pub(crate) struct ApplicationRuntime {
     playback_application: PlaybackApplication,
     player_search: PlayerSearchClient,
     player_runtime: Option<PlayerRuntime>,
-    playerd_supervisor: Option<PlayerdSupervisor>,
+    native_playback: PlaybackHandle,
+    native_playback_runtime: Option<NativePlaybackRuntime>,
     openai_runtime: Option<OpenAiRuntime>,
     ai: AiClient,
     song_requests: SongRequestApplication,
@@ -874,10 +876,11 @@ impl ApplicationRuntime {
         } = config;
         let system_clock = Arc::new(SystemClock);
         let ocr_device = ProductionOcrDevice::new(ocr_args.clone())?;
-        let playerd_supervisor =
-            PlayerdSupervisor::start(&config.playerd).context("启动或连接 miliastra-playerd")?;
-        let playerd =
-            PlayerdClient::connect(&config.playerd).context("连接 miliastra-playerd HTTP API")?;
+        let native_playback_runtime =
+            NativePlaybackRuntime::start(config.playback.credential_directory.clone())
+                .context("启动原生播放器")?;
+        let native_playback = native_playback_runtime.handle();
+        let playback_adapter = NativePlaybackAdapter::new(native_playback.clone());
         let idiom_chain = IdiomChainService::load(config.idiom_chain.clone())?;
         if config.idiom_chain.enabled {
             log::info!("已加载成语接龙词库: {} 条", idiom_chain.lexicon_len());
@@ -890,7 +893,6 @@ impl ApplicationRuntime {
             system_clock.clone(),
         )?;
         let playback = PlaybackService::load(
-            config.state.queue_path.clone(),
             config.state.playback_state_path.clone(),
             config.song_dedup.history_path.clone(),
             config.queue.max_size,
@@ -932,9 +934,9 @@ impl ApplicationRuntime {
         )?;
         let ocr = ocr_runtime.handle();
         let player_runtime = PlayerRuntime::start(
-            playerd.clone(),
-            playerd.clone(),
-            playerd.clone(),
+            playback_adapter.clone(),
+            playback_adapter.clone(),
+            playback_adapter,
             player_runtime_config,
         )
         .context("启动播放器运行时")?;
@@ -1092,7 +1094,8 @@ impl ApplicationRuntime {
             playback_application,
             player_search,
             player_runtime: Some(player_runtime),
-            playerd_supervisor: Some(playerd_supervisor),
+            native_playback,
+            native_playback_runtime: Some(native_playback_runtime),
             openai_runtime: Some(openai_runtime),
             ai,
             song_requests,

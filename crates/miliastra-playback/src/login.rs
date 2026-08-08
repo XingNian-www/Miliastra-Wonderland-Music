@@ -23,6 +23,7 @@ struct ActiveLogin {
     expires_at: Instant,
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 pub struct LoginLease {
     coordinator: LoginCoordinator,
@@ -41,6 +42,7 @@ impl LoginCoordinator {
         }
     }
 
+    #[cfg(test)]
     pub fn begin(&self, provider: ProviderId) -> Result<LoginLease, Failure> {
         let active = self.reserve(provider)?;
         Ok(LoginLease {
@@ -135,20 +137,7 @@ impl Default for LoginCoordinator {
     }
 }
 
-impl LoginLease {
-    pub fn id(&self) -> Uuid {
-        self.active.id
-    }
-
-    pub fn provider(&self) -> ProviderId {
-        self.active.provider
-    }
-
-    pub fn finish(self) {
-        drop(self);
-    }
-}
-
+#[cfg(test)]
 impl Drop for LoginLease {
     fn drop(&mut self) {
         self.coordinator.release(self.active.id);

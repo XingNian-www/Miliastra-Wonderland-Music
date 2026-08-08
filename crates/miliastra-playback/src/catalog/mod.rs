@@ -1,9 +1,6 @@
-#[cfg(feature = "bilibili")]
 mod bilibili;
-#[cfg(feature = "netease")]
 mod netease;
 mod provider;
-#[cfg(feature = "qqmusic")]
 mod qqmusic;
 
 use std::collections::HashMap;
@@ -15,15 +12,12 @@ use crate::credentials::ProviderCredential;
 use crate::domain::{ResolverLocator, SearchSpec, Song, SongKey, StreamSource};
 
 pub use crate::domain::Failure;
-#[cfg(feature = "bilibili")]
 pub use bilibili::BilibiliAdapter;
-#[cfg(feature = "netease")]
 pub use netease::NeteaseAdapter;
 pub use provider::{
-    Eligibility, PlaybackEligibility, ProviderAvailability, ProviderId, ProviderRegistry,
-    ProviderSearchCandidate, ProviderSearchOutcome, UnknownProvider, canonical_provider_id,
+    PlaybackEligibility, ProviderId, ProviderRegistry, ProviderSearchCandidate,
+    ProviderSearchOutcome,
 };
-#[cfg(feature = "qqmusic")]
 pub use qqmusic::QqMusicAdapter;
 
 #[derive(Clone, Debug, thiserror::Error)]

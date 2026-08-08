@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+#[cfg(test)]
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -21,14 +22,15 @@ use super::repository::TurtleSoupBankStore;
 use super::{
     TurtleSoupAppendReceipt, TurtleSoupDeadlineKind, TurtleSoupDelivery, TurtleSoupDeliveryIntent,
     TurtleSoupDeliveryOutcome, TurtleSoupDeliveryPort, TurtleSoupDeliveryPurpose, TurtleSoupPuzzle,
-    TurtleSoupSubmission, load_question_bank,
+    TurtleSoupSubmission,
 };
 use crate::features::chat_text::{MAX_CHAT_WIDTH, display_width, split_numbered_chat_message};
 use crate::features::entertainment::{AcquireOutcome, EntertainmentKind, EntertainmentState};
-use crate::runtime::clock::{Clock, Delay};
-use crate::runtime::identity::SessionGeneration;
-use crate::runtime::openai::{Authentication, OpenAiRuntimeHandle, Target, validate_http_proxy};
 use crate::text::normalize_comparison_text;
+use miliastra_contracts::StateStore;
+use miliastra_kernel::ai::{Authentication, OpenAiRuntimeHandle, Target, validate_http_proxy};
+use miliastra_kernel::clock::{Clock, Delay};
+use miliastra_kernel::identity::SessionGeneration;
 
 const RECENT_JUDGMENT_LIMIT: usize = 30;
 const OPENAI_DEFAULT_ENDPOINT: &str = "https://api.openai.com/v1/chat/completions";
@@ -369,6 +371,7 @@ pub(crate) struct TurtleSoupService {
     cancelled_through: Arc<AtomicU64>,
     clock: Arc<dyn Clock>,
     retry_delay: Arc<dyn Delay>,
+    store: Arc<dyn StateStore>,
 }
 
 pub(crate) struct TurtleSoupWorkerRuntime {
@@ -842,12 +845,13 @@ impl TurtleSoupService {
         openai: OpenAiRuntimeHandle,
         clock: Arc<dyn Clock>,
         retry_delay: Arc<dyn Delay>,
+        store: Arc<dyn StateStore>,
     ) -> Self {
         config.nickname_stable_count = config
             .nickname_stable_count
             .max(BUILTIN_OCR_STABILITY_COUNT);
         config.content_stable_count = config.content_stable_count.max(BUILTIN_OCR_STABILITY_COUNT);
-        let bank = TurtleSoupBankStore::new(config.question_bank_path.clone());
+        let bank = TurtleSoupBankStore::new(config.question_bank_path.clone(), store.clone());
         let (worker_sender, worker_receiver) = mpsc::sync_channel(config.max_pending.max(1));
         Self {
             config,
@@ -859,6 +863,7 @@ impl TurtleSoupService {
             cancelled_through: Arc::new(AtomicU64::new(0)),
             clock,
             retry_delay,
+            store,
         }
     }
 
@@ -1462,8 +1467,17 @@ impl TurtleSoupService {
         }
 
         let result = (|| {
-            let bank = load_question_bank(&self.config.question_bank_path)?;
-            let mut used = load_used_state(&self.config.used_state_path)?;
+            let bank_text = self
+                .store
+                .read_to_string(&self.config.question_bank_path)
+                .with_context(|| {
+                    format!(
+                        "读取海龟汤题库失败: {}",
+                        self.config.question_bank_path.display()
+                    )
+                })?;
+            let bank = super::parse_question_bank(&bank_text, &self.config.question_bank_path)?;
+            let mut used = load_used_state(&self.config.used_state_path, self.store.as_ref())?;
             let mut available = bank
                 .into_iter()
                 .filter(|puzzle| puzzle.enabled && !used.used_ids.contains(&puzzle.id))
@@ -1481,7 +1495,7 @@ impl TurtleSoupService {
             };
             let puzzle = available.swap_remove(selected_index);
             used.used_ids.insert(puzzle.id.clone());
-            save_used_state(&self.config.used_state_path, &used)?;
+            save_used_state(&self.config.used_state_path, &used, self.store.as_ref())?;
             let remaining = available.len();
 
             let generation = {
@@ -2185,19 +2199,20 @@ fn normalize_player_key(value: &str) -> String {
     normalize_player_display(value).to_ascii_lowercase()
 }
 
-fn load_used_state(path: &Path) -> Result<UsedQuestionState> {
-    if !path.exists() {
+fn load_used_state(path: &Path, store: &dyn StateStore) -> Result<UsedQuestionState> {
+    if !store.exists(path) {
         return Ok(UsedQuestionState::default());
     }
-    let text = fs::read_to_string(path)
+    let text = store
+        .read_to_string(path)
         .with_context(|| format!("读取海龟汤使用记录失败: {}", path.display()))?;
     serde_json::from_str(&text)
         .with_context(|| format!("解析海龟汤使用记录失败: {}", path.display()))
 }
 
-fn save_used_state(path: &Path, state: &UsedQuestionState) -> Result<()> {
+fn save_used_state(path: &Path, state: &UsedQuestionState, store: &dyn StateStore) -> Result<()> {
     let text = serde_json::to_string_pretty(state)?;
-    crate::adapters::file_store::write_atomic(path, text.as_bytes(), "海龟汤使用记录")
+    store.write_atomic(path, text.as_bytes(), "海龟汤使用记录")
 }
 
 fn pseudo_random_index(len: usize) -> usize {
@@ -2416,21 +2431,27 @@ fn unix_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::clock::{Clock, ManualClock};
+    use miliastra_kernel::clock::{Clock, ManualClock};
 
     fn test_openai() -> OpenAiRuntimeHandle {
-        static RUNTIME: std::sync::OnceLock<crate::runtime::openai::OpenAiRuntime> =
+        static RUNTIME: std::sync::OnceLock<miliastra_kernel::ai::OpenAiRuntime> =
             std::sync::OnceLock::new();
         RUNTIME
             .get_or_init(|| {
-                crate::runtime::openai::OpenAiRuntime::start().expect("test OpenAI runtime")
+                miliastra_kernel::ai::OpenAiRuntime::start().expect("test OpenAI runtime")
             })
             .handle()
     }
 
     fn test_service(config: TurtleSoupConfig) -> TurtleSoupService {
         let clock = Arc::new(ManualClock::new(Instant::now()));
-        TurtleSoupService::new(config, test_openai(), clock.clone(), clock)
+        TurtleSoupService::new(
+            config,
+            test_openai(),
+            clock.clone(),
+            clock,
+            crate::test_support::test_state_store(),
+        )
     }
 
     #[derive(Clone, Copy)]
@@ -3333,6 +3354,7 @@ mod tests {
             test_openai(),
             clock.clone(),
             clock.clone(),
+            crate::test_support::test_state_store(),
         );
         service.state.phase = TurtleSoupPhase::Active;
         service.state.session = Some(TurtleSoupSession {

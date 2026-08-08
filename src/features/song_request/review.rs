@@ -11,8 +11,8 @@ use miliastra_playback::TrackKey;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::runtime::clock::Delay;
-use crate::runtime::openai::{OpenAiRuntimeHandle, Target, validate_http_proxy};
+use miliastra_kernel::ai::{OpenAiRuntimeHandle, Target, validate_http_proxy};
+use miliastra_kernel::clock::Delay;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -470,14 +470,14 @@ mod tests {
 
     use super::*;
     use crate::features::playback::test_track;
-    use crate::runtime::clock::{Clock, ManualClock};
+    use miliastra_kernel::clock::{Clock, ManualClock};
 
     fn test_openai() -> OpenAiRuntimeHandle {
-        static RUNTIME: std::sync::OnceLock<crate::runtime::openai::OpenAiRuntime> =
+        static RUNTIME: std::sync::OnceLock<miliastra_kernel::ai::OpenAiRuntime> =
             std::sync::OnceLock::new();
         RUNTIME
             .get_or_init(|| {
-                crate::runtime::openai::OpenAiRuntime::start().expect("test OpenAI runtime")
+                miliastra_kernel::ai::OpenAiRuntime::start().expect("test OpenAI runtime")
             })
             .handle()
     }

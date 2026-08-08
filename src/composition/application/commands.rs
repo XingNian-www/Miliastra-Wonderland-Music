@@ -183,28 +183,33 @@ impl AdministrationImmediatePort for ImmediateAdministrationPort {
 impl ApplicationRuntime {
     pub(super) fn deferred_idiom_chain_port(&self) -> DeferredIdiomChainPort {
         DeferredIdiomChainPort {
-            business: self.business.clone(),
-            task_engine: self.task_engine.clone(),
+            business: self.business.business.clone(),
+            task_engine: self.business.task_engine.clone(),
         }
     }
 
     fn turtle_soup_command_port(&self) -> TurtleSoupCommandPort {
         TurtleSoupCommandPort {
-            business: self.business.clone(),
-            task_engine: self.task_engine.clone(),
+            business: self.business.business.clone(),
+            task_engine: self.business.task_engine.clone(),
         }
     }
 
     pub(super) fn immediate_administration_port(&self) -> ImmediateAdministrationPort {
         ImmediateAdministrationPort {
-            business: self.business.clone(),
-            monitor: self.monitor.clone(),
-            executed_commands_log_path: self.config.state.executed_commands_log_path.clone(),
+            business: self.business.business.clone(),
+            monitor: self.lifecycle.monitor.clone(),
+            executed_commands_log_path: self
+                .lifecycle
+                .config
+                .state
+                .executed_commands_log_path
+                .clone(),
         }
     }
 
     pub(super) fn maybe_warn_hall_expiring(&mut self) -> Result<bool> {
-        let application = self.hall_application;
+        let application = self.business.hall_application;
         application.maybe_warn_expiring(self)
     }
 
@@ -217,7 +222,10 @@ impl ApplicationRuntime {
                     username: command_username(parsed).to_string(),
                     user_command: parsed.user_command.clone(),
                 };
-                self.song_requests.clone().execute(&context, command, self)
+                self.business
+                    .song_requests
+                    .clone()
+                    .execute(&context, command, self)
             }
             ModuleCommand::Playback(command) => self.execute_playback_intent(parsed, command),
             ModuleCommand::Hall(command) => self.execute_hall_intent(parsed, command),
@@ -242,7 +250,7 @@ impl ApplicationRuntime {
             username: command_username(parsed).to_string(),
             user_command: parsed.user_command.clone(),
         };
-        let application = self.hall_application;
+        let application = self.business.hall_application;
         application.execute(&context, command, self)
     }
 
@@ -256,7 +264,7 @@ impl ApplicationRuntime {
             username: command_username(parsed).to_string(),
             user_command: parsed.user_command.clone(),
         };
-        let application = self.administration_application;
+        let application = self.business.administration_application;
         application.execute(&context, command, self)
     }
 
@@ -267,12 +275,12 @@ impl ApplicationRuntime {
     ) -> Result<()> {
         let observed_at = command_observed_at(parsed);
         if command.requires_executor() {
-            let application = self.idiom_chain_application;
+            let application = self.business.idiom_chain_application;
             application.execute_explanation(&parsed.username, command, observed_at, self)
         } else {
             log::debug!("成语接龙命令已按正式队列顺序处理，回复进入延迟聊天队列");
             let mut port = self.deferred_idiom_chain_port();
-            self.idiom_chain_application.execute_deferred(
+            self.business.idiom_chain_application.execute_deferred(
                 &parsed.raw,
                 &parsed.username,
                 command,
@@ -289,7 +297,7 @@ impl ApplicationRuntime {
     ) -> Result<()> {
         let observed_at = command_observed_at(parsed);
         match card_game_effect_lane(command) {
-            CardGameEffectLane::Formal => self.card_games.execute_command(
+            CardGameEffectLane::Formal => self.business.card_games.execute_command(
                 &parsed.username,
                 command,
                 observed_at,
@@ -298,9 +306,9 @@ impl ApplicationRuntime {
             ),
             CardGameEffectLane::Deferred => {
                 let port = DeferredCardGamePort {
-                    task_engine: self.task_engine.clone(),
+                    task_engine: self.business.task_engine.clone(),
                 };
-                self.card_games.execute_command(
+                self.business.card_games.execute_command(
                     &parsed.username,
                     command,
                     observed_at,
@@ -318,7 +326,7 @@ impl ApplicationRuntime {
     ) -> Result<()> {
         log::debug!("海龟汤控制命令已按正式队列顺序处理，回复进入延迟聊天队列");
         let mut port = self.turtle_soup_command_port();
-        self.turtle_soup_application.execute_command(
+        self.business.turtle_soup_application.execute_command(
             &parsed.raw,
             &parsed.username,
             parsed.message_type == "pink",
@@ -342,7 +350,7 @@ impl ApplicationRuntime {
     ) -> Result<()> {
         let request =
             InviteRequest::new(invite.username.clone(), invite.seq, invite.password.clone());
-        let execution = match self.business.begin_invite(request)? {
+        let execution = match self.business.business.begin_invite(request)? {
             InviteStart::Duplicate { sequence } => {
                 log::info!("邀请参数 {} 已执行过，跳过", sequence);
                 return Ok(());
@@ -375,11 +383,12 @@ impl ApplicationRuntime {
     }
 
     pub(super) fn configure_idle_exit(&self, minutes: u32) -> Result<()> {
-        configure_idle_exit(&self.business, minutes)
+        configure_idle_exit(&self.business.business, minutes)
     }
 
     pub(super) fn commands_enabled(&self) -> Result<bool> {
         Ok(self
+            .business
             .business
             .operational_snapshot(Instant::now())?
             .commands_enabled())
@@ -387,10 +396,10 @@ impl ApplicationRuntime {
 
     pub(super) fn check_public_hall(&self) -> Result<bool> {
         let mut port = PublicHallDetectionPort {
-            hall_ui: self.hall_ui.clone(),
-            business: self.business.clone(),
+            hall_ui: self.ui.hall_ui.clone(),
+            business: self.business.business.clone(),
         };
-        self.hall_application.check_public_hall(&mut port)
+        self.business.hall_application.check_public_hall(&mut port)
     }
 
     fn execute_undercover_command(
@@ -403,7 +412,7 @@ impl ApplicationRuntime {
             "控制台" => UndercoverCommandSource::Console,
             _ => UndercoverCommandSource::Hall,
         };
-        self.undercover_game.execute_command(
+        self.business.undercover_game.execute_command(
             &parsed.username,
             source,
             command,
@@ -418,7 +427,8 @@ impl ApplicationRuntime {
         observed_at: Instant,
     ) -> Result<bool> {
         let mut port = self.turtle_soup_command_port();
-        self.turtle_soup_application
+        self.business
+            .turtle_soup_application
             .submit_question(question, observed_at, &mut port)
     }
 }
@@ -448,6 +458,7 @@ impl IdiomChainExplanationPort for ApplicationRuntime {
         observed_at: Instant,
     ) -> Result<IdiomChainOutcome> {
         self.business
+            .business
             .explain_idiom_chain_at(player, command, observed_at)
             .map_err(anyhow::Error::from)
     }
@@ -461,6 +472,7 @@ impl IdiomChainExplanationPort for ApplicationRuntime {
 impl AdministrationImmediatePort for ApplicationRuntime {
     fn set_commands_enabled(&mut self, enabled: bool) -> Result<()> {
         self.business
+            .business
             .set_commands_enabled(enabled)
             .map_err(anyhow::Error::from)
     }
@@ -499,17 +511,19 @@ impl AdministrationApplicationPort for ApplicationRuntime {
 
 impl HallDetectionPort for ApplicationRuntime {
     fn detect_public_hall(&mut self) -> Result<Option<HallObservation>> {
-        detect_public_hall(&self.hall_ui)
+        detect_public_hall(&self.ui.hall_ui)
     }
 
     fn update_hall_remaining_minutes(&mut self, minutes: u32) -> Result<()> {
         self.business
+            .business
             .update_hall_remaining_minutes(minutes)
             .map_err(anyhow::Error::from)
     }
 
     fn clear_hall_remaining_minutes(&mut self) -> Result<()> {
         self.business
+            .business
             .clear_hall_remaining_minutes()
             .map_err(anyhow::Error::from)
     }
@@ -531,6 +545,7 @@ impl HallApplicationPort for ApplicationRuntime {
 
     fn read_hall_info(&mut self) -> Result<HallObservation> {
         let outcome = self
+            .ui
             .hall_ui
             .submit_read(ReadHallInfo)
             .context("提交大厅信息读取 UI 事务")?
@@ -553,6 +568,7 @@ impl HallApplicationPort for ApplicationRuntime {
 
     fn toggle_microphone(&mut self) -> Result<()> {
         let outcome = self
+            .ui
             .hall_ui
             .submit_microphone(ToggleMicrophone)
             .context("提交麦克风切换 UI 事务")?
@@ -568,7 +584,11 @@ impl HallApplicationPort for ApplicationRuntime {
     }
 
     fn hall_remaining_minutes(&mut self) -> Result<Option<u32>> {
-        Ok(self.business.hall_state_snapshot()?.remaining_minutes_now())
+        Ok(self
+            .business
+            .business
+            .hall_state_snapshot()?
+            .remaining_minutes_now())
     }
 }
 
@@ -603,11 +623,19 @@ impl HallMaintenancePort for ApplicationRuntime {
     }
 
     fn hall_expiring_warning_sent(&mut self) -> Result<bool> {
-        Ok(self.business.hall_state_snapshot()?.expiring_warning_sent)
+        Ok(self
+            .business
+            .business
+            .hall_state_snapshot()?
+            .expiring_warning_sent)
     }
 
     fn hall_remaining_minutes(&mut self) -> Result<Option<u32>> {
-        Ok(self.business.hall_state_snapshot()?.remaining_minutes_now())
+        Ok(self
+            .business
+            .business
+            .hall_state_snapshot()?
+            .remaining_minutes_now())
     }
 
     fn reply(&mut self, message: &str) -> Result<()> {
@@ -616,6 +644,7 @@ impl HallMaintenancePort for ApplicationRuntime {
 
     fn mark_hall_expiring_warning_sent(&mut self) -> Result<()> {
         self.business
+            .business
             .patch_hall_state(HallStatePatch {
                 expiring_warning_sent: Some(true),
                 ..HallStatePatch::default()

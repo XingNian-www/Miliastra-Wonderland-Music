@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 
-use super::{ApplicationRuntime, PendingTask, PendingTaskExecution};
+use super::{FormalTaskExecutionContext, PendingTask, PendingTaskExecution};
 use crate::features::hall::HallRuntimeState;
 use crate::features::playback::{PlaybackRuntimeState, QueueItem};
 use crate::features::startup::StartupTask;
@@ -26,16 +26,18 @@ use crate::runtime::scheduler::{
     FormalTaskEnqueueOutcome, FormalTaskExecutionOutcome, FormalTaskSubmission, FormalTaskWork,
 };
 use crate::runtime::task_engine::{TaskEngineError, TaskEngineHandle};
+use crate::runtime::ui::UiCoordinator;
 
 const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+const DROP_SHUTDOWN_GRACE: Duration = Duration::from_millis(100);
 
-struct ApplicationExecutionState {
-    application: Mutex<Option<ApplicationRuntime>>,
+struct FormalTaskExecutionState {
+    context: Mutex<Option<FormalTaskExecutionContext>>,
 }
 
 #[derive(Clone)]
 pub(crate) struct FormalTaskExecutionHandle {
-    application: Weak<ApplicationExecutionState>,
+    context: Weak<FormalTaskExecutionState>,
 }
 
 impl FormalTaskExecutionHandle {
@@ -44,30 +46,29 @@ impl FormalTaskExecutionHandle {
         mut task: PendingTask,
         cancellation: FormalTaskCancellationToken,
     ) -> FormalTaskExecutionOutcome {
-        let Some(state) = self.application.upgrade() else {
+        let Some(state) = self.context.upgrade() else {
             return FormalTaskExecutionOutcome::Completed(Err(anyhow!("正式任务执行上下文已停止")));
         };
-        let mut application = match state.application.lock() {
-            Ok(application) => application,
+        let context = match state.context.lock() {
+            Ok(context) => context,
             Err(poisoned) => {
                 log::error!("正式任务执行上下文锁曾发生异常，继续使用已恢复状态");
                 poisoned.into_inner()
             }
         };
-        let Some(application) = application.as_mut() else {
+        let Some(context) = context.as_ref() else {
             return FormalTaskExecutionOutcome::Completed(Err(anyhow!(
                 "正式任务执行上下文尚未初始化"
             )));
         };
         if cancellation.is_requested() {
-            task.cancel(&application.business);
+            task.cancel(&context.business.business);
             return FormalTaskExecutionOutcome::Canceled(
                 "任务在开始执行前收到取消请求".to_string(),
             );
         }
         let label = task.label();
-        let result = match catch_unwind(AssertUnwindSafe(|| application.execute_pending_task(task)))
-        {
+        let result = match catch_unwind(AssertUnwindSafe(|| context.execute_pending_task(task))) {
             Ok(Ok(PendingTaskExecution::Completed)) => Ok(format!("{label}执行完成")),
             Ok(Err(error)) => Err(error),
             Err(_) => Err(anyhow!("待处理任务执行发生未捕获异常")),
@@ -77,21 +78,21 @@ impl FormalTaskExecutionHandle {
 
     fn execute_diagnostic(&self, request: WebToolRequest) -> Result<String> {
         let state = self
-            .application
+            .context
             .upgrade()
             .ok_or_else(|| anyhow!("应用执行上下文已停止"))?;
-        let mut application = match state.application.lock() {
-            Ok(application) => application,
+        let context = match state.context.lock() {
+            Ok(context) => context,
             Err(poisoned) => {
                 log::error!("应用执行上下文锁曾发生异常，继续使用已恢复状态");
                 poisoned.into_inner()
             }
         };
-        let application = application
-            .as_mut()
+        let context = context
+            .as_ref()
             .ok_or_else(|| anyhow!("应用执行上下文尚未初始化"))?;
         match catch_unwind(AssertUnwindSafe(|| {
-            application.execute_web_tool_request(request)
+            context.execute_web_tool_request(request)
         })) {
             Ok(result) => result,
             Err(_) => Err(anyhow!("Web 工具执行发生未捕获异常")),
@@ -266,7 +267,7 @@ impl FormalTaskShutdownReport {
 /// Queue order, task history and shared-lane state live in `TaskEngineHandle`.
 pub(crate) struct FormalTaskRuntime {
     client: FormalTaskClient,
-    application: Option<Arc<ApplicationExecutionState>>,
+    context: Option<Arc<FormalTaskExecutionState>>,
     task_engine: TaskEngineHandle,
     stop_requested: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
@@ -280,27 +281,29 @@ impl FormalTaskRuntime {
         running: Arc<AtomicBool>,
         paused: Arc<AtomicBool>,
         post_settle: Duration,
-        build_app: impl FnOnce(FormalTaskClient) -> ApplicationRuntime,
+        build_context: impl FnOnce(FormalTaskClient) -> FormalTaskExecutionContext,
     ) -> Result<Self> {
-        let application = Arc::new(ApplicationExecutionState {
-            application: Mutex::new(None),
+        let context = Arc::new(FormalTaskExecutionState {
+            context: Mutex::new(None),
         });
         let handle = FormalTaskExecutionHandle {
-            application: Arc::downgrade(&application),
+            context: Arc::downgrade(&context),
         };
         let client = FormalTaskClient::new(handle, business.clone(), task_engine.clone());
-        let app = build_app(client.clone());
-        *application
-            .application
+        let execution_context = build_context(client.clone());
+        let coordinator = execution_context.coordinator.clone();
+        *context
+            .context
             .lock()
-            .map_err(|_| anyhow!("初始化正式任务执行上下文失败"))? = Some(app);
+            .map_err(|_| anyhow!("初始化正式任务执行上下文失败"))? = Some(execution_context);
         Self::start_worker(
             task_engine,
             running,
             paused,
             post_settle,
             client,
-            Some(application),
+            Some(context),
+            Some(coordinator),
         )
     }
 
@@ -311,15 +314,24 @@ impl FormalTaskRuntime {
         running: Arc<AtomicBool>,
         paused: Arc<AtomicBool>,
         post_settle: Duration,
+        coordinator: Option<UiCoordinator>,
     ) -> Result<Self> {
         let client = FormalTaskClient::new(
             FormalTaskExecutionHandle {
-                application: Weak::new(),
+                context: Weak::new(),
             },
             business.clone(),
             task_engine.clone(),
         );
-        Self::start_worker(task_engine, running, paused, post_settle, client, None)
+        Self::start_worker(
+            task_engine,
+            running,
+            paused,
+            post_settle,
+            client,
+            None,
+            coordinator,
+        )
     }
 
     fn start_worker(
@@ -328,7 +340,8 @@ impl FormalTaskRuntime {
         paused: Arc<AtomicBool>,
         post_settle: Duration,
         client: FormalTaskClient,
-        application: Option<Arc<ApplicationExecutionState>>,
+        context: Option<Arc<FormalTaskExecutionState>>,
+        coordinator: Option<UiCoordinator>,
     ) -> Result<Self> {
         let stop_requested = Arc::new(AtomicBool::new(false));
         let worker_engine = task_engine.clone();
@@ -338,9 +351,14 @@ impl FormalTaskRuntime {
             .name("formal-task-runtime".to_string())
             .spawn(move || {
                 log::info!("正式任务运行时已启动");
-                if let Err(error) =
-                    run_task_loop(worker_engine, running, paused, worker_stop, post_settle)
-                {
+                if let Err(error) = run_task_loop(
+                    worker_engine,
+                    running,
+                    paused,
+                    worker_stop,
+                    post_settle,
+                    coordinator,
+                ) {
                     log::error!("正式任务运行时异常退出: {error:#}");
                 }
                 let _ = finished_sender.send(());
@@ -348,7 +366,7 @@ impl FormalTaskRuntime {
             .map_err(|error| anyhow!("启动正式任务运行时失败: {error}"))?;
         Ok(Self {
             client,
-            application,
+            context,
             task_engine,
             stop_requested,
             worker: Some(worker),
@@ -397,8 +415,8 @@ impl FormalTaskRuntime {
                 true
             }
         };
-        self.application.take();
         prepare_result?;
+        self.context.take();
         Ok(FormalTaskShutdownReport {
             timed_out,
             active_task_id,
@@ -408,7 +426,7 @@ impl FormalTaskRuntime {
 
 impl Drop for FormalTaskRuntime {
     fn drop(&mut self) {
-        if let Err(error) = self.stop(Duration::ZERO) {
+        if let Err(error) = self.stop(DROP_SHUTDOWN_GRACE) {
             log::error!("正式任务运行时关闭失败: {error:#}");
         }
     }
@@ -420,6 +438,7 @@ fn run_task_loop(
     paused: Arc<AtomicBool>,
     stop_requested: Arc<AtomicBool>,
     post_settle: Duration,
+    coordinator: Option<UiCoordinator>,
 ) -> Result<()> {
     let mut generation = task_engine.generation()?;
     while running.load(AtomicOrdering::SeqCst) && !stop_requested.load(AtomicOrdering::SeqCst) {
@@ -429,6 +448,7 @@ fn run_task_loop(
             if paused.load(AtomicOrdering::SeqCst) {
                 task_engine.restore_formal(task)?;
             } else {
+                let _ui_lease = coordinator.as_ref().map(UiCoordinator::acquire_formal);
                 let succeeded = execute_formal_task(&task_engine, task)?;
                 generation = task_engine.generation()?;
                 if succeeded {
@@ -688,6 +708,7 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
             Arc::new(AtomicBool::new(false)),
             Duration::ZERO,
+            None,
         )
         .expect("formal task runtime");
         let (executed, execution) = mpsc::channel();
@@ -712,6 +733,49 @@ mod tests {
     }
 
     #[test]
+    fn formal_task_ui_lease_covers_post_settle() {
+        let (business_runtime, task_engine) = business_runtime();
+        let business = business_runtime.handle();
+        let coordinator = UiCoordinator::new();
+        let task_runtime = FormalTaskRuntime::start_without_application(
+            business.clone(),
+            task_engine.clone(),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+            Duration::from_millis(150),
+            Some(coordinator.clone()),
+        )
+        .expect("formal task runtime");
+        let (executed, execution) = mpsc::channel();
+
+        task_engine
+            .enqueue_formal(FormalTaskSubmission::new(
+                "settle lease",
+                None,
+                false,
+                Box::new(NotifyWork(executed)),
+            ))
+            .expect("enqueue formal task");
+        execution
+            .recv_timeout(Duration::from_secs(1))
+            .expect("formal task execution");
+
+        assert!(!coordinator.scan_may_run());
+        thread::sleep(Duration::from_millis(50));
+        assert!(!coordinator.scan_may_run());
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !coordinator.scan_may_run() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(coordinator.scan_may_run());
+
+        task_runtime
+            .shutdown()
+            .expect("formal task runtime shutdown");
+        business_runtime.shutdown().expect("business shutdown");
+    }
+
+    #[test]
     fn formal_task_runtime_requests_cancellation_from_the_running_task_on_shutdown() {
         let (business_runtime, task_engine) = business_runtime();
         let business = business_runtime.handle();
@@ -721,6 +785,7 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
             Arc::new(AtomicBool::new(false)),
             Duration::ZERO,
+            None,
         )
         .expect("formal task runtime");
         let (started, start) = mpsc::channel();
@@ -758,6 +823,7 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
             Arc::new(AtomicBool::new(false)),
             Duration::ZERO,
+            None,
         )
         .expect("formal task runtime");
         let (started, start) = mpsc::channel();

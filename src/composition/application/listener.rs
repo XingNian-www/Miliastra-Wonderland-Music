@@ -82,8 +82,8 @@ impl ApplicationRuntime {
         &self,
         reason: &str,
     ) -> Result<bool> {
-        let cleared = self.business.clear_hall_countdown_cache()?;
-        let visual_session = self.chat_observations.begin_visual_session()?;
+        let cleared = self.business.business.clear_hall_countdown_cache()?;
+        let visual_session = self.ui.chat_observations.begin_visual_session()?;
         if cleared {
             log::info!("{reason}，已清理大厅倒计时缓存，等待本次大厅检测重新确认");
         }
@@ -97,88 +97,101 @@ impl ApplicationRuntime {
         templates: &ResolvedTemplateArgs,
     ) -> Result<Vec<ChatMessage>> {
         scan_chat_with_shared_ocr(
-            &self.ocr,
-            &self.monitor,
-            self.config.screen.chat_rect.into(),
+            &self.ui.ocr,
+            &self.lifecycle.monitor,
+            self.lifecycle.config.screen.chat_rect.into(),
             image,
             templates,
         )
     }
 
     pub(super) fn warn_if_screen_size_mismatch(&self) -> Result<()> {
-        let frame = match self.game_ui.capture() {
+        let frame = match self.ui.game_ui.capture() {
             Ok(frame) => frame,
             Err(error) => {
                 log::warn!("启动时未能截图，扫描循环将等待目标窗口恢复: {error:#}");
                 return Ok(());
             }
         };
-        if self.config.screen.warn_on_size_mismatch
-            && (frame.width() != self.config.screen.expected_width
-                || frame.height() != self.config.screen.expected_height)
+        if self.lifecycle.config.screen.warn_on_size_mismatch
+            && (frame.width() != self.lifecycle.config.screen.expected_width
+                || frame.height() != self.lifecycle.config.screen.expected_height)
         {
             log::warn!(
                 "截图尺寸为 {}x{}，预期 {}x{}，程序继续运行",
                 frame.width(),
                 frame.height(),
-                self.config.screen.expected_width,
-                self.config.screen.expected_height
+                self.lifecycle.config.screen.expected_width,
+                self.lifecycle.config.screen.expected_height
             );
         }
         Ok(())
     }
 
     pub(super) fn start_http_server(&mut self) -> Result<()> {
-        if !self.config.http.enabled {
+        if !self.lifecycle.config.http.enabled {
             return Ok(());
         }
-        if self.http_server.is_some() {
+        if self.lifecycle.http_server.is_some() {
             return Err(anyhow!("HTTP/Web 面板已经启动"));
         }
         let player_runtime = self
+            .playback
             .player_runtime
             .as_ref()
             .ok_or_else(|| anyhow!("播放器运行时尚未启动"))?
             .handle();
         let formal_tasks = Arc::new(
-            self.formal_tasks
+            self.business
+                .formal_tasks
                 .clone()
                 .ok_or_else(|| anyhow!("正式任务执行运行时尚未启动"))?,
         );
         let server = http::start(http::HttpSharedState::new(
             http::HttpInterfaceConfig::new(
-                self.config.http.clone(),
-                self.config.screen.clone(),
-                self.config.templates.clone(),
-                self.config.moderation.clone(),
-                self.config.startup.clone(),
-                self.config.invite.clone(),
-                self.config.timing.clone(),
-                self.config.custom_workflows.clone(),
+                self.lifecycle.config.http.clone(),
+                self.lifecycle.config.screen.clone(),
+                self.lifecycle.config.templates.clone(),
+                self.lifecycle.config.moderation.clone(),
+                self.lifecycle.config.startup.clone(),
+                self.lifecycle.config.invite.clone(),
+                self.lifecycle.config.timing.clone(),
+                self.lifecycle.config.custom_workflows.clone(),
             ),
-            self.custom_workflow.clone(),
-            formal_tasks.clone(),
-            formal_tasks,
-            self.monitor.clone(),
-            Arc::new(HttpHallDetector {
-                hall_ui: self.hall_ui.clone(),
-            }),
-            self.latest_frame.clone(),
-            self.player_search.clone(),
-            player_runtime,
-            self.login_helper.clone(),
-            self.ai.clone(),
+            self.lifecycle.monitor.clone(),
+            self.ui.latest_frame.clone(),
+            http::HttpApplicationPorts::new(
+                Arc::new(http_facade::ApplicationHttpCommandFacade::new(
+                    formal_tasks.clone(),
+                    self.business.custom_workflow.clone(),
+                )),
+                formal_tasks.clone(),
+                formal_tasks,
+                Arc::new(HttpHallDetector {
+                    hall_ui: self.ui.hall_ui.clone(),
+                }),
+                Arc::new(http_facade::ApplicationHttpPlayerFacade::new(
+                    PlayerRuntimeBackend::new(player_runtime),
+                    self.playback.player_search.clone(),
+                )),
+                Arc::new(http_facade::ApplicationHttpLoginFacade::new(
+                    self.playback.login_helper.clone(),
+                )),
+                Arc::new(http_facade::ApplicationHttpAiFacade::new(
+                    self.business.ai.clone(),
+                )),
+            ),
         ))?;
-        self.http_server = Some(server);
+        self.lifecycle.http_server = Some(server);
         Ok(())
     }
 
     pub(super) fn start_hotkeys(&self) -> Result<hotkeys::HotkeyRuntime> {
-        let task_engine = self.task_engine.clone();
+        let task_engine = self.business.task_engine.clone();
         hotkeys::start(
-            &self.config.hotkeys,
-            Arc::clone(&self.running),
-            Arc::clone(&self.paused),
+            &self.lifecycle.config.hotkeys,
+            Arc::clone(&self.lifecycle.running),
+            Arc::clone(&self.lifecycle.paused),
             Arc::new(move || {
                 if let Err(error) = task_engine.wake() {
                     log::debug!("热键切换暂停状态后唤醒任务引擎失败: {error}");
@@ -189,6 +202,7 @@ impl ApplicationRuntime {
 
     pub(super) fn run_scan_loop(&mut self) -> Result<()> {
         let mut completion_subscriber = self
+            .ui
             .chat_observations
             .subscribe_completion_advances()
             .context("订阅聊天观察完成推进")?;
@@ -209,27 +223,28 @@ impl ApplicationRuntime {
         &mut self,
         completion_subscriber: &mut CompletionAdvanceSubscriber,
     ) -> Result<()> {
-        let template_args = self.chat_templates.clone();
+        let template_args = self.ui.chat_templates.clone();
         let canvas = Canvas {
-            width: self.config.screen.expected_width,
-            height: self.config.screen.expected_height,
+            width: self.lifecycle.config.screen.expected_width,
+            height: self.lifecycle.config.screen.expected_height,
             resize: true,
         };
         let ui_handle = self
+            .ui
             .ui_runtime
             .as_ref()
             .context("UI runtime 在扫描循环启动前已停止")?
             .handle();
         let frame_demand = FrameDemand::new(Duration::from_millis(
-            self.config.timing.loop_idle_ms.max(1),
+            self.lifecycle.config.timing.loop_idle_ms.max(1),
         ))
         .context("创建聊天观察帧需求")?;
         let mut frame_subscription: Option<FrameDemandSubscription> = None;
         let mut last_fingerprint: Option<ChangeFingerprint> = None;
-        let mut last_ocr_at =
-            Instant::now() - Duration::from_millis(self.config.timing.chat_scan.fallback_ms);
-        let mut last_change_ocr_at =
-            Instant::now() - Duration::from_millis(self.config.timing.chat_scan.change_cooldown_ms);
+        let mut last_ocr_at = Instant::now()
+            - Duration::from_millis(self.lifecycle.config.timing.chat_scan.fallback_ms);
+        let mut last_change_ocr_at = Instant::now()
+            - Duration::from_millis(self.lifecycle.config.timing.chat_scan.change_cooldown_ms);
         let mut suppress_change_until = Instant::now();
         let mut force_scan_after: Option<Instant> = None;
         let mut force_scan_reason: Option<&'static str> = None;
@@ -243,19 +258,43 @@ impl ApplicationRuntime {
         let mut target_missing = false;
 
         log::info!("自动化扫描已启动");
-        while self.running.load(AtomicOrdering::SeqCst) {
+        while self.lifecycle.running.load(AtomicOrdering::SeqCst) {
             self.forward_completion_advances(completion_subscriber)?;
             let loop_started = Instant::now();
             self.update_monitor_operational_state();
             self.tick_entertainment();
-            if self.paused.load(AtomicOrdering::SeqCst) {
+            if !self.ui.coordinator.scan_may_run() {
+                if let Some(subscription) = frame_subscription.take()
+                    && let Err(error) = subscription.cancel()
+                {
+                    log::warn!("正式任务占用 UI 时撤销观察帧需求失败: {error}");
+                }
+                self.invalidate_latest_frame();
+                primary_visible = false;
+                last_fingerprint = None;
+                force_scan_after = None;
+                force_scan_reason = None;
+                secondary_friend_bubble_fingerprint = None;
+                secondary_hall_bubble_sequence = None;
+                secondary_hall_command_tracker.reset();
+                secondary_title_fingerprint = None;
+                secondary_identity = None;
+                self.maybe_idle_exit()?;
+                sleep(Duration::from_millis(
+                    self.lifecycle.config.timing.loop_idle_ms,
+                ));
+                continue;
+            }
+            if self.lifecycle.paused.load(AtomicOrdering::SeqCst) {
                 if let Some(subscription) = frame_subscription.take()
                     && let Err(error) = subscription.cancel()
                 {
                     log::warn!("暂停监听时撤销观察帧需求失败: {error}");
                 }
                 self.maybe_idle_exit()?;
-                sleep(Duration::from_millis(self.config.timing.loop_idle_ms));
+                sleep(Duration::from_millis(
+                    self.lifecycle.config.timing.loop_idle_ms,
+                ));
                 continue;
             }
 
@@ -275,7 +314,7 @@ impl ApplicationRuntime {
                 &canvas,
             ) {
                 Ok(frame) => {
-                    if let Ok(mut latest_frame) = self.latest_frame.lock() {
+                    if let Ok(mut latest_frame) = self.ui.latest_frame.lock() {
                         latest_frame.store(Arc::clone(&frame.image));
                     } else {
                         log::error!("主扫描画面缓存锁已损坏");
@@ -307,15 +346,17 @@ impl ApplicationRuntime {
                         };
                     match &ui_state_result {
                         Ok((ui_state, _)) => self
+                            .lifecycle
                             .monitor
                             .publish(MonitorEvent::UiState(ui_state.clone())),
                         Err(_) => self
+                            .lifecycle
                             .monitor
                             .publish(MonitorEvent::UiState("界面检测失败".to_string())),
                     }
                     let ui_ms = elapsed_ms(ui_started);
-                    let listener_snapshot = self.business.chat_listener_snapshot()?;
-                    let command_executing = self.task_engine.snapshot()?.is_busy();
+                    let listener_snapshot = self.business.business.chat_listener_snapshot()?;
+                    let command_executing = self.business.task_engine.snapshot()?.is_busy();
                     match ui_state_result {
                         Ok((ui_state, None)) => {
                             log::debug!("界面仍在过渡，暂停聊天扫描: {}", ui_state);
@@ -354,7 +395,9 @@ impl ApplicationRuntime {
                                     "二级监听当前不在二级聊天界面: {}，回退一级监听",
                                     ui_state
                                 );
-                                self.business.fail_chat_listener_mode_to_primary()?;
+                                self.business
+                                    .business
+                                    .fail_chat_listener_mode_to_primary()?;
                                 secondary_friend_bubble_fingerprint = None;
                                 secondary_hall_bubble_sequence = None;
                                 secondary_hall_command_tracker.reset();
@@ -385,7 +428,7 @@ impl ApplicationRuntime {
                             primary_visible = true;
                             let fingerprint = match rect_chat_change_fingerprint(
                                 &frame.image,
-                                self.config.screen.chat_rect.into(),
+                                self.lifecycle.config.screen.chat_rect.into(),
                             ) {
                                 Ok(fingerprint) => Some(fingerprint),
                                 Err(error) => {
@@ -398,7 +441,7 @@ impl ApplicationRuntime {
                                 last_fingerprint = Some(fingerprint);
                                 let scan_after = now
                                     + Duration::from_millis(
-                                        self.config.timing.chat_scan.change_debounce_ms,
+                                        self.lifecycle.config.timing.chat_scan.change_debounce_ms,
                                     );
                                 if force_scan_after.is_none_or(|time| scan_after < time) {
                                     force_scan_after = Some(scan_after);
@@ -406,14 +449,14 @@ impl ApplicationRuntime {
                                 }
                                 log::info!(target: "timing",
                                     "进入一级界面，已建立聊天区对比基线，快速扫描延迟={}ms",
-                                    self.config.timing.chat_scan.change_debounce_ms
+                                    self.lifecycle.config.timing.chat_scan.change_debounce_ms
                                 );
                             }
                             let change_suppressed = now < suppress_change_until;
                             let forced_scan_due = force_scan_after.is_some_and(|time| now >= time);
                             let cooldown_until = last_change_ocr_at
                                 + Duration::from_millis(
-                                    self.config.timing.chat_scan.change_cooldown_ms,
+                                    self.lifecycle.config.timing.chat_scan.change_cooldown_ms,
                                 );
                             let change_stats = fingerprint.as_ref().and_then(|current| {
                                 last_fingerprint
@@ -421,8 +464,10 @@ impl ApplicationRuntime {
                                     .map(|previous| change_stats(previous, current))
                             });
                             let change_over_threshold = change_stats.is_some_and(|stats| {
-                                stats.mean_abs_diff >= self.config.ocr.change_mean_threshold
-                                    || stats.changed_ratio >= self.config.ocr.change_pixel_threshold
+                                stats.mean_abs_diff
+                                    >= self.lifecycle.config.ocr.change_mean_threshold
+                                    || stats.changed_ratio
+                                        >= self.lifecycle.config.ocr.change_pixel_threshold
                             });
                             let change_ready = !change_suppressed && now >= cooldown_until;
                             let mut keep_previous_fingerprint = false;
@@ -442,7 +487,7 @@ impl ApplicationRuntime {
                                 && (forced_scan_due
                                     || now.duration_since(last_ocr_at)
                                         >= Duration::from_millis(
-                                            self.config.timing.chat_scan.fallback_ms,
+                                            self.lifecycle.config.timing.chat_scan.fallback_ms,
                                         ));
                             let change_due = change_over_threshold && change_ready;
 
@@ -453,10 +498,10 @@ impl ApplicationRuntime {
                                     "触发聊天扫描: reason=change mean={:.3} ratio={:.5} debounce={}ms",
                                     stats.mean_abs_diff,
                                     stats.changed_ratio,
-                                    self.config.timing.chat_scan.change_debounce_ms
+                                    self.lifecycle.config.timing.chat_scan.change_debounce_ms
                                 );
                                 sleep(Duration::from_millis(
-                                    self.config.timing.chat_scan.change_debounce_ms,
+                                    self.lifecycle.config.timing.chat_scan.change_debounce_ms,
                                 ));
                                 let rescan_frame_started = Instant::now();
                                 match receive_observation_frame(
@@ -469,6 +514,7 @@ impl ApplicationRuntime {
                                         let rescan_frame_ms = elapsed_ms(rescan_frame_started);
                                         let scan_started = Instant::now();
                                         let observation_frame = self
+                                            .ui
                                             .chat_observations
                                             .begin_frame(frame.captured_at)?;
                                         let messages = self.scan_chat_with_shared_ocr(
@@ -488,8 +534,10 @@ impl ApplicationRuntime {
                                             )?,
                                             Err(error) => {
                                                 log::error!("聊天扫描失败: {error:#}");
-                                                if let Err(record_error) =
-                                                    self.chat_observations.record_terminal_failure(
+                                                if let Err(record_error) = self
+                                                    .ui
+                                                    .chat_observations
+                                                    .record_terminal_failure(
                                                         observation_frame,
                                                         format!("{error:#}"),
                                                     )
@@ -506,7 +554,7 @@ impl ApplicationRuntime {
                                         force_scan_reason = None;
                                         last_fingerprint = rect_chat_change_fingerprint(
                                             &frame.image,
-                                            self.config.screen.chat_rect.into(),
+                                            self.lifecycle.config.screen.chat_rect.into(),
                                         )
                                         .ok();
                                         scanned_this_round = true;
@@ -525,7 +573,7 @@ impl ApplicationRuntime {
                                     now.duration_since(last_ocr_at).as_millis()
                                 );
                                 let observation_frame =
-                                    self.chat_observations.begin_frame(frame.captured_at)?;
+                                    self.ui.chat_observations.begin_frame(frame.captured_at)?;
                                 let messages =
                                     self.scan_chat_with_shared_ocr(&frame.image, &template_args);
                                 match messages {
@@ -536,7 +584,7 @@ impl ApplicationRuntime {
                                     Err(error) => {
                                         log::error!("聊天扫描失败: {error:#}");
                                         if let Err(record_error) =
-                                            self.chat_observations.record_terminal_failure(
+                                            self.ui.chat_observations.record_terminal_failure(
                                                 observation_frame,
                                                 format!("{error:#}"),
                                             )
@@ -631,7 +679,8 @@ impl ApplicationRuntime {
                     if !target_missing {
                         self.abort_entertainment_for_context_loss("目标游戏窗口已关闭或不可用");
                     }
-                    self.monitor
+                    self.lifecycle
+                        .monitor
                         .publish(MonitorEvent::UiState("目标窗口不可用".to_string()));
                     primary_visible = false;
                     last_fingerprint = None;
@@ -641,7 +690,7 @@ impl ApplicationRuntime {
                     secondary_title_fingerprint = None;
                     secondary_identity = None;
                     let observed_window_detection_generation =
-                        self.window_detection_signal.generation()?;
+                        self.ui.window_detection_signal.generation()?;
                     log::warn!(
                         "截图失败，{}秒后重试: {error:#}",
                         target_missing_backoff.as_secs()
@@ -654,7 +703,7 @@ impl ApplicationRuntime {
                     );
                     target_missing = true;
                     self.maybe_idle_exit()?;
-                    if self.window_detection_signal.wait_for_change(
+                    if self.ui.window_detection_signal.wait_for_change(
                         observed_window_detection_generation,
                         target_missing_backoff,
                     )? {
@@ -669,7 +718,7 @@ impl ApplicationRuntime {
             }
             if primary_visible && self.maybe_warn_hall_expiring()? {
                 suppress_change_until = Instant::now()
-                    + Duration::from_millis(self.config.timing.command.post_settle_ms);
+                    + Duration::from_millis(self.lifecycle.config.timing.command.post_settle_ms);
                 force_scan_after = Some(suppress_change_until);
                 force_scan_reason = Some("hall-expiring");
                 last_fingerprint = None;
@@ -677,7 +726,9 @@ impl ApplicationRuntime {
             }
             self.forward_completion_advances(completion_subscriber)?;
             self.maybe_idle_exit()?;
-            sleep(Duration::from_millis(self.config.timing.loop_idle_ms));
+            sleep(Duration::from_millis(
+                self.lifecycle.config.timing.loop_idle_ms,
+            ));
         }
 
         if let Some(subscription) = frame_subscription
@@ -694,14 +745,20 @@ impl ApplicationRuntime {
         subscriber: &mut CompletionAdvanceSubscriber,
     ) -> Result<()> {
         loop {
-            match self.chat_observations.read_completion_advance(subscriber)? {
+            match self
+                .ui
+                .chat_observations
+                .read_completion_advance(subscriber)?
+            {
                 Some(ObservationRead::Item { value, .. }) => self
+                    .business
                     .business_events
                     .submit(BusinessEvent::CompletionAdvance(Arc::unwrap_or_clone(
                         value,
                     )))
                     .context("向业务运行时提交观察完成推进")?,
                 Some(ObservationRead::Gap(gap)) => self
+                    .business
                     .business_events
                     .submit(BusinessEvent::CompletionGap(gap))
                     .context("向业务运行时提交观察完成流缺口")?,
@@ -715,7 +772,7 @@ impl ApplicationRuntime {
         frame: ObservedFrame,
         messages: Vec<ChatMessage>,
     ) -> Result<()> {
-        let dispatches = self.chat_observations.publish_primary(frame, messages)?;
+        let dispatches = self.ui.chat_observations.publish_primary(frame, messages)?;
         self.dispatch_chat_observations(dispatches)?;
         Ok(())
     }
@@ -736,7 +793,8 @@ impl ApplicationRuntime {
                         self.process_secondary_chat_observation(frame, observation)?;
                 }
                 ChatObservationDispatch::Gap(gap) => {
-                    self.chat_baseline_primed
+                    self.ui
+                        .chat_baseline_primed
                         .store(false, AtomicOrdering::SeqCst);
                     log::warn!(
                         "聊天观察流出现缺口，下一屏仅重建命令基线: kind={:?} missing={:?}..={:?}",
@@ -762,9 +820,9 @@ impl ApplicationRuntime {
                 &observed.message
             })
             .collect::<Vec<_>>();
-        let active_entertainment = self.business.active_entertainment()?;
-        let command_router = ChatCommandRouter::new(&self.custom_workflow);
-        let visible_turtle_questions = if self.business.turtle_soup_accepts_questions()? {
+        let active_entertainment = self.business.business.active_entertainment()?;
+        let command_router = ChatCommandRouter::new(&self.business.custom_workflow);
+        let visible_turtle_questions = if self.business.business.turtle_soup_accepts_questions()? {
             messages
                 .iter()
                 .enumerate()
@@ -787,14 +845,18 @@ impl ApplicationRuntime {
         } else {
             Vec::new()
         };
-        let suppress_new_turtle_questions = !self.chat_baseline_primed.load(AtomicOrdering::SeqCst);
-        let new_turtle_questions = self.business.filter_turtle_soup_primary_questions(
-            visible_turtle_questions
-                .iter()
-                .map(|(_, question)| question.clone())
-                .collect(),
-            suppress_new_turtle_questions,
-        )?;
+        let suppress_new_turtle_questions =
+            !self.ui.chat_baseline_primed.load(AtomicOrdering::SeqCst);
+        let new_turtle_questions = self
+            .business
+            .business
+            .filter_turtle_soup_primary_questions(
+                visible_turtle_questions
+                    .iter()
+                    .map(|(_, question)| question.clone())
+                    .collect(),
+                suppress_new_turtle_questions,
+            )?;
         if messages.is_empty() {
             log::debug!("没有找到聊天标志，本轮不更新命令锁");
             return Ok(());
@@ -826,15 +888,19 @@ impl ApplicationRuntime {
             };
             if !self.commands_enabled()? && message.message_type != "pink" {
                 log::info!("命令识别已禁用，跳过: {}", parsed_command.raw);
-                self.chat_observations.acknowledge_primary(&observed.id)?;
+                self.ui
+                    .chat_observations
+                    .acknowledge_primary(&observed.id)?;
                 continue;
             }
             if let ModuleCommand::Invite(invite) = &parsed_command.command
-                && !self.business.invite_should_accept(invite.seq)?
+                && !self.business.business.invite_should_accept(invite.seq)?
             {
                 let seq = invite.seq.expect("unsequenced invites are always accepted");
                 log::info!("邀请参数 {} 已执行过，跳过: {}", seq, parsed_command.raw);
-                self.chat_observations.acknowledge_primary(&observed.id)?;
+                self.ui
+                    .chat_observations
+                    .acknowledge_primary(&observed.id)?;
                 continue;
             }
             log::debug!("解析命令: {}", parsed_command.raw);
@@ -848,7 +914,11 @@ impl ApplicationRuntime {
                 routed,
             })
             .collect::<Vec<_>>();
-        if !self.chat_baseline_primed.swap(true, AtomicOrdering::SeqCst) {
+        if !self
+            .ui
+            .chat_baseline_primed
+            .swap(true, AtomicOrdering::SeqCst)
+        {
             for question in new_turtle_questions {
                 log::info!(
                     "启动屏幕锁已记录当前可见海龟汤提问，不执行: nickname={}",
@@ -914,7 +984,7 @@ impl ApplicationRuntime {
         let Some(message_id) = command.observation.message_id.as_ref() else {
             return Ok(());
         };
-        if !self.chat_observations.acknowledge_primary(message_id)? {
+        if !self.ui.chat_observations.acknowledge_primary(message_id)? {
             log::debug!("一级命令完成处理时消息已滚出当前画面: id={message_id:?}");
         }
         Ok(())
@@ -929,17 +999,19 @@ impl ApplicationRuntime {
         };
         match command {
             ChatListenerModeCommand::Status => {
-                let snapshot = self.business.chat_listener_snapshot()?;
+                let snapshot = self.business.business.chat_listener_snapshot()?;
                 let pending = snapshot
                     .pending_mode
                     .map(|mode| format!("，等待切换{}", mode.label()))
                     .unwrap_or_default();
                 let message = format!("监听模式状态: {}{}", snapshot.mode.label(), pending);
                 log::info!("{}", message);
-                self.monitor.publish(MonitorEvent::Command(format!(
-                    "{} -> {}",
-                    parsed.user_command, message
-                )));
+                self.lifecycle
+                    .monitor
+                    .publish(MonitorEvent::Command(format!(
+                        "{} -> {}",
+                        parsed.user_command, message
+                    )));
             }
             ChatListenerModeCommand::Primary | ChatListenerModeCommand::Secondary => {
                 let target = match command {
@@ -947,8 +1019,8 @@ impl ApplicationRuntime {
                     ChatListenerModeCommand::Secondary => ChatListenerMode::Secondary,
                     ChatListenerModeCommand::Status => unreachable!(),
                 };
-                if !self.business.request_chat_listener_mode(target)? {
-                    let snapshot = self.business.chat_listener_snapshot()?;
+                if !self.business.business.request_chat_listener_mode(target)? {
+                    let snapshot = self.business.business.chat_listener_snapshot()?;
                     log::info!(
                         "监听模式切换已处于当前或等待状态，跳过: current={} pending={:?}",
                         snapshot.mode.label(),
@@ -960,7 +1032,9 @@ impl ApplicationRuntime {
                 if let Err(error) =
                     self.push_pending_task(PendingTask::SetChatListenerMode { target })
                 {
-                    self.business.cancel_chat_listener_mode_request(target)?;
+                    self.business
+                        .business
+                        .cancel_chat_listener_mode_request(target)?;
                     return Err(error);
                 }
                 log::info!("监听模式切换已加入待处理队列: {}", target.label());
@@ -983,20 +1057,20 @@ impl ApplicationRuntime {
     }
 
     pub(super) fn abort_entertainment_for_context_loss(&self, reason: &str) {
-        if let Err(error) = self.business.abort_turtle_soup(reason) {
+        if let Err(error) = self.business.business.abort_turtle_soup(reason) {
             log::error!("无法中止海龟汤会话: {error:#}");
         }
-        match self.undercover_game.abort() {
+        match self.business.undercover_game.abort() {
             Ok(true) => log::warn!("谁是卧底已因聊天上下文变化中止: {}", reason),
             Ok(false) => {}
             Err(error) => log::error!("无法中止旧谁是卧底牌局: {error:#}"),
         }
-        match self.card_games.abort() {
+        match self.business.card_games.abort() {
             Ok(true) => log::warn!("牌局已因聊天上下文变化中止: {}", reason),
             Ok(false) => {}
             Err(error) => log::error!("无法中止旧牌局: {error:#}"),
         }
-        match self.business.abort_idiom_chain() {
+        match self.business.business.abort_idiom_chain() {
             Ok(true) => log::warn!("成语接龙已因聊天上下文变化中止: {}", reason),
             Ok(false) => {}
             Err(error) => log::error!("无法中止旧成语接龙会话: {error:#}"),
@@ -1004,21 +1078,23 @@ impl ApplicationRuntime {
     }
 
     fn tick_entertainment(&self) {
-        let scheduler_idle = match self.task_engine.snapshot() {
+        let scheduler_idle = match self.business.task_engine.snapshot() {
             Ok(snapshot) => snapshot.is_idle(),
             Err(error) => {
                 log::error!("无法读取业务调度状态，娱乐计时保持暂停: {error}");
                 false
             }
         };
-        let clock_active = !self.paused.load(AtomicOrdering::SeqCst) && scheduler_idle;
+        let clock_active = !self.lifecycle.paused.load(AtomicOrdering::SeqCst) && scheduler_idle;
         if let Err(error) = self
+            .business
             .business
             .refresh_turtle_soup_deadline(Instant::now(), clock_active)
         {
             log::error!("无法同步海龟汤期限: {error:#}");
         }
         let card_game_outcome = match self
+            .business
             .card_games
             .poll_timed_outcome(Instant::now(), clock_active)
         {
@@ -1030,15 +1106,16 @@ impl ApplicationRuntime {
         };
         if let Some(outcome) = card_game_outcome {
             let key = outcome.key();
-            let effect = self.card_games.timed_effect(outcome);
+            let effect = self.business.card_games.timed_effect(outcome);
             if let Err(error) = self.push_pending_task(PendingTask::CardGameEffect(effect)) {
                 log::error!("牌局计时结果入队失败: {error:#}");
-                if let Err(cancel_error) = self.card_games.cancel_effect(key) {
+                if let Err(cancel_error) = self.business.card_games.cancel_effect(key) {
                     log::error!("牌局计时结果入队失败后无法清理牌局: {cancel_error:#}");
                 }
             }
         }
         let undercover_outcome = match self
+            .business
             .undercover_game
             .poll_timed_outcome(Instant::now(), clock_active)
         {
@@ -1050,10 +1127,10 @@ impl ApplicationRuntime {
         };
         if let Some(outcome) = undercover_outcome {
             let key = outcome.key();
-            let effect = self.undercover_game.timed_effect(outcome);
+            let effect = self.business.undercover_game.timed_effect(outcome);
             if let Err(error) = self.push_pending_task(PendingTask::UndercoverEffect(effect)) {
                 log::error!("谁是卧底计时消息入队失败: {error:#}");
-                if let Err(cancel_error) = self.undercover_game.cancel_effect(key) {
+                if let Err(cancel_error) = self.business.undercover_game.cancel_effect(key) {
                     log::error!("谁是卧底计时消息入队失败后无法清理牌局: {cancel_error:#}");
                 }
             }
@@ -1069,7 +1146,7 @@ impl ApplicationRuntime {
             return Ok(());
         }
         if let ModuleCommand::Invite(invite) = &parsed.command
-            && !self.business.invite_should_accept(invite.seq)?
+            && !self.business.business.invite_should_accept(invite.seq)?
         {
             let seq = invite.seq.expect("unsequenced invites are always accepted");
             log::info!("邀请参数 {} 已执行过，跳过: {}", seq, parsed.raw);
@@ -1109,7 +1186,7 @@ impl ApplicationRuntime {
         };
         let mut port = self.immediate_administration_port();
         Ok(matches!(
-            self.administration_application.apply_immediate(
+            self.business.administration_application.apply_immediate(
                 &context,
                 command,
                 propagate_log_error,
@@ -1137,12 +1214,14 @@ impl ApplicationRuntime {
             .establish_ui_residency(residency, ResidencyPurpose::ListenerModeSwitch)
             .is_ok()
         {
-            self.business.complete_chat_listener_mode(target)?;
+            self.business.business.complete_chat_listener_mode(target)?;
             log::info!("聊天监听模式已切换为{}", target.label());
             return Ok(());
         }
 
-        self.business.fail_chat_listener_mode_to_primary()?;
+        self.business
+            .business
+            .fail_chat_listener_mode_to_primary()?;
         let _ = self.establish_ui_residency(
             UiResidency::Primary,
             ResidencyPurpose::IndependentRecovery("监听切换失败回退一级"),

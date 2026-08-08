@@ -41,7 +41,7 @@ impl ApplicationRuntime {
             message_type: parsed.message_type.clone(),
             user_command: parsed.user_command.clone(),
         };
-        let service = self.custom_workflow.clone();
+        let service = self.business.custom_workflow.clone();
         service.execute(&invocation, self).map(|_| ())
     }
 
@@ -68,7 +68,7 @@ impl ApplicationRuntime {
                 parse_decision(text).is_some()
             })?;
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-        while self.running.load(AtomicOrdering::SeqCst) && Instant::now() < deadline {
+        while self.lifecycle.running.load(AtomicOrdering::SeqCst) && Instant::now() < deadline {
             sleep(Duration::from_millis(reader.poll_interval_ms(poll_ms)));
             let messages = match self.poll_chat_decision_reader(&mut reader) {
                 Ok(messages) => messages,
@@ -89,7 +89,7 @@ impl ApplicationRuntime {
                 }
             }
         }
-        if self.running.load(AtomicOrdering::SeqCst) {
+        if self.lifecycle.running.load(AtomicOrdering::SeqCst) {
             Ok(ChatDecisionWait::Timeout)
         } else {
             Ok(ChatDecisionWait::Stopped)
@@ -113,8 +113,8 @@ impl ApplicationRuntime {
     fn wait_for_invite_decision(&self) -> Result<Option<bool>> {
         match self.wait_for_chat_decision(
             "邀请确认",
-            self.config.timing.invite.confirm_timeout_ms,
-            self.config.timing.invite.confirm_poll_ms,
+            self.lifecycle.config.timing.invite.confirm_timeout_ms,
+            self.lifecycle.config.timing.invite.confirm_poll_ms,
             |message_type| message_type == "blue",
             parse_invite_decision,
         )? {
@@ -126,8 +126,9 @@ impl ApplicationRuntime {
     fn on_entered_new_hall(&self) -> Result<()> {
         log::info!("已进入新大厅，重置命令识别状态");
         self.abort_entertainment_for_context_loss("邀请流程已进入新大厅");
-        self.business.set_commands_enabled(true)?;
-        self.chat_baseline_primed
+        self.business.business.set_commands_enabled(true)?;
+        self.ui
+            .chat_baseline_primed
             .store(false, AtomicOrdering::SeqCst);
         self.clear_hall_countdown_cache_for_new_visual_session("已进入新大厅")?;
         Ok(())
@@ -197,7 +198,7 @@ impl ApplicationRuntime {
                 .collect(),
             residency,
         );
-        let operation = match self.friend_delivery_ui.submit(request.clone()) {
+        let operation = match self.ui.friend_delivery_ui.submit(request.clone()) {
             Ok(operation) => operation,
             Err(error) => {
                 return Ok(FriendBatchOutcome::Failed {
@@ -328,6 +329,7 @@ impl CustomWorkflowExecutionPort for ApplicationRuntime {
             return Err(anyhow!("custom action plan must not be empty"));
         }
         let outcome = self
+            .ui
             .custom_action_ui
             .submit(CustomActionPlan::new(workflow, operations))
             .map_err(|error| anyhow!("自定义动作计划未进入 UI runtime: {error}"))?
@@ -359,7 +361,7 @@ impl CustomWorkflowExecutionPort for ApplicationRuntime {
         match capability {
             WorkflowCapability::SendHall { message } => self.reply(&message),
             WorkflowCapability::SendCurrentChat { message } => {
-                self.chat_output.send_current_chat(&message)
+                self.ui.chat_output.send_current_chat(&message)
             }
             WorkflowCapability::SendFriendMessage { target, message } => {
                 if self.send_friend_message(&target, &message)? {
@@ -373,6 +375,7 @@ impl CustomWorkflowExecutionPort for ApplicationRuntime {
             }
             WorkflowCapability::InviteUser { target } => {
                 let InviteStart::Ready(execution) = self
+                    .business
                     .business
                     .begin_invite(InviteRequest::new(target, None, None))?
                 else {
@@ -416,6 +419,7 @@ impl InviteExecutionPort for ApplicationRuntime {
             super::UiResidency::SecondaryCurrentHall => UiResidencyTarget::SecondaryCurrentHall,
         };
         let outcome = self
+            .ui
             .invite_ui
             .submit(ExecuteInvite::new(
                 username,

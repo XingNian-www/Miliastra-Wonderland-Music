@@ -167,12 +167,13 @@ fn secondary_hall_command_observation(
         let command = command.trim();
         let (prefix, payload) = if let Some(payload) = command.strip_prefix('@') {
             ('@', payload)
-        } else if let Some(payload) = command.strip_prefix('#') {
-            ('#', payload)
-        } else if let Some(payload) = command.strip_prefix('＃') {
-            ('#', payload)
         } else {
-            return None;
+            (
+                '#',
+                command
+                    .strip_prefix('#')
+                    .or_else(|| command.strip_prefix('＃'))?,
+            )
         };
         format!("{prefix}:{}", command_identity(payload))
     } else {

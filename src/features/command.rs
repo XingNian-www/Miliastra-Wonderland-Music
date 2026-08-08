@@ -73,13 +73,13 @@ impl CommandEnvelope {
             .to_string();
         let (prefix, command_text) = if let Some(text) = user_command.strip_prefix('@') {
             (CommandPrefix::At, text)
-        } else if let Some(text) = user_command
-            .strip_prefix('#')
-            .or_else(|| user_command.strip_prefix('＃'))
-        {
-            (CommandPrefix::Hash, text)
         } else {
-            return None;
+            (
+                CommandPrefix::Hash,
+                user_command
+                    .strip_prefix('#')
+                    .or_else(|| user_command.strip_prefix('＃'))?,
+            )
         };
         let command_text = command_text.trim_start().to_string();
         if command_text.is_empty() {

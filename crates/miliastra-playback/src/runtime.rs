@@ -42,12 +42,14 @@ pub struct PlaybackHandle {
 pub struct PlaybackSnapshot {
     pub runtime_identity: String,
     pub generation: u64,
+    pub session_id: Option<Uuid>,
     pub state: EngineState,
     pub track: Option<PlayableTrack>,
     pub position_seconds: Option<f64>,
     pub duration_seconds: Option<f64>,
     pub volume: u8,
     pub last_end_cause: Option<EndCause>,
+    pub end_behavior: Option<EndBehavior>,
     pub failure: Option<Failure>,
 }
 
@@ -517,12 +519,14 @@ fn public_snapshot(
     PlaybackSnapshot {
         runtime_identity: snapshot.runtime_identity,
         generation: snapshot.generation,
+        session_id: snapshot.session_id,
         state: snapshot.state,
         track,
         position_seconds: snapshot.position_seconds,
         duration_seconds: snapshot.duration_seconds,
         volume: snapshot.volume,
         last_end_cause: snapshot.last_end_cause,
+        end_behavior: snapshot.end_behavior,
         failure: snapshot.failure,
     }
 }

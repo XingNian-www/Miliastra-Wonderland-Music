@@ -112,6 +112,36 @@ impl SearchCandidate {
             text,
         })
     }
+
+    pub fn playable_track(&self) -> PlayableTrack {
+        PlayableTrack {
+            track_ref: self.track_ref.clone(),
+            metadata: self.metadata.clone(),
+        }
+    }
+
+    pub fn select_preferred_equivalent(candidates: &[Self]) -> Option<Self> {
+        let first = candidates.first()?;
+        let identity = comparable_identity(&first.text);
+        candidates
+            .iter()
+            .filter(|candidate| comparable_identity(&candidate.text) == identity)
+            .max_by_key(|candidate| candidate.eligibility.preference_rank())
+            .cloned()
+    }
+}
+
+fn comparable_identity(text: &str) -> String {
+    text.trim()
+        .rsplit_once('[')
+        .map_or(
+            text,
+            |(prefix, suffix)| {
+                if suffix.ends_with(']') { prefix } else { text }
+            },
+        )
+        .trim()
+        .to_ascii_lowercase()
 }
 
 fn format_candidate_text(metadata: &TrackMetadata, provider: ProviderId) -> String {

@@ -45,10 +45,9 @@ pub(crate) fn run(config_path: &Path) -> Result<()> {
         app_config.http.enabled
     );
     log::info!(
-        "miliastra-playerd: {}:{} auto_start={}",
-        app_config.playerd.host,
-        app_config.playerd.port,
-        app_config.playerd.auto_start
+        "原生播放器: credentials={} helper={}",
+        app_config.playback.credential_directory.display(),
+        app_config.playback.login_helper_executable.display()
     );
 
     let mut app = ApplicationRuntime::new(config, monitor.clone())?;

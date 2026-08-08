@@ -600,7 +600,8 @@ impl ApplicationRuntime {
             playback_application: self.playback_application.clone(),
             player_search: self.player_search.clone(),
             player_runtime: None,
-            playerd_supervisor: None,
+            native_playback: self.native_playback.clone(),
+            native_playback_runtime: None,
             openai_runtime: None,
             ai: self.ai.clone(),
             song_requests: self.song_requests.clone(),
@@ -779,16 +780,16 @@ mod tests {
 
         assert!(!current_song_has_switched(
             &mut first_uri,
-            &status("fuo://song/1")
+            &status("miliastra://track/qqmusic/1")
         ));
-        assert_eq!(first_uri.as_deref(), Some("fuo://song/1"));
+        assert_eq!(first_uri.as_deref(), Some("miliastra://track/qqmusic/1"));
         assert!(!current_song_has_switched(
             &mut first_uri,
-            &status("fuo://song/1")
+            &status("miliastra://track/qqmusic/1")
         ));
         assert!(current_song_has_switched(
             &mut first_uri,
-            &status("fuo://song/2")
+            &status("miliastra://track/qqmusic/2")
         ));
     }
 }

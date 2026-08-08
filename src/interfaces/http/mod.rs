@@ -17,7 +17,7 @@ use axum::response::Response;
 use axum::routing::any;
 use image::codecs::jpeg::JpegEncoder;
 use image::{ColorType, DynamicImage};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 #[cfg(test)]
 use serde_json::Value;
 use serde_json::json;
@@ -27,6 +27,9 @@ use url::form_urlencoded;
 
 mod tools;
 
+use crate::adapters::login_helper::{
+    LoginHelperFailure, LoginHelperManager, LoginManagerStatus, ProviderView,
+};
 use crate::adapters::player::PlayerRuntimeBackend;
 #[cfg(test)]
 use crate::config::AppConfig;
@@ -70,7 +73,9 @@ use crate::runtime::scheduler::{
 };
 use crate::ui::frame::LatestFrameCache;
 use crate::ui::geometry::parse_rect;
+use miliastra_playback::{LoginSession, PlayableTrack, PlaybackError, PlaybackHandle, ProviderId};
 pub(crate) use tools::{WebToolRequest, WebToolTemplate};
+use uuid::Uuid;
 
 pub(crate) trait HttpTaskPort: Send + Sync {
     fn apply_mutation(&self, intent: BusinessMutationIntent) -> Result<BusinessMutationOutcome>;
@@ -128,6 +133,52 @@ pub(crate) trait HttpPlayerPort: Send + Sync {
         keyword: &str,
         source: &str,
     ) -> std::result::Result<Vec<SearchCandidate>, PlayerSearchClientError>;
+}
+
+trait HttpNativePlaybackPort: Send + Sync {
+    fn play_track(&self, track: PlayableTrack) -> Result<(), PlaybackError>;
+}
+
+impl HttpNativePlaybackPort for PlaybackHandle {
+    fn play_track(&self, track: PlayableTrack) -> Result<(), PlaybackError> {
+        PlaybackHandle::play(self, track)
+    }
+}
+
+trait HttpLoginPort: Send + Sync {
+    fn providers(&self) -> Result<Vec<ProviderView>, LoginHelperFailure>;
+    fn status(&self) -> LoginManagerStatus;
+    fn start(&self, provider: ProviderId) -> Result<LoginSession, LoginHelperFailure>;
+    fn cancel(&self, session_id: Uuid) -> Result<(), LoginHelperFailure>;
+    fn logout(
+        &self,
+        provider: ProviderId,
+    ) -> Result<miliastra_playback::CredentialStatus, LoginHelperFailure>;
+}
+
+impl HttpLoginPort for LoginHelperManager {
+    fn providers(&self) -> Result<Vec<ProviderView>, LoginHelperFailure> {
+        LoginHelperManager::providers(self)
+    }
+
+    fn status(&self) -> LoginManagerStatus {
+        LoginHelperManager::status(self)
+    }
+
+    fn start(&self, provider: ProviderId) -> Result<LoginSession, LoginHelperFailure> {
+        LoginHelperManager::start(self, provider)
+    }
+
+    fn cancel(&self, session_id: Uuid) -> Result<(), LoginHelperFailure> {
+        LoginHelperManager::cancel(self, session_id)
+    }
+
+    fn logout(
+        &self,
+        provider: ProviderId,
+    ) -> Result<miliastra_playback::CredentialStatus, LoginHelperFailure> {
+        LoginHelperManager::logout(self, provider)
+    }
 }
 
 pub(crate) trait HttpAiPort: Send + Sync {
@@ -200,10 +251,28 @@ struct BodyRouteSpec {
     handler: BodyRouteHandler,
 }
 
-const BODY_ROUTES: &[BodyRouteSpec] = &[BodyRouteSpec {
-    path: "/turtle-soup/questions",
-    handler: turtle_soup_questions_route,
-}];
+const BODY_ROUTES: &[BodyRouteSpec] = &[
+    BodyRouteSpec {
+        path: "/player/play-track",
+        handler: player_play_track_body_route,
+    },
+    BodyRouteSpec {
+        path: "/player/login/start",
+        handler: player_login_start_body_route,
+    },
+    BodyRouteSpec {
+        path: "/player/login/cancel",
+        handler: player_login_cancel_body_route,
+    },
+    BodyRouteSpec {
+        path: "/player/logout",
+        handler: player_logout_body_route,
+    },
+    BodyRouteSpec {
+        path: "/turtle-soup/questions",
+        handler: turtle_soup_questions_route,
+    },
+];
 
 const SPECIAL_ROUTES: &[&str] = &["/screenshot", "/hall-screenshot"];
 const ROUTES: &[RouteSpec] = &[
@@ -284,6 +353,18 @@ const ROUTES: &[RouteSpec] = &[
         json: true,
         mutating: false,
         handler: search_candidates_route,
+    },
+    RouteSpec {
+        path: "/player/providers",
+        json: true,
+        mutating: false,
+        handler: player_providers_route,
+    },
+    RouteSpec {
+        path: "/player/login/status",
+        json: true,
+        mutating: false,
+        handler: player_login_status_route,
     },
     RouteSpec {
         path: "/queue",
@@ -569,6 +650,8 @@ pub struct HttpSharedState {
     hall: Arc<dyn HttpHallPort>,
     latest_frame: Arc<Mutex<LatestFrameCache>>,
     player: Arc<dyn HttpPlayerPort>,
+    native_playback: Arc<dyn HttpNativePlaybackPort>,
+    login: Arc<dyn HttpLoginPort>,
     ai: Arc<dyn HttpAiPort>,
 }
 
@@ -652,6 +735,8 @@ impl HttpSharedState {
         latest_frame: Arc<Mutex<LatestFrameCache>>,
         player_search: PlayerSearchClient,
         player_runtime: PlayerRuntimeHandle,
+        native_playback: PlaybackHandle,
+        login: LoginHelperManager,
         ai: AiClient,
     ) -> Self {
         let player = Arc::new(RuntimeHttpPlayerPort {
@@ -667,6 +752,8 @@ impl HttpSharedState {
             hall,
             latest_frame,
             player,
+            Arc::new(native_playback),
+            Arc::new(login),
             Arc::new(ai),
         )
     }
@@ -681,6 +768,8 @@ impl HttpSharedState {
         hall: Arc<dyn HttpHallPort>,
         latest_frame: Arc<Mutex<LatestFrameCache>>,
         player: Arc<dyn HttpPlayerPort>,
+        native_playback: Arc<dyn HttpNativePlaybackPort>,
+        login: Arc<dyn HttpLoginPort>,
         ai: Arc<dyn HttpAiPort>,
     ) -> Self {
         Self {
@@ -694,6 +783,8 @@ impl HttpSharedState {
             hall,
             latest_frame,
             player,
+            native_playback,
+            login,
             ai,
         }
     }
@@ -1151,6 +1242,184 @@ fn search_candidates_route(
             .map_err(player_search_error)?,
     )
     .map_err(internal_error)
+}
+
+fn player_providers_route(
+    _query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    serde_json::to_string(&state.login.providers().map_err(login_http_error)?)
+        .map_err(internal_error)
+}
+
+fn player_login_status_route(
+    _query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    serde_json::to_string(&state.login.status()).map_err(internal_error)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LoginProviderRequest {
+    provider: ProviderId,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LoginCancelRequest {
+    session_id: Uuid,
+}
+
+fn player_play_track_body_route(
+    body: &[u8],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let track = parse_json_body::<PlayableTrack>(body, "结构化曲目")?;
+    validate_playable_track(&track)?;
+    let current_uri = track.track_ref.key.to_string();
+    state
+        .native_playback
+        .play_track(track.clone())
+        .map_err(playback_http_error)?;
+    Ok(json!({
+        "ok": true,
+        "played": true,
+        "currentUri": current_uri,
+        "track": track,
+    })
+    .to_string())
+}
+
+fn player_login_start_body_route(
+    body: &[u8],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let request = parse_json_body::<LoginProviderRequest>(body, "登录请求")?;
+    let session = state
+        .login
+        .start(request.provider)
+        .map_err(login_http_error)?;
+    Ok(json!({
+        "ok": true,
+        "sessionId": session.session_id,
+        "provider": session.provider,
+    })
+    .to_string())
+}
+
+fn player_login_cancel_body_route(
+    body: &[u8],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let request = parse_json_body::<LoginCancelRequest>(body, "取消登录请求")?;
+    state
+        .login
+        .cancel(request.session_id)
+        .map_err(login_http_error)?;
+    Ok(json!({ "ok": true, "sessionId": request.session_id }).to_string())
+}
+
+fn player_logout_body_route(
+    body: &[u8],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let request = parse_json_body::<LoginProviderRequest>(body, "退出登录请求")?;
+    let status = state
+        .login
+        .logout(request.provider)
+        .map_err(login_http_error)?;
+    serde_json::to_string(&json!({ "ok": true, "credential": status })).map_err(internal_error)
+}
+
+fn parse_json_body<T: DeserializeOwned>(
+    body: &[u8],
+    label: &str,
+) -> std::result::Result<T, AppError> {
+    if body.is_empty() {
+        return Err(bad_request(&format!("{label}不能为空")));
+    }
+    serde_json::from_slice(body).map_err(|error| bad_request(&format!("{label} JSON无效: {error}")))
+}
+
+fn validate_playable_track(track: &PlayableTrack) -> std::result::Result<(), AppError> {
+    const MAX_ID_BYTES: usize = 512;
+    const MAX_TEXT_BYTES: usize = 1024;
+    const MAX_ARTISTS: usize = 32;
+    const MAX_DURATION_MS: u64 = 24 * 60 * 60 * 1000;
+
+    let id = track.track_ref.key.id.as_str();
+    if id.trim().is_empty()
+        || id != id.trim()
+        || id.contains('/')
+        || id.len() > MAX_ID_BYTES
+        || id.chars().any(char::is_control)
+    {
+        return Err(bad_request("trackRef.key.id字段无效"));
+    }
+    validate_track_text(
+        &track.metadata.title,
+        "metadata.title",
+        true,
+        MAX_TEXT_BYTES,
+    )?;
+    if track.metadata.artists.len() > MAX_ARTISTS {
+        return Err(bad_request("metadata.artists数量过多"));
+    }
+    for artist in &track.metadata.artists {
+        validate_track_text(artist, "metadata.artists", true, MAX_TEXT_BYTES)?;
+    }
+    if let Some(album) = track.metadata.album.as_deref() {
+        validate_track_text(album, "metadata.album", false, MAX_TEXT_BYTES)?;
+    }
+    if track
+        .metadata
+        .duration_ms
+        .is_some_and(|duration| duration == 0 || duration > MAX_DURATION_MS)
+    {
+        return Err(bad_request("metadata.durationMs字段无效"));
+    }
+    if let Some(locator) = track.track_ref.resolver_locator.as_ref() {
+        validate_locator_identity(track.track_ref.key.provider, id, locator.as_str())?;
+    }
+    Ok(())
+}
+
+fn validate_track_text(
+    value: &str,
+    field: &str,
+    required: bool,
+    max_bytes: usize,
+) -> std::result::Result<(), AppError> {
+    if (required && value.trim().is_empty())
+        || value != value.trim()
+        || value.len() > max_bytes
+        || value.chars().any(char::is_control)
+    {
+        return Err(bad_request(&format!("{field}字段无效")));
+    }
+    Ok(())
+}
+
+fn validate_locator_identity(
+    provider: ProviderId,
+    track_id: &str,
+    locator: &str,
+) -> std::result::Result<(), AppError> {
+    let mut parts = locator.split(':');
+    let locator_provider = parts.next().unwrap_or_default();
+    let version = parts.next().unwrap_or_default();
+    let locator_track = parts.next().unwrap_or_default();
+    if locator_provider != provider.as_str() {
+        return Err(bad_request("resolverLocator平台与trackRef不一致"));
+    }
+    if !matches!(version, "v1" | "v2") || locator_track.is_empty() {
+        return Err(bad_request("resolverLocator格式无效"));
+    }
+    if locator_track != track_id {
+        return Err(bad_request("resolverLocator曲目与trackRef不一致"));
+    }
+    Ok(())
 }
 
 fn queue_route(
@@ -2961,6 +3230,40 @@ fn player_search_error(error: PlayerSearchClientError) -> AppError {
     internal_message(&message)
 }
 
+fn playback_http_error(error: PlaybackError) -> AppError {
+    let code = error.code();
+    let (status, message) = match code {
+        "track_unavailable" => (409, "曲目当前不可播放"),
+        "provider_auth_required" => (401, "该平台尚未登录"),
+        "relogin_required" => (401, "登录凭据已失效，请重新登录"),
+        "provider_rate_limited" => (429, "平台请求过于频繁"),
+        "provider_timeout" => (504, "平台请求超时"),
+        "unknown_provider" | "invalid_request" => (400, "曲目请求无效"),
+        "playback_busy" => (429, "播放器正忙"),
+        "playback_runtime_stopped" => (503, "播放器未运行"),
+        _ => (500, "播放操作失败"),
+    };
+    AppError {
+        status,
+        message: format!("{code}: {message}"),
+    }
+}
+
+fn login_http_error(error: LoginHelperFailure) -> AppError {
+    let status = match error.code {
+        "unsupported_provider" | "invalid_helper_provider" | "invalid_helper_credential" => 400,
+        "login_not_active" => 404,
+        "login_in_progress" | "login_session_invalid" => 409,
+        "login_timeout" | "login_cancel_timeout" => 504,
+        "webview_runtime_unavailable" => 503,
+        _ => 500,
+    };
+    AppError {
+        status,
+        message: format!("{}: {}", error.code, error.message),
+    }
+}
+
 fn internal_message(message: &str) -> AppError {
     internal_error(anyhow!(message.to_string()))
 }
@@ -3561,6 +3864,92 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct HttpTestNativePlaybackPort {
+        played: Mutex<Vec<PlayableTrack>>,
+    }
+
+    impl HttpNativePlaybackPort for HttpTestNativePlaybackPort {
+        fn play_track(&self, track: PlayableTrack) -> Result<(), PlaybackError> {
+            self.played.lock().unwrap().push(track);
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct HttpTestLoginPort {
+        active: Mutex<Option<LoginSession>>,
+    }
+
+    impl HttpLoginPort for HttpTestLoginPort {
+        fn providers(&self) -> Result<Vec<ProviderView>, LoginHelperFailure> {
+            Ok(ProviderId::ALL
+                .into_iter()
+                .map(|provider| {
+                    let status = miliastra_playback::CredentialStatus::empty(provider.as_str());
+                    ProviderView {
+                        provider,
+                        configured: status.configured,
+                        fields: status
+                            .fields
+                            .into_iter()
+                            .map(|(name, present)| (name.to_owned(), present))
+                            .collect(),
+                    }
+                })
+                .collect())
+        }
+
+        fn status(&self) -> LoginManagerStatus {
+            let active = self.active.lock().unwrap().clone();
+            LoginManagerStatus {
+                active: active.is_some(),
+                session_id: active.as_ref().map(|session| session.session_id),
+                provider: active.map(|session| session.provider),
+                last_error: None,
+            }
+        }
+
+        fn start(&self, provider: ProviderId) -> Result<LoginSession, LoginHelperFailure> {
+            let mut active = self.active.lock().unwrap();
+            if active.is_some() {
+                return Err(LoginHelperFailure {
+                    code: "login_in_progress",
+                    message: "已有登录任务正在进行",
+                    provider: Some(provider),
+                });
+            }
+            let session = LoginSession {
+                session_id: Uuid::new_v4(),
+                provider,
+            };
+            *active = Some(session.clone());
+            Ok(session)
+        }
+
+        fn cancel(&self, session_id: Uuid) -> Result<(), LoginHelperFailure> {
+            let mut active = self.active.lock().unwrap();
+            if active.as_ref().map(|session| session.session_id) != Some(session_id) {
+                return Err(LoginHelperFailure {
+                    code: "login_session_invalid",
+                    message: "登录会话无效",
+                    provider: None,
+                });
+            }
+            *active = None;
+            Ok(())
+        }
+
+        fn logout(
+            &self,
+            provider: ProviderId,
+        ) -> Result<miliastra_playback::CredentialStatus, LoginHelperFailure> {
+            Ok(miliastra_playback::CredentialStatus::empty(
+                provider.as_str(),
+            ))
+        }
+    }
+
     struct HttpTestAiPort;
 
     impl HttpAiPort for HttpTestAiPort {
@@ -3580,6 +3969,7 @@ mod tests {
     struct HttpTestState {
         state: HttpSharedState,
         recording: Arc<RecordingHttpPort>,
+        native_playback: Arc<HttpTestNativePlaybackPort>,
     }
 
     impl Deref for HttpTestState {
@@ -3621,11 +4011,30 @@ mod tests {
         http_request(address, "POST", target, access_token)
     }
 
+    fn http_post_json(
+        address: SocketAddr,
+        target: &str,
+        body: &str,
+        access_token: Option<&str>,
+    ) -> TestHttpResponse {
+        http_request_with_body(address, "POST", target, access_token, body)
+    }
+
     fn http_request(
         address: SocketAddr,
         method: &str,
         target: &str,
         access_token: Option<&str>,
+    ) -> TestHttpResponse {
+        http_request_with_body(address, method, target, access_token, "")
+    }
+
+    fn http_request_with_body(
+        address: SocketAddr,
+        method: &str,
+        target: &str,
+        access_token: Option<&str>,
+        body: &str,
     ) -> TestHttpResponse {
         let mut stream = TcpStream::connect(address).expect("connect to HTTP server");
         stream
@@ -3634,8 +4043,14 @@ mod tests {
         let token_header = access_token
             .map(|token| format!("X-Miliastra-Token: {token}\r\n"))
             .unwrap_or_default();
+        let content_type = if body.is_empty() {
+            String::new()
+        } else {
+            "Content-Type: application/json\r\n".to_string()
+        };
         let request = format!(
-            "{method} {target} HTTP/1.1\r\nHost: localhost\r\n{token_header}Content-Length: 0\r\nConnection: close\r\n\r\n"
+            "{method} {target} HTTP/1.1\r\nHost: localhost\r\n{token_header}{content_type}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
         );
         stream
             .write_all(request.as_bytes())
@@ -3780,6 +4195,96 @@ mod tests {
             }])
         );
 
+        server.shutdown().expect("shutdown HTTP server");
+    }
+
+    #[test]
+    fn native_player_and_login_routes_use_structured_json_without_secrets() {
+        let mut state = test_state();
+        let server = start_test_http_server(&mut state, "");
+        let address = server.local_addr();
+
+        let providers = http_get(address, "/player/providers", None);
+        assert_eq!(providers.status_line, "HTTP/1.1 200 OK");
+        let providers: Value = serde_json::from_str(&providers.body).expect("providers JSON");
+        assert_eq!(providers.as_array().map(Vec::len), Some(3));
+        assert_eq!(providers[0]["configured"], false);
+        assert!(providers[0].get("cookies").is_none());
+
+        let track = json!({
+            "trackRef": {
+                "key": {"provider": "netease", "id": "123"},
+                "resolverLocator": "netease:v1:123"
+            },
+            "metadata": {
+                "title": "结构化歌曲",
+                "artists": ["测试歌手"],
+                "album": "测试专辑",
+                "durationMs": 180000
+            }
+        });
+        let played = http_post_json(address, "/player/play-track", &track.to_string(), None);
+        assert_eq!(played.status_line, "HTTP/1.1 200 OK");
+        let played: Value = serde_json::from_str(&played.body).expect("play response JSON");
+        assert_eq!(played["currentUri"], "miliastra://track/netease/123");
+        assert_eq!(state.native_playback.played.lock().unwrap().len(), 1);
+
+        let mismatch = json!({
+            "trackRef": {
+                "key": {"provider": "netease", "id": "123"},
+                "resolverLocator": "qqmusic:v1:123"
+            },
+            "metadata": {"title": "坏曲目", "artists": []}
+        });
+        let mismatch = http_post_json(address, "/player/play-track", &mismatch.to_string(), None);
+        assert_eq!(mismatch.status_line, "HTTP/1.1 400 Bad Request");
+        assert!(mismatch.body.contains("resolverLocator"));
+        assert_eq!(state.native_playback.played.lock().unwrap().len(), 1);
+
+        let session = http_post_json(
+            address,
+            "/player/login/start",
+            r#"{"provider":"qqmusic"}"#,
+            None,
+        );
+        assert_eq!(session.status_line, "HTTP/1.1 200 OK");
+        let session: Value = serde_json::from_str(&session.body).expect("login response JSON");
+        let session_id = session["sessionId"].as_str().expect("session id");
+        let status = http_get(address, "/player/login/status", None);
+        let status: Value = serde_json::from_str(&status.body).expect("login status JSON");
+        assert_eq!(status["active"], true);
+        assert_eq!(status["provider"], "qqmusic");
+        let cancel = http_post_json(
+            address,
+            "/player/login/cancel",
+            &json!({"sessionId": session_id}).to_string(),
+            None,
+        );
+        assert_eq!(cancel.status_line, "HTTP/1.1 200 OK");
+        let status = http_get(address, "/player/login/status", None);
+        let status: Value = serde_json::from_str(&status.body).expect("inactive login status JSON");
+        assert_eq!(status["active"], false);
+
+        server.shutdown().expect("shutdown HTTP server");
+    }
+
+    #[test]
+    fn native_play_track_rejects_unknown_fields() {
+        let mut state = test_state();
+        let server = start_test_http_server(&mut state, "");
+        let body = json!({
+            "trackRef": {"key": {"provider": "qqmusic", "id": "1"}},
+            "metadata": {"title": "歌曲", "artists": []},
+            "credential": "must not be accepted"
+        });
+        let response = http_post_json(
+            server.local_addr(),
+            "/player/play-track",
+            &body.to_string(),
+            None,
+        );
+        assert_eq!(response.status_line, "HTTP/1.1 400 Bad Request");
+        assert_eq!(state.native_playback.played.lock().unwrap().len(), 0);
         server.shutdown().expect("shutdown HTTP server");
     }
 
@@ -4324,7 +4829,9 @@ workflows:
         assert!(PAGE.contains("function toggleRefresh()"));
         assert!(PAGE.contains("if(!refreshPaused)refreshAll()"));
         assert!(PAGE.contains("async function refreshAll()"));
-        assert!(PAGE.contains("Promise.allSettled([loadMonitor(),loadHistory(),refreshPlayer()])"));
+        assert!(PAGE.contains(
+            "Promise.allSettled([loadMonitor(),loadHistory(),refreshPlayer(),loadLoginState()])"
+        ));
         assert!(PAGE.contains("cache:'no-store'"));
         assert!(!PAGE.contains("onclick=\"loadMonitor()\""));
     }
@@ -4699,6 +5206,8 @@ workflows:
             &config.ocr,
         );
         let recording = Arc::new(RecordingHttpPort::new());
+        let native_playback = Arc::new(HttpTestNativePlaybackPort::default());
+        let login = Arc::new(HttpTestLoginPort::default());
         HttpTestState {
             state: HttpSharedState::new_with_ports(
                 HttpInterfaceConfig::new(
@@ -4718,9 +5227,12 @@ workflows:
                 recording.clone(),
                 Arc::new(Mutex::new(LatestFrameCache::default())),
                 Arc::new(player),
+                native_playback.clone(),
+                login.clone(),
                 Arc::new(HttpTestAiPort),
             ),
             recording,
+            native_playback,
         }
     }
 }

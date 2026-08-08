@@ -14,6 +14,7 @@ use crate::domain::{ResolverLocator, SearchSpec, Song, SongKey, StreamSource};
 use crate::lyrics::{TimedLyrics, parse_lrc_pair};
 
 const SEARCH_URL: &str = "https://music.163.com/api/search/get";
+const PROVIDER: &str = "netease";
 const MEDIA_URL: &str = "https://music.163.com/api/song/enhance/player/url/v1";
 const LYRICS_URL: &str = "https://music.163.com/song/lyric";
 
@@ -135,15 +136,11 @@ impl NeteaseAdapter {
 
 #[async_trait]
 impl SourceAdapter for NeteaseAdapter {
-    fn source_code(&self) -> &'static str {
-        "netease"
-    }
-
     async fn validate_credential(
         &self,
         candidate: &ProviderCredential,
     ) -> Result<(), CatalogError> {
-        if candidate.provider() != self.source_code() {
+        if candidate.provider() != PROVIDER {
             return Err(CatalogError::InvalidResponse(
                 "NetEase candidate provider does not match adapter".to_owned(),
             ));
@@ -159,16 +156,7 @@ impl SourceAdapter for NeteaseAdapter {
         Ok(())
     }
 
-    async fn search(&self, spec: &SearchSpec) -> Result<Vec<Song>, CatalogError> {
-        Ok(self
-            .search_candidates(spec)
-            .await?
-            .into_iter()
-            .map(|candidate| candidate.song)
-            .collect())
-    }
-
-    async fn search_candidates(
+    async fn search(
         &self,
         spec: &SearchSpec,
     ) -> Result<Vec<ProviderSearchCandidate>, CatalogError> {
@@ -181,7 +169,7 @@ impl SourceAdapter for NeteaseAdapter {
         key: &SongKey,
         locator: Option<&ResolverLocator>,
     ) -> Result<StreamSource, CatalogError> {
-        if key.source != self.source_code() {
+        if key.source != PROVIDER {
             return Err(CatalogError::InvalidResponse(
                 "song key provider does not match NetEase adapter".to_owned(),
             ));
@@ -217,7 +205,7 @@ impl SourceAdapter for NeteaseAdapter {
         key: &SongKey,
         locator: Option<&ResolverLocator>,
     ) -> Result<Option<TimedLyrics>, CatalogError> {
-        if key.source != self.source_code() {
+        if key.source != PROVIDER {
             return Err(CatalogError::InvalidResponse(
                 "song key provider does not match NetEase adapter".to_owned(),
             ));

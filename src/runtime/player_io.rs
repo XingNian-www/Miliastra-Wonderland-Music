@@ -200,7 +200,41 @@ impl ControlDispatchOutcome {
 }
 
 pub trait PlayerControlPort: Send + 'static {
-    fn dispatch(&mut self, control: &PlayerControl) -> ControlDispatchOutcome;
+    fn dispatch(&mut self, control: &PlayerControl) -> ControlDispatch;
+}
+
+type ControlCompletion = Box<dyn FnOnce() -> ControlDispatchOutcome + Send + 'static>;
+type ControlCancellation = Box<dyn FnOnce() + Send + 'static>;
+
+pub enum ControlDispatch {
+    Immediate(ControlDispatchOutcome),
+    Deferred {
+        completion: ControlCompletion,
+        cancellation: Option<ControlCancellation>,
+    },
+}
+
+impl ControlDispatch {
+    pub fn immediate(outcome: ControlDispatchOutcome) -> Self {
+        Self::Immediate(outcome)
+    }
+
+    pub fn deferred(completion: impl FnOnce() -> ControlDispatchOutcome + Send + 'static) -> Self {
+        Self::Deferred {
+            completion: Box::new(completion),
+            cancellation: None,
+        }
+    }
+
+    pub fn deferred_with_cancel(
+        completion: impl FnOnce() -> ControlDispatchOutcome + Send + 'static,
+        cancellation: impl FnOnce() + Send + 'static,
+    ) -> Self {
+        Self::Deferred {
+            completion: Box::new(completion),
+            cancellation: Some(Box::new(cancellation)),
+        }
+    }
 }
 
 pub use crate::features::song_request::{PickedCandidate, SearchCandidate};
@@ -1108,6 +1142,55 @@ pub struct PlayerRuntime {
     observation_worker: Option<JoinHandle<()>>,
     control_worker: Option<JoinHandle<()>>,
     search_worker: Option<JoinHandle<()>>,
+    control_completions: Arc<ControlCompletionWorkers>,
+}
+
+#[derive(Default)]
+struct ControlCompletionWorkers {
+    workers: Mutex<Vec<ControlCompletionWorker>>,
+    panicked: AtomicBool,
+}
+
+struct ControlCompletionWorker {
+    worker: JoinHandle<()>,
+    cancellation: Option<ControlCancellation>,
+}
+
+impl ControlCompletionWorkers {
+    fn register(&self, worker: JoinHandle<()>, cancellation: Option<ControlCancellation>) {
+        let mut workers = self.workers.lock().unwrap();
+        let mut index = 0;
+        while index < workers.len() {
+            if workers[index].worker.is_finished() {
+                let finished = workers.swap_remove(index);
+                if finished.worker.join().is_err() {
+                    self.panicked.store(true, Ordering::Release);
+                }
+            } else {
+                index += 1;
+            }
+        }
+        workers.push(ControlCompletionWorker {
+            worker,
+            cancellation,
+        });
+    }
+
+    fn cancel_and_join(&self) -> bool {
+        let mut workers = std::mem::take(&mut *self.workers.lock().unwrap());
+        for completion in &mut workers {
+            if !completion.worker.is_finished()
+                && let Some(cancellation) = completion.cancellation.take()
+            {
+                cancellation();
+            }
+        }
+        let mut panicked = self.panicked.swap(false, Ordering::AcqRel);
+        for completion in workers {
+            panicked |= completion.worker.join().is_err();
+        }
+        panicked
+    }
 }
 
 impl PlayerRuntime {
@@ -1148,6 +1231,7 @@ impl PlayerRuntime {
             config.observation.stale_timeout,
             clock,
         ));
+        let control_completions = Arc::new(ControlCompletionWorkers::default());
 
         let worker_observation = Arc::clone(&observation);
         let worker_latest = Arc::clone(&latest_observation);
@@ -1168,10 +1252,17 @@ impl PlayerRuntime {
             })?;
 
         let worker_control = Arc::clone(&control);
+        let worker_completions = Arc::clone(&control_completions);
         let control_worker = match thread::Builder::new()
             .name("player-control-runtime".to_string())
-            .spawn(move || run_control_lane(control_port, control_receiver, worker_control))
-        {
+            .spawn(move || {
+                run_control_lane(
+                    control_port,
+                    control_receiver,
+                    worker_control,
+                    worker_completions,
+                )
+            }) {
             Ok(worker) => worker,
             Err(source) => {
                 latest_observation.close();
@@ -1196,6 +1287,7 @@ impl PlayerRuntime {
                 control.begin_shutdown(ControlCommand::Shutdown);
                 let _ = observation_worker.join();
                 let _ = control_worker.join();
+                let _ = control_completions.cancel_and_join();
                 return Err(PlayerRuntimeStartError::Spawn {
                     lane: PlayerLane::Search,
                     source,
@@ -1213,6 +1305,7 @@ impl PlayerRuntime {
             observation_worker: Some(observation_worker),
             control_worker: Some(control_worker),
             search_worker: Some(search_worker),
+            control_completions,
         })
     }
 
@@ -1255,6 +1348,11 @@ impl PlayerRuntime {
             PlayerLane::Search,
             &mut panicked_lanes,
         );
+        if self.control_completions.cancel_and_join()
+            && !panicked_lanes.contains(&PlayerLane::Control)
+        {
+            panicked_lanes.push(PlayerLane::Control);
+        }
         if panicked_lanes.is_empty() {
             Ok(())
         } else {
@@ -1444,6 +1542,7 @@ fn run_control_lane(
     mut port: impl PlayerControlPort,
     receiver: Receiver<ControlCommand>,
     lane: Arc<RuntimeLane<ControlCommand>>,
+    completions: Arc<ControlCompletionWorkers>,
 ) {
     loop {
         let command = match receiver.recv() {
@@ -1458,14 +1557,23 @@ fn run_control_lane(
         match command {
             ControlCommand::Dispatch(request) => {
                 let started_at = Instant::now();
-                let outcome = port.dispatch(&request.control);
-                let _ = request.response.send(ControlOperationResult {
-                    operation_id: request.operation_id,
-                    control: request.control,
-                    outcome,
-                    started_at: Some(started_at),
-                    finished_at: Instant::now(),
-                });
+                match port.dispatch(&request.control) {
+                    ControlDispatch::Immediate(outcome) => {
+                        complete_control_request(request, outcome, started_at);
+                    }
+                    ControlDispatch::Deferred {
+                        completion,
+                        cancellation,
+                    } => {
+                        spawn_control_completion(
+                            request,
+                            completion,
+                            cancellation,
+                            started_at,
+                            &completions,
+                        );
+                    }
+                }
             }
             ControlCommand::Shutdown => {
                 drain_control_commands(&receiver);
@@ -1473,6 +1581,49 @@ fn run_control_lane(
             }
         }
     }
+}
+
+fn spawn_control_completion(
+    request: ControlRequest,
+    completion: ControlCompletion,
+    cancellation: Option<ControlCancellation>,
+    started_at: Instant,
+    completions: &ControlCompletionWorkers,
+) {
+    let fallback_response = request.response.clone();
+    let fallback_control = request.control.clone();
+    let operation_id = request.operation_id;
+    match thread::Builder::new()
+        .name("player-control-completion".to_owned())
+        .spawn(move || complete_control_request(request, completion(), started_at))
+    {
+        Ok(worker) => completions.register(worker, cancellation),
+        Err(error) => {
+            let _ = fallback_response.send(ControlOperationResult {
+                operation_id,
+                control: fallback_control,
+                outcome: ControlDispatchOutcome::outcome_unknown(format!(
+                    "failed to start control completion worker: {error}"
+                )),
+                started_at: Some(started_at),
+                finished_at: Instant::now(),
+            });
+        }
+    }
+}
+
+fn complete_control_request(
+    request: ControlRequest,
+    outcome: ControlDispatchOutcome,
+    started_at: Instant,
+) {
+    let _ = request.response.send(ControlOperationResult {
+        operation_id: request.operation_id,
+        control: request.control,
+        outcome,
+        started_at: Some(started_at),
+        finished_at: Instant::now(),
+    });
 }
 
 fn complete_control_not_sent(command: ControlCommand) {
@@ -1578,14 +1729,15 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        ControlDispatchOutcome, FastObservationCancelStatus, FastObservationDemandStatus,
-        ObservationWaitOutcome, PickedCandidate, PlayerControl, PlayerControlPort, PlayerLane,
-        PlayerLaneError, PlayerObservationPort, PlayerObservationReadError,
-        PlayerOperationReceiveError, PlayerRuntime, PlayerRuntimeConfig, PlayerRuntimeConfigError,
-        PlayerSearch, PlayerSearchClient, PlayerSearchClientError, PlayerSearchError,
-        PlayerSearchOutcome, PlayerSearchPort, SearchCandidate,
+        ControlDispatch, ControlDispatchOutcome, FastObservationCancelStatus,
+        FastObservationDemandStatus, ObservationWaitOutcome, PickedCandidate, PlayerControl,
+        PlayerControlPort, PlayerLane, PlayerLaneError, PlayerObservationPort,
+        PlayerObservationReadError, PlayerOperationReceiveError, PlayerRuntime,
+        PlayerRuntimeConfig, PlayerRuntimeConfigError, PlayerSearch, PlayerSearchClient,
+        PlayerSearchClientError, PlayerSearchError, PlayerSearchOutcome, PlayerSearchPort,
+        SearchCandidate,
     };
-    use crate::features::playback::test_candidate;
+    use crate::features::playback::{test_candidate, test_track};
     use crate::runtime::clock::{ManualClock, SystemClock};
     use crate::runtime::identity::{BusinessOperationId, BusinessOperationIdAllocator};
     use crate::runtime::player::PlayerObservationConfig;
@@ -1622,7 +1774,10 @@ mod tests {
     impl PlayerObservationPort for ConstantObservationPort {
         fn read_sample(&mut self) -> Result<RawPlayerSample, PlayerObservationReadError> {
             Ok(RawPlayerSample::new(
-                "miliastra://track/qqmusic/observation",
+                test_track(
+                    "miliastra://track/qqmusic/observation",
+                    "observation - test",
+                ),
                 TransportState::Playing,
             ))
         }
@@ -1634,11 +1789,13 @@ mod tests {
     }
 
     impl PlayerControlPort for RecordingControlPort {
-        fn dispatch(&mut self, control: &PlayerControl) -> ControlDispatchOutcome {
+        fn dispatch(&mut self, control: &PlayerControl) -> ControlDispatch {
             self.calls.lock().unwrap().push(control.clone());
-            self.outcomes
-                .pop_front()
-                .expect("one fake outcome per call")
+            ControlDispatch::immediate(
+                self.outcomes
+                    .pop_front()
+                    .expect("one fake outcome per call"),
+            )
         }
     }
 
@@ -1739,7 +1896,10 @@ mod tests {
                     .expect("test observation port release timed out");
             }
             let mut sample = RawPlayerSample::new(
-                "miliastra://track/qqmusic/observation",
+                test_track(
+                    "miliastra://track/qqmusic/observation",
+                    "observation - test",
+                ),
                 TransportState::Playing,
             );
             sample.title = Some("cached title".to_string());
@@ -1759,7 +1919,10 @@ mod tests {
                     .expect("test observation port release timed out");
             }
             Ok(RawPlayerSample::new(
-                "miliastra://track/qqmusic/observation",
+                test_track(
+                    "miliastra://track/qqmusic/observation",
+                    "observation - test",
+                ),
                 TransportState::Playing,
             ))
         }
@@ -1772,8 +1935,70 @@ mod tests {
         calls: Arc<Mutex<Vec<PlayerControl>>>,
     }
 
+    struct DeferredPlayControlPort {
+        started: SyncSender<()>,
+        release: Option<Receiver<()>>,
+    }
+
+    struct CancellableDeferredControlPort {
+        started: SyncSender<()>,
+        release: Option<Receiver<()>>,
+        cancel_release: Option<SyncSender<()>>,
+        cancelled: Option<SyncSender<()>>,
+    }
+
+    impl PlayerControlPort for DeferredPlayControlPort {
+        fn dispatch(&mut self, control: &PlayerControl) -> ControlDispatch {
+            match control {
+                PlayerControl::Play(_) => {
+                    let release = self.release.take().expect("one deferred play");
+                    self.started.send(()).unwrap();
+                    ControlDispatch::deferred(move || {
+                        release
+                            .recv_timeout(FAKE_PORT_BLOCK_TIMEOUT)
+                            .expect("deferred play release timed out");
+                        ControlDispatchOutcome::rejected_with_code(
+                            "track is unavailable",
+                            "track_unavailable",
+                        )
+                    })
+                }
+                PlayerControl::SetVolume(_) => {
+                    ControlDispatch::immediate(ControlDispatchOutcome::acknowledged("volume"))
+                }
+                _ => ControlDispatch::immediate(ControlDispatchOutcome::acknowledged("ok")),
+            }
+        }
+    }
+
+    impl PlayerControlPort for CancellableDeferredControlPort {
+        fn dispatch(&mut self, control: &PlayerControl) -> ControlDispatch {
+            match control {
+                PlayerControl::Play(_) => {
+                    let release = self.release.take().expect("one deferred play");
+                    let cancel_release = self.cancel_release.take().expect("one cancellation");
+                    let cancelled = self.cancelled.take().expect("one cancellation receipt");
+                    self.started.send(()).unwrap();
+                    ControlDispatch::deferred_with_cancel(
+                        move || {
+                            release
+                                .recv_timeout(FAKE_PORT_BLOCK_TIMEOUT)
+                                .expect("cancelled play release timed out");
+                            ControlDispatchOutcome::acknowledged("cancelled")
+                        },
+                        move || {
+                            let _ = cancelled.send(());
+                            let _ = cancel_release.send(());
+                        },
+                    )
+                }
+                _ => ControlDispatch::immediate(ControlDispatchOutcome::acknowledged("ok")),
+            }
+        }
+    }
+
     impl PlayerControlPort for BlockingControlPort {
-        fn dispatch(&mut self, control: &PlayerControl) -> ControlDispatchOutcome {
+        fn dispatch(&mut self, control: &PlayerControl) -> ControlDispatch {
             self.calls.lock().unwrap().push(control.clone());
             if self.block_next {
                 self.block_next = false;
@@ -1782,7 +2007,7 @@ mod tests {
                     .recv_timeout(FAKE_PORT_BLOCK_TIMEOUT)
                     .expect("test control port release timed out");
             }
-            ControlDispatchOutcome::acknowledged("ok")
+            ControlDispatch::immediate(ControlDispatchOutcome::acknowledged("ok"))
         }
     }
 
@@ -2003,6 +2228,149 @@ mod tests {
     }
 
     #[test]
+    fn deferred_play_does_not_block_later_controls_and_preserves_its_result() {
+        let (started_sender, started_receiver) = mpsc::sync_channel(1);
+        let (release_sender, release_receiver) = mpsc::sync_channel(1);
+        let runtime = PlayerRuntime::start(
+            ConstantObservationPort,
+            DeferredPlayControlPort {
+                started: started_sender,
+                release: Some(release_receiver),
+            },
+            EmptySearchPort,
+            config(),
+        )
+        .unwrap();
+        let handle = runtime.handle();
+        let play = handle
+            .submit_control(
+                BusinessOperationId::new(14),
+                PlayerControl::Play(crate::features::playback::test_track(
+                    "miliastra://track/qqmusic/deferred",
+                    "deferred",
+                )),
+            )
+            .unwrap();
+        started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        let volume = handle
+            .submit_control(BusinessOperationId::new(15), PlayerControl::SetVolume(37))
+            .unwrap();
+
+        assert_eq!(
+            volume.wait_timeout(Duration::from_secs(1)).unwrap().outcome,
+            ControlDispatchOutcome::acknowledged("volume")
+        );
+        assert_eq!(
+            play.wait_timeout(Duration::from_millis(10)),
+            Err(PlayerOperationReceiveError::TimedOut(PlayerLane::Control))
+        );
+
+        release_sender.send(()).unwrap();
+        assert_eq!(
+            play.wait_timeout(Duration::from_secs(1)).unwrap().outcome,
+            ControlDispatchOutcome::rejected_with_code("track is unavailable", "track_unavailable",)
+        );
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn shutdown_waits_for_an_accepted_deferred_completion() {
+        let (started_sender, started_receiver) = mpsc::sync_channel(1);
+        let (release_sender, release_receiver) = mpsc::sync_channel(1);
+        let runtime = PlayerRuntime::start(
+            ConstantObservationPort,
+            DeferredPlayControlPort {
+                started: started_sender,
+                release: Some(release_receiver),
+            },
+            EmptySearchPort,
+            config(),
+        )
+        .unwrap();
+        let operation = runtime
+            .handle()
+            .submit_control(
+                BusinessOperationId::new(16),
+                PlayerControl::Play(crate::features::playback::test_track(
+                    "miliastra://track/qqmusic/shutdown-deferred",
+                    "shutdown deferred",
+                )),
+            )
+            .unwrap();
+        started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        let (shutdown_sender, shutdown_receiver) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            let _ = shutdown_sender.send(runtime.shutdown());
+        });
+
+        assert_eq!(
+            shutdown_receiver.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        );
+        release_sender.send(()).unwrap();
+        shutdown_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            operation
+                .wait_timeout(Duration::from_secs(1))
+                .unwrap()
+                .outcome,
+            ControlDispatchOutcome::rejected_with_code("track is unavailable", "track_unavailable",)
+        );
+    }
+
+    #[test]
+    fn shutdown_cancels_an_accepted_deferred_completion_before_joining() {
+        let (started_sender, started_receiver) = mpsc::sync_channel(1);
+        let (release_sender, release_receiver) = mpsc::sync_channel(1);
+        let (cancelled_sender, cancelled_receiver) = mpsc::sync_channel(1);
+        let runtime = PlayerRuntime::start(
+            ConstantObservationPort,
+            CancellableDeferredControlPort {
+                started: started_sender,
+                release: Some(release_receiver),
+                cancel_release: Some(release_sender),
+                cancelled: Some(cancelled_sender),
+            },
+            EmptySearchPort,
+            config(),
+        )
+        .unwrap();
+        let operation = runtime
+            .handle()
+            .submit_control(
+                BusinessOperationId::new(17),
+                PlayerControl::Play(crate::features::playback::test_track(
+                    "miliastra://track/qqmusic/shutdown-cancelled",
+                    "shutdown cancelled",
+                )),
+            )
+            .unwrap();
+        started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+
+        runtime.shutdown().unwrap();
+
+        cancelled_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(
+            operation
+                .wait_timeout(Duration::from_secs(1))
+                .unwrap()
+                .outcome,
+            ControlDispatchOutcome::acknowledged("cancelled")
+        );
+    }
+
+    #[test]
     fn observation_publications_advance_revision_and_preserve_read_failures() {
         let mut runtime_config = config();
         runtime_config.normal_observation_interval = Duration::from_millis(20);
@@ -2011,7 +2379,7 @@ mod tests {
             ScriptedObservationPort {
                 samples: VecDeque::from([
                     Ok(RawPlayerSample::new(
-                        "miliastra://track/qqmusic/one",
+                        test_track("miliastra://track/qqmusic/one", "observation - test"),
                         TransportState::Playing,
                     )),
                     Err(PlayerObservationReadError::new("status RPC failed")),
@@ -2100,7 +2468,7 @@ mod tests {
                 ObservationWaitOutcome::Advanced(observation) => observation,
                 _ => panic!("stable observation must be published"),
             };
-        assert!(fresh.observation().uri_freshness.is_fresh());
+        assert!(fresh.observation().track_key_freshness.is_fresh());
         started_receiver
             .recv_timeout(Duration::from_secs(1))
             .unwrap();
@@ -2120,14 +2488,14 @@ mod tests {
         let aged = handle.latest_observation().unwrap();
         assert_eq!(aged.revision(), fresh.revision());
         assert_eq!(
-            aged.observation().uri_freshness,
+            aged.observation().track_key_freshness,
             ObservationFreshness::Unknown
         );
         assert_eq!(
             aged.observation().transport_freshness,
             ObservationFreshness::Unknown
         );
-        assert_eq!(aged.observation().uri, None);
+        assert_eq!(aged.observation().track_key, None);
         assert_eq!(aged.observation().transport, None);
         assert_eq!(aged.observation().title, None);
         let waited = handle.wait_for_observation_after(first.revision(), Duration::ZERO);
@@ -2136,7 +2504,7 @@ mod tests {
         };
         assert_eq!(waited.revision(), fresh.revision());
         assert_eq!(
-            waited.observation().uri_freshness,
+            waited.observation().track_key_freshness,
             ObservationFreshness::Unknown
         );
         assert!(matches!(
@@ -2154,11 +2522,11 @@ mod tests {
         let clock = ManualClock::new(now);
         let mut observer = PlayerObserver::new(clock, PlayerObservationConfig::default());
         observer.observe_sample(RawPlayerSample::new(
-            "miliastra://track/qqmusic/seed",
+            test_track("miliastra://track/qqmusic/seed", "observation - test"),
             TransportState::Playing,
         ));
         let observation = observer.observe_sample(RawPlayerSample::new(
-            "miliastra://track/qqmusic/seed",
+            test_track("miliastra://track/qqmusic/seed", "observation - test"),
             TransportState::Playing,
         ));
         let latest = Arc::new(super::LatestObservationStore::new(

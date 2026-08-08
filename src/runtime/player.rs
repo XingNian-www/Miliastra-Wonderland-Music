@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use miliastra_playback::PlayableTrack;
+use miliastra_playback::{PlayableTrack, TrackKey};
 
 use super::clock::Clock;
 
@@ -21,7 +21,6 @@ pub enum TransportState {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RawPlayerSample {
     pub track: Option<PlayableTrack>,
-    pub uri: Option<String>,
     pub transport: Option<TransportState>,
     pub title: Option<String>,
     pub artist: Option<String>,
@@ -52,16 +51,16 @@ pub struct PlayerRuntimeMetadata {
 }
 
 impl RawPlayerSample {
-    pub fn new(uri: impl Into<String>, transport: TransportState) -> Self {
+    pub fn new(track: PlayableTrack, transport: TransportState) -> Self {
         Self {
-            uri: Some(uri.into()),
+            track: Some(track),
             transport: Some(transport),
             ..Self::default()
         }
     }
 
     pub fn is_complete(&self) -> bool {
-        normalized_uri(self.uri.as_deref()).is_some() && self.transport.is_some()
+        self.track.is_some() && self.transport.is_some()
     }
 }
 
@@ -82,7 +81,7 @@ impl PlaybackInstance {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PlaybackIdentity {
-    pub uri: String,
+    pub key: TrackKey,
     pub instance: PlaybackInstance,
 }
 
@@ -117,10 +116,10 @@ pub struct PlayerObservation {
     pub evaluated_at: Instant,
     pub last_attempted_at: Option<Instant>,
     pub last_successful_observed_at: Option<Instant>,
-    pub uri: Option<String>,
-    pub uri_freshness: ObservationFreshness,
-    pub uri_evidence: Option<StabilityEvidence<String>>,
-    pub uri_candidate: Option<StabilityEvidence<String>>,
+    pub track_key: Option<TrackKey>,
+    pub track_key_freshness: ObservationFreshness,
+    pub track_key_evidence: Option<StabilityEvidence<TrackKey>>,
+    pub track_key_candidate: Option<StabilityEvidence<TrackKey>>,
     pub transport: Option<TransportState>,
     pub transport_freshness: ObservationFreshness,
     pub transport_evidence: Option<StabilityEvidence<TransportState>>,
@@ -142,33 +141,30 @@ pub struct PlayerObservation {
 }
 
 impl PlayerObservation {
-    pub fn confirms_uri(&self, expected: &str) -> bool {
-        normalized_uri(Some(expected)).is_some_and(|expected| {
-            self.fresh_identity()
-                .is_some_and(|identity| identity.uri == expected)
-        })
+    pub fn confirms_track(&self, expected: &TrackKey) -> bool {
+        self.fresh_identity()
+            .is_some_and(|identity| identity.key == *expected)
     }
 
     pub fn fresh_identity(&self) -> Option<PlaybackIdentity> {
-        if !self.uri_freshness.is_confirmable() {
+        if !self.track_key_freshness.is_confirmable() {
             return None;
         }
-        let uri = normalized_uri(self.uri.as_deref())?;
-        let evidence = self.uri_evidence.as_ref()?;
-        let evidence_uri = normalized_uri(Some(&evidence.value))?;
-        if evidence.confirmed_at.is_none() || evidence_uri != uri {
+        let key = self.track_key.as_ref()?;
+        let evidence = self.track_key_evidence.as_ref()?;
+        if evidence.confirmed_at.is_none() || evidence.value != *key {
             return None;
         }
         Some(PlaybackIdentity {
-            uri: uri.to_owned(),
+            key: key.clone(),
             instance: self.playback_instance?,
         })
     }
 
-    /// Returns a fresh identity whose stable URI evidence was sampled at or after `not_before`.
+    /// Returns a fresh identity whose stable track-key evidence was sampled at or after `not_before`.
     pub fn fresh_identity_sampled_after(&self, not_before: Instant) -> Option<PlaybackIdentity> {
         let identity = self.fresh_identity()?;
-        (self.uri_evidence.as_ref()?.last_sampled_at >= not_before).then_some(identity)
+        (self.track_key_evidence.as_ref()?.last_sampled_at >= not_before).then_some(identity)
     }
 
     pub fn fresh_transport(&self) -> Option<TransportState> {
@@ -195,17 +191,17 @@ impl PlayerObservation {
         let mut reevaluated = self.clone();
         reevaluated.evaluated_at = now;
 
-        let uri_expired = reevaluate_stable_field(
-            &mut reevaluated.uri,
-            &mut reevaluated.uri_freshness,
-            &mut reevaluated.uri_evidence,
+        let track_key_expired = reevaluate_stable_field(
+            &mut reevaluated.track_key,
+            &mut reevaluated.track_key_freshness,
+            &mut reevaluated.track_key_evidence,
             now,
             stale_timeout,
         );
-        if uri_expired {
-            reevaluated.uri_candidate = None;
+        if track_key_expired {
+            reevaluated.track_key_candidate = None;
         } else {
-            expire_candidate(&mut reevaluated.uri_candidate, now, stale_timeout);
+            expire_candidate(&mut reevaluated.track_key_candidate, now, stale_timeout);
         }
 
         let transport_expired = reevaluate_stable_field(
@@ -221,7 +217,7 @@ impl PlayerObservation {
             expire_candidate(&mut reevaluated.transport_candidate, now, stale_timeout);
         }
 
-        if reevaluated.uri.is_none() {
+        if reevaluated.track_key.is_none() {
             reevaluated.playback_instance = None;
             reevaluated.track = None;
             reevaluated.title = None;
@@ -235,7 +231,7 @@ impl PlayerObservation {
             reevaluated.volume = None;
             reevaluated.volume_sampled_at = None;
             reevaluated.sampled_at = None;
-        } else if reevaluated.uri_freshness.is_fresh()
+        } else if reevaluated.track_key_freshness.is_fresh()
             && reevaluated.transport_freshness.is_fresh()
             && reevaluated.transport == Some(TransportState::Playing)
             && let Some(progress) = reevaluated.progress
@@ -342,7 +338,7 @@ struct StableField<T> {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-struct UriUpdate {
+struct TrackKeyUpdate {
     accepted_new: bool,
     identity_changed: bool,
 }
@@ -409,21 +405,21 @@ impl TrackEvidence {
     }
 }
 
-/// Converts raw player samples into independently stabilized URI and transport observations.
+/// Converts raw player samples into independently stabilized track-key and transport observations.
 ///
 /// Request failures must be reported with [`Self::observe_failure`]. A successful but partial
 /// response is still useful: each present field advances only its own stability counter.
 pub struct PlayerObserver<C> {
     clock: C,
     config: PlayerObservationConfig,
-    stable_uri: Option<StableField<String>>,
-    uri_candidate: Option<Candidate<String>>,
+    stable_track_key: Option<StableField<TrackKey>>,
+    track_key_candidate: Option<Candidate<TrackKey>>,
     stable_transport: Option<StableField<TransportState>>,
     transport_candidate: Option<Candidate<TransportState>>,
     evidence: TrackEvidence,
     runtime: PlayerRuntimeMetadata,
     playback_instance: Option<PlaybackInstance>,
-    last_identity_uri: Option<String>,
+    last_identity_key: Option<TrackKey>,
     last_transport: Option<TransportState>,
     last_attempted_at: Option<Instant>,
     last_successful_observed_at: Option<Instant>,
@@ -436,14 +432,14 @@ impl<C: Clock> PlayerObserver<C> {
         Self {
             clock,
             config: config.normalized(),
-            stable_uri: None,
-            uri_candidate: None,
+            stable_track_key: None,
+            track_key_candidate: None,
             stable_transport: None,
             transport_candidate: None,
             evidence: TrackEvidence::default(),
             runtime: PlayerRuntimeMetadata::default(),
             playback_instance: None,
-            last_identity_uri: None,
+            last_identity_key: None,
             last_transport: None,
             last_attempted_at: None,
             last_successful_observed_at: None,
@@ -459,50 +455,56 @@ impl<C: Clock> PlayerObserver<C> {
         self.last_successful_observed_at = Some(now);
         self.runtime = sample.runtime.clone();
 
-        let raw_uri = normalized_uri(sample.uri.as_deref()).map(str::to_owned);
-        let prior_progress = raw_uri
-            .as_deref()
-            .filter(|uri| {
-                self.stable_uri
+        let raw_track_key = sample
+            .track
+            .as_ref()
+            .map(|track| track.track_ref.key.clone());
+        let prior_progress = raw_track_key
+            .as_ref()
+            .filter(|key| {
+                self.stable_track_key
                     .as_ref()
-                    .is_some_and(|stable| stable.value == *uri)
+                    .is_some_and(|stable| stable.value == **key)
             })
             .and(self.evidence.progress);
 
-        let uri_update = self.observe_uri(raw_uri.as_deref(), now);
-        if uri_update.accepted_new {
+        let track_key_update = self.observe_track_key(raw_track_key.as_ref(), now);
+        if track_key_update.accepted_new {
             self.evidence = TrackEvidence::default();
         }
         let transport_update = self.observe_transport(sample.transport, now);
-        let progress_restarted = !uri_update.identity_changed
-            && raw_uri.as_deref().is_some_and(|uri| {
-                self.stable_uri
+        let progress_restarted = !track_key_update.identity_changed
+            && raw_track_key.as_ref().is_some_and(|key| {
+                self.stable_track_key
                     .as_ref()
-                    .is_some_and(|stable| stable.fresh && stable.value == uri)
+                    .is_some_and(|stable| stable.fresh && stable.value == *key)
             })
             && prior_progress
                 .zip(sample.progress)
                 .is_some_and(|(before, after)| self.progress_restarted(before, after));
 
-        let accepted_current_uri = raw_uri.as_deref().is_some_and(|uri| {
-            self.stable_uri
+        let accepted_current_track = raw_track_key.as_ref().is_some_and(|key| {
+            self.stable_track_key
                 .as_ref()
-                .is_some_and(|stable| stable.fresh && stable.value == uri)
+                .is_some_and(|stable| stable.fresh && stable.value == *key)
         });
-        if accepted_current_uri {
+        if accepted_current_track {
             self.evidence.update(&sample, now);
         }
 
-        let has_fresh_track = self.stable_uri.as_ref().is_some_and(|stable| stable.fresh);
+        let has_fresh_track = self
+            .stable_track_key
+            .as_ref()
+            .is_some_and(|stable| stable.fresh);
         let transport_is_fresh = self
             .stable_transport
             .as_ref()
             .is_some_and(|stable| stable.fresh);
-        if uri_update.identity_changed && !transport_is_fresh {
+        if track_key_update.identity_changed && !transport_is_fresh {
             self.identity_waiting_for_transport = true;
         }
 
-        let mut advance_instance = uri_update.identity_changed || progress_restarted;
+        let mut advance_instance = track_key_update.identity_changed || progress_restarted;
         if transport_update.accepted_new && self.identity_waiting_for_transport {
             self.identity_waiting_for_transport = false;
         } else if transport_update.restarted {
@@ -535,7 +537,7 @@ impl<C: Clock> PlayerObserver<C> {
         let now = self.clock.now();
         self.expire_stale_fields(now);
         self.last_attempted_at = Some(now);
-        self.mark_uri_stale();
+        self.mark_track_key_stale();
         self.mark_transport_stale();
         self.snapshot_at(now)
     }
@@ -546,55 +548,55 @@ impl<C: Clock> PlayerObserver<C> {
         self.snapshot_at(now)
     }
 
-    fn observe_uri(&mut self, uri: Option<&str>, now: Instant) -> UriUpdate {
-        let Some(uri) = uri else {
-            self.mark_uri_stale();
-            return UriUpdate::default();
+    fn observe_track_key(&mut self, key: Option<&TrackKey>, now: Instant) -> TrackKeyUpdate {
+        let Some(key) = key else {
+            self.mark_track_key_stale();
+            return TrackKeyUpdate::default();
         };
 
         if self
-            .stable_uri
+            .stable_track_key
             .as_ref()
-            .is_some_and(|stable| stable.value == uri)
+            .is_some_and(|stable| stable.value == *key)
         {
-            if let Some(stable) = self.stable_uri.as_mut() {
+            if let Some(stable) = self.stable_track_key.as_mut() {
                 stable.last_sampled_at = now;
                 stable.fresh = true;
             }
-            self.uri_candidate = None;
-            return UriUpdate::default();
+            self.track_key_candidate = None;
+            return TrackKeyUpdate::default();
         }
 
-        if let Some(stable) = self.stable_uri.as_mut() {
+        if let Some(stable) = self.stable_track_key.as_mut() {
             stable.fresh = false;
         }
         let accepted = advance_candidate(
-            &mut self.uri_candidate,
-            uri.to_owned(),
+            &mut self.track_key_candidate,
+            key.clone(),
             self.config.uri_stable_samples,
             now,
         );
         if !accepted {
-            return UriUpdate::default();
+            return TrackKeyUpdate::default();
         }
 
         let candidate = self
-            .uri_candidate
+            .track_key_candidate
             .take()
-            .expect("accepted URI candidate must exist");
+            .expect("accepted track-key candidate must exist");
         let identity_changed = self
-            .last_identity_uri
-            .as_deref()
-            .is_some_and(|previous| previous != candidate.value);
-        self.last_identity_uri = Some(candidate.value.clone());
-        self.stable_uri = Some(StableField {
+            .last_identity_key
+            .as_ref()
+            .is_some_and(|previous| *previous != candidate.value);
+        self.last_identity_key = Some(candidate.value.clone());
+        self.stable_track_key = Some(StableField {
             value: candidate.value,
             consecutive_samples: candidate.consecutive_samples,
             confirmed_at: now,
             last_sampled_at: candidate.last_sampled_at,
             fresh: true,
         });
-        UriUpdate {
+        TrackKeyUpdate {
             accepted_new: true,
             identity_changed,
         }
@@ -661,9 +663,9 @@ impl<C: Clock> PlayerObserver<C> {
             && before.saturating_sub(after) >= self.config.restart_minimum_drop
     }
 
-    fn mark_uri_stale(&mut self) {
-        self.uri_candidate = None;
-        if let Some(stable) = self.stable_uri.as_mut() {
+    fn mark_track_key_stale(&mut self) {
+        self.track_key_candidate = None;
+        if let Some(stable) = self.stable_track_key.as_mut() {
             stable.fresh = false;
         }
     }
@@ -676,10 +678,10 @@ impl<C: Clock> PlayerObserver<C> {
     }
 
     fn expire_stale_fields(&mut self, now: Instant) {
-        if self.uri_candidate.as_ref().is_some_and(|candidate| {
+        if self.track_key_candidate.as_ref().is_some_and(|candidate| {
             now.saturating_duration_since(candidate.last_sampled_at) > self.config.stale_timeout
         }) {
-            self.uri_candidate = None;
+            self.track_key_candidate = None;
         }
         if self.transport_candidate.as_ref().is_some_and(|candidate| {
             now.saturating_duration_since(candidate.last_sampled_at) > self.config.stale_timeout
@@ -687,12 +689,12 @@ impl<C: Clock> PlayerObserver<C> {
             self.transport_candidate = None;
         }
 
-        let uri_expired = self.stable_uri.as_ref().is_some_and(|stable| {
+        let track_key_expired = self.stable_track_key.as_ref().is_some_and(|stable| {
             now.saturating_duration_since(stable.last_sampled_at) > self.config.stale_timeout
         });
-        if uri_expired {
-            self.stable_uri = None;
-            self.uri_candidate = None;
+        if track_key_expired {
+            self.stable_track_key = None;
+            self.track_key_candidate = None;
             self.evidence = TrackEvidence::default();
         }
 
@@ -705,26 +707,32 @@ impl<C: Clock> PlayerObserver<C> {
             self.last_transport = None;
             self.identity_waiting_for_transport = false;
         }
-        if uri_expired || transport_expired {
+        if track_key_expired || transport_expired {
             self.pending_transport_restart = false;
             self.identity_waiting_for_transport = false;
         }
     }
 
     fn snapshot_at(&self, now: Instant) -> PlayerObservation {
-        let uri_freshness = field_freshness(self.stable_uri.as_ref(), now);
+        let track_key_freshness = field_freshness(self.stable_track_key.as_ref(), now);
         let transport_freshness = field_freshness(self.stable_transport.as_ref(), now);
-        let progress = self.estimated_progress(now, uri_freshness, transport_freshness);
+        let progress = self.estimated_progress(now, track_key_freshness, transport_freshness);
 
         PlayerObservation {
             evaluated_at: now,
             last_attempted_at: self.last_attempted_at,
             last_successful_observed_at: self.last_successful_observed_at,
-            uri: self.stable_uri.as_ref().map(|stable| stable.value.clone()),
-            uri_freshness,
-            uri_evidence: stable_evidence(self.stable_uri.as_ref(), self.config.uri_stable_samples),
-            uri_candidate: candidate_evidence(
-                self.uri_candidate.as_ref(),
+            track_key: self
+                .stable_track_key
+                .as_ref()
+                .map(|stable| stable.value.clone()),
+            track_key_freshness,
+            track_key_evidence: stable_evidence(
+                self.stable_track_key.as_ref(),
+                self.config.uri_stable_samples,
+            ),
+            track_key_candidate: candidate_evidence(
+                self.track_key_candidate.as_ref(),
                 self.config.uri_stable_samples,
             ),
             transport: self.stable_transport.as_ref().map(|stable| stable.value),
@@ -737,7 +745,7 @@ impl<C: Clock> PlayerObserver<C> {
                 self.transport_candidate.as_ref(),
                 self.config.transport_stable_samples,
             ),
-            playback_instance: self.stable_uri.as_ref().and(self.playback_instance),
+            playback_instance: self.stable_track_key.as_ref().and(self.playback_instance),
             track: self.evidence.track.clone(),
             title: self.evidence.title.clone(),
             artist: self.evidence.artist.clone(),
@@ -757,11 +765,11 @@ impl<C: Clock> PlayerObserver<C> {
     fn estimated_progress(
         &self,
         now: Instant,
-        uri_freshness: ObservationFreshness,
+        track_key_freshness: ObservationFreshness,
         transport_freshness: ObservationFreshness,
     ) -> Option<Duration> {
         let sampled = self.evidence.progress?;
-        if !uri_freshness.is_fresh()
+        if !track_key_freshness.is_fresh()
             || !transport_freshness.is_fresh()
             || self.stable_transport.as_ref().map(|stable| stable.value)
                 != Some(TransportState::Playing)
@@ -843,10 +851,6 @@ fn field_freshness<T>(field: Option<&StableField<T>>, now: Instant) -> Observati
     }
 }
 
-fn normalized_uri(uri: Option<&str>) -> Option<&str> {
-    uri.map(str::trim).filter(|uri| !uri.is_empty())
-}
-
 fn normalized_owned(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_owned())
@@ -876,14 +880,25 @@ mod tests {
         ObservationFreshness, PlaybackIdentity, PlaybackInstance, PlayerObservationConfig,
         PlayerObserver, PlayerRuntimeMetadata, RawPlayerSample, TransportState,
     };
+    use crate::features::playback::test_track;
     use crate::runtime::clock::{Clock, ManualClock};
+
+    fn track(uri: &str) -> miliastra_playback::PlayableTrack {
+        test_track(uri, "test track - test artist")
+    }
+
+    fn key(uri: &str) -> miliastra_playback::TrackKey {
+        track(uri).track_ref.key
+    }
 
     #[test]
     fn raw_runtime_metadata_survives_observation_stabilization() {
         let clock = ManualClock::new(Instant::now());
         let mut observer = PlayerObserver::new(clock, PlayerObservationConfig::default());
-        let mut sample =
-            RawPlayerSample::new("miliastra://track/netease/123", TransportState::Stopped);
+        let mut sample = RawPlayerSample::new(
+            track("miliastra://track/netease/123"),
+            TransportState::Stopped,
+        );
         sample.runtime = PlayerRuntimeMetadata {
             runtime_identity: "runtime-a".to_string(),
             session_id: "session-a".to_string(),
@@ -911,7 +926,7 @@ mod tests {
 
     fn sample(uri: &str, transport: TransportState, progress_secs: u64) -> RawPlayerSample {
         RawPlayerSample {
-            uri: Some(uri.to_owned()),
+            track: Some(track(uri)),
             transport: Some(transport),
             progress: Some(Duration::from_secs(progress_secs)),
             duration: Some(Duration::from_secs(180)),
@@ -930,7 +945,7 @@ mod tests {
     }
 
     #[test]
-    fn uri_and_transport_reach_stability_independently() {
+    fn track_key_and_transport_reach_stability_independently() {
         let clock = ManualClock::new(Instant::now());
         let mut observer = observer(
             &clock,
@@ -945,7 +960,7 @@ mod tests {
             TransportState::Playing,
             1,
         ));
-        assert_eq!(first.uri_freshness, ObservationFreshness::Unknown);
+        assert_eq!(first.track_key_freshness, ObservationFreshness::Unknown);
         assert_eq!(first.transport_freshness, ObservationFreshness::Unknown);
 
         let second = observer.observe_sample(sample(
@@ -953,8 +968,8 @@ mod tests {
             TransportState::Playing,
             2,
         ));
-        assert_eq!(second.uri.as_deref(), Some("miliastra://track/qqmusic/1"));
-        assert_eq!(second.uri_freshness, ObservationFreshness::Fresh);
+        assert_eq!(second.track_key, Some(key("miliastra://track/qqmusic/1")));
+        assert_eq!(second.track_key_freshness, ObservationFreshness::Fresh);
         assert_eq!(second.transport, None);
         let transport_candidate = second.transport_candidate.unwrap();
         assert_eq!(transport_candidate.value, TransportState::Playing);
@@ -995,21 +1010,21 @@ mod tests {
         assert_eq!(
             fresh.fresh_identity(),
             Some(PlaybackIdentity {
-                uri: "miliastra://track/qqmusic/1".to_string(),
+                key: key("miliastra://track/qqmusic/1"),
                 instance: PlaybackInstance::INITIAL,
             })
         );
         assert_eq!(fresh.fresh_transport(), Some(TransportState::Playing));
 
         let mut missing_identity_evidence = fresh.clone();
-        missing_identity_evidence.uri_evidence = None;
+        missing_identity_evidence.track_key_evidence = None;
         assert_eq!(missing_identity_evidence.fresh_identity(), None);
         let mut mismatched_identity_evidence = fresh.clone();
         mismatched_identity_evidence
-            .uri_evidence
+            .track_key_evidence
             .as_mut()
             .unwrap()
-            .value = "miliastra://track/qqmusic/other".to_string();
+            .value = key("miliastra://track/qqmusic/other");
         assert_eq!(mismatched_identity_evidence.fresh_identity(), None);
         let mut missing_instance = fresh.clone();
         missing_instance.playback_instance = None;
@@ -1048,7 +1063,7 @@ mod tests {
         clock.advance(Duration::from_millis(100)).unwrap();
         let stale = observer.observe_failure();
         assert!(matches!(
-            stale.uri_freshness,
+            stale.track_key_freshness,
             ObservationFreshness::Stale { .. }
         ));
         assert!(matches!(
@@ -1072,18 +1087,18 @@ mod tests {
         second.volume = Some(80);
         let observation = observer.observe_sample(second);
 
-        assert_eq!(observation.uri_freshness, ObservationFreshness::Fresh);
+        assert_eq!(observation.track_key_freshness, ObservationFreshness::Fresh);
         assert_eq!(observation.transport_freshness, ObservationFreshness::Fresh);
         assert_eq!(observation.title.as_deref(), Some("new title"));
         assert_eq!(observation.volume, Some(80));
     }
 
     #[test]
-    fn empty_uri_never_becomes_a_track_identity_but_transport_can_stabilize() {
+    fn missing_track_never_becomes_an_identity_but_transport_can_stabilize() {
         let clock = ManualClock::new(Instant::now());
         let mut observer = observer(&clock, PlayerObservationConfig::default());
         let incomplete = RawPlayerSample {
-            uri: Some("  ".to_owned()),
+            track: None,
             transport: Some(TransportState::Playing),
             ..RawPlayerSample::default()
         };
@@ -1091,8 +1106,11 @@ mod tests {
         observer.observe_sample(incomplete.clone());
         let observation = observer.observe_sample(incomplete);
 
-        assert_eq!(observation.uri, None);
-        assert_eq!(observation.uri_freshness, ObservationFreshness::Unknown);
+        assert_eq!(observation.track_key, None);
+        assert_eq!(
+            observation.track_key_freshness,
+            ObservationFreshness::Unknown
+        );
         assert_eq!(observation.transport, Some(TransportState::Playing));
         assert_eq!(observation.transport_freshness, ObservationFreshness::Fresh);
         assert_eq!(observation.playback_instance, None);
@@ -1110,13 +1128,13 @@ mod tests {
         );
 
         let observation = observer.observe_sample(RawPlayerSample {
-            uri: Some("miliastra://track/qqmusic/1".to_owned()),
+            track: Some(track("miliastra://track/qqmusic/1")),
             transport: None,
             progress: Some(Duration::from_secs(21)),
             ..RawPlayerSample::default()
         });
 
-        assert_eq!(observation.uri_freshness, ObservationFreshness::Fresh);
+        assert_eq!(observation.track_key_freshness, ObservationFreshness::Fresh);
         assert!(matches!(
             observation.transport_freshness,
             ObservationFreshness::Stale { .. }
@@ -1137,18 +1155,18 @@ mod tests {
 
         clock.advance(Duration::from_secs(2)).unwrap();
         let stale = observer.observe_failure();
-        assert_eq!(stale.uri.as_deref(), Some("miliastra://track/qqmusic/1"));
+        assert_eq!(stale.track_key, Some(key("miliastra://track/qqmusic/1")));
         assert_eq!(
-            stale.uri_freshness,
+            stale.track_key_freshness,
             ObservationFreshness::Stale {
                 age: Duration::from_secs(2)
             }
         );
-        assert!(!stale.confirms_uri("miliastra://track/qqmusic/1"));
+        assert!(!stale.confirms_track(&key("miliastra://track/qqmusic/1")));
 
         clock.advance(Duration::from_secs(3)).unwrap();
         assert_eq!(
-            observer.current().uri_freshness,
+            observer.current().track_key_freshness,
             ObservationFreshness::Stale {
                 age: Duration::from_secs(5)
             }
@@ -1156,13 +1174,13 @@ mod tests {
 
         clock.advance(Duration::from_millis(1)).unwrap();
         let unknown = observer.current();
-        assert_eq!(unknown.uri, None);
-        assert_eq!(unknown.uri_freshness, ObservationFreshness::Unknown);
+        assert_eq!(unknown.track_key, None);
+        assert_eq!(unknown.track_key_freshness, ObservationFreshness::Unknown);
         assert_eq!(unknown.playback_instance, None);
     }
 
     #[test]
-    fn same_uri_recovers_from_stale_immediately() {
+    fn same_track_key_recovers_from_stale_immediately() {
         let clock = ManualClock::new(Instant::now());
         let mut observer = observer(&clock, PlayerObservationConfig::default());
         stabilize(
@@ -1179,13 +1197,13 @@ mod tests {
             21,
         ));
 
-        assert_eq!(recovered.uri_freshness, ObservationFreshness::Fresh);
-        assert!(recovered.confirms_uri("miliastra://track/qqmusic/1"));
+        assert_eq!(recovered.track_key_freshness, ObservationFreshness::Fresh);
+        assert!(recovered.confirms_track(&key("miliastra://track/qqmusic/1")));
         assert_eq!(recovered.playback_instance, Some(PlaybackInstance::INITIAL));
     }
 
     #[test]
-    fn a_different_uri_requires_full_stability_while_old_uri_is_stale() {
+    fn a_different_track_key_requires_full_stability_while_old_key_is_stale() {
         let clock = ManualClock::new(Instant::now());
         let mut observer = observer(&clock, PlayerObservationConfig::default());
         stabilize(
@@ -1200,27 +1218,30 @@ mod tests {
             TransportState::Playing,
             1,
         ));
-        assert_eq!(pending.uri.as_deref(), Some("miliastra://track/qqmusic/1"));
+        assert_eq!(pending.track_key, Some(key("miliastra://track/qqmusic/1")));
         assert!(matches!(
-            pending.uri_freshness,
+            pending.track_key_freshness,
             ObservationFreshness::Stale { .. }
         ));
-        let stable_evidence = pending.uri_evidence.as_ref().unwrap();
+        let stable_evidence = pending.track_key_evidence.as_ref().unwrap();
         assert!(stable_evidence.consecutive_samples >= stable_evidence.required_samples);
         assert!(stable_evidence.confirmed_at.is_some());
-        let uri_candidate = pending.uri_candidate.unwrap();
-        assert_eq!(uri_candidate.value, "miliastra://track/qqmusic/2");
-        assert_eq!(uri_candidate.consecutive_samples, 1);
-        assert_eq!(uri_candidate.required_samples, 2);
-        assert_eq!(uri_candidate.confirmed_at, None);
+        let track_key_candidate = pending.track_key_candidate.unwrap();
+        assert_eq!(
+            track_key_candidate.value,
+            key("miliastra://track/qqmusic/2")
+        );
+        assert_eq!(track_key_candidate.consecutive_samples, 1);
+        assert_eq!(track_key_candidate.required_samples, 2);
+        assert_eq!(track_key_candidate.confirmed_at, None);
 
         let accepted = observer.observe_sample(sample(
             "miliastra://track/qqmusic/2",
             TransportState::Playing,
             2,
         ));
-        assert_eq!(accepted.uri.as_deref(), Some("miliastra://track/qqmusic/2"));
-        assert_eq!(accepted.uri_freshness, ObservationFreshness::Fresh);
+        assert_eq!(accepted.track_key, Some(key("miliastra://track/qqmusic/2")));
+        assert_eq!(accepted.track_key_freshness, ObservationFreshness::Fresh);
         assert_eq!(
             accepted.playback_instance.map(PlaybackInstance::get),
             Some(2)
@@ -1228,7 +1249,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_uri_breaks_candidate_consecutiveness() {
+    fn missing_track_breaks_candidate_consecutiveness() {
         let clock = ManualClock::new(Instant::now());
         let mut observer = observer(&clock, PlayerObservationConfig::default());
         stabilize(
@@ -1243,7 +1264,7 @@ mod tests {
             1,
         ));
         observer.observe_sample(RawPlayerSample {
-            uri: None,
+            track: None,
             transport: Some(TransportState::Playing),
             ..RawPlayerSample::default()
         });
@@ -1255,14 +1276,14 @@ mod tests {
         ));
         assert_eq!(
             restarted
-                .uri_candidate
+                .track_key_candidate
                 .as_ref()
                 .map(|candidate| candidate.consecutive_samples),
             Some(1)
         );
         assert_eq!(
-            restarted.uri.as_deref(),
-            Some("miliastra://track/qqmusic/1")
+            restarted.track_key,
+            Some(key("miliastra://track/qqmusic/1"))
         );
     }
 
@@ -1283,11 +1304,11 @@ mod tests {
             2,
         ));
 
-        assert_eq!(restarted.uri, None);
+        assert_eq!(restarted.track_key, None);
         assert_eq!(restarted.transport, None);
         assert_eq!(
             restarted
-                .uri_candidate
+                .track_key_candidate
                 .map(|evidence| evidence.consecutive_samples),
             Some(1)
         );
@@ -1383,7 +1404,7 @@ mod tests {
     }
 
     #[test]
-    fn expired_same_uri_must_stabilize_again_without_inventing_a_new_instance() {
+    fn expired_same_track_key_must_stabilize_again_without_inventing_a_new_instance() {
         let clock = ManualClock::new(Instant::now());
         let mut observer = observer(&clock, PlayerObservationConfig::default());
         stabilize(
@@ -1395,7 +1416,7 @@ mod tests {
         observer.observe_failure();
         clock.advance(Duration::from_secs(6)).unwrap();
         assert_eq!(
-            observer.current().uri_freshness,
+            observer.current().track_key_freshness,
             ObservationFreshness::Unknown
         );
 
@@ -1404,14 +1425,14 @@ mod tests {
             TransportState::Playing,
             21,
         ));
-        assert_eq!(pending.uri_freshness, ObservationFreshness::Unknown);
+        assert_eq!(pending.track_key_freshness, ObservationFreshness::Unknown);
         let recovered = observer.observe_sample(sample(
             "miliastra://track/qqmusic/1",
             TransportState::Playing,
             22,
         ));
 
-        assert_eq!(recovered.uri_freshness, ObservationFreshness::Fresh);
+        assert_eq!(recovered.track_key_freshness, ObservationFreshness::Fresh);
         assert_eq!(
             recovered.playback_instance.map(PlaybackInstance::get),
             Some(1)
@@ -1419,7 +1440,7 @@ mod tests {
     }
 
     #[test]
-    fn transport_restart_waits_for_the_same_uri_to_recover() {
+    fn transport_restart_waits_for_the_same_track_key_to_recover() {
         let clock = ManualClock::new(Instant::now());
         let mut observer = observer(&clock, PlayerObservationConfig::default());
         stabilize(
@@ -1429,14 +1450,14 @@ mod tests {
             20,
         );
 
-        let missing_uri = RawPlayerSample {
-            uri: None,
+        let missing_track = RawPlayerSample {
+            track: None,
             transport: Some(TransportState::Playing),
             progress: Some(Duration::from_secs(20)),
             ..RawPlayerSample::default()
         };
-        observer.observe_sample(missing_uri.clone());
-        let restarted_without_identity = observer.observe_sample(missing_uri);
+        observer.observe_sample(missing_track.clone());
+        let restarted_without_identity = observer.observe_sample(missing_track);
         assert_eq!(
             restarted_without_identity
                 .playback_instance
@@ -1456,7 +1477,7 @@ mod tests {
     }
 
     #[test]
-    fn uri_change_and_later_transport_restart_advance_one_instance() {
+    fn track_key_change_and_later_transport_restart_advance_one_instance() {
         let clock = ManualClock::new(Instant::now());
         let mut observer = observer(
             &clock,
@@ -1479,13 +1500,15 @@ mod tests {
             TransportState::Playing,
             1,
         ));
-        let uri_accepted = observer.observe_sample(sample(
+        let track_key_accepted = observer.observe_sample(sample(
             "miliastra://track/qqmusic/2",
             TransportState::Playing,
             2,
         ));
         assert_eq!(
-            uri_accepted.playback_instance.map(PlaybackInstance::get),
+            track_key_accepted
+                .playback_instance
+                .map(PlaybackInstance::get),
             Some(2)
         );
 
@@ -1503,7 +1526,7 @@ mod tests {
     }
 
     #[test]
-    fn uri_accepted_without_transport_merges_the_later_playing_transition() {
+    fn track_key_accepted_without_transport_merges_the_later_playing_transition() {
         let clock = ManualClock::new(Instant::now());
         let mut observer = observer(&clock, PlayerObservationConfig::default());
         stabilize(
@@ -1513,16 +1536,18 @@ mod tests {
             20,
         );
 
-        let new_uri_without_transport = RawPlayerSample {
-            uri: Some("miliastra://track/qqmusic/2".to_owned()),
+        let new_track_without_transport = RawPlayerSample {
+            track: Some(track("miliastra://track/qqmusic/2")),
             transport: None,
             progress: Some(Duration::from_secs(1)),
             ..RawPlayerSample::default()
         };
-        observer.observe_sample(new_uri_without_transport.clone());
-        let uri_accepted = observer.observe_sample(new_uri_without_transport);
+        observer.observe_sample(new_track_without_transport.clone());
+        let track_key_accepted = observer.observe_sample(new_track_without_transport);
         assert_eq!(
-            uri_accepted.playback_instance.map(PlaybackInstance::get),
+            track_key_accepted
+                .playback_instance
+                .map(PlaybackInstance::get),
             Some(2)
         );
 
@@ -1545,7 +1570,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_same_uri_sample_preserves_existing_track_evidence() {
+    fn partial_same_track_sample_preserves_existing_track_evidence() {
         let clock = ManualClock::new(Instant::now());
         let mut observer = observer(&clock, PlayerObservationConfig::default());
         let mut complete = sample("miliastra://track/qqmusic/1", TransportState::Playing, 20);
@@ -1559,7 +1584,7 @@ mod tests {
         observer.observe_sample(complete);
 
         let partial = observer.observe_sample(RawPlayerSample {
-            uri: Some("miliastra://track/qqmusic/1".to_owned()),
+            track: Some(track("miliastra://track/qqmusic/1")),
             transport: Some(TransportState::Playing),
             ..RawPlayerSample::default()
         });
@@ -1588,7 +1613,7 @@ mod tests {
 
         clock.advance(Duration::from_secs(1)).unwrap();
         let missing = observer.observe_sample(RawPlayerSample {
-            uri: Some("miliastra://track/qqmusic/1".to_owned()),
+            track: Some(track("miliastra://track/qqmusic/1")),
             transport: Some(TransportState::Playing),
             volume: None,
             ..RawPlayerSample::default()
@@ -1599,7 +1624,7 @@ mod tests {
 
         clock.advance(Duration::from_secs(1)).unwrap();
         let updated = observer.observe_sample(RawPlayerSample {
-            uri: Some("miliastra://track/qqmusic/1".to_owned()),
+            track: Some(track("miliastra://track/qqmusic/1")),
             transport: Some(TransportState::Playing),
             volume: Some(80),
             ..RawPlayerSample::default()
@@ -1640,7 +1665,7 @@ mod tests {
                 TransportState::Playing,
                 1,
             ));
-            assert_eq!(first.uri_freshness, ObservationFreshness::Unknown);
+            assert_eq!(first.track_key_freshness, ObservationFreshness::Unknown);
             assert_eq!(first.transport_freshness, ObservationFreshness::Unknown);
 
             let second = observer.observe_sample(sample(
@@ -1648,7 +1673,7 @@ mod tests {
                 TransportState::Playing,
                 2,
             ));
-            assert_eq!(second.uri_freshness, ObservationFreshness::Fresh);
+            assert_eq!(second.track_key_freshness, ObservationFreshness::Fresh);
             assert_eq!(second.transport_freshness, ObservationFreshness::Fresh);
         }
     }
@@ -1671,9 +1696,9 @@ mod tests {
         assert_eq!(current.evaluated_at, started_at + Duration::from_secs(6));
         assert_eq!(current.last_attempted_at, Some(started_at));
         assert_eq!(current.last_successful_observed_at, Some(started_at));
-        assert_eq!(current.uri_freshness, ObservationFreshness::Unknown);
+        assert_eq!(current.track_key_freshness, ObservationFreshness::Unknown);
         assert_eq!(current.transport_freshness, ObservationFreshness::Unknown);
-        assert_eq!(current.uri, None);
+        assert_eq!(current.track_key, None);
         assert_eq!(current.transport, None);
     }
 
@@ -1691,7 +1716,7 @@ mod tests {
         failure_clock.advance(Duration::from_secs(6)).unwrap();
 
         let failed = failure_observer.observe_failure();
-        assert_eq!(failed.uri_freshness, ObservationFreshness::Unknown);
+        assert_eq!(failed.track_key_freshness, ObservationFreshness::Unknown);
         assert_eq!(failed.transport_freshness, ObservationFreshness::Unknown);
         assert_eq!(
             failed.last_attempted_at,
@@ -1710,7 +1735,7 @@ mod tests {
         empty_clock.advance(Duration::from_secs(6)).unwrap();
 
         let empty = empty_observer.observe_sample(RawPlayerSample::default());
-        assert_eq!(empty.uri_freshness, ObservationFreshness::Unknown);
+        assert_eq!(empty.track_key_freshness, ObservationFreshness::Unknown);
         assert_eq!(empty.transport_freshness, ObservationFreshness::Unknown);
         assert_eq!(
             empty.last_attempted_at,
@@ -1739,16 +1764,16 @@ mod tests {
             21,
         ));
 
-        let uri_evidence = confirmed.uri_evidence.unwrap();
-        assert_eq!(uri_evidence.value, "miliastra://track/qqmusic/1");
-        assert_eq!(uri_evidence.consecutive_samples, 2);
-        assert_eq!(uri_evidence.required_samples, 2);
+        let track_key_evidence = confirmed.track_key_evidence.unwrap();
+        assert_eq!(track_key_evidence.value, key("miliastra://track/qqmusic/1"));
+        assert_eq!(track_key_evidence.consecutive_samples, 2);
+        assert_eq!(track_key_evidence.required_samples, 2);
         assert_eq!(
-            uri_evidence.confirmed_at,
+            track_key_evidence.confirmed_at,
             Some(started_at + Duration::from_secs(1))
         );
         assert_eq!(
-            uri_evidence.last_sampled_at,
+            track_key_evidence.last_sampled_at,
             started_at + Duration::from_secs(1)
         );
 
@@ -1773,8 +1798,8 @@ mod tests {
             TransportState::Playing,
             1,
         ));
-        let candidate = pending.uri_candidate.unwrap();
-        assert_eq!(candidate.value, "miliastra://track/qqmusic/2");
+        let candidate = pending.track_key_candidate.unwrap();
+        assert_eq!(candidate.value, key("miliastra://track/qqmusic/2"));
         assert_eq!(candidate.consecutive_samples, 1);
         assert_eq!(candidate.required_samples, 2);
         assert_eq!(candidate.confirmed_at, None);
@@ -1806,7 +1831,7 @@ mod tests {
         );
         assert_eq!(reevaluated.last_attempted_at, Some(started_at));
         assert_eq!(reevaluated.last_successful_observed_at, Some(started_at));
-        assert_eq!(reevaluated.uri_freshness, ObservationFreshness::Fresh);
+        assert_eq!(reevaluated.track_key_freshness, ObservationFreshness::Fresh);
         assert_eq!(reevaluated.transport_freshness, ObservationFreshness::Fresh);
         assert_eq!(reevaluated.progress, Some(Duration::from_secs(22)));
     }
@@ -1829,10 +1854,13 @@ mod tests {
         let reevaluated =
             snapshot.reevaluated_at(started_at + Duration::from_secs(6), Duration::from_secs(5));
 
-        assert_eq!(reevaluated.uri, None);
-        assert_eq!(reevaluated.uri_freshness, ObservationFreshness::Unknown);
-        assert_eq!(reevaluated.uri_evidence, None);
-        assert_eq!(reevaluated.uri_candidate, None);
+        assert_eq!(reevaluated.track_key, None);
+        assert_eq!(
+            reevaluated.track_key_freshness,
+            ObservationFreshness::Unknown
+        );
+        assert_eq!(reevaluated.track_key_evidence, None);
+        assert_eq!(reevaluated.track_key_candidate, None);
         assert_eq!(reevaluated.playback_instance, None);
         assert_eq!(reevaluated.transport, None);
         assert_eq!(
@@ -1872,7 +1900,7 @@ mod tests {
             stale.reevaluated_at(started_at + Duration::from_secs(3), Duration::from_secs(5));
 
         assert_eq!(
-            reevaluated.uri_freshness,
+            reevaluated.track_key_freshness,
             ObservationFreshness::Stale {
                 age: Duration::from_secs(3)
             }
@@ -1887,7 +1915,7 @@ mod tests {
     }
 
     #[test]
-    fn accepting_a_new_uri_clears_the_previous_tracks_optional_evidence() {
+    fn accepting_a_new_track_key_clears_the_previous_tracks_optional_evidence() {
         let clock = ManualClock::new(Instant::now());
         let mut observer = observer(&clock, PlayerObservationConfig::default());
         let mut old = sample("miliastra://track/qqmusic/1", TransportState::Playing, 20);
@@ -1900,12 +1928,14 @@ mod tests {
         observer.observe_sample(old.clone());
         observer.observe_sample(old);
 
-        let new_track =
-            RawPlayerSample::new("miliastra://track/qqmusic/2", TransportState::Playing);
+        let new_track = RawPlayerSample::new(
+            track("miliastra://track/qqmusic/2"),
+            TransportState::Playing,
+        );
         observer.observe_sample(new_track.clone());
         let accepted = observer.observe_sample(new_track);
 
-        assert_eq!(accepted.uri.as_deref(), Some("miliastra://track/qqmusic/2"));
+        assert_eq!(accepted.track_key, Some(key("miliastra://track/qqmusic/2")));
         assert_eq!(accepted.title, None);
         assert_eq!(accepted.artist, None);
         assert_eq!(accepted.album_name, None);
@@ -1930,18 +1960,18 @@ mod tests {
             20,
         );
 
-        let missing_uri_playing = RawPlayerSample {
-            uri: None,
+        let missing_track_playing = RawPlayerSample {
+            track: None,
             transport: Some(TransportState::Playing),
             progress: Some(Duration::from_secs(20)),
             ..RawPlayerSample::default()
         };
-        observer.observe_sample(missing_uri_playing.clone());
-        observer.observe_sample(missing_uri_playing);
+        observer.observe_sample(missing_track_playing.clone());
+        observer.observe_sample(missing_track_playing);
 
         clock.advance(Duration::from_secs(6)).unwrap();
         assert_eq!(
-            observer.current().uri_freshness,
+            observer.current().track_key_freshness,
             ObservationFreshness::Unknown
         );
         observer.observe_sample(sample(
@@ -1972,7 +2002,7 @@ mod tests {
             20,
         );
         observer.observe_sample(RawPlayerSample {
-            uri: None,
+            track: None,
             transport: Some(TransportState::Playing),
             ..RawPlayerSample::default()
         });
@@ -1984,7 +2014,7 @@ mod tests {
         ));
         assert_eq!(
             recovered
-                .uri_evidence
+                .track_key_evidence
                 .as_ref()
                 .map(|evidence| evidence.consecutive_samples),
             Some(2)
@@ -2011,7 +2041,7 @@ mod tests {
 
         clock.advance(Duration::from_secs(1)).unwrap();
         let missing = observer.observe_sample(RawPlayerSample {
-            uri: Some("miliastra://track/qqmusic/1".to_owned()),
+            track: Some(track("miliastra://track/qqmusic/1")),
             transport: Some(TransportState::Playing),
             lyric_line_text: None,
             ..RawPlayerSample::default()
@@ -2021,7 +2051,7 @@ mod tests {
 
         clock.advance(Duration::from_secs(1)).unwrap();
         let blank = observer.observe_sample(RawPlayerSample {
-            uri: Some("miliastra://track/qqmusic/1".to_owned()),
+            track: Some(track("miliastra://track/qqmusic/1")),
             transport: Some(TransportState::Playing),
             lyric_line_text: Some("   ".to_owned()),
             ..RawPlayerSample::default()
@@ -2031,7 +2061,7 @@ mod tests {
 
         clock.advance(Duration::from_secs(1)).unwrap();
         let updated = observer.observe_sample(RawPlayerSample {
-            uri: Some("miliastra://track/qqmusic/1".to_owned()),
+            track: Some(track("miliastra://track/qqmusic/1")),
             transport: Some(TransportState::Playing),
             lyric_line_text: Some("  next line  ".to_owned()),
             ..RawPlayerSample::default()

@@ -25,6 +25,7 @@ use crate::domain::{ResolverLocator, SearchSpec, Song, SongKey, StreamSource};
 use crate::lyrics::TimedLyrics;
 
 const SEARCH_URL: &str = "https://api.bilibili.com/x/web-interface/wbi/search/type";
+const PROVIDER: &str = "bilibili";
 const NAV_URL: &str = "https://api.bilibili.com/x/web-interface/nav";
 const VIEW_URL: &str = "https://api.bilibili.com/x/web-interface/view";
 const PLAYURL_URL: &str = "https://api.bilibili.com/x/player/playurl";
@@ -391,15 +392,11 @@ impl BilibiliAdapter {
 
 #[async_trait]
 impl SourceAdapter for BilibiliAdapter {
-    fn source_code(&self) -> &'static str {
-        "bilibili"
-    }
-
     async fn validate_credential(
         &self,
         candidate: &ProviderCredential,
     ) -> Result<(), CatalogError> {
-        if candidate.provider() != self.source_code() {
+        if candidate.provider() != PROVIDER {
             return Err(CatalogError::InvalidResponse(
                 "Bilibili candidate provider does not match adapter".to_owned(),
             ));
@@ -432,16 +429,7 @@ impl SourceAdapter for BilibiliAdapter {
         Ok(())
     }
 
-    async fn search(&self, spec: &SearchSpec) -> Result<Vec<Song>, CatalogError> {
-        Ok(self
-            .search_candidates(spec)
-            .await?
-            .into_iter()
-            .map(|candidate| candidate.song)
-            .collect())
-    }
-
-    async fn search_candidates(
+    async fn search(
         &self,
         spec: &SearchSpec,
     ) -> Result<Vec<ProviderSearchCandidate>, CatalogError> {
@@ -454,7 +442,7 @@ impl SourceAdapter for BilibiliAdapter {
         key: &SongKey,
         locator: Option<&ResolverLocator>,
     ) -> Result<StreamSource, CatalogError> {
-        if key.source != self.source_code() {
+        if key.source != PROVIDER {
             return Err(CatalogError::InvalidResponse(
                 "song key provider does not match Bilibili adapter".to_owned(),
             ));
@@ -479,7 +467,7 @@ impl SourceAdapter for BilibiliAdapter {
         key: &SongKey,
         locator: Option<&ResolverLocator>,
     ) -> Result<Option<TimedLyrics>, CatalogError> {
-        if key.source != self.source_code() {
+        if key.source != PROVIDER {
             return Err(CatalogError::InvalidResponse(
                 "song key provider does not match Bilibili adapter".to_owned(),
             ));
@@ -1006,7 +994,7 @@ mod tests {
         .unwrap();
 
         let result = adapter
-            .search_candidates(&SearchSpec {
+            .search(&SearchSpec {
                 keyword: "music".to_owned(),
                 sources: Vec::new(),
                 limit: 1,

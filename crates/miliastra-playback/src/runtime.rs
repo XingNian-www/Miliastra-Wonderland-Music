@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
@@ -5,8 +6,8 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use serde::Serialize;
-use tokio::sync::mpsc;
-use tokio::task::JoinHandle as TokioJoinHandle;
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::{AbortHandle, Id as TaskId, JoinError, JoinHandle as TokioJoinHandle, JoinSet};
 use uuid::Uuid;
 
 use crate::catalog::{
@@ -37,6 +38,14 @@ pub struct PlaybackRuntime {
 #[derive(Clone)]
 pub struct PlaybackHandle {
     commands: mpsc::Sender<Command>,
+}
+
+pub struct PlaybackOperation {
+    reply: std_mpsc::Receiver<Result<(), PlaybackError>>,
+}
+
+pub struct LoginOperation {
+    reply: std_mpsc::Receiver<Result<CredentialStatus, PlaybackError>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -90,6 +99,16 @@ pub enum PlaybackError {
     Internal(String),
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum LoginOperationWaitError {
+    #[error("login operation timed out")]
+    TimedOut,
+    #[error("playback runtime stopped before the login operation completed")]
+    RuntimeStopped,
+    #[error(transparent)]
+    Playback(#[from] PlaybackError),
+}
+
 impl PlaybackError {
     pub fn code(&self) -> &'static str {
         match self {
@@ -107,6 +126,7 @@ impl PlaybackError {
                 "login_session_invalid" => "login_session_invalid",
                 "unknown_provider" => "unknown_provider",
                 "invalid_request" => "invalid_request",
+                "playback_cancelled" => "playback_cancelled",
                 _ => "playback_failed",
             },
             Self::Startup(_) => "playback_startup_failed",
@@ -143,6 +163,39 @@ enum LyricState {
         generation: u64,
         lyrics: Option<TimedLyrics>,
     },
+}
+
+struct PendingPlay {
+    reply: Reply<()>,
+    cancellation: oneshot::Sender<()>,
+    task: TokioJoinHandle<PlayCompletion>,
+}
+
+struct PlayCompletion {
+    track: PlayableTrack,
+    key: crate::domain::SongKey,
+    resolver_locator: Option<crate::domain::ResolverLocator>,
+    result: Result<crate::core::StartReceipt, PlaybackCoreError>,
+}
+
+struct PendingLoginValidation {
+    session_id: Uuid,
+    provider: ProviderId,
+    credential: ProviderCredential,
+    reply: Reply<CredentialStatus>,
+    task_id: TaskId,
+    abort: AbortHandle,
+}
+
+struct LoginValidationCompletion {
+    result: Result<(), PlaybackCoreError>,
+}
+
+enum RuntimeEvent {
+    Command(Option<Command>),
+    PlayCompleted(Result<PlayCompletion, JoinError>),
+    LoginValidationCompleted(Option<Result<(TaskId, LoginValidationCompletion), JoinError>>),
+    SearchCompleted(Option<Result<(), JoinError>>),
 }
 
 impl LyricState {
@@ -221,8 +274,10 @@ impl PlaybackHandle {
         self.request(|reply| Command::Search(query, reply))
     }
 
-    pub fn play(&self, track: PlayableTrack) -> Result<(), PlaybackError> {
-        self.request(|reply| Command::Play(track, reply))
+    pub fn play(&self, track: PlayableTrack) -> Result<PlaybackOperation, PlaybackError> {
+        Ok(PlaybackOperation {
+            reply: self.submit(|reply| Command::Play(track, reply))?,
+        })
     }
 
     pub fn pause(&self) -> Result<(), PlaybackError> {
@@ -276,8 +331,10 @@ impl PlaybackHandle {
         &self,
         session_id: Uuid,
         credential: ProviderCredential,
-    ) -> Result<CredentialStatus, PlaybackError> {
-        self.request(|reply| Command::CompleteLogin(session_id, credential, reply))
+    ) -> Result<LoginOperation, PlaybackError> {
+        Ok(LoginOperation {
+            reply: self.submit(|reply| Command::CompleteLogin(session_id, credential, reply))?,
+        })
     }
 
     pub fn cancel_login(&self, session_id: Uuid) -> Result<(), PlaybackError> {
@@ -289,6 +346,15 @@ impl PlaybackHandle {
     }
 
     fn request<T>(&self, command: impl FnOnce(Reply<T>) -> Command) -> Result<T, PlaybackError> {
+        self.submit(command)?
+            .recv()
+            .map_err(|_| PlaybackError::RuntimeStopped)?
+    }
+
+    fn submit<T>(
+        &self,
+        command: impl FnOnce(Reply<T>) -> Command,
+    ) -> Result<std_mpsc::Receiver<Result<T, PlaybackError>>, PlaybackError> {
         let (reply_tx, reply_rx) = std_mpsc::sync_channel(1);
         self.commands
             .try_send(command(reply_tx))
@@ -296,7 +362,36 @@ impl PlaybackHandle {
                 mpsc::error::TrySendError::Full(_) => PlaybackError::Busy,
                 mpsc::error::TrySendError::Closed(_) => PlaybackError::RuntimeStopped,
             })?;
-        reply_rx.recv().map_err(|_| PlaybackError::RuntimeStopped)?
+        Ok(reply_rx)
+    }
+}
+
+impl PlaybackOperation {
+    pub fn wait(self) -> Result<(), PlaybackError> {
+        self.reply
+            .recv()
+            .map_err(|_| PlaybackError::RuntimeStopped)?
+    }
+}
+
+impl LoginOperation {
+    pub fn wait(self) -> Result<CredentialStatus, PlaybackError> {
+        self.reply
+            .recv()
+            .map_err(|_| PlaybackError::RuntimeStopped)?
+    }
+
+    pub fn wait_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<CredentialStatus, LoginOperationWaitError> {
+        match self.reply.recv_timeout(timeout) {
+            Ok(result) => result.map_err(LoginOperationWaitError::Playback),
+            Err(std_mpsc::RecvTimeoutError::Timeout) => Err(LoginOperationWaitError::TimedOut),
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+                Err(LoginOperationWaitError::RuntimeStopped)
+            }
+        }
     }
 }
 
@@ -324,8 +419,8 @@ fn run_runtime_thread(
                 return;
             }
         };
-        let adapters = match build_catalog(&credentials) {
-            Ok(adapters) => adapters,
+        let catalog = match build_catalog(&credentials) {
+            Ok(catalog) => catalog,
             Err(error) => {
                 let _ = ready.send(Err(error));
                 return;
@@ -339,7 +434,7 @@ fn run_runtime_thread(
             }
         };
         let core = PlaybackCore::new_with_registry(
-            SourceCatalog::new(adapters),
+            catalog,
             ProviderRegistry,
             engine.clone(),
             SOURCE_TIMEOUT,
@@ -359,20 +454,27 @@ fn run_runtime_thread(
     });
 }
 
-fn build_catalog(
-    credentials: &CredentialStore,
-) -> Result<Vec<Arc<dyn SourceAdapter>>, PlaybackError> {
+fn build_catalog(credentials: &CredentialStore) -> Result<SourceCatalog, PlaybackError> {
     let qqmusic = QqMusicAdapter::new(credentials.clone(), SOURCE_TIMEOUT)
         .map_err(|error| PlaybackError::Startup(error.to_string()))?;
     let netease = NeteaseAdapter::new(credentials.clone(), SOURCE_TIMEOUT)
         .map_err(|error| PlaybackError::Startup(error.to_string()))?;
     let bilibili = BilibiliAdapter::new(credentials.clone(), SOURCE_TIMEOUT)
         .map_err(|error| PlaybackError::Startup(error.to_string()))?;
-    Ok(vec![
-        Arc::new(qqmusic),
-        Arc::new(netease),
-        Arc::new(bilibili),
-    ])
+    Ok(SourceCatalog::new([
+        (
+            ProviderId::QqMusic.to_string(),
+            Arc::new(qqmusic) as Arc<dyn SourceAdapter>,
+        ),
+        (
+            ProviderId::Netease.to_string(),
+            Arc::new(netease) as Arc<dyn SourceAdapter>,
+        ),
+        (
+            ProviderId::Bilibili.to_string(),
+            Arc::new(bilibili) as Arc<dyn SourceAdapter>,
+        ),
+    ]))
 }
 
 async fn run_commands(
@@ -383,43 +485,167 @@ async fn run_commands(
     let mut active_session: Option<SessionRef> = None;
     let mut active_track: Option<PlayableTrack> = None;
     let mut lyric_state: Option<LyricState> = None;
-    while let Some(command) = commands.recv().await {
+    let mut pending_play: Option<PendingPlay> = None;
+    let mut pending_login: Option<PendingLoginValidation> = None;
+    let mut searches = JoinSet::new();
+    let mut login_validations = JoinSet::new();
+    loop {
+        let event = if let Some(play) = pending_play.as_mut() {
+            tokio::select! {
+                biased;
+                completion = &mut play.task => RuntimeEvent::PlayCompleted(completion),
+                completion = login_validations.join_next_with_id(), if !login_validations.is_empty() => {
+                    RuntimeEvent::LoginValidationCompleted(completion)
+                }
+                command = commands.recv() => RuntimeEvent::Command(command),
+                completion = searches.join_next(), if !searches.is_empty() => {
+                    RuntimeEvent::SearchCompleted(completion)
+                }
+            }
+        } else {
+            tokio::select! {
+                biased;
+                completion = login_validations.join_next_with_id(), if !login_validations.is_empty() => {
+                    RuntimeEvent::LoginValidationCompleted(completion)
+                }
+                command = commands.recv() => RuntimeEvent::Command(command),
+                completion = searches.join_next(), if !searches.is_empty() => {
+                    RuntimeEvent::SearchCompleted(completion)
+                }
+            }
+        };
+
+        let command = match event {
+            RuntimeEvent::Command(Some(command)) => command,
+            RuntimeEvent::Command(None) => {
+                cancel_pending_play(&mut pending_play, &core, "playback runtime stopped");
+                cancel_pending_login(
+                    &mut pending_login,
+                    None,
+                    "playback runtime stopped during credential validation",
+                );
+                searches.abort_all();
+                login_validations.abort_all();
+                clear_lyric_state(&mut lyric_state);
+                return None;
+            }
+            RuntimeEvent::SearchCompleted(Some(Err(error))) if !error.is_cancelled() => {
+                tracing::warn!(%error, "playback search task failed");
+                continue;
+            }
+            RuntimeEvent::SearchCompleted(_) => continue,
+            RuntimeEvent::LoginValidationCompleted(completion) => {
+                let task_id = match &completion {
+                    Some(Ok((task_id, _))) => *task_id,
+                    Some(Err(error)) => error.id(),
+                    None => continue,
+                };
+                if pending_login
+                    .as_ref()
+                    .is_none_or(|pending| pending.task_id != task_id)
+                {
+                    continue;
+                }
+                let pending = pending_login
+                    .take()
+                    .expect("matching login validation exists");
+                let result = match completion {
+                    Some(Ok((_, completion))) => completion
+                        .result
+                        .map_err(PlaybackError::from)
+                        .and_then(|()| {
+                            credentials
+                                .save(pending.provider.as_str(), pending.credential)
+                                .map_err(internal_error)
+                        }),
+                    Some(Err(error)) if error.is_cancelled() => Err(PlaybackError::Failure(
+                        Failure::new("playback_cancelled", "credential validation was cancelled"),
+                    )),
+                    Some(Err(error)) => Err(PlaybackError::Internal(format!(
+                        "credential validation task failed: {error}"
+                    ))),
+                    None => unreachable!("empty login completion handled above"),
+                };
+                core.release_login(pending.session_id);
+                let _ = pending.reply.send(result);
+                continue;
+            }
+            RuntimeEvent::PlayCompleted(completion) => {
+                let Some(play) = pending_play.take() else {
+                    continue;
+                };
+                let result = match completion {
+                    Ok(completion) => completion
+                        .result
+                        .map(|receipt| {
+                            let lyric_core = core.clone();
+                            let generation = receipt.generation;
+                            lyric_state = Some(LyricState::Loading {
+                                generation,
+                                task: tokio::spawn(async move {
+                                    lyric_core
+                                        .lyrics(completion.key, completion.resolver_locator)
+                                        .await
+                                }),
+                            });
+                            active_session = Some(receipt.session_ref());
+                            active_track = Some(completion.track);
+                        })
+                        .map_err(PlaybackError::from),
+                    Err(error) => Err(PlaybackError::Internal(format!(
+                        "playback resolution task failed: {error}"
+                    ))),
+                };
+                let _ = play.reply.send(result);
+                continue;
+            }
+        };
+
         match command {
             Command::Search(query, reply) => {
-                let result = search(&core, query).await;
-                let _ = reply.send(result);
+                let search_core = core.clone();
+                searches.spawn(async move {
+                    let _ = reply.send(search(&search_core, query).await);
+                });
             }
             Command::Play(track, reply) => {
-                clear_lyric_state(&mut lyric_state);
                 let key = track.track_ref.key.to_song_key();
-                let result = match key {
-                    Ok(key) => {
-                        let resolver_locator = track.track_ref.resolver_locator.clone();
-                        let result = core
-                            .play(
-                                key.clone(),
-                                resolver_locator.clone(),
-                                EndBehavior::NotifyController,
-                            )
-                            .await;
-                        result
-                            .map(|receipt| {
-                                let lyric_core = core.clone();
-                                let generation = receipt.generation;
-                                lyric_state = Some(LyricState::Loading {
-                                    generation,
-                                    task: tokio::spawn(async move {
-                                        lyric_core.lyrics(key, resolver_locator).await
-                                    }),
-                                });
-                                active_session = Some(receipt.session_ref());
-                                active_track = Some(track);
-                            })
-                            .map_err(PlaybackError::from)
-                    }
-                    Err(error) => Err(PlaybackError::Internal(error.to_string())),
+                let Ok(key) = key else {
+                    let _ = reply.send(Err(PlaybackError::Internal(key.unwrap_err().to_string())));
+                    continue;
                 };
-                let _ = reply.send(result);
+                cancel_pending_play(
+                    &mut pending_play,
+                    &core,
+                    "play request was superseded by a newer request",
+                );
+                clear_lyric_state(&mut lyric_state);
+                let resolver_locator = track.track_ref.resolver_locator.clone();
+                let play_core = core.clone();
+                let task_key = key.clone();
+                let task_locator = resolver_locator.clone();
+                let (cancellation, cancelled) = oneshot::channel();
+                let task = tokio::spawn(async move {
+                    let result = play_core
+                        .play_cancellable(
+                            task_key.clone(),
+                            task_locator.clone(),
+                            EndBehavior::NotifyController,
+                            cancelled,
+                        )
+                        .await;
+                    PlayCompletion {
+                        track,
+                        key: task_key,
+                        resolver_locator: task_locator,
+                        result,
+                    }
+                });
+                pending_play = Some(PendingPlay {
+                    reply,
+                    cancellation,
+                    task,
+                });
             }
             Command::Pause(reply) => {
                 let result = match active_session {
@@ -436,8 +662,14 @@ async fn run_commands(
                 let _ = reply.send(result);
             }
             Command::Stop(reply) => {
+                let cancelled_pending = cancel_pending_play(
+                    &mut pending_play,
+                    &core,
+                    "play request was cancelled by stop",
+                );
                 let result = match active_session {
                     Some(session) => block_result(core.stop(session).await),
+                    None if cancelled_pending => Ok(()),
                     None => Err(PlaybackError::NoActiveSession),
                 };
                 if result.is_ok() {
@@ -499,35 +731,126 @@ async fn run_commands(
             }
             Command::CompleteLogin(session_id, credential, reply) => {
                 let provider = credential.provider().parse::<ProviderId>();
-                let result = match provider {
-                    Ok(provider) if core.owns_login(session_id, provider) => core
-                        .validate_credential(provider, &credential)
-                        .await
-                        .map_err(PlaybackError::from)
-                        .and_then(|()| {
-                            credentials
-                                .save(provider.as_str(), credential)
-                                .map_err(internal_error)
-                        }),
-                    _ => Err(PlaybackError::Failure(Failure::new(
+                let Ok(provider) = provider else {
+                    core.release_login(session_id);
+                    let _ = reply.send(Err(PlaybackError::Failure(Failure::new(
                         "login_session_invalid",
                         "login session is missing or does not match the credential provider",
-                    ))),
+                    ))));
+                    continue;
                 };
-                core.release_login(session_id);
-                let _ = reply.send(result);
+                if pending_login.is_some() {
+                    let _ = reply.send(Err(PlaybackError::Failure(Failure::new(
+                        "login_in_progress",
+                        "credential validation is already in progress",
+                    ))));
+                    continue;
+                }
+                if !core.owns_login(session_id, provider) {
+                    core.release_login(session_id);
+                    let _ = reply.send(Err(PlaybackError::Failure(Failure::new(
+                        "login_session_invalid",
+                        "login session is missing or does not match the credential provider",
+                    ))));
+                    continue;
+                }
+                let validation_core = core.clone();
+                let validation_credential = credential.clone();
+                let abort = login_validations.spawn(async move {
+                    LoginValidationCompletion {
+                        result: validation_core
+                            .validate_credential(provider, &validation_credential)
+                            .await,
+                    }
+                });
+                pending_login = Some(PendingLoginValidation {
+                    session_id,
+                    provider,
+                    credential,
+                    reply,
+                    task_id: abort.id(),
+                    abort,
+                });
             }
             Command::CancelLogin(session_id, reply) => {
+                cancel_pending_login(
+                    &mut pending_login,
+                    Some(session_id),
+                    "credential validation was cancelled",
+                );
                 core.release_login(session_id);
                 let _ = reply.send(Ok(()));
             }
             Command::Shutdown(reply) => {
+                cancel_pending_play(
+                    &mut pending_play,
+                    &core,
+                    "playback runtime is shutting down",
+                );
+                cancel_pending_login(
+                    &mut pending_login,
+                    None,
+                    "playback runtime is shutting down during credential validation",
+                );
+                searches.abort_all();
+                login_validations.abort_all();
                 clear_lyric_state(&mut lyric_state);
                 return Some(reply);
             }
         }
     }
-    None
+}
+
+fn cancel_pending_play(
+    pending: &mut Option<PendingPlay>,
+    core: &PlaybackCore,
+    message: &'static str,
+) -> bool {
+    let Some(play) = pending.take() else {
+        return false;
+    };
+    let _ = play.cancellation.send(());
+    let cleanup_core = core.clone();
+    tokio::spawn(async move {
+        match play.task.await {
+            Ok(completion) => {
+                if let Ok(receipt) = completion.result
+                    && let Err(error) = cleanup_core.stop(receipt.session_ref()).await
+                {
+                    tracing::debug!(%error, "cancelled playback receipt was already superseded");
+                }
+            }
+            Err(error) if !error.is_cancelled() => {
+                tracing::warn!(%error, "cancelled playback task failed during cleanup");
+            }
+            Err(_) => {}
+        }
+    });
+    let _ = play.reply.send(Err(PlaybackError::Failure(Failure::new(
+        "playback_cancelled",
+        message,
+    ))));
+    true
+}
+
+fn cancel_pending_login(
+    pending: &mut Option<PendingLoginValidation>,
+    session_id: Option<Uuid>,
+    message: &'static str,
+) -> bool {
+    if pending
+        .as_ref()
+        .is_none_or(|pending| session_id.is_some_and(|session_id| pending.session_id != session_id))
+    {
+        return false;
+    }
+    let pending = pending.take().expect("matching login validation exists");
+    pending.abort.abort();
+    let _ = pending.reply.send(Err(PlaybackError::Failure(Failure::new(
+        "playback_cancelled",
+        message,
+    ))));
+    true
 }
 
 fn clear_lyric_state(state: &mut Option<LyricState>) {
@@ -597,11 +920,29 @@ async fn search(
         })
         .await
         .map_err(PlaybackError::from)?;
-    result
+    let mut provider_candidates = result
         .outcomes
         .into_iter()
-        .flat_map(|outcome| outcome.candidates)
-        .take(limit)
+        .map(|outcome| VecDeque::from(outcome.candidates))
+        .collect::<Vec<_>>();
+    let mut selected = Vec::with_capacity(limit);
+    while selected.len() < limit {
+        let mut advanced = false;
+        for candidates in &mut provider_candidates {
+            if let Some(candidate) = candidates.pop_front() {
+                selected.push(candidate);
+                advanced = true;
+                if selected.len() == limit {
+                    break;
+                }
+            }
+        }
+        if !advanced {
+            break;
+        }
+    }
+    selected
+        .into_iter()
         .map(|candidate| {
             SearchCandidate::from_song(candidate.song, candidate.eligibility)
                 .map_err(|error| PlaybackError::Internal(error.to_string()))
@@ -650,6 +991,10 @@ impl From<PlaybackCoreError> for PlaybackError {
     fn from(error: PlaybackCoreError) -> Self {
         match error {
             PlaybackCoreError::Failure(failure) => Self::Failure(failure),
+            PlaybackCoreError::Cancelled => Self::Failure(Failure::new(
+                "playback_cancelled",
+                "playback operation was cancelled",
+            )),
             PlaybackCoreError::Catalog(error) => Self::Failure(error.as_failure(None)),
             PlaybackCoreError::SearchFailed { outcomes } => {
                 let failure = outcomes
@@ -678,31 +1023,38 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
-    use tokio::sync::watch;
+    use tokio::sync::{Notify, watch};
     use url::Url;
 
     use super::*;
-    use crate::catalog::CatalogError;
+    use crate::catalog::{CatalogError, PlaybackEligibility, ProviderSearchCandidate};
     use crate::domain::{PlaybackSnapshot as EngineSnapshot, Song, SongKey, StreamSource};
     use crate::engine::{AudioEngine, EngineCommand, EngineError};
     use crate::lyrics::{TimedLyricLine, TimedLyrics};
 
     struct FakeSource;
 
+    struct SearchSource {
+        provider: ProviderId,
+        count: usize,
+    }
+
     #[async_trait]
     impl SourceAdapter for FakeSource {
-        fn source_code(&self) -> &'static str {
-            "qqmusic"
-        }
-
-        async fn search(&self, spec: &SearchSpec) -> Result<Vec<Song>, CatalogError> {
-            Ok(vec![Song {
-                key: SongKey::new("qqmusic", "track-1").unwrap(),
-                resolver_locator: None,
-                title: spec.keyword.clone(),
-                artists: vec!["Singer".to_owned()],
-                album: Some("Album".to_owned()),
-                duration_ms: Some(123_000),
+        async fn search(
+            &self,
+            spec: &SearchSpec,
+        ) -> Result<Vec<ProviderSearchCandidate>, CatalogError> {
+            Ok(vec![ProviderSearchCandidate {
+                song: Song {
+                    key: SongKey::new("qqmusic", "track-1").unwrap(),
+                    resolver_locator: None,
+                    title: spec.keyword.clone(),
+                    artists: vec!["Singer".to_owned()],
+                    album: Some("Album".to_owned()),
+                    duration_ms: Some(123_000),
+                },
+                eligibility: PlaybackEligibility::Unknown,
             }])
         }
 
@@ -734,10 +1086,200 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl SourceAdapter for SearchSource {
+        async fn search(
+            &self,
+            spec: &SearchSpec,
+        ) -> Result<Vec<ProviderSearchCandidate>, CatalogError> {
+            Ok((0..self.count)
+                .map(|index| ProviderSearchCandidate {
+                    song: Song {
+                        key: SongKey::new(
+                            self.provider.as_str(),
+                            format!("{}-{index}", self.provider.as_str()),
+                        )
+                        .unwrap(),
+                        resolver_locator: None,
+                        title: spec.keyword.clone(),
+                        artists: vec!["Singer".to_owned()],
+                        album: None,
+                        duration_ms: Some(180_000),
+                    },
+                    eligibility: PlaybackEligibility::Eligible,
+                })
+                .collect())
+        }
+
+        async fn resolve(
+            &self,
+            _key: &SongKey,
+            _locator: Option<&crate::domain::ResolverLocator>,
+        ) -> Result<StreamSource, CatalogError> {
+            unreachable!("search fairness test does not resolve tracks")
+        }
+    }
+
+    struct BlockingSource {
+        resolve_started: Mutex<Option<std_mpsc::SyncSender<()>>>,
+        release_resolve: Notify,
+    }
+
+    #[async_trait]
+    impl SourceAdapter for BlockingSource {
+        async fn search(
+            &self,
+            _spec: &SearchSpec,
+        ) -> Result<Vec<ProviderSearchCandidate>, CatalogError> {
+            Ok(Vec::new())
+        }
+
+        async fn resolve(
+            &self,
+            _key: &SongKey,
+            _locator: Option<&crate::domain::ResolverLocator>,
+        ) -> Result<StreamSource, CatalogError> {
+            if let Some(started) = self.resolve_started.lock().unwrap().take() {
+                let _ = started.send(());
+            }
+            self.release_resolve.notified().await;
+            Ok(StreamSource {
+                url: Url::parse("https://example.test/audio.m4a").unwrap(),
+                headers: BTreeMap::new(),
+                expires_at_epoch_ms: None,
+            })
+        }
+    }
+
+    struct BlockingSearchSource {
+        search_started: Mutex<Option<std_mpsc::SyncSender<()>>>,
+        release_search: Notify,
+    }
+
+    struct BlockingCredentialSource {
+        validation_started: Mutex<Option<std_mpsc::SyncSender<()>>>,
+        release_validation: Notify,
+    }
+
+    #[async_trait]
+    impl SourceAdapter for BlockingSearchSource {
+        async fn search(
+            &self,
+            _spec: &SearchSpec,
+        ) -> Result<Vec<ProviderSearchCandidate>, CatalogError> {
+            if let Some(started) = self.search_started.lock().unwrap().take() {
+                let _ = started.send(());
+            }
+            self.release_search.notified().await;
+            Ok(Vec::new())
+        }
+
+        async fn resolve(
+            &self,
+            _key: &SongKey,
+            _locator: Option<&crate::domain::ResolverLocator>,
+        ) -> Result<StreamSource, CatalogError> {
+            unreachable!("search responsiveness test does not resolve tracks")
+        }
+    }
+
+    #[async_trait]
+    impl SourceAdapter for BlockingCredentialSource {
+        async fn validate_credential(
+            &self,
+            _candidate: &ProviderCredential,
+        ) -> Result<(), CatalogError> {
+            if let Some(started) = self.validation_started.lock().unwrap().take() {
+                let _ = started.send(());
+            }
+            self.release_validation.notified().await;
+            Ok(())
+        }
+
+        async fn search(
+            &self,
+            _spec: &SearchSpec,
+        ) -> Result<Vec<ProviderSearchCandidate>, CatalogError> {
+            Ok(Vec::new())
+        }
+
+        async fn resolve(
+            &self,
+            _key: &SongKey,
+            _locator: Option<&crate::domain::ResolverLocator>,
+        ) -> Result<StreamSource, CatalogError> {
+            unreachable!("credential responsiveness test does not resolve tracks")
+        }
+    }
+
     struct FakeEngine {
         snapshot_tx: watch::Sender<EngineSnapshot>,
         snapshot: watch::Receiver<EngineSnapshot>,
         commands: Mutex<Vec<EngineCommand>>,
+    }
+
+    struct CommittingEngine {
+        snapshot_tx: watch::Sender<EngineSnapshot>,
+        snapshot: watch::Receiver<EngineSnapshot>,
+        start_committed: Mutex<Option<std_mpsc::SyncSender<()>>>,
+        release_start: Notify,
+    }
+
+    impl CommittingEngine {
+        fn new(start_committed: std_mpsc::SyncSender<()>) -> Self {
+            let (snapshot_tx, snapshot) = watch::channel(EngineSnapshot::default());
+            Self {
+                snapshot_tx,
+                snapshot,
+                start_committed: Mutex::new(Some(start_committed)),
+                release_start: Notify::new(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl AudioEngine for CommittingEngine {
+        async fn command(&self, command: EngineCommand) -> Result<(), EngineError> {
+            let mut snapshot = self.snapshot.borrow().clone();
+            match command {
+                EngineCommand::Start {
+                    session_id,
+                    generation,
+                    song_key,
+                    end_behavior,
+                    ..
+                } => {
+                    snapshot.generation = generation;
+                    snapshot.session_id = Some(session_id);
+                    snapshot.song_key = Some(song_key);
+                    snapshot.end_behavior = Some(end_behavior);
+                    snapshot.state = EngineState::Playing;
+                    self.snapshot_tx.send_replace(snapshot);
+                    if let Some(committed) = self.start_committed.lock().unwrap().take() {
+                        let _ = committed.send(());
+                    }
+                    self.release_start.notified().await;
+                }
+                EngineCommand::Stop { session } => {
+                    if snapshot.generation == session.generation
+                        && snapshot.session_id == Some(session.session_id)
+                    {
+                        snapshot.state = EngineState::Stopped;
+                        self.snapshot_tx.send_replace(snapshot);
+                    }
+                }
+                EngineCommand::Pause { .. }
+                | EngineCommand::Resume { .. }
+                | EngineCommand::SetVolume { .. }
+                | EngineCommand::RefreshStream { .. }
+                | EngineCommand::Seek { .. } => {}
+            }
+            Ok(())
+        }
+
+        fn subscribe(&self) -> watch::Receiver<EngineSnapshot> {
+            self.snapshot.clone()
+        }
     }
 
     impl FakeEngine {
@@ -787,10 +1329,34 @@ mod tests {
     }
 
     fn test_runtime() -> PlaybackRuntime {
+        test_runtime_with_source(Arc::new(FakeSource))
+    }
+
+    fn test_runtime_with_source(source: Arc<dyn SourceAdapter>) -> PlaybackRuntime {
         let credentials = CredentialStore::memory();
         let engine = Arc::new(FakeEngine::new());
+        test_runtime_with_parts(source, engine, credentials)
+    }
+
+    fn test_runtime_with_parts(
+        source: Arc<dyn SourceAdapter>,
+        engine: Arc<dyn AudioEngine>,
+        credentials: CredentialStore,
+    ) -> PlaybackRuntime {
+        test_runtime_with_catalog(
+            vec![(ProviderId::QqMusic.to_string(), source)],
+            engine,
+            credentials,
+        )
+    }
+
+    fn test_runtime_with_catalog(
+        sources: Vec<(String, Arc<dyn SourceAdapter>)>,
+        engine: Arc<dyn AudioEngine>,
+        credentials: CredentialStore,
+    ) -> PlaybackRuntime {
         let core = PlaybackCore::new_with_registry(
-            SourceCatalog::new([Arc::new(FakeSource) as Arc<dyn SourceAdapter>]),
+            SourceCatalog::new(sources),
             ProviderRegistry,
             engine,
             Duration::from_secs(1),
@@ -817,6 +1383,211 @@ mod tests {
     }
 
     #[test]
+    fn multi_provider_search_preserves_candidates_from_each_provider() {
+        let sources = ProviderId::ALL
+            .into_iter()
+            .map(|provider| {
+                (
+                    provider.to_string(),
+                    Arc::new(SearchSource { provider, count: 3 }) as Arc<dyn SourceAdapter>,
+                )
+            })
+            .collect();
+        let runtime = test_runtime_with_catalog(
+            sources,
+            Arc::new(FakeEngine::new()),
+            CredentialStore::memory(),
+        );
+
+        let candidates = runtime
+            .handle()
+            .search(SearchQuery {
+                keyword: "Test Song".to_owned(),
+                providers: ProviderId::ALL.to_vec(),
+                limit: 3,
+            })
+            .unwrap();
+
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.track_ref.key.provider)
+                .collect::<Vec<_>>(),
+            ProviderId::ALL
+        );
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn blocking_resolution_keeps_the_actor_responsive_and_can_be_stopped() {
+        let (started_tx, started_rx) = std_mpsc::sync_channel(1);
+        let runtime = test_runtime_with_source(Arc::new(BlockingSource {
+            resolve_started: Mutex::new(Some(started_tx)),
+            release_resolve: Notify::new(),
+        }));
+        let handle = runtime.handle();
+        let submit_started = std::time::Instant::now();
+        let play = handle
+            .play(PlayableTrack {
+                track_ref: crate::model::TrackRef {
+                    key: crate::model::TrackKey::new(ProviderId::QqMusic, "blocked").unwrap(),
+                    resolver_locator: None,
+                },
+                metadata: crate::model::TrackMetadata {
+                    title: "blocked".to_owned(),
+                    artists: vec!["artist".to_owned()],
+                    album: None,
+                    duration_ms: Some(10_000),
+                },
+            })
+            .unwrap();
+        assert!(submit_started.elapsed() < Duration::from_millis(250));
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("play resolution started");
+
+        let snapshot_started = std::time::Instant::now();
+        handle.snapshot().expect("snapshot remains responsive");
+        assert!(snapshot_started.elapsed() < Duration::from_millis(250));
+
+        let stop_started = std::time::Instant::now();
+        handle.stop().expect("stop cancels pending resolution");
+        assert!(stop_started.elapsed() < Duration::from_millis(250));
+        assert!(matches!(
+            play.wait(),
+            Err(PlaybackError::Failure(failure)) if failure.code == "playback_cancelled"
+        ));
+
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn blocking_search_keeps_the_actor_responsive_and_shutdown_cancels_it() {
+        let (started_tx, started_rx) = std_mpsc::sync_channel(1);
+        let runtime = test_runtime_with_source(Arc::new(BlockingSearchSource {
+            search_started: Mutex::new(Some(started_tx)),
+            release_search: Notify::new(),
+        }));
+        let handle = runtime.handle();
+        let search_handle = handle.clone();
+        let search = thread::spawn(move || {
+            search_handle.search(SearchQuery {
+                keyword: "blocked".to_owned(),
+                providers: vec![ProviderId::QqMusic],
+                limit: 5,
+            })
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("provider search started");
+
+        let snapshot_started = std::time::Instant::now();
+        handle.snapshot().expect("snapshot remains responsive");
+        assert!(snapshot_started.elapsed() < Duration::from_millis(250));
+
+        runtime.shutdown().unwrap();
+        assert!(matches!(
+            search.join().expect("search caller joins"),
+            Err(PlaybackError::RuntimeStopped)
+        ));
+    }
+
+    #[test]
+    fn blocking_credential_validation_is_responsive_and_cancellable() {
+        let (started_tx, started_rx) = std_mpsc::sync_channel(1);
+        let credentials = CredentialStore::memory();
+        let runtime = test_runtime_with_parts(
+            Arc::new(BlockingCredentialSource {
+                validation_started: Mutex::new(Some(started_tx)),
+                release_validation: Notify::new(),
+            }),
+            Arc::new(FakeEngine::new()),
+            credentials.clone(),
+        );
+        let handle = runtime.handle();
+        let login = handle.begin_login(ProviderId::QqMusic).unwrap();
+        let complete_handle = handle.clone();
+        let completion = thread::spawn(move || {
+            complete_handle
+                .complete_login(
+                    login.session_id,
+                    ProviderCredential::QqMusic {
+                        cookies: BTreeMap::from([
+                            ("uin".to_owned(), "123".to_owned()),
+                            ("qqmusic_key".to_owned(), "secret".to_owned()),
+                        ]),
+                    },
+                )
+                .and_then(LoginOperation::wait)
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("credential validation started");
+
+        let snapshot_started = std::time::Instant::now();
+        handle.snapshot().expect("snapshot remains responsive");
+        assert!(snapshot_started.elapsed() < Duration::from_millis(250));
+
+        let cancel_started = std::time::Instant::now();
+        handle.cancel_login(login.session_id).unwrap();
+        assert!(cancel_started.elapsed() < Duration::from_millis(250));
+        assert!(matches!(
+            completion.join().expect("completion caller joins"),
+            Err(PlaybackError::Failure(failure)) if failure.code == "playback_cancelled"
+        ));
+        assert!(!handle.login_status().unwrap().active);
+        assert!(credentials.get("qqmusic").unwrap().is_none());
+
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn stop_during_start_commit_cannot_leave_untracked_playback() {
+        let (committed_tx, committed_rx) = std_mpsc::sync_channel(1);
+        let runtime = test_runtime_with_parts(
+            Arc::new(FakeSource),
+            Arc::new(CommittingEngine::new(committed_tx)),
+            CredentialStore::memory(),
+        );
+        let handle = runtime.handle();
+        let play_handle = handle.clone();
+        let play = thread::spawn(move || {
+            play_handle
+                .play(PlayableTrack {
+                    track_ref: crate::model::TrackRef {
+                        key: crate::model::TrackKey::new(ProviderId::QqMusic, "committed").unwrap(),
+                        resolver_locator: None,
+                    },
+                    metadata: crate::model::TrackMetadata {
+                        title: "committed".to_owned(),
+                        artists: vec!["artist".to_owned()],
+                        album: None,
+                        duration_ms: Some(10_000),
+                    },
+                })
+                .and_then(PlaybackOperation::wait)
+        });
+        committed_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("engine start committed");
+
+        handle.stop().expect("stop cancels the committing play");
+        let deadline = std::time::Instant::now() + Duration::from_millis(250);
+        while std::time::Instant::now() < deadline
+            && handle.snapshot().unwrap().state != EngineState::Stopped
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(handle.snapshot().unwrap().state, EngineState::Stopped);
+        assert!(matches!(
+            play.join().expect("play caller joins"),
+            Err(PlaybackError::Failure(failure)) if failure.code == "playback_cancelled"
+        ));
+
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
     fn handle_drives_structured_playback_credentials_and_login() {
         let runtime = test_runtime();
         let handle = runtime.handle();
@@ -834,7 +1605,7 @@ mod tests {
             metadata: candidates[0].metadata.clone(),
         };
 
-        handle.play(track.clone()).unwrap();
+        handle.play(track.clone()).unwrap().wait().unwrap();
         assert_eq!(handle.snapshot().unwrap().track, Some(track));
         handle.pause().unwrap();
         assert_eq!(handle.snapshot().unwrap().state, EngineState::Paused);
@@ -859,6 +1630,8 @@ mod tests {
                     ]),
                 },
             )
+            .unwrap()
+            .wait()
             .unwrap();
         assert!(status.configured);
         assert!(!handle.login_status().unwrap().active);
@@ -901,8 +1674,8 @@ mod tests {
             },
         };
 
-        handle.play(first).unwrap();
-        handle.play(second).unwrap();
+        handle.play(first).unwrap().wait().unwrap();
+        handle.play(second).unwrap().wait().unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
         let mut line = None;
         while std::time::Instant::now() < deadline {

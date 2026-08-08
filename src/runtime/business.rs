@@ -6,6 +6,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use miliastra_playback::TrackKey;
+
 use crate::features::administration::{
     AdministrationMutationIntent, AdministrationMutationOutcome,
 };
@@ -502,7 +504,7 @@ enum PlaybackRuntimeMessage {
         response: SyncSender<Result<(), BusinessRuntimeError>>,
     },
     ObserveExternalPlayback {
-        identity: String,
+        identity: TrackKey,
         now: Instant,
         protect_after: Duration,
         response: SyncSender<Result<ExternalPlaybackObservation, BusinessRuntimeError>>,
@@ -1272,7 +1274,7 @@ impl BusinessRuntimeHandle {
 
     pub(crate) fn observe_external_playback(
         &self,
-        identity: String,
+        identity: TrackKey,
         now: Instant,
         protect_after: Duration,
     ) -> Result<ExternalPlaybackObservation, BusinessRuntimeError> {

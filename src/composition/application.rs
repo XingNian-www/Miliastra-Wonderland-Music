@@ -131,7 +131,7 @@ use crate::ui::template::{best_template_hit, find_template_hits};
 use anyhow::{Context, Result, anyhow};
 use enigo::Key;
 use image::DynamicImage;
-use miliastra_playback::{PlaybackHandle, PlaybackRuntime as NativePlaybackRuntime};
+use miliastra_playback::{PlaybackHandle, PlaybackRuntime as NativePlaybackRuntime, TrackKey};
 
 const TARGET_MISSING_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const TARGET_MISSING_BACKOFF_MAX: Duration = Duration::from_secs(60);
@@ -465,7 +465,7 @@ impl PlaybackStatePort for BusinessPlaybackStateAdapter {
 
     fn observe_external_playback(
         &self,
-        identity: String,
+        identity: TrackKey,
         now: Instant,
         protect_after: Duration,
     ) -> Result<ExternalPlaybackObservation> {

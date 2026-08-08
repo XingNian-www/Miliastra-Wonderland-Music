@@ -13,8 +13,8 @@ use crate::catalog::{
     BilibiliAdapter, NeteaseAdapter, ProviderId, ProviderRegistry, QqMusicAdapter, SourceAdapter,
     SourceCatalog,
 };
+use crate::core::{PlaybackCore, PlaybackCoreError};
 use crate::credentials::{CredentialStatus, CredentialStore, ProviderCredential};
-use crate::daemon::{DaemonError, PlayerDaemon};
 use crate::domain::{
     EndBehavior, EndCause, EngineState, Failure, PlaybackSnapshot as EngineSnapshot, SearchSpec,
     SessionRef,
@@ -137,7 +137,7 @@ enum Command {
 enum LyricState {
     Loading {
         generation: u64,
-        task: TokioJoinHandle<Result<Option<TimedLyrics>, DaemonError>>,
+        task: TokioJoinHandle<Result<Option<TimedLyrics>, PlaybackCoreError>>,
     },
     Ready {
         generation: u64,
@@ -338,7 +338,7 @@ fn run_runtime_thread(
                 return;
             }
         };
-        let daemon = PlayerDaemon::new_with_registry(
+        let core = PlaybackCore::new_with_registry(
             SourceCatalog::new(adapters),
             ProviderRegistry,
             engine.clone(),
@@ -348,7 +348,7 @@ fn run_runtime_thread(
             let _ = engine.shutdown().await;
             return;
         }
-        let shutdown_reply = run_commands(command_rx, daemon, credentials).await;
+        let shutdown_reply = run_commands(command_rx, core, credentials).await;
         let shutdown_result = engine
             .shutdown()
             .await
@@ -377,7 +377,7 @@ fn build_catalog(
 
 async fn run_commands(
     mut commands: mpsc::Receiver<Command>,
-    daemon: PlayerDaemon,
+    core: PlaybackCore,
     credentials: CredentialStore,
 ) -> Option<Reply<()>> {
     let mut active_session: Option<SessionRef> = None;
@@ -386,7 +386,7 @@ async fn run_commands(
     while let Some(command) = commands.recv().await {
         match command {
             Command::Search(query, reply) => {
-                let result = search(&daemon, query).await;
+                let result = search(&core, query).await;
                 let _ = reply.send(result);
             }
             Command::Play(track, reply) => {
@@ -395,7 +395,7 @@ async fn run_commands(
                 let result = match key {
                     Ok(key) => {
                         let resolver_locator = track.track_ref.resolver_locator.clone();
-                        let result = daemon
+                        let result = core
                             .play(
                                 key.clone(),
                                 resolver_locator.clone(),
@@ -404,12 +404,12 @@ async fn run_commands(
                             .await;
                         result
                             .map(|receipt| {
-                                let lyric_daemon = daemon.clone();
+                                let lyric_core = core.clone();
                                 let generation = receipt.generation;
                                 lyric_state = Some(LyricState::Loading {
                                     generation,
                                     task: tokio::spawn(async move {
-                                        lyric_daemon.lyrics(key, resolver_locator).await
+                                        lyric_core.lyrics(key, resolver_locator).await
                                     }),
                                 });
                                 active_session = Some(receipt.session_ref());
@@ -423,21 +423,21 @@ async fn run_commands(
             }
             Command::Pause(reply) => {
                 let result = match active_session {
-                    Some(session) => block_result(daemon.pause(session).await),
+                    Some(session) => block_result(core.pause(session).await),
                     None => Err(PlaybackError::NoActiveSession),
                 };
                 let _ = reply.send(result);
             }
             Command::Resume(reply) => {
                 let result = match active_session {
-                    Some(session) => block_result(daemon.resume(session).await),
+                    Some(session) => block_result(core.resume(session).await),
                     None => Err(PlaybackError::NoActiveSession),
                 };
                 let _ = reply.send(result);
             }
             Command::Stop(reply) => {
                 let result = match active_session {
-                    Some(session) => block_result(daemon.stop(session).await),
+                    Some(session) => block_result(core.stop(session).await),
                     None => Err(PlaybackError::NoActiveSession),
                 };
                 if result.is_ok() {
@@ -446,10 +446,10 @@ async fn run_commands(
                 let _ = reply.send(result);
             }
             Command::SetVolume(volume, reply) => {
-                let _ = reply.send(block_result(daemon.set_volume(volume).await));
+                let _ = reply.send(block_result(core.set_volume(volume).await));
             }
             Command::Snapshot(reply) => {
-                let engine_snapshot = daemon.snapshot();
+                let engine_snapshot = core.snapshot();
                 let lyric_line_text =
                     lyric_line_for_snapshot(&mut lyric_state, &engine_snapshot).await;
                 let snapshot =
@@ -477,7 +477,7 @@ async fn run_commands(
                 );
             }
             Command::BeginLogin(provider, reply) => {
-                let result = daemon
+                let result = core
                     .acquire_login(provider)
                     .map(|(session_id, provider)| LoginSession {
                         session_id,
@@ -487,7 +487,7 @@ async fn run_commands(
                 let _ = reply.send(result);
             }
             Command::LoginStatus(reply) => {
-                let status = daemon.login_coordinator().active().map_or_else(
+                let status = core.login_coordinator().active().map_or_else(
                     LoginStatus::default,
                     |(session_id, provider)| LoginStatus {
                         active: true,
@@ -500,7 +500,7 @@ async fn run_commands(
             Command::CompleteLogin(session_id, credential, reply) => {
                 let provider = credential.provider().parse::<ProviderId>();
                 let result = match provider {
-                    Ok(provider) if daemon.owns_login(session_id, provider) => daemon
+                    Ok(provider) if core.owns_login(session_id, provider) => core
                         .validate_credential(provider, &credential)
                         .await
                         .map_err(PlaybackError::from)
@@ -514,11 +514,11 @@ async fn run_commands(
                         "login session is missing or does not match the credential provider",
                     ))),
                 };
-                daemon.release_login(session_id);
+                core.release_login(session_id);
                 let _ = reply.send(result);
             }
             Command::CancelLogin(session_id, reply) => {
-                daemon.release_login(session_id);
+                core.release_login(session_id);
                 let _ = reply.send(Ok(()));
             }
             Command::Shutdown(reply) => {
@@ -581,11 +581,11 @@ async fn lyric_line_for_snapshot(
 }
 
 async fn search(
-    daemon: &PlayerDaemon,
+    core: &PlaybackCore,
     query: SearchQuery,
 ) -> Result<Vec<SearchCandidate>, PlaybackError> {
     let limit = query.limit;
-    let result = daemon
+    let result = core
         .search(SearchSpec {
             keyword: query.keyword,
             sources: query
@@ -638,7 +638,7 @@ fn public_snapshot(
     }
 }
 
-fn block_result(result: Result<(), DaemonError>) -> Result<(), PlaybackError> {
+fn block_result(result: Result<(), PlaybackCoreError>) -> Result<(), PlaybackError> {
     result.map_err(PlaybackError::from)
 }
 
@@ -646,26 +646,26 @@ fn internal_error(error: impl std::fmt::Display) -> PlaybackError {
     PlaybackError::Internal(error.to_string())
 }
 
-impl From<DaemonError> for PlaybackError {
-    fn from(error: DaemonError) -> Self {
+impl From<PlaybackCoreError> for PlaybackError {
+    fn from(error: PlaybackCoreError) -> Self {
         match error {
-            DaemonError::Failure(failure) => Self::Failure(failure),
-            DaemonError::Catalog(error) => Self::Failure(error.as_failure(None)),
-            DaemonError::SearchFailed { outcomes } => {
+            PlaybackCoreError::Failure(failure) => Self::Failure(failure),
+            PlaybackCoreError::Catalog(error) => Self::Failure(error.as_failure(None)),
+            PlaybackCoreError::SearchFailed { outcomes } => {
                 let failure = outcomes
                     .into_iter()
                     .find_map(|outcome| outcome.failure)
                     .unwrap_or_else(|| Failure::new("search_failed", "no provider completed"));
                 Self::Failure(failure)
             }
-            DaemonError::InvalidRequest(message) => {
+            PlaybackCoreError::InvalidRequest(message) => {
                 Self::Failure(Failure::new("invalid_request", message))
             }
-            DaemonError::UnknownSource(source) => Self::Failure(
+            PlaybackCoreError::UnknownSource(source) => Self::Failure(
                 Failure::new("unknown_provider", "provider identifier is unknown")
                     .with_provider(source),
             ),
-            DaemonError::Engine(error) => {
+            PlaybackCoreError::Engine(error) => {
                 Self::Failure(Failure::new("playback_engine_failed", error.to_string()))
             }
         }
@@ -789,7 +789,7 @@ mod tests {
     fn test_runtime() -> PlaybackRuntime {
         let credentials = CredentialStore::memory();
         let engine = Arc::new(FakeEngine::new());
-        let daemon = PlayerDaemon::new_with_registry(
+        let core = PlaybackCore::new_with_registry(
             SourceCatalog::new([Arc::new(FakeSource) as Arc<dyn SourceAdapter>]),
             ProviderRegistry,
             engine,
@@ -804,7 +804,7 @@ mod tests {
                     .build()
                     .unwrap()
                     .block_on(async move {
-                        if let Some(reply) = run_commands(command_rx, daemon, credentials).await {
+                        if let Some(reply) = run_commands(command_rx, core, credentials).await {
                             let _ = reply.send(Ok(()));
                         }
                     });

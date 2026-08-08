@@ -1,6 +1,6 @@
 mod catalog;
+mod core;
 mod credentials;
-mod daemon;
 mod domain;
 mod engine;
 mod login;

@@ -6,10 +6,10 @@
 
 - 使用 Windows，并让游戏画面分辨率与 `config.yaml` 中的坐标配置相符。
 - 游戏已经安装，且 `window.target_process` 填写了正确的进程名。
-- `miliastra-playerd` 已启动并通过 HTTP 提供播放器服务，默认地址为 `127.0.0.1:17854`。
-- playerd 运行目录中应放置 `miliastra-playerd.exe`、可选的
-  `miliastra-login-helper.exe`、`libmpv-2.dll`（及其原生依赖）和 `data/`；如果
-  目录不在主线工作目录下，把 `playerd.working_dir` 改为该目录。
+- 播放器由主程序内置的 FFmpeg 8.1 + CPAL/WASAPI 运行时提供，不需要单独启动播放器进程。
+- 发布包中应放置主程序、`miliastra-login-helper.exe`、`MNN.dll`、四个 FFmpeg
+  媒体 DLL、`libwinpthread-1.dll` 和 `data/`；登录功能需要系统已安装 WebView2
+  Evergreen Runtime。
 - 发布包中的 `assets/`、`models/` 和 `config.yaml` 位于程序可读取的位置。
 - 程序以管理员权限运行，这样才能操作游戏窗口和发送按键。
 
@@ -133,7 +133,7 @@ AI 点歌会先搜索歌曲候选，再从候选中选择，不会凭空生成�
 | 配置段 | 用途 |
 | --- | --- |
 | `window` | 游戏进程名和画面尺寸 |
-| `playerd` | 无 GUI 播放器的地址、进程和 token 路径 |
+| `playback` | 原生播放凭据目录、登录辅助器路径和登录超时 |
 | `http` | Web 面板监听地址、端口和访问令牌 |
 | `ocr.backend_priority` | OCR 后端顺序；默认 CPU 即可 |
 | `ai` | AI 点歌的地址、密钥、模型和代理 |
@@ -190,7 +190,7 @@ custom_workflows:
 
 **无法播放歌曲**
 
-检查 `miliastra-playerd` 是否运行、HTTP 地址和 API token 路径是否正确，并先用 `@状态` 或 Web 面板确认播放器连接。
+检查 `playback.credential_directory`、登录辅助器路径和 FFmpeg DLL 是否存在，并先用 `@状态` 或 Web 面板确认原生播放运行时状态。
 
 **AI 命令提示未启用**
 

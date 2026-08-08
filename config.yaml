@@ -158,7 +158,7 @@ timing:
     skip_status_retries: 5
     # 播放监控线程循环间隔，单位毫秒
     monitor_tick_ms: 200
-    # 播放结束监控向 playerd 校准状态的间隔，单位毫秒
+    # 播放结束监控向原生播放运行时校准状态的间隔，单位毫秒
     monitor_status_ms: 1000
     # 播放 URI 连续确认次数；大于 1 时覆盖全局值，0 或 1 表示继承
     uri_stable_samples: 0

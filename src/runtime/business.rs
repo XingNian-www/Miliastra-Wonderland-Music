@@ -5353,12 +5353,10 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("mwm-business-queue-{suffix}.json"));
-        let playback_state_path = path.with_extension("playback-state.json");
-        let hall_state_path = path.with_extension("hall-state.json");
-        let queue = crate::features::playback::PersistentQueue::load(path, 4).unwrap();
+        let hall_state_path = std::env::temp_dir().join(format!("mwm-business-hall-{suffix}.json"));
+        let queue = crate::features::playback::PersistentQueue::new_for_test(4).unwrap();
         let playback_state =
-            crate::features::playback::PersistentPlaybackState::load(playback_state_path).unwrap();
+            crate::features::playback::PersistentPlaybackState::new_for_test().unwrap();
         let runtime = BusinessRuntime::start_with_playback(
             4,
             idiom_service(None),
@@ -5396,13 +5394,9 @@ mod tests {
             .unwrap()
             .as_nanos();
         let directory = std::env::temp_dir().join(format!("mwm-business-state-{suffix}"));
-        let queue =
-            crate::features::playback::PersistentQueue::load(directory.join("queue.json"), 4)
-                .unwrap();
-        let playback_state = crate::features::playback::PersistentPlaybackState::load(
-            directory.join("playback-state.json"),
-        )
-        .unwrap();
+        let queue = crate::features::playback::PersistentQueue::new_for_test(4).unwrap();
+        let playback_state =
+            crate::features::playback::PersistentPlaybackState::new_for_test().unwrap();
         let runtime = BusinessRuntime::start_with_playback(
             4,
             idiom_service(None),

@@ -8,8 +8,6 @@ use serde_json::{Value, json};
 pub enum CaptureError {
     #[error("WebView2 Evergreen Runtime is missing")]
     RuntimeMissing,
-    #[error("WebView2Loader.dll is missing")]
-    LoaderMissing,
     #[error("WebView2 login timed out before required cookies were captured")]
     Timeout,
     #[error("WebView2 COM error: {0}")]
@@ -409,7 +407,7 @@ mod platform {
     use super::{CaptureError, allowed_cookie_names, login_url};
     use std::collections::BTreeMap;
     use std::ffi::{OsStr, c_void};
-    use std::mem::{size_of, transmute, transmute_copy};
+    use std::mem::{size_of, transmute_copy};
     use std::os::windows::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
     use std::ptr::{null, null_mut};
@@ -420,15 +418,12 @@ mod platform {
     use std::time::{Duration, Instant};
 
     use windows_sys::Win32::Foundation::{
-        E_INVALIDARG, E_NOINTERFACE, FreeLibrary, HMODULE, HWND, LPARAM, RECT, S_FALSE, S_OK,
-        WPARAM,
+        E_INVALIDARG, E_NOINTERFACE, HWND, LPARAM, RECT, S_FALSE, S_OK, WPARAM,
     };
     use windows_sys::Win32::System::Com::{
         COINIT_APARTMENTTHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize,
     };
-    use windows_sys::Win32::System::LibraryLoader::{
-        GetModuleHandleW, GetProcAddress, LoadLibraryW,
-    };
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::HiDpi::{
         DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
     };
@@ -438,7 +433,16 @@ mod platform {
         PeekMessageW, PostQuitMessage, RegisterClassW, SetWindowLongPtrW, ShowWindow,
         TranslateMessage, WM_CLOSE, WM_DESTROY, WM_SIZE, WNDCLASSW, WS_OVERLAPPEDWINDOW,
     };
-    use windows_sys::core::{GUID, HRESULT, PCSTR, PCWSTR};
+    use windows_sys::core::{GUID, HRESULT, PCWSTR};
+
+    unsafe extern "system" {
+        fn CreateCoreWebView2EnvironmentWithOptions(
+            browser_executable_folder: PCWSTR,
+            user_data_folder: PCWSTR,
+            environment_options: *mut c_void,
+            environment_created_handler: *mut c_void,
+        ) -> HRESULT;
+    }
 
     const IID_IUNKNOWN: GUID = GUID {
         data1: 0x00000000,
@@ -1224,64 +1228,6 @@ mod platform {
         ))
     }
 
-    type CreateEnvironment =
-        unsafe extern "system" fn(PCWSTR, PCWSTR, *mut c_void, *mut c_void) -> HRESULT;
-
-    struct Loader {
-        module: HMODULE,
-        create_environment: CreateEnvironment,
-    }
-
-    impl Loader {
-        fn load(runtime_dir: &Path) -> Result<Self, CaptureError> {
-            for candidate in loader_candidates(runtime_dir) {
-                let path = wide(&candidate.to_string_lossy());
-                let module = unsafe { LoadLibraryW(path.as_ptr()) };
-                if module.is_null() {
-                    continue;
-                }
-                let symbol = b"CreateCoreWebView2EnvironmentWithOptions\0";
-                let Some(symbol) = (unsafe { GetProcAddress(module, symbol.as_ptr() as PCSTR) })
-                else {
-                    unsafe { FreeLibrary(module) };
-                    continue;
-                };
-                let create_environment: CreateEnvironment = unsafe { transmute(symbol) };
-                return Ok(Self {
-                    module,
-                    create_environment,
-                });
-            }
-            Err(CaptureError::LoaderMissing)
-        }
-
-        fn create(&self, profile: &Path, handler: *mut c_void) -> HRESULT {
-            let user_data = wide(&profile.to_string_lossy());
-            unsafe { (self.create_environment)(null(), user_data.as_ptr(), null_mut(), handler) }
-        }
-    }
-
-    impl Drop for Loader {
-        fn drop(&mut self) {
-            unsafe { FreeLibrary(self.module) };
-        }
-    }
-
-    fn loader_candidates(runtime_dir: &Path) -> Vec<PathBuf> {
-        let mut candidates = Vec::new();
-        if let Ok(path) = std::env::var("WEBVIEW2_LOADER_PATH") {
-            candidates.push(PathBuf::from(path));
-        }
-        if let Ok(executable) = std::env::current_exe()
-            && let Some(parent) = executable.parent()
-        {
-            candidates.push(parent.join("WebView2Loader.dll"));
-        }
-        candidates.push(runtime_dir.join("WebView2Loader.dll"));
-        candidates.push(PathBuf::from("WebView2Loader.dll"));
-        candidates
-    }
-
     struct HostWindow {
         hwnd: HWND,
     }
@@ -1393,13 +1339,9 @@ mod platform {
         timeout: Duration,
     ) -> Result<BTreeMap<String, String>, CaptureError> {
         set_process_dpi_awareness();
-        let runtime = runtime_executable().ok_or(CaptureError::RuntimeMissing)?;
-        let runtime_dir = runtime.parent().ok_or_else(|| {
-            CaptureError::Io("WebView2 runtime has no parent directory".to_owned())
-        })?;
+        let _runtime = runtime_executable().ok_or(CaptureError::RuntimeMissing)?;
         let _com = ComApartment::initialize()?;
         let window = HostWindow::create()?;
-        let loader = Loader::load(runtime_dir)?;
         let context = Rc::new(CaptureContext::new(provider, window.hwnd)?);
         window.attach_context(&context);
         let environment_handler = Box::into_raw(Box::new(EnvironmentHandler {
@@ -1407,7 +1349,15 @@ mod platform {
             refs: AtomicU32::new(1),
             context: Rc::clone(&context),
         })) as *mut c_void;
-        let result = loader.create(profile, environment_handler);
+        let user_data = wide(&profile.to_string_lossy());
+        let result = unsafe {
+            CreateCoreWebView2EnvironmentWithOptions(
+                null(),
+                user_data.as_ptr(),
+                null_mut(),
+                environment_handler,
+            )
+        };
         unsafe { release_com(environment_handler) };
         if result < 0 {
             context.finish_error(com_error(

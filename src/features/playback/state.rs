@@ -128,6 +128,14 @@ impl RequestStateStore {
         Ok(Arc::new(Mutex::new(store)))
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_for_test() -> SharedRequestStateStore {
+        Arc::new(Mutex::new(Self {
+            path: PathBuf::new(),
+            snapshot: RequestStateSnapshot::default(),
+        }))
+    }
+
     pub(crate) fn queue_snapshot(&self) -> (u64, Vec<QueueItem>) {
         (
             self.snapshot.next_queue_item_id,
@@ -312,6 +320,9 @@ impl RequestStateStore {
     }
 
     fn save(&self, snapshot: &RequestStateSnapshot) -> Result<()> {
+        if self.path.as_os_str().is_empty() {
+            return Ok(());
+        }
         let text = serde_json::to_vec_pretty(snapshot)?;
         if self.path.exists() {
             let current = fs::read(&self.path).with_context(|| {
@@ -491,51 +502,28 @@ pub struct PlaybackObservation {
 
 impl PlaybackRuntimeState {
     const MAX_PREVIOUS_REQUESTS: usize = 32;
-
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn load(path: &Path) -> Result<Self> {
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-        let text = fs::read_to_string(path)
-            .with_context(|| format!("read playback state {}", path.display()))?;
-        serde_json::from_str(&text)
-            .with_context(|| format!("parse playback state {}", path.display()))
-    }
-
-    fn save(&self, path: &Path) -> Result<()> {
-        let text = serde_json::to_string_pretty(self)?;
-        crate::adapters::file_store::write_atomic(path, text.as_bytes(), "播放状态")
-    }
 }
 
 pub struct PersistentPlaybackState {
-    path: PathBuf,
     state: PlaybackRuntimeState,
-    request_store: Option<SharedRequestStateStore>,
+    request_store: SharedRequestStateStore,
 }
 
 impl PersistentPlaybackState {
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn load(path: PathBuf) -> Result<Self> {
-        let state = PlaybackRuntimeState::load(&path)?;
-        Ok(Self {
-            path,
-            state,
-            request_store: None,
-        })
-    }
-
     pub(crate) fn from_request_store(request_store: SharedRequestStateStore) -> Result<Self> {
         let state = request_store
             .lock()
             .map_err(|_| anyhow::anyhow!("请求状态存储锁已中毒"))?
             .playback_snapshot();
         Ok(Self {
-            path: PathBuf::new(),
             state,
-            request_store: Some(request_store),
+            request_store,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test() -> Result<Self> {
+        Self::from_request_store(RequestStateStore::new_for_test())
     }
 
     pub fn state(&self) -> &PlaybackRuntimeState {
@@ -549,24 +537,21 @@ impl PersistentPlaybackState {
         let mut next = self.state.clone();
         let changed = mutation(&mut next);
         if changed {
-            if let Some(store) = &self.request_store {
-                let mut store = store
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("请求状态存储锁已中毒"))?;
-                store.update(|snapshot| {
-                    if active_request_identity(snapshot.playback.active_request.as_ref())
-                        != active_request_identity(next.active_request.as_ref())
-                        || next.active_request.is_none()
-                    {
-                        // A binding only authorizes the exact active request which established it.
-                        snapshot.session_binding = None;
-                    }
-                    snapshot.playback = next.clone();
-                    true
-                })?;
-            } else {
-                next.save(&self.path)?;
-            }
+            let mut store = self
+                .request_store
+                .lock()
+                .map_err(|_| anyhow::anyhow!("请求状态存储锁已中毒"))?;
+            store.update(|snapshot| {
+                if active_request_identity(snapshot.playback.active_request.as_ref())
+                    != active_request_identity(next.active_request.as_ref())
+                    || next.active_request.is_none()
+                {
+                    // A binding only authorizes the exact active request which established it.
+                    snapshot.session_binding = None;
+                }
+                snapshot.playback = next.clone();
+                true
+            })?;
             self.state = next;
         }
         Ok(changed)
@@ -814,12 +799,7 @@ mod tests {
 
     #[test]
     fn unified_request_state_rejects_unversioned_state_with_delete_hint() {
-        let (state_path, queue_path) = temp_request_state_paths("legacy-migration");
-        fs::write(
-            &queue_path,
-            r#"{"nextId":2,"items":[{"id":1,"keyword":"歌名","source":"qqmusic","preferAccompaniment":false,"aiOriginalText":"","uri":"","friendUsername":"","dedupBypass":false}]}"#,
-        )
-        .unwrap();
+        let state_path = temp_request_state_path("legacy-migration");
         fs::write(
             &state_path,
             r#"{"state":"idle","pauseReason":"none","activeRequest":null,"lastObservation":null}"#,
@@ -832,12 +812,46 @@ mod tests {
         assert!(error.to_string().contains("schemaVersion"));
         assert!(error.to_string().contains("请删除状态文件"));
 
-        remove_request_state_paths(state_path, queue_path);
+        remove_request_state_path(state_path);
+    }
+
+    #[test]
+    fn unified_request_state_rejects_v1_with_delete_hint() {
+        let state_path = temp_request_state_path("v1-rejected");
+        let mut value = serde_json::to_value(RequestStateSnapshot::default()).unwrap();
+        value["schemaVersion"] = serde_json::json!(1);
+        fs::write(&state_path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+        let error =
+            RequestStateStore::load(state_path.clone()).expect_err("v1 state must not be migrated");
+
+        assert!(error.to_string().contains("schemaVersion Some(1)"));
+        assert!(error.to_string().contains("请删除状态文件"));
+        remove_request_state_path(state_path);
+    }
+
+    #[test]
+    fn unified_request_state_rejects_a_stale_queue_id_allocator() {
+        let state_path = temp_request_state_path("stale-queue-id");
+        let mut snapshot = RequestStateSnapshot::default();
+        snapshot.queue.push(QueueItem {
+            id: 1,
+            keyword: "歌名".to_string(),
+            ..QueueItem::default()
+        });
+        snapshot.next_queue_item_id = 1;
+        fs::write(&state_path, serde_json::to_vec_pretty(&snapshot).unwrap()).unwrap();
+
+        let error = RequestStateStore::load(state_path.clone())
+            .expect_err("queue ids must be valid in schema v2");
+
+        assert!(error.to_string().contains("nextQueueItemId"));
+        remove_request_state_path(state_path);
     }
 
     #[test]
     fn queue_and_playback_updates_share_one_versioned_snapshot() {
-        let (state_path, queue_path) = temp_request_state_paths("shared-snapshot");
+        let state_path = temp_request_state_path("shared-snapshot");
         let store = RequestStateStore::load(state_path.clone()).unwrap();
         let mut queue =
             super::super::queue::PersistentQueue::from_request_store(store.clone(), 3).unwrap();
@@ -861,17 +875,13 @@ mod tests {
         assert_eq!(json["schemaVersion"], REQUEST_STATE_SCHEMA_VERSION);
         assert_eq!(json["queue"].as_array().unwrap().len(), 1);
         assert_eq!(json["playback"]["state"], "paused_by_user");
-        assert!(
-            !queue_path.exists(),
-            "new store must not write legacy queue file"
-        );
 
-        remove_request_state_paths(state_path, queue_path);
+        remove_request_state_path(state_path);
     }
 
     #[test]
     fn corrupted_primary_recovers_the_last_valid_backup() {
-        let (state_path, queue_path) = temp_request_state_paths("backup-recovery");
+        let state_path = temp_request_state_path("backup-recovery");
         let store = RequestStateStore::load(state_path.clone()).unwrap();
         store
             .lock()
@@ -909,12 +919,12 @@ mod tests {
                 .contains("\"schemaVersion\"")
         );
 
-        remove_request_state_paths(state_path, queue_path);
+        remove_request_state_path(state_path);
     }
 
     #[test]
     fn terminal_claim_is_idempotent_and_session_reconciliation_is_durable() {
-        let (state_path, queue_path) = temp_request_state_paths("terminal-session");
+        let state_path = temp_request_state_path("terminal-session");
         let store = RequestStateStore::load(state_path.clone()).unwrap();
         store
             .lock()
@@ -931,7 +941,7 @@ mod tests {
             })
             .unwrap();
         let binding = PlaybackSessionBinding {
-            runtime_identity: "playerd-A".to_string(),
+            runtime_identity: "native-runtime-A".to_string(),
             session_id: "session-1".to_string(),
             generation: 3,
             bound_at_ms: 9,
@@ -980,10 +990,10 @@ mod tests {
         assert!(restored.snapshot.session_binding.is_none());
         assert_eq!(restored.snapshot.handled_terminal_outcomes.len(), 1);
 
-        remove_request_state_paths(state_path, queue_path);
+        remove_request_state_path(state_path);
     }
 
-    fn temp_request_state_paths(name: &str) -> (PathBuf, PathBuf) {
+    fn temp_request_state_path(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -994,15 +1004,11 @@ mod tests {
             name,
             nanos
         ));
-        (
-            root.with_extension("state.json"),
-            root.with_extension("queue.json"),
-        )
+        root.with_extension("state.json")
     }
 
-    fn remove_request_state_paths(state_path: PathBuf, queue_path: PathBuf) {
+    fn remove_request_state_path(state_path: PathBuf) {
         let _ = fs::remove_file(&state_path);
         let _ = fs::remove_file(backup_path(&state_path));
-        let _ = fs::remove_file(queue_path);
     }
 }

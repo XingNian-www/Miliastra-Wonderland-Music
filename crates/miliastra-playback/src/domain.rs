@@ -245,7 +245,7 @@ pub enum EndCause {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlaybackSnapshot {
-    /// Unique for the lifetime of one playerd process. Session references from
+    /// Unique for the lifetime of one native playback runtime. Session references from
     /// another runtime must never be treated as valid after a restart.
     #[serde(default)]
     pub runtime_identity: String,

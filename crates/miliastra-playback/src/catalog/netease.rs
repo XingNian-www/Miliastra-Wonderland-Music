@@ -30,7 +30,7 @@ impl NeteaseAdapter {
     pub fn new(credentials: CredentialStore, timeout: Duration) -> Result<Self, CatalogError> {
         let client = Client::builder()
             .timeout(timeout)
-            .user_agent("miliastra-playerd/0.1")
+            .user_agent("miliastra-wonderland-music/0.1")
             .build()
             .map_err(|error| CatalogError::Transient(error.to_string()))?;
         Ok(Self {

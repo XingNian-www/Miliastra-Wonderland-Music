@@ -1711,7 +1711,6 @@ mod tests {
     use crate::features::playback::{SongDedupConfig, test_track};
     use crate::runtime::clock::{Clock, Delay, ManualClock, SystemClock, WallClock};
     use std::collections::{HashSet, VecDeque};
-    use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
@@ -2046,11 +2045,8 @@ mod tests {
         delay: Arc<dyn Delay>,
         identity_judge: Arc<dyn PlaybackIdentityJudge>,
     ) -> PlayerController<FakeBackend, TestPlaybackState> {
-        let runtime_path = temp_path("runtime");
         let history_path = temp_path("dedup");
-        let _ = fs::remove_file(&runtime_path);
-        let _ = fs::remove_file(&history_path);
-        let runtime = PersistentPlaybackState::load(runtime_path).unwrap();
+        let runtime = PersistentPlaybackState::new_for_test().unwrap();
         let history = PersistentSongDedupHistory::load(history_path, wall_clock.clone()).unwrap();
         let matching = MatchConfig::default();
         let song_dedup = SongDedupConfig {

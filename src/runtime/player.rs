@@ -1,5 +1,7 @@
 use std::time::{Duration, Instant};
 
+use miliastra_playback::PlayableTrack;
+
 use super::clock::Clock;
 
 pub const DEFAULT_PLAYER_STABILITY_SAMPLES: usize = 2;
@@ -18,6 +20,7 @@ pub enum TransportState {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RawPlayerSample {
+    pub track: Option<PlayableTrack>,
     pub uri: Option<String>,
     pub transport: Option<TransportState>,
     pub title: Option<String>,
@@ -123,6 +126,7 @@ pub struct PlayerObservation {
     pub transport_evidence: Option<StabilityEvidence<TransportState>>,
     pub transport_candidate: Option<StabilityEvidence<TransportState>>,
     pub playback_instance: Option<PlaybackInstance>,
+    pub track: Option<PlayableTrack>,
     pub title: Option<String>,
     pub artist: Option<String>,
     pub album_name: Option<String>,
@@ -219,6 +223,7 @@ impl PlayerObservation {
 
         if reevaluated.uri.is_none() {
             reevaluated.playback_instance = None;
+            reevaluated.track = None;
             reevaluated.title = None;
             reevaluated.artist = None;
             reevaluated.album_name = None;
@@ -350,6 +355,7 @@ struct TransportUpdate {
 
 #[derive(Clone, Debug, Default)]
 struct TrackEvidence {
+    track: Option<PlayableTrack>,
     title: Option<String>,
     artist: Option<String>,
     album_name: Option<String>,
@@ -366,6 +372,9 @@ struct TrackEvidence {
 
 impl TrackEvidence {
     fn update(&mut self, sample: &RawPlayerSample, sampled_at: Instant) {
+        if let Some(track) = sample.track.as_ref() {
+            self.track = Some(track.clone());
+        }
         if let Some(title) = normalized_owned(sample.title.clone()) {
             self.title = Some(title);
         }
@@ -729,6 +738,7 @@ impl<C: Clock> PlayerObserver<C> {
                 self.config.transport_stable_samples,
             ),
             playback_instance: self.stable_uri.as_ref().and(self.playback_instance),
+            track: self.evidence.track.clone(),
             title: self.evidence.title.clone(),
             artist: self.evidence.artist.clone(),
             album_name: self.evidence.album_name.clone(),
@@ -930,12 +940,20 @@ mod tests {
             },
         );
 
-        let first = observer.observe_sample(sample("fuo://song/1", TransportState::Playing, 1));
+        let first = observer.observe_sample(sample(
+            "miliastra://track/qqmusic/1",
+            TransportState::Playing,
+            1,
+        ));
         assert_eq!(first.uri_freshness, ObservationFreshness::Unknown);
         assert_eq!(first.transport_freshness, ObservationFreshness::Unknown);
 
-        let second = observer.observe_sample(sample("fuo://song/1", TransportState::Playing, 2));
-        assert_eq!(second.uri.as_deref(), Some("fuo://song/1"));
+        let second = observer.observe_sample(sample(
+            "miliastra://track/qqmusic/1",
+            TransportState::Playing,
+            2,
+        ));
+        assert_eq!(second.uri.as_deref(), Some("miliastra://track/qqmusic/1"));
         assert_eq!(second.uri_freshness, ObservationFreshness::Fresh);
         assert_eq!(second.transport, None);
         let transport_candidate = second.transport_candidate.unwrap();
@@ -944,7 +962,11 @@ mod tests {
         assert_eq!(transport_candidate.required_samples, 3);
         assert_eq!(transport_candidate.confirmed_at, None);
 
-        let third = observer.observe_sample(sample("fuo://song/1", TransportState::Playing, 3));
+        let third = observer.observe_sample(sample(
+            "miliastra://track/qqmusic/1",
+            TransportState::Playing,
+            3,
+        ));
         assert_eq!(third.transport, Some(TransportState::Playing));
         assert_eq!(third.transport_freshness, ObservationFreshness::Fresh);
         assert_eq!(third.playback_instance, Some(PlaybackInstance::INITIAL));
@@ -956,16 +978,24 @@ mod tests {
         let clock = ManualClock::new(started_at);
         let mut observer = observer(&clock, PlayerObservationConfig::default());
 
-        let unknown = observer.observe_sample(sample("fuo://song/1", TransportState::Playing, 1));
+        let unknown = observer.observe_sample(sample(
+            "miliastra://track/qqmusic/1",
+            TransportState::Playing,
+            1,
+        ));
         assert_eq!(unknown.fresh_identity(), None);
         assert_eq!(unknown.fresh_transport(), None);
 
         clock.advance(Duration::from_millis(100)).unwrap();
-        let fresh = observer.observe_sample(sample("fuo://song/1", TransportState::Playing, 2));
+        let fresh = observer.observe_sample(sample(
+            "miliastra://track/qqmusic/1",
+            TransportState::Playing,
+            2,
+        ));
         assert_eq!(
             fresh.fresh_identity(),
             Some(PlaybackIdentity {
-                uri: "fuo://song/1".to_string(),
+                uri: "miliastra://track/qqmusic/1".to_string(),
                 instance: PlaybackInstance::INITIAL,
             })
         );
@@ -979,7 +1009,7 @@ mod tests {
             .uri_evidence
             .as_mut()
             .unwrap()
-            .value = "fuo://song/other".to_string();
+            .value = "miliastra://track/qqmusic/other".to_string();
         assert_eq!(mismatched_identity_evidence.fresh_identity(), None);
         let mut missing_instance = fresh.clone();
         missing_instance.playback_instance = None;
@@ -1033,11 +1063,11 @@ mod tests {
     fn changing_progress_and_metadata_does_not_reset_stability() {
         let clock = ManualClock::new(Instant::now());
         let mut observer = observer(&clock, PlayerObservationConfig::default());
-        let mut first = sample("fuo://song/1", TransportState::Playing, 20);
+        let mut first = sample("miliastra://track/qqmusic/1", TransportState::Playing, 20);
         first.title = Some("old title".to_owned());
         observer.observe_sample(first);
 
-        let mut second = sample("fuo://song/1", TransportState::Playing, 21);
+        let mut second = sample("miliastra://track/qqmusic/1", TransportState::Playing, 21);
         second.title = Some("new title".to_owned());
         second.volume = Some(80);
         let observation = observer.observe_sample(second);
@@ -1072,10 +1102,15 @@ mod tests {
     fn incomplete_samples_only_interrupt_the_missing_field() {
         let clock = ManualClock::new(Instant::now());
         let mut observer = observer(&clock, PlayerObservationConfig::default());
-        stabilize(&mut observer, "fuo://song/1", TransportState::Playing, 20);
+        stabilize(
+            &mut observer,
+            "miliastra://track/qqmusic/1",
+            TransportState::Playing,
+            20,
+        );
 
         let observation = observer.observe_sample(RawPlayerSample {
-            uri: Some("fuo://song/1".to_owned()),
+            uri: Some("miliastra://track/qqmusic/1".to_owned()),
             transport: None,
             progress: Some(Duration::from_secs(21)),
             ..RawPlayerSample::default()
@@ -1093,18 +1128,23 @@ mod tests {
     fn failures_retain_stale_identity_for_at_most_five_seconds() {
         let clock = ManualClock::new(Instant::now());
         let mut observer = observer(&clock, PlayerObservationConfig::default());
-        stabilize(&mut observer, "fuo://song/1", TransportState::Playing, 20);
+        stabilize(
+            &mut observer,
+            "miliastra://track/qqmusic/1",
+            TransportState::Playing,
+            20,
+        );
 
         clock.advance(Duration::from_secs(2)).unwrap();
         let stale = observer.observe_failure();
-        assert_eq!(stale.uri.as_deref(), Some("fuo://song/1"));
+        assert_eq!(stale.uri.as_deref(), Some("miliastra://track/qqmusic/1"));
         assert_eq!(
             stale.uri_freshness,
             ObservationFreshness::Stale {
                 age: Duration::from_secs(2)
             }
         );
-        assert!(!stale.confirms_uri("fuo://song/1"));
+        assert!(!stale.confirms_uri("miliastra://track/qqmusic/1"));
 
         clock.advance(Duration::from_secs(3)).unwrap();
         assert_eq!(
@@ -1125,14 +1165,22 @@ mod tests {
     fn same_uri_recovers_from_stale_immediately() {
         let clock = ManualClock::new(Instant::now());
         let mut observer = observer(&clock, PlayerObservationConfig::default());
-        stabilize(&mut observer, "fuo://song/1", TransportState::Playing, 20);
+        stabilize(
+            &mut observer,
+            "miliastra://track/qqmusic/1",
+            TransportState::Playing,
+            20,
+        );
         observer.observe_failure();
 
-        let recovered =
-            observer.observe_sample(sample("fuo://song/1", TransportState::Playing, 21));
+        let recovered = observer.observe_sample(sample(
+            "miliastra://track/qqmusic/1",
+            TransportState::Playing,
+            21,
+        ));
 
         assert_eq!(recovered.uri_freshness, ObservationFreshness::Fresh);
-        assert!(recovered.confirms_uri("fuo://song/1"));
+        assert!(recovered.confirms_uri("miliastra://track/qqmusic/1"));
         assert_eq!(recovered.playback_instance, Some(PlaybackInstance::INITIAL));
     }
 
@@ -1140,10 +1188,19 @@ mod tests {
     fn a_different_uri_requires_full_stability_while_old_uri_is_stale() {
         let clock = ManualClock::new(Instant::now());
         let mut observer = observer(&clock, PlayerObservationConfig::default());
-        stabilize(&mut observer, "fuo://song/1", TransportState::Playing, 20);
+        stabilize(
+            &mut observer,
+            "miliastra://track/qqmusic/1",
+            TransportState::Playing,
+            20,
+        );
 
-        let pending = observer.observe_sample(sample("fuo://song/2", TransportState::Playing, 1));
-        assert_eq!(pending.uri.as_deref(), Some("fuo://song/1"));
+        let pending = observer.observe_sample(sample(
+            "miliastra://track/qqmusic/2",
+            TransportState::Playing,
+            1,
+        ));
+        assert_eq!(pending.uri.as_deref(), Some("miliastra://track/qqmusic/1"));
         assert!(matches!(
             pending.uri_freshness,
             ObservationFreshness::Stale { .. }
@@ -1152,13 +1209,17 @@ mod tests {
         assert!(stable_evidence.consecutive_samples >= stable_evidence.required_samples);
         assert!(stable_evidence.confirmed_at.is_some());
         let uri_candidate = pending.uri_candidate.unwrap();
-        assert_eq!(uri_candidate.value, "fuo://song/2");
+        assert_eq!(uri_candidate.value, "miliastra://track/qqmusic/2");
         assert_eq!(uri_candidate.consecutive_samples, 1);
         assert_eq!(uri_candidate.required_samples, 2);
         assert_eq!(uri_candidate.confirmed_at, None);
 
-        let accepted = observer.observe_sample(sample("fuo://song/2", TransportState::Playing, 2));
-        assert_eq!(accepted.uri.as_deref(), Some("fuo://song/2"));
+        let accepted = observer.observe_sample(sample(
+            "miliastra://track/qqmusic/2",
+            TransportState::Playing,
+            2,
+        ));
+        assert_eq!(accepted.uri.as_deref(), Some("miliastra://track/qqmusic/2"));
         assert_eq!(accepted.uri_freshness, ObservationFreshness::Fresh);
         assert_eq!(
             accepted.playback_instance.map(PlaybackInstance::get),
@@ -1170,15 +1231,28 @@ mod tests {
     fn invalid_uri_breaks_candidate_consecutiveness() {
         let clock = ManualClock::new(Instant::now());
         let mut observer = observer(&clock, PlayerObservationConfig::default());
-        stabilize(&mut observer, "fuo://song/1", TransportState::Playing, 20);
-        observer.observe_sample(sample("fuo://song/2", TransportState::Playing, 1));
+        stabilize(
+            &mut observer,
+            "miliastra://track/qqmusic/1",
+            TransportState::Playing,
+            20,
+        );
+        observer.observe_sample(sample(
+            "miliastra://track/qqmusic/2",
+            TransportState::Playing,
+            1,
+        ));
         observer.observe_sample(RawPlayerSample {
             uri: None,
             transport: Some(TransportState::Playing),
             ..RawPlayerSample::default()
         });
 
-        let restarted = observer.observe_sample(sample("fuo://song/2", TransportState::Playing, 1));
+        let restarted = observer.observe_sample(sample(
+            "miliastra://track/qqmusic/2",
+            TransportState::Playing,
+            1,
+        ));
         assert_eq!(
             restarted
                 .uri_candidate
@@ -1186,18 +1260,28 @@ mod tests {
                 .map(|candidate| candidate.consecutive_samples),
             Some(1)
         );
-        assert_eq!(restarted.uri.as_deref(), Some("fuo://song/1"));
+        assert_eq!(
+            restarted.uri.as_deref(),
+            Some("miliastra://track/qqmusic/1")
+        );
     }
 
     #[test]
     fn expired_pending_identity_and_transport_require_full_stability_again() {
         let clock = ManualClock::new(Instant::now());
         let mut observer = observer(&clock, PlayerObservationConfig::default());
-        observer.observe_sample(sample("fuo://song/pending", TransportState::Playing, 1));
+        observer.observe_sample(sample(
+            "miliastra://track/qqmusic/pending",
+            TransportState::Playing,
+            1,
+        ));
 
         clock.advance(Duration::from_secs(6)).unwrap();
-        let restarted =
-            observer.observe_sample(sample("fuo://song/pending", TransportState::Playing, 2));
+        let restarted = observer.observe_sample(sample(
+            "miliastra://track/qqmusic/pending",
+            TransportState::Playing,
+            2,
+        ));
 
         assert_eq!(restarted.uri, None);
         assert_eq!(restarted.transport, None);
@@ -1219,14 +1303,27 @@ mod tests {
     fn stopped_to_playing_advances_the_instance_after_transport_is_stable() {
         let clock = ManualClock::new(Instant::now());
         let mut observer = observer(&clock, PlayerObservationConfig::default());
-        stabilize(&mut observer, "fuo://song/1", TransportState::Stopped, 20);
+        stabilize(
+            &mut observer,
+            "miliastra://track/qqmusic/1",
+            TransportState::Stopped,
+            20,
+        );
 
-        let pending = observer.observe_sample(sample("fuo://song/1", TransportState::Playing, 20));
+        let pending = observer.observe_sample(sample(
+            "miliastra://track/qqmusic/1",
+            TransportState::Playing,
+            20,
+        ));
         assert_eq!(
             pending.playback_instance.map(PlaybackInstance::get),
             Some(1)
         );
-        let playing = observer.observe_sample(sample("fuo://song/1", TransportState::Playing, 20));
+        let playing = observer.observe_sample(sample(
+            "miliastra://track/qqmusic/1",
+            TransportState::Playing,
+            20,
+        ));
 
         assert_eq!(
             playing.playback_instance.map(PlaybackInstance::get),
@@ -1238,18 +1335,27 @@ mod tests {
     fn clear_return_to_start_advances_instance_but_small_jitter_does_not() {
         let clock = ManualClock::new(Instant::now());
         let mut observer = observer(&clock, PlayerObservationConfig::default());
-        stabilize(&mut observer, "fuo://song/1", TransportState::Playing, 30);
+        stabilize(
+            &mut observer,
+            "miliastra://track/qqmusic/1",
+            TransportState::Playing,
+            30,
+        );
 
         let jittered = observer.observe_sample(RawPlayerSample {
             progress: Some(Duration::from_millis(29_200)),
-            ..sample("fuo://song/1", TransportState::Playing, 29)
+            ..sample("miliastra://track/qqmusic/1", TransportState::Playing, 29)
         });
         assert_eq!(
             jittered.playback_instance.map(PlaybackInstance::get),
             Some(1)
         );
 
-        let restarted = observer.observe_sample(sample("fuo://song/1", TransportState::Playing, 1));
+        let restarted = observer.observe_sample(sample(
+            "miliastra://track/qqmusic/1",
+            TransportState::Playing,
+            1,
+        ));
         assert_eq!(
             restarted.playback_instance.map(PlaybackInstance::get),
             Some(2)
@@ -1260,7 +1366,12 @@ mod tests {
     fn local_progress_estimation_uses_the_manual_clock_and_stops_when_stale() {
         let clock = ManualClock::new(Instant::now());
         let mut observer = observer(&clock, PlayerObservationConfig::default());
-        stabilize(&mut observer, "fuo://song/1", TransportState::Playing, 20);
+        stabilize(
+            &mut observer,
+            "miliastra://track/qqmusic/1",
+            TransportState::Playing,
+            20,
+        );
 
         clock.advance(Duration::from_secs(2)).unwrap();
         assert_eq!(observer.current().progress, Some(Duration::from_secs(22)));
@@ -1275,7 +1386,12 @@ mod tests {
     fn expired_same_uri_must_stabilize_again_without_inventing_a_new_instance() {
         let clock = ManualClock::new(Instant::now());
         let mut observer = observer(&clock, PlayerObservationConfig::default());
-        stabilize(&mut observer, "fuo://song/1", TransportState::Playing, 20);
+        stabilize(
+            &mut observer,
+            "miliastra://track/qqmusic/1",
+            TransportState::Playing,
+            20,
+        );
         observer.observe_failure();
         clock.advance(Duration::from_secs(6)).unwrap();
         assert_eq!(
@@ -1283,10 +1399,17 @@ mod tests {
             ObservationFreshness::Unknown
         );
 
-        let pending = observer.observe_sample(sample("fuo://song/1", TransportState::Playing, 21));
+        let pending = observer.observe_sample(sample(
+            "miliastra://track/qqmusic/1",
+            TransportState::Playing,
+            21,
+        ));
         assert_eq!(pending.uri_freshness, ObservationFreshness::Unknown);
-        let recovered =
-            observer.observe_sample(sample("fuo://song/1", TransportState::Playing, 22));
+        let recovered = observer.observe_sample(sample(
+            "miliastra://track/qqmusic/1",
+            TransportState::Playing,
+            22,
+        ));
 
         assert_eq!(recovered.uri_freshness, ObservationFreshness::Fresh);
         assert_eq!(
@@ -1299,7 +1422,12 @@ mod tests {
     fn transport_restart_waits_for_the_same_uri_to_recover() {
         let clock = ManualClock::new(Instant::now());
         let mut observer = observer(&clock, PlayerObservationConfig::default());
-        stabilize(&mut observer, "fuo://song/1", TransportState::Stopped, 20);
+        stabilize(
+            &mut observer,
+            "miliastra://track/qqmusic/1",
+            TransportState::Stopped,
+            20,
+        );
 
         let missing_uri = RawPlayerSample {
             uri: None,
@@ -1316,8 +1444,11 @@ mod tests {
             Some(1)
         );
 
-        let recovered =
-            observer.observe_sample(sample("fuo://song/1", TransportState::Playing, 21));
+        let recovered = observer.observe_sample(sample(
+            "miliastra://track/qqmusic/1",
+            TransportState::Playing,
+            21,
+        ));
         assert_eq!(
             recovered.playback_instance.map(PlaybackInstance::get),
             Some(2)
@@ -1336,19 +1467,33 @@ mod tests {
             },
         );
         for _ in 0..3 {
-            observer.observe_sample(sample("fuo://song/1", TransportState::Stopped, 20));
+            observer.observe_sample(sample(
+                "miliastra://track/qqmusic/1",
+                TransportState::Stopped,
+                20,
+            ));
         }
 
-        observer.observe_sample(sample("fuo://song/2", TransportState::Playing, 1));
-        let uri_accepted =
-            observer.observe_sample(sample("fuo://song/2", TransportState::Playing, 2));
+        observer.observe_sample(sample(
+            "miliastra://track/qqmusic/2",
+            TransportState::Playing,
+            1,
+        ));
+        let uri_accepted = observer.observe_sample(sample(
+            "miliastra://track/qqmusic/2",
+            TransportState::Playing,
+            2,
+        ));
         assert_eq!(
             uri_accepted.playback_instance.map(PlaybackInstance::get),
             Some(2)
         );
 
-        let transport_accepted =
-            observer.observe_sample(sample("fuo://song/2", TransportState::Playing, 3));
+        let transport_accepted = observer.observe_sample(sample(
+            "miliastra://track/qqmusic/2",
+            TransportState::Playing,
+            3,
+        ));
         assert_eq!(
             transport_accepted
                 .playback_instance
@@ -1361,10 +1506,15 @@ mod tests {
     fn uri_accepted_without_transport_merges_the_later_playing_transition() {
         let clock = ManualClock::new(Instant::now());
         let mut observer = observer(&clock, PlayerObservationConfig::default());
-        stabilize(&mut observer, "fuo://song/1", TransportState::Stopped, 20);
+        stabilize(
+            &mut observer,
+            "miliastra://track/qqmusic/1",
+            TransportState::Stopped,
+            20,
+        );
 
         let new_uri_without_transport = RawPlayerSample {
-            uri: Some("fuo://song/2".to_owned()),
+            uri: Some("miliastra://track/qqmusic/2".to_owned()),
             transport: None,
             progress: Some(Duration::from_secs(1)),
             ..RawPlayerSample::default()
@@ -1376,9 +1526,16 @@ mod tests {
             Some(2)
         );
 
-        observer.observe_sample(sample("fuo://song/2", TransportState::Playing, 2));
-        let transport_accepted =
-            observer.observe_sample(sample("fuo://song/2", TransportState::Playing, 3));
+        observer.observe_sample(sample(
+            "miliastra://track/qqmusic/2",
+            TransportState::Playing,
+            2,
+        ));
+        let transport_accepted = observer.observe_sample(sample(
+            "miliastra://track/qqmusic/2",
+            TransportState::Playing,
+            3,
+        ));
         assert_eq!(
             transport_accepted
                 .playback_instance
@@ -1391,7 +1548,7 @@ mod tests {
     fn partial_same_uri_sample_preserves_existing_track_evidence() {
         let clock = ManualClock::new(Instant::now());
         let mut observer = observer(&clock, PlayerObservationConfig::default());
-        let mut complete = sample("fuo://song/1", TransportState::Playing, 20);
+        let mut complete = sample("miliastra://track/qqmusic/1", TransportState::Playing, 20);
         complete.title = Some("title".to_owned());
         complete.artist = Some("artist".to_owned());
         complete.album_name = Some("album".to_owned());
@@ -1402,7 +1559,7 @@ mod tests {
         observer.observe_sample(complete);
 
         let partial = observer.observe_sample(RawPlayerSample {
-            uri: Some("fuo://song/1".to_owned()),
+            uri: Some("miliastra://track/qqmusic/1".to_owned()),
             transport: Some(TransportState::Playing),
             ..RawPlayerSample::default()
         });
@@ -1422,7 +1579,7 @@ mod tests {
         let started_at = Instant::now();
         let clock = ManualClock::new(started_at);
         let mut observer = observer(&clock, PlayerObservationConfig::default());
-        let mut complete = sample("fuo://song/1", TransportState::Playing, 20);
+        let mut complete = sample("miliastra://track/qqmusic/1", TransportState::Playing, 20);
         complete.volume = Some(70);
         observer.observe_sample(complete.clone());
         let stable = observer.observe_sample(complete);
@@ -1431,7 +1588,7 @@ mod tests {
 
         clock.advance(Duration::from_secs(1)).unwrap();
         let missing = observer.observe_sample(RawPlayerSample {
-            uri: Some("fuo://song/1".to_owned()),
+            uri: Some("miliastra://track/qqmusic/1".to_owned()),
             transport: Some(TransportState::Playing),
             volume: None,
             ..RawPlayerSample::default()
@@ -1442,7 +1599,7 @@ mod tests {
 
         clock.advance(Duration::from_secs(1)).unwrap();
         let updated = observer.observe_sample(RawPlayerSample {
-            uri: Some("fuo://song/1".to_owned()),
+            uri: Some("miliastra://track/qqmusic/1".to_owned()),
             transport: Some(TransportState::Playing),
             volume: Some(80),
             ..RawPlayerSample::default()
@@ -1455,7 +1612,7 @@ mod tests {
     fn huge_finite_playback_rate_saturates_progress_without_panicking() {
         let clock = ManualClock::new(Instant::now());
         let mut observer = observer(&clock, PlayerObservationConfig::default());
-        let mut fast = sample("fuo://song/1", TransportState::Playing, 20);
+        let mut fast = sample("miliastra://track/qqmusic/1", TransportState::Playing, 20);
         fast.duration = None;
         fast.playback_rate = Some(1e308);
         observer.observe_sample(fast.clone());
@@ -1478,12 +1635,19 @@ mod tests {
                 },
             );
 
-            let first = observer.observe_sample(sample("fuo://song/1", TransportState::Playing, 1));
+            let first = observer.observe_sample(sample(
+                "miliastra://track/qqmusic/1",
+                TransportState::Playing,
+                1,
+            ));
             assert_eq!(first.uri_freshness, ObservationFreshness::Unknown);
             assert_eq!(first.transport_freshness, ObservationFreshness::Unknown);
 
-            let second =
-                observer.observe_sample(sample("fuo://song/1", TransportState::Playing, 2));
+            let second = observer.observe_sample(sample(
+                "miliastra://track/qqmusic/1",
+                TransportState::Playing,
+                2,
+            ));
             assert_eq!(second.uri_freshness, ObservationFreshness::Fresh);
             assert_eq!(second.transport_freshness, ObservationFreshness::Fresh);
         }
@@ -1494,7 +1658,12 @@ mod tests {
         let started_at = Instant::now();
         let clock = ManualClock::new(started_at);
         let mut observer = observer(&clock, PlayerObservationConfig::default());
-        stabilize(&mut observer, "fuo://song/1", TransportState::Playing, 20);
+        stabilize(
+            &mut observer,
+            "miliastra://track/qqmusic/1",
+            TransportState::Playing,
+            20,
+        );
 
         clock.advance(Duration::from_secs(6)).unwrap();
         let current = observer.current();
@@ -1515,7 +1684,7 @@ mod tests {
         let mut failure_observer = observer(&failure_clock, PlayerObservationConfig::default());
         stabilize(
             &mut failure_observer,
-            "fuo://song/1",
+            "miliastra://track/qqmusic/1",
             TransportState::Playing,
             20,
         );
@@ -1534,7 +1703,7 @@ mod tests {
         let mut empty_observer = observer(&empty_clock, PlayerObservationConfig::default());
         stabilize(
             &mut empty_observer,
-            "fuo://song/1",
+            "miliastra://track/qqmusic/1",
             TransportState::Playing,
             20,
         );
@@ -1558,13 +1727,20 @@ mod tests {
         let started_at = Instant::now();
         let clock = ManualClock::new(started_at);
         let mut observer = observer(&clock, PlayerObservationConfig::default());
-        observer.observe_sample(sample("fuo://song/1", TransportState::Playing, 20));
+        observer.observe_sample(sample(
+            "miliastra://track/qqmusic/1",
+            TransportState::Playing,
+            20,
+        ));
         clock.advance(Duration::from_secs(1)).unwrap();
-        let confirmed =
-            observer.observe_sample(sample("fuo://song/1", TransportState::Playing, 21));
+        let confirmed = observer.observe_sample(sample(
+            "miliastra://track/qqmusic/1",
+            TransportState::Playing,
+            21,
+        ));
 
         let uri_evidence = confirmed.uri_evidence.unwrap();
-        assert_eq!(uri_evidence.value, "fuo://song/1");
+        assert_eq!(uri_evidence.value, "miliastra://track/qqmusic/1");
         assert_eq!(uri_evidence.consecutive_samples, 2);
         assert_eq!(uri_evidence.required_samples, 2);
         assert_eq!(
@@ -1586,11 +1762,19 @@ mod tests {
         );
 
         clock.advance(Duration::from_secs(1)).unwrap();
-        observer.observe_sample(sample("fuo://song/1", TransportState::Playing, 22));
+        observer.observe_sample(sample(
+            "miliastra://track/qqmusic/1",
+            TransportState::Playing,
+            22,
+        ));
         clock.advance(Duration::from_secs(1)).unwrap();
-        let pending = observer.observe_sample(sample("fuo://song/2", TransportState::Playing, 1));
+        let pending = observer.observe_sample(sample(
+            "miliastra://track/qqmusic/2",
+            TransportState::Playing,
+            1,
+        ));
         let candidate = pending.uri_candidate.unwrap();
-        assert_eq!(candidate.value, "fuo://song/2");
+        assert_eq!(candidate.value, "miliastra://track/qqmusic/2");
         assert_eq!(candidate.consecutive_samples, 1);
         assert_eq!(candidate.required_samples, 2);
         assert_eq!(candidate.confirmed_at, None);
@@ -1605,7 +1789,12 @@ mod tests {
         let started_at = Instant::now();
         let clock = ManualClock::new(started_at);
         let mut observer = observer(&clock, PlayerObservationConfig::default());
-        stabilize(&mut observer, "fuo://song/1", TransportState::Playing, 20);
+        stabilize(
+            &mut observer,
+            "miliastra://track/qqmusic/1",
+            TransportState::Playing,
+            20,
+        );
         let snapshot = observer.current();
 
         let reevaluated =
@@ -1627,7 +1816,7 @@ mod tests {
         let started_at = Instant::now();
         let clock = ManualClock::new(started_at);
         let mut observer = observer(&clock, PlayerObservationConfig::default());
-        let mut complete = sample("fuo://song/1", TransportState::Playing, 20);
+        let mut complete = sample("miliastra://track/qqmusic/1", TransportState::Playing, 20);
         complete.title = Some("title".to_owned());
         complete.artist = Some("artist".to_owned());
         complete.album_name = Some("album".to_owned());
@@ -1670,7 +1859,12 @@ mod tests {
         let started_at = Instant::now();
         let clock = ManualClock::new(started_at);
         let mut observer = observer(&clock, PlayerObservationConfig::default());
-        stabilize(&mut observer, "fuo://song/1", TransportState::Playing, 20);
+        stabilize(
+            &mut observer,
+            "miliastra://track/qqmusic/1",
+            TransportState::Playing,
+            20,
+        );
         clock.advance(Duration::from_secs(1)).unwrap();
         let stale = observer.observe_failure();
 
@@ -1696,7 +1890,7 @@ mod tests {
     fn accepting_a_new_uri_clears_the_previous_tracks_optional_evidence() {
         let clock = ManualClock::new(Instant::now());
         let mut observer = observer(&clock, PlayerObservationConfig::default());
-        let mut old = sample("fuo://song/1", TransportState::Playing, 20);
+        let mut old = sample("miliastra://track/qqmusic/1", TransportState::Playing, 20);
         old.title = Some("old title".to_owned());
         old.artist = Some("old artist".to_owned());
         old.album_name = Some("old album".to_owned());
@@ -1706,11 +1900,12 @@ mod tests {
         observer.observe_sample(old.clone());
         observer.observe_sample(old);
 
-        let new_track = RawPlayerSample::new("fuo://song/2", TransportState::Playing);
+        let new_track =
+            RawPlayerSample::new("miliastra://track/qqmusic/2", TransportState::Playing);
         observer.observe_sample(new_track.clone());
         let accepted = observer.observe_sample(new_track);
 
-        assert_eq!(accepted.uri.as_deref(), Some("fuo://song/2"));
+        assert_eq!(accepted.uri.as_deref(), Some("miliastra://track/qqmusic/2"));
         assert_eq!(accepted.title, None);
         assert_eq!(accepted.artist, None);
         assert_eq!(accepted.album_name, None);
@@ -1728,7 +1923,12 @@ mod tests {
     fn expired_identity_does_not_consume_an_old_pending_transport_restart() {
         let clock = ManualClock::new(Instant::now());
         let mut observer = observer(&clock, PlayerObservationConfig::default());
-        stabilize(&mut observer, "fuo://song/1", TransportState::Stopped, 20);
+        stabilize(
+            &mut observer,
+            "miliastra://track/qqmusic/1",
+            TransportState::Stopped,
+            20,
+        );
 
         let missing_uri_playing = RawPlayerSample {
             uri: None,
@@ -1744,9 +1944,16 @@ mod tests {
             observer.current().uri_freshness,
             ObservationFreshness::Unknown
         );
-        observer.observe_sample(sample("fuo://song/1", TransportState::Playing, 21));
-        let restabilized =
-            observer.observe_sample(sample("fuo://song/1", TransportState::Playing, 22));
+        observer.observe_sample(sample(
+            "miliastra://track/qqmusic/1",
+            TransportState::Playing,
+            21,
+        ));
+        let restabilized = observer.observe_sample(sample(
+            "miliastra://track/qqmusic/1",
+            TransportState::Playing,
+            22,
+        ));
 
         assert_eq!(
             restabilized.playback_instance.map(PlaybackInstance::get),
@@ -1758,15 +1965,23 @@ mod tests {
     fn stable_evidence_keeps_the_original_confirmation_sample_count() {
         let clock = ManualClock::new(Instant::now());
         let mut observer = observer(&clock, PlayerObservationConfig::default());
-        stabilize(&mut observer, "fuo://song/1", TransportState::Playing, 20);
+        stabilize(
+            &mut observer,
+            "miliastra://track/qqmusic/1",
+            TransportState::Playing,
+            20,
+        );
         observer.observe_sample(RawPlayerSample {
             uri: None,
             transport: Some(TransportState::Playing),
             ..RawPlayerSample::default()
         });
 
-        let recovered =
-            observer.observe_sample(sample("fuo://song/1", TransportState::Playing, 21));
+        let recovered = observer.observe_sample(sample(
+            "miliastra://track/qqmusic/1",
+            TransportState::Playing,
+            21,
+        ));
         assert_eq!(
             recovered
                 .uri_evidence
@@ -1788,7 +2003,7 @@ mod tests {
         let started_at = Instant::now();
         let clock = ManualClock::new(started_at);
         let mut observer = observer(&clock, PlayerObservationConfig::default());
-        let mut initial = sample("fuo://song/1", TransportState::Playing, 20);
+        let mut initial = sample("miliastra://track/qqmusic/1", TransportState::Playing, 20);
         initial.lyric_line_text = Some("first line".to_owned());
         observer.observe_sample(initial.clone());
         let stable = observer.observe_sample(initial);
@@ -1796,7 +2011,7 @@ mod tests {
 
         clock.advance(Duration::from_secs(1)).unwrap();
         let missing = observer.observe_sample(RawPlayerSample {
-            uri: Some("fuo://song/1".to_owned()),
+            uri: Some("miliastra://track/qqmusic/1".to_owned()),
             transport: Some(TransportState::Playing),
             lyric_line_text: None,
             ..RawPlayerSample::default()
@@ -1806,7 +2021,7 @@ mod tests {
 
         clock.advance(Duration::from_secs(1)).unwrap();
         let blank = observer.observe_sample(RawPlayerSample {
-            uri: Some("fuo://song/1".to_owned()),
+            uri: Some("miliastra://track/qqmusic/1".to_owned()),
             transport: Some(TransportState::Playing),
             lyric_line_text: Some("   ".to_owned()),
             ..RawPlayerSample::default()
@@ -1816,7 +2031,7 @@ mod tests {
 
         clock.advance(Duration::from_secs(1)).unwrap();
         let updated = observer.observe_sample(RawPlayerSample {
-            uri: Some("fuo://song/1".to_owned()),
+            uri: Some("miliastra://track/qqmusic/1".to_owned()),
             transport: Some(TransportState::Playing),
             lyric_line_text: Some("  next line  ".to_owned()),
             ..RawPlayerSample::default()

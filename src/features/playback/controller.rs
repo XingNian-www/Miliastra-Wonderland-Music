@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
+use miliastra_playback::{PlayableTrack, TrackKey};
 
 use crate::features::song_request::SearchCandidate;
 
@@ -21,7 +22,7 @@ use crate::runtime::clock::{Clock, Delay, WallClock};
 
 pub(crate) trait MusicPlayerBackend: Clone + Send + Sync + 'static {
     fn status(&self) -> Result<PlayerStatus>;
-    fn play_uri(&self, uri: &str) -> Result<String>;
+    fn play(&self, track: &PlayableTrack) -> Result<String>;
     /// Reports a provider-level "this candidate cannot be played" error.
     ///
     /// Backends use this hook to preserve the distinction between a stale or
@@ -49,7 +50,7 @@ pub(crate) trait PlaybackStatePort: Clone + Send + Sync + 'static {
         protect_after: Duration,
     ) -> Result<super::ExternalPlaybackObservation>;
     fn clear_external_playback_tracker(&self) -> Result<()>;
-    /// Records and compares the playerd runtime/session responsible for an
+    /// Records and compares the playback runtime/session responsible for an
     /// active request. The persistent implementation makes a process restart
     /// distinguishable from an ordinary stopped transport sample.
     fn reconcile_player_session(
@@ -208,12 +209,21 @@ pub(crate) struct PlaybackRequest {
     pub(crate) keyword: String,
     pub(crate) source: String,
     pub(crate) prefer_accompaniment: bool,
-    pub(crate) uri: String,
+    pub(crate) track: Option<PlayableTrack>,
     pub(crate) requester: String,
     pub(crate) navigation: PlaybackNavigation,
     /// Immutable results from the request's initial provider search. A
     /// fallback selection must reuse these entries instead of searching again.
     pub(crate) candidate_snapshot: Vec<SearchCandidate>,
+}
+
+impl PlaybackRequest {
+    pub(crate) fn uri(&self) -> String {
+        self.track
+            .as_ref()
+            .map(|track| track.track_ref.key.to_string())
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -225,9 +235,9 @@ pub(crate) enum PlaybackNavigation {
 
 #[derive(Clone, Debug)]
 struct PlaybackAttempt {
-    initial_uri: String,
+    initial_key: Option<TrackKey>,
     initial_progress: f64,
-    requested_uri: String,
+    requested_key: TrackKey,
     previous_playback: PlaybackRuntimeState,
     started_at_ms: u64,
 }
@@ -423,14 +433,9 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         let Some(previous) = runtime.previous_requests.last() else {
             return Ok(None);
         };
-        let uri = if previous.confirmed_uri.trim().is_empty() {
-            previous.requested_uri.trim()
-        } else {
-            previous.confirmed_uri.trim()
-        };
-        if uri.is_empty() {
+        let Some(track) = previous.track.clone() else {
             return Ok(None);
-        }
+        };
         Ok(Some(PlaybackRequest {
             keyword: if previous.keyword.trim().is_empty() {
                 previous.song.clone()
@@ -439,7 +444,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             },
             source: previous.source.clone(),
             prefer_accompaniment: previous.prefer_accompaniment,
-            uri: uri.to_string(),
+            track: Some(track),
             requester: previous.requester.clone(),
             navigation: PlaybackNavigation::Previous,
             candidate_snapshot: Vec::new(),
@@ -465,11 +470,10 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             return Ok(false);
         }
         if status.status == "playing" {
-            return Ok(!status.current_uri.trim().is_empty());
+            return Ok(status.current_track.is_some());
         }
         if status.status == "paused"
-            && (playback_remaining_seconds(status).is_some()
-                || !status.current_uri.trim().is_empty())
+            && (playback_remaining_seconds(status).is_some() || status.current_track.is_some())
         {
             return Ok(true);
         }
@@ -480,7 +484,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         if status_matches_active_request(&self.matching, playback.active_request.as_ref(), status) {
             return Ok(true);
         }
-        if status.current_uri.trim().is_empty() {
+        if status.current_track.is_none() {
             return Ok(false);
         }
         if active_request_guard_active(
@@ -494,17 +498,29 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
     }
 
     pub(crate) fn song_dedup_limited(&self, request: &PlaybackRequest) -> Result<bool> {
-        let candidate = request_dedup_candidate(request);
+        let Some(candidate) = request_dedup_candidate(request) else {
+            return Ok(false);
+        };
         self.playback_state.song_dedup_limited(candidate)
     }
 
     fn begin_playback_attempt(&self, request: &PlaybackRequest) -> Result<PlaybackAttempt> {
+        let requested_key = request
+            .track
+            .as_ref()
+            .map(|track| track.track_ref.key.clone())
+            .ok_or_else(|| anyhow!("播放请求缺少结构化曲目"))?;
         self.clear_external_playback_tracker()?;
         let previous_playback = self.playback_snapshot()?;
         let initial = self
             .backend
             .status()
-            .map(|status| (status.current_uri, status.progress))
+            .map(|status| {
+                (
+                    status.current_track.map(|track| track.track_ref.key),
+                    status.progress,
+                )
+            })
             .unwrap_or_default();
         let started_at_ms = self.wall_clock.unix_millis();
         self.playback_state.update(PlaybackStateUpdate::Starting {
@@ -512,8 +528,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
                 keyword: request.keyword.clone(),
                 source: request.source.clone(),
                 prefer_accompaniment: request.prefer_accompaniment,
-                requested_uri: request.uri.clone(),
-                confirmed_uri: String::new(),
+                track: request.track.clone(),
                 song: String::new(),
                 title: String::new(),
                 artist: String::new(),
@@ -525,17 +540,21 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         })?;
         log::info!("播放器状态转移: Starting keyword={}", request.keyword);
         Ok(PlaybackAttempt {
-            initial_uri: initial.0,
+            initial_key: initial.0,
             initial_progress: initial.1,
-            requested_uri: request.uri.clone(),
+            requested_key,
             previous_playback,
             started_at_ms,
         })
     }
 
-    fn play_request_uri(&self, request: &PlaybackRequest) -> Result<PlaybackAttempt> {
+    fn play_request(&self, request: &PlaybackRequest) -> Result<PlaybackAttempt> {
         let attempt = self.begin_playback_attempt(request)?;
-        let result = self.backend.play_uri(&request.uri);
+        let result = request
+            .track
+            .as_ref()
+            .ok_or_else(|| anyhow!("播放请求缺少结构化曲目"))
+            .and_then(|track| self.backend.play(track));
         self.record_attempt_outcome(request, attempt.started_at_ms, result.is_ok());
         if let Err(error) = result {
             let _ = self.restore_failed_attempt(&attempt, "dispatch_failed");
@@ -547,7 +566,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
     fn record_attempt_outcome(&self, request: &PlaybackRequest, started_at_ms: u64, success: bool) {
         if let Err(error) = self.playback_state.record_playback_attempt(
             request.source.clone(),
-            request.uri.clone(),
+            request.uri(),
             started_at_ms,
             if success {
                 "dispatch_acknowledged"
@@ -611,35 +630,27 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
                 continue;
             }
 
-            let current_uri = status.current_uri.trim().to_string();
-            let requested_uri = attempt.requested_uri.trim();
-            if requested_uri.is_empty() {
+            let Some(current_key) = status
+                .current_track
+                .as_ref()
+                .map(|track| track.track_ref.key.clone())
+            else {
                 log::info!(
-                    "播放请求缺少 URI，无法确认歌曲身份 ({}/{})",
+                    "播放器观测缺少结构化曲目，继续等待 ({}/{})",
                     retry + 1,
                     self.timing.status_retries
                 );
                 self.delay
                     .wait(Duration::from_millis(self.timing.status_poll_ms));
                 continue;
-            }
-            if current_uri.is_empty() {
-                log::info!(
-                    "播放器观测缺少 URI，继续等待 ({}/{})",
-                    retry + 1,
-                    self.timing.status_retries
-                );
-                self.delay
-                    .wait(Duration::from_millis(self.timing.status_poll_ms));
-                continue;
-            }
-            if current_uri != requested_uri {
-                if !attempt.initial_uri.is_empty()
-                    && current_uri == attempt.initial_uri
+            };
+            let current_uri = current_key.to_string();
+            if current_key != attempt.requested_key {
+                if attempt.initial_key.as_ref() == Some(&current_key)
                     && !playback_progress_restarted(attempt.initial_progress, status.progress)
                 {
                     log::info!(
-                        "歌曲 URI 尚未切换，继续等待播放请求生效 ({}/{})",
+                        "曲目尚未切换，继续等待播放请求生效 ({}/{})",
                         retry + 1,
                         self.timing.status_retries
                     );
@@ -647,7 +658,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
                         .wait(Duration::from_millis(self.timing.status_poll_ms));
                     continue;
                 }
-                if is_cross_source_uri(requested_uri, &current_uri) {
+                if is_cross_source_track(&attempt.requested_key, &current_key) {
                     match self.reconcile_cross_source_status(request, &status)? {
                         CrossSourceReconciliation::Match {
                             status: stable_status,
@@ -658,7 +669,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
                             let message = format_play_message(&stable_status);
                             log::info!(
                                 "跨源同曲确认成功: requested={} confirmed={} score={:.2} reason={}",
-                                requested_uri,
+                                attempt.requested_key,
                                 stable_status.current_uri,
                                 score,
                                 reason
@@ -675,7 +686,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
                         } => {
                             log::info!(
                                 "跨源同曲判断不匹配: requested={} confirmed={} score={:.2} reason={}",
-                                requested_uri,
+                                attempt.requested_key,
                                 stable_status.current_uri,
                                 score,
                                 reason
@@ -687,7 +698,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
                         } => {
                             log::info!(
                                 "跨源同曲判断不可用: requested={} confirmed={} reason={}",
-                                requested_uri,
+                                attempt.requested_key,
                                 stable_status.current_uri,
                                 reason
                             );
@@ -695,7 +706,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
                         CrossSourceReconciliation::Pending => {
                             log::debug!(
                                 "跨源同曲确认尚未稳定: requested={} current={}",
-                                requested_uri,
+                                attempt.requested_key,
                                 current_uri
                             );
                         }
@@ -704,7 +715,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
                 log::info!(
                     "URI 与请求资源不同，不能用歌曲信息兜底: current={} requested={} ({}/{})",
                     current_uri,
-                    requested_uri,
+                    attempt.requested_key,
                     retry + 1,
                     self.timing.status_retries
                 );
@@ -713,7 +724,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
                         status,
                         local_reason: format!(
                             "播放器 URI 与请求不一致: current={} requested={}",
-                            current_uri, requested_uri
+                            current_key, attempt.requested_key
                         ),
                     },
                 ));
@@ -761,7 +772,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         &self,
         request: &PlaybackRequest,
     ) -> Result<PlaybackVerification> {
-        let mut attempt = self.play_request_uri(request)?;
+        let mut attempt = self.play_request(request)?;
         self.verify_playback_started(request, &mut attempt)
     }
 
@@ -834,7 +845,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
                 log::debug!(
                     "跨源同曲本地判断不确定: current={} requested={} reason={}",
                     status.current_uri,
-                    request.uri,
+                    request.uri(),
                     reason
                 );
                 self.identity_judge.judge(request, status)
@@ -863,11 +874,11 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         }
 
         if session_reconciliation == SessionReconciliation::Restarted {
-            return self.recover_after_playerd_restart(&runtime_snapshot, &status);
+            return self.recover_after_runtime_restart(&runtime_snapshot, &status);
         }
         if session_reconciliation == SessionReconciliation::Replaced {
             log::warn!(
-                "playerd 会话已更新，等待请求身份校验: session={} generation={}",
+                "播放运行时会话已更新，等待请求身份校验: session={} generation={}",
                 status.session_id,
                 status.generation
             );
@@ -925,10 +936,13 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             )
         {
             if let Some(active_request) = runtime_snapshot.active_request.as_ref()
-                && is_cross_source_uri(
-                    active_request_expected_uri(active_request),
-                    status.current_uri.trim(),
-                )
+                && active_request
+                    .track
+                    .as_ref()
+                    .zip(status.current_track.as_ref())
+                    .is_some_and(|(requested, current)| {
+                        is_cross_source_track(&requested.track_ref.key, &current.track_ref.key)
+                    })
             {
                 let request = playback_request_from_active(active_request);
                 match self.reconcile_cross_source_status(&request, &status)? {
@@ -1033,7 +1047,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
                 self.wall_clock.unix_millis(),
             )?;
             if !claimed {
-                log::debug!("已处理过同一 playerd 自然结束，忽略重复观测");
+                log::debug!("已处理过同一 播放运行时自然结束，忽略重复观测");
                 return Ok(QueueAdvanceDecision::None);
             }
             self.clear_active_request()?;
@@ -1160,7 +1174,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             && is_notify_controller_natural_end(status)
     }
 
-    fn recover_after_playerd_restart(
+    fn recover_after_runtime_restart(
         &self,
         runtime: &PlaybackRuntimeState,
         status: &PlayerStatus,
@@ -1169,7 +1183,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             return Ok(QueueAdvanceDecision::None);
         };
         if runtime.pause_reason == PauseReason::User {
-            log::info!("playerd 已重启，但用户暂停仍生效，跳过恢复");
+            log::info!("播放运行时已重启，但用户暂停仍生效，跳过恢复");
             return Ok(QueueAdvanceDecision::None);
         }
         if status.session_id.trim().is_empty()
@@ -1177,8 +1191,8 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         {
             let request = playback_request_from_active(active);
             log::warn!(
-                "检测到 playerd runtime 重启，控制器授权新恢复会话: previous_uri={}",
-                request.uri
+                "检测到 playback runtime 重启，控制器授权新恢复会话: previous_uri={}",
+                request.uri()
             );
             match self.play_and_verify(&request)? {
                 PlaybackVerification::Success { status, .. } => {
@@ -1187,7 +1201,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
                     return Ok(QueueAdvanceDecision::PlaybackStateChanged);
                 }
                 PlaybackVerification::NoSource { reason, .. } => {
-                    log::error!("playerd 重启后的恢复会话无法播放: {reason}");
+                    log::error!("播放运行时重启后的恢复会话无法播放: {reason}");
                     self.mark_unknown()?;
                     return Ok(QueueAdvanceDecision::PlaybackStateChanged);
                 }
@@ -1233,13 +1247,8 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
                     active_uri: playback
                         .active_request
                         .as_ref()
-                        .map(|request| {
-                            if request.confirmed_uri.trim().is_empty() {
-                                request.requested_uri.clone()
-                            } else {
-                                request.confirmed_uri.clone()
-                            }
-                        })
+                        .and_then(|request| request.track.as_ref())
+                        .map(|track| track.track_ref.key.to_string())
                         .unwrap_or_default(),
                     last_observation_reliability: playback
                         .last_observation
@@ -1250,7 +1259,8 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
                         .map(|observation| observation.status.clone())
                         .unwrap_or_default(),
                     current_uri: observation
-                        .map(|observation| observation.uri.clone())
+                        .and_then(|observation| observation.track.as_ref())
+                        .map(|track| track.track_ref.key.to_string())
                         .unwrap_or_default(),
                     title: observation
                         .map(|observation| observation.title.clone())
@@ -1302,7 +1312,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         request: &PlaybackRequest,
         status: &PlayerStatus,
     ) -> Result<()> {
-        self.confirm_playback_success_with_uri(request, status, true, "playback_confirmed")
+        self.confirm_playback_success_with_track(request, status, true, "playback_confirmed")
     }
 
     fn confirm_playback_fallback(
@@ -1311,7 +1321,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         status: &PlayerStatus,
         reason: &str,
     ) -> Result<()> {
-        self.confirm_playback_success_with_uri(request, status, false, reason)
+        self.confirm_playback_success_with_track(request, status, false, reason)
     }
 
     fn confirm_playback_reconciliation(
@@ -1320,12 +1330,12 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         status: &PlayerStatus,
         reason: &str,
     ) -> Result<()> {
-        let confirmed_uri = status.current_uri.trim();
-        if confirmed_uri.is_empty() {
-            return Err(anyhow!("跨源换源确认缺少 URI"));
-        }
+        let confirmed_track = status
+            .current_track
+            .clone()
+            .ok_or_else(|| anyhow!("跨源换源确认缺少结构化曲目"))?;
         let mut reconciled = active_request.clone();
-        reconciled.confirmed_uri = confirmed_uri.to_string();
+        reconciled.track = Some(confirmed_track);
         reconciled.song = format!("{}{}", status.name, status.singer);
         reconciled.title = status.name.trim().to_string();
         reconciled.artist = status.singer.trim().to_string();
@@ -1335,39 +1345,39 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
                 request: reconciled,
             })?;
         let request = playback_request_from_active(active_request);
-        self.record_song_dedup_playback(&request, confirmed_uri, status)?;
+        self.record_song_dedup_playback(&request, status)?;
         log::info!(
             "播放器状态保持 RequestedSongPlaying reason={} confirmed_uri={}",
             reason,
-            confirmed_uri
+            status.current_uri
         );
         Ok(())
     }
 
-    fn confirm_playback_success_with_uri(
+    fn confirm_playback_success_with_track(
         &self,
         request: &PlaybackRequest,
         status: &PlayerStatus,
-        require_requested_uri: bool,
+        require_requested_track: bool,
         reason: &str,
     ) -> Result<()> {
-        let requested_uri = request.uri.trim();
-        let confirmed_uri = status.current_uri.trim();
-        if requested_uri.is_empty() {
-            return Err(anyhow!("播放请求缺少 URI，不能确认播放成功"));
-        }
-        if confirmed_uri.is_empty() {
-            return Err(anyhow!("播放器观测缺少 URI，不能确认播放成功"));
-        }
-        if require_requested_uri && confirmed_uri != requested_uri {
-            return Err(anyhow!("播放器观测 URI 与请求不一致，不能确认播放成功"));
+        let confirmed_track = status
+            .current_track
+            .as_ref()
+            .ok_or_else(|| anyhow!("播放器观测缺少结构化曲目，不能确认播放成功"))?;
+        if require_requested_track
+            && request
+                .track
+                .as_ref()
+                .is_none_or(|track| confirmed_track.track_ref.key != track.track_ref.key)
+        {
+            return Err(anyhow!("播放器观测曲目与请求不一致，不能确认播放成功"));
         }
         let active_request = ActivePlaybackRequest {
             keyword: request.keyword.clone(),
             source: request.source.clone(),
             prefer_accompaniment: request.prefer_accompaniment,
-            requested_uri: request.uri.clone(),
-            confirmed_uri: confirmed_uri.to_string(),
+            track: Some(confirmed_track.clone()),
             song: format!("{}{}", status.name, status.singer),
             title: status.name.trim().to_string(),
             artist: status.singer.trim().to_string(),
@@ -1379,7 +1389,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             request: active_request,
             navigation: request.navigation,
         })?;
-        self.record_song_dedup_playback(request, confirmed_uri, status)?;
+        self.record_song_dedup_playback(request, status)?;
         log::info!("播放器状态转移: Starting -> RequestedSongPlaying reason={reason}");
         Ok(())
     }
@@ -1387,7 +1397,6 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
     fn record_song_dedup_playback(
         &self,
         request: &PlaybackRequest,
-        confirmed_uri: &str,
         status: &PlayerStatus,
     ) -> Result<()> {
         let (fallback_title, fallback_artist) = split_title_artist(&request.keyword);
@@ -1402,7 +1411,17 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             status.singer.trim().to_string()
         };
         let candidate = SongDedupCandidate {
-            uri: confirmed_uri.to_string(),
+            track_key: status
+                .current_track
+                .as_ref()
+                .map(|track| track.track_ref.key.clone())
+                .or_else(|| {
+                    request
+                        .track
+                        .as_ref()
+                        .map(|track| track.track_ref.key.clone())
+                })
+                .ok_or_else(|| anyhow!("播放去重缺少结构化曲目"))?,
             title,
             artist,
             source: request.source.clone(),
@@ -1418,7 +1437,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
     ) -> Result<()> {
         let observation = PlaybackObservation {
             status: status.status.clone(),
-            uri: status.current_uri.clone(),
+            track: status.current_track.clone(),
             title: status.name.clone(),
             artist: status.singer.clone(),
             progress: status.progress,
@@ -1505,27 +1524,23 @@ fn external_playback_identity(status: &PlayerStatus) -> Option<String> {
     if status.status != "playing" {
         return None;
     }
-    let uri = status.current_uri.trim();
-    (!uri.is_empty()).then(|| format!("uri:{uri}"))
+    status
+        .current_track
+        .as_ref()
+        .map(|track| format!("track:{}", track.track_ref.key))
 }
 
-fn is_cross_source_uri(requested: &str, current: &str) -> bool {
-    let requested_source = uri_source(requested);
-    let current_source = uri_source(current);
-    requested_source.is_some() && current_source.is_some() && requested_source != current_source
-}
-
-fn uri_source(uri: &str) -> Option<&str> {
-    uri.strip_prefix("miliastra://track/")
-        .or_else(|| uri.strip_prefix("fuo://"))
-        .and_then(|rest| rest.split('/').next())
-        .filter(|source| !source.trim().is_empty())
+fn is_cross_source_track(requested: &TrackKey, current: &TrackKey) -> bool {
+    requested.provider != current.provider
 }
 
 fn stable_fallback_identity(previous: &PlayerStatus, current: &PlayerStatus) -> bool {
     matches!(current.status.as_str(), "playing" | "paused")
-        && !current.current_uri.trim().is_empty()
-        && current.current_uri.trim() == previous.current_uri.trim()
+        && current
+            .current_track
+            .as_ref()
+            .zip(previous.current_track.as_ref())
+            .is_some_and(|(current, previous)| current.track_ref.key == previous.track_ref.key)
         && current.name.trim() == previous.name.trim()
         && current.singer.trim() == previous.singer.trim()
 }
@@ -1548,17 +1563,19 @@ fn status_matches_active_request(
     let Some(active_request) = active_request else {
         return false;
     };
-    let current_uri = status.current_uri.trim();
-    let requested_uri = active_request_expected_uri(active_request);
-    !current_uri.is_empty() && !requested_uri.is_empty() && current_uri == requested_uri
+    active_request
+        .track
+        .as_ref()
+        .zip(status.current_track.as_ref())
+        .is_some_and(|(requested, current)| requested.track_ref.key == current.track_ref.key)
 }
 
-fn active_request_expected_uri(active_request: &ActivePlaybackRequest) -> &str {
-    if active_request.confirmed_uri.trim().is_empty() {
-        active_request.requested_uri.trim()
-    } else {
-        active_request.confirmed_uri.trim()
-    }
+fn active_request_expected_uri(active_request: &ActivePlaybackRequest) -> String {
+    active_request
+        .track
+        .as_ref()
+        .map(|track| track.track_ref.key.to_string())
+        .unwrap_or_default()
 }
 
 fn playback_request_from_active(active_request: &ActivePlaybackRequest) -> PlaybackRequest {
@@ -1566,7 +1583,7 @@ fn playback_request_from_active(active_request: &ActivePlaybackRequest) -> Playb
         keyword: active_request.keyword.clone(),
         source: active_request.source.clone(),
         prefer_accompaniment: active_request.prefer_accompaniment,
-        uri: active_request_expected_uri(active_request).to_string(),
+        track: active_request.track.clone(),
         requester: active_request.requester.clone(),
         navigation: PlaybackNavigation::Normal,
         candidate_snapshot: Vec::new(),
@@ -1613,22 +1630,24 @@ fn active_request_track_changed(
     let Some(active_request) = active_request else {
         return false;
     };
-    let current_uri = status.current_uri.trim();
-    let requested_uri = active_request_expected_uri(active_request);
-    let changed =
-        !current_uri.is_empty() && !requested_uri.is_empty() && current_uri != requested_uri;
+    let changed = active_request
+        .track
+        .as_ref()
+        .zip(status.current_track.as_ref())
+        .is_some_and(|(requested, current)| requested.track_ref.key != current.track_ref.key);
     changed && !status_matches_active_request(matching, Some(active_request), status)
 }
 
-fn request_dedup_candidate(request: &PlaybackRequest) -> SongDedupCandidate {
+fn request_dedup_candidate(request: &PlaybackRequest) -> Option<SongDedupCandidate> {
+    let track = request.track.as_ref()?;
     let (title, artist) = split_title_artist(&request.keyword);
-    SongDedupCandidate {
-        uri: request.uri.clone(),
+    Some(SongDedupCandidate {
+        track_key: track.track_ref.key.clone(),
         title,
         artist,
         source: request.source.clone(),
         prefer_accompaniment: request.prefer_accompaniment,
-    }
+    })
 }
 
 fn split_title_artist(value: &str) -> (String, String) {
@@ -1646,7 +1665,7 @@ fn classify_observation(status: &PlayerStatus) -> ObservationReliability {
     if status.status != "playing" && status.status != "paused" {
         return ObservationReliability::Stale;
     }
-    if status.current_uri.trim().is_empty() {
+    if status.current_track.is_none() {
         return ObservationReliability::Incomplete;
     }
     ObservationReliability::Reliable
@@ -1689,7 +1708,7 @@ fn format_reliability(reliability: ObservationReliability) -> String {
 mod tests {
     use super::super::{PersistentPlaybackState, PersistentSongDedupHistory};
     use super::*;
-    use crate::features::playback::SongDedupConfig;
+    use crate::features::playback::{SongDedupConfig, test_track};
     use crate::runtime::clock::{Clock, Delay, ManualClock, SystemClock, WallClock};
     use std::collections::{HashSet, VecDeque};
     use std::fs;
@@ -1901,7 +1920,7 @@ mod tests {
                 .unwrap_or_default())
         }
 
-        fn play_uri(&self, _uri: &str) -> Result<String> {
+        fn play(&self, _track: &PlayableTrack) -> Result<String> {
             if self.play_error {
                 return Err(anyhow!("play failed"));
             }
@@ -1937,6 +1956,7 @@ mod tests {
     fn status(name: &str, uri: &str, progress: f64, duration: f64) -> PlayerStatus {
         PlayerStatus {
             status: "playing".to_string(),
+            current_track: (!uri.is_empty()).then(|| test_track(uri, name)),
             current_uri: uri.to_string(),
             name: name.to_string(),
             singer: "歌手".to_string(),
@@ -1956,6 +1976,7 @@ mod tests {
     fn stopped_status_with_uri(uri: &str) -> PlayerStatus {
         PlayerStatus {
             status: "stopped".to_string(),
+            current_track: Some(test_track(uri, "测试歌曲 - 测试歌手")),
             current_uri: uri.to_string(),
             ..PlayerStatus::default()
         }
@@ -2079,7 +2100,7 @@ mod tests {
     }
 
     fn request() -> PlaybackRequest {
-        playback_request("目标 - 歌手", "fuo://qqmusic/songs/1")
+        playback_request("目标 - 歌手", "miliastra://track/qqmusic/1")
     }
 
     fn playback_request(keyword: &str, uri: &str) -> PlaybackRequest {
@@ -2087,7 +2108,7 @@ mod tests {
             keyword: keyword.to_string(),
             source: "qqmusic".to_string(),
             prefer_accompaniment: false,
-            uri: uri.to_string(),
+            track: Some(test_track(uri, keyword)),
             requester: String::new(),
             navigation: PlaybackNavigation::Normal,
             candidate_snapshot: Vec::new(),
@@ -2107,12 +2128,12 @@ mod tests {
     #[test]
     fn starting_waits_through_old_song_then_confirms_uri() {
         let backend = FakeBackend::new(vec![
-            status("旧歌", "fuo://qqmusic/songs/old", 30.0, 120.0),
-            status("目标", "fuo://qqmusic/songs/1", 1.0, 180.0),
+            status("旧歌", "miliastra://track/qqmusic/old", 30.0, 120.0),
+            status("目标", "miliastra://track/qqmusic/1", 1.0, 180.0),
         ]);
         let controller = controller(backend);
         let request = request();
-        let mut attempt = controller.play_request_uri(&request).unwrap();
+        let mut attempt = controller.play_request(&request).unwrap();
 
         let result = controller
             .verify_playback_started(&request, &mut attempt)
@@ -2124,8 +2145,8 @@ mod tests {
 
     #[test]
     fn confirmed_playback_keeps_previous_uri_for_direct_previous() {
-        let uri_a = "fuo://qqmusic/songs/a";
-        let uri_b = "fuo://qqmusic/songs/b";
+        let uri_a = "miliastra://track/qqmusic/a";
+        let uri_b = "miliastra://track/qqmusic/b";
         let backend = FakeBackend::new(vec![
             stopped_status(),
             status("歌曲A", uri_a, 1.0, 180.0),
@@ -2137,14 +2158,14 @@ mod tests {
         let controller = controller(backend);
 
         let first = playback_request("歌曲A", uri_a);
-        let mut attempt = controller.play_request_uri(&first).unwrap();
+        let mut attempt = controller.play_request(&first).unwrap();
         assert!(matches!(
             controller.verify_playback_started(&first, &mut attempt),
             Ok(PlaybackVerification::Success { .. })
         ));
 
         let second = playback_request("歌曲B", uri_b);
-        let mut attempt = controller.play_request_uri(&second).unwrap();
+        let mut attempt = controller.play_request(&second).unwrap();
         assert!(matches!(
             controller.verify_playback_started(&second, &mut attempt),
             Ok(PlaybackVerification::Success { .. })
@@ -2154,10 +2175,10 @@ mod tests {
             .previous_playback_request()
             .unwrap()
             .expect("confirmed previous URI");
-        assert_eq!(previous.uri, uri_a);
+        assert_eq!(previous.uri(), uri_a);
         assert_eq!(previous.navigation, PlaybackNavigation::Previous);
 
-        let mut previous_attempt = controller.play_request_uri(&previous).unwrap();
+        let mut previous_attempt = controller.play_request(&previous).unwrap();
         assert!(matches!(
             controller.verify_playback_started(&previous, &mut previous_attempt),
             Ok(PlaybackVerification::Success { .. })
@@ -2167,10 +2188,10 @@ mod tests {
 
     #[test]
     fn stable_external_observation_becomes_previous_uri_before_new_playback() {
-        let external_uri = "fuo://netease/songs/external";
+        let external_uri = "miliastra://track/netease/external";
         let backend = FakeBackend::new(vec![
             status("外部歌曲", external_uri, 20.0, 180.0),
-            status("新歌曲", "fuo://qqmusic/songs/new", 1.0, 180.0),
+            status("新歌曲", "miliastra://track/qqmusic/new", 1.0, 180.0),
         ]);
         let controller = controller(backend);
         controller
@@ -2181,7 +2202,7 @@ mod tests {
             .playback_state
             .update(PlaybackStateUpdate::Observation(PlaybackObservation {
                 status: "playing".to_string(),
-                uri: external_uri.to_string(),
+                track: Some(test_track(external_uri, "外部歌曲 - 歌手")),
                 title: "外部歌曲".to_string(),
                 artist: "歌手".to_string(),
                 progress: 20.0,
@@ -2191,26 +2212,26 @@ mod tests {
             }))
             .unwrap();
 
-        let request = playback_request("新歌曲", "fuo://qqmusic/songs/new");
-        let _attempt = controller.play_request_uri(&request).unwrap();
+        let request = playback_request("新歌曲", "miliastra://track/qqmusic/new");
+        let _attempt = controller.play_request(&request).unwrap();
         let previous = controller
             .previous_playback_request()
             .unwrap()
             .expect("external URI should be retained");
 
-        assert_eq!(previous.uri, external_uri);
+        assert_eq!(previous.uri(), external_uri);
         assert_eq!(previous.source, "netease");
     }
 
     #[test]
     fn verification_does_not_accept_matching_title_with_different_uri() {
         let backend = FakeBackend::new(vec![
-            status("旧歌", "fuo://qqmusic/songs/old", 30.0, 180.0),
-            status("目标", "fuo://qqmusic/songs/other", 1.0, 180.0),
+            status("旧歌", "miliastra://track/qqmusic/old", 30.0, 180.0),
+            status("目标", "miliastra://track/qqmusic/other", 1.0, 180.0),
         ]);
         let controller = controller(backend);
         let request = request();
-        let mut attempt = controller.play_request_uri(&request).unwrap();
+        let mut attempt = controller.play_request(&request).unwrap();
 
         let result = controller
             .verify_playback_started(&request, &mut attempt)
@@ -2225,9 +2246,9 @@ mod tests {
 
     #[test]
     fn cross_source_fallback_requires_stability_and_identity_confirmation() {
-        let fallback_uri = "fuo://netease/songs/fallback";
+        let fallback_uri = "miliastra://track/netease/fallback";
         let backend = FakeBackend::new(vec![
-            status("旧歌", "fuo://qqmusic/songs/old", 30.0, 180.0),
+            status("旧歌", "miliastra://track/qqmusic/old", 30.0, 180.0),
             status("别名版本", fallback_uri, 1.0, 180.0),
             status("别名版本", fallback_uri, 2.0, 180.0),
         ]);
@@ -2240,7 +2261,7 @@ mod tests {
         );
         controller.timing.fallback_identity_stable_samples = 2;
         let request = request();
-        let mut attempt = controller.play_request_uri(&request).unwrap();
+        let mut attempt = controller.play_request(&request).unwrap();
 
         let result = controller
             .verify_playback_started(&request, &mut attempt)
@@ -2255,7 +2276,7 @@ mod tests {
 
     #[test]
     fn post_confirmation_cross_source_switch_rechecks_identity_before_external_transition() {
-        let fallback_uri = "fuo://netease/songs/fallback";
+        let fallback_uri = "miliastra://track/netease/fallback";
         let backend = FakeBackend::new(vec![status("目标", fallback_uri, 12.0, 180.0)]);
         let manual_clock = Arc::new(ManualClock::new(Instant::now()));
         let controller = controller_with_time_and_judge(
@@ -2267,7 +2288,10 @@ mod tests {
         );
         let request = request();
         controller
-            .confirm_playback_success(&request, &status("目标", request.uri.as_str(), 1.0, 180.0))
+            .confirm_playback_success(
+                &request,
+                &status("目标", request.uri().as_str(), 1.0, 180.0),
+            )
             .unwrap();
         manual_clock.advance(Duration::from_secs(10)).unwrap();
 
@@ -2299,8 +2323,8 @@ mod tests {
 
     #[test]
     fn post_confirmation_cross_source_switch_waits_for_stable_identity() {
-        let fallback_uri = "fuo://netease/songs/fallback";
-        let other_uri = "fuo://netease/songs/other";
+        let fallback_uri = "miliastra://track/netease/fallback";
+        let other_uri = "miliastra://track/netease/other";
         let backend = FakeBackend::new(vec![
             status("目标", fallback_uri, 12.0, 180.0),
             status("目标", other_uri, 13.0, 180.0),
@@ -2316,7 +2340,10 @@ mod tests {
         controller.timing.fallback_identity_stable_samples = 2;
         let request = request();
         controller
-            .confirm_playback_success(&request, &status("目标", request.uri.as_str(), 1.0, 180.0))
+            .confirm_playback_success(
+                &request,
+                &status("目标", request.uri().as_str(), 1.0, 180.0),
+            )
             .unwrap();
         manual_clock.advance(Duration::from_secs(10)).unwrap();
 
@@ -2335,12 +2362,12 @@ mod tests {
         assert_eq!(decision, QueueAdvanceDecision::None);
         let snapshot = controller.snapshot();
         assert_eq!(snapshot.state, "requested_song_playing");
-        assert_eq!(snapshot.active_uri, request.uri);
+        assert_eq!(snapshot.active_uri, request.uri());
     }
 
     #[test]
     fn post_confirmation_cross_source_switch_with_unavailable_identity_enters_unknown() {
-        let fallback_uri = "fuo://netease/songs/fallback";
+        let fallback_uri = "miliastra://track/netease/fallback";
         let backend = FakeBackend::new(vec![status("别名版本", fallback_uri, 12.0, 180.0)]);
         let backend_probe = backend.clone();
         let manual_clock = Arc::new(ManualClock::new(Instant::now()));
@@ -2352,7 +2379,10 @@ mod tests {
         );
         let request = request();
         controller
-            .confirm_playback_success(&request, &status("目标", request.uri.as_str(), 1.0, 180.0))
+            .confirm_playback_success(
+                &request,
+                &status("目标", request.uri().as_str(), 1.0, 180.0),
+            )
             .unwrap();
         manual_clock.advance(Duration::from_secs(10)).unwrap();
 
@@ -2377,7 +2407,7 @@ mod tests {
 
     #[test]
     fn post_confirmation_cross_source_switch_with_different_identity_becomes_external() {
-        let fallback_uri = "fuo://netease/songs/fallback";
+        let fallback_uri = "miliastra://track/netease/fallback";
         let backend = FakeBackend::new(vec![status("别名版本", fallback_uri, 12.0, 180.0)]);
         let manual_clock = Arc::new(ManualClock::new(Instant::now()));
         let controller = controller_with_time_and_judge(
@@ -2389,7 +2419,10 @@ mod tests {
         );
         let request = request();
         controller
-            .confirm_playback_success(&request, &status("目标", request.uri.as_str(), 1.0, 180.0))
+            .confirm_playback_success(
+                &request,
+                &status("目标", request.uri().as_str(), 1.0, 180.0),
+            )
             .unwrap();
         manual_clock.advance(Duration::from_secs(10)).unwrap();
 
@@ -2413,7 +2446,7 @@ mod tests {
 
     #[test]
     fn stopped_cross_source_observation_does_not_complete_the_active_request() {
-        let fallback_uri = "fuo://netease/songs/fallback";
+        let fallback_uri = "miliastra://track/netease/fallback";
         let backend = FakeBackend::new(vec![stopped_status_with_uri(fallback_uri)]);
         let manual_clock = Arc::new(ManualClock::new(Instant::now()));
         let controller = controller_with_time_and_judge(
@@ -2425,7 +2458,10 @@ mod tests {
         );
         let request = request();
         controller
-            .confirm_playback_success(&request, &status("目标", request.uri.as_str(), 1.0, 180.0))
+            .confirm_playback_success(
+                &request,
+                &status("目标", request.uri().as_str(), 1.0, 180.0),
+            )
             .unwrap();
         manual_clock.advance(Duration::from_secs(10)).unwrap();
 
@@ -2445,7 +2481,7 @@ mod tests {
         assert_eq!(decision, QueueAdvanceDecision::None);
         let snapshot = controller.snapshot();
         assert_eq!(snapshot.state, "requested_song_playing");
-        assert_eq!(snapshot.active_uri, request.uri);
+        assert_eq!(snapshot.active_uri, request.uri());
     }
 
     #[test]
@@ -2453,7 +2489,8 @@ mod tests {
         let request = request();
         let terminal = PlayerStatus {
             status: "stopped".to_string(),
-            current_uri: request.uri.clone(),
+            current_track: request.track.clone(),
+            current_uri: request.uri(),
             runtime_identity: "runtime-a".to_string(),
             session_id: "session-a".to_string(),
             generation: 41,
@@ -2463,7 +2500,7 @@ mod tests {
         };
         let controller = controller(FakeBackend::new(Vec::new()));
         controller
-            .confirm_playback_success(&request, &status("目标", &request.uri, 1.0, 180.0))
+            .confirm_playback_success(&request, &status("目标", &request.uri(), 1.0, 180.0))
             .unwrap();
         let context = QueueAdvanceContext {
             queue_empty: false,
@@ -2490,11 +2527,12 @@ mod tests {
     }
 
     #[test]
-    fn playerd_runtime_restart_requires_and_receives_controller_recovery() {
+    fn playback_runtime_restart_requires_and_receives_controller_recovery() {
         let request = request();
         let old_runtime = PlayerStatus {
             status: "playing".to_string(),
-            current_uri: request.uri.clone(),
+            current_track: request.track.clone(),
+            current_uri: request.uri(),
             runtime_identity: "runtime-old".to_string(),
             session_id: "session-old".to_string(),
             generation: 7,
@@ -2509,7 +2547,8 @@ mod tests {
         };
         let recovered = PlayerStatus {
             status: "playing".to_string(),
-            current_uri: request.uri.clone(),
+            current_track: request.track.clone(),
+            current_uri: request.uri(),
             runtime_identity: "runtime-new".to_string(),
             session_id: "session-recovered".to_string(),
             generation: 1,
@@ -2520,7 +2559,7 @@ mod tests {
         };
         let controller = controller(FakeBackend::new(vec![recovered.clone(), recovered]));
         controller
-            .confirm_playback_success(&request, &status("目标", &request.uri, 1.0, 180.0))
+            .confirm_playback_success(&request, &status("目标", &request.uri(), 1.0, 180.0))
             .unwrap();
         let context = QueueAdvanceContext {
             queue_empty: true,
@@ -2541,18 +2580,18 @@ mod tests {
             QueueAdvanceDecision::PlaybackStateChanged
         );
         assert_eq!(controller.snapshot().state, "requested_song_playing");
-        assert_eq!(controller.snapshot().active_uri, request.uri);
+        assert_eq!(controller.snapshot().active_uri, request.uri());
     }
 
     #[test]
     fn verification_rejects_missing_uri_even_when_metadata_is_present() {
         let backend = FakeBackend::new(vec![
-            status("旧歌", "fuo://qqmusic/songs/old", 30.0, 180.0),
+            status("旧歌", "miliastra://track/qqmusic/old", 30.0, 180.0),
             status("目标", "", 1.0, 180.0),
         ]);
         let controller = controller(backend);
         let request = request();
-        let mut attempt = controller.play_request_uri(&request).unwrap();
+        let mut attempt = controller.play_request(&request).unwrap();
 
         let result = controller
             .verify_playback_started(&request, &mut attempt)
@@ -2575,7 +2614,10 @@ mod tests {
         let controller = controller(FakeBackend::new(vec![]));
         let request = request();
         controller
-            .confirm_playback_success(&request, &status("目标", request.uri.as_str(), 1.0, 180.0))
+            .confirm_playback_success(
+                &request,
+                &status("目标", request.uri().as_str(), 1.0, 180.0),
+            )
             .unwrap();
 
         assert!(
@@ -2610,7 +2652,7 @@ mod tests {
     #[test]
     fn stopped_status_does_not_complete_active_request_when_queue_is_empty() {
         let backend = FakeBackend::new(vec![
-            status("目标", "fuo://qqmusic/songs/1", 100.0, 100.0),
+            status("目标", "miliastra://track/qqmusic/1", 100.0, 100.0),
             stopped_status(),
         ]);
         let controller = controller(backend);
@@ -2644,7 +2686,7 @@ mod tests {
     fn play_uri_failure_clears_starting_request() {
         let controller = controller(FakeBackend::new(vec![]).with_play_error());
 
-        let result = controller.play_request_uri(&request());
+        let result = controller.play_request(&request());
 
         assert!(result.is_err());
         assert_eq!(controller.snapshot().state, "idle");
@@ -2655,7 +2697,7 @@ mod tests {
     fn play_dispatch_outcome_is_recorded_for_a_failed_attempt() {
         let controller = controller(FakeBackend::new(vec![]).with_play_error());
 
-        assert!(controller.play_request_uri(&request()).is_err());
+        assert!(controller.play_request(&request()).is_err());
 
         assert_eq!(
             controller
@@ -2666,7 +2708,7 @@ mod tests {
                 .as_slice(),
             [(
                 "qqmusic".to_string(),
-                "fuo://qqmusic/songs/1".to_string(),
+                "miliastra://track/qqmusic/1".to_string(),
                 "dispatch_failed".to_string(),
             )]
         );
@@ -2680,7 +2722,7 @@ mod tests {
         let should_queue = controller
             .should_queue_until_current_song_finished(&status(
                 "外部歌",
-                "fuo://qqmusic/songs/external",
+                "miliastra://track/qqmusic/external",
                 30.0,
                 180.0,
             ))
@@ -2696,7 +2738,7 @@ mod tests {
 
         let decision = controller
             .maybe_advance_queue(
-                status("外部歌", "fuo://qqmusic/songs/external", 30.0, 180.0),
+                status("外部歌", "miliastra://track/qqmusic/external", 30.0, 180.0),
                 QueueAdvanceContext {
                     queue_empty: false,
                     has_pending_playback_task: false,
@@ -2720,19 +2762,19 @@ mod tests {
         let mut tracker = ExternalPlaybackTracker::default();
         let delay = Duration::from_secs(20);
 
-        assert!(!tracker.observe("uri:fuo://qqmusic/songs/external", now, delay));
+        assert!(!tracker.observe("track:miliastra://track/qqmusic/external", now, delay));
         assert!(!tracker.observe(
-            "uri:fuo://qqmusic/songs/external",
+            "track:miliastra://track/qqmusic/external",
             now + Duration::from_secs(19),
             delay
         ));
         assert!(tracker.observe(
-            "uri:fuo://qqmusic/songs/external",
+            "track:miliastra://track/qqmusic/external",
             now + Duration::from_secs(20),
             delay
         ));
         assert!(!tracker.observe(
-            "uri:fuo://qqmusic/songs/next",
+            "track:miliastra://track/qqmusic/next",
             now + Duration::from_secs(21),
             delay
         ));
@@ -2747,7 +2789,7 @@ mod tests {
             clock.clone(),
             clock.clone(),
         );
-        let external = status("外部歌", "fuo://qqmusic/songs/external", 30.0, 180.0);
+        let external = status("外部歌", "miliastra://track/qqmusic/external", 30.0, 180.0);
         controller.mark_external_playback().unwrap();
 
         assert!(
@@ -2807,7 +2849,7 @@ mod tests {
     #[test]
     fn stable_external_playback_protects_current_song_from_new_requests() {
         let controller = controller(FakeBackend::new(vec![]));
-        let external = status("外部歌", "fuo://qqmusic/songs/external", 30.0, 180.0);
+        let external = status("外部歌", "miliastra://track/qqmusic/external", 30.0, 180.0);
         controller.mark_external_playback().unwrap();
         controller
             .playback_state
@@ -2832,7 +2874,7 @@ mod tests {
 
         let decision = controller
             .maybe_advance_queue(
-                status("未知歌", "fuo://qqmusic/songs/unknown", 179.0, 180.0),
+                status("未知歌", "miliastra://track/qqmusic/unknown", 179.0, 180.0),
                 QueueAdvanceContext {
                     queue_empty: false,
                     has_pending_playback_task: false,
@@ -2848,19 +2890,19 @@ mod tests {
     #[test]
     fn request_play_uri_failure_restores_previous_request_state() {
         let controller = controller(FakeBackend::new(vec![]).with_play_error());
-        let old_request = playback_request("旧歌 - 歌手", "fuo://qqmusic/songs/old");
-        let old_status = status("旧歌", "fuo://qqmusic/songs/old", 30.0, 180.0);
+        let old_request = playback_request("旧歌 - 歌手", "miliastra://track/qqmusic/old");
+        let old_status = status("旧歌", "miliastra://track/qqmusic/old", 30.0, 180.0);
         controller
             .confirm_playback_success(&old_request, &old_status)
             .unwrap();
 
-        let result = controller.play_request_uri(&request());
+        let result = controller.play_request(&request());
 
         assert!(result.is_err());
         let snapshot = controller.snapshot();
         assert_eq!(snapshot.state, "requested_song_playing");
         assert_eq!(snapshot.active_keyword, "旧歌 - 歌手");
-        assert_eq!(snapshot.active_uri, "fuo://qqmusic/songs/old");
+        assert_eq!(snapshot.active_uri, "miliastra://track/qqmusic/old");
     }
 
     #[test]
@@ -2879,7 +2921,7 @@ mod tests {
     fn later_status_backend_failures_keep_the_playback_attempt_retryable() {
         let controller = controller(
             FakeBackend::new(vec![
-                status("旧歌", "fuo://qqmusic/songs/old", 30.0, 180.0),
+                status("旧歌", "miliastra://track/qqmusic/old", 30.0, 180.0),
                 stopped_status(),
             ])
             .with_status_error_after(2),
@@ -2896,17 +2938,17 @@ mod tests {
     #[test]
     fn verification_no_source_marks_state_unknown_after_dispatch() {
         let backend = FakeBackend::new(vec![
-            status("旧歌", "fuo://qqmusic/songs/old", 30.0, 180.0),
-            status("短歌", "fuo://qqmusic/songs/1", 1.0, 10.0),
+            status("旧歌", "miliastra://track/qqmusic/old", 30.0, 180.0),
+            status("短歌", "miliastra://track/qqmusic/1", 1.0, 10.0),
         ]);
         let controller = controller(backend);
-        let old_request = playback_request("旧歌 - 歌手", "fuo://qqmusic/songs/old");
-        let old_status = status("旧歌", "fuo://qqmusic/songs/old", 30.0, 180.0);
+        let old_request = playback_request("旧歌 - 歌手", "miliastra://track/qqmusic/old");
+        let old_status = status("旧歌", "miliastra://track/qqmusic/old", 30.0, 180.0);
         controller
             .confirm_playback_success(&old_request, &old_status)
             .unwrap();
         let request = request();
-        let mut attempt = controller.play_request_uri(&request).unwrap();
+        let mut attempt = controller.play_request(&request).unwrap();
 
         let result = controller
             .verify_playback_started(&request, &mut attempt)
@@ -2919,7 +2961,7 @@ mod tests {
         else {
             panic!("short playback should report its observed no-source evidence");
         };
-        assert_eq!(status.current_uri, "fuo://qqmusic/songs/1");
+        assert_eq!(status.current_uri, "miliastra://track/qqmusic/1");
         assert_eq!(status.duration, 10.0);
         assert_eq!(reason, "歌曲时长过短: 10.0s");
         let snapshot = controller.snapshot();
@@ -2930,16 +2972,20 @@ mod tests {
 
     #[test]
     fn verification_timeout_marks_state_unknown_after_dispatch() {
-        let backend =
-            FakeBackend::new(vec![status("旧歌", "fuo://qqmusic/songs/old", 30.0, 180.0)]);
+        let backend = FakeBackend::new(vec![status(
+            "旧歌",
+            "miliastra://track/qqmusic/old",
+            30.0,
+            180.0,
+        )]);
         let controller = controller(backend);
-        let old_request = playback_request("旧歌 - 歌手", "fuo://qqmusic/songs/old");
-        let old_status = status("旧歌", "fuo://qqmusic/songs/old", 30.0, 180.0);
+        let old_request = playback_request("旧歌 - 歌手", "miliastra://track/qqmusic/old");
+        let old_status = status("旧歌", "miliastra://track/qqmusic/old", 30.0, 180.0);
         controller
             .confirm_playback_success(&old_request, &old_status)
             .unwrap();
         let request = request();
-        let mut attempt = controller.play_request_uri(&request).unwrap();
+        let mut attempt = controller.play_request(&request).unwrap();
 
         let result = controller
             .verify_playback_started(&request, &mut attempt)
@@ -2957,12 +3003,12 @@ mod tests {
         let backend = FakeBackend::new(vec![]);
         let controller = controller(backend.clone());
         let request = request();
-        let _attempt = controller.play_request_uri(&request).unwrap();
+        let _attempt = controller.play_request(&request).unwrap();
 
         controller
             .reject_mismatch_as_no_source(Some(&status(
                 "不匹配",
-                "fuo://qqmusic/songs/other",
+                "miliastra://track/qqmusic/other",
                 1.0,
                 180.0,
             )))
@@ -2982,7 +3028,7 @@ mod tests {
 
         let decision = controller
             .maybe_advance_queue(
-                status("目标", "fuo://qqmusic/songs/1", 179.0, 180.0),
+                status("目标", "miliastra://track/qqmusic/1", 179.0, 180.0),
                 QueueAdvanceContext {
                     queue_empty: true,
                     has_pending_playback_task: false,
@@ -3003,7 +3049,7 @@ mod tests {
 
         let decision = controller
             .maybe_advance_queue(
-                status("目标", "fuo://qqmusic/songs/1", 179.0, 180.0),
+                status("目标", "miliastra://track/qqmusic/1", 179.0, 180.0),
                 QueueAdvanceContext {
                     queue_empty: true,
                     has_pending_playback_task: true,
@@ -3025,7 +3071,7 @@ mod tests {
 
         let decision = controller
             .maybe_advance_queue(
-                status("目标", "fuo://qqmusic/songs/1", 10.0, 180.0),
+                status("目标", "miliastra://track/qqmusic/1", 10.0, 180.0),
                 QueueAdvanceContext {
                     queue_empty: true,
                     has_pending_playback_task: false,
@@ -3047,7 +3093,7 @@ mod tests {
 
         let decision = controller
             .maybe_advance_queue(
-                status("目标", "fuo://qqmusic/songs/1", 10.0, 180.0),
+                status("目标", "miliastra://track/qqmusic/1", 10.0, 180.0),
                 QueueAdvanceContext {
                     queue_empty: true,
                     has_pending_playback_task: false,

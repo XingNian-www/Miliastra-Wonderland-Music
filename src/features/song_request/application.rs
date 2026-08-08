@@ -2,6 +2,7 @@ use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
+use miliastra_playback::PlayableTrack;
 
 use super::{
     AiCandidatePickResult, AiClient, SongCommand, SongReviewCandidate, SongReviewClient,
@@ -188,7 +189,7 @@ pub(crate) fn select_ai_candidate(
     let pick = ai.pick_song_candidate(request, prefer_accompaniment, candidates)?;
     let candidate = candidates
         .iter()
-        .find(|candidate| candidate.uri == pick.uri)
+        .find(|candidate| candidate.track_ref.key.to_string() == pick.uri)
         .cloned()
         .ok_or_else(|| anyhow!("AI 返回未知歌曲候选: {}", pick.uri))?;
     Ok((candidate, pick))
@@ -235,7 +236,7 @@ pub(crate) struct ResolvedSongRequest {
     pub(crate) source: String,
     pub(crate) prefer_accompaniment: bool,
     pub(crate) ai_original_text: String,
-    pub(crate) uri: String,
+    pub(crate) track: Option<PlayableTrack>,
     pub(crate) friend_username: String,
     pub(crate) requester: String,
     pub(crate) console_bypass_dedup: bool,
@@ -257,7 +258,7 @@ impl ResolvedSongRequest {
             source: self.source.clone(),
             prefer_accompaniment: self.prefer_accompaniment,
             ai_original_text: self.ai_original_text.clone(),
-            uri: self.uri.clone(),
+            track: self.track.clone(),
             friend_username: self.friend_username.clone(),
             requester: self.requester.clone(),
             console_bypass_dedup: self.console_bypass_dedup,
@@ -285,7 +286,11 @@ impl ResolvedSongRequest {
         };
         format!(
             "{} keyword={} source={} uri={} aiOriginal={}",
-            action, playback_request.keyword, source, playback_request.uri, self.ai_original_text,
+            action,
+            playback_request.keyword,
+            source,
+            playback_request.uri(),
+            self.ai_original_text,
         )
     }
 }
@@ -411,8 +416,12 @@ impl SongRequestExecution<'_> {
         let status = self.port.player_status();
         match status {
             Ok(status) if is_playing(&status) => {
-                if !request.uri.trim().is_empty() && status.current_uri.trim() == request.uri.trim()
-                {
+                if request.track.as_ref().is_some_and(|requested| {
+                    status
+                        .current_track
+                        .as_ref()
+                        .is_some_and(|current| current.track_ref.key == requested.track_ref.key)
+                }) {
                     self.log_executed_command(context, &request.final_command("already-playing"))?;
                     self.reply(&format!("当前正在播放: {}", request.keyword))?;
                     return Ok(());
@@ -488,7 +497,7 @@ impl SongRequestExecution<'_> {
                 source: song.source.as_str().to_string(),
                 prefer_accompaniment: song.prefer_accompaniment,
                 ai_original_text: String::new(),
-                uri: String::new(),
+                track: None,
                 friend_username: song.friend_username.clone(),
                 requester: String::new(),
                 console_bypass_dedup: false,
@@ -549,7 +558,7 @@ impl SongRequestExecution<'_> {
             "AI点歌候选: raw={} pick={} uri={} score={:.2} reason={}",
             song.keyword,
             candidate.text,
-            candidate.uri,
+            candidate.track_ref.key,
             pick.score,
             pick.reason
         );
@@ -565,7 +574,7 @@ impl SongRequestExecution<'_> {
             source: String::new(),
             prefer_accompaniment: song.prefer_accompaniment,
             ai_original_text: song.keyword.clone(),
-            uri: candidate.uri.clone(),
+            track: Some(candidate.playable_track()),
             friend_username: song.friend_username.clone(),
             requester: String::new(),
             console_bypass_dedup: false,
@@ -580,7 +589,7 @@ impl SongRequestExecution<'_> {
         let Some(request) = self.resolve_song_request(song)? else {
             return Ok(None);
         };
-        if request.uri.is_empty() {
+        if request.track.is_none() {
             let source = if request.source.trim().is_empty() {
                 "qqmusic"
             } else {
@@ -626,7 +635,7 @@ impl SongRequestExecution<'_> {
                 }
             };
             let song_title = picked.candidate.text.clone();
-            let uri = picked.candidate.uri.clone();
+            let track = picked.candidate.playable_track();
             let actions = if self.ai.enabled() {
                 "@确认@跳过@换源@AI"
             } else {
@@ -642,7 +651,7 @@ impl SongRequestExecution<'_> {
                         source: source.to_string(),
                         prefer_accompaniment: request.prefer_accompaniment,
                         ai_original_text: String::new(),
-                        uri,
+                        track: Some(track),
                         friend_username: request.friend_username.clone(),
                         requester: request.requester.clone(),
                         console_bypass_dedup: request.console_bypass_dedup,
@@ -728,7 +737,7 @@ impl SongRequestExecution<'_> {
                     source: source.to_string(),
                     prefer_accompaniment: song.prefer_accompaniment,
                     ai_original_text: String::new(),
-                    uri: picked.candidate.uri.clone(),
+                    track: Some(picked.candidate.playable_track()),
                     friend_username: song.friend_username.clone(),
                     requester: String::new(),
                     console_bypass_dedup: false,
@@ -757,7 +766,7 @@ impl SongRequestExecution<'_> {
             keyword: request.keyword.clone(),
             source: request.source.clone(),
             prefer_accompaniment: request.prefer_accompaniment,
-            uri: request.uri.clone(),
+            track: request.track.clone(),
             ..QueueItem::default()
         })
     }
@@ -767,7 +776,11 @@ impl SongRequestExecution<'_> {
             log::info!(
                 "长时间同歌去重入队拦截: keyword={} uri={}",
                 request.keyword,
-                request.uri
+                request
+                    .track
+                    .as_ref()
+                    .map(|track| track.track_ref.key.to_string())
+                    .unwrap_or_default()
             );
             return Ok(SongQueuePushOutcome::DedupLimited);
         }
@@ -777,7 +790,7 @@ impl SongRequestExecution<'_> {
             source: request.source.clone(),
             prefer_accompaniment: request.prefer_accompaniment,
             ai_original_text: request.ai_original_text.clone(),
-            uri: request.uri.clone(),
+            track: request.track.clone(),
             friend_username: request.friend_username.clone(),
             requester: request.requester.clone(),
             dedup_bypass: request.console_bypass_dedup,
@@ -854,7 +867,11 @@ impl SongRequestExecution<'_> {
             log::info!(
                 "候选歌曲审核跳过: 控制台最高权限免审 command={} uri={}",
                 context.raw,
-                request.uri
+                request
+                    .track
+                    .as_ref()
+                    .map(|track| track.track_ref.key.to_string())
+                    .unwrap_or_default()
             );
             return Ok(true);
         }
@@ -864,7 +881,11 @@ impl SongRequestExecution<'_> {
             source: request.source.clone(),
             title,
             artist,
-            uri: request.uri.clone(),
+            uri: request
+                .track
+                .as_ref()
+                .map(|track| track.track_ref.key.to_string())
+                .unwrap_or_default(),
             message_type: context.message_type.clone(),
             username: context.username.clone(),
         };
@@ -1033,6 +1054,7 @@ mod tests {
     use anyhow::{Result, anyhow};
 
     use super::*;
+    use crate::features::playback::{test_candidate, test_track};
     use crate::features::song_request::SongSource;
 
     fn application() -> SongRequestApplication {
@@ -1145,7 +1167,7 @@ mod tests {
     }
 
     enum FakeStatus {
-        Available(PlayerStatus),
+        Available(Box<PlayerStatus>),
         Unavailable,
     }
 
@@ -1175,7 +1197,7 @@ mod tests {
                 searches: RefCell::new(searches.into_iter().collect()),
                 search_sources: RefCell::new(Vec::new()),
                 queue: RefCell::new(Vec::new()),
-                status: FakeStatus::Available(stopped_status()),
+                status: FakeStatus::Available(Box::new(stopped_status())),
                 should_queue: false,
                 status_matches: false,
                 play_outcome: PlaybackOutcome::Success,
@@ -1235,7 +1257,7 @@ mod tests {
                 .queue
                 .borrow()
                 .iter()
-                .any(|queued| queued.uri == item.uri && queued.keyword == item.keyword))
+                .any(|queued| queued.track == item.track && queued.keyword == item.keyword))
         }
 
         fn push_queue(&self, mut item: QueueItem) -> Result<QueuePushOutcome> {
@@ -1250,7 +1272,7 @@ mod tests {
 
         fn player_status(&self) -> Result<PlayerStatus> {
             match &self.status {
-                FakeStatus::Available(status) => Ok(status.clone()),
+                FakeStatus::Available(status) => Ok(status.as_ref().clone()),
                 FakeStatus::Unavailable => Err(anyhow!("status unavailable")),
             }
         }
@@ -1285,7 +1307,7 @@ mod tests {
     }
 
     fn picked(text: &str, uri: &str) -> PickedCandidate {
-        let candidate = SearchCandidate::new(text, uri);
+        let candidate = test_candidate(text, uri);
         PickedCandidate {
             candidate_snapshot: vec![candidate.clone()],
             candidate,
@@ -1295,22 +1317,30 @@ mod tests {
 
     #[test]
     fn confirmed_candidate_plays_when_the_player_is_idle() {
-        let mut port = FakePort::idle([Some(picked("晴天 - 周杰伦", "fuo://qqmusic/songs/1"))]);
+        let mut port =
+            FakePort::idle([Some(picked("晴天 - 周杰伦", "miliastra://track/qqmusic/1"))]);
 
         application()
             .execute(&context(), &command(), &mut port)
             .expect("song request");
 
         assert_eq!(port.played.borrow().len(), 1);
-        assert_eq!(port.played.borrow()[0].uri, "fuo://qqmusic/songs/1");
+        assert_eq!(
+            port.played.borrow()[0]
+                .track
+                .as_ref()
+                .map(|track| track.track_ref.key.to_string())
+                .as_deref(),
+            Some("miliastra://track/qqmusic/1")
+        );
         assert_eq!(port.played.borrow()[0].requester, "Alice");
         assert_eq!(
             port.played.borrow()[0]
                 .playback_request()
                 .candidate_snapshot,
-            vec![SearchCandidate::new(
+            vec![test_candidate(
                 "晴天 - 周杰伦",
-                "fuo://qqmusic/songs/1"
+                "miliastra://track/qqmusic/1"
             )]
         );
         assert!(port.logs.borrow()[0].starts_with("play keyword=晴天 - 周杰伦"));
@@ -1318,12 +1348,13 @@ mod tests {
 
     #[test]
     fn execution_log_uses_the_final_source_switched_request() {
-        let mut port = FakePort::idle([Some(picked("晴天 - 周杰伦", "fuo://qqmusic/songs/1"))]);
+        let mut port =
+            FakePort::idle([Some(picked("晴天 - 周杰伦", "miliastra://track/qqmusic/1"))]);
         port.play_final_request = Some(PlaybackRequest {
             keyword: "晴天 - 周杰伦".to_string(),
             source: "netease".to_string(),
             prefer_accompaniment: false,
-            uri: "fuo://netease/songs/2".to_string(),
+            track: Some(test_track("miliastra://track/netease/2", "晴天 - 周杰伦")),
             requester: "Alice".to_string(),
             navigation: crate::features::playback::PlaybackNavigation::Normal,
             candidate_snapshot: Vec::new(),
@@ -1335,13 +1366,16 @@ mod tests {
 
         assert_eq!(
             port.logs.borrow().as_slice(),
-            ["play keyword=晴天 - 周杰伦 source=netease uri=fuo://netease/songs/2 aiOriginal="]
+            [
+                "play keyword=晴天 - 周杰伦 source=netease uri=miliastra://track/netease/2 aiOriginal="
+            ]
         );
     }
 
     #[test]
     fn candidate_prompt_uses_one_prompt_and_decision_operation() {
-        let mut port = FakePort::idle([Some(picked("晴天 - 周杰伦", "fuo://qqmusic/songs/1"))]);
+        let mut port =
+            FakePort::idle([Some(picked("晴天 - 周杰伦", "miliastra://track/qqmusic/1"))]);
 
         application()
             .execute(&context(), &command(), &mut port)
@@ -1355,7 +1389,8 @@ mod tests {
 
     #[test]
     fn unavailable_player_status_queues_the_confirmed_candidate() {
-        let mut port = FakePort::idle([Some(picked("晴天 - 周杰伦", "fuo://qqmusic/songs/1"))]);
+        let mut port =
+            FakePort::idle([Some(picked("晴天 - 周杰伦", "miliastra://track/qqmusic/1"))]);
         port.status = FakeStatus::Unavailable;
 
         application()
@@ -1373,11 +1408,15 @@ mod tests {
 
     #[test]
     fn queue_dedup_rejection_does_not_add_an_item() {
-        let mut port = FakePort::idle([Some(picked("晴天 - 周杰伦", "fuo://qqmusic/songs/1"))]);
+        let mut port =
+            FakePort::idle([Some(picked("晴天 - 周杰伦", "miliastra://track/qqmusic/1"))]);
         port.queue.borrow_mut().push(QueueItem {
             id: 1,
             keyword: "其他歌曲".to_string(),
-            uri: "fuo://qqmusic/songs/other".to_string(),
+            track: Some(test_track(
+                "miliastra://track/qqmusic/other",
+                "其他歌曲 - 测试歌手",
+            )),
             ..QueueItem::default()
         });
         port.dedup_limited.set(true);
@@ -1396,8 +1435,10 @@ mod tests {
 
     #[test]
     fn switch_source_searches_the_other_provider_before_playing() {
-        let mut port =
-            FakePort::idle([None, Some(picked("晴天 - 周杰伦", "fuo://netease/songs/2"))]);
+        let mut port = FakePort::idle([
+            None,
+            Some(picked("晴天 - 周杰伦", "miliastra://track/netease/2")),
+        ]);
         port.decisions = VecDeque::from([
             SongRequestDecision::SwitchSource,
             SongRequestDecision::Confirm,
@@ -1425,7 +1466,8 @@ mod tests {
             20,
             true,
         );
-        let mut port = FakePort::idle([Some(picked("晴天 - 周杰伦", "fuo://qqmusic/songs/1"))]);
+        let mut port =
+            FakePort::idle([Some(picked("晴天 - 周杰伦", "miliastra://track/qqmusic/1"))]);
         port.status = FakeStatus::Unavailable;
 
         application

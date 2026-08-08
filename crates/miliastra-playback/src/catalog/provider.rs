@@ -88,6 +88,16 @@ pub enum PlaybackEligibility {
     Unknown,
 }
 
+impl PlaybackEligibility {
+    pub const fn preference_rank(self) -> u8 {
+        match self {
+            Self::Eligible => 2,
+            Self::Unknown => 1,
+            Self::Ineligible => 0,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderSearchCandidate {

@@ -4,6 +4,7 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 
 use anyhow::{Result, anyhow};
+use miliastra_playback::PlayableTrack;
 
 use crate::features::playback::{MusicPlayerBackend, PlayerStatus};
 use crate::runtime::identity::BusinessOperationIdAllocator;
@@ -95,6 +96,7 @@ impl MusicPlayerBackend for PlayerRuntimeBackend {
             .unwrap_or("unknown");
         Ok(PlayerStatus {
             status: transport.to_string(),
+            current_track: observation.track.clone(),
             current_uri: observation
                 .fresh_identity()
                 .map(|identity| identity.uri)
@@ -125,8 +127,8 @@ impl MusicPlayerBackend for PlayerRuntimeBackend {
         })
     }
 
-    fn play_uri(&self, uri: &str) -> Result<String> {
-        self.dispatch(PlayerControl::PlayUri(uri.to_string()))
+    fn play(&self, track: &PlayableTrack) -> Result<String> {
+        self.dispatch(PlayerControl::Play(track.clone()))
     }
 
     fn is_track_unavailable_error(&self, error: &anyhow::Error) -> bool {
@@ -187,7 +189,7 @@ mod tests {
     impl PlayerControlPort for TrackUnavailableControlPort {
         fn dispatch(&mut self, _control: &PlayerControl) -> ControlDispatchOutcome {
             ControlDispatchOutcome::rejected_with_code(
-                "playerd failure [track_unavailable]: no playable URL",
+                "playback failure [track_unavailable]: no playable URL",
                 "track_unavailable",
             )
         }
@@ -232,15 +234,19 @@ mod tests {
         )
         .expect("player runtime should start");
         let backend = PlayerRuntimeBackend::new(runtime.handle());
+        let track = crate::features::playback::test_track(
+            "miliastra://track/qqmusic/track-1",
+            "测试歌曲 - 测试歌手",
+        );
 
         let error = backend
-            .play_uri("miliastra://track/qqmusic/track-1")
-            .expect_err("the fake playerd should reject the track");
+            .play(&track)
+            .expect_err("the fake player should reject the track");
 
         assert!(backend.is_track_unavailable_error(&error));
         assert_eq!(
             error.to_string(),
-            "播放器控制未确认: playerd failure [track_unavailable]: no playable URL"
+            "播放器控制未确认: playback failure [track_unavailable]: no playable URL"
         );
         runtime.shutdown().expect("player runtime should shut down");
     }

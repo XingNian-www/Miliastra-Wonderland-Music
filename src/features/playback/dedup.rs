@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use miliastra_playback::TrackKey;
 use serde::{Deserialize, Serialize};
 
 use super::SongDedupConfig;
@@ -10,7 +11,7 @@ use crate::runtime::clock::WallClock;
 
 #[derive(Clone, Debug)]
 pub(crate) struct SongDedupCandidate {
-    pub(super) uri: String,
+    pub(super) track_key: TrackKey,
     pub(super) title: String,
     pub(super) artist: String,
     pub(super) source: String,
@@ -20,7 +21,7 @@ pub(crate) struct SongDedupCandidate {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SongDedupEntry {
-    uri: String,
+    track_key: TrackKey,
     title: String,
     artist: String,
     source: String,
@@ -93,7 +94,7 @@ impl PersistentSongDedupHistory {
         let mut entries = self.entries.clone();
         entries.retain(|entry| entry.played_at >= window_start);
         entries.push(SongDedupEntry {
-            uri: candidate.uri,
+            track_key: candidate.track_key,
             title: candidate.title,
             artist: candidate.artist,
             source: candidate.source,
@@ -119,9 +120,8 @@ fn parse_history_entries(text: &str) -> Result<Vec<SongDedupEntry>> {
 }
 
 fn same_song(candidate: &SongDedupCandidate, entry: &SongDedupEntry) -> bool {
-    let candidate_uri = candidate.uri.trim();
-    let entry_uri = entry.uri.trim();
-    !candidate_uri.is_empty() && !entry_uri.is_empty() && candidate_uri == entry_uri
+    candidate.track_key == entry.track_key
+        && candidate.prefer_accompaniment == entry.prefer_accompaniment
 }
 
 fn write_atomic(path: &Path, text: &str) -> Result<()> {
@@ -136,6 +136,11 @@ mod tests {
 
     use super::*;
     use crate::runtime::clock::{ManualClock, SystemClock};
+    use miliastra_playback::ProviderId;
+
+    fn key(id: &str) -> TrackKey {
+        TrackKey::new(ProviderId::QqMusic, id).unwrap()
+    }
 
     #[test]
     fn existing_empty_history_file_is_rejected_as_incomplete() {
@@ -160,7 +165,7 @@ mod tests {
         let clock = Arc::new(ManualClock::with_unix_seconds(Instant::now(), 1_000));
         let mut history = PersistentSongDedupHistory::load(PathBuf::new(), clock.clone()).unwrap();
         history.entries.push(SongDedupEntry {
-            uri: "fuo://qqmusic/songs/1".to_string(),
+            track_key: key("1"),
             title: "晴天".to_string(),
             artist: "周杰伦".to_string(),
             source: "qqmusic".to_string(),
@@ -168,7 +173,7 @@ mod tests {
             played_at: 1_000,
         });
         let candidate = SongDedupCandidate {
-            uri: "fuo://qqmusic/songs/1".to_string(),
+            track_key: key("1"),
             title: "晴天".to_string(),
             artist: "周杰伦".to_string(),
             source: "qqmusic".to_string(),
@@ -186,12 +191,12 @@ mod tests {
     }
 
     #[test]
-    fn uri_match_is_limited() {
+    fn track_key_match_is_limited() {
         let history = PersistentSongDedupHistory {
             path: PathBuf::new(),
             clock: Arc::new(SystemClock),
             entries: vec![SongDedupEntry {
-                uri: "fuo://qqmusic/songs/1".to_string(),
+                track_key: key("1"),
                 title: "晴天".to_string(),
                 artist: "周杰伦".to_string(),
                 source: "qqmusic".to_string(),
@@ -200,7 +205,7 @@ mod tests {
             }],
         };
         let candidate = SongDedupCandidate {
-            uri: "fuo://qqmusic/songs/1".to_string(),
+            track_key: key("1"),
             title: "晴天".to_string(),
             artist: "周杰伦".to_string(),
             source: "netease".to_string(),
@@ -215,7 +220,7 @@ mod tests {
             path: PathBuf::new(),
             clock: Arc::new(SystemClock),
             entries: vec![SongDedupEntry {
-                uri: String::new(),
+                track_key: key("1"),
                 title: "晴天".to_string(),
                 artist: "周杰伦".to_string(),
                 source: "qqmusic".to_string(),
@@ -224,7 +229,7 @@ mod tests {
             }],
         };
         let candidate = SongDedupCandidate {
-            uri: String::new(),
+            track_key: key("1"),
             title: "晴天".to_string(),
             artist: "周杰伦".to_string(),
             source: "netease".to_string(),
@@ -234,12 +239,12 @@ mod tests {
     }
 
     #[test]
-    fn missing_uri_never_falls_back_to_title_or_artist() {
+    fn different_track_key_never_falls_back_to_title_or_artist() {
         let history = PersistentSongDedupHistory {
             path: PathBuf::new(),
             clock: Arc::new(SystemClock),
             entries: vec![SongDedupEntry {
-                uri: String::new(),
+                track_key: key("1"),
                 title: "晴天".to_string(),
                 artist: "周杰伦".to_string(),
                 source: "qqmusic".to_string(),
@@ -248,7 +253,7 @@ mod tests {
             }],
         };
         let candidate = SongDedupCandidate {
-            uri: String::new(),
+            track_key: key("2"),
             title: "晴天".to_string(),
             artist: "周杰伦".to_string(),
             source: "qqmusic".to_string(),
@@ -272,7 +277,7 @@ mod tests {
         let clock = Arc::new(ManualClock::with_unix_seconds(Instant::now(), 1_000));
         let mut history = PersistentSongDedupHistory::load(path, clock).unwrap();
         let candidate = SongDedupCandidate {
-            uri: "fuo://qqmusic/songs/1".to_string(),
+            track_key: key("1"),
             title: "晴天".to_string(),
             artist: "周杰伦".to_string(),
             source: "qqmusic".to_string(),

@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use miliastra_playback::{PlayableTrack, TrackKey};
 use serde::{Deserialize, Serialize};
 
 use crate::features::song_request::SearchCandidate;
@@ -18,7 +19,8 @@ pub struct QueueItem {
     pub source: String,
     pub prefer_accompaniment: bool,
     pub ai_original_text: String,
-    pub uri: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub track: Option<PlayableTrack>,
     pub friend_username: String,
     #[serde(default)]
     pub requester: String,
@@ -35,7 +37,7 @@ impl Default for QueueItem {
             source: "qqmusic".to_string(),
             prefer_accompaniment: false,
             ai_original_text: String::new(),
-            uri: String::new(),
+            track: None,
             friend_username: String::new(),
             requester: String::new(),
             dedup_bypass: false,
@@ -123,16 +125,19 @@ impl PersistentQueue {
     pub fn has_duplicate(&self, keyword: &str, source: &str, prefer_accompaniment: bool) -> bool {
         let source = normalize_source(source);
         self.items.iter().any(|item| {
-            item.uri.is_empty()
+            item.track.is_none()
                 && matcher::same_song_query(&item.keyword, keyword)
                 && normalize_source(&item.source) == source
                 && item.prefer_accompaniment == prefer_accompaniment
         })
     }
 
-    pub fn has_duplicate_uri(&self, uri: &str) -> bool {
-        let uri = uri.trim();
-        !uri.is_empty() && self.items.iter().any(|item| item.uri.trim() == uri)
+    pub fn has_duplicate_track(&self, key: &TrackKey) -> bool {
+        self.items.iter().any(|item| {
+            item.track
+                .as_ref()
+                .is_some_and(|track| &track.track_ref.key == key)
+        })
     }
 
     pub fn push(&mut self, item: QueueItem) -> Result<bool> {
@@ -148,7 +153,7 @@ impl PersistentQueue {
             prefer_accompaniment: item.prefer_accompaniment,
             keyword: item.keyword,
             ai_original_text: item.ai_original_text,
-            uri: item.uri,
+            track: item.track,
             friend_username: item.friend_username,
             requester: item.requester,
             dedup_bypass: item.dedup_bypass,
@@ -221,20 +226,6 @@ impl PersistentQueue {
     }
 }
 
-/// Reads the pre-ADR-0010 queue file.  It is intentionally retained only for one-way import
-/// into [`RequestStateStore`](super::state::RequestStateStore); new services never write it.
-pub(crate) fn load_legacy_queue_state(path: &Path) -> Result<(u64, Vec<QueueItem>)> {
-    if !path.exists() {
-        return Ok((1, Vec::new()));
-    }
-    let text =
-        fs::read_to_string(path).with_context(|| format!("read queue state {}", path.display()))?;
-    let file: QueueFile = serde_json::from_str(&text)
-        .with_context(|| format!("parse queue state {}", path.display()))?;
-    validate_queue_file(&file)?;
-    Ok((file.next_id, file.items))
-}
-
 fn validate_queue_file(file: &QueueFile) -> Result<()> {
     if file.items.iter().any(|item| item.id == 0) {
         bail!("播放队列当前格式要求每个 items[].id 大于 0");
@@ -280,6 +271,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+    use crate::features::playback::test_candidate;
 
     #[test]
     fn push_persists_wrapped_queue_file() {
@@ -291,7 +283,7 @@ mod tests {
             .push(QueueItem {
                 keyword: "song name".to_string(),
                 source: "netease".to_string(),
-                candidate_snapshot: vec![SearchCandidate::new(
+                candidate_snapshot: vec![test_candidate(
                     "song name - artist",
                     "miliastra://track/netease/42",
                 )],
@@ -313,7 +305,7 @@ mod tests {
         assert_eq!(loaded.items()[0].source, "netease");
         assert_eq!(
             loaded.items()[0].candidate_snapshot,
-            vec![SearchCandidate::new(
+            vec![test_candidate(
                 "song name - artist",
                 "miliastra://track/netease/42",
             )]

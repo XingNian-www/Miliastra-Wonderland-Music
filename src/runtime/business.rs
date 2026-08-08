@@ -88,7 +88,7 @@ pub(crate) enum BusinessMutationOutcome {
     Administration(AdministrationMutationOutcome),
     Hall(HallMutationOutcome),
     Playback(PlaybackMutationOutcome),
-    TurtleSoup(TurtleSoupMutationOutcome),
+    TurtleSoup(Box<TurtleSoupMutationOutcome>),
 }
 
 /// Narrow projection port for business-owned public state. Implementations must only retain
@@ -864,9 +864,9 @@ impl BusinessRuntimeHandle {
             BusinessMutationIntent::Playback(intent) => {
                 BusinessMutationOutcome::Playback(self.apply_playback_mutation(intent)?)
             }
-            BusinessMutationIntent::TurtleSoup(intent) => {
-                BusinessMutationOutcome::TurtleSoup(self.apply_turtle_soup_mutation(intent)?)
-            }
+            BusinessMutationIntent::TurtleSoup(intent) => BusinessMutationOutcome::TurtleSoup(
+                Box::new(self.apply_turtle_soup_mutation(intent)?),
+            ),
         })
     }
 
@@ -893,7 +893,7 @@ impl BusinessRuntimeHandle {
     ) -> Result<PlaybackMutationOutcome, BusinessRuntimeError> {
         Ok(match intent {
             PlaybackMutationIntent::Push(item) => {
-                PlaybackMutationOutcome::Pushed(self.push_playback_queue(item)?)
+                PlaybackMutationOutcome::Pushed(self.push_playback_queue(*item)?)
             }
             PlaybackMutationIntent::Remove(removal) => {
                 PlaybackMutationOutcome::Removed(self.remove_playback_queue(removal)?)
@@ -5373,7 +5373,10 @@ mod tests {
             .push_playback_queue(QueueItem {
                 keyword: "晴天".to_string(),
                 source: "qqmusic".to_string(),
-                uri: "fuo://qqmusic/songs/1".to_string(),
+                track: Some(crate::features::playback::test_track(
+                    "miliastra://track/qqmusic/1",
+                    "晴天 - 周杰伦",
+                )),
                 ..QueueItem::default()
             })
             .unwrap();

@@ -214,7 +214,12 @@ impl ApplicationRuntime {
                     format!("候选数量: {}", candidates.len()),
                 ];
                 lines.extend(candidates.iter().enumerate().map(|(index, candidate)| {
-                    format!("{}. {} -> {}", index + 1, candidate.text, candidate.uri)
+                    format!(
+                        "{}. {} -> {}",
+                        index + 1,
+                        candidate.text,
+                        candidate.track_ref.key
+                    )
                 }));
                 if let Some(pick) = pick {
                     lines.push(format!(

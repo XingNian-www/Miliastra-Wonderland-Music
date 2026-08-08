@@ -175,7 +175,7 @@ fn truncate_candidates_per_source(
     let mut counts: HashMap<String, usize> = HashMap::new();
     let mut result = Vec::new();
     for candidate in candidates {
-        let source = candidate_source(&candidate.uri);
+        let source = candidate.track_ref.key.provider.to_string();
         let count = counts.entry(source).or_insert(0);
         if *count >= per_source {
             continue;
@@ -187,14 +187,6 @@ fn truncate_candidates_per_source(
         }
     }
     result
-}
-
-fn candidate_source(uri: &str) -> String {
-    uri.strip_prefix("miliastra://track/")
-        .or_else(|| uri.strip_prefix("fuo://"))
-        .and_then(|rest| rest.split('/').next())
-        .unwrap_or("unknown")
-        .to_string()
 }
 
 impl AiClient {
@@ -257,28 +249,8 @@ fn parse_bool(value: Option<&str>) -> bool {
 }
 
 fn parse_query_candidates(text: &str) -> Result<Vec<SearchCandidate>> {
-    let value: Value = serde_json::from_str(text).context("candidates参数必须是JSON数组")?;
-    let array = value
-        .as_array()
-        .ok_or_else(|| anyhow::anyhow!("candidates参数必须是JSON数组"))?;
-    let mut candidates = Vec::new();
-    for item in array {
-        let uri = item.get("uri").and_then(Value::as_str).unwrap_or("").trim();
-        if uri.is_empty() {
-            continue;
-        }
-        candidates.push(SearchCandidate {
-            uri: uri.to_string(),
-            text: item
-                .get("text")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .trim()
-                .to_string(),
-            eligibility: super::CandidateEligibility::Unknown,
-            resolver_locator: None,
-        });
-    }
+    let candidates: Vec<SearchCandidate> =
+        serde_json::from_str(text).context("candidates参数必须是结构化JSON数组")?;
     if candidates.is_empty() {
         bail!("candidates参数缺少有效候选");
     }
@@ -439,7 +411,7 @@ fn build_candidate_pick_prompt(
         .map(|(index, candidate)| {
             json!({
                 "index": index + 1,
-                "uri": candidate.uri,
+                "uri": candidate.track_ref.key.to_string(),
                 "text": candidate.text,
             })
         })
@@ -591,7 +563,11 @@ fn validate_candidate_pick_json(text: &str, candidates: &[SearchCandidate]) -> R
         .and_then(Value::as_str)
         .map(str::trim)
         .unwrap_or("");
-    if uri.is_empty() || !candidates.iter().any(|candidate| candidate.uri == uri) {
+    if uri.is_empty()
+        || !candidates
+            .iter()
+            .any(|candidate| candidate.track_ref.key.to_string() == uri)
+    {
         bail!("AI返回JSON字段无效: uri");
     }
     if !value

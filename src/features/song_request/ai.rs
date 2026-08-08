@@ -512,11 +512,11 @@ fn build_ai_request(
                 .into(),
         ])
         .response_format(ResponseFormat::JsonObject)
-        .temperature(0.1)
+        .temperature(0.1_f32)
         .stream(false)
         .store(false)
         .max_completion_tokens(u32::try_from(max_tokens).context("AI max_tokens 超出范围")?)
-        .top_p(0.95)
+        .top_p(0.95_f32)
         .build()?)
 }
 

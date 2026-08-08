@@ -4,7 +4,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde::Serialize;
-use tokio::sync::watch;
 use tokio::time::timeout;
 use uuid::Uuid;
 
@@ -31,6 +30,7 @@ pub struct PlayerDaemon {
 }
 
 impl PlayerDaemon {
+    #[cfg(test)]
     pub fn new(
         catalog: SourceCatalog,
         engine: Arc<dyn AudioEngine>,
@@ -81,7 +81,7 @@ impl PlayerDaemon {
         let requests = sources.iter().cloned().map(|source| {
             let request_source = source.clone();
             let catalog = self.catalog.clone();
-            let registry = self.registry.clone();
+            let registry = self.registry;
             let keyword = keyword.to_owned();
             let request_timeout = self.source_timeout;
             let per_source_limit = spec.limit;
@@ -231,25 +231,6 @@ impl PlayerDaemon {
         Ok(())
     }
 
-    pub async fn seek(
-        &self,
-        session: SessionRef,
-        position_seconds: f64,
-    ) -> Result<(), DaemonError> {
-        if !position_seconds.is_finite() || position_seconds < 0.0 {
-            return Err(DaemonError::InvalidRequest(
-                "positionSeconds must be a finite non-negative number".to_owned(),
-            ));
-        }
-        self.engine
-            .command(EngineCommand::Seek {
-                session,
-                position_seconds,
-            })
-            .await?;
-        Ok(())
-    }
-
     pub async fn set_volume(&self, volume: u8) -> Result<(), DaemonError> {
         if volume > 100 {
             return Err(DaemonError::InvalidRequest(
@@ -267,22 +248,6 @@ impl PlayerDaemon {
         let mut snapshot = receiver.borrow().clone();
         snapshot.runtime_identity = self.runtime_identity.to_string();
         snapshot
-    }
-
-    pub fn runtime_identity(&self) -> &str {
-        &self.runtime_identity
-    }
-
-    pub fn subscribe(&self) -> watch::Receiver<PlaybackSnapshot> {
-        self.engine.subscribe()
-    }
-
-    pub fn sources(&self) -> Vec<String> {
-        self.catalog.sources()
-    }
-
-    pub fn providers(&self) -> Option<ProviderRegistry> {
-        self.registry.clone()
     }
 
     pub fn login_coordinator(&self) -> LoginCoordinator {
@@ -503,7 +468,7 @@ impl StartReceipt {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum DaemonError {
+pub(crate) enum DaemonError {
     #[error("invalid request: {0}")]
     InvalidRequest(String),
     #[error("unknown source: {0}")]

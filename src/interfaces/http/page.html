@@ -180,6 +180,12 @@ button,input,select,textarea{font:inherit}
 .sidebar{grid-area:sidebar;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));align-content:start;gap:var(--sp-5) var(--sp-4)}
 .controls{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:var(--sp-2);min-width:0}
 .controls .btn,.two .btn,.three .btn{min-width:0;white-space:nowrap}
+.login-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:var(--sp-2);align-items:center;padding:var(--sp-2) 0;border-bottom:1px solid var(--sep-2)}
+.login-row:first-child{padding-top:0}
+.login-row:last-child{border-bottom:0;padding-bottom:0}
+.login-row strong,.login-row small{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.login-row small{margin-top:2px;color:var(--text-2);font-size:var(--fs-tiny);line-height:var(--lh-tiny)}
+.login-row .controls{grid-template-columns:repeat(3,minmax(0,1fr));min-width:178px}
 .row{display:flex;gap:var(--sp-2);align-items:center;min-width:0}
 .row>*{min-width:0}
 .row>.btn{flex:0 0 auto}
@@ -271,7 +277,7 @@ html[data-theme=light] .theme-toggle .moon{display:none}
 /* ===== 响应式 ===== */
  @media(max-width:1200px){.status-chips{gap:var(--sp-2)}.chip{font-size:var(--fs-meta)}.chip em{max-width:96px}}
  @media(max-width:1050px){.layout{grid-template-columns:1fr;grid-template-areas:"monitor" "sidebar"}.topbar{grid-template-columns:1fr;padding:var(--sp-3) var(--sp-1) var(--sp-4)}.brand{padding:var(--sp-2) var(--sp-4);border-bottom:1px solid var(--sep-2)}.status-chips,.top-actions{flex-wrap:wrap;padding:var(--sp-3) var(--sp-4);border-left:none;border-top:1px solid var(--sep-2)}.top-actions{justify-content:flex-start}.sidebar{grid-template-columns:repeat(2,minmax(0,1fr))}.monitor{grid-template-columns:1fr}.turtle-stats{grid-template-columns:repeat(3,minmax(0,1fr))}}
- @media(max-width:720px){.sidebar{display:flex;flex-direction:column;gap:var(--sp-4)}.controls,.two,.three,.compact-form,.ocr-send,.ocr-options,.turtle-toolbar,.turtle-grid{grid-template-columns:1fr}.turtle-stats{grid-template-columns:1fr 1fr}.undercover-toolbar{justify-content:stretch}.undercover-toolbar .btn{flex:1}.monitor{gap:var(--sp-2)}}
+ @media(max-width:720px){.sidebar{display:flex;flex-direction:column;gap:var(--sp-4)}.controls,.two,.three,.compact-form,.ocr-send,.ocr-options,.turtle-toolbar,.turtle-grid,.login-row{grid-template-columns:1fr}.login-row .controls{min-width:0}.turtle-stats{grid-template-columns:1fr 1fr}.undercover-toolbar{justify-content:stretch}.undercover-toolbar .btn{flex:1}.monitor{gap:var(--sp-2)}}
 </style>
 </head>
 <body>
@@ -413,6 +419,13 @@ html[data-theme=light] .theme-toggle .moon{display:none}
       </div>
 
       <div class="panel">
+        <div class="panel-head"><h2>平台登录</h2><small id="loginMeta">读取中</small></div>
+        <div class="panel-body" id="loginProviders">
+          <div class="result">读取平台状态...</div>
+        </div>
+      </div>
+
+      <div class="panel">
         <div class="panel-head"><h2>点歌</h2><small>排队执行</small></div>
         <div class="panel-body">
           <input id="keyword" placeholder="歌名 / 歌手 / 关键词">
@@ -543,7 +556,7 @@ html[data-theme=light] .theme-toggle .moon{display:none}
 <script>
 function $(id){return document.getElementById(id)}
 const esc=(s)=>String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')
-const commandLabels={'/status':'状态','/play':'继续','/pause':'暂停','/skip-next':'下一首','/skip-prev':'上一首','/volume':'音量','/startup/game':'启动游戏','/startup/wonderland':'启动并进入千星','/startup/enter-wonderland':'进入千星','/searchPlay':'点歌','/searchSource':'指定音源点歌','/search':'搜索','/search/candidates':'候选搜索','/player/play-uri':'播放URI','/queue':'队列','/queue/add':'加入队列','/queue/remove':'删除队列','/queue/clear':'清空队列','/ai/search':'AI点歌','/chat/send':'控制台发言','/chat-listener/mode':'聊天监听','/tasks/cancel':'撤销任务','/operator/lyrics':'发送歌词','/operator/hall-detect':'大厅检测','/operator/hall-time':'大厅时间','/operator/microphone':'麦克风','/operator/commands':'命令开关','/operator/idle-exit':'闲置退出','/operator/workflows':'工作流','/operator/workflows/run':'执行工作流','/turtle-soup':'海龟汤状态','/turtle-soup/start':'海龟汤开局','/turtle-soup/end':'海龟汤结束','/undercover':'谁是卧底状态','/undercover/start':'谁是卧底开局','/undercover/end':'谁是卧底结束'}
+const commandLabels={'/status':'状态','/play':'继续','/pause':'暂停','/skip-next':'下一首','/skip-prev':'上一首','/volume':'音量','/startup/game':'启动游戏','/startup/wonderland':'启动并进入千星','/startup/enter-wonderland':'进入千星','/searchPlay':'点歌','/searchSource':'指定音源点歌','/search':'搜索','/search/candidates':'候选搜索','/player/providers':'平台状态','/player/login/status':'登录状态','/player/play-track':'播放曲目','/player/login/start':'开始登录','/player/login/cancel':'取消登录','/player/logout':'退出登录','/queue':'队列','/queue/add':'加入队列','/queue/remove':'删除队列','/queue/clear':'清空队列','/ai/search':'AI点歌','/chat/send':'控制台发言','/chat-listener/mode':'聊天监听','/tasks/cancel':'撤销任务','/operator/lyrics':'发送歌词','/operator/hall-detect':'大厅检测','/operator/hall-time':'大厅时间','/operator/microphone':'麦克风','/operator/commands':'命令开关','/operator/idle-exit':'闲置退出','/operator/workflows':'工作流','/operator/workflows/run':'执行工作流','/turtle-soup':'海龟汤状态','/turtle-soup/start':'海龟汤开局','/turtle-soup/end':'海龟汤结束','/undercover':'谁是卧底状态','/undercover/start':'谁是卧底开局','/undercover/end':'谁是卧底结束'}
 const stMap={playing:'播放中',paused:'已暂停',stopped:'已停止',stoped:'已停止'}
 const controllerStateMap={idle:'空闲',starting:'启动播放',requested_song_playing:'点歌播放中',paused_by_user:'用户暂停',paused_waiting_for_queue:'等待队列',external_playback:'外部播放',unknown:'状态未知',unavailable:'不可用'}
 const pauseReasonMap={none:'无',user:'用户暂停',waiting_for_queue:'等待队列',unknown:'未知'}
@@ -561,6 +574,8 @@ let monitorLoading=false
 let historyLoading=false
 let screenshotLoading=false
 let searchCandidateItems=[]
+let loginProviderItems=[]
+let loginRuntimeStatus={active:false}
 let operatorWorkflows=[]
 let taskSnapshots=[]
 let activeDecisionId=0
@@ -594,6 +609,14 @@ function bindEnter(id,handler){
 }
 async function request(url,method){
   const r=await fetch(url,{method:method||'GET',cache:'no-store',headers:requestHeaders()})
+  const text=await r.text()
+  if(!r.ok)throw new Error(text||('HTTP '+r.status))
+  const type=r.headers.get('content-type')||''
+  if(type.includes('application/json')){try{return JSON.parse(text)}catch{return text}}
+  return text
+}
+async function requestJson(url,body){
+  const r=await fetch(url,{method:'POST',cache:'no-store',headers:{...requestHeaders(),'Content-Type':'application/json'},body:JSON.stringify(body)})
   const text=await r.text()
   if(!r.ok)throw new Error(text||('HTTP '+r.status))
   const type=r.headers.get('content-type')||''
@@ -649,6 +672,56 @@ async function loadStatus(){
   }catch(e){setResult('错误: '+e.message)}
   await loadHistory()
 }
+const providerNames={qqmusic:'QQ音乐',netease:'网易云音乐',bilibili:'哔哩哔哩'}
+function providerLabel(provider){return providerNames[provider]||provider||'未知平台'}
+function renderLoginState(){
+  const active=loginRuntimeStatus&&loginRuntimeStatus.active
+  const activeProvider=active?loginRuntimeStatus.provider:''
+  $('loginMeta').textContent=active?'正在登录 '+providerLabel(activeProvider):'无进行中的登录'
+  const items=Array.isArray(loginProviderItems)?loginProviderItems:[]
+  $('loginProviders').innerHTML=items.map((item)=>{
+    const provider=item.provider
+    const isActive=activeProvider===provider
+    const fields=Object.entries(item.fields||{}).map(([name,present])=>esc(name)+': '+(present?'有':'无')).join(' / ')
+    return '<div class="login-row"><div><strong>'+esc(providerLabel(provider))+'</strong><small>'+
+      (item.configured?'已配置':'未配置')+' · '+fields+'</small></div><div class="controls compact">'+
+      '<button class="btn small login-start" data-provider="'+esc(provider)+'" '+(active?'disabled':'')+'>登录</button>'+
+      (isActive?'<button class="btn small warn login-cancel">取消</button>':'')+
+      '<button class="btn small ghost login-logout" data-provider="'+esc(provider)+'" '+(active?'disabled':'')+'>退出</button></div></div>'
+  }).join('')||'<div class="result">没有可用平台</div>'
+  $('loginProviders').querySelectorAll('.login-start').forEach((button)=>{
+    button.addEventListener('click',()=>startLogin(button.dataset.provider||''))
+  })
+  $('loginProviders').querySelectorAll('.login-cancel').forEach((button)=>{
+    button.addEventListener('click',cancelLogin)
+  })
+  $('loginProviders').querySelectorAll('.login-logout').forEach((button)=>{
+    button.addEventListener('click',()=>logoutProvider(button.dataset.provider||''))
+  })
+}
+async function loadLoginState(){
+  try{
+    const results=await Promise.all([request('/player/providers'),request('/player/login/status')])
+    loginProviderItems=Array.isArray(results[0])?results[0]:[]
+    loginRuntimeStatus=results[1]||{active:false}
+    renderLoginState()
+  }catch(e){$('loginMeta').textContent='读取失败';$('loginProviders').innerHTML='<div class="result">'+esc(e.message)+'</div>'}
+}
+async function jsonAction(url,body){
+  if(actionInFlight){setResult('上一项操作仍在请求中');return false}
+  actionInFlight=true
+  setResult('请求中...')
+  try{setResult(await requestJson(url,body));await loadLoginState();return true}
+  catch(e){setResult('错误: '+e.message);return false}
+  finally{actionInFlight=false}
+}
+function startLogin(provider){return jsonAction('/player/login/start',{provider})}
+function cancelLogin(){
+  const sessionId=loginRuntimeStatus&&loginRuntimeStatus.sessionId
+  if(!sessionId){setResult('当前没有进行中的登录');return}
+  return jsonAction('/player/login/cancel',{sessionId})
+}
+function logoutProvider(provider){return jsonAction('/player/logout',{provider})}
 function setVolume(value){
   const next=volumeNum(value==null?$('volumeInput').value: value)
   if(next==null){setResult('音量必须是 0 到 100');return}
@@ -689,14 +762,18 @@ async function searchOnly(){
 function renderSearchCandidates(){
   const el=$('searchCandidates')
   if(!searchCandidateItems.length){el.innerHTML='';el.classList.add('hidden');return}
-  el.innerHTML=searchCandidateItems.map((item,index)=>'<div class="candidate-item"><div><div class="queue-title">'+esc(item.text||'未命名候选')+'</div><div class="candidate-uri">'+esc(item.uri||'')+'</div></div><button class="btn small" onclick="queueCandidate('+index+')">加入</button></div>').join('')
+  el.innerHTML=searchCandidateItems.map((item,index)=>{
+    const key=item.trackRef&&item.trackRef.key||{}
+    const identity=key.provider&&key.id?key.provider+'/'+key.id:'未知曲目'
+    const eligibility=item.eligibility||'unknown'
+    return '<div class="candidate-item"><div><div class="queue-title">'+esc(item.text||'未命名候选')+'</div><div class="candidate-uri">'+esc(identity)+' · '+esc(eligibility)+'</div></div><button class="btn small" onclick="playCandidate('+index+')">播放</button></div>'
+  }).join('')
   el.classList.remove('hidden')
 }
-function queueCandidate(index){
+function playCandidate(index){
   const item=searchCandidateItems[index]
-  if(!item||!item.uri){setResult('候选 URI 无效');return}
-  const url='/player/play-uri?uri='+encodeURIComponent(item.uri)+'&title='+encodeURIComponent(item.text||item.uri)
-  call(url,'POST')
+  if(!item||!item.trackRef||!item.metadata){setResult('候选曲目结构无效');return}
+  return jsonAction('/player/play-track',{trackRef:item.trackRef,metadata:item.metadata})
 }
 function submitDecision(action){
   if(!activeDecisionId){setResult('当前没有等待中的候选决策');return}
@@ -954,7 +1031,7 @@ function toggleRefresh(){
   if(!refreshPaused)refreshAll()
 }
 async function refreshAll(){
-  const results=await Promise.allSettled([loadMonitor(),loadHistory(),refreshPlayer()])
+  const results=await Promise.allSettled([loadMonitor(),loadHistory(),refreshPlayer(),loadLoginState()])
   const failed=results.find((item)=>item.status==='rejected')
   if(failed)setResult('刷新失败: '+failed.reason.message)
 }
@@ -979,6 +1056,7 @@ $('accessToken').value=accessToken()
 loadOperatorWorkflows()
 refreshAll()
 setInterval(()=>{if(!refreshPaused)loadMonitor()},1000)
+setInterval(()=>{if(!refreshPaused)loadLoginState()},2000)
 </script>
 </body>
 </html>

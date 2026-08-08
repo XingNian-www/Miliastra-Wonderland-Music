@@ -601,6 +601,7 @@ impl ApplicationRuntime {
             player_search: self.player_search.clone(),
             player_runtime: None,
             native_playback: self.native_playback.clone(),
+            login_helper: self.login_helper.clone(),
             native_playback_runtime: None,
             openai_runtime: None,
             ai: self.ai.clone(),

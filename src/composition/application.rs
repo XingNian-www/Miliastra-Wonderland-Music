@@ -21,6 +21,7 @@ use std::thread::{self, sleep};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use self::formal_task::{FormalTaskClient, FormalTaskRuntime};
+use crate::adapters::login_helper::LoginHelperManager;
 use crate::adapters::native_playback::NativePlaybackAdapter;
 use crate::adapters::player::PlayerRuntimeBackend;
 use crate::adapters::windows::{WindowsUiDevice, parse_key};
@@ -365,6 +366,7 @@ pub(crate) struct ApplicationRuntime {
     player_search: PlayerSearchClient,
     player_runtime: Option<PlayerRuntime>,
     native_playback: PlaybackHandle,
+    login_helper: LoginHelperManager,
     native_playback_runtime: Option<NativePlaybackRuntime>,
     openai_runtime: Option<OpenAiRuntime>,
     ai: AiClient,
@@ -880,6 +882,12 @@ impl ApplicationRuntime {
             NativePlaybackRuntime::start(config.playback.credential_directory.clone())
                 .context("启动原生播放器")?;
         let native_playback = native_playback_runtime.handle();
+        let login_helper = LoginHelperManager::new(
+            native_playback.clone(),
+            config.playback.login_helper_executable.clone(),
+            config.playback.credential_directory.clone(),
+            Duration::from_millis(config.playback.login_timeout_ms),
+        );
         let playback_adapter = NativePlaybackAdapter::new(native_playback.clone());
         let idiom_chain = IdiomChainService::load(config.idiom_chain.clone())?;
         if config.idiom_chain.enabled {
@@ -1095,6 +1103,7 @@ impl ApplicationRuntime {
             player_search,
             player_runtime: Some(player_runtime),
             native_playback,
+            login_helper,
             native_playback_runtime: Some(native_playback_runtime),
             openai_runtime: Some(openai_runtime),
             ai,

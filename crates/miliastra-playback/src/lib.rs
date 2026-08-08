@@ -18,5 +18,6 @@ pub use model::{
     PlayableTrack, SearchCandidate, SearchQuery, TrackKey, TrackKeyError, TrackMetadata, TrackRef,
 };
 pub use runtime::{
-    LoginSession, LoginStatus, PlaybackError, PlaybackHandle, PlaybackRuntime, PlaybackSnapshot,
+    LoginOperation, LoginOperationWaitError, LoginSession, LoginStatus, PlaybackError,
+    PlaybackHandle, PlaybackOperation, PlaybackRuntime, PlaybackSnapshot,
 };

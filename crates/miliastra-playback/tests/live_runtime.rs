@@ -110,7 +110,11 @@ fn live_bilibili_runtime_controls_and_natural_end() {
         },
     };
 
-    handle.play(track.clone()).expect("start Bilibili playback");
+    handle
+        .play(track.clone())
+        .expect("submit Bilibili playback")
+        .wait()
+        .expect("start Bilibili playback");
     let first = wait_for_snapshot(&handle, Duration::from_secs(45), |snapshot| {
         snapshot.state == EngineState::Playing
     });
@@ -132,7 +136,11 @@ fn live_bilibili_runtime_controls_and_natural_end() {
         snapshot.state == EngineState::Playing
     });
 
-    handle.play(track).expect("replace active playback");
+    handle
+        .play(track)
+        .expect("submit replacement playback")
+        .wait()
+        .expect("replace active playback");
     let replacement = wait_for_snapshot(&handle, Duration::from_secs(45), |snapshot| {
         snapshot.generation > first.generation && snapshot.state == EngineState::Playing
     });

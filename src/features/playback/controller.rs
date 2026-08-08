@@ -45,7 +45,7 @@ pub(crate) trait PlaybackStatePort: Clone + Send + Sync + 'static {
     fn record_song_dedup(&self, candidate: SongDedupCandidate) -> Result<()>;
     fn observe_external_playback(
         &self,
-        identity: String,
+        identity: TrackKey,
         now: Instant,
         protect_after: Duration,
     ) -> Result<super::ExternalPlaybackObservation>;
@@ -169,7 +169,7 @@ impl PlaybackTimePorts {
 
 #[derive(Default)]
 pub(super) struct ExternalPlaybackTracker {
-    identity: String,
+    identity: Option<TrackKey>,
     playing_since: Option<Instant>,
     pub(super) protected: bool,
 }
@@ -177,12 +177,12 @@ pub(super) struct ExternalPlaybackTracker {
 impl ExternalPlaybackTracker {
     pub(super) fn observe(
         &mut self,
-        identity: &str,
+        identity: &TrackKey,
         now: Instant,
         protect_after: Duration,
     ) -> bool {
-        if self.identity != identity {
-            self.identity = identity.to_string();
+        if self.identity.as_ref() != Some(identity) {
+            self.identity = Some(identity.clone());
             self.playing_since = Some(now);
             self.protected = false;
         }
@@ -198,7 +198,7 @@ impl ExternalPlaybackTracker {
     }
 
     pub(super) fn clear(&mut self) {
-        self.identity.clear();
+        self.identity = None;
         self.playing_since = None;
         self.protected = false;
     }
@@ -1520,14 +1520,14 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
     }
 }
 
-fn external_playback_identity(status: &PlayerStatus) -> Option<String> {
+fn external_playback_identity(status: &PlayerStatus) -> Option<TrackKey> {
     if status.status != "playing" {
         return None;
     }
     status
         .current_track
         .as_ref()
-        .map(|track| format!("track:{}", track.track_ref.key))
+        .map(|track| track.track_ref.key.clone())
 }
 
 fn is_cross_source_track(requested: &TrackKey, current: &TrackKey) -> bool {
@@ -1714,6 +1714,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -1756,7 +1757,7 @@ mod tests {
 
         fn observe_external_playback(
             &self,
-            identity: String,
+            identity: TrackKey,
             now: Instant,
             protect_after: Duration,
         ) -> Result<super::super::ExternalPlaybackObservation> {
@@ -1965,6 +1966,10 @@ mod tests {
         }
     }
 
+    fn track_key(uri: &str) -> TrackKey {
+        test_track(uri, "test track - test artist").track_ref.key
+    }
+
     fn stopped_status() -> PlayerStatus {
         PlayerStatus {
             status: "stopped".to_string(),
@@ -2113,10 +2118,15 @@ mod tests {
 
     fn temp_path(name: &str) -> PathBuf {
         let seq = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let created_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         std::env::temp_dir().join(format!(
-            "miliastra-player-controller-{}-{}-{}.json",
+            "miliastra-player-controller-{}-{}-{}-{}.json",
             name,
             std::process::id(),
+            created_at,
             seq
         ))
     }
@@ -2757,23 +2767,13 @@ mod tests {
         let now = Instant::now();
         let mut tracker = ExternalPlaybackTracker::default();
         let delay = Duration::from_secs(20);
+        let external = track_key("miliastra://track/qqmusic/external");
+        let next = track_key("miliastra://track/qqmusic/next");
 
-        assert!(!tracker.observe("track:miliastra://track/qqmusic/external", now, delay));
-        assert!(!tracker.observe(
-            "track:miliastra://track/qqmusic/external",
-            now + Duration::from_secs(19),
-            delay
-        ));
-        assert!(tracker.observe(
-            "track:miliastra://track/qqmusic/external",
-            now + Duration::from_secs(20),
-            delay
-        ));
-        assert!(!tracker.observe(
-            "track:miliastra://track/qqmusic/next",
-            now + Duration::from_secs(21),
-            delay
-        ));
+        assert!(!tracker.observe(&external, now, delay));
+        assert!(!tracker.observe(&external, now + Duration::from_secs(19), delay));
+        assert!(tracker.observe(&external, now + Duration::from_secs(20), delay));
+        assert!(!tracker.observe(&next, now + Duration::from_secs(21), delay));
     }
 
     #[test]

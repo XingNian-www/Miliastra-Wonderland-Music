@@ -16,7 +16,8 @@ use miliastra_login_protocol::{
 #[cfg(test)]
 use miliastra_playback::Failure;
 use miliastra_playback::{
-    CredentialStatus, LoginSession, PlaybackError, PlaybackHandle, ProviderCredential, ProviderId,
+    CredentialStatus, LoginOperation, LoginOperationWaitError, LoginSession, PlaybackError,
+    PlaybackHandle, ProviderCredential, ProviderId,
 };
 use serde::Serialize;
 use uuid::Uuid;
@@ -35,9 +36,35 @@ trait LoginPlaybackPort: Send + Sync {
         &self,
         session_id: Uuid,
         credential: ProviderCredential,
-    ) -> Result<CredentialStatus, PlaybackError>;
+    ) -> Result<Box<dyn PendingLoginCompletion>, PlaybackError>;
     fn cancel_login(&self, session_id: Uuid) -> Result<(), PlaybackError>;
     fn logout(&self, provider: ProviderId) -> Result<CredentialStatus, PlaybackError>;
+}
+
+enum PendingLoginPoll {
+    Completed(Result<CredentialStatus, PlaybackError>),
+    TimedOut,
+}
+
+trait PendingLoginCompletion: Send {
+    fn wait_timeout(&self, timeout: Duration) -> PendingLoginPoll;
+}
+
+struct NativeLoginCompletion(LoginOperation);
+
+impl PendingLoginCompletion for NativeLoginCompletion {
+    fn wait_timeout(&self, timeout: Duration) -> PendingLoginPoll {
+        match self.0.wait_timeout(timeout) {
+            Ok(status) => PendingLoginPoll::Completed(Ok(status)),
+            Err(LoginOperationWaitError::TimedOut) => PendingLoginPoll::TimedOut,
+            Err(LoginOperationWaitError::RuntimeStopped) => {
+                PendingLoginPoll::Completed(Err(PlaybackError::RuntimeStopped))
+            }
+            Err(LoginOperationWaitError::Playback(error)) => {
+                PendingLoginPoll::Completed(Err(error))
+            }
+        }
+    }
 }
 
 impl LoginPlaybackPort for PlaybackHandle {
@@ -53,8 +80,9 @@ impl LoginPlaybackPort for PlaybackHandle {
         &self,
         session_id: Uuid,
         credential: ProviderCredential,
-    ) -> Result<CredentialStatus, PlaybackError> {
+    ) -> Result<Box<dyn PendingLoginCompletion>, PlaybackError> {
         PlaybackHandle::complete_login(self, session_id, credential)
+            .map(|operation| Box::new(NativeLoginCompletion(operation)) as Box<_>)
     }
 
     fn cancel_login(&self, session_id: Uuid) -> Result<(), PlaybackError> {
@@ -617,7 +645,10 @@ fn run_helper(
                 ));
                 break;
             }
-            match output_rx.recv_timeout(REAPER_POLL) {
+            let wait = deadline
+                .saturating_duration_since(Instant::now())
+                .min(REAPER_POLL);
+            match output_rx.recv_timeout(wait) {
                 Ok(Ok(bytes)) => {
                     match decode_message(&bytes) {
                         Ok(decoded) => message = Some(decoded),
@@ -648,14 +679,18 @@ fn run_helper(
         }
     }
 
-    let process_deadline = Instant::now() + TERMINATION_GRACE;
+    let process_deadline = deadline.min(Instant::now() + TERMINATION_GRACE);
     let process_success = wait_child_until(&child, process_deadline).unwrap_or(false);
     if failure.is_none() && !process_success {
-        failure = Some(manager_failure(
-            "helper_process_failed",
-            "登录助手异常退出",
-            Some(session.provider),
-        ));
+        failure = Some(if Instant::now() >= deadline {
+            manager_failure("login_timeout", "登录等待超时", Some(session.provider))
+        } else {
+            manager_failure(
+                "helper_process_failed",
+                "登录助手异常退出",
+                Some(session.provider),
+            )
+        });
     }
     if let Ok(reader) = reader {
         let _ = reader.join();
@@ -664,7 +699,7 @@ fn run_helper(
     let result = if let Some(failure) = failure {
         Err(failure)
     } else if let Some(message) = message {
-        process_message(&inner, &session, message)
+        process_message(&inner, &session, message, &cancel, deadline)
     } else {
         Err(manager_failure(
             "helper_output_unavailable",
@@ -696,6 +731,8 @@ fn process_message(
     inner: &ManagerInner,
     session: &LoginSession,
     message: LoginHelperMessage,
+    cancel: &AtomicBool,
+    deadline: Instant,
 ) -> Result<(), LoginHelperFailure> {
     match message {
         LoginHelperMessage::Success {
@@ -711,11 +748,13 @@ fn process_message(
                     Some(session.provider),
                 ));
             }
-            inner
-                .playback
-                .complete_login(session.session_id, credential_from_payload(credential))
-                .map(|_| ())
-                .map_err(|error| playback_failure(error, Some(session.provider)))
+            complete_login_until(
+                inner,
+                session,
+                credential_from_payload(credential),
+                cancel,
+                deadline,
+            )
         }
         LoginHelperMessage::Error { provider, code, .. } => {
             let actual = parse_helper_provider(&provider, session.provider)?;
@@ -734,6 +773,81 @@ fn process_message(
             ))
         }
     }
+}
+
+fn complete_login_until(
+    inner: &ManagerInner,
+    session: &LoginSession,
+    credential: ProviderCredential,
+    cancel: &AtomicBool,
+    deadline: Instant,
+) -> Result<(), LoginHelperFailure> {
+    if cancel.load(Ordering::Acquire) {
+        return Err(manager_failure(
+            "login_cancelled",
+            "登录任务已取消",
+            Some(session.provider),
+        ));
+    }
+    if Instant::now() >= deadline {
+        return Err(manager_failure(
+            "login_timeout",
+            "登录等待超时",
+            Some(session.provider),
+        ));
+    }
+
+    let completion = inner
+        .playback
+        .complete_login(session.session_id, credential)
+        .map_err(|error| playback_failure(error, Some(session.provider)))?;
+
+    loop {
+        if let PendingLoginPoll::Completed(result) = completion.wait_timeout(Duration::ZERO) {
+            return map_login_completion(result, session.provider);
+        }
+
+        let cancelled = cancel.load(Ordering::Acquire);
+        let timed_out = Instant::now() >= deadline;
+        if cancelled || timed_out {
+            let terminal_failure = if cancelled {
+                manager_failure("login_cancelled", "登录任务已取消", Some(session.provider))
+            } else {
+                manager_failure("login_timeout", "登录等待超时", Some(session.provider))
+            };
+            let _ = inner.playback.cancel_login(session.session_id);
+            return match completion.wait_timeout(TERMINATION_GRACE) {
+                PendingLoginPoll::Completed(Ok(_)) => Ok(()),
+                PendingLoginPoll::Completed(Err(error)) => {
+                    if error.code() == "playback_cancelled" {
+                        Err(terminal_failure)
+                    } else {
+                        Err(playback_failure(error, Some(session.provider)))
+                    }
+                }
+                PendingLoginPoll::TimedOut => Err(terminal_failure),
+            };
+        }
+
+        let wait = deadline
+            .saturating_duration_since(Instant::now())
+            .min(REAPER_POLL);
+        match completion.wait_timeout(wait) {
+            PendingLoginPoll::Completed(result) => {
+                return map_login_completion(result, session.provider);
+            }
+            PendingLoginPoll::TimedOut => {}
+        }
+    }
+}
+
+fn map_login_completion(
+    result: Result<CredentialStatus, PlaybackError>,
+    provider: ProviderId,
+) -> Result<(), LoginHelperFailure> {
+    result
+        .map(|_| ())
+        .map_err(|error| playback_failure(error, Some(provider)))
 }
 
 fn parse_helper_provider(
@@ -890,7 +1004,54 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct FakePlayback {
-        state: Mutex<FakePlaybackState>,
+        state: Arc<Mutex<FakePlaybackState>>,
+        changed: Arc<Condvar>,
+        completion_started: Arc<Mutex<Option<std::sync::mpsc::SyncSender<()>>>>,
+        completion_behavior: FakeCompletionBehavior,
+    }
+
+    struct ChannelPendingLoginCompletion {
+        result: std::sync::mpsc::Receiver<Result<CredentialStatus, PlaybackError>>,
+        worker: Mutex<Option<JoinHandle<()>>>,
+    }
+
+    impl ChannelPendingLoginCompletion {
+        fn join_worker(&self) {
+            if let Some(worker) = self.worker.lock().unwrap().take() {
+                let _ = worker.join();
+            }
+        }
+    }
+
+    impl PendingLoginCompletion for ChannelPendingLoginCompletion {
+        fn wait_timeout(&self, timeout: Duration) -> PendingLoginPoll {
+            match self.result.recv_timeout(timeout) {
+                Ok(result) => {
+                    self.join_worker();
+                    PendingLoginPoll::Completed(result)
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => PendingLoginPoll::TimedOut,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    self.join_worker();
+                    PendingLoginPoll::Completed(Err(PlaybackError::RuntimeStopped))
+                }
+            }
+        }
+    }
+
+    impl Drop for ChannelPendingLoginCompletion {
+        fn drop(&mut self) {
+            if let Some(worker) = self.worker.get_mut().unwrap().take() {
+                let _ = worker.join();
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum FakeCompletionBehavior {
+        Immediate,
+        BlockUntilCancelled,
+        CommitThenDelay(Duration),
     }
 
     struct FakePlaybackState {
@@ -902,11 +1063,40 @@ mod tests {
     impl FakePlayback {
         fn new() -> Arc<Self> {
             Arc::new(Self {
-                state: Mutex::new(FakePlaybackState {
+                state: Arc::new(Mutex::new(FakePlaybackState {
                     active: None,
                     completed: 0,
                     cancelled: 0,
-                }),
+                })),
+                changed: Arc::new(Condvar::new()),
+                completion_started: Arc::new(Mutex::new(None)),
+                completion_behavior: FakeCompletionBehavior::Immediate,
+            })
+        }
+
+        fn blocking_completion(started: std::sync::mpsc::SyncSender<()>) -> Arc<Self> {
+            Arc::new(Self {
+                state: Arc::new(Mutex::new(FakePlaybackState {
+                    active: None,
+                    completed: 0,
+                    cancelled: 0,
+                })),
+                changed: Arc::new(Condvar::new()),
+                completion_started: Arc::new(Mutex::new(Some(started))),
+                completion_behavior: FakeCompletionBehavior::BlockUntilCancelled,
+            })
+        }
+
+        fn committed_then_delayed(delay: Duration) -> Arc<Self> {
+            Arc::new(Self {
+                state: Arc::new(Mutex::new(FakePlaybackState {
+                    active: None,
+                    completed: 0,
+                    cancelled: 0,
+                })),
+                changed: Arc::new(Condvar::new()),
+                completion_started: Arc::new(Mutex::new(None)),
+                completion_behavior: FakeCompletionBehavior::CommitThenDelay(delay),
             })
         }
     }
@@ -939,17 +1129,57 @@ mod tests {
             &self,
             session_id: Uuid,
             _credential: ProviderCredential,
-        ) -> Result<CredentialStatus, PlaybackError> {
-            let mut state = self.state.lock().unwrap();
-            if state.active.as_ref().map(|session| session.session_id) != Some(session_id) {
-                return Err(PlaybackError::Failure(Failure::new(
-                    "login_session_invalid",
-                    "invalid",
-                )));
-            }
-            state.active = None;
-            state.completed += 1;
-            Ok(CredentialStatus::empty("qqmusic"))
+        ) -> Result<Box<dyn PendingLoginCompletion>, PlaybackError> {
+            let state = Arc::clone(&self.state);
+            let changed = Arc::clone(&self.changed);
+            let completion_started = Arc::clone(&self.completion_started);
+            let behavior = self.completion_behavior;
+            let (result_sender, result) = std::sync::mpsc::sync_channel(1);
+            let worker = thread::spawn(move || {
+                if let Some(started) = completion_started.lock().unwrap().take() {
+                    let _ = started.send(());
+                }
+                let mut state = state.lock().unwrap();
+                let result = if state.active.as_ref().map(|session| session.session_id)
+                    != Some(session_id)
+                {
+                    Err(PlaybackError::Failure(Failure::new(
+                        "login_session_invalid",
+                        "invalid",
+                    )))
+                } else {
+                    match behavior {
+                        FakeCompletionBehavior::Immediate => {
+                            state.active = None;
+                            state.completed += 1;
+                            Ok(CredentialStatus::empty("qqmusic"))
+                        }
+                        FakeCompletionBehavior::BlockUntilCancelled => {
+                            while state.active.as_ref().map(|session| session.session_id)
+                                == Some(session_id)
+                            {
+                                state = changed.wait(state).unwrap();
+                            }
+                            Err(PlaybackError::Failure(Failure::new(
+                                "playback_cancelled",
+                                "cancelled",
+                            )))
+                        }
+                        FakeCompletionBehavior::CommitThenDelay(delay) => {
+                            state.active = None;
+                            state.completed += 1;
+                            drop(state);
+                            thread::sleep(delay);
+                            Ok(CredentialStatus::empty("qqmusic"))
+                        }
+                    }
+                };
+                let _ = result_sender.send(result);
+            });
+            Ok(Box::new(ChannelPendingLoginCompletion {
+                result,
+                worker: Mutex::new(Some(worker)),
+            }))
         }
 
         fn cancel_login(&self, session_id: Uuid) -> Result<(), PlaybackError> {
@@ -957,6 +1187,7 @@ mod tests {
             if state.active.as_ref().map(|session| session.session_id) == Some(session_id) {
                 state.active = None;
                 state.cancelled += 1;
+                self.changed.notify_all();
             }
             Ok(())
         }
@@ -1209,6 +1440,56 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(4));
         assert_eq!(status.last_error.as_ref().unwrap().code, "login_timeout");
         assert_eq!(playback.state.lock().unwrap().cancelled, 1);
+        manager.shutdown().unwrap();
+    }
+
+    #[test]
+    fn helper_timeout_includes_credential_validation_and_persistence() {
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let playback = FakePlayback::blocking_completion(started_tx);
+        let launcher = FakeLauncher::new([FakeScenario::Message(valid_success("qqmusic"))]);
+        let manager = manager(
+            Arc::clone(&playback),
+            launcher,
+            "validation-timeout",
+            Duration::from_millis(40),
+        );
+        manager.start(ProviderId::QqMusic).unwrap();
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("credential validation started");
+
+        let started = Instant::now();
+        let status = wait_idle(&manager);
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(status.last_error.as_ref().unwrap().code, "login_timeout");
+        let state = playback.state.lock().unwrap();
+        assert_eq!(state.completed, 0);
+        assert_eq!(state.cancelled, 1);
+        drop(state);
+        manager.shutdown().unwrap();
+    }
+
+    #[test]
+    fn committed_credential_result_wins_over_deadline_reporting() {
+        let playback = FakePlayback::committed_then_delayed(Duration::from_millis(80));
+        let launcher = FakeLauncher::new([FakeScenario::Message(valid_success("qqmusic"))]);
+        let manager = manager(
+            Arc::clone(&playback),
+            launcher,
+            "committed-before-deadline",
+            Duration::from_millis(40),
+        );
+
+        manager.start(ProviderId::QqMusic).unwrap();
+        let status = wait_idle(&manager);
+
+        assert!(status.last_error.is_none());
+        let state = playback.state.lock().unwrap();
+        assert_eq!(state.completed, 1);
+        assert_eq!(state.cancelled, 0);
+        drop(state);
         manager.shutdown().unwrap();
     }
 }

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::credentials::ProviderCredential;
-use crate::domain::{ResolverLocator, SearchSpec, Song, SongKey, StreamSource};
+use crate::domain::{ResolverLocator, SearchSpec, SongKey, StreamSource};
 use crate::lyrics::TimedLyrics;
 
 pub use crate::domain::Failure;
@@ -86,31 +86,14 @@ impl From<&CatalogError> for Failure {
 
 #[async_trait]
 pub trait SourceAdapter: Send + Sync + 'static {
-    fn source_code(&self) -> &'static str;
     async fn validate_credential(
         &self,
         _candidate: &ProviderCredential,
     ) -> Result<(), CatalogError> {
         Ok(())
     }
-    async fn search(&self, spec: &SearchSpec) -> Result<Vec<Song>, CatalogError>;
-    /// Provider-specific search metadata is normalized here. Legacy adapters
-    /// that do not expose rights fields remain `unknown` rather than being
-    /// guessed as playable.
-    async fn search_candidates(
-        &self,
-        spec: &SearchSpec,
-    ) -> Result<Vec<ProviderSearchCandidate>, CatalogError> {
-        Ok(self
-            .search(spec)
-            .await?
-            .into_iter()
-            .map(|song| ProviderSearchCandidate {
-                song,
-                eligibility: PlaybackEligibility::Unknown,
-            })
-            .collect())
-    }
+    async fn search(&self, spec: &SearchSpec)
+    -> Result<Vec<ProviderSearchCandidate>, CatalogError>;
     async fn resolve(
         &self,
         key: &SongKey,
@@ -131,11 +114,8 @@ pub struct SourceCatalog {
 }
 
 impl SourceCatalog {
-    pub fn new(adapters: impl IntoIterator<Item = Arc<dyn SourceAdapter>>) -> Self {
-        let adapters = adapters
-            .into_iter()
-            .map(|adapter| (adapter.source_code().to_owned(), adapter))
-            .collect();
+    pub fn new(adapters: impl IntoIterator<Item = (String, Arc<dyn SourceAdapter>)>) -> Self {
+        let adapters = adapters.into_iter().collect();
         Self {
             adapters: Arc::new(adapters),
         }

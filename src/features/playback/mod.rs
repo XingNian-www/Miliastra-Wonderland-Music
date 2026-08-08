@@ -307,10 +307,10 @@ pub(crate) struct PlayerStatus {
     /// The player runtime which produced this observation, when the backend
     /// exposes a stable process identity.
     pub(crate) runtime_identity: String,
-    /// Session reference carried by playerd terminal outcomes.
+    /// Session reference carried by native playback terminal outcomes.
     pub(crate) session_id: String,
     pub(crate) generation: u64,
-    /// Playerd end behavior and durable terminal outcome metadata.
+    /// Native playback end behavior and durable terminal outcome metadata.
     pub(crate) end_behavior: String,
     pub(crate) last_end_cause: String,
     pub(crate) failure_code: String,
@@ -1041,17 +1041,14 @@ mod tests {
         ));
         fs::write(&blocker, "not a directory").unwrap();
         let state_path = blocker.join("playback-state.json");
-        let queue_path = std::env::temp_dir().join(format!(
-            "miliastra-playback-queue-unused-{}-{suffix}.json",
-            std::process::id()
-        ));
         let history_path = std::env::temp_dir().join(format!(
             "miliastra-playback-history-unused-{}-{suffix}.json",
             std::process::id()
         ));
+        let request_store = RequestStateStore::load(state_path.clone()).unwrap();
         let mut service = PlaybackService::new(
-            PersistentQueue::load(queue_path, 10).unwrap(),
-            PersistentPlaybackState::load(state_path).unwrap(),
+            PersistentQueue::from_request_store(request_store.clone(), 10).unwrap(),
+            PersistentPlaybackState::from_request_store(request_store).unwrap(),
             PersistentSongDedupHistory::load(history_path, Arc::new(SystemClock)).unwrap(),
             SongDedupConfig::default(),
         );
@@ -1061,7 +1058,7 @@ mod tests {
             .expect_err("blocked parent must reject the state write");
         let snapshot = service.playback_state_snapshot();
 
-        assert!(error.to_string().contains("播放状态目录"));
+        assert!(error.to_string().contains("请求状态目录"));
         assert_eq!(snapshot.state, ConfirmedPlaybackState::Idle);
         assert_eq!(snapshot.pause_reason, PauseReason::None);
         fs::remove_file(blocker).unwrap();

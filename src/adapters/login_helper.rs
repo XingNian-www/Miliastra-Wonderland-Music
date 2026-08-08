@@ -842,12 +842,9 @@ fn terminate_child(child: &SharedChild) {
 
 fn wait_child_until(child: &SharedChild, deadline: Instant) -> io::Result<bool> {
     loop {
-        let poll = child.lock().map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                "login helper process state is unavailable",
-            )
-        })?;
+        let poll = child
+            .lock()
+            .map_err(|_| io::Error::other("login helper process state is unavailable"))?;
         let mut poll = poll;
         let result = match poll.as_mut() {
             Some(child) => child.try_wait()?,
@@ -861,12 +858,9 @@ fn wait_child_until(child: &SharedChild, deadline: Instant) -> io::Result<bool> 
         }
         drop(poll);
         if Instant::now() >= deadline {
-            let mut process = child.lock().map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    "login helper process state is unavailable",
-                )
-            })?;
+            let mut process = child
+                .lock()
+                .map_err(|_| io::Error::other("login helper process state is unavailable"))?;
             if let Some(mut process) = process.take() {
                 let _ = process.kill();
                 return process.wait();

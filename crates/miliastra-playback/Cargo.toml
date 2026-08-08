@@ -1,0 +1,26 @@
+[package]
+name = "miliastra-playback"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[dependencies]
+async-trait = "0.1"
+base64 = "0.22"
+cpal = "0.18.1"
+ffmpeg-next = { version = "9.0.0", default-features = false, features = ["codec", "format", "software-resampling"] }
+miliastra-login-protocol = { path = "../miliastra-login-protocol" }
+reqwest = { version = "0.13", default-features = false, features = ["form", "json", "query", "rustls"] }
+rsa = { version = "0.9", features = ["pem", "sha2"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tracing = "0.1"
+url = { version = "2", features = ["serde"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+
+[dev-dependencies]
+http-body-util = "0.1"

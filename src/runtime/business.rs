@@ -6,7 +6,14 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+mod entertainment;
+mod hall;
+mod playback;
+
+use entertainment::EntertainmentRuntimeState as EntertainmentComponent;
+use hall::HallRuntimeState as HallComponent;
 use miliastra_playback::TrackKey;
+use playback::PlaybackRuntimeState as PlaybackComponent;
 
 use crate::features::administration::{
     AdministrationMutationIntent, AdministrationMutationOutcome,
@@ -51,18 +58,18 @@ use crate::observation::chat::{
 };
 use crate::observation::shared::ObservationGap;
 use crate::runtime::chat_listener::{ChatListenerMode, ChatListenerSnapshot, ChatListenerState};
-use crate::runtime::clock::Clock;
-#[cfg(test)]
-use crate::runtime::clock::SystemClock;
 use crate::runtime::deadline::{BusinessDeadlineEvent, BusinessDeadlineToken};
 use crate::runtime::decision::{DecisionAction, DecisionSnapshot, DecisionState};
-use crate::runtime::identity::{
-    BusinessOperationId, BusinessOperationIdAllocator, SessionGeneration,
-};
-use crate::runtime::task_engine::BusinessTaskPort;
 #[cfg(test)]
 use crate::runtime::task_engine::TaskEngineHandle;
-use crate::runtime::timer::{
+use crate::runtime::task_engine::{BusinessTaskPort, TaskEngineError};
+use miliastra_kernel::clock::Clock;
+#[cfg(test)]
+use miliastra_kernel::clock::SystemClock;
+use miliastra_kernel::identity::{
+    BusinessOperationId, BusinessOperationIdAllocator, SessionGeneration,
+};
+use miliastra_kernel::timer::{
     DeadlineCancellation, DeadlineSchedule, TimerCommandKind, TimerRuntimeEvent, TimerRuntimeHandle,
 };
 
@@ -2191,7 +2198,10 @@ impl BusinessRuntime {
 
 #[cfg(test)]
 fn default_undercover_service() -> UndercoverRuntimeService {
-    UndercoverRuntimeService::new(UndercoverConfig::default())
+    UndercoverRuntimeService::new(
+        UndercoverConfig::default(),
+        crate::test_support::test_state_store(),
+    )
 }
 
 impl Drop for BusinessRuntime {
@@ -2969,135 +2979,80 @@ fn handle_business_timer(
 
 fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: BusinessRuntimeWorker) {
     let BusinessRuntimeWorker {
-        mut idiom_chain,
-        mut card_games,
-        mut undercover,
-        mut turtle_soup,
-        mut hall,
-        mut playback,
-        mut invite,
+        idiom_chain,
+        card_games,
+        undercover,
+        turtle_soup,
+        hall,
+        playback,
+        invite,
         mut task_port,
         timer,
         state_sink,
         clock,
     } = worker_config;
     let mut snapshot = BusinessRuntimeSnapshot::default();
-    let mut entertainment = EntertainmentState::new();
-    let mut chat_listener = ChatListenerState::new();
-    let mut decision = DecisionState::new();
-    let mut operational = OperationalState::new();
-    let mut active_idiom_deadline = None;
-    let mut active_card_game_deadline = None;
-    let mut active_undercover_deadline = None;
-    let mut active_turtle_soup_deadline = None;
-    let mut pending_card_game_cancellations = Vec::new();
-    let mut pending_undercover_cancellations = Vec::new();
-    let mut pending_turtle_soup_cancellations = Vec::new();
-    let mut pending_card_game_outcomes = std::collections::VecDeque::new();
-    let mut pending_undercover_outcomes = std::collections::VecDeque::new();
-    let mut entertainment_clock_active = true;
-    let mut moderation_workflows = HashSet::new();
-    let operation_ids = BusinessOperationIdAllocator::new();
-    let mut session_generation = SessionGeneration::INITIAL;
-    publish_business_state(
-        &state_sink,
-        turtle_soup.as_ref(),
-        &undercover,
+    let mut entertainment = EntertainmentComponent::new(
+        idiom_chain,
+        card_games,
+        undercover,
+        turtle_soup,
+        invite,
+        state_sink.clone(),
         clock.as_ref(),
     );
-    publish_playback_queue(&state_sink, playback.as_ref());
-    publish_hall_state(&state_sink, hall.as_ref());
-    publish_chat_listener_state(&state_sink, &chat_listener);
-    publish_decision_state(&state_sink, &mut decision);
-    publish_operational_state(&state_sink, &operational, clock.now());
+    let mut chat_listener = ChatListenerRuntimeState::new(state_sink.clone());
+    let mut decision = DecisionRuntimeState::new(state_sink.clone());
+    let mut task_state = TaskRuntimeState::new(state_sink.clone());
+    let mut hall = HallComponent::new(hall, state_sink.clone());
+    let mut playback = PlaybackComponent::new(playback, state_sink.clone());
+    chat_listener.publish();
+    decision.publish();
+    task_state.publish(clock.now());
     while let Ok(message) = receiver.recv() {
         match message {
             RuntimeMessage::OperationalSnapshot { now, response } => {
-                let _ = response.send(Ok(operational.snapshot(now)));
+                task_state.handle_snapshot(now, response);
             }
             RuntimeMessage::SetCommandsEnabled { enabled, response } => {
-                operational.commands_enabled = enabled;
-                publish_operational_state(&state_sink, &operational, clock.now());
-                let _ = response.send(Ok(()));
+                task_state.handle_set_commands_enabled(enabled, clock.now(), response);
             }
             RuntimeMessage::ConfigureIdleExit {
                 timeout,
                 now,
                 response,
-            } => {
-                operational.configure_idle_exit(timeout, now);
-                publish_operational_state(&state_sink, &operational, now);
-                let _ = response.send(Ok(()));
-            }
+            } => task_state.handle_configure_idle_exit(timeout, now, response),
             RuntimeMessage::RecordCommandActivity { now, response } => {
-                operational.record_command_activity(now);
-                publish_operational_state(&state_sink, &operational, clock.now());
-                let _ = response.send(Ok(()));
+                task_state.handle_record_command_activity(now, clock.now(), response);
             }
             RuntimeMessage::ClaimIdleExit { now, response } => {
-                let claimed = task_port
-                    .is_idle()
-                    .map(|scheduler_idle| operational.claim_idle_exit(now, scheduler_idle))
-                    .map_err(|error| {
-                        BusinessRuntimeError::TaskEngineOperationFailed(error.to_string())
-                    });
-                publish_operational_state(&state_sink, &operational, now);
-                let _ = response.send(claimed);
+                task_state.handle_claim_idle_exit(now, task_port.is_idle(), response);
             }
             RuntimeMessage::ClearIdleExit(response) => {
-                operational.idle_exit = None;
-                publish_operational_state(&state_sink, &operational, clock.now());
-                let _ = response.send(Ok(()));
+                task_state.handle_clear_idle_exit(clock.now(), response);
             }
-            RuntimeMessage::ChatListener(message) => {
-                handle_chat_listener_message(&mut chat_listener, message, &state_sink);
-            }
-            RuntimeMessage::Decision(message) => {
-                handle_decision_message(&mut decision, message, &state_sink);
-            }
+            RuntimeMessage::ChatListener(message) => chat_listener.handle(message),
+            RuntimeMessage::Decision(message) => decision.handle(message),
             RuntimeMessage::Event(event) => match event {
                 BusinessEvent::Timer(timer_event) => {
                     snapshot.apply(BusinessEvent::Timer(timer_event.clone()));
-                    if let Err(error) = handle_business_timer(
+                    if let Err(error) = entertainment.handle_timer(
                         timer_event,
-                        &mut entertainment,
-                        &mut idiom_chain,
-                        &mut card_games,
-                        &mut undercover,
-                        turtle_soup.as_mut(),
                         &mut task_port,
                         timer.as_ref(),
-                        &mut active_idiom_deadline,
-                        &mut active_card_game_deadline,
-                        &mut active_undercover_deadline,
-                        &mut active_turtle_soup_deadline,
-                        &mut pending_card_game_cancellations,
-                        &mut pending_undercover_cancellations,
-                        &mut pending_turtle_soup_cancellations,
-                        &mut pending_card_game_outcomes,
-                        &mut pending_undercover_outcomes,
-                        &operation_ids,
-                        &mut session_generation,
-                        entertainment_clock_active,
                         clock.as_ref(),
                     ) {
                         log::error!("业务运行时处理计时事件失败: {error}");
                     }
                 }
                 BusinessEvent::TurtleSoupAiCompleted(completion) => {
-                    if let Some(service) = turtle_soup.as_mut() {
-                        service.apply_ai_completion(&mut entertainment, completion, &mut task_port);
-                        if let Err(error) = sync_turtle_soup_deadline(
-                            Some(&*service),
-                            timer.as_ref(),
-                            &mut active_turtle_soup_deadline,
-                            &mut pending_turtle_soup_cancellations,
-                            &operation_ids,
-                            clock.now(),
-                            entertainment_clock_active,
-                        ) {
-                            log::error!("处理海龟汤 AI 裁决后同步期限失败: {error}");
-                        }
+                    if let Err(error) = entertainment.apply_turtle_soup_ai_completion(
+                        completion,
+                        &mut task_port,
+                        timer.as_ref(),
+                        clock.as_ref(),
+                    ) {
+                        log::error!("处理海龟汤 AI 裁决后同步期限失败: {error}");
                     }
                 }
                 other => snapshot.apply(other),
@@ -3108,20 +3063,12 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
                 observed_at,
                 response,
             } => {
-                let observed_at = observed_at.unwrap_or_else(|| clock.now());
-                let result = idiom_chain
-                    .handle_at(&mut entertainment, &player, &command, observed_at)
-                    .map_err(idiom_chain_operation_failed)
-                    .and_then(|outcome| {
-                        sync_idiom_deadline(
-                            &idiom_chain,
-                            timer.as_ref(),
-                            &mut active_idiom_deadline,
-                            &operation_ids,
-                            &mut session_generation,
-                        )?;
-                        Ok(outcome)
-                    });
+                let result = entertainment.handle_idiom(
+                    &player,
+                    &command,
+                    observed_at.unwrap_or_else(|| clock.now()),
+                    timer.as_ref(),
+                );
                 let _ = response.send(result);
             }
             RuntimeMessage::ExplainIdiomChain {
@@ -3130,103 +3077,43 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
                 observed_at,
                 response,
             } => {
-                let observed_at = observed_at.unwrap_or_else(|| clock.now());
-                let result = idiom_chain
-                    .explain_at(&player, &command, observed_at)
-                    .map_err(idiom_chain_operation_failed)
-                    .and_then(|outcome| {
-                        sync_idiom_deadline(
-                            &idiom_chain,
-                            timer.as_ref(),
-                            &mut active_idiom_deadline,
-                            &operation_ids,
-                            &mut session_generation,
-                        )?;
-                        Ok(outcome)
-                    });
+                let result = entertainment.explain_idiom(
+                    &player,
+                    &command,
+                    observed_at.unwrap_or_else(|| clock.now()),
+                    timer.as_ref(),
+                );
                 let _ = response.send(result);
             }
             RuntimeMessage::AbortIdiomChain(response) => {
-                let result = idiom_chain
-                    .abort(&mut entertainment)
-                    .map_err(idiom_chain_operation_failed)
-                    .and_then(|aborted| {
-                        sync_idiom_deadline(
-                            &idiom_chain,
-                            timer.as_ref(),
-                            &mut active_idiom_deadline,
-                            &operation_ids,
-                            &mut session_generation,
-                        )?;
-                        Ok(aborted)
-                    });
-                let _ = response.send(result);
+                let _ = response.send(entertainment.abort_idiom(timer.as_ref()));
             }
             RuntimeMessage::ExpireIdiomChain(response) => {
-                let result = idiom_chain
-                    .expire_idle_at(&mut entertainment, clock.now())
-                    .map_err(idiom_chain_operation_failed)
-                    .and_then(|expired| {
-                        sync_idiom_deadline(
-                            &idiom_chain,
-                            timer.as_ref(),
-                            &mut active_idiom_deadline,
-                            &operation_ids,
-                            &mut session_generation,
-                        )?;
-                        Ok(expired)
-                    });
-                let _ = response.send(result);
+                let _ = response.send(entertainment.expire_idiom(clock.now(), timer.as_ref()));
             }
             RuntimeMessage::CardGame(message) => {
-                if let Err(error) = handle_card_game_message(
-                    &mut card_games,
-                    &mut entertainment,
-                    message,
-                    timer.as_ref(),
-                    &mut active_card_game_deadline,
-                    &mut pending_card_game_cancellations,
-                    &operation_ids,
-                    &mut pending_card_game_outcomes,
-                    &mut entertainment_clock_active,
-                    clock.as_ref(),
-                ) {
+                if let Err(error) =
+                    entertainment.handle_card_game(message, timer.as_ref(), clock.as_ref())
+                {
                     log::error!("业务运行时处理牌局消息失败: {error}");
                 }
             }
             RuntimeMessage::Undercover(message) => {
-                if let Err(error) = handle_undercover_message(
-                    &mut undercover,
-                    &mut entertainment,
-                    message,
-                    timer.as_ref(),
-                    &mut active_undercover_deadline,
-                    &mut pending_undercover_cancellations,
-                    &operation_ids,
-                    &mut pending_undercover_outcomes,
-                    &mut entertainment_clock_active,
-                    clock.as_ref(),
-                ) {
+                if let Err(error) =
+                    entertainment.handle_undercover(message, timer.as_ref(), clock.as_ref())
+                {
                     log::error!("业务运行时处理谁是卧底消息失败: {error}");
                 }
             }
             RuntimeMessage::UndercoverSnapshot(response) => {
-                let _ = response.send(Ok(undercover.snapshot(clock.now())));
+                let _ = response.send(Ok(entertainment.undercover_snapshot(clock.now())));
             }
             RuntimeMessage::TurtleSoup(message) => {
-                if let Err(error) = handle_turtle_soup_message(
-                    TurtleSoupHandlerContext {
-                        turtle_soup: turtle_soup.as_mut(),
-                        entertainment: &mut entertainment,
-                        task_port: &mut task_port,
-                        timer: timer.as_ref(),
-                        active_deadline: &mut active_turtle_soup_deadline,
-                        pending_cancellations: &mut pending_turtle_soup_cancellations,
-                        operation_ids: &operation_ids,
-                        clock_active: entertainment_clock_active,
-                        clock: clock.as_ref(),
-                    },
+                if let Err(error) = entertainment.handle_turtle_soup(
                     message,
+                    &mut task_port,
+                    timer.as_ref(),
+                    clock.as_ref(),
                 ) {
                     log::error!("业务运行时处理海龟汤消息失败: {error}");
                 }
@@ -3236,297 +3123,33 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
                 clock_active,
                 response,
             } => {
-                let result = sync_turtle_soup_deadline(
-                    turtle_soup.as_ref(),
+                let _ = response.send(entertainment.refresh_turtle_soup(
                     timer.as_ref(),
-                    &mut active_turtle_soup_deadline,
-                    &mut pending_turtle_soup_cancellations,
-                    &operation_ids,
                     now,
                     clock_active,
-                );
-                let _ = response.send(result);
+                ));
             }
             RuntimeMessage::TurtleSoupSnapshot(response) => {
-                let result = turtle_soup
-                    .as_ref()
-                    .map(|service| service.snapshot())
-                    .ok_or(BusinessRuntimeError::RuntimeStopped);
-                let _ = response.send(result);
+                let _ = response.send(entertainment.turtle_soup_snapshot());
             }
             RuntimeMessage::InviteShouldAccept { sequence, response } => {
-                let _ = response.send(invite.should_accept(sequence));
+                let _ = response.send(entertainment.invite_should_accept(sequence));
             }
             RuntimeMessage::BeginInvite { request, response } => {
-                let _ = response.send(invite.begin(request));
+                let _ = response.send(entertainment.begin_invite(request));
             }
             RuntimeMessage::AcquireModerationWorkflow { key, response } => {
-                let _ = response.send(moderation_workflows.insert(key));
+                task_state.handle_acquire_moderation_workflow(key, response);
             }
             RuntimeMessage::ReleaseModerationWorkflow { key, response } => {
-                let _ = response.send(moderation_workflows.remove(&key));
+                task_state.handle_release_moderation_workflow(key, response);
             }
             #[cfg(test)]
             RuntimeMessage::ContainsModerationWorkflow { key, response } => {
-                let _ = response.send(moderation_workflows.contains(&key));
+                task_state.handle_contains_moderation_workflow(key, response);
             }
-            RuntimeMessage::Hall(message) => match message {
-                HallRuntimeMessage::PatchState { patch, response } => {
-                    let result = hall
-                        .as_mut()
-                        .ok_or(BusinessRuntimeError::RuntimeStopped)
-                        .and_then(|service| service.patch(patch).map_err(hall_operation_failed));
-                    if result.is_ok() {
-                        publish_hall_state(&state_sink, hall.as_ref());
-                    }
-                    let _ = response.send(result);
-                }
-                HallRuntimeMessage::StateSnapshot(response) => {
-                    let result = hall
-                        .as_ref()
-                        .map(HallStateService::snapshot)
-                        .ok_or(BusinessRuntimeError::RuntimeStopped);
-                    let _ = response.send(result);
-                }
-                HallRuntimeMessage::UpdateRemainingMinutes { minutes, response } => {
-                    let result = hall
-                        .as_mut()
-                        .ok_or(BusinessRuntimeError::RuntimeStopped)
-                        .and_then(|service| {
-                            service
-                                .update_remaining_minutes(minutes)
-                                .map_err(hall_operation_failed)
-                        });
-                    if result.is_ok() {
-                        publish_hall_state(&state_sink, hall.as_ref());
-                    }
-                    let _ = response.send(result);
-                }
-                HallRuntimeMessage::ClearRemainingMinutes(response) => {
-                    let result = hall
-                        .as_mut()
-                        .ok_or(BusinessRuntimeError::RuntimeStopped)
-                        .and_then(|service| {
-                            service
-                                .clear_remaining_minutes()
-                                .map_err(hall_operation_failed)
-                        });
-                    if result.is_ok() {
-                        publish_hall_state(&state_sink, hall.as_ref());
-                    }
-                    let _ = response.send(result);
-                }
-                HallRuntimeMessage::ClearCountdownCache(response) => {
-                    let result = hall
-                        .as_mut()
-                        .ok_or(BusinessRuntimeError::RuntimeStopped)
-                        .and_then(|service| {
-                            service
-                                .clear_countdown_cache()
-                                .map_err(hall_operation_failed)
-                        });
-                    if result.as_ref().is_ok_and(|cleared| *cleared) {
-                        publish_hall_state(&state_sink, hall.as_ref());
-                    }
-                    let _ = response.send(result);
-                }
-            },
-            RuntimeMessage::Playback(message) => match message {
-                PlaybackRuntimeMessage::PushQueue { item, response } => {
-                    let result = playback
-                        .as_mut()
-                        .ok_or(BusinessRuntimeError::RuntimeStopped)
-                        .and_then(|service| {
-                            service.push_queue(item).map_err(playback_operation_failed)
-                        });
-                    if result.is_ok() {
-                        publish_playback_queue(&state_sink, playback.as_ref());
-                    }
-                    let _ = response.send(result);
-                }
-                PlaybackRuntimeMessage::RemoveQueue { removal, response } => {
-                    let result = playback
-                        .as_mut()
-                        .ok_or(BusinessRuntimeError::RuntimeStopped)
-                        .and_then(|service| {
-                            service
-                                .remove_queue(removal)
-                                .map_err(playback_operation_failed)
-                        });
-                    if matches!(result, Ok(QueueRemoveOutcome::Removed { .. })) {
-                        publish_playback_queue(&state_sink, playback.as_ref());
-                    }
-                    let _ = response.send(result);
-                }
-                PlaybackRuntimeMessage::RemoveQueueIndexes { indexes, response } => {
-                    let result = playback
-                        .as_mut()
-                        .ok_or(BusinessRuntimeError::RuntimeStopped)
-                        .and_then(|service| {
-                            service
-                                .remove_queue_indexes(indexes)
-                                .map_err(playback_operation_failed)
-                        });
-                    if result.as_ref().is_ok_and(|removed| !removed.is_empty()) {
-                        publish_playback_queue(&state_sink, playback.as_ref());
-                    }
-                    let _ = response.send(result);
-                }
-                PlaybackRuntimeMessage::ClearQueue(response) => {
-                    let result = playback
-                        .as_mut()
-                        .ok_or(BusinessRuntimeError::RuntimeStopped)
-                        .and_then(|service| {
-                            service.clear_queue().map_err(playback_operation_failed)
-                        });
-                    if result.as_ref().is_ok_and(|count| *count > 0) {
-                        publish_playback_queue(&state_sink, playback.as_ref());
-                    }
-                    let _ = response.send(result);
-                }
-                PlaybackRuntimeMessage::QueueContains { item, response } => {
-                    let result = playback
-                        .as_ref()
-                        .map(|service| service.queue_contains(&item))
-                        .ok_or(BusinessRuntimeError::RuntimeStopped);
-                    let _ = response.send(result);
-                }
-                PlaybackRuntimeMessage::QueueSnapshot(response) => {
-                    let result = playback
-                        .as_ref()
-                        .map(PlaybackService::queue_snapshot)
-                        .ok_or(BusinessRuntimeError::RuntimeStopped);
-                    let _ = response.send(result);
-                }
-                PlaybackRuntimeMessage::StateSnapshot(response) => {
-                    let result = playback
-                        .as_ref()
-                        .map(PlaybackService::playback_state_snapshot)
-                        .ok_or(BusinessRuntimeError::RuntimeStopped);
-                    let _ = response.send(result);
-                }
-                PlaybackRuntimeMessage::UpdatePlaybackState { update, response } => {
-                    let result = playback
-                        .as_mut()
-                        .ok_or(BusinessRuntimeError::RuntimeStopped)
-                        .and_then(|service| {
-                            service
-                                .apply_playback_state_update(update)
-                                .map_err(playback_operation_failed)
-                        });
-                    let _ = response.send(result);
-                }
-                PlaybackRuntimeMessage::CheckSongDedup {
-                    candidate,
-                    response,
-                } => {
-                    let result = playback
-                        .as_ref()
-                        .map(|service| service.song_dedup_limited(&candidate))
-                        .ok_or(BusinessRuntimeError::RuntimeStopped);
-                    let _ = response.send(result);
-                }
-                PlaybackRuntimeMessage::RecordSongDedup {
-                    candidate,
-                    response,
-                } => {
-                    let result = playback
-                        .as_mut()
-                        .ok_or(BusinessRuntimeError::RuntimeStopped)
-                        .and_then(|service| {
-                            service
-                                .record_song_dedup(candidate)
-                                .map_err(playback_operation_failed)
-                        });
-                    let _ = response.send(result);
-                }
-                PlaybackRuntimeMessage::ObserveExternalPlayback {
-                    identity,
-                    now,
-                    protect_after,
-                    response,
-                } => {
-                    let result = playback
-                        .as_mut()
-                        .map(|service| {
-                            service.observe_external_playback(&identity, now, protect_after)
-                        })
-                        .ok_or(BusinessRuntimeError::RuntimeStopped);
-                    let _ = response.send(result);
-                }
-                PlaybackRuntimeMessage::ClearExternalPlaybackTracker(response) => {
-                    let result = playback
-                        .as_mut()
-                        .map(|service| service.clear_external_playback_tracker())
-                        .ok_or(BusinessRuntimeError::RuntimeStopped);
-                    let _ = response.send(result);
-                }
-                PlaybackRuntimeMessage::ReconcilePlayerSession { binding, response } => {
-                    let result = playback
-                        .as_mut()
-                        .ok_or(BusinessRuntimeError::RuntimeStopped)
-                        .and_then(|service| {
-                            service
-                                .reconcile_player_session(binding)
-                                .map_err(playback_operation_failed)
-                        });
-                    let _ = response.send(result);
-                }
-                PlaybackRuntimeMessage::ClaimTerminalOutcome {
-                    request_id,
-                    outcome,
-                    handled_at_ms,
-                    response,
-                } => {
-                    let result = playback
-                        .as_mut()
-                        .ok_or(BusinessRuntimeError::RuntimeStopped)
-                        .and_then(|service| {
-                            service
-                                .claim_terminal_outcome(request_id, outcome, handled_at_ms)
-                                .map_err(playback_operation_failed)
-                        });
-                    let _ = response.send(result);
-                }
-                PlaybackRuntimeMessage::RecordPlaybackAttempt {
-                    provider,
-                    locator,
-                    started_at_ms,
-                    result: attempt_result,
-                    response,
-                } => {
-                    let result = playback
-                        .as_mut()
-                        .ok_or(BusinessRuntimeError::RuntimeStopped)
-                        .and_then(|service| {
-                            service
-                                .record_playback_attempt(
-                                    provider,
-                                    locator,
-                                    started_at_ms,
-                                    attempt_result,
-                                )
-                                .map_err(playback_operation_failed)
-                        });
-                    let _ = response.send(result);
-                }
-                PlaybackRuntimeMessage::RecordControlOperation {
-                    operation,
-                    requested_at_ms,
-                    completed,
-                    response,
-                } => {
-                    let result = playback
-                        .as_mut()
-                        .ok_or(BusinessRuntimeError::RuntimeStopped)
-                        .and_then(|service| {
-                            service
-                                .record_control_operation(operation, requested_at_ms, completed)
-                                .map_err(playback_operation_failed)
-                        });
-                    let _ = response.send(result);
-                }
-            },
+            RuntimeMessage::Hall(message) => hall.handle(message),
+            RuntimeMessage::Playback(message) => playback.handle(message),
             RuntimeMessage::ActiveEntertainment(response) => {
                 let _ = response.send(entertainment.active());
             }
@@ -3534,62 +3157,17 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
                 let _ = response.send(snapshot);
             }
             RuntimeMessage::PrepareShutdown(response) => {
-                abort_business_modules(
-                    &mut entertainment,
-                    &mut idiom_chain,
-                    &mut card_games,
-                    &mut undercover,
-                    turtle_soup.as_mut(),
-                    timer.as_ref(),
-                    &mut active_idiom_deadline,
-                    &mut active_card_game_deadline,
-                    &mut active_undercover_deadline,
-                    &mut active_turtle_soup_deadline,
-                    &mut pending_card_game_cancellations,
-                    &mut pending_undercover_cancellations,
-                    &mut pending_turtle_soup_cancellations,
-                    &operation_ids,
-                    &mut session_generation,
-                    &mut pending_card_game_outcomes,
-                    &mut pending_undercover_outcomes,
-                    entertainment_clock_active,
-                    clock.as_ref(),
-                );
+                entertainment.abort_all(timer.as_ref(), clock.as_ref());
                 snapshot.quiescing = true;
                 let _ = response.send(snapshot);
             }
             RuntimeMessage::Shutdown(response) => {
-                abort_business_modules(
-                    &mut entertainment,
-                    &mut idiom_chain,
-                    &mut card_games,
-                    &mut undercover,
-                    turtle_soup.as_mut(),
-                    timer.as_ref(),
-                    &mut active_idiom_deadline,
-                    &mut active_card_game_deadline,
-                    &mut active_undercover_deadline,
-                    &mut active_turtle_soup_deadline,
-                    &mut pending_card_game_cancellations,
-                    &mut pending_undercover_cancellations,
-                    &mut pending_turtle_soup_cancellations,
-                    &operation_ids,
-                    &mut session_generation,
-                    &mut pending_card_game_outcomes,
-                    &mut pending_undercover_outcomes,
-                    entertainment_clock_active,
-                    clock.as_ref(),
-                );
+                entertainment.abort_all(timer.as_ref(), clock.as_ref());
                 let _ = response.send(snapshot);
                 break;
             }
         }
-        publish_business_state(
-            &state_sink,
-            turtle_soup.as_ref(),
-            &undercover,
-            clock.as_ref(),
-        );
+        entertainment.publish(clock.as_ref());
     }
 }
 
@@ -4247,173 +3825,265 @@ fn turtle_soup_operation_failed(error: anyhow::Error) -> BusinessRuntimeError {
     BusinessRuntimeError::TurtleSoupOperationFailed(format!("{error:#}"))
 }
 
-fn hall_operation_failed(error: anyhow::Error) -> BusinessRuntimeError {
-    BusinessRuntimeError::HallOperationFailed(format!("{error:#}"))
+/// 封装操作控制状态与审核工作流占用表。
+struct TaskRuntimeState {
+    operational: OperationalState,
+    moderation_workflows: HashSet<ModerationWorkflowKey>,
+    state_sink: Option<Arc<dyn BusinessStateSink>>,
 }
 
-fn playback_operation_failed(error: anyhow::Error) -> BusinessRuntimeError {
-    BusinessRuntimeError::PlaybackOperationFailed(format!("{error:#}"))
-}
+impl TaskRuntimeState {
+    fn new(state_sink: Option<Arc<dyn BusinessStateSink>>) -> Self {
+        Self {
+            operational: OperationalState::new(),
+            moderation_workflows: HashSet::new(),
+            state_sink,
+        }
+    }
 
-fn publish_playback_queue(
-    state_sink: &Option<Arc<dyn BusinessStateSink>>,
-    playback: Option<&PlaybackService>,
-) {
-    if let (Some(state_sink), Some(playback)) = (state_sink, playback) {
-        state_sink.publish_playback_queue(playback.queue_snapshot());
+    fn publish(&self, now: Instant) {
+        if let Some(state_sink) = &self.state_sink {
+            state_sink.publish_operational(self.operational.snapshot(now));
+        }
+    }
+
+    fn handle_snapshot(
+        &self,
+        now: Instant,
+        response: SyncSender<Result<BusinessOperationalSnapshot, BusinessRuntimeError>>,
+    ) {
+        let _ = response.send(Ok(self.operational.snapshot(now)));
+    }
+
+    fn handle_set_commands_enabled(
+        &mut self,
+        enabled: bool,
+        now: Instant,
+        response: SyncSender<Result<(), BusinessRuntimeError>>,
+    ) {
+        self.operational.commands_enabled = enabled;
+        self.publish(now);
+        let _ = response.send(Ok(()));
+    }
+
+    fn handle_configure_idle_exit(
+        &mut self,
+        timeout: Duration,
+        now: Instant,
+        response: SyncSender<Result<(), BusinessRuntimeError>>,
+    ) {
+        self.operational.configure_idle_exit(timeout, now);
+        self.publish(now);
+        let _ = response.send(Ok(()));
+    }
+
+    fn handle_record_command_activity(
+        &mut self,
+        observed_at: Instant,
+        published_at: Instant,
+        response: SyncSender<Result<(), BusinessRuntimeError>>,
+    ) {
+        self.operational.record_command_activity(observed_at);
+        self.publish(published_at);
+        let _ = response.send(Ok(()));
+    }
+
+    fn handle_claim_idle_exit(
+        &mut self,
+        now: Instant,
+        scheduler_idle: Result<bool, TaskEngineError>,
+        response: SyncSender<Result<Option<Duration>, BusinessRuntimeError>>,
+    ) {
+        let claimed = scheduler_idle
+            .map(|scheduler_idle| self.operational.claim_idle_exit(now, scheduler_idle))
+            .map_err(|error| BusinessRuntimeError::TaskEngineOperationFailed(error.to_string()));
+        self.publish(now);
+        let _ = response.send(claimed);
+    }
+
+    fn handle_clear_idle_exit(
+        &mut self,
+        now: Instant,
+        response: SyncSender<Result<(), BusinessRuntimeError>>,
+    ) {
+        self.operational.idle_exit = None;
+        self.publish(now);
+        let _ = response.send(Ok(()));
+    }
+
+    fn handle_acquire_moderation_workflow(
+        &mut self,
+        key: ModerationWorkflowKey,
+        response: SyncSender<bool>,
+    ) {
+        let _ = response.send(self.moderation_workflows.insert(key));
+    }
+
+    fn handle_release_moderation_workflow(
+        &mut self,
+        key: ModerationWorkflowKey,
+        response: SyncSender<bool>,
+    ) {
+        let _ = response.send(self.moderation_workflows.remove(&key));
+    }
+
+    #[cfg(test)]
+    fn handle_contains_moderation_workflow(
+        &self,
+        key: ModerationWorkflowKey,
+        response: SyncSender<bool>,
+    ) {
+        let _ = response.send(self.moderation_workflows.contains(&key));
     }
 }
 
-fn publish_hall_state(
-    state_sink: &Option<Arc<dyn BusinessStateSink>>,
-    hall: Option<&HallStateService>,
-) {
-    if let (Some(state_sink), Some(hall)) = (state_sink, hall) {
-        state_sink.publish_hall_remaining_minutes(hall.snapshot().remaining_minutes_now());
+struct ChatListenerRuntimeState {
+    state: ChatListenerState,
+    state_sink: Option<Arc<dyn BusinessStateSink>>,
+}
+
+impl ChatListenerRuntimeState {
+    fn new(state_sink: Option<Arc<dyn BusinessStateSink>>) -> Self {
+        Self {
+            state: ChatListenerState::new(),
+            state_sink,
+        }
+    }
+
+    fn publish(&self) {
+        if let Some(state_sink) = &self.state_sink {
+            state_sink.publish_chat_listener(self.state.snapshot());
+        }
+    }
+
+    fn handle(&mut self, message: ChatListenerRuntimeMessage) {
+        let mutated = match message {
+            ChatListenerRuntimeMessage::Snapshot(response) => {
+                let _ = response.send(Ok(self.state.snapshot()));
+                false
+            }
+            ChatListenerRuntimeMessage::RequestMode { target, response } => {
+                let changed = self.state.request_mode(target);
+                let _ = response.send(Ok(changed));
+                changed
+            }
+            ChatListenerRuntimeMessage::CompleteMode { mode, response } => {
+                self.state.complete_mode_switch(mode);
+                let _ = response.send(Ok(()));
+                true
+            }
+            ChatListenerRuntimeMessage::CancelModeRequest { target, response } => {
+                self.state.cancel_mode_request(target);
+                let _ = response.send(Ok(()));
+                true
+            }
+            ChatListenerRuntimeMessage::FailModeSwitchToPrimary(response) => {
+                self.state.fail_mode_switch_to_primary();
+                let _ = response.send(Ok(()));
+                true
+            }
+            ChatListenerRuntimeMessage::BeginTemporaryPrimary(response) => {
+                self.state.begin_temporary_primary();
+                let _ = response.send(Ok(()));
+                true
+            }
+            ChatListenerRuntimeMessage::EndTemporaryPrimary(response) => {
+                self.state.end_temporary_primary();
+                let _ = response.send(Ok(()));
+                true
+            }
+            ChatListenerRuntimeMessage::ClaimUnreadTask(response) => {
+                let claimed = self.state.claim_unread_task();
+                let _ = response.send(Ok(claimed));
+                claimed
+            }
+            ChatListenerRuntimeMessage::FinishUnreadTask {
+                processed_message,
+                response,
+            } => {
+                self.state.finish_unread_task(processed_message);
+                let _ = response.send(Ok(()));
+                true
+            }
+            ChatListenerRuntimeMessage::ReleaseUnreadTask(response) => {
+                self.state.release_unread_task();
+                let _ = response.send(Ok(()));
+                true
+            }
+            ChatListenerRuntimeMessage::FinishInitialUnreadClear(response) => {
+                self.state.finish_initial_unread_clear();
+                let _ = response.send(Ok(()));
+                true
+            }
+            ChatListenerRuntimeMessage::FinishHallRound(response) => {
+                self.state.finish_hall_round();
+                let _ = response.send(Ok(()));
+                true
+            }
+        };
+        if mutated {
+            self.publish();
+        }
     }
 }
 
-fn publish_operational_state(
-    state_sink: &Option<Arc<dyn BusinessStateSink>>,
-    operational: &OperationalState,
-    now: Instant,
-) {
-    if let Some(state_sink) = state_sink {
-        state_sink.publish_operational(operational.snapshot(now));
-    }
+struct DecisionRuntimeState {
+    state: DecisionState,
+    state_sink: Option<Arc<dyn BusinessStateSink>>,
 }
 
-fn publish_chat_listener_state(
-    state_sink: &Option<Arc<dyn BusinessStateSink>>,
-    chat_listener: &ChatListenerState,
-) {
-    if let Some(state_sink) = state_sink {
-        state_sink.publish_chat_listener(chat_listener.snapshot());
+impl DecisionRuntimeState {
+    fn new(state_sink: Option<Arc<dyn BusinessStateSink>>) -> Self {
+        Self {
+            state: DecisionState::new(),
+            state_sink,
+        }
     }
-}
 
-fn handle_chat_listener_message(
-    state: &mut ChatListenerState,
-    message: ChatListenerRuntimeMessage,
-    state_sink: &Option<Arc<dyn BusinessStateSink>>,
-) {
-    let mutated = match message {
-        ChatListenerRuntimeMessage::Snapshot(response) => {
-            let _ = response.send(Ok(state.snapshot()));
-            false
+    fn publish(&mut self) {
+        if let Some(state_sink) = &self.state_sink {
+            state_sink.publish_decision(self.state.snapshot());
         }
-        ChatListenerRuntimeMessage::RequestMode { target, response } => {
-            let changed = state.request_mode(target);
-            let _ = response.send(Ok(changed));
-            changed
-        }
-        ChatListenerRuntimeMessage::CompleteMode { mode, response } => {
-            state.complete_mode_switch(mode);
-            let _ = response.send(Ok(()));
-            true
-        }
-        ChatListenerRuntimeMessage::CancelModeRequest { target, response } => {
-            state.cancel_mode_request(target);
-            let _ = response.send(Ok(()));
-            true
-        }
-        ChatListenerRuntimeMessage::FailModeSwitchToPrimary(response) => {
-            state.fail_mode_switch_to_primary();
-            let _ = response.send(Ok(()));
-            true
-        }
-        ChatListenerRuntimeMessage::BeginTemporaryPrimary(response) => {
-            state.begin_temporary_primary();
-            let _ = response.send(Ok(()));
-            true
-        }
-        ChatListenerRuntimeMessage::EndTemporaryPrimary(response) => {
-            state.end_temporary_primary();
-            let _ = response.send(Ok(()));
-            true
-        }
-        ChatListenerRuntimeMessage::ClaimUnreadTask(response) => {
-            let claimed = state.claim_unread_task();
-            let _ = response.send(Ok(claimed));
-            claimed
-        }
-        ChatListenerRuntimeMessage::FinishUnreadTask {
-            processed_message,
-            response,
-        } => {
-            state.finish_unread_task(processed_message);
-            let _ = response.send(Ok(()));
-            true
-        }
-        ChatListenerRuntimeMessage::ReleaseUnreadTask(response) => {
-            state.release_unread_task();
-            let _ = response.send(Ok(()));
-            true
-        }
-        ChatListenerRuntimeMessage::FinishInitialUnreadClear(response) => {
-            state.finish_initial_unread_clear();
-            let _ = response.send(Ok(()));
-            true
-        }
-        ChatListenerRuntimeMessage::FinishHallRound(response) => {
-            state.finish_hall_round();
-            let _ = response.send(Ok(()));
-            true
-        }
-    };
-    if mutated {
-        publish_chat_listener_state(state_sink, state);
     }
-}
 
-fn publish_decision_state(
-    state_sink: &Option<Arc<dyn BusinessStateSink>>,
-    decision: &mut DecisionState,
-) {
-    if let Some(state_sink) = state_sink {
-        state_sink.publish_decision(decision.snapshot());
+    fn handle(&mut self, message: DecisionRuntimeMessage) {
+        match message {
+            DecisionRuntimeMessage::Begin {
+                label,
+                allow_switch_source,
+                allow_ai,
+                timeout,
+                delivery,
+                response,
+            } => {
+                let result = self
+                    .state
+                    .begin(label, allow_switch_source, allow_ai, timeout, delivery)
+                    .map_err(BusinessRuntimeError::DecisionOperationFailed);
+                let _ = response.send(result);
+            }
+            #[cfg(test)]
+            DecisionRuntimeMessage::Snapshot(response) => {
+                let _ = response.send(Ok(self.state.snapshot()));
+            }
+            DecisionRuntimeMessage::Submit {
+                id,
+                action,
+                response,
+            } => {
+                let result = self
+                    .state
+                    .submit(id, action)
+                    .map_err(BusinessRuntimeError::DecisionOperationFailed);
+                let _ = response.send(result);
+            }
+            DecisionRuntimeMessage::Finish { id, response } => {
+                self.state.finish(id);
+                let _ = response.send(Ok(()));
+            }
+        }
+        self.publish();
     }
-}
-
-fn handle_decision_message(
-    state: &mut DecisionState,
-    message: DecisionRuntimeMessage,
-    state_sink: &Option<Arc<dyn BusinessStateSink>>,
-) {
-    match message {
-        DecisionRuntimeMessage::Begin {
-            label,
-            allow_switch_source,
-            allow_ai,
-            timeout,
-            delivery,
-            response,
-        } => {
-            let result = state
-                .begin(label, allow_switch_source, allow_ai, timeout, delivery)
-                .map_err(BusinessRuntimeError::DecisionOperationFailed);
-            let _ = response.send(result);
-        }
-        #[cfg(test)]
-        DecisionRuntimeMessage::Snapshot(response) => {
-            let _ = response.send(Ok(state.snapshot()));
-        }
-        DecisionRuntimeMessage::Submit {
-            id,
-            action,
-            response,
-        } => {
-            let result = state
-                .submit(id, action)
-                .map_err(BusinessRuntimeError::DecisionOperationFailed);
-            let _ = response.send(result);
-        }
-        DecisionRuntimeMessage::Finish { id, response } => {
-            state.finish(id);
-            let _ = response.send(Ok(()));
-        }
-    }
-    publish_decision_state(state_sink, state);
 }
 
 #[cfg(test)]
@@ -4437,14 +4107,14 @@ mod tests {
     use crate::features::undercover::{UndercoverDeadlineKind, UndercoverDeadlineToken};
     use crate::observation::chat::ChatObservationLedger;
     use crate::observation::shared::{ObservationGapKind, SharedObservationStream};
-    use crate::runtime::clock::ManualClock;
     use crate::runtime::deadline::{BusinessDeadlineEvent, BusinessDeadlineToken};
-    use crate::runtime::identity::{BusinessOperationId, SessionGeneration};
     use crate::runtime::scheduler::{
         FormalTaskCancelOutcome, FormalTaskCancellationToken, FormalTaskDedupKey,
         FormalTaskEnqueueOutcome, FormalTaskExecutionOutcome, FormalTaskSubmission, FormalTaskWork,
     };
-    use crate::runtime::timer::{DeadlineSchedule, TimerCore, TimerRuntime, TimerRuntimeEvent};
+    use miliastra_kernel::clock::ManualClock;
+    use miliastra_kernel::identity::{BusinessOperationId, SessionGeneration};
+    use miliastra_kernel::timer::{DeadlineSchedule, TimerCore, TimerRuntime, TimerRuntimeEvent};
 
     struct TestFormalWork;
 
@@ -4660,6 +4330,7 @@ mod tests {
         let history = crate::features::playback::PersistentSongDedupHistory::load(
             std::env::temp_dir().join(format!("mwm-business-dedup-{suffix}.json")),
             Arc::new(SystemClock),
+            crate::test_support::test_state_store(),
         )
         .unwrap();
         crate::features::playback::PlaybackService::new(
@@ -4673,7 +4344,11 @@ mod tests {
     fn hall_service(path: std::path::PathBuf) -> HallStateService {
         let clock = Arc::new(SystemClock);
         HallStateService::new_with_time(
-            crate::features::hall::PersistentHallState::load(path).expect("hall state"),
+            crate::features::hall::PersistentHallState::load(
+                path,
+                crate::test_support::test_state_store(),
+            )
+            .expect("hall state"),
             clock.clone(),
             clock,
         )

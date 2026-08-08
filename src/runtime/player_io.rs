@@ -7,9 +7,9 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use super::clock::{Clock, SystemClock};
-use super::identity::{BusinessOperationId, BusinessOperationIdAllocator};
 use super::player::{PlayerObservation, PlayerObservationConfig, PlayerObserver, RawPlayerSample};
+use miliastra_kernel::clock::{Clock, SystemClock};
+use miliastra_kernel::identity::{BusinessOperationId, BusinessOperationIdAllocator};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PlayerRuntimeConfig {
@@ -1738,12 +1738,12 @@ mod tests {
         SearchCandidate,
     };
     use crate::features::playback::{test_candidate, test_track};
-    use crate::runtime::clock::{ManualClock, SystemClock};
-    use crate::runtime::identity::{BusinessOperationId, BusinessOperationIdAllocator};
     use crate::runtime::player::PlayerObservationConfig;
     use crate::runtime::player::{
         ObservationFreshness, PlayerObserver, RawPlayerSample, TransportState,
     };
+    use miliastra_kernel::clock::{ManualClock, SystemClock};
+    use miliastra_kernel::identity::{BusinessOperationId, BusinessOperationIdAllocator};
 
     const FAKE_PORT_BLOCK_TIMEOUT: Duration = Duration::from_secs(2);
 

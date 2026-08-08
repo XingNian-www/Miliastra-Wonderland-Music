@@ -334,6 +334,7 @@ impl CustomWorkflowService {
         Self { config, defaults }
     }
 
+    #[allow(dead_code)]
     pub fn enabled(&self) -> bool {
         self.config.enabled
     }

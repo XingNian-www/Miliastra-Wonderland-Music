@@ -1,0 +1,15 @@
+[package]
+name = "miliastra-kernel"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+anyhow = { workspace = true }
+async-openai = { workspace = true, features = ["byot", "chat-completion", "middleware", "responses", "rustls"] }
+reqwest = { workspace = true, features = ["json", "query", "rustls"] }
+secrecy = "0.10"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "sync", "time"] }
+url = { workspace = true }

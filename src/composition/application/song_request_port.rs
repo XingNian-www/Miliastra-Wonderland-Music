@@ -32,7 +32,8 @@ impl SongRequestPort for ApplicationRuntime {
         keyword: &str,
         source: &str,
     ) -> std::result::Result<Option<Vec<SearchCandidate>>, SongSearchFailure> {
-        self.player_search
+        self.playback
+            .player_search
             .search_candidates(keyword, source)
             .map(|candidates| (!candidates.is_empty()).then_some(candidates))
             .map_err(song_search_failure)
@@ -44,7 +45,8 @@ impl SongRequestPort for ApplicationRuntime {
         source: &str,
         prefer_accompaniment: bool,
     ) -> std::result::Result<Option<PickedCandidate>, SongSearchFailure> {
-        self.player_search
+        self.playback
+            .player_search
             .search_and_pick(keyword, source, prefer_accompaniment)
             .map_err(song_search_failure)
     }
@@ -55,26 +57,30 @@ impl SongRequestPort for ApplicationRuntime {
 
     fn queue_contains(&self, item: QueueItem) -> Result<bool> {
         self.business
+            .business
             .playback_queue_contains(item)
             .map_err(anyhow::Error::from)
     }
 
     fn push_queue(&self, item: QueueItem) -> Result<QueuePushOutcome> {
         self.business
+            .business
             .push_playback_queue(item)
             .map_err(anyhow::Error::from)
     }
 
     fn player_status(&self) -> Result<PlayerStatus> {
-        self.player.status()
+        self.playback.player.status()
     }
 
     fn should_queue_until_current_song_finished(&self, status: &PlayerStatus) -> Result<bool> {
-        self.player.should_queue_until_current_song_finished(status)
+        self.playback
+            .player
+            .should_queue_until_current_song_finished(status)
     }
 
     fn current_status_matches_request(&self, status: &PlayerStatus) -> Result<bool> {
-        self.player.current_status_matches_request(status)
+        self.playback.player.current_status_matches_request(status)
     }
 
     fn play_confirmed(&mut self, request: &ResolvedSongRequest) -> Result<PlaybackResult> {
@@ -82,7 +88,7 @@ impl SongRequestPort for ApplicationRuntime {
     }
 
     fn song_dedup_limited(&self, request: &PlaybackRequest) -> Result<bool> {
-        self.player.song_dedup_limited(request)
+        self.playback.player.song_dedup_limited(request)
     }
 
     fn log_executed(&self, context: &SongRequestContext, final_command: &str) -> Result<()> {

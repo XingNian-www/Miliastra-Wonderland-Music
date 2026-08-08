@@ -740,6 +740,64 @@ impl Display for FrameDemandError {
 
 impl Error for FrameDemandError {}
 
+#[derive(Clone, Default)]
+pub struct UiCoordinator {
+    state: Arc<Mutex<UiCoordinatorState>>,
+}
+
+#[derive(Default)]
+struct UiCoordinatorState {
+    formal_leases: usize,
+}
+
+impl UiCoordinator {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn acquire_formal(&self) -> UiFormalLease {
+        let mut state = self.state.lock().unwrap_or_else(|poisoned| {
+            log::error!("UI coordinator 状态锁曾发生异常，继续使用已恢复状态");
+            poisoned.into_inner()
+        });
+        state.formal_leases = state.formal_leases.saturating_add(1);
+        UiFormalLease {
+            coordinator: self.clone(),
+            active: true,
+        }
+    }
+
+    pub fn scan_may_run(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .formal_leases
+            == 0
+    }
+
+    fn release_formal(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.formal_leases = state.formal_leases.saturating_sub(1);
+    }
+}
+
+pub struct UiFormalLease {
+    coordinator: UiCoordinator,
+    active: bool,
+}
+
+impl Drop for UiFormalLease {
+    fn drop(&mut self) {
+        if self.active {
+            self.coordinator.release_formal();
+            self.active = false;
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CaptureFrame;
 
@@ -977,6 +1035,22 @@ impl Display for UiShutdownError {
 
 impl Error for UiShutdownError {}
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UiShutdownReport {
+    timed_out: bool,
+    detached: bool,
+}
+
+impl UiShutdownReport {
+    pub fn timed_out(&self) -> bool {
+        self.timed_out
+    }
+
+    pub fn detached(&self) -> bool {
+        self.detached
+    }
+}
+
 trait ErasedUiJob: Send {
     fn execute(
         self: Box<Self>,
@@ -1032,6 +1106,7 @@ enum RuntimeMessage {
 struct RuntimeChannel {
     sender: SyncSender<RuntimeMessage>,
     accepting: Mutex<bool>,
+    stop_requested: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -1151,8 +1226,11 @@ impl FrameDemandSubscription {
         }
         self.channel
             .sender
-            .send(RuntimeMessage::RemoveFrameDemand(self.id))
-            .map_err(|_| UiSubmitError::RuntimeStopped)?;
+            .try_send(RuntimeMessage::RemoveFrameDemand(self.id))
+            .map_err(|error| match error {
+                TrySendError::Full(_) => UiSubmitError::QueueFull,
+                TrySendError::Disconnected(_) => UiSubmitError::RuntimeStopped,
+            })?;
         self.active = false;
         Ok(())
     }
@@ -1233,9 +1311,11 @@ impl UiRuntime {
         }
 
         let (sender, receiver) = mpsc::sync_channel(queue_capacity);
+        let stop_requested = Arc::new(AtomicBool::new(false));
         let channel = Arc::new(RuntimeChannel {
             sender,
             accepting: Mutex::new(true),
+            stop_requested: Arc::clone(&stop_requested),
         });
         let latest_frame = Arc::new(Mutex::new(None));
         let worker_latest_frame = Arc::clone(&latest_frame);
@@ -1252,6 +1332,7 @@ impl UiRuntime {
                     progress,
                     classifier,
                     stable_count,
+                    stop_requested,
                 )
             })
             .map_err(UiRuntimeStartError::Spawn)?;
@@ -1272,25 +1353,45 @@ impl UiRuntime {
         self.handle.clone()
     }
 
-    pub fn shutdown(mut self) -> Result<(), UiShutdownError> {
-        self.stop_worker()
+    pub fn shutdown(mut self) -> Result<UiShutdownReport, UiShutdownError> {
+        self.stop_worker(Duration::from_secs(2))
     }
 
-    fn stop_worker(&mut self) -> Result<(), UiShutdownError> {
+    fn stop_worker(&mut self, grace_period: Duration) -> Result<UiShutdownReport, UiShutdownError> {
         let Some(worker) = self.worker.take() else {
-            return Ok(());
+            return Ok(UiShutdownReport::default());
         };
         if let Ok(mut accepting) = self.handle.channel.accepting.lock() {
             *accepting = false;
-            let _ = self.handle.channel.sender.send(RuntimeMessage::Shutdown);
         }
-        worker.join().map_err(|_| UiShutdownError)
+        self.handle
+            .channel
+            .stop_requested
+            .store(true, Ordering::Release);
+        let _ = self
+            .handle
+            .channel
+            .sender
+            .try_send(RuntimeMessage::Shutdown);
+
+        let (joined_sender, joined_receiver) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            let _ = joined_sender.send(worker.join().map_err(|_| UiShutdownError));
+        });
+        match joined_receiver.recv_timeout(grace_period) {
+            Ok(result) => result.map(|()| UiShutdownReport::default()),
+            Err(RecvTimeoutError::Timeout) => Ok(UiShutdownReport {
+                timed_out: true,
+                detached: true,
+            }),
+            Err(RecvTimeoutError::Disconnected) => Err(UiShutdownError),
+        }
     }
 }
 
 impl Drop for UiRuntime {
     fn drop(&mut self) {
-        let _ = self.stop_worker();
+        let _ = self.stop_worker(Duration::from_millis(100));
     }
 }
 
@@ -1300,6 +1401,7 @@ struct ActiveFrameDemand {
     sender: SyncSender<FramePublication>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_ui_runtime(
     device: impl UiDevice,
     receiver: Receiver<RuntimeMessage>,
@@ -1308,11 +1410,15 @@ fn run_ui_runtime(
     progress: Arc<dyn UiRoutineProgressSink>,
     classifier: Option<Box<dyn UiStateClassifier>>,
     stable_count: u32,
+    stop_requested: Arc<AtomicBool>,
 ) {
     let mut device = device;
     let mut demands = HashMap::<u64, ActiveFrameDemand>::new();
     let mut observation = UiObservationRuntime::new(classifier, stable_count, latest_ui_state);
     loop {
+        if stop_requested.load(Ordering::Acquire) {
+            break;
+        }
         let message = match next_frame_timeout(&demands) {
             Some(timeout) => match receiver.recv_timeout(timeout) {
                 Ok(message) => Some(message),
@@ -1325,13 +1431,16 @@ fn run_ui_runtime(
             },
         };
         match message {
-            Some(RuntimeMessage::Execute(job)) => job.execute(
-                &mut device,
-                progress.as_ref(),
-                &mut observation,
-                &mut demands,
-                &latest_frame,
-            ),
+            Some(RuntimeMessage::Execute(job)) => {
+                job.execute(
+                    &mut device,
+                    progress.as_ref(),
+                    &mut observation,
+                    &mut demands,
+                    &latest_frame,
+                );
+                publish_due_frame(&mut device, &mut observation, &mut demands, &latest_frame);
+            }
             Some(RuntimeMessage::AddFrameDemand { id, demand, sender }) => {
                 demands.insert(
                     id,
@@ -1427,6 +1536,32 @@ mod tests {
 
     fn classified(kind: UiStateKind) -> UiStateClassification {
         UiStateClassification::new(kind, format!("{kind:?}"))
+    }
+
+    #[test]
+    fn formal_leases_are_counted_and_release_independently() {
+        let coordinator = UiCoordinator::new();
+        let first = coordinator.acquire_formal();
+        let second = coordinator.acquire_formal();
+        assert!(!coordinator.scan_may_run());
+        drop(first);
+        assert!(!coordinator.scan_may_run());
+        drop(second);
+        assert!(coordinator.scan_may_run());
+    }
+
+    #[test]
+    fn formal_lease_is_released_during_unwind() {
+        let coordinator = UiCoordinator::new();
+        let unwind = std::panic::catch_unwind({
+            let coordinator = coordinator.clone();
+            move || {
+                let _lease = coordinator.acquire_formal();
+                panic!("测试 panic");
+            }
+        });
+        assert!(unwind.is_err());
+        assert!(coordinator.scan_may_run());
     }
 
     #[test]
@@ -1610,6 +1745,77 @@ mod tests {
                 UiRoutineProgressStage::NormalizingStart,
             )]
         );
-        runtime.shutdown().unwrap();
+        let report = runtime.shutdown().unwrap();
+        assert!(!report.timed_out());
+        assert!(!report.detached());
+    }
+
+    struct BlockingRoutine {
+        started: SyncSender<()>,
+        release: Receiver<()>,
+    }
+
+    impl sealed::UiRoutineSealed for BlockingRoutine {}
+
+    impl UiRoutine for BlockingRoutine {
+        type Output = ();
+
+        fn execute(self, _context: &mut UiRoutineContext<'_>) -> Self::Output {
+            let _ = self.started.send(());
+            let _ = self.release.recv();
+        }
+    }
+
+    #[test]
+    fn shutdown_does_not_block_when_queue_is_full() {
+        let mut runtime = UiRuntime::start(UnusedDevice, 1).unwrap();
+        let handle = runtime.handle();
+        let (started_sender, started_receiver) = mpsc::sync_channel(1);
+        let (release_sender, release_receiver) = mpsc::sync_channel(1);
+        let _blocking = handle
+            .submit(BlockingRoutine {
+                started: started_sender,
+                release: release_receiver,
+            })
+            .unwrap();
+        started_receiver.recv().unwrap();
+        let _queued = handle.submit(ContextProbeRoutine).unwrap();
+
+        let started_at = Instant::now();
+        let report = runtime
+            .stop_worker(Duration::from_millis(50))
+            .expect("关闭应返回报告");
+
+        assert!(started_at.elapsed() < Duration::from_secs(1));
+        assert!(report.timed_out());
+        assert!(report.detached());
+        assert!(matches!(
+            handle.submit(ContextProbeRoutine),
+            Err(UiSubmitError::RuntimeStopped)
+        ));
+        let _ = release_sender.send(());
+    }
+
+    #[test]
+    fn blocking_job_shutdown_reports_timeout_and_detachment() {
+        let mut runtime = UiRuntime::start(UnusedDevice, 1).unwrap();
+        let (started_sender, started_receiver) = mpsc::sync_channel(1);
+        let (release_sender, release_receiver) = mpsc::sync_channel(1);
+        let _operation = runtime
+            .handle()
+            .submit(BlockingRoutine {
+                started: started_sender,
+                release: release_receiver,
+            })
+            .unwrap();
+        started_receiver.recv().unwrap();
+
+        let report = runtime
+            .stop_worker(Duration::from_millis(50))
+            .expect("关闭应返回报告");
+
+        assert!(report.timed_out());
+        assert!(report.detached());
+        let _ = release_sender.send(());
     }
 }

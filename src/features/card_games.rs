@@ -12,7 +12,7 @@ use crate::features::command::{
 use crate::features::friend_delivery::{
     FriendBatchFailure, FriendBatchFailureKind, FriendBatchOutcome, FriendMessage,
 };
-use crate::runtime::timer::{DeadlineKind, DeadlineModule, DeadlineToken};
+use miliastra_kernel::timer::{DeadlineKind, DeadlineModule, DeadlineToken};
 
 mod service;
 
@@ -2222,7 +2222,7 @@ mod tests {
     use super::*;
     use crate::features::chat_text::{MAX_CHAT_WIDTH, display_width};
     use crate::features::entertainment::{AcquireOutcome, EntertainmentKind, EntertainmentState};
-    use crate::runtime::clock::{Clock, ManualClock};
+    use miliastra_kernel::clock::{Clock, ManualClock};
 
     struct TestCardGameService {
         inner: CardGameService,

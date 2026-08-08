@@ -12,9 +12,11 @@ use super::chat_text::{
 };
 use super::command::{CommandAuthority, CommandEnvelope, CommandPrefix, FeatureCommandMatch};
 use super::entertainment::{AcquireOutcome, EntertainmentKind, EntertainmentState};
-use crate::runtime::timer::{DeadlineKind, DeadlineModule, DeadlineToken};
+use miliastra_kernel::timer::{DeadlineKind, DeadlineModule, DeadlineToken};
 
-const PROJECT_IDIOM_ASSET_PATH: &str = "assets/idioms.txt";
+fn default_lexicon_path() -> std::path::PathBuf {
+    std::path::PathBuf::from("assets/idioms.txt")
+}
 
 #[derive(Debug)]
 pub struct IdiomChainDeadlineModule;
@@ -38,6 +40,8 @@ pub type IdiomChainDeadlineToken = DeadlineToken<IdiomChainDeadlineKind>;
 #[serde(deny_unknown_fields)]
 pub struct IdiomChainConfig {
     pub enabled: bool,
+    #[serde(default = "default_lexicon_path")]
+    pub lexicon_path: std::path::PathBuf,
     pub history_limit: usize,
     pub idle_timeout_seconds: u64,
     pub allow_consecutive_player: bool,
@@ -48,6 +52,7 @@ impl Default for IdiomChainConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            lexicon_path: default_lexicon_path(),
             history_limit: 200,
             idle_timeout_seconds: 300,
             allow_consecutive_player: false,
@@ -417,7 +422,7 @@ impl IdiomChainService {
 impl IdiomChainGame {
     pub fn load(config: IdiomChainConfig) -> Result<Self> {
         let lexicon = if config.enabled {
-            IdiomLexicon::load_project_asset()?
+            IdiomLexicon::load(&config.lexicon_path)?
         } else {
             IdiomLexicon::default()
         };
@@ -720,8 +725,7 @@ struct IdiomDetails {
 }
 
 impl IdiomLexicon {
-    fn load_project_asset() -> Result<Self> {
-        let path = Path::new(PROJECT_IDIOM_ASSET_PATH);
+    fn load(path: &Path) -> Result<Self> {
         let text = fs::read_to_string(path)
             .with_context(|| format!("读取项目成语词库失败: {}", path.display()))?;
         Self::from_text(&text, path)
@@ -944,7 +948,7 @@ fn outcome(action: &'static str, reply: impl Into<String>) -> IdiomChainOutcome 
 mod tests {
     use super::*;
     use crate::features::entertainment::EntertainmentState;
-    use crate::runtime::clock::{Clock, ManualClock};
+    use miliastra_kernel::clock::{Clock, ManualClock};
 
     fn game(entries: &[&str]) -> IdiomChainGame {
         IdiomChainGame {
@@ -1022,7 +1026,8 @@ mod tests {
 
     #[test]
     fn loads_the_complete_project_lexicon_asset() {
-        let lexicon = IdiomLexicon::load_project_asset().expect("load project idioms");
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(default_lexicon_path());
+        let lexicon = IdiomLexicon::load(&path).expect("load project idioms");
 
         assert!(lexicon.len() >= 30_000);
         assert!(lexicon.contains("阿鼻地狱"));

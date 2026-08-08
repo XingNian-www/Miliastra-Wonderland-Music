@@ -4,6 +4,8 @@ members = [
   "crates/miliastra-login-helper",
   "crates/miliastra-login-protocol",
   "crates/miliastra-playback",
+  "crates/miliastra-contracts",
+  "crates/miliastra-kernel",
 ]
 resolver = "3"
 
@@ -23,31 +25,46 @@ ocr-mnn = ["dep:ocr-rs"]
 # `backend_priority` selects `openvino`.
 ocr-openvino = ["dep:imageproc", "dep:openvino", "dep:openvino-sys"]
 
-[dependencies]
+[workspace.dependencies]
 anyhow = "1"
-async-openai = { version = "0.41.1", default-features = false, features = ["byot", "chat-completion", "middleware", "responses", "rustls"] }
+async-openai = { version = "0.41.1", default-features = false }
+miliastra-contracts = { path = "crates/miliastra-contracts" }
+miliastra-kernel = { path = "crates/miliastra-kernel" }
+miliastra-login-protocol = { path = "crates/miliastra-login-protocol" }
+miliastra-playback = { path = "crates/miliastra-playback" }
+reqwest = { version = "0.13", default-features = false }
+serde = "1"
+serde_json = "1"
+thiserror = "2"
+tokio = "1"
+url = "2.5"
+uuid = "1"
+
+[dependencies]
+anyhow = { workspace = true }
+miliastra-contracts = { workspace = true }
+miliastra-kernel = { workspace = true }
+async-openai = { workspace = true, features = ["byot", "chat-completion", "middleware", "responses", "rustls"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 enigo = "0.6"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 imageproc = { version = "0.25", optional = true }
 log = { version = "0.4", features = ["std"] }
-miliastra-login-protocol = { path = "crates/miliastra-login-protocol" }
-miliastra-playback = { path = "crates/miliastra-playback" }
+miliastra-login-protocol = { workspace = true }
+miliastra-playback = { workspace = true }
 pinyin = { version = "0.11", default-features = false, features = ["plain"] }
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
 ocr-rs = { git = "https://github.com/zibo-chen/rust-paddle-ocr.git", tag = "v2.3.1", optional = true, features = ["mnn-dynamic"] }
 openvino = { version = "0.11.0", optional = true, default-features = false, features = ["runtime-linking"] }
 # Low-level runtime loader used to prefer a bundled OpenVINO DLL before environment search paths.
 openvino-sys = { version = "0.11.0", optional = true, default-features = false, features = ["runtime-linking"] }
-reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"] }
-secrecy = "0.10"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 serde_yaml = "0.9"
 template-matching = { version = "0.2", default-features = false }
-tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time"] }
-url = "2.5"
-uuid = { version = "1", features = ["serde", "v4"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "sync", "time"] }
+url = { workspace = true }
+uuid = { workspace = true, features = ["serde", "v4"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [

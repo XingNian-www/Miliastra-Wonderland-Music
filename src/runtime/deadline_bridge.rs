@@ -8,7 +8,7 @@ use super::business::{
     BusinessRuntimeHandle, BusinessRuntimeSnapshot,
 };
 use super::deadline::{BusinessDeadlineEvent, BusinessDeadlineToken};
-use super::timer::{
+use miliastra_kernel::timer::{
     TimerRuntime, TimerRuntimeEvent, TimerRuntimeHandle, TimerRuntimeStartError, TimerShutdownError,
 };
 
@@ -453,8 +453,8 @@ mod tests {
     use crate::features::undercover::{UndercoverDeadlineKind, UndercoverDeadlineToken};
     use crate::runtime::business::{BusinessRuntime, BusinessRuntimeError};
     use crate::runtime::deadline::BusinessDeadlineToken;
-    use crate::runtime::identity::{BusinessOperationId, SessionGeneration};
-    use crate::runtime::timer::{
+    use miliastra_kernel::identity::{BusinessOperationId, SessionGeneration};
+    use miliastra_kernel::timer::{
         DeadlineCancellation, DeadlineSchedule, TimerCommandOutcome, TimerRuntime,
         TimerRuntimeEvent, TimerSubmitError,
     };

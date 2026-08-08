@@ -14,7 +14,7 @@ use crate::features::entertainment::{AcquireOutcome, EntertainmentKind, Entertai
 use crate::features::friend_delivery::{
     FriendBatchFailure, FriendBatchFailureKind, FriendBatchOutcome, FriendMessage,
 };
-use crate::runtime::identity::{BusinessOperationId, SessionGeneration};
+use miliastra_kernel::identity::{BusinessOperationId, SessionGeneration};
 
 /// Identifies one UI effect chain owned by the business runtime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -364,10 +364,11 @@ enum UndercoverContinuation {
 }
 
 impl UndercoverRuntimeService {
-    pub fn new(config: UndercoverConfig) -> Self {
+    pub fn new(config: UndercoverConfig, store: Arc<dyn miliastra_contracts::StateStore>) -> Self {
         let bank = UndercoverBankStore::new(
             config.word_bank_path.clone(),
             config.used_state_path.clone(),
+            store,
         );
         Self {
             game: UndercoverGame::new(config.clone()),
@@ -1276,8 +1277,8 @@ mod runtime_tests {
 
     use super::*;
     use crate::features::entertainment::EntertainmentState;
-    use crate::runtime::clock::{Clock, ManualClock};
-    use crate::runtime::identity::BusinessOperationId;
+    use miliastra_kernel::clock::{Clock, ManualClock};
+    use miliastra_kernel::identity::BusinessOperationId;
 
     fn service(timeout: u64) -> (UndercoverRuntimeService, EntertainmentState) {
         let suffix = SystemTime::now()
@@ -1293,13 +1294,16 @@ mod runtime_tests {
         )
         .expect("word bank");
         let entertainment = EntertainmentState::new();
-        let service = UndercoverRuntimeService::new(UndercoverConfig {
-            enabled: true,
-            word_bank_path: bank_path,
-            used_state_path: directory.join("used.yaml"),
-            lobby_timeout_seconds: timeout,
-            ..UndercoverConfig::default()
-        });
+        let service = UndercoverRuntimeService::new(
+            UndercoverConfig {
+                enabled: true,
+                word_bank_path: bank_path,
+                used_state_path: directory.join("used.yaml"),
+                lobby_timeout_seconds: timeout,
+                ..UndercoverConfig::default()
+            },
+            crate::test_support::test_state_store(),
+        );
         (service, entertainment)
     }
 

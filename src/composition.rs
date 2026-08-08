@@ -12,7 +12,10 @@ pub(crate) mod application;
 use application::{ApplicationRuntime, ResolvedApplicationConfig};
 
 pub(crate) fn run(config_path: &Path) -> Result<()> {
-    let config = AppConfig::load(config_path)?;
+    let executable_root = config_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("配置路径缺少 EXE 根目录: {}", config_path.display()))?;
+    let config = AppConfig::load_from_root(config_path, executable_root)?;
     let config = ResolvedApplicationConfig::resolve(config)?;
     let app_config = config.app();
     let monitor = MonitorShared::new(app_config.tui.log_lines);

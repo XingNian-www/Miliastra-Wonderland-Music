@@ -3,7 +3,7 @@ use crate::features::idiom_chain::IdiomChainDeadlineToken;
 use crate::features::turtle_soup::TurtleSoupDeadlineToken;
 use crate::features::undercover::UndercoverDeadlineToken;
 
-use super::timer::{DeadlineIdentity, TimerRuntimeEvent};
+use miliastra_kernel::timer::{DeadlineIdentity, TimerRuntimeEvent};
 
 /// The sole timer-runtime identity. It routes only by vertical module; deadline meaning stays in
 /// each module's typed token.
@@ -98,8 +98,8 @@ mod tests {
     use crate::features::idiom_chain::{IdiomChainDeadlineKind, IdiomChainDeadlineToken};
     use crate::features::turtle_soup::{TurtleSoupDeadlineKind, TurtleSoupDeadlineToken};
     use crate::features::undercover::{UndercoverDeadlineKind, UndercoverDeadlineToken};
-    use crate::runtime::identity::{BusinessOperationId, SessionGeneration};
-    use crate::runtime::timer::{DeadlineSchedule, TimerCore, TimerRuntimeEvent};
+    use miliastra_kernel::identity::{BusinessOperationId, SessionGeneration};
+    use miliastra_kernel::timer::{DeadlineSchedule, TimerCore, TimerRuntimeEvent};
 
     #[test]
     fn top_level_token_routes_each_module_without_losing_correlation() {

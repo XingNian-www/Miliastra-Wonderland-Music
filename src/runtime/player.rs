@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use miliastra_playback::{PlayableTrack, TrackKey};
 
-use super::clock::Clock;
+use miliastra_kernel::clock::Clock;
 
 pub const DEFAULT_PLAYER_STABILITY_SAMPLES: usize = 2;
 pub const DEFAULT_PLAYER_STALE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -881,7 +881,7 @@ mod tests {
         PlayerObserver, PlayerRuntimeMetadata, RawPlayerSample, TransportState,
     };
     use crate::features::playback::test_track;
-    use crate::runtime::clock::{Clock, ManualClock};
+    use miliastra_kernel::clock::{Clock, ManualClock};
 
     fn track(uri: &str) -> miliastra_playback::PlayableTrack {
         test_track(uri, "test track - test artist")

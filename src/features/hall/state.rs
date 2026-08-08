@@ -1,7 +1,9 @@
-use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
+
+use miliastra_contracts::StateStore;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::HALL_EXPIRING_WARNING_MINUTES;
@@ -78,30 +80,32 @@ impl HallRuntimeState {
         }
     }
 
-    fn load(path: &Path) -> Result<Self> {
-        if !path.exists() {
+    fn load(path: &Path, store: &dyn StateStore) -> Result<Self> {
+        if !store.exists(path) {
             return Ok(Self::default());
         }
-        let text = fs::read_to_string(path)
+        let text = store
+            .read_to_string(path)
             .with_context(|| format!("read hall state {}", path.display()))?;
         serde_json::from_str(&text).with_context(|| format!("parse hall state {}", path.display()))
     }
 
-    fn save(&self, path: &Path) -> Result<()> {
+    fn save(&self, path: &Path, store: &dyn StateStore) -> Result<()> {
         let text = serde_json::to_string_pretty(self)?;
-        crate::adapters::file_store::write_atomic(path, text.as_bytes(), "大厅状态")
+        store.write_atomic(path, text.as_bytes(), "大厅状态")
     }
 }
 
 pub(crate) struct PersistentHallState {
     path: PathBuf,
     state: HallRuntimeState,
+    store: Arc<dyn StateStore>,
 }
 
 impl PersistentHallState {
-    pub(crate) fn load(path: PathBuf) -> Result<Self> {
-        let state = HallRuntimeState::load(&path)?;
-        Ok(Self { path, state })
+    pub(crate) fn load(path: PathBuf, store: Arc<dyn StateStore>) -> Result<Self> {
+        let state = HallRuntimeState::load(&path, store.as_ref())?;
+        Ok(Self { path, state, store })
     }
 
     pub(crate) fn state(&self) -> &HallRuntimeState {
@@ -115,7 +119,7 @@ impl PersistentHallState {
         let mut next = self.state.clone();
         let changed = mutation(&mut next);
         if changed {
-            next.save(&self.path)?;
+            next.save(&self.path, self.store.as_ref())?;
             self.state = next;
         }
         Ok(changed)

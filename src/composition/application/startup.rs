@@ -12,7 +12,7 @@ impl StartupExecutionPort for ApplicationRuntime {
     }
 
     fn request_window_rescan(&self, reason: &'static str) -> Result<()> {
-        self.window_detection_signal.request(reason)
+        self.ui.window_detection_signal.request(reason)
     }
 
     fn run_start_game(
@@ -20,6 +20,7 @@ impl StartupExecutionPort for ApplicationRuntime {
         on_window_detection_reset: &mut dyn FnMut(&'static str),
     ) -> Result<()> {
         let outcome = self
+            .ui
             .startup_ui
             .submit_enter_game(EnterGame)
             .context("提交进入游戏 UI 事务")?
@@ -38,6 +39,7 @@ impl StartupExecutionPort for ApplicationRuntime {
 
     fn run_enter_wonderland(&self) -> Result<()> {
         let outcome = self
+            .ui
             .startup_ui
             .submit_enter_wonderland(EnterWonderland)
             .context("提交进入千星 UI 事务")?

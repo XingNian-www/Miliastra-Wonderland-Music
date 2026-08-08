@@ -170,7 +170,7 @@ impl ModerationCommandPort for ApplicationRuntime {
     }
 
     fn prepare_vote_hold(&mut self) -> Result<Box<dyn ModerationPrimaryHold>> {
-        let mut hold = TemporaryPrimaryHold::new(self.business.clone())?;
+        let mut hold = TemporaryPrimaryHold::new(self.business.business.clone())?;
         if let Err(error) =
             self.establish_ui_residency(UiResidency::Primary, ResidencyPurpose::ListenerModeSwitch)
         {
@@ -192,6 +192,7 @@ impl ModerationExecutionPort for ApplicationRuntime {
             command::ModerationAction::BlockChat => ModerationUiAction::BlockChat,
         };
         let outcome = self
+            .ui
             .moderation_ui
             .submit(ExecuteModeration::new(action, &command.uid))
             .context("提交管理 UI 事务")?
@@ -249,7 +250,7 @@ impl ApplicationRuntime {
         &mut self,
         command: &command::ModerationCommand,
     ) -> Result<bool> {
-        let moderation = self.moderation.clone();
+        let moderation = self.business.moderation.clone();
         match moderation.start(command, self)? {
             ModerationStart::Duplicate => Ok(false),
             ModerationStart::Started(work) => {
@@ -261,28 +262,29 @@ impl ApplicationRuntime {
 
     fn spawn_moderation_vote(&self, work: ModerationVoteWork) -> Result<()> {
         let mut workers = self
+            .business
             .moderation_workers
             .lock()
             .map_err(|_| anyhow::anyhow!("管理投票线程句柄锁已损坏"))?;
         let vote_context = ModerationVoteContext {
-            running: Arc::clone(&self.running),
-            game_ui: self.game_ui.clone(),
-            ocr: self.ocr.clone(),
-            monitor: self.monitor.clone(),
-            chat_observations: self.chat_observations.clone(),
-            template_args: self.chat_templates.clone(),
-            chat_rect: self.config.screen.chat_rect.into(),
+            running: Arc::clone(&self.lifecycle.running),
+            game_ui: self.ui.game_ui.clone(),
+            ocr: self.ui.ocr.clone(),
+            monitor: self.lifecycle.monitor.clone(),
+            chat_observations: self.ui.chat_observations.clone(),
+            template_args: self.ui.chat_templates.clone(),
+            chat_rect: self.lifecycle.config.screen.chat_rect.into(),
             canvas: Canvas {
-                width: self.config.screen.expected_width,
-                height: self.config.screen.expected_height,
+                width: self.lifecycle.config.screen.expected_width,
+                height: self.lifecycle.config.screen.expected_height,
                 resize: true,
             },
         };
         let task_context = ModerationTaskContext {
-            running: Arc::clone(&self.running),
-            formal_tasks: self.formal_tasks.clone(),
+            running: Arc::clone(&self.lifecycle.running),
+            formal_tasks: self.business.formal_tasks.clone(),
         };
-        let moderation = self.moderation.clone();
+        let moderation = self.business.moderation.clone();
         workers.push(thread::spawn(move || {
             let action = work.command().action;
             let uid = work.command().uid.clone();
@@ -302,7 +304,7 @@ impl ApplicationRuntime {
     }
 
     pub(super) fn join_moderation_workers(&self) {
-        let workers = match self.moderation_workers.lock() {
+        let workers = match self.business.moderation_workers.lock() {
             Ok(mut workers) => workers.drain(..).collect::<Vec<_>>(),
             Err(_) => {
                 log::error!("管理投票线程句柄锁已损坏，无法等待线程关闭");
@@ -320,7 +322,7 @@ impl ApplicationRuntime {
         &mut self,
         task: ModerationResultTask,
     ) -> Result<PendingTaskExecution> {
-        let moderation = self.moderation.clone();
+        let moderation = self.business.moderation.clone();
         match moderation.execute_result(task, self)? {
             ModerationResultExecution::Completed => Ok(PendingTaskExecution::Completed),
         }

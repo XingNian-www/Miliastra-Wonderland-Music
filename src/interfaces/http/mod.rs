@@ -286,12 +286,6 @@ const ROUTES: &[RouteSpec] = &[
         handler: search_candidates_route,
     },
     RouteSpec {
-        path: "/player/play-uri",
-        json: true,
-        mutating: true,
-        handler: player_play_uri_route,
-    },
-    RouteSpec {
         path: "/queue",
         json: true,
         mutating: false,
@@ -1007,11 +1001,11 @@ fn status_route(
     if let Ok(playback) = state.queries.playback_state_snapshot()
         && let Some(request) = playback.active_request
     {
-        let active_uri = if request.confirmed_uri.trim().is_empty() {
-            request.requested_uri.trim()
-        } else {
-            request.confirmed_uri.trim()
-        };
+        let active_uri = request
+            .track
+            .as_ref()
+            .map(|track| track.track_ref.key.to_string())
+            .unwrap_or_default();
         if !status.current_uri.trim().is_empty()
             && !active_uri.is_empty()
             && status.current_uri.trim() == active_uri
@@ -1157,62 +1151,6 @@ fn search_candidates_route(
             .map_err(player_search_error)?,
     )
     .map_err(internal_error)
-}
-
-fn player_play_uri_route(
-    query: &[(String, String)],
-    state: &HttpSharedState,
-) -> std::result::Result<String, AppError> {
-    let uri = normalize_fuo_uri(query_value_or(query, "url", "uri"))?;
-    let keyword = normalize_optional_text(
-        query_value_or(query, "keyword", "title")
-            .or_else(|| query_value(query, "text"))
-            .or_else(|| query_value(query, "name")),
-        "keyword",
-    )?;
-    let keyword = if keyword.is_empty() {
-        uri.clone()
-    } else {
-        keyword
-    };
-    let source =
-        normalize_source(query_value(query, "source").or_else(|| source_from_fuo_uri(&uri)))?;
-    let prefer_accompaniment = parse_bool(query_value_or(
-        query,
-        "preferAccompaniment",
-        "accompaniment",
-    ));
-    let requester = requester_from_query(query)?;
-    let BusinessMutationOutcome::Playback(PlaybackMutationOutcome::Pushed(pushed)) = state
-        .formal_tasks
-        .apply_mutation(BusinessMutationIntent::Playback(
-            PlaybackMutationIntent::Push(QueueItem {
-                id: 0,
-                keyword: keyword.clone(),
-                source,
-                prefer_accompaniment,
-                ai_original_text: String::new(),
-                uri: uri.trim().to_string(),
-                friend_username: String::new(),
-                requester,
-                dedup_bypass: true,
-                candidate_snapshot: Vec::new(),
-            }),
-        ))
-        .map_err(internal_error)?
-    else {
-        unreachable!("playback queue push intent returned a different outcome")
-    };
-    if !pushed.accepted {
-        return Err(AppError {
-            status: 400,
-            message: "音乐播放队列已满".to_string(),
-        });
-    }
-    Ok(
-        json!({ "ok": true, "queued": true, "size": pushed.size, "keyword": keyword, "uri": uri })
-            .to_string(),
-    )
 }
 
 fn queue_route(
@@ -1621,13 +1559,16 @@ fn turtle_soup_start_route(
         .map(str::trim)
         .filter(|id| !id.is_empty())
         .map(str::to_string);
-    let BusinessMutationOutcome::TurtleSoup(TurtleSoupMutationOutcome::Started(snapshot)) = state
+    let BusinessMutationOutcome::TurtleSoup(outcome) = state
         .formal_tasks
         .apply_mutation(BusinessMutationIntent::TurtleSoup(
             TurtleSoupMutationIntent::Start { puzzle_id },
         ))
         .map_err(internal_error)?
     else {
+        unreachable!("turtle soup start intent returned a different outcome")
+    };
+    let TurtleSoupMutationOutcome::Started(snapshot) = *outcome else {
         unreachable!("turtle soup start intent returned a different outcome")
     };
     serde_json::to_string(&json!({
@@ -1641,14 +1582,16 @@ fn turtle_soup_end_route(
     _query: &[(String, String)],
     state: &HttpSharedState,
 ) -> std::result::Result<String, AppError> {
-    let BusinessMutationOutcome::TurtleSoup(TurtleSoupMutationOutcome::Ended { ended, snapshot }) =
-        state
-            .formal_tasks
-            .apply_mutation(BusinessMutationIntent::TurtleSoup(
-                TurtleSoupMutationIntent::End,
-            ))
-            .map_err(internal_error)?
+    let BusinessMutationOutcome::TurtleSoup(outcome) = state
+        .formal_tasks
+        .apply_mutation(BusinessMutationIntent::TurtleSoup(
+            TurtleSoupMutationIntent::End,
+        ))
+        .map_err(internal_error)?
     else {
+        unreachable!("turtle soup end intent returned a different outcome")
+    };
+    let TurtleSoupMutationOutcome::Ended { ended, snapshot } = *outcome else {
         unreachable!("turtle soup end intent returned a different outcome")
     };
     if !ended {
@@ -1679,14 +1622,16 @@ fn turtle_soup_questions_route(
     {
         return Err(bad_request("海龟汤标题、汤面和汤底不能为空"));
     }
-    let BusinessMutationOutcome::TurtleSoup(TurtleSoupMutationOutcome::PuzzleAppended(receipt)) =
-        state
-            .formal_tasks
-            .apply_mutation(BusinessMutationIntent::TurtleSoup(
-                TurtleSoupMutationIntent::AppendPuzzle(submission),
-            ))
-            .map_err(internal_error)?
+    let BusinessMutationOutcome::TurtleSoup(outcome) = state
+        .formal_tasks
+        .apply_mutation(BusinessMutationIntent::TurtleSoup(
+            TurtleSoupMutationIntent::AppendPuzzle(submission),
+        ))
+        .map_err(internal_error)?
     else {
+        unreachable!("turtle soup append intent returned a different outcome")
+    };
+    let TurtleSoupMutationOutcome::PuzzleAppended(receipt) = *outcome else {
         unreachable!("turtle soup append intent returned a different outcome")
     };
     serde_json::to_string(&receipt).map_err(internal_error)
@@ -2208,23 +2153,22 @@ fn queue_add(
     ));
     let ai_original_text =
         normalize_optional_text(query_value(query, "aiOriginalText"), "aiOriginalText")?;
-    let uri = normalize_optional_text(query_value(query, "uri"), "uri")?;
     let requester = requester_from_query(query)?;
     let BusinessMutationOutcome::Playback(PlaybackMutationOutcome::Pushed(pushed)) = state
         .formal_tasks
         .apply_mutation(BusinessMutationIntent::Playback(
-            PlaybackMutationIntent::Push(QueueItem {
+            PlaybackMutationIntent::Push(Box::new(QueueItem {
                 id: 0,
                 keyword,
                 source,
                 prefer_accompaniment: prefer,
                 ai_original_text,
-                uri,
+                track: None,
                 friend_username: String::new(),
                 requester,
                 dedup_bypass: true,
                 candidate_snapshot: Vec::new(),
-            }),
+            })),
         ))
         .map_err(internal_error)?
     else {
@@ -2628,32 +2572,6 @@ fn validate_source(raw: &str) -> std::result::Result<String, AppError> {
     Ok(text)
 }
 
-fn normalize_fuo_uri(value: Option<&str>) -> std::result::Result<String, AppError> {
-    let uri = assert_no_control_chars(value.unwrap_or(""), "url")?
-        .trim()
-        .to_string();
-    if uri.is_empty() {
-        return Err(bad_request("缺少url或uri参数"));
-    }
-    if !uri.starts_with("miliastra://track/") && !uri.starts_with("fuo://") {
-        return Err(bad_request("只允许打开miliastra://track/<source>/<id>链接"));
-    }
-    Ok(uri)
-}
-
-fn source_from_fuo_uri(uri: &str) -> Option<&'static str> {
-    let rest = uri
-        .strip_prefix("miliastra://track/")
-        .or_else(|| uri.strip_prefix("fuo://"))?;
-    let source = rest.split('/').next().unwrap_or("");
-    match source {
-        "qqmusic" => Some("qqmusic"),
-        "netease" => Some("netease"),
-        "bilibili" => Some("bilibili"),
-        _ => None,
-    }
-}
-
 fn normalize_optional_text(
     value: Option<&str>,
     name: &str,
@@ -3055,6 +2973,7 @@ mod tests {
     use std::ops::{Deref, DerefMut};
     use std::time::Duration;
 
+    use crate::features::playback::{test_candidate, test_track};
     use crate::features::turtle_soup::TurtleSoupAppendReceipt;
     use crate::runtime::chat_listener::ChatListenerState;
     use crate::runtime::player_io::PlayerSearchError;
@@ -3101,7 +3020,7 @@ mod tests {
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     enum RecordedMutation {
-        PlaybackPush(QueueItem),
+        PlaybackPush(Box<QueueItem>),
         PlaybackRemove(QueueRemoval),
         PlaybackClear,
         HallPatch(HallStatePatch),
@@ -3299,7 +3218,7 @@ mod tests {
                     state
                         .mutations
                         .push(RecordedMutation::PlaybackPush(item.clone()));
-                    state.queue.push(item);
+                    state.queue.push(*item);
                     BusinessMutationOutcome::Playback(PlaybackMutationOutcome::Pushed(
                         crate::features::playback::QueuePushOutcome {
                             accepted: true,
@@ -3323,7 +3242,7 @@ mod tests {
                             let item = state.queue.remove(index);
                             QueueRemoveOutcome::Removed {
                                 index,
-                                item,
+                                item: Box::new(item),
                                 size: state.queue.len(),
                             }
                         }
@@ -3362,18 +3281,20 @@ mod tests {
                         .mutations
                         .push(RecordedMutation::TurtleSoupStart(puzzle_id));
                     state.turtle_soup.enabled = true;
-                    BusinessMutationOutcome::TurtleSoup(TurtleSoupMutationOutcome::Started(
-                        state.turtle_soup.clone(),
+                    BusinessMutationOutcome::TurtleSoup(Box::new(
+                        TurtleSoupMutationOutcome::Started(state.turtle_soup.clone()),
                     ))
                 }
                 BusinessMutationIntent::TurtleSoup(TurtleSoupMutationIntent::End) => {
                     state.mutations.push(RecordedMutation::TurtleSoupEnd);
                     let ended = state.turtle_soup.enabled;
                     state.turtle_soup = TurtleSoupSnapshot::default();
-                    BusinessMutationOutcome::TurtleSoup(TurtleSoupMutationOutcome::Ended {
-                        ended,
-                        snapshot: state.turtle_soup.clone(),
-                    })
+                    BusinessMutationOutcome::TurtleSoup(Box::new(
+                        TurtleSoupMutationOutcome::Ended {
+                            ended,
+                            snapshot: state.turtle_soup.clone(),
+                        },
+                    ))
                 }
                 BusinessMutationIntent::TurtleSoup(TurtleSoupMutationIntent::AppendPuzzle(
                     submission,
@@ -3387,12 +3308,12 @@ mod tests {
                     });
                     state.turtle_soup_submissions.push(submission);
                     let position = state.turtle_soup_submissions.len();
-                    BusinessMutationOutcome::TurtleSoup(TurtleSoupMutationOutcome::PuzzleAppended(
-                        TurtleSoupAppendReceipt {
+                    BusinessMutationOutcome::TurtleSoup(Box::new(
+                        TurtleSoupMutationOutcome::PuzzleAppended(TurtleSoupAppendReceipt {
                             id: format!("soup-{position:04}"),
                             position,
                             total: position,
-                        },
+                        }),
                     ))
                 }
             })
@@ -3633,9 +3554,9 @@ mod tests {
             source: &str,
         ) -> std::result::Result<Vec<SearchCandidate>, PlayerSearchClientError> {
             self.fail_if_requested()?;
-            Ok(vec![SearchCandidate::new(
-                format!("{keyword} result"),
-                format!("fuo://{source}/songs/1"),
+            Ok(vec![test_candidate(
+                &format!("{keyword} result"),
+                &format!("miliastra://track/{source}/1"),
             )])
         }
     }
@@ -3846,14 +3767,16 @@ mod tests {
             Some("application/json; charset=utf-8")
         );
         assert_eq!(
-            candidates.body,
-            r#"[{"text":"song result","uri":"fuo://netease/songs/1"}]"#
-        );
-        assert_eq!(
             serde_json::from_str::<Value>(&candidates.body).expect("candidate JSON"),
             json!([{
+                "trackRef": {"key": {"provider": "netease", "id": "1"}},
+                "metadata": {
+                    "title": "song result",
+                    "artists": ["测试歌手"],
+                    "durationMs": 180000
+                },
+                "eligibility": "unknown",
                 "text": "song result",
-                "uri": "fuo://netease/songs/1"
             }])
         );
 
@@ -4239,7 +4162,7 @@ workflows:
     fn status_route_includes_requester_for_the_matching_active_song() {
         let status = PlayerStatus {
             status: "playing".to_string(),
-            current_uri: "fuo://qqmusic/songs/1".to_string(),
+            current_uri: "miliastra://track/qqmusic/1".to_string(),
             name: "晴天".to_string(),
             ..PlayerStatus::default()
         };
@@ -4251,7 +4174,7 @@ workflows:
             .expect("recording state")
             .playback
             .active_request = Some(ActivePlaybackRequest {
-            confirmed_uri: "fuo://qqmusic/songs/1".to_string(),
+            track: Some(test_track("miliastra://track/qqmusic/1", "晴天 - 周杰伦")),
             requester: "Alice".to_string(),
             ..ActivePlaybackRequest::default()
         });
@@ -4285,8 +4208,14 @@ workflows:
             serde_json::from_str::<Value>(&search_candidates_route(&query, &state).unwrap())
                 .unwrap(),
             json!([{
+                "trackRef": {"key": {"provider": "netease", "id": "1"}},
+                "metadata": {
+                    "title": "晴天 result",
+                    "artists": ["测试歌手"],
+                    "durationMs": 180000
+                },
+                "eligibility": "unknown",
                 "text": "晴天 result",
-                "uri": "fuo://netease/songs/1"
             }])
         );
     }
@@ -4327,39 +4256,6 @@ workflows:
     }
 
     #[test]
-    fn player_play_uri_route_pushes_music_queue_item() {
-        let state = test_state();
-        let body = player_play_uri_route(
-            &[
-                ("uri".to_string(), "fuo://netease/songs/123".to_string()),
-                ("title".to_string(), "测试歌曲".to_string()),
-                ("requester".to_string(), "Alice".to_string()),
-            ],
-            &state,
-        )
-        .expect("play uri route succeeds");
-
-        let value: Value = serde_json::from_str(&body).expect("json response");
-        assert_eq!(value["ok"], true);
-        assert_eq!(value["queued"], true);
-        assert_eq!(value["size"], 1);
-        assert_eq!(value["keyword"], "测试歌曲");
-        assert_eq!(value["uri"], "fuo://netease/songs/123");
-
-        let queue = state
-            .queries
-            .playback_queue_snapshot()
-            .expect("queue snapshot");
-        let item = queue.first().expect("queued item");
-        assert_eq!(item.keyword, "测试歌曲");
-        assert_eq!(item.source, "netease");
-        assert_eq!(item.uri, "fuo://netease/songs/123");
-        assert_eq!(item.requester, "Alice");
-        assert!(item.dedup_bypass);
-        assert!(item.friend_username.is_empty());
-    }
-
-    #[test]
     fn queue_add_defaults_api_requester_when_not_provided() {
         let state = test_state();
         queue_add(
@@ -4383,19 +4279,6 @@ workflows:
         assert!(PAGE.contains("点歌人"));
         assert!(PAGE.contains("it.requester||it.friendUsername"));
         assert!(PAGE.contains("pc.requester"));
-    }
-
-    #[test]
-    fn source_from_fuo_uri_supports_known_music_sources() {
-        assert_eq!(
-            source_from_fuo_uri("fuo://qqmusic/songs/1"),
-            Some("qqmusic")
-        );
-        assert_eq!(
-            source_from_fuo_uri("fuo://netease/songs/1"),
-            Some("netease")
-        );
-        assert_eq!(source_from_fuo_uri("fuo://local/songs/1"), None);
     }
 
     #[test]

@@ -2,6 +2,7 @@ use std::fmt::{Display, Formatter};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use miliastra_playback::PlayableTrack;
 
 use crate::features::song_request::SearchCandidate;
 use crate::text::{MAX_CHAT_WIDTH, char_width, display_width};
@@ -46,7 +47,7 @@ impl AlternatePlaybackSource {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PlaybackPickedCandidate {
     pub(crate) text: String,
-    pub(crate) uri: String,
+    pub(crate) track: PlayableTrack,
     pub(crate) candidate_snapshot: Vec<SearchCandidate>,
 }
 
@@ -88,7 +89,7 @@ pub(crate) struct PlaybackSelection {
     pub(crate) source: String,
     pub(crate) prefer_accompaniment: bool,
     pub(crate) ai_original_text: String,
-    pub(crate) uri: String,
+    pub(crate) track: Option<PlayableTrack>,
     pub(crate) friend_username: String,
     pub(crate) requester: String,
     pub(crate) console_bypass_dedup: bool,
@@ -101,7 +102,7 @@ impl PlaybackSelection {
             keyword: self.keyword.clone(),
             source: self.source.clone(),
             prefer_accompaniment: self.prefer_accompaniment,
-            uri: self.uri.clone(),
+            track: self.track.clone(),
             requester: self.requester.clone(),
             navigation: PlaybackNavigation::Normal,
             candidate_snapshot: self.candidate_snapshot.clone(),
@@ -232,7 +233,7 @@ impl PlaybackResult {
             final_request: final_request.clone(),
             status: None,
             source_switched: outcome == PlaybackOutcome::Success
-                && requested.uri != final_request.uri,
+                && requested.track != final_request.track,
             failure_reason: (outcome != PlaybackOutcome::Success)
                 .then(|| format!("test outcome: {outcome:?}")),
         }
@@ -774,7 +775,7 @@ impl PlaybackApplication {
                 source: item.source.clone(),
                 prefer_accompaniment: item.prefer_accompaniment,
                 ai_original_text: item.ai_original_text.clone(),
-                uri: item.uri.clone(),
+                track: item.track.clone(),
                 friend_username: item.friend_username.clone(),
                 requester: item.requester.clone(),
                 console_bypass_dedup: item.dedup_bypass,
@@ -835,7 +836,11 @@ impl PlaybackApplication {
             log::info!(
                 "长时间同歌去重拦截: keyword={} uri={}",
                 selection.keyword,
-                selection.uri
+                selection
+                    .track
+                    .as_ref()
+                    .map(|track| track.track_ref.key.to_string())
+                    .unwrap_or_default()
             );
             return Ok(PlaybackCompletion::new(
                 PlaybackResult::dedup_limited(&requested),
@@ -843,7 +848,7 @@ impl PlaybackApplication {
                 false,
             ));
         }
-        if selection.uri.trim().is_empty() {
+        if selection.track.is_none() {
             let source = if selection.source.trim().is_empty() {
                 "qqmusic"
             } else {
@@ -876,11 +881,15 @@ impl PlaybackApplication {
                     ));
                 }
             };
-            log::info!("播放器候选: {} -> {}", picked.text, picked.uri);
+            log::info!(
+                "播放器候选: {} -> {}",
+                picked.text,
+                picked.track.track_ref.key
+            );
             let mut resolved = selection.clone();
             resolved.keyword = picked.text;
             resolved.source = source.to_string();
-            resolved.uri = picked.uri;
+            resolved.track = Some(picked.track);
             resolved.candidate_snapshot = picked.candidate_snapshot;
             return self.run_request(&requested, &resolved.request(), purpose, port);
         }
@@ -920,7 +929,7 @@ impl PlaybackApplication {
             {
                 log::info!(
                     "请求歌曲已被播放器标记为不可用，尝试备用来源: uri={}",
-                    request.uri
+                    request.uri()
                 );
                 return self.switch_source_and_play(requested, request, None, purpose, port);
             }
@@ -930,7 +939,7 @@ impl PlaybackApplication {
                 {
                     log::info!(
                         "备用来源也已确认无音源，完成项目级失败: uri={}",
-                        request.uri
+                        request.uri()
                     );
                     return Ok(PlaybackCompletion::new(
                         PlaybackResult::no_source(
@@ -1028,21 +1037,21 @@ impl PlaybackApplication {
         };
         let picked = PlaybackPickedCandidate {
             text: candidate.text.clone(),
-            uri: candidate.uri.clone(),
+            track: candidate.playable_track(),
             candidate_snapshot: request.candidate_snapshot.clone(),
         };
         log::info!(
             "AI 自动换源候选: source={} keyword={} uri={}",
             next_source.id(),
             picked.text,
-            picked.uri
+            picked.track.track_ref.key
         );
         let resolved = PlaybackSelection {
             keyword: picked.text.clone(),
             source: next_source.id().to_string(),
             prefer_accompaniment: request.prefer_accompaniment,
             ai_original_text: String::new(),
-            uri: picked.uri,
+            track: Some(picked.track),
             friend_username: String::new(),
             requester: request.requester.clone(),
             console_bypass_dedup: false,
@@ -1087,7 +1096,7 @@ fn select_snapshot_candidate(
 ) -> Option<SearchCandidate> {
     let source_candidates = candidates
         .iter()
-        .filter(|candidate| candidate_source(&candidate.uri).is_some_and(|value| value == source))
+        .filter(|candidate| candidate.track_ref.key.provider.as_str() == source)
         .filter(|candidate| {
             candidate.eligibility != crate::features::song_request::CandidateEligibility::Ineligible
         })
@@ -1109,12 +1118,6 @@ fn select_snapshot_candidate(
     SearchCandidate::select_preferred_equivalent(&comparable)
 }
 
-fn candidate_source(uri: &str) -> Option<&str> {
-    uri.strip_prefix("miliastra://track/")
-        .or_else(|| uri.strip_prefix("fuo://"))
-        .and_then(|rest| rest.split('/').next())
-}
-
 fn is_accompaniment_candidate(text: &str) -> bool {
     ["伴奏", "纯音乐", "instrumental", "karaoke", "off vocal"]
         .iter()
@@ -1123,10 +1126,9 @@ fn is_accompaniment_candidate(text: &str) -> bool {
 
 fn request_source(request: &PlaybackRequest) -> &str {
     request
-        .uri
-        .strip_prefix("miliastra://track/")
-        .or_else(|| request.uri.strip_prefix("fuo://"))
-        .and_then(|rest| rest.split('/').next())
+        .track
+        .as_ref()
+        .map(|track| track.track_ref.key.provider.as_str())
         .filter(|source| !source.trim().is_empty())
         .unwrap_or_else(|| request.source.trim())
 }
@@ -1216,6 +1218,7 @@ mod tests {
 
     use super::super::controller::PlaybackMismatch;
     use super::*;
+    use crate::features::playback::{test_candidate, test_track};
     use crate::runtime::clock::{Clock, ManualClock};
 
     struct MonitorPort {
@@ -1246,7 +1249,7 @@ mod tests {
             self.status_reads += 1;
             Ok(PlayerStatus {
                 status: "playing".to_string(),
-                current_uri: "fuo://qqmusic/songs/current".to_string(),
+                current_uri: "miliastra://track/qqmusic/current".to_string(),
                 name: "当前歌曲".to_string(),
                 duration: 180.0,
                 progress: self.waits as f64,
@@ -1368,7 +1371,7 @@ mod tests {
         }
 
         fn play_and_verify(&mut self, request: &PlaybackRequest) -> Result<PlaybackVerification> {
-            self.played_uris.push(request.uri.clone());
+            self.played_uris.push(request.uri());
             Ok(self
                 .verifications
                 .pop_front()
@@ -1382,7 +1385,7 @@ mod tests {
         fn player_status(&mut self) -> Result<PlayerStatus> {
             Ok(PlayerStatus {
                 status: "playing".to_string(),
-                current_uri: "fuo://qqmusic/songs/current".to_string(),
+                current_uri: "miliastra://track/qqmusic/current".to_string(),
                 name: "当前歌曲".to_string(),
                 singer: String::new(),
                 album_name: String::new(),
@@ -1444,7 +1447,7 @@ mod tests {
             ));
             Ok(self.track_unavailable.then(|| PlaybackPickedCandidate {
                 text: "备用歌曲 - 歌手".to_string(),
-                uri: "miliastra://track/netease/backup".to_string(),
+                track: test_track("miliastra://track/netease/backup", "备用歌曲 - 歌手"),
                 candidate_snapshot: Vec::new(),
             }))
         }
@@ -1462,7 +1465,7 @@ mod tests {
                 return Ok(PlaybackVerification::Success {
                     status: PlayerStatus {
                         status: "playing".to_string(),
-                        current_uri: request.uri.clone(),
+                        current_uri: request.uri(),
                         ..PlayerStatus::default()
                     },
                     message: "开始播放: 备用歌曲".to_string(),
@@ -1502,7 +1505,10 @@ mod tests {
         let item = QueueItem {
             id: 7,
             keyword: "测试歌曲".to_string(),
-            uri: "fuo://qqmusic/songs/7".to_string(),
+            track: Some(test_track(
+                "miliastra://track/qqmusic/7",
+                "测试歌曲 - 测试歌手",
+            )),
             ..QueueItem::default()
         };
         let mut port = FailingPlaybackPort {
@@ -1538,8 +1544,11 @@ mod tests {
         let item = QueueItem {
             id: 17,
             keyword: "不可用候选".to_string(),
-            uri: "fuo://qqmusic/songs/17".to_string(),
-            candidate_snapshot: vec![SearchCandidate::new(
+            track: Some(test_track(
+                "miliastra://track/qqmusic/17",
+                "不可用候选 - 测试歌手",
+            )),
+            candidate_snapshot: vec![test_candidate(
                 "备用歌曲 - 歌手",
                 "miliastra://track/netease/backup",
             )],
@@ -1584,8 +1593,11 @@ mod tests {
         let item = QueueItem {
             id: 18,
             keyword: "持续不可用候选".to_string(),
-            uri: "fuo://qqmusic/songs/18".to_string(),
-            candidate_snapshot: vec![SearchCandidate::new(
+            track: Some(test_track(
+                "miliastra://track/qqmusic/18",
+                "持续不可用候选 - 测试歌手",
+            )),
+            candidate_snapshot: vec![test_candidate(
                 "备用歌曲 - 歌手",
                 "miliastra://track/netease/backup",
             )],
@@ -1627,7 +1639,10 @@ mod tests {
         let item = QueueItem {
             id: 13,
             keyword: "已成功播放".to_string(),
-            uri: "fuo://qqmusic/songs/13".to_string(),
+            track: Some(test_track(
+                "miliastra://track/qqmusic/13",
+                "已成功播放 - 测试歌手",
+            )),
             ..QueueItem::default()
         };
         let mut port = VerifyingPlaybackPort {
@@ -1635,7 +1650,7 @@ mod tests {
             verifications: VecDeque::from([PlaybackVerification::Success {
                 status: PlayerStatus {
                     status: "playing".to_string(),
-                    current_uri: "fuo://qqmusic/songs/13".to_string(),
+                    current_uri: "miliastra://track/qqmusic/13".to_string(),
                     ..PlayerStatus::default()
                 },
                 message: "开始播放: 已成功播放".to_string(),
@@ -1673,7 +1688,10 @@ mod tests {
         let item = QueueItem {
             id: 8,
             keyword: "暂停期间歌曲".to_string(),
-            uri: "fuo://qqmusic/songs/8".to_string(),
+            track: Some(test_track(
+                "miliastra://track/qqmusic/8",
+                "暂停期间歌曲 - 测试歌手",
+            )),
             ..QueueItem::default()
         };
         let mut port = VerifyingPlaybackPort {
@@ -1712,13 +1730,19 @@ mod tests {
         let first = QueueItem {
             id: 1,
             keyword: "无音源歌曲".to_string(),
-            uri: "fuo://qqmusic/songs/missing".to_string(),
+            track: Some(test_track(
+                "miliastra://track/qqmusic/missing",
+                "无音源歌曲 - 测试歌手",
+            )),
             ..QueueItem::default()
         };
         let second = QueueItem {
             id: 2,
             keyword: "可播放歌曲".to_string(),
-            uri: "fuo://qqmusic/songs/ok".to_string(),
+            track: Some(test_track(
+                "miliastra://track/qqmusic/ok",
+                "可播放歌曲 - 测试歌手",
+            )),
             ..QueueItem::default()
         };
         let mut port = VerifyingPlaybackPort {
@@ -1731,7 +1755,7 @@ mod tests {
                 PlaybackVerification::Success {
                     status: PlayerStatus {
                         status: "playing".to_string(),
-                        current_uri: "fuo://qqmusic/songs/ok".to_string(),
+                        current_uri: "miliastra://track/qqmusic/ok".to_string(),
                         name: "可播放歌曲".to_string(),
                         singer: String::new(),
                         album_name: String::new(),
@@ -1780,7 +1804,10 @@ mod tests {
             id: 9,
             keyword: "队列歌曲".to_string(),
             source: "qqmusic".to_string(),
-            uri: "fuo://qqmusic/songs/requested".to_string(),
+            track: Some(test_track(
+                "miliastra://track/qqmusic/requested",
+                "队列歌曲 - 测试歌手",
+            )),
             ..QueueItem::default()
         };
         let mut port = VerifyingPlaybackPort {
@@ -1789,7 +1816,7 @@ mod tests {
                 PlaybackMismatch {
                     status: PlayerStatus {
                         status: "playing".to_string(),
-                        current_uri: "fuo://qqmusic/songs/other".to_string(),
+                        current_uri: "miliastra://track/qqmusic/other".to_string(),
                         ..PlayerStatus::default()
                     },
                     local_reason: "播放器 URI 与请求不一致: current=other".to_string(),
@@ -1800,7 +1827,7 @@ mod tests {
             reply_error: false,
             ai_search_result: Ok(Some(PlaybackPickedCandidate {
                 text: "备用歌曲 - 备用歌手".to_string(),
-                uri: "fuo://netease/songs/backup".to_string(),
+                track: test_track("miliastra://track/netease/backup", "备用歌曲 - 备用歌手"),
                 candidate_snapshot: Vec::new(),
             })),
             ai_search_requests: Vec::new(),
@@ -1824,7 +1851,7 @@ mod tests {
 
         assert_eq!(port.removed_ids, [9]);
         assert!(port.ai_search_requests.is_empty());
-        assert_eq!(port.played_uris, ["fuo://qqmusic/songs/requested"]);
+        assert_eq!(port.played_uris, ["miliastra://track/qqmusic/requested"]);
         assert_eq!(port.replies, ["平台无对应歌曲音源"]);
     }
 
@@ -1834,7 +1861,10 @@ mod tests {
             id: 10,
             keyword: "等待重试歌曲".to_string(),
             source: "qqmusic".to_string(),
-            uri: "fuo://qqmusic/songs/requested".to_string(),
+            track: Some(test_track(
+                "miliastra://track/qqmusic/requested",
+                "等待重试歌曲 - 测试歌手",
+            )),
             ..QueueItem::default()
         };
         let mut port = VerifyingPlaybackPort {
@@ -1843,7 +1873,7 @@ mod tests {
                 PlaybackMismatch {
                     status: PlayerStatus {
                         status: "playing".to_string(),
-                        current_uri: "fuo://qqmusic/songs/other".to_string(),
+                        current_uri: "miliastra://track/qqmusic/other".to_string(),
                         ..PlayerStatus::default()
                     },
                     local_reason: "播放器 URI 与请求不一致: current=other".to_string(),
@@ -1886,14 +1916,20 @@ mod tests {
             id: 11,
             keyword: "两个平台都无音源".to_string(),
             source: "qqmusic".to_string(),
-            uri: "fuo://qqmusic/songs/missing".to_string(),
+            track: Some(test_track(
+                "miliastra://track/qqmusic/missing",
+                "两个平台都无音源 - 测试歌手",
+            )),
             ..QueueItem::default()
         };
         let second = QueueItem {
             id: 12,
             keyword: "下一首可播放".to_string(),
             source: "qqmusic".to_string(),
-            uri: "fuo://qqmusic/songs/next".to_string(),
+            track: Some(test_track(
+                "miliastra://track/qqmusic/next",
+                "下一首可播放 - 测试歌手",
+            )),
             ..QueueItem::default()
         };
         let mut port = VerifyingPlaybackPort {
@@ -1902,7 +1938,7 @@ mod tests {
                 PlaybackVerification::MismatchedCandidate(PlaybackMismatch {
                     status: PlayerStatus {
                         status: "playing".to_string(),
-                        current_uri: "fuo://qqmusic/songs/other".to_string(),
+                        current_uri: "miliastra://track/qqmusic/other".to_string(),
                         ..PlayerStatus::default()
                     },
                     local_reason: "播放器 URI 与请求不一致: current=other".to_string(),
@@ -1910,7 +1946,7 @@ mod tests {
                 PlaybackVerification::Success {
                     status: PlayerStatus {
                         status: "playing".to_string(),
-                        current_uri: "fuo://qqmusic/songs/next".to_string(),
+                        current_uri: "miliastra://track/qqmusic/next".to_string(),
                         ..PlayerStatus::default()
                     },
                     message: "开始播放: 下一首可播放".to_string(),
@@ -1943,7 +1979,10 @@ mod tests {
         assert_eq!(port.removed_ids, [11, 12]);
         assert_eq!(
             port.played_uris,
-            ["fuo://qqmusic/songs/missing", "fuo://qqmusic/songs/next"]
+            [
+                "miliastra://track/qqmusic/missing",
+                "miliastra://track/qqmusic/next"
+            ]
         );
         assert_eq!(
             port.replies,
@@ -1958,7 +1997,10 @@ mod tests {
             source: "qqmusic".to_string(),
             prefer_accompaniment: false,
             ai_original_text: String::new(),
-            uri: "fuo://qqmusic/songs/requested".to_string(),
+            track: Some(test_track(
+                "miliastra://track/qqmusic/requested",
+                "目标歌曲 - 原歌手",
+            )),
             friend_username: String::new(),
             requester: String::new(),
             console_bypass_dedup: false,
@@ -1970,7 +2012,7 @@ mod tests {
                 PlaybackMismatch {
                     status: PlayerStatus {
                         status: "playing".to_string(),
-                        current_uri: "fuo://qqmusic/songs/other".to_string(),
+                        current_uri: "miliastra://track/qqmusic/other".to_string(),
                         ..PlayerStatus::default()
                     },
                     local_reason: "播放器 URI 与请求不一致: current=other".to_string(),
@@ -1981,7 +2023,7 @@ mod tests {
             reply_error: false,
             ai_search_result: Ok(Some(PlaybackPickedCandidate {
                 text: "备用歌曲 - 备用歌手".to_string(),
-                uri: "fuo://netease/songs/ai".to_string(),
+                track: test_track("miliastra://track/netease/ai", "备用歌曲 - 备用歌手"),
                 candidate_snapshot: Vec::new(),
             })),
             ai_search_requests: Vec::new(),
@@ -2004,15 +2046,21 @@ mod tests {
             .expect("mismatched playback should be reported without source switching");
 
         assert_eq!(result.outcome(), PlaybackOutcome::ItemScopedFailure);
-        assert_eq!(result.requested().uri, "fuo://qqmusic/songs/requested");
-        assert_eq!(result.final_request().uri, "fuo://qqmusic/songs/requested");
+        assert_eq!(
+            result.requested().uri(),
+            "miliastra://track/qqmusic/requested"
+        );
+        assert_eq!(
+            result.final_request().uri(),
+            "miliastra://track/qqmusic/requested"
+        );
         assert_eq!(
             result.status().map(|status| status.current_uri.as_str()),
-            Some("fuo://qqmusic/songs/other")
+            Some("miliastra://track/qqmusic/other")
         );
         assert!(!result.source_switched());
         assert!(port.ai_search_requests.is_empty());
-        assert_eq!(port.played_uris, ["fuo://qqmusic/songs/requested"]);
+        assert_eq!(port.played_uris, ["miliastra://track/qqmusic/requested"]);
         assert_eq!(port.replies, ["平台无对应歌曲音源"]);
     }
 
@@ -2023,7 +2071,10 @@ mod tests {
             source: "qqmusic".to_string(),
             prefer_accompaniment: false,
             ai_original_text: String::new(),
-            uri: "fuo://qqmusic/songs/requested".to_string(),
+            track: Some(test_track(
+                "miliastra://track/qqmusic/requested",
+                "目标歌曲 - 原歌手",
+            )),
             friend_username: String::new(),
             requester: String::new(),
             console_bypass_dedup: false,
@@ -2035,7 +2086,7 @@ mod tests {
                 PlaybackMismatch {
                     status: PlayerStatus {
                         status: "playing".to_string(),
-                        current_uri: "fuo://qqmusic/songs/other".to_string(),
+                        current_uri: "miliastra://track/qqmusic/other".to_string(),
                         ..PlayerStatus::default()
                     },
                     local_reason: "其他匹配失败原因".to_string(),
@@ -2046,7 +2097,7 @@ mod tests {
             reply_error: false,
             ai_search_result: Ok(Some(PlaybackPickedCandidate {
                 text: "不应播放 - 不应播放".to_string(),
-                uri: "fuo://netease/songs/ai".to_string(),
+                track: test_track("miliastra://track/netease/ai", "不应播放 - 不应播放"),
                 candidate_snapshot: Vec::new(),
             })),
             ai_search_requests: Vec::new(),
@@ -2070,7 +2121,7 @@ mod tests {
 
         assert_eq!(result.outcome(), PlaybackOutcome::ItemScopedFailure);
         assert!(port.ai_search_requests.is_empty());
-        assert_eq!(port.played_uris, ["fuo://qqmusic/songs/requested"]);
+        assert_eq!(port.played_uris, ["miliastra://track/qqmusic/requested"]);
         assert_eq!(port.replies, ["平台无对应歌曲音源"]);
     }
 
@@ -2113,7 +2164,7 @@ mod tests {
         }
 
         fn play_and_verify(&mut self, request: &PlaybackRequest) -> Result<PlaybackVerification> {
-            self.played_uris.push(request.uri.clone());
+            self.played_uris.push(request.uri());
             Ok(self
                 .verifications
                 .pop_front()
@@ -2385,9 +2436,9 @@ mod tests {
             batch_delays: Vec::new(),
             queue: Vec::new(),
             status_updates: VecDeque::from([
-                playing("fuo://song/1", "第一句"),
-                playing("fuo://song/1", "第一句"),
-                playing("fuo://song/2", "新歌第一句"),
+                playing("miliastra://track/qqmusic/1", "第一句"),
+                playing("miliastra://track/qqmusic/1", "第一句"),
+                playing("miliastra://track/qqmusic/2", "新歌第一句"),
             ]),
             clock: Some(Arc::clone(&clock)),
             status: PlayerStatus::default(),
@@ -2447,13 +2498,13 @@ mod tests {
 
     #[test]
     fn previous_prefers_known_uri_over_native_navigation() {
-        let previous_uri = "fuo://qqmusic/songs/previous";
+        let previous_uri = "miliastra://track/qqmusic/previous";
         let mut port = NavigationCommandPort {
             previous_request: Some(PlaybackRequest {
                 keyword: "上一首歌曲".to_string(),
                 source: "qqmusic".to_string(),
                 prefer_accompaniment: false,
-                uri: previous_uri.to_string(),
+                track: Some(test_track(previous_uri, "上一首歌曲 - 测试歌手")),
                 requester: String::new(),
                 navigation: PlaybackNavigation::Previous,
                 candidate_snapshot: Vec::new(),

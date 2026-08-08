@@ -5,16 +5,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
+use miliastra_playback::PlayableTrack;
 use serde::{Deserialize, Deserializer, Serialize};
 
-use super::queue::{QueueItem, load_legacy_queue_state};
+use super::queue::QueueItem;
 
 /// The sole durable snapshot for a requested-playback session.
 ///
-/// The old queue and playback-state files were written independently.  That could leave a
-/// dequeued item without its matching active request after a crash.  New installations write
-/// this envelope only; the old files are read once as an import source.
-const REQUEST_STATE_SCHEMA_VERSION: u32 = 1;
+const REQUEST_STATE_SCHEMA_VERSION: u32 = 2;
 const MAX_HISTORY_ENTRIES: usize = 64;
 
 fn default_history_id() -> u64 {
@@ -114,25 +112,19 @@ pub(crate) struct RequestStateStore {
 pub(crate) type SharedRequestStateStore = Arc<Mutex<RequestStateStore>>;
 
 impl RequestStateStore {
-    pub(crate) fn load(path: PathBuf, legacy_queue_path: &Path) -> Result<SharedRequestStateStore> {
-        let primary_is_legacy =
-            path.exists() && is_legacy_playback_state_file(&path).unwrap_or(false);
+    pub(crate) fn load(path: PathBuf) -> Result<SharedRequestStateStore> {
         let snapshot = if path.exists() {
-            Self::read_current_or_recover(&path, legacy_queue_path)?
+            Self::read_current_or_recover(&path)?
         } else if backup_path(&path).exists() {
-            let snapshot = Self::read_snapshot(&backup_path(&path), legacy_queue_path)?;
+            let snapshot = Self::read_snapshot(&backup_path(&path))?;
             let text = serde_json::to_vec_pretty(&snapshot)?;
             crate::adapters::file_store::write_atomic(&path, &text, "请求状态恢复文件")?;
             log::warn!("请求状态主文件缺失，已从备份恢复: {}", path.display());
             snapshot
         } else {
-            Self::migrate_legacy(&path, legacy_queue_path)?
+            RequestStateSnapshot::default()
         };
         let store = Self { path, snapshot };
-        if primary_is_legacy {
-            store.save(&store.snapshot)?;
-            log::info!("已将旧播放状态迁移到统一请求状态: {}", store.path.display());
-        }
         Ok(Arc::new(Mutex::new(store)))
     }
 
@@ -273,24 +265,20 @@ impl RequestStateStore {
         })
     }
 
-    fn read_current_or_recover(
-        path: &Path,
-        legacy_queue_path: &Path,
-    ) -> Result<RequestStateSnapshot> {
-        match Self::read_snapshot(path, legacy_queue_path) {
+    fn read_current_or_recover(path: &Path) -> Result<RequestStateSnapshot> {
+        match Self::read_snapshot(path) {
             Ok(snapshot) => Ok(snapshot),
             Err(primary_error) => {
                 let backup = backup_path(path);
                 if !backup.exists() {
                     return Err(primary_error);
                 }
-                let snapshot =
-                    Self::read_snapshot(&backup, legacy_queue_path).with_context(|| {
-                        format!(
-                            "解析请求状态主文件失败且备份也不可恢复: {}",
-                            backup.display()
-                        )
-                    })?;
+                let snapshot = Self::read_snapshot(&backup).with_context(|| {
+                    format!(
+                        "解析请求状态主文件失败且备份也不可恢复: {}",
+                        backup.display()
+                    )
+                })?;
                 log::warn!(
                     "请求状态主文件损坏，已从备份恢复: {} ({primary_error:#})",
                     path.display()
@@ -302,48 +290,24 @@ impl RequestStateStore {
         }
     }
 
-    fn read_snapshot(path: &Path, legacy_queue_path: &Path) -> Result<RequestStateSnapshot> {
+    fn read_snapshot(path: &Path) -> Result<RequestStateSnapshot> {
         let text = fs::read_to_string(path)
             .with_context(|| format!("read request state {}", path.display()))?;
         let value: serde_json::Value = serde_json::from_str(&text)
             .with_context(|| format!("parse request state {}", path.display()))?;
-        if value.get("schemaVersion").is_none() {
-            let playback: PlaybackRuntimeState = serde_json::from_value(value)
-                .with_context(|| format!("parse legacy playback state {}", path.display()))?;
-            let (next_queue_item_id, queue) = load_legacy_queue_state(legacy_queue_path)?;
-            let snapshot = RequestStateSnapshot {
-                next_queue_item_id,
-                queue,
-                playback,
-                ..RequestStateSnapshot::default()
-            };
-            validate_snapshot(&snapshot)?;
-            return Ok(snapshot);
+        let schema_version = value
+            .get("schemaVersion")
+            .and_then(serde_json::Value::as_u64);
+        if schema_version != Some(u64::from(REQUEST_STATE_SCHEMA_VERSION)) {
+            bail!(
+                "不支持的请求状态 schemaVersion {:?}，请删除状态文件 {} 后重启",
+                schema_version,
+                path.display()
+            );
         }
         let snapshot: RequestStateSnapshot = serde_json::from_value(value)
             .with_context(|| format!("parse request state {}", path.display()))?;
         validate_snapshot(&snapshot)?;
-        Ok(snapshot)
-    }
-
-    fn migrate_legacy(path: &Path, legacy_queue_path: &Path) -> Result<RequestStateSnapshot> {
-        if !legacy_queue_path.exists() {
-            return Ok(RequestStateSnapshot::default());
-        }
-        let (next_queue_item_id, queue) = load_legacy_queue_state(legacy_queue_path)?;
-        let snapshot = RequestStateSnapshot {
-            next_queue_item_id,
-            queue,
-            ..RequestStateSnapshot::default()
-        };
-        validate_snapshot(&snapshot)?;
-        // Persist the import before exposing it so later queue and state mutations share one file.
-        let store = Self {
-            path: path.to_path_buf(),
-            snapshot: RequestStateSnapshot::default(),
-        };
-        store.save(&snapshot)?;
-        log::info!("已将旧播放队列迁移到统一请求状态: {}", path.display());
         Ok(snapshot)
     }
 
@@ -378,14 +342,6 @@ fn backup_path(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
-fn is_legacy_playback_state_file(path: &Path) -> Result<bool> {
-    let text = fs::read_to_string(path)
-        .with_context(|| format!("read request state {}", path.display()))?;
-    let value: serde_json::Value = serde_json::from_str(&text)
-        .with_context(|| format!("parse request state {}", path.display()))?;
-    Ok(value.get("schemaVersion").is_none())
-}
-
 fn validate_snapshot(snapshot: &RequestStateSnapshot) -> Result<()> {
     if snapshot.schema_version != REQUEST_STATE_SCHEMA_VERSION {
         bail!(
@@ -416,6 +372,15 @@ fn validate_snapshot(snapshot: &RequestStateSnapshot) -> Result<()> {
         .is_some_and(|max| snapshot.next_queue_item_id <= max)
     {
         bail!("请求状态 nextQueueItemId 必须大于所有 queue item id");
+    }
+    if snapshot
+        .playback
+        .active_request
+        .iter()
+        .chain(snapshot.playback.previous_requests.iter())
+        .any(|request| request.track.is_none())
+    {
+        bail!("请求状态中的播放请求必须包含结构化 track");
     }
     Ok(())
 }
@@ -494,8 +459,8 @@ pub struct ActivePlaybackRequest {
     pub keyword: String,
     pub source: String,
     pub prefer_accompaniment: bool,
-    pub requested_uri: String,
-    pub confirmed_uri: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub track: Option<PlayableTrack>,
     pub song: String,
     pub title: String,
     pub artist: String,
@@ -514,7 +479,8 @@ pub struct ActivePlaybackRequest {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct PlaybackObservation {
     pub status: String,
-    pub uri: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub track: Option<PlayableTrack>,
     pub title: String,
     pub artist: String,
     pub progress: f64,
@@ -607,13 +573,14 @@ impl PersistentPlaybackState {
     }
 }
 
-fn active_request_identity(request: Option<&ActivePlaybackRequest>) -> Option<(&str, &str, u64)> {
-    request.map(|request| {
-        (
-            request.requested_uri.as_str(),
-            request.confirmed_uri.as_str(),
-            request.started_at_ms,
-        )
+fn active_request_identity(
+    request: Option<&ActivePlaybackRequest>,
+) -> Option<(&miliastra_playback::TrackKey, u64)> {
+    request.and_then(|request| {
+        request
+            .track
+            .as_ref()
+            .map(|track| (&track.track_ref.key, request.started_at_ms))
     })
 }
 
@@ -670,13 +637,12 @@ impl PlaybackRuntimeState {
         if observation.status != "playing" && observation.status != "paused" {
             return;
         }
-        let uri = observation.uri.trim();
-        if uri.is_empty() {
+        let Some(track) = observation.track else {
             return;
-        }
+        };
         let request = ActivePlaybackRequest {
             keyword: if observation.title.trim().is_empty() {
-                observation.uri.clone()
+                track.track_ref.key.to_string()
             } else if observation.artist.trim().is_empty() {
                 observation.title.clone()
             } else {
@@ -686,10 +652,9 @@ impl PlaybackRuntimeState {
                     observation.artist.trim()
                 )
             },
-            source: source_from_uri(uri),
+            source: track.track_ref.key.provider.to_string(),
             prefer_accompaniment: false,
-            requested_uri: uri.to_string(),
-            confirmed_uri: uri.to_string(),
+            track: Some(track),
             song: format!("{}{}", observation.title, observation.artist),
             title: observation.title,
             artist: observation.artist,
@@ -743,24 +708,11 @@ impl PlaybackRuntimeState {
 }
 
 fn playback_identity(request: &ActivePlaybackRequest) -> String {
-    let uri = if request.confirmed_uri.trim().is_empty() {
-        request.requested_uri.trim()
-    } else {
-        request.confirmed_uri.trim()
-    };
-    if uri.is_empty() {
-        String::new()
-    } else {
-        format!("{}:{uri}", request.source.trim())
-    }
-}
-
-fn source_from_uri(uri: &str) -> String {
-    uri.strip_prefix("miliastra://track/")
-        .or_else(|| uri.strip_prefix("fuo://"))
-        .and_then(|rest| rest.split('/').next())
+    request
+        .track
+        .as_ref()
+        .map(|track| track.track_ref.key.to_string())
         .unwrap_or_default()
-        .to_string()
 }
 
 #[cfg(test)]
@@ -769,6 +721,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+    use crate::features::playback::test_track;
 
     #[test]
     fn playback_state_rejects_unknown_fields() {
@@ -834,7 +787,7 @@ mod tests {
         )
         .expect_err("persisted player observation must not infer missing current fields");
 
-        assert!(error.to_string().contains("uri"));
+        assert!(error.to_string().contains("title"));
     }
 
     #[test]
@@ -860,7 +813,7 @@ mod tests {
     }
 
     #[test]
-    fn unified_request_state_migrates_legacy_queue_and_playback_once() {
+    fn unified_request_state_rejects_unversioned_state_with_delete_hint() {
         let (state_path, queue_path) = temp_request_state_paths("legacy-migration");
         fs::write(
             &queue_path,
@@ -873,18 +826,11 @@ mod tests {
         )
         .unwrap();
 
-        let store = RequestStateStore::load(state_path.clone(), &queue_path).unwrap();
-        let snapshot = store.lock().unwrap().snapshot.clone();
+        let error = RequestStateStore::load(state_path.clone())
+            .expect_err("unversioned state must not be migrated");
 
-        assert_eq!(snapshot.schema_version, REQUEST_STATE_SCHEMA_VERSION);
-        assert_eq!(snapshot.next_queue_item_id, 2);
-        assert_eq!(snapshot.queue[0].keyword, "歌名");
-        assert_eq!(snapshot.playback.state, ConfirmedPlaybackState::Idle);
-        assert!(
-            fs::read_to_string(&state_path)
-                .unwrap()
-                .contains("\"schemaVersion\"")
-        );
+        assert!(error.to_string().contains("schemaVersion"));
+        assert!(error.to_string().contains("请删除状态文件"));
 
         remove_request_state_paths(state_path, queue_path);
     }
@@ -892,7 +838,7 @@ mod tests {
     #[test]
     fn queue_and_playback_updates_share_one_versioned_snapshot() {
         let (state_path, queue_path) = temp_request_state_paths("shared-snapshot");
-        let store = RequestStateStore::load(state_path.clone(), &queue_path).unwrap();
+        let store = RequestStateStore::load(state_path.clone()).unwrap();
         let mut queue =
             super::super::queue::PersistentQueue::from_request_store(store.clone(), 3).unwrap();
         let mut playback = PersistentPlaybackState::from_request_store(store).unwrap();
@@ -926,7 +872,7 @@ mod tests {
     #[test]
     fn corrupted_primary_recovers_the_last_valid_backup() {
         let (state_path, queue_path) = temp_request_state_paths("backup-recovery");
-        let store = RequestStateStore::load(state_path.clone(), &queue_path).unwrap();
+        let store = RequestStateStore::load(state_path.clone()).unwrap();
         store
             .lock()
             .unwrap()
@@ -950,7 +896,7 @@ mod tests {
             .unwrap();
         fs::write(&state_path, "{broken").unwrap();
 
-        let recovered = RequestStateStore::load(state_path.clone(), &queue_path).unwrap();
+        let recovered = RequestStateStore::load(state_path.clone()).unwrap();
         let recovered = recovered.lock().unwrap();
         assert_eq!(recovered.snapshot.control_operation_history.len(), 1);
         assert_eq!(
@@ -969,12 +915,18 @@ mod tests {
     #[test]
     fn terminal_claim_is_idempotent_and_session_reconciliation_is_durable() {
         let (state_path, queue_path) = temp_request_state_paths("terminal-session");
-        let store = RequestStateStore::load(state_path.clone(), &queue_path).unwrap();
+        let store = RequestStateStore::load(state_path.clone()).unwrap();
         store
             .lock()
             .unwrap()
             .update(|snapshot| {
-                snapshot.playback.active_request = Some(ActivePlaybackRequest::default());
+                snapshot.playback.active_request = Some(ActivePlaybackRequest {
+                    track: Some(test_track(
+                        "miliastra://track/qqmusic/session-track",
+                        "会话歌曲 - 测试歌手",
+                    )),
+                    ..ActivePlaybackRequest::default()
+                });
                 true
             })
             .unwrap();
@@ -1023,7 +975,7 @@ mod tests {
             })
             .unwrap();
 
-        let restored = RequestStateStore::load(state_path.clone(), &queue_path).unwrap();
+        let restored = RequestStateStore::load(state_path.clone()).unwrap();
         let restored = restored.lock().unwrap();
         assert!(restored.snapshot.session_binding.is_none());
         assert_eq!(restored.snapshot.handled_terminal_outcomes.len(), 1);

@@ -2264,7 +2264,7 @@ fn build_ai_request(
         .stream(false)
         .store(false)
         .max_tokens(config.max_tokens)
-        .temperature(0.0)
+        .temperature(0.0_f32)
         .build()?)
 }
 

@@ -1412,7 +1412,7 @@ fn run_observation_lane(
         };
         let sample_due = last_sample_completed_at
             .and_then(|completed_at: Instant| completed_at.checked_add(interval))
-            .or(Some(now).filter(|_| last_sample_completed_at.is_none()));
+            .or(last_sample_completed_at.is_none().then_some(now));
         if sample_due.is_some_and(|due| due <= now) {
             let (observation, read_error) = match port.read_sample() {
                 Ok(sample) => (observer.observe_sample(sample), None),

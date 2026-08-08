@@ -1,4 +1,5 @@
 use super::*;
+use miliastra_playback::TrackKey;
 use std::collections::HashMap;
 
 use crate::features::playback::{
@@ -185,7 +186,7 @@ fn run_background_lyrics(
     let poll = poll.max(Duration::from_millis(1));
     let deadline = duration.map(|duration| Instant::now() + duration);
     let mut lyric_tracker = LyricTracker::default();
-    let mut first_uri = None::<String>;
+    let mut first_key = None::<TrackKey>;
 
     while running.load(AtomicOrdering::SeqCst)
         && !stop.load(AtomicOrdering::SeqCst)
@@ -211,7 +212,7 @@ fn run_background_lyrics(
         match player.status() {
             Ok(status) => {
                 if matches!(scope, BackgroundLyricsScope::CurrentSong)
-                    && current_song_has_switched(&mut first_uri, &status)
+                    && current_song_has_switched(&mut first_key, &status)
                 {
                     log::info!("单曲后台歌词因歌曲切换结束");
                     break;
@@ -247,17 +248,20 @@ fn run_background_lyrics(
     log::info!("后台歌词监听线程已退出");
 }
 
-fn current_song_has_switched(first_uri: &mut Option<String>, status: &PlayerStatus) -> bool {
-    let uri = status.current_uri.trim();
-    if uri.is_empty() {
+fn current_song_has_switched(first_key: &mut Option<TrackKey>, status: &PlayerStatus) -> bool {
+    let Some(key) = status
+        .current_track
+        .as_ref()
+        .map(|track| &track.track_ref.key)
+    else {
         return false;
-    }
-    if let Some(first_uri) = first_uri.as_deref()
-        && first_uri != uri
+    };
+    if let Some(first_key) = first_key.as_ref()
+        && first_key != key
     {
         return true;
     }
-    first_uri.get_or_insert_with(|| uri.to_string());
+    first_key.get_or_insert_with(|| key.clone());
     false
 }
 
@@ -772,24 +776,38 @@ mod tests {
     }
 
     #[test]
-    fn current_song_scope_stops_when_the_player_uri_changes() {
-        let mut first_uri = None;
+    fn current_song_scope_stops_when_the_player_track_changes() {
+        let mut first_key = None;
         let status = |uri: &str| PlayerStatus {
+            current_track: Some(crate::features::playback::test_track(
+                uri,
+                "worker test - test artist",
+            )),
             current_uri: uri.to_string(),
             ..PlayerStatus::default()
         };
 
         assert!(!current_song_has_switched(
-            &mut first_uri,
+            &mut first_key,
             &status("miliastra://track/qqmusic/1")
         ));
-        assert_eq!(first_uri.as_deref(), Some("miliastra://track/qqmusic/1"));
+        assert_eq!(
+            first_key,
+            Some(
+                crate::features::playback::test_track(
+                    "miliastra://track/qqmusic/1",
+                    "worker test - test artist",
+                )
+                .track_ref
+                .key
+            )
+        );
         assert!(!current_song_has_switched(
-            &mut first_uri,
+            &mut first_key,
             &status("miliastra://track/qqmusic/1")
         ));
         assert!(current_song_has_switched(
-            &mut first_uri,
+            &mut first_key,
             &status("miliastra://track/qqmusic/2")
         ));
     }

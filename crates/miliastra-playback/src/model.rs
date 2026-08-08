@@ -1,15 +1,32 @@
 use std::fmt::{Display, Formatter};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::catalog::{PlaybackEligibility, ProviderId};
 use crate::domain::{ResolverLocator, Song, SongKey};
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TrackKey {
     pub provider: ProviderId,
     pub id: String,
+}
+
+impl<'de> Deserialize<'de> for TrackKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct TrackKeyWire {
+            provider: ProviderId,
+            id: String,
+        }
+
+        let wire = TrackKeyWire::deserialize(deserializer)?;
+        Self::new(wire.provider, wire.id).map_err(serde::de::Error::custom)
+    }
 }
 
 impl TrackKey {
@@ -167,5 +184,39 @@ impl Default for SearchQuery {
             providers: Vec::new(),
             limit: 10,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn track_key_deserialization_enforces_constructor_invariants() {
+        for json in [
+            r#"{"provider":"qqmusic","id":""}"#,
+            r#"{"provider":"netease","id":"   "}"#,
+            r#"{"provider":"bilibili","id":"part/one"}"#,
+            r#"{"provider":"qqmusic","id":"valid","extra":true}"#,
+        ] {
+            assert!(serde_json::from_str::<TrackKey>(json).is_err(), "{json}");
+        }
+
+        let key = serde_json::from_str::<TrackKey>(r#"{"provider":"qqmusic","id":"valid-track"}"#)
+            .expect("valid track key");
+        assert_eq!(
+            key,
+            TrackKey::new(ProviderId::QqMusic, "valid-track").unwrap()
+        );
+    }
+
+    #[test]
+    fn nested_playable_track_rejects_an_invalid_track_key() {
+        let json = r#"{
+            "trackRef":{"key":{"provider":"qqmusic","id":"bad/id"}},
+            "metadata":{"title":"test","artists":["artist"]}
+        }"#;
+
+        assert!(serde_json::from_str::<PlayableTrack>(json).is_err());
     }
 }

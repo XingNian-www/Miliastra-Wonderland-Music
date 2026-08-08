@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde::Serialize;
+use tokio::sync::oneshot;
 use tokio::time::timeout;
 use uuid::Uuid;
 
@@ -101,7 +102,7 @@ impl PlaybackCore {
                     sources: vec![request_source.clone()],
                     limit: per_source_limit,
                 };
-                timeout(request_timeout, adapter.search_candidates(&source_spec))
+                timeout(request_timeout, adapter.search(&source_spec))
                     .await
                     .map_err(|_| {
                         CatalogError::TimedOut(request_source.clone())
@@ -159,11 +160,34 @@ impl PlaybackCore {
         })
     }
 
+    #[cfg(test)]
     pub async fn play(
         &self,
         song_key: SongKey,
         resolver_locator: Option<ResolverLocator>,
         end_behavior: EndBehavior,
+    ) -> Result<StartReceipt, PlaybackCoreError> {
+        self.play_inner(song_key, resolver_locator, end_behavior, None)
+            .await
+    }
+
+    pub(crate) async fn play_cancellable(
+        &self,
+        song_key: SongKey,
+        resolver_locator: Option<ResolverLocator>,
+        end_behavior: EndBehavior,
+        cancellation: oneshot::Receiver<()>,
+    ) -> Result<StartReceipt, PlaybackCoreError> {
+        self.play_inner(song_key, resolver_locator, end_behavior, Some(cancellation))
+            .await
+    }
+
+    async fn play_inner(
+        &self,
+        song_key: SongKey,
+        resolver_locator: Option<ResolverLocator>,
+        end_behavior: EndBehavior,
+        mut cancellation: Option<oneshot::Receiver<()>>,
     ) -> Result<StartReceipt, PlaybackCoreError> {
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let session_id = Uuid::new_v4();
@@ -182,12 +206,24 @@ impl PlaybackCore {
             .catalog
             .get(&song_key.source)
             .ok_or_else(|| PlaybackCoreError::UnknownSource(song_key.source.clone()))?;
-        let stream = timeout(
-            self.source_timeout,
-            adapter.resolve(&song_key, resolver_locator.as_ref()),
-        )
-        .await
-        .map_err(|_| {
+        let resolved = {
+            let resolve = timeout(
+                self.source_timeout,
+                adapter.resolve(&song_key, resolver_locator.as_ref()),
+            );
+            tokio::pin!(resolve);
+            match cancellation.as_mut() {
+                Some(cancellation) => {
+                    tokio::select! {
+                        biased;
+                        _ = cancellation => return Err(PlaybackCoreError::Cancelled),
+                        resolved = &mut resolve => resolved,
+                    }
+                }
+                None => resolve.await,
+            }
+        };
+        let stream = resolved.map_err(|_| {
             PlaybackCoreError::Catalog(CatalogError::TimedOut(song_key.source.clone()))
         })??;
 
@@ -197,15 +233,37 @@ impl PlaybackCore {
             )));
         }
 
-        self.engine
-            .command(EngineCommand::Start {
+        let session = SessionRef {
+            session_id,
+            generation,
+        };
+        let start_result = {
+            let start = self.engine.command(EngineCommand::Start {
                 session_id,
                 generation,
                 song_key: song_key.clone(),
                 stream,
                 end_behavior,
-            })
-            .await?;
+            });
+            tokio::pin!(start);
+            match cancellation.as_mut() {
+                Some(cancellation) => {
+                    tokio::select! {
+                        biased;
+                        _ = cancellation => None,
+                        result = &mut start => Some(result),
+                    }
+                }
+                None => Some(start.await),
+            }
+        };
+        let Some(start_result) = start_result else {
+            if let Err(error) = self.engine.command(EngineCommand::Stop { session }).await {
+                tracing::debug!(%error, generation, %session_id, "cancelled playback cleanup was rejected");
+            }
+            return Err(PlaybackCoreError::Cancelled);
+        };
+        start_result?;
 
         self.spawn_stream_retry(session_id, generation, song_key, resolver_locator);
 
@@ -507,6 +565,8 @@ pub(crate) enum PlaybackCoreError {
     },
     #[error("operation failed: {0:?}")]
     Failure(Failure),
+    #[error("playback operation was cancelled")]
+    Cancelled,
     #[error(transparent)]
     Catalog(#[from] CatalogError),
     #[error(transparent)]
@@ -524,26 +584,32 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::catalog::SourceAdapter;
+    use crate::catalog::{PlaybackEligibility, ProviderSearchCandidate, SourceAdapter};
     use crate::domain::{PlaybackSnapshot, StreamSource};
 
     struct FakeSource {
-        source: &'static str,
         songs: Vec<Song>,
         fail_search: bool,
     }
 
     #[async_trait]
     impl SourceAdapter for FakeSource {
-        fn source_code(&self) -> &'static str {
-            self.source
-        }
-
-        async fn search(&self, _spec: &SearchSpec) -> Result<Vec<Song>, CatalogError> {
+        async fn search(
+            &self,
+            _spec: &SearchSpec,
+        ) -> Result<Vec<ProviderSearchCandidate>, CatalogError> {
             if self.fail_search {
                 Err(CatalogError::Transient("offline".to_owned()))
             } else {
-                Ok(self.songs.clone())
+                Ok(self
+                    .songs
+                    .iter()
+                    .cloned()
+                    .map(|song| ProviderSearchCandidate {
+                        song,
+                        eligibility: PlaybackEligibility::Unknown,
+                    })
+                    .collect())
             }
         }
 
@@ -589,7 +655,9 @@ mod tests {
         }
     }
 
-    fn core(adapters: Vec<Arc<dyn SourceAdapter>>) -> (PlaybackCore, Arc<RecordingEngine>) {
+    fn core(
+        adapters: Vec<(String, Arc<dyn SourceAdapter>)>,
+    ) -> (PlaybackCore, Arc<RecordingEngine>) {
         let (snapshot_tx, snapshot) = watch::channel(PlaybackSnapshot::default());
         let engine = Arc::new(RecordingEngine {
             commands: Mutex::new(Vec::new()),
@@ -620,16 +688,20 @@ mod tests {
     #[tokio::test]
     async fn search_keeps_successful_sources_and_reports_failed_sources() {
         let (core, _) = core(vec![
-            Arc::new(FakeSource {
-                source: "qq",
-                songs: vec![song("qq", "q1"), song("qq", "q2")],
-                fail_search: false,
-            }),
-            Arc::new(FakeSource {
-                source: "wy",
-                songs: Vec::new(),
-                fail_search: true,
-            }),
+            (
+                "qq".to_owned(),
+                Arc::new(FakeSource {
+                    songs: vec![song("qq", "q1"), song("qq", "q2")],
+                    fail_search: false,
+                }),
+            ),
+            (
+                "wy".to_owned(),
+                Arc::new(FakeSource {
+                    songs: Vec::new(),
+                    fail_search: true,
+                }),
+            ),
         ]);
 
         let response = core
@@ -648,11 +720,13 @@ mod tests {
 
     #[tokio::test]
     async fn play_resolves_media_just_in_time_and_dispatches_generation() {
-        let (core, engine) = core(vec![Arc::new(FakeSource {
-            source: "qq",
-            songs: Vec::new(),
-            fail_search: false,
-        })]);
+        let (core, engine) = core(vec![(
+            "qq".to_owned(),
+            Arc::new(FakeSource {
+                songs: Vec::new(),
+                fail_search: false,
+            }),
+        )]);
 
         let receipt = core
             .play(
@@ -679,11 +753,10 @@ mod tests {
 
     #[async_trait]
     impl SourceAdapter for RetrySource {
-        fn source_code(&self) -> &'static str {
-            "tx"
-        }
-
-        async fn search(&self, _spec: &SearchSpec) -> Result<Vec<Song>, CatalogError> {
+        async fn search(
+            &self,
+            _spec: &SearchSpec,
+        ) -> Result<Vec<ProviderSearchCandidate>, CatalogError> {
             Ok(Vec::new())
         }
 
@@ -708,7 +781,7 @@ mod tests {
             resolve_count: AtomicUsize::new(0),
             seen_locators: Mutex::new(Vec::new()),
         });
-        let (core, engine) = core(vec![source.clone()]);
+        let (core, engine) = core(vec![("tx".to_owned(), source.clone())]);
         let song_key = SongKey::new("tx", "song-1").unwrap();
         let resolver_locator = ResolverLocator::new("test-v1:persisted").unwrap();
         let receipt = core
@@ -773,11 +846,10 @@ mod tests {
 
     #[async_trait]
     impl SourceAdapter for OrderedSource {
-        fn source_code(&self) -> &'static str {
-            "tx"
-        }
-
-        async fn search(&self, _spec: &SearchSpec) -> Result<Vec<Song>, CatalogError> {
+        async fn search(
+            &self,
+            _spec: &SearchSpec,
+        ) -> Result<Vec<ProviderSearchCandidate>, CatalogError> {
             Ok(Vec::new())
         }
 
@@ -850,7 +922,7 @@ mod tests {
             snapshot,
         });
         let core = PlaybackCore::new(
-            SourceCatalog::new([source.clone() as Arc<dyn SourceAdapter>]),
+            SourceCatalog::new([("tx".to_owned(), source.clone() as Arc<dyn SourceAdapter>)]),
             engine.clone(),
             Duration::from_secs(1),
         );
@@ -897,11 +969,10 @@ mod tests {
 
     #[async_trait]
     impl SourceAdapter for NewerFailureSource {
-        fn source_code(&self) -> &'static str {
-            "tx"
-        }
-
-        async fn search(&self, _spec: &SearchSpec) -> Result<Vec<Song>, CatalogError> {
+        async fn search(
+            &self,
+            _spec: &SearchSpec,
+        ) -> Result<Vec<ProviderSearchCandidate>, CatalogError> {
             Ok(Vec::new())
         }
 
@@ -932,7 +1003,7 @@ mod tests {
             old_started: Notify::new(),
             release_old: Notify::new(),
         });
-        let (core, engine) = core(vec![source.clone()]);
+        let (core, engine) = core(vec![("tx".to_owned(), source.clone())]);
 
         let older_core = core.clone();
         let older = tokio::spawn(async move {
@@ -977,11 +1048,10 @@ mod tests {
 
     #[async_trait]
     impl SourceAdapter for DelayedRetrySource {
-        fn source_code(&self) -> &'static str {
-            "tx"
-        }
-
-        async fn search(&self, _spec: &SearchSpec) -> Result<Vec<Song>, CatalogError> {
+        async fn search(
+            &self,
+            _spec: &SearchSpec,
+        ) -> Result<Vec<ProviderSearchCandidate>, CatalogError> {
             Ok(Vec::new())
         }
 
@@ -1017,7 +1087,7 @@ mod tests {
             retry_started: Notify::new(),
             release_retry: Notify::new(),
         });
-        let (core, engine) = core(vec![source.clone()]);
+        let (core, engine) = core(vec![("tx".to_owned(), source.clone())]);
         let old_song = SongKey::new("tx", "old").unwrap();
         let old = core
             .play(old_song.clone(), None, EndBehavior::NotifyController)

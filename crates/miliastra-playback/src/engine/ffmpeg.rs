@@ -54,8 +54,7 @@ struct RuntimeControl {
 }
 
 impl FfmpegEngine {
-    /// Starts FFmpeg decoding and a CPAL output stream. FFmpeg is intentionally
-    /// linked only through this opt-in feature so libmpv remains the default path.
+    /// Starts the process-local FFmpeg decoder and CPAL output stream.
     pub async fn spawn(config: FfmpegConfig) -> Result<Self, EngineError> {
         if config.command_timeout.is_zero()
             || config.io_timeout.is_zero()
@@ -790,6 +789,7 @@ fn handle_command(
             state.publish(snapshots);
             Ok(())
         }
+        #[cfg(test)]
         EngineCommand::Seek {
             session,
             position_seconds,
@@ -2097,7 +2097,6 @@ mod tests {
         assert_eq!(state.snapshot.last_end_cause, None);
     }
 
-    #[cfg(feature = "server")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "makes a public network request and plays the complete Bilibili track"]
     async fn bilibili_public_stream_reaches_natural_end() {

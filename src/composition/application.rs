@@ -3,6 +3,7 @@ mod custom_workflow;
 mod delivery;
 mod diagnostics;
 pub(crate) mod formal_task;
+pub(crate) mod http_facade;
 mod lifecycle;
 mod listener;
 mod moderation;
@@ -87,26 +88,23 @@ use crate::runtime::business::{
     BusinessRuntimeWorker,
 };
 use crate::runtime::chat_listener::ChatListenerMode;
-use crate::runtime::clock::SystemClock;
 use crate::runtime::deadline_bridge::{BusinessRuntimeGroup, BusinessRuntimeGroupBuilder};
 use crate::runtime::decision::DecisionAction;
 use crate::runtime::deferred_chat::{
     BatchFailureOutcome, DeferredChatItem, DeferredChatMessage, DeferredChatTarget, EnqueueOutcome,
 };
-use crate::runtime::identity::BusinessOperationIdAllocator;
 use crate::runtime::monitor::{MonitorEvent, MonitorShared, OcrSnapshot};
 use crate::runtime::ocr::{
     OcrArgs, OcrBackendProbeStatus, OcrPriority, OcrRuntime, OcrRuntimeConfig, OcrRuntimeHandle,
     ProductionOcrDevice, ResolvedOcrArgs, probe_ocr_backend_support,
 };
-use crate::runtime::openai::OpenAiRuntime;
 use crate::runtime::player_io::{
     PlayerRuntime, PlayerRuntimeConfig, PlayerSearchClient, PlayerSearchClientError,
 };
 use crate::runtime::scheduler::FormalTaskEnqueueOutcome;
 use crate::runtime::task_engine::TaskEngineHandle;
 use crate::runtime::ui::{
-    FrameDemand, FrameDemandSubscription, FramePublication, UiRuntime, UiStateKind,
+    FrameDemand, FrameDemandSubscription, FramePublication, UiCoordinator, UiRuntime, UiStateKind,
     UiStateObservation,
 };
 use crate::ui::atoms::GameUi;
@@ -131,6 +129,9 @@ use crate::ui::template::{best_template_hit, find_template_hits};
 use anyhow::{Context, Result, anyhow};
 use enigo::Key;
 use image::DynamicImage;
+use miliastra_kernel::ai::OpenAiRuntime;
+use miliastra_kernel::clock::SystemClock;
+use miliastra_kernel::identity::BusinessOperationIdAllocator;
 use miliastra_playback::{PlaybackHandle, PlaybackRuntime as NativePlaybackRuntime, TrackKey};
 
 const TARGET_MISSING_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
@@ -338,11 +339,10 @@ struct SecondaryBubbleProcessOutcome {
     confirmation_pending: bool,
 }
 
-pub(crate) struct ApplicationRuntime {
-    config: AppConfig,
+struct UiBundle {
+    coordinator: UiCoordinator,
     ocr_args: ResolvedOcrArgs,
     chat_templates: ResolvedTemplateArgs,
-    http_server: Option<http::HttpServer>,
     hotkeys: Option<hotkeys::HotkeyRuntime>,
     game_ui: GameUi,
     residency_ui: ResidencyUi,
@@ -354,13 +354,16 @@ pub(crate) struct ApplicationRuntime {
     invite_ui: InviteUi,
     custom_action_ui: CustomActionUi,
     ui_runtime: Option<UiRuntime>,
-    business: BusinessRuntimeHandle,
-    task_engine: TaskEngineHandle,
-    business_events: BusinessRuntimeEventSink,
-    business_runtime: Option<BusinessRuntimeGroup>,
-    formal_task_runtime: Option<FormalTaskRuntime>,
-    formal_tasks: Option<FormalTaskClient>,
-    background_commands: workers::BackgroundCommandManager,
+    chat_output: ChatOutput,
+    ocr: OcrRuntimeHandle,
+    ocr_runtime: Option<OcrRuntime>,
+    latest_frame: Arc<Mutex<LatestFrameCache>>,
+    window_detection_signal: WindowDetectionSignal,
+    chat_baseline_primed: Arc<AtomicBool>,
+    chat_observations: ChatObservationShared,
+}
+
+struct PlaybackBundle {
     player: PlayerController<PlayerRuntimeBackend, BusinessPlaybackStateAdapter>,
     playback_application: PlaybackApplication,
     player_search: PlayerSearchClient,
@@ -368,15 +371,18 @@ pub(crate) struct ApplicationRuntime {
     native_playback: PlaybackHandle,
     login_helper: LoginHelperManager,
     native_playback_runtime: Option<NativePlaybackRuntime>,
-    openai_runtime: Option<OpenAiRuntime>,
+}
+
+struct BusinessBundle {
+    business: BusinessRuntimeHandle,
+    task_engine: TaskEngineHandle,
+    business_events: BusinessRuntimeEventSink,
+    business_runtime: Option<BusinessRuntimeGroup>,
+    formal_task_runtime: Option<FormalTaskRuntime>,
+    formal_tasks: Option<FormalTaskClient>,
+    background_commands: workers::BackgroundCommandManager,
     ai: AiClient,
     song_requests: SongRequestApplication,
-    chat_output: ChatOutput,
-    ocr: OcrRuntimeHandle,
-    ocr_runtime: Option<OcrRuntime>,
-    latest_frame: Arc<Mutex<LatestFrameCache>>,
-    window_detection_signal: WindowDetectionSignal,
-    chat_baseline_primed: Arc<AtomicBool>,
     card_games: CardGameApplication,
     administration_application: AdministrationApplication,
     hall_application: HallApplication,
@@ -387,11 +393,174 @@ pub(crate) struct ApplicationRuntime {
     moderation_workers: Arc<Mutex<Vec<thread::JoinHandle<()>>>>,
     startup: StartupService,
     custom_workflow: CustomWorkflowService,
+}
+
+struct LifecycleBundle {
+    config: AppConfig,
+    http_server: Option<http::HttpServer>,
+    openai_runtime: Option<OpenAiRuntime>,
     running: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     console_reply_context: Arc<AtomicBool>,
-    chat_observations: ChatObservationShared,
     monitor: MonitorShared,
+}
+
+pub(crate) struct ApplicationRuntime {
+    ui: UiBundle,
+    playback: PlaybackBundle,
+    business: BusinessBundle,
+    lifecycle: LifecycleBundle,
+}
+
+/// 正式任务执行所需的窄上下文。
+///
+/// 这里只保留 `PendingTask` 各变体及其下游命令实际使用的可克隆端口和服务；
+/// 各运行时所有权、HTTP 服务、热键等生命周期资源仍只属于 `ApplicationRuntime`。
+pub(crate) struct FormalTaskExecutionContext {
+    coordinator: UiCoordinator,
+    ui: FormalTaskUiContext,
+    playback: FormalTaskPlaybackContext,
+    business: FormalTaskBusinessContext,
+    lifecycle: FormalTaskLifecycleContext,
+}
+
+struct FormalTaskUiContext {
+    ocr_args: ResolvedOcrArgs,
+    chat_templates: ResolvedTemplateArgs,
+    game_ui: GameUi,
+    residency_ui: ResidencyUi,
+    hall_ui: HallUi,
+    moderation_ui: ModerationUi,
+    startup_ui: StartupUi,
+    secondary_unread_ui: SecondaryUnreadUi,
+    friend_delivery_ui: FriendDeliveryUi,
+    invite_ui: InviteUi,
+    custom_action_ui: CustomActionUi,
+    chat_output: ChatOutput,
+    ocr: OcrRuntimeHandle,
+    latest_frame: Arc<Mutex<LatestFrameCache>>,
+    window_detection_signal: WindowDetectionSignal,
+    chat_baseline_primed: Arc<AtomicBool>,
+    chat_observations: ChatObservationShared,
+}
+
+struct FormalTaskPlaybackContext {
+    player: PlayerController<PlayerRuntimeBackend, BusinessPlaybackStateAdapter>,
+    playback_application: PlaybackApplication,
+    player_search: PlayerSearchClient,
+    native_playback: PlaybackHandle,
+    login_helper: LoginHelperManager,
+}
+
+struct FormalTaskBusinessContext {
+    business: BusinessRuntimeHandle,
+    task_engine: TaskEngineHandle,
+    business_events: BusinessRuntimeEventSink,
+    formal_tasks: FormalTaskClient,
+    background_commands: workers::BackgroundCommandManager,
+    ai: AiClient,
+    song_requests: SongRequestApplication,
+    card_games: CardGameApplication,
+    administration_application: AdministrationApplication,
+    hall_application: HallApplication,
+    idiom_chain_application: IdiomChainApplication,
+    turtle_soup_application: TurtleSoupApplication,
+    undercover_game: UndercoverApplication,
+    moderation: ModerationService,
+    moderation_workers: Arc<Mutex<Vec<thread::JoinHandle<()>>>>,
+    startup: StartupService,
+    custom_workflow: CustomWorkflowService,
+}
+
+struct FormalTaskLifecycleContext {
+    config: AppConfig,
+    running: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
+    console_reply_context: Arc<AtomicBool>,
+    monitor: MonitorShared,
+}
+
+struct FormalTaskExecutionFacade {
+    application: ApplicationRuntime,
+}
+
+impl FormalTaskExecutionContext {
+    fn facade(&self) -> FormalTaskExecutionFacade {
+        FormalTaskExecutionFacade {
+            application: ApplicationRuntime {
+                ui: UiBundle {
+                    coordinator: self.coordinator.clone(),
+                    ocr_args: self.ui.ocr_args.clone(),
+                    chat_templates: self.ui.chat_templates.clone(),
+                    hotkeys: None,
+                    game_ui: self.ui.game_ui.clone(),
+                    residency_ui: self.ui.residency_ui.clone(),
+                    hall_ui: self.ui.hall_ui.clone(),
+                    moderation_ui: self.ui.moderation_ui.clone(),
+                    startup_ui: self.ui.startup_ui.clone(),
+                    secondary_unread_ui: self.ui.secondary_unread_ui.clone(),
+                    friend_delivery_ui: self.ui.friend_delivery_ui.clone(),
+                    invite_ui: self.ui.invite_ui.clone(),
+                    custom_action_ui: self.ui.custom_action_ui.clone(),
+                    ui_runtime: None,
+                    chat_output: self.ui.chat_output.clone(),
+                    ocr: self.ui.ocr.clone(),
+                    ocr_runtime: None,
+                    latest_frame: self.ui.latest_frame.clone(),
+                    window_detection_signal: self.ui.window_detection_signal.clone(),
+                    chat_baseline_primed: self.ui.chat_baseline_primed.clone(),
+                    chat_observations: self.ui.chat_observations.clone(),
+                },
+                playback: PlaybackBundle {
+                    player: self.playback.player.clone(),
+                    playback_application: self.playback.playback_application.clone(),
+                    player_search: self.playback.player_search.clone(),
+                    player_runtime: None,
+                    native_playback: self.playback.native_playback.clone(),
+                    login_helper: self.playback.login_helper.clone(),
+                    native_playback_runtime: None,
+                },
+                business: BusinessBundle {
+                    business: self.business.business.clone(),
+                    task_engine: self.business.task_engine.clone(),
+                    business_events: self.business.business_events.clone(),
+                    business_runtime: None,
+                    formal_task_runtime: None,
+                    formal_tasks: Some(self.business.formal_tasks.clone()),
+                    background_commands: self.business.background_commands.clone(),
+                    ai: self.business.ai.clone(),
+                    song_requests: self.business.song_requests.clone(),
+                    card_games: self.business.card_games.clone(),
+                    administration_application: self.business.administration_application,
+                    hall_application: self.business.hall_application,
+                    idiom_chain_application: self.business.idiom_chain_application,
+                    turtle_soup_application: self.business.turtle_soup_application,
+                    undercover_game: self.business.undercover_game.clone(),
+                    moderation: self.business.moderation.clone(),
+                    moderation_workers: self.business.moderation_workers.clone(),
+                    startup: self.business.startup,
+                    custom_workflow: self.business.custom_workflow.clone(),
+                },
+                lifecycle: LifecycleBundle {
+                    config: self.lifecycle.config.clone(),
+                    http_server: None,
+                    openai_runtime: None,
+                    running: self.lifecycle.running.clone(),
+                    paused: self.lifecycle.paused.clone(),
+                    console_reply_context: self.lifecycle.console_reply_context.clone(),
+                    monitor: self.lifecycle.monitor.clone(),
+                },
+            },
+        }
+    }
+
+    fn execute_pending_task(&self, task: PendingTask) -> Result<PendingTaskExecution> {
+        self.facade().application.execute_pending_task(task)
+    }
+
+    fn execute_web_tool_request(&self, request: WebToolRequest) -> Result<String> {
+        self.facade().application.execute_web_tool_request(request)
+    }
 }
 
 #[derive(Clone)]
@@ -877,6 +1046,8 @@ impl ApplicationRuntime {
             ai_request_timeout,
         } = config;
         let system_clock = Arc::new(SystemClock);
+        let state_store: Arc<dyn miliastra_contracts::StateStore> =
+            Arc::new(crate::adapters::file_store::FsStateStore);
         let ocr_device = ProductionOcrDevice::new(ocr_args.clone())?;
         let native_playback_runtime =
             NativePlaybackRuntime::start(config.playback.credential_directory.clone())
@@ -894,9 +1065,11 @@ impl ApplicationRuntime {
             log::info!("已加载成语接龙词库: {} 条", idiom_chain.lexicon_len());
         }
         let landlord = CardGameService::new(config.landlord.clone());
-        let undercover = UndercoverRuntimeService::new(config.undercover.clone());
+        let undercover =
+            UndercoverRuntimeService::new(config.undercover.clone(), state_store.clone());
         let hall = HallStateService::load(
             config.state.hall_state_path.clone(),
+            state_store.clone(),
             system_clock.clone(),
             system_clock.clone(),
         )?;
@@ -906,6 +1079,7 @@ impl ApplicationRuntime {
             config.queue.max_size,
             config.song_dedup.clone(),
             system_clock.clone(),
+            state_store.clone(),
         )?;
         let moderation_policy = ModerationPolicy::new(
             Duration::from_millis(config.timing.moderation.vote_timeout_ms),
@@ -1027,6 +1201,7 @@ impl ApplicationRuntime {
             turtle_soup_openai,
             system_clock.clone(),
             system_clock.clone(),
+            state_store,
         );
         let business_timer = business_runtime_builder.handle();
         let business_runtime = business_runtime_builder.build_with(|| {
@@ -1076,59 +1251,68 @@ impl ApplicationRuntime {
             IdiomChainApplication::new(config.timing.command.help_batch_ms);
         let moderation = ModerationService::new(moderation_policy, Arc::new(business.clone()));
         Ok(Self {
-            config,
-            ocr_args,
-            chat_templates,
-            http_server: None,
-            hotkeys: None,
-            game_ui,
-            residency_ui,
-            hall_ui,
-            moderation_ui,
-            startup_ui,
-            secondary_unread_ui,
-            friend_delivery_ui,
-            invite_ui,
-            custom_action_ui,
-            ui_runtime: Some(ui_runtime),
-            business,
-            task_engine,
-            business_events,
-            business_runtime: Some(business_runtime),
-            formal_task_runtime: None,
-            formal_tasks: None,
-            background_commands: workers::BackgroundCommandManager::new(),
-            player,
-            playback_application,
-            player_search,
-            player_runtime: Some(player_runtime),
-            native_playback,
-            login_helper,
-            native_playback_runtime: Some(native_playback_runtime),
-            openai_runtime: Some(openai_runtime),
-            ai,
-            song_requests,
-            chat_output,
-            ocr,
-            ocr_runtime: Some(ocr_runtime),
-            latest_frame: Arc::new(Mutex::new(LatestFrameCache::default())),
-            window_detection_signal: WindowDetectionSignal::new(),
-            chat_baseline_primed: Arc::new(AtomicBool::new(false)),
-            card_games,
-            administration_application,
-            hall_application: HallApplication,
-            idiom_chain_application,
-            turtle_soup_application: TurtleSoupApplication,
-            undercover_game,
-            moderation,
-            moderation_workers: Arc::new(Mutex::new(Vec::new())),
-            startup: StartupService::new(),
-            custom_workflow,
-            running,
-            paused: Arc::new(AtomicBool::new(false)),
-            console_reply_context: Arc::new(AtomicBool::new(false)),
-            chat_observations,
-            monitor,
+            ui: UiBundle {
+                coordinator: UiCoordinator::new(),
+                ocr_args,
+                chat_templates,
+                hotkeys: None,
+                game_ui,
+                residency_ui,
+                hall_ui,
+                moderation_ui,
+                startup_ui,
+                secondary_unread_ui,
+                friend_delivery_ui,
+                invite_ui,
+                custom_action_ui,
+                ui_runtime: Some(ui_runtime),
+                chat_output,
+                ocr,
+                ocr_runtime: Some(ocr_runtime),
+                latest_frame: Arc::new(Mutex::new(LatestFrameCache::default())),
+                window_detection_signal: WindowDetectionSignal::new(),
+                chat_baseline_primed: Arc::new(AtomicBool::new(false)),
+                chat_observations,
+            },
+            playback: PlaybackBundle {
+                player,
+                playback_application,
+                player_search,
+                player_runtime: Some(player_runtime),
+                native_playback,
+                login_helper,
+                native_playback_runtime: Some(native_playback_runtime),
+            },
+            business: BusinessBundle {
+                business,
+                task_engine,
+                business_events,
+                business_runtime: Some(business_runtime),
+                formal_task_runtime: None,
+                formal_tasks: None,
+                background_commands: workers::BackgroundCommandManager::new(),
+                ai,
+                song_requests,
+                card_games,
+                administration_application,
+                hall_application: HallApplication,
+                idiom_chain_application,
+                turtle_soup_application: TurtleSoupApplication,
+                undercover_game,
+                moderation,
+                moderation_workers: Arc::new(Mutex::new(Vec::new())),
+                startup: StartupService::new(),
+                custom_workflow,
+            },
+            lifecycle: LifecycleBundle {
+                config,
+                http_server: None,
+                openai_runtime: Some(openai_runtime),
+                running,
+                paused: Arc::new(AtomicBool::new(false)),
+                console_reply_context: Arc::new(AtomicBool::new(false)),
+                monitor,
+            },
         })
     }
 }

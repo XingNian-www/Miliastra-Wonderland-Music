@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::SearchCandidate;
-use crate::runtime::openai::{Authentication, OpenAiRuntimeHandle, Target, validate_http_proxy};
+use miliastra_kernel::ai::{Authentication, OpenAiRuntimeHandle, Target, validate_http_proxy};
 
 const MIMO_ENDPOINT: &str = "https://api.xiaomimimo.com/v1/chat/completions";
 const MIMO_MODEL: &str = "mimo-v2.5";

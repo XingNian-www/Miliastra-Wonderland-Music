@@ -3,12 +3,13 @@ use super::*;
 impl ApplicationRuntime {
     pub(super) fn record_command_activity(&self, observed_at: Instant) -> Result<()> {
         self.business
+            .business
             .record_command_activity(observed_at)
             .map_err(anyhow::Error::from)
     }
 
     pub(super) fn maybe_idle_exit(&self) -> Result<()> {
-        let Some(timeout) = self.business.claim_idle_exit(Instant::now())? else {
+        let Some(timeout) = self.business.business.claim_idle_exit(Instant::now())? else {
             return Ok(());
         };
         log::info!(
@@ -16,13 +17,13 @@ impl ApplicationRuntime {
             timeout.as_secs() / 60
         );
         self.abort_entertainment_for_context_loss("闲置退出即将关闭游戏");
-        if let Err(error) = self.player.pause_for_idle_exit() {
+        if let Err(error) = self.playback.player.pause_for_idle_exit() {
             log::error!("闲置退出自动暂停播放器失败: {error:#}");
         } else {
             log::info!("闲置退出已自动暂停播放器，防止退出后自动恢复或出队");
         }
         self.update_monitor_playback_controller();
-        match self.game_ui.close_window() {
+        match self.ui.game_ui.close_window() {
             Ok(()) => self.invalidate_latest_frame(),
             Err(error) => {
                 log::error!("关闭目标窗口失败: {error:#}");
@@ -32,7 +33,10 @@ impl ApplicationRuntime {
     }
 
     pub(super) fn clear_idle_exit_timer(&self) -> Result<()> {
-        self.business.clear_idle_exit().map_err(anyhow::Error::from)
+        self.business
+            .business
+            .clear_idle_exit()
+            .map_err(anyhow::Error::from)
     }
 
     pub(super) fn execute_pending_task(
@@ -51,6 +55,7 @@ impl ApplicationRuntime {
                 .execute_console_chat_task(text, prefix)
                 .map(|_| PendingTaskExecution::Completed),
             PendingTask::Startup(task) => self
+                .business
                 .startup
                 .execute(task, self)
                 .map(|_| PendingTaskExecution::Completed),
@@ -105,7 +110,7 @@ impl ApplicationRuntime {
         );
         let _console_reply_context = if pending.routed.message_type == "控制台" {
             Some(ConsoleReplyContextGuard::new(Arc::clone(
-                &self.console_reply_context,
+                &self.lifecycle.console_reply_context,
             )))
         } else {
             None
@@ -156,8 +161,8 @@ impl ApplicationRuntime {
         final_command: &str,
     ) -> Result<()> {
         write_executed_command_fields(
-            &self.monitor,
-            &self.config.state.executed_commands_log_path,
+            &self.lifecycle.monitor,
+            &self.lifecycle.config.state.executed_commands_log_path,
             message_type,
             username,
             user_command,
@@ -166,7 +171,8 @@ impl ApplicationRuntime {
     }
 
     pub(super) fn pending_contains_command(&self, parsed: &RoutedCommand) -> Result<bool> {
-        self.task_engine
+        self.business
+            .task_engine
             .contains_formal_dedup_key(&crate::runtime::scheduler::FormalTaskDedupKey::new(
                 command::lock_key(parsed),
             ))
@@ -174,11 +180,12 @@ impl ApplicationRuntime {
     }
 
     pub(super) fn executor_is_idle(&self) -> Result<bool> {
-        Ok(self.task_engine.snapshot()?.is_idle())
+        Ok(self.business.task_engine.snapshot()?.is_idle())
     }
 
     pub(super) fn push_pending_task(&self, task: PendingTask) -> Result<()> {
         let tasks = self
+            .business
             .formal_tasks
             .clone()
             .ok_or_else(|| anyhow!("正式任务执行运行时尚未启动"))?;
@@ -192,15 +199,15 @@ impl ApplicationRuntime {
     }
 
     pub(super) fn enqueue_startup_task_if_enabled(&self) -> Result<()> {
-        if !self.config.startup.enabled {
+        if !self.lifecycle.config.startup.enabled {
             return Ok(());
         }
-        if self.config.startup.launch_game || self.config.startup.enter_game {
+        if self.lifecycle.config.startup.launch_game || self.lifecycle.config.startup.enter_game {
             self.push_pending_task(PendingTask::Startup(StartupTask::start_game(
                 StartupSource::STARTUP_CONFIG,
             )))?;
         }
-        if self.config.startup.enter_wonderland {
+        if self.lifecycle.config.startup.enter_wonderland {
             self.push_pending_task(PendingTask::Startup(StartupTask::enter_wonderland(
                 StartupSource::STARTUP_CONFIG,
             )))?;
@@ -209,7 +216,7 @@ impl ApplicationRuntime {
     }
 
     pub(super) fn active_ui_residency(&self) -> Result<UiResidency> {
-        let snapshot = self.business.chat_listener_snapshot()?;
+        let snapshot = self.business.business.chat_listener_snapshot()?;
         Ok(listener_residency(
             snapshot.mode,
             snapshot.temporary_primary,
@@ -227,6 +234,7 @@ impl ApplicationRuntime {
             UiResidency::SecondaryCurrentHall => UiResidencyTarget::SecondaryCurrentHall,
         };
         let outcome = self
+            .ui
             .residency_ui
             .submit(EstablishResidency::new(target))
             .with_context(|| format!("{context}: 提交 UI 驻留任务失败"))?

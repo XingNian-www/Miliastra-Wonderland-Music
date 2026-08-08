@@ -80,6 +80,9 @@ impl ApplicationRuntime {
         {
             log::error!("播放器运行时关闭失败: {error}");
         }
+        if let Err(error) = self.login_helper.shutdown() {
+            log::error!("登录助手关闭失败: {error}");
+        }
         if let Some(native_playback) = self.native_playback_runtime.take()
             && let Err(error) = native_playback.shutdown()
         {

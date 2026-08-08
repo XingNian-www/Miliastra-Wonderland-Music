@@ -166,6 +166,8 @@ impl ApplicationRuntime {
             self.latest_frame.clone(),
             self.player_search.clone(),
             player_runtime,
+            self.native_playback.clone(),
+            self.login_helper.clone(),
             self.ai.clone(),
         ))?;
         self.http_server = Some(server);

@@ -66,6 +66,13 @@ jobs:
           update: true
           install: mingw-w64-x86_64-binutils
 
+      - name: 解析 PE 导入表检查工具路径
+        shell: msys2 {0}
+        run: |
+          objdump_path="$(command -v objdump)"
+          test -x "$objdump_path"
+          echo "OBJDUMP=$(cygpath -w "$objdump_path")" >> "$GITHUB_ENV"
+
       - name: 缓存 OCR 模型
         uses: actions/cache@v4
         with:
@@ -162,7 +169,7 @@ jobs:
             -LoginHelper 'target/x86_64-pc-windows-msvc/release/miliastra-login-helper.exe' `
             -Mnn 'vendor/mnn/3.6.0/windows-x64/bin/MNN.dll' `
             -Destination $dist `
-            -Objdump 'C:\msys64\mingw64\bin\objdump.exe'
+            -Objdump $env:OBJDUMP
           Copy-Item 'assets' $dist -Recurse
           Copy-Item 'models' $dist -Recurse
           Copy-Item 'config.yaml' $dist

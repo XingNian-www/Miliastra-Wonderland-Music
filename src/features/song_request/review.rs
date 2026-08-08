@@ -638,7 +638,7 @@ mod tests {
             source: "qqmusic".to_string(),
             title: "晴天".to_string(),
             artist: "周杰伦".to_string(),
-            uri: "fuo://qqmusic/songs/1".to_string(),
+            uri: "miliastra://track/qqmusic/1".to_string(),
             message_type: "大厅".to_string(),
             username: "测试".to_string(),
         };

@@ -29,7 +29,7 @@ pub struct AppConfig {
     pub templates: TemplateConfig,
     pub output: OutputConfig,
     pub moderation: ModerationConfig,
-    pub playerd: PlayerdConfig,
+    pub playback: PlaybackConfig,
     pub http: HttpConfig,
     pub logging: LoggingConfig,
     pub tui: TuiConfig,
@@ -110,7 +110,7 @@ impl AppConfig {
         self.screen.validate()?;
         self.ocr.validate()?;
         self.templates.validate()?;
-        self.playerd.validate()?;
+        self.playback.validate()?;
         self.http.validate()?;
         self.logging.validate()?;
         self.tui.validate()?;
@@ -754,41 +754,22 @@ pub struct OutputConfig {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PlayerdConfig {
-    pub host: String,
-    pub port: u16,
-    pub executable: PathBuf,
-    pub working_dir: PathBuf,
-    pub token_path: PathBuf,
-    pub resolver_locator_path: PathBuf,
-    pub auto_start: bool,
-    pub startup_timeout_ms: u64,
-    pub request_timeout_ms: u64,
-    pub restart_limit: u32,
+pub struct PlaybackConfig {
+    pub credential_directory: PathBuf,
+    pub login_helper_executable: PathBuf,
+    pub login_timeout_ms: u64,
 }
 
-impl PlayerdConfig {
+impl PlaybackConfig {
     fn validate(&self) -> Result<()> {
-        if self.host.trim().is_empty() {
-            bail!("playerd.host 不能为空");
+        if self.credential_directory.as_os_str().is_empty() {
+            bail!("playback.credential_directory 不能为空");
         }
-        if self.port == 0 {
-            bail!("playerd.port 必须大于 0");
+        if self.login_helper_executable.as_os_str().is_empty() {
+            bail!("playback.login_helper_executable 不能为空");
         }
-        if self.executable.as_os_str().is_empty() {
-            bail!("playerd.executable 不能为空");
-        }
-        if self.working_dir.as_os_str().is_empty() {
-            bail!("playerd.working_dir 不能为空");
-        }
-        if self.token_path.as_os_str().is_empty() {
-            bail!("playerd.token_path 不能为空");
-        }
-        if self.resolver_locator_path.as_os_str().is_empty() {
-            bail!("playerd.resolver_locator_path 不能为空");
-        }
-        if self.startup_timeout_ms == 0 || self.request_timeout_ms == 0 {
-            bail!("playerd 启动和请求超时必须大于 0");
+        if self.login_timeout_ms == 0 {
+            bail!("playback.login_timeout_ms 必须大于 0");
         }
         Ok(())
     }
@@ -869,7 +850,6 @@ impl TuiConfig {
 pub struct StateConfig {
     pub playback_state_path: PathBuf,
     pub hall_state_path: PathBuf,
-    pub queue_path: PathBuf,
     pub executed_commands_log_path: PathBuf,
 }
 
@@ -878,7 +858,6 @@ impl StateConfig {
         for (path, field) in [
             (&self.playback_state_path, "state.playback_state_path"),
             (&self.hall_state_path, "state.hall_state_path"),
-            (&self.queue_path, "state.queue_path"),
             (
                 &self.executed_commands_log_path,
                 "state.executed_commands_log_path",
@@ -1274,11 +1253,11 @@ stale_timeout_ms: 7500
             ("templates.friend", |config| {
                 config.templates.friend = PathBuf::new();
             }),
-            ("playerd.host", |config| {
-                config.playerd.host.clear();
+            ("playback.credential_directory", |config| {
+                config.playback.credential_directory = PathBuf::new();
             }),
-            ("playerd.port", |config| {
-                config.playerd.port = 0;
+            ("playback.login_helper_executable", |config| {
+                config.playback.login_helper_executable = PathBuf::new();
             }),
             ("http.port", |config| {
                 config.http.port = 0;
@@ -1295,8 +1274,8 @@ stale_timeout_ms: 7500
             ("tui.log_lines", |config| {
                 config.tui.log_lines = 0;
             }),
-            ("state.queue_path", |config| {
-                config.state.queue_path = PathBuf::new();
+            ("playback.login_timeout_ms", |config| {
+                config.playback.login_timeout_ms = 0;
             }),
             ("hotkeys.pause_key", |config| {
                 config.hotkeys.pause_key.clear();
@@ -1442,7 +1421,7 @@ stale_timeout_ms: 7500
             "turtle_soup",
             "song_review",
             "friend_delivery",
-            "playerd",
+            "playback",
         ] {
             let mut value: serde_yaml::Value =
                 serde_yaml::from_str(bundled_config_yaml()).expect("default config value");

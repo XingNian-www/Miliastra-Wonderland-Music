@@ -7,6 +7,7 @@ use async_openai::types::responses::{
     CreateResponse, CreateResponseArgs, ResponseFormatJsonSchema, Tool, ToolChoiceOptions,
     ToolChoiceParam, WebSearchTool,
 };
+use miliastra_playback::TrackKey;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -112,7 +113,7 @@ pub(crate) struct SongReviewCandidate {
     pub source: String,
     pub title: String,
     pub artist: String,
-    pub uri: String,
+    pub track_key: TrackKey,
     pub message_type: String,
     pub username: String,
 }
@@ -223,9 +224,6 @@ impl SongReviewClient {
     }
 
     fn review_once(&self, candidate: &SongReviewCandidate) -> Result<SongReviewResult> {
-        if candidate.uri.trim().is_empty() {
-            bail!("候选歌曲审核缺少 URI");
-        }
         if self.config.provider.endpoint.trim().is_empty() {
             bail!("song_review.provider.endpoint 未配置");
         }
@@ -471,6 +469,7 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+    use crate::features::playback::test_track;
     use crate::runtime::clock::{Clock, ManualClock};
 
     fn test_openai() -> OpenAiRuntimeHandle {
@@ -492,7 +491,7 @@ mod tests {
             retry_count: 2,
             retry_delay_ms: 500,
             provider: SongReviewProviderConfig {
-                endpoint: "https://example.com/v1/responses".to_string(),
+                endpoint: String::new(),
                 api_key: "key".to_string(),
                 model: "gpt-5.6".to_string(),
                 http_proxy: String::new(),
@@ -510,7 +509,9 @@ mod tests {
             source: "qqmusic".to_string(),
             title: "测试".to_string(),
             artist: "歌手".to_string(),
-            uri: String::new(),
+            track_key: test_track("miliastra://track/qqmusic/retry-test", "测试 - 歌手")
+                .track_ref
+                .key,
             message_type: "大厅".to_string(),
             username: "测试者".to_string(),
         };
@@ -638,7 +639,9 @@ mod tests {
             source: "qqmusic".to_string(),
             title: "晴天".to_string(),
             artist: "周杰伦".to_string(),
-            uri: "miliastra://track/qqmusic/1".to_string(),
+            track_key: test_track("miliastra://track/qqmusic/1", "晴天 - 周杰伦")
+                .track_ref
+                .key,
             message_type: "大厅".to_string(),
             username: "测试".to_string(),
         };

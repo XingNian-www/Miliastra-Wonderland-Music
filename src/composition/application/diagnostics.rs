@@ -223,8 +223,8 @@ impl ApplicationRuntime {
                 }));
                 if let Some(pick) = pick {
                     lines.push(format!(
-                        "AI 选择: {} score={:.2} reason={}",
-                        pick.uri, pick.score, pick.reason
+                        "AI 选择: #{} score={:.2} reason={}",
+                        pick.index, pick.score, pick.reason
                     ));
                 }
                 Ok(lines.join("\n"))

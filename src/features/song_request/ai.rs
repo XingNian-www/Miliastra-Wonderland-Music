@@ -52,7 +52,8 @@ pub struct AiClient {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct AiCandidatePickResult {
-    pub uri: String,
+    /// One-based index into the original candidate list.
+    pub index: usize,
     pub reason: String,
     pub score: f64,
 }
@@ -171,17 +172,17 @@ impl AiClient {
 fn truncate_candidates_per_source(
     candidates: &[SearchCandidate],
     per_source: usize,
-) -> Vec<SearchCandidate> {
+) -> Vec<(usize, SearchCandidate)> {
     let mut counts: HashMap<String, usize> = HashMap::new();
     let mut result = Vec::new();
-    for candidate in candidates {
+    for (index, candidate) in candidates.iter().enumerate() {
         let source = candidate.track_ref.key.provider.to_string();
         let count = counts.entry(source).or_insert(0);
         if *count >= per_source {
             continue;
         }
         *count += 1;
-        result.push(candidate.clone());
+        result.push((index, candidate.clone()));
         if result.len() >= CANDIDATE_PICK_LIMIT {
             break;
         }
@@ -220,16 +221,19 @@ impl AiClient {
         let request = normalize_required(query_value(query, "request").unwrap_or(""), "request")?;
         let prefer_accompaniment = parse_bool(query_value(query, "preferAccompaniment"));
         let candidates = parse_query_candidates(query_value(query, "candidates").unwrap_or(""))?;
+        let indexed_candidates = truncate_candidates_per_source(&candidates, CANDIDATES_PER_SOURCE);
+        if indexed_candidates.is_empty() {
+            bail!("缺少搜索候选");
+        }
         let reply = call_ai(
             &self.openai,
             &provider,
-            &build_candidate_pick_prompt(&request, prefer_accompaniment, &candidates),
+            &build_candidate_pick_prompt(&request, prefer_accompaniment, &indexed_candidates),
             2048,
             self.request_timeout,
         )?;
         let json = model_reply_json_object(&reply)?;
-        validate_candidate_pick_json(&json, &candidates)?;
-        Ok(json)
+        candidate_pick_web_response(&json, &indexed_candidates)
     }
 }
 
@@ -403,15 +407,13 @@ fn build_match_prompt(request: &str, song_name: &str, song_singer: &str) -> Stri
 fn build_candidate_pick_prompt(
     request: &str,
     prefer_accompaniment: bool,
-    candidates: &[SearchCandidate],
+    candidates: &[(usize, SearchCandidate)],
 ) -> String {
     let candidates_json = candidates
         .iter()
-        .enumerate()
         .map(|(index, candidate)| {
             json!({
                 "index": index + 1,
-                "uri": candidate.track_ref.key.to_string(),
                 "text": candidate.text,
             })
         })
@@ -419,8 +421,8 @@ fn build_candidate_pick_prompt(
     [
         "任务：从播放器搜索候选中选出最适合用户点歌的一首。".to_string(),
         "只返回 JSON，不要解释、不要注释、不要 Markdown 代码块。".to_string(),
-        "必须输出结构：{\"uri\":string,\"score\":number,\"reason\":string}。".to_string(),
-        "uri 必须逐字等于候选列表中的一个 uri，不能编造，不能改写。".to_string(),
+        "必须输出结构：{\"index\":number,\"score\":number,\"reason\":string}。".to_string(),
+        "index 必须是候选列表中的整数索引，不能编造，不能改写。".to_string(),
         "歌名和歌手以字面匹配为主：用户输入的每个关键词应在候选标题中找到对应文字（允许大小写、空格、标点差异）。".to_string(),
         "翻译名、别名、罗马音可作为补充匹配，但优先级低于字面匹配。".to_string(),
         "不要仅凭语义相近就选择字面完全不同的歌名或歌手。".to_string(),
@@ -443,10 +445,33 @@ fn build_candidate_pick_prompt(
 fn parse_candidate_pick_result(text: &str) -> Result<AiCandidatePickResult> {
     let value: Value = serde_json::from_str(text)?;
     Ok(AiCandidatePickResult {
-        uri: json_string(&value, "uri"),
+        index: value
+            .get("index")
+            .and_then(Value::as_u64)
+            .and_then(|index| usize::try_from(index).ok())
+            .unwrap_or_default(),
         reason: json_string(&value, "reason"),
         score: value.get("score").and_then(Value::as_f64).unwrap_or(0.0),
     })
+}
+
+fn candidate_pick_web_response(
+    text: &str,
+    candidates: &[(usize, SearchCandidate)],
+) -> Result<String> {
+    validate_candidate_pick_json(text, candidates)?;
+    let pick = parse_candidate_pick_result(text)?;
+    let candidate = candidates
+        .iter()
+        .find(|(index, _)| index + 1 == pick.index)
+        .map(|(_, candidate)| candidate)
+        .ok_or_else(|| anyhow::anyhow!("AI返回JSON字段无效: index"))?;
+    Ok(json!({
+        "uri": candidate.track_ref.key.to_string(),
+        "score": pick.score,
+        "reason": pick.reason,
+    })
+    .to_string())
 }
 
 fn json_string(value: &Value, key: &str) -> String {
@@ -556,19 +581,15 @@ fn validate_recognize_json(text: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_candidate_pick_json(text: &str, candidates: &[SearchCandidate]) -> Result<()> {
+fn validate_candidate_pick_json(text: &str, candidates: &[(usize, SearchCandidate)]) -> Result<()> {
     let value: Value = serde_json::from_str(text)?;
-    let uri = value
-        .get("uri")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .unwrap_or("");
-    if uri.is_empty()
-        || !candidates
+    let index = value.get("index").and_then(Value::as_u64);
+    if !index.is_some_and(|index| {
+        candidates
             .iter()
-            .any(|candidate| candidate.track_ref.key.to_string() == uri)
-    {
-        bail!("AI返回JSON字段无效: uri");
+            .any(|(original_index, _)| (*original_index as u64) + 1 == index)
+    }) {
+        bail!("AI返回JSON字段无效: index");
     }
     if !value
         .get("score")
@@ -610,6 +631,75 @@ fn validate_match_json(text: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::features::playback::test_candidate;
+
+    #[test]
+    fn candidate_pick_protocol_uses_original_one_based_indexes_without_uris() {
+        let candidates = vec![
+            (
+                0,
+                test_candidate("first", "miliastra://track/qqmusic/first"),
+            ),
+            (
+                2,
+                test_candidate("third", "miliastra://track/netease/third"),
+            ),
+        ];
+        let prompt = build_candidate_pick_prompt("third", false, &candidates);
+
+        assert!(prompt.contains(r#""index":1"#));
+        assert!(prompt.contains(r#""index":3"#));
+        assert!(!prompt.contains("miliastra://"));
+        validate_candidate_pick_json(
+            r#"{"index":3,"score":0.9,"reason":"best match"}"#,
+            &candidates,
+        )
+        .expect("original candidate index should be accepted");
+        assert!(
+            validate_candidate_pick_json(
+                r#"{"index":2,"score":0.9,"reason":"not exposed"}"#,
+                &candidates,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn candidate_pick_result_parses_an_index_instead_of_a_track_uri() {
+        let result =
+            parse_candidate_pick_result(r#"{"index":2,"score":0.75,"reason":"title match"}"#)
+                .expect("candidate result");
+
+        assert_eq!(result.index, 2);
+        assert_eq!(result.score, 0.75);
+        assert_eq!(result.reason, "title match");
+    }
+
+    #[test]
+    fn candidate_pick_web_response_preserves_the_uri_contract() {
+        let candidates = vec![
+            (
+                0,
+                test_candidate("first", "miliastra://track/qqmusic/first"),
+            ),
+            (
+                2,
+                test_candidate("third", "miliastra://track/netease/third"),
+            ),
+        ];
+
+        let response = candidate_pick_web_response(
+            r#"{"index":3,"score":0.8,"reason":"best match"}"#,
+            &candidates,
+        )
+        .expect("web response");
+        let value: Value = serde_json::from_str(&response).expect("web response json");
+
+        assert_eq!(value["uri"], "miliastra://track/netease/third");
+        assert_eq!(value["score"], 0.8);
+        assert_eq!(value["reason"], "best match");
+        assert!(value.get("index").is_none());
+    }
 
     #[test]
     fn current_provider_names_require_an_explicit_supported_value() {

@@ -803,7 +803,7 @@ impl PlaybackService {
 
     pub(crate) fn observe_external_playback(
         &mut self,
-        identity: &str,
+        identity: &miliastra_playback::TrackKey,
         now: Instant,
         protect_after: Duration,
     ) -> ExternalPlaybackObservation {

@@ -18,7 +18,7 @@ use crate::features::playback::{
     MatchConfig, PlaybackControllerSnapshot, PlaybackStateUpdate, PlaybackTimingConfig,
     PlayerStatus, QueueConfig,
 };
-use crate::runtime::clock::{Clock, Delay, WallClock};
+use miliastra_kernel::clock::{Clock, Delay, WallClock};
 
 pub(crate) trait MusicPlayerBackend: Clone + Send + Sync + 'static {
     fn status(&self) -> Result<PlayerStatus>;
@@ -1709,7 +1709,7 @@ mod tests {
     use super::super::{PersistentPlaybackState, PersistentSongDedupHistory};
     use super::*;
     use crate::features::playback::{SongDedupConfig, test_track};
-    use crate::runtime::clock::{Clock, Delay, ManualClock, SystemClock, WallClock};
+    use miliastra_kernel::clock::{Clock, Delay, ManualClock, SystemClock, WallClock};
     use std::collections::{HashSet, VecDeque};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -2052,7 +2052,12 @@ mod tests {
     ) -> PlayerController<FakeBackend, TestPlaybackState> {
         let history_path = temp_path("dedup");
         let runtime = PersistentPlaybackState::new_for_test().unwrap();
-        let history = PersistentSongDedupHistory::load(history_path, wall_clock.clone()).unwrap();
+        let history = PersistentSongDedupHistory::load(
+            history_path,
+            wall_clock.clone(),
+            crate::test_support::test_state_store(),
+        )
+        .unwrap();
         let matching = MatchConfig::default();
         let song_dedup = SongDedupConfig {
             history_path: temp_path("dedup-config"),

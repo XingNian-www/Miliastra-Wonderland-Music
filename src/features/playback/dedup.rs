@@ -1,5 +1,4 @@
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -7,7 +6,8 @@ use miliastra_playback::TrackKey;
 use serde::{Deserialize, Serialize};
 
 use super::SongDedupConfig;
-use crate::runtime::clock::WallClock;
+use miliastra_contracts::StateStore;
+use miliastra_kernel::clock::WallClock;
 
 #[derive(Clone, Debug)]
 pub(crate) struct SongDedupCandidate {
@@ -39,12 +39,18 @@ pub(crate) struct PersistentSongDedupHistory {
     path: PathBuf,
     entries: Vec<SongDedupEntry>,
     clock: Arc<dyn WallClock>,
+    store: Arc<dyn StateStore>,
 }
 
 impl PersistentSongDedupHistory {
-    pub(crate) fn load(path: PathBuf, clock: Arc<dyn WallClock>) -> Result<Self> {
-        let entries = if path.exists() {
-            let text = fs::read_to_string(&path)
+    pub(crate) fn load(
+        path: PathBuf,
+        clock: Arc<dyn WallClock>,
+        store: Arc<dyn StateStore>,
+    ) -> Result<Self> {
+        let entries = if store.exists(&path) {
+            let text = store
+                .read_to_string(&path)
                 .with_context(|| format!("读取长时间同歌去重历史失败: {}", path.display()))?;
             parse_history_entries(&text)
                 .with_context(|| format!("解析长时间同歌去重历史失败: {}", path.display()))?
@@ -55,6 +61,7 @@ impl PersistentSongDedupHistory {
             path,
             entries,
             clock,
+            store,
         })
     }
 
@@ -111,7 +118,8 @@ impl PersistentSongDedupHistory {
             entries: entries.to_vec(),
         };
         let text = serde_json::to_string_pretty(&file)?;
-        write_atomic(&self.path, &text)
+        self.store
+            .write_atomic(&self.path, text.as_bytes(), "长时间同歌去重历史")
     }
 }
 
@@ -124,10 +132,6 @@ fn same_song(candidate: &SongDedupCandidate, entry: &SongDedupEntry) -> bool {
         && candidate.prefer_accompaniment == entry.prefer_accompaniment
 }
 
-fn write_atomic(path: &Path, text: &str) -> Result<()> {
-    crate::adapters::file_store::write_atomic(path, text.as_bytes(), "长时间同歌去重历史")
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -135,7 +139,7 @@ mod tests {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use super::*;
-    use crate::runtime::clock::{ManualClock, SystemClock};
+    use miliastra_kernel::clock::{ManualClock, SystemClock};
     use miliastra_playback::ProviderId;
 
     fn key(id: &str) -> TrackKey {
@@ -151,7 +155,11 @@ mod tests {
         let path = std::env::temp_dir().join(format!("mwm-empty-dedup-{suffix}.json"));
         fs::write(&path, "").unwrap();
 
-        let error = match PersistentSongDedupHistory::load(path.clone(), Arc::new(SystemClock)) {
+        let error = match PersistentSongDedupHistory::load(
+            path.clone(),
+            Arc::new(SystemClock),
+            crate::test_support::test_state_store(),
+        ) {
             Ok(_) => panic!("an existing history file must use the current wrapped format"),
             Err(error) => error,
         };
@@ -163,7 +171,12 @@ mod tests {
     #[test]
     fn dedup_window_uses_the_injected_wall_clock() {
         let clock = Arc::new(ManualClock::with_unix_seconds(Instant::now(), 1_000));
-        let mut history = PersistentSongDedupHistory::load(PathBuf::new(), clock.clone()).unwrap();
+        let mut history = PersistentSongDedupHistory::load(
+            PathBuf::new(),
+            clock.clone(),
+            crate::test_support::test_state_store(),
+        )
+        .unwrap();
         history.entries.push(SongDedupEntry {
             track_key: key("1"),
             title: "晴天".to_string(),
@@ -195,6 +208,7 @@ mod tests {
         let history = PersistentSongDedupHistory {
             path: PathBuf::new(),
             clock: Arc::new(SystemClock),
+            store: crate::test_support::test_state_store(),
             entries: vec![SongDedupEntry {
                 track_key: key("1"),
                 title: "晴天".to_string(),
@@ -219,6 +233,7 @@ mod tests {
         let history = PersistentSongDedupHistory {
             path: PathBuf::new(),
             clock: Arc::new(SystemClock),
+            store: crate::test_support::test_state_store(),
             entries: vec![SongDedupEntry {
                 track_key: key("1"),
                 title: "晴天".to_string(),
@@ -243,6 +258,7 @@ mod tests {
         let history = PersistentSongDedupHistory {
             path: PathBuf::new(),
             clock: Arc::new(SystemClock),
+            store: crate::test_support::test_state_store(),
             entries: vec![SongDedupEntry {
                 track_key: key("1"),
                 title: "晴天".to_string(),
@@ -275,7 +291,9 @@ mod tests {
         fs::write(&blocker, "not a directory").unwrap();
         let path = blocker.join("dedup-history.json");
         let clock = Arc::new(ManualClock::with_unix_seconds(Instant::now(), 1_000));
-        let mut history = PersistentSongDedupHistory::load(path, clock).unwrap();
+        let mut history =
+            PersistentSongDedupHistory::load(path, clock, crate::test_support::test_state_store())
+                .unwrap();
         let candidate = SongDedupCandidate {
             track_key: key("1"),
             title: "晴天".to_string(),

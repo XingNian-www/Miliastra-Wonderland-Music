@@ -272,11 +272,96 @@ impl AppConfig {
     pub fn load(path: &Path) -> Result<Self> {
         let text = fs::read_to_string(path).with_context(|| {
             format!(
-                "读取配置失败: {}。请将发布包中的 config.yaml 放在程序工作目录",
+                "读取配置失败: {}。请将发布包中的 config.yaml 放在主程序 EXE 所在目录",
                 path.display()
             )
         })?;
         serde_yaml::from_str(&text).with_context(|| format!("解析配置失败: {}", path.display()))
+    }
+
+    pub(crate) fn load_from_root(path: &Path, executable_root: &Path) -> Result<Self> {
+        let mut config = Self::load(path)?;
+        config.resolve_runtime_paths(executable_root);
+        Ok(config)
+    }
+
+    fn resolve_runtime_paths(&mut self, executable_root: &Path) {
+        resolve_optional_path(executable_root, &mut self.ocr.det_model);
+        resolve_optional_path(executable_root, &mut self.ocr.rec_model);
+        resolve_path(executable_root, &mut self.ocr.charset);
+        resolve_optional_path(executable_root, &mut self.ocr.openvino.det_model);
+        resolve_optional_path(executable_root, &mut self.ocr.openvino.det_weights);
+        resolve_optional_path(executable_root, &mut self.ocr.openvino.rec_model);
+        resolve_optional_path(executable_root, &mut self.ocr.openvino.rec_weights);
+        resolve_optional_path(executable_root, &mut self.ocr.openvino.cache_dir);
+
+        for path in [
+            &mut self.templates.blue_marker,
+            &mut self.templates.yellow_marker,
+            &mut self.templates.pink_marker,
+            &mut self.templates.friend,
+            &mut self.templates.secondary_back,
+            &mut self.templates.secondary_hall,
+            &mut self.templates.invite_view_star,
+            &mut self.templates.invite_goto_hall,
+            &mut self.templates.invite_enter_hall,
+            &mut self.templates.friend_panel,
+            &mut self.templates.friend_search_panel,
+            &mut self.templates.friend_more_settings,
+            &mut self.templates.friend_block_chat,
+            &mut self.templates.friend_blacklist,
+            &mut self.templates.friend_confirm,
+            &mut self.playback.credential_directory,
+            &mut self.playback.login_helper_executable,
+            &mut self.logging.dir,
+            &mut self.state.playback_state_path,
+            &mut self.state.hall_state_path,
+            &mut self.state.executed_commands_log_path,
+            &mut self.song_dedup.history_path,
+            &mut self.idiom_chain.lexicon_path,
+            &mut self.startup.exe_path,
+            &mut self.startup.templates.wonderland_map_star,
+            &mut self.startup.templates.wonderland_confirm,
+            &mut self.startup.templates.paimon_menu,
+            &mut self.turtle_soup.question_bank_path,
+            &mut self.turtle_soup.used_state_path,
+            &mut self.undercover.word_bank_path,
+            &mut self.undercover.used_state_path,
+        ] {
+            resolve_path(executable_root, path);
+        }
+        for path in self.custom_workflows.templates.values_mut() {
+            resolve_path(executable_root, path);
+        }
+        for workflow in &mut self.custom_workflows.workflows {
+            for step in &mut workflow.steps {
+                let Some(template) = &mut step.template else {
+                    continue;
+                };
+                if self
+                    .custom_workflows
+                    .templates
+                    .contains_key(template.as_str())
+                {
+                    continue;
+                }
+                let mut path = PathBuf::from(&*template);
+                resolve_path(executable_root, &mut path);
+                *template = path.to_string_lossy().into_owned();
+            }
+        }
+    }
+}
+
+fn resolve_path(root: &Path, path: &mut PathBuf) {
+    if !path.as_os_str().is_empty() && path.is_relative() {
+        *path = root.join(&*path);
+    }
+}
+
+fn resolve_optional_path(root: &Path, path: &mut Option<PathBuf>) {
+    if let Some(path) = path {
+        resolve_path(root, path);
     }
 }
 
@@ -1041,6 +1126,120 @@ stale_timeout_ms: 7500
             serde_yaml::from_str(bundled_config_yaml()).expect("default config");
 
         config.validate().expect("default config is valid");
+    }
+
+    #[test]
+    fn runtime_paths_resolve_against_the_executable_root_and_preserve_absolute_paths() {
+        let root = Path::new(r"C:\发布目录");
+        let mut config: AppConfig =
+            serde_yaml::from_str(bundled_config_yaml()).expect("默认配置应可解析");
+        config.ocr.openvino.det_model = Some(PathBuf::from("models/det.xml"));
+        config.ocr.openvino.det_weights = Some(PathBuf::from("models/det.bin"));
+        config.ocr.openvino.rec_model = Some(PathBuf::from("models/rec.xml"));
+        config.ocr.openvino.rec_weights = Some(PathBuf::from("models/rec.bin"));
+        config.startup.exe_path = PathBuf::from(r"D:\游戏\GenshinImpact.exe");
+        config
+            .custom_workflows
+            .templates
+            .insert("按钮".to_string(), PathBuf::from("custom/button.png"));
+        let workflow = config
+            .custom_workflows
+            .workflows
+            .first_mut()
+            .expect("默认配置应包含自定义流程");
+        workflow.steps[0].template = Some("inline/button.png".to_string());
+        workflow.steps[1].template = Some("按钮".to_string());
+
+        config.resolve_runtime_paths(root);
+
+        for path in [
+            config.ocr.det_model.as_ref().expect("检测模型"),
+            config.ocr.rec_model.as_ref().expect("识别模型"),
+            &config.ocr.charset,
+            config
+                .ocr
+                .openvino
+                .det_model
+                .as_ref()
+                .expect("OpenVINO 检测模型"),
+            config
+                .ocr
+                .openvino
+                .det_weights
+                .as_ref()
+                .expect("OpenVINO 检测权重"),
+            config
+                .ocr
+                .openvino
+                .rec_model
+                .as_ref()
+                .expect("OpenVINO 识别模型"),
+            config
+                .ocr
+                .openvino
+                .rec_weights
+                .as_ref()
+                .expect("OpenVINO 识别权重"),
+            config
+                .ocr
+                .openvino
+                .cache_dir
+                .as_ref()
+                .expect("OpenVINO 缓存"),
+            &config.templates.blue_marker,
+            &config.templates.friend_confirm,
+            &config.playback.credential_directory,
+            &config.playback.login_helper_executable,
+            &config.logging.dir,
+            &config.state.playback_state_path,
+            &config.state.hall_state_path,
+            &config.state.executed_commands_log_path,
+            &config.song_dedup.history_path,
+            &config.startup.templates.wonderland_map_star,
+            &config.startup.templates.wonderland_confirm,
+            &config.startup.templates.paimon_menu,
+            &config.turtle_soup.question_bank_path,
+            &config.turtle_soup.used_state_path,
+            &config.undercover.word_bank_path,
+            &config.undercover.used_state_path,
+            config
+                .custom_workflows
+                .templates
+                .get("按钮")
+                .expect("自定义模板"),
+        ] {
+            assert!(
+                path.is_absolute(),
+                "路径未解析为绝对路径: {}",
+                path.display()
+            );
+            assert!(
+                path.starts_with(root),
+                "路径未基于 EXE 根目录: {}",
+                path.display()
+            );
+        }
+        assert_eq!(
+            config.startup.exe_path,
+            PathBuf::from(r"D:\游戏\GenshinImpact.exe")
+        );
+        let workflow = &config.custom_workflows.workflows[0];
+        assert_eq!(
+            workflow.steps[0].template.as_deref(),
+            Some(r"C:\发布目录\inline/button.png")
+        );
+        assert_eq!(workflow.steps[1].template.as_deref(), Some("按钮"));
+    }
+
+    #[test]
+    fn empty_optional_runtime_path_stays_empty() {
+        let mut config: AppConfig =
+            serde_yaml::from_str(bundled_config_yaml()).expect("默认配置应可解析");
+        config.startup.exe_path = PathBuf::new();
+
+        config.resolve_runtime_paths(Path::new(r"C:\发布目录"));
+
+        assert!(config.startup.exe_path.as_os_str().is_empty());
     }
 
     #[test]

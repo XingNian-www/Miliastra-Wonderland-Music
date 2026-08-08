@@ -13,7 +13,7 @@ use crate::features::entertainment::{AcquireOutcome, EntertainmentKind, Entertai
 use crate::features::friend_delivery::{
     FriendBatchFailure, FriendBatchFailureKind, FriendBatchOutcome, FriendMessage,
 };
-use crate::runtime::identity::{BusinessOperationId, SessionGeneration};
+use miliastra_kernel::identity::{BusinessOperationId, SessionGeneration};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CardGameEffectKey {

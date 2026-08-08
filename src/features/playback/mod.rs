@@ -58,7 +58,6 @@ use crate::features::chat_text::{CommandSyntax, command_identity, parse_prefixed
 use crate::features::command::{
     CommandAuthority, CommandEnvelope, CommandPrefix, FeatureCommandMatch,
 };
-use crate::runtime::clock::WallClock;
 pub(crate) use controller::{
     MusicPlayerBackend, PlaybackIdentityDecision, PlaybackIdentityJudge, PlaybackNavigation,
     PlaybackOutcome, PlaybackRequest, PlaybackStatePort, PlaybackTimePorts, PlaybackVerification,
@@ -69,6 +68,7 @@ pub(crate) use format::{
     PlaybackSnapshot, estimated_player_status, format_lyrics, format_play_message, format_status,
     is_playing,
 };
+use miliastra_kernel::clock::WallClock;
 pub(crate) use queue::{PersistentQueue, QueueItem};
 pub(crate) use state::{
     ActivePlaybackRequest, ConfirmedPlaybackState, ControlOperationRecord, PauseReason,
@@ -687,12 +687,13 @@ impl PlaybackService {
         queue_max_size: usize,
         song_dedup: SongDedupConfig,
         wall_clock: Arc<dyn WallClock>,
+        store: Arc<dyn miliastra_contracts::StateStore>,
     ) -> Result<Self> {
-        let request_state = RequestStateStore::load(playback_state_path)?;
+        let request_state = RequestStateStore::load(playback_state_path, store.clone())?;
         let queue = PersistentQueue::from_request_store(request_state.clone(), queue_max_size)?;
         let playback_state = PersistentPlaybackState::from_request_store(request_state.clone())?;
         let song_dedup_history =
-            PersistentSongDedupHistory::load(song_dedup_history_path, wall_clock)?;
+            PersistentSongDedupHistory::load(song_dedup_history_path, wall_clock, store)?;
         log::info!("已加载队列: {} 首", queue.len());
         log::info!("已加载长时间同歌去重历史: {} 条", song_dedup_history.len());
         log::info!(
@@ -925,7 +926,7 @@ pub(crate) use application::{
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::clock::SystemClock;
+    use miliastra_kernel::clock::SystemClock;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1045,11 +1046,18 @@ mod tests {
             "miliastra-playback-history-unused-{}-{suffix}.json",
             std::process::id()
         ));
-        let request_store = RequestStateStore::load(state_path.clone()).unwrap();
+        let request_store =
+            RequestStateStore::load(state_path.clone(), crate::test_support::test_state_store())
+                .unwrap();
         let mut service = PlaybackService::new(
             PersistentQueue::from_request_store(request_store.clone(), 10).unwrap(),
             PersistentPlaybackState::from_request_store(request_store).unwrap(),
-            PersistentSongDedupHistory::load(history_path, Arc::new(SystemClock)).unwrap(),
+            PersistentSongDedupHistory::load(
+                history_path,
+                Arc::new(SystemClock),
+                crate::test_support::test_state_store(),
+            )
+            .unwrap(),
             SongDedupConfig::default(),
         );
 

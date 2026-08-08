@@ -1261,7 +1261,7 @@ mod tests {
     use super::super::controller::PlaybackMismatch;
     use super::*;
     use crate::features::playback::{test_candidate, test_track};
-    use crate::runtime::clock::{Clock, ManualClock};
+    use miliastra_kernel::clock::{Clock, ManualClock};
 
     struct MonitorPort {
         clock: Arc<ManualClock>,

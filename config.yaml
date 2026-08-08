@@ -405,8 +405,10 @@ song_dedup:
   history_path: data/song-dedup-history.json
 
 idiom_chain:
-  # 是否启用项目内置成语词库的接龙功能；词库位于 assets/idioms.txt，并随发布包携带
+  # 是否启用项目内置成语词库的接龙功能
   enabled: true
+  # 成语词库路径；相对路径以主程序 EXE 所在目录为基准
+  lexicon_path: assets/idioms.txt
   # 最多保留多少个最近成语用于会话历史；本局完整已用集合始终禁止重复
   history_limit: 200
   # 多久无人接词就自动结束本局；0 表示不超时，单位秒

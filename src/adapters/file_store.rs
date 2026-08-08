@@ -5,7 +5,32 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 
+use miliastra_contracts::{AtomicFileStore, StateStore};
+
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Default)]
+pub(crate) struct FsStateStore;
+
+impl AtomicFileStore for FsStateStore {
+    fn write_atomic(&self, path: &Path, bytes: &[u8], description: &str) -> Result<()> {
+        write_atomic(path, bytes, description)
+    }
+}
+
+impl StateStore for FsStateStore {
+    fn exists(&self, path: &Path) -> bool {
+        path.exists()
+    }
+
+    fn read(&self, path: &Path) -> Result<Vec<u8>> {
+        fs::read(path).with_context(|| format!("读取状态文件失败: {}", path.display()))
+    }
+
+    fn read_to_string(&self, path: &Path) -> Result<String> {
+        fs::read_to_string(path).with_context(|| format!("读取状态文件失败: {}", path.display()))
+    }
+}
 
 /// 写入同目录临时文件并以替换方式提交，避免进程中断留下半份业务文件。
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8], description: &str) -> Result<()> {

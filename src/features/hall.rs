@@ -14,8 +14,9 @@ use crate::features::chat_text::{
 use crate::features::command::{
     CommandAuthority, CommandEnvelope, CommandPrefix, FeatureCommandMatch,
 };
-use crate::runtime::clock::{Clock, WallClock};
 use crate::text::normalize_comparison_text;
+use miliastra_contracts::StateStore;
+use miliastra_kernel::clock::{Clock, WallClock};
 
 pub(crate) const HALL_EXPIRING_WARNING_MINUTES: u32 = 10;
 
@@ -37,10 +38,11 @@ pub(crate) struct HallStateService {
 impl HallStateService {
     pub(crate) fn load(
         path: PathBuf,
+        store: Arc<dyn StateStore>,
         clock: Arc<dyn Clock>,
         wall_clock: Arc<dyn WallClock>,
     ) -> Result<Self> {
-        let state = PersistentHallState::load(path)?;
+        let state = PersistentHallState::load(path, store)?;
         let mut service = Self::from_state(state, clock, wall_clock);
         if service.clear_countdown_cache()? {
             log::info!("启动时已清理上次运行的大厅倒计时缓存，等待本次大厅检测重新确认");
@@ -426,7 +428,7 @@ mod tests {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use super::*;
-    use crate::runtime::clock::ManualClock;
+    use miliastra_kernel::clock::ManualClock;
 
     struct MaintenancePort {
         idle: bool,
@@ -479,7 +481,9 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&path);
         let clock = Arc::new(ManualClock::with_unix_seconds(Instant::now(), 1_234));
-        let state = PersistentHallState::load(path.clone()).expect("load hall state");
+        let state =
+            PersistentHallState::load(path.clone(), crate::test_support::test_state_store())
+                .expect("load hall state");
         let mut service = HallStateService::new_with_time(state, clock.clone(), clock.clone());
 
         service.update_remaining_minutes(5).unwrap();
@@ -504,7 +508,8 @@ mod tests {
         fs::write(&blocker, "not a directory").unwrap();
         let path = blocker.join("hall-state.json");
         let clock = Arc::new(ManualClock::with_unix_seconds(Instant::now(), 1_234));
-        let state = PersistentHallState::load(path).expect("load hall state");
+        let state = PersistentHallState::load(path, crate::test_support::test_state_store())
+            .expect("load hall state");
         let mut service = HallStateService::new_with_time(state, clock.clone(), clock.clone());
 
         let error = service

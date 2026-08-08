@@ -1,12 +1,13 @@
 #[cfg(test)]
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
-use super::{TurtleSoupPuzzle, load_question_bank, parse_question_bank};
+use super::{TurtleSoupPuzzle, parse_question_bank};
+use miliastra_contracts::StateStore;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -36,13 +37,15 @@ pub(crate) struct TurtleSoupAppendReceipt {
 pub(crate) struct TurtleSoupBankStore {
     path: PathBuf,
     write_lock: Arc<Mutex<()>>,
+    store: Arc<dyn StateStore>,
 }
 
 impl TurtleSoupBankStore {
-    pub(crate) fn new(path: PathBuf) -> Self {
+    pub(crate) fn new(path: PathBuf, store: Arc<dyn StateStore>) -> Self {
         Self {
             path,
             write_lock: Arc::new(Mutex::new(())),
+            store,
         }
     }
 
@@ -54,8 +57,12 @@ impl TurtleSoupBankStore {
             .write_lock
             .lock()
             .map_err(|_| anyhow!("海龟汤题库写入锁已损坏"))?;
-        let mut questions = if self.path.exists() {
-            load_question_bank(&self.path)?
+        let mut questions = if self.store.exists(&self.path) {
+            let text = self
+                .store
+                .read_to_string(&self.path)
+                .with_context(|| format!("读取海龟汤题库失败: {}", self.path.display()))?;
+            parse_question_bank(&text, &self.path)?
         } else {
             Vec::new()
         };
@@ -74,7 +81,8 @@ impl TurtleSoupBankStore {
         })
         .context("序列化海龟汤题库失败")?;
         parse_question_bank(&text, &self.path).context("写入前校验海龟汤题库失败")?;
-        atomic_write(&self.path, text.as_bytes())?;
+        self.store
+            .write_atomic(&self.path, text.as_bytes(), "海龟汤题库")?;
         Ok(TurtleSoupAppendReceipt {
             id,
             position: questions.len(),
@@ -108,10 +116,6 @@ fn next_question_id(questions: &[TurtleSoupPuzzle]) -> String {
     }
 }
 
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    crate::adapters::file_store::write_atomic(path, bytes, "海龟汤题库")
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -125,7 +129,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let path = std::env::temp_dir().join(format!("mwm-turtle-bank-{suffix}.yaml"));
-        let store = TurtleSoupBankStore::new(path.clone());
+        let store = TurtleSoupBankStore::new(path.clone(), crate::test_support::test_state_store());
 
         let first = store
             .append(submission("第一题", "第一面", "第一底"))
@@ -150,7 +154,8 @@ mod tests {
                 total: 2
             }
         );
-        let questions = load_question_bank(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        let questions = parse_question_bank(&text, &path).unwrap();
         assert_eq!(
             questions
                 .iter()
@@ -164,7 +169,7 @@ mod tests {
     fn rejects_missing_required_content_without_creating_a_file() {
         let path = std::env::temp_dir().join("mwm-turtle-bank-invalid.yaml");
         let _ = fs::remove_file(&path);
-        let store = TurtleSoupBankStore::new(path.clone());
+        let store = TurtleSoupBankStore::new(path.clone(), crate::test_support::test_state_store());
         let error = store.append(submission("", "汤面", "汤底")).unwrap_err();
 
         assert!(error.to_string().contains("标题不能为空"));

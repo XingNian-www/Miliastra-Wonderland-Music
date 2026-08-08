@@ -1,12 +1,15 @@
+#[cfg(target_os = "windows")]
 mod custom_action;
 mod friend_delivery;
 mod hall;
 mod invite;
 mod moderation;
 mod secondary_unread;
+#[cfg(target_os = "windows")]
 mod startup;
 mod state_observation;
 
+#[cfg(target_os = "windows")]
 pub(crate) use custom_action::{CustomActionPlan, CustomActionUi};
 pub(crate) use friend_delivery::{
     EstablishResidency, FriendDelivery, FriendDeliveryMessageStatus, FriendDeliveryRoutineConfig,
@@ -28,6 +31,7 @@ pub(crate) use moderation::{
 pub(crate) use secondary_unread::{
     ProcessSecondaryUnread, SecondaryUnreadEffect, SecondaryUnreadRoutineConfig, SecondaryUnreadUi,
 };
+#[cfg(target_os = "windows")]
 pub(crate) use startup::{
     EnterGame, EnterGameEffect, EnterWonderland, EnterWonderlandEffect, StartupRoutineConfig,
     StartupUi, StartupUiConfig, StartupUiTemplates,

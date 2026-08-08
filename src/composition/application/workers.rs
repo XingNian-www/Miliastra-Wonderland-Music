@@ -278,34 +278,30 @@ fn sleep_background_lyrics_poll(poll: Duration, deadline: Option<Instant>) -> bo
 
 impl ApplicationRuntime {
     pub(super) fn start_formal_task_runtime(&mut self) -> Result<()> {
-        if self.formal_task_runtime.is_some() {
+        if self.business.formal_task_runtime.is_some() {
             return Ok(());
         }
         let runtime = FormalTaskRuntime::start(
-            self.business.clone(),
-            self.task_engine.clone(),
-            Arc::clone(&self.running),
-            Arc::clone(&self.paused),
-            Duration::from_millis(self.config.timing.command.post_settle_ms),
-            |client| {
-                let mut app = self.clone_for_formal_task_execution();
-                app.formal_tasks = Some(client);
-                app
-            },
+            self.business.business.clone(),
+            self.business.task_engine.clone(),
+            Arc::clone(&self.lifecycle.running),
+            Arc::clone(&self.lifecycle.paused),
+            Duration::from_millis(self.lifecycle.config.timing.command.post_settle_ms),
+            |client| self.formal_task_execution_context(client),
         )?;
-        self.formal_tasks = Some(runtime.client());
-        self.formal_task_runtime = Some(runtime);
+        self.business.formal_tasks = Some(runtime.client());
+        self.business.formal_task_runtime = Some(runtime);
         Ok(())
     }
 
     pub(super) fn start_deferred_chat_sender(&self) -> thread::JoinHandle<()> {
         let sender = DeferredChatSender {
-            retry_delay: Duration::from_millis(self.config.timing.loop_idle_ms.max(50)),
-            running: Arc::clone(&self.running),
-            paused: Arc::clone(&self.paused),
-            task_engine: self.task_engine.clone(),
-            business: self.business.clone(),
-            chat_output: self.chat_output.clone(),
+            retry_delay: Duration::from_millis(self.lifecycle.config.timing.loop_idle_ms.max(50)),
+            running: Arc::clone(&self.lifecycle.running),
+            paused: Arc::clone(&self.lifecycle.paused),
+            task_engine: self.business.task_engine.clone(),
+            business: self.business.business.clone(),
+            chat_output: self.ui.chat_output.clone(),
         };
         thread::spawn(move || {
             log::info!("延迟聊天发送线程已启动");
@@ -559,14 +555,14 @@ impl DeferredChatSender {
 impl ApplicationRuntime {
     pub(super) fn start_playback_monitor(&self) -> thread::JoinHandle<()> {
         let monitor = PlaybackMonitorWorker {
-            application: self.playback_application.clone(),
-            player: self.player.clone(),
-            business: self.business.clone(),
-            task_engine: self.task_engine.clone(),
-            formal_tasks: self.formal_tasks.clone(),
-            running: Arc::clone(&self.running),
-            paused: Arc::clone(&self.paused),
-            monitor: self.monitor.clone(),
+            application: self.playback.playback_application.clone(),
+            player: self.playback.player.clone(),
+            business: self.business.business.clone(),
+            task_engine: self.business.task_engine.clone(),
+            formal_tasks: self.business.formal_tasks.clone(),
+            running: Arc::clone(&self.lifecycle.running),
+            paused: Arc::clone(&self.lifecycle.paused),
+            monitor: self.lifecycle.monitor.clone(),
         };
         thread::spawn(move || {
             log::info!("播放监控线程已启动");
@@ -574,74 +570,78 @@ impl ApplicationRuntime {
         })
     }
 
-    // The formal executor is the only worker that may dispatch every vertical module.
-    // All long-lived background workers use the narrow contexts defined in this file.
-    fn clone_for_formal_task_execution(&self) -> Self {
-        Self {
-            config: self.config.clone(),
-            ocr_args: self.ocr_args.clone(),
-            chat_templates: self.chat_templates.clone(),
-            http_server: None,
-            hotkeys: None,
-            game_ui: self.game_ui.clone(),
-            residency_ui: self.residency_ui.clone(),
-            hall_ui: self.hall_ui.clone(),
-            moderation_ui: self.moderation_ui.clone(),
-            startup_ui: self.startup_ui.clone(),
-            secondary_unread_ui: self.secondary_unread_ui.clone(),
-            friend_delivery_ui: self.friend_delivery_ui.clone(),
-            invite_ui: self.invite_ui.clone(),
-            custom_action_ui: self.custom_action_ui.clone(),
-            ui_runtime: None,
-            business: self.business.clone(),
-            task_engine: self.task_engine.clone(),
-            business_events: self.business_events.clone(),
-            business_runtime: None,
-            formal_task_runtime: None,
-            formal_tasks: self.formal_tasks.clone(),
-            background_commands: self.background_commands.clone(),
-            player: self.player.clone(),
-            playback_application: self.playback_application.clone(),
-            player_search: self.player_search.clone(),
-            player_runtime: None,
-            native_playback: self.native_playback.clone(),
-            login_helper: self.login_helper.clone(),
-            native_playback_runtime: None,
-            openai_runtime: None,
-            ai: self.ai.clone(),
-            song_requests: self.song_requests.clone(),
-            chat_output: self.chat_output.clone(),
-            ocr: self.ocr.clone(),
-            ocr_runtime: None,
-            latest_frame: self.latest_frame.clone(),
-            window_detection_signal: self.window_detection_signal.clone(),
-            chat_baseline_primed: self.chat_baseline_primed.clone(),
-            card_games: self.card_games.clone(),
-            administration_application: self.administration_application,
-            hall_application: self.hall_application,
-            idiom_chain_application: self.idiom_chain_application,
-            turtle_soup_application: self.turtle_soup_application,
-            undercover_game: self.undercover_game.clone(),
-            moderation: self.moderation.clone(),
-            moderation_workers: self.moderation_workers.clone(),
-            startup: self.startup,
-            custom_workflow: self.custom_workflow.clone(),
-            running: self.running.clone(),
-            paused: self.paused.clone(),
-            console_reply_context: self.console_reply_context.clone(),
-            chat_observations: self.chat_observations.clone(),
-            monitor: self.monitor.clone(),
+    // 正式执行器是唯一可调度全部垂直模块的工作线程。
+    fn formal_task_execution_context(
+        &self,
+        formal_tasks: FormalTaskClient,
+    ) -> FormalTaskExecutionContext {
+        FormalTaskExecutionContext {
+            coordinator: self.ui.coordinator.clone(),
+            ui: FormalTaskUiContext {
+                ocr_args: self.ui.ocr_args.clone(),
+                chat_templates: self.ui.chat_templates.clone(),
+                game_ui: self.ui.game_ui.clone(),
+                residency_ui: self.ui.residency_ui.clone(),
+                hall_ui: self.ui.hall_ui.clone(),
+                moderation_ui: self.ui.moderation_ui.clone(),
+                startup_ui: self.ui.startup_ui.clone(),
+                secondary_unread_ui: self.ui.secondary_unread_ui.clone(),
+                friend_delivery_ui: self.ui.friend_delivery_ui.clone(),
+                invite_ui: self.ui.invite_ui.clone(),
+                custom_action_ui: self.ui.custom_action_ui.clone(),
+                chat_output: self.ui.chat_output.clone(),
+                ocr: self.ui.ocr.clone(),
+                latest_frame: self.ui.latest_frame.clone(),
+                window_detection_signal: self.ui.window_detection_signal.clone(),
+                chat_baseline_primed: self.ui.chat_baseline_primed.clone(),
+                chat_observations: self.ui.chat_observations.clone(),
+            },
+            playback: FormalTaskPlaybackContext {
+                player: self.playback.player.clone(),
+                playback_application: self.playback.playback_application.clone(),
+                player_search: self.playback.player_search.clone(),
+                native_playback: self.playback.native_playback.clone(),
+                login_helper: self.playback.login_helper.clone(),
+            },
+            business: FormalTaskBusinessContext {
+                business: self.business.business.clone(),
+                task_engine: self.business.task_engine.clone(),
+                business_events: self.business.business_events.clone(),
+                formal_tasks,
+                background_commands: self.business.background_commands.clone(),
+                ai: self.business.ai.clone(),
+                song_requests: self.business.song_requests.clone(),
+                card_games: self.business.card_games.clone(),
+                administration_application: self.business.administration_application,
+                hall_application: self.business.hall_application,
+                idiom_chain_application: self.business.idiom_chain_application,
+                turtle_soup_application: self.business.turtle_soup_application,
+                undercover_game: self.business.undercover_game.clone(),
+                moderation: self.business.moderation.clone(),
+                moderation_workers: self.business.moderation_workers.clone(),
+                startup: self.business.startup,
+                custom_workflow: self.business.custom_workflow.clone(),
+            },
+            lifecycle: FormalTaskLifecycleContext {
+                config: self.lifecycle.config.clone(),
+                running: self.lifecycle.running.clone(),
+                paused: self.lifecycle.paused.clone(),
+                console_reply_context: self.lifecycle.console_reply_context.clone(),
+                monitor: self.lifecycle.monitor.clone(),
+            },
         }
     }
 
     pub(super) fn playback_queue(&self) -> Result<Vec<QueueItem>> {
         self.business
+            .business
             .playback_queue_snapshot()
             .map_err(anyhow::Error::from)
     }
 
     pub(super) fn latest_frame(&self) -> Result<Arc<DynamicImage>> {
-        self.latest_frame
+        self.ui
+            .latest_frame
             .lock()
             .map_err(|_| anyhow!("主扫描画面缓存锁已损坏"))?
             .image()
@@ -649,7 +649,7 @@ impl ApplicationRuntime {
     }
 
     pub(super) fn invalidate_latest_frame(&self) {
-        if let Ok(mut latest_frame) = self.latest_frame.lock() {
+        if let Ok(mut latest_frame) = self.ui.latest_frame.lock() {
             latest_frame.invalidate();
         } else {
             log::error!("主扫描画面缓存锁已损坏");

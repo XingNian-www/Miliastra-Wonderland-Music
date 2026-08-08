@@ -1,9 +1,129 @@
+use anyhow::{Context, Result, anyhow, bail};
+use async_openai::config::Config;
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
+use secrecy::SecretString;
+use url::Url;
+
+const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
+const RESPONSES_PATH: &str = "/responses";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Authentication {
+    Bearer,
+    ApiKey,
+}
+
+#[derive(Clone)]
+pub struct Target {
+    config: EndpointConfig,
+}
+
+impl Target {
+    pub fn chat(endpoint: &str, api_key: &str, auth: Authentication) -> Result<Self> {
+        Self::new(endpoint, api_key, auth, CHAT_COMPLETIONS_PATH)
+    }
+
+    pub fn responses(endpoint: &str, api_key: &str) -> Result<Self> {
+        Self::new(endpoint, api_key, Authentication::Bearer, RESPONSES_PATH)
+    }
+
+    fn new(endpoint: &str, api_key: &str, auth: Authentication, path: &str) -> Result<Self> {
+        let endpoint = normalize_endpoint(endpoint, path)?;
+        let api_key = api_key.trim();
+        if api_key.is_empty() {
+            bail!("OpenAI API Key 未配置");
+        }
+        let mut headers = HeaderMap::new();
+        match auth {
+            Authentication::Bearer => {
+                headers.insert(
+                    AUTHORIZATION,
+                    HeaderValue::from_str(&format!("Bearer {api_key}"))
+                        .context("OpenAI API Key 不是有效 HTTP header")?,
+                );
+            }
+            Authentication::ApiKey => {
+                headers.insert(
+                    HeaderName::from_static("api-key"),
+                    HeaderValue::from_str(api_key)
+                        .context("OpenAI API Key 不是有效 HTTP header")?,
+                );
+            }
+        }
+        Ok(Self {
+            config: EndpointConfig {
+                endpoint,
+                api_key: SecretString::from(api_key),
+                headers,
+            },
+        })
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct EndpointConfig {
+    endpoint: String,
+    api_key: SecretString,
+    headers: HeaderMap,
+}
+
+impl Config for EndpointConfig {
+    fn headers(&self) -> HeaderMap {
+        self.headers.clone()
+    }
+
+    fn url(&self, _path: &str) -> String {
+        self.endpoint.clone()
+    }
+
+    fn query(&self) -> Vec<(&str, &str)> {
+        Vec::new()
+    }
+
+    fn api_base(&self) -> &str {
+        &self.endpoint
+    }
+
+    fn api_key(&self) -> &SecretString {
+        &self.api_key
+    }
+}
+
+impl EndpointConfig {
+    #[cfg(test)]
+    pub(crate) fn secret_key(&self) -> &SecretString {
+        &self.api_key
+    }
+}
+
+fn normalize_endpoint(endpoint: &str, expected_path: &str) -> Result<String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        bail!("OpenAI endpoint 未配置");
+    }
+    let mut url = Url::parse(endpoint).context("OpenAI endpoint 格式无效")?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        bail!("OpenAI endpoint 必须是完整的 HTTP(S) 地址");
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        bail!("OpenAI endpoint 不能包含用户名或密码");
+    }
+    if url.fragment().is_some() {
+        bail!("OpenAI endpoint 不能包含 fragment");
+    }
+    let normalized_path = url.path().trim_end_matches('/').to_string();
+    if !normalized_path.ends_with(expected_path) {
+        bail!("OpenAI endpoint 必须以 {expected_path} 结尾");
+    }
+    url.set_path(&normalized_path);
+    Ok(url.to_string())
+}
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
 use async_openai::Client;
 use async_openai::error::OpenAIError;
 use async_openai::middleware::ReqwestService;
@@ -12,20 +132,17 @@ use async_openai::types::responses::CreateResponse;
 use serde::Serialize;
 use serde_json::Value;
 use tokio::runtime::{Builder, Runtime};
-use url::Url;
-
-pub(crate) use crate::adapters::ai_http::{Authentication, Target};
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const WORKER_THREADS: usize = 2;
 
-pub(crate) struct OpenAiRuntime {
+pub struct OpenAiRuntime {
     runtime: Option<Runtime>,
     handle: OpenAiRuntimeHandle,
 }
 
 #[derive(Clone)]
-pub(crate) struct OpenAiRuntimeHandle {
+pub struct OpenAiRuntimeHandle {
     runtime: tokio::runtime::Handle,
     http: reqwest::Client,
     state: Arc<OpenAiRuntimeState>,
@@ -36,13 +153,13 @@ struct OpenAiRuntimeState {
     submit_lock: Mutex<()>,
 }
 
-pub(crate) struct OpenAiOperation {
+pub struct OpenAiOperation {
     receiver: mpsc::Receiver<Result<Value>>,
     response_name: &'static str,
 }
 
 impl OpenAiRuntime {
-    pub(crate) fn start() -> Result<Self> {
+    pub fn start() -> Result<Self> {
         let runtime = Builder::new_multi_thread()
             .worker_threads(WORKER_THREADS)
             .enable_all()
@@ -67,11 +184,11 @@ impl OpenAiRuntime {
         })
     }
 
-    pub(crate) fn handle(&self) -> OpenAiRuntimeHandle {
+    pub fn handle(&self) -> OpenAiRuntimeHandle {
         self.handle.clone()
     }
 
-    pub(crate) fn shutdown(mut self) {
+    pub fn shutdown(mut self) {
         self.stop();
     }
 
@@ -94,7 +211,7 @@ impl Drop for OpenAiRuntime {
 }
 
 impl OpenAiRuntimeHandle {
-    pub(crate) fn with_http_proxy(&self, proxy: &str) -> Result<Self> {
+    pub fn with_http_proxy(&self, proxy: &str) -> Result<Self> {
         let Some(proxy) = build_http_proxy(proxy)? else {
             return Ok(self.clone());
         };
@@ -109,7 +226,7 @@ impl OpenAiRuntimeHandle {
         })
     }
 
-    pub(crate) fn chat_completion(
+    pub fn chat_completion(
         &self,
         target: Target,
         request: CreateChatCompletionRequest,
@@ -123,7 +240,7 @@ impl OpenAiRuntimeHandle {
         )
     }
 
-    pub(crate) fn create_response(
+    pub fn create_response(
         &self,
         target: Target,
         request: CreateResponse,
@@ -207,7 +324,7 @@ impl OpenAiRuntimeHandle {
 }
 
 impl OpenAiOperation {
-    pub(crate) fn wait(self) -> Result<Value> {
+    pub fn wait(self) -> Result<Value> {
         self.receiver
             .recv()
             .with_context(|| format!("OpenAI runtime 在返回 {} 结果前停止", self.response_name))?
@@ -221,7 +338,7 @@ fn validate_timeout(timeout: Duration) -> Result<Duration> {
     Ok(timeout)
 }
 
-pub(crate) fn validate_http_proxy(proxy: &str) -> Result<()> {
+pub fn validate_http_proxy(proxy: &str) -> Result<()> {
     build_http_proxy(proxy).map(|_| ())
 }
 

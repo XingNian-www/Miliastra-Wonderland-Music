@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -7,20 +6,23 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
 use super::{UndercoverWordPair, normalized_word_component, unordered_word_key};
+use miliastra_contracts::StateStore;
 
 #[derive(Clone)]
 pub(crate) struct UndercoverBankStore {
     bank_path: PathBuf,
     used_path: PathBuf,
     lock: Arc<Mutex<()>>,
+    store: Arc<dyn StateStore>,
 }
 
 impl UndercoverBankStore {
-    pub(crate) fn new(bank_path: PathBuf, used_path: PathBuf) -> Self {
+    pub(crate) fn new(bank_path: PathBuf, used_path: PathBuf, store: Arc<dyn StateStore>) -> Self {
         Self {
             bank_path,
             used_path,
             lock: Arc::new(Mutex::new(())),
+            store,
         }
     }
 
@@ -29,8 +31,8 @@ impl UndercoverBankStore {
             .lock
             .lock()
             .map_err(|_| anyhow!("谁是卧底词库写入锁已损坏"))?;
-        let candidates = load_candidates(&self.bank_path)?;
-        let mut used = load_used_pairs(&self.used_path)?;
+        let candidates = load_candidates(&self.bank_path, self.store.as_ref())?;
+        let mut used = load_used_pairs(&self.used_path, self.store.as_ref())?;
         let available = candidates
             .into_iter()
             .filter(|pair| !used.contains(&pair.unordered_key()))
@@ -40,7 +42,7 @@ impl UndercoverBankStore {
         }
         let pair = available[(mix_seed(seed) as usize) % available.len()].clone();
         used.insert(pair.unordered_key());
-        save_used_pairs(&self.used_path, &used)?;
+        save_used_pairs(&self.used_path, &used, self.store.as_ref())?;
         Ok(pair)
     }
 }
@@ -65,8 +67,9 @@ fn default_enabled() -> bool {
     true
 }
 
-fn load_candidates(path: &Path) -> Result<Vec<UndercoverWordPair>> {
-    let text = fs::read_to_string(path)
+fn load_candidates(path: &Path, store: &dyn StateStore) -> Result<Vec<UndercoverWordPair>> {
+    let text = store
+        .read_to_string(path)
         .with_context(|| format!("读取谁是卧底词库失败: {}", path.display()))?;
     let file: WordBankFile = serde_yaml::from_str(&text)
         .with_context(|| format!("解析谁是卧底词库失败: {}", path.display()))?;
@@ -105,11 +108,12 @@ struct UsedPairFile {
     pairs: Vec<[String; 2]>,
 }
 
-fn load_used_pairs(path: &Path) -> Result<HashSet<String>> {
-    if !path.exists() {
+fn load_used_pairs(path: &Path, store: &dyn StateStore) -> Result<HashSet<String>> {
+    if !store.exists(path) {
         return Ok(HashSet::new());
     }
-    let text = fs::read_to_string(path)
+    let text = store
+        .read_to_string(path)
         .with_context(|| format!("读取谁是卧底永久使用记录失败: {}", path.display()))?;
     let file: UsedPairFile = serde_yaml::from_str(&text)
         .with_context(|| format!("解析谁是卧底永久使用记录失败: {}", path.display()))?;
@@ -120,7 +124,7 @@ fn load_used_pairs(path: &Path) -> Result<HashSet<String>> {
         .collect())
 }
 
-fn save_used_pairs(path: &Path, keys: &HashSet<String>) -> Result<()> {
+fn save_used_pairs(path: &Path, keys: &HashSet<String>, store: &dyn StateStore) -> Result<()> {
     let mut pairs = keys
         .iter()
         .filter_map(|key| {
@@ -131,11 +135,7 @@ fn save_used_pairs(path: &Path, keys: &HashSet<String>) -> Result<()> {
     pairs.sort();
     let text =
         serde_yaml::to_string(&UsedPairFile { pairs }).context("序列化谁是卧底永久使用记录失败")?;
-    atomic_write(path, text.as_bytes())
-}
-
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    crate::adapters::file_store::write_atomic(path, bytes, "谁是卧底记录")
+    store.write_atomic(path, text.as_bytes(), "谁是卧底记录")
 }
 
 fn mix_seed(mut value: u64) -> u64 {
@@ -177,7 +177,11 @@ mod tests {
 "#,
         )
         .unwrap();
-        let store = UndercoverBankStore::new(bank_path, used_path.clone());
+        let store = UndercoverBankStore::new(
+            bank_path,
+            used_path.clone(),
+            crate::test_support::test_state_store(),
+        );
 
         let first = store.consume_random(1).unwrap();
         assert!(used_path.exists(), "used record is durable before return");
@@ -212,7 +216,11 @@ mod tests {
             "词组:\n  - 平民词: 苹果\n    卧底词: 梨\n    启用: true\n",
         )
         .unwrap();
-        let store = UndercoverBankStore::new(bank_path, used_path.clone());
+        let store = UndercoverBankStore::new(
+            bank_path,
+            used_path.clone(),
+            crate::test_support::test_state_store(),
+        );
 
         for invalid in ["{}", "已用词对: ["] {
             fs::write(&used_path, invalid).unwrap();

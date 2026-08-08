@@ -2452,6 +2452,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "miliastra-contracts"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+]
+
+[[package]]
+name = "miliastra-kernel"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-openai",
+ "reqwest",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "miliastra-login-helper"
 version = "0.1.0"
 dependencies = [
@@ -2483,7 +2504,6 @@ dependencies = [
  "cpal",
  "ffmpeg-next",
  "http-body-util",
- "miliastra-login-protocol",
  "reqwest",
  "rsa",
  "serde",
@@ -2508,6 +2528,8 @@ dependencies = [
  "image",
  "imageproc",
  "log",
+ "miliastra-contracts",
+ "miliastra-kernel",
  "miliastra-login-protocol",
  "miliastra-playback",
  "ocr-rs",
@@ -2515,8 +2537,6 @@ dependencies = [
  "openvino-sys",
  "pinyin",
  "ratatui",
- "reqwest",
- "secrecy",
  "serde",
  "serde_json",
  "serde_yaml",

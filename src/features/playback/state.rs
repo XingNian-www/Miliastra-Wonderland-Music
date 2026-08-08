@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -9,6 +8,7 @@ use miliastra_playback::PlayableTrack;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::queue::QueueItem;
+use miliastra_contracts::StateStore;
 
 /// The sole durable snapshot for a requested-playback session.
 ///
@@ -126,25 +126,33 @@ impl Default for RequestStateSnapshot {
 pub(crate) struct RequestStateStore {
     path: PathBuf,
     snapshot: RequestStateSnapshot,
+    store: Arc<dyn StateStore>,
 }
 
 pub(crate) type SharedRequestStateStore = Arc<Mutex<RequestStateStore>>;
 
 impl RequestStateStore {
-    pub(crate) fn load(path: PathBuf) -> Result<SharedRequestStateStore> {
-        let snapshot = if path.exists() {
-            Self::read_current_or_recover(&path)?
-        } else if backup_path(&path).exists() {
-            let snapshot = Self::read_snapshot(&backup_path(&path))?;
+    pub(crate) fn load(
+        path: PathBuf,
+        store: Arc<dyn StateStore>,
+    ) -> Result<SharedRequestStateStore> {
+        let snapshot = if store.exists(&path) {
+            Self::read_current_or_recover(&path, store.as_ref())?
+        } else if store.exists(&backup_path(&path)) {
+            let snapshot = Self::read_snapshot(&backup_path(&path), store.as_ref())?;
             let text = serde_json::to_vec_pretty(&snapshot)?;
-            crate::adapters::file_store::write_atomic(&path, &text, "请求状态恢复文件")?;
+            store.write_atomic(&path, &text, "请求状态恢复文件")?;
             log::warn!("请求状态主文件缺失，已从备份恢复: {}", path.display());
             snapshot
         } else {
             RequestStateSnapshot::default()
         };
-        let store = Self { path, snapshot };
-        Ok(Arc::new(Mutex::new(store)))
+        let request_store = Self {
+            path,
+            snapshot,
+            store,
+        };
+        Ok(Arc::new(Mutex::new(request_store)))
     }
 
     #[cfg(test)]
@@ -152,6 +160,7 @@ impl RequestStateStore {
         Arc::new(Mutex::new(Self {
             path: PathBuf::new(),
             snapshot: RequestStateSnapshot::default(),
+            store: crate::test_support::test_state_store(),
         }))
     }
 
@@ -292,8 +301,11 @@ impl RequestStateStore {
         })
     }
 
-    fn read_current_or_recover(path: &Path) -> Result<RequestStateSnapshot> {
-        match Self::read_snapshot(path) {
+    fn read_current_or_recover(
+        path: &Path,
+        store: &dyn StateStore,
+    ) -> Result<RequestStateSnapshot> {
+        match Self::read_snapshot(path, store) {
             Ok(snapshot) => Ok(snapshot),
             Err(error)
                 if error
@@ -304,10 +316,10 @@ impl RequestStateStore {
             }
             Err(primary_error) => {
                 let backup = backup_path(path);
-                if !backup.exists() {
+                if !store.exists(&backup) {
                     return Err(primary_error);
                 }
-                let snapshot = Self::read_snapshot(&backup).with_context(|| {
+                let snapshot = Self::read_snapshot(&backup, store).with_context(|| {
                     format!(
                         "解析请求状态主文件失败且备份也不可恢复: {}",
                         backup.display()
@@ -318,14 +330,15 @@ impl RequestStateStore {
                     path.display()
                 );
                 let text = serde_json::to_vec_pretty(&snapshot)?;
-                crate::adapters::file_store::write_atomic(path, &text, "请求状态恢复文件")?;
+                store.write_atomic(path, &text, "请求状态恢复文件")?;
                 Ok(snapshot)
             }
         }
     }
 
-    fn read_snapshot(path: &Path) -> Result<RequestStateSnapshot> {
-        let text = fs::read_to_string(path)
+    fn read_snapshot(path: &Path, store: &dyn StateStore) -> Result<RequestStateSnapshot> {
+        let text = store
+            .read_to_string(path)
             .with_context(|| format!("read request state {}", path.display()))?;
         let value: serde_json::Value = serde_json::from_str(&text)
             .with_context(|| format!("parse request state {}", path.display()))?;
@@ -350,17 +363,14 @@ impl RequestStateStore {
             return Ok(());
         }
         let text = serde_json::to_vec_pretty(snapshot)?;
-        if self.path.exists() {
-            let current = fs::read(&self.path).with_context(|| {
+        if self.store.exists(&self.path) {
+            let current = self.store.read(&self.path).with_context(|| {
                 format!("read request state before backup {}", self.path.display())
             })?;
-            crate::adapters::file_store::write_atomic(
-                &backup_path(&self.path),
-                &current,
-                "请求状态备份",
-            )?;
+            self.store
+                .write_atomic(&backup_path(&self.path), &current, "请求状态备份")?;
         }
-        crate::adapters::file_store::write_atomic(&self.path, &text, "请求状态")
+        self.store.write_atomic(&self.path, &text, "请求状态")
     }
 }
 
@@ -828,8 +838,9 @@ mod tests {
         )
         .unwrap();
 
-        let error = RequestStateStore::load(state_path.clone())
-            .expect_err("unversioned state must not be migrated");
+        let error =
+            RequestStateStore::load(state_path.clone(), crate::test_support::test_state_store())
+                .expect_err("unversioned state must not be migrated");
 
         assert!(error.to_string().contains("schemaVersion"));
         assert!(error.to_string().contains("请删除状态文件"));
@@ -845,7 +856,8 @@ mod tests {
         fs::write(&state_path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
 
         let error =
-            RequestStateStore::load(state_path.clone()).expect_err("v1 state must not be migrated");
+            RequestStateStore::load(state_path.clone(), crate::test_support::test_state_store())
+                .expect_err("v1 state must not be migrated");
 
         assert!(error.to_string().contains("schemaVersion Some(1)"));
         assert!(error.to_string().contains("请删除状态文件"));
@@ -864,8 +876,9 @@ mod tests {
         )
         .unwrap();
 
-        let error = RequestStateStore::load(state_path.clone())
-            .expect_err("unsupported primary schema must not use the backup");
+        let error =
+            RequestStateStore::load(state_path.clone(), crate::test_support::test_state_store())
+                .expect_err("unsupported primary schema must not use the backup");
 
         assert!(error.to_string().contains("schemaVersion Some(1)"));
         let persisted: serde_json::Value =
@@ -886,8 +899,9 @@ mod tests {
         snapshot.next_queue_item_id = 1;
         fs::write(&state_path, serde_json::to_vec_pretty(&snapshot).unwrap()).unwrap();
 
-        let error = RequestStateStore::load(state_path.clone())
-            .expect_err("queue ids must be valid in schema v2");
+        let error =
+            RequestStateStore::load(state_path.clone(), crate::test_support::test_state_store())
+                .expect_err("queue ids must be valid in schema v2");
 
         assert!(error.to_string().contains("nextQueueItemId"));
         remove_request_state_path(state_path);
@@ -896,7 +910,9 @@ mod tests {
     #[test]
     fn queue_and_playback_updates_share_one_versioned_snapshot() {
         let state_path = temp_request_state_path("shared-snapshot");
-        let store = RequestStateStore::load(state_path.clone()).unwrap();
+        let store =
+            RequestStateStore::load(state_path.clone(), crate::test_support::test_state_store())
+                .unwrap();
         let mut queue =
             super::super::queue::PersistentQueue::from_request_store(store.clone(), 3).unwrap();
         let mut playback = PersistentPlaybackState::from_request_store(store).unwrap();
@@ -926,7 +942,9 @@ mod tests {
     #[test]
     fn corrupted_primary_recovers_the_last_valid_backup() {
         let state_path = temp_request_state_path("backup-recovery");
-        let store = RequestStateStore::load(state_path.clone()).unwrap();
+        let store =
+            RequestStateStore::load(state_path.clone(), crate::test_support::test_state_store())
+                .unwrap();
         store
             .lock()
             .unwrap()
@@ -950,7 +968,9 @@ mod tests {
             .unwrap();
         fs::write(&state_path, "{broken").unwrap();
 
-        let recovered = RequestStateStore::load(state_path.clone()).unwrap();
+        let recovered =
+            RequestStateStore::load(state_path.clone(), crate::test_support::test_state_store())
+                .unwrap();
         let recovered = recovered.lock().unwrap();
         assert_eq!(recovered.snapshot.control_operation_history.len(), 1);
         assert_eq!(
@@ -969,7 +989,9 @@ mod tests {
     #[test]
     fn terminal_claim_is_idempotent_and_session_reconciliation_is_durable() {
         let state_path = temp_request_state_path("terminal-session");
-        let store = RequestStateStore::load(state_path.clone()).unwrap();
+        let store =
+            RequestStateStore::load(state_path.clone(), crate::test_support::test_state_store())
+                .unwrap();
         store
             .lock()
             .unwrap()
@@ -1029,7 +1051,9 @@ mod tests {
             })
             .unwrap();
 
-        let restored = RequestStateStore::load(state_path.clone()).unwrap();
+        let restored =
+            RequestStateStore::load(state_path.clone(), crate::test_support::test_state_store())
+                .unwrap();
         let restored = restored.lock().unwrap();
         assert!(restored.snapshot.session_binding.is_none());
         assert_eq!(restored.snapshot.handled_terminal_outcomes.len(), 1);

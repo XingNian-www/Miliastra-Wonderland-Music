@@ -16,11 +16,13 @@ use url::Url;
 use crate::catalog::{CatalogError, PlaybackEligibility, ProviderSearchCandidate, SourceAdapter};
 use crate::credentials::{CredentialStore, ProviderCredential};
 use crate::domain::{ResolverLocator, SearchSpec, Song, SongKey, StreamSource};
+use crate::lyrics::{TimedLyrics, parse_lrc_pair};
 
 const SEARCH_URL: &str = "https://u.y.qq.com/cgi-bin/musicu.fcg";
 const RESOLVE_URL: &str = "https://u.y.qq.com/cgi-bin/musicu.fcg";
 const LOGIN_URL: &str = "https://u.y.qq.com/cgi-bin/musics.fcg";
 const WEB_REFRESH_URL: &str = "https://c.y.qq.com/base/fcgi-bin/login_get_musickey.fcg";
+const LYRICS_URL: &str = "https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg";
 const QQ_MOBILE_VERSION: i64 = 14_090_008;
 const QQ_QIMEI_FALLBACK: &str = "6c9d3cd110abca9b16311cee10001e717614";
 const PLAY_BITS_MASK: i64 = 0b1110;
@@ -33,6 +35,7 @@ pub struct QqMusicAdapter {
     search_url: Url,
     resolve_url: Url,
     login_url: Url,
+    lyrics_url: Url,
 }
 
 impl QqMusicAdapter {
@@ -51,6 +54,8 @@ impl QqMusicAdapter {
                 .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?,
             login_url: Url::parse(LOGIN_URL)
                 .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?,
+            lyrics_url: Url::parse(LYRICS_URL)
+                .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?,
         })
     }
 
@@ -66,6 +71,12 @@ impl QqMusicAdapter {
         adapter.resolve_url = resolve_url.clone();
         adapter.login_url = resolve_url;
         Ok(adapter)
+    }
+
+    #[cfg(test)]
+    pub fn with_lyrics_endpoint(mut self, lyrics_url: Url) -> Self {
+        self.lyrics_url = lyrics_url;
+        self
     }
 
     fn credential(&self) -> Result<ProviderCredential, CatalogError> {
@@ -112,6 +123,30 @@ impl QqMusicAdapter {
             }
             Err(error) => Err(error),
         }
+    }
+
+    async fn lyrics_json(&self, song_mid: &str) -> Result<Value, CatalogError> {
+        let credential = self.credential()?;
+        let response = self
+            .client
+            .get(self.lyrics_url.clone())
+            .query(&[
+                ("songmid", song_mid),
+                ("format", "json"),
+                ("nobase64", "1"),
+                ("g_tk", "5381"),
+            ])
+            .header("Cookie", cookie_header(credential.cookies()))
+            .header("Referer", "https://y.qq.com/")
+            .send()
+            .await
+            .map_err(classify_request_error)?;
+        classify_status(&response)?;
+        let body = response
+            .text()
+            .await
+            .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?;
+        parse_qq_json(&body)
     }
 
     async fn retry_after_refresh(
@@ -475,6 +510,42 @@ impl SourceAdapter for QqMusicAdapter {
             expires_at_epoch_ms: None,
         })
     }
+
+    async fn lyrics(
+        &self,
+        key: &SongKey,
+        locator: Option<&ResolverLocator>,
+    ) -> Result<Option<TimedLyrics>, CatalogError> {
+        if key.source != self.source_code() {
+            return Err(CatalogError::InvalidResponse(
+                "song key provider does not match QQ Music adapter".to_owned(),
+            ));
+        }
+        let (song_mid, _) = qq_resolver_ids(key, locator)?;
+        let response = self.lyrics_json(&song_mid).await?;
+        let code = response
+            .get("retcode")
+            .or_else(|| response.get("code"))
+            .and_then(as_i64)
+            .unwrap_or_default();
+        if code != 0 {
+            return if qq_response_requires_auth_refresh(&response) {
+                Err(CatalogError::AuthRequired(
+                    "QQ Music lyric request requires relogin".to_owned(),
+                ))
+            } else {
+                Err(CatalogError::Unavailable(
+                    "QQ Music returned no lyrics for this track".to_owned(),
+                ))
+            };
+        }
+        let primary = lyric_value(&response, "lyric")
+            .map(decode_qq_lyric)
+            .unwrap_or_default();
+        let translation = lyric_value(&response, "trans").map(decode_qq_lyric);
+        parse_lrc_pair(&primary, translation.as_deref())
+            .map_err(|error| CatalogError::InvalidResponse(error.to_string()))
+    }
 }
 
 pub(crate) fn parse_search_candidates(
@@ -596,6 +667,41 @@ fn qq_response_requires_auth_refresh(response: &Value) -> bool {
         .iter()
         .filter_map(|pointer| response.pointer(pointer).and_then(as_i64))
         .any(|code| matches!(code, 401 | 403 | 1000 | 1001 | 1002 | 1003 | 1004 | 1005))
+}
+
+fn lyric_value<'a>(response: &'a Value, field: &str) -> Option<&'a str> {
+    response
+        .get(field)
+        .or_else(|| response.pointer(&format!("/data/{field}")))
+        .and_then(Value::as_str)
+}
+
+fn parse_qq_json(body: &str) -> Result<Value, CatalogError> {
+    let body = body.trim();
+    let body = body
+        .find('(')
+        .filter(|_| body.ends_with(')'))
+        .map_or(body, |index| &body[index + 1..body.len() - 1]);
+    serde_json::from_str(body).map_err(|error| CatalogError::InvalidResponse(error.to_string()))
+}
+
+fn decode_qq_lyric(value: &str) -> String {
+    let value = value.trim();
+    if value.contains('[') {
+        return value.to_owned();
+    }
+    for engine in [
+        &base64::engine::general_purpose::STANDARD,
+        &base64::engine::general_purpose::STANDARD_NO_PAD,
+    ] {
+        if let Ok(decoded) = engine.decode(value)
+            && let Ok(decoded) = String::from_utf8(decoded)
+            && decoded.contains('[')
+        {
+            return decoded;
+        }
+    }
+    value.to_owned()
 }
 
 fn first_cookie<'a>(cookies: &'a BTreeMap<String, String>, aliases: &[&str]) -> Option<&'a str> {
@@ -1332,5 +1438,34 @@ mod tests {
             payload.pointer("/req_0/param/filename/0"),
             Some(&json!("M500mediaMid.mp3"))
         );
+    }
+
+    #[tokio::test]
+    async fn qq_lyrics_uses_the_native_endpoint_and_prefers_translation() {
+        let body = json!({
+            "retcode": 0,
+            "lyric": "[00:01.00]original",
+            "trans": "[00:01.00]translated"
+        })
+        .to_string();
+        let (endpoint, request) = fixture_server(body);
+        let adapter = QqMusicAdapter::with_endpoints(
+            credentials(),
+            Duration::from_secs(2),
+            endpoint.clone(),
+            endpoint.clone(),
+        )
+        .unwrap()
+        .with_lyrics_endpoint(endpoint);
+        let key = SongKey::new("qqmusic", "songMid").unwrap();
+        let locator = ResolverLocator::new("qqmusic:v2:songMid:mediaMid").unwrap();
+
+        let lyrics = adapter.lyrics(&key, Some(&locator)).await.unwrap().unwrap();
+
+        assert_eq!(lyrics.line_at_ms(1_000), Some("translated"));
+        let request = request.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(request.contains("/resolve?songmid=songMid"));
+        assert!(request.contains("nobase64=1"));
+        assert!(request.to_ascii_lowercase().contains("cookie:"));
     }
 }

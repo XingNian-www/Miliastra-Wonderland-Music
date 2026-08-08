@@ -17,6 +17,7 @@ use crate::domain::{
 };
 use crate::engine::{AudioEngine, EngineCommand, EngineError};
 use crate::login::LoginCoordinator;
+use crate::lyrics::TimedLyrics;
 
 #[derive(Clone)]
 pub struct PlayerDaemon {
@@ -210,6 +211,29 @@ impl PlayerDaemon {
             session_id,
             generation,
         })
+    }
+
+    pub async fn lyrics(
+        &self,
+        song_key: SongKey,
+        resolver_locator: Option<ResolverLocator>,
+    ) -> Result<Option<TimedLyrics>, DaemonError> {
+        if let Some(registry) = self.registry.as_ref() {
+            registry
+                .require_enabled(&song_key.source)
+                .map_err(DaemonError::Failure)?;
+        }
+        let adapter = self
+            .catalog
+            .get(&song_key.source)
+            .ok_or_else(|| DaemonError::UnknownSource(song_key.source.clone()))?;
+        timeout(
+            self.source_timeout,
+            adapter.lyrics(&song_key, resolver_locator.as_ref()),
+        )
+        .await
+        .map_err(|_| DaemonError::Catalog(CatalogError::TimedOut(song_key.source)))?
+        .map_err(DaemonError::Catalog)
     }
 
     pub async fn pause(&self, session: SessionRef) -> Result<(), DaemonError> {

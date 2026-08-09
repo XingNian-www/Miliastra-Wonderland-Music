@@ -477,8 +477,11 @@ html[data-theme=light] .theme-toggle .moon{display:none}
 
       <div class="panel">
         <div class="panel-head"><h2>平台登录</h2><small id="loginMeta">读取中</small></div>
-        <div class="panel-body" id="loginProviders">
-          <div class="result">读取平台状态...</div>
+        <div class="panel-body">
+          <div class="login-session" id="loginSessionDetail">等待登录状态</div>
+          <div id="loginProviders">
+            <div class="result">读取平台状态...</div>
+          </div>
         </div>
       </div>
 
@@ -636,13 +639,6 @@ function setupPages(){
   document.querySelectorAll('#legacyContent .panel').forEach(panel=>{if(!moved.has(panel))$('settingsGrid').appendChild(panel)})
   const response=$('responsePanel')
   if(response){response.classList.add('global-result');document.body.appendChild(response)}
-  const loginPanel=$('loginProviders')&&$('loginProviders').closest('.panel')
-  if(loginPanel){
-    const body=loginPanel.querySelector('.panel-body')
-    const detail=document.createElement('div')
-    detail.id='loginSessionDetail';detail.className='login-session';detail.textContent='等待登录状态'
-    body.insertBefore(detail,body.firstChild)
-  }
 }
 function navigateTo(route,updateHash=true){
   if(!pageRoutes.includes(route))route='overview'

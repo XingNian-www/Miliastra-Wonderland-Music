@@ -33,6 +33,19 @@ pub struct AiConfig {
     pub extra_body: HashMap<String, Value>,
 }
 
+impl Default for AiConfig {
+    fn default() -> Self {
+        Self {
+            provider: "openai".to_string(),
+            api_key: String::new(),
+            endpoint: String::new(),
+            model: "gpt-5.6-mini".to_string(),
+            http_proxy: String::new(),
+            extra_body: HashMap::new(),
+        }
+    }
+}
+
 impl AiConfig {
     pub(crate) fn validate(&self) -> Result<()> {
         validate_http_proxy(&self.http_proxy).context("ai.http_proxy 配置无效")?;
@@ -56,13 +69,6 @@ pub struct AiCandidatePickResult {
     pub index: usize,
     pub reason: String,
     pub score: f64,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct AiSongIdentityResult {
-    pub(crate) matched: bool,
-    pub(crate) score: f64,
-    pub(crate) reason: String,
 }
 
 #[derive(Clone, Debug)]
@@ -93,31 +99,6 @@ impl AiClient {
 
     pub fn enabled(&self) -> bool {
         !self.config.api_key.trim().is_empty()
-    }
-
-    pub(crate) fn judge_song_identity(
-        &self,
-        request: &str,
-        song_name: &str,
-        song_singer: &str,
-    ) -> Result<AiSongIdentityResult> {
-        let provider = resolve_provider_config(&self.config, None)?;
-        let json = self.match_song_identity_json(&provider, request, song_name, song_singer)?;
-        let value: Value = serde_json::from_str(&json)?;
-        Ok(AiSongIdentityResult {
-            matched: value.get("match").and_then(Value::as_bool).unwrap_or(false)
-                && value
-                    .get("decision")
-                    .and_then(Value::as_str)
-                    .is_some_and(|decision| decision == "match"),
-            score: value.get("score").and_then(Value::as_f64).unwrap_or(0.0),
-            reason: value
-                .get("reason")
-                .and_then(Value::as_str)
-                .unwrap_or("AI未提供判断理由")
-                .trim()
-                .to_string(),
-        })
     }
 
     fn match_song_identity_json(

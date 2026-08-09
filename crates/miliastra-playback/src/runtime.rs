@@ -11,8 +11,9 @@ use tokio::task::{AbortHandle, Id as TaskId, JoinError, JoinHandle as TokioJoinH
 use uuid::Uuid;
 
 use crate::catalog::{
-    BilibiliAdapter, KugouAccountStatus, KugouAdapter, KugouListenReport, NeteaseAdapter,
-    ProviderId, ProviderRegistry, QqMusicAdapter, SourceAdapter, SourceCatalog,
+    BilibiliAdapter, CredentialRefreshAdapter, KugouAccountStatus, KugouAdapter,
+    KugouListenReport, NeteaseAdapter, ProviderAccountStatus, ProviderId, ProviderRegistry,
+    QqMusicAdapter, SourceAdapter, SourceCatalog,
 };
 use crate::core::{PlaybackCore, PlaybackCoreError};
 use crate::credentials::{CredentialStatus, CredentialStore, ProviderCredential};
@@ -119,6 +120,8 @@ impl PlaybackError {
             Self::NoActiveSession => "no_active_session",
             Self::Failure(failure) => match failure.code.as_str() {
                 "track_unavailable" => "track_unavailable",
+                "track_vip_required" => "track_vip_required",
+                "track_no_copyright" => "track_no_copyright",
                 "provider_auth_required" => "provider_auth_required",
                 "relogin_required" => "relogin_required",
                 "provider_rate_limited" => "provider_rate_limited",
@@ -140,6 +143,8 @@ impl PlaybackError {
 enum Command {
     Search(SearchQuery, Reply<Vec<SearchCandidate>>),
     Play(PlayableTrack, Reply<()>),
+    /// 预加载音源解析结果（fire-and-forget，无回复；失败静默）。
+    Preload(PlayableTrack),
     Pause(Reply<()>),
     Resume(Reply<()>),
     Stop(Reply<()>),
@@ -149,10 +154,9 @@ enum Command {
     CredentialStatuses(Reply<Vec<CredentialStatus>>),
     RefreshCredential(ProviderId, Reply<CredentialStatus>),
     KugouAccountStatus(Reply<KugouAccountStatus>),
-    KugouReportListenSong {
-        mixsongid: String,
-        reply: Reply<KugouListenReport>,
-    },
+    AccountStatus(ProviderId, Reply<Option<ProviderAccountStatus>>),
+    KugouClaimVip(Reply<KugouListenReport>),
+    KugouUpgradeVip(Reply<KugouListenReport>),
     SaveCredential(ProviderCredential, Reply<CredentialStatus>),
     Logout(ProviderId, Reply<CredentialStatus>),
     BeginLogin(ProviderId, Reply<LoginSession>),
@@ -225,6 +229,7 @@ impl PlaybackRuntime {
     pub fn start(
         credential_directory: impl Into<PathBuf>,
         kugou_api_base_url: &str,
+        audio_cache_config: Option<crate::cache::AudioCacheConfig>,
     ) -> Result<Self, PlaybackError> {
         let credential_directory = credential_directory.into();
         let kugou_api_base_url = kugou_api_base_url.to_owned();
@@ -236,6 +241,7 @@ impl PlaybackRuntime {
                 run_runtime_thread(
                     credential_directory,
                     kugou_api_base_url,
+                    audio_cache_config,
                     command_rx,
                     ready_tx,
                 )
@@ -300,6 +306,17 @@ impl PlaybackHandle {
         })
     }
 
+    /// 预加载音源解析：后台执行、立即返回；结果进入解析缓存，
+    /// 之后的 `play` 可直接使用缓存跳过网络解析。
+    pub fn preload(&self, track: PlayableTrack) -> Result<(), PlaybackError> {
+        self.commands
+            .try_send(Command::Preload(track))
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => PlaybackError::Busy,
+                mpsc::error::TrySendError::Closed(_) => PlaybackError::RuntimeStopped,
+            })
+    }
+
     pub fn pause(&self) -> Result<(), PlaybackError> {
         self.request(Command::Pause)
     }
@@ -339,11 +356,20 @@ impl PlaybackHandle {
         self.request(Command::KugouAccountStatus)
     }
 
-    pub fn kugou_report_listen_song(
+    /// 查询平台账号状态（QQ 音乐/网易云）。平台不支持时返回 None。
+    pub fn account_status(
         &self,
-        mixsongid: String,
-    ) -> Result<KugouListenReport, PlaybackError> {
-        self.request(|reply| Command::KugouReportListenSong { mixsongid, reply })
+        provider: ProviderId,
+    ) -> Result<Option<ProviderAccountStatus>, PlaybackError> {
+        self.request(|reply| Command::AccountStatus(provider, reply))
+    }
+
+    pub fn kugou_claim_vip(&self) -> Result<KugouListenReport, PlaybackError> {
+        self.request(Command::KugouClaimVip)
+    }
+
+    pub fn kugou_upgrade_vip(&self) -> Result<KugouListenReport, PlaybackError> {
+        self.request(Command::KugouUpgradeVip)
     }
 
     pub fn save_credential(
@@ -436,6 +462,7 @@ impl LoginOperation {
 fn run_runtime_thread(
     credential_directory: PathBuf,
     kugou_api_base_url: String,
+    audio_cache_config: Option<crate::cache::AudioCacheConfig>,
     command_rx: mpsc::Receiver<Command>,
     ready: std_mpsc::SyncSender<Result<(), PlaybackError>>,
 ) {
@@ -472,17 +499,38 @@ fn run_runtime_thread(
                 return;
             }
         };
+        let audio_cache = match audio_cache_config {
+            Some(config) if config.enabled => match crate::cache::AudioCache::spawn(config).await {
+                Ok(cache) => {
+                    tracing::info!("音频数据缓存已启用");
+                    Some(cache)
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "音频数据缓存启动失败，本次运行不启用缓存");
+                    None
+                }
+            },
+            _ => None,
+        };
         let core = PlaybackCore::new_with_registry(
             catalog,
             ProviderRegistry,
             engine.clone(),
             SOURCE_TIMEOUT,
         );
+        let core = match audio_cache {
+            Some(cache) => core.with_audio_cache(cache),
+            None => core,
+        };
         if ready.send(Ok(())).is_err() {
             let _ = engine.shutdown().await;
             return;
         }
+        let audio_cache = core.audio_cache.clone();
         let shutdown_reply = run_commands(command_rx, core, credentials).await;
+        if let Some(cache) = audio_cache {
+            cache.shutdown().await;
+        }
         let shutdown_result = engine
             .shutdown()
             .await
@@ -497,12 +545,16 @@ fn build_catalog(
     credentials: &CredentialStore,
     kugou_api_base_url: &str,
 ) -> Result<SourceCatalog, PlaybackError> {
-    let qqmusic = QqMusicAdapter::new(credentials.clone(), SOURCE_TIMEOUT)
-        .map_err(|error| PlaybackError::Startup(error.to_string()))?;
+    let qqmusic = Arc::new(
+        QqMusicAdapter::new(credentials.clone(), SOURCE_TIMEOUT)
+            .map_err(|error| PlaybackError::Startup(error.to_string()))?,
+    );
     let netease = NeteaseAdapter::new(credentials.clone(), SOURCE_TIMEOUT)
         .map_err(|error| PlaybackError::Startup(error.to_string()))?;
-    let bilibili = BilibiliAdapter::new(credentials.clone(), SOURCE_TIMEOUT)
-        .map_err(|error| PlaybackError::Startup(error.to_string()))?;
+    let bilibili = Arc::new(
+        BilibiliAdapter::new(credentials.clone(), SOURCE_TIMEOUT)
+            .map_err(|error| PlaybackError::Startup(error.to_string()))?,
+    );
     let kugou = Arc::new(
         KugouAdapter::new(credentials.clone(), SOURCE_TIMEOUT, kugou_api_base_url)
             .map_err(|error| PlaybackError::Startup(error.to_string()))?,
@@ -510,7 +562,7 @@ fn build_catalog(
     Ok(SourceCatalog::new([
         (
             ProviderId::QqMusic.to_string(),
-            Arc::new(qqmusic) as Arc<dyn SourceAdapter>,
+            qqmusic.clone() as Arc<dyn SourceAdapter>,
         ),
         (
             ProviderId::Netease.to_string(),
@@ -518,14 +570,22 @@ fn build_catalog(
         ),
         (
             ProviderId::Bilibili.to_string(),
-            Arc::new(bilibili) as Arc<dyn SourceAdapter>,
+            bilibili.clone() as Arc<dyn SourceAdapter>,
         ),
         (
             ProviderId::Kugou.to_string(),
             kugou.clone() as Arc<dyn SourceAdapter>,
         ),
     ])
-    .with_kugou_account(kugou as Arc<dyn crate::catalog::KugouAccountAdapter>))
+    .with_kugou_account(kugou as Arc<dyn crate::catalog::KugouAccountAdapter>)
+    .with_refresh_adapter(
+        ProviderId::QqMusic.as_str(),
+        qqmusic as Arc<dyn CredentialRefreshAdapter>,
+    )
+    .with_refresh_adapter(
+        ProviderId::Bilibili.as_str(),
+        bilibili as Arc<dyn CredentialRefreshAdapter>,
+    ))
 }
 
 async fn run_commands(
@@ -667,6 +727,18 @@ async fn run_commands(
                     let _ = reply.send(search(&search_core, query).await);
                 });
             }
+            Command::Preload(track) => {
+                let Ok(key) = track.track_ref.key.to_song_key() else {
+                    continue;
+                };
+                let resolver_locator = track.track_ref.resolver_locator.clone();
+                let preload_core = core.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = preload_core.preload(key, resolver_locator).await {
+                        tracing::debug!(%error, "音源预加载失败，播放时将重新解析");
+                    }
+                });
+            }
             Command::Play(track, reply) => {
                 let key = track.track_ref.key.to_song_key();
                 let Ok(key) = key else {
@@ -754,31 +826,15 @@ async fn run_commands(
                 let _ = reply.send(credentials.statuses().map_err(internal_error));
             }
             Command::RefreshCredential(provider, reply) => {
-                let result = if provider != ProviderId::Kugou {
-                    Err(PlaybackError::Failure(Failure::new(
+                let result = match provider {
+                    ProviderId::Kugou => refresh_kugou_credential(&core, &credentials).await,
+                    ProviderId::QqMusic | ProviderId::Bilibili => {
+                        refresh_manual_credential(&core, &credentials, provider).await
+                    }
+                    _ => Err(PlaybackError::Failure(Failure::new(
                         "unsupported_provider",
-                        "仅支持酷狗账户刷新",
-                    )))
-                } else {
-                    let _ = credentials.mark_refresh_started(provider.as_str());
-                    let result = match core.refresh_kugou_credential().await {
-                        Ok(credential) => credentials
-                            .save(provider.as_str(), credential)
-                            .map_err(internal_error),
-                        Err(error) => Err(PlaybackError::from(error)),
-                    };
-                    let metadata_result = result.as_ref().map(|_| ()).map_err(ToString::to_string);
-                    let next_check = Some(current_epoch_ms().saturating_add(if result.is_ok() {
-                        REFRESH_CHECK_INTERVAL_MS
-                    } else {
-                        REFRESH_FAILURE_BACKOFF_MS
-                    }));
-                    let _ = credentials.mark_refresh_finished(
-                        provider.as_str(),
-                        metadata_result,
-                        next_check,
-                    );
-                    result
+                        "该平台不支持凭据刷新",
+                    ))),
                 };
                 let _ = reply.send(result);
             }
@@ -789,9 +845,23 @@ async fn run_commands(
                     .map_err(PlaybackError::from);
                 let _ = reply.send(result);
             }
-            Command::KugouReportListenSong { mixsongid, reply } => {
+            Command::AccountStatus(provider, reply) => {
+                let result = core
+                    .account_status(provider)
+                    .await
+                    .map_err(PlaybackError::from);
+                let _ = reply.send(result);
+            }
+            Command::KugouClaimVip(reply) => {
                 let _ = reply.send(
-                    core.kugou_report_listen_song(&mixsongid)
+                    core.kugou_claim_vip()
+                        .await
+                        .map_err(PlaybackError::from),
+                );
+            }
+            Command::KugouUpgradeVip(reply) => {
+                let _ = reply.send(
+                    core.kugou_upgrade_vip()
                         .await
                         .map_err(PlaybackError::from),
                 );
@@ -1081,6 +1151,66 @@ fn public_snapshot(
     }
 }
 
+/// 手动刷新酷狗凭据，并统一记录刷新元数据。
+async fn refresh_kugou_credential(
+    core: &PlaybackCore,
+    credentials: &CredentialStore,
+) -> Result<CredentialStatus, PlaybackError> {
+    let provider = ProviderId::Kugou;
+    let _ = credentials.mark_refresh_started(provider.as_str());
+    let result = match core.refresh_kugou_credential().await {
+        Ok(credential) => credentials
+            .save(provider.as_str(), credential)
+            .map_err(internal_error),
+        Err(error) => Err(PlaybackError::from(error)),
+    };
+    finish_refresh(credentials, provider, result).await
+}
+
+/// 手动刷新支持通用刷新协议的平台凭据（QQ 音乐、哔哩哔哩）。
+async fn refresh_manual_credential(
+    core: &PlaybackCore,
+    credentials: &CredentialStore,
+    provider: ProviderId,
+) -> Result<CredentialStatus, PlaybackError> {
+    let _ = credentials.mark_refresh_started(provider.as_str());
+    let result = match credentials.get(provider.as_str()) {
+        Err(error) => Err(internal_error(error)),
+        Ok(None) => Err(PlaybackError::Failure(Failure::new(
+            "provider_auth_required",
+            "该平台尚未登录",
+        ))),
+        Ok(Some(credential)) => match core.refresh_credential(provider, &credential).await {
+            Ok(Some(refreshed)) => credentials
+                .save(provider.as_str(), refreshed)
+                .map_err(internal_error),
+            // 凭据仍有效、无需刷新：视为正常完成，不记录失败状态，
+            // 否则 WEB 面板会把「无需刷新」误显示为刷新失败。
+            Ok(None) => credentials
+                .status(provider.as_str())
+                .map_err(internal_error),
+            Err(error) => Err(PlaybackError::from(error)),
+        },
+    };
+    finish_refresh(credentials, provider, result).await
+}
+
+/// 记录刷新结果元数据并返回原始结果。
+async fn finish_refresh(
+    credentials: &CredentialStore,
+    provider: ProviderId,
+    result: Result<CredentialStatus, PlaybackError>,
+) -> Result<CredentialStatus, PlaybackError> {
+    let metadata_result = result.as_ref().map(|_| ()).map_err(ToString::to_string);
+    let next_check = Some(current_epoch_ms().saturating_add(if result.is_ok() {
+        REFRESH_CHECK_INTERVAL_MS
+    } else {
+        REFRESH_FAILURE_BACKOFF_MS
+    }));
+    let _ = credentials.mark_refresh_finished(provider.as_str(), metadata_result, next_check);
+    result
+}
+
 async fn refresh_due_credentials(core: &PlaybackCore, credentials: &CredentialStore) {
     let provider = ProviderId::Kugou;
     let Ok(status) = credentials.status(provider.as_str()) else {
@@ -1260,7 +1390,11 @@ mod tests {
             _key: &SongKey,
             _locator: Option<&crate::domain::ResolverLocator>,
         ) -> Result<StreamSource, CatalogError> {
-            unreachable!("search fairness test does not resolve tracks")
+            Ok(StreamSource {
+                url: Url::parse("https://example.test/audio.m4a").unwrap(),
+                headers: BTreeMap::new(),
+                expires_at_epoch_ms: None,
+            })
         }
     }
 

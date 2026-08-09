@@ -45,6 +45,19 @@ impl WorkflowTimingConfig {
     }
 }
 
+impl Default for CustomWorkflowConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            default_threshold: 0.9,
+            wait_template_absent_stable_default: true,
+            max_hold_key_seconds: 10,
+            templates: HashMap::new(),
+            workflows: Vec::new(),
+        }
+    }
+}
+
 impl CustomWorkflowConfig {
     pub(crate) fn validate(&self) -> Result<()> {
         if !self.default_threshold.is_finite() || !(0.0..=1.0).contains(&self.default_threshold) {
@@ -1719,7 +1732,7 @@ mod tests {
 
     #[test]
     fn default_control_commands_resolve_shared_prefixes_and_duration_arguments() {
-        let app = AppConfig::load(Path::new("config.yaml")).expect("default config");
+        let app = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).expect("default config");
         let service = CustomWorkflowService::new(app.custom_workflows, defaults());
 
         for (text, workflow, args) in [
@@ -2071,3 +2084,4 @@ mod tests {
         assert_eq!(parse_confirmation("用户：@确认其他"), None);
     }
 }
+

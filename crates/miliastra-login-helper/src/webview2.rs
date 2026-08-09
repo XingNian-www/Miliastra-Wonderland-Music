@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::thread;
 use std::time::Duration;
 
+use md5::{Digest, Md5};
 use serde_json::{Value, json};
 
 #[derive(Debug, thiserror::Error)]
@@ -29,7 +31,8 @@ fn login_url(provider: &str) -> Option<&'static str> {
         "qqmusic" => Some("https://y.qq.com/portal/profile.html"),
         "netease" => Some("https://music.163.com/"),
         "bilibili" => Some("https://www.bilibili.com/"),
-        "kugou" => Some("https://www.kugou.com/login/"),
+        // 酷狗 /login/ 路径已下线（404），登录入口在首页右上角。
+        "kugou" => Some("https://www.kugou.com/"),
         _ => None,
     }
 }
@@ -65,7 +68,9 @@ fn allowed_cookie_names(provider: &str) -> &'static [&'static str] {
             "psrf_qqunionid",
         ],
         "netease" => &["MUSIC_U", "__csrf"],
-        "kugou" => &["token", "userid", "dfid", "KugouGUID", "kg_mid", "mid"],
+        // 酷狗网页登录凭据集中在单个 KuGoo cookie（值形如
+        // t=token&KugooID=userid&ct=...），其余为辅助标识 cookie。
+        "kugou" => &["KuGoo", "dfid", "KugouGUID", "kg_mid", "mid"],
         "bilibili" => &[
             "SESSDATA",
             "bili_jct",
@@ -92,16 +97,18 @@ fn has_required_cookies(provider: &str, cookies: &BTreeMap<String, String>) -> b
         }
         "netease" => cookies.contains_key("MUSIC_U"),
         "bilibili" => cookies.contains_key("SESSDATA"),
-        "kugou" => ["token", "userid"].iter().all(|name| {
-            cookies
-                .get(*name)
-                .is_some_and(|value| !value.trim().is_empty())
-        }),
+        "kugou" => cookies
+            .get("KuGoo")
+            .is_some_and(|value| value.contains("t=") && value.contains("KugooID=")),
         _ => false,
     }
 }
 
 const COOKIE_POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// B 站将 refresh_token 存在页面 localStorage/sessionStorage（键名
+/// ac_time_value），cookie 是否下发不稳定。登录完成后最多探测这么多次
+/// 读取它（约 6 秒），拿不到则按基础 cookie 判定正常完成。
+const BILIBILI_JS_PROBE_ATTEMPTS: u32 = 12;
 const QQ_REFRESH_COOKIE_GRACE_PERIOD: Duration = Duration::from_secs(3);
 const QQ_LOGIN_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(15);
 const QQ_WEB_REFRESH_URL: &str = "https://c.y.qq.com/base/fcgi-bin/login_get_musickey.fcg";
@@ -390,8 +397,214 @@ fn refresh_qq_web_session(
     }
 }
 
-/// QQ writes its refresh cookies after the basic login cookies. Keep polling
-/// briefly so a successful login captures the complete refreshable credential.
+/// 酷狗概念版扫码登录凭据获取（不依赖 sidecar，直连酷狗官方接口）。
+///
+/// 流程：v2/qrcode 拿 key → WebView2 显示 H5 二维码页 → 用户用酷狗 App
+/// 扫码 → v2/get_userinfo_qrcode 轮询到 status=4 返回 token/userid。
+const KUGOU_WEB_SIGN_SALT: &str = "NVPh5oo715z5DIWAeQlhMDsWXXQV4hwt";
+const KUGOU_LITE_APPID: i64 = 3116;
+const KUGOU_LITE_CLIENTVER: i64 = 11440;
+const KUGOU_SRCAPPID: i64 = 2919;
+const KUGOU_QR_KEY_URL: &str = "https://login-user.kugou.com/v2/qrcode";
+const KUGOU_QR_CHECK_URL: &str = "https://login-user.kugou.com/v2/get_userinfo_qrcode";
+const KUGOU_QR_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const KUGOU_QR_POLL_ATTEMPTS: u32 = 90;
+const KUGOU_UA: &str = "Android15-1070-11083-46-0-DiscoveryDRADProtocol-wifi";
+
+/// 酷狗 web 版签名：md5(盐值 + 参数按 key 排序后的 k=v 拼接 + 盐值)。
+fn kugou_web_signature(params: &BTreeMap<String, String>) -> String {
+    let mut pairs = params.iter().collect::<Vec<_>>();
+    pairs.sort_by(|left, right| left.0.cmp(right.0));
+    let joined = pairs
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<String>();
+    let mut hasher = Md5::new();
+    hasher.update(format!("{KUGOU_WEB_SIGN_SALT}{joined}{KUGOU_WEB_SIGN_SALT}"));
+    format!("{:x}", hasher.finalize())
+}
+
+/// 计算酷狗设备 MID：md5(GUID) 的 hex 视为 128 位无符号大整数，转十进制。
+fn kugou_calculate_mid(guid: &str) -> String {
+    let mut hasher = Md5::new();
+    hasher.update(guid.as_bytes());
+    let hex = format!("{:x}", hasher.finalize());
+    u128::from_str_radix(&hex, 16)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|_| "-".to_owned())
+}
+
+/// 扫码登录请求的默认参数。mid 必须与 sidecar 设备一致
+/// （主程序通过 KUGOU_API_GUID 环境变量传入），否则扫码 token
+/// 绑定匿名设备，概念版 API 会拒绝（error_code 20018）。
+fn kugou_default_params() -> BTreeMap<String, String> {
+    let mid = std::env::var("KUGOU_API_GUID")
+        .ok()
+        .map(|guid| kugou_calculate_mid(&guid))
+        .unwrap_or_else(|| "-".to_owned());
+    BTreeMap::from([
+        ("dfid".to_owned(), "-".to_owned()),
+        ("mid".to_owned(), mid),
+        ("uuid".to_owned(), "-".to_owned()),
+        ("appid".to_owned(), KUGOU_LITE_APPID.to_string()),
+        ("clientver".to_owned(), KUGOU_LITE_CLIENTVER.to_string()),
+        (
+            "clienttime".to_owned(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_secs())
+                .unwrap_or(0)
+                .to_string(),
+        ),
+    ])
+}
+
+fn kugou_web_get(url: &str, params: &BTreeMap<String, String>) -> Result<serde_json::Value, String> {
+    kugou_web_get_with_cookies(url, params).map(|(value, _)| value)
+}
+
+/// 酷狗 web 接口请求，额外返回响应 Set-Cookie 的键值（续期字段如 t1 只经
+/// Set-Cookie 下发，不返回它们会导致概念版 token 刷新被官方拒绝）。
+fn kugou_web_get_with_cookies(
+    url: &str,
+    params: &BTreeMap<String, String>,
+) -> Result<(serde_json::Value, BTreeMap<String, String>), String> {
+    let mut signed = params.clone();
+    let signature = kugou_web_signature(params);
+    signed.insert("signature".to_owned(), signature);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let response = client
+        .get(url)
+        .query(&signed)
+        .header("User-Agent", KUGOU_UA)
+        .send()
+        .map_err(|error| format!("酷狗登录接口请求失败: {error}"))?;
+    let mut cookies = BTreeMap::new();
+    for set_cookie in response.headers().get_all(reqwest::header::SET_COOKIE) {
+        if let Ok(header) = set_cookie.to_str()
+            && let Some((name, rest)) = header.split_once('=')
+        {
+            let name = name.trim();
+            let value = rest.split(';').next().unwrap_or("").trim();
+            if !name.is_empty() && !value.is_empty() {
+                cookies.insert(name.to_owned(), value.to_owned());
+            }
+        }
+    }
+    let value = response
+        .json::<serde_json::Value>()
+        .map_err(|error| format!("酷狗登录接口响应无效: {error}"))?;
+    Ok((value, cookies))
+}
+
+/// 获取扫码登录 key 与二维码图片（base64 data URL）。
+fn kugou_qr_key() -> Result<(String, String), String> {
+    let mut params = kugou_default_params();
+    params.insert("appid".to_owned(), "1001".to_owned());
+    params.insert("type".to_owned(), "1".to_owned());
+    params.insert("plat".to_owned(), "4".to_owned());
+    params.insert(
+        "qrcode_txt".to_owned(),
+        "https://h5.kugou.com/apps/loginQRCode/html/index.html?appid=1001&".to_owned(),
+    );
+    params.insert("srcappid".to_owned(), KUGOU_SRCAPPID.to_string());
+    let value = kugou_web_get(KUGOU_QR_KEY_URL, &params)?;
+    let key = value
+        .get("data")
+        .and_then(|data| data.get("qrcode"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .filter(|key| !key.is_empty())
+        .ok_or_else(|| "酷狗二维码 key 获取失败".to_owned())?;
+    let image = value
+        .get("data")
+        .and_then(|data| data.get("qrcode_img"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_default();
+    Ok((key, image))
+}
+
+/// 构建二维码展示页 HTML（直接内嵌 base64 图片，避免 H5 页 UA 跳转）。
+fn kugou_qr_page(image: &str) -> String {
+    format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>酷狗登录</title></head>\
+         <body style=\"margin:0;background:#f5f5f5;display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;font-family:sans-serif\">\
+         <div style=\"background:#fff;padding:24px;border-radius:12px;box-shadow:0 2px 12px rgba(0,0,0,.08)\">\
+         <img src=\"{image}\" style=\"width:min(70vw,520px);height:auto;display:block\"></div>\
+         <p style=\"color:#666;margin-top:18px;font-size:14px\">请使用酷狗 App 扫码登录</p>\
+         </body></html>"
+    )
+}
+
+/// 轮询扫码状态。`Ok(Some((token, userid, cookies)))` 表示登录成功，
+/// cookies 为官方 Set-Cookie 下发的续期字段（t1 等）。
+fn kugou_qr_poll(key: &str) -> Result<Option<(String, String, BTreeMap<String, String>)>, String> {
+    let mut params = kugou_default_params();
+    params.insert("plat".to_owned(), "4".to_owned());
+    params.insert("srcappid".to_owned(), KUGOU_SRCAPPID.to_string());
+    params.insert("qrcode".to_owned(), key.to_owned());
+    let (value, set_cookies) = kugou_web_get_with_cookies(KUGOU_QR_CHECK_URL, &params)?;
+    let status = value
+        .pointer("/data/status")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    match status {
+        4 => {
+            let token = value
+                .pointer("/data/token")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "酷狗扫码登录未返回 token".to_owned())?;
+            // userid 可能是数字或字符串。
+            let userid = value
+                .pointer("/data/userid")
+                .and_then(|value| {
+                    value
+                        .as_str()
+                        .map(str::to_owned)
+                        .or_else(|| value.as_i64().map(|id| id.to_string()))
+                })
+                .ok_or_else(|| "酷狗扫码登录未返回 userid".to_owned())?;
+            Ok(Some((token.to_owned(), userid, set_cookies)))
+        }
+        0 => Err("酷狗二维码已过期，请重新登录".to_owned()),
+        _ => Ok(None),
+    }
+}
+
+/// 后台轮询线程：直到登录成功、连续失败或超时。
+/// 酷狗登录接口偶发连接重置，网络类错误连续出现多次才放弃。
+fn kugou_qr_poll_loop(
+    key: &str,
+    sender: std::sync::mpsc::Sender<Result<Option<(String, String, BTreeMap<String, String>)>, String>>,
+) {
+    let mut consecutive_errors = 0;
+    for _ in 0..KUGOU_QR_POLL_ATTEMPTS {
+        match kugou_qr_poll(key) {
+            Ok(Some(triple)) => {
+                let _ = sender.send(Ok(Some(triple)));
+                return;
+            }
+            Ok(None) => consecutive_errors = 0,
+            Err(error) => {
+                eprintln!("[kugou-qr] poll error: {error:#}");
+                consecutive_errors += 1;
+                if consecutive_errors >= 3 {
+                    let _ = sender.send(Err(error));
+                    return;
+                }
+            }
+        }
+        thread::sleep(KUGOU_QR_POLL_INTERVAL);
+    }
+    let _ = sender.send(Err("酷狗扫码等待超时".to_owned()));
+}
+
+/// QQ 与 B 站的刷新 cookie 在基础登录 cookie 之后写入。保持短暂轮询，
+/// 使成功登录捕获到完整的可刷新凭据。
 fn should_complete_capture(
     provider: &str,
     cookies: &BTreeMap<String, String>,
@@ -402,11 +615,31 @@ fn should_complete_capture(
         *required_seen_at = None;
         return false;
     }
-    if provider != "qqmusic" || has_qq_refresh_cookies(cookies) {
+    let refresh_ready = match provider {
+        "qqmusic" => has_qq_refresh_cookies(cookies),
+        "bilibili" => cookies.contains_key("ac_time_value"),
+        _ => true,
+    };
+    if refresh_ready {
         return true;
     }
     let seen_at = required_seen_at.get_or_insert(now);
     now.duration_since(*seen_at) >= QQ_REFRESH_COOKIE_GRACE_PERIOD
+}
+
+#[cfg(test)]
+mod kugou_qr_tests {
+    use super::{kugou_qr_key, kugou_qr_poll};
+
+    #[test]
+    #[ignore = "需要公网访问酷狗登录接口"]
+    fn kugou_qr_key_and_poll_round_trip() {
+        let (key, image) = kugou_qr_key().expect("获取二维码 key");
+        assert!(!key.is_empty());
+        assert!(image.starts_with("data:image"));
+        let result = kugou_qr_poll(&key);
+        eprintln!("poll 结果: {result:?}");
+    }
 }
 
 #[cfg(windows)]
@@ -488,6 +721,12 @@ mod platform {
         data3: 0x432b,
         data4: [0x9d, 0xdc, 0xf8, 0x88, 0x1f, 0xbd, 0x76, 0xe3],
     };
+    const IID_SCRIPT_HANDLER: GUID = GUID {
+        data1: 0x3d8b2a74,
+        data2: 0x9f1e,
+        data3: 0x4c6a,
+        data4: [0xa5, 0x0b, 0x7c, 0x2e, 0x1d, 0x9f, 0x08, 0x53],
+    };
 
     type HandlerQueryInterface =
         unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT;
@@ -521,11 +760,17 @@ mod platform {
         exchange_rx: Option<mpsc::Receiver<Result<BTreeMap<String, String>, String>>>,
         exchange_cookies: BTreeMap<String, String>,
         outcome: Option<Result<BTreeMap<String, String>, CaptureError>>,
+        js_probe_inflight: bool,
+        bilibili_js_probe_attempts: u32,
+        kugou_qr_rx: Option<
+            mpsc::Receiver<Result<Option<(String, String, BTreeMap<String, String>)>, String>>,
+        >,
     }
 
     struct CaptureContext {
         provider: String,
         url: Vec<u16>,
+        html: Option<Vec<u16>>,
         hwnd: HWND,
         state: Mutex<CaptureState>,
     }
@@ -535,9 +780,24 @@ mod platform {
             let url = login_url(provider).ok_or_else(|| {
                 CaptureError::Com(format!("unsupported provider login page: {provider}"))
             })?;
+            Self::new_with_url(provider, hwnd, url)
+        }
+
+        fn new_with_url(provider: &str, hwnd: HWND, url: &str) -> Result<Self, CaptureError> {
             Ok(Self {
                 provider: provider.to_owned(),
                 url: wide(url),
+                html: None,
+                hwnd,
+                state: Mutex::new(CaptureState::default()),
+            })
+        }
+
+        fn new_with_html(provider: &str, hwnd: HWND, html: &str) -> Result<Self, CaptureError> {
+            Ok(Self {
+                provider: provider.to_owned(),
+                url: Vec::new(),
+                html: Some(wide(html)),
                 hwnd,
                 state: Mutex::new(CaptureState::default()),
             })
@@ -692,6 +952,49 @@ mod platform {
             }
         }
 
+        fn poll_kugou_qr(self: &Rc<Self>) {
+            if self.provider != "kugou" {
+                return;
+            }
+            let result = {
+                let state = self.state.lock().expect("capture state mutex poisoned");
+                if state.outcome.is_some() {
+                    return;
+                }
+                let Some(receiver) = state.kugou_qr_rx.as_ref() else {
+                    return;
+                };
+                match receiver.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(mpsc::TryRecvError::Empty)
+                    | Err(mpsc::TryRecvError::Disconnected) => None,
+                }
+            };
+            match result {
+                Some(Ok(Some((token, userid, set_cookies)))) => {
+                    let mut cookies = BTreeMap::new();
+                    cookies.insert(
+                        "KuGoo".to_owned(),
+                        format!("t={token}&KugooID={userid}"),
+                    );
+                    // 保留官方下发的续期字段（t1 等），概念版刷新接口依赖它们。
+                    for (name, value) in set_cookies {
+                        if matches!(name.as_str(), "t1" | "vip_type" | "vip_token") {
+                            cookies.insert(name, value);
+                        }
+                    }
+                    let mut state = self.state.lock().expect("capture state mutex poisoned");
+                    state.outcome = Some(Ok(cookies));
+                }
+                Some(Ok(None)) => {}
+                Some(Err(error)) => {
+                    let mut state = self.state.lock().expect("capture state mutex poisoned");
+                    state.outcome = Some(Err(CaptureError::Io(error)));
+                }
+                None => {}
+            }
+        }
+
         fn poll_cookies(self: &Rc<Self>) {
             let manager = {
                 let mut state = self.state.lock().expect("capture state mutex poisoned");
@@ -726,6 +1029,69 @@ mod platform {
             unsafe { release_com(handler) };
             if result < 0 {
                 self.finish_error(com_error("ICoreWebView2CookieManager::GetCookies", result));
+            }
+        }
+
+        /// B 站把 refresh_token 存在页面 localStorage/sessionStorage（键名
+        /// ac_time_value），cookie 里通常拿不到。登录完成后通过 ExecuteScript
+        /// 读取：若当前页面不在 bilibili 域则先导航回首页；首页的重新加载会
+        /// 触发 B 站前端写入 refresh_token，所以前几次探测交替执行
+        /// 导航刷新与 JS 读取，直到拿到值或达到探测次数上限。
+        fn start_bilibili_js_probe(self: &Rc<Self>, webview: *mut c_void) {
+            if webview.is_null() {
+                let mut state = self.state.lock().expect("capture state mutex poisoned");
+                state.js_probe_inflight = false;
+                state.next_cookie_poll = Some(Instant::now());
+                return;
+            }
+            let probe_index = {
+                let state = self.state.lock().expect("capture state mutex poisoned");
+                state.bilibili_js_probe_attempts
+            };
+            let get_source: unsafe extern "system" fn(*mut c_void, *mut *mut u16) -> HRESULT =
+                unsafe { vtable_fn(webview, 4) };
+            let mut source = null_mut();
+            let mut on_bilibili = false;
+            if unsafe { get_source(webview, &mut source) } >= 0 && !source.is_null() {
+                let source_text = unsafe { read_wide(source) };
+                unsafe { CoTaskMemFree(source as *const c_void) };
+                on_bilibili = source_text.starts_with("https://www.bilibili.com")
+                    || source_text.starts_with("https://bilibili.com");
+            }
+            let navigate: unsafe extern "system" fn(*mut c_void, PCWSTR) -> HRESULT =
+                unsafe { vtable_fn(webview, 5) };
+            let url = wide("https://www.bilibili.com/");
+            // 前 5 次探测交替刷新首页（触发前端写入 refresh_token）与读取。
+            let should_navigate = !on_bilibili || (probe_index <= 5 && probe_index % 2 == 1);
+            if should_navigate {
+                let _ = unsafe { navigate(webview, url.as_ptr()) };
+                let mut state = self.state.lock().expect("capture state mutex poisoned");
+                state.js_probe_inflight = false;
+                state.next_cookie_poll = Some(Instant::now());
+                return;
+            }
+            // ICoreWebView2::ExecuteScript 位于 vtable 槽位 29
+            // （0 get_Settings 起第 26 个方法，加 IUnknown 三个槽位）。
+            let handler = Box::into_raw(Box::new(ScriptHandler {
+                vtbl: &SCRIPT_HANDLER_VTABLE,
+                refs: AtomicU32::new(1),
+                context: Rc::clone(self),
+            })) as *mut c_void;
+            let execute_script: unsafe extern "system" fn(
+                *mut c_void,
+                PCWSTR,
+                *mut c_void,
+            ) -> HRESULT = unsafe { vtable_fn(webview, 29) };
+            let script = wide(
+                "(localStorage.getItem('ac_time_value')||sessionStorage.getItem('ac_time_value'))",
+            );
+            let result = unsafe { execute_script(webview, script.as_ptr(), handler) };
+            unsafe { release_com(handler) };
+            if result < 0 {
+                eprintln!("[js-probe] ExecuteScript failed: {result:#x}");
+                let mut state = self.state.lock().expect("capture state mutex poisoned");
+                state.js_probe_inflight = false;
+                state.next_cookie_poll = Some(Instant::now());
             }
         }
     }
@@ -769,6 +1135,23 @@ mod platform {
         invoke: NavigationStartingInvoke,
     }
 
+    #[repr(C)]
+    struct ScriptHandler {
+        vtbl: &'static ScriptHandlerVtable,
+        refs: AtomicU32,
+        context: Rc<CaptureContext>,
+    }
+
+    type ScriptInvoke = unsafe extern "system" fn(*mut c_void, HRESULT, *const u16) -> HRESULT;
+
+    #[repr(C)]
+    struct ScriptHandlerVtable {
+        query_interface: HandlerQueryInterface,
+        add_ref: HandlerAddRef,
+        release: HandlerRelease,
+        invoke: ScriptInvoke,
+    }
+
     static ENVIRONMENT_HANDLER_VTABLE: HandlerVtable = HandlerVtable {
         query_interface: environment_query_interface,
         add_ref: environment_add_ref,
@@ -794,6 +1177,12 @@ mod platform {
             release: navigation_starting_release,
             invoke: navigation_starting_invoke,
         };
+    static SCRIPT_HANDLER_VTABLE: ScriptHandlerVtable = ScriptHandlerVtable {
+        query_interface: script_query_interface,
+        add_ref: script_add_ref,
+        release: script_release,
+        invoke: script_invoke,
+    };
 
     unsafe extern "system" fn environment_query_interface(
         this: *mut c_void,
@@ -839,6 +1228,14 @@ mod platform {
         )
     }
 
+    unsafe extern "system" fn script_query_interface(
+        this: *mut c_void,
+        riid: *const GUID,
+        out: *mut *mut c_void,
+    ) -> HRESULT {
+        query_interface(this, riid, out, &IID_SCRIPT_HANDLER, script_add_ref)
+    }
+
     unsafe fn query_interface(
         this: *mut c_void,
         riid: *const GUID,
@@ -875,6 +1272,10 @@ mod platform {
         handler_refs(this).fetch_add(1, Ordering::Relaxed) + 1
     }
 
+    unsafe extern "system" fn script_add_ref(this: *mut c_void) -> u32 {
+        handler_refs(this).fetch_add(1, Ordering::Relaxed) + 1
+    }
+
     unsafe extern "system" fn environment_release(this: *mut c_void) -> u32 {
         release_handler::<EnvironmentHandler>(this)
     }
@@ -889,6 +1290,10 @@ mod platform {
 
     unsafe extern "system" fn navigation_starting_release(this: *mut c_void) -> u32 {
         release_handler::<NavigationStartingHandler>(this)
+    }
+
+    unsafe extern "system" fn script_release(this: *mut c_void) -> u32 {
+        release_handler::<ScriptHandler>(this)
     }
 
     unsafe fn handler_refs(this: *mut c_void) -> &'static AtomicU32 {
@@ -1038,9 +1443,17 @@ mod platform {
             return S_OK;
         }
 
-        let navigate: unsafe extern "system" fn(*mut c_void, PCWSTR) -> HRESULT =
-            vtable_fn(webview, 5);
-        let hr = navigate(webview, context.url.as_ptr());
+        // 内嵌 HTML（酷狗二维码页）走 NavigateToString，其余走 Navigate。
+        // ICoreWebView2::NavigateToString 位于 vtable 槽位 6。
+        let hr = if let Some(html) = &context.html {
+            let navigate_to_string: unsafe extern "system" fn(*mut c_void, PCWSTR) -> HRESULT =
+                vtable_fn(webview, 6);
+            navigate_to_string(webview, html.as_ptr())
+        } else {
+            let navigate: unsafe extern "system" fn(*mut c_void, PCWSTR) -> HRESULT =
+                vtable_fn(webview, 5);
+            navigate(webview, context.url.as_ptr())
+        };
         if hr < 0 {
             release_com(cookie_manager);
             release_com(webview);
@@ -1093,20 +1506,61 @@ mod platform {
         let cookies = state.latest_cookies.clone();
         let now = Instant::now();
         let exchange_pending = state.exchange_rx.is_some();
-        if !exchange_pending
+        let complete = !exchange_pending
             && super::should_complete_capture(
                 &context.provider,
                 &cookies,
                 &mut state.required_cookies_seen_at,
                 now,
-            )
-        {
+            );
+        // B 站完成前先尝试从 localStorage/sessionStorage 探测 refresh_token：
+        // 未拿到且次数未耗尽时禁止完成，持续轮询（ExecuteScript 异步回调
+        // 可能晚于下一次 GetCookies，提前完成会错过稍后写入的值）。
+        let probing = complete
+            && context.provider == "bilibili"
+            && !cookies.contains_key("ac_time_value")
+            && state.bilibili_js_probe_attempts < super::BILIBILI_JS_PROBE_ATTEMPTS;
+        if probing {
+            if !state.js_probe_inflight {
+                state.bilibili_js_probe_attempts += 1;
+                state.js_probe_inflight = true;
+                let webview = state.webview;
+                drop(state);
+                context.start_bilibili_js_probe(webview);
+            } else {
+                state.next_cookie_poll = Some(now + super::COOKIE_POLL_INTERVAL);
+            }
+            return S_OK;
+        }
+        if complete {
             state.outcome = Some(Ok(cookies));
         } else {
             state.next_cookie_poll = Some(now + super::COOKIE_POLL_INTERVAL);
         }
         drop(state);
         context.start_login_exchange();
+        S_OK
+    }
+
+    unsafe extern "system" fn script_invoke(
+        this: *mut c_void,
+        result: HRESULT,
+        json_result: *const u16,
+    ) -> HRESULT {
+        let context = (&*(this as *mut ScriptHandler)).context.clone();
+        let mut state = context.state.lock().expect("capture state mutex poisoned");
+        state.js_probe_inflight = false;
+        state.next_cookie_poll = Some(Instant::now());
+        if result >= 0 && !json_result.is_null() {
+            let text = unsafe { read_wide(json_result) };
+            // ExecuteScript 返回 JSON 编码：null 或带引号的字符串。
+            if let Ok(Some(value)) = serde_json::from_str::<Option<String>>(&text)
+                && !value.is_empty()
+            {
+                state.latest_cookies.insert("ac_time_value".to_owned(), value);
+                state.outcome = Some(Ok(state.latest_cookies.clone()));
+            }
+        }
         S_OK
     }
 
@@ -1350,7 +1804,28 @@ mod platform {
         let _runtime = runtime_executable().ok_or(CaptureError::RuntimeMissing)?;
         let _com = ComApartment::initialize()?;
         let window = HostWindow::create()?;
-        let context = Rc::new(CaptureContext::new(provider, window.hwnd)?);
+        // 酷狗走概念版扫码登录：获取二维码 key 与图片，窗口内直接显示
+        // 二维码（内嵌 HTML，避免 H5 页对桌面 UA 跳转），后台轮询扫码状态；
+        // 其余平台使用固定的登录页。
+        let (context, qr_receiver) = if provider == "kugou" {
+            let (key, image) = super::kugou_qr_key().map_err(CaptureError::Io)?;
+            let (sender, receiver) = mpsc::channel();
+            let poll_key = key.clone();
+            thread::spawn(move || super::kugou_qr_poll_loop(&poll_key, sender));
+            let html = super::kugou_qr_page(&image);
+            let context = Rc::new(CaptureContext::new_with_html(provider, window.hwnd, &html)?);
+            (context, Some(receiver))
+        } else {
+            let context = Rc::new(CaptureContext::new(provider, window.hwnd)?);
+            (context, None)
+        };
+        if let Some(receiver) = qr_receiver {
+            context
+                .state
+                .lock()
+                .expect("capture state mutex poisoned")
+                .kugou_qr_rx = Some(receiver);
+        }
         window.attach_context(&context);
         let environment_handler = Box::into_raw(Box::new(EnvironmentHandler {
             vtbl: &ENVIRONMENT_HANDLER_VTABLE,
@@ -1379,6 +1854,7 @@ mod platform {
             pump_messages(&context);
             context.poll_navigation();
             context.poll_login_exchange();
+            context.poll_kugou_qr();
             context.poll_cookies();
             context.start_login_exchange();
             if let Some(outcome) = context.take_outcome() {
@@ -1622,17 +2098,49 @@ mod tests {
     }
 
     #[test]
-    fn bilibili_capture_finishes_when_sessdata_is_available() {
-        let bilibili = BTreeMap::from([("SESSDATA".to_owned(), "session".to_owned())]);
+    fn bilibili_capture_waits_for_refresh_token_after_sessdata() {
+        let basic = BTreeMap::from([("SESSDATA".to_owned(), "session".to_owned())]);
+        let start = Instant::now();
+        let mut required_seen_at = None;
+
+        assert!(!should_complete_capture(
+            "bilibili",
+            &basic,
+            &mut required_seen_at,
+            start,
+        ));
+        assert_eq!(required_seen_at, Some(start));
+    }
+
+    #[test]
+    fn bilibili_capture_finishes_when_refresh_token_arrives() {
+        let refreshable = BTreeMap::from([
+            ("SESSDATA".to_owned(), "session".to_owned()),
+            ("ac_time_value".to_owned(), "refresh".to_owned()),
+        ]);
         let mut required_seen_at = None;
 
         assert!(should_complete_capture(
             "bilibili",
-            &bilibili,
+            &refreshable,
             &mut required_seen_at,
             Instant::now(),
         ));
         assert_eq!(required_seen_at, None);
+    }
+
+    #[test]
+    fn bilibili_capture_falls_back_to_basic_cookies_after_grace_period() {
+        let basic = BTreeMap::from([("SESSDATA".to_owned(), "session".to_owned())]);
+        let start = Instant::now();
+        let mut required_seen_at = Some(start);
+
+        assert!(should_complete_capture(
+            "bilibili",
+            &basic,
+            &mut required_seen_at,
+            start + QQ_REFRESH_COOKIE_GRACE_PERIOD,
+        ));
     }
 
     #[test]

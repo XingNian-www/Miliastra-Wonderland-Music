@@ -39,6 +39,41 @@ pub struct StartupConfig {
     pub wonderland_map_star_region: RectConfig,
 }
 
+impl Default for StartupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            launch_game: false,
+            enter_game: false,
+            enter_wonderland: false,
+            exe_path: PathBuf::new(),
+            game_args: String::new(),
+            launch_wait_ms: 0,
+            launch_retries: 0,
+            enter_game_timeout_ms: 0,
+            enter_wonderland_timeout_ms: 0,
+            wonderland_map_star_retries: 0,
+            wonderland_map_star_retry_ms: 0,
+            wonderland_hall_retries: 0,
+            wonderland_hall_retry_ms: 0,
+            wonderland_transition_timeout_ms: 0,
+            wonderland_confirm_stable_timeout_ms: 0,
+            final_primary_timeout_ms: 0,
+            poll_ms: 0,
+            stable_mean_threshold: 0.0,
+            stable_changed_ratio_threshold: 0.0,
+            template_threshold: 0.0,
+            wonderland_confirm_threshold: 0.0,
+            templates: StartupTemplateConfig::default(),
+            enter_game_text_region: RectConfig::default(),
+            wonderland_hall_ocr_region: RectConfig::default(),
+            wonderland_confirm_region: RectConfig::default(),
+            main_ui_region: RectConfig::default(),
+            wonderland_map_star_region: RectConfig::default(),
+        }
+    }
+}
+
 impl StartupConfig {
     pub(crate) fn validate(&self) -> Result<()> {
         validate_threshold(self.template_threshold, "startup.template_threshold")?;
@@ -154,6 +189,16 @@ pub struct StartupTemplateConfig {
     pub wonderland_map_star: PathBuf,
     pub wonderland_confirm: PathBuf,
     pub paimon_menu: PathBuf,
+}
+
+impl Default for StartupTemplateConfig {
+    fn default() -> Self {
+        Self {
+            wonderland_map_star: PathBuf::new(),
+            wonderland_confirm: PathBuf::new(),
+            paimon_menu: PathBuf::new(),
+        }
+    }
 }
 
 const START_GAME_CONTEXT_LOSS_REASON: &str = "启动游戏任务将重建聊天上下文";

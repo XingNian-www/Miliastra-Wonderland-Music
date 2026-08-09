@@ -826,10 +826,10 @@ impl PlaybackApplication {
                                 .ok()
                                 .flatten()
                         });
-                    if let Some(track) = next {
-                        if let Err(error) = port.preload_track(&track) {
-                            log::debug!("预加载下一首音源失败: {error:#}");
-                        }
+                    if let Some(track) = next
+                        && let Err(error) = port.preload_track(&track)
+                    {
+                        log::debug!("预加载下一首音源失败: {error:#}");
                     }
                     return Ok(());
                 }

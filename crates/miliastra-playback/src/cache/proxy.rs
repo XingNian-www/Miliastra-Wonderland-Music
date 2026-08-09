@@ -94,19 +94,17 @@ async fn read_request_head(stream: &mut TcpStream) -> std::io::Result<Option<Req
     let mut range_end = None;
     for line in lines {
         let lower = line.to_ascii_lowercase();
-        if let Some(value) = lower.strip_prefix("range:") {
-            let value = value.trim();
-            if let Some(rest) = value.strip_prefix("bytes=") {
-                if let Some(dash) = rest.find('-') {
-                    let start = rest[..dash].trim();
-                    let end = rest[dash + 1..].trim();
-                    if !start.is_empty() {
-                        range_start = start.parse::<u64>().ok();
-                    }
-                    if !end.is_empty() {
-                        range_end = end.parse::<u64>().ok();
-                    }
-                }
+        if let Some(value) = lower.strip_prefix("range:")
+            && let Some(rest) = value.trim().strip_prefix("bytes=")
+            && let Some(dash) = rest.find('-')
+        {
+            let start = rest[..dash].trim();
+            let end = rest[dash + 1..].trim();
+            if !start.is_empty() {
+                range_start = start.parse::<u64>().ok();
+            }
+            if !end.is_empty() {
+                range_end = end.parse::<u64>().ok();
             }
         }
     }
@@ -335,9 +333,7 @@ async fn serve_streaming(
             return Ok(());
         }
     }
-    let head = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
-    );
+    let head = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
     stream.write_all(head.as_bytes()).await?;
 
     let mut file = loop {

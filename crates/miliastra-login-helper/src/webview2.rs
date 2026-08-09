@@ -411,6 +411,9 @@ const KUGOU_QR_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const KUGOU_QR_POLL_ATTEMPTS: u32 = 90;
 const KUGOU_UA: &str = "Android15-1070-11083-46-0-DiscoveryDRADProtocol-wifi";
 
+/// 酷狗扫码轮询结果：`Ok(Some((token, userid, cookies)))` 表示登录成功。
+type KugouQrPollResult = Result<Option<(String, String, BTreeMap<String, String>)>, String>;
+
 /// 酷狗 web 版签名：md5(盐值 + 参数按 key 排序后的 k=v 拼接 + 盐值)。
 fn kugou_web_signature(params: &BTreeMap<String, String>) -> String {
     let mut pairs = params.iter().collect::<Vec<_>>();
@@ -547,7 +550,7 @@ fn kugou_qr_page(image: &str) -> String {
 
 /// 轮询扫码状态。`Ok(Some((token, userid, cookies)))` 表示登录成功，
 /// cookies 为官方 Set-Cookie 下发的续期字段（t1 等）。
-fn kugou_qr_poll(key: &str) -> Result<Option<(String, String, BTreeMap<String, String>)>, String> {
+fn kugou_qr_poll(key: &str) -> KugouQrPollResult {
     let mut params = kugou_default_params();
     params.insert("plat".to_owned(), "4".to_owned());
     params.insert("srcappid".to_owned(), KUGOU_SRCAPPID.to_string());
@@ -582,12 +585,7 @@ fn kugou_qr_poll(key: &str) -> Result<Option<(String, String, BTreeMap<String, S
 
 /// 后台轮询线程：直到登录成功、连续失败或超时。
 /// 酷狗登录接口偶发连接重置，网络类错误连续出现多次才放弃。
-fn kugou_qr_poll_loop(
-    key: &str,
-    sender: std::sync::mpsc::Sender<
-        Result<Option<(String, String, BTreeMap<String, String>)>, String>,
-    >,
-) {
+fn kugou_qr_poll_loop(key: &str, sender: std::sync::mpsc::Sender<KugouQrPollResult>) {
     let mut consecutive_errors = 0;
     for _ in 0..KUGOU_QR_POLL_ATTEMPTS {
         match kugou_qr_poll(key) {
@@ -652,7 +650,7 @@ mod kugou_qr_tests {
 #[cfg(windows)]
 #[allow(unsafe_op_in_unsafe_fn)]
 mod platform {
-    use super::{CaptureError, allowed_cookie_names, login_url};
+    use super::{CaptureError, KugouQrPollResult, allowed_cookie_names, login_url};
     use std::collections::BTreeMap;
     use std::ffi::{OsStr, c_void};
     use std::mem::{size_of, transmute_copy};
@@ -769,9 +767,7 @@ mod platform {
         outcome: Option<Result<BTreeMap<String, String>, CaptureError>>,
         js_probe_inflight: bool,
         bilibili_js_probe_attempts: u32,
-        kugou_qr_rx: Option<
-            mpsc::Receiver<Result<Option<(String, String, BTreeMap<String, String>)>, String>>,
-        >,
+        kugou_qr_rx: Option<mpsc::Receiver<KugouQrPollResult>>,
     }
 
     struct CaptureContext {

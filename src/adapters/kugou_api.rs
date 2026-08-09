@@ -235,10 +235,10 @@ fn generated_mac() -> io::Result<String> {
             }
             current = adapter.Next;
         }
-        return Err(io::Error::new(
+        Err(io::Error::new(
             io::ErrorKind::NotFound,
             "未找到可用本机网卡地址",
-        ));
+        ))
     }
     #[cfg(not(windows))]
     {

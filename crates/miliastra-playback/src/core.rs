@@ -36,10 +36,11 @@ fn unix_epoch_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// 对搜索候选逐个执行真实可用性探测（平台权限接口或播放流解析），
-/// 把可用性标注换成实测结果：
-/// - 探测确认可播放 → Eligible；
-/// - 平台明确 VIP/无版权 → 对应标注；
+/// 对搜索候选确定可用性：
+/// - 账号 VIP 状态已知时优先直接用账号信息改写标注（VIP 歌曲按账号判定），不探测；
+/// - 只有 VIP 无法判定（未登录/未知/查询失败）且标注需要确认时才探测；
+/// - 免费可播/无版权/付费/不可播等标注与账号 VIP 无关，直接采用；
+/// - 探测确认可播放 → Eligible；平台明确 VIP/无版权 → 对应标注；
 /// - 探测确认为不可用（Unavailable）且无明确初始原因 → Ineligible；
 /// - 认证/限流/超时等无法确认的场景 → 保留初始标注，不猜测。
 async fn probe_candidates(
@@ -47,12 +48,35 @@ async fn probe_candidates(
     candidates: Vec<ProviderSearchCandidate>,
     request_timeout: Duration,
 ) -> Vec<ProviderSearchCandidate> {
+    // 账号 VIP 信息（平台自身带缓存）：已知时省掉全部播放流探测。
+    let account_vip = match timeout(request_timeout, adapter.account_status()).await {
+        Ok(Ok(Some(status))) if status.logged_in && status.vip_type.is_some() => Some(status.vip),
+        _ => None,
+    };
     let mut probes = Vec::with_capacity(candidates.len());
     for candidate in candidates.into_iter().take(PROBE_CONCURRENCY) {
+        let initial = candidate.eligibility;
+        let needs_probe = match initial {
+            // 明确标注 VIP 的歌曲：账号 VIP 未知时探测兜底（凭据能拿到流即可播）。
+            PlaybackEligibility::VipRequired => account_vip.is_none(),
+            // 元数据未给出判定：探测确认。
+            PlaybackEligibility::Unknown => true,
+            // 免费可播/无版权/付费/不可播与账号 VIP 无关，直接采用。
+            _ => false,
+        };
+        if !needs_probe {
+            let eligibility = match (initial, account_vip) {
+                // 账号有 VIP → VIP 歌曲直接放行；无 VIP → 屏蔽。
+                (PlaybackEligibility::VipRequired, Some(true)) => PlaybackEligibility::Eligible,
+                (PlaybackEligibility::VipRequired, Some(false)) => PlaybackEligibility::VipRequired,
+                (other, _) => other,
+            };
+            probes.push(tokio::spawn(async move { (candidate, eligibility) }));
+            continue;
+        }
         let adapter = adapter.clone();
         let key = candidate.song.key.clone();
         let locator = candidate.song.resolver_locator.clone();
-        let initial = candidate.eligibility;
         probes.push(tokio::spawn(async move {
             let outcome = timeout(
                 request_timeout,
@@ -881,7 +905,9 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::catalog::{PlaybackEligibility, ProviderSearchCandidate, SourceAdapter};
+    use crate::catalog::{
+        PlaybackEligibility, ProviderAccountStatus, ProviderSearchCandidate, SourceAdapter,
+    };
     use crate::domain::{PlaybackSnapshot, StreamSource};
 
     struct FakeSource {
@@ -1020,6 +1046,117 @@ mod tests {
 
         assert!(!first.is_empty());
         assert_eq!(first, second);
+    }
+
+    /// 账号 VIP 已知：VIP 标注直接按账号改写，不探测；
+    /// 账号 VIP 未知：探测兜底。
+    #[tokio::test]
+    async fn vip_candidates_use_account_status_before_probing() {
+        struct VipSource {
+            account: Option<ProviderAccountStatus>,
+            probes: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl SourceAdapter for VipSource {
+            async fn search(
+                &self,
+                _spec: &SearchSpec,
+            ) -> Result<Vec<ProviderSearchCandidate>, CatalogError> {
+                Ok(vec![ProviderSearchCandidate {
+                    song: song("vip", "1"),
+                    eligibility: PlaybackEligibility::VipRequired,
+                }])
+            }
+
+            async fn resolve(
+                &self,
+                _key: &SongKey,
+                _locator: Option<&ResolverLocator>,
+            ) -> Result<StreamSource, CatalogError> {
+                Ok(StreamSource {
+                    url: Url::parse("https://example.test/audio.mp3").unwrap(),
+                    headers: BTreeMap::new(),
+                    expires_at_epoch_ms: None,
+                })
+            }
+
+            async fn probe_eligibility(
+                &self,
+                _key: &SongKey,
+                _locator: Option<&ResolverLocator>,
+            ) -> Result<PlaybackEligibility, CatalogError> {
+                self.probes.fetch_add(1, Ordering::SeqCst);
+                Ok(PlaybackEligibility::Eligible)
+            }
+
+            async fn account_status(&self) -> Result<Option<ProviderAccountStatus>, CatalogError> {
+                Ok(self.account.clone())
+            }
+        }
+
+        fn status(vip: bool, vip_type: Option<&str>) -> ProviderAccountStatus {
+            ProviderAccountStatus {
+                logged_in: true,
+                vip,
+                vip_type: vip_type.map(str::to_owned),
+                ..ProviderAccountStatus::default()
+            }
+        }
+
+        // 账号有 VIP：直接放行，探测 0 次。
+        let probes = Arc::new(AtomicUsize::new(0));
+        let source = Arc::new(VipSource {
+            account: Some(status(true, Some("1"))),
+            probes: probes.clone(),
+        });
+        let candidates = probe_candidates(
+            source,
+            vec![ProviderSearchCandidate {
+                song: song("vip", "1"),
+                eligibility: PlaybackEligibility::VipRequired,
+            }],
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(probes.load(Ordering::SeqCst), 0);
+        assert_eq!(candidates[0].eligibility, PlaybackEligibility::Eligible);
+
+        // 账号无 VIP：屏蔽，探测 0 次。
+        let probes = Arc::new(AtomicUsize::new(0));
+        let source = Arc::new(VipSource {
+            account: Some(status(false, Some("0"))),
+            probes: probes.clone(),
+        });
+        let candidates = probe_candidates(
+            source,
+            vec![ProviderSearchCandidate {
+                song: song("vip", "1"),
+                eligibility: PlaybackEligibility::VipRequired,
+            }],
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(probes.load(Ordering::SeqCst), 0);
+        assert_eq!(candidates[0].eligibility, PlaybackEligibility::VipRequired);
+
+        // 账号 VIP 未知（未登录/查询失败）：探测兜底。
+        let probes = Arc::new(AtomicUsize::new(0));
+        let source = Arc::new(VipSource {
+            account: None,
+            probes: probes.clone(),
+        });
+        let candidates = probe_candidates(
+            source,
+            vec![ProviderSearchCandidate {
+                song: song("vip", "1"),
+                eligibility: PlaybackEligibility::VipRequired,
+            }],
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(probes.load(Ordering::SeqCst), 1);
+        assert_eq!(candidates[0].eligibility, PlaybackEligibility::Eligible);
     }
 
     #[tokio::test]

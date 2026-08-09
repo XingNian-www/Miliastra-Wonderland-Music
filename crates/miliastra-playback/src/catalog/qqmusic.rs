@@ -5,11 +5,20 @@
 //! PlaybackEligibility.
 
 use std::collections::BTreeMap;
-use std::time::Duration;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use aes::Aes128;
 use async_trait::async_trait;
 use base64::Engine;
+use cbc::Encryptor;
+use cipher::{BlockEncryptMut, KeyIvInit, block_padding::Pkcs7};
+use rand::{Rng, distributions::Alphanumeric};
 use reqwest::{Client, StatusCode};
+use rsa::pkcs8::DecodePublicKey;
+use rsa::{Pkcs1v15Encrypt, RsaPublicKey};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use url::Url;
 
@@ -24,8 +33,14 @@ const RESOLVE_URL: &str = "https://u.y.qq.com/cgi-bin/musicu.fcg";
 const LOGIN_URL: &str = "https://u.y.qq.com/cgi-bin/musics.fcg";
 const WEB_REFRESH_URL: &str = "https://c.y.qq.com/base/fcgi-bin/login_get_musickey.fcg";
 const LYRICS_URL: &str = "https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg";
+const LYRICS_NATIVE_URL: &str = "https://u.y.qq.com/cgi-bin/musicu.fcg";
 const QQ_MOBILE_VERSION: i64 = 14_090_008;
 const QQ_QIMEI_FALLBACK: &str = "6c9d3cd110abca9b16311cee10001e717614";
+const QQ_DEVICE_FILE: &str = "qqmusic-device.json";
+const QIMEI_URL: &str = "https://api.tencentmusic.com/tme/trpc/proxy";
+const QIMEI_APP_KEY: &str = "0AND0HD6FE4HY80F";
+const QIMEI_SECRET: &str = "ZdJqM15EeO2zWc08";
+const QIMEI_PUBLIC_KEY: &str = "-----BEGIN PUBLIC KEY-----\nMIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDEIxgwoutfwoJxcGQeedgP7FG9qaIuS0qzfR8gWkrkTZKM2iWHn2ajQpBRZjMSoSf6+KJGvar2ORhBfpDXyVtZCKpqLQ+FLkpncClKVIrBwv6PHyUvuCb0rIarmgDnzkfQAqVufEtR64iazGDKatvJ9y6B9NMbHddGSAUmRTCrHQIDAQAB\n-----END PUBLIC KEY-----";
 const PLAY_BITS_MASK: i64 = 0b1110;
 const TRY_BIT_MASK: i64 = 1 << 14;
 
@@ -37,6 +52,8 @@ pub struct QqMusicAdapter {
     resolve_url: Url,
     login_url: Url,
     lyrics_url: Url,
+    native_lyrics_url: Url,
+    device: QqDevice,
 }
 
 impl QqMusicAdapter {
@@ -46,9 +63,12 @@ impl QqMusicAdapter {
             .user_agent("miliastra-wonderland-music/0.1")
             .build()
             .map_err(|error| CatalogError::Transient(error.to_string()))?;
+        let device = QqDevice::load(credentials.non_sensitive_path(QQ_DEVICE_FILE))
+            .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?;
         Ok(Self {
             client,
             credentials,
+            device,
             search_url: Url::parse(SEARCH_URL)
                 .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?,
             resolve_url: Url::parse(RESOLVE_URL)
@@ -56,6 +76,8 @@ impl QqMusicAdapter {
             login_url: Url::parse(LOGIN_URL)
                 .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?,
             lyrics_url: Url::parse(LYRICS_URL)
+                .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?,
+            native_lyrics_url: Url::parse(LYRICS_NATIVE_URL)
                 .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?,
         })
     }
@@ -75,7 +97,8 @@ impl QqMusicAdapter {
     }
 
     #[cfg(test)]
-    pub fn with_lyrics_endpoint(mut self, lyrics_url: Url) -> Self {
+    pub fn with_lyrics_endpoints(mut self, native_lyrics_url: Url, lyrics_url: Url) -> Self {
+        self.native_lyrics_url = native_lyrics_url;
         self.lyrics_url = lyrics_url;
         self
     }
@@ -150,6 +173,47 @@ impl QqMusicAdapter {
         parse_qq_json(&body)
     }
 
+    async fn native_lyrics_json(&self, song_mid: &str) -> Result<Value, CatalogError> {
+        let credential = self.credential()?;
+        let body = json!({
+            "req": {
+                "method": "GetPlayLyricInfo",
+                "module": "music.musichallSong.PlayLyricInfo",
+                "param": {
+                    "songMID": song_mid,
+                    "trans": 1
+                }
+            }
+        });
+        let data = body.to_string();
+        let response = self
+            .client
+            .get(self.native_lyrics_url.clone())
+            .query(&[
+                ("format", "json"),
+                ("inCharset", "utf8"),
+                ("outCharset", "utf-8"),
+                ("data", data.as_str()),
+            ])
+            .header("Cookie", cookie_header(credential.cookies()))
+            .header("Referer", "https://y.qq.com/")
+            .send()
+            .await
+            .map_err(classify_request_error)?;
+        classify_status(&response)?;
+        response
+            .json::<Value>()
+            .await
+            .map_err(|error| CatalogError::InvalidResponse(error.to_string()))
+    }
+
+    async fn lyrics_json_with_translation(&self, song_mid: &str) -> Result<Value, CatalogError> {
+        match self.native_lyrics_json(song_mid).await {
+            Ok(response) if response.pointer("/req/data").is_some() => Ok(response),
+            Ok(_) | Err(_) => self.lyrics_json(song_mid).await,
+        }
+    }
+
     async fn retry_after_refresh(
         &self,
         credential: &ProviderCredential,
@@ -202,6 +266,7 @@ impl QqMusicAdapter {
         let music_id = uin.parse::<u64>().map_err(|_| {
             CatalogError::AuthRequired("QQ Music account identifier requires relogin".to_owned())
         })?;
+        let qimei = self.qimei().await;
         let payload = qq_refresh_payload(
             &uin,
             music_key,
@@ -210,6 +275,8 @@ impl QqMusicAdapter {
             refresh_token,
             refresh_key,
             music_id,
+            &self.device,
+            &qimei,
         );
         let body = serde_json::to_string(&payload)
             .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?;
@@ -374,6 +441,69 @@ impl QqMusicAdapter {
         Ok(Some(refreshed))
     }
 
+    async fn qimei(&self) -> QqQimei {
+        if let Some(qimei) = self.device.qimei.clone() {
+            return qimei;
+        }
+        let Ok(payload) =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| qimei_payload(&self.device)))
+        else {
+            return QqQimei {
+                q16: String::new(),
+                q36: QQ_QIMEI_FALLBACK.to_owned(),
+            };
+        };
+        let result = self
+            .client
+            .post(QIMEI_URL)
+            .header("method", "GetQimei")
+            .header("service", "trpc.tme_datasvr.qimeiproxy.QimeiProxy")
+            .header("appid", "qimei_qq_android")
+            .header("User-Agent", "QQMusic")
+            .header("timestamp", payload.timestamp.to_string())
+            .header(
+                "sign",
+                md5_hex(&format!(
+                    "qimei_qq_androidpzAuCmaFAaFaHrdakPjLIEqKrGnSOOvH{}",
+                    payload.timestamp
+                )),
+            )
+            .json(&payload.body)
+            .send()
+            .await
+            .ok();
+        let result = if let Some(response) = result {
+            response.json::<Value>().await.ok()
+        } else {
+            None
+        }
+        .and_then(|body| body.get("data").cloned())
+        .and_then(|data| {
+            if data.is_string() {
+                serde_json::from_str(data.as_str()?).ok()
+            } else {
+                Some(data)
+            }
+        })
+        .and_then(|data| data.get("data").cloned())
+        .and_then(|data| {
+            Some(QqQimei {
+                q16: data.get("q16")?.to_string().trim_matches('"').to_owned(),
+                q36: data.get("q36")?.to_string().trim_matches('"').to_owned(),
+            })
+        });
+        if let Some(result) = result {
+            let mut device = self.device.clone();
+            device.qimei = Some(result.clone());
+            let _ = device.save();
+            return result;
+        }
+        QqQimei {
+            q16: String::new(),
+            q36: QQ_QIMEI_FALLBACK.to_owned(),
+        }
+    }
+
     fn search_payload(keyword: &str, limit: usize) -> Value {
         json!({
             "comm": {
@@ -510,10 +640,11 @@ impl SourceAdapter for QqMusicAdapter {
             ));
         }
         let (song_mid, _) = qq_resolver_ids(key, locator)?;
-        let response = self.lyrics_json(&song_mid).await?;
+        let response = self.lyrics_json_with_translation(&song_mid).await?;
         let code = response
             .get("retcode")
             .or_else(|| response.get("code"))
+            .or_else(|| response.pointer("/req/code"))
             .and_then(as_i64)
             .unwrap_or_default();
         if code != 0 {
@@ -530,7 +661,9 @@ impl SourceAdapter for QqMusicAdapter {
         let primary = lyric_value(&response, "lyric")
             .map(decode_qq_lyric)
             .unwrap_or_default();
-        let translation = lyric_value(&response, "trans").map(decode_qq_lyric);
+        let translation = lyric_value(&response, "trans")
+            .map(decode_qq_lyric)
+            .and_then(|value| strip_untranslated_placeholder_lines(&value));
         parse_lrc_pair(&primary, translation.as_deref())
             .map_err(|error| CatalogError::InvalidResponse(error.to_string()))
     }
@@ -661,7 +794,20 @@ fn lyric_value<'a>(response: &'a Value, field: &str) -> Option<&'a str> {
     response
         .get(field)
         .or_else(|| response.pointer(&format!("/data/{field}")))
+        .or_else(|| response.pointer(&format!("/req/data/{field}")))
         .and_then(Value::as_str)
+}
+
+fn strip_untranslated_placeholder_lines(value: &str) -> Option<String> {
+    let cleaned = value
+        .lines()
+        .filter(|line| {
+            line.rsplit_once(']')
+                .is_none_or(|(_, text)| text.trim() != "//")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!cleaned.trim().is_empty()).then_some(cleaned)
 }
 
 fn parse_qq_json(body: &str) -> Result<Value, CatalogError> {
@@ -727,6 +873,195 @@ fn replace_cookie_alias_from_value(
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct QqQimei {
+    q16: String,
+    q36: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct QqOsVersion {
+    incremental: String,
+    release: String,
+    codename: String,
+    sdk: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct QqDevice {
+    display: String,
+    product: String,
+    device: String,
+    board: String,
+    model: String,
+    fingerprint: String,
+    boot_id: String,
+    proc_version: String,
+    imei: String,
+    brand: String,
+    bootloader: String,
+    base_band: String,
+    version: QqOsVersion,
+    sim_info: String,
+    os_type: String,
+    mac_address: String,
+    wifi_bssid: String,
+    wifi_ssid: String,
+    imsi_md5: Vec<u8>,
+    android_id: String,
+    #[serde(skip)]
+    path: Option<PathBuf>,
+    apn: String,
+    vendor_name: String,
+    vendor_os_name: String,
+    qimei: Option<QqQimei>,
+}
+
+impl QqDevice {
+    fn load(path: Option<PathBuf>) -> Result<Self, std::io::Error> {
+        if let Some(path) = path {
+            if path.exists() {
+                let mut device: Self = serde_json::from_str(&fs::read_to_string(&path)?)
+                    .map_err(std::io::Error::other)?;
+                device.path = Some(path);
+                return Ok(device);
+            }
+            let mut device = Self::new();
+            device.path = Some(path.clone());
+            device.save_at(&path)?;
+            return Ok(device);
+        }
+        Ok(Self::new())
+    }
+    fn new() -> Self {
+        let mut rng = rand::thread_rng();
+        let serial: u32 = rng.gen_range(100000..1_000_000);
+        let build: u32 = rng.gen_range(1_000_000..10_000_000);
+        let android_id: u64 = rand::random();
+        Self {
+            display: format!("QMAPI.{serial}.001"),
+            product: "iarim".into(),
+            device: "sagit".into(),
+            board: "eomam".into(),
+            model: "MI 6".into(),
+            fingerprint: format!(
+                "xiaomi/iarim/sagit:10/eomam.200122.001/{build}:user/release-keys"
+            ),
+            boot_id: uuid::Uuid::new_v4().to_string(),
+            proc_version: format!("Linux 5.4.0-54-generic-{serial:08x} (android-build@google.com)"),
+            imei: random_imei(&mut rng),
+            brand: "Xiaomi".into(),
+            bootloader: "U-boot".into(),
+            base_band: String::new(),
+            version: QqOsVersion {
+                incremental: "5891938".into(),
+                release: "10".into(),
+                codename: "REL".into(),
+                sdk: 29,
+            },
+            sim_info: "T-Mobile".into(),
+            os_type: "android".into(),
+            mac_address: "00:50:56:C0:00:08".into(),
+            wifi_bssid: "00:50:56:C0:00:08".into(),
+            wifi_ssid: "<unknown ssid>".into(),
+            imsi_md5: md5::compute(android_id.to_be_bytes()).0.to_vec(),
+            android_id: format!("{android_id:016x}"),
+            apn: "wifi".into(),
+            vendor_name: "MIUI".into(),
+            vendor_os_name: "qmapi".into(),
+            qimei: None,
+            path: None,
+        }
+    }
+    fn save(&self) -> Result<(), std::io::Error> {
+        if let Some(path) = &self.path {
+            self.save_at(path)?;
+        }
+        Ok(())
+    }
+    fn save_at(&self, path: &Path) -> Result<(), std::io::Error> {
+        fs::write(
+            path,
+            serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?,
+        )
+    }
+}
+
+fn random_imei(rng: &mut impl rand::Rng) -> String {
+    let mut digits: Vec<u8> = (0..14).map(|_| rng.gen_range(0..10)).collect();
+    let sum: u32 = digits
+        .iter()
+        .enumerate()
+        .map(|(i, n)| {
+            let v = if (i + 2) % 2 == 0 {
+                *n as u32 * 2
+            } else {
+                *n as u32
+            };
+            v / 10 + v % 10
+        })
+        .sum();
+    digits.push(((sum * 9) % 10) as u8);
+    digits.into_iter().map(|n| char::from(b'0' + n)).collect()
+}
+
+struct QimeiRequest {
+    timestamp: u64,
+    body: Value,
+}
+fn qimei_payload(device: &QqDevice) -> QimeiRequest {
+    let crypt_key: String = rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(16)
+        .map(char::from)
+        .collect();
+    let nonce: String = rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(16)
+        .map(char::from)
+        .collect();
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let key = base64::engine::general_purpose::STANDARD.encode(
+        RsaPublicKey::from_public_key_pem(QIMEI_PUBLIC_KEY)
+            .unwrap()
+            .encrypt(
+                &mut rand::thread_rng(),
+                Pkcs1v15Encrypt,
+                crypt_key.as_bytes(),
+            )
+            .unwrap(),
+    );
+    let plain = json!({"androidId":device.android_id,"platformId":1,"appKey":QIMEI_APP_KEY,"appVersion":"14.9.0","brand":device.brand,"channelId":"10003505","imei":device.imei,"model":device.model,"osVersion":"Android 10,level 29","qimei":"","qimei36":"","sdkVersion":"1.2.13.6","targetSdkVersion":"33","packageId":"com.tencent.qqmusic"}).to_string();
+    let cipher =
+        Encryptor::<Aes128>::new_from_slices(crypt_key.as_bytes(), crypt_key.as_bytes()).unwrap();
+    let mut buffer = plain.into_bytes();
+    let length = buffer.len();
+    buffer.resize(length + 16, 0);
+    let encrypted = cipher
+        .encrypt_padded_mut::<Pkcs7>(&mut buffer, length)
+        .unwrap();
+    let params = base64::engine::general_purpose::STANDARD.encode(encrypted);
+    let extra = format!("{{\"appKey\":\"{QIMEI_APP_KEY}\"}}");
+    let sign = md5_hex(&format!(
+        "{key}{params}{}{}{}{}",
+        timestamp * 1000,
+        nonce,
+        QIMEI_SECRET,
+        extra
+    ));
+    QimeiRequest {
+        timestamp,
+        body: json!({"app":0,"os":1,"qimeiParams":{"key":key,"params":params,"time":timestamp.to_string(),"nonce":nonce,"sign":sign,"extra":extra}}),
+    }
+}
+fn md5_hex(value: &str) -> String {
+    format!("{:x}", md5::compute(value))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn qq_refresh_payload(
     uin: &str,
     music_key: &str,
@@ -735,6 +1070,8 @@ fn qq_refresh_payload(
     refresh_token: &str,
     refresh_key: &str,
     music_id: u64,
+    device: &QqDevice,
+    qimei: &QqQimei,
 ) -> Value {
     json!({
         "comm": {
@@ -742,8 +1079,8 @@ fn qq_refresh_payload(
             "ct": 11,
             "cv": QQ_MOBILE_VERSION,
             "chid": "2005000982",
-            "QIMEI": "",
-            "QIMEI36": QQ_QIMEI_FALLBACK,
+            "QIMEI": qimei.q16,
+            "QIMEI36": qimei.q36,
             "tmeAppID": "qqmusic",
             "format": "json",
             "inCharset": "utf-8",
@@ -751,16 +1088,16 @@ fn qq_refresh_payload(
             "qq": uin,
             "authst": music_key,
             "tmeLoginType": 2,
-            "OpenUDID": "ffffffffbff94f7d000000000033c587",
-            "udid": "ffffffffbff94f7d000000000033c587",
-            "os_ver": "10",
-            "aid": "d2550265db4ce5c4",
-            "phonetype": "MI 6",
-            "devicelevel": 29,
-            "newdevicelevel": 29,
+            "OpenUDID": device.android_id,
+            "udid": device.boot_id,
+            "os_ver": device.version.release,
+            "aid": device.android_id,
+            "phonetype": device.model,
+            "devicelevel": device.version.sdk,
+            "newdevicelevel": device.version.sdk,
             "nettype": "1030",
-            "rom": "xiaomi/iarim/sagit:10/eomam.200122.001/5891938:user/release-keys",
-            "OpenUDID2": "ffffffffbff94f7d000001999ff7d5bf"
+            "rom": device.fingerprint,
+            "OpenUDID2": device.android_id
         },
         "req": {
             "module": "music.login.LoginServer",
@@ -900,9 +1237,7 @@ fn qq_resolver_ids(
         return Ok((key.id.clone(), key.id.clone()));
     };
     let value = locator.as_str();
-    let (song_mid, media_mid) = if let Some(song_mid) = value.strip_prefix("qqmusic:v1:") {
-        (song_mid, song_mid)
-    } else if let Some(value) = value.strip_prefix("qqmusic:v2:") {
+    let (song_mid, media_mid) = if let Some(value) = value.strip_prefix("qqmusic:v2:") {
         value.split_once(':').ok_or_else(|| {
             CatalogError::InvalidResolverLocator("QQ Music locator is malformed".to_owned())
         })?
@@ -1013,8 +1348,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        PlaybackEligibility, QqMusicAdapter, parse_search_candidates, qq_eligibility, qq_filename,
-        qq_resolver_ids, qq_stream_url,
+        PlaybackEligibility, QQ_QIMEI_FALLBACK, QqDevice, QqMusicAdapter, QqQimei,
+        parse_search_candidates, qq_eligibility, qq_filename, qq_resolver_ids, qq_stream_url,
     };
     use crate::catalog::{CatalogError, SourceAdapter};
     use crate::credentials::{CredentialStore, ProviderCredential};
@@ -1164,19 +1499,19 @@ mod tests {
     }
 
     #[test]
-    fn qq_resolver_keeps_v1_fallback_and_reads_v2_media_mid() {
+    fn qq_resolver_requires_current_v2_locator() {
         let key = SongKey::new("qqmusic", "songMid").unwrap();
-        let v1 = ResolverLocator::new("qqmusic:v1:songMid").unwrap();
-        let v2 = ResolverLocator::new("qqmusic:v2:songMid:mediaMid").unwrap();
+        let locator = ResolverLocator::new("qqmusic:v2:songMid:mediaMid").unwrap();
+        let legacy = ResolverLocator::new("qqmusic:v1:songMid").unwrap();
 
         assert_eq!(
-            qq_resolver_ids(&key, Some(&v1)).unwrap(),
-            ("songMid".to_owned(), "songMid".to_owned())
-        );
-        assert_eq!(
-            qq_resolver_ids(&key, Some(&v2)).unwrap(),
+            qq_resolver_ids(&key, Some(&locator)).unwrap(),
             ("songMid".to_owned(), "mediaMid".to_owned())
         );
+        assert!(matches!(
+            qq_resolver_ids(&key, Some(&legacy)),
+            Err(CatalogError::InvalidResolverLocator(_))
+        ));
     }
 
     #[test]
@@ -1221,6 +1556,11 @@ mod tests {
             "refresh-token",
             "refresh-key",
             42,
+            &QqDevice::new(),
+            &QqQimei {
+                q16: "".into(),
+                q36: QQ_QIMEI_FALLBACK.into(),
+            },
         );
         assert_eq!(payload["req"]["module"], "music.login.LoginServer");
         assert_eq!(payload["req"]["param"]["refresh_key"], "refresh-key");
@@ -1431,9 +1771,13 @@ mod tests {
     #[tokio::test]
     async fn qq_lyrics_uses_the_native_endpoint_and_prefers_translation() {
         let body = json!({
-            "retcode": 0,
-            "lyric": "[00:01.00]original",
-            "trans": "[00:01.00]translated"
+            "req": {
+                "code": 0,
+                "data": {
+                    "lyric": "[00:01.00]original",
+                    "trans": "[00:01.00]translated"
+                }
+            }
         })
         .to_string();
         let (endpoint, request) = fixture_server(body);
@@ -1444,7 +1788,7 @@ mod tests {
             endpoint.clone(),
         )
         .unwrap()
-        .with_lyrics_endpoint(endpoint);
+        .with_lyrics_endpoints(endpoint.clone(), endpoint);
         let key = SongKey::new("qqmusic", "songMid").unwrap();
         let locator = ResolverLocator::new("qqmusic:v2:songMid:mediaMid").unwrap();
 
@@ -1452,8 +1796,40 @@ mod tests {
 
         assert_eq!(lyrics.line_at_ms(1_000), Some("translated"));
         let request = request.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert!(request.contains("/resolve?songmid=songMid"));
-        assert!(request.contains("nobase64=1"));
+        let target = request
+            .lines()
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .nth(1)
+            .unwrap();
+        let request_url = Url::parse(&format!("http://fixture{target}")).unwrap();
+        let payload = request_url
+            .query_pairs()
+            .find(|(name, _)| name == "data")
+            .map(|(_, value)| serde_json::from_str::<serde_json::Value>(&value).unwrap())
+            .unwrap();
+        assert_eq!(
+            payload.pointer("/req/method"),
+            Some(&json!("GetPlayLyricInfo"))
+        );
+        assert_eq!(
+            payload.pointer("/req/param/songMID"),
+            Some(&json!("songMid"))
+        );
+        assert_eq!(payload.pointer("/req/param/trans"), Some(&json!(1)));
         assert!(request.to_ascii_lowercase().contains("cookie:"));
+    }
+
+    #[test]
+    fn qq_translation_placeholder_lines_are_removed() {
+        assert_eq!(
+            super::strip_untranslated_placeholder_lines("[00:01.00]translated\n[00:02.00]//"),
+            Some("[00:01.00]translated".to_owned())
+        );
+        assert_eq!(
+            super::strip_untranslated_placeholder_lines("[00:02.00]//"),
+            None
+        );
     }
 }

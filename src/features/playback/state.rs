@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
-use miliastra_playback::PlayableTrack;
+use miliastra_playback::{PlayableTrack, TrackKey};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::queue::QueueItem;
@@ -94,6 +94,9 @@ pub(crate) struct RequestStateSnapshot {
     #[serde(default = "default_history_id")]
     pub next_control_operation_id: u64,
     pub queue: Vec<QueueItem>,
+    /// 已确认播放过的歌曲，队列播完后随机播放；按 TrackKey 去重，持久化。
+    #[serde(default)]
+    pub playback_pool: Vec<PlayableTrack>,
     pub playback: PlaybackRuntimeState,
     #[serde(default)]
     pub session_binding: Option<PlaybackSessionBinding>,
@@ -113,6 +116,7 @@ impl Default for RequestStateSnapshot {
             next_attempt_id: 1,
             next_control_operation_id: 1,
             queue: Vec::new(),
+            playback_pool: Vec::new(),
             playback: PlaybackRuntimeState::default(),
             session_binding: None,
             handled_terminal_outcomes: Vec::new(),
@@ -169,6 +173,53 @@ impl RequestStateStore {
             self.snapshot.next_queue_item_id,
             self.snapshot.queue.clone(),
         )
+    }
+
+    pub(crate) fn playback_pool_snapshot(&self) -> Vec<PlayableTrack> {
+        self.snapshot.playback_pool.clone()
+    }
+
+    /// 把已确认播放的歌曲写入播放池；同 TrackKey 已在池中时忽略，不重复进入。
+    /// `max_size == 0` 表示播放池禁用，直接忽略。超过上限时淘汰最旧一首。
+    pub(crate) fn record_pool_track(
+        &mut self,
+        track: PlayableTrack,
+        max_size: usize,
+    ) -> Result<bool> {
+        if max_size == 0 {
+            return Ok(false);
+        }
+        self.update(|snapshot| {
+            let pool = &mut snapshot.playback_pool;
+            if pool
+                .iter()
+                .any(|existing| existing.track_ref.key == track.track_ref.key)
+            {
+                return false;
+            }
+            if pool.len() >= max_size {
+                pool.remove(0);
+            }
+            pool.push(track);
+            true
+        })
+    }
+
+    /// 从播放池随机挑一首，排除 `exclude` 指定的 TrackKey；池空或全部被排除时返回 None。
+    pub(crate) fn pick_pool_track(&self, exclude: Option<&TrackKey>) -> Option<PlayableTrack> {
+        let pool = &self.snapshot.playback_pool;
+        let candidates = pool
+            .iter()
+            .filter(|track| exclude != Some(&track.track_ref.key))
+            .collect::<Vec<_>>();
+        let count = candidates.len();
+        if count == 0 {
+            return None;
+        }
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.subsec_nanos() as usize);
+        Some(candidates[seed % count].clone())
     }
 
     pub(crate) fn playback_snapshot(&self) -> PlaybackRuntimeState {
@@ -936,6 +987,105 @@ mod tests {
         assert_eq!(json["queue"].as_array().unwrap().len(), 1);
         assert_eq!(json["playback"]["state"], "paused_by_user");
 
+        remove_request_state_path(state_path);
+    }
+
+    #[test]
+    fn playback_pool_deduplicates_by_track_key_and_respects_max_size() {
+        let state_path = temp_request_state_path("playback-pool");
+        let store =
+            RequestStateStore::load(state_path.clone(), crate::test_support::test_state_store())
+                .unwrap();
+        {
+            let mut store = store.lock().unwrap();
+            assert!(store
+                .record_pool_track(
+                    test_track("miliastra://track/qqmusic/1", "歌一 - 歌手A"),
+                    3,
+                )
+                .unwrap());
+            // 同 TrackKey 再次写入被忽略，不重复进入。
+            assert!(!store
+                .record_pool_track(
+                    test_track("miliastra://track/qqmusic/1", "歌一 - 歌手A"),
+                    3,
+                )
+                .unwrap());
+            assert_eq!(store.playback_pool_snapshot().len(), 1);
+            store
+                .record_pool_track(test_track("miliastra://track/qqmusic/2", "歌二 - 歌手B"), 3)
+                .unwrap();
+            store
+                .record_pool_track(test_track("miliastra://track/qqmusic/3", "歌三 - 歌手C"), 3)
+                .unwrap();
+            // 达到上限后新歌淘汰最旧一首。
+            store
+                .record_pool_track(test_track("miliastra://track/qqmusic/4", "歌四 - 歌手D"), 3)
+                .unwrap();
+            let snapshot = store.playback_pool_snapshot();
+            let keys = snapshot
+                .iter()
+                .map(|track| track.track_ref.key.id.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(keys, ["2", "3", "4"]);
+            // max_size == 0 表示禁用，直接忽略。
+            assert!(!store
+                .record_pool_track(
+                    test_track("miliastra://track/qqmusic/5", "歌五 - 歌手E"),
+                    0,
+                )
+                .unwrap());
+        }
+        remove_request_state_path(state_path);
+    }
+
+    #[test]
+    fn playback_pool_pick_excludes_the_requested_key() {
+        let state_path = temp_request_state_path("playback-pool-pick");
+        let store =
+            RequestStateStore::load(state_path.clone(), crate::test_support::test_state_store())
+                .unwrap();
+        {
+            let mut store = store.lock().unwrap();
+            for id in ["1", "2", "3"] {
+                store
+                    .record_pool_track(
+                        test_track(
+                            &format!("miliastra://track/qqmusic/{id}"),
+                            &format!("歌{id} - 歌手{id}"),
+                        ),
+                        10,
+                    )
+                    .unwrap();
+            }
+            let picked = store.pick_pool_track(None).expect("pool has candidates");
+            assert_ne!(picked.track_ref.key.id, "");
+            let re_picked = store
+                .pick_pool_track(Some(&picked.track_ref.key))
+                .expect("excluding one key still leaves candidates");
+            assert_ne!(re_picked.track_ref.key.id, picked.track_ref.key.id);
+            // 排除不在池中的 key 仍能选到候选。
+            let last_key = store
+                .playback_pool_snapshot()
+                .iter()
+                .find(|track| {
+                    track.track_ref.key.id != picked.track_ref.key.id
+                        && track.track_ref.key.id != re_picked.track_ref.key.id
+                })
+                .unwrap()
+                .track_ref
+                .key
+                .clone();
+            assert!(store.pick_pool_track(Some(&last_key)).is_some());
+            // 空池返回 None。
+            store
+                .update(|snapshot| {
+                    snapshot.playback_pool.clear();
+                    true
+                })
+                .unwrap();
+            assert!(store.pick_pool_track(None).is_none());
+        }
         remove_request_state_path(state_path);
     }
 

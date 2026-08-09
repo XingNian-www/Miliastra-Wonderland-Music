@@ -16,7 +16,7 @@ use crate::interfaces::http::{
 use crate::runtime::chat_listener::ChatListenerState;
 use crate::runtime::player_io::SearchCandidate;
 use crate::runtime::scheduler::{DiagnosticTaskSnapshot, FormalTaskReceipt};
-use miliastra_playback::LoginSession;
+use miliastra_playback::{KugouAccountStatus, KugouListenReport, LoginSession};
 
 fn custom_workflow_service_from_config_parts(
     config: &CustomWorkflowConfig,
@@ -624,6 +624,13 @@ impl HttpLoginPort for HttpTestLoginPort {
                         .into_iter()
                         .map(|(name, present)| (name.to_owned(), present))
                         .collect(),
+                    refresh_supported: status.refresh_supported,
+                    manual_refresh_supported: status.manual_refresh_supported,
+                    refresh_ready: status.refresh_ready,
+                    refresh_state: status.refresh_state,
+                    last_refresh_at_ms: status.last_refresh_at_ms,
+                    next_refresh_check_at_ms: status.next_refresh_check_at_ms,
+                    last_refresh_error: status.last_refresh_error,
                 }
             })
             .collect())
@@ -674,6 +681,35 @@ impl HttpLoginPort for HttpTestLoginPort {
         Ok(miliastra_playback::CredentialStatus::empty(
             provider.as_str(),
         ))
+    }
+
+    fn refresh(
+        &self,
+        provider: ProviderId,
+    ) -> Result<miliastra_playback::CredentialStatus, HttpLoginError> {
+        Ok(miliastra_playback::CredentialStatus::empty(
+            provider.as_str(),
+        ))
+    }
+
+    fn kugou_status(&self) -> Result<KugouAccountStatus, HttpLoginError> {
+        Ok(KugouAccountStatus {
+            logged_in: true,
+            user_id: Some("123".to_owned()),
+            nickname: Some("测试账号".to_owned()),
+            vip: true,
+            vip_type: Some("年费".to_owned()),
+            vip_expire_at_ms: Some(1_735_689_600_000),
+            listen_report_available: true,
+        })
+    }
+
+    fn kugou_report(&self, _mixsongid: String) -> Result<KugouListenReport, HttpLoginError> {
+        Ok(KugouListenReport {
+            accepted: true,
+            vip_days: 30,
+            message: "领取成功".to_owned(),
+        })
     }
 }
 
@@ -929,7 +965,7 @@ fn native_player_and_login_routes_use_structured_json_without_secrets() {
     let providers = http_get(address, "/player/providers", None);
     assert_eq!(providers.status_line, "HTTP/1.1 200 OK");
     let providers: Value = serde_json::from_str(&providers.body).expect("providers JSON");
-    assert_eq!(providers.as_array().map(Vec::len), Some(3));
+    assert_eq!(providers.as_array().map(Vec::len), Some(4));
     assert_eq!(providers[0]["configured"], false);
     assert!(providers[0].get("cookies").is_none());
 
@@ -974,7 +1010,7 @@ fn native_player_and_login_routes_use_structured_json_without_secrets() {
     let mismatch = json!({
         "trackRef": {
             "key": {"provider": "netease", "id": "123"},
-            "resolverLocator": "qqmusic:v1:123"
+            "resolverLocator": "qqmusic:v2:123:media123"
         },
         "metadata": {"title": "坏曲目", "artists": []}
     });
@@ -1039,6 +1075,33 @@ fn native_player_and_login_routes_use_structured_json_without_secrets() {
     let status = http_get(address, "/player/login/status", None);
     let status: Value = serde_json::from_str(&status.body).expect("inactive login status JSON");
     assert_eq!(status["active"], false);
+
+    let refresh = http_post_json(address, "/player/login/refresh?provider=kugou", "{}", None);
+    assert_eq!(refresh.status_line, "HTTP/1.1 200 OK");
+    let refresh: Value = serde_json::from_str(&refresh.body).expect("refresh JSON");
+    assert_eq!(refresh["provider"], "kugou");
+
+    let kugou_status = http_get(address, "/player/kugou/status", None);
+    assert_eq!(kugou_status.status_line, "HTTP/1.1 200 OK");
+    let kugou_status: Value = serde_json::from_str(&kugou_status.body).expect("Kugou status JSON");
+    assert_eq!(kugou_status["loggedIn"], true);
+    assert_eq!(kugou_status["userId"], "123");
+    assert_eq!(kugou_status["vip"], true);
+    assert!(kugou_status.get("token").is_none());
+
+    let report = http_post_json(address, "/player/kugou/report?mixsongid=314159", "{}", None);
+    assert_eq!(report.status_line, "HTTP/1.1 200 OK");
+    let report: Value = serde_json::from_str(&report.body).expect("Kugou report JSON");
+    assert_eq!(report["accepted"], true);
+    assert_eq!(report["vipDays"], 30);
+
+    let invalid_report = http_post_json(
+        address,
+        "/player/kugou/report?mixsongid=not-a-number",
+        "{}",
+        None,
+    );
+    assert_eq!(invalid_report.status_line, "HTTP/1.1 400 Bad Request");
 
     server.shutdown().expect("shutdown HTTP server");
 }

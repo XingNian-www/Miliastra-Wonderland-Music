@@ -234,6 +234,24 @@ const ROUTES: &[RouteSpec] = &[
         handler: player_login_status_route,
     },
     RouteSpec {
+        path: "/player/login/refresh",
+        json: true,
+        mutating: true,
+        handler: player_login_refresh_route,
+    },
+    RouteSpec {
+        path: "/player/kugou/status",
+        json: true,
+        mutating: false,
+        handler: player_kugou_status_route,
+    },
+    RouteSpec {
+        path: "/player/kugou/report",
+        json: true,
+        mutating: true,
+        handler: player_kugou_report_route,
+    },
+    RouteSpec {
         path: "/queue",
         json: true,
         mutating: false,
@@ -980,8 +998,15 @@ fn validate_source(raw: &str) -> std::result::Result<String, AppError> {
         return Ok(text);
     }
     for part in text.split(',').map(str::trim) {
-        if !part.is_empty() && part != "qqmusic" && part != "netease" && part != "bilibili" {
-            return Err(bad_request("source参数只允许qqmusic、netease或bilibili"));
+        if !part.is_empty()
+            && part != "qqmusic"
+            && part != "netease"
+            && part != "bilibili"
+            && part != "kugou"
+        {
+            return Err(bad_request(
+                "source参数只允许qqmusic、netease、bilibili或kugou",
+            ));
         }
     }
     Ok(text)
@@ -1382,6 +1407,7 @@ fn player_search_error(error: HttpPlayerSearchError) -> AppError {
 fn login_http_error(error: HttpLoginError) -> AppError {
     let status = match error.code {
         "unsupported_provider" | "invalid_helper_provider" | "invalid_helper_credential" => 400,
+        "provider_auth_required" | "relogin_required" => 401,
         "login_not_active" => 404,
         "login_in_progress" | "login_session_invalid" => 409,
         "login_timeout" | "login_cancel_timeout" => 504,

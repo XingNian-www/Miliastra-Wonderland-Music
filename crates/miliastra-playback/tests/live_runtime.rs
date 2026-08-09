@@ -8,7 +8,7 @@ use miliastra_playback::{
     ProviderId, SearchQuery, TrackKey, TrackMetadata, TrackRef,
 };
 
-const LEGACY_CREDENTIAL_DIRECTORY: &str = "MILIASTRA_LEGACY_CREDENTIAL_DIRECTORY";
+const CREDENTIAL_DIRECTORY: &str = "MILIASTRA_CREDENTIAL_DIRECTORY";
 const SEARCH_KEYWORD: &str = "\u{828a}\u{828a}";
 const BILIBILI_BVID: &str = "BV1us411d75p";
 
@@ -19,26 +19,24 @@ struct LiveRuntime {
 
 impl LiveRuntime {
     fn start(providers: &[ProviderId]) -> Self {
-        let source = std::env::var_os(LEGACY_CREDENTIAL_DIRECTORY)
+        let source = std::env::var_os(CREDENTIAL_DIRECTORY)
             .map(PathBuf::from)
             .unwrap_or_else(|| {
                 panic!(
-                    "set {LEGACY_CREDENTIAL_DIRECTORY} to a directory containing the three legacy credential JSON files"
+                    "set {CREDENTIAL_DIRECTORY} to a directory containing provider credential JSON files"
                 )
             });
         let credential_directory = temporary_credential_directory();
-        let runtime =
-            PlaybackRuntime::start(&credential_directory).expect("start playback runtime");
+        let runtime = PlaybackRuntime::start(&credential_directory, "http://127.0.0.1:3000")
+            .expect("start playback runtime");
         let handle = runtime.handle();
         for provider in providers.iter().copied() {
             let path = source.join(format!("{}.json", provider.as_str()));
-            let credential: ProviderCredential =
-                serde_json::from_slice(&fs::read(&path).unwrap_or_else(|error| {
-                    panic!("read legacy credential {}: {error}", path.display())
-                }))
-                .unwrap_or_else(|error| {
-                    panic!("parse legacy credential {}: {error}", path.display())
-                });
+            let credential: ProviderCredential = serde_json::from_slice(
+                &fs::read(&path)
+                    .unwrap_or_else(|error| panic!("read credential {}: {error}", path.display())),
+            )
+            .unwrap_or_else(|error| panic!("parse credential {}: {error}", path.display()));
             assert_eq!(credential.provider(), provider.as_str());
             let status = handle
                 .save_credential(credential)
@@ -67,7 +65,7 @@ impl Drop for LiveRuntime {
 
 #[test]
 #[ignore = "requires live provider credentials and public network access"]
-fn live_search_reports_three_provider_candidates() {
+fn live_search_reports_provider_candidates() {
     let runtime = LiveRuntime::start(&ProviderId::ALL);
     let handle = runtime.handle();
 

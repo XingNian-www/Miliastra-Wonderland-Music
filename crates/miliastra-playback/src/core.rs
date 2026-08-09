@@ -356,6 +356,44 @@ impl PlaybackCore {
         self.login.owns(session_id, provider)
     }
 
+    pub async fn refresh_kugou_credential(&self) -> Result<ProviderCredential, PlaybackCoreError> {
+        let account = self
+            .catalog
+            .kugou_account()
+            .ok_or_else(|| PlaybackCoreError::UnknownSource("kugou".to_owned()))?;
+        timeout(self.source_timeout, account.refresh_token())
+            .await
+            .map_err(|_| PlaybackCoreError::Catalog(CatalogError::TimedOut("kugou".to_owned())))?
+            .map_err(PlaybackCoreError::Catalog)
+    }
+
+    pub async fn kugou_account_status(
+        &self,
+    ) -> Result<crate::catalog::KugouAccountStatus, PlaybackCoreError> {
+        let account = self
+            .catalog
+            .kugou_account()
+            .ok_or_else(|| PlaybackCoreError::UnknownSource("kugou".to_owned()))?;
+        timeout(self.source_timeout, account.account_status())
+            .await
+            .map_err(|_| PlaybackCoreError::Catalog(CatalogError::TimedOut("kugou".to_owned())))?
+            .map_err(PlaybackCoreError::Catalog)
+    }
+
+    pub async fn kugou_report_listen_song(
+        &self,
+        mixsongid: &str,
+    ) -> Result<crate::catalog::KugouListenReport, PlaybackCoreError> {
+        let account = self
+            .catalog
+            .kugou_account()
+            .ok_or_else(|| PlaybackCoreError::UnknownSource("kugou".to_owned()))?;
+        timeout(self.source_timeout, account.report_listen_song(mixsongid))
+            .await
+            .map_err(|_| PlaybackCoreError::Catalog(CatalogError::TimedOut("kugou".to_owned())))?
+            .map_err(PlaybackCoreError::Catalog)
+    }
+
     pub async fn validate_credential(
         &self,
         provider: crate::catalog::ProviderId,

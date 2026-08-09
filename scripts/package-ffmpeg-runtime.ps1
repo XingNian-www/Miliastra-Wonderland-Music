@@ -10,6 +10,8 @@ param(
 
     [string]$LoginHelper = (Join-Path $PSScriptRoot "..\target\release\miliastra-login-helper.exe"),
 
+    [string]$KugouApi = (Join-Path $PSScriptRoot "..\target\kugou-api.exe"),
+
     [string]$Mnn = (Join-Path $PSScriptRoot "..\vendor\mnn\3.6.0\windows-x64\bin\MNN.dll"),
 
     [Parameter(Mandatory = $true)]
@@ -80,7 +82,7 @@ function Test-SystemImport {
     param([string]$Import)
 
     return $Import -match "^(api-ms-win|ext-ms-win)-.*\.dll$" -or
-        $Import -match "^(advapi32|bcrypt|bcryptprimitives|cfgmgr32|combase|crypt32|d3dcompiler_47|dwmapi|gdi32|imm32|kernel32|kernelbase|mmdevapi|msvcp[0-9_]*|msvcrt|ncrypt|ntdll|ole32|oleaut32|propsys|rpcrt4|secur32|setupapi|shell32|shlwapi|ucrtbase|user32|userenv|version|vcruntime[0-9_]*|winhttp|wininet|winmm|wintrust|ws2_32)\.dll$"
+        $Import -match "^(advapi32|bcrypt|bcryptprimitives|cfgmgr32|combase|crypt32|dbghelp|d3dcompiler_47|dwmapi|gdi32|imm32|kernel32|kernelbase|iphlpapi|mmdevapi|msvcp[0-9_]*|msvcrt|ncrypt|ntdll|ole32|oleaut32|psapi|propsys|rpcrt4|secur32|setupapi|shell32|shlwapi|ucrtbase|user32|userenv|version|vcruntime[0-9_]*|winhttp|wininet|winmm|wintrust|ws2_32)\.dll$"
 }
 
 function Assert-NoForbiddenImport {
@@ -106,6 +108,7 @@ if (-not (Test-Path -LiteralPath $ffmpegBin -PathType Container)) {
 
 $executableFile = Get-ExistingFile $Executable "main executable"
 $loginHelperFile = Get-ExistingFile $LoginHelper "login helper executable"
+$kugouApiFile = Get-ExistingFile $KugouApi "Kugou API executable"
 $mnnFile = Get-ExistingFile $Mnn "MNN runtime"
 $minGwRuntimeFile = Get-ExistingFile $MinGwRuntime "MinGW runtime"
 if ($minGwRuntimeFile.Name.ToLowerInvariant() -ne "libwinpthread-1.dll") {
@@ -130,6 +133,7 @@ $destinationDirectory = (Resolve-Path -LiteralPath $Destination).Path
 $filesToCopy = @(
     $executableFile
     $loginHelperFile
+    $kugouApiFile
     $mnnFile
     $mediaFiles
     $minGwRuntimeFile
@@ -141,6 +145,7 @@ foreach ($file in $filesToCopy) {
 $expectedFiles = @(
     $executableFile.Name.ToLowerInvariant()
     $loginHelperFile.Name.ToLowerInvariant()
+    $kugouApiFile.Name.ToLowerInvariant()
     "mnn.dll"
     $mediaNames | ForEach-Object { $_.ToLowerInvariant() }
     $minGwRuntimeFile.Name.ToLowerInvariant()
@@ -170,6 +175,7 @@ foreach ($mediaName in $mediaNames) {
 $roots = @(
     (Join-Path $destinationDirectory $executableFile.Name)
     (Join-Path $destinationDirectory $loginHelperFile.Name)
+    (Join-Path $destinationDirectory $kugouApiFile.Name)
     (Join-Path $destinationDirectory $mnnFile.Name)
 )
 $visited = @{}

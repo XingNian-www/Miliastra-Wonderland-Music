@@ -152,6 +152,8 @@ pub struct QueueConfig {
     pub auto_advance_seconds: u64,
     pub protect_current_song_until_finished: bool,
     pub external_playback_protect_after_seconds: u64,
+    /// 播放池最大容量，0 表示禁用播放池
+    pub pool_max_size: usize,
 }
 
 impl QueueConfig {
@@ -678,6 +680,7 @@ pub(crate) struct PlaybackService {
     song_dedup_history: PersistentSongDedupHistory,
     song_dedup: SongDedupConfig,
     external_playback_tracker: controller::ExternalPlaybackTracker,
+    pool_max_size: usize,
 }
 
 impl PlaybackService {
@@ -685,6 +688,7 @@ impl PlaybackService {
         playback_state_path: PathBuf,
         song_dedup_history_path: PathBuf,
         queue_max_size: usize,
+        pool_max_size: usize,
         song_dedup: SongDedupConfig,
         wall_clock: Arc<dyn WallClock>,
         store: Arc<dyn miliastra_contracts::StateStore>,
@@ -694,13 +698,25 @@ impl PlaybackService {
         let playback_state = PersistentPlaybackState::from_request_store(request_state.clone())?;
         let song_dedup_history =
             PersistentSongDedupHistory::load(song_dedup_history_path, wall_clock, store)?;
+        let pool_size = request_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("请求状态存储锁已中毒"))?
+            .playback_pool_snapshot()
+            .len();
         log::info!("已加载队列: {} 首", queue.len());
+        log::info!("已加载播放池: {} 首", pool_size);
         log::info!("已加载长时间同歌去重历史: {} 条", song_dedup_history.len());
         log::info!(
             "已加载播放状态: playback_state={:?}",
             playback_state.state().state
         );
-        let mut service = Self::new(queue, playback_state, song_dedup_history, song_dedup);
+        let mut service = Self::new(
+            queue,
+            playback_state,
+            song_dedup_history,
+            song_dedup,
+            pool_max_size,
+        );
         service.request_state = Some(request_state);
         Ok(service)
     }
@@ -710,6 +726,7 @@ impl PlaybackService {
         playback_state: PersistentPlaybackState,
         song_dedup_history: PersistentSongDedupHistory,
         song_dedup: SongDedupConfig,
+        pool_max_size: usize,
     ) -> Self {
         Self {
             queue,
@@ -718,6 +735,7 @@ impl PlaybackService {
             song_dedup_history,
             song_dedup,
             external_playback_tracker: controller::ExternalPlaybackTracker::default(),
+            pool_max_size,
         }
     }
 
@@ -786,6 +804,47 @@ impl PlaybackService {
 
     pub(crate) fn clear_queue(&mut self) -> Result<usize> {
         self.queue.clear()
+    }
+
+    pub(crate) fn playback_pool_snapshot(&self) -> Result<Vec<PlayableTrack>> {
+        let Some(store) = &self.request_state else {
+            return Ok(Vec::new());
+        };
+        store
+            .lock()
+            .map_err(|_| anyhow::anyhow!("请求状态存储锁已中毒"))
+            .map(|store| store.playback_pool_snapshot())
+    }
+
+    pub(crate) fn record_playback_pool_track(&mut self, track: PlayableTrack) -> Result<()> {
+        let Some(store) = &self.request_state else {
+            return Ok(());
+        };
+        store
+            .lock()
+            .map_err(|_| anyhow::anyhow!("请求状态存储锁已中毒"))?
+            .record_pool_track(track, self.pool_max_size)
+            .map(|_| ())
+    }
+
+    pub(crate) fn pick_playback_pool_track(
+        &mut self,
+        exclude: Option<&miliastra_playback::TrackKey>,
+    ) -> Result<Option<PlayableTrack>> {
+        let Some(store) = &self.request_state else {
+            return Ok(None);
+        };
+        Ok(store
+            .lock()
+            .map_err(|_| anyhow::anyhow!("请求状态存储锁已中毒"))?
+            .pick_pool_track(exclude))
+    }
+
+    pub(crate) fn playback_pool_available(&self) -> Result<bool> {
+        if self.pool_max_size == 0 {
+            return Ok(false);
+        }
+        Ok(!self.playback_pool_snapshot()?.is_empty())
     }
 
     pub(crate) fn playback_state_snapshot(&self) -> PlaybackRuntimeState {
@@ -1059,6 +1118,7 @@ mod tests {
             )
             .unwrap(),
             SongDedupConfig::default(),
+            0,
         );
 
         let error = service

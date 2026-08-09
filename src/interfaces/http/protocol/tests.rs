@@ -1280,7 +1280,8 @@ workflows:
     )
     .expect("custom workflow config");
     let default_config: AppConfig =
-        serde_yaml::from_str(include_str!("../../../../tests/fixtures/config.full.yaml")).expect("default config");
+        serde_yaml::from_str(include_str!("../../../../tests/fixtures/config.full.yaml"))
+            .expect("default config");
     state.application.commands = Arc::new(ApplicationHttpCommandFacade::new(
         state.recording.clone(),
         custom_workflow_service_from_config_parts(
@@ -1534,7 +1535,8 @@ fn web_tool_templates_expose_configured_fixed_regions() {
 #[test]
 fn remote_http_api_requires_token_when_configured() {
     let mut config: AppConfig =
-        serde_yaml::from_str(include_str!("../../../../tests/fixtures/config.full.yaml")).expect("default config");
+        serde_yaml::from_str(include_str!("../../../../tests/fixtures/config.full.yaml"))
+            .expect("default config");
     config.http.host = "0.0.0.0".to_string();
     config.http.access_token = "secret".to_string();
     let request = Request {
@@ -2221,26 +2223,29 @@ fn search_source_route_requires_an_explicit_source() {
 fn startup_wonderland_partial_enqueue_reports_which_tasks_queued() {
     let state = test_state();
     state.recording.fail_startup_enqueue();
-    let value: Value = serde_json::from_str(
-        &enqueue_startup_wonderland(&state).expect("partial response"),
-    )
-    .expect("response JSON");
+    let value: Value =
+        serde_json::from_str(&enqueue_startup_wonderland(&state).expect("partial response"))
+            .expect("response JSON");
 
     assert_eq!(value["ok"], true);
     assert_eq!(value["queued"], true);
     assert_eq!(value["allQueued"], false);
     assert_eq!(value["taskIds"].as_array().unwrap().len(), 1);
     assert_eq!(value["failed"][0]["index"], 1);
-    assert!(value["failed"][0]["error"].as_str().unwrap().contains("内部错误"));
+    assert!(
+        value["failed"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("内部错误")
+    );
 }
 
 #[test]
 fn startup_wonderland_full_success_keeps_existing_contract() {
     let state = test_state();
-    let value: Value = serde_json::from_str(
-        &enqueue_startup_wonderland(&state).expect("full response"),
-    )
-    .expect("response JSON");
+    let value: Value =
+        serde_json::from_str(&enqueue_startup_wonderland(&state).expect("full response"))
+            .expect("response JSON");
 
     assert_eq!(value["ok"], true);
     assert_eq!(value["queued"], true);
@@ -2252,7 +2257,8 @@ fn startup_wonderland_full_success_keeps_existing_contract() {
 
 fn test_state_with_player_port(player: impl HttpPlayerPort + 'static) -> HttpTestState {
     let config: AppConfig =
-        serde_yaml::from_str(include_str!("../../../../tests/fixtures/config.full.yaml")).expect("default config");
+        serde_yaml::from_str(include_str!("../../../../tests/fixtures/config.full.yaml"))
+            .expect("default config");
     let monitor = MonitorShared::new(20);
     let custom_workflow = custom_workflow_service_from_config_parts(
         &config.custom_workflows,
@@ -2291,4 +2297,3 @@ fn test_state_with_player_port(player: impl HttpPlayerPort + 'static) -> HttpTes
         recording,
     }
 }
-

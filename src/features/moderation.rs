@@ -25,6 +25,23 @@ pub struct ModerationConfig {
     pub confirm_region: RectConfig,
 }
 
+impl Default for ModerationConfig {
+    fn default() -> Self {
+        Self {
+            stable_vote_samples: 0,
+            required_vote_margin: 0,
+            friend_panel_region: RectConfig::default(),
+            search_panel_region: RectConfig::default(),
+            search_input_point: PointConfig::default(),
+            search_button_point: PointConfig::default(),
+            more_settings_region: RectConfig::default(),
+            block_chat_region: RectConfig::default(),
+            blacklist_region: RectConfig::default(),
+            confirm_region: RectConfig::default(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModerationTimingConfig {

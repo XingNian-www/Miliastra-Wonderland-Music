@@ -113,15 +113,6 @@ jobs:
             }
           }
 
-      - name: 安装 Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 18
-
-      - name: 构建酷狗概念版 API sidecar
-        shell: pwsh
-        run: ./scripts/build-kugou-api.ps1 -Destination 'target/kugou-api.exe'
-
       - name: 编译 Release EXE
         run: cargo build --workspace --release --target x86_64-pc-windows-msvc --locked
 
@@ -179,7 +170,6 @@ jobs:
             -MinGwRuntime 'vendor/ffmpeg/8.1/windows-x64/bin/libwinpthread-1.dll' `
             -Executable 'target/x86_64-pc-windows-msvc/release/miliastra-wonderland-music.exe' `
             -LoginHelper 'target/x86_64-pc-windows-msvc/release/miliastra-login-helper.exe' `
-            -KugouApi 'target/kugou-api.exe' `
             -Mnn 'vendor/mnn/3.6.0/windows-x64/bin/MNN.dll' `
             -Destination $dist `
             -Objdump $env:OBJDUMP
@@ -204,7 +194,6 @@ jobs:
           $requiredFiles = @(
             'miliastra-wonderland-music.exe',
             'miliastra-login-helper.exe',
-            'kugou-api.exe',
             'MNN.dll',
             'avformat-62.dll',
             'avcodec-62.dll',

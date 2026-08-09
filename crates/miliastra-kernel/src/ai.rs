@@ -366,8 +366,10 @@ fn merge_extra_body<T: Serialize>(
     let standard = standard
         .as_object()
         .ok_or_else(|| anyhow!("OpenAI 标准请求必须是 JSON object"))?;
+    // 值为 null 的占位字段不发送（配置文件预置了各网关可选字段，全部默认为 null）。
     let mut merged = extra_body
         .iter()
+        .filter(|(_, value)| !value.is_null())
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect::<serde_json::Map<_, _>>();
     for (key, value) in standard {
@@ -431,6 +433,7 @@ fn sanitized_error_token(value: Option<&str>) -> &str {
 mod tests {
     use super::*;
     use async_openai::config::Config;
+    use serde_json::json;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
@@ -820,6 +823,46 @@ mod tests {
             }
         });
         (format!("http://{address}"), requests, server)
+    }
+
+    #[test]
+    fn merge_extra_body_skips_null_placeholders_and_keeps_standard_fields() {
+        let standard = json!({
+            "model": "gpt-5.6-mini",
+            "messages": [{"role": "user", "content": "hi"}],
+            "temperature": 0.2,
+        });
+        let mut extra = std::collections::HashMap::new();
+        extra.insert("reasoning_effort".to_string(), serde_json::Value::Null);
+        extra.insert("service_tier".to_string(), serde_json::Value::Null);
+        extra.insert("enable_thinking".to_string(), serde_json::Value::Bool(true));
+        extra.insert(
+            "thinking".to_string(),
+            serde_json::to_value(json!({"type": "disabled"})).unwrap(),
+        );
+
+        let merged = merge_extra_body(&standard, &extra).expect("merge");
+
+        // null 占位字段不发送，真实值字段与标准字段保留。
+        assert!(merged.get("reasoning_effort").is_none());
+        assert!(merged.get("service_tier").is_none());
+        assert_eq!(
+            merged.get("enable_thinking"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert_eq!(
+            merged.get("thinking"),
+            Some(&serde_json::to_value(json!({"type": "disabled"})).unwrap())
+        );
+        assert_eq!(
+            merged.get("model"),
+            Some(&serde_json::Value::String("gpt-5.6-mini".into()))
+        );
+        // 全部为 null 时等价于空对象。
+        let mut all_null = std::collections::HashMap::new();
+        all_null.insert("a".to_string(), serde_json::Value::Null);
+        let empty = merge_extra_body(&json!({}), &all_null).expect("merge empty");
+        assert_eq!(empty, serde_json::Value::Object(serde_json::Map::new()));
     }
 
     fn read_http_request(stream: &mut impl Read, read_chunk_size: usize) -> Vec<u8> {

@@ -526,7 +526,6 @@ pub enum ConfirmedPlaybackState {
     Starting,
     RequestedSongPlaying,
     PausedByUser,
-    PausedWaitingForQueue,
     ExternalPlayback,
     Unknown,
 }
@@ -537,7 +536,6 @@ pub enum PauseReason {
     #[default]
     None,
     User,
-    WaitingForQueue,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -682,7 +680,6 @@ impl PlaybackRuntimeState {
             self.state,
             ConfirmedPlaybackState::RequestedSongPlaying
                 | ConfirmedPlaybackState::PausedByUser
-                | ConfirmedPlaybackState::PausedWaitingForQueue
         ) {
             return;
         }

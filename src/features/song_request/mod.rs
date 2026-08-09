@@ -304,6 +304,7 @@ const HALL_COMMANDS: &[(&str, SongSource, bool)] = &[
     ("网易点歌", SongSource::Netease, false),
     ("网易云点歌", SongSource::Netease, false),
     ("网易搜索", SongSource::Netease, false),
+    ("酷狗点歌", SongSource::Kugou, false),
     ("点歌", SongSource::QqMusic, false),
     ("搜索", SongSource::QqMusic, false),
 ];

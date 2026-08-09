@@ -167,7 +167,17 @@ fn format_candidate_text(metadata: &TrackMetadata, provider: ProviderId) -> Stri
     } else {
         metadata.artists.join(" / ")
     };
-    format!("{} - {} [{}]", metadata.title, artists, provider.as_str())
+    format!("{} - {} [{}]", metadata.title, artists, provider_label(provider))
+}
+
+/// 点歌展示用的平台简化中文标识。
+fn provider_label(provider: ProviderId) -> &'static str {
+    match provider {
+        ProviderId::QqMusic => "QQ",
+        ProviderId::Netease => "网易",
+        ProviderId::Bilibili => "B站",
+        ProviderId::Kugou => "酷狗",
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -22,7 +22,7 @@ use std::thread::{self, sleep};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use self::formal_task::{FormalTaskClient, FormalTaskRuntime};
-use crate::adapters::kugou_api::{KugouApiConfig, KugouApiSidecar};
+use crate::adapters::kugou_api::{KugouApiConfig, KugouApiSidecar, resolve_kugou_api_executable};
 use crate::adapters::login_helper::LoginHelperManager;
 use crate::adapters::native_playback::NativePlaybackAdapter;
 use crate::adapters::player::PlayerRuntimeBackend;
@@ -50,9 +50,8 @@ use crate::features::invite::{InviteRequest, InviteService, InviteStart};
 use crate::features::moderation::{ModerationPolicy, ModerationResultTask, ModerationService};
 use crate::features::playback::{
     ExternalPlaybackObservation, PlaybackApplication, PlaybackApplicationConfig, PlaybackCommand,
-    PlaybackIdentityDecision, PlaybackIdentityJudge, PlaybackRequest, PlaybackRuntimeState,
-    PlaybackService, PlaybackStatePort, PlaybackStateUpdate, PlaybackTimePorts, PlayerController,
-    PlayerStatus, QueueItem, SongDedupCandidate,
+    PlaybackRequest, PlaybackRuntimeState, PlaybackService, PlaybackStatePort, PlaybackStateUpdate,
+    PlaybackTimePorts, PlayerController, PlayerStatus, QueueItem, SongDedupCandidate,
 };
 use crate::features::song_request::{
     AiClient, ResolvedSongRequest, SongRequestApplication, SongRequestContext, SongRequestDecision,
@@ -573,39 +572,6 @@ struct BusinessPlaybackStateAdapter {
     business: BusinessRuntimeHandle,
 }
 
-#[derive(Clone)]
-struct AiPlaybackIdentityJudge {
-    ai: AiClient,
-}
-
-impl PlaybackIdentityJudge for AiPlaybackIdentityJudge {
-    fn judge(&self, request: &PlaybackRequest, status: &PlayerStatus) -> PlaybackIdentityDecision {
-        if !self.ai.enabled() {
-            return PlaybackIdentityDecision::Unavailable {
-                reason: "点歌 AI 未启用".to_string(),
-            };
-        }
-        match self
-            .ai
-            .judge_song_identity(&request.keyword, &status.name, &status.singer)
-        {
-            Ok(result) if result.matched && result.score >= 0.85 => {
-                PlaybackIdentityDecision::Match {
-                    score: result.score,
-                    reason: result.reason,
-                }
-            }
-            Ok(result) => PlaybackIdentityDecision::NoMatch {
-                score: result.score,
-                reason: result.reason,
-            },
-            Err(error) => PlaybackIdentityDecision::Unavailable {
-                reason: format!("AI 判断失败: {error:#}"),
-            },
-        }
-    }
-}
-
 impl BusinessPlaybackStateAdapter {
     fn new(business: BusinessRuntimeHandle) -> Self {
         Self { business }
@@ -1066,15 +1032,34 @@ impl ApplicationRuntime {
         let state_store: Arc<dyn miliastra_contracts::StateStore> =
             Arc::new(crate::adapters::file_store::FsStateStore);
         let ocr_device = ProductionOcrDevice::new(ocr_args.clone())?;
-        let kugou_api_sidecar = KugouApiSidecar::start(&KugouApiConfig::new(
-            config.playback.kugou_api_executable.clone(),
-            config.playback.credential_directory.clone(),
-        ))
-        .context("启动酷狗概念版 API")?;
-        let kugou_api_base_url = kugou_api_sidecar.base_url().to_string();
+        // 酷狗概念版 API 默认不启用：仅当目录下存在 kugou-api.exe 或 app_win.exe 时才自动启动。
+        // 缺失时回退到配置的 base_url（若外部已运行 KuGouMusicApi 服务仍可访问）。
+        let kugou_api_sidecar =
+            match resolve_kugou_api_executable(&config.playback.kugou_api_executable) {
+                Some(executable) => {
+                    log::info!("检测到酷狗 API sidecar: {}", executable.display());
+                    Some(
+                        KugouApiSidecar::start(&KugouApiConfig::new(
+                            executable,
+                            config.playback.credential_directory.clone(),
+                            config.logging.dir.clone(),
+                        ))
+                        .context("启动酷狗概念版 API")?,
+                    )
+                }
+                None => {
+                    log::warn!("未检测到 kugou-api.exe 或 app_win.exe，酷狗概念版 API 未启用");
+                    None
+                }
+            };
+        let kugou_api_base_url = kugou_api_sidecar
+            .as_ref()
+            .map(|sidecar| sidecar.base_url().to_string())
+            .unwrap_or_else(|| config.playback.kugou_api_base_url.clone());
         let native_playback_runtime = NativePlaybackRuntime::start(
             config.playback.credential_directory.clone(),
             &kugou_api_base_url,
+            config.playback.audio_cache_runtime_config(),
         )
         .context("启动原生播放器")?;
         let native_playback = native_playback_runtime.handle();
@@ -1085,7 +1070,10 @@ impl ApplicationRuntime {
             Duration::from_millis(config.playback.login_timeout_ms),
             &kugou_api_base_url,
         );
-        let playback_adapter = NativePlaybackAdapter::new(native_playback.clone());
+        let playback_adapter = NativePlaybackAdapter::new(
+            native_playback.clone(),
+            config.timing.external.volume_smooth_step_ms,
+        );
         let idiom_chain = IdiomChainService::load(config.idiom_chain.clone())?;
         if config.idiom_chain.enabled {
             log::info!("已加载成语接龙词库: {} 条", idiom_chain.lexicon_len());
@@ -1259,15 +1247,11 @@ impl ApplicationRuntime {
             &config.timing.playback,
             &config.queue,
             &config.matching,
-            Arc::new(AiPlaybackIdentityJudge { ai: ai.clone() }),
-            PlaybackTimePorts::new(system_clock.clone(), system_clock.clone(), system_clock),
+            PlaybackTimePorts::new(system_clock.clone(), system_clock.clone()),
         );
         let playback_application = PlaybackApplication::new(PlaybackApplicationConfig {
             console_bypass_dedup: config.song_dedup.console_bypass,
             queue_max_size: config.queue.max_size,
-            skip_status_initial_ms: config.timing.playback.skip_status_initial_ms,
-            skip_status_poll_ms: config.timing.playback.skip_status_poll_ms,
-            skip_status_retries: config.timing.playback.skip_status_retries,
             monitor_tick_ms: config.timing.playback.monitor_tick_ms,
             monitor_status_ms: config.timing.playback.monitor_status_ms,
             help_batch_ms: config.timing.command.help_batch_ms,
@@ -1309,7 +1293,7 @@ impl ApplicationRuntime {
                 native_playback,
                 login_helper,
                 native_playback_runtime: Some(native_playback_runtime),
-                kugou_api_sidecar: Some(kugou_api_sidecar),
+                kugou_api_sidecar,
             },
             business: BusinessBundle {
                 business,

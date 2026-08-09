@@ -122,6 +122,11 @@ button,input,select,textarea{font:inherit}
 .top-actions .sep{width:1px;height:20px;background:var(--sep-2)}
 .top-actions .btn{height:var(--ctl-h);border-color:transparent}
 .current-song{font-size:var(--fs-body);line-height:var(--lh-body);font-weight:600;color:var(--text-1);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:break-word}
+.playback-progress{margin-top:var(--sp-2)}
+.playback-progress .progress-track{height:5px;border-radius:3px;background:var(--fill-2);overflow:hidden}
+.playback-progress .progress-track i{display:block;height:100%;background:var(--accent);width:0;transition:width .3s linear}
+.playback-progress .progress-row{display:flex;justify-content:space-between;gap:var(--sp-2);margin-top:var(--sp-1);font-size:var(--fs-caption);color:var(--text-2)}
+.playback-progress .progress-row span:last-child{text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .layout{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);grid-template-areas:"monitor sidebar";gap:var(--sp-5);align-items:start}
 .monitor{grid-area:monitor;display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:var(--sp-5)}
 .monitor>.panel:nth-child(2){order:1}
@@ -158,7 +163,13 @@ button,input,select,textarea{font:inherit}
 .task-result{grid-column:2/-1;color:var(--text-2);font-size:var(--fs-tiny);line-height:var(--lh-tiny);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .candidate-list{display:flex;flex-direction:column;gap:var(--sp-1);margin-top:var(--sp-2);max-height:220px;overflow:auto}
 .candidate-item{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:var(--sp-2);align-items:center;padding:var(--sp-1) var(--sp-2)}
+.candidate-actions{display:flex;gap:var(--sp-1);align-items:center}
 .candidate-uri{color:var(--text-3);font-size:var(--fs-tiny);line-height:var(--lh-tiny);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.candidate-eligibility{font-size:var(--fs-tiny);font-weight:600}
+.candidate-eligibility[data-eligibility=eligible]{color:var(--ok)}
+.candidate-eligibility[data-eligibility=vip]{color:var(--warn)}
+.candidate-eligibility[data-eligibility=no_copyright],.candidate-eligibility[data-eligibility=ineligible],.candidate-eligibility[data-eligibility=paid]{color:var(--danger)}
+.candidate-eligibility[data-eligibility=unknown]{color:var(--text-3)}
 @media(hover:hover){
   .queue-item .btn,.candidate-item .btn{opacity:0;pointer-events:none;transition:opacity .2s ease}
   .queue-item:hover .btn,.queue-item:focus-within .btn,.candidate-item:hover .btn,.candidate-item:focus-within .btn{opacity:1;pointer-events:auto}
@@ -302,16 +313,32 @@ html[data-theme=light] .theme-toggle .moon{display:none}
 .field-state.ok{background:var(--ok-soft);color:var(--ok)}
 .login-progress{height:5px;border-radius:4px;background:var(--fill-2);overflow:hidden;margin-top:var(--sp-2)}
 .login-progress i{display:block;height:100%;background:var(--accent)}
+.login-account{display:flex;flex-wrap:wrap;gap:var(--sp-2);align-items:center;margin-top:var(--sp-2);padding:var(--sp-1) var(--sp-2);background:var(--fill-2);border-radius:var(--radius-s);font-size:var(--fs-tiny)}
+.login-account .vip-badge{color:var(--warn);font-weight:600}
+.login-account.vip{border:1px solid var(--warn-soft)}
 .login-refresh-info{color:var(--text-3);font-size:var(--fs-meta);line-height:1.5;word-break:break-word}
 .global-result{position:fixed;right:var(--sp-4);bottom:var(--sp-4);z-index:9;width:min(420px,calc(100vw - 32px));padding:var(--sp-3);border:1px solid var(--sep-1);border-radius:var(--radius-l);background:var(--bg-card);box-shadow:0 12px 40px rgba(0,0,0,.3)}
 .global-result .panel-head{height:28px}
 .global-result .panel-body{padding-top:var(--sp-2)}
 .global-result .result{min-height:0;max-height:100px}
 
+/* ===== 高级控制 ===== */
+.tools-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:var(--sp-5)}
+.tools-grid>.wide{grid-column:1/-1}
+.tools-output{margin:0;min-height:240px;max-height:420px;overflow:auto;white-space:pre-wrap;word-break:break-word;background:var(--bg-input);color:var(--text-1);padding:var(--sp-3);font-family:var(--font-mono);font-size:var(--fs-meta);line-height:1.5;border:1px solid var(--sep-2);border-radius:var(--radius-m)}
+.tools-task-list{display:flex;flex-direction:column;gap:var(--sp-1);max-height:180px;overflow:auto}
+.tools-task{width:100%;background:var(--bg-input);border:1px solid var(--sep-2);color:var(--text-1);border-radius:var(--radius-s);padding:var(--sp-1) var(--sp-2);font-size:var(--fs-meta);line-height:var(--lh-meta);text-align:left;cursor:pointer;transition:background-color .2s ease}
+.tools-task:hover{background:var(--bg-raised)}
+.tools-task .state{color:var(--text-3);margin-right:var(--sp-1);font-size:var(--fs-tiny);line-height:var(--lh-tiny)}
+.tools-task .state.ok{color:var(--ok)}
+.tools-task .state.err{color:var(--danger)}
+.tools-checkbox{display:inline-flex;align-items:center;gap:var(--sp-2);color:var(--text-2);font-size:var(--fs-meta);line-height:var(--lh-meta);cursor:pointer;user-select:none}
+.tools-stretch{width:100%}
+
 /* ===== 响应式 ===== */
  @media(max-width:1200px){.status-chips{gap:var(--sp-2)}.chip{font-size:var(--fs-meta)}.chip em{max-width:96px}}
- @media(max-width:1050px){.topbar{grid-template-columns:1fr;padding:var(--sp-3) var(--sp-1) var(--sp-4)}.brand{padding:var(--sp-2) var(--sp-4);border-bottom:1px solid var(--sep-2)}.status-chips,.top-actions{flex-wrap:wrap;padding:var(--sp-3) var(--sp-4);border-left:none;border-top:1px solid var(--sep-2)}.top-actions{justify-content:flex-start}.page-grid{grid-template-columns:1fr}.page-grid>.panel{grid-column:auto}.turtle-stats{grid-template-columns:repeat(3,minmax(0,1fr))}}
- @media(max-width:720px){.app-nav{position:sticky;top:0;width:100%;height:auto;padding:var(--sp-2);border-right:0;border-bottom:1px solid var(--sep-1);overflow:hidden}.nav-brand{display:none}.nav-links{flex-direction:row;overflow-x:auto;scrollbar-width:thin}.nav-link{width:auto;flex:0 0 auto;white-space:nowrap}.nav-tools{margin-top:0}.shell{margin-left:0;padding:0 var(--sp-3) var(--sp-5)}.controls,.two,.three,.compact-form,.ocr-send,.ocr-options,.turtle-toolbar,.turtle-grid,.login-row,.login-session-grid,.login-facts{grid-template-columns:1fr}.login-row .controls{min-width:0}.turtle-stats{grid-template-columns:1fr 1fr}.undercover-toolbar{justify-content:stretch}.undercover-toolbar .btn{flex:1}.global-result{bottom:var(--sp-2)}}
+ @media(max-width:1050px){.topbar{grid-template-columns:1fr;padding:var(--sp-3) var(--sp-1) var(--sp-4)}.brand{padding:var(--sp-2) var(--sp-4);border-bottom:1px solid var(--sep-2)}.status-chips,.top-actions{flex-wrap:wrap;padding:var(--sp-3) var(--sp-4);border-left:none;border-top:1px solid var(--sep-2)}.top-actions{justify-content:flex-start}.page-grid{grid-template-columns:1fr}.page-grid>.panel{grid-column:auto}.turtle-stats{grid-template-columns:repeat(3,minmax(0,1fr))}.tools-grid{grid-template-columns:1fr}.tools-grid>.panel{grid-column:auto}}
+ @media(max-width:720px){.app-nav{position:sticky;top:0;width:100%;height:auto;padding:var(--sp-2);border-right:0;border-bottom:1px solid var(--sep-1);overflow:hidden}.nav-brand{display:none}.nav-links{flex-direction:row;overflow-x:auto;scrollbar-width:thin}.nav-link{width:auto;flex:0 0 auto;white-space:nowrap}.nav-tools{margin-top:0}.shell{margin-left:0;padding:0 var(--sp-3) var(--sp-5)}.controls,.two,.three,.compact-form,.ocr-send,.ocr-options,.turtle-toolbar,.turtle-grid,.login-row,.login-session-grid,.login-facts{grid-template-columns:1fr}.login-row .controls{min-width:0}.turtle-stats{grid-template-columns:1fr 1fr}.undercover-toolbar{justify-content:stretch}.undercover-toolbar .btn{flex:1}.global-result{bottom:var(--sp-2)}.tools-grid{gap:var(--sp-4)}}
 </style>
 </head>
 <body>
@@ -324,9 +351,9 @@ html[data-theme=light] .theme-toggle .moon{display:none}
     <button class="nav-link" data-route="game" onclick="navigateTo('game')">游戏与聊天</button>
     <button class="nav-link" data-route="entertainment" onclick="navigateTo('entertainment')">娱乐玩法</button>
     <button class="nav-link" data-route="tasks" onclick="navigateTo('tasks')">任务与日志</button>
+    <button class="nav-link" data-route="tools" onclick="navigateTo('tools')">高级控制</button>
     <button class="nav-link" data-route="settings" onclick="navigateTo('settings')">设置</button>
   </div>
-  <a class="nav-link nav-tools" href="/tools">高级控制</a>
 </nav>
 <div class="shell">
   <header class="topbar">
@@ -348,7 +375,7 @@ html[data-theme=light] .theme-toggle .moon{display:none}
         <svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
       </button>
       <button class="btn" id="refreshToggle" onclick="toggleRefresh()">暂停刷新</button>
-      <a class="btn" href="/tools">高级控制</a>
+      <button class="btn" onclick="navigateTo('tools')">高级控制</button>
     </div>
   </header>
 
@@ -359,6 +386,51 @@ html[data-theme=light] .theme-toggle .moon{display:none}
     <section class="page-section" id="page-game" data-page="game"><h1 class="page-title">游戏与聊天</h1><div class="page-grid" id="gameGrid"></div></section>
     <section class="page-section" id="page-entertainment" data-page="entertainment"><h1 class="page-title">娱乐玩法</h1><div class="page-grid" id="entertainmentGrid"></div></section>
     <section class="page-section" id="page-tasks" data-page="tasks"><h1 class="page-title">任务与日志</h1><div class="page-grid" id="tasksGrid"></div></section>
+    <section class="page-section" id="page-tools" data-page="tools"><h1 class="page-title">高级控制</h1><div class="tools-grid">
+      <div class="panel">
+        <div class="panel-head"><h2>画面与识别</h2></div>
+        <div class="panel-body">
+          <div class="two"><button class="btn primary" onclick="runTool('/tools/ocr')">全屏 OCR</button><button class="btn" onclick="runTool('/tools/scan-chat')">扫描聊天</button></div>
+          <div class="row"><input id="ocrRect" placeholder="OCR 区域 x,y,width,height"><button class="btn" onclick="runTool('/tools/ocr',{rect:val('ocrRect')})">区域 OCR</button></div>
+          <div class="two"><button class="btn" onclick="runTool('/tools/ui-state')">检测 UI</button><button class="btn" onclick="runTool('/tools/hall-name')">大厅名称</button></div>
+          <div class="row"><button class="btn tools-stretch" onclick="loadScreenshot()">获取截图</button></div>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-head"><h2>模板</h2></div>
+        <div class="panel-body">
+          <div class="row"><select id="template"></select></div>
+          <div class="row"><input id="templateRect" placeholder="匹配区域 x,y,width,height，留空全屏"><button class="btn" onclick="useConfiguredTemplateRegion()">读取配置区域</button></div>
+          <div class="row"><input id="threshold" placeholder="阈值，留空使用配置" inputmode="decimal"></div>
+          <div class="two"><button class="btn" onclick="matchTemplate(false)">匹配</button><button class="btn warn" onclick="matchTemplate(true)">匹配并点击</button></div>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-head"><h2>手动输入</h2></div>
+        <div class="panel-body">
+          <div class="row"><input id="x" placeholder="x" inputmode="numeric"><input id="y" placeholder="y" inputmode="numeric"><button class="btn warn" onclick="clickPoint()">点击</button></div>
+          <div class="row"><input id="key" placeholder="按键，如 Escape / Return / F2"><button class="btn warn" onclick="sendKey()">发送</button></div>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-head"><h2>诊断</h2></div>
+        <div class="panel-body">
+          <button class="btn tools-stretch" onclick="runTool('/tools/ocr-backends')">OCR 后端探测</button>
+          <div class="row"><input id="changeSamples" value="10" inputmode="numeric" placeholder="变化采样次数"><button class="btn" onclick="sampleChatChanges()">聊天变化</button></div>
+          <div class="row"><input id="benchmarkRounds" value="3" inputmode="numeric" placeholder="面板基准轮数"><button class="btn warn" onclick="panelBenchmark()">面板基准</button></div>
+          <div class="row"><input id="aiKeyword" placeholder="AI 候选诊断关键词"><button class="btn" onclick="aiPreview()">诊断</button></div>
+          <label class="tools-checkbox"><input id="aiAccompaniment" type="checkbox">优先伴奏</label>
+        </div>
+      </div>
+      <div class="panel wide">
+        <div class="panel-head"><h2>任务结果</h2><small id="toolsResultMeta">最新输出</small></div>
+        <div class="panel-body"><pre class="tools-output" id="toolsResult">等待任务</pre></div>
+      </div>
+      <div class="panel">
+        <div class="panel-head"><h2>最近任务</h2></div>
+        <div class="panel-body"><div class="tools-task-list" id="toolTasks">暂无任务</div></div>
+      </div>
+    </div></section>
     <section class="page-section" id="page-settings" data-page="settings"><h1 class="page-title">设置</h1><div class="page-grid" id="settingsGrid"></div></section>
   </main>
 
@@ -455,6 +527,10 @@ html[data-theme=light] .theme-toggle .moon{display:none}
         <div class="panel-head"><h2>播放控制</h2><small>常用</small></div>
         <div class="panel-body">
           <div class="current-song" id="songState">等待播放器状态</div>
+          <div class="playback-progress" id="playbackProgress" hidden>
+            <div class="progress-track"><i id="progressFill"></i></div>
+            <div class="progress-row"><span id="progressTime">0:00 / 0:00</span><span id="progressMeta"></span></div>
+          </div>
           <div class="controls">
             <button class="btn good" onclick="call('/play','POST')"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M7 4.5v15l12-7.5-12-7.5z"/></svg>继续</button>
             <button class="btn warn" onclick="call('/pause','POST')"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M6.5 4.5h3.5v15H6.5zM14 4.5h3.5v15H14z"/></svg>暂停</button>
@@ -616,7 +692,7 @@ html[data-theme=light] .theme-toggle .moon{display:none}
 
 <script>
 function $(id){return document.getElementById(id)}
-const pageRoutes=['overview','playback','login','game','entertainment','tasks','settings']
+const pageRoutes=['overview','playback','login','game','entertainment','tasks','tools','settings']
 function setupPages(){
   const moves={
     overview:['monitorOcr','runtimeDetail'],
@@ -658,9 +734,9 @@ window.addEventListener('hashchange',()=>navigateTo(location.hash.slice(1),false
 navigateTo(initialRoute())
 const esc=(s)=>String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')
 const commandLabels={'/status':'状态','/play':'继续','/pause':'暂停','/skip-next':'下一首','/skip-prev':'上一首','/volume':'音量','/startup/game':'启动游戏','/startup/wonderland':'启动并进入千星','/startup/enter-wonderland':'进入千星','/searchPlay':'点歌','/searchSource':'指定音源点歌','/search':'搜索','/search/candidates':'候选搜索','/player/providers':'平台状态','/player/login/status':'登录状态','/player/play-track':'播放曲目','/player/login/start':'开始登录','/player/login/cancel':'取消登录','/player/logout':'退出登录','/queue':'队列','/queue/add':'加入队列','/queue/remove':'删除队列','/queue/clear':'清空队列','/ai/search':'AI点歌','/chat/send':'控制台发言','/chat-listener/mode':'聊天监听','/tasks/cancel':'撤销任务','/operator/lyrics':'发送歌词','/operator/hall-detect':'大厅检测','/operator/hall-time':'大厅时间','/operator/microphone':'麦克风','/operator/commands':'命令开关','/operator/idle-exit':'闲置退出','/operator/workflows':'工作流','/operator/workflows/run':'执行工作流','/turtle-soup':'海龟汤状态','/turtle-soup/start':'海龟汤开局','/turtle-soup/end':'海龟汤结束','/undercover':'谁是卧底状态','/undercover/start':'谁是卧底开局','/undercover/end':'谁是卧底结束'}
-const stMap={playing:'播放中',paused:'已暂停',stopped:'已停止',stoped:'已停止'}
-const controllerStateMap={idle:'空闲',starting:'启动播放',requested_song_playing:'点歌播放中',paused_by_user:'用户暂停',paused_waiting_for_queue:'等待队列',external_playback:'外部播放',unknown:'状态未知',unavailable:'不可用'}
-const pauseReasonMap={none:'无',user:'用户暂停',waiting_for_queue:'等待队列',unknown:'未知'}
+const stMap={playing:'播放中',paused:'已暂停',stopped:'已停止'}
+const controllerStateMap={idle:'空闲',starting:'启动播放',requested_song_playing:'点歌播放中',paused_by_user:'用户暂停',external_playback:'外部播放',unknown:'状态未知'}
+const pauseReasonMap={none:'无',user:'用户暂停',unknown:'未知'}
 const reliabilityMap={reliable:'可靠',incomplete:'信息不完整',stale:'已过期',mismatched:'不匹配',unknown:'未知'}
 const taskStatusLabel={queued:'等待',running:'执行中',completed:'完成',failed:'失败',canceled:'已撤销'}
 const safeNum=(n)=>(n!=null&&isFinite(n)&&!isNaN(n))?Number(n):null
@@ -752,7 +828,21 @@ function renderPlayer(d){
     $('volumeSlider').value=String(value)
     $('volumeInput').value=String(value)
   }
+  renderProgress(d)
   return title
+}
+function renderProgress(d){
+  const box=$('playbackProgress')
+  const progress=safeNum(d.progress)
+  const duration=safeNum(d.duration)
+  if(progress==null&&duration==null){box.classList.add('hidden');return}
+  box.classList.remove('hidden')
+  const fill=(duration!=null&&duration>0)?Math.max(0,Math.min(100,progress/duration*100)):0
+  $('progressFill').style.width=fill+'%'
+  $('progressTime').textContent=fmt(progress)+' / '+fmt(duration)
+  const failure=d.failureCode?('失败: '+d.failureMessage+(d.failureRetryable?'（可重试）':'')):''
+  const lyric=d.lyricLineText?('歌词: '+d.lyricLineText):''
+  $('progressMeta').textContent=[failure,lyric].filter(Boolean).join(' · ')
 }
 async function refreshPlayer(){
   const d=await request('/status')
@@ -804,12 +894,15 @@ function renderLoginState(){
     const completeness=item.completeness??item.completion??(entries.length?Math.round(present/entries.length*100):(item.configured?100:0))
     const fields=entries.map(([name,value])=>'<span class="field-state '+(value?'ok':'')+'">'+esc(name)+'：'+(value?'就绪':'缺失')+'</span>').join('')||'<span class="field-state">后端暂未提供字段状态</span>'
     const refreshInfo=item.refreshSupported?('刷新: '+esc(item.refreshState||'idle')+' · 上次: '+esc(refreshTime(item.lastRefreshAtMs))):'不支持刷新'
+    const accountInfo=provider==='kugou'?renderKugouAccountInfo():renderAccountInfo(provider)
     return '<div class="login-card"><div class="login-card-head"><div><strong>'+esc(providerLabel(provider))+'</strong><small>'+(item.configured?'已配置':'未配置')+' · 完整度 '+esc(completeness)+'%</small></div><div class="controls compact">'+
       '<button class="btn small login-start" data-provider="'+esc(provider)+'" '+(active?'disabled':'')+'>登录</button>'+
       (isActive?'<button class="btn small warn login-cancel">取消</button>':'')+
       (item.manualRefreshSupported?'<button class="btn small" data-refresh-provider="'+esc(provider)+'">刷新</button>':'')+
-      (provider==='kugou'?'<button class="btn small good" data-kugou-status>VIP状态</button><button class="btn small good" data-kugou-report>领取VIP</button>':'')+
-      '<button class="btn small ghost login-logout" data-provider="'+esc(provider)+'" '+(active?'disabled':'')+'>退出</button></div></div><div class="login-progress"><i style="width:'+Math.max(0,Math.min(100,Number(completeness)||0))+'%"></i></div><div class="login-fields">'+fields+'</div><div class="login-refresh-info">'+refreshInfo+(item.nextRefreshCheckAtMs?' · 下次检查：'+esc(refreshTime(item.nextRefreshCheckAtMs)):'')+(item.lastRefreshError?' · '+esc(item.lastRefreshError):'')+'</div></div>'
+      (provider==='kugou'?'<button class="btn small good" data-kugou-status>VIP状态</button><button class="btn small good" data-kugou-report>领取VIP</button><button class="btn small good" data-kugou-upgrade>升级VIP</button>':'')+
+      '<button class="btn small ghost login-logout" data-provider="'+esc(provider)+'" '+(active?'disabled':'')+'>退出</button></div></div><div class="login-progress"><i style="width:'+Math.max(0,Math.min(100,Number(completeness)||0))+'%"></i></div>'+
+      accountInfo+
+      '<div class="login-fields">'+fields+'</div><div class="login-refresh-info">'+refreshInfo+(item.nextRefreshCheckAtMs?' · 下次检查：'+esc(refreshTime(item.nextRefreshCheckAtMs)):'')+(item.lastRefreshError?' · '+esc(item.lastRefreshError):'')+'</div></div>'
   }).join('')||'<div class="result">没有可用平台</div>'
   $('loginProviders').querySelectorAll('.login-start').forEach((button)=>{button.addEventListener('click',()=>startLogin(button.dataset.provider||''))})
   $('loginProviders').querySelectorAll('.login-cancel').forEach((button)=>{button.addEventListener('click',cancelLogin)})
@@ -818,15 +911,15 @@ function renderLoginState(){
   $('loginProviders').querySelectorAll('[data-kugou-status]').forEach((button)=>{button.addEventListener('click',async()=>{try{setResult(await request('/player/kugou/status'))}catch(e){setResult('错误: '+e.message)}})})
   $('loginProviders').querySelectorAll('[data-kugou-report]').forEach((button)=>{button.addEventListener('click',async()=>{
     try{
-      const player=await request('/status')
-      const trackRef=player.currentTrack&&player.currentTrack.trackRef
-      const provider=trackRef&&trackRef.key&&trackRef.key.provider
-      const locator=trackRef&&trackRef.resolverLocator
-      if(provider!=='kugou'||!locator)throw new Error('当前播放曲目不是有效酷狗歌曲')
-      const parts=String(locator).split(':')
-      const mixsongid=parts.length===4&&parts[0]==='kugou'?parts[3]:''
-      if(!/^\d+$/.test(mixsongid)||mixsongid==='0')throw new Error('当前曲目缺少酷狗 mixsongid')
-      setResult(await request('/player/kugou/report?mixsongid='+encodeURIComponent(mixsongid),'POST'))
+      const r=await request('/player/kugou/claim-vip','POST')
+      setResult(r&&r.accepted?('领取成功：VIP+'+((r.vipDays||0)+'天')+(r.message?('（'+r.message+'）'):'')):('领取失败：'+((r&&r.message)||'未知原因')))
+      await loadLoginState()
+    }catch(e){setResult('错误: '+e.message)}
+  })})
+  $('loginProviders').querySelectorAll('[data-kugou-upgrade]').forEach((button)=>{button.addEventListener('click',async()=>{
+    try{
+      const r=await request('/player/kugou/upgrade-vip','POST')
+      setResult(r&&r.accepted?('升级成功：VIP+'+((r.vipDays||0)+'天')+(r.message?('（'+r.message+'）'):'')):('升级失败：'+((r&&r.message)||'未知原因')))
       await loadLoginState()
     }catch(e){setResult('错误: '+e.message)}
   })})
@@ -836,8 +929,39 @@ async function loadLoginState(){
     const results=await Promise.all([request('/player/providers'),request('/player/login/status')])
     loginProviderItems=Array.isArray(results[0])?results[0]:[]
     loginRuntimeStatus=results[1]||{active:false}
+    loadKugouAccountInfo()
+    loadPlatformAccounts()
     renderLoginState()
   }catch(e){$('loginMeta').textContent='读取失败';$('loginProviders').innerHTML='<div class="result">'+esc(e.message)+'</div>'}
+}
+let kugouAccountInfo=null
+let platformAccounts={}
+function renderKugouAccountInfo(){
+  const info=kugouAccountInfo
+  if(!info)return ''
+  const vipLabel=info.vip?(info.vipType&&info.vipType!=='0'?'VIP('+esc(info.vipType)+')':'VIP'):(info.vipType==null?'VIP未知':'非VIP')
+  const expire=info.vipExpireAtMs?(' · 到期 '+esc(loginTime(info.vipExpireAtMs))):''
+  const nickname=info.nickname||info.userId||'未知'
+  return '<div class="login-account '+(info.vip?'vip':'')+'"><span class="field-state '+(info.loggedIn?'ok':'')+'">'+(info.loggedIn?'已登录':'未登录')+'</span>'+
+    '<span>账号：'+esc(nickname)+'</span><span class="vip-badge">'+vipLabel+expire+'</span></div>'
+}
+function renderAccountInfo(provider){
+  const info=platformAccounts[provider]
+  if(!info)return ''
+  const vipLabel=info.vip?(info.vipType&&info.vipType!=='0'?'VIP('+esc(info.vipType)+')':'VIP'):(info.vipType==null?'VIP未知':'非VIP')
+  const expire=info.vipExpireAtMs?(' · 到期 '+esc(loginTime(info.vipExpireAtMs))):''
+  const nickname=info.nickname||info.userId||'未知'
+  const methodTag=info.loginMethod==='qq'?' · QQ登录':(info.loginMethod==='wechat'?' · 微信登录':'')
+  return '<div class="login-account '+(info.vip?'vip':'')+'"><span class="field-state '+(info.loggedIn?'ok':'')+'">'+(info.loggedIn?'已登录':'未登录')+'</span>'+
+    '<span>账号：'+esc(nickname)+methodTag+'</span>'+(vipLabel?'<span class="vip-badge">'+vipLabel+expire+'</span>':'')+'</div>'
+}
+async function loadPlatformAccounts(){
+  for(const provider of ['qqmusic','netease']){
+    try{platformAccounts[provider]=await request('/player/account/status?provider='+provider)}catch(e){platformAccounts[provider]=null}
+  }
+}
+async function loadKugouAccountInfo(){
+  try{kugouAccountInfo=await request('/player/kugou/status')}catch(e){kugouAccountInfo=null}
 }
 async function jsonAction(url,body){
   if(actionInFlight){setResult('上一项操作仍在请求中');return false}
@@ -891,6 +1015,7 @@ async function searchOnly(){
   }catch(e){searchCandidateItems=[];renderSearchCandidates();setResult('错误: '+e.message)}
   await loadHistory()
 }
+const eligibilityLabels={eligible:'可播放',vip:'需要VIP',no_copyright:'无版权',paid:'需购买',ineligible:'不可播放',unknown:'未知'}
 function renderSearchCandidates(){
   const el=$('searchCandidates')
   if(!searchCandidateItems.length){el.innerHTML='';el.classList.add('hidden');return}
@@ -898,9 +1023,17 @@ function renderSearchCandidates(){
     const key=item.trackRef&&item.trackRef.key||{}
     const identity=key.provider&&key.id?key.provider+'/'+key.id:'未知曲目'
     const eligibility=item.eligibility||'unknown'
-    return '<div class="candidate-item"><div><div class="queue-title">'+esc(item.text||'未命名候选')+'</div><div class="candidate-uri">'+esc(identity)+' · '+esc(eligibility)+'</div></div><button class="btn small" onclick="playCandidate('+index+')">播放</button></div>'
+    const label=eligibilityLabels[eligibility]||eligibility
+    return '<div class="candidate-item"><div><div class="queue-title">'+esc(item.text||'未命名候选')+'</div><div class="candidate-uri">'+esc(identity)+' · <span class="candidate-eligibility" data-eligibility="'+esc(eligibility)+'">'+esc(label)+'</span></div></div><div class="candidate-actions"><button class="btn small" onclick="playCandidate('+index+')">播放</button><button class="btn small ghost" onclick="testCandidate('+index+')">测试点歌</button></div></div>'
   }).join('')
   el.classList.remove('hidden')
+}
+function testCandidate(index){
+  const item=searchCandidateItems[index]
+  if(!item||!item.text){setResult('候选曲目结构无效');return}
+  let url='/searchPlay?keyword='+encodeURIComponent(item.text)
+  if(item.trackRef&&item.trackRef.key&&item.trackRef.key.provider)url+='&source='+encodeURIComponent(item.trackRef.key.provider)
+  call(url,'POST')
 }
 function playCandidate(index){
   const item=searchCandidateItems[index]
@@ -1104,13 +1237,11 @@ function renderMonitor(d){
   $('runtimeDetail').textContent=runtimeRows.join('\n')
   const pc=d.playbackController||{}
   const ps=pc.backendStatus||''
-  const pstate=ps==='playing'?'ok':ps==='paused'?'warn':ps==='stopped'?'err':'neutral'
-  setState('playerState',stMap[ps]||controllerStateMap[pc.state]||pc.state||'未知',pstate)
+  // 播放状态 chip 由 /status 实时数据权威更新（renderPlayer），这里只更新详情文本。
   $('playbackDetail').textContent=[
     '控制器: '+(controllerStateMap[pc.state]||pc.state||'未知'),
     '暂停原因: '+(pauseReasonMap[pc.pauseReason]||pc.pauseReason||'无'),
     '点歌人: '+(pc.requester||'未知'),
-    '进度: '+fmt(pc.progress)+' / '+fmt(pc.duration),
     '观测: '+(reliabilityMap[pc.lastObservationReliability]||pc.lastObservationReliability||'未知')+' / '+ageText(pc.observedAtMs)
   ].join('\n')
   const decision=d.decision
@@ -1192,7 +1323,95 @@ $('accessToken').value=accessToken()
 loadOperatorWorkflows()
 refreshAll()
 setInterval(()=>{if(!refreshPaused)loadMonitor()},1000)
+setInterval(()=>{if(!refreshPaused)refreshPlayer()},1000)
 setInterval(()=>{if(!refreshPaused)loadLoginState()},2000)
+
+/* ===== 高级控制（原 /tools 独立页面，已并入左侧导航） ===== */
+const val=(id)=>{const el=$(id);return el?el.value.trim():''}
+let toolsBusy=false
+let toolsActiveId=0
+let toolTemplateItems=[]
+function toolsParams(values){const p=new URLSearchParams();for(const[k,v]of Object.entries(values||{})){if(v!==undefined&&v!==null&&String(v)!=='')p.set(k,v)}const s=p.toString();return s?'?'+s:''}
+function setToolsResult(text){const el=$('toolsResult');if(!el)return;el.textContent=typeof text==='string'?text:JSON.stringify(text,null,2)}
+function setToolsBusy(value){toolsBusy=value;document.querySelectorAll('#page-tools button').forEach(button=>button.disabled=value)}
+async function runTool(path,values){
+  if(toolsBusy)return
+  setToolsBusy(true);setToolsResult('任务已提交...')
+  try{
+    const task=await request(path+toolsParams(values),'POST')
+    toolsActiveId=task.id
+    $('toolsResultMeta').textContent='任务 #'+task.id
+    await pollToolTask()
+  }catch(error){setToolsResult('错误: '+error.message);setToolsBusy(false)}
+  await loadToolTasks()
+}
+async function pollToolTask(){
+  try{
+    const task=await request('/tools/task?id='+encodeURIComponent(toolsActiveId),'GET')
+    const label=taskStatusLabel[task.status]||task.status
+    $('toolsResultMeta').textContent='任务 #'+task.id+' '+label
+    setToolsResult(task.result||'等待执行...')
+    if(task.status==='queued'||task.status==='running'){setTimeout(pollToolTask,500);return}
+  }catch(error){setToolsResult('读取任务失败: '+error.message)}
+  setToolsBusy(false);loadToolTasks()
+}
+function matchTemplate(click){runTool('/tools/template',{template:val('template'),rect:val('templateRect'),threshold:val('threshold'),click:click?'1':''})}
+function clickPoint(){runTool('/tools/click',{x:val('x'),y:val('y')})}
+function sendKey(){runTool('/tools/key',{key:val('key')})}
+function aiPreview(){runTool('/tools/ai-preview',{keyword:val('aiKeyword'),preferAccompaniment:$('aiAccompaniment').checked?'1':''})}
+function sampleChatChanges(){runTool('/tools/chat-change-samples',{samples:val('changeSamples')})}
+function panelBenchmark(){runTool('/tools/panel-benchmark',{rounds:val('benchmarkRounds')})}
+function renderToolTasks(items){
+  const el=$('toolTasks')
+  if(!el)return
+  if(!Array.isArray(items)||!items.length){el.textContent='暂无任务';return}
+  el.innerHTML=items.map(item=>'<button class="tools-task" onclick="inspectToolTask('+Number(item.id)+')"><span class="state '+(item.status==='failed'?'err':item.status==='completed'?'ok':'')+'">'+esc(taskStatusLabel[item.status]||item.status)+'</span>#'+item.id+' '+esc(item.label)+'</button>').join('')
+}
+function inspectToolTask(id){
+  if(toolsBusy)return
+  toolsActiveId=id
+  $('toolsResultMeta').textContent='任务 #'+id
+  setToolsBusy(true);pollToolTask()
+}
+async function loadToolTemplates(){
+  try{
+    const items=await request('/tools/templates','GET')
+    toolTemplateItems=Array.isArray(items)?items:[]
+    const selected=val('template')
+    $('template').innerHTML=toolTemplateItems.map(item=>'<option value="'+esc(item.name)+'">'+esc(item.label)+'</option>').join('')
+    if([...$('template').options].some(option=>option.value===selected))$('template').value=selected
+    return toolTemplateItems
+  }catch(error){$('toolsResultMeta').textContent='模板读取失败';return []}
+}
+async function useConfiguredTemplateRegion(){
+  try{
+    const items=await loadToolTemplates()
+    const item=items.find(item=>item.name===val('template'))
+    const region=item&&item.region
+    if(!region||!Number.isInteger(region.x)||!Number.isInteger(region.y)||!Number.isInteger(region.width)||!Number.isInteger(region.height)){throw new Error('所选模板没有配置固定匹配区域，请手动填写')}
+    $('templateRect').value=[region.x,region.y,region.width,region.height].join(',')
+    if(Number.isFinite(Number(item.threshold)))$('threshold').value=String(item.threshold)
+    setToolsResult('已读取 '+item.label+' 的配置区域')
+  }catch(error){setToolsResult('错误: '+error.message)}
+}
+async function loadToolTasks(){
+  try{
+    const monitor=await request('/monitor','GET')
+    renderToolTasks(monitor.webTools)
+  }catch(error){$('toolsResultMeta').textContent='任务读取失败'}
+}
+function initToolsPage(){
+  loadToolTemplates()
+  loadToolTasks()
+}
+document.addEventListener('keydown',event=>{
+  if(event.key==='Enter'&&!event.isComposing&&event.target.tagName==='INPUT'){
+    const map={ocrRect:()=>runTool('/tools/ocr',{rect:val('ocrRect')}),x:clickPoint,y:clickPoint,key:sendKey,aiKeyword:aiPreview,threshold:()=>matchTemplate(false),templateRect:()=>matchTemplate(false),changeSamples:sampleChatChanges,benchmarkRounds:panelBenchmark}
+    const action=map[event.target.id]
+    if(action){event.preventDefault();action()}
+  }
+})
+initToolsPage()
 </script>
 </body>
 </html>

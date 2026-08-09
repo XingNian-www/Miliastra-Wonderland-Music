@@ -692,7 +692,8 @@ impl PlaybackMonitorPort for PlaybackMonitorWorker {
     }
 
     fn player_status(&mut self) -> Result<PlayerStatus> {
-        self.player.status()
+        // 监控循环使用轻量读取：观测记录由决策路径负责，避免每轮重复记录。
+        self.player.monitor_status()
     }
 
     fn playback_queue(&mut self) -> Result<Vec<QueueItem>> {
@@ -706,7 +707,6 @@ impl PlaybackMonitorPort for PlaybackMonitorWorker {
         Ok(PlaybackWorkload {
             has_pending_playback_task: scheduler.pending_playback_related(),
             command_executing: scheduler.is_busy(),
-            song_command_executing: scheduler.active_playback_related(),
         })
     }
 

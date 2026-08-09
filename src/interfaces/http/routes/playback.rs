@@ -91,6 +91,10 @@ pub(super) fn search_source_route(
     query: &[(String, String)],
     state: &HttpSharedState,
 ) -> std::result::Result<String, AppError> {
+    // 指定音源点歌：source 必填，与 /searchPlay 区分。
+    if query_value(query, "source").map(str::trim).unwrap_or("").is_empty() {
+        return Err(bad_request("指定音源点歌必须提供 source 参数"));
+    }
     enqueue_remote_song(query, state, false)
 }
 
@@ -176,22 +180,47 @@ pub(super) fn player_kugou_status_route(
     .map_err(internal_error)
 }
 
-pub(super) fn player_kugou_report_route(
+pub(super) fn player_account_status_route(
     query: &[(String, String)],
     state: &HttpSharedState,
 ) -> std::result::Result<String, AppError> {
-    let mixsongid = normalize_required_text(query_value(query, "mixsongid"), "mixsongid")?;
-    if !mixsongid
-        .chars()
-        .all(|character| character.is_ascii_digit())
-    {
-        return Err(bad_request("mixsongid参数无效"));
-    }
+    let provider = query_value(query, "provider")
+        .unwrap_or("netease")
+        .parse::<ProviderId>()
+        .map_err(|_| bad_request("provider参数无效"))?;
     serde_json::to_string(
         &state
             .application
             .login
-            .kugou_report(mixsongid)
+            .account_status(provider)
+            .map_err(login_http_error)?,
+    )
+    .map_err(internal_error)
+}
+
+pub(super) fn player_kugou_claim_vip_route(
+    _query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    serde_json::to_string(
+        &state
+            .application
+            .login
+            .kugou_claim_vip()
+            .map_err(login_http_error)?,
+    )
+    .map_err(internal_error)
+}
+
+pub(super) fn player_kugou_upgrade_vip_route(
+    _query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    serde_json::to_string(
+        &state
+            .application
+            .login
+            .kugou_upgrade_vip()
             .map_err(login_http_error)?,
     )
     .map_err(internal_error)

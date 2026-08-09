@@ -9,8 +9,9 @@ build = "build.rs"
 [dependencies]
 anyhow = { workspace = true }
 clap = { version = "4", features = ["derive"] }
+md-5 = "0.10"
 miliastra-login-protocol = { workspace = true }
-reqwest = { workspace = true, features = ["json", "rustls"] }
+reqwest = { workspace = true, features = ["blocking", "json", "query", "rustls"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt"] }

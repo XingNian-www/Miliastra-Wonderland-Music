@@ -7,6 +7,7 @@ use std::time::Duration;
 use crate::composition::application::http_facade::ApplicationHttpCommandFacade;
 use crate::features::hall::HallRuntimeState;
 use crate::features::playback::{PlaybackRuntimeState, PlayerStatus, test_candidate, test_track};
+use crate::features::startup::{StartupSource, StartupTaskKind};
 use crate::features::turtle_soup::{TurtleSoupAppendReceipt, TurtleSoupSnapshot};
 use crate::features::undercover::UndercoverSnapshot;
 use crate::interfaces::http::{
@@ -91,6 +92,7 @@ struct RecordingHttpState {
     hall_screenshot_requests: usize,
     hall_screenshot_error: bool,
     listener_enqueue_error: bool,
+    startup_enqueue_error: bool,
     turtle_soup: TurtleSoupSnapshot,
     turtle_soup_submissions: Vec<TurtleSoupSubmission>,
     undercover: UndercoverSnapshot,
@@ -114,6 +116,7 @@ impl RecordingHttpState {
             hall_screenshot_requests: 0,
             hall_screenshot_error: false,
             listener_enqueue_error: false,
+            startup_enqueue_error: false,
             turtle_soup: TurtleSoupSnapshot::default(),
             turtle_soup_submissions: Vec::new(),
             undercover: UndercoverSnapshot::default(),
@@ -220,6 +223,13 @@ impl RecordingHttpPort {
             .lock()
             .expect("recording port")
             .listener_enqueue_error = true;
+    }
+
+    fn fail_startup_enqueue(&self) {
+        self.state
+            .lock()
+            .expect("recording port")
+            .startup_enqueue_error = true;
     }
 }
 
@@ -381,6 +391,22 @@ impl HttpTaskPort for RecordingHttpPort {
     }
 
     fn enqueue_startup(&self, task: StartupTask) -> Result<FormalTaskEnqueueOutcome> {
+        // 注入点：fail_startup_enqueue 时只拒绝「进入千星」任务，模拟多任务入队部分失败。
+        let fail = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow!("recording HTTP port lock poisoned"))?;
+            state.startup_enqueue_error
+                && task
+                    == StartupTask::new(
+                        StartupTaskKind::EnterWonderland,
+                        StartupSource::REMOTE_CONSOLE,
+                    )
+        };
+        if fail {
+            return Err(anyhow!("startup enqueue failed"));
+        }
         self.enqueue_kind(RecordedFormalTaskKind::Startup(task))
     }
 
@@ -650,8 +676,8 @@ impl HttpLoginPort for HttpTestLoginPort {
         let mut active = self.active.lock().unwrap();
         if active.is_some() {
             return Err(HttpLoginError {
-                code: "login_in_progress",
-                message: "已有登录任务正在进行",
+                code: "login_in_progress".to_owned(),
+                message: "已有登录任务正在进行".to_owned(),
             });
         }
         let session = LoginSession {
@@ -666,8 +692,8 @@ impl HttpLoginPort for HttpTestLoginPort {
         let mut active = self.active.lock().unwrap();
         if active.as_ref().map(|session| session.session_id) != Some(session_id) {
             return Err(HttpLoginError {
-                code: "login_session_invalid",
-                message: "登录会话无效",
+                code: "login_session_invalid".to_owned(),
+                message: "登录会话无效".to_owned(),
             });
         }
         *active = None;
@@ -704,11 +730,26 @@ impl HttpLoginPort for HttpTestLoginPort {
         })
     }
 
-    fn kugou_report(&self, _mixsongid: String) -> Result<KugouListenReport, HttpLoginError> {
+    fn account_status(
+        &self,
+        _provider: ProviderId,
+    ) -> Result<Option<miliastra_playback::ProviderAccountStatus>, HttpLoginError> {
+        Ok(None)
+    }
+
+    fn kugou_claim_vip(&self) -> Result<KugouListenReport, HttpLoginError> {
         Ok(KugouListenReport {
             accepted: true,
             vip_days: 30,
             message: "领取成功".to_owned(),
+        })
+    }
+
+    fn kugou_upgrade_vip(&self) -> Result<KugouListenReport, HttpLoginError> {
+        Ok(KugouListenReport {
+            accepted: true,
+            vip_days: 7,
+            message: "升级成功".to_owned(),
         })
     }
 }
@@ -1089,19 +1130,17 @@ fn native_player_and_login_routes_use_structured_json_without_secrets() {
     assert_eq!(kugou_status["vip"], true);
     assert!(kugou_status.get("token").is_none());
 
-    let report = http_post_json(address, "/player/kugou/report?mixsongid=314159", "{}", None);
+    let report = http_post_json(address, "/player/kugou/claim-vip", "{}", None);
     assert_eq!(report.status_line, "HTTP/1.1 200 OK");
-    let report: Value = serde_json::from_str(&report.body).expect("Kugou report JSON");
+    let report: Value = serde_json::from_str(&report.body).expect("Kugou claim JSON");
     assert_eq!(report["accepted"], true);
     assert_eq!(report["vipDays"], 30);
 
-    let invalid_report = http_post_json(
-        address,
-        "/player/kugou/report?mixsongid=not-a-number",
-        "{}",
-        None,
-    );
-    assert_eq!(invalid_report.status_line, "HTTP/1.1 400 Bad Request");
+    let upgrade = http_post_json(address, "/player/kugou/upgrade-vip", "{}", None);
+    assert_eq!(upgrade.status_line, "HTTP/1.1 200 OK");
+    let upgrade: Value = serde_json::from_str(&upgrade.body).expect("Kugou upgrade JSON");
+    assert_eq!(upgrade["accepted"], true);
+    assert_eq!(upgrade["vipDays"], 7);
 
     server.shutdown().expect("shutdown HTTP server");
 }
@@ -1241,7 +1280,7 @@ workflows:
     )
     .expect("custom workflow config");
     let default_config: AppConfig =
-        serde_yaml::from_str(include_str!("../../../../config.yaml")).expect("default config");
+        serde_yaml::from_str(include_str!("../../../../tests/fixtures/config.full.yaml")).expect("default config");
     state.application.commands = Arc::new(ApplicationHttpCommandFacade::new(
         state.recording.clone(),
         custom_workflow_service_from_config_parts(
@@ -1495,7 +1534,7 @@ fn web_tool_templates_expose_configured_fixed_regions() {
 #[test]
 fn remote_http_api_requires_token_when_configured() {
     let mut config: AppConfig =
-        serde_yaml::from_str(include_str!("../../../../config.yaml")).expect("default config");
+        serde_yaml::from_str(include_str!("../../../../tests/fixtures/config.full.yaml")).expect("default config");
     config.http.host = "0.0.0.0".to_string();
     config.http.access_token = "secret".to_string();
     let request = Request {
@@ -2091,9 +2130,129 @@ fn test_state() -> HttpTestState {
     test_state_with_player_port(HttpTestPlayerPort::successful())
 }
 
+#[test]
+fn internal_errors_use_a_generic_message_instead_of_leaking_details() {
+    let error = internal_error(anyhow!("读取配置失败: C:\\secret\\path\\config.yaml"));
+    assert_eq!(error.status, 500);
+    assert_eq!(error.message, "内部错误");
+}
+
+#[test]
+fn access_token_matching_is_exact_and_length_safe() {
+    let make = |token: &str| Request {
+        method: "GET".to_string(),
+        path: "/status".to_string(),
+        query: Vec::new(),
+        headers: {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "x-miliastra-token",
+                HeaderValue::from_str(token).expect("token header"),
+            );
+            headers
+        },
+        body: Vec::new(),
+    };
+    assert!(has_valid_access_token(&make("secret"), "secret"));
+    assert!(!has_valid_access_token(&make("secret2"), "secret"));
+    assert!(!has_valid_access_token(&make("sec"), "secret"));
+    assert!(!has_valid_access_token(&make(""), "secret"));
+    assert!(!has_valid_access_token(&make("SECRET"), "secret"));
+}
+
+#[test]
+fn hall_state_patch_rejects_invalid_values_instead_of_silently_ignoring() {
+    let mut patch = HashMap::new();
+    patch.insert("hallRemainingMinutes".to_string(), serde_json::json!("abc"));
+    assert_eq!(hall_state_patch(&patch).unwrap_err().status, 400);
+
+    let mut patch = HashMap::new();
+    patch.insert(
+        "hallRemainingMinutes".to_string(),
+        serde_json::json!(u64::MAX),
+    );
+    assert_eq!(hall_state_patch(&patch).unwrap_err().status, 400);
+
+    let mut patch = HashMap::new();
+    patch.insert(
+        "hallRemainingUpdatedAt".to_string(),
+        serde_json::json!("now"),
+    );
+    assert_eq!(hall_state_patch(&patch).unwrap_err().status, 400);
+
+    let mut patch = HashMap::new();
+    patch.insert(
+        "hallExpiringWarningSent".to_string(),
+        serde_json::json!("yes"),
+    );
+    assert_eq!(hall_state_patch(&patch).unwrap_err().status, 400);
+
+    // 合法值与 null 清空保持可用。
+    let mut patch = HashMap::new();
+    patch.insert("hallRemainingMinutes".to_string(), serde_json::json!(null));
+    patch.insert(
+        "hallRemainingUpdatedAt".to_string(),
+        serde_json::json!(123456),
+    );
+    patch.insert(
+        "hallExpiringWarningSent".to_string(),
+        serde_json::json!(true),
+    );
+    let result = hall_state_patch(&patch).expect("valid patch");
+    assert_eq!(result.remaining_minutes, Some(None));
+    assert_eq!(result.remaining_updated_at, Some(Some(123456)));
+    assert_eq!(result.expiring_warning_sent, Some(true));
+}
+
+#[test]
+fn search_source_route_requires_an_explicit_source() {
+    let state = test_state();
+    let error = search_source_route(&[], &state).unwrap_err();
+    assert_eq!(error.status, 400);
+    assert!(error.message.contains("source"));
+
+    let query = [("source".to_string(), "qqmusic".to_string())];
+    // 有 source 时不再报“必须提供 source”；缺 keyword 等其余参数属正常业务错误。
+    let error = search_source_route(&query, &state).unwrap_err();
+    assert!(!error.message.contains("必须提供 source"));
+}
+
+#[test]
+fn startup_wonderland_partial_enqueue_reports_which_tasks_queued() {
+    let state = test_state();
+    state.recording.fail_startup_enqueue();
+    let value: Value = serde_json::from_str(
+        &enqueue_startup_wonderland(&state).expect("partial response"),
+    )
+    .expect("response JSON");
+
+    assert_eq!(value["ok"], true);
+    assert_eq!(value["queued"], true);
+    assert_eq!(value["allQueued"], false);
+    assert_eq!(value["taskIds"].as_array().unwrap().len(), 1);
+    assert_eq!(value["failed"][0]["index"], 1);
+    assert!(value["failed"][0]["error"].as_str().unwrap().contains("内部错误"));
+}
+
+#[test]
+fn startup_wonderland_full_success_keeps_existing_contract() {
+    let state = test_state();
+    let value: Value = serde_json::from_str(
+        &enqueue_startup_wonderland(&state).expect("full response"),
+    )
+    .expect("response JSON");
+
+    assert_eq!(value["ok"], true);
+    assert_eq!(value["queued"], true);
+    // 全部成功走原版响应契约（无 allQueued 字段）。
+    assert!(value.get("allQueued").is_none());
+    assert_eq!(value["taskIds"].as_array().unwrap().len(), 2);
+    assert!(value.get("failed").is_none());
+}
+
 fn test_state_with_player_port(player: impl HttpPlayerPort + 'static) -> HttpTestState {
     let config: AppConfig =
-        serde_yaml::from_str(include_str!("../../../../config.yaml")).expect("default config");
+        serde_yaml::from_str(include_str!("../../../../tests/fixtures/config.full.yaml")).expect("default config");
     let monitor = MonitorShared::new(20);
     let custom_workflow = custom_workflow_service_from_config_parts(
         &config.custom_workflows,
@@ -2132,3 +2291,4 @@ fn test_state_with_player_port(player: impl HttpPlayerPort + 'static) -> HttpTes
         recording,
     }
 }
+

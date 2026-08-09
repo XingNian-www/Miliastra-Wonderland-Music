@@ -615,11 +615,19 @@ impl HttpLoginPort for ApplicationHttpLoginFacade {
         self.manager.kugou_status().map_err(login_error)
     }
 
-    fn kugou_report(
+    fn account_status(
         &self,
-        mixsongid: String,
-    ) -> Result<miliastra_playback::KugouListenReport, HttpLoginError> {
-        self.manager.kugou_report(mixsongid).map_err(login_error)
+        provider: ProviderId,
+    ) -> Result<Option<miliastra_playback::ProviderAccountStatus>, HttpLoginError> {
+        self.manager.account_status(provider).map_err(login_error)
+    }
+
+    fn kugou_claim_vip(&self) -> Result<miliastra_playback::KugouListenReport, HttpLoginError> {
+        self.manager.kugou_claim_vip().map_err(login_error)
+    }
+
+    fn kugou_upgrade_vip(&self) -> Result<miliastra_playback::KugouListenReport, HttpLoginError> {
+        self.manager.kugou_upgrade_vip().map_err(login_error)
     }
 }
 

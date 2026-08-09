@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use serde::Serialize;
@@ -9,16 +10,137 @@ use tokio::time::timeout;
 use uuid::Uuid;
 
 use crate::catalog::{
-    CatalogError, Failure, ProviderRegistry, ProviderSearchOutcome, SourceCatalog,
+    CatalogError, Failure, PlaybackEligibility, ProviderRegistry, ProviderSearchCandidate,
+    ProviderSearchOutcome, SourceCatalog,
 };
 use crate::credentials::ProviderCredential;
 use crate::domain::{
     EndBehavior, EndCause, EngineState, PlaybackSnapshot, ResolverLocator, SearchSpec, SessionRef,
-    Song, SongKey,
+    Song, SongKey, StreamSource,
 };
 use crate::engine::{AudioEngine, EngineCommand, EngineError};
 use crate::login::LoginCoordinator;
 use crate::lyrics::TimedLyrics;
+
+/// resolve 结果缓存最大条目数；超出后淘汰最旧条目。
+const RESOLVE_CACHE_MAX_ENTRIES: usize = 8;
+/// 音源 URL 未携带过期时间时的兜底缓存窗口。
+const RESOLVE_CACHE_FALLBACK_TTL_MS: u64 = 10 * 60 * 1000;
+/// 搜索候选可用性探测的最大并发数。
+const PROBE_CONCURRENCY: usize = 5;
+
+fn unix_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 对搜索候选逐个执行真实可用性探测（平台权限接口或播放流解析），
+/// 把可用性标注换成实测结果：
+/// - 探测确认可播放 → Eligible；
+/// - 平台明确 VIP/无版权 → 对应标注；
+/// - 探测确认为不可用（Unavailable）且无明确初始原因 → Ineligible；
+/// - 认证/限流/超时等无法确认的场景 → 保留初始标注，不猜测。
+async fn probe_candidates(
+    adapter: Arc<dyn crate::catalog::SourceAdapter>,
+    candidates: Vec<ProviderSearchCandidate>,
+    request_timeout: Duration,
+) -> Vec<ProviderSearchCandidate> {
+    let mut probes = Vec::with_capacity(candidates.len());
+    for candidate in candidates.into_iter().take(PROBE_CONCURRENCY) {
+        let adapter = adapter.clone();
+        let key = candidate.song.key.clone();
+        let locator = candidate.song.resolver_locator.clone();
+        let initial = candidate.eligibility;
+        probes.push(tokio::spawn(async move {
+            let outcome =
+                timeout(request_timeout, adapter.probe_eligibility(&key, locator.as_ref())).await;
+            let eligibility = match outcome {
+                // 探测确认可播放（resolve 用账号凭据，VIP 账号能解析 VIP 歌）→ 直接可用。
+                Ok(Ok(confirmed)) => match confirmed {
+                    PlaybackEligibility::Eligible => PlaybackEligibility::Eligible,
+                    other => other,
+                },
+                Ok(Err(CatalogError::VipRequired(_))) => PlaybackEligibility::VipRequired,
+                Ok(Err(CatalogError::NoCopyright(_))) => match initial {
+                    // 平台元数据明确标 VIP 的歌曲，探测拿不到完整流多为 VIP 限制。
+                    PlaybackEligibility::VipRequired => PlaybackEligibility::VipRequired,
+                    _ => PlaybackEligibility::NoCopyright,
+                },
+                Ok(Err(CatalogError::Unavailable(_))) => match initial {
+                    PlaybackEligibility::VipRequired => PlaybackEligibility::VipRequired,
+                    PlaybackEligibility::NoCopyright => PlaybackEligibility::NoCopyright,
+                    _ => PlaybackEligibility::Ineligible,
+                },
+                Ok(Err(_)) | Err(_) => initial,
+            };
+            (candidate, eligibility)
+        }));
+    }
+    let mut confirmed = Vec::with_capacity(probes.len());
+    for probe in probes {
+        match probe.await {
+            Ok((candidate, eligibility)) => {
+                confirmed.push(ProviderSearchCandidate {
+                    song: candidate.song,
+                    eligibility,
+                })
+            }
+            Err(error) => log::warn!("搜索候选探测任务失败: {error}"),
+        }
+    }
+    confirmed
+}
+
+#[derive(Clone)]
+struct ResolveCacheEntry {
+    key: SongKey,
+    stream: StreamSource,
+    resolved_at_epoch_ms: u64,
+}
+
+impl ResolveCacheEntry {
+    fn is_valid(&self, now_epoch_ms: u64) -> bool {
+        if let Some(expires_at) = self.stream.expires_at_epoch_ms {
+            // 签名 URL：以平台给出的过期时间为准。
+            expires_at > now_epoch_ms
+        } else {
+            // 无过期字段：按兜底窗口保守缓存，避免 CDN URL 长期失效。
+            now_epoch_ms
+                .saturating_sub(self.resolved_at_epoch_ms)
+                < RESOLVE_CACHE_FALLBACK_TTL_MS
+        }
+    }
+}
+
+#[derive(Default)]
+struct ResolveCache {
+    entries: Vec<ResolveCacheEntry>,
+}
+
+impl ResolveCache {
+    fn get(&mut self, key: &SongKey, now_epoch_ms: u64) -> Option<StreamSource> {
+        self.entries.retain(|entry| entry.is_valid(now_epoch_ms));
+        let position = self.entries.iter().position(|entry| entry.key == *key)?;
+        // 命中提升到末尾（近似 LRU）。
+        let entry = self.entries.remove(position);
+        self.entries.push(entry.clone());
+        Some(entry.stream)
+    }
+
+    fn put(&mut self, key: SongKey, stream: StreamSource, now_epoch_ms: u64) {
+        self.entries.retain(|entry| entry.key != key);
+        self.entries.push(ResolveCacheEntry {
+            key,
+            stream,
+            resolved_at_epoch_ms: now_epoch_ms,
+        });
+        while self.entries.len() > RESOLVE_CACHE_MAX_ENTRIES {
+            self.entries.remove(0);
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct PlaybackCore {
@@ -29,6 +151,8 @@ pub struct PlaybackCore {
     generation: Arc<AtomicU64>,
     runtime_identity: Arc<str>,
     login: LoginCoordinator,
+    resolve_cache: Arc<Mutex<ResolveCache>>,
+    pub(crate) audio_cache: Option<crate::cache::AudioCache>,
 }
 
 impl PlaybackCore {
@@ -46,6 +170,8 @@ impl PlaybackCore {
             generation: Arc::new(AtomicU64::new(0)),
             runtime_identity: Uuid::new_v4().to_string().into(),
             login: LoginCoordinator::default(),
+            resolve_cache: Arc::new(Mutex::new(ResolveCache::default())),
+            audio_cache: None,
         }
     }
 
@@ -63,6 +189,22 @@ impl PlaybackCore {
             generation: Arc::new(AtomicU64::new(0)),
             runtime_identity: Uuid::new_v4().to_string().into(),
             login: LoginCoordinator::default(),
+            resolve_cache: Arc::new(Mutex::new(ResolveCache::default())),
+            audio_cache: None,
+        }
+    }
+
+    /// 启用音频数据缓存（本地代理）：播放音源 URL 将改写为本机地址。
+    pub fn with_audio_cache(mut self, cache: crate::cache::AudioCache) -> Self {
+        self.audio_cache = Some(cache);
+        self
+    }
+
+    /// 把音源改写为本地代理地址（若启用了音频缓存）。
+    async fn route_stream(&self, song_key: &SongKey, stream: StreamSource) -> StreamSource {
+        match &self.audio_cache {
+            Some(cache) => cache.rewrite(song_key, stream).await,
+            None => stream,
         }
     }
 
@@ -102,13 +244,16 @@ impl PlaybackCore {
                     sources: vec![request_source.clone()],
                     limit: per_source_limit,
                 };
-                timeout(request_timeout, adapter.search(&source_spec))
+                let candidates = timeout(request_timeout, adapter.search(&source_spec))
                     .await
                     .map_err(|_| {
                         CatalogError::TimedOut(request_source.clone())
                             .as_failure(Some(&request_source))
                     })?
-                    .map_err(|error| error.as_failure(Some(&request_source)))
+                    .map_err(|error| error.as_failure(Some(&request_source)))?;
+                let candidates =
+                    probe_candidates(adapter, candidates, request_timeout).await;
+                Ok(candidates)
             });
             (source, task)
         });
@@ -161,8 +306,7 @@ impl PlaybackCore {
     }
 
     #[cfg(test)]
-    pub async fn play(
-        &self,
+    pub async fn play(        &self,
         song_key: SongKey,
         resolver_locator: Option<ResolverLocator>,
         end_behavior: EndBehavior,
@@ -180,6 +324,56 @@ impl PlaybackCore {
     ) -> Result<StartReceipt, PlaybackCoreError> {
         self.play_inner(song_key, resolver_locator, end_behavior, Some(cancellation))
             .await
+    }
+
+    /// 预加载音源：提前完成网络解析并写入缓存，`play` 时可跳过等待。
+    ///
+    /// 只解析不启动引擎；失败时静默返回错误（播放路径会重新解析）。
+    pub async fn preload(
+        &self,
+        song_key: SongKey,
+        resolver_locator: Option<ResolverLocator>,
+    ) -> Result<(), PlaybackCoreError> {
+        if self.cached_stream(&song_key).is_some() {
+            tracing::debug!(key = %song_key, "音源已在缓存中，跳过预加载");
+            return Ok(());
+        }
+        let stream = self.resolve_stream(&song_key, resolver_locator.as_ref()).await?;
+        self.cache_stream(song_key, stream);
+        Ok(())
+    }
+
+    async fn resolve_stream(
+        &self,
+        song_key: &SongKey,
+        resolver_locator: Option<&ResolverLocator>,
+    ) -> Result<StreamSource, PlaybackCoreError> {
+        if let Some(registry) = self.registry.as_ref() {
+            registry
+                .require_enabled(&song_key.source)
+                .map_err(PlaybackCoreError::Failure)?;
+        }
+        let adapter = self
+            .catalog
+            .get(&song_key.source)
+            .ok_or_else(|| PlaybackCoreError::UnknownSource(song_key.source.clone()))?;
+        timeout(
+            self.source_timeout,
+            adapter.resolve(song_key, resolver_locator),
+        )
+        .await
+        .map_err(|_| PlaybackCoreError::Catalog(CatalogError::TimedOut(song_key.source.clone())))?
+        .map_err(PlaybackCoreError::Catalog)
+    }
+
+    fn cached_stream(&self, key: &SongKey) -> Option<StreamSource> {
+        let mut cache = self.resolve_cache.lock().unwrap();
+        cache.get(key, unix_epoch_ms())
+    }
+
+    fn cache_stream(&self, key: SongKey, stream: StreamSource) {
+        let mut cache = self.resolve_cache.lock().unwrap();
+        cache.put(key, stream, unix_epoch_ms());
     }
 
     async fn play_inner(
@@ -206,26 +400,37 @@ impl PlaybackCore {
             .catalog
             .get(&song_key.source)
             .ok_or_else(|| PlaybackCoreError::UnknownSource(song_key.source.clone()))?;
-        let resolved = {
-            let resolve = timeout(
-                self.source_timeout,
-                adapter.resolve(&song_key, resolver_locator.as_ref()),
-            );
-            tokio::pin!(resolve);
-            match cancellation.as_mut() {
-                Some(cancellation) => {
-                    tokio::select! {
-                        biased;
-                        _ = cancellation => return Err(PlaybackCoreError::Cancelled),
-                        resolved = &mut resolve => resolved,
+        let stream = match self.cached_stream(&song_key) {
+            Some(cached) => {
+                tracing::debug!(key = %song_key, "播放音源缓存命中，跳过网络解析");
+                cached
+            }
+            None => {
+                let resolved = {
+                    let resolve = timeout(
+                        self.source_timeout,
+                        adapter.resolve(&song_key, resolver_locator.as_ref()),
+                    );
+                    tokio::pin!(resolve);
+                    match cancellation.as_mut() {
+                        Some(cancellation) => {
+                            tokio::select! {
+                                biased;
+                                _ = cancellation => return Err(PlaybackCoreError::Cancelled),
+                                resolved = &mut resolve => resolved,
+                            }
+                        }
+                        None => resolve.await,
                     }
-                }
-                None => resolve.await,
+                };
+                let stream = resolved.map_err(|_| {
+                    PlaybackCoreError::Catalog(CatalogError::TimedOut(song_key.source.clone()))
+                })??;
+                self.cache_stream(song_key.clone(), stream.clone());
+                stream
             }
         };
-        let stream = resolved.map_err(|_| {
-            PlaybackCoreError::Catalog(CatalogError::TimedOut(song_key.source.clone()))
-        })??;
+        let stream = self.route_stream(&song_key, stream).await;
 
         if self.generation.load(Ordering::SeqCst) != generation {
             return Err(PlaybackCoreError::Engine(EngineError::Rejected(
@@ -367,6 +572,25 @@ impl PlaybackCore {
             .map_err(PlaybackCoreError::Catalog)
     }
 
+    /// 刷新支持手动刷新的平台凭据（QQ 音乐、哔哩哔哩）。
+    /// 返回 `None` 表示当前凭据无需刷新。
+    pub async fn refresh_credential(
+        &self,
+        provider: crate::catalog::ProviderId,
+        credential: &ProviderCredential,
+    ) -> Result<Option<ProviderCredential>, PlaybackCoreError> {
+        let adapter = self
+            .catalog
+            .refresh_adapter(provider.as_str())
+            .ok_or_else(|| PlaybackCoreError::UnknownSource(provider.as_str().to_owned()))?;
+        timeout(self.source_timeout, adapter.refresh_credential(credential))
+            .await
+            .map_err(|_| {
+                PlaybackCoreError::Catalog(CatalogError::TimedOut(provider.as_str().to_owned()))
+            })?
+            .map_err(PlaybackCoreError::Catalog)
+    }
+
     pub async fn kugou_account_status(
         &self,
     ) -> Result<crate::catalog::KugouAccountStatus, PlaybackCoreError> {
@@ -380,15 +604,43 @@ impl PlaybackCore {
             .map_err(PlaybackCoreError::Catalog)
     }
 
-    pub async fn kugou_report_listen_song(
+    /// 查询平台账号状态（QQ 音乐/网易云）。平台不支持时返回 None。
+    pub async fn account_status(
         &self,
-        mixsongid: &str,
+        provider: crate::catalog::ProviderId,
+    ) -> Result<Option<crate::catalog::ProviderAccountStatus>, PlaybackCoreError> {
+        timeout(
+            self.source_timeout,
+            self.catalog.account_status(provider.as_str()),
+        )
+        .await
+        .map_err(|_| {
+            PlaybackCoreError::Catalog(CatalogError::TimedOut(provider.as_str().to_owned()))
+        })?
+        .map_err(PlaybackCoreError::Catalog)
+    }
+
+    pub async fn kugou_claim_vip(
+        &self,
     ) -> Result<crate::catalog::KugouListenReport, PlaybackCoreError> {
         let account = self
             .catalog
             .kugou_account()
             .ok_or_else(|| PlaybackCoreError::UnknownSource("kugou".to_owned()))?;
-        timeout(self.source_timeout, account.report_listen_song(mixsongid))
+        timeout(self.source_timeout, account.claim_vip())
+            .await
+            .map_err(|_| PlaybackCoreError::Catalog(CatalogError::TimedOut("kugou".to_owned())))?
+            .map_err(PlaybackCoreError::Catalog)
+    }
+
+    pub async fn kugou_upgrade_vip(
+        &self,
+    ) -> Result<crate::catalog::KugouListenReport, PlaybackCoreError> {
+        let account = self
+            .catalog
+            .kugou_account()
+            .ok_or_else(|| PlaybackCoreError::UnknownSource("kugou".to_owned()))?;
+        timeout(self.source_timeout, account.upgrade_vip())
             .await
             .map_err(|_| PlaybackCoreError::Catalog(CatalogError::TimedOut("kugou".to_owned())))?
             .map_err(PlaybackCoreError::Catalog)
@@ -451,6 +703,7 @@ impl PlaybackCore {
         let engine = self.engine.clone();
         let source_timeout = self.source_timeout;
         let latest_generation = self.generation.clone();
+        let audio_cache = self.audio_cache.clone();
         tokio::spawn(async move {
             let mut snapshots = engine.subscribe();
             loop {
@@ -524,6 +777,11 @@ impl PlaybackCore {
                 return;
             }
 
+            // 重试音源同样改写为本地代理地址，保证与初始播放走同一缓存条目。
+            let stream = match audio_cache {
+                Some(cache) => cache.rewrite(&song_key, stream).await,
+                None => stream,
+            };
             if let Err(error) = engine
                 .command(EngineCommand::RefreshStream {
                     session_id,
@@ -628,6 +886,44 @@ mod tests {
     struct FakeSource {
         songs: Vec<Song>,
         fail_search: bool,
+    }
+
+    /// 记录 resolve 调用次数的假音源，用于缓存/预加载测试。
+    struct CountingSource {
+        resolve_calls: Arc<AtomicUsize>,
+        expires_at_epoch_ms: Option<u64>,
+    }
+
+    #[async_trait]
+    impl SourceAdapter for CountingSource {
+        async fn search(
+            &self,
+            _spec: &SearchSpec,
+        ) -> Result<Vec<ProviderSearchCandidate>, CatalogError> {
+            Ok(Vec::new())
+        }
+
+        async fn resolve(
+            &self,
+            _key: &SongKey,
+            _locator: Option<&ResolverLocator>,
+        ) -> Result<StreamSource, CatalogError> {
+            self.resolve_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(StreamSource {
+                url: Url::parse("https://example.test/audio.mp3").unwrap(),
+                headers: BTreeMap::new(),
+                expires_at_epoch_ms: self.expires_at_epoch_ms,
+            })
+        }
+    }
+
+    fn counting_source(expires_at_epoch_ms: Option<u64>) -> (Arc<CountingSource>, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let source = Arc::new(CountingSource {
+            resolve_calls: calls.clone(),
+            expires_at_epoch_ms,
+        });
+        (source, calls)
     }
 
     #[async_trait]
@@ -782,6 +1078,91 @@ mod tests {
             [EngineCommand::Start { generation: 1, song_key, .. }]
                 if song_key == &SongKey::new("qq", "song-1").unwrap()
         ));
+    }
+
+    #[tokio::test]
+    async fn preload_then_play_uses_cached_resolve() {
+        let (source, calls) = counting_source(None);
+        let (core, _) = core(vec![("qq".to_owned(), source)]);
+        let key = SongKey::new("qq", "song-1").unwrap();
+
+        core.preload(key.clone(), None).await.unwrap();
+        core.preload(key.clone(), None).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        core.play(key.clone(), None, EndBehavior::NotifyController)
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // 无过期字段的 URL 在兜底窗口内仍命中缓存。
+        core.play(key, None, EndBehavior::NotifyController)
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn play_uses_cached_resolve_within_signed_expiry() {
+        let expires_at = unix_epoch_ms() + 2000;
+        let (source, calls) = counting_source(Some(expires_at));
+        let (core, _) = core(vec![("qq".to_owned(), source)]);
+        let key = SongKey::new("qq", "song-1").unwrap();
+
+        core.play(key.clone(), None, EndBehavior::NotifyController)
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // 有效期内重复播放：命中缓存。
+        core.play(key.clone(), None, EndBehavior::NotifyController)
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // 签名过期后：重新解析。
+        tokio::time::sleep(Duration::from_millis(2100)).await;
+        core.play(key, None, EndBehavior::NotifyController)
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn resolve_cache_evicts_the_oldest_entry() {
+        let (source, calls) = counting_source(None);
+        let (core, _) = core(vec![("qq".to_owned(), source)]);
+
+        for index in 0..(RESOLVE_CACHE_MAX_ENTRIES + 2) {
+            let key = SongKey::new("qq", &format!("song-{index}")).unwrap();
+            core.preload(key, None).await.unwrap();
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            RESOLVE_CACHE_MAX_ENTRIES + 2
+        );
+
+        // 最旧的两首已被淘汰：重新解析。
+        for index in 0..2 {
+            let key = SongKey::new("qq", &format!("song-{index}")).unwrap();
+            core.play(key, None, EndBehavior::NotifyController)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            RESOLVE_CACHE_MAX_ENTRIES + 4
+        );
+
+        // 最新的仍在缓存中：命中。
+        let newest = SongKey::new("qq", &format!("song-{}", RESOLVE_CACHE_MAX_ENTRIES + 1))
+            .unwrap();
+        core.play(newest, None, EndBehavior::NotifyController)
+            .await
+            .unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            RESOLVE_CACHE_MAX_ENTRIES + 4
+        );
     }
 
     struct RetrySource {

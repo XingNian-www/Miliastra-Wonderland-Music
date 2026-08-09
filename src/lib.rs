@@ -26,8 +26,33 @@ pub fn default_config_path(
 
 #[cfg(target_os = "windows")]
 pub fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
+    // 发布布局：EXE 同目录只保留 config.yaml 与主程序，
+    // ffmpeg/MNN 等动态库统一放在 deps/dll/，启动时加入 DLL 搜索路径。
+    add_dependency_dll_directory(config_path);
     adapters::windows::dpi::set_process_dpi_awareness();
     composition::run(config_path)
+}
+
+/// 将发布目录的 `deps/dll/` 加入进程 DLL 搜索路径（SetDllDirectoryW），
+/// 使 ffmpeg、MNN 等动态库从依赖文件夹加载。
+#[cfg(target_os = "windows")]
+fn add_dependency_dll_directory(config_path: &std::path::Path) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::System::LibraryLoader::SetDllDirectoryW;
+    let Some(executable_root) = config_path.parent() else {
+        return;
+    };
+    let dll_directory = executable_root.join("deps").join("dll");
+    if !dll_directory.is_dir() {
+        return;
+    }
+    let wide = dll_directory
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<u16>>();
+    let _ = unsafe { SetDllDirectoryW(PCWSTR(wide.as_ptr())) };
 }
 
 #[cfg(target_os = "windows")]

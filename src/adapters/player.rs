@@ -138,11 +138,15 @@ impl MusicPlayerBackend for PlayerRuntimeBackend {
         self.dispatch(PlayerControl::Play(track.clone()))
     }
 
+    /// 歌曲级不可播放（无音源/需要VIP/无版权）——这类错误会触发自动换源尝试其他平台；
+    /// 认证/限流/超时等平台级错误不在此列。
     fn is_track_unavailable_error(&self, error: &anyhow::Error) -> bool {
-        error
-            .downcast_ref::<PlayerControlFailure>()
-            .and_then(|failure| failure.code.as_deref())
-            == Some("track_unavailable")
+        matches!(
+            error
+                .downcast_ref::<PlayerControlFailure>()
+                .and_then(|failure| failure.code.as_deref()),
+            Some("track_unavailable" | "track_vip_required" | "track_no_copyright")
+        )
     }
 
     fn pause(&self) -> Result<String> {
@@ -165,7 +169,10 @@ impl MusicPlayerBackend for PlayerRuntimeBackend {
         let volume = volume
             .trim()
             .parse::<u8>()
-            .map_err(|_| anyhow!("播放器音量不是有效的 0-100 数字"))?;
+            .map_err(|_| anyhow!("音量必须是 0-100 的数字"))?;
+        if volume > 100 {
+            return Err(anyhow!("音量必须是 0-100 的数字"));
+        }
         self.dispatch(PlayerControl::SetVolume(volume))
     }
 }
@@ -214,10 +221,22 @@ mod tests {
         }
     }
 
+    struct AcknowledgingControlPort;
+
+    impl PlayerControlPort for AcknowledgingControlPort {
+        fn dispatch(&mut self, control: &PlayerControl) -> ControlDispatch {
+            ControlDispatch::immediate(match control {
+                PlayerControl::SetVolume(volume) => {
+                    ControlDispatchOutcome::acknowledged(&format!("volume {volume}"))
+                }
+                _ => ControlDispatchOutcome::acknowledged("ok"),
+            })
+        }
+    }
+
     struct EmptySearchPort;
 
-    impl PlayerSearchPort for EmptySearchPort {
-        fn search_text(
+    impl PlayerSearchPort for EmptySearchPort {        fn search_text(
             &mut self,
             _keyword: &str,
             _source: &str,
@@ -241,6 +260,34 @@ mod tests {
         ) -> Result<Option<PickedCandidate>, PlayerSearchError> {
             Ok(None)
         }
+    }
+
+    #[test]
+    fn runtime_backend_rejects_volume_outside_the_0_100_range() {
+        let runtime = PlayerRuntime::start(
+            FailingObservationPort,
+            AcknowledgingControlPort,
+            EmptySearchPort,
+            PlayerRuntimeConfig::default(),
+        )
+        .expect("player runtime should start");
+        let backend = PlayerRuntimeBackend::new(runtime.handle());
+
+        for invalid in ["150", "101", "-1", "abc", "50.5", ""] {
+            let error = backend
+                .set_volume(invalid)
+                .expect_err("out-of-range volume should be rejected");
+            assert!(
+                error.to_string().contains("0-100"),
+                "unexpected message for {invalid:?}: {error}"
+            );
+        }
+
+        assert!(backend.set_volume("0").is_ok());
+        assert!(backend.set_volume("50").is_ok());
+        assert!(backend.set_volume(" 75 ").is_ok());
+        assert!(backend.set_volume("100").is_ok());
+        runtime.shutdown().expect("player runtime should shut down");
     }
 
     #[test]

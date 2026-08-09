@@ -59,9 +59,9 @@ use crate::features::command::{
     CommandAuthority, CommandEnvelope, CommandPrefix, FeatureCommandMatch,
 };
 pub(crate) use controller::{
-    MusicPlayerBackend, PlaybackIdentityDecision, PlaybackIdentityJudge, PlaybackNavigation,
-    PlaybackOutcome, PlaybackRequest, PlaybackStatePort, PlaybackTimePorts, PlaybackVerification,
-    PlayerController, QueueAdvanceContext, QueueAdvanceDecision,
+    MusicPlayerBackend, PlaybackNavigation, PlaybackOutcome, PlaybackRequest, PlaybackStatePort,
+    PlaybackTimePorts, PlaybackVerification, PlayerController, QueueAdvanceContext,
+    QueueAdvanceDecision,
 };
 pub(crate) use dedup::{PersistentSongDedupHistory, SongDedupCandidate};
 pub(crate) use format::{
@@ -79,52 +79,22 @@ pub(crate) use state::{
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlaybackTimingConfig {
-    pub search_settle_ms: u64,
     pub status_poll_ms: u64,
-    pub status_retries: u32,
-    pub skip_status_initial_ms: u64,
-    pub skip_status_poll_ms: u64,
-    pub skip_status_retries: u32,
     pub monitor_tick_ms: u64,
     pub monitor_status_ms: u64,
     pub uri_stable_samples: u32,
     pub transport_stable_samples: u32,
-    #[serde(default = "default_fallback_identity_stable_samples")]
-    pub fallback_identity_stable_samples: u32,
     #[serde(deserialize_with = "deserialize_positive_u64")]
     pub stale_timeout_ms: u64,
-}
-
-fn default_fallback_identity_stable_samples() -> u32 {
-    2
 }
 
 impl PlaybackTimingConfig {
     pub(crate) fn validate(&self) -> Result<()> {
         for (value, field) in [
             (self.status_poll_ms, "timing.playback.status_poll_ms"),
-            (
-                self.skip_status_poll_ms,
-                "timing.playback.skip_status_poll_ms",
-            ),
             (self.monitor_tick_ms, "timing.playback.monitor_tick_ms"),
             (self.monitor_status_ms, "timing.playback.monitor_status_ms"),
             (self.stale_timeout_ms, "timing.playback.stale_timeout_ms"),
-        ] {
-            if value == 0 {
-                bail!("{} 必须大于 0", field);
-            }
-        }
-        for (value, field) in [
-            (self.status_retries, "timing.playback.status_retries"),
-            (
-                self.skip_status_retries,
-                "timing.playback.skip_status_retries",
-            ),
-            (
-                self.fallback_identity_stable_samples,
-                "timing.playback.fallback_identity_stable_samples",
-            ),
         ] {
             if value == 0 {
                 bail!("{} 必须大于 0", field);
@@ -149,11 +119,21 @@ where
 #[serde(deny_unknown_fields)]
 pub struct QueueConfig {
     pub max_size: usize,
-    pub auto_advance_seconds: u64,
     pub protect_current_song_until_finished: bool,
     pub external_playback_protect_after_seconds: u64,
     /// 播放池最大容量，0 表示禁用播放池
     pub pool_max_size: usize,
+}
+
+impl Default for QueueConfig {
+    fn default() -> Self {
+        Self {
+            max_size: 5,
+            protect_current_song_until_finished: true,
+            external_playback_protect_after_seconds: 20,
+            pool_max_size: 200,
+        }
+    }
 }
 
 impl QueueConfig {
@@ -230,15 +210,6 @@ impl Default for MatchConfig {
 }
 
 impl MatchConfig {
-    pub(crate) fn match_song_identity(
-        &self,
-        request: &str,
-        observed_title: &str,
-        observed_artist: &str,
-    ) -> matcher::SongIdentityMatch {
-        matcher::match_song_identity(self, request, observed_title, observed_artist)
-    }
-
     pub(crate) fn validate(&self) -> Result<()> {
         for (value, field) in [
             (self.min_song_name_score, "matching.min_song_name_score"),
@@ -555,16 +526,9 @@ pub(crate) enum PlaybackStateUpdate {
         request: ActivePlaybackRequest,
         navigation: PlaybackNavigation,
     },
-    ClearPauseReason,
-    MarkRequestedPlayingIfActive,
-    PauseWaitingForQueue,
-    ResumeWaitingForQueue,
     Confirmed {
         request: ActivePlaybackRequest,
         navigation: PlaybackNavigation,
-    },
-    Reconciled {
-        request: ActivePlaybackRequest,
     },
     Observation(PlaybackObservation),
     Unknown,
@@ -605,31 +569,6 @@ impl PlaybackStateUpdate {
                 playback.active_request = Some(request);
                 true
             }
-            Self::ClearPauseReason => {
-                playback.pause_reason = PauseReason::None;
-                true
-            }
-            Self::MarkRequestedPlayingIfActive => {
-                playback.pause_reason = PauseReason::None;
-                if playback.active_request.is_some() {
-                    playback.state = ConfirmedPlaybackState::RequestedSongPlaying;
-                }
-                true
-            }
-            Self::PauseWaitingForQueue => {
-                playback.pause_reason = PauseReason::WaitingForQueue;
-                playback.state = ConfirmedPlaybackState::PausedWaitingForQueue;
-                true
-            }
-            Self::ResumeWaitingForQueue => {
-                playback.pause_reason = PauseReason::None;
-                playback.state = if playback.active_request.is_some() {
-                    ConfirmedPlaybackState::RequestedSongPlaying
-                } else {
-                    ConfirmedPlaybackState::ExternalPlayback
-                };
-                true
-            }
             Self::Confirmed {
                 request,
                 navigation,
@@ -641,13 +580,6 @@ impl PlaybackStateUpdate {
                 }
                 playback.state = ConfirmedPlaybackState::RequestedSongPlaying;
                 playback.pause_reason = PauseReason::None;
-                playback.active_request = Some(request);
-                true
-            }
-            Self::Reconciled { request } => {
-                if playback.active_request.is_none() {
-                    return false;
-                }
                 playback.active_request = Some(request);
                 true
             }

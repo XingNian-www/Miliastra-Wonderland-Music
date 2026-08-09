@@ -141,7 +141,6 @@ pub(crate) struct FormalSchedulerSnapshot {
     tasks: Vec<FormalTaskSnapshot>,
     active_lane: Option<SchedulerLane>,
     formal_epoch: u64,
-    active_playback_related: bool,
     pending_playback_related: bool,
     pending_diagnostic: bool,
     pending_deferred: bool,
@@ -173,10 +172,6 @@ impl FormalSchedulerSnapshot {
             && self.pending_labels.is_empty()
             && !self.pending_diagnostic
             && !self.pending_deferred
-    }
-
-    pub(crate) const fn active_playback_related(&self) -> bool {
-        self.active_playback_related
     }
 
     pub(crate) const fn pending_playback_related(&self) -> bool {
@@ -265,7 +260,6 @@ enum ActiveSchedulerWork {
     Formal {
         id: u64,
         label: String,
-        playback_related: bool,
         cancellation: FormalTaskCancellationToken,
     },
     External(SchedulerLaneLease),
@@ -557,13 +551,6 @@ impl FormalScheduler {
                 ActiveSchedulerWork::Diagnostic { .. } => SchedulerLane::Diagnostic,
             }),
             formal_epoch: self.formal_epoch,
-            active_playback_related: matches!(
-                self.active.as_ref(),
-                Some(&ActiveSchedulerWork::Formal {
-                    playback_related: true,
-                    ..
-                })
-            ),
             pending_playback_related: self.queued.iter().any(|task| task.playback_related),
             pending_diagnostic: !self.diagnostic_queued.is_empty(),
             pending_deferred: false,
@@ -584,7 +571,6 @@ impl FormalScheduler {
         self.active = Some(ActiveSchedulerWork::Formal {
             id: queued.id,
             label: queued.label.clone(),
-            playback_related: queued.playback_related,
             cancellation: queued.cancellation.clone(),
         });
         self.update_record(queued.id, |record| {

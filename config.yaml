@@ -1,286 +1,179 @@
 # Miliastra Wonderland Music 配置
-# 坐标沿用旧脚本习惯：以游戏客户区左上角为原点，按 1920x1080 有效画面写坐标
+# 坐标以游戏客户区左上角为原点，按 1920x1080 有效画面书写
+#
+# 本文件只保留核心运行配置。功能配置已按功能域拆到 deps/ 目录，
+# 修改对应功能时直接改对应文件：
+#
+#   deps/ocr.yaml               OCR 模型与识别参数
+#   deps/screen.yaml            游戏界面区域坐标
+#   deps/templates.yaml         模板图片路径与匹配阈值
+#   deps/moderation.yaml        拉黑/屏蔽区域与投票参数
+#   deps/startup.yaml           启动游戏 / 进入千星流程
+#   deps/invite.yaml            好友邀请流程区域
+#   deps/playback.yaml          播放器、登录助手与音频缓存
+#   deps/song.yaml              点歌队列、去重、审核与匹配
+#   deps/ai.yaml                点歌 AI
+#   deps/entertainment.yaml     成语接龙、斗地主、卧底、海龟汤
+#   deps/hotkeys.yaml           全局热键
+#   deps/friend_delivery.yaml   好友投递
+#   deps/custom_workflows.yaml  自定义流程
+#
+ocr_config_path: deps/ocr.yaml
+screen_config_path: deps/screen.yaml
+templates_config_path: deps/templates.yaml
+moderation_config_path: deps/moderation.yaml
+startup_config_path: deps/startup.yaml
+invite_config_path: deps/invite.yaml
+playback_config_path: deps/playback.yaml
+song_config_path: deps/song.yaml
+ai_config_path: deps/ai.yaml
+entertainment_config_path: deps/entertainment.yaml
+hotkeys_config_path: deps/hotkeys.yaml
+friend_delivery_config_path: deps/friend_delivery.yaml
+custom_workflows_config_path: deps/custom_workflows.yaml
 
+# ===== 窗口 =====
+# 目标游戏进程与画面尺寸，坐标均以此为基准
 window:
-  # 目标游戏进程名，按进程文件名匹配，大小写不敏感；多个进程名可用逗号分隔
+  # 进程名，多个用逗号分隔，大小写不敏感
   target_process: yuanshen.exe,GenshinImpact.exe
-  # 配置坐标对应的游戏有效画面宽度
+  # 画面宽度
   content_width: 1920
-  # 配置坐标对应的游戏有效画面高度
+  # 画面高度
   content_height: 1080
-  # /active-window 接口是否尝试自动切回目标窗口
+  # /active-window 接口是否自动切回游戏窗口
   auto_activate_window: false
-  # 全局安全聚焦点，只在业务入口显式激活/聚焦游戏窗口时使用一次
+  # 全局安全聚焦点，只在业务入口聚焦窗口时使用一次
   focus_point:
     x: 1919
     y: 1000
 
-screen:
-  # 截图会缩放到这个宽度后再做模板匹配和 OCR
-  expected_width: 1920
-  # 截图会缩放到这个高度后再做模板匹配和 OCR
-  expected_height: 1080
-  # 截图尺寸和预期不一致时是否记录 warning
-  warn_on_size_mismatch: true
-  # 聊天区域，用于匹配蓝/黄/粉聊天标志和 OCR 聊天文本
-  chat_rect:
-    x: 39
-    y: 879
-    width: 416
-    height: 143
-  # 一级聊天界面无聊天内容时好友按钮模板检测区域；有聊天内容时由蓝/黄/粉标识判定（游戏客户区坐标，不含标题栏）
-  friend_rect:
-    x: 170
-    y: 1018
-    width: 50
-    height: 40
-  # 二级聊天界面左上角返回按钮模板检测区域
-  secondary_back_rect:
-    x: 15
-    y: 15
-    width: 65
-    height: 65
-  # 二级大厅/面板界面模板检测区域
-  secondary_hall_rect:
-    x: 10
-    y: 190
-    width: 65
-    height: 55
-  # F2 大厅页顶部大厅名称 OCR 区域
-  hall_name_rect:
-    x: 75
-    y: 425
-    width: 325
-    height: 40
-  # 大厅成员人数 OCR 区域，用于判断是否需要滚动右侧成员列表
-  hall_member_count_rect:
-    x: 75
-    y: 470
-    width: 450
-    height: 50
-  # F2 大厅页剩余时间 OCR 区域，只保留识别到的分钟数字
-  hall_time_rect:
-    x: 430
-    y: 520
-    width: 110
-    height: 40
-  # F2 大厅页成员列表滚动区域；拖动点位约在画布宽度的 2/3 处
-  hall_member_list_rect:
-    x: 1280
-    y: 110
-    width: 560
-    height: 850
-
+# ===== 稳定性 =====
+# 界面状态连续确认次数，防止瞬时误判
 stability:
-  # 连续确认次数的全局默认值；只有大于 1 才生效，否则使用内置默认值 2
+  # 全局默认值；只有大于 1 才生效，否则用内置值 2
   default_count: 2
-  # 公共 UI 模板状态的局部覆盖；大于 1 时优先，否则继承 default_count
+  # 公共 UI 模板状态；0/1 继承全局
   ui_state_count: 0
-  # 二级大厅气泡与发送者关联的局部覆盖；大于 1 时优先，否则继承 default_count
+  # 二级大厅气泡与发送者关联；0/1 继承全局
   secondary_hall_count: 0
 
+# ===== 时序 =====
+# 各流程等待与轮询间隔，单位毫秒
 timing:
-  # 1. 监听子进程异常退出后的重启等待时间，单位毫秒
+  # 监听子进程异常退出后的重启等待
   watchdog_restart_ms: 2000
-  # 2. 监听主循环空转间隔；脚本暂停或每轮扫描结束后等待多久再继续，单位毫秒
+  # 主循环空转间隔（脚本暂停或每轮扫描后）
   loop_idle_ms: 60
+
+  # ---- 聊天扫描 ----
   chat_scan:
-    # 聊天 OCR 兜底扫描间隔；画面没变化时按这个间隔强制扫描一次，单位毫秒
+    # 画面无变化时强制扫描的兜底间隔
     fallback_ms: 2000
-    # 聊天变化后等待画面稳定再 OCR 的时间，单位毫秒
+    # 变化后等待画面稳定再 OCR
     change_debounce_ms: 120
-    # 两次变化触发 OCR 之间的最小间隔，单位毫秒
+    # 两次变化触发 OCR 的最小间隔
     change_cooldown_ms: 250
+
+  # ---- 命令执行 ----
   command:
-    # 执行命令前等待回到一级界面的最长时间，单位毫秒
+    # 执行命令前等待回到一级界面的最长时间
     ui_timeout_ms: 15000
-    # 返回一级界面时每次 ESC 后等待重新检测的基础时间；连续失败后会递增，超过 5 次固定为 2000ms
+    # 返回一级时 ESC 后的重检基础时间；连续失败递增，超过 5 次固定 2000
     return_retry_ms: 1000
-    # 命令执行后等待聊天列表/动画稳定再复扫的时间，单位毫秒
+    # 命令执行后等待聊天列表/动画稳定再复扫
     post_settle_ms: 500
-    # @帮助 多条消息之间的间隔，单位毫秒
+    # @帮助 多条消息的发送间隔
     help_batch_ms: 500
+
+  # ---- 输入操作 ----
   input:
-    # 自动激活游戏窗口后等待前台窗口切换完成的时间，单位毫秒
+    # 自动激活游戏窗口后等待前台切换完成
     after_activate_ms: 200
-    # 手动调试工具在显式聚焦游戏窗口后的等待时间，单位毫秒
+    # 手动调试工具显式聚焦游戏窗口后的等待
     focus_ms: 300
-    # 按回车打开聊天输入后的等待时间，单位毫秒
+    # 回车打开聊天输入后的等待
     open_chat_ms: 300
-    # 每次点击聊天输入区域后的等待时间，单位毫秒
+    # 每次点击聊天输入区域后的等待
     click_ms: 150
-    # 输入文本后到发送前的等待时间，单位毫秒
+    # 输入文本后到发送前的等待
     text_ms: 250
-    # 发送聊天后等待界面稳定的时间，单位毫秒
+    # 发送聊天后等待界面稳定
     send_ms: 300
+
+  # ---- 自定义流程 ----
   workflow:
-    # wait_template/click_template 默认等待模板出现的最长时间，单位毫秒
+    # wait_template/click_template 默认最长等待
     default_timeout_ms: 5000
-    # 等待模板出现时的轮询间隔，单位毫秒
+    # 等待模板出现时的轮询间隔
     default_poll_ms: 200
-    # 每个步骤执行后的默认等待时间，单位毫秒
+    # 每个步骤执行后的默认等待
     default_step_wait_ms: 300
+
+  # ---- 大厅 ----
   hall:
-    # 进入/退出大厅页面后等待页面稳定的时间，单位毫秒
+    # 进入/退出大厅页面后等待页面稳定
     page_settle_ms: 800
-    # 大厅信息多次 OCR 采样之间的间隔，单位毫秒
+    # 大厅信息多次 OCR 采样间隔
     ocr_sample_interval_ms: 120
+
+  # ---- 邀请 ----
   invite:
-    # 邀请流程打开好友/聊天面板前后的固定等待，单位毫秒
+    # 打开好友/聊天面板前后的固定等待
     open_chat_ms: 400
-    # 点击好友后发送私聊反馈、以及输入大厅密码前的短暂等待时间，单位毫秒；邀请主流程由后续 OCR 直接确认页面状态
+    # 点击好友后、输入密码前的短暂等待；主流程由后续 OCR 确认页面状态
     step_ms: 800
-    # 非公共大厅邀请时等待邀请确认/拒绝命令的最长时间，单位毫秒
+    # 非公共大厅邀请等待确认/拒绝命令的最长时间
     confirm_timeout_ms: 30000
-    # 邀请确认扫描间隔，单位毫秒
+    # 邀请确认扫描间隔
     confirm_poll_ms: 2000
+
+  # ---- 管理（拉黑/屏蔽）----
   moderation:
-    # 拉黑/屏蔽 UID 请求的好友私聊投票等待时间，单位毫秒
+    # UID 请求的好友私聊投票等待时间
     vote_timeout_ms: 120000
-    # 投票 OCR 扫描间隔，单位毫秒
+    # 投票 OCR 扫描间隔
     vote_poll_ms: 2000
-    # 点击 UID 搜索按钮后等待搜索结果出现的最长时间，单位毫秒
+    # 点击 UID 搜索按钮后等待搜索结果出现
     search_result_timeout_ms: 5000
-    # 点击确认按钮后等待动作完成的时间，单位毫秒
+    # 点击确认按钮后等待动作完成
     confirm_wait_ms: 2000
+
+  # ---- 播放监控 ----
   playback:
-    # 点歌搜索发起后等待播放器切歌的时间，单位毫秒
-    search_settle_ms: 2000
-    # 点歌后查询播放状态的间隔，单位毫秒
+    # 点歌后查询播放状态的间隔
     status_poll_ms: 1000
-    # 点歌后最多查询播放状态次数
-    status_retries: 15
-    # 下一首/上一首后首次查询播放器状态前的等待时间，单位毫秒
-    skip_status_initial_ms: 500
-    # 下一首/上一首后轮询播放器状态的间隔，单位毫秒
-    skip_status_poll_ms: 300
-    # 下一首/上一首后最多查询播放状态次数
-    skip_status_retries: 5
-    # 播放监控线程循环间隔，单位毫秒
+    # 播放监控线程循环间隔
     monitor_tick_ms: 200
-    # 播放结束监控向原生播放运行时校准状态的间隔，单位毫秒
+    # 监控向原生播放运行时校准状态的间隔
     monitor_status_ms: 1000
-    # 播放 URI 连续确认次数；大于 1 时覆盖全局值，0 或 1 表示继承
+    # URI 连续确认次数；0/1 继承全局
     uri_stable_samples: 0
-    # 播放状态连续确认次数；大于 1 时覆盖全局值，0 或 1 表示继承
+    # 播放状态连续确认次数；0/1 继承全局
     transport_stable_samples: 0
-    # 播放器跨源自动换源后，备用 URI/标题/歌手需要连续稳定的确认次数
-    fallback_identity_stable_samples: 2
-    # 播放器异常时保留上一条稳定观测的最长时间，必须为正整数，单位毫秒
+    # 播放器异常时保留上一条稳定观测的最长时间
     stale_timeout_ms: 5000
+
+  # ---- 决策确认 ----
   decision:
-    # 匹配失败/AI 自动匹配后等待用户确认的最长时间，单位毫秒
+    # 匹配失败/AI 自动匹配后等待用户确认的最长时间
     timeout_ms: 20000
-    # 匹配失败/AI 自动匹配期间扫描确认命令的间隔，单位毫秒
+    # 期间扫描确认命令的间隔
     poll_ms: 2000
+
+  # ---- 外部服务 ----
   external:
-    # 调整音量时每个平滑步进之间的等待时间，单位毫秒
+    # 内置播放器音量渐变（防爆音）：每个平滑步进的间隔，异步执行不阻塞命令
     volume_smooth_step_ms: 300
-    # AI HTTP 请求超时，单位毫秒
+    # AI HTTP 请求超时
     ai_request_timeout_ms: 35000
 
-ocr:
-  # MNN/PaddleOCR 检测模型路径；OpenVINO-only 配置可设为 null 或省略
-  det_model: models/PP-OCRv6_small_det.mnn
-  # MNN/PaddleOCR 识别模型路径；OpenVINO-only 配置可设为 null 或省略
-  rec_model: models/PP-OCRv6_small_rec.mnn
-  # PaddleOCR 字符集路径
-  charset: models/ppocr_keys_v6_small.txt
-  # OCR 最低置信度，低于该值的结果会被过滤
-  min_confidence: 0.9
-  # OCR 线程数
-  threads: 4
-  # 单次 OCR 请求从入队到返回的最长时间，单位毫秒
-  request_timeout_ms: 10000
-  # 关闭时等待底层 OCR 推理退出的最长时间，单位毫秒
-  shutdown_timeout_ms: 5000
-  # OCR 后端优先级；可用值: cuda, vulkan, opencl, openvino, cpu。默认只使用 CPU OCR
-  backend_priority:
-    - cpu
-  # OpenVINO IR 模型配置。默认 EXE 已包含 OpenVINO 适配器，但只在
-  # backend_priority 选择 openvino 时检查运行时 DLL 和这些模型文件。
-  openvino:
-    det_model: null
-    det_weights: null
-    rec_model: null
-    rec_weights: null
-    device: CPU
-    # OpenVINO GPU/CPU 编译缓存；首次启动会预热聊天 OCR 的固定形状，后续启动可避免重复编译。
-    # 设置为 null 可关闭缓存。
-    cache_dir: data/openvino-cache
-  # 检测模型最长边限制；保持 960 与 PaddleOCR/BetterGI 常用配置一致
-  det_max_side_len: 960
-  # 检测分割阈值；越低越容易检出细小文字，也更容易产生噪声框
-  det_score_threshold: 0.3
-  # 文本框外扩比例；2.0 更接近 BetterGI，减少裁掉边缘字符
-  det_unclip_ratio: 2.0
-  # 最小文本框面积；小聊天文字用较低值，避免漏掉短命令
-  det_min_area: 9
-  # OCR 库额外裁剪边框；BetterGI 主要依赖 unclip 外扩，这里关闭额外扩边
-  det_box_border: 0
-  # 聊天区缩略图平均像素差超过该值时认为画面有变化
-  change_mean_threshold: 6.0
-  # 聊天区缩略图变化像素比例超过该值时认为画面有变化
-  change_pixel_threshold: 0.03
-  # 聊天标志右侧到文本区域的间距
-  text_left_gap: 8
-  # 聊天消息块顶部向上扩展像素
-  block_top_padding: 2
-  # 聊天消息块底部向上收缩像素，避免吃到下一条标志
-  block_bottom_padding: 2
-  # 单条聊天消息 OCR 块最大高度
-  max_block_height: 120
-  # OCR 结果合并为同一行的 Y 轴容差
-  same_line_y_tolerance: 10
-  # 聊天标志去重 X 轴容差
-  marker_dedupe_x: 8
-  # 聊天标志去重 Y 轴容差
-  marker_dedupe_y: 8
-  # 判定下一条聊天标志的最小 Y 轴间隔
-  next_marker_min_gap: 12
-  # 聊天文本区域右侧留白
-  right_padding: 4
-  # 实验性：将聊天块拼接为单张图片一次性 OCR，减少推理次数
-  batch_recognize: false
-
-templates:
-  # 蓝色聊天标志模板，通常是自己/普通聊天行标志
-  blue_marker: assets/chat-marker-blue.png
-  # 黄色聊天标志模板，通常是系统/高亮聊天行标志
-  yellow_marker: assets/chat-marker-yellow.png
-  # 粉色聊天标志模板，用于识别好友私聊命令
-  pink_marker: assets/chat-marker-pink.png
-  # 一级聊天界面的好友按钮模板
-  friend: assets/ui-primary-friend.png
-  # 二级聊天界面左上角返回按钮模板，用于稳定判断二级界面
-  secondary_back: assets/ui-secondary-back.png
-  # 二级大厅/面板界面模板
-  secondary_hall: assets/ui-secondary-hall.png
-  # 邀请流程里的“查看千星”按钮模板
-  invite_view_star: assets/invite-view-star.png
-  # 邀请流程里的“前往其大厅”按钮模板
-  invite_goto_hall: assets/invite-goto-hall.png
-  # 邀请流程里的“进入大厅”按钮模板
-  invite_enter_hall: assets/invite-enter-hall.png
-  # 好友界面模板，用于 UID 拉黑/屏蔽流程
-  friend_panel: assets/friend-panel.png
-  # 好友搜索界面模板
-  friend_search_panel: assets/friend-search-panel.png
-  # 好友搜索结果里的更多设置按钮模板
-  friend_more_settings: assets/friend-more-settings.png
-  # 更多设置里的屏蔽聊天按钮模板
-  friend_block_chat: assets/friend-block-chat.png
-  # 更多设置里的拉黑按钮模板
-  friend_blacklist: assets/friend-blacklist.png
-  # 拉黑/屏蔽弹窗里的确认按钮模板
-  friend_confirm: assets/friend-confirm.png
-  # UI/聊天标志模板匹配阈值，越高越严格
-  marker_threshold: 0.9
-
+# ===== 输出 =====
+# 游戏内回复与点击点位
 output:
   # 是否真的向游戏内发送回复；false 时只写日志
   send_enabled: true
-  # 保留给手动调试工具使用的聊天面板安全点击点；自动流程返回一级只使用 ESC
+  # 手动调试工具用的聊天面板安全点击点；自动流程返回一级只用 ESC
   focus_point:
     x: 1919
     y: 1000
@@ -289,704 +182,42 @@ output:
     x: 600
     y: 1013
 
-moderation:
-  # 同一好友同一判决需要连续稳定识别次数
-  stable_vote_samples: 3
-  # 同意人数 - 不同意人数 达到该值才执行
-  required_vote_margin: 3
-  # 好友界面模板搜索区域
-  friend_panel_region:
-    x: 770
-    y: 20
-    width: 75
-    height: 50
-  # 搜索按钮模板搜索区域；命中后会点击按钮左侧 500 像素处粘贴 UID，再点击按钮
-  search_panel_region:
-    x: 1600
-    y: 100
-    width: 240
-    height: 90
-  # UID 搜索输入框点击点
-  search_input_point:
-    x: 1180
-    y: 135
-  # UID 搜索按钮点击点
-  search_button_point:
-    x: 1680
-    y: 135
-  # 更多设置按钮模板搜索区域
-  more_settings_region:
-    x: 1140
-    y: 180
-    width: 80
-    height: 70
-  # 屏蔽聊天按钮模板搜索区域
-  block_chat_region:
-    x: 1240
-    y: 130
-    width: 440
-    height: 505
-  # 拉黑按钮模板搜索区域
-  blacklist_region:
-    x: 1240
-    y: 130
-    width: 440
-    height: 505
-  # 拉黑/屏蔽弹窗确认按钮模板搜索区域
-  confirm_region:
-    x: 900
-    y: 700
-    width: 500
-    height: 100
-playback:
-  # 三个平台凭据的版本化存储目录
-  credential_directory: data/credentials
-  # 受控登录使用的短生命周期助手
-  login_helper_executable: miliastra-login-helper.exe
-  # 内置酷狗概念版 API sidecar
-  kugou_api_executable: kugou-api.exe
-  # 单次交互登录的最长时间，单位毫秒
-  login_timeout_ms: 180000
-  # 酷狗 KuGouMusicApi 服务地址；文档站不是 API 服务
-  kugou_api_base_url: http://127.0.0.1:3000
-
+# ===== Web 面板 =====
 http:
-  # Web/API 面板监听地址
+  # 监听地址
   host: 127.0.0.1
-  # Web/API 面板端口
+  # 监听端口
   port: 18888
-  # 是否启用 Web/API 面板
+  # 是否启用
   enabled: true
   # 非本机监听时必须设置；Web 页面会在当前浏览器会话中保存该令牌
   access_token: ""
 
+# ===== 日志 =====
 logging:
   # 日志目录
   dir: logs
-  # 日志级别：error/warn/info/debug/trace
+  # 级别：error/warn/info/debug/trace
   level: info
-  # 是否按自然日分文件；启用后主日志和性能日志都会在跨日时自动轮转
+  # 按自然日分文件；跨日自动轮转
   rotate_daily: true
-  # 最多保留多少个自然日的按日日志；设为 0 时不自动清理
+  # 最多保留多少个自然日的日志；0 不清理
   retain_days: 7
 
+# ===== 终端面板 =====
 tui:
-  # 是否启用终端 TUI 面板；启用后实时显示事件日志、OCR 内容和队列状态
+  # 是否启用；启用后实时显示事件日志、OCR 内容和队列状态
   enabled: true
-  # TUI 刷新间隔，单位毫秒
+  # 刷新间隔（毫秒）
   refresh_ms: 100
-  # TUI 保留最近多少行日志
+  # 保留最近多少行日志
   log_lines: 200
 
+# ===== 状态持久化 =====
 state:
-  # 播放器确认状态持久化路径
+  # 播放器确认状态
   playback_state_path: data/playback-state.json
-  # 大厅倒计时状态持久化路径
+  # 大厅倒计时状态
   hall_state_path: data/hall-state.json
-  # 最终执行命令记录路径
+  # 最终执行命令记录
   executed_commands_log_path: data/executed-commands.log
-
-queue:
-  # 队列最大长度
-  max_size: 5
-  # 播放池最大容量；已确认播放过的点歌会进入播放池，队列播完后从播放池随机播放；0 表示禁用播放池
-  pool_max_size: 200
-  # 当前歌曲剩余多少秒以内自动播放队列下一首
-  auto_advance_seconds: 1
-  # 机器人确认播放的歌曲是否保护；true 时新点歌会排队，未结束只能用 @下一首 提前切换；自动出队仍由 auto_advance_seconds 控制
-  protect_current_song_until_finished: true
-  # 非点歌歌曲连续正常播放多少秒后加入当前歌曲保护；0 表示外部播放永不保护
-  external_playback_protect_after_seconds: 20
-
-song_dedup:
-  # 长时间同歌去重；播放/入队前检查，确认播放成功后记录
-  enabled: true
-  # 最近多少秒内统计同一首歌播放次数
-  window_seconds: 3600
-  # 最近窗口内同一首歌最多允许播放次数；达到该值后拒绝或跳过
-  max_count: 1
-  # 控制台来源是否默认豁免长时间同歌去重
-  console_bypass: true
-  # 长时间同歌去重历史持久化路径
-  history_path: data/song-dedup-history.json
-
-idiom_chain:
-  # 是否启用项目内置成语词库的接龙功能
-  enabled: true
-  # 成语词库路径；相对路径以主程序 EXE 所在目录为基准
-  lexicon_path: assets/idioms.txt
-  # 最多保留多少个最近成语用于会话历史；本局完整已用集合始终禁止重复
-  history_limit: 200
-  # 多久无人接词就自动结束本局；0 表示不超时，单位秒
-  idle_timeout_seconds: 300
-  # false 时开局玩家不能连续接词
-  allow_consecutive_player: false
-  # false 时仅开局玩家可使用 #结束
-  allow_anyone_stop: false
-
-landlord:
-  # 三名好友参与的单局斗地主娱乐模块
-  enabled: true
-  # 等待三人组局的最长时间
-  lobby_timeout_seconds: 120
-  # 每名玩家的出牌时间
-  turn_timeout_seconds: 90
-  # 连续超时多少次后进入自动托管
-  trustee_after_timeouts: 2
-  # 好友私聊 #手牌 的单人查询冷却
-  hand_cooldown_seconds: 10
-
-# 谁是卧底默认关闭；启用前复制 undercover.example.yaml 为 undercover.yaml 并审核词对
-undercover:
-  enabled: false
-  word_bank_path: undercover.yaml
-  used_state_path: data/undercover-used.yaml
-  min_players: 4
-  double_min_players: 6
-  max_players: 11
-  lobby_timeout_seconds: 180
-  phase_timeout_seconds: 180
-  # 投票阶段公布未投票位置的间隔，单位秒
-  progress_interval_seconds: 20
-  # 单条公屏 #内容 的最大显示宽度
-  description_max_width: 70
-turtle_soup:
-  # 海龟汤娱乐模块默认关闭；启用前必须准备正式题库并配置独立 AI Provider
-  enabled: false
-  # 正式题库由使用者维护，不随仓库提交；格式参考 turtle_soup.example.yaml
-  question_bank_path: turtle_soup.yaml
-  # 永久已使用题目记录；程序不提供重置接口，只能手动修改此文件
-  used_state_path: data/turtle-soup-used.json
-  # 进行中多久没有新问题就自动结束，单位秒
-  idle_timeout_seconds: 600
-  # 单局最长时间，单位秒
-  max_session_seconds: 3600
-  # AI 同时裁决的最大请求数
-  max_concurrency: 4
-  # 除正在裁决外，最多等待多少条问题
-  max_pending: 32
-  # 单个昵称的一份批量长答案最多暂存多少段；每段仍受游戏聊天长度限制
-  batch_max_parts: 32
-  # 昵称 OCR 连续确认次数；大于 1 时覆盖全局值，0 或 1 表示继承
-  nickname_stable_count: 0
-  # 正文 OCR 连续确认次数；大于 1 时覆盖全局值，0 或 1 表示继承
-  content_stable_count: 0
-  # 单次 AI 请求超时，单位秒
-  request_timeout_seconds: 20
-  # 单次裁决请求失败后的重试次数；实际最多请求 retry_count + 1 次
-  retry_count: 2
-  # AI 请求重试间隔，单位毫秒
-  retry_delay_ms: 500
-  # 附加在固定裁决提示词后的房间规则；不要要求模型输出自由解释或汤底
-  custom_prompt: |
-    裁决备注若以“主持裁决：问题=结果”的形式明确列出标准问法，语义等价的玩家问题优先遵循该结果。
-    对裁决备注没有列出的问法，严格使用内置的互斥裁决协议，只判断本次问题，不自行放宽“相容近似”或“完全正确”的范围。
-  # 海龟汤默认使用 OpenAI Chat Completions；优先选择高能力模型，保证复杂逻辑整理质量
-  ai:
-    # OpenAI 官方完整 Chat Completions 地址
-    endpoint: "https://api.openai.com/v1/chat/completions"
-    # 填写 OpenAI API Key；不要提交到 Git
-    api_key: ""
-    # 高能力模型；请求只发送 OpenAI 标准 Chat Completions 字段
-    model: "gpt-5.6"
-    # 可选的独立 HTTP(S) 代理；留空时沿用环境代理设置
-    http_proxy: ""
-    # 单次裁决允许生成的最大 Token；复杂裁决使用更充足的 JSON 输出空间
-    # 程序按 OpenAI Chat Completions 的 max_tokens 字段发送
-    max_tokens: 1024
-    # 第三方兼容字段；默认空。只能补充字段，和官方字段同名时官方值优先
-    # 例如某 Provider 必须显式关闭私有思考模式时，可填：{ thinking: { type: disabled } }
-    extra_body: {}
-
-ai:
-  # 点歌 AI Provider。可选：mimo、openai、deepseek、custom；默认选择响应更快的 OpenAI 小模型。
-  #
-  # mimo：默认使用小米 Mimo，鉴权头为 api-key。
-  #   默认 endpoint: https://api.xiaomimimo.com/v1/chat/completions
-  #   默认 model: mimo-v2.5
-  # openai：默认使用 OpenAI，鉴权头为 Authorization: Bearer。
-  #   默认 endpoint: https://api.openai.com/v1/chat/completions
-  #   默认 model: gpt-5.6-mini
-  # deepseek：默认使用 DeepSeek OpenAI Chat Completions 接口。
-  #   默认 endpoint: https://api.deepseek.com/chat/completions
-  #   默认 model: deepseek-chat
-  # custom：自定义 OpenAI-compatible 网关，必须同时填写 endpoint 和 model。
-  provider: openai
-  # API Key。留空表示点歌 AI 未启用；不要提交到 Git，也不要放进 URL 查询参数。
-  # mimo 使用 api-key 请求头，其他 Provider 使用 Authorization Bearer 请求头。
-  api_key: ""
-  # 完整的 Chat Completions 请求地址，必须以 /chat/completions 结尾。
-  # 非 custom Provider 留空时使用上面列出的默认 endpoint；custom 必填。
-  # 可包含网关要求的查询参数，例如：
-  #   https://gateway.example/v1/chat/completions?api-version=2026-07-15
-  endpoint: ""
-  # 模型名；点歌默认使用低延迟模型，custom 必须填写。
-  # 网关可用模型以其 /v1/models 返回结果为准。
-  model: "gpt-5.6-mini"
-  # 可选的独立 HTTP(S) 代理；只作用于点歌 AI，留空时沿用环境代理设置
-  http_proxy: ""
-  # 第三方兼容字段。必须是 JSON object；默认空对象。
-  # 程序会自动生成官方 Chat Completions 字段：model、messages、response_format、
-  # temperature、stream=false、store=false、max_completion_tokens、top_p。
-  # extra_body 与这些字段同名时，官方值覆盖 extra_body；其他字段原样传给网关。
-  # 例如 DeepSeek 私有思考开关（仅在网关明确支持时配置）：
-  #   extra_body:
-  #     thinking:
-  #       type: disabled
-  # 也可以放置网关自定义的租户、路由或思考参数；程序不会自动猜测这些字段。
-  extra_body: {}
-
-  # 点歌 AI 请求超时不在本段配置，由 timing.external.ai_request_timeout_ms 控制。
-  # Web 调试接口 /ai/recognize、/ai/match、/ai/pick 还允许用 query 临时覆盖：
-  # provider、apiKey（或 api_key）、endpoint、model。
-  # 切换到不同 Provider 时，配置中的 extra_body 不会带过去，避免跨供应商泄漏私有字段。
-
-song_review:
-  # 候选歌曲 AI 审核；只审核最终候选歌曲/URI，控制台来源最高权限免审。
-  # 配置 API Key 后改为 true；未配置密钥时保持关闭，避免所有歌曲因审核失败被拒绝。
-  enabled: false
-  # 审核返回 level 为 1-10，超过该阈值会拒绝点歌
-  max_allowed_level: 4
-  # 审核服务多次失败后的策略：reject 拒绝，allow 放行并写警告日志
-  failure_policy: reject
-  # 审核请求失败后的重试次数；实际最多请求 retry_count + 1 次
-  retry_count: 2
-  # 审核重试间隔
-  retry_delay_ms: 500
-  # 游戏内拒绝原因最多显示的字符数；完整原因写日志
-  reply_reason_max_chars: 40
-  # 审核条件；可以按房间氛围修改，但不要要求模型改变 JSON 输出格式
-  policy_prompt: |
-    审核目标：只通过整体听感偏舒缓、柔和、轻松、安静、治愈、抒情、慢节奏或中低强度的歌曲。
-    拒绝明显炸场、吵闹、压迫感强、节奏过快、情绪过激、强烈电子噪音、重金属、硬核、鬼畜、洗脑循环、尖锐喊叫、强烈攻击性或明显破坏房间氛围的歌曲。
-    请尽量使用联网搜索得到的曲风、歌词摘要、歌曲介绍和公开听感描述判断。
-    如果信息不足，请保守判断；不确定时应给较高强度等级，而不是因为歌曲热门、用户喜欢或歌手知名就放宽标准。
-  # 追加审核规则；会附加在 policy_prompt 后面，用于临时补充口径
-  custom_prompt: |
-    本房间偏好舒缓、轻松、不吵闹的音乐。
-  # 独立审核 Provider；必须支持 OpenAI Responses API、web_search 和严格 JSON Schema
-  provider:
-    # OpenAI 官方完整 Responses 地址；程序会固定要求 web_search。
-    endpoint: "https://api.openai.com/v1/responses"
-    # Responses API 使用 Authorization: Bearer <key>；不要提交到 Git。
-    api_key: ""
-    # 高能力审核模型；启用审核时必须同时填写 api_key。
-    model: "gpt-5.6"
-    # 可选的独立 HTTP(S) 代理；只作用于歌曲审核，留空时沿用环境代理设置
-    http_proxy: ""
-    # 第三方兼容字段；必须是 JSON object，默认空对象。
-    # 程序会自动生成官方 Responses 字段：model、instructions、input、text、tools、
-    # tool_choice、temperature、top_p、max_output_tokens、store、stream。
-    # extra_body 与这些字段同名时，官方值覆盖 extra_body；其他字段原样传给网关。
-    # web_search 和严格 JSON Schema 由程序固定启用，不能通过 extra_body 关闭。
-    extra_body: {}
-
-matching:
-  # 歌名最低匹配分数
-  min_song_name_score: 0.5
-  # 4 字以内中文歌名最多允许漏字数
-  short_chinese_song_max_miss: 1
-  # 长中文歌名最低命中比例
-  long_chinese_song_min_score: 0.5
-  # 完整歌名后最多忽略的 OCR 噪声字符数
-  max_ocr_noise_chars: 1
-  # 是否启用中文歌手模糊匹配
-  enable_fuzzy_singer: true
-  # 4 字以内中文歌手最多允许漏字数
-  short_chinese_singer_max_miss: 1
-  # 长中文歌手最低命中比例
-  long_chinese_singer_min_score: 0.8
-  # 英文歌名编辑距离占比上限
-  en_max_edit_fraction: 0.3
-  # 英文歌手编辑距离占比上限
-  en_singer_max_edit_fraction: 0.35
-
-hotkeys:
-  # 是否启用全局热键
-  enabled: true
-  # 暂停/恢复热键
-  pause_key: F7
-  # 退出热键
-  exit_key: F12
-
-startup:
-  # 程序启动后是否按配置自动排队执行“启动游戏”和“进入千星”
-  enabled: false
-  # 找不到游戏窗口时是否启动游戏
-  launch_game: true
-  # 是否处理“点击进入”等开门按钮
-  enter_game: true
-  # 是否按 M 打开地图，进入千星奇域大厅后停止
-  enter_wonderland: true
-  # 启动 EXE 路径；可填完整 exe 文件路径，也可填 exe 所在目录；留空时自动从米哈游启动器注册表查找官服/国际服
-  exe_path: ""
-  # 启动游戏时附加的命令行参数
-  game_args: ""
-  # 启动游戏后每次等待窗口出现的时间，单位毫秒
-  launch_wait_ms: 5000
-  # 启动游戏后最多检查窗口次数
-  launch_retries: 12
-  # OCR 等待并点击“点击进入”的最长时间，单位毫秒
-  enter_game_timeout_ms: 60000
-  # 等待千星奇域界面/大厅确认的最长时间，单位毫秒
-  enter_wonderland_timeout_ms: 300000
-  # 地图星型入口阶段最多匹配次数
-  wonderland_map_star_retries: 120
-  # 地图星型入口匹配轮询间隔，单位毫秒
-  wonderland_map_star_retry_ms: 2500
-  # 千星大厅 OCR 阶段最多重试次数
-  wonderland_hall_retries: 90
-  # 千星大厅 OCR 轮询间隔，单位毫秒
-  wonderland_hall_retry_ms: 2000
-  # 千星入口和确认弹窗各阶段过渡等待的最长时间，单位毫秒
-  wonderland_transition_timeout_ms: 60000
-  # 确认按钮消失后等待该区域像素稳定的最长时间，单位毫秒
-  wonderland_confirm_stable_timeout_ms: 60000
-  # 启动游戏结束时等待派蒙菜单模板的最长时间，单位毫秒
-  final_primary_timeout_ms: 120000
-  # 启动流程 OCR/截图轮询间隔，单位毫秒
-  poll_ms: 1000
-  # 像素稳定平均差阈值
-  stable_mean_threshold: 2.0
-  # 像素稳定变化比例阈值
-  stable_changed_ratio_threshold: 0.01
-  # 启动界面模板匹配阈值（例如派蒙菜单）；越高越严格
-  template_threshold: 0.9
-  # 千星确认按钮模板匹配阈值；越高越严格
-  wonderland_confirm_threshold: 0.9
-  # 进入千星流程模板资源；启动游戏完成判断使用 paimon_menu
-  templates:
-    # 地图右下角星型入口模板
-    wonderland_map_star: assets/startup-wonderland-map-star.png
-    # 千星弹窗“确认”按钮模板
-    wonderland_confirm: assets/startup-wonderland-confirm.png
-    paimon_menu: assets/startup-paimon-menu.png
-  # “点击进入”按钮 OCR 区域
-  enter_game_text_region:
-    x: 900
-    y: 1000
-    width: 130
-    height: 40
-  # 右侧千星大厅选项 OCR 区域
-  wonderland_hall_ocr_region:
-    x: 1280
-    y: 0
-    width: 640
-    height: 1040
-  # 千星确认按钮模板区域
-  wonderland_confirm_region:
-    x: 900
-    y: 650
-    width: 500
-    height: 250
-  # 派蒙菜单/主界面模板区域
-  main_ui_region:
-    x: 0
-    y: 0
-    width: 480
-    height: 270
-  # 地图右下角星型入口模板区域
-  wonderland_map_star_region:
-    x: 1700
-    y: 850
-    width: 220
-    height: 230
-invite:
-  # 好友备注连续完整匹配次数；大于 1 时覆盖全局值，0 或 1 表示继承
-  friend_name_stable_count: 0
-  # 好友列表 OCR 区域，用于查找发起邀请的用户名
-  friend_list_region:
-    x: 80
-    y: 280
-    width: 170
-    height: 600
-  # 点击好友后用于确认备注的二级聊天内容区域，不使用顶部原昵称
-  friend_chat_region:
-    x: 260
-    y: 100
-    width: 920
-    height: 850
-  # “查看千星”模板搜索区域
-  view_star_region:
-    x: 400
-    y: 80
-    width: 440
-    height: 860
-  # “前往其大厅”模板搜索区域
-  goto_hall_region:
-    x: 700
-    y: 560
-    width: 500
-    height: 300
-  # “进入大厅”模板搜索区域
-  enter_hall_region:
-    x: 700
-    y: 700
-    width: 500
-    height: 100
-
-friend_delivery:
-  # 好友投递中确认尚未发送项的自动重试次数；0 表示禁用
-  auto_retry_count: 0
-
-custom_workflows:
-  # 是否启用配置驱动的自定义流程命令
-  enabled: true
-  # 模板默认匹配阈值
-  default_threshold: 0.9
-  wait_template_absent_stable_default: true
-  # hold_key 单次按住按键允许的最大秒数；时长从命令参数读取
-  max_hold_key_seconds: 10
-  # 自定义流程默认超时、轮询和步骤等待统一在 timing.workflow 中配置
-  # 自定义模板名到图片路径的映射，步骤里通过 template 引用这里的名字
-  templates: {}
-  # 支持的步骤：activate_game/focus_game/key/hold_key/click/mouse_button/click_template/wait_template/wait_template_absent/wait_stable/click_text/wait_text/paste/send_chat/send_current_chat/send_friend_message/invite_user/ensure_primary/ensure_current_hall/return_primary/sleep
-  # ensure_primary 固定返回一级；return_primary 按当前监听模式自动返回一级或二级当前大厅
-  # wait_template_absent 默认在模板消失后继续等待像素稳定；可在步骤上设置 stable_after_absent: false 关闭
-  # wait_stable 会等待 region 内像素变化稳定，适合点击后等待面板动画结束
-  # 支持变量：{{username}}、{{args}}、{{arg1}}、{{arg2}}、{{command}}、{{workflow}}、{{message_type}}
-  # send_friend_message 默认发送给触发命令的好友，也可以用 target 指定好友名
-  # confirm_message_types 控制确认命令来源：[blue] 为大厅，[pink] 为好友私聊，留空表示不限
-  # 默认自定义流程不接受参数；需要参数时设置 allow_args: true
-  # 示例：
-  # templates:
-  #   my_button: assets/my-button.png
-  # workflows:
-  #   - name: example
-  #     enabled: true
-  #     commands: [测试流程]
-  #     allow_args: true
-  #     message_types: [blue]
-  #     confirm_before_run: false
-  #     confirm_message: "{{username}} 请求执行测试流程 {{args}},@确认@跳过"
-  #     confirm_message_types: [blue]
-  #     confirm_timeout_ms: 20000
-  #     confirm_poll_ms: 2000
-  #     success_message: ""
-  #     steps:
-  #       - type: key
-  #         key: F2
-  #         wait_ms: 800
-  #       - type: click_template
-  #         template: my_button
-  #         region: { x: 700, y: 560, width: 500, height: 300 }
-  #       - type: send_chat
-  #         message: "{{username}} 触发了测试流程 {{args}}"
-  #       - type: return_primary
-  workflows:
-    # WSAD 前的独立按钮；只允许从 Web 工作流列表选择“鼠标中键”，不提供聊天命令
-    - name: 鼠标中键
-      enabled: true
-      commands: []
-      allow_args: false
-      message_types: [pink]
-      confirm_before_run: false
-      confirm_message: ""
-      confirm_message_types: []
-      success_message: ""
-      steps:
-        - type: ensure_primary
-        - type: mouse_button
-          button: middle
-    # 好友私聊 @W/@S/@A/@D [秒数]：先按一下中键，再按住方向键；例如 @W 默认按住 1 秒、@W 10 按住 10 秒
-    - name: hold-w
-      enabled: true
-      commands: [W]
-      allow_args: true
-      message_types: [pink]
-      confirm_before_run: false
-      confirm_message: ""
-      confirm_message_types: []
-      success_message: ""
-      steps:
-        - type: ensure_primary
-        - type: mouse_button
-          button: middle
-        - type: hold_key
-          key: W
-          hold_seconds_arg: 1
-    - name: hold-s
-      enabled: true
-      commands: [S]
-      allow_args: true
-      message_types: [pink]
-      confirm_before_run: false
-      confirm_message: ""
-      confirm_message_types: []
-      success_message: ""
-      steps:
-        - type: ensure_primary
-        - type: mouse_button
-          button: middle
-        - type: hold_key
-          key: S
-          hold_seconds_arg: 1
-    - name: hold-a
-      enabled: true
-      commands: [A]
-      allow_args: true
-      message_types: [pink]
-      confirm_before_run: false
-      confirm_message: ""
-      confirm_message_types: []
-      success_message: ""
-      steps:
-        - type: ensure_primary
-        - type: mouse_button
-          button: middle
-        - type: hold_key
-          key: A
-          hold_seconds_arg: 1
-    - name: hold-d
-      enabled: true
-      commands: [D]
-      allow_args: true
-      message_types: [pink]
-      confirm_before_run: false
-      confirm_message: ""
-      confirm_message_types: []
-      success_message: ""
-      steps:
-        - type: ensure_primary
-        - type: mouse_button
-          button: middle
-        - type: hold_key
-          key: D
-          hold_seconds_arg: 1
-    # 好友私聊 @C：先确保一级界面，再按一次 Ctrl
-    - name: press-control
-      enabled: true
-      commands: [C]
-      allow_args: false
-      message_types: [pink]
-      confirm_before_run: false
-      confirm_message: ""
-      confirm_message_types: []
-      success_message: ""
-      steps:
-        - type: ensure_primary
-        - type: key
-          key: Ctrl
-    # 好友私聊 @CW/@CS/@CA/@CD [秒数]：Ctrl、中键、按住方向键、Ctrl；时长规则与 @W/@S/@A/@D 相同
-    - name: control-hold-w
-      enabled: true
-      commands: [CW]
-      allow_args: true
-      message_types: [pink]
-      confirm_before_run: false
-      confirm_message: ""
-      confirm_message_types: []
-      success_message: ""
-      steps:
-        - type: ensure_primary
-        - type: key
-          key: Ctrl
-        - type: mouse_button
-          button: middle
-        - type: hold_key
-          key: W
-          hold_seconds_arg: 1
-        - type: key
-          key: Ctrl
-    - name: control-hold-s
-      enabled: true
-      commands: [CS]
-      allow_args: true
-      message_types: [pink]
-      confirm_before_run: false
-      confirm_message: ""
-      confirm_message_types: []
-      success_message: ""
-      steps:
-        - type: ensure_primary
-        - type: key
-          key: Ctrl
-        - type: mouse_button
-          button: middle
-        - type: hold_key
-          key: S
-          hold_seconds_arg: 1
-        - type: key
-          key: Ctrl
-    - name: control-hold-a
-      enabled: true
-      commands: [CA]
-      allow_args: true
-      message_types: [pink]
-      confirm_before_run: false
-      confirm_message: ""
-      confirm_message_types: []
-      success_message: ""
-      steps:
-        - type: ensure_primary
-        - type: key
-          key: Ctrl
-        - type: mouse_button
-          button: middle
-        - type: hold_key
-          key: A
-          hold_seconds_arg: 1
-        - type: key
-          key: Ctrl
-    - name: control-hold-d
-      enabled: true
-      commands: [CD]
-      allow_args: true
-      message_types: [pink]
-      confirm_before_run: false
-      confirm_message: ""
-      confirm_message_types: []
-      success_message: ""
-      steps:
-        - type: ensure_primary
-        - type: key
-          key: Ctrl
-        - type: mouse_button
-          button: middle
-        - type: hold_key
-          key: D
-          hold_seconds_arg: 1
-        - type: key
-          key: Ctrl
-    # 好友私聊 @F：先确保一级界面，再发送一次 F；任务结束后按监听模式恢复驻留界面
-    - name: press-f
-      enabled: true
-      commands: [F]
-      allow_args: false
-      message_types: [pink]
-      confirm_before_run: false
-      confirm_message: ""
-      confirm_message_types: []
-      success_message: ""
-      steps:
-        - type: ensure_primary
-        - type: key
-          key: F
-        - type: return_primary
-    # 好友私聊 @X：先确保一级界面，再发送一次 X；任务结束后按监听模式恢复驻留界面
-    - name: press-x
-      enabled: true
-      commands: [X]
-      allow_args: false
-      message_types: [pink]
-      confirm_before_run: false
-      confirm_message: ""
-      confirm_message_types: []
-      success_message: ""
-      steps:
-        - type: ensure_primary
-        - type: key
-          key: X
-    # 好友私聊 @通告 内容，向当前大厅发送“内容”
-    - name: notice
-      enabled: true
-      commands: [通告]
-      allow_args: true
-      message_types: [pink]
-      confirm_before_run: false
-      confirm_message: ""
-      confirm_message_types: []
-      success_message: ""
-      steps:
-        - type: send_chat
-          message: "{{args}}"

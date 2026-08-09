@@ -1452,7 +1452,7 @@ mod tests {
     #[test]
     #[cfg(feature = "ocr-mnn")]
     fn fixed_secondary_chat_fixture_proves_stable_friend_row_and_title_first_identity_fallback() {
-        let config = AppConfig::load(Path::new("config.yaml")).expect("load default config");
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).expect("load default config");
         let args = OcrArgs::default().resolve(&config.ocr);
         let runtime = OcrRuntime::start(
             ProductionOcrDevice::new(args).expect("initialize OCR device"),
@@ -1720,7 +1720,7 @@ mod tests {
 
     #[test]
     fn ordered_batch_sends_every_message_before_restoring_secondary_hall_once() {
-        let mut config = AppConfig::load(Path::new("config.yaml")).unwrap();
+        let mut config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
         config.timing.input.after_activate_ms = 0;
         config.timing.input.open_chat_ms = 0;
         config.timing.input.click_ms = 0;
@@ -1805,7 +1805,7 @@ mod tests {
 
     #[test]
     fn friend_conversation_falls_back_to_the_chat_region_when_title_has_no_name() {
-        let mut config = AppConfig::load(Path::new("config.yaml")).unwrap();
+        let mut config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
         config.timing.input.after_activate_ms = 0;
         config.timing.input.open_chat_ms = 0;
         config.timing.input.click_ms = 0;
@@ -1878,7 +1878,7 @@ mod tests {
 
     #[test]
     fn hall_batch_sends_all_messages_and_confirms_secondary_residency() {
-        let mut config = AppConfig::load(Path::new("config.yaml")).unwrap();
+        let mut config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
         config.timing.input.after_activate_ms = 0;
         config.timing.input.open_chat_ms = 0;
         config.timing.input.click_ms = 0;
@@ -1982,7 +1982,7 @@ mod tests {
 
     #[test]
     fn friend_list_does_not_treat_a_longer_name_as_the_requested_friend() {
-        let mut config = AppConfig::load(Path::new("config.yaml")).unwrap();
+        let mut config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
         config.timing.input.after_activate_ms = 0;
         config.timing.input.open_chat_ms = 0;
         config.timing.input.click_ms = 0;
@@ -2057,7 +2057,7 @@ mod tests {
 
     #[test]
     fn unknown_message_is_never_retried_and_only_unattempted_messages_remain_safe() {
-        let mut config = AppConfig::load(Path::new("config.yaml")).unwrap();
+        let mut config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
         config.friend_delivery.auto_retry_count = 3;
         config.timing.input.after_activate_ms = 0;
         config.timing.input.open_chat_ms = 0;
@@ -2193,7 +2193,7 @@ mod tests {
 
     #[test]
     fn persistent_unknown_residency_escapes_once_then_reports_primary_failure() {
-        let config = AppConfig::load(Path::new("config.yaml")).unwrap();
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
         let keys = Arc::new(Mutex::new(Vec::new()));
         let ui_runtime = start_test_ui_runtime(
             UnknownResidencyDevice {
@@ -2257,7 +2257,7 @@ mod tests {
 
     #[test]
     fn stable_unknown_residency_escapes_then_confirms_primary() {
-        let config = AppConfig::load(Path::new("config.yaml")).unwrap();
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
         let keys = Arc::new(Mutex::new(Vec::new()));
         let ui_runtime = start_test_ui_runtime(
             StableUnknownThenPrimaryDevice {
@@ -2325,7 +2325,7 @@ mod tests {
 
     #[test]
     fn secondary_residency_escapes_once_then_waits_through_unknown_transition() {
-        let config = AppConfig::load(Path::new("config.yaml")).unwrap();
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
         let keys = Arc::new(Mutex::new(Vec::new()));
         let ui_runtime = start_test_ui_runtime(
             TransitionResidencyDevice {
@@ -2407,7 +2407,7 @@ mod tests {
 
     #[test]
     fn recovery_requires_fresh_stability_after_a_pre_stabilized_secondary_state() {
-        let config = AppConfig::load(Path::new("config.yaml")).unwrap();
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
         let state = Arc::new(Mutex::new(PreStabilizedRecoveryState::default()));
         let ui_runtime = start_test_ui_runtime(
             PreStabilizedRecoveryDevice {
@@ -2486,7 +2486,7 @@ mod tests {
 
     #[test]
     fn capture_failure_after_escape_is_reported_as_input_result_unknown() {
-        let config = AppConfig::load(Path::new("config.yaml")).unwrap();
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
         let ui_runtime = start_test_ui_runtime(
             CaptureFailsAfterEscapeDevice {
                 secondary: secondary_frame(&config),
@@ -2550,3 +2550,4 @@ mod tests {
         frame
     }
 }
+

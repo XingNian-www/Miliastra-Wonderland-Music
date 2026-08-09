@@ -19,7 +19,10 @@ use sha2::Sha256;
 use tracing::{info, warn};
 use url::Url;
 
-use crate::catalog::{CatalogError, PlaybackEligibility, ProviderSearchCandidate, SourceAdapter};
+use crate::catalog::{
+    CatalogError, CredentialRefreshAdapter, PlaybackEligibility, ProviderSearchCandidate,
+    SourceAdapter,
+};
 use crate::credentials::{CredentialStore, ProviderCredential};
 use crate::domain::{ResolverLocator, SearchSpec, Song, SongKey, StreamSource};
 use crate::lyrics::TimedLyrics;
@@ -423,6 +426,19 @@ impl BilibiliAdapter {
 }
 
 #[async_trait]
+impl CredentialRefreshAdapter for BilibiliAdapter {
+    async fn refresh_credential(
+        &self,
+        _credential: &ProviderCredential,
+    ) -> Result<Option<ProviderCredential>, CatalogError> {
+        if !self.refresh_cookie().await? {
+            return Ok(None);
+        }
+        self.credential().map(Some)
+    }
+}
+
+#[async_trait]
 impl SourceAdapter for BilibiliAdapter {
     async fn validate_credential(
         &self,
@@ -550,11 +566,10 @@ pub(crate) fn parse_search_candidates(
             album: None,
             duration_ms: raw.get("duration").and_then(parse_duration_ms),
         };
-        // Video search results do not carry source playback-rights evidence.
-        // Keep them unknown; resolution will determine concrete availability.
+        // B站搜索无需验证可用性：视频流默认可播，直接标 Eligible。
         candidates.push(ProviderSearchCandidate {
             song,
-            eligibility: PlaybackEligibility::Unknown,
+            eligibility: PlaybackEligibility::Eligible,
         });
         if candidates.len() == 5 {
             break;
@@ -897,7 +912,7 @@ mod tests {
         assert_eq!(parsed[0].song.title, "A song & more");
         assert_eq!(parsed[0].song.artists, ["Uploader"]);
         assert_eq!(parsed[0].song.duration_ms, Some(201_000));
-        assert_eq!(parsed[0].eligibility, PlaybackEligibility::Unknown);
+        assert_eq!(parsed[0].eligibility, PlaybackEligibility::Eligible);
         assert_eq!(
             parsed[0].song.resolver_locator.as_ref().unwrap().as_str(),
             "bilibili:v1:BV1xx411c7mD"

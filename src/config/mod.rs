@@ -23,31 +23,112 @@ use crate::runtime::player_io::{PlayerRuntimeConfig, PlayerRuntimeConfigError};
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
     pub window: WindowConfig,
+    /// 游戏区域坐标可拆到独立文件（`screen_config_path`）；内嵌段可省略。
+    #[serde(default)]
     pub screen: ScreenConfig,
     pub stability: StabilityConfig,
     pub timing: TimingConfig,
+    /// OCR 配置可从主配置拆出到独立文件（`ocr_config_path`）；内嵌段可省略。
+    #[serde(default)]
     pub ocr: OcrConfig,
+    /// 独立 OCR 配置文件（相对 EXE 根目录）。一般不改动的 OCR 参数可单独放
+    /// 一个文件；存在时覆盖内嵌 `ocr` 段，缺失时回退内嵌段。
+    #[serde(default)]
+    pub ocr_config_path: Option<PathBuf>,
+    /// 独立游戏区域坐标文件（相对 EXE 根目录）。用法同 `ocr_config_path`。
+    #[serde(default)]
+    pub screen_config_path: Option<PathBuf>,
+    /// 独立模板图片路径文件（相对 EXE 根目录）。用法同 `ocr_config_path`。
+    #[serde(default)]
+    pub templates_config_path: Option<PathBuf>,
+    /// 独立管理（拉黑/屏蔽）区域文件（相对 EXE 根目录）。用法同 `ocr_config_path`。
+    #[serde(default)]
+    pub moderation_config_path: Option<PathBuf>,
+    /// 独立启动流程文件（相对 EXE 根目录）。用法同 `ocr_config_path`。
+    #[serde(default)]
+    pub startup_config_path: Option<PathBuf>,
+    /// 独立邀请流程区域文件（相对 EXE 根目录）。用法同 `ocr_config_path`。
+    #[serde(default)]
+    pub invite_config_path: Option<PathBuf>,
+    /// 独立播放器配置（凭据/登录助手/酷狗 API/音频缓存）文件（相对 EXE 根目录）。
+    /// 用法同 `ocr_config_path`。
+    #[serde(default)]
+    pub playback_config_path: Option<PathBuf>,
+    /// 独立点歌链路配置（队列/同歌去重/审核/匹配）文件（相对 EXE 根目录）。
+    /// 一个文件可含 queue、song_dedup、song_review、matching 多个顶层段。
+    #[serde(default)]
+    pub song_config_path: Option<PathBuf>,
+    /// 独立点歌 AI 配置文件（相对 EXE 根目录）。用法同 `ocr_config_path`。
+    #[serde(default)]
+    pub ai_config_path: Option<PathBuf>,
+    /// 独立娱乐配置（成语接龙/斗地主/谁是卧底/海龟汤）文件（相对 EXE 根目录）。
+    /// 一个文件可含 idiom_chain、landlord、undercover、turtle_soup 多个顶层段。
+    #[serde(default)]
+    pub entertainment_config_path: Option<PathBuf>,
+    /// 独立全局热键配置文件（相对 EXE 根目录）。用法同 `ocr_config_path`。
+    #[serde(default)]
+    pub hotkeys_config_path: Option<PathBuf>,
+    /// 独立好友投递配置文件（相对 EXE 根目录）。用法同 `ocr_config_path`。
+    #[serde(default)]
+    pub friend_delivery_config_path: Option<PathBuf>,
+    /// 独立自定义流程配置文件（相对 EXE 根目录）。用法同 `ocr_config_path`。
+    #[serde(default)]
+    pub custom_workflows_config_path: Option<PathBuf>,
+    /// 模板图片路径可拆到独立文件（`templates_config_path`）；内嵌段可省略。
+    #[serde(default)]
     pub templates: TemplateConfig,
     pub output: OutputConfig,
+    /// 管理（拉黑/屏蔽）区域可拆到独立文件（`moderation_config_path`）；内嵌段可省略。
+    #[serde(default)]
     pub moderation: ModerationConfig,
+    /// 播放器配置可拆到独立文件（`playback_config_path`）；内嵌段可省略。
+    #[serde(default)]
     pub playback: PlaybackConfig,
     pub http: HttpConfig,
     pub logging: LoggingConfig,
     pub tui: TuiConfig,
     pub state: StateConfig,
+    /// 点歌队列可拆到独立文件（`song_config_path`）；内嵌段可省略。
+    #[serde(default)]
     pub queue: QueueConfig,
+    /// 同歌去重可拆到独立文件（`song_config_path`）；内嵌段可省略。
+    #[serde(default)]
     pub song_dedup: SongDedupConfig,
+    /// 成语接龙可拆到独立文件（`entertainment_config_path`）；内嵌段可省略。
+    #[serde(default)]
     pub idiom_chain: IdiomChainConfig,
+    /// 斗地主可拆到独立文件（`entertainment_config_path`）；内嵌段可省略。
+    #[serde(default)]
     pub landlord: LandlordConfig,
+    /// 谁是卧底可拆到独立文件（`entertainment_config_path`）；内嵌段可省略。
+    #[serde(default)]
     pub undercover: UndercoverConfig,
+    /// 海龟汤可拆到独立文件（`entertainment_config_path`）；内嵌段可省略。
+    #[serde(default)]
     pub turtle_soup: TurtleSoupConfig,
+    /// 点歌 AI 可拆到独立文件（`ai_config_path`）；内嵌段可省略。
+    #[serde(default)]
     pub ai: AiConfig,
+    /// 歌曲审核可拆到独立文件（`song_config_path`）；内嵌段可省略。
+    #[serde(default)]
     pub song_review: SongReviewConfig,
+    /// 歌名/歌手匹配可拆到独立文件（`song_config_path`）；内嵌段可省略。
+    #[serde(default)]
     pub matching: MatchConfig,
+    /// 全局热键可拆到独立文件（`hotkeys_config_path`）；内嵌段可省略。
+    #[serde(default)]
     pub hotkeys: HotkeyConfig,
+    /// 启动流程可拆到独立文件（`startup_config_path`）；内嵌段可省略。
+    #[serde(default)]
     pub startup: StartupConfig,
+    /// 邀请流程区域可拆到独立文件（`invite_config_path`）；内嵌段可省略。
+    #[serde(default)]
     pub invite: InviteConfig,
+    /// 好友投递可拆到独立文件（`friend_delivery_config_path`）；内嵌段可省略。
+    #[serde(default)]
     pub friend_delivery: FriendDeliveryConfig,
+    /// 自定义流程可拆到独立文件（`custom_workflows_config_path`）；内嵌段可省略。
+    #[serde(default)]
     pub custom_workflows: CustomWorkflowConfig,
 }
 
@@ -283,10 +364,36 @@ impl AppConfig {
     pub(crate) fn load_from_root(path: &Path, executable_root: &Path) -> Result<Self> {
         let mut config = Self::load(path)?;
         config.resolve_runtime_paths(executable_root);
+        config.load_external_ocr(executable_root)?;
+        config.load_external_screen(executable_root)?;
+        config.load_external_templates(executable_root)?;
+        config.load_external_moderation(executable_root)?;
+        config.load_external_startup(executable_root)?;
+        config.load_external_invite(executable_root)?;
+        config.load_external_playback(executable_root)?;
+        config.load_external_song(executable_root)?;
+        config.load_external_ai(executable_root)?;
+        config.load_external_entertainment(executable_root)?;
+        config.load_external_hotkeys(executable_root)?;
+        config.load_external_friend_delivery(executable_root)?;
+        config.load_external_custom_workflows(executable_root)?;
         Ok(config)
     }
 
     fn resolve_runtime_paths(&mut self, executable_root: &Path) {
+        resolve_optional_path(executable_root, &mut self.ocr_config_path);
+        resolve_optional_path(executable_root, &mut self.screen_config_path);
+        resolve_optional_path(executable_root, &mut self.templates_config_path);
+        resolve_optional_path(executable_root, &mut self.moderation_config_path);
+        resolve_optional_path(executable_root, &mut self.startup_config_path);
+        resolve_optional_path(executable_root, &mut self.invite_config_path);
+        resolve_optional_path(executable_root, &mut self.playback_config_path);
+        resolve_optional_path(executable_root, &mut self.song_config_path);
+        resolve_optional_path(executable_root, &mut self.ai_config_path);
+        resolve_optional_path(executable_root, &mut self.entertainment_config_path);
+        resolve_optional_path(executable_root, &mut self.hotkeys_config_path);
+        resolve_optional_path(executable_root, &mut self.friend_delivery_config_path);
+        resolve_optional_path(executable_root, &mut self.custom_workflows_config_path);
         resolve_optional_path(executable_root, &mut self.ocr.det_model);
         resolve_optional_path(executable_root, &mut self.ocr.rec_model);
         resolve_path(executable_root, &mut self.ocr.charset);
@@ -353,6 +460,400 @@ impl AppConfig {
             }
         }
     }
+
+    /// 加载独立 OCR 配置文件（`ocr_config_path` 指向的外部文件）。
+    /// 以当前（内嵌）OCR 配置为基础，外部文件只写需要覆盖的字段；
+    /// 文件不存在时静默回退内嵌配置。
+    fn load_external_ocr(&mut self, executable_root: &Path) -> Result<()> {
+        let Some(path) = self.ocr_config_path.clone() else {
+            return Ok(());
+        };
+        if !path.is_file() {
+            return Ok(());
+        }
+        let text = fs::read_to_string(&path).with_context(|| {
+            format!("读取 OCR 配置文件失败: {}", path.display())
+        })?;
+        let overlay: serde_yaml::Value = serde_yaml::from_str(&text).with_context(|| {
+            format!("解析 OCR 配置文件失败: {}", path.display())
+        })?;
+        let mut merged = serde_yaml::to_value(&self.ocr)
+            .map_err(|error| anyhow::anyhow!("序列化内嵌 OCR 配置失败: {error}"))?;
+        merge_yaml_mapping(&mut merged, overlay)?;
+        let mut external: OcrConfig = serde_yaml::from_value(merged)
+            .map_err(|error| anyhow::anyhow!("合并 OCR 配置无效: {error}"))?;
+        // 外部文件里的路径同样相对 EXE 根目录解析。
+        resolve_optional_path(executable_root, &mut external.det_model);
+        resolve_optional_path(executable_root, &mut external.rec_model);
+        resolve_path(executable_root, &mut external.charset);
+        resolve_optional_path(executable_root, &mut external.openvino.det_model);
+        resolve_optional_path(executable_root, &mut external.openvino.det_weights);
+        resolve_optional_path(executable_root, &mut external.openvino.rec_model);
+        resolve_optional_path(executable_root, &mut external.openvino.rec_weights);
+        resolve_optional_path(executable_root, &mut external.openvino.cache_dir);
+        self.ocr = external;
+        Ok(())
+    }
+
+    /// 加载独立游戏区域坐标文件（`screen_config_path` 指向的外部文件）。
+    /// 以当前（内嵌）配置为基础，外部文件只写需要覆盖的字段；
+    /// 文件不存在时静默回退内嵌配置。
+    fn load_external_screen(&mut self, _executable_root: &Path) -> Result<()> {
+        let Some(path) = self.screen_config_path.clone() else {
+            return Ok(());
+        };
+        if !path.is_file() {
+            return Ok(());
+        }
+        let text = fs::read_to_string(&path).with_context(|| {
+            format!("读取区域坐标配置文件失败: {}", path.display())
+        })?;
+        let overlay: serde_yaml::Value = serde_yaml::from_str(&text).with_context(|| {
+            format!("解析区域坐标配置文件失败: {}", path.display())
+        })?;
+        let mut merged = serde_yaml::to_value(&self.screen)
+            .map_err(|error| anyhow::anyhow!("序列化内嵌区域坐标配置失败: {error}"))?;
+        merge_yaml_mapping(&mut merged, overlay)?;
+        self.screen = serde_yaml::from_value(merged)
+            .map_err(|error| anyhow::anyhow!("合并区域坐标配置无效: {error}"))?;
+        Ok(())
+    }
+
+    /// 加载独立模板图片路径文件（`templates_config_path`）。
+    fn load_external_templates(&mut self, executable_root: &Path) -> Result<()> {
+        let Some(path) = self.templates_config_path.clone() else {
+            return Ok(());
+        };
+        if !path.is_file() {
+            return Ok(());
+        }
+        let merged = read_external_overlay(&path, &self.templates, "模板")?;
+        let mut external: TemplateConfig = serde_yaml::from_value(merged)
+            .map_err(|error| anyhow::anyhow!("合并模板配置无效: {error}"))?;
+        for path in [
+            &mut external.blue_marker,
+            &mut external.yellow_marker,
+            &mut external.pink_marker,
+            &mut external.friend,
+            &mut external.secondary_back,
+            &mut external.secondary_hall,
+            &mut external.invite_view_star,
+            &mut external.invite_goto_hall,
+            &mut external.invite_enter_hall,
+            &mut external.friend_panel,
+            &mut external.friend_search_panel,
+            &mut external.friend_more_settings,
+            &mut external.friend_block_chat,
+            &mut external.friend_blacklist,
+            &mut external.friend_confirm,
+        ] {
+            resolve_path(executable_root, path);
+        }
+        self.templates = external;
+        Ok(())
+    }
+
+    /// 加载独立管理（拉黑/屏蔽）区域文件（`moderation_config_path`）。
+    fn load_external_moderation(&mut self, _executable_root: &Path) -> Result<()> {
+        let Some(path) = self.moderation_config_path.clone() else {
+            return Ok(());
+        };
+        if !path.is_file() {
+            return Ok(());
+        }
+        let merged = read_external_overlay(&path, &self.moderation, "管理区域")?;
+        self.moderation = serde_yaml::from_value(merged)
+            .map_err(|error| anyhow::anyhow!("合并管理区域配置无效: {error}"))?;
+        Ok(())
+    }
+
+    /// 加载独立启动流程文件（`startup_config_path`）。
+    fn load_external_startup(&mut self, executable_root: &Path) -> Result<()> {
+        let Some(path) = self.startup_config_path.clone() else {
+            return Ok(());
+        };
+        if !path.is_file() {
+            return Ok(());
+        }
+        let merged = read_external_overlay(&path, &self.startup, "启动流程")?;
+        let mut external: StartupConfig = serde_yaml::from_value(merged)
+            .map_err(|error| anyhow::anyhow!("合并启动流程配置无效: {error}"))?;
+        resolve_path(executable_root, &mut external.exe_path);
+        resolve_path(executable_root, &mut external.templates.wonderland_map_star);
+        resolve_path(executable_root, &mut external.templates.wonderland_confirm);
+        resolve_path(executable_root, &mut external.templates.paimon_menu);
+        self.startup = external;
+        Ok(())
+    }
+
+    /// 加载独立邀请流程区域文件（`invite_config_path`）。
+    fn load_external_invite(&mut self, _executable_root: &Path) -> Result<()> {
+        let Some(path) = self.invite_config_path.clone() else {
+            return Ok(());
+        };
+        if !path.is_file() {
+            return Ok(());
+        }
+        let merged = read_external_overlay(&path, &self.invite, "邀请区域")?;
+        self.invite = serde_yaml::from_value(merged)
+            .map_err(|error| anyhow::anyhow!("合并邀请区域配置无效: {error}"))?;
+        Ok(())
+    }
+
+    /// 加载独立播放器配置文件（`playback_config_path`）。
+    fn load_external_playback(&mut self, executable_root: &Path) -> Result<()> {
+        let Some(path) = self.playback_config_path.clone() else {
+            return Ok(());
+        };
+        if !path.is_file() {
+            return Ok(());
+        }
+        let merged = read_external_overlay(&path, &self.playback, "播放器")?;
+        let mut external: PlaybackConfig = serde_yaml::from_value(merged)
+            .map_err(|error| anyhow::anyhow!("合并播放器配置无效: {error}"))?;
+        resolve_path(executable_root, &mut external.credential_directory);
+        resolve_path(executable_root, &mut external.login_helper_executable);
+        resolve_path(executable_root, &mut external.kugou_api_executable);
+        if let Some(audio_cache) = &mut external.audio_cache {
+            resolve_path(executable_root, &mut audio_cache.directory);
+        }
+        self.playback = external;
+        Ok(())
+    }
+
+    /// 加载独立点歌链路配置文件（`song_config_path`）；文件可含
+    /// queue、song_dedup、song_review、matching 多个顶层段，缺失的段保持内嵌。
+    fn load_external_song(&mut self, executable_root: &Path) -> Result<()> {
+        let Some(path) = self.song_config_path.clone() else {
+            return Ok(());
+        };
+        if !path.is_file() {
+            return Ok(());
+        }
+        let sections = read_external_overlay_sections(
+            &path,
+            &[
+                ("queue", serde_yaml::to_value(&self.queue)?),
+                ("song_dedup", serde_yaml::to_value(&self.song_dedup)?),
+                ("song_review", serde_yaml::to_value(&self.song_review)?),
+                ("matching", serde_yaml::to_value(&self.matching)?),
+            ],
+            "点歌",
+        )?;
+        for (name, merged) in sections {
+            match name.as_str() {
+                "queue" => {
+                    self.queue = serde_yaml::from_value(merged)
+                        .map_err(|error| anyhow::anyhow!("合并点歌队列配置无效: {error}"))?;
+                }
+                "song_dedup" => {
+                    let mut external: SongDedupConfig = serde_yaml::from_value(merged)
+                        .map_err(|error| anyhow::anyhow!("合并同歌去重配置无效: {error}"))?;
+                    resolve_path(executable_root, &mut external.history_path);
+                    self.song_dedup = external;
+                }
+                "song_review" => {
+                    self.song_review = serde_yaml::from_value(merged)
+                        .map_err(|error| anyhow::anyhow!("合并歌曲审核配置无效: {error}"))?;
+                }
+                "matching" => {
+                    self.matching = serde_yaml::from_value(merged)
+                        .map_err(|error| anyhow::anyhow!("合并歌曲匹配配置无效: {error}"))?;
+                }
+                _ => unreachable!("read_external_overlay_sections 只返回请求的段"),
+            }
+        }
+        Ok(())
+    }
+
+    /// 加载独立点歌 AI 配置文件（`ai_config_path`）。
+    fn load_external_ai(&mut self, _executable_root: &Path) -> Result<()> {
+        let Some(path) = self.ai_config_path.clone() else {
+            return Ok(());
+        };
+        if !path.is_file() {
+            return Ok(());
+        }
+        let merged = read_external_overlay(&path, &self.ai, "点歌 AI")?;
+        self.ai = serde_yaml::from_value(merged)
+            .map_err(|error| anyhow::anyhow!("合并点歌 AI 配置无效: {error}"))?;
+        Ok(())
+    }
+
+    /// 加载独立娱乐配置文件（`entertainment_config_path`）；文件可含
+    /// idiom_chain、landlord、undercover、turtle_soup 多个顶层段，缺失的段保持内嵌。
+    fn load_external_entertainment(&mut self, executable_root: &Path) -> Result<()> {
+        let Some(path) = self.entertainment_config_path.clone() else {
+            return Ok(());
+        };
+        if !path.is_file() {
+            return Ok(());
+        }
+        let sections = read_external_overlay_sections(
+            &path,
+            &[
+                ("idiom_chain", serde_yaml::to_value(&self.idiom_chain)?),
+                ("landlord", serde_yaml::to_value(&self.landlord)?),
+                ("undercover", serde_yaml::to_value(&self.undercover)?),
+                ("turtle_soup", serde_yaml::to_value(&self.turtle_soup)?),
+            ],
+            "娱乐",
+        )?;
+        for (name, merged) in sections {
+            match name.as_str() {
+                "idiom_chain" => {
+                    let mut external: IdiomChainConfig = serde_yaml::from_value(merged)
+                        .map_err(|error| anyhow::anyhow!("合并成语接龙配置无效: {error}"))?;
+                    resolve_path(executable_root, &mut external.lexicon_path);
+                    self.idiom_chain = external;
+                }
+                "landlord" => {
+                    self.landlord = serde_yaml::from_value(merged)
+                        .map_err(|error| anyhow::anyhow!("合并斗地主配置无效: {error}"))?;
+                }
+                "undercover" => {
+                    let mut external: UndercoverConfig = serde_yaml::from_value(merged)
+                        .map_err(|error| anyhow::anyhow!("合并谁是卧底配置无效: {error}"))?;
+                    resolve_path(executable_root, &mut external.word_bank_path);
+                    resolve_path(executable_root, &mut external.used_state_path);
+                    self.undercover = external;
+                }
+                "turtle_soup" => {
+                    let mut external: TurtleSoupConfig = serde_yaml::from_value(merged)
+                        .map_err(|error| anyhow::anyhow!("合并海龟汤配置无效: {error}"))?;
+                    resolve_path(executable_root, &mut external.question_bank_path);
+                    resolve_path(executable_root, &mut external.used_state_path);
+                    self.turtle_soup = external;
+                }
+                _ => unreachable!("read_external_overlay_sections 只返回请求的段"),
+            }
+        }
+        Ok(())
+    }
+
+    /// 加载独立全局热键配置文件（`hotkeys_config_path`）。
+    fn load_external_hotkeys(&mut self, _executable_root: &Path) -> Result<()> {
+        let Some(path) = self.hotkeys_config_path.clone() else {
+            return Ok(());
+        };
+        if !path.is_file() {
+            return Ok(());
+        }
+        let merged = read_external_overlay(&path, &self.hotkeys, "全局热键")?;
+        self.hotkeys = serde_yaml::from_value(merged)
+            .map_err(|error| anyhow::anyhow!("合并全局热键配置无效: {error}"))?;
+        Ok(())
+    }
+
+    /// 加载独立好友投递配置文件（`friend_delivery_config_path`）。
+    fn load_external_friend_delivery(&mut self, _executable_root: &Path) -> Result<()> {
+        let Some(path) = self.friend_delivery_config_path.clone() else {
+            return Ok(());
+        };
+        if !path.is_file() {
+            return Ok(());
+        }
+        let merged = read_external_overlay(&path, &self.friend_delivery, "好友投递")?;
+        self.friend_delivery = serde_yaml::from_value(merged)
+            .map_err(|error| anyhow::anyhow!("合并好友投递配置无效: {error}"))?;
+        Ok(())
+    }
+
+    /// 加载独立自定义流程配置文件（`custom_workflows_config_path`）。
+    fn load_external_custom_workflows(&mut self, executable_root: &Path) -> Result<()> {
+        let Some(path) = self.custom_workflows_config_path.clone() else {
+            return Ok(());
+        };
+        if !path.is_file() {
+            return Ok(());
+        }
+        let merged = read_external_overlay(&path, &self.custom_workflows, "自定义流程")?;
+        let mut external: CustomWorkflowConfig = serde_yaml::from_value(merged)
+            .map_err(|error| anyhow::anyhow!("合并自定义流程配置无效: {error}"))?;
+        for path in external.templates.values_mut() {
+            resolve_path(executable_root, path);
+        }
+        for workflow in &mut external.workflows {
+            for step in &mut workflow.steps {
+                let Some(template) = &mut step.template else {
+                    continue;
+                };
+                if external.templates.contains_key(template.as_str()) {
+                    continue;
+                }
+                let mut path = PathBuf::from(&*template);
+                resolve_path(executable_root, &mut path);
+                *template = path.to_string_lossy().into_owned();
+            }
+        }
+        self.custom_workflows = external;
+        Ok(())
+    }
+}
+
+/// 读取外部配置文件，与内嵌配置合并（外部字段覆盖，同名嵌套映射递归合并）。
+fn read_external_overlay(
+    path: &std::path::Path,
+    inline: &impl serde::Serialize,
+    context: &str,
+) -> Result<serde_yaml::Value> {
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("读取{context}配置文件失败: {}", path.display()))?;
+    let overlay: serde_yaml::Value = serde_yaml::from_str(&text)
+        .with_context(|| format!("解析{context}配置文件失败: {}", path.display()))?;
+    let mut merged = serde_yaml::to_value(inline)
+        .map_err(|error| anyhow::anyhow!("序列化内嵌{context}配置失败: {error}"))?;
+    merge_yaml_mapping(&mut merged, overlay)?;
+    Ok(merged)
+}
+
+/// 读取外部配置文件中的若干顶层段，逐段与内嵌配置合并（外部字段覆盖）。
+/// 文件中缺失的段保持内嵌；文件顶层必须是映射。
+fn read_external_overlay_sections(
+    path: &std::path::Path,
+    inline: &[(&str, serde_yaml::Value)],
+    context: &str,
+) -> Result<Vec<(String, serde_yaml::Value)>> {
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("读取{context}配置文件失败: {}", path.display()))?;
+    let doc: serde_yaml::Value = serde_yaml::from_str(&text)
+        .with_context(|| format!("解析{context}配置文件失败: {}", path.display()))?;
+    let Some(mapping) = doc.as_mapping() else {
+        bail!("{context}配置文件顶层必须是映射");
+    };
+    let mut merged_sections = Vec::new();
+    for (name, value) in inline {
+        let Some(overlay) = mapping.get(serde_yaml::Value::String(name.to_string())) else {
+            continue;
+        };
+        let mut merged = value.clone();
+        merge_yaml_mapping(&mut merged, overlay.clone())?;
+        merged_sections.push((name.to_string(), merged));
+    }
+    Ok(merged_sections)
+}
+
+/// 将 `overlay` 映射合并进 `base` 映射；同名嵌套映射递归合并，其余字段覆盖。
+fn merge_yaml_mapping(base: &mut serde_yaml::Value, overlay: serde_yaml::Value) -> Result<()> {
+    let Some(base_map) = base.as_mapping_mut() else {
+        bail!("内嵌 OCR 配置结构异常");
+    };
+    let Some(overlay_map) = overlay.as_mapping() else {
+        bail!("OCR 配置文件必须是键值映射");
+    };
+    for (key, value) in overlay_map {
+        if value.is_mapping()
+            && base_map
+                .get(key)
+                .is_some_and(serde_yaml::Value::is_mapping)
+        {
+            let nested = base_map.get_mut(key).expect("checked mapping key");
+            merge_yaml_mapping(nested, value.clone())?;
+        } else {
+            base_map.insert(key.clone(), value.clone());
+        }
+    }
+    Ok(())
 }
 
 fn resolve_path(root: &Path, path: &mut PathBuf) {
@@ -433,7 +934,9 @@ fn validate_nonempty_path(path: &Path, field: &str) -> Result<()> {
 
 #[cfg(test)]
 fn bundled_config_yaml() -> &'static str {
-    include_str!("../../config.yaml")
+    // 完整配置模板（含全部功能段）固定在测试夹具中；
+    // 仓库与发布包的 config.yaml 是精简版（核心段 + 外部文件引用）。
+    include_str!("../../tests/fixtures/config.full.yaml")
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -445,11 +948,28 @@ pub struct RectConfig {
     pub height: u32,
 }
 
+impl Default for RectConfig {
+    fn default() -> Self {
+        Self {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PointConfig {
     pub x: i32,
     pub y: i32,
+}
+
+impl Default for PointConfig {
+    fn default() -> Self {
+        Self { x: 0, y: 0 }
+    }
 }
 
 impl PointConfig {
@@ -472,6 +992,30 @@ pub struct ScreenConfig {
     pub hall_member_count_rect: RectConfig,
     pub hall_time_rect: RectConfig,
     pub hall_member_list_rect: RectConfig,
+}
+
+impl Default for ScreenConfig {
+    fn default() -> Self {
+        let rect = RectConfig {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+        };
+        Self {
+            expected_width: 0,
+            expected_height: 0,
+            warn_on_size_mismatch: true,
+            chat_rect: rect,
+            friend_rect: rect,
+            secondary_back_rect: rect,
+            secondary_hall_rect: rect,
+            hall_name_rect: rect,
+            hall_member_count_rect: rect,
+            hall_time_rect: rect,
+            hall_member_list_rect: rect,
+        }
+    }
 }
 
 impl ScreenConfig {
@@ -690,6 +1234,39 @@ impl Default for OpenVinoConfig {
     }
 }
 
+impl Default for OcrConfig {
+    fn default() -> Self {
+        Self {
+            det_model: None,
+            rec_model: None,
+            charset: PathBuf::new(),
+            min_confidence: 0.9,
+            threads: 4,
+            request_timeout_ms: 10_000,
+            shutdown_timeout_ms: 5_000,
+            backend_priority: vec!["cpu".to_string()],
+            openvino: OpenVinoConfig::default(),
+            det_max_side_len: 960,
+            det_score_threshold: 0.3,
+            det_unclip_ratio: 2.0,
+            det_min_area: 9,
+            det_box_border: 0,
+            change_mean_threshold: 6.0,
+            change_pixel_threshold: 0.03,
+            text_left_gap: 8,
+            block_top_padding: 2,
+            block_bottom_padding: 2,
+            max_block_height: 120,
+            same_line_y_tolerance: 10,
+            marker_dedupe_x: 8,
+            marker_dedupe_y: 8,
+            next_marker_min_gap: 12,
+            right_padding: 4,
+            batch_recognize: false,
+        }
+    }
+}
+
 fn default_openvino_device() -> String {
     "CPU".to_string()
 }
@@ -805,9 +1382,31 @@ pub struct TemplateConfig {
     pub marker_threshold: f32,
 }
 
+impl Default for TemplateConfig {
+    fn default() -> Self {
+        Self {
+            blue_marker: PathBuf::new(),
+            yellow_marker: PathBuf::new(),
+            pink_marker: PathBuf::new(),
+            friend: PathBuf::new(),
+            secondary_back: PathBuf::new(),
+            secondary_hall: PathBuf::new(),
+            invite_view_star: PathBuf::new(),
+            invite_goto_hall: PathBuf::new(),
+            invite_enter_hall: PathBuf::new(),
+            friend_panel: PathBuf::new(),
+            friend_search_panel: PathBuf::new(),
+            friend_more_settings: PathBuf::new(),
+            friend_block_chat: PathBuf::new(),
+            friend_blacklist: PathBuf::new(),
+            friend_confirm: PathBuf::new(),
+            marker_threshold: 0.9,
+        }
+    }
+}
+
 impl TemplateConfig {
-    fn validate(&self) -> Result<()> {
-        validate_unit_interval(self.marker_threshold, "templates.marker_threshold")?;
+    fn validate(&self) -> Result<()> {        validate_unit_interval(self.marker_threshold, "templates.marker_threshold")?;
         for (path, field) in [
             (&self.blue_marker, "templates.blue_marker"),
             (&self.yellow_marker, "templates.yellow_marker"),
@@ -847,6 +1446,38 @@ pub struct PlaybackConfig {
     pub kugou_api_executable: PathBuf,
     pub login_timeout_ms: u64,
     pub kugou_api_base_url: String,
+    /// 音频数据缓存配置；缺失或 enabled=false 时不启用。
+    pub audio_cache: Option<AudioCacheFileConfig>,
+}
+
+/// 音频数据缓存（本地代理 + 磁盘缓存）的文件配置。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AudioCacheFileConfig {
+    pub enabled: bool,
+    /// 缓存根目录；为空时使用系统临时目录。
+    pub directory: PathBuf,
+    /// 磁盘占用上限，单位 MiB。
+    pub max_bytes_mb: u64,
+    /// 同时进行的源站下载任务上限。
+    pub max_concurrent_downloads: usize,
+    /// 源站连接/响应超时，单位毫秒。
+    pub request_timeout_ms: u64,
+    /// 请求尚未下载完成的位置时，等待下载推进的最长时间，单位毫秒。
+    pub seek_wait_timeout_ms: u64,
+}
+
+impl Default for PlaybackConfig {
+    fn default() -> Self {
+        Self {
+            credential_directory: PathBuf::from("data/credentials"),
+            login_helper_executable: PathBuf::from("miliastra-login-helper.exe"),
+            kugou_api_executable: PathBuf::from("kugou-api.exe"),
+            login_timeout_ms: 180000,
+            kugou_api_base_url: "http://127.0.0.1:3000".to_string(),
+            audio_cache: None,
+        }
+    }
 }
 
 impl PlaybackConfig {
@@ -872,7 +1503,41 @@ impl PlaybackConfig {
         if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
             bail!("playback.kugou_api_base_url 必须使用 http 或 https URL");
         }
+        if let Some(audio_cache) = &self.audio_cache {
+            if !audio_cache.enabled {
+                return Ok(());
+            }
+            if audio_cache.max_bytes_mb == 0 {
+                bail!("playback.audio_cache.max_bytes_mb 必须大于 0");
+            }
+            if audio_cache.max_concurrent_downloads == 0 {
+                bail!("playback.audio_cache.max_concurrent_downloads 必须大于 0");
+            }
+            if audio_cache.request_timeout_ms == 0 {
+                bail!("playback.audio_cache.request_timeout_ms 必须大于 0");
+            }
+            if audio_cache.seek_wait_timeout_ms == 0 {
+                bail!("playback.audio_cache.seek_wait_timeout_ms 必须大于 0");
+            }
+        }
         Ok(())
+    }
+
+    /// 转换成播放 crate 的运行时缓存配置；未启用时返回 None。
+    pub(crate) fn audio_cache_runtime_config(&self) -> Option<miliastra_playback::AudioCacheConfig> {
+        let file = self.audio_cache.as_ref()?;
+        if !file.enabled {
+            return None;
+        }
+        Some(miliastra_playback::AudioCacheConfig {
+            enabled: true,
+            directory: file.directory.clone(),
+            max_bytes: file.max_bytes_mb.saturating_mul(1024 * 1024),
+            max_concurrent_downloads: file.max_concurrent_downloads,
+            request_timeout: Duration::from_millis(file.request_timeout_ms),
+            seek_wait_timeout: Duration::from_millis(file.seek_wait_timeout_ms),
+            max_registry_entries: 16,
+        })
     }
 }
 
@@ -978,6 +1643,16 @@ pub struct HotkeyConfig {
     pub exit_key: String,
 }
 
+impl Default for HotkeyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            pause_key: "F7".to_string(),
+            exit_key: "F12".to_string(),
+        }
+    }
+}
+
 impl HotkeyConfig {
     fn validate(&self) -> Result<()> {
         if !self.enabled {
@@ -1014,12 +1689,7 @@ mod tests {
     fn playback_observation_fields_accept_explicit_inheritance_and_stale_timeout() {
         let playback = playback_timing(
             r#"
-search_settle_ms: 2000
 status_poll_ms: 1000
-status_retries: 15
-skip_status_initial_ms: 500
-skip_status_poll_ms: 300
-skip_status_retries: 5
 monitor_tick_ms: 200
 monitor_status_ms: 1000
 uri_stable_samples: 0
@@ -1030,7 +1700,6 @@ stale_timeout_ms: 5000
 
         assert_eq!(playback.uri_stable_samples, 0);
         assert_eq!(playback.transport_stable_samples, 0);
-        assert_eq!(playback.fallback_identity_stable_samples, 2);
         assert_eq!(playback.stale_timeout_ms, 5000);
     }
 
@@ -1038,17 +1707,11 @@ stale_timeout_ms: 5000
     fn playback_observation_rejects_zero_stale_timeout() {
         let error = serde_yaml::from_str::<PlaybackTimingConfig>(
             r#"
-search_settle_ms: 2000
 status_poll_ms: 1000
-status_retries: 15
-skip_status_initial_ms: 500
-skip_status_poll_ms: 300
-skip_status_retries: 5
 monitor_tick_ms: 200
 monitor_status_ms: 1000
 uri_stable_samples: 0
 transport_stable_samples: 0
-fallback_identity_stable_samples: 2
 stale_timeout_ms: 0
 "#,
         )
@@ -1061,17 +1724,11 @@ stale_timeout_ms: 0
     fn playback_observation_stability_uses_local_then_global_then_builtin_default() {
         let local = playback_timing(
             r#"
-search_settle_ms: 2000
 status_poll_ms: 1000
-status_retries: 15
-skip_status_initial_ms: 500
-skip_status_poll_ms: 300
-skip_status_retries: 5
 monitor_tick_ms: 200
 monitor_status_ms: 1000
 uri_stable_samples: 4
 transport_stable_samples: 3
-fallback_identity_stable_samples: 2
 stale_timeout_ms: 7500
 "#,
         );
@@ -1085,7 +1742,6 @@ stale_timeout_ms: 7500
         let inherited = PlaybackTimingConfig {
             uri_stable_samples: 1,
             transport_stable_samples: 0,
-            fallback_identity_stable_samples: 2,
             ..local
         };
         assert_eq!(resolve_stability_count(inherited.uri_stable_samples, 6), 6);
@@ -1387,7 +2043,7 @@ stale_timeout_ms: 7500
 
     #[test]
     fn startup_validation_rejects_zero_runtime_intervals_timeouts_and_retries() {
-        let invalid_fields: [ConfigMutation; 16] = [
+        let invalid_fields: [ConfigMutation; 14] = [
             ("timing.watchdog_restart_ms", |config| {
                 config.timing.watchdog_restart_ms = 0;
             }),
@@ -1412,15 +2068,6 @@ stale_timeout_ms: 7500
             ("timing.playback.status_poll_ms", |config| {
                 config.timing.playback.status_poll_ms = 0;
             }),
-            ("timing.playback.status_retries", |config| {
-                config.timing.playback.status_retries = 0;
-            }),
-            (
-                "timing.playback.fallback_identity_stable_samples",
-                |config| {
-                    config.timing.playback.fallback_identity_stable_samples = 0;
-                },
-            ),
             ("timing.playback.monitor_tick_ms", |config| {
                 config.timing.playback.monitor_tick_ms = 0;
             }),
@@ -1459,7 +2106,7 @@ stale_timeout_ms: 7500
 
     #[test]
     fn startup_validation_rejects_invalid_required_runtime_resources() {
-        let invalid_fields: [ConfigMutation; 15] = [
+        let invalid_fields: [ConfigMutation; 16] = [
             ("ocr.det_model", |config| {
                 config.ocr.det_model = Some(PathBuf::new());
             }),
@@ -1504,6 +2151,12 @@ stale_timeout_ms: 7500
             }),
             ("window.content_width", |config| {
                 config.window.content_width -= 1;
+            }),
+            ("playback.audio_cache.max_bytes_mb", |config| {
+                if let Some(audio_cache) = config.playback.audio_cache.as_mut() {
+                    audio_cache.enabled = true;
+                    audio_cache.max_bytes_mb = 0;
+                }
             }),
         ];
 
@@ -1633,18 +2286,9 @@ stale_timeout_ms: 7500
     }
 
     #[test]
-    fn current_config_requires_every_top_level_module_section() {
-        for section in [
-            "stability",
-            "song_dedup",
-            "idiom_chain",
-            "landlord",
-            "undercover",
-            "turtle_soup",
-            "song_review",
-            "friend_delivery",
-            "playback",
-        ] {
+    fn current_config_requires_core_top_level_sections() {
+        // 精简 config.yaml 只保留核心段；这些段删掉后解析必须失败。
+        for section in ["stability", "window", "timing", "output", "http", "logging", "state"] {
             let mut value: serde_yaml::Value =
                 serde_yaml::from_str(bundled_config_yaml()).expect("default config value");
             value
@@ -1653,11 +2297,40 @@ stale_timeout_ms: 7500
                 .remove(serde_yaml::Value::String(section.to_string()));
 
             let error = serde_yaml::from_value::<AppConfig>(value)
-                .expect_err("current top-level section must be required");
+                .expect_err("core top-level section must be required");
 
             assert!(
                 error.to_string().contains(section),
                 "section={section} error={error}"
+            );
+        }
+        // 完整模板必须包含全部可拆段（供发布脚本提取）。
+        let full: serde_yaml::Value =
+            serde_yaml::from_str(bundled_config_yaml()).expect("default config value");
+        for section in [
+            "screen",
+            "ocr",
+            "templates",
+            "moderation",
+            "startup",
+            "invite",
+            "playback",
+            "queue",
+            "song_dedup",
+            "song_review",
+            "matching",
+            "idiom_chain",
+            "landlord",
+            "undercover",
+            "turtle_soup",
+            "ai",
+            "hotkeys",
+            "friend_delivery",
+            "custom_workflows",
+        ] {
+            assert!(
+                full.get(section).is_some(),
+                "完整模板缺少顶层段 {section}"
             );
         }
     }
@@ -1870,5 +2543,552 @@ marker_threshold: 0.9
                 .to_string()
                 .contains("wonderland_home_retries")
         );
+    }
+
+    #[test]
+    fn external_ocr_config_file_overrides_inline_section_and_resolves_paths() {
+        let directory = std::env::temp_dir().join(format!("config-ocr-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+
+        // 主配置：ocr_config_path 指向外部文件；内嵌 ocr 段保留为回退。
+        let mut main_config = bundled_config_yaml().to_string();
+        main_config.push_str("ocr_config_path: ocr.yaml\n");
+        let config_path = directory.join("config.yaml");
+        std::fs::write(&config_path, main_config).unwrap();
+
+        // 外部 OCR 配置：模型路径改写为可辨识值。文件顶层即 OcrConfig。
+        let ocr_yaml = r#"
+det_model: models/external-det.mnn
+rec_model: models/external-rec.mnn
+charset: models/external-chars.txt
+det_max_side_len: 1280
+"#;
+        std::fs::write(directory.join("ocr.yaml"), ocr_yaml).unwrap();
+
+        let config = AppConfig::load_from_root(&config_path, &directory).expect("load config");
+        let expected_det = directory.join("models/external-det.mnn");
+        let expected_rec = directory.join("models/external-rec.mnn");
+        assert_eq!(config.ocr.det_model.as_deref(), Some(expected_det.as_path()));
+        assert_eq!(config.ocr.rec_model.as_deref(), Some(expected_rec.as_path()));
+        assert_eq!(
+            config.ocr.charset,
+            directory.join("models/external-chars.txt")
+        );
+        assert_eq!(config.ocr.det_max_side_len, 1280);
+        // 未覆盖的字段继承内嵌配置。
+        assert_eq!(config.ocr.threads, 4);
+
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn missing_external_ocr_config_falls_back_to_inline_section() {
+        let directory = std::env::temp_dir().join(format!("config-ocr-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut main_config = bundled_config_yaml().to_string();
+        main_config.push_str("ocr_config_path: does-not-exist.yaml\n");
+        let config_path = directory.join("config.yaml");
+        std::fs::write(&config_path, main_config).unwrap();
+
+        let config = AppConfig::load_from_root(&config_path, &directory).expect("load config");
+        let expected = directory.join("models/PP-OCRv6_small_det.mnn");
+        assert_eq!(config.ocr.det_model.as_deref(), Some(expected.as_path()));
+
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn inline_ocr_section_is_optional_when_external_file_provides_full_config() {
+        let directory = std::env::temp_dir().join(format!("config-ocr-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+
+        // 发布形态：主配置不含 ocr 段，只引用外部文件。
+        let bundled = bundled_config_yaml();
+        let (ocr_start, ocr_end) = ocr_section_span(bundled).expect("bundled ocr section");
+        let without_ocr = format!(
+            "{}{}",
+            &bundled[..ocr_start],
+            &bundled[ocr_end..]
+        );
+        let main_config = format!("{without_ocr}ocr_config_path: ocr.yaml\n");
+        let config_path = directory.join("config.yaml");
+        std::fs::write(&config_path, main_config).unwrap();
+
+        // 外部文件为完整 OCR 配置（同发布包 deps/ocr.yaml）。
+        let ocr_section = bundled[ocr_start + 4..ocr_end]
+            .trim_start_matches('\n')
+            .to_string();
+        std::fs::write(directory.join("ocr.yaml"), ocr_section).unwrap();
+
+        let config = AppConfig::load_from_root(&config_path, &directory).expect("load config");
+        let expected = directory.join("models/PP-OCRv6_small_det.mnn");
+        assert_eq!(config.ocr.det_model.as_deref(), Some(expected.as_path()));
+        assert_eq!(config.ocr.threads, 4);
+        assert_eq!(config.ocr.backend_priority, vec!["cpu".to_string()]);
+        assert_eq!(config.ocr.det_max_side_len, 960);
+
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// 返回内嵌 `ocr:` 段（含 `templates:` 行）在配置文本中的区间。
+    fn ocr_section_span(source: &str) -> Option<(usize, usize)> {
+        let start = source.find("\nocr:")? + 1;
+        let tail = &source[start + 4..];
+        let templates = tail.find("\ntemplates:")?;
+        Some((start, start + 4 + templates + 1))
+    }
+
+    #[test]
+    fn external_screen_config_overrides_inline_section() {
+        let directory = std::env::temp_dir().join(format!("config-scr-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+
+        let mut main_config = bundled_config_yaml().to_string();
+        main_config.push_str("screen_config_path: screen.yaml\n");
+        let config_path = directory.join("config.yaml");
+        std::fs::write(&config_path, main_config).unwrap();
+
+        // 外部文件只覆盖聊天区域，其余继承内嵌配置。
+        let screen_yaml = r#"
+chat_rect:
+  x: 100
+  y: 200
+  width: 300
+  height: 400
+"#;
+        std::fs::write(directory.join("screen.yaml"), screen_yaml).unwrap();
+
+        let config = AppConfig::load_from_root(&config_path, &directory).expect("load config");
+        assert_eq!(config.screen.chat_rect.x, 100);
+        assert_eq!(config.screen.chat_rect.y, 200);
+        assert_eq!(config.screen.chat_rect.width, 300);
+        assert_eq!(config.screen.chat_rect.height, 400);
+        // 未覆盖字段继承内嵌配置。
+        assert_eq!(config.screen.expected_width, 1920);
+        assert_eq!(config.screen.hall_name_rect.x, 75);
+
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn inline_screen_section_is_optional_when_external_file_provides_full_config() {
+        let directory = std::env::temp_dir().join(format!("config-scr-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+
+        let bundled = bundled_config_yaml();
+        let (ocr_start, ocr_end) = ocr_section_span(bundled).expect("bundled ocr section");
+        let without_ocr_and_screen = format!(
+            "{}{}",
+            &bundled[..ocr_start],
+            &bundled[ocr_end..]
+        );
+        let main_config = format!("{without_ocr_and_screen}screen_config_path: screen.yaml\n");
+        let config_path = directory.join("config.yaml");
+        std::fs::write(&config_path, main_config).unwrap();
+
+        // 完整 screen 配置（同发布包 deps/screen.yaml）。
+        let screen_start = without_ocr_and_screen
+            .find("\nscreen:")
+            .expect("bundled screen section")
+            + 1;
+        let screen_tail = &without_ocr_and_screen[screen_start + 7..];
+        let screen_end = screen_tail.find("\nstability:").expect("stability follows") + screen_start + 7;
+        // 跳过 `screen:` 包装行：外部文件顶层即 ScreenConfig。
+        let screen_section = without_ocr_and_screen[screen_start + 7..screen_end].to_string();
+        std::fs::write(directory.join("screen.yaml"), screen_section).unwrap();
+
+        let config = AppConfig::load_from_root(&config_path, &directory).expect("load config");
+        assert_eq!(config.screen.expected_width, 1920);
+        assert_eq!(config.screen.chat_rect.x, 39);
+        assert_eq!(config.screen.hall_member_list_rect.width, 560);
+
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn external_section_configs_override_inline_sections() {
+        let directory = std::env::temp_dir().join(format!("config-sec-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+
+        let mut main_config = bundled_config_yaml().to_string();
+        main_config.push_str(
+            "templates_config_path: templates.yaml\n\
+             moderation_config_path: moderation.yaml\n\
+             startup_config_path: startup.yaml\n\
+             invite_config_path: invite.yaml\n",
+        );
+        let config_path = directory.join("config.yaml");
+        std::fs::write(&config_path, main_config).unwrap();
+
+        // 每个外部文件只覆盖一个可辨识字段，其余继承内嵌配置。
+        std::fs::write(directory.join("templates.yaml"), "marker_threshold: 0.8\n").unwrap();
+        std::fs::write(
+            directory.join("moderation.yaml"),
+            "friend_panel_region:\n  x: 100\n  y: 200\n  width: 300\n  height: 400\n",
+        )
+        .unwrap();
+        std::fs::write(directory.join("startup.yaml"), "enabled: true\n").unwrap();
+        std::fs::write(
+            directory.join("invite.yaml"),
+            "friend_list_region:\n  x: 11\n  y: 22\n  width: 33\n  height: 44\n",
+        )
+        .unwrap();
+
+        let config = AppConfig::load_from_root(&config_path, &directory).expect("load config");
+        assert_eq!(config.templates.marker_threshold, 0.8);
+        assert_eq!(
+            config.templates.blue_marker,
+            directory.join("assets/chat-marker-blue.png")
+        );
+        assert_eq!(config.moderation.friend_panel_region.x, 100);
+        assert_eq!(config.moderation.confirm_region.x, 900);
+        assert!(config.startup.enabled);
+        assert_eq!(config.startup.poll_ms, 1000);
+        assert_eq!(config.invite.friend_list_region.x, 11);
+        assert_eq!(config.invite.enter_hall_region.width, 500);
+
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn inline_sections_optional_when_external_files_provide_full_configs() {
+        let directory = std::env::temp_dir().join(format!("config-sec-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+
+        let bundled = bundled_config_yaml();
+        // 去掉 templates/moderation/startup/invite 四个内嵌段（发布形态）。
+        let mut text = bundled.to_string();
+        for (section, next_section) in [
+            ("templates:", "output:"),
+            ("moderation:", "playback:"),
+            ("startup:", "invite:"),
+            ("invite:", "friend_delivery:"),
+        ] {
+            let start = text.find(&format!("\n{section}")).expect(section) + 1;
+            let tail = &text[start..];
+            let next = tail.find(&format!("\n{next_section}")).expect(next_section);
+            text = format!("{}{}", &text[..start], &tail[next..]);
+        }
+        let main_config = format!(
+            "{text}ocr_config_path: ocr.yaml\n\
+             screen_config_path: screen.yaml\n\
+             templates_config_path: templates.yaml\n\
+             moderation_config_path: moderation.yaml\n\
+             startup_config_path: startup.yaml\n\
+             invite_config_path: invite.yaml\n"
+        );
+        let config_path = directory.join("config.yaml");
+        std::fs::write(&config_path, main_config).unwrap();
+
+        // 四个外部文件用完整内嵌段内容（顶层去缩进）。
+        for (section, next_section, file) in [
+            ("templates:", "output:", "templates.yaml"),
+            ("moderation:", "playback:", "moderation.yaml"),
+            ("startup:", "invite:", "startup.yaml"),
+            ("invite:", "friend_delivery:", "invite.yaml"),
+        ] {
+            let start = bundled.find(&format!("\n{section}")).expect(section) + 1 + section.len();
+            let tail = &bundled[start..];
+            let next = tail.find(&format!("\n{next_section}")).expect(next_section);
+            let content = tail[..next]
+                .lines()
+                .map(|line| {
+                    if line.starts_with("  ") {
+                        &line[2..]
+                    } else {
+                        line
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            std::fs::write(directory.join(file), content).unwrap();
+        }
+
+        let config = AppConfig::load_from_root(&config_path, &directory).expect("load config");
+        assert_eq!(
+            config.templates.blue_marker,
+            directory.join("assets/chat-marker-blue.png")
+        );
+        assert_eq!(config.moderation.friend_panel_region.x, 770);
+        assert!(!config.startup.enabled);
+        assert_eq!(config.startup.enter_game_text_region.x, 900);
+        assert_eq!(config.invite.friend_list_region.width, 170);
+
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// 从完整模板提取一段的完整内容并去掉顶层 2 空格缩进。
+    fn extract_section_dedented(source: &str, section: &str, next_section: &str) -> String {
+        let start = source.find(&format!("\n{section}")).expect(section) + 1 + section.len();
+        let tail = &source[start..];
+        let next = tail.find(&format!("\n{next_section}")).expect(next_section);
+        tail[..next]
+            .lines()
+            .map(|line| {
+                if line.starts_with("  ") {
+                    &line[2..]
+                } else {
+                    line
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// 从完整模板提取一段的完整内容（保留原缩进，供多段文件使用）。
+    fn extract_section_as_is(source: &str, section: &str, next_section: &str) -> String {
+        let start = source.find(&format!("\n{section}")).expect(section) + 1 + section.len();
+        let tail = &source[start..];
+        let next = tail.find(&format!("\n{next_section}")).expect(next_section);
+        tail[..next].trim_end().to_string()
+    }
+
+    #[test]
+    fn external_feature_configs_override_inline_sections() {
+        let directory = std::env::temp_dir().join(format!("config-feat-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+
+        let mut main_config = bundled_config_yaml().to_string();
+        main_config.push_str(
+            "playback_config_path: playback.yaml\n\
+             song_config_path: song.yaml\n\
+             ai_config_path: ai.yaml\n\
+             entertainment_config_path: entertainment.yaml\n\
+             hotkeys_config_path: hotkeys.yaml\n\
+             friend_delivery_config_path: friend_delivery.yaml\n\
+             custom_workflows_config_path: custom_workflows.yaml\n",
+        );
+        let config_path = directory.join("config.yaml");
+        std::fs::write(&config_path, main_config).unwrap();
+
+        // 每个外部文件只覆盖一个可辨识字段，其余继承内嵌配置。
+        std::fs::write(
+            directory.join("playback.yaml"),
+            "kugou_api_base_url: http://127.0.0.1:3999\n",
+        )
+        .unwrap();
+        std::fs::write(directory.join("song.yaml"), "queue:\n  max_size: 7\n").unwrap();
+        std::fs::write(directory.join("ai.yaml"), "provider: deepseek\n").unwrap();
+        std::fs::write(
+            directory.join("entertainment.yaml"),
+            "landlord:\n  enabled: false\n",
+        )
+        .unwrap();
+        std::fs::write(directory.join("hotkeys.yaml"), "pause_key: F8\n").unwrap();
+        std::fs::write(directory.join("friend_delivery.yaml"), "auto_retry_count: 3\n").unwrap();
+        std::fs::write(
+            directory.join("custom_workflows.yaml"),
+            "default_threshold: 0.85\n",
+        )
+        .unwrap();
+
+        let config = AppConfig::load_from_root(&config_path, &directory).expect("load config");
+        assert_eq!(config.playback.kugou_api_base_url, "http://127.0.0.1:3999");
+        assert_eq!(config.playback.login_timeout_ms, 180000);
+        assert_eq!(
+            config.playback.credential_directory,
+            directory.join("data/credentials")
+        );
+        assert_eq!(config.queue.max_size, 7);
+        assert_eq!(config.queue.pool_max_size, 200);
+        assert_eq!(config.song_dedup.enabled, true);
+        assert_eq!(config.ai.provider, "deepseek");
+        assert_eq!(config.ai.model, "gpt-5.6-mini");
+        assert!(!config.landlord.enabled);
+        assert_eq!(config.idiom_chain.enabled, true);
+        assert_eq!(config.hotkeys.pause_key, "F8");
+        assert_eq!(config.friend_delivery.auto_retry_count, 3);
+        assert_eq!(config.custom_workflows.default_threshold, 0.85);
+        assert_eq!(config.custom_workflows.workflows.len(), 13);
+
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn all_splittable_sections_optional_when_external_files_provide_full_configs() {
+        let directory = std::env::temp_dir().join(format!("config-all-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+
+        // 发布形态：主配置只含核心段 + 全部 13 个外部引用。
+        let bundled = bundled_config_yaml();
+        let mut text = bundled.to_string();
+        let removal_pairs = [
+            ("screen:", "stability:"),
+            ("ocr:", "templates:"),
+            ("templates:", "output:"),
+            ("moderation:", "playback:"),
+            ("playback:", "http:"),
+            ("queue:", "song_dedup:"),
+            ("song_dedup:", "idiom_chain:"),
+            ("idiom_chain:", "landlord:"),
+            ("landlord:", "undercover:"),
+            ("undercover:", "turtle_soup:"),
+            ("turtle_soup:", "ai:"),
+            ("ai:", "song_review:"),
+            ("song_review:", "matching:"),
+            ("matching:", "hotkeys:"),
+            ("hotkeys:", "startup:"),
+            ("startup:", "invite:"),
+            ("invite:", "friend_delivery:"),
+            ("friend_delivery:", "custom_workflows:"),
+        ];
+        for (section, next_section) in removal_pairs {
+            let start = text.find(&format!("\n{section}")).expect(section) + 1;
+            let tail = &text[start..];
+            let next = tail.find(&format!("\n{next_section}")).expect(next_section);
+            text = format!("{}{}", &text[..start], &tail[next..]);
+        }
+        // custom_workflows 是末段，删到文件尾。
+        let start = text.find("\ncustom_workflows:").expect("custom_workflows") + 1;
+        text.truncate(start);
+        let main_config = format!(
+            "{text}\
+             ocr_config_path: ocr.yaml\n\
+             screen_config_path: screen.yaml\n\
+             templates_config_path: templates.yaml\n\
+             moderation_config_path: moderation.yaml\n\
+             startup_config_path: startup.yaml\n\
+             invite_config_path: invite.yaml\n\
+             playback_config_path: playback.yaml\n\
+             song_config_path: song.yaml\n\
+             ai_config_path: ai.yaml\n\
+             entertainment_config_path: entertainment.yaml\n\
+             hotkeys_config_path: hotkeys.yaml\n\
+             friend_delivery_config_path: friend_delivery.yaml\n\
+             custom_workflows_config_path: custom_workflows.yaml\n"
+        );
+        let config_path = directory.join("config.yaml");
+        std::fs::write(&config_path, main_config).unwrap();
+
+        // 外部文件提供各段完整内容。
+        let single_files = [
+            ("screen:", "stability:", "screen.yaml"),
+            ("ocr:", "templates:", "ocr.yaml"),
+            ("templates:", "output:", "templates.yaml"),
+            ("moderation:", "playback:", "moderation.yaml"),
+            ("playback:", "http:", "playback.yaml"),
+            ("ai:", "song_review:", "ai.yaml"),
+            ("hotkeys:", "startup:", "hotkeys.yaml"),
+            ("friend_delivery:", "custom_workflows:", "friend_delivery.yaml"),
+        ];
+        for (section, next_section, file) in single_files {
+            std::fs::write(
+                directory.join(file),
+                extract_section_dedented(bundled, section, next_section),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            directory.join("song.yaml"),
+            [
+                format!("queue:\n{}", extract_section_as_is(bundled, "queue:", "song_dedup:")),
+                format!(
+                    "song_dedup:\n{}",
+                    extract_section_as_is(bundled, "song_dedup:", "idiom_chain:")
+                ),
+                format!(
+                    "song_review:\n{}",
+                    extract_section_as_is(bundled, "song_review:", "matching:")
+                ),
+                format!(
+                    "matching:\n{}",
+                    extract_section_as_is(bundled, "matching:", "hotkeys:")
+                ),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join("entertainment.yaml"),
+            [
+                format!(
+                    "idiom_chain:\n{}",
+                    extract_section_as_is(bundled, "idiom_chain:", "landlord:")
+                ),
+                format!(
+                    "landlord:\n{}",
+                    extract_section_as_is(bundled, "landlord:", "undercover:")
+                ),
+                format!(
+                    "undercover:\n{}",
+                    extract_section_as_is(bundled, "undercover:", "turtle_soup:")
+                ),
+                format!(
+                    "turtle_soup:\n{}",
+                    extract_section_as_is(bundled, "turtle_soup:", "ai:")
+                ),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        // custom_workflows 是末段：提取到文件尾，去缩进为无段名单段文件。
+        let workflows = bundled
+            .find("\ncustom_workflows:")
+            .expect("custom_workflows")
+            + 1
+            + "custom_workflows:".len();
+        let workflows_content = bundled[workflows..]
+            .lines()
+            .map(|line| {
+                if line.starts_with("  ") {
+                    &line[2..]
+                } else {
+                    line
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(
+            directory.join("custom_workflows.yaml"),
+            workflows_content.trim_end(),
+        )
+        .unwrap();
+        let startup_files = [
+            ("startup:", "invite:", "startup.yaml"),
+            ("invite:", "friend_delivery:", "invite.yaml"),
+        ];
+        for (section, next_section, file) in startup_files {
+            std::fs::write(
+                directory.join(file),
+                extract_section_dedented(bundled, section, next_section),
+            )
+            .unwrap();
+        }
+
+        let config = AppConfig::load_from_root(&config_path, &directory).expect("load config");
+        assert_eq!(
+            config.playback.credential_directory,
+            directory.join("data/credentials")
+        );
+        assert_eq!(
+            config.playback.login_helper_executable,
+            directory.join("miliastra-login-helper.exe")
+        );
+        assert_eq!(config.playback.kugou_api_base_url, "http://127.0.0.1:3000");
+        assert_eq!(config.queue.max_size, 5);
+        assert_eq!(
+            config.song_dedup.history_path,
+            directory.join("data/song-dedup-history.json")
+        );
+        assert!(!config.song_review.enabled);
+        assert_eq!(config.matching.min_song_name_score, 0.5);
+        assert_eq!(config.ai.provider, "openai");
+        assert_eq!(
+            config.idiom_chain.lexicon_path,
+            directory.join("assets/idioms.txt")
+        );
+        assert!(config.landlord.enabled);
+        assert!(!config.undercover.enabled);
+        assert!(!config.turtle_soup.enabled);
+        assert_eq!(config.hotkeys.pause_key, "F7");
+        assert_eq!(config.friend_delivery.auto_retry_count, 0);
+        assert_eq!(config.custom_workflows.workflows.len(), 13);
+        assert!(!config.custom_workflows.workflows[0].steps.is_empty());
+        // 核心段仍来自主配置。
+        assert_eq!(config.http.port, 18888);
+        assert_eq!(config.window.target_process, "yuanshen.exe,GenshinImpact.exe");
+        assert!(config.validate().is_ok());
+
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 }

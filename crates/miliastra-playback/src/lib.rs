@@ -1,3 +1,4 @@
+mod cache;
 mod catalog;
 mod core;
 mod credentials;
@@ -8,10 +9,14 @@ mod lyrics;
 mod model;
 mod runtime;
 
-pub use catalog::{KugouAccountStatus, KugouListenReport, PlaybackEligibility, ProviderId};
+pub use cache::{AudioCache, AudioCacheConfig};
+pub use catalog::{
+    KugouAccountStatus, KugouListenReport, PlaybackEligibility, ProviderAccountStatus, ProviderId,
+};
 pub use credentials::{CredentialError, CredentialStatus, ProviderCredential};
 pub use domain::{
-    EndBehavior, EndCause, EngineState, Failure, ResolverLocator, ResolverLocatorError,
+    EndBehavior, EndCause, EngineState, Failure, ResolverLocator, ResolverLocatorError, SongKey,
+    StreamSource,
 };
 pub use lyrics::{LyricsParseError, TimedLyricLine, TimedLyrics, parse_lrc_pair};
 pub use model::{

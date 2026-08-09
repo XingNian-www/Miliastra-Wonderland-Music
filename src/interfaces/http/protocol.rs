@@ -5,7 +5,7 @@ use std::net::TcpListener;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, anyhow};
 use axum::Router;
@@ -141,7 +141,6 @@ const BODY_ROUTES: &[BodyRouteSpec] = &[
     },
 ];
 
-const SPECIAL_ROUTES: &[&str] = &["/screenshot", "/hall-screenshot"];
 const ROUTES: &[RouteSpec] = &[
     RouteSpec {
         path: "/status",
@@ -246,10 +245,22 @@ const ROUTES: &[RouteSpec] = &[
         handler: player_kugou_status_route,
     },
     RouteSpec {
-        path: "/player/kugou/report",
+        path: "/player/account/status",
+        json: true,
+        mutating: false,
+        handler: player_account_status_route,
+    },
+    RouteSpec {
+        path: "/player/kugou/claim-vip",
         json: true,
         mutating: true,
-        handler: player_kugou_report_route,
+        handler: player_kugou_claim_vip_route,
+    },
+    RouteSpec {
+        path: "/player/kugou/upgrade-vip",
+        json: true,
+        mutating: true,
+        handler: player_kugou_upgrade_vip_route,
     },
     RouteSpec {
         path: "/queue",
@@ -644,9 +655,18 @@ impl HttpServer {
         let Some(worker) = self.worker.take() else {
             return Ok(());
         };
-        worker
-            .join()
-            .map_err(|_| anyhow!("HTTP server thread panicked"))?
+        // 给 worker 有限时间退出；keep-alive 连接未断开时不能无限阻塞程序退出。
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if worker.is_finished() {
+                return worker.join().map_err(|_| anyhow!("HTTP server thread panicked"))?;
+            }
+            if Instant::now() >= deadline {
+                log::warn!("HTTP server 5 秒内未退出，放弃等待");
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
     }
 }
 
@@ -891,7 +911,7 @@ fn route(
     } else {
         Err(AppError {
             status: 404,
-            message: format!("未知接口，可用: {}", known_routes()),
+            message: "未知接口".to_string(),
         })
     }
 }
@@ -902,16 +922,6 @@ fn route_spec(path: &str) -> Option<&'static RouteSpec> {
 
 fn body_route_spec(path: &str) -> Option<&'static BodyRouteSpec> {
     BODY_ROUTES.iter().find(|route| route.path == path)
-}
-
-fn known_routes() -> String {
-    ROUTES
-        .iter()
-        .map(|route| route.path)
-        .chain(BODY_ROUTES.iter().map(|route| route.path))
-        .chain(SPECIAL_ROUTES.iter().copied())
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 fn parse_json_body<T: DeserializeOwned>(
@@ -1117,7 +1127,15 @@ fn requires_access_token(config: &crate::config::HttpConfig, path: &str) -> bool
 }
 
 fn has_valid_access_token(request: &Request, expected: &str) -> bool {
-    header_value(request, "x-miliastra-token").is_some_and(|value| value == expected)
+    header_value(request, "x-miliastra-token").is_some_and(|value| {
+        // 常数时间比较，避免长度/逐字节时序侧信道泄露 token 信息。
+        value.len() == expected.len()
+            && value
+                .bytes()
+                .zip(expected.bytes())
+                .fold(0_u8, |diff, (actual, want)| diff | (actual ^ want))
+                == 0
+    })
 }
 
 fn current_time_text() -> String {
@@ -1387,9 +1405,11 @@ fn method_not_allowed(message: &str) -> AppError {
 }
 
 fn internal_error(error: impl std::fmt::Display) -> AppError {
+    // 内部错误详情只写日志，响应体用通用信息，避免泄漏内部路径/错误链。
+    log::error!("HTTP 内部错误: {error:#}");
     AppError {
         status: 500,
-        message: error.to_string(),
+        message: "内部错误".to_string(),
     }
 }
 
@@ -1401,11 +1421,15 @@ fn command_error(error: HttpCommandError) -> AppError {
 }
 
 fn player_search_error(error: HttpPlayerSearchError) -> AppError {
-    internal_message(&error.to_string())
+    // 搜索失败原因面向用户可读（如“队列已满/无结果”），直接透传，不走 internal_error。
+    AppError {
+        status: 500,
+        message: error.to_string(),
+    }
 }
 
 fn login_http_error(error: HttpLoginError) -> AppError {
-    let status = match error.code {
+    let status = match error.code.as_str() {
         "unsupported_provider" | "invalid_helper_provider" | "invalid_helper_credential" => 400,
         "provider_auth_required" | "relogin_required" => 401,
         "login_not_active" => 404,

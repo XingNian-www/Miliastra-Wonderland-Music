@@ -20,20 +20,44 @@ const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// sidecar 备选可执行文件名：配置的 kugou-api.exe 不存在时自动探测。
+const ALTERNATE_EXECUTABLE: &str = "app_win.exe";
+
+/// 解析可用的酷狗 API sidecar 可执行文件。
+///
+/// 优先使用配置路径；不存在时探测同目录下的 `app_win.exe`。
+/// 两者都不存在返回 `None`，表示不自动启用酷狗概念版 API。
+pub(crate) fn resolve_kugou_api_executable(configured: &std::path::Path) -> Option<PathBuf> {
+    if configured.is_file() {
+        return Some(configured.to_path_buf());
+    }
+    let alternate = configured
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new(""))
+        .join(ALTERNATE_EXECUTABLE);
+    alternate.is_file().then_some(alternate)
+}
+
 /// 酷狗 API sidecar 启动配置。
 #[derive(Clone, Debug)]
 pub(crate) struct KugouApiConfig {
     pub executable: PathBuf,
     pub device_directory: PathBuf,
+    pub log_directory: PathBuf,
     pub startup_timeout: Duration,
     pub poll_interval: Duration,
 }
 
 impl KugouApiConfig {
-    pub(crate) fn new(executable: PathBuf, device_directory: PathBuf) -> Self {
+    pub(crate) fn new(
+        executable: PathBuf,
+        device_directory: PathBuf,
+        log_directory: PathBuf,
+    ) -> Self {
         Self {
             executable,
             device_directory,
+            log_directory,
             startup_timeout: DEFAULT_STARTUP_TIMEOUT,
             poll_interval: DEFAULT_POLL_INTERVAL,
         }
@@ -125,10 +149,15 @@ fn build_command(config: &KugouApiConfig, port: u16, device: &KugouDevice) -> Co
         .env("KUGOU_API_GUID", &device.guid)
         .env("KUGOU_API_DEV", &device.dev)
         .env("KUGOU_API_MAC", &device.mac)
-        .env("KUGOU_API_PLATFORM", "lite")
-        // 不继承标准流，避免 sidecar 输出意外包含或泄露凭据。
+        .env("KUGOU_API_PLATFORM", "lite");
+    // 临时诊断：保留 sidecar 输出到日志文件，观察请求与错误。
+    let _ = std::fs::create_dir_all(&config.log_directory);
+    let stdout = std::fs::File::create(config.log_directory.join("kugou-sidecar.log"))
+        .or_else(|_| std::fs::OpenOptions::new().write(true).open("NUL"))
+        .expect("sidecar stdout target");
+    command
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::from(stdout))
         .stderr(Stdio::null());
     command
 }
@@ -228,6 +257,7 @@ mod tests {
         let config = KugouApiConfig::new(
             PathBuf::from("kugou-api.exe"),
             PathBuf::from("data/credentials"),
+            PathBuf::from("logs"),
         );
         let device = KugouDevice {
             guid: "guid".to_string(),
@@ -255,7 +285,11 @@ mod tests {
     #[test]
     fn 命令配置保留可执行文件路径() {
         let path = PathBuf::from("tools/kugou-api.exe");
-        let config = KugouApiConfig::new(path.clone(), PathBuf::from("data/credentials"));
+        let config = KugouApiConfig::new(
+            path.clone(),
+            PathBuf::from("data/credentials"),
+            PathBuf::from("logs"),
+        );
         let device = KugouDevice {
             guid: "guid".to_string(),
             dev: "dev".to_string(),
@@ -264,5 +298,40 @@ mod tests {
         let command = build_command(&config, 1, &device);
         assert_eq!(command.get_program(), path.as_os_str());
         assert!(command.get_args().next().is_none());
+    }
+
+    fn temp_directory() -> PathBuf {
+        let directory = std::env::temp_dir().join(format!("kugou-detect-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        directory
+    }
+
+    #[test]
+    fn 检测优先使用配置的可执行文件() {
+        let directory = temp_directory();
+        let configured = directory.join("kugou-api.exe");
+        std::fs::write(&configured, b"fake").unwrap();
+        std::fs::write(directory.join("app_win.exe"), b"fake").unwrap();
+        let resolved = resolve_kugou_api_executable(&configured).unwrap();
+        assert_eq!(resolved, configured);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn 检测配置缺失时回退到app_win() {
+        let directory = temp_directory();
+        let configured = directory.join("kugou-api.exe");
+        std::fs::write(directory.join("app_win.exe"), b"fake").unwrap();
+        let resolved = resolve_kugou_api_executable(&configured).unwrap();
+        assert_eq!(resolved, directory.join("app_win.exe"));
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn 检测两者都不存在时返回none() {
+        let directory = temp_directory();
+        let configured = directory.join("kugou-api.exe");
+        assert!(resolve_kugou_api_executable(&configured).is_none());
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 }

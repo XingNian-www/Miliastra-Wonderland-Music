@@ -1,0 +1,62 @@
+# 点歌 AI Provider。可选：mimo、openai、deepseek、custom；默认选择响应更快的 OpenAI 小模型。
+#
+# mimo：默认使用小米 Mimo，鉴权头为 api-key。
+#   默认 endpoint: https://api.xiaomimimo.com/v1/chat/completions
+#   默认 model: mimo-v2.5
+# openai：默认使用 OpenAI，鉴权头为 Authorization: Bearer。
+#   默认 endpoint: https://api.openai.com/v1/chat/completions
+#   默认 model: gpt-5.6-mini
+# deepseek：默认使用 DeepSeek OpenAI Chat Completions 接口。
+#   默认 endpoint: https://api.deepseek.com/chat/completions
+#   默认 model: deepseek-chat
+# custom：自定义 OpenAI-compatible 网关，必须同时填写 endpoint 和 model。
+provider: openai
+
+# API Key。留空表示点歌 AI 未启用；不要提交到 Git，也不要放进 URL 查询参数。
+# mimo 使用 api-key 请求头，其他 Provider 使用 Authorization Bearer 请求头。
+api_key: ""
+
+# 完整的 Chat Completions 请求地址，必须以 /chat/completions 结尾。
+# 非 custom Provider 留空时使用上面列出的默认 endpoint；custom 必填。
+# 可包含网关要求的查询参数，例如：
+#   https://gateway.example/v1/chat/completions?api-version=2026-07-15
+endpoint: ""
+
+# 模型名；点歌默认使用低延迟模型，custom 必须填写。
+# 网关可用模型以其 /v1/models 返回结果为准。
+model: "gpt-5.6-mini"
+
+# 可选的独立 HTTP(S) 代理；只作用于点歌 AI，留空时沿用环境代理设置
+http_proxy: ""
+
+extra_body:
+  # 全部字段默认 null = 不发送；需要时改为具体值即可。
+  # 程序自动生成官方 Chat Completions 字段：model、messages、response_format、
+  # temperature、stream=false、store=false、max_completion_tokens、top_p；
+  # extra_body 与这些字段同名时官方值优先，其他字段原样传给网关。
+  # 字段均来自各家官方 API 文档：
+  #
+  # OpenAI / 通用 OpenAI 兼容网关（platform.openai.com）：
+  reasoning_effort: null  # 推理强度：none/minimal/low/medium/high/xhigh/max
+  service_tier: null      # 服务等级：auto/default/flex/scale/priority/fast
+  safety_identifier: null # 滥用检测标识，≤64 字符（替代已废弃的 user）
+  prompt_cache_key: null  # 缓存优化键（替代 user）
+  metadata: null          # 附加元数据，最多 16 对；键 ≤64、字符串值 ≤512 字符
+  seed: null              # 确定性采样（Beta）
+  verbosity: null         # 回复详略：low/medium/high
+  #
+  # DeepSeek（api-docs.deepseek.com）：
+  #   reasoning_effort 取值：low/high/max（medium/xhigh 按 high 处理）
+  thinking: null          # 思考模式开关：{"type": "enabled"|"disabled"}（默认 enabled）
+  user_id: null           # 自定义用户 ID：仅 [a-zA-Z0-9-_]，≤512 字符
+  #
+  # 阿里云百炼 qwen 系列（help.aliyun.com）：
+  enable_thinking: null   # 混合思考模式开关：true/false
+  #
+  # OpenRouter（openrouter.ai/docs）：
+  provider: null          # 供应商路由偏好：{"order": [...], "allow_fallbacks": true, ...}
+
+# 点歌 AI 请求超时不在本段配置，由 timing.external.ai_request_timeout_ms 控制。
+# Web 调试接口 /ai/recognize、/ai/match、/ai/pick 还允许用 query 临时覆盖：
+# provider、apiKey（或 api_key）、endpoint、model。
+# 切换到不同 Provider 时，配置中的 extra_body 不会带过去，避免跨供应商泄漏私有字段。

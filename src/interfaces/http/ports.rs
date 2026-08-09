@@ -4,8 +4,8 @@ use std::sync::Arc;
 use anyhow::Result;
 use image::DynamicImage;
 use miliastra_playback::{
-    CredentialStatus, KugouAccountStatus, KugouListenReport, LoginSession, ProviderId,
-    TrackMetadata, TrackRef,
+    CredentialStatus, KugouAccountStatus, KugouListenReport, LoginSession, ProviderAccountStatus,
+    ProviderId, TrackMetadata, TrackRef,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -184,13 +184,13 @@ pub(crate) struct HttpLoginStatus {
 
 #[derive(Clone, Debug)]
 pub(crate) struct HttpLoginError {
-    pub code: &'static str,
-    pub message: &'static str,
+    pub code: String,
+    pub message: String,
 }
 
 impl std::fmt::Display for HttpLoginError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.message)
+        formatter.write_str(&self.message)
     }
 }
 
@@ -204,7 +204,12 @@ pub(crate) trait HttpLoginPort: Send + Sync {
     fn logout(&self, provider: ProviderId) -> Result<CredentialStatus, HttpLoginError>;
     fn refresh(&self, provider: ProviderId) -> Result<CredentialStatus, HttpLoginError>;
     fn kugou_status(&self) -> Result<KugouAccountStatus, HttpLoginError>;
-    fn kugou_report(&self, mixsongid: String) -> Result<KugouListenReport, HttpLoginError>;
+    fn account_status(
+        &self,
+        provider: ProviderId,
+    ) -> Result<Option<ProviderAccountStatus>, HttpLoginError>;
+    fn kugou_claim_vip(&self) -> Result<KugouListenReport, HttpLoginError>;
+    fn kugou_upgrade_vip(&self) -> Result<KugouListenReport, HttpLoginError>;
 }
 
 pub(crate) trait HttpAiPort: Send + Sync {

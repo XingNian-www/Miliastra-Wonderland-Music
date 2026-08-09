@@ -603,7 +603,7 @@ mod tests {
     #[test]
     #[cfg(feature = "ocr-mnn")]
     fn fixed_secondary_chat_fixture_recognizes_title_and_strict_friend_list() {
-        let config = AppConfig::load(Path::new("config.yaml")).expect("load default config");
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).expect("load default config");
         let args = OcrArgs::default().resolve(&config.ocr);
         let mut engine = make_ocr_engine(&args).expect("initialize OCR engine");
         let image = image::open("tests/fixtures/ui/secondary-chat-scrolled-1920x1080.jpg")
@@ -638,3 +638,4 @@ mod tests {
         );
     }
 }
+

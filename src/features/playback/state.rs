@@ -678,8 +678,7 @@ impl PlaybackRuntimeState {
     pub(crate) fn remember_active_request(&mut self) {
         if !matches!(
             self.state,
-            ConfirmedPlaybackState::RequestedSongPlaying
-                | ConfirmedPlaybackState::PausedByUser
+            ConfirmedPlaybackState::RequestedSongPlaying | ConfirmedPlaybackState::PausedByUser
         ) {
             return;
         }

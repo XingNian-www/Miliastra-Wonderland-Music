@@ -350,7 +350,8 @@ mod tests {
 
     #[test]
     fn fixed_scrolled_friend_list_uses_the_back_anchor_for_secondary_state() {
-        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).expect("load default config");
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml"))
+            .expect("load default config");
         let image = image::open("tests/fixtures/ui/secondary-chat-scrolled-1920x1080.jpg")
             .expect("open fixed secondary-chat screenshot");
         assert_eq!((image.width(), image.height()), (1920, 1080));
@@ -405,4 +406,3 @@ mod tests {
         assert!(evidence.template_probes()[1].hit_rect().is_some());
     }
 }
-

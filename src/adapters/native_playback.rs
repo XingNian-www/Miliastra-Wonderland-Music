@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -326,7 +326,7 @@ fn dispatch_error(error: PlaybackError) -> ControlDispatchOutcome {
 
 #[cfg(test)]
 mod tests {
-    use super::{volume_smooth_sequence, providers};
+    use super::{providers, volume_smooth_sequence};
     use miliastra_playback::ProviderId;
 
     #[test]

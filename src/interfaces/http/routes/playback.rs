@@ -92,7 +92,11 @@ pub(super) fn search_source_route(
     state: &HttpSharedState,
 ) -> std::result::Result<String, AppError> {
     // 指定音源点歌：source 必填，与 /searchPlay 区分。
-    if query_value(query, "source").map(str::trim).unwrap_or("").is_empty() {
+    if query_value(query, "source")
+        .map(str::trim)
+        .unwrap_or("")
+        .is_empty()
+    {
         return Err(bad_request("指定音源点歌必须提供 source 参数"));
     }
     enqueue_remote_song(query, state, false)

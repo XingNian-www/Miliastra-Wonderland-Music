@@ -659,7 +659,9 @@ impl HttpServer {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             if worker.is_finished() {
-                return worker.join().map_err(|_| anyhow!("HTTP server thread panicked"))?;
+                return worker
+                    .join()
+                    .map_err(|_| anyhow!("HTTP server thread panicked"))?;
             }
             if Instant::now() >= deadline {
                 log::warn!("HTTP server 5 秒内未退出，放弃等待");

@@ -113,11 +113,7 @@ pub(crate) struct CacheInner {
 }
 
 fn inner_concurrency(configured: usize) -> usize {
-    if configured == 0 {
-        1
-    } else {
-        configured
-    }
+    if configured == 0 { 1 } else { configured }
 }
 
 impl AudioCache {
@@ -130,9 +126,8 @@ impl AudioCache {
             config.directory.clone()
         };
         config.directory = directory.clone();
-        std::fs::create_dir_all(&directory).map_err(|error| {
-            CacheError::Io(format!("创建音频缓存目录失败: {error}"))
-        })?;
+        std::fs::create_dir_all(&directory)
+            .map_err(|error| CacheError::Io(format!("创建音频缓存目录失败: {error}")))?;
         let client = reqwest::Client::builder()
             .timeout(config.request_timeout)
             .build()
@@ -166,10 +161,7 @@ impl AudioCache {
         let hash = cache_key_hash(key);
         {
             let mut entries = inner.entries.write().await;
-            let file = inner
-                .config
-                .directory
-                .join(cache_file_name(&hash, false));
+            let file = inner.config.directory.join(cache_file_name(&hash, false));
             entries
                 .entry(hash.clone())
                 .and_modify(|entry| {
@@ -273,7 +265,9 @@ async fn trim_cache(inner: Arc<CacheInner>, max_bytes: u64) {
         }
         if std::fs::remove_file(&path).is_ok() {
             total = total.saturating_sub(size);
-            inner.downloaded_bytes.fetch_sub(size as usize, Ordering::SeqCst);
+            inner
+                .downloaded_bytes
+                .fetch_sub(size as usize, Ordering::SeqCst);
         }
     }
 }

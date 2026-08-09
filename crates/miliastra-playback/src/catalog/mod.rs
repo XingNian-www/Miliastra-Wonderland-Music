@@ -1,4 +1,5 @@
 mod bilibili;
+mod kugou;
 mod netease;
 mod provider;
 mod qqmusic;
@@ -12,8 +13,19 @@ use crate::credentials::ProviderCredential;
 use crate::domain::{ResolverLocator, SearchSpec, SongKey, StreamSource};
 use crate::lyrics::TimedLyrics;
 
+#[async_trait]
+pub trait KugouAccountAdapter: Send + Sync + 'static {
+    async fn refresh_token(&self) -> Result<ProviderCredential, CatalogError>;
+    async fn account_status(&self) -> Result<kugou::KugouAccountStatus, CatalogError>;
+    async fn report_listen_song(
+        &self,
+        mixsongid: &str,
+    ) -> Result<kugou::KugouListenReport, CatalogError>;
+}
+
 pub use crate::domain::Failure;
 pub use bilibili::BilibiliAdapter;
+pub use kugou::{KugouAccountStatus, KugouAdapter, KugouListenReport};
 pub use netease::NeteaseAdapter;
 pub use provider::{
     PlaybackEligibility, ProviderId, ProviderRegistry, ProviderSearchCandidate,
@@ -56,7 +68,7 @@ pub enum CatalogError {
 }
 
 impl CatalogError {
-    /// Convert legacy adapter errors into the stable provider failure taxonomy.
+    /// 将适配器错误转换为稳定的平台故障分类。
     pub fn as_failure(&self, provider: Option<&str>) -> Failure {
         let (code, retryable) = match self {
             Self::AuthRequired(_) => ("provider_auth_required", false),
@@ -111,6 +123,7 @@ pub trait SourceAdapter: Send + Sync + 'static {
 #[derive(Clone, Default)]
 pub struct SourceCatalog {
     adapters: Arc<HashMap<String, Arc<dyn SourceAdapter>>>,
+    kugou_account: Option<Arc<dyn KugouAccountAdapter>>,
 }
 
 impl SourceCatalog {
@@ -118,7 +131,17 @@ impl SourceCatalog {
         let adapters = adapters.into_iter().collect();
         Self {
             adapters: Arc::new(adapters),
+            kugou_account: None,
         }
+    }
+
+    pub fn with_kugou_account(mut self, account: Arc<dyn KugouAccountAdapter>) -> Self {
+        self.kugou_account = Some(account);
+        self
+    }
+
+    pub fn kugou_account(&self) -> Option<Arc<dyn KugouAccountAdapter>> {
+        self.kugou_account.clone()
     }
 
     pub fn get(&self, source: &str) -> Option<Arc<dyn SourceAdapter>> {

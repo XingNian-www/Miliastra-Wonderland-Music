@@ -89,6 +89,7 @@ enum Provider {
     QqMusic,
     Netease,
     Bilibili,
+    Kugou,
 }
 
 impl Provider {
@@ -97,6 +98,7 @@ impl Provider {
             "qqmusic" => Some(Self::QqMusic),
             "netease" => Some(Self::Netease),
             "bilibili" => Some(Self::Bilibili),
+            "kugou" => Some(Self::Kugou),
             _ => None,
         }
     }
@@ -106,26 +108,56 @@ impl Provider {
             Self::QqMusic => "qqmusic",
             Self::Netease => "netease",
             Self::Bilibili => "bilibili",
+            Self::Kugou => "kugou",
         }
     }
 
-    fn payload(self, cookies: BTreeMap<String, String>) -> CredentialPayload {
+    fn payload(self, mut cookies: BTreeMap<String, String>) -> CredentialPayload {
         match self {
             Self::QqMusic => CredentialPayload::QqMusic { cookies },
             Self::Netease => CredentialPayload::Netease { cookies },
-            Self::Bilibili => CredentialPayload::Bilibili { cookies },
+            Self::Bilibili => CredentialPayload::Bilibili {
+                refresh_token: cookies.remove("ac_time_value").unwrap_or_default(),
+                cookies,
+            },
+            Self::Kugou => CredentialPayload::Kugou {
+                token: cookies.remove("token").unwrap_or_default(),
+                userid: cookies.remove("userid").unwrap_or_default(),
+                cookies,
+            },
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use miliastra_login_protocol::CredentialPayload;
+
     use super::{Provider, helper_error_code};
 
     #[test]
     fn provider_identifiers_are_closed_and_canonical() {
         assert_eq!(Provider::parse("qqmusic").unwrap().id(), "qqmusic");
         assert!(Provider::parse("tx").is_none());
+    }
+
+    #[test]
+    fn bilibili_payload_extracts_refresh_cookie_before_encoding() {
+        let payload = Provider::Bilibili.payload(BTreeMap::from([
+            ("SESSDATA".to_owned(), "session".to_owned()),
+            ("ac_time_value".to_owned(), "refresh".to_owned()),
+        ]));
+        let CredentialPayload::Bilibili {
+            cookies,
+            refresh_token,
+        } = payload
+        else {
+            panic!("expected Bilibili payload");
+        };
+        assert_eq!(refresh_token, "refresh");
+        assert!(!cookies.contains_key("ac_time_value"));
     }
 
     #[test]

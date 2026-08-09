@@ -297,6 +297,8 @@ impl ApplicationRuntime {
     pub(super) fn start_deferred_chat_sender(&self) -> thread::JoinHandle<()> {
         let sender = DeferredChatSender {
             retry_delay: Duration::from_millis(self.lifecycle.config.timing.loop_idle_ms.max(50)),
+            // 海龟汤分段批次与普通批量回复共用同一发送节奏，避免刷屏
+            batch_interval_ms: self.lifecycle.config.timing.command.help_batch_ms,
             running: Arc::clone(&self.lifecycle.running),
             paused: Arc::clone(&self.lifecycle.paused),
             task_engine: self.business.task_engine.clone(),
@@ -314,6 +316,7 @@ impl ApplicationRuntime {
 
 struct DeferredChatSender {
     retry_delay: Duration,
+    batch_interval_ms: u64,
     running: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     task_engine: TaskEngineHandle,
@@ -430,10 +433,12 @@ impl DeferredChatSender {
                     };
                     let messages = batch.remaining_texts();
                     let outcome = match residency {
-                        UiResidency::Primary => self.chat_output.send_batch_outcome(&messages, 0),
+                        UiResidency::Primary => self
+                            .chat_output
+                            .send_batch_outcome(&messages, self.batch_interval_ms),
                         UiResidency::SecondaryCurrentHall => self
                             .chat_output
-                            .send_current_chat_batch_outcome(&messages, 0),
+                            .send_current_chat_batch_outcome(&messages, self.batch_interval_ms),
                     };
                     drop(sending);
 

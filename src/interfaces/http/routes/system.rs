@@ -482,9 +482,9 @@ pub(super) fn state_save(
     let BusinessMutationOutcome::Hall(HallMutationOutcome::StatePatched) = state
         .application
         .tasks
-        .apply_mutation(BusinessMutationIntent::Hall(HallMutationIntent::PatchState(
-            hall_state_patch(&patch)?,
-        )))
+        .apply_mutation(BusinessMutationIntent::Hall(
+            HallMutationIntent::PatchState(hall_state_patch(&patch)?),
+        ))
         .map_err(internal_error)?
     else {
         unreachable!("runtime state patch intent returned a different outcome")
@@ -596,18 +596,21 @@ pub(super) fn hall_state_patch(
     let remaining_minutes = match patch.get("hallRemainingMinutes") {
         None => None,
         Some(value) if value.is_null() => Some(None),
-        Some(value) => Some(Some(value.as_u64().and_then(|minutes| u32::try_from(minutes).ok()).ok_or_else(
-            || bad_request("hallRemainingMinutes 必须是 0-4294967295 的整数"),
-        )?)),
+        Some(value) => Some(Some(
+            value
+                .as_u64()
+                .and_then(|minutes| u32::try_from(minutes).ok())
+                .ok_or_else(|| bad_request("hallRemainingMinutes 必须是 0-4294967295 的整数"))?,
+        )),
     };
     let remaining_updated_at = match patch.get("hallRemainingUpdatedAt") {
         None => None,
         Some(value) if value.is_null() => Some(None),
-        Some(value) => Some(Some(
-            value
-                .as_u64()
-                .ok_or_else(|| bad_request("hallRemainingUpdatedAt 必须是时间戳整数"))?,
-        )),
+        Some(value) => {
+            Some(Some(value.as_u64().ok_or_else(|| {
+                bad_request("hallRemainingUpdatedAt 必须是时间戳整数")
+            })?))
+        }
     };
     let expiring_warning_sent = match patch.get("hallExpiringWarningSent") {
         None => None,

@@ -8,9 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use tokio::io::AsyncWriteExt;
 
-use crate::cache::{
-    CacheInner, DownloadHandle, EntryState, complete_file_size, trim_cache,
-};
+use crate::cache::{CacheInner, DownloadHandle, EntryState, complete_file_size, trim_cache};
 
 /// 开始下载；幂等：已下载中/已完成则直接返回现有句柄。
 pub(crate) async fn start_download(inner: &Arc<CacheInner>, hash: &str) -> Option<DownloadView> {

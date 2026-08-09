@@ -236,7 +236,8 @@ mod tests {
 
     struct EmptySearchPort;
 
-    impl PlayerSearchPort for EmptySearchPort {        fn search_text(
+    impl PlayerSearchPort for EmptySearchPort {
+        fn search_text(
             &mut self,
             _keyword: &str,
             _source: &str,

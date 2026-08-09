@@ -310,10 +310,7 @@ impl NeteaseAdapter {
         let value = response.json::<Value>().await.ok()?;
         value
             .get("data")
-            .and_then(|data| {
-                data.get("musicPackage")
-                    .or_else(|| data.get("associator"))
-            })
+            .and_then(|data| data.get("musicPackage").or_else(|| data.get("associator")))
             .and_then(|package| package.get("expireTime"))
             .and_then(Value::as_i64)
             .filter(|expire| *expire > 0)
@@ -427,7 +424,12 @@ impl SourceAdapter for NeteaseAdapter {
         let now = std::time::Instant::now();
         if let Ok(mut guard) = self.account_cache.lock()
             && let Some((status, cached_at, failed)) = guard.as_ref()
-            && cached_at.elapsed() < if *failed { ACCOUNT_CACHE_FAILED_TTL } else { ACCOUNT_CACHE_TTL }
+            && cached_at.elapsed()
+                < if *failed {
+                    ACCOUNT_CACHE_FAILED_TTL
+                } else {
+                    ACCOUNT_CACHE_TTL
+                }
         {
             return Ok(Some(status.clone()));
         }

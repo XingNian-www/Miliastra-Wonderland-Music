@@ -1595,7 +1595,6 @@ mod tests {
             self.queue.retain(|item| item.id != id);
             Ok(())
         }
-
     }
 
     #[test]
@@ -1877,13 +1876,7 @@ mod tests {
         assert_eq!(port.removed, [QueueRemoval::Id(11), QueueRemoval::Id(12)]);
         // 每首歌各尝试一次：换源时无候选快照，直接确认项目级失败并丢弃。
         assert_eq!(port.play_attempts, 2);
-        assert_eq!(
-            port.replies,
-            [
-                "平台无对应歌曲音源",
-                "平台无对应歌曲音源"
-            ]
-        );
+        assert_eq!(port.replies, ["平台无对应歌曲音源", "平台无对应歌曲音源"]);
     }
 
     #[test]
@@ -1964,19 +1957,13 @@ mod tests {
         let first = QueueItem {
             id: 21,
             keyword: "第一首".to_string(),
-            track: Some(test_track(
-                "miliastra://track/qqmusic/21",
-                "第一首 - 歌手A",
-            )),
+            track: Some(test_track("miliastra://track/qqmusic/21", "第一首 - 歌手A")),
             ..QueueItem::default()
         };
         let second = QueueItem {
             id: 22,
             keyword: "第二首".to_string(),
-            track: Some(test_track(
-                "miliastra://track/qqmusic/22",
-                "第二首 - 歌手B",
-            )),
+            track: Some(test_track("miliastra://track/qqmusic/22", "第二首 - 歌手B")),
             ..QueueItem::default()
         };
         let mut port = VerifyingPlaybackPort {

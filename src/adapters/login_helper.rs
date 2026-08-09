@@ -1544,7 +1544,9 @@ mod tests {
             Ok(Default::default())
         }
 
-        fn kugou_upgrade_vip(&self) -> Result<miliastra_playback::KugouListenReport, PlaybackError> {
+        fn kugou_upgrade_vip(
+            &self,
+        ) -> Result<miliastra_playback::KugouListenReport, PlaybackError> {
             Ok(Default::default())
         }
 

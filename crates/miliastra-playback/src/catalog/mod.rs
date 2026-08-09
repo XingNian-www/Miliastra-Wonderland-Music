@@ -199,10 +199,7 @@ impl SourceCatalog {
         self
     }
 
-    pub fn refresh_adapter(
-        &self,
-        provider: &str,
-    ) -> Option<Arc<dyn CredentialRefreshAdapter>> {
+    pub fn refresh_adapter(&self, provider: &str) -> Option<Arc<dyn CredentialRefreshAdapter>> {
         self.refresh_adapters.get(provider).cloned()
     }
 
@@ -215,9 +212,9 @@ impl SourceCatalog {
         &self,
         source: &str,
     ) -> Result<Option<ProviderAccountStatus>, CatalogError> {
-        let adapter = self.get(source).ok_or_else(|| {
-            CatalogError::UnknownSource(format!("unknown source: {source}"))
-        })?;
+        let adapter = self
+            .get(source)
+            .ok_or_else(|| CatalogError::UnknownSource(format!("unknown source: {source}")))?;
         adapter.account_status().await
     }
 

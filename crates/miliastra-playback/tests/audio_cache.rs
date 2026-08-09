@@ -75,17 +75,18 @@ fn sample_stream(url: String) -> StreamSource {
 async fn proxy_serves_streaming_then_cached_complete_and_range() {
     let body: Vec<u8> = (0..1024u32).map(|i| (i % 251) as u8).collect();
     let (origin_addr, _done) = spawn_fake_origin(body.clone()).await;
-    let directory = std::env::temp_dir().join(format!(
-        "miliastra-audio-cache-test-{}",
-        std::process::id()
-    ));
+    let directory =
+        std::env::temp_dir().join(format!("miliastra-audio-cache-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&directory);
     let cache = AudioCache::spawn(cache_config(directory.clone()))
         .await
         .expect("缓存启动");
     let key = SongKey::new("qq", "e2e-1").unwrap();
     let rewritten = cache
-        .rewrite(&key, sample_stream(format!("http://{origin_addr}/audio.mp3")))
+        .rewrite(
+            &key,
+            sample_stream(format!("http://{origin_addr}/audio.mp3")),
+        )
         .await;
 
     // 1. 首次请求：chunked 流式。
@@ -99,12 +100,13 @@ async fn proxy_serves_streaming_then_cached_complete_and_range() {
     assert_eq!(&first[..], &body[..]);
 
     // 2. 第二次请求：完整文件 200 + Content-Length。
-    let response = reqwest::get(rewritten.url.clone())
-        .await
-        .expect("完整请求");
+    let response = reqwest::get(rewritten.url.clone()).await.expect("完整请求");
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     assert_eq!(
-        response.headers().get(reqwest::header::CONTENT_LENGTH).unwrap(),
+        response
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .unwrap(),
         body.len().to_string().as_str()
     );
     let second = response.bytes().await.unwrap();
@@ -139,16 +141,15 @@ async fn failed_download_is_retried_on_next_request() {
         let body = body.clone();
         async move {
             for _ in 0..2 {
-                let Ok((mut stream, _)) = listener.accept().await else { continue };
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    continue;
+                };
                 let mut buffer = [0u8; 2048];
                 let _ = stream.read(&mut buffer).await;
                 let n = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 if n == 0 {
                     // 第一次：发完响应头就断开。
-                    let head = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
-                        body.len()
-                    );
+                    let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
                     let _ = stream.write_all(head.as_bytes()).await;
                     drop(stream);
                 } else {
@@ -182,9 +183,7 @@ async fn failed_download_is_retried_on_next_request() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // 第二次请求触发重试，应拿到完整数据。
-    let response = reqwest::get(rewritten.url)
-        .await
-        .expect("重试请求");
+    let response = reqwest::get(rewritten.url).await.expect("重试请求");
     let data = response.bytes().await.expect("读取重试响应");
     assert_eq!(&data[..], &body[..]);
 
@@ -207,10 +206,7 @@ async fn rewrite_points_to_local_proxy_and_preserves_source_headers() {
         .expect("缓存启动");
     let key = SongKey::new("wy", "e2e-3").unwrap();
     let mut headers = BTreeMap::new();
-    headers.insert(
-        "authorization".to_owned(),
-        "Bearer test".to_owned(),
-    );
+    headers.insert("authorization".to_owned(), "Bearer test".to_owned());
     let rewritten = cache
         .rewrite(
             &key,

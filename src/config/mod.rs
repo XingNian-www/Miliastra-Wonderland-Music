@@ -471,12 +471,10 @@ impl AppConfig {
         if !path.is_file() {
             return Ok(());
         }
-        let text = fs::read_to_string(&path).with_context(|| {
-            format!("读取 OCR 配置文件失败: {}", path.display())
-        })?;
-        let overlay: serde_yaml::Value = serde_yaml::from_str(&text).with_context(|| {
-            format!("解析 OCR 配置文件失败: {}", path.display())
-        })?;
+        let text = fs::read_to_string(&path)
+            .with_context(|| format!("读取 OCR 配置文件失败: {}", path.display()))?;
+        let overlay: serde_yaml::Value = serde_yaml::from_str(&text)
+            .with_context(|| format!("解析 OCR 配置文件失败: {}", path.display()))?;
         let mut merged = serde_yaml::to_value(&self.ocr)
             .map_err(|error| anyhow::anyhow!("序列化内嵌 OCR 配置失败: {error}"))?;
         merge_yaml_mapping(&mut merged, overlay)?;
@@ -505,12 +503,10 @@ impl AppConfig {
         if !path.is_file() {
             return Ok(());
         }
-        let text = fs::read_to_string(&path).with_context(|| {
-            format!("读取区域坐标配置文件失败: {}", path.display())
-        })?;
-        let overlay: serde_yaml::Value = serde_yaml::from_str(&text).with_context(|| {
-            format!("解析区域坐标配置文件失败: {}", path.display())
-        })?;
+        let text = fs::read_to_string(&path)
+            .with_context(|| format!("读取区域坐标配置文件失败: {}", path.display()))?;
+        let overlay: serde_yaml::Value = serde_yaml::from_str(&text)
+            .with_context(|| format!("解析区域坐标配置文件失败: {}", path.display()))?;
         let mut merged = serde_yaml::to_value(&self.screen)
             .map_err(|error| anyhow::anyhow!("序列化内嵌区域坐标配置失败: {error}"))?;
         merge_yaml_mapping(&mut merged, overlay)?;
@@ -842,11 +838,7 @@ fn merge_yaml_mapping(base: &mut serde_yaml::Value, overlay: serde_yaml::Value) 
         bail!("OCR 配置文件必须是键值映射");
     };
     for (key, value) in overlay_map {
-        if value.is_mapping()
-            && base_map
-                .get(key)
-                .is_some_and(serde_yaml::Value::is_mapping)
-        {
+        if value.is_mapping() && base_map.get(key).is_some_and(serde_yaml::Value::is_mapping) {
             let nested = base_map.get_mut(key).expect("checked mapping key");
             merge_yaml_mapping(nested, value.clone())?;
         } else {
@@ -1406,7 +1398,8 @@ impl Default for TemplateConfig {
 }
 
 impl TemplateConfig {
-    fn validate(&self) -> Result<()> {        validate_unit_interval(self.marker_threshold, "templates.marker_threshold")?;
+    fn validate(&self) -> Result<()> {
+        validate_unit_interval(self.marker_threshold, "templates.marker_threshold")?;
         for (path, field) in [
             (&self.blue_marker, "templates.blue_marker"),
             (&self.yellow_marker, "templates.yellow_marker"),
@@ -1524,7 +1517,9 @@ impl PlaybackConfig {
     }
 
     /// 转换成播放 crate 的运行时缓存配置；未启用时返回 None。
-    pub(crate) fn audio_cache_runtime_config(&self) -> Option<miliastra_playback::AudioCacheConfig> {
+    pub(crate) fn audio_cache_runtime_config(
+        &self,
+    ) -> Option<miliastra_playback::AudioCacheConfig> {
         let file = self.audio_cache.as_ref()?;
         if !file.enabled {
             return None;
@@ -2288,7 +2283,15 @@ stale_timeout_ms: 7500
     #[test]
     fn current_config_requires_core_top_level_sections() {
         // 精简 config.yaml 只保留核心段；这些段删掉后解析必须失败。
-        for section in ["stability", "window", "timing", "output", "http", "logging", "state"] {
+        for section in [
+            "stability",
+            "window",
+            "timing",
+            "output",
+            "http",
+            "logging",
+            "state",
+        ] {
             let mut value: serde_yaml::Value =
                 serde_yaml::from_str(bundled_config_yaml()).expect("default config value");
             value
@@ -2328,10 +2331,7 @@ stale_timeout_ms: 7500
             "friend_delivery",
             "custom_workflows",
         ] {
-            assert!(
-                full.get(section).is_some(),
-                "完整模板缺少顶层段 {section}"
-            );
+            assert!(full.get(section).is_some(), "完整模板缺少顶层段 {section}");
         }
     }
 
@@ -2568,8 +2568,14 @@ det_max_side_len: 1280
         let config = AppConfig::load_from_root(&config_path, &directory).expect("load config");
         let expected_det = directory.join("models/external-det.mnn");
         let expected_rec = directory.join("models/external-rec.mnn");
-        assert_eq!(config.ocr.det_model.as_deref(), Some(expected_det.as_path()));
-        assert_eq!(config.ocr.rec_model.as_deref(), Some(expected_rec.as_path()));
+        assert_eq!(
+            config.ocr.det_model.as_deref(),
+            Some(expected_det.as_path())
+        );
+        assert_eq!(
+            config.ocr.rec_model.as_deref(),
+            Some(expected_rec.as_path())
+        );
         assert_eq!(
             config.ocr.charset,
             directory.join("models/external-chars.txt")
@@ -2605,11 +2611,7 @@ det_max_side_len: 1280
         // 发布形态：主配置不含 ocr 段，只引用外部文件。
         let bundled = bundled_config_yaml();
         let (ocr_start, ocr_end) = ocr_section_span(bundled).expect("bundled ocr section");
-        let without_ocr = format!(
-            "{}{}",
-            &bundled[..ocr_start],
-            &bundled[ocr_end..]
-        );
+        let without_ocr = format!("{}{}", &bundled[..ocr_start], &bundled[ocr_end..]);
         let main_config = format!("{without_ocr}ocr_config_path: ocr.yaml\n");
         let config_path = directory.join("config.yaml");
         std::fs::write(&config_path, main_config).unwrap();
@@ -2677,11 +2679,7 @@ chat_rect:
 
         let bundled = bundled_config_yaml();
         let (ocr_start, ocr_end) = ocr_section_span(bundled).expect("bundled ocr section");
-        let without_ocr_and_screen = format!(
-            "{}{}",
-            &bundled[..ocr_start],
-            &bundled[ocr_end..]
-        );
+        let without_ocr_and_screen = format!("{}{}", &bundled[..ocr_start], &bundled[ocr_end..]);
         let main_config = format!("{without_ocr_and_screen}screen_config_path: screen.yaml\n");
         let config_path = directory.join("config.yaml");
         std::fs::write(&config_path, main_config).unwrap();
@@ -2692,7 +2690,8 @@ chat_rect:
             .expect("bundled screen section")
             + 1;
         let screen_tail = &without_ocr_and_screen[screen_start + 7..];
-        let screen_end = screen_tail.find("\nstability:").expect("stability follows") + screen_start + 7;
+        let screen_end =
+            screen_tail.find("\nstability:").expect("stability follows") + screen_start + 7;
         // 跳过 `screen:` 包装行：外部文件顶层即 ScreenConfig。
         let screen_section = without_ocr_and_screen[screen_start + 7..screen_end].to_string();
         std::fs::write(directory.join("screen.yaml"), screen_section).unwrap();
@@ -2875,7 +2874,11 @@ chat_rect:
         )
         .unwrap();
         std::fs::write(directory.join("hotkeys.yaml"), "pause_key: F8\n").unwrap();
-        std::fs::write(directory.join("friend_delivery.yaml"), "auto_retry_count: 3\n").unwrap();
+        std::fs::write(
+            directory.join("friend_delivery.yaml"),
+            "auto_retry_count: 3\n",
+        )
+        .unwrap();
         std::fs::write(
             directory.join("custom_workflows.yaml"),
             "default_threshold: 0.85\n",
@@ -2969,7 +2972,11 @@ chat_rect:
             ("playback:", "http:", "playback.yaml"),
             ("ai:", "song_review:", "ai.yaml"),
             ("hotkeys:", "startup:", "hotkeys.yaml"),
-            ("friend_delivery:", "custom_workflows:", "friend_delivery.yaml"),
+            (
+                "friend_delivery:",
+                "custom_workflows:",
+                "friend_delivery.yaml",
+            ),
         ];
         for (section, next_section, file) in single_files {
             std::fs::write(
@@ -2981,7 +2988,10 @@ chat_rect:
         std::fs::write(
             directory.join("song.yaml"),
             [
-                format!("queue:\n{}", extract_section_as_is(bundled, "queue:", "song_dedup:")),
+                format!(
+                    "queue:\n{}",
+                    extract_section_as_is(bundled, "queue:", "song_dedup:")
+                ),
                 format!(
                     "song_dedup:\n{}",
                     extract_section_as_is(bundled, "song_dedup:", "idiom_chain:")
@@ -3086,7 +3096,10 @@ chat_rect:
         assert!(!config.custom_workflows.workflows[0].steps.is_empty());
         // 核心段仍来自主配置。
         assert_eq!(config.http.port, 18888);
-        assert_eq!(config.window.target_process, "yuanshen.exe,GenshinImpact.exe");
+        assert_eq!(
+            config.window.target_process,
+            "yuanshen.exe,GenshinImpact.exe"
+        );
         assert!(config.validate().is_ok());
 
         std::fs::remove_dir_all(&directory).unwrap();

@@ -97,6 +97,25 @@ impl CommandEnvelope {
         })
     }
 
+    /// 生成仅替换命令文本的副本，用于 OCR 容错重试（观察信息与原始文本保留在原 envelope）。
+    pub(crate) fn with_command_text(&self, command_text: impl Into<String>) -> Self {
+        let command_text = command_text.into();
+        let user_command = match self.prefix {
+            CommandPrefix::At => format!("@{command_text}"),
+            CommandPrefix::Hash => format!("#{command_text}"),
+        };
+        Self {
+            original_text: self.original_text.clone(),
+            user_command,
+            command_text,
+            message_type: self.message_type.clone(),
+            username: self.username.clone(),
+            prefix: self.prefix,
+            authority: self.authority,
+            observation: self.observation.clone(),
+        }
+    }
+
     pub(crate) fn username(&self) -> &str {
         &self.username
     }

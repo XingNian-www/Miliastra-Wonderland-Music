@@ -66,7 +66,8 @@ mod tests {
 
     #[test]
     fn bundled_configuration_resolves_before_runtime_construction() {
-        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).expect("load bundled config");
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml"))
+            .expect("load bundled config");
 
         let resolved = ResolvedApplicationConfig::resolve(config)
             .expect("resolve all module configuration before runtime construction");
@@ -74,4 +75,3 @@ mod tests {
         assert!(!resolved.app().window.target_process.trim().is_empty());
     }
 }
-

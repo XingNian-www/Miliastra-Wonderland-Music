@@ -11,9 +11,9 @@ use tokio::task::{AbortHandle, Id as TaskId, JoinError, JoinHandle as TokioJoinH
 use uuid::Uuid;
 
 use crate::catalog::{
-    BilibiliAdapter, CredentialRefreshAdapter, KugouAccountStatus, KugouAdapter,
-    KugouListenReport, NeteaseAdapter, ProviderAccountStatus, ProviderId, ProviderRegistry,
-    QqMusicAdapter, SourceAdapter, SourceCatalog,
+    BilibiliAdapter, CredentialRefreshAdapter, KugouAccountStatus, KugouAdapter, KugouListenReport,
+    NeteaseAdapter, ProviderAccountStatus, ProviderId, ProviderRegistry, QqMusicAdapter,
+    SourceAdapter, SourceCatalog,
 };
 use crate::core::{PlaybackCore, PlaybackCoreError};
 use crate::credentials::{CredentialStatus, CredentialStore, ProviderCredential};
@@ -853,18 +853,10 @@ async fn run_commands(
                 let _ = reply.send(result);
             }
             Command::KugouClaimVip(reply) => {
-                let _ = reply.send(
-                    core.kugou_claim_vip()
-                        .await
-                        .map_err(PlaybackError::from),
-                );
+                let _ = reply.send(core.kugou_claim_vip().await.map_err(PlaybackError::from));
             }
             Command::KugouUpgradeVip(reply) => {
-                let _ = reply.send(
-                    core.kugou_upgrade_vip()
-                        .await
-                        .map_err(PlaybackError::from),
-                );
+                let _ = reply.send(core.kugou_upgrade_vip().await.map_err(PlaybackError::from));
             }
             Command::SaveCredential(credential, reply) => {
                 let provider = credential.provider();

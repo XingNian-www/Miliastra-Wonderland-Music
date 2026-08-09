@@ -307,7 +307,9 @@ async fn serve_complete_chunked(
         if read == 0 {
             break;
         }
-        stream.write_all(format!("{:x}\r\n", read).as_bytes()).await?;
+        stream
+            .write_all(format!("{:x}\r\n", read).as_bytes())
+            .await?;
         stream.write_all(&buffer[..read]).await?;
         stream.write_all(b"\r\n").await?;
         remaining -= read as u64;
@@ -362,7 +364,8 @@ async fn serve_streaming(
                 }
                 // 等待下载推进后再试。
                 let progressed =
-                    wait_for_bytes(handle, start as usize + 1, inner.config.seek_wait_timeout).await;
+                    wait_for_bytes(handle, start as usize + 1, inner.config.seek_wait_timeout)
+                        .await;
                 if !progressed {
                     write_chunk_end(stream).await?;
                     return Ok(());
@@ -384,7 +387,9 @@ async fn serve_streaming(
             if read == 0 {
                 break;
             }
-            stream.write_all(format!("{:x}\r\n", read).as_bytes()).await?;
+            stream
+                .write_all(format!("{:x}\r\n", read).as_bytes())
+                .await?;
             stream.write_all(&buffer[..read]).await?;
             stream.write_all(b"\r\n").await?;
             next_read_offset += read;
@@ -426,14 +431,8 @@ mod tests {
 
     #[test]
     fn parses_hash_from_proxy_paths() {
-        assert_eq!(
-            path_hash("/audio/abc123").as_deref(),
-            Some("abc123")
-        );
-        assert_eq!(
-            path_hash("/audio/abc123?x=1").as_deref(),
-            Some("abc123")
-        );
+        assert_eq!(path_hash("/audio/abc123").as_deref(), Some("abc123"));
+        assert_eq!(path_hash("/audio/abc123?x=1").as_deref(), Some("abc123"));
         assert_eq!(path_hash("/audio/"), None);
         assert_eq!(path_hash("/other/abc"), None);
         assert_eq!(path_hash("/audio/ab/c"), None);
@@ -442,7 +441,10 @@ mod tests {
     #[test]
     fn finds_header_end_marker() {
         assert_eq!(find_header_end(b"GET / HTTP/1.1\r\n\r\n"), Some(18));
-        assert_eq!(find_header_end(b"GET / HTTP/1.1\r\nA: b\r\n\r\nx"), Some(24));
+        assert_eq!(
+            find_header_end(b"GET / HTTP/1.1\r\nA: b\r\n\r\nx"),
+            Some(24)
+        );
         assert_eq!(find_header_end(b"no marker"), None);
     }
 }

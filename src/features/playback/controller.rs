@@ -672,7 +672,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             }
             log::info!("队列推进决策: advance reason=playback_failure");
             return Ok(QueueAdvanceDecision::AdvanceQueue {
-                reason: "播放失败",
+                reason: "播放失败"
             });
         }
 
@@ -784,8 +784,8 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             );
             match self.play_and_verify(&request) {
                 Ok(PlaybackVerification::Success { status, .. }) => {
-                    let _ = self
-                        .reconcile_player_session(&self.playback_state.snapshot()?, &status)?;
+                    let _ =
+                        self.reconcile_player_session(&self.playback_state.snapshot()?, &status)?;
                     return Ok(QueueAdvanceDecision::PlaybackStateChanged);
                 }
                 Err(error) => {
@@ -1091,7 +1091,8 @@ fn status_matches_active_request(
     _matching: &MatchConfig,
     active_request: Option<&ActivePlaybackRequest>,
     status: &PlayerStatus,
-) -> bool {    let Some(active_request) = active_request else {
+) -> bool {
+    let Some(active_request) = active_request else {
         return false;
     };
     active_request
@@ -1750,11 +1751,7 @@ mod tests {
         let fallback_uri = "miliastra://track/netease/fallback";
         let backend = FakeBackend::new(vec![status("目标", fallback_uri, 12.0, 180.0)]);
         let manual_clock = Arc::new(ManualClock::new(Instant::now()));
-        let controller = controller_with_time(
-            backend,
-            manual_clock.clone(),
-            manual_clock.clone(),
-        );
+        let controller = controller_with_time(backend, manual_clock.clone(), manual_clock.clone());
         let request = request();
         controller
             .confirm_playback_success(
@@ -1786,11 +1783,7 @@ mod tests {
         let fallback_uri = "miliastra://track/netease/fallback";
         let backend = FakeBackend::new(vec![stopped_status_with_uri(fallback_uri)]);
         let manual_clock = Arc::new(ManualClock::new(Instant::now()));
-        let controller = controller_with_time(
-            backend,
-            manual_clock.clone(),
-            manual_clock.clone(),
-        );
+        let controller = controller_with_time(backend, manual_clock.clone(), manual_clock.clone());
         let request = request();
         controller
             .confirm_playback_success(
@@ -1970,10 +1963,10 @@ mod tests {
 
         // 不可重试的播放中失败：丢弃当前请求并推进到队列下一首。
         assert_eq!(
-            controller
-                .maybe_advance_queue(failure, context)
-                .unwrap(),
-            QueueAdvanceDecision::AdvanceQueue { reason: "播放失败" }
+            controller.maybe_advance_queue(failure, context).unwrap(),
+            QueueAdvanceDecision::AdvanceQueue {
+                reason: "播放失败"
+            }
         );
         let snapshot = controller.snapshot();
         assert!(snapshot.active_uri.is_empty());
@@ -2092,7 +2085,9 @@ mod tests {
                 .last_observation
                 .as_ref()
                 .map(|observation| observation.captured_at_ms),
-            before.as_ref().map(|observation| observation.captured_at_ms)
+            before
+                .as_ref()
+                .map(|observation| observation.captured_at_ms)
         );
     }
 
@@ -2321,11 +2316,8 @@ mod tests {
     #[test]
     fn external_playback_protection_uses_the_injected_clock() {
         let clock = Arc::new(ManualClock::new(Instant::now()));
-        let controller = controller_with_time(
-            FakeBackend::new(vec![]),
-            clock.clone(),
-            clock.clone(),
-        );
+        let controller =
+            controller_with_time(FakeBackend::new(vec![]), clock.clone(), clock.clone());
         let external = status("外部歌", "miliastra://track/qqmusic/external", 30.0, 180.0);
         controller.mark_external_playback().unwrap();
 

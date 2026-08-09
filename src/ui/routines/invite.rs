@@ -818,4 +818,3 @@ mod tests {
         left.0.abs_diff(right.0) <= 10 && left.1.abs_diff(right.1) <= 10
     }
 }
-

@@ -1033,8 +1033,8 @@ mod tests {
 
     #[test]
     fn parses_blue_kugou_song_command_as_hidden_hall_command() {
-        let parsed = parse_text("用户：@酷狗点歌 晴天 周杰伦", "blue")
-            .expect("parse hall kugou song");
+        let parsed =
+            parse_text("用户：@酷狗点歌 晴天 周杰伦", "blue").expect("parse hall kugou song");
         assert_eq!(
             parsed.command,
             ModuleCommand::SongRequest(SongCommand {

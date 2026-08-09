@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -54,8 +54,11 @@ async fn probe_candidates(
         let locator = candidate.song.resolver_locator.clone();
         let initial = candidate.eligibility;
         probes.push(tokio::spawn(async move {
-            let outcome =
-                timeout(request_timeout, adapter.probe_eligibility(&key, locator.as_ref())).await;
+            let outcome = timeout(
+                request_timeout,
+                adapter.probe_eligibility(&key, locator.as_ref()),
+            )
+            .await;
             let eligibility = match outcome {
                 // 探测确认可播放（resolve 用账号凭据，VIP 账号能解析 VIP 歌）→ 直接可用。
                 Ok(Ok(confirmed)) => match confirmed {
@@ -81,12 +84,10 @@ async fn probe_candidates(
     let mut confirmed = Vec::with_capacity(probes.len());
     for probe in probes {
         match probe.await {
-            Ok((candidate, eligibility)) => {
-                confirmed.push(ProviderSearchCandidate {
-                    song: candidate.song,
-                    eligibility,
-                })
-            }
+            Ok((candidate, eligibility)) => confirmed.push(ProviderSearchCandidate {
+                song: candidate.song,
+                eligibility,
+            }),
             Err(error) => log::warn!("搜索候选探测任务失败: {error}"),
         }
     }
@@ -107,9 +108,7 @@ impl ResolveCacheEntry {
             expires_at > now_epoch_ms
         } else {
             // 无过期字段：按兜底窗口保守缓存，避免 CDN URL 长期失效。
-            now_epoch_ms
-                .saturating_sub(self.resolved_at_epoch_ms)
-                < RESOLVE_CACHE_FALLBACK_TTL_MS
+            now_epoch_ms.saturating_sub(self.resolved_at_epoch_ms) < RESOLVE_CACHE_FALLBACK_TTL_MS
         }
     }
 }
@@ -251,8 +250,7 @@ impl PlaybackCore {
                             .as_failure(Some(&request_source))
                     })?
                     .map_err(|error| error.as_failure(Some(&request_source)))?;
-                let candidates =
-                    probe_candidates(adapter, candidates, request_timeout).await;
+                let candidates = probe_candidates(adapter, candidates, request_timeout).await;
                 Ok(candidates)
             });
             (source, task)
@@ -306,7 +304,8 @@ impl PlaybackCore {
     }
 
     #[cfg(test)]
-    pub async fn play(        &self,
+    pub async fn play(
+        &self,
         song_key: SongKey,
         resolver_locator: Option<ResolverLocator>,
         end_behavior: EndBehavior,
@@ -338,7 +337,9 @@ impl PlaybackCore {
             tracing::debug!(key = %song_key, "音源已在缓存中，跳过预加载");
             return Ok(());
         }
-        let stream = self.resolve_stream(&song_key, resolver_locator.as_ref()).await?;
+        let stream = self
+            .resolve_stream(&song_key, resolver_locator.as_ref())
+            .await?;
         self.cache_stream(song_key, stream);
         Ok(())
     }
@@ -917,7 +918,9 @@ mod tests {
         }
     }
 
-    fn counting_source(expires_at_epoch_ms: Option<u64>) -> (Arc<CountingSource>, Arc<AtomicUsize>) {
+    fn counting_source(
+        expires_at_epoch_ms: Option<u64>,
+    ) -> (Arc<CountingSource>, Arc<AtomicUsize>) {
         let calls = Arc::new(AtomicUsize::new(0));
         let source = Arc::new(CountingSource {
             resolve_calls: calls.clone(),
@@ -1136,10 +1139,7 @@ mod tests {
             let key = SongKey::new("qq", &format!("song-{index}")).unwrap();
             core.preload(key, None).await.unwrap();
         }
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            RESOLVE_CACHE_MAX_ENTRIES + 2
-        );
+        assert_eq!(calls.load(Ordering::SeqCst), RESOLVE_CACHE_MAX_ENTRIES + 2);
 
         // 最旧的两首已被淘汰：重新解析。
         for index in 0..2 {
@@ -1148,21 +1148,15 @@ mod tests {
                 .await
                 .unwrap();
         }
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            RESOLVE_CACHE_MAX_ENTRIES + 4
-        );
+        assert_eq!(calls.load(Ordering::SeqCst), RESOLVE_CACHE_MAX_ENTRIES + 4);
 
         // 最新的仍在缓存中：命中。
-        let newest = SongKey::new("qq", &format!("song-{}", RESOLVE_CACHE_MAX_ENTRIES + 1))
-            .unwrap();
+        let newest =
+            SongKey::new("qq", &format!("song-{}", RESOLVE_CACHE_MAX_ENTRIES + 1)).unwrap();
         core.play(newest, None, EndBehavior::NotifyController)
             .await
             .unwrap();
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            RESOLVE_CACHE_MAX_ENTRIES + 4
-        );
+        assert_eq!(calls.load(Ordering::SeqCst), RESOLVE_CACHE_MAX_ENTRIES + 4);
     }
 
     struct RetrySource {

@@ -1027,4 +1027,3 @@ mod tests {
         assert!(split_command_args(r#""abc"#).is_err());
     }
 }
-

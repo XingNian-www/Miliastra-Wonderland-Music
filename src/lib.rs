@@ -38,8 +38,8 @@ pub fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
 #[cfg(target_os = "windows")]
 fn add_dependency_dll_directory(config_path: &std::path::Path) {
     use std::os::windows::ffi::OsStrExt;
-    use windows::core::PCWSTR;
     use windows::Win32::System::LibraryLoader::SetDllDirectoryW;
+    use windows::core::PCWSTR;
     let Some(executable_root) = config_path.parent() else {
         return;
     };

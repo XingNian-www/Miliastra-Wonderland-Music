@@ -141,7 +141,9 @@ impl KugouAdapter {
             .header("Cookie", Self::credential_cookie_header(credential));
         request = request.query(&[("token", token), ("userid", userid), ("dfid", dfid)]);
         // 临时诊断：记录搜索请求的完整 URL，便于比对酷狗侧拒绝原因。
-        log::warn!("Kugou sidecar request: {url}?{query:?} token={token} userid={userid} dfid={dfid}");
+        log::warn!(
+            "Kugou sidecar request: {url}?{query:?} token={token} userid={userid} dfid={dfid}"
+        );
         let response = request.send().await.map_err(classify_request_error)?;
         classify_status(&response)?;
         response
@@ -334,7 +336,12 @@ impl KugouAdapter {
         let now = std::time::Instant::now();
         if let Ok(mut guard) = self.vip_cache.lock()
             && let Some((status, cached_at, failed)) = guard.as_ref()
-            && cached_at.elapsed() < if *failed { VIP_CACHE_FAILED_TTL } else { VIP_CACHE_TTL }
+            && cached_at.elapsed()
+                < if *failed {
+                    VIP_CACHE_FAILED_TTL
+                } else {
+                    VIP_CACHE_TTL
+                }
         {
             return *status;
         }
@@ -386,7 +393,12 @@ impl KugouAdapter {
         let now = std::time::Instant::now();
         if let Ok(mut guard) = self.account_cache.lock()
             && let Some((status, cached_at, failed)) = guard.as_ref()
-            && cached_at.elapsed() < if *failed { VIP_CACHE_FAILED_TTL } else { VIP_CACHE_TTL }
+            && cached_at.elapsed()
+                < if *failed {
+                    VIP_CACHE_FAILED_TTL
+                } else {
+                    VIP_CACHE_TTL
+                }
         {
             return Ok(status.clone());
         }
@@ -426,10 +438,7 @@ impl KugouAdapter {
                 .and_then(value_string)
                 .or(credential_userid);
             // 2) VIP 状态：概念版 /youth/union/vip → /user/vip/detail → 凭据 cookie vip_type。
-            let vip = match self
-                .account_json("/youth/union/vip", &credential)
-                .await
-            {
+            let vip = match self.account_json("/youth/union/vip", &credential).await {
                 Ok(vip) => vip,
                 Err(_) => self
                     .account_json("/user/vip/detail", &credential)
@@ -441,13 +450,11 @@ impl KugouAdapter {
                 .get("vip_type")
                 .and_then(value_u64)
                 .or_else(|| vip_data.get("vip_type").and_then(value_u64))
-                .or_else(|| {
-                    match &credential {
-                        ProviderCredential::Kugou { cookies, .. } => cookies
-                            .get("vip_type")
-                            .and_then(|value| value.parse::<u64>().ok()),
-                        _ => None,
-                    }
+                .or_else(|| match &credential {
+                    ProviderCredential::Kugou { cookies, .. } => cookies
+                        .get("vip_type")
+                        .and_then(|value| value.parse::<u64>().ok()),
+                    _ => None,
                 })
                 .map(|value| value.to_string());
             return Ok(KugouAccountStatus {
@@ -803,16 +810,13 @@ fn parse_search_candidates(response: &Value) -> Result<Vec<ProviderSearchCandida
                         .collect()
                 })
                 .unwrap_or_default();
-            let duration_ms = raw
-                .get("Duration")
-                .and_then(value_u64)
-                .map(|value| {
-                    if value < 10_000 {
-                        value.saturating_mul(1000)
-                    } else {
-                        value
-                    }
-                });
+            let duration_ms = raw.get("Duration").and_then(value_u64).map(|value| {
+                if value < 10_000 {
+                    value.saturating_mul(1000)
+                } else {
+                    value
+                }
+            });
             let song = Song {
                 key: SongKey::new(PROVIDER, hash).ok()?,
                 resolver_locator: ResolverLocator::new(format!(
@@ -852,10 +856,13 @@ fn kugou_candidate_is_vip(raw: &Value) -> bool {
             }
         }
     }
-    raw.get("VIP").and_then(value_u64).is_some_and(|value| value != 0)
+    raw.get("VIP")
+        .and_then(value_u64)
+        .is_some_and(|value| value != 0)
 }
 
-fn resolver_parts(    key: &SongKey,
+fn resolver_parts(
+    key: &SongKey,
     locator: Option<&ResolverLocator>,
 ) -> Result<(String, String, String), CatalogError> {
     let (hash, album_id, album_audio_id) = match locator {
@@ -989,7 +996,9 @@ mod tests {
     use base64::Engine;
     use serde_json::json;
 
-    use super::{PROVIDER, decode_lrc_content, extract_stream_url, parse_search_candidates, resolver_parts};
+    use super::{
+        PROVIDER, decode_lrc_content, extract_stream_url, parse_search_candidates, resolver_parts,
+    };
     use crate::catalog::CatalogError;
     use crate::credentials::ProviderCredential;
     use crate::domain::{ResolverLocator, SongKey};
@@ -1040,7 +1049,9 @@ mod tests {
     fn stream_url_accepts_new_array_shape() {
         // 新版：顶层 url 为数组
         assert_eq!(
-            extract_stream_url(&json!({"url": ["http://cdn.example/1.mp3", "http://cdn.example/2.mp3"]})),
+            extract_stream_url(
+                &json!({"url": ["http://cdn.example/1.mp3", "http://cdn.example/2.mp3"]})
+            ),
             Some("http://cdn.example/1.mp3")
         );
         // backupUrl 兜底

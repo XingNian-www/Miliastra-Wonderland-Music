@@ -133,6 +133,7 @@ turtle_soup:
       #
       # DeepSeek（api-docs.deepseek.com）：
       #   reasoning_effort 取值：low/high/max（medium/xhigh 按 high 处理）
+      #   注意：thinking 必须是对象 {"type": "enabled"|"disabled"}，写布尔 true/false 会被 API 400 拒绝
       thinking: null          # 思考模式开关：{"type": "enabled"|"disabled"}（默认 enabled）
       user_id: null           # 自定义用户 ID：仅 [a-zA-Z0-9-_]，≤512 字符
       #

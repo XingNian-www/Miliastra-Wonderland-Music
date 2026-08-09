@@ -614,7 +614,7 @@ mod tests {
 
     #[test]
     fn public_hall_detection_owns_f2_ocr_and_primary_recovery_in_one_operation() {
-        let mut config = AppConfig::load(Path::new("config.yaml")).unwrap();
+        let mut config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
         config.timing.input.after_activate_ms = 0;
         config.timing.input.click_ms = 0;
         config.timing.hall.page_settle_ms = 0;
@@ -677,7 +677,7 @@ mod tests {
 
     #[test]
     fn hall_screenshot_captures_top_then_bottom_after_scroll() {
-        let mut config = AppConfig::load(Path::new("config.yaml")).unwrap();
+        let mut config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
         config.timing.input.after_activate_ms = 0;
         config.timing.input.click_ms = 0;
         config.timing.hall.page_settle_ms = 0;
@@ -726,7 +726,7 @@ mod tests {
 
     #[test]
     fn hall_exit_treats_unknown_frames_as_transition_until_primary_is_stable() {
-        let mut config = AppConfig::load(Path::new("config.yaml")).unwrap();
+        let mut config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
         config.timing.input.after_activate_ms = 0;
         config.timing.input.click_ms = 0;
         config.timing.hall.page_settle_ms = 0;
@@ -808,3 +808,4 @@ mod tests {
         frame
     }
 }
+

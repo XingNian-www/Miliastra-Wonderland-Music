@@ -1032,6 +1032,31 @@ mod tests {
     }
 
     #[test]
+    fn parses_blue_kugou_song_command_as_hidden_hall_command() {
+        let parsed = parse_text("用户：@酷狗点歌 晴天 周杰伦", "blue")
+            .expect("parse hall kugou song");
+        assert_eq!(
+            parsed.command,
+            ModuleCommand::SongRequest(SongCommand {
+                keyword: "晴天 周杰伦".to_string(),
+                source: SongSource::Kugou,
+                prefix: "酷狗点歌".to_string(),
+                prefer_accompaniment: false,
+                ai_assisted: false,
+                friend_username: String::new(),
+            })
+        );
+        assert_eq!(parsed.username, "用户");
+        assert_eq!(parsed.message_type, "blue");
+        assert_eq!(parsed.user_command, "@酷狗点歌 晴天 周杰伦");
+    }
+
+    #[test]
+    fn rejects_pink_kugou_song_command() {
+        assert!(parse_text("[Alice]：@酷狗点歌 晴天 周杰伦", "pink").is_none());
+    }
+
+    #[test]
     fn parses_pink_bilibili_song_command() {
         let parsed = parse_text("[Alice]：@B站点歌 晴天 周杰伦", "pink")
             .expect("parse friend bilibili song");

@@ -995,7 +995,8 @@ impl SongRequestExecution<'_> {
 
 fn ai_candidate_source(song: &SongCommand) -> &'static str {
     if song.friend_username.trim().is_empty() {
-        "qqmusic,netease,bilibili,kugou"
+        // 大厅 AI 点歌不提供 B站 音源，B站 仅限好友点歌。
+        "qqmusic,netease,kugou"
     } else {
         song.source.as_str()
     }
@@ -1579,5 +1580,33 @@ mod tests {
         assert!(SongRequestDecision::is_feedback_text(
             "搜索到:晴天,@确认@跳过@换源"
         ));
+    }
+
+    #[test]
+    fn hall_ai_song_search_excludes_bilibili_while_friend_ai_search_keeps_it() {
+        // 大厅 AI 点歌：不提供 B站 音源。
+        let hall = SongCommand {
+            friend_username: String::new(),
+            ..command()
+        };
+        let source = ai_candidate_source(&hall);
+        assert!(!source.split(',').any(|part| part == "bilibili"));
+        assert_eq!(source, "qqmusic,netease,kugou");
+
+        // 好友 AI 点歌：按好友命令的 source（All 为空串 → 全平台，含 B站）。
+        let friend_ai = SongCommand {
+            source: SongSource::All,
+            friend_username: "Alice".to_string(),
+            ..command()
+        };
+        assert_eq!(ai_candidate_source(&friend_ai), "");
+
+        // 好友 B站点歌：明确只搜 B站。
+        let friend_bilibili = SongCommand {
+            source: SongSource::Bilibili,
+            friend_username: "Alice".to_string(),
+            ..command()
+        };
+        assert_eq!(ai_candidate_source(&friend_bilibili), "bilibili");
     }
 }

@@ -120,11 +120,22 @@ impl Provider {
                 refresh_token: cookies.remove("ac_time_value").unwrap_or_default(),
                 cookies,
             },
-            Self::Kugou => CredentialPayload::Kugou {
-                token: cookies.remove("token").unwrap_or_default(),
-                userid: cookies.remove("userid").unwrap_or_default(),
-                cookies,
-            },
+            Self::Kugou => {
+                // 酷狗网页登录凭据集中在 KuGoo cookie：
+                // 值形如 t=<token>&KugooID=<userid>&ct=<时间戳>&...
+                let fields = cookies
+                    .remove("KuGoo")
+                    .unwrap_or_default()
+                    .split('&')
+                    .filter_map(|pair| pair.split_once('='))
+                    .map(|(name, value)| (name.to_owned(), value.to_owned()))
+                    .collect::<BTreeMap<_, _>>();
+                CredentialPayload::Kugou {
+                    token: fields.get("t").cloned().unwrap_or_default(),
+                    userid: fields.get("KugooID").cloned().unwrap_or_default(),
+                    cookies,
+                }
+            }
         }
     }
 }
@@ -158,6 +169,29 @@ mod tests {
         };
         assert_eq!(refresh_token, "refresh");
         assert!(!cookies.contains_key("ac_time_value"));
+    }
+
+    #[test]
+    fn kugou_payload_parses_token_and_userid_from_ku_goo_cookie() {
+        let payload = Provider::Kugou.payload(BTreeMap::from([
+            (
+                "KuGoo".to_owned(),
+                "t=secret-token&KugooID=123456&ct=1700000000".to_owned(),
+            ),
+            ("dfid".to_owned(), "dfid-value".to_owned()),
+        ]));
+        let CredentialPayload::Kugou {
+            token,
+            userid,
+            cookies,
+        } = payload
+        else {
+            panic!("expected Kugou payload");
+        };
+        assert_eq!(token, "secret-token");
+        assert_eq!(userid, "123456");
+        assert!(!cookies.contains_key("KuGoo"));
+        assert_eq!(cookies.get("dfid").map(String::as_str), Some("dfid-value"));
     }
 
     #[test]

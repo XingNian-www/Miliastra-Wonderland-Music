@@ -343,8 +343,12 @@ playback:
   credential_directory: data/credentials
   # 受控登录使用的短生命周期助手
   login_helper_executable: miliastra-login-helper.exe
+  # 内置酷狗概念版 API sidecar
+  kugou_api_executable: kugou-api.exe
   # 单次交互登录的最长时间，单位毫秒
   login_timeout_ms: 180000
+  # 酷狗 KuGouMusicApi 服务地址；文档站不是 API 服务
+  kugou_api_base_url: http://127.0.0.1:3000
 
 http:
   # Web/API 面板监听地址
@@ -385,6 +389,8 @@ state:
 queue:
   # 队列最大长度
   max_size: 5
+  # 播放池最大容量；已确认播放过的点歌会进入播放池，队列播完后从播放池随机播放；0 表示禁用播放池
+  pool_max_size: 200
   # 当前歌曲剩余多少秒以内自动播放队列下一首
   auto_advance_seconds: 1
   # 机器人确认播放的歌曲是否保护；true 时新点歌会排队，未结束只能用 @下一首 提前切换；自动出队仍由 auto_advance_seconds 控制
@@ -605,7 +611,7 @@ hotkeys:
 
 startup:
   # 程序启动后是否按配置自动排队执行“启动游戏”和“进入千星”
-  enabled: true
+  enabled: false
   # 找不到游戏窗口时是否启动游戏
   launch_game: true
   # 是否处理“点击进入”等开门按钮

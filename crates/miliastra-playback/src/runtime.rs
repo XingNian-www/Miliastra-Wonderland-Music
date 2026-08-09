@@ -11,8 +11,8 @@ use tokio::task::{AbortHandle, Id as TaskId, JoinError, JoinHandle as TokioJoinH
 use uuid::Uuid;
 
 use crate::catalog::{
-    BilibiliAdapter, NeteaseAdapter, ProviderId, ProviderRegistry, QqMusicAdapter, SourceAdapter,
-    SourceCatalog,
+    BilibiliAdapter, KugouAccountStatus, KugouAdapter, KugouListenReport, NeteaseAdapter,
+    ProviderId, ProviderRegistry, QqMusicAdapter, SourceAdapter, SourceCatalog,
 };
 use crate::core::{PlaybackCore, PlaybackCoreError};
 use crate::credentials::{CredentialStatus, CredentialStore, ProviderCredential};
@@ -26,6 +26,8 @@ use crate::model::{PlayableTrack, SearchCandidate, SearchQuery};
 
 const COMMAND_CAPACITY: usize = 32;
 const SOURCE_TIMEOUT: Duration = Duration::from_secs(15);
+const REFRESH_CHECK_INTERVAL_MS: u64 = 24 * 60 * 60 * 1000;
+const REFRESH_FAILURE_BACKOFF_MS: u64 = 15 * 60 * 1000;
 
 type Reply<T> = std_mpsc::SyncSender<Result<T, PlaybackError>>;
 
@@ -145,6 +147,12 @@ enum Command {
     Snapshot(Reply<PlaybackSnapshot>),
     Providers(Reply<Vec<ProviderId>>),
     CredentialStatuses(Reply<Vec<CredentialStatus>>),
+    RefreshCredential(ProviderId, Reply<CredentialStatus>),
+    KugouAccountStatus(Reply<KugouAccountStatus>),
+    KugouReportListenSong {
+        mixsongid: String,
+        reply: Reply<KugouListenReport>,
+    },
     SaveCredential(ProviderCredential, Reply<CredentialStatus>),
     Logout(ProviderId, Reply<CredentialStatus>),
     BeginLogin(ProviderId, Reply<LoginSession>),
@@ -193,6 +201,7 @@ struct LoginValidationCompletion {
 
 enum RuntimeEvent {
     Command(Option<Command>),
+    RefreshTick,
     PlayCompleted(Result<PlayCompletion, JoinError>),
     LoginValidationCompleted(Option<Result<(TaskId, LoginValidationCompletion), JoinError>>),
     SearchCompleted(Option<Result<(), JoinError>>),
@@ -213,13 +222,24 @@ impl LyricState {
 }
 
 impl PlaybackRuntime {
-    pub fn start(credential_directory: impl Into<PathBuf>) -> Result<Self, PlaybackError> {
+    pub fn start(
+        credential_directory: impl Into<PathBuf>,
+        kugou_api_base_url: &str,
+    ) -> Result<Self, PlaybackError> {
         let credential_directory = credential_directory.into();
+        let kugou_api_base_url = kugou_api_base_url.to_owned();
         let (commands, command_rx) = mpsc::channel(COMMAND_CAPACITY);
         let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
         let thread = thread::Builder::new()
             .name("miliastra-playback".to_owned())
-            .spawn(move || run_runtime_thread(credential_directory, command_rx, ready_tx))
+            .spawn(move || {
+                run_runtime_thread(
+                    credential_directory,
+                    kugou_api_base_url,
+                    command_rx,
+                    ready_tx,
+                )
+            })
             .map_err(|error| PlaybackError::Startup(error.to_string()))?;
 
         match ready_rx.recv() {
@@ -306,6 +326,24 @@ impl PlaybackHandle {
 
     pub fn credential_statuses(&self) -> Result<Vec<CredentialStatus>, PlaybackError> {
         self.request(Command::CredentialStatuses)
+    }
+
+    pub fn refresh_credential(
+        &self,
+        provider: ProviderId,
+    ) -> Result<CredentialStatus, PlaybackError> {
+        self.request(|reply| Command::RefreshCredential(provider, reply))
+    }
+
+    pub fn kugou_account_status(&self) -> Result<KugouAccountStatus, PlaybackError> {
+        self.request(Command::KugouAccountStatus)
+    }
+
+    pub fn kugou_report_listen_song(
+        &self,
+        mixsongid: String,
+    ) -> Result<KugouListenReport, PlaybackError> {
+        self.request(|reply| Command::KugouReportListenSong { mixsongid, reply })
     }
 
     pub fn save_credential(
@@ -397,6 +435,7 @@ impl LoginOperation {
 
 fn run_runtime_thread(
     credential_directory: PathBuf,
+    kugou_api_base_url: String,
     command_rx: mpsc::Receiver<Command>,
     ready: std_mpsc::SyncSender<Result<(), PlaybackError>>,
 ) {
@@ -419,7 +458,7 @@ fn run_runtime_thread(
                 return;
             }
         };
-        let catalog = match build_catalog(&credentials) {
+        let catalog = match build_catalog(&credentials, &kugou_api_base_url) {
             Ok(catalog) => catalog,
             Err(error) => {
                 let _ = ready.send(Err(error));
@@ -454,13 +493,20 @@ fn run_runtime_thread(
     });
 }
 
-fn build_catalog(credentials: &CredentialStore) -> Result<SourceCatalog, PlaybackError> {
+fn build_catalog(
+    credentials: &CredentialStore,
+    kugou_api_base_url: &str,
+) -> Result<SourceCatalog, PlaybackError> {
     let qqmusic = QqMusicAdapter::new(credentials.clone(), SOURCE_TIMEOUT)
         .map_err(|error| PlaybackError::Startup(error.to_string()))?;
     let netease = NeteaseAdapter::new(credentials.clone(), SOURCE_TIMEOUT)
         .map_err(|error| PlaybackError::Startup(error.to_string()))?;
     let bilibili = BilibiliAdapter::new(credentials.clone(), SOURCE_TIMEOUT)
         .map_err(|error| PlaybackError::Startup(error.to_string()))?;
+    let kugou = Arc::new(
+        KugouAdapter::new(credentials.clone(), SOURCE_TIMEOUT, kugou_api_base_url)
+            .map_err(|error| PlaybackError::Startup(error.to_string()))?,
+    );
     Ok(SourceCatalog::new([
         (
             ProviderId::QqMusic.to_string(),
@@ -474,7 +520,12 @@ fn build_catalog(credentials: &CredentialStore) -> Result<SourceCatalog, Playbac
             ProviderId::Bilibili.to_string(),
             Arc::new(bilibili) as Arc<dyn SourceAdapter>,
         ),
-    ]))
+        (
+            ProviderId::Kugou.to_string(),
+            kugou.clone() as Arc<dyn SourceAdapter>,
+        ),
+    ])
+    .with_kugou_account(kugou as Arc<dyn crate::catalog::KugouAccountAdapter>))
 }
 
 async fn run_commands(
@@ -489,6 +540,8 @@ async fn run_commands(
     let mut pending_login: Option<PendingLoginValidation> = None;
     let mut searches = JoinSet::new();
     let mut login_validations = JoinSet::new();
+    let mut refresh_tick = tokio::time::interval(Duration::from_secs(60));
+    refresh_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         let event = if let Some(play) = pending_play.as_mut() {
             tokio::select! {
@@ -498,6 +551,7 @@ async fn run_commands(
                     RuntimeEvent::LoginValidationCompleted(completion)
                 }
                 command = commands.recv() => RuntimeEvent::Command(command),
+                _ = refresh_tick.tick() => RuntimeEvent::RefreshTick,
                 completion = searches.join_next(), if !searches.is_empty() => {
                     RuntimeEvent::SearchCompleted(completion)
                 }
@@ -509,6 +563,7 @@ async fn run_commands(
                     RuntimeEvent::LoginValidationCompleted(completion)
                 }
                 command = commands.recv() => RuntimeEvent::Command(command),
+                _ = refresh_tick.tick() => RuntimeEvent::RefreshTick,
                 completion = searches.join_next(), if !searches.is_empty() => {
                     RuntimeEvent::SearchCompleted(completion)
                 }
@@ -534,6 +589,10 @@ async fn run_commands(
                 continue;
             }
             RuntimeEvent::SearchCompleted(_) => continue,
+            RuntimeEvent::RefreshTick => {
+                refresh_due_credentials(&core, &credentials).await;
+                continue;
+            }
             RuntimeEvent::LoginValidationCompleted(completion) => {
                 let task_id = match &completion {
                     Some(Ok((task_id, _))) => *task_id,
@@ -693,6 +752,49 @@ async fn run_commands(
             }
             Command::CredentialStatuses(reply) => {
                 let _ = reply.send(credentials.statuses().map_err(internal_error));
+            }
+            Command::RefreshCredential(provider, reply) => {
+                let result = if provider != ProviderId::Kugou {
+                    Err(PlaybackError::Failure(Failure::new(
+                        "unsupported_provider",
+                        "仅支持酷狗账户刷新",
+                    )))
+                } else {
+                    let _ = credentials.mark_refresh_started(provider.as_str());
+                    let result = match core.refresh_kugou_credential().await {
+                        Ok(credential) => credentials
+                            .save(provider.as_str(), credential)
+                            .map_err(internal_error),
+                        Err(error) => Err(PlaybackError::from(error)),
+                    };
+                    let metadata_result = result.as_ref().map(|_| ()).map_err(ToString::to_string);
+                    let next_check = Some(current_epoch_ms().saturating_add(if result.is_ok() {
+                        REFRESH_CHECK_INTERVAL_MS
+                    } else {
+                        REFRESH_FAILURE_BACKOFF_MS
+                    }));
+                    let _ = credentials.mark_refresh_finished(
+                        provider.as_str(),
+                        metadata_result,
+                        next_check,
+                    );
+                    result
+                };
+                let _ = reply.send(result);
+            }
+            Command::KugouAccountStatus(reply) => {
+                let result = core
+                    .kugou_account_status()
+                    .await
+                    .map_err(PlaybackError::from);
+                let _ = reply.send(result);
+            }
+            Command::KugouReportListenSong { mixsongid, reply } => {
+                let _ = reply.send(
+                    core.kugou_report_listen_song(&mixsongid)
+                        .await
+                        .map_err(PlaybackError::from),
+                );
             }
             Command::SaveCredential(credential, reply) => {
                 let provider = credential.provider();
@@ -977,6 +1079,48 @@ fn public_snapshot(
         end_behavior: snapshot.end_behavior,
         failure: snapshot.failure,
     }
+}
+
+async fn refresh_due_credentials(core: &PlaybackCore, credentials: &CredentialStore) {
+    let provider = ProviderId::Kugou;
+    let Ok(status) = credentials.status(provider.as_str()) else {
+        return;
+    };
+    let now = current_epoch_ms();
+    if !status.refresh_ready
+        || status.refresh_state == "failed"
+        || status
+            .next_refresh_check_at_ms
+            .is_some_and(|next_check| next_check > now)
+    {
+        return;
+    }
+    if let Err(error) = credentials.mark_refresh_started(provider.as_str()) {
+        tracing::warn!(%error, "记录酷狗自动刷新状态失败");
+        return;
+    }
+    let result = match core.refresh_kugou_credential().await {
+        Ok(credential) => credentials
+            .save(provider.as_str(), credential)
+            .map(|_| ())
+            .map_err(|error| error.to_string()),
+        Err(error) => Err(error.to_string()),
+    };
+    let next_check = Some(now.saturating_add(if result.is_ok() {
+        REFRESH_CHECK_INTERVAL_MS
+    } else {
+        REFRESH_FAILURE_BACKOFF_MS
+    }));
+    if let Err(error) = credentials.mark_refresh_finished(provider.as_str(), result, next_check) {
+        tracing::warn!(%error, "保存酷狗自动刷新结果失败");
+    }
+}
+
+fn current_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn block_result(result: Result<(), PlaybackCoreError>) -> Result<(), PlaybackError> {
@@ -1404,7 +1548,7 @@ mod tests {
             .search(SearchQuery {
                 keyword: "Test Song".to_owned(),
                 providers: ProviderId::ALL.to_vec(),
-                limit: 3,
+                limit: 4,
             })
             .unwrap();
 
@@ -1635,7 +1779,7 @@ mod tests {
             .unwrap();
         assert!(status.configured);
         assert!(!handle.login_status().unwrap().active);
-        assert_eq!(handle.credential_statuses().unwrap().len(), 3);
+        assert_eq!(handle.credential_statuses().unwrap().len(), 4);
         assert!(!handle.logout(ProviderId::QqMusic).unwrap().configured);
 
         runtime.shutdown().unwrap();

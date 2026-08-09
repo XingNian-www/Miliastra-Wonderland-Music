@@ -22,6 +22,7 @@ use std::thread::{self, sleep};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use self::formal_task::{FormalTaskClient, FormalTaskRuntime};
+use crate::adapters::kugou_api::{KugouApiConfig, KugouApiSidecar};
 use crate::adapters::login_helper::LoginHelperManager;
 use crate::adapters::native_playback::NativePlaybackAdapter;
 use crate::adapters::player::PlayerRuntimeBackend;
@@ -132,7 +133,9 @@ use image::DynamicImage;
 use miliastra_kernel::ai::OpenAiRuntime;
 use miliastra_kernel::clock::SystemClock;
 use miliastra_kernel::identity::BusinessOperationIdAllocator;
-use miliastra_playback::{PlaybackHandle, PlaybackRuntime as NativePlaybackRuntime, TrackKey};
+use miliastra_playback::{
+    PlayableTrack, PlaybackHandle, PlaybackRuntime as NativePlaybackRuntime, TrackKey,
+};
 
 const TARGET_MISSING_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const TARGET_MISSING_BACKOFF_MAX: Duration = Duration::from_secs(60);
@@ -371,6 +374,7 @@ struct PlaybackBundle {
     native_playback: PlaybackHandle,
     login_helper: LoginHelperManager,
     native_playback_runtime: Option<NativePlaybackRuntime>,
+    kugou_api_sidecar: Option<KugouApiSidecar>,
 }
 
 struct BusinessBundle {
@@ -519,6 +523,7 @@ impl FormalTaskExecutionContext {
                     native_playback: self.playback.native_playback.clone(),
                     login_helper: self.playback.login_helper.clone(),
                     native_playback_runtime: None,
+                    kugou_api_sidecar: None,
                 },
                 business: BusinessBundle {
                     business: self.business.business.clone(),
@@ -629,6 +634,18 @@ impl PlaybackStatePort for BusinessPlaybackStateAdapter {
     fn record_song_dedup(&self, candidate: SongDedupCandidate) -> Result<()> {
         self.business
             .record_song_dedup(candidate)
+            .map_err(anyhow::Error::from)
+    }
+
+    fn record_playback_pool_track(&self, track: PlayableTrack) -> Result<()> {
+        self.business
+            .record_playback_pool_track(track)
+            .map_err(anyhow::Error::from)
+    }
+
+    fn playback_pool_available(&self) -> Result<bool> {
+        self.business
+            .playback_pool_available()
             .map_err(anyhow::Error::from)
     }
 
@@ -1049,15 +1066,24 @@ impl ApplicationRuntime {
         let state_store: Arc<dyn miliastra_contracts::StateStore> =
             Arc::new(crate::adapters::file_store::FsStateStore);
         let ocr_device = ProductionOcrDevice::new(ocr_args.clone())?;
-        let native_playback_runtime =
-            NativePlaybackRuntime::start(config.playback.credential_directory.clone())
-                .context("启动原生播放器")?;
+        let kugou_api_sidecar = KugouApiSidecar::start(&KugouApiConfig::new(
+            config.playback.kugou_api_executable.clone(),
+            config.playback.credential_directory.clone(),
+        ))
+        .context("启动酷狗概念版 API")?;
+        let kugou_api_base_url = kugou_api_sidecar.base_url().to_string();
+        let native_playback_runtime = NativePlaybackRuntime::start(
+            config.playback.credential_directory.clone(),
+            &kugou_api_base_url,
+        )
+        .context("启动原生播放器")?;
         let native_playback = native_playback_runtime.handle();
         let login_helper = LoginHelperManager::new(
             native_playback.clone(),
             config.playback.login_helper_executable.clone(),
             config.playback.credential_directory.clone(),
             Duration::from_millis(config.playback.login_timeout_ms),
+            &kugou_api_base_url,
         );
         let playback_adapter = NativePlaybackAdapter::new(native_playback.clone());
         let idiom_chain = IdiomChainService::load(config.idiom_chain.clone())?;
@@ -1077,6 +1103,7 @@ impl ApplicationRuntime {
             config.state.playback_state_path.clone(),
             config.song_dedup.history_path.clone(),
             config.queue.max_size,
+            config.queue.pool_max_size,
             config.song_dedup.clone(),
             system_clock.clone(),
             state_store.clone(),
@@ -1282,6 +1309,7 @@ impl ApplicationRuntime {
                 native_playback,
                 login_helper,
                 native_playback_runtime: Some(native_playback_runtime),
+                kugou_api_sidecar: Some(kugou_api_sidecar),
             },
             business: BusinessBundle {
                 business,

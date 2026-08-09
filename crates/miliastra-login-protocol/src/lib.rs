@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-pub const LOGIN_PROTOCOL_VERSION: u32 = 1;
+pub const LOGIN_PROTOCOL_VERSION: u32 = 3;
 pub const MAX_LOGIN_MESSAGE_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -18,7 +18,16 @@ pub enum CredentialPayload {
     #[serde(rename = "netease")]
     Netease { cookies: BTreeMap<String, String> },
     #[serde(rename = "bilibili")]
-    Bilibili { cookies: BTreeMap<String, String> },
+    Bilibili {
+        cookies: BTreeMap<String, String>,
+        refresh_token: String,
+    },
+    #[serde(rename = "kugou")]
+    Kugou {
+        token: String,
+        userid: String,
+        cookies: BTreeMap<String, String>,
+    },
 }
 
 impl CredentialPayload {
@@ -27,6 +36,7 @@ impl CredentialPayload {
             Self::QqMusic { .. } => "qqmusic",
             Self::Netease { .. } => "netease",
             Self::Bilibili { .. } => "bilibili",
+            Self::Kugou { .. } => "kugou",
         }
     }
 }
@@ -158,6 +168,40 @@ mod tests {
 
         assert_eq!(decoded.version(), LOGIN_PROTOCOL_VERSION);
         assert!(!format!("{decoded:?}").contains("secret"));
+    }
+
+    #[test]
+    fn bilibili_payload_round_trips_independent_refresh_token_and_rejects_legacy_shape() {
+        let message = LoginHelperMessage::success(
+            "bilibili",
+            CredentialPayload::Bilibili {
+                cookies: BTreeMap::from([("SESSDATA".to_owned(), "session".to_owned())]),
+                refresh_token: "refresh-secret".to_owned(),
+            },
+        );
+        let encoded = encode_message(&message).unwrap();
+        let encoded_text = String::from_utf8(encoded.clone()).unwrap();
+        assert!(encoded_text.contains("\"refreshToken\":\"refresh-secret\""));
+        assert!(!encoded_text.contains("ac_time_value"));
+        let decoded = decode_message(&encoded).unwrap();
+        let LoginHelperMessage::Success { credential, .. } = decoded else {
+            panic!("expected success message");
+        };
+        let CredentialPayload::Bilibili {
+            cookies,
+            refresh_token,
+        } = credential
+        else {
+            panic!("expected Bilibili payload");
+        };
+        assert_eq!(refresh_token, "refresh-secret");
+        assert!(!cookies.contains_key("ac_time_value"));
+
+        let legacy = br#"{"status":"success","version":2,"provider":"bilibili","credential":{"kind":"bilibili","cookies":{"SESSDATA":"session","ac_time_value":"legacy-refresh"}}}"#;
+        assert!(matches!(
+            decode_message(legacy),
+            Err(ProtocolError::Json(_))
+        ));
     }
 
     #[test]

@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 use crate::features::card_games::LandlordConfig;
 use crate::features::custom_workflow::{CustomWorkflowConfig, WorkflowTimingConfig};
@@ -313,6 +314,7 @@ impl AppConfig {
             &mut self.templates.friend_confirm,
             &mut self.playback.credential_directory,
             &mut self.playback.login_helper_executable,
+            &mut self.playback.kugou_api_executable,
             &mut self.logging.dir,
             &mut self.state.playback_state_path,
             &mut self.state.hall_state_path,
@@ -842,7 +844,9 @@ pub struct OutputConfig {
 pub struct PlaybackConfig {
     pub credential_directory: PathBuf,
     pub login_helper_executable: PathBuf,
+    pub kugou_api_executable: PathBuf,
     pub login_timeout_ms: u64,
+    pub kugou_api_base_url: String,
 }
 
 impl PlaybackConfig {
@@ -853,8 +857,20 @@ impl PlaybackConfig {
         if self.login_helper_executable.as_os_str().is_empty() {
             bail!("playback.login_helper_executable 不能为空");
         }
+        if self.kugou_api_executable.as_os_str().is_empty() {
+            bail!("playback.kugou_api_executable 不能为空");
+        }
         if self.login_timeout_ms == 0 {
             bail!("playback.login_timeout_ms 必须大于 0");
+        }
+        let base_url = self.kugou_api_base_url.trim();
+        if base_url.is_empty() {
+            bail!("playback.kugou_api_base_url 不能为空");
+        }
+        let url =
+            Url::parse(base_url).with_context(|| "playback.kugou_api_base_url 必须是有效 URL")?;
+        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+            bail!("playback.kugou_api_base_url 必须使用 http 或 https URL");
         }
         Ok(())
     }
@@ -1190,6 +1206,7 @@ stale_timeout_ms: 7500
             &config.templates.friend_confirm,
             &config.playback.credential_directory,
             &config.playback.login_helper_executable,
+            &config.playback.kugou_api_executable,
             &config.logging.dir,
             &config.state.playback_state_path,
             &config.state.hall_state_path,
@@ -1442,7 +1459,7 @@ stale_timeout_ms: 7500
 
     #[test]
     fn startup_validation_rejects_invalid_required_runtime_resources() {
-        let invalid_fields: [ConfigMutation; 13] = [
+        let invalid_fields: [ConfigMutation; 15] = [
             ("ocr.det_model", |config| {
                 config.ocr.det_model = Some(PathBuf::new());
             }),
@@ -1457,6 +1474,9 @@ stale_timeout_ms: 7500
             }),
             ("playback.login_helper_executable", |config| {
                 config.playback.login_helper_executable = PathBuf::new();
+            }),
+            ("playback.kugou_api_executable", |config| {
+                config.playback.kugou_api_executable = PathBuf::new();
             }),
             ("http.port", |config| {
                 config.http.port = 0;
@@ -1475,6 +1495,9 @@ stale_timeout_ms: 7500
             }),
             ("playback.login_timeout_ms", |config| {
                 config.playback.login_timeout_ms = 0;
+            }),
+            ("playback.kugou_api_base_url", |config| {
+                config.playback.kugou_api_base_url.clear();
             }),
             ("hotkeys.pause_key", |config| {
                 config.hotkeys.pause_key.clear();

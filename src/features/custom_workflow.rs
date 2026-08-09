@@ -1732,7 +1732,8 @@ mod tests {
 
     #[test]
     fn default_control_commands_resolve_shared_prefixes_and_duration_arguments() {
-        let app = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).expect("default config");
+        let app =
+            AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).expect("default config");
         let service = CustomWorkflowService::new(app.custom_workflows, defaults());
 
         for (text, workflow, args) in [
@@ -2084,4 +2085,3 @@ mod tests {
         assert_eq!(parse_confirmation("用户：@确认其他"), None);
     }
 }
-

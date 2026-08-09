@@ -58,15 +58,8 @@ pub struct QqMusicAdapter {
     native_lyrics_url: Url,
     device: QqDevice,
     /// 账号 VIP 状态缓存（成功 5 分钟/失败 60 秒），避免轮询频繁打账号接口。
-    account_cache: std::sync::Arc<
-        std::sync::Mutex<
-            Option<(
-                ProviderAccountStatus,
-                std::time::Instant,
-                bool,
-            )>,
-        >,
-    >,
+    account_cache:
+        std::sync::Arc<std::sync::Mutex<Option<(ProviderAccountStatus, std::time::Instant, bool)>>>,
 }
 
 /// QQ 账号状态缓存有效期（查询成功时）。
@@ -793,7 +786,12 @@ impl SourceAdapter for QqMusicAdapter {
         let now = std::time::Instant::now();
         if let Ok(mut guard) = self.account_cache.lock()
             && let Some((status, cached_at, failed)) = guard.as_ref()
-            && cached_at.elapsed() < if *failed { ACCOUNT_CACHE_FAILED_TTL } else { ACCOUNT_CACHE_TTL }
+            && cached_at.elapsed()
+                < if *failed {
+                    ACCOUNT_CACHE_FAILED_TTL
+                } else {
+                    ACCOUNT_CACHE_TTL
+                }
         {
             return Ok(Some(status.clone()));
         }
@@ -1449,7 +1447,9 @@ fn parse_qq_date_ms(value: &str) -> Option<u64> {
     } else {
         value
     };
-    let mut parts = date.split(['-', ' ', ':']).filter_map(|part| part.parse::<u64>().ok());
+    let mut parts = date
+        .split(['-', ' ', ':'])
+        .filter_map(|part| part.parse::<u64>().ok());
     let year = parts.next()?;
     let month = parts.next()?;
     let day = parts.next()?;
@@ -1457,9 +1457,7 @@ fn parse_qq_date_ms(value: &str) -> Option<u64> {
     let minute = parts.next().unwrap_or(0);
     let second = parts.next().unwrap_or(0);
     let days = days_from_civil(year as i64, month as i64, day as i64)?;
-    Some(
-        (days * 86_400 + hour as i64 * 3_600 + minute as i64 * 60 + second as i64) as u64 * 1000,
-    )
+    Some((days * 86_400 + hour as i64 * 3_600 + minute as i64 * 60 + second as i64) as u64 * 1000)
 }
 
 /// 公历转儒略日（days since 1970-01-01）。
@@ -1468,12 +1466,15 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
         return None;
     }
     let adjusted_year = if month <= 2 { year - 1 } else { year };
-    let era = if adjusted_year >= 0 { adjusted_year } else { adjusted_year - 399 } / 400;
+    let era = if adjusted_year >= 0 {
+        adjusted_year
+    } else {
+        adjusted_year - 399
+    } / 400;
     let year_of_era = adjusted_year - era * 400;
     let month_adjusted = month + if month > 2 { -3 } else { 9 };
     let day_of_year = (153 * month_adjusted + 2) / 5 + day - 1;
-    let day_of_era =
-        year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
     Some(era * 146_097 + day_of_era - 719_468)
 }
 

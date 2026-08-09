@@ -167,7 +167,12 @@ fn format_candidate_text(metadata: &TrackMetadata, provider: ProviderId) -> Stri
     } else {
         metadata.artists.join(" / ")
     };
-    format!("{} - {} [{}]", metadata.title, artists, provider_label(provider))
+    format!(
+        "{} - {} [{}]",
+        metadata.title,
+        artists,
+        provider_label(provider)
+    )
 }
 
 /// 点歌展示用的平台简化中文标识。

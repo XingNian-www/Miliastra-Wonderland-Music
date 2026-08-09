@@ -1,4 +1,5 @@
 pub(crate) mod file_store;
+pub(crate) mod kugou_api;
 pub(crate) mod logging;
 pub(crate) mod login_helper;
 pub(crate) mod native_playback;

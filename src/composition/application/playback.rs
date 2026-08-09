@@ -1,5 +1,7 @@
 use super::*;
 
+use miliastra_playback::PlayableTrack;
+
 use crate::features::playback::{
     BackgroundLyricsScope, PlaybackCommandContext, PlaybackCommandPort, PlaybackExecutionPort,
     PlaybackPickedCandidate, PlaybackResult, PlaybackSearchFailure, PlaybackVerification,
@@ -241,6 +243,16 @@ impl PlaybackExecutionPort for ApplicationRuntime {
 
     fn playback_queue(&mut self) -> Result<Vec<QueueItem>> {
         ApplicationRuntime::playback_queue(self)
+    }
+
+    fn pick_playback_pool_track(
+        &mut self,
+        exclude: Option<&miliastra_playback::TrackKey>,
+    ) -> Result<Option<PlayableTrack>> {
+        self.business
+            .business
+            .pick_playback_pool_track(exclude)
+            .map_err(anyhow::Error::from)
     }
 
     fn remove_playback_queue(&mut self, removal: QueueRemoval) -> Result<()> {

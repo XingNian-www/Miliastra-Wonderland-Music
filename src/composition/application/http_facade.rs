@@ -163,9 +163,10 @@ impl HttpCommandPort for ApplicationHttpCommandFacade {
                 "qqmusic" => ("点歌", SongSource::QqMusic),
                 "netease" => ("网易点歌", SongSource::Netease),
                 "bilibili" => ("B站点歌", SongSource::Bilibili),
+                "kugou" => ("酷狗点歌", SongSource::Kugou),
                 _ => {
                     return Err(HttpCommandError::bad_request(
-                        "远程点歌source只允许qqmusic、netease或bilibili",
+                        "远程点歌source只允许qqmusic、netease、bilibili或kugou",
                     ));
                 }
             }
@@ -425,12 +426,6 @@ fn validate_track_identity(
             let Some(locator) = locator else {
                 return Ok(());
             };
-            if let Some(locator_track) = locator.strip_prefix("qqmusic:v1:") {
-                if !is_ascii_alphanumeric(locator_track) {
-                    return Err(HttpCommandError::bad_request("resolverLocator格式无效"));
-                }
-                return validate_locator_track(track_id, locator_track);
-            }
             let Some(value) = locator.strip_prefix("qqmusic:v2:") else {
                 return Err(HttpCommandError::bad_request("resolverLocator格式无效"));
             };
@@ -476,11 +471,48 @@ fn validate_track_identity(
             }
             validate_locator_track(track_id, locator_track)
         }
+        ProviderId::Kugou => {
+            if track_id.is_empty()
+                || !track_id
+                    .chars()
+                    .all(|character| character.is_ascii_hexdigit())
+            {
+                return Err(HttpCommandError::bad_request(
+                    "trackRef.key.id不是有效的酷狗歌曲Hash",
+                ));
+            }
+            let Some(locator) = locator else {
+                return Ok(());
+            };
+            let mut parts = locator.split(':');
+            if parts.next() != Some("kugou") {
+                return Err(HttpCommandError::bad_request("resolverLocator格式无效"));
+            }
+            let Some(locator_track) = parts.next() else {
+                return Err(HttpCommandError::bad_request("resolverLocator格式无效"));
+            };
+            let Some(album_id) = parts.next() else {
+                return Err(HttpCommandError::bad_request("resolverLocator格式无效"));
+            };
+            let Some(album_audio_id) = parts.next() else {
+                return Err(HttpCommandError::bad_request("resolverLocator格式无效"));
+            };
+            if parts.next().is_some()
+                || !locator_track
+                    .chars()
+                    .all(|character| character.is_ascii_hexdigit())
+                || !album_id.bytes().all(|byte| byte.is_ascii_digit())
+                || !album_audio_id.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                return Err(HttpCommandError::bad_request("resolverLocator格式无效"));
+            }
+            validate_locator_track(track_id, locator_track)
+        }
     }
 }
 
 fn validate_locator_track(track_id: &str, locator_track: &str) -> Result<(), HttpCommandError> {
-    if locator_track != track_id {
+    if !locator_track.eq_ignore_ascii_case(track_id) {
         return Err(HttpCommandError::bad_request(
             "resolverLocator曲目与trackRef不一致",
         ));
@@ -572,6 +604,23 @@ impl HttpLoginPort for ApplicationHttpLoginFacade {
     fn logout(&self, provider: ProviderId) -> Result<CredentialStatus, HttpLoginError> {
         self.manager.logout(provider).map_err(login_error)
     }
+
+    fn refresh(&self, provider: ProviderId) -> Result<CredentialStatus, HttpLoginError> {
+        self.manager
+            .refresh_credential(provider)
+            .map_err(login_error)
+    }
+
+    fn kugou_status(&self) -> Result<miliastra_playback::KugouAccountStatus, HttpLoginError> {
+        self.manager.kugou_status().map_err(login_error)
+    }
+
+    fn kugou_report(
+        &self,
+        mixsongid: String,
+    ) -> Result<miliastra_playback::KugouListenReport, HttpLoginError> {
+        self.manager.kugou_report(mixsongid).map_err(login_error)
+    }
 }
 
 fn provider_view(view: ProviderView) -> HttpProviderView {
@@ -579,6 +628,13 @@ fn provider_view(view: ProviderView) -> HttpProviderView {
         provider: view.provider,
         configured: view.configured,
         fields: view.fields,
+        refresh_supported: view.refresh_supported,
+        manual_refresh_supported: view.manual_refresh_supported,
+        refresh_ready: view.refresh_ready,
+        refresh_state: view.refresh_state,
+        last_refresh_at_ms: view.last_refresh_at_ms,
+        next_refresh_check_at_ms: view.next_refresh_check_at_ms,
+        last_refresh_error: view.last_refresh_error,
     }
 }
 

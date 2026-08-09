@@ -227,7 +227,7 @@ mod tests {
         fn dispatch(&mut self, control: &PlayerControl) -> ControlDispatch {
             ControlDispatch::immediate(match control {
                 PlayerControl::SetVolume(volume) => {
-                    ControlDispatchOutcome::acknowledged(&format!("volume {volume}"))
+                    ControlDispatchOutcome::acknowledged(format!("volume {volume}").as_str())
                 }
                 _ => ControlDispatchOutcome::acknowledged("ok"),
             })

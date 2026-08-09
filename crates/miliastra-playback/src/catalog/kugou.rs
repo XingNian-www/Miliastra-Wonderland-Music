@@ -44,15 +44,20 @@ pub struct KugouListenReport {
     pub message: String,
 }
 
+/// 账号 VIP 状态缓存条目（判定结果、时间、是否失败）。
+type VipCacheEntry = Option<(Option<bool>, std::time::Instant, bool)>;
+/// 账号状态缓存条目（状态、时间、是否失败）。
+type AccountCacheEntry = Option<(KugouAccountStatus, std::time::Instant, bool)>;
+
 #[derive(Clone)]
 pub struct KugouAdapter {
     client: Client,
     credentials: CredentialStore,
     api_base_url: Url,
     /// 账号 VIP 状态缓存（/user/vip/detail 查询较重且接口不稳定）。
-    vip_cache: Arc<std::sync::Mutex<Option<(Option<bool>, std::time::Instant, bool)>>>,
+    vip_cache: Arc<std::sync::Mutex<VipCacheEntry>>,
     /// 账号状态整体缓存（成功 5 分钟/失败 60 秒），防止轮询频繁打账号接口触发风控。
-    account_cache: Arc<std::sync::Mutex<Option<(KugouAccountStatus, std::time::Instant, bool)>>>,
+    account_cache: Arc<std::sync::Mutex<AccountCacheEntry>>,
 }
 
 /// 账号 VIP 状态缓存有效期（判定成功时）。
@@ -334,7 +339,7 @@ impl KugouAdapter {
     /// 查询账号 VIP 状态（带缓存）。`None` 表示查询失败、无法判定。
     async fn account_vip_status(&self) -> Option<bool> {
         let now = std::time::Instant::now();
-        if let Ok(mut guard) = self.vip_cache.lock()
+        if let Ok(guard) = self.vip_cache.lock()
             && let Some((status, cached_at, failed)) = guard.as_ref()
             && cached_at.elapsed()
                 < if *failed {
@@ -391,7 +396,7 @@ impl KugouAdapter {
     /// 账号接口带整体缓存（成功 5 分钟/失败 60 秒），避免频繁轮询触发酷狗风控。
     pub async fn account_status(&self) -> Result<KugouAccountStatus, CatalogError> {
         let now = std::time::Instant::now();
-        if let Ok(mut guard) = self.account_cache.lock()
+        if let Ok(guard) = self.account_cache.lock()
             && let Some((status, cached_at, failed)) = guard.as_ref()
             && cached_at.elapsed()
                 < if *failed {

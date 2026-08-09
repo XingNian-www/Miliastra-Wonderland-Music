@@ -1136,14 +1136,14 @@ mod tests {
         let (core, _) = core(vec![("qq".to_owned(), source)]);
 
         for index in 0..(RESOLVE_CACHE_MAX_ENTRIES + 2) {
-            let key = SongKey::new("qq", &format!("song-{index}")).unwrap();
+            let key = SongKey::new("qq", format!("song-{index}").as_str()).unwrap();
             core.preload(key, None).await.unwrap();
         }
         assert_eq!(calls.load(Ordering::SeqCst), RESOLVE_CACHE_MAX_ENTRIES + 2);
 
         // 最旧的两首已被淘汰：重新解析。
         for index in 0..2 {
-            let key = SongKey::new("qq", &format!("song-{index}")).unwrap();
+            let key = SongKey::new("qq", format!("song-{index}").as_str()).unwrap();
             core.play(key, None, EndBehavior::NotifyController)
                 .await
                 .unwrap();
@@ -1151,8 +1151,11 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), RESOLVE_CACHE_MAX_ENTRIES + 4);
 
         // 最新的仍在缓存中：命中。
-        let newest =
-            SongKey::new("qq", &format!("song-{}", RESOLVE_CACHE_MAX_ENTRIES + 1)).unwrap();
+        let newest = SongKey::new(
+            "qq",
+            format!("song-{}", RESOLVE_CACHE_MAX_ENTRIES + 1).as_str(),
+        )
+        .unwrap();
         core.play(newest, None, EndBehavior::NotifyController)
             .await
             .unwrap();

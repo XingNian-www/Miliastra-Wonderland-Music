@@ -70,38 +70,56 @@ impl<'a> ChatCommandRouter<'a> {
         envelope: &CommandEnvelope,
         active_entertainment: Option<EntertainmentKind>,
     ) -> Option<RoutedCommand> {
+        match self.route_match(envelope, active_entertainment) {
+            Some(matched) => Some(RoutedCommand::from_envelope(envelope, matched)),
+            // OCR 容错：命令文本带噪声标点时，用清理后的文本重试一次。
+            // 仅影响路由匹配，原始文本与观察信息仍取自原 envelope。
+            None => {
+                let tolerant = ocr_tolerant_command_text(envelope.command_text())?;
+                let tolerant_envelope = envelope.with_command_text(tolerant);
+                let matched = self.route_match(&tolerant_envelope, active_entertainment)?;
+                Some(RoutedCommand::from_envelope(envelope, matched))
+            }
+        }
+    }
+
+    fn route_match(
+        &self,
+        envelope: &CommandEnvelope,
+        active_entertainment: Option<EntertainmentKind>,
+    ) -> Option<FeatureCommandMatch<ModuleCommand>> {
         let module = self.select_module(envelope, active_entertainment)?;
-        let matched =
-            match module {
-                ChatCommandModule::SongRequest => SongCommand::parse_chat(envelope)
-                    .map(|matched| matched.map(ModuleCommand::SongRequest)),
-                ChatCommandModule::Playback => PlaybackCommand::parse_chat(envelope)
-                    .map(|matched| matched.map(ModuleCommand::Playback)),
-                ChatCommandModule::Hall => HallCommand::parse_chat(envelope)
-                    .map(|matched| matched.map(ModuleCommand::Hall)),
-                ChatCommandModule::Administration => AdministrationCommand::parse_chat(envelope)
-                    .map(|matched| matched.map(ModuleCommand::Administration)),
-                ChatCommandModule::IdiomChain => {
-                    route_idiom(envelope).map(|matched| matched.map(ModuleCommand::IdiomChain))
-                }
-                ChatCommandModule::CardGame => {
-                    route_card_game(envelope).map(|matched| matched.map(ModuleCommand::CardGame))
-                }
-                ChatCommandModule::TurtleSoup => route_turtle_soup(envelope)
-                    .map(|matched| matched.map(ModuleCommand::TurtleSoup)),
-                ChatCommandModule::Undercover => {
-                    route_undercover(envelope).map(|matched| matched.map(ModuleCommand::Undercover))
-                }
-                ChatCommandModule::Invite => InviteCommand::parse_chat(envelope)
-                    .map(|matched| matched.map(ModuleCommand::Invite)),
-                ChatCommandModule::Moderation => ModerationCommand::parse_chat(envelope)
-                    .map(|matched| matched.map(ModuleCommand::Moderation)),
-                ChatCommandModule::CustomWorkflow => self
-                    .custom_workflow?
-                    .parse_chat(envelope)
-                    .map(|matched| matched.map(ModuleCommand::CustomWorkflow)),
-            }?;
-        Some(RoutedCommand::from_envelope(envelope, matched))
+        match module {
+            ChatCommandModule::SongRequest => SongCommand::parse_chat(envelope)
+                .map(|matched| matched.map(ModuleCommand::SongRequest)),
+            ChatCommandModule::Playback => PlaybackCommand::parse_chat(envelope)
+                .map(|matched| matched.map(ModuleCommand::Playback)),
+            ChatCommandModule::Hall => {
+                HallCommand::parse_chat(envelope).map(|matched| matched.map(ModuleCommand::Hall))
+            }
+            ChatCommandModule::Administration => AdministrationCommand::parse_chat(envelope)
+                .map(|matched| matched.map(ModuleCommand::Administration)),
+            ChatCommandModule::IdiomChain => {
+                route_idiom(envelope).map(|matched| matched.map(ModuleCommand::IdiomChain))
+            }
+            ChatCommandModule::CardGame => {
+                route_card_game(envelope).map(|matched| matched.map(ModuleCommand::CardGame))
+            }
+            ChatCommandModule::TurtleSoup => {
+                route_turtle_soup(envelope).map(|matched| matched.map(ModuleCommand::TurtleSoup))
+            }
+            ChatCommandModule::Undercover => {
+                route_undercover(envelope).map(|matched| matched.map(ModuleCommand::Undercover))
+            }
+            ChatCommandModule::Invite => InviteCommand::parse_chat(envelope)
+                .map(|matched| matched.map(ModuleCommand::Invite)),
+            ChatCommandModule::Moderation => ModerationCommand::parse_chat(envelope)
+                .map(|matched| matched.map(ModuleCommand::Moderation)),
+            ChatCommandModule::CustomWorkflow => self
+                .custom_workflow?
+                .parse_chat(envelope)
+                .map(|matched| matched.map(ModuleCommand::CustomWorkflow)),
+        }
     }
 
     fn select_at_module(&self, envelope: &CommandEnvelope) -> Option<ChatCommandModule> {
@@ -258,6 +276,25 @@ fn route_undercover(envelope: &CommandEnvelope) -> Option<FeatureCommandMatch<Un
         .or_else(|| UndercoverCommand::parse_active_chat(envelope))
 }
 
+/// OCR 容错：去掉命令文本首尾的噪声标点后重试路由。
+/// 覆盖常见抖动（如 `#海龟汤，` 尾部粘连标点），不处理文本内部的形近字差异。
+fn ocr_tolerant_command_text(text: &str) -> Option<String> {
+    let trimmed = text.trim_end_matches(OCR_TRAILING_NOISE);
+    let trimmed = trimmed.trim_start_matches(OCR_LEADING_NOISE);
+    (!trimmed.is_empty() && trimmed != text).then(|| trimmed.to_string())
+}
+
+/// 命令尾部常见 OCR 噪声：中文/英文标点、括号、引号、省略号与空白。
+const OCR_TRAILING_NOISE: &[char] = &[
+    '，', ',', '。', '.', '！', '!', '？', '?', '、', '；', ';', '：', ':', '·', '…', '~', '～',
+    '—', '」', '』', '”', '’', '）', ')', '】', ']', ' ', '\t', '　',
+];
+
+/// 命令头部常见 OCR 噪声：空白与普通标点（# / @ 前缀在 envelope 中已剥离）。
+const OCR_LEADING_NOISE: &[char] = &[
+    ' ', '\t', '　', '，', ',', '。', '.', '！', '!', '？', '?', '、', '；', ';', '：', ':',
+];
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -306,6 +343,34 @@ mod tests {
                 "ordinary command was reserved: {message_type} {command}"
             );
         }
+    }
+
+    #[test]
+    fn ocr_tolerant_command_text_strips_leading_and_trailing_noise() {
+        assert_eq!(
+            ocr_tolerant_command_text("海龟汤，").as_deref(),
+            Some("海龟汤")
+        );
+        assert_eq!(
+            ocr_tolerant_command_text("下一首。！").as_deref(),
+            Some("下一首")
+        );
+        assert_eq!(ocr_tolerant_command_text("，帮助").as_deref(), Some("帮助"));
+        assert_eq!(ocr_tolerant_command_text("海龟汤"), None);
+        assert_eq!(ocr_tolerant_command_text("，"), None);
+    }
+
+    #[test]
+    fn route_retries_with_ocr_tolerant_text() {
+        let router = ChatCommandRouter::without_custom_workflow();
+        // 尾部粘连标点：原文本无法匹配，容错重试后命中。
+        let routed = router.route(&envelope("blue", "#海龟汤，"), None);
+        assert!(routed.is_some(), "尾部标点应通过容错命中海龟汤开局");
+        let routed = router.route(&envelope("blue", "@帮助。"), None);
+        assert!(routed.is_some(), "尾部标点应通过容错命中帮助命令");
+        // 原始 user_command 保留，便于回显与日志关联原文本。
+        let routed = router.route(&envelope("blue", "@帮助。"), None).unwrap();
+        assert_eq!(routed.user_command, "@帮助。");
     }
 
     #[test]

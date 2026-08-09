@@ -467,6 +467,73 @@ fn establish_primary_baseline(
     observed
 }
 
+/// 无法与旧画面对应时的新基线建立：
+/// - 新画面含旧基线见过的消息 → 判定为聊天滚动（旧消息被顶出、新消息滚入），
+///   按内容对回旧基线，未见过的消息保留为未处理（命令不会丢）；
+/// - 新画面完全没有旧消息 → 判定为界面切换（弹窗/切屏），全部视为已处理，避免误判。
+fn rebase_primary_baseline(
+    state: &mut ChatObservationState,
+    messages: Vec<ChatMessage>,
+) -> Vec<PrimaryObservedMessage> {
+    let known = state.primary_visible.iter().any(|previous| {
+        messages.iter().any(|message| {
+            previous.message_type == message.message_type
+                && previous.text_key == normalize_primary_text(&message.text)
+        })
+    }) || messages.is_empty();
+    if !known {
+        return establish_primary_baseline(state, messages);
+    }
+    state.primary_initialized = true;
+    state.primary_rebase_candidate = None;
+    let mut consumed = vec![false; state.primary_visible.len()];
+    let mut tracked = Vec::with_capacity(messages.len());
+    let mut observed = Vec::with_capacity(messages.len());
+    for message in messages {
+        let text_key = normalize_primary_text(&message.text);
+        let matched = state
+            .primary_visible
+            .iter()
+            .enumerate()
+            .find(|(index, previous)| {
+                !consumed[*index]
+                    && previous.message_type == message.message_type
+                    && previous.text_key == text_key
+            })
+            .map(|(index, previous)| {
+                consumed[index] = true;
+                previous
+            });
+        match matched {
+            Some(previous) => {
+                let next = PrimaryTrackedMessage {
+                    id: previous.id.clone(),
+                    message_type: message.message_type.clone(),
+                    text_key,
+                    handled: previous.handled,
+                };
+                observed.push(PrimaryObservedMessage {
+                    id: next.id.clone(),
+                    message,
+                    is_new: false,
+                });
+                tracked.push(next);
+            }
+            None => {
+                let next = new_primary_tracked_message(state, &message, false);
+                observed.push(PrimaryObservedMessage {
+                    id: next.id.clone(),
+                    message,
+                    is_new: true,
+                });
+                tracked.push(next);
+            }
+        }
+    }
+    state.primary_visible = tracked;
+    observed
+}
+
 fn handle_primary_lost_overlap(
     state: &mut ChatObservationState,
     messages: Vec<ChatMessage>,
@@ -486,7 +553,7 @@ fn handle_primary_lost_overlap(
                 "一级聊天连续 {} 次无法与旧画面对应，已把当前画面作为新基线；为避免误判，不执行其中命令",
                 candidate.stable_samples
             );
-            return establish_primary_baseline(state, messages);
+            return rebase_primary_baseline(state, messages);
         }
     } else {
         state.primary_rebase_candidate = Some(PrimaryRebaseCandidate {
@@ -811,6 +878,61 @@ mod tests {
                 .iter()
                 .all(|message| !message.is_new)
         );
+    }
+
+    #[test]
+    fn primary_rebase_after_scroll_keeps_unhandled_commands() {
+        let shared = ChatObservationShared::new();
+        publish_primary(
+            &shared,
+            vec![
+                message_at("消息1", 0, 10),
+                message_at("消息2", 20, 20),
+                message_at("消息3", 40, 30),
+            ],
+        );
+
+        // 画面头部多出无法对应的新消息（overlap 失败），但画面仍含旧消息 → 判定聊天滚动。
+        let rolling = vec![message_at("不同", 0, 5), message_at("消息3", 40, 30)];
+        let first_lost = publish_primary(&shared, rolling.clone());
+        assert!(primary_messages(&first_lost).is_empty());
+        let settled = publish_primary(&shared, rolling);
+
+        let messages = primary_messages(&settled);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.is_new)
+                .collect::<Vec<_>>(),
+            vec![true, false]
+        );
+    }
+
+    #[test]
+    fn primary_rebase_after_screen_switch_marks_everything_handled() {
+        let shared = ChatObservationShared::new();
+        publish_primary(
+            &shared,
+            vec![
+                message_at("消息1", 0, 10),
+                message_at("消息2", 20, 20),
+                message_at("消息3", 40, 30),
+            ],
+        );
+
+        // 画面完全无旧消息 → 判定界面切换，全部视为已处理，避免误判。
+        let switched = vec![
+            message_at("完全不同A", 0, 5),
+            message_at("完全不同B", 20, 15),
+        ];
+        let first_lost = publish_primary(&shared, switched.clone());
+        assert!(primary_messages(&first_lost).is_empty());
+        let settled = publish_primary(&shared, switched);
+
+        let messages = primary_messages(&settled);
+        assert_eq!(messages.len(), 2);
+        assert!(messages.iter().all(|message| !message.is_new));
     }
 
     #[test]

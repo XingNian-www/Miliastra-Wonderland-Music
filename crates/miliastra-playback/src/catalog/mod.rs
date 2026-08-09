@@ -17,10 +17,18 @@ use crate::lyrics::TimedLyrics;
 pub trait KugouAccountAdapter: Send + Sync + 'static {
     async fn refresh_token(&self) -> Result<ProviderCredential, CatalogError>;
     async fn account_status(&self) -> Result<kugou::KugouAccountStatus, CatalogError>;
-    async fn report_listen_song(
+    async fn claim_vip(&self) -> Result<kugou::KugouListenReport, CatalogError>;
+    async fn upgrade_vip(&self) -> Result<kugou::KugouListenReport, CatalogError>;
+}
+
+/// 支持手动凭据刷新的平台适配器（QQ 音乐、哔哩哔哩）。
+/// 刷新成功后返回新凭据；返回 `None` 表示当前凭据无需刷新。
+#[async_trait]
+pub trait CredentialRefreshAdapter: Send + Sync + 'static {
+    async fn refresh_credential(
         &self,
-        mixsongid: &str,
-    ) -> Result<kugou::KugouListenReport, CatalogError>;
+        credential: &ProviderCredential,
+    ) -> Result<Option<ProviderCredential>, CatalogError>;
 }
 
 pub use crate::domain::Failure;
@@ -39,6 +47,10 @@ pub enum CatalogError {
     AuthRequired(String),
     #[error("source credential was rejected: {0}")]
     CredentialRejected(String),
+    #[error("track requires VIP membership: {0}")]
+    VipRequired(String),
+    #[error("track has no copyright: {0}")]
+    NoCopyright(String),
     #[error("track is unavailable: {0}")]
     Unavailable(String),
     #[error("source rate limit reached: {0}")]
@@ -73,6 +85,8 @@ impl CatalogError {
         let (code, retryable) = match self {
             Self::AuthRequired(_) => ("provider_auth_required", false),
             Self::CredentialRejected(_) => ("relogin_required", false),
+            Self::VipRequired(_) => ("track_vip_required", false),
+            Self::NoCopyright(_) => ("track_no_copyright", false),
             Self::Unavailable(_) => ("track_unavailable", false),
             Self::RateLimited(_) => ("provider_rate_limited", true),
             Self::TimedOut(_) => ("provider_timeout", true),
@@ -111,6 +125,17 @@ pub trait SourceAdapter: Send + Sync + 'static {
         key: &SongKey,
         locator: Option<&ResolverLocator>,
     ) -> Result<StreamSource, CatalogError>;
+    /// 搜索候选的真实可用性探测：默认实际解析一次播放流确认。
+    /// 平台有权威权限接口时可覆盖（如酷狗 /privilege/lite 的 pay_type）。
+    /// 返回 `Ok(eligibility)` 表示已确认；`Err` 透传探测错误（认证/限流/超时等无法确认）。
+    async fn probe_eligibility(
+        &self,
+        key: &SongKey,
+        locator: Option<&ResolverLocator>,
+    ) -> Result<PlaybackEligibility, CatalogError> {
+        let _ = self.resolve(key, locator).await?;
+        Ok(PlaybackEligibility::Eligible)
+    }
     async fn lyrics(
         &self,
         _key: &SongKey,
@@ -118,12 +143,32 @@ pub trait SourceAdapter: Send + Sync + 'static {
     ) -> Result<Option<TimedLyrics>, CatalogError> {
         Ok(None)
     }
+    /// 平台账号状态（登录态/昵称/VIP）。默认不支持，返回 None。
+    async fn account_status(&self) -> Result<Option<ProviderAccountStatus>, CatalogError> {
+        Ok(None)
+    }
+}
+
+/// 平台账号状态（web 面板登录卡片展示）。
+#[derive(Clone, Debug, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderAccountStatus {
+    pub logged_in: bool,
+    pub user_id: Option<String>,
+    pub nickname: Option<String>,
+    pub vip: bool,
+    pub vip_type: Option<String>,
+    pub vip_expire_at_ms: Option<u64>,
+    /// 登录方式标识（如 QQ 音乐 "qq"/"wechat"）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub login_method: Option<String>,
 }
 
 #[derive(Clone, Default)]
 pub struct SourceCatalog {
     adapters: Arc<HashMap<String, Arc<dyn SourceAdapter>>>,
     kugou_account: Option<Arc<dyn KugouAccountAdapter>>,
+    refresh_adapters: Arc<HashMap<String, Arc<dyn CredentialRefreshAdapter>>>,
 }
 
 impl SourceCatalog {
@@ -132,6 +177,7 @@ impl SourceCatalog {
         Self {
             adapters: Arc::new(adapters),
             kugou_account: None,
+            refresh_adapters: Arc::new(HashMap::new()),
         }
     }
 
@@ -144,8 +190,35 @@ impl SourceCatalog {
         self.kugou_account.clone()
     }
 
+    pub fn with_refresh_adapter(
+        mut self,
+        provider: &str,
+        adapter: Arc<dyn CredentialRefreshAdapter>,
+    ) -> Self {
+        Arc::make_mut(&mut self.refresh_adapters).insert(provider.to_owned(), adapter);
+        self
+    }
+
+    pub fn refresh_adapter(
+        &self,
+        provider: &str,
+    ) -> Option<Arc<dyn CredentialRefreshAdapter>> {
+        self.refresh_adapters.get(provider).cloned()
+    }
+
     pub fn get(&self, source: &str) -> Option<Arc<dyn SourceAdapter>> {
         self.adapters.get(source).cloned()
+    }
+
+    /// 查询平台账号状态（QQ 音乐/网易云）；平台不支持或未登录时返回 None。
+    pub async fn account_status(
+        &self,
+        source: &str,
+    ) -> Result<Option<ProviderAccountStatus>, CatalogError> {
+        let adapter = self.get(source).ok_or_else(|| {
+            CatalogError::UnknownSource(format!("unknown source: {source}"))
+        })?;
+        adapter.account_status().await
     }
 
     pub fn sources(&self) -> Vec<String> {

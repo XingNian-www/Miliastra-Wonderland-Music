@@ -7,9 +7,7 @@ use miliastra_playback::{PlayableTrack, TrackKey};
 use crate::features::song_request::SearchCandidate;
 
 use super::dedup::SongDedupCandidate;
-use super::format::{
-    format_play_message, format_time, playback_progress_restarted, playback_remaining_seconds,
-};
+use super::format::{format_play_message, playback_remaining_seconds};
 use super::state::{
     ActivePlaybackRequest, ConfirmedPlaybackState, ObservationReliability, PauseReason,
     PlaybackObservation, PlaybackRuntimeState, PlaybackSessionBinding, SessionReconciliation,
@@ -18,7 +16,7 @@ use crate::features::playback::{
     MatchConfig, PlaybackControllerSnapshot, PlaybackStateUpdate, PlaybackTimingConfig,
     PlayerStatus, QueueConfig,
 };
-use miliastra_kernel::clock::{Clock, Delay, WallClock};
+use miliastra_kernel::clock::{Clock, WallClock};
 
 pub(crate) trait MusicPlayerBackend: Clone + Send + Sync + 'static {
     fn status(&self) -> Result<PlayerStatus>;
@@ -96,51 +94,6 @@ pub(crate) trait PlaybackStatePort: Clone + Send + Sync + 'static {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) enum PlaybackIdentityDecision {
-    Match { score: f64, reason: String },
-    NoMatch { score: f64, reason: String },
-    Unavailable { reason: String },
-}
-
-enum CrossSourceReconciliation {
-    Pending,
-    Match {
-        status: PlayerStatus,
-        score: f64,
-        reason: String,
-    },
-    NoMatch {
-        status: PlayerStatus,
-        score: f64,
-        reason: String,
-    },
-    Unavailable {
-        status: PlayerStatus,
-        reason: String,
-    },
-}
-
-pub(crate) trait PlaybackIdentityJudge: Send + Sync {
-    fn judge(&self, request: &PlaybackRequest, status: &PlayerStatus) -> PlaybackIdentityDecision;
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) struct DisabledPlaybackIdentityJudge;
-
-impl PlaybackIdentityJudge for DisabledPlaybackIdentityJudge {
-    fn judge(
-        &self,
-        _request: &PlaybackRequest,
-        _status: &PlayerStatus,
-    ) -> PlaybackIdentityDecision {
-        PlaybackIdentityDecision::Unavailable {
-            reason: "跨源同曲判断未启用".to_string(),
-        }
-    }
-}
-
 #[derive(Clone)]
 pub(crate) struct PlayerController<B: MusicPlayerBackend, S: PlaybackStatePort> {
     backend: B,
@@ -148,30 +101,19 @@ pub(crate) struct PlayerController<B: MusicPlayerBackend, S: PlaybackStatePort> 
     timing: PlaybackTimingConfig,
     queue: QueueConfig,
     matching: MatchConfig,
-    identity_judge: Arc<dyn PlaybackIdentityJudge>,
     clock: Arc<dyn Clock>,
     wall_clock: Arc<dyn WallClock>,
-    delay: Arc<dyn Delay>,
 }
 
 #[derive(Clone)]
 pub(crate) struct PlaybackTimePorts {
     clock: Arc<dyn Clock>,
     wall_clock: Arc<dyn WallClock>,
-    delay: Arc<dyn Delay>,
 }
 
 impl PlaybackTimePorts {
-    pub(crate) fn new(
-        clock: Arc<dyn Clock>,
-        wall_clock: Arc<dyn WallClock>,
-        delay: Arc<dyn Delay>,
-    ) -> Self {
-        Self {
-            clock,
-            wall_clock,
-            delay,
-        }
+    pub(crate) fn new(clock: Arc<dyn Clock>, wall_clock: Arc<dyn WallClock>) -> Self {
+        Self { clock, wall_clock }
     }
 }
 
@@ -243,17 +185,8 @@ pub(crate) enum PlaybackNavigation {
 
 #[derive(Clone, Debug)]
 struct PlaybackAttempt {
-    initial_key: Option<TrackKey>,
-    initial_progress: f64,
-    requested_key: TrackKey,
     previous_playback: PlaybackRuntimeState,
     started_at_ms: u64,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct PlaybackMismatch {
-    pub(crate) status: PlayerStatus,
-    pub(crate) local_reason: String,
 }
 
 #[derive(Clone, Debug)]
@@ -262,11 +195,6 @@ pub(crate) enum PlaybackVerification {
         status: PlayerStatus,
         message: String,
     },
-    NoSource {
-        status: Option<PlayerStatus>,
-        reason: String,
-    },
-    MismatchedCandidate(PlaybackMismatch),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -286,15 +214,12 @@ pub(crate) struct QueueAdvanceContext {
     pub(crate) queue_empty: bool,
     pub(crate) has_pending_playback_task: bool,
     pub(crate) command_executing: bool,
-    pub(crate) song_command_executing: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum QueueAdvanceDecision {
     None,
     PlaybackStateChanged,
-    PauseForQueue,
-    ResumeIfIdle,
     AdvanceQueue { reason: &'static str },
 }
 
@@ -305,7 +230,6 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         timing: &PlaybackTimingConfig,
         queue: &QueueConfig,
         matching: &MatchConfig,
-        identity_judge: Arc<dyn PlaybackIdentityJudge>,
         time: PlaybackTimePorts,
     ) -> Self {
         Self {
@@ -314,10 +238,8 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             timing: timing.clone(),
             queue: queue.clone(),
             matching: matching.clone(),
-            identity_judge,
             clock: time.clock,
             wall_clock: time.wall_clock,
-            delay: time.delay,
         }
     }
 
@@ -325,6 +247,12 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         let status = self.backend.status()?;
         self.record_observation(&status, classify_observation(&status))?;
         Ok(status)
+    }
+
+    /// 监控循环使用的轻量读取：不做观测记录，避免每轮轮询重复记录。
+    /// 必要的观测记录由决策路径（状态转移、外部播放确认）负责。
+    pub(crate) fn monitor_status(&self) -> Result<PlayerStatus> {
+        self.backend.status()
     }
 
     pub(crate) fn pause_by_user(&self) -> Result<String> {
@@ -513,23 +441,8 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
     }
 
     fn begin_playback_attempt(&self, request: &PlaybackRequest) -> Result<PlaybackAttempt> {
-        let requested_key = request
-            .track
-            .as_ref()
-            .map(|track| track.track_ref.key.clone())
-            .ok_or_else(|| anyhow!("播放请求缺少结构化曲目"))?;
         self.clear_external_playback_tracker()?;
         let previous_playback = self.playback_snapshot()?;
-        let initial = self
-            .backend
-            .status()
-            .map(|status| {
-                (
-                    status.current_track.map(|track| track.track_ref.key),
-                    status.progress,
-                )
-            })
-            .unwrap_or_default();
         let started_at_ms = self.wall_clock.unix_millis();
         self.playback_state.update(PlaybackStateUpdate::Starting {
             request: ActivePlaybackRequest {
@@ -548,9 +461,6 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         })?;
         log::info!("播放器状态转移: Starting keyword={}", request.keyword);
         Ok(PlaybackAttempt {
-            initial_key: initial.0,
-            initial_progress: initial.1,
-            requested_key,
             previous_playback,
             started_at_ms,
         })
@@ -597,183 +507,24 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         }
     }
 
+    /// 内置 ffmpeg 引擎的 play 同步回报成功/失败（失败已在 play_request 处理），
+    /// 无需轮询外部播放器状态确认。播放信息直接采用请求时的结构化元数据。
     fn verify_playback_started(
         &self,
         request: &PlaybackRequest,
-        attempt: &mut PlaybackAttempt,
+        _attempt: &mut PlaybackAttempt,
     ) -> Result<PlaybackVerification> {
-        self.delay
-            .wait(Duration::from_millis(self.timing.search_settle_ms));
-
-        let mut last_status = None;
-        let mut last_status_error = None;
-        for retry in 0..self.timing.status_retries {
-            let status = match self.backend.status() {
-                Ok(status) => status,
-                Err(error) => {
-                    log::error!("查询播放状态失败: {error:#}");
-                    last_status_error = Some(error.to_string());
-                    self.mark_unknown()?;
-                    self.delay
-                        .wait(Duration::from_millis(self.timing.status_poll_ms));
-                    continue;
-                }
-            };
-            last_status_error = None;
-            last_status = Some(status.clone());
-            let reliability = classify_observation(&status);
-            self.record_observation(&status, reliability)?;
-            log::debug!(
-                "播放器观测: raw={} uri={} title={} artist={} reliability={:?}",
-                status.status,
-                status.current_uri,
-                status.name,
-                status.singer,
-                reliability
-            );
-
-            if status.status != "playing" && status.status != "paused" {
-                self.delay
-                    .wait(Duration::from_millis(self.timing.status_poll_ms));
-                continue;
-            }
-
-            let Some(current_key) = status
-                .current_track
-                .as_ref()
-                .map(|track| track.track_ref.key.clone())
-            else {
-                log::info!(
-                    "播放器观测缺少结构化曲目，继续等待 ({}/{})",
-                    retry + 1,
-                    self.timing.status_retries
-                );
-                self.delay
-                    .wait(Duration::from_millis(self.timing.status_poll_ms));
-                continue;
-            };
-            let current_uri = current_key.to_string();
-            if current_key != attempt.requested_key {
-                if attempt.initial_key.as_ref() == Some(&current_key)
-                    && !playback_progress_restarted(attempt.initial_progress, status.progress)
-                {
-                    log::info!(
-                        "曲目尚未切换，继续等待播放请求生效 ({}/{})",
-                        retry + 1,
-                        self.timing.status_retries
-                    );
-                    self.delay
-                        .wait(Duration::from_millis(self.timing.status_poll_ms));
-                    continue;
-                }
-                if is_cross_source_track(&attempt.requested_key, &current_key) {
-                    match self.reconcile_cross_source_status(request, &status)? {
-                        CrossSourceReconciliation::Match {
-                            status: stable_status,
-                            score,
-                            reason,
-                        } => {
-                            self.confirm_playback_fallback(request, &stable_status, &reason)?;
-                            let message = format_play_message(&stable_status);
-                            log::info!(
-                                "跨源同曲确认成功: requested={} confirmed={} score={:.2} reason={}",
-                                attempt.requested_key,
-                                stable_status.current_uri,
-                                score,
-                                reason
-                            );
-                            return Ok(PlaybackVerification::Success {
-                                status: stable_status,
-                                message,
-                            });
-                        }
-                        CrossSourceReconciliation::NoMatch {
-                            status: stable_status,
-                            score,
-                            reason,
-                        } => {
-                            log::info!(
-                                "跨源同曲判断不匹配: requested={} confirmed={} score={:.2} reason={}",
-                                attempt.requested_key,
-                                stable_status.current_uri,
-                                score,
-                                reason
-                            );
-                        }
-                        CrossSourceReconciliation::Unavailable {
-                            status: stable_status,
-                            reason,
-                        } => {
-                            log::info!(
-                                "跨源同曲判断不可用: requested={} confirmed={} reason={}",
-                                attempt.requested_key,
-                                stable_status.current_uri,
-                                reason
-                            );
-                        }
-                        CrossSourceReconciliation::Pending => {
-                            log::debug!(
-                                "跨源同曲确认尚未稳定: requested={} current={}",
-                                attempt.requested_key,
-                                current_uri
-                            );
-                        }
-                    }
-                }
-                log::info!(
-                    "URI 与请求资源不同，不能用歌曲信息兜底: current={} requested={} ({}/{})",
-                    current_uri,
-                    attempt.requested_key,
-                    retry + 1,
-                    self.timing.status_retries
-                );
-                return Ok(PlaybackVerification::MismatchedCandidate(
-                    PlaybackMismatch {
-                        status,
-                        local_reason: format!(
-                            "播放器 URI 与请求不一致: current={} requested={}",
-                            current_key, attempt.requested_key
-                        ),
-                    },
-                ));
-            }
-
-            if playback_status_has_no_timing(&status) {
-                log::info!(
-                    "0:00/0:00，等待后重试 ({}/{})",
-                    retry + 1,
-                    self.timing.status_retries
-                );
-                self.delay
-                    .wait(Duration::from_millis(self.timing.status_poll_ms));
-                continue;
-            }
-            if status.duration > 0.0 && status.duration < 20.0 {
-                log::info!("歌曲时长过短 ({:.1}s)，视为无音源", status.duration);
-                self.restore_failed_attempt(attempt, "verification_failed")?;
-                let reason = format!("歌曲时长过短: {:.1}s", status.duration);
-                return Ok(PlaybackVerification::NoSource {
-                    status: Some(status),
-                    reason,
-                });
-            }
-
-            let message = format_play_message(&status);
-            self.confirm_playback_success(request, &status)?;
-            log::info!("播放成功: {}", message);
-            return Ok(PlaybackVerification::Success { status, message });
+        let mut status = status_from_request(request);
+        // 播放成功消息里的音量显示引擎当前实际音量（音量命令是异步渐变，
+        // 请求元数据里没有音量，之前硬编码 0 导致「播放: … 音量0」）。
+        if let Ok(current) = self.backend.status() {
+            status.volume = current.volume;
         }
-
-        log::info!("超时未播放成功");
-        self.restore_failed_attempt(attempt, "verification_failed")?;
-        if let Some(error) = last_status_error {
-            log::error!("播放确认结束时播放器状态接口不可用: {error}");
-            return Err(anyhow!("播放器状态暂不可用，请稍后再试"));
-        }
-        Ok(PlaybackVerification::NoSource {
-            status: last_status,
-            reason: "超时未播放成功".to_string(),
-        })
+        self.record_observation(&status, classify_observation(&status))?;
+        let message = format_play_message(&status);
+        self.confirm_playback_success(request, &status)?;
+        log::info!("播放成功: {}", message);
+        Ok(PlaybackVerification::Success { status, message })
     }
 
     pub(crate) fn play_and_verify(
@@ -782,90 +533,6 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
     ) -> Result<PlaybackVerification> {
         let mut attempt = self.play_request(request)?;
         self.verify_playback_started(request, &mut attempt)
-    }
-
-    fn observe_stable_fallback(&self, first: &PlayerStatus) -> Result<Option<PlayerStatus>> {
-        let mut stable = first.clone();
-        for _ in 1..self.timing.fallback_identity_stable_samples {
-            self.delay
-                .wait(Duration::from_millis(self.timing.status_poll_ms));
-            let status = match self.backend.status() {
-                Ok(status) => status,
-                Err(error) => {
-                    log::warn!("跨源同曲确认读取播放器状态失败: {error:#}");
-                    return Ok(None);
-                }
-            };
-            self.record_observation(&status, classify_observation(&status))?;
-            if !stable_fallback_identity(&stable, &status) {
-                log::info!("跨源同曲确认未稳定，放弃当前备用 URI");
-                return Ok(None);
-            }
-            stable = status;
-        }
-        Ok(Some(stable))
-    }
-
-    fn reconcile_cross_source_status(
-        &self,
-        request: &PlaybackRequest,
-        first: &PlayerStatus,
-    ) -> Result<CrossSourceReconciliation> {
-        let Some(status) = self.observe_stable_fallback(first)? else {
-            return Ok(CrossSourceReconciliation::Pending);
-        };
-        if !fallback_status_is_playable(&status) {
-            return Ok(CrossSourceReconciliation::Pending);
-        }
-        let decision = self.judge_cross_source_identity(request, &status);
-        Ok(match decision {
-            PlaybackIdentityDecision::Match { score, reason } => CrossSourceReconciliation::Match {
-                status,
-                score,
-                reason,
-            },
-            PlaybackIdentityDecision::NoMatch { score, reason } => {
-                CrossSourceReconciliation::NoMatch {
-                    status,
-                    score,
-                    reason,
-                }
-            }
-            PlaybackIdentityDecision::Unavailable { reason } => {
-                CrossSourceReconciliation::Unavailable { status, reason }
-            }
-        })
-    }
-
-    fn judge_cross_source_identity(
-        &self,
-        request: &PlaybackRequest,
-        status: &PlayerStatus,
-    ) -> PlaybackIdentityDecision {
-        match self
-            .matching
-            .match_song_identity(&request.keyword, &status.name, &status.singer)
-        {
-            super::matcher::SongIdentityMatch::Match { score, reason } => {
-                PlaybackIdentityDecision::Match { score, reason }
-            }
-            super::matcher::SongIdentityMatch::Unknown { reason } => {
-                log::debug!(
-                    "跨源同曲本地判断不确定: current={} requested={} reason={}",
-                    status.current_uri,
-                    request.uri(),
-                    reason
-                );
-                self.identity_judge.judge(request, status)
-            }
-        }
-    }
-
-    pub(crate) fn reject_mismatch_as_no_source(&self, status: Option<&PlayerStatus>) -> Result<()> {
-        if status.is_some_and(|status| status.status == "playing") {
-            let _ = self.backend.pause();
-        }
-        self.mark_unknown()
     }
 
     pub(crate) fn maybe_advance_queue(
@@ -906,13 +573,26 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         {
             match self.backend.status() {
                 Ok(fresh_status) => {
-                    log::info!(
-                        "点歌状态与播放监控快照不一致，已刷新播放状态: snapshot_uri={} fresh_uri={}",
-                        status.current_uri,
-                        fresh_status.current_uri,
-                    );
-                    status = fresh_status;
-                    self.record_observation(&status, classify_observation(&status))?;
+                    if status.current_uri != fresh_status.current_uri
+                        || status.status != fresh_status.status
+                    {
+                        // 监控快照确实过期：刷新并记录，后续 tick 复用一致状态。
+                        log::info!(
+                            "点歌状态与播放监控快照不一致，已刷新播放状态: snapshot_uri={} fresh_uri={}",
+                            status.current_uri,
+                            fresh_status.current_uri,
+                        );
+                        status = fresh_status;
+                        self.record_observation(&status, classify_observation(&status))?;
+                    } else {
+                        // 快照与引擎实时一致且与点歌请求不匹配（外部切歌/引擎异常）：
+                        // 属持续状态而非过期快照，降级为 debug 避免每轮轮询刷屏，
+                        // 由后续 track_changed/自然结束路径处理。
+                        log::debug!(
+                            "点歌状态与引擎持续不一致，等待状态转移处理: uri={}",
+                            fresh_status.current_uri,
+                        );
+                    }
                 }
                 Err(error) => {
                     log::error!("刷新点歌播放状态失败，暂不自动出队: {error:#}");
@@ -943,75 +623,12 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
                 &self.matching,
             )
         {
-            if let Some(active_request) = runtime_snapshot.active_request.as_ref()
-                && active_request
-                    .track
-                    .as_ref()
-                    .zip(status.current_track.as_ref())
-                    .is_some_and(|(requested, current)| {
-                        is_cross_source_track(&requested.track_ref.key, &current.track_ref.key)
-                    })
-            {
-                let request = playback_request_from_active(active_request);
-                match self.reconcile_cross_source_status(&request, &status)? {
-                    CrossSourceReconciliation::Match {
-                        status: stable_status,
-                        score,
-                        reason,
-                    } => {
-                        self.confirm_playback_reconciliation(
-                            active_request,
-                            &stable_status,
-                            &reason,
-                        )?;
-                        log::info!(
-                            "跨源换源同曲确认成功，保留点歌状态: requested={} confirmed={} score={:.2} reason={}",
-                            active_request_expected_uri(active_request),
-                            stable_status.current_uri,
-                            score,
-                            reason
-                        );
-                        return Ok(QueueAdvanceDecision::PlaybackStateChanged);
-                    }
-                    CrossSourceReconciliation::Pending => {
-                        log::debug!(
-                            "跨源换源尚未稳定，暂不转为外部播放: requested={} current={}",
-                            active_request_expected_uri(active_request),
-                            status.current_uri
-                        );
-                        return Ok(QueueAdvanceDecision::None);
-                    }
-                    CrossSourceReconciliation::NoMatch {
-                        status: stable_status,
-                        score,
-                        reason,
-                    } => {
-                        log::info!(
-                            "跨源换源判断为不同歌曲: requested={} confirmed={} score={:.2} reason={}",
-                            active_request_expected_uri(active_request),
-                            stable_status.current_uri,
-                            score,
-                            reason
-                        );
-                    }
-                    CrossSourceReconciliation::Unavailable {
-                        status: stable_status,
-                        reason,
-                    } => {
-                        log::warn!(
-                            "跨源换源无法确认歌曲身份，暂停并进入 Unknown: requested={} current={} reason={}",
-                            active_request_expected_uri(active_request),
-                            stable_status.current_uri,
-                            reason
-                        );
-                        self.reject_mismatch_as_no_source(Some(&stable_status))?;
-                        return Ok(QueueAdvanceDecision::PlaybackStateChanged);
-                    }
-                }
-            }
+            // 内置引擎只播请求的 URI；曲目变化只可能来自用户手动控制或引擎异常，
+            // 直接视为外部播放，不再做跨源同曲确认。
             log::info!(
                 "播放器状态转移: RequestedSongPlaying -> ExternalPlayback reason=track_changed"
             );
+            self.record_observation(&status, classify_observation(&status))?;
             self.mark_external_playback()?;
             return Ok(QueueAdvanceDecision::PlaybackStateChanged);
         }
@@ -1029,6 +646,36 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             });
         }
 
+        // 引擎报告播放失败（解码失败/流被拒等），播放已终止。
+        // 可重试失败保留队首等待用户处理；不可重试失败丢弃当前请求继续下一首。
+        // 失败观测放在点歌保护之前：失败是明确终止信号，不应被起步保护忽略。
+        if !status.failure_code.is_empty() && runtime_snapshot.active_request.is_some() {
+            log::error!(
+                "引擎播放失败: code={} message={}",
+                status.failure_code,
+                status.failure_message
+            );
+            if status.failure_retryable {
+                log::warn!(
+                    "失败可重试，保留队首等待重新播放: uri={}",
+                    status.current_uri
+                );
+                return Ok(QueueAdvanceDecision::None);
+            }
+            self.clear_active_request()?;
+            let _ = self.playback_state.reconcile_player_session(None)?;
+            if context.command_executing
+                || context.has_pending_playback_task
+                || (context.queue_empty && !self.playback_state.playback_pool_available()?)
+            {
+                return Ok(QueueAdvanceDecision::PlaybackStateChanged);
+            }
+            log::info!("队列推进决策: advance reason=playback_failure");
+            return Ok(QueueAdvanceDecision::AdvanceQueue {
+                reason: "播放失败",
+            });
+        }
+
         if runtime_snapshot.active_request.is_some()
             && guard_active
             && !is_notify_controller_natural_end(&status)
@@ -1036,10 +683,6 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             log::debug!("点歌刚开始，暂不触发队列自动出队");
             return Ok(QueueAdvanceDecision::None);
         }
-
-        let has_pending_playback = self.has_pending_tracks(&context)?
-            || context.has_pending_playback_task
-            || context.song_command_executing;
 
         let pause_reason = self.playback_state.snapshot()?.pause_reason;
 
@@ -1080,78 +723,9 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             return Ok(QueueAdvanceDecision::None);
         }
 
-        if context.queue_empty
-            && !context.has_pending_playback_task
-            && !context.command_executing
-            && !context.song_command_executing
-        {
-            return self.resume_waiting_for_queue_if_idle();
-        }
-
-        if status.status == "paused" {
-            if pause_reason == PauseReason::WaitingForQueue {
-                let Some(remaining) = playback_remaining_seconds(&status) else {
-                    return Ok(QueueAdvanceDecision::None);
-                };
-                if remaining > self.queue.auto_advance_seconds as f64 {
-                    return Ok(QueueAdvanceDecision::None);
-                }
-                if !context.command_executing
-                    && !context.has_pending_playback_task
-                    && self.has_pending_tracks(&context)?
-                {
-                    log::info!("队列推进决策: advance reason=near_end_paused");
-                    return Ok(QueueAdvanceDecision::AdvanceQueue {
-                        reason: "即将结束"
-                    });
-                }
-                return Ok(QueueAdvanceDecision::None);
-            }
-            let Some(remaining) = playback_remaining_seconds(&status) else {
-                return Ok(QueueAdvanceDecision::None);
-            };
-            if remaining > self.queue.auto_advance_seconds as f64 {
-                return Ok(QueueAdvanceDecision::None);
-            }
-            if context.command_executing
-                || context.has_pending_playback_task
-                || !self.has_pending_tracks(&context)?
-            {
-                return Ok(QueueAdvanceDecision::None);
-            }
-            self.playback_state
-                .update(PlaybackStateUpdate::ClearPauseReason)?;
-            log::info!("队列推进决策: advance reason=paused");
-            return Ok(QueueAdvanceDecision::AdvanceQueue { reason: "暂停" });
-        }
-
+        // 内置引擎播完自然结束，由 natural_end 检测推进；播放中无需预切。
         if status.status != "playing" {
             return Ok(QueueAdvanceDecision::None);
-        }
-
-        if pause_reason != PauseReason::None {
-            self.playback_state
-                .update(PlaybackStateUpdate::MarkRequestedPlayingIfActive)?;
-        }
-        if let Some(remaining) = playback_remaining_seconds(&status)
-            && remaining <= self.queue.auto_advance_seconds as f64
-            && has_pending_playback
-        {
-            let paused = self.pause_for_queue()?;
-            if !context.command_executing
-                && !context.has_pending_playback_task
-                && self.has_pending_tracks(&context)?
-            {
-                log::info!("队列推进决策: advance reason=near_end");
-                return Ok(QueueAdvanceDecision::AdvanceQueue {
-                    reason: "即将结束"
-                });
-            }
-            return Ok(if paused {
-                QueueAdvanceDecision::PauseForQueue
-            } else {
-                QueueAdvanceDecision::None
-            });
         }
         Ok(QueueAdvanceDecision::None)
     }
@@ -1188,20 +762,6 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             && is_notify_controller_natural_end(status)
     }
 
-    /// 队列或播放池里是否还有后续歌曲可播。
-    ///
-    /// 播放池只在点歌播放中（存在 active_request）才视为后续来源，避免外部
-    /// 手动播放被自动切歌或随机插歌。
-    fn has_pending_tracks(&self, context: &QueueAdvanceContext) -> Result<bool> {
-        if !context.queue_empty {
-            return Ok(true);
-        }
-        if !self.playback_state.playback_pool_available()? {
-            return Ok(false);
-        }
-        Ok(self.playback_state.snapshot()?.active_request.is_some())
-    }
-
     fn recover_after_runtime_restart(
         &self,
         runtime: &PlaybackRuntimeState,
@@ -1222,18 +782,14 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
                 "检测到 playback runtime 重启，控制器授权新恢复会话: previous_uri={}",
                 request.uri()
             );
-            match self.play_and_verify(&request)? {
-                PlaybackVerification::Success { status, .. } => {
-                    let _ =
-                        self.reconcile_player_session(&self.playback_state.snapshot()?, &status)?;
+            match self.play_and_verify(&request) {
+                Ok(PlaybackVerification::Success { status, .. }) => {
+                    let _ = self
+                        .reconcile_player_session(&self.playback_state.snapshot()?, &status)?;
                     return Ok(QueueAdvanceDecision::PlaybackStateChanged);
                 }
-                PlaybackVerification::NoSource { reason, .. } => {
-                    log::error!("播放运行时重启后的恢复会话无法播放: {reason}");
-                    self.mark_unknown()?;
-                    return Ok(QueueAdvanceDecision::PlaybackStateChanged);
-                }
-                PlaybackVerification::MismatchedCandidate(_) => {
+                Err(error) => {
+                    log::error!("播放运行时重启后的恢复会话无法播放: {error:#}");
                     self.mark_unknown()?;
                     return Ok(QueueAdvanceDecision::PlaybackStateChanged);
                 }
@@ -1309,79 +865,12 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         )
     }
 
-    fn pause_for_queue(&self) -> Result<bool> {
-        let already_waiting =
-            self.playback_state.snapshot()?.pause_reason == PauseReason::WaitingForQueue;
-        if already_waiting {
-            return Ok(false);
-        }
-        log::info!("队列推进决策: pause_waiting_for_queue");
-        self.backend.pause()?;
-        self.playback_state
-            .update(PlaybackStateUpdate::PauseWaitingForQueue)?;
-        Ok(true)
-    }
-
-    fn resume_waiting_for_queue_if_idle(&self) -> Result<QueueAdvanceDecision> {
-        let should_resume =
-            self.playback_state.snapshot()?.pause_reason == PauseReason::WaitingForQueue;
-        if !should_resume {
-            return Ok(QueueAdvanceDecision::None);
-        }
-        log::info!("队列推进决策: resume_waiting_for_queue_idle");
-        self.backend.resume()?;
-        self.playback_state
-            .update(PlaybackStateUpdate::ResumeWaitingForQueue)?;
-        Ok(QueueAdvanceDecision::ResumeIfIdle)
-    }
-
     fn confirm_playback_success(
         &self,
         request: &PlaybackRequest,
         status: &PlayerStatus,
     ) -> Result<()> {
         self.confirm_playback_success_with_track(request, status, true, "playback_confirmed")
-    }
-
-    fn confirm_playback_fallback(
-        &self,
-        request: &PlaybackRequest,
-        status: &PlayerStatus,
-        reason: &str,
-    ) -> Result<()> {
-        self.confirm_playback_success_with_track(request, status, false, reason)
-    }
-
-    fn confirm_playback_reconciliation(
-        &self,
-        active_request: &ActivePlaybackRequest,
-        status: &PlayerStatus,
-        reason: &str,
-    ) -> Result<()> {
-        let confirmed_track = status
-            .current_track
-            .clone()
-            .ok_or_else(|| anyhow!("跨源换源确认缺少结构化曲目"))?;
-        let mut reconciled = active_request.clone();
-        reconciled.track = Some(confirmed_track.clone());
-        reconciled.song = format!("{}{}", status.name, status.singer);
-        reconciled.title = status.name.trim().to_string();
-        reconciled.artist = status.singer.trim().to_string();
-        reconciled.guard_started_at = None;
-        self.playback_state
-            .update(PlaybackStateUpdate::Reconciled {
-                request: reconciled,
-            })?;
-        let request = playback_request_from_active(active_request);
-        self.record_song_dedup_playback(&request, status)?;
-        self.playback_state
-            .record_playback_pool_track(confirmed_track)?;
-        log::info!(
-            "播放器状态保持 RequestedSongPlaying reason={} confirmed_uri={}",
-            reason,
-            status.current_uri
-        );
-        Ok(())
     }
 
     fn confirm_playback_success_with_track(
@@ -1515,6 +1004,9 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         )?;
         if should_mark_external {
             self.playback_state.update(PlaybackStateUpdate::External)?;
+            // 外部播放确认时补一次观测记录，保证 last_observation 新鲜
+            // （监控循环改为轻量读取后不再高频记录）。
+            self.record_observation(status, classify_observation(status))?;
         }
         if observation.protected && !observation.was_protected {
             log::info!(
@@ -1562,37 +1054,44 @@ fn external_playback_identity(status: &PlayerStatus) -> Option<TrackKey> {
         .map(|track| track.track_ref.key.clone())
 }
 
-fn is_cross_source_track(requested: &TrackKey, current: &TrackKey) -> bool {
-    requested.provider != current.provider
-}
-
-fn stable_fallback_identity(previous: &PlayerStatus, current: &PlayerStatus) -> bool {
-    matches!(current.status.as_str(), "playing" | "paused")
-        && current
-            .current_track
+/// 用点歌请求自身的结构化元数据构造播放确认状态。
+/// 内置引擎 play 同步回报成功，无需等待外部状态采样。
+fn status_from_request(request: &PlaybackRequest) -> PlayerStatus {
+    let track = request.track.clone();
+    let metadata = track.as_ref().map(|track| &track.metadata);
+    PlayerStatus {
+        status: "playing".to_string(),
+        current_track: track.clone(),
+        current_uri: track
             .as_ref()
-            .zip(previous.current_track.as_ref())
-            .is_some_and(|(current, previous)| current.track_ref.key == previous.track_ref.key)
-        && current.name.trim() == previous.name.trim()
-        && current.singer.trim() == previous.singer.trim()
-}
-
-fn playback_status_has_no_timing(status: &PlayerStatus) -> bool {
-    let progress = format_time(status.progress);
-    let duration = format_time(status.duration);
-    (progress == "0:00" && duration == "0:00") || duration == "error"
-}
-
-fn fallback_status_is_playable(status: &PlayerStatus) -> bool {
-    !(playback_status_has_no_timing(status) || status.duration > 0.0 && status.duration < 20.0)
+            .map(|track| track.track_ref.key.to_string())
+            .unwrap_or_default(),
+        name: metadata
+            .map(|metadata| metadata.title.clone())
+            .unwrap_or_default(),
+        singer: metadata
+            .map(|metadata| metadata.artists.join(" / "))
+            .unwrap_or_default(),
+        album_name: metadata
+            .and_then(|metadata| metadata.album.clone())
+            .unwrap_or_default(),
+        lyric_line_text: String::new(),
+        duration: metadata
+            .and_then(|metadata| metadata.duration_ms)
+            .map_or(0.0, |millis| millis as f64 / 1000.0),
+        progress: 0.0,
+        playback_rate: 1.0,
+        volume: 0,
+        requester: request.requester.clone(),
+        ..PlayerStatus::default()
+    }
 }
 
 fn status_matches_active_request(
     _matching: &MatchConfig,
     active_request: Option<&ActivePlaybackRequest>,
     status: &PlayerStatus,
-) -> bool {
-    let Some(active_request) = active_request else {
+) -> bool {    let Some(active_request) = active_request else {
         return false;
     };
     active_request
@@ -1600,14 +1099,6 @@ fn status_matches_active_request(
         .as_ref()
         .zip(status.current_track.as_ref())
         .is_some_and(|(requested, current)| requested.track_ref.key == current.track_ref.key)
-}
-
-fn active_request_expected_uri(active_request: &ActivePlaybackRequest) -> String {
-    active_request
-        .track
-        .as_ref()
-        .map(|track| track.track_ref.key.to_string())
-        .unwrap_or_default()
 }
 
 fn playback_request_from_active(active_request: &ActivePlaybackRequest) -> PlaybackRequest {
@@ -1709,7 +1200,6 @@ fn format_state(state: ConfirmedPlaybackState) -> String {
         ConfirmedPlaybackState::Starting => "starting",
         ConfirmedPlaybackState::RequestedSongPlaying => "requested_song_playing",
         ConfirmedPlaybackState::PausedByUser => "paused_by_user",
-        ConfirmedPlaybackState::PausedWaitingForQueue => "paused_waiting_for_queue",
         ConfirmedPlaybackState::ExternalPlayback => "external_playback",
         ConfirmedPlaybackState::Unknown => "unknown",
     }
@@ -1720,7 +1210,6 @@ fn format_pause_reason(reason: PauseReason) -> String {
     match reason {
         PauseReason::None => "none",
         PauseReason::User => "user",
-        PauseReason::WaitingForQueue => "waiting_for_queue",
     }
     .to_string()
 }
@@ -1741,7 +1230,7 @@ mod tests {
     use super::super::{PersistentPlaybackState, PersistentSongDedupHistory};
     use super::*;
     use crate::features::playback::{SongDedupConfig, test_track};
-    use miliastra_kernel::clock::{Clock, Delay, ManualClock, SystemClock, WallClock};
+    use miliastra_kernel::clock::{Clock, ManualClock, SystemClock, WallClock};
     use std::collections::{HashSet, VecDeque};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1908,8 +1397,6 @@ mod tests {
     #[derive(Clone)]
     struct FakeBackend {
         statuses: Arc<Mutex<VecDeque<PlayerStatus>>>,
-        status_calls: Arc<Mutex<usize>>,
-        status_error_after: Option<usize>,
         paused: Arc<Mutex<u32>>,
         resumed: Arc<Mutex<u32>>,
         play_error: bool,
@@ -1920,23 +1407,11 @@ mod tests {
         fn new(statuses: Vec<PlayerStatus>) -> Self {
             Self {
                 statuses: Arc::new(Mutex::new(statuses.into())),
-                status_calls: Arc::new(Mutex::new(0)),
-                status_error_after: None,
                 paused: Arc::new(Mutex::new(0)),
                 resumed: Arc::new(Mutex::new(0)),
                 play_error: false,
                 pause_error: false,
             }
-        }
-
-        fn with_status_error(mut self) -> Self {
-            self.status_error_after = Some(0);
-            self
-        }
-
-        fn with_status_error_after(mut self, successful_reads: usize) -> Self {
-            self.status_error_after = Some(successful_reads);
-            self
         }
 
         fn with_play_error(mut self) -> Self {
@@ -1952,15 +1427,6 @@ mod tests {
 
     impl MusicPlayerBackend for FakeBackend {
         fn status(&self) -> Result<PlayerStatus> {
-            let mut calls = self.status_calls.lock().unwrap();
-            if self
-                .status_error_after
-                .is_some_and(|successful_reads| *calls >= successful_reads)
-            {
-                *calls += 1;
-                return Err(anyhow!("status failed"));
-            }
-            *calls += 1;
             Ok(self
                 .statuses
                 .lock()
@@ -2037,53 +1503,15 @@ mod tests {
 
     fn controller(backend: FakeBackend) -> PlayerController<FakeBackend, TestPlaybackState> {
         let system_time = Arc::new(SystemClock);
-        controller_with_time(
-            backend,
-            system_time.clone(),
-            system_time.clone(),
-            system_time,
-        )
-    }
-
-    #[derive(Clone, Copy)]
-    struct MatchingIdentityJudge;
-
-    impl PlaybackIdentityJudge for MatchingIdentityJudge {
-        fn judge(
-            &self,
-            _request: &PlaybackRequest,
-            _status: &PlayerStatus,
-        ) -> PlaybackIdentityDecision {
-            PlaybackIdentityDecision::Match {
-                score: 0.99,
-                reason: "测试同曲".to_string(),
-            }
-        }
-    }
-
-    #[derive(Clone, Copy)]
-    struct NonMatchingIdentityJudge;
-
-    impl PlaybackIdentityJudge for NonMatchingIdentityJudge {
-        fn judge(
-            &self,
-            _request: &PlaybackRequest,
-            _status: &PlayerStatus,
-        ) -> PlaybackIdentityDecision {
-            PlaybackIdentityDecision::NoMatch {
-                score: 0.1,
-                reason: "测试不同曲".to_string(),
-            }
-        }
+        controller_with_time(backend, system_time.clone(), system_time.clone())
     }
 
     fn controller_with_time(
         backend: FakeBackend,
         clock: Arc<dyn Clock>,
         wall_clock: Arc<dyn WallClock>,
-        delay: Arc<dyn Delay>,
     ) -> PlayerController<FakeBackend, TestPlaybackState> {
-        controller_with_pool(backend, clock, wall_clock, delay, false)
+        controller_with_pool(backend, clock, wall_clock, false)
     }
 
     /// 与 `controller` 相同，但允许启用播放池（用于测试队列空时的随机播放决策）。
@@ -2091,25 +1519,6 @@ mod tests {
         backend: FakeBackend,
         clock: Arc<dyn Clock>,
         wall_clock: Arc<dyn WallClock>,
-        delay: Arc<dyn Delay>,
-        pool_available: bool,
-    ) -> PlayerController<FakeBackend, TestPlaybackState> {
-        controller_with_time_and_judge(
-            backend,
-            clock,
-            wall_clock,
-            delay,
-            Arc::new(DisabledPlaybackIdentityJudge),
-            pool_available,
-        )
-    }
-
-    fn controller_with_time_and_judge(
-        backend: FakeBackend,
-        clock: Arc<dyn Clock>,
-        wall_clock: Arc<dyn WallClock>,
-        delay: Arc<dyn Delay>,
-        identity_judge: Arc<dyn PlaybackIdentityJudge>,
         pool_available: bool,
     ) -> PlayerController<FakeBackend, TestPlaybackState> {
         let history_path = temp_path("dedup");
@@ -2150,30 +1559,22 @@ mod tests {
             &test_timing(),
             &QueueConfig {
                 max_size: 10,
-                auto_advance_seconds: 2,
                 protect_current_song_until_finished: true,
                 external_playback_protect_after_seconds: 20,
                 pool_max_size: if pool_available { 200 } else { 0 },
             },
             &matching,
-            identity_judge,
-            PlaybackTimePorts::new(clock, wall_clock, delay),
+            PlaybackTimePorts::new(clock, wall_clock),
         )
     }
 
     fn test_timing() -> PlaybackTimingConfig {
         PlaybackTimingConfig {
-            search_settle_ms: 0,
             status_poll_ms: 0,
-            status_retries: 3,
-            skip_status_initial_ms: 0,
-            skip_status_poll_ms: 0,
-            skip_status_retries: 1,
             monitor_tick_ms: 50,
             monitor_status_ms: 50,
             uri_stable_samples: 0,
             transport_stable_samples: 0,
-            fallback_identity_stable_samples: 1,
             stale_timeout_ms: 5000,
         }
     }
@@ -2207,6 +1608,25 @@ mod tests {
             created_at,
             seq
         ))
+    }
+
+    #[test]
+    fn playback_started_message_reports_the_engine_volume_instead_of_zero() {
+        let mut observed = status("目标", "miliastra://track/qqmusic/1", 1.0, 180.0);
+        observed.volume = 70;
+        let backend = FakeBackend::new(vec![observed]);
+        let controller = controller(backend);
+        let request = request();
+        let mut attempt = controller.play_request(&request).unwrap();
+
+        let result = controller
+            .verify_playback_started(&request, &mut attempt)
+            .unwrap();
+
+        let PlaybackVerification::Success { status, message } = result;
+        assert_eq!(status.volume, 70);
+        assert!(message.contains("音量70"), "message: {message}");
+        assert!(!message.contains("音量0"), "message: {message}");
     }
 
     #[test]
@@ -2308,43 +1728,9 @@ mod tests {
     }
 
     #[test]
-    fn verification_does_not_accept_matching_title_with_different_uri() {
-        let backend = FakeBackend::new(vec![
-            status("旧歌", "miliastra://track/qqmusic/old", 30.0, 180.0),
-            status("目标", "miliastra://track/qqmusic/other", 1.0, 180.0),
-        ]);
+    fn verification_confirms_from_request_metadata_without_observation() {
+        let backend = FakeBackend::new(vec![]);
         let controller = controller(backend);
-        let request = request();
-        let mut attempt = controller.play_request(&request).unwrap();
-
-        let result = controller
-            .verify_playback_started(&request, &mut attempt)
-            .unwrap();
-
-        assert!(matches!(
-            result,
-            PlaybackVerification::MismatchedCandidate(PlaybackMismatch { .. })
-        ));
-        assert_eq!(controller.snapshot().state, "starting");
-    }
-
-    #[test]
-    fn cross_source_fallback_requires_stability_and_identity_confirmation() {
-        let fallback_uri = "miliastra://track/netease/fallback";
-        let backend = FakeBackend::new(vec![
-            status("旧歌", "miliastra://track/qqmusic/old", 30.0, 180.0),
-            status("别名版本", fallback_uri, 1.0, 180.0),
-            status("别名版本", fallback_uri, 2.0, 180.0),
-        ]);
-        let mut controller = controller_with_time_and_judge(
-            backend,
-            Arc::new(SystemClock),
-            Arc::new(SystemClock),
-            Arc::new(SystemClock),
-            Arc::new(MatchingIdentityJudge),
-            false,
-        );
-        controller.timing.fallback_identity_stable_samples = 2;
         let request = request();
         let mut attempt = controller.play_request(&request).unwrap();
 
@@ -2355,114 +1741,19 @@ mod tests {
         assert!(matches!(result, PlaybackVerification::Success { .. }));
         let snapshot = controller.snapshot();
         assert_eq!(snapshot.state, "requested_song_playing");
-        assert_eq!(snapshot.current_uri, fallback_uri);
-        assert_eq!(snapshot.active_uri, fallback_uri);
-    }
-
-    #[test]
-    fn post_confirmation_cross_source_switch_rechecks_identity_before_external_transition() {
-        let fallback_uri = "miliastra://track/netease/fallback";
-        let backend = FakeBackend::new(vec![status("目标", fallback_uri, 12.0, 180.0)]);
-        let manual_clock = Arc::new(ManualClock::new(Instant::now()));
-        let controller = controller_with_time_and_judge(
-            backend,
-            manual_clock.clone(),
-            manual_clock.clone(),
-            manual_clock.clone(),
-            Arc::new(MatchingIdentityJudge),
-            false,
-        );
-        let request = request();
-        controller
-            .confirm_playback_success(
-                &request,
-                &status("目标", request.uri().as_str(), 1.0, 180.0),
-            )
-            .unwrap();
-        manual_clock.advance(Duration::from_secs(10)).unwrap();
-
-        let decision = controller
-            .maybe_advance_queue(
-                status("目标", fallback_uri, 12.0, 180.0),
-                QueueAdvanceContext {
-                    queue_empty: true,
-                    has_pending_playback_task: false,
-                    command_executing: false,
-                    song_command_executing: false,
-                },
-            )
-            .unwrap();
-
-        assert_eq!(decision, QueueAdvanceDecision::PlaybackStateChanged);
-        let snapshot = controller.snapshot();
-        assert_eq!(snapshot.state, "requested_song_playing");
-        assert_eq!(snapshot.active_uri, fallback_uri);
-        assert!(
-            controller
-                .playback_state
-                .snapshot()
-                .unwrap()
-                .previous_requests
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn post_confirmation_cross_source_switch_waits_for_stable_identity() {
-        let fallback_uri = "miliastra://track/netease/fallback";
-        let other_uri = "miliastra://track/netease/other";
-        let backend = FakeBackend::new(vec![
-            status("目标", fallback_uri, 12.0, 180.0),
-            status("目标", other_uri, 13.0, 180.0),
-        ]);
-        let manual_clock = Arc::new(ManualClock::new(Instant::now()));
-        let mut controller = controller_with_time_and_judge(
-            backend,
-            manual_clock.clone(),
-            manual_clock.clone(),
-            manual_clock.clone(),
-            Arc::new(MatchingIdentityJudge),
-            false,
-        );
-        controller.timing.fallback_identity_stable_samples = 2;
-        let request = request();
-        controller
-            .confirm_playback_success(
-                &request,
-                &status("目标", request.uri().as_str(), 1.0, 180.0),
-            )
-            .unwrap();
-        manual_clock.advance(Duration::from_secs(10)).unwrap();
-
-        let decision = controller
-            .maybe_advance_queue(
-                status("目标", fallback_uri, 12.0, 180.0),
-                QueueAdvanceContext {
-                    queue_empty: true,
-                    has_pending_playback_task: false,
-                    command_executing: false,
-                    song_command_executing: false,
-                },
-            )
-            .unwrap();
-
-        assert_eq!(decision, QueueAdvanceDecision::None);
-        let snapshot = controller.snapshot();
-        assert_eq!(snapshot.state, "requested_song_playing");
+        assert_eq!(snapshot.current_uri, request.uri());
         assert_eq!(snapshot.active_uri, request.uri());
     }
 
     #[test]
-    fn post_confirmation_cross_source_switch_with_unavailable_identity_enters_unknown() {
+    fn track_changed_observation_transitions_to_external_playback() {
         let fallback_uri = "miliastra://track/netease/fallback";
-        let backend = FakeBackend::new(vec![status("别名版本", fallback_uri, 12.0, 180.0)]);
-        let backend_probe = backend.clone();
+        let backend = FakeBackend::new(vec![status("目标", fallback_uri, 12.0, 180.0)]);
         let manual_clock = Arc::new(ManualClock::new(Instant::now()));
         let controller = controller_with_time(
             backend,
             manual_clock.clone(),
             manual_clock.clone(),
-            manual_clock.clone(),
         );
         let request = request();
         controller
@@ -2475,53 +1766,11 @@ mod tests {
 
         let decision = controller
             .maybe_advance_queue(
-                status("别名版本", fallback_uri, 12.0, 180.0),
+                status("目标", fallback_uri, 12.0, 180.0),
                 QueueAdvanceContext {
                     queue_empty: true,
                     has_pending_playback_task: false,
                     command_executing: false,
-                    song_command_executing: false,
-                },
-            )
-            .unwrap();
-
-        assert_eq!(decision, QueueAdvanceDecision::PlaybackStateChanged);
-        let snapshot = controller.snapshot();
-        assert_eq!(snapshot.state, "unknown");
-        assert!(snapshot.active_uri.is_empty());
-        assert_eq!(*backend_probe.paused.lock().unwrap(), 1);
-    }
-
-    #[test]
-    fn post_confirmation_cross_source_switch_with_different_identity_becomes_external() {
-        let fallback_uri = "miliastra://track/netease/fallback";
-        let backend = FakeBackend::new(vec![status("别名版本", fallback_uri, 12.0, 180.0)]);
-        let manual_clock = Arc::new(ManualClock::new(Instant::now()));
-        let controller = controller_with_time_and_judge(
-            backend,
-            manual_clock.clone(),
-            manual_clock.clone(),
-            manual_clock.clone(),
-            Arc::new(NonMatchingIdentityJudge),
-            false,
-        );
-        let request = request();
-        controller
-            .confirm_playback_success(
-                &request,
-                &status("目标", request.uri().as_str(), 1.0, 180.0),
-            )
-            .unwrap();
-        manual_clock.advance(Duration::from_secs(10)).unwrap();
-
-        let decision = controller
-            .maybe_advance_queue(
-                status("别名版本", fallback_uri, 12.0, 180.0),
-                QueueAdvanceContext {
-                    queue_empty: true,
-                    has_pending_playback_task: false,
-                    command_executing: false,
-                    song_command_executing: false,
                 },
             )
             .unwrap();
@@ -2537,13 +1786,10 @@ mod tests {
         let fallback_uri = "miliastra://track/netease/fallback";
         let backend = FakeBackend::new(vec![stopped_status_with_uri(fallback_uri)]);
         let manual_clock = Arc::new(ManualClock::new(Instant::now()));
-        let controller = controller_with_time_and_judge(
+        let controller = controller_with_time(
             backend,
             manual_clock.clone(),
             manual_clock.clone(),
-            manual_clock.clone(),
-            Arc::new(MatchingIdentityJudge),
-            false,
         );
         let request = request();
         controller
@@ -2562,7 +1808,6 @@ mod tests {
                     queue_empty: true,
                     has_pending_playback_task: false,
                     command_executing: false,
-                    song_command_executing: false,
                 },
             )
             .unwrap();
@@ -2595,7 +1840,6 @@ mod tests {
             queue_empty: false,
             has_pending_playback_task: false,
             command_executing: false,
-            song_command_executing: false,
         };
 
         // The first observation creates the durable binding; it cannot also
@@ -2633,7 +1877,6 @@ mod tests {
             FakeBackend::new(Vec::new()),
             Arc::new(SystemClock),
             Arc::new(SystemClock),
-            Arc::new(SystemClock),
             true,
         );
         controller
@@ -2643,7 +1886,6 @@ mod tests {
             queue_empty: true,
             has_pending_playback_task: false,
             command_executing: false,
-            song_command_executing: false,
         };
 
         // 队列空但播放池可用时，自然结束应推进到播放池随机播放。
@@ -2680,7 +1922,6 @@ mod tests {
             FakeBackend::new(Vec::new()),
             Arc::new(SystemClock),
             Arc::new(SystemClock),
-            Arc::new(SystemClock),
             true,
         );
         // 外部手动播放：无点歌请求，播放池可用也不得随机插歌。
@@ -2692,12 +1933,166 @@ mod tests {
             queue_empty: true,
             has_pending_playback_task: false,
             command_executing: false,
-            song_command_executing: false,
         };
 
         assert_eq!(
             controller.maybe_advance_queue(terminal, context).unwrap(),
             QueueAdvanceDecision::None
+        );
+    }
+
+    #[test]
+    fn engine_failure_drops_active_request_and_advances() {
+        let request = request();
+        let failure = PlayerStatus {
+            status: "stopped".to_string(),
+            current_track: request.track.clone(),
+            current_uri: request.uri(),
+            runtime_identity: "runtime-a".to_string(),
+            session_id: "session-a".to_string(),
+            generation: 41,
+            end_behavior: "notify_controller".to_string(),
+            last_end_cause: "decode_failure".to_string(),
+            failure_code: "decode_failure".to_string(),
+            failure_message: "音源解码失败".to_string(),
+            failure_retryable: false,
+            ..PlayerStatus::default()
+        };
+        let controller = controller(FakeBackend::new(Vec::new()));
+        controller
+            .confirm_playback_success(&request, &status("目标", &request.uri(), 1.0, 180.0))
+            .unwrap();
+        let context = QueueAdvanceContext {
+            queue_empty: false,
+            has_pending_playback_task: false,
+            command_executing: false,
+        };
+
+        // 不可重试的播放中失败：丢弃当前请求并推进到队列下一首。
+        assert_eq!(
+            controller
+                .maybe_advance_queue(failure, context)
+                .unwrap(),
+            QueueAdvanceDecision::AdvanceQueue { reason: "播放失败" }
+        );
+        let snapshot = controller.snapshot();
+        assert!(snapshot.active_uri.is_empty());
+    }
+
+    #[test]
+    fn engine_failure_with_no_next_track_returns_state_changed() {
+        let request = request();
+        let failure = PlayerStatus {
+            status: "stopped".to_string(),
+            current_track: request.track.clone(),
+            current_uri: request.uri(),
+            runtime_identity: "runtime-a".to_string(),
+            session_id: "session-a".to_string(),
+            generation: 41,
+            end_behavior: "notify_controller".to_string(),
+            last_end_cause: "decode_failure".to_string(),
+            failure_code: "decode_failure".to_string(),
+            failure_retryable: false,
+            ..PlayerStatus::default()
+        };
+        let controller = controller(FakeBackend::new(Vec::new()));
+        controller
+            .confirm_playback_success(&request, &status("目标", &request.uri(), 1.0, 180.0))
+            .unwrap();
+        let context = QueueAdvanceContext {
+            queue_empty: true,
+            has_pending_playback_task: false,
+            command_executing: false,
+        };
+
+        // 队列空且无播放池：清空请求但不推进，与自然结束行为一致。
+        assert_eq!(
+            controller.maybe_advance_queue(failure, context).unwrap(),
+            QueueAdvanceDecision::PlaybackStateChanged
+        );
+        assert_eq!(controller.snapshot().state, "idle");
+    }
+
+    #[test]
+    fn retryable_engine_failure_keeps_active_request() {
+        let request = request();
+        let failure = PlayerStatus {
+            status: "stopped".to_string(),
+            current_track: request.track.clone(),
+            current_uri: request.uri(),
+            runtime_identity: "runtime-a".to_string(),
+            session_id: "session-a".to_string(),
+            generation: 41,
+            end_behavior: "notify_controller".to_string(),
+            last_end_cause: "decode_failure".to_string(),
+            failure_code: "decode_failure".to_string(),
+            failure_message: "音源暂时不可用".to_string(),
+            failure_retryable: true,
+            ..PlayerStatus::default()
+        };
+        let controller = controller(FakeBackend::new(Vec::new()));
+        controller
+            .confirm_playback_success(&request, &status("目标", &request.uri(), 1.0, 180.0))
+            .unwrap();
+        let context = QueueAdvanceContext {
+            queue_empty: false,
+            has_pending_playback_task: false,
+            command_executing: false,
+        };
+
+        // 可重试失败：保留队首等待用户处理，不自动推进。
+        assert_eq!(
+            controller.maybe_advance_queue(failure, context).unwrap(),
+            QueueAdvanceDecision::None
+        );
+        assert_eq!(controller.snapshot().active_uri, request.uri());
+    }
+
+    #[test]
+    fn monitor_status_reads_without_recording_observation() {
+        let backend_status = status("目标", "miliastra://track/qqmusic/1", 10.0, 180.0);
+        let controller = controller(FakeBackend::new(vec![
+            backend_status.clone(),
+            backend_status,
+        ]));
+        assert!(
+            controller
+                .playback_state
+                .snapshot()
+                .unwrap()
+                .last_observation
+                .is_none()
+        );
+
+        // 普通读取会记录观测。
+        controller.status().unwrap();
+        assert!(
+            controller
+                .playback_state
+                .snapshot()
+                .unwrap()
+                .last_observation
+                .is_some()
+        );
+
+        // 监控循环的轻量读取不改变观测记录。
+        let before = controller
+            .playback_state
+            .snapshot()
+            .unwrap()
+            .last_observation
+            .clone();
+        controller.monitor_status().unwrap();
+        controller.monitor_status().unwrap();
+        assert_eq!(
+            controller
+                .playback_state
+                .snapshot()
+                .unwrap()
+                .last_observation
+                .as_ref()
+                .map(|observation| observation.captured_at_ms),
+            before.as_ref().map(|observation| observation.captured_at_ms)
         );
     }
 
@@ -2740,7 +2135,6 @@ mod tests {
             queue_empty: true,
             has_pending_playback_task: false,
             command_executing: false,
-            song_command_executing: false,
         };
         // Bind the original runtime before it becomes unavailable.
         assert_eq!(
@@ -2756,24 +2150,6 @@ mod tests {
         );
         assert_eq!(controller.snapshot().state, "requested_song_playing");
         assert_eq!(controller.snapshot().active_uri, request.uri());
-    }
-
-    #[test]
-    fn verification_rejects_missing_uri_even_when_metadata_is_present() {
-        let backend = FakeBackend::new(vec![
-            status("旧歌", "miliastra://track/qqmusic/old", 30.0, 180.0),
-            status("目标", "", 1.0, 180.0),
-        ]);
-        let controller = controller(backend);
-        let request = request();
-        let mut attempt = controller.play_request(&request).unwrap();
-
-        let result = controller
-            .verify_playback_started(&request, &mut attempt)
-            .unwrap();
-
-        assert!(matches!(result, PlaybackVerification::NoSource { .. }));
-        assert_eq!(controller.snapshot().state, "unknown");
     }
 
     #[test]
@@ -2816,7 +2192,6 @@ mod tests {
                     queue_empty: false,
                     has_pending_playback_task: false,
                     command_executing: false,
-                    song_command_executing: false,
                 },
             )
             .unwrap();
@@ -2847,7 +2222,6 @@ mod tests {
                     queue_empty: true,
                     has_pending_playback_task: false,
                     command_executing: false,
-                    song_command_executing: false,
                 },
             )
             .unwrap();
@@ -2918,7 +2292,6 @@ mod tests {
                     queue_empty: false,
                     has_pending_playback_task: false,
                     command_executing: false,
-                    song_command_executing: false,
                 },
             )
             .unwrap();
@@ -2950,7 +2323,6 @@ mod tests {
         let clock = Arc::new(ManualClock::new(Instant::now()));
         let controller = controller_with_time(
             FakeBackend::new(vec![]),
-            clock.clone(),
             clock.clone(),
             clock.clone(),
         );
@@ -3044,7 +2416,6 @@ mod tests {
                     queue_empty: false,
                     has_pending_playback_task: false,
                     command_executing: false,
-                    song_command_executing: false,
                 },
             )
             .unwrap();
@@ -3071,186 +2442,6 @@ mod tests {
     }
 
     #[test]
-    fn status_backend_failure_is_not_reported_as_confirmed_no_source() {
-        let controller = controller(FakeBackend::new(Vec::new()).with_status_error());
-
-        let error = controller
-            .play_and_verify(&request())
-            .expect_err("status backend failure must remain retryable");
-
-        assert_eq!(error.to_string(), "播放器状态暂不可用，请稍后再试");
-        assert_eq!(controller.snapshot().state, "unknown");
-    }
-
-    #[test]
-    fn later_status_backend_failures_keep_the_playback_attempt_retryable() {
-        let controller = controller(
-            FakeBackend::new(vec![
-                status("旧歌", "miliastra://track/qqmusic/old", 30.0, 180.0),
-                stopped_status(),
-            ])
-            .with_status_error_after(2),
-        );
-
-        let error = controller
-            .play_and_verify(&request())
-            .expect_err("final status failures must not become confirmed no-source");
-
-        assert_eq!(error.to_string(), "播放器状态暂不可用，请稍后再试");
-        assert_eq!(controller.snapshot().state, "unknown");
-    }
-
-    #[test]
-    fn verification_no_source_marks_state_unknown_after_dispatch() {
-        let backend = FakeBackend::new(vec![
-            status("旧歌", "miliastra://track/qqmusic/old", 30.0, 180.0),
-            status("短歌", "miliastra://track/qqmusic/1", 1.0, 10.0),
-        ]);
-        let controller = controller(backend);
-        let old_request = playback_request("旧歌 - 歌手", "miliastra://track/qqmusic/old");
-        let old_status = status("旧歌", "miliastra://track/qqmusic/old", 30.0, 180.0);
-        controller
-            .confirm_playback_success(&old_request, &old_status)
-            .unwrap();
-        let request = request();
-        let mut attempt = controller.play_request(&request).unwrap();
-
-        let result = controller
-            .verify_playback_started(&request, &mut attempt)
-            .unwrap();
-
-        let PlaybackVerification::NoSource {
-            status: Some(status),
-            reason,
-        } = result
-        else {
-            panic!("short playback should report its observed no-source evidence");
-        };
-        assert_eq!(status.current_uri, "miliastra://track/qqmusic/1");
-        assert_eq!(status.duration, 10.0);
-        assert_eq!(reason, "歌曲时长过短: 10.0s");
-        let snapshot = controller.snapshot();
-        assert_eq!(snapshot.state, "unknown");
-        assert!(snapshot.active_keyword.is_empty());
-        assert!(snapshot.active_uri.is_empty());
-    }
-
-    #[test]
-    fn verification_timeout_marks_state_unknown_after_dispatch() {
-        let backend = FakeBackend::new(vec![status(
-            "旧歌",
-            "miliastra://track/qqmusic/old",
-            30.0,
-            180.0,
-        )]);
-        let controller = controller(backend);
-        let old_request = playback_request("旧歌 - 歌手", "miliastra://track/qqmusic/old");
-        let old_status = status("旧歌", "miliastra://track/qqmusic/old", 30.0, 180.0);
-        controller
-            .confirm_playback_success(&old_request, &old_status)
-            .unwrap();
-        let request = request();
-        let mut attempt = controller.play_request(&request).unwrap();
-
-        let result = controller
-            .verify_playback_started(&request, &mut attempt)
-            .unwrap();
-
-        assert!(matches!(result, PlaybackVerification::NoSource { .. }));
-        let snapshot = controller.snapshot();
-        assert_eq!(snapshot.state, "unknown");
-        assert!(snapshot.active_keyword.is_empty());
-        assert!(snapshot.active_uri.is_empty());
-    }
-
-    #[test]
-    fn rejected_mismatch_marks_state_unknown_after_dispatch() {
-        let backend = FakeBackend::new(vec![]);
-        let controller = controller(backend.clone());
-        let request = request();
-        let _attempt = controller.play_request(&request).unwrap();
-
-        controller
-            .reject_mismatch_as_no_source(Some(&status(
-                "不匹配",
-                "miliastra://track/qqmusic/other",
-                1.0,
-                180.0,
-            )))
-            .unwrap();
-
-        let snapshot = controller.snapshot();
-        assert_eq!(snapshot.state, "unknown");
-        assert!(snapshot.active_keyword.is_empty());
-        assert!(snapshot.active_uri.is_empty());
-        assert_eq!(*backend.paused.lock().unwrap(), 1);
-    }
-
-    #[test]
-    fn non_playback_pending_task_does_not_pause_near_end_song() {
-        let backend = FakeBackend::new(vec![]);
-        let controller = controller(backend.clone());
-
-        let decision = controller
-            .maybe_advance_queue(
-                status("目标", "miliastra://track/qqmusic/1", 179.0, 180.0),
-                QueueAdvanceContext {
-                    queue_empty: true,
-                    has_pending_playback_task: false,
-                    command_executing: false,
-                    song_command_executing: false,
-                },
-            )
-            .unwrap();
-
-        assert_eq!(decision, QueueAdvanceDecision::None);
-        assert_eq!(*backend.paused.lock().unwrap(), 0);
-    }
-
-    #[test]
-    fn playback_pending_task_pauses_near_end_song() {
-        let backend = FakeBackend::new(vec![]);
-        let controller = controller(backend.clone());
-
-        let decision = controller
-            .maybe_advance_queue(
-                status("目标", "miliastra://track/qqmusic/1", 179.0, 180.0),
-                QueueAdvanceContext {
-                    queue_empty: true,
-                    has_pending_playback_task: true,
-                    command_executing: false,
-                    song_command_executing: false,
-                },
-            )
-            .unwrap();
-
-        assert_eq!(decision, QueueAdvanceDecision::PauseForQueue);
-        assert_eq!(*backend.paused.lock().unwrap(), 1);
-    }
-
-    #[test]
-    fn waiting_for_queue_pause_resumes_only_when_idle() {
-        let backend = FakeBackend::new(vec![]);
-        let controller = controller(backend.clone());
-        assert!(controller.pause_for_queue().unwrap());
-
-        let decision = controller
-            .maybe_advance_queue(
-                status("目标", "miliastra://track/qqmusic/1", 10.0, 180.0),
-                QueueAdvanceContext {
-                    queue_empty: true,
-                    has_pending_playback_task: false,
-                    command_executing: false,
-                    song_command_executing: false,
-                },
-            )
-            .unwrap();
-
-        assert_eq!(decision, QueueAdvanceDecision::ResumeIfIdle);
-        assert_eq!(*backend.resumed.lock().unwrap(), 1);
-    }
-
-    #[test]
     fn user_pause_does_not_auto_resume() {
         let backend = FakeBackend::new(vec![]);
         let controller = controller(backend.clone());
@@ -3263,7 +2454,6 @@ mod tests {
                     queue_empty: true,
                     has_pending_playback_task: false,
                     command_executing: false,
-                    song_command_executing: false,
                 },
             )
             .unwrap();

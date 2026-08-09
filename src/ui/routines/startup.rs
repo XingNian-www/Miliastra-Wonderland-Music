@@ -962,7 +962,7 @@ mod tests {
 
     #[test]
     fn enter_wonderland_accepts_a_paimon_only_primary_screen() {
-        let app = AppConfig::load(Path::new("config.yaml")).unwrap();
+        let app = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
         let mut config = test_startup_config(&app);
         config.startup.enter_wonderland_timeout_ms = 1;
         config.startup.wonderland_map_star_retries = 1;
@@ -1027,3 +1027,4 @@ mod tests {
         assert!(split_command_args(r#""abc"#).is_err());
     }
 }
+

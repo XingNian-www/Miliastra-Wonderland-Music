@@ -619,7 +619,7 @@ mod tests {
 
     #[test]
     fn invite_notification_and_navigation_run_in_one_ui_operation() {
-        let mut config = AppConfig::load(Path::new("config.yaml")).unwrap();
+        let mut config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
         config.timing.input.after_activate_ms = 0;
         config.timing.input.open_chat_ms = 0;
         config.timing.input.click_ms = 0;
@@ -818,3 +818,4 @@ mod tests {
         left.0.abs_diff(right.0) <= 10 && left.1.abs_diff(right.1) <= 10
     }
 }
+

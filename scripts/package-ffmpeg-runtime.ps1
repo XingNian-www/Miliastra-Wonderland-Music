@@ -10,8 +10,6 @@ param(
 
     [string]$LoginHelper = (Join-Path $PSScriptRoot "..\target\release\miliastra-login-helper.exe"),
 
-    [string]$KugouApi = (Join-Path $PSScriptRoot "..\target\kugou-api.exe"),
-
     [string]$Mnn = (Join-Path $PSScriptRoot "..\vendor\mnn\3.6.0\windows-x64\bin\MNN.dll"),
 
     [Parameter(Mandatory = $true)]
@@ -108,7 +106,6 @@ if (-not (Test-Path -LiteralPath $ffmpegBin -PathType Container)) {
 
 $executableFile = Get-ExistingFile $Executable "main executable"
 $loginHelperFile = Get-ExistingFile $LoginHelper "login helper executable"
-$kugouApiFile = Get-ExistingFile $KugouApi "Kugou API executable"
 $mnnFile = Get-ExistingFile $Mnn "MNN runtime"
 $minGwRuntimeFile = Get-ExistingFile $MinGwRuntime "MinGW runtime"
 if ($minGwRuntimeFile.Name.ToLowerInvariant() -ne "libwinpthread-1.dll") {
@@ -133,7 +130,6 @@ $destinationDirectory = (Resolve-Path -LiteralPath $Destination).Path
 $filesToCopy = @(
     $executableFile
     $loginHelperFile
-    $kugouApiFile
     $mnnFile
     $mediaFiles
     $minGwRuntimeFile
@@ -145,7 +141,6 @@ foreach ($file in $filesToCopy) {
 $expectedFiles = @(
     $executableFile.Name.ToLowerInvariant()
     $loginHelperFile.Name.ToLowerInvariant()
-    $kugouApiFile.Name.ToLowerInvariant()
     "mnn.dll"
     $mediaNames | ForEach-Object { $_.ToLowerInvariant() }
     $minGwRuntimeFile.Name.ToLowerInvariant()
@@ -175,7 +170,6 @@ foreach ($mediaName in $mediaNames) {
 $roots = @(
     (Join-Path $destinationDirectory $executableFile.Name)
     (Join-Path $destinationDirectory $loginHelperFile.Name)
-    (Join-Path $destinationDirectory $kugouApiFile.Name)
     (Join-Path $destinationDirectory $mnnFile.Name)
 )
 $visited = @{}

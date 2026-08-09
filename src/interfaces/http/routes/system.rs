@@ -387,19 +387,44 @@ pub(super) fn enqueue_startup_task_response<const N: usize>(
     tasks: [StartupTask; N],
 ) -> std::result::Result<String, AppError> {
     let mut receipts = Vec::with_capacity(N);
-    for task in tasks {
-        receipts.push(required_enqueue_receipt(
-            state.application.tasks.enqueue_startup(task),
-        )?);
+    let mut failures = Vec::new();
+    for (index, task) in tasks.into_iter().enumerate() {
+        match required_enqueue_receipt(state.application.tasks.enqueue_startup(task)) {
+            Ok(receipt) => receipts.push(receipt),
+            Err(error) => failures.push(json!({
+                "index": index,
+                "error": error.message,
+            })),
+        }
     }
-    let positions = receipts
-        .iter()
-        .map(|receipt| receipt.position)
-        .collect::<Vec<_>>();
-    let task_ids = receipts
-        .iter()
-        .map(|receipt| receipt.task_id)
-        .collect::<Vec<_>>();
+    if failures.is_empty() {
+        return enqueue_startup_success(task_label, &receipts);
+    }
+    // 部分任务入队失败：返回 200 并带完整信息，前端可感知已入队部分。
+    let mut response = json!({
+        "ok": true,
+        "queued": !receipts.is_empty(),
+        "allQueued": false,
+        "task": task_label,
+        "failed": failures,
+    });
+    if !receipts.is_empty() {
+        let positions = receipts.iter().map(|r| r.position).collect::<Vec<_>>();
+        let task_ids = receipts.iter().map(|r| r.task_id).collect::<Vec<_>>();
+        if let Some(object) = response.as_object_mut() {
+            object.insert("positions".to_string(), json!(positions));
+            object.insert("taskIds".to_string(), json!(task_ids));
+        }
+    }
+    Ok(response.to_string())
+}
+
+fn enqueue_startup_success(
+    task_label: &'static str,
+    receipts: &[EnqueueReceipt],
+) -> std::result::Result<String, AppError> {
+    let positions = receipts.iter().map(|r| r.position).collect::<Vec<_>>();
+    let task_ids = receipts.iter().map(|r| r.task_id).collect::<Vec<_>>();
     let mut response = json!({
         "ok": true,
         "queued": true,
@@ -457,9 +482,9 @@ pub(super) fn state_save(
     let BusinessMutationOutcome::Hall(HallMutationOutcome::StatePatched) = state
         .application
         .tasks
-        .apply_mutation(BusinessMutationIntent::Hall(
-            HallMutationIntent::PatchState(hall_state_patch(&patch)),
-        ))
+        .apply_mutation(BusinessMutationIntent::Hall(HallMutationIntent::PatchState(
+            hall_state_patch(&patch)?,
+        )))
         .map_err(internal_error)?
     else {
         unreachable!("runtime state patch intent returned a different outcome")
@@ -565,24 +590,36 @@ pub(super) fn monitor_json(state: &HttpSharedState) -> std::result::Result<Strin
     serde_json::to_string(&state.monitor.snapshot()).map_err(internal_error)
 }
 
-pub(super) fn hall_state_patch(patch: &HashMap<String, serde_json::Value>) -> HallStatePatch {
-    HallStatePatch {
-        remaining_minutes: patch.get("hallRemainingMinutes").and_then(|value| {
-            if value.is_null() {
-                Some(None)
-            } else {
-                value.as_u64().map(|minutes| u32::try_from(minutes).ok())
-            }
-        }),
-        remaining_updated_at: patch.get("hallRemainingUpdatedAt").and_then(|value| {
-            if value.is_null() {
-                Some(None)
-            } else {
-                value.as_u64().map(Some)
-            }
-        }),
-        expiring_warning_sent: patch
-            .get("hallExpiringWarningSent")
-            .and_then(serde_json::Value::as_bool),
-    }
+pub(super) fn hall_state_patch(
+    patch: &HashMap<String, serde_json::Value>,
+) -> std::result::Result<HallStatePatch, AppError> {
+    let remaining_minutes = match patch.get("hallRemainingMinutes") {
+        None => None,
+        Some(value) if value.is_null() => Some(None),
+        Some(value) => Some(Some(value.as_u64().and_then(|minutes| u32::try_from(minutes).ok()).ok_or_else(
+            || bad_request("hallRemainingMinutes 必须是 0-4294967295 的整数"),
+        )?)),
+    };
+    let remaining_updated_at = match patch.get("hallRemainingUpdatedAt") {
+        None => None,
+        Some(value) if value.is_null() => Some(None),
+        Some(value) => Some(Some(
+            value
+                .as_u64()
+                .ok_or_else(|| bad_request("hallRemainingUpdatedAt 必须是时间戳整数"))?,
+        )),
+    };
+    let expiring_warning_sent = match patch.get("hallExpiringWarningSent") {
+        None => None,
+        Some(value) => Some(
+            value
+                .as_bool()
+                .ok_or_else(|| bad_request("hallExpiringWarningSent 必须是 true/false"))?,
+        ),
+    };
+    Ok(HallStatePatch {
+        remaining_minutes,
+        remaining_updated_at,
+        expiring_warning_sent,
+    })
 }

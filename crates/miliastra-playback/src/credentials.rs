@@ -149,7 +149,11 @@ impl ProviderCredential {
                         "Kugou token, userid and dfid must not be empty".to_owned(),
                     ));
                 }
-                require_allowed_cookie_names(cookies, &["KugouGUID", "kg_mid", "mid"])?;
+                // t1 是概念版续期字段，登录/刷新时由官方 Set-Cookie 下发。
+                require_allowed_cookie_names(
+                    cookies,
+                    &["KugouGUID", "kg_mid", "mid", "t1", "vip_type", "vip_token"],
+                )?;
             }
         }
         let encoded = serde_json::to_vec(self)
@@ -225,8 +229,14 @@ impl ProviderCredential {
             provider: self.provider(),
             configured: true,
             fields,
-            refresh_supported: matches!(self, Self::Kugou { .. }),
-            manual_refresh_supported: matches!(self, Self::Kugou { .. }),
+            refresh_supported: matches!(
+                self,
+                Self::Kugou { .. } | Self::QqMusic { .. } | Self::Bilibili { .. }
+            ),
+            manual_refresh_supported: matches!(
+                self,
+                Self::Kugou { .. } | Self::QqMusic { .. } | Self::Bilibili { .. }
+            ),
             refresh_ready: match self {
                 Self::QqMusic { cookies } => has_any_cookie(
                     cookies,
@@ -304,8 +314,8 @@ impl CredentialStatus {
             provider,
             configured: false,
             fields,
-            refresh_supported: provider == "kugou",
-            manual_refresh_supported: provider == "kugou",
+            refresh_supported: matches!(provider, "kugou" | "qqmusic" | "bilibili"),
+            manual_refresh_supported: matches!(provider, "kugou" | "qqmusic" | "bilibili"),
             refresh_ready: false,
             refresh_state: "unavailable",
             last_refresh_at_ms: None,

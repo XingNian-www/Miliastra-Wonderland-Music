@@ -1,3 +1,6 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::thread;
 use std::time::Duration;
 
 use miliastra_playback::{
@@ -12,15 +15,80 @@ use crate::runtime::player_io::{
     PlayerObservationPort, PlayerObservationReadError, PlayerSearchError, PlayerSearchPort,
 };
 
+/// 音量渐变总步数（线性插值，防爆音）。
+const VOLUME_SMOOTH_STEPS: u8 = 8;
+
 #[derive(Clone)]
 pub(crate) struct NativePlaybackAdapter {
     playback: PlaybackHandle,
+    /// 每个平滑步进之间的等待时间，来自 timing.external.volume_smooth_step_ms。
+    volume_smooth_step_ms: u64,
+    /// 渐变代际：新命令自增，旧渐变线程据此退出，避免多次命令互相打架。
+    volume_smooth_generation: Arc<AtomicU64>,
 }
 
 impl NativePlaybackAdapter {
-    pub(crate) fn new(playback: PlaybackHandle) -> Self {
-        Self { playback }
+    pub(crate) fn new(playback: PlaybackHandle, volume_smooth_step_ms: u64) -> Self {
+        Self {
+            playback,
+            volume_smooth_step_ms,
+            volume_smooth_generation: Arc::new(AtomicU64::new(0)),
+        }
     }
+
+    /// 异步音量渐变：立即确认命令，后台线程按步进间隔逐步逼近目标音量。
+    fn set_volume_smoothed(&self, target: u8) -> ControlDispatch {
+        let my_generation = self
+            .volume_smooth_generation
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        let generation = Arc::clone(&self.volume_smooth_generation);
+        let playback = self.playback.clone();
+        let step_ms = self.volume_smooth_step_ms;
+        thread::Builder::new()
+            .name("volume-smooth".to_string())
+            .spawn(move || {
+                let current = playback
+                    .snapshot()
+                    .map(|snapshot| snapshot.volume)
+                    .unwrap_or(target);
+                for next in volume_smooth_sequence(current, target) {
+                    if generation.load(Ordering::Relaxed) != my_generation {
+                        // 已有更新的音量命令接管渐变。
+                        return;
+                    }
+                    if playback.set_volume(next).is_err() {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(step_ms));
+                }
+            })
+            .ok();
+        ControlDispatch::immediate(ControlDispatchOutcome::acknowledged("ok"))
+    }
+}
+
+/// 线性渐变序列：从 current 到 target 分 [`VOLUME_SMOOTH_STEPS`] 步插值，
+/// 跳过与当前值相同的重复步，目标与当前一致时返回空序列。
+fn volume_smooth_sequence(current: u8, target: u8) -> Vec<u8> {
+    let current = i32::from(current);
+    let target = i32::from(target);
+    if current == target {
+        return Vec::new();
+    }
+    let mut sequence = Vec::with_capacity(usize::from(VOLUME_SMOOTH_STEPS));
+    let mut last = current;
+    for index in 1..=i32::from(VOLUME_SMOOTH_STEPS) {
+        let next = current + (target - current) * index / i32::from(VOLUME_SMOOTH_STEPS);
+        if next != last {
+            sequence.push(next as u8);
+            last = next;
+        }
+        if next == target {
+            break;
+        }
+    }
+    sequence
 }
 
 impl PlayerObservationPort for NativePlaybackAdapter {
@@ -107,7 +175,9 @@ impl PlayerControlPort for NativePlaybackAdapter {
         let result = match control {
             PlayerControl::Pause => self.playback.pause(),
             PlayerControl::Resume => self.playback.resume(),
-            PlayerControl::SetVolume(volume) => self.playback.set_volume(*volume),
+            PlayerControl::SetVolume(volume) => {
+                return self.set_volume_smoothed(*volume);
+            }
             PlayerControl::Next | PlayerControl::Previous => {
                 return ControlDispatch::immediate(ControlDispatchOutcome::not_sent(
                     "native playback queue navigation is owned by the application",
@@ -151,9 +221,16 @@ impl PlayerSearchPort for NativePlaybackAdapter {
     ) -> Result<Option<PickedCandidate>, PlayerSearchError> {
         let candidates = self.search_candidates(keyword, source)?;
         let formatted = format_candidates(&candidates);
+        // 只保留可播放与无法确认的候选；VIP/无版权/需购买/不可播的歌曲直接屏蔽
+        // （搜索标注已按账号凭据判定：VIP 账号的 VIP 歌解析成功会标可播放）。
         let playable = candidates
             .iter()
-            .filter(|candidate| candidate.eligibility != PlaybackEligibility::Ineligible)
+            .filter(|candidate| {
+                matches!(
+                    candidate.eligibility,
+                    PlaybackEligibility::Eligible | PlaybackEligibility::Unknown
+                )
+            })
             .cloned()
             .collect::<Vec<_>>();
         let preferred = if prefer_accompaniment {
@@ -249,7 +326,7 @@ fn dispatch_error(error: PlaybackError) -> ControlDispatchOutcome {
 
 #[cfg(test)]
 mod tests {
-    use super::providers;
+    use super::{volume_smooth_sequence, providers};
     use miliastra_playback::ProviderId;
 
     #[test]
@@ -272,5 +349,31 @@ mod tests {
         );
         assert!(providers("qqmusic,unknown").is_err());
         assert!(providers("qqmusic,,netease").is_err());
+    }
+
+    #[test]
+    fn volume_smooth_sequence_interpolates_linearly_in_eight_steps() {
+        assert_eq!(
+            volume_smooth_sequence(100, 50),
+            vec![94, 88, 82, 75, 69, 63, 57, 50]
+        );
+        assert_eq!(
+            volume_smooth_sequence(0, 100),
+            vec![12, 25, 37, 50, 62, 75, 87, 100]
+        );
+    }
+
+    #[test]
+    fn volume_smooth_sequence_skips_duplicate_steps_when_the_delta_is_small() {
+        assert_eq!(volume_smooth_sequence(53, 50), vec![52, 51, 50]);
+        assert_eq!(volume_smooth_sequence(50, 55), vec![51, 52, 53, 54, 55]);
+        assert_eq!(volume_smooth_sequence(50, 51), vec![51]);
+    }
+
+    #[test]
+    fn volume_smooth_sequence_is_empty_when_already_at_target() {
+        assert_eq!(volume_smooth_sequence(50, 50), Vec::<u8>::new());
+        assert_eq!(volume_smooth_sequence(0, 0), Vec::<u8>::new());
+        assert_eq!(volume_smooth_sequence(100, 100), Vec::<u8>::new());
     }
 }

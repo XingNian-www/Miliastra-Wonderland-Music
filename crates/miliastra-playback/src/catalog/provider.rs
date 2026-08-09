@@ -86,7 +86,18 @@ impl ProviderRegistry {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PlaybackEligibility {
+    /// 可直接播放。
     Eligible,
+    /// 需要 VIP/付费才能完整播放。
+    #[serde(rename = "vip")]
+    VipRequired,
+    /// 无版权/版权受限（含仅试听），不可完整播放。
+    #[serde(rename = "no_copyright")]
+    NoCopyright,
+    /// 需要单独购买（数字专辑/单曲）。
+    #[serde(rename = "paid")]
+    PaidRequired,
+    /// 不可播放（无有效音源等）。
     Ineligible,
     #[default]
     Unknown,
@@ -97,7 +108,7 @@ impl PlaybackEligibility {
         match self {
             Self::Eligible => 2,
             Self::Unknown => 1,
-            Self::Ineligible => 0,
+            Self::VipRequired | Self::NoCopyright | Self::PaidRequired | Self::Ineligible => 0,
         }
     }
 }

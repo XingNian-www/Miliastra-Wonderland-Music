@@ -422,7 +422,7 @@ impl SourceAdapter for NeteaseAdapter {
 
     async fn account_status(&self) -> Result<Option<ProviderAccountStatus>, CatalogError> {
         let now = std::time::Instant::now();
-        if let Ok(mut guard) = self.account_cache.lock()
+        if let Ok(guard) = self.account_cache.lock()
             && let Some((status, cached_at, failed)) = guard.as_ref()
             && cached_at.elapsed()
                 < if *failed {

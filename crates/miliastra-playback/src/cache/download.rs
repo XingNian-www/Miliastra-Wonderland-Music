@@ -12,37 +12,35 @@ use crate::cache::{CacheInner, DownloadHandle, EntryState, complete_file_size, t
 
 /// 开始下载；幂等：已下载中/已完成则直接返回现有句柄。
 pub(crate) async fn start_download(inner: &Arc<CacheInner>, hash: &str) -> Option<DownloadView> {
-    loop {
-        let mut entries = inner.entries.write().await;
-        let entry = entries.get_mut(hash)?;
-        match &entry.state {
-            EntryState::Complete { bytes } => {
-                entry.last_used = std::time::Instant::now();
-                return Some(DownloadView::Complete { bytes: *bytes });
-            }
-            EntryState::Downloading(handle) => {
-                entry.last_used = std::time::Instant::now();
-                return Some(DownloadView::InProgress(handle.clone()));
-            }
-            EntryState::Idle => {
-                // 先占位为 Downloading，再释放锁启动任务，防止并发重复下载。
-                let handle = DownloadHandle {
-                    ready: Arc::new(tokio::sync::Notify::new()),
-                    bytes: Arc::new(AtomicUsize::new(0)),
-                    failed: Arc::new(AtomicBool::new(false)),
-                    finished: Arc::new(AtomicBool::new(false)),
-                };
-                entry.state = EntryState::Downloading(handle.clone());
-                let source = entry.source.clone();
-                let file = entry.file.clone();
-                let hash = hash.to_owned();
-                drop(entries);
-                let inner = inner.clone();
-                tokio::spawn(async move {
-                    run_download(inner.clone(), hash, source, file).await;
-                });
-                return Some(DownloadView::InProgress(handle));
-            }
+    let mut entries = inner.entries.write().await;
+    let entry = entries.get_mut(hash)?;
+    match &entry.state {
+        EntryState::Complete { bytes } => {
+            entry.last_used = std::time::Instant::now();
+            Some(DownloadView::Complete { bytes: *bytes })
+        }
+        EntryState::Downloading(handle) => {
+            entry.last_used = std::time::Instant::now();
+            Some(DownloadView::InProgress(handle.clone()))
+        }
+        EntryState::Idle => {
+            // 先占位为 Downloading，再释放锁启动任务，防止并发重复下载。
+            let handle = DownloadHandle {
+                ready: Arc::new(tokio::sync::Notify::new()),
+                bytes: Arc::new(AtomicUsize::new(0)),
+                failed: Arc::new(AtomicBool::new(false)),
+                finished: Arc::new(AtomicBool::new(false)),
+            };
+            entry.state = EntryState::Downloading(handle.clone());
+            let source = entry.source.clone();
+            let file = entry.file.clone();
+            let hash = hash.to_owned();
+            drop(entries);
+            let inner = inner.clone();
+            tokio::spawn(async move {
+                run_download(inner.clone(), hash, source, file).await;
+            });
+            Some(DownloadView::InProgress(handle))
         }
     }
 }

@@ -784,7 +784,7 @@ impl SourceAdapter for QqMusicAdapter {
     /// 使用 musicu.fcg `VipLogin.VipLoginInter/vip_login_base`（无签名即可用）。
     async fn account_status(&self) -> Result<Option<ProviderAccountStatus>, CatalogError> {
         let now = std::time::Instant::now();
-        if let Ok(mut guard) = self.account_cache.lock()
+        if let Ok(guard) = self.account_cache.lock()
             && let Some((status, cached_at, failed)) = guard.as_ref()
             && cached_at.elapsed()
                 < if *failed {
@@ -1462,7 +1462,7 @@ fn parse_qq_date_ms(value: &str) -> Option<u64> {
 
 /// 公历转儒略日（days since 1970-01-01）。
 fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
-    if !(1..=12).contains(&month) || day < 1 || day > 31 {
+    if !matches!(month, 1..=12) || !(1..=31).contains(&day) {
         return None;
     }
     let adjusted_year = if month <= 2 { year - 1 } else { year };

@@ -10,7 +10,7 @@ use crate::features::command::{
     CommandAuthority, CommandEnvelope, CommandPrefix, FeatureCommandMatch,
 };
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InviteConfig {
     pub friend_name_stable_count: u32,
@@ -19,19 +19,6 @@ pub struct InviteConfig {
     pub view_star_region: RectConfig,
     pub goto_hall_region: RectConfig,
     pub enter_hall_region: RectConfig,
-}
-
-impl Default for InviteConfig {
-    fn default() -> Self {
-        Self {
-            friend_name_stable_count: 0,
-            friend_list_region: RectConfig::default(),
-            friend_chat_region: RectConfig::default(),
-            view_star_region: RectConfig::default(),
-            goto_hall_region: RectConfig::default(),
-            enter_hall_region: RectConfig::default(),
-        }
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

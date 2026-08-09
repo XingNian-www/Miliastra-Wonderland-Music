@@ -21,6 +21,19 @@ pub struct InviteConfig {
     pub enter_hall_region: RectConfig,
 }
 
+impl Default for InviteConfig {
+    fn default() -> Self {
+        Self {
+            friend_name_stable_count: 0,
+            friend_list_region: RectConfig::default(),
+            friend_chat_region: RectConfig::default(),
+            view_star_region: RectConfig::default(),
+            goto_hall_region: RectConfig::default(),
+            enter_hall_region: RectConfig::default(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InviteTimingConfig {

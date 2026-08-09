@@ -22,7 +22,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use url::Url;
 
-use crate::catalog::{CatalogError, PlaybackEligibility, ProviderSearchCandidate, SourceAdapter};
+use crate::catalog::{
+    CatalogError, CredentialRefreshAdapter, PlaybackEligibility, ProviderAccountStatus,
+    ProviderSearchCandidate, SourceAdapter,
+};
 use crate::credentials::{CredentialStore, ProviderCredential};
 use crate::domain::{ResolverLocator, SearchSpec, Song, SongKey, StreamSource};
 use crate::lyrics::{TimedLyrics, parse_lrc_pair};
@@ -54,7 +57,22 @@ pub struct QqMusicAdapter {
     lyrics_url: Url,
     native_lyrics_url: Url,
     device: QqDevice,
+    /// 账号 VIP 状态缓存（成功 5 分钟/失败 60 秒），避免轮询频繁打账号接口。
+    account_cache: std::sync::Arc<
+        std::sync::Mutex<
+            Option<(
+                ProviderAccountStatus,
+                std::time::Instant,
+                bool,
+            )>,
+        >,
+    >,
 }
+
+/// QQ 账号状态缓存有效期（查询成功时）。
+const ACCOUNT_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+/// 查询失败（登录态失效/风控/超时）时的短缓存。
+const ACCOUNT_CACHE_FAILED_TTL: Duration = Duration::from_secs(60);
 
 impl QqMusicAdapter {
     pub fn new(credentials: CredentialStore, timeout: Duration) -> Result<Self, CatalogError> {
@@ -79,6 +97,7 @@ impl QqMusicAdapter {
                 .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?,
             native_lyrics_url: Url::parse(LYRICS_NATIVE_URL)
                 .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?,
+            account_cache: std::sync::Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -554,6 +573,103 @@ impl QqMusicAdapter {
             }
         })
     }
+
+    async fn query_account_status(&self) -> Result<Option<ProviderAccountStatus>, CatalogError> {
+        let Ok(credential) = self.credential() else {
+            return Ok(Some(ProviderAccountStatus {
+                logged_in: false,
+                ..ProviderAccountStatus::default()
+            }));
+        };
+        let cookies = credential.cookies();
+        let configured = ["qqmusic_key", "qm_keyst", "uin", "wxuin"]
+            .iter()
+            .any(|name| cookies.get(*name).is_some_and(|value| !value.is_empty()));
+        let user_id = first_cookie(cookies, &["uin", "wxuin"])
+            .map(str::to_owned)
+            .filter(|value| value != "0" && !value.is_empty());
+        // login_type：1=QQ 登录，2=微信授权登录（y.qq.com 微信扫码入口）。
+        let login_method = match cookies.get("login_type").map(String::as_str) {
+            Some("1") => Some("qq".to_owned()),
+            Some("2") => Some("wechat".to_owned()),
+            _ => cookies
+                .get("uin")
+                .is_some_and(|value| value != "0")
+                .then(|| "qq".to_owned()),
+        };
+        if !configured {
+            return Ok(Some(ProviderAccountStatus {
+                logged_in: false,
+                user_id,
+                login_method,
+                ..ProviderAccountStatus::default()
+            }));
+        }
+        let uin = first_cookie(cookies, &["uin", "wxuin"]).unwrap_or("0");
+        let body = serde_json::json!({
+            "comm": {"ct": 24, "cv": 0, "uin": uin},
+            "req_0": {
+                "module": "VipLogin.VipLoginInter",
+                "method": "vip_login_base",
+                "param": {}
+            }
+        });
+        let response = self
+            .client
+            .post(self.search_url.clone())
+            .header("Cookie", cookie_header(cookies))
+            .header("Referer", "https://y.qq.com/")
+            .json(&body)
+            .send()
+            .await
+            .map_err(classify_request_error)?;
+        classify_status(&response)?;
+        let value = response
+            .json::<Value>()
+            .await
+            .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?;
+        let Some(data) = value.pointer("/req_0/data").filter(|v| v.is_object()) else {
+            // 登录态失效或接口拒绝：视为查询失败，走失败缓存快速重试。
+            return Err(CatalogError::InvalidResponse(
+                "QQ Music vip_login_base returned no data".to_owned(),
+            ));
+        };
+        let identity = data.get("identity").unwrap_or(data);
+        let vip = identity
+            .get("vip")
+            .or_else(|| data.get("svip"))
+            .or_else(|| identity.get("HugeVip"))
+            .or_else(|| identity.get("star"))
+            .or_else(|| identity.get("twelve"))
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+            != 0;
+        let vip_type = vip_vip_type_label(identity, data);
+        let vip_expire_at_ms = identity
+            .get("HugeVipEnd")
+            .or_else(|| identity.get("LMEnd"))
+            .and_then(Value::as_str)
+            .and_then(parse_qq_date_ms);
+        Ok(Some(ProviderAccountStatus {
+            logged_in: true,
+            user_id,
+            nickname: None,
+            vip,
+            vip_type: vip.then_some(vip_type).or_else(|| Some("非VIP".to_owned())),
+            vip_expire_at_ms,
+            login_method,
+        }))
+    }
+}
+
+#[async_trait]
+impl CredentialRefreshAdapter for QqMusicAdapter {
+    async fn refresh_credential(
+        &self,
+        credential: &ProviderCredential,
+    ) -> Result<Option<ProviderCredential>, CatalogError> {
+        QqMusicAdapter::refresh_credential(self, credential).await
+    }
 }
 
 #[async_trait]
@@ -619,7 +735,10 @@ impl SourceAdapter for QqMusicAdapter {
                 Self::resolve_payload(&song_mid, &media_mid, uin),
             )
             .await?;
-        let url = qq_stream_url(&response)?;
+        let url = match qq_stream_url(&response) {
+            Ok(url) => url,
+            Err(error) => return Err(classify_qq_resolve_failure(&response, error)),
+        };
         Ok(StreamSource {
             url,
             // The vkey is embedded in purl. Account cookies must not be sent
@@ -666,6 +785,33 @@ impl SourceAdapter for QqMusicAdapter {
             .and_then(|value| strip_untranslated_placeholder_lines(&value));
         parse_lrc_pair(&primary, translation.as_deref())
             .map_err(|error| CatalogError::InvalidResponse(error.to_string()))
+    }
+
+    /// QQ 音乐账号状态：登录态 + VIP（绿钻/SVIP）查询。
+    /// 使用 musicu.fcg `VipLogin.VipLoginInter/vip_login_base`（无签名即可用）。
+    async fn account_status(&self) -> Result<Option<ProviderAccountStatus>, CatalogError> {
+        let now = std::time::Instant::now();
+        if let Ok(mut guard) = self.account_cache.lock()
+            && let Some((status, cached_at, failed)) = guard.as_ref()
+            && cached_at.elapsed() < if *failed { ACCOUNT_CACHE_FAILED_TTL } else { ACCOUNT_CACHE_TTL }
+        {
+            return Ok(Some(status.clone()));
+        }
+        let result = self.query_account_status().await;
+        if let Ok(mut guard) = self.account_cache.lock() {
+            match &result {
+                Ok(Some(status)) => *guard = Some((status.clone(), now, false)),
+                // 失败（登录态失效/风控/超时）时保留上次成功值并标记失败。
+                _ => {
+                    let cached = guard
+                        .as_ref()
+                        .map(|(status, ..)| status.clone())
+                        .unwrap_or_default();
+                    *guard = Some((cached, now, true));
+                }
+            }
+        }
+        result
     }
 }
 
@@ -754,17 +900,48 @@ fn qq_filename(media_mid: &str, prefix: &str, extension: &str) -> String {
     format!("{prefix}{media_mid}.{extension}")
 }
 
+/// QQ 播放 URL 获取失败时的分类：先排除登录失效（响应带 auth 错误码），
+/// 再查 midurlinfo 的 vip=1 表示需要 VIP；否则视为版权/音源受限。
+fn classify_qq_resolve_failure(response: &Value, error: CatalogError) -> CatalogError {
+    if qq_response_requires_auth_refresh(response) {
+        return CatalogError::AuthRequired(
+            "QQ Music credential expired; login is required".to_owned(),
+        );
+    }
+    let info = response
+        .pointer("/req_0/data/midurlinfo/0")
+        .or_else(|| response.pointer("/req_0/data/midurlinfo"));
+    let vip = info
+        .and_then(|value| {
+            value
+                .as_array()
+                .and_then(|items| items.first())
+                .or(Some(value))
+        })
+        .and_then(|item| item.get("vip"))
+        .and_then(as_i64);
+    if vip == Some(1) {
+        return CatalogError::VipRequired("QQ Music track requires VIP membership".to_owned());
+    }
+    match error {
+        CatalogError::Unavailable(message) => {
+            CatalogError::NoCopyright(format!("QQ Music track has no copyright: {message}"))
+        }
+        other => other,
+    }
+}
+
 pub(crate) fn qq_eligibility(raw: &Value) -> PlaybackEligibility {
     let switch = raw.pointer("/action/switch").and_then(as_i64);
     let play_bits_off = switch.is_some_and(|value| value & PLAY_BITS_MASK == 0);
     if play_bits_off && switch.is_some_and(|value| value & TRY_BIT_MASK == 0) {
-        return PlaybackEligibility::Ineligible;
+        return PlaybackEligibility::NoCopyright;
     }
     if raw.pointer("/pay/pay_play").and_then(as_i64) == Some(1) {
-        return PlaybackEligibility::Unknown;
+        return PlaybackEligibility::VipRequired;
     }
     if play_bits_off {
-        return PlaybackEligibility::Unknown;
+        return PlaybackEligibility::NoCopyright;
     }
     if let Some(file) = raw.get("file").and_then(Value::as_object) {
         let sizes = file
@@ -1229,6 +1406,77 @@ fn as_i64(value: &Value) -> Option<i64> {
     value.as_i64().or_else(|| value.as_str()?.parse().ok())
 }
 
+/// 生成 QQ 音乐 VIP 类型标签（绿钻/SVIP/豪华绿钻/年费等组合）。
+fn vip_vip_type_label(identity: &Value, data: &Value) -> String {
+    let flag = |name: &str, value: &Value| {
+        value
+            .get(name)
+            .and_then(Value::as_i64)
+            .is_some_and(|v| v != 0)
+    };
+    let mut labels = Vec::new();
+    if flag("HugeVip", identity) {
+        labels.push("豪华绿钻");
+    } else if flag("vip", identity) {
+        labels.push("绿钻");
+    }
+    if flag("svip", data) {
+        labels.push("SVIP");
+    }
+    if flag("star", identity) {
+        labels.push("星级");
+    }
+    if flag("twelve", identity) {
+        labels.push("十二平台");
+    }
+    if flag("yearflag", identity) || flag("HugeYearFlag", identity) {
+        labels.push("年费");
+    }
+    if labels.is_empty() {
+        labels.push("VIP");
+    }
+    labels.join("·")
+}
+
+/// 解析 QQ VIP 到期时间（"2026-07-20 07:50:53"）为 epoch 毫秒。
+fn parse_qq_date_ms(value: &str) -> Option<u64> {
+    let value = value.trim();
+    if value.is_empty() || value == "-1" {
+        return None;
+    }
+    let date = if let Some(rest) = value.strip_suffix(" 00:00:00") {
+        rest
+    } else {
+        value
+    };
+    let mut parts = date.split(['-', ' ', ':']).filter_map(|part| part.parse::<u64>().ok());
+    let year = parts.next()?;
+    let month = parts.next()?;
+    let day = parts.next()?;
+    let hour = parts.next().unwrap_or(0);
+    let minute = parts.next().unwrap_or(0);
+    let second = parts.next().unwrap_or(0);
+    let days = days_from_civil(year as i64, month as i64, day as i64)?;
+    Some(
+        (days * 86_400 + hour as i64 * 3_600 + minute as i64 * 60 + second as i64) as u64 * 1000,
+    )
+}
+
+/// 公历转儒略日（days since 1970-01-01）。
+fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
+    if !(1..=12).contains(&month) || day < 1 || day > 31 {
+        return None;
+    }
+    let adjusted_year = if month <= 2 { year - 1 } else { year };
+    let era = if adjusted_year >= 0 { adjusted_year } else { adjusted_year - 399 } / 400;
+    let year_of_era = adjusted_year - era * 400;
+    let month_adjusted = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * month_adjusted + 2) / 5 + day - 1;
+    let day_of_era =
+        year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    Some(era * 146_097 + day_of_era - 719_468)
+}
+
 fn qq_resolver_ids(
     key: &SongKey,
     locator: Option<&ResolverLocator>,
@@ -1523,14 +1771,14 @@ mod tests {
     }
 
     #[test]
-    fn qq_rights_metadata_maps_to_three_states_without_preflight() {
+    fn qq_rights_metadata_maps_to_states_without_preflight() {
         assert_eq!(
             qq_eligibility(&json!({"action":{"switch":0},"file":{"size_128mp3":0}})),
-            PlaybackEligibility::Ineligible
+            PlaybackEligibility::NoCopyright
         );
         assert_eq!(
             qq_eligibility(&json!({"action":{"switch":1 << 14}})),
-            PlaybackEligibility::Unknown
+            PlaybackEligibility::NoCopyright
         );
         assert_eq!(
             qq_eligibility(&json!({"action":{"switch":14},"file":{"size_128mp3":1}})),
@@ -1695,10 +1943,19 @@ mod tests {
             parse_search_candidates(&json!({"search":{"data":{"body":{"song":{"list":raw}}}}}))
                 .unwrap();
         assert_eq!(parsed.len(), 5);
+        // switch=0 的歌曲标注无版权（保留展示），其余为可播放。
+        assert_eq!(
+            parsed
+                .iter()
+                .find(|candidate| candidate.song.key.id == "mid-0")
+                .unwrap()
+                .eligibility,
+            PlaybackEligibility::NoCopyright
+        );
         assert!(
             parsed
                 .iter()
-                .all(|candidate| candidate.song.key.id != "mid-0")
+                .all(|candidate| candidate.eligibility != PlaybackEligibility::Ineligible)
         );
     }
 

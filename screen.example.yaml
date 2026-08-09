@@ -1,0 +1,64 @@
+# 截图会缩放到这个宽度后再做模板匹配和 OCR
+expected_width: 1920
+
+# 截图会缩放到这个高度后再做模板匹配和 OCR
+expected_height: 1080
+
+# 截图尺寸和预期不一致时是否记录 warning
+warn_on_size_mismatch: true
+
+# 聊天区域，用于匹配蓝/黄/粉聊天标志和 OCR 聊天文本
+chat_rect:
+  x: 39
+  y: 879
+  width: 416
+  height: 143
+
+# 一级聊天界面无聊天内容时好友按钮模板检测区域；有聊天内容时由蓝/黄/粉标识判定（游戏客户区坐标，不含标题栏）
+friend_rect:
+  x: 170
+  y: 1018
+  width: 50
+  height: 40
+
+# 二级聊天界面左上角返回按钮模板检测区域
+secondary_back_rect:
+  x: 15
+  y: 15
+  width: 65
+  height: 65
+
+# 二级大厅/面板界面模板检测区域
+secondary_hall_rect:
+  x: 10
+  y: 190
+  width: 65
+  height: 55
+
+# F2 大厅页顶部大厅名称 OCR 区域
+hall_name_rect:
+  x: 75
+  y: 425
+  width: 325
+  height: 40
+
+# 大厅成员人数 OCR 区域，用于判断是否需要滚动右侧成员列表
+hall_member_count_rect:
+  x: 75
+  y: 470
+  width: 450
+  height: 50
+
+# F2 大厅页剩余时间 OCR 区域，只保留识别到的分钟数字
+hall_time_rect:
+  x: 430
+  y: 520
+  width: 110
+  height: 40
+
+# F2 大厅页成员列表滚动区域；拖动点位约在画布宽度的 2/3 处
+hall_member_list_rect:
+  x: 1280
+  y: 110
+  width: 560
+  height: 850

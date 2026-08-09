@@ -33,10 +33,6 @@ pub(super) fn playback_remaining_seconds(status: &PlayerStatus) -> Option<f64> {
     Some(status.duration - status.progress)
 }
 
-pub(super) fn playback_progress_restarted(before: f64, after: f64) -> bool {
-    before.is_finite() && after.is_finite() && before > 2.0 && (after < 2.0 || after + 1.0 < before)
-}
-
 pub(crate) fn format_play_message(status: &PlayerStatus) -> String {
     format!(
         "播放: {} ({}/{}) 音量{}",

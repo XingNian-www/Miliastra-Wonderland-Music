@@ -35,10 +35,12 @@ trait LoginPlaybackPort: Send + Sync {
     fn credential_statuses(&self) -> Result<Vec<CredentialStatus>, PlaybackError>;
     fn refresh_credential(&self, provider: ProviderId) -> Result<CredentialStatus, PlaybackError>;
     fn kugou_status(&self) -> Result<miliastra_playback::KugouAccountStatus, PlaybackError>;
-    fn kugou_report(
+    fn account_status(
         &self,
-        mixsongid: String,
-    ) -> Result<miliastra_playback::KugouListenReport, PlaybackError>;
+        provider: ProviderId,
+    ) -> Result<Option<miliastra_playback::ProviderAccountStatus>, PlaybackError>;
+    fn kugou_claim_vip(&self) -> Result<miliastra_playback::KugouListenReport, PlaybackError>;
+    fn kugou_upgrade_vip(&self) -> Result<miliastra_playback::KugouListenReport, PlaybackError>;
     fn begin_login(&self, provider: ProviderId) -> Result<LoginSession, PlaybackError>;
     fn complete_login(
         &self,
@@ -88,11 +90,19 @@ impl LoginPlaybackPort for PlaybackHandle {
         PlaybackHandle::kugou_account_status(self)
     }
 
-    fn kugou_report(
+    fn account_status(
         &self,
-        mixsongid: String,
-    ) -> Result<miliastra_playback::KugouListenReport, PlaybackError> {
-        PlaybackHandle::kugou_report_listen_song(self, mixsongid)
+        provider: ProviderId,
+    ) -> Result<Option<miliastra_playback::ProviderAccountStatus>, PlaybackError> {
+        PlaybackHandle::account_status(self, provider)
+    }
+
+    fn kugou_claim_vip(&self) -> Result<miliastra_playback::KugouListenReport, PlaybackError> {
+        PlaybackHandle::kugou_claim_vip(self)
+    }
+
+    fn kugou_upgrade_vip(&self) -> Result<miliastra_playback::KugouListenReport, PlaybackError> {
+        PlaybackHandle::kugou_upgrade_vip(self)
     }
 
     fn begin_login(&self, provider: ProviderId) -> Result<LoginSession, PlaybackError> {
@@ -235,6 +245,7 @@ impl KugouDeviceRegistrar for HttpKugouDeviceRegistrar {
 
 struct CommandHelperLauncher {
     executable: PathBuf,
+    credential_directory: PathBuf,
 }
 
 impl HelperLauncher for CommandHelperLauncher {
@@ -244,7 +255,8 @@ impl HelperLauncher for CommandHelperLauncher {
         profile: &Path,
         timeout: Duration,
     ) -> io::Result<SpawnedHelper> {
-        let mut child = Command::new(&self.executable)
+        let mut command = Command::new(&self.executable);
+        command
             .arg(provider.as_str())
             .arg("--profile")
             .arg(profile)
@@ -252,8 +264,15 @@ impl HelperLauncher for CommandHelperLauncher {
             .arg(timeout.as_secs().max(1).to_string())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()?;
+            .stderr(Stdio::null());
+        // 酷狗概念版扫码登录必须使用与 sidecar 相同的设备标识，
+        // 否则扫码 token 绑定匿名设备，概念版 API 会拒绝（20018）。
+        if provider == ProviderId::Kugou
+            && let Some(guid) = load_kugou_device_guid(&self.credential_directory)
+        {
+            command.env("KUGOU_API_GUID", guid);
+        }
+        let mut child = command.spawn()?;
         let stdout = child.stdout.take().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -265,6 +284,17 @@ impl HelperLauncher for CommandHelperLauncher {
             stdout: Box::new(stdout),
         })
     }
+}
+
+/// 读取酷狗设备标识文件中的 GUID（与 sidecar 共用同一设备）。
+fn load_kugou_device_guid(directory: &std::path::Path) -> Option<String> {
+    let path = directory.join("kugou-device.json");
+    let text = std::fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    value
+        .get("guid")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
 }
 
 struct CommandChild {
@@ -376,14 +406,14 @@ pub(crate) struct LoginManagerStatus {
 
 #[derive(Clone, Debug)]
 pub(crate) struct LoginHelperFailure {
-    pub code: &'static str,
-    pub message: &'static str,
+    pub code: String,
+    pub message: String,
     pub provider: Option<ProviderId>,
 }
 
 impl std::fmt::Display for LoginHelperFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.message)
+        formatter.write_str(&self.message)
     }
 }
 
@@ -411,7 +441,10 @@ impl LoginHelperManager {
             .expect("酷狗 API 基址已在配置阶段校验");
         Self::new_with_dependencies(
             Arc::new(playback),
-            Arc::new(CommandHelperLauncher { executable }),
+            Arc::new(CommandHelperLauncher {
+                executable,
+                credential_directory: credential_directory.clone(),
+            }),
             Arc::new(registrar),
             credential_directory,
             timeout,
@@ -697,13 +730,31 @@ impl LoginHelperManager {
             .map_err(|error| playback_failure(error, Some(ProviderId::Kugou)))
     }
 
-    pub(crate) fn kugou_report(
+    pub(crate) fn account_status(
         &self,
-        mixsongid: String,
+        provider: ProviderId,
+    ) -> Result<Option<miliastra_playback::ProviderAccountStatus>, LoginHelperFailure> {
+        self.inner
+            .playback
+            .account_status(provider)
+            .map_err(|error| playback_failure(error, Some(provider)))
+    }
+
+    pub(crate) fn kugou_claim_vip(
+        &self,
     ) -> Result<miliastra_playback::KugouListenReport, LoginHelperFailure> {
         self.inner
             .playback
-            .kugou_report(mixsongid)
+            .kugou_claim_vip()
+            .map_err(|error| playback_failure(error, Some(ProviderId::Kugou)))
+    }
+
+    pub(crate) fn kugou_upgrade_vip(
+        &self,
+    ) -> Result<miliastra_playback::KugouListenReport, LoginHelperFailure> {
+        self.inner
+            .playback
+            .kugou_upgrade_vip()
             .map_err(|error| playback_failure(error, Some(ProviderId::Kugou)))
     }
 
@@ -1138,11 +1189,14 @@ fn credential_from_payload_with_device_registration(
         CredentialPayload::Kugou {
             token,
             userid,
-            cookies,
+            mut cookies,
         } => {
             let dfid = inner
                 .kugou_device_registrar
                 .register(&token, &userid, &cookies)?;
+            // dfid 已作为独立凭据字段保存；移除 cookie 副本以通过
+            // 凭据 cookie 白名单校验。
+            cookies.remove("dfid");
             Ok(ProviderCredential::Kugou {
                 token,
                 userid,
@@ -1181,15 +1235,52 @@ fn protocol_failure(error: ProtocolError, provider: ProviderId) -> LoginHelperFa
     manager_failure(code, message, Some(provider))
 }
 
+/// 播放层错误映射：透传真实错误码与原始信息（失败原因一目了然），
+/// 仅在原始信息为空时回落到中文说明。
 fn playback_failure(error: PlaybackError, provider: Option<ProviderId>) -> LoginHelperFailure {
-    let (code, message) = match error.code() {
-        "login_in_progress" => ("login_in_progress", "已有登录任务正在进行"),
-        "login_session_invalid" => ("login_session_invalid", "登录会话无效"),
-        "provider_auth_required" => ("provider_auth_required", "该平台尚未登录"),
-        "relogin_required" => ("relogin_required", "登录凭据已失效，请重新登录"),
-        _ => ("login_operation_failed", "登录操作失败"),
-    };
-    manager_failure(code, message, provider)
+    match error {
+        PlaybackError::Failure(failure) => {
+            let message = if failure.message.trim().is_empty() {
+                playback_code_message(&failure.code).to_owned()
+            } else {
+                failure.message
+            };
+            LoginHelperFailure {
+                code: failure.code,
+                message,
+                provider,
+            }
+        }
+        other => {
+            let code = other.code();
+            LoginHelperFailure {
+                code: code.to_owned(),
+                message: playback_code_message(code).to_owned(),
+                provider,
+            }
+        }
+    }
+}
+
+fn playback_code_message(code: &str) -> &'static str {
+    match code {
+        "playback_runtime_stopped" => "播放运行时未启动",
+        "playback_busy" => "播放运行时繁忙，请稍后重试",
+        "no_active_session" => "没有活动的播放会话",
+        "track_unavailable" => "曲目不可用",
+        "provider_auth_required" => "该平台尚未登录",
+        "relogin_required" => "登录凭据已失效，请重新登录",
+        "provider_rate_limited" => "上游接口触发限流，请稍后重试",
+        "provider_timeout" => "上游接口超时，请稍后重试",
+        "provider_transient" => "上游服务暂时不可用，请稍后重试",
+        "login_in_progress" => "已有登录任务正在进行",
+        "login_session_invalid" => "登录会话无效",
+        "unknown_provider" => "未知平台",
+        "invalid_request" => "请求参数无效",
+        "playback_cancelled" => "操作已取消",
+        "playback_failed" => "播放操作失败",
+        _ => "播放操作失败",
+    }
 }
 
 fn provider_display_name(provider: ProviderId) -> &'static str {
@@ -1220,8 +1311,8 @@ fn manager_failure(
     provider: Option<ProviderId>,
 ) -> LoginHelperFailure {
     LoginHelperFailure {
-        code,
-        message,
+        code: code.to_owned(),
+        message: message.to_owned(),
         provider,
     }
 }
@@ -1442,10 +1533,18 @@ mod tests {
             Ok(Default::default())
         }
 
-        fn kugou_report(
+        fn account_status(
             &self,
-            _mixsongid: String,
-        ) -> Result<miliastra_playback::KugouListenReport, PlaybackError> {
+            _provider: ProviderId,
+        ) -> Result<Option<miliastra_playback::ProviderAccountStatus>, PlaybackError> {
+            Ok(None)
+        }
+
+        fn kugou_claim_vip(&self) -> Result<miliastra_playback::KugouListenReport, PlaybackError> {
+            Ok(Default::default())
+        }
+
+        fn kugou_upgrade_vip(&self) -> Result<miliastra_playback::KugouListenReport, PlaybackError> {
             Ok(Default::default())
         }
 

@@ -233,10 +233,6 @@ impl PlaybackExecutionPort for ApplicationRuntime {
         self.playback.player.is_track_unavailable_error(error)
     }
 
-    fn reject_mismatch_as_no_source(&mut self, status: Option<&PlayerStatus>) -> Result<()> {
-        self.playback.player.reject_mismatch_as_no_source(status)
-    }
-
     fn player_status(&mut self) -> Result<PlayerStatus> {
         self.playback.player.status()
     }
@@ -265,6 +261,13 @@ impl PlaybackExecutionPort for ApplicationRuntime {
 
     fn user_pause_active(&mut self) -> Result<bool> {
         self.playback.player.user_pause_active()
+    }
+
+    fn preload_track(&mut self, track: &miliastra_playback::PlayableTrack) -> Result<()> {
+        self.playback
+            .native_playback
+            .preload(track.clone())
+            .map_err(anyhow::Error::from)
     }
 }
 

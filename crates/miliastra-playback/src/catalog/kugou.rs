@@ -1,6 +1,7 @@
 //! 酷狗音乐公开接口适配器。
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -15,6 +16,12 @@ use crate::lyrics::{TimedLyrics, parse_lrc_pair};
 
 const PROVIDER: &str = "kugou";
 
+/// 概念版广告领取 VIP 的广告位 ID（官方 youth_vip.js 固定值）。
+const KUGOU_VIP_AD_ID: u64 = 12_307_537_187;
+
+/// 广告播放时长（毫秒），官方固定 30 秒。
+const KUGOU_VIP_AD_PLAY_MS: u64 = 30_000;
+
 /// 酷狗账户/VIP 服务返回的脱敏状态。
 #[derive(Clone, Debug, Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -28,6 +35,7 @@ pub struct KugouAccountStatus {
     pub listen_report_available: bool,
 }
 
+/// 概念版 VIP 领取结果（广告播放领取）。
 #[derive(Clone, Debug, Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KugouListenReport {
@@ -41,7 +49,16 @@ pub struct KugouAdapter {
     client: Client,
     credentials: CredentialStore,
     api_base_url: Url,
+    /// 账号 VIP 状态缓存（/user/vip/detail 查询较重且接口不稳定）。
+    vip_cache: Arc<std::sync::Mutex<Option<(Option<bool>, std::time::Instant, bool)>>>,
+    /// 账号状态整体缓存（成功 5 分钟/失败 60 秒），防止轮询频繁打账号接口触发风控。
+    account_cache: Arc<std::sync::Mutex<Option<(KugouAccountStatus, std::time::Instant, bool)>>>,
 }
+
+/// 账号 VIP 状态缓存有效期（判定成功时）。
+const VIP_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+/// 判定失败（接口风控/超时）时的短缓存，尽快重试账号接口。
+const VIP_CACHE_FAILED_TTL: Duration = Duration::from_secs(60);
 
 impl KugouAdapter {
     pub fn new(
@@ -58,6 +75,8 @@ impl KugouAdapter {
             client,
             credentials,
             api_base_url: parse_url(api_base_url)?,
+            vip_cache: Arc::new(std::sync::Mutex::new(None)),
+            account_cache: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -121,6 +140,8 @@ impl KugouAdapter {
             .query(&query)
             .header("Cookie", Self::credential_cookie_header(credential));
         request = request.query(&[("token", token), ("userid", userid), ("dfid", dfid)]);
+        // 临时诊断：记录搜索请求的完整 URL，便于比对酷狗侧拒绝原因。
+        log::warn!("Kugou sidecar request: {url}?{query:?} token={token} userid={userid} dfid={dfid}");
         let response = request.send().await.map_err(classify_request_error)?;
         classify_status(&response)?;
         response
@@ -148,6 +169,103 @@ impl KugouAdapter {
         .await
     }
 
+    /// 概念版广告播放领取 VIP：上报一次完整广告播放（约 30 秒）。
+    /// 走 KuGouMusicApi `/youth/vip`（youth_vip.js → /youth/v1/ad/play_report）。
+    pub async fn claim_vip(&self) -> Result<KugouListenReport, CatalogError> {
+        let credential = self.credential()?;
+        let (token, userid, dfid) = Self::credential_fields(&credential)?;
+        let url = self.api_url("/youth/vip")?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(0);
+        let response = self
+            .client
+            .post(url)
+            .query(&[("token", token), ("userid", userid), ("dfid", dfid)])
+            .header("Cookie", Self::credential_cookie_header(&credential))
+            .header("Content-Type", "application/json; charset=utf-8")
+            .json(&serde_json::json!({
+                "ad_id": KUGOU_VIP_AD_ID,
+                "play_end": now_ms,
+                "play_start": now_ms.saturating_sub(KUGOU_VIP_AD_PLAY_MS),
+            }))
+            .send()
+            .await
+            .map_err(classify_request_error)?;
+        classify_status(&response)?;
+        let value = response
+            .json::<Value>()
+            .await
+            .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?;
+        let data = response_data(&value);
+        let code = value
+            .get("code")
+            .and_then(value_u64)
+            .or_else(|| data.get("code").and_then(value_u64));
+        let vip_days = data
+            .get("vip_days")
+            .or_else(|| data.get("vipDays"))
+            .and_then(value_u64)
+            .unwrap_or(0) as u32;
+        Ok(KugouListenReport {
+            accepted: code == Some(0),
+            vip_days,
+            message: value
+                .get("message")
+                .or_else(|| data.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("酷狗已接受广告播放上报")
+                .to_owned(),
+        })
+    }
+
+    /// 概念版升级 VIP：听歌奖励升级（youth_day_vip_upgrade.js → /youth/v1/listen_song/upgrade_vip_reward）。
+    /// 需要已领取过听歌奖励，升级到更高档位。
+    pub async fn upgrade_vip(&self) -> Result<KugouListenReport, CatalogError> {
+        let credential = self.credential()?;
+        let (token, userid, dfid) = Self::credential_fields(&credential)?;
+        let response = self
+            .client
+            .post(self.api_url("/youth/day/vip/upgrade")?)
+            .query(&[
+                ("token", token),
+                ("userid", userid),
+                ("dfid", dfid),
+                ("kugouid", userid),
+                ("ad_type", "1"),
+            ])
+            .header("Cookie", Self::credential_cookie_header(&credential))
+            .send()
+            .await
+            .map_err(classify_request_error)?;
+        classify_status(&response)?;
+        let value = response
+            .json::<Value>()
+            .await
+            .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?;
+        let data = response_data(&value);
+        let code = value
+            .get("code")
+            .and_then(value_u64)
+            .or_else(|| data.get("code").and_then(value_u64));
+        let vip_days = data
+            .get("vip_days")
+            .or_else(|| data.get("vipDays"))
+            .and_then(value_u64)
+            .unwrap_or(0) as u32;
+        Ok(KugouListenReport {
+            accepted: code == Some(0),
+            vip_days,
+            message: value
+                .get("message")
+                .or_else(|| data.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("酷狗已接受升级请求")
+                .to_owned(),
+        })
+    }
+
     /// 刷新酷狗 token，并在成功后返回新凭据。响应只提取必要字段，不记录密钥。
     pub async fn refresh_token(&self) -> Result<ProviderCredential, CatalogError> {
         let credential = self.credential()?;
@@ -162,6 +280,20 @@ impl KugouAdapter {
             .await
             .map_err(classify_request_error)?;
         classify_status(&response)?;
+        // 官方经 Set-Cookie 下发新的续期字段（t1 等），必须保留供下次刷新。
+        let mut refreshed_cookies = response
+            .headers()
+            .get_all(reqwest::header::SET_COOKIE)
+            .iter()
+            .filter_map(|header| header.to_str().ok())
+            .filter_map(|header| {
+                let (name, rest) = header.split_once('=')?;
+                let name = name.trim();
+                let value = rest.split(';').next()?.trim();
+                matches!(name, "t1" | "vip_type" | "vip_token")
+                    .then(|| (name.to_owned(), value.to_owned()))
+            })
+            .collect::<BTreeMap<_, _>>();
         let value = response
             .json::<Value>()
             .await
@@ -187,92 +319,172 @@ impl KugouAdapter {
         let ProviderCredential::Kugou { cookies, .. } = credential else {
             unreachable!()
         };
+        // 新下发的续期字段覆盖旧值；其余 cookie 保持原样。
+        refreshed_cookies.extend(cookies);
         Ok(ProviderCredential::Kugou {
             token: new_token,
             userid: new_userid,
             dfid: new_dfid,
-            cookies,
+            cookies: refreshed_cookies,
         })
+    }
+
+    /// 查询账号 VIP 状态（带缓存）。`None` 表示查询失败、无法判定。
+    async fn account_vip_status(&self) -> Option<bool> {
+        let now = std::time::Instant::now();
+        if let Ok(mut guard) = self.vip_cache.lock()
+            && let Some((status, cached_at, failed)) = guard.as_ref()
+            && cached_at.elapsed() < if *failed { VIP_CACHE_FAILED_TTL } else { VIP_CACHE_TTL }
+        {
+            return *status;
+        }
+        let result = self.query_account_vip_status().await;
+        if let Ok(mut guard) = self.vip_cache.lock() {
+            *guard = Some((result, now, result.is_none()));
+        }
+        result
+    }
+
+    /// 解析 get_union_vip 系列响应中的 VIP 判定字段（is_vip / vip_type / vip）。
+    fn vip_flags_from_union(data: &Value) -> Option<bool> {
+        let is_vip = data.get("is_vip").and_then(value_u64);
+        let vip_type = data
+            .get("vip_type")
+            .and_then(value_u64)
+            .or_else(|| data.get("vip").and_then(value_u64));
+        match (is_vip, vip_type) {
+            (Some(value), _) => Some(value != 0),
+            (None, Some(value)) => Some(value != 0),
+            (None, None) => None,
+        }
+    }
+
+    async fn query_account_vip_status(&self) -> Option<bool> {
+        let credential = self.credential().ok()?;
+        // 1) 概念版「获取已领取 VIP 状态」/youth/union/vip（概念版专用，与领取同源的权威状态）；
+        //    风控时顺延到下一途径，接口恢复后自动生效。
+        if let Ok(vip) = self.account_json("/youth/union/vip", &credential).await
+            && let Some(vip_status) = Self::vip_flags_from_union(response_data(&vip))
+        {
+            return Some(vip_status);
+        }
+        // 2) /user/vip/detail（kugouvip get_union_vip 查询态）。
+        if let Ok(vip) = self.account_json("/user/vip/detail", &credential).await
+            && let Some(vip_status) = Self::vip_flags_from_union(response_data(&vip))
+        {
+            return Some(vip_status);
+        }
+        // 3) 凭据 cookie vip_type 不可信（概念版扫码登录不会写入），
+        //    风控期间无法判定 → None（播放过滤按可播处理，不误伤）。
+        let _ = credential;
+        None
     }
 
     /// 查询账户与 VIP 状态。仅返回脱敏状态。
+    /// 账号接口带整体缓存（成功 5 分钟/失败 60 秒），避免频繁轮询触发酷狗风控。
     pub async fn account_status(&self) -> Result<KugouAccountStatus, CatalogError> {
-        let credential = self.credential()?;
-        let detail = self.account_json("/user/detail", &credential).await?;
-        let vip = self
-            .account_json("/user/vip/detail", &credential)
-            .await
-            .unwrap_or(Value::Null);
-        let detail_data = response_data(&detail);
-        let vip_data = response_data(&vip);
-        let user_id = detail_data.get("userid").and_then(value_string);
-        let logged_in = user_id.is_some();
-        Ok(KugouAccountStatus {
-            logged_in,
-            user_id,
-            nickname: detail_data
-                .get("nickname")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            vip: vip_data
-                .get("is_vip")
-                .and_then(value_u64)
-                .is_some_and(|v| v > 0)
-                || vip_data
-                    .get("vip")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-            vip_type: vip_data.get("vip_type").and_then(value_string),
-            vip_expire_at_ms: vip_data
-                .get("expire_time")
-                .and_then(value_u64)
-                .map(|v| if v < 10_000_000_000 { v * 1000 } else { v }),
-            listen_report_available: logged_in,
-        })
+        let now = std::time::Instant::now();
+        if let Ok(mut guard) = self.account_cache.lock()
+            && let Some((status, cached_at, failed)) = guard.as_ref()
+            && cached_at.elapsed() < if *failed { VIP_CACHE_FAILED_TTL } else { VIP_CACHE_TTL }
+        {
+            return Ok(status.clone());
+        }
+        let result = self.query_account_status().await;
+        if let Ok(mut guard) = self.account_cache.lock() {
+            match &result {
+                Ok(status) => *guard = Some((status.clone(), now, false)),
+                // 查询失败（风控/超时）时保留上次成功值并标记失败，60 秒后重试。
+                Err(_) => {
+                    let cached = guard
+                        .as_ref()
+                        .map(|(status, ..)| status.clone())
+                        .unwrap_or_default();
+                    *guard = Some((cached, now, true));
+                }
+            }
+        }
+        result
     }
 
-    /// 上报听歌行为，领取酷狗青春版 VIP 权益。
-    pub async fn report_listen_song(
-        &self,
-        mixsongid: &str,
-    ) -> Result<KugouListenReport, CatalogError> {
-        if !mixsongid
-            .chars()
-            .all(|character| character.is_ascii_digit())
-            || mixsongid.is_empty()
-        {
-            return Err(CatalogError::InvalidResponse(
-                "Kugou mixsongid is invalid".to_owned(),
-            ));
-        }
+    async fn query_account_status(&self) -> Result<KugouAccountStatus, CatalogError> {
         let credential = self.credential()?;
-        let value = self
-            .account_post_json(
-                "/youth/v2/report/listen_song",
-                vec![("clientver", "10566".to_owned())],
-                serde_json::json!({"mixsongid": mixsongid}),
-                &credential,
-            )
-            .await?;
-        let data = response_data(&value);
-        let code = value
-            .get("code")
-            .and_then(value_u64)
-            .or_else(|| data.get("code").and_then(value_u64));
-        let vip_days = data
-            .get("vip_days")
-            .or_else(|| data.get("vipDays"))
-            .and_then(value_u64)
-            .unwrap_or(0) as u32;
-        Ok(KugouListenReport {
-            accepted: code == Some(0),
-            vip_days,
-            message: value
-                .get("message")
-                .or_else(|| data.get("message"))
-                .and_then(Value::as_str)
-                .unwrap_or("酷狗已接受听歌上报")
-                .to_owned(),
+        let credential_userid = match &credential {
+            ProviderCredential::Kugou { userid, .. } => Some(userid.clone()),
+            _ => None,
+        };
+        // 1) /user/detail（v3/get_my_info）：登录态 + 基础账号信息（轻量、非登录刷新接口）。
+        let detail = self.account_json("/user/detail", &credential).await;
+        if let Ok(detail) = detail {
+            let detail_data = response_data(&detail);
+            let logged_in = detail
+                .get("error_code")
+                .and_then(value_u64)
+                .is_none_or(|code| code == 0);
+            let user_id = detail_data
+                .get("userid")
+                .and_then(value_string)
+                .or(credential_userid);
+            // 2) VIP 状态：概念版 /youth/union/vip → /user/vip/detail → 凭据 cookie vip_type。
+            let vip = match self
+                .account_json("/youth/union/vip", &credential)
+                .await
+            {
+                Ok(vip) => vip,
+                Err(_) => self
+                    .account_json("/user/vip/detail", &credential)
+                    .await
+                    .unwrap_or(Value::Null),
+            };
+            let vip_data = response_data(&vip);
+            let vip_type = detail_data
+                .get("vip_type")
+                .and_then(value_u64)
+                .or_else(|| vip_data.get("vip_type").and_then(value_u64))
+                .or_else(|| {
+                    match &credential {
+                        ProviderCredential::Kugou { cookies, .. } => cookies
+                            .get("vip_type")
+                            .and_then(|value| value.parse::<u64>().ok()),
+                        _ => None,
+                    }
+                })
+                .map(|value| value.to_string());
+            return Ok(KugouAccountStatus {
+                logged_in,
+                user_id,
+                nickname: detail_data
+                    .get("nickname")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                vip: vip_type.as_deref().is_some_and(|v| v != "0")
+                    || vip_data
+                        .get("is_vip")
+                        .and_then(value_u64)
+                        .is_some_and(|v| v > 0)
+                    || vip_data
+                        .get("vip")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                vip_type,
+                vip_expire_at_ms: vip_data
+                    .get("expire_time")
+                    .and_then(value_u64)
+                    .map(|v| if v < 10_000_000_000 { v * 1000 } else { v }),
+                listen_report_available: logged_in,
+            });
+        }
+        // 3) 账号接口全部不可用（风控）：凭据存在即视为已登录。
+        //    cookie vip_type 在概念版扫码登录时不会写入（接口才权威），
+        //    回退时不展示 VIP 判定，前端显示「未知」避免误导。
+        Ok(KugouAccountStatus {
+            logged_in: true,
+            user_id: credential_userid,
+            nickname: None,
+            vip: false,
+            vip_type: None,
+            vip_expire_at_ms: None,
+            listen_report_available: true,
         })
     }
 
@@ -283,37 +495,6 @@ impl KugouAdapter {
     ) -> Result<Value, CatalogError> {
         self.account_request(reqwest::Method::GET, path, Vec::new(), credential)
             .await
-    }
-
-    async fn account_post_json(
-        &self,
-        path: &str,
-        query: Vec<(&str, String)>,
-        body: Value,
-        credential: &ProviderCredential,
-    ) -> Result<Value, CatalogError> {
-        let (token, userid, dfid) = Self::credential_fields(credential)?;
-        let url = self.api_url(path)?;
-        let response = self
-            .client
-            .post(url)
-            .query(&query)
-            .query(&[("token", token), ("userid", userid), ("dfid", dfid)])
-            .header("Cookie", Self::credential_cookie_header(credential))
-            .header(
-                "User-Agent",
-                "Android13-1070-10566-201-0-ReportPlaySongToServerProtocol-wifi",
-            )
-            .header("Content-Type", "application/json; charset=utf-8")
-            .json(&body)
-            .send()
-            .await
-            .map_err(classify_request_error)?;
-        classify_status(&response)?;
-        response
-            .json::<Value>()
-            .await
-            .map_err(|error| CatalogError::InvalidResponse(error.to_string()))
     }
 
     async fn account_request(
@@ -392,8 +573,11 @@ impl crate::catalog::KugouAccountAdapter for KugouAdapter {
     async fn account_status(&self) -> Result<KugouAccountStatus, CatalogError> {
         self.account_status().await
     }
-    async fn report_listen_song(&self, mixsongid: &str) -> Result<KugouListenReport, CatalogError> {
-        self.report_listen_song(mixsongid).await
+    async fn claim_vip(&self) -> Result<KugouListenReport, CatalogError> {
+        self.claim_vip().await
+    }
+    async fn upgrade_vip(&self) -> Result<KugouListenReport, CatalogError> {
+        self.upgrade_vip().await
     }
 }
 
@@ -450,22 +634,72 @@ impl SourceAdapter for KugouAdapter {
                 &credential,
             )
             .await?;
-        let url = response
-            .pointer("/data/url")
-            .or_else(|| response.pointer("/data/play_url"))
-            .or_else(|| response.pointer("/data/play_backup_url"))
-            .or_else(|| response.get("url"))
-            .and_then(Value::as_str)
-            .filter(|url| !url.is_empty())
-            .ok_or_else(|| {
-                CatalogError::Unavailable("Kugou returned no playable stream".to_owned())
-            })?;
+        let url = match extract_stream_url(&response) {
+            Some(url) => url,
+            None => return Err(classify_kugou_resolve_failure(&response)),
+        };
         Ok(StreamSource {
             url: Url::parse(url)
                 .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?,
             headers: BTreeMap::from([("Referer".to_owned(), "https://www.kugou.com/".to_owned())]),
             expires_at_epoch_ms: None,
         })
+    }
+
+    /// 酷狗权威权限接口 /privilege/lite 的 pay_type：
+    /// 0=免费可播，1/3=VIP 歌曲，2=付费专辑。
+    /// 账号 VIP 状态可判定时：VIP 账号直接用 VIP 歌曲（Eligible），非 VIP 屏蔽（VipRequired）；
+    /// 判定失败（接口不稳定）时回退实际解析播放流确认可播性。
+    async fn probe_eligibility(
+        &self,
+        key: &SongKey,
+        locator: Option<&ResolverLocator>,
+    ) -> Result<PlaybackEligibility, CatalogError> {
+        if key.source != PROVIDER {
+            return Err(CatalogError::InvalidResponse(
+                "song key provider does not match Kugou adapter".to_owned(),
+            ));
+        }
+        let (hash, album_id, _) = resolver_parts(key, locator)?;
+        let credential = self.credential()?;
+        let response = self
+            .get_json(
+                &self.api_url("/privilege/lite")?,
+                vec![("hash", hash), ("album_id", album_id)],
+                &credential,
+            )
+            .await?;
+        let item = response
+            .pointer("/data/0")
+            .or_else(|| response.pointer("/data"))
+            .and_then(|value| {
+                value
+                    .as_array()
+                    .and_then(|items| items.first())
+                    .or(Some(value))
+            });
+        let Some(item) = item else {
+            return Err(CatalogError::InvalidResponse(
+                "Kugou privilege response has no resource".to_owned(),
+            ));
+        };
+        let pay_type = item.get("pay_type").and_then(value_u64);
+        match pay_type {
+            Some(0) => Ok(PlaybackEligibility::Eligible),
+            Some(2) => Ok(PlaybackEligibility::PaidRequired),
+            Some(1 | 3) => match self.account_vip_status().await {
+                Some(true) => Ok(PlaybackEligibility::Eligible),
+                Some(false) => Ok(PlaybackEligibility::VipRequired),
+                None => {
+                    // 账号 VIP 状态无法判定：以实际解析结果为准（账号凭据能拿到流即可播）。
+                    let _ = self.resolve(key, locator).await?;
+                    Ok(PlaybackEligibility::Eligible)
+                }
+            },
+            _ => Err(CatalogError::InvalidResponse(
+                "Kugou privilege response has no pay_type".to_owned(),
+            )),
+        }
     }
 
     async fn lyrics(
@@ -492,43 +726,73 @@ impl SourceAdapter for KugouAdapter {
             .and_then(Value::as_str)
             .unwrap_or_default();
         let lyric = decode_lrc_content(content)?;
-        parse_lrc_pair(&lyric, None)
+        // 酷狗翻译歌词：decodeTrcContent（若歌曲有翻译）；否则退化为内嵌双语 lrc。
+        let translation = response
+            .get("decodeTrcContent")
+            .or_else(|| response.get("trcContent"))
+            .and_then(Value::as_str)
+            .map(decode_lrc_content)
+            .transpose()?;
+        parse_lrc_pair(&lyric, translation.as_deref())
             .map_err(|error| CatalogError::InvalidResponse(error.to_string()))
     }
 }
 
+/// 酷狗拿不到播放流时的分类：响应明确带 vip=1 标志则需 VIP；
+/// 否则无法确认原因，返回 Unavailable（探测层按初始标注确认不可用）。
+fn classify_kugou_resolve_failure(response: &Value) -> CatalogError {
+    let vip = response
+        .pointer("/data/vip")
+        .or_else(|| response.pointer("/vip"))
+        .and_then(value_u64);
+    if vip == Some(1) {
+        return CatalogError::VipRequired("Kugou track requires VIP membership".to_owned());
+    }
+    CatalogError::Unavailable("Kugou returned no playable stream".to_owned())
+}
+
+/// 从酷狗 /song/url 响应提取可播放 URL（新版：顶层 `url`/`backupUrl` 数组）。
+fn extract_stream_url(response: &Value) -> Option<&str> {
+    response
+        .get("url")
+        .or_else(|| response.get("backupUrl"))
+        .and_then(|value| match value {
+            Value::Array(items) => items
+                .iter()
+                .find_map(|item| item.as_str().filter(|url| !url.is_empty())),
+            Value::String(text) => (!text.is_empty()).then_some(text.as_str()),
+            _ => None,
+        })
+}
+
 fn parse_search_candidates(response: &Value) -> Result<Vec<ProviderSearchCandidate>, CatalogError> {
+    // 酷狗新版搜索响应：data.lists（大写驼峰字段，FileHash/OriSongName 等）。
     let songs = response
-        .pointer("/data/info")
-        .or_else(|| response.pointer("/data/records"))
-        .or_else(|| response.pointer("/data/song_list"))
+        .pointer("/data/lists")
         .and_then(Value::as_array)
         .ok_or_else(|| CatalogError::InvalidResponse("Kugou search list is missing".to_owned()))?;
     Ok(songs
         .iter()
         .filter_map(|raw| {
-            let hash = raw.get("hash").and_then(Value::as_str)?.trim();
+            let hash = raw.get("FileHash").and_then(Value::as_str)?.trim();
             let title = raw
-                .get("songname")
-                .or_else(|| raw.get("song_name"))
-                .or_else(|| raw.get("filename"))
+                .get("OriSongName")
+                .or_else(|| raw.get("FileName"))
                 .and_then(Value::as_str)?
                 .trim();
             if hash.is_empty() || title.is_empty() {
                 return None;
             }
             let album_id = raw
-                .get("album_id")
+                .get("AlbumID")
                 .and_then(value_string)
                 .unwrap_or_else(|| "0".to_owned());
             let album_audio_id = raw
-                .get("album_audio_id")
-                .or_else(|| raw.get("mixsongid"))
+                .get("MixSongID")
                 .and_then(value_string)
                 .unwrap_or_else(|| "0".to_owned());
             let artists = raw
-                .get("singername")
-                .or_else(|| raw.get("singer_name"))
+                .get("SingerName")
                 .and_then(Value::as_str)
                 .map(|value| {
                     value
@@ -540,8 +804,7 @@ fn parse_search_candidates(response: &Value) -> Result<Vec<ProviderSearchCandida
                 })
                 .unwrap_or_default();
             let duration_ms = raw
-                .get("duration")
-                .or_else(|| raw.get("duration_ms"))
+                .get("Duration")
                 .and_then(value_u64)
                 .map(|value| {
                     if value < 10_000 {
@@ -559,7 +822,7 @@ fn parse_search_candidates(response: &Value) -> Result<Vec<ProviderSearchCandida
                 title: title.to_owned(),
                 artists,
                 album: raw
-                    .get("album_name")
+                    .get("AlbumName")
                     .and_then(Value::as_str)
                     .filter(|v| !v.trim().is_empty())
                     .map(str::to_owned),
@@ -567,14 +830,32 @@ fn parse_search_candidates(response: &Value) -> Result<Vec<ProviderSearchCandida
             };
             Some(ProviderSearchCandidate {
                 song,
-                eligibility: PlaybackEligibility::Unknown,
+                eligibility: if kugou_candidate_is_vip(raw) {
+                    PlaybackEligibility::VipRequired
+                } else {
+                    PlaybackEligibility::Unknown
+                },
             })
         })
         .collect::<Vec<_>>())
 }
 
-fn resolver_parts(
-    key: &SongKey,
+/// 酷狗搜索项 VIP 判断：优先读 TransParam（JSON 字符串）的 display_vip/vip，
+/// 兼容旧接口顶层 VIP 数字字段。
+fn kugou_candidate_is_vip(raw: &Value) -> bool {
+    if let Some(trans) = raw.get("TransParam").and_then(Value::as_str)
+        && let Ok(param) = serde_json::from_str::<Value>(trans)
+    {
+        for field in ["display_vip", "vip"] {
+            if let Some(value) = param.get(field).and_then(value_u64) {
+                return value != 0;
+            }
+        }
+    }
+    raw.get("VIP").and_then(value_u64).is_some_and(|value| value != 0)
+}
+
+fn resolver_parts(    key: &SongKey,
     locator: Option<&ResolverLocator>,
 ) -> Result<(String, String, String), CatalogError> {
     let (hash, album_id, album_audio_id) = match locator {
@@ -708,21 +989,21 @@ mod tests {
     use base64::Engine;
     use serde_json::json;
 
-    use super::{PROVIDER, decode_lrc_content, parse_search_candidates, resolver_parts};
+    use super::{PROVIDER, decode_lrc_content, extract_stream_url, parse_search_candidates, resolver_parts};
     use crate::catalog::CatalogError;
     use crate::credentials::ProviderCredential;
     use crate::domain::{ResolverLocator, SongKey};
 
     #[test]
     fn search_preserves_kugou_playback_and_vip_identifiers() {
-        let parsed = parse_search_candidates(&json!({"data": {"info": [{
-            "hash": "ABCDEF0123456789",
-            "songname": "测试歌曲",
-            "singername": "歌手甲、歌手乙",
-            "album_id": 42,
-            "album_audio_id": 314159,
-            "album_name": "测试专辑",
-            "duration": 180
+        let parsed = parse_search_candidates(&json!({"data": {"lists": [{
+            "FileHash": "ABCDEF0123456789",
+            "OriSongName": "测试歌曲",
+            "SingerName": "歌手甲、歌手乙",
+            "AlbumID": 42,
+            "MixSongID": 314159,
+            "AlbumName": "测试专辑",
+            "Duration": 180
         }]}}))
         .unwrap();
 
@@ -737,22 +1018,39 @@ mod tests {
     }
 
     #[test]
-    fn search_accepts_records_shape_and_mixsongid_alias() {
-        let parsed = parse_search_candidates(&json!({"data": {"records": [{
-            "hash": "0123456789ABCDEF",
-            "song_name": "另一首歌",
-            "singer_name": "歌手",
-            "album_id": "7",
-            "mixsongid": "88",
-            "duration_ms": 180500
+    fn search_accepts_lists_shape_and_mix_song_id() {
+        let parsed = parse_search_candidates(&json!({"data": {"lists": [{
+            "FileHash": "0123456789ABCDEF",
+            "OriSongName": "另一首歌",
+            "SingerName": "歌手",
+            "AlbumID": "7",
+            "MixSongID": "88",
+            "Duration": 180
         }]}}))
         .unwrap();
 
-        assert_eq!(parsed[0].song.duration_ms, Some(180_500));
+        assert_eq!(parsed[0].song.duration_ms, Some(180_000));
         assert_eq!(
             parsed[0].song.resolver_locator.as_ref().unwrap().as_str(),
             "kugou:0123456789ABCDEF:7:88"
         );
+    }
+
+    #[test]
+    fn stream_url_accepts_new_array_shape() {
+        // 新版：顶层 url 为数组
+        assert_eq!(
+            extract_stream_url(&json!({"url": ["http://cdn.example/1.mp3", "http://cdn.example/2.mp3"]})),
+            Some("http://cdn.example/1.mp3")
+        );
+        // backupUrl 兜底
+        assert_eq!(
+            extract_stream_url(&json!({"backupUrl": ["http://cdn.example/bak.mp3"]})),
+            Some("http://cdn.example/bak.mp3")
+        );
+        // 空数组 / 缺失字段
+        assert_eq!(extract_stream_url(&json!({"url": []})), None);
+        assert_eq!(extract_stream_url(&json!({"data": {"status": 1}})), None);
     }
 
     #[test]

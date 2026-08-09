@@ -931,7 +931,7 @@ fn bundled_config_yaml() -> &'static str {
     include_str!("../../tests/fixtures/config.full.yaml")
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RectConfig {
     pub x: i32,
@@ -940,28 +940,11 @@ pub struct RectConfig {
     pub height: u32,
 }
 
-impl Default for RectConfig {
-    fn default() -> Self {
-        Self {
-            x: 0,
-            y: 0,
-            width: 0,
-            height: 0,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PointConfig {
     pub x: i32,
     pub y: i32,
-}
-
-impl Default for PointConfig {
-    fn default() -> Self {
-        Self { x: 0, y: 0 }
-    }
 }
 
 impl PointConfig {
@@ -2792,8 +2775,8 @@ chat_rect:
             let content = tail[..next]
                 .lines()
                 .map(|line| {
-                    if line.starts_with("  ") {
-                        &line[2..]
+                    if let Some(rest) = line.strip_prefix("  ") {
+                        rest
                     } else {
                         line
                     }
@@ -2824,8 +2807,8 @@ chat_rect:
         tail[..next]
             .lines()
             .map(|line| {
-                if line.starts_with("  ") {
-                    &line[2..]
+                if let Some(rest) = line.strip_prefix("  ") {
+                    rest
                 } else {
                     line
                 }
@@ -2894,11 +2877,11 @@ chat_rect:
         );
         assert_eq!(config.queue.max_size, 7);
         assert_eq!(config.queue.pool_max_size, 200);
-        assert_eq!(config.song_dedup.enabled, true);
+        assert!(config.song_dedup.enabled);
         assert_eq!(config.ai.provider, "deepseek");
         assert_eq!(config.ai.model, "gpt-5.6-mini");
         assert!(!config.landlord.enabled);
-        assert_eq!(config.idiom_chain.enabled, true);
+        assert!(config.idiom_chain.enabled);
         assert_eq!(config.hotkeys.pause_key, "F8");
         assert_eq!(config.friend_delivery.auto_retry_count, 3);
         assert_eq!(config.custom_workflows.default_threshold, 0.85);
@@ -3040,8 +3023,8 @@ chat_rect:
         let workflows_content = bundled[workflows..]
             .lines()
             .map(|line| {
-                if line.starts_with("  ") {
-                    &line[2..]
+                if let Some(rest) = line.strip_prefix("  ") {
+                    rest
                 } else {
                     line
                 }

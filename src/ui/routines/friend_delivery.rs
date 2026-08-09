@@ -1452,7 +1452,8 @@ mod tests {
     #[test]
     #[cfg(feature = "ocr-mnn")]
     fn fixed_secondary_chat_fixture_proves_stable_friend_row_and_title_first_identity_fallback() {
-        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).expect("load default config");
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml"))
+            .expect("load default config");
         let args = OcrArgs::default().resolve(&config.ocr);
         let runtime = OcrRuntime::start(
             ProductionOcrDevice::new(args).expect("initialize OCR device"),
@@ -2550,4 +2551,3 @@ mod tests {
         frame
     }
 }
-

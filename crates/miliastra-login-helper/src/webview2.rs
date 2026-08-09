@@ -420,7 +420,9 @@ fn kugou_web_signature(params: &BTreeMap<String, String>) -> String {
         .map(|(key, value)| format!("{key}={value}"))
         .collect::<String>();
     let mut hasher = Md5::new();
-    hasher.update(format!("{KUGOU_WEB_SIGN_SALT}{joined}{KUGOU_WEB_SIGN_SALT}"));
+    hasher.update(format!(
+        "{KUGOU_WEB_SIGN_SALT}{joined}{KUGOU_WEB_SIGN_SALT}"
+    ));
     format!("{:x}", hasher.finalize())
 }
 
@@ -459,7 +461,10 @@ fn kugou_default_params() -> BTreeMap<String, String> {
     ])
 }
 
-fn kugou_web_get(url: &str, params: &BTreeMap<String, String>) -> Result<serde_json::Value, String> {
+fn kugou_web_get(
+    url: &str,
+    params: &BTreeMap<String, String>,
+) -> Result<serde_json::Value, String> {
     kugou_web_get_with_cookies(url, params).map(|(value, _)| value)
 }
 
@@ -579,7 +584,9 @@ fn kugou_qr_poll(key: &str) -> Result<Option<(String, String, BTreeMap<String, S
 /// 酷狗登录接口偶发连接重置，网络类错误连续出现多次才放弃。
 fn kugou_qr_poll_loop(
     key: &str,
-    sender: std::sync::mpsc::Sender<Result<Option<(String, String, BTreeMap<String, String>)>, String>>,
+    sender: std::sync::mpsc::Sender<
+        Result<Option<(String, String, BTreeMap<String, String>)>, String>,
+    >,
 ) {
     let mut consecutive_errors = 0;
     for _ in 0..KUGOU_QR_POLL_ATTEMPTS {
@@ -966,17 +973,13 @@ mod platform {
                 };
                 match receiver.try_recv() {
                     Ok(result) => Some(result),
-                    Err(mpsc::TryRecvError::Empty)
-                    | Err(mpsc::TryRecvError::Disconnected) => None,
+                    Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => None,
                 }
             };
             match result {
                 Some(Ok(Some((token, userid, set_cookies)))) => {
                     let mut cookies = BTreeMap::new();
-                    cookies.insert(
-                        "KuGoo".to_owned(),
-                        format!("t={token}&KugooID={userid}"),
-                    );
+                    cookies.insert("KuGoo".to_owned(), format!("t={token}&KugooID={userid}"));
                     // 保留官方下发的续期字段（t1 等），概念版刷新接口依赖它们。
                     for (name, value) in set_cookies {
                         if matches!(name.as_str(), "t1" | "vip_type" | "vip_token") {
@@ -1557,7 +1560,9 @@ mod platform {
             if let Ok(Some(value)) = serde_json::from_str::<Option<String>>(&text)
                 && !value.is_empty()
             {
-                state.latest_cookies.insert("ac_time_value".to_owned(), value);
+                state
+                    .latest_cookies
+                    .insert("ac_time_value".to_owned(), value);
                 state.outcome = Some(Ok(state.latest_cookies.clone()));
             }
         }

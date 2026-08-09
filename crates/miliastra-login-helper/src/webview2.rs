@@ -29,6 +29,7 @@ fn login_url(provider: &str) -> Option<&'static str> {
         "qqmusic" => Some("https://y.qq.com/portal/profile.html"),
         "netease" => Some("https://music.163.com/"),
         "bilibili" => Some("https://www.bilibili.com/"),
+        "kugou" => Some("https://www.kugou.com/login/"),
         _ => None,
     }
 }
@@ -64,6 +65,7 @@ fn allowed_cookie_names(provider: &str) -> &'static [&'static str] {
             "psrf_qqunionid",
         ],
         "netease" => &["MUSIC_U", "__csrf"],
+        "kugou" => &["token", "userid", "dfid", "KugouGUID", "kg_mid", "mid"],
         "bilibili" => &[
             "SESSDATA",
             "bili_jct",
@@ -75,6 +77,7 @@ fn allowed_cookie_names(provider: &str) -> &'static [&'static str] {
             "b_nut",
             "_uuid",
             "b_lsid",
+            // 捕获后会从普通 Cookie 集合移除并写入独立 refreshToken 字段。
             "ac_time_value",
         ],
         _ => &[],
@@ -89,6 +92,11 @@ fn has_required_cookies(provider: &str, cookies: &BTreeMap<String, String>) -> b
         }
         "netease" => cookies.contains_key("MUSIC_U"),
         "bilibili" => cookies.contains_key("SESSDATA"),
+        "kugou" => ["token", "userid"].iter().all(|name| {
+            cookies
+                .get(*name)
+                .is_some_and(|value| !value.trim().is_empty())
+        }),
         _ => false,
     }
 }

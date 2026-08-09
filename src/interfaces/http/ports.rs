@@ -3,7 +3,10 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use image::DynamicImage;
-use miliastra_playback::{CredentialStatus, LoginSession, ProviderId, TrackMetadata, TrackRef};
+use miliastra_playback::{
+    CredentialStatus, KugouAccountStatus, KugouListenReport, LoginSession, ProviderId,
+    TrackMetadata, TrackRef,
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -150,6 +153,13 @@ pub(crate) struct HttpProviderView {
     pub provider: ProviderId,
     pub configured: bool,
     pub fields: BTreeMap<String, bool>,
+    pub refresh_supported: bool,
+    pub manual_refresh_supported: bool,
+    pub refresh_ready: bool,
+    pub refresh_state: &'static str,
+    pub last_refresh_at_ms: Option<u64>,
+    pub next_refresh_check_at_ms: Option<u64>,
+    pub last_refresh_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -192,6 +202,9 @@ pub(crate) trait HttpLoginPort: Send + Sync {
     fn start(&self, provider: ProviderId) -> Result<LoginSession, HttpLoginError>;
     fn cancel(&self, session_id: Uuid) -> Result<(), HttpLoginError>;
     fn logout(&self, provider: ProviderId) -> Result<CredentialStatus, HttpLoginError>;
+    fn refresh(&self, provider: ProviderId) -> Result<CredentialStatus, HttpLoginError>;
+    fn kugou_status(&self) -> Result<KugouAccountStatus, HttpLoginError>;
+    fn kugou_report(&self, mixsongid: String) -> Result<KugouListenReport, HttpLoginError>;
 }
 
 pub(crate) trait HttpAiPort: Send + Sync {

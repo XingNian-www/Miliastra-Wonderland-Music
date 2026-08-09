@@ -201,7 +201,11 @@ impl BilibiliAdapter {
         credential: &ProviderCredential,
         headers: &HeaderMap,
     ) -> Result<(), CatalogError> {
-        let ProviderCredential::Bilibili { cookies } = credential else {
+        let ProviderCredential::Bilibili {
+            cookies,
+            refresh_token,
+        } = credential
+        else {
             return Ok(());
         };
         let mut updated = cookies.clone();
@@ -212,7 +216,10 @@ impl BilibiliAdapter {
         self.credentials
             .save(
                 "bilibili",
-                ProviderCredential::Bilibili { cookies: updated },
+                ProviderCredential::Bilibili {
+                    cookies: updated,
+                    refresh_token: refresh_token.clone(),
+                },
             )
             .map_err(|error| CatalogError::Transient(error.to_string()))?;
         Ok(())
@@ -225,13 +232,29 @@ impl BilibiliAdapter {
                 .ok()
                 .flatten()
                 .is_some_and(|credential| {
-                    first_cookie(credential.cookies(), &["ac_time_value"])
-                        .is_some_and(|value| !value.is_empty())
+                    matches!(
+                        credential,
+                        ProviderCredential::Bilibili {
+                            refresh_token: Some(token),
+                            ..
+                        } if !token.trim().is_empty()
+                    )
                 });
         if !has_refresh_token {
             return;
         }
 
+        let status = match self.credentials.status(PROVIDER) {
+            Ok(status) => status,
+            Err(_) => return,
+        };
+        if !status.refresh_ready
+            || status
+                .next_refresh_check_at_ms
+                .is_some_and(|next| next > now_ms())
+        {
+            return;
+        }
         let today = current_day();
         {
             let Ok(mut state) = self.refresh_state.lock() else {
@@ -255,22 +278,29 @@ impl BilibiliAdapter {
         }
     }
 
-    async fn refresh_cookie(&self) -> Result<(), CatalogError> {
+    async fn refresh_cookie(&self) -> Result<bool, CatalogError> {
         let credential = self.credential()?;
-        let ProviderCredential::Bilibili { cookies } = credential else {
-            return Ok(());
-        };
-        let Some(refresh_token) = first_cookie(&cookies, &["ac_time_value"])
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned)
+        let ProviderCredential::Bilibili {
+            cookies,
+            refresh_token,
+        } = credential
         else {
-            return Ok(());
+            return Err(CatalogError::AuthRequired(
+                "Bilibili refresh credential is unavailable".to_owned(),
+            ));
+        };
+        let Some(refresh_token) = refresh_token.filter(|value| !value.trim().is_empty()) else {
+            return Err(CatalogError::AuthRequired(
+                "Bilibili refresh token is missing".to_owned(),
+            ));
         };
         let Some(csrf) = first_cookie(&cookies, &["bili_jct"])
             .filter(|value| !value.is_empty())
             .map(str::to_owned)
         else {
-            return Ok(());
+            return Err(CatalogError::AuthRequired(
+                "Bilibili csrf is missing".to_owned(),
+            ));
         };
 
         let info_response = self
@@ -297,7 +327,7 @@ impl BilibiliAdapter {
             .and_then(Value::as_bool)
             .unwrap_or(false)
         {
-            return Ok(());
+            return Ok(false);
         }
         let timestamp = info_data.get("timestamp").and_then(as_u64).ok_or_else(|| {
             CatalogError::InvalidResponse(
@@ -350,13 +380,12 @@ impl BilibiliAdapter {
 
         let mut refreshed = cookies.clone();
         merge_set_cookie_headers(&mut refreshed, &refresh_headers);
-        if let Some(new_refresh_token) = refresh_body
+        let refreshed_refresh_token = refresh_body
             .pointer("/data/refresh_token")
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty())
-        {
-            refreshed.insert("ac_time_value".to_owned(), new_refresh_token.to_owned());
-        }
+            .map(str::to_owned)
+            .unwrap_or_else(|| refresh_token.clone());
         let confirm_csrf = first_cookie(&refreshed, &["bili_jct"])
             .filter(|value| !value.is_empty())
             .unwrap_or(csrf.as_str());
@@ -383,10 +412,13 @@ impl BilibiliAdapter {
         self.credentials
             .save(
                 "bilibili",
-                ProviderCredential::Bilibili { cookies: refreshed },
+                ProviderCredential::Bilibili {
+                    cookies: refreshed,
+                    refresh_token: Some(refreshed_refresh_token),
+                },
             )
             .map_err(|error| CatalogError::Transient(error.to_string()))?;
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -647,6 +679,13 @@ fn cookie_header(cookies: &BTreeMap<String, String>) -> String {
         .join("; ")
 }
 
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
+}
+
 fn current_day() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -690,7 +729,6 @@ fn is_allowed_bilibili_cookie(name: &str) -> bool {
             | "b_nut"
             | "_uuid"
             | "b_lsid"
-            | "ac_time_value"
     )
 }
 
@@ -834,6 +872,7 @@ mod tests {
                 "bilibili",
                 ProviderCredential::Bilibili {
                     cookies: BTreeMap::from([("SESSDATA".to_owned(), "secret".to_owned())]),
+                    refresh_token: None,
                 },
             )
             .unwrap();
@@ -1033,6 +1072,7 @@ mod tests {
         adapter
             .validate_credential(&ProviderCredential::Bilibili {
                 cookies: BTreeMap::from([("SESSDATA".to_owned(), "candidate".to_owned())]),
+                refresh_token: None,
             })
             .await
             .unwrap();
@@ -1063,6 +1103,7 @@ mod tests {
             adapter
                 .validate_credential(&ProviderCredential::Bilibili {
                     cookies: BTreeMap::from([("SESSDATA".to_owned(), "expired".to_owned())]),
+                    refresh_token: None,
                 })
                 .await,
             Err(CatalogError::CredentialRejected(_))

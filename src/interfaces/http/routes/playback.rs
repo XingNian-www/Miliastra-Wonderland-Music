@@ -144,6 +144,59 @@ pub(super) fn player_login_status_route(
     serde_json::to_string(&state.application.login.status()).map_err(internal_error)
 }
 
+pub(super) fn player_login_refresh_route(
+    query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let provider = query_value(query, "provider")
+        .unwrap_or("kugou")
+        .parse::<ProviderId>()
+        .map_err(|_| bad_request("provider参数无效"))?;
+    serde_json::to_string(
+        &state
+            .application
+            .login
+            .refresh(provider)
+            .map_err(login_http_error)?,
+    )
+    .map_err(internal_error)
+}
+
+pub(super) fn player_kugou_status_route(
+    _query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    serde_json::to_string(
+        &state
+            .application
+            .login
+            .kugou_status()
+            .map_err(login_http_error)?,
+    )
+    .map_err(internal_error)
+}
+
+pub(super) fn player_kugou_report_route(
+    query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let mixsongid = normalize_required_text(query_value(query, "mixsongid"), "mixsongid")?;
+    if !mixsongid
+        .chars()
+        .all(|character| character.is_ascii_digit())
+    {
+        return Err(bad_request("mixsongid参数无效"));
+    }
+    serde_json::to_string(
+        &state
+            .application
+            .login
+            .kugou_report(mixsongid)
+            .map_err(login_http_error)?,
+    )
+    .map_err(internal_error)
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct LoginProviderRequest {

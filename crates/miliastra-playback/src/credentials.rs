@@ -3,13 +3,15 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const SUPPORTED_PROVIDERS: &[&str] = &["qqmusic", "netease", "bilibili"];
+pub const SUPPORTED_PROVIDERS: &[&str] = &["qqmusic", "netease", "bilibili", "kugou"];
 const MAX_SECRET_BYTES: usize = 64 * 1024;
-const CREDENTIAL_SCHEMA_VERSION: u32 = 1;
+const CREDENTIAL_SCHEMA_VERSION: u32 = 2;
+const REFRESH_STATE_FILE: &str = "refresh-state.json";
 
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -21,7 +23,7 @@ struct CredentialEnvelope {
 /// Plaintext account state captured by the provider login helper. The store
 /// never exposes secret values through its status APIs; native adapters read a
 /// clone only when they need to make a provider request.
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(
     rename_all = "camelCase",
     rename_all_fields = "camelCase",
@@ -34,7 +36,18 @@ pub enum ProviderCredential {
     #[serde(rename = "netease")]
     Netease { cookies: BTreeMap<String, String> },
     #[serde(rename = "bilibili")]
-    Bilibili { cookies: BTreeMap<String, String> },
+    Bilibili {
+        cookies: BTreeMap<String, String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        refresh_token: Option<String>,
+    },
+    #[serde(rename = "kugou")]
+    Kugou {
+        token: String,
+        userid: String,
+        dfid: String,
+        cookies: BTreeMap<String, String>,
+    },
 }
 
 impl std::fmt::Debug for ProviderCredential {
@@ -53,14 +66,16 @@ impl ProviderCredential {
             Self::QqMusic { .. } => "qqmusic",
             Self::Netease { .. } => "netease",
             Self::Bilibili { .. } => "bilibili",
+            Self::Kugou { .. } => "kugou",
         }
     }
 
     pub fn cookies(&self) -> &BTreeMap<String, String> {
         match self {
-            Self::QqMusic { cookies } | Self::Netease { cookies } | Self::Bilibili { cookies } => {
-                cookies
-            }
+            Self::QqMusic { cookies }
+            | Self::Netease { cookies }
+            | Self::Bilibili { cookies, .. }
+            | Self::Kugou { cookies, .. } => cookies,
         }
     }
 
@@ -105,7 +120,7 @@ impl ProviderCredential {
                 require_allowed_cookie_names(cookies, &["MUSIC_U", "__csrf"])?;
                 require_any_cookie(cookies, "musicU", &["MUSIC_U"])?;
             }
-            Self::Bilibili { cookies } => {
+            Self::Bilibili { cookies, .. } => {
                 require_allowed_cookie_names(
                     cookies,
                     &[
@@ -119,12 +134,22 @@ impl ProviderCredential {
                         "b_nut",
                         "_uuid",
                         "b_lsid",
-                        // Bilibili stores this refresh value in localStorage. It is
-                        // optional today, but may be retained by a future capture flow.
-                        "ac_time_value",
                     ],
                 )?;
                 require_any_cookie(cookies, "sessdata", &["SESSDATA"])?;
+            }
+            Self::Kugou {
+                token,
+                userid,
+                dfid,
+                cookies,
+            } => {
+                if !has_value(token) || !has_value(userid) || !has_value(dfid) {
+                    return Err(CredentialError::Invalid(
+                        "Kugou token, userid and dfid must not be empty".to_owned(),
+                    ));
+                }
+                require_allowed_cookie_names(cookies, &["KugouGUID", "kg_mid", "mid"])?;
             }
         }
         let encoded = serde_json::to_vec(self)
@@ -172,20 +197,67 @@ impl ProviderCredential {
                 ("musicU", has_any_cookie(cookies, &["MUSIC_U"])),
                 ("csrf", has_any_cookie(cookies, &["__csrf"])),
             ]),
-            Self::Bilibili { cookies } => BTreeMap::from([
+            Self::Bilibili {
+                cookies,
+                refresh_token,
+            } => BTreeMap::from([
                 ("sessdata", has_any_cookie(cookies, &["SESSDATA"])),
                 ("csrf", has_any_cookie(cookies, &["bili_jct"])),
                 ("userId", has_any_cookie(cookies, &["DedeUserID"])),
-                ("refreshToken", has_any_cookie(cookies, &["ac_time_value"])),
+                (
+                    "refreshToken",
+                    refresh_token.as_deref().is_some_and(has_value),
+                ),
                 ("buvid3", has_any_cookie(cookies, &["buvid3"])),
+            ]),
+            Self::Kugou {
+                token,
+                userid,
+                dfid,
+                ..
+            } => BTreeMap::from([
+                ("token", has_value(token)),
+                ("userId", has_value(userid)),
+                ("dfid", has_value(dfid)),
             ]),
         };
         CredentialStatus {
             provider: self.provider(),
             configured: true,
             fields,
+            refresh_supported: matches!(self, Self::Kugou { .. }),
+            manual_refresh_supported: matches!(self, Self::Kugou { .. }),
+            refresh_ready: match self {
+                Self::QqMusic { cookies } => has_any_cookie(
+                    cookies,
+                    &[
+                        "psrf_qqrefresh_token",
+                        "refresh_token",
+                        "wxrefresh_token",
+                        "psrf_qqrefresh_key",
+                        "refresh_key",
+                    ],
+                ),
+                Self::Bilibili { refresh_token, .. } => {
+                    refresh_token.as_deref().is_some_and(has_value)
+                }
+                Self::Kugou { token, .. } => has_value(token),
+                Self::Netease { .. } => false,
+            },
+            refresh_state: "idle",
+            last_refresh_at_ms: None,
+            next_refresh_check_at_ms: None,
+            last_refresh_error: None,
         }
     }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct RefreshMetadata {
+    state: String,
+    last_refresh_at_ms: Option<u64>,
+    next_refresh_check_at_ms: Option<u64>,
+    last_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -194,6 +266,16 @@ pub struct CredentialStatus {
     pub provider: &'static str,
     pub configured: bool,
     pub fields: BTreeMap<&'static str, bool>,
+    pub refresh_supported: bool,
+    pub manual_refresh_supported: bool,
+    pub refresh_ready: bool,
+    pub refresh_state: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_refresh_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_refresh_check_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_refresh_error: Option<String>,
 }
 
 impl CredentialStatus {
@@ -215,12 +297,20 @@ impl CredentialStatus {
                 ("refreshToken", false),
                 ("buvid3", false),
             ]),
+            "kugou" => BTreeMap::from([("token", false), ("userId", false), ("dfid", false)]),
             _ => BTreeMap::new(),
         };
         Self {
             provider,
             configured: false,
             fields,
+            refresh_supported: provider == "kugou",
+            manual_refresh_supported: provider == "kugou",
+            refresh_ready: false,
+            refresh_state: "unavailable",
+            last_refresh_at_ms: None,
+            next_refresh_check_at_ms: None,
+            last_refresh_error: None,
         }
     }
 }
@@ -229,12 +319,14 @@ impl CredentialStatus {
 pub struct CredentialStore {
     directory: Option<PathBuf>,
     credentials: Arc<RwLock<BTreeMap<&'static str, ProviderCredential>>>,
+    refresh_metadata: Arc<RwLock<BTreeMap<String, RefreshMetadata>>>,
 }
 
 impl CredentialStore {
     pub fn open(directory: PathBuf) -> Result<Self, CredentialError> {
         ensure_credential_directory(&directory)?;
         let mut credentials = BTreeMap::new();
+        let refresh_metadata = load_refresh_metadata(&directory)?;
         for provider in SUPPORTED_PROVIDERS {
             let path = credential_path(&directory, provider);
             restore_interrupted_write(&path)?;
@@ -272,6 +364,7 @@ impl CredentialStore {
         Ok(Self {
             directory: Some(directory),
             credentials: Arc::new(RwLock::new(credentials)),
+            refresh_metadata: Arc::new(RwLock::new(refresh_metadata)),
         })
     }
 
@@ -280,12 +373,14 @@ impl CredentialStore {
         Self {
             directory: None,
             credentials: Arc::new(RwLock::new(BTreeMap::new())),
+            refresh_metadata: Arc::new(RwLock::new(BTreeMap::new())),
         }
     }
 
     pub fn status(&self, provider: &str) -> Result<CredentialStatus, CredentialError> {
         let provider = canonical_provider(provider)?;
-        self.credentials
+        let mut status = self
+            .credentials
             .read()
             .map_err(|_| CredentialError::Poisoned)
             .map(|credentials| {
@@ -293,7 +388,104 @@ impl CredentialStore {
                     .get(provider)
                     .map(ProviderCredential::presence)
                     .unwrap_or_else(|| CredentialStatus::empty(provider))
+            })?;
+        if let Some(metadata) = self
+            .refresh_metadata
+            .read()
+            .map_err(|_| CredentialError::Poisoned)?
+            .get(provider)
+            .cloned()
+        {
+            status.refresh_state = match metadata.state.as_str() {
+                "unavailable" => "unavailable",
+                "refreshing" => "refreshing",
+                "success" => "success",
+                "failed" => "failed",
+                _ => "idle",
+            };
+            status.last_refresh_at_ms = metadata.last_refresh_at_ms;
+            status.next_refresh_check_at_ms = metadata.next_refresh_check_at_ms;
+            status.last_refresh_error = metadata.last_error;
+        }
+        Ok(status)
+    }
+
+    pub fn mark_refresh_started(&self, provider: &str) -> Result<(), CredentialError> {
+        let provider = canonical_provider(provider)?;
+        let mut metadata = self
+            .refresh_metadata
+            .write()
+            .map_err(|_| CredentialError::Poisoned)?;
+        metadata.insert(
+            provider.to_owned(),
+            RefreshMetadata {
+                state: "refreshing".to_owned(),
+                ..RefreshMetadata::default()
+            },
+        );
+        self.persist_refresh_metadata(&metadata)
+            .map_err(|error| CredentialError::Write {
+                path: self.refresh_state_path().unwrap_or_default(),
+                error,
             })
+            .map(|_| ())
+    }
+
+    pub fn mark_refresh_finished(
+        &self,
+        provider: &str,
+        result: Result<(), String>,
+        next_check_at_ms: Option<u64>,
+    ) -> Result<(), CredentialError> {
+        let provider = canonical_provider(provider)?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .ok();
+        let (state, error) = match result {
+            Ok(()) => ("success", None),
+            Err(error) => ("failed", Some(error)),
+        };
+        let mut metadata = self
+            .refresh_metadata
+            .write()
+            .map_err(|_| CredentialError::Poisoned)?;
+        metadata.insert(
+            provider.to_owned(),
+            RefreshMetadata {
+                state: state.to_owned(),
+                last_refresh_at_ms: now,
+                next_refresh_check_at_ms: next_check_at_ms,
+                last_error: error,
+            },
+        );
+        self.persist_refresh_metadata(&metadata)
+            .map_err(|error| CredentialError::Write {
+                path: self.refresh_state_path().unwrap_or_default(),
+                error,
+            })
+            .map(|_| ())
+    }
+
+    pub(crate) fn non_sensitive_path(&self, file_name: &str) -> Option<PathBuf> {
+        self.directory
+            .as_ref()
+            .map(|directory| directory.join(file_name))
+    }
+
+    fn refresh_state_path(&self) -> Option<PathBuf> {
+        self.non_sensitive_path(REFRESH_STATE_FILE)
+    }
+
+    fn persist_refresh_metadata(
+        &self,
+        metadata: &BTreeMap<String, RefreshMetadata>,
+    ) -> Result<(), String> {
+        let Some(path) = self.refresh_state_path() else {
+            return Ok(());
+        };
+        let content = serde_json::to_vec_pretty(metadata).map_err(|error| error.to_string())?;
+        write_atomic(&path, &content).map_err(|error| error.to_string())
     }
 
     pub fn statuses(&self) -> Result<Vec<CredentialStatus>, CredentialError> {
@@ -398,12 +590,33 @@ fn has_any_cookie(cookies: &BTreeMap<String, String>, candidates: &[&str]) -> bo
     candidates.iter().any(|candidate| {
         cookies
             .get(*candidate)
-            .is_some_and(|value| !value.trim().is_empty())
+            .is_some_and(|value| has_value(value))
     })
+}
+
+fn has_value(value: &str) -> bool {
+    !value.trim().is_empty()
 }
 
 fn credential_path(directory: &Path, provider: &str) -> PathBuf {
     directory.join(format!("{provider}.json"))
+}
+
+fn load_refresh_metadata(
+    directory: &Path,
+) -> Result<BTreeMap<String, RefreshMetadata>, CredentialError> {
+    let path = directory.join(REFRESH_STATE_FILE);
+    restore_interrupted_write(&path)?;
+    if !path.exists() {
+        return Ok(BTreeMap::new());
+    }
+    secure_credential_file(&path)?;
+    let text = fs::read_to_string(&path).map_err(|error| CredentialError::Read {
+        path: path.clone(),
+        error: error.to_string(),
+    })?;
+    serde_json::from_str(&text)
+        .map_err(|error| CredentialError::Invalid(format!("{}: {error}", path.display())))
 }
 
 fn persist_credential(path: &Path, credential: &ProviderCredential) -> Result<(), CredentialError> {
@@ -746,24 +959,60 @@ mod tests {
                 "bilibili",
                 ProviderCredential::Bilibili {
                     cookies: BTreeMap::from([("SESSDATA".to_owned(), "bili-secret".to_owned())]),
+                    refresh_token: None,
                 },
             )
             .unwrap();
         assert!(directory.join("qqmusic.json").exists());
         assert!(directory.join("netease.json").exists());
         assert!(directory.join("bilibili.json").exists());
+        assert_eq!(store.statuses().unwrap().len(), 4);
         let persisted: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(directory.join("qqmusic.json")).unwrap())
                 .unwrap();
-        assert_eq!(persisted["schemaVersion"], 1);
+        assert_eq!(persisted["schemaVersion"], 2);
         assert_eq!(persisted["credential"]["kind"], "qqMusic");
         assert!(
             !serde_json::to_string(&store.status("qqmusic").unwrap())
                 .unwrap()
                 .contains("secret")
         );
-        assert_eq!(store.statuses().unwrap().len(), 3);
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn kugou_credentials_require_all_session_fields_without_exposing_values() {
+        let store = CredentialStore::memory();
+        assert!(
+            store
+                .save(
+                    "kugou",
+                    ProviderCredential::Kugou {
+                        token: "token".to_owned(),
+                        userid: "123".to_owned(),
+                        dfid: String::new(),
+                        cookies: BTreeMap::new(),
+                    },
+                )
+                .is_err()
+        );
+        let status = store
+            .save(
+                "kugou",
+                ProviderCredential::Kugou {
+                    token: "token-secret".to_owned(),
+                    userid: "123".to_owned(),
+                    dfid: "dfid-secret".to_owned(),
+                    cookies: BTreeMap::from([("KugouGUID".to_owned(), "guid".to_owned())]),
+                },
+            )
+            .unwrap();
+        assert_eq!(status.fields.get("token"), Some(&true));
+        assert!(
+            !serde_json::to_string(&status)
+                .unwrap()
+                .contains("token-secret")
+        );
     }
 
     #[cfg(windows)]
@@ -939,6 +1188,7 @@ mod tests {
                 "bilibili",
                 ProviderCredential::Bilibili {
                     cookies: BTreeMap::from([("bili_jct".to_owned(), "csrf".to_owned())]),
+                    refresh_token: None,
                 },
             )
             .unwrap_err();
@@ -955,13 +1205,92 @@ mod tests {
                     cookies: BTreeMap::from([
                         ("SESSDATA".to_owned(), "session".to_owned()),
                         ("bili_jct".to_owned(), "csrf".to_owned()),
-                        ("ac_time_value".to_owned(), "refresh".to_owned()),
                     ]),
+                    refresh_token: Some("refresh".to_owned()),
                 },
             )
             .unwrap();
         assert!(status.configured);
         assert_eq!(status.fields.get("sessdata"), Some(&true));
         assert_eq!(status.fields.get("refreshToken"), Some(&true));
+    }
+
+    #[test]
+    fn bilibili_legacy_refresh_cookie_format_is_rejected() {
+        let directory =
+            std::env::temp_dir().join(format!("miliastra-credentials-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("bilibili.json"),
+            r#"{"schemaVersion":2,"credential":{"kind":"bilibili","cookies":{"SESSDATA":"session","ac_time_value":"legacy-refresh"}}}"#,
+        )
+        .unwrap();
+
+        let error = match CredentialStore::open(directory.clone()) {
+            Ok(_) => panic!("legacy Bilibili credential must be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported credential cookie field ac_time_value")
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn schema_version_one_credentials_are_rejected() {
+        let directory =
+            std::env::temp_dir().join(format!("miliastra-credentials-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("bilibili.json"),
+            r#"{"schemaVersion":1,"credential":{"kind":"bilibili","cookies":{"SESSDATA":"session"},"refreshToken":"refresh"}}"#,
+        )
+        .unwrap();
+
+        let error = match CredentialStore::open(directory.clone()) {
+            Ok(_) => panic!("schema version one must be rejected"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            CredentialError::UnsupportedSchema {
+                expected: 2,
+                actual: Some(1),
+                ..
+            }
+        ));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn bilibili_persistence_keeps_refresh_token_out_of_cookies_and_status() {
+        let directory =
+            std::env::temp_dir().join(format!("miliastra-credentials-{}", uuid::Uuid::new_v4()));
+        let store = CredentialStore::open(directory.clone()).unwrap();
+        store
+            .save(
+                "bilibili",
+                ProviderCredential::Bilibili {
+                    cookies: BTreeMap::from([("SESSDATA".to_owned(), "session".to_owned())]),
+                    refresh_token: Some("independent-refresh".to_owned()),
+                },
+            )
+            .unwrap();
+
+        let persisted = fs::read_to_string(directory.join("bilibili.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&persisted).unwrap();
+        assert_eq!(value["schemaVersion"], 2);
+        assert_eq!(value["credential"]["refreshToken"], "independent-refresh");
+        assert!(
+            value["credential"]["cookies"]
+                .get("ac_time_value")
+                .is_none()
+        );
+        let status = serde_json::to_string(&store.status("bilibili").unwrap()).unwrap();
+        assert!(status.contains("\"refreshToken\":true"));
+        assert!(!status.contains("independent-refresh"));
+        fs::remove_dir_all(directory).unwrap();
     }
 }

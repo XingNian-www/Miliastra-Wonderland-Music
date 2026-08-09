@@ -8,7 +8,7 @@ mod lyrics;
 mod model;
 mod runtime;
 
-pub use catalog::{PlaybackEligibility, ProviderId};
+pub use catalog::{KugouAccountStatus, KugouListenReport, PlaybackEligibility, ProviderId};
 pub use credentials::{CredentialError, CredentialStatus, ProviderCredential};
 pub use domain::{
     EndBehavior, EndCause, EngineState, Failure, ResolverLocator, ResolverLocatorError,

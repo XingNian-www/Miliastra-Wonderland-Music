@@ -105,6 +105,7 @@ pub(crate) enum SongSource {
     QqMusic,
     Netease,
     Bilibili,
+    Kugou,
 }
 
 impl SongSource {
@@ -114,6 +115,7 @@ impl SongSource {
             Self::QqMusic => "qqmusic",
             Self::Netease => "netease",
             Self::Bilibili => "bilibili",
+            Self::Kugou => "kugou",
         }
     }
 }

@@ -43,6 +43,14 @@ pub(crate) trait PlaybackStatePort: Clone + Send + Sync + 'static {
     fn update(&self, update: PlaybackStateUpdate) -> Result<bool>;
     fn song_dedup_limited(&self, candidate: SongDedupCandidate) -> Result<bool>;
     fn record_song_dedup(&self, candidate: SongDedupCandidate) -> Result<()>;
+    /// 把确认播放成功的歌曲写入持久播放池，队列播完后随机播放。
+    fn record_playback_pool_track(&self, _track: PlayableTrack) -> Result<()> {
+        Ok(())
+    }
+    /// 播放池是否可用（已启用且非空），用于队列空时的随机播放决策。
+    fn playback_pool_available(&self) -> Result<bool> {
+        Ok(false)
+    }
     fn observe_external_playback(
         &self,
         identity: TrackKey,
@@ -1029,7 +1037,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             return Ok(QueueAdvanceDecision::None);
         }
 
-        let has_pending_playback = !context.queue_empty
+        let has_pending_playback = self.has_pending_tracks(&context)?
             || context.has_pending_playback_task
             || context.song_command_executing;
 
@@ -1052,7 +1060,11 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             }
             self.clear_active_request()?;
             let _ = self.playback_state.reconcile_player_session(None)?;
-            if context.command_executing || context.has_pending_playback_task || context.queue_empty
+            // 自然结束已清空 active_request：队列有歌直接推进；队列空时
+            // 仅当播放池可用才继续随机播放（能匹配到自然结束本身就是点歌播放）。
+            if context.command_executing
+                || context.has_pending_playback_task
+                || (context.queue_empty && !self.playback_state.playback_pool_available()?)
             {
                 return Ok(QueueAdvanceDecision::PlaybackStateChanged);
             }
@@ -1086,7 +1098,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
                 }
                 if !context.command_executing
                     && !context.has_pending_playback_task
-                    && !context.queue_empty
+                    && self.has_pending_tracks(&context)?
                 {
                     log::info!("队列推进决策: advance reason=near_end_paused");
                     return Ok(QueueAdvanceDecision::AdvanceQueue {
@@ -1101,7 +1113,9 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             if remaining > self.queue.auto_advance_seconds as f64 {
                 return Ok(QueueAdvanceDecision::None);
             }
-            if context.command_executing || context.has_pending_playback_task || context.queue_empty
+            if context.command_executing
+                || context.has_pending_playback_task
+                || !self.has_pending_tracks(&context)?
             {
                 return Ok(QueueAdvanceDecision::None);
             }
@@ -1126,7 +1140,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             let paused = self.pause_for_queue()?;
             if !context.command_executing
                 && !context.has_pending_playback_task
-                && !context.queue_empty
+                && self.has_pending_tracks(&context)?
             {
                 log::info!("队列推进决策: advance reason=near_end");
                 return Ok(QueueAdvanceDecision::AdvanceQueue {
@@ -1172,6 +1186,20 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         runtime.active_request.is_some()
             && reconciliation == SessionReconciliation::Match
             && is_notify_controller_natural_end(status)
+    }
+
+    /// 队列或播放池里是否还有后续歌曲可播。
+    ///
+    /// 播放池只在点歌播放中（存在 active_request）才视为后续来源，避免外部
+    /// 手动播放被自动切歌或随机插歌。
+    fn has_pending_tracks(&self, context: &QueueAdvanceContext) -> Result<bool> {
+        if !context.queue_empty {
+            return Ok(true);
+        }
+        if !self.playback_state.playback_pool_available()? {
+            return Ok(false);
+        }
+        Ok(self.playback_state.snapshot()?.active_request.is_some())
     }
 
     fn recover_after_runtime_restart(
@@ -1335,7 +1363,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             .clone()
             .ok_or_else(|| anyhow!("跨源换源确认缺少结构化曲目"))?;
         let mut reconciled = active_request.clone();
-        reconciled.track = Some(confirmed_track);
+        reconciled.track = Some(confirmed_track.clone());
         reconciled.song = format!("{}{}", status.name, status.singer);
         reconciled.title = status.name.trim().to_string();
         reconciled.artist = status.singer.trim().to_string();
@@ -1346,6 +1374,8 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             })?;
         let request = playback_request_from_active(active_request);
         self.record_song_dedup_playback(&request, status)?;
+        self.playback_state
+            .record_playback_pool_track(confirmed_track)?;
         log::info!(
             "播放器状态保持 RequestedSongPlaying reason={} confirmed_uri={}",
             reason,
@@ -1390,6 +1420,8 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             navigation: request.navigation,
         })?;
         self.record_song_dedup_playback(request, status)?;
+        self.playback_state
+            .record_playback_pool_track(confirmed_track.clone())?;
         log::info!("播放器状态转移: Starting -> RequestedSongPlaying reason={reason}");
         Ok(())
     }
@@ -1728,6 +1760,8 @@ mod tests {
         attempts: Arc<Mutex<Vec<(String, String, String)>>>,
         controls: Arc<Mutex<Vec<(String, bool)>>>,
         song_dedup: SongDedupConfig,
+        pool: Arc<Mutex<Vec<PlayableTrack>>>,
+        pool_available: bool,
     }
 
     impl PlaybackStatePort for TestPlaybackState {
@@ -1753,6 +1787,21 @@ mod tests {
                 .lock()
                 .unwrap()
                 .record_playback(&self.song_dedup, candidate)
+        }
+
+        fn record_playback_pool_track(&self, track: PlayableTrack) -> Result<()> {
+            let mut pool = self.pool.lock().unwrap();
+            if !pool
+                .iter()
+                .any(|existing| existing.track_ref.key == track.track_ref.key)
+            {
+                pool.push(track);
+            }
+            Ok(())
+        }
+
+        fn playback_pool_available(&self) -> Result<bool> {
+            Ok(self.pool_available && !self.pool.lock().unwrap().is_empty())
         }
 
         fn observe_external_playback(
@@ -2034,12 +2083,24 @@ mod tests {
         wall_clock: Arc<dyn WallClock>,
         delay: Arc<dyn Delay>,
     ) -> PlayerController<FakeBackend, TestPlaybackState> {
+        controller_with_pool(backend, clock, wall_clock, delay, false)
+    }
+
+    /// 与 `controller` 相同，但允许启用播放池（用于测试队列空时的随机播放决策）。
+    fn controller_with_pool(
+        backend: FakeBackend,
+        clock: Arc<dyn Clock>,
+        wall_clock: Arc<dyn WallClock>,
+        delay: Arc<dyn Delay>,
+        pool_available: bool,
+    ) -> PlayerController<FakeBackend, TestPlaybackState> {
         controller_with_time_and_judge(
             backend,
             clock,
             wall_clock,
             delay,
             Arc::new(DisabledPlaybackIdentityJudge),
+            pool_available,
         )
     }
 
@@ -2049,6 +2110,7 @@ mod tests {
         wall_clock: Arc<dyn WallClock>,
         delay: Arc<dyn Delay>,
         identity_judge: Arc<dyn PlaybackIdentityJudge>,
+        pool_available: bool,
     ) -> PlayerController<FakeBackend, TestPlaybackState> {
         let history_path = temp_path("dedup");
         let runtime = PersistentPlaybackState::new_for_test().unwrap();
@@ -2063,6 +2125,14 @@ mod tests {
             history_path: temp_path("dedup-config"),
             ..SongDedupConfig::default()
         };
+        let pool = if pool_available {
+            vec![test_track(
+                "miliastra://track/qqmusic/pool-1",
+                "池歌一 - 歌手A",
+            )]
+        } else {
+            Vec::new()
+        };
         PlayerController::new(
             backend,
             TestPlaybackState {
@@ -2074,6 +2144,8 @@ mod tests {
                 attempts: Arc::new(Mutex::new(Vec::new())),
                 controls: Arc::new(Mutex::new(Vec::new())),
                 song_dedup,
+                pool: Arc::new(Mutex::new(pool)),
+                pool_available,
             },
             &test_timing(),
             &QueueConfig {
@@ -2081,6 +2153,7 @@ mod tests {
                 auto_advance_seconds: 2,
                 protect_current_song_until_finished: true,
                 external_playback_protect_after_seconds: 20,
+                pool_max_size: if pool_available { 200 } else { 0 },
             },
             &matching,
             identity_judge,
@@ -2269,6 +2342,7 @@ mod tests {
             Arc::new(SystemClock),
             Arc::new(SystemClock),
             Arc::new(MatchingIdentityJudge),
+            false,
         );
         controller.timing.fallback_identity_stable_samples = 2;
         let request = request();
@@ -2296,6 +2370,7 @@ mod tests {
             manual_clock.clone(),
             manual_clock.clone(),
             Arc::new(MatchingIdentityJudge),
+            false,
         );
         let request = request();
         controller
@@ -2347,6 +2422,7 @@ mod tests {
             manual_clock.clone(),
             manual_clock.clone(),
             Arc::new(MatchingIdentityJudge),
+            false,
         );
         controller.timing.fallback_identity_stable_samples = 2;
         let request = request();
@@ -2427,6 +2503,7 @@ mod tests {
             manual_clock.clone(),
             manual_clock.clone(),
             Arc::new(NonMatchingIdentityJudge),
+            false,
         );
         let request = request();
         controller
@@ -2466,6 +2543,7 @@ mod tests {
             manual_clock.clone(),
             manual_clock.clone(),
             Arc::new(MatchingIdentityJudge),
+            false,
         );
         let request = request();
         controller
@@ -2535,6 +2613,92 @@ mod tests {
             }
         );
         assert_eq!(controller.snapshot().state, "idle");
+    }
+
+    #[test]
+    fn natural_end_with_empty_queue_advances_from_pool_when_available() {
+        let request = request();
+        let terminal = PlayerStatus {
+            status: "stopped".to_string(),
+            current_track: request.track.clone(),
+            current_uri: request.uri(),
+            runtime_identity: "runtime-a".to_string(),
+            session_id: "session-a".to_string(),
+            generation: 41,
+            end_behavior: "notify_controller".to_string(),
+            last_end_cause: "natural_end".to_string(),
+            ..PlayerStatus::default()
+        };
+        let controller = controller_with_pool(
+            FakeBackend::new(Vec::new()),
+            Arc::new(SystemClock),
+            Arc::new(SystemClock),
+            Arc::new(SystemClock),
+            true,
+        );
+        controller
+            .confirm_playback_success(&request, &status("目标", &request.uri(), 1.0, 180.0))
+            .unwrap();
+        let context = QueueAdvanceContext {
+            queue_empty: true,
+            has_pending_playback_task: false,
+            command_executing: false,
+            song_command_executing: false,
+        };
+
+        // 队列空但播放池可用时，自然结束应推进到播放池随机播放。
+        assert_eq!(
+            controller
+                .maybe_advance_queue(terminal.clone(), context.clone())
+                .unwrap(),
+            QueueAdvanceDecision::None
+        );
+        assert_eq!(
+            controller.maybe_advance_queue(terminal, context).unwrap(),
+            QueueAdvanceDecision::AdvanceQueue {
+                reason: "自然结束"
+            }
+        );
+        assert_eq!(controller.snapshot().state, "idle");
+    }
+
+    #[test]
+    fn external_playback_with_pool_available_never_advances_from_pool() {
+        let request = request();
+        let terminal = PlayerStatus {
+            status: "stopped".to_string(),
+            current_track: request.track.clone(),
+            current_uri: request.uri(),
+            runtime_identity: "runtime-a".to_string(),
+            session_id: "session-a".to_string(),
+            generation: 41,
+            end_behavior: "notify_controller".to_string(),
+            last_end_cause: "natural_end".to_string(),
+            ..PlayerStatus::default()
+        };
+        let controller = controller_with_pool(
+            FakeBackend::new(Vec::new()),
+            Arc::new(SystemClock),
+            Arc::new(SystemClock),
+            Arc::new(SystemClock),
+            true,
+        );
+        // 外部手动播放：无点歌请求，播放池可用也不得随机插歌。
+        controller
+            .playback_state
+            .update(PlaybackStateUpdate::External)
+            .unwrap();
+        let context = QueueAdvanceContext {
+            queue_empty: true,
+            has_pending_playback_task: false,
+            command_executing: false,
+            song_command_executing: false,
+        };
+
+        assert_eq!(
+            controller.maybe_advance_queue(terminal, context).unwrap(),
+            QueueAdvanceDecision::None
+        );
     }
 
     #[test]

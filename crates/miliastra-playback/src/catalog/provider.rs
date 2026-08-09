@@ -14,16 +14,19 @@ pub enum ProviderId {
     #[serde(rename = "netease")]
     Netease,
     Bilibili,
+    #[serde(rename = "kugou")]
+    Kugou,
 }
 
 impl ProviderId {
-    pub const ALL: [Self; 3] = [Self::QqMusic, Self::Netease, Self::Bilibili];
+    pub const ALL: [Self; 4] = [Self::QqMusic, Self::Netease, Self::Bilibili, Self::Kugou];
 
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::QqMusic => "qqmusic",
             Self::Netease => "netease",
             Self::Bilibili => "bilibili",
+            Self::Kugou => "kugou",
         }
     }
 }
@@ -48,6 +51,7 @@ impl FromStr for ProviderId {
             "qqmusic" => Ok(Self::QqMusic),
             "netease" => Ok(Self::Netease),
             "bilibili" => Ok(Self::Bilibili),
+            "kugou" => Ok(Self::Kugou),
             _ => Err(UnknownProvider(value.to_owned())),
         }
     }
@@ -149,11 +153,14 @@ mod tests {
     fn canonical_ids_are_strict_and_registry_lists_all_known_providers() {
         assert_eq!(
             ProviderId::ALL.map(ProviderId::as_str),
-            ["qqmusic", "netease", "bilibili"]
+            ["qqmusic", "netease", "bilibili", "kugou"]
         );
         assert!("tx".parse::<ProviderId>().is_err());
         let registry = ProviderRegistry;
-        assert_eq!(registry.enabled(), vec!["qqmusic", "netease", "bilibili"]);
+        assert_eq!(
+            registry.enabled(),
+            vec!["qqmusic", "netease", "bilibili", "kugou"]
+        );
     }
 
     #[test]

@@ -6,7 +6,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
 use miliastra_login_protocol::encode_message;
@@ -19,7 +19,9 @@ use miliastra_playback::{
     CredentialStatus, LoginOperation, LoginOperationWaitError, LoginSession, PlaybackError,
     PlaybackHandle, ProviderCredential, ProviderId,
 };
+use reqwest::blocking::Client as BlockingHttpClient;
 use serde::Serialize;
+use url::Url;
 use uuid::Uuid;
 
 const REAPER_POLL: Duration = Duration::from_millis(25);
@@ -31,6 +33,12 @@ const PROFILE_ROOT_NAME: &str = ".login-profiles";
 /// FFmpeg runtime or a WebView2 window.
 trait LoginPlaybackPort: Send + Sync {
     fn credential_statuses(&self) -> Result<Vec<CredentialStatus>, PlaybackError>;
+    fn refresh_credential(&self, provider: ProviderId) -> Result<CredentialStatus, PlaybackError>;
+    fn kugou_status(&self) -> Result<miliastra_playback::KugouAccountStatus, PlaybackError>;
+    fn kugou_report(
+        &self,
+        mixsongid: String,
+    ) -> Result<miliastra_playback::KugouListenReport, PlaybackError>;
     fn begin_login(&self, provider: ProviderId) -> Result<LoginSession, PlaybackError>;
     fn complete_login(
         &self,
@@ -70,6 +78,21 @@ impl PendingLoginCompletion for NativeLoginCompletion {
 impl LoginPlaybackPort for PlaybackHandle {
     fn credential_statuses(&self) -> Result<Vec<CredentialStatus>, PlaybackError> {
         PlaybackHandle::credential_statuses(self)
+    }
+
+    fn refresh_credential(&self, provider: ProviderId) -> Result<CredentialStatus, PlaybackError> {
+        PlaybackHandle::refresh_credential(self, provider)
+    }
+
+    fn kugou_status(&self) -> Result<miliastra_playback::KugouAccountStatus, PlaybackError> {
+        PlaybackHandle::kugou_account_status(self)
+    }
+
+    fn kugou_report(
+        &self,
+        mixsongid: String,
+    ) -> Result<miliastra_playback::KugouListenReport, PlaybackError> {
+        PlaybackHandle::kugou_report_listen_song(self, mixsongid)
     }
 
     fn begin_login(&self, provider: ProviderId) -> Result<LoginSession, PlaybackError> {
@@ -113,6 +136,101 @@ trait HelperLauncher: Send + Sync {
         profile: &Path,
         timeout: Duration,
     ) -> io::Result<SpawnedHelper>;
+}
+
+trait KugouDeviceRegistrar: Send + Sync {
+    fn register(
+        &self,
+        token: &str,
+        userid: &str,
+        cookies: &BTreeMap<String, String>,
+    ) -> Result<String, LoginHelperFailure>;
+}
+
+struct HttpKugouDeviceRegistrar {
+    client: BlockingHttpClient,
+    api_base_url: Url,
+}
+
+impl HttpKugouDeviceRegistrar {
+    fn new(api_base_url: &str, timeout: Duration) -> Result<Self, String> {
+        let api_base_url = Url::parse(api_base_url).map_err(|error| error.to_string())?;
+        let client = BlockingHttpClient::builder()
+            .timeout(timeout)
+            .user_agent("Miliastra-Wonderland-Music/4.1")
+            .build()
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            client,
+            api_base_url,
+        })
+    }
+}
+
+impl KugouDeviceRegistrar for HttpKugouDeviceRegistrar {
+    fn register(
+        &self,
+        token: &str,
+        userid: &str,
+        cookies: &BTreeMap<String, String>,
+    ) -> Result<String, LoginHelperFailure> {
+        let url = self.api_base_url.join("register/dev").map_err(|_| {
+            manager_failure(
+                "kugou_device_registration_failed",
+                "酷狗设备注册失败",
+                Some(ProviderId::Kugou),
+            )
+        })?;
+        let mut cookie_pairs = cookies
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>();
+        cookie_pairs.push(format!("token={token}"));
+        cookie_pairs.push(format!("userid={userid}"));
+        let response = self
+            .client
+            .post(url)
+            .query(&[("token", token), ("userid", userid)])
+            .header(reqwest::header::COOKIE, cookie_pairs.join("; "))
+            .send()
+            .map_err(|_| {
+                manager_failure(
+                    "kugou_device_registration_failed",
+                    "酷狗设备注册失败",
+                    Some(ProviderId::Kugou),
+                )
+            })?;
+        let value = response
+            .error_for_status()
+            .map_err(|_| {
+                manager_failure(
+                    "kugou_device_registration_failed",
+                    "酷狗设备注册失败",
+                    Some(ProviderId::Kugou),
+                )
+            })?
+            .json::<serde_json::Value>()
+            .map_err(|_| {
+                manager_failure(
+                    "kugou_device_registration_failed",
+                    "酷狗设备注册响应无效",
+                    Some(ProviderId::Kugou),
+                )
+            })?;
+        value
+            .get("data")
+            .and_then(|data| data.get("dfid"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|dfid| !dfid.trim().is_empty())
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| {
+                manager_failure(
+                    "kugou_device_registration_failed",
+                    "酷狗设备注册未返回 dfid",
+                    Some(ProviderId::Kugou),
+                )
+            })
+    }
 }
 
 struct CommandHelperLauncher {
@@ -179,6 +297,7 @@ pub(crate) struct LoginHelperManager {
 struct ManagerInner {
     playback: Arc<dyn LoginPlaybackPort>,
     launcher: Arc<dyn HelperLauncher>,
+    kugou_device_registrar: Arc<dyn KugouDeviceRegistrar>,
     profile_root: PathBuf,
     timeout: Duration,
     state: Mutex<ManagerState>,
@@ -188,6 +307,9 @@ struct ManagerInner {
 struct ManagerState {
     active: Option<ActiveLogin>,
     worker: Option<JoinHandle<()>>,
+    phase: LoginPhase,
+    started_at_ms: Option<u64>,
+    deadline_at_ms: Option<u64>,
     last_error: Option<LoginErrorView>,
 }
 
@@ -197,12 +319,34 @@ struct ActiveLogin {
     child: SharedChild,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum LoginPhase {
+    Idle,
+    Starting,
+    WaitingForUser,
+    ValidatingCredential,
+    Canceling,
+    Failed,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ProviderView {
     pub provider: ProviderId,
+    pub display_name: &'static str,
     pub configured: bool,
     pub fields: BTreeMap<String, bool>,
+    pub required_fields: Vec<String>,
+    pub present_field_count: usize,
+    pub total_field_count: usize,
+    pub refresh_supported: bool,
+    pub manual_refresh_supported: bool,
+    pub refresh_ready: bool,
+    pub refresh_state: &'static str,
+    pub last_refresh_at_ms: Option<u64>,
+    pub next_refresh_check_at_ms: Option<u64>,
+    pub last_refresh_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -217,10 +361,15 @@ pub(crate) struct LoginErrorView {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct LoginManagerStatus {
     pub active: bool,
+    pub phase: LoginPhase,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<ProviderId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deadline_at_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<LoginErrorView>,
 }
@@ -256,10 +405,14 @@ impl LoginHelperManager {
         executable: PathBuf,
         credential_directory: PathBuf,
         timeout: Duration,
+        kugou_api_base_url: &str,
     ) -> Self {
+        let registrar = HttpKugouDeviceRegistrar::new(kugou_api_base_url, timeout)
+            .expect("酷狗 API 基址已在配置阶段校验");
         Self::new_with_dependencies(
             Arc::new(playback),
             Arc::new(CommandHelperLauncher { executable }),
+            Arc::new(registrar),
             credential_directory,
             timeout,
         )
@@ -268,6 +421,7 @@ impl LoginHelperManager {
     fn new_with_dependencies(
         playback: Arc<dyn LoginPlaybackPort>,
         launcher: Arc<dyn HelperLauncher>,
+        kugou_device_registrar: Arc<dyn KugouDeviceRegistrar>,
         credential_directory: PathBuf,
         timeout: Duration,
     ) -> Self {
@@ -275,11 +429,15 @@ impl LoginHelperManager {
             inner: Arc::new(ManagerInner {
                 playback,
                 launcher,
+                kugou_device_registrar,
                 profile_root: credential_directory.join(PROFILE_ROOT_NAME),
                 timeout: timeout.max(Duration::from_millis(1)),
                 state: Mutex::new(ManagerState {
                     active: None,
                     worker: None,
+                    phase: LoginPhase::Idle,
+                    started_at_ms: None,
+                    deadline_at_ms: None,
                     last_error: None,
                 }),
                 changed: Condvar::new(),
@@ -301,14 +459,26 @@ impl LoginHelperManager {
                     .find(|status| status.provider == provider.as_str())
                     .cloned()
                     .unwrap_or_else(|| CredentialStatus::empty(provider.as_str()));
+                let fields: BTreeMap<String, bool> = status
+                    .fields
+                    .into_iter()
+                    .map(|(name, present)| (name.to_owned(), present))
+                    .collect();
                 ProviderView {
                     provider,
+                    display_name: provider_display_name(provider),
                     configured: status.configured,
-                    fields: status
-                        .fields
-                        .into_iter()
-                        .map(|(name, present)| (name.to_owned(), present))
-                        .collect(),
+                    required_fields: fields.keys().cloned().collect(),
+                    present_field_count: fields.values().filter(|present| **present).count(),
+                    total_field_count: fields.len(),
+                    refresh_supported: status.refresh_supported,
+                    manual_refresh_supported: status.manual_refresh_supported,
+                    refresh_ready: status.refresh_ready,
+                    refresh_state: status.refresh_state,
+                    last_refresh_at_ms: status.last_refresh_at_ms,
+                    next_refresh_check_at_ms: status.next_refresh_check_at_ms,
+                    last_refresh_error: status.last_refresh_error,
+                    fields,
                 }
             })
             .collect())
@@ -318,8 +488,11 @@ impl LoginHelperManager {
         let Ok(state) = self.inner.state.lock() else {
             return LoginManagerStatus {
                 active: false,
+                phase: LoginPhase::Failed,
                 session_id: None,
                 provider: None,
+                started_at_ms: None,
+                deadline_at_ms: None,
                 last_error: Some(
                     manager_failure("login_manager_unavailable", "登录管理器不可用", None).view(),
                 ),
@@ -337,38 +510,61 @@ impl LoginHelperManager {
             .unwrap_or((None, None));
         LoginManagerStatus {
             active: session_id.is_some(),
+            phase: state.phase,
             session_id,
             provider,
+            started_at_ms: state.started_at_ms,
+            deadline_at_ms: state.deadline_at_ms,
             last_error: state.last_error.clone(),
         }
     }
 
     pub(crate) fn start(&self, provider: ProviderId) -> Result<LoginSession, LoginHelperFailure> {
         self.join_finished_worker()?;
-        let mut state = self.inner.state.lock().map_err(|_| {
-            manager_failure(
-                "login_manager_unavailable",
-                "登录管理器不可用",
-                Some(provider),
-            )
-        })?;
-        if state.active.is_some() {
-            return Err(manager_failure(
-                "login_in_progress",
-                "已有登录任务正在进行",
-                Some(provider),
-            ));
+        let started_at_ms = unix_time_ms();
+        let deadline_at_ms = started_at_ms.saturating_add(duration_ms(self.inner.timeout));
+        {
+            let mut state = self.inner.state.lock().map_err(|_| {
+                manager_failure(
+                    "login_manager_unavailable",
+                    "登录管理器不可用",
+                    Some(provider),
+                )
+            })?;
+            if state.active.is_some()
+                || matches!(
+                    state.phase,
+                    LoginPhase::Starting
+                        | LoginPhase::WaitingForUser
+                        | LoginPhase::ValidatingCredential
+                        | LoginPhase::Canceling
+                )
+            {
+                return Err(manager_failure(
+                    "login_in_progress",
+                    "已有登录任务正在进行",
+                    Some(provider),
+                ));
+            }
+            state.phase = LoginPhase::Starting;
+            state.started_at_ms = Some(started_at_ms);
+            state.deadline_at_ms = Some(deadline_at_ms);
+            state.last_error = None;
         }
 
-        let session = self
-            .inner
-            .playback
-            .begin_login(provider)
-            .map_err(|error| playback_failure(error, Some(provider)))?;
+        let session = match self.inner.playback.begin_login(provider) {
+            Ok(session) => session,
+            Err(error) => {
+                let failure = playback_failure(error, Some(provider));
+                self.record_start_failure(&failure);
+                return Err(failure);
+            }
+        };
         let profile = match self.create_profile(session.session_id, provider) {
             Ok(profile) => profile,
             Err(error) => {
                 let _ = self.inner.playback.cancel_login(session.session_id);
+                self.record_start_failure(&error);
                 return Err(error);
             }
         };
@@ -381,11 +577,10 @@ impl LoginHelperManager {
             Err(_) => {
                 let _ = self.inner.playback.cancel_login(session.session_id);
                 cleanup_profile(&profile);
-                return Err(manager_failure(
-                    "helper_start_failed",
-                    "登录助手启动失败",
-                    Some(provider),
-                ));
+                let failure =
+                    manager_failure("helper_start_failed", "登录助手启动失败", Some(provider));
+                self.record_start_failure(&failure);
+                return Err(failure);
             }
         };
 
@@ -396,11 +591,19 @@ impl LoginHelperManager {
         let worker_inner = Arc::clone(&self.inner);
         let worker_session = session.clone();
         let worker_profile = profile.clone();
+        let mut state = self.inner.state.lock().map_err(|_| {
+            manager_failure(
+                "login_manager_unavailable",
+                "登录管理器不可用",
+                Some(provider),
+            )
+        })?;
         state.active = Some(ActiveLogin {
             session: session.clone(),
             cancel: Arc::clone(&cancel),
             child: Arc::clone(&child),
         });
+        state.phase = LoginPhase::WaitingForUser;
         let worker = thread::Builder::new()
             .name("login-helper-manager".to_owned())
             .spawn(move || {
@@ -416,28 +619,30 @@ impl LoginHelperManager {
         match worker {
             Ok(worker) => {
                 state.worker = Some(worker);
-                state.last_error = None;
                 Ok(session)
             }
             Err(_) => {
+                let failure = manager_failure(
+                    "helper_start_failed",
+                    "登录助手线程启动失败",
+                    Some(provider),
+                );
                 state.active = None;
+                state.phase = LoginPhase::Failed;
+                state.last_error = Some(failure.view());
                 self.inner.changed.notify_all();
                 drop(state);
                 terminate_child(&child);
                 let _ = self.inner.playback.cancel_login(session.session_id);
                 cleanup_profile(&profile);
-                Err(manager_failure(
-                    "helper_start_failed",
-                    "登录助手线程启动失败",
-                    Some(provider),
-                ))
+                Err(failure)
             }
         }
     }
 
     pub(crate) fn cancel(&self, session_id: Uuid) -> Result<(), LoginHelperFailure> {
         let (cancel, child, provider) = {
-            let state = self.inner.state.lock().map_err(|_| {
+            let mut state = self.inner.state.lock().map_err(|_| {
                 manager_failure("login_manager_unavailable", "登录管理器不可用", None)
             })?;
             let Some(active) = state.active.as_ref() else {
@@ -454,16 +659,52 @@ impl LoginHelperManager {
                     None,
                 ));
             }
-            (
-                Arc::clone(&active.cancel),
-                Arc::clone(&active.child),
-                active.session.provider,
-            )
+            let cancel = Arc::clone(&active.cancel);
+            let child = Arc::clone(&active.child);
+            let provider = active.session.provider;
+            state.phase = LoginPhase::Canceling;
+            (cancel, child, provider)
         };
         cancel.store(true, Ordering::Release);
         terminate_child(&child);
         let _ = self.inner.playback.cancel_login(session_id);
         self.finish_and_join(session_id, provider)
+    }
+
+    pub(crate) fn refresh_credential(
+        &self,
+        provider: ProviderId,
+    ) -> Result<CredentialStatus, LoginHelperFailure> {
+        if self.status().active {
+            return Err(manager_failure(
+                "login_in_progress",
+                "登录进行中，不能刷新凭据",
+                Some(provider),
+            ));
+        }
+        self.inner
+            .playback
+            .refresh_credential(provider)
+            .map_err(|error| playback_failure(error, Some(provider)))
+    }
+
+    pub(crate) fn kugou_status(
+        &self,
+    ) -> Result<miliastra_playback::KugouAccountStatus, LoginHelperFailure> {
+        self.inner
+            .playback
+            .kugou_status()
+            .map_err(|error| playback_failure(error, Some(ProviderId::Kugou)))
+    }
+
+    pub(crate) fn kugou_report(
+        &self,
+        mixsongid: String,
+    ) -> Result<miliastra_playback::KugouListenReport, LoginHelperFailure> {
+        self.inner
+            .playback
+            .kugou_report(mixsongid)
+            .map_err(|error| playback_failure(error, Some(ProviderId::Kugou)))
     }
 
     pub(crate) fn logout(
@@ -495,6 +736,13 @@ impl LoginHelperManager {
         let cancel_error = session_id.and_then(|session_id| self.cancel(session_id).err());
         let join_error = self.join_finished_worker().err();
         cancel_error.or(join_error).map_or(Ok(()), Err)
+    }
+
+    fn record_start_failure(&self, failure: &LoginHelperFailure) {
+        if let Ok(mut state) = self.inner.state.lock() {
+            state.phase = LoginPhase::Failed;
+            state.last_error = Some(failure.view());
+        }
     }
 
     fn create_profile(
@@ -722,7 +970,18 @@ fn run_helper(
         .is_some_and(|active| active.session.session_id == session.session_id)
     {
         state.active = None;
-        state.last_error = result.err().map(|error| error.view());
+        match result {
+            Ok(()) => {
+                state.phase = LoginPhase::Idle;
+                state.started_at_ms = None;
+                state.deadline_at_ms = None;
+                state.last_error = None;
+            }
+            Err(error) => {
+                state.phase = LoginPhase::Failed;
+                state.last_error = Some(error.view());
+            }
+        }
         inner.changed.notify_all();
     }
 }
@@ -748,13 +1007,9 @@ fn process_message(
                     Some(session.provider),
                 ));
             }
-            complete_login_until(
-                inner,
-                session,
-                credential_from_payload(credential),
-                cancel,
-                deadline,
-            )
+            set_active_phase(inner, session.session_id, LoginPhase::ValidatingCredential);
+            let credential = credential_from_payload_with_device_registration(inner, credential)?;
+            complete_login_until(inner, session, credential, cancel, deadline)
         }
         LoginHelperMessage::Error { provider, code, .. } => {
             let actual = parse_helper_provider(&provider, session.provider)?;
@@ -841,6 +1096,18 @@ fn complete_login_until(
     }
 }
 
+fn set_active_phase(inner: &ManagerInner, session_id: Uuid, phase: LoginPhase) {
+    if let Ok(mut state) = inner.state.lock()
+        && state
+            .active
+            .as_ref()
+            .is_some_and(|active| active.session.session_id == session_id)
+    {
+        state.phase = phase;
+        inner.changed.notify_all();
+    }
+}
+
 fn map_login_completion(
     result: Result<CredentialStatus, PlaybackError>,
     provider: ProviderId,
@@ -863,11 +1130,44 @@ fn parse_helper_provider(
     })
 }
 
+fn credential_from_payload_with_device_registration(
+    inner: &ManagerInner,
+    payload: CredentialPayload,
+) -> Result<ProviderCredential, LoginHelperFailure> {
+    match payload {
+        CredentialPayload::Kugou {
+            token,
+            userid,
+            cookies,
+        } => {
+            let dfid = inner
+                .kugou_device_registrar
+                .register(&token, &userid, &cookies)?;
+            Ok(ProviderCredential::Kugou {
+                token,
+                userid,
+                dfid,
+                cookies,
+            })
+        }
+        payload => Ok(credential_from_payload(payload)),
+    }
+}
+
 fn credential_from_payload(payload: CredentialPayload) -> ProviderCredential {
     match payload {
         CredentialPayload::QqMusic { cookies } => ProviderCredential::QqMusic { cookies },
         CredentialPayload::Netease { cookies } => ProviderCredential::Netease { cookies },
-        CredentialPayload::Bilibili { cookies } => ProviderCredential::Bilibili { cookies },
+        CredentialPayload::Bilibili {
+            cookies,
+            refresh_token,
+        } => ProviderCredential::Bilibili {
+            cookies,
+            refresh_token: (!refresh_token.trim().is_empty()).then_some(refresh_token),
+        },
+        CredentialPayload::Kugou { .. } => {
+            unreachable!("酷狗凭据必须先完成设备注册")
+        }
     }
 }
 
@@ -890,6 +1190,28 @@ fn playback_failure(error: PlaybackError, provider: Option<ProviderId>) -> Login
         _ => ("login_operation_failed", "登录操作失败"),
     };
     manager_failure(code, message, provider)
+}
+
+fn provider_display_name(provider: ProviderId) -> &'static str {
+    match provider {
+        ProviderId::QqMusic => "QQ音乐",
+        ProviderId::Netease => "网易云音乐",
+        ProviderId::Bilibili => "哔哩哔哩",
+        ProviderId::Kugou => "酷狗音乐",
+    }
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    duration.as_millis().try_into().unwrap_or(u64::MAX)
 }
 
 fn manager_failure(
@@ -1109,6 +1431,24 @@ mod tests {
                 .collect())
         }
 
+        fn refresh_credential(
+            &self,
+            provider: ProviderId,
+        ) -> Result<CredentialStatus, PlaybackError> {
+            Ok(CredentialStatus::empty(provider.as_str()))
+        }
+
+        fn kugou_status(&self) -> Result<miliastra_playback::KugouAccountStatus, PlaybackError> {
+            Ok(Default::default())
+        }
+
+        fn kugou_report(
+            &self,
+            _mixsongid: String,
+        ) -> Result<miliastra_playback::KugouListenReport, PlaybackError> {
+            Ok(Default::default())
+        }
+
         fn begin_login(&self, provider: ProviderId) -> Result<LoginSession, PlaybackError> {
             let mut state = self.state.lock().unwrap();
             if state.active.is_some() {
@@ -1128,8 +1468,11 @@ mod tests {
         fn complete_login(
             &self,
             session_id: Uuid,
-            _credential: ProviderCredential,
+            credential: ProviderCredential,
         ) -> Result<Box<dyn PendingLoginCompletion>, PlaybackError> {
+            if let ProviderCredential::Kugou { dfid, .. } = &credential {
+                assert_eq!(dfid, "test-dfid");
+            }
             let state = Arc::clone(&self.state);
             let changed = Arc::clone(&self.changed);
             let completion_started = Arc::clone(&self.completion_started);
@@ -1265,6 +1608,19 @@ mod tests {
         Blocking,
     }
 
+    struct FakeKugouDeviceRegistrar;
+
+    impl KugouDeviceRegistrar for FakeKugouDeviceRegistrar {
+        fn register(
+            &self,
+            _token: &str,
+            _userid: &str,
+            _cookies: &BTreeMap<String, String>,
+        ) -> Result<String, LoginHelperFailure> {
+            Ok("test-dfid".to_owned())
+        }
+    }
+
     struct FakeLauncher {
         scenarios: Mutex<VecDeque<FakeScenario>>,
     }
@@ -1320,7 +1676,13 @@ mod tests {
         name: &str,
         timeout: Duration,
     ) -> LoginHelperManager {
-        LoginHelperManager::new_with_dependencies(playback, launcher, profile_root(name), timeout)
+        LoginHelperManager::new_with_dependencies(
+            playback,
+            launcher,
+            Arc::new(FakeKugouDeviceRegistrar),
+            profile_root(name),
+            timeout,
+        )
     }
 
     fn wait_idle(manager: &LoginHelperManager) -> LoginManagerStatus {
@@ -1347,6 +1709,36 @@ mod tests {
         .unwrap()
     }
 
+    fn valid_kugou_success() -> Vec<u8> {
+        encode_message(&LoginHelperMessage::success(
+            "kugou",
+            CredentialPayload::Kugou {
+                token: "token".to_owned(),
+                userid: "123".to_owned(),
+                cookies: BTreeMap::new(),
+            },
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn kugou_helper_payload_registers_device_before_completion() {
+        let playback = FakePlayback::new();
+        let launcher = FakeLauncher::new([FakeScenario::Message(valid_kugou_success())]);
+        let manager = manager(
+            Arc::clone(&playback),
+            launcher,
+            "kugou-device",
+            Duration::from_secs(1),
+        );
+        manager.start(ProviderId::Kugou).unwrap();
+        let status = wait_idle(&manager);
+        assert!(!status.active);
+        assert!(status.last_error.is_none());
+        assert_eq!(playback.state.lock().unwrap().completed, 1);
+        manager.shutdown().unwrap();
+    }
+
     #[test]
     fn successful_helper_message_completes_the_matching_session() {
         let playback = FakePlayback::new();
@@ -1360,6 +1752,9 @@ mod tests {
         manager.start(ProviderId::QqMusic).unwrap();
         let status = wait_idle(&manager);
         assert!(!status.active);
+        assert_eq!(status.phase, LoginPhase::Idle);
+        assert!(status.started_at_ms.is_none());
+        assert!(status.deadline_at_ms.is_none());
         assert!(status.last_error.is_none());
         assert_eq!(playback.state.lock().unwrap().completed, 1);
         manager.shutdown().unwrap();
@@ -1416,9 +1811,14 @@ mod tests {
             Duration::from_secs(10),
         );
         let session = manager.start(ProviderId::QqMusic).unwrap();
+        let active = manager.status();
+        assert_eq!(active.phase, LoginPhase::WaitingForUser);
+        assert!(active.started_at_ms.is_some());
+        assert!(active.deadline_at_ms > active.started_at_ms);
         manager.cancel(session.session_id).unwrap();
         let status = manager.status();
         assert!(!status.active);
+        assert_eq!(status.phase, LoginPhase::Failed);
         assert_eq!(status.last_error.as_ref().unwrap().code, "login_cancelled");
         assert_eq!(playback.state.lock().unwrap().cancelled, 1);
         manager.shutdown().unwrap();
@@ -1458,6 +1858,7 @@ mod tests {
         started_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("credential validation started");
+        assert_eq!(manager.status().phase, LoginPhase::ValidatingCredential);
 
         let started = Instant::now();
         let status = wait_idle(&manager);

@@ -12,7 +12,7 @@ mod playback;
 
 use entertainment::EntertainmentRuntimeState as EntertainmentComponent;
 use hall::HallRuntimeState as HallComponent;
-use miliastra_playback::TrackKey;
+use miliastra_playback::{PlayableTrack, TrackKey};
 use playback::PlaybackRuntimeState as PlaybackComponent;
 
 use crate::features::administration::{
@@ -497,6 +497,15 @@ enum PlaybackRuntimeMessage {
         response: SyncSender<Result<bool, BusinessRuntimeError>>,
     },
     QueueSnapshot(SyncSender<Result<Vec<QueueItem>, BusinessRuntimeError>>),
+    PlaybackPoolAvailable(SyncSender<Result<bool, BusinessRuntimeError>>),
+    RecordPlaybackPoolTrack {
+        track: PlayableTrack,
+        response: SyncSender<Result<(), BusinessRuntimeError>>,
+    },
+    PickPlaybackPoolTrack {
+        exclude: Option<TrackKey>,
+        response: SyncSender<Result<Option<PlayableTrack>, BusinessRuntimeError>>,
+    },
     StateSnapshot(SyncSender<Result<PlaybackRuntimeState, BusinessRuntimeError>>),
     UpdatePlaybackState {
         update: PlaybackStateUpdate,
@@ -1189,6 +1198,36 @@ impl BusinessRuntimeHandle {
     pub(crate) fn playback_queue_snapshot(&self) -> Result<Vec<QueueItem>, BusinessRuntimeError> {
         self.request(|response| {
             RuntimeMessage::Playback(PlaybackRuntimeMessage::QueueSnapshot(response))
+        })
+    }
+
+    pub(crate) fn playback_pool_available(&self) -> Result<bool, BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::Playback(PlaybackRuntimeMessage::PlaybackPoolAvailable(response))
+        })
+    }
+
+    pub(crate) fn record_playback_pool_track(
+        &self,
+        track: PlayableTrack,
+    ) -> Result<(), BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::Playback(PlaybackRuntimeMessage::RecordPlaybackPoolTrack {
+                track,
+                response,
+            })
+        })
+    }
+
+    pub(crate) fn pick_playback_pool_track(
+        &self,
+        exclude: Option<&TrackKey>,
+    ) -> Result<Option<PlayableTrack>, BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::Playback(PlaybackRuntimeMessage::PickPlaybackPoolTrack {
+                exclude: exclude.cloned(),
+                response,
+            })
         })
     }
 
@@ -4338,6 +4377,7 @@ mod tests {
             playback_state,
             history,
             crate::features::playback::SongDedupConfig::default(),
+            0,
         )
     }
 

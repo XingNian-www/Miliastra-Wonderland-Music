@@ -1,5 +1,5 @@
 # 三个平台凭据的版本化存储目录
-credential_directory: data/credentials
+credential_directory: deps/data/credentials
 
 # 受控登录使用的短生命周期助手
 login_helper_executable: miliastra-login-helper.exe

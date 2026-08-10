@@ -160,10 +160,14 @@ foreach ($file in Get-ChildItem -LiteralPath $destinationDirectory -Filter "*.dl
     $packagedDlls[$file.Name.ToLowerInvariant()] = $file.FullName
 }
 
-$mainImports = Get-PeImports (Join-Path $destinationDirectory $executableFile.Name)
+# FFmpeg DLL 通过 /DELAYLOAD 延迟加载（build.rs），不在普通导入表里，
+# objdump -p 的 DLL Name 列表看不到；改为直接检查 PE 文件内是否包含 DLL 名
+# （延迟加载描述符中的名称字符串），确保主程序确实引用了这些 DLL。
+$mainBytes = [System.IO.File]::ReadAllBytes((Join-Path $destinationDirectory $executableFile.Name))
+$mainText = [System.Text.Encoding]::ASCII.GetString($mainBytes)
 foreach ($mediaName in $mediaNames) {
-    if ($mainImports -notcontains $mediaName.ToLowerInvariant()) {
-        throw "main executable does not import expected FFmpeg DLL: $mediaName"
+    if (-not $mainText.Contains($mediaName.ToLowerInvariant())) {
+        throw "main executable does not reference expected FFmpeg DLL: $mediaName"
     }
 }
 
@@ -172,6 +176,9 @@ $roots = @(
     (Join-Path $destinationDirectory $loginHelperFile.Name)
     (Join-Path $destinationDirectory $mnnFile.Name)
 )
+foreach ($mediaFile in $mediaFiles) {
+    $roots += $mediaFile.FullName
+}
 $visited = @{}
 $pending = [System.Collections.Generic.Queue[string]]::new()
 foreach ($root in $roots) {

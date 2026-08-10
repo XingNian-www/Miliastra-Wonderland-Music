@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
@@ -31,9 +32,17 @@ pub(crate) trait MusicPlayerBackend: Clone + Send + Sync + 'static {
     }
     fn pause(&self) -> Result<String>;
     fn resume(&self) -> Result<String>;
+    /// 内置引擎不实现队列导航（导航归应用层），实现侧一律拒绝；保留作防御。
+    #[allow(dead_code)]
     fn next(&self) -> Result<String>;
+    /// 内置引擎不实现队列导航（导航归应用层），实现侧一律拒绝；保留作防御。
+    #[allow(dead_code)]
     fn previous(&self) -> Result<String>;
     fn set_volume(&self, volume: &str) -> Result<String>;
+    /// 清除曲目的音频缓存（播放解码失败后自愈：下次播放重新下载）。
+    fn invalidate_audio_cache(&self, _key: &miliastra_playback::TrackKey) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub(crate) trait PlaybackStatePort: Clone + Send + Sync + 'static {
@@ -65,6 +74,19 @@ pub(crate) trait PlaybackStatePort: Clone + Send + Sync + 'static {
     ) -> Result<SessionReconciliation> {
         Ok(SessionReconciliation::Unknown)
     }
+    /// 原子确认播放成功并删除对应队列项（同一笔持久化）。
+    ///
+    /// 生产端口在同一个请求状态事务里完成「确认 + 队首出队」，消除
+    /// 「确认已持久化、出队未持久化」的崩溃窗口：窗口内进程退出时，
+    /// 重启不会把已确认消费的队首再次播放，也不会在确认失败前丢歌。
+    /// 默认实现退化为非原子确认，出队由消费流程在确认后补偿（幂等）。
+    fn confirm_playback_and_dequeue(
+        &self,
+        update: PlaybackStateUpdate,
+        _queue_item_id: Option<u64>,
+    ) -> Result<bool> {
+        self.update(update)
+    }
     /// Atomically claims a terminal outcome. Non-persistent test ports retain
     /// the old one-shot semantics; the production state store deduplicates it.
     fn claim_terminal_outcome(
@@ -94,7 +116,6 @@ pub(crate) trait PlaybackStatePort: Clone + Send + Sync + 'static {
     }
 }
 
-#[derive(Clone)]
 pub(crate) struct PlayerController<B: MusicPlayerBackend, S: PlaybackStatePort> {
     backend: B,
     playback_state: S,
@@ -103,7 +124,42 @@ pub(crate) struct PlayerController<B: MusicPlayerBackend, S: PlaybackStatePort> 
     matching: MatchConfig,
     clock: Arc<dyn Clock>,
     wall_clock: Arc<dyn WallClock>,
+    /// 上次空闲续播尝试的墙钟毫秒：播放尝试失败会回到 Idle，冷却窗口内不重复触发，避免热循环。
+    /// 用 Arc 共享：控制器副本（worker/任务各自持有）必须看到同一计时器，
+    /// 否则副本会无视冷却立即再次触发空闲续播，形成热循环。
+    last_idle_advance_at_ms: Arc<AtomicU64>,
+    /// 引擎不可重试失败首次出现的墙钟毫秒（0 = 无失败）。失败后先给 core 流重试
+    /// （第一轮缓存、第二轮清缓存直连）留窗口，持续失败超过窗口才放弃当前曲目。
+    /// 用 Arc 共享：副本各自记录起点会把同一失败当作新的首次失败，
+    /// 窗口被无限重置，导致失败曲目永不推进。
+    engine_failure_at_ms: Arc<AtomicU64>,
 }
+
+impl<B: MusicPlayerBackend, S: PlaybackStatePort> Clone for PlayerController<B, S> {
+    fn clone(&self) -> Self {
+        Self {
+            backend: self.backend.clone(),
+            playback_state: self.playback_state.clone(),
+            timing: self.timing.clone(),
+            queue: self.queue.clone(),
+            matching: self.matching.clone(),
+            clock: self.clock.clone(),
+            wall_clock: self.wall_clock.clone(),
+            // 共享计时器，而不是拷贝当前值：任一副本写入的时间戳对所有副本可见。
+            last_idle_advance_at_ms: self.last_idle_advance_at_ms.clone(),
+            engine_failure_at_ms: self.engine_failure_at_ms.clone(),
+        }
+    }
+}
+
+/// 空闲续播失败后的冷却窗口。
+const IDLE_ADVANCE_COOLDOWN_MS: u64 = 30_000;
+
+/// 引擎不可重试失败后等待 core 流重试的总窗口。
+const ENGINE_RETRY_WINDOW_MS: u64 = 8_000;
+
+/// 失败信号持续到可推进队列的最小间隔（防抖，避免瞬时失败误推进）。
+const ENGINE_RETRY_MIN_INTERVAL_MS: u64 = 1_000;
 
 #[derive(Clone)]
 pub(crate) struct PlaybackTimePorts {
@@ -165,6 +221,9 @@ pub(crate) struct PlaybackRequest {
     /// Immutable results from the request's initial provider search. A
     /// fallback selection must reuse these entries instead of searching again.
     pub(crate) candidate_snapshot: Vec<SearchCandidate>,
+    /// 队列消费来源时携带队首 queue_item_id：确认成功时与播放状态原子出队，
+    /// 崩溃后重启不会重播已确认消费的队首。手动点歌/恢复播放为 None。
+    pub(crate) queue_item_id: Option<u64>,
 }
 
 impl PlaybackRequest {
@@ -240,6 +299,8 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             matching: matching.clone(),
             clock: time.clock,
             wall_clock: time.wall_clock,
+            last_idle_advance_at_ms: Arc::new(AtomicU64::new(0)),
+            engine_failure_at_ms: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -310,26 +371,6 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         Ok(message)
     }
 
-    pub(crate) fn next_external(&self) -> Result<String> {
-        let requested_at_ms = self.wall_clock.unix_millis();
-        let result = self.backend.next();
-        self.record_control_outcome("next", requested_at_ms, result.is_ok());
-        let message = result?;
-        self.clear_external_playback_tracker()?;
-        self.mark_external_playback()?;
-        Ok(message)
-    }
-
-    pub(crate) fn previous_external(&self) -> Result<String> {
-        let requested_at_ms = self.wall_clock.unix_millis();
-        let result = self.backend.previous();
-        self.record_control_outcome("previous", requested_at_ms, result.is_ok());
-        let message = result?;
-        self.clear_external_playback_tracker()?;
-        self.mark_external_playback()?;
-        Ok(message)
-    }
-
     pub(crate) fn set_volume(&self, volume: &str) -> Result<String> {
         let requested_at_ms = self.wall_clock.unix_millis();
         let result = self.backend.set_volume(volume);
@@ -348,6 +389,8 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             .map(|_| ())
     }
 
+    /// 外部播放器时代遗留：仅测试使用，运行时无调用点；保留以便回归验证外部状态转移。
+    #[allow(dead_code)]
     pub(crate) fn mark_external_playback(&self) -> Result<()> {
         self.clear_external_playback_tracker()?;
         self.playback_state
@@ -384,6 +427,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             requester: previous.requester.clone(),
             navigation: PlaybackNavigation::Previous,
             candidate_snapshot: Vec::new(),
+            queue_item_id: None,
         }))
     }
 
@@ -417,6 +461,10 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
 
     fn begin_playback_attempt(&self, request: &PlaybackRequest) -> Result<PlaybackAttempt> {
         self.clear_external_playback_tracker()?;
+        // 新播放周期开始：重置失败重试窗口时间戳。上一首歌的失败残留若不清除，
+        // 会在本次起播（解析/起播可能耗时数秒，引擎状态仍是旧失败）期间被误判为已超窗，
+        // 导致当前请求被清掉并推进队列（连跳）。
+        self.engine_failure_at_ms.store(0, Ordering::Relaxed);
         let previous_playback = self.playback_snapshot()?;
         let started_at_ms = self.wall_clock.unix_millis();
         self.playback_state.update(PlaybackStateUpdate::Starting {
@@ -431,6 +479,8 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
                 requester: request.requester.clone(),
                 started_at_ms,
                 guard_started_at: Some(self.clock.now()),
+                expected_session_id: String::new(),
+                expected_generation: 0,
             },
             navigation: request.navigation,
         })?;
@@ -450,7 +500,11 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             .and_then(|track| self.backend.play(track));
         self.record_attempt_outcome(request, attempt.started_at_ms, result.is_ok());
         if let Err(error) = result {
-            let _ = self.restore_failed_attempt(&attempt, "dispatch_failed");
+            if let Err(restore_error) = self.restore_failed_attempt(&attempt, "dispatch_failed") {
+                log::error!(
+                    "播放失败且状态恢复也失败: play_error={error:#} restore_error={restore_error:#}"
+                );
+            }
             return Err(error);
         }
         Ok(attempt)
@@ -516,6 +570,11 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         context: QueueAdvanceContext,
     ) -> Result<QueueAdvanceDecision> {
         let status = snapshot_status;
+        // 失败信号消失（重试成功或干净结束）时重置重试窗口计时，避免残留时间戳
+        // 导致下一首歌的首次失败被误判为已超窗。
+        if status.failure_code.is_empty() {
+            self.engine_failure_at_ms.store(0, Ordering::Relaxed);
+        }
         let external_playback_protected = self.observe_external_playback(&status)?.unwrap_or(false);
         let runtime_snapshot = self.playback_state.snapshot()?;
         let session_reconciliation = self.reconcile_player_session(&runtime_snapshot, &status)?;
@@ -524,7 +583,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         }
 
         if session_reconciliation == SessionReconciliation::Restarted {
-            return self.recover_after_runtime_restart(&runtime_snapshot, &status);
+            return self.recover_after_runtime_restart(&runtime_snapshot, &status, &context);
         }
         if session_reconciliation == SessionReconciliation::Replaced {
             log::warn!(
@@ -543,6 +602,33 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         // 起播换歌时可能短暂保留上一首身份，因此不能据此中断当前请求或推进队列。
         // 当前请求只由传输状态、绑定会话的自然结束和明确失败信号驱动。
 
+        // 播放器防闲置：引擎空闲（无点播请求、无外部播放、无失败信号、无用户暂停）
+        // 且队列或播放池有内容时自动续播（覆盖启动后、自然结束兜底、异常恢复）。
+        // 播放尝试失败会回到 Idle，按冷却窗口退避，避免连续失败时热循环。
+        if runtime_snapshot.state == ConfirmedPlaybackState::Idle
+            && runtime_snapshot.active_request.is_none()
+            && runtime_snapshot.pause_reason == PauseReason::None
+            && matches!(status.status.as_str(), "stopped" | "stoped")
+            && status.failure_code.is_empty()
+            && !context.command_executing
+            && !context.has_pending_playback_task
+            && (!context.queue_empty || self.playback_state.playback_pool_available()?)
+        {
+            let now_ms = self.wall_clock.unix_millis();
+            if now_ms.saturating_sub(self.last_idle_advance_at_ms.load(Ordering::Relaxed))
+                < IDLE_ADVANCE_COOLDOWN_MS
+            {
+                log::debug!("空闲续播冷却中，暂不触发");
+                return Ok(QueueAdvanceDecision::None);
+            }
+            self.last_idle_advance_at_ms
+                .store(now_ms, Ordering::Relaxed);
+            log::info!("队列推进决策: advance reason=idle_keep_alive");
+            return Ok(QueueAdvanceDecision::AdvanceQueue {
+                reason: "空闲续播"
+            });
+        }
+
         if !external_playback_protected
             && runtime_snapshot.state == ConfirmedPlaybackState::ExternalPlayback
             && runtime_snapshot.active_request.is_none()
@@ -557,20 +643,101 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         }
 
         // 引擎报告播放失败（解码失败/流被拒等），播放已终止。
-        // 可重试失败保留队首等待用户处理；不可重试失败丢弃当前请求继续下一首。
         // 失败观测放在点歌保护之前：失败是明确终止信号，不应被起步保护忽略。
         if !status.failure_code.is_empty() && runtime_snapshot.active_request.is_some() {
-            log::error!(
-                "引擎播放失败: code={} message={}",
-                status.failure_code,
-                status.failure_message
-            );
+            // 用户暂停中：保留暂停状态，失败不推进队列，避免静默解除暂停并自动播放下一首。
+            // （暂停命令发出后引擎流可能仍在缓冲，源站断流时会产生失败信号。）
+            if self.playback_state.snapshot()?.pause_reason == PauseReason::User {
+                log::debug!(
+                    "用户暂停中，播放失败保留暂停状态: code={} message={}",
+                    status.failure_code,
+                    status.failure_message
+                );
+                return Ok(QueueAdvanceDecision::None);
+            }
+            // 只处理归属当前播放会话的失败：advance 后引擎状态更新有延迟，旧会话的失败
+            // 残留（session/generation 不匹配）不得触发推进，否则会连跳下一首。
+            // 未确认的请求（expected 为空）不阻断，交给重试窗口兜底。
+            let belongs_to_active =
+                runtime_snapshot
+                    .active_request
+                    .as_ref()
+                    .is_none_or(|request| {
+                        request.expected_session_id.is_empty()
+                            || (request.expected_session_id == status.session_id.trim()
+                                && request.expected_generation == status.generation)
+                    });
+            if !belongs_to_active {
+                log::debug!(
+                    "忽略非当前会话的失败残留: code={} session={} generation={}",
+                    status.failure_code,
+                    status.session_id,
+                    status.generation
+                );
+                return Ok(QueueAdvanceDecision::None);
+            }
             if status.failure_retryable {
+                log::error!(
+                    "引擎播放失败: code={} message={}",
+                    status.failure_code,
+                    status.failure_message
+                );
                 log::warn!(
                     "失败可重试，保留队首等待重新播放: uri={}",
                     status.current_uri
                 );
                 return Ok(QueueAdvanceDecision::None);
+            }
+            // 不可重试失败：core 层仍会流重试（第一轮缓存、第二轮清缓存直连），
+            // 这里给重试留窗口，持续失败超过窗口才清除缓存并推进队列。
+            let now_ms = self.wall_clock.unix_millis();
+            let first_seen = self.engine_failure_at_ms.load(Ordering::Relaxed);
+            if first_seen == 0 {
+                self.engine_failure_at_ms.store(now_ms, Ordering::Relaxed);
+                log::error!(
+                    "引擎播放失败: code={} message={}，等待流重试(窗口{}ms)",
+                    status.failure_code,
+                    status.failure_message,
+                    ENGINE_RETRY_WINDOW_MS
+                );
+                return Ok(QueueAdvanceDecision::None);
+            }
+            let elapsed = now_ms.saturating_sub(first_seen);
+            if elapsed < ENGINE_RETRY_MIN_INTERVAL_MS {
+                log::debug!(
+                    "引擎播放失败持续，最小间隔内暂不决策: code={} message={}",
+                    status.failure_code,
+                    status.failure_message
+                );
+                return Ok(QueueAdvanceDecision::None);
+            }
+            if elapsed < ENGINE_RETRY_WINDOW_MS {
+                log::debug!(
+                    "引擎播放失败持续，等待流重试(剩余{}ms): code={} message={}",
+                    ENGINE_RETRY_WINDOW_MS - elapsed,
+                    status.failure_code,
+                    status.failure_message
+                );
+                return Ok(QueueAdvanceDecision::None);
+            }
+            log::warn!(
+                "流重试窗口超时，放弃当前曲目: code={} message={}",
+                status.failure_code,
+                status.failure_message
+            );
+            self.engine_failure_at_ms.store(0, Ordering::Relaxed);
+            // 自动推进前保留上一曲历史，与手动点歌路径一致（@上一曲可用）。
+            self.playback_state
+                .update(PlaybackStateUpdate::RememberCurrentPlayback)?;
+            // 清除曲目音频缓存，下次播放重新下载自愈。
+            if let Some(key) = runtime_snapshot
+                .active_request
+                .as_ref()
+                .and_then(|request| request.track.as_ref())
+                .map(|track| track.track_ref.key.clone())
+                && let Err(error) = self.backend.invalidate_audio_cache(&key)
+            {
+                log::warn!("清除曲目音频缓存失败: {error:#}");
             }
             self.clear_active_request()?;
             let _ = self.playback_state.reconcile_player_session(None)?;
@@ -611,6 +778,9 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
                 log::debug!("已处理过同一 播放运行时自然结束，忽略重复观测");
                 return Ok(QueueAdvanceDecision::None);
             }
+            // 自然结束清空前保留上一曲历史，与手动点歌路径一致（@上一曲可用）。
+            self.playback_state
+                .update(PlaybackStateUpdate::RememberCurrentPlayback)?;
             self.clear_active_request()?;
             let _ = self.playback_state.reconcile_player_session(None)?;
             // 自然结束已清空 active_request：队列有歌直接推进；队列空时
@@ -676,7 +846,15 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         &self,
         runtime: &PlaybackRuntimeState,
         status: &PlayerStatus,
+        context: &QueueAdvanceContext,
     ) -> Result<QueueAdvanceDecision> {
+        // 正式播放任务或用户命令执行中不触发恢复：monitor 若此时 play 会与
+        // 播放任务并发起播，新会话互相覆盖。恢复由播放任务完成后的下一次
+        // 决策接管（其 context 中这两个标志已复位）。
+        if context.command_executing || context.has_pending_playback_task {
+            log::debug!("播放运行时已重启，但播放任务仍在执行，跳过恢复");
+            return Ok(QueueAdvanceDecision::None);
+        }
         let Some(active) = runtime.active_request.as_ref() else {
             return Ok(QueueAdvanceDecision::None);
         };
@@ -802,6 +980,18 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         {
             return Err(anyhow!("播放器观测曲目与请求不一致，不能确认播放成功"));
         }
+        // 沿用 Starting 阶段的发起时刻，而不是确认时刻：起播（解析/流请求）可能耗时数秒，
+        // 若改写为确认时刻，active_request_identity（TrackKey + started_at_ms）会变化，
+        // 持久层据此判定请求身份变更而清空 session binding，导致已绑定的引擎会话被无谓作废、
+        // 需要重新绑定（期间可能被误判为会话重启/替换）。无 Starting 上下文（如直接确认）
+        // 时退回当前墙钟，保持原有行为。
+        let started_at_ms = self
+            .playback_state
+            .snapshot()?
+            .active_request
+            .as_ref()
+            .map(|request| request.started_at_ms)
+            .unwrap_or_else(|| self.wall_clock.unix_millis());
         let active_request = ActivePlaybackRequest {
             keyword: request.keyword.clone(),
             source: request.source.clone(),
@@ -811,13 +1001,18 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             title: status.name.trim().to_string(),
             artist: status.singer.trim().to_string(),
             requester: request.requester.clone(),
-            started_at_ms: self.wall_clock.unix_millis(),
+            started_at_ms,
             guard_started_at: Some(self.clock.now()),
+            expected_session_id: status.session_id.trim().to_string(),
+            expected_generation: status.generation,
         };
-        self.playback_state.update(PlaybackStateUpdate::Confirmed {
-            request: active_request,
-            navigation: request.navigation,
-        })?;
+        self.playback_state.confirm_playback_and_dequeue(
+            PlaybackStateUpdate::Confirmed {
+                request: active_request,
+                navigation: request.navigation,
+            },
+            request.queue_item_id,
+        )?;
         self.record_song_dedup_playback(request, status)?;
         self.playback_state
             .record_playback_pool_track(confirmed_track.clone())?;
@@ -1021,6 +1216,8 @@ fn playback_request_from_active(active_request: &ActivePlaybackRequest) -> Playb
         requester: active_request.requester.clone(),
         navigation: PlaybackNavigation::Normal,
         candidate_snapshot: Vec::new(),
+        // 恢复播放不消费队列：不得携带队列项，避免恢复时误出队。
+        queue_item_id: None,
     }
 }
 
@@ -1128,7 +1325,7 @@ mod tests {
     use miliastra_kernel::clock::{Clock, ManualClock, SystemClock, WallClock};
     use std::collections::{HashSet, VecDeque};
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1146,6 +1343,8 @@ mod tests {
         song_dedup: SongDedupConfig,
         pool: Arc<Mutex<Vec<PlayableTrack>>>,
         pool_available: bool,
+        /// 原子确认端口收到的 queue_item_id（None 表示手动点歌/恢复播放）。
+        confirm_dequeues: Arc<Mutex<Vec<Option<u64>>>>,
     }
 
     impl PlaybackStatePort for TestPlaybackState {
@@ -1164,6 +1363,15 @@ mod tests {
                 .lock()
                 .unwrap()
                 .is_limited(&self.song_dedup, &candidate))
+        }
+
+        fn confirm_playback_and_dequeue(
+            &self,
+            update: PlaybackStateUpdate,
+            queue_item_id: Option<u64>,
+        ) -> Result<bool> {
+            self.confirm_dequeues.lock().unwrap().push(queue_item_id);
+            self.update(update)
         }
 
         fn record_song_dedup(&self, candidate: SongDedupCandidate) -> Result<()> {
@@ -1294,6 +1502,7 @@ mod tests {
         statuses: Arc<Mutex<VecDeque<PlayerStatus>>>,
         paused: Arc<Mutex<u32>>,
         resumed: Arc<Mutex<u32>>,
+        play_calls: Arc<AtomicU32>,
         play_error: bool,
         pause_error: bool,
     }
@@ -1304,6 +1513,7 @@ mod tests {
                 statuses: Arc::new(Mutex::new(statuses.into())),
                 paused: Arc::new(Mutex::new(0)),
                 resumed: Arc::new(Mutex::new(0)),
+                play_calls: Arc::new(AtomicU32::new(0)),
                 play_error: false,
                 pause_error: false,
             }
@@ -1331,6 +1541,7 @@ mod tests {
         }
 
         fn play(&self, _track: &PlayableTrack) -> Result<String> {
+            self.play_calls.fetch_add(1, Ordering::Relaxed);
             if self.play_error {
                 return Err(anyhow!("play failed"));
             }
@@ -1450,6 +1661,7 @@ mod tests {
                 song_dedup,
                 pool: Arc::new(Mutex::new(pool)),
                 pool_available,
+                confirm_dequeues: Arc::new(Mutex::new(Vec::new())),
             },
             &test_timing(),
             &QueueConfig {
@@ -1487,6 +1699,7 @@ mod tests {
             requester: String::new(),
             navigation: PlaybackNavigation::Normal,
             candidate_snapshot: Vec::new(),
+            queue_item_id: None,
         }
     }
 
@@ -1522,6 +1735,38 @@ mod tests {
         assert_eq!(status.volume, 70);
         assert!(message.contains("音量70"), "message: {message}");
         assert!(!message.contains("音量0"), "message: {message}");
+    }
+
+    #[test]
+    fn confirmation_forwards_queue_item_id_to_the_atomic_dequeue_port() {
+        let backend = FakeBackend::new(vec![
+            status("目标", "miliastra://track/qqmusic/1", 1.0, 180.0),
+            status("目标", "miliastra://track/qqmusic/1", 2.0, 180.0),
+        ]);
+        let controller = controller(backend);
+        // 队列消费来源：确认时必须携带队首 queue_item_id，供原子出队。
+        let mut queued = playback_request("目标 - 歌手", "miliastra://track/qqmusic/1");
+        queued.queue_item_id = Some(42);
+        let mut attempt = controller.play_request(&queued).unwrap();
+        controller
+            .verify_playback_started(&queued, &mut attempt)
+            .unwrap();
+        assert_eq!(
+            *controller.playback_state.confirm_dequeues.lock().unwrap(),
+            [Some(42)]
+        );
+
+        // 恢复播放/手动点歌：不携带队列项，确认时不触发任何出队。
+        let mut restored = playback_request("目标 - 歌手", "miliastra://track/qqmusic/1");
+        restored.queue_item_id = None;
+        let mut attempt = controller.play_request(&restored).unwrap();
+        controller
+            .verify_playback_started(&restored, &mut attempt)
+            .unwrap();
+        assert_eq!(
+            *controller.playback_state.confirm_dequeues.lock().unwrap(),
+            [Some(42), None]
+        );
     }
 
     #[test]
@@ -1638,6 +1883,57 @@ mod tests {
         assert_eq!(snapshot.state, "requested_song_playing");
         assert_eq!(snapshot.current_uri, request.uri());
         assert_eq!(snapshot.active_uri, request.uri());
+    }
+
+    #[test]
+    fn confirmed_playback_keeps_the_starting_started_at_ms() {
+        let clock = Arc::new(ManualClock::with_unix_seconds(Instant::now(), 10));
+        let controller =
+            controller_with_time(FakeBackend::new(Vec::new()), clock.clone(), clock.clone());
+        let request = request();
+        let mut attempt = controller.play_request(&request).unwrap();
+
+        // Starting 阶段记录发起时刻（unix_millis = 10 * 1000）。
+        let starting = controller
+            .playback_state
+            .snapshot()
+            .unwrap()
+            .active_request
+            .expect("Starting 状态应有 active_request");
+        assert_eq!(starting.started_at_ms, 10_000);
+
+        // 起播到确认之间墙钟前进（流解析/起播可能耗时数秒）：确认不得改写发起时刻。
+        clock.advance(Duration::from_secs(5)).unwrap();
+        controller
+            .verify_playback_started(&request, &mut attempt)
+            .unwrap();
+
+        let confirmed = controller
+            .playback_state
+            .snapshot()
+            .unwrap()
+            .active_request
+            .expect("确认后应有 active_request");
+        // 沿用 Starting 的发起时刻，保证 active_request_identity（TrackKey + started_at_ms）
+        // 在 Starting -> Confirmed 间不变，避免持久层误判请求身份变更而清空 session binding。
+        assert_eq!(confirmed.started_at_ms, starting.started_at_ms);
+        assert_eq!(
+            (
+                confirmed
+                    .track
+                    .as_ref()
+                    .map(|track| track.track_ref.key.clone()),
+                confirmed.started_at_ms,
+            ),
+            (
+                starting
+                    .track
+                    .as_ref()
+                    .map(|track| track.track_ref.key.clone()),
+                starting.started_at_ms,
+            )
+        );
+        assert_eq!(controller.snapshot().state, "requested_song_playing");
     }
 
     #[test]
@@ -1848,7 +2144,12 @@ mod tests {
             failure_retryable: false,
             ..PlayerStatus::default()
         };
-        let controller = controller(FakeBackend::new(Vec::new()));
+        let manual_clock = Arc::new(ManualClock::with_unix_seconds(Instant::now(), 10));
+        let controller = controller_with_time(
+            FakeBackend::new(Vec::new()),
+            manual_clock.clone(),
+            manual_clock.clone(),
+        );
         controller
             .confirm_playback_success(&request, &status("目标", &request.uri(), 1.0, 180.0))
             .unwrap();
@@ -1858,7 +2159,26 @@ mod tests {
             command_executing: false,
         };
 
-        // 不可重试的播放中失败：丢弃当前请求并推进到队列下一首。
+        // 不可重试的播放中失败：先给 core 流重试留窗口，首 tick 只记录不推进。
+        assert_eq!(
+            controller
+                .maybe_advance_queue(failure.clone(), context.clone())
+                .unwrap(),
+            QueueAdvanceDecision::None
+        );
+        assert_eq!(controller.snapshot().active_uri, request.uri());
+
+        // 窗口内仍失败：继续等待。
+        manual_clock.advance(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            controller
+                .maybe_advance_queue(failure.clone(), context.clone())
+                .unwrap(),
+            QueueAdvanceDecision::None
+        );
+
+        // 超过窗口仍失败：丢弃当前请求并推进到队列下一首。
+        manual_clock.advance(Duration::from_secs(5)).unwrap();
         assert_eq!(
             controller.maybe_advance_queue(failure, context).unwrap(),
             QueueAdvanceDecision::AdvanceQueue {
@@ -1867,6 +2187,189 @@ mod tests {
         );
         let snapshot = controller.snapshot();
         assert!(snapshot.active_uri.is_empty());
+    }
+
+    #[test]
+    fn engine_failure_recovery_resets_retry_window() {
+        let request = request();
+        let failure = PlayerStatus {
+            status: "stopped".to_string(),
+            current_track: request.track.clone(),
+            current_uri: request.uri(),
+            runtime_identity: "runtime-a".to_string(),
+            session_id: "session-a".to_string(),
+            generation: 41,
+            end_behavior: "notify_controller".to_string(),
+            last_end_cause: "decode_failure".to_string(),
+            failure_code: "decode_failure".to_string(),
+            failure_message: "音源解码失败".to_string(),
+            failure_retryable: false,
+            ..PlayerStatus::default()
+        };
+        let manual_clock = Arc::new(ManualClock::with_unix_seconds(Instant::now(), 10));
+        let controller = controller_with_time(
+            FakeBackend::new(Vec::new()),
+            manual_clock.clone(),
+            manual_clock.clone(),
+        );
+        controller
+            .confirm_playback_success(&request, &status("目标", &request.uri(), 1.0, 180.0))
+            .unwrap();
+        let context = QueueAdvanceContext {
+            queue_empty: false,
+            has_pending_playback_task: false,
+            command_executing: false,
+        };
+
+        // 首次失败：记录窗口起点。
+        assert_eq!(
+            controller
+                .maybe_advance_queue(failure.clone(), context.clone())
+                .unwrap(),
+            QueueAdvanceDecision::None
+        );
+        manual_clock.advance(Duration::from_secs(3)).unwrap();
+
+        // 流重试成功：失败信号消失，窗口重置。
+        let recovered = status("目标", &request.uri(), 30.0, 180.0);
+        assert_eq!(
+            controller
+                .maybe_advance_queue(recovered, context.clone())
+                .unwrap(),
+            QueueAdvanceDecision::None
+        );
+
+        // 同一首歌再次失败：重新开始完整的重试窗口，而不是按旧时间戳立即推进。
+        manual_clock.advance(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            controller
+                .maybe_advance_queue(failure.clone(), context.clone())
+                .unwrap(),
+            QueueAdvanceDecision::None
+        );
+        manual_clock.advance(Duration::from_secs(9)).unwrap();
+        assert_eq!(
+            controller.maybe_advance_queue(failure, context).unwrap(),
+            QueueAdvanceDecision::AdvanceQueue {
+                reason: "播放失败"
+            }
+        );
+    }
+
+    #[test]
+    fn engine_failure_window_is_shared_across_clones() {
+        let request = request();
+        let failure = PlayerStatus {
+            status: "stopped".to_string(),
+            current_track: request.track.clone(),
+            current_uri: request.uri(),
+            runtime_identity: "runtime-a".to_string(),
+            session_id: "session-a".to_string(),
+            generation: 41,
+            end_behavior: "notify_controller".to_string(),
+            last_end_cause: "decode_failure".to_string(),
+            failure_code: "decode_failure".to_string(),
+            failure_message: "音源解码失败".to_string(),
+            failure_retryable: false,
+            ..PlayerStatus::default()
+        };
+        let manual_clock = Arc::new(ManualClock::with_unix_seconds(Instant::now(), 10));
+        let controller = controller_with_time(
+            FakeBackend::new(Vec::new()),
+            manual_clock.clone(),
+            manual_clock.clone(),
+        );
+        controller
+            .confirm_playback_success(&request, &status("目标", &request.uri(), 1.0, 180.0))
+            .unwrap();
+        // 副本 B 与副本 A 共享同一失败窗口计时器（worker/任务各持一份副本）。
+        let clone = controller.clone();
+        let context = QueueAdvanceContext {
+            queue_empty: false,
+            has_pending_playback_task: false,
+            command_executing: false,
+        };
+
+        // 副本 A 首次观察失败：记录窗口起点。
+        assert_eq!(
+            controller
+                .maybe_advance_queue(failure.clone(), context.clone())
+                .unwrap(),
+            QueueAdvanceDecision::None
+        );
+        // 窗口内副本 B 观察同一失败：共享起点，仍在等待流重试。
+        manual_clock.advance(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            clone
+                .maybe_advance_queue(failure.clone(), context.clone())
+                .unwrap(),
+            QueueAdvanceDecision::None
+        );
+        // 超过窗口后副本 B 观察：若计时器未共享，副本 B 会把同一失败当作新的首次失败
+        // 重新开始窗口并返回 None，失败曲目将永不推进。
+        manual_clock.advance(Duration::from_secs(4)).unwrap();
+        assert_eq!(
+            clone.maybe_advance_queue(failure, context).unwrap(),
+            QueueAdvanceDecision::AdvanceQueue {
+                reason: "播放失败"
+            }
+        );
+        assert!(clone.snapshot().active_uri.is_empty());
+    }
+
+    #[test]
+    fn stale_failure_from_previous_session_does_not_advance() {
+        let request = request();
+        // 确认播放时绑定当前会话（session-a / generation 41）。
+        let mut confirmed = status("目标", &request.uri(), 1.0, 180.0);
+        confirmed.session_id = "session-a".to_string();
+        confirmed.generation = 41;
+        let manual_clock = Arc::new(ManualClock::with_unix_seconds(Instant::now(), 10));
+        let controller = controller_with_time(
+            FakeBackend::new(Vec::new()),
+            manual_clock.clone(),
+            manual_clock.clone(),
+        );
+        controller
+            .confirm_playback_success(&request, &confirmed)
+            .unwrap();
+        let context = QueueAdvanceContext {
+            queue_empty: false,
+            has_pending_playback_task: false,
+            command_executing: false,
+        };
+
+        // 推进队列后引擎状态更新有延迟：旧会话（session-b）的失败残留不得触发推进。
+        let stale_failure = PlayerStatus {
+            status: "stopped".to_string(),
+            current_track: request.track.clone(),
+            current_uri: request.uri(),
+            runtime_identity: "runtime-a".to_string(),
+            session_id: "session-b".to_string(),
+            generation: 42,
+            end_behavior: "notify_controller".to_string(),
+            last_end_cause: "decode_failure".to_string(),
+            failure_code: "decode_failure".to_string(),
+            failure_message: "上一首的失败残留".to_string(),
+            failure_retryable: false,
+            ..PlayerStatus::default()
+        };
+        manual_clock.advance(Duration::from_secs(9)).unwrap();
+        assert_eq!(
+            controller
+                .maybe_advance_queue(stale_failure.clone(), context.clone())
+                .unwrap(),
+            QueueAdvanceDecision::None
+        );
+        // 残留状态不记录重试窗口起点：再多 tick 也不会推进。
+        manual_clock.advance(Duration::from_secs(9)).unwrap();
+        assert_eq!(
+            controller
+                .maybe_advance_queue(stale_failure, context)
+                .unwrap(),
+            QueueAdvanceDecision::None
+        );
+        assert_eq!(controller.snapshot().active_uri, request.uri());
     }
 
     #[test]
@@ -1885,7 +2388,12 @@ mod tests {
             failure_retryable: false,
             ..PlayerStatus::default()
         };
-        let controller = controller(FakeBackend::new(Vec::new()));
+        let manual_clock = Arc::new(ManualClock::with_unix_seconds(Instant::now(), 10));
+        let controller = controller_with_time(
+            FakeBackend::new(Vec::new()),
+            manual_clock.clone(),
+            manual_clock.clone(),
+        );
         controller
             .confirm_playback_success(&request, &status("目标", &request.uri(), 1.0, 180.0))
             .unwrap();
@@ -1895,7 +2403,15 @@ mod tests {
             command_executing: false,
         };
 
-        // 队列空且无播放池：清空请求但不推进，与自然结束行为一致。
+        // 首次失败：记录窗口起点，等待流重试。
+        assert_eq!(
+            controller
+                .maybe_advance_queue(failure.clone(), context.clone())
+                .unwrap(),
+            QueueAdvanceDecision::None
+        );
+        // 队列空且无播放池：窗口超时后清空请求但不推进，与自然结束行为一致。
+        manual_clock.advance(Duration::from_secs(9)).unwrap();
         assert_eq!(
             controller.maybe_advance_queue(failure, context).unwrap(),
             QueueAdvanceDecision::PlaybackStateChanged
@@ -2019,7 +2535,8 @@ mod tests {
             duration: 180.0,
             ..PlayerStatus::default()
         };
-        let controller = controller(FakeBackend::new(vec![recovered.clone(), recovered]));
+        let backend = FakeBackend::new(vec![recovered.clone(), recovered]);
+        let controller = controller(backend.clone());
         controller
             .confirm_playback_success(&request, &status("目标", &request.uri(), 1.0, 180.0))
             .unwrap();
@@ -2041,6 +2558,103 @@ mod tests {
             QueueAdvanceDecision::PlaybackStateChanged
         );
         assert_eq!(controller.snapshot().state, "requested_song_playing");
+        assert_eq!(controller.snapshot().active_uri, request.uri());
+        // 无并发任务时恢复确实发起 play（与抑制测试形成对照）。
+        assert_eq!(backend.play_calls.load(Ordering::Relaxed), 1);
+    }
+
+    /// 构造「运行时已重启、可恢复」的固定场景：确认播放并绑定旧运行时，
+    /// 随后观察新 runtime identity 的空闲状态，返回触发恢复所需的 status。
+    /// 各抑制测试复用同一场景，只改变 QueueAdvanceContext。
+    fn restarted_recovery_scenario(
+        controller: &PlayerController<FakeBackend, TestPlaybackState>,
+        request: &PlaybackRequest,
+    ) -> PlayerStatus {
+        let old_runtime = PlayerStatus {
+            status: "playing".to_string(),
+            current_track: request.track.clone(),
+            current_uri: request.uri(),
+            runtime_identity: "runtime-old".to_string(),
+            session_id: "session-old".to_string(),
+            generation: 7,
+            end_behavior: "notify_controller".to_string(),
+            ..PlayerStatus::default()
+        };
+        // 先观察旧运行时建立绑定，再观察新 identity：reconcile 判为 Restarted。
+        assert_eq!(
+            controller
+                .maybe_advance_queue(
+                    old_runtime,
+                    QueueAdvanceContext {
+                        queue_empty: true,
+                        has_pending_playback_task: false,
+                        command_executing: false,
+                    },
+                )
+                .unwrap(),
+            QueueAdvanceDecision::None
+        );
+        PlayerStatus {
+            status: "stopped".to_string(),
+            runtime_identity: "runtime-new".to_string(),
+            generation: 0,
+            ..PlayerStatus::default()
+        }
+    }
+
+    #[test]
+    fn restarted_recovery_is_suppressed_while_command_is_executing() {
+        let request = request();
+        let backend = FakeBackend::new(Vec::new());
+        let controller = controller(backend.clone());
+        controller
+            .confirm_playback_success(&request, &status("目标", &request.uri(), 1.0, 180.0))
+            .unwrap();
+        let restarted = restarted_recovery_scenario(&controller, &request);
+
+        // 用户命令执行中：monitor 不得并发 play 恢复，等命令完成后由下一次决策接管。
+        assert_eq!(
+            controller
+                .maybe_advance_queue(
+                    restarted,
+                    QueueAdvanceContext {
+                        queue_empty: true,
+                        has_pending_playback_task: false,
+                        command_executing: true,
+                    },
+                )
+                .unwrap(),
+            QueueAdvanceDecision::None
+        );
+        assert_eq!(backend.play_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn restarted_recovery_is_suppressed_while_playback_task_is_pending() {
+        let request = request();
+        let backend = FakeBackend::new(Vec::new());
+        let controller = controller(backend.clone());
+        controller
+            .confirm_playback_success(&request, &status("目标", &request.uri(), 1.0, 180.0))
+            .unwrap();
+        let restarted = restarted_recovery_scenario(&controller, &request);
+
+        // 正式播放任务未完成：monitor 不得并发 play 恢复，避免两个任务同时起播。
+        assert_eq!(
+            controller
+                .maybe_advance_queue(
+                    restarted,
+                    QueueAdvanceContext {
+                        queue_empty: true,
+                        has_pending_playback_task: true,
+                        command_executing: false,
+                    },
+                )
+                .unwrap(),
+            QueueAdvanceDecision::None
+        );
+        assert_eq!(backend.play_calls.load(Ordering::Relaxed), 0);
+        // 恢复请求未被消费：active_request 保留，任务完成后的下一次决策仍可恢复。
         assert_eq!(controller.snapshot().active_uri, request.uri());
     }
 
@@ -2086,6 +2700,175 @@ mod tests {
                 },
                 QueueAdvanceContext {
                     queue_empty: false,
+                    has_pending_playback_task: false,
+                    command_executing: false,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(decision, QueueAdvanceDecision::None);
+    }
+
+    #[test]
+    fn idle_stopped_status_with_pool_advances_once_per_cooldown() {
+        // 非零墙钟基准：冷却判断用 unix 毫秒，初始 0 会误判为冷却中。
+        let clock = Arc::new(ManualClock::with_unix_seconds(
+            Instant::now(),
+            1_700_000_000,
+        ));
+        let controller =
+            controller_with_pool(FakeBackend::new(vec![]), clock.clone(), clock.clone(), true);
+        let context = QueueAdvanceContext {
+            queue_empty: true,
+            has_pending_playback_task: false,
+            command_executing: false,
+        };
+
+        // 启动后引擎空闲 + 播放池有歌：触发空闲续播。
+        assert_eq!(
+            controller
+                .maybe_advance_queue(stopped_status(), context.clone())
+                .unwrap(),
+            QueueAdvanceDecision::AdvanceQueue {
+                reason: "空闲续播"
+            }
+        );
+        // 冷却窗口内不重复触发（播放失败回到 Idle 时防热循环）。
+        assert_eq!(
+            controller
+                .maybe_advance_queue(stopped_status(), context.clone())
+                .unwrap(),
+            QueueAdvanceDecision::None
+        );
+        // 冷却过后允许重试。
+        clock
+            .advance(Duration::from_millis(IDLE_ADVANCE_COOLDOWN_MS + 1))
+            .unwrap();
+        assert_eq!(
+            controller
+                .maybe_advance_queue(stopped_status(), context.clone())
+                .unwrap(),
+            QueueAdvanceDecision::AdvanceQueue {
+                reason: "空闲续播"
+            }
+        );
+    }
+
+    #[test]
+    fn idle_advance_cooldown_is_shared_across_clones() {
+        // 非零墙钟基准：冷却判断用 unix 毫秒，初始 0 会误判为冷却中。
+        let clock = Arc::new(ManualClock::with_unix_seconds(
+            Instant::now(),
+            1_700_000_000,
+        ));
+        let controller =
+            controller_with_pool(FakeBackend::new(vec![]), clock.clone(), clock.clone(), true);
+        // 副本 B 与副本 A 共享同一冷却计时器。
+        let clone = controller.clone();
+        let context = QueueAdvanceContext {
+            queue_empty: true,
+            has_pending_playback_task: false,
+            command_executing: false,
+        };
+
+        // 副本 A 触发空闲续播并记录冷却时间戳。
+        assert_eq!(
+            controller
+                .maybe_advance_queue(stopped_status(), context.clone())
+                .unwrap(),
+            QueueAdvanceDecision::AdvanceQueue {
+                reason: "空闲续播"
+            }
+        );
+        // 副本 B 立即观察同一空闲状态：冷却共享，不得无视冷却再次触发（否则播放失败回到
+        // Idle 时各副本轮流触发，形成热循环）。
+        assert_eq!(
+            clone
+                .maybe_advance_queue(stopped_status(), context.clone())
+                .unwrap(),
+            QueueAdvanceDecision::None
+        );
+        // 冷却过后副本 B 允许再次触发。
+        clock
+            .advance(Duration::from_millis(IDLE_ADVANCE_COOLDOWN_MS + 1))
+            .unwrap();
+        assert_eq!(
+            clone
+                .maybe_advance_queue(stopped_status(), context)
+                .unwrap(),
+            QueueAdvanceDecision::AdvanceQueue {
+                reason: "空闲续播"
+            }
+        );
+    }
+
+    #[test]
+    fn idle_stopped_status_advances_with_queue_items_even_without_pool() {
+        let controller = controller(FakeBackend::new(vec![]));
+        let decision = controller
+            .maybe_advance_queue(
+                stopped_status(),
+                QueueAdvanceContext {
+                    queue_empty: false,
+                    has_pending_playback_task: false,
+                    command_executing: false,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            decision,
+            QueueAdvanceDecision::AdvanceQueue {
+                reason: "空闲续播"
+            }
+        );
+    }
+
+    #[test]
+    fn idle_stopped_status_does_not_advance_when_user_paused_or_engine_failed() {
+        let paused_controller = controller(FakeBackend::new(vec![]));
+        let mut paused = paused_controller.playback_state.snapshot().unwrap();
+        paused.pause_reason = PauseReason::User;
+        paused_controller
+            .playback_state
+            .update(PlaybackStateUpdate::Restore(Box::new(paused)))
+            .unwrap();
+        let context = QueueAdvanceContext {
+            queue_empty: false,
+            has_pending_playback_task: false,
+            command_executing: false,
+        };
+
+        assert_eq!(
+            paused_controller
+                .maybe_advance_queue(stopped_status(), context.clone())
+                .unwrap(),
+            QueueAdvanceDecision::None
+        );
+
+        let failed_controller = controller(FakeBackend::new(vec![]));
+        let decision = failed_controller
+            .maybe_advance_queue(
+                PlayerStatus {
+                    status: "stopped".to_string(),
+                    failure_code: "decode_failure".to_string(),
+                    ..PlayerStatus::default()
+                },
+                context,
+            )
+            .unwrap();
+
+        assert_eq!(decision, QueueAdvanceDecision::None);
+    }
+
+    #[test]
+    fn idle_stopped_status_does_not_advance_when_everything_is_empty() {
+        let controller = controller(FakeBackend::new(vec![]));
+        let decision = controller
+            .maybe_advance_queue(
+                stopped_status(),
+                QueueAdvanceContext {
+                    queue_empty: true,
                     has_pending_playback_task: false,
                     command_executing: false,
                 },

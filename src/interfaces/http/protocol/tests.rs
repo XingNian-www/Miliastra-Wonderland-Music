@@ -234,6 +234,18 @@ impl RecordingHttpPort {
 }
 
 impl HttpTaskPort for RecordingHttpPort {
+    /// 与真实端口一致：复用 QueueItem 统一去重策略（含结构化/待解析交叉形态）。
+    fn playback_queue_contains(&self, item: QueueItem) -> Result<bool> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("recording HTTP port lock poisoned"))?;
+        Ok(state
+            .queue
+            .iter()
+            .any(|existing| existing.duplicates_with(&item)))
+    }
+
     fn apply_mutation(&self, intent: BusinessMutationIntent) -> Result<BusinessMutationOutcome> {
         let mut state = self
             .state
@@ -1038,7 +1050,7 @@ fn native_player_and_login_routes_use_structured_json_without_secrets() {
     assert_eq!(queue[0].keyword, "结构化歌曲");
     assert_eq!(queue[0].source, "netease");
     assert_eq!(queue[0].requester, "Alice");
-    assert!(queue[0].dedup_bypass);
+    assert!(!queue[0].dedup_bypass);
     assert_eq!(
         queue[0]
             .track
@@ -1668,6 +1680,107 @@ fn queue_add_defaults_api_requester_when_not_provided() {
         .playback_queue_snapshot()
         .expect("playback queue snapshot");
     assert_eq!(queue[0].requester, "WEB/API");
+    // HTTP 默认不绕过去重。
+    assert!(!queue[0].dedup_bypass);
+}
+
+#[test]
+fn queue_add_rejects_obvious_duplicate_without_bypass() {
+    let state = test_state();
+    queue_add(
+        &[
+            ("keyword".to_string(), "晴天".to_string()),
+            ("source".to_string(), "netease".to_string()),
+        ],
+        &state,
+    )
+    .expect("first queue add succeeds");
+
+    let error = queue_add(
+        &[
+            ("keyword".to_string(), "晴天".to_string()),
+            ("source".to_string(), "netease".to_string()),
+        ],
+        &state,
+    )
+    .expect_err("duplicate queue add is rejected");
+    assert_eq!(error.status, 409);
+    assert!(error.message.contains("队列已有"));
+
+    let queue = state
+        .application
+        .queries
+        .playback_queue_snapshot()
+        .expect("playback queue snapshot");
+    assert_eq!(queue.len(), 1);
+}
+
+#[test]
+fn queue_add_cross_detects_structured_track_duplicate() {
+    let state = test_state();
+    // 先入队结构化曲目（标题“晴天”）。
+    let track = test_track("miliastra://track/netease/42", "晴天 - 周杰伦");
+    state
+        .application
+        .commands
+        .play_track(crate::interfaces::http::PlayTrackRequest {
+            track_ref: track.track_ref,
+            metadata: track.metadata,
+            requester: String::new(),
+        })
+        .expect("play track succeeds");
+
+    // 待解析项命中结构化曲目：409，不再直接允许明显重复。
+    let error = queue_add(
+        &[
+            ("keyword".to_string(), "晴天".to_string()),
+            ("source".to_string(), "netease".to_string()),
+        ],
+        &state,
+    )
+    .expect_err("cross-form duplicate queue add is rejected");
+    assert_eq!(error.status, 409);
+
+    let queue = state
+        .application
+        .queries
+        .playback_queue_snapshot()
+        .expect("playback queue snapshot");
+    assert_eq!(queue.len(), 1);
+    assert!(queue[0].track.is_some());
+}
+
+#[test]
+fn play_track_rejects_duplicate_track_key() {
+    let state = test_state();
+    let request = || {
+        let track = test_track("miliastra://track/netease/42", "晴天 - 周杰伦");
+        crate::interfaces::http::PlayTrackRequest {
+            track_ref: track.track_ref,
+            metadata: track.metadata,
+            requester: String::new(),
+        }
+    };
+    state
+        .application
+        .commands
+        .play_track(request())
+        .expect("first play track succeeds");
+
+    let error = state
+        .application
+        .commands
+        .play_track(request())
+        .expect_err("duplicate play track is rejected");
+    assert_eq!(error.status, 409);
+    assert!(error.message.contains("队列已有"));
+
+    let queue = state
+        .application
+        .queries
+        .playback_queue_snapshot()
+        .expect("playback queue snapshot");
+    assert_eq!(queue.len(), 1);
 }
 
 #[test]

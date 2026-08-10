@@ -202,21 +202,34 @@ impl HttpCommandPort for ApplicationHttpCommandFacade {
         };
         validate_playable_track(&track)?;
         let current_uri = track.track_ref.key.to_string();
+        let item = QueueItem {
+            id: 0,
+            keyword: track.metadata.title.clone(),
+            source: track.track_ref.key.provider.to_string(),
+            prefer_accompaniment: false,
+            ai_original_text: String::new(),
+            track: Some(track.clone()),
+            friend_username: String::new(),
+            requester,
+            // 与聊天路径一致：HTTP 默认不绕过去重；协议无权限/参数，不提供显式 bypass。
+            dedup_bypass: false,
+            candidate_snapshot: Vec::new(),
+        };
+        // 入队前复用播放队列统一去重策略（结构化/待解析交叉形态同样生效）。
+        if self
+            .tasks
+            .playback_queue_contains(item.clone())
+            .map_err(internal_command_error)?
+        {
+            return Err(HttpCommandError {
+                status: 409,
+                message: format!("队列已有: {}", track.metadata.title),
+            });
+        }
         let BusinessMutationOutcome::Playback(PlaybackMutationOutcome::Pushed(pushed)) = self
             .tasks
             .apply_mutation(BusinessMutationIntent::Playback(
-                PlaybackMutationIntent::Push(Box::new(QueueItem {
-                    id: 0,
-                    keyword: track.metadata.title.clone(),
-                    source: track.track_ref.key.provider.to_string(),
-                    prefer_accompaniment: false,
-                    ai_original_text: String::new(),
-                    track: Some(track.clone()),
-                    friend_username: String::new(),
-                    requester,
-                    dedup_bypass: true,
-                    candidate_snapshot: Vec::new(),
-                })),
+                PlaybackMutationIntent::Push(Box::new(item)),
             ))
             .map_err(internal_command_error)?
         else {

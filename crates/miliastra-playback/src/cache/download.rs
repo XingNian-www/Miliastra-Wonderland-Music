@@ -158,6 +158,9 @@ async fn download_to_file(
     if !response.status().is_success() {
         return Err(format!("源站返回 HTTP {}", response.status()));
     }
+    // 有明确 Content-Length 时，下载结束必须与之相符，否则视为源站截断：
+    // 残缺文件一旦改名 .complete 会被当作完整缓存反复播放失败。
+    let expected_bytes = response.content_length();
     let mut file = tokio::fs::File::create(part_file)
         .await
         .map_err(|error| format!("创建缓存文件失败: {error}"))?;
@@ -181,6 +184,13 @@ async fn download_to_file(
             handle.bytes.store(written, Ordering::SeqCst);
             handle.ready.notify_waiters();
         }
+    }
+    if let Some(expected) = expected_bytes
+        && written as u64 != expected
+    {
+        return Err(format!(
+            "源站响应提前结束: 期望 {expected} 字节，实际 {written} 字节"
+        ));
     }
     file.flush()
         .await

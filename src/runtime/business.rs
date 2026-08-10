@@ -503,12 +503,17 @@ enum PlaybackRuntimeMessage {
         response: SyncSender<Result<(), BusinessRuntimeError>>,
     },
     PickPlaybackPoolTrack {
-        exclude: Option<TrackKey>,
+        excluded: HashSet<TrackKey>,
         response: SyncSender<Result<Option<PlayableTrack>, BusinessRuntimeError>>,
     },
     StateSnapshot(SyncSender<Result<PlaybackRuntimeState, BusinessRuntimeError>>),
     UpdatePlaybackState {
         update: PlaybackStateUpdate,
+        response: SyncSender<Result<bool, BusinessRuntimeError>>,
+    },
+    ConfirmPlaybackAndDequeue {
+        update: PlaybackStateUpdate,
+        queue_item_id: Option<u64>,
         response: SyncSender<Result<bool, BusinessRuntimeError>>,
     },
     CheckSongDedup {
@@ -1221,11 +1226,11 @@ impl BusinessRuntimeHandle {
 
     pub(crate) fn pick_playback_pool_track(
         &self,
-        exclude: Option<&TrackKey>,
+        excluded: &HashSet<TrackKey>,
     ) -> Result<Option<PlayableTrack>, BusinessRuntimeError> {
         self.request(|response| {
             RuntimeMessage::Playback(PlaybackRuntimeMessage::PickPlaybackPoolTrack {
-                exclude: exclude.cloned(),
+                excluded: excluded.clone(),
                 response,
             })
         })
@@ -1289,6 +1294,22 @@ impl BusinessRuntimeHandle {
         self.request(|response| {
             RuntimeMessage::Playback(PlaybackRuntimeMessage::UpdatePlaybackState {
                 update,
+                response,
+            })
+        })
+    }
+
+    /// 原子确认播放成功并从队列删除对应项（同一笔持久化），
+    /// 消除「确认成功、出队未持久化」的崩溃窗口。
+    pub(crate) fn confirm_playback_and_dequeue(
+        &self,
+        update: PlaybackStateUpdate,
+        queue_item_id: Option<u64>,
+    ) -> Result<bool, BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::Playback(PlaybackRuntimeMessage::ConfirmPlaybackAndDequeue {
+                update,
+                queue_item_id,
                 response,
             })
         })

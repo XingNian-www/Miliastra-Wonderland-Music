@@ -19,6 +19,7 @@ const COMMAND_QUEUE_CAPACITY: usize = 32;
 const PCM_BUFFER_DEFAULT_DURATION: Duration = Duration::from_secs(3);
 const PCM_WAIT_INTERVAL: Duration = Duration::from_millis(20);
 const PROGRESS_POLL_INTERVAL: Duration = Duration::from_millis(200);
+const MAX_CONSECUTIVE_INVALID_PACKETS: usize = 16;
 
 static FFMPEG_INITIALIZED: OnceLock<Result<(), ()>> = OnceLock::new();
 
@@ -1284,6 +1285,7 @@ fn decode_once(
 
     let mut packet = ffmpeg::Packet::empty();
     let mut started = false;
+    let mut consecutive_invalid_packets = 0_usize;
     loop {
         if !audio.is_current(request.identity.id, cancelled) {
             return WorkerOutcome::Cancelled;
@@ -1293,8 +1295,12 @@ fn decode_once(
                 if packet.stream() != stream_index {
                     continue;
                 }
-                if decoder.send_packet(&packet).is_err() {
-                    return decode_error_outcome(cancelled, DecodeFailureStage::SubmitPacket);
+                match submit_packet(&mut decoder, &packet, &mut consecutive_invalid_packets) {
+                    PacketSubmit::Accepted => {}
+                    PacketSubmit::SkipInvalid => continue,
+                    PacketSubmit::Failed => {
+                        return decode_error_outcome(cancelled, DecodeFailureStage::SubmitPacket);
+                    }
                 }
                 match drain_decoder_frames(
                     &mut decoder,
@@ -1377,6 +1383,42 @@ fn decode_error_outcome(cancelled: &AtomicBool, stage: DecodeFailureStage) -> Wo
     } else {
         WorkerOutcome::Failed(WorkerFailurePhase::Decoding(stage))
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PacketSubmit {
+    Accepted,
+    SkipInvalid,
+    Failed,
+}
+
+fn classify_packet_submit(
+    result: Result<(), ffmpeg::Error>,
+    consecutive_invalid_packets: &mut usize,
+) -> PacketSubmit {
+    match result {
+        Ok(()) => {
+            *consecutive_invalid_packets = 0;
+            PacketSubmit::Accepted
+        }
+        Err(ffmpeg::Error::InvalidData) => {
+            *consecutive_invalid_packets = consecutive_invalid_packets.saturating_add(1);
+            if *consecutive_invalid_packets <= MAX_CONSECUTIVE_INVALID_PACKETS {
+                PacketSubmit::SkipInvalid
+            } else {
+                PacketSubmit::Failed
+            }
+        }
+        Err(_) => PacketSubmit::Failed,
+    }
+}
+
+fn submit_packet(
+    decoder: &mut ffmpeg::decoder::Audio,
+    packet: &ffmpeg::Packet,
+    consecutive_invalid_packets: &mut usize,
+) -> PacketSubmit {
+    classify_packet_submit(decoder.send_packet(packet), consecutive_invalid_packets)
 }
 
 enum FrameDrain {
@@ -1637,9 +1679,10 @@ mod tests {
 
     use super::{
         ActivePlayback, ActiveWorker, ActorState, AttemptIdentity, AudioEngine, DecodeFailureStage,
-        EndBehavior, EndCause, EngineCommand, EngineError, EngineState, FrameDrain, OutputFormat,
-        OutputRuntime, PcmBuffer, PlaybackSnapshot, SessionRef, StreamSource, WorkerEvent,
-        WorkerFailurePhase, WorkerRequest, classify_eof, ffmpeg_http_headers, ffmpeg_input_options,
+        EndBehavior, EndCause, EngineCommand, EngineError, EngineState, FrameDrain,
+        MAX_CONSECUTIVE_INVALID_PACKETS, OutputFormat, OutputRuntime, PacketSubmit, PcmBuffer,
+        PlaybackSnapshot, SessionRef, StreamSource, WorkerEvent, WorkerFailurePhase, WorkerRequest,
+        classify_eof, classify_packet_submit, ffmpeg_http_headers, ffmpeg_input_options,
         flush_resampler, handle_command, handle_worker_event, initialize_ffmpeg, run_decode_worker,
     };
 
@@ -1888,6 +1931,53 @@ mod tests {
 
         assert!(matches!(result, FrameDrain::Continue));
         assert!(started);
+    }
+
+    #[test]
+    fn isolated_invalid_packet_is_skipped_and_success_resets_the_streak() {
+        let mut consecutive = 0;
+
+        assert_eq!(
+            classify_packet_submit(Err(ffmpeg::Error::InvalidData), &mut consecutive),
+            PacketSubmit::SkipInvalid
+        );
+        assert_eq!(consecutive, 1);
+        assert_eq!(
+            classify_packet_submit(Ok(()), &mut consecutive),
+            PacketSubmit::Accepted
+        );
+        assert_eq!(consecutive, 0);
+    }
+
+    #[test]
+    fn too_many_consecutive_invalid_packets_fail_the_worker() {
+        let mut consecutive = 0;
+        for _ in 0..MAX_CONSECUTIVE_INVALID_PACKETS {
+            assert_eq!(
+                classify_packet_submit(Err(ffmpeg::Error::InvalidData), &mut consecutive),
+                PacketSubmit::SkipInvalid
+            );
+        }
+
+        assert_eq!(
+            classify_packet_submit(Err(ffmpeg::Error::InvalidData), &mut consecutive),
+            PacketSubmit::Failed
+        );
+    }
+
+    #[test]
+    fn non_data_submit_errors_fail_immediately() {
+        let mut consecutive = 0;
+
+        assert_eq!(
+            classify_packet_submit(
+                Err(ffmpeg::Error::Other {
+                    errno: ffmpeg::error::EAGAIN,
+                }),
+                &mut consecutive,
+            ),
+            PacketSubmit::Failed
+        );
     }
 
     #[test]

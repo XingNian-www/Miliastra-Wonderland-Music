@@ -97,10 +97,10 @@ impl PlaybackRuntimeState {
                 });
                 let _ = response.send(result);
             }
-            PlaybackRuntimeMessage::PickPlaybackPoolTrack { exclude, response } => {
+            PlaybackRuntimeMessage::PickPlaybackPoolTrack { excluded, response } => {
                 let result = self.service_mut().and_then(|service| {
                     service
-                        .pick_playback_pool_track(exclude.as_ref())
+                        .pick_playback_pool_track(&excluded)
                         .map_err(playback_operation_failed)
                 });
                 let _ = response.send(result);
@@ -119,6 +119,22 @@ impl PlaybackRuntimeState {
                         .apply_playback_state_update(update)
                         .map_err(playback_operation_failed)
                 });
+                let _ = response.send(result);
+            }
+            PlaybackRuntimeMessage::ConfirmPlaybackAndDequeue {
+                update,
+                queue_item_id,
+                response,
+            } => {
+                let result = self.service_mut().and_then(|service| {
+                    service
+                        .confirm_playback_and_dequeue(update, queue_item_id)
+                        .map_err(playback_operation_failed)
+                });
+                // 原子确认可能已出队：成功后刷新队列快照订阅。
+                if result.as_ref().is_ok_and(|changed| *changed) {
+                    self.publish_queue();
+                }
                 let _ = response.send(result);
             }
             PlaybackRuntimeMessage::CheckSongDedup {

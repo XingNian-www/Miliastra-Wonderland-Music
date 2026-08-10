@@ -195,8 +195,8 @@ http:
 
 # ===== 日志 =====
 logging:
-  # 日志目录
-  dir: logs
+  # 日志目录；统一放在 deps/ 内，与凭据等运行数据一致
+  dir: deps/logs
   # 级别：error/warn/info/debug/trace
   level: info
   # 按自然日分文件；跨日自动轮转
@@ -215,9 +215,9 @@ tui:
 
 # ===== 状态持久化 =====
 state:
-  # 播放器确认状态
-  playback_state_path: data/playback-state.json
+  # 播放器确认状态；统一放在 deps/ 内
+  playback_state_path: deps/data/playback-state.json
   # 大厅倒计时状态
-  hall_state_path: data/hall-state.json
+  hall_state_path: deps/data/hall-state.json
   # 最终执行命令记录
-  executed_commands_log_path: data/executed-commands.log
+  executed_commands_log_path: deps/data/executed-commands.log

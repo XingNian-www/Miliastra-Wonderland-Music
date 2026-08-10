@@ -5,6 +5,7 @@ use miliastra_playback::{
     PlaybackEligibility, ProviderId, SearchCandidate, TrackKey, TrackMetadata, TrackRef,
 };
 use serde::{Deserialize, Deserializer, Serialize};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -65,8 +66,7 @@ pub(crate) use controller::{
 };
 pub(crate) use dedup::{PersistentSongDedupHistory, SongDedupCandidate};
 pub(crate) use format::{
-    PlaybackSnapshot, estimated_player_status, format_lyrics, format_play_message, format_status,
-    is_playing,
+    PlaybackSnapshot, estimated_player_status, format_lyrics, format_status, is_playing,
 };
 use miliastra_kernel::clock::WallClock;
 pub(crate) use queue::{PersistentQueue, QueueItem};
@@ -131,7 +131,7 @@ impl Default for QueueConfig {
             max_size: 5,
             protect_current_song_until_finished: true,
             external_playback_protect_after_seconds: 20,
-            pool_max_size: 200,
+            pool_max_size: 1000,
         }
     }
 }
@@ -521,6 +521,8 @@ pub(crate) enum PlaybackStateUpdate {
     UserPaused,
     UserResumed,
     ClearActiveRequest,
+    /// 把当前播放保留进上一曲历史（自动推进清空请求前调用，与手动点歌路径对齐）。
+    RememberCurrentPlayback,
     External,
     Starting {
         request: ActivePlaybackRequest,
@@ -548,6 +550,10 @@ impl PlaybackStateUpdate {
             }
             Self::ClearActiveRequest => {
                 playback.clear_active_request();
+                true
+            }
+            Self::RememberCurrentPlayback => {
+                playback.remember_current_playback();
                 true
             }
             Self::External => {
@@ -578,13 +584,18 @@ impl PlaybackStateUpdate {
                 } else {
                     playback.remember_current_playback();
                 }
-                playback.state = ConfirmedPlaybackState::RequestedSongPlaying;
-                playback.pause_reason = PauseReason::None;
+                // play 是异步操作，确认返回前用户可能已暂停：此时引擎实际处于暂停，
+                // 必须保留 User 暂停状态，否则暂停的歌不会自然结束，队列自动推进被永久卡住。
+                playback.state = if playback.pause_reason == PauseReason::User {
+                    ConfirmedPlaybackState::PausedByUser
+                } else {
+                    ConfirmedPlaybackState::RequestedSongPlaying
+                };
                 playback.active_request = Some(request);
                 true
             }
             Self::Observation(observation) => {
-                if !observation_identity_changed(playback.last_observation.as_ref(), &observation) {
+                if !observation_requires_persist(playback.last_observation.as_ref(), &observation) {
                     false
                 } else {
                     playback.last_observation = Some(observation);
@@ -676,11 +687,7 @@ impl PlaybackService {
     }
 
     pub(crate) fn queue_contains(&self, item: &QueueItem) -> bool {
-        if let Some(track) = item.track.as_ref() {
-            return self.queue.has_duplicate_track(&track.track_ref.key);
-        }
-        self.queue
-            .has_duplicate(&item.keyword, &item.source, item.prefer_accompaniment)
+        self.queue.contains_duplicate(item)
     }
 
     pub(crate) fn push_queue(&mut self, item: QueueItem) -> Result<QueuePushOutcome> {
@@ -761,7 +768,7 @@ impl PlaybackService {
 
     pub(crate) fn pick_playback_pool_track(
         &mut self,
-        exclude: Option<&miliastra_playback::TrackKey>,
+        excluded: &HashSet<miliastra_playback::TrackKey>,
     ) -> Result<Option<PlayableTrack>> {
         let Some(store) = &self.request_state else {
             return Ok(None);
@@ -769,7 +776,7 @@ impl PlaybackService {
         Ok(store
             .lock()
             .map_err(|_| anyhow::anyhow!("请求状态存储锁已中毒"))?
-            .pick_pool_track(exclude))
+            .pick_pool_track(excluded))
     }
 
     pub(crate) fn playback_pool_available(&self) -> Result<bool> {
@@ -819,6 +826,52 @@ impl PlaybackService {
     ) -> Result<bool> {
         self.playback_state
             .update(|playback| update.apply(playback))
+    }
+
+    /// 原子确认播放成功并从队列删除对应项（同一笔持久化）。
+    ///
+    /// 共享请求状态存储存在时，确认与队首出队在同一事务内落盘：
+    /// 崩溃发生在事务前，队首保留等待重播；发生在事务后，队首已出队，
+    /// 重启不会再次播放同一队首。仅当 `queue_item_id` 与当前队首匹配才出队。
+    /// 无共享存储（测试构造）时退化为非原子确认，出队由消费流程补偿。
+    pub(crate) fn confirm_playback_and_dequeue(
+        &mut self,
+        update: PlaybackStateUpdate,
+        queue_item_id: Option<u64>,
+    ) -> Result<bool> {
+        let Some(store) = &self.request_state else {
+            return self
+                .playback_state
+                .update(|playback| update.apply(playback));
+        };
+        let changed = store
+            .lock()
+            .map_err(|_| anyhow::anyhow!("请求状态存储锁已中毒"))?
+            .confirm_playback_and_dequeue(update, queue_item_id)?;
+        if changed {
+            // 共享存储内的事务已直接修改落盘快照，刷新内存缓存保持一致。
+            self.sync_from_request_store()?;
+        }
+        Ok(changed)
+    }
+
+    /// 从共享请求状态存储重读队列与播放状态，覆盖本服务的内存缓存。
+    fn sync_from_request_store(&mut self) -> Result<()> {
+        let store = self
+            .request_state
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("请求状态存储未初始化"))?;
+        let (next_id, items, playback) = {
+            let guard = store
+                .lock()
+                .map_err(|_| anyhow::anyhow!("请求状态存储锁已中毒"))?;
+            let (next_id, items) = guard.queue_snapshot();
+            let playback = guard.playback_snapshot();
+            (next_id, items, playback)
+        };
+        self.queue.sync_snapshot(next_id, items);
+        self.playback_state.sync_state(playback);
+        Ok(())
     }
 
     pub(crate) fn reconcile_player_session(
@@ -894,18 +947,45 @@ impl PlaybackService {
     }
 }
 
-fn observation_identity_changed(
+/// 观测 progress 变化达到该秒数才持久化，节流高频观测写盘（如 50ms 轮询）。
+const OBSERVATION_PROGRESS_PERSIST_THRESHOLD_SECS: f64 = 5.0;
+
+/// 观测记录持久化兜底间隔：距上次持久化超过该毫秒数时即使进度未达阈值也刷新，
+/// 保证 progress/duration/captured_at 等观测元数据不会永久冻结。
+const OBSERVATION_PERSIST_FALLBACK_INTERVAL_MS: u64 = 10_000;
+
+/// 判断观测记录是否需要持久化。
+///
+/// 身份字段（状态、曲目、标题、歌手、可靠性）变化时立即持久化；
+/// 仅进度、时长、观测时间变化时按阈值节流，避免每个观测周期都写盘。
+fn observation_requires_persist(
     previous: Option<&PlaybackObservation>,
     current: &PlaybackObservation,
 ) -> bool {
     let Some(previous) = previous else {
         return true;
     };
-    previous.status != current.status
+    if previous.status != current.status
         || previous.track != current.track
         || previous.title != current.title
         || previous.artist != current.artist
         || previous.reliability != current.reliability
+    {
+        return true;
+    }
+    // 进度推进达到阈值：节流写盘。
+    if (current.progress - previous.progress).abs() >= OBSERVATION_PROGRESS_PERSIST_THRESHOLD_SECS {
+        return true;
+    }
+    // 时长变化：立即持久化。
+    if current.duration != previous.duration {
+        return true;
+    }
+    // 观测时间超过兜底间隔：定期刷新，避免观测元数据永久冻结。
+    current
+        .captured_at_ms
+        .saturating_sub(previous.captured_at_ms)
+        >= OBSERVATION_PERSIST_FALLBACK_INTERVAL_MS
 }
 
 pub(crate) use application::{
@@ -917,6 +997,7 @@ pub(crate) use application::{
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::features::playback::state::ObservationReliability;
     use miliastra_kernel::clock::SystemClock;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1022,6 +1103,37 @@ mod tests {
     }
 
     #[test]
+    fn playback_confirmation_keeps_a_user_pause_set_during_the_async_play_window() {
+        let mut playback = PlaybackRuntimeState::default();
+        playback.set_user_paused();
+        let request = ActivePlaybackRequest {
+            keyword: "song".to_owned(),
+            source: "qqmusic".to_owned(),
+            prefer_accompaniment: false,
+            track: None,
+            song: String::new(),
+            title: String::new(),
+            artist: String::new(),
+            requester: String::new(),
+            started_at_ms: 1,
+            guard_started_at: None,
+            expected_session_id: String::new(),
+            expected_generation: 0,
+        };
+        PlaybackStateUpdate::Confirmed {
+            request,
+            navigation: PlaybackNavigation::Normal,
+        }
+        .apply(&mut playback);
+
+        // 异步 play 确认返回时用户暂停已生效：引擎实际暂停，状态必须保留暂停语义，
+        // 否则暂停的歌不会自然结束，队列自动推进被永久卡住。
+        assert_eq!(playback.state, ConfirmedPlaybackState::PausedByUser);
+        assert_eq!(playback.pause_reason, PauseReason::User);
+        assert!(playback.active_request.is_some());
+    }
+
+    #[test]
     fn failed_playback_state_write_keeps_the_previous_runtime_state() {
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1062,5 +1174,376 @@ mod tests {
         assert_eq!(snapshot.state, ConfirmedPlaybackState::Idle);
         assert_eq!(snapshot.pause_reason, PauseReason::None);
         fs::remove_file(blocker).unwrap();
+    }
+
+    fn observation(status: &str, progress: f64, captured_at_ms: u64) -> PlaybackObservation {
+        PlaybackObservation {
+            status: status.to_string(),
+            track: Some(test_track(
+                "miliastra://track/qqmusic/obs",
+                "观测歌曲 - 测试歌手",
+            )),
+            title: "观测歌曲".to_string(),
+            artist: "测试歌手".to_string(),
+            progress,
+            duration: 180.0,
+            captured_at_ms,
+            reliability: ObservationReliability::Reliable,
+        }
+    }
+
+    #[test]
+    fn observation_identity_change_persists_immediately() {
+        let mut playback = PlaybackRuntimeState::default();
+        assert!(
+            PlaybackStateUpdate::Observation(observation("playing", 1.0, 1_000))
+                .apply(&mut playback)
+        );
+        // 状态变化即使进度差异很小也立即持久化。
+        assert!(
+            PlaybackStateUpdate::Observation(observation("paused", 1.5, 1_100))
+                .apply(&mut playback)
+        );
+        let last = playback.last_observation.as_ref().expect("observation");
+        assert_eq!(last.status, "paused");
+        assert_eq!(last.progress, 1.5);
+    }
+
+    #[test]
+    fn observation_progress_below_threshold_skips_persist() {
+        let mut playback = PlaybackRuntimeState::default();
+        assert!(
+            PlaybackStateUpdate::Observation(observation("playing", 10.0, 1_000))
+                .apply(&mut playback)
+        );
+
+        // 进度推进不足 5 秒且未到兜底间隔：不写盘，保持上次观测，避免高频持久化。
+        assert!(
+            !PlaybackStateUpdate::Observation(observation("playing", 12.0, 2_000))
+                .apply(&mut playback)
+        );
+        let last = playback.last_observation.as_ref().expect("observation");
+        assert_eq!(last.progress, 10.0);
+        assert_eq!(last.captured_at_ms, 1_000);
+    }
+
+    #[test]
+    fn observation_progress_at_threshold_persists() {
+        let mut playback = PlaybackRuntimeState::default();
+        assert!(
+            PlaybackStateUpdate::Observation(observation("playing", 10.0, 1_000))
+                .apply(&mut playback)
+        );
+
+        // 进度推进达到 5 秒阈值：即使间隔小于兜底间隔也写盘。
+        assert!(
+            PlaybackStateUpdate::Observation(observation("playing", 15.0, 2_000))
+                .apply(&mut playback)
+        );
+        let last = playback.last_observation.as_ref().expect("observation");
+        assert_eq!(last.progress, 15.0);
+        assert_eq!(last.captured_at_ms, 2_000);
+    }
+
+    #[test]
+    fn observation_refreshes_when_capture_age_reaches_fallback_interval() {
+        let mut playback = PlaybackRuntimeState::default();
+        assert!(
+            PlaybackStateUpdate::Observation(observation("playing", 10.0, 1_000))
+                .apply(&mut playback)
+        );
+
+        // 进度推进不足阈值但观测时间差达到兜底间隔：定期刷新，不永久冻结。
+        assert!(
+            PlaybackStateUpdate::Observation(observation(
+                "playing",
+                11.0,
+                1_000 + OBSERVATION_PERSIST_FALLBACK_INTERVAL_MS,
+            ))
+            .apply(&mut playback)
+        );
+        let last = playback.last_observation.as_ref().expect("observation");
+        assert_eq!(last.progress, 11.0);
+        assert_eq!(
+            last.captured_at_ms,
+            1_000 + OBSERVATION_PERSIST_FALLBACK_INTERVAL_MS
+        );
+    }
+
+    #[test]
+    fn observation_duration_change_persists_immediately() {
+        let mut playback = PlaybackRuntimeState::default();
+        assert!(
+            PlaybackStateUpdate::Observation(observation("playing", 10.0, 1_000))
+                .apply(&mut playback)
+        );
+
+        let mut changed = observation("playing", 10.5, 2_000);
+        changed.duration = 200.0;
+        assert!(PlaybackStateUpdate::Observation(changed).apply(&mut playback));
+        assert_eq!(
+            playback
+                .last_observation
+                .as_ref()
+                .expect("observation")
+                .duration,
+            200.0
+        );
+    }
+
+    #[test]
+    fn observation_requires_persist_accepts_exact_threshold_boundaries() {
+        let previous = observation("playing", 10.0, 1_000);
+        // 差 5.0 秒：达到阈值。
+        let at_threshold = observation("playing", 15.0, 2_000);
+        assert!(observation_requires_persist(Some(&previous), &at_threshold));
+        // 差 4.999 秒：低于阈值，且间隔未到兜底。
+        let below_threshold = observation("playing", 14.999, 2_000);
+        assert!(!observation_requires_persist(
+            Some(&previous),
+            &below_threshold
+        ));
+        // 无上次观测：首次观测必须持久化。
+        assert!(observation_requires_persist(None, &previous));
+    }
+
+    fn service_temp_path(name: &str, suffix: u128) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "miliastra-playback-service-{}-{}-{suffix}.json",
+            std::process::id(),
+            name
+        ))
+    }
+
+    /// 队列项播放确认成功后到删除持久化前进程退出，重启后不会再次播放同一队首：
+    /// 确认与出队在同一笔持久化中完成，重载后队首直接是下一首。
+    #[test]
+    fn confirmed_dequeue_survives_reload_without_replaying_the_head() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state_path = service_temp_path("crash-state", suffix);
+        let history_path = service_temp_path("crash-dedup", suffix);
+        let wall_clock: Arc<dyn WallClock> = Arc::new(SystemClock);
+        let track_a = test_track("miliastra://track/qqmusic/a", "歌曲A - 歌手A");
+        let track_b = test_track("miliastra://track/qqmusic/b", "歌曲B - 歌手B");
+        let dedup = SongDedupConfig {
+            history_path: history_path.clone(),
+            ..SongDedupConfig::default()
+        };
+
+        let mut service = PlaybackService::load(
+            state_path.clone(),
+            history_path.clone(),
+            10,
+            0,
+            dedup.clone(),
+            wall_clock.clone(),
+            crate::test_support::test_state_store(),
+        )
+        .unwrap();
+        service
+            .push_queue(QueueItem {
+                keyword: "歌曲A".to_string(),
+                track: Some(track_a.clone()),
+                ..QueueItem::default()
+            })
+            .unwrap();
+        service
+            .push_queue(QueueItem {
+                keyword: "歌曲B".to_string(),
+                track: Some(track_b.clone()),
+                ..QueueItem::default()
+            })
+            .unwrap();
+        let head_id = service.queue_snapshot()[0].id;
+        assert_eq!(head_id, 1);
+
+        // 队列消费起播：进入 Starting。
+        let started_at_ms = 4242;
+        service
+            .apply_playback_state_update(PlaybackStateUpdate::Starting {
+                request: ActivePlaybackRequest {
+                    keyword: "歌曲A".to_string(),
+                    source: "qqmusic".to_string(),
+                    track: Some(track_a.clone()),
+                    started_at_ms,
+                    ..ActivePlaybackRequest::default()
+                },
+                navigation: PlaybackNavigation::Normal,
+            })
+            .unwrap();
+
+        // 确认播放成功：与队首出队在同一事务内落盘。
+        service
+            .confirm_playback_and_dequeue(
+                PlaybackStateUpdate::Confirmed {
+                    request: ActivePlaybackRequest {
+                        keyword: "歌曲A".to_string(),
+                        source: "qqmusic".to_string(),
+                        track: Some(track_a.clone()),
+                        started_at_ms,
+                        ..ActivePlaybackRequest::default()
+                    },
+                    navigation: PlaybackNavigation::Normal,
+                },
+                Some(head_id),
+            )
+            .unwrap();
+
+        // 内存缓存与落盘一致：队首已是 B，播放状态已确认 A。
+        let queue = service.queue_snapshot();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].keyword, "歌曲B");
+        let playback = service.playback_state_snapshot();
+        assert_eq!(playback.state, ConfirmedPlaybackState::RequestedSongPlaying);
+        assert_eq!(
+            playback
+                .active_request
+                .as_ref()
+                .unwrap()
+                .track
+                .as_ref()
+                .unwrap()
+                .track_ref
+                .key,
+            track_a.track_ref.key
+        );
+
+        // 模拟进程崩溃退出后重启：重载同一文件。
+        drop(service);
+        let reloaded = PlaybackService::load(
+            state_path.clone(),
+            history_path.clone(),
+            10,
+            0,
+            dedup,
+            wall_clock,
+            crate::test_support::test_state_store(),
+        )
+        .unwrap();
+        let queue = reloaded.queue_snapshot();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(
+            queue[0].keyword, "歌曲B",
+            "已确认消费的队首 A 不得在重启后残留"
+        );
+        let playback = reloaded.playback_state_snapshot();
+        assert_eq!(playback.state, ConfirmedPlaybackState::RequestedSongPlaying);
+        assert_eq!(
+            playback
+                .active_request
+                .unwrap()
+                .track
+                .unwrap()
+                .track_ref
+                .key,
+            track_a.track_ref.key
+        );
+        // 重启后再次消费：直接从 B 开始，A 不会重播。
+        assert_eq!(reloaded.queue_snapshot()[0].id, head_id + 1);
+
+        fs::remove_file(&state_path).ok();
+        fs::remove_file(format!("{}.bak", state_path.display())).ok();
+        fs::remove_file(&history_path).ok();
+    }
+
+    /// 播放确认失败前不得丢歌：确认事务写盘失败时整体回滚，
+    /// 队首保留且播放状态未确认，重启后仍可重播。
+    #[test]
+    fn failed_confirmed_dequeue_keeps_the_head_for_replay() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state_path = service_temp_path("keep-head-state", suffix);
+        let history_path = service_temp_path("keep-head-dedup", suffix);
+        let wall_clock: Arc<dyn WallClock> = Arc::new(SystemClock);
+        let track_a = test_track("miliastra://track/qqmusic/a", "歌曲A - 歌手A");
+        let failing = Arc::new(crate::test_support::FailingWriteStore::new(
+            crate::test_support::test_state_store(),
+        ));
+
+        let mut service = PlaybackService::load(
+            state_path.clone(),
+            history_path.clone(),
+            10,
+            0,
+            SongDedupConfig {
+                history_path: history_path.clone(),
+                ..SongDedupConfig::default()
+            },
+            wall_clock.clone(),
+            failing.clone(),
+        )
+        .unwrap();
+        service
+            .push_queue(QueueItem {
+                keyword: "歌曲A".to_string(),
+                track: Some(track_a.clone()),
+                ..QueueItem::default()
+            })
+            .unwrap();
+        let head_id = service.queue_snapshot()[0].id;
+
+        // 注入写盘故障：确认+出队事务持久化失败，整体回滚。
+        failing
+            .fail_writes
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            service
+                .confirm_playback_and_dequeue(
+                    PlaybackStateUpdate::Confirmed {
+                        request: ActivePlaybackRequest {
+                            keyword: "歌曲A".to_string(),
+                            source: "qqmusic".to_string(),
+                            track: Some(track_a.clone()),
+                            started_at_ms: 7,
+                            ..ActivePlaybackRequest::default()
+                        },
+                        navigation: PlaybackNavigation::Normal,
+                    },
+                    Some(head_id),
+                )
+                .is_err()
+        );
+        // 内存缓存整体回滚：队首保留，播放状态未确认（不丢歌、无部分写入）。
+        assert_eq!(service.queue_snapshot().len(), 1);
+        assert_eq!(service.queue_snapshot()[0].id, head_id);
+        assert_ne!(
+            service.playback_state_snapshot().state,
+            ConfirmedPlaybackState::RequestedSongPlaying
+        );
+
+        // 故障恢复后重载（模拟重启）：磁盘仍是事务前状态，队首可重播。
+        failing
+            .fail_writes
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        drop(service);
+        let reloaded = PlaybackService::load(
+            state_path.clone(),
+            history_path.clone(),
+            10,
+            0,
+            SongDedupConfig {
+                history_path: history_path.clone(),
+                ..SongDedupConfig::default()
+            },
+            wall_clock,
+            failing,
+        )
+        .unwrap();
+        assert_eq!(reloaded.queue_snapshot().len(), 1);
+        assert_eq!(reloaded.queue_snapshot()[0].id, head_id);
+        assert_eq!(
+            reloaded.playback_state_snapshot().state,
+            ConfirmedPlaybackState::Idle,
+            "确认未提交时播放状态保持空闲，队首等待重新播放"
+        );
+
+        fs::remove_file(&state_path).ok();
+        fs::remove_file(format!("{}.bak", state_path.display())).ok();
+        fs::remove_file(&history_path).ok();
     }
 }

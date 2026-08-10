@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use miliastra_playback::{PlayableTrack, TrackKey};
+use miliastra_playback::PlayableTrack;
 use serde::{Deserialize, Serialize};
 
 use crate::features::song_request::SearchCandidate;
@@ -44,6 +44,36 @@ impl Default for QueueItem {
     }
 }
 
+impl QueueItem {
+    /// 判定两个队列项是否构成重复，供队列去重与 HTTP 契约复用同一策略。
+    ///
+    /// 统一规则：
+    /// - 双方都是结构化曲目：精确比较 TrackKey，避免不同版本/不同音源误判；
+    /// - 其余形态（至少一方是待解析项）：比较查询特征（结构化项取曲目标题、
+    ///   待解析项取 keyword），要求模糊匹配且音源、伴奏偏好一致。
+    ///   这样结构化曲目与待解析项交叉形态不会漏去重。
+    pub(crate) fn duplicates_with(&self, other: &QueueItem) -> bool {
+        match (&self.track, &other.track) {
+            (Some(left), Some(right)) => left.track_ref.key == right.track_ref.key,
+            _ => {
+                let left_query = self
+                    .track
+                    .as_ref()
+                    .map(|track| track.metadata.title.as_str())
+                    .unwrap_or(self.keyword.as_str());
+                let right_query = other
+                    .track
+                    .as_ref()
+                    .map(|track| track.metadata.title.as_str())
+                    .unwrap_or(other.keyword.as_str());
+                matcher::same_song_query(left_query, right_query)
+                    && normalize_source(&self.source) == normalize_source(&other.source)
+                    && self.prefer_accompaniment == other.prefer_accompaniment
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct PersistentQueue {
     max_size: usize,
@@ -78,6 +108,13 @@ impl PersistentQueue {
         &self.items
     }
 
+    /// 用共享请求状态存储中的最新队列快照覆盖内存缓存。
+    /// 供共享存储内的原子事务（如确认+出队）落盘后同步缓存使用。
+    pub(crate) fn sync_snapshot(&mut self, next_id: u64, items: Vec<QueueItem>) {
+        self.next_id = next_id;
+        self.items = items;
+    }
+
     pub fn len(&self) -> usize {
         self.items.len()
     }
@@ -90,22 +127,10 @@ impl PersistentQueue {
         self.items.len() >= self.max_size
     }
 
-    pub fn has_duplicate(&self, keyword: &str, source: &str, prefer_accompaniment: bool) -> bool {
-        let source = normalize_source(source);
-        self.items.iter().any(|item| {
-            item.track.is_none()
-                && matcher::same_song_query(&item.keyword, keyword)
-                && normalize_source(&item.source) == source
-                && item.prefer_accompaniment == prefer_accompaniment
-        })
-    }
-
-    pub fn has_duplicate_track(&self, key: &TrackKey) -> bool {
-        self.items.iter().any(|item| {
-            item.track
-                .as_ref()
-                .is_some_and(|track| &track.track_ref.key == key)
-        })
+    pub fn contains_duplicate(&self, item: &QueueItem) -> bool {
+        self.items
+            .iter()
+            .any(|existing| existing.duplicates_with(item))
     }
 
     pub fn push(&mut self, item: QueueItem) -> Result<bool> {
@@ -199,7 +224,7 @@ fn normalize_source(source: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::features::playback::test_candidate;
+    use crate::features::playback::{test_candidate, test_track};
 
     #[test]
     fn push_assigns_stable_ids_and_normalizes_source() {
@@ -251,5 +276,133 @@ mod tests {
         assert_eq!(removed.1.keyword, "third");
         assert_eq!(queue.items().len(), 1);
         assert_eq!(queue.items()[0].keyword, "second");
+    }
+
+    #[test]
+    fn pending_items_match_by_query_features() {
+        let mut queue = PersistentQueue::new_for_test(5).unwrap();
+        queue
+            .push(QueueItem {
+                keyword: "晴天".to_string(),
+                source: "netease".to_string(),
+                ..QueueItem::default()
+            })
+            .unwrap();
+
+        // 同 keyword + 同音源判重；音源不同不判重。
+        assert!(queue.contains_duplicate(&QueueItem {
+            keyword: "晴天".to_string(),
+            source: "netease".to_string(),
+            ..QueueItem::default()
+        }));
+        assert!(!queue.contains_duplicate(&QueueItem {
+            keyword: "晴天".to_string(),
+            source: "qqmusic".to_string(),
+            ..QueueItem::default()
+        }));
+        assert!(!queue.contains_duplicate(&QueueItem {
+            keyword: "稻香".to_string(),
+            source: "netease".to_string(),
+            ..QueueItem::default()
+        }));
+    }
+
+    #[test]
+    fn structured_track_and_pending_query_are_cross_detected_as_duplicates() {
+        let mut queue = PersistentQueue::new_for_test(5).unwrap();
+        // 队列中先有结构化曲目（keyword 为曲目标题）。
+        queue
+            .push(QueueItem {
+                keyword: "晴天".to_string(),
+                source: "netease".to_string(),
+                track: Some(test_track("miliastra://track/netease/42", "晴天 - 周杰伦")),
+                ..QueueItem::default()
+            })
+            .unwrap();
+
+        // 待解析项用相同查询特征：命中结构化曲目，不再漏去重。
+        assert!(queue.contains_duplicate(&QueueItem {
+            keyword: "晴天".to_string(),
+            source: "netease".to_string(),
+            ..QueueItem::default()
+        }));
+        // 模糊子串同样命中。
+        assert!(queue.contains_duplicate(&QueueItem {
+            keyword: "周杰伦 晴天 现场".to_string(),
+            source: "netease".to_string(),
+            ..QueueItem::default()
+        }));
+        // 音源不同不判重。
+        assert!(!queue.contains_duplicate(&QueueItem {
+            keyword: "晴天".to_string(),
+            source: "qqmusic".to_string(),
+            ..QueueItem::default()
+        }));
+        // 伴奏偏好不同不判重。
+        assert!(!queue.contains_duplicate(&QueueItem {
+            keyword: "晴天".to_string(),
+            source: "netease".to_string(),
+            prefer_accompaniment: true,
+            ..QueueItem::default()
+        }));
+    }
+
+    #[test]
+    fn pending_query_and_structured_track_are_cross_detected_as_duplicates() {
+        let mut queue = PersistentQueue::new_for_test(5).unwrap();
+        // 队列中先有待解析项。
+        queue
+            .push(QueueItem {
+                keyword: "晴天".to_string(),
+                source: "netease".to_string(),
+                ..QueueItem::default()
+            })
+            .unwrap();
+
+        // 新结构化曲目标题与待解析项匹配：判重。
+        assert!(queue.contains_duplicate(&QueueItem {
+            keyword: "晴天".to_string(),
+            source: "netease".to_string(),
+            track: Some(test_track("miliastra://track/netease/42", "晴天 - 周杰伦")),
+            ..QueueItem::default()
+        }));
+        // 标题不匹配不判重。
+        assert!(!queue.contains_duplicate(&QueueItem {
+            keyword: "稻香".to_string(),
+            source: "netease".to_string(),
+            track: Some(test_track("miliastra://track/netease/43", "稻香 - 周杰伦")),
+            ..QueueItem::default()
+        }));
+    }
+
+    #[test]
+    fn structured_tracks_compare_exact_key_not_title() {
+        let mut queue = PersistentQueue::new_for_test(5).unwrap();
+        queue
+            .push(QueueItem {
+                keyword: "晴天".to_string(),
+                source: "netease".to_string(),
+                track: Some(test_track("miliastra://track/netease/42", "晴天 - 周杰伦")),
+                ..QueueItem::default()
+            })
+            .unwrap();
+
+        // 同一 TrackKey 判重（即使标题写法不同）。
+        assert!(queue.contains_duplicate(&QueueItem {
+            keyword: "晴天".to_string(),
+            source: "netease".to_string(),
+            track: Some(test_track(
+                "miliastra://track/netease/42",
+                "晴天 现场 - 周杰伦"
+            )),
+            ..QueueItem::default()
+        }));
+        // 同标题不同 id：不同版本，不判重。
+        assert!(!queue.contains_duplicate(&QueueItem {
+            keyword: "晴天".to_string(),
+            source: "netease".to_string(),
+            track: Some(test_track("miliastra://track/netease/43", "晴天 - 周杰伦")),
+            ..QueueItem::default()
+        }));
     }
 }

@@ -374,22 +374,36 @@ pub(super) fn queue_add(
     let ai_original_text =
         normalize_optional_text(query_value(query, "aiOriginalText"), "aiOriginalText")?;
     let requester = requester_from_query(query)?;
+    let item = QueueItem {
+        id: 0,
+        keyword,
+        source,
+        prefer_accompaniment: prefer,
+        ai_original_text,
+        track: None,
+        friend_username: String::new(),
+        requester,
+        // 与聊天路径一致：HTTP 默认不绕过去重；协议无权限/参数，不提供显式 bypass。
+        dedup_bypass: false,
+        candidate_snapshot: Vec::new(),
+    };
+    // 入队前复用播放队列统一去重策略，避免直接允许明显重复。
+    if state
+        .application
+        .tasks
+        .playback_queue_contains(item.clone())
+        .map_err(internal_error)?
+    {
+        return Err(AppError {
+            status: 409,
+            message: format!("队列已有: {}", item.keyword),
+        });
+    }
     let BusinessMutationOutcome::Playback(PlaybackMutationOutcome::Pushed(pushed)) = state
         .application
         .tasks
         .apply_mutation(BusinessMutationIntent::Playback(
-            PlaybackMutationIntent::Push(Box::new(QueueItem {
-                id: 0,
-                keyword,
-                source,
-                prefer_accompaniment: prefer,
-                ai_original_text,
-                track: None,
-                friend_username: String::new(),
-                requester,
-                dedup_bypass: true,
-                candidate_snapshot: Vec::new(),
-            })),
+            PlaybackMutationIntent::Push(Box::new(item)),
         ))
         .map_err(internal_error)?
     else {

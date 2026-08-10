@@ -183,6 +183,14 @@ impl PlayerControlPort for NativePlaybackAdapter {
                     "native playback queue navigation is owned by the application",
                 ));
             }
+            PlayerControl::InvalidateAudioCache(key) => {
+                return ControlDispatch::immediate(
+                    match self.playback.invalidate_audio_cache(key) {
+                        Ok(()) => ControlDispatchOutcome::acknowledged("ok"),
+                        Err(error) => dispatch_error(error),
+                    },
+                );
+            }
             PlayerControl::Play(_) => unreachable!("play control handled above"),
         };
         ControlDispatch::immediate(match result {

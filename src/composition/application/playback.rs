@@ -1,5 +1,7 @@
 use super::*;
 
+use std::collections::HashSet;
+
 use miliastra_playback::PlayableTrack;
 
 use crate::features::playback::{
@@ -30,6 +32,7 @@ impl ApplicationRuntime {
             .playback_application
             .clone()
             .consume_queue_after_monitor(reason, self)
+            .map(|_| ())
     }
 
     pub(super) fn play_request_confirmed(
@@ -243,11 +246,11 @@ impl PlaybackExecutionPort for ApplicationRuntime {
 
     fn pick_playback_pool_track(
         &mut self,
-        exclude: Option<&miliastra_playback::TrackKey>,
+        excluded: &HashSet<miliastra_playback::TrackKey>,
     ) -> Result<Option<PlayableTrack>> {
         self.business
             .business
-            .pick_playback_pool_track(exclude)
+            .pick_playback_pool_track(excluded)
             .map_err(anyhow::Error::from)
     }
 
@@ -302,14 +305,6 @@ impl PlaybackCommandPort for ApplicationRuntime {
         &mut self,
     ) -> Result<Option<crate::features::playback::PlaybackRequest>> {
         self.playback.player.previous_playback_request()
-    }
-
-    fn next_external(&mut self) -> Result<String> {
-        self.playback.player.next_external()
-    }
-
-    fn previous_external(&mut self) -> Result<String> {
-        self.playback.player.previous_external()
     }
 
     fn set_volume(&mut self, volume: &str) -> Result<()> {

@@ -27,6 +27,8 @@ use crate::runtime::scheduler::{
 
 pub(crate) trait HttpTaskPort: Send + Sync {
     fn apply_mutation(&self, intent: BusinessMutationIntent) -> Result<BusinessMutationOutcome>;
+    /// 复用播放队列去重策略查询：新项是否与队列现有项重复（含结构化/待解析交叉形态）。
+    fn playback_queue_contains(&self, item: QueueItem) -> Result<bool>;
     fn enqueue_command(&self, pending: PendingCommand) -> Result<FormalTaskEnqueueOutcome>;
     fn enqueue_startup(&self, task: StartupTask) -> Result<FormalTaskEnqueueOutcome>;
     fn enqueue_console_chat(

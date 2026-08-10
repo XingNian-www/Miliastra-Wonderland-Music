@@ -23,16 +23,6 @@ pub(crate) fn estimated_player_status(snapshot: &PlaybackSnapshot) -> PlayerStat
     status
 }
 
-pub(super) fn playback_remaining_seconds(status: &PlayerStatus) -> Option<f64> {
-    if !status.duration.is_finite() || !status.progress.is_finite() {
-        return None;
-    }
-    if status.duration <= 0.0 || status.progress < 0.0 || status.progress > status.duration {
-        return None;
-    }
-    Some(status.duration - status.progress)
-}
-
 pub(crate) fn format_play_message(status: &PlayerStatus) -> String {
     format!(
         "播放: {} ({}/{}) 音量{}",

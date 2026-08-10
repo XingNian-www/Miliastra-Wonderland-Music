@@ -7,7 +7,7 @@ use miliastra_playback::{PlayableTrack, TrackKey};
 use crate::features::song_request::SearchCandidate;
 
 use super::dedup::SongDedupCandidate;
-use super::format::{format_play_message, playback_remaining_seconds};
+use super::format::format_play_message;
 use super::state::{
     ActivePlaybackRequest, ConfirmedPlaybackState, ObservationReliability, PauseReason,
     PlaybackObservation, PlaybackRuntimeState, PlaybackSessionBinding, SessionReconciliation,

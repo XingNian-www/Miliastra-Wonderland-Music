@@ -405,32 +405,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         if playback.state == ConfirmedPlaybackState::Unknown {
             return Ok(false);
         }
-        if status.status == "playing" {
-            return Ok(status.current_track.is_some());
-        }
-        if status.status == "paused"
-            && (playback_remaining_seconds(status).is_some() || status.current_track.is_some())
-        {
-            return Ok(true);
-        }
-
-        if playback.active_request.is_none() {
-            return Ok(false);
-        }
-        if status_matches_active_request(&self.matching, playback.active_request.as_ref(), status) {
-            return Ok(true);
-        }
-        if status.current_track.is_none() {
-            return Ok(false);
-        }
-        if active_request_guard_active(
-            &self.timing,
-            playback.active_request.as_ref(),
-            self.clock.now(),
-        ) {
-            return Ok(true);
-        }
-        Ok(status.status != "stopped" && status.status != "stoped")
+        Ok(matches!(status.status.as_str(), "playing" | "paused"))
     }
 
     pub(crate) fn song_dedup_limited(&self, request: &PlaybackRequest) -> Result<bool> {
@@ -540,7 +515,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         snapshot_status: PlayerStatus,
         context: QueueAdvanceContext,
     ) -> Result<QueueAdvanceDecision> {
-        let mut status = snapshot_status;
+        let status = snapshot_status;
         let external_playback_protected = self.observe_external_playback(&status)?.unwrap_or(false);
         let runtime_snapshot = self.playback_state.snapshot()?;
         let session_reconciliation = self.reconcile_player_session(&runtime_snapshot, &status)?;
@@ -564,74 +539,9 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             self.clock.now(),
         );
 
-        if runtime_snapshot.active_request.is_some()
-            && !status_matches_active_request(
-                &self.matching,
-                runtime_snapshot.active_request.as_ref(),
-                &status,
-            )
-        {
-            match self.backend.status() {
-                Ok(fresh_status) => {
-                    if status.current_uri != fresh_status.current_uri
-                        || status.status != fresh_status.status
-                    {
-                        // 监控快照确实过期：刷新并记录，后续 tick 复用一致状态。
-                        log::info!(
-                            "点歌状态与播放监控快照不一致，已刷新播放状态: snapshot_uri={} fresh_uri={}",
-                            status.current_uri,
-                            fresh_status.current_uri,
-                        );
-                        status = fresh_status;
-                        self.record_observation(&status, classify_observation(&status))?;
-                    } else {
-                        // 快照与引擎实时一致且与点歌请求不匹配（外部切歌/引擎异常）：
-                        // 属持续状态而非过期快照，降级为 debug 避免每轮轮询刷屏，
-                        // 由后续 track_changed/自然结束路径处理。
-                        log::debug!(
-                            "点歌状态与引擎持续不一致，等待状态转移处理: uri={}",
-                            fresh_status.current_uri,
-                        );
-                    }
-                }
-                Err(error) => {
-                    log::error!("刷新点歌播放状态失败，暂不自动出队: {error:#}");
-                    self.mark_unknown()?;
-                    return Ok(QueueAdvanceDecision::None);
-                }
-            }
-        }
-
-        if runtime_snapshot.active_request.is_some()
-            && guard_active
-            && !is_notify_controller_natural_end(&status)
-            && !status_matches_active_request(
-                &self.matching,
-                runtime_snapshot.active_request.as_ref(),
-                &status,
-            )
-        {
-            log::debug!("点歌刚开始，忽略可能过期的播放状态");
-            return Ok(QueueAdvanceDecision::None);
-        }
-
-        if runtime_snapshot.active_request.is_some()
-            && matches!(status.status.as_str(), "playing" | "paused")
-            && active_request_track_changed(
-                runtime_snapshot.active_request.as_ref(),
-                &status,
-                &self.matching,
-            )
-        {
-            // 内置引擎只播请求的 URI；曲目变化只可能来自用户手动控制或引擎异常，
-            // 直接视为外部播放，不再做跨源同曲确认。
-            log::info!(
-                "播放器状态转移: RequestedSongPlaying -> ExternalPlayback reason=track_changed"
-            );
-            self.record_observation(&status, classify_observation(&status))?;
-            self.mark_external_playback()?;
-            return Ok(QueueAdvanceDecision::PlaybackStateChanged);
-        }
+        // 内置播放后端持有已解析的实际音源 URL。监控中的 TrackKey 经过独立稳定化，
+        // 起播换歌时可能短暂保留上一首身份，因此不能据此中断当前请求或推进队列。
+        // 当前请求只由传输状态、绑定会话的自然结束和明确失败信号驱动。
 
         if !external_playback_protected
             && runtime_snapshot.state == ConfirmedPlaybackState::ExternalPlayback
@@ -1144,22 +1054,6 @@ fn active_request_guard_active(
         .saturating_mul(3)
         .max(3000);
     now.saturating_duration_since(started_at) < Duration::from_millis(guard_ms)
-}
-
-fn active_request_track_changed(
-    active_request: Option<&ActivePlaybackRequest>,
-    status: &PlayerStatus,
-    matching: &MatchConfig,
-) -> bool {
-    let Some(active_request) = active_request else {
-        return false;
-    };
-    let changed = active_request
-        .track
-        .as_ref()
-        .zip(status.current_track.as_ref())
-        .is_some_and(|(requested, current)| requested.track_ref.key != current.track_ref.key);
-    changed && !status_matches_active_request(matching, Some(active_request), status)
 }
 
 fn request_dedup_candidate(request: &PlaybackRequest) -> Option<SongDedupCandidate> {
@@ -1747,11 +1641,14 @@ mod tests {
     }
 
     #[test]
-    fn track_changed_observation_transitions_to_external_playback() {
-        let fallback_uri = "miliastra://track/netease/fallback";
-        let backend = FakeBackend::new(vec![status("目标", fallback_uri, 12.0, 180.0)]);
+    fn playing_observation_with_stale_track_keeps_active_request() {
+        let stale_uri = "miliastra://track/netease/previous";
         let manual_clock = Arc::new(ManualClock::new(Instant::now()));
-        let controller = controller_with_time(backend, manual_clock.clone(), manual_clock.clone());
+        let controller = controller_with_time(
+            FakeBackend::new(Vec::new()),
+            manual_clock.clone(),
+            manual_clock.clone(),
+        );
         let request = request();
         controller
             .confirm_playback_success(
@@ -1763,19 +1660,19 @@ mod tests {
 
         let decision = controller
             .maybe_advance_queue(
-                status("目标", fallback_uri, 12.0, 180.0),
+                status("上一首", stale_uri, 12.0, 180.0),
                 QueueAdvanceContext {
-                    queue_empty: true,
+                    queue_empty: false,
                     has_pending_playback_task: false,
                     command_executing: false,
                 },
             )
             .unwrap();
 
-        assert_eq!(decision, QueueAdvanceDecision::PlaybackStateChanged);
+        assert_eq!(decision, QueueAdvanceDecision::None);
         let snapshot = controller.snapshot();
-        assert_eq!(snapshot.state, "external_playback");
-        assert!(snapshot.active_uri.is_empty());
+        assert_eq!(snapshot.state, "requested_song_playing");
+        assert_eq!(snapshot.active_uri, request.uri());
     }
 
     #[test]
@@ -2156,7 +2053,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_uri_does_not_protect_the_current_song() {
+    fn playing_transport_without_track_identity_protects_the_current_song() {
         let controller = controller(FakeBackend::new(vec![]));
         let request = request();
         controller
@@ -2165,10 +2062,14 @@ mod tests {
                 &status("目标", request.uri().as_str(), 1.0, 180.0),
             )
             .unwrap();
+        let playing_without_identity = PlayerStatus {
+            status: "playing".to_string(),
+            ..PlayerStatus::default()
+        };
 
         assert!(
-            !controller
-                .should_queue_until_current_song_finished(&status("目标", "", 10.0, 180.0))
+            controller
+                .should_queue_until_current_song_finished(&playing_without_identity)
                 .unwrap()
         );
     }

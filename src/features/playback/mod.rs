@@ -162,7 +162,7 @@ impl Default for SongDedupConfig {
             window_seconds: 3600,
             max_count: 1,
             console_bypass: true,
-            history_path: PathBuf::from("data/song-dedup-history.json"),
+            history_path: PathBuf::from("deps/data/song-dedup-history.json"),
         }
     }
 }

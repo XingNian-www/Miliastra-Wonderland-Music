@@ -1247,7 +1247,7 @@ fn default_openvino_device() -> String {
 }
 
 fn default_openvino_cache_dir() -> Option<PathBuf> {
-    Some(PathBuf::from("data/openvino-cache"))
+    Some(PathBuf::from("deps/data/openvino-cache"))
 }
 
 impl OpenVinoConfig {
@@ -1446,7 +1446,7 @@ pub struct AudioCacheFileConfig {
 impl Default for PlaybackConfig {
     fn default() -> Self {
         Self {
-            credential_directory: PathBuf::from("data/credentials"),
+            credential_directory: PathBuf::from("deps/data/credentials"),
             login_helper_executable: PathBuf::from("miliastra-login-helper.exe"),
             kugou_api_executable: PathBuf::from("kugou-api.exe"),
             login_timeout_ms: 180000,

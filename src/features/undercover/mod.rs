@@ -194,8 +194,8 @@ impl Default for UndercoverConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            word_bank_path: PathBuf::from("undercover.yaml"),
-            used_state_path: PathBuf::from("data/undercover-used.yaml"),
+            word_bank_path: PathBuf::from("deps/undercover.yaml"),
+            used_state_path: PathBuf::from("deps/data/undercover-used.yaml"),
             min_players: 4,
             double_min_players: 6,
             max_players: 11,

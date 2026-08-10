@@ -35,11 +35,11 @@ landlord:
   # 好友私聊 #手牌 的单人查询冷却
   hand_cooldown_seconds: 10
 
-# 谁是卧底默认关闭；启用前复制 undercover.example.yaml 为 undercover.yaml 并审核词对
+# 谁是卧底默认关闭；启用前复制 undercover.example.yaml 为 deps/undercover.yaml 并审核词对
 undercover:
   enabled: false
-  word_bank_path: undercover.yaml
-  used_state_path: data/undercover-used.yaml
+  word_bank_path: deps/undercover.yaml
+  used_state_path: deps/data/undercover-used.yaml
   min_players: 4
   double_min_players: 6
   max_players: 11
@@ -58,10 +58,10 @@ turtle_soup:
   enabled: false
 
   # 正式题库由使用者维护，不随仓库提交；格式参考 turtle_soup.example.yaml
-  question_bank_path: turtle_soup.yaml
+  question_bank_path: deps/turtle_soup.yaml
 
   # 永久已使用题目记录；程序不提供重置接口，只能手动修改此文件
-  used_state_path: data/turtle-soup-used.json
+  used_state_path: deps/data/turtle-soup-used.json
 
   # 进行中多久没有新问题就自动结束，单位秒
   idle_timeout_seconds: 600

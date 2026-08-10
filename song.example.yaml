@@ -27,7 +27,7 @@ song_dedup:
   console_bypass: true
 
   # 长时间同歌去重历史持久化路径
-  history_path: data/song-dedup-history.json
+  history_path: deps/data/song-dedup-history.json
 
 song_review:
 

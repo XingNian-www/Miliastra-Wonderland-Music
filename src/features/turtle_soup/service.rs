@@ -65,8 +65,8 @@ impl Default for TurtleSoupConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            question_bank_path: PathBuf::from("turtle_soup.yaml"),
-            used_state_path: PathBuf::from("data/turtle-soup-used.json"),
+            question_bank_path: PathBuf::from("deps/turtle_soup.yaml"),
+            used_state_path: PathBuf::from("deps/data/turtle-soup-used.json"),
             idle_timeout_seconds: 600,
             max_session_seconds: 3600,
             max_concurrency: 4,

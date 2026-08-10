@@ -35,7 +35,7 @@ openvino:
 
   # OpenVINO GPU/CPU 编译缓存；首次启动会预热聊天 OCR 的固定形状，后续启动可避免重复编译。
   # 设置为 null 可关闭缓存。
-  cache_dir: data/openvino-cache
+  cache_dir: deps/data/openvino-cache
 
 # 检测模型最长边限制；保持 960 与 PaddleOCR/BetterGI 常用配置一致
 det_max_side_len: 960

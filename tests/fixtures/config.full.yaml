@@ -346,8 +346,8 @@ playback:
     enabled: true
     # 缓存根目录；为空时使用系统临时目录
     directory: ""
-    # 磁盘占用上限，单位 MiB
-    max_bytes_mb: 2048
+    # 磁盘占用上限，单位 MiB（20 GiB）
+    max_bytes_mb: 20480
     # 同时进行的源站下载任务上限
     max_concurrent_downloads: 2
     # 源站连接/响应超时，单位毫秒
@@ -395,7 +395,7 @@ queue:
   # 队列最大长度
   max_size: 5
   # 播放池最大容量；已确认播放过的点歌会进入播放池，队列播完后从播放池随机播放；0 表示禁用播放池
-  pool_max_size: 200
+  pool_max_size: 1000
   # 机器人确认播放的歌曲是否保护；true 时新点歌会排队，未结束只能用 @下一首 提前切换；歌曲播完由自然结束自动出队
   protect_current_song_until_finished: true
   # 非点歌歌曲连续正常播放多少秒后加入当前歌曲保护；0 表示外部播放永不保护

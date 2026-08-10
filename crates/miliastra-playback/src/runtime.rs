@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
@@ -23,9 +23,13 @@ use crate::domain::{
 };
 use crate::engine::{FfmpegConfig, FfmpegEngine};
 use crate::lyrics::TimedLyrics;
-use crate::model::{PlayableTrack, SearchCandidate, SearchQuery};
+use crate::model::{PlayableTrack, SearchCandidate, SearchQuery, TrackKey};
 
 const COMMAND_CAPACITY: usize = 32;
+/// 预加载任务最大并发数：超出部分进入等待队列，避免无界 tokio::spawn。
+const PRELOAD_CONCURRENCY_LIMIT: usize = 4;
+/// 预加载等待队列长度上限：队列满时丢弃新的预加载请求（fire-and-forget）。
+const PRELOAD_QUEUE_LIMIT: usize = 32;
 const SOURCE_TIMEOUT: Duration = Duration::from_secs(15);
 const REFRESH_CHECK_INTERVAL_MS: u64 = 24 * 60 * 60 * 1000;
 const REFRESH_FAILURE_BACKOFF_MS: u64 = 15 * 60 * 1000;
@@ -163,6 +167,8 @@ enum Command {
     LoginStatus(Reply<LoginStatus>),
     CompleteLogin(Uuid, ProviderCredential, Reply<CredentialStatus>),
     CancelLogin(Uuid, Reply<()>),
+    /// 删除曲目音频缓存（解码失败后自愈，下次播放重新下载）。
+    InvalidateAudioCache(crate::domain::SongKey, Reply<()>),
     Shutdown(Reply<()>),
 }
 
@@ -209,6 +215,7 @@ enum RuntimeEvent {
     PlayCompleted(Result<PlayCompletion, JoinError>),
     LoginValidationCompleted(Option<Result<(TaskId, LoginValidationCompletion), JoinError>>),
     SearchCompleted(Option<Result<(), JoinError>>),
+    PreloadCompleted(Option<Result<(TaskId, TrackKey), JoinError>>),
 }
 
 impl LyricState {
@@ -403,6 +410,14 @@ impl PlaybackHandle {
 
     pub fn cancel_login(&self, session_id: Uuid) -> Result<(), PlaybackError> {
         self.request(|reply| Command::CancelLogin(session_id, reply))
+    }
+
+    /// 删除曲目的音频缓存（解码失败后自愈：下次播放重新下载）。
+    pub fn invalidate_audio_cache(&self, key: &TrackKey) -> Result<(), PlaybackError> {
+        let song_key = key
+            .to_song_key()
+            .map_err(|error| PlaybackError::Internal(error.to_string()))?;
+        self.request(|reply| Command::InvalidateAudioCache(song_key, reply))
     }
 
     fn shutdown_runtime(&self) -> Result<(), PlaybackError> {
@@ -600,6 +615,14 @@ async fn run_commands(
     let mut pending_login: Option<PendingLoginValidation> = None;
     let mut searches = JoinSet::new();
     let mut login_validations = JoinSet::new();
+    // 预加载任务管理：JoinSet 统一跟踪、可整体取消；in-flight 集合实现
+    // 按曲目单飞（重复请求合并）；等待队列配合并发上限限流。
+    let mut preloads = JoinSet::new();
+    let mut preload_inflight: HashSet<TrackKey> = HashSet::new();
+    // 预加载任务 id -> 曲目 key：任务 panic/取消时 JoinError 不携带结果，
+    // 必须按 id 找回 key 才能释放对应 in-flight 标记，防止该曲目被永久堵住。
+    let mut preload_task_keys: HashMap<TaskId, TrackKey> = HashMap::new();
+    let mut pending_preloads: VecDeque<PlayableTrack> = VecDeque::new();
     let mut refresh_tick = tokio::time::interval(Duration::from_secs(60));
     refresh_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -609,6 +632,10 @@ async fn run_commands(
                 completion = &mut play.task => RuntimeEvent::PlayCompleted(completion),
                 completion = login_validations.join_next_with_id(), if !login_validations.is_empty() => {
                     RuntimeEvent::LoginValidationCompleted(completion)
+                }
+                // 预加载完成事件优先于新命令：防止持续命令流饿死 in-flight 释放。
+                completion = preloads.join_next_with_id(), if !preloads.is_empty() => {
+                    RuntimeEvent::PreloadCompleted(completion)
                 }
                 command = commands.recv() => RuntimeEvent::Command(command),
                 _ = refresh_tick.tick() => RuntimeEvent::RefreshTick,
@@ -621,6 +648,10 @@ async fn run_commands(
                 biased;
                 completion = login_validations.join_next_with_id(), if !login_validations.is_empty() => {
                     RuntimeEvent::LoginValidationCompleted(completion)
+                }
+                // 预加载完成事件优先于新命令：防止持续命令流饿死 in-flight 释放。
+                completion = preloads.join_next_with_id(), if !preloads.is_empty() => {
+                    RuntimeEvent::PreloadCompleted(completion)
                 }
                 command = commands.recv() => RuntimeEvent::Command(command),
                 _ = refresh_tick.tick() => RuntimeEvent::RefreshTick,
@@ -641,6 +672,10 @@ async fn run_commands(
                 );
                 searches.abort_all();
                 login_validations.abort_all();
+                preloads.abort_all();
+                pending_preloads.clear();
+                preload_inflight.clear();
+                preload_task_keys.clear();
                 clear_lyric_state(&mut lyric_state);
                 return None;
             }
@@ -649,6 +684,36 @@ async fn run_commands(
                 continue;
             }
             RuntimeEvent::SearchCompleted(_) => continue,
+            RuntimeEvent::PreloadCompleted(completion) => {
+                match completion {
+                    Some(Ok((task_id, key))) => {
+                        // 任务正常完成：释放 in-flight 标记，同曲目可再次预加载。
+                        preload_inflight.remove(&key);
+                        preload_task_keys.remove(&task_id);
+                    }
+                    Some(Err(error)) => {
+                        // panic/取消：JoinError 不携带任务结果，按 TaskId 找回曲目 key
+                        // 并释放 in-flight 标记；否则该 key 会被永久堵住，同曲目再也
+                        // 无法预加载。
+                        if let Some(key) = preload_task_keys.remove(&error.id()) {
+                            preload_inflight.remove(&key);
+                        }
+                        if !error.is_cancelled() {
+                            tracing::warn!(%error, "预加载任务异常结束");
+                        }
+                    }
+                    // 空完成只出现在 JoinSet 清空后，关闭路径已整体清理，无需恢复标记。
+                    None => {}
+                }
+                // 完成的任务空出槽位：按序启动等待队列中的下一个预加载。
+                start_pending_preloads(
+                    &mut pending_preloads,
+                    &mut preloads,
+                    &mut preload_task_keys,
+                    &core,
+                );
+                continue;
+            }
             RuntimeEvent::RefreshTick => {
                 refresh_due_credentials(&core, &credentials).await;
                 continue;
@@ -728,16 +793,27 @@ async fn run_commands(
                 });
             }
             Command::Preload(track) => {
-                let Ok(key) = track.track_ref.key.to_song_key() else {
+                let key = track.track_ref.key.clone();
+                let Ok(_) = key.to_song_key() else {
                     continue;
                 };
-                let resolver_locator = track.track_ref.resolver_locator.clone();
-                let preload_core = core.clone();
-                tokio::spawn(async move {
-                    if let Err(error) = preload_core.preload(key, resolver_locator).await {
-                        tracing::debug!(%error, "音源预加载失败，播放时将重新解析");
-                    }
-                });
+                // 单飞：同一曲目已在运行或排队时，合并重复请求。
+                if !preload_inflight.insert(key.clone()) {
+                    continue;
+                }
+                // 等待队列满时丢弃新请求（fire-and-forget，失败静默）。
+                if pending_preloads.len() >= PRELOAD_QUEUE_LIMIT {
+                    preload_inflight.remove(&key);
+                    tracing::debug!(?key, "预加载等待队列已满，丢弃请求");
+                    continue;
+                }
+                pending_preloads.push_back(track);
+                start_pending_preloads(
+                    &mut pending_preloads,
+                    &mut preloads,
+                    &mut preload_task_keys,
+                    &core,
+                );
             }
             Command::Play(track, reply) => {
                 let key = track.track_ref.key.to_song_key();
@@ -945,6 +1021,13 @@ async fn run_commands(
                 core.release_login(session_id);
                 let _ = reply.send(Ok(()));
             }
+            Command::InvalidateAudioCache(key, reply) => {
+                let invalidated = core.invalidate_audio_cache(&key).await;
+                let _ = reply.send(Ok(()));
+                if invalidated {
+                    tracing::info!("已清除音频缓存: {key}");
+                }
+            }
             Command::Shutdown(reply) => {
                 cancel_pending_play(
                     &mut pending_play,
@@ -958,10 +1041,44 @@ async fn run_commands(
                 );
                 searches.abort_all();
                 login_validations.abort_all();
+                preloads.abort_all();
+                pending_preloads.clear();
+                preload_inflight.clear();
+                preload_task_keys.clear();
                 clear_lyric_state(&mut lyric_state);
                 return Some(reply);
             }
         }
+    }
+}
+
+/// 从等待队列启动预加载任务，直到并发数达到上限。
+/// 任务统一放入 `JoinSet`：关闭时可整体取消，完成事件由事件循环处理。
+fn start_pending_preloads(
+    pending: &mut VecDeque<PlayableTrack>,
+    preloads: &mut JoinSet<TrackKey>,
+    preload_task_keys: &mut HashMap<TaskId, TrackKey>,
+    core: &PlaybackCore,
+) {
+    // 先检查空位再弹出：达到上限时保留队列中的任务，等待后续空位。
+    while !pending.is_empty() && preloads.len() < PRELOAD_CONCURRENCY_LIMIT {
+        let track = pending.pop_front().expect("等待队列非空");
+        let key = track.track_ref.key.clone();
+        let Ok(song_key) = key.to_song_key() else {
+            continue;
+        };
+        let resolver_locator = track.track_ref.resolver_locator.clone();
+        let preload_core = core.clone();
+        // 任务返回曲目 key：完成事件据此释放 in-flight 标记。
+        let task_key = key.clone();
+        let abort = preloads.spawn(async move {
+            if let Err(error) = preload_core.preload(song_key, resolver_locator).await {
+                tracing::debug!(%error, "音源预加载失败，播放时将重新解析");
+            }
+            task_key
+        });
+        // 记录任务 id -> 曲目 key：任务 panic/取消时按 id 找回 key 释放 in-flight。
+        preload_task_keys.insert(abort.id(), key);
     }
 }
 
@@ -1286,6 +1403,7 @@ impl From<PlaybackCoreError> for PlaybackError {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
@@ -1426,9 +1544,82 @@ mod tests {
         release_search: Notify,
     }
 
+    /// 预加载测试用假源：resolve 进入时计数、可阻塞，逐个释放后计数完成；
+    /// `fail_mode` 为 true 时 resolve 直接失败（不阻塞、不写解析缓存）。
+    struct GatedResolveSource {
+        resolve_entries: Arc<AtomicUsize>,
+        resolve_completed: Arc<AtomicUsize>,
+        release_resolve: Arc<Notify>,
+        fail_mode: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl SourceAdapter for GatedResolveSource {
+        async fn search(
+            &self,
+            _spec: &SearchSpec,
+        ) -> Result<Vec<ProviderSearchCandidate>, CatalogError> {
+            Ok(Vec::new())
+        }
+
+        async fn resolve(
+            &self,
+            _key: &SongKey,
+            _locator: Option<&crate::domain::ResolverLocator>,
+        ) -> Result<StreamSource, CatalogError> {
+            self.resolve_entries.fetch_add(1, Ordering::SeqCst);
+            if self.fail_mode.load(Ordering::SeqCst) {
+                return Err(CatalogError::Unavailable("gated failure".to_owned()));
+            }
+            self.release_resolve.notified().await;
+            self.resolve_completed.fetch_add(1, Ordering::SeqCst);
+            Ok(StreamSource {
+                url: Url::parse("https://example.test/audio.m4a").unwrap(),
+                headers: BTreeMap::new(),
+                expires_at_epoch_ms: None,
+            })
+        }
+    }
+
     struct BlockingCredentialSource {
         validation_started: Mutex<Option<std_mpsc::SyncSender<()>>>,
         release_validation: Notify,
+    }
+
+    /// 预加载 panic 测试用假源：首次 resolve 直接 panic（模拟任务异常），
+    /// 之后 resolve 阻塞等待释放（用于验证 panic 后同曲目可再次预加载）。
+    struct PanicResolveSource {
+        resolve_entries: Arc<AtomicUsize>,
+        release_resolve: Arc<Notify>,
+        panic_mode: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl SourceAdapter for PanicResolveSource {
+        async fn search(
+            &self,
+            _spec: &SearchSpec,
+        ) -> Result<Vec<ProviderSearchCandidate>, CatalogError> {
+            Ok(Vec::new())
+        }
+
+        async fn resolve(
+            &self,
+            _key: &SongKey,
+            _locator: Option<&crate::domain::ResolverLocator>,
+        ) -> Result<StreamSource, CatalogError> {
+            self.resolve_entries.fetch_add(1, Ordering::SeqCst);
+            // 仅首次 panic；panic 后自动退出 panic 模式，后续解析正常执行。
+            if self.panic_mode.swap(false, Ordering::SeqCst) {
+                panic!("模拟预加载任务 panic");
+            }
+            self.release_resolve.notified().await;
+            Ok(StreamSource {
+                url: Url::parse("https://example.test/audio.m4a").unwrap(),
+                headers: BTreeMap::new(),
+                expires_at_epoch_ms: None,
+            })
+        }
     }
 
     #[async_trait]
@@ -1650,6 +1841,216 @@ mod tests {
             handle: PlaybackHandle { commands },
             thread: Some(thread),
         }
+    }
+
+    /// 构造测试曲目。
+    fn playable_track(id: &str) -> PlayableTrack {
+        PlayableTrack {
+            track_ref: crate::model::TrackRef {
+                key: crate::model::TrackKey::new(ProviderId::QqMusic, id).unwrap(),
+                resolver_locator: None,
+            },
+            metadata: crate::model::TrackMetadata {
+                title: id.to_owned(),
+                artists: vec!["artist".to_owned()],
+                album: None,
+                duration_ms: Some(10_000),
+            },
+        }
+    }
+
+    /// 轮询等待条件成立，超时返回 false。
+    fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if condition() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        condition()
+    }
+
+    #[test]
+    fn duplicate_preloads_are_coalesced_and_slot_released_on_completion() {
+        let entries = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(Notify::new());
+        // 首次解析失败（不写解析缓存），使「任务完成后同曲目再次解析」可观测。
+        let fail_mode = Arc::new(AtomicBool::new(true));
+        let runtime = test_runtime_with_source(Arc::new(GatedResolveSource {
+            resolve_entries: entries.clone(),
+            resolve_completed: completed.clone(),
+            release_resolve: release.clone(),
+            fail_mode: fail_mode.clone(),
+        }));
+        let handle = runtime.handle();
+
+        // 同一曲目连续预加载三次：单飞合并，只启动一次解析。
+        let track = playable_track("track-dup");
+        handle.preload(track.clone()).unwrap();
+        handle.preload(track.clone()).unwrap();
+        handle.preload(track).unwrap();
+        assert!(wait_until(Duration::from_secs(1), || entries
+            .load(Ordering::SeqCst)
+            >= 1));
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(entries.load(Ordering::SeqCst), 1, "重复请求应被合并");
+
+        // 首个任务（失败）完成后 in-flight 标记释放：同曲目再次预加载被接受并重新解析。
+        // 轮询重发：in-flight 释放前的请求仍会被合并丢弃。
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline && entries.load(Ordering::SeqCst) < 2 {
+            match handle.preload(playable_track("track-dup")) {
+                Ok(()) | Err(PlaybackError::Busy) => {}
+                Err(error) => panic!("预加载命令发送失败: {error:?}"),
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            entries.load(Ordering::SeqCst) >= 2,
+            "任务完成后应释放 in-flight，同曲目可再次预加载"
+        );
+
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn preloads_respect_concurrency_limit_and_drain_queue_on_completion() {
+        let entries = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(Notify::new());
+        let runtime = test_runtime_with_source(Arc::new(GatedResolveSource {
+            resolve_entries: entries.clone(),
+            resolve_completed: completed.clone(),
+            release_resolve: release.clone(),
+            fail_mode: Arc::new(AtomicBool::new(false)),
+        }));
+        let handle = runtime.handle();
+
+        // 发送超过并发上限的不同曲目：多余请求进入等待队列。
+        let total = PRELOAD_CONCURRENCY_LIMIT + 2;
+        for index in 0..total {
+            handle
+                .preload(playable_track(&format!("track-{index}")))
+                .unwrap();
+        }
+        assert!(wait_until(Duration::from_secs(1), || entries
+            .load(Ordering::SeqCst)
+            >= PRELOAD_CONCURRENCY_LIMIT));
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            entries.load(Ordering::SeqCst),
+            PRELOAD_CONCURRENCY_LIMIT,
+            "超出上限的预加载必须排队等待"
+        );
+
+        // 排队中的曲目重复预加载：同样合并，不重复解析。
+        handle
+            .preload(playable_track(&format!(
+                "track-{}",
+                PRELOAD_CONCURRENCY_LIMIT
+            )))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(entries.load(Ordering::SeqCst), PRELOAD_CONCURRENCY_LIMIT);
+
+        // 逐个释放：完成的任务空出槽位，等待队列按序启动。
+        for expected in (PRELOAD_CONCURRENCY_LIMIT + 1)..=total {
+            release.notify_one();
+            assert!(
+                wait_until(Duration::from_secs(1), || {
+                    entries.load(Ordering::SeqCst) >= expected
+                }),
+                "任务完成后应启动队列中的下一个预加载"
+            );
+        }
+        // 释放剩余全部任务，等待全部完成。
+        for _ in 0..PRELOAD_CONCURRENCY_LIMIT {
+            release.notify_one();
+        }
+        assert!(wait_until(Duration::from_secs(1), || completed
+            .load(Ordering::SeqCst)
+            >= total));
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            entries.load(Ordering::SeqCst),
+            total,
+            "不得重复解析同一曲目"
+        );
+
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn panicked_preload_releases_inflight_so_the_key_can_be_preloaded_again() {
+        let entries = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(Notify::new());
+        let runtime = test_runtime_with_source(Arc::new(PanicResolveSource {
+            resolve_entries: entries.clone(),
+            release_resolve: release.clone(),
+            panic_mode: Arc::new(AtomicBool::new(true)),
+        }));
+        let handle = runtime.handle();
+
+        // 首次预加载：任务 panic（JoinError 且未取消）。in-flight 标记必须被释放，
+        // 否则该曲目被永久堵住，同曲目再也无法预加载。
+        handle.preload(playable_track("track-panic")).unwrap();
+        assert!(wait_until(Duration::from_secs(1), || entries
+            .load(Ordering::SeqCst)
+            >= 1));
+
+        // 轮询重发同曲目：panic 任务的完成事件被事件循环处理后 in-flight 释放，
+        // 第二次解析被接受并启动（阻塞等待释放）。
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline && entries.load(Ordering::SeqCst) < 2 {
+            match handle.preload(playable_track("track-panic")) {
+                Ok(()) | Err(PlaybackError::Busy) => {}
+                Err(error) => panic!("预加载命令发送失败: {error:?}"),
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            entries.load(Ordering::SeqCst) >= 2,
+            "预加载任务 panic 后应释放 in-flight，同曲目可再次预加载"
+        );
+
+        // 释放第二次解析，随后关闭（关闭取消仍在运行的任务，不等待阻塞）。
+        release.notify_one();
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn shutdown_aborts_in_flight_and_queued_preloads() {
+        let entries = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(Notify::new());
+        let runtime = test_runtime_with_source(Arc::new(GatedResolveSource {
+            resolve_entries: entries.clone(),
+            resolve_completed: Arc::new(AtomicUsize::new(0)),
+            release_resolve: release.clone(),
+            fail_mode: Arc::new(AtomicBool::new(false)),
+        }));
+        let handle = runtime.handle();
+
+        // 一个任务运行中阻塞，两个请求排队。
+        handle.preload(playable_track("track-a")).unwrap();
+        handle.preload(playable_track("track-b")).unwrap();
+        handle.preload(playable_track("track-c")).unwrap();
+        assert!(wait_until(Duration::from_secs(1), || entries
+            .load(Ordering::SeqCst)
+            >= 1));
+
+        // 关闭时取消运行中的任务并丢弃排队请求，不等待阻塞中的解析。
+        let started = std::time::Instant::now();
+        runtime.shutdown().unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "关闭不得等待阻塞中的预加载"
+        );
+        assert!(matches!(
+            handle.preload(playable_track("track-d")),
+            Err(PlaybackError::RuntimeStopped)
+        ));
     }
 
     #[test]

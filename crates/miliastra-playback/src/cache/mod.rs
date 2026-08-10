@@ -20,8 +20,8 @@ use crate::domain::{SongKey, StreamSource};
 /// 代理 URL 的路径前缀。
 pub(crate) const PROXY_PATH_PREFIX: &str = "/audio/";
 
-/// 默认磁盘缓存上限。
-pub const DEFAULT_MAX_CACHE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// 默认磁盘缓存上限（20 GiB）。
+pub const DEFAULT_MAX_CACHE_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct AudioCacheConfig {
@@ -204,6 +204,130 @@ impl AudioCache {
     /// 停止代理服务器（进程退出时调用）。
     pub async fn shutdown(&self) {
         let _ = self.inner.shutdown.send_replace(true);
+    }
+
+    /// 删除曲目的缓存条目与磁盘文件（播放解码失败后自愈：下次播放重新下载）。
+    /// 下载进行中的任务会被标记失败并自行清理残留。
+    pub async fn invalidate(&self, key: &SongKey) -> bool {
+        let inner = &self.inner;
+        if !inner.config.enabled {
+            return false;
+        }
+        let hash = cache_key_hash(key);
+        let mut entries = inner.entries.write().await;
+        let Some(entry) = entries.remove(&hash) else {
+            return false;
+        };
+        if let EntryState::Downloading(handle) = &entry.state {
+            handle.failed.store(true, Ordering::SeqCst);
+            handle.ready.notify_waiters();
+        }
+        let _ = std::fs::remove_file(&entry.file);
+        let _ = std::fs::remove_file(entry.file.with_extension("complete"));
+        true
+    }
+
+    /// 主动下载曲目音源到缓存（播放成功后的后台预热）。
+    /// 条目必须先经 `rewrite` 注册；下载失败静默，条目保持 Idle 等待下次代理请求重试。
+    pub async fn prefetch(&self, key: &SongKey) -> bool {
+        let inner = &self.inner;
+        if !inner.config.enabled {
+            return false;
+        }
+        let hash = cache_key_hash(key);
+        match download::start_download(inner, &hash).await {
+            Some(download::DownloadView::Complete { .. })
+            | Some(download::DownloadView::InProgress(_)) => true,
+            None => false,
+        }
+    }
+
+    /// 读取曲目的缓存歌词（未命中或无歌词缓存返回 None）。
+    pub async fn get_lyrics(&self, key: &SongKey) -> Option<crate::lyrics::TimedLyrics> {
+        let inner = &self.inner;
+        if !inner.config.enabled {
+            return None;
+        }
+        let path = lyrics_file(&inner.config.directory, key);
+        let bytes = tokio::fs::read(&path).await.ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    /// 写入曲目的歌词缓存（跟随音频缓存的启用状态、目录与容量上限）。
+    pub async fn put_lyrics(&self, key: &SongKey, lyrics: &crate::lyrics::TimedLyrics) -> bool {
+        let inner = &self.inner;
+        if !inner.config.enabled {
+            return false;
+        }
+        let Ok(bytes) = serde_json::to_vec(lyrics) else {
+            return false;
+        };
+        let directory = inner.config.directory.join("lyrics");
+        if std::fs::create_dir_all(&directory).is_err() {
+            return false;
+        }
+        let path = lyrics_file(&inner.config.directory, key);
+        if tokio::fs::write(&path, bytes).await.is_err() {
+            return false;
+        }
+        trim_lyrics_directory(
+            &directory,
+            inner.config.max_bytes,
+            inner.config.max_registry_entries,
+        );
+        true
+    }
+}
+
+/// 歌词缓存目录内的文件路径。
+fn lyrics_file(directory: &Path, key: &SongKey) -> PathBuf {
+    directory
+        .join("lyrics")
+        .join(format!("{}.json", cache_key_hash(key)))
+}
+
+/// 歌词缓存上限与音频缓存保持一致：
+/// 字节上限 `max_bytes`、文件数量上限 `max_registry_entries`；
+/// 任一超限时按修改时间删除最旧文件。
+fn trim_lyrics_directory(directory: &Path, max_bytes: u64, max_entries: usize) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    let mut files: Vec<(PathBuf, u64, u64)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().is_none_or(|ext| ext != "json") {
+                return None;
+            }
+            let Ok(metadata) = path.metadata() else {
+                return None;
+            };
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .map(|duration| duration.as_secs())
+                .unwrap_or(0);
+            Some((path, metadata.len(), modified))
+        })
+        .collect();
+    let mut total: u64 = files.iter().map(|(_, size, _)| *size).sum();
+    if files.len() <= max_entries && total <= max_bytes {
+        return;
+    }
+    files.sort_by_key(|(_, _, modified)| *modified);
+    let mut remaining = files.len();
+    for (path, size, _) in files {
+        let over_entries = remaining > max_entries;
+        let over_bytes = total > max_bytes;
+        if !over_entries && !over_bytes {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            total = total.saturating_sub(size);
+            remaining -= 1;
+        }
     }
 }
 

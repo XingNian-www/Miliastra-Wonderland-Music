@@ -105,13 +105,7 @@ struct PrimaryTrackedMessage {
 }
 
 struct PrimaryRebaseCandidate {
-    messages: Vec<PrimaryRebaseMessage>,
-    stable_samples: u32,
-}
-
-struct PrimaryRebaseMessage {
-    message_type: String,
-    text_key: String,
+    lost_samples: u32,
 }
 
 #[derive(Clone)]
@@ -528,35 +522,18 @@ fn handle_primary_lost_overlap(
     state: &mut ChatObservationState,
     messages: Vec<ChatMessage>,
 ) -> Vec<PrimaryObservedMessage> {
-    let candidate_matches = state
+    let lost_samples = state
         .primary_rebase_candidate
         .as_ref()
-        .is_some_and(|candidate| primary_rebase_matches(candidate, &messages));
-    if candidate_matches {
-        let candidate = state
-            .primary_rebase_candidate
-            .as_mut()
-            .expect("matching rebase candidate exists");
-        candidate.stable_samples = candidate.stable_samples.saturating_add(1);
-        if candidate.stable_samples >= PRIMARY_REBASE_STABLE_SAMPLES {
-            log::warn!(
-                "一级聊天连续 {} 次无法与旧画面对应，已把当前画面作为新基线；旧消息按内容保留状态，新消息等待识别",
-                candidate.stable_samples
-            );
-            return rebase_primary_baseline(state, messages);
-        }
-    } else {
-        state.primary_rebase_candidate = Some(PrimaryRebaseCandidate {
-            messages: messages
-                .iter()
-                .map(|message| PrimaryRebaseMessage {
-                    message_type: message.message_type.clone(),
-                    text_key: normalize_primary_text(&message.text),
-                })
-                .collect(),
-            stable_samples: 1,
-        });
+        .map_or(1, |candidate| candidate.lost_samples.saturating_add(1));
+    if lost_samples >= PRIMARY_REBASE_STABLE_SAMPLES {
+        log::warn!(
+            "一级聊天连续 {} 次无法与旧画面对应，已把当前画面作为新基线；旧消息按内容保留状态，新消息立即识别",
+            lost_samples
+        );
+        return rebase_primary_baseline(state, messages);
     }
+    state.primary_rebase_candidate = Some(PrimaryRebaseCandidate { lost_samples });
     log::debug!("一级聊天当前画面无法与旧画面可靠对应，暂不更新基线，等待重扫");
     Vec::new()
 }
@@ -686,22 +663,6 @@ fn primary_ocr_sequence_score<'a>(
         }
     }
     score
-}
-
-fn primary_rebase_matches(candidate: &PrimaryRebaseCandidate, current: &[ChatMessage]) -> bool {
-    if candidate.messages.len() != current.len() {
-        return false;
-    }
-    primary_ocr_sequence_score(candidate.messages.iter().zip(current).map(|(left, right)| {
-        (
-            left.message_type.as_str(),
-            left.text_key.as_str(),
-            true,
-            right.message_type.as_str(),
-            normalize_primary_text(&right.text),
-        )
-    }))
-    .is_reliable()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1008,6 +969,37 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![true, false]
         );
+    }
+
+    #[test]
+    fn primary_rebase_does_not_wait_for_two_identical_lost_frames() {
+        let shared = ChatObservationShared::new();
+        publish_primary(
+            &shared,
+            vec![message_at("消息1", 0, 10), message_at("消息2", 20, 20)],
+        );
+
+        let first_lost = publish_primary(
+            &shared,
+            vec![
+                message_at("旧画面已滚出", 0, 30),
+                message_at("临时识别", 20, 40),
+            ],
+        );
+        assert!(primary_messages(&first_lost).is_empty());
+
+        let second_lost = publish_primary(
+            &shared,
+            vec![
+                message_at("另一个新消息", 0, 50),
+                message_at("用户：@状态", 20, 60),
+            ],
+        );
+        let messages = primary_messages(&second_lost);
+
+        assert_eq!(messages.len(), 2);
+        assert!(messages.iter().all(|message| message.is_new));
+        assert_eq!(messages[1].message.text, "用户：@状态");
     }
 
     #[test]

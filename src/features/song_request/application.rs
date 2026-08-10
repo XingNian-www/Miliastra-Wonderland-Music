@@ -264,6 +264,7 @@ impl ResolvedSongRequest {
             requester: self.requester.clone(),
             console_bypass_dedup: self.console_bypass_dedup,
             candidate_snapshot: self.candidate_snapshot.clone(),
+            queue_item_id: None,
         }
     }
 
@@ -1422,6 +1423,7 @@ mod tests {
             requester: "Alice".to_string(),
             navigation: crate::features::playback::PlaybackNavigation::Normal,
             candidate_snapshot: Vec::new(),
+            queue_item_id: None,
         });
 
         application()

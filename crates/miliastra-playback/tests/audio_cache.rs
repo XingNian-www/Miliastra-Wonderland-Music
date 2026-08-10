@@ -233,3 +233,198 @@ async fn rewrite_points_to_local_proxy_and_preserves_source_headers() {
     cache.shutdown().await;
     let _ = std::fs::remove_dir_all(&directory);
 }
+
+/// 源站声明 Content-Length 但提前正常关闭：下载必须判失败，
+/// 残缺文件不得被当作完整缓存（否则每次播放都会提前 EOF）。
+#[tokio::test]
+async fn truncated_origin_response_is_not_marked_complete() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let body: Vec<u8> = vec![9u8; 4096];
+    tokio::spawn({
+        let attempts = attempts.clone();
+        let body = body.clone();
+        async move {
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    continue;
+                };
+                let mut buffer = [0u8; 2048];
+                let _ = stream.read(&mut buffer).await;
+                let n = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                if n == 0 {
+                    // 第一次：只发 100 字节就正常关闭连接（截断响应）。
+                    let _ = stream.write_all(&body[..100]).await;
+                } else {
+                    let _ = stream.write_all(&body).await;
+                }
+            }
+        }
+    });
+
+    let directory = std::env::temp_dir().join(format!(
+        "miliastra-audio-cache-test-trunc-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&directory);
+    let cache = AudioCache::spawn(cache_config(directory.clone()))
+        .await
+        .expect("缓存启动");
+    let key = SongKey::new("qq", "e2e-trunc").unwrap();
+    let rewritten = cache
+        .rewrite(&key, sample_stream(format!("http://{addr}/audio.mp3")))
+        .await;
+
+    // 第一次请求：截断数据不应被视为完整缓存。
+    let _ = reqwest::get(rewritten.url.clone()).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // 第二次请求触发重新下载，应拿到完整数据。
+    let response = reqwest::get(rewritten.url).await.expect("重试请求");
+    let data = response.bytes().await.expect("读取重试响应");
+    assert_eq!(&data[..], &body[..]);
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+    cache.shutdown().await;
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// invalidate 删除缓存条目与磁盘文件；重新 rewrite 后再次播放会重新下载。
+#[tokio::test]
+async fn invalidate_removes_cache_entry_and_triggers_redownload() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let body: Vec<u8> = vec![3u8; 2048];
+    tokio::spawn({
+        let requests = requests.clone();
+        let body = body.clone();
+        async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    continue;
+                };
+                let mut buffer = [0u8; 2048];
+                let _ = stream.read(&mut buffer).await;
+                requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(&body).await;
+            }
+        }
+    });
+
+    let directory = std::env::temp_dir().join(format!(
+        "miliastra-audio-cache-test-inv-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&directory);
+    let cache = AudioCache::spawn(cache_config(directory.clone()))
+        .await
+        .expect("缓存启动");
+    let key = SongKey::new("qq", "e2e-inv").unwrap();
+
+    // 首次播放：完整下载。
+    let rewritten = cache
+        .rewrite(&key, sample_stream(format!("http://{addr}/a.mp3")))
+        .await;
+    let data = reqwest::get(rewritten.url)
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(&data[..], &body[..]);
+
+    // 清除缓存：条目与文件都被删除。
+    assert!(cache.invalidate(&key).await);
+    assert!(!cache.invalidate(&key).await, "重复清除应返回 false");
+
+    // 重新播放（重新 rewrite）：触发重新下载，数据完整。
+    let rewritten = cache
+        .rewrite(&key, sample_stream(format!("http://{addr}/a.mp3")))
+        .await;
+    let data = reqwest::get(rewritten.url)
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(&data[..], &body[..]);
+    assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+    cache.shutdown().await;
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// prefetch 主动下载后，代理直接服务完整文件（源站只被下载请求访问一次）。
+#[tokio::test]
+async fn prefetch_downloads_immediately_and_proxy_serves_from_disk() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let body: Vec<u8> = vec![5u8; 3072];
+    tokio::spawn({
+        let requests = requests.clone();
+        let body = body.clone();
+        async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    continue;
+                };
+                let mut buffer = [0u8; 2048];
+                let _ = stream.read(&mut buffer).await;
+                requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(&body).await;
+            }
+        }
+    });
+
+    let directory = std::env::temp_dir().join(format!(
+        "miliastra-audio-cache-test-prefetch-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&directory);
+    let cache = AudioCache::spawn(cache_config(directory.clone()))
+        .await
+        .expect("缓存启动");
+    let key = SongKey::new("qq", "e2e-prefetch").unwrap();
+    let rewritten = cache
+        .rewrite(&key, sample_stream(format!("http://{addr}/a.mp3")))
+        .await;
+
+    // 主动下载；下载完成后代理请求命中磁盘（不再次访问源站）。
+    assert!(cache.prefetch(&key).await);
+    let data = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Ok(response) = reqwest::get(rewritten.url.clone()).await
+                && let Ok(bytes) = response.bytes().await
+                && bytes.len() == body.len()
+            {
+                return bytes;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("等待下载完成并服务完整数据");
+    assert_eq!(&data[..], &body[..]);
+    assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    cache.shutdown().await;
+    let _ = std::fs::remove_dir_all(&directory);
+}

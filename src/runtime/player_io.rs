@@ -142,6 +142,8 @@ pub enum PlayerControl {
     Next,
     Previous,
     SetVolume(u8),
+    /// 删除曲目音频缓存（解码失败后自愈，下次播放重新下载）。
+    InvalidateAudioCache(miliastra_playback::TrackKey),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

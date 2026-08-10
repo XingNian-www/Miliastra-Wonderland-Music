@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde::Serialize;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use tokio::time::timeout;
 use uuid::Uuid;
 
@@ -223,6 +223,14 @@ impl PlaybackCore {
         self
     }
 
+    /// 删除曲目的音频缓存（播放解码失败后自愈：下次播放重新下载）。
+    pub async fn invalidate_audio_cache(&self, key: &SongKey) -> bool {
+        match &self.audio_cache {
+            Some(cache) => cache.invalidate(key).await,
+            None => false,
+        }
+    }
+
     /// 把音源改写为本地代理地址（若启用了音频缓存）。
     async fn route_stream(&self, song_key: &SongKey, stream: StreamSource) -> StreamSource {
         match &self.audio_cache {
@@ -351,7 +359,9 @@ impl PlaybackCore {
 
     /// 预加载音源：提前完成网络解析并写入缓存，`play` 时可跳过等待。
     ///
-    /// 只解析不启动引擎；失败时静默返回错误（播放路径会重新解析）。
+    /// 启用音频缓存时同时注册条目并主动下载音频数据：下一首播放时
+    /// 直接从磁盘服务，避免起播等待源站。只解析不启动引擎；失败时
+    /// 静默返回错误（播放路径会重新解析）。
     pub async fn preload(
         &self,
         song_key: SongKey,
@@ -364,7 +374,14 @@ impl PlaybackCore {
         let stream = self
             .resolve_stream(&song_key, resolver_locator.as_ref())
             .await?;
-        self.cache_stream(song_key, stream);
+        self.cache_stream(song_key.clone(), stream.clone());
+        // 音频数据预下载：播放时直接命中本地文件（下载失败静默，播放时走正常下载）。
+        if let Some(cache) = &self.audio_cache {
+            cache.rewrite(&song_key, stream).await;
+            if cache.prefetch(&song_key).await {
+                tracing::debug!(key = %song_key, "音频数据已开始预下载");
+            }
+        }
         Ok(())
     }
 
@@ -508,6 +525,12 @@ impl PlaybackCore {
         song_key: SongKey,
         resolver_locator: Option<ResolverLocator>,
     ) -> Result<Option<TimedLyrics>, PlaybackCoreError> {
+        // 缓存命中直接返回，避免重复请求平台歌词接口。
+        if let Some(cache) = &self.audio_cache
+            && let Some(lyrics) = cache.get_lyrics(&song_key).await
+        {
+            return Ok(Some(lyrics));
+        }
         if let Some(registry) = self.registry.as_ref() {
             registry
                 .require_enabled(&song_key.source)
@@ -517,13 +540,20 @@ impl PlaybackCore {
             .catalog
             .get(&song_key.source)
             .ok_or_else(|| PlaybackCoreError::UnknownSource(song_key.source.clone()))?;
-        timeout(
+        let result = timeout(
             self.source_timeout,
             adapter.lyrics(&song_key, resolver_locator.as_ref()),
         )
         .await
-        .map_err(|_| PlaybackCoreError::Catalog(CatalogError::TimedOut(song_key.source)))?
-        .map_err(PlaybackCoreError::Catalog)
+        .map_err(|_| PlaybackCoreError::Catalog(CatalogError::TimedOut(song_key.source.clone())))?
+        .map_err(PlaybackCoreError::Catalog);
+        // 网络成功且命中歌词：写入缓存（无歌词不缓存）。
+        if let Ok(Some(lyrics)) = &result
+            && let Some(cache) = &self.audio_cache
+        {
+            cache.put_lyrics(&song_key, lyrics).await;
+        }
+        result
     }
 
     pub async fn pause(&self, session: SessionRef) -> Result<(), PlaybackCoreError> {
@@ -717,6 +747,9 @@ impl PlaybackCore {
         Ok(requested_sources(&self.catalog, requested))
     }
 
+    /// 流类失败（StreamRejected/DecodeFailure）后自动重试：
+    /// 第一轮重新解析音源并走缓存代理（缓存优先）；
+    /// 第一轮刷新后仍失败，第二轮清除缓存并直连源站（跳过缓存）。
     fn spawn_stream_retry(
         &self,
         session_id: Uuid,
@@ -731,79 +764,29 @@ impl PlaybackCore {
         let audio_cache = self.audio_cache.clone();
         tokio::spawn(async move {
             let mut snapshots = engine.subscribe();
-            loop {
-                if latest_generation.load(Ordering::SeqCst) != generation {
-                    return;
-                }
-                let snapshot = snapshots.borrow_and_update().clone();
-                if snapshot.generation > generation
-                    || (snapshot.generation == generation
-                        && snapshot.session_id.is_some()
-                        && snapshot.session_id != Some(session_id))
-                {
-                    return;
-                }
-                if snapshot.generation == generation
-                    && snapshot.session_id == Some(session_id)
-                    && snapshot.state == EngineState::Failed
-                {
-                    if !matches!(
-                        snapshot.last_end_cause,
-                        Some(EndCause::StreamRejected | EndCause::DecodeFailure)
-                    ) {
-                        return;
-                    }
-                    break;
-                }
-                if snapshot.generation == generation
-                    && snapshot.session_id == Some(session_id)
-                    && snapshot.state == EngineState::Stopped
-                {
-                    return;
-                }
-                if snapshots.changed().await.is_err() {
-                    return;
-                }
-            }
-
-            let Some(adapter) = catalog.get(&song_key.source) else {
+            // 第一轮：缓存优先。
+            if !wait_for_stream_failure(&mut snapshots, &latest_generation, generation, session_id)
+                .await
+            {
                 return;
-            };
-            let stream = match timeout(
+            }
+            let Some(stream) = resolve_stream_retry(
+                &catalog,
+                &song_key,
+                resolver_locator.as_ref(),
                 source_timeout,
-                adapter.resolve(&song_key, resolver_locator.as_ref()),
             )
             .await
-            {
-                Ok(Ok(stream)) => stream,
-                Ok(Err(error)) => {
-                    tracing::warn!(%song_key, %error, "stream retry resolution failed");
-                    return;
-                }
-                Err(_) => {
-                    tracing::warn!(%song_key, "stream retry resolution timed out");
-                    return;
-                }
+            else {
+                return;
             };
-
-            if latest_generation.load(Ordering::SeqCst) != generation {
-                return;
-            }
-
-            let snapshot = engine.subscribe().borrow().clone();
-            if snapshot.generation != generation
-                || snapshot.session_id != Some(session_id)
-                || snapshot.state != EngineState::Failed
-                || !matches!(
-                    snapshot.last_end_cause,
-                    Some(EndCause::StreamRejected | EndCause::DecodeFailure)
-                )
+            if !generation_is_latest(&latest_generation, generation)
+                || !snapshot_is_stream_failure(&snapshots.borrow(), generation, session_id)
             {
                 return;
             }
-
-            // 重试音源同样改写为本地代理地址，保证与初始播放走同一缓存条目。
-            let stream = match audio_cache {
+            // 第一轮重试音源同样改写为本地代理地址，保证与初始播放走同一缓存条目。
+            let stream = match &audio_cache {
                 Some(cache) => cache.rewrite(&song_key, stream).await,
                 None => stream,
             };
@@ -817,8 +800,225 @@ impl PlaybackCore {
             {
                 tracing::warn!(%song_key, %error, "stream retry command failed");
             }
+            // 第二轮：跳过缓存——第一轮刷新后仍失败，清除缓存并直连源站。
+            if !wait_for_stream_failure_after_refresh(
+                &mut snapshots,
+                &latest_generation,
+                generation,
+                session_id,
+            )
+            .await
+            {
+                return;
+            }
+            if let Some(cache) = &audio_cache {
+                cache.invalidate(&song_key).await;
+            }
+            let Some(stream) = resolve_stream_retry(
+                &catalog,
+                &song_key,
+                resolver_locator.as_ref(),
+                source_timeout,
+            )
+            .await
+            else {
+                return;
+            };
+            if !generation_is_latest(&latest_generation, generation)
+                || !snapshot_is_stream_failure(&snapshots.borrow(), generation, session_id)
+            {
+                return;
+            }
+            // 直连源站：不再改写为缓存代理地址。
+            if let Err(error) = engine
+                .command(EngineCommand::RefreshStream {
+                    session_id,
+                    generation,
+                    stream: stream.clone(),
+                })
+                .await
+            {
+                tracing::warn!(%song_key, %error, "stream retry command failed");
+            }
+            // 直连播放成功后，把本次音源写回缓存（后台预热：下次播放直接命中）。
+            if let Some(cache) = audio_cache {
+                spawn_cache_prefetch(
+                    cache,
+                    engine,
+                    latest_generation,
+                    song_key,
+                    stream,
+                    generation,
+                    session_id,
+                );
+            }
         });
     }
+}
+
+/// 直连播放成功后把音源写回缓存：观察会话进入 Playing → rewrite 注册 → 主动下载。
+/// 播放失败/会话结束/超时则放弃（下次播放走正常缓存路径重新下载）。
+fn spawn_cache_prefetch(
+    cache: crate::cache::AudioCache,
+    engine: Arc<dyn AudioEngine>,
+    latest_generation: Arc<AtomicU64>,
+    song_key: SongKey,
+    stream: StreamSource,
+    generation: u64,
+    session_id: Uuid,
+) {
+    tokio::spawn(async move {
+        let mut snapshots = engine.subscribe();
+        if !wait_for_playing_after_refresh(
+            &mut snapshots,
+            &latest_generation,
+            generation,
+            session_id,
+        )
+        .await
+        {
+            return;
+        }
+        cache.rewrite(&song_key, stream).await;
+        if cache.prefetch(&song_key).await {
+            tracing::info!("直连播放成功后已写回音频缓存: {song_key}");
+        }
+    });
+}
+
+/// RefreshStream 生效后等待当前会话进入 Playing（直连播放成功）。
+/// 先消费刷新前的旧失败快照，避免把刷新前的状态当作本轮结果。
+async fn wait_for_playing_after_refresh(
+    snapshots: &mut watch::Receiver<PlaybackSnapshot>,
+    latest_generation: &AtomicU64,
+    generation: u64,
+    session_id: Uuid,
+) -> bool {
+    if snapshots.changed().await.is_err() {
+        return false;
+    }
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if latest_generation.load(Ordering::SeqCst) != generation {
+                return false;
+            }
+            let snapshot = snapshots.borrow_and_update().clone();
+            if snapshot.generation > generation
+                || (snapshot.generation == generation
+                    && snapshot.session_id.is_some()
+                    && snapshot.session_id != Some(session_id))
+            {
+                return false;
+            }
+            if snapshot.generation == generation && snapshot.session_id == Some(session_id) {
+                match snapshot.state {
+                    EngineState::Playing => return true,
+                    EngineState::Failed | EngineState::Stopped => return false,
+                    _ => {}
+                }
+            }
+            if snapshots.changed().await.is_err() {
+                return false;
+            }
+        }
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// 等待当前会话出现流类失败（StreamRejected/DecodeFailure）。
+/// 返回 true 表示可开始重试；会话结束/换代/其他失败 → false。
+async fn wait_for_stream_failure(
+    snapshots: &mut watch::Receiver<PlaybackSnapshot>,
+    latest_generation: &AtomicU64,
+    generation: u64,
+    session_id: Uuid,
+) -> bool {
+    loop {
+        if latest_generation.load(Ordering::SeqCst) != generation {
+            return false;
+        }
+        let snapshot = snapshots.borrow_and_update().clone();
+        if snapshot.generation > generation
+            || (snapshot.generation == generation
+                && snapshot.session_id.is_some()
+                && snapshot.session_id != Some(session_id))
+        {
+            return false;
+        }
+        if snapshot.generation == generation
+            && snapshot.session_id == Some(session_id)
+            && snapshot.state == EngineState::Failed
+        {
+            return matches!(
+                snapshot.last_end_cause,
+                Some(EndCause::StreamRejected | EndCause::DecodeFailure)
+            );
+        }
+        if snapshot.generation == generation
+            && snapshot.session_id == Some(session_id)
+            && snapshot.state == EngineState::Stopped
+        {
+            return false;
+        }
+        if snapshots.changed().await.is_err() {
+            return false;
+        }
+    }
+}
+
+/// RefreshStream 生效后的流失败观察：先消费刷新前的旧失败快照，
+/// 等待刷新产生的新状态变化后再判断，避免把刷新前的失败当作本轮结果。
+async fn wait_for_stream_failure_after_refresh(
+    snapshots: &mut watch::Receiver<PlaybackSnapshot>,
+    latest_generation: &AtomicU64,
+    generation: u64,
+    session_id: Uuid,
+) -> bool {
+    if snapshots.changed().await.is_err() {
+        return false;
+    }
+    wait_for_stream_failure(snapshots, latest_generation, generation, session_id).await
+}
+
+/// 重新解析音源（流重试用）；失败或超时返回 None。
+async fn resolve_stream_retry(
+    catalog: &SourceCatalog,
+    song_key: &SongKey,
+    resolver_locator: Option<&ResolverLocator>,
+    source_timeout: Duration,
+) -> Option<StreamSource> {
+    let adapter = catalog.get(&song_key.source)?;
+    match timeout(source_timeout, adapter.resolve(song_key, resolver_locator)).await {
+        Ok(Ok(stream)) => Some(stream),
+        Ok(Err(error)) => {
+            tracing::warn!(%song_key, %error, "stream retry resolution failed");
+            None
+        }
+        Err(_) => {
+            tracing::warn!(%song_key, "stream retry resolution timed out");
+            None
+        }
+    }
+}
+
+fn generation_is_latest(latest_generation: &AtomicU64, generation: u64) -> bool {
+    latest_generation.load(Ordering::SeqCst) == generation
+}
+
+/// 当前快照是否仍是「本会话的流类失败」状态（RefreshStream 前检查用）。
+fn snapshot_is_stream_failure(
+    snapshot: &PlaybackSnapshot,
+    generation: u64,
+    session_id: Uuid,
+) -> bool {
+    snapshot.generation == generation
+        && snapshot.session_id == Some(session_id)
+        && snapshot.state == EngineState::Failed
+        && matches!(
+            snapshot.last_end_cause,
+            Some(EndCause::StreamRejected | EndCause::DecodeFailure)
+        )
 }
 
 fn requested_sources(catalog: &SourceCatalog, requested: Vec<String>) -> Vec<String> {
@@ -901,6 +1101,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
     use tokio::sync::{Notify, watch};
     use url::Url;
 
@@ -993,11 +1195,28 @@ mod tests {
         commands: Mutex<Vec<EngineCommand>>,
         snapshot_tx: watch::Sender<PlaybackSnapshot>,
         snapshot: watch::Receiver<PlaybackSnapshot>,
+        /// RefreshStream 处理后发布流类失败（模拟第一轮刷新后仍失败，触发第二轮直连重试）。
+        refresh_fails_after: bool,
     }
 
     #[async_trait]
     impl AudioEngine for RecordingEngine {
         async fn command(&self, command: EngineCommand) -> Result<(), EngineError> {
+            if let EngineCommand::RefreshStream {
+                session_id,
+                generation,
+                ..
+            } = &command
+                && self.refresh_fails_after
+            {
+                self.snapshot_tx.send_replace(PlaybackSnapshot {
+                    generation: *generation,
+                    session_id: Some(*session_id),
+                    state: EngineState::Failed,
+                    last_end_cause: Some(EndCause::DecodeFailure),
+                    ..PlaybackSnapshot::default()
+                });
+            }
             self.commands.lock().unwrap().push(command);
             Ok(())
         }
@@ -1026,6 +1245,7 @@ mod tests {
             commands: Mutex::new(Vec::new()),
             snapshot_tx,
             snapshot,
+            refresh_fails_after: false,
         });
         (
             PlaybackCore::new(
@@ -1392,6 +1612,69 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn stream_retry_second_round_skips_cache_when_first_round_still_fails() {
+        // 第一轮刷新（缓存路径）后仍失败 → 第二轮重新解析并直连源站（跳过缓存）。
+        let source = Arc::new(RetrySource {
+            resolve_count: AtomicUsize::new(0),
+            seen_locators: Mutex::new(Vec::new()),
+        });
+        let (snapshot_tx, snapshot) = watch::channel(PlaybackSnapshot::default());
+        let engine = Arc::new(RecordingEngine {
+            commands: Mutex::new(Vec::new()),
+            snapshot_tx,
+            snapshot,
+            refresh_fails_after: true,
+        });
+        let core = PlaybackCore::new(
+            SourceCatalog::new([("tx".to_owned(), source.clone() as Arc<dyn SourceAdapter>)]),
+            engine.clone(),
+            Duration::from_secs(1),
+        );
+        let song_key = SongKey::new("tx", "song-1").unwrap();
+        let receipt = core
+            .play(song_key.clone(), None, EndBehavior::NotifyController)
+            .await
+            .unwrap();
+
+        // 初始播放失败（流类失败）→ 触发两轮重试。
+        engine.snapshot_tx.send_replace(PlaybackSnapshot {
+            generation: receipt.generation,
+            session_id: Some(receipt.session_id),
+            state: crate::domain::EngineState::Failed,
+            song_key: Some(song_key),
+            end_behavior: Some(EndBehavior::NotifyController),
+            position_seconds: Some(31.5),
+            duration_seconds: Some(240.0),
+            last_end_cause: Some(crate::domain::EndCause::DecodeFailure),
+            ..PlaybackSnapshot::default()
+        });
+
+        // 等两轮 RefreshStream 全部发出。
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if engine.commands.lock().unwrap().len() >= 3 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(source.resolve_count.load(Ordering::SeqCst), 3);
+        let commands = engine.commands.lock().unwrap();
+        assert!(matches!(
+            commands.as_slice(),
+            [
+                EngineCommand::Start { .. },
+                EngineCommand::RefreshStream { stream: first, .. },
+                EngineCommand::RefreshStream { stream: second, .. }
+            ] if first.url.as_str() == "https://example.test/audio-2.mp3"
+                && second.url.as_str() == "https://example.test/audio-3.mp3"
+        ));
+    }
+
     struct OrderedSource {
         old_started: Notify,
         release_old: Notify,
@@ -1675,5 +1958,236 @@ mod tests {
                 EngineCommand::Start { generation: 2, .. }
             ]
         ));
+    }
+
+    struct FixedUrlSource {
+        url: String,
+    }
+
+    #[async_trait]
+    impl SourceAdapter for FixedUrlSource {
+        async fn search(
+            &self,
+            _spec: &SearchSpec,
+        ) -> Result<Vec<ProviderSearchCandidate>, CatalogError> {
+            Ok(Vec::new())
+        }
+
+        async fn resolve(
+            &self,
+            _key: &SongKey,
+            _locator: Option<&ResolverLocator>,
+        ) -> Result<StreamSource, CatalogError> {
+            Ok(StreamSource {
+                url: Url::parse(&self.url).unwrap(),
+                headers: BTreeMap::new(),
+                expires_at_epoch_ms: None,
+            })
+        }
+    }
+
+    /// 预加载启用音频缓存时主动下载音频数据：播放时直接命中本地文件，不再访问源站。
+    #[tokio::test]
+    async fn preload_with_audio_cache_predownloads_audio_data() {
+        // 假源站：计数 + 返回固定音频数据。
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let body: Vec<u8> = vec![4u8; 2048];
+        tokio::spawn({
+            let requests = requests.clone();
+            let body = body.clone();
+            async move {
+                loop {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        continue;
+                    };
+                    let mut buffer = [0u8; 2048];
+                    let _ = stream.read(&mut buffer).await;
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.write_all(&body).await;
+                }
+            }
+        });
+
+        let directory = std::env::temp_dir().join(format!(
+            "miliastra-core-preload-cache-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        let cache = crate::cache::AudioCache::spawn(crate::cache::AudioCacheConfig {
+            enabled: true,
+            directory: directory.clone(),
+            max_bytes: 64 * 1024 * 1024,
+            max_concurrent_downloads: 2,
+            request_timeout: Duration::from_secs(15),
+            seek_wait_timeout: Duration::from_secs(5),
+            max_registry_entries: 16,
+        })
+        .await
+        .expect("缓存启动");
+
+        let source = Arc::new(FixedUrlSource {
+            url: format!("http://{addr}/audio.mp3"),
+        });
+        let (snapshot_tx, snapshot) = watch::channel(PlaybackSnapshot::default());
+        let engine = Arc::new(RecordingEngine {
+            commands: Mutex::new(Vec::new()),
+            snapshot_tx,
+            snapshot,
+            refresh_fails_after: false,
+        });
+        let core = PlaybackCore::new(
+            SourceCatalog::new([("fake".to_owned(), source.clone() as Arc<dyn SourceAdapter>)]),
+            engine.clone(),
+            Duration::from_secs(1),
+        )
+        .with_audio_cache(cache.clone());
+        let key = SongKey::new("fake", "preload-1").unwrap();
+
+        // 预加载：注册缓存条目并主动下载音频数据。
+        core.preload(key.clone(), None).await.unwrap();
+
+        // 播放：Start 命令的音源是本地代理地址，数据已由预加载下载完成。
+        let _receipt = core
+            .play(key, None, EndBehavior::NotifyController)
+            .await
+            .unwrap();
+        let proxy_url = {
+            let commands = engine.commands.lock().unwrap();
+            let EngineCommand::Start { stream, .. } = &commands[0] else {
+                panic!("expected start command");
+            };
+            assert!(
+                stream.url.as_str().starts_with("http://127.0.0.1:"),
+                "播放音源应改写为本地代理: {}",
+                stream.url
+            );
+            stream.url.clone()
+        };
+        let data = reqwest::get(proxy_url)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(&data[..], &body[..]);
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "预下载已完成，播放不应再访问源站"
+        );
+
+        cache.shutdown().await;
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    struct CountingLyricsSource {
+        lyrics_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl SourceAdapter for CountingLyricsSource {
+        async fn search(
+            &self,
+            _spec: &SearchSpec,
+        ) -> Result<Vec<ProviderSearchCandidate>, CatalogError> {
+            Ok(Vec::new())
+        }
+
+        async fn resolve(
+            &self,
+            _key: &SongKey,
+            _locator: Option<&ResolverLocator>,
+        ) -> Result<StreamSource, CatalogError> {
+            Ok(StreamSource {
+                url: Url::parse("https://example.test/audio.mp3").unwrap(),
+                headers: BTreeMap::new(),
+                expires_at_epoch_ms: None,
+            })
+        }
+
+        async fn lyrics(
+            &self,
+            _key: &SongKey,
+            _locator: Option<&ResolverLocator>,
+        ) -> Result<Option<TimedLyrics>, CatalogError> {
+            self.lyrics_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::lyrics::TimedLyrics::new(vec![
+                crate::lyrics::TimedLyricLine {
+                    start_ms: 0,
+                    text: "第一句".to_owned(),
+                    translation: Some("translation".to_owned()),
+                },
+            ]))
+        }
+    }
+
+    /// 歌词首次网络获取后写入缓存：再次请求直接命中，不再访问平台接口。
+    #[tokio::test]
+    async fn lyrics_are_cached_after_the_first_network_fetch() {
+        let directory = std::env::temp_dir().join(format!(
+            "miliastra-core-lyrics-cache-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        let cache = crate::cache::AudioCache::spawn(crate::cache::AudioCacheConfig {
+            enabled: true,
+            directory: directory.clone(),
+            max_bytes: 64 * 1024 * 1024,
+            max_concurrent_downloads: 2,
+            request_timeout: Duration::from_secs(15),
+            seek_wait_timeout: Duration::from_secs(5),
+            max_registry_entries: 16,
+        })
+        .await
+        .expect("缓存启动");
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let source = Arc::new(CountingLyricsSource {
+            lyrics_calls: calls.clone(),
+        });
+        let (snapshot_tx, snapshot) = watch::channel(PlaybackSnapshot::default());
+        let engine = Arc::new(RecordingEngine {
+            commands: Mutex::new(Vec::new()),
+            snapshot_tx,
+            snapshot,
+            refresh_fails_after: false,
+        });
+        let core = PlaybackCore::new(
+            SourceCatalog::new([("fake".to_owned(), source.clone() as Arc<dyn SourceAdapter>)]),
+            engine.clone(),
+            Duration::from_secs(1),
+        )
+        .with_audio_cache(cache.clone());
+        let key = SongKey::new("fake", "lyrics-1").unwrap();
+
+        let first = core.lyrics(key.clone(), None).await.unwrap().unwrap();
+        assert_eq!(first.lines.len(), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // 第二次：命中缓存，不再访问平台。
+        let second = core.lyrics(key.clone(), None).await.unwrap().unwrap();
+        assert_eq!(second, first);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // 缓存文件已落盘：新 core（同一缓存目录）也能命中。
+        let core2 = PlaybackCore::new(
+            SourceCatalog::new([("fake".to_owned(), source.clone() as Arc<dyn SourceAdapter>)]),
+            engine.clone(),
+            Duration::from_secs(1),
+        )
+        .with_audio_cache(cache.clone());
+        let third = core2.lyrics(key, None).await.unwrap().unwrap();
+        assert_eq!(third, first);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        cache.shutdown().await;
+        let _ = std::fs::remove_dir_all(&directory);
     }
 }

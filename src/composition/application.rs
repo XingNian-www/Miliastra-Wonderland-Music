@@ -591,6 +591,16 @@ impl PlaybackStatePort for BusinessPlaybackStateAdapter {
             .map_err(anyhow::Error::from)
     }
 
+    fn confirm_playback_and_dequeue(
+        &self,
+        update: PlaybackStateUpdate,
+        queue_item_id: Option<u64>,
+    ) -> Result<bool> {
+        self.business
+            .confirm_playback_and_dequeue(update, queue_item_id)
+            .map_err(anyhow::Error::from)
+    }
+
     fn song_dedup_limited(&self, candidate: SongDedupCandidate) -> Result<bool> {
         self.business
             .song_dedup_limited(candidate)
@@ -821,8 +831,10 @@ impl PendingTask {
         match self {
             Self::Command(pending) => Some(pending.lock_key.clone()),
             Self::ModerationResult(task) => Some(task.dedup_key()),
-            Self::AdvanceQueue { .. }
-            | Self::ConsoleChat { .. }
+            // 播放队列自动推进使用稳定去重键：同一时刻只保留一个待执行推进任务，
+            // 推进决策在任务执行时重新评估，多个推进原因可以安全合并为一次执行。
+            Self::AdvanceQueue { .. } => Some("playback_advance_queue".to_string()),
+            Self::ConsoleChat { .. }
             | Self::Startup(_)
             | Self::ClearIdleExit
             | Self::SetChatListenerMode { .. }
@@ -1604,6 +1616,38 @@ fn web_tool_panel_response_rect(config: &AppConfig) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn advance_queue_uses_a_stable_dedup_key() {
+        // 不同推进原因必须归并为同一个调度去重键，保证多个 pending 推进任务只留一个。
+        let first = PendingTask::AdvanceQueue {
+            reason: "song-ended",
+        }
+        .dedup_key();
+        let second = PendingTask::AdvanceQueue {
+            reason: "manual-next",
+        }
+        .dedup_key();
+        assert_eq!(first.as_deref(), Some("playback_advance_queue"));
+        assert_eq!(second, first);
+        // 与命令锁键区分，避免误合并或误拦截。
+        let command = PendingTask::Command(Box::new(PendingCommand {
+            lock_key: ModuleCommand::Playback(PlaybackCommand::Next).lock_key(),
+            routed: RoutedCommand::console(
+                "下一首",
+                "下一首",
+                ModuleCommand::Playback(PlaybackCommand::Next),
+            ),
+        }))
+        .dedup_key();
+        assert_ne!(command, first);
+        assert_ne!(first, PendingTask::ClearIdleExit.dedup_key());
+    }
+
+    #[test]
+    fn advance_queue_is_a_playback_task() {
+        assert!(PendingTask::AdvanceQueue { reason: "test" }.is_playback_task());
+    }
 
     #[test]
     fn secondary_sender_uses_the_rightmost_parenthesized_name() {

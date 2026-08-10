@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail};
 use miliastra_playback::{PlayableTrack, TrackKey};
 use serde::{Deserialize, Deserializer, Serialize};
 
+use super::PlaybackStateUpdate;
 use super::queue::QueueItem;
 use miliastra_contracts::StateStore;
 
@@ -205,12 +206,12 @@ impl RequestStateStore {
         })
     }
 
-    /// 从播放池随机挑一首，排除 `exclude` 指定的 TrackKey；池空或全部被排除时返回 None。
-    pub(crate) fn pick_pool_track(&self, exclude: Option<&TrackKey>) -> Option<PlayableTrack> {
+    /// 从播放池随机挑一首，排除本轮已尝试的 TrackKey；池空或全部被排除时返回 None。
+    pub(crate) fn pick_pool_track(&self, excluded: &HashSet<TrackKey>) -> Option<PlayableTrack> {
         let pool = &self.snapshot.playback_pool;
         let candidates = pool
             .iter()
-            .filter(|track| exclude != Some(&track.track_ref.key))
+            .filter(|track| !excluded.contains(&track.track_ref.key))
             .collect::<Vec<_>>();
         let count = candidates.len();
         if count == 0 {
@@ -319,6 +320,59 @@ impl RequestStateStore {
             request_id,
             outcome: outcome.into(),
             handled_at_ms,
+        })
+    }
+
+    /// 原子确认播放成功并删除对应队列项（同一笔持久化）。
+    ///
+    /// 把「确认播放成功」与「队首出队」合并为单次快照写入：进程在确认成功后、
+    /// 出队持久化前退出时，重启后要么两者都已生效（已确认消费的队首不会重播），
+    /// 要么都未生效（队首保留等待重新播放），不存在「已确认但队首未删」的中间态。
+    /// 仅在 `queue_item_id` 与当前队首匹配时出队；不匹配（队列已被外部修改，
+    /// 如用户删除/清空）时只确认播放状态，不误删其他队列项。
+    pub(crate) fn confirm_playback_and_dequeue(
+        &mut self,
+        update: PlaybackStateUpdate,
+        queue_item_id: Option<u64>,
+    ) -> Result<bool> {
+        self.update(|snapshot| {
+            // 与 PersistentPlaybackState::update 保持一致：请求身份变化时作废会话绑定。
+            // identity 取拥有的数据（TrackKey 克隆），避免借用阻塞 apply 的可变借用。
+            let previous_identity = snapshot
+                .playback
+                .active_request
+                .as_ref()
+                .and_then(|request| {
+                    request
+                        .track
+                        .as_ref()
+                        .map(|track| (track.track_ref.key.clone(), request.started_at_ms))
+                });
+            if !update.apply(&mut snapshot.playback) {
+                return false;
+            }
+            let next_identity = snapshot
+                .playback
+                .active_request
+                .as_ref()
+                .and_then(|request| {
+                    request
+                        .track
+                        .as_ref()
+                        .map(|track| (track.track_ref.key.clone(), request.started_at_ms))
+                });
+            if previous_identity != next_identity || snapshot.playback.active_request.is_none() {
+                snapshot.session_binding = None;
+            }
+            if let Some(item_id) = queue_item_id
+                && snapshot
+                    .queue
+                    .first()
+                    .is_some_and(|item| item.id == item_id)
+            {
+                snapshot.queue.remove(0);
+            }
+            true
         })
     }
 
@@ -569,6 +623,12 @@ pub struct ActivePlaybackRequest {
     /// request therefore has no guard and is reconciled from a fresh player observation.
     #[serde(skip)]
     pub(crate) guard_started_at: Option<Instant>,
+    /// 播放确认时观测到的引擎会话归属，用于失败分支校验：
+    /// 推进队列后引擎状态更新有延迟，旧会话的失败残留不得触发再次推进（防连跳）。
+    #[serde(skip)]
+    pub(crate) expected_session_id: String,
+    #[serde(skip)]
+    pub(crate) expected_generation: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -613,6 +673,12 @@ impl PersistentPlaybackState {
 
     pub fn state(&self) -> &PlaybackRuntimeState {
         &self.state
+    }
+
+    /// 用共享请求状态存储中的最新播放状态覆盖内存缓存。
+    /// 供共享存储内的原子事务（如确认+出队）落盘后同步缓存使用。
+    pub(crate) fn sync_state(&mut self, state: PlaybackRuntimeState) {
+        self.state = state;
     }
 
     pub(crate) fn update(
@@ -729,6 +795,8 @@ impl PlaybackRuntimeState {
             requester: String::new(),
             started_at_ms: observation.captured_at_ms,
             guard_started_at: None,
+            expected_session_id: String::new(),
+            expected_generation: 0,
         };
         self.push_previous_request(request);
     }
@@ -785,7 +853,238 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
-    use crate::features::playback::test_track;
+    use crate::features::playback::{
+        ConfirmedPlaybackState, PersistentQueue, PlaybackNavigation, PlaybackStateUpdate,
+        test_track,
+    };
+    use crate::test_support::FailingWriteStore;
+
+    /// 构造 Confirmed 状态更新（与 Starting 使用同一 started_at_ms，保持请求身份不变）。
+    fn confirmed_update(
+        track: &miliastra_playback::PlayableTrack,
+        started_at_ms: u64,
+    ) -> PlaybackStateUpdate {
+        PlaybackStateUpdate::Confirmed {
+            request: ActivePlaybackRequest {
+                keyword: track.metadata.title.clone(),
+                source: track.track_ref.key.provider.as_str().to_string(),
+                track: Some(track.clone()),
+                song: track.metadata.title.clone(),
+                title: track.metadata.title.clone(),
+                artist: track.metadata.artists.join("/"),
+                started_at_ms,
+                ..ActivePlaybackRequest::default()
+            },
+            navigation: PlaybackNavigation::Normal,
+        }
+    }
+
+    fn enter_starting(
+        store: &SharedRequestStateStore,
+        track: &miliastra_playback::PlayableTrack,
+        started_at_ms: u64,
+    ) {
+        store
+            .lock()
+            .unwrap()
+            .update(|snapshot| {
+                snapshot.playback.state = ConfirmedPlaybackState::Starting;
+                snapshot.playback.active_request = Some(ActivePlaybackRequest {
+                    track: Some(track.clone()),
+                    started_at_ms,
+                    ..ActivePlaybackRequest::default()
+                });
+                true
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn confirm_and_dequeue_commit_together_and_survive_reload() {
+        let state_path = temp_request_state_path("confirm-dequeue-atomic");
+        let store =
+            RequestStateStore::load(state_path.clone(), crate::test_support::test_state_store())
+                .unwrap();
+        let track_a = test_track("miliastra://track/qqmusic/a", "歌曲A - 歌手A");
+        let track_b = test_track("miliastra://track/qqmusic/b", "歌曲B - 歌手B");
+        let started_at_ms = 1234;
+        {
+            let mut queue = PersistentQueue::from_request_store(store.clone(), 10).unwrap();
+            queue
+                .push(QueueItem {
+                    keyword: "歌曲A".to_string(),
+                    track: Some(track_a.clone()),
+                    ..QueueItem::default()
+                })
+                .unwrap();
+            queue
+                .push(QueueItem {
+                    keyword: "歌曲B".to_string(),
+                    track: Some(track_b.clone()),
+                    ..QueueItem::default()
+                })
+                .unwrap();
+        }
+        enter_starting(&store, &track_a, started_at_ms);
+        let head_id = store.lock().unwrap().queue_snapshot().1[0].id;
+        assert_eq!(head_id, 1);
+
+        // 原子确认 + 出队：单次快照写入同时完成「确认播放成功」与「删除队首」。
+        assert!(
+            store
+                .lock()
+                .unwrap()
+                .confirm_playback_and_dequeue(
+                    confirmed_update(&track_a, started_at_ms),
+                    Some(head_id)
+                )
+                .unwrap()
+        );
+
+        let (next_id, items) = store.lock().unwrap().queue_snapshot();
+        assert_eq!(items.len(), 1, "队首 A 已出队");
+        assert_eq!(items[0].keyword, "歌曲B");
+        assert_eq!(next_id, 3, "next_queue_item_id 只增不减，不受出队影响");
+        let playback = store.lock().unwrap().playback_snapshot();
+        assert_eq!(playback.state, ConfirmedPlaybackState::RequestedSongPlaying);
+        assert_eq!(
+            playback
+                .active_request
+                .unwrap()
+                .track
+                .unwrap()
+                .track_ref
+                .key,
+            track_a.track_ref.key
+        );
+
+        // 模拟进程崩溃重启：重载文件后确认与出队都已持久化，队首直接是 B。
+        drop(store);
+        let reloaded =
+            RequestStateStore::load(state_path.clone(), crate::test_support::test_state_store())
+                .unwrap();
+        let (_, items) = reloaded.lock().unwrap().queue_snapshot();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].keyword, "歌曲B");
+        let playback = reloaded.lock().unwrap().playback_snapshot();
+        assert_eq!(playback.state, ConfirmedPlaybackState::RequestedSongPlaying);
+        assert_eq!(
+            playback
+                .active_request
+                .unwrap()
+                .track
+                .unwrap()
+                .track_ref
+                .key,
+            track_a.track_ref.key
+        );
+
+        remove_request_state_path(state_path);
+    }
+
+    #[test]
+    fn confirm_and_dequeue_keeps_queue_when_head_id_mismatches() {
+        let state_path = temp_request_state_path("confirm-dequeue-mismatch");
+        let store =
+            RequestStateStore::load(state_path.clone(), crate::test_support::test_state_store())
+                .unwrap();
+        let track_a = test_track("miliastra://track/qqmusic/a", "歌曲A - 歌手A");
+        let started_at_ms = 77;
+        {
+            let mut queue = PersistentQueue::from_request_store(store.clone(), 10).unwrap();
+            queue
+                .push(QueueItem {
+                    keyword: "歌曲A".to_string(),
+                    track: Some(track_a.clone()),
+                    ..QueueItem::default()
+                })
+                .unwrap();
+        }
+        enter_starting(&store, &track_a, started_at_ms);
+
+        // 队首 id(1) 与传入 id(999) 不匹配：只确认播放状态，不误删队首。
+        assert!(
+            store
+                .lock()
+                .unwrap()
+                .confirm_playback_and_dequeue(confirmed_update(&track_a, started_at_ms), Some(999))
+                .unwrap()
+        );
+        let (_, items) = store.lock().unwrap().queue_snapshot();
+        assert_eq!(items.len(), 1, "队首不匹配时不得出队");
+        let playback = store.lock().unwrap().playback_snapshot();
+        assert_eq!(playback.state, ConfirmedPlaybackState::RequestedSongPlaying);
+
+        remove_request_state_path(state_path);
+    }
+
+    #[test]
+    fn confirm_and_dequeue_write_failure_keeps_previous_state() {
+        let state_path = temp_request_state_path("confirm-dequeue-crash");
+        let failing = Arc::new(FailingWriteStore::new(
+            crate::test_support::test_state_store(),
+        ));
+        let store = RequestStateStore::load(state_path.clone(), failing.clone()).unwrap();
+        let track_a = test_track("miliastra://track/qqmusic/a", "歌曲A - 歌手A");
+        let track_b = test_track("miliastra://track/qqmusic/b", "歌曲B - 歌手B");
+        let started_at_ms = 55;
+        {
+            let mut queue = PersistentQueue::from_request_store(store.clone(), 10).unwrap();
+            queue
+                .push(QueueItem {
+                    keyword: "歌曲A".to_string(),
+                    track: Some(track_a.clone()),
+                    ..QueueItem::default()
+                })
+                .unwrap();
+            queue
+                .push(QueueItem {
+                    keyword: "歌曲B".to_string(),
+                    track: Some(track_b.clone()),
+                    ..QueueItem::default()
+                })
+                .unwrap();
+        }
+        enter_starting(&store, &track_a, started_at_ms);
+        let head_id = store.lock().unwrap().queue_snapshot().1[0].id;
+
+        // 注入写盘故障：确认+出队事务持久化失败，必须整体回滚。
+        failing
+            .fail_writes
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            store
+                .lock()
+                .unwrap()
+                .confirm_playback_and_dequeue(
+                    confirmed_update(&track_a, started_at_ms),
+                    Some(head_id)
+                )
+                .is_err()
+        );
+        // 内存态保持原状：队首仍在，播放状态仍是 Starting。
+        let (_, items) = store.lock().unwrap().queue_snapshot();
+        assert_eq!(items.len(), 2, "写失败时队首不得丢失");
+        assert_eq!(items[0].id, head_id);
+        let playback = store.lock().unwrap().playback_snapshot();
+        assert_eq!(playback.state, ConfirmedPlaybackState::Starting);
+
+        // 故障恢复后重载：磁盘仍是事务前的状态（不丢歌、不产生部分写入）。
+        failing
+            .fail_writes
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        drop(store);
+        let reloaded = RequestStateStore::load(state_path.clone(), failing.clone()).unwrap();
+        let (_, items) = reloaded.lock().unwrap().queue_snapshot();
+        assert_eq!(items.len(), 2, "磁盘不得出现部分写入");
+        assert_eq!(items[0].id, head_id);
+        assert_eq!(
+            reloaded.lock().unwrap().playback_snapshot().state,
+            ConfirmedPlaybackState::Starting
+        );
+
+        remove_request_state_path(state_path);
+    }
 
     #[test]
     fn playback_state_rejects_unknown_fields() {
@@ -1054,25 +1353,18 @@ mod tests {
                     )
                     .unwrap();
             }
-            let picked = store.pick_pool_track(None).expect("pool has candidates");
+            let mut excluded = HashSet::new();
+            let picked = store
+                .pick_pool_track(&excluded)
+                .expect("pool has candidates");
             assert_ne!(picked.track_ref.key.id, "");
+            excluded.insert(picked.track_ref.key.clone());
             let re_picked = store
-                .pick_pool_track(Some(&picked.track_ref.key))
+                .pick_pool_track(&excluded)
                 .expect("excluding one key still leaves candidates");
             assert_ne!(re_picked.track_ref.key.id, picked.track_ref.key.id);
-            // 排除不在池中的 key 仍能选到候选。
-            let last_key = store
-                .playback_pool_snapshot()
-                .iter()
-                .find(|track| {
-                    track.track_ref.key.id != picked.track_ref.key.id
-                        && track.track_ref.key.id != re_picked.track_ref.key.id
-                })
-                .unwrap()
-                .track_ref
-                .key
-                .clone();
-            assert!(store.pick_pool_track(Some(&last_key)).is_some());
+            excluded.insert(re_picked.track_ref.key.clone());
+            assert!(store.pick_pool_track(&excluded).is_some());
             // 空池返回 None。
             store
                 .update(|snapshot| {
@@ -1080,7 +1372,7 @@ mod tests {
                     true
                 })
                 .unwrap();
-            assert!(store.pick_pool_track(None).is_none());
+            assert!(store.pick_pool_track(&HashSet::new()).is_none());
         }
         remove_request_state_path(state_path);
     }

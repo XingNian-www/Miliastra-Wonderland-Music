@@ -4,7 +4,7 @@ queue:
   max_size: 5
 
   # 播放池最大容量；已确认播放过的点歌会进入播放池，队列播完后从播放池随机播放；0 表示禁用播放池
-  pool_max_size: 200
+  pool_max_size: 1000
 
   # 机器人确认播放的歌曲是否保护；true 时新点歌会排队，未结束只能用 @下一首 提前切换；歌曲播完由自然结束自动出队
   protect_current_song_until_finished: true

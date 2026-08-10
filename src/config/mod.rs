@@ -611,6 +611,10 @@ impl AppConfig {
         resolve_path(executable_root, &mut external.login_helper_executable);
         resolve_path(executable_root, &mut external.kugou_api_executable);
         if let Some(audio_cache) = &mut external.audio_cache {
+            // 缓存目录默认 deps/cache/audio（相对程序 exe 目录）。
+            if audio_cache.directory.as_os_str().is_empty() {
+                audio_cache.directory = PathBuf::from("deps/cache/audio");
+            }
             resolve_path(executable_root, &mut audio_cache.directory);
         }
         self.playback = external;
@@ -2876,7 +2880,7 @@ chat_rect:
             directory.join("data/credentials")
         );
         assert_eq!(config.queue.max_size, 7);
-        assert_eq!(config.queue.pool_max_size, 200);
+        assert_eq!(config.queue.pool_max_size, 1000);
         assert!(config.song_dedup.enabled);
         assert_eq!(config.ai.provider, "deepseek");
         assert_eq!(config.ai.model, "gpt-5.6-mini");

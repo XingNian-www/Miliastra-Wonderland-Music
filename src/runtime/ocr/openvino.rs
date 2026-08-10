@@ -883,9 +883,12 @@ fn prepare_local_runtime_loading() {
     });
 }
 
+/// 本地运行时查找根：优先 `deps/openvino`（统一依赖布局），兼容旧版 EXE 旁 `openvino/`
+/// 与开发构建把 `openvino_c.dll` 直接放 EXE 旁/工作目录的布局。
 #[cfg(windows)]
 fn local_runtime_roots(executable_dir: &Path, working_dir: Option<&Path>) -> Vec<PathBuf> {
-    let mut roots = Vec::with_capacity(2);
+    let mut roots = Vec::with_capacity(3);
+    push_unique_path(&mut roots, executable_dir.join("deps").join("openvino"));
     push_unique_path(&mut roots, executable_dir.to_path_buf());
     if let Some(working_dir) = working_dir {
         push_unique_path(&mut roots, working_dir.to_path_buf());
@@ -1020,15 +1023,26 @@ mod tests {
     fn local_runtime_search_paths_prioritize_executable_directory() {
         let executable_dir = Path::new(r"C:\app");
         let roots = local_runtime_roots(executable_dir, Some(executable_dir));
-        assert_eq!(roots, vec![PathBuf::from(r"C:\app")]);
+        assert_eq!(
+            roots,
+            vec![
+                PathBuf::from(r"C:\app\deps\openvino"),
+                PathBuf::from(r"C:\app")
+            ]
+        );
 
         let paths = local_runtime_search_paths(&roots);
-        assert_eq!(paths[0], PathBuf::from(r"C:\app"));
+        assert_eq!(paths[0], PathBuf::from(r"C:\app\deps\openvino"));
         assert_eq!(
             paths[1],
+            PathBuf::from(r"C:\app\deps\openvino\runtime\bin\intel64\Release")
+        );
+        assert_eq!(paths[8], PathBuf::from(r"C:\app"));
+        assert_eq!(
+            paths[9],
             PathBuf::from(r"C:\app\runtime\bin\intel64\Release")
         );
-        assert_eq!(paths[4], PathBuf::from(r"C:\app\openvino"));
+        assert_eq!(paths[12], PathBuf::from(r"C:\app\openvino"));
     }
 
     /// Run a real IR + runtime smoke only when the local model directory is supplied.

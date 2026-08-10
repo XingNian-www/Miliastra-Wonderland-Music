@@ -20,11 +20,11 @@ kugou_api_base_url: http://127.0.0.1:3000
 audio_cache:
   enabled: true
 
-  # 缓存根目录；为空时使用系统临时目录
-  directory: ""
+  # 缓存根目录；相对路径基于程序 exe 所在目录，留空默认 deps/cache/audio
+  directory: deps/cache/audio
 
-  # 磁盘占用上限，单位 MiB
-  max_bytes_mb: 2048
+  # 磁盘占用上限，单位 MiB（20 GiB）
+  max_bytes_mb: 20480
 
   # 同时进行的源站下载任务上限
   max_concurrent_downloads: 2

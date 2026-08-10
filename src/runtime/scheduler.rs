@@ -861,3 +861,101 @@ fn current_unix_millis() -> u64 {
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct NoopWork;
+
+    impl FormalTaskWork for NoopWork {
+        fn execute(
+            self: Box<Self>,
+            _cancellation: FormalTaskCancellationToken,
+        ) -> FormalTaskExecutionOutcome {
+            FormalTaskExecutionOutcome::Completed(Ok("done".to_string()))
+        }
+
+        fn cancel(self: Box<Self>) {}
+    }
+
+    fn submission(label: &str, dedup_key: Option<&str>) -> FormalTaskSubmission {
+        FormalTaskSubmission::new(
+            label,
+            dedup_key.map(FormalTaskDedupKey::new),
+            false,
+            Box::new(NoopWork),
+        )
+    }
+
+    #[test]
+    fn enqueue_deduplicates_queued_tasks_sharing_a_dedup_key() {
+        let mut scheduler = FormalScheduler::new();
+
+        let first = scheduler
+            .enqueue(submission("自动出队(a)", Some("playback_advance_queue")))
+            .expect("first advance queue enqueues");
+        assert!(matches!(first, FormalTaskEnqueueOutcome::Queued(_)));
+
+        // 相同去重键再次入队被拒绝，待执行范围内只保留一个推进任务。
+        let duplicate = scheduler
+            .enqueue(submission("自动出队(b)", Some("playback_advance_queue")))
+            .expect("duplicate key reports outcome");
+        assert_eq!(duplicate, FormalTaskEnqueueOutcome::Duplicate);
+        assert_eq!(scheduler.snapshot().pending_labels().len(), 1);
+
+        // 无去重键或不同键的任务不受影响。
+        let other = scheduler
+            .enqueue(submission("普通任务", None))
+            .expect("no-key task enqueues");
+        assert!(matches!(other, FormalTaskEnqueueOutcome::Queued(_)));
+        let different = scheduler
+            .enqueue(submission("自动出队", Some("other_key")))
+            .expect("different key enqueues");
+        assert!(matches!(different, FormalTaskEnqueueOutcome::Queued(_)));
+        assert_eq!(scheduler.snapshot().pending_labels().len(), 3);
+    }
+
+    #[test]
+    fn completed_task_releases_its_dedup_key() {
+        let mut scheduler = FormalScheduler::new();
+        let receipt = match scheduler
+            .enqueue(submission("自动出队", Some("playback_advance_queue")))
+            .expect("first enqueue")
+        {
+            FormalTaskEnqueueOutcome::Queued(receipt) => receipt,
+            FormalTaskEnqueueOutcome::Duplicate => panic!("first enqueue must queue"),
+        };
+
+        let lease = scheduler.take_next().expect("queued task lease");
+        scheduler
+            .complete(
+                receipt.task_id,
+                FormalTaskCompletion::Succeeded("ok".to_string()),
+            )
+            .expect("complete active task");
+        drop(lease);
+
+        // 执行完成后相同键可以再次入队。
+        let again = scheduler
+            .enqueue(submission("自动出队", Some("playback_advance_queue")))
+            .expect("re-enqueue after completion");
+        assert!(matches!(again, FormalTaskEnqueueOutcome::Queued(_)));
+    }
+
+    #[test]
+    fn contains_dedup_key_reports_only_queued_tasks() {
+        let mut scheduler = FormalScheduler::new();
+        let key = FormalTaskDedupKey::new("playback_advance_queue");
+        assert!(!scheduler.contains_dedup_key(&key));
+
+        scheduler
+            .enqueue(submission("自动出队", Some("playback_advance_queue")))
+            .expect("enqueue");
+        assert!(scheduler.contains_dedup_key(&key));
+
+        // 任务进入执行后不再占用去重键，新推进任务仍可入队。
+        let _lease = scheduler.take_next().expect("task lease");
+        assert!(!scheduler.contains_dedup_key(&key));
+    }
+}

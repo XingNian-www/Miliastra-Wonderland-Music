@@ -172,10 +172,13 @@ impl BilibiliAdapter {
         .await
     }
 
+    async fn view_json(&self, bvid: &str) -> Result<Value, CatalogError> {
+        self.get_json(&self.view_url, &[("bvid".to_owned(), bvid.to_owned())])
+            .await
+    }
+
     async fn resolve_json(&self, bvid: &str) -> Result<Value, CatalogError> {
-        let view = self
-            .get_json(&self.view_url, &[("bvid".to_owned(), bvid.to_owned())])
-            .await?;
+        let view = self.view_json(bvid).await?;
         let cid = view
             .pointer("/data/cid")
             .and_then(as_u64)
@@ -481,7 +484,20 @@ impl SourceAdapter for BilibiliAdapter {
         &self,
         spec: &SearchSpec,
     ) -> Result<Vec<ProviderSearchCandidate>, CatalogError> {
-        let response = self.search_json(spec.keyword.trim(), spec.limit).await?;
+        let keyword = spec.keyword.trim();
+        // 游戏聊天 OCR 场景：关键词若是 BV 号（允许 OCR 噪声与混淆字符），
+        // 直接按 BV 解析单曲，避免把 BV 号当搜索词返回空结果或无关内容。
+        if let Some(bvid) = normalize_bvid(keyword) {
+            let response = self.view_json(&bvid).await?;
+            return parse_view_candidate(&response)?
+                .map(|candidate| vec![candidate])
+                .ok_or_else(|| {
+                    CatalogError::InvalidResponse(
+                        "Bilibili view response contains no valid BV track".to_owned(),
+                    )
+                });
+        }
+        let response = self.search_json(keyword, spec.limit).await?;
         parse_search_candidates(&response)
     }
 
@@ -670,12 +686,114 @@ fn strip_html(value: &str) -> String {
         .to_owned()
 }
 
+/// B站 bvid 算法当前生效的官方 58 字符表（base58，排除数字 `0` 与 `I`/`O`/`l`）。
+///
+/// 真实 BV 号恒为 12 位：固定前缀 `BV1` + 9 位表内字符。
+/// 参考 bilibili-API-collect 文档：
+/// <https://github.com/SocialSisterYi/bilibili-API-collect/blob/master/docs/misc/bvid_desc.md>
+const BVID_TABLE: &str = "FcwAPNKTMug3GV5Lj7EJnHpWsx4tb8haYeviqBz6rkCy12mUSDQX9RdoZf";
+
+fn is_bvid_char(character: char) -> bool {
+    BVID_TABLE.contains(character)
+}
+
+/// 纠正单个 OCR 误读字符为合法 BV 字符；无法可靠纠正的返回 None。
+fn correct_bvid_char(character: char) -> Option<char> {
+    if is_bvid_char(character) {
+        return Some(character);
+    }
+    match character {
+        // OCR 常把数字 1 识别成大写 I、小写 l、竖线、撇号或反引号；
+        // 表内小写 o 与数字 0、大写 O 同形，OCR 常把 o 识别成 0/O；
+        // 表内大写 J 常被 OCR 识别成右方括号（半角/全角）。
+        'I' | 'l' | '|' | '\'' | '`' => Some('1'),
+        'O' | '0' => Some('o'),
+        ']' | '】' => Some('J'),
+        _ => None,
+    }
+}
+
+/// 从含 OCR 噪声的文本中容错提取规范化 BV 号（BV1 + 9 位官方字符）。
+///
+/// 接受任意大小写前缀（bv/Bv/bV/BV），输出规范大写；识别不到返回 None。
+/// 窗口滑动扫描：文本中任何「bv + 10 位可纠正字符」的 12 位片段都算命中，
+/// 因此分享链接、URL 参数、混入标点/混淆字符的 OCR 结果均可提取。
+pub(crate) fn normalize_bvid(input: &str) -> Option<String> {
+    let characters = input.chars().collect::<Vec<_>>();
+    if characters.len() < 12 {
+        return None;
+    }
+    for start in 0..=characters.len() - 12 {
+        if !matches!(characters[start], 'B' | 'b') || !matches!(characters[start + 1], 'V' | 'v') {
+            continue;
+        }
+        let mut corrected = String::with_capacity(12);
+        // 前缀强制归一为大写 BV；第三位仍走混淆纠正（I/l/0/|/撇号 → 1）。
+        corrected.push('B');
+        corrected.push('V');
+        let mut valid = true;
+        for &character in &characters[start + 2..start + 12] {
+            match correct_bvid_char(character) {
+                Some(character) => corrected.push(character),
+                None => {
+                    valid = false;
+                    break;
+                }
+            }
+        }
+        // 官方格式要求第三位固定为 1（BV1 前缀）。
+        if valid && corrected.starts_with("BV1") {
+            return Some(corrected);
+        }
+    }
+    None
+}
+
 fn is_bvid(value: &str) -> bool {
-    value.starts_with("BV")
-        && (8..=32).contains(&value.len())
-        && value
-            .bytes()
-            .all(|character| character.is_ascii_alphanumeric())
+    value.starts_with("BV1") && value.len() == 12 && value.chars().skip(3).all(is_bvid_char)
+}
+
+/// 从 B站 view 接口响应构造单曲候选（BV 号直解析时复用）。
+fn parse_view_candidate(response: &Value) -> Result<Option<ProviderSearchCandidate>, CatalogError> {
+    let data = response.pointer("/data").ok_or_else(|| {
+        CatalogError::InvalidResponse("Bilibili view response is missing data".to_owned())
+    })?;
+    let Some(bvid) = data
+        .get("bvid")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|bvid| is_bvid(bvid))
+    else {
+        return Ok(None);
+    };
+    let title = data
+        .get("title")
+        .and_then(Value::as_str)
+        .map(strip_html)
+        .filter(|title| !title.is_empty());
+    let Some(title) = title else {
+        return Ok(None);
+    };
+    let artists = data
+        .pointer("/owner/name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|artist| !artist.is_empty())
+        .map(|artist| vec![artist.to_owned()])
+        .unwrap_or_default();
+    let song = Song {
+        key: SongKey::new("bilibili", bvid)
+            .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?,
+        resolver_locator: ResolverLocator::new(format!("bilibili:v1:{bvid}")).ok(),
+        title,
+        artists,
+        album: None,
+        duration_ms: data.get("duration").and_then(parse_duration_ms),
+    };
+    Ok(Some(ProviderSearchCandidate {
+        song,
+        eligibility: PlaybackEligibility::Eligible,
+    }))
 }
 
 fn as_u64(value: &Value) -> Option<u64> {
@@ -844,7 +962,7 @@ mod tests {
 
     use super::{
         BilibiliAdapter, PlaybackEligibility, bilibili_dash_audio_url, bilibili_resolver_bvid,
-        parse_duration_ms, parse_search_candidates,
+        is_bvid, normalize_bvid, parse_duration_ms, parse_search_candidates,
     };
     use crate::catalog::{CatalogError, SourceAdapter};
     use crate::credentials::{CredentialStore, ProviderCredential};
@@ -972,6 +1090,152 @@ mod tests {
         assert_eq!(parse_duration_ms(&json!("1:02:03")), Some(3_723_000));
         assert_eq!(parse_duration_ms(&json!(180)), Some(180_000));
         assert_eq!(parse_duration_ms(&json!("bad")), None);
+    }
+
+    #[test]
+    fn bvid_matches_the_official_character_table() {
+        // 官方示例与真实 BV 号。
+        for bvid in [
+            "BV1GJ411x7h7",
+            "BV1us411d75p",
+            "BV1Q5411674a",
+            "BV1xx411c7mD",
+            "BV1L9Uoa9EUx",
+            "BV16x4y1H7M1",
+        ] {
+            assert!(is_bvid(bvid), "{bvid} 应命中官方字符集");
+        }
+        // 表外字符 0/I/O/l、长度不符、第三位非 1、非 BV1 前缀一律拒绝。
+        for invalid in [
+            "BV1GJ411x7h0",
+            "BV1GJ411x7hI",
+            "BV1GJ411x7hO",
+            "BV1GJ411x7hl",
+            "BV1GJ411x7h7x",
+            "BV1GJ411x7h",
+            "BVxGJ411x7h7",
+            "bv1GJ411x7h7",
+            "av1GJ411x7h7",
+        ] {
+            assert!(!is_bvid(invalid), "{invalid} 不应命中");
+        }
+    }
+
+    #[test]
+    fn normalize_bvid_extracts_from_ocr_noisy_text() {
+        // 分享链接、URL 参数、带大小写变体与混淆字符的 OCR 文本。
+        for (input, expected) in [
+            ("BV1GJ411x7h7", Some("BV1GJ411x7h7")),
+            ("BV1L9Uoa9EUx", Some("BV1L9Uoa9EUx")),
+            (
+                "https://www.bilibili.com/video/BV1GJ411x7h7?p=2",
+                Some("BV1GJ411x7h7"),
+            ),
+            ("【标题】 BV1GJ411x7h7 超好听", Some("BV1GJ411x7h7")),
+            ("bv1GJ411x7h7", Some("BV1GJ411x7h7")),
+            // OCR 把数字 1 识别成大写 I / 小写 l / 竖线 / 撇号。
+            ("BV1GJ4I1x7h7", Some("BV1GJ411x7h7")),
+            ("BV1GJ4l1x7h7", Some("BV1GJ411x7h7")),
+            ("BV1GJ41|x7h7", Some("BV1GJ411x7h7")),
+            ("BV1GJ41'x7h7", Some("BV1GJ411x7h7")),
+            // OCR 把表内小写 o 识别成大写 O 或数字 0。
+            ("BV1GJ4O1x7h7", Some("BV1GJ4o1x7h7")),
+            ("BV1GJ401x7h7", Some("BV1GJ4o1x7h7")),
+            // OCR 把表内大写 J 识别成右方括号（半角/全角）。
+            ("BV1G]411x7h7", Some("BV1GJ411x7h7")),
+            ("BV1G】411x7h7", Some("BV1GJ411x7h7")),
+            // 分隔符被 OCR 吞掉时仍取前 10 位。
+            ("BV1GJ411x7h7x后续", Some("BV1GJ411x7h7")),
+        ] {
+            assert_eq!(normalize_bvid(input).as_deref(), expected, "input={input}");
+        }
+    }
+
+    #[test]
+    fn normalize_bvid_rejects_unrecoverable_input() {
+        // 窗口内混入分隔符/中文、长度不足、第三位非 1、无 BV 前缀、空串。
+        for input in [
+            "",
+            "BV1GJ4 1x7h7",
+            "BV1GJ4-1x7h7",
+            "BV1GJ4啊1x7h7",
+            "BV1GJ411x7h",
+            "BVxGJ411x7h7",
+            "hello world",
+        ] {
+            assert_eq!(normalize_bvid(input), None, "input={input}");
+        }
+    }
+
+    #[tokio::test]
+    async fn search_resolves_a_bvid_keyword_directly_without_hitting_search_api() {
+        let (endpoint, requests) = fixture_server(vec![
+            json!({
+                "code": 0,
+                "data": {
+                    "bvid": "BV1GJ411x7h7",
+                    "title": "Sample &amp; Title",
+                    "owner": {"name": "Uploader"},
+                    "duration": "03:21"
+                }
+            })
+            .to_string(),
+        ]);
+        let adapter = BilibiliAdapter::with_endpoints(
+            credentials(),
+            Duration::from_secs(2),
+            endpoint.clone(),
+            endpoint.clone(),
+            endpoint,
+        )
+        .unwrap();
+
+        // 模拟游戏聊天 OCR 结果：BV 号前带分享文案、数字 1 被识别成大写 I。
+        let result = adapter
+            .search(&SearchSpec {
+                keyword: "这个视频 BV1GJ4I1x7h7 好听".to_owned(),
+                sources: Vec::new(),
+                limit: 5,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].song.key.id, "BV1GJ411x7h7");
+        assert_eq!(result[0].song.title, "Sample & Title");
+        assert_eq!(result[0].song.artists, ["Uploader"]);
+        assert_eq!(result[0].song.duration_ms, Some(201_000));
+        assert_eq!(result[0].eligibility, PlaybackEligibility::Eligible);
+        let request = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(request.contains("bvid=BV1GJ411x7h7"));
+        assert!(!request.contains("search_type"));
+    }
+
+    #[tokio::test]
+    async fn search_keeps_using_search_api_for_plain_keywords() {
+        let (endpoint, requests) =
+            fixture_server(vec![json!({"code": 0, "data": {"result": []}}).to_string()]);
+        let adapter = BilibiliAdapter::with_endpoints(
+            credentials(),
+            Duration::from_secs(2),
+            endpoint.clone(),
+            endpoint.clone(),
+            endpoint,
+        )
+        .unwrap();
+
+        let result = adapter
+            .search(&SearchSpec {
+                keyword: "晴天 周杰伦".to_owned(),
+                sources: Vec::new(),
+                limit: 5,
+            })
+            .await
+            .unwrap();
+
+        assert!(result.is_empty());
+        let request = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(request.contains("search_type=video"));
     }
 
     #[tokio::test]

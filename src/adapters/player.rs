@@ -175,6 +175,11 @@ impl MusicPlayerBackend for PlayerRuntimeBackend {
         }
         self.dispatch(PlayerControl::SetVolume(volume))
     }
+
+    fn invalidate_audio_cache(&self, key: &miliastra_playback::TrackKey) -> Result<()> {
+        self.dispatch(PlayerControl::InvalidateAudioCache(key.clone()))
+            .map(|_| ())
+    }
 }
 
 #[cfg(test)]

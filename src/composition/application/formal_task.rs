@@ -184,6 +184,10 @@ impl HttpTaskPort for FormalTaskClient {
         Ok(self.business.apply_mutation(intent)?)
     }
 
+    fn playback_queue_contains(&self, item: QueueItem) -> Result<bool> {
+        Ok(self.business.playback_queue_contains(item)?)
+    }
+
     fn enqueue_command(&self, pending: PendingCommand) -> Result<FormalTaskEnqueueOutcome> {
         Ok(FormalTaskClient::enqueue_command(self, pending)?)
     }

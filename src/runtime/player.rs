@@ -228,9 +228,8 @@ impl PlayerObservation {
             reevaluated.progress = None;
             reevaluated.duration = None;
             reevaluated.playback_rate = None;
-            reevaluated.volume = None;
-            reevaluated.volume_sampled_at = None;
-            reevaluated.sampled_at = None;
+            // volume 与最近采样时间都是引擎级属性，不随 track_key 过期清空
+            // （见 TrackEvidence::clear_track_evidence）。
         } else if reevaluated.track_key_freshness.is_fresh()
             && reevaluated.transport_freshness.is_fresh()
             && reevaluated.transport == Some(TransportState::Playing)
@@ -367,6 +366,24 @@ struct TrackEvidence {
 }
 
 impl TrackEvidence {
+    /// 清空曲目相关证据，保留引擎级音量与最近采样时间。
+    ///
+    /// 音量命令作用于引擎全局，与当前曲目无关；track 过期或切换时若连音量一起清掉，
+    /// 播放刚启动（track_key 尚未稳定）的观测 volume 会是 None，
+    /// 导致播放成功消息显示「音量0」。
+    fn clear_track_evidence(&mut self) {
+        self.track = None;
+        self.title = None;
+        self.artist = None;
+        self.album_name = None;
+        self.lyric_line_text = None;
+        self.lyric_line_sampled_at = None;
+        self.progress = None;
+        self.progress_sampled_at = None;
+        self.duration = None;
+        self.playback_rate = None;
+    }
+
     fn update(&mut self, sample: &RawPlayerSample, sampled_at: Instant) {
         if let Some(track) = sample.track.as_ref() {
             self.track = Some(track.clone());
@@ -470,7 +487,7 @@ impl<C: Clock> PlayerObserver<C> {
 
         let track_key_update = self.observe_track_key(raw_track_key.as_ref(), now);
         if track_key_update.accepted_new {
-            self.evidence = TrackEvidence::default();
+            self.evidence.clear_track_evidence();
         }
         let transport_update = self.observe_transport(sample.transport, now);
         let progress_restarted = !track_key_update.identity_changed
@@ -695,7 +712,7 @@ impl<C: Clock> PlayerObserver<C> {
         if track_key_expired {
             self.stable_track_key = None;
             self.track_key_candidate = None;
-            self.evidence = TrackEvidence::default();
+            self.evidence.clear_track_evidence();
         }
 
         let transport_expired = self.stable_transport.as_ref().is_some_and(|stable| {
@@ -1877,9 +1894,10 @@ mod tests {
         assert_eq!(reevaluated.progress, None);
         assert_eq!(reevaluated.duration, None);
         assert_eq!(reevaluated.playback_rate, None);
-        assert_eq!(reevaluated.volume, None);
-        assert_eq!(reevaluated.volume_sampled_at, None);
-        assert_eq!(reevaluated.sampled_at, None);
+        // volume 与采样时间属引擎级属性，track_key 过期时保留。
+        assert_eq!(reevaluated.volume, Some(70));
+        assert_eq!(reevaluated.volume_sampled_at, Some(started_at));
+        assert_eq!(reevaluated.sampled_at, Some(started_at));
     }
 
     #[test]
@@ -1944,8 +1962,9 @@ mod tests {
         assert_eq!(accepted.progress, None);
         assert_eq!(accepted.duration, None);
         assert_eq!(accepted.playback_rate, None);
-        assert_eq!(accepted.volume, None);
-        assert_eq!(accepted.volume_sampled_at, None);
+        // 引擎级音量不随换歌清空。
+        assert_eq!(accepted.volume, Some(70));
+        assert_eq!(accepted.volume_sampled_at, Some(clock.now()));
         assert_eq!(accepted.sampled_at, Some(clock.now()));
     }
 

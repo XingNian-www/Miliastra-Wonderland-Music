@@ -8,7 +8,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use tokio::io::AsyncWriteExt;
 
-use crate::cache::{CacheInner, DownloadHandle, EntryState, complete_file_size, trim_cache};
+use crate::cache::{
+    CacheInner, DownloadHandle, EntryState, cache_file_name, complete_file_size, trim_cache,
+};
 
 /// 开始下载；幂等：已下载中/已完成则直接返回现有句柄。
 pub(crate) async fn start_download(inner: &Arc<CacheInner>, hash: &str) -> Option<DownloadView> {
@@ -24,6 +26,18 @@ pub(crate) async fn start_download(inner: &Arc<CacheInner>, hash: &str) -> Optio
             Some(DownloadView::InProgress(handle.clone()))
         }
         EntryState::Idle => {
+            // 磁盘已有完整文件（上次运行遗留或已下载过）：直接复用，跳过源站下载。
+            // 命中后立即转 Complete，后续请求直接从本地文件服务，断网也能播。
+            if let Some(bytes) = complete_file_size(&inner.config.directory, hash) {
+                // 刷新文件修改时间，让容量淘汰按最近使用（而非上次下载时间）进行。
+                let complete_path = inner.config.directory.join(cache_file_name(hash, true));
+                if let Ok(file) = std::fs::File::open(&complete_path) {
+                    let _ = file.set_modified(std::time::SystemTime::now());
+                }
+                entry.state = EntryState::Complete { bytes };
+                entry.last_used = std::time::Instant::now();
+                return Some(DownloadView::Complete { bytes });
+            }
             // 先占位为 Downloading，再释放锁启动任务，防止并发重复下载。
             let handle = DownloadHandle {
                 ready: Arc::new(tokio::sync::Notify::new()),

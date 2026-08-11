@@ -422,4 +422,46 @@ mod tests {
         assert_eq!(cache_file_name("abc", false), "abc.part");
         assert_eq!(cache_file_name("abc", true), "abc.complete");
     }
+
+    #[tokio::test]
+    async fn idle_entry_reuses_disk_complete_file_without_downloading() {
+        let directory =
+            std::env::temp_dir().join(format!("miliastra-cache-{}", uuid::Uuid::new_v4()));
+        let cache = AudioCache::spawn(AudioCacheConfig {
+            directory: directory.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let key = crate::domain::SongKey::new("kugou", "abcdef0123456789").unwrap();
+        let hash = cache_key_hash(&key);
+        // 注册条目（Idle）。
+        cache
+            .rewrite(
+                &key,
+                crate::domain::StreamSource {
+                    url: "http://127.0.0.1:1/unreachable.mp3".parse().unwrap(),
+                    headers: std::collections::BTreeMap::new(),
+                    expires_at_epoch_ms: None,
+                },
+            )
+            .await;
+        // 磁盘预置上次运行遗留的完整文件。
+        let complete_path = directory.join(format!("{hash}.complete"));
+        std::fs::write(&complete_path, b"fake-audio-bytes").unwrap();
+
+        // 触发下载判断：应直接命中磁盘（源站不可达也不触发下载）。
+        assert!(cache.prefetch(&key).await);
+        assert!(complete_path.exists());
+
+        let state = cache
+            .inner
+            .entries
+            .read()
+            .await
+            .get(&hash)
+            .map(|entry| entry.state.clone());
+        assert!(matches!(state, Some(EntryState::Complete { .. })));
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
 }

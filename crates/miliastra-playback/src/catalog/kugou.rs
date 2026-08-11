@@ -44,6 +44,17 @@ pub struct KugouListenReport {
     pub message: String,
 }
 
+/// get_union_vip 响应解析出的 VIP 状态（概念版 busi_vip 优先）。
+#[derive(Clone, Debug, Default)]
+struct UnionVipStatus {
+    /// 是否判定为 VIP；`None` 表示响应无法判定。
+    active: Option<bool>,
+    /// 业务线 VIP 类型（svip/tvip/...），来自 busi_vip。
+    product_type: Option<String>,
+    /// VIP 到期时间（毫秒），来自 busi_vip 的 vip_end_time。
+    expire_at_ms: Option<u64>,
+}
+
 /// 账号 VIP 状态缓存条目（判定结果、时间、是否失败）。
 type VipCacheEntry = Option<(Option<bool>, std::time::Instant, bool)>;
 /// 账号状态缓存条目（状态、时间、是否失败）。
@@ -371,18 +382,54 @@ impl KugouAdapter {
         }
     }
 
+    /// 从 get_union_vip 响应提取概念版 VIP 状态：
+    /// 优先解析 `busi_vip` 数组（busi_type=concept 的 svip/tvip 业务线），
+    /// 数组缺失或为空时回退顶层 is_vip / vip_type（标准版字段）。
+    /// 实测顶层 is_vip 表示标准版会员，概念版真实状态只在 busi_vip 中，
+    /// 因此 busi_vip 存在时以它为准（即使顶层 is_vip=0）。
+    fn union_vip_status(data: &Value) -> UnionVipStatus {
+        let mut status = UnionVipStatus::default();
+        if let Some(list) = data.get("busi_vip").and_then(Value::as_array) {
+            for entry in list {
+                if entry.get("is_vip").and_then(value_u64).unwrap_or(0) == 0 {
+                    continue;
+                }
+                status.active = Some(true);
+                if status.product_type.is_none() {
+                    status.product_type = entry
+                        .get("product_type")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                }
+                if status.expire_at_ms.is_none() {
+                    status.expire_at_ms = entry
+                        .get("vip_end_time")
+                        .and_then(Value::as_str)
+                        .and_then(parse_kugou_datetime_ms);
+                }
+            }
+            // busi_vip 存在但没有生效条目：明确判定为非 VIP，不回退顶层。
+            if status.active.is_none() {
+                status.active = Some(false);
+            }
+            return status;
+        }
+        status.active = Self::vip_flags_from_union(data);
+        status
+    }
+
     async fn query_account_vip_status(&self) -> Option<bool> {
         let credential = self.credential().ok()?;
         // 1) 概念版「获取已领取 VIP 状态」/youth/union/vip（概念版专用，与领取同源的权威状态）；
         //    风控时顺延到下一途径，接口恢复后自动生效。
         if let Ok(vip) = self.account_json("/youth/union/vip", &credential).await
-            && let Some(vip_status) = Self::vip_flags_from_union(response_data(&vip))
+            && let Some(vip_status) = Self::union_vip_status(response_data(&vip)).active
         {
             return Some(vip_status);
         }
         // 2) /user/vip/detail（kugouvip get_union_vip 查询态）。
         if let Ok(vip) = self.account_json("/user/vip/detail", &credential).await
-            && let Some(vip_status) = Self::vip_flags_from_union(response_data(&vip))
+            && let Some(vip_status) = Self::union_vip_status(response_data(&vip)).active
         {
             return Some(vip_status);
         }
@@ -451,17 +498,24 @@ impl KugouAdapter {
                     .unwrap_or(Value::Null),
             };
             let vip_data = response_data(&vip);
-            let vip_type = detail_data
-                .get("vip_type")
-                .and_then(value_u64)
-                .or_else(|| vip_data.get("vip_type").and_then(value_u64))
+            let union_status = Self::union_vip_status(vip_data);
+            // busi_vip 的 product_type（svip/tvip 等）是概念版权威字段；
+            // 回退顺序：busi_vip → 顶层 vip_type → 凭据 cookie vip_type。
+            let vip_type = union_status
+                .product_type
+                .or_else(|| {
+                    vip_data
+                        .get("vip_type")
+                        .and_then(value_u64)
+                        .map(|value| value.to_string())
+                })
                 .or_else(|| match &credential {
                     ProviderCredential::Kugou { cookies, .. } => cookies
                         .get("vip_type")
-                        .and_then(|value| value.parse::<u64>().ok()),
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .map(|value| value.to_string()),
                     _ => None,
-                })
-                .map(|value| value.to_string());
+                });
             return Ok(KugouAccountStatus {
                 logged_in,
                 user_id,
@@ -469,7 +523,9 @@ impl KugouAdapter {
                     .get("nickname")
                     .and_then(Value::as_str)
                     .map(str::to_owned),
-                vip: vip_type.as_deref().is_some_and(|v| v != "0")
+                // 概念版判定以 busi_vip 为准（实测顶层 is_vip=0 不代表无概念版 VIP）。
+                vip: union_status.active.unwrap_or(false)
+                    || vip_type.as_deref().is_some_and(|v| v != "0")
                     || vip_data
                         .get("is_vip")
                         .and_then(value_u64)
@@ -479,10 +535,12 @@ impl KugouAdapter {
                         .and_then(Value::as_bool)
                         .unwrap_or(false),
                 vip_type,
-                vip_expire_at_ms: vip_data
-                    .get("expire_time")
-                    .and_then(value_u64)
-                    .map(|v| if v < 10_000_000_000 { v * 1000 } else { v }),
+                vip_expire_at_ms: union_status.expire_at_ms.or_else(|| {
+                    vip_data
+                        .get("expire_time")
+                        .and_then(value_u64)
+                        .map(|v| if v < 10_000_000_000 { v * 1000 } else { v })
+                }),
                 listen_report_available: logged_in,
             });
         }
@@ -957,6 +1015,42 @@ fn response_data(value: &Value) -> &Value {
     value.get("data").unwrap_or(value)
 }
 
+/// 解析酷狗时间字符串 "YYYY-MM-DD HH:MM:SS" 为毫秒时间戳。
+/// 酷狗 get_union_vip 的 vip_end_time 使用本地时区格式；到期判定以秒级精度即可，
+/// 不引入 chrono，按公历换算（Howard Hinnant 算法）。
+fn parse_kugou_datetime_ms(value: &str) -> Option<u64> {
+    let parts = value.split(['-', ' ', ':']).collect::<Vec<_>>();
+    if parts.len() != 6 {
+        return None;
+    }
+    let year: u64 = parts[0].parse().ok()?;
+    let month: u64 = parts[1].parse().ok()?;
+    let day: u64 = parts[2].parse().ok()?;
+    let hour: u64 = parts[3].parse().ok()?;
+    let minute: u64 = parts[4].parse().ok()?;
+    let second: u64 = parts[5].parse().ok()?;
+    let days = days_from_civil(year, month, day)?;
+    Some((days * 86_400 + hour * 3_600 + minute * 60 + second) * 1000)
+}
+
+/// 公历日期到 1970-01-01 起的天数（Howard Hinnant days_from_civil）。
+fn days_from_civil(year: u64, month: u64, day: u64) -> Option<u64> {
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let year = if month <= 2 {
+        year.checked_sub(1)?
+    } else {
+        year
+    };
+    let era = year / 400;
+    let year_of_era = year - era * 400;
+    let month_prime = (month + 9) % 12;
+    let day_of_year = (153 * month_prime + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    Some(era * 146_097 + day_of_era - 719_468)
+}
+
 fn value_string(value: &Value) -> Option<String> {
     value
         .as_str()
@@ -1002,7 +1096,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        PROVIDER, decode_lrc_content, extract_stream_url, parse_search_candidates, resolver_parts,
+        PROVIDER, decode_lrc_content, extract_stream_url, parse_kugou_datetime_ms,
+        parse_search_candidates, resolver_parts,
     };
     use crate::catalog::CatalogError;
     use crate::credentials::ProviderCredential;
@@ -1153,5 +1248,69 @@ mod tests {
         let data = super::response_data(&value);
         assert_eq!(data["code"], 0);
         assert_eq!(data["vipDays"], 30);
+    }
+
+    #[test]
+    fn union_vip_status_prefers_busi_vip_over_top_level() {
+        // 实测响应：顶层 is_vip=0（标准版），概念版 svip/tvip 在 busi_vip 中。
+        let value = json!({
+            "is_vip": 0,
+            "vip_type": 0,
+            "busi_vip": [
+                {
+                    "is_vip": 1,
+                    "is_paid_vip": 1,
+                    "product_type": "svip",
+                    "vip_end_time": "2026-09-12 02:08:52",
+                    "busi_type": "concept"
+                },
+                {
+                    "is_vip": 1,
+                    "is_paid_vip": 0,
+                    "product_type": "tvip",
+                    "vip_end_time": "2026-09-12 01:37:19",
+                    "busi_type": "concept"
+                }
+            ]
+        });
+        let status = super::KugouAdapter::union_vip_status(&value);
+        assert_eq!(status.active, Some(true));
+        assert_eq!(status.product_type.as_deref(), Some("svip"));
+        assert_eq!(
+            status.expire_at_ms,
+            Some(parse_kugou_datetime_ms("2026-09-12 02:08:52").unwrap())
+        );
+    }
+
+    #[test]
+    fn union_vip_status_marks_inactive_when_busi_vip_present_but_all_inactive() {
+        let value = json!({
+            "is_vip": 1,
+            "busi_vip": [{"is_vip": 0, "product_type": "svip", "vip_end_time": ""}]
+        });
+        let status = super::KugouAdapter::union_vip_status(&value);
+        // busi_vip 存在且无生效条目：判定非 VIP，不采信顶层 is_vip=1。
+        assert_eq!(status.active, Some(false));
+    }
+
+    #[test]
+    fn union_vip_status_falls_back_to_top_level_without_busi_vip() {
+        let active = super::KugouAdapter::union_vip_status(&json!({"is_vip": 1}));
+        assert_eq!(active.active, Some(true));
+        let inactive = super::KugouAdapter::union_vip_status(&json!({"vip_type": 0}));
+        assert_eq!(inactive.active, Some(false));
+        let unknown = super::KugouAdapter::union_vip_status(&json!({"error": 1}));
+        assert_eq!(unknown.active, None);
+    }
+
+    #[test]
+    fn kugou_datetime_is_parsed_to_epoch_ms() {
+        assert_eq!(parse_kugou_datetime_ms("1970-01-01 00:00:00"), Some(0));
+        assert_eq!(
+            parse_kugou_datetime_ms("2026-09-12 02:08:52"),
+            Some(1_789_178_932_000)
+        );
+        assert_eq!(parse_kugou_datetime_ms(""), None);
+        assert_eq!(parse_kugou_datetime_ms("2026-09-12"), None);
     }
 }

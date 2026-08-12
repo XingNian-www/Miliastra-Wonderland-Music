@@ -20,23 +20,45 @@ impl TimedLyrics {
     }
 
     pub fn line_at_ms(&self, position_ms: u64) -> Option<&str> {
+        self.line_at_ms_with_translation(position_ms, true)
+    }
+
+    pub fn line_at_ms_with_translation(
+        &self,
+        position_ms: u64,
+        use_translation: bool,
+    ) -> Option<&str> {
         let index = self
             .lines
             .partition_point(|line| line.start_ms <= position_ms);
         let line = self.lines.get(index.checked_sub(1)?)?;
-        let text = line
-            .translation
-            .as_deref()
-            .filter(|text| !text.trim().is_empty())
-            .unwrap_or(&line.text);
+        let text = if use_translation {
+            line.translation
+                .as_deref()
+                .filter(|text| !text.trim().is_empty())
+                .unwrap_or(&line.text)
+        } else {
+            &line.text
+        };
         (!text.trim().is_empty()).then_some(text)
     }
 
     pub fn line_at_seconds(&self, position_seconds: f64) -> Option<&str> {
+        self.line_at_seconds_with_translation(position_seconds, true)
+    }
+
+    pub fn line_at_seconds_with_translation(
+        &self,
+        position_seconds: f64,
+        use_translation: bool,
+    ) -> Option<&str> {
         if !position_seconds.is_finite() || position_seconds < 0.0 {
             return None;
         }
-        self.line_at_ms((position_seconds * 1000.0).round() as u64)
+        self.line_at_ms_with_translation(
+            (position_seconds * 1000.0).round() as u64,
+            use_translation,
+        )
     }
 }
 
@@ -183,6 +205,10 @@ mod tests {
         assert_eq!(lyrics.lines[1].start_ms, 2_000);
         assert_eq!(lyrics.line_at_ms(1_250), Some("first"));
         assert_eq!(lyrics.line_at_ms(3_000), Some("translated"));
+        assert_eq!(
+            lyrics.line_at_ms_with_translation(3_000, false),
+            Some("second")
+        );
     }
 
     #[test]

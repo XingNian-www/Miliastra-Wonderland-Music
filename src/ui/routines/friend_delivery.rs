@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -8,8 +9,7 @@ use image::DynamicImage;
 #[cfg(test)]
 use crate::config::AppConfig;
 use crate::config::{
-    FriendDeliveryConfig, InputTimingConfig, OcrConfig, OutputConfig, PointConfig, ScreenConfig,
-    TemplateConfig,
+    InputTimingConfig, OcrConfig, OutputConfig, PointConfig, ScreenConfig, TemplateConfig,
 };
 use crate::observation::chat::{SECONDARY_TITLE_RECT, SecondaryChatIdentity, classify_title};
 use crate::runtime::ocr::{OcrPriority, OcrRuntimeHandle, merge_ocr_lines};
@@ -434,7 +434,8 @@ pub(crate) struct FriendDeliveryRoutineConfig {
     timeout_ms: u64,
     pub(super) poll_ms: u64,
     pub(super) stable_count: u32,
-    auto_retry_count: u32,
+    /// 热更新共享句柄（阶段 7）：保存 friend_delivery.auto_retry_count 后立即生效。
+    auto_retry_count: Arc<RwLock<u32>>,
     stable_mean_threshold: f32,
     stable_changed_ratio_threshold: f32,
     secondary_hall_template: PathBuf,
@@ -447,7 +448,8 @@ pub(crate) struct FriendDeliveryRoutineConfigSource<'a> {
     pub(crate) ocr: &'a OcrConfig,
     pub(crate) output: &'a OutputConfig,
     pub(crate) input_timing: &'a InputTimingConfig,
-    pub(crate) delivery: &'a FriendDeliveryConfig,
+    /// 好友投递自动重试次数共享句柄（热更新）。
+    pub(crate) auto_retry_count: Arc<RwLock<u32>>,
     pub(crate) friend_list_region: Rect,
     pub(crate) friend_step_ms: u64,
     pub(crate) timeout_ms: u64,
@@ -477,7 +479,7 @@ impl FriendDeliveryRoutineConfig {
             timeout_ms: source.timeout_ms,
             poll_ms: source.poll_ms.max(10),
             stable_count: source.stable_count,
-            auto_retry_count: source.delivery.auto_retry_count,
+            auto_retry_count: source.auto_retry_count,
             stable_mean_threshold: source.ocr.change_mean_threshold,
             stable_changed_ratio_threshold: source.ocr.change_pixel_threshold,
             secondary_hall_template: source.templates.secondary_hall.clone(),
@@ -487,13 +489,15 @@ impl FriendDeliveryRoutineConfig {
 
     #[cfg(test)]
     pub(crate) fn from_app(config: &AppConfig) -> Self {
+        // 测试辅助：热更新共享值从给定配置初始化（与运行态 ApplicationRuntime 一致）。
+        let live = crate::config::LiveConfigs::from_config(config);
         Self::resolve(FriendDeliveryRoutineConfigSource {
             screen: &config.screen,
             templates: &config.templates,
             ocr: &config.ocr,
             output: &config.output,
             input_timing: &config.timing.input,
-            delivery: &config.friend_delivery,
+            auto_retry_count: live.friend_delivery_auto_retry_count,
             friend_list_region: config.invite.friend_list_region.into(),
             friend_step_ms: config.timing.invite.step_ms,
             timeout_ms: config.timing.workflow.default_timeout_ms,
@@ -584,14 +588,21 @@ fn execute_friend_deliveries(
                 ) {
                     Ok(()) => break,
                     Err(attempt)
-                        if retry < config.auto_retry_count
+                        if retry
+                            < *config
+                                .auto_retry_count
+                                .read()
+                                .expect("好友投递自动重试次数共享锁已中毒")
                             && retryable_certainty(attempt.failure.certainty()) =>
                     {
                         retry = retry.saturating_add(1);
                         log::warn!(
                             "好友投递确认未发送，执行自动重试 {}/{} stage={}",
                             retry,
-                            config.auto_retry_count,
+                            *config
+                                .auto_retry_count
+                                .read()
+                                .expect("好友投递自动重试次数共享锁已中毒"),
                             attempt.failure.stage()
                         );
                     }

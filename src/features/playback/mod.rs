@@ -7,7 +7,7 @@ use miliastra_playback::{
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 mod application;
@@ -86,6 +86,19 @@ pub struct PlaybackTimingConfig {
     pub transport_stable_samples: u32,
     #[serde(deserialize_with = "deserialize_positive_u64")]
     pub stale_timeout_ms: u64,
+}
+
+impl Default for PlaybackTimingConfig {
+    fn default() -> Self {
+        Self {
+            status_poll_ms: 1000,
+            monitor_tick_ms: 200,
+            monitor_status_ms: 1000,
+            uri_stable_samples: 0,
+            transport_stable_samples: 0,
+            stale_timeout_ms: 5000,
+        }
+    }
 }
 
 impl PlaybackTimingConfig {
@@ -245,6 +258,7 @@ pub(crate) enum PlaybackCommand {
     Volume(String),
     Status,
     Lyrics,
+    ToggleLyrics,
     LyricsFor(u16),
     ContinuousLyrics,
     BackgroundLyrics,
@@ -351,6 +365,7 @@ impl PlaybackCommand {
             ("播放", false),
             ("音量", true),
             ("状态", false),
+            ("切换", false),
             ("停止歌词", false),
             ("后台歌词", false),
             ("单曲歌词", false),
@@ -370,6 +385,7 @@ impl PlaybackCommand {
                 "上一首" | "上一曲" => Self::Previous,
                 "音量" => Self::Volume(argument.to_string()),
                 "状态" => Self::Status,
+                "切换" => Self::ToggleLyrics,
                 "停止歌词" => Self::StopBackgroundLyrics,
                 "后台歌词" => Self::BackgroundLyrics,
                 "单曲歌词" => Self::SingleSongLyrics,
@@ -399,6 +415,7 @@ impl PlaybackCommand {
             Self::Volume(volume) => format!("volume:{}", command_identity(volume)),
             Self::Status => "status".to_string(),
             Self::Lyrics => "lyrics".to_string(),
+            Self::ToggleLyrics => "lyrics_toggle".to_string(),
             Self::LyricsFor(_) => "lyrics_for".to_string(),
             Self::ContinuousLyrics => "lyrics_continuous".to_string(),
             Self::BackgroundLyrics => "lyrics_background".to_string(),
@@ -442,6 +459,7 @@ const PLAYBACK_COMMAND_PREFIXES: &[&str] = &[
     "播放",
     "音量",
     "状态",
+    "切换",
     "停止歌词",
     "后台歌词",
     "单曲歌词",
@@ -532,6 +550,10 @@ pub(crate) enum PlaybackStateUpdate {
         request: ActivePlaybackRequest,
         navigation: PlaybackNavigation,
     },
+    /// 持久化音量（0-100）：后端设置成功后写入，供重启恢复。
+    Volume(u8),
+    /// 持久化歌词翻译开关：后端切换成功后写入，供重启恢复。
+    LyricsMode(bool),
     Observation(PlaybackObservation),
     Unknown,
     Restore(Box<PlaybackRuntimeState>),
@@ -594,6 +616,22 @@ impl PlaybackStateUpdate {
                 playback.active_request = Some(request);
                 true
             }
+            Self::Volume(volume) => {
+                if playback.volume != volume {
+                    playback.volume = volume;
+                    true
+                } else {
+                    false
+                }
+            }
+            Self::LyricsMode(use_translation) => {
+                if playback.use_translation != use_translation {
+                    playback.use_translation = use_translation;
+                    true
+                } else {
+                    false
+                }
+            }
             Self::Observation(observation) => {
                 if !observation_requires_persist(playback.last_observation.as_ref(), &observation) {
                     false
@@ -621,7 +659,9 @@ pub(crate) struct PlaybackService {
     playback_state: PersistentPlaybackState,
     request_state: Option<state::SharedRequestStateStore>,
     song_dedup_history: PersistentSongDedupHistory,
-    song_dedup: SongDedupConfig,
+    /// 热更新共享句柄（阶段 7）：保存成功后由 HTTP 层 apply，
+    /// enabled/window_seconds/max_count 立即作用于去重判定。
+    song_dedup: Arc<RwLock<SongDedupConfig>>,
     external_playback_tracker: controller::ExternalPlaybackTracker,
     pool_max_size: usize,
 }
@@ -632,7 +672,7 @@ impl PlaybackService {
         song_dedup_history_path: PathBuf,
         queue_max_size: usize,
         pool_max_size: usize,
-        song_dedup: SongDedupConfig,
+        song_dedup: Arc<RwLock<SongDedupConfig>>,
         wall_clock: Arc<dyn WallClock>,
         store: Arc<dyn miliastra_contracts::StateStore>,
     ) -> Result<Self> {
@@ -668,7 +708,7 @@ impl PlaybackService {
         queue: PersistentQueue,
         playback_state: PersistentPlaybackState,
         song_dedup_history: PersistentSongDedupHistory,
-        song_dedup: SongDedupConfig,
+        song_dedup: Arc<RwLock<SongDedupConfig>>,
         pool_max_size: usize,
     ) -> Self {
         Self {
@@ -791,13 +831,14 @@ impl PlaybackService {
     }
 
     pub(crate) fn song_dedup_limited(&self, candidate: &SongDedupCandidate) -> bool {
-        self.song_dedup_history
-            .is_limited(&self.song_dedup, candidate)
+        let song_dedup = self.song_dedup.read().expect("同歌去重配置共享锁已中毒");
+        self.song_dedup_history.is_limited(&song_dedup, candidate)
     }
 
     pub(crate) fn record_song_dedup(&mut self, candidate: SongDedupCandidate) -> Result<()> {
+        let song_dedup = self.song_dedup.read().expect("同歌去重配置共享锁已中毒");
         self.song_dedup_history
-            .record_playback(&self.song_dedup, candidate)
+            .record_playback(&song_dedup, candidate)
     }
 
     pub(crate) fn observe_external_playback(
@@ -1039,6 +1080,15 @@ mod tests {
     }
 
     #[test]
+    fn hidden_toggle_command_has_a_dedicated_lock() {
+        let parsed = PlaybackCommand::parse_hall("切换").expect("lyrics toggle command");
+        assert_eq!(parsed.command, PlaybackCommand::ToggleLyrics);
+        assert_eq!(parsed.argument, "");
+        assert_eq!(parsed.command.lock_key(), "lyrics_toggle");
+        assert_eq!(PlaybackCommand::parse_hall("切换 原文"), None);
+    }
+
+    #[test]
     fn timed_lyrics_uses_a_different_lock_from_one_shot_lyrics() {
         assert_ne!(
             PlaybackCommand::Lyrics.lock_key(),
@@ -1139,41 +1189,59 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let blocker = std::env::temp_dir().join(format!(
-            "miliastra-playback-write-blocker-{}-{suffix}",
-            std::process::id()
-        ));
-        fs::write(&blocker, "not a directory").unwrap();
-        let state_path = blocker.join("playback-state.json");
-        let history_path = std::env::temp_dir().join(format!(
-            "miliastra-playback-history-unused-{}-{suffix}.json",
-            std::process::id()
-        ));
+        let state_path = service_temp_path("write-blocker", suffix);
+        let history_path = service_temp_path("write-blocker-dedup", suffix);
         let request_store =
             RequestStateStore::load(state_path.clone(), crate::test_support::test_state_store())
                 .unwrap();
+        // 注入 SQLite 写盘故障：状态写入必须失败且内存态保持不变。
+        request_store
+            .lock()
+            .unwrap()
+            .inject_write_failure()
+            .unwrap();
         let mut service = PlaybackService::new(
             PersistentQueue::from_request_store(request_store.clone(), 10).unwrap(),
             PersistentPlaybackState::from_request_store(request_store).unwrap(),
             PersistentSongDedupHistory::load(
-                history_path,
+                history_path.clone(),
                 Arc::new(SystemClock),
                 crate::test_support::test_state_store(),
             )
             .unwrap(),
-            SongDedupConfig::default(),
+            Arc::new(RwLock::new(SongDedupConfig::default())),
             0,
         );
 
         let error = service
             .apply_playback_state_update(PlaybackStateUpdate::UserPaused)
-            .expect_err("blocked parent must reject the state write");
+            .expect_err("注入的写故障必须拒绝状态写入");
         let snapshot = service.playback_state_snapshot();
 
-        assert!(error.to_string().contains("请求状态目录"));
+        assert!(error.to_string().contains("注入的写盘故障"));
         assert_eq!(snapshot.state, ConfirmedPlaybackState::Idle);
         assert_eq!(snapshot.pause_reason, PauseReason::None);
-        fs::remove_file(blocker).unwrap();
+        fs::remove_file(&state_path).ok();
+        fs::remove_file(format!("{}-wal", state_path.display())).ok();
+        fs::remove_file(format!("{}-shm", state_path.display())).ok();
+        fs::remove_file(&history_path).ok();
+    }
+
+    #[test]
+    fn volume_and_lyrics_mode_updates_apply_and_skip_unchanged_values() {
+        let mut playback = PlaybackRuntimeState::default();
+        assert_eq!(playback.volume, 100);
+        assert!(playback.use_translation);
+
+        // 值变化：应用并标记需要持久化。
+        assert!(PlaybackStateUpdate::Volume(60).apply(&mut playback));
+        assert_eq!(playback.volume, 60);
+        assert!(PlaybackStateUpdate::LyricsMode(false).apply(&mut playback));
+        assert!(!playback.use_translation);
+
+        // 相同值再次写入：不产生持久化（节流重复写盘）。
+        assert!(!PlaybackStateUpdate::Volume(60).apply(&mut playback));
+        assert!(!PlaybackStateUpdate::LyricsMode(false).apply(&mut playback));
     }
 
     fn observation(status: &str, progress: f64, captured_at_ms: u64) -> PlaybackObservation {
@@ -1328,10 +1396,10 @@ mod tests {
         let wall_clock: Arc<dyn WallClock> = Arc::new(SystemClock);
         let track_a = test_track("miliastra://track/qqmusic/a", "歌曲A - 歌手A");
         let track_b = test_track("miliastra://track/qqmusic/b", "歌曲B - 歌手B");
-        let dedup = SongDedupConfig {
+        let dedup = Arc::new(RwLock::new(SongDedupConfig {
             history_path: history_path.clone(),
             ..SongDedupConfig::default()
-        };
+        }));
 
         let mut service = PlaybackService::load(
             state_path.clone(),
@@ -1445,7 +1513,8 @@ mod tests {
         assert_eq!(reloaded.queue_snapshot()[0].id, head_id + 1);
 
         fs::remove_file(&state_path).ok();
-        fs::remove_file(format!("{}.bak", state_path.display())).ok();
+        fs::remove_file(format!("{}-wal", state_path.display())).ok();
+        fs::remove_file(format!("{}-shm", state_path.display())).ok();
         fs::remove_file(&history_path).ok();
     }
 
@@ -1461,21 +1530,18 @@ mod tests {
         let history_path = service_temp_path("keep-head-dedup", suffix);
         let wall_clock: Arc<dyn WallClock> = Arc::new(SystemClock);
         let track_a = test_track("miliastra://track/qqmusic/a", "歌曲A - 歌手A");
-        let failing = Arc::new(crate::test_support::FailingWriteStore::new(
-            crate::test_support::test_state_store(),
-        ));
 
         let mut service = PlaybackService::load(
             state_path.clone(),
             history_path.clone(),
             10,
             0,
-            SongDedupConfig {
+            Arc::new(RwLock::new(SongDedupConfig {
                 history_path: history_path.clone(),
                 ..SongDedupConfig::default()
-            },
+            })),
             wall_clock.clone(),
-            failing.clone(),
+            crate::test_support::test_state_store(),
         )
         .unwrap();
         service
@@ -1487,10 +1553,15 @@ mod tests {
             .unwrap();
         let head_id = service.queue_snapshot()[0].id;
 
-        // 注入写盘故障：确认+出队事务持久化失败，整体回滚。
-        failing
-            .fail_writes
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // 注入 SQLite 写盘故障：确认+出队事务持久化失败，整体回滚。
+        service
+            .request_state
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .inject_write_failure()
+            .unwrap();
         assert!(
             service
                 .confirm_playback_and_dequeue(
@@ -1517,21 +1588,18 @@ mod tests {
         );
 
         // 故障恢复后重载（模拟重启）：磁盘仍是事务前状态，队首可重播。
-        failing
-            .fail_writes
-            .store(false, std::sync::atomic::Ordering::SeqCst);
         drop(service);
         let reloaded = PlaybackService::load(
             state_path.clone(),
             history_path.clone(),
             10,
             0,
-            SongDedupConfig {
+            Arc::new(RwLock::new(SongDedupConfig {
                 history_path: history_path.clone(),
                 ..SongDedupConfig::default()
-            },
+            })),
             wall_clock,
-            failing,
+            crate::test_support::test_state_store(),
         )
         .unwrap();
         assert_eq!(reloaded.queue_snapshot().len(), 1);
@@ -1543,7 +1611,62 @@ mod tests {
         );
 
         fs::remove_file(&state_path).ok();
-        fs::remove_file(format!("{}.bak", state_path.display())).ok();
+        fs::remove_file(format!("{}-wal", state_path.display())).ok();
+        fs::remove_file(format!("{}-shm", state_path.display())).ok();
+        fs::remove_file(&history_path).ok();
+    }
+
+    /// 热更新共享 SongDedupConfig 后，去重判定必须立即变化（不重启）。
+    #[test]
+    fn song_dedup_config_hot_reload_changes_limited_judgement() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state_path = service_temp_path("dedup-hot-state", suffix);
+        let history_path = service_temp_path("dedup-hot-history", suffix);
+        let song_dedup = Arc::new(RwLock::new(SongDedupConfig {
+            history_path: history_path.clone(),
+            ..SongDedupConfig::default()
+        }));
+        // 初始关闭去重：任何候选都不受限。
+        song_dedup.write().unwrap().enabled = false;
+        let mut service = PlaybackService::load(
+            state_path.clone(),
+            history_path.clone(),
+            10,
+            0,
+            song_dedup.clone(),
+            Arc::new(SystemClock),
+            crate::test_support::test_state_store(),
+        )
+        .unwrap();
+        let track = test_track("miliastra://track/qqmusic/hot", "热更新歌曲 - 歌手A");
+        let candidate = SongDedupCandidate {
+            track_key: track.track_ref.key,
+            title: "热更新歌曲".to_string(),
+            artist: "歌手A".to_string(),
+            source: "qqmusic".to_string(),
+            prefer_accompaniment: false,
+        };
+        assert!(!service.song_dedup_limited(&candidate));
+        // 热更新共享值：启用去重、窗口 3600s、最多 1 次。
+        {
+            let mut config = song_dedup.write().unwrap();
+            config.enabled = true;
+            config.window_seconds = 3600;
+            config.max_count = 1;
+        }
+        // 启用后记录一次播放 → 同一首歌立即受限（判定读取共享值，未重启）。
+        service.record_song_dedup(candidate.clone()).unwrap();
+        assert!(service.song_dedup_limited(&candidate));
+        // 热更新 max_count=2 → 判定立即变化，不再受限。
+        song_dedup.write().unwrap().max_count = 2;
+        assert!(!service.song_dedup_limited(&candidate));
+
+        fs::remove_file(&state_path).ok();
+        fs::remove_file(format!("{}-wal", state_path.display())).ok();
+        fs::remove_file(format!("{}-shm", state_path.display())).ok();
         fs::remove_file(&history_path).ok();
     }
 }

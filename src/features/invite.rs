@@ -30,6 +30,17 @@ pub struct InviteTimingConfig {
     pub confirm_poll_ms: u64,
 }
 
+impl Default for InviteTimingConfig {
+    fn default() -> Self {
+        Self {
+            open_chat_ms: 400,
+            step_ms: 800,
+            confirm_timeout_ms: 30000,
+            confirm_poll_ms: 2000,
+        }
+    }
+}
+
 impl InviteConfig {
     pub(crate) fn validate(&self, timing: &InviteTimingConfig) -> Result<()> {
         for (rect, field) in [

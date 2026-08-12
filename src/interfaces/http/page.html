@@ -247,6 +247,11 @@ a.btn{text-decoration:none}
 .history-item.err{border-left-color:var(--danger)}
 .history-time{color:var(--text-3);margin-right:var(--sp-1)}
 .history-result{color:var(--text-2);margin-top:var(--sp-1);word-break:break-word}
+.cache-track-list{display:flex;flex-direction:column;gap:var(--sp-1);max-height:240px;overflow-y:auto}
+.cache-track-item{border-left:3px solid var(--accent);background:var(--bg-input);border-radius:var(--radius-m);padding:var(--sp-1) var(--sp-2);font-size:var(--fs-meta);line-height:var(--lh-meta)}
+.cache-track-item.orphan{border-left-color:var(--text-3)}
+.cache-track-source{color:var(--text-3);margin-left:var(--sp-2);font-size:var(--fs-meta)}
+.cache-track-meta{color:var(--text-2);margin-top:var(--sp-1);word-break:break-word}
 .compact-form{display:grid;grid-template-columns:minmax(0,1fr) 82px;gap:var(--sp-2)}
 .switch-line{display:inline-flex;align-items:center;gap:var(--sp-2);color:var(--text-2);font-size:var(--fs-meta);line-height:var(--lh-meta);cursor:pointer;user-select:none}
 .volume-control{min-width:0}
@@ -337,9 +342,54 @@ html[data-theme=light] .theme-toggle .moon{display:none}
 .tools-checkbox{display:inline-flex;align-items:center;gap:var(--sp-2);color:var(--text-2);font-size:var(--fs-meta);line-height:var(--lh-meta);cursor:pointer;user-select:none}
 .tools-stretch{width:100%}
 
+/* ===== 配置中心 ===== */
+.config-status{display:flex;align-items:center;flex-wrap:wrap;gap:var(--sp-3);margin:0 0 var(--sp-4);padding:var(--sp-3) var(--sp-4);background:var(--bg-input);border:1px solid var(--sep-2);border-radius:var(--radius-m);font-size:var(--fs-meta);line-height:var(--lh-meta);color:var(--text-2)}
+.config-status .chip{padding-right:var(--sp-3);border-right:1px solid var(--sep-2)}
+.config-dirty{color:var(--warn);font-weight:600}
+.config-layout{display:grid;grid-template-columns:210px minmax(0,1fr);gap:var(--sp-4);align-items:start}
+.config-sidebar{background:var(--bg-card);border:1px solid var(--sep-1);border-radius:var(--radius-m);padding:var(--sp-2);display:flex;flex-direction:column;gap:2px;position:sticky;top:76px;max-height:calc(100vh - 96px);overflow:auto}
+.config-section-item{width:100%;display:flex;align-items:center;justify-content:space-between;gap:var(--sp-2);padding:var(--sp-2) var(--sp-3);border:0;border-radius:var(--radius-s);background:transparent;color:var(--text-2);text-align:left;cursor:pointer;font-size:var(--fs-item);line-height:var(--lh-item)}
+.config-section-item:hover{background:var(--fill-1);color:var(--text-1)}
+.config-section-item.active{background:var(--accent-soft);color:var(--accent);font-weight:600}
+.config-section-item .section-name{color:var(--text-3);font-size:var(--fs-tiny);line-height:var(--lh-tiny);font-family:var(--font-mono)}
+.config-section-item.active .section-name{color:var(--accent)}
+.config-section-item .dirty-dot{width:6px;height:6px;border-radius:50%;background:var(--warn);flex:none;box-shadow:0 0 0 2px var(--warn-soft)}
+.config-main{min-width:0;display:flex;flex-direction:column;gap:var(--sp-4)}
+.config-toolbar{display:flex;gap:var(--sp-2);align-items:center;flex-wrap:wrap}
+.config-toolbar input[type=text]{flex:1;min-width:200px;height:var(--btn-h)}
+.config-toolbar .btn{flex:0 0 auto}
+.config-message{padding:var(--sp-3);border-radius:var(--radius-m);font-size:var(--fs-item);line-height:var(--lh-item);word-break:break-word;white-space:pre-wrap;border:1px solid transparent}
+.config-message.ok{background:var(--ok-soft);color:var(--ok);border-color:var(--ok-soft)}
+.config-message.err{background:var(--danger-soft);color:var(--danger);border-color:var(--danger-soft)}
+.config-form{display:flex;flex-direction:column;gap:var(--sp-3)}
+.config-field{background:var(--bg-card);border:1px solid var(--sep-2);border-radius:var(--radius-m);padding:var(--sp-3);display:flex;flex-direction:column;gap:var(--sp-2);min-width:0}
+.config-field.bootstrap{opacity:.62}
+.config-field.err{border-color:var(--danger);box-shadow:0 0 0 3px var(--danger-soft)}
+.config-field-head{display:flex;align-items:baseline;gap:var(--sp-2);flex-wrap:wrap;min-width:0}
+.config-field-head b{font-size:var(--fs-item);line-height:var(--lh-item);color:var(--text-1)}
+.config-field-head code{font-family:var(--font-mono);font-size:var(--fs-tiny);color:var(--text-3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.config-field-hint{color:var(--text-2);font-size:var(--fs-meta);line-height:var(--lh-meta)}
+.config-field-meta{display:flex;gap:var(--sp-2);flex-wrap:wrap;align-items:center;font-size:var(--fs-tiny);color:var(--text-3)}
+.config-effect{display:inline-flex;align-items:center;padding:1px var(--sp-2);border-radius:999px;font-size:var(--fs-tiny);line-height:var(--lh-tiny)}
+.config-effect.live{background:var(--ok-soft);color:var(--ok)}
+.config-effect.next{background:var(--warn-soft);color:var(--warn)}
+.config-effect.restart{background:var(--info-soft);color:var(--info)}
+.config-effect.bootstrap{background:var(--fill-2);color:var(--text-3)}
+.config-field-error{color:var(--danger);font-size:var(--fs-meta);line-height:var(--lh-meta)}
+.config-string-row{display:flex;gap:var(--sp-2);align-items:center}
+.config-string-row input{flex:1}
+.config-array{display:flex;flex-direction:column;gap:var(--sp-2)}
+.config-num-row{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:var(--sp-2)}
+.config-num-row.two{grid-template-columns:repeat(2,minmax(0,1fr))}
+.config-num-row label{display:flex;flex-direction:column;gap:2px;font-size:var(--fs-tiny);color:var(--text-3)}
+.config-readonly-note{color:var(--warn)}
+input.config-invalid,textarea.config-invalid{border-color:var(--danger)}
+input.config-invalid:focus,textarea.config-invalid:focus{border-color:var(--danger);box-shadow:0 0 0 3px var(--danger-soft)}
+#configRevisionsPanel .history{max-height:260px}
+
 /* ===== 响应式 ===== */
  @media(max-width:1200px){.status-chips{gap:var(--sp-2)}.chip{font-size:var(--fs-meta)}.chip em{max-width:96px}}
- @media(max-width:1050px){.topbar{grid-template-columns:1fr;padding:var(--sp-3) var(--sp-1) var(--sp-4)}.brand{padding:var(--sp-2) var(--sp-4);border-bottom:1px solid var(--sep-2)}.status-chips,.top-actions{flex-wrap:wrap;padding:var(--sp-3) var(--sp-4);border-left:none;border-top:1px solid var(--sep-2)}.top-actions{justify-content:flex-start}.page-grid{grid-template-columns:1fr}.page-grid>.panel{grid-column:auto}.turtle-stats{grid-template-columns:repeat(3,minmax(0,1fr))}.tools-grid{grid-template-columns:1fr}.tools-grid>.panel{grid-column:auto}}
+ @media(max-width:1050px){.topbar{grid-template-columns:1fr;padding:var(--sp-3) var(--sp-1) var(--sp-4)}.brand{padding:var(--sp-2) var(--sp-4);border-bottom:1px solid var(--sep-2)}.status-chips,.top-actions{flex-wrap:wrap;padding:var(--sp-3) var(--sp-4);border-left:none;border-top:1px solid var(--sep-2)}.top-actions{justify-content:flex-start}.page-grid{grid-template-columns:1fr}.page-grid>.panel{grid-column:auto}.turtle-stats{grid-template-columns:repeat(3,minmax(0,1fr))}.tools-grid{grid-template-columns:1fr}.tools-grid>.panel{grid-column:auto}.config-layout{grid-template-columns:1fr}.config-sidebar{position:static;max-height:none}.config-num-row{grid-template-columns:repeat(2,minmax(0,1fr))}}
  @media(max-width:720px){.app-nav{position:sticky;top:0;width:100%;height:auto;padding:var(--sp-2);border-right:0;border-bottom:1px solid var(--sep-1);overflow:hidden}.nav-brand{display:none}.nav-links{flex-direction:row;overflow-x:auto;scrollbar-width:thin}.nav-link{width:auto;flex:0 0 auto;white-space:nowrap}.nav-tools{margin-top:0}.shell{margin-left:0;padding:0 var(--sp-3) var(--sp-5)}.controls,.two,.three,.compact-form,.ocr-send,.ocr-options,.turtle-toolbar,.turtle-grid,.login-row,.login-session-grid,.login-facts{grid-template-columns:1fr}.login-row .controls{min-width:0}.turtle-stats{grid-template-columns:1fr 1fr}.undercover-toolbar{justify-content:stretch}.undercover-toolbar .btn{flex:1}.global-result{bottom:var(--sp-2)}.tools-grid{gap:var(--sp-4)}}
 </style>
 </head>
@@ -354,6 +404,7 @@ html[data-theme=light] .theme-toggle .moon{display:none}
     <button class="nav-link" data-route="entertainment" onclick="navigateTo('entertainment')">娱乐玩法</button>
     <button class="nav-link" data-route="tasks" onclick="navigateTo('tasks')">任务与日志</button>
     <button class="nav-link" data-route="tools" onclick="navigateTo('tools')">高级控制</button>
+    <button class="nav-link" data-route="config" onclick="navigateTo('config')">配置中心</button>
     <button class="nav-link" data-route="settings" onclick="navigateTo('settings')">设置</button>
   </div>
 </nav>
@@ -432,6 +483,31 @@ html[data-theme=light] .theme-toggle .moon{display:none}
         <div class="panel-body"><div class="tools-task-list" id="toolTasks">暂无任务</div></div>
       </div>
     </div></section>
+    <section class="page-section" id="page-config" data-page="config">
+      <h1 class="page-title">配置中心</h1>
+      <div class="config-status" id="configStatusBar">
+        <span class="chip"><i class="dot"></i><span>当前版本</span><em id="configRevision">-</em></span>
+        <span id="configSavedAt">尚未保存</span>
+        <span id="configDirtyHint" class="config-dirty hidden">有未保存的修改</span>
+      </div>
+      <div class="config-layout">
+        <div class="config-sidebar" id="configSectionList"></div>
+        <div class="config-main">
+          <div class="config-toolbar">
+            <input id="configSearch" type="text" placeholder="搜索字段（名称 / 路径 / 说明）">
+            <button class="btn" onclick="restoreDefaults()">恢复默认</button>
+            <button class="btn" onclick="toggleConfigRevisions()">历史版本</button>
+            <button class="btn primary" id="configSaveBtn" onclick="saveConfig()">保存全部</button>
+          </div>
+          <div class="config-message hidden" id="configMessage"></div>
+          <div id="configForm"></div>
+          <div class="panel" id="configRevisionsPanel" hidden>
+            <div class="panel-head"><h2>历史版本</h2><small>回滚会记录为新版本</small></div>
+            <div class="panel-body"><div class="history" id="configRevisions">暂无历史版本</div></div>
+          </div>
+        </div>
+      </div>
+    </section>
     <section class="page-section" id="page-settings" data-page="settings"><h1 class="page-title">设置</h1><div class="page-grid" id="settingsGrid"></div></section>
   </main>
 
@@ -550,6 +626,32 @@ html[data-theme=light] .theme-toggle .moon{display:none}
           </div>
           <div class="result" id="playbackDetail" style="margin-top:var(--sp-3);min-height:0">等待播放器状态</div>
         </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><h2>缓存统计</h2><small id="cacheStatsMeta">读取中</small></div>
+        <div class="panel-body">
+          <div class="login-facts" id="cacheStats">
+            <div class="login-fact"><span>音频缓存</span><strong>读取中</strong></div>
+          </div>
+          <div class="result" id="cacheDirectory" style="margin-top:var(--sp-2);min-height:0">等待缓存状态</div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><h2>磁盘缓存歌曲</h2><small id="cacheTracksMeta">读取中</small></div>
+        <div class="panel-body">
+          <div class="cache-track-list" id="cacheTracks">读取中</div>
+          <div class="controls" style="margin-top:var(--sp-3)">
+            <button class="btn ghost" id="cacheTracksPrev" onclick="changeCacheTracksPage(-1)">上一页</button>
+            <button class="btn ghost" id="cacheTracksNext" onclick="changeCacheTracksPage(1)">下一页</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel wide">
+        <div class="panel-head"><h2>播放历史</h2><small id="playbackHistoryMeta">最近 0 首</small></div>
+        <div class="panel-body"><div class="history" id="playbackHistory">暂无播放历史</div></div>
       </div>
 
       <div class="panel">
@@ -693,11 +795,11 @@ html[data-theme=light] .theme-toggle .moon{display:none}
 
 <script>
 function $(id){return document.getElementById(id)}
-const pageRoutes=['overview','playback','login','game','entertainment','tasks','tools','settings']
+const pageRoutes=['overview','playback','login','game','entertainment','tasks','tools','config','settings']
 function setupPages(){
   const moves={
     overview:['monitorOcr','runtimeDetail'],
-    playback:['songState','keyword','monitorQueue','queueMeta'],
+    playback:['songState','keyword','monitorQueue','queueMeta','cacheStats','cacheTracks','playbackHistory'],
     tasks:['monitorPending','monitorLogs','history'],
     login:['loginProviders'],
     game:['consoleChatText','listenerPrimary','idleExitMinutes','screenshotImage'],
@@ -719,10 +821,12 @@ function setupPages(){
 }
 function navigateTo(route,updateHash=true){
   if(!pageRoutes.includes(route))route='overview'
+  if(configUnsaved&&route!==document.querySelector('.page-section.active')?.dataset.page&&!confirm('有未保存的配置修改，确定离开配置中心？'))return
   document.querySelectorAll('.page-section').forEach(page=>page.classList.toggle('active',page.dataset.page===route))
   document.querySelectorAll('.nav-link[data-route]').forEach(link=>link.classList.toggle('active',link.dataset.route===route))
   try{localStorage.setItem('miliastraRoute',route)}catch(e){}
   if(updateHash&&location.hash!=='#'+route)history.replaceState(null,'','#'+route)
+  if(route==='config')loadConfigPage()
 }
 function initialRoute(){
   const hash=location.hash.slice(1)
@@ -744,12 +848,14 @@ const safeNum=(n)=>(n!=null&&isFinite(n)&&!isNaN(n))?Number(n):null
 const volumeNum=(n)=>{const v=safeNum(n);return v==null?null:Math.min(100,Math.max(0,Math.round(v)))}
 const pad=(n)=>String(parseInt(n)||0).padStart(2,'0')
 const fmt=(s)=>{s=safeNum(s);return s!=null?(Math.floor(s/60)+':'+pad(s%60)):'??:??'}
+const fmtBytes=(value)=>{let n=safeNum(value);if(n==null)return '未知';const units=['B','KB','MB','GB','TB'];let i=0;while(n>=1024&&i<units.length-1){n/=1024;i++}return (i===0?Math.round(n):n.toFixed(n>=10?1:2))+' '+units[i]}
 const nowText=()=>new Date().toLocaleTimeString('zh-CN',{hour12:false})
 let refreshPaused=false
 let screenshotUrl=''
 let actionInFlight=false
 let monitorLoading=false
 let historyLoading=false
+let playbackInsightsLoading=false
 let screenshotLoading=false
 let searchCandidateItems=[]
 let loginProviderItems=[]
@@ -849,6 +955,92 @@ async function refreshPlayer(){
   const d=await request('/status')
   renderPlayer(d)
   return d
+}
+function renderPlaybackInsights(data){
+  const cache=data&&data.cache
+  if(cache){
+    const used=safeNum(cache.completeBytes)||0,max=safeNum(cache.maxBytes)||0
+    const percent=max>0?Math.min(100,used/max*100):0
+    $('cacheStatsMeta').textContent=(cache.enabled?'已启用':'未启用')+' · '+percent.toFixed(1)+'%'
+    $('cacheStats').innerHTML=[
+      ['音频',String(cache.completeEntries||0)+' 首'],
+      ['占用',fmtBytes(used)+' / '+fmtBytes(max)],
+      ['下载中',String(cache.activeDownloads||0)+' 个'],
+      ['播放 / 失败',String(cache.playCount||0)+' / '+String(cache.failureCount||0)],
+      ['点歌 / 歌曲池',String(cache.requestedPlayCount||0)+' / '+String(cache.poolPlayCount||0)],
+      ['缓存命中',String(cache.cacheHitCount||0)+' 次'],
+      ['歌词',String(cache.lyricsEntries||0)+' 份 · '+fmtBytes(cache.lyricsBytes||0)]
+    ].map(item=>'<div class="login-fact"><span>'+esc(item[0])+'</span><strong>'+esc(item[1])+'</strong></div>').join('')
+    $('cacheDirectory').textContent='目录: '+(cache.directory||'未知')
+  }else{
+    $('cacheStatsMeta').textContent='未启用'
+    $('cacheStats').innerHTML='<div class="login-fact"><span>音频缓存</span><strong>未启用</strong></div>'
+    $('cacheDirectory').textContent='播放器未启用音频缓存'
+  }
+  const history=Array.isArray(data&&data.history)?data.history:[]
+  $('playbackHistoryMeta').textContent='最近 '+history.length+' 首'
+  $('playbackHistory').innerHTML=history.length?history.map(item=>{
+    const title=[item.title,item.artist].filter(Boolean).join(' - ')||item.keyword||'未知歌曲'
+    const cacheText=item.cached?('已缓存 · '+fmtBytes(item.cacheBytes)):'未缓存'
+    const time=item.startedAtMs?new Date(item.startedAtMs).toLocaleString('zh-CN',{hour12:false}):'时间未知'
+    const requester=item.requester?' · '+item.requester:''
+    const stats=' · 播放 '+(item.playCount||0)+'（点歌 '+(item.requestedPlayCount||0)+' / 池 '+(item.poolPlayCount||0)+'） · 命中 '+(item.cacheHitCount||0)+' · 失败 '+(item.failureCount||0)
+    return '<div class="history-item"><div><span class="history-time">'+esc(time)+'</span><b>'+esc(title)+'</b></div><div class="history-result">'+esc(providerLabel(item.source))+' · '+esc(cacheText)+esc(stats)+esc(requester)+'</div></div>'
+  }).join(''):'暂无播放历史'
+}
+async function loadPlaybackInsights(){
+  if(playbackInsightsLoading)return
+  playbackInsightsLoading=true
+  try{renderPlaybackInsights(await request('/playback/insights'))}
+  catch(e){$('cacheStatsMeta').textContent='读取失败';$('playbackHistory').textContent='读取播放历史失败: '+e.message}
+  finally{playbackInsightsLoading=false}
+  // 与 insights 的 5 秒刷新节奏同步刷新磁盘缓存歌曲列表。
+  loadCacheTracks()
+}
+let cacheTracksLoading=false
+const cacheTracksPageSize=100
+let cacheTracksOffset=0
+function renderCacheTracks(page){
+  const total=page&&page.total||0
+  const tracks=Array.isArray(page&&page.tracks)?page.tracks:[]
+  const current=total?Math.floor((page.offset||0)/(page.limit||cacheTracksPageSize))+1:0
+  const pages=total?Math.ceil(total/(page.limit||cacheTracksPageSize)):0
+  $('cacheTracksMeta').textContent='共 '+total+' 首 · 第 '+current+' / '+pages+' 页'
+  $('cacheTracksPrev').disabled=!page||page.offset<=0
+  $('cacheTracksNext').disabled=!page||(page.offset+tracks.length>=total)
+  $('cacheTracks').innerHTML=tracks.length?tracks.map((t)=>{
+    const known=Boolean(t.source)
+    const title=known?[t.title,t.artists&&t.artists.join('/')].filter(Boolean).join(' - ')||'未知歌曲':'未知缓存'
+    const source=known?providerLabel(t.source):'未知来源'
+    const size=fmtBytes(t.bytes)
+    const used=t.lastUsedAtMs?new Date(t.lastUsedAtMs).toLocaleString('zh-CN',{hour12:false}):'未知'
+    const state=t.complete?'已缓存':'未完整'
+    const activity='播放 '+(t.playCount||0)+'（点歌 '+(t.requestedPlayCount||0)+' / 池 '+(t.poolPlayCount||0)+'） · 命中 '+(t.cacheHitCount||0)+' · 失败 '+(t.failureCount||0)
+    const failure=t.lastFailureCode?' · 最近失败 '+t.lastFailureCode:''
+    const reset=known?'<button class="btn ghost" onclick="resetTrackStatistics(\''+encodeURIComponent(t.source)+'\',\''+encodeURIComponent(t.id)+'\')">清零统计</button>':''
+    return '<div class="cache-track-item'+(known?'':' orphan')+'"><div><b>'+esc(title)+'</b><span class="cache-track-source">'+esc(source)+'</span>'+reset+'</div><div class="cache-track-meta">'+esc(size)+' · 最近使用 '+esc(used)+' · '+esc(state)+' · '+esc(activity)+esc(failure)+'</div></div>'
+  }).join(''):'暂无磁盘缓存歌曲'
+}
+async function resetTrackStatistics(provider,id){
+  if(!confirm('清零该歌曲统计？音频缓存和曲目元数据会保留。'))return
+  await call('/playback/statistics/reset?provider='+provider+'&id='+id,'POST')
+  await Promise.all([loadPlaybackInsights(),loadCacheTracks()])
+}
+async function loadCacheTracks(){
+  if(cacheTracksLoading)return
+  cacheTracksLoading=true
+  try{
+    const page=await request('/playback/cache/tracks?offset='+cacheTracksOffset+'&limit='+cacheTracksPageSize)
+    if(page.total>0&&cacheTracksOffset>=page.total){cacheTracksOffset=Math.floor((page.total-1)/cacheTracksPageSize)*cacheTracksPageSize;cacheTracksLoading=false;return loadCacheTracks()}
+    renderCacheTracks(page)
+  }
+  catch(e){$('cacheTracksMeta').textContent='读取失败';$('cacheTracks').textContent='读取磁盘缓存歌曲失败: '+e.message}
+  finally{cacheTracksLoading=false}
+}
+function changeCacheTracksPage(direction){
+  if(cacheTracksLoading)return
+  cacheTracksOffset=Math.max(0,cacheTracksOffset+direction*cacheTracksPageSize)
+  loadCacheTracks()
 }
 async function loadStatus(){
   try{
@@ -1299,7 +1491,7 @@ function toggleRefresh(){
   if(!refreshPaused)refreshAll()
 }
 async function refreshAll(){
-  const results=await Promise.allSettled([loadMonitor(),loadHistory(),refreshPlayer(),loadLoginState()])
+  const results=await Promise.allSettled([loadMonitor(),loadHistory(),refreshPlayer(),loadPlaybackInsights(),loadLoginState()])
   const failed=results.find((item)=>item.status==='rejected')
   if(failed)setResult('刷新失败: '+failed.reason.message)
 }
@@ -1325,6 +1517,7 @@ loadOperatorWorkflows()
 refreshAll()
 setInterval(()=>{if(!refreshPaused)loadMonitor()},1000)
 setInterval(()=>{if(!refreshPaused)refreshPlayer()},1000)
+setInterval(()=>{if(!refreshPaused)loadPlaybackInsights()},5000)
 setInterval(()=>{if(!refreshPaused)loadLoginState()},2000)
 
 /* ===== 高级控制（原 /tools 独立页面，已并入左侧导航） ===== */
@@ -1413,6 +1606,562 @@ document.addEventListener('keydown',event=>{
   }
 })
 initToolsPage()
+
+/* ===== 配置中心（阶段 6：Web 配置页面） ===== */
+const SECRET_MASK_TEXT='••••••'
+let configSchema=null
+let configData=null            // GET /config 响应 {revision, sections}
+let configDirty=new Set()      // 有未保存修改的段名集合
+let configActiveSection=null   // 当前选中分组
+let configUnsaved=false
+let configLoading=false
+let configSaving=false
+let configSavedAtMs=null       // 本次会话最近一次成功保存/回滚的时间
+let configLatestRevisionAtMs=null // 服务端最新历史版本时间（首次加载时展示用）
+let configSearchText=''
+let configRevisionsOpen=false
+function showConfigMessage(text,kind){
+  const el=$('configMessage')
+  if(!el)return
+  el.textContent=text
+  el.className='config-message'+(kind?' '+kind:'')
+  el.classList.remove('hidden')
+}
+function clearConfigMessage(){const el=$('configMessage');if(el)el.classList.add('hidden')}
+function configSectionByName(name){return (configSchema||[]).find(s=>s.name===name)}
+function configFieldByPath(path){
+  const section=configSectionByName(String(path||'').split('.')[0])
+  return section&&section.fields.find(f=>f.path===path)
+}
+function configValueAt(sectionName,path){
+  const seg=String(path).split('.')
+  if(seg[0]!==sectionName)return undefined
+  let node=configData&&configData.sections?configData.sections[sectionName]:undefined
+  for(let i=1;i<seg.length;i++){
+    if(node==null||typeof node!=='object')return undefined
+    node=node[seg[i]]
+  }
+  return node
+}
+function getNestedValue(node,seg){
+  for(const key of seg){
+    if(node==null||typeof node!=='object'||!(key in node))return undefined
+    node=node[key]
+  }
+  return node
+}
+function setNestedValue(root,seg,value){
+  let node=root
+  for(let i=0;i<seg.length-1;i++){
+    if(node[seg[i]]==null||typeof node[seg[i]]!=='object')node[seg[i]]={}
+    node=node[seg[i]]
+  }
+  node[seg[seg.length-1]]=value
+}
+function configControlId(path){return 'cfg-'+String(path).replace(/\./g,'-')}
+function configNullableObjectParent(sectionName,path){
+  // 找同段中 path 的 nullable object 父字段（如 audio_cache.enabled -> audio_cache）；
+  // 父值为 null 时子字段禁用，避免写入无处安放的值。
+  const seg=String(path).split('.')
+  for(let i=seg.length-1;i>=1;i--){
+    const field=configFieldByPath(seg.slice(0,i).join('.'))
+    if(field&&field.nullable&&field.kind&&field.kind.type==='object')return field
+  }
+  return null
+}
+function configFieldMatches(field){
+  if(!configSearchText)return true
+  return [field.label,field.path,field.hint].join(' ').toLowerCase().includes(configSearchText)
+}
+function configSectionHasMatch(section){
+  if(!configSearchText)return true
+  return section.fields.some(configFieldMatches)
+}
+function markConfigDirty(sectionName){
+  configDirty.add(sectionName)
+  configUnsaved=true
+  clearConfigFieldErrors()
+  renderConfigStatus()
+  renderConfigSectionList()
+}
+function renderConfigStatus(){
+  const rev=$('configRevision')
+  if(rev)rev.textContent=configData&&configData.revision!=null?String(configData.revision):'-'
+  const savedAt=$('configSavedAt')
+  if(savedAt){
+    const ts=configSavedAtMs||configLatestRevisionAtMs
+    savedAt.textContent='上次保存: '+(ts?new Date(ts).toLocaleString('zh-CN',{hour12:false}):'尚未保存')
+  }
+  const hint=$('configDirtyHint')
+  if(hint){
+    hint.classList.toggle('hidden',!configUnsaved)
+    hint.textContent='有未保存的修改（'+configDirty.size+' 段）'
+  }
+}
+function renderConfigSectionList(){
+  const el=$('configSectionList')
+  if(!el)return
+  el.innerHTML=(configSchema||[]).map(section=>{
+    if(!configSectionHasMatch(section))return ''
+    const dirty=configDirty.has(section.name)
+    const active=section.name===configActiveSection?' active':''
+    return '<button type="button" class="config-section-item'+active+'" onclick="selectConfigSection(\''+section.name+'\')"><span>'+esc(section.label)+'</span><span class="section-name">'+esc(section.name)+'</span>'+(dirty?'<span class="dirty-dot" title="有未保存修改"></span>':'')+'</button>'
+  }).join('')||'<div class="config-field-hint" style="padding:var(--sp-2)">没有匹配的配置段</div>'
+}
+function selectConfigSection(name){
+  configActiveSection=name
+  renderConfigSectionList()
+  renderConfigForm()
+}
+function configEffectTag(field){
+  if(field.source==='bootstrap')return '<span class="config-effect bootstrap">config.yaml</span>'
+  const map={live:['live','立即生效'],nextTask:['next','下一任务生效'],restart:['restart','重启生效']}
+  const item=map[field.effect]||['restart','重启生效']
+  return '<span class="config-effect '+item[0]+'">'+item[1]+'</span>'
+}
+function configDefaultText(value){
+  if(value==null)return 'null'
+  if(typeof value==='string')return value.length>48?esc(value.slice(0,48))+'…':esc(value)
+  if(typeof value==='boolean'||typeof value==='number')return String(value)
+  const text=JSON.stringify(value)
+  return text.length>48?esc(text.slice(0,48))+'…':esc(text)
+}
+function configControlHtml(field,value){
+  const kind=field.kind&&field.kind.type
+  const id=configControlId(field.path)
+  const path=field.path
+  const disabledAttr=field.source==='bootstrap'?' disabled':''
+  const parent=configNullableObjectParent(configActiveSection,path)
+  const parentNull=parent&&configValueAt(configActiveSection,parent.path)==null
+  const parentAttr=parent?(' data-cfg-parent="'+parent.path+'"'+(parentNull?' disabled':'')):''
+  if(kind==='bool'){
+    return '<label class="switch-line"><input id="'+id+'" type="checkbox" data-cfg="'+path+'"'+(value===true?' checked':'')+disabledAttr+parentAttr+'>'+(value===true?'已启用':'未启用')+'</label>'
+  }
+  if(kind==='int'||kind==='float'){
+    const min=field.kind.min!=null?' min="'+field.kind.min+'"':''
+    const max=field.kind.max!=null?' max="'+field.kind.max+'"':''
+    const step=kind==='float'?' step="any"':''
+    return '<input id="'+id+'" type="number" data-cfg="'+path+'" data-cfg-sub="1"'+min+max+step+' value="'+(value==null?'':esc(String(value)))+'"'+disabledAttr+parentAttr+'>'
+  }
+  if(kind==='string'||kind==='path'){
+    return '<input id="'+id+'" type="text" data-cfg="'+path+'" value="'+(value==null?'':esc(String(value)))+'" placeholder="'+(field.nullable?'留空表示 null':'')+'"'+disabledAttr+parentAttr+'>'
+  }
+  if(kind==='enum'){
+    const values=Array.isArray(field.kind.values)?field.kind.values:[]
+    const unknown=value!=null&&!values.some(item=>item.value===String(value))
+    const placeholder=unknown?'<option value="">（未知值 '+esc(String(value))+'）</option>':'<option value="">（未选择）</option>'
+    const options=values.map(item=>'<option value="'+esc(item.value)+'"'+(String(value)===item.value?' selected':'')+'>'+esc(item.label)+'</option>').join('')
+    return '<select id="'+id+'" data-cfg="'+path+'"'+disabledAttr+parentAttr+'>'+placeholder+options+'</select>'
+  }
+  if(kind==='stringArray'){
+    const items=Array.isArray(value)?value:[]
+    const rows=items.map(item=>'<div class="config-string-row" data-cfg-row><input type="text" data-cfg="'+path+'" data-cfg-array="1" value="'+esc(String(item))+'"><button type="button" class="btn small ghost" onclick="configArrayRemove(this)">删除</button></div>').join('')
+    return '<div class="config-array" id="'+id+'">'+rows+'<div class="config-string-row"><button type="button" class="btn small" onclick="configArrayAdd(\''+path+'\')">添加一行</button></div></div>'
+  }
+  if(kind==='object'){
+    const text=value==null?'':JSON.stringify(value,null,2)
+    const placeholder=field.nullable?'null 表示未启用；填入 JSON 对象以启用':'必须是 JSON 对象'
+    let html='<textarea id="'+id+'" data-cfg="'+path+'" data-cfg-object="1" placeholder="'+placeholder+'"'+disabledAttr+'>'+esc(text)+'</textarea>'
+    if(field.nullable&&value==null)html+='<div class="config-field-hint">当前未启用（null）。填入 JSON 对象后下方子字段自动可用。</div>'
+    return html
+  }
+  if(kind==='rect'||kind==='point'){
+    const keys=kind==='rect'?['x','y','width','height']:['x','y']
+    const labels={x:'X',y:'Y',width:'宽',height:'高'}
+    const nums=keys.map(key=>'<label>'+labels[key]+'<input id="'+id+'-'+key+'" type="number" data-cfg="'+path+'" data-cfg-sub="1" data-key="'+key+'" value="'+(value&&value[key]!=null?esc(String(value[key])):'')+'"'+disabledAttr+parentAttr+'></label>').join('')
+    return '<div class="config-num-row'+(keys.length===2?' two':'')+'">'+nums+'</div>'
+  }
+  if(kind==='secret'){
+    const note=value===SECRET_MASK_TEXT?'当前已设置密钥，留空保存表示不修改；点「清除」可移除':'当前未设置'
+    return '<div class="config-string-row"><input id="'+id+'" type="password" data-cfg="'+path+'" value="" placeholder="留空表示不修改" autocomplete="new-password"'+disabledAttr+'><button type="button" class="btn small warn" onclick="clearConfigSecret(\''+path+'\')"'+disabledAttr+'>清除</button></div><div class="config-field-hint">'+note+'</div>'
+  }
+  return ''
+}
+function renderConfigForm(){
+  const form=$('configForm')
+  if(!form)return
+  const section=configSectionByName(configActiveSection)
+  if(!section){form.innerHTML='<div class="config-message err">配置段不存在</div>';return}
+  const parts=['<div class="config-form">']
+  for(const field of section.fields){
+    const id=configControlId(field.path)
+    const value=configValueAt(section.name,field.path)
+    const bootstrap=field.source==='bootstrap'
+    const hiddenBySearch=!configFieldMatches(field)
+    parts.push('<div class="config-field'+(bootstrap?' bootstrap':'')+(hiddenBySearch?' hidden':'')+'" data-cfg-field="'+field.path+'" id="cfg-field-'+id+'">')
+    parts.push('<div class="config-field-head"><b>'+esc(field.label)+'</b><code>'+esc(field.path)+'</code>'+configEffectTag(field)+'</div>')
+    if(field.hint)parts.push('<div class="config-field-hint">'+esc(field.hint)+'</div>')
+    parts.push(configControlHtml(field,value))
+    parts.push('<div class="config-field-meta">')
+    if(field.default!=null)parts.push('<span>默认: '+configDefaultText(field.default)+'</span>')
+    parts.push('</div>')
+    if(bootstrap)parts.push('<div class="config-readonly-note">该字段由 config.yaml 提供，在 config.yaml 修改后重启生效</div>')
+    parts.push('</div>')
+  }
+  parts.push('</div>')
+  form.innerHTML=parts.join('')
+}
+function validateConfigNumber(el,field){
+  const raw=String(el.value||'').trim()
+  if(raw===''){el.classList.remove('config-invalid');return}
+  const kind=field.kind||{}
+  const n=kind.type==='float'?parseFloat(raw):parseInt(raw,10)
+  const valid=Number.isFinite(n)&&!((kind.min!=null&&n<kind.min)||(kind.max!=null&&n>kind.max))
+  el.classList.toggle('config-invalid',!valid)
+}
+function configFillControl(el,val){
+  if(!el)return
+  if(el.type==='checkbox'){el.checked=val===true;return}
+  if(el.tagName==='SELECT'){el.value=val==null?'':String(val);return}
+  el.value=val==null?'':String(val)
+}
+function onConfigObjectInput(el,field){
+  // 父级 object（audio_cache 等）输入合法 JSON 对象后，启用并回填子字段控件。
+  try{
+    const value=JSON.parse(el.value||'null')
+    if(value&&typeof value==='object'&&!Array.isArray(value)){
+      el.classList.remove('config-invalid')
+      document.querySelectorAll('[data-cfg-parent="'+field.path+'"]').forEach(child=>{
+        const val=getNestedValue(value,String(child.dataset.cfg).split('.').slice(1))
+        child.disabled=false
+        configFillControl(child,val)
+      })
+    }else{
+      const text=String(el.value||'').trim()
+      const nulled=text===''||text==='null'
+      el.classList.toggle('config-invalid',!nulled)
+      // 输入 null/空（提交后父级为 null）→ 禁用并清空子字段，避免残留旧值。
+      if(nulled)document.querySelectorAll('[data-cfg-parent="'+field.path+'"]').forEach(child=>{
+        child.disabled=true
+        configFillControl(child,null)
+      })
+    }
+  }catch{el.classList.add('config-invalid')}
+}
+function onConfigFormInput(e){
+  const el=e.target
+  const path=el&&el.dataset&&el.dataset.cfg
+  if(!path)return
+  const field=configFieldByPath(path)
+  if(!field||field.source==='bootstrap')return
+  const kind=field.kind&&field.kind.type
+  if((kind==='int'||kind==='float'||kind==='rect'||kind==='point')&&el.dataset.cfgSub==='1')validateConfigNumber(el,field)
+  if(kind==='object'&&el.tagName==='TEXTAREA')onConfigObjectInput(el,field)
+  if(el.dataset.cfgClear!==undefined)delete el.dataset.cfgClear
+  markConfigDirty(String(path).split('.')[0])
+}
+function onConfigFormChange(e){
+  const el=e.target
+  const path=el&&el.dataset&&el.dataset.cfg
+  if(!path)return
+  const field=configFieldByPath(path)
+  if(!field||field.source==='bootstrap')return
+  markConfigDirty(String(path).split('.')[0])
+}
+function configArrayAdd(path){
+  const box=document.getElementById(configControlId(path))
+  if(!box)return
+  const row=document.createElement('div')
+  row.className='config-string-row'
+  row.dataset.cfgRow='1'
+  row.innerHTML='<input type="text" data-cfg="'+path+'" data-cfg-array="1" value=""><button type="button" class="btn small ghost" onclick="configArrayRemove(this)">删除</button>'
+  box.insertBefore(row,box.lastElementChild)
+  row.querySelector('input').focus()
+  markConfigDirty(String(path).split('.')[0])
+}
+function configArrayRemove(button){
+  const row=button.closest('[data-cfg-row]')
+  if(!row)return
+  const input=row.querySelector('input[data-cfg]')
+  const path=input&&input.dataset.cfg
+  row.remove()
+  if(path)markConfigDirty(String(path).split('.')[0])
+}
+function clearConfigSecret(path){
+  const el=document.getElementById(configControlId(path))
+  if(!el)return
+  el.value=''
+  el.dataset.cfgClear='1'
+  markConfigDirty(String(path).split('.')[0])
+}
+function collectConfigFieldValue(field,sectionName){
+  const kind=field.kind&&field.kind.type
+  const el=document.getElementById(configControlId(field.path))
+  if(!el)return {skip:true}
+  // 父级 nullable object 当前提交值为 null（库中为 null，或 textarea 输入为空/“null”）
+  // → 跳过子字段，避免把旧子字段写回提交段导致父级重新变成对象。
+  const parent=configNullableObjectParent(sectionName,field.path)
+  if(parent){
+    const parentEl=document.getElementById(configControlId(parent.path))
+    const parentText=parentEl&&parentEl.dataset.cfgObject==='1'?String(parentEl.value||'').trim():''
+    if(configValueAt(sectionName,parent.path)==null||parentText===''||parentText==='null')return {skip:true}
+  }
+  if(kind==='bool')return {value:el.checked}
+  if(kind==='int'||kind==='float'){
+    const raw=String(el.value||'').trim()
+    if(raw==='')return {value:null}
+    const n=kind==='float'?parseFloat(raw):parseInt(raw,10)
+    return {value:Number.isFinite(n)?n:null}
+  }
+  if(kind==='string'||kind==='path'){
+    const v=el.value
+    if(field.nullable&&String(v||'').trim()==='')return {value:null}
+    return {value:v}
+  }
+  if(kind==='enum')return {value:el.value===''?null:el.value}
+  if(kind==='stringArray'){
+    const rows=el.closest('.config-field')?el.closest('.config-field').querySelectorAll('input[data-cfg-array]'):[]
+    return {value:[...rows].map(i=>String(i.value||'').trim()).filter(v=>v!=='')}
+  }
+  if(kind==='object'){
+    const text=String(el.value||'').trim()
+    // 空文本或 “null” 都表示提交 null（清空可空对象）。
+    if(text===''||text==='null')return {value:null}
+    try{
+      const value=JSON.parse(text)
+      if(value&&typeof value==='object'&&!Array.isArray(value))return {value}
+      return {invalid:true}
+    }catch{return {invalid:true}}
+  }
+  if(kind==='rect'||kind==='point'){
+    const keys=kind==='rect'?['x','y','width','height']:['x','y']
+    const out={}
+    for(const key of keys){
+      const input=document.getElementById(configControlId(field.path)+'-'+key)
+      const raw=String(input?input.value||'':'').trim()
+      out[key]=raw===''?null:Number(raw)
+    }
+    return {value:out}
+  }
+  if(kind==='secret'){
+    if(el.dataset.cfgClear==='1')return {clear:true}
+    return {value:String(el.value||'')}
+  }
+  return {skip:true}
+}
+function configBuildSubmitSections(){
+  const sections={}
+  for(const name of [...configDirty]){
+    const section=configSectionByName(name)
+    if(!section)continue
+    const base=configData&&configData.sections?configData.sections[name]:null
+    const out=(base&&typeof base==='object')?JSON.parse(JSON.stringify(base)):{}
+    let invalidField=null
+    for(const field of section.fields){
+      if(field.source==='bootstrap')continue
+      const collected=collectConfigFieldValue(field,name)
+      if(collected.skip)continue
+      if(collected.invalid){invalidField=field;break}
+      const seg=String(field.path).split('.').slice(1)
+      if(collected.clear)setNestedValue(out,seg,{'__clear__':true})
+      else setNestedValue(out,seg,collected.value)
+    }
+    if(invalidField){
+      showConfigMessage('字段「'+invalidField.label+'」的值格式无效，请检查后重试','err')
+      return null
+    }
+    sections[name]=out
+  }
+  return sections
+}
+function applyConfigErrors(errors){
+  clearConfigFieldErrors()
+  const lines=[]
+  for(const error of Array.isArray(errors)?errors:[]){
+    const field=error&&error.field
+    if(field){
+      const input=document.getElementById(configControlId(field))
+      const box=document.getElementById('cfg-field-'+configControlId(field))
+      if(input)input.classList.add('config-invalid')
+      if(box)box.classList.add('err')
+      const meta=configFieldByPath(field)
+      lines.push((meta?meta.label+'（'+field+'）':field)+'：'+error.message)
+    }else if(error&&error.message){
+      lines.push(error.message)
+    }
+  }
+  showConfigMessage('保存校验失败：\n'+lines.join('\n'),'err')
+}
+function clearConfigFieldErrors(){
+  document.querySelectorAll('#configForm .err').forEach(el=>el.classList.remove('err'))
+  document.querySelectorAll('#configForm .config-invalid').forEach(el=>el.classList.remove('config-invalid'))
+}
+function formatConfigFields(paths){
+  return (Array.isArray(paths)?paths:[]).map(path=>{
+    const field=configFieldByPath(path)
+    return field?field.label+'（'+path+'）':path
+  }).join('、')||'无'
+}
+function setConfigSavingUI(saving){
+  document.querySelectorAll('#page-config .btn').forEach(btn=>{btn.disabled=saving})
+  const btn=$('configSaveBtn')
+  if(btn)btn.textContent=saving?'保存中...':'保存全部'
+}
+async function applyConfigSaveResult(resp,action){
+  configSavedAtMs=Date.now()
+  configLatestRevisionAtMs=Date.now()
+  configDirty.clear()
+  configUnsaved=false
+  // 重新拉取完整配置（服务端可能规范化/解析相对路径）。
+  const data=await request('/config')
+  configData=data
+  renderConfigStatus()
+  renderConfigSectionList()
+  renderConfigForm()
+  let message=action+'成功，当前版本 '+resp.revision
+  if(resp.restartRequired)message+='\n以下配置需重启生效：'+formatConfigFields(resp.restartFields)
+  if(resp.appliedLiveFields&&resp.appliedLiveFields.length)message+='\n已立即生效：'+formatConfigFields(resp.appliedLiveFields)
+  showConfigMessage(message,'ok')
+  if(configRevisionsOpen)loadConfigRevisions()
+}
+async function loadConfigPage(){
+  if(configLoading)return
+  configLoading=true
+  try{
+    const [schema,data,revisions]=await Promise.all([request('/config/schema'),request('/config'),request('/config/revisions')])
+    configSchema=Array.isArray(schema&&schema.sections)?schema.sections:[]
+    configData=data||{}
+    configDirty.clear()
+    configUnsaved=false
+    const latest=Array.isArray(revisions&&revisions.revisions)&&revisions.revisions.length?revisions.revisions[0]:null
+    configLatestRevisionAtMs=latest&&latest.createdAtMs?Number(latest.createdAtMs):null
+    if(!configActiveSection||!configSchema.some(s=>s.name===configActiveSection))configActiveSection=configSchema.length?configSchema[0].name:null
+    renderConfigStatus()
+    renderConfigSectionList()
+    renderConfigForm()
+    clearConfigMessage()
+    if(configRevisionsOpen)loadConfigRevisions()
+  }catch(e){
+    showConfigMessage('加载配置失败: '+e.message,'err')
+  }finally{
+    configLoading=false
+  }
+}
+async function saveConfig(){
+  if(configSaving)return
+  const sections=configBuildSubmitSections()
+  if(!sections)return
+  if(!Object.keys(sections).length){showConfigMessage('没有需要保存的修改','err');return}
+  configSaving=true
+  setConfigSavingUI(true)
+  try{
+    // 保存前先预检（与后端 save 同一校验路径）。
+    const validation=await requestJson('/config/validate',{sections})
+    if(validation&&Array.isArray(validation.errors)&&validation.errors.length){
+      applyConfigErrors(validation.errors)
+      return
+    }
+    const resp=await requestJson('/config/save',{baseRevision:configData&&configData.revision!=null?configData.revision:0,sections})
+    if(!resp||resp.ok!==true){
+      if(resp&&resp.code==='config_conflict'){
+        showConfigMessage('保存失败：配置已被其他修改，请刷新后重试','err')
+        await loadConfigPage()
+      }else if(resp&&Array.isArray(resp.errors)&&resp.errors.length){
+        applyConfigErrors(resp.errors)
+      }else{
+        showConfigMessage('保存失败：'+(resp&&resp.message||'未知错误'),'err')
+      }
+      return
+    }
+    await applyConfigSaveResult(resp,'已保存')
+  }catch(e){showConfigMessage('保存失败: '+e.message,'err')}
+  finally{configSaving=false;setConfigSavingUI(false)}
+}
+function configDefaultSections(){
+  // 按 schema 各字段 default 组装段对象；父级 default 为 null（如 audio_cache）
+  // 时子字段不写入；http/logging 为启动引导段，不参与恢复。
+  const sections={}
+  for(const section of configSchema){
+    if(section.name==='http'||section.name==='logging')continue
+    const obj={}
+    for(const field of section.fields){
+      if(field.source==='bootstrap')continue
+      const seg=String(field.path).split('.').slice(1)
+      const parentVal=seg.length>1?getNestedValue(obj,seg.slice(0,-1)):obj
+      if(parentVal===null)continue
+      const def=field.default
+      setNestedValue(obj,seg,def==null?null:JSON.parse(JSON.stringify(def)))
+    }
+    sections[section.name]=obj
+  }
+  return sections
+}
+async function restoreDefaults(){
+  if(configSaving)return
+  if(configUnsaved&&!confirm('有未保存的修改，恢复默认将丢弃这些修改。确定继续？'))return
+  if(!confirm('将恢复所有配置为默认值，此操作会覆盖当前全部配置，确定？'))return
+  const sections=configDefaultSections()
+  configSaving=true
+  setConfigSavingUI(true)
+  try{
+    const resp=await requestJson('/config/save',{baseRevision:configData&&configData.revision!=null?configData.revision:0,sections})
+    if(!resp||resp.ok!==true){
+      if(resp&&resp.code==='config_conflict'){
+        showConfigMessage('恢复失败：配置已被其他修改，请刷新后重试','err')
+        await loadConfigPage()
+      }else if(resp&&Array.isArray(resp.errors)&&resp.errors.length){
+        applyConfigErrors(resp.errors)
+      }else{
+        showConfigMessage('恢复默认失败：'+(resp&&resp.message||'未知错误'),'err')
+      }
+      return
+    }
+    await applyConfigSaveResult(resp,'已恢复默认配置')
+  }catch(e){showConfigMessage('恢复默认失败: '+e.message,'err')}
+  finally{configSaving=false;setConfigSavingUI(false)}
+}
+function toggleConfigRevisions(){
+  configRevisionsOpen=!configRevisionsOpen
+  const panel=$('configRevisionsPanel')
+  if(panel)panel.hidden=!configRevisionsOpen
+  if(configRevisionsOpen)loadConfigRevisions()
+}
+async function loadConfigRevisions(){
+  const el=$('configRevisions')
+  if(!el)return
+  try{
+    const resp=await request('/config/revisions')
+    const items=Array.isArray(resp&&resp.revisions)?resp.revisions:[]
+    if(items.length&&configLatestRevisionAtMs==null)configLatestRevisionAtMs=Number(items[0].createdAtMs||0)||null
+    renderConfigStatus()
+    const current=configData&&configData.revision!=null?Number(configData.revision):null
+    el.innerHTML=items.map(item=>{
+      const isCurrent=Number(item.revision)===current
+      const time=item.createdAtMs?new Date(Number(item.createdAtMs)).toLocaleString('zh-CN',{hour12:false}):'时间未知'
+      return '<div class="history-item"><div><span class="history-time">#'+esc(String(item.revision))+'</span><b>'+esc(time)+'</b>'+(isCurrent?'<span class="field-state ok" style="margin-left:var(--sp-2)">当前</span>':'')+'</div><div class="history-result"><button type="button" class="btn small" onclick="rollbackTo('+Number(item.revision)+')" '+(isCurrent||configSaving?'disabled':'')+'>回滚到此版本</button></div></div>'
+    }).join('')||'暂无历史版本'
+  }catch(e){el.textContent='读取历史版本失败: '+e.message}
+}
+async function rollbackTo(rev){
+  if(configSaving)return
+  if(!confirm('确定回滚到版本 #'+rev+'？当前未保存的修改将被丢弃，回滚会记录为新版本。'))return
+  configSaving=true
+  setConfigSavingUI(true)
+  try{
+    const resp=await requestJson('/config/rollback',{revision:Number(rev)})
+    if(!resp||resp.ok!==true){
+      if(resp&&resp.code==='config_conflict'){
+        showConfigMessage('回滚失败：配置已被其他修改，请刷新后重试','err')
+        await loadConfigPage()
+      }else{
+        showConfigMessage('回滚失败：'+(resp&&resp.message||'未知错误'),'err')
+      }
+      return
+    }
+    await applyConfigSaveResult(resp,'已回滚到版本 #'+rev)
+  }catch(e){showConfigMessage('回滚失败: '+e.message,'err')}
+  finally{configSaving=false;setConfigSavingUI(false)}
+}
+$('configForm').addEventListener('input',onConfigFormInput)
+$('configForm').addEventListener('change',onConfigFormChange)
+$('configSearch').addEventListener('input',()=>{
+  configSearchText=$('configSearch').value.trim().toLowerCase()
+  renderConfigSectionList()
+  renderConfigForm()
+})
+window.addEventListener('beforeunload',(e)=>{
+  if(configUnsaved){e.preventDefault();e.returnValue='有未保存的配置修改，确定离开？'}
+})
 </script>
 </body>
 </html>

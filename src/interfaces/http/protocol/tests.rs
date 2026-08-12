@@ -1,7 +1,9 @@
 use super::*;
+use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::ops::{Deref, DerefMut};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::composition::application::http_facade::ApplicationHttpCommandFacade;
@@ -17,7 +19,10 @@ use crate::interfaces::http::{
 use crate::runtime::chat_listener::ChatListenerState;
 use crate::runtime::player_io::SearchCandidate;
 use crate::runtime::scheduler::{DiagnosticTaskSnapshot, FormalTaskReceipt};
-use miliastra_playback::{KugouAccountStatus, KugouListenReport, LoginSession};
+use miliastra_playback::{
+    AudioCacheStats, AudioCacheTrackStatus, CachedTrackInfo, CachedTrackPage, KugouAccountStatus,
+    KugouListenReport, LoginSession, TrackKey,
+};
 
 fn custom_workflow_service_from_config_parts(
     config: &CustomWorkflowConfig,
@@ -621,6 +626,119 @@ impl HttpPlayerPort for HttpTestPlayerPort {
         Ok(self.status.clone())
     }
 
+    fn cache_stats(
+        &self,
+        keys: &[TrackKey],
+    ) -> Result<(Option<AudioCacheStats>, Vec<AudioCacheTrackStatus>)> {
+        Ok((
+            Some(AudioCacheStats {
+                enabled: true,
+                directory: "deps/cache/audio".to_string(),
+                complete_entries: 3,
+                complete_bytes: 1024,
+                max_bytes: 2048,
+                active_downloads: 1,
+                lyrics_entries: 2,
+                lyrics_bytes: 128,
+                play_count: 12,
+                requested_play_count: 9,
+                pool_play_count: 3,
+                cache_hit_count: 8,
+                failure_count: 2,
+            }),
+            keys.iter()
+                .map(|key| AudioCacheTrackStatus {
+                    source: key.provider.to_string(),
+                    id: key.id.clone(),
+                    cached: true,
+                    bytes: Some(512),
+                    play_count: 4,
+                    requested_play_count: 3,
+                    pool_play_count: 1,
+                    cache_hit_count: 3,
+                    failure_count: 1,
+                    last_played_at_ms: Some(1_700_000_100_000),
+                    last_failure_code: Some("decode_failure".to_string()),
+                })
+                .collect(),
+        ))
+    }
+
+    fn cached_tracks(&self, offset: usize, limit: usize) -> Result<CachedTrackPage> {
+        // 模拟两条已知曲目与一条未知孤儿（无身份信息）的混合分页数据。
+        let tracks = vec![
+            CachedTrackInfo {
+                hash: "hash-known-a".to_string(),
+                source: Some("qqmusic".to_string()),
+                id: Some("song-a".to_string()),
+                title: Some("晴天".to_string()),
+                artists: Some(vec!["周杰伦".to_string()]),
+                album: Some("叶惠美".to_string()),
+                duration_ms: Some(269_000),
+                bytes: 8_388_608,
+                complete: true,
+                cached_at_ms: 1_700_000_000_000,
+                last_used_at_ms: 1_700_000_100_000,
+                play_count: 5,
+                requested_play_count: 4,
+                pool_play_count: 1,
+                cache_hit_count: 3,
+                failure_count: 1,
+                last_played_at_ms: Some(1_700_000_090_000),
+                last_failure_code: Some("decode_failure".to_string()),
+                downloaded_at_ms: Some(1_700_000_000_000),
+            },
+            CachedTrackInfo {
+                hash: "hash-known-b".to_string(),
+                source: Some("netease".to_string()),
+                id: Some("song-b".to_string()),
+                title: Some("夜曲".to_string()),
+                artists: Some(vec!["周杰伦".to_string()]),
+                album: None,
+                duration_ms: None,
+                bytes: 4_194_304,
+                complete: true,
+                cached_at_ms: 1_700_000_200_000,
+                last_used_at_ms: 1_700_000_300_000,
+                play_count: 2,
+                requested_play_count: 1,
+                pool_play_count: 1,
+                cache_hit_count: 1,
+                failure_count: 0,
+                last_played_at_ms: Some(1_700_000_290_000),
+                last_failure_code: None,
+                downloaded_at_ms: Some(1_700_000_200_000),
+            },
+            CachedTrackInfo {
+                hash: "hash-orphan".to_string(),
+                source: None,
+                id: None,
+                title: None,
+                artists: None,
+                album: None,
+                duration_ms: None,
+                bytes: 1_048_576,
+                complete: true,
+                cached_at_ms: 1_700_000_400_000,
+                last_used_at_ms: 1_700_000_400_000,
+                play_count: 0,
+                requested_play_count: 0,
+                pool_play_count: 0,
+                cache_hit_count: 0,
+                failure_count: 0,
+                last_played_at_ms: None,
+                last_failure_code: None,
+                downloaded_at_ms: None,
+            },
+        ];
+        Ok(CachedTrackPage {
+            total: tracks.len(),
+            offset,
+            limit,
+            tracks: tracks.into_iter().skip(offset).take(limit).collect(),
+        })
+    }
+
     fn search_text(
         &self,
         keyword: &str,
@@ -785,6 +903,16 @@ impl HttpAiPort for HttpTestAiPort {
 struct HttpTestState {
     state: HttpSharedState,
     recording: Arc<RecordingHttpPort>,
+    /// 配置中心临时数据库根目录；Drop 时清理。
+    config_root: Option<PathBuf>,
+}
+
+impl Drop for HttpTestState {
+    fn drop(&mut self) {
+        if let Some(root) = self.config_root.take() {
+            let _ = fs::remove_dir_all(root);
+        }
+    }
 }
 
 impl Deref for HttpTestState {
@@ -1592,6 +1720,169 @@ fn status_route_includes_requester_for_the_matching_active_song() {
 }
 
 #[test]
+fn playback_insights_returns_history_and_cache_status() {
+    let state = test_state_with_player_port(HttpTestPlayerPort::successful());
+    state
+        .recording
+        .state
+        .lock()
+        .expect("recording state")
+        .playback
+        .previous_requests = vec![ActivePlaybackRequest {
+        keyword: "晴天 - 周杰伦".to_string(),
+        source: "qqmusic".to_string(),
+        title: "晴天".to_string(),
+        artist: "周杰伦".to_string(),
+        requester: "Alice".to_string(),
+        started_at_ms: 1_700_000_000_000,
+        track: Some(test_track("miliastra://track/qqmusic/1", "晴天 - 周杰伦")),
+        ..ActivePlaybackRequest::default()
+    }];
+
+    let value: Value = serde_json::from_str(
+        &playback_insights_route(&[], &state).expect("playback insights route"),
+    )
+    .expect("insights JSON");
+    assert_eq!(value["history"][0]["title"], "晴天");
+    assert_eq!(value["history"][0]["cached"], true);
+    assert_eq!(value["history"][0]["cacheBytes"], 512);
+    assert_eq!(value["cache"]["completeEntries"], 3);
+    assert_eq!(value["cache"]["activeDownloads"], 1);
+    assert!(is_json_route("/playback/insights"));
+    assert!(!is_mutating_route("/playback/insights"));
+}
+
+#[test]
+fn playback_statistics_reset_is_controlled_and_preserves_cache_assets() {
+    let state = test_state_with_player_port(HttpTestPlayerPort::successful());
+    let value: Value = serde_json::from_str(
+        &playback_statistics_reset_route(
+            &[
+                ("provider".to_string(), "qqmusic".to_string()),
+                ("id".to_string(), "song-a".to_string()),
+            ],
+            &state,
+        )
+        .expect("statistics reset route"),
+    )
+    .expect("statistics reset JSON");
+    assert_eq!(value["ok"], true);
+    assert_eq!(value["cachePreserved"], true);
+    assert_eq!(value["metadataPreserved"], true);
+    assert!(is_json_route("/playback/statistics/reset"));
+    assert!(is_mutating_route("/playback/statistics/reset"));
+
+    let error =
+        playback_statistics_reset_route(&[("provider".to_string(), "qqmusic".to_string())], &state)
+            .expect_err("missing id rejected");
+    assert_eq!(error.status, 400);
+}
+
+#[test]
+fn playback_cache_tracks_route_returns_paginated_camel_case_list() {
+    let state = test_state_with_player_port(HttpTestPlayerPort::successful());
+
+    let value: Value = serde_json::from_str(
+        &playback_cache_tracks_route(
+            &[
+                ("offset".to_string(), "1".to_string()),
+                ("limit".to_string(), "2".to_string()),
+            ],
+            &state,
+        )
+        .expect("cache tracks route"),
+    )
+    .expect("cache tracks JSON");
+
+    assert_eq!(value["total"], 3);
+    assert_eq!(value["offset"], 1);
+    assert_eq!(value["limit"], 2);
+    let tracks = value["tracks"].as_array().expect("tracks array");
+    assert_eq!(tracks.len(), 2);
+    assert_eq!(tracks[0]["hash"], "hash-known-b");
+    assert_eq!(tracks[0]["source"], "netease");
+    assert_eq!(tracks[0]["id"], "song-b");
+    assert_eq!(tracks[0]["title"], "夜曲");
+    assert_eq!(tracks[0]["artists"], json!(["周杰伦"]));
+    assert_eq!(tracks[0]["bytes"], 4_194_304);
+    assert_eq!(tracks[0]["complete"], true);
+    assert_eq!(tracks[0]["cachedAtMs"], 1_700_000_200_000_i64);
+    assert_eq!(tracks[0]["lastUsedAtMs"], 1_700_000_300_000_i64);
+    // 未知孤儿：身份与元数据字段为 null，前端展示为「未知缓存」。
+    let orphan = tracks[1].as_object().expect("orphan object");
+    assert_eq!(orphan["hash"], "hash-orphan");
+    assert!(orphan["source"].is_null());
+    assert!(orphan["id"].is_null());
+    assert!(orphan["title"].is_null());
+    assert!(orphan["album"].is_null());
+    assert!(orphan["durationMs"].is_null());
+
+    // 缺省参数：offset=0、limit=100。
+    let default_page: Value = serde_json::from_str(
+        &playback_cache_tracks_route(&[], &state).expect("default cache tracks route"),
+    )
+    .expect("default page JSON");
+    assert_eq!(default_page["offset"], 0);
+    assert_eq!(default_page["limit"], 100);
+    assert_eq!(default_page["tracks"].as_array().map(Vec::len), Some(3));
+
+    assert!(is_json_route("/playback/cache/tracks"));
+    assert!(!is_mutating_route("/playback/cache/tracks"));
+}
+
+#[test]
+fn playback_cache_tracks_route_rejects_invalid_pagination() {
+    let state = test_state();
+
+    let error = playback_cache_tracks_route(&[("limit".to_string(), "abc".to_string())], &state)
+        .expect_err("non-numeric limit rejected");
+    assert_eq!(error.status, 400);
+    assert!(error.message.contains("limit"));
+
+    let error = playback_cache_tracks_route(&[("offset".to_string(), "-1".to_string())], &state)
+        .expect_err("negative offset rejected");
+    assert_eq!(error.status, 400);
+    assert!(error.message.contains("offset"));
+
+    let error = playback_cache_tracks_route(&[("limit".to_string(), "0".to_string())], &state)
+        .expect_err("zero limit rejected");
+    assert_eq!(error.status, 400);
+    assert!(error.message.contains("limit"));
+}
+
+#[test]
+fn playback_cache_tracks_contract_over_real_http_and_clamps_limit() {
+    let mut state = test_state();
+    let server = start_test_http_server(&mut state, "");
+    let address = server.local_addr();
+
+    let page = http_get(address, "/playback/cache/tracks?offset=1&limit=2", None);
+    assert_eq!(page.status_line, "HTTP/1.1 200 OK");
+    assert_eq!(
+        page.headers.get("content-type").map(String::as_str),
+        Some("application/json; charset=utf-8")
+    );
+    let value: Value = serde_json::from_str(&page.body).expect("page JSON");
+    assert_eq!(value["total"], 3);
+    assert_eq!(value["offset"], 1);
+    assert_eq!(value["limit"], 2);
+    assert_eq!(value["tracks"][0]["title"], "夜曲");
+
+    // 超过最大页大小 500 时收敛到 500，不报错。
+    let clamped = http_get(address, "/playback/cache/tracks?limit=9999", None);
+    assert_eq!(clamped.status_line, "HTTP/1.1 200 OK");
+    let value: Value = serde_json::from_str(&clamped.body).expect("clamped page JSON");
+    assert_eq!(value["limit"], 500);
+
+    // 非法参数返回 400。
+    let invalid = http_get(address, "/playback/cache/tracks?limit=abc", None);
+    assert_eq!(invalid.status_line, "HTTP/1.1 400 Bad Request");
+    assert!(invalid.body.contains("limit"));
+
+    server.shutdown().expect("shutdown HTTP server");
+}
+
+#[test]
 fn remote_song_routes_are_queued_json_post_routes() {
     assert!(is_mutating_route("/searchPlay"));
     assert!(is_mutating_route("/ai/search"));
@@ -1791,6 +2082,45 @@ fn page_displays_song_requester() {
 }
 
 #[test]
+fn page_displays_disk_cache_track_list() {
+    assert!(PAGE.contains("磁盘缓存歌曲"));
+    assert!(PAGE.contains("id=\"cacheTracks\""));
+    assert!(PAGE.contains("loadCacheTracks()"));
+    assert!(PAGE.contains("id=\"cacheTracksPrev\""));
+    assert!(PAGE.contains("id=\"cacheTracksNext\""));
+    assert!(PAGE.contains("changeCacheTracksPage(-1)"));
+    assert!(PAGE.contains("changeCacheTracksPage(1)"));
+    assert!(PAGE.contains("offset='+cacheTracksOffset+'&limit='+cacheTracksPageSize"));
+    assert!(PAGE.contains("共 '+total+' 首 · 第 '"));
+    // 未知孤儿曲目展示为「未知缓存」。
+    assert!(PAGE.contains("未知缓存"));
+}
+
+#[test]
+fn page_contains_config_center() {
+    // 内嵌页面必须与配置中心后端接口配套：导航、页面容器与全部接口调用点。
+    assert!(PAGE.contains("配置中心"));
+    assert!(PAGE.contains("data-route=\"config\""));
+    assert!(PAGE.contains("id=\"page-config\""));
+    assert!(PAGE.contains("function loadConfigPage()"));
+    assert!(PAGE.contains("function saveConfig()"));
+    assert!(PAGE.contains("function restoreDefaults()"));
+    assert!(PAGE.contains("function rollbackTo(rev)"));
+    assert!(PAGE.contains("function loadConfigRevisions()"));
+    assert!(PAGE.contains("request('/config/schema')"));
+    assert!(PAGE.contains("request('/config')"));
+    assert!(PAGE.contains("request('/config/revisions')"));
+    assert!(PAGE.contains("requestJson('/config/validate'"));
+    assert!(PAGE.contains("requestJson('/config/save'"));
+    assert!(PAGE.contains("requestJson('/config/rollback'"));
+    // secret 清除标记与保留语义必须体现在页面中。
+    assert!(PAGE.contains("__clear__"));
+    assert!(PAGE.contains("留空表示不修改"));
+    // 路由表必须包含 config（导航可达）。
+    assert!(PAGE.contains("'config'"));
+}
+
+#[test]
 fn remote_next_builds_console_game_command() {
     let pending = ApplicationHttpCommandFacade::remote_control_command(
         "下一首".to_string(),
@@ -1834,7 +2164,7 @@ fn refresh_toggle_runs_full_uncached_refresh_when_resumed() {
     assert!(PAGE.contains("if(!refreshPaused)refreshAll()"));
     assert!(PAGE.contains("async function refreshAll()"));
     assert!(PAGE.contains(
-        "Promise.allSettled([loadMonitor(),loadHistory(),refreshPlayer(),loadLoginState()])"
+        "Promise.allSettled([loadMonitor(),loadHistory(),refreshPlayer(),loadPlaybackInsights(),loadLoginState()])"
     ));
     assert!(PAGE.contains("cache:'no-store'"));
     assert!(!PAGE.contains("onclick=\"loadMonitor()\""));
@@ -2245,6 +2575,12 @@ fn test_state() -> HttpTestState {
     test_state_with_player_port(HttpTestPlayerPort::successful())
 }
 
+/// 构造 bootstrap.http.access_token 为非空值的测试状态，用于验证配置中心
+/// 路由对启动引导注入令牌的脱敏（http 段未入库，脱敏必须覆盖注入值）。
+fn test_state_with_bootstrap_access_token(access_token: &str) -> HttpTestState {
+    test_state_with_player_port_and_bootstrap_token(HttpTestPlayerPort::successful(), access_token)
+}
+
 #[test]
 fn internal_errors_use_a_generic_message_instead_of_leaking_details() {
     let error = internal_error(anyhow!("读取配置失败: C:\\secret\\path\\config.yaml"));
@@ -2369,9 +2705,18 @@ fn startup_wonderland_full_success_keeps_existing_contract() {
 }
 
 fn test_state_with_player_port(player: impl HttpPlayerPort + 'static) -> HttpTestState {
-    let config: AppConfig =
+    test_state_with_player_port_and_bootstrap_token(player, "")
+}
+
+fn test_state_with_player_port_and_bootstrap_token(
+    player: impl HttpPlayerPort + 'static,
+    access_token: &str,
+) -> HttpTestState {
+    let mut config: AppConfig =
         serde_yaml::from_str(include_str!("../../../../tests/fixtures/config.full.yaml"))
             .expect("default config");
+    // 配置中心的 bootstrap 注入值：非空时用于验证 http.access_token 脱敏。
+    config.http.access_token = access_token.to_string();
     let monitor = MonitorShared::new(20);
     let custom_workflow = custom_workflow_service_from_config_parts(
         &config.custom_workflows,
@@ -2380,6 +2725,22 @@ fn test_state_with_player_port(player: impl HttpPlayerPort + 'static) -> HttpTes
     );
     let recording = Arc::new(RecordingHttpPort::new());
     let login = Arc::new(HttpTestLoginPort::default());
+    // 配置中心：临时目录新建 ConfigStore，供 /config 系列路由读写。
+    let config_root = std::env::temp_dir().join(format!("http-config-store-{}", Uuid::new_v4()));
+    let database_path = config_root.join("deps/data/playback.sqlite3");
+    fs::create_dir_all(database_path.parent().unwrap()).unwrap();
+    let config_store: crate::config::SharedConfigStore = Arc::new(Mutex::new(
+        crate::config::ConfigStore::open(
+            &database_path,
+            &config_root,
+            crate::config::BootstrapConfig {
+                database_path: database_path.clone(),
+                http: config.http.clone(),
+                logging: config.logging.clone(),
+            },
+        )
+        .expect("open config store"),
+    ));
     HttpTestState {
         state: HttpSharedState::new(
             HttpInterfaceConfig::new(
@@ -2394,6 +2755,8 @@ fn test_state_with_player_port(player: impl HttpPlayerPort + 'static) -> HttpTes
             ),
             monitor,
             Arc::new(Mutex::new(LatestFrameCache::default())),
+            config_store,
+            crate::config::LiveConfigs::from_config(&config),
             HttpApplicationPorts::new(
                 Arc::new(ApplicationHttpCommandFacade::new(
                     recording.clone(),
@@ -2408,5 +2771,673 @@ fn test_state_with_player_port(player: impl HttpPlayerPort + 'static) -> HttpTes
             ),
         ),
         recording,
+        config_root: Some(config_root),
     }
+}
+
+/// 从配置中心读取当前完整配置 JSON（load_full 序列化，含注入段，未脱敏），
+/// 作为保存/校验请求的候选段基底（与 ConfigStore::save 的整段替换语义一致）。
+fn full_config_sections(state: &HttpSharedState) -> Value {
+    let store = state.config_store.lock().expect("config store");
+    serde_json::to_value(store.load_full().expect("load full config")).expect("serialize config")
+}
+
+#[test]
+fn config_routes_have_expected_methods() {
+    for route in [
+        "/config",
+        "/config/schema",
+        "/config/section",
+        "/config/revisions",
+    ] {
+        assert!(!is_mutating_route(route), "{route} should allow GET");
+        assert!(is_json_route(route), "{route} should return JSON");
+    }
+    for route in ["/config/validate", "/config/save", "/config/rollback"] {
+        assert!(is_mutating_route(route), "{route} should require POST");
+        assert!(is_json_route(route), "{route} should return JSON");
+    }
+}
+
+#[test]
+fn config_route_masks_secrets_and_reports_revision() {
+    let state = test_state();
+    // 保存含 api_key 的配置 → revision 2。
+    let mut sections = full_config_sections(&state);
+    sections["ai"]["api_key"] = json!("sk-test-http-123");
+    let body = serde_json::to_string(&json!({ "baseRevision": 1, "sections": sections })).unwrap();
+    let saved: Value =
+        serde_json::from_str(&config_save_route(body.as_bytes(), &state).unwrap()).unwrap();
+    assert_eq!(saved["ok"], true);
+    assert_eq!(saved["revision"], 2);
+
+    let response: Value = serde_json::from_str(&config_route(&[], &state).unwrap()).unwrap();
+    assert_eq!(response["ok"], true);
+    assert_eq!(response["revision"], 2);
+    assert_eq!(response["schemaVersion"], 1);
+    assert_eq!(response["sections"]["ai"]["api_key"], "••••••");
+    // 数据库中的真实密钥必须保留（脱敏只影响展示）。
+    let store = state.config_store.lock().unwrap();
+    assert_eq!(store.load_full().unwrap().ai.api_key, "sk-test-http-123");
+}
+
+#[test]
+fn config_schema_route_lists_all_sections_with_defaults() {
+    let state = test_state();
+    let response: Value = serde_json::from_str(&config_schema_route(&[], &state).unwrap()).unwrap();
+    assert_eq!(response["ok"], true);
+    let sections = response["sections"].as_array().expect("sections array");
+    assert!(!sections.is_empty());
+    let queue = sections
+        .iter()
+        .find(|section| section["name"] == "queue")
+        .expect("queue section");
+    let max_size = queue["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|field| field["path"] == "queue.max_size")
+        .expect("queue.max_size field");
+    assert_eq!(max_size["kind"]["type"], "int");
+    assert_eq!(max_size["kind"]["min"], 1);
+    assert_eq!(max_size["default"], 5);
+    assert_eq!(max_size["effect"], "restart");
+    assert_eq!(max_size["source"], "db");
+    assert_eq!(max_size["nullable"], false);
+    // secret 字段的类型。
+    let ai = sections
+        .iter()
+        .find(|section| section["name"] == "ai")
+        .expect("ai section");
+    let api_key = ai["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|field| field["path"] == "ai.api_key")
+        .expect("ai.api_key field");
+    assert_eq!(api_key["kind"]["type"], "secret");
+    // audio_cache 默认 null 时子字段 default 为 null。
+    let playback = sections
+        .iter()
+        .find(|section| section["name"] == "playback")
+        .expect("playback section");
+    let cache_enabled = playback["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|field| field["path"] == "playback.audio_cache.enabled")
+        .expect("audio_cache.enabled field");
+    assert!(cache_enabled["default"].is_null());
+    assert_eq!(cache_enabled["optionalParent"], true);
+}
+
+#[test]
+fn config_section_route_returns_values_and_revision() {
+    let state = test_state();
+    let response: Value = serde_json::from_str(
+        &config_section_route(&[("name".to_string(), "queue".to_string())], &state).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(response["ok"], true);
+    assert_eq!(response["name"], "queue");
+    assert_eq!(response["label"], "点歌队列");
+    assert_eq!(response["values"]["max_size"], 5);
+    assert_eq!(response["revision"], 1);
+    let fields = response["fields"].as_array().unwrap();
+    assert!(fields.iter().any(|field| field["path"] == "queue.max_size"));
+}
+
+#[test]
+fn config_section_route_unknown_section_fails() {
+    let state = test_state();
+    let error = config_section_route(&[("name".to_string(), "不存在".to_string())], &state)
+        .expect_err("unknown section rejected");
+    assert_eq!(error.status, 400);
+    assert!(error.message.contains("配置段不存在"));
+}
+
+#[test]
+fn config_section_route_masks_secret_fields() {
+    let state = test_state();
+    // 保存 ai.api_key 与 song_review.provider.api_key 真实值 → revision 2。
+    let mut sections = full_config_sections(&state);
+    sections["ai"]["api_key"] = json!("sk-ai-real-1");
+    sections["song_review"]["provider"]["api_key"] = json!("sk-song-real-1");
+    let body = serde_json::to_string(&json!({ "baseRevision": 1, "sections": sections })).unwrap();
+    let saved: Value =
+        serde_json::from_str(&config_save_route(body.as_bytes(), &state).unwrap()).unwrap();
+    assert_eq!(saved["ok"], true);
+    assert_eq!(saved["revision"], 2);
+    // 再保存 turtle_soup.ai.api_key 真实值 → revision 3。
+    let mut sections = full_config_sections(&state);
+    sections["turtle_soup"]["ai"]["api_key"] = json!("sk-soup-real-1");
+    let body = serde_json::to_string(&json!({ "baseRevision": 2, "sections": sections })).unwrap();
+    let saved: Value =
+        serde_json::from_str(&config_save_route(body.as_bytes(), &state).unwrap()).unwrap();
+    assert_eq!(saved["ok"], true);
+    assert_eq!(saved["revision"], 3);
+
+    // ai 段：api_key 必须掩码且响应不含真实值。
+    let ai: Value = serde_json::from_str(
+        &config_section_route(&[("name".to_string(), "ai".to_string())], &state).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(ai["values"]["api_key"], crate::config::SECRET_MASK);
+    assert!(
+        !serde_json::to_string(&ai["values"])
+            .unwrap()
+            .contains("sk-ai-real-1"),
+        "ai 段不得泄漏真实 api_key"
+    );
+
+    // song_review 段：provider.api_key 必须掩码。
+    let song: Value = serde_json::from_str(
+        &config_section_route(&[("name".to_string(), "song_review".to_string())], &state).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        song["values"]["provider"]["api_key"],
+        crate::config::SECRET_MASK
+    );
+    assert!(
+        !serde_json::to_string(&song["values"])
+            .unwrap()
+            .contains("sk-song-real-1"),
+        "song_review 段不得泄漏真实 api_key"
+    );
+
+    // turtle_soup 段：ai.api_key 必须掩码。
+    let soup: Value = serde_json::from_str(
+        &config_section_route(&[("name".to_string(), "turtle_soup".to_string())], &state).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(soup["values"]["ai"]["api_key"], crate::config::SECRET_MASK);
+    assert!(
+        !serde_json::to_string(&soup["values"])
+            .unwrap()
+            .contains("sk-soup-real-1"),
+        "turtle_soup 段不得泄漏真实 api_key"
+    );
+
+    // http 段：bootstrap 注入的 access_token 即使未保存也必须掩码。
+    let http_token = state
+        .config_store
+        .lock()
+        .unwrap()
+        .bootstrap()
+        .http
+        .access_token
+        .clone();
+    let http: Value = serde_json::from_str(
+        &config_section_route(&[("name".to_string(), "http".to_string())], &state).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(http["values"]["access_token"], crate::config::SECRET_MASK);
+    if !http_token.is_empty() {
+        assert!(
+            !serde_json::to_string(&http["values"])
+                .unwrap()
+                .contains(&http_token),
+            "http 段不得泄漏 bootstrap access_token"
+        );
+    }
+
+    // 数据库中真实密钥必须保留（脱敏只影响展示）。
+    let store = state.config_store.lock().unwrap();
+    let full = store.load_full().unwrap();
+    assert_eq!(full.ai.api_key, "sk-ai-real-1");
+    assert_eq!(full.song_review.provider.api_key, "sk-song-real-1");
+    assert_eq!(full.turtle_soup.ai.api_key, "sk-soup-real-1");
+}
+
+#[test]
+fn config_routes_mask_non_empty_bootstrap_access_token() {
+    // bootstrap http.access_token 非空时（未入库、由启动引导注入），
+    // /config 与 /config/section?name=http 的响应都不得包含明文。
+    let state = test_state_with_bootstrap_access_token("bootstrap-secret-token-123");
+
+    let full: Value = serde_json::from_str(&config_route(&[], &state).unwrap()).unwrap();
+    assert_eq!(
+        full["sections"]["http"]["access_token"],
+        crate::config::SECRET_MASK,
+        "/config 中 http.access_token 必须掩码"
+    );
+    let serialized = serde_json::to_string(&full).unwrap();
+    assert!(
+        !serialized.contains("bootstrap-secret-token-123"),
+        "/config 响应不得包含 bootstrap access_token 明文"
+    );
+
+    let section: Value = serde_json::from_str(
+        &config_section_route(&[("name".to_string(), "http".to_string())], &state).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        section["values"]["access_token"],
+        crate::config::SECRET_MASK,
+        "/config/section 中 http.access_token 必须掩码"
+    );
+    assert!(
+        !serde_json::to_string(&section["values"])
+            .unwrap()
+            .contains("bootstrap-secret-token-123"),
+        "/config/section 响应不得包含 bootstrap access_token 明文"
+    );
+
+    // 脱敏只影响展示：bootstrap 中的真实令牌必须原样保留。
+    assert_eq!(
+        state
+            .config_store
+            .lock()
+            .unwrap()
+            .bootstrap()
+            .http
+            .access_token,
+        "bootstrap-secret-token-123",
+        "bootstrap 中的真实 access_token 必须保留"
+    );
+}
+
+#[test]
+fn config_revisions_route_lists_history() {
+    let state = test_state();
+    let response: Value =
+        serde_json::from_str(&config_revisions_route(&[], &state).unwrap()).unwrap();
+    assert_eq!(response["ok"], true);
+    let revisions = response["revisions"].as_array().unwrap();
+    assert_eq!(revisions.len(), 1);
+    assert_eq!(revisions[0]["revision"], 1);
+    assert!(revisions[0]["createdAtMs"].as_u64().is_some());
+}
+
+#[test]
+fn config_validate_route_reports_field_errors() {
+    let state = test_state();
+    let mut sections = full_config_sections(&state);
+    sections["window"]["content_width"] = json!(0);
+    let body = serde_json::to_string(&json!({ "sections": sections })).unwrap();
+    let response: Value =
+        serde_json::from_str(&config_validate_route(body.as_bytes(), &state).unwrap()).unwrap();
+    assert_eq!(response["ok"], true);
+    let errors = response["errors"].as_array().expect("errors array");
+    assert!(!errors.is_empty());
+    assert!(
+        errors
+            .iter()
+            .any(|error| error["field"] == "window.content_width")
+    );
+    assert!(errors.iter().any(|error| error["section"] == "window"));
+}
+
+#[test]
+fn config_validate_route_rejects_missing_sections() {
+    let state = test_state();
+    let error = config_validate_route(b"{}", &state).expect_err("missing sections rejected");
+    assert_eq!(error.status, 400);
+    assert!(error.message.contains("sections"));
+    // 段值不是对象。
+    let error = config_validate_route(r#"{"sections":{"queue":[1,2]}}"#.as_bytes(), &state)
+        .expect_err("non-object section rejected");
+    assert_eq!(error.status, 400);
+    // 非 JSON 请求体。
+    let error = config_validate_route(b"not-json", &state).expect_err("invalid JSON rejected");
+    assert_eq!(error.status, 400);
+}
+
+#[test]
+fn config_save_route_persists_and_reports_changed_fields() {
+    let state = test_state();
+    let mut sections = full_config_sections(&state);
+    sections["queue"]["max_size"] = json!(20);
+    let body = serde_json::to_string(&json!({ "baseRevision": 1, "sections": sections })).unwrap();
+    let response: Value =
+        serde_json::from_str(&config_save_route(body.as_bytes(), &state).unwrap()).unwrap();
+    assert_eq!(response["ok"], true);
+    assert_eq!(response["revision"], 2);
+    let changed = response["changedFields"].as_array().unwrap();
+    assert!(changed.contains(&json!("queue.max_size")));
+    assert_eq!(response["restartRequired"], true);
+    assert!(
+        response["restartFields"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("queue.max_size"))
+    );
+    assert!(response["appliedLiveFields"].as_array().unwrap().is_empty());
+    let store = state.config_store.lock().unwrap();
+    assert_eq!(store.load_full().unwrap().queue.max_size, 20);
+}
+
+#[test]
+fn config_save_route_applies_live_fields_to_shared_values() {
+    let state = test_state();
+    // 预热：load_full 返回的是绝对路径，先按原值提交一次，使库中值与候选
+    // 基底一致（避免路径解析差异污染后续变更集合），revision 2。
+    let sections = full_config_sections(&state);
+    let body = serde_json::to_string(&json!({ "baseRevision": 1, "sections": sections })).unwrap();
+    let warm_up: Value =
+        serde_json::from_str(&config_save_route(body.as_bytes(), &state).unwrap()).unwrap();
+    assert_eq!(warm_up["ok"], true);
+    assert_eq!(warm_up["revision"], 2);
+
+    // 仅变更 Live 字段：queue.protect_current_song_until_finished → 无需重启。
+    let mut sections = full_config_sections(&state);
+    sections["queue"]["protect_current_song_until_finished"] = json!(false);
+    let body = serde_json::to_string(&json!({ "baseRevision": 2, "sections": sections })).unwrap();
+    let response: Value =
+        serde_json::from_str(&config_save_route(body.as_bytes(), &state).unwrap()).unwrap();
+    assert_eq!(response["ok"], true);
+    assert_eq!(response["revision"], 3);
+    assert!(
+        response["appliedLiveFields"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("queue.protect_current_song_until_finished")),
+        "live 字段必须进入 appliedLiveFields: {}",
+        response
+    );
+    assert_eq!(
+        response["restartRequired"], false,
+        "仅 live 变更时不得要求重启: {}",
+        response
+    );
+    assert!(response["restartFields"].as_array().unwrap().is_empty());
+    // 共享热更新值必须已覆盖：运行态读取点立即看到新值（不虚报已生效）。
+    assert!(
+        !*state
+            .live_configs
+            .queue_protect_current_song
+            .read()
+            .unwrap()
+    );
+    assert!(
+        !state
+            .config_store
+            .lock()
+            .unwrap()
+            .load_full()
+            .unwrap()
+            .queue
+            .protect_current_song_until_finished,
+        "库中值必须同步落盘"
+    );
+
+    // 混合变更（Live + Restart）：restartRequired=true，Live 字段仍进 appliedLiveFields。
+    let mut sections = full_config_sections(&state);
+    sections["queue"]["protect_current_song_until_finished"] = json!(true);
+    sections["queue"]["max_size"] = json!(30);
+    let body = serde_json::to_string(&json!({ "baseRevision": 3, "sections": sections })).unwrap();
+    let response: Value =
+        serde_json::from_str(&config_save_route(body.as_bytes(), &state).unwrap()).unwrap();
+    assert_eq!(response["restartRequired"], true);
+    assert!(
+        response["appliedLiveFields"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("queue.protect_current_song_until_finished"))
+    );
+    assert!(
+        response["restartFields"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("queue.max_size"))
+    );
+    assert!(
+        *state
+            .live_configs
+            .queue_protect_current_song
+            .read()
+            .unwrap()
+    );
+}
+
+#[test]
+fn config_rollback_route_applies_live_fields_to_shared_values() {
+    let state = test_state();
+    // 预热：先按原值提交一次使库中值与候选基底一致，revision 2。
+    let sections = full_config_sections(&state);
+    let body = serde_json::to_string(&json!({ "baseRevision": 1, "sections": sections })).unwrap();
+    let warm_up: Value =
+        serde_json::from_str(&config_save_route(body.as_bytes(), &state).unwrap()).unwrap();
+    assert_eq!(warm_up["revision"], 2);
+    // 保存 live 字段（protect=false）→ revision 3，共享值立即变化。
+    let mut sections = full_config_sections(&state);
+    sections["queue"]["protect_current_song_until_finished"] = json!(false);
+    let body = serde_json::to_string(&json!({ "baseRevision": 2, "sections": sections })).unwrap();
+    config_save_route(body.as_bytes(), &state).unwrap();
+    assert!(
+        !*state
+            .live_configs
+            .queue_protect_current_song
+            .read()
+            .unwrap()
+    );
+    // 回滚到 revision 2（默认 protect=true）→ 共享值恢复为 true。
+    let body = serde_json::to_string(&json!({ "revision": 2 })).unwrap();
+    let response: Value =
+        serde_json::from_str(&config_rollback_route(body.as_bytes(), &state).unwrap()).unwrap();
+    assert_eq!(response["ok"], true);
+    assert!(
+        response["appliedLiveFields"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("queue.protect_current_song_until_finished"))
+    );
+    assert!(
+        *state
+            .live_configs
+            .queue_protect_current_song
+            .read()
+            .unwrap()
+    );
+}
+
+#[test]
+fn config_save_succeeds_even_when_live_apply_fails() {
+    let state = test_state();
+    // 落库成功：手动走 store.save（等价于 config_save_route 的保存成功分支）。
+    let sections = full_config_sections(&state);
+    let mut store = state.config_store.lock().unwrap();
+    let outcome = store
+        .save(1, sections.as_object().expect("sections 对象").clone())
+        .unwrap();
+    assert_eq!(outcome.revision, 2);
+
+    // 模拟「落库成功后热更新应用阶段读取失败」：从另一连接破坏 config_sections 表
+    // （真实场景：保存提交后存储异常/被外部工具修改，apply 阶段 load_full 失败）。
+    let database_path = state
+        .config_root
+        .as_ref()
+        .expect("config root")
+        .join("deps/data/playback.sqlite3");
+    let connection = rusqlite::Connection::open(&database_path).expect("open sqlite");
+    connection
+        .execute_batch("DROP TABLE config_sections")
+        .expect("drop config_sections");
+    drop(connection);
+    // 模拟必须使 apply 阶段读取失败，否则测试失去意义。
+    assert!(store.load_full().is_err(), "破坏表后 load_full 必须失败");
+
+    // 保存成功分支的收尾：apply 失败被吞掉，仍返回保存成功响应（revision 等）。
+    let response: Value = serde_json::from_str(
+        &save_outcome_response_after_apply(&state, &store, outcome, "配置已保存")
+            .expect("save response"),
+    )
+    .expect("response JSON");
+    assert_eq!(response["ok"], true);
+    assert_eq!(response["revision"], 2);
+}
+
+#[test]
+fn config_save_route_stale_base_revision_conflicts() {
+    let state = test_state();
+    let sections = full_config_sections(&state);
+    let body = serde_json::to_string(&json!({ "baseRevision": 0, "sections": sections })).unwrap();
+    let response: Value =
+        serde_json::from_str(&config_save_route(body.as_bytes(), &state).unwrap()).unwrap();
+    assert_eq!(response["ok"], false);
+    assert_eq!(response["code"], "config_conflict");
+    assert_eq!(response["message"], "配置已被其他修改，请刷新后重试");
+    assert_eq!(
+        state
+            .config_store
+            .lock()
+            .unwrap()
+            .current_revision()
+            .unwrap(),
+        1,
+        "冲突时不得写库"
+    );
+}
+
+#[test]
+fn config_save_route_requires_base_revision() {
+    let state = test_state();
+    let sections = full_config_sections(&state);
+    let body = serde_json::to_string(&json!({ "sections": sections })).unwrap();
+    let error = config_save_route(body.as_bytes(), &state).expect_err("missing baseRevision");
+    assert_eq!(error.status, 400);
+    assert!(error.message.contains("baseRevision"));
+}
+
+#[test]
+fn config_save_route_reports_validation_failure_without_writing() {
+    let state = test_state();
+    let mut sections = full_config_sections(&state);
+    sections["window"]["content_width"] = json!(0);
+    let body = serde_json::to_string(&json!({ "baseRevision": 1, "sections": sections })).unwrap();
+    let response: Value =
+        serde_json::from_str(&config_save_route(body.as_bytes(), &state).unwrap()).unwrap();
+    assert_eq!(response["ok"], false);
+    assert_eq!(response["code"], "config_validation_failed");
+    assert_eq!(response["message"], "配置校验失败");
+    assert!(
+        response["errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|error| error["field"] == "window.content_width")
+    );
+    assert_eq!(
+        state
+            .config_store
+            .lock()
+            .unwrap()
+            .current_revision()
+            .unwrap(),
+        1,
+        "校验失败时不得写库"
+    );
+}
+
+#[test]
+fn config_save_route_secret_mask_submission_keeps_previous_value() {
+    let state = test_state();
+    // 先保存真实密钥 → revision 2。
+    let mut sections = full_config_sections(&state);
+    sections["ai"]["api_key"] = json!("sk-http-secret");
+    let body = serde_json::to_string(&json!({ "baseRevision": 1, "sections": sections })).unwrap();
+    let saved: Value =
+        serde_json::from_str(&config_save_route(body.as_bytes(), &state).unwrap()).unwrap();
+    assert_eq!(saved["ok"], true);
+    assert_eq!(saved["revision"], 2);
+
+    // Web 表单回传掩码重新提交 → 密钥保留 → revision 3，changedFields 不含密钥。
+    let mut sections = full_config_sections(&state);
+    sections["ai"]["api_key"] = json!(crate::config::SECRET_MASK);
+    let body = serde_json::to_string(&json!({ "baseRevision": 2, "sections": sections })).unwrap();
+    let response: Value =
+        serde_json::from_str(&config_save_route(body.as_bytes(), &state).unwrap()).unwrap();
+    assert_eq!(response["ok"], true);
+    assert_eq!(response["revision"], 3);
+    assert!(
+        !response["changedFields"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("ai.api_key"))
+    );
+    assert_eq!(
+        state
+            .config_store
+            .lock()
+            .unwrap()
+            .load_full()
+            .unwrap()
+            .ai
+            .api_key,
+        "sk-http-secret",
+        "掩码提交不得覆盖已保存的密钥"
+    );
+}
+
+#[test]
+fn config_rollback_route_restores_previous_revision() {
+    let state = test_state();
+    // queue.max_size = 20 → revision 2。
+    let mut sections = full_config_sections(&state);
+    sections["queue"]["max_size"] = json!(20);
+    let body = serde_json::to_string(&json!({ "baseRevision": 1, "sections": sections })).unwrap();
+    let saved: Value =
+        serde_json::from_str(&config_save_route(body.as_bytes(), &state).unwrap()).unwrap();
+    assert_eq!(saved["revision"], 2);
+    // queue.max_size = 30 → revision 3。
+    let mut sections = full_config_sections(&state);
+    sections["queue"]["max_size"] = json!(30);
+    let body = serde_json::to_string(&json!({ "baseRevision": 2, "sections": sections })).unwrap();
+    config_save_route(body.as_bytes(), &state).unwrap();
+
+    // 回滚到 revision 2 → 新版本 4，queue.max_size 恢复 20。
+    let body = serde_json::to_string(&json!({ "revision": 2 })).unwrap();
+    let response: Value =
+        serde_json::from_str(&config_rollback_route(body.as_bytes(), &state).unwrap()).unwrap();
+    assert_eq!(response["ok"], true);
+    assert_eq!(response["revision"], 4);
+    assert_eq!(
+        state
+            .config_store
+            .lock()
+            .unwrap()
+            .load_full()
+            .unwrap()
+            .queue
+            .max_size,
+        20,
+        "回滚后必须恢复目标版本的值"
+    );
+
+    // 不存在的目标版本 → config_revision_not_found。
+    let body = serde_json::to_string(&json!({ "revision": 99 })).unwrap();
+    let response: Value =
+        serde_json::from_str(&config_rollback_route(body.as_bytes(), &state).unwrap()).unwrap();
+    assert_eq!(response["ok"], false);
+    assert_eq!(response["code"], "config_revision_not_found");
+}
+
+#[test]
+fn config_endpoints_require_access_token() {
+    let mut state = test_state();
+    let server = start_test_http_server(&mut state, "secret");
+    let address = server.local_addr();
+
+    for target in [
+        "/config",
+        "/config/schema",
+        "/config/section?name=queue",
+        "/config/revisions",
+        "/config/validate",
+        "/config/save",
+        "/config/rollback",
+    ] {
+        let response = http_get(address, target, None);
+        assert_eq!(
+            response.status_line, "HTTP/1.1 401 Unauthorized",
+            "{target}"
+        );
+    }
+    // 携带正确 token 后可正常访问。
+    let response = http_get(address, "/config", Some("secret"));
+    assert_eq!(response.status_line, "HTTP/1.1 200 OK");
+    let value: Value = serde_json::from_str(&response.body).expect("config JSON");
+    assert_eq!(value["ok"], true);
+    server.shutdown().expect("shutdown HTTP server");
 }

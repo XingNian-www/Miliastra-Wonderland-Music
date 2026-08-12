@@ -17,7 +17,7 @@ const MIMO_MODEL: &str = "mimo-v2.5";
 const OPENAI_ENDPOINT: &str = "https://api.openai.com/v1/chat/completions";
 const OPENAI_MODEL: &str = "gpt-5.6-mini";
 const DEEPSEEK_ENDPOINT: &str = "https://api.deepseek.com/chat/completions";
-const DEEPSEEK_MODEL: &str = "deepseek-chat";
+const DEEPSEEK_MODEL: &str = "deepseek-v4-flash";
 const CANDIDATE_PICK_LIMIT: usize = 30;
 const CANDIDATES_PER_SOURCE: usize = 5;
 
@@ -52,8 +52,63 @@ impl AiConfig {
         if self.api_key.trim().is_empty() {
             return Ok(());
         }
-        resolve_provider_config(self, None).map(|_| ())
+        let provider = resolve_provider_config(self, None)?;
+        validate_provider_extra_body(provider.provider, &provider.extra_body)
     }
+}
+
+fn validate_provider_extra_body(
+    provider: AiProvider,
+    extra_body: &HashMap<String, Value>,
+) -> Result<()> {
+    let optional_string = |key: &str, max_len: usize| -> Result<()> {
+        let Some(value) = extra_body.get(key).filter(|value| !value.is_null()) else {
+            return Ok(());
+        };
+        let text = value
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("ai.extra_body.{key} 必须是字符串"))?;
+        if text.chars().count() > max_len {
+            bail!("ai.extra_body.{key} 不能超过 {max_len} 个字符");
+        }
+        Ok(())
+    };
+    match provider {
+        AiProvider::OpenAi => {
+            optional_string("safety_identifier", 64)?;
+            if let Some(metadata) = extra_body.get("metadata").filter(|value| !value.is_null()) {
+                let object = metadata
+                    .as_object()
+                    .ok_or_else(|| anyhow::anyhow!("ai.extra_body.metadata 必须是 JSON object"))?;
+                if object.len() > 16 {
+                    bail!("ai.extra_body.metadata 不能超过 16 项");
+                }
+                for (key, value) in object {
+                    if key.chars().count() > 64 {
+                        bail!("ai.extra_body.metadata 的键不能超过 64 个字符");
+                    }
+                    let text = value.as_str().ok_or_else(|| {
+                        anyhow::anyhow!("ai.extra_body.metadata 的值必须是字符串")
+                    })?;
+                    if text.chars().count() > 512 {
+                        bail!("ai.extra_body.metadata 的值不能超过 512 个字符");
+                    }
+                }
+            }
+        }
+        AiProvider::DeepSeek => {
+            optional_string("user_id", 512)?;
+            if let Some(user_id) = extra_body.get("user_id").and_then(Value::as_str)
+                && !user_id
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+            {
+                bail!("ai.extra_body.user_id 只允许 a-zA-Z0-9-_");
+            }
+        }
+        AiProvider::Mimo | AiProvider::Custom => {}
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -698,6 +753,44 @@ mod tests {
 
             assert!(error.to_string().contains("provider只允许"));
         }
+    }
+
+    #[test]
+    fn official_providers_resolve_current_default_models() {
+        for (provider, expected) in [
+            ("mimo", MIMO_MODEL),
+            ("openai", OPENAI_MODEL),
+            ("deepseek", DEEPSEEK_MODEL),
+        ] {
+            let config = AiConfig {
+                provider: provider.to_string(),
+                api_key: "secret".to_string(),
+                endpoint: String::new(),
+                model: String::new(),
+                http_proxy: String::new(),
+                extra_body: HashMap::new(),
+            };
+
+            let resolved = resolve_provider_config(&config, None).expect("official provider");
+            assert_eq!(resolved.model, expected);
+        }
+    }
+
+    #[test]
+    fn official_provider_extra_body_rejects_invalid_typed_fields() {
+        let mut config = AiConfig {
+            provider: "deepseek".to_string(),
+            api_key: "secret".to_string(),
+            endpoint: String::new(),
+            model: String::new(),
+            http_proxy: String::new(),
+            extra_body: HashMap::from([("user_id".to_string(), json!("含中文"))]),
+        };
+        assert!(config.validate().is_err());
+
+        config.provider = "openai".to_string();
+        config.extra_body = HashMap::from([("metadata".to_string(), json!(["not-object"]))]);
+        assert!(config.validate().is_err());
     }
 
     #[test]

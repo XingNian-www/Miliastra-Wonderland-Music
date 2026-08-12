@@ -223,14 +223,14 @@ jobs:
           }
           New-Item -ItemType Directory -Force -Path $dist | Out-Null
 
-          $distModels = Join-Path $dist 'models'
+          $distModels = Join-Path $dist 'deps\models'
           New-Item -ItemType Directory -Force -Path $distModels | Out-Null
           Copy-Item -LiteralPath 'models\PP-OCRv6_small_det.xml', 'models\PP-OCRv6_small_det.bin', `
             'models\PP-OCRv6_small_rec.xml', 'models\PP-OCRv6_small_rec.bin', `
             'models\ppocr_keys_v6_small.txt' -Destination $distModels
 
           $runtimeSource = Join-Path $env:OPENVINO_ROOT 'runtime\bin\intel64\Release'
-          $runtimeTarget = Join-Path $dist 'openvino\runtime\bin\intel64\Release'
+          $runtimeTarget = Join-Path $dist 'deps\openvino\runtime\bin\intel64\Release'
           New-Item -ItemType Directory -Force -Path $runtimeTarget | Out-Null
           $runtimeDlls = Get-ChildItem -LiteralPath $runtimeSource -Filter '*.dll' -File |
             Where-Object { $_.Name -notmatch '_debug\.dll$' }
@@ -240,7 +240,7 @@ jobs:
           $runtimeDlls | Copy-Item -Destination $runtimeTarget -Force
 
           $tbbSource = Join-Path $env:OPENVINO_ROOT 'runtime\3rdparty\tbb\bin'
-          $tbbTarget = Join-Path $dist 'openvino\runtime\3rdparty\tbb\bin'
+          $tbbTarget = Join-Path $dist 'deps\openvino\runtime\3rdparty\tbb\bin'
           New-Item -ItemType Directory -Force -Path $tbbTarget | Out-Null
           $tbbDlls = Get-ChildItem -LiteralPath $tbbSource -Filter '*.dll' -File |
             Where-Object { $_.Name -notmatch '_debug\.dll$' }
@@ -261,56 +261,37 @@ jobs:
             Copy-Item -LiteralPath $entry.Value -Destination (Join-Path $dist $entry.Key)
           }
 
-          $configExample = @'
-          # Reference values for the ocr section in the Web panel "Config Center".
-          # Functional config is stored in deps/data/playback.sqlite3; config.yaml
-          # only keeps the database_path/http/logging bootstrap sections.
-          # Keep the existing MNN paths when retaining CPU fallback.
-          ocr:
-            backend_priority:
-              - openvino
-              - cpu
-            openvino:
-              det_model: models/PP-OCRv6_small_det.xml
-              det_weights: models/PP-OCRv6_small_det.bin
-              rec_model: models/PP-OCRv6_small_rec.xml
-              rec_weights: models/PP-OCRv6_small_rec.bin
-              device: CPU
-              cache_dir: deps/data/openvino-cache
-          '@
-          Set-Content -LiteralPath (Join-Path $dist 'config-openvino.example.yaml') -Value $configExample -Encoding utf8
-
           $readme = @'
-          OpenVINO OCR runtime dependency package
+          OpenVINO OCR 运行时附加组件
 
-          This package does not contain the application EXE. Use it with the normal
-          Windows x64 package, whose EXE already contains the OpenVINO adapter.
+          此包不含主程序。将包内 deps 文件夹合并到主程序目录下的 deps 文件夹，
+          不要删除或替换主程序及 config.yaml。
 
-          Installation:
-          1. Extract this directory next to the normal EXE package, preserving paths.
-          2. Apply the ocr values from config-openvino.example.yaml in the Web panel
-             "Config Center" (ocr section). Functional config is stored in
-             deps/data/playback.sqlite3; do not merge into config.yaml.
-          3. Start the EXE from the extracted package. It automatically prefers the
-             included openvino\runtime\bin\intel64\Release and
-             openvino\runtime\3rdparty\tbb\bin directories. OPENVINO_INSTALL_DIR
-             or PATH may still be set when using a different runtime installation.
-          4. Keep backend_priority as openvino, cpu when CPU/MNN fallback is wanted.
+          安装：
+          1. 先解压普通 Windows x64 主程序包。
+          2. 将此包内 deps 文件夹复制到主程序根目录，确认最终路径为：
+             deps\openvino\runtime\bin\intel64\Release\openvino_c.dll
+             deps\openvino\runtime\3rdparty\tbb\bin\tbb12.dll
+             deps\models\PP-OCRv6_small_det.xml
+          3. 在 Web“配置中心”的 ocr 区域选择 OpenVINO 后端。
+             功能配置保存在 deps\data\playback.sqlite3，不要写入 config.yaml。
+             模型路径使用 deps/models/ 下对应的 XML、BIN 文件。
+          4. 需要 MNN CPU 兜底时，保持后端优先级为 openvino、cpu。
 
-          The normal package must provide MNN models and MNN.dll when CPU fallback is used.
-          The target machine still needs the x64 Microsoft Visual C++ Redistributable.
+          主程序会自动检测 deps\openvino，无需设置 PATH。使用其他安装位置时，
+          才需要配置 OPENVINO_INSTALL_DIR 或 PATH。
+          目标电脑仍需安装 x64 Microsoft Visual C++ Redistributable。
           '@
           Set-Content -LiteralPath (Join-Path $dist 'README-OPENVINO.txt') -Value $readme -Encoding utf8
 
           $required = @(
-            'models\PP-OCRv6_small_det.xml',
-            'models\PP-OCRv6_small_det.bin',
-            'models\PP-OCRv6_small_rec.xml',
-            'models\PP-OCRv6_small_rec.bin',
-            'openvino\runtime\bin\intel64\Release\openvino_c.dll',
-            'openvino\runtime\bin\intel64\Release\openvino_intel_cpu_plugin.dll',
-            'openvino\runtime\3rdparty\tbb\bin\tbb12.dll',
-            'config-openvino.example.yaml',
+            'deps\models\PP-OCRv6_small_det.xml',
+            'deps\models\PP-OCRv6_small_det.bin',
+            'deps\models\PP-OCRv6_small_rec.xml',
+            'deps\models\PP-OCRv6_small_rec.bin',
+            'deps\openvino\runtime\bin\intel64\Release\openvino_c.dll',
+            'deps\openvino\runtime\bin\intel64\Release\openvino_intel_cpu_plugin.dll',
+            'deps\openvino\runtime\3rdparty\tbb\bin\tbb12.dll',
             'README-OPENVINO.txt',
             'OPENVINO-LICENSE.txt',
             'OPENVINO-THIRD-PARTY-NOTICES.txt',

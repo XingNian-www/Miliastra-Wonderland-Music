@@ -193,12 +193,10 @@ impl Default for AppConfig {
                 wonderland_confirm_threshold: 0.9,
                 templates: StartupTemplateConfig {
                     wonderland_map_star: PathBuf::from(
-                        "deps/templates/startup-wonderland-map-star.png",
+                        "deps/assets/startup-wonderland-map-star.png",
                     ),
-                    wonderland_confirm: PathBuf::from(
-                        "deps/templates/startup-wonderland-confirm.png",
-                    ),
-                    paimon_menu: PathBuf::from("deps/templates/startup-paimon-menu.png"),
+                    wonderland_confirm: PathBuf::from("deps/assets/startup-wonderland-confirm.png"),
+                    paimon_menu: PathBuf::from("deps/assets/startup-paimon-menu.png"),
                 },
                 enter_game_text_region: RectConfig {
                     x: 900,
@@ -393,24 +391,6 @@ impl AppConfig {
         self.ocr.validate()?;
         self.templates.validate()?;
         self.playback.validate()?;
-        if let Some(audio_cache) = self
-            .playback
-            .audio_cache
-            .as_ref()
-            .filter(|audio_cache| audio_cache.enabled)
-        {
-            let metadata_directory = if audio_cache.metadata_directory.as_os_str().is_empty() {
-                Path::new("deps/data")
-            } else {
-                audio_cache.metadata_directory.as_path()
-            };
-            let database_path = metadata_directory.join("playback.sqlite3");
-            if database_path != self.state.playback_state_path {
-                bail!(
-                    "state.playback_state_path 必须与 playback.audio_cache.metadata_directory 下的 playback.sqlite3 指向同一文件"
-                );
-            }
-        }
         self.http.validate()?;
         self.logging.validate()?;
         self.tui.validate()?;
@@ -1149,10 +1129,10 @@ pub struct OpenVinoConfig {
 impl Default for OpenVinoConfig {
     fn default() -> Self {
         Self {
-            det_model: None,
-            det_weights: None,
-            rec_model: None,
-            rec_weights: None,
+            det_model: Some(PathBuf::from("deps/models/PP-OCRv6_small_det.xml")),
+            det_weights: Some(PathBuf::from("deps/models/PP-OCRv6_small_det.bin")),
+            rec_model: Some(PathBuf::from("deps/models/PP-OCRv6_small_rec.xml")),
+            rec_weights: Some(PathBuf::from("deps/models/PP-OCRv6_small_rec.bin")),
             device: default_openvino_device(),
             cache_dir: default_openvino_cache_dir(),
         }
@@ -1311,25 +1291,25 @@ pub struct TemplateConfig {
 
 impl Default for TemplateConfig {
     fn default() -> Self {
-        // 模板路径默认使用发布布局 deps/templates/，文件名与
+        // 模板路径默认使用发布布局 deps/assets/，文件名与
         // tests/fixtures/config.full.yaml 及 assets/ 目录一致；
         // 全部非空才能通过 validate() 的路径校验。
         Self {
-            blue_marker: PathBuf::from("deps/templates/chat-marker-blue.png"),
-            yellow_marker: PathBuf::from("deps/templates/chat-marker-yellow.png"),
-            pink_marker: PathBuf::from("deps/templates/chat-marker-pink.png"),
-            friend: PathBuf::from("deps/templates/ui-primary-friend.png"),
-            secondary_back: PathBuf::from("deps/templates/ui-secondary-back.png"),
-            secondary_hall: PathBuf::from("deps/templates/ui-secondary-hall.png"),
-            invite_view_star: PathBuf::from("deps/templates/invite-view-star.png"),
-            invite_goto_hall: PathBuf::from("deps/templates/invite-goto-hall.png"),
-            invite_enter_hall: PathBuf::from("deps/templates/invite-enter-hall.png"),
-            friend_panel: PathBuf::from("deps/templates/friend-panel.png"),
-            friend_search_panel: PathBuf::from("deps/templates/friend-search-panel.png"),
-            friend_more_settings: PathBuf::from("deps/templates/friend-more-settings.png"),
-            friend_block_chat: PathBuf::from("deps/templates/friend-block-chat.png"),
-            friend_blacklist: PathBuf::from("deps/templates/friend-blacklist.png"),
-            friend_confirm: PathBuf::from("deps/templates/friend-confirm.png"),
+            blue_marker: PathBuf::from("deps/assets/chat-marker-blue.png"),
+            yellow_marker: PathBuf::from("deps/assets/chat-marker-yellow.png"),
+            pink_marker: PathBuf::from("deps/assets/chat-marker-pink.png"),
+            friend: PathBuf::from("deps/assets/ui-primary-friend.png"),
+            secondary_back: PathBuf::from("deps/assets/ui-secondary-back.png"),
+            secondary_hall: PathBuf::from("deps/assets/ui-secondary-hall.png"),
+            invite_view_star: PathBuf::from("deps/assets/invite-view-star.png"),
+            invite_goto_hall: PathBuf::from("deps/assets/invite-goto-hall.png"),
+            invite_enter_hall: PathBuf::from("deps/assets/invite-enter-hall.png"),
+            friend_panel: PathBuf::from("deps/assets/friend-panel.png"),
+            friend_search_panel: PathBuf::from("deps/assets/friend-search-panel.png"),
+            friend_more_settings: PathBuf::from("deps/assets/friend-more-settings.png"),
+            friend_block_chat: PathBuf::from("deps/assets/friend-block-chat.png"),
+            friend_blacklist: PathBuf::from("deps/assets/friend-blacklist.png"),
+            friend_confirm: PathBuf::from("deps/assets/friend-confirm.png"),
             marker_threshold: 0.9,
         }
     }
@@ -1398,9 +1378,6 @@ pub struct AudioCacheFileConfig {
     pub enabled: bool,
     /// 音频缓存文件目录。
     pub directory: PathBuf,
-    /// 统一播放数据库所在目录；数据库文件固定为 playback.sqlite3。
-    #[serde(default)]
-    pub metadata_directory: PathBuf,
     /// 磁盘占用上限，单位 MiB。
     pub max_bytes_mb: u64,
     /// 同时进行的源站下载任务上限。
@@ -1415,8 +1392,8 @@ impl Default for PlaybackConfig {
     fn default() -> Self {
         Self {
             credential_directory: PathBuf::from("deps/data/credentials"),
-            login_helper_executable: PathBuf::from("miliastra-login-helper.exe"),
-            kugou_api_executable: PathBuf::from("kugou-api.exe"),
+            login_helper_executable: PathBuf::from("deps/bin/miliastra-login-helper.exe"),
+            kugou_api_executable: PathBuf::from("deps/bin/kugou-api.exe"),
             login_timeout_ms: 180000,
             kugou_api_base_url: "http://127.0.0.1:3000".to_string(),
             audio_cache: None,
@@ -1433,11 +1410,6 @@ impl PlaybackConfig {
             executable_root,
             &mut audio_cache.directory,
             "deps/cache/audio",
-        );
-        resolve_path_with_default(
-            executable_root,
-            &mut audio_cache.metadata_directory,
-            "deps/data",
         );
     }
 
@@ -1484,8 +1456,11 @@ impl PlaybackConfig {
     }
 
     /// 转换成播放 crate 的运行时缓存配置；未启用时返回 None。
+    /// `metadata_directory` 固定为统一数据库所在目录（state.playback_state_path
+    /// 的父目录）：项目只有一个数据库，缓存元数据与配置共用 playback.sqlite3。
     pub(crate) fn audio_cache_runtime_config(
         &self,
+        metadata_directory: &Path,
     ) -> Option<miliastra_playback::AudioCacheConfig> {
         let file = self.audio_cache.as_ref()?;
         if !file.enabled {
@@ -1494,7 +1469,7 @@ impl PlaybackConfig {
         Some(miliastra_playback::AudioCacheConfig {
             enabled: true,
             directory: file.directory.clone(),
-            metadata_directory: file.metadata_directory.clone(),
+            metadata_directory: metadata_directory.to_path_buf(),
             max_bytes: file.max_bytes_mb.saturating_mul(1024 * 1024),
             max_concurrent_downloads: file.max_concurrent_downloads,
             request_timeout: Duration::from_millis(file.request_timeout_ms),
@@ -2622,21 +2597,46 @@ marker_threshold: 0.9
     }
 
     #[test]
-    fn legacy_inline_audio_cache_without_metadata_directory_uses_defaults() {
+    fn inline_audio_cache_loads_with_default_directory() {
+        // bundled 完整配置中 audio_cache.directory 为空字符串：normalize 后
+        // 回退到发布布局默认 deps/cache/audio。
         let directory =
             std::env::temp_dir().join(format!("config-cache-old-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&directory).unwrap();
-        let mut value: serde_yaml::Value =
+        let value: serde_yaml::Value =
             serde_yaml::from_str(bundled_config_yaml()).expect("完整配置");
-        inline_audio_cache_mapping(&mut value)
-            .remove(serde_yaml::Value::String("metadata_directory".to_string()));
         let config_path = directory.join("config.yaml");
         std::fs::write(&config_path, serde_yaml::to_string(&value).unwrap()).unwrap();
 
         let config = AppConfig::load_from_root(&config_path, &directory).expect("加载配置");
         let audio_cache = config.playback.audio_cache.expect("音频缓存配置");
         assert_eq!(audio_cache.directory, directory.join("deps/cache/audio"));
-        assert_eq!(audio_cache.metadata_directory, directory.join("deps/data"));
+
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn inline_audio_cache_rejects_metadata_directory_field() {
+        // 项目只有一个数据库（deps/data/playback.sqlite3），不再允许单独配置
+        // 数据库目录；deny_unknown_fields 必须拒绝旧格式的 metadata_directory。
+        let directory =
+            std::env::temp_dir().join(format!("config-cache-rej-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut value: serde_yaml::Value =
+            serde_yaml::from_str(bundled_config_yaml()).expect("完整配置");
+        inline_audio_cache_mapping(&mut value).insert(
+            serde_yaml::Value::String("metadata_directory".to_string()),
+            serde_yaml::Value::String("deps/data".to_string()),
+        );
+        let config_path = directory.join("config.yaml");
+        std::fs::write(&config_path, serde_yaml::to_string(&value).unwrap()).unwrap();
+
+        let error =
+            AppConfig::load_from_root(&config_path, &directory).expect_err("必须拒绝未知字段");
+        assert!(
+            format!("{error:#}").contains("metadata_directory"),
+            "错误信息应指明未知字段 metadata_directory，实际: {error:#}"
+        );
 
         std::fs::remove_dir_all(&directory).unwrap();
     }
@@ -2653,17 +2653,12 @@ marker_threshold: 0.9
             serde_yaml::Value::String("directory".to_string()),
             serde_yaml::Value::String("cache/audio".to_string()),
         );
-        audio_cache.insert(
-            serde_yaml::Value::String("metadata_directory".to_string()),
-            serde_yaml::Value::String("deps/data".to_string()),
-        );
         let config_path = directory.join("config.yaml");
         std::fs::write(&config_path, serde_yaml::to_string(&value).unwrap()).unwrap();
 
         let config = AppConfig::load_from_root(&config_path, &directory).expect("加载配置");
         let audio_cache = config.playback.audio_cache.expect("音频缓存配置");
         assert_eq!(audio_cache.directory, directory.join("cache/audio"));
-        assert_eq!(audio_cache.metadata_directory, directory.join("deps/data"));
 
         std::fs::remove_dir_all(&directory).unwrap();
     }
@@ -2676,7 +2671,6 @@ marker_threshold: 0.9
         let absolute_root =
             std::env::temp_dir().join(format!("audio-cache-abs-{}", uuid::Uuid::new_v4()));
         let audio_directory = absolute_root.join("audio");
-        let metadata_directory = absolute_root.join("metadata");
         let mut value: serde_yaml::Value =
             serde_yaml::from_str(bundled_config_yaml()).expect("完整配置");
         let audio_cache = inline_audio_cache_mapping(&mut value);
@@ -2684,18 +2678,41 @@ marker_threshold: 0.9
             serde_yaml::Value::String("directory".to_string()),
             serde_yaml::Value::String(audio_directory.to_string_lossy().into_owned()),
         );
-        audio_cache.insert(
-            serde_yaml::Value::String("metadata_directory".to_string()),
-            serde_yaml::Value::String(metadata_directory.to_string_lossy().into_owned()),
-        );
         let config_path = directory.join("config.yaml");
         std::fs::write(&config_path, serde_yaml::to_string(&value).unwrap()).unwrap();
 
         let config = AppConfig::load_from_root(&config_path, &directory).expect("加载配置");
         let audio_cache = config.playback.audio_cache.expect("音频缓存配置");
         assert_eq!(audio_cache.directory, audio_directory);
-        assert_eq!(audio_cache.metadata_directory, metadata_directory);
 
         std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn default_custom_workflows_come_from_builtin_resource() {
+        // 默认工作流编译进程序，新数据库开箱即用，无需发布额外配置文件。
+        let config = AppConfig::default();
+        assert!(config.custom_workflows.enabled);
+        assert!(
+            config.custom_workflows.workflows.len() >= 10,
+            "内置默认工作流数量不足，实际 {} 个",
+            config.custom_workflows.workflows.len()
+        );
+        assert!(
+            config
+                .custom_workflows
+                .workflows
+                .iter()
+                .any(|workflow| workflow.name == "鼠标中键")
+        );
+        assert!(
+            config
+                .custom_workflows
+                .workflows
+                .iter()
+                .any(|workflow| workflow.name == "notice")
+        );
+        // example 工作流的步骤必须全部合法（默认配置通过完整校验）。
+        config.validate().expect("默认配置必须通过校验");
     }
 }

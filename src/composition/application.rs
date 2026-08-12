@@ -1092,7 +1092,14 @@ impl ApplicationRuntime {
         let native_playback_runtime = NativePlaybackRuntime::start(
             config.playback.credential_directory.clone(),
             &kugou_api_base_url,
-            config.playback.audio_cache_runtime_config(),
+            // 统一数据库：缓存元数据与配置共用同一个 playback.sqlite3。
+            config.playback.audio_cache_runtime_config(
+                config
+                    .state
+                    .playback_state_path
+                    .parent()
+                    .expect("统一数据库路径必须有父目录"),
+            ),
         )
         .context("启动原生播放器")?;
         let native_playback = native_playback_runtime.handle();

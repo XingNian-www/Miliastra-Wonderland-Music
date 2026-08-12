@@ -698,7 +698,7 @@ impl PlaybackMonitorPort for PlaybackMonitorWorker {
     }
 
     fn player_status(&mut self) -> Result<PlayerStatus> {
-        // 监控循环使用轻量读取：观测记录由决策路径负责，避免每轮重复记录。
+        // 控制器按进度/时间阈值节流持久化，保证重启能从最新可靠进度续播。
         self.player.monitor_status()
     }
 

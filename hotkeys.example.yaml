@@ -1,8 +1,0 @@
-# 是否启用全局热键
-enabled: true
-
-# 暂停/恢复热键
-pause_key: F7
-
-# 退出热键
-exit_key: F12

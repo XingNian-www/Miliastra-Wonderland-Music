@@ -355,7 +355,14 @@ impl PlaybackCommandPort for ApplicationRuntime {
             self.playback.player.clone(),
             self.business.task_engine.clone(),
             self.lifecycle.running.clone(),
-            Duration::from_millis(self.lifecycle.config.timing.playback.monitor_status_ms),
+            Duration::from_millis(
+                *self
+                    .lifecycle
+                    .live_configs
+                    .monitor_status_ms
+                    .read()
+                    .expect("播放状态校准间隔共享锁已中毒"),
+            ),
             duration,
             scope,
         )

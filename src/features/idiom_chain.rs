@@ -15,7 +15,7 @@ use super::entertainment::{AcquireOutcome, EntertainmentKind, EntertainmentState
 use miliastra_kernel::timer::{DeadlineKind, DeadlineModule, DeadlineToken};
 
 fn default_lexicon_path() -> std::path::PathBuf {
-    std::path::PathBuf::from("assets/idioms.txt")
+    std::path::PathBuf::from("deps/assets/idioms.txt")
 }
 
 #[derive(Debug)]
@@ -1026,7 +1026,8 @@ mod tests {
 
     #[test]
     fn loads_the_complete_project_lexicon_asset() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(default_lexicon_path());
+        // 仓库根 assets/ 保存源资源；发布包中位于 deps/assets/。
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/idioms.txt");
         let lexicon = IdiomLexicon::load(&path).expect("load project idioms");
 
         assert!(lexicon.len() >= 30_000);

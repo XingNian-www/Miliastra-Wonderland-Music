@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use miliastra_playback::{PlayableTrack, TrackKey};
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::PlaybackStateUpdate;
@@ -127,45 +128,140 @@ impl Default for RequestStateSnapshot {
     }
 }
 
+/// 请求状态持久化存储：单行 SQLite 表保存整个快照 JSON blob，每次更新事务原子提交。
 #[derive(Debug)]
 pub(crate) struct RequestStateStore {
-    path: PathBuf,
     snapshot: RequestStateSnapshot,
-    store: Arc<dyn StateStore>,
+    connection: rusqlite::Connection,
 }
 
 pub(crate) type SharedRequestStateStore = Arc<Mutex<RequestStateStore>>;
 
 impl RequestStateStore {
+    /// 打开（必要时创建）SQLite 状态数据库并加载内存快照。
+    ///
+    /// `store` 参数仅为维持上层 API 稳定而保留：SQLite 模式不使用文件端口，
+    /// `path` 直接视为数据库文件路径。数据库已存在但结构不匹配（含旧版 JSON 文件）
+    /// 时明确失败，不做迁移。
     pub(crate) fn load(
         path: PathBuf,
-        store: Arc<dyn StateStore>,
+        _store: Arc<dyn StateStore>,
     ) -> Result<SharedRequestStateStore> {
-        let snapshot = if store.exists(&path) {
-            Self::read_current_or_recover(&path, store.as_ref())?
-        } else if store.exists(&backup_path(&path)) {
-            let snapshot = Self::read_snapshot(&backup_path(&path), store.as_ref())?;
-            let text = serde_json::to_vec_pretty(&snapshot)?;
-            store.write_atomic(&path, &text, "请求状态恢复文件")?;
-            log::warn!("请求状态主文件缺失，已从备份恢复: {}", path.display());
-            snapshot
-        } else {
-            RequestStateSnapshot::default()
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("创建请求状态数据库目录失败: {}", parent.display()))?;
+        }
+        let connection = rusqlite::Connection::open(&path)
+            .with_context(|| format!("打开请求状态数据库失败: {}", path.display()))?;
+        Self::initialize_connection(&connection).with_context(|| {
+            format!(
+                "初始化请求状态数据库失败（文件可能不是 SQLite 数据库）: {}",
+                path.display()
+            )
+        })?;
+        Self::ensure_schema(&connection, &path)?;
+        let snapshot = match Self::read_snapshot_row(&connection)? {
+            Some((stored_version, text)) => {
+                let value: serde_json::Value = serde_json::from_str(&text)
+                    .with_context(|| format!("解析请求状态快照失败: {}", path.display()))?;
+                let schema_version = value
+                    .get("schemaVersion")
+                    .and_then(serde_json::Value::as_u64);
+                if schema_version != Some(u64::from(REQUEST_STATE_SCHEMA_VERSION)) {
+                    return Err(UnsupportedRequestStateSchema {
+                        actual: schema_version,
+                        path: path.clone(),
+                    }
+                    .into());
+                }
+                if Some(stored_version) != schema_version {
+                    bail!(
+                        "请求状态数据库 schema_version 列与快照内容不一致，请删除 {} 后重启",
+                        path.display()
+                    );
+                }
+                let snapshot: RequestStateSnapshot = serde_json::from_value(value)
+                    .with_context(|| format!("解析请求状态快照失败: {}", path.display()))?;
+                validate_snapshot(&snapshot)?;
+                snapshot
+            }
+            None => RequestStateSnapshot::default(),
         };
-        let request_store = Self {
-            path,
+        Ok(Arc::new(Mutex::new(Self {
             snapshot,
-            store,
-        };
-        Ok(Arc::new(Mutex::new(request_store)))
+            connection,
+        })))
+    }
+
+    /// 设置连接参数：WAL、synchronous=NORMAL、foreign_keys=ON、busy_timeout=5000。
+    fn initialize_connection(connection: &rusqlite::Connection) -> Result<()> {
+        connection.pragma_update(None, "journal_mode", "WAL")?;
+        connection.pragma_update(None, "synchronous", "NORMAL")?;
+        connection.pragma_update(None, "foreign_keys", true)?;
+        connection.pragma_update(None, "busy_timeout", 5_000i64)?;
+        Ok(())
+    }
+
+    /// 校验或创建 request_state 单行表。统一数据库允许缓存表与请求状态表共存；
+    /// request_state 已存在但列结构不匹配时明确失败，不做迁移。
+    fn ensure_schema(connection: &rusqlite::Connection, path: &Path) -> Result<()> {
+        const EXPECTED_COLUMNS: [&str; 3] = ["id", "schema_version", "snapshot"];
+        let tables = connection
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+            )?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if tables.iter().any(|name| name == "request_state") {
+            let columns = connection
+                .prepare("PRAGMA table_info(request_state)")?
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            if columns.len() != EXPECTED_COLUMNS.len()
+                || columns
+                    .iter()
+                    .any(|column| !EXPECTED_COLUMNS.contains(&column.as_str()))
+            {
+                bail!(
+                    "请求状态数据库表结构不匹配，请删除 {} 后重启",
+                    path.display()
+                );
+            }
+            return Ok(());
+        }
+        connection.execute_batch(
+            "CREATE TABLE request_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                schema_version INTEGER NOT NULL,
+                snapshot TEXT NOT NULL
+            )",
+        )?;
+        Ok(())
+    }
+
+    /// 读取单行快照：无行返回 None，此时按全新状态处理。
+    fn read_snapshot_row(connection: &rusqlite::Connection) -> Result<Option<(u64, String)>> {
+        let row = connection
+            .query_row(
+                "SELECT schema_version, snapshot FROM request_state WHERE id = 1",
+                [],
+                |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        Ok(row)
     }
 
     #[cfg(test)]
     pub(crate) fn new_for_test() -> SharedRequestStateStore {
+        let connection = rusqlite::Connection::open_in_memory().expect("打开测试内存数据库失败");
+        Self::initialize_connection(&connection).expect("初始化测试数据库失败");
+        Self::ensure_schema(&connection, Path::new(":memory:")).expect("创建测试表失败");
         Arc::new(Mutex::new(Self {
-            path: PathBuf::new(),
             snapshot: RequestStateSnapshot::default(),
-            store: crate::test_support::test_state_store(),
+            connection,
         }))
     }
 
@@ -406,76 +502,28 @@ impl RequestStateStore {
         })
     }
 
-    fn read_current_or_recover(
-        path: &Path,
-        store: &dyn StateStore,
-    ) -> Result<RequestStateSnapshot> {
-        match Self::read_snapshot(path, store) {
-            Ok(snapshot) => Ok(snapshot),
-            Err(error)
-                if error
-                    .downcast_ref::<UnsupportedRequestStateSchema>()
-                    .is_some() =>
-            {
-                Err(error)
-            }
-            Err(primary_error) => {
-                let backup = backup_path(path);
-                if !store.exists(&backup) {
-                    return Err(primary_error);
-                }
-                let snapshot = Self::read_snapshot(&backup, store).with_context(|| {
-                    format!(
-                        "解析请求状态主文件失败且备份也不可恢复: {}",
-                        backup.display()
-                    )
-                })?;
-                log::warn!(
-                    "请求状态主文件损坏，已从备份恢复: {} ({primary_error:#})",
-                    path.display()
-                );
-                let text = serde_json::to_vec_pretty(&snapshot)?;
-                store.write_atomic(path, &text, "请求状态恢复文件")?;
-                Ok(snapshot)
-            }
-        }
+    /// 单行快照原子提交：整张快照序列化为 JSON blob 后在一个事务内写入，
+    /// 失败时整体回滚，不产生部分写入。
+    fn save(&mut self, snapshot: &RequestStateSnapshot) -> Result<()> {
+        let text = serde_json::to_string(snapshot)?;
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "INSERT OR REPLACE INTO request_state (id, schema_version, snapshot) VALUES (1, ?1, ?2)",
+            rusqlite::params![i64::from(snapshot.schema_version), text],
+        )?;
+        transaction.commit()?;
+        Ok(())
     }
 
-    fn read_snapshot(path: &Path, store: &dyn StateStore) -> Result<RequestStateSnapshot> {
-        let text = store
-            .read_to_string(path)
-            .with_context(|| format!("read request state {}", path.display()))?;
-        let value: serde_json::Value = serde_json::from_str(&text)
-            .with_context(|| format!("parse request state {}", path.display()))?;
-        let schema_version = value
-            .get("schemaVersion")
-            .and_then(serde_json::Value::as_u64);
-        if schema_version != Some(u64::from(REQUEST_STATE_SCHEMA_VERSION)) {
-            return Err(UnsupportedRequestStateSchema {
-                actual: schema_version,
-                path: path.to_path_buf(),
-            }
-            .into());
-        }
-        let snapshot: RequestStateSnapshot = serde_json::from_value(value)
-            .with_context(|| format!("parse request state {}", path.display()))?;
-        validate_snapshot(&snapshot)?;
-        Ok(snapshot)
-    }
-
-    fn save(&self, snapshot: &RequestStateSnapshot) -> Result<()> {
-        if self.path.as_os_str().is_empty() {
-            return Ok(());
-        }
-        let text = serde_json::to_vec_pretty(snapshot)?;
-        if self.store.exists(&self.path) {
-            let current = self.store.read(&self.path).with_context(|| {
-                format!("read request state before backup {}", self.path.display())
-            })?;
-            self.store
-                .write_atomic(&backup_path(&self.path), &current, "请求状态备份")?;
-        }
-        self.store.write_atomic(&self.path, &text, "请求状态")
+    /// 仅测试：在 request_state 表上注入 BEFORE INSERT 触发器，
+    /// 使后续任何快照写入失败并整体回滚（模拟写盘故障）。
+    #[cfg(test)]
+    pub(crate) fn inject_write_failure(&self) -> Result<()> {
+        self.connection.execute_batch(
+            "CREATE TRIGGER inject_write_failure BEFORE INSERT ON request_state
+             BEGIN SELECT RAISE(ABORT, '注入的写盘故障'); END",
+        )?;
+        Ok(())
     }
 }
 
@@ -483,15 +531,6 @@ fn retain_recent<T>(items: &mut Vec<T>) {
     if items.len() > MAX_HISTORY_ENTRIES {
         items.drain(..items.len() - MAX_HISTORY_ENTRIES);
     }
-}
-
-fn backup_path(path: &Path) -> PathBuf {
-    let mut name = path
-        .file_name()
-        .unwrap_or_else(|| std::ffi::OsStr::new("request-state"))
-        .to_os_string();
-    name.push(".bak");
-    path.with_file_name(name)
 }
 
 fn validate_snapshot(snapshot: &RequestStateSnapshot) -> Result<()> {
@@ -525,6 +564,9 @@ fn validate_snapshot(snapshot: &RequestStateSnapshot) -> Result<()> {
     {
         bail!("请求状态 nextQueueItemId 必须大于所有 queue item id");
     }
+    if snapshot.playback.volume > 100 {
+        bail!("请求状态播放音量必须在 0-100 之间");
+    }
     if snapshot
         .playback
         .active_request
@@ -542,12 +584,28 @@ fn validate_snapshot(snapshot: &RequestStateSnapshot) -> Result<()> {
 pub struct PlaybackRuntimeState {
     pub state: ConfirmedPlaybackState,
     pub pause_reason: PauseReason,
+    /// 持久化音量（0-100）：成功设置音量后写入，重启恢复播放前应用。
+    #[serde(default = "default_volume")]
+    pub volume: u8,
+    /// 歌词是否显示翻译：成功切换歌词后写入，重启后引擎按该模式加载歌词。
+    #[serde(default = "default_use_translation")]
+    pub use_translation: bool,
     #[serde(deserialize_with = "deserialize_required_option")]
     pub active_request: Option<ActivePlaybackRequest>,
     #[serde(deserialize_with = "deserialize_required_option")]
     pub last_observation: Option<PlaybackObservation>,
     #[serde(default)]
     pub previous_requests: Vec<ActivePlaybackRequest>,
+}
+
+/// 默认音量 100：新装用户与旧版快照（无该字段）都以最大音量启动。
+fn default_volume() -> u8 {
+    100
+}
+
+/// 默认使用翻译歌词：新装用户与旧版快照（无该字段）都启用翻译。
+fn default_use_translation() -> bool {
+    true
 }
 
 fn deserialize_required_option<'de, D, T>(
@@ -565,6 +623,8 @@ impl Default for PlaybackRuntimeState {
         Self {
             state: ConfirmedPlaybackState::Idle,
             pause_reason: PauseReason::None,
+            volume: default_volume(),
+            use_translation: default_use_translation(),
             active_request: None,
             last_observation: None,
             previous_requests: Vec::new(),
@@ -857,7 +917,6 @@ mod tests {
         ConfirmedPlaybackState, PersistentQueue, PlaybackNavigation, PlaybackStateUpdate,
         test_track,
     };
-    use crate::test_support::FailingWriteStore;
 
     /// 构造 Confirmed 状态更新（与 Starting 使用同一 started_at_ms，保持请求身份不变）。
     fn confirmed_update(
@@ -958,7 +1017,7 @@ mod tests {
             track_a.track_ref.key
         );
 
-        // 模拟进程崩溃重启：重载文件后确认与出队都已持久化，队首直接是 B。
+        // 模拟进程崩溃重启：重载数据库后确认与出队都已持久化，队首直接是 B。
         drop(store);
         let reloaded =
             RequestStateStore::load(state_path.clone(), crate::test_support::test_state_store())
@@ -1021,10 +1080,9 @@ mod tests {
     #[test]
     fn confirm_and_dequeue_write_failure_keeps_previous_state() {
         let state_path = temp_request_state_path("confirm-dequeue-crash");
-        let failing = Arc::new(FailingWriteStore::new(
-            crate::test_support::test_state_store(),
-        ));
-        let store = RequestStateStore::load(state_path.clone(), failing.clone()).unwrap();
+        let store =
+            RequestStateStore::load(state_path.clone(), crate::test_support::test_state_store())
+                .unwrap();
         let track_a = test_track("miliastra://track/qqmusic/a", "歌曲A - 歌手A");
         let track_b = test_track("miliastra://track/qqmusic/b", "歌曲B - 歌手B");
         let started_at_ms = 55;
@@ -1048,10 +1106,8 @@ mod tests {
         enter_starting(&store, &track_a, started_at_ms);
         let head_id = store.lock().unwrap().queue_snapshot().1[0].id;
 
-        // 注入写盘故障：确认+出队事务持久化失败，必须整体回滚。
-        failing
-            .fail_writes
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // 通过 BEFORE INSERT 触发器注入写盘故障：任何快照写入都会失败并整体回滚。
+        store.lock().unwrap().inject_write_failure().unwrap();
         assert!(
             store
                 .lock()
@@ -1069,12 +1125,11 @@ mod tests {
         let playback = store.lock().unwrap().playback_snapshot();
         assert_eq!(playback.state, ConfirmedPlaybackState::Starting);
 
-        // 故障恢复后重载：磁盘仍是事务前的状态（不丢歌、不产生部分写入）。
-        failing
-            .fail_writes
-            .store(false, std::sync::atomic::Ordering::SeqCst);
+        // 故障恢复（重新打开连接，触发器不复存在）后重载：磁盘仍是事务前的状态。
         drop(store);
-        let reloaded = RequestStateStore::load(state_path.clone(), failing.clone()).unwrap();
+        let reloaded =
+            RequestStateStore::load(state_path.clone(), crate::test_support::test_state_store())
+                .unwrap();
         let (_, items) = reloaded.lock().unwrap().queue_snapshot();
         assert_eq!(items.len(), 2, "磁盘不得出现部分写入");
         assert_eq!(items[0].id, head_id);
@@ -1178,11 +1233,9 @@ mod tests {
     #[test]
     fn unified_request_state_rejects_unversioned_state_with_delete_hint() {
         let state_path = temp_request_state_path("legacy-migration");
-        fs::write(
-            &state_path,
-            r#"{"state":"idle","pauseReason":"none","activeRequest":null,"lastObservation":null}"#,
-        )
-        .unwrap();
+        let mut value = serde_json::to_value(RequestStateSnapshot::default()).unwrap();
+        value.as_object_mut().unwrap().remove("schemaVersion");
+        write_snapshot_blob(&state_path, &value);
 
         let error =
             RequestStateStore::load(state_path.clone(), crate::test_support::test_state_store())
@@ -1199,7 +1252,7 @@ mod tests {
         let state_path = temp_request_state_path("v1-rejected");
         let mut value = serde_json::to_value(RequestStateSnapshot::default()).unwrap();
         value["schemaVersion"] = serde_json::json!(1);
-        fs::write(&state_path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        write_snapshot_blob(&state_path, &value);
 
         let error =
             RequestStateStore::load(state_path.clone(), crate::test_support::test_state_store())
@@ -1207,29 +1260,6 @@ mod tests {
 
         assert!(error.to_string().contains("schemaVersion Some(1)"));
         assert!(error.to_string().contains("请删除状态文件"));
-        remove_request_state_path(state_path);
-    }
-
-    #[test]
-    fn unsupported_primary_schema_never_falls_back_to_a_valid_backup() {
-        let state_path = temp_request_state_path("v1-with-v2-backup");
-        let mut legacy = serde_json::to_value(RequestStateSnapshot::default()).unwrap();
-        legacy["schemaVersion"] = serde_json::json!(1);
-        fs::write(&state_path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
-        fs::write(
-            backup_path(&state_path),
-            serde_json::to_vec_pretty(&RequestStateSnapshot::default()).unwrap(),
-        )
-        .unwrap();
-
-        let error =
-            RequestStateStore::load(state_path.clone(), crate::test_support::test_state_store())
-                .expect_err("unsupported primary schema must not use the backup");
-
-        assert!(error.to_string().contains("schemaVersion Some(1)"));
-        let persisted: serde_json::Value =
-            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
-        assert_eq!(persisted["schemaVersion"], 1);
         remove_request_state_path(state_path);
     }
 
@@ -1243,7 +1273,7 @@ mod tests {
             ..QueueItem::default()
         });
         snapshot.next_queue_item_id = 1;
-        fs::write(&state_path, serde_json::to_vec_pretty(&snapshot).unwrap()).unwrap();
+        write_snapshot_blob(&state_path, &serde_json::to_value(&snapshot).unwrap());
 
         let error =
             RequestStateStore::load(state_path.clone(), crate::test_support::test_state_store())
@@ -1276,11 +1306,31 @@ mod tests {
             })
             .unwrap();
 
-        let json: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&state_path).unwrap()).unwrap();
+        // 单行快照：数据库里只有一行，JSON blob 同时包含队列与播放状态。
+        let connection = rusqlite::Connection::open(&state_path).unwrap();
+        let (row_count, text): (i64, String) = connection
+            .query_row(
+                "SELECT COUNT(*), snapshot FROM request_state WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row_count, 1, "快照必须始终只有一行");
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(json["schemaVersion"], REQUEST_STATE_SCHEMA_VERSION);
         assert_eq!(json["queue"].as_array().unwrap().len(), 1);
         assert_eq!(json["playback"]["state"], "paused_by_user");
+
+        // 重载后队列与播放状态都能恢复。
+        let reloaded =
+            RequestStateStore::load(state_path.clone(), crate::test_support::test_state_store())
+                .unwrap();
+        let reloaded = reloaded.lock().unwrap();
+        assert_eq!(reloaded.queue_snapshot().1.len(), 1);
+        assert_eq!(
+            reloaded.playback_snapshot().state,
+            ConfirmedPlaybackState::PausedByUser
+        );
 
         remove_request_state_path(state_path);
     }
@@ -1378,8 +1428,8 @@ mod tests {
     }
 
     #[test]
-    fn corrupted_primary_recovers_the_last_valid_backup() {
-        let state_path = temp_request_state_path("backup-recovery");
+    fn corrupted_database_fails_loudly_without_recovery() {
+        let state_path = temp_request_state_path("corrupt-db");
         let store =
             RequestStateStore::load(state_path.clone(), crate::test_support::test_state_store())
                 .unwrap();
@@ -1393,34 +1443,46 @@ mod tests {
                 completed: true,
             })
             .unwrap();
-        // A second write retains the first valid version as .bak.
-        store
-            .lock()
-            .unwrap()
-            .record_control_operation(ControlOperationRecord {
-                operation_id: 8,
-                operation: "resume".to_string(),
-                requested_at_ms: 43,
-                completed: true,
-            })
-            .unwrap();
-        fs::write(&state_path, "{broken").unwrap();
+        drop(store);
 
-        let recovered =
+        // 破坏数据库文件：SQLite 无备份机制，损坏必须明确失败而不是静默恢复。
+        fs::write(&state_path, b"not-a-sqlite-database").unwrap();
+        let error =
             RequestStateStore::load(state_path.clone(), crate::test_support::test_state_store())
-                .unwrap();
-        let recovered = recovered.lock().unwrap();
-        assert_eq!(recovered.snapshot.control_operation_history.len(), 1);
-        assert_eq!(
-            recovered.snapshot.control_operation_history[0].operation,
-            "pause"
-        );
-        assert!(
-            fs::read_to_string(&state_path)
-                .unwrap()
-                .contains("\"schemaVersion\"")
-        );
+                .expect_err("损坏的数据库必须明确失败");
 
+        assert!(error.to_string().contains("请求状态数据库"));
+        remove_request_state_path(state_path);
+    }
+
+    #[test]
+    fn database_schema_mismatch_fails_loudly() {
+        // 表列结构不匹配：明确失败，不迁移。
+        let state_path = temp_request_state_path("schema-column-mismatch");
+        let connection = rusqlite::Connection::open(&state_path).unwrap();
+        connection
+            .execute_batch("CREATE TABLE request_state (id INTEGER PRIMARY KEY, value TEXT)")
+            .unwrap();
+        let error =
+            RequestStateStore::load(state_path.clone(), crate::test_support::test_state_store())
+                .expect_err("表结构不匹配必须明确失败");
+        assert!(error.to_string().contains("表结构"));
+        remove_request_state_path(state_path);
+
+        // 统一数据库已存在缓存表时，应在同一文件中补建 request_state。
+        let state_path = temp_request_state_path("schema-other-tables");
+        let connection = rusqlite::Connection::open(&state_path).unwrap();
+        connection
+            .execute_batch("CREATE TABLE cached_tracks (hash TEXT PRIMARY KEY)")
+            .unwrap();
+        drop(connection);
+        let store =
+            RequestStateStore::load(state_path.clone(), crate::test_support::test_state_store())
+                .expect("缓存表与请求状态表必须能够共存");
+        assert_eq!(
+            store.lock().unwrap().playback_snapshot().state,
+            ConfirmedPlaybackState::Idle
+        );
         remove_request_state_path(state_path);
     }
 
@@ -1499,6 +1561,31 @@ mod tests {
         remove_request_state_path(state_path);
     }
 
+    /// 在测试数据库里直接写入一行快照 blob（模拟旧版本/外部写入的数据）。
+    fn write_snapshot_blob(path: &Path, value: &serde_json::Value) {
+        let connection = rusqlite::Connection::open(path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE request_state (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    schema_version INTEGER NOT NULL,
+                    snapshot TEXT NOT NULL
+                )",
+            )
+            .unwrap();
+        let text = serde_json::to_string(value).unwrap();
+        let version = value
+            .get("schemaVersion")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as i64;
+        connection
+            .execute(
+                "INSERT INTO request_state (id, schema_version, snapshot) VALUES (1, ?1, ?2)",
+                rusqlite::params![version, text],
+            )
+            .unwrap();
+    }
+
     fn temp_request_state_path(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1510,11 +1597,84 @@ mod tests {
             name,
             nanos
         ));
-        root.with_extension("state.json")
+        root.with_extension("state.sqlite")
     }
 
+    /// 清理测试数据库及其 WAL/SHM 附属文件。
     fn remove_request_state_path(state_path: PathBuf) {
         let _ = fs::remove_file(&state_path);
-        let _ = fs::remove_file(backup_path(&state_path));
+        let mut wal = state_path.as_os_str().to_os_string();
+        wal.push("-wal");
+        let _ = fs::remove_file(wal);
+        let mut shm = state_path.as_os_str().to_os_string();
+        shm.push("-shm");
+        let _ = fs::remove_file(shm);
+    }
+
+    #[test]
+    fn playback_runtime_state_defaults_volume_100_and_translation_enabled() {
+        let state = PlaybackRuntimeState::default();
+        assert_eq!(state.volume, 100, "默认音量必须是 100");
+        assert!(state.use_translation, "默认歌词必须使用翻译");
+
+        // 旧版快照缺少 volume/useTranslation 字段：反序列化必须恢复默认值。
+        let restored: PlaybackRuntimeState = serde_json::from_str(
+            r#"{
+                "state": "idle",
+                "pauseReason": "none",
+                "activeRequest": null,
+                "lastObservation": null
+            }"#,
+        )
+        .expect("旧版快照必须可读");
+        assert_eq!(restored.volume, 100);
+        assert!(restored.use_translation);
+
+        // 序列化往返保留音量与歌词模式。
+        let state = PlaybackRuntimeState {
+            volume: 60,
+            use_translation: false,
+            ..PlaybackRuntimeState::default()
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let restored: PlaybackRuntimeState = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.volume, 60);
+        assert!(!restored.use_translation);
+    }
+
+    #[test]
+    fn volume_and_lyrics_mode_persist_and_survive_reload() {
+        let state_path = temp_request_state_path("volume-lyrics-persist");
+        {
+            let store = RequestStateStore::load(
+                state_path.clone(),
+                crate::test_support::test_state_store(),
+            )
+            .unwrap();
+            let mut playback = PersistentPlaybackState::from_request_store(store).unwrap();
+            // 新装默认：音量 100、使用翻译。
+            assert_eq!(playback.state().volume, 100);
+            assert!(playback.state().use_translation);
+            // 成功设置音量/切换歌词后的写入路径（apply 后落盘）。
+            assert!(
+                playback
+                    .update(|state| {
+                        state.volume = 60;
+                        state.use_translation = false;
+                        true
+                    })
+                    .unwrap()
+            );
+        }
+
+        // 模拟重启：重载数据库后音量与歌词模式恢复。
+        let reloaded =
+            RequestStateStore::load(state_path.clone(), crate::test_support::test_state_store())
+                .unwrap();
+        let playback = reloaded.lock().unwrap().playback_snapshot();
+        assert_eq!(playback.volume, 60);
+        assert!(!playback.use_translation);
+
+        remove_request_state_path(state_path);
     }
 }

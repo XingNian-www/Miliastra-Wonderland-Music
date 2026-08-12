@@ -4397,7 +4397,9 @@ mod tests {
             queue,
             playback_state,
             history,
-            crate::features::playback::SongDedupConfig::default(),
+            std::sync::Arc::new(std::sync::RwLock::new(
+                crate::features::playback::SongDedupConfig::default(),
+            )),
             0,
         )
     }

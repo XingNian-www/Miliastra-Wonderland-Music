@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -373,6 +374,7 @@ pub(crate) trait PlaybackCommandPort: PlaybackExecutionPort {
         Ok(None)
     }
     fn set_volume(&mut self, volume: &str) -> Result<()>;
+    fn toggle_lyrics(&mut self) -> Result<String>;
     fn remove_playback_queue_indexes(
         &mut self,
         indexes: Vec<usize>,
@@ -418,12 +420,14 @@ pub(crate) trait PlaybackMonitorPort {
     fn update_monitor(&mut self);
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct PlaybackApplicationConfig {
     pub(crate) console_bypass_dedup: bool,
     pub(crate) queue_max_size: usize,
-    pub(crate) monitor_tick_ms: u64,
-    pub(crate) monitor_status_ms: u64,
+    /// 热更新共享句柄（阶段 7）：保存 timing.playback.monitor_tick_ms 后立即生效。
+    pub(crate) monitor_tick_ms: Arc<RwLock<u64>>,
+    /// 热更新共享句柄（阶段 7）：保存 timing.playback.monitor_status_ms 后立即生效。
+    pub(crate) monitor_status_ms: Arc<RwLock<u64>>,
     pub(crate) help_batch_ms: u64,
 }
 
@@ -465,7 +469,7 @@ pub(crate) struct PlaybackApplication {
 }
 
 impl PlaybackApplication {
-    pub(crate) const fn new(config: PlaybackApplicationConfig) -> Self {
+    pub(crate) fn new(config: PlaybackApplicationConfig) -> Self {
         Self { config }
     }
 
@@ -529,6 +533,15 @@ impl PlaybackApplication {
                 port.log_executed(context, "lyrics")?;
                 port.reply(&format_lyrics(&status))?;
             }
+            PlaybackCommand::ToggleLyrics => {
+                let mode = port.toggle_lyrics()?;
+                port.log_executed(context, "lyrics toggle")?;
+                port.reply(if mode == "translation" {
+                    "歌词已切换为翻译"
+                } else {
+                    "歌词已切换为原文"
+                })?;
+            }
             PlaybackCommand::LyricsFor(seconds) => {
                 let started = port.start_background_lyrics(
                     Some(Duration::from_secs(u64::from(*seconds))),
@@ -537,7 +550,7 @@ impl PlaybackApplication {
                 port.log_executed(context, &format!("lyrics {}s", seconds))?;
                 let message = if started {
                     format!(
-                        "限时歌词已开启，将持续{}秒；正式命令执行期间暂不发送，完成后自动继续",
+                        "限时歌词已开启，将持续{}秒；默认显示翻译，发送@切换可切换原文/翻译",
                         seconds
                     )
                 } else {
@@ -555,7 +568,7 @@ impl PlaybackApplication {
                     port.start_background_lyrics(None, BackgroundLyricsScope::AllSongs)?;
                 port.log_executed(context, "lyrics background")?;
                 port.reply(if started {
-                    "后台歌词已开启，正式命令执行期间暂不发送，完成后自动继续"
+                    "后台歌词已开启；默认显示翻译，发送@切换 可切换原文/翻译；"
                 } else {
                     "后台歌词已经在运行"
                 })?;
@@ -565,7 +578,7 @@ impl PlaybackApplication {
                     port.start_background_lyrics(None, BackgroundLyricsScope::CurrentSong)?;
                 port.log_executed(context, "lyrics single song")?;
                 port.reply(if started {
-                    "单曲后台歌词已开启，切歌后自动停止"
+                    "单曲后台歌词已开启；默认显示翻译，发送@切换可切换原文/翻译；切歌后自动停止"
                 } else {
                     "后台歌词已经在运行"
                 })?;
@@ -627,7 +640,13 @@ impl PlaybackApplication {
     }
 
     fn reply_continuous_lyrics<P: PlaybackCommandPort + ?Sized>(&self, port: &mut P) -> Result<()> {
-        let poll = Duration::from_millis(self.config.monitor_status_ms.max(1));
+        let poll = Duration::from_millis(
+            self.config
+                .monitor_status_ms
+                .read()
+                .expect("播放状态校准间隔共享锁已中毒")
+                .max(1),
+        );
         let mut lyric_tracker = LyricTracker::default();
 
         loop {
@@ -653,11 +672,23 @@ impl PlaybackApplication {
     }
 
     pub(crate) fn run_monitor_loop<P: PlaybackMonitorPort + ?Sized>(&self, port: &mut P) {
-        let tick_ms = self.config.monitor_tick_ms.max(50);
-        let status_ms = self.config.monitor_status_ms.max(tick_ms);
         let mut snapshot: Option<PlaybackSnapshot> = None;
         let mut next_status_at = port.now();
         while port.is_running() {
+            // 每轮重读热更新共享值：运行中保存 monitor_tick_ms/monitor_status_ms
+            // 立即影响轮询间隔与状态校准间隔（钳制语义与启动时一致）。
+            let tick_ms = self
+                .config
+                .monitor_tick_ms
+                .read()
+                .expect("播放监控循环间隔共享锁已中毒")
+                .max(50);
+            let status_ms = self
+                .config
+                .monitor_status_ms
+                .read()
+                .expect("播放状态校准间隔共享锁已中毒")
+                .max(tick_ms);
             if port.is_paused() {
                 port.wait(Duration::from_millis(tick_ms));
                 continue;
@@ -1324,6 +1355,11 @@ mod tests {
         clock: Arc<ManualClock>,
         waits: usize,
         status_reads: usize,
+        /// 测试用：第几次 wait 前把共享 tick 值改为新值（模拟运行中热更新）。
+        tick_override: Option<(usize, u64)>,
+        /// 与 PlaybackApplicationConfig.monitor_tick_ms 共享同一句柄。
+        tick: Arc<RwLock<u64>>,
+        wait_durations: Vec<Duration>,
     }
 
     impl PlaybackMonitorPort for MonitorPort {
@@ -1340,8 +1376,14 @@ mod tests {
         }
 
         fn wait(&mut self, duration: Duration) {
+            if let Some((at_wait, value)) = self.tick_override
+                && self.waits + 1 == at_wait
+            {
+                *self.tick.write().expect("测试 tick 共享锁已中毒") = value;
+            }
             self.clock.advance(duration).unwrap();
             self.waits += 1;
+            self.wait_durations.push(duration);
         }
 
         fn player_status(&mut self) -> Result<PlayerStatus> {
@@ -1416,18 +1458,56 @@ mod tests {
             clock,
             waits: 0,
             status_reads: 0,
+            tick_override: None,
+            tick: Arc::new(RwLock::new(50)),
+            wait_durations: Vec::new(),
         };
         let application = PlaybackApplication::new(PlaybackApplicationConfig {
             console_bypass_dedup: true,
             queue_max_size: 20,
-            monitor_tick_ms: 50,
-            monitor_status_ms: 100,
+            monitor_tick_ms: Arc::new(RwLock::new(50)),
+            monitor_status_ms: Arc::new(RwLock::new(100)),
             help_batch_ms: 0,
         });
 
         application.run_monitor_loop(&mut port);
 
         assert_eq!(port.status_reads, 2);
+    }
+
+    #[test]
+    fn monitor_loop_reads_live_tick_values_each_round() {
+        let clock = Arc::new(ManualClock::new(Instant::now()));
+        let tick = Arc::new(RwLock::new(50u64));
+        let mut port = MonitorPort {
+            clock,
+            waits: 0,
+            status_reads: 0,
+            // 第 2 次 wait 前把共享 tick 从 50 改为 500：循环每轮重读共享值
+            // 时第 3 次起的 wait 时长应为 500ms；修复前启动时只读一次，恒为 50ms。
+            tick_override: Some((2, 500)),
+            tick: tick.clone(),
+            wait_durations: Vec::new(),
+        };
+        let application = PlaybackApplication::new(PlaybackApplicationConfig {
+            console_bypass_dedup: true,
+            queue_max_size: 20,
+            monitor_tick_ms: tick,
+            monitor_status_ms: Arc::new(RwLock::new(100)),
+            help_batch_ms: 0,
+        });
+
+        application.run_monitor_loop(&mut port);
+
+        assert_eq!(
+            port.wait_durations,
+            [
+                Duration::from_millis(50),
+                Duration::from_millis(50),
+                Duration::from_millis(500),
+                Duration::from_millis(500),
+            ]
+        );
     }
 
     impl PlaybackExecutionPort for VerifyingPlaybackPort {
@@ -1641,8 +1721,8 @@ mod tests {
         let application = PlaybackApplication::new(PlaybackApplicationConfig {
             console_bypass_dedup: true,
             queue_max_size: 20,
-            monitor_tick_ms: 50,
-            monitor_status_ms: 50,
+            monitor_tick_ms: Arc::new(RwLock::new(50)),
+            monitor_status_ms: Arc::new(RwLock::new(50)),
             help_batch_ms: 0,
         });
 
@@ -1682,8 +1762,8 @@ mod tests {
         let application = PlaybackApplication::new(PlaybackApplicationConfig {
             console_bypass_dedup: true,
             queue_max_size: 20,
-            monitor_tick_ms: 50,
-            monitor_status_ms: 50,
+            monitor_tick_ms: Arc::new(RwLock::new(50)),
+            monitor_status_ms: Arc::new(RwLock::new(50)),
             help_batch_ms: 0,
         });
 
@@ -1743,8 +1823,8 @@ mod tests {
         let application = PlaybackApplication::new(PlaybackApplicationConfig {
             console_bypass_dedup: true,
             queue_max_size: 20,
-            monitor_tick_ms: 50,
-            monitor_status_ms: 50,
+            monitor_tick_ms: Arc::new(RwLock::new(50)),
+            monitor_status_ms: Arc::new(RwLock::new(50)),
             help_batch_ms: 0,
         });
 
@@ -1793,8 +1873,8 @@ mod tests {
         let application = PlaybackApplication::new(PlaybackApplicationConfig {
             console_bypass_dedup: true,
             queue_max_size: 20,
-            monitor_tick_ms: 50,
-            monitor_status_ms: 50,
+            monitor_tick_ms: Arc::new(RwLock::new(50)),
+            monitor_status_ms: Arc::new(RwLock::new(50)),
             help_batch_ms: 0,
         });
 
@@ -1834,8 +1914,8 @@ mod tests {
         let application = PlaybackApplication::new(PlaybackApplicationConfig {
             console_bypass_dedup: true,
             queue_max_size: 20,
-            monitor_tick_ms: 50,
-            monitor_status_ms: 50,
+            monitor_tick_ms: Arc::new(RwLock::new(50)),
+            monitor_status_ms: Arc::new(RwLock::new(50)),
             help_batch_ms: 0,
         });
 
@@ -1883,8 +1963,8 @@ mod tests {
         let application = PlaybackApplication::new(PlaybackApplicationConfig {
             console_bypass_dedup: true,
             queue_max_size: 20,
-            monitor_tick_ms: 50,
-            monitor_status_ms: 50,
+            monitor_tick_ms: Arc::new(RwLock::new(50)),
+            monitor_status_ms: Arc::new(RwLock::new(50)),
             help_batch_ms: 0,
         });
 
@@ -1925,8 +2005,8 @@ mod tests {
         let application = PlaybackApplication::new(PlaybackApplicationConfig {
             console_bypass_dedup: true,
             queue_max_size: 20,
-            monitor_tick_ms: 50,
-            monitor_status_ms: 50,
+            monitor_tick_ms: Arc::new(RwLock::new(50)),
+            monitor_status_ms: Arc::new(RwLock::new(50)),
             help_batch_ms: 0,
         });
 
@@ -1958,8 +2038,8 @@ mod tests {
         let application = PlaybackApplication::new(PlaybackApplicationConfig {
             console_bypass_dedup: true,
             queue_max_size: 20,
-            monitor_tick_ms: 50,
-            monitor_status_ms: 50,
+            monitor_tick_ms: Arc::new(RwLock::new(50)),
+            monitor_status_ms: Arc::new(RwLock::new(50)),
             help_batch_ms: 0,
         });
 
@@ -2009,8 +2089,8 @@ mod tests {
         let application = PlaybackApplication::new(PlaybackApplicationConfig {
             console_bypass_dedup: true,
             queue_max_size: 20,
-            monitor_tick_ms: 50,
-            monitor_status_ms: 50,
+            monitor_tick_ms: Arc::new(RwLock::new(50)),
+            monitor_status_ms: Arc::new(RwLock::new(50)),
             help_batch_ms: 0,
         });
 
@@ -2135,6 +2215,10 @@ mod tests {
             Ok(())
         }
 
+        fn toggle_lyrics(&mut self) -> Result<String> {
+            Ok("translation".to_string())
+        }
+
         fn remove_playback_queue_indexes(
             &mut self,
             _indexes: Vec<usize>,
@@ -2198,8 +2282,8 @@ mod tests {
         let application = PlaybackApplication::new(PlaybackApplicationConfig {
             console_bypass_dedup: true,
             queue_max_size: 20,
-            monitor_tick_ms: 50,
-            monitor_status_ms: 50,
+            monitor_tick_ms: Arc::new(RwLock::new(50)),
+            monitor_status_ms: Arc::new(RwLock::new(50)),
             help_batch_ms: 321,
         });
         let context = PlaybackCommandContext {
@@ -2241,8 +2325,8 @@ mod tests {
         let application = PlaybackApplication::new(PlaybackApplicationConfig {
             console_bypass_dedup: true,
             queue_max_size: 20,
-            monitor_tick_ms: 50,
-            monitor_status_ms: 1_000,
+            monitor_tick_ms: Arc::new(RwLock::new(50)),
+            monitor_status_ms: Arc::new(RwLock::new(1_000)),
             help_batch_ms: 0,
         });
         let context = PlaybackCommandContext {
@@ -2264,7 +2348,7 @@ mod tests {
         );
         assert_eq!(
             port.replies,
-            ["限时歌词已开启，将持续5秒；正式命令执行期间暂不发送，完成后自动继续"]
+            ["限时歌词已开启，将持续5秒；默认显示翻译，发送@切换可切换原文/翻译"]
         );
     }
 
@@ -2289,8 +2373,8 @@ mod tests {
         let application = PlaybackApplication::new(PlaybackApplicationConfig {
             console_bypass_dedup: true,
             queue_max_size: 20,
-            monitor_tick_ms: 50,
-            monitor_status_ms: 1_000,
+            monitor_tick_ms: Arc::new(RwLock::new(50)),
+            monitor_status_ms: Arc::new(RwLock::new(1_000)),
             help_batch_ms: 0,
         });
         let context = PlaybackCommandContext {
@@ -2307,7 +2391,10 @@ mod tests {
             port.background_lyrics_starts,
             [(None, BackgroundLyricsScope::CurrentSong)]
         );
-        assert_eq!(port.replies, ["单曲后台歌词已开启，切歌后自动停止"]);
+        assert_eq!(
+            port.replies,
+            ["单曲后台歌词已开启；默认显示翻译，发送@切换可切换原文/翻译；切歌后自动停止"]
+        );
     }
 
     #[test]
@@ -2344,8 +2431,8 @@ mod tests {
         let application = PlaybackApplication::new(PlaybackApplicationConfig {
             console_bypass_dedup: true,
             queue_max_size: 20,
-            monitor_tick_ms: 50,
-            monitor_status_ms: 1_000,
+            monitor_tick_ms: Arc::new(RwLock::new(50)),
+            monitor_status_ms: Arc::new(RwLock::new(1_000)),
             help_batch_ms: 0,
         });
         let context = PlaybackCommandContext {
@@ -2436,8 +2523,8 @@ mod tests {
         let application = PlaybackApplication::new(PlaybackApplicationConfig {
             console_bypass_dedup: true,
             queue_max_size: 20,
-            monitor_tick_ms: 50,
-            monitor_status_ms: 50,
+            monitor_tick_ms: Arc::new(RwLock::new(50)),
+            monitor_status_ms: Arc::new(RwLock::new(50)),
             help_batch_ms: 0,
         });
         let context = PlaybackCommandContext {
@@ -2476,8 +2563,8 @@ mod tests {
         let application = PlaybackApplication::new(PlaybackApplicationConfig {
             console_bypass_dedup: true,
             queue_max_size: 20,
-            monitor_tick_ms: 50,
-            monitor_status_ms: 50,
+            monitor_tick_ms: Arc::new(RwLock::new(50)),
+            monitor_status_ms: Arc::new(RwLock::new(50)),
             help_batch_ms: 0,
         });
         let context = PlaybackCommandContext {
@@ -2527,8 +2614,8 @@ mod tests {
         let application = PlaybackApplication::new(PlaybackApplicationConfig {
             console_bypass_dedup: true,
             queue_max_size: 20,
-            monitor_tick_ms: 50,
-            monitor_status_ms: 50,
+            monitor_tick_ms: Arc::new(RwLock::new(50)),
+            monitor_status_ms: Arc::new(RwLock::new(50)),
             help_batch_ms: 0,
         });
         let context = PlaybackCommandContext {
@@ -2589,8 +2676,8 @@ mod tests {
         let application = PlaybackApplication::new(PlaybackApplicationConfig {
             console_bypass_dedup: true,
             queue_max_size: 20,
-            monitor_tick_ms: 50,
-            monitor_status_ms: 50,
+            monitor_tick_ms: Arc::new(RwLock::new(50)),
+            monitor_status_ms: Arc::new(RwLock::new(50)),
             help_batch_ms: 0,
         });
         let context = PlaybackCommandContext {
@@ -2630,8 +2717,8 @@ mod tests {
         let application = PlaybackApplication::new(PlaybackApplicationConfig {
             console_bypass_dedup: true,
             queue_max_size: 20,
-            monitor_tick_ms: 50,
-            monitor_status_ms: 50,
+            monitor_tick_ms: Arc::new(RwLock::new(50)),
+            monitor_status_ms: Arc::new(RwLock::new(50)),
             help_batch_ms: 0,
         });
         let context = PlaybackCommandContext {

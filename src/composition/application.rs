@@ -27,7 +27,7 @@ use crate::adapters::login_helper::LoginHelperManager;
 use crate::adapters::native_playback::NativePlaybackAdapter;
 use crate::adapters::player::PlayerRuntimeBackend;
 use crate::adapters::windows::{WindowsUiDevice, parse_key};
-use crate::config::{AppConfig, PointConfig};
+use crate::config::{AppConfig, LiveConfigs, PointConfig};
 use crate::features::administration::{
     AdministrationApplication, AdministrationCommand, ChatListenerModeCommand,
 };
@@ -158,6 +158,9 @@ impl ChatScanTelemetrySink for MonitorShared {
 
 pub(crate) struct ResolvedApplicationConfig {
     app: AppConfig,
+    /// 热更新共享句柄集合（阶段 7）：resolve 时从最终配置创建，
+    /// 由 ApplicationRuntime::new 分发到各消费方并随生命周期持有。
+    live_configs: LiveConfigs,
     player_runtime: PlayerRuntimeConfig,
     ocr: ResolvedOcrArgs,
     chat_templates: ResolvedTemplateArgs,
@@ -175,6 +178,8 @@ pub(crate) struct ResolvedApplicationConfig {
 impl ResolvedApplicationConfig {
     pub(crate) fn resolve(app: AppConfig) -> Result<Self> {
         app.validate().context("启动前校验组合配置")?;
+        // 热更新共享值以最终启动配置为准（与运行态消费方同一份值）。
+        let live_configs = LiveConfigs::from_config(&app);
 
         let player_runtime = app
             .player_runtime_config()
@@ -189,7 +194,7 @@ impl ResolvedApplicationConfig {
                 ocr: &app.ocr,
                 output: &app.output,
                 input_timing: &app.timing.input,
-                delivery: &app.friend_delivery,
+                auto_retry_count: live_configs.friend_delivery_auto_retry_count.clone(),
                 friend_list_region: app.invite.friend_list_region.into(),
                 friend_step_ms: app.timing.invite.step_ms,
                 timeout_ms: app.timing.workflow.default_timeout_ms,
@@ -301,6 +306,7 @@ impl ResolvedApplicationConfig {
 
         Ok(Self {
             app,
+            live_configs,
             player_runtime,
             ocr,
             chat_templates,
@@ -400,12 +406,18 @@ struct BusinessBundle {
 
 struct LifecycleBundle {
     config: AppConfig,
+    /// 热更新共享句柄集合（阶段 7）：HTTP 保存成功后 apply，
+    /// HTTP 服务与各消费方持有同一份 Arc。
+    live_configs: LiveConfigs,
     http_server: Option<http::HttpServer>,
     openai_runtime: Option<OpenAiRuntime>,
     running: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     console_reply_context: Arc<AtomicBool>,
     monitor: MonitorShared,
+    /// 配置中心共享句柄；正式运行时由 ApplicationRuntime::new 注入，
+    /// 正式任务执行上下文（facade 重建）中不持有（HTTP 服务不在其中）。
+    config_store: Option<crate::config::SharedConfigStore>,
 }
 
 pub(crate) struct ApplicationRuntime {
@@ -477,6 +489,8 @@ struct FormalTaskBusinessContext {
 
 struct FormalTaskLifecycleContext {
     config: AppConfig,
+    /// 热更新共享句柄集合：正式任务上下文（facade 重建）与 HTTP 服务共享同一份。
+    live_configs: LiveConfigs,
     running: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     console_reply_context: Arc<AtomicBool>,
@@ -547,12 +561,14 @@ impl FormalTaskExecutionContext {
                 },
                 lifecycle: LifecycleBundle {
                     config: self.lifecycle.config.clone(),
+                    live_configs: self.lifecycle.live_configs.clone(),
                     http_server: None,
                     openai_runtime: None,
                     running: self.lifecycle.running.clone(),
                     paused: self.lifecycle.paused.clone(),
                     console_reply_context: self.lifecycle.console_reply_context.clone(),
                     monitor: self.lifecycle.monitor.clone(),
+                    config_store: None,
                 },
             },
         }
@@ -1024,9 +1040,14 @@ impl Drop for ConsoleReplyContextGuard {
 }
 
 impl ApplicationRuntime {
-    pub(crate) fn new(config: ResolvedApplicationConfig, monitor: MonitorShared) -> Result<Self> {
+    pub(crate) fn new(
+        config: ResolvedApplicationConfig,
+        monitor: MonitorShared,
+        config_store: crate::config::SharedConfigStore,
+    ) -> Result<Self> {
         let ResolvedApplicationConfig {
             app: config,
+            live_configs,
             player_runtime: player_runtime_config,
             ocr: ocr_args,
             chat_templates,
@@ -1104,7 +1125,7 @@ impl ApplicationRuntime {
             config.song_dedup.history_path.clone(),
             config.queue.max_size,
             config.queue.pool_max_size,
-            config.song_dedup.clone(),
+            live_configs.song_dedup.clone(),
             system_clock.clone(),
             state_store.clone(),
         )?;
@@ -1256,16 +1277,23 @@ impl ApplicationRuntime {
         let player = PlayerController::new(
             PlayerRuntimeBackend::new(player_runtime_handle),
             BusinessPlaybackStateAdapter::new(business.clone()),
-            &config.timing.playback,
-            &config.queue,
             &config.matching,
             PlaybackTimePorts::new(system_clock.clone(), system_clock.clone()),
+            live_configs.clone(),
         );
+        // 重启恢复：上次会话有活动歌曲时，从最后可靠进度恢复播放（新引擎会话）。
+        // 音量已持久化，恢复前由控制器重新应用；原用户暂停的歌曲恢复后保持暂停。
+        match player.play_restored() {
+            Ok(true) => log::info!("已恢复上次会话的活动歌曲"),
+            Ok(false) => log::info!("无待恢复的活动歌曲"),
+            Err(error) => log::warn!("恢复上次会话的活动歌曲失败: {error:#}"),
+        }
         let playback_application = PlaybackApplication::new(PlaybackApplicationConfig {
             console_bypass_dedup: config.song_dedup.console_bypass,
             queue_max_size: config.queue.max_size,
-            monitor_tick_ms: config.timing.playback.monitor_tick_ms,
-            monitor_status_ms: config.timing.playback.monitor_status_ms,
+            // 热更新共享句柄：保存 timing.playback.monitor_tick_ms/status_poll 后立即生效。
+            monitor_tick_ms: live_configs.monitor_tick_ms.clone(),
+            monitor_status_ms: live_configs.monitor_status_ms.clone(),
             help_batch_ms: config.timing.command.help_batch_ms,
         });
         let administration_application =
@@ -1330,12 +1358,14 @@ impl ApplicationRuntime {
             },
             lifecycle: LifecycleBundle {
                 config,
+                live_configs,
                 http_server: None,
                 openai_runtime: Some(openai_runtime),
                 running,
                 paused: Arc::new(AtomicBool::new(false)),
                 console_reply_context: Arc::new(AtomicBool::new(false)),
                 monitor,
+                config_store: Some(config_store),
             },
         })
     }

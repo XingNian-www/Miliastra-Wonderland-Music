@@ -34,6 +34,17 @@ pub struct ModerationTimingConfig {
     pub confirm_wait_ms: u64,
 }
 
+impl Default for ModerationTimingConfig {
+    fn default() -> Self {
+        Self {
+            vote_timeout_ms: 120000,
+            vote_poll_ms: 2000,
+            search_result_timeout_ms: 5000,
+            confirm_wait_ms: 2000,
+        }
+    }
+}
+
 impl ModerationConfig {
     pub(crate) fn validate(&self, timing: &ModerationTimingConfig) -> Result<()> {
         if self.stable_vote_samples == 0 || self.required_vote_margin <= 0 {

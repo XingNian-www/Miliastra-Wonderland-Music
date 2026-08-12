@@ -2,6 +2,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -10,14 +12,18 @@ use log::{LevelFilter, Log, Metadata, Record, SetLoggerError};
 use crate::config::LoggingConfig;
 use crate::runtime::monitor::MonitorLogSink;
 
+/// 全局文件日志器引用：init_file 设置全局 logger 后由动态附加
+/// （attach_sink / set_stderr）经此引用调整 monitor sink 与 stderr 开关。
+static FILE_LOGGER: OnceLock<&'static FileLogger> = OnceLock::new();
+
 struct FileLogger {
     files: Mutex<LogFiles>,
     log_dir: PathBuf,
     rotate_daily: bool,
     retain_days: u32,
     level: LevelFilter,
-    monitor: Option<MonitorLogSink>,
-    stderr: bool,
+    monitor: Mutex<Option<MonitorLogSink>>,
+    stderr: AtomicBool,
 }
 
 struct LogFiles {
@@ -62,11 +68,12 @@ impl Log for FileLogger {
         }
 
         if !is_monitor_hidden_target(record.target())
-            && let Some(monitor) = &self.monitor
+            && let Ok(monitor) = self.monitor.lock()
+            && let Some(monitor) = monitor.as_ref()
         {
             monitor.push(line.clone());
         }
-        if self.stderr {
+        if self.stderr.load(Ordering::Relaxed) {
             let _ = std::io::stderr().write_all(format!("{line}\n").as_bytes());
         }
         let _ = files.main.write_all(format!("{line}\n").as_bytes());
@@ -82,7 +89,7 @@ impl Log for FileLogger {
 
 impl FileLogger {
     fn write_fallback(&self, message: &str) {
-        if self.stderr {
+        if self.stderr.load(Ordering::Relaxed) {
             let _ = std::io::stderr().write_all(format!("[WARN ] : {message}\n").as_bytes());
         }
     }
@@ -159,11 +166,12 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (year, month as u32, day as u32)
 }
 
-pub fn init(
-    config: &LoggingConfig,
-    monitor: Option<MonitorLogSink>,
-    stderr: bool,
-) -> Result<LogPaths> {
+/// 两阶段日志第一步：仅初始化文件日志（stderr 输出开启、monitor sink 未附加）。
+///
+/// 启动流程在 BootstrapConfig 读取成功后立即调用，保证数据库/完整配置加载
+/// 失败时错误已进入日志文件；TUI 启动完成后由 [`attach_sink`] / [`set_stderr`]
+/// 动态附加 monitor sink 并关闭 stderr。
+pub(crate) fn init_file(config: &LoggingConfig) -> Result<LogPaths> {
     fs::create_dir_all(&config.dir)
         .with_context(|| format!("create log directory {}", config.dir.display()))?;
     let now = SystemTime::now();
@@ -182,8 +190,8 @@ pub fn init(
         rotate_daily: config.rotate_daily,
         retain_days: config.retain_days,
         level,
-        monitor,
-        stderr,
+        monitor: Mutex::new(None),
+        stderr: AtomicBool::new(true),
     };
     set_logger(logger).context("initialize logger")?;
     log::set_max_level(level);
@@ -191,6 +199,29 @@ pub fn init(
         log::warn!("{warning}");
     }
     Ok(paths)
+}
+
+/// 两阶段日志第二步：动态附加（或替换）TUI 的 monitor 日志 sink。
+/// 日志尚未初始化或全局 logger 类型不匹配时静默忽略。
+pub(crate) fn attach_sink(sink: MonitorLogSink) {
+    if let Some(logger) = logger_downcast()
+        && let Ok(mut monitor) = logger.monitor.lock()
+    {
+        *monitor = Some(sink);
+    }
+}
+
+/// 动态开关 stderr 输出：TUI 全屏启动后关闭，避免终端界面被日志输出干扰；
+/// TUI 未启用或回退普通输出时保持开启。
+pub(crate) fn set_stderr(enabled: bool) {
+    if let Some(logger) = logger_downcast() {
+        logger.stderr.store(enabled, Ordering::Relaxed);
+    }
+}
+
+/// 取全局 logger 的 FileLogger 引用（日志未初始化时返回 None）。
+fn logger_downcast() -> Option<&'static FileLogger> {
+    FILE_LOGGER.get().copied()
 }
 
 fn open_append_file(path: &Path, label: &str) -> Result<File> {
@@ -316,7 +347,13 @@ fn days_in_month(year: i64, month: u32) -> u32 {
 }
 
 fn set_logger(logger: FileLogger) -> std::result::Result<(), SetLoggerError> {
-    log::set_boxed_logger(Box::new(logger))
+    // 泄漏为 'static 供动态附加（attach_sink / set_stderr）通过 FILE_LOGGER 引用；
+    // 全局 logger 生命周期与进程一致，泄漏是预期行为。重复初始化失败时
+    // （logger 已设置）同样泄漏，由调用方报错退出，可接受。
+    let logger: &'static FileLogger = Box::leak(Box::new(logger));
+    log::set_logger(logger)?;
+    let _ = FILE_LOGGER.set(logger);
+    Ok(())
 }
 
 fn parse_level(value: &str) -> LevelFilter {

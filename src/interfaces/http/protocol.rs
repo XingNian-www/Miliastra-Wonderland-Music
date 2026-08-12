@@ -30,6 +30,8 @@ mod tools;
 
 #[path = "routes/ai.rs"]
 mod ai_routes;
+#[path = "routes/config.rs"]
+mod config_routes;
 #[path = "routes/entertainment.rs"]
 mod entertainment_routes;
 #[path = "routes/operator.rs"]
@@ -42,6 +44,7 @@ mod system_routes;
 mod tasks_chat_routes;
 
 use ai_routes::*;
+use config_routes::*;
 use entertainment_routes::*;
 use operator_routes::*;
 use playback_routes::*;
@@ -92,7 +95,7 @@ use crate::runtime::monitor::MonitorShared;
 use crate::runtime::scheduler::{FormalTaskCancelOutcome, FormalTaskEnqueueOutcome};
 use crate::ui::frame::LatestFrameCache;
 use crate::ui::geometry::parse_rect;
-use miliastra_playback::ProviderId;
+use miliastra_playback::{ProviderId, TrackKey};
 pub(crate) use tools::{WebToolRequest, WebToolTemplate};
 use uuid::Uuid;
 
@@ -139,6 +142,18 @@ const BODY_ROUTES: &[BodyRouteSpec] = &[
         path: "/turtle-soup/questions",
         handler: turtle_soup_questions_route,
     },
+    BodyRouteSpec {
+        path: "/config/validate",
+        handler: config_validate_route,
+    },
+    BodyRouteSpec {
+        path: "/config/save",
+        handler: config_save_route,
+    },
+    BodyRouteSpec {
+        path: "/config/rollback",
+        handler: config_rollback_route,
+    },
 ];
 
 const ROUTES: &[RouteSpec] = &[
@@ -147,6 +162,24 @@ const ROUTES: &[RouteSpec] = &[
         json: true,
         mutating: false,
         handler: status_route,
+    },
+    RouteSpec {
+        path: "/playback/insights",
+        json: true,
+        mutating: false,
+        handler: playback_insights_route,
+    },
+    RouteSpec {
+        path: "/playback/cache/tracks",
+        json: true,
+        mutating: false,
+        handler: playback_cache_tracks_route,
+    },
+    RouteSpec {
+        path: "/playback/statistics/reset",
+        json: true,
+        mutating: true,
+        handler: playback_statistics_reset_route,
     },
     RouteSpec {
         path: "/play",
@@ -527,6 +560,30 @@ const ROUTES: &[RouteSpec] = &[
         handler: tool_ai_preview_route,
     },
     RouteSpec {
+        path: "/config",
+        json: true,
+        mutating: false,
+        handler: config_route,
+    },
+    RouteSpec {
+        path: "/config/schema",
+        json: true,
+        mutating: false,
+        handler: config_schema_route,
+    },
+    RouteSpec {
+        path: "/config/section",
+        json: true,
+        mutating: false,
+        handler: config_section_route,
+    },
+    RouteSpec {
+        path: "/config/revisions",
+        json: true,
+        mutating: false,
+        handler: config_revisions_route,
+    },
+    RouteSpec {
         path: "/health",
         json: false,
         mutating: false,
@@ -542,6 +599,11 @@ pub struct HttpSharedState {
     pub active_connections: Arc<AtomicUsize>,
     application: HttpApplicationPorts,
     latest_frame: Arc<Mutex<LatestFrameCache>>,
+    /// 配置中心共享句柄（阶段 5 起由 HTTP 配置接口持有）。
+    pub config_store: crate::config::SharedConfigStore,
+    /// 热更新共享句柄集合（阶段 7）：配置保存/回滚成功后 apply，
+    /// 使 schema 中标 Live 的字段立即作用于运行态。
+    pub live_configs: crate::config::LiveConfigs,
 }
 
 #[derive(Clone)]
@@ -618,6 +680,8 @@ impl HttpSharedState {
         config: HttpInterfaceConfig,
         monitor: MonitorShared,
         latest_frame: Arc<Mutex<LatestFrameCache>>,
+        config_store: crate::config::SharedConfigStore,
+        live_configs: crate::config::LiveConfigs,
         application: HttpApplicationPorts,
     ) -> Self {
         Self {
@@ -627,6 +691,8 @@ impl HttpSharedState {
             active_connections: Arc::new(AtomicUsize::new(0)),
             application,
             latest_frame,
+            config_store,
+            live_configs,
         }
     }
 }
@@ -943,6 +1009,9 @@ fn push_history(request: &Request, result: &str, ok: bool, state: &HttpSharedSta
             "/history"
                 | "/clear-history"
                 | "/monitor"
+                | "/status"
+                | "/playback/insights"
+                | "/playback/cache/tracks"
                 | "/screenshot"
                 | "/hall-screenshot"
                 | "/favicon.ico"

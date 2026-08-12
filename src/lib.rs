@@ -57,10 +57,26 @@ fn add_dependency_dll_directory(config_path: &std::path::Path) {
 
 #[cfg(target_os = "windows")]
 pub fn watchdog_restart_ms(config_path: &std::path::Path) -> anyhow::Result<u64> {
+    use anyhow::Context;
+
     let executable_root = config_path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("配置路径缺少父目录: {}", config_path.display()))?;
-    let config = config::AppConfig::load_from_root(config_path, executable_root)?;
+    // 与主程序启动同链路：最小引导配置 → 统一 SQLite 数据库 → 完整业务配置。
+    // 数据库损坏时这里返回错误会导致 watchdog 父进程退出，错误信息必须清楚。
+    let bootstrap = config::BootstrapConfig::load(config_path, executable_root)
+        .with_context(|| format!("读取启动配置失败: {}", config_path.display()))?;
+    let store =
+        config::ConfigStore::open(&bootstrap.database_path, executable_root, bootstrap.clone())
+            .with_context(|| {
+                format!(
+                    "打开统一配置数据库失败: {}",
+                    bootstrap.database_path.display()
+                )
+            })?;
+    let config = store
+        .load_full()
+        .with_context(|| "从统一配置数据库加载完整配置失败")?;
     config.validate()?;
     Ok(config.timing.watchdog_restart_ms)
 }

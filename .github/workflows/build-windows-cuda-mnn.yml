@@ -174,7 +174,9 @@ jobs:
           1. Build or download the normal Windows x64 EXE package.
           2. Replace the EXE package's MNN.dll with this package's MNN.dll.
           3. Keep the CUDA runtime DLLs from this package next to the EXE.
-          4. Set config.yaml ocr.backend_priority to:
+          4. Set ocr.backend_priority to the following in the Web panel
+             "Config Center" (ocr section). config.yaml only keeps the
+             database_path/http/logging bootstrap sections:
              - cuda
              - cpu
 

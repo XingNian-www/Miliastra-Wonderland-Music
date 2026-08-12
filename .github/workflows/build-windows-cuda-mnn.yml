@@ -152,9 +152,12 @@ jobs:
         run: |
           $dist = 'dist/${{ steps.version.outputs.artifact }}'
           $mnnBuildDir = '${{ steps.build_mnn.outputs.build_dir }}'
-          New-Item -ItemType Directory -Force -Path $dist | Out-Null
-          Copy-Item "$mnnBuildDir\MNN.dll" $dist
-          Copy-Item "$mnnBuildDir\MNN.lib" $dist
+          if (Test-Path -LiteralPath $dist) {
+            Remove-Item -LiteralPath $dist -Recurse -Force
+          }
+          $dllTarget = Join-Path $dist 'deps\dll'
+          New-Item -ItemType Directory -Force -Path $dllTarget | Out-Null
+          Copy-Item "$mnnBuildDir\MNN.dll" $dllTarget
 
           $cudaBin = Join-Path $env:CUDA_PATH 'bin'
           $cudaRuntimeDlls = @(
@@ -163,28 +166,34 @@ jobs:
             'cublasLt64_*.dll'
           )
           foreach ($pattern in $cudaRuntimeDlls) {
-            Get-ChildItem -Path $cudaBin -Filter $pattern -ErrorAction SilentlyContinue |
-              Copy-Item -Destination $dist -Force
+            $matches = @(Get-ChildItem -Path $cudaBin -Filter $pattern -File -ErrorAction SilentlyContinue)
+            if (-not $matches) {
+              throw "CUDA 运行时缺少必需 DLL: $pattern"
+            }
+            $matches | Copy-Item -Destination $dllTarget -Force
+          }
+          if (-not (Test-Path -LiteralPath (Join-Path $dllTarget 'MNN.dll') -PathType Leaf)) {
+            throw 'CUDA MNN 附加组件缺少 deps\dll\MNN.dll'
           }
 
           @"
-          CUDA MNN runtime for Miliastra Wonderland Music
+          CUDA MNN 运行时附加组件
 
-          Usage:
-          1. Build or download the normal Windows x64 EXE package.
-          2. Replace the EXE package's MNN.dll with this package's MNN.dll.
-          3. Keep the CUDA runtime DLLs from this package next to the EXE.
-          4. Set ocr.backend_priority to the following in the Web panel
-             "Config Center" (ocr section). config.yaml only keeps the
-             database_path/http/logging bootstrap sections:
-             - cuda
-             - cpu
+          此包不含主程序。将包内 deps 文件夹合并到主程序目录下的 deps 文件夹，
+          其中 deps\dll\MNN.dll 会替换主程序包自带的 CPU 版本。
 
-          Driver requirements:
-          - The default CUDA 12.4.1 runtime requires NVIDIA driver 551.78 or newer on Windows.
-          - P100 uses Pascal / sm_60. Older 538.xx vGPU/GRID drivers are not compatible with CUDA 12.4.1.
+          安装：
+          1. 先解压普通 Windows x64 主程序包。
+          2. 将此包内 deps 文件夹复制到主程序根目录并确认覆盖。
+          3. 确认 MNN.dll 和 CUDA Runtime DLL 均位于 deps\dll。
+          4. 在 Web“配置中心”的 ocr 区域将后端优先级设为 cuda、cpu。
+             功能配置保存在 deps\data\playback.sqlite3，不要写入 config.yaml。
 
-          The EXE and MNN.dll are built separately. The EXE still requires an ABI-compatible MNN.dll named MNN.dll at runtime.
+          驱动要求：
+          - 默认 CUDA 12.4.1 运行时要求 Windows NVIDIA 驱动 551.78 或更高版本。
+          - P100 使用 Pascal / sm_60；旧版 538.xx vGPU/GRID 驱动不兼容 CUDA 12.4.1。
+
+          主程序与 MNN.dll 分开构建，附加组件必须提供 ABI 兼容且名为 MNN.dll 的文件。
           "@ | Set-Content -Path "$dist\README-CUDA-MNN.txt" -Encoding UTF8
 
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -192,7 +201,7 @@ jobs:
           $vsDevCmd = Join-Path $vsInstall 'Common7\Tools\VsDevCmd.bat'
           $dumpCmd = @"
           call "$vsDevCmd" -arch=x64 -host_arch=x64
-          dumpbin /dependents "$dist\MNN.dll" > "$dist\MNN-dependents.txt"
+          dumpbin /dependents "$dllTarget\MNN.dll" > "$dist\MNN-dependents.txt"
           "@
           $cmdPath = Join-Path $env:RUNNER_TEMP 'dump-mnn-dependents.cmd'
           Set-Content -Path $cmdPath -Value $dumpCmd -Encoding ASCII

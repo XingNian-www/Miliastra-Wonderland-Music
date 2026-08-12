@@ -339,10 +339,13 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         Ok(status)
     }
 
-    /// 监控循环使用的轻量读取：不做观测记录，避免每轮轮询重复记录。
-    /// 必要的观测记录由决策路径（状态转移、外部播放确认）负责。
+    /// 监控循环读取播放器状态，并按持久化节流规则记录最新可靠进度。
+    /// `PlaybackStateUpdate::Observation` 只在身份变化、进度推进至少 5 秒或
+    /// 距上次落盘至少 10 秒时写 SQLite，不会随每轮轮询高频写盘。
     pub(crate) fn monitor_status(&self) -> Result<PlayerStatus> {
-        self.backend.status()
+        let status = self.backend.status()?;
+        self.record_observation(&status, classify_observation(&status))?;
+        Ok(status)
     }
 
     pub(crate) fn pause_by_user(&self) -> Result<String> {
@@ -1235,8 +1238,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         )?;
         if should_mark_external {
             self.playback_state.update(PlaybackStateUpdate::External)?;
-            // 外部播放确认时补一次观测记录，保证 last_observation 新鲜
-            // （监控循环改为轻量读取后不再高频记录）。
+            // 外部播放身份确认时立即补一次观测；常规进度由监控循环按阈值刷新。
             self.record_observation(status, classify_observation(status))?;
         }
         if observation.protected && !observation.was_protected {
@@ -2877,12 +2879,10 @@ mod tests {
     }
 
     #[test]
-    fn monitor_status_reads_without_recording_observation() {
-        let backend_status = status("目标", "miliastra://track/qqmusic/1", 10.0, 180.0);
-        let controller = controller(FakeBackend::new(vec![
-            backend_status.clone(),
-            backend_status,
-        ]));
+    fn monitor_status_records_latest_progress_for_restart_recovery() {
+        let first = status("目标", "miliastra://track/qqmusic/1", 10.0, 180.0);
+        let second = status("目标", "miliastra://track/qqmusic/1", 16.0, 180.0);
+        let controller = controller(FakeBackend::new(vec![first, second]));
         assert!(
             controller
                 .playback_state
@@ -2892,25 +2892,6 @@ mod tests {
                 .is_none()
         );
 
-        // 普通读取会记录观测。
-        controller.status().unwrap();
-        assert!(
-            controller
-                .playback_state
-                .snapshot()
-                .unwrap()
-                .last_observation
-                .is_some()
-        );
-
-        // 监控循环的轻量读取不改变观测记录。
-        let before = controller
-            .playback_state
-            .snapshot()
-            .unwrap()
-            .last_observation
-            .clone();
-        controller.monitor_status().unwrap();
         controller.monitor_status().unwrap();
         assert_eq!(
             controller
@@ -2919,10 +2900,21 @@ mod tests {
                 .unwrap()
                 .last_observation
                 .as_ref()
-                .map(|observation| observation.captured_at_ms),
-            before
+                .map(|observation| observation.progress),
+            Some(10.0)
+        );
+
+        // 进度推进超过 5 秒阈值后必须刷新持久化观测，供下次启动 seek。
+        controller.monitor_status().unwrap();
+        assert_eq!(
+            controller
+                .playback_state
+                .snapshot()
+                .unwrap()
+                .last_observation
                 .as_ref()
-                .map(|observation| observation.captured_at_ms)
+                .map(|observation| observation.progress),
+            Some(16.0)
         );
     }
 

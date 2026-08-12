@@ -346,8 +346,6 @@ playback:
     enabled: true
     # 音频文件目录；留空默认 deps/cache/audio
     directory: ""
-    # 统一播放数据库所在目录；留空默认 deps/data
-    metadata_directory: ""
     # 磁盘占用上限，单位 MiB（20 GiB）
     max_bytes_mb: 20480
     # 同时进行的源站下载任务上限
@@ -514,7 +512,7 @@ ai:
   #   默认 model: gpt-5.6-mini
   # deepseek：默认使用 DeepSeek OpenAI Chat Completions 接口。
   #   默认 endpoint: https://api.deepseek.com/chat/completions
-  #   默认 model: deepseek-chat
+  #   默认 model: deepseek-v4-flash（V4 系列：deepseek-v4-flash / deepseek-v4-pro）
   # custom：自定义 OpenAI-compatible 网关，必须同时填写 endpoint 和 model。
   provider: openai
   # API Key。留空表示点歌 AI 未启用；不要提交到 Git，也不要放进 URL 查询参数。

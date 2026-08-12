@@ -162,6 +162,7 @@ pub(crate) trait SongRequestPort {
     fn playback_queue(&self) -> Result<Vec<QueueItem>>;
     fn queue_contains(&self, item: QueueItem) -> Result<bool>;
     fn push_queue(&self, item: QueueItem) -> Result<QueuePushOutcome>;
+    fn preload_track(&self, track: &PlayableTrack) -> Result<()>;
     fn player_status(&self) -> Result<PlayerStatus>;
     fn should_queue_until_current_song_finished(&self, status: &PlayerStatus) -> Result<bool>;
     fn current_status_matches_request(&self, status: &PlayerStatus) -> Result<bool>;
@@ -800,6 +801,11 @@ impl SongRequestExecution<'_> {
             candidate_snapshot: request.candidate_snapshot.clone(),
         })?;
         if pushed.accepted {
+            if let Some(track) = &request.track
+                && let Err(error) = self.port.preload_track(track)
+            {
+                log::debug!("点歌入队后预加载音源失败，播放时将重试: {error:#}");
+            }
             Ok(SongQueuePushOutcome::Added(pushed.size))
         } else {
             Ok(SongQueuePushOutcome::Full)
@@ -1212,6 +1218,7 @@ mod tests {
         play_outcome: PlaybackOutcome,
         play_final_request: Option<PlaybackRequest>,
         played: RefCell<Vec<ResolvedSongRequest>>,
+        preloaded: RefCell<Vec<PlayableTrack>>,
         dedup_limited: Cell<bool>,
         logs: RefCell<Vec<String>>,
     }
@@ -1231,6 +1238,7 @@ mod tests {
                 play_outcome: PlaybackOutcome::Success,
                 play_final_request: None,
                 played: RefCell::new(Vec::new()),
+                preloaded: RefCell::new(Vec::new()),
                 dedup_limited: Cell::new(false),
                 logs: RefCell::new(Vec::new()),
             }
@@ -1296,6 +1304,11 @@ mod tests {
                 accepted: true,
                 size: queue.len(),
             })
+        }
+
+        fn preload_track(&self, track: &PlayableTrack) -> Result<()> {
+            self.preloaded.borrow_mut().push(track.clone());
+            Ok(())
         }
 
         fn player_status(&self) -> Result<PlayerStatus> {
@@ -1466,6 +1479,11 @@ mod tests {
         assert!(port.played.borrow().is_empty());
         assert_eq!(port.queue.borrow().len(), 1);
         assert_eq!(port.queue.borrow()[0].requester, "Alice");
+        assert_eq!(port.preloaded.borrow().len(), 1);
+        assert_eq!(
+            port.preloaded.borrow()[0].track_ref.key.to_string(),
+            "miliastra://track/qqmusic/1"
+        );
         assert_eq!(
             port.replies.borrow().last().map(String::as_str),
             Some("状态未知，队列已加入(1/20): 晴天 - 周杰伦")

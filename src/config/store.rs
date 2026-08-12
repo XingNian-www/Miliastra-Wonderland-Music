@@ -5,10 +5,7 @@
 //! （[`CONFIG_SCHEMA_VERSION`]）与请求状态快照版本、缓存 user_version 完全独立。
 //! schema 不兼容时明确失败，不做迁移。
 //!
-//! 阶段 3 起 open/load_full 由启动流程（composition::run、lib::watchdog_restart_ms）
-//! 消费；save/revisions/rollback 等写操作在阶段 4 HTTP 接口接入前仍仅被测试引用，
-//! 非测试构建允许未使用告警。
-#![cfg_attr(not(test), allow(dead_code))]
+//! 启动流程读取完整配置，Web 配置中心负责保存、历史版本和回滚。
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -56,10 +53,6 @@ pub struct ConfigSaveOutcome {
     pub revision: u64,
     /// 变更字段点路径（如 "queue.max_size"），用于页面显示。
     pub changed_fields: Vec<String>,
-    /// 是否存在需重启字段；阶段 4 schema 生效级别接入前，先返回 changed_fields 非空。
-    pub restart_required: bool,
-    /// 已热更新字段；阶段 7 热更新接入前返回空。
-    pub applied_live_fields: Vec<String>,
 }
 
 /// 字段级配置错误（保存校验失败时逐字段报告）。
@@ -359,8 +352,29 @@ impl ConfigStore {
 
     /// 返回脱敏后的配置 JSON（供 Web 显示）：section 合并后的 JSON，
     /// secret 字段替换为 "••••••"（保留字段存在性）。
+    ///
+    /// 与 [`Self::load_full`] 不同：本方法**不解析相对路径**，返回库中存储的
+    /// 原始值（如 `deps/assets/idioms.txt`），避免 Web 表单回填绝对路径后
+    /// 保存把绝对路径写回配置库。http/logging 段不落库，这里按启动引导
+    /// （config.yaml）原始值注入；state.playback_state_path 注入统一数据库路径。
     pub fn current_value(&self) -> Result<Value> {
         let mut value = Value::Object(self.read_all_sections()?);
+        if let Some(object) = value.as_object_mut() {
+            object.insert(
+                "http".to_string(),
+                serde_json::to_value(&self.bootstrap.http)?,
+            );
+            object.insert(
+                "logging".to_string(),
+                serde_json::to_value(&self.bootstrap.logging)?,
+            );
+            if let Some(state) = object.get_mut("state").and_then(Value::as_object_mut) {
+                state.insert(
+                    "playback_state_path".to_string(),
+                    serde_json::to_value(&self.bootstrap.database_path)?,
+                );
+            }
+        }
         mask_secrets(&mut value);
         Ok(value)
     }
@@ -426,7 +440,6 @@ impl ConfigStore {
         // 更新 config_meta.revision；事务内重读 revision 与基线比对保证并发安全。
         // Immediate：立即取写锁，避免 HTTP 并发保存时 deferred 事务互相升级
         // 造成 SQLite busy 死锁（busy_timeout=5000 已有）。
-        let next_revision = self.current_revision()? + 1;
         let timestamp = now_ms() as i64;
         let transaction = self
             .connection
@@ -440,6 +453,7 @@ impl ConfigStore {
                 "配置已被其他修改，请刷新后重试（当前版本 {stored_revision}，期望基线 {base_revision}）"
             );
         }
+        let next_revision = stored_revision as u64 + 1;
         for (section, section_value) in &merged {
             transaction.execute(
                 "INSERT OR REPLACE INTO config_sections (section, value_json, revision, updated_at_ms)
@@ -476,22 +490,8 @@ impl ConfigStore {
         );
         Ok(ConfigSaveOutcome {
             revision: next_revision,
-            restart_required: !changed_fields.is_empty(),
-            applied_live_fields: Vec::new(),
             changed_fields,
         })
-    }
-
-    /// 恢复内置默认配置：候选 = [`AppConfig::default()`] 全段，走 save 同路径
-    /// （revision 冲突检查视为 base=当前 revision 的提交）。
-    pub fn restore_defaults(&mut self) -> Result<ConfigSaveOutcome> {
-        let base_revision = self.current_revision()?;
-        let default_value = AppConfig::default().to_db_value();
-        let sections = default_value
-            .as_object()
-            .cloned()
-            .context("默认配置序列化结果必须是对象")?;
-        self.save(base_revision, sections)
     }
 
     /// 按 revision 倒序返回全部历史版本。
@@ -515,7 +515,11 @@ impl ConfigStore {
     /// 回滚到目标版本：读目标快照作为候选全段（secret 字段保留当前值，
     /// 防止历史快照中的掩码或旧值覆盖当前密钥），走 save 校验/事务，
     /// 记录新版本（当前 +1）。
-    pub fn rollback(&mut self, target_revision: u64) -> Result<ConfigSaveOutcome> {
+    pub fn rollback(
+        &mut self,
+        target_revision: u64,
+        base_revision: u64,
+    ) -> Result<ConfigSaveOutcome> {
         let snapshot: Option<String> = self
             .connection
             .query_row(
@@ -532,16 +536,11 @@ impl ConfigStore {
             .context("目标版本快照必须是对象")?;
         let current_sections = self.read_all_sections()?;
         force_retain_secret_fields(&mut sections, &current_sections);
-        let base_revision = self.current_revision()?;
         self.save(base_revision, sections)
     }
 
-    /// 统一数据库路径（启动引导注入值，已解析为绝对路径）。
-    pub fn database_path(&self) -> &Path {
-        &self.bootstrap.database_path
-    }
-
-    /// 启动引导配置。
+    /// 测试读取启动引导配置，确认脱敏不会修改运行态密钥。
+    #[cfg(test)]
     pub fn bootstrap(&self) -> &BootstrapConfig {
         &self.bootstrap
     }
@@ -1055,17 +1054,23 @@ fn get_path<'a>(root: &'a Map<String, Value>, path: &str) -> Option<&'a Value> {
 
 /// 按点路径写入嵌套值；中间节点不存在时创建对象。
 /// 中间节点已存在但不是对象时视为数据损坏，直接失败。
-fn set_path(map: &mut Map<String, Value>, path: &str, value: Value) {
+fn set_path(map: &mut Map<String, Value>, path: &str, value: Value) -> bool {
     let segments = path.split('.').collect::<Vec<_>>();
+    if segments.is_empty() {
+        return false;
+    }
     let mut current = map;
     for segment in &segments[..segments.len() - 1] {
-        current = current
+        let entry = current
             .entry((*segment).to_string())
-            .or_insert_with(|| Value::Object(Map::new()))
-            .as_object_mut()
-            .expect("配置 secret 路径中间节点必须是对象");
+            .or_insert_with(|| Value::Object(Map::new()));
+        let Some(object) = entry.as_object_mut() else {
+            return false;
+        };
+        current = object;
     }
     current.insert(segments[segments.len() - 1].to_string(), value);
+    true
 }
 
 /// 应用 secret 清除标记：候选值等于 JSON 对象 `{"__clear__": true}`
@@ -1080,8 +1085,7 @@ fn apply_secret_clear_markers(
         let is_clear_marker = matches!(get_path(merged, field), Some(Value::Object(map))
             if map.len() == 1
                 && map.get(SECRET_CLEAR_MARKER) == Some(&Value::Bool(true)));
-        if is_clear_marker {
-            set_path(merged, field, Value::String(String::new()));
+        if is_clear_marker && set_path(merged, field, Value::String(String::new())) {
             forced_cleared.insert(field);
         }
     }
@@ -1112,7 +1116,7 @@ fn retain_secret_fields(
             }
         };
         if should_retain {
-            set_path(merged, field, current_value.clone());
+            let _ = set_path(merged, field, current_value.clone());
         }
     }
 }
@@ -1121,7 +1125,7 @@ fn retain_secret_fields(
 fn force_retain_secret_fields(merged: &mut Map<String, Value>, current: &Map<String, Value>) {
     for field in SECRET_PATHS {
         if let Some(current_value) = get_path(current, field) {
-            set_path(merged, field, current_value.clone());
+            let _ = set_path(merged, field, current_value.clone());
         }
     }
 }
@@ -1459,16 +1463,6 @@ mod tests {
             "logging 段必须由启动引导提供并解析为绝对路径"
         );
         assert_eq!(
-            store.database_path(),
-            bootstrap.database_path.as_path(),
-            "database_path 访问器必须返回统一数据库路径"
-        );
-        assert_eq!(
-            store.bootstrap().database_path,
-            bootstrap.database_path,
-            "bootstrap 访问器必须返回启动引导配置"
-        );
-        assert_eq!(
             store
                 .validate_candidate(&full_sections(&store))
                 .unwrap()
@@ -1485,13 +1479,9 @@ mod tests {
         assert_eq!(revisions.len(), 1, "初始化后必须只有一条历史快照");
         assert_eq!(revisions[0].revision, 1, "初始化快照必须是 revision 1");
 
-        // 共享句柄（阶段 4 起由 HTTP 接口持有）必须可正常加锁访问。
+        // 共享句柄必须可正常加锁访问。
         let shared: SharedConfigStore = Arc::new(Mutex::new(store));
-        assert_eq!(
-            shared.lock().unwrap().database_path(),
-            bootstrap.database_path.as_path(),
-            "共享句柄必须能访问统一数据库路径"
-        );
+        assert_eq!(shared.lock().unwrap().current_revision().unwrap(), 1);
         cleanup(&root);
     }
 
@@ -1519,14 +1509,6 @@ mod tests {
                 .contains(&"timing.loop_idle_ms".to_string()),
             "changed_fields 必须包含 timing.loop_idle_ms: {:?}",
             outcome.changed_fields
-        );
-        assert!(
-            outcome.restart_required,
-            "有变更时 restart_required 必须为 true"
-        );
-        assert!(
-            outcome.applied_live_fields.is_empty(),
-            "阶段 7 热更新接入前 applied_live_fields 必须为空"
         );
         drop(store);
 
@@ -1593,6 +1575,23 @@ mod tests {
             1,
             "拒绝写入时 revision 必须不变"
         );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn invalid_secret_parent_returns_validation_error_without_panicking() {
+        let (root, database_path) = temp_database("invalid-secret-parent");
+        let bootstrap = test_bootstrap(&database_path);
+        let store = ConfigStore::open(&database_path, &root, bootstrap).unwrap();
+
+        let mut sections = full_sections(&store);
+        sections["song_review"]["provider"] = Value::Null;
+        let errors = store.validate_candidate(&sections).unwrap();
+        assert!(
+            !errors.is_empty(),
+            "secret 中间节点为 null 时必须返回校验错误，不能 panic"
+        );
+        assert_eq!(stored_revision(&database_path), 1, "校验失败不得写入新版本");
         cleanup(&root);
     }
 
@@ -1677,7 +1676,7 @@ mod tests {
         store.save(2, second).unwrap();
 
         // 回滚到第一次保存产生的版本（revision 2），revision 递增为 4。
-        let outcome = store.rollback(2).unwrap();
+        let outcome = store.rollback(2, 3).unwrap();
         assert_eq!(outcome.revision, 4, "回滚后必须记录新版本");
         let loaded = store.load_full().unwrap();
         assert_eq!(loaded.queue.max_size, 20, "回滚后必须恢复首次保存的值");
@@ -1694,30 +1693,6 @@ mod tests {
             revisions.iter().all(|info| info.created_at_ms > 0),
             "历史版本必须记录创建时间戳"
         );
-        cleanup(&root);
-    }
-
-    #[test]
-    fn restore_defaults_returns_to_builtin_defaults() {
-        let (root, database_path) = temp_database("restore-defaults");
-        let bootstrap = test_bootstrap(&database_path);
-        let mut store = ConfigStore::open(&database_path, &root, bootstrap.clone()).unwrap();
-
-        let mut sections = full_sections(&store);
-        sections["queue"]["max_size"] = json!(20);
-        sections["timing"]["loop_idle_ms"] = json!(100);
-        store.save(1, sections).unwrap();
-
-        let outcome = store.restore_defaults().unwrap();
-        assert_eq!(outcome.revision, 3, "恢复默认后必须记录新版本");
-        let loaded = store.load_full().unwrap();
-        let expected = expected_loaded_config(&bootstrap, &root);
-        assert_eq!(
-            serde_json::to_value(&loaded).unwrap(),
-            serde_json::to_value(&expected).unwrap(),
-            "恢复默认后配置必须与内置默认值（注入启动引导并解析路径后）一致"
-        );
-        assert_eq!(loaded.queue.max_size, 5, "queue.max_size 必须恢复默认");
         cleanup(&root);
     }
 

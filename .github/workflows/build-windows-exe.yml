@@ -114,7 +114,9 @@ jobs:
           }
 
       - name: 编译 Release EXE
-        run: cargo build --workspace --release --target x86_64-pc-windows-msvc --locked
+        run: |
+          cargo build --workspace --release --target x86_64-pc-windows-msvc --locked
+          cargo build --release --target x86_64-pc-windows-msvc --example ensure-config-db --locked
 
       - name: 解析发布版本
         id: version
@@ -173,17 +175,26 @@ jobs:
             -Mnn 'vendor/mnn/3.6.0/windows-x64/bin/MNN.dll' `
             -Destination $dist `
             -Objdump $env:OBJDUMP
-          Copy-Item 'assets' $dist -Recurse
-          Copy-Item 'models' $dist -Recurse
+          # 发布布局：EXE 根目录只保留主程序与 config.yaml，其余依赖统一放入 deps/。
+          New-Item -ItemType Directory -Force -Path (Join-Path $dist 'deps/bin'), (Join-Path $dist 'deps/dll') | Out-Null
+          Move-Item -LiteralPath (Join-Path $dist 'miliastra-login-helper.exe') -Destination (Join-Path $dist 'deps/bin')
+          foreach ($dll in @('MNN.dll', 'avformat-62.dll', 'avcodec-62.dll', 'avutil-60.dll', 'swresample-6.dll', 'libwinpthread-1.dll')) {
+            Move-Item -LiteralPath (Join-Path $dist $dll) -Destination (Join-Path $dist 'deps/dll')
+          }
+          Copy-Item 'assets' (Join-Path $dist 'deps') -Recurse
+          Copy-Item 'models' (Join-Path $dist 'deps') -Recurse
           Copy-Item 'config.yaml' $dist
-          Copy-Item 'turtle_soup.example.yaml' $dist
-          Copy-Item 'undercover.example.yaml' $dist
-          Copy-Item 'README.md' $dist
-          Copy-Item 'THIRD_PARTY_NOTICES.md' $dist
+          New-Item -ItemType Directory -Force -Path (Join-Path $dist 'deps/docs') | Out-Null
+          Copy-Item 'turtle_soup.example.yaml', 'undercover.example.yaml', 'README.md', 'THIRD_PARTY_NOTICES.md' (Join-Path $dist 'deps/docs')
+          # 预置配置库：以当前默认配置初始化 deps/data/playback.sqlite3
+          & 'target/x86_64-pc-windows-msvc/release/examples/ensure-config-db.exe' (Join-Path $dist 'config.yaml')
 
           $requiredDirectories = @(
-            'assets',
-            'models'
+            'deps\assets',
+            'deps\models',
+            'deps\dll',
+            'deps\bin',
+            'deps\docs'
           )
           foreach ($directory in $requiredDirectories) {
             if (-not (Test-Path -LiteralPath (Join-Path $dist $directory) -PathType Container)) {
@@ -193,22 +204,23 @@ jobs:
 
           $requiredFiles = @(
             'miliastra-wonderland-music.exe',
-            'miliastra-login-helper.exe',
-            'MNN.dll',
-            'avformat-62.dll',
-            'avcodec-62.dll',
-            'avutil-60.dll',
-            'swresample-6.dll',
-            'libwinpthread-1.dll',
-            'assets\idioms.txt',
             'config.yaml',
-            'models\PP-OCRv6_small_det.mnn',
-            'models\PP-OCRv6_small_rec.mnn',
-            'models\ppocr_keys_v6_small.txt',
-            'turtle_soup.example.yaml',
-            'undercover.example.yaml',
-            'README.md',
-            'THIRD_PARTY_NOTICES.md'
+            'deps\bin\miliastra-login-helper.exe',
+            'deps\dll\MNN.dll',
+            'deps\dll\avformat-62.dll',
+            'deps\dll\avcodec-62.dll',
+            'deps\dll\avutil-60.dll',
+            'deps\dll\swresample-6.dll',
+            'deps\dll\libwinpthread-1.dll',
+            'deps\assets\idioms.txt',
+            'deps\models\PP-OCRv6_small_det.mnn',
+            'deps\models\PP-OCRv6_small_rec.mnn',
+            'deps\models\ppocr_keys_v6_small.txt',
+            'deps\data\playback.sqlite3',
+            'deps\docs\turtle_soup.example.yaml',
+            'deps\docs\undercover.example.yaml',
+            'deps\docs\README.md',
+            'deps\docs\THIRD_PARTY_NOTICES.md'
           )
           foreach ($file in $requiredFiles) {
             if (-not (Test-Path -LiteralPath (Join-Path $dist $file) -PathType Leaf)) {

@@ -18,13 +18,11 @@ pub enum ConfigSource {
     Bootstrap,
 }
 
-/// 生效级别：保存后立即生效 / 下一任务生效 / 重启生效
+/// 生效级别：保存后立即生效 / 重启生效
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Effect {
     /// 保存后立即生效
     Live,
-    /// 下一任务生效
-    NextTask,
     /// 重启生效
     Restart,
 }
@@ -66,7 +64,7 @@ pub enum FieldKind {
 /// 引导（config.yaml）提供、不在配置库 sections 中，store 的保留规则
 /// （`get_path` 找不到即跳过）天然兼容，无需特殊处理。
 ///
-/// `store.rs` 的 `SECRET_FIELDS` 引用本常量，禁止在别处重复定义。
+/// `store.rs` 的 `SECRET_PATHS` 引用本常量，禁止在别处重复定义。
 pub const SECRET_PATHS: &[&str] = &[
     "http.access_token",
     "ai.api_key",
@@ -89,7 +87,7 @@ pub struct ConfigFieldSchema {
     /// 字段值可为 null（对应 struct 的 Option 字段；如 ocr.det_model、
     /// playback.audio_cache 本身）。表单允许提交 null 表示未启用。
     pub nullable: bool,
-    /// 字段的父级可能为 null（如 audio_cache=null 时其 7 个子字段在结构中
+    /// 字段的父级可能为 null（如 audio_cache=null 时其 6 个子字段在结构中
     /// 仍存在但取值路径中间节点为 null）。测试取值时允许该路径返回 null。
     pub optional_parent: bool,
 }
@@ -119,20 +117,6 @@ impl ConfigFieldSchema {
             label: label.to_string(),
             kind,
             effect: Effect::Restart,
-            source: ConfigSource::Db,
-            hint: hint.to_string(),
-            nullable: false,
-            optional_parent: false,
-        }
-    }
-
-    /// 数据库可编辑、下一任务生效字段。
-    fn db_next_task(path: &str, label: &str, kind: FieldKind, hint: &str) -> Self {
-        Self {
-            path: path.to_string(),
-            label: label.to_string(),
-            kind,
-            effect: Effect::NextTask,
             source: ConfigSource::Db,
             hint: hint.to_string(),
             nullable: false,
@@ -1004,7 +988,7 @@ fn templates_section() -> Vec<ConfigFieldSchema> {
     ]
 }
 
-/// playback 段：播放器凭据/程序路径（Restart）与数值类（NextTask）混合。
+/// playback 段：播放器凭据、程序路径与启动时加载的数值配置。
 fn playback_section() -> Vec<ConfigFieldSchema> {
     vec![
         ConfigFieldSchema::db_restart(
@@ -1025,7 +1009,7 @@ fn playback_section() -> Vec<ConfigFieldSchema> {
             FieldKind::Path,
             "内置酷狗概念版 API sidecar；仅当程序目录下存在该文件时才自动启动",
         ),
-        ConfigFieldSchema::db_next_task(
+        ConfigFieldSchema::db_restart(
             "login_timeout_ms",
             "登录超时",
             int(1, MAX_TIMEOUT_MS),
@@ -1059,34 +1043,27 @@ fn playback_section() -> Vec<ConfigFieldSchema> {
         )
         .optional_parent(),
         ConfigFieldSchema::db_restart(
-            "audio_cache.metadata_directory",
-            "播放数据库目录",
-            FieldKind::Path,
-            "统一播放数据库所在目录；须与 state.playback_state_path 的父目录一致，留空默认 deps/data",
-        )
-        .optional_parent(),
-        ConfigFieldSchema::db_next_task(
             "audio_cache.max_bytes_mb",
             "磁盘占用上限",
             int(1, 1_048_576),
             "磁盘占用上限，单位 MiB",
         )
         .optional_parent(),
-        ConfigFieldSchema::db_next_task(
+        ConfigFieldSchema::db_restart(
             "audio_cache.max_concurrent_downloads",
             "并发下载上限",
             int(1, 1024),
             "同时进行的源站下载任务上限",
         )
         .optional_parent(),
-        ConfigFieldSchema::db_next_task(
+        ConfigFieldSchema::db_restart(
             "audio_cache.request_timeout_ms",
             "源站请求超时",
             int(1, MAX_TIMEOUT_MS),
             "源站连接/响应超时，单位毫秒",
         )
         .optional_parent(),
-        ConfigFieldSchema::db_next_task(
+        ConfigFieldSchema::db_restart(
             "audio_cache.seek_wait_timeout_ms",
             "跳转等待超时",
             int(1, MAX_TIMEOUT_MS),
@@ -1488,7 +1465,7 @@ fn turtle_soup_section() -> Vec<ConfigFieldSchema> {
             "ai.extra_body",
             "第三方兼容字段",
             FieldKind::Object,
-            "第三方兼容字段；默认空。只能补充字段，和官方字段同名时官方值优先",
+            "第三方兼容字段；默认空。Web 可载入主流网关模板或手动填写 JSON。只能补充字段，和程序固定字段同名时程序值优先",
         ),
     ]
 }
@@ -1499,8 +1476,13 @@ fn ai_section() -> Vec<ConfigFieldSchema> {
         ConfigFieldSchema::db_restart(
             "provider",
             "服务商",
-            FieldKind::String,
-            "点歌 AI Provider。可选：mimo、openai、deepseek、custom；默认选择响应更快的 OpenAI 小模型",
+            FieldKind::Enum(vec![
+                ("mimo".to_string(), "小米 MiMo".to_string()),
+                ("openai".to_string(), "OpenAI".to_string()),
+                ("deepseek".to_string(), "DeepSeek".to_string()),
+                ("custom".to_string(), "自定义网关".to_string()),
+            ]),
+            "点歌 AI Provider。二段式配置：先选服务商，再按服务商填写参数；custom 必须填写 endpoint 与 model",
         ),
         ConfigFieldSchema::db_restart(
             "api_key",
@@ -1530,7 +1512,7 @@ fn ai_section() -> Vec<ConfigFieldSchema> {
             "extra_body",
             "第三方兼容字段",
             FieldKind::Object,
-            "第三方兼容字段。必须是 JSON object；与官方字段同名时官方值覆盖",
+            "服务商专属请求参数。Web 对 MiMo/OpenAI/DeepSeek 提供官方字段结构化表单；只有 custom 使用自由 JSON。与程序固定字段同名时程序值优先",
         ),
     ]
 }
@@ -2153,13 +2135,39 @@ pub fn default_config_json() -> Value {
     serde_json::to_value(AppConfig::default()).expect("AppConfig 序列化不应失败")
 }
 
+/// 与 [`default_config_json`] 相同，但 audio_cache 替换为启用后的默认对象：
+/// 内置默认中 audio_cache 为 null（不启用），其子字段无法提取默认值；
+/// Web 表单「启用」音频缓存时需要这些子字段默认值预填。
+/// 数值与运行时（crates/miliastra-playback AudioCacheConfig::default）一致：
+/// 上限 20 GiB、并发 2、请求超时 15s、跳转等待 10s；目录为发布布局相对路径。
+pub fn default_config_json_with_audio_cache() -> Value {
+    let mut value = default_config_json();
+    if let Some(playback) = value
+        .as_object_mut()
+        .and_then(|object| object.get_mut("playback"))
+        .and_then(Value::as_object_mut)
+    {
+        playback.insert(
+            "audio_cache".to_string(),
+            serde_json::json!({
+                "enabled": true,
+                "directory": "deps/cache/audio",
+                "max_bytes_mb": 20 * 1024,
+                "max_concurrent_downloads": 2,
+                "request_timeout_ms": 15_000,
+                "seek_wait_timeout_ms": 10_000,
+            }),
+        );
+    }
+    value
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeSet, HashMap};
-    use std::path::PathBuf;
 
     use super::*;
-    use crate::config::AudioCacheFileConfig;
+    use serde_json::json;
 
     /// schema 全部字段路径 → (nullable, optional_parent) 映射，供 json_path 判断
     /// 中间节点为 null 时该路径是否允许。
@@ -2271,19 +2279,10 @@ mod tests {
     }
 
     /// 带音频缓存样例的配置 JSON：默认 audio_cache 为 null，无法覆盖其子路径，
-    /// 用样例（Some）补一个完整的 AudioCacheFileConfig 再序列化。
+    /// 用启用后的默认对象补一个完整的 AudioCacheFileConfig 再序列化。
+    /// 与正式函数共用同一份默认值（Web「启用」预填来源）。
     fn sample_config_json_with_audio_cache() -> Value {
-        let mut sample = AppConfig::default();
-        sample.playback.audio_cache = Some(AudioCacheFileConfig {
-            enabled: true,
-            directory: PathBuf::from("deps/cache/audio"),
-            metadata_directory: PathBuf::from("deps/data"),
-            max_bytes_mb: 1024,
-            max_concurrent_downloads: 4,
-            request_timeout_ms: 10_000,
-            seek_wait_timeout_ms: 5_000,
-        });
-        serde_json::to_value(&sample).expect("序列化样例配置")
+        default_config_json_with_audio_cache()
     }
 
     /// JSON 中存在但 schema 不声明的注入字段（由启动引导提供，不进配置库）：
@@ -2350,7 +2349,7 @@ mod tests {
             }
         }
         assert_eq!(
-            total_fields, 267,
+            total_fields, 266,
             "schema 总字段数应与预期一致（声明数 = 实际数）"
         );
     }
@@ -2503,9 +2502,28 @@ mod tests {
         }
     }
 
-    /// schema 声明的字段路径集合必须与默认配置 JSON 的全部叶路径双向一致：
-    /// schema 有而 JSON 没有、JSON 有而 schema 没有都算失败。默认 JSON 中
-    /// audio_cache 为 null，其 7 个子路径用样例配置（Some）补充枚举，两个集合
+    /// 启用音频缓存后的默认子字段必须与运行时默认对齐：
+    /// Web「启用」开关预填这些值，若与运行时不一致会出现"默认值却不生效"。
+    #[test]
+    fn audio_cache_defaults_match_runtime_values() {
+        let value = default_config_json_with_audio_cache();
+        let audio_cache = &value["playback"]["audio_cache"];
+        assert_eq!(audio_cache["enabled"], json!(true));
+        assert_eq!(audio_cache["directory"], json!("deps/cache/audio"));
+        // 与 crates/miliastra-playback AudioCacheConfig::default 对齐（20 GiB / 2 / 15s / 10s）。
+        assert_eq!(audio_cache["max_bytes_mb"], json!(20 * 1024));
+        assert_eq!(audio_cache["max_concurrent_downloads"], json!(2));
+        assert_eq!(audio_cache["request_timeout_ms"], json!(15_000));
+        assert_eq!(audio_cache["seek_wait_timeout_ms"], json!(10_000));
+        // 内置默认仍为 null（不启用）。
+        assert_eq!(
+            default_config_json()["playback"]["audio_cache"],
+            Value::Null
+        );
+    }
+
+    /// schema 声明的字段路径集合必须与默认配置 JSON 的全部叶路径双向一致：    /// schema 有而 JSON 没有、JSON 有而 schema 没有都算失败。默认 JSON 中
+    /// audio_cache 为 null，其 6 个子路径用样例配置（Some）补充枚举，两个集合
     /// 取并集后再与 schema 比较；注入字段（state.playback_state_path）显式豁免。
     #[test]
     fn schema_leaf_paths_cover_all_default_config_leaves() {

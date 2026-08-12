@@ -364,6 +364,11 @@ html[data-theme=light] .theme-toggle .moon{display:none}
 .config-form{display:flex;flex-direction:column;gap:var(--sp-3)}
 .config-field{background:var(--bg-card);border:1px solid var(--sep-2);border-radius:var(--radius-m);padding:var(--sp-3);display:flex;flex-direction:column;gap:var(--sp-2);min-width:0}
 .config-field.bootstrap{opacity:.62}
+.config-step-title{margin:var(--sp-3) 0 var(--sp-2);padding:var(--sp-2) var(--sp-3);background:var(--bg-2);border:1px solid var(--border);border-radius:var(--radius);font-weight:600;color:var(--text-1)}
+.config-step-title+.config-field{margin-top:var(--sp-2)}
+.ai-provider-info{padding:var(--sp-2) var(--sp-3);background:var(--warn-soft);border-radius:var(--radius)}
+.config-extra-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:var(--sp-2)}
+.config-extra-field{display:flex;flex-direction:column;gap:var(--sp-1);font-size:var(--fs-meta);color:var(--text-2)}
 .config-field.err{border-color:var(--danger);box-shadow:0 0 0 3px var(--danger-soft)}
 .config-field-head{display:flex;align-items:baseline;gap:var(--sp-2);flex-wrap:wrap;min-width:0}
 .config-field-head b{font-size:var(--fs-item);line-height:var(--lh-item);color:var(--text-1)}
@@ -372,7 +377,6 @@ html[data-theme=light] .theme-toggle .moon{display:none}
 .config-field-meta{display:flex;gap:var(--sp-2);flex-wrap:wrap;align-items:center;font-size:var(--fs-tiny);color:var(--text-3)}
 .config-effect{display:inline-flex;align-items:center;padding:1px var(--sp-2);border-radius:999px;font-size:var(--fs-tiny);line-height:var(--lh-tiny)}
 .config-effect.live{background:var(--ok-soft);color:var(--ok)}
-.config-effect.next{background:var(--warn-soft);color:var(--warn)}
 .config-effect.restart{background:var(--info-soft);color:var(--info)}
 .config-effect.bootstrap{background:var(--fill-2);color:var(--text-3)}
 .config-field-error{color:var(--danger);font-size:var(--fs-meta);line-height:var(--lh-meta)}
@@ -819,6 +823,20 @@ function setupPages(){
   const response=$('responsePanel')
   if(response){response.classList.add('global-result');document.body.appendChild(response)}
 }
+// 配置中心未保存标记：navigateTo 在脚本中段即被调用，声明必须位于其之前，
+// 否则触发 let 的暂时性死区（TDZ）ReferenceError，导致整段初始化中断。
+let configUnsaved=false
+let configSchema=null
+let configData=null            // GET /config 响应 {revision, sections}
+let configDirty=new Set()      // 有未保存修改的段名集合
+let configActiveSection=null   // 当前选中分组
+let configLoading=false
+let configSaving=false
+let configSavedAtMs=null       // 本次会话最近一次成功保存/回滚的时间
+let configLatestRevisionAtMs=null // 服务端最新历史版本时间（首次加载时展示用）
+let configSearchText=''
+let configRevisionsOpen=false
+let configSecretDraft={}
 function navigateTo(route,updateHash=true){
   if(!pageRoutes.includes(route))route='overview'
   if(configUnsaved&&route!==document.querySelector('.page-section.active')?.dataset.page&&!confirm('有未保存的配置修改，确定离开配置中心？'))return
@@ -826,7 +844,7 @@ function navigateTo(route,updateHash=true){
   document.querySelectorAll('.nav-link[data-route]').forEach(link=>link.classList.toggle('active',link.dataset.route===route))
   try{localStorage.setItem('miliastraRoute',route)}catch(e){}
   if(updateHash&&location.hash!=='#'+route)history.replaceState(null,'','#'+route)
-  if(route==='config')loadConfigPage()
+  if(route==='config'&&(!configData||!configUnsaved))loadConfigPage()
 }
 function initialRoute(){
   const hash=location.hash.slice(1)
@@ -1609,17 +1627,139 @@ initToolsPage()
 
 /* ===== 配置中心（阶段 6：Web 配置页面） ===== */
 const SECRET_MASK_TEXT='••••••'
-let configSchema=null
-let configData=null            // GET /config 响应 {revision, sections}
-let configDirty=new Set()      // 有未保存修改的段名集合
-let configActiveSection=null   // 当前选中分组
-let configUnsaved=false
-let configLoading=false
-let configSaving=false
-let configSavedAtMs=null       // 本次会话最近一次成功保存/回滚的时间
-let configLatestRevisionAtMs=null // 服务端最新历史版本时间（首次加载时展示用）
-let configSearchText=''
-let configRevisionsOpen=false
+// extra_body 主流模型快速配置（值经官方文档核对；合并到请求体顶层，null 不发送）。
+// OpenAI 兼容平台（Kimi/豆包等）通常无需额外字段，选预设即得到 {}。
+const EXTRA_BODY_PRESETS=[
+  {key:'openai',label:'OpenAI 兼容（无额外字段）',value:{}},
+  {key:'openai-effort',label:'OpenAI：高推理强度',value:{'reasoning_effort':'high'}},
+  {key:'deepseek',label:'DeepSeek：开启思考',value:{'thinking':{'type':'enabled'}}},
+  {key:'deepseek-fast',label:'DeepSeek：关闭思考（快速回答）',value:{'thinking':{'type':'disabled'}}},
+  {key:'qwen',label:'通义千问 Qwen：关闭思考',value:{'enable_thinking':false}},
+  {key:'qwen-search',label:'通义千问 Qwen：思考 + 联网搜索',value:{'enable_thinking':true,'enable_search':true}},
+  {key:'zhipu',label:'智谱 GLM：关闭思考（直接回答）',value:{'thinking':{'type':'disabled'}}},
+  {key:'zhipu-think',label:'智谱 GLM：开启思考',value:{'thinking':{'type':'enabled'}}},
+  {key:'kimi',label:'Kimi / Moonshot（无额外字段）',value:{}},
+  {key:'doubao',label:'豆包 / 火山方舟（无额外字段）',value:{}}
+]
+// 各服务商可用的预设组：mimo/openai/deepseek 只显示自身预设，
+// custom（自定义网关）展示全部主流预设 + 自定义手填。
+const EXTRA_BODY_PRESET_OPTIONS=EXTRA_BODY_PRESETS.map(p=>'<option value="'+p.key+'">'+p.label+'</option>').join('')
+// 服务商信息与默认值均来自官方 API 文档，并与运行时常量保持一致。
+const AI_PROVIDER_INFO={
+  mimo:'小米 MiMo · OpenAI Chat Completions 兼容接口 · 支持 mimo-v2.5 / mimo-v2.5-pro',
+  openai:'OpenAI · Chat Completions 接口 · 推理参数是否可用取决于所选模型',
+  deepseek:'DeepSeek · Chat Completions 接口 · 支持 deepseek-v4-flash / deepseek-v4-pro',
+  custom:'自定义网关 · endpoint 与 model 必填；extra_body 以 JSON 对象原样合并到请求体顶层'
+}
+const AI_PROVIDER_DEFAULTS={
+  mimo:{endpoint:'',model:'mimo-v2.5'},
+  openai:{endpoint:'',model:'gpt-5.6-mini'},
+  deepseek:{endpoint:'',model:'deepseek-v4-flash'},
+  custom:{endpoint:'',model:''}
+}
+const AI_KNOWN_MODELS={
+  mimo:['mimo-v2.5','mimo-v2.5-pro'],
+  openai:['gpt-5.6-mini','gpt-5.6','gpt-5.5-mini','gpt-5.5'],
+  deepseek:['deepseek-v4-flash','deepseek-v4-pro'],
+  custom:[]
+}
+function extraSelect(name,label,value,options){
+  const rows=['<option value="">默认（不发送）</option>'].concat(options.map(item=>'<option value="'+esc(item)+'"'+(value===item?' selected':'')+'>'+esc(item)+'</option>'))
+  return '<label class="config-extra-field"><span>'+label+'</span><select data-ai-extra="'+name+'" onchange="syncAiExtraBody()">'+rows.join('')+'</select></label>'
+}
+function extraText(name,label,value,placeholder){
+  return '<label class="config-extra-field"><span>'+label+'</span><input type="text" data-ai-extra="'+name+'" value="'+esc(value||'')+'" placeholder="'+esc(placeholder||'留空不发送')+'" oninput="syncAiExtraBody()"></label>'
+}
+function aiExtraBodyEditor(path,value){
+  const provider=String(configValueAt('ai','ai.provider')||'openai')
+  const body=value&&typeof value==='object'&&!Array.isArray(value)?value:{}
+  const thinking=body.thinking&&typeof body.thinking==='object'?String(body.thinking.type||''):''
+  let controls=''
+  if(provider==='mimo'){
+    controls+=extraSelect('thinking.type','思考模式',thinking,['enabled','disabled'])
+    controls+='<div class="config-field-hint">官方说明：mimo-v2.5 与 mimo-v2.5-pro 默认启用思考；思考模式下 temperature/top_p 会使用模型推荐值。</div>'
+  }else if(provider==='openai'){
+    controls+=extraSelect('reasoning_effort','推理强度',String(body.reasoning_effort||''),['none','minimal','low','medium','high','xhigh','max'])
+    controls+=extraSelect('service_tier','服务等级',String(body.service_tier||''),['auto','default','flex','scale','priority','fast'])
+    controls+=extraSelect('verbosity','回复详略',String(body.verbosity||''),['low','medium','high'])
+    controls+=extraText('safety_identifier','安全标识',body.safety_identifier,'稳定匿名标识，最多 64 字符')
+    controls+=extraText('prompt_cache_key','提示缓存键',body.prompt_cache_key,'相似请求共用的缓存键')
+    controls+=extraText('metadata','元数据 JSON',body.metadata?JSON.stringify(body.metadata):'','例如 {"scene":"song_request"}')
+    controls+='<div class="config-field-hint">字段来自 OpenAI 官方 OpenAPI。seed 已废弃，不再提供；模型未必支持全部推理强度。</div>'
+  }else if(provider==='deepseek'){
+    controls+=extraSelect('thinking.type','思考模式',thinking,['enabled','disabled'])
+    controls+=extraSelect('reasoning_effort','推理强度',String(body.reasoning_effort||''),['low','high','max'])
+    controls+=extraText('user_id','用户隔离 ID',body.user_id,'仅 a-zA-Z0-9-_，最多 512 字符')
+    controls+='<div class="config-field-hint">官方说明：默认开启思考；V4 Flash 支持 low/high/max，V4 Pro 当前主要支持 high/max。</div>'
+  }
+  // 切换官方服务商后丢弃其他服务商专属字段，避免把无效参数带到新请求。
+  if(provider!=='custom'){
+    const allowed={
+      mimo:['thinking'],
+      openai:['reasoning_effort','service_tier','verbosity','safety_identifier','prompt_cache_key','metadata'],
+      deepseek:['thinking','reasoning_effort','user_id']
+    }[provider]||[]
+    for(const key of Object.keys(body))if(!allowed.includes(key))delete body[key]
+  }
+  const text=JSON.stringify(body,null,2)
+  if(provider==='custom'){
+    return '<div class="config-string-row"><select data-cfg-extra-preset="1" data-cfg-extra-preset-path="'+path+'" onchange="applyExtraBodyPreset(this,\''+path+'\')"><option value="">可选：载入常见网关模板</option>'+EXTRA_BODY_PRESET_OPTIONS+'</select><button type="button" class="btn small ghost" onclick="clearExtraBody(\''+path+'\')">清空</button></div><textarea id="'+configControlId(path)+'" data-cfg="'+path+'" data-cfg-object="1" placeholder="必须是 JSON 对象">'+esc(text)+'</textarea>'
+  }
+  return '<div class="config-extra-grid">'+controls+'</div><textarea class="hidden" id="'+configControlId(path)+'" data-cfg="'+path+'" data-cfg-object="1">'+esc(text)+'</textarea>'
+}
+function syncAiExtraBody(){
+  const el=document.getElementById(configControlId('ai.extra_body'))
+  if(!el)return
+  let body={}
+  try{const current=JSON.parse(el.value||'{}');if(current&&typeof current==='object'&&!Array.isArray(current))body=current}catch{}
+  // 只重写当前结构化表单拥有的字段，保留未来版本或手工配置的其他官方字段。
+  for(const key of ['thinking','reasoning_effort','service_tier','verbosity','safety_identifier','prompt_cache_key','metadata','user_id'])delete body[key]
+  document.querySelectorAll('[data-ai-extra]').forEach(control=>{
+    const key=control.getAttribute('data-ai-extra')
+    const raw=String(control.value||'').trim()
+    if(!raw)return
+    let value=raw
+    if(key==='metadata'){
+      try{value=JSON.parse(raw);control.classList.remove('config-invalid')}catch{control.classList.add('config-invalid');return}
+    }
+    if(key==='thinking.type')body.thinking={type:value}
+    else body[key]=value
+  })
+  el.value=JSON.stringify(body,null,2)
+  markConfigDirty('ai')
+}
+function applyExtraBodyPreset(select,path){
+  const preset=EXTRA_BODY_PRESETS.find(p=>p.key===select.value)
+  const el=document.getElementById(configControlId(path))
+  if(!el)return
+  el.value=preset?JSON.stringify(preset.value,null,2):''
+  onConfigObjectInput(el,configFieldByPath(path))
+  markConfigDirty(String(path).split('.')[0])
+}
+function clearExtraBody(path){
+  const el=document.getElementById(configControlId(path))
+  if(!el)return
+  el.value='{}'
+  onConfigObjectInput(el,configFieldByPath(path))
+  markConfigDirty(String(path).split('.')[0])
+}
+function onAiProviderChange(select){
+  const provider=select.value
+  const defaults=AI_PROVIDER_DEFAULTS[provider]||AI_PROVIDER_DEFAULTS.custom
+  const ai=configData&&configData.sections&&configData.sections.ai
+  if(!ai)return
+  if(!syncConfigFormToData()){
+    showConfigMessage('当前配置存在格式错误，请修正后再切换服务商','err')
+    select.value=String(ai.provider||'')
+    return
+  }
+  // 先保留当前表单全部值，再仅为留空字段填入新服务商默认值。
+  ai.provider=provider
+  if(String(ai.endpoint||'').trim()==='')ai.endpoint=defaults.endpoint
+  if(String(ai.model||'').trim()==='')ai.model=defaults.model
+  markConfigDirty('ai')
+  renderConfigForm()
+}
 function showConfigMessage(text,kind){
   const el=$('configMessage')
   if(!el)return
@@ -1652,8 +1792,7 @@ function getNestedValue(node,seg){
 }
 function setNestedValue(root,seg,value){
   let node=root
-  for(let i=0;i<seg.length-1;i++){
-    if(node[seg[i]]==null||typeof node[seg[i]]!=='object')node[seg[i]]={}
+  for(let i=0;i<seg.length-1;i++){    if(node[seg[i]]==null||typeof node[seg[i]]!=='object')node[seg[i]]={}
     node=node[seg[i]]
   }
   node[seg[seg.length-1]]=value
@@ -1708,14 +1847,37 @@ function renderConfigSectionList(){
     return '<button type="button" class="config-section-item'+active+'" onclick="selectConfigSection(\''+section.name+'\')"><span>'+esc(section.label)+'</span><span class="section-name">'+esc(section.name)+'</span>'+(dirty?'<span class="dirty-dot" title="有未保存修改"></span>':'')+'</button>'
   }).join('')||'<div class="config-field-hint" style="padding:var(--sp-2)">没有匹配的配置段</div>'
 }
+function syncConfigFormToData(){
+  if(!configActiveSection||!configData||!configDirty.has(configActiveSection))return true
+  const section=configSectionByName(configActiveSection)
+  if(!section)return true
+  const out={}
+  for(const field of section.fields){
+    if(field.source==='bootstrap')continue
+    const collected=collectConfigFieldValue(field,configActiveSection)
+    if(collected.invalid)return false
+    if(collected.skip)continue
+    const seg=String(field.path).split('.').slice(1)
+    if(collected.clear)setNestedValue(out,seg,{'__clear__':true})
+    else setNestedValue(out,seg,collected.value)
+  }
+  const base=configData.sections[configActiveSection]
+  configData.sections[configActiveSection]=Object.assign(base&&typeof base==='object'?JSON.parse(JSON.stringify(base)):{},out)
+  return true
+}
 function selectConfigSection(name){
+  if(name===configActiveSection)return
+  if(!syncConfigFormToData()){
+    showConfigMessage('当前配置存在格式错误，请修正后再切换','err')
+    return
+  }
   configActiveSection=name
   renderConfigSectionList()
   renderConfigForm()
 }
 function configEffectTag(field){
   if(field.source==='bootstrap')return '<span class="config-effect bootstrap">config.yaml</span>'
-  const map={live:['live','立即生效'],nextTask:['next','下一任务生效'],restart:['restart','重启生效']}
+  const map={live:['live','立即生效'],restart:['restart','重启生效']}
   const item=map[field.effect]||['restart','重启生效']
   return '<span class="config-effect '+item[0]+'">'+item[1]+'</span>'
 }
@@ -1735,7 +1897,7 @@ function configControlHtml(field,value){
   const parentNull=parent&&configValueAt(configActiveSection,parent.path)==null
   const parentAttr=parent?(' data-cfg-parent="'+parent.path+'"'+(parentNull?' disabled':'')):''
   if(kind==='bool'){
-    return '<label class="switch-line"><input id="'+id+'" type="checkbox" data-cfg="'+path+'"'+(value===true?' checked':'')+disabledAttr+parentAttr+'>'+(value===true?'已启用':'未启用')+'</label>'
+    return '<label class="switch-line"><input id="'+id+'" type="checkbox" data-cfg="'+path+'"'+(value===true?' checked':'')+disabledAttr+parentAttr+'><span data-switch-state>'+(value===true?'已启用':'未启用')+'</span></label>'
   }
   if(kind==='int'||kind==='float'){
     const min=field.kind.min!=null?' min="'+field.kind.min+'"':''
@@ -1749,7 +1911,7 @@ function configControlHtml(field,value){
   if(kind==='enum'){
     const values=Array.isArray(field.kind.values)?field.kind.values:[]
     const unknown=value!=null&&!values.some(item=>item.value===String(value))
-    const placeholder=unknown?'<option value="">（未知值 '+esc(String(value))+'）</option>':'<option value="">（未选择）</option>'
+    const placeholder=unknown?'<option value="'+esc(String(value))+'" selected>（未知值 '+esc(String(value))+'）</option>':'<option value="">（未选择）</option>'
     const options=values.map(item=>'<option value="'+esc(item.value)+'"'+(String(value)===item.value?' selected':'')+'>'+esc(item.label)+'</option>').join('')
     return '<select id="'+id+'" data-cfg="'+path+'"'+disabledAttr+parentAttr+'>'+placeholder+options+'</select>'
   }
@@ -1759,16 +1921,31 @@ function configControlHtml(field,value){
     return '<div class="config-array" id="'+id+'">'+rows+'<div class="config-string-row"><button type="button" class="btn small" onclick="configArrayAdd(\''+path+'\')">添加一行</button></div></div>'
   }
   if(kind==='object'){
+    // 有子字段 schema 声明的可空对象（如 audio_cache）→ 结构化开关，禁止手填 JSON；
+    // 无子字段声明的自由对象（ai.extra_body、custom_workflows 等）→ 高级 JSON 编辑。
+    const hasChildren=configSchema&&configSchema.some(s=>s.name===configActiveSection&&s.fields.some(f=>String(f.path).startsWith(path+'.')))
+    if(field.nullable&&hasChildren){
+      const on=value!=null&&value.enabled!==false
+      return '<label class="switch-line config-object-toggle"><input id="'+id+'" type="checkbox" data-cfg="'+path+'" data-cfg-object-toggle="1"'+(on?' checked':'')+disabledAttr+'><span data-switch-state>'+(on?'已启用':'未启用')+'</span></label>'+
+        '<div class="config-field-hint">'+(on?'已启用。下方子字段已填入默认值，按需修改即可':'当前未启用（null）。打开开关后用默认值启用，无需手填 JSON')+'</div>'
+    }
     const text=value==null?'':JSON.stringify(value,null,2)
     const placeholder=field.nullable?'null 表示未启用；填入 JSON 对象以启用':'必须是 JSON 对象'
-    let html='<textarea id="'+id+'" data-cfg="'+path+'" data-cfg-object="1" placeholder="'+placeholder+'"'+disabledAttr+'>'+esc(text)+'</textarea>'
+    let html=''
+    // 点歌 AI 使用服务商专属结构化控件；只有 custom 保留自由 JSON。
+    if(field.path==='ai.extra_body')return aiExtraBodyEditor(path,value)
+    // 其他模块尚无 provider 字段，只提供模板辅助，不伪装成服务商配置。
+    if(field.path.endsWith('.extra_body')){
+      html+='<div class="config-string-row"><select id="'+id+'-preset" data-cfg-extra-preset="1" data-cfg-extra-preset-path="'+path+'" onchange="applyExtraBodyPreset(this,\''+path+'\')"><option value="">可选：载入常见网关模板</option>'+EXTRA_BODY_PRESET_OPTIONS+'</select><button type="button" class="btn small ghost" onclick="clearExtraBody(\''+path+'\')">清空</button></div>'
+    }
+    html+='<textarea id="'+id+'" data-cfg="'+path+'" data-cfg-object="1" placeholder="'+placeholder+'"'+disabledAttr+'>'+esc(text)+'</textarea>'
     if(field.nullable&&value==null)html+='<div class="config-field-hint">当前未启用（null）。填入 JSON 对象后下方子字段自动可用。</div>'
     return html
   }
   if(kind==='rect'||kind==='point'){
     const keys=kind==='rect'?['x','y','width','height']:['x','y']
     const labels={x:'X',y:'Y',width:'宽',height:'高'}
-    const nums=keys.map(key=>'<label>'+labels[key]+'<input id="'+id+'-'+key+'" type="number" data-cfg="'+path+'" data-cfg-sub="1" data-key="'+key+'" value="'+(value&&value[key]!=null?esc(String(value[key])):'')+'"'+disabledAttr+parentAttr+'></label>').join('')
+    const nums=keys.map(key=>'<label>'+labels[key]+'<input id="'+id+'-'+key+'" type="number" step="1" data-cfg="'+path+'" data-cfg-sub="1" data-key="'+key+'" value="'+(value&&value[key]!=null?esc(String(value[key])):'')+'"'+disabledAttr+parentAttr+'></label>').join('')
     return '<div class="config-num-row'+(keys.length===2?' two':'')+'">'+nums+'</div>'
   }
   if(kind==='secret'){
@@ -1781,13 +1958,17 @@ function renderConfigForm(){
   const form=$('configForm')
   if(!form)return
   const section=configSectionByName(configActiveSection)
-  if(!section){form.innerHTML='<div class="config-message err">配置段不存在</div>';return}
+  if(!section){form.innerHTML='<div class="config-message">没有匹配的配置字段</div>';return}
   const parts=['<div class="config-form">']
+  const isAi=section.name==='ai'
   for(const field of section.fields){
     const id=configControlId(field.path)
     const value=configValueAt(section.name,field.path)
     const bootstrap=field.source==='bootstrap'
     const hiddenBySearch=!configFieldMatches(field)
+    // 点歌 AI 二段式：第一步选服务商，第二步按服务商填参数。
+    if(isAi&&field.path==='ai.provider')parts.push('<div class="config-step-title">第一步：选择服务商</div>')
+    if(isAi&&field.path==='ai.api_key')parts.push('<div class="config-step-title">第二步：服务商参数</div><div class="config-field-hint ai-provider-info" id="aiProviderInfo"></div>')
     parts.push('<div class="config-field'+(bootstrap?' bootstrap':'')+(hiddenBySearch?' hidden':'')+'" data-cfg-field="'+field.path+'" id="cfg-field-'+id+'">')
     parts.push('<div class="config-field-head"><b>'+esc(field.label)+'</b><code>'+esc(field.path)+'</code>'+configEffectTag(field)+'</div>')
     if(field.hint)parts.push('<div class="config-field-hint">'+esc(field.hint)+'</div>')
@@ -1800,13 +1981,38 @@ function renderConfigForm(){
   }
   parts.push('</div>')
   form.innerHTML=parts.join('')
+  if(isAi)aiProviderBind()
+}
+function aiProviderBind(){
+  const providerEl=document.getElementById(configControlId('ai.provider'))
+  if(!providerEl)return
+  const provider=providerEl.value
+  const info=$('aiProviderInfo')
+  if(info)info.textContent=AI_PROVIDER_INFO[provider]||''
+  const model=document.getElementById(configControlId('ai.model'))
+  if(model&&AI_KNOWN_MODELS[provider]&&AI_KNOWN_MODELS[provider].length){
+    const listId='ai-model-suggestions'
+    model.setAttribute('list',listId)
+    const list=document.createElement('datalist')
+    list.id=listId
+    list.innerHTML=AI_KNOWN_MODELS[provider].map(value=>'<option value="'+esc(value)+'"></option>').join('')
+    model.after(list)
+  }
+  providerEl.removeEventListener('change',onAiProviderChange)
+  providerEl.addEventListener('change',onAiProviderChange)
 }
 function validateConfigNumber(el,field){
   const raw=String(el.value||'').trim()
   if(raw===''){el.classList.remove('config-invalid');return}
   const kind=field.kind||{}
-  const n=kind.type==='float'?parseFloat(raw):parseInt(raw,10)
-  const valid=Number.isFinite(n)&&!((kind.min!=null&&n<kind.min)||(kind.max!=null&&n>kind.max))
+  const integer=kind.type!=='float'
+  const syntax=integer?/^[+-]?\d+$/.test(raw):/^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/.test(raw)
+  const n=Number(raw)
+  let valid=syntax&&Number.isFinite(n)&&(!integer||Number.isSafeInteger(n))&&!((kind.min!=null&&n<kind.min)||(kind.max!=null&&n>kind.max))
+  if(kind.type==='rect'){
+    const key=el.dataset.key
+    if((key==='width'||key==='height')&&n<=0)valid=false
+  }
   el.classList.toggle('config-invalid',!valid)
 }
 function configFillControl(el,val){
@@ -1819,7 +2025,7 @@ function onConfigObjectInput(el,field){
   // 父级 object（audio_cache 等）输入合法 JSON 对象后，启用并回填子字段控件。
   try{
     const value=JSON.parse(el.value||'null')
-    if(value&&typeof value==='object'&&!Array.isArray(value)){
+    if(value&&typeof value==='object'){
       el.classList.remove('config-invalid')
       document.querySelectorAll('[data-cfg-parent="'+field.path+'"]').forEach(child=>{
         const val=getNestedValue(value,String(child.dataset.cfg).split('.').slice(1))
@@ -1838,6 +2044,22 @@ function onConfigObjectInput(el,field){
     }
   }catch{el.classList.add('config-invalid')}
 }
+function onConfigObjectToggle(el,field){
+  // 结构化可空对象开关（audio_cache）：启用时用 schema 默认值预填全部子字段，
+  // 禁用时清空并禁用子字段（提交为 null），用户无需手填 JSON。
+  const on=el.checked
+  const state=el.closest('label')&&el.closest('label').querySelector('[data-switch-state]')
+  if(state)state.textContent=on?'已启用':'未启用'
+  const section=configSectionByName(configActiveSection)
+  const children=(section&&section.fields||[]).filter(f=>String(f.path).startsWith(field.path+'.'))
+  children.forEach(f=>{
+    const child=document.getElementById(configControlId(f.path))
+    if(!child)return
+    child.disabled=!on
+    configFillControl(child,on?f.default:null)
+  })
+  markConfigDirty(String(field.path).split('.')[0])
+}
 function onConfigFormInput(e){
   const el=e.target
   const path=el&&el.dataset&&el.dataset.cfg
@@ -1847,6 +2069,7 @@ function onConfigFormInput(e){
   const kind=field.kind&&field.kind.type
   if((kind==='int'||kind==='float'||kind==='rect'||kind==='point')&&el.dataset.cfgSub==='1')validateConfigNumber(el,field)
   if(kind==='object'&&el.tagName==='TEXTAREA')onConfigObjectInput(el,field)
+  if(kind==='object'&&el.dataset.cfgObjectToggle!==undefined)onConfigObjectToggle(el,field)
   if(el.dataset.cfgClear!==undefined)delete el.dataset.cfgClear
   markConfigDirty(String(path).split('.')[0])
 }
@@ -1856,6 +2079,10 @@ function onConfigFormChange(e){
   if(!path)return
   const field=configFieldByPath(path)
   if(!field||field.source==='bootstrap')return
+  if(el.type==='checkbox'){
+    const state=el.closest('label')&&el.closest('label').querySelector('[data-switch-state]')
+    if(state)state.textContent=el.checked?'已启用':'未启用'
+  }
   markConfigDirty(String(path).split('.')[0])
 }
 function configArrayAdd(path){
@@ -1888,38 +2115,62 @@ function collectConfigFieldValue(field,sectionName){
   const kind=field.kind&&field.kind.type
   const el=document.getElementById(configControlId(field.path))
   if(!el)return {skip:true}
-  // 父级 nullable object 当前提交值为 null（库中为 null，或 textarea 输入为空/“null”）
+  // 父级 nullable object 未启用（开关关闭 / textarea 为 null / 库中为 null）
   // → 跳过子字段，避免把旧子字段写回提交段导致父级重新变成对象。
   const parent=configNullableObjectParent(sectionName,field.path)
   if(parent){
     const parentEl=document.getElementById(configControlId(parent.path))
-    const parentText=parentEl&&parentEl.dataset.cfgObject==='1'?String(parentEl.value||'').trim():''
-    if(configValueAt(sectionName,parent.path)==null||parentText===''||parentText==='null')return {skip:true}
+    let parentOn=false
+    if(parentEl&&parentEl.dataset.cfgObjectToggle!==undefined){
+      parentOn=parentEl.checked
+    }else if(parentEl&&parentEl.dataset.cfgObject==='1'){
+      const parentText=String(parentEl.value||'').trim()
+      parentOn=!(parentText===''||parentText==='null')
+    }else{
+      parentOn=configValueAt(sectionName,parent.path)!=null
+    }
+    if(!parentOn)return {skip:true}
   }
   if(kind==='bool')return {value:el.checked}
   if(kind==='int'||kind==='float'){
     const raw=String(el.value||'').trim()
-    if(raw==='')return {value:null}
-    const n=kind==='float'?parseFloat(raw):parseInt(raw,10)
-    return {value:Number.isFinite(n)?n:null}
+    if(raw==='')return {invalid:true}
+    const integer=kind==='int'
+    const syntax=integer?/^[+-]?\d+$/.test(raw):/^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/.test(raw)
+    const n=Number(raw)
+    if(!syntax||!Number.isFinite(n))return {invalid:true}
+    if((kind==='int'&&(!Number.isInteger(n)||n<-(2**53-1)||n>2**53-1)))return {invalid:true}
+    const fieldKind=field.kind||{}
+    if((fieldKind.min!=null&&n<fieldKind.min)||(fieldKind.max!=null&&n>fieldKind.max))return {invalid:true}
+    return {value:n}
   }
   if(kind==='string'||kind==='path'){
     const v=el.value
     if(field.nullable&&String(v||'').trim()==='')return {value:null}
     return {value:v}
   }
-  if(kind==='enum')return {value:el.value===''?null:el.value}
+  if(kind==='enum'){
+    // 未知枚举值仍回传原值，避免用户修改同段其他字段时破坏旧配置。
+    const value=el.value===''?null:el.value
+    if(value===null&&!field.nullable){
+      const current=configValueAt(sectionName,field.path)
+      return current==null?{invalid:true}:{value:current}
+    }
+    return {value}
+  }
   if(kind==='stringArray'){
     const rows=el.closest('.config-field')?el.closest('.config-field').querySelectorAll('input[data-cfg-array]'):[]
     return {value:[...rows].map(i=>String(i.value||'').trim()).filter(v=>v!=='')}
   }
   if(kind==='object'){
+    // 结构化可空对象（audio_cache）：关闭必须显式提交 null；开启由子字段逐个组装。
+    if(el.dataset.cfgObjectToggle!==undefined)return el.checked?{skip:true}:{value:null}
     const text=String(el.value||'').trim()
-    // 空文本或 “null” 都表示提交 null（清空可空对象）。
-    if(text===''||text==='null')return {value:null}
+    // 可空对象允许 null；非可空对象清空时恢复为空对象。
+    if(text===''||text==='null')return field.nullable?{value:null}:{value:{}}
     try{
       const value=JSON.parse(text)
-      if(value&&typeof value==='object'&&!Array.isArray(value))return {value}
+      if(value&&typeof value==='object')return {value}
       return {invalid:true}
     }catch{return {invalid:true}}
   }
@@ -1929,7 +2180,11 @@ function collectConfigFieldValue(field,sectionName){
     for(const key of keys){
       const input=document.getElementById(configControlId(field.path)+'-'+key)
       const raw=String(input?input.value||'':'').trim()
-      out[key]=raw===''?null:Number(raw)
+      if(raw==='')return {invalid:true}
+      const value=Number(raw)
+      if(!Number.isSafeInteger(value))return {invalid:true}
+      if(kind==='rect'&&(key==='width'||key==='height')&&value<=0)return {invalid:true}
+      out[key]=value
     }
     return {value:out}
   }
@@ -1940,6 +2195,14 @@ function collectConfigFieldValue(field,sectionName){
   return {skip:true}
 }
 function configBuildSubmitSections(){
+  if(document.querySelector('#configForm .config-invalid')){
+    showConfigMessage('存在格式无效的配置，请修正红色字段后重试','err')
+    return null
+  }
+  if(!syncConfigFormToData()){
+    showConfigMessage('存在格式无效的配置，请修正后重试','err')
+    return null
+  }
   const sections={}
   for(const name of [...configDirty]){
     const section=configSectionByName(name)
@@ -1966,8 +2229,16 @@ function configBuildSubmitSections(){
 }
 function applyConfigErrors(errors){
   clearConfigFieldErrors()
+  const items=Array.isArray(errors)?errors:[]
+  const firstField=items.find(error=>error&&error.field)
+  const firstSection=firstField&&String(firstField.field).split('.')[0]
+  if(firstSection&&firstSection!==configActiveSection&&configSectionByName(firstSection)){
+    configActiveSection=firstSection
+    renderConfigSectionList()
+    renderConfigForm()
+  }
   const lines=[]
-  for(const error of Array.isArray(errors)?errors:[]){
+  for(const error of items){
     const field=error&&error.field
     if(field){
       const input=document.getElementById(configControlId(field))
@@ -1994,6 +2265,12 @@ function formatConfigFields(paths){
 }
 function setConfigSavingUI(saving){
   document.querySelectorAll('#page-config .btn').forEach(btn=>{btn.disabled=saving})
+  const search=$('configSearch')
+  if(search)search.disabled=saving
+  document.querySelectorAll('#configForm input, #configForm textarea, #configForm select').forEach(control=>{
+    if(saving){control.dataset.savingDisabled=control.disabled?'1':'0';control.disabled=true}
+    else if(control.dataset.savingDisabled!==undefined){control.disabled=control.dataset.savingDisabled==='1';delete control.dataset.savingDisabled}
+  })
   const btn=$('configSaveBtn')
   if(btn)btn.textContent=saving?'保存中...':'保存全部'
 }
@@ -2002,17 +2279,22 @@ async function applyConfigSaveResult(resp,action){
   configLatestRevisionAtMs=Date.now()
   configDirty.clear()
   configUnsaved=false
-  // 重新拉取完整配置（服务端可能规范化/解析相对路径）。
-  const data=await request('/config')
-  configData=data
-  renderConfigStatus()
-  renderConfigSectionList()
-  renderConfigForm()
   let message=action+'成功，当前版本 '+resp.revision
+  // 落库成功后先更新本地版本；只读刷新失败不能反转保存结果。
+  if(configData)configData.revision=resp.revision
+  try{
+    // 重新拉取完整配置（服务端可能规范化/解析相对路径）。
+    const data=await request('/config')
+    configData=data
+    renderConfigStatus()
+    renderConfigSectionList()
+    renderConfigForm()
+  }catch(e){
+    message+='；配置已保存，但页面刷新失败：'+e.message
+  }
   if(resp.restartRequired)message+='\n以下配置需重启生效：'+formatConfigFields(resp.restartFields)
   if(resp.appliedLiveFields&&resp.appliedLiveFields.length)message+='\n已立即生效：'+formatConfigFields(resp.appliedLiveFields)
   showConfigMessage(message,'ok')
-  if(configRevisionsOpen)loadConfigRevisions()
 }
 async function loadConfigPage(){
   if(configLoading)return
@@ -2065,7 +2347,11 @@ async function saveConfig(){
     }
     await applyConfigSaveResult(resp,'已保存')
   }catch(e){showConfigMessage('保存失败: '+e.message,'err')}
-  finally{configSaving=false;setConfigSavingUI(false)}
+  finally{
+    configSaving=false
+    setConfigSavingUI(false)
+    if(configRevisionsOpen)loadConfigRevisions()
+  }
 }
 function configDefaultSections(){
   // 按 schema 各字段 default 组装段对象；父级 default 为 null（如 audio_cache）
@@ -2108,7 +2394,11 @@ async function restoreDefaults(){
     }
     await applyConfigSaveResult(resp,'已恢复默认配置')
   }catch(e){showConfigMessage('恢复默认失败: '+e.message,'err')}
-  finally{configSaving=false;setConfigSavingUI(false)}
+  finally{
+    configSaving=false
+    setConfigSavingUI(false)
+    if(configRevisionsOpen)loadConfigRevisions()
+  }
 }
 function toggleConfigRevisions(){
   configRevisionsOpen=!configRevisionsOpen
@@ -2138,7 +2428,7 @@ async function rollbackTo(rev){
   configSaving=true
   setConfigSavingUI(true)
   try{
-    const resp=await requestJson('/config/rollback',{revision:Number(rev)})
+    const resp=await requestJson('/config/rollback',{revision:Number(rev),baseRevision:configData&&configData.revision!=null?configData.revision:0})
     if(!resp||resp.ok!==true){
       if(resp&&resp.code==='config_conflict'){
         showConfigMessage('回滚失败：配置已被其他修改，请刷新后重试','err')
@@ -2150,12 +2440,22 @@ async function rollbackTo(rev){
     }
     await applyConfigSaveResult(resp,'已回滚到版本 #'+rev)
   }catch(e){showConfigMessage('回滚失败: '+e.message,'err')}
-  finally{configSaving=false;setConfigSavingUI(false)}
+  finally{
+    configSaving=false
+    setConfigSavingUI(false)
+    if(configRevisionsOpen)loadConfigRevisions()
+  }
 }
 $('configForm').addEventListener('input',onConfigFormInput)
 $('configForm').addEventListener('change',onConfigFormChange)
 $('configSearch').addEventListener('input',()=>{
+  if(!syncConfigFormToData()){
+    showConfigMessage('当前配置存在格式错误，暂不能搜索重绘','err')
+    return
+  }
   configSearchText=$('configSearch').value.trim().toLowerCase()
+  const visible=(configSchema||[]).filter(configSectionHasMatch)
+  if(!visible.some(section=>section.name===configActiveSection))configActiveSection=visible.length?visible[0].name:null
   renderConfigSectionList()
   renderConfigForm()
 })

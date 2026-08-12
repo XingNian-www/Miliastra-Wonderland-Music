@@ -2116,6 +2116,11 @@ fn page_contains_config_center() {
     // secret 清除标记与保留语义必须体现在页面中。
     assert!(PAGE.contains("__clear__"));
     assert!(PAGE.contains("留空表示不修改"));
+    // 配置表单重绘前必须先同步编辑缓冲；Object 收集需支持数组。
+    assert!(PAGE.contains("function syncConfigFormToData()"));
+    assert!(PAGE.contains("if(value&&typeof value==='object')return {value}"));
+    // 保存成功后的只读刷新失败不能被误报为保存失败。
+    assert!(PAGE.contains("配置已保存，但页面刷新失败"));
     // 路由表必须包含 config（导航可达）。
     assert!(PAGE.contains("'config'"));
 }
@@ -2822,6 +2827,35 @@ fn config_route_masks_secrets_and_reports_revision() {
 }
 
 #[test]
+fn config_route_keeps_relative_paths_unresolved() {
+    // 显示值必须保持库中相对路径（deps/assets/...），不能返回解析后的绝对路径，
+    // 否则 Web 表单回填绝对路径并在保存时把绝对路径写回配置库。
+    let state = test_state();
+    let response: Value = serde_json::from_str(&config_route(&[], &state).unwrap()).unwrap();
+    let blue = response["sections"]["templates"]["blue_marker"]
+        .as_str()
+        .expect("blue_marker 必须是字符串");
+    assert!(
+        blue.starts_with("deps/assets/"),
+        "显示值应保持相对路径，实际: {blue}"
+    );
+    let idioms = response["sections"]["idiom_chain"]["lexicon_path"]
+        .as_str()
+        .expect("lexicon_path 必须是字符串");
+    assert!(
+        idioms.starts_with("deps/assets/"),
+        "成语词库显示值应保持相对路径，实际: {idioms}"
+    );
+    // http/logging 段不落库，必须由 bootstrap 注入且保持可显示。
+    assert_eq!(response["sections"]["http"]["port"], 18888);
+    assert!(response["sections"]["logging"]["dir"].is_string());
+    // 与 load_full（运行态解析后）不同：显示值保持相对，运行值仍为绝对。
+    let store = state.config_store.lock().unwrap();
+    let runtime = store.load_full().unwrap();
+    assert!(runtime.templates.blue_marker.is_absolute());
+}
+
+#[test]
 fn config_schema_route_lists_all_sections_with_defaults() {
     let state = test_state();
     let response: Value = serde_json::from_str(&config_schema_route(&[], &state).unwrap()).unwrap();
@@ -2856,7 +2890,8 @@ fn config_schema_route_lists_all_sections_with_defaults() {
         .find(|field| field["path"] == "ai.api_key")
         .expect("ai.api_key field");
     assert_eq!(api_key["kind"]["type"], "secret");
-    // audio_cache 默认 null 时子字段 default 为 null。
+    // audio_cache 默认 null，但其子字段 default 用"启用后默认对象"提供
+    // （Web「启用」开关预填来源，避免用户手填 JSON）。
     let playback = sections
         .iter()
         .find(|section| section["name"] == "playback")
@@ -2867,8 +2902,22 @@ fn config_schema_route_lists_all_sections_with_defaults() {
         .iter()
         .find(|field| field["path"] == "playback.audio_cache.enabled")
         .expect("audio_cache.enabled field");
-    assert!(cache_enabled["default"].is_null());
+    assert_eq!(cache_enabled["default"], json!(true));
     assert_eq!(cache_enabled["optionalParent"], true);
+    let cache_dir = playback["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|field| field["path"] == "playback.audio_cache.directory")
+        .expect("audio_cache.directory field");
+    assert_eq!(cache_dir["default"], json!("deps/cache/audio"));
+    let cache_max = playback["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|field| field["path"] == "playback.audio_cache.max_bytes_mb")
+        .expect("audio_cache.max_bytes_mb field");
+    assert_eq!(cache_max["default"], json!(20 * 1024));
 }
 
 #[test]
@@ -3213,7 +3262,7 @@ fn config_rollback_route_applies_live_fields_to_shared_values() {
             .unwrap()
     );
     // 回滚到 revision 2（默认 protect=true）→ 共享值恢复为 true。
-    let body = serde_json::to_string(&json!({ "revision": 2 })).unwrap();
+    let body = serde_json::to_string(&json!({ "revision": 2, "baseRevision": 3 })).unwrap();
     let response: Value =
         serde_json::from_str(&config_rollback_route(body.as_bytes(), &state).unwrap()).unwrap();
     assert_eq!(response["ok"], true);
@@ -3387,7 +3436,7 @@ fn config_rollback_route_restores_previous_revision() {
     config_save_route(body.as_bytes(), &state).unwrap();
 
     // 回滚到 revision 2 → 新版本 4，queue.max_size 恢复 20。
-    let body = serde_json::to_string(&json!({ "revision": 2 })).unwrap();
+    let body = serde_json::to_string(&json!({ "revision": 2, "baseRevision": 3 })).unwrap();
     let response: Value =
         serde_json::from_str(&config_rollback_route(body.as_bytes(), &state).unwrap()).unwrap();
     assert_eq!(response["ok"], true);
@@ -3406,11 +3455,18 @@ fn config_rollback_route_restores_previous_revision() {
     );
 
     // 不存在的目标版本 → config_revision_not_found。
-    let body = serde_json::to_string(&json!({ "revision": 99 })).unwrap();
+    let body = serde_json::to_string(&json!({ "revision": 99, "baseRevision": 4 })).unwrap();
     let response: Value =
         serde_json::from_str(&config_rollback_route(body.as_bytes(), &state).unwrap()).unwrap();
     assert_eq!(response["ok"], false);
     assert_eq!(response["code"], "config_revision_not_found");
+
+    // 旧页面基于过期 revision 发起回滚时必须冲突，不能覆盖新配置。
+    let body = serde_json::to_string(&json!({ "revision": 2, "baseRevision": 3 })).unwrap();
+    let response: Value =
+        serde_json::from_str(&config_rollback_route(body.as_bytes(), &state).unwrap()).unwrap();
+    assert_eq!(response["ok"], false);
+    assert_eq!(response["code"], "config_conflict");
 }
 
 #[test]

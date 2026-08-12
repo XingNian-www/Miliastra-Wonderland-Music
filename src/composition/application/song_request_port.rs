@@ -69,6 +69,13 @@ impl SongRequestPort for ApplicationRuntime {
             .map_err(anyhow::Error::from)
     }
 
+    fn preload_track(&self, track: &PlayableTrack) -> Result<()> {
+        self.playback
+            .native_playback
+            .preload(track.clone())
+            .map_err(anyhow::Error::from)
+    }
+
     fn player_status(&self) -> Result<PlayerStatus> {
         self.playback.player.status()
     }

@@ -1,8 +1,7 @@
 //! 本地 HTTP 代理服务器：把缓存内容以 HTTP 流喂给解码器。
 //!
 //! - 完整文件：标准 `200`/`206` + Content-Length，支持 Range。
-//! - 下载中：`200` + `Transfer-Encoding: chunked` 边下边播；
-//!   Range 起点尚未下载到位时等待下载推进（`seek_wait_timeout`）。
+//! - 下载中：无 Range 时以 `200` + chunked 边下边播；非零 Range 返回 `416`。
 //! - 仅监听 127.0.0.1，只处理 GET `/audio/{hash}`。
 
 use std::sync::Arc;
@@ -141,6 +140,15 @@ async fn handle_connection(inner: Arc<CacheInner>, mut stream: TcpStream) -> std
     };
     match view {
         DownloadView::Complete { bytes } => {
+            let store = inner.metadata_store.clone();
+            let hit_hash = hash.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let store = super::lock_metadata_store(&store);
+                if let Err(error) = store.record_cache_hit(&hit_hash) {
+                    log::warn!("音频缓存命中统计写入失败: {error}");
+                }
+            })
+            .await;
             serve_complete(
                 &inner,
                 &mut stream,
@@ -326,12 +334,10 @@ async fn serve_streaming(
     _range_end: Option<u64>,
 ) -> std::io::Result<()> {
     let start = range_start.unwrap_or(0);
+    // 未完成流无法给出总长和合法 Content-Range；绝不能返回 200 却从非零偏移发送。
     if start > 0 {
-        let reached = wait_for_bytes(handle, start as usize, inner.config.seek_wait_timeout).await;
-        if !reached {
-            write_range_not_satisfiable(stream, None).await?;
-            return Ok(());
-        }
+        write_range_not_satisfiable(stream, None).await?;
+        return Ok(());
     }
     let head = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
     stream.write_all(head.as_bytes()).await?;

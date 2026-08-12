@@ -10,10 +10,11 @@
 - [谁是卧底](undercover.md)：报名、发言、投票和词库配置。
 - [Web 面板使用](web-tools.md)：本地网页、远程控制和高级工具。
 
-## 配置示例
+## 配置说明
 
-- `config.yaml`：主程序配置。
-- `turtle_soup.example.yaml`：海龟汤题库格式示例。
-- `undercover.example.yaml`：谁是卧底词库格式示例。
+- 功能配置统一保存在数据库 `deps/data/playback.sqlite3` 中，通过 Web 面板「配置中心」页面查看与修改（见 [Web 面板使用](web-tools.md)）。
+- `config.yaml` 只保留启动引导三段：`database_path`、`http`、`logging`。
+- `turtle_soup.example.yaml`：海龟汤题库格式示例（内容数据仍是文件）。
+- `undercover.example.yaml`：谁是卧底词库格式示例（内容数据仍是文件）。
 
 如果只想运行点歌功能，使用默认配置即可；娱乐玩法和 AI 功能可以按需开启。

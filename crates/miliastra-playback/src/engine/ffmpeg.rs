@@ -625,6 +625,7 @@ fn handle_command(
             song_key,
             stream,
             end_behavior,
+            seek_seconds,
         } => {
             let session = SessionRef {
                 session_id,
@@ -658,7 +659,7 @@ fn handle_command(
                 session,
                 stream,
                 end_behavior,
-                seek_seconds: None,
+                seek_seconds,
             });
             state.playback_committed = false;
             state.position_base_seconds = None;
@@ -2030,6 +2031,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn start_keeps_the_restored_seek_position_for_the_next_launch() {
+        // 新会话（generation 2）以恢复起始位置起播：Start 命令的 seek_seconds
+        // 必须进入 pending_launch，让下一次解码尝试从该进度续播。
+        let new_session = SessionRef {
+            session_id: Uuid::new_v4(),
+            generation: 2,
+        };
+        let mut state = active_state(
+            SessionRef {
+                session_id: Uuid::new_v4(),
+                generation: 1,
+            },
+            EngineState::Playing,
+        );
+        state.retiring_workers.push(ActiveWorker {
+            identity: AttemptIdentity {
+                id: 1,
+                session: new_session,
+            },
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            task: tokio::spawn(async {}),
+        });
+        let output = output();
+        let (snapshots, _) = watch::channel(PlaybackSnapshot::default());
+        let (events, _) = mpsc::unbounded_channel();
+
+        handle_command(
+            EngineCommand::Start {
+                session_id: new_session.session_id,
+                generation: new_session.generation,
+                song_key: SongKey::new("bilibili", "BV1us411d75p").unwrap(),
+                stream: stream(),
+                end_behavior: EndBehavior::NotifyController,
+                seek_seconds: Some(37.0),
+            },
+            &mut state,
+            &snapshots,
+            &output,
+            &events,
+        )
+        .unwrap();
+
+        assert_eq!(state.snapshot.state, EngineState::Loading);
+        assert_eq!(
+            state
+                .pending_launch
+                .as_ref()
+                .and_then(|launch| launch.seek_seconds),
+            Some(37.0)
+        );
+        assert!(state.active_worker.is_none());
+    }
+
+    #[tokio::test]
     async fn repeated_stream_failure_can_refresh_from_the_known_restart_position() {
         let session = SessionRef {
             session_id: Uuid::new_v4(),
@@ -2160,6 +2215,7 @@ mod tests {
                 song_key: SongKey::new("bilibili", "BV1us411d75p").unwrap(),
                 stream: stream(),
                 end_behavior: EndBehavior::NotifyController,
+                seek_seconds: None,
             },
             &mut state,
             &snapshots,
@@ -2272,6 +2328,7 @@ mod tests {
                     expires_at_epoch_ms: None,
                 },
                 end_behavior: EndBehavior::NotifyController,
+                seek_seconds: None,
             })
             .await
             .unwrap();

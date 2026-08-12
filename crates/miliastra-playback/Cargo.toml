@@ -19,6 +19,7 @@ num-bigint = "0.4"
 rand = "0.8"
 reqwest = { workspace = true, features = ["form", "json", "query", "rustls"] }
 rsa = { version = "0.9", features = ["pem", "sha2"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = "0.10"

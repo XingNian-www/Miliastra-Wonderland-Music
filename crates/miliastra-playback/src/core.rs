@@ -21,6 +21,7 @@ use crate::domain::{
 use crate::engine::{AudioEngine, EngineCommand, EngineError};
 use crate::login::LoginCoordinator;
 use crate::lyrics::TimedLyrics;
+use crate::model::TrackMetadata;
 
 /// resolve 结果缓存最大条目数；超出后淘汰最旧条目。
 const RESOLVE_CACHE_MAX_ENTRIES: usize = 8;
@@ -232,9 +233,15 @@ impl PlaybackCore {
     }
 
     /// 把音源改写为本地代理地址（若启用了音频缓存）。
-    async fn route_stream(&self, song_key: &SongKey, stream: StreamSource) -> StreamSource {
+    /// 曲目元数据（若有）随 rewrite 一并注册到缓存条目。
+    async fn route_stream(
+        &self,
+        song_key: &SongKey,
+        metadata: Option<&TrackMetadata>,
+        stream: StreamSource,
+    ) -> StreamSource {
         match &self.audio_cache {
-            Some(cache) => cache.rewrite(song_key, stream).await,
+            Some(cache) => cache.rewrite(song_key, metadata, stream).await,
             None => stream,
         }
     }
@@ -342,33 +349,61 @@ impl PlaybackCore {
         resolver_locator: Option<ResolverLocator>,
         end_behavior: EndBehavior,
     ) -> Result<StartReceipt, PlaybackCoreError> {
-        self.play_inner(song_key, resolver_locator, end_behavior, None)
-            .await
+        self.play_inner(
+            song_key,
+            resolver_locator,
+            None,
+            end_behavior,
+            None,
+            true,
+            None,
+        )
+        .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn play_cancellable(
         &self,
         song_key: SongKey,
         resolver_locator: Option<ResolverLocator>,
+        metadata: Option<&TrackMetadata>,
         end_behavior: EndBehavior,
         cancellation: oneshot::Receiver<()>,
+        requested: bool,
+        seek_seconds: Option<f64>,
     ) -> Result<StartReceipt, PlaybackCoreError> {
-        self.play_inner(song_key, resolver_locator, end_behavior, Some(cancellation))
-            .await
+        self.play_inner(
+            song_key,
+            resolver_locator,
+            metadata,
+            end_behavior,
+            Some(cancellation),
+            requested,
+            seek_seconds,
+        )
+        .await
     }
 
     /// 预加载音源：提前完成网络解析并写入缓存，`play` 时可跳过等待。
     ///
     /// 启用音频缓存时同时注册条目并主动下载音频数据：下一首播放时
-    /// 直接从磁盘服务，避免起播等待源站。只解析不启动引擎；失败时
-    /// 静默返回错误（播放路径会重新解析）。
+    /// 直接从磁盘服务，避免起播等待源站。曲目元数据（若有）随
+    /// rewrite 一并写入缓存条目。只解析不启动引擎；失败时静默返回
+    /// 错误（播放路径会重新解析）。
     pub async fn preload(
         &self,
         song_key: SongKey,
         resolver_locator: Option<ResolverLocator>,
+        metadata: Option<&TrackMetadata>,
     ) -> Result<(), PlaybackCoreError> {
         if self.cached_stream(&song_key).is_some() {
             tracing::debug!(key = %song_key, "音源已在缓存中，跳过预加载");
+            return Ok(());
+        }
+        // 磁盘缓存优先：完整文件已落盘时直接注册本地代理，不调用 provider resolve。
+        if let Some(stream) = self.disk_complete_stream(&song_key, metadata).await {
+            tracing::debug!(key = %song_key, "磁盘缓存命中，跳过预加载解析");
+            self.cache_stream(song_key.clone(), stream);
             return Ok(());
         }
         let stream = self
@@ -377,7 +412,7 @@ impl PlaybackCore {
         self.cache_stream(song_key.clone(), stream.clone());
         // 音频数据预下载：播放时直接命中本地文件（下载失败静默，播放时走正常下载）。
         if let Some(cache) = &self.audio_cache {
-            cache.rewrite(&song_key, stream).await;
+            cache.rewrite(&song_key, metadata, stream).await;
             if cache.prefetch(&song_key).await {
                 tracing::debug!(key = %song_key, "音频数据已开始预下载");
             }
@@ -418,12 +453,29 @@ impl PlaybackCore {
         cache.put(key, stream, unix_epoch_ms());
     }
 
+    /// 磁盘完整缓存命中：注册本地代理条目并返回代理音源；未命中返回 None。
+    /// 命中时不调用 provider resolve，源 URL 可不存在（代理直接服务磁盘文件）。
+    async fn disk_complete_stream(
+        &self,
+        song_key: &SongKey,
+        metadata: Option<&TrackMetadata>,
+    ) -> Option<StreamSource> {
+        match &self.audio_cache {
+            Some(cache) => cache.proxy_for_complete(song_key, metadata).await,
+            None => None,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn play_inner(
         &self,
         song_key: SongKey,
         resolver_locator: Option<ResolverLocator>,
+        metadata: Option<&TrackMetadata>,
         end_behavior: EndBehavior,
         mut cancellation: Option<oneshot::Receiver<()>>,
+        requested: bool,
+        seek_seconds: Option<f64>,
     ) -> Result<StartReceipt, PlaybackCoreError> {
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let session_id = Uuid::new_v4();
@@ -438,41 +490,49 @@ impl PlaybackCore {
                 ));
             }
         }
-        let adapter = self
-            .catalog
-            .get(&song_key.source)
-            .ok_or_else(|| PlaybackCoreError::UnknownSource(song_key.source.clone()))?;
         let stream = match self.cached_stream(&song_key) {
             Some(cached) => {
                 tracing::debug!(key = %song_key, "播放音源缓存命中，跳过网络解析");
                 cached
             }
             None => {
-                let resolved = {
-                    let resolve = timeout(
-                        self.source_timeout,
-                        adapter.resolve(&song_key, resolver_locator.as_ref()),
-                    );
-                    tokio::pin!(resolve);
-                    match cancellation.as_mut() {
-                        Some(cancellation) => {
-                            tokio::select! {
-                                biased;
-                                _ = cancellation => return Err(PlaybackCoreError::Cancelled),
-                                resolved = &mut resolve => resolved,
+                // 磁盘缓存优先：完整文件已落盘时直接注册本地代理并返回代理音源，
+                // 不调用 provider resolve（断网/源站不可用也能播）。
+                if let Some(stream) = self.disk_complete_stream(&song_key, metadata).await {
+                    tracing::debug!(key = %song_key, "磁盘缓存命中，跳过网络解析");
+                    self.cache_stream(song_key.clone(), stream.clone());
+                    stream
+                } else {
+                    let adapter = self
+                        .catalog
+                        .get(&song_key.source)
+                        .ok_or_else(|| PlaybackCoreError::UnknownSource(song_key.source.clone()))?;
+                    let resolved = {
+                        let resolve = timeout(
+                            self.source_timeout,
+                            adapter.resolve(&song_key, resolver_locator.as_ref()),
+                        );
+                        tokio::pin!(resolve);
+                        match cancellation.as_mut() {
+                            Some(cancellation) => {
+                                tokio::select! {
+                                    biased;
+                                    _ = cancellation => return Err(PlaybackCoreError::Cancelled),
+                                    resolved = &mut resolve => resolved,
+                                }
                             }
+                            None => resolve.await,
                         }
-                        None => resolve.await,
-                    }
-                };
-                let stream = resolved.map_err(|_| {
-                    PlaybackCoreError::Catalog(CatalogError::TimedOut(song_key.source.clone()))
-                })??;
-                self.cache_stream(song_key.clone(), stream.clone());
-                stream
+                    };
+                    let stream = resolved.map_err(|_| {
+                        PlaybackCoreError::Catalog(CatalogError::TimedOut(song_key.source.clone()))
+                    })??;
+                    self.cache_stream(song_key.clone(), stream.clone());
+                    stream
+                }
             }
         };
-        let stream = self.route_stream(&song_key, stream).await;
+        let stream = self.route_stream(&song_key, metadata, stream).await;
 
         if self.generation.load(Ordering::SeqCst) != generation {
             return Err(PlaybackCoreError::Engine(EngineError::Rejected(
@@ -491,6 +551,7 @@ impl PlaybackCore {
                 song_key: song_key.clone(),
                 stream,
                 end_behavior,
+                seek_seconds,
             });
             tokio::pin!(start);
             match cancellation.as_mut() {
@@ -512,7 +573,14 @@ impl PlaybackCore {
         };
         start_result?;
 
-        self.spawn_stream_retry(session_id, generation, song_key, resolver_locator);
+        self.spawn_playback_statistics(session_id, generation, song_key.clone(), requested);
+        self.spawn_stream_retry(
+            session_id,
+            generation,
+            song_key,
+            resolver_locator,
+            metadata.cloned(),
+        );
 
         Ok(StartReceipt {
             session_id,
@@ -747,15 +815,85 @@ impl PlaybackCore {
         Ok(requested_sources(&self.catalog, requested))
     }
 
+    /// 观察真实引擎状态并写统计。首次 Playing 记一次播放；最终 Failed 才记失败。
+    /// 流重试的瞬时 Failed 会继续变化，因此延迟一个短窗口后复查当前会话；SQL 围栏
+    /// 再保证重复快照、并发观察者只计一次。换代或 session 不符立即退出。
+    fn spawn_playback_statistics(
+        &self,
+        session_id: Uuid,
+        generation: u64,
+        song_key: SongKey,
+        requested: bool,
+    ) {
+        let Some(cache) = self.audio_cache.clone() else {
+            return;
+        };
+        let engine = self.engine.clone();
+        let latest_generation = self.generation.clone();
+        tokio::spawn(async move {
+            let mut snapshots = engine.subscribe();
+            loop {
+                if !generation_is_latest(&latest_generation, generation) {
+                    return;
+                }
+                let snapshot = snapshots.borrow_and_update().clone();
+                if snapshot.generation > generation
+                    || (snapshot.generation == generation
+                        && snapshot.session_id.is_some()
+                        && snapshot.session_id != Some(session_id))
+                {
+                    return;
+                }
+                if snapshot.generation == generation && snapshot.session_id == Some(session_id) {
+                    match snapshot.state {
+                        EngineState::Playing => {
+                            cache
+                                .record_play(&song_key, session_id, generation, requested)
+                                .await;
+                        }
+                        EngineState::Failed => {
+                            tokio::time::sleep(Duration::from_millis(750)).await;
+                            let current = engine.subscribe().borrow().clone();
+                            if generation_is_latest(&latest_generation, generation)
+                                && current.generation == generation
+                                && current.session_id == Some(session_id)
+                                && current.state == EngineState::Failed
+                            {
+                                let code = current
+                                    .failure
+                                    .as_ref()
+                                    .map(|failure| failure.code.as_str())
+                                    .unwrap_or_else(|| {
+                                        end_cause_failure_code(current.last_end_cause)
+                                    });
+                                cache
+                                    .record_failure(&song_key, session_id, generation, code)
+                                    .await;
+                                return;
+                            }
+                        }
+                        EngineState::Stopped => return,
+                        _ => {}
+                    }
+                }
+                if snapshots.changed().await.is_err() {
+                    return;
+                }
+            }
+        });
+    }
+
     /// 流类失败（StreamRejected/DecodeFailure）后自动重试：
     /// 第一轮重新解析音源并走缓存代理（缓存优先）；
     /// 第一轮刷新后仍失败，第二轮清除缓存并直连源站（跳过缓存）。
+    /// 曲目元数据（若有）随两轮 rewrite/写回一并注册到缓存条目。
     fn spawn_stream_retry(
         &self,
         session_id: Uuid,
         generation: u64,
         song_key: SongKey,
         resolver_locator: Option<ResolverLocator>,
+        metadata: Option<TrackMetadata>,
     ) {
         let catalog = self.catalog.clone();
         let engine = self.engine.clone();
@@ -787,7 +925,7 @@ impl PlaybackCore {
             }
             // 第一轮重试音源同样改写为本地代理地址，保证与初始播放走同一缓存条目。
             let stream = match &audio_cache {
-                Some(cache) => cache.rewrite(&song_key, stream).await,
+                Some(cache) => cache.rewrite(&song_key, metadata.as_ref(), stream).await,
                 None => stream,
             };
             if let Err(error) = engine
@@ -848,6 +986,7 @@ impl PlaybackCore {
                     latest_generation,
                     song_key,
                     stream,
+                    metadata,
                     generation,
                     session_id,
                 );
@@ -858,12 +997,14 @@ impl PlaybackCore {
 
 /// 直连播放成功后把音源写回缓存：观察会话进入 Playing → rewrite 注册 → 主动下载。
 /// 播放失败/会话结束/超时则放弃（下次播放走正常缓存路径重新下载）。
+#[allow(clippy::too_many_arguments)]
 fn spawn_cache_prefetch(
     cache: crate::cache::AudioCache,
     engine: Arc<dyn AudioEngine>,
     latest_generation: Arc<AtomicU64>,
     song_key: SongKey,
     stream: StreamSource,
+    metadata: Option<TrackMetadata>,
     generation: u64,
     session_id: Uuid,
 ) {
@@ -879,7 +1020,7 @@ fn spawn_cache_prefetch(
         {
             return;
         }
-        cache.rewrite(&song_key, stream).await;
+        cache.rewrite(&song_key, metadata.as_ref(), stream).await;
         if cache.prefetch(&song_key).await {
             tracing::info!("直连播放成功后已写回音频缓存: {song_key}");
         }
@@ -1004,6 +1145,16 @@ async fn resolve_stream_retry(
 
 fn generation_is_latest(latest_generation: &AtomicU64, generation: u64) -> bool {
     latest_generation.load(Ordering::SeqCst) == generation
+}
+
+fn end_cause_failure_code(cause: Option<EndCause>) -> &'static str {
+    match cause {
+        Some(EndCause::StreamRejected) => "stream_rejected",
+        Some(EndCause::DecodeFailure) => "decode_failure",
+        Some(EndCause::RecoveryPositionUnknown) => "recovery_position_unknown",
+        Some(EndCause::EngineExited) => "engine_exited",
+        _ => "playback_failed",
+    }
 }
 
 /// 当前快照是否仍是「本会话的流类失败」状态（RefreshStream 前检查用）。
@@ -1441,13 +1592,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn play_cancellable_forwards_the_restored_seek_position_to_engine_start() {
+        let (core, engine) = core(vec![(
+            "qq".to_owned(),
+            Arc::new(FakeSource {
+                songs: Vec::new(),
+                fail_search: false,
+            }),
+        )]);
+        // 保持取消发送端存活：Sender 被 drop 会立即触发取消信号。
+        let (_cancellation_tx, cancellation) = tokio::sync::oneshot::channel::<()>();
+
+        let receipt = core
+            .play_cancellable(
+                SongKey::new("qq", "song-1").unwrap(),
+                None,
+                None,
+                EndBehavior::NotifyController,
+                cancellation,
+                true,
+                Some(42.5),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(receipt.generation, 1);
+        // 恢复起始位置必须随 Start 命令到达引擎：新会话从该进度续播。
+        let commands = engine.commands.lock().unwrap();
+        assert!(matches!(
+            commands.as_slice(),
+            [EngineCommand::Start { seek_seconds: Some(seek), .. }]
+                if (*seek - 42.5).abs() < 1e-9
+        ));
+    }
+
+    #[tokio::test]
     async fn preload_then_play_uses_cached_resolve() {
         let (source, calls) = counting_source(None);
         let (core, _) = core(vec![("qq".to_owned(), source)]);
         let key = SongKey::new("qq", "song-1").unwrap();
 
-        core.preload(key.clone(), None).await.unwrap();
-        core.preload(key.clone(), None).await.unwrap();
+        core.preload(key.clone(), None, None).await.unwrap();
+        core.preload(key.clone(), None, None).await.unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
         core.play(key.clone(), None, EndBehavior::NotifyController)
@@ -1494,7 +1680,7 @@ mod tests {
 
         for index in 0..(RESOLVE_CACHE_MAX_ENTRIES + 2) {
             let key = SongKey::new("qq", format!("song-{index}").as_str()).unwrap();
-            core.preload(key, None).await.unwrap();
+            core.preload(key, None, None).await.unwrap();
         }
         assert_eq!(calls.load(Ordering::SeqCst), RESOLVE_CACHE_MAX_ENTRIES + 2);
 
@@ -2023,6 +2209,7 @@ mod tests {
         let cache = crate::cache::AudioCache::spawn(crate::cache::AudioCacheConfig {
             enabled: true,
             directory: directory.clone(),
+            metadata_directory: directory.join("index"),
             max_bytes: 64 * 1024 * 1024,
             max_concurrent_downloads: 2,
             request_timeout: Duration::from_secs(15),
@@ -2051,7 +2238,7 @@ mod tests {
         let key = SongKey::new("fake", "preload-1").unwrap();
 
         // 预加载：注册缓存条目并主动下载音频数据。
-        core.preload(key.clone(), None).await.unwrap();
+        core.preload(key.clone(), None, None).await.unwrap();
 
         // 播放：Start 命令的音源是本地代理地址，数据已由预加载下载完成。
         let _receipt = core
@@ -2082,6 +2269,174 @@ mod tests {
             1,
             "预下载已完成，播放不应再访问源站"
         );
+
+        cache.shutdown().await;
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// resolver 恒失败的假音源：验证磁盘缓存优先路径不依赖 provider。
+    struct FailingResolveSource {
+        resolve_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl SourceAdapter for FailingResolveSource {
+        async fn search(
+            &self,
+            _spec: &SearchSpec,
+        ) -> Result<Vec<ProviderSearchCandidate>, CatalogError> {
+            Ok(Vec::new())
+        }
+
+        async fn resolve(
+            &self,
+            _key: &SongKey,
+            _locator: Option<&ResolverLocator>,
+        ) -> Result<StreamSource, CatalogError> {
+            self.resolve_calls.fetch_add(1, Ordering::SeqCst);
+            Err(CatalogError::Transient("源站离线".to_owned()))
+        }
+    }
+
+    /// 重启后进程内 resolve_cache 为空：磁盘已有 `.complete` 文件时，
+    /// 直接注册本地代理条目并返回代理音源，不调用 provider resolve；
+    /// resolver 失败时仍可播放，代理直接服务磁盘完整文件。
+    #[tokio::test]
+    async fn disk_complete_cache_plays_when_resolver_fails() {
+        let directory = std::env::temp_dir().join(format!(
+            "miliastra-core-disk-complete-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        let cache = crate::cache::AudioCache::spawn(crate::cache::AudioCacheConfig {
+            enabled: true,
+            directory: directory.clone(),
+            metadata_directory: directory.join("index"),
+            max_bytes: 64 * 1024 * 1024,
+            max_concurrent_downloads: 2,
+            request_timeout: Duration::from_secs(15),
+            seek_wait_timeout: Duration::from_secs(5),
+            max_registry_entries: 16,
+        })
+        .await
+        .expect("缓存启动");
+
+        // 磁盘预置上次运行遗留的完整缓存文件；源 URL 不存在（无任何可达源站）。
+        let key = SongKey::new("fake", "disk-1").unwrap();
+        let hash = crate::cache::cache_key_hash(&key);
+        let body: Vec<u8> = vec![9u8; 4096];
+        std::fs::write(directory.join(format!("{hash}.complete")), &body).unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let source = Arc::new(FailingResolveSource {
+            resolve_calls: calls.clone(),
+        });
+        let (snapshot_tx, snapshot) = watch::channel(PlaybackSnapshot::default());
+        let engine = Arc::new(RecordingEngine {
+            commands: Mutex::new(Vec::new()),
+            snapshot_tx,
+            snapshot,
+            refresh_fails_after: false,
+        });
+        let core = PlaybackCore::new(
+            SourceCatalog::new([("fake".to_owned(), source.clone() as Arc<dyn SourceAdapter>)]),
+            engine.clone(),
+            Duration::from_secs(1),
+        )
+        .with_audio_cache(cache.clone());
+
+        // resolver 失败，但磁盘完整文件存在：播放必须成功。
+        let _receipt = core
+            .play(key.clone(), None, EndBehavior::NotifyController)
+            .await
+            .unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "磁盘命中不得调用 provider resolve"
+        );
+
+        // Start 命令的音源是本地代理地址，且代理直接服务磁盘完整文件。
+        let proxy_url = {
+            let commands = engine.commands.lock().unwrap();
+            let EngineCommand::Start { stream, .. } = &commands[0] else {
+                panic!("expected start command");
+            };
+            assert!(
+                stream.url.as_str().starts_with("http://127.0.0.1:"),
+                "播放音源应改写为本地代理: {}",
+                stream.url
+            );
+            stream.url.clone()
+        };
+        let data = reqwest::get(proxy_url)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(&data[..], &body[..]);
+
+        cache.shutdown().await;
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// 预加载同样磁盘优先：完整文件已落盘时跳过 provider resolve。
+    #[tokio::test]
+    async fn preload_prefers_disk_complete_when_resolver_fails() {
+        let directory = std::env::temp_dir().join(format!(
+            "miliastra-core-preload-disk-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        let cache = crate::cache::AudioCache::spawn(crate::cache::AudioCacheConfig {
+            enabled: true,
+            directory: directory.clone(),
+            metadata_directory: directory.join("index"),
+            max_bytes: 64 * 1024 * 1024,
+            max_concurrent_downloads: 2,
+            request_timeout: Duration::from_secs(15),
+            seek_wait_timeout: Duration::from_secs(5),
+            max_registry_entries: 16,
+        })
+        .await
+        .expect("缓存启动");
+
+        let key = SongKey::new("fake", "preload-disk-1").unwrap();
+        let hash = crate::cache::cache_key_hash(&key);
+        std::fs::write(directory.join(format!("{hash}.complete")), vec![3u8; 1024]).unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let source = Arc::new(FailingResolveSource {
+            resolve_calls: calls.clone(),
+        });
+        let (snapshot_tx, snapshot) = watch::channel(PlaybackSnapshot::default());
+        let engine = Arc::new(RecordingEngine {
+            commands: Mutex::new(Vec::new()),
+            snapshot_tx,
+            snapshot,
+            refresh_fails_after: false,
+        });
+        let core = PlaybackCore::new(
+            SourceCatalog::new([("fake".to_owned(), source.clone() as Arc<dyn SourceAdapter>)]),
+            engine.clone(),
+            Duration::from_secs(1),
+        )
+        .with_audio_cache(cache.clone());
+
+        // 预加载命中磁盘：不调用 provider resolve。
+        core.preload(key.clone(), None, None).await.unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "预加载磁盘命中不得调用 provider resolve"
+        );
+
+        // 预加载后播放同样命中（resolve_cache 已写入代理音源）。
+        core.play(key, None, EndBehavior::NotifyController)
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
 
         cache.shutdown().await;
         let _ = std::fs::remove_dir_all(&directory);
@@ -2139,6 +2494,7 @@ mod tests {
         let cache = crate::cache::AudioCache::spawn(crate::cache::AudioCacheConfig {
             enabled: true,
             directory: directory.clone(),
+            metadata_directory: directory.join("index"),
             max_bytes: 64 * 1024 * 1024,
             max_concurrent_downloads: 2,
             request_timeout: Duration::from_secs(15),

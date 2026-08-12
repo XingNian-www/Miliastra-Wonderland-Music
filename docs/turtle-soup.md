@@ -1,6 +1,6 @@
 # 海龟汤
 
-海龟汤是默认关闭的大厅娱乐玩法。开启前请准备题库文件，并在 `config.yaml` 的 `turtle_soup.enabled` 中启用。
+海龟汤是默认关闭的大厅娱乐玩法。开启前请准备题库文件，并在配置中心把 `turtle_soup.enabled` 设为 `true`。
 
 ## 游戏命令
 
@@ -26,7 +26,7 @@
 
 ## 题库
 
-复制 `turtle_soup.example.yaml` 为 `turtle_soup.yaml`，按示例填写：
+题库是内容数据文件（不是功能配置）。复制发布包中的 `deps/docs/turtle_soup.example.yaml` 为 `deps/turtle_soup.yaml`，按示例填写：
 
 ```yaml
 题目:
@@ -38,11 +38,11 @@
     启用: true
 ```
 
-题目 ID 不能重复，关键字段不能为空。每次选中的题目会记录到 `turtle_soup.used_state_path`，之后不会再次随机选中；需要重新使用时，请在停止程序后手动处理使用记录。
+题目 ID 不能重复，关键字段不能为空。每次选中的题目会记录到配置中心 `turtle_soup.used_state_path` 指定的文件，之后不会再次随机选中；需要重新使用时，请在停止程序后手动处理使用记录。
 
 ## AI 配置
 
-海龟汤使用独立的 `turtle_soup.ai` 配置，不会复用点歌 AI：
+海龟汤使用独立的 `turtle_soup.ai` 配置，不会复用点歌 AI。该段在配置中心 `turtle_soup` 段中修改，字段结构如下（示意）：
 
 ```yaml
 turtle_soup:

@@ -37,15 +37,27 @@ pub(crate) fn format_status(status: &PlayerStatus) -> String {
     let title = optional_song_title(&status.name, &status.singer);
     let progress = format_seconds(status.progress);
     let duration = format_seconds(status.duration);
+    let state = match status.status.as_str() {
+        "playing" => "播放",
+        "paused" => "暂停",
+        "stopped" => "停止",
+        _ => "未知",
+    };
+    let requester = status.requester.trim();
+    let requester = if requester.is_empty() {
+        String::new()
+    } else {
+        format!("  {requester}")
+    };
     if title.is_empty() {
         format!(
-            "状态: {} ({}/{}) 音量{}",
-            status.status, progress, duration, status.volume
+            "{}:({}/{}) 音量{}{}",
+            state, progress, duration, status.volume, requester
         )
     } else {
         format!(
-            "状态: {} {} ({}/{}) 音量{}",
-            status.status, title, progress, duration, status.volume
+            "{}:{} ({}/{}) 音量{}{}",
+            state, title, progress, duration, status.volume, requester
         )
     }
 }
@@ -98,4 +110,47 @@ pub(super) fn format_time(value: f64) -> String {
     }
     let total = value.floor() as i64;
     format!("{}:{:02}", total / 60, total % 60)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PlayerStatus, format_status};
+
+    #[test]
+    fn status_uses_chinese_state_and_includes_requester() {
+        let status = PlayerStatus {
+            status: "playing".to_string(),
+            name: "测试歌曲".to_string(),
+            singer: "测试歌手".to_string(),
+            progress: 65.0,
+            duration: 185.0,
+            volume: 80,
+            requester: "点歌人".to_string(),
+            ..PlayerStatus::default()
+        };
+        assert_eq!(
+            format_status(&status),
+            "播放:测试歌曲 - 测试歌手 (1:05/3:05) 音量80  点歌人"
+        );
+    }
+
+    #[test]
+    fn status_maps_all_transport_states_and_omits_empty_requester() {
+        for (raw, expected) in [
+            ("playing", "播放"),
+            ("paused", "暂停"),
+            ("stopped", "停止"),
+            ("unknown", "未知"),
+            ("other", "未知"),
+        ] {
+            let status = PlayerStatus {
+                status: raw.to_string(),
+                ..PlayerStatus::default()
+            };
+            assert_eq!(
+                format_status(&status),
+                format!("{expected}:(0:00/0:00) 音量0")
+            );
+        }
+    }
 }

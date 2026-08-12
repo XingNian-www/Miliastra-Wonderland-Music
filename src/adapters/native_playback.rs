@@ -155,28 +155,45 @@ impl PlayerObservationPort for NativePlaybackAdapter {
 
 impl PlayerControlPort for NativePlaybackAdapter {
     fn dispatch(&mut self, control: &PlayerControl) -> ControlDispatch {
-        if let PlayerControl::Play(track) = control {
-            return match self.playback.play(track.clone()) {
-                Ok(operation) => {
-                    let cancellation = self.playback.clone();
-                    ControlDispatch::deferred_with_cancel(
-                        move || match operation.wait() {
-                            Ok(()) => ControlDispatchOutcome::acknowledged("ok"),
-                            Err(error) => dispatch_error(error),
-                        },
-                        move || {
-                            let _ = cancellation.stop();
-                        },
-                    )
-                }
-                Err(error) => ControlDispatch::immediate(dispatch_error(error)),
-            };
+        match control {
+            PlayerControl::Play(track, requested) => {
+                return self
+                    .dispatch_play(self.playback.play_with_origin(track.clone(), *requested));
+            }
+            PlayerControl::PlayRestored(track, seek_seconds) => {
+                return self.dispatch_play(self.playback.play_with_seek(
+                    track.clone(),
+                    false,
+                    *seek_seconds,
+                ));
+            }
+            _ => {}
         }
         let result = match control {
             PlayerControl::Pause => self.playback.pause(),
             PlayerControl::Resume => self.playback.resume(),
             PlayerControl::SetVolume(volume) => {
                 return self.set_volume_smoothed(*volume);
+            }
+            PlayerControl::ToggleLyrics => {
+                return ControlDispatch::immediate(match self.playback.toggle_lyrics() {
+                    Ok(use_translation) => {
+                        ControlDispatchOutcome::acknowledged(if use_translation {
+                            "translation"
+                        } else {
+                            "original"
+                        })
+                    }
+                    Err(error) => dispatch_error(error),
+                });
+            }
+            PlayerControl::SetLyricsTranslation(use_translation) => {
+                return ControlDispatch::immediate(
+                    match self.playback.set_lyrics_translation(*use_translation) {
+                        Ok(()) => ControlDispatchOutcome::acknowledged("ok"),
+                        Err(error) => dispatch_error(error),
+                    },
+                );
             }
             PlayerControl::Next | PlayerControl::Previous => {
                 return ControlDispatch::immediate(ControlDispatchOutcome::not_sent(
@@ -191,12 +208,38 @@ impl PlayerControlPort for NativePlaybackAdapter {
                     },
                 );
             }
-            PlayerControl::Play(_) => unreachable!("play control handled above"),
+            PlayerControl::Play(_, _) | PlayerControl::PlayRestored(_, _) => {
+                unreachable!("play controls are handled above")
+            }
         };
         ControlDispatch::immediate(match result {
             Ok(()) => ControlDispatchOutcome::acknowledged("ok"),
             Err(error) => dispatch_error(error),
         })
+    }
+}
+
+impl NativePlaybackAdapter {
+    /// 把播放操作包装为可取消的延迟派发：操作在后台等待引擎回报，取消时停止会话。
+    fn dispatch_play(
+        &self,
+        operation: Result<miliastra_playback::PlaybackOperation, miliastra_playback::PlaybackError>,
+    ) -> ControlDispatch {
+        match operation {
+            Ok(operation) => {
+                let cancellation = self.playback.clone();
+                ControlDispatch::deferred_with_cancel(
+                    move || match operation.wait() {
+                        Ok(()) => ControlDispatchOutcome::acknowledged("ok"),
+                        Err(error) => dispatch_error(error),
+                    },
+                    move || {
+                        let _ = cancellation.stop();
+                    },
+                )
+            }
+            Err(error) => ControlDispatch::immediate(dispatch_error(error)),
+        }
     }
 }
 

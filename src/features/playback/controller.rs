@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
@@ -14,14 +14,20 @@ use super::state::{
     PlaybackObservation, PlaybackRuntimeState, PlaybackSessionBinding, SessionReconciliation,
 };
 use crate::features::playback::{
-    MatchConfig, PlaybackControllerSnapshot, PlaybackStateUpdate, PlaybackTimingConfig,
-    PlayerStatus, QueueConfig,
+    MatchConfig, PlaybackControllerSnapshot, PlaybackStateUpdate, PlayerStatus,
 };
 use miliastra_kernel::clock::{Clock, WallClock};
 
 pub(crate) trait MusicPlayerBackend: Clone + Send + Sync + 'static {
     fn status(&self) -> Result<PlayerStatus>;
-    fn play(&self, track: &PlayableTrack) -> Result<String>;
+    fn play(&self, track: &PlayableTrack, requested: bool) -> Result<String>;
+    /// 恢复播放：携带起始位置（秒），None 表示从头播放。
+    ///
+    /// 重启恢复活动歌曲时由控制器调用，走新引擎会话；默认实现从头播放，
+    /// 需要 seek 的后端自行覆盖（内置引擎支持从指定进度续播）。
+    fn play_restored(&self, track: &PlayableTrack, _seek_seconds: Option<f64>) -> Result<String> {
+        self.play(track, false)
+    }
     /// Reports a provider-level "this candidate cannot be played" error.
     ///
     /// Backends use this hook to preserve the distinction between a stale or
@@ -39,6 +45,12 @@ pub(crate) trait MusicPlayerBackend: Clone + Send + Sync + 'static {
     #[allow(dead_code)]
     fn previous(&self) -> Result<String>;
     fn set_volume(&self, volume: &str) -> Result<String>;
+    fn toggle_lyrics(&self) -> Result<String>;
+    /// 明确设置歌词是否使用翻译（不等价于切换）：恢复播放时应用持久化模式。
+    /// 默认实现直接成功（后端不支持时无副作用），需要该能力的后端自行覆盖。
+    fn set_lyrics_translation(&self, _use_translation: bool) -> Result<String> {
+        Ok("ok".to_string())
+    }
     /// 清除曲目的音频缓存（播放解码失败后自愈：下次播放重新下载）。
     fn invalidate_audio_cache(&self, _key: &miliastra_playback::TrackKey) -> Result<()> {
         Ok(())
@@ -119,11 +131,15 @@ pub(crate) trait PlaybackStatePort: Clone + Send + Sync + 'static {
 pub(crate) struct PlayerController<B: MusicPlayerBackend, S: PlaybackStatePort> {
     backend: B,
     playback_state: S,
-    timing: PlaybackTimingConfig,
-    queue: QueueConfig,
     matching: MatchConfig,
     clock: Arc<dyn Clock>,
     wall_clock: Arc<dyn WallClock>,
+    /// 热更新共享句柄（阶段 7）：保存成功后由 HTTP 层 apply，运行态读取点
+    /// 从这里取值，不再读启动时 clone 的 AppConfig。
+    queue_protect_current_song: Arc<RwLock<bool>>,
+    queue_external_protect_seconds: Arc<RwLock<u64>>,
+    status_poll_ms: Arc<RwLock<u64>>,
+    monitor_status_ms: Arc<RwLock<u64>>,
     /// 上次空闲续播尝试的墙钟毫秒：播放尝试失败会回到 Idle，冷却窗口内不重复触发，避免热循环。
     /// 用 Arc 共享：控制器副本（worker/任务各自持有）必须看到同一计时器，
     /// 否则副本会无视冷却立即再次触发空闲续播，形成热循环。
@@ -140,11 +156,14 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> Clone for PlayerController<B, 
         Self {
             backend: self.backend.clone(),
             playback_state: self.playback_state.clone(),
-            timing: self.timing.clone(),
-            queue: self.queue.clone(),
             matching: self.matching.clone(),
             clock: self.clock.clone(),
             wall_clock: self.wall_clock.clone(),
+            // 共享句柄：任一副本与 HTTP 层看到同一份热更新值。
+            queue_protect_current_song: self.queue_protect_current_song.clone(),
+            queue_external_protect_seconds: self.queue_external_protect_seconds.clone(),
+            status_poll_ms: self.status_poll_ms.clone(),
+            monitor_status_ms: self.monitor_status_ms.clone(),
             // 共享计时器，而不是拷贝当前值：任一副本写入的时间戳对所有副本可见。
             last_idle_advance_at_ms: self.last_idle_advance_at_ms.clone(),
             engine_failure_at_ms: self.engine_failure_at_ms.clone(),
@@ -286,26 +305,36 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
     pub(crate) fn new(
         backend: B,
         playback_state: S,
-        timing: &PlaybackTimingConfig,
-        queue: &QueueConfig,
         matching: &MatchConfig,
         time: PlaybackTimePorts,
+        live: crate::config::LiveConfigs,
     ) -> Self {
         Self {
             backend,
             playback_state,
-            timing: timing.clone(),
-            queue: queue.clone(),
             matching: matching.clone(),
             clock: time.clock,
             wall_clock: time.wall_clock,
+            queue_protect_current_song: live.queue_protect_current_song,
+            queue_external_protect_seconds: live.queue_external_protect_seconds,
+            status_poll_ms: live.status_poll_ms,
+            monitor_status_ms: live.monitor_status_ms,
             last_idle_advance_at_ms: Arc::new(AtomicU64::new(0)),
             engine_failure_at_ms: Arc::new(AtomicU64::new(0)),
         }
     }
 
     pub(crate) fn status(&self) -> Result<PlayerStatus> {
-        let status = self.backend.status()?;
+        let mut status = self.backend.status()?;
+        let playback = self.playback_state.snapshot()?;
+        if status_matches_active_request(&self.matching, playback.active_request.as_ref(), &status)
+        {
+            status.requester = playback
+                .active_request
+                .as_ref()
+                .map(|request| request.requester.clone())
+                .unwrap_or_default();
+        }
         self.record_observation(&status, classify_observation(&status))?;
         Ok(status)
     }
@@ -375,7 +404,26 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         let requested_at_ms = self.wall_clock.unix_millis();
         let result = self.backend.set_volume(volume);
         self.record_control_outcome("set_volume", requested_at_ms, result.is_ok());
-        result
+        let message = result?;
+        // 设置成功后把音量写入持久化播放状态（SQLite），供重启恢复播放前应用。
+        if let Ok(volume) = volume.trim().parse::<u8>() {
+            self.playback_state
+                .update(PlaybackStateUpdate::Volume(volume))?;
+        }
+        Ok(message)
+    }
+
+    pub(crate) fn toggle_lyrics(&self) -> Result<String> {
+        let requested_at_ms = self.wall_clock.unix_millis();
+        let result = self.backend.toggle_lyrics();
+        self.record_control_outcome("toggle_lyrics", requested_at_ms, result.is_ok());
+        let message = result?;
+        // 切换成功后把歌词模式写入持久化播放状态（SQLite），供重启恢复。
+        if let Some(use_translation) = lyrics_mode_from_message(&message) {
+            self.playback_state
+                .update(PlaybackStateUpdate::LyricsMode(use_translation))?;
+        }
+        Ok(message)
     }
 
     pub(crate) fn is_track_unavailable_error(&self, error: &anyhow::Error) -> bool {
@@ -435,7 +483,11 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         &self,
         status: &PlayerStatus,
     ) -> Result<bool> {
-        if !self.queue.protect_current_song_until_finished {
+        if !*self
+            .queue_protect_current_song
+            .read()
+            .expect("队列当前歌曲保护共享锁已中毒")
+        {
             return Ok(false);
         }
         if let Some(protected) = self.observe_external_playback(status)? {
@@ -497,7 +549,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             .track
             .as_ref()
             .ok_or_else(|| anyhow!("播放请求缺少结构化曲目"))
-            .and_then(|track| self.backend.play(track));
+            .and_then(|track| self.backend.play(track, !request.requester.is_empty()));
         self.record_attempt_outcome(request, attempt.started_at_ms, result.is_ok());
         if let Err(error) = result {
             if let Err(restore_error) = self.restore_failed_attempt(&attempt, "dispatch_failed") {
@@ -564,6 +616,75 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         self.verify_playback_started(request, &mut attempt)
     }
 
+    /// 重启后恢复上次会话的活动歌曲（新引擎会话），返回是否发起了恢复。
+    ///
+    /// 恢复规则：
+    /// - 仅恢复已确认播放（RequestedSongPlaying / PausedByUser）且带结构化曲目的请求；
+    /// - 起始位置采用最后可靠观测进度：非法/负数/距结尾不足 5 秒时从头播放；
+    /// - 恢复前先应用持久化音量（引擎启动默认 100，与上次会话音量可能不同）；
+    /// - 上次会话是用户暂停时，恢复歌曲后立即保持暂停语义。
+    pub(crate) fn play_restored(&self) -> Result<bool> {
+        let runtime = self.playback_state.snapshot()?;
+        let Some(active) = runtime.active_request.clone() else {
+            return Ok(false);
+        };
+        if !matches!(
+            runtime.state,
+            ConfirmedPlaybackState::RequestedSongPlaying | ConfirmedPlaybackState::PausedByUser
+        ) {
+            return Ok(false);
+        }
+        let request = playback_request_from_active(&active);
+        let seek_seconds = restored_seek_seconds(runtime.last_observation.as_ref());
+        let keep_paused = runtime.pause_reason == PauseReason::User;
+        // 恢复前先应用持久化音量：引擎重启后默认 100，必须恢复到上次会话的音量。
+        if let Err(error) = self.backend.set_volume(&runtime.volume.to_string()) {
+            log::warn!("恢复播放前设置音量失败: {error:#}");
+        }
+        let mut attempt = self.begin_playback_attempt(&request)?;
+        let result = request
+            .track
+            .as_ref()
+            .ok_or_else(|| anyhow!("恢复播放请求缺少结构化曲目"))
+            .and_then(|track| self.backend.play_restored(track, seek_seconds));
+        self.record_attempt_outcome(&request, attempt.started_at_ms, result.is_ok());
+        if let Err(error) = result {
+            if let Err(restore_error) = self.restore_failed_attempt(&attempt, "dispatch_failed") {
+                log::error!(
+                    "恢复播放失败且状态恢复也失败: play_error={error:#} restore_error={restore_error:#}"
+                );
+            }
+            return Err(error);
+        }
+        let verification = self.verify_playback_started(&request, &mut attempt)?;
+        // 应用持久化歌词模式：引擎起播默认使用翻译，恢复时必须按上次会话的设置。
+        // 明确设置（非 toggle），引擎加载中的歌词任务完成后按该模式显示。
+        if let Err(error) = self.backend.set_lyrics_translation(runtime.use_translation) {
+            log::warn!("恢复播放后设置歌词模式失败: {error:#}");
+        }
+        // 原用户暂停：歌曲已开始播放，立即暂停以保持用户暂停语义。
+        if keep_paused {
+            match self.backend.pause() {
+                Ok(_) => {
+                    self.playback_state
+                        .update(PlaybackStateUpdate::UserPaused)?;
+                    log::info!("恢复播放后保持用户暂停: uri={}", request.uri());
+                }
+                Err(error) => log::warn!("恢复播放后保持暂停失败: {error:#}"),
+            }
+        }
+        // 恢复会话是新引擎会话：立即绑定，避免监控把新会话误判为 runtime 重启。
+        let PlaybackVerification::Success { status, .. } = &verification;
+        let _ = self.reconcile_player_session(&self.playback_state.snapshot()?, status)?;
+        log::info!(
+            "播放器状态转移: restored uri={} seek={:?} keep_paused={}",
+            request.uri(),
+            seek_seconds,
+            keep_paused
+        );
+        Ok(true)
+    }
+
     pub(crate) fn maybe_advance_queue(
         &self,
         snapshot_status: PlayerStatus,
@@ -593,7 +714,14 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             );
         }
         let guard_active = active_request_guard_active(
-            &self.timing,
+            *self
+                .monitor_status_ms
+                .read()
+                .expect("播放状态校准间隔共享锁已中毒"),
+            *self
+                .status_poll_ms
+                .read()
+                .expect("播放状态查询间隔共享锁已中毒"),
             runtime_snapshot.active_request.as_ref(),
             self.clock.now(),
         );
@@ -858,10 +986,6 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         let Some(active) = runtime.active_request.as_ref() else {
             return Ok(QueueAdvanceDecision::None);
         };
-        if runtime.pause_reason == PauseReason::User {
-            log::info!("播放运行时已重启，但用户暂停仍生效，跳过恢复");
-            return Ok(QueueAdvanceDecision::None);
-        }
         if status.session_id.trim().is_empty()
             && matches!(status.status.as_str(), "stopped" | "idle")
         {
@@ -870,12 +994,9 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
                 "检测到 playback runtime 重启，控制器授权新恢复会话: previous_uri={}",
                 request.uri()
             );
-            match self.play_and_verify(&request) {
-                Ok(PlaybackVerification::Success { status, .. }) => {
-                    let _ =
-                        self.reconcile_player_session(&self.playback_state.snapshot()?, &status)?;
-                    return Ok(QueueAdvanceDecision::PlaybackStateChanged);
-                }
+            match self.play_restored() {
+                Ok(true) => return Ok(QueueAdvanceDecision::PlaybackStateChanged),
+                Ok(false) => return Ok(QueueAdvanceDecision::None),
                 Err(error) => {
                     log::error!("播放运行时重启后的恢复会话无法播放: {error:#}");
                     self.mark_unknown()?;
@@ -1101,7 +1222,12 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             self.clear_external_playback_tracker()?;
             return Ok(None);
         };
-        let protect_after = Duration::from_secs(self.queue.external_playback_protect_after_seconds);
+        let protect_after = Duration::from_secs(
+            *self
+                .queue_external_protect_seconds
+                .read()
+                .expect("外部播放保护时间共享锁已中毒"),
+        );
         let observation = self.playback_state.observe_external_playback(
             identity.clone(),
             self.clock.now(),
@@ -1116,7 +1242,10 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         if observation.protected && !observation.was_protected {
             log::info!(
                 "外部播放已稳定 {}s，加入当前歌曲保护: {}",
-                self.queue.external_playback_protect_after_seconds,
+                *self
+                    .queue_external_protect_seconds
+                    .read()
+                    .expect("外部播放保护时间共享锁已中毒"),
                 identity
             );
         }
@@ -1207,6 +1336,37 @@ fn status_matches_active_request(
         .is_some_and(|(requested, current)| requested.track_ref.key == current.track_ref.key)
 }
 
+/// 恢复起始位置：采用最后可靠观测进度。
+///
+/// 观测缺失、进度非法（NaN/无穷）或为负数、或距结尾不足 5 秒（歌曲即将结束）
+/// 时返回 None，表示从头播放。
+fn restored_seek_seconds(observation: Option<&PlaybackObservation>) -> Option<f64> {
+    let observation = observation?;
+    // 只有可靠观测的进度才能作为续播起点：不可靠观测的进度可能是残留旧值。
+    if observation.reliability != ObservationReliability::Reliable {
+        return None;
+    }
+    let progress = observation.progress;
+    if !progress.is_finite() || progress < 0.0 {
+        return None;
+    }
+    let duration = observation.duration;
+    if duration.is_finite() && duration > 0.0 && duration - progress < 5.0 {
+        return None;
+    }
+    Some(progress)
+}
+
+/// 从歌词切换的回报消息解析当前歌词模式：translation=使用翻译，original=原文。
+/// 后端返回其它格式时返回 None（不持久化，保持原值）。
+fn lyrics_mode_from_message(message: &str) -> Option<bool> {
+    match message {
+        "translation" => Some(true),
+        "original" => Some(false),
+        _ => None,
+    }
+}
+
 fn playback_request_from_active(active_request: &ActivePlaybackRequest) -> PlaybackRequest {
     PlaybackRequest {
         keyword: active_request.keyword.clone(),
@@ -1235,7 +1395,8 @@ fn is_notify_controller_natural_end(status: &PlayerStatus) -> bool {
 }
 
 fn active_request_guard_active(
-    timing: &PlaybackTimingConfig,
+    monitor_status_ms: u64,
+    status_poll_ms: u64,
     active_request: Option<&ActivePlaybackRequest>,
     now: Instant,
 ) -> bool {
@@ -1245,9 +1406,8 @@ fn active_request_guard_active(
     let Some(started_at) = active_request.guard_started_at else {
         return false;
     };
-    let guard_ms = timing
-        .monitor_status_ms
-        .max(timing.status_poll_ms)
+    let guard_ms = monitor_status_ms
+        .max(status_poll_ms)
         .saturating_mul(3)
         .max(3000);
     now.saturating_duration_since(started_at) < Duration::from_millis(guard_ms)
@@ -1505,6 +1665,12 @@ mod tests {
         play_calls: Arc<AtomicU32>,
         play_error: bool,
         pause_error: bool,
+        /// 恢复播放收到的起始位置（None 表示从头播放）。
+        restored_seeks: Arc<Mutex<Vec<Option<f64>>>>,
+        /// 设置音量收到的目标值（字符串原样记录）。
+        set_volumes: Arc<Mutex<Vec<String>>>,
+        /// 明确设置歌词模式收到的值（true=使用翻译）。
+        lyrics_translations: Arc<Mutex<Vec<bool>>>,
     }
 
     impl FakeBackend {
@@ -1516,6 +1682,9 @@ mod tests {
                 play_calls: Arc::new(AtomicU32::new(0)),
                 play_error: false,
                 pause_error: false,
+                restored_seeks: Arc::new(Mutex::new(Vec::new())),
+                set_volumes: Arc::new(Mutex::new(Vec::new())),
+                lyrics_translations: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -1540,7 +1709,7 @@ mod tests {
                 .unwrap_or_default())
         }
 
-        fn play(&self, _track: &PlayableTrack) -> Result<String> {
+        fn play(&self, _track: &PlayableTrack, _requested: bool) -> Result<String> {
             self.play_calls.fetch_add(1, Ordering::Relaxed);
             if self.play_error {
                 return Err(anyhow!("play failed"));
@@ -1569,7 +1738,30 @@ mod tests {
             Ok(String::new())
         }
 
-        fn set_volume(&self, _volume: &str) -> Result<String> {
+        fn set_volume(&self, volume: &str) -> Result<String> {
+            self.set_volumes.lock().unwrap().push(volume.to_string());
+            Ok(String::new())
+        }
+
+        fn toggle_lyrics(&self) -> Result<String> {
+            Ok("translation".to_string())
+        }
+
+        fn play_restored(
+            &self,
+            track: &PlayableTrack,
+            seek_seconds: Option<f64>,
+        ) -> Result<String> {
+            self.restored_seeks.lock().unwrap().push(seek_seconds);
+            // 模拟真实后端语义：恢复播放仍是一次播放派发。
+            self.play(track, false)
+        }
+
+        fn set_lyrics_translation(&self, use_translation: bool) -> Result<String> {
+            self.lyrics_translations
+                .lock()
+                .unwrap()
+                .push(use_translation);
             Ok(String::new())
         }
     }
@@ -1663,27 +1855,11 @@ mod tests {
                 pool_available,
                 confirm_dequeues: Arc::new(Mutex::new(Vec::new())),
             },
-            &test_timing(),
-            &QueueConfig {
-                max_size: 10,
-                protect_current_song_until_finished: true,
-                external_playback_protect_after_seconds: 20,
-                pool_max_size: if pool_available { 200 } else { 0 },
-            },
             &matching,
             PlaybackTimePorts::new(clock, wall_clock),
+            // 测试构造：热更新共享值用默认配置初始化；需要覆盖时直接改写共享值。
+            crate::config::LiveConfigs::from_config(&crate::config::AppConfig::default()),
         )
-    }
-
-    fn test_timing() -> PlaybackTimingConfig {
-        PlaybackTimingConfig {
-            status_poll_ms: 0,
-            monitor_tick_ms: 50,
-            monitor_status_ms: 50,
-            uri_stable_samples: 0,
-            transport_stable_samples: 0,
-            stale_timeout_ms: 5000,
-        }
     }
 
     fn request() -> PlaybackRequest {
@@ -1883,6 +2059,252 @@ mod tests {
         assert_eq!(snapshot.state, "requested_song_playing");
         assert_eq!(snapshot.current_uri, request.uri());
         assert_eq!(snapshot.active_uri, request.uri());
+    }
+
+    /// 构造已确认播放的活动请求（与 Starting 同一 started_at_ms，保持身份稳定）。
+    fn restored_active_request(track: &miliastra_playback::PlayableTrack) -> ActivePlaybackRequest {
+        ActivePlaybackRequest {
+            keyword: "目标".to_string(),
+            source: "qqmusic".to_string(),
+            prefer_accompaniment: false,
+            track: Some(track.clone()),
+            song: "目标歌手".to_string(),
+            title: "目标".to_string(),
+            artist: "歌手".to_string(),
+            requester: String::new(),
+            started_at_ms: 1,
+            ..ActivePlaybackRequest::default()
+        }
+    }
+
+    /// 构造「已确认播放 + 可靠进度观测」的持久化状态，模拟上次会话的活动歌曲。
+    fn enter_confirmed_playing(controller: &PlayerController<FakeBackend, TestPlaybackState>) {
+        let track = test_track("miliastra://track/qqmusic/1", "目标 - 歌手");
+        controller
+            .playback_state
+            .update(PlaybackStateUpdate::Starting {
+                request: restored_active_request(&track),
+                navigation: PlaybackNavigation::Normal,
+            })
+            .unwrap();
+        controller
+            .playback_state
+            .update(PlaybackStateUpdate::Confirmed {
+                request: restored_active_request(&track),
+                navigation: PlaybackNavigation::Normal,
+            })
+            .unwrap();
+        controller
+            .playback_state
+            .update(PlaybackStateUpdate::Observation(PlaybackObservation {
+                status: "playing".to_string(),
+                track: Some(track),
+                title: "目标".to_string(),
+                artist: "歌手".to_string(),
+                progress: 42.0,
+                duration: 180.0,
+                captured_at_ms: 2,
+                reliability: ObservationReliability::Reliable,
+            }))
+            .unwrap();
+    }
+
+    #[test]
+    fn set_volume_persists_the_applied_volume() {
+        let backend = FakeBackend::new(Vec::new());
+        let controller = controller(backend);
+
+        controller.set_volume("70").unwrap();
+
+        // 成功设置音量后必须写入持久化播放状态（SQLite），供重启恢复。
+        assert_eq!(controller.playback_state.snapshot().unwrap().volume, 70);
+        assert_eq!(*controller.backend.set_volumes.lock().unwrap(), ["70"]);
+    }
+
+    #[test]
+    fn toggle_lyrics_persists_the_translation_mode() {
+        let backend = FakeBackend::new(Vec::new());
+        let controller = controller(backend);
+
+        controller.toggle_lyrics().unwrap();
+
+        // 成功切换歌词后必须写入持久化播放状态（SQLite），供重启恢复。
+        assert!(
+            controller
+                .playback_state
+                .snapshot()
+                .unwrap()
+                .use_translation
+        );
+    }
+
+    #[test]
+    fn play_restored_resumes_from_last_reliable_progress_with_persisted_volume() {
+        let backend = FakeBackend::new(Vec::new());
+        let controller = controller(backend);
+        enter_confirmed_playing(&controller);
+        controller
+            .playback_state
+            .update(PlaybackStateUpdate::Volume(55))
+            .unwrap();
+
+        assert!(controller.play_restored().unwrap());
+
+        // 恢复前必须应用持久化音量（引擎重启后默认 100，与上次会话不同）。
+        assert_eq!(*controller.backend.set_volumes.lock().unwrap(), ["55"]);
+        // 恢复播放携带最后可靠进度，从该位置续播而不是整首重播。
+        assert_eq!(
+            *controller.backend.restored_seeks.lock().unwrap(),
+            [Some(42.0)]
+        );
+        // 恢复后应用持久化歌词模式（默认使用翻译）。
+        assert_eq!(
+            *controller.backend.lyrics_translations.lock().unwrap(),
+            [true]
+        );
+        let state = controller.playback_state.snapshot().unwrap();
+        assert_eq!(state.state, ConfirmedPlaybackState::RequestedSongPlaying);
+        assert!(state.active_request.is_some());
+    }
+
+    #[test]
+    fn play_restored_applies_the_persisted_lyrics_mode() {
+        let backend = FakeBackend::new(Vec::new());
+        let controller = controller(backend);
+        enter_confirmed_playing(&controller);
+        // 上次会话关闭了歌词翻译：恢复后必须明确设置为原文，而不是默认的翻译。
+        controller
+            .playback_state
+            .update(PlaybackStateUpdate::LyricsMode(false))
+            .unwrap();
+
+        assert!(controller.play_restored().unwrap());
+
+        assert_eq!(
+            *controller.backend.lyrics_translations.lock().unwrap(),
+            [false]
+        );
+        assert!(
+            !controller
+                .playback_state
+                .snapshot()
+                .unwrap()
+                .use_translation
+        );
+    }
+
+    #[test]
+    fn play_restored_keeps_a_user_paused_song_paused() {
+        let backend = FakeBackend::new(Vec::new());
+        let controller = controller(backend);
+        enter_confirmed_playing(&controller);
+        controller
+            .playback_state
+            .update(PlaybackStateUpdate::UserPaused)
+            .unwrap();
+
+        assert!(controller.play_restored().unwrap());
+
+        // 原用户暂停：恢复歌曲后必须立即暂停并保持暂停状态，不得自动播放。
+        assert_eq!(*controller.backend.paused.lock().unwrap(), 1);
+        let state = controller.playback_state.snapshot().unwrap();
+        assert_eq!(state.state, ConfirmedPlaybackState::PausedByUser);
+        assert_eq!(state.pause_reason, PauseReason::User);
+        assert!(state.active_request.is_some());
+    }
+
+    #[test]
+    fn play_restored_without_an_active_request_returns_false() {
+        let backend = FakeBackend::new(Vec::new());
+        let controller = controller(backend);
+
+        assert!(!controller.play_restored().unwrap());
+        assert!(controller.backend.restored_seeks.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn play_restored_skips_unconfirmed_starting_state() {
+        let backend = FakeBackend::new(Vec::new());
+        let controller = controller(backend);
+        let track = test_track("miliastra://track/qqmusic/1", "目标 - 歌手");
+        controller
+            .playback_state
+            .update(PlaybackStateUpdate::Starting {
+                request: restored_active_request(&track),
+                navigation: PlaybackNavigation::Normal,
+            })
+            .unwrap();
+
+        // 上次会话只停留在 Starting（确认前退出）：不自动恢复，避免重播未确认的歌曲。
+        assert!(!controller.play_restored().unwrap());
+        assert!(controller.backend.restored_seeks.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn restored_seek_requires_reliable_finite_progress_away_from_the_end() {
+        let observation = |progress: f64,
+                           duration: f64,
+                           reliability: ObservationReliability|
+         -> PlaybackObservation {
+            PlaybackObservation {
+                status: "playing".to_string(),
+                track: Some(test_track("miliastra://track/qqmusic/obs", "观测 - 歌手")),
+                title: "观测".to_string(),
+                artist: "歌手".to_string(),
+                progress,
+                duration,
+                captured_at_ms: 1,
+                reliability,
+            }
+        };
+        let reliable = ObservationReliability::Reliable;
+        assert_eq!(restored_seek_seconds(None), None);
+        // 非法（NaN/无穷）与负数进度：从头播放。
+        assert_eq!(
+            restored_seek_seconds(Some(&observation(f64::NAN, 180.0, reliable))),
+            None
+        );
+        assert_eq!(
+            restored_seek_seconds(Some(&observation(-1.0, 180.0, reliable))),
+            None
+        );
+        // 距结尾不足 5 秒：从头播放。
+        assert_eq!(
+            restored_seek_seconds(Some(&observation(178.0, 180.0, reliable))),
+            None
+        );
+        // 恰 5 秒仍可续播。
+        assert_eq!(
+            restored_seek_seconds(Some(&observation(175.0, 180.0, reliable))),
+            Some(175.0)
+        );
+        // 正常进度：从该位置续播。
+        assert_eq!(
+            restored_seek_seconds(Some(&observation(42.0, 180.0, reliable))),
+            Some(42.0)
+        );
+        // 不可靠观测的进度不得作为续播起点。
+        assert_eq!(
+            restored_seek_seconds(Some(&observation(
+                42.0,
+                180.0,
+                ObservationReliability::Stale
+            ))),
+            None
+        );
+        // duration 非法（NaN）时仍采用有限进度。
+        assert_eq!(
+            restored_seek_seconds(Some(&observation(42.0, f64::NAN, reliable))),
+            Some(42.0)
+        );
+    }
+
+    #[test]
+    fn lyrics_mode_from_message_parses_translation_and_original() {
+        assert_eq!(lyrics_mode_from_message("translation"), Some(true));
+        assert_eq!(lyrics_mode_from_message("original"), Some(false));
+        assert_eq!(lyrics_mode_from_message("ok"), None);
+        assert_eq!(lyrics_mode_from_message(""), None);
     }
 
     #[test]
@@ -3019,30 +3441,95 @@ mod tests {
     }
 
     #[test]
+    fn protect_current_song_hot_reload_changes_queueing_behavior() {
+        let controller = controller(FakeBackend::new(vec![]));
+        let request = request();
+        controller
+            .confirm_playback_success(
+                &request,
+                &status("目标", request.uri().as_str(), 1.0, 180.0),
+            )
+            .unwrap();
+        let playing_without_identity = PlayerStatus {
+            status: "playing".to_string(),
+            ..PlayerStatus::default()
+        };
+        // 默认 protect=true：确认播放的歌曲受保护，新点歌排队。
+        assert!(
+            controller
+                .should_queue_until_current_song_finished(&playing_without_identity)
+                .unwrap()
+        );
+        // 热更新共享值（对应保存 queue.protect_current_song_until_finished=false）：
+        // 立即放行，不再排队等待当前歌曲结束。
+        *controller.queue_protect_current_song.write().unwrap() = false;
+        assert!(
+            !controller
+                .should_queue_until_current_song_finished(&playing_without_identity)
+                .unwrap()
+        );
+        // 改回 true：保护恢复。
+        *controller.queue_protect_current_song.write().unwrap() = true;
+        assert!(
+            controller
+                .should_queue_until_current_song_finished(&playing_without_identity)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn external_protect_seconds_hot_reload_changes_protection_timing() {
+        let clock = Arc::new(ManualClock::new(Instant::now()));
+        let controller =
+            controller_with_time(FakeBackend::new(vec![]), clock.clone(), clock.clone());
+        let external = status("外部歌", "miliastra://track/qqmusic/external", 30.0, 180.0);
+        controller.mark_external_playback().unwrap();
+        // 默认 20s 保护：19s 时未受保护。
+        clock.advance(Duration::from_secs(19)).unwrap();
+        assert!(
+            !controller
+                .should_queue_until_current_song_finished(&external)
+                .unwrap()
+        );
+        // 热更新共享值（对应保存 external_playback_protect_after_seconds=5）：
+        // 同一外部播放再播 5s 后立即受保护（原 20s 不会保护）。
+        *controller.queue_external_protect_seconds.write().unwrap() = 5;
+        clock.advance(Duration::from_secs(5)).unwrap();
+        assert!(
+            controller
+                .should_queue_until_current_song_finished(&external)
+                .unwrap()
+        );
+    }
+
+    #[test]
     fn active_request_guard_uses_only_the_injected_monotonic_anchor() {
         let started_at = Instant::now();
         let clock = ManualClock::with_unix_seconds(started_at, 10);
-        let timing = test_timing();
+        // 与运行态热更新值一致：监控/查询间隔共享值（默认 1000ms）。
+        let monitor_status_ms: u64 = 1000;
+        let status_poll_ms: u64 = 1000;
         let active_request = ActivePlaybackRequest {
             // Deliberately unrelated wall-clock metadata: changing it must not affect the guard.
             started_at_ms: u64::MAX,
             guard_started_at: Some(started_at),
             ..ActivePlaybackRequest::default()
         };
-        let guard_ms = timing
-            .monitor_status_ms
-            .max(timing.status_poll_ms)
+        let guard_ms = monitor_status_ms
+            .max(status_poll_ms)
             .saturating_mul(3)
             .max(3000);
 
         assert!(active_request_guard_active(
-            &timing,
+            monitor_status_ms,
+            status_poll_ms,
             Some(&active_request),
             clock.now(),
         ));
         clock.advance(Duration::from_millis(guard_ms)).unwrap();
         assert!(!active_request_guard_active(
-            &timing,
+            monitor_status_ms,
+            status_poll_ms,
             Some(&active_request),
             clock.now(),
         ));
@@ -3053,7 +3540,8 @@ mod tests {
             ..ActivePlaybackRequest::default()
         };
         assert!(!active_request_guard_active(
-            &timing,
+            monitor_status_ms,
+            status_poll_ms,
             Some(&restored_request),
             clock.now(),
         ));

@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 发布版本，例如 v4.1.0。留空时使用 Cargo.toml 版本。
+        description: 发布版本，例如 v5.0.0。留空时使用 Cargo.toml 版本。
         required: false
         type: string
       create_release:
@@ -262,7 +262,9 @@ jobs:
           }
 
           $configExample = @'
-          # Merge these values into the normal universal EXE package config.yaml.
+          # Reference values for the ocr section in the Web panel "Config Center".
+          # Functional config is stored in deps/data/playback.sqlite3; config.yaml
+          # only keeps the database_path/http/logging bootstrap sections.
           # Keep the existing MNN paths when retaining CPU fallback.
           ocr:
             backend_priority:
@@ -274,7 +276,7 @@ jobs:
               rec_model: models/PP-OCRv6_small_rec.xml
               rec_weights: models/PP-OCRv6_small_rec.bin
               device: CPU
-              cache_dir: data/openvino-cache
+              cache_dir: deps/data/openvino-cache
           '@
           Set-Content -LiteralPath (Join-Path $dist 'config-openvino.example.yaml') -Value $configExample -Encoding utf8
 
@@ -286,7 +288,9 @@ jobs:
 
           Installation:
           1. Extract this directory next to the normal EXE package, preserving paths.
-          2. Merge config-openvino.example.yaml into config.yaml.
+          2. Apply the ocr values from config-openvino.example.yaml in the Web panel
+             "Config Center" (ocr section). Functional config is stored in
+             deps/data/playback.sqlite3; do not merge into config.yaml.
           3. Start the EXE from the extracted package. It automatically prefers the
              included openvino\runtime\bin\intel64\Release and
              openvino\runtime\3rdparty\tbb\bin directories. OPENVINO_INSTALL_DIR

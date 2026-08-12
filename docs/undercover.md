@@ -1,6 +1,6 @@
 # 谁是卧底
 
-谁是卧底是默认关闭的多人玩法。开启前请准备词库，并把 `undercover.enabled` 改为 `true`。
+谁是卧底是默认关闭的多人玩法。开启前请准备词库，并在配置中心把 `undercover.enabled` 改为 `true`。
 
 ## 开始游戏
 
@@ -38,7 +38,9 @@
 
 ## 词库配置
 
-复制 `undercover.example.yaml` 为 `undercover.yaml`。每行填写一对词语，格式为 `平民词:卧底词`；顺序相反的词对视为同一对。
+词库是内容数据文件（不是功能配置）。复制发布包中的 `deps/docs/undercover.example.yaml` 为 `deps/undercover.yaml`。每行填写一对词语，格式为 `平民词:卧底词`；顺序相反的词对视为同一对。
+
+`undercover` 功能段在配置中心修改，字段结构如下（示意）：
 
 ```yaml
 undercover:
@@ -49,4 +51,4 @@ undercover:
   max_players: 11
 ```
 
-词对在第一次发词前会标记为已用，之后不会再次抽到。人数和阶段时间可以在 `config.yaml` 中调整。
+词对在第一次发词前会标记为已用，之后不会再次抽到。人数和阶段时间可以在配置中心中调整。

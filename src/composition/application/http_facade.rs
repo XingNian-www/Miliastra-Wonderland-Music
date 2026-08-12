@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use miliastra_playback::{CredentialStatus, LoginSession, PlayableTrack, ProviderId};
+use miliastra_playback::{
+    AudioCacheStats, AudioCacheTrackStatus, CachedTrackPage, CredentialStatus, LoginSession,
+    PlayableTrack, PlaybackHandle, ProviderId, TrackKey,
+};
 use serde_json::json;
 use uuid::Uuid;
 
@@ -545,17 +548,41 @@ fn is_bilibili_bvid(value: &str) -> bool {
 pub(super) struct ApplicationHttpPlayerFacade {
     backend: PlayerRuntimeBackend,
     search: PlayerSearchClient,
+    playback: PlaybackHandle,
 }
 
 impl ApplicationHttpPlayerFacade {
-    pub(super) fn new(backend: PlayerRuntimeBackend, search: PlayerSearchClient) -> Self {
-        Self { backend, search }
+    pub(super) fn new(
+        backend: PlayerRuntimeBackend,
+        search: PlayerSearchClient,
+        playback: PlaybackHandle,
+    ) -> Self {
+        Self {
+            backend,
+            search,
+            playback,
+        }
     }
 }
 
 impl HttpPlayerPort for ApplicationHttpPlayerFacade {
     fn status(&self) -> Result<PlayerStatus> {
         self.backend.status()
+    }
+
+    fn cache_stats(
+        &self,
+        keys: &[TrackKey],
+    ) -> Result<(Option<AudioCacheStats>, Vec<AudioCacheTrackStatus>)> {
+        Ok(self.playback.cache_stats(keys)?)
+    }
+
+    fn cached_tracks(&self, offset: usize, limit: usize) -> Result<CachedTrackPage> {
+        Ok(self.playback.cached_tracks(offset, limit)?)
+    }
+
+    fn reset_track_statistics(&self, key: &TrackKey) -> Result<bool> {
+        Ok(self.playback.reset_track_statistics(key)?)
     }
 
     fn search_text(&self, keyword: &str, source: &str) -> Result<String, HttpPlayerSearchError> {

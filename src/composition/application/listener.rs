@@ -147,6 +147,11 @@ impl ApplicationRuntime {
                 .clone()
                 .ok_or_else(|| anyhow!("正式任务执行运行时尚未启动"))?,
         );
+        let config_store = self
+            .lifecycle
+            .config_store
+            .clone()
+            .ok_or_else(|| anyhow!("配置中心存储尚未初始化"))?;
         let server = http::start(http::HttpSharedState::new(
             http::HttpInterfaceConfig::new(
                 self.lifecycle.config.http.clone(),
@@ -160,6 +165,8 @@ impl ApplicationRuntime {
             ),
             self.lifecycle.monitor.clone(),
             self.ui.latest_frame.clone(),
+            config_store,
+            self.lifecycle.live_configs.clone(),
             http::HttpApplicationPorts::new(
                 Arc::new(http_facade::ApplicationHttpCommandFacade::new(
                     formal_tasks.clone(),
@@ -173,6 +180,7 @@ impl ApplicationRuntime {
                 Arc::new(http_facade::ApplicationHttpPlayerFacade::new(
                     PlayerRuntimeBackend::new(player_runtime),
                     self.playback.player_search.clone(),
+                    self.playback.native_playback.clone(),
                 )),
                 Arc::new(http_facade::ApplicationHttpLoginFacade::new(
                     self.playback.login_helper.clone(),

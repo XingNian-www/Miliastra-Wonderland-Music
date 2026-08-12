@@ -134,14 +134,19 @@ pub trait PlayerObservationPort: Send + 'static {
     fn read_sample(&mut self) -> Result<RawPlayerSample, PlayerObservationReadError>;
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum PlayerControl {
-    Play(miliastra_playback::PlayableTrack),
+    Play(miliastra_playback::PlayableTrack, bool),
+    /// 恢复播放（重启恢复）：携带起始位置（秒），None 表示从头播放。
+    PlayRestored(miliastra_playback::PlayableTrack, Option<f64>),
     Pause,
     Resume,
     Next,
     Previous,
     SetVolume(u8),
+    ToggleLyrics,
+    /// 明确设置歌词是否使用翻译（不等价于切换）：恢复播放时应用持久化模式。
+    SetLyricsTranslation(bool),
     /// 删除曲目音频缓存（解码失败后自愈，下次播放重新下载）。
     InvalidateAudioCache(miliastra_playback::TrackKey),
 }
@@ -337,7 +342,7 @@ pub enum PlayerSearchOutcome {
     NotRun { reason: String },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ControlOperationResult {
     pub operation_id: BusinessOperationId,
     pub control: PlayerControl,
@@ -1952,7 +1957,7 @@ mod tests {
     impl PlayerControlPort for DeferredPlayControlPort {
         fn dispatch(&mut self, control: &PlayerControl) -> ControlDispatch {
             match control {
-                PlayerControl::Play(_) => {
+                PlayerControl::Play(_, _) => {
                     let release = self.release.take().expect("one deferred play");
                     self.started.send(()).unwrap();
                     ControlDispatch::deferred(move || {
@@ -1976,7 +1981,7 @@ mod tests {
     impl PlayerControlPort for CancellableDeferredControlPort {
         fn dispatch(&mut self, control: &PlayerControl) -> ControlDispatch {
             match control {
-                PlayerControl::Play(_) => {
+                PlayerControl::Play(_, _) => {
                     let release = self.release.take().expect("one deferred play");
                     let cancel_release = self.cancel_release.take().expect("one cancellation");
                     let cancelled = self.cancelled.take().expect("one cancellation receipt");
@@ -2247,10 +2252,13 @@ mod tests {
         let play = handle
             .submit_control(
                 BusinessOperationId::new(14),
-                PlayerControl::Play(crate::features::playback::test_track(
-                    "miliastra://track/qqmusic/deferred",
-                    "deferred",
-                )),
+                PlayerControl::Play(
+                    crate::features::playback::test_track(
+                        "miliastra://track/qqmusic/deferred",
+                        "deferred",
+                    ),
+                    true,
+                ),
             )
             .unwrap();
         started_receiver
@@ -2295,10 +2303,13 @@ mod tests {
             .handle()
             .submit_control(
                 BusinessOperationId::new(16),
-                PlayerControl::Play(crate::features::playback::test_track(
-                    "miliastra://track/qqmusic/shutdown-deferred",
-                    "shutdown deferred",
-                )),
+                PlayerControl::Play(
+                    crate::features::playback::test_track(
+                        "miliastra://track/qqmusic/shutdown-deferred",
+                        "shutdown deferred",
+                    ),
+                    true,
+                ),
             )
             .unwrap();
         started_receiver
@@ -2348,10 +2359,13 @@ mod tests {
             .handle()
             .submit_control(
                 BusinessOperationId::new(17),
-                PlayerControl::Play(crate::features::playback::test_track(
-                    "miliastra://track/qqmusic/shutdown-cancelled",
-                    "shutdown cancelled",
-                )),
+                PlayerControl::Play(
+                    crate::features::playback::test_track(
+                        "miliastra://track/qqmusic/shutdown-cancelled",
+                        "shutdown cancelled",
+                    ),
+                    true,
+                ),
             )
             .unwrap();
         started_receiver

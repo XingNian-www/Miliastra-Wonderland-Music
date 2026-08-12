@@ -2,7 +2,7 @@ use super::*;
 
 use crate::config::{
     ConfigFieldError, ConfigSaveOutcome, ConfigSectionSchema, ConfigSource, Effect, FieldKind,
-    config_sections, default_config_json, mask_secrets, section_schema,
+    config_sections, default_config_json, default_config_json_with_audio_cache, section_schema,
 };
 use serde_json::{Map, Value};
 
@@ -65,7 +65,6 @@ fn kind_json(kind: &FieldKind) -> Value {
 fn effect_str(effect: Effect) -> &'static str {
     match effect {
         Effect::Live => "live",
-        Effect::NextTask => "nextTask",
         Effect::Restart => "restart",
     }
 }
@@ -80,7 +79,19 @@ fn source_str(source: ConfigSource) -> &'static str {
 
 /// 字段 schema JSON：default 从内置默认配置按点路径提取，提取不到为 null
 /// （如 audio_cache 为 null 时其子字段 default 为 null）。
-fn field_json(field: &crate::config::ConfigFieldSchema, defaults: &Value) -> Value {
+///
+/// audio_cache.* 子字段改用 [`default_config_json_with_audio_cache`] 提取：
+/// 默认 audio_cache=null 时子字段无默认值，Web「启用」按钮需要真实默认值预填。
+fn field_json(
+    field: &crate::config::ConfigFieldSchema,
+    defaults: &Value,
+    audio_cache_defaults: &Value,
+) -> Value {
+    let source_defaults = if field.path.contains(".audio_cache.") {
+        audio_cache_defaults
+    } else {
+        defaults
+    };
     json!({
         "path": field.path,
         "label": field.label,
@@ -90,14 +101,18 @@ fn field_json(field: &crate::config::ConfigFieldSchema, defaults: &Value) -> Val
         "hint": field.hint,
         "nullable": field.nullable,
         "optionalParent": field.optional_parent,
-        "default": get_value_by_path(defaults, &field.path)
+        "default": get_value_by_path(source_defaults, &field.path)
             .cloned()
             .unwrap_or(Value::Null),
     })
 }
 
 /// 段 schema JSON（config_schema_route 使用，不含段当前值）。
-fn section_json(section: &ConfigSectionSchema, defaults: &Value) -> Value {
+fn section_json(
+    section: &ConfigSectionSchema,
+    defaults: &Value,
+    audio_cache_defaults: &Value,
+) -> Value {
     json!({
         "name": section.name,
         "label": section.label,
@@ -105,7 +120,7 @@ fn section_json(section: &ConfigSectionSchema, defaults: &Value) -> Value {
         "fields": section
             .fields
             .iter()
-            .map(|field| field_json(field, defaults))
+            .map(|field| field_json(field, defaults, audio_cache_defaults))
             .collect::<Vec<_>>(),
     })
 }
@@ -152,8 +167,7 @@ fn validation_failed_json(errors: &[ConfigFieldError]) -> Value {
 /// 把变更字段按 schema 生效级别拆分为「重启生效」与「已热更新生效」两组；
 /// schema 未声明的路径（如 state.playback_state_path 注入项）归入重启生效。
 /// appliedLiveFields 只收 effect==Live 的字段（保存成功后已由
-/// [`crate::config::LiveConfigs::apply`] 真正作用到运行态）；NextTask 当前
-/// 未引入，统一归入重启组，防止页面虚报「已生效」。
+/// [`crate::config::LiveConfigs::apply`] 真正作用到运行态）。
 fn split_changed_fields_by_effect(changed_fields: &[String]) -> (Vec<String>, Vec<String>) {
     let effects = config_sections()
         .into_iter()
@@ -165,15 +179,14 @@ fn split_changed_fields_by_effect(changed_fields: &[String]) -> (Vec<String>, Ve
     for path in changed_fields {
         match effects.get(path) {
             Some(Effect::Live) => applied_live.push(path.clone()),
-            Some(Effect::NextTask) | Some(Effect::Restart) | None => restart.push(path.clone()),
+            Some(Effect::Restart) | None => restart.push(path.clone()),
         }
     }
     (restart, applied_live)
 }
 
-/// 保存/回滚成功响应；restartRequired 由本次变更中实际需要重启的字段决定
-/// （仅 Live 变更时 false），与 store 的 restart_required（changed_fields 非空）
-/// 解耦——store 语义不动，页面展示以 restartFields 为准。
+/// 保存/回滚成功响应；restartRequired 由本次变更中实际需要重启的字段决定，
+/// 仅修改 Live 字段时为 false。
 fn save_outcome_json(outcome: &ConfigSaveOutcome) -> std::result::Result<String, AppError> {
     let (restart_fields, applied_live_fields) =
         split_changed_fields_by_effect(&outcome.changed_fields);
@@ -201,16 +214,15 @@ fn parse_sections(body: &Value) -> std::result::Result<&Map<String, Value>, AppE
     Ok(sections)
 }
 
-/// GET /config：完整配置（脱敏后）+ 当前版本号 + schema 版本。
+/// GET /config：完整配置（脱敏后，路径保持库中相对值）+ 当前版本号 + schema 版本。
 pub(super) fn config_route(
     _query: &[(String, String)],
     state: &HttpSharedState,
 ) -> std::result::Result<String, AppError> {
     let store = lock_store(state)?;
-    let config = store.load_full().map_err(internal_error)?;
+    // current_value 不解析相对路径：避免 Web 表单回填绝对路径后保存回写。
+    let sections = store.current_value().map_err(internal_error)?;
     let revision = store.current_revision().map_err(internal_error)?;
-    let mut sections = serde_json::to_value(&config).map_err(internal_error)?;
-    mask_secrets(&mut sections);
     serde_json::to_string(&json!({
         "ok": true,
         "revision": revision,
@@ -226,9 +238,10 @@ pub(super) fn config_schema_route(
     _state: &HttpSharedState,
 ) -> std::result::Result<String, AppError> {
     let defaults = default_config_json();
+    let audio_cache_defaults = default_config_json_with_audio_cache();
     let sections = config_sections()
         .iter()
-        .map(|section| section_json(section, &defaults))
+        .map(|section| section_json(section, &defaults, &audio_cache_defaults))
         .collect::<Vec<_>>();
     serde_json::to_string(&json!({ "ok": true, "sections": sections })).map_err(internal_error)
 }
@@ -243,14 +256,15 @@ pub(super) fn config_section_route(
         return Err(bad_request(&format!("配置段不存在: {name}")));
     };
     let store = lock_store(state)?;
-    let config = store.load_full().map_err(internal_error)?;
     let revision = store.current_revision().map_err(internal_error)?;
     // 先对完整配置根对象脱敏（点路径含段前缀，如 ai.api_key），再提取目标段；
     // 若先提取段对象再脱敏，路径前缀被截断（api_key），SECRET_PATHS 匹配失败，
     // 单段接口会明文泄漏 http.access_token、ai.api_key 等密钥。
-    let mut sections = serde_json::to_value(&config).map_err(internal_error)?;
-    mask_secrets(&mut sections);
+    // 不解析相对路径（current_value）：与 GET /config 一致，避免绝对路径回写。
+    let sections = store.current_value().map_err(internal_error)?;
     let values = sections.get(name).cloned().unwrap_or(Value::Null);
+    let defaults = default_config_json();
+    let audio_cache_defaults = default_config_json_with_audio_cache();
     serde_json::to_string(&json!({
         "ok": true,
         "name": section.name,
@@ -259,7 +273,7 @@ pub(super) fn config_section_route(
         "fields": section
             .fields
             .iter()
-            .map(|field| field_json(field, &default_config_json()))
+            .map(|field| field_json(field, &defaults, &audio_cache_defaults))
             .collect::<Vec<_>>(),
         "values": values,
         "revision": revision,
@@ -347,8 +361,12 @@ pub(super) fn config_rollback_route(
         .get("revision")
         .and_then(Value::as_u64)
         .ok_or_else(|| bad_request("请求必须包含 revision 整数"))?;
+    let base_revision = body
+        .get("baseRevision")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| bad_request("请求必须包含 baseRevision 整数"))?;
     let mut store = lock_store(state)?;
-    match store.rollback(revision) {
+    match store.rollback(revision, base_revision) {
         Ok(outcome) => {
             // 回滚同样是完整配置替换：落库已提交后热更新应用改为尽力而为，
             // 失败只记录日志，仍返回回滚成功响应。

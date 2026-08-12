@@ -57,14 +57,10 @@ impl WorkflowTimingConfig {
 
 impl Default for CustomWorkflowConfig {
     fn default() -> Self {
-        Self {
-            enabled: true,
-            default_threshold: 0.9,
-            wait_template_absent_stable_default: true,
-            max_hold_key_seconds: 10,
-            templates: HashMap::new(),
-            workflows: Vec::new(),
-        }
+        // 工作流作为源码内置资源编译进程序，新数据库可直接获得默认命令。
+        // 解析失败会由默认配置测试发现，不依赖发布目录中的配置文件。
+        serde_yaml::from_str(include_str!("defaults/custom_workflows.yaml"))
+            .expect("内置 custom_workflows 默认配置必须可解析")
     }
 }
 

@@ -20,6 +20,140 @@ pub(super) fn status_route(
     serde_json::to_string(&status).map_err(internal_error)
 }
 
+pub(super) fn playback_insights_route(
+    _query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let playback = state
+        .application
+        .queries
+        .playback_state_snapshot()
+        .map_err(internal_error)?;
+    let keys: Vec<_> = playback
+        .previous_requests
+        .iter()
+        .filter_map(|request| {
+            request
+                .track
+                .as_ref()
+                .map(|track| track.track_ref.key.clone())
+        })
+        .collect();
+    let (cache, tracks) = state
+        .application
+        .player
+        .cache_stats(&keys)
+        .map_err(internal_error)?;
+    let cached_by_key: std::collections::HashMap<_, _> = tracks
+        .into_iter()
+        .map(|track| ((track.source.clone(), track.id.clone()), track))
+        .collect();
+    let history: Vec<_> = playback
+        .previous_requests
+        .into_iter()
+        .rev()
+        .map(|request| {
+            let statistics = request.track.as_ref().and_then(|track| {
+                let key = &track.track_ref.key;
+                cached_by_key.get(&(key.provider.to_string(), key.id.clone()))
+            });
+            let cached = statistics.is_some_and(|track| track.cached);
+            let cache_bytes = statistics.and_then(|track| track.bytes);
+            json!({
+                "keyword": request.keyword,
+                "source": request.source,
+                "title": request.title,
+                "artist": request.artist,
+                "requester": request.requester,
+                "startedAtMs": request.started_at_ms,
+                "track": request.track,
+                "cached": cached,
+                "cacheBytes": cache_bytes,
+                "playCount": statistics.map_or(0, |track| track.play_count),
+                "requestedPlayCount": statistics.map_or(0, |track| track.requested_play_count),
+                "poolPlayCount": statistics.map_or(0, |track| track.pool_play_count),
+                "cacheHitCount": statistics.map_or(0, |track| track.cache_hit_count),
+                "failureCount": statistics.map_or(0, |track| track.failure_count),
+                "lastPlayedAtMs": statistics.and_then(|track| track.last_played_at_ms),
+                "lastFailureCode": statistics.and_then(|track| track.last_failure_code.as_deref()),
+            })
+        })
+        .collect();
+    serde_json::to_string(&json!({
+        "history": history,
+        "cache": cache,
+    }))
+    .map_err(internal_error)
+}
+
+/// 磁盘缓存歌曲列表页大小上限。
+const CACHE_TRACKS_MAX_LIMIT: usize = 500;
+/// 磁盘缓存歌曲列表默认页大小。
+const CACHE_TRACKS_DEFAULT_LIMIT: usize = 100;
+
+pub(super) fn playback_statistics_reset_route(
+    query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let provider = query_value(query, "provider")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| bad_request("缺少provider参数"))?
+        .parse::<ProviderId>()
+        .map_err(|_| bad_request("provider参数无效"))?;
+    let id = query_value(query, "id")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| bad_request("缺少id参数"))?;
+    let key = TrackKey::new(provider, id).map_err(|_| bad_request("id参数无效"))?;
+    let reset = state
+        .application
+        .player
+        .reset_track_statistics(&key)
+        .map_err(internal_error)?;
+    serde_json::to_string(&json!({
+        "ok": true,
+        "reset": reset,
+        "cachePreserved": true,
+        "metadataPreserved": true,
+    }))
+    .map_err(internal_error)
+}
+
+pub(super) fn playback_cache_tracks_route(
+    query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let offset = parse_page_param(query_value(query, "offset"), "offset", 0)?;
+    let limit = parse_page_param(
+        query_value(query, "limit"),
+        "limit",
+        CACHE_TRACKS_DEFAULT_LIMIT,
+    )?;
+    if limit == 0 {
+        return Err(bad_request("limit参数必须是1-500"));
+    }
+    let limit = limit.min(CACHE_TRACKS_MAX_LIMIT);
+    let page = state
+        .application
+        .player
+        .cached_tracks(offset, limit)
+        .map_err(internal_error)?;
+    serde_json::to_string(&page).map_err(internal_error)
+}
+
+/// 解析分页参数：缺省返回 `default`；非整数（含负数）返回 bad request。
+fn parse_page_param(
+    value: Option<&str>,
+    name: &str,
+    default: usize,
+) -> std::result::Result<usize, AppError> {
+    let Some(value) = value.filter(|value| !value.trim().is_empty()) else {
+        return Ok(default);
+    };
+    value
+        .parse::<usize>()
+        .map_err(|_| bad_request(&format!("{name}参数必须是整数")))
+}
+
 pub(super) fn play_route(
     _query: &[(String, String)],
     state: &HttpSharedState,

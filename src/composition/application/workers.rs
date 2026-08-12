@@ -629,6 +629,7 @@ impl ApplicationRuntime {
             },
             lifecycle: FormalTaskLifecycleContext {
                 config: self.lifecycle.config.clone(),
+                live_configs: self.lifecycle.live_configs.clone(),
                 running: self.lifecycle.running.clone(),
                 paused: self.lifecycle.paused.clone(),
                 console_reply_context: self.lifecycle.console_reply_context.clone(),

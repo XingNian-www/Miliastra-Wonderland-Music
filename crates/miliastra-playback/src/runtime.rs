@@ -146,7 +146,7 @@ impl PlaybackError {
 
 enum Command {
     Search(SearchQuery, Reply<Vec<SearchCandidate>>),
-    Play(PlayableTrack, Reply<()>),
+    Play(PlayableTrack, bool, Option<f64>, Reply<()>),
     /// 预加载音源解析结果（fire-and-forget，无回复；失败静默）。
     Preload(PlayableTrack),
     Pause(Reply<()>),
@@ -154,6 +154,9 @@ enum Command {
     Stop(Reply<()>),
     SetVolume(u8, Reply<()>),
     Snapshot(Reply<PlaybackSnapshot>),
+    ToggleLyrics(Reply<bool>),
+    /// 明确设置歌词是否使用翻译（不等价于切换）：恢复播放时应用持久化模式。
+    SetLyricsTranslation(bool, Reply<()>),
     Providers(Reply<Vec<ProviderId>>),
     CredentialStatuses(Reply<Vec<CredentialStatus>>),
     RefreshCredential(ProviderId, Reply<CredentialStatus>),
@@ -169,16 +172,30 @@ enum Command {
     CancelLogin(Uuid, Reply<()>),
     /// 删除曲目音频缓存（解码失败后自愈，下次播放重新下载）。
     InvalidateAudioCache(crate::domain::SongKey, Reply<()>),
+    /// 查询缓存统计与指定曲目的完整缓存状态。
+    CacheStats(
+        Vec<crate::domain::SongKey>,
+        Reply<(
+            Option<crate::cache::AudioCacheStats>,
+            Vec<crate::cache::AudioCacheTrackStatus>,
+        )>,
+    ),
+    /// 分页查询磁盘缓存歌曲列表（SQLite 查询走 spawn_blocking，不阻塞事件循环）。
+    CachedTracks(usize, usize, Reply<crate::cache::CachedTrackPage>),
+    /// 清零单曲统计；保留音频缓存、曲目元数据与歌词。
+    ResetTrackStatistics(crate::domain::SongKey, Reply<bool>),
     Shutdown(Reply<()>),
 }
 
 enum LyricState {
     Loading {
         generation: u64,
+        use_translation: bool,
         task: TokioJoinHandle<Result<Option<TimedLyrics>, PlaybackCoreError>>,
     },
     Ready {
         generation: u64,
+        use_translation: bool,
         lyrics: Option<TimedLyrics>,
     },
 }
@@ -222,6 +239,36 @@ impl LyricState {
     fn generation(&self) -> u64 {
         match self {
             Self::Loading { generation, .. } | Self::Ready { generation, .. } => *generation,
+        }
+    }
+
+    fn toggle_translation(&mut self) -> bool {
+        match self {
+            Self::Loading {
+                use_translation, ..
+            }
+            | Self::Ready {
+                use_translation, ..
+            } => {
+                *use_translation = !*use_translation;
+                *use_translation
+            }
+        }
+    }
+
+    /// 明确设置歌词是否使用翻译（幂等，不等价于切换）。
+    fn set_translation(&mut self, use_translation: bool) {
+        match self {
+            Self::Loading {
+                use_translation: current,
+                ..
+            }
+            | Self::Ready {
+                use_translation: current,
+                ..
+            } => {
+                *current = use_translation;
+            }
         }
     }
 
@@ -308,8 +355,27 @@ impl PlaybackHandle {
     }
 
     pub fn play(&self, track: PlayableTrack) -> Result<PlaybackOperation, PlaybackError> {
+        self.play_with_origin(track, true)
+    }
+
+    pub fn play_with_origin(
+        &self,
+        track: PlayableTrack,
+        requested: bool,
+    ) -> Result<PlaybackOperation, PlaybackError> {
+        self.play_with_seek(track, requested, None)
+    }
+
+    /// 播放并可选指定起始位置（秒）：`seek_seconds` 为 None 时从头播放。
+    /// 用于重启恢复：新会话从上次可靠进度继续，而不是整首重播。
+    pub fn play_with_seek(
+        &self,
+        track: PlayableTrack,
+        requested: bool,
+        seek_seconds: Option<f64>,
+    ) -> Result<PlaybackOperation, PlaybackError> {
         Ok(PlaybackOperation {
-            reply: self.submit(|reply| Command::Play(track, reply))?,
+            reply: self.submit(|reply| Command::Play(track, requested, seek_seconds, reply))?,
         })
     }
 
@@ -342,6 +408,16 @@ impl PlaybackHandle {
 
     pub fn snapshot(&self) -> Result<PlaybackSnapshot, PlaybackError> {
         self.request(Command::Snapshot)
+    }
+
+    /// 切换当前歌曲歌词的原文/翻译显示；返回切换后是否使用翻译。
+    pub fn toggle_lyrics(&self) -> Result<bool, PlaybackError> {
+        self.request(Command::ToggleLyrics)
+    }
+
+    /// 明确设置当前歌曲歌词是否使用翻译（不等价于切换），供恢复播放应用持久化模式。
+    pub fn set_lyrics_translation(&self, use_translation: bool) -> Result<(), PlaybackError> {
+        self.request(|reply| Command::SetLyricsTranslation(use_translation, reply))
     }
 
     pub fn providers(&self) -> Result<Vec<ProviderId>, PlaybackError> {
@@ -418,6 +494,41 @@ impl PlaybackHandle {
             .to_song_key()
             .map_err(|error| PlaybackError::Internal(error.to_string()))?;
         self.request(|reply| Command::InvalidateAudioCache(song_key, reply))
+    }
+
+    /// 查询缓存统计与指定曲目的完整缓存状态。
+    pub fn cache_stats(
+        &self,
+        keys: &[TrackKey],
+    ) -> Result<
+        (
+            Option<crate::cache::AudioCacheStats>,
+            Vec<crate::cache::AudioCacheTrackStatus>,
+        ),
+        PlaybackError,
+    > {
+        let keys = keys
+            .iter()
+            .filter_map(|key| key.to_song_key().ok())
+            .collect();
+        self.request(|reply| Command::CacheStats(keys, reply))
+    }
+
+    /// 分页查询磁盘缓存歌曲列表（SQLite 查询在后台线程执行，不阻塞调用方）。
+    pub fn cached_tracks(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<crate::cache::CachedTrackPage, PlaybackError> {
+        self.request(|reply| Command::CachedTracks(offset, limit, reply))
+    }
+
+    /// 清零单曲播放与缓存统计。缓存资产、身份元数据和歌词不变。
+    pub fn reset_track_statistics(&self, key: &TrackKey) -> Result<bool, PlaybackError> {
+        let song_key = key
+            .to_song_key()
+            .map_err(|error| PlaybackError::Internal(error.to_string()))?;
+        self.request(|reply| Command::ResetTrackStatistics(song_key, reply))
     }
 
     fn shutdown_runtime(&self) -> Result<(), PlaybackError> {
@@ -766,6 +877,7 @@ async fn run_commands(
                             let generation = receipt.generation;
                             lyric_state = Some(LyricState::Loading {
                                 generation,
+                                use_translation: true,
                                 task: tokio::spawn(async move {
                                     lyric_core
                                         .lyrics(completion.key, completion.resolver_locator)
@@ -815,7 +927,7 @@ async fn run_commands(
                     &core,
                 );
             }
-            Command::Play(track, reply) => {
+            Command::Play(track, requested, seek_seconds, reply) => {
                 let key = track.track_ref.key.to_song_key();
                 let Ok(key) = key else {
                     let _ = reply.send(Err(PlaybackError::Internal(key.unwrap_err().to_string())));
@@ -837,8 +949,11 @@ async fn run_commands(
                         .play_cancellable(
                             task_key.clone(),
                             task_locator.clone(),
+                            Some(&track.metadata),
                             EndBehavior::NotifyController,
                             cancelled,
+                            requested,
+                            seek_seconds,
                         )
                         .await;
                     PlayCompletion {
@@ -894,6 +1009,22 @@ async fn run_commands(
                 let snapshot =
                     public_snapshot(engine_snapshot, active_track.as_ref(), lyric_line_text);
                 let _ = reply.send(Ok(snapshot));
+            }
+            Command::ToggleLyrics(reply) => {
+                let result = lyric_state
+                    .as_mut()
+                    .map(LyricState::toggle_translation)
+                    .ok_or(PlaybackError::NoActiveSession);
+                let _ = reply.send(result);
+            }
+            Command::SetLyricsTranslation(use_translation, reply) => {
+                let result = lyric_state
+                    .as_mut()
+                    .map(|state| {
+                        state.set_translation(use_translation);
+                    })
+                    .ok_or(PlaybackError::NoActiveSession);
+                let _ = reply.send(result);
             }
             Command::Providers(reply) => {
                 let _ = reply.send(Ok(ProviderId::ALL.to_vec()));
@@ -1028,6 +1159,40 @@ async fn run_commands(
                     tracing::info!("已清除音频缓存: {key}");
                 }
             }
+            Command::CacheStats(keys, reply) => match core.audio_cache.clone() {
+                Some(cache) => {
+                    tokio::task::spawn_blocking(move || {
+                        let (stats, tracks) = cache.stats(&keys);
+                        let _ = reply.send(Ok((Some(stats), tracks)));
+                    });
+                }
+                None => {
+                    let _ = reply.send(Ok((None, Vec::new())));
+                }
+            },
+            Command::CachedTracks(offset, limit, reply) => match core.audio_cache.clone() {
+                Some(cache) => {
+                    // SQLite 查询可能耗时，移到阻塞线程池，避免阻塞播放事件循环。
+                    tokio::task::spawn_blocking(move || {
+                        let page = cache.cached_tracks(offset, limit);
+                        let _ = reply.send(Ok(page));
+                    });
+                }
+                None => {
+                    let _ = reply.send(Ok(crate::cache::CachedTrackPage::empty(offset, limit)));
+                }
+            },
+            Command::ResetTrackStatistics(key, reply) => match core.audio_cache.clone() {
+                Some(cache) => {
+                    tokio::spawn(async move {
+                        let changed = cache.reset_statistics(&key).await;
+                        let _ = reply.send(Ok(changed));
+                    });
+                }
+                None => {
+                    let _ = reply.send(Ok(false));
+                }
+            },
             Command::Shutdown(reply) => {
                 cancel_pending_play(
                     &mut pending_play,
@@ -1072,7 +1237,10 @@ fn start_pending_preloads(
         // 任务返回曲目 key：完成事件据此释放 in-flight 标记。
         let task_key = key.clone();
         let abort = preloads.spawn(async move {
-            if let Err(error) = preload_core.preload(song_key, resolver_locator).await {
+            if let Err(error) = preload_core
+                .preload(song_key, resolver_locator, Some(&track.metadata))
+                .await
+            {
                 tracing::debug!(%error, "音源预加载失败，播放时将重新解析");
             }
             task_key
@@ -1156,7 +1324,13 @@ async fn lyric_line_for_snapshot(
         state.as_ref(),
         Some(LyricState::Loading { task, .. }) if task.is_finished()
     );
-    if finished && let Some(LyricState::Loading { generation, task }) = state.take() {
+    if finished
+        && let Some(LyricState::Loading {
+            generation,
+            use_translation,
+            task,
+        }) = state.take()
+    {
         let lyrics = match task.await {
             Ok(Ok(lyrics)) => lyrics,
             Ok(Err(error)) => {
@@ -1170,15 +1344,23 @@ async fn lyric_line_for_snapshot(
             }
         };
         if snapshot.generation == generation {
-            *state = Some(LyricState::Ready { generation, lyrics });
+            *state = Some(LyricState::Ready {
+                generation,
+                use_translation,
+                lyrics,
+            });
         }
     }
 
     let position_seconds = snapshot.position_seconds?;
     match state.as_ref()? {
-        LyricState::Ready { lyrics, .. } => lyrics
+        LyricState::Ready {
+            lyrics,
+            use_translation,
+            ..
+        } => lyrics
             .as_ref()?
-            .line_at_seconds(position_seconds)
+            .line_at_seconds_with_translation(position_seconds, *use_translation)
             .map(str::to_owned),
         LyricState::Loading { .. } => None,
     }
@@ -2259,6 +2441,32 @@ mod tests {
     }
 
     #[test]
+    fn play_with_seek_forwards_the_restored_position_to_the_engine_start() {
+        let source: Arc<dyn SourceAdapter> = Arc::new(FakeSource);
+        let credentials = CredentialStore::memory();
+        let engine = Arc::new(FakeEngine::new());
+        let runtime = test_runtime_with_parts(source, engine.clone(), credentials);
+        let handle = runtime.handle();
+        let track = playable_track("track-1");
+
+        handle
+            .play_with_seek(track.clone(), false, Some(73.5))
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(handle.snapshot().unwrap().track, Some(track));
+
+        // 恢复起始位置必须随 Start 命令到达引擎（新会话从该进度续播）。
+        let commands = engine.commands.lock().unwrap();
+        assert!(matches!(
+            commands.as_slice(),
+            [EngineCommand::Start { seek_seconds: Some(seek), .. }] if (*seek - 73.5).abs() < 1e-9
+        ));
+
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
     fn handle_drives_structured_playback_credentials_and_login() {
         let runtime = test_runtime();
         let handle = runtime.handle();
@@ -2357,6 +2565,61 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(line.as_deref(), Some("translated-track-2"));
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn set_lyrics_translation_applies_the_mode_without_toggling() {
+        let runtime = test_runtime();
+        let handle = runtime.handle();
+        let track = playable_track("track-1");
+
+        handle.play(track).unwrap().wait().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let mut line = None;
+        while std::time::Instant::now() < deadline {
+            line = handle.snapshot().unwrap().lyric_line_text;
+            if line.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // 起播默认使用翻译。
+        assert_eq!(line.as_deref(), Some("translated-track-1"));
+
+        // 明确设置为原文（不依赖 toggle 的翻转计数）。
+        handle.set_lyrics_translation(false).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let mut line = None;
+        while std::time::Instant::now() < deadline {
+            line = handle.snapshot().unwrap().lyric_line_text;
+            if line == Some("track-1".to_owned()) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(line.as_deref(), Some("track-1"));
+
+        // 再明确设置为翻译：直接生效，不翻转。
+        handle.set_lyrics_translation(true).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let mut line = None;
+        while std::time::Instant::now() < deadline {
+            line = handle.snapshot().unwrap().lyric_line_text;
+            if line == Some("translated-track-1".to_owned()) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(line.as_deref(), Some("translated-track-1"));
+
+        // 无活动会话时明确失败（与 toggle 一致）。
+        handle.stop().unwrap();
+        assert!(matches!(
+            handle.set_lyrics_translation(true),
+            Err(PlaybackError::NoActiveSession)
+        ));
+
         runtime.shutdown().unwrap();
     }
 }

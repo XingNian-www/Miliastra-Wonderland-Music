@@ -4,8 +4,9 @@ use std::sync::Arc;
 use anyhow::Result;
 use image::DynamicImage;
 use miliastra_playback::{
-    CredentialStatus, KugouAccountStatus, KugouListenReport, LoginSession, ProviderAccountStatus,
-    ProviderId, TrackMetadata, TrackRef,
+    AudioCacheStats, AudioCacheTrackStatus, CachedTrackPage, CredentialStatus, KugouAccountStatus,
+    KugouListenReport, LoginSession, ProviderAccountStatus, ProviderId, TrackKey, TrackMetadata,
+    TrackRef,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -120,6 +121,20 @@ pub(crate) trait HttpHallPort: Send + Sync {
 
 pub(crate) trait HttpPlayerPort: Send + Sync {
     fn status(&self) -> Result<PlayerStatus>;
+    fn cache_stats(
+        &self,
+        _keys: &[TrackKey],
+    ) -> Result<(Option<AudioCacheStats>, Vec<AudioCacheTrackStatus>)> {
+        Ok((None, Vec::new()))
+    }
+    /// 分页查询磁盘缓存歌曲列表；默认实现返回空页（播放器未接入缓存时）。
+    fn cached_tracks(&self, offset: usize, limit: usize) -> Result<CachedTrackPage> {
+        Ok(CachedTrackPage::empty(offset, limit))
+    }
+    /// 清零单曲统计；默认实现表示未接入播放器缓存。
+    fn reset_track_statistics(&self, _key: &TrackKey) -> Result<bool> {
+        Ok(false)
+    }
     fn search_text(&self, keyword: &str, source: &str) -> Result<String, HttpPlayerSearchError>;
     fn search_candidates(
         &self,

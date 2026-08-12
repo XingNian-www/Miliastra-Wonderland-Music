@@ -9,52 +9,111 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::io::AsyncWriteExt;
 
 use crate::cache::{
-    CacheInner, DownloadHandle, EntryState, cache_file_name, complete_file_size, trim_cache,
+    CacheInner, DownloadHandle, EntryState, cache_file_name, complete_file_size,
+    lock_metadata_store, trim_cache,
 };
 
 /// 开始下载；幂等：已下载中/已完成则直接返回现有句柄。
 pub(crate) async fn start_download(inner: &Arc<CacheInner>, hash: &str) -> Option<DownloadView> {
-    let mut entries = inner.entries.write().await;
-    let entry = entries.get_mut(hash)?;
-    match &entry.state {
-        EntryState::Complete { bytes } => {
-            entry.last_used = std::time::Instant::now();
-            Some(DownloadView::Complete { bytes: *bytes })
-        }
-        EntryState::Downloading(handle) => {
-            entry.last_used = std::time::Instant::now();
-            Some(DownloadView::InProgress(handle.clone()))
-        }
-        EntryState::Idle => {
-            // 磁盘已有完整文件（上次运行遗留或已下载过）：直接复用，跳过源站下载。
-            // 命中后立即转 Complete，后续请求直接从本地文件服务，断网也能播。
-            if let Some(bytes) = complete_file_size(&inner.config.directory, hash) {
-                // 刷新文件修改时间，让容量淘汰按最近使用（而非上次下载时间）进行。
-                let complete_path = inner.config.directory.join(cache_file_name(hash, true));
-                if let Ok(file) = std::fs::File::open(&complete_path) {
-                    let _ = file.set_modified(std::time::SystemTime::now());
-                }
-                entry.state = EntryState::Complete { bytes };
+    loop {
+        let mut entries = inner.entries.write().await;
+        let entry = entries.get_mut(hash)?;
+        match &entry.state {
+            EntryState::Complete { bytes } => {
+                let expected_bytes = *bytes;
                 entry.last_used = std::time::Instant::now();
-                return Some(DownloadView::Complete { bytes });
+                drop(entries);
+                let directory = inner.config.directory.clone();
+                let store = inner.metadata_store.clone();
+                let owned_hash = hash.to_owned();
+                let hit = tokio::task::spawn_blocking(move || {
+                    let path = directory.join(cache_file_name(&owned_hash, true));
+                    let Some(bytes) = std::fs::metadata(&path)
+                        .ok()
+                        .filter(|metadata| metadata.is_file())
+                        .map(|metadata| metadata.len())
+                    else {
+                        let store = lock_metadata_store(&store);
+                        if let Err(error) = store.clear_complete(&owned_hash) {
+                            log::warn!("音频缓存热命中文件缺失，清除完整状态失败: {error}");
+                        }
+                        return None;
+                    };
+                    if let Ok(file) = std::fs::File::open(&path) {
+                        let _ = file.set_modified(std::time::SystemTime::now());
+                    }
+                    let store = lock_metadata_store(&store);
+                    if let Err(error) = store.touch(&owned_hash) {
+                        log::warn!("音频缓存热命中刷新元数据失败: {error}");
+                    }
+                    Some(bytes)
+                })
+                .await
+                .ok()
+                .flatten();
+                if let Some(bytes) = hit {
+                    return Some(DownloadView::Complete { bytes });
+                }
+                let mut entries = inner.entries.write().await;
+                if let Some(entry) = entries.get_mut(hash)
+                    && matches!(entry.state, EntryState::Complete { bytes } if bytes == expected_bytes)
+                {
+                    entry.state = EntryState::Idle;
+                }
+                drop(entries);
+                continue;
             }
-            // 先占位为 Downloading，再释放锁启动任务，防止并发重复下载。
-            let handle = DownloadHandle {
-                ready: Arc::new(tokio::sync::Notify::new()),
-                bytes: Arc::new(AtomicUsize::new(0)),
-                failed: Arc::new(AtomicBool::new(false)),
-                finished: Arc::new(AtomicBool::new(false)),
-            };
-            entry.state = EntryState::Downloading(handle.clone());
-            let source = entry.source.clone();
-            let file = entry.file.clone();
-            let hash = hash.to_owned();
-            drop(entries);
-            let inner = inner.clone();
-            tokio::spawn(async move {
-                run_download(inner.clone(), hash, source, file).await;
-            });
-            Some(DownloadView::InProgress(handle))
+            EntryState::Downloading(handle) => {
+                entry.last_used = std::time::Instant::now();
+                return Some(DownloadView::InProgress(handle.clone()));
+            }
+            EntryState::Idle => {
+                // 磁盘已有完整文件（上次运行遗留或已下载过）：直接复用，跳过源站下载。
+                // 命中后立即转 Complete，后续请求直接从本地文件服务，断网也能播。
+                if let Some(bytes) = complete_file_size(&inner.config.directory, hash) {
+                    // 刷新文件修改时间，让容量淘汰按最近使用（而非上次下载时间）进行。
+                    let complete_path = inner.config.directory.join(cache_file_name(hash, true));
+                    if let Ok(file) = std::fs::File::open(&complete_path) {
+                        let _ = file.set_modified(std::time::SystemTime::now());
+                    }
+                    entry.state = EntryState::Complete { bytes };
+                    entry.last_used = std::time::Instant::now();
+                    // 释放注册表锁后，在阻塞线程池刷新元数据索引（失败仅 warning）。
+                    drop(entries);
+                    let store = inner.metadata_store.clone();
+                    let hash = hash.to_owned();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let store = lock_metadata_store(&store);
+                        if let Err(error) = store.touch(&hash) {
+                            log::warn!("音频缓存命中刷新元数据失败: {error}");
+                        }
+                        if let Err(error) = store.mark_complete(&hash, bytes, false) {
+                            log::warn!("音频缓存命中标记完整失败: {error}");
+                        }
+                    })
+                    .await;
+                    return Some(DownloadView::Complete { bytes });
+                }
+                // 先占位为 Downloading，再释放锁启动任务，防止并发重复下载。
+                let handle = DownloadHandle {
+                    token: Arc::new(()),
+                    ready: Arc::new(tokio::sync::Notify::new()),
+                    bytes: Arc::new(AtomicUsize::new(0)),
+                    failed: Arc::new(AtomicBool::new(false)),
+                    finished: Arc::new(AtomicBool::new(false)),
+                };
+                entry.state = EntryState::Downloading(handle.clone());
+                let source = entry.source.clone();
+                let file = entry.file.clone();
+                let hash = hash.to_owned();
+                drop(entries);
+                let inner = inner.clone();
+                let task_handle = handle.clone();
+                tokio::spawn(async move {
+                    run_download(inner.clone(), hash, source, file, task_handle).await;
+                });
+                return Some(DownloadView::InProgress(handle));
+            }
         }
     }
 }
@@ -99,6 +158,7 @@ async fn run_download(
     hash: String,
     source: crate::domain::StreamSource,
     part_file: PathBuf,
+    task_handle: DownloadHandle,
 ) {
     // 并发下载槽位：占满时排队等待，保证配置的并发上限生效。
     // 信号量只在进程退出时关闭，acquire 失败视为放弃本次下载。
@@ -107,22 +167,30 @@ async fn run_download(
         Err(_) => return,
     };
     inner.active_downloads.fetch_add(1, Ordering::SeqCst);
-    let result = download_to_file(&inner, &hash, &source, &part_file).await;
+    let result = download_to_file(&inner, &hash, &source, &part_file, &task_handle).await;
     inner.active_downloads.fetch_sub(1, Ordering::SeqCst);
 
     // 更新注册表状态（先取句柄，避免借用冲突）。
     let max_bytes = inner.config.max_bytes;
-    let (notify, handle, completed) = {
+    let (notify, handle, completed, completed_size) = {
         let mut entries = inner.entries.write().await;
         // 以下两个提前返回实际不可达：下载中条目 last_used 最新不会被淘汰，
         // 幂等占位保证本任务执行期间状态恒为 Downloading；此处清理残留文件兜底。
         let Some(entry) = entries.get_mut(&hash) else {
-            let _ = std::fs::remove_file(&part_file);
+            task_handle.finished.store(true, Ordering::SeqCst);
+            task_handle.ready.notify_waiters();
             return;
         };
         let EntryState::Downloading(handle) = &entry.state else {
+            task_handle.finished.store(true, Ordering::SeqCst);
+            task_handle.ready.notify_waiters();
             return;
         };
+        if !Arc::ptr_eq(&handle.token, &task_handle.token) {
+            task_handle.finished.store(true, Ordering::SeqCst);
+            task_handle.ready.notify_waiters();
+            return;
+        }
         let handle = handle.clone();
         match result {
             Ok(()) => {
@@ -132,17 +200,30 @@ async fn run_download(
                 inner
                     .downloaded_bytes
                     .fetch_add(size as usize, Ordering::SeqCst);
-                (handle.ready.clone(), handle, true)
+                (handle.ready.clone(), handle, true, Some(size))
             }
             Err(error) => {
                 log::warn!("音频缓存下载失败，等待下次请求重试: {error}");
                 let _ = std::fs::remove_file(&part_file);
                 entry.state = EntryState::Idle;
                 handle.failed.store(true, Ordering::SeqCst);
-                (handle.ready.clone(), handle, false)
+                (handle.ready.clone(), handle, false, None)
             }
         }
     };
+    // 注册表锁已释放：在阻塞线程池同步元数据索引，标记完整并记录字节数
+    // （失败仅 warning，不影响缓存可用性，下次对账可补齐）。
+    if let Some(size) = completed_size {
+        let store = inner.metadata_store.clone();
+        let hash = hash.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            let store = lock_metadata_store(&store);
+            if let Err(error) = store.mark_complete(&hash, size, true) {
+                log::warn!("音频缓存下载完成标记元数据失败: {error}");
+            }
+        })
+        .await;
+    }
     // 标记下载结束并唤醒所有等待方（最后一块数据后不再有推进通知）。
     handle.finished.store(true, Ordering::SeqCst);
     notify.notify_waiters();
@@ -157,17 +238,15 @@ async fn download_to_file(
     hash: &str,
     source: &crate::domain::StreamSource,
     part_file: &std::path::Path,
+    task_handle: &DownloadHandle,
 ) -> Result<(), String> {
-    let mut request = inner
-        .client
-        .get(source.url.clone())
-        .timeout(inner.config.request_timeout);
+    let mut request = inner.client.get(source.url.clone());
     for (name, value) in &source.headers {
         request = request.header(name, value);
     }
-    let mut response = request
-        .send()
+    let mut response = tokio::time::timeout(inner.config.request_timeout, request.send())
         .await
+        .map_err(|_| "等待源站响应头超时".to_owned())?
         .map_err(|error| format!("源站请求失败: {error}"))?;
     if !response.status().is_success() {
         return Err(format!("源站返回 HTTP {}", response.status()));
@@ -175,29 +254,46 @@ async fn download_to_file(
     // 有明确 Content-Length 时，下载结束必须与之相符，否则视为源站截断：
     // 残缺文件一旦改名 .complete 会被当作完整缓存反复播放失败。
     let expected_bytes = response.content_length();
+    if expected_bytes.is_some_and(|bytes| bytes > inner.config.max_bytes) {
+        return Err(format!(
+            "源站文件超过单文件缓存上限 {} 字节",
+            inner.config.max_bytes
+        ));
+    }
     let mut file = tokio::fs::File::create(part_file)
         .await
         .map_err(|error| format!("创建缓存文件失败: {error}"))?;
     let mut written = 0usize;
     loop {
-        let chunk = response
-            .chunk()
+        let chunk = tokio::time::timeout(inner.config.request_timeout, response.chunk())
             .await
+            .map_err(|_| "读取源站响应流超时".to_owned())?
             .map_err(|error| format!("读取源站响应流失败: {error}"))?;
         let Some(chunk) = chunk else {
             break;
         };
+        if (written as u64).saturating_add(chunk.len() as u64) > inner.config.max_bytes {
+            return Err(format!(
+                "源站文件超过单文件缓存上限 {} 字节",
+                inner.config.max_bytes
+            ));
+        }
+        let entries = inner.entries.read().await;
+        let owns_entry = entries.get(hash).is_some_and(|entry| {
+            matches!(&entry.state, EntryState::Downloading(handle)
+                if Arc::ptr_eq(&handle.token, &task_handle.token))
+        });
+        if !owns_entry {
+            return Err("下载任务身份已失效".to_owned());
+        }
+        // 持有读锁直到本块落盘，保证 invalidate 不能在身份检查与写入间替换任务。
         file.write_all(&chunk)
             .await
             .map_err(|error| format!("写入缓存文件失败: {error}"))?;
+        drop(entries);
         written += chunk.len();
-        let mut entries = inner.entries.write().await;
-        if let Some(entry) = entries.get_mut(hash)
-            && let EntryState::Downloading(handle) = &entry.state
-        {
-            handle.bytes.store(written, Ordering::SeqCst);
-            handle.ready.notify_waiters();
-        }
+        task_handle.bytes.store(written, Ordering::SeqCst);
+        task_handle.ready.notify_waiters();
     }
     if let Some(expected) = expected_bytes
         && written as u64 != expected
@@ -210,9 +306,18 @@ async fn download_to_file(
         .await
         .map_err(|error| format!("刷新缓存文件失败: {error}"))?;
     drop(file);
-    // 半成品改名为完整文件。
+    let entries = inner.entries.read().await;
+    let owns_entry = entries.get(hash).is_some_and(|entry| {
+        matches!(&entry.state, EntryState::Downloading(handle)
+            if Arc::ptr_eq(&handle.token, &task_handle.token))
+    });
+    if !owns_entry {
+        return Err("下载任务身份已失效".to_owned());
+    }
+    // 持有读锁完成改名，防止 invalidate+rewrite 在最终身份检查后插入新任务。
     let complete_path = part_file.with_extension("complete");
     std::fs::rename(part_file, &complete_path)
         .map_err(|error| format!("缓存文件落盘失败: {error}"))?;
+    drop(entries);
     Ok(())
 }

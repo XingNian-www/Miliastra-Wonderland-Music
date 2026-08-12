@@ -16,6 +16,8 @@ pub(crate) enum EngineCommand {
         song_key: SongKey,
         stream: StreamSource,
         end_behavior: EndBehavior,
+        /// 起始播放位置（秒）：恢复播放时从该位置起播；None 表示从头播放。
+        seek_seconds: Option<f64>,
     },
     RefreshStream {
         session_id: Uuid,

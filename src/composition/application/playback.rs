@@ -311,6 +311,10 @@ impl PlaybackCommandPort for ApplicationRuntime {
         self.playback.player.set_volume(volume).map(|_| ())
     }
 
+    fn toggle_lyrics(&mut self) -> Result<String> {
+        self.playback.player.toggle_lyrics()
+    }
+
     fn remove_playback_queue_indexes(
         &mut self,
         indexes: Vec<usize>,

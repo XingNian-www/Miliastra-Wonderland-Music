@@ -134,8 +134,13 @@ impl MusicPlayerBackend for PlayerRuntimeBackend {
         })
     }
 
-    fn play(&self, track: &PlayableTrack) -> Result<String> {
-        self.dispatch(PlayerControl::Play(track.clone()))
+    fn play(&self, track: &PlayableTrack, requested: bool) -> Result<String> {
+        self.dispatch(PlayerControl::Play(track.clone(), requested))
+    }
+
+    /// 恢复播放：把起始位置（秒）透传给播放器运行时（内置引擎从该进度续播）。
+    fn play_restored(&self, track: &PlayableTrack, seek_seconds: Option<f64>) -> Result<String> {
+        self.dispatch(PlayerControl::PlayRestored(track.clone(), seek_seconds))
     }
 
     /// 歌曲级不可播放（无音源/需要VIP/无版权）——这类错误会触发自动换源尝试其他平台；
@@ -174,6 +179,15 @@ impl MusicPlayerBackend for PlayerRuntimeBackend {
             return Err(anyhow!("音量必须是 0-100 的数字"));
         }
         self.dispatch(PlayerControl::SetVolume(volume))
+    }
+
+    fn toggle_lyrics(&self) -> Result<String> {
+        self.dispatch(PlayerControl::ToggleLyrics)
+    }
+
+    /// 明确设置歌词是否使用翻译：透传给播放器运行时（恢复播放时应用持久化模式）。
+    fn set_lyrics_translation(&self, use_translation: bool) -> Result<String> {
+        self.dispatch(PlayerControl::SetLyricsTranslation(use_translation))
     }
 
     fn invalidate_audio_cache(&self, key: &miliastra_playback::TrackKey) -> Result<()> {
@@ -312,7 +326,7 @@ mod tests {
         );
 
         let error = backend
-            .play(&track)
+            .play(&track, true)
             .expect_err("the fake player should reject the track");
 
         assert!(backend.is_track_unavailable_error(&error));

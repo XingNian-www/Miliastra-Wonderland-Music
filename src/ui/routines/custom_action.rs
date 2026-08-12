@@ -774,7 +774,7 @@ mod tests {
         let keys = Arc::new(Mutex::new(Vec::new()));
         let ui_runtime = UiRuntime::start(RecordingDevice { keys: keys.clone() }, 4).unwrap();
         let ocr_runtime = OcrRuntime::start(EmptyOcr, 1).unwrap();
-        let config = AppConfig::load(Path::new("config.yaml")).unwrap();
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
         let action_ui = CustomActionUi::new(
             ui_runtime.handle(),
             ocr_runtime.handle(),
@@ -818,7 +818,7 @@ mod tests {
         let keys = Arc::new(Mutex::new(Vec::new()));
         let ui_runtime = UiRuntime::start(RecordingDevice { keys: keys.clone() }, 2).unwrap();
         let ocr_runtime = OcrRuntime::start(EmptyOcr, 1).unwrap();
-        let config = AppConfig::load(Path::new("config.yaml")).unwrap();
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
         let action_ui = CustomActionUi::new(
             ui_runtime.handle(),
             ocr_runtime.handle(),
@@ -865,7 +865,7 @@ mod tests {
         )
         .unwrap();
         let ocr_runtime = OcrRuntime::start(EmptyOcr, 1).unwrap();
-        let config = AppConfig::load(Path::new("config.yaml")).unwrap();
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
         let action_ui = CustomActionUi::new(
             ui_runtime.handle(),
             ocr_runtime.handle(),
@@ -907,7 +907,7 @@ mod tests {
         )
         .unwrap();
         let ocr_runtime = OcrRuntime::start(EmptyOcr, 1).unwrap();
-        let config = AppConfig::load(Path::new("config.yaml")).unwrap();
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
         let action_ui = CustomActionUi::new(
             ui_runtime.handle(),
             ocr_runtime.handle(),

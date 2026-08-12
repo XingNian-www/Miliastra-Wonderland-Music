@@ -9,7 +9,10 @@ mod lyrics;
 mod model;
 mod runtime;
 
-pub use cache::{AudioCache, AudioCacheConfig};
+pub use cache::{
+    AudioCache, AudioCacheConfig, AudioCacheStats, AudioCacheTrackStatus, CachedTrackInfo,
+    CachedTrackPage, DEFAULT_MAX_REGISTRY_ENTRIES,
+};
 pub use catalog::{
     KugouAccountStatus, KugouListenReport, PlaybackEligibility, ProviderAccountStatus, ProviderId,
 };

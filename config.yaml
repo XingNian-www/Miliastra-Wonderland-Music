@@ -1,223 +1,24 @@
-# Miliastra Wonderland Music 配置
-# 坐标以游戏客户区左上角为原点，按 1920x1080 有效画面书写
-#
-# 本文件只保留核心运行配置。功能配置已按功能域拆到 deps/ 目录，
-# 修改对应功能时直接改对应文件：
-#
-#   deps/ocr.yaml               OCR 模型与识别参数
-#   deps/screen.yaml            游戏界面区域坐标
-#   deps/templates.yaml         模板图片路径与匹配阈值
-#   deps/moderation.yaml        拉黑/屏蔽区域与投票参数
-#   deps/startup.yaml           启动游戏 / 进入千星流程
-#   deps/invite.yaml            好友邀请流程区域
-#   deps/playback.yaml          播放器、登录助手与音频缓存
-#   deps/song.yaml              点歌队列、去重、审核与匹配
-#   deps/ai.yaml                点歌 AI
-#   deps/entertainment.yaml     成语接龙、斗地主、卧底、海龟汤
-#   deps/hotkeys.yaml           全局热键
-#   deps/friend_delivery.yaml   好友投递
-#   deps/custom_workflows.yaml  自定义流程
-#
-ocr_config_path: deps/ocr.yaml
-screen_config_path: deps/screen.yaml
-templates_config_path: deps/templates.yaml
-moderation_config_path: deps/moderation.yaml
-startup_config_path: deps/startup.yaml
-invite_config_path: deps/invite.yaml
-playback_config_path: deps/playback.yaml
-song_config_path: deps/song.yaml
-ai_config_path: deps/ai.yaml
-entertainment_config_path: deps/entertainment.yaml
-hotkeys_config_path: deps/hotkeys.yaml
-friend_delivery_config_path: deps/friend_delivery.yaml
-custom_workflows_config_path: deps/custom_workflows.yaml
+# Miliastra 最小启动配置
+# 本文件只保留启动引导所需的三个段：database_path、http、logging。
+# 旧版完整配置（window/screen/ocr/templates 等全部功能段）不再从本文件读取，
+# 升级时请删除旧段、只保留以下三个引导段；其余配置保存在统一数据库
+# playback.sqlite3 中，通过 Web 面板（http.port）的“配置中心”页面查看与修改。
+# 保留旧段会导致启动解析失败（未知字段被严格拒绝）。
 
-# ===== 窗口 =====
-# 目标游戏进程与画面尺寸，坐标均以此为基准
-window:
-  # 进程名，多个用逗号分隔，大小写不敏感
-  target_process: yuanshen.exe,GenshinImpact.exe
-  # 画面宽度
-  content_width: 1920
-  # 画面高度
-  content_height: 1080
-  # /active-window 接口是否自动切回游戏窗口
-  auto_activate_window: false
-  # 全局安全聚焦点，只在业务入口聚焦窗口时使用一次
-  focus_point:
-    x: 1919
-    y: 1000
+# 统一数据库路径（相对主程序所在目录）；存放配置、播放状态、队列、缓存索引、歌词
+database_path: deps/data/playback.sqlite3
 
-# ===== 稳定性 =====
-# 界面状态连续确认次数，防止瞬时误判
-stability:
-  # 全局默认值；只有大于 1 才生效，否则用内置值 2
-  default_count: 2
-  # 公共 UI 模板状态；0/1 继承全局
-  ui_state_count: 0
-  # 二级大厅气泡与发送者关联；0/1 继承全局
-  secondary_hall_count: 0
-
-# ===== 时序 =====
-# 各流程等待与轮询间隔，单位毫秒
-timing:
-  # 监听子进程异常退出后的重启等待
-  watchdog_restart_ms: 2000
-  # 主循环空转间隔（脚本暂停或每轮扫描后）
-  loop_idle_ms: 60
-
-  # ---- 聊天扫描 ----
-  chat_scan:
-    # 画面无变化时强制扫描的兜底间隔
-    fallback_ms: 2000
-    # 变化后等待画面稳定再 OCR
-    change_debounce_ms: 120
-    # 两次变化触发 OCR 的最小间隔
-    change_cooldown_ms: 250
-
-  # ---- 命令执行 ----
-  command:
-    # 执行命令前等待回到一级界面的最长时间
-    ui_timeout_ms: 15000
-    # 返回一级时 ESC 后的重检基础时间；连续失败递增，超过 5 次固定 2000
-    return_retry_ms: 1000
-    # 命令执行后等待聊天列表/动画稳定再复扫
-    post_settle_ms: 500
-    # @帮助 多条消息的发送间隔
-    help_batch_ms: 500
-
-  # ---- 输入操作 ----
-  input:
-    # 自动激活游戏窗口后等待前台切换完成
-    after_activate_ms: 200
-    # 手动调试工具显式聚焦游戏窗口后的等待
-    focus_ms: 300
-    # 回车打开聊天输入后的等待
-    open_chat_ms: 300
-    # 每次点击聊天输入区域后的等待
-    click_ms: 150
-    # 输入文本后到发送前的等待
-    text_ms: 250
-    # 发送聊天后等待界面稳定
-    send_ms: 300
-
-  # ---- 自定义流程 ----
-  workflow:
-    # wait_template/click_template 默认最长等待
-    default_timeout_ms: 5000
-    # 等待模板出现时的轮询间隔
-    default_poll_ms: 200
-    # 每个步骤执行后的默认等待
-    default_step_wait_ms: 300
-
-  # ---- 大厅 ----
-  hall:
-    # 进入/退出大厅页面后等待页面稳定
-    page_settle_ms: 800
-    # 大厅信息多次 OCR 采样间隔
-    ocr_sample_interval_ms: 120
-
-  # ---- 邀请 ----
-  invite:
-    # 打开好友/聊天面板前后的固定等待
-    open_chat_ms: 400
-    # 点击好友后、输入密码前的短暂等待；主流程由后续 OCR 确认页面状态
-    step_ms: 800
-    # 非公共大厅邀请等待确认/拒绝命令的最长时间
-    confirm_timeout_ms: 30000
-    # 邀请确认扫描间隔
-    confirm_poll_ms: 2000
-
-  # ---- 管理（拉黑/屏蔽）----
-  moderation:
-    # UID 请求的好友私聊投票等待时间
-    vote_timeout_ms: 120000
-    # 投票 OCR 扫描间隔
-    vote_poll_ms: 2000
-    # 点击 UID 搜索按钮后等待搜索结果出现
-    search_result_timeout_ms: 5000
-    # 点击确认按钮后等待动作完成
-    confirm_wait_ms: 2000
-
-  # ---- 播放监控 ----
-  playback:
-    # 点歌后查询播放状态的间隔
-    status_poll_ms: 1000
-    # 播放监控线程循环间隔
-    monitor_tick_ms: 200
-    # 监控向原生播放运行时校准状态的间隔
-    monitor_status_ms: 1000
-    # URI 连续确认次数；0/1 继承全局
-    uri_stable_samples: 0
-    # 播放状态连续确认次数；0/1 继承全局
-    transport_stable_samples: 0
-    # 播放器异常时保留上一条稳定观测的最长时间
-    stale_timeout_ms: 5000
-
-  # ---- 决策确认 ----
-  decision:
-    # 匹配失败/AI 自动匹配后等待用户确认的最长时间
-    timeout_ms: 20000
-    # 期间扫描确认命令的间隔
-    poll_ms: 2000
-
-  # ---- 外部服务 ----
-  external:
-    # 内置播放器音量渐变（防爆音）：每个平滑步进的间隔，异步执行不阻塞命令
-    volume_smooth_step_ms: 300
-    # AI HTTP 请求超时
-    ai_request_timeout_ms: 35000
-
-# ===== 输出 =====
-# 游戏内回复与点击点位
-output:
-  # 是否真的向游戏内发送回复；false 时只写日志
-  send_enabled: true
-  # 手动调试工具用的聊天面板安全点击点；自动流程返回一级只用 ESC
-  focus_point:
-    x: 1919
-    y: 1000
-  # 打开聊天输入后的输入框位置
-  chat_click_2:
-    x: 600
-    y: 1013
-
-# ===== Web 面板 =====
+# Web 面板/配置中心
 http:
-  # 监听地址
-  host: 127.0.0.1
-  # 监听端口
-  port: 18888
-  # 是否启用
   enabled: true
-  # 非本机监听时必须设置；Web 页面会在当前浏览器会话中保存该令牌
+  host: 127.0.0.1
+  port: 18888
+  # access_token 留空默认本机免鉴权；非本机监听时必须设置
   access_token: ""
 
-# ===== 日志 =====
+# 日志（日志初始化在数据库打开之前，必须留在引导配置）
 logging:
-  # 日志目录；统一放在 deps/ 内，与凭据等运行数据一致
   dir: deps/logs
-  # 级别：error/warn/info/debug/trace
   level: info
-  # 按自然日分文件；跨日自动轮转
   rotate_daily: true
-  # 最多保留多少个自然日的日志；0 不清理
   retain_days: 7
-
-# ===== 终端面板 =====
-tui:
-  # 是否启用；启用后实时显示事件日志、OCR 内容和队列状态
-  enabled: true
-  # 刷新间隔（毫秒）
-  refresh_ms: 100
-  # 保留最近多少行日志
-  log_lines: 200
-
-# ===== 状态持久化 =====
-state:
-  # 播放器确认状态；统一放在 deps/ 内
-  playback_state_path: deps/data/playback-state.json
-  # 大厅倒计时状态
-  hall_state_path: deps/data/hall-state.json
-  # 最终执行命令记录
-  executed_commands_log_path: deps/data/executed-commands.log

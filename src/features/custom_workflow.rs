@@ -33,6 +33,16 @@ pub struct WorkflowTimingConfig {
     pub default_step_wait_ms: u64,
 }
 
+impl Default for WorkflowTimingConfig {
+    fn default() -> Self {
+        Self {
+            default_timeout_ms: 5000,
+            default_poll_ms: 200,
+            default_step_wait_ms: 300,
+        }
+    }
+}
+
 impl WorkflowTimingConfig {
     pub(crate) fn validate(&self) -> Result<()> {
         if self.default_timeout_ms == 0 {

@@ -53,6 +53,7 @@ fn cache_config(directory: PathBuf) -> AudioCacheConfig {
     AudioCacheConfig {
         enabled: true,
         directory,
+        metadata_directory: PathBuf::new(),
         max_bytes: 64 * 1024 * 1024,
         max_concurrent_downloads: 2,
         request_timeout: Duration::from_secs(15),
@@ -85,6 +86,7 @@ async fn proxy_serves_streaming_then_cached_complete_and_range() {
     let rewritten = cache
         .rewrite(
             &key,
+            None,
             sample_stream(format!("http://{origin_addr}/audio.mp3")),
         )
         .await;
@@ -174,7 +176,11 @@ async fn failed_download_is_retried_on_next_request() {
         .expect("缓存启动");
     let key = SongKey::new("qq", "e2e-2").unwrap();
     let rewritten = cache
-        .rewrite(&key, sample_stream(format!("http://{addr}/audio.mp3")))
+        .rewrite(
+            &key,
+            None,
+            sample_stream(format!("http://{addr}/audio.mp3")),
+        )
         .await;
 
     // 第一次请求可能拿不到完整数据（连接被切断）；失败后注册表回退 Idle。
@@ -210,6 +216,7 @@ async fn rewrite_points_to_local_proxy_and_preserves_source_headers() {
     let rewritten = cache
         .rewrite(
             &key,
+            None,
             StreamSource {
                 url: format!("http://{origin_addr}/a.mp3").parse().unwrap(),
                 headers,
@@ -278,7 +285,11 @@ async fn truncated_origin_response_is_not_marked_complete() {
         .expect("缓存启动");
     let key = SongKey::new("qq", "e2e-trunc").unwrap();
     let rewritten = cache
-        .rewrite(&key, sample_stream(format!("http://{addr}/audio.mp3")))
+        .rewrite(
+            &key,
+            None,
+            sample_stream(format!("http://{addr}/audio.mp3")),
+        )
         .await;
 
     // 第一次请求：截断数据不应被视为完整缓存。
@@ -335,7 +346,7 @@ async fn invalidate_removes_cache_entry_and_triggers_redownload() {
 
     // 首次播放：完整下载。
     let rewritten = cache
-        .rewrite(&key, sample_stream(format!("http://{addr}/a.mp3")))
+        .rewrite(&key, None, sample_stream(format!("http://{addr}/a.mp3")))
         .await;
     let data = reqwest::get(rewritten.url)
         .await
@@ -351,7 +362,7 @@ async fn invalidate_removes_cache_entry_and_triggers_redownload() {
 
     // 重新播放（重新 rewrite）：触发重新下载，数据完整。
     let rewritten = cache
-        .rewrite(&key, sample_stream(format!("http://{addr}/a.mp3")))
+        .rewrite(&key, None, sample_stream(format!("http://{addr}/a.mp3")))
         .await;
     let data = reqwest::get(rewritten.url)
         .await
@@ -404,7 +415,7 @@ async fn prefetch_downloads_immediately_and_proxy_serves_from_disk() {
         .expect("缓存启动");
     let key = SongKey::new("qq", "e2e-prefetch").unwrap();
     let rewritten = cache
-        .rewrite(&key, sample_stream(format!("http://{addr}/a.mp3")))
+        .rewrite(&key, None, sample_stream(format!("http://{addr}/a.mp3")))
         .await;
 
     // 主动下载；下载完成后代理请求命中磁盘（不再次访问源站）。
@@ -424,6 +435,106 @@ async fn prefetch_downloads_immediately_and_proxy_serves_from_disk() {
     .expect("等待下载完成并服务完整数据");
     assert_eq!(&data[..], &body[..]);
     assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    cache.shutdown().await;
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// 下载未完成时非零 Range 必须返回 416，不能用 200 从偏移处伪装整流。
+#[tokio::test]
+async fn streaming_nonzero_range_returns_416() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buffer = [0u8; 2048];
+        let _ = stream.read(&mut buffer).await;
+        let _ = stream
+            .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+            .await;
+        let _ = stream.write_all(b"4\r\ntest\r\n").await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    });
+    let directory = std::env::temp_dir().join(format!(
+        "miliastra-audio-cache-range-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let cache = AudioCache::spawn(cache_config(directory.clone()))
+        .await
+        .unwrap();
+    let key = SongKey::new("qq", "range-downloading").unwrap();
+    let rewritten = cache
+        .rewrite(
+            &key,
+            None,
+            sample_stream(format!("http://{addr}/audio.mp3")),
+        )
+        .await;
+    assert!(cache.prefetch(&key).await);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let response = reqwest::Client::new()
+        .get(rewritten.url)
+        .header(reqwest::header::RANGE, "bytes=1-2")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::RANGE_NOT_SATISFIABLE
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(reqwest::header::CONTENT_RANGE)
+            .unwrap(),
+        "bytes */*"
+    );
+
+    cache.shutdown().await;
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// Content-Length 超过单文件上限时提前失败，且不得留下 part/complete 文件。
+#[tokio::test]
+async fn oversized_content_length_is_rejected_without_cache_file() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buffer = [0u8; 2048];
+        let _ = stream.read(&mut buffer).await;
+        let _ = stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1024\r\n\r\n")
+            .await;
+    });
+    let directory = std::env::temp_dir().join(format!(
+        "miliastra-audio-cache-oversize-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let mut config = cache_config(directory.clone());
+    config.max_bytes = 16;
+    let cache = AudioCache::spawn(config).await.unwrap();
+    let key = SongKey::new("qq", "oversize").unwrap();
+    cache
+        .rewrite(
+            &key,
+            None,
+            sample_stream(format!("http://{addr}/audio.mp3")),
+        )
+        .await;
+    assert!(cache.prefetch(&key).await);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let files: Vec<_> = std::fs::read_dir(&directory)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|ext| ext == "part" || ext == "complete")
+        })
+        .collect();
+    assert!(files.is_empty(), "超限下载留下文件: {files:?}");
 
     cache.shutdown().await;
     let _ = std::fs::remove_dir_all(&directory);

@@ -17,7 +17,6 @@ use crate::observation::shared::{
 const SHARED_CHAT_HISTORY_CAPACITY: usize = 64;
 const PRIMARY_VISIBLE_MIN_MESSAGES: usize = 2;
 const PRIMARY_VISIBLE_MAX_MESSAGES: usize = 5;
-const PRIMARY_REBASE_STABLE_SAMPLES: u32 = 2;
 
 #[derive(Clone)]
 pub(crate) struct PrimaryObservedMessage {
@@ -91,7 +90,6 @@ struct ChatObservationState {
     next_bubble_sequence: u64,
     primary_visible: Vec<PrimaryTrackedMessage>,
     primary_initialized: bool,
-    primary_rebase_candidate: Option<PrimaryRebaseCandidate>,
     ledger: ChatObservationLedger,
     completion_advances: SharedObservationStream<CompletionAdvance>,
 }
@@ -102,10 +100,6 @@ struct PrimaryTrackedMessage {
     message_type: String,
     text_key: String,
     handled: bool,
-}
-
-struct PrimaryRebaseCandidate {
-    lost_samples: u32,
 }
 
 #[derive(Clone)]
@@ -128,7 +122,6 @@ impl ChatObservationShared {
                 next_bubble_sequence: 1,
                 primary_visible: Vec::new(),
                 primary_initialized: false,
-                primary_rebase_candidate: None,
                 ledger: ChatObservationLedger::new(),
                 completion_advances: SharedObservationStream::new(
                     NonZeroUsize::new(SHARED_CHAT_HISTORY_CAPACITY)
@@ -321,7 +314,6 @@ impl ChatObservationShared {
         state.next_bubble_sequence = 1;
         state.primary_visible.clear();
         state.primary_initialized = false;
-        state.primary_rebase_candidate = None;
         Ok(state.visual_session)
     }
 
@@ -415,9 +407,9 @@ fn track_primary_messages(
     }
 
     let Some(overlap) = primary_suffix_prefix_overlap(state, &messages) else {
-        return handle_primary_lost_overlap(state, messages);
+        log::debug!("一级聊天当前画面无法与旧画面可靠对应，立即按内容重建基线");
+        return rebase_primary_baseline(state, messages);
     };
-    state.primary_rebase_candidate = None;
 
     let previous_start = state.primary_visible.len() - overlap;
     let mut tracked = Vec::with_capacity(messages.len());
@@ -445,7 +437,6 @@ fn establish_primary_baseline(
     messages: Vec<ChatMessage>,
 ) -> Vec<PrimaryObservedMessage> {
     state.primary_initialized = true;
-    state.primary_rebase_candidate = None;
     let mut tracked = Vec::with_capacity(messages.len());
     let mut observed = Vec::with_capacity(messages.len());
     for message in messages {
@@ -469,7 +460,6 @@ fn rebase_primary_baseline(
     messages: Vec<ChatMessage>,
 ) -> Vec<PrimaryObservedMessage> {
     state.primary_initialized = true;
-    state.primary_rebase_candidate = None;
     let mut consumed = vec![false; state.primary_visible.len()];
     let mut tracked = Vec::with_capacity(messages.len());
     let mut observed = Vec::with_capacity(messages.len());
@@ -516,26 +506,6 @@ fn rebase_primary_baseline(
     }
     state.primary_visible = tracked;
     observed
-}
-
-fn handle_primary_lost_overlap(
-    state: &mut ChatObservationState,
-    messages: Vec<ChatMessage>,
-) -> Vec<PrimaryObservedMessage> {
-    let lost_samples = state
-        .primary_rebase_candidate
-        .as_ref()
-        .map_or(1, |candidate| candidate.lost_samples.saturating_add(1));
-    if lost_samples >= PRIMARY_REBASE_STABLE_SAMPLES {
-        log::warn!(
-            "一级聊天连续 {} 次无法与旧画面对应，已把当前画面作为新基线；旧消息按内容保留状态，新消息立即识别",
-            lost_samples
-        );
-        return rebase_primary_baseline(state, messages);
-    }
-    state.primary_rebase_candidate = Some(PrimaryRebaseCandidate { lost_samples });
-    log::debug!("一级聊天当前画面无法与旧画面可靠对应，暂不更新基线，等待重扫");
-    Vec::new()
 }
 
 fn new_primary_tracked_message(
@@ -955,11 +925,9 @@ mod tests {
 
         // 画面头部多出无法对应的新消息（overlap 失败），画面仍含旧消息「消息3」。
         let rolling = vec![message_at("不同", 0, 5), message_at("消息3", 40, 30)];
-        let first_lost = publish_primary(&shared, rolling.clone());
-        assert!(primary_messages(&first_lost).is_empty());
-        let settled = publish_primary(&shared, rolling);
+        let current = publish_primary(&shared, rolling);
 
-        let messages = primary_messages(&settled);
+        let messages = primary_messages(&current);
         assert_eq!(messages.len(), 2);
         // 未见过的新消息保留为未处理（命令不丢）；旧消息保持已处理（不重复识别）。
         assert_eq!(
@@ -972,30 +940,21 @@ mod tests {
     }
 
     #[test]
-    fn primary_rebase_does_not_wait_for_two_identical_lost_frames() {
+    fn primary_rebase_recognizes_the_first_lost_frame_immediately() {
         let shared = ChatObservationShared::new();
         publish_primary(
             &shared,
             vec![message_at("消息1", 0, 10), message_at("消息2", 20, 20)],
         );
 
-        let first_lost = publish_primary(
+        let current = publish_primary(
             &shared,
             vec![
                 message_at("旧画面已滚出", 0, 30),
-                message_at("临时识别", 20, 40),
+                message_at("用户：@状态", 20, 40),
             ],
         );
-        assert!(primary_messages(&first_lost).is_empty());
-
-        let second_lost = publish_primary(
-            &shared,
-            vec![
-                message_at("另一个新消息", 0, 50),
-                message_at("用户：@状态", 20, 60),
-            ],
-        );
-        let messages = primary_messages(&second_lost);
+        let messages = primary_messages(&current);
 
         assert_eq!(messages.len(), 2);
         assert!(messages.iter().all(|message| message.is_new));

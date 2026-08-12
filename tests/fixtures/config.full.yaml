@@ -344,8 +344,10 @@ playback:
   # 播放时音源先落本地缓存，重复播放与断网时直接从磁盘服务。
   audio_cache:
     enabled: true
-    # 缓存根目录；为空时使用系统临时目录
+    # 音频文件目录；留空默认 deps/cache/audio
     directory: ""
+    # 统一播放数据库所在目录；留空默认 deps/data
+    metadata_directory: ""
     # 磁盘占用上限，单位 MiB（20 GiB）
     max_bytes_mb: 20480
     # 同时进行的源站下载任务上限
@@ -384,8 +386,8 @@ tui:
   log_lines: 200
 
 state:
-  # 播放器确认状态持久化路径
-  playback_state_path: data/playback-state.json
+  # 统一播放状态数据库路径
+  playback_state_path: deps/data/playback.sqlite3
   # 大厅倒计时状态持久化路径
   hall_state_path: data/hall-state.json
   # 最终执行命令记录路径

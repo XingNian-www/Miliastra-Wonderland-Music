@@ -628,15 +628,7 @@ impl QqMusicAdapter {
             ));
         };
         let identity = data.get("identity").unwrap_or(data);
-        let vip = identity
-            .get("vip")
-            .or_else(|| data.get("svip"))
-            .or_else(|| identity.get("HugeVip"))
-            .or_else(|| identity.get("star"))
-            .or_else(|| identity.get("twelve"))
-            .and_then(Value::as_i64)
-            .unwrap_or(0)
-            != 0;
+        let vip = qq_account_is_vip(identity, data);
         let vip_type = vip_vip_type_label(identity, data);
         let vip_expire_at_ms = identity
             .get("HugeVipEnd")
@@ -1404,30 +1396,36 @@ fn as_i64(value: &Value) -> Option<i64> {
     value.as_i64().or_else(|| value.as_str()?.parse().ok())
 }
 
+fn qq_vip_flag(value: &Value, name: &str) -> bool {
+    value.get(name).and_then(as_i64).is_some_and(|v| v != 0)
+}
+
+fn qq_account_is_vip(identity: &Value, data: &Value) -> bool {
+    qq_vip_flag(identity, "vip")
+        || qq_vip_flag(data, "svip")
+        || qq_vip_flag(identity, "HugeVip")
+        || qq_vip_flag(data, "star")
+        || qq_vip_flag(identity, "twelve")
+}
+
 /// 生成 QQ 音乐 VIP 类型标签（绿钻/SVIP/豪华绿钻/年费等组合）。
 fn vip_vip_type_label(identity: &Value, data: &Value) -> String {
-    let flag = |name: &str, value: &Value| {
-        value
-            .get(name)
-            .and_then(Value::as_i64)
-            .is_some_and(|v| v != 0)
-    };
     let mut labels = Vec::new();
-    if flag("HugeVip", identity) {
+    if qq_vip_flag(identity, "HugeVip") {
         labels.push("豪华绿钻");
-    } else if flag("vip", identity) {
+    } else if qq_vip_flag(identity, "vip") {
         labels.push("绿钻");
     }
-    if flag("svip", data) {
+    if qq_vip_flag(data, "svip") {
         labels.push("SVIP");
     }
-    if flag("star", identity) {
+    if qq_vip_flag(data, "star") {
         labels.push("星级");
     }
-    if flag("twelve", identity) {
+    if qq_vip_flag(identity, "twelve") {
         labels.push("十二平台");
     }
-    if flag("yearflag", identity) || flag("HugeYearFlag", identity) {
+    if qq_vip_flag(identity, "yearflag") || qq_vip_flag(identity, "HugeYearFlag") {
         labels.push("年费");
     }
     if labels.is_empty() {
@@ -1598,7 +1596,8 @@ mod tests {
 
     use super::{
         PlaybackEligibility, QQ_QIMEI_FALLBACK, QqDevice, QqMusicAdapter, QqQimei,
-        parse_search_candidates, qq_eligibility, qq_filename, qq_resolver_ids, qq_stream_url,
+        parse_search_candidates, qq_account_is_vip, qq_eligibility, qq_filename, qq_resolver_ids,
+        qq_stream_url, vip_vip_type_label,
     };
     use crate::catalog::{CatalogError, SourceAdapter};
     use crate::credentials::{CredentialStore, ProviderCredential};
@@ -1745,6 +1744,29 @@ mod tests {
         assert_eq!(qq_filename("mediaMid", "M500", "mp3"), "M500mediaMid.mp3");
         assert_eq!(qq_filename("mediaMid", "M800", "mp3"), "M800mediaMid.mp3");
         assert_eq!(qq_filename("mediaMid", "F000", "flac"), "F000mediaMid.flac");
+    }
+
+    #[test]
+    fn qq_account_vip_checks_every_returned_flag() {
+        let identity = json!({"vip": 0, "HugeVip": 1, "twelve": 0});
+        let data = json!({"svip": 0, "star": 0});
+        assert!(qq_account_is_vip(&identity, &data));
+
+        let identity = json!({"vip": 0, "HugeVip": 0, "twelve": 0});
+        let data = json!({"svip": 1, "star": 0});
+        assert!(qq_account_is_vip(&identity, &data));
+
+        let data = json!({"svip": 0, "star": 1});
+        assert!(qq_account_is_vip(&identity, &data));
+        assert_eq!(vip_vip_type_label(&identity, &data), "星级");
+    }
+
+    #[test]
+    fn qq_account_vip_is_false_when_all_flags_are_zero() {
+        let identity = json!({"vip": 0, "HugeVip": 0, "twelve": 0});
+        let data = json!({"svip": 0, "star": 0});
+
+        assert!(!qq_account_is_vip(&identity, &data));
     }
 
     #[test]

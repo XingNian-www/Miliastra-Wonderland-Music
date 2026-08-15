@@ -311,6 +311,27 @@ html[data-theme=light] .theme-toggle .moon{display:none}
 .page-title{margin:0 0 var(--sp-4);font-size:22px;line-height:30px}
 .page-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:var(--sp-5) var(--sp-4);align-items:start}
 .page-grid>.wide{grid-column:1/-1}
+.playback-layout{grid-template-columns:repeat(12,minmax(0,1fr));gap:var(--sp-4)}
+.playback-layout>.playback-player-panel{grid-column:span 7}
+.playback-layout>.playback-request-panel{grid-column:span 5}
+.playback-layout>.playback-queue-panel{grid-column:1/-1}
+.playback-layout>.playback-cache-stats-panel{grid-column:span 5}
+.playback-layout>.playback-cache-tracks-panel{grid-column:span 7}
+.playback-layout>.playback-history-panel{grid-column:1/-1}
+.playback-player-panel,.playback-request-panel{border:1px solid var(--sep-1);border-radius:var(--radius-l);background:var(--bg-card);padding:0 var(--sp-3) var(--sp-4);box-shadow:var(--shadow)}
+.playback-player-panel .current-song{min-height:42px;font-size:16px;line-height:23px}
+.playback-player-panel .controls{grid-template-columns:repeat(3,minmax(0,1fr));margin-top:var(--sp-4)}
+.playback-player-panel .play-mode-row{padding:var(--sp-2);border-radius:var(--radius-s);background:var(--bg-input)}
+.playback-player-panel #playbackDetail{max-height:112px}
+.playback-request-panel .panel-body>input:first-child{height:40px;font-size:var(--fs-title)}
+.playback-request-panel .compact-form{grid-template-columns:minmax(0,1fr) auto}
+.playback-request-panel>.panel-body>.controls{grid-template-columns:repeat(4,minmax(0,1fr))}
+.playback-request-panel .candidate-list{max-height:320px}
+.playback-queue-panel .queue-list{min-height:120px;max-height:280px;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));align-content:start}
+.playback-queue-panel .queue-item{min-height:48px}
+.playback-cache-stats-panel,.playback-cache-tracks-panel,.playback-history-panel,.playback-queue-panel{padding:0 var(--sp-2) var(--sp-3);border:1px solid var(--sep-2);border-radius:var(--radius-m);background:var(--bg-card)}
+.playback-cache-tracks-panel .cache-track-list{max-height:360px}
+.playback-history-panel .history{max-height:360px}
 .legacy-content{display:none!important}
 .login-session{border:1px solid var(--sep-1);border-radius:var(--radius-m);padding:var(--sp-3);background:var(--bg-input)}
 .login-session-grid,.login-facts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:var(--sp-2)}
@@ -397,8 +418,9 @@ input.config-invalid:focus,textarea.config-invalid:focus{border-color:var(--dang
 
 /* ===== 响应式 ===== */
  @media(max-width:1200px){.status-chips{gap:var(--sp-2)}.chip{font-size:var(--fs-meta)}.chip em{max-width:96px}}
- @media(max-width:1050px){.topbar{grid-template-columns:1fr;padding:var(--sp-3) var(--sp-1) var(--sp-4)}.brand{padding:var(--sp-2) var(--sp-4);border-bottom:1px solid var(--sep-2)}.status-chips,.top-actions{flex-wrap:wrap;padding:var(--sp-3) var(--sp-4);border-left:none;border-top:1px solid var(--sep-2)}.top-actions{justify-content:flex-start}.page-grid{grid-template-columns:1fr}.page-grid>.panel{grid-column:auto}.turtle-stats{grid-template-columns:repeat(3,minmax(0,1fr))}.tools-grid{grid-template-columns:1fr}.tools-grid>.panel{grid-column:auto}.config-layout{grid-template-columns:1fr}.config-sidebar{position:static;max-height:none}.config-num-row{grid-template-columns:repeat(2,minmax(0,1fr))}}
- @media(max-width:720px){.app-nav{position:sticky;top:0;width:100%;height:auto;padding:var(--sp-2);border-right:0;border-bottom:1px solid var(--sep-1);overflow:hidden}.nav-brand{display:none}.nav-links{flex-direction:row;overflow-x:auto;scrollbar-width:thin}.nav-link{width:auto;flex:0 0 auto;white-space:nowrap}.nav-tools{margin-top:0}.shell{margin-left:0;padding:0 var(--sp-3) var(--sp-5)}.controls,.two,.three,.compact-form,.ocr-send,.ocr-options,.turtle-toolbar,.turtle-grid,.login-row,.login-session-grid,.login-facts{grid-template-columns:1fr}.login-row .controls{min-width:0}.turtle-stats{grid-template-columns:1fr 1fr}.undercover-toolbar{justify-content:stretch}.undercover-toolbar .btn{flex:1}.global-result{bottom:var(--sp-2)}.tools-grid{gap:var(--sp-4)}}
+ @media(max-width:1050px){.playback-layout{grid-template-columns:1fr}.playback-layout>.panel{grid-column:auto}.playback-queue-panel .queue-list{grid-template-columns:1fr}
+ .topbar{grid-template-columns:1fr;padding:var(--sp-3) var(--sp-1) var(--sp-4)}.brand{padding:var(--sp-2) var(--sp-4);border-bottom:1px solid var(--sep-2)}.status-chips,.top-actions{flex-wrap:wrap;padding:var(--sp-3) var(--sp-4);border-left:none;border-top:1px solid var(--sep-2)}.top-actions{justify-content:flex-start}.page-grid{grid-template-columns:1fr}.page-grid>.panel{grid-column:auto}.turtle-stats{grid-template-columns:repeat(3,minmax(0,1fr))}.tools-grid{grid-template-columns:1fr}.tools-grid>.panel{grid-column:auto}.config-layout{grid-template-columns:1fr}.config-sidebar{position:static;max-height:none}.config-num-row{grid-template-columns:repeat(2,minmax(0,1fr))}}
+ @media(max-width:720px){.app-nav{position:sticky;top:0;width:100%;height:auto;padding:var(--sp-2);border-right:0;border-bottom:1px solid var(--sep-1);overflow:hidden}.nav-brand{display:none}.nav-links{flex-direction:row;overflow-x:auto;scrollbar-width:thin}.nav-link{width:auto;flex:0 0 auto;white-space:nowrap}.nav-tools{margin-top:0}.shell{margin-left:0;padding:0 var(--sp-3) var(--sp-5)}.controls,.two,.three,.compact-form,.ocr-send,.ocr-options,.turtle-toolbar,.turtle-grid,.login-row,.login-session-grid,.login-facts{grid-template-columns:1fr}.login-row .controls{min-width:0}.turtle-stats{grid-template-columns:1fr 1fr}.undercover-toolbar{justify-content:stretch}.undercover-toolbar .btn{flex:1}.global-result{bottom:var(--sp-2)}.tools-grid{gap:var(--sp-4)}.playback-player-panel,.playback-request-panel{padding-left:var(--sp-2);padding-right:var(--sp-2)}.playback-player-panel .controls{grid-template-columns:repeat(2,minmax(0,1fr))}.playback-request-panel>.panel-body>.controls{grid-template-columns:repeat(2,minmax(0,1fr))}.playback-request-panel>.panel-body>.controls .btn.primary{grid-column:auto}.candidate-item{grid-template-columns:1fr}.candidate-actions{justify-content:flex-start}}
 </style>
 </head>
 <body>
@@ -441,7 +463,7 @@ input.config-invalid:focus,textarea.config-invalid:focus{border-color:var(--dang
 
   <main id="pageHost">
     <section class="page-section" id="page-overview" data-page="overview"><h1 class="page-title">总览</h1><div class="page-grid" id="overviewGrid"><div class="panel wide"><div class="panel-head"><h2>关键摘要</h2><small>实时</small></div><div class="panel-body"><div class="login-facts"><div class="login-fact"><span>待播队列</span><strong id="overviewQueueSummary">0 首</strong></div><div class="login-fact"><span>活动任务</span><strong id="overviewTaskSummary">0 个</strong></div><div class="login-fact"><span>播放器</span><strong id="overviewPlayerSummary">未知</strong></div><div class="login-fact"><span>OCR</span><strong id="overviewOcrSummary">暂无采样</strong></div></div></div></div></div></section>
-    <section class="page-section" id="page-playback" data-page="playback"><h1 class="page-title">播放与点歌</h1><div class="page-grid" id="playbackGrid"></div></section>
+    <section class="page-section" id="page-playback" data-page="playback"><h1 class="page-title">播放与点歌</h1><div class="page-grid playback-layout" id="playbackGrid"></div></section>
     <section class="page-section" id="page-login" data-page="login"><h1 class="page-title">账号登录</h1><div class="page-grid" id="loginGrid"></div></section>
     <section class="page-section" id="page-game" data-page="game"><h1 class="page-title">游戏与聊天</h1><div class="page-grid" id="gameGrid"></div></section>
     <section class="page-section" id="page-entertainment" data-page="entertainment"><h1 class="page-title">娱乐玩法</h1><div class="page-grid" id="entertainmentGrid"></div></section>
@@ -625,9 +647,9 @@ input.config-invalid:focus,textarea.config-invalid:focus{border-color:var(--dang
           <div class="controls">
             <button class="btn good" onclick="call('/play','POST')"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M7 4.5v15l12-7.5-12-7.5z"/></svg>继续</button>
             <button class="btn warn" onclick="call('/pause','POST')"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M6.5 4.5h3.5v15H6.5zM14 4.5h3.5v15H14z"/></svg>暂停</button>
+            <button class="btn" onclick="loadStatus()">状态</button>
             <button class="btn" onclick="call('/skip-prev','POST')"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M6 4.5h2.2v15H6zM19.5 4.5 9.8 12l9.7 7.5v-15z"/></svg>上一首</button>
             <button class="btn" onclick="call('/skip-next','POST')"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M15.8 4.5H18v15h-2.2zM4.5 4.5v15l9.7-7.5-9.7-7.5z"/></svg>下一首</button>
-            <button class="btn" onclick="loadStatus()">状态</button>
             <button class="btn ghost" onclick="clearQueue()">清空队列</button>
           </div>
           <div class="volume-control">
@@ -811,6 +833,14 @@ input.config-invalid:focus,textarea.config-invalid:focus{border-color:var(--dang
 function $(id){return document.getElementById(id)}
 const pageRoutes=['overview','playback','login','game','entertainment','tasks','tools','config','settings']
 function setupPages(){
+  const playbackPanelClasses={
+    songState:'playback-player-panel',
+    keyword:'playback-request-panel',
+    monitorQueue:'playback-queue-panel',
+    cacheStats:'playback-cache-stats-panel',
+    cacheTracks:'playback-cache-tracks-panel',
+    playbackHistory:'playback-history-panel'
+  }
   const moves={
     overview:['monitorOcr','runtimeDetail'],
     playback:['songState','keyword','monitorQueue','queueMeta','cacheStats','cacheTracks','playbackHistory'],
@@ -826,7 +856,10 @@ function setupPages(){
     ids.forEach(id=>{
       const el=$(id)
       const panel=el&&el.closest('.panel')
-      if(panel&&!moved.has(panel)){grid.appendChild(panel);moved.add(panel)}
+      if(panel&&!moved.has(panel)){
+        if(route==='playback'&&playbackPanelClasses[id])panel.classList.add(playbackPanelClasses[id])
+        grid.appendChild(panel);moved.add(panel)
+      }
     })
   })
   document.querySelectorAll('#legacyContent .panel').forEach(panel=>{if(!moved.has(panel))$('settingsGrid').appendChild(panel)})
@@ -1000,7 +1033,7 @@ async function onProgressChange(){
   try{await call('/playback/seek?position='+position.toFixed(1),'POST')}catch(e){setResult('跳转失败: '+e.message)}
   loadStatus()
 }
-let currentPlayMode='sequential'
+let currentPlayMode='shuffle'
 async function setPlayMode(mode){
   try{await call('/playback/mode?mode='+mode,'POST')}catch(e){setResult('设置播放模式失败: '+e.message);return}
   currentPlayMode=mode
@@ -1010,11 +1043,11 @@ async function setPlayMode(mode){
 function refreshModeButtons(){
   const map={sequential:'modeSeq',repeat_one:'modeRepeat',shuffle:'modeShuffle'}
   ;['modeSeq','modeRepeat','modeShuffle'].forEach(id=>{const el=$(id);if(el)el.classList.remove('active')})
-  const el=$(map[currentPlayMode]||'modeSeq')
+  const el=$(map[currentPlayMode]||'modeShuffle')
   if(el)el.classList.add('active')
 }
 async function loadPlayMode(){
-  try{currentPlayMode=(await request('/playback/mode')).mode||'sequential'}catch(e){currentPlayMode='sequential'}
+  try{currentPlayMode=(await request('/playback/mode')).mode||'shuffle'}catch(e){currentPlayMode='shuffle'}
   refreshModeButtons()
 }
 async function refreshPlayer(){

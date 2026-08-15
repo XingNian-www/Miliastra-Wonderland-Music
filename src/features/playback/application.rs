@@ -375,6 +375,7 @@ pub(crate) trait PlaybackCommandPort: PlaybackExecutionPort {
         Ok(None)
     }
     fn set_volume(&mut self, volume: &str) -> Result<()>;
+    fn remove_playback_pool_track(&mut self, key: &TrackKey) -> Result<bool>;
     fn toggle_lyrics(&mut self) -> Result<String>;
     fn remove_playback_queue_indexes(
         &mut self,
@@ -436,7 +437,7 @@ pub(crate) struct PlaybackApplicationConfig {
 pub(crate) const PLAY_MODE_SEQUENTIAL: u8 = 0;
 /// 播放模式:单曲循环(重复当前曲目,不消费队列)。
 pub(crate) const PLAY_MODE_REPEAT_ONE: u8 = 1;
-/// 播放模式:随机(队列内随机选曲)。
+/// 播放模式:随机(仅作用于队列耗尽后的歌曲池)。
 pub(crate) const PLAY_MODE_SHUFFLE: u8 = 2;
 
 #[derive(Clone, Debug)]
@@ -484,13 +485,17 @@ impl PlaybackApplication {
     pub(crate) fn new(config: PlaybackApplicationConfig) -> Self {
         Self {
             config,
-            play_mode: Arc::new(AtomicU8::new(PLAY_MODE_SEQUENTIAL)),
+            play_mode: Arc::new(AtomicU8::new(PLAY_MODE_SHUFFLE)),
             last_played: Arc::new(Mutex::new(None)),
         }
     }
 
     pub(crate) fn play_mode(&self) -> u8 {
-        self.play_mode.load(Ordering::Relaxed)
+        match self.play_mode.load(Ordering::Relaxed) {
+            PLAY_MODE_REPEAT_ONE => PLAY_MODE_REPEAT_ONE,
+            PLAY_MODE_SHUFFLE => PLAY_MODE_SHUFFLE,
+            _ => PLAY_MODE_SEQUENTIAL,
+        }
     }
 
     /// 供 Web 面板共享同一个模式句柄(facade 通过它读写模式)。
@@ -529,6 +534,42 @@ impl PlaybackApplication {
                     None => port.reply("队列和播放池都为空，无可播放歌曲")?,
                 }
                 port.log_executed(context, "next queue")?;
+            }
+            PlaybackCommand::DeleteCurrentPoolTrack => {
+                let status = port.player_status()?;
+                let Some(track) = status.current_track else {
+                    port.log_executed(context, "delete current pool track unavailable")?;
+                    port.reply("当前歌曲信息不可用，未删除播放池歌曲")?;
+                    return Ok(());
+                };
+                let removed = port.remove_playback_pool_track(&track.track_ref.key)?;
+                port.log_executed(
+                    context,
+                    if removed {
+                        "delete current pool track"
+                    } else {
+                        "delete current pool track missing; next"
+                    },
+                )?;
+                match self.consume_queue("删除当前歌曲并下一曲", port)? {
+                    Some(ConsumedSelection::Queue { .. }) => {}
+                    Some(ConsumedSelection::Pool { keyword }) => {
+                        let action = if removed {
+                            "已从播放池删除当前歌曲"
+                        } else {
+                            "当前歌曲不在播放池中"
+                        };
+                        port.reply(&format!("{action}，随机续播: {keyword}"))?;
+                    }
+                    None => {
+                        let action = if removed {
+                            "已从播放池删除当前歌曲"
+                        } else {
+                            "当前歌曲不在播放池中"
+                        };
+                        port.reply(&format!("{action}；队列和播放池都为空"))?;
+                    }
+                }
             }
             PlaybackCommand::Previous => {
                 if let Some(request) = port.previous_playback_request()? {
@@ -822,9 +863,10 @@ impl PlaybackApplication {
                 log::info!("自动出队已跳过: 播放器处于用户暂停状态");
                 return Ok(None);
             }
-            // 单曲循环:重复最近一次成功播放的歌曲(不消费队列);
-            // 重播失败则清除记忆并回落到队列逻辑,避免死循环。
-            if self.play_mode() == PLAY_MODE_REPEAT_ONE {
+            let queue = port.playback_queue()?;
+            // 点歌队列独立于播放模式，始终优先按入队顺序消费。
+            // 只有队列为空时，单曲循环才作用于自动续播。
+            if queue.is_empty() && self.play_mode() == PLAY_MODE_REPEAT_ONE {
                 let last = self
                     .last_played
                     .lock()
@@ -855,16 +897,7 @@ impl PlaybackApplication {
                     }
                 }
             }
-            let queue = port.playback_queue()?;
-            let item = if queue.is_empty() {
-                None
-            } else if self.play_mode() == PLAY_MODE_SHUFFLE {
-                // 随机模式:从队列中随机取一首(不要求随机数加密安全)。
-                let index = (uuid::Uuid::new_v4().as_u128() % queue.len() as u128) as usize;
-                queue.into_iter().nth(index)
-            } else {
-                queue.into_iter().next()
-            };
+            let item = queue.into_iter().next();
             let Some(item) = item else {
                 let Some(track) = port.pick_playback_pool_track(&pool_excluded)? else {
                     return Ok(None);
@@ -1597,7 +1630,7 @@ mod tests {
     }
 
     #[test]
-    fn play_mode_defaults_to_sequential_and_handle_shares_state() {
+    fn play_mode_defaults_to_shuffle_and_handle_shares_state() {
         let application = PlaybackApplication::new(PlaybackApplicationConfig {
             console_bypass_dedup: true,
             queue_max_size: 20,
@@ -1605,14 +1638,67 @@ mod tests {
             monitor_status_ms: Arc::new(RwLock::new(100)),
             help_batch_ms: 0,
         });
-        // 默认顺序播放。
-        assert_eq!(application.play_mode(), PLAY_MODE_SEQUENTIAL);
+        // 默认随机播放歌曲池；点歌队列仍固定按顺序消费。
+        assert_eq!(application.play_mode(), PLAY_MODE_SHUFFLE);
         // Web 面板共享句柄写入后,应用侧立即可见。
         let handle = application.play_mode_handle();
         handle.store(PLAY_MODE_SHUFFLE, Ordering::Relaxed);
         assert_eq!(application.play_mode(), PLAY_MODE_SHUFFLE);
         handle.store(PLAY_MODE_REPEAT_ONE, Ordering::Relaxed);
         assert_eq!(application.play_mode(), PLAY_MODE_REPEAT_ONE);
+    }
+
+    #[test]
+    fn queued_songs_ignore_play_mode_and_keep_insertion_order() {
+        let queue = [1, 2].map(|id| QueueItem {
+            id,
+            keyword: format!("队列歌曲{id}"),
+            track: Some(test_track(
+                &format!("miliastra://track/qqmusic/{id}"),
+                &format!("队列歌曲{id} - 歌手{id}"),
+            )),
+            ..QueueItem::default()
+        });
+        let verifications = [1, 2].map(|id| PlaybackVerification::Success {
+            status: PlayerStatus {
+                status: "playing".to_string(),
+                current_uri: format!("miliastra://track/qqmusic/{id}"),
+                ..PlayerStatus::default()
+            },
+            message: format!("开始播放: 队列歌曲{id}"),
+        });
+        let mut port = VerifyingPlaybackPort {
+            queue: queue.into(),
+            verifications: verifications.into(),
+            removed_ids: Vec::new(),
+            replies: Vec::new(),
+            reply_error: false,
+            ai_search_result: Ok(None),
+            ai_search_requests: Vec::new(),
+            played_uris: Vec::new(),
+            user_paused: false,
+            pool: Vec::new(),
+            preloaded: Vec::new(),
+        };
+        let application = PlaybackApplication::new(PlaybackApplicationConfig {
+            console_bypass_dedup: true,
+            queue_max_size: 20,
+            monitor_tick_ms: Arc::new(RwLock::new(50)),
+            monitor_status_ms: Arc::new(RwLock::new(100)),
+            help_batch_ms: 0,
+        });
+        application
+            .play_mode_handle()
+            .store(PLAY_MODE_REPEAT_ONE, Ordering::Relaxed);
+
+        application.consume_queue("test", &mut port).unwrap();
+        application.consume_queue("test", &mut port).unwrap();
+
+        assert_eq!(port.removed_ids, [1, 2]);
+        assert_eq!(
+            port.played_uris,
+            ["miliastra://track/qqmusic/1", "miliastra://track/qqmusic/2"]
+        );
     }
 
     impl PlaybackExecutionPort for VerifyingPlaybackPort {
@@ -2320,6 +2406,12 @@ mod tests {
             Ok(())
         }
 
+        fn remove_playback_pool_track(&mut self, key: &TrackKey) -> Result<bool> {
+            let before = self.pool.len();
+            self.pool.retain(|track| &track.track_ref.key != key);
+            Ok(self.pool.len() != before)
+        }
+
         fn toggle_lyrics(&mut self) -> Result<String> {
             Ok("translation".to_string())
         }
@@ -2737,6 +2829,132 @@ mod tests {
         assert_eq!(
             port.replies,
             ["播放列表为空，随机续播: 播放池歌曲 - 测试歌手"]
+        );
+    }
+
+    #[test]
+    fn delete_command_removes_current_pool_track_and_plays_the_next_one() {
+        let current_uri = "miliastra://track/qqmusic/current-pool";
+        let next_uri = "miliastra://track/qqmusic/next-pool";
+        let current_track = test_track(current_uri, "待删除歌曲 - 歌手A");
+        let mut port = NavigationCommandPort {
+            previous_request: None,
+            played_uris: Vec::new(),
+            verifications: VecDeque::from([PlaybackVerification::Success {
+                status: PlayerStatus {
+                    status: "playing".to_string(),
+                    current_uri: next_uri.to_string(),
+                    ..PlayerStatus::default()
+                },
+                message: "开始播放: 下一首歌曲 - 歌手B".to_string(),
+            }]),
+            replies: Vec::new(),
+            batch_replies: Vec::new(),
+            batch_delays: Vec::new(),
+            queue: Vec::new(),
+            pool: vec![
+                current_track.clone(),
+                test_track(next_uri, "下一首歌曲 - 歌手B"),
+            ],
+            status_updates: VecDeque::new(),
+            clock: None,
+            status: PlayerStatus {
+                status: "playing".to_string(),
+                current_uri: current_uri.to_string(),
+                current_track: Some(current_track),
+                ..PlayerStatus::default()
+            },
+            stop_continuous_lyrics_after_statuses: None,
+            status_calls: 0,
+            background_lyrics_starts: Vec::new(),
+        };
+        let application = PlaybackApplication::new(PlaybackApplicationConfig {
+            console_bypass_dedup: true,
+            queue_max_size: 20,
+            monitor_tick_ms: Arc::new(RwLock::new(50)),
+            monitor_status_ms: Arc::new(RwLock::new(50)),
+            help_batch_ms: 0,
+        });
+        let context = PlaybackCommandContext {
+            message_type: "blue".to_string(),
+            username: "tester".to_string(),
+            user_command: "@删除".to_string(),
+        };
+
+        application
+            .execute_command(
+                &context,
+                &PlaybackCommand::DeleteCurrentPoolTrack,
+                &mut port,
+            )
+            .expect("delete command must succeed");
+
+        assert_eq!(port.pool.len(), 1);
+        assert_eq!(port.pool[0].track_ref.key.id, "next-pool");
+        assert_eq!(port.played_uris, [next_uri]);
+        assert_eq!(
+            port.replies,
+            ["已从播放池删除当前歌曲，随机续播: 下一首歌曲 - 歌手B"]
+        );
+    }
+
+    #[test]
+    fn delete_command_still_plays_next_when_current_track_is_not_in_pool() {
+        let current_track = test_track("miliastra://track/qqmusic/outside", "池外歌曲 - 歌手A");
+        let next_uri = "miliastra://track/qqmusic/pool-next";
+        let mut port = NavigationCommandPort {
+            previous_request: None,
+            played_uris: Vec::new(),
+            verifications: VecDeque::from([PlaybackVerification::Success {
+                status: PlayerStatus {
+                    status: "playing".to_string(),
+                    current_uri: next_uri.to_string(),
+                    ..PlayerStatus::default()
+                },
+                message: "开始播放: 池内歌曲 - 歌手B".to_string(),
+            }]),
+            replies: Vec::new(),
+            batch_replies: Vec::new(),
+            batch_delays: Vec::new(),
+            queue: Vec::new(),
+            pool: vec![test_track(next_uri, "池内歌曲 - 歌手B")],
+            status_updates: VecDeque::new(),
+            clock: None,
+            status: PlayerStatus {
+                status: "playing".to_string(),
+                current_track: Some(current_track),
+                ..PlayerStatus::default()
+            },
+            stop_continuous_lyrics_after_statuses: None,
+            status_calls: 0,
+            background_lyrics_starts: Vec::new(),
+        };
+        let application = PlaybackApplication::new(PlaybackApplicationConfig {
+            console_bypass_dedup: true,
+            queue_max_size: 20,
+            monitor_tick_ms: Arc::new(RwLock::new(50)),
+            monitor_status_ms: Arc::new(RwLock::new(50)),
+            help_batch_ms: 0,
+        });
+        let context = PlaybackCommandContext {
+            message_type: "blue".to_string(),
+            username: "tester".to_string(),
+            user_command: "@删除".to_string(),
+        };
+
+        application
+            .execute_command(
+                &context,
+                &PlaybackCommand::DeleteCurrentPoolTrack,
+                &mut port,
+            )
+            .expect("delete command must advance even when current track is outside pool");
+
+        assert_eq!(port.pool.len(), 1);
+        assert_eq!(port.played_uris, [next_uri]);
+        assert_eq!(
+            port.replies,
+            ["当前歌曲不在播放池中，随机续播: 池内歌曲 - 歌手B"]
         );
     }
 

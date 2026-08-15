@@ -873,6 +873,7 @@ impl PendingTask {
                             | PlaybackCommand::Resume
                             | PlaybackCommand::Play
                             | PlaybackCommand::Next
+                            | PlaybackCommand::DeleteCurrentPoolTrack
                             | PlaybackCommand::Previous
                     )
             ),

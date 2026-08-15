@@ -30,10 +30,14 @@ pub(super) fn turtle_soup_start_route(
         ))
         .map_err(internal_error)?
     else {
-        unreachable!("turtle soup start intent returned a different outcome")
+        return Err(internal_error(
+            "turtle soup start intent returned a different outcome",
+        ));
     };
     let TurtleSoupMutationOutcome::Started(snapshot) = *outcome else {
-        unreachable!("turtle soup start intent returned a different outcome")
+        return Err(internal_error(
+            "turtle soup start intent returned a different outcome",
+        ));
     };
     serde_json::to_string(&json!({
         "ok": true,
@@ -54,10 +58,14 @@ pub(super) fn turtle_soup_end_route(
         ))
         .map_err(internal_error)?
     else {
-        unreachable!("turtle soup end intent returned a different outcome")
+        return Err(internal_error(
+            "turtle soup end intent returned a different outcome",
+        ));
     };
     let TurtleSoupMutationOutcome::Ended { ended, snapshot } = *outcome else {
-        unreachable!("turtle soup end intent returned a different outcome")
+        return Err(internal_error(
+            "turtle soup end intent returned a different outcome",
+        ));
     };
     if !ended {
         return Err(AppError {
@@ -95,10 +103,14 @@ pub(super) fn turtle_soup_questions_route(
         ))
         .map_err(internal_error)?
     else {
-        unreachable!("turtle soup append intent returned a different outcome")
+        return Err(internal_error(
+            "turtle soup append intent returned a different outcome",
+        ));
     };
     let TurtleSoupMutationOutcome::PuzzleAppended(receipt) = *outcome else {
-        unreachable!("turtle soup append intent returned a different outcome")
+        return Err(internal_error(
+            "turtle soup append intent returned a different outcome",
+        ));
     };
     serde_json::to_string(&receipt).map_err(internal_error)
 }

@@ -56,11 +56,23 @@ impl From<RectConfig> for Rect {
     }
 }
 
+/// 把 rect 裁剪进画布范围(坐标下限 0、宽高收窄),防止越界/溢出输入。
+pub(crate) fn clamp_rect(rect: Rect, canvas_width: u32, canvas_height: u32) -> Rect {
+    let x = rect.x.clamp(0, canvas_width as i32);
+    let y = rect.y.clamp(0, canvas_height as i32);
+    let width = rect.width.min(canvas_width.saturating_sub(x as u32));
+    let height = rect.height.min(canvas_height.saturating_sub(y as u32));
+    Rect::new(x, y, width, height)
+}
+
 pub(crate) fn crop_canvas(image: &DynamicImage, rect: Rect) -> Result<DynamicImage> {
+    // 用 i64 做边界运算,防止 x+width 溢出回绕(负数)绕过越界检查。
+    let right = i64::from(rect.x) + i64::from(rect.width);
+    let bottom = i64::from(rect.y) + i64::from(rect.height);
     if rect.x < 0
         || rect.y < 0
-        || rect.right() > image.width() as i32
-        || rect.bottom() > image.height() as i32
+        || right > i64::from(image.width())
+        || bottom > i64::from(image.height())
     {
         bail!(
             "crop rect {},{},{},{} outside image {}x{}",

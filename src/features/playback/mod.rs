@@ -395,7 +395,7 @@ impl PlaybackCommand {
                 "队列" | "列表" => Self::Queue,
                 "队列删除" => Self::QueueDelete(parse_queue_indexes(argument)),
                 "队列清空" => Self::QueueClear,
-                _ => unreachable!("all playback prefixes are handled"),
+                _ => return None,
             };
             return Some(CommandSyntax {
                 matched: prefix,
@@ -501,12 +501,15 @@ pub(crate) enum PlaybackMutationIntent {
     Push(Box<QueueItem>),
     Remove(QueueRemoval),
     Clear,
+    /// 删除指定歌曲:从播放池移除(不再随机播放)。
+    RemovePoolTrack(miliastra_playback::TrackKey),
 }
 
 pub(crate) enum PlaybackMutationOutcome {
     Pushed(QueuePushOutcome),
     Removed(QueueRemoveOutcome),
     Cleared,
+    PoolTrackRemoved(bool),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -826,17 +829,37 @@ impl PlaybackService {
         Ok(!self.playback_pool_snapshot()?.is_empty())
     }
 
+    /// 从播放池删除指定歌曲(不再参与随机播放)。
+    pub(crate) fn remove_playback_pool_track(
+        &mut self,
+        key: &miliastra_playback::TrackKey,
+    ) -> Result<bool> {
+        let Some(store) = &self.request_state else {
+            return Ok(false);
+        };
+        store
+            .lock()
+            .map_err(|_| anyhow::anyhow!("请求状态存储锁已中毒"))?
+            .remove_pool_track(key)
+    }
+
     pub(crate) fn playback_state_snapshot(&self) -> PlaybackRuntimeState {
         self.playback_state.state().clone()
     }
 
     pub(crate) fn song_dedup_limited(&self, candidate: &SongDedupCandidate) -> bool {
-        let song_dedup = self.song_dedup.read().expect("同歌去重配置共享锁已中毒");
+        let song_dedup = self
+            .song_dedup
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.song_dedup_history.is_limited(&song_dedup, candidate)
     }
 
     pub(crate) fn record_song_dedup(&mut self, candidate: SongDedupCandidate) -> Result<()> {
-        let song_dedup = self.song_dedup.read().expect("同歌去重配置共享锁已中毒");
+        let song_dedup = self
+            .song_dedup
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.song_dedup_history
             .record_playback(&song_dedup, candidate)
     }

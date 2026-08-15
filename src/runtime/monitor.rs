@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::sync::mpsc::{self, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
@@ -387,7 +387,14 @@ impl MonitorShared {
         {
             return unavailable_snapshot();
         }
-        receiver.recv().unwrap_or_else(|_| unavailable_snapshot())
+        // 有限等待:worker 卡死时返回降级快照,避免 Web/TUI 线程无限挂起。
+        match receiver.recv_timeout(Duration::from_secs(2)) {
+            Ok(snapshot) => snapshot,
+            Err(_) => {
+                log::warn!("monitor snapshot 等待超时,返回降级快照");
+                unavailable_snapshot()
+            }
+        }
     }
 
     pub(crate) fn shutdown(&self) {

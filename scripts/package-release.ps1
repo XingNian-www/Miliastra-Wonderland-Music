@@ -11,9 +11,15 @@ Write-Host "== 1/3 构建 release =="
 cargo build --release --workspace
 if ($LASTEXITCODE -ne 0) { throw "cargo build 失败" }
 
-$stage = Join-Path $root $OutDir
+$stage = [System.IO.Path]::GetFullPath((Join-Path $root $OutDir))
+$rootFull = [System.IO.Path]::GetFullPath($root).TrimEnd('\', '/')
+if ($stage.TrimEnd('\', '/') -eq $rootFull) {
+    throw "发布目录不能是项目根目录: $stage"
+}
 Write-Host "== 2/3 组装发布目录: $stage =="
-if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
+if (Test-Path -LiteralPath $stage) {
+    Remove-Item -LiteralPath $stage -Recurse -Force
+}
 New-Item -ItemType Directory -Force -Path $stage | Out-Null
 
 # 主程序与配置

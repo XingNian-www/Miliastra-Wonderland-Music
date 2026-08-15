@@ -21,7 +21,7 @@ pub fn get_text() -> Result<Option<String>> {
     use windows::Win32::System::DataExchange::{
         GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
     };
-    use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+    use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
 
     const CF_UNICODETEXT: u32 = 13;
 
@@ -37,14 +37,22 @@ pub fn get_text() -> Result<Option<String>> {
             return Ok(None);
         }
         let memory = HGLOBAL(handle.0);
+        let allocation_bytes = GlobalSize(memory);
         let locked = GlobalLock(memory);
         if locked.is_null() {
             bail!("lock clipboard memory failed");
         }
         let wide = locked.cast::<u16>();
+        // 安全加固:以分配大小为界扫描终止符,防止其他进程提供的
+        // 非 \0 结尾数据导致越界读取。
+        let max_units = allocation_bytes / 2;
         let mut len = 0usize;
-        while *wide.add(len) != 0 {
+        while len < max_units && *wide.add(len) != 0 {
             len += 1;
+        }
+        if len >= max_units {
+            let _ = GlobalUnlock(memory);
+            bail!("clipboard text is not null-terminated within its allocation");
         }
         let text = String::from_utf16_lossy(std::slice::from_raw_parts(wide, len));
         let _ = GlobalUnlock(memory);

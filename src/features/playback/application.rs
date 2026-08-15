@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -431,6 +432,22 @@ pub(crate) struct PlaybackApplicationConfig {
     pub(crate) help_batch_ms: u64,
 }
 
+/// 播放模式:顺序播放。
+pub(crate) const PLAY_MODE_SEQUENTIAL: u8 = 0;
+/// 播放模式:单曲循环(重复当前曲目,不消费队列)。
+pub(crate) const PLAY_MODE_REPEAT_ONE: u8 = 1;
+/// 播放模式:随机(队列内随机选曲)。
+pub(crate) const PLAY_MODE_SHUFFLE: u8 = 2;
+
+#[derive(Clone, Debug)]
+pub(crate) struct PlaybackApplication {
+    config: PlaybackApplicationConfig,
+    /// 播放模式(Web 运行期设置,不持久化)。
+    play_mode: Arc<AtomicU8>,
+    /// 最近一次成功播放的选择(单曲循环重播用)。
+    last_played: Arc<Mutex<Option<PlaybackSelection>>>,
+}
+
 #[derive(Default)]
 pub(crate) struct LyricTracker {
     current_key: Option<TrackKey>,
@@ -463,14 +480,22 @@ impl LyricTracker {
     }
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct PlaybackApplication {
-    config: PlaybackApplicationConfig,
-}
-
 impl PlaybackApplication {
     pub(crate) fn new(config: PlaybackApplicationConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            play_mode: Arc::new(AtomicU8::new(PLAY_MODE_SEQUENTIAL)),
+            last_played: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub(crate) fn play_mode(&self) -> u8 {
+        self.play_mode.load(Ordering::Relaxed)
+    }
+
+    /// 供 Web 面板共享同一个模式句柄(facade 通过它读写模式)。
+    pub(crate) fn play_mode_handle(&self) -> Arc<AtomicU8> {
+        self.play_mode.clone()
     }
 
     pub(crate) fn execute_command<P: PlaybackCommandPort + ?Sized>(
@@ -797,7 +822,50 @@ impl PlaybackApplication {
                 log::info!("自动出队已跳过: 播放器处于用户暂停状态");
                 return Ok(None);
             }
-            let Some(item) = port.playback_queue()?.into_iter().next() else {
+            // 单曲循环:重复最近一次成功播放的歌曲(不消费队列);
+            // 重播失败则清除记忆并回落到队列逻辑,避免死循环。
+            if self.play_mode() == PLAY_MODE_REPEAT_ONE {
+                let last = self
+                    .last_played
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                if let Some(mut selection) = last {
+                    selection.queue_item_id = None;
+                    log::info!("单曲循环重播({}): {}", reason, selection.keyword);
+                    let completion = self.run_selection(&selection, purpose, port)?;
+                    match self.finish_playback(completion, port)?.outcome() {
+                        PlaybackOutcome::Success => {
+                            return Ok(Some(ConsumedSelection::Queue {
+                                keyword: selection.keyword,
+                            }));
+                        }
+                        PlaybackOutcome::QueueBlockingFailure => {
+                            log::warn!("单曲循环重播被阻断，保留队列状态");
+                            return Ok(None);
+                        }
+                        _ => {
+                            log::warn!("单曲循环重播失败，清除重播记忆: {}", selection.keyword);
+                            *self
+                                .last_played
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                            continue;
+                        }
+                    }
+                }
+            }
+            let queue = port.playback_queue()?;
+            let item = if queue.is_empty() {
+                None
+            } else if self.play_mode() == PLAY_MODE_SHUFFLE {
+                // 随机模式:从队列中随机取一首(不要求随机数加密安全)。
+                let index = (uuid::Uuid::new_v4().as_u128() % queue.len() as u128) as usize;
+                queue.into_iter().nth(index)
+            } else {
+                queue.into_iter().next()
+            };
+            let Some(item) = item else {
                 let Some(track) = port.pick_playback_pool_track(&pool_excluded)? else {
                     return Ok(None);
                 };
@@ -810,6 +878,11 @@ impl PlaybackApplication {
                 let completion = self.run_selection(&selection, pool_purpose, port)?;
                 match self.finish_playback(completion, port)?.outcome() {
                     PlaybackOutcome::Success => {
+                        *self
+                            .last_played
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            Some(selection.clone());
                         return Ok(Some(ConsumedSelection::Pool {
                             keyword: selection.keyword,
                         }));
@@ -849,6 +922,11 @@ impl PlaybackApplication {
             let result = self.finish_playback(completion, port)?;
             match result.outcome() {
                 PlaybackOutcome::Success => {
+                    // 记录重播记忆(单曲循环用)。
+                    *self
+                        .last_played
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(request.clone());
                     // 预加载后续曲目音源（解析 + 音频预下载），缩短下次切歌延迟；失败静默。
                     self.preload_next_track(port, &pool_excluded)?;
                     return Ok(Some(ConsumedSelection::Queue {
@@ -879,6 +957,11 @@ impl PlaybackApplication {
         // 点歌确认播放成功后，同样预加载下一首（队列优先，空则池随机），
         // 连续播放时下一首直接命中本地缓存，避免起播等待。
         if result.outcome() == PlaybackOutcome::Success {
+            // 记录重播记忆(单曲循环用)。
+            *self
+                .last_played
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(request.clone());
             self.preload_next_track(port, &HashSet::new())?;
         }
         Ok(result)
@@ -1379,7 +1462,10 @@ mod tests {
             if let Some((at_wait, value)) = self.tick_override
                 && self.waits + 1 == at_wait
             {
-                *self.tick.write().expect("测试 tick 共享锁已中毒") = value;
+                *self
+                    .tick
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = value;
             }
             self.clock.advance(duration).unwrap();
             self.waits += 1;
@@ -1508,6 +1594,25 @@ mod tests {
                 Duration::from_millis(500),
             ]
         );
+    }
+
+    #[test]
+    fn play_mode_defaults_to_sequential_and_handle_shares_state() {
+        let application = PlaybackApplication::new(PlaybackApplicationConfig {
+            console_bypass_dedup: true,
+            queue_max_size: 20,
+            monitor_tick_ms: Arc::new(RwLock::new(50)),
+            monitor_status_ms: Arc::new(RwLock::new(100)),
+            help_batch_ms: 0,
+        });
+        // 默认顺序播放。
+        assert_eq!(application.play_mode(), PLAY_MODE_SEQUENTIAL);
+        // Web 面板共享句柄写入后,应用侧立即可见。
+        let handle = application.play_mode_handle();
+        handle.store(PLAY_MODE_SHUFFLE, Ordering::Relaxed);
+        assert_eq!(application.play_mode(), PLAY_MODE_SHUFFLE);
+        handle.store(PLAY_MODE_REPEAT_ONE, Ordering::Relaxed);
+        assert_eq!(application.play_mode(), PLAY_MODE_REPEAT_ONE);
     }
 
     impl PlaybackExecutionPort for VerifyingPlaybackPort {

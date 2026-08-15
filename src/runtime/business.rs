@@ -498,6 +498,10 @@ enum PlaybackRuntimeMessage {
     },
     QueueSnapshot(SyncSender<Result<Vec<QueueItem>, BusinessRuntimeError>>),
     PlaybackPoolAvailable(SyncSender<Result<bool, BusinessRuntimeError>>),
+    RemovePoolTrack {
+        key: TrackKey,
+        response: SyncSender<Result<bool, BusinessRuntimeError>>,
+    },
     RecordPlaybackPoolTrack {
         track: PlayableTrack,
         response: SyncSender<Result<(), BusinessRuntimeError>>,
@@ -925,6 +929,9 @@ impl BusinessRuntimeHandle {
                 self.clear_playback_queue()?;
                 PlaybackMutationOutcome::Cleared
             }
+            PlaybackMutationIntent::RemovePoolTrack(key) => {
+                PlaybackMutationOutcome::PoolTrackRemoved(self.remove_playback_pool_track(key)?)
+            }
         })
     }
 
@@ -1209,6 +1216,16 @@ impl BusinessRuntimeHandle {
     pub(crate) fn playback_pool_available(&self) -> Result<bool, BusinessRuntimeError> {
         self.request(|response| {
             RuntimeMessage::Playback(PlaybackRuntimeMessage::PlaybackPoolAvailable(response))
+        })
+    }
+
+    /// 从播放池删除指定歌曲(不再参与随机播放)。
+    pub(crate) fn remove_playback_pool_track(
+        &self,
+        key: TrackKey,
+    ) -> Result<bool, BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::Playback(PlaybackRuntimeMessage::RemovePoolTrack { key, response })
         })
     }
 
@@ -1885,16 +1902,19 @@ impl BusinessRuntimeHandle {
     }
 
     fn send_request(&self, message: RuntimeMessage) -> Result<(), BusinessRuntimeError> {
-        let state = self
-            .channel
-            .state
-            .lock()
-            .map_err(|_| BusinessRuntimeError::RuntimeStopped)?;
-        match *state {
-            RuntimeChannelState::Running => {}
-            RuntimeChannelState::Quiescing => return Err(BusinessRuntimeError::Quiescing),
-            RuntimeChannelState::Stopped => return Err(BusinessRuntimeError::RuntimeStopped),
+        {
+            let state = self
+                .channel
+                .state
+                .lock()
+                .map_err(|_| BusinessRuntimeError::RuntimeStopped)?;
+            match *state {
+                RuntimeChannelState::Running => {}
+                RuntimeChannelState::Quiescing => return Err(BusinessRuntimeError::Quiescing),
+                RuntimeChannelState::Stopped => return Err(BusinessRuntimeError::RuntimeStopped),
+            }
         }
+        // 锁外 send:队列打满时不再持锁阻塞,避免拖住同锁的 shutdown/stop_worker。
         self.channel
             .sender
             .send(message)
@@ -1902,14 +1922,17 @@ impl BusinessRuntimeHandle {
     }
 
     fn send_query(&self, message: RuntimeMessage) -> Result<(), BusinessRuntimeError> {
-        let state = self
-            .channel
-            .state
-            .lock()
-            .map_err(|_| BusinessRuntimeError::RuntimeStopped)?;
-        if *state == RuntimeChannelState::Stopped {
-            return Err(BusinessRuntimeError::RuntimeStopped);
+        {
+            let state = self
+                .channel
+                .state
+                .lock()
+                .map_err(|_| BusinessRuntimeError::RuntimeStopped)?;
+            if *state == RuntimeChannelState::Stopped {
+                return Err(BusinessRuntimeError::RuntimeStopped);
+            }
         }
+        // 锁外 send,同上:避免持锁阻塞 shutdown/stop_worker。
         self.channel
             .sender
             .send(message)
@@ -2403,9 +2426,11 @@ fn sync_card_game_deadline(
             return Ok(());
         }
         if previous.token == token {
-            let previous = active
-                .take()
-                .expect("active card deadline remains while replacing it");
+            let Some(previous) = active.take() else {
+                return Err(BusinessRuntimeError::TimerOperationFailed(
+                    "card deadline state inconsistent".to_owned(),
+                ));
+            };
             let cancellation = DeadlineCancellation::new(
                 previous.token.clone(),
                 previous.operation_id,
@@ -2420,9 +2445,11 @@ fn sync_card_game_deadline(
             pending_cancellations.push(previous);
             return Ok(());
         }
-        let previous = active
-            .take()
-            .expect("active card deadline exists while replacing its token");
+        let Some(previous) = active.take() else {
+            return Err(BusinessRuntimeError::TimerOperationFailed(
+                "card deadline state inconsistent".to_owned(),
+            ));
+        };
         let cancellation = DeadlineCancellation::new(
             previous.token.clone(),
             previous.operation_id,
@@ -2520,7 +2547,11 @@ fn sync_turtle_soup_deadline(
         }
         return Ok(());
     };
-    let service = turtle_soup.expect("deadline exists only with turtle soup service");
+    let Some(service) = turtle_soup else {
+        return Err(BusinessRuntimeError::TimerOperationFailed(
+            "turtle soup service state inconsistent".to_owned(),
+        ));
+    };
     let token = turtle_soup_deadline_token(kind);
     let session_generation = service.session_generation();
     if let Some(previous) = active.as_ref() {
@@ -2531,9 +2562,11 @@ fn sync_turtle_soup_deadline(
             return Ok(());
         }
         if previous.token == token {
-            let previous = active
-                .take()
-                .expect("active turtle soup deadline remains while replacing it");
+            let Some(previous) = active.take() else {
+                return Err(BusinessRuntimeError::TimerOperationFailed(
+                    "turtle soup deadline state inconsistent".to_owned(),
+                ));
+            };
             let cancellation = DeadlineCancellation::new(
                 previous.token.clone(),
                 previous.operation_id,
@@ -2548,9 +2581,11 @@ fn sync_turtle_soup_deadline(
             pending_cancellations.push(previous);
             return Ok(());
         }
-        let previous = active
-            .take()
-            .expect("active turtle soup deadline exists while replacing its token");
+        let Some(previous) = active.take() else {
+            return Err(BusinessRuntimeError::TimerOperationFailed(
+                "turtle soup deadline state inconsistent".to_owned(),
+            ));
+        };
         let cancellation = DeadlineCancellation::new(
             previous.token.clone(),
             previous.operation_id,
@@ -2626,9 +2661,11 @@ fn sync_undercover_deadline(
             return Ok(());
         }
         if previous.token == token {
-            let previous = active
-                .take()
-                .expect("active undercover deadline remains while replacing it");
+            let Some(previous) = active.take() else {
+                return Err(BusinessRuntimeError::TimerOperationFailed(
+                    "undercover deadline state inconsistent".to_owned(),
+                ));
+            };
             let cancellation = DeadlineCancellation::new(
                 previous.token.clone(),
                 previous.operation_id,
@@ -2643,9 +2680,11 @@ fn sync_undercover_deadline(
             pending_cancellations.push(previous);
             return Ok(());
         }
-        let previous = active
-            .take()
-            .expect("active undercover deadline exists while replacing its token");
+        let Some(previous) = active.take() else {
+            return Err(BusinessRuntimeError::TimerOperationFailed(
+                "undercover deadline state inconsistent".to_owned(),
+            ));
+        };
         let cancellation = DeadlineCancellation::new(
             previous.token.clone(),
             previous.operation_id,

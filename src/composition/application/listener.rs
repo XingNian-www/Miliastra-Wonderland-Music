@@ -152,9 +152,20 @@ impl ApplicationRuntime {
             .config_store
             .clone()
             .ok_or_else(|| anyhow!("配置中心存储尚未初始化"))?;
+        let mut http_config = self.lifecycle.config.http.clone();
+        if http_config.access_token.trim().is_empty() {
+            // 安全加固:本机面板默认不再免鉴权,每次启动生成随机访问令牌(不持久化)。
+            http_config.access_token = uuid::Uuid::new_v4().simple().to_string();
+            log::info!(
+                "Web 面板访问令牌(每次启动随机生成,访问 http://{}:{} 时输入): {}",
+                http_config.host,
+                http_config.port,
+                http_config.access_token
+            );
+        }
         let server = http::start(http::HttpSharedState::new(
             http::HttpInterfaceConfig::new(
-                self.lifecycle.config.http.clone(),
+                http_config,
                 self.lifecycle.config.screen.clone(),
                 self.lifecycle.config.templates.clone(),
                 self.lifecycle.config.moderation.clone(),
@@ -181,6 +192,7 @@ impl ApplicationRuntime {
                     PlayerRuntimeBackend::new(player_runtime),
                     self.playback.player_search.clone(),
                     self.playback.native_playback.clone(),
+                    self.playback.playback_application.play_mode_handle(),
                 )),
                 Arc::new(http_facade::ApplicationHttpLoginFacade::new(
                     self.playback.login_helper.clone(),

@@ -13,6 +13,23 @@ pub(crate) fn resolve_game_executable(
         if configured_path.is_dir() {
             return resolve_from_directory(configured_path, target_process);
         }
+        // 安全加固:直接文件路径必须命中目标游戏可执行文件白名单
+        // (target_process 候选或 YuanShen/GenshinImpact 兜底),防止
+        // Web 面板改写 exe_path 后启动任意程序。
+        let candidates = executable_candidates(target_process);
+        let file_name = configured_path
+            .file_name()
+            .map(|name| name.to_string_lossy())
+            .unwrap_or_default();
+        let allowed = candidates
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(&file_name));
+        if !allowed {
+            anyhow::bail!(
+                "startup.exe_path 必须指向目标游戏可执行文件(允许: {})",
+                candidates.join(", ")
+            );
+        }
         return Ok(configured_path.to_path_buf());
     }
     registry_game_path().ok_or_else(|| {

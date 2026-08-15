@@ -791,7 +791,6 @@ fn handle_command(
             state.publish(snapshots);
             Ok(())
         }
-        #[cfg(test)]
         EngineCommand::Seek {
             session,
             position_seconds,

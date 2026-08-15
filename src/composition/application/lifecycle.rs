@@ -12,7 +12,11 @@ impl ApplicationRuntime {
         // No fallible setup may follow start_hotkeys: later workers require the shared teardown.
         self.enqueue_startup_task_if_enabled()?;
         self.start_http_server()?;
-        self.ui.hotkeys = Some(self.start_hotkeys()?);
+        match self.start_hotkeys() {
+            Ok(runtime) => self.ui.hotkeys = Some(runtime),
+            // 热键被占用时降级继续运行:退出热键失效,但主流程不受影响。
+            Err(error) => log::error!("全局热键不可用(继续运行,退出热键失效): {error:#}"),
+        }
         let deferred_chat_sender = self.start_deferred_chat_sender();
         let playback_monitor = self.start_playback_monitor();
         let result = self.run_scan_loop();

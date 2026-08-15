@@ -311,6 +311,13 @@ impl PlaybackCommandPort for ApplicationRuntime {
         self.playback.player.set_volume(volume).map(|_| ())
     }
 
+    fn remove_playback_pool_track(&mut self, key: &miliastra_playback::TrackKey) -> Result<bool> {
+        self.business
+            .business
+            .remove_playback_pool_track(key.clone())
+            .map_err(anyhow::Error::from)
+    }
+
     fn toggle_lyrics(&mut self) -> Result<String> {
         self.playback.player.toggle_lyrics()
     }

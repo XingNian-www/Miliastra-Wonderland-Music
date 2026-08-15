@@ -324,10 +324,8 @@ impl RequestStateStore {
         if count == 0 {
             return None;
         }
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.subsec_nanos() as usize);
-        Some(candidates[seed % count].clone())
+        let index = (uuid::Uuid::new_v4().as_u128() % count as u128) as usize;
+        Some(candidates[index].clone())
     }
 
     pub(crate) fn playback_snapshot(&self) -> PlaybackRuntimeState {

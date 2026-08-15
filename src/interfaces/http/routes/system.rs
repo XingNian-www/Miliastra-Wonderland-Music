@@ -126,6 +126,14 @@ pub(super) fn tool_ocr_route(
         .map(parse_rect)
         .transpose()
         .map_err(|error| bad_request(&format!("rect参数无效: {error}")))?;
+    // 安全加固:把 rect 裁剪到期望屏幕尺寸内,防止溢出/越界输入。
+    let rect = rect.map(|rect| {
+        crate::ui::geometry::clamp_rect(
+            rect,
+            state.config.screen.expected_width,
+            state.config.screen.expected_height,
+        )
+    });
     enqueue_web_tool(state, WebToolRequest::Ocr { rect })
 }
 
@@ -162,6 +170,14 @@ pub(super) fn tool_template_route(
         .map(parse_rect)
         .transpose()
         .map_err(|error| bad_request(&format!("rect参数无效: {error}")))?;
+    // 安全加固:把 rect 裁剪到期望屏幕尺寸内。
+    let rect = rect.map(|rect| {
+        crate::ui::geometry::clamp_rect(
+            rect,
+            state.config.screen.expected_width,
+            state.config.screen.expected_height,
+        )
+    });
     let threshold = query_value(query, "threshold")
         .filter(|value| !value.trim().is_empty())
         .map(|value| {
@@ -191,6 +207,15 @@ pub(super) fn tool_click_route(
 ) -> std::result::Result<String, AppError> {
     let x = parse_coordinate(query_value(query, "x"), "x")?;
     let y = parse_coordinate(query_value(query, "y"), "y")?;
+    // 安全加固:点击坐标限制在期望屏幕范围内。
+    let x = x.clamp(
+        0,
+        state.config.screen.expected_width.saturating_sub(1) as i32,
+    );
+    let y = y.clamp(
+        0,
+        state.config.screen.expected_height.saturating_sub(1) as i32,
+    );
     enqueue_web_tool(state, WebToolRequest::Click { x, y })
 }
 
@@ -487,7 +512,9 @@ pub(super) fn state_save(
         ))
         .map_err(internal_error)?
     else {
-        unreachable!("runtime state patch intent returned a different outcome")
+        return Err(internal_error(
+            "runtime state patch intent returned a different outcome",
+        ));
     };
     Ok(json!({ "ok": true }).to_string())
 }

@@ -1250,6 +1250,8 @@ impl Drop for FrameDemandSubscription {
 pub struct UiRuntime {
     handle: UiRuntimeHandle,
     worker: Option<JoinHandle<()>>,
+    /// 关闭超时后分离的 join 线程,后续 stop 时回收已结束的线程。
+    detached_joins: Vec<JoinHandle<()>>,
 }
 
 impl UiRuntime {
@@ -1345,6 +1347,7 @@ impl UiRuntime {
                 latest_frame,
                 latest_ui_state,
             },
+            detached_joins: Vec::new(),
             worker: Some(worker),
         })
     }
@@ -1358,6 +1361,8 @@ impl UiRuntime {
     }
 
     fn stop_worker(&mut self, grace_period: Duration) -> Result<UiShutdownReport, UiShutdownError> {
+        // 先回收上一轮超时分离的 join 线程。
+        self.reap_detached_joins();
         let Some(worker) = self.worker.take() else {
             return Ok(UiShutdownReport::default());
         };
@@ -1375,16 +1380,38 @@ impl UiRuntime {
             .try_send(RuntimeMessage::Shutdown);
 
         let (joined_sender, joined_receiver) = mpsc::sync_channel(1);
-        thread::spawn(move || {
+        let join_thread = thread::spawn(move || {
             let _ = joined_sender.send(worker.join().map_err(|_| UiShutdownError));
         });
         match joined_receiver.recv_timeout(grace_period) {
             Ok(result) => result.map(|()| UiShutdownReport::default()),
-            Err(RecvTimeoutError::Timeout) => Ok(UiShutdownReport {
-                timed_out: true,
-                detached: true,
-            }),
+            Err(RecvTimeoutError::Timeout) => {
+                // join 线程可能长期阻塞在 join 上,保留句柄供后续回收。
+                self.detached_joins.push(join_thread);
+                Ok(UiShutdownReport {
+                    timed_out: true,
+                    detached: true,
+                })
+            }
             Err(RecvTimeoutError::Disconnected) => Err(UiShutdownError),
+        }
+    }
+
+    fn reap_detached_joins(&mut self) {
+        let mut index = 0;
+        while index < self.detached_joins.len() {
+            if self.detached_joins[index].is_finished() {
+                let join_thread = self.detached_joins.swap_remove(index);
+                let _ = join_thread.join();
+            } else {
+                index += 1;
+            }
+        }
+        if self.detached_joins.len() > 8 {
+            log::error!(
+                "UI worker 累计 {} 个未退出 join 线程,可能存在设备调用卡死",
+                self.detached_joins.len()
+            );
         }
     }
 }

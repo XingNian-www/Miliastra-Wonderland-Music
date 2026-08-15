@@ -316,7 +316,7 @@ fn make_room_for_enqueue(
 fn make_room_for_requeue(
     queue: &mut VecDeque<DeferredChatItem>,
     capacity: usize,
-    protected: bool,
+    _protected: bool,
     remove_from_back: bool,
 ) -> EnqueueOutcome {
     if queue.len() < capacity {
@@ -330,9 +330,10 @@ fn make_room_for_requeue(
     if let Some(index) = index {
         queue.remove(index);
         EnqueueOutcome::DroppedMessage
-    } else if protected {
-        EnqueueOutcome::Added
     } else {
+        // 队列已满且没有可驱逐项:拒绝入队(含受保护消息),保持容量契约。
+        // 受保护消息由调用方的批次 max_attempts 机制负责重试/放弃。
+        log::warn!("延迟聊天队列已满({capacity})且无可驱逐项,拒绝消息入队");
         EnqueueOutcome::Rejected
     }
 }

@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::OptionalExtension;
 use serde_json::{Map, Value};
 
@@ -93,6 +93,29 @@ impl std::error::Error for ConfigFieldErrors {}
 pub struct ConfigRevisionInfo {
     pub revision: u64,
     pub created_at_ms: u64,
+}
+
+/// 配置保存/回滚的结构化错误,路由层按变体分类,不依赖错误消息文本。
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigSaveError {
+    #[error("配置已被其他修改，请刷新后重试")]
+    Conflict,
+    #[error("目标版本 {0} 不存在")]
+    RevisionNotFound(u64),
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
+impl From<rusqlite::Error> for ConfigSaveError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Other(error.into())
+    }
+}
+
+impl From<serde_json::Error> for ConfigSaveError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Other(error.into())
+    }
 }
 
 impl ConfigStore {
@@ -419,7 +442,7 @@ impl ConfigStore {
         &mut self,
         base_revision: u64,
         sections: Map<String, Value>,
-    ) -> Result<ConfigSaveOutcome> {
+    ) -> std::result::Result<ConfigSaveOutcome, ConfigSaveError> {
         // 应用候选：并集合并、剔除注入段、secret 空值/掩码保留、
         // `{"__clear__": true}` 标记强制清除（写入空串，绕过保留规则）。
         let current_sections = self.read_all_sections()?;
@@ -431,10 +454,16 @@ impl ConfigStore {
         // 组装完整配置并校验；失败返回字段级错误，不写库。
         let config = match self.build_config(&merged) {
             Ok(config) => config,
-            Err(error) => return Err(field_errors_from_message(&error.to_string()).into()),
+            Err(error) => {
+                return Err(ConfigSaveError::Other(
+                    field_errors_from_message(&error.to_string()).into(),
+                ));
+            }
         };
         if let Err(error) = config.validate() {
-            return Err(field_errors_from_anyhow(&error).into());
+            return Err(ConfigSaveError::Other(
+                field_errors_from_anyhow(&error).into(),
+            ));
         }
         // 单事务：写/更新 config_sections、插入完整快照（含 secret 明文，DB 本地）、
         // 更新 config_meta.revision；事务内重读 revision 与基线比对保证并发安全。
@@ -449,9 +478,7 @@ impl ConfigStore {
                 row.get(0)
             })?;
         if stored_revision as u64 != base_revision {
-            bail!(
-                "配置已被其他修改，请刷新后重试（当前版本 {stored_revision}，期望基线 {base_revision}）"
-            );
+            return Err(ConfigSaveError::Conflict);
         }
         let next_revision = stored_revision as u64 + 1;
         for (section, section_value) in &merged {
@@ -478,6 +505,11 @@ impl ConfigStore {
         transaction.execute(
             "UPDATE config_meta SET revision = ?1, updated_at_ms = ?2 WHERE id = 1",
             rusqlite::params![next_revision as i64, timestamp],
+        )?;
+        // 只保留最近 50 版历史快照,防止配置库无限膨胀。
+        transaction.execute(
+            "DELETE FROM config_revisions WHERE revision <= ?1",
+            rusqlite::params![next_revision as i64 - 50],
         )?;
         transaction.commit()?;
         // 计算变更字段点路径（候选 vs 当前）。
@@ -519,7 +551,7 @@ impl ConfigStore {
         &mut self,
         target_revision: u64,
         base_revision: u64,
-    ) -> Result<ConfigSaveOutcome> {
+    ) -> std::result::Result<ConfigSaveOutcome, ConfigSaveError> {
         let snapshot: Option<String> = self
             .connection
             .query_row(
@@ -528,12 +560,14 @@ impl ConfigStore {
                 |row| row.get(0),
             )
             .optional()?;
-        let snapshot = snapshot.with_context(|| format!("目标版本 {target_revision} 不存在"))?;
-        let value: Value = serde_json::from_str(&snapshot).context("解析目标版本快照失败")?;
+        let Some(snapshot) = snapshot else {
+            return Err(ConfigSaveError::RevisionNotFound(target_revision));
+        };
+        let value: Value = serde_json::from_str(&snapshot).map_err(ConfigSaveError::from)?;
         let mut sections = value
             .as_object()
             .cloned()
-            .context("目标版本快照必须是对象")?;
+            .ok_or_else(|| anyhow!("目标版本快照必须是对象"))?;
         let current_sections = self.read_all_sections()?;
         force_retain_secret_fields(&mut sections, &current_sections);
         self.save(base_revision, sections)
@@ -1536,6 +1570,9 @@ mod tests {
             error.to_string().contains("bogus_section"),
             "未知段必须被拒绝并报告段名: {error}"
         );
+        let ConfigSaveError::Other(error) = error else {
+            panic!("save 的字段错误必须包装在 Other 中");
+        };
         let field_errors = error
             .downcast_ref::<ConfigFieldErrors>()
             .expect("save 的字段错误必须可 downcast 为 ConfigFieldErrors");
@@ -1559,6 +1596,9 @@ mod tests {
             error.to_string().contains("bogus_field"),
             "未知字段必须被拒绝并报告字段名: {error}"
         );
+        let ConfigSaveError::Other(error) = error else {
+            panic!("save 的字段错误必须包装在 Other 中");
+        };
         let field_errors = error
             .downcast_ref::<ConfigFieldErrors>()
             .expect("save 的字段错误必须可 downcast 为 ConfigFieldErrors");

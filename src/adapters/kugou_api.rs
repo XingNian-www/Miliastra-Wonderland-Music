@@ -150,14 +150,16 @@ fn build_command(config: &KugouApiConfig, port: u16, device: &KugouDevice) -> Co
         .env("KUGOU_API_DEV", &device.dev)
         .env("KUGOU_API_MAC", &device.mac)
         .env("KUGOU_API_PLATFORM", "lite");
-    // 临时诊断：保留 sidecar 输出到日志文件，观察请求与错误。
+    // 保留 sidecar 输出到日志文件；不可写时静默丢弃,不 panic。
     let _ = std::fs::create_dir_all(&config.log_directory);
     let stdout = std::fs::File::create(config.log_directory.join("kugou-sidecar.log"))
         .or_else(|_| std::fs::OpenOptions::new().write(true).open("NUL"))
-        .expect("sidecar stdout target");
+        .map(Stdio::from)
+        .unwrap_or_else(|_| Stdio::null());
+    let _ = &stdout;
     command
         .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout))
+        .stdout(stdout)
         .stderr(Stdio::null());
     command
 }
@@ -204,41 +206,55 @@ fn generated_mac() -> io::Result<String> {
         if result != 0 && size == 0 {
             return Err(io::Error::other(format!("读取本机网卡地址失败: {result}")));
         }
-        let mut buffer = vec![0u8; size as usize];
+        // 按 IP_ADAPTER_ADDRESSES_LH 的对齐要求分配缓冲区(避免 1 字节对齐
+        // 的 u8 缓冲区被当作对齐结构解引用)。
+        let layout = std::alloc::Layout::from_size_align(
+            size as usize,
+            std::mem::align_of::<IP_ADAPTER_ADDRESSES_LH>(),
+        )
+        .map_err(|_| io::Error::other("分配网卡地址缓冲区布局无效"))?;
+        let pointer = unsafe { std::alloc::alloc(layout) };
+        if pointer.is_null() {
+            return Err(io::Error::other("分配网卡地址缓冲区失败"));
+        }
         let addresses = unsafe {
             GetAdaptersAddresses(
                 AF_UNSPEC.0.into(),
                 GET_ADAPTERS_ADDRESSES_FLAGS(0),
                 None,
-                Some(buffer.as_mut_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>()),
+                Some(pointer.cast::<IP_ADAPTER_ADDRESSES_LH>()),
                 &mut size,
             )
         };
         if addresses != 0 {
+            unsafe { std::alloc::dealloc(pointer, layout) };
             return Err(io::Error::other(format!(
                 "读取本机网卡地址失败: {addresses}"
             )));
         }
-        let mut current = buffer.as_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>();
-        while !current.is_null() {
+        let mut current = pointer.cast::<IP_ADAPTER_ADDRESSES_LH>();
+        let found = loop {
+            if current.is_null() {
+                break None;
+            }
             let adapter = unsafe { &*current };
             let length = adapter.PhysicalAddressLength as usize;
             if (6..=8).contains(&length) {
                 let bytes = &adapter.PhysicalAddress[..length];
                 if bytes.iter().any(|byte| *byte != 0) {
-                    return Ok(bytes
-                        .iter()
-                        .map(|byte| format!("{byte:02x}"))
-                        .collect::<Vec<_>>()
-                        .join(":"));
+                    break Some(
+                        bytes
+                            .iter()
+                            .map(|byte| format!("{byte:02x}"))
+                            .collect::<Vec<_>>()
+                            .join(":"),
+                    );
                 }
             }
             current = adapter.Next;
-        }
-        Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "未找到可用本机网卡地址",
-        ))
+        };
+        unsafe { std::alloc::dealloc(pointer, layout) };
+        found.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "未找到可用本机网卡地址"))
     }
     #[cfg(not(windows))]
     {

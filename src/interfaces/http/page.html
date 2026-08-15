@@ -125,8 +125,12 @@ button,input,select,textarea{font:inherit}
 .top-actions .btn{height:var(--ctl-h);border-color:transparent}
 .current-song{font-size:var(--fs-body);line-height:var(--lh-body);font-weight:600;color:var(--text-1);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:break-word}
 .playback-progress{margin-top:var(--sp-2)}
-.playback-progress .progress-track{height:5px;border-radius:3px;background:var(--fill-2);overflow:hidden}
+.playback-progress .progress-track{position:relative;height:5px;border-radius:3px;background:var(--fill-2);overflow:hidden}
 .playback-progress .progress-track i{display:block;height:100%;background:var(--accent);width:0;transition:width .3s linear}
+.playback-progress .progress-track input[type=range]{position:absolute;inset:0;width:100%;height:100%;margin:0;opacity:0;cursor:pointer}
+.play-mode-row{display:flex;align-items:center;gap:var(--sp-1);margin-top:var(--sp-2);flex-wrap:wrap}
+.play-mode-label{font-size:var(--fs-caption);color:var(--text-2);margin-right:auto}
+.play-mode-row .btn.active{border-color:var(--accent);color:var(--accent)}
 .playback-progress .progress-row{display:flex;justify-content:space-between;gap:var(--sp-2);margin-top:var(--sp-1);font-size:var(--fs-caption);color:var(--text-2)}
 .playback-progress .progress-row span:last-child{text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .layout{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);grid-template-areas:"monitor sidebar";gap:var(--sp-5);align-items:start}
@@ -609,8 +613,14 @@ input.config-invalid:focus,textarea.config-invalid:focus{border-color:var(--dang
         <div class="panel-body">
           <div class="current-song" id="songState">等待播放器状态</div>
           <div class="playback-progress" id="playbackProgress" hidden>
-            <div class="progress-track"><i id="progressFill"></i></div>
+            <div class="progress-track"><i id="progressFill"></i><input type="range" id="progressSlider" min="0" max="1000" step="1" value="0" aria-label="播放进度" oninput="onProgressInput()" onchange="onProgressChange()"></div>
             <div class="progress-row"><span id="progressTime">0:00 / 0:00</span><span id="progressMeta"></span></div>
+          </div>
+          <div class="play-mode-row">
+            <span class="play-mode-label">播放模式</span>
+            <button class="btn small" id="modeSeq" onclick="setPlayMode('sequential')">顺序</button>
+            <button class="btn small" id="modeRepeat" onclick="setPlayMode('repeat_one')">单曲循环</button>
+            <button class="btn small" id="modeShuffle" onclick="setPlayMode('shuffle')">随机</button>
           </div>
           <div class="controls">
             <button class="btn good" onclick="call('/play','POST')"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M7 4.5v15l12-7.5-12-7.5z"/></svg>继续</button>
@@ -956,18 +966,56 @@ function renderPlayer(d){
   renderProgress(d)
   return title
 }
+let progressDragging=false
+let currentDuration=null
 function renderProgress(d){
   const box=$('playbackProgress')
   const progress=safeNum(d.progress)
   const duration=safeNum(d.duration)
+  currentDuration=duration
   if(progress==null&&duration==null){box.classList.add('hidden');return}
   box.classList.remove('hidden')
   const fill=(duration!=null&&duration>0)?Math.max(0,Math.min(100,progress/duration*100)):0
   $('progressFill').style.width=fill+'%'
-  $('progressTime').textContent=fmt(progress)+' / '+fmt(duration)
+  if(!progressDragging){
+    $('progressSlider').value=String(Math.round(fill*10))
+    $('progressTime').textContent=fmt(progress)+' / '+fmt(duration)
+  }
   const failure=d.failureCode?('失败: '+d.failureMessage+(d.failureRetryable?'（可重试）':'')):''
   const lyric=d.lyricLineText?('歌词: '+d.lyricLineText):''
   $('progressMeta').textContent=[failure,lyric].filter(Boolean).join(' · ')
+}
+function onProgressInput(){
+  if(!currentDuration||currentDuration<=0)return
+  progressDragging=true
+  const pct=Number($('progressSlider').value)/10
+  $('progressFill').style.width=Math.max(0,Math.min(100,pct))+'%'
+  $('progressTime').textContent=fmt(currentDuration*pct/100)+' / '+fmt(currentDuration)+' · 拖动中'
+}
+async function onProgressChange(){
+  progressDragging=false
+  if(!currentDuration||currentDuration<=0)return
+  const pct=Number($('progressSlider').value)/10
+  const position=currentDuration*pct/100
+  try{await call('/playback/seek?position='+position.toFixed(1),'POST')}catch(e){setResult('跳转失败: '+e.message)}
+  loadStatus()
+}
+let currentPlayMode='sequential'
+async function setPlayMode(mode){
+  try{await call('/playback/mode?mode='+mode,'POST')}catch(e){setResult('设置播放模式失败: '+e.message);return}
+  currentPlayMode=mode
+  refreshModeButtons()
+  setResult('播放模式已切换: '+({sequential:'顺序',repeat_one:'单曲循环',shuffle:'随机'}[mode]||mode))
+}
+function refreshModeButtons(){
+  const map={sequential:'modeSeq',repeat_one:'modeRepeat',shuffle:'modeShuffle'}
+  ;['modeSeq','modeRepeat','modeShuffle'].forEach(id=>{const el=$(id);if(el)el.classList.remove('active')})
+  const el=$(map[currentPlayMode]||'modeSeq')
+  if(el)el.classList.add('active')
+}
+async function loadPlayMode(){
+  try{currentPlayMode=(await request('/playback/mode')).mode||'sequential'}catch(e){currentPlayMode='sequential'}
+  refreshModeButtons()
 }
 async function refreshPlayer(){
   const d=await request('/status')
@@ -1018,15 +1066,17 @@ async function loadPlaybackInsights(){
 let cacheTracksLoading=false
 const cacheTracksPageSize=100
 let cacheTracksOffset=0
+let cacheTracksItems=[]
 function renderCacheTracks(page){
   const total=page&&page.total||0
   const tracks=Array.isArray(page&&page.tracks)?page.tracks:[]
+  cacheTracksItems=tracks
   const current=total?Math.floor((page.offset||0)/(page.limit||cacheTracksPageSize))+1:0
   const pages=total?Math.ceil(total/(page.limit||cacheTracksPageSize)):0
   $('cacheTracksMeta').textContent='共 '+total+' 首 · 第 '+current+' / '+pages+' 页'
   $('cacheTracksPrev').disabled=!page||page.offset<=0
   $('cacheTracksNext').disabled=!page||(page.offset+tracks.length>=total)
-  $('cacheTracks').innerHTML=tracks.length?tracks.map((t)=>{
+  $('cacheTracks').innerHTML=tracks.length?tracks.map((t,i)=>{
     const known=Boolean(t.source)
     const title=known?[t.title,t.artists&&t.artists.join('/')].filter(Boolean).join(' - ')||'未知歌曲':'未知缓存'
     const source=known?providerLabel(t.source):'未知来源'
@@ -1035,9 +1085,22 @@ function renderCacheTracks(page){
     const state=t.complete?'已缓存':'未完整'
     const activity='播放 '+(t.playCount||0)+'（点歌 '+(t.requestedPlayCount||0)+' / 池 '+(t.poolPlayCount||0)+'） · 命中 '+(t.cacheHitCount||0)+' · 失败 '+(t.failureCount||0)
     const failure=t.lastFailureCode?' · 最近失败 '+t.lastFailureCode:''
-    const reset=known?'<button class="btn ghost" onclick="resetTrackStatistics(\''+encodeURIComponent(t.source)+'\',\''+encodeURIComponent(t.id)+'\')">清零统计</button>':''
-    return '<div class="cache-track-item'+(known?'':' orphan')+'"><div><b>'+esc(title)+'</b><span class="cache-track-source">'+esc(source)+'</span>'+reset+'</div><div class="cache-track-meta">'+esc(size)+' · 最近使用 '+esc(used)+' · '+esc(state)+' · '+esc(activity)+esc(failure)+'</div></div>'
+    const buttons=known?'<button class="btn ghost" onclick="playCachedTrack('+i+')">播放</button><button class="btn ghost" onclick="deleteCachedTrack('+i+')">删除歌曲</button><button class="btn ghost" onclick="resetTrackStatistics(\''+encodeURIComponent(t.source)+'\',\''+encodeURIComponent(t.id)+'\')">清零统计</button>':''
+    return '<div class="cache-track-item'+(known?'':' orphan')+'"><div><b>'+esc(title)+'</b><span class="cache-track-source">'+esc(source)+'</span>'+buttons+'</div><div class="cache-track-meta">'+esc(size)+' · 最近使用 '+esc(used)+' · '+esc(state)+' · '+esc(activity)+esc(failure)+'</div></div>'
   }).join(''):'暂无磁盘缓存歌曲'
+}
+async function playCachedTrack(index){
+  const t=cacheTracksItems[index]
+  if(!t||!t.source||!t.id){setResult('缓存曲目信息不完整');return}
+  const body={trackRef:{key:{source:t.source,id:t.id}},metadata:{title:t.title||'缓存歌曲',artists:Array.isArray(t.artists)?t.artists:[]}}
+  try{await jsonAction('/player/play-track',body)}catch(e){setResult('播放失败: '+e.message)}
+}
+async function deleteCachedTrack(index){
+  const t=cacheTracksItems[index]
+  if(!t||!t.source||!t.id){setResult('缓存曲目信息不完整');return}
+  if(!confirm('删除歌曲「'+(t.title||t.id)+'」？将从歌曲池移除并删除音频缓存,不再随机播放;如需再次播放请重新点歌。'))return
+  try{await call('/playback/song/delete?provider='+encodeURIComponent(t.source)+'&id='+encodeURIComponent(t.id),'POST')}catch(e){setResult('删除歌曲失败: '+e.message);return}
+  await Promise.all([loadPlaybackInsights(),loadCacheTracks()])
 }
 async function resetTrackStatistics(provider,id){
   if(!confirm('清零该歌曲统计？音频缓存和曲目元数据会保留。'))return
@@ -1061,6 +1124,7 @@ function changeCacheTracksPage(direction){
   loadCacheTracks()
 }
 async function loadStatus(){
+  loadPlayMode()
   try{
     const d=await refreshPlayer()
     const title=renderPlayer(d)
@@ -1509,7 +1573,7 @@ function toggleRefresh(){
   if(!refreshPaused)refreshAll()
 }
 async function refreshAll(){
-  const results=await Promise.allSettled([loadMonitor(),loadHistory(),refreshPlayer(),loadPlaybackInsights(),loadLoginState()])
+  const results=await Promise.allSettled([loadMonitor(),loadHistory(),refreshPlayer(),loadPlaybackInsights(),loadLoginState(),loadPlayMode()])
   const failed=results.find((item)=>item.status==='rejected')
   if(failed)setResult('刷新失败: '+failed.reason.message)
 }

@@ -331,6 +331,10 @@ impl HttpTaskPort for RecordingHttpPort {
                 state.queue.clear();
                 BusinessMutationOutcome::Playback(PlaybackMutationOutcome::Cleared)
             }
+            BusinessMutationIntent::Playback(PlaybackMutationIntent::RemovePoolTrack(_key)) => {
+                state.mutations.push(RecordedMutation::PlaybackClear);
+                BusinessMutationOutcome::Playback(PlaybackMutationOutcome::PoolTrackRemoved(false))
+            }
             BusinessMutationIntent::Hall(HallMutationIntent::PatchState(patch)) => {
                 state
                     .mutations
@@ -2169,7 +2173,7 @@ fn refresh_toggle_runs_full_uncached_refresh_when_resumed() {
     assert!(PAGE.contains("if(!refreshPaused)refreshAll()"));
     assert!(PAGE.contains("async function refreshAll()"));
     assert!(PAGE.contains(
-        "Promise.allSettled([loadMonitor(),loadHistory(),refreshPlayer(),loadPlaybackInsights(),loadLoginState()])"
+        "Promise.allSettled([loadMonitor(),loadHistory(),refreshPlayer(),loadPlaybackInsights(),loadLoginState(),loadPlayMode()])"
     ));
     assert!(PAGE.contains("cache:'no-store'"));
     assert!(!PAGE.contains("onclick=\"loadMonitor()\""));

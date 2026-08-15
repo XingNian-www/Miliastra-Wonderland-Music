@@ -209,10 +209,7 @@ impl ChatObservationLedger {
 
     pub fn begin_frame(&mut self, captured_at: Instant) -> ObservedFrame {
         let id = ObservationFrameId(self.next_frame_id);
-        self.next_frame_id = self
-            .next_frame_id
-            .checked_add(1)
-            .expect("observation frame sequence exhausted");
+        self.next_frame_id = self.next_frame_id.wrapping_add(1);
         let frame = ObservedFrame { id, captured_at };
         self.pending.insert(
             id,
@@ -275,10 +272,7 @@ impl ChatObservationLedger {
                 .remove(&id)
                 .expect("complete pending frame checked above");
             let outcome = pending.outcome.expect("complete outcome checked above");
-            self.next_to_release = self
-                .next_to_release
-                .checked_add(1)
-                .expect("observation release sequence exhausted");
+            self.next_to_release = self.next_to_release.wrapping_add(1);
             self.watermark = Some(ObservationWatermark {
                 completed_through: pending.frame.id,
                 captured_through: pending.frame.captured_at,

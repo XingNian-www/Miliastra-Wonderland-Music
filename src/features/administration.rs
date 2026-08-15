@@ -289,7 +289,7 @@ impl AdministrationCommand {
             let command = match prefix {
                 "娱乐帮助" => Self::EntertainmentHelp,
                 "帮助" => Self::Help,
-                _ => unreachable!("all administration prefixes are handled"),
+                _ => return None,
             };
             return Some(CommandSyntax {
                 matched: prefix,

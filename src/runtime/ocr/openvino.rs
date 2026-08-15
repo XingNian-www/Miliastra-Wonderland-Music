@@ -929,30 +929,29 @@ fn local_runtime_search_paths(roots: &[PathBuf]) -> Vec<PathBuf> {
 
 /// 把本地 OpenVINO/TBB 目录加入进程 DLL 搜索路径。
 ///
-/// 使用 AddDllDirectory 而非修改进程级 PATH:set_var 是 unsafe 的(进程级
-/// 环境变异与并发进程派生存在数据竞争),而 DLL 目录只影响本进程后续的
-/// LoadLibrary 解析,无并发风险。
+/// openvino-sys 通过 libloading 的 flags=0 加载 openvino_c.dll；这种加载方式
+/// 不保证使用 AddDllDirectory 注册的用户目录。必须在 OCR 工作线程启动前把
+/// 运行时目录加入 PATH，才能让 OpenVINO 的 TBB 与插件依赖按传统规则解析。
 #[cfg(windows)]
 fn prepend_process_path(paths: &[PathBuf]) {
-    use std::os::windows::ffi::OsStrExt;
-
-    use windows::Win32::System::LibraryLoader::AddDllDirectory;
-    use windows::core::PCWSTR;
-
     let mut ordered = Vec::with_capacity(paths.len());
     for path in paths.iter().filter(|path| path.is_dir()) {
         push_unique_path(&mut ordered, path.clone());
     }
-    for path in ordered {
-        let wide = path
-            .as_os_str()
-            .encode_wide()
-            .chain(Some(0))
-            .collect::<Vec<_>>();
-        if unsafe { AddDllDirectory(PCWSTR(wide.as_ptr())) }.is_null() {
-            log::warn!("AddDllDirectory 失败: {}", path.display());
+    if ordered.is_empty() {
+        return;
+    }
+    if let Some(existing) = std::env::var_os("PATH") {
+        for path in std::env::split_paths(&existing) {
+            push_unique_path(&mut ordered, path);
         }
     }
+    let Ok(path) = std::env::join_paths(ordered) else {
+        log::warn!("无法拼接 OpenVINO 本地 DLL 搜索路径，继续使用原 PATH");
+        return;
+    };
+    // 此函数由 Once 在 OCR 初始化期间调用，早于 OCR 工作线程创建。
+    unsafe { std::env::set_var("PATH", path) };
 }
 
 #[cfg(windows)]

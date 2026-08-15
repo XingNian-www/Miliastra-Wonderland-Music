@@ -214,7 +214,7 @@ impl PersistentQueue {
 fn normalize_source(source: &str) -> String {
     if source.trim().is_empty() {
         String::new()
-    } else if matches!(source, "qqmusic" | "netease" | "bilibili") {
+    } else if matches!(source, "qqmusic" | "netease" | "bilibili" | "kugou") {
         source.to_string()
     } else {
         "qqmusic".to_string()
@@ -246,6 +246,16 @@ mod tests {
         assert_eq!(queue.items()[0].id, 1);
         assert_eq!(queue.items()[0].keyword, "song name");
         assert_eq!(queue.items()[0].source, "netease");
+
+        let added = queue
+            .push(QueueItem {
+                source: "kugou".to_string(),
+                keyword: "酷狗歌曲".to_string(),
+                ..QueueItem::default()
+            })
+            .unwrap();
+        assert!(added);
+        assert_eq!(queue.items()[1].source, "kugou");
         assert_eq!(
             queue.items()[0].candidate_snapshot,
             vec![test_candidate(

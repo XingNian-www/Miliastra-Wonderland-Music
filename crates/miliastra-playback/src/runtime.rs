@@ -1149,6 +1149,7 @@ async fn run_commands(
                     continue;
                 };
                 if pending_login.is_some() {
+                    core.release_login(session_id);
                     let _ = reply.send(Err(PlaybackError::Failure(Failure::new(
                         "login_in_progress",
                         "credential validation is already in progress",

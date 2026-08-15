@@ -336,8 +336,10 @@ impl KugouAdapter {
                 "kugou refresh requires a kugou credential".to_owned(),
             ));
         };
-        // 新下发的续期字段覆盖旧值；其余 cookie 保持原样。
-        refreshed_cookies.extend(cookies);
+        // 保留旧 cookie；新下发的续期字段覆盖旧值。
+        let mut merged_cookies = cookies.clone();
+        merged_cookies.extend(refreshed_cookies);
+        refreshed_cookies = merged_cookies;
         Ok(ProviderCredential::Kugou {
             token: new_token,
             userid: new_userid,

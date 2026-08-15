@@ -254,6 +254,7 @@ pub(crate) enum PlaybackCommand {
     Resume,
     Play,
     Next,
+    DeleteCurrentPoolTrack,
     Previous,
     Volume(String),
     Status,
@@ -327,11 +328,16 @@ pub(crate) struct PlaybackControllerSnapshot {
 
 impl PlaybackCommand {
     pub(crate) fn claims_chat(envelope: &CommandEnvelope) -> bool {
-        envelope.prefix() == CommandPrefix::At
-            && envelope.authority() == CommandAuthority::HallMember
-            && PLAYBACK_COMMAND_PREFIXES
+        if envelope.prefix() != CommandPrefix::At {
+            return false;
+        }
+        match envelope.authority() {
+            CommandAuthority::HallMember => PLAYBACK_COMMAND_PREFIXES
                 .iter()
-                .any(|prefix| envelope.command_text().starts_with(prefix))
+                .filter(|prefix| **prefix != "删除")
+                .any(|prefix| envelope.command_text().starts_with(prefix)),
+            CommandAuthority::Friend => envelope.command_text() == "删除",
+        }
     }
 
     pub(crate) fn parse_chat(envelope: &CommandEnvelope) -> Option<FeatureCommandMatch<Self>> {
@@ -357,6 +363,7 @@ impl PlaybackCommand {
             ("队列清空", false),
             ("下一首", false),
             ("下一曲", false),
+            ("删除", false),
             ("上一首", false),
             ("上一曲", false),
             ("暂停", false),
@@ -382,6 +389,7 @@ impl PlaybackCommand {
                 "继续" | "恢复" => Self::Resume,
                 "播放" => Self::Play,
                 "下一首" | "下一曲" => Self::Next,
+                "删除" => Self::DeleteCurrentPoolTrack,
                 "上一首" | "上一曲" => Self::Previous,
                 "音量" => Self::Volume(argument.to_string()),
                 "状态" => Self::Status,
@@ -411,6 +419,7 @@ impl PlaybackCommand {
             Self::Pause => "pause".to_string(),
             Self::Resume | Self::Play => "play".to_string(),
             Self::Next => "next".to_string(),
+            Self::DeleteCurrentPoolTrack => "delete_current_pool_track".to_string(),
             Self::Previous => "previous".to_string(),
             Self::Volume(volume) => format!("volume:{}", command_identity(volume)),
             Self::Status => "status".to_string(),
@@ -451,6 +460,7 @@ const PLAYBACK_COMMAND_PREFIXES: &[&str] = &[
     "队列清空",
     "下一首",
     "下一曲",
+    "删除",
     "上一首",
     "上一曲",
     "暂停",
@@ -1065,6 +1075,14 @@ mod tests {
     use miliastra_kernel::clock::SystemClock;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn hidden_delete_command_parses_without_an_argument() {
+        let parsed = PlaybackCommand::parse_hall("删除").expect("hidden delete command");
+        assert_eq!(parsed.command, PlaybackCommand::DeleteCurrentPoolTrack);
+        assert_eq!(parsed.argument, "");
+        assert_eq!(PlaybackCommand::parse_hall("删除 1"), None);
+    }
 
     #[test]
     fn queue_aliases_parse_as_the_full_queue_command() {

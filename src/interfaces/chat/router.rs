@@ -144,6 +144,7 @@ impl<'a> ChatCommandRouter<'a> {
                     AdministrationCommand::claims_chat,
                 ),
                 (ChatCommandModule::SongRequest, SongCommand::claims_chat),
+                (ChatCommandModule::Playback, PlaybackCommand::claims_chat),
                 (ChatCommandModule::Invite, InviteCommand::claims_chat),
                 (
                     ChatCommandModule::Moderation,
@@ -343,6 +344,21 @@ mod tests {
                 "ordinary command was reserved: {message_type} {command}"
             );
         }
+    }
+
+    #[test]
+    fn delete_current_pool_track_is_friend_only() {
+        let router = ChatCommandRouter::without_custom_workflow();
+
+        let friend = router
+            .route(&envelope("pink", "@删除"), None)
+            .expect("好友私聊应允许删除当前播放池歌曲");
+        assert_eq!(
+            friend.command,
+            ModuleCommand::Playback(PlaybackCommand::DeleteCurrentPoolTrack)
+        );
+        assert!(router.route(&envelope("blue", "@删除"), None).is_none());
+        assert!(router.route(&envelope("pink", "@下一首"), None).is_none());
     }
 
     #[test]

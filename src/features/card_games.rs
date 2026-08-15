@@ -1487,10 +1487,9 @@ fn find_player(players: &[Player], name: &str) -> Option<usize> {
 }
 
 fn player_key(name: &str) -> String {
-    name.chars()
-        .filter(|ch| !ch.is_whitespace() && !ch.is_ascii_punctuation())
-        .flat_map(char::to_lowercase)
-        .collect()
+    // 只做去首尾空白 + 小写,保留标点:避免 "小明!" 与 "小明" 碰撞
+    // (否则可代他人出牌/抢地主/收到私聊手牌)。
+    name.trim().chars().flat_map(char::to_lowercase).collect()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

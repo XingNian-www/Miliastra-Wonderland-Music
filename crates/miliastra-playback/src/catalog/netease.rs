@@ -39,31 +39,33 @@ const WEAPI_RSA_E: &str = "010001";
 const WEAPI_RSA_N: &str = "00e0b509f6259df8642dbc35662901477df22677ec152b5ff68ace615bb7b725152b3ab17a876aea8a5aa76d2e417629ec4ee341f56135fccf695280104e0312ecbda92557c93870114af6c9d05c4f7f0c3685b7a46bee255932575cce10b424d813cfe4875d3e82047b97ddef52741d546b8e289dc6935b3ece0462db0a22b8e7";
 
 /// AES-128-CBC 加密（PKCS7 填充，固定 IV），返回 base64。
-fn weapi_aes_encrypt_base64(text: &str, key: &[u8]) -> String {
+fn weapi_aes_encrypt_base64(text: &str, key: &[u8]) -> Result<String, CatalogError> {
     let encryptor = Encryptor::<Aes128>::new_from_slices(key, WEAPI_AES_IV)
-        .expect("weapi AES key and IV are 16 bytes");
+        .map_err(|error| CatalogError::InvalidResponse(format!("weapi AES 初始化失败: {error}")))?;
     let mut buffer = text.as_bytes().to_vec();
     let position = buffer.len();
     buffer.resize(position + 16, 0);
     let encrypted = encryptor
         .encrypt_padded_mut::<Pkcs7>(&mut buffer, position)
-        .expect("weapi AES padding");
-    base64::engine::general_purpose::STANDARD.encode(encrypted)
+        .map_err(|error| CatalogError::InvalidResponse(format!("weapi AES 加密失败: {error}")))?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(encrypted))
 }
 
 /// RSA 裸模幂（无 PKCS#1 填充）：m = 反转后的密钥字节（大端），
 /// c = m^e mod n，输出 256 位 hex 补零。
-fn weapi_rsa_encrypt(second_key: &str) -> String {
-    let exponent = BigUint::parse_bytes(WEAPI_RSA_E.as_bytes(), 16).expect("weapi RSA e");
-    let modulus = BigUint::parse_bytes(WEAPI_RSA_N.as_bytes(), 16).expect("weapi RSA n");
+fn weapi_rsa_encrypt(second_key: &str) -> Result<String, CatalogError> {
+    let exponent = BigUint::parse_bytes(WEAPI_RSA_E.as_bytes(), 16)
+        .ok_or_else(|| CatalogError::InvalidResponse("weapi RSA 指数解析失败".to_owned()))?;
+    let modulus = BigUint::parse_bytes(WEAPI_RSA_N.as_bytes(), 16)
+        .ok_or_else(|| CatalogError::InvalidResponse("weapi RSA 模数解析失败".to_owned()))?;
     let reversed = second_key.chars().rev().collect::<String>();
     let message = BigUint::from_bytes_be(reversed.as_bytes());
     let encrypted = message.modpow(&exponent, &modulus);
-    format!("{encrypted:0256x}")
+    Ok(format!("{encrypted:0256x}"))
 }
 
 /// 构造 weapi 请求体：{params, encSecKey}。
-fn weapi_encrypt(data: &Value) -> BTreeMap<String, String> {
+fn weapi_encrypt(data: &Value) -> Result<BTreeMap<String, String>, CatalogError> {
     let text = data.to_string();
     let second_key = rand::thread_rng()
         .sample_iter(&Alphanumeric)
@@ -71,12 +73,12 @@ fn weapi_encrypt(data: &Value) -> BTreeMap<String, String> {
         .map(char::from)
         .collect::<String>()
         .to_ascii_lowercase();
-    let first_pass = weapi_aes_encrypt_base64(&text, WEAPI_FIRST_KEY);
-    let params = weapi_aes_encrypt_base64(&first_pass, second_key.as_bytes());
-    BTreeMap::from([
+    let first_pass = weapi_aes_encrypt_base64(&text, WEAPI_FIRST_KEY)?;
+    let params = weapi_aes_encrypt_base64(&first_pass, second_key.as_bytes())?;
+    Ok(BTreeMap::from([
         ("params".to_owned(), params),
-        ("encSecKey".to_owned(), weapi_rsa_encrypt(&second_key)),
-    ])
+        ("encSecKey".to_owned(), weapi_rsa_encrypt(&second_key)?),
+    ]))
 }
 
 #[derive(Clone)]
@@ -187,7 +189,7 @@ impl NeteaseAdapter {
                 .cloned()
                 .unwrap_or_default(),
         });
-        let payload = weapi_encrypt(&params);
+        let payload = weapi_encrypt(&params)?;
         let response = self
             .client
             .post(self.media_url.clone())
@@ -232,7 +234,7 @@ impl NeteaseAdapter {
                 ..ProviderAccountStatus::default()
             }));
         };
-        let payload = weapi_encrypt(&serde_json::json!({}));
+        let payload = weapi_encrypt(&serde_json::json!({}))?;
         let response = self
             .client
             .post(self.account_url.clone())
@@ -296,7 +298,7 @@ impl NeteaseAdapter {
         user_id: Option<&Value>,
     ) -> Option<u64> {
         let user_id = user_id.and_then(Value::as_i64)?;
-        let payload = weapi_encrypt(&serde_json::json!({ "userId": user_id.to_string() }));
+        let payload = weapi_encrypt(&serde_json::json!({ "userId": user_id.to_string() })).ok()?;
         let response = self
             .client
             .post(self.vip_url.clone())
@@ -717,18 +719,18 @@ mod tests {
         // text={"ids":"[42]","br":320000,"csrf_token":"token"}，second_key=1234567890abcdef
         let text = r#"{"ids":"[42]","br":320000,"csrf_token":"token"}"#;
         let second_key = "1234567890abcdef";
-        let first_pass = super::weapi_aes_encrypt_base64(text, super::WEAPI_FIRST_KEY);
+        let first_pass = super::weapi_aes_encrypt_base64(text, super::WEAPI_FIRST_KEY).unwrap();
         assert_eq!(
             first_pass,
             "KWxUcxtHzWTJ54oXtah+UUsdY6jYhIc8X2U0MjR58DkeUILbKW4A5mZ7klw+Q0nA"
         );
-        let params = super::weapi_aes_encrypt_base64(&first_pass, second_key.as_bytes());
+        let params = super::weapi_aes_encrypt_base64(&first_pass, second_key.as_bytes()).unwrap();
         assert_eq!(
             params,
             "47V96V0k548QH7Q38d7j7KspR6S6rWt45b/f0ZvmqP47Ap+vUFNOrRVML7AG8ONES1fZ8jy70gAgzRZYzW4a7cg3KPg4yP9EcMA1eI0Ovyw="
         );
         assert_eq!(
-            super::weapi_rsa_encrypt(second_key),
+            super::weapi_rsa_encrypt(second_key).unwrap(),
             "bc05a756cb87b1a2674efda9e90a27d641dcbbe2e6b7be3b61193e47315c298183d409578ac80502bd441d82bf1611d6d9238bcaf64794d096417b726373fdd8cf4a9e9d31d198d6d785ffa3d0a2e8c621b4d6c019fabe0ca6f3a815d9f2a4875a0bcab968f331f394566e1162603ed1dd002aa89b47fd8dcbc77d2c6976efed"
         );
     }

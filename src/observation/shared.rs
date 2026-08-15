@@ -107,9 +107,8 @@ impl<T> SharedObservationStream<T> {
 }
 
 fn next_sequence(sequence: u64) -> u64 {
-    sequence
-        .checked_add(1)
-        .expect("observation sequence exhausted")
+    // 序列号回绕即可,无需在 2^64 溢出时 panic。
+    sequence.wrapping_add(1)
 }
 
 pub struct ObservationSubscriber {

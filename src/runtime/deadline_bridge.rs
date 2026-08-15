@@ -211,14 +211,16 @@ impl BusinessRuntimeGroupBuilder {
         ) -> Result<BusinessDeadlineBridge, std::io::Error>,
     ) -> Result<BusinessRuntimeGroup, BusinessRuntimeGroupStartError> {
         let event_sink = business.event_sink();
-        let events = self
-            .events
-            .take()
-            .expect("a fresh deadline timer owns its event receiver");
-        let timer = self
-            .timer
-            .take()
-            .expect("a fresh deadline timer owns its runtime");
+        let Some(events) = self.events.take() else {
+            return Err(BusinessRuntimeGroupStartError::BridgeSpawn(
+                std::io::Error::other("deadline timer event receiver already consumed"),
+            ));
+        };
+        let Some(timer) = self.timer.take() else {
+            return Err(BusinessRuntimeGroupStartError::BridgeSpawn(
+                std::io::Error::other("deadline timer runtime already consumed"),
+            ));
+        };
         let bridge = match start_bridge(events, event_sink) {
             Ok(bridge) => bridge,
             Err(error) => {

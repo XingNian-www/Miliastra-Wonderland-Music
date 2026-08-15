@@ -302,6 +302,17 @@ impl RequestStateStore {
         })
     }
 
+    /// 从播放池删除指定歌曲(删除歌曲功能:该曲不再参与随机播放);返回是否实际移除。
+    pub(crate) fn remove_pool_track(&mut self, key: &TrackKey) -> Result<bool> {
+        self.update(|snapshot| {
+            let before = snapshot.playback_pool.len();
+            snapshot
+                .playback_pool
+                .retain(|track| track.track_ref.key != *key);
+            snapshot.playback_pool.len() < before
+        })
+    }
+
     /// 从播放池随机挑一首，排除本轮已尝试的 TrackKey；池空或全部被排除时返回 None。
     pub(crate) fn pick_pool_track(&self, excluded: &HashSet<TrackKey>) -> Option<PlayableTrack> {
         let pool = &self.snapshot.playback_pool;
@@ -1422,6 +1433,43 @@ mod tests {
                     true
                 })
                 .unwrap();
+            assert!(store.pick_pool_track(&HashSet::new()).is_none());
+        }
+    }
+
+    #[test]
+    fn playback_pool_remove_track_takes_it_out_of_pool() {
+        let state_path = temp_request_state_path("playback-pool-remove");
+        let store =
+            RequestStateStore::load(state_path.clone(), crate::test_support::test_state_store())
+                .unwrap();
+        {
+            let mut store = store.lock().unwrap();
+            let first = test_track("miliastra://track/qqmusic/1", "歌一 - 歌手A");
+            let second = test_track("miliastra://track/qqmusic/2", "歌二 - 歌手B");
+            store.record_pool_track(first.clone(), 10).unwrap();
+            store.record_pool_track(second.clone(), 10).unwrap();
+            assert_eq!(store.playback_pool_snapshot().len(), 2);
+
+            // 删除指定歌曲后不再出现在播放池。
+            let removed = store
+                .remove_pool_track(&first.track_ref.key)
+                .expect("remove pool track");
+            assert!(removed);
+            assert_eq!(store.playback_pool_snapshot().len(), 1);
+            assert_eq!(
+                store.playback_pool_snapshot()[0].track_ref.key,
+                second.track_ref.key
+            );
+
+            // 删除不存在的歌曲返回 false。
+            let again = store
+                .remove_pool_track(&first.track_ref.key)
+                .expect("remove again");
+            assert!(!again);
+
+            // 全部删除后池为空。
+            let _ = store.remove_pool_track(&second.track_ref.key).unwrap();
             assert!(store.pick_pool_track(&HashSet::new()).is_none());
         }
         remove_request_state_path(state_path);

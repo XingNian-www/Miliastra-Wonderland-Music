@@ -214,6 +214,8 @@ pub(crate) struct OcrRuntime {
     worker: Option<JoinHandle<()>>,
     worker_finished: Receiver<()>,
     shutdown_timeout: Duration,
+    /// 关闭超时后放弃的 worker,后续启动/关闭时回收已结束的线程。
+    abandoned_workers: Vec<JoinHandle<()>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -301,6 +303,7 @@ impl OcrRuntime {
             worker: Some(worker),
             worker_finished,
             shutdown_timeout: config.shutdown_timeout,
+            abandoned_workers: Vec::new(),
         })
     }
 
@@ -313,6 +316,8 @@ impl OcrRuntime {
     }
 
     fn stop_worker(&mut self) -> Result<OcrShutdownReport> {
+        // 先回收上一轮超时放弃的 worker(已结束的直接 join,避免线程泄漏累积)。
+        self.reap_abandoned_workers();
         let Some(worker) = self.worker.take() else {
             return Ok(OcrShutdownReport::default());
         };
@@ -324,7 +329,17 @@ impl OcrRuntime {
                     .map_err(|_| anyhow!("OCR runtime worker panicked"))?;
                 Ok(OcrShutdownReport { timed_out: false })
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => Ok(OcrShutdownReport { timed_out: true }),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // 保留句柄供后续回收,不再直接丢弃。
+                self.abandoned_workers.push(worker);
+                if self.abandoned_workers.len() > 8 {
+                    log::error!(
+                        "OCR worker 累计 {} 个未退出线程,可能存在原生推理卡死",
+                        self.abandoned_workers.len()
+                    );
+                }
+                Ok(OcrShutdownReport { timed_out: true })
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 worker
                     .join()
@@ -332,6 +347,18 @@ impl OcrRuntime {
                 Err(anyhow!(
                     "OCR runtime worker stopped without a completion signal"
                 ))
+            }
+        }
+    }
+
+    fn reap_abandoned_workers(&mut self) {
+        let mut index = 0;
+        while index < self.abandoned_workers.len() {
+            if self.abandoned_workers[index].is_finished() {
+                let worker = self.abandoned_workers.swap_remove(index);
+                let _ = worker.join();
+            } else {
+                index += 1;
             }
         }
     }

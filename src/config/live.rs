@@ -74,33 +74,38 @@ impl LiveConfigs {
     /// 用新配置覆盖全部值（保存成功后调用）；共享句柄保持不变，
     /// 运行态读取点无需重建即可看到新值。
     pub fn apply(&self, config: &AppConfig) {
+        // 锁中毒时恢复继续使用,避免把可恢复的配置热更新升级为线程崩溃。
+        use std::sync::PoisonError;
         *self
             .queue_protect_current_song
             .write()
-            .expect("队列当前歌曲保护共享锁已中毒") =
+            .unwrap_or_else(PoisonError::into_inner) =
             config.queue.protect_current_song_until_finished;
         *self
             .queue_external_protect_seconds
             .write()
-            .expect("外部播放保护时间共享锁已中毒") =
+            .unwrap_or_else(PoisonError::into_inner) =
             config.queue.external_playback_protect_after_seconds;
         *self
             .status_poll_ms
             .write()
-            .expect("播放状态查询间隔共享锁已中毒") = config.timing.playback.status_poll_ms;
+            .unwrap_or_else(PoisonError::into_inner) = config.timing.playback.status_poll_ms;
         *self
             .monitor_status_ms
             .write()
-            .expect("播放状态校准间隔共享锁已中毒") = config.timing.playback.monitor_status_ms;
+            .unwrap_or_else(PoisonError::into_inner) = config.timing.playback.monitor_status_ms;
         *self
             .monitor_tick_ms
             .write()
-            .expect("播放监控循环间隔共享锁已中毒") = config.timing.playback.monitor_tick_ms;
-        *self.song_dedup.write().expect("同歌去重配置共享锁已中毒") = config.song_dedup.clone();
+            .unwrap_or_else(PoisonError::into_inner) = config.timing.playback.monitor_tick_ms;
+        *self
+            .song_dedup
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = config.song_dedup.clone();
         *self
             .friend_delivery_auto_retry_count
             .write()
-            .expect("好友投递自动重试次数共享锁已中毒") = config.friend_delivery.auto_retry_count;
+            .unwrap_or_else(PoisonError::into_inner) = config.friend_delivery.auto_retry_count;
     }
 }
 

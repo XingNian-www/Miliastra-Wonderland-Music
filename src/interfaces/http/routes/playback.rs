@@ -118,6 +118,140 @@ pub(super) fn playback_statistics_reset_route(
     .map_err(internal_error)
 }
 
+/// POST /playback/song/delete?provider=&id= :删除指定歌曲
+/// (从播放池移除,不再随机播放;同时删除磁盘音频缓存)。
+pub(super) fn playback_song_delete_route(
+    query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let provider = query_value(query, "provider")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| bad_request("缺少provider参数"))?
+        .parse::<ProviderId>()
+        .map_err(|_| bad_request("provider参数无效"))?;
+    let id = query_value(query, "id")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| bad_request("缺少id参数"))?;
+    let key = TrackKey::new(provider, id).map_err(|_| bad_request("id参数无效"))?;
+    // 1) 从播放池移除(不再参与随机播放)。
+    let pool_removed = match state
+        .application
+        .tasks
+        .apply_mutation(BusinessMutationIntent::Playback(
+            PlaybackMutationIntent::RemovePoolTrack(key.clone()),
+        ))
+        .map_err(internal_error)?
+    {
+        BusinessMutationOutcome::Playback(PlaybackMutationOutcome::PoolTrackRemoved(removed)) => {
+            removed
+        }
+        _ => {
+            return Err(internal_error("播放池删除结果变体不匹配"));
+        }
+    };
+    // 2) 删除磁盘音频缓存(下次播放重新下载)。
+    let cache_removed = state
+        .application
+        .player
+        .invalidate_track_cache(&key)
+        .map_err(internal_error)?;
+    serde_json::to_string(&json!({
+        "ok": true,
+        "poolRemoved": pool_removed,
+        "cacheRemoved": cache_removed,
+    }))
+    .map_err(internal_error)
+}
+
+/// POST /playback/cache/invalidate?provider=&id= :删除指定曲目的磁盘音频缓存。
+pub(super) fn playback_cache_invalidate_route(
+    query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let provider = query_value(query, "provider")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| bad_request("缺少provider参数"))?
+        .parse::<ProviderId>()
+        .map_err(|_| bad_request("provider参数无效"))?;
+    let id = query_value(query, "id")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| bad_request("缺少id参数"))?;
+    let key = TrackKey::new(provider, id).map_err(|_| bad_request("id参数无效"))?;
+    let removed = state
+        .application
+        .player
+        .invalidate_track_cache(&key)
+        .map_err(internal_error)?;
+    serde_json::to_string(&json!({
+        "ok": true,
+        "removed": removed,
+        "cachePreserved": false,
+    }))
+    .map_err(internal_error)
+}
+
+/// /playback/seek?position=<秒> :跳转到指定播放位置。
+pub(super) fn playback_seek_route(
+    query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let position = query_value(query, "position")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| bad_request("缺少position参数(秒)"))?;
+    let position: f64 = position
+        .trim()
+        .parse()
+        .map_err(|_| bad_request("position参数必须是数字(秒)"))?;
+    if !position.is_finite() || position < 0.0 {
+        return Err(bad_request("position参数必须是有限的非负数"));
+    }
+    state
+        .application
+        .player
+        .seek(position)
+        .map_err(internal_error)?;
+    serde_json::to_string(&json!({ "ok": true })).map_err(internal_error)
+}
+
+/// GET /playback/mode 查询当前播放模式;
+/// POST /playback/mode?mode=sequential|repeat_one|shuffle 设置。
+pub(super) fn playback_mode_route(
+    query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let Some(mode_text) = query_value(query, "mode").filter(|value| !value.trim().is_empty())
+    else {
+        let mode = state
+            .application
+            .player
+            .play_mode()
+            .map_err(internal_error)?;
+        let label = match mode {
+            1 => "repeat_one",
+            2 => "shuffle",
+            _ => "sequential",
+        };
+        return serde_json::to_string(&json!({ "mode": label })).map_err(internal_error);
+    };
+    let mode = match mode_text.trim() {
+        "sequential" | "0" => 0,
+        "repeat_one" | "1" => 1,
+        "shuffle" | "2" => 2,
+        _ => return Err(bad_request("mode只允许sequential/repeat_one/shuffle")),
+    };
+    state
+        .application
+        .player
+        .set_play_mode(mode)
+        .map_err(internal_error)?;
+    let label = match mode {
+        1 => "repeat_one",
+        2 => "shuffle",
+        _ => "sequential",
+    };
+    serde_json::to_string(&json!({ "ok": true, "mode": label })).map_err(internal_error)
+}
+
 pub(super) fn playback_cache_tracks_route(
     query: &[(String, String)],
     state: &HttpSharedState,
@@ -541,7 +675,9 @@ pub(super) fn queue_add(
         ))
         .map_err(internal_error)?
     else {
-        unreachable!("playback queue push intent returned a different outcome")
+        return Err(internal_error(
+            "playback queue push intent returned a different outcome",
+        ));
     };
     if !pushed.accepted {
         return Err(AppError {
@@ -595,7 +731,9 @@ pub(super) fn queue_remove(
         ))
         .map_err(internal_error)?
     else {
-        unreachable!("playback queue remove intent returned a different outcome")
+        return Err(internal_error(
+            "playback queue remove intent returned a different outcome",
+        ));
     };
     let QueueRemoveOutcome::Removed { index, item, size } = removed else {
         return Err(match removed {
@@ -605,7 +743,10 @@ pub(super) fn queue_remove(
             },
             QueueRemoveOutcome::InvalidIndex => bad_request("无效的队列索引"),
             QueueRemoveOutcome::Empty => bad_request("队列为空"),
-            QueueRemoveOutcome::Removed { .. } => unreachable!(),
+            QueueRemoveOutcome::Removed { .. } => AppError {
+                status: 500,
+                message: "内部错误: 队列移除结果变体不匹配".to_string(),
+            },
         });
     };
     Ok(json!({
@@ -629,7 +770,9 @@ pub(super) fn queue_clear(state: &HttpSharedState) -> std::result::Result<String
         ))
         .map_err(internal_error)?
     else {
-        unreachable!("playback queue clear intent returned a different outcome")
+        return Err(internal_error(
+            "playback queue clear intent returned a different outcome",
+        ));
     };
     Ok(json!({ "ok": true }).to_string())
 }

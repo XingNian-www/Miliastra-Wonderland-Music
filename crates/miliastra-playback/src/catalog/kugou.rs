@@ -156,10 +156,7 @@ impl KugouAdapter {
             .query(&query)
             .header("Cookie", Self::credential_cookie_header(credential));
         request = request.query(&[("token", token), ("userid", userid), ("dfid", dfid)]);
-        // 临时诊断：记录搜索请求的完整 URL，便于比对酷狗侧拒绝原因。
-        log::warn!(
-            "Kugou sidecar request: {url}?{query:?} token={token} userid={userid} dfid={dfid}"
-        );
+        // 注意:不得在日志中输出 token/userid/dfid 等会话凭证。
         let response = request.send().await.map_err(classify_request_error)?;
         classify_status(&response)?;
         response
@@ -335,7 +332,9 @@ impl KugouAdapter {
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| dfid.to_owned());
         let ProviderCredential::Kugou { cookies, .. } = credential else {
-            unreachable!()
+            return Err(CatalogError::CredentialRejected(
+                "kugou refresh requires a kugou credential".to_owned(),
+            ));
         };
         // 新下发的续期字段覆盖旧值；其余 cookie 保持原样。
         refreshed_cookies.extend(cookies);

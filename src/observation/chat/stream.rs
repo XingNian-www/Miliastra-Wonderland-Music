@@ -243,10 +243,7 @@ impl ChatObservationShared {
                 chat.clone(),
                 BubbleSequence::new(state.next_bubble_sequence),
             );
-            state.next_bubble_sequence = state
-                .next_bubble_sequence
-                .checked_add(1)
-                .expect("secondary chat bubble sequence exhausted");
+            state.next_bubble_sequence = state.next_bubble_sequence.wrapping_add(1);
             observed.push(SecondaryObservedMessage {
                 id,
                 text: message.text,
@@ -305,11 +302,7 @@ impl ChatObservationShared {
             .state
             .lock()
             .map_err(|_| anyhow!("聊天观察流状态锁已损坏"))?;
-        let next = state
-            .visual_session
-            .get()
-            .checked_add(1)
-            .expect("chat visual session sequence exhausted");
+        let next = state.visual_session.get().wrapping_add(1);
         state.visual_session = VisualSessionId::new(next);
         state.next_bubble_sequence = 1;
         state.primary_visible.clear();
@@ -518,10 +511,7 @@ fn new_primary_tracked_message(
         ChatIdentity::PrimaryHall,
         BubbleSequence::new(state.next_bubble_sequence),
     );
-    state.next_bubble_sequence = state
-        .next_bubble_sequence
-        .checked_add(1)
-        .expect("primary chat bubble sequence exhausted");
+    state.next_bubble_sequence = state.next_bubble_sequence.wrapping_add(1);
     PrimaryTrackedMessage {
         id,
         message_type: message.message_type.clone(),

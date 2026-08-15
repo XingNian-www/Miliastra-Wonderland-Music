@@ -379,7 +379,7 @@ impl HallCommand {
             let command = match prefix {
                 "大厅检测" => Self::Detect,
                 "大厅时间" => Self::Time,
-                _ => unreachable!("all hall prefixes are handled"),
+                _ => return None,
             };
             return Some(CommandSyntax {
                 matched: prefix,

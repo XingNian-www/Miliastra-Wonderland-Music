@@ -597,10 +597,9 @@ impl<C: Clock> PlayerObserver<C> {
             return TrackKeyUpdate::default();
         }
 
-        let candidate = self
-            .track_key_candidate
-            .take()
-            .expect("accepted track-key candidate must exist");
+        let Some(candidate) = self.track_key_candidate.take() else {
+            return TrackKeyUpdate::default();
+        };
         let identity_changed = self
             .last_identity_key
             .as_ref()
@@ -654,10 +653,9 @@ impl<C: Clock> PlayerObserver<C> {
             return TransportUpdate::default();
         }
 
-        let candidate = self
-            .transport_candidate
-            .take()
-            .expect("accepted transport candidate must exist");
+        let Some(candidate) = self.transport_candidate.take() else {
+            return TransportUpdate::default();
+        };
         let restarted = self.last_transport == Some(TransportState::Stopped)
             && candidate.value == TransportState::Playing;
         self.last_transport = Some(candidate.value);

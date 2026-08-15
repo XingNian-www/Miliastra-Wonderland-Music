@@ -302,17 +302,18 @@ fn resolve_provider_config(
     query: Option<&[(String, String)]>,
 ) -> Result<AiProviderConfig> {
     let query_value = |key| query.and_then(|items| query_value(items, key));
+    // 安全加固:endpoint/apiKey 不允许通过查询参数覆盖(防止把配置中的
+    // 真实密钥作为 Bearer 头发往攻击者指定的端点,或用作 SSRF)。
+    if query_value("endpoint").is_some() {
+        bail!("endpoint不允许通过查询参数覆盖,请在配置中心设置ai.endpoint");
+    }
+    if query_value("apiKey").is_some() || query_value("api_key").is_some() {
+        bail!("apiKey不允许通过查询参数覆盖,请在配置中心设置ai.api_key");
+    }
     let provider_override = query_value("provider");
     let provider = parse_provider(provider_override.unwrap_or(&config.provider))?;
-    let api_key = normalize_api_key(
-        query_value("apiKey")
-            .or_else(|| query_value("api_key"))
-            .unwrap_or(config.api_key.as_str()),
-    )?;
-    let endpoint = resolve_endpoint(
-        provider,
-        query_value("endpoint").unwrap_or(config.endpoint.as_str()),
-    )?;
+    let api_key = normalize_api_key(config.api_key.as_str())?;
+    let endpoint = resolve_endpoint(provider, config.endpoint.as_str())?;
     let model = resolve_model(
         provider,
         query_value("model").unwrap_or(config.model.as_str()),

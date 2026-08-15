@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -330,6 +330,8 @@ pub struct CredentialStore {
     directory: Option<PathBuf>,
     credentials: Arc<RwLock<BTreeMap<&'static str, ProviderCredential>>>,
     refresh_metadata: Arc<RwLock<BTreeMap<String, RefreshMetadata>>>,
+    /// 串行化磁盘写入,避免 fsync 在 RwLock 写锁内执行阻塞所有读取。
+    save_lock: Arc<Mutex<()>>,
 }
 
 impl CredentialStore {
@@ -375,6 +377,7 @@ impl CredentialStore {
             directory: Some(directory),
             credentials: Arc::new(RwLock::new(credentials)),
             refresh_metadata: Arc::new(RwLock::new(refresh_metadata)),
+            save_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -384,6 +387,7 @@ impl CredentialStore {
             directory: None,
             credentials: Arc::new(RwLock::new(BTreeMap::new())),
             refresh_metadata: Arc::new(RwLock::new(BTreeMap::new())),
+            save_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -422,18 +426,21 @@ impl CredentialStore {
 
     pub fn mark_refresh_started(&self, provider: &str) -> Result<(), CredentialError> {
         let provider = canonical_provider(provider)?;
-        let mut metadata = self
-            .refresh_metadata
-            .write()
-            .map_err(|_| CredentialError::Poisoned)?;
-        metadata.insert(
-            provider.to_owned(),
-            RefreshMetadata {
-                state: "refreshing".to_owned(),
-                ..RefreshMetadata::default()
-            },
-        );
-        self.persist_refresh_metadata(&metadata)
+        let updated = {
+            let mut metadata = self
+                .refresh_metadata
+                .write()
+                .map_err(|_| CredentialError::Poisoned)?;
+            metadata.insert(
+                provider.to_owned(),
+                RefreshMetadata {
+                    state: "refreshing".to_owned(),
+                    ..RefreshMetadata::default()
+                },
+            );
+            metadata.clone()
+        };
+        self.persist_refresh_metadata(&updated)
             .map_err(|error| CredentialError::Write {
                 path: self.refresh_state_path().unwrap_or_default(),
                 error,
@@ -456,20 +463,23 @@ impl CredentialStore {
             Ok(()) => ("success", None),
             Err(error) => ("failed", Some(error)),
         };
-        let mut metadata = self
-            .refresh_metadata
-            .write()
-            .map_err(|_| CredentialError::Poisoned)?;
-        metadata.insert(
-            provider.to_owned(),
-            RefreshMetadata {
-                state: state.to_owned(),
-                last_refresh_at_ms: now,
-                next_refresh_check_at_ms: next_check_at_ms,
-                last_error: error,
-            },
-        );
-        self.persist_refresh_metadata(&metadata)
+        let updated = {
+            let mut metadata = self
+                .refresh_metadata
+                .write()
+                .map_err(|_| CredentialError::Poisoned)?;
+            metadata.insert(
+                provider.to_owned(),
+                RefreshMetadata {
+                    state: state.to_owned(),
+                    last_refresh_at_ms: now,
+                    next_refresh_check_at_ms: next_check_at_ms,
+                    last_error: error,
+                },
+            );
+            metadata.clone()
+        };
+        self.persist_refresh_metadata(&updated)
             .map_err(|error| CredentialError::Write {
                 path: self.refresh_state_path().unwrap_or_default(),
                 error,
@@ -495,6 +505,10 @@ impl CredentialStore {
             return Ok(());
         };
         let content = serde_json::to_vec_pretty(metadata).map_err(|error| error.to_string())?;
+        let _guard = self
+            .save_lock
+            .lock()
+            .map_err(|_| "save lock poisoned".to_string())?;
         write_atomic(&path, &content).map_err(|error| error.to_string())
     }
 
@@ -521,13 +535,19 @@ impl CredentialStore {
         let provider = canonical_provider(provider)?;
         validate_source(provider, &credential)?;
         credential.validate()?;
+        // 磁盘写入在 save_lock 下串行执行,且不持有 RwLock 写锁,
+        // 避免 fsync/ACL 调用阻塞其他读取。
+        if let Some(directory) = self.directory.as_ref() {
+            let _guard = self
+                .save_lock
+                .lock()
+                .map_err(|_| CredentialError::Poisoned)?;
+            persist_credential(&credential_path(directory, provider), &credential)?;
+        }
         let mut credentials = self
             .credentials
             .write()
             .map_err(|_| CredentialError::Poisoned)?;
-        if let Some(directory) = self.directory.as_ref() {
-            persist_credential(&credential_path(directory, provider), &credential)?;
-        }
         let status = credential.presence();
         credentials.insert(provider, credential);
         Ok(status)

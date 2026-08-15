@@ -457,9 +457,7 @@ impl QqMusicAdapter {
         if let Some(qimei) = self.device.qimei.clone() {
             return qimei;
         }
-        let Ok(payload) =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| qimei_payload(&self.device)))
-        else {
+        let Ok(payload) = qimei_payload(&self.device) else {
             return QqQimei {
                 q16: String::new(),
                 q36: QQ_QIMEI_FALLBACK.to_owned(),
@@ -1176,7 +1174,7 @@ struct QimeiRequest {
     timestamp: u64,
     body: Value,
 }
-fn qimei_payload(device: &QqDevice) -> QimeiRequest {
+fn qimei_payload(device: &QqDevice) -> Result<QimeiRequest, CatalogError> {
     let crypt_key: String = rand::thread_rng()
         .sample_iter(&Alphanumeric)
         .take(16)
@@ -1191,25 +1189,28 @@ fn qimei_payload(device: &QqDevice) -> QimeiRequest {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let key = base64::engine::general_purpose::STANDARD.encode(
-        RsaPublicKey::from_public_key_pem(QIMEI_PUBLIC_KEY)
-            .unwrap()
-            .encrypt(
-                &mut rand::thread_rng(),
-                Pkcs1v15Encrypt,
-                crypt_key.as_bytes(),
-            )
-            .unwrap(),
-    );
+    let public_key = RsaPublicKey::from_public_key_pem(QIMEI_PUBLIC_KEY).map_err(|error| {
+        CatalogError::InvalidResponse(format!("QIMEI RSA 公钥解析失败: {error}"))
+    })?;
+    let encrypted_key = public_key
+        .encrypt(
+            &mut rand::thread_rng(),
+            Pkcs1v15Encrypt,
+            crypt_key.as_bytes(),
+        )
+        .map_err(|error| CatalogError::InvalidResponse(format!("QIMEI RSA 加密失败: {error}")))?;
+    let key = base64::engine::general_purpose::STANDARD.encode(encrypted_key);
     let plain = json!({"androidId":device.android_id,"platformId":1,"appKey":QIMEI_APP_KEY,"appVersion":"14.9.0","brand":device.brand,"channelId":"10003505","imei":device.imei,"model":device.model,"osVersion":"Android 10,level 29","qimei":"","qimei36":"","sdkVersion":"1.2.13.6","targetSdkVersion":"33","packageId":"com.tencent.qqmusic"}).to_string();
-    let cipher =
-        Encryptor::<Aes128>::new_from_slices(crypt_key.as_bytes(), crypt_key.as_bytes()).unwrap();
+    let cipher = Encryptor::<Aes128>::new_from_slices(crypt_key.as_bytes(), crypt_key.as_bytes())
+        .map_err(|error| {
+        CatalogError::InvalidResponse(format!("QIMEI AES 初始化失败: {error}"))
+    })?;
     let mut buffer = plain.into_bytes();
     let length = buffer.len();
     buffer.resize(length + 16, 0);
     let encrypted = cipher
         .encrypt_padded_mut::<Pkcs7>(&mut buffer, length)
-        .unwrap();
+        .map_err(|error| CatalogError::InvalidResponse(format!("QIMEI AES 加密失败: {error}")))?;
     let params = base64::engine::general_purpose::STANDARD.encode(encrypted);
     let extra = format!("{{\"appKey\":\"{QIMEI_APP_KEY}\"}}");
     let sign = md5_hex(&format!(
@@ -1219,10 +1220,10 @@ fn qimei_payload(device: &QqDevice) -> QimeiRequest {
         QIMEI_SECRET,
         extra
     ));
-    QimeiRequest {
+    Ok(QimeiRequest {
         timestamp,
         body: json!({"app":0,"os":1,"qimeiParams":{"key":key,"params":params,"time":timestamp.to_string(),"nonce":nonce,"sign":sign,"extra":extra}}),
-    }
+    })
 }
 fn md5_hex(value: &str) -> String {
     format!("{:x}", md5::compute(value))

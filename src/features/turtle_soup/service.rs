@@ -429,8 +429,26 @@ impl TurtleSoupWorkerRuntime {
             return;
         }
         for worker in self.workers.drain(..) {
-            if worker.join().is_err() {
-                log::error!("海龟汤 AI Worker 退出时 panic");
+            if worker.is_finished() {
+                if worker.join().is_err() {
+                    log::error!("海龟汤 AI Worker 退出时 panic");
+                }
+                continue;
+            }
+            // 有界等待:worker 可能正阻塞在 AI 长调用(含重试)上,
+            // 无限 join 会让退出路径卡住数十秒。
+            let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+            let reaper = thread::spawn(move || {
+                let result = worker.join();
+                let _ = done_tx.send(result);
+            });
+            match done_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                Ok(Err(_)) => log::error!("海龟汤 AI Worker 退出时 panic"),
+                Ok(Ok(())) => {}
+                Err(_) => {
+                    log::error!("海龟汤 AI Worker 未能在 5 秒内退出,已分离(可能阻塞在 AI 请求)");
+                    let _ = reaper;
+                }
             }
         }
     }

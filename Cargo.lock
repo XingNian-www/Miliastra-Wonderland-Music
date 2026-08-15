@@ -2674,6 +2674,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "template-matching",
+ "thiserror 2.0.19",
  "tokio",
  "url",
  "uuid",

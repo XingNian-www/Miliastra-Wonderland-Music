@@ -1,8 +1,9 @@
 use super::*;
 
 use crate::config::{
-    ConfigFieldError, ConfigSaveOutcome, ConfigSectionSchema, ConfigSource, Effect, FieldKind,
-    config_sections, default_config_json, default_config_json_with_audio_cache, section_schema,
+    ConfigFieldError, ConfigSaveError, ConfigSaveOutcome, ConfigSectionSchema, ConfigSource,
+    Effect, FieldKind, config_sections, default_config_json, default_config_json_with_audio_cache,
+    section_schema,
 };
 use serde_json::{Map, Value};
 
@@ -338,15 +339,13 @@ pub(super) fn config_save_route(
             save_outcome_response_after_apply(state, &store, outcome, "配置已保存")
         }
         // 版本冲突：事务内重读版本与基线不一致（并发修改）。
-        Err(error) if error.to_string().contains("配置已被其他修改") => {
-            serde_json::to_string(&json!({
-                "ok": false,
-                "code": "config_conflict",
-                "message": "配置已被其他修改，请刷新后重试",
-                "errors": [],
-            }))
-            .map_err(internal_error)
-        }
+        Err(ConfigSaveError::Conflict) => serde_json::to_string(&json!({
+            "ok": false,
+            "code": "config_conflict",
+            "message": "配置已被其他修改，请刷新后重试",
+            "errors": [],
+        }))
+        .map_err(internal_error),
         Err(error) => Err(internal_error(error)),
     }
 }
@@ -372,22 +371,20 @@ pub(super) fn config_rollback_route(
             // 失败只记录日志，仍返回回滚成功响应。
             save_outcome_response_after_apply(state, &store, outcome, "配置已回滚")
         }
-        Err(error) if error.to_string().contains("不存在") => serde_json::to_string(&json!({
+        Err(ConfigSaveError::RevisionNotFound(_)) => serde_json::to_string(&json!({
             "ok": false,
             "code": "config_revision_not_found",
             "message": format!("目标版本 {revision} 不存在"),
             "errors": [],
         }))
         .map_err(internal_error),
-        Err(error) if error.to_string().contains("配置已被其他修改") => {
-            serde_json::to_string(&json!({
-                "ok": false,
-                "code": "config_conflict",
-                "message": "配置已被其他修改，请刷新后重试",
-                "errors": [],
-            }))
-            .map_err(internal_error)
-        }
+        Err(ConfigSaveError::Conflict) => serde_json::to_string(&json!({
+            "ok": false,
+            "code": "config_conflict",
+            "message": "配置已被其他修改，请刷新后重试",
+            "errors": [],
+        }))
+        .map_err(internal_error),
         Err(error) => Err(internal_error(error)),
     }
 }

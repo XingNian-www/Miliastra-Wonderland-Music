@@ -549,6 +549,8 @@ pub(super) struct ApplicationHttpPlayerFacade {
     backend: PlayerRuntimeBackend,
     search: PlayerSearchClient,
     playback: PlaybackHandle,
+    /// 与 PlaybackApplication 共享的播放模式句柄(0=顺序 1=单曲循环 2=随机)。
+    play_mode: std::sync::Arc<std::sync::atomic::AtomicU8>,
 }
 
 impl ApplicationHttpPlayerFacade {
@@ -556,11 +558,13 @@ impl ApplicationHttpPlayerFacade {
         backend: PlayerRuntimeBackend,
         search: PlayerSearchClient,
         playback: PlaybackHandle,
+        play_mode: std::sync::Arc<std::sync::atomic::AtomicU8>,
     ) -> Self {
         Self {
             backend,
             search,
             playback,
+            play_mode,
         }
     }
 }
@@ -583,6 +587,32 @@ impl HttpPlayerPort for ApplicationHttpPlayerFacade {
 
     fn reset_track_statistics(&self, key: &TrackKey) -> Result<bool> {
         Ok(self.playback.reset_track_statistics(key)?)
+    }
+
+    fn invalidate_track_cache(&self, key: &TrackKey) -> Result<bool> {
+        self.playback
+            .invalidate_audio_cache(key)
+            .map(|()| true)
+            .map_err(anyhow::Error::from)
+    }
+
+    fn seek(&self, position_seconds: f64) -> Result<()> {
+        self.playback
+            .seek(position_seconds)
+            .map_err(anyhow::Error::from)
+    }
+
+    fn play_mode(&self) -> Result<u8> {
+        Ok(self.play_mode.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    fn set_play_mode(&self, mode: u8) -> Result<()> {
+        if mode > 2 {
+            anyhow::bail!("播放模式只允许 0(顺序)/1(单曲循环)/2(随机)");
+        }
+        self.play_mode
+            .store(mode, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
     }
 
     fn search_text(&self, keyword: &str, source: &str) -> Result<String, HttpPlayerSearchError> {

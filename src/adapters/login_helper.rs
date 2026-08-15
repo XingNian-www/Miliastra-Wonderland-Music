@@ -26,6 +26,8 @@ use uuid::Uuid;
 
 const REAPER_POLL: Duration = Duration::from_millis(25);
 const TERMINATION_GRACE: Duration = Duration::from_secs(2);
+/// 等待登录助手输出线程退出的上限;超过则分离(孙进程可能持有管道写端)。
+const READER_JOIN_GRACE: Duration = Duration::from_secs(3);
 const PROFILE_ROOT_NAME: &str = ".login-profiles";
 
 /// The application owns the login lease and credential store. Keeping this
@@ -174,6 +176,24 @@ impl HttpKugouDeviceRegistrar {
             client,
             api_base_url,
         })
+    }
+}
+
+/// 注册器创建失败时的降级实现:酷狗登录直接返回失败,不 panic。
+struct UnavailableKugouDeviceRegistrar;
+
+impl KugouDeviceRegistrar for UnavailableKugouDeviceRegistrar {
+    fn register(
+        &self,
+        _token: &str,
+        _userid: &str,
+        _cookies: &BTreeMap<String, String>,
+    ) -> Result<String, LoginHelperFailure> {
+        Err(manager_failure(
+            "kugou_device_registration_unavailable",
+            "酷狗设备注册器不可用",
+            Some(miliastra_playback::ProviderId::Kugou),
+        ))
     }
 }
 
@@ -437,15 +457,22 @@ impl LoginHelperManager {
         timeout: Duration,
         kugou_api_base_url: &str,
     ) -> Self {
-        let registrar = HttpKugouDeviceRegistrar::new(kugou_api_base_url, timeout)
-            .expect("酷狗 API 基址已在配置阶段校验");
+        // 注册器创建失败时降级为不可用注册器(酷狗登录不可用,但其他平台不受影响)。
+        let registrar: Arc<dyn KugouDeviceRegistrar> =
+            match HttpKugouDeviceRegistrar::new(kugou_api_base_url, timeout) {
+                Ok(registrar) => Arc::new(registrar),
+                Err(error) => {
+                    log::error!("创建酷狗设备注册器失败(酷狗登录将不可用): {error}");
+                    Arc::new(UnavailableKugouDeviceRegistrar)
+                }
+            };
         Self::new_with_dependencies(
             Arc::new(playback),
             Arc::new(CommandHelperLauncher {
                 executable,
                 credential_directory: credential_directory.clone(),
             }),
-            Arc::new(registrar),
+            registrar,
             credential_directory,
             timeout,
         )
@@ -992,7 +1019,21 @@ fn run_helper(
         });
     }
     if let Ok(reader) = reader {
-        let _ = reader.join();
+        // 有界等待 reader 退出:WebView2 等孙进程可能继承 stdout 管道写端,
+        // 导致 read() 永不返回 EOF、join 永久阻塞。超时则分离 join 线程。
+        let (reader_done_tx, reader_done_rx) = std::sync::mpsc::sync_channel(1);
+        let reaper = thread::Builder::new()
+            .name("login-helper-output-reaper".to_owned())
+            .spawn(move || {
+                let _ = reader_done_tx.send(reader.join());
+            });
+        match reader_done_rx.recv_timeout(READER_JOIN_GRACE) {
+            Ok(_) => {}
+            Err(_) => {
+                log::error!("登录助手输出线程 join 超时,已分离(孙进程可能持有 stdout 管道写端)");
+            }
+        }
+        let _ = reaper;
     }
 
     let result = if let Some(failure) = failure {

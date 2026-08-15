@@ -1165,7 +1165,10 @@ struct ControlCompletionWorker {
 
 impl ControlCompletionWorkers {
     fn register(&self, worker: JoinHandle<()>, cancellation: Option<ControlCancellation>) {
-        let mut workers = self.workers.lock().unwrap();
+        let mut workers = self
+            .workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut index = 0;
         while index < workers.len() {
             if workers[index].worker.is_finished() {
@@ -1184,7 +1187,12 @@ impl ControlCompletionWorkers {
     }
 
     fn cancel_and_join(&self) -> bool {
-        let mut workers = std::mem::take(&mut *self.workers.lock().unwrap());
+        let mut workers = std::mem::take(
+            &mut *self
+                .workers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
         for completion in &mut workers {
             if !completion.worker.is_finished()
                 && let Some(cancellation) = completion.cancellation.take()

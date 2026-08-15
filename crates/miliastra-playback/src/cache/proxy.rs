@@ -22,6 +22,8 @@ const IO_CHUNK_SIZE: usize = 64 * 1024;
 const MAX_REQUEST_HEADER_BYTES: usize = 16 * 1024;
 /// 下载无进展时关闭连接的最长等待。
 const STALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// 读取请求头的超时:慢速/挂起的本地连接不应无限占用任务。
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(crate) async fn spawn_proxy_server(
     inner: Arc<CacheInner>,
@@ -70,7 +72,11 @@ async fn read_request_head(stream: &mut TcpStream) -> std::io::Result<Option<Req
     let mut chunk = [0u8; 512];
     let header_end;
     loop {
-        let read = stream.read(&mut chunk).await?;
+        let read = tokio::time::timeout(HEADER_READ_TIMEOUT, stream.read(&mut chunk))
+            .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "读取代理请求头超时")
+            })??;
         if read == 0 {
             return Ok(None);
         }

@@ -45,7 +45,7 @@ impl NativePlaybackAdapter {
         let generation = Arc::clone(&self.volume_smooth_generation);
         let playback = self.playback.clone();
         let step_ms = self.volume_smooth_step_ms;
-        thread::Builder::new()
+        match thread::Builder::new()
             .name("volume-smooth".to_string())
             .spawn(move || {
                 let current = playback
@@ -62,9 +62,13 @@ impl NativePlaybackAdapter {
                     }
                     thread::sleep(Duration::from_millis(step_ms));
                 }
-            })
-            .ok();
-        ControlDispatch::immediate(ControlDispatchOutcome::acknowledged("ok"))
+            }) {
+            Ok(_) => ControlDispatch::immediate(ControlDispatchOutcome::acknowledged("ok")),
+            // 渐变线程创建失败:不能静默假装音量已生效。
+            Err(error) => ControlDispatch::immediate(ControlDispatchOutcome::rejected(format!(
+                "音量渐变线程创建失败: {error}"
+            ))),
+        }
     }
 }
 

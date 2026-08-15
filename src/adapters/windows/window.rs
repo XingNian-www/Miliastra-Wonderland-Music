@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use enigo::{Axis, Button, Coordinate, Direction, Enigo, Mouse};
 use image::DynamicImage;
-use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, ClientToScreen, CreateCompatibleBitmap,
     CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits, HGDIOBJ,
@@ -607,17 +607,35 @@ unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL 
     true.into()
 }
 
+/// RAII 持有进程句柄,保证所有路径(含错误返回)都关闭句柄。
+struct ProcessHandle(HANDLE);
+
+impl ProcessHandle {
+    fn open(process_id: u32) -> Result<Self> {
+        let handle = unsafe {
+            OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id)
+                .with_context(|| format!("OpenProcess failed for pid {}", process_id))?
+        };
+        Ok(Self(handle))
+    }
+}
+
+impl Drop for ProcessHandle {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+
 fn process_name(process_id: u32) -> Result<String> {
-    let process = unsafe {
-        OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id)
-            .with_context(|| format!("OpenProcess failed for pid {}", process_id))?
-    };
+    let process = ProcessHandle::open(process_id)?;
 
     let mut buffer = vec![0_u16; 32768];
     let mut len = buffer.len() as u32;
     unsafe {
         QueryFullProcessImageNameW(
-            process,
+            process.0,
             PROCESS_NAME_WIN32,
             windows::core::PWSTR(buffer.as_mut_ptr()),
             &mut len,
@@ -625,9 +643,6 @@ fn process_name(process_id: u32) -> Result<String> {
         .with_context(|| format!("QueryFullProcessImageNameW failed for pid {}", process_id))?
     };
     let path = String::from_utf16_lossy(&buffer[..len as usize]);
-    unsafe {
-        let _ = CloseHandle(process);
-    }
     Ok(Path::new(&path)
         .file_name()
         .map(|name| name.to_string_lossy().to_string())

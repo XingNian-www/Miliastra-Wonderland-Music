@@ -147,7 +147,8 @@ impl BilibiliAdapter {
             .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?;
         classify_api_response(&response)?;
         if persist_cookie_updates {
-            self.persist_set_cookie_updates(credential, &headers)?;
+            self.persist_set_cookie_updates(credential, &headers)
+                .await?;
         }
         Ok(response)
     }
@@ -202,7 +203,7 @@ impl BilibiliAdapter {
         .await
     }
 
-    fn persist_set_cookie_updates(
+    async fn persist_set_cookie_updates(
         &self,
         credential: &ProviderCredential,
         headers: &HeaderMap,
@@ -219,15 +220,21 @@ impl BilibiliAdapter {
         if updated == *cookies {
             return Ok(());
         }
-        self.credentials
-            .save(
+        // 凭证落盘(含 fsync/ACL)移到阻塞线程池,避免阻塞 tokio worker。
+        let store = self.credentials.clone();
+        let refresh_token = refresh_token.clone();
+        tokio::task::spawn_blocking(move || {
+            store.save(
                 "bilibili",
                 ProviderCredential::Bilibili {
                     cookies: updated,
-                    refresh_token: refresh_token.clone(),
+                    refresh_token,
                 },
             )
-            .map_err(|error| CatalogError::Transient(error.to_string()))?;
+        })
+        .await
+        .map_err(|error| CatalogError::Transient(error.to_string()))?
+        .map_err(|error| CatalogError::Transient(error.to_string()))?;
         Ok(())
     }
 
@@ -415,15 +422,20 @@ impl BilibiliAdapter {
             .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?;
         classify_api_response(&confirm_body)?;
 
-        self.credentials
-            .save(
+        // 凭证落盘(含 fsync/ACL)移到阻塞线程池。
+        let store = self.credentials.clone();
+        tokio::task::spawn_blocking(move || {
+            store.save(
                 "bilibili",
                 ProviderCredential::Bilibili {
                     cookies: refreshed,
                     refresh_token: Some(refreshed_refresh_token),
                 },
             )
-            .map_err(|error| CatalogError::Transient(error.to_string()))?;
+        })
+        .await
+        .map_err(|error| CatalogError::Transient(error.to_string()))?
+        .map_err(|error| CatalogError::Transient(error.to_string()))?;
         Ok(true)
     }
 }

@@ -61,11 +61,6 @@ pub fn start(
     }
     let pause_key = parse_virtual_key(&config.pause_key)?;
     let exit_key = parse_virtual_key(&config.exit_key)?;
-    log::info!(
-        "全局热键已启用: 暂停={} 退出={}",
-        config.pause_key,
-        config.exit_key
-    );
     let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
     let worker_running = Arc::clone(&running);
     let worker = thread::spawn(move || {
@@ -78,9 +73,19 @@ pub fn start(
             ready_sender,
         )
     });
-    let thread_id = ready_receiver
+    // 注册结果回传:热键被占用时启动方必须感知,而不是静默当作已启用。
+    let thread_id = match ready_receiver
         .recv()
-        .map_err(|_| anyhow::anyhow!("热键线程未能初始化消息队列"))?;
+        .map_err(|_| anyhow::anyhow!("热键线程未能初始化消息队列"))?
+    {
+        Ok(thread_id) => thread_id,
+        Err(error) => return Err(anyhow::anyhow!("热键注册失败: {error}")),
+    };
+    log::info!(
+        "全局热键已启用: 暂停={} 退出={}",
+        config.pause_key,
+        config.exit_key
+    );
     Ok(HotkeyRuntime {
         thread_id,
         running,
@@ -94,21 +99,30 @@ fn hotkey_loop(
     running: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     wake_tasks: Arc<dyn Fn() + Send + Sync>,
-    ready: SyncSender<u32>,
+    ready: SyncSender<std::result::Result<u32, String>>,
 ) {
     unsafe {
         let thread_id = GetCurrentThreadId();
         let mut queue_probe = MSG::default();
         let _ = PeekMessageW(&mut queue_probe, None, 0, 0, PM_NOREMOVE);
-        let _ = ready.send(thread_id);
-        if let Err(error) = RegisterHotKey(None, PAUSE_ID, MOD_NOREPEAT, pause_key.0 as u32) {
-            log::error!("注册暂停热键失败: {error:#}");
-            return;
-        }
-        if let Err(error) = RegisterHotKey(None, EXIT_ID, MOD_NOREPEAT, exit_key.0 as u32) {
-            log::error!("注册退出热键失败: {error:#}");
-            let _ = UnregisterHotKey(None, PAUSE_ID);
-            return;
+        let registration = (|| -> std::result::Result<(), String> {
+            RegisterHotKey(None, PAUSE_ID, MOD_NOREPEAT, pause_key.0 as u32)
+                .map_err(|error| format!("注册暂停热键失败: {error:#}"))?;
+            RegisterHotKey(None, EXIT_ID, MOD_NOREPEAT, exit_key.0 as u32).map_err(|error| {
+                let _ = UnregisterHotKey(None, PAUSE_ID);
+                format!("注册退出热键失败: {error:#}")
+            })?;
+            Ok(())
+        })();
+        match registration {
+            Ok(()) => {
+                let _ = ready.send(Ok(thread_id));
+            }
+            Err(error) => {
+                log::error!("{error}");
+                let _ = ready.send(Err(error));
+                return;
+            }
         }
 
         let mut message = MSG::default();

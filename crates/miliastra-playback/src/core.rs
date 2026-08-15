@@ -444,12 +444,18 @@ impl PlaybackCore {
     }
 
     fn cached_stream(&self, key: &SongKey) -> Option<StreamSource> {
-        let mut cache = self.resolve_cache.lock().unwrap();
+        let mut cache = self
+            .resolve_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         cache.get(key, unix_epoch_ms())
     }
 
     fn cache_stream(&self, key: SongKey, stream: StreamSource) {
-        let mut cache = self.resolve_cache.lock().unwrap();
+        let mut cache = self
+            .resolve_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         cache.put(key, stream, unix_epoch_ms());
     }
 
@@ -622,6 +628,27 @@ impl PlaybackCore {
             cache.put_lyrics(&song_key, lyrics).await;
         }
         result
+    }
+
+    /// 跳转到指定播放位置(秒);仅播放/暂停状态可用。
+    pub async fn seek(
+        &self,
+        session: SessionRef,
+        position_seconds: f64,
+    ) -> Result<(), PlaybackCoreError> {
+        if !position_seconds.is_finite() || position_seconds < 0.0 {
+            return Err(PlaybackCoreError::Failure(Failure::new(
+                "invalid_seek_position",
+                "seek 位置必须是有限的非负数",
+            )));
+        }
+        self.engine
+            .command(EngineCommand::Seek {
+                session,
+                position_seconds,
+            })
+            .await?;
+        Ok(())
     }
 
     pub async fn pause(&self, session: SessionRef) -> Result<(), PlaybackCoreError> {

@@ -72,10 +72,7 @@ impl<T> ExclusiveObservationRouter<T> {
             return Err(ExclusiveSessionError::AlreadyActive);
         }
         let session = ExclusiveSessionId(self.next_session);
-        self.next_session = self
-            .next_session
-            .checked_add(1)
-            .expect("exclusive observation session sequence exhausted");
+        self.next_session = self.next_session.wrapping_add(1);
         self.active = Some(session);
         Ok(session)
     }

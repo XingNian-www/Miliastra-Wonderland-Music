@@ -89,6 +89,14 @@ impl PlaybackRuntimeState {
                     .ok_or(BusinessRuntimeError::RuntimeStopped);
                 let _ = response.send(result);
             }
+            PlaybackRuntimeMessage::RemovePoolTrack { key, response } => {
+                let result = self.service_mut().and_then(|service| {
+                    service
+                        .remove_playback_pool_track(&key)
+                        .map_err(playback_operation_failed)
+                });
+                let _ = response.send(result);
+            }
             PlaybackRuntimeMessage::RecordPlaybackPoolTrack { track, response } => {
                 let result = self.service_mut().and_then(|service| {
                     service

@@ -135,6 +135,23 @@ pub(crate) trait HttpPlayerPort: Send + Sync {
     fn reset_track_statistics(&self, _key: &TrackKey) -> Result<bool> {
         Ok(false)
     }
+    /// 删除指定曲目的磁盘音频缓存（下次播放重新下载）；默认实现表示未接入。
+    fn invalidate_track_cache(&self, _key: &TrackKey) -> Result<bool> {
+        Ok(false)
+    }
+    /// 跳转到指定播放位置（秒）；默认实现表示未接入。
+    fn seek(&self, _position_seconds: f64) -> Result<()> {
+        Ok(())
+    }
+    /// 当前播放模式：0=顺序 1=单曲循环 2=随机。
+    fn play_mode(&self) -> Result<u8> {
+        Ok(0)
+    }
+    /// 设置播放模式（0=顺序 1=单曲循环 2=随机）。
+    fn set_play_mode(&self, mode: u8) -> Result<()> {
+        let _ = mode;
+        Ok(())
+    }
     fn search_text(&self, keyword: &str, source: &str) -> Result<String, HttpPlayerSearchError>;
     fn search_candidates(
         &self,

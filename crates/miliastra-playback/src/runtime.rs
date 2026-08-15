@@ -152,6 +152,8 @@ enum Command {
     Pause(Reply<()>),
     Resume(Reply<()>),
     Stop(Reply<()>),
+    /// 跳转到指定播放位置(秒)。
+    Seek(f64, Reply<()>),
     SetVolume(u8, Reply<()>),
     Snapshot(Reply<PlaybackSnapshot>),
     ToggleLyrics(Reply<bool>),
@@ -400,6 +402,11 @@ impl PlaybackHandle {
 
     pub fn stop(&self) -> Result<(), PlaybackError> {
         self.request(Command::Stop)
+    }
+
+    /// 跳转到指定播放位置(秒);无活动会话时返回 NoActiveSession。
+    pub fn seek(&self, position_seconds: f64) -> Result<(), PlaybackError> {
+        self.request(|reply| Command::Seek(position_seconds, reply))
     }
 
     pub fn set_volume(&self, volume: u8) -> Result<(), PlaybackError> {
@@ -826,7 +833,12 @@ async fn run_commands(
                 continue;
             }
             RuntimeEvent::RefreshTick => {
-                refresh_due_credentials(&core, &credentials).await;
+                // 自动刷新含网络请求,放入独立任务避免阻塞命令循环。
+                let core = core.clone();
+                let credentials = credentials.clone();
+                tokio::spawn(async move {
+                    refresh_due_credentials(&core, &credentials).await;
+                });
                 continue;
             }
             RuntimeEvent::LoginValidationCompleted(completion) => {
@@ -841,9 +853,9 @@ async fn run_commands(
                 {
                     continue;
                 }
-                let pending = pending_login
-                    .take()
-                    .expect("matching login validation exists");
+                let Some(pending) = pending_login.take() else {
+                    continue;
+                };
                 let result = match completion {
                     Some(Ok((_, completion))) => completion
                         .result
@@ -928,10 +940,12 @@ async fn run_commands(
                 );
             }
             Command::Play(track, requested, seek_seconds, reply) => {
-                let key = track.track_ref.key.to_song_key();
-                let Ok(key) = key else {
-                    let _ = reply.send(Err(PlaybackError::Internal(key.unwrap_err().to_string())));
-                    continue;
+                let key = match track.track_ref.key.to_song_key() {
+                    Ok(key) => key,
+                    Err(error) => {
+                        let _ = reply.send(Err(PlaybackError::Internal(error.to_string())));
+                        continue;
+                    }
                 };
                 cancel_pending_play(
                     &mut pending_play,
@@ -999,6 +1013,13 @@ async fn run_commands(
                 }
                 let _ = reply.send(result);
             }
+            Command::Seek(position_seconds, reply) => {
+                let result = match active_session {
+                    Some(session) => block_result(core.seek(session, position_seconds).await),
+                    None => Err(PlaybackError::NoActiveSession),
+                };
+                let _ = reply.send(result);
+            }
             Command::SetVolume(volume, reply) => {
                 let _ = reply.send(block_result(core.set_volume(volume).await));
             }
@@ -1033,37 +1054,54 @@ async fn run_commands(
                 let _ = reply.send(credentials.statuses().map_err(internal_error));
             }
             Command::RefreshCredential(provider, reply) => {
-                let result = match provider {
-                    ProviderId::Kugou => refresh_kugou_credential(&core, &credentials).await,
-                    ProviderId::QqMusic | ProviderId::Bilibili => {
-                        refresh_manual_credential(&core, &credentials, provider).await
-                    }
-                    _ => Err(PlaybackError::Failure(Failure::new(
-                        "unsupported_provider",
-                        "该平台不支持凭据刷新",
-                    ))),
-                };
-                let _ = reply.send(result);
+                // 网络请求(最长 SOURCE_TIMEOUT)放入独立任务,避免阻塞命令循环。
+                let core = core.clone();
+                let credentials = credentials.clone();
+                tokio::spawn(async move {
+                    let result = match provider {
+                        ProviderId::Kugou => refresh_kugou_credential(&core, &credentials).await,
+                        ProviderId::QqMusic | ProviderId::Bilibili => {
+                            refresh_manual_credential(&core, &credentials, provider).await
+                        }
+                        _ => Err(PlaybackError::Failure(Failure::new(
+                            "unsupported_provider",
+                            "该平台不支持凭据刷新",
+                        ))),
+                    };
+                    let _ = reply.send(result);
+                });
             }
             Command::KugouAccountStatus(reply) => {
-                let result = core
-                    .kugou_account_status()
-                    .await
-                    .map_err(PlaybackError::from);
-                let _ = reply.send(result);
+                let core = core.clone();
+                tokio::spawn(async move {
+                    let result = core
+                        .kugou_account_status()
+                        .await
+                        .map_err(PlaybackError::from);
+                    let _ = reply.send(result);
+                });
             }
             Command::AccountStatus(provider, reply) => {
-                let result = core
-                    .account_status(provider)
-                    .await
-                    .map_err(PlaybackError::from);
-                let _ = reply.send(result);
+                let core = core.clone();
+                tokio::spawn(async move {
+                    let result = core
+                        .account_status(provider)
+                        .await
+                        .map_err(PlaybackError::from);
+                    let _ = reply.send(result);
+                });
             }
             Command::KugouClaimVip(reply) => {
-                let _ = reply.send(core.kugou_claim_vip().await.map_err(PlaybackError::from));
+                let core = core.clone();
+                tokio::spawn(async move {
+                    let _ = reply.send(core.kugou_claim_vip().await.map_err(PlaybackError::from));
+                });
             }
             Command::KugouUpgradeVip(reply) => {
-                let _ = reply.send(core.kugou_upgrade_vip().await.map_err(PlaybackError::from));
+                let core = core.clone();
+                tokio::spawn(async move {
+                    let _ = reply.send(core.kugou_upgrade_vip().await.map_err(PlaybackError::from));
+                });
             }
             Command::SaveCredential(credential, reply) => {
                 let provider = credential.provider();
@@ -1227,7 +1265,9 @@ fn start_pending_preloads(
 ) {
     // 先检查空位再弹出：达到上限时保留队列中的任务，等待后续空位。
     while !pending.is_empty() && preloads.len() < PRELOAD_CONCURRENCY_LIMIT {
-        let track = pending.pop_front().expect("等待队列非空");
+        let Some(track) = pending.pop_front() else {
+            break;
+        };
         let key = track.track_ref.key.clone();
         let Ok(song_key) = key.to_song_key() else {
             continue;
@@ -1293,7 +1333,9 @@ fn cancel_pending_login(
     {
         return false;
     }
-    let pending = pending.take().expect("matching login validation exists");
+    let Some(pending) = pending.take() else {
+        return false;
+    };
     pending.abort.abort();
     let _ = pending.reply.send(Err(PlaybackError::Failure(Failure::new(
         "playback_cancelled",
@@ -1450,9 +1492,18 @@ async fn refresh_kugou_credential(
     let provider = ProviderId::Kugou;
     let _ = credentials.mark_refresh_started(provider.as_str());
     let result = match core.refresh_kugou_credential().await {
-        Ok(credential) => credentials
-            .save(provider.as_str(), credential)
-            .map_err(internal_error),
+        Ok(credential) => {
+            // 凭证落盘(含 fsync/ACL)移到阻塞线程池,避免阻塞 tokio worker。
+            let store = credentials.clone();
+            let provider = provider.as_str();
+            match tokio::task::spawn_blocking(move || store.save(provider, credential)).await {
+                Ok(saved) => saved.map_err(internal_error),
+                Err(error) => Err(PlaybackError::Failure(Failure::new(
+                    "credential_save_join",
+                    error.to_string(),
+                ))),
+            }
+        }
         Err(error) => Err(PlaybackError::from(error)),
     };
     finish_refresh(credentials, provider, result).await
@@ -1472,9 +1523,18 @@ async fn refresh_manual_credential(
             "该平台尚未登录",
         ))),
         Ok(Some(credential)) => match core.refresh_credential(provider, &credential).await {
-            Ok(Some(refreshed)) => credentials
-                .save(provider.as_str(), refreshed)
-                .map_err(internal_error),
+            Ok(Some(refreshed)) => {
+                // 凭证落盘(含 fsync/ACL)移到阻塞线程池。
+                let store = credentials.clone();
+                let provider = provider.as_str();
+                match tokio::task::spawn_blocking(move || store.save(provider, refreshed)).await {
+                    Ok(saved) => saved.map_err(internal_error),
+                    Err(error) => Err(PlaybackError::Failure(Failure::new(
+                        "credential_save_join",
+                        error.to_string(),
+                    ))),
+                }
+            }
             // 凭据仍有效、无需刷新：视为正常完成，不记录失败状态，
             // 否则 WEB 面板会把「无需刷新」误显示为刷新失败。
             Ok(None) => credentials

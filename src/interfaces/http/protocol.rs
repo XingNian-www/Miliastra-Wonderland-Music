@@ -182,6 +182,30 @@ const ROUTES: &[RouteSpec] = &[
         handler: playback_statistics_reset_route,
     },
     RouteSpec {
+        path: "/playback/cache/invalidate",
+        json: true,
+        mutating: true,
+        handler: playback_cache_invalidate_route,
+    },
+    RouteSpec {
+        path: "/playback/song/delete",
+        json: true,
+        mutating: true,
+        handler: playback_song_delete_route,
+    },
+    RouteSpec {
+        path: "/playback/seek",
+        json: true,
+        mutating: true,
+        handler: playback_seek_route,
+    },
+    RouteSpec {
+        path: "/playback/mode",
+        json: true,
+        mutating: true,
+        handler: playback_mode_route,
+    },
+    RouteSpec {
         path: "/play",
         json: true,
         mutating: true,
@@ -835,11 +859,15 @@ async fn axum_entry(
             format!("错误: {}", error.message),
             default_cors_headers(&fallback_host, fallback_port),
         ),
-        Err(error) => plain_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("错误: HTTP请求处理失败: {error}"),
-            default_cors_headers(&fallback_host, fallback_port),
-        ),
+        Err(error) => {
+            // 内部错误详情只记日志,响应体不包含 panic 位置/内部路径。
+            log::error!("HTTP 请求处理失败(worker panic): {error:#}");
+            plain_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "错误: HTTP请求处理失败".to_string(),
+                default_cors_headers(&fallback_host, fallback_port),
+            )
+        }
     }
 }
 

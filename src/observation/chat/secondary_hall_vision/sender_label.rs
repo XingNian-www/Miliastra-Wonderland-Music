@@ -28,12 +28,30 @@ struct AvatarTextureSampleRow {
     right_index: usize,
 }
 
+// 观察线程每帧复用的大块前缀和缓冲区(约 390KB),避免反复分配。
+thread_local! {
+    static ROW_PREFIXES_SCRATCH: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 struct AvatarTextureScan {
     row_prefixes: Vec<usize>,
     prefix_width: usize,
     visible_bottom: i32,
     sample_rows: Vec<AvatarTextureSampleRow>,
     total_samples: usize,
+}
+
+impl Drop for AvatarTextureScan {
+    fn drop(&mut self) {
+        // 把缓冲区归还线程局部缓存,供下一帧复用(保留已分配容量)。
+        ROW_PREFIXES_SCRATCH.with(|cell| {
+            let mut scratch = cell.borrow_mut();
+            if scratch.capacity() < self.row_prefixes.capacity() {
+                *scratch = std::mem::take(&mut self.row_prefixes);
+            }
+        });
+    }
 }
 
 impl AvatarTextureScan {
@@ -71,9 +89,14 @@ impl AvatarTextureScan {
             .sum();
         let visible_bottom = config.search_rect.bottom().min(image.height() as i32);
         let prefix_width = x_coordinates.len() + 1;
-        let mut row_prefixes = vec![0; visible_bottom.max(0) as usize * prefix_width];
+        let needed = visible_bottom.max(0) as usize * prefix_width;
+        let mut row_prefixes: Vec<usize> =
+            ROW_PREFIXES_SCRATCH.with(|cell| cell.borrow_mut().drain(..).collect());
+        row_prefixes.resize(needed, 0);
         for y in 0..(visible_bottom - 1).max(0) {
             let row_start = y as usize * prefix_width;
+            // resize 复用旧值时行首必须清零(前缀和基线)。
+            row_prefixes[row_start] = 0;
             for (index, x) in x_coordinates.iter().enumerate() {
                 let pixel = image.get_pixel(*x as u32, y as u32).0;
                 let right = image.get_pixel((*x + 1) as u32, y as u32).0;

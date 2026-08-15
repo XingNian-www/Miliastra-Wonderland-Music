@@ -37,12 +37,13 @@ pub(super) fn ai_search_route(
 }
 
 pub(super) fn ai_route_error(error: anyhow::Error) -> AppError {
-    AppError {
-        status: if is_client_error(&error.to_string()) {
-            400
-        } else {
-            500
-        },
-        message: error.to_string(),
+    // 内部错误(500)只记日志,响应用通用文案,避免错误链泄漏内部路径;
+    // 仅用户输入类错误(400)保留原文。
+    if is_client_error(&error.to_string()) {
+        return AppError {
+            status: 400,
+            message: error.to_string(),
+        };
     }
+    internal_error(error)
 }

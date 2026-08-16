@@ -78,7 +78,8 @@ use crate::observation::chat::{
     SecondaryRecognizedMessage, TemplateArgs, UnreadFriendHit, classify_title, count_chat_markers,
     find_unread_friend_hits, hall_bubble_layout_is_stable, hall_bubble_sequence_is_retained_prefix,
     hall_bubble_sequence_overlap, latest_incoming_bubble_rect, latest_incoming_fingerprint,
-    prepare_chat_scan, recognize_prepared_chat, secondary_hall_bubbles,
+    prepare_chat_scan, prepare_chat_scan_with_markers, recognize_prepared_chat,
+    secondary_hall_bubbles,
 };
 use crate::observation::decision::DecisionScreenLock;
 use crate::observation::shared::ObservationRead;

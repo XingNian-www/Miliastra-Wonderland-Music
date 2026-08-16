@@ -242,6 +242,10 @@ pub(crate) trait HttpLoginPort: Send + Sync {
         &self,
         provider: ProviderId,
     ) -> Result<Option<ProviderAccountStatus>, HttpLoginError>;
+    fn refresh_account_status(
+        &self,
+        provider: ProviderId,
+    ) -> Result<Option<ProviderAccountStatus>, HttpLoginError>;
     fn kugou_claim_vip(&self) -> Result<KugouListenReport, HttpLoginError>;
     fn kugou_upgrade_vip(&self) -> Result<KugouListenReport, HttpLoginError>;
 }

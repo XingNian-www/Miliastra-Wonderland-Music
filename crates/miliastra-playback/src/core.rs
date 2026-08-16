@@ -51,7 +51,7 @@ async fn probe_candidates(
 ) -> Vec<ProviderSearchCandidate> {
     // 账号 VIP 信息（平台自身带缓存）：已知时省掉全部播放流探测。
     let account_vip = match timeout(request_timeout, adapter.account_status()).await {
-        Ok(Ok(Some(status))) if status.logged_in && status.vip_type.is_some() => Some(status.vip),
+        Ok(Ok(Some(status))) if status.logged_in && status.vip_known => Some(status.vip),
         _ => None,
     };
     let mut probes = Vec::with_capacity(candidates.len());
@@ -711,12 +711,15 @@ impl PlaybackCore {
         self.login.owns(session_id, provider)
     }
 
-    pub async fn refresh_kugou_credential(&self) -> Result<ProviderCredential, PlaybackCoreError> {
+    pub async fn refresh_kugou_credential(
+        &self,
+        credential: &ProviderCredential,
+    ) -> Result<ProviderCredential, PlaybackCoreError> {
         let account = self
             .catalog
             .kugou_account()
             .ok_or_else(|| PlaybackCoreError::UnknownSource("kugou".to_owned()))?;
-        timeout(self.source_timeout, account.refresh_token())
+        timeout(self.source_timeout, account.refresh_token(credential))
             .await
             .map_err(|_| PlaybackCoreError::Catalog(CatalogError::TimedOut("kugou".to_owned())))?
             .map_err(PlaybackCoreError::Catalog)
@@ -754,7 +757,7 @@ impl PlaybackCore {
             .map_err(PlaybackCoreError::Catalog)
     }
 
-    /// 查询平台账号状态（QQ 音乐/网易云）。平台不支持时返回 None。
+    /// 查询平台账号状态。普通查询优先使用乐观缓存。
     pub async fn account_status(
         &self,
         provider: crate::catalog::ProviderId,
@@ -768,6 +771,31 @@ impl PlaybackCore {
             PlaybackCoreError::Catalog(CatalogError::TimedOut(provider.as_str().to_owned()))
         })?
         .map_err(PlaybackCoreError::Catalog)
+    }
+
+    /// 跳过缓存并重新查询平台账号状态。
+    pub async fn refresh_account_status(
+        &self,
+        provider: crate::catalog::ProviderId,
+    ) -> Result<Option<crate::catalog::ProviderAccountStatus>, PlaybackCoreError> {
+        timeout(
+            self.source_timeout,
+            self.catalog.refresh_account_status(provider.as_str()),
+        )
+        .await
+        .map_err(|_| {
+            PlaybackCoreError::Catalog(CatalogError::TimedOut(provider.as_str().to_owned()))
+        })?
+        .map_err(PlaybackCoreError::Catalog)
+    }
+
+    pub fn invalidate_account_status(
+        &self,
+        provider: crate::catalog::ProviderId,
+    ) -> Result<(), PlaybackCoreError> {
+        self.catalog
+            .invalidate_account_status(provider.as_str())
+            .map_err(PlaybackCoreError::Catalog)
     }
 
     pub async fn kugou_claim_vip(
@@ -1493,11 +1521,11 @@ mod tests {
             }
         }
 
-        fn status(vip: bool, vip_type: Option<&str>) -> ProviderAccountStatus {
+        fn status(vip: bool, vip_known: bool) -> ProviderAccountStatus {
             ProviderAccountStatus {
                 logged_in: true,
+                vip_known,
                 vip,
-                vip_type: vip_type.map(str::to_owned),
                 ..ProviderAccountStatus::default()
             }
         }
@@ -1505,7 +1533,7 @@ mod tests {
         // 账号有 VIP：直接放行，探测 0 次。
         let probes = Arc::new(AtomicUsize::new(0));
         let source = Arc::new(VipSource {
-            account: Some(status(true, Some("1"))),
+            account: Some(status(true, true)),
             probes: probes.clone(),
         });
         let candidates = probe_candidates(
@@ -1520,10 +1548,31 @@ mod tests {
         assert_eq!(probes.load(Ordering::SeqCst), 0);
         assert_eq!(candidates[0].eligibility, PlaybackEligibility::Eligible);
 
+        // 账号查询临时失败时，过期缓存中的已知 VIP 结论仍参与播放筛选。
+        let probes = Arc::new(AtomicUsize::new(0));
+        let mut stale_vip = status(true, true);
+        stale_vip.stale = true;
+        stale_vip.last_error = Some("provider_transient".to_owned());
+        let source = Arc::new(VipSource {
+            account: Some(stale_vip),
+            probes: probes.clone(),
+        });
+        let candidates = probe_candidates(
+            source,
+            vec![ProviderSearchCandidate {
+                song: song("vip", "stale"),
+                eligibility: PlaybackEligibility::VipRequired,
+            }],
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(probes.load(Ordering::SeqCst), 0);
+        assert_eq!(candidates[0].eligibility, PlaybackEligibility::Eligible);
+
         // 账号无 VIP：屏蔽，探测 0 次。
         let probes = Arc::new(AtomicUsize::new(0));
         let source = Arc::new(VipSource {
-            account: Some(status(false, Some("0"))),
+            account: Some(status(false, true)),
             probes: probes.clone(),
         });
         let candidates = probe_candidates(

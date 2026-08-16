@@ -23,8 +23,8 @@ use serde_json::{Value, json};
 use url::Url;
 
 use crate::catalog::{
-    CatalogError, CredentialRefreshAdapter, PlaybackEligibility, ProviderAccountStatus,
-    ProviderSearchCandidate, SourceAdapter,
+    AccountStatusCache, CatalogError, CredentialRefreshAdapter, PlaybackEligibility,
+    ProviderAccountStatus, ProviderSearchCandidate, SourceAdapter,
 };
 use crate::credentials::{CredentialStore, ProviderCredential};
 use crate::domain::{ResolverLocator, SearchSpec, Song, SongKey, StreamSource};
@@ -58,13 +58,12 @@ pub struct QqMusicAdapter {
     native_lyrics_url: Url,
     device: QqDevice,
     /// 账号 VIP 状态缓存（成功 5 分钟/失败 60 秒），避免轮询频繁打账号接口。
-    account_cache:
-        std::sync::Arc<std::sync::Mutex<Option<(ProviderAccountStatus, std::time::Instant, bool)>>>,
+    account_cache: std::sync::Arc<std::sync::Mutex<AccountStatusCache>>,
 }
 
-/// QQ 账号状态缓存有效期（查询成功时）。
-const ACCOUNT_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
-/// 查询失败（登录态失效/风控/超时）时的短缓存。
+/// QQ 账号状态采用30分钟乐观缓存，避免频繁请求会员接口。
+const ACCOUNT_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
+/// 上次刷新失败后，旧成功结果继续返回；一分钟后才允许再次联网重试。
 const ACCOUNT_CACHE_FAILED_TTL: Duration = Duration::from_secs(60);
 
 impl QqMusicAdapter {
@@ -90,7 +89,9 @@ impl QqMusicAdapter {
                 .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?,
             native_lyrics_url: Url::parse(LYRICS_NATIVE_URL)
                 .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?,
-            account_cache: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            account_cache: std::sync::Arc::new(
+                std::sync::Mutex::new(AccountStatusCache::default()),
+            ),
         })
     }
 
@@ -145,17 +146,23 @@ impl QqMusicAdapter {
     }
 
     async fn request_json(&self, url: &Url, body: Value) -> Result<Value, CatalogError> {
-        let credential = self.credential()?;
+        let snapshot = self
+            .credentials
+            .snapshot(PROVIDER)
+            .map_err(|error| CatalogError::AuthRequired(error.to_string()))?
+            .ok_or_else(|| CatalogError::AuthRequired("QQ Music credential_required".to_owned()))?;
         match self
-            .request_json_with_credential(&credential, url, body.clone())
+            .request_json_with_credential(&snapshot.credential, url, body.clone())
             .await
         {
             Ok(response) if qq_response_requires_auth_refresh(&response) => {
-                self.retry_after_refresh(&credential, url, body).await
+                self.retry_after_refresh(&snapshot.credential, snapshot.revision, url, body)
+                    .await
             }
             Ok(response) => Ok(response),
             Err(CatalogError::AuthRequired(_)) => {
-                self.retry_after_refresh(&credential, url, body).await
+                self.retry_after_refresh(&snapshot.credential, snapshot.revision, url, body)
+                    .await
             }
             Err(error) => Err(error),
         }
@@ -229,16 +236,104 @@ impl QqMusicAdapter {
     async fn retry_after_refresh(
         &self,
         credential: &ProviderCredential,
+        expected_revision: u64,
         url: &Url,
         body: Value,
     ) -> Result<Value, CatalogError> {
+        let Some(_refresh_lease) = self
+            .credentials
+            .try_acquire_refresh_lease(PROVIDER)
+            .map_err(|error| CatalogError::Transient(error.to_string()))?
+        else {
+            return self
+                .retry_with_current_credential(Some(expected_revision), url, body)
+                .await;
+        };
+        let snapshot_is_current = self
+            .credentials
+            .snapshot(PROVIDER)
+            .map_err(|error| CatalogError::Transient(error.to_string()))?
+            .is_some_and(|current| {
+                current.revision == expected_revision && current.credential == *credential
+            });
+        if !snapshot_is_current {
+            return self
+                .retry_with_current_credential(Some(expected_revision), url, body)
+                .await;
+        }
         let Some(refreshed) = self.refresh_credential(credential).await? else {
             return Err(CatalogError::AuthRequired(
                 "QQ Music credentials require relogin".to_owned(),
             ));
         };
-        self.request_json_with_credential(&refreshed, url, body)
+        if self
+            .persist_refreshed_credential(expected_revision, refreshed.clone())
+            .await?
+        {
+            return self
+                .request_with_refreshed_credential(&refreshed, url, body)
+                .await;
+        }
+        self.retry_with_current_credential(Some(expected_revision), url, body)
             .await
+    }
+
+    async fn retry_with_current_credential(
+        &self,
+        expected_revision: Option<u64>,
+        url: &Url,
+        body: Value,
+    ) -> Result<Value, CatalogError> {
+        let current = self
+            .credentials
+            .snapshot(PROVIDER)
+            .map_err(|error| CatalogError::Transient(error.to_string()))?
+            .ok_or_else(|| {
+                CatalogError::AuthRequired("QQ Music credentials require relogin".to_owned())
+            })?;
+        if expected_revision.is_some_and(|expected| current.revision == expected) {
+            return Err(CatalogError::Transient(
+                "QQ Music credential refresh is already in progress".to_owned(),
+            ));
+        }
+        self.request_with_refreshed_credential(&current.credential, url, body)
+            .await
+    }
+
+    async fn request_with_refreshed_credential(
+        &self,
+        credential: &ProviderCredential,
+        url: &Url,
+        body: Value,
+    ) -> Result<Value, CatalogError> {
+        let response = self
+            .request_json_with_credential(credential, url, body)
+            .await?;
+        if qq_response_requires_auth_refresh(&response) {
+            return Err(CatalogError::AuthRequired(
+                "QQ Music credentials require relogin".to_owned(),
+            ));
+        }
+        Ok(response)
+    }
+
+    async fn persist_refreshed_credential(
+        &self,
+        expected_revision: u64,
+        refreshed: ProviderCredential,
+    ) -> Result<bool, CatalogError> {
+        let store = self.credentials.clone();
+        let saved = tokio::task::spawn_blocking(move || {
+            store.save_if_revision(PROVIDER, expected_revision, refreshed)
+        })
+        .await
+        .map_err(|error| CatalogError::Transient(error.to_string()))?
+        .map_err(|error| CatalogError::Transient(error.to_string()))?;
+        if saved.is_some() {
+            self.invalidate_account_status();
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     async fn refresh_credential(
@@ -267,14 +362,13 @@ impl QqMusicAdapter {
         else {
             return Ok(None);
         };
-        let Some(refresh_token) = first_cookie(cookies, &["psrf_qqrefresh_token", "refresh_token"])
-        else {
+        // 网页登录（QQ OAuth）通常只下发 refresh_token；refresh_key 由移动端
+        // 续期接口在响应中补发。两者任一存在即可发起续期，缺失者传空串。
+        let refresh_token = first_cookie(cookies, &["psrf_qqrefresh_token", "refresh_token"]);
+        let refresh_key = first_cookie(cookies, &["psrf_qqrefresh_key", "refresh_key"]);
+        if refresh_token.is_none() && refresh_key.is_none() {
             return Ok(None);
-        };
-        let Some(refresh_key) = first_cookie(cookies, &["psrf_qqrefresh_key", "refresh_key"])
-        else {
-            return Ok(None);
-        };
+        }
         let music_id = uin.parse::<u64>().map_err(|_| {
             CatalogError::AuthRequired("QQ Music account identifier requires relogin".to_owned())
         })?;
@@ -284,8 +378,8 @@ impl QqMusicAdapter {
             music_key,
             open_id,
             access_token,
-            refresh_token,
-            refresh_key,
+            refresh_token.unwrap_or(""),
+            refresh_key.unwrap_or(""),
             music_id,
             &self.device,
             &qimei,
@@ -354,11 +448,7 @@ impl QqMusicAdapter {
             data,
             "refresh_key",
         );
-        let refreshed = ProviderCredential::QqMusic { cookies: refreshed };
-        self.credentials
-            .save("qqmusic", refreshed.clone())
-            .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?;
-        Ok(Some(refreshed))
+        Ok(Some(ProviderCredential::QqMusic { cookies: refreshed }))
     }
 
     /// QQ Music's current web login stores a WeChat refresh session rather
@@ -411,7 +501,9 @@ impl QqMusicAdapter {
             .await
             .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?;
         if body.get("code").and_then(as_i64) != Some(0) {
-            return Ok(None);
+            return Err(CatalogError::AuthRequired(
+                "QQ Music web refresh was rejected; relogin is required".to_owned(),
+            ));
         }
         let Some(data) = body.as_object() else {
             return Ok(None);
@@ -446,11 +538,7 @@ impl QqMusicAdapter {
         {
             return Ok(None);
         }
-        let refreshed = ProviderCredential::QqMusic { cookies: refreshed };
-        self.credentials
-            .save("qqmusic", refreshed.clone())
-            .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?;
-        Ok(Some(refreshed))
+        Ok(Some(ProviderCredential::QqMusic { cookies: refreshed }))
     }
 
     async fn qimei(&self) -> QqQimei {
@@ -565,10 +653,58 @@ impl QqMusicAdapter {
         })
     }
 
+    async fn account_status_cached(
+        &self,
+        force: bool,
+    ) -> Result<Option<ProviderAccountStatus>, CatalogError> {
+        let now = std::time::Instant::now();
+        let checked_at_ms = epoch_ms();
+        let (generation, cached) = {
+            let guard = self.account_cache.lock().map_err(|_| {
+                CatalogError::Transient("QQ Music account cache poisoned".to_owned())
+            })?;
+            let cached = (!force)
+                .then(|| guard.cached(ACCOUNT_CACHE_TTL, ACCOUNT_CACHE_FAILED_TTL))
+                .flatten();
+            (guard.generation(), cached)
+        };
+        if let Some(status) = cached {
+            return Ok(Some(status.clone()));
+        }
+        let result = self.query_account_status().await;
+        let mut guard = self
+            .account_cache
+            .lock()
+            .map_err(|_| CatalogError::Transient("QQ Music account cache poisoned".to_owned()))?;
+        match result {
+            Ok(Some(status)) => {
+                guard.store_if_current(generation, status.clone(), now, false);
+                Ok(Some(status))
+            }
+            Ok(None) => Ok(None),
+            Err(error) => {
+                if let Some(stale) = guard.stale_for_current(generation, &error) {
+                    guard.store_if_current(generation, stale.clone(), now, true);
+                    Ok(Some(stale))
+                } else if let Some(failed) =
+                    guard.failed_for_current(generation, PROVIDER, checked_at_ms, &error)
+                {
+                    guard.store_if_current(generation, failed, now, true);
+                    Err(error)
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
     async fn query_account_status(&self) -> Result<Option<ProviderAccountStatus>, CatalogError> {
+        let checked_at_ms = epoch_ms();
         let Ok(credential) = self.credential() else {
             return Ok(Some(ProviderAccountStatus {
+                provider: PROVIDER.to_owned(),
                 logged_in: false,
+                checked_at_ms,
                 ..ProviderAccountStatus::default()
             }));
         };
@@ -590,9 +726,11 @@ impl QqMusicAdapter {
         };
         if !configured {
             return Ok(Some(ProviderAccountStatus {
+                provider: PROVIDER.to_owned(),
                 logged_in: false,
                 user_id,
                 login_method,
+                checked_at_ms,
                 ..ProviderAccountStatus::default()
             }));
         }
@@ -634,13 +772,18 @@ impl QqMusicAdapter {
             .and_then(Value::as_str)
             .and_then(parse_qq_date_ms);
         Ok(Some(ProviderAccountStatus {
+            provider: PROVIDER.to_owned(),
             logged_in: true,
             user_id,
             nickname: None,
+            vip_known: true,
             vip,
             vip_type: vip.then_some(vip_type).or_else(|| Some("非VIP".to_owned())),
             vip_expire_at_ms,
             login_method,
+            checked_at_ms,
+            stale: false,
+            last_error: None,
         }))
     }
 }
@@ -773,33 +916,17 @@ impl SourceAdapter for QqMusicAdapter {
     /// QQ 音乐账号状态：登录态 + VIP（绿钻/SVIP）查询。
     /// 使用 musicu.fcg `VipLogin.VipLoginInter/vip_login_base`（无签名即可用）。
     async fn account_status(&self) -> Result<Option<ProviderAccountStatus>, CatalogError> {
-        let now = std::time::Instant::now();
-        if let Ok(guard) = self.account_cache.lock()
-            && let Some((status, cached_at, failed)) = guard.as_ref()
-            && cached_at.elapsed()
-                < if *failed {
-                    ACCOUNT_CACHE_FAILED_TTL
-                } else {
-                    ACCOUNT_CACHE_TTL
-                }
-        {
-            return Ok(Some(status.clone()));
-        }
-        let result = self.query_account_status().await;
+        self.account_status_cached(false).await
+    }
+
+    async fn refresh_account_status(&self) -> Result<Option<ProviderAccountStatus>, CatalogError> {
+        self.account_status_cached(true).await
+    }
+
+    fn invalidate_account_status(&self) {
         if let Ok(mut guard) = self.account_cache.lock() {
-            match &result {
-                Ok(Some(status)) => *guard = Some((status.clone(), now, false)),
-                // 失败（登录态失效/风控/超时）时保留上次成功值并标记失败。
-                _ => {
-                    let cached = guard
-                        .as_ref()
-                        .map(|(status, ..)| status.clone())
-                        .unwrap_or_default();
-                    *guard = Some((cached, now, true));
-                }
-            }
+            guard.invalidate();
         }
-        result
     }
 }
 
@@ -1436,6 +1563,13 @@ fn vip_vip_type_label(identity: &Value, data: &Value) -> String {
 }
 
 /// 解析 QQ VIP 到期时间（"2026-07-20 07:50:53"）为 epoch 毫秒。
+fn epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 fn parse_qq_date_ms(value: &str) -> Option<u64> {
     let value = value.trim();
     if value.is_empty() || value == "-1" {
@@ -1593,14 +1727,14 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::mpsc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use super::{
         PlaybackEligibility, QQ_QIMEI_FALLBACK, QqDevice, QqMusicAdapter, QqQimei,
         parse_search_candidates, qq_account_is_vip, qq_eligibility, qq_filename, qq_resolver_ids,
         qq_stream_url, vip_vip_type_label,
     };
-    use crate::catalog::{CatalogError, SourceAdapter};
+    use crate::catalog::{CatalogError, ProviderAccountStatus, SourceAdapter};
     use crate::credentials::{CredentialStore, ProviderCredential};
     use crate::domain::{ResolverLocator, SearchSpec, SongKey};
     use serde_json::json;
@@ -1853,6 +1987,147 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn qq_implicit_refresh_is_single_flight_while_the_old_revision_is_current() {
+        let store = CredentialStore::memory();
+        refresh_credentials(&store);
+        let snapshot = store.snapshot("qqmusic").unwrap().unwrap();
+        let _lease = store
+            .try_acquire_refresh_lease("qqmusic")
+            .unwrap()
+            .expect("the first refresh owns the provider lease");
+        let endpoint = Url::parse("http://127.0.0.1:1/qq-fixture").unwrap();
+        let adapter = QqMusicAdapter::with_endpoints(
+            store,
+            Duration::from_secs(1),
+            endpoint.clone(),
+            endpoint.clone(),
+        )
+        .unwrap();
+
+        let error = adapter
+            .retry_after_refresh(
+                &snapshot.credential,
+                snapshot.revision,
+                &endpoint,
+                json!({}),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, CatalogError::Transient(_)));
+    }
+
+    #[tokio::test]
+    async fn qq_stale_same_value_snapshot_never_refreshes_or_overwrites_a_new_login() {
+        let store = CredentialStore::memory();
+        refresh_credentials(&store);
+        let snapshot = store.snapshot("qqmusic").unwrap().unwrap();
+        // A login completion may re-save the same cookie values. Revision, rather than value
+        // equality, identifies that the old request no longer owns this session.
+        store.save("qqmusic", snapshot.credential.clone()).unwrap();
+        let (endpoint, requests) = fixture_server_sequence(vec![Some(
+            r#"{"req":{"code":0,"data":{"musickey":"stale-refresh-key","musicid":"42","openid":"stale-open-id","access_token":"stale-access-token","refresh_token":"stale-refresh-token","refresh_key":"stale-refresh-key"}}}"#.to_owned(),
+        )]);
+        let mut adapter = QqMusicAdapter::with_endpoints(
+            store.clone(),
+            Duration::from_secs(2),
+            endpoint.clone(),
+            endpoint.clone(),
+        )
+        .unwrap();
+        adapter.device.qimei = Some(QqQimei {
+            q16: String::new(),
+            q36: QQ_QIMEI_FALLBACK.to_owned(),
+        });
+
+        adapter
+            .retry_after_refresh(
+                &snapshot.credential,
+                snapshot.revision,
+                &endpoint,
+                json!({}),
+            )
+            .await
+            .unwrap();
+
+        let request = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(request.starts_with("GET "));
+        assert_eq!(
+            store
+                .get("qqmusic")
+                .unwrap()
+                .unwrap()
+                .cookies()
+                .get("qqmusic_key")
+                .map(String::as_str),
+            Some("old-key"),
+            "the stale refresh result must not overwrite a same-value re-login"
+        );
+    }
+
+    #[tokio::test]
+    async fn qq_persisted_implicit_refresh_invalidates_account_status_cache() {
+        let store = CredentialStore::memory();
+        refresh_credentials(&store);
+        let snapshot = store.snapshot("qqmusic").unwrap().unwrap();
+        let endpoint = Url::parse("http://127.0.0.1:1/qq-fixture").unwrap();
+        let adapter = QqMusicAdapter::with_endpoints(
+            store.clone(),
+            Duration::from_secs(1),
+            endpoint.clone(),
+            endpoint,
+        )
+        .unwrap();
+        {
+            let mut cache = adapter.account_cache.lock().unwrap();
+            let generation = cache.generation();
+            assert!(cache.store_if_current(
+                generation,
+                ProviderAccountStatus {
+                    provider: "qqmusic".to_owned(),
+                    logged_in: true,
+                    vip_known: true,
+                    vip: true,
+                    ..ProviderAccountStatus::default()
+                },
+                Instant::now(),
+                false,
+            ));
+        }
+        let mut cookies = snapshot.credential.cookies().clone();
+        cookies.insert("qqmusic_key".to_owned(), "new-key".to_owned());
+
+        assert!(
+            adapter
+                .persist_refreshed_credential(
+                    snapshot.revision,
+                    ProviderCredential::QqMusic { cookies },
+                )
+                .await
+                .unwrap()
+        );
+
+        assert!(
+            adapter
+                .account_cache
+                .lock()
+                .unwrap()
+                .cached(Duration::from_secs(1), Duration::from_secs(1))
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .get("qqmusic")
+                .unwrap()
+                .unwrap()
+                .cookies()
+                .get("qqmusic_key")
+                .map(String::as_str),
+            Some("new-key")
+        );
+    }
+
+    #[tokio::test]
     async fn qq_auth_failure_refreshes_once_retries_and_persists_new_cookie_state() {
         let root =
             std::env::temp_dir().join(format!("miliastra-qq-refresh-{}", uuid::Uuid::new_v4()));
@@ -1908,6 +2183,70 @@ mod tests {
             "new-key"
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn qq_refresh_works_with_refresh_token_only_and_persists_issued_refresh_key() {
+        let store = CredentialStore::memory();
+        store
+            .save(
+                "qqmusic",
+                ProviderCredential::QqMusic {
+                    // 网页登录（QQ OAuth）常见形态：有 refresh_token 无 refresh_key。
+                    cookies: BTreeMap::from([
+                        ("uin".to_owned(), "o42".to_owned()),
+                        ("qqmusic_key".to_owned(), "old-key".to_owned()),
+                        ("psrf_qqopenid".to_owned(), "open-id".to_owned()),
+                        ("psrf_qqaccess_token".to_owned(), "access-token".to_owned()),
+                        (
+                            "psrf_qqrefresh_token".to_owned(),
+                            "refresh-token".to_owned(),
+                        ),
+                    ]),
+                },
+            )
+            .unwrap();
+        let (endpoint, requests) = fixture_server_sequence(vec![
+            Some(r#"{"req_0":{"code":1000}}"#.to_owned()),
+            Some(
+                r#"{"req":{"code":0,"data":{"musickey":"new-key","musicid":"42","openid":"new-open-id","access_token":"new-access-token","refresh_token":"new-refresh-token","refresh_key":"new-refresh-key"}}}"#.to_owned(),
+            ),
+            Some(r#"{"search":{"data":{"body":{"song":{"list":[]}}}}}"#.to_owned()),
+        ]);
+        let adapter = QqMusicAdapter::with_endpoints(
+            store.clone(),
+            Duration::from_secs(2),
+            endpoint.clone(),
+            endpoint,
+        )
+        .unwrap();
+
+        let result = adapter
+            .search(&SearchSpec {
+                keyword: "validation".to_owned(),
+                sources: Vec::new(),
+                limit: 1,
+            })
+            .await
+            .unwrap();
+        assert!(result.is_empty());
+        let _ = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        let refresh = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(refresh.starts_with("POST "));
+        assert!(refresh.contains("refresh_token"));
+        let _ = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let current = store.get("qqmusic").unwrap().unwrap();
+        assert_eq!(current.cookies().get("qqmusic_key").unwrap(), "new-key");
+        // 移动端续期响应补发的 refresh_key 已持久化，后续可继续续期。
+        assert_eq!(
+            current.cookies().get("psrf_qqrefresh_key").unwrap(),
+            "new-refresh-key"
+        );
+        assert_eq!(
+            current.cookies().get("psrf_qqrefresh_token").unwrap(),
+            "new-refresh-token"
+        );
     }
 
     #[tokio::test]

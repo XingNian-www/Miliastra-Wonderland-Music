@@ -20,7 +20,7 @@ struct GrayTemplate {
     alpha_sum: u64,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct TemplateHit {
     pub(crate) kind: String,
     pub(crate) x: i32,
@@ -108,30 +108,44 @@ pub(crate) fn find_template_hits(
     ))
 }
 
-pub(crate) fn find_color_template_hits(
+pub(crate) fn find_color_template_hit_groups(
     image: &DynamicImage,
     search_rect: Option<Rect>,
-    template_path: &Path,
+    template_paths: &[&Path],
     threshold: f32,
-) -> Result<Vec<TemplateHit>> {
+) -> Result<Vec<Vec<TemplateHit>>> {
     let haystack = match search_rect {
         Some(rect) => crop_canvas(image, rect)?,
         None => image.clone(),
     };
-    let template_rgb = cached_rgb_template(template_path)?;
+    let haystack_rgb = haystack.to_rgb8();
+    template_paths
+        .iter()
+        .map(|template_path| {
+            find_color_template_hits_in_rgb(&haystack_rgb, search_rect, template_path, threshold)
+        })
+        .collect()
+}
 
-    if template_rgb.width() > haystack.width() || template_rgb.height() > haystack.height() {
+fn find_color_template_hits_in_rgb(
+    haystack_rgb: &RgbImage,
+    search_rect: Option<Rect>,
+    template_path: &Path,
+    threshold: f32,
+) -> Result<Vec<TemplateHit>> {
+    let template_rgb = cached_rgb_template(template_path)?;
+    if template_rgb.width() > haystack_rgb.width() || template_rgb.height() > haystack_rgb.height()
+    {
         return Ok(Vec::new());
     }
 
-    let haystack_rgb = haystack.to_rgb8();
     let max_sad = template_rgb.width() as u64 * template_rgb.height() as u64 * 3 * 255;
     let max_allowed_sad = ((1.0 - threshold).clamp(0.0, 1.0) * max_sad as f32) as u64;
     let mut hits = Vec::new();
 
     for y in 0..=(haystack_rgb.height() - template_rgb.height()) {
         for x in 0..=(haystack_rgb.width() - template_rgb.width()) {
-            let sad = color_sad_at(&haystack_rgb, &template_rgb, x, y, max_allowed_sad);
+            let sad = color_sad_at(haystack_rgb, &template_rgb, x, y, max_allowed_sad);
             let score = 1.0 - sad as f32 / max_sad as f32;
             if score >= threshold {
                 let base_x = search_rect.map(|rect| rect.x).unwrap_or(0);

@@ -1202,12 +1202,13 @@ function renderLoginState(){
     const completeness=item.completeness??item.completion??(entries.length?Math.round(present/entries.length*100):(item.configured?100:0))
     const fields=entries.map(([name,value])=>'<span class="field-state '+(value?'ok':'')+'">'+esc(name)+'：'+(value?'就绪':'缺失')+'</span>').join('')||'<span class="field-state">后端暂未提供字段状态</span>'
     const refreshInfo=item.refreshSupported?('刷新: '+esc(item.refreshState||'idle')+' · 上次: '+esc(refreshTime(item.lastRefreshAtMs))):'不支持刷新'
-    const accountInfo=provider==='kugou'?renderKugouAccountInfo():renderAccountInfo(provider)
+    const accountInfo=renderAccountInfo(provider)
     return '<div class="login-card"><div class="login-card-head"><div><strong>'+esc(providerLabel(provider))+'</strong><small>'+(item.configured?'已配置':'未配置')+' · 完整度 '+esc(completeness)+'%</small></div><div class="controls compact">'+
       '<button class="btn small login-start" data-provider="'+esc(provider)+'" '+(active?'disabled':'')+'>登录</button>'+
       (isActive?'<button class="btn small warn login-cancel">取消</button>':'')+
-      (item.manualRefreshSupported?'<button class="btn small" data-refresh-provider="'+esc(provider)+'">刷新</button>':'')+
-      (provider==='kugou'?'<button class="btn small good" data-kugou-status>VIP状态</button><button class="btn small good" data-kugou-report>领取VIP</button><button class="btn small good" data-kugou-upgrade>升级VIP</button>':'')+
+      '<button class="btn small" data-refresh-status="'+esc(provider)+'">刷新状态</button>'+
+      (item.manualRefreshSupported?'<button class="btn small" data-refresh-provider="'+esc(provider)+'">刷新凭据</button>':'')+
+      (provider==='kugou'?'<button class="btn small good" data-kugou-report>领取VIP</button><button class="btn small good" data-kugou-upgrade>升级VIP</button>':'')+
       '<button class="btn small ghost login-logout" data-provider="'+esc(provider)+'" '+(active?'disabled':'')+'>退出</button></div></div><div class="login-progress"><i style="width:'+Math.max(0,Math.min(100,Number(completeness)||0))+'%"></i></div>'+
       accountInfo+
       '<div class="login-fields">'+fields+'</div><div class="login-refresh-info">'+refreshInfo+(item.nextRefreshCheckAtMs?' · 下次检查：'+esc(refreshTime(item.nextRefreshCheckAtMs)):'')+(item.lastRefreshError?' · '+esc(item.lastRefreshError):'')+'</div></div>'
@@ -1216,7 +1217,7 @@ function renderLoginState(){
   $('loginProviders').querySelectorAll('.login-cancel').forEach((button)=>{button.addEventListener('click',cancelLogin)})
   $('loginProviders').querySelectorAll('.login-logout').forEach((button)=>{button.addEventListener('click',()=>logoutProvider(button.dataset.provider||''))})
   $('loginProviders').querySelectorAll('[data-refresh-provider]').forEach((button)=>{button.addEventListener('click',()=>jsonAction('/player/login/refresh?provider='+encodeURIComponent(button.dataset.refreshProvider||'kugou'),null))})
-  $('loginProviders').querySelectorAll('[data-kugou-status]').forEach((button)=>{button.addEventListener('click',async()=>{try{setResult(await request('/player/kugou/status'))}catch(e){setResult('错误: '+e.message)}})})
+  $('loginProviders').querySelectorAll('[data-refresh-status]').forEach((button)=>{button.addEventListener('click',()=>refreshAccountStatus(button.dataset.refreshStatus||''))})
   $('loginProviders').querySelectorAll('[data-kugou-report]').forEach((button)=>{button.addEventListener('click',async()=>{
     try{
       const r=await request('/player/kugou/claim-vip','POST')
@@ -1237,39 +1238,48 @@ async function loadLoginState(){
     const results=await Promise.all([request('/player/providers'),request('/player/login/status')])
     loginProviderItems=Array.isArray(results[0])?results[0]:[]
     loginRuntimeStatus=results[1]||{active:false}
-    loadKugouAccountInfo()
-    loadPlatformAccounts()
+    await loadPlatformAccounts()
     renderLoginState()
   }catch(e){$('loginMeta').textContent='读取失败';$('loginProviders').innerHTML='<div class="result">'+esc(e.message)+'</div>'}
 }
-let kugouAccountInfo=null
 let platformAccounts={}
-function renderKugouAccountInfo(){
-  const info=kugouAccountInfo
-  if(!info)return ''
-  const vipLabel=info.vip?(info.vipType&&info.vipType!=='0'?'VIP('+esc(info.vipType)+')':'VIP'):(info.vipType==null?'VIP未知':'非VIP')
-  const expire=info.vipExpireAtMs?(' · 到期 '+esc(loginTime(info.vipExpireAtMs))):''
-  const nickname=info.nickname||info.userId||'未知'
-  return '<div class="login-account '+(info.vip?'vip':'')+'"><span class="field-state '+(info.loggedIn?'ok':'')+'">'+(info.loggedIn?'已登录':'未登录')+'</span>'+
-    '<span>账号：'+esc(nickname)+'</span><span class="vip-badge">'+vipLabel+expire+'</span></div>'
-}
 function renderAccountInfo(provider){
   const info=platformAccounts[provider]
   if(!info)return ''
-  const vipLabel=info.vip?(info.vipType&&info.vipType!=='0'?'VIP('+esc(info.vipType)+')':'VIP'):(info.vipType==null?'VIP未知':'非VIP')
+  const vipLabel=info.vipKnown?(info.vip?(info.vipType&&info.vipType!=='0'?'VIP('+esc(info.vipType)+')':'VIP'):'非VIP'):(info.loggedIn?'VIP状态未知':'')
   const expire=info.vipExpireAtMs?(' · 到期 '+esc(loginTime(info.vipExpireAtMs))):''
+  const stale=info.stale?'<span class="field-state">状态可能过期</span>':''
   const nickname=info.nickname||info.userId||'未知'
   const methodTag=info.loginMethod==='qq'?' · QQ登录':(info.loginMethod==='wechat'?' · 微信登录':'')
   return '<div class="login-account '+(info.vip?'vip':'')+'"><span class="field-state '+(info.loggedIn?'ok':'')+'">'+(info.loggedIn?'已登录':'未登录')+'</span>'+
-    '<span>账号：'+esc(nickname)+methodTag+'</span>'+(vipLabel?'<span class="vip-badge">'+vipLabel+expire+'</span>':'')+'</div>'
+    '<span>账号：'+esc(nickname)+methodTag+'</span>'+(vipLabel?'<span class="vip-badge">'+vipLabel+expire+'</span>':'')+stale+'</div>'
 }
 async function loadPlatformAccounts(){
-  for(const provider of ['qqmusic','netease']){
+  await Promise.all(['qqmusic','netease','kugou','bilibili'].map(async(provider)=>{
     try{platformAccounts[provider]=await request('/player/account/status?provider='+provider)}catch(e){platformAccounts[provider]=null}
-  }
+  }))
 }
-async function loadKugouAccountInfo(){
-  try{kugouAccountInfo=await request('/player/kugou/status')}catch(e){kugouAccountInfo=null}
+async function refreshAccountStatus(provider){
+  if(actionInFlight){setResult('上一项操作仍在请求中');return}
+  actionInFlight=true
+  setResult('刷新状态中...')
+  try{
+    const info=await request('/player/account/refresh?provider='+encodeURIComponent(provider),'POST')
+    platformAccounts[provider]=info||null
+    renderLoginState()
+    setResult('刷新状态成功：'+(info&&info.loggedIn?'已登录':'未登录')+formatVipLabel(info))
+  }catch(e){setResult('刷新状态失败：'+e.message)}
+  finally{actionInFlight=false}
+}
+function formatVipLabel(info){
+  if(!info||!info.loggedIn)return ''
+  if(!info.vipKnown)return '，VIP状态未知'
+  if(info.vip){
+    const type=info.vipType&&info.vipType!=='0'?('（'+info.vipType+'）'):''
+    const expire=info.vipExpireAtMs?('，到期 '+loginTime(info.vipExpireAtMs)):''
+    return '，VIP'+type+expire
+  }
+  return '，非VIP'
 }
 async function jsonAction(url,body){
   if(actionInFlight){setResult('上一项操作仍在请求中');return false}

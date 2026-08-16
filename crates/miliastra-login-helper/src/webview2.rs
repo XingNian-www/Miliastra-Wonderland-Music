@@ -114,14 +114,13 @@ const QQ_LOGIN_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(15);
 const QQ_WEB_REFRESH_URL: &str = "https://c.y.qq.com/base/fcgi-bin/login_get_musickey.fcg";
 
 fn has_qq_refresh_cookies(cookies: &BTreeMap<String, String>) -> bool {
-    [
-        ["psrf_qqopenid", "openid"].as_slice(),
-        ["psrf_qqaccess_token", "access_token"].as_slice(),
-        ["psrf_qqrefresh_token", "refresh_token"].as_slice(),
-        ["psrf_qqrefresh_key", "refresh_key"].as_slice(),
-    ]
-    .iter()
-    .all(|aliases| aliases.iter().any(|name| cookies.contains_key(*name)))
+    let has_any = |aliases: &[&str]| aliases.iter().any(|name| cookies.contains_key(*name));
+    has_any(&["psrf_qqopenid", "openid"])
+        && has_any(&["psrf_qqaccess_token", "access_token"])
+        // QQ OAuth 网页登录通常只下发 refresh_token，不保证下发 refresh_key；
+        // refresh_key 由移动端续期响应补发，任一存在即可视为可刷新。
+        && (has_any(&["psrf_qqrefresh_token", "refresh_token"])
+            || has_any(&["psrf_qqrefresh_key", "refresh_key"]))
 }
 
 fn parse_qq_login_callback(raw_url: &str) -> Option<(String, String)> {
@@ -252,6 +251,31 @@ fn cookie_header(cookies: &BTreeMap<String, String>) -> String {
         .join("; ")
 }
 
+fn finish_qq_login_exchange<F>(
+    login_type: &str,
+    cookies: &BTreeMap<String, String>,
+    mut fields: BTreeMap<String, String>,
+    callback_error: Option<String>,
+    refresh_web_session: F,
+) -> Result<BTreeMap<String, String>, String>
+where
+    F: FnOnce(&BTreeMap<String, String>) -> Result<BTreeMap<String, String>, String>,
+{
+    // 微信网页登录的授权码交换可能已经被页面消费；此时仍可用浏览器会话
+    // 刷新出凭据。因此必须在报告 callback 错误之前尝试该兜底路径。
+    if login_type == "2"
+        && let Ok(web_fields) = refresh_web_session(cookies)
+    {
+        fields.extend(web_fields);
+    }
+    if fields.is_empty()
+        && let Some(error) = callback_error
+    {
+        return Err(error);
+    }
+    Ok(fields)
+}
+
 fn exchange_qq_login_code(
     login_type: &str,
     code: &str,
@@ -291,21 +315,61 @@ fn exchange_qq_login_code(
         Ok((response_headers, response)) => {
             merge_qq_set_cookie_headers(&mut fields, &response_headers);
             merge_qq_login_response_fields(&mut fields, &response);
+            // 记录接口响应结构（仅字段名，不打印值），用于定位 refresh_key 缺失。
+            let data_keys = qq_login_response_data(&response)
+                .map(|data| data.keys().cloned().collect::<Vec<_>>().join(","))
+                .unwrap_or_else(|| "<no data>".to_owned());
+            eprintln!(
+                "[qqmusic-oauth] 交换响应 data 字段: {data_keys}; 已合并字段: {}",
+                fields.keys().cloned().collect::<Vec<_>>().join(",")
+            );
             qq_login_response_code(&response)
                 .filter(|code| code != "0" && !code.is_empty())
                 .map(|code| format!("QQ Music web login returned code {code}"))
         }
         Err(error) => Some(error),
     };
-    if login_type == "2"
-        && let Ok(web_fields) = refresh_qq_web_session(cookies)
-    {
-        fields.extend(web_fields);
-    }
-    if fields.is_empty()
-        && let Some(error) = callback_error
-    {
-        return Err(error);
+    let fields = finish_qq_login_exchange(
+        login_type,
+        cookies,
+        fields,
+        callback_error,
+        refresh_qq_web_session,
+    )?;
+    if login_type == "1" {
+        // QQ OAuth 交换只保证 openid/access_token/refresh_token；refresh_key
+        // 往往不返回（由移动端续期接口补发）。字段缺失时保留已合并部分并记录
+        // 诊断，不再整体丢弃——网页 Cookie 通常已包含其余字段。
+        let missing = [
+            ("uin", ["uin"].as_slice()),
+            ("musicKey", ["qqmusic_key", "qm_keyst"].as_slice()),
+            ("openId", ["psrf_qqopenid", "openid"].as_slice()),
+            (
+                "accessToken",
+                ["psrf_qqaccess_token", "access_token"].as_slice(),
+            ),
+            (
+                "refreshToken/refreshKey",
+                [
+                    "psrf_qqrefresh_token",
+                    "refresh_token",
+                    "psrf_qqrefresh_key",
+                    "refresh_key",
+                ]
+                .as_slice(),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(label, aliases)| {
+            (!aliases.iter().any(|name| fields.contains_key(*name))).then_some(label)
+        })
+        .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            eprintln!(
+                "[qqmusic-oauth] QQ OAuth 授权码交换返回字段不完整(保留可用字段): {}",
+                missing.join(", ")
+            );
+        }
     }
     Ok(fields)
 }
@@ -867,7 +931,8 @@ mod platform {
             let mut state = self.state.lock().expect("capture state mutex poisoned");
             let previous = state.login_callback.clone();
             super::remember_qq_login_callback(&mut state.login_callback, &source_text);
-            if state.login_callback != previous {
+            let changed = state.login_callback != previous;
+            if changed {
                 state.exchange_attempted = false;
             }
         }
@@ -876,12 +941,13 @@ mod platform {
             let mut state = self.state.lock().expect("capture state mutex poisoned");
             let previous = state.login_callback.clone();
             super::remember_qq_login_callback(&mut state.login_callback, raw_url);
-            if state.login_callback != previous {
+            let changed = state.login_callback != previous;
+            if changed {
                 state.exchange_attempted = false;
             }
         }
 
-        fn start_login_exchange(self: &Rc<Self>) {
+        fn start_login_exchange(&self) {
             let (login_type, code, cookies, sender) = {
                 let mut state = self.state.lock().expect("capture state mutex poisoned");
                 if self.provider != "qqmusic"
@@ -925,13 +991,15 @@ mod platform {
                         }) {
                             state.exchange_rx = None;
                             state.exchange_started_at = None;
+                            Some(Err("QQ OAuth 授权码交换超时".to_owned()))
+                        } else {
+                            None
                         }
-                        None
                     }
                     Err(mpsc::TryRecvError::Disconnected) => {
                         state.exchange_rx = None;
                         state.exchange_started_at = None;
-                        None
+                        Some(Err("QQ OAuth 授权码交换线程异常结束".to_owned()))
                     }
                 }
             };
@@ -943,13 +1011,11 @@ mod platform {
                 }
                 Some(Err(error)) => {
                     let mut state = self.state.lock().expect("capture state mutex poisoned");
-                    // The callback code is single-use and QQ may consume it in
-                    // the page before this best-effort side request completes.
-                    // The browser session itself remains a valid candidate, so
-                    // keep capturing cookies instead of discarding the login.
+                    // 基础 Cookie 仍可用于当前登录，但必须记录 OAuth 交换失败原因，
+                    // 避免最终只表现为 refreshKey 缺失而无法定位。
+                    eprintln!("[qqmusic-oauth] {error}");
                     state.exchange_attempted = true;
                     state.next_cookie_poll = Some(Instant::now());
-                    let _ = error;
                 }
                 None => {}
             }
@@ -1965,6 +2031,40 @@ mod platform {
             .chain(std::iter::once(0))
             .collect()
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::CaptureContext;
+
+        #[test]
+        fn qq_navigation_callback_waits_for_browser_cookies_before_exchange() {
+            let context =
+                CaptureContext::new_with_url("qqmusic", std::ptr::null_mut(), "about:blank")
+                    .expect("build test capture context");
+
+            context.remember_navigation_url(
+                "https://y.qq.com/portal/profile.html?login_type=2&code=callback-code",
+            );
+            {
+                let state = context.state.lock().expect("capture state mutex poisoned");
+                assert_eq!(
+                    state
+                        .login_callback
+                        .as_ref()
+                        .map(|(login_type, code)| (login_type.as_str(), code.as_str())),
+                    Some(("2", "callback-code"))
+                );
+                assert!(!state.exchange_attempted);
+                assert!(state.exchange_rx.is_none());
+            }
+
+            context.start_login_exchange();
+
+            let state = context.state.lock().expect("capture state mutex poisoned");
+            assert!(!state.exchange_attempted);
+            assert!(state.exchange_rx.is_none());
+        }
+    }
 }
 
 #[cfg(not(windows))]
@@ -1986,9 +2086,9 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::{
-        QQ_REFRESH_COOKIE_GRACE_PERIOD, allowed_cookie_names, has_qq_refresh_cookies,
-        has_required_cookies, login_url, merge_qq_login_response_fields, parse_qq_login_callback,
-        should_complete_capture,
+        QQ_REFRESH_COOKIE_GRACE_PERIOD, allowed_cookie_names, finish_qq_login_exchange,
+        has_qq_refresh_cookies, has_required_cookies, login_url, merge_qq_login_response_fields,
+        parse_qq_login_callback, should_complete_capture,
     };
     use serde_json::json;
     use std::collections::BTreeMap;
@@ -2065,6 +2165,33 @@ mod tests {
             &mut required_seen_at,
             Instant::now(),
         ));
+    }
+
+    #[test]
+    fn qq_capture_finishes_with_refresh_token_only() {
+        // QQ OAuth 网页登录通常只下发 refresh_token（无 refresh_key），
+        // 此时应视为可刷新并立即完成捕获，无需等待 3 秒宽限；
+        // refresh_key 由后续移动端续期响应补发。
+        let refreshable = BTreeMap::from([
+            ("uin".to_owned(), "1".to_owned()),
+            ("qqmusic_key".to_owned(), "key".to_owned()),
+            ("psrf_qqopenid".to_owned(), "open-id".to_owned()),
+            ("psrf_qqaccess_token".to_owned(), "access-token".to_owned()),
+            (
+                "psrf_qqrefresh_token".to_owned(),
+                "refresh-token".to_owned(),
+            ),
+        ]);
+        let mut required_seen_at = None;
+
+        assert!(has_qq_refresh_cookies(&refreshable));
+        assert!(should_complete_capture(
+            "qqmusic",
+            &refreshable,
+            &mut required_seen_at,
+            Instant::now(),
+        ));
+        assert_eq!(required_seen_at, None);
     }
 
     #[test]
@@ -2168,6 +2295,30 @@ mod tests {
         assert_eq!(
             callback,
             Some(("2".to_owned(), "transient-code".to_owned()))
+        );
+    }
+
+    #[test]
+    fn qq_web_session_fallback_precedes_callback_error() {
+        let cookies = BTreeMap::from([("wxopenid".to_owned(), "open-id".to_owned())]);
+        let fields = finish_qq_login_exchange(
+            "2",
+            &cookies,
+            BTreeMap::new(),
+            Some("callback exchange rejected".to_owned()),
+            |captured_cookies| {
+                assert_eq!(captured_cookies, &cookies);
+                Ok(BTreeMap::from([(
+                    "wxaccess_token".to_owned(),
+                    "web-access-token".to_owned(),
+                )]))
+            },
+        )
+        .expect("web session fallback should recover a rejected callback exchange");
+
+        assert_eq!(
+            fields.get("wxaccess_token"),
+            Some(&"web-access-token".to_owned())
         );
     }
 

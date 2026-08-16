@@ -308,6 +308,12 @@ const ROUTES: &[RouteSpec] = &[
         handler: player_account_status_route,
     },
     RouteSpec {
+        path: "/player/account/refresh",
+        json: true,
+        mutating: true,
+        handler: player_account_refresh_route,
+    },
+    RouteSpec {
         path: "/player/kugou/claim-vip",
         json: true,
         mutating: true,

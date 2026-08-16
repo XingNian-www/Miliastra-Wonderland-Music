@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -23,7 +23,7 @@ struct CredentialEnvelope {
 /// Plaintext account state captured by the provider login helper. The store
 /// never exposes secret values through its status APIs; native adapters read a
 /// clone only when they need to make a provider request.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
     rename_all = "camelCase",
     rename_all_fields = "camelCase",
@@ -238,16 +238,7 @@ impl ProviderCredential {
                 Self::Kugou { .. } | Self::QqMusic { .. } | Self::Bilibili { .. }
             ),
             refresh_ready: match self {
-                Self::QqMusic { cookies } => has_any_cookie(
-                    cookies,
-                    &[
-                        "psrf_qqrefresh_token",
-                        "refresh_token",
-                        "wxrefresh_token",
-                        "psrf_qqrefresh_key",
-                        "refresh_key",
-                    ],
-                ),
+                Self::QqMusic { cookies } => qq_refresh_ready(cookies),
                 Self::Bilibili { refresh_token, .. } => {
                     refresh_token.as_deref().is_some_and(has_value)
                 }
@@ -329,9 +320,37 @@ impl CredentialStatus {
 pub struct CredentialStore {
     directory: Option<PathBuf>,
     credentials: Arc<RwLock<BTreeMap<&'static str, ProviderCredential>>>,
+    /// 单调递增的凭据版本。异步刷新只能写回它开始时观察到的版本。
+    credential_revisions: Arc<RwLock<BTreeMap<&'static str, u64>>>,
     refresh_metadata: Arc<RwLock<BTreeMap<String, RefreshMetadata>>>,
+    /// 同一平台的手动和自动刷新共用此集合，避免并发发起重复续期请求。
+    refresh_inflight: Arc<Mutex<BTreeSet<&'static str>>>,
+    /// 串行化凭据的“检查版本 -> 落盘 -> 更新内存”事务。
+    mutation_lock: Arc<Mutex<()>>,
     /// 串行化磁盘写入,避免 fsync 在 RwLock 写锁内执行阻塞所有读取。
     save_lock: Arc<Mutex<()>>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CredentialSnapshot {
+    pub credential: ProviderCredential,
+    pub revision: u64,
+}
+
+/// A per-provider refresh lease shared by explicit and implicit refresh paths.
+///
+/// Dropping the lease releases the provider even when an async task exits early.
+pub(crate) struct CredentialRefreshLease {
+    inflight: Arc<Mutex<BTreeSet<&'static str>>>,
+    provider: &'static str,
+}
+
+impl Drop for CredentialRefreshLease {
+    fn drop(&mut self) {
+        if let Ok(mut inflight) = self.inflight.lock() {
+            inflight.remove(self.provider);
+        }
+    }
 }
 
 impl CredentialStore {
@@ -376,7 +395,10 @@ impl CredentialStore {
         Ok(Self {
             directory: Some(directory),
             credentials: Arc::new(RwLock::new(credentials)),
+            credential_revisions: Arc::new(RwLock::new(BTreeMap::new())),
             refresh_metadata: Arc::new(RwLock::new(refresh_metadata)),
+            refresh_inflight: Arc::new(Mutex::new(BTreeSet::new())),
+            mutation_lock: Arc::new(Mutex::new(())),
             save_lock: Arc::new(Mutex::new(())),
         })
     }
@@ -386,7 +408,10 @@ impl CredentialStore {
         Self {
             directory: None,
             credentials: Arc::new(RwLock::new(BTreeMap::new())),
+            credential_revisions: Arc::new(RwLock::new(BTreeMap::new())),
             refresh_metadata: Arc::new(RwLock::new(BTreeMap::new())),
+            refresh_inflight: Arc::new(Mutex::new(BTreeSet::new())),
+            mutation_lock: Arc::new(Mutex::new(())),
             save_lock: Arc::new(Mutex::new(())),
         }
     }
@@ -424,30 +449,82 @@ impl CredentialStore {
         Ok(status)
     }
 
-    pub fn mark_refresh_started(&self, provider: &str) -> Result<(), CredentialError> {
+    /// 尝试取得不更新刷新状态元数据的续期租约。
+    ///
+    /// QQ 的请求内隐式续期也必须使用这把租约，避免与手动/自动续期并发旋转
+    /// 同一份 refresh token。
+    pub(crate) fn try_acquire_refresh_lease(
+        &self,
+        provider: &str,
+    ) -> Result<Option<CredentialRefreshLease>, CredentialError> {
         let provider = canonical_provider(provider)?;
-        let updated = {
+        let mut inflight = self
+            .refresh_inflight
+            .lock()
+            .map_err(|_| CredentialError::Poisoned)?;
+        if !inflight.insert(provider) {
+            return Ok(None);
+        }
+        Ok(Some(CredentialRefreshLease {
+            inflight: self.refresh_inflight.clone(),
+            provider,
+        }))
+    }
+
+    /// 尝试取得平台续期租约并记录刷新中状态。返回 `None` 说明同平台已有续期任务。
+    pub(crate) fn try_mark_refresh_started(
+        &self,
+        provider: &str,
+    ) -> Result<Option<CredentialRefreshLease>, CredentialError> {
+        let provider = canonical_provider(provider)?;
+        let Some(lease) = self.try_acquire_refresh_lease(provider)? else {
+            return Ok(None);
+        };
+        let _mutation = self
+            .mutation_lock
+            .lock()
+            .map_err(|_| CredentialError::Poisoned)?;
+        let (previous, updated) = {
             let mut metadata = self
                 .refresh_metadata
                 .write()
                 .map_err(|_| CredentialError::Poisoned)?;
-            metadata.insert(
+            let previous = metadata.insert(
                 provider.to_owned(),
                 RefreshMetadata {
                     state: "refreshing".to_owned(),
                     ..RefreshMetadata::default()
                 },
             );
-            metadata.clone()
+            (previous, metadata.clone())
         };
-        self.persist_refresh_metadata(&updated)
-            .map_err(|error| CredentialError::Write {
-                path: self.refresh_state_path().unwrap_or_default(),
-                error,
-            })
-            .map(|_| ())
+        if let Err(error) =
+            self.persist_refresh_metadata(&updated)
+                .map_err(|error| CredentialError::Write {
+                    path: self.refresh_state_path().unwrap_or_default(),
+                    error,
+                })
+        {
+            // The durable write did not complete, so do not leave a task that never started
+            // represented as permanently "refreshing" in this process.
+            let mut metadata = self
+                .refresh_metadata
+                .write()
+                .map_err(|_| CredentialError::Poisoned)?;
+            match previous {
+                Some(previous) => {
+                    metadata.insert(provider.to_owned(), previous);
+                }
+                None => {
+                    metadata.remove(provider);
+                }
+            }
+            return Err(error);
+        }
+        Ok(Some(lease))
     }
 
+    #[cfg(test)]
     pub fn mark_refresh_finished(
         &self,
         provider: &str,
@@ -455,13 +532,71 @@ impl CredentialStore {
         next_check_at_ms: Option<u64>,
     ) -> Result<(), CredentialError> {
         let provider = canonical_provider(provider)?;
+        let persisted = self.write_refresh_metadata(provider, result, next_check_at_ms);
+        self.release_refresh_lease(provider);
+        persisted
+    }
+
+    /// 仅当同一凭据版本仍存在时写入刷新结果。
+    ///
+    /// 这把“检查版本 -> 更新刷新元数据”放在同一条凭据变更锁下，避免旧请求在
+    /// 新登录完成后把成功状态和 12 小时检查间隔写回新会话。
+    pub(crate) fn mark_refresh_finished_if_current_revision(
+        &self,
+        provider: &str,
+        expected_revision: Option<u64>,
+        result: Result<(), String>,
+        next_check_at_ms: Option<u64>,
+    ) -> Result<bool, CredentialError> {
+        let provider = canonical_provider(provider)?;
+        let mutation = self
+            .mutation_lock
+            .lock()
+            .map_err(|_| CredentialError::Poisoned)?;
+        let current = match expected_revision {
+            Some(expected_revision) => {
+                let revision = self
+                    .credential_revisions
+                    .read()
+                    .map_err(|_| CredentialError::Poisoned)?
+                    .get(provider)
+                    .copied()
+                    .unwrap_or_default();
+                let exists = self
+                    .credentials
+                    .read()
+                    .map_err(|_| CredentialError::Poisoned)?
+                    .contains_key(provider);
+                exists && revision == expected_revision
+            }
+            None => true,
+        };
+        if !current {
+            drop(mutation);
+            self.discard_refresh(provider)?;
+            return Ok(false);
+        }
+        let persisted = self.write_refresh_metadata(provider, result, next_check_at_ms);
+        drop(mutation);
+        self.release_refresh_lease(provider);
+        persisted.map(|_| true)
+    }
+
+    fn write_refresh_metadata(
+        &self,
+        provider: &'static str,
+        result: Result<(), String>,
+        next_check_at_ms: Option<u64>,
+    ) -> Result<(), CredentialError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_millis() as u64)
             .ok();
         let (state, error) = match result {
             Ok(()) => ("success", None),
-            Err(error) => ("failed", Some(error)),
+            // refresh-state.json 会被 Web 状态接口读取，绝不能把请求 URL、cookie
+            // 或 provider 原始错误持久化进去。
+            Err(_) => ("failed", Some("refresh_failed".to_owned())),
         };
         let updated = {
             let mut metadata = self
@@ -479,12 +614,44 @@ impl CredentialStore {
             );
             metadata.clone()
         };
-        self.persist_refresh_metadata(&updated)
-            .map_err(|error| CredentialError::Write {
-                path: self.refresh_state_path().unwrap_or_default(),
-                error,
-            })
-            .map(|_| ())
+        let persisted =
+            self.persist_refresh_metadata(&updated)
+                .map_err(|error| CredentialError::Write {
+                    path: self.refresh_state_path().unwrap_or_default(),
+                    error,
+                });
+        persisted.map(|_| ())
+    }
+
+    fn release_refresh_lease(&self, provider: &'static str) {
+        if let Ok(mut inflight) = self.refresh_inflight.lock() {
+            inflight.remove(provider);
+        }
+    }
+
+    /// 丢弃已被退出/重新登录取代的刷新任务，不让旧任务污染新会话的刷新状态。
+    pub fn discard_refresh(&self, provider: &str) -> Result<(), CredentialError> {
+        let provider = canonical_provider(provider)?;
+        let _mutation = self
+            .mutation_lock
+            .lock()
+            .map_err(|_| CredentialError::Poisoned)?;
+        let updated = {
+            let mut metadata = self
+                .refresh_metadata
+                .write()
+                .map_err(|_| CredentialError::Poisoned)?;
+            metadata.remove(provider);
+            metadata.clone()
+        };
+        let persisted =
+            self.persist_refresh_metadata(&updated)
+                .map_err(|error| CredentialError::Write {
+                    path: self.refresh_state_path().unwrap_or_default(),
+                    error,
+                });
+        self.release_refresh_lease(provider);
+        persisted.map(|_| ())
     }
 
     pub(crate) fn non_sensitive_path(&self, file_name: &str) -> Option<PathBuf> {
@@ -527,6 +694,38 @@ impl CredentialStore {
             .map(|credentials| credentials.get(provider).cloned())
     }
 
+    /// 读取凭据及其当前版本，供可能跨越网络 await 的续期流程使用。
+    pub(crate) fn snapshot(
+        &self,
+        provider: &str,
+    ) -> Result<Option<CredentialSnapshot>, CredentialError> {
+        let provider = canonical_provider(provider)?;
+        let _mutation = self
+            .mutation_lock
+            .lock()
+            .map_err(|_| CredentialError::Poisoned)?;
+        let credential = self
+            .credentials
+            .read()
+            .map_err(|_| CredentialError::Poisoned)?
+            .get(provider)
+            .cloned();
+        let Some(credential) = credential else {
+            return Ok(None);
+        };
+        let revision = self
+            .credential_revisions
+            .read()
+            .map_err(|_| CredentialError::Poisoned)?
+            .get(provider)
+            .copied()
+            .unwrap_or_default();
+        Ok(Some(CredentialSnapshot {
+            credential,
+            revision,
+        }))
+    }
+
     pub fn save(
         &self,
         provider: &str,
@@ -535,6 +734,10 @@ impl CredentialStore {
         let provider = canonical_provider(provider)?;
         validate_source(provider, &credential)?;
         credential.validate()?;
+        let _mutation = self
+            .mutation_lock
+            .lock()
+            .map_err(|_| CredentialError::Poisoned)?;
         // 磁盘写入在 save_lock 下串行执行,且不持有 RwLock 写锁,
         // 避免 fsync/ACL 调用阻塞其他读取。
         if let Some(directory) = self.directory.as_ref() {
@@ -550,11 +753,66 @@ impl CredentialStore {
             .map_err(|_| CredentialError::Poisoned)?;
         let status = credential.presence();
         credentials.insert(provider, credential);
+        drop(credentials);
+        self.bump_revision(provider)?;
+        // 新登录/手工保存不能继承上一个会话的失败退避或“刷新中”标记。
+        let _ = self.clear_refresh_metadata(provider);
         Ok(status)
+    }
+
+    /// 仅在凭据仍是续期请求开始时的版本时写入新凭据。
+    ///
+    /// 这会阻止已退出账号或已重新登录账号被旧网络任务的结果覆盖。
+    pub(crate) fn save_if_revision(
+        &self,
+        provider: &str,
+        expected_revision: u64,
+        credential: ProviderCredential,
+    ) -> Result<Option<CredentialStatus>, CredentialError> {
+        let provider = canonical_provider(provider)?;
+        validate_source(provider, &credential)?;
+        credential.validate()?;
+        let _mutation = self
+            .mutation_lock
+            .lock()
+            .map_err(|_| CredentialError::Poisoned)?;
+        let revision = self
+            .credential_revisions
+            .read()
+            .map_err(|_| CredentialError::Poisoned)?
+            .get(provider)
+            .copied()
+            .unwrap_or_default();
+        let exists = self
+            .credentials
+            .read()
+            .map_err(|_| CredentialError::Poisoned)?
+            .contains_key(provider);
+        if revision != expected_revision || !exists {
+            return Ok(None);
+        }
+        if let Some(directory) = self.directory.as_ref() {
+            let _guard = self
+                .save_lock
+                .lock()
+                .map_err(|_| CredentialError::Poisoned)?;
+            persist_credential(&credential_path(directory, provider), &credential)?;
+        }
+        let status = credential.presence();
+        self.credentials
+            .write()
+            .map_err(|_| CredentialError::Poisoned)?
+            .insert(provider, credential);
+        self.bump_revision(provider)?;
+        Ok(Some(status))
     }
 
     pub fn remove(&self, provider: &str) -> Result<CredentialStatus, CredentialError> {
         let provider = canonical_provider(provider)?;
+        let _mutation = self
+            .mutation_lock
+            .lock()
+            .map_err(|_| CredentialError::Poisoned)?;
         let mut credentials = self
             .credentials
             .write()
@@ -563,7 +821,38 @@ impl CredentialStore {
             remove_credential_file(&credential_path(directory, provider))?;
         }
         credentials.remove(provider);
+        drop(credentials);
+        self.bump_revision(provider)?;
+        let _ = self.clear_refresh_metadata(provider);
         Ok(CredentialStatus::empty(provider))
+    }
+
+    fn bump_revision(&self, provider: &'static str) -> Result<(), CredentialError> {
+        let mut revisions = self
+            .credential_revisions
+            .write()
+            .map_err(|_| CredentialError::Poisoned)?;
+        let revision = revisions.entry(provider).or_default();
+        *revision = revision.wrapping_add(1);
+        Ok(())
+    }
+
+    fn clear_refresh_metadata(&self, provider: &'static str) -> Result<(), CredentialError> {
+        let updated = {
+            let mut metadata = self
+                .refresh_metadata
+                .write()
+                .map_err(|_| CredentialError::Poisoned)?;
+            if metadata.remove(provider).is_none() {
+                return Ok(());
+            }
+            metadata.clone()
+        };
+        self.persist_refresh_metadata(&updated)
+            .map_err(|error| CredentialError::Write {
+                path: self.refresh_state_path().unwrap_or_default(),
+                error,
+            })
     }
 }
 
@@ -628,6 +917,23 @@ fn has_value(value: &str) -> bool {
     !value.trim().is_empty()
 }
 
+fn qq_refresh_ready(cookies: &BTreeMap<String, String>) -> bool {
+    let web_ready = has_any_cookie(cookies, &["wxopenid"])
+        && has_any_cookie(cookies, &["wxrefresh_token"])
+        && has_any_cookie(cookies, &["qqmusic_key", "qm_keyst"])
+        && has_any_cookie(cookies, &["uin", "wxuin"]);
+    // QQ 网页登录（QQ OAuth）通常只下发 refresh_token，不保证下发
+    // refresh_key；移动端续期接口接受两者任一作为已有登录凭据，并在响应中
+    // 补发新的 refresh_token 与 refresh_key。因此任一存在即可刷新。
+    let oauth_ready = has_any_cookie(cookies, &["uin", "wxuin"])
+        && has_any_cookie(cookies, &["qqmusic_key", "qm_keyst"])
+        && has_any_cookie(cookies, &["psrf_qqopenid", "openid"])
+        && has_any_cookie(cookies, &["psrf_qqaccess_token", "access_token"])
+        && (has_any_cookie(cookies, &["psrf_qqrefresh_token", "refresh_token"])
+            || has_any_cookie(cookies, &["psrf_qqrefresh_key", "refresh_key"]));
+    web_ready || oauth_ready
+}
+
 fn credential_path(directory: &Path, provider: &str) -> PathBuf {
     directory.join(format!("{provider}.json"))
 }
@@ -645,8 +951,26 @@ fn load_refresh_metadata(
         path: path.clone(),
         error: error.to_string(),
     })?;
-    serde_json::from_str(&text)
-        .map_err(|error| CredentialError::Invalid(format!("{}: {error}", path.display())))
+    let mut metadata: BTreeMap<String, RefreshMetadata> = serde_json::from_str(&text)
+        .map_err(|error| CredentialError::Invalid(format!("{}: {error}", path.display())))?;
+    // 旧版本可能将 provider 原始错误写入该文件。状态会直接被 Web 面板读取，
+    // 因此加载时迁移为稳定错误码并立即落盘，避免升级后继续暴露旧的 URL 或凭据。
+    let migrated = metadata.values_mut().fold(false, |changed, entry| {
+        if entry.last_error.as_deref() == Some("refresh_failed") {
+            changed
+        } else if entry.last_error.is_some() {
+            entry.last_error = Some("refresh_failed".to_owned());
+            true
+        } else {
+            changed
+        }
+    });
+    if migrated {
+        let content = serde_json::to_vec_pretty(&metadata)
+            .map_err(|error| CredentialError::Invalid(error.to_string()))?;
+        write_atomic(&path, &content)?;
+    }
+    Ok(metadata)
 }
 
 fn persist_credential(path: &Path, credential: &ProviderCredential) -> Result<(), CredentialError> {
@@ -958,7 +1282,138 @@ mod tests {
     #[cfg(windows)]
     use std::path::Path;
 
-    use super::{CredentialError, CredentialStore, ProviderCredential};
+    use super::{
+        CredentialError, CredentialStore, ProviderCredential, REFRESH_STATE_FILE, qq_refresh_ready,
+    };
+
+    #[test]
+    fn qq_refresh_requires_a_complete_supported_credential_set() {
+        let basic = BTreeMap::from([
+            ("uin".to_owned(), "123".to_owned()),
+            ("qqmusic_key".to_owned(), "key".to_owned()),
+        ]);
+        let mut oauth = basic.clone();
+        oauth.insert("psrf_qqopenid".to_owned(), "openid".to_owned());
+        oauth.insert("psrf_qqaccess_token".to_owned(), "access".to_owned());
+        assert!(!qq_refresh_ready(&oauth));
+        // 网页登录只下发 refresh_token（无 refresh_key）时即可刷新。
+        oauth.insert("psrf_qqrefresh_token".to_owned(), "refresh".to_owned());
+        assert!(qq_refresh_ready(&oauth));
+        oauth.remove("psrf_qqrefresh_token");
+        oauth.insert("psrf_qqrefresh_key".to_owned(), "key".to_owned());
+        assert!(qq_refresh_ready(&oauth));
+
+        let mut web = basic;
+        web.insert("wxopenid".to_owned(), "openid".to_owned());
+        assert!(!qq_refresh_ready(&web));
+        web.insert("wxrefresh_token".to_owned(), "refresh".to_owned());
+        assert!(qq_refresh_ready(&web));
+    }
+
+    #[test]
+    fn conditional_refresh_save_cannot_restore_a_logged_out_credential() {
+        let store = CredentialStore::memory();
+        let original = ProviderCredential::QqMusic {
+            cookies: BTreeMap::from([
+                ("uin".to_owned(), "123".to_owned()),
+                ("qqmusic_key".to_owned(), "old-key".to_owned()),
+            ]),
+        };
+        store.save("qqmusic", original).unwrap();
+        let snapshot = store.snapshot("qqmusic").unwrap().unwrap();
+
+        store.remove("qqmusic").unwrap();
+        let saved = store
+            .save_if_revision(
+                "qqmusic",
+                snapshot.revision,
+                ProviderCredential::QqMusic {
+                    cookies: BTreeMap::from([
+                        ("uin".to_owned(), "123".to_owned()),
+                        ("qqmusic_key".to_owned(), "new-key".to_owned()),
+                    ]),
+                },
+            )
+            .unwrap();
+
+        assert!(saved.is_none());
+        assert!(store.get("qqmusic").unwrap().is_none());
+    }
+
+    #[test]
+    fn refresh_lease_is_single_flight_and_never_persists_raw_errors() {
+        let store = CredentialStore::memory();
+        let lease = store
+            .try_mark_refresh_started("qqmusic")
+            .unwrap()
+            .expect("first refresh should obtain a lease");
+        assert!(store.try_mark_refresh_started("qqmusic").unwrap().is_none());
+        store
+            .mark_refresh_finished(
+                "qqmusic",
+                Err("request https://example.invalid/?token=secret-value failed".to_owned()),
+                Some(123),
+            )
+            .unwrap();
+        drop(lease);
+
+        let status = store.status("qqmusic").unwrap();
+        let serialized = serde_json::to_string(&status).unwrap();
+        assert_eq!(status.last_refresh_error.as_deref(), Some("refresh_failed"));
+        assert!(!serialized.contains("secret-value"));
+        assert!(store.try_mark_refresh_started("qqmusic").unwrap().is_some());
+    }
+
+    #[test]
+    fn failed_refresh_start_rolls_back_metadata_and_releases_its_lease() {
+        let directory =
+            std::env::temp_dir().join(format!("miliastra-credentials-{}", uuid::Uuid::new_v4()));
+        let store = CredentialStore::open(directory.clone()).unwrap();
+        // `write_atomic` cannot create a file at an existing directory. This causes the durable
+        // refresh-state write to fail without depending on platform-specific file permissions.
+        fs::create_dir(directory.join("refresh-state.tmp")).unwrap();
+
+        assert!(store.try_mark_refresh_started("qqmusic").is_err());
+        let status = store.status("qqmusic").unwrap();
+        assert_eq!(status.refresh_state, "unavailable");
+        assert!(status.last_refresh_at_ms.is_none());
+        assert!(status.last_refresh_error.is_none());
+
+        let lease = store
+            .try_acquire_refresh_lease("qqmusic")
+            .unwrap()
+            .expect("the failed start must not leave the provider leased");
+        drop(lease);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn legacy_refresh_errors_are_sanitized_and_rewritten_on_open() {
+        let directory = std::env::temp_dir().join(format!(
+            "miliastra-refresh-metadata-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let secret =
+            "https://provider.invalid/refresh?token=private-token-value&cookie=session-secret";
+        fs::write(
+            directory.join(REFRESH_STATE_FILE),
+            format!(r#"{{"qqmusic":{{"state":"failed","last_error":"{secret}"}}}}"#),
+        )
+        .unwrap();
+
+        let store = CredentialStore::open(directory.clone()).unwrap();
+        let status = store.status("qqmusic").unwrap();
+        assert_eq!(status.last_refresh_error.as_deref(), Some("refresh_failed"));
+
+        let persisted = fs::read_to_string(directory.join(REFRESH_STATE_FILE)).unwrap();
+        assert!(persisted.contains("refresh_failed"));
+        assert!(!persisted.contains(secret));
+        assert!(!persisted.contains("private-token-value"));
+        assert!(!persisted.contains("session-secret"));
+
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn providers_are_saved_in_independent_plaintext_files() {

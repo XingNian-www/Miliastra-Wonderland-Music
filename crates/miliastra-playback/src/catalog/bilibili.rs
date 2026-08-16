@@ -16,12 +16,11 @@ use rsa::rand_core::OsRng;
 use rsa::{Oaep, RsaPublicKey};
 use serde_json::Value;
 use sha2::Sha256;
-use tracing::{info, warn};
 use url::Url;
 
 use crate::catalog::{
-    CatalogError, CredentialRefreshAdapter, PlaybackEligibility, ProviderSearchCandidate,
-    SourceAdapter,
+    AccountStatusCache, CatalogError, CredentialRefreshAdapter, PlaybackEligibility,
+    ProviderSearchCandidate, SourceAdapter,
 };
 use crate::credentials::{CredentialStore, ProviderCredential};
 use crate::domain::{ResolverLocator, SearchSpec, Song, SongKey, StreamSource};
@@ -42,12 +41,6 @@ const REFERER: &str = "https://www.bilibili.com/";
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36";
 const CORRESPOND_PUBLIC_KEY: &str = "-----BEGIN PUBLIC KEY-----\nMIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDLgd2OAkcGVtoE3ThUREbio0Eg\nUc/prcajMKXvkCKFCWhJYJcLkcM2DKKcSeFpD/j6Boy538YXnR6VhcuUJOhH2x71\nnzPjfdTcqMz7djHum0qSZA0AyCBDABUqCrfNgCiJ00Ra7GmRj+YCK1NJEuewlb40\nJNrRuoEUXpabUzGB8QIDAQAB\n-----END PUBLIC KEY-----";
 
-#[derive(Default)]
-struct RefreshState {
-    last_check_day: Option<u64>,
-    refreshing: bool,
-}
-
 #[derive(Clone)]
 pub struct BilibiliAdapter {
     client: Client,
@@ -60,10 +53,13 @@ pub struct BilibiliAdapter {
     correspond_url: Url,
     cookie_refresh_url: Url,
     confirm_refresh_url: Url,
-    refresh_state: Arc<Mutex<RefreshState>>,
+    account_cache: Arc<Mutex<AccountStatusCache>>,
 }
 
 impl BilibiliAdapter {
+    const ACCOUNT_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
+    const ACCOUNT_CACHE_FAILED_TTL: Duration = Duration::from_secs(60);
+
     pub fn new(credentials: CredentialStore, timeout: Duration) -> Result<Self, CatalogError> {
         let client = Client::builder()
             .timeout(timeout)
@@ -89,7 +85,7 @@ impl BilibiliAdapter {
                 .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?,
             confirm_refresh_url: Url::parse(CONFIRM_REFRESH_URL)
                 .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?,
-            refresh_state: Arc::new(Mutex::new(RefreshState::default())),
+            account_cache: Arc::new(Mutex::new(AccountStatusCache::default())),
         })
     }
 
@@ -122,12 +118,89 @@ impl BilibiliAdapter {
             .ok_or_else(|| CatalogError::AuthRequired("Bilibili credential_required".to_owned()))
     }
 
+    async fn account_status_cached(
+        &self,
+        force: bool,
+    ) -> Result<Option<crate::catalog::ProviderAccountStatus>, CatalogError> {
+        let now = std::time::Instant::now();
+        let generation = {
+            let guard = self.account_cache.lock().map_err(|_| {
+                CatalogError::Transient("Bilibili account cache poisoned".to_owned())
+            })?;
+            if !force
+                && let Some(status) =
+                    guard.cached(Self::ACCOUNT_CACHE_TTL, Self::ACCOUNT_CACHE_FAILED_TTL)
+            {
+                return Ok(Some(status));
+            }
+            guard.generation()
+        };
+        let checked_at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let result = match self.credential() {
+            Err(_) => Ok(Some(crate::catalog::ProviderAccountStatus {
+                provider: PROVIDER.to_owned(),
+                logged_in: false,
+                checked_at_ms,
+                ..crate::catalog::ProviderAccountStatus::default()
+            })),
+            Ok(credential) => self
+                .get_json_with_credential(&credential, &self.nav_url, &[], false, None)
+                .await
+                .map(|value| {
+                    let data = value.get("data").unwrap_or(&value);
+                    Some(crate::catalog::ProviderAccountStatus {
+                        provider: PROVIDER.to_owned(),
+                        logged_in: data
+                            .get("isLogin")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                        user_id: data
+                            .get("mid")
+                            .and_then(Value::as_u64)
+                            .map(|id| id.to_string()),
+                        nickname: data.get("uname").and_then(Value::as_str).map(str::to_owned),
+                        vip_known: false,
+                        checked_at_ms,
+                        ..crate::catalog::ProviderAccountStatus::default()
+                    })
+                }),
+        };
+        let mut guard = self
+            .account_cache
+            .lock()
+            .map_err(|_| CatalogError::Transient("Bilibili account cache poisoned".to_owned()))?;
+        match result {
+            Ok(Some(status)) => {
+                guard.store_if_current(generation, status.clone(), now, false);
+                Ok(Some(status))
+            }
+            Ok(None) => Ok(None),
+            Err(error) => {
+                if let Some(stale) = guard.stale_for_current(generation, &error) {
+                    guard.store_if_current(generation, stale.clone(), now, true);
+                    Ok(Some(stale))
+                } else if let Some(failed) =
+                    guard.failed_for_current(generation, PROVIDER, checked_at_ms, &error)
+                {
+                    guard.store_if_current(generation, failed, now, true);
+                    Err(error)
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
     async fn get_json_with_credential(
         &self,
         credential: &ProviderCredential,
         url: &Url,
         query: &[(String, String)],
         persist_cookie_updates: bool,
+        expected_revision: Option<u64>,
     ) -> Result<Value, CatalogError> {
         let response = self
             .client
@@ -147,17 +220,26 @@ impl BilibiliAdapter {
             .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?;
         classify_api_response(&response)?;
         if persist_cookie_updates {
-            self.persist_set_cookie_updates(credential, &headers)
+            self.persist_set_cookie_updates(credential, expected_revision, &headers)
                 .await?;
         }
         Ok(response)
     }
 
     async fn get_json(&self, url: &Url, query: &[(String, String)]) -> Result<Value, CatalogError> {
-        self.maybe_refresh_cookie().await;
-        let credential = self.credential()?;
-        self.get_json_with_credential(&credential, url, query, true)
-            .await
+        let snapshot = self
+            .credentials
+            .snapshot(PROVIDER)
+            .map_err(|error| CatalogError::AuthRequired(error.to_string()))?
+            .ok_or_else(|| CatalogError::AuthRequired("Bilibili credential_required".to_owned()))?;
+        self.get_json_with_credential(
+            &snapshot.credential,
+            url,
+            query,
+            true,
+            Some(snapshot.revision),
+        )
+        .await
     }
 
     async fn search_json(&self, keyword: &str, limit: usize) -> Result<Value, CatalogError> {
@@ -206,6 +288,7 @@ impl BilibiliAdapter {
     async fn persist_set_cookie_updates(
         &self,
         credential: &ProviderCredential,
+        expected_revision: Option<u64>,
         headers: &HeaderMap,
     ) -> Result<(), CatalogError> {
         let ProviderCredential::Bilibili {
@@ -220,12 +303,16 @@ impl BilibiliAdapter {
         if updated == *cookies {
             return Ok(());
         }
-        // 凭证落盘(含 fsync/ACL)移到阻塞线程池,避免阻塞 tokio worker。
+        let Some(expected_revision) = expected_revision else {
+            return Ok(());
+        };
+        // 凭证落盘(含 fsync/ACL)移到阻塞线程池，并仅在原凭据仍有效时写入。
         let store = self.credentials.clone();
         let refresh_token = refresh_token.clone();
-        tokio::task::spawn_blocking(move || {
-            store.save(
+        let saved = tokio::task::spawn_blocking(move || {
+            store.save_if_revision(
                 "bilibili",
+                expected_revision,
                 ProviderCredential::Bilibili {
                     cookies: updated,
                     refresh_token,
@@ -235,64 +322,16 @@ impl BilibiliAdapter {
         .await
         .map_err(|error| CatalogError::Transient(error.to_string()))?
         .map_err(|error| CatalogError::Transient(error.to_string()))?;
+        if saved.is_some() {
+            self.invalidate_account_status();
+        }
         Ok(())
     }
 
-    async fn maybe_refresh_cookie(&self) {
-        let has_refresh_token =
-            self.credentials
-                .get("bilibili")
-                .ok()
-                .flatten()
-                .is_some_and(|credential| {
-                    matches!(
-                        credential,
-                        ProviderCredential::Bilibili {
-                            refresh_token: Some(token),
-                            ..
-                        } if !token.trim().is_empty()
-                    )
-                });
-        if !has_refresh_token {
-            return;
-        }
-
-        let status = match self.credentials.status(PROVIDER) {
-            Ok(status) => status,
-            Err(_) => return,
-        };
-        if !status.refresh_ready
-            || status
-                .next_refresh_check_at_ms
-                .is_some_and(|next| next > now_ms())
-        {
-            return;
-        }
-        let today = current_day();
-        {
-            let Ok(mut state) = self.refresh_state.lock() else {
-                return;
-            };
-            if state.refreshing || state.last_check_day == Some(today) {
-                return;
-            }
-            state.last_check_day = Some(today);
-            state.refreshing = true;
-        }
-
-        if let Err(error) = self.refresh_cookie().await {
-            warn!(error = %error, "Bilibili cookie refresh failed");
-        } else {
-            info!("Bilibili cookie refresh check completed");
-        }
-
-        if let Ok(mut state) = self.refresh_state.lock() {
-            state.refreshing = false;
-        }
-    }
-
-    async fn refresh_cookie(&self) -> Result<bool, CatalogError> {
-        let credential = self.credential()?;
+    async fn refresh_cookie(
+        &self,
+        credential: &ProviderCredential,
+    ) -> Result<Option<ProviderCredential>, CatalogError> {
         let ProviderCredential::Bilibili {
             cookies,
             refresh_token,
@@ -302,7 +341,10 @@ impl BilibiliAdapter {
                 "Bilibili refresh credential is unavailable".to_owned(),
             ));
         };
-        let Some(refresh_token) = refresh_token.filter(|value| !value.trim().is_empty()) else {
+        let Some(refresh_token) = refresh_token
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        else {
             return Err(CatalogError::AuthRequired(
                 "Bilibili refresh token is missing".to_owned(),
             ));
@@ -340,7 +382,7 @@ impl BilibiliAdapter {
             .and_then(Value::as_bool)
             .unwrap_or(false)
         {
-            return Ok(false);
+            return Ok(None);
         }
         let timestamp = info_data.get("timestamp").and_then(as_u64).ok_or_else(|| {
             CatalogError::InvalidResponse(
@@ -375,7 +417,7 @@ impl BilibiliAdapter {
                 ("csrf", csrf.as_str()),
                 ("refresh_csrf", refresh_csrf.as_str()),
                 ("source", "main_web"),
-                ("refresh_token", refresh_token.as_str()),
+                ("refresh_token", refresh_token),
             ])
             .header("Cookie", cookie_header(&cookies))
             .header("Referer", REFERER)
@@ -398,17 +440,14 @@ impl BilibiliAdapter {
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty())
             .map(str::to_owned)
-            .unwrap_or_else(|| refresh_token.clone());
+            .unwrap_or_else(|| refresh_token.to_owned());
         let confirm_csrf = first_cookie(&refreshed, &["bili_jct"])
             .filter(|value| !value.is_empty())
             .unwrap_or(csrf.as_str());
         let confirm_response = self
             .client
             .post(self.confirm_refresh_url.clone())
-            .form(&[
-                ("csrf", confirm_csrf),
-                ("refresh_token", refresh_token.as_str()),
-            ])
+            .form(&[("csrf", confirm_csrf), ("refresh_token", refresh_token)])
             .header("Cookie", cookie_header(&refreshed))
             .header("Referer", REFERER)
             .header("User-Agent", USER_AGENT)
@@ -422,21 +461,10 @@ impl BilibiliAdapter {
             .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?;
         classify_api_response(&confirm_body)?;
 
-        // 凭证落盘(含 fsync/ACL)移到阻塞线程池。
-        let store = self.credentials.clone();
-        tokio::task::spawn_blocking(move || {
-            store.save(
-                "bilibili",
-                ProviderCredential::Bilibili {
-                    cookies: refreshed,
-                    refresh_token: Some(refreshed_refresh_token),
-                },
-            )
-        })
-        .await
-        .map_err(|error| CatalogError::Transient(error.to_string()))?
-        .map_err(|error| CatalogError::Transient(error.to_string()))?;
-        Ok(true)
+        Ok(Some(ProviderCredential::Bilibili {
+            cookies: refreshed,
+            refresh_token: Some(refreshed_refresh_token),
+        }))
     }
 }
 
@@ -444,12 +472,9 @@ impl BilibiliAdapter {
 impl CredentialRefreshAdapter for BilibiliAdapter {
     async fn refresh_credential(
         &self,
-        _credential: &ProviderCredential,
+        credential: &ProviderCredential,
     ) -> Result<Option<ProviderCredential>, CatalogError> {
-        if !self.refresh_cookie().await? {
-            return Ok(None);
-        }
-        self.credential().map(Some)
+        self.refresh_cookie(credential).await
     }
 }
 
@@ -465,7 +490,7 @@ impl SourceAdapter for BilibiliAdapter {
             ));
         }
         let response = self
-            .get_json_with_credential(candidate, &self.nav_url, &[], false)
+            .get_json_with_credential(candidate, &self.nav_url, &[], false, None)
             .await?;
         let data = response
             .get("data")
@@ -550,6 +575,24 @@ impl SourceAdapter for BilibiliAdapter {
         }
         bilibili_resolver_bvid(key, locator)?;
         Ok(None)
+    }
+
+    async fn account_status(
+        &self,
+    ) -> Result<Option<crate::catalog::ProviderAccountStatus>, CatalogError> {
+        self.account_status_cached(false).await
+    }
+
+    async fn refresh_account_status(
+        &self,
+    ) -> Result<Option<crate::catalog::ProviderAccountStatus>, CatalogError> {
+        self.account_status_cached(true).await
+    }
+
+    fn invalidate_account_status(&self) {
+        if let Ok(mut guard) = self.account_cache.lock() {
+            guard.invalidate();
+        }
     }
 }
 
@@ -824,20 +867,6 @@ fn cookie_header(cookies: &BTreeMap<String, String>) -> String {
         .join("; ")
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or_default()
-}
-
-fn current_day() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs() / 86_400)
-        .unwrap_or_default()
-}
-
 fn first_cookie<'a>(cookies: &'a BTreeMap<String, String>, names: &[&str]) -> Option<&'a str> {
     names
         .iter()
@@ -970,15 +999,16 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::mpsc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use super::{
         BilibiliAdapter, PlaybackEligibility, bilibili_dash_audio_url, bilibili_resolver_bvid,
         is_bvid, normalize_bvid, parse_duration_ms, parse_search_candidates,
     };
-    use crate::catalog::{CatalogError, SourceAdapter};
+    use crate::catalog::{CatalogError, ProviderAccountStatus, SourceAdapter};
     use crate::credentials::{CredentialStore, ProviderCredential};
     use crate::domain::{ResolverLocator, SearchSpec, SongKey};
+    use reqwest::header::{HeaderMap, HeaderValue, SET_COOKIE};
     use serde_json::json;
     use url::Url;
 
@@ -1022,6 +1052,57 @@ mod tests {
             )
             .unwrap();
         store
+    }
+
+    #[tokio::test]
+    async fn persisted_cookie_rotation_invalidates_account_status_cache() {
+        let store = credentials();
+        let adapter = BilibiliAdapter::new(store.clone(), Duration::from_secs(2)).unwrap();
+        {
+            let mut cache = adapter.account_cache.lock().unwrap();
+            let generation = cache.generation();
+            assert!(cache.store_if_current(
+                generation,
+                ProviderAccountStatus {
+                    provider: "bilibili".to_owned(),
+                    logged_in: true,
+                    user_id: Some("old-user".to_owned()),
+                    ..ProviderAccountStatus::default()
+                },
+                Instant::now(),
+                false,
+            ));
+        }
+        let snapshot = store.snapshot("bilibili").unwrap().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.append(
+            SET_COOKIE,
+            HeaderValue::from_static("SESSDATA=rotated-session; Path=/; HttpOnly"),
+        );
+
+        adapter
+            .persist_set_cookie_updates(&snapshot.credential, Some(snapshot.revision), &headers)
+            .await
+            .unwrap();
+
+        let cache = adapter.account_cache.lock().unwrap();
+        assert!(
+            cache
+                .cached(Duration::from_secs(1), Duration::from_secs(1))
+                .is_none(),
+            "newly persisted cookies must not retain the account status from the old session"
+        );
+        drop(cache);
+        assert_eq!(
+            store
+                .get("bilibili")
+                .unwrap()
+                .unwrap()
+                .cookies()
+                .get("SESSDATA")
+                .map(String::as_str),
+            Some("rotated-session")
+        );
     }
 
     #[test]

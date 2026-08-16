@@ -7,7 +7,9 @@ use image::imageops::FilterType;
 use serde::Serialize;
 
 use crate::config::{self, OcrConfig, TemplateConfig};
-use crate::observation::chat::{ResolvedTemplateArgs, TemplateArgs, count_chat_markers};
+use crate::observation::chat::{
+    ResolvedTemplateArgs, TemplateArgs, count_scanned_chat_markers, scan_chat_markers,
+};
 use crate::runtime::ui::{
     UiEvidenceRect, UiMarkerProbeEvidence, UiStateClassification, UiStateClassifier,
     UiStateEvidence, UiStateKind as RuntimeUiStateKind, UiTemplateProbeEvidence,
@@ -252,11 +254,17 @@ fn detect_ui_state_with_evidence(
     let back_ms = elapsed_ms(back_started);
 
     let marker_started = Instant::now();
-    let (blue, yellow, pink) =
-        count_chat_markers(image, &templates.chat_templates, screen.chat_rect)?;
+    let marker_hits = scan_chat_markers(image, &templates.chat_templates, screen.chat_rect)?;
+    let (blue, yellow, pink) = count_scanned_chat_markers(&marker_hits);
     let marker_ms = elapsed_ms(marker_started);
-    let marker_probe =
-        UiMarkerProbeEvidence::new(evidence_rect(screen.chat_rect.into()), blue, yellow, pink);
+    let marker_probe = UiMarkerProbeEvidence::new(
+        evidence_rect(screen.chat_rect.into()),
+        (image.width(), image.height()),
+        blue,
+        yellow,
+        pink,
+        marker_hits,
+    );
     if blue + yellow + pink > 0 {
         log::info!(target: "timing",
             "UI 状态检测耗时: total={}ms friend={}ms back={}ms marker={}ms state=primary_marker blue={} yellow={} pink={}",

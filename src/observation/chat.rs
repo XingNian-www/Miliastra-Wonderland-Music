@@ -12,7 +12,8 @@ use std::time::Instant;
 
 pub(crate) use scan::{
     ChatMessage, ChatScanTelemetry, ChatScanTelemetrySink, ResolvedTemplateArgs, TemplateArgs,
-    count_chat_markers, prepare_chat_scan, recognize_prepared_chat,
+    count_chat_markers, count_scanned_chat_markers, prepare_chat_scan,
+    prepare_chat_scan_with_markers, recognize_prepared_chat, scan_chat_markers,
 };
 pub(crate) use secondary_unread_vision::{
     UnreadFriendHit, find_unread_friend_hits, unread_hit_still_visible,

@@ -9,7 +9,9 @@ use reqwest::{Client, StatusCode};
 use serde_json::Value;
 use url::Url;
 
-use crate::catalog::{CatalogError, PlaybackEligibility, ProviderSearchCandidate, SourceAdapter};
+use crate::catalog::{
+    AccountStatusCache, CatalogError, PlaybackEligibility, ProviderSearchCandidate, SourceAdapter,
+};
 use crate::credentials::{CredentialStore, ProviderCredential};
 use crate::domain::{ResolverLocator, SearchSpec, Song, SongKey, StreamSource};
 use crate::lyrics::{TimedLyrics, parse_lrc_pair};
@@ -55,24 +57,17 @@ struct UnionVipStatus {
     expire_at_ms: Option<u64>,
 }
 
-/// 账号 VIP 状态缓存条目（判定结果、时间、是否失败）。
-type VipCacheEntry = Option<(Option<bool>, std::time::Instant, bool)>;
-/// 账号状态缓存条目（状态、时间、是否失败）。
-type AccountCacheEntry = Option<(KugouAccountStatus, std::time::Instant, bool)>;
-
 #[derive(Clone)]
 pub struct KugouAdapter {
     client: Client,
     credentials: CredentialStore,
     api_base_url: Url,
-    /// 账号 VIP 状态缓存（/user/vip/detail 查询较重且接口不稳定）。
-    vip_cache: Arc<std::sync::Mutex<VipCacheEntry>>,
-    /// 账号状态整体缓存（成功 5 分钟/失败 60 秒），防止轮询频繁打账号接口触发风控。
-    account_cache: Arc<std::sync::Mutex<AccountCacheEntry>>,
+    /// 账号状态整体缓存（成功30分钟/失败60秒），防止轮询频繁打账号接口触发风控。
+    account_cache: Arc<std::sync::Mutex<AccountStatusCache>>,
 }
 
 /// 账号 VIP 状态缓存有效期（判定成功时）。
-const VIP_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+const VIP_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
 /// 判定失败（接口风控/超时）时的短缓存，尽快重试账号接口。
 const VIP_CACHE_FAILED_TTL: Duration = Duration::from_secs(60);
 
@@ -91,8 +86,7 @@ impl KugouAdapter {
             client,
             credentials,
             api_base_url: parse_url(api_base_url)?,
-            vip_cache: Arc::new(std::sync::Mutex::new(None)),
-            account_cache: Arc::new(std::sync::Mutex::new(None)),
+            account_cache: Arc::new(std::sync::Mutex::new(AccountStatusCache::default())),
         })
     }
 
@@ -282,15 +276,20 @@ impl KugouAdapter {
     }
 
     /// 刷新酷狗 token，并在成功后返回新凭据。响应只提取必要字段，不记录密钥。
-    pub async fn refresh_token(&self) -> Result<ProviderCredential, CatalogError> {
-        let credential = self.credential()?;
-        let (token, userid, dfid) = Self::credential_fields(&credential)?;
+    ///
+    /// 调用方传入与版本号绑定的凭据快照；刷新期间不能重新读取凭据存储，
+    /// 否则旧请求的结果可能覆盖随后完成的新登录。
+    pub async fn refresh_token(
+        &self,
+        credential: &ProviderCredential,
+    ) -> Result<ProviderCredential, CatalogError> {
+        let (token, userid, dfid) = Self::credential_fields(credential)?;
         let url = self.api_url("/login/token")?;
         let response = self
             .client
             .post(url)
             .query(&[("userid", userid), ("dfid", dfid), ("token", token)])
-            .header("Cookie", Self::credential_cookie_header(&credential))
+            .header("Cookie", Self::credential_cookie_header(credential))
             .send()
             .await
             .map_err(classify_request_error)?;
@@ -348,25 +347,13 @@ impl KugouAdapter {
         })
     }
 
-    /// 查询账号 VIP 状态（带缓存）。`None` 表示查询失败、无法判定。
+    /// 查询账号 VIP 状态。展示与播放共用同一份乐观缓存。
     async fn account_vip_status(&self) -> Option<bool> {
-        let now = std::time::Instant::now();
-        if let Ok(guard) = self.vip_cache.lock()
-            && let Some((status, cached_at, failed)) = guard.as_ref()
-            && cached_at.elapsed()
-                < if *failed {
-                    VIP_CACHE_FAILED_TTL
-                } else {
-                    VIP_CACHE_TTL
-                }
-        {
-            return *status;
-        }
-        let result = self.query_account_vip_status().await;
-        if let Ok(mut guard) = self.vip_cache.lock() {
-            *guard = Some((result, now, result.is_none()));
-        }
-        result
+        self.account_status_cached(false)
+            .await
+            .ok()
+            .filter(|status| status.vip_known)
+            .map(|status| status.vip)
     }
 
     /// 解析 get_union_vip 系列响应中的 VIP 判定字段（is_vip / vip_type / vip）。
@@ -419,144 +406,174 @@ impl KugouAdapter {
         status
     }
 
-    async fn query_account_vip_status(&self) -> Option<bool> {
-        let credential = self.credential().ok()?;
-        // 1) 概念版「获取已领取 VIP 状态」/youth/union/vip（概念版专用，与领取同源的权威状态）；
-        //    风控时顺延到下一途径，接口恢复后自动生效。
-        if let Ok(vip) = self.account_json("/youth/union/vip", &credential).await
-            && let Some(vip_status) = Self::union_vip_status(response_data(&vip)).active
-        {
-            return Some(vip_status);
-        }
-        // 2) /user/vip/detail（kugouvip get_union_vip 查询态）。
-        if let Ok(vip) = self.account_json("/user/vip/detail", &credential).await
-            && let Some(vip_status) = Self::union_vip_status(response_data(&vip)).active
-        {
-            return Some(vip_status);
-        }
-        // 3) 凭据 cookie vip_type 不可信（概念版扫码登录不会写入），
-        //    风控期间无法判定 → None（播放过滤按可播处理，不误伤）。
-        let _ = credential;
-        None
+    /// 兼容旧酷狗专用接口；状态来源与通用账号状态完全一致。
+    pub async fn account_status(&self) -> Result<KugouAccountStatus, CatalogError> {
+        let status = self.account_status_cached(false).await?;
+        Ok(KugouAccountStatus {
+            logged_in: status.logged_in,
+            user_id: status.user_id,
+            nickname: status.nickname,
+            vip: status.vip,
+            vip_type: status.vip_type,
+            vip_expire_at_ms: status.vip_expire_at_ms,
+            listen_report_available: status.logged_in,
+        })
     }
 
-    /// 查询账户与 VIP 状态。仅返回脱敏状态。
-    /// 账号接口带整体缓存（成功 5 分钟/失败 60 秒），避免频繁轮询触发酷狗风控。
-    pub async fn account_status(&self) -> Result<KugouAccountStatus, CatalogError> {
+    async fn account_status_cached(
+        &self,
+        force: bool,
+    ) -> Result<crate::catalog::ProviderAccountStatus, CatalogError> {
         let now = std::time::Instant::now();
-        if let Ok(guard) = self.account_cache.lock()
-            && let Some((status, cached_at, failed)) = guard.as_ref()
-            && cached_at.elapsed()
-                < if *failed {
-                    VIP_CACHE_FAILED_TTL
-                } else {
-                    VIP_CACHE_TTL
-                }
-        {
+        let checked_at_ms = epoch_ms();
+        let (generation, cached) = {
+            let guard = self
+                .account_cache
+                .lock()
+                .map_err(|_| CatalogError::Transient("Kugou account cache poisoned".to_owned()))?;
+            let cached = (!force)
+                .then(|| guard.cached(VIP_CACHE_TTL, VIP_CACHE_FAILED_TTL))
+                .flatten();
+            (guard.generation(), cached)
+        };
+        if let Some(status) = cached {
             return Ok(status.clone());
         }
         let result = self.query_account_status().await;
-        if let Ok(mut guard) = self.account_cache.lock() {
-            match &result {
-                Ok(status) => *guard = Some((status.clone(), now, false)),
-                // 查询失败（风控/超时）时保留上次成功值并标记失败，60 秒后重试。
-                Err(_) => {
-                    let cached = guard
-                        .as_ref()
-                        .map(|(status, ..)| status.clone())
-                        .unwrap_or_default();
-                    *guard = Some((cached, now, true));
+        let mut guard = self
+            .account_cache
+            .lock()
+            .map_err(|_| CatalogError::Transient("Kugou account cache poisoned".to_owned()))?;
+        match result {
+            Ok(status) => {
+                guard.store_if_current(generation, status.clone(), now, false);
+                Ok(status)
+            }
+            Err(error) => {
+                if let Some(stale) = guard.stale_for_current(generation, &error) {
+                    guard.store_if_current(generation, stale.clone(), now, true);
+                    Ok(stale)
+                } else if let Some(failed) =
+                    guard.failed_for_current(generation, PROVIDER, checked_at_ms, &error)
+                {
+                    guard.store_if_current(generation, failed, now, true);
+                    Err(error)
+                } else {
+                    Err(error)
                 }
             }
         }
-        result
     }
 
-    async fn query_account_status(&self) -> Result<KugouAccountStatus, CatalogError> {
+    async fn query_account_status(
+        &self,
+    ) -> Result<crate::catalog::ProviderAccountStatus, CatalogError> {
+        let checked_at_ms = epoch_ms();
         let credential = self.credential()?;
-        let credential_userid = match &credential {
+        // 1) /user/detail（v3/get_my_info）：登录态 + 基础账号信息（轻量、非登录刷新接口）。
+        // 即使它被风控或暂时不可用，也不能提前返回；VIP 接口仍可能给出可用于
+        // 播放筛选的有效结论。
+        let detail = self.account_json("/user/detail", &credential).await;
+        // 2) VIP 状态：概念版 /youth/union/vip → /user/vip/detail → 凭据 cookie vip_type。
+        let vip = match self.account_json("/youth/union/vip", &credential).await {
+            Ok(vip) => Ok(vip),
+            Err(_) => self.account_json("/user/vip/detail", &credential).await,
+        };
+
+        match (detail, vip) {
+            (Ok(detail), Ok(vip)) => Ok(Self::account_status_from_responses(
+                &credential,
+                Some(&detail),
+                Some(&vip),
+                checked_at_ms,
+            )),
+            // 基础资料可用时仍展示账号；VIP 结论明确标为未知。该行为与原有
+            // 降级展示一致，且不会把 Cookie 中的猜测当作播放筛选结论。
+            (Ok(detail), Err(_)) => Ok(Self::account_status_from_responses(
+                &credential,
+                Some(&detail),
+                None,
+                checked_at_ms,
+            )),
+            // /user/detail 失败并不代表 VIP 接口也失败。保留后者的权威结论，
+            // 这样账号信息的短暂故障不会把 VIP 歌全部降为未知。
+            (Err(_), Ok(vip)) => Ok(Self::account_status_from_responses(
+                &credential,
+                None,
+                Some(&vip),
+                checked_at_ms,
+            )),
+            // 两类接口均不可用时，让缓存层记录一分钟失败状态，而不是把
+            // vip_known=false 当成三十分钟的成功结果。
+            (Err(_), Err(error)) => Err(error),
+        }
+    }
+
+    fn account_status_from_responses(
+        credential: &ProviderCredential,
+        detail: Option<&Value>,
+        vip: Option<&Value>,
+        checked_at_ms: u64,
+    ) -> crate::catalog::ProviderAccountStatus {
+        let credential_userid = match credential {
             ProviderCredential::Kugou { userid, .. } => Some(userid.clone()),
             _ => None,
         };
-        // 1) /user/detail（v3/get_my_info）：登录态 + 基础账号信息（轻量、非登录刷新接口）。
-        let detail = self.account_json("/user/detail", &credential).await;
-        if let Ok(detail) = detail {
-            let detail_data = response_data(&detail);
-            let logged_in = detail
-                .get("error_code")
-                .and_then(value_u64)
-                .is_none_or(|code| code == 0);
-            let user_id = detail_data
-                .get("userid")
-                .and_then(value_string)
-                .or(credential_userid);
-            // 2) VIP 状态：概念版 /youth/union/vip → /user/vip/detail → 凭据 cookie vip_type。
-            let vip = match self.account_json("/youth/union/vip", &credential).await {
-                Ok(vip) => vip,
-                Err(_) => self
-                    .account_json("/user/vip/detail", &credential)
-                    .await
-                    .unwrap_or(Value::Null),
-            };
-            let vip_data = response_data(&vip);
-            let union_status = Self::union_vip_status(vip_data);
-            // busi_vip 的 product_type（svip/tvip 等）是概念版权威字段；
-            // 回退顺序：busi_vip → 顶层 vip_type → 凭据 cookie vip_type。
-            let vip_type = union_status
-                .product_type
-                .or_else(|| {
-                    vip_data
-                        .get("vip_type")
-                        .and_then(value_u64)
-                        .map(|value| value.to_string())
-                })
-                .or_else(|| match &credential {
-                    ProviderCredential::Kugou { cookies, .. } => cookies
-                        .get("vip_type")
-                        .and_then(|value| value.parse::<u64>().ok())
-                        .map(|value| value.to_string()),
-                    _ => None,
-                });
-            return Ok(KugouAccountStatus {
-                logged_in,
-                user_id,
-                nickname: detail_data
-                    .get("nickname")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                // 概念版判定以 busi_vip 为准（实测顶层 is_vip=0 不代表无概念版 VIP）。
-                vip: union_status.active.unwrap_or(false)
-                    || vip_type.as_deref().is_some_and(|v| v != "0")
-                    || vip_data
-                        .get("is_vip")
-                        .and_then(value_u64)
-                        .is_some_and(|v| v > 0)
-                    || vip_data
-                        .get("vip")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                vip_type,
-                vip_expire_at_ms: union_status.expire_at_ms.or_else(|| {
-                    vip_data
-                        .get("expire_time")
-                        .and_then(value_u64)
-                        .map(|v| if v < 10_000_000_000 { v * 1000 } else { v })
-                }),
-                listen_report_available: logged_in,
+        let detail_data = detail.map(response_data);
+        let vip_data = vip.map(response_data);
+        let union_status = vip_data.map(Self::union_vip_status).unwrap_or_default();
+        // busi_vip 的 product_type（svip/tvip 等）是概念版权威字段；
+        // 回退顺序：busi_vip → 顶层 vip_type → 凭据 cookie vip_type。
+        let vip_type = union_status
+            .product_type
+            .or_else(|| {
+                vip_data
+                    .and_then(|data| data.get("vip_type"))
+                    .and_then(value_u64)
+                    .map(|value| value.to_string())
+            })
+            .or_else(|| match credential {
+                ProviderCredential::Kugou { cookies, .. } => cookies
+                    .get("vip_type")
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .map(|value| value.to_string()),
+                _ => None,
             });
+        crate::catalog::ProviderAccountStatus {
+            provider: PROVIDER.to_owned(),
+            logged_in: detail
+                .and_then(|detail| detail.get("error_code"))
+                .and_then(value_u64)
+                .is_none_or(|code| code == 0),
+            user_id: detail_data
+                .and_then(|data| data.get("userid"))
+                .and_then(value_string)
+                .or(credential_userid),
+            nickname: detail_data
+                .and_then(|data| data.get("nickname"))
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            // 展示与点歌共用同一个 busi_vip 优先结论。
+            vip_known: union_status.active.is_some(),
+            vip: union_status.active.unwrap_or(false),
+            vip_type,
+            vip_expire_at_ms: union_status.expire_at_ms.or_else(|| {
+                vip_data
+                    .and_then(|data| data.get("expire_time"))
+                    .and_then(value_u64)
+                    .map(|value| {
+                        if value < 10_000_000_000 {
+                            value * 1000
+                        } else {
+                            value
+                        }
+                    })
+            }),
+            login_method: None,
+            checked_at_ms,
+            stale: false,
+            last_error: None,
         }
-        // 3) 账号接口全部不可用（风控）：凭据存在即视为已登录。
-        //    cookie vip_type 在概念版扫码登录时不会写入（接口才权威），
-        //    回退时不展示 VIP 判定，前端显示「未知」避免误导。
-        Ok(KugouAccountStatus {
-            logged_in: true,
-            user_id: credential_userid,
-            nickname: None,
-            vip: false,
-            vip_type: None,
-            vip_expire_at_ms: None,
-            listen_report_available: true,
-        })
     }
 
     async fn account_json(
@@ -638,8 +655,11 @@ impl KugouAdapter {
 
 #[async_trait]
 impl crate::catalog::KugouAccountAdapter for KugouAdapter {
-    async fn refresh_token(&self) -> Result<ProviderCredential, CatalogError> {
-        self.refresh_token().await
+    async fn refresh_token(
+        &self,
+        credential: &ProviderCredential,
+    ) -> Result<ProviderCredential, CatalogError> {
+        self.refresh_token(credential).await
     }
     async fn account_status(&self) -> Result<KugouAccountStatus, CatalogError> {
         self.account_status().await
@@ -807,10 +827,35 @@ impl SourceAdapter for KugouAdapter {
         parse_lrc_pair(&lyric, translation.as_deref())
             .map_err(|error| CatalogError::InvalidResponse(error.to_string()))
     }
+
+    async fn account_status(
+        &self,
+    ) -> Result<Option<crate::catalog::ProviderAccountStatus>, CatalogError> {
+        self.account_status_cached(false).await.map(Some)
+    }
+
+    async fn refresh_account_status(
+        &self,
+    ) -> Result<Option<crate::catalog::ProviderAccountStatus>, CatalogError> {
+        self.account_status_cached(true).await.map(Some)
+    }
+
+    fn invalidate_account_status(&self) {
+        if let Ok(mut guard) = self.account_cache.lock() {
+            guard.invalidate();
+        }
+    }
 }
 
 /// 酷狗拿不到播放流时的分类：响应明确带 vip=1 标志则需 VIP；
 /// 否则无法确认原因，返回 Unavailable（探测层按初始标注确认不可用）。
+fn epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 fn classify_kugou_resolve_failure(response: &Value) -> CatalogError {
     let vip = response
         .pointer("/data/vip")
@@ -1241,6 +1286,36 @@ mod tests {
         assert_eq!(detail["nickname"], "测试账号");
         assert_eq!(vip["vip_type"], "年费");
         assert_eq!(vip["expire_time"], 1_735_689_600u64);
+    }
+
+    #[test]
+    fn vip_result_is_kept_when_kugou_detail_request_failed() {
+        let credential = ProviderCredential::Kugou {
+            token: "token".to_owned(),
+            userid: "123".to_owned(),
+            dfid: "device".to_owned(),
+            cookies: BTreeMap::new(),
+        };
+        let vip = json!({
+            "data": {
+                "busi_vip": [{
+                    "is_vip": 1,
+                    "product_type": "svip",
+                    "vip_end_time": "2026-09-12 02:08:52"
+                }]
+            }
+        });
+
+        // `None` represents /user/detail failing while the VIP endpoint succeeds.
+        let status =
+            super::KugouAdapter::account_status_from_responses(&credential, None, Some(&vip), 42);
+
+        assert!(status.logged_in);
+        assert_eq!(status.user_id.as_deref(), Some("123"));
+        assert!(status.vip_known);
+        assert!(status.vip);
+        assert_eq!(status.vip_type.as_deref(), Some("svip"));
+        assert_eq!(status.checked_at_ms, 42);
     }
 
     #[test]

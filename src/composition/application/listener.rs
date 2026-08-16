@@ -95,6 +95,7 @@ impl ApplicationRuntime {
         &self,
         image: &DynamicImage,
         templates: &ResolvedTemplateArgs,
+        marker_hits: Option<Vec<crate::ui::template::TemplateHit>>,
     ) -> Result<Vec<ChatMessage>> {
         scan_chat_with_shared_ocr(
             &self.ui.ocr,
@@ -102,6 +103,7 @@ impl ApplicationRuntime {
             self.lifecycle.config.screen.chat_rect.into(),
             image,
             templates,
+            marker_hits,
         )
     }
 
@@ -537,9 +539,11 @@ impl ApplicationRuntime {
                                             .ui
                                             .chat_observations
                                             .begin_frame(frame.captured_at)?;
+                                        let marker_hits = frame.marker_hits_for_image();
                                         let messages = self.scan_chat_with_shared_ocr(
                                             &frame.image,
                                             &template_args,
+                                            marker_hits,
                                         );
                                         let scan_ms = elapsed_ms(scan_started);
                                         log::info!(target: "timing",
@@ -594,8 +598,12 @@ impl ApplicationRuntime {
                                 );
                                 let observation_frame =
                                     self.ui.chat_observations.begin_frame(frame.captured_at)?;
-                                let messages =
-                                    self.scan_chat_with_shared_ocr(&frame.image, &template_args);
+                                let marker_hits = frame.marker_hits_for_image();
+                                let messages = self.scan_chat_with_shared_ocr(
+                                    &frame.image,
+                                    &template_args,
+                                    marker_hits,
+                                );
                                 match messages {
                                     Ok(messages) => self.publish_primary_chat_observation(
                                         observation_frame,
@@ -1256,9 +1264,10 @@ pub(super) fn scan_chat_with_shared_ocr(
     chat_rect: Rect,
     image: &DynamicImage,
     templates: &ResolvedTemplateArgs,
+    marker_hits: Option<Vec<crate::ui::template::TemplateHit>>,
 ) -> Result<Vec<ChatMessage>> {
     let total_started = Instant::now();
-    let prepared = prepare_chat_scan(image, templates, chat_rect)?;
+    let prepared = prepare_chat_scan_with_markers(image, templates, chat_rect, marker_hits)?;
     let messages = recognize_prepared_chat(
         ocr,
         OcrPriority::ChatObservation,

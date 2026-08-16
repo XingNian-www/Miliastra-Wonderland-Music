@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::Result;
@@ -9,7 +9,7 @@ use crate::config::{OcrConfig, RectConfig, TemplateConfig};
 use crate::privacy::redacted_chat_text;
 use crate::runtime::ocr::{OcrImageBlock, OcrPriority, OcrRuntimeHandle, batch_recognize_blocks};
 use crate::ui::geometry::{Rect, clamp_i32, crop_canvas};
-use crate::ui::template::{TemplateHit, dedupe_hits, find_color_template_hits};
+use crate::ui::template::{TemplateHit, dedupe_hits, find_color_template_hit_groups};
 
 const CHAT_MARKER_SEARCH_WIDTH: u32 = 60;
 const CHAT_SCAN_RESULT_LOG_TARGET: &str = "chat_scan_result";
@@ -118,12 +118,24 @@ pub(crate) fn prepare_chat_scan(
     templates: &ResolvedTemplateArgs,
     chat_rect: Rect,
 ) -> Result<PreparedChatScan> {
+    prepare_chat_scan_with_markers(image, templates, chat_rect, None)
+}
+
+pub(crate) fn prepare_chat_scan_with_markers(
+    image: &DynamicImage,
+    templates: &ResolvedTemplateArgs,
+    chat_rect: Rect,
+    markers: Option<Vec<TemplateHit>>,
+) -> Result<PreparedChatScan> {
     let started = Instant::now();
     let crop_started = Instant::now();
     let chat = crop_canvas(image, chat_rect)?;
     let crop_ms = elapsed_ms(crop_started);
     let marker_started = Instant::now();
-    let markers = find_chat_markers(&chat, templates)?;
+    let markers = match markers {
+        Some(markers) => markers,
+        None => find_chat_markers(&chat, templates)?,
+    };
     let marker_ms = elapsed_ms(marker_started);
     let block_started = Instant::now();
     let blocks: Vec<(TemplateHit, Rect)> = markers
@@ -267,28 +279,24 @@ fn find_chat_markers(
         CHAT_MARKER_SEARCH_WIDTH.min(chat.width()),
         chat.height(),
     ));
+    let template_paths = [
+        templates.blue_template.as_path(),
+        templates.yellow_template.as_path(),
+        templates.pink_template.as_path(),
+    ];
+    let groups = find_color_template_hit_groups(
+        chat,
+        search_rect,
+        &template_paths,
+        templates.marker_threshold,
+    )?;
     let mut markers = Vec::new();
-    markers.extend(find_markers(
-        chat,
-        search_rect,
-        &templates.blue_template,
-        "blue",
-        templates.marker_threshold,
-    )?);
-    markers.extend(find_markers(
-        chat,
-        search_rect,
-        &templates.yellow_template,
-        "yellow",
-        templates.marker_threshold,
-    )?);
-    markers.extend(find_markers(
-        chat,
-        search_rect,
-        &templates.pink_template,
-        "pink",
-        templates.marker_threshold,
-    )?);
+    for (mut hits, marker_type) in groups.into_iter().zip(["blue", "yellow", "pink"]) {
+        for hit in &mut hits {
+            hit.kind = marker_type.to_string();
+        }
+        markers.extend(hits);
+    }
     Ok(dedupe_chat_marker_hits(
         markers,
         templates.marker_dedupe_x,
@@ -329,20 +337,6 @@ fn dedupe_chat_marker_hits(
             .then_with(|| left.x.cmp(&right.x))
     });
     dedupe_hits(by_score, tolerance_x, tolerance_y)
-}
-
-fn find_markers(
-    image: &DynamicImage,
-    search_rect: Option<Rect>,
-    template: &Path,
-    marker_type: &str,
-    threshold: f32,
-) -> Result<Vec<TemplateHit>> {
-    let mut hits = find_color_template_hits(image, search_rect, template, threshold)?;
-    for hit in &mut hits {
-        hit.kind = marker_type.to_string();
-    }
-    Ok(hits)
 }
 
 fn make_message_block(
@@ -395,15 +389,28 @@ fn next_marker<'a>(
         .min_by_key(|candidate| candidate.y)
 }
 
+pub(crate) fn scan_chat_markers(
+    image: &DynamicImage,
+    templates: &ResolvedTemplateArgs,
+    chat_rect: RectConfig,
+) -> Result<Vec<TemplateHit>> {
+    let chat = crop_canvas(image, chat_rect.into())?;
+    find_chat_markers(&chat, templates)
+}
+
 pub(crate) fn count_chat_markers(
     image: &DynamicImage,
     templates: &ResolvedTemplateArgs,
     chat_rect: RectConfig,
 ) -> Result<(usize, usize, usize)> {
-    let chat = crop_canvas(image, chat_rect.into())?;
-    let markers = find_chat_markers(&chat, templates)?;
+    let markers = scan_chat_markers(image, templates, chat_rect)?;
     let counts = chat_marker_counts(&markers);
     Ok((counts.blue, counts.yellow, counts.pink))
+}
+
+pub(crate) fn count_scanned_chat_markers(markers: &[TemplateHit]) -> (usize, usize, usize) {
+    let counts = chat_marker_counts(markers);
+    (counts.blue, counts.yellow, counts.pink)
 }
 
 fn elapsed_ms(started: Instant) -> u128 {

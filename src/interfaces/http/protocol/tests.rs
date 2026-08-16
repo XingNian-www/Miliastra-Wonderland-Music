@@ -866,8 +866,31 @@ impl HttpLoginPort for HttpTestLoginPort {
 
     fn account_status(
         &self,
-        _provider: ProviderId,
+        provider: ProviderId,
     ) -> Result<Option<miliastra_playback::ProviderAccountStatus>, HttpLoginError> {
+        if matches!(provider, ProviderId::Kugou | ProviderId::Netease) {
+            return Ok(Some(miliastra_playback::ProviderAccountStatus {
+                provider: provider.to_string(),
+                logged_in: true,
+                user_id: Some("123".to_owned()),
+                ..miliastra_playback::ProviderAccountStatus::default()
+            }));
+        }
+        Ok(None)
+    }
+
+    fn refresh_account_status(
+        &self,
+        provider: ProviderId,
+    ) -> Result<Option<miliastra_playback::ProviderAccountStatus>, HttpLoginError> {
+        if provider == ProviderId::Kugou {
+            return Ok(Some(miliastra_playback::ProviderAccountStatus {
+                provider: "kugou".to_owned(),
+                logged_in: true,
+                user_id: Some("123".to_owned()),
+                ..miliastra_playback::ProviderAccountStatus::default()
+            }));
+        }
         Ok(None)
     }
 
@@ -1273,6 +1296,40 @@ fn native_player_and_login_routes_use_structured_json_without_secrets() {
     assert_eq!(kugou_status["userId"], "123");
     assert_eq!(kugou_status["vip"], true);
     assert!(kugou_status.get("token").is_none());
+
+    let account_status = http_get(address, "/player/account/status?provider=kugou", None);
+    assert_eq!(account_status.status_line, "HTTP/1.1 200 OK");
+    let account_status: Value =
+        serde_json::from_str(&account_status.body).expect("account status JSON");
+    assert_eq!(account_status["provider"], "kugou");
+
+    for target in ["/player/account/status", "/player/account/status?provider="] {
+        let account_status = http_get(address, target, None);
+        assert_eq!(account_status.status_line, "HTTP/1.1 200 OK");
+        let account_status: Value =
+            serde_json::from_str(&account_status.body).expect("default account status JSON");
+        assert_eq!(account_status["provider"], "netease");
+    }
+
+    let account_refresh = http_post_json(
+        address,
+        "/player/account/refresh?provider=kugou",
+        "{}",
+        None,
+    );
+    assert_eq!(account_refresh.status_line, "HTTP/1.1 200 OK");
+    let account_refresh: Value =
+        serde_json::from_str(&account_refresh.body).expect("account refresh JSON");
+    assert_eq!(account_refresh["provider"], "kugou");
+    assert_eq!(account_refresh["loggedIn"], true);
+
+    let account_refresh = http_post_json(
+        address,
+        "/player/account/refresh?provider=%20kugou%20",
+        "{}",
+        None,
+    );
+    assert_eq!(account_refresh.status_line, "HTTP/1.1 200 OK");
 
     let report = http_post_json(address, "/player/kugou/claim-vip", "{}", None);
     assert_eq!(report.status_line, "HTTP/1.1 200 OK");

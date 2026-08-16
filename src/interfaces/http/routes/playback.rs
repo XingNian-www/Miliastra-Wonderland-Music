@@ -96,7 +96,8 @@ pub(super) fn playback_statistics_reset_route(
     state: &HttpSharedState,
 ) -> std::result::Result<String, AppError> {
     let provider = query_value(query, "provider")
-        .filter(|value| !value.trim().is_empty())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
         .ok_or_else(|| bad_request("缺少provider参数"))?
         .parse::<ProviderId>()
         .map_err(|_| bad_request("provider参数无效"))?;
@@ -457,6 +458,9 @@ pub(super) fn player_account_status_route(
     state: &HttpSharedState,
 ) -> std::result::Result<String, AppError> {
     let provider = query_value(query, "provider")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        // 保持旧接口兼容：省略 provider 时查询原本的网易云账号状态。
         .unwrap_or("netease")
         .parse::<ProviderId>()
         .map_err(|_| bad_request("provider参数无效"))?;
@@ -465,6 +469,27 @@ pub(super) fn player_account_status_route(
             .application
             .login
             .account_status(provider)
+            .map_err(login_http_error)?,
+    )
+    .map_err(internal_error)
+}
+
+/// POST /player/account/refresh?provider= :跳过缓存重新查询账号/VIP状态。
+pub(super) fn player_account_refresh_route(
+    query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let provider = query_value(query, "provider")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| bad_request("缺少provider参数"))?
+        .parse::<ProviderId>()
+        .map_err(|_| bad_request("provider参数无效"))?;
+    serde_json::to_string(
+        &state
+            .application
+            .login
+            .refresh_account_status(provider)
             .map_err(login_http_error)?,
     )
     .map_err(internal_error)

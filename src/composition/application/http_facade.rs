@@ -692,6 +692,15 @@ impl HttpLoginPort for ApplicationHttpLoginFacade {
         self.manager.account_status(provider).map_err(login_error)
     }
 
+    fn refresh_account_status(
+        &self,
+        provider: ProviderId,
+    ) -> Result<Option<miliastra_playback::ProviderAccountStatus>, HttpLoginError> {
+        self.manager
+            .refresh_account_status(provider)
+            .map_err(login_error)
+    }
+
     fn kugou_claim_vip(&self) -> Result<miliastra_playback::KugouListenReport, HttpLoginError> {
         self.manager.kugou_claim_vip().map_err(login_error)
     }

@@ -630,7 +630,7 @@ impl ApplicationRuntime {
             .context("等待一级聊天确认基线观察")?
             .map_err(|failure| anyhow!("建立一级聊天确认基线失败：{failure}"))?;
         let template_args = self.ui.chat_templates.clone();
-        let messages = self.scan_chat_with_shared_ocr(&image, &template_args)?;
+        let messages = self.scan_chat_with_shared_ocr(&image, &template_args, None)?;
         let observed = self.ui.chat_observations.observe_primary(messages)?;
         let cursor = match cursor_before_scan {
             Some(cursor) => Some(cursor),
@@ -662,7 +662,8 @@ impl ApplicationRuntime {
                     resize: true,
                 };
                 let frame = load_frame(&canvas, &self.ui.game_ui)?;
-                let messages = self.scan_chat_with_shared_ocr(&frame.image, &template_args)?;
+                let messages =
+                    self.scan_chat_with_shared_ocr(&frame.image, &template_args, None)?;
                 let observed = self.ui.chat_observations.observe_primary(messages)?;
                 let Some(current_cursor) = *cursor else {
                     *cursor = self.ui.chat_observations.primary_cursor()?;

@@ -273,31 +273,42 @@ impl UiTemplateProbeEvidence {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct UiMarkerProbeEvidence {
     search_rect: UiEvidenceRect,
+    coordinate_size: (u32, u32),
     blue_count: usize,
     yellow_count: usize,
     pink_count: usize,
+    marker_hits: Vec<crate::ui::template::TemplateHit>,
 }
 
 impl UiMarkerProbeEvidence {
-    pub fn new(
+    pub(crate) fn new(
         search_rect: UiEvidenceRect,
+        coordinate_size: (u32, u32),
         blue_count: usize,
         yellow_count: usize,
         pink_count: usize,
+        marker_hits: Vec<crate::ui::template::TemplateHit>,
     ) -> Self {
         Self {
             search_rect,
+            coordinate_size,
             blue_count,
             yellow_count,
             pink_count,
+            marker_hits,
         }
     }
 
     pub fn search_rect(&self) -> UiEvidenceRect {
         self.search_rect
+    }
+
+    /// Dimensions of the normalized image on which the marker hits were found.
+    pub(crate) fn coordinate_size(&self) -> (u32, u32) {
+        self.coordinate_size
     }
 
     pub fn blue_count(&self) -> usize {
@@ -310,6 +321,10 @@ impl UiMarkerProbeEvidence {
 
     pub fn pink_count(&self) -> usize {
         self.pink_count
+    }
+
+    pub(crate) fn marker_hits(&self) -> &[crate::ui::template::TemplateHit] {
+        &self.marker_hits
     }
 }
 

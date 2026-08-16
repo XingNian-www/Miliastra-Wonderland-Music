@@ -83,6 +83,7 @@ impl AppModerationVotePort {
             self.chat_rect,
             &frame.image,
             &self.template_args,
+            None,
         ) else {
             return DecisionScreenLock::default();
         };
@@ -115,6 +116,7 @@ impl ModerationVotePort for AppModerationVotePort {
             self.chat_rect,
             &frame.image,
             &self.template_args,
+            None,
         )
         .context("管理投票 OCR 失败")?;
         Ok(messages

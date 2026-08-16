@@ -6,3 +6,4 @@
 /.build
 /dist
 .bitfun/
+/.bitfun/search/flashgrep-index/

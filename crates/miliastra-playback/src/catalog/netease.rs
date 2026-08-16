@@ -1,7 +1,7 @@
 //! Minimal native NetEase Cloud Music adapter.
 
 use std::collections::BTreeMap;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aes::Aes128;
 use async_trait::async_trait;
@@ -15,8 +15,8 @@ use serde_json::Value;
 use url::Url;
 
 use crate::catalog::{
-    CatalogError, PlaybackEligibility, ProviderAccountStatus, ProviderSearchCandidate,
-    SourceAdapter,
+    AccountStatusCache, CatalogError, PlaybackEligibility, ProviderAccountStatus,
+    ProviderSearchCandidate, SourceAdapter,
 };
 use crate::credentials::{CredentialStore, ProviderCredential};
 use crate::domain::{ResolverLocator, SearchSpec, Song, SongKey, StreamSource};
@@ -90,20 +90,12 @@ pub struct NeteaseAdapter {
     lyrics_url: Url,
     account_url: Url,
     vip_url: Url,
-    /// 账号状态缓存（成功 5 分钟/失败 60 秒），避免轮询频繁打账号接口。
-    account_cache: std::sync::Arc<
-        std::sync::Mutex<
-            Option<(
-                crate::catalog::ProviderAccountStatus,
-                std::time::Instant,
-                bool,
-            )>,
-        >,
-    >,
+    /// 账号状态采用30分钟乐观缓存，避免轮询频繁打账号接口。
+    account_cache: std::sync::Arc<std::sync::Mutex<AccountStatusCache>>,
 }
 
 /// 网易账号状态缓存有效期（查询成功时）。
-const ACCOUNT_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+const ACCOUNT_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
 /// 查询失败（未登录/风控/超时）时的短缓存。
 const ACCOUNT_CACHE_FAILED_TTL: Duration = Duration::from_secs(60);
 
@@ -127,7 +119,9 @@ impl NeteaseAdapter {
                 .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?,
             vip_url: Url::parse(VIP_INFO_URL)
                 .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?,
-            account_cache: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            account_cache: std::sync::Arc::new(
+                std::sync::Mutex::new(AccountStatusCache::default()),
+            ),
         })
     }
 
@@ -227,10 +221,58 @@ impl NeteaseAdapter {
     }
 
     /// 查询账号状态（weapi /nuser/account/get）。未登录返回 logged_in=false。
+    async fn account_status_cached(
+        &self,
+        force: bool,
+    ) -> Result<Option<ProviderAccountStatus>, CatalogError> {
+        let now = std::time::Instant::now();
+        let checked_at_ms = epoch_ms();
+        let (generation, cached) = {
+            let guard = self.account_cache.lock().map_err(|_| {
+                CatalogError::Transient("NetEase account cache poisoned".to_owned())
+            })?;
+            let cached = (!force)
+                .then(|| guard.cached(ACCOUNT_CACHE_TTL, ACCOUNT_CACHE_FAILED_TTL))
+                .flatten();
+            (guard.generation(), cached)
+        };
+        if let Some(status) = cached {
+            return Ok(Some(status.clone()));
+        }
+        let result = self.account_status_uncached().await;
+        let mut guard = self
+            .account_cache
+            .lock()
+            .map_err(|_| CatalogError::Transient("NetEase account cache poisoned".to_owned()))?;
+        match result {
+            Ok(Some(status)) => {
+                guard.store_if_current(generation, status.clone(), now, false);
+                Ok(Some(status))
+            }
+            Ok(None) => Ok(None),
+            Err(error) => {
+                if let Some(stale) = guard.stale_for_current(generation, &error) {
+                    guard.store_if_current(generation, stale.clone(), now, true);
+                    Ok(Some(stale))
+                } else if let Some(failed) =
+                    guard.failed_for_current(generation, PROVIDER, checked_at_ms, &error)
+                {
+                    guard.store_if_current(generation, failed, now, true);
+                    Err(error)
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
     async fn account_status_uncached(&self) -> Result<Option<ProviderAccountStatus>, CatalogError> {
+        let checked_at_ms = epoch_ms();
         let Ok(credential) = self.credential() else {
             return Ok(Some(ProviderAccountStatus {
+                provider: PROVIDER.to_owned(),
                 logged_in: false,
+                checked_at_ms,
                 ..ProviderAccountStatus::default()
             }));
         };
@@ -251,9 +293,11 @@ impl NeteaseAdapter {
             .await
             .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?;
         let code = value.get("code").and_then(Value::as_i64);
-        if code.is_some_and(|code| code == 301 || code == 400) {
+        if code.is_some_and(|code| code == 301 || code == 400 || code == 401) {
             return Ok(Some(ProviderAccountStatus {
+                provider: PROVIDER.to_owned(),
                 logged_in: false,
+                checked_at_ms,
                 ..ProviderAccountStatus::default()
             }));
         }
@@ -275,6 +319,7 @@ impl NeteaseAdapter {
             .vip_expire_at_ms(&credential, profile.get("userId"))
             .await;
         Ok(Some(ProviderAccountStatus {
+            provider: PROVIDER.to_owned(),
             logged_in: true,
             user_id: profile
                 .get("userId")
@@ -284,10 +329,14 @@ impl NeteaseAdapter {
                 .get("nickname")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
+            vip_known: true,
             vip: vip_type != 0,
             vip_type: Some(vip_type.to_string()),
             vip_expire_at_ms,
             login_method: None,
+            checked_at_ms,
+            stale: false,
+            last_error: None,
         }))
     }
 
@@ -423,38 +472,29 @@ impl SourceAdapter for NeteaseAdapter {
     }
 
     async fn account_status(&self) -> Result<Option<ProviderAccountStatus>, CatalogError> {
-        let now = std::time::Instant::now();
-        if let Ok(guard) = self.account_cache.lock()
-            && let Some((status, cached_at, failed)) = guard.as_ref()
-            && cached_at.elapsed()
-                < if *failed {
-                    ACCOUNT_CACHE_FAILED_TTL
-                } else {
-                    ACCOUNT_CACHE_TTL
-                }
-        {
-            return Ok(Some(status.clone()));
-        }
-        let result = self.account_status_uncached().await;
+        self.account_status_cached(false).await
+    }
+
+    async fn refresh_account_status(&self) -> Result<Option<ProviderAccountStatus>, CatalogError> {
+        self.account_status_cached(true).await
+    }
+
+    fn invalidate_account_status(&self) {
         if let Ok(mut guard) = self.account_cache.lock() {
-            match &result {
-                Ok(Some(status)) => *guard = Some((status.clone(), now, false)),
-                // 失败（风控/超时）时保留上次成功值并标记失败，60 秒后重试。
-                _ => {
-                    let cached = guard
-                        .as_ref()
-                        .map(|(status, ..)| status.clone())
-                        .unwrap_or_default();
-                    *guard = Some((cached, now, true));
-                }
-            }
+            guard.invalidate();
         }
-        result
     }
 }
 
 /// 网易播放 URL 获取失败时的分类：仅返回试听流（freeTrialInfo）视为版权受限；
 /// 其余保持原错误（探测层按初始标注确认不可用）。
+fn epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 fn classify_netease_resolve_failure(response: &Value, error: CatalogError) -> CatalogError {
     let preview_only = response
         .pointer("/data/0")

@@ -41,6 +41,10 @@ trait LoginPlaybackPort: Send + Sync {
         &self,
         provider: ProviderId,
     ) -> Result<Option<miliastra_playback::ProviderAccountStatus>, PlaybackError>;
+    fn refresh_account_status(
+        &self,
+        provider: ProviderId,
+    ) -> Result<Option<miliastra_playback::ProviderAccountStatus>, PlaybackError>;
     fn kugou_claim_vip(&self) -> Result<miliastra_playback::KugouListenReport, PlaybackError>;
     fn kugou_upgrade_vip(&self) -> Result<miliastra_playback::KugouListenReport, PlaybackError>;
     fn begin_login(&self, provider: ProviderId) -> Result<LoginSession, PlaybackError>;
@@ -99,6 +103,13 @@ impl LoginPlaybackPort for PlaybackHandle {
         PlaybackHandle::account_status(self, provider)
     }
 
+    fn refresh_account_status(
+        &self,
+        provider: ProviderId,
+    ) -> Result<Option<miliastra_playback::ProviderAccountStatus>, PlaybackError> {
+        PlaybackHandle::refresh_account_status(self, provider)
+    }
+
     fn kugou_claim_vip(&self) -> Result<miliastra_playback::KugouListenReport, PlaybackError> {
         PlaybackHandle::kugou_claim_vip(self)
     }
@@ -139,6 +150,8 @@ trait ManagedChild: Send {
 struct SpawnedHelper {
     child: Box<dyn ManagedChild>,
     stdout: Box<dyn Read + Send>,
+    /// 持续读取以避免 sidecar 的 stderr 管道写满后阻塞。
+    stderr: Box<dyn Read + Send>,
 }
 
 trait HelperLauncher: Send + Sync {
@@ -284,7 +297,9 @@ impl HelperLauncher for CommandHelperLauncher {
             .arg(timeout.as_secs().max(1).to_string())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            // 持续读取 stderr，避免 sidecar 因管道写满而阻塞。其内容可能含有
+            // 二维码 URL 或认证参数，不能转发到主程序日志。
+            .stderr(Stdio::piped());
         // 酷狗概念版扫码登录必须使用与 sidecar 相同的设备标识，
         // 否则扫码 token 绑定匿名设备，概念版 API 会拒绝（20018）。
         if provider == ProviderId::Kugou
@@ -299,9 +314,16 @@ impl HelperLauncher for CommandHelperLauncher {
                 "login helper stdout is unavailable",
             )
         })?;
+        let stderr = child.stderr.take().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "login helper stderr is unavailable",
+            )
+        })?;
         Ok(SpawnedHelper {
             child: Box::new(CommandChild { child }),
             stdout: Box::new(stdout),
+            stderr: Box::new(stderr),
         })
     }
 }
@@ -673,6 +695,7 @@ impl LoginHelperManager {
                     worker_cancel,
                     worker_child,
                     spawned.stdout,
+                    spawned.stderr,
                     worker_profile,
                 );
             });
@@ -764,6 +787,16 @@ impl LoginHelperManager {
         self.inner
             .playback
             .account_status(provider)
+            .map_err(|error| playback_failure(error, Some(provider)))
+    }
+
+    pub(crate) fn refresh_account_status(
+        &self,
+        provider: ProviderId,
+    ) -> Result<Option<miliastra_playback::ProviderAccountStatus>, LoginHelperFailure> {
+        self.inner
+            .playback
+            .refresh_account_status(provider)
             .map_err(|error| playback_failure(error, Some(provider)))
     }
 
@@ -930,6 +963,7 @@ fn run_helper(
     cancel: Arc<AtomicBool>,
     child: SharedChild,
     mut stdout: Box<dyn Read + Send>,
+    stderr: Box<dyn Read + Send>,
     profile: PathBuf,
 ) {
     let deadline = Instant::now() + inner.timeout;
@@ -940,6 +974,17 @@ fn run_helper(
             let result = read_limited(&mut *stdout);
             let _ = output_tx.send(result);
         });
+    // 登录助手可能在 stderr 写入二维码 URL 或认证参数。持续排空该管道，
+    // 但绝不记录原文，避免敏感信息进入主程序日志。
+    {
+        let mut stderr = stderr;
+        thread::Builder::new()
+            .name("login-helper-diagnostic".to_owned())
+            .spawn(move || {
+                drain_helper_stderr(&mut *stderr);
+            })
+            .ok();
+    }
 
     let mut failure = if reader.is_err() {
         Some(manager_failure(
@@ -1400,6 +1445,15 @@ fn read_limited(reader: &mut dyn Read) -> Result<Vec<u8>, &'static str> {
     }
 }
 
+fn drain_helper_stderr(reader: &mut dyn Read) {
+    let mut buffer = [0_u8; 2048];
+    while let Ok(read) = reader.read(&mut buffer) {
+        if read == 0 {
+            break;
+        }
+    }
+}
+
 fn terminate_child(child: &SharedChild) {
     if let Ok(mut child) = child.lock()
         && let Some(child) = child.as_mut()
@@ -1575,6 +1629,13 @@ mod tests {
         }
 
         fn account_status(
+            &self,
+            _provider: ProviderId,
+        ) -> Result<Option<miliastra_playback::ProviderAccountStatus>, PlaybackError> {
+            Ok(None)
+        }
+
+        fn refresh_account_status(
             &self,
             _provider: ProviderId,
         ) -> Result<Option<miliastra_playback::ProviderAccountStatus>, PlaybackError> {
@@ -1797,6 +1858,7 @@ mod tests {
             Ok(SpawnedHelper {
                 child: Box::new(child),
                 stdout,
+                stderr: Box::new(Cursor::new(Vec::new())),
             })
         }
     }
@@ -1861,6 +1923,16 @@ mod tests {
             },
         ))
         .unwrap()
+    }
+
+    #[test]
+    fn helper_stderr_is_drained_without_interpreting_its_contents() {
+        let diagnostic = b"https://login.example.invalid/qr?token=secret-token\n";
+        let mut stderr = Cursor::new(diagnostic.to_vec());
+
+        drain_helper_stderr(&mut stderr);
+
+        assert_eq!(stderr.position(), diagnostic.len() as u64);
     }
 
     #[test]

@@ -16,7 +16,9 @@ use crate::catalog::{
     SourceAdapter, SourceCatalog,
 };
 use crate::core::{PlaybackCore, PlaybackCoreError};
-use crate::credentials::{CredentialStatus, CredentialStore, ProviderCredential};
+use crate::credentials::{
+    CredentialRefreshLease, CredentialStatus, CredentialStore, ProviderCredential,
+};
 use crate::domain::{
     EndBehavior, EndCause, EngineState, Failure, PlaybackSnapshot as EngineSnapshot, SearchSpec,
     SessionRef,
@@ -31,7 +33,7 @@ const PRELOAD_CONCURRENCY_LIMIT: usize = 4;
 /// 预加载等待队列长度上限：队列满时丢弃新的预加载请求（fire-and-forget）。
 const PRELOAD_QUEUE_LIMIT: usize = 32;
 const SOURCE_TIMEOUT: Duration = Duration::from_secs(15);
-const REFRESH_CHECK_INTERVAL_MS: u64 = 24 * 60 * 60 * 1000;
+const REFRESH_CHECK_INTERVAL_MS: u64 = 12 * 60 * 60 * 1000;
 const REFRESH_FAILURE_BACKOFF_MS: u64 = 15 * 60 * 1000;
 
 type Reply<T> = std_mpsc::SyncSender<Result<T, PlaybackError>>;
@@ -164,6 +166,7 @@ enum Command {
     RefreshCredential(ProviderId, Reply<CredentialStatus>),
     KugouAccountStatus(Reply<KugouAccountStatus>),
     AccountStatus(ProviderId, Reply<Option<ProviderAccountStatus>>),
+    RefreshAccountStatus(ProviderId, Reply<Option<ProviderAccountStatus>>),
     KugouClaimVip(Reply<KugouListenReport>),
     KugouUpgradeVip(Reply<KugouListenReport>),
     SaveCredential(ProviderCredential, Reply<CredentialStatus>),
@@ -452,6 +455,13 @@ impl PlaybackHandle {
         provider: ProviderId,
     ) -> Result<Option<ProviderAccountStatus>, PlaybackError> {
         self.request(|reply| Command::AccountStatus(provider, reply))
+    }
+
+    pub fn refresh_account_status(
+        &self,
+        provider: ProviderId,
+    ) -> Result<Option<ProviderAccountStatus>, PlaybackError> {
+        self.request(|reply| Command::RefreshAccountStatus(provider, reply))
     }
 
     pub fn kugou_claim_vip(&self) -> Result<KugouListenReport, PlaybackError> {
@@ -861,9 +871,11 @@ async fn run_commands(
                         .result
                         .map_err(PlaybackError::from)
                         .and_then(|()| {
-                            credentials
+                            let status = credentials
                                 .save(pending.provider.as_str(), pending.credential)
-                                .map_err(internal_error)
+                                .map_err(internal_error)?;
+                            let _ = core.invalidate_account_status(pending.provider);
+                            Ok(status)
                         }),
                     Some(Err(error)) if error.is_cancelled() => Err(PlaybackError::Failure(
                         Failure::new("playback_cancelled", "credential validation was cancelled"),
@@ -1068,6 +1080,9 @@ async fn run_commands(
                             "该平台不支持凭据刷新",
                         ))),
                     };
+                    if result.is_ok() {
+                        let _ = core.invalidate_account_status(provider);
+                    }
                     let _ = reply.send(result);
                 });
             }
@@ -1091,31 +1106,52 @@ async fn run_commands(
                     let _ = reply.send(result);
                 });
             }
+            Command::RefreshAccountStatus(provider, reply) => {
+                let core = core.clone();
+                tokio::spawn(async move {
+                    let result = core
+                        .refresh_account_status(provider)
+                        .await
+                        .map_err(PlaybackError::from);
+                    let _ = reply.send(result);
+                });
+            }
             Command::KugouClaimVip(reply) => {
                 let core = core.clone();
                 tokio::spawn(async move {
-                    let _ = reply.send(core.kugou_claim_vip().await.map_err(PlaybackError::from));
+                    let result = core.kugou_claim_vip().await.map_err(PlaybackError::from);
+                    let _ = core.invalidate_account_status(ProviderId::Kugou);
+                    let _ = reply.send(result);
                 });
             }
             Command::KugouUpgradeVip(reply) => {
                 let core = core.clone();
                 tokio::spawn(async move {
-                    let _ = reply.send(core.kugou_upgrade_vip().await.map_err(PlaybackError::from));
+                    let result = core.kugou_upgrade_vip().await.map_err(PlaybackError::from);
+                    let _ = core.invalidate_account_status(ProviderId::Kugou);
+                    let _ = reply.send(result);
                 });
             }
             Command::SaveCredential(credential, reply) => {
                 let provider = credential.provider();
                 let result = credentials
                     .save(provider, credential)
-                    .map_err(internal_error);
+                    .map_err(internal_error)
+                    .inspect(|_| {
+                        if let Ok(provider) = provider.parse::<ProviderId>() {
+                            let _ = core.invalidate_account_status(provider);
+                        }
+                    });
                 let _ = reply.send(result);
             }
             Command::Logout(provider, reply) => {
-                let _ = reply.send(
-                    credentials
-                        .remove(provider.as_str())
-                        .map_err(internal_error),
-                );
+                let result = credentials
+                    .remove(provider.as_str())
+                    .map_err(internal_error)
+                    .inspect(|_| {
+                        let _ = core.invalidate_account_status(provider);
+                    });
+                let _ = reply.send(result);
             }
             Command::BeginLogin(provider, reply) => {
                 let result = core
@@ -1491,23 +1527,50 @@ async fn refresh_kugou_credential(
     credentials: &CredentialStore,
 ) -> Result<CredentialStatus, PlaybackError> {
     let provider = ProviderId::Kugou;
-    let _ = credentials.mark_refresh_started(provider.as_str());
-    let result = match core.refresh_kugou_credential().await {
+    let Some(refresh_lease) = credentials
+        .try_mark_refresh_started(provider.as_str())
+        .map_err(internal_error)?
+    else {
+        return Err(refresh_in_progress(provider));
+    };
+    let snapshot = match credentials.snapshot(provider.as_str()) {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => {
+            let result = Err(PlaybackError::Failure(Failure::new(
+                "provider_auth_required",
+                "该平台尚未登录",
+            )));
+            return finish_refresh(credentials, provider, None, false, refresh_lease, result).await;
+        }
+        Err(error) => {
+            let result = Err(internal_error(error));
+            return finish_refresh(credentials, provider, None, false, refresh_lease, result).await;
+        }
+    };
+    let (result, credential_written) = match core
+        .refresh_kugou_credential(&snapshot.credential)
+        .await
+    {
         Ok(credential) => {
-            // 凭证落盘(含 fsync/ACL)移到阻塞线程池,避免阻塞 tokio worker。
-            let store = credentials.clone();
-            let provider = provider.as_str();
-            match tokio::task::spawn_blocking(move || store.save(provider, credential)).await {
-                Ok(saved) => saved.map_err(internal_error),
-                Err(error) => Err(PlaybackError::Failure(Failure::new(
-                    "credential_save_join",
-                    error.to_string(),
-                ))),
+            match save_refreshed_credential(credentials, provider, snapshot.revision, credential)
+                .await
+            {
+                Ok(Some(status)) => (Ok(status), true),
+                Ok(None) => (Err(refresh_superseded()), false),
+                Err(error) => (Err(error), false),
             }
         }
-        Err(error) => Err(PlaybackError::from(error)),
+        Err(error) => (Err(refresh_failure(error)), false),
     };
-    finish_refresh(credentials, provider, result).await
+    finish_refresh(
+        credentials,
+        provider,
+        Some(snapshot.revision),
+        credential_written,
+        refresh_lease,
+        result,
+    )
+    .await
 }
 
 /// 手动刷新支持通用刷新协议的平台凭据（QQ 音乐、哔哩哔哩）。
@@ -1516,41 +1579,67 @@ async fn refresh_manual_credential(
     credentials: &CredentialStore,
     provider: ProviderId,
 ) -> Result<CredentialStatus, PlaybackError> {
-    let _ = credentials.mark_refresh_started(provider.as_str());
-    let result = match credentials.get(provider.as_str()) {
-        Err(error) => Err(internal_error(error)),
-        Ok(None) => Err(PlaybackError::Failure(Failure::new(
-            "provider_auth_required",
-            "该平台尚未登录",
-        ))),
-        Ok(Some(credential)) => match core.refresh_credential(provider, &credential).await {
-            Ok(Some(refreshed)) => {
-                // 凭证落盘(含 fsync/ACL)移到阻塞线程池。
-                let store = credentials.clone();
-                let provider = provider.as_str();
-                match tokio::task::spawn_blocking(move || store.save(provider, refreshed)).await {
-                    Ok(saved) => saved.map_err(internal_error),
-                    Err(error) => Err(PlaybackError::Failure(Failure::new(
-                        "credential_save_join",
-                        error.to_string(),
-                    ))),
-                }
+    let Some(refresh_lease) = credentials
+        .try_mark_refresh_started(provider.as_str())
+        .map_err(internal_error)?
+    else {
+        return Err(refresh_in_progress(provider));
+    };
+    let snapshot = match credentials.snapshot(provider.as_str()) {
+        Err(error) => {
+            let result = Err(internal_error(error));
+            return finish_refresh(credentials, provider, None, false, refresh_lease, result).await;
+        }
+        Ok(None) => {
+            let result = Err(PlaybackError::Failure(Failure::new(
+                "provider_auth_required",
+                "该平台尚未登录",
+            )));
+            return finish_refresh(credentials, provider, None, false, refresh_lease, result).await;
+        }
+        Ok(Some(snapshot)) => snapshot,
+    };
+    let (result, credential_written) = match core
+        .refresh_credential(provider, &snapshot.credential)
+        .await
+    {
+        Ok(Some(refreshed)) => {
+            match save_refreshed_credential(credentials, provider, snapshot.revision, refreshed)
+                .await
+            {
+                Ok(Some(status)) => (Ok(status), true),
+                Ok(None) => (Err(refresh_superseded()), false),
+                Err(error) => (Err(error), false),
             }
-            // 凭据仍有效、无需刷新：视为正常完成，不记录失败状态，
-            // 否则 WEB 面板会把「无需刷新」误显示为刷新失败。
-            Ok(None) => credentials
+        }
+        // 凭据仍有效、无需刷新：视为正常完成，不记录失败状态，
+        // 否则 WEB 面板会把「无需刷新」误显示为刷新失败。
+        Ok(None) => (
+            credentials
                 .status(provider.as_str())
                 .map_err(internal_error),
-            Err(error) => Err(PlaybackError::from(error)),
-        },
+            false,
+        ),
+        Err(error) => (Err(refresh_failure(error)), false),
     };
-    finish_refresh(credentials, provider, result).await
+    finish_refresh(
+        credentials,
+        provider,
+        Some(snapshot.revision),
+        credential_written,
+        refresh_lease,
+        result,
+    )
+    .await
 }
 
 /// 记录刷新结果元数据并返回原始结果。
 async fn finish_refresh(
     credentials: &CredentialStore,
     provider: ProviderId,
+    started_revision: Option<u64>,
+    credential_written: bool,
+    _refresh_lease: CredentialRefreshLease,
     result: Result<CredentialStatus, PlaybackError>,
 ) -> Result<CredentialStatus, PlaybackError> {
     let metadata_result = result.as_ref().map(|_| ()).map_err(ToString::to_string);
@@ -1559,42 +1648,99 @@ async fn finish_refresh(
     } else {
         REFRESH_FAILURE_BACKOFF_MS
     }));
-    let _ = credentials.mark_refresh_finished(provider.as_str(), metadata_result, next_check);
+    let Some(started_revision) = started_revision else {
+        // No credential snapshot was captured. This can happen for an unconfigured provider or
+        // when logout won the race; neither case may leave a failed refresh state behind.
+        let _ = credentials.discard_refresh(provider.as_str());
+        return result;
+    };
+    let expected_revision = if credential_written {
+        started_revision.wrapping_add(1)
+    } else {
+        started_revision
+    };
+    // 网络请求期间若用户退出或重新登录，旧结果不能改写新的元数据或下次检查时间。
+    let _ = credentials.mark_refresh_finished_if_current_revision(
+        provider.as_str(),
+        Some(expected_revision),
+        metadata_result,
+        next_check,
+    );
     result
 }
 
+async fn save_refreshed_credential(
+    credentials: &CredentialStore,
+    provider: ProviderId,
+    expected_revision: u64,
+    credential: ProviderCredential,
+) -> Result<Option<CredentialStatus>, PlaybackError> {
+    let store = credentials.clone();
+    tokio::task::spawn_blocking(move || {
+        store.save_if_revision(provider.as_str(), expected_revision, credential)
+    })
+    .await
+    .map_err(|error| {
+        PlaybackError::Failure(Failure::new("credential_save_join", error.to_string()))
+    })?
+    .map_err(internal_error)
+}
+
+fn refresh_in_progress(provider: ProviderId) -> PlaybackError {
+    PlaybackError::Failure(
+        Failure::new("credential_refresh_in_progress", "该平台凭据正在刷新")
+            .with_provider(provider.as_str()),
+    )
+}
+
+fn refresh_superseded() -> PlaybackError {
+    PlaybackError::Failure(Failure::new(
+        "credential_changed",
+        "登录状态已变更，未写入旧的刷新结果",
+    ))
+}
+
+fn refresh_failure(error: PlaybackCoreError) -> PlaybackError {
+    match error {
+        PlaybackCoreError::Catalog(_) => PlaybackError::Failure(Failure::new(
+            "credential_refresh_failed",
+            "平台拒绝或未完成凭据刷新",
+        )),
+        error => PlaybackError::from(error),
+    }
+}
+
 async fn refresh_due_credentials(core: &PlaybackCore, credentials: &CredentialStore) {
-    let provider = ProviderId::Kugou;
-    let Ok(status) = credentials.status(provider.as_str()) else {
-        return;
-    };
-    let now = current_epoch_ms();
-    if !status.refresh_ready
-        || status.refresh_state == "failed"
-        || status
-            .next_refresh_check_at_ms
-            .is_some_and(|next_check| next_check > now)
-    {
-        return;
-    }
-    if let Err(error) = credentials.mark_refresh_started(provider.as_str()) {
-        tracing::warn!(%error, "记录酷狗自动刷新状态失败");
-        return;
-    }
-    let result = match core.refresh_kugou_credential().await {
-        Ok(credential) => credentials
-            .save(provider.as_str(), credential)
-            .map(|_| ())
-            .map_err(|error| error.to_string()),
-        Err(error) => Err(error.to_string()),
-    };
-    let next_check = Some(now.saturating_add(if result.is_ok() {
-        REFRESH_CHECK_INTERVAL_MS
-    } else {
-        REFRESH_FAILURE_BACKOFF_MS
-    }));
-    if let Err(error) = credentials.mark_refresh_finished(provider.as_str(), result, next_check) {
-        tracing::warn!(%error, "保存酷狗自动刷新结果失败");
+    for provider in [ProviderId::Kugou, ProviderId::QqMusic, ProviderId::Bilibili] {
+        let Ok(status) = credentials.status(provider.as_str()) else {
+            continue;
+        };
+        let now = current_epoch_ms();
+        if !status.refresh_ready
+            || status
+                .next_refresh_check_at_ms
+                .is_some_and(|next_check| next_check > now)
+        {
+            continue;
+        }
+        let result = match provider {
+            ProviderId::Kugou => refresh_kugou_credential(core, credentials).await,
+            ProviderId::QqMusic | ProviderId::Bilibili => {
+                refresh_manual_credential(core, credentials, provider).await
+            }
+            _ => continue,
+        };
+        if result.is_ok() {
+            let _ = core.invalidate_account_status(provider);
+        }
+        if let Err(error) = result {
+            if !matches!(
+                error,
+                PlaybackError::Failure(ref failure) if failure.code == "credential_refresh_in_progress"
+            ) {
+                tracing::warn!(provider = %provider, error = %error, "自动刷新凭据失败");
+            }
+        }
     }
 }
 
@@ -1650,11 +1796,14 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
-    use tokio::sync::{Notify, watch};
+    use tokio::sync::{Notify, oneshot, watch};
     use url::Url;
 
     use super::*;
-    use crate::catalog::{CatalogError, PlaybackEligibility, ProviderSearchCandidate};
+    use crate::catalog::{
+        CatalogError, KugouAccountAdapter, KugouAccountStatus, KugouListenReport,
+        PlaybackEligibility, ProviderSearchCandidate,
+    };
     use crate::domain::{PlaybackSnapshot as EngineSnapshot, Song, SongKey, StreamSource};
     use crate::engine::{AudioEngine, EngineCommand, EngineError};
     use crate::lyrics::{TimedLyricLine, TimedLyrics};
@@ -1829,6 +1978,12 @@ mod tests {
         release_validation: Notify,
     }
 
+    struct BlockingKugouRefresh {
+        refresh_started: Mutex<Option<oneshot::Sender<ProviderCredential>>>,
+        release_refresh: Arc<Notify>,
+        refreshed: ProviderCredential,
+    }
+
     /// 预加载 panic 测试用假源：首次 resolve 直接 panic（模拟任务异常），
     /// 之后 resolve 阻塞等待释放（用于验证 panic 后同曲目可再次预加载）。
     struct PanicResolveSource {
@@ -1913,6 +2068,32 @@ mod tests {
             _locator: Option<&crate::domain::ResolverLocator>,
         ) -> Result<StreamSource, CatalogError> {
             unreachable!("credential responsiveness test does not resolve tracks")
+        }
+    }
+
+    #[async_trait]
+    impl KugouAccountAdapter for BlockingKugouRefresh {
+        async fn refresh_token(
+            &self,
+            credential: &ProviderCredential,
+        ) -> Result<ProviderCredential, CatalogError> {
+            if let Some(started) = self.refresh_started.lock().unwrap().take() {
+                let _ = started.send(credential.clone());
+            }
+            self.release_refresh.notified().await;
+            Ok(self.refreshed.clone())
+        }
+
+        async fn account_status(&self) -> Result<KugouAccountStatus, CatalogError> {
+            Ok(KugouAccountStatus::default())
+        }
+
+        async fn claim_vip(&self) -> Result<KugouListenReport, CatalogError> {
+            Ok(KugouListenReport::default())
+        }
+
+        async fn upgrade_vip(&self) -> Result<KugouListenReport, CatalogError> {
+            Ok(KugouListenReport::default())
         }
     }
 
@@ -2112,6 +2293,86 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         condition()
+    }
+
+    fn kugou_credential(token: &str) -> ProviderCredential {
+        ProviderCredential::Kugou {
+            token: token.to_owned(),
+            userid: "42".to_owned(),
+            dfid: "device-42".to_owned(),
+            cookies: BTreeMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn kugou_refresh_uses_the_original_snapshot_and_cannot_overwrite_newer_login() {
+        let credentials = CredentialStore::memory();
+        let old_credential = kugou_credential("old-token");
+        let newer_credential = kugou_credential("newer-token");
+        credentials.save("kugou", old_credential.clone()).unwrap();
+
+        let (refresh_started_tx, refresh_started_rx) = oneshot::channel();
+        let release_refresh = Arc::new(Notify::new());
+        let refresh_adapter = Arc::new(BlockingKugouRefresh {
+            refresh_started: Mutex::new(Some(refresh_started_tx)),
+            release_refresh: release_refresh.clone(),
+            refreshed: kugou_credential("refreshed-old-token"),
+        });
+        let catalog = SourceCatalog::new(Vec::<(String, Arc<dyn SourceAdapter>)>::new())
+            .with_kugou_account(refresh_adapter as Arc<dyn KugouAccountAdapter>);
+        let core = Arc::new(PlaybackCore::new(
+            catalog,
+            Arc::new(FakeEngine::new()),
+            Duration::from_secs(1),
+        ));
+
+        let task_core = core.clone();
+        let task_credentials = credentials.clone();
+        let refresh =
+            tokio::spawn(
+                async move { refresh_kugou_credential(&task_core, &task_credentials).await },
+            );
+        let received = tokio::time::timeout(Duration::from_secs(1), refresh_started_rx)
+            .await
+            .expect("refresh should start")
+            .expect("refresh adapter should receive a credential");
+        assert_eq!(received, old_credential);
+
+        // 新登录在旧刷新请求返回前完成；版本条件写入必须保留这个新凭据。
+        credentials.save("kugou", newer_credential.clone()).unwrap();
+        release_refresh.notify_one();
+
+        assert!(matches!(
+            refresh.await.unwrap(),
+            Err(PlaybackError::Failure(failure)) if failure.code == "credential_changed"
+        ));
+        assert_eq!(
+            credentials.get("kugou").unwrap(),
+            Some(newer_credential),
+            "旧刷新结果不得覆盖新登录凭据"
+        );
+    }
+
+    #[tokio::test]
+    async fn refreshing_an_unconfigured_provider_does_not_record_a_failed_state() {
+        let credentials = CredentialStore::memory();
+        let core = PlaybackCore::new(
+            SourceCatalog::new(Vec::<(String, Arc<dyn SourceAdapter>)>::new()),
+            Arc::new(FakeEngine::new()),
+            Duration::from_secs(1),
+        );
+
+        let result = refresh_manual_credential(&core, &credentials, ProviderId::QqMusic).await;
+
+        assert!(matches!(
+            result,
+            Err(PlaybackError::Failure(failure)) if failure.code == "provider_auth_required"
+        ));
+        let status = credentials.status("qqmusic").unwrap();
+        assert!(!status.configured);
+        assert_eq!(status.refresh_state, "unavailable");
+        assert!(status.last_refresh_at_ms.is_none());
+        assert!(status.last_refresh_error.is_none());
     }
 
     #[test]

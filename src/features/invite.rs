@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::VecDeque;
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -241,9 +241,11 @@ pub trait InviteExecutionPort {
     ) -> Result<InviteUiOutcome>;
 }
 
+const EXECUTED_SEQUENCE_LIMIT: usize = 5;
+
 #[derive(Default)]
 pub struct InviteService {
-    executed_sequences: HashSet<u32>,
+    executed_sequences: VecDeque<u32>,
 }
 
 impl InviteService {
@@ -259,10 +261,14 @@ impl InviteService {
     }
 
     pub fn begin(&mut self, request: InviteRequest) -> InviteStart {
-        if let Some(sequence) = request.sequence
-            && !self.executed_sequences.insert(sequence)
-        {
-            return InviteStart::Duplicate { sequence };
+        if let Some(sequence) = request.sequence {
+            if self.executed_sequences.contains(&sequence) {
+                return InviteStart::Duplicate { sequence };
+            }
+            self.executed_sequences.push_back(sequence);
+            if self.executed_sequences.len() > EXECUTED_SEQUENCE_LIMIT {
+                self.executed_sequences.pop_front();
+            }
         }
         InviteStart::Ready(InviteExecution {
             username: request.username,
@@ -414,7 +420,7 @@ mod tests {
     }
 
     #[test]
-    fn execution_ledger_accepts_each_sequence_once() {
+    fn execution_ledger_accepts_each_sequence_once_within_the_recent_window() {
         let mut service = InviteService::new();
 
         assert!(service.should_accept(Some(7)));
@@ -424,6 +430,42 @@ mod tests {
             service.begin(InviteRequest::new("乙", Some(7), None)),
             InviteStart::Duplicate { sequence: 7 }
         ));
+    }
+
+    #[test]
+    fn execution_ledger_releases_the_oldest_sequence_after_five_newer_entries() {
+        let mut service = InviteService::new();
+
+        for sequence in 1..=5 {
+            drop(begin_ready(&mut service, "甲", Some(sequence)));
+        }
+        assert!(!service.should_accept(Some(1)));
+        assert!(!service.should_accept(Some(5)));
+
+        drop(begin_ready(&mut service, "甲", Some(6)));
+
+        assert!(service.should_accept(Some(1)));
+        for sequence in 2..=6 {
+            assert!(!service.should_accept(Some(sequence)));
+        }
+    }
+
+    #[test]
+    fn duplicate_sequence_does_not_advance_the_recent_window() {
+        let mut service = InviteService::new();
+
+        for sequence in 1..=5 {
+            drop(begin_ready(&mut service, "甲", Some(sequence)));
+        }
+        assert!(matches!(
+            service.begin(InviteRequest::new("甲", Some(1), None)),
+            InviteStart::Duplicate { sequence: 1 }
+        ));
+
+        drop(begin_ready(&mut service, "甲", Some(6)));
+
+        assert!(service.should_accept(Some(1)));
+        assert!(!service.should_accept(Some(2)));
     }
 
     #[test]

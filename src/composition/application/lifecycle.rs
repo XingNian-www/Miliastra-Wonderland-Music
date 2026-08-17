@@ -1,7 +1,8 @@
 use super::*;
+use crate::RunOutcome;
 
 impl ApplicationRuntime {
-    pub(crate) fn run(&mut self) -> Result<()> {
+    pub(crate) fn run(&mut self) -> Result<RunOutcome> {
         self.start_formal_task_runtime()?;
         self.lifecycle
             .monitor
@@ -107,9 +108,18 @@ impl ApplicationRuntime {
             openai_runtime.shutdown();
             log::info!("OpenAI runtime 已关闭");
         }
+        let outcome = if self.lifecycle.reload_on_exit {
+            RunOutcome::Reload
+        } else {
+            RunOutcome::Stopped
+        };
+        let status = match outcome {
+            RunOutcome::Stopped => "已退出",
+            RunOutcome::Reload => "配置重载关停完成",
+        };
         self.lifecycle
             .monitor
-            .publish(MonitorEvent::Status("已退出".to_string()));
-        result
+            .publish(MonitorEvent::Status(status.to_string()));
+        result.map(|()| outcome)
     }
 }

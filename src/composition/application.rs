@@ -16,7 +16,7 @@ mod workers;
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, sleep};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -49,9 +49,10 @@ use crate::features::idiom_chain::{IdiomChainApplication, IdiomChainService};
 use crate::features::invite::{InviteRequest, InviteService, InviteStart};
 use crate::features::moderation::{ModerationPolicy, ModerationResultTask, ModerationService};
 use crate::features::playback::{
-    ExternalPlaybackObservation, PlaybackApplication, PlaybackApplicationConfig, PlaybackCommand,
-    PlaybackRequest, PlaybackRuntimeState, PlaybackService, PlaybackStatePort, PlaybackStateUpdate,
-    PlaybackTimePorts, PlayerController, PlayerStatus, QueueItem, SongDedupCandidate,
+    ConfirmedPlaybackState, ExternalPlaybackObservation, PlaybackApplication,
+    PlaybackApplicationConfig, PlaybackCommand, PlaybackRequest, PlaybackRuntimeState,
+    PlaybackService, PlaybackStatePort, PlaybackStateUpdate, PlaybackTimePorts, PlayerController,
+    PlayerStatus, QueueItem, SongDedupCandidate,
 };
 use crate::features::song_request::{
     AiClient, ResolvedSongRequest, SongRequestApplication, SongRequestContext, SongRequestDecision,
@@ -139,6 +140,7 @@ use miliastra_playback::{
 
 const TARGET_MISSING_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const TARGET_MISSING_BACKOFF_MAX: Duration = Duration::from_secs(60);
+const CONFIG_RELOAD_IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const UI_RUNTIME_QUEUE_CAPACITY: usize = 32;
 const OCR_RUNTIME_QUEUE_CAPACITY: usize = 64;
 const BUSINESS_RUNTIME_QUEUE_CAPACITY: usize = 64;
@@ -196,6 +198,7 @@ impl ResolvedApplicationConfig {
                 output: &app.output,
                 input_timing: &app.timing.input,
                 auto_retry_count: live_configs.friend_delivery_auto_retry_count.clone(),
+                send_enabled: live_configs.output_send_enabled.clone(),
                 friend_list_region: app.invite.friend_list_region.into(),
                 friend_step_ms: app.timing.invite.step_ms,
                 timeout_ms: app.timing.workflow.default_timeout_ms,
@@ -279,7 +282,7 @@ impl ResolvedApplicationConfig {
         let secondary_unread = SecondaryUnreadRoutineConfig::resolve(
             friend_delivery.clone(),
             app.ocr.same_line_y_tolerance,
-            app.timing.chat_scan.change_debounce_ms,
+            live_configs.change_debounce_ms.clone(),
         );
         let invite = InviteRoutineConfig::resolve(InviteRoutineConfigSource {
             friend: friend_delivery.clone(),
@@ -331,14 +334,20 @@ impl ResolvedApplicationConfig {
 fn receive_observation_frame(
     subscription: &FrameDemandSubscription,
     canvas: &Canvas,
-) -> Result<Frame> {
-    match subscription.recv().context("等待 UI runtime 发布观察帧")? {
-        FramePublication::Captured(published) => Ok(from_captured_frame(&published, canvas)),
-        FramePublication::Failed(failure) => Err(anyhow!(
+) -> Result<Option<Frame>> {
+    match subscription.recv_timeout(CONFIG_RELOAD_IDLE_CHECK_INTERVAL) {
+        Ok(FramePublication::Captured(published)) => {
+            Ok(Some(from_captured_frame(&published, canvas)))
+        }
+        Ok(FramePublication::Failed(failure)) => Err(anyhow!(
             "UI runtime 观察帧截图失败 at {:?}: {}",
             failure.failed_at(),
             failure.reason()
         )),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(None),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(anyhow!("等待 UI runtime 发布观察帧时通道断开"))
+        }
     }
 }
 
@@ -411,8 +420,11 @@ struct LifecycleBundle {
     /// HTTP 服务与各消费方持有同一份 Arc。
     live_configs: LiveConfigs,
     http_server: Option<http::HttpServer>,
+    http_reload_blockers: Arc<AtomicUsize>,
     openai_runtime: Option<OpenAiRuntime>,
     running: Arc<AtomicBool>,
+    reload_on_exit: bool,
+    reload_check_after: Instant,
     paused: Arc<AtomicBool>,
     console_reply_context: Arc<AtomicBool>,
     monitor: MonitorShared,
@@ -564,8 +576,11 @@ impl FormalTaskExecutionContext {
                     config: self.lifecycle.config.clone(),
                     live_configs: self.lifecycle.live_configs.clone(),
                     http_server: None,
+                    http_reload_blockers: Arc::new(AtomicUsize::new(0)),
                     openai_runtime: None,
                     running: self.lifecycle.running.clone(),
+                    reload_on_exit: false,
+                    reload_check_after: Instant::now(),
                     paused: self.lifecycle.paused.clone(),
                     console_reply_context: self.lifecycle.console_reply_context.clone(),
                     monitor: self.lifecycle.monitor.clone(),
@@ -1144,8 +1159,8 @@ impl ApplicationRuntime {
             config.moderation.stable_vote_samples,
             config.moderation.required_vote_margin,
         );
-        let custom_workflow = CustomWorkflowService::new(
-            config.custom_workflows.clone(),
+        let custom_workflow = CustomWorkflowService::with_live_config(
+            live_configs.custom_workflows.clone(),
             WorkflowDefaults {
                 default_timeout_ms: config.timing.workflow.default_timeout_ms,
                 default_poll_ms: config.timing.workflow.default_poll_ms,
@@ -1172,11 +1187,12 @@ impl ApplicationRuntime {
             },
         )?;
         let ocr = ocr_runtime.handle();
-        let player_runtime = PlayerRuntime::start(
+        let player_runtime = PlayerRuntime::start_with_live_observation_interval(
             playback_adapter.clone(),
             playback_adapter.clone(),
             playback_adapter,
             player_runtime_config,
+            live_configs.monitor_status_ms.clone(),
         )
         .context("启动播放器运行时")?;
         let player_runtime_handle = player_runtime.handle();
@@ -1252,7 +1268,8 @@ impl ApplicationRuntime {
             config.queue.max_size,
             config.song_dedup.console_bypass,
         );
-        let chat_output = ChatOutput::new(&config.output, hall_batch_ui);
+        let chat_output =
+            ChatOutput::with_live_enabled(live_configs.output_send_enabled.clone(), hall_batch_ui);
         let turtle_soup = TurtleSoupService::new(
             turtle_soup_config,
             turtle_soup_openai,
@@ -1286,7 +1303,6 @@ impl ApplicationRuntime {
         let player = PlayerController::new(
             PlayerRuntimeBackend::new(player_runtime_handle),
             BusinessPlaybackStateAdapter::new(business.clone()),
-            &config.matching,
             PlaybackTimePorts::new(system_clock.clone(), system_clock.clone()),
             live_configs.clone(),
         );
@@ -1369,8 +1385,11 @@ impl ApplicationRuntime {
                 config,
                 live_configs,
                 http_server: None,
+                http_reload_blockers: Arc::new(AtomicUsize::new(0)),
                 openai_runtime: Some(openai_runtime),
                 running,
+                reload_on_exit: false,
+                reload_check_after: Instant::now(),
                 paused: Arc::new(AtomicBool::new(false)),
                 console_reply_context: Arc::new(AtomicBool::new(false)),
                 monitor,

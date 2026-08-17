@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 
 use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
@@ -344,41 +345,52 @@ pub trait CustomWorkflowExecutionPort {
 
 #[derive(Clone, Debug)]
 pub struct CustomWorkflowService {
-    config: CustomWorkflowConfig,
+    config: Arc<RwLock<CustomWorkflowConfig>>,
     defaults: WorkflowDefaults,
 }
 
 impl CustomWorkflowService {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(config: CustomWorkflowConfig, defaults: WorkflowDefaults) -> Self {
+        Self {
+            config: Arc::new(RwLock::new(config)),
+            defaults,
+        }
+    }
+
+    pub(crate) fn with_live_config(
+        config: Arc<RwLock<CustomWorkflowConfig>>,
+        defaults: WorkflowDefaults,
+    ) -> Self {
         Self { config, defaults }
+    }
+
+    fn config(&self) -> std::sync::RwLockReadGuard<'_, CustomWorkflowConfig> {
+        self.config
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     #[allow(dead_code)]
     pub fn enabled(&self) -> bool {
-        self.config.enabled
+        self.config().enabled
     }
 
     pub fn claims_chat(&self, envelope: &CommandEnvelope) -> bool {
-        if !self.config.enabled || envelope.prefix() != CommandPrefix::At {
+        let config = self.config();
+        if !config.enabled || envelope.prefix() != CommandPrefix::At {
             return false;
         }
-        find_command_workflow(
-            &self.config,
-            envelope.command_text(),
-            envelope.message_type(),
-        )
-        .is_some()
+        find_command_workflow(&config, envelope.command_text(), envelope.message_type()).is_some()
     }
 
     pub fn parse_chat(&self, envelope: &CommandEnvelope) -> Option<CustomWorkflowMatch> {
-        if !self.config.enabled || envelope.prefix() != CommandPrefix::At {
+        let config = self.config();
+        if !config.enabled || envelope.prefix() != CommandPrefix::At {
             return None;
         }
-        let (workflow, matched, args) = find_command_workflow(
-            &self.config,
-            envelope.command_text(),
-            envelope.message_type(),
-        )?;
+        let (workflow, matched, args) =
+            find_command_workflow(&config, envelope.command_text(), envelope.message_type())?;
         let workflow_name = workflow_name(workflow, matched);
         Some(FeatureCommandMatch::new(
             matched,
@@ -391,12 +403,8 @@ impl CustomWorkflowService {
         ))
     }
 
-    fn find(&self, name: &str) -> Option<&CustomWorkflowDefinition> {
-        find_workflow(&self.config, name)
-    }
-
     pub fn list(&self) -> Vec<CustomWorkflowSummary> {
-        self.config
+        self.config()
             .workflows
             .iter()
             .filter(|workflow| workflow.enabled)
@@ -417,7 +425,8 @@ impl CustomWorkflowService {
     }
 
     pub fn prepare_remote(&self, name: &str, args: &str) -> Result<CustomWorkflowMatch> {
-        if !self.config.enabled {
+        let config = self.config();
+        if !config.enabled {
             bail!("自定义工作流未启用");
         }
         let name = name.trim();
@@ -425,9 +434,8 @@ impl CustomWorkflowService {
             bail!("name 不能为空");
         }
         let args = args.trim();
-        let workflow = self
-            .find(name)
-            .ok_or_else(|| anyhow!("自定义工作流不存在或未启用"))?;
+        let workflow =
+            find_workflow(&config, name).ok_or_else(|| anyhow!("自定义工作流不存在或未启用"))?;
         if !workflow.allow_args && !args.is_empty() {
             bail!("该自定义工作流不允许参数");
         }
@@ -509,8 +517,8 @@ impl CustomWorkflowService {
     }
 
     fn prepare(&self, invocation: &CustomWorkflowInvocation) -> Result<WorkflowPlan> {
-        let workflow = self
-            .find(&invocation.command.workflow)
+        let config = self.config();
+        let workflow = find_workflow(&config, &invocation.command.workflow)
             .ok_or_else(|| anyhow!("custom workflow not found: {}", invocation.command.workflow))?;
         if workflow.steps.is_empty() {
             bail!(
@@ -525,8 +533,8 @@ impl CustomWorkflowService {
             .then(|| self.prepare_confirmation(workflow, &context));
         let mut steps = Vec::with_capacity(workflow.steps.len().saturating_mul(2));
         for step in &workflow.steps {
-            steps.push(self.prepare_step(step, &context)?);
-            if !step_consumes_wait(step, self.config.wait_template_absent_stable_default) {
+            steps.push(self.prepare_step(&config, step, &context)?);
+            if !step_consumes_wait(step, config.wait_template_absent_stable_default) {
                 let wait_ms = step.wait_ms.unwrap_or(self.defaults.default_step_wait_ms);
                 if wait_ms > 0 {
                     steps.push(PreparedWorkflowStep::Mechanical(WorkflowOperation::Wait {
@@ -575,6 +583,7 @@ impl CustomWorkflowService {
 
     fn prepare_step(
         &self,
+        config: &CustomWorkflowConfig,
         step: &CustomWorkflowStep,
         context: &WorkflowContext,
     ) -> Result<PreparedWorkflowStep> {
@@ -605,7 +614,7 @@ impl CustomWorkflowService {
                         duration_seconds: custom_hold_key_seconds(
                             step,
                             context,
-                            self.config.max_hold_key_seconds,
+                            config.max_hold_key_seconds,
                         )?,
                     },
                 ))
@@ -633,9 +642,9 @@ impl CustomWorkflowService {
                     button: parse_mouse_button(configured_text(step.button.as_deref()))?,
                 },
             )),
-            "click_template" => self.prepare_template_step(step, context, true),
-            "wait_template" => self.prepare_template_step(step, context, false),
-            "wait_template_absent" => self.prepare_template_absent_step(step, context),
+            "click_template" => self.prepare_template_step(config, step, context, true),
+            "wait_template" => self.prepare_template_step(config, step, context, false),
+            "wait_template_absent" => self.prepare_template_absent_step(config, step, context),
             "wait_stable" | "wait_pixels_stable" => {
                 let region =
                     required_region(step, "custom workflow wait_stable step missing region")?;
@@ -724,13 +733,14 @@ impl CustomWorkflowService {
 
     fn prepare_template_step(
         &self,
+        config: &CustomWorkflowConfig,
         step: &CustomWorkflowStep,
         context: &WorkflowContext,
         click: bool,
     ) -> Result<PreparedWorkflowStep> {
-        let template = self.resolve_template(step, context)?;
+        let template = self.resolve_template(config, step, context)?;
         let region = required_region(step, "custom workflow template step missing region")?;
-        let threshold = step.threshold.unwrap_or(self.config.default_threshold);
+        let threshold = step.threshold.unwrap_or(config.default_threshold);
         let timeout_ms = step.timeout_ms.unwrap_or(self.defaults.default_timeout_ms);
         let poll_ms = resolved_poll_ms(step, self.defaults.default_poll_ms);
         if click {
@@ -759,15 +769,16 @@ impl CustomWorkflowService {
 
     fn prepare_template_absent_step(
         &self,
+        config: &CustomWorkflowConfig,
         step: &CustomWorkflowStep,
         context: &WorkflowContext,
     ) -> Result<PreparedWorkflowStep> {
-        let template = self.resolve_template(step, context)?;
+        let template = self.resolve_template(config, step, context)?;
         let region = required_region(step, "custom workflow template step missing region")?;
         let poll_ms = resolved_poll_ms(step, self.defaults.default_poll_ms);
         let stable_after_absent = step
             .stable_after_absent
-            .unwrap_or(self.config.wait_template_absent_stable_default);
+            .unwrap_or(config.wait_template_absent_stable_default);
         let stability = stable_after_absent.then(|| {
             self.pixel_stability(
                 step.wait_ms
@@ -779,7 +790,7 @@ impl CustomWorkflowService {
             WorkflowOperation::WaitTemplateAbsent {
                 template,
                 region,
-                threshold: step.threshold.unwrap_or(self.config.default_threshold),
+                threshold: step.threshold.unwrap_or(config.default_threshold),
                 timeout_ms: step.timeout_ms.unwrap_or(self.defaults.default_timeout_ms),
                 poll_ms,
                 stability,
@@ -824,11 +835,12 @@ impl CustomWorkflowService {
 
     fn resolve_template(
         &self,
+        config: &CustomWorkflowConfig,
         step: &CustomWorkflowStep,
         context: &WorkflowContext,
     ) -> Result<PathBuf> {
         let name = context.render(step.template.as_deref().unwrap_or("").trim());
-        template_path(&self.config, &name)
+        template_path(config, &name)
     }
 
     fn pixel_stability(&self, timeout_ms: u64) -> WorkflowPixelStability {
@@ -1535,8 +1547,13 @@ mod tests {
             _ => {}
         }
         let service = CustomWorkflowService::new(config(workflow()), defaults());
+        let service_config = service.config();
         service
-            .prepare_step(&value, &WorkflowContext::new(&invocation("3")))
+            .prepare_step(
+                &service_config,
+                &value,
+                &WorkflowContext::new(&invocation("3")),
+            )
             .unwrap()
     }
 
@@ -1737,6 +1754,21 @@ mod tests {
     }
 
     #[test]
+    fn shared_config_is_read_again_for_each_command() {
+        let mut initial = config(workflow());
+        initial.enabled = false;
+        let shared = Arc::new(RwLock::new(initial));
+        let service = CustomWorkflowService::with_live_config(shared.clone(), defaults());
+        let chat = envelope("用户", "blue", "@测试流程");
+        assert!(!service.claims_chat(&chat));
+
+        *shared.write().unwrap() = config(workflow());
+
+        assert!(service.claims_chat(&chat));
+        assert!(service.parse_chat(&chat).is_some());
+    }
+
+    #[test]
     fn default_control_commands_resolve_shared_prefixes_and_duration_arguments() {
         let app =
             AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).expect("default config");
@@ -1931,9 +1963,15 @@ mod tests {
         ] {
             let mut value = step("mouse_button");
             value.button = Some(configured.to_string());
+            let service = CustomWorkflowService::new(config(workflow()), defaults());
+            let service_config = service.config();
             assert_eq!(
-                CustomWorkflowService::new(config(workflow()), defaults())
-                    .prepare_step(&value, &WorkflowContext::new(&invocation("")))
+                service
+                    .prepare_step(
+                        &service_config,
+                        &value,
+                        &WorkflowContext::new(&invocation("")),
+                    )
                     .unwrap(),
                 PreparedWorkflowStep::Mechanical(WorkflowOperation::ClickMouseButton {
                     button: expected,

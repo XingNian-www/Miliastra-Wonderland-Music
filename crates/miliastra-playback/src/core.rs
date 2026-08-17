@@ -38,7 +38,8 @@ fn unix_epoch_ms() -> u64 {
 }
 
 /// 对搜索候选确定可用性：
-/// - 账号 VIP 状态已知时优先直接用账号信息改写标注（VIP 歌曲按账号判定），不探测；
+/// - 已知 VIP 的账号直接放行 VIP 歌曲；已知非 VIP 时额外探测一次，允许刚开通
+///   会员的用户立刻点播；
 /// - 只有 VIP 无法判定（未登录/未知/查询失败）且标注需要确认时才探测；
 /// - 免费可播/无版权/付费/不可播等标注与账号 VIP 无关，直接采用；
 /// - 探测确认可播放 → Eligible；平台明确 VIP/无版权 → 对应标注；
@@ -49,17 +50,26 @@ async fn probe_candidates(
     candidates: Vec<ProviderSearchCandidate>,
     request_timeout: Duration,
 ) -> Vec<ProviderSearchCandidate> {
-    // 账号 VIP 信息（平台自身带缓存）：已知时省掉全部播放流探测。
-    let account_vip = match timeout(request_timeout, adapter.account_status()).await {
-        Ok(Ok(Some(status))) if status.logged_in && status.vip_known => Some(status.vip),
-        _ => None,
+    // 免费和未知候选不依赖账号 VIP 状态。仅在候选明确标为 VIP 时才读取
+    // 账号缓存，避免每次搜索都额外调用平台账号接口。
+    let has_vip_candidate = candidates
+        .iter()
+        .any(|candidate| candidate.eligibility == PlaybackEligibility::VipRequired);
+    let account_vip = if has_vip_candidate {
+        match timeout(request_timeout, adapter.account_status()).await {
+            Ok(Ok(Some(status))) if status.logged_in && status.vip_known => Some(status.vip),
+            _ => None,
+        }
+    } else {
+        None
     };
     let mut probes = Vec::with_capacity(candidates.len());
     for candidate in candidates.into_iter().take(PROBE_CONCURRENCY) {
         let initial = candidate.eligibility;
         let needs_probe = match initial {
-            // 明确标注 VIP 的歌曲：账号 VIP 未知时探测兜底（凭据能拿到流即可播）。
-            PlaybackEligibility::VipRequired => account_vip.is_none(),
+            // 明确标注 VIP 的歌曲：只有已确认 VIP 时才能直接放行。缓存的非 VIP
+            // 仍需探测一次，避免用户刚开通会员时被一天的旧负缓存挡住。
+            PlaybackEligibility::VipRequired => account_vip != Some(true),
             // 元数据未给出判定：探测确认。
             PlaybackEligibility::Unknown => true,
             // 免费可播/无版权/付费/不可播与账号 VIP 无关，直接采用。
@@ -90,18 +100,29 @@ async fn probe_candidates(
                     PlaybackEligibility::Eligible => PlaybackEligibility::Eligible,
                     other => other,
                 },
-                Ok(Err(CatalogError::VipRequired(_))) => PlaybackEligibility::VipRequired,
-                Ok(Err(CatalogError::NoCopyright(_))) => match initial {
-                    // 平台元数据明确标 VIP 的歌曲，探测拿不到完整流多为 VIP 限制。
-                    PlaybackEligibility::VipRequired => PlaybackEligibility::VipRequired,
-                    _ => PlaybackEligibility::NoCopyright,
-                },
-                Ok(Err(CatalogError::Unavailable(_))) => match initial {
-                    PlaybackEligibility::VipRequired => PlaybackEligibility::VipRequired,
-                    PlaybackEligibility::NoCopyright => PlaybackEligibility::NoCopyright,
-                    _ => PlaybackEligibility::Ineligible,
-                },
-                Ok(Err(_)) | Err(_) => initial,
+                Ok(Err(error)) => {
+                    // 已缓存为非 VIP 时，VIP 拒绝正好验证了现有结论，不能清空
+                    // 一天的乐观缓存后让下一次搜索重新打账号接口。
+                    if !matches!(&error, CatalogError::VipRequired(_)) || account_vip != Some(false)
+                    {
+                        adapter.observe_playback_failure(&error);
+                    }
+                    match error {
+                        CatalogError::VipRequired(_) => PlaybackEligibility::VipRequired,
+                        CatalogError::NoCopyright(_) => match initial {
+                            // 平台元数据明确标 VIP 的歌曲，探测拿不到完整流多为 VIP 限制。
+                            PlaybackEligibility::VipRequired => PlaybackEligibility::VipRequired,
+                            _ => PlaybackEligibility::NoCopyright,
+                        },
+                        CatalogError::Unavailable(_) => match initial {
+                            PlaybackEligibility::VipRequired => PlaybackEligibility::VipRequired,
+                            PlaybackEligibility::NoCopyright => PlaybackEligibility::NoCopyright,
+                            _ => PlaybackEligibility::Ineligible,
+                        },
+                        _ => initial,
+                    }
+                }
+                Err(_) => initial,
             };
             (candidate, eligibility)
         }));
@@ -434,13 +455,23 @@ impl PlaybackCore {
             .catalog
             .get(&song_key.source)
             .ok_or_else(|| PlaybackCoreError::UnknownSource(song_key.source.clone()))?;
-        timeout(
+        match timeout(
             self.source_timeout,
             adapter.resolve(song_key, resolver_locator),
         )
         .await
-        .map_err(|_| PlaybackCoreError::Catalog(CatalogError::TimedOut(song_key.source.clone())))?
-        .map_err(PlaybackCoreError::Catalog)
+        {
+            Err(_) => Err(PlaybackCoreError::Catalog(CatalogError::TimedOut(
+                song_key.source.clone(),
+            ))),
+            Ok(Ok(stream)) => Ok(stream),
+            Ok(Err(error)) => {
+                let _ = self
+                    .catalog
+                    .observe_playback_failure(&song_key.source, &error);
+                Err(PlaybackCoreError::Catalog(error))
+            }
+        }
     }
 
     fn cached_stream(&self, key: &SongKey) -> Option<StreamSource> {
@@ -530,9 +561,20 @@ impl PlaybackCore {
                             None => resolve.await,
                         }
                     };
-                    let stream = resolved.map_err(|_| {
-                        PlaybackCoreError::Catalog(CatalogError::TimedOut(song_key.source.clone()))
-                    })??;
+                    let stream = match resolved {
+                        Err(_) => {
+                            return Err(PlaybackCoreError::Catalog(CatalogError::TimedOut(
+                                song_key.source.clone(),
+                            )));
+                        }
+                        Ok(Ok(stream)) => stream,
+                        Ok(Err(error)) => {
+                            let _ = self
+                                .catalog
+                                .observe_playback_failure(&song_key.source, &error);
+                            return Err(PlaybackCoreError::Catalog(error));
+                        }
+                    };
                     self.cache_stream(song_key.clone(), stream.clone());
                     stream
                 }
@@ -1188,6 +1230,7 @@ async fn resolve_stream_retry(
     match timeout(source_timeout, adapter.resolve(song_key, resolver_locator)).await {
         Ok(Ok(stream)) => Some(stream),
         Ok(Err(error)) => {
+            let _ = catalog.observe_playback_failure(&song_key.source, &error);
             tracing::warn!(%song_key, %error, "stream retry resolution failed");
             None
         }
@@ -1569,7 +1612,7 @@ mod tests {
         assert_eq!(probes.load(Ordering::SeqCst), 0);
         assert_eq!(candidates[0].eligibility, PlaybackEligibility::Eligible);
 
-        // 账号无 VIP：屏蔽，探测 0 次。
+        // 账号缓存为非 VIP 时仍探测一次，避免刚开通会员时被旧负缓存挡住。
         let probes = Arc::new(AtomicUsize::new(0));
         let source = Arc::new(VipSource {
             account: Some(status(false, true)),
@@ -1584,8 +1627,8 @@ mod tests {
             Duration::from_secs(5),
         )
         .await;
-        assert_eq!(probes.load(Ordering::SeqCst), 0);
-        assert_eq!(candidates[0].eligibility, PlaybackEligibility::VipRequired);
+        assert_eq!(probes.load(Ordering::SeqCst), 1);
+        assert_eq!(candidates[0].eligibility, PlaybackEligibility::Eligible);
 
         // 账号 VIP 未知（未登录/查询失败）：探测兜底。
         let probes = Arc::new(AtomicUsize::new(0));
@@ -1604,6 +1647,236 @@ mod tests {
         .await;
         assert_eq!(probes.load(Ordering::SeqCst), 1);
         assert_eq!(candidates[0].eligibility, PlaybackEligibility::Eligible);
+    }
+
+    #[tokio::test]
+    async fn confirmed_non_vip_probe_keeps_the_optimistic_account_cache() {
+        struct ConfirmedNonVipSource {
+            invalidations: Arc<AtomicUsize>,
+            probes: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl SourceAdapter for ConfirmedNonVipSource {
+            async fn search(
+                &self,
+                _spec: &SearchSpec,
+            ) -> Result<Vec<ProviderSearchCandidate>, CatalogError> {
+                Ok(Vec::new())
+            }
+
+            async fn resolve(
+                &self,
+                _key: &SongKey,
+                _locator: Option<&ResolverLocator>,
+            ) -> Result<StreamSource, CatalogError> {
+                unreachable!("the explicit probe implementation is used")
+            }
+
+            async fn probe_eligibility(
+                &self,
+                _key: &SongKey,
+                _locator: Option<&ResolverLocator>,
+            ) -> Result<PlaybackEligibility, CatalogError> {
+                self.probes.fetch_add(1, Ordering::SeqCst);
+                Err(CatalogError::VipRequired("membership".to_owned()))
+            }
+
+            async fn account_status(&self) -> Result<Option<ProviderAccountStatus>, CatalogError> {
+                Ok(Some(ProviderAccountStatus {
+                    logged_in: true,
+                    vip_known: true,
+                    vip: false,
+                    ..ProviderAccountStatus::default()
+                }))
+            }
+
+            fn invalidate_account_status(&self) {
+                self.invalidations.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let invalidations = Arc::new(AtomicUsize::new(0));
+        let probes = Arc::new(AtomicUsize::new(0));
+        let candidates = probe_candidates(
+            Arc::new(ConfirmedNonVipSource {
+                invalidations: invalidations.clone(),
+                probes: probes.clone(),
+            }),
+            vec![ProviderSearchCandidate {
+                song: song("vip", "membership"),
+                eligibility: PlaybackEligibility::VipRequired,
+            }],
+            Duration::from_secs(5),
+        )
+        .await;
+
+        assert_eq!(probes.load(Ordering::SeqCst), 1);
+        assert_eq!(candidates[0].eligibility, PlaybackEligibility::VipRequired);
+        assert_eq!(invalidations.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn non_vip_candidates_skip_account_status_lookup() {
+        struct UnknownSource {
+            account_queries: Arc<AtomicUsize>,
+            probes: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl SourceAdapter for UnknownSource {
+            async fn search(
+                &self,
+                _spec: &SearchSpec,
+            ) -> Result<Vec<ProviderSearchCandidate>, CatalogError> {
+                Ok(Vec::new())
+            }
+
+            async fn resolve(
+                &self,
+                _key: &SongKey,
+                _locator: Option<&ResolverLocator>,
+            ) -> Result<StreamSource, CatalogError> {
+                unreachable!("the explicit probe implementation is used")
+            }
+
+            async fn probe_eligibility(
+                &self,
+                _key: &SongKey,
+                _locator: Option<&ResolverLocator>,
+            ) -> Result<PlaybackEligibility, CatalogError> {
+                self.probes.fetch_add(1, Ordering::SeqCst);
+                Ok(PlaybackEligibility::Eligible)
+            }
+
+            async fn account_status(&self) -> Result<Option<ProviderAccountStatus>, CatalogError> {
+                self.account_queries.fetch_add(1, Ordering::SeqCst);
+                Ok(None)
+            }
+        }
+
+        let account_queries = Arc::new(AtomicUsize::new(0));
+        let probes = Arc::new(AtomicUsize::new(0));
+        let candidates = probe_candidates(
+            Arc::new(UnknownSource {
+                account_queries: account_queries.clone(),
+                probes: probes.clone(),
+            }),
+            vec![ProviderSearchCandidate {
+                song: song("test", "unknown"),
+                eligibility: PlaybackEligibility::Unknown,
+            }],
+            Duration::from_secs(5),
+        )
+        .await;
+
+        assert_eq!(account_queries.load(Ordering::SeqCst), 0);
+        assert_eq!(probes.load(Ordering::SeqCst), 1);
+        assert_eq!(candidates[0].eligibility, PlaybackEligibility::Eligible);
+    }
+
+    #[tokio::test]
+    async fn only_account_related_playback_failures_invalidate_optimistic_status() {
+        struct FailingSource {
+            error: CatalogError,
+            invalidations: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl SourceAdapter for FailingSource {
+            async fn search(
+                &self,
+                _spec: &SearchSpec,
+            ) -> Result<Vec<ProviderSearchCandidate>, CatalogError> {
+                Ok(Vec::new())
+            }
+
+            async fn resolve(
+                &self,
+                _key: &SongKey,
+                _locator: Option<&ResolverLocator>,
+            ) -> Result<StreamSource, CatalogError> {
+                Err(self.error.clone())
+            }
+
+            fn invalidate_account_status(&self) {
+                self.invalidations.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        for (error, expected_invalidations) in [
+            (CatalogError::AuthRequired("expired".to_owned()), 1),
+            (CatalogError::CredentialRejected("expired".to_owned()), 1),
+            (CatalogError::VipRequired("membership".to_owned()), 1),
+            (CatalogError::Unavailable("track".to_owned()), 0),
+            (
+                CatalogError::InvalidResolverLocator("malformed locator".to_owned()),
+                0,
+            ),
+        ] {
+            let invalidations = Arc::new(AtomicUsize::new(0));
+            let (core, _) = core(vec![(
+                "source".to_owned(),
+                Arc::new(FailingSource {
+                    error,
+                    invalidations: invalidations.clone(),
+                }),
+            )]);
+
+            let result = core
+                .resolve_stream(&SongKey::new("source", "track").unwrap(), None)
+                .await;
+            assert!(matches!(result, Err(PlaybackCoreError::Catalog(_))));
+            assert_eq!(invalidations.load(Ordering::SeqCst), expected_invalidations);
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_retry_observes_account_related_resolution_failures() {
+        struct RetryFailureSource {
+            invalidations: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl SourceAdapter for RetryFailureSource {
+            async fn search(
+                &self,
+                _spec: &SearchSpec,
+            ) -> Result<Vec<ProviderSearchCandidate>, CatalogError> {
+                Ok(Vec::new())
+            }
+
+            async fn resolve(
+                &self,
+                _key: &SongKey,
+                _locator: Option<&ResolverLocator>,
+            ) -> Result<StreamSource, CatalogError> {
+                Err(CatalogError::CredentialRejected("expired".to_owned()))
+            }
+
+            fn invalidate_account_status(&self) {
+                self.invalidations.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let invalidations = Arc::new(AtomicUsize::new(0));
+        let catalog = SourceCatalog::new([(
+            "source".to_owned(),
+            Arc::new(RetryFailureSource {
+                invalidations: invalidations.clone(),
+            }) as Arc<dyn SourceAdapter>,
+        )]);
+
+        let stream = resolve_stream_retry(
+            &catalog,
+            &SongKey::new("source", "track").unwrap(),
+            None,
+            Duration::from_secs(1),
+        )
+        .await;
+
+        assert!(stream.is_none());
+        assert_eq!(invalidations.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

@@ -57,8 +57,8 @@ pub struct BilibiliAdapter {
 }
 
 impl BilibiliAdapter {
-    const ACCOUNT_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
-    const ACCOUNT_CACHE_FAILED_TTL: Duration = Duration::from_secs(60);
+    const ACCOUNT_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+    const ACCOUNT_CACHE_FAILED_TTL: Duration = Duration::from_secs(15 * 60);
 
     pub fn new(credentials: CredentialStore, timeout: Duration) -> Result<Self, CatalogError> {
         let client = Client::builder()
@@ -122,19 +122,41 @@ impl BilibiliAdapter {
         &self,
         force: bool,
     ) -> Result<Option<crate::catalog::ProviderAccountStatus>, CatalogError> {
-        let now = std::time::Instant::now();
-        let generation = {
+        let (refresh_gate, cached) = {
             let guard = self.account_cache.lock().map_err(|_| {
                 CatalogError::Transient("Bilibili account cache poisoned".to_owned())
             })?;
-            if !force
-                && let Some(status) =
-                    guard.cached(Self::ACCOUNT_CACHE_TTL, Self::ACCOUNT_CACHE_FAILED_TTL)
-            {
-                return Ok(Some(status));
-            }
-            guard.generation()
+            let cached = (!force)
+                .then(|| guard.cached(Self::ACCOUNT_CACHE_TTL, Self::ACCOUNT_CACHE_FAILED_TTL))
+                .flatten();
+            (guard.refresh_gate(), cached)
         };
+        if let Some(status) = cached {
+            return Ok(Some(status));
+        }
+
+        let mut waited_for_refresh = false;
+        let _status_refresh = match refresh_gate.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                waited_for_refresh = true;
+                refresh_gate.lock().await
+            }
+        };
+        let (generation, cached) = {
+            let guard = self.account_cache.lock().map_err(|_| {
+                CatalogError::Transient("Bilibili account cache poisoned".to_owned())
+            })?;
+            let cached = (!force || waited_for_refresh)
+                .then(|| guard.cached(Self::ACCOUNT_CACHE_TTL, Self::ACCOUNT_CACHE_FAILED_TTL))
+                .flatten();
+            (guard.generation(), cached)
+        };
+        if let Some(status) = cached {
+            return Ok(Some(status));
+        }
+
+        let now = std::time::Instant::now();
         let checked_at_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()

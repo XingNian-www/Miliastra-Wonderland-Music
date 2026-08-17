@@ -6,7 +6,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use serde::Serialize;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 use tokio::task::{AbortHandle, Id as TaskId, JoinError, JoinHandle as TokioJoinHandle, JoinSet};
 use uuid::Uuid;
 
@@ -17,7 +17,8 @@ use crate::catalog::{
 };
 use crate::core::{PlaybackCore, PlaybackCoreError};
 use crate::credentials::{
-    CredentialRefreshLease, CredentialStatus, CredentialStore, ProviderCredential,
+    CredentialRefreshLease, CredentialStatus, CredentialStore, DAILY_REFRESH_INTERVAL_MS,
+    ProviderCredential,
 };
 use crate::domain::{
     EndBehavior, EndCause, EngineState, Failure, PlaybackSnapshot as EngineSnapshot, SearchSpec,
@@ -33,7 +34,8 @@ const PRELOAD_CONCURRENCY_LIMIT: usize = 4;
 /// 预加载等待队列长度上限：队列满时丢弃新的预加载请求（fire-and-forget）。
 const PRELOAD_QUEUE_LIMIT: usize = 32;
 const SOURCE_TIMEOUT: Duration = Duration::from_secs(15);
-const REFRESH_CHECK_INTERVAL_MS: u64 = 12 * 60 * 60 * 1000;
+const REFRESH_CHECK_INTERVAL_MS: u64 = DAILY_REFRESH_INTERVAL_MS;
+const ACCOUNT_STATUS_CHECK_INTERVAL_MS: u64 = DAILY_REFRESH_INTERVAL_MS;
 const REFRESH_FAILURE_BACKOFF_MS: u64 = 15 * 60 * 1000;
 
 type Reply<T> = std_mpsc::SyncSender<Result<T, PlaybackError>>;
@@ -751,6 +753,9 @@ async fn run_commands(
     // 必须按 id 找回 key 才能释放对应 in-flight 标记，防止该曲目被永久堵住。
     let mut preload_task_keys: HashMap<TaskId, TrackKey> = HashMap::new();
     let mut pending_preloads: VecDeque<PlayableTrack> = VecDeque::new();
+    // A slow provider must not let later minute ticks start overlapping daily
+    // background refresh passes against the same accounts.
+    let background_refresh_lock = Arc::new(AsyncMutex::new(()));
     let mut refresh_tick = tokio::time::interval(Duration::from_secs(60));
     refresh_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -765,8 +770,8 @@ async fn run_commands(
                 completion = preloads.join_next_with_id(), if !preloads.is_empty() => {
                     RuntimeEvent::PreloadCompleted(completion)
                 }
-                command = commands.recv() => RuntimeEvent::Command(command),
                 _ = refresh_tick.tick() => RuntimeEvent::RefreshTick,
+                command = commands.recv() => RuntimeEvent::Command(command),
                 completion = searches.join_next(), if !searches.is_empty() => {
                     RuntimeEvent::SearchCompleted(completion)
                 }
@@ -781,8 +786,8 @@ async fn run_commands(
                 completion = preloads.join_next_with_id(), if !preloads.is_empty() => {
                     RuntimeEvent::PreloadCompleted(completion)
                 }
-                command = commands.recv() => RuntimeEvent::Command(command),
                 _ = refresh_tick.tick() => RuntimeEvent::RefreshTick,
+                command = commands.recv() => RuntimeEvent::Command(command),
                 completion = searches.join_next(), if !searches.is_empty() => {
                     RuntimeEvent::SearchCompleted(completion)
                 }
@@ -846,8 +851,13 @@ async fn run_commands(
                 // 自动刷新含网络请求,放入独立任务避免阻塞命令循环。
                 let core = core.clone();
                 let credentials = credentials.clone();
+                let background_refresh_lock = background_refresh_lock.clone();
                 tokio::spawn(async move {
+                    let Ok(_guard) = background_refresh_lock.try_lock() else {
+                        return;
+                    };
                     refresh_due_credentials(&core, &credentials).await;
+                    refresh_due_account_statuses(&core, &credentials).await;
                 });
                 continue;
             }
@@ -1744,6 +1754,53 @@ async fn refresh_due_credentials(core: &PlaybackCore, credentials: &CredentialSt
     }
 }
 
+/// Daily forced refresh of the account/VIP view for every configured provider.
+///
+/// This only reads existing credential snapshots and never starts a login flow.
+/// A stale/error response is retried on the short refresh backoff; a confirmed
+/// status is deferred for the normal daily interval.
+async fn refresh_due_account_statuses(core: &PlaybackCore, credentials: &CredentialStore) {
+    for provider in ProviderId::ALL {
+        let now = current_epoch_ms();
+        let snapshot = match credentials.snapshot(provider.as_str()) {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => continue,
+            Err(error) => {
+                tracing::warn!(provider = %provider, %error, "读取账号状态刷新凭据失败");
+                continue;
+            }
+        };
+        let due = match credentials.account_status_check_due(provider.as_str(), now) {
+            Ok(due) => due,
+            Err(error) => {
+                tracing::warn!(provider = %provider, %error, "读取账号状态刷新调度失败");
+                continue;
+            }
+        };
+        if !due {
+            continue;
+        }
+
+        let result = core.refresh_account_status(provider).await;
+        let delay = match &result {
+            Ok(Some(status)) if status.stale => REFRESH_FAILURE_BACKOFF_MS,
+            Ok(_) => ACCOUNT_STATUS_CHECK_INTERVAL_MS,
+            Err(_) => REFRESH_FAILURE_BACKOFF_MS,
+        };
+        let next_check_at_ms = current_epoch_ms().saturating_add(delay);
+        if let Err(error) = credentials.mark_account_status_check_finished_if_current_revision(
+            provider.as_str(),
+            snapshot.revision,
+            next_check_at_ms,
+        ) {
+            tracing::warn!(provider = %provider, %error, "保存账号状态刷新调度失败");
+        }
+        if let Err(error) = result {
+            tracing::warn!(provider = %provider, %error, "自动刷新账号状态失败");
+        }
+    }
+}
+
 fn current_epoch_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1802,7 +1859,7 @@ mod tests {
     use super::*;
     use crate::catalog::{
         CatalogError, KugouAccountAdapter, KugouAccountStatus, KugouListenReport,
-        PlaybackEligibility, ProviderSearchCandidate,
+        PlaybackEligibility, ProviderAccountStatus, ProviderSearchCandidate,
     };
     use crate::domain::{PlaybackSnapshot as EngineSnapshot, Song, SongKey, StreamSource};
     use crate::engine::{AudioEngine, EngineCommand, EngineError};
@@ -1810,9 +1867,29 @@ mod tests {
 
     struct FakeSource;
 
+    struct DailyAccountStatusSource {
+        forced_calls: Arc<AtomicUsize>,
+        stale: bool,
+    }
+
     struct SearchSource {
         provider: ProviderId,
         count: usize,
+    }
+
+    #[test]
+    fn invalid_resolver_locator_is_exposed_as_track_unavailable() {
+        let error = PlaybackError::from(crate::core::PlaybackCoreError::Catalog(
+            CatalogError::InvalidResolverLocator("bad album id".to_owned()),
+        ));
+
+        assert_eq!(error.code(), "track_unavailable");
+        assert!(matches!(
+            error,
+            PlaybackError::Failure(failure)
+                if failure.code == "track_unavailable"
+                    && failure.message == "track resolver metadata is invalid"
+        ));
     }
 
     #[async_trait]
@@ -1859,6 +1936,36 @@ mod tests {
                 text: key.id.clone(),
                 translation: Some(format!("translated-{}", key.id)),
             }]))
+        }
+    }
+
+    #[async_trait]
+    impl SourceAdapter for DailyAccountStatusSource {
+        async fn search(
+            &self,
+            _spec: &SearchSpec,
+        ) -> Result<Vec<ProviderSearchCandidate>, CatalogError> {
+            Ok(Vec::new())
+        }
+
+        async fn resolve(
+            &self,
+            _key: &SongKey,
+            _locator: Option<&crate::domain::ResolverLocator>,
+        ) -> Result<StreamSource, CatalogError> {
+            unreachable!("daily account refresh test does not resolve tracks")
+        }
+
+        async fn refresh_account_status(
+            &self,
+        ) -> Result<Option<ProviderAccountStatus>, CatalogError> {
+            self.forced_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(ProviderAccountStatus {
+                logged_in: true,
+                vip_known: true,
+                stale: self.stale,
+                ..ProviderAccountStatus::default()
+            }))
         }
     }
 
@@ -2304,6 +2411,74 @@ mod tests {
         }
     }
 
+    fn save_all_provider_credentials(credentials: &CredentialStore) {
+        credentials
+            .save(
+                "qqmusic",
+                ProviderCredential::QqMusic {
+                    cookies: BTreeMap::from([
+                        ("uin".to_owned(), "42".to_owned()),
+                        ("qqmusic_key".to_owned(), "key".to_owned()),
+                    ]),
+                },
+            )
+            .unwrap();
+        credentials
+            .save(
+                "netease",
+                ProviderCredential::Netease {
+                    cookies: BTreeMap::from([("MUSIC_U".to_owned(), "session".to_owned())]),
+                },
+            )
+            .unwrap();
+        credentials
+            .save(
+                "bilibili",
+                ProviderCredential::Bilibili {
+                    cookies: BTreeMap::from([("SESSDATA".to_owned(), "session".to_owned())]),
+                    refresh_token: None,
+                },
+            )
+            .unwrap();
+        credentials
+            .save("kugou", kugou_credential("token"))
+            .unwrap();
+    }
+
+    fn account_refresh_core(forced_calls: Arc<AtomicUsize>, stale: bool) -> PlaybackCore {
+        let source: Arc<dyn SourceAdapter> = Arc::new(DailyAccountStatusSource {
+            forced_calls,
+            stale,
+        });
+        let sources = ProviderId::ALL
+            .into_iter()
+            .map(|provider| (provider.to_string(), source.clone()))
+            .collect::<Vec<_>>();
+        PlaybackCore::new(
+            SourceCatalog::new(sources),
+            Arc::new(FakeEngine::new()),
+            Duration::from_secs(1),
+        )
+    }
+
+    fn mark_account_checks_due(credentials: &CredentialStore) {
+        for provider in ProviderId::ALL {
+            let snapshot = credentials
+                .snapshot(provider.as_str())
+                .unwrap()
+                .expect("configured credential must have a snapshot");
+            assert!(
+                credentials
+                    .mark_account_status_check_finished_if_current_revision(
+                        provider.as_str(),
+                        snapshot.revision,
+                        0,
+                    )
+                    .unwrap()
+            );
+        }
+    }
+
     #[tokio::test]
     async fn kugou_refresh_uses_the_original_snapshot_and_cannot_overwrite_newer_login() {
         let credentials = CredentialStore::memory();
@@ -2350,6 +2525,99 @@ mod tests {
             credentials.get("kugou").unwrap(),
             Some(newer_credential),
             "旧刷新结果不得覆盖新登录凭据"
+        );
+    }
+
+    #[tokio::test]
+    async fn newly_saved_credentials_are_not_immediately_due_for_background_refresh() {
+        let credentials = CredentialStore::memory();
+        credentials
+            .save("kugou", kugou_credential("token"))
+            .unwrap();
+        let (refresh_started_tx, mut refresh_started_rx) = oneshot::channel();
+        let refresh_adapter = Arc::new(BlockingKugouRefresh {
+            refresh_started: Mutex::new(Some(refresh_started_tx)),
+            release_refresh: Arc::new(Notify::new()),
+            refreshed: kugou_credential("refreshed-token"),
+        });
+        let core = PlaybackCore::new(
+            SourceCatalog::new(Vec::<(String, Arc<dyn SourceAdapter>)>::new())
+                .with_kugou_account(refresh_adapter as Arc<dyn KugouAccountAdapter>),
+            Arc::new(FakeEngine::new()),
+            Duration::from_secs(1),
+        );
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            refresh_due_credentials(&core, &credentials),
+        )
+        .await
+        .expect("a newly saved credential should be skipped without a network refresh");
+        assert!(refresh_started_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn daily_account_refresh_checks_each_configured_provider_once() {
+        let credentials = CredentialStore::memory();
+        save_all_provider_credentials(&credentials);
+        mark_account_checks_due(&credentials);
+        let forced_calls = Arc::new(AtomicUsize::new(0));
+        let core = account_refresh_core(forced_calls.clone(), false);
+
+        refresh_due_account_statuses(&core, &credentials).await;
+
+        assert_eq!(forced_calls.load(Ordering::SeqCst), ProviderId::ALL.len());
+        for provider in ProviderId::ALL {
+            assert!(
+                !credentials
+                    .account_status_check_due(provider.as_str(), current_epoch_ms())
+                    .unwrap()
+            );
+        }
+        refresh_due_account_statuses(&core, &credentials).await;
+        assert_eq!(forced_calls.load(Ordering::SeqCst), ProviderId::ALL.len());
+    }
+
+    #[tokio::test]
+    async fn stale_daily_account_status_uses_the_short_retry_backoff() {
+        let credentials = CredentialStore::memory();
+        credentials
+            .save(
+                "qqmusic",
+                ProviderCredential::QqMusic {
+                    cookies: BTreeMap::from([
+                        ("uin".to_owned(), "42".to_owned()),
+                        ("qqmusic_key".to_owned(), "key".to_owned()),
+                    ]),
+                },
+            )
+            .unwrap();
+        let snapshot = credentials.snapshot("qqmusic").unwrap().unwrap();
+        credentials
+            .mark_account_status_check_finished_if_current_revision("qqmusic", snapshot.revision, 0)
+            .unwrap();
+        let forced_calls = Arc::new(AtomicUsize::new(0));
+        let core = account_refresh_core(forced_calls.clone(), true);
+        let before_refresh = current_epoch_ms();
+
+        refresh_due_account_statuses(&core, &credentials).await;
+
+        assert_eq!(forced_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            !credentials
+                .account_status_check_due(
+                    "qqmusic",
+                    before_refresh.saturating_add(REFRESH_FAILURE_BACKOFF_MS - 1),
+                )
+                .unwrap()
+        );
+        assert!(
+            credentials
+                .account_status_check_due(
+                    "qqmusic",
+                    current_epoch_ms().saturating_add(REFRESH_FAILURE_BACKOFF_MS),
+                )
+                .unwrap()
         );
     }
 

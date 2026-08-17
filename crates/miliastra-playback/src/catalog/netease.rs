@@ -90,14 +90,14 @@ pub struct NeteaseAdapter {
     lyrics_url: Url,
     account_url: Url,
     vip_url: Url,
-    /// 账号状态采用30分钟乐观缓存，避免轮询频繁打账号接口。
+    /// 账号状态采用 24 小时乐观缓存，避免轮询频繁打账号接口。
     account_cache: std::sync::Arc<std::sync::Mutex<AccountStatusCache>>,
 }
 
 /// 网易账号状态缓存有效期（查询成功时）。
-const ACCOUNT_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
+const ACCOUNT_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// 查询失败（未登录/风控/超时）时的短缓存。
-const ACCOUNT_CACHE_FAILED_TTL: Duration = Duration::from_secs(60);
+const ACCOUNT_CACHE_FAILED_TTL: Duration = Duration::from_secs(15 * 60);
 
 impl NeteaseAdapter {
     pub fn new(credentials: CredentialStore, timeout: Duration) -> Result<Self, CatalogError> {
@@ -225,20 +225,42 @@ impl NeteaseAdapter {
         &self,
         force: bool,
     ) -> Result<Option<ProviderAccountStatus>, CatalogError> {
-        let now = std::time::Instant::now();
-        let checked_at_ms = epoch_ms();
-        let (generation, cached) = {
+        let (refresh_gate, cached) = {
             let guard = self.account_cache.lock().map_err(|_| {
                 CatalogError::Transient("NetEase account cache poisoned".to_owned())
             })?;
             let cached = (!force)
                 .then(|| guard.cached(ACCOUNT_CACHE_TTL, ACCOUNT_CACHE_FAILED_TTL))
                 .flatten();
+            (guard.refresh_gate(), cached)
+        };
+        if let Some(status) = cached {
+            return Ok(Some(status));
+        }
+
+        let mut waited_for_refresh = false;
+        let _status_refresh = match refresh_gate.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                waited_for_refresh = true;
+                refresh_gate.lock().await
+            }
+        };
+        let (generation, cached) = {
+            let guard = self.account_cache.lock().map_err(|_| {
+                CatalogError::Transient("NetEase account cache poisoned".to_owned())
+            })?;
+            let cached = (!force || waited_for_refresh)
+                .then(|| guard.cached(ACCOUNT_CACHE_TTL, ACCOUNT_CACHE_FAILED_TTL))
+                .flatten();
             (guard.generation(), cached)
         };
         if let Some(status) = cached {
-            return Ok(Some(status.clone()));
+            return Ok(Some(status));
         }
+
+        let now = std::time::Instant::now();
+        let checked_at_ms = epoch_ms();
         let result = self.account_status_uncached().await;
         let mut guard = self
             .account_cache
@@ -367,6 +389,54 @@ impl NeteaseAdapter {
             .filter(|expire| *expire > 0)
             .map(|expire| expire as u64)
     }
+
+    /// 登录阶段必须确认候选 cookie 对账号接口有效。搜索接口可匿名使用，不能
+    /// 作为登录成功的依据。
+    async fn validate_account_credential(
+        &self,
+        credential: &ProviderCredential,
+    ) -> Result<(), CatalogError> {
+        let payload = weapi_encrypt(&serde_json::json!({}))?;
+        let response = self
+            .client
+            .post(self.account_url.clone())
+            .form(&payload)
+            .header("Cookie", cookie_header(credential.cookies()))
+            .header("Referer", "https://music.163.com/")
+            .header("x-os", "web")
+            .send()
+            .await
+            .map_err(classify_request_error)?;
+        classify_status(&response)?;
+        let value = response
+            .json::<Value>()
+            .await
+            .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?;
+        if value
+            .get("code")
+            .and_then(Value::as_i64)
+            .is_some_and(|code| matches!(code, 301 | 400 | 401))
+        {
+            return Err(CatalogError::CredentialRejected(
+                "NetEase account session is not authenticated".to_owned(),
+            ));
+        }
+        let Some(profile) = value.get("profile").filter(|value| value.is_object()) else {
+            return Err(CatalogError::InvalidResponse(
+                "NetEase credential validation response is missing profile".to_owned(),
+            ));
+        };
+        if !profile
+            .get("userId")
+            .and_then(Value::as_i64)
+            .is_some_and(|user_id| user_id > 0)
+        {
+            return Err(CatalogError::CredentialRejected(
+                "NetEase account session has no user id".to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -380,15 +450,7 @@ impl SourceAdapter for NeteaseAdapter {
                 "NetEase candidate provider does not match adapter".to_owned(),
             ));
         }
-        let response = self
-            .search_json_with_credential(candidate, "validation", 1)
-            .await?;
-        if !response.is_object() {
-            return Err(CatalogError::InvalidResponse(
-                "NetEase credential validation response is not an object".to_owned(),
-            ));
-        }
-        Ok(())
+        self.validate_account_credential(candidate).await
     }
 
     async fn search(

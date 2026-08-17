@@ -77,29 +77,29 @@ pub(super) fn tool_templates_route(
     _query: &[(String, String)],
     state: &HttpSharedState,
 ) -> std::result::Result<String, AppError> {
-    let marker_threshold = state.config.templates.marker_threshold;
+    let config = state.live_configs.snapshot();
+    let marker_threshold = config.templates.marker_threshold;
     let mut templates = vec![
-        json!({ "name": "blue-marker", "label": "蓝色聊天标志", "region": state.config.screen.chat_rect, "threshold": marker_threshold }),
-        json!({ "name": "yellow-marker", "label": "黄色聊天标志", "region": state.config.screen.chat_rect, "threshold": marker_threshold }),
-        json!({ "name": "pink-marker", "label": "粉色聊天标志", "region": state.config.screen.chat_rect, "threshold": marker_threshold }),
-        json!({ "name": "friend", "label": "好友按钮", "region": state.config.screen.friend_rect, "threshold": marker_threshold }),
-        json!({ "name": "secondary-back", "label": "二级聊天返回按钮", "region": state.config.screen.secondary_back_rect, "threshold": marker_threshold }),
-        json!({ "name": "secondary-hall", "label": "二级当前大厅", "region": state.config.screen.secondary_hall_rect, "threshold": marker_threshold }),
-        json!({ "name": "invite-view-star", "label": "邀请查看千星", "region": state.config.invite.view_star_region, "threshold": marker_threshold }),
-        json!({ "name": "invite-goto-hall", "label": "邀请前往大厅", "region": state.config.invite.goto_hall_region, "threshold": marker_threshold }),
-        json!({ "name": "invite-enter-hall", "label": "邀请进入大厅", "region": state.config.invite.enter_hall_region, "threshold": marker_threshold }),
-        json!({ "name": "friend-panel", "label": "好友面板", "region": state.config.moderation.friend_panel_region, "threshold": marker_threshold }),
-        json!({ "name": "friend-search-panel", "label": "好友搜索面板", "region": state.config.moderation.search_panel_region, "threshold": marker_threshold }),
-        json!({ "name": "friend-more-settings", "label": "好友更多设置", "region": state.config.moderation.more_settings_region, "threshold": marker_threshold }),
-        json!({ "name": "friend-block-chat", "label": "屏蔽聊天", "region": state.config.moderation.block_chat_region, "threshold": marker_threshold }),
-        json!({ "name": "friend-blacklist", "label": "拉黑", "region": state.config.moderation.blacklist_region, "threshold": marker_threshold }),
-        json!({ "name": "friend-confirm", "label": "好友操作确认", "region": state.config.moderation.confirm_region, "threshold": marker_threshold }),
-        json!({ "name": "wonderland-confirm", "label": "千星确认按钮", "region": state.config.startup.wonderland_confirm_region, "threshold": state.config.startup.wonderland_confirm_threshold }),
-        json!({ "name": "paimon-menu", "label": "派蒙主界面", "region": state.config.startup.main_ui_region, "threshold": state.config.startup.template_threshold }),
-        json!({ "name": "wonderland-map-star", "label": "千星地图入口", "region": state.config.startup.wonderland_map_star_region, "threshold": state.config.startup.template_threshold }),
+        json!({ "name": "blue-marker", "label": "蓝色聊天标志", "region": config.screen.chat_rect, "threshold": marker_threshold }),
+        json!({ "name": "yellow-marker", "label": "黄色聊天标志", "region": config.screen.chat_rect, "threshold": marker_threshold }),
+        json!({ "name": "pink-marker", "label": "粉色聊天标志", "region": config.screen.chat_rect, "threshold": marker_threshold }),
+        json!({ "name": "friend", "label": "好友按钮", "region": config.screen.friend_rect, "threshold": marker_threshold }),
+        json!({ "name": "secondary-back", "label": "二级聊天返回按钮", "region": config.screen.secondary_back_rect, "threshold": marker_threshold }),
+        json!({ "name": "secondary-hall", "label": "二级当前大厅", "region": config.screen.secondary_hall_rect, "threshold": marker_threshold }),
+        json!({ "name": "invite-view-star", "label": "邀请查看千星", "region": config.invite.view_star_region, "threshold": marker_threshold }),
+        json!({ "name": "invite-goto-hall", "label": "邀请前往大厅", "region": config.invite.goto_hall_region, "threshold": marker_threshold }),
+        json!({ "name": "invite-enter-hall", "label": "邀请进入大厅", "region": config.invite.enter_hall_region, "threshold": marker_threshold }),
+        json!({ "name": "friend-panel", "label": "好友面板", "region": config.moderation.friend_panel_region, "threshold": marker_threshold }),
+        json!({ "name": "friend-search-panel", "label": "好友搜索面板", "region": config.moderation.search_panel_region, "threshold": marker_threshold }),
+        json!({ "name": "friend-more-settings", "label": "好友更多设置", "region": config.moderation.more_settings_region, "threshold": marker_threshold }),
+        json!({ "name": "friend-block-chat", "label": "屏蔽聊天", "region": config.moderation.block_chat_region, "threshold": marker_threshold }),
+        json!({ "name": "friend-blacklist", "label": "拉黑", "region": config.moderation.blacklist_region, "threshold": marker_threshold }),
+        json!({ "name": "friend-confirm", "label": "好友操作确认", "region": config.moderation.confirm_region, "threshold": marker_threshold }),
+        json!({ "name": "wonderland-confirm", "label": "千星确认按钮", "region": config.startup.wonderland_confirm_region, "threshold": config.startup.wonderland_confirm_threshold }),
+        json!({ "name": "paimon-menu", "label": "派蒙主界面", "region": config.startup.main_ui_region, "threshold": config.startup.template_threshold }),
+        json!({ "name": "wonderland-map-star", "label": "千星地图入口", "region": config.startup.wonderland_map_star_region, "threshold": config.startup.template_threshold }),
     ];
-    let mut custom = state
-        .config
+    let mut custom = config
         .custom_workflows
         .templates
         .keys()
@@ -111,7 +111,7 @@ pub(super) fn tool_templates_route(
             "name": name,
             "label": format!("自定义: {name}"),
             "region": null,
-            "threshold": state.config.custom_workflows.default_threshold,
+            "threshold": config.custom_workflows.default_threshold,
         })
     }));
     serde_json::to_string(&templates).map_err(internal_error)
@@ -162,8 +162,9 @@ pub(super) fn tool_template_route(
     query: &[(String, String)],
     state: &HttpSharedState,
 ) -> std::result::Result<String, AppError> {
+    let config = state.live_configs.snapshot();
     let name = normalize_required_text(query_value(query, "template"), "template")?;
-    let template = WebToolTemplate::parse(&name, &state.config.custom_workflows.templates)
+    let template = WebToolTemplate::parse(&name, &config.custom_workflows.templates)
         .map_err(|error| bad_request(&error.to_string()))?;
     let rect = query_value(query, "rect")
         .filter(|value| !value.trim().is_empty())
@@ -174,8 +175,8 @@ pub(super) fn tool_template_route(
     let rect = rect.map(|rect| {
         crate::ui::geometry::clamp_rect(
             rect,
-            state.config.screen.expected_width,
-            state.config.screen.expected_height,
+            config.screen.expected_width,
+            config.screen.expected_height,
         )
     });
     let threshold = query_value(query, "threshold")
@@ -235,12 +236,13 @@ pub(super) fn tool_chat_change_samples_route(
     state: &HttpSharedState,
 ) -> std::result::Result<String, AppError> {
     let samples = parse_bounded_u32(query_value(query, "samples"), "samples", 1, 30, 10)?;
+    let live_config = state.live_configs.snapshot();
     let interval_ms = parse_bounded_u64(
         query_value(query, "intervalMs"),
         "intervalMs",
         50,
         5_000,
-        state.config.timing.loop_idle_ms,
+        live_config.timing.loop_idle_ms,
     )?;
     enqueue_web_tool(
         state,

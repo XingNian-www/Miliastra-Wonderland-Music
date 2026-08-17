@@ -165,7 +165,7 @@ impl ApplicationRuntime {
                 http_config.access_token
             );
         }
-        let server = http::start(http::HttpSharedState::new(
+        let http_state = http::HttpSharedState::new(
             http::HttpInterfaceConfig::new(
                 http_config,
                 self.lifecycle.config.screen.clone(),
@@ -203,7 +203,9 @@ impl ApplicationRuntime {
                     self.business.ai.clone(),
                 )),
             ),
-        ))?;
+        );
+        self.lifecycle.http_reload_blockers = http_state.active_reload_blockers.clone();
+        let server = http::start(http_state)?;
         self.lifecycle.http_server = Some(server);
         Ok(())
     }
@@ -257,16 +259,16 @@ impl ApplicationRuntime {
             .as_ref()
             .context("UI runtime 在扫描循环启动前已停止")?
             .handle();
-        let frame_demand = FrameDemand::new(Duration::from_millis(
-            self.lifecycle.config.timing.loop_idle_ms.max(1),
-        ))
-        .context("创建聊天观察帧需求")?;
+        let initial_live_config = self.lifecycle.live_configs.snapshot();
+        let mut frame_demand_ms = initial_live_config.timing.loop_idle_ms.max(1);
+        let mut frame_demand = FrameDemand::new(Duration::from_millis(frame_demand_ms))
+            .context("创建聊天观察帧需求")?;
         let mut frame_subscription: Option<FrameDemandSubscription> = None;
         let mut last_fingerprint: Option<ChangeFingerprint> = None;
         let mut last_ocr_at = Instant::now()
-            - Duration::from_millis(self.lifecycle.config.timing.chat_scan.fallback_ms);
+            - Duration::from_millis(initial_live_config.timing.chat_scan.fallback_ms);
         let mut last_change_ocr_at = Instant::now()
-            - Duration::from_millis(self.lifecycle.config.timing.chat_scan.change_cooldown_ms);
+            - Duration::from_millis(initial_live_config.timing.chat_scan.change_cooldown_ms);
         let mut suppress_change_until = Instant::now();
         let mut force_scan_after: Option<Instant> = None;
         let mut force_scan_reason: Option<&'static str> = None;
@@ -281,6 +283,18 @@ impl ApplicationRuntime {
 
         log::info!("自动化扫描已启动");
         while self.lifecycle.running.load(AtomicOrdering::SeqCst) {
+            let live_config = self.lifecycle.live_configs.snapshot();
+            let next_frame_demand_ms = live_config.timing.loop_idle_ms.max(1);
+            if next_frame_demand_ms != frame_demand_ms {
+                if let Some(subscription) = frame_subscription.take()
+                    && let Err(error) = subscription.cancel()
+                {
+                    log::warn!("主循环间隔变化时撤销旧观察帧需求失败: {error}");
+                }
+                frame_demand = FrameDemand::new(Duration::from_millis(next_frame_demand_ms))
+                    .context("更新聊天观察帧需求")?;
+                frame_demand_ms = next_frame_demand_ms;
+            }
             self.forward_completion_advances(completion_subscriber)?;
             let loop_started = Instant::now();
             self.update_monitor_operational_state();
@@ -302,9 +316,13 @@ impl ApplicationRuntime {
                 secondary_title_fingerprint = None;
                 secondary_identity = None;
                 self.maybe_idle_exit()?;
-                sleep(Duration::from_millis(
-                    self.lifecycle.config.timing.loop_idle_ms,
-                ));
+                self.maybe_reload_config_when_idle();
+                if !self.lifecycle.running.load(AtomicOrdering::SeqCst) {
+                    continue;
+                }
+                sleep(
+                    self.reload_aware_wait(Duration::from_millis(live_config.timing.loop_idle_ms)),
+                );
                 continue;
             }
             if self.lifecycle.paused.load(AtomicOrdering::SeqCst) {
@@ -314,9 +332,13 @@ impl ApplicationRuntime {
                     log::warn!("暂停监听时撤销观察帧需求失败: {error}");
                 }
                 self.maybe_idle_exit()?;
-                sleep(Duration::from_millis(
-                    self.lifecycle.config.timing.loop_idle_ms,
-                ));
+                self.maybe_reload_config_when_idle();
+                if !self.lifecycle.running.load(AtomicOrdering::SeqCst) {
+                    continue;
+                }
+                sleep(
+                    self.reload_aware_wait(Duration::from_millis(live_config.timing.loop_idle_ms)),
+                );
                 continue;
             }
 
@@ -335,7 +357,7 @@ impl ApplicationRuntime {
                     .expect("frame subscription initialized above"),
                 &canvas,
             ) {
-                Ok(frame) => {
+                Ok(Some(frame)) => {
                     if let Ok(mut latest_frame) = self.ui.latest_frame.lock() {
                         latest_frame.store(Arc::clone(&frame.image));
                     } else {
@@ -463,7 +485,7 @@ impl ApplicationRuntime {
                                 last_fingerprint = Some(fingerprint);
                                 let scan_after = now
                                     + Duration::from_millis(
-                                        self.lifecycle.config.timing.chat_scan.change_debounce_ms,
+                                        live_config.timing.chat_scan.change_debounce_ms,
                                     );
                                 if force_scan_after.is_none_or(|time| scan_after < time) {
                                     force_scan_after = Some(scan_after);
@@ -471,14 +493,14 @@ impl ApplicationRuntime {
                                 }
                                 log::info!(target: "timing",
                                     "进入一级界面，已建立聊天区对比基线，快速扫描延迟={}ms",
-                                    self.lifecycle.config.timing.chat_scan.change_debounce_ms
+                                    live_config.timing.chat_scan.change_debounce_ms
                                 );
                             }
                             let change_suppressed = now < suppress_change_until;
                             let forced_scan_due = force_scan_after.is_some_and(|time| now >= time);
                             let cooldown_until = last_change_ocr_at
                                 + Duration::from_millis(
-                                    self.lifecycle.config.timing.chat_scan.change_cooldown_ms,
+                                    live_config.timing.chat_scan.change_cooldown_ms,
                                 );
                             let change_stats = fingerprint.as_ref().and_then(|current| {
                                 last_fingerprint
@@ -509,7 +531,7 @@ impl ApplicationRuntime {
                                 && (forced_scan_due
                                     || now.duration_since(last_ocr_at)
                                         >= Duration::from_millis(
-                                            self.lifecycle.config.timing.chat_scan.fallback_ms,
+                                            live_config.timing.chat_scan.fallback_ms,
                                         ));
                             let change_due = change_over_threshold && change_ready;
 
@@ -520,10 +542,10 @@ impl ApplicationRuntime {
                                     "触发聊天扫描: reason=change mean={:.3} ratio={:.5} debounce={}ms",
                                     stats.mean_abs_diff,
                                     stats.changed_ratio,
-                                    self.lifecycle.config.timing.chat_scan.change_debounce_ms
+                                    live_config.timing.chat_scan.change_debounce_ms
                                 );
                                 sleep(Duration::from_millis(
-                                    self.lifecycle.config.timing.chat_scan.change_debounce_ms,
+                                    live_config.timing.chat_scan.change_debounce_ms,
                                 ));
                                 let rescan_frame_started = Instant::now();
                                 match receive_observation_frame(
@@ -532,7 +554,7 @@ impl ApplicationRuntime {
                                         .expect("frame subscription initialized above"),
                                     &canvas,
                                 ) {
-                                    Ok(frame) => {
+                                    Ok(Some(frame)) => {
                                         let rescan_frame_ms = elapsed_ms(rescan_frame_started);
                                         let scan_started = Instant::now();
                                         let observation_frame = self
@@ -583,6 +605,7 @@ impl ApplicationRuntime {
                                         .ok();
                                         scanned_this_round = true;
                                     }
+                                    Ok(None) => log::debug!("变化后等待新观察帧超时，本轮稍后重试"),
                                     Err(error) => log::error!("变化后截图失败: {error:#}"),
                                 }
                             } else if fallback_due {
@@ -696,6 +719,10 @@ impl ApplicationRuntime {
                         }
                     }
                 }
+                Ok(None) => {
+                    self.maybe_reload_config_when_idle();
+                    continue;
+                }
                 Err(error) => {
                     self.invalidate_latest_frame();
                     if let Some(subscription) = frame_subscription.take()
@@ -719,21 +746,26 @@ impl ApplicationRuntime {
                     secondary_identity = None;
                     let observed_window_detection_generation =
                         self.ui.window_detection_signal.generation()?;
+                    let target_missing_wait = self.reload_aware_wait(target_missing_backoff);
                     log::warn!(
                         "截图失败，{}秒后重试: {error:#}",
-                        target_missing_backoff.as_secs()
+                        target_missing_wait.as_secs()
                     );
                     log::info!(target: "timing",
                         "主循环阶段耗时: total={}ms frame={}ms state=capture_error retry={}ms",
                         elapsed_ms(loop_started),
                         frame_ms,
-                        target_missing_backoff.as_millis()
+                        target_missing_wait.as_millis()
                     );
                     target_missing = true;
                     self.maybe_idle_exit()?;
+                    self.maybe_reload_config_when_idle();
+                    if !self.lifecycle.running.load(AtomicOrdering::SeqCst) {
+                        continue;
+                    }
                     if self.ui.window_detection_signal.wait_for_change(
                         observed_window_detection_generation,
-                        target_missing_backoff,
+                        target_missing_wait,
                     )? {
                         log::info!("收到窗口检测重置请求，立即重试并重置截图退避");
                         target_missing_backoff = TARGET_MISSING_BACKOFF_INITIAL;
@@ -746,7 +778,7 @@ impl ApplicationRuntime {
             }
             if primary_visible && self.maybe_warn_hall_expiring()? {
                 suppress_change_until = Instant::now()
-                    + Duration::from_millis(self.lifecycle.config.timing.command.post_settle_ms);
+                    + Duration::from_millis(live_config.timing.command.post_settle_ms);
                 force_scan_after = Some(suppress_change_until);
                 force_scan_reason = Some("hall-expiring");
                 last_fingerprint = None;
@@ -754,9 +786,11 @@ impl ApplicationRuntime {
             }
             self.forward_completion_advances(completion_subscriber)?;
             self.maybe_idle_exit()?;
-            sleep(Duration::from_millis(
-                self.lifecycle.config.timing.loop_idle_ms,
-            ));
+            self.maybe_reload_config_when_idle();
+            if !self.lifecycle.running.load(AtomicOrdering::SeqCst) {
+                continue;
+            }
+            sleep(self.reload_aware_wait(Duration::from_millis(live_config.timing.loop_idle_ms)));
         }
 
         if let Some(subscription) = frame_subscription

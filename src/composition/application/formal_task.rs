@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow};
 
 use super::{FormalTaskExecutionContext, PendingTask, PendingTaskExecution};
+use crate::config::LiveConfigs;
 use crate::features::hall::HallRuntimeState;
 use crate::features::playback::{PlaybackRuntimeState, QueueItem};
 use crate::features::startup::StartupTask;
@@ -284,7 +285,7 @@ impl FormalTaskRuntime {
         task_engine: TaskEngineHandle,
         running: Arc<AtomicBool>,
         paused: Arc<AtomicBool>,
-        post_settle: Duration,
+        live_configs: LiveConfigs,
         build_context: impl FnOnce(FormalTaskClient) -> FormalTaskExecutionContext,
     ) -> Result<Self> {
         let context = Arc::new(FormalTaskExecutionState {
@@ -304,7 +305,7 @@ impl FormalTaskRuntime {
             task_engine,
             running,
             paused,
-            post_settle,
+            PostSettleConfig::Live(live_configs),
             client,
             Some(context),
             Some(coordinator),
@@ -331,7 +332,7 @@ impl FormalTaskRuntime {
             task_engine,
             running,
             paused,
-            post_settle,
+            PostSettleConfig::Fixed(post_settle),
             client,
             None,
             coordinator,
@@ -342,7 +343,7 @@ impl FormalTaskRuntime {
         task_engine: TaskEngineHandle,
         running: Arc<AtomicBool>,
         paused: Arc<AtomicBool>,
-        post_settle: Duration,
+        post_settle: PostSettleConfig,
         client: FormalTaskClient,
         context: Option<Arc<FormalTaskExecutionState>>,
         coordinator: Option<UiCoordinator>,
@@ -441,7 +442,7 @@ fn run_task_loop(
     running: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     stop_requested: Arc<AtomicBool>,
-    post_settle: Duration,
+    post_settle: PostSettleConfig,
     coordinator: Option<UiCoordinator>,
 ) -> Result<()> {
     let mut generation = task_engine.generation()?;
@@ -461,7 +462,7 @@ fn run_task_loop(
                         &running,
                         &stop_requested,
                         &mut generation,
-                        post_settle,
+                        post_settle.current(),
                     )?;
                 }
             }
@@ -475,6 +476,24 @@ fn run_task_loop(
         generation = task_engine.wait_for_change(generation)?;
     }
     Ok(())
+}
+
+enum PostSettleConfig {
+    #[cfg(test)]
+    Fixed(Duration),
+    Live(LiveConfigs),
+}
+
+impl PostSettleConfig {
+    fn current(&self) -> Duration {
+        match self {
+            #[cfg(test)]
+            Self::Fixed(duration) => *duration,
+            Self::Live(configs) => {
+                Duration::from_millis(configs.snapshot().timing.command.post_settle_ms)
+            }
+        }
+    }
 }
 
 fn execute_formal_task(

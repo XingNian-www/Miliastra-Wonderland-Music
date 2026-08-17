@@ -4,7 +4,14 @@ fn main() {
 }
 
 #[cfg(target_os = "windows")]
-fn main() -> anyhow::Result<()> {
+fn is_config_reload_exit(code: Option<i32>) -> bool {
+    code == Some(i32::from(
+        miliastra_wonderland_music::CONFIG_RELOAD_EXIT_CODE,
+    ))
+}
+
+#[cfg(target_os = "windows")]
+fn main() -> anyhow::Result<std::process::ExitCode> {
     use std::process::Command;
     use std::thread::sleep;
     use std::time::Duration;
@@ -25,7 +32,8 @@ fn main() -> anyhow::Result<()> {
         default_config_path
     };
     if is_watchdog_child {
-        return miliastra_wonderland_music::run(&config_path);
+        let outcome = miliastra_wonderland_music::run(&config_path)?;
+        return Ok(std::process::ExitCode::from(outcome.exit_code()));
     }
 
     // 单实例互斥(仅看门狗父进程持有):避免重复启动导致全局热键
@@ -38,7 +46,7 @@ fn main() -> anyhow::Result<()> {
         Ok(handle) => {
             if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
                 eprintln!("Miliastra 已有实例在运行,请先退出旧实例");
-                return Ok(());
+                return Ok(std::process::ExitCode::SUCCESS);
             }
             Some(handle)
         }
@@ -53,11 +61,28 @@ fn main() -> anyhow::Result<()> {
             .with_context(|| format!("启动监听子进程失败: {}", current_exe.display()))?;
         let status = child.wait().context("等待监听子进程退出")?;
         if status.success() {
-            return Ok(());
+            return Ok(std::process::ExitCode::SUCCESS);
+        }
+        if is_config_reload_exit(status.code()) {
+            eprintln!("监听子进程已完成配置重载关停，立即重新启动");
+            continue;
         }
 
         let restart_ms = miliastra_wonderland_music::watchdog_restart_ms(&config_path)?;
         eprintln!("监听子进程异常退出: status={status}，{restart_ms}ms 后重启");
         sleep(Duration::from_millis(restart_ms));
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+    use super::is_config_reload_exit;
+
+    #[test]
+    fn watchdog_only_treats_the_reserved_code_as_a_configuration_reload() {
+        assert!(is_config_reload_exit(Some(75)));
+        assert!(!is_config_reload_exit(Some(0)));
+        assert!(!is_config_reload_exit(Some(1)));
+        assert!(!is_config_reload_exit(None));
     }
 }

@@ -20,7 +20,14 @@ impl ApplicationRuntime {
         }
     }
 
-    pub(super) fn reply_batch(&self, messages: &[&str], delay_ms: u64) -> Result<()> {
+    pub(super) fn reply_batch(&self, messages: &[&str], _delay_ms: u64) -> Result<()> {
+        let delay_ms = self
+            .lifecycle
+            .live_configs
+            .snapshot()
+            .timing
+            .command
+            .help_batch_ms;
         match self.active_ui_residency()? {
             UiResidency::Primary => self
                 .ui
@@ -88,17 +95,22 @@ impl UndercoverDeliveryPort for ApplicationRuntime {
 
     fn send_hall_batch(&self, messages: &[String]) -> Result<()> {
         let refs = messages.iter().map(String::as_str).collect::<Vec<_>>();
+        let help_batch_ms = self
+            .lifecycle
+            .live_configs
+            .snapshot()
+            .timing
+            .command
+            .help_batch_ms;
         match self.active_ui_residency()? {
-            UiResidency::Primary => self.ui.chat_output.send_batch_for_command_redacted(
-                &refs,
-                self.lifecycle.config.timing.command.help_batch_ms,
-            ),
-            UiResidency::SecondaryCurrentHall => {
-                self.ui.chat_output.send_current_chat_batch_redacted(
-                    &refs,
-                    self.lifecycle.config.timing.command.help_batch_ms,
-                )
-            }
+            UiResidency::Primary => self
+                .ui
+                .chat_output
+                .send_batch_for_command_redacted(&refs, help_batch_ms),
+            UiResidency::SecondaryCurrentHall => self
+                .ui
+                .chat_output
+                .send_current_chat_batch_redacted(&refs, help_batch_ms),
         }
     }
 }

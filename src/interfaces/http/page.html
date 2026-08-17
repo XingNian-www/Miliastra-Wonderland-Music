@@ -402,6 +402,7 @@ html[data-theme=light] .theme-toggle .moon{display:none}
 .config-field-meta{display:flex;gap:var(--sp-2);flex-wrap:wrap;align-items:center;font-size:var(--fs-tiny);color:var(--text-3)}
 .config-effect{display:inline-flex;align-items:center;padding:1px var(--sp-2);border-radius:999px;font-size:var(--fs-tiny);line-height:var(--lh-tiny)}
 .config-effect.live{background:var(--ok-soft);color:var(--ok)}
+.config-effect.idle-reload{background:var(--warn-soft);color:var(--warn)}
 .config-effect.restart{background:var(--info-soft);color:var(--info)}
 .config-effect.bootstrap{background:var(--fill-2);color:var(--text-3)}
 .config-field-error{color:var(--danger);font-size:var(--fs-meta);line-height:var(--lh-meta)}
@@ -1995,7 +1996,7 @@ function selectConfigSection(name){
 }
 function configEffectTag(field){
   if(field.source==='bootstrap')return '<span class="config-effect bootstrap">config.yaml</span>'
-  const map={live:['live','立即生效'],restart:['restart','重启生效']}
+  const map={live:['live','立即生效'],idleReload:['idle-reload','当前曲结束后重载'],restart:['restart','重启生效']}
   const item=map[field.effect]||['restart','重启生效']
   return '<span class="config-effect '+item[0]+'">'+item[1]+'</span>'
 }
@@ -2410,8 +2411,9 @@ async function applyConfigSaveResult(resp,action){
   }catch(e){
     message+='；配置已保存，但页面刷新失败：'+e.message
   }
-  if(resp.restartRequired)message+='\n以下配置需重启生效：'+formatConfigFields(resp.restartFields)
   if(resp.appliedLiveFields&&resp.appliedLiveFields.length)message+='\n已立即生效：'+formatConfigFields(resp.appliedLiveFields)
+  if(resp.reloadScheduled&&resp.reloadFields&&resp.reloadFields.length)message+='\n已安排当前曲结束后自动重载：'+formatConfigFields(resp.reloadFields)
+  if(resp.restartRequired)message+='\n以下配置需重启生效：'+formatConfigFields(resp.restartFields)
   showConfigMessage(message,'ok')
 }
 async function loadConfigPage(){

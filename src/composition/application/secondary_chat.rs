@@ -375,6 +375,7 @@ impl ApplicationRuntime {
         previous: &mut Option<Vec<SecondaryHallBubble>>,
         tracker: &mut SecondaryHallCommandTracker,
     ) -> Result<bool> {
+        let live_config = self.lifecycle.live_configs.snapshot();
         let current = secondary_hall_bubbles(image)?;
         let delta = secondary_hall_sequence_delta(previous.as_deref(), &current);
         match delta {
@@ -396,19 +397,13 @@ impl ApplicationRuntime {
                 return Ok(false);
             }
             SecondaryHallSequenceDelta::RetainedPrefix => {
-                if !tracker.scan_due(
-                    Instant::now(),
-                    self.lifecycle.config.timing.chat_scan.fallback_ms,
-                ) {
+                if !tracker.scan_due(Instant::now(), live_config.timing.chat_scan.fallback_ms) {
                     log::debug!("二级大厅当前只显示旧序列前缀，保留原基线等待完整观测");
                     return Ok(false);
                 }
             }
             SecondaryHallSequenceDelta::NoChange => {
-                if !tracker.scan_due(
-                    Instant::now(),
-                    self.lifecycle.config.timing.chat_scan.fallback_ms,
-                ) {
+                if !tracker.scan_due(Instant::now(), live_config.timing.chat_scan.fallback_ms) {
                     self.business
                         .business
                         .clear_turtle_soup_secondary_stability()?;
@@ -1148,6 +1143,7 @@ impl ApplicationRuntime {
 
     fn wait_for_secondary_bubble_stability(&self) -> Result<Frame> {
         const STABILITY_TIMEOUT_MS: u64 = 500;
+        let live_config = self.lifecycle.live_configs.snapshot();
 
         let canvas = Canvas {
             width: self.lifecycle.config.screen.expected_width,
@@ -1157,9 +1153,7 @@ impl ApplicationRuntime {
         let first = load_frame(&canvas, &self.ui.game_ui)?;
         let mut previous = latest_incoming_fingerprint(&first.image)?;
         let mut latest_frame = first;
-        let poll_ms = self
-            .lifecycle
-            .config
+        let poll_ms = live_config
             .timing
             .chat_scan
             .change_debounce_ms
@@ -1183,6 +1177,7 @@ impl ApplicationRuntime {
     fn wait_for_secondary_hall_stability(
         &self,
     ) -> Result<Option<(Frame, Vec<SecondaryHallBubble>)>> {
+        let live_config = self.lifecycle.live_configs.snapshot();
         let canvas = Canvas {
             width: self.lifecycle.config.screen.expected_width,
             height: self.lifecycle.config.screen.expected_height,
@@ -1190,17 +1185,13 @@ impl ApplicationRuntime {
         };
         let first = load_frame(&canvas, &self.ui.game_ui)?;
         let mut previous = secondary_hall_bubbles(&first.image)?;
-        let poll_ms = self
-            .lifecycle
-            .config
+        let poll_ms = live_config
             .timing
             .chat_scan
             .change_debounce_ms
             .clamp(100, 200);
-        let required_samples = self
-            .lifecycle
-            .config
-            .resolve_stability_count(self.lifecycle.config.stability.secondary_hall_count);
+        let required_samples =
+            live_config.resolve_stability_count(live_config.stability.secondary_hall_count);
         let mut stable_samples = 1_u32;
         let timeout_ms = poll_ms
             .saturating_mul(u64::from(required_samples.saturating_add(1)))
@@ -1231,6 +1222,7 @@ impl ApplicationRuntime {
     }
 
     fn wait_for_secondary_hall_command_stability(&self) -> Result<SecondaryHallCommandStability> {
+        let live_config = self.lifecycle.live_configs.snapshot();
         let canvas = Canvas {
             width: self.lifecycle.config.screen.expected_width,
             height: self.lifecycle.config.screen.expected_height,
@@ -1247,17 +1239,13 @@ impl ApplicationRuntime {
         )?;
         let mut previous_bubbles = first_bubbles;
         let mut previous_messages = first_messages;
-        let poll_ms = self
-            .lifecycle
-            .config
+        let poll_ms = live_config
             .timing
             .chat_scan
             .change_debounce_ms
             .clamp(100, 200);
-        let required_samples = self
-            .lifecycle
-            .config
-            .resolve_stability_count(self.lifecycle.config.stability.secondary_hall_count);
+        let required_samples =
+            live_config.resolve_stability_count(live_config.stability.secondary_hall_count);
         let mut stable_samples = 1_u32;
         let timeout_ms = poll_ms
             .saturating_mul(u64::from(required_samples.saturating_add(1)))

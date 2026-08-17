@@ -423,6 +423,25 @@ impl TaskEngineHandle {
         Ok(active_task_id)
     }
 
+    /// 仅当所有任务通道仍为空闲时，原子停止接收新工作。
+    ///
+    /// 闲置配置重载不能把“检查空闲”和“停止接单”拆成两次加锁，否则两步之间
+    /// 新入队的任务可能在调用方已经决定关停后被取消。返回 `false` 表示状态已不再
+    /// 空闲或任务引擎已经进入关停流程，调用方应保持当前进程运行。
+    pub(crate) fn begin_shutdown_if_idle(&self) -> Result<bool, TaskEngineError> {
+        let projection = {
+            let mut state = self.lock_state()?;
+            if !state.accepting || !Self::scheduler_snapshot(&state).is_idle() {
+                return Ok(false);
+            }
+            state.accepting = false;
+            Self::mark_changed(&mut state, &self.inner.changed);
+            Self::projection(&state)
+        };
+        self.publish_projection(projection);
+        Ok(true)
+    }
+
     fn release_lane(&self, lease: SchedulerLaneLease) -> Result<(), TaskEngineError> {
         let projection = {
             let mut state = self.lock_state()?;
@@ -893,6 +912,34 @@ mod tests {
                     Box::new(FormalNoop),
                 ))
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn idle_shutdown_atomically_stops_accepting_new_work() {
+        let engine = TaskEngineHandle::new(None);
+
+        assert!(engine.begin_shutdown_if_idle().unwrap());
+        assert!(!engine.begin_shutdown_if_idle().unwrap());
+        assert!(
+            engine
+                .enqueue_formal(formal_submission("late", None))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn idle_shutdown_refuses_pending_work_without_closing_the_engine() {
+        let engine = TaskEngineHandle::new(None);
+        engine
+            .enqueue_formal(formal_submission("pending", None))
+            .unwrap();
+
+        assert!(!engine.begin_shutdown_if_idle().unwrap());
+        assert!(
+            engine
+                .enqueue_formal(formal_submission("still accepted", None))
+                .is_ok()
         );
     }
 }

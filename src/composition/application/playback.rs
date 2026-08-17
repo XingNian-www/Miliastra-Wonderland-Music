@@ -28,6 +28,10 @@ impl ApplicationRuntime {
     }
 
     pub(super) fn execute_advance_queue_task(&mut self, reason: &'static str) -> Result<()> {
+        if !automatic_advance_allowed(&self.lifecycle.live_configs) {
+            log::info!("配置重载待处理，跳过自动下一曲: reason={reason}");
+            return Ok(());
+        }
         self.playback
             .playback_application
             .clone()
@@ -163,6 +167,13 @@ impl ApplicationRuntime {
     }
 }
 
+/// A pending child-process reload takes precedence over every monitor-scheduled
+/// queue advance. The queue remains persisted and will be available to the
+/// replacement process after the current request reaches its terminal state.
+fn automatic_advance_allowed(live_configs: &crate::config::LiveConfigs) -> bool {
+    !live_configs.has_pending_reload()
+}
+
 impl PlaybackExecutionPort for ApplicationRuntime {
     fn reply(&mut self, message: &str) -> Result<()> {
         ApplicationRuntime::reply(self, message)
@@ -264,6 +275,10 @@ impl PlaybackExecutionPort for ApplicationRuntime {
 
     fn user_pause_active(&mut self) -> Result<bool> {
         self.playback.player.user_pause_active()
+    }
+
+    fn automatic_queue_advance_allowed(&mut self) -> Result<bool> {
+        Ok(automatic_advance_allowed(&self.lifecycle.live_configs))
     }
 
     fn preload_track(&mut self, track: &miliastra_playback::PlayableTrack) -> Result<()> {
@@ -398,5 +413,20 @@ fn playback_search_failure(error: PlayerSearchClientError) -> PlaybackSearchFail
         PlayerSearchClientError::UnexpectedOutcome(outcome) => {
             PlaybackSearchFailure::Unexpected(outcome.to_string())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::automatic_advance_allowed;
+    use crate::config::LiveConfigs;
+
+    #[test]
+    fn pending_reload_suppresses_automatic_queue_advance() {
+        let live = LiveConfigs::default();
+        assert!(automatic_advance_allowed(&live));
+
+        live.schedule_reload(["queue.max_size".to_string()]);
+        assert!(!automatic_advance_allowed(&live));
     }
 }

@@ -627,6 +627,7 @@ pub struct HttpSharedState {
     pub monitor: MonitorShared,
     pub history: Arc<Mutex<VecDeque<HistoryItem>>>,
     pub active_connections: Arc<AtomicUsize>,
+    pub active_reload_blockers: Arc<AtomicUsize>,
     application: HttpApplicationPorts,
     latest_frame: Arc<Mutex<LatestFrameCache>>,
     /// 配置中心共享句柄（阶段 5 起由 HTTP 配置接口持有）。
@@ -637,6 +638,7 @@ pub struct HttpSharedState {
 }
 
 #[derive(Clone)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct HttpInterfaceConfig {
     http: HttpConfig,
     screen: ScreenConfig,
@@ -719,6 +721,7 @@ impl HttpSharedState {
             monitor,
             history: Arc::new(Mutex::new(VecDeque::new())),
             active_connections: Arc::new(AtomicUsize::new(0)),
+            active_reload_blockers: Arc::new(AtomicUsize::new(0)),
             application,
             latest_frame,
             config_store,
@@ -843,10 +846,17 @@ async fn axum_entry(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let blocks_idle_reload = request_blocks_idle_reload(uri.path());
     let active = state.active_connections.fetch_add(1, Ordering::SeqCst);
     let _guard = ActiveConnectionGuard {
         counter: state.active_connections.clone(),
     };
+    let _reload_blocker_guard = blocks_idle_reload.then(|| {
+        state.active_reload_blockers.fetch_add(1, Ordering::SeqCst);
+        ActiveConnectionGuard {
+            counter: state.active_reload_blockers.clone(),
+        }
+    });
     if active >= MAX_ACTIVE_CONNECTIONS {
         return plain_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1273,6 +1283,10 @@ fn enforce_method(
 
 fn is_mutating_route(path: &str) -> bool {
     body_route_spec(path).is_some() || route_spec(path).is_some_and(|route| route.mutating)
+}
+
+fn request_blocks_idle_reload(path: &str) -> bool {
+    is_mutating_route(path) || path == "/hall-screenshot"
 }
 
 fn status_code(status: u16) -> StatusCode {

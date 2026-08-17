@@ -4,29 +4,137 @@ use super::*;
 struct ReloadIdleState {
     task_engine_idle: bool,
     entertainment_idle: bool,
-    playback_idle: bool,
-    background_commands_idle: bool,
+    playback: PlaybackReloadReadiness,
     moderation_workers_idle: bool,
     login_helper_idle: bool,
     http_operations_idle: bool,
 }
 
 impl ReloadIdleState {
-    const fn is_idle(self) -> bool {
+    const fn non_http_idle(self, requires_playback_idle: bool) -> bool {
         self.task_engine_idle
             && self.entertainment_idle
-            && self.playback_idle
-            && self.background_commands_idle
+            && if requires_playback_idle {
+                matches!(
+                    self.playback,
+                    PlaybackReloadReadiness::Idle | PlaybackReloadReadiness::PausedRecoverable
+                )
+            } else {
+                !matches!(self.playback, PlaybackReloadReadiness::Unsafe)
+            }
             && self.moderation_workers_idle
             && self.login_helper_idle
-            && self.http_operations_idle
+    }
+
+    const fn is_idle(self, requires_playback_idle: bool) -> bool {
+        self.non_http_idle(requires_playback_idle) && self.http_operations_idle
+    }
+
+    const fn drain_readiness(self, requires_playback_idle: bool) -> ReloadDrainReadiness {
+        if !self.non_http_idle(requires_playback_idle) {
+            ReloadDrainReadiness::Unsafe
+        } else if self.http_operations_idle {
+            ReloadDrainReadiness::Ready
+        } else {
+            ReloadDrainReadiness::WaitingForHttp
+        }
     }
 }
 
-fn playback_is_idle(playback: &PlaybackRuntimeState) -> bool {
-    // 只有状态机明确确认 Idle 才允许重载；Unknown 代表观测不可靠，
-    // 必须继续等待，避免在仍可能播放时中断播放器。
-    playback.active_request.is_none() && playback.state == ConfirmedPlaybackState::Idle
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReloadDrainReadiness {
+    Unsafe,
+    WaitingForHttp,
+    Ready,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlaybackReloadReadiness {
+    Idle,
+    PlayingRecoverable,
+    PausedRecoverable,
+    Unsafe,
+}
+
+fn reload_fields_require_startup(fields: &std::collections::BTreeSet<String>) -> bool {
+    fields.iter().any(|field| {
+        matches!(
+            field.as_str(),
+            "startup"
+                | "startup.enabled"
+                | "startup.launch_game"
+                | "startup.enter_game"
+                | "startup.enter_wonderland"
+        )
+    })
+}
+
+fn playback_reload_readiness(playback: &PlaybackRuntimeState) -> PlaybackReloadReadiness {
+    if playback.active_request.is_none() && playback.state == ConfirmedPlaybackState::Idle {
+        return PlaybackReloadReadiness::Idle;
+    }
+    let recoverable_observation = |expected_status: &str, keep_paused: bool| {
+        let Some(active_track) = playback
+            .active_request
+            .as_ref()
+            .and_then(|request| request.track.as_ref())
+        else {
+            return false;
+        };
+        let Some(observation) = playback.last_observation.as_ref() else {
+            return false;
+        };
+        observation.status == expected_status
+            && observation.track.as_ref().is_some_and(|observed_track| {
+                observed_track.track_ref.key == active_track.track_ref.key
+            })
+            && has_restorable_playback_progress(Some(observation), keep_paused)
+    };
+    if playback.state == ConfirmedPlaybackState::PausedByUser
+        && recoverable_observation("paused", true)
+    {
+        return PlaybackReloadReadiness::PausedRecoverable;
+    }
+    if playback.state == ConfirmedPlaybackState::RequestedSongPlaying
+        && recoverable_observation("playing", false)
+    {
+        return PlaybackReloadReadiness::PlayingRecoverable;
+    }
+    PlaybackReloadReadiness::Unsafe
+}
+
+fn playback_reload_readiness_after_refresh(
+    playback: &PlaybackRuntimeState,
+    status: &PlayerStatus,
+) -> PlaybackReloadReadiness {
+    let readiness = playback_reload_readiness(playback);
+    let status_matches_active_track = playback
+        .active_request
+        .as_ref()
+        .and_then(|request| request.track.as_ref())
+        .zip(status.current_track.as_ref())
+        .is_some_and(|(requested, current)| requested.track_ref.key == current.track_ref.key);
+
+    match readiness {
+        PlaybackReloadReadiness::Idle
+            if matches!(status.status.as_str(), "stopped" | "stoped" | "idle") =>
+        {
+            PlaybackReloadReadiness::Idle
+        }
+        PlaybackReloadReadiness::PlayingRecoverable
+            if status.status == "playing" && status_matches_active_track =>
+        {
+            PlaybackReloadReadiness::PlayingRecoverable
+        }
+        PlaybackReloadReadiness::PausedRecoverable
+            if status.status == "paused" && status_matches_active_track =>
+        {
+            PlaybackReloadReadiness::PausedRecoverable
+        }
+        // 持久状态可能尚未追上刚开始的外部播放，或实时播放器已经切歌、停止。
+        // 最终关停必须以真实 transport 和曲目身份为准，不能截断无法恢复的音频。
+        _ => PlaybackReloadReadiness::Unsafe,
+    }
 }
 
 fn reload_poll_wait(requested: Duration, pending_reload: bool) -> Duration {
@@ -74,9 +182,15 @@ impl ApplicationRuntime {
     }
 
     pub(super) fn maybe_reload_config_when_idle(&mut self) {
-        if !self.lifecycle.running.load(AtomicOrdering::SeqCst)
+        if !self.lifecycle.running.load(AtomicOrdering::SeqCst) {
+            return;
+        }
+        if self.lifecycle.paused.load(AtomicOrdering::SeqCst)
             || !self.lifecycle.live_configs.has_pending_reload()
         {
+            self.lifecycle
+                .http_reload_draining
+                .store(false, AtomicOrdering::SeqCst);
             return;
         }
         let now = Instant::now();
@@ -84,42 +198,167 @@ impl ApplicationRuntime {
             return;
         }
         self.lifecycle.reload_check_after = now + CONFIG_RELOAD_IDLE_CHECK_INTERVAL;
-        let idle = match self.reload_idle_state() {
+        let preliminary_requires_playback_idle = self
+            .lifecycle
+            .live_configs
+            .pending_reload_requires_playback_idle();
+        let preliminary_idle = match self.reload_idle_state() {
             Ok(idle) => idle,
             Err(error) => {
+                self.lifecycle
+                    .http_reload_draining
+                    .store(false, AtomicOrdering::SeqCst);
                 log::warn!("读取闲置重载状态失败，本轮保持运行: {error:#}");
                 return;
             }
         };
-        if !idle.is_idle() {
+        if preliminary_idle.drain_readiness(preliminary_requires_playback_idle)
+            == ReloadDrainReadiness::Unsafe
+        {
+            self.lifecycle
+                .http_reload_draining
+                .store(false, AtomicOrdering::SeqCst);
+            return;
+        }
+        // 先关闭新的 HTTP 写操作准入，再复查现有请求，避免在读取到 0 后又有
+        // 登录、保存或播放器操作进入并被关停打断。
+        self.lifecycle
+            .http_reload_draining
+            .store(true, AtomicOrdering::SeqCst);
+        let idle = match self.reload_idle_state() {
+            Ok(idle) => idle,
+            Err(error) => {
+                self.lifecycle
+                    .http_reload_draining
+                    .store(false, AtomicOrdering::SeqCst);
+                log::warn!("进入 HTTP 排空后复查重载状态失败，本轮保持运行: {error:#}");
+                return;
+            }
+        };
+        match idle.drain_readiness(preliminary_requires_playback_idle) {
+            ReloadDrainReadiness::Unsafe => {
+                self.lifecycle
+                    .http_reload_draining
+                    .store(false, AtomicOrdering::SeqCst);
+                return;
+            }
+            ReloadDrainReadiness::WaitingForHttp => return,
+            ReloadDrainReadiness::Ready => {}
+        }
+
+        // blocker 归零后，所有已获准的保存请求都已完成；此时重新读取累计字段的
+        // 最严格屏障，避免并发保存把普通重载升级为播放器重载后仍沿用旧判断。
+        let requires_playback_idle = self
+            .lifecycle
+            .live_configs
+            .pending_reload_requires_playback_idle();
+        let mut idle = match self.reload_idle_state() {
+            Ok(idle) => idle,
+            Err(error) => {
+                self.lifecycle
+                    .http_reload_draining
+                    .store(false, AtomicOrdering::SeqCst);
+                log::warn!("HTTP 排空后复查重载状态失败，本轮保持运行: {error:#}");
+                return;
+            }
+        };
+        match idle.drain_readiness(requires_playback_idle) {
+            ReloadDrainReadiness::Unsafe => {
+                self.lifecycle
+                    .http_reload_draining
+                    .store(false, AtomicOrdering::SeqCst);
+                return;
+            }
+            ReloadDrainReadiness::WaitingForHttp => return,
+            ReloadDrainReadiness::Ready => {}
+        }
+        let refreshed_status = match self.refresh_playback_state_for_reload() {
+            Ok(status) => status,
+            Err(error) => {
+                self.lifecycle
+                    .http_reload_draining
+                    .store(false, AtomicOrdering::SeqCst);
+                log::warn!("配置重载前刷新播放器状态失败，本轮保持运行: {error:#}");
+                return;
+            }
+        };
+        idle = match self.reload_idle_state_with_status(Some(&refreshed_status)) {
+            Ok(idle) => idle,
+            Err(error) => {
+                self.lifecycle
+                    .http_reload_draining
+                    .store(false, AtomicOrdering::SeqCst);
+                log::warn!("刷新播放器状态后复查重载条件失败，本轮保持运行: {error:#}");
+                return;
+            }
+        };
+        if !idle.is_idle(requires_playback_idle) {
+            self.lifecycle
+                .http_reload_draining
+                .store(false, AtomicOrdering::SeqCst);
+            return;
+        }
+        // Reserve the reload outcome before sealing the task engine. A user exit records a
+        // higher-priority reason and can therefore win on either side of this claim.
+        if !self.lifecycle.shutdown.try_claim_config_reload() {
+            self.lifecycle
+                .http_reload_draining
+                .store(false, AtomicOrdering::SeqCst);
             return;
         }
         // 空闲检查与停止接单必须在任务引擎的同一把锁内完成，避免新任务落入两者之间。
         match self.business.task_engine.begin_shutdown_if_idle() {
             Ok(true) => {}
-            Ok(false) => return,
+            Ok(false) => {
+                self.lifecycle.shutdown.release_config_reload_claim();
+                self.lifecycle
+                    .http_reload_draining
+                    .store(false, AtomicOrdering::SeqCst);
+                return;
+            }
             Err(error) => {
+                self.lifecycle.shutdown.release_config_reload_claim();
+                self.lifecycle
+                    .http_reload_draining
+                    .store(false, AtomicOrdering::SeqCst);
                 log::warn!("重载关停前原子锁定任务引擎失败，本轮保持运行: {error}");
                 return;
             }
         }
-        let Some(fields) = self.lifecycle.live_configs.begin_reload() else {
-            return;
+        let fields = match self.lifecycle.live_configs.begin_reload() {
+            Some(fields) => fields,
+            None => {
+                // 任务引擎已经不可逆地停止接单；即使内部待重载标记出现异常，
+                // 也必须完成进程替换，不能留下一个仍运行但永远不再接收任务的 BOT。
+                log::error!("任务引擎已停止接单，但待重载字段无法认领，仍强制重载子进程");
+                Default::default()
+            }
         };
+        if reload_fields_require_startup(&fields) {
+            self.lifecycle.shutdown.require_startup_after_reload();
+        }
         log::info!(
             "运行环境已闲置，开始配置重载关停: fields={}",
             fields.into_iter().collect::<Vec<_>>().join(",")
         );
-        self.lifecycle.reload_on_exit = true;
         self.lifecycle.running.store(false, AtomicOrdering::SeqCst);
     }
 
     fn reload_idle_state(&self) -> Result<ReloadIdleState> {
+        self.reload_idle_state_with_status(None)
+    }
+
+    fn reload_idle_state_with_status(
+        &self,
+        refreshed_status: Option<&PlayerStatus>,
+    ) -> Result<ReloadIdleState> {
         let task_engine_idle = self.business.task_engine.is_idle()?;
         let entertainment_idle = self.business.business.active_entertainment()?.is_none();
         let playback = self.business.business.playback_state_snapshot()?;
-        let playback_idle = playback_is_idle(&playback);
-        let background_commands_idle = self.business.background_commands.is_idle()?;
+        let playback = refreshed_status.map_or_else(
+            || playback_reload_readiness(&playback),
+            |status| playback_reload_readiness_after_refresh(&playback, status),
+        );
         let moderation_workers_idle = self
             .business
             .moderation_workers
@@ -136,12 +375,30 @@ impl ApplicationRuntime {
         Ok(ReloadIdleState {
             task_engine_idle,
             entertainment_idle,
-            playback_idle,
-            background_commands_idle,
+            playback,
             moderation_workers_idle,
             login_helper_idle,
             http_operations_idle,
         })
+    }
+
+    fn refresh_playback_state_for_reload(&self) -> Result<PlayerStatus> {
+        let status = self.playback.player.status_for_reload()?;
+        let scheduler = self.business.task_engine.snapshot()?;
+        let context = QueueAdvanceContext {
+            queue_empty: self.playback_queue()?.is_empty(),
+            has_pending_playback_task: scheduler.pending_playback_related(),
+            command_executing: scheduler.is_busy(),
+        };
+        if matches!(
+            self.playback
+                .player
+                .maybe_advance_queue_for_reload(status.clone(), context)?,
+            QueueAdvanceDecision::AdvanceQueue { .. }
+        ) {
+            log::info!("配置重载待处理，刷新播放状态后抑制自动出队");
+        }
+        Ok(status)
     }
 
     pub(super) fn clear_idle_exit_timer(&self) -> Result<()> {
@@ -166,11 +423,14 @@ impl ApplicationRuntime {
             PendingTask::ConsoleChat { text, prefix } => self
                 .execute_console_chat_task(text, prefix)
                 .map(|_| PendingTaskExecution::Completed),
-            PendingTask::Startup(task) => self
-                .business
-                .startup
-                .execute(task, self)
-                .map(|_| PendingTaskExecution::Completed),
+            PendingTask::Startup(task) => {
+                let kind = task.kind();
+                let result = self.business.startup.execute(task, self);
+                if result.is_ok() {
+                    self.lifecycle.reload_startup.record_success(kind);
+                }
+                result.map(|_| PendingTaskExecution::Completed)
+            }
             PendingTask::ClearIdleExit => self
                 .clear_idle_exit_timer()
                 .map(|_| PendingTaskExecution::Completed),
@@ -312,15 +572,39 @@ impl ApplicationRuntime {
     }
 
     pub(super) fn enqueue_startup_task_if_enabled(&self) -> Result<()> {
-        if !self.lifecycle.config.startup.enabled {
-            return Ok(());
+        self.enqueue_startup_actions(ReloadStartupActions::from_startup_config(
+            &self.lifecycle.config,
+        ))
+    }
+
+    pub(super) fn require_reload_startup_automation(&self) -> Result<bool> {
+        let actions = self
+            .lifecycle
+            .reload_startup
+            .require_from_config(&self.lifecycle.config);
+        if actions.is_empty() {
+            return Ok(false);
         }
-        if self.lifecycle.config.startup.launch_game || self.lifecycle.config.startup.enter_game {
+        self.enqueue_reload_startup_tasks_if_needed()?;
+        Ok(true)
+    }
+
+    pub(super) fn enqueue_reload_startup_tasks_if_needed(&self) -> Result<bool> {
+        let missing = self.lifecycle.reload_startup.missing_actions();
+        if missing.is_empty() {
+            return Ok(false);
+        }
+        self.enqueue_startup_actions(missing)?;
+        Ok(true)
+    }
+
+    fn enqueue_startup_actions(&self, actions: ReloadStartupActions) -> Result<()> {
+        if actions.includes_start_game() {
             self.push_pending_task(PendingTask::Startup(StartupTask::start_game(
                 StartupSource::STARTUP_CONFIG,
             )))?;
         }
-        if self.lifecycle.config.startup.enter_wonderland {
+        if actions.includes_enter_wonderland() {
             self.push_pending_task(PendingTask::Startup(StartupTask::enter_wonderland(
                 StartupSource::STARTUP_CONFIG,
             )))?;
@@ -406,16 +690,20 @@ mod reload_tests {
     use std::time::Duration;
 
     use super::{
-        CONFIG_RELOAD_IDLE_CHECK_INTERVAL, ReloadIdleState, playback_is_idle, reload_poll_wait,
+        CONFIG_RELOAD_IDLE_CHECK_INTERVAL, PlaybackReloadReadiness, ReloadDrainReadiness,
+        ReloadIdleState, playback_reload_readiness, playback_reload_readiness_after_refresh,
+        reload_fields_require_startup, reload_poll_wait,
     };
-    use crate::features::playback::{ConfirmedPlaybackState, PlaybackRuntimeState};
+    use crate::features::playback::{
+        ActivePlaybackRequest, ConfirmedPlaybackState, ObservationReliability, PlaybackObservation,
+        PlaybackRuntimeState, PlayerStatus, test_track,
+    };
 
     fn idle_state() -> ReloadIdleState {
         ReloadIdleState {
             task_engine_idle: true,
             entertainment_idle: true,
-            playback_idle: true,
-            background_commands_idle: true,
+            playback: PlaybackReloadReadiness::Idle,
             moderation_workers_idle: true,
             login_helper_idle: true,
             http_operations_idle: true,
@@ -424,40 +712,237 @@ mod reload_tests {
 
     #[test]
     fn reload_requires_every_runtime_lane_to_be_idle() {
-        assert!(idle_state().is_idle());
+        assert!(idle_state().is_idle(false));
 
-        let mut states = [idle_state(); 7];
+        let mut states = [idle_state(); 6];
         states[0].task_engine_idle = false;
         states[1].entertainment_idle = false;
-        states[2].playback_idle = false;
-        states[3].background_commands_idle = false;
-        states[4].moderation_workers_idle = false;
-        states[5].login_helper_idle = false;
-        states[6].http_operations_idle = false;
+        states[2].playback = PlaybackReloadReadiness::Unsafe;
+        states[3].moderation_workers_idle = false;
+        states[4].login_helper_idle = false;
+        states[5].http_operations_idle = false;
 
-        assert!(states.into_iter().all(|state| !state.is_idle()));
+        assert!(states.into_iter().all(|state| !state.is_idle(false)));
+    }
+
+    #[test]
+    fn startup_fields_request_startup_automation_in_the_replacement() {
+        assert!(reload_fields_require_startup(
+            &std::collections::BTreeSet::from(["startup.enter_wonderland".to_string()])
+        ));
+        assert!(reload_fields_require_startup(
+            &std::collections::BTreeSet::from(["startup.enabled".to_string()])
+        ));
+        assert!(!reload_fields_require_startup(
+            &std::collections::BTreeSet::from(["startup.template_threshold".to_string()])
+        ));
+        assert!(!reload_fields_require_startup(
+            &std::collections::BTreeSet::from(["timing.loop_idle_ms".to_string()])
+        ));
     }
 
     #[test]
     fn reload_allows_queued_tracks_when_player_is_idle() {
         // 待重载时队列内容会留在持久化存储中，重启后的新进程继续消费；
         // 队列非空不应阻止当前歌曲结束后的重载。
-        assert!(idle_state().is_idle());
+        assert!(idle_state().is_idle(false));
     }
 
     #[test]
-    fn playback_reload_idle_rejects_owned_and_external_sessions() {
+    fn http_drain_is_kept_only_while_existing_http_work_is_the_last_blocker() {
+        let mut state = idle_state();
+        state.http_operations_idle = false;
+        assert_eq!(
+            state.drain_readiness(false),
+            ReloadDrainReadiness::WaitingForHttp
+        );
+
+        state.login_helper_idle = false;
+        assert_eq!(state.drain_readiness(false), ReloadDrainReadiness::Unsafe);
+
+        state.login_helper_idle = true;
+        state.playback = PlaybackReloadReadiness::PlayingRecoverable;
+        assert_eq!(state.drain_readiness(true), ReloadDrainReadiness::Unsafe);
+    }
+
+    #[test]
+    fn playback_reload_readiness_distinguishes_idle_recoverable_and_unsafe_sessions() {
         let mut playback = PlaybackRuntimeState::default();
-        assert!(playback_is_idle(&playback));
+        assert_eq!(
+            playback_reload_readiness(&playback),
+            PlaybackReloadReadiness::Idle
+        );
+        assert_eq!(
+            playback_reload_readiness_after_refresh(
+                &playback,
+                &PlayerStatus {
+                    status: "playing".to_string(),
+                    current_track: Some(test_track(
+                        "miliastra://track/qqmusic/external",
+                        "刚开始的外部播放",
+                    )),
+                    ..Default::default()
+                }
+            ),
+            PlaybackReloadReadiness::Unsafe,
+            "真实播放器已开始外部播放时，旧 Idle 快照不得放行重载"
+        );
+        assert_eq!(
+            playback_reload_readiness_after_refresh(
+                &playback,
+                &PlayerStatus {
+                    status: "stopped".to_string(),
+                    ..Default::default()
+                }
+            ),
+            PlaybackReloadReadiness::Idle
+        );
+
+        playback.state = ConfirmedPlaybackState::RequestedSongPlaying;
+        let requested_track = test_track("miliastra://track/qqmusic/1", "测试歌曲");
+        playback.active_request = Some(ActivePlaybackRequest {
+            track: Some(requested_track.clone()),
+            ..Default::default()
+        });
+        playback.last_observation = Some(PlaybackObservation {
+            status: "playing".to_string(),
+            track: Some(requested_track.clone()),
+            progress: 42.0,
+            duration: 180.0,
+            reliability: ObservationReliability::Reliable,
+            ..Default::default()
+        });
+        assert_eq!(
+            playback_reload_readiness(&playback),
+            PlaybackReloadReadiness::PlayingRecoverable
+        );
+        assert_eq!(
+            playback_reload_readiness_after_refresh(
+                &playback,
+                &PlayerStatus {
+                    status: "playing".to_string(),
+                    current_track: Some(requested_track.clone()),
+                    ..Default::default()
+                }
+            ),
+            PlaybackReloadReadiness::PlayingRecoverable
+        );
+        assert_eq!(
+            playback_reload_readiness_after_refresh(
+                &playback,
+                &PlayerStatus {
+                    status: "paused".to_string(),
+                    current_track: Some(requested_track.clone()),
+                    ..Default::default()
+                }
+            ),
+            PlaybackReloadReadiness::Unsafe,
+            "实时 transport 已改变时不能按可恢复播放放行重载"
+        );
+        assert_eq!(
+            playback_reload_readiness_after_refresh(
+                &playback,
+                &PlayerStatus {
+                    status: "playing".to_string(),
+                    current_track: Some(test_track(
+                        "miliastra://track/qqmusic/external",
+                        "实时外部播放",
+                    )),
+                    ..Default::default()
+                }
+            ),
+            PlaybackReloadReadiness::Unsafe,
+            "实时播放器切到其他歌曲时不能中断外部播放"
+        );
+        let mut state = idle_state();
+        state.playback = PlaybackReloadReadiness::PlayingRecoverable;
+        assert!(state.is_idle(false));
+        assert!(!state.is_idle(true));
+
+        playback.last_observation.as_mut().unwrap().track = Some(test_track(
+            "miliastra://track/qqmusic/2",
+            "后台已切换的歌曲",
+        ));
+        assert_eq!(
+            playback_reload_readiness(&playback),
+            PlaybackReloadReadiness::Unsafe
+        );
+
+        let observation = playback.last_observation.as_mut().unwrap();
+        observation.track = Some(requested_track.clone());
+        observation.status = "stopped".to_string();
+        assert_eq!(
+            playback_reload_readiness(&playback),
+            PlaybackReloadReadiness::Unsafe
+        );
+
+        let observation = playback.last_observation.as_mut().unwrap();
+        observation.status = "playing".to_string();
+        observation.progress = 178.0;
+        assert_eq!(
+            playback_reload_readiness(&playback),
+            PlaybackReloadReadiness::Unsafe
+        );
+
+        playback.state = ConfirmedPlaybackState::PausedByUser;
+        let observation = playback.last_observation.as_mut().unwrap();
+        observation.status = "paused".to_string();
+        assert_eq!(
+            playback_reload_readiness(&playback),
+            PlaybackReloadReadiness::PausedRecoverable,
+            "暂停在末尾保护区内不会自然结束，必须允许钳制进度后重载"
+        );
+        assert_eq!(
+            playback_reload_readiness_after_refresh(
+                &playback,
+                &PlayerStatus {
+                    status: "paused".to_string(),
+                    current_track: Some(requested_track.clone()),
+                    ..Default::default()
+                }
+            ),
+            PlaybackReloadReadiness::PausedRecoverable
+        );
+        assert_eq!(
+            playback_reload_readiness_after_refresh(
+                &playback,
+                &PlayerStatus {
+                    status: "playing".to_string(),
+                    current_track: Some(requested_track.clone()),
+                    ..Default::default()
+                }
+            ),
+            PlaybackReloadReadiness::Unsafe,
+            "用户暂停后实时播放器继续播放时不应作为暂停恢复会话重载"
+        );
+        state.playback = PlaybackReloadReadiness::PausedRecoverable;
+        assert!(state.is_idle(false));
+        assert!(state.is_idle(true));
+
+        playback.last_observation.as_mut().unwrap().status = "stopped".to_string();
+        assert_eq!(
+            playback_reload_readiness(&playback),
+            PlaybackReloadReadiness::Unsafe
+        );
+
+        playback.last_observation = None;
+        assert_eq!(
+            playback_reload_readiness(&playback),
+            PlaybackReloadReadiness::Unsafe
+        );
 
         playback.state = ConfirmedPlaybackState::ExternalPlayback;
-        assert!(!playback_is_idle(&playback));
+        playback.active_request = None;
+        assert_eq!(
+            playback_reload_readiness(&playback),
+            PlaybackReloadReadiness::Unsafe
+        );
 
         playback.state = ConfirmedPlaybackState::Unknown;
-        assert!(!playback_is_idle(&playback));
-
-        playback.active_request = Some(Default::default());
-        assert!(!playback_is_idle(&playback));
+        assert_eq!(
+            playback_reload_readiness(&playback),
+            PlaybackReloadReadiness::Unsafe
+        );
     }
 
     #[test]

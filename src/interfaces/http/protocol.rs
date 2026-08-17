@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 #[cfg(test)]
 use std::net::SocketAddr;
 use std::net::TcpListener;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -628,6 +628,7 @@ pub struct HttpSharedState {
     pub history: Arc<Mutex<VecDeque<HistoryItem>>>,
     pub active_connections: Arc<AtomicUsize>,
     pub active_reload_blockers: Arc<AtomicUsize>,
+    pub reload_draining: Arc<AtomicBool>,
     application: HttpApplicationPorts,
     latest_frame: Arc<Mutex<LatestFrameCache>>,
     /// 配置中心共享句柄（阶段 5 起由 HTTP 配置接口持有）。
@@ -722,6 +723,7 @@ impl HttpSharedState {
             history: Arc::new(Mutex::new(VecDeque::new())),
             active_connections: Arc::new(AtomicUsize::new(0)),
             active_reload_blockers: Arc::new(AtomicUsize::new(0)),
+            reload_draining: Arc::new(AtomicBool::new(false)),
             application,
             latest_frame,
             config_store,
@@ -851,12 +853,20 @@ async fn axum_entry(
     let _guard = ActiveConnectionGuard {
         counter: state.active_connections.clone(),
     };
-    let _reload_blocker_guard = blocks_idle_reload.then(|| {
-        state.active_reload_blockers.fetch_add(1, Ordering::SeqCst);
-        ActiveConnectionGuard {
-            counter: state.active_reload_blockers.clone(),
+    let _reload_blocker_guard = if blocks_idle_reload {
+        match try_begin_reload_blocking_request(&state) {
+            Some(guard) => Some(guard),
+            None => {
+                return plain_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "配置重载排空中，请稍后重试".to_string(),
+                    Vec::new(),
+                );
+            }
         }
-    });
+    } else {
+        None
+    };
     if active >= MAX_ACTIVE_CONNECTIONS {
         return plain_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1287,6 +1297,22 @@ fn is_mutating_route(path: &str) -> bool {
 
 fn request_blocks_idle_reload(path: &str) -> bool {
     is_mutating_route(path) || path == "/hall-screenshot"
+}
+
+fn try_begin_reload_blocking_request(state: &HttpSharedState) -> Option<ActiveConnectionGuard> {
+    if state.reload_draining.load(Ordering::SeqCst) {
+        return None;
+    }
+    state.active_reload_blockers.fetch_add(1, Ordering::SeqCst);
+    let guard = ActiveConnectionGuard {
+        counter: state.active_reload_blockers.clone(),
+    };
+    if state.reload_draining.load(Ordering::SeqCst) {
+        drop(guard);
+        None
+    } else {
+        Some(guard)
+    }
 }
 
 fn status_code(status: u16) -> StatusCode {

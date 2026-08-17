@@ -10,6 +10,8 @@ mod test_support;
 mod text;
 mod ui;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 pub mod observation;
 
 pub mod runtime;
@@ -17,11 +19,61 @@ pub mod runtime;
 /// Watchdog child exit code reserved for a normal configuration reload.
 pub const CONFIG_RELOAD_EXIT_CODE: u8 = 75;
 
+/// Configuration reload exit code that asks the replacement to run startup automation.
+pub const CONFIG_RELOAD_WITH_STARTUP_EXIT_CODE: u8 = 77;
+
+/// Temporary HTTP access token inherited by every child in one watchdog lifetime.
+pub const WATCHDOG_HTTP_ACCESS_TOKEN_ENV: &str = "MILIASTRA_WATCHDOG_HTTP_ACCESS_TOKEN";
+
+/// One-shot marker set only for the child launched after a configuration reload.
+pub const CONFIG_RELOAD_CHILD_ENV: &str = "MILIASTRA_CONFIG_RELOAD_CHILD";
+
+/// One-shot flag carried by the watchdog when changed startup fields must run in the replacement.
+pub const CONFIG_RELOAD_RUN_STARTUP_ENV: &str = "MILIASTRA_CONFIG_RELOAD_RUN_STARTUP";
+
+/// Child exit code used when a replacement process fails before reaching its ready point.
+pub const CONFIG_RELOAD_STARTUP_FAILURE_EXIT_CODE: u8 = 76;
+
+/// Per-child marker path used by the watchdog to observe replacement readiness.
+pub const CONFIG_RELOAD_READY_FILE_ENV: &str = "MILIASTRA_CONFIG_RELOAD_READY_FILE";
+
+/// Exact contents atomically published when a replacement child becomes ready.
+pub const CONFIG_RELOAD_READY_MARKER: &[u8] = b"miliastra-config-reload-ready-v1\n";
+
+static CONFIG_RELOAD_CHILD_READY: AtomicBool = AtomicBool::new(false);
+
+/// Mark the replacement child ready after its HTTP/worker/scan runtime is usable.
+///
+/// The in-process flag selects the child's exit code. The marker file lets the
+/// watchdog retain the hot-reload handoff even if this child later panics or is
+/// terminated without returning through `main`.
+pub(crate) fn mark_config_reload_child_ready() -> anyhow::Result<bool> {
+    if CONFIG_RELOAD_CHILD_READY.load(Ordering::SeqCst) {
+        return Ok(false);
+    }
+    if let Some(path) = std::env::var_os(CONFIG_RELOAD_READY_FILE_ENV) {
+        let path = std::path::PathBuf::from(path);
+        adapters::file_store::write_atomic(
+            &path,
+            CONFIG_RELOAD_READY_MARKER,
+            "配置重载 ready 标记",
+        )?;
+    }
+    CONFIG_RELOAD_CHILD_READY.store(true, Ordering::SeqCst);
+    Ok(true)
+}
+
+/// Whether this child reached the ready point before returning an error.
+pub fn config_reload_child_ready() -> bool {
+    CONFIG_RELOAD_CHILD_READY.load(Ordering::SeqCst)
+}
+
 /// Result of a fully torn-down application runtime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RunOutcome {
     Stopped,
     Reload,
+    ReloadWithStartup,
 }
 
 impl RunOutcome {
@@ -29,6 +81,7 @@ impl RunOutcome {
         match self {
             Self::Stopped => 0,
             Self::Reload => CONFIG_RELOAD_EXIT_CODE,
+            Self::ReloadWithStartup => CONFIG_RELOAD_WITH_STARTUP_EXIT_CODE,
         }
     }
 }
@@ -124,6 +177,14 @@ mod tests {
     fn run_outcome_reserves_a_dedicated_reload_exit_code() {
         assert_eq!(RunOutcome::Stopped.exit_code(), 0);
         assert_eq!(RunOutcome::Reload.exit_code(), CONFIG_RELOAD_EXIT_CODE);
+        assert_eq!(
+            RunOutcome::ReloadWithStartup.exit_code(),
+            CONFIG_RELOAD_WITH_STARTUP_EXIT_CODE
+        );
         assert_ne!(RunOutcome::Reload.exit_code(), 0);
+        assert_ne!(
+            RunOutcome::ReloadWithStartup.exit_code(),
+            RunOutcome::Reload.exit_code()
+        );
     }
 }

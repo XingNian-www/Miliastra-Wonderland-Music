@@ -16,7 +16,7 @@ use std::{
 use crate::features::custom_workflow::CustomWorkflowConfig;
 use crate::features::playback::{MatchConfig, SongDedupConfig};
 
-use super::AppConfig;
+use super::{AppConfig, Effect, config_effect_for_path};
 
 /// LiveConfigs 覆盖的配置点路径集合（与 schema effect==Live 的字段集合
 /// 严格一一对应，由测试 [`live_fields_match_schema_effect`] 强制；新增 Live
@@ -24,6 +24,7 @@ use super::AppConfig;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const LIVE_CONFIG_PATHS: &[&str] = &[
     "stability.secondary_hall_count",
+    "timing.watchdog_restart_ms",
     "timing.loop_idle_ms",
     "timing.chat_scan.fallback_ms",
     "timing.chat_scan.change_debounce_ms",
@@ -202,6 +203,16 @@ impl LiveConfigs {
             .is_empty()
     }
 
+    /// 当前累计变更中是否包含必须等播放器空闲才能重载的字段。
+    pub(crate) fn pending_reload_requires_playback_idle(&self) -> bool {
+        self.pending_reload
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .fields
+            .iter()
+            .any(|field| config_effect_for_path(field) == Some(Effect::PlaybackIdleReload))
+    }
+
     /// 原子认领一次闲置重载请求。
     ///
     /// 首次调用在存在待处理字段时返回当时的字段快照；之后返回 `None`。
@@ -275,6 +286,7 @@ impl LiveConfigs {
 
         let mut effective = Arc::unwrap_or_clone(self.effective.snapshot());
         effective.stability.secondary_hall_count = config.stability.secondary_hall_count;
+        effective.timing.watchdog_restart_ms = config.timing.watchdog_restart_ms;
         effective.timing.loop_idle_ms = config.timing.loop_idle_ms;
         effective.timing.chat_scan.fallback_ms = config.timing.chat_scan.fallback_ms;
         effective.timing.chat_scan.change_debounce_ms = config.timing.chat_scan.change_debounce_ms;
@@ -308,11 +320,12 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
-    use crate::config::{Effect, config_sections};
+    use crate::config::config_sections;
 
     /// 构造一份与默认值不同的完整配置，用于取值/覆盖断言。
     fn changed_config() -> AppConfig {
         let mut config = AppConfig::default();
+        config.timing.watchdog_restart_ms = 4321;
         config.queue.protect_current_song_until_finished = false;
         config.queue.external_playback_protect_after_seconds = 99;
         config.timing.playback.status_poll_ms = 1111;
@@ -360,6 +373,7 @@ mod tests {
         assert!(live.custom_workflows.read().unwrap().enabled);
         let snapshot = live.snapshot();
         assert_eq!(snapshot.stability.secondary_hall_count, 6);
+        assert_eq!(snapshot.timing.watchdog_restart_ms, 4321);
         assert_eq!(snapshot.timing.loop_idle_ms, 77);
         assert_eq!(snapshot.timing.command.help_batch_ms, 999);
         assert_eq!(
@@ -387,6 +401,16 @@ mod tests {
             cloned.pending_reload_fields(),
             BTreeSet::from(["providers.qq".to_string(), "queue.max_size".to_string(),])
         );
+    }
+
+    #[test]
+    fn pending_reload_uses_the_strictest_playback_barrier() {
+        let live = LiveConfigs::default();
+        live.schedule_reload(["queue.max_size".to_string()]);
+        assert!(!live.pending_reload_requires_playback_idle());
+
+        live.schedule_reload(["playback.credential_directory".to_string()]);
+        assert!(live.pending_reload_requires_playback_idle());
     }
 
     #[test]
@@ -446,6 +470,7 @@ mod tests {
             0.73
         );
         let snapshot = live.snapshot();
+        assert_eq!(snapshot.timing.watchdog_restart_ms, 4321);
         assert_eq!(snapshot.timing.chat_scan.fallback_ms, 4444);
         assert_eq!(snapshot.timing.chat_scan.change_debounce_ms, 155);
         assert_eq!(snapshot.timing.chat_scan.change_cooldown_ms, 666);

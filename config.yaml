@@ -13,7 +13,7 @@ http:
   enabled: true
   host: 127.0.0.1
   port: 18888
-  # access_token 留空默认本机免鉴权；非本机监听时必须设置
+  # access_token 留空时生成临时令牌；自动重载期间保持不变，完整退出后重新生成
   access_token: ""
 
 # 日志（日志初始化在数据库打开之前，必须留在引导配置）

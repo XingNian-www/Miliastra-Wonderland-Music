@@ -371,7 +371,7 @@ impl BilibiliAdapter {
                 "Bilibili refresh token is missing".to_owned(),
             ));
         };
-        let Some(csrf) = first_cookie(&cookies, &["bili_jct"])
+        let Some(csrf) = first_cookie(cookies, &["bili_jct"])
             .filter(|value| !value.is_empty())
             .map(str::to_owned)
         else {
@@ -384,7 +384,7 @@ impl BilibiliAdapter {
             .client
             .get(self.cookie_info_url.clone())
             .query(&[("csrf", csrf.clone())])
-            .header("Cookie", cookie_header(&cookies))
+            .header("Cookie", cookie_header(cookies))
             .header("Referer", REFERER)
             .header("User-Agent", USER_AGENT)
             .send()
@@ -417,7 +417,7 @@ impl BilibiliAdapter {
         let correspond_response = self
             .client
             .get(correspond_url)
-            .header("Cookie", cookie_header(&cookies))
+            .header("Cookie", cookie_header(cookies))
             .header("Referer", REFERER)
             .header("User-Agent", USER_AGENT)
             .send()
@@ -441,7 +441,7 @@ impl BilibiliAdapter {
                 ("source", "main_web"),
                 ("refresh_token", refresh_token),
             ])
-            .header("Cookie", cookie_header(&cookies))
+            .header("Cookie", cookie_header(cookies))
             .header("Referer", REFERER)
             .header("User-Agent", USER_AGENT)
             .send()

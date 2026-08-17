@@ -2,8 +2,8 @@ use super::*;
 
 use crate::config::{
     ConfigFieldError, ConfigSaveError, ConfigSaveOutcome, ConfigSectionSchema, ConfigSource,
-    Effect, FieldKind, config_sections, default_config_json, default_config_json_with_audio_cache,
-    section_schema,
+    Effect, FieldKind, config_effect_for_path, config_sections, default_config_json,
+    default_config_json_with_audio_cache, section_schema,
 };
 use serde_json::{Map, Value};
 
@@ -132,26 +132,48 @@ fn field_errors_json(errors: &[ConfigFieldError]) -> Vec<Value> {
         .collect()
 }
 
-/// 保存/回滚落库成功后的收尾：先 best-effort 应用即时热更新（失败只记录日志，
-/// 绝不把已提交的保存误报为失败），再按变更字段登记闲置重载并构造成功响应。
+/// 保存/回滚落库成功后的收尾：先 best-effort 应用即时热更新；失败时不把已提交
+/// 的保存误报为失败，而是把本次 Live 字段降级为运行态闲置重载。
 pub(super) fn save_outcome_response_after_apply(
     state: &HttpSharedState,
     store: &crate::config::ConfigStore,
     outcome: ConfigSaveOutcome,
     committed_label: &str,
 ) -> std::result::Result<String, AppError> {
-    if let Err(error) = apply_live_configs(state, store) {
-        log::error!("{}，但热更新应用失败: {}", committed_label, error.message);
+    let live_apply_error = apply_live_configs(state, store).err();
+    let (
+        restart_fields,
+        mut runtime_reload_fields,
+        playback_reload_fields,
+        mut applied_live_fields,
+    ) = split_changed_fields_by_effect(&outcome.changed_fields);
+    if let Some(error) = live_apply_error {
+        log::error!(
+            "{}，但热更新应用失败，相关字段改为闲置重载: {}",
+            committed_label,
+            error.message
+        );
+        runtime_reload_fields.append(&mut applied_live_fields);
     }
-    let (restart_fields, reload_fields, applied_live_fields) =
-        split_changed_fields_by_effect(&outcome.changed_fields);
+    let reload_fields = runtime_reload_fields
+        .iter()
+        .chain(&playback_reload_fields)
+        .cloned()
+        .collect::<Vec<_>>();
     let reload_scheduled = !reload_fields.is_empty();
     if reload_scheduled {
         state
             .live_configs
             .schedule_reload(reload_fields.iter().cloned());
     }
-    save_outcome_json(&outcome, restart_fields, reload_fields, applied_live_fields)
+    save_outcome_json(
+        &outcome,
+        restart_fields,
+        reload_fields,
+        runtime_reload_fields,
+        playback_reload_fields,
+        applied_live_fields,
+    )
 }
 
 /// 校验失败业务响应（HTTP 200 + ok=false，前端按 ok 判断）。
@@ -164,43 +186,26 @@ fn validation_failed_json(errors: &[ConfigFieldError]) -> Value {
     })
 }
 
-/// 把变更字段按 schema 生效级别拆分为「人工重启」「闲置自动重载」与
-/// 「已即时热更新」三组；
-/// Object/Rect/Point 的 JSON 叶子路径继承其 schema 父字段效果；其余未声明路径
-/// （如 state.playback_state_path 注入项）归入重启生效。
+/// 把变更字段按 schema 生效级别拆分为「人工重启」「运行态闲置重载」
+/// 「播放器闲置重载」与「已即时热更新」四组；未声明路径归入重启生效。
 /// appliedLiveFields 只收 effect==Live 的字段（保存成功后已由
 /// [`crate::config::LiveConfigs::apply`] 真正作用到运行态）。
 fn split_changed_fields_by_effect(
     changed_fields: &[String],
-) -> (Vec<String>, Vec<String>, Vec<String>) {
-    let fields = config_sections()
-        .into_iter()
-        .flat_map(|section| section.fields)
-        .collect::<Vec<_>>();
+) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
     let mut restart = Vec::new();
     let mut idle_reload = Vec::new();
+    let mut playback_idle_reload = Vec::new();
     let mut applied_live = Vec::new();
     for path in changed_fields {
-        let effect = fields
-            .iter()
-            .filter(|field| {
-                field.path == *path
-                    || (matches!(
-                        field.kind,
-                        FieldKind::Object | FieldKind::Rect | FieldKind::Point
-                    ) && path
-                        .strip_prefix(&field.path)
-                        .is_some_and(|suffix| suffix.starts_with('.')))
-            })
-            .max_by_key(|field| field.path.len())
-            .map(|field| field.effect);
-        match effect {
+        match config_effect_for_path(path) {
             Some(Effect::Live) => applied_live.push(path.clone()),
             Some(Effect::IdleReload) => idle_reload.push(path.clone()),
+            Some(Effect::PlaybackIdleReload) => playback_idle_reload.push(path.clone()),
             Some(Effect::Restart) | None => restart.push(path.clone()),
         }
     }
-    (restart, idle_reload, applied_live)
+    (restart, idle_reload, playback_idle_reload, applied_live)
 }
 
 /// 保存/回滚成功响应；restartRequired 由本次变更中实际需要重启的字段决定，
@@ -209,6 +214,8 @@ fn save_outcome_json(
     outcome: &ConfigSaveOutcome,
     restart_fields: Vec<String>,
     reload_fields: Vec<String>,
+    runtime_reload_fields: Vec<String>,
+    playback_reload_fields: Vec<String>,
     applied_live_fields: Vec<String>,
 ) -> std::result::Result<String, AppError> {
     let reload_scheduled = !reload_fields.is_empty();
@@ -220,6 +227,8 @@ fn save_outcome_json(
         "restartFields": restart_fields,
         "reloadScheduled": reload_scheduled,
         "reloadFields": reload_fields,
+        "runtimeReloadFields": runtime_reload_fields,
+        "playbackReloadFields": playback_reload_fields,
         "appliedLiveFields": applied_live_fields,
     }))
     .map_err(internal_error)

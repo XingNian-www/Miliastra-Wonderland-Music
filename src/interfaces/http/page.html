@@ -403,6 +403,7 @@ html[data-theme=light] .theme-toggle .moon{display:none}
 .config-effect{display:inline-flex;align-items:center;padding:1px var(--sp-2);border-radius:999px;font-size:var(--fs-tiny);line-height:var(--lh-tiny)}
 .config-effect.live{background:var(--ok-soft);color:var(--ok)}
 .config-effect.idle-reload{background:var(--warn-soft);color:var(--warn)}
+.config-effect.playback-idle-reload{background:var(--info-soft);color:var(--info)}
 .config-effect.restart{background:var(--info-soft);color:var(--info)}
 .config-effect.bootstrap{background:var(--fill-2);color:var(--text-3)}
 .config-field-error{color:var(--danger);font-size:var(--fs-meta);line-height:var(--lh-meta)}
@@ -1996,7 +1997,7 @@ function selectConfigSection(name){
 }
 function configEffectTag(field){
   if(field.source==='bootstrap')return '<span class="config-effect bootstrap">config.yaml</span>'
-  const map={live:['live','立即生效'],idleReload:['idle-reload','当前曲结束后重载'],restart:['restart','重启生效']}
+  const map={live:['live','立即生效'],idleReload:['idle-reload','任务结束后重载'],playbackIdleReload:['playback-idle-reload','播放结束/暂停后重载'],restart:['restart','重启生效']}
   const item=map[field.effect]||['restart','重启生效']
   return '<span class="config-effect '+item[0]+'">'+item[1]+'</span>'
 }
@@ -2412,7 +2413,8 @@ async function applyConfigSaveResult(resp,action){
     message+='；配置已保存，但页面刷新失败：'+e.message
   }
   if(resp.appliedLiveFields&&resp.appliedLiveFields.length)message+='\n已立即生效：'+formatConfigFields(resp.appliedLiveFields)
-  if(resp.reloadScheduled&&resp.reloadFields&&resp.reloadFields.length)message+='\n已安排当前曲结束后自动重载：'+formatConfigFields(resp.reloadFields)
+  if(resp.runtimeReloadFields&&resp.runtimeReloadFields.length)message+='\n已安排任务结束后自动重载：'+formatConfigFields(resp.runtimeReloadFields)
+  if(resp.playbackReloadFields&&resp.playbackReloadFields.length)message+='\n已安排播放结束或可安全恢复的暂停状态后自动重载：'+formatConfigFields(resp.playbackReloadFields)
   if(resp.restartRequired)message+='\n以下配置需重启生效：'+formatConfigFields(resp.restartFields)
   showConfigMessage(message,'ok')
 }

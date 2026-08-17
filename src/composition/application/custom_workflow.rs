@@ -111,10 +111,11 @@ impl ApplicationRuntime {
     }
 
     fn wait_for_invite_decision(&self) -> Result<Option<bool>> {
+        let live_config = self.lifecycle.live_configs.snapshot();
         match self.wait_for_chat_decision(
             "邀请确认",
-            self.lifecycle.config.timing.invite.confirm_timeout_ms,
-            self.lifecycle.config.timing.invite.confirm_poll_ms,
+            live_config.timing.invite.confirm_timeout_ms,
+            live_config.timing.invite.confirm_poll_ms,
             |message_type| message_type == "blue",
             parse_invite_decision,
         )? {

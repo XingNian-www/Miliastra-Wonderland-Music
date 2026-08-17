@@ -96,6 +96,16 @@ impl BackgroundCommandManager {
         Ok(())
     }
 
+    pub(super) fn is_idle(&self) -> Result<bool> {
+        self.reap_finished()?;
+        Ok(self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| anyhow!("后台命令状态锁已损坏"))?
+            .is_empty())
+    }
+
     pub(super) fn stop(&self, name: &str) -> Result<bool> {
         let Some(command) = self
             .inner
@@ -286,7 +296,7 @@ impl ApplicationRuntime {
             self.business.task_engine.clone(),
             Arc::clone(&self.lifecycle.running),
             Arc::clone(&self.lifecycle.paused),
-            Duration::from_millis(self.lifecycle.config.timing.command.post_settle_ms),
+            self.lifecycle.live_configs.clone(),
             |client| self.formal_task_execution_context(client),
         )?;
         self.business.formal_tasks = Some(runtime.client());
@@ -296,9 +306,7 @@ impl ApplicationRuntime {
 
     pub(super) fn start_deferred_chat_sender(&self) -> thread::JoinHandle<()> {
         let sender = DeferredChatSender {
-            retry_delay: Duration::from_millis(self.lifecycle.config.timing.loop_idle_ms.max(50)),
-            // 海龟汤分段批次与普通批量回复共用同一发送节奏，避免刷屏
-            batch_interval_ms: self.lifecycle.config.timing.command.help_batch_ms,
+            live_configs: self.lifecycle.live_configs.clone(),
             running: Arc::clone(&self.lifecycle.running),
             paused: Arc::clone(&self.lifecycle.paused),
             task_engine: self.business.task_engine.clone(),
@@ -315,8 +323,7 @@ impl ApplicationRuntime {
 }
 
 struct DeferredChatSender {
-    retry_delay: Duration,
-    batch_interval_ms: u64,
+    live_configs: LiveConfigs,
     running: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     task_engine: TaskEngineHandle,
@@ -432,13 +439,15 @@ impl DeferredChatSender {
                         DeferredChatTarget::CurrentHall => self.active_ui_residency()?,
                     };
                     let messages = batch.remaining_texts();
+                    let batch_interval_ms =
+                        self.live_configs.snapshot().timing.command.help_batch_ms;
                     let outcome = match residency {
                         UiResidency::Primary => self
                             .chat_output
-                            .send_batch_outcome(&messages, self.batch_interval_ms),
+                            .send_batch_outcome(&messages, batch_interval_ms),
                         UiResidency::SecondaryCurrentHall => self
                             .chat_output
-                            .send_current_chat_batch_outcome(&messages, self.batch_interval_ms),
+                            .send_current_chat_batch_outcome(&messages, batch_interval_ms),
                     };
                     drop(sending);
 
@@ -529,10 +538,12 @@ impl DeferredChatSender {
     }
 
     fn wait_for_retry(&self, generation: &mut u64) -> Result<()> {
+        let retry_delay =
+            Duration::from_millis(self.live_configs.snapshot().timing.loop_idle_ms.max(50));
         *generation = self.task_engine.generation()?;
         *generation = self
             .task_engine
-            .wait_for_change_timeout(*generation, self.retry_delay)?;
+            .wait_for_change_timeout(*generation, retry_delay)?;
         Ok(())
     }
 
@@ -565,6 +576,7 @@ impl ApplicationRuntime {
             business: self.business.business.clone(),
             task_engine: self.business.task_engine.clone(),
             formal_tasks: self.business.formal_tasks.clone(),
+            live_configs: self.lifecycle.live_configs.clone(),
             running: Arc::clone(&self.lifecycle.running),
             paused: Arc::clone(&self.lifecycle.paused),
             monitor: self.lifecycle.monitor.clone(),
@@ -669,6 +681,7 @@ struct PlaybackMonitorWorker {
     business: BusinessRuntimeHandle,
     task_engine: TaskEngineHandle,
     formal_tasks: Option<FormalTaskClient>,
+    live_configs: LiveConfigs,
     running: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     monitor: MonitorShared,
@@ -721,7 +734,12 @@ impl PlaybackMonitorPort for PlaybackMonitorWorker {
         status: PlayerStatus,
         context: QueueAdvanceContext,
     ) -> Result<QueueAdvanceDecision> {
-        self.player.maybe_advance_queue(status, context)
+        let decision = self.player.maybe_advance_queue(status, context)?;
+        let pending_reload = self.live_configs.has_pending_reload();
+        Ok(suppress_automatic_advance_for_reload(
+            decision,
+            pending_reload,
+        ))
     }
 
     fn enqueue_advance_queue(&mut self, reason: &'static str) -> Result<()> {
@@ -741,6 +759,21 @@ impl PlaybackMonitorPort for PlaybackMonitorWorker {
     fn update_monitor(&mut self) {
         self.monitor
             .publish(MonitorEvent::PlaybackController(self.player.snapshot()));
+    }
+}
+
+/// Let the playback controller finish its terminal-state bookkeeping, but do
+/// not turn that state transition into a new automatic playback request while
+/// the child process is waiting to reload. The persisted queue survives the
+/// teardown and is consumed by the replacement process.
+fn suppress_automatic_advance_for_reload(
+    decision: QueueAdvanceDecision,
+    pending_reload: bool,
+) -> QueueAdvanceDecision {
+    if pending_reload && matches!(decision, QueueAdvanceDecision::AdvanceQueue { .. }) {
+        QueueAdvanceDecision::PlaybackStateChanged
+    } else {
+        decision
     }
 }
 
@@ -816,5 +849,33 @@ mod tests {
             &mut first_key,
             &status("miliastra://track/qqmusic/2")
         ));
+    }
+
+    #[test]
+    fn pending_reload_suppresses_automatic_advance_but_keeps_state_updates() {
+        assert_eq!(
+            suppress_automatic_advance_for_reload(
+                QueueAdvanceDecision::AdvanceQueue {
+                    reason: "自然结束"
+                },
+                true,
+            ),
+            QueueAdvanceDecision::PlaybackStateChanged
+        );
+        assert_eq!(
+            suppress_automatic_advance_for_reload(QueueAdvanceDecision::None, true),
+            QueueAdvanceDecision::None
+        );
+        assert_eq!(
+            suppress_automatic_advance_for_reload(
+                QueueAdvanceDecision::AdvanceQueue {
+                    reason: "自然结束"
+                },
+                false,
+            ),
+            QueueAdvanceDecision::AdvanceQueue {
+                reason: "自然结束"
+            }
+        );
     }
 }

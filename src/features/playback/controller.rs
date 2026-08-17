@@ -131,7 +131,7 @@ pub(crate) trait PlaybackStatePort: Clone + Send + Sync + 'static {
 pub(crate) struct PlayerController<B: MusicPlayerBackend, S: PlaybackStatePort> {
     backend: B,
     playback_state: S,
-    matching: MatchConfig,
+    matching: Arc<RwLock<MatchConfig>>,
     clock: Arc<dyn Clock>,
     wall_clock: Arc<dyn WallClock>,
     /// 热更新共享句柄（阶段 7）：保存成功后由 HTTP 层 apply，运行态读取点
@@ -305,14 +305,13 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
     pub(crate) fn new(
         backend: B,
         playback_state: S,
-        matching: &MatchConfig,
         time: PlaybackTimePorts,
         live: crate::config::LiveConfigs,
     ) -> Self {
         Self {
             backend,
             playback_state,
-            matching: matching.clone(),
+            matching: live.matching.clone(),
             clock: time.clock,
             wall_clock: time.wall_clock,
             queue_protect_current_song: live.queue_protect_current_song,
@@ -327,8 +326,14 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
     pub(crate) fn status(&self) -> Result<PlayerStatus> {
         let mut status = self.backend.status()?;
         let playback = self.playback_state.snapshot()?;
-        if status_matches_active_request(&self.matching, playback.active_request.as_ref(), &status)
-        {
+        let matches_active_request = {
+            let matching = self
+                .matching
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            status_matches_active_request(&matching, playback.active_request.as_ref(), &status)
+        };
+        if matches_active_request {
             status.requester = playback
                 .active_request
                 .as_ref()
@@ -451,8 +456,12 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
 
     pub(crate) fn current_status_matches_request(&self, status: &PlayerStatus) -> Result<bool> {
         let runtime = self.playback_state.snapshot()?;
+        let matching = self
+            .matching
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         Ok(status_matches_active_request(
-            &self.matching,
+            &matching,
             runtime.active_request.as_ref(),
             status,
         ))
@@ -1208,7 +1217,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
     }
 
     fn observe_external_playback(&self, status: &PlayerStatus) -> Result<Option<bool>> {
-        let (is_external, should_mark_external) = {
+        let (is_external, was_external, should_mark_external) = {
             let runtime = self.playback_state.snapshot()?;
             let playback = &runtime;
             let is_external = playback.active_request.is_none()
@@ -1216,6 +1225,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
                 && playback.pause_reason == PauseReason::None;
             (
                 is_external,
+                is_external && playback.state == ConfirmedPlaybackState::ExternalPlayback,
                 is_external
                     && (playback.state != ConfirmedPlaybackState::ExternalPlayback
                         || playback.pause_reason != PauseReason::None),
@@ -1223,6 +1233,14 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         };
         let Some(identity) = external_playback_identity(status).filter(|_| is_external) else {
             self.clear_external_playback_tracker()?;
+            // 外部播放结束后没有 active request 可由自然结束分支清理，
+            // 因此必须在明确的停止观测处把状态收敛回 Idle；否则待重载会永久
+            // 认为仍有外部歌曲，且后续队列续播也无法恢复。暂停/加载/异常观测
+            // 不代表歌曲已结束，保留 ExternalPlayback 保护状态。
+            if was_external && matches!(status.status.as_str(), "stopped" | "stoped" | "idle") {
+                self.playback_state
+                    .update(PlaybackStateUpdate::ClearActiveRequest)?;
+            }
             return Ok(None);
         };
         let protect_after = Duration::from_secs(
@@ -1829,7 +1847,6 @@ mod tests {
             crate::test_support::test_state_store(),
         )
         .unwrap();
-        let matching = MatchConfig::default();
         let song_dedup = SongDedupConfig {
             history_path: temp_path("dedup-config"),
             ..SongDedupConfig::default()
@@ -1857,7 +1874,6 @@ mod tests {
                 pool_available,
                 confirm_dequeues: Arc::new(Mutex::new(Vec::new())),
             },
-            &matching,
             PlaybackTimePorts::new(clock, wall_clock),
             // 测试构造：热更新共享值用默认配置初始化；需要覆盖时直接改写共享值。
             crate::config::LiveConfigs::from_config(&crate::config::AppConfig::default()),
@@ -3395,6 +3411,26 @@ mod tests {
                 reason: "外部播放未稳定"
             }
         );
+    }
+
+    #[test]
+    fn stopped_external_playback_returns_to_idle_for_reload_and_queue_recovery() {
+        let controller = controller(FakeBackend::new(vec![]));
+        controller.mark_external_playback().unwrap();
+
+        let decision = controller
+            .maybe_advance_queue(
+                stopped_status(),
+                QueueAdvanceContext {
+                    queue_empty: true,
+                    has_pending_playback_task: false,
+                    command_executing: false,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(decision, QueueAdvanceDecision::None);
+        assert_eq!(controller.snapshot().state, "idle");
     }
 
     #[test]

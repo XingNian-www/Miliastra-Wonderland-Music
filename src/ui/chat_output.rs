@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow};
+use std::sync::{Arc, RwLock};
 
-use crate::config::OutputConfig;
 #[cfg(test)]
 use crate::text::split_numbered_chat_message;
 use crate::text::{MAX_CHAT_WIDTH, char_width, display_width};
@@ -55,16 +55,26 @@ impl ChatBatchSendOutcome {
 
 #[derive(Clone)]
 pub struct ChatOutput {
-    enabled: bool,
+    enabled: Arc<RwLock<bool>>,
     hall_batch_ui: HallBatchUi,
 }
 
 impl ChatOutput {
-    pub(crate) fn new(config: &OutputConfig, hall_batch_ui: HallBatchUi) -> Self {
+    pub(crate) fn with_live_enabled(
+        enabled: Arc<RwLock<bool>>,
+        hall_batch_ui: HallBatchUi,
+    ) -> Self {
         Self {
-            enabled: config.send_enabled,
+            enabled,
             hall_batch_ui,
         }
+    }
+
+    fn enabled(&self) -> bool {
+        *self
+            .enabled
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     pub fn send(&self, message: &str) -> Result<()> {
@@ -78,7 +88,7 @@ impl ChatOutput {
     fn send_primary(&self, message: &str, restore_after_task: bool) -> Result<()> {
         let message = fit_chat_message(message);
         log::info!("游戏内回复: {}", redacted_chat_text(&message));
-        if !self.enabled {
+        if !self.enabled() {
             log::info!("游戏内回复发送已关闭，仅记录日志");
             return Ok(());
         }
@@ -88,7 +98,7 @@ impl ChatOutput {
     pub fn send_current_chat(&self, message: &str) -> Result<()> {
         let message = fit_chat_message(message);
         log::info!("当前聊天回复: {}", redacted_chat_text(&message));
-        if !self.enabled {
+        if !self.enabled() {
             log::info!("当前聊天回复发送已关闭，仅记录日志");
             return Ok(());
         }
@@ -106,7 +116,7 @@ impl ChatOutput {
         for message in &messages {
             log::info!("当前聊天回复: {}", redacted_chat_text(message));
         }
-        if !self.enabled {
+        if !self.enabled() {
             log::info!("当前聊天回复发送已关闭，仅记录日志");
             return Ok(());
         }
@@ -125,7 +135,7 @@ impl ChatOutput {
             .map(|message| fit_chat_message(message))
             .collect::<Vec<_>>();
         log::info!("游戏内批量回复: [谁是卧底内容已隐藏] {}条", messages.len());
-        if !self.enabled {
+        if !self.enabled() {
             log::info!("游戏内回复发送已关闭，仅记录脱敏日志");
             return Ok(());
         }
@@ -143,7 +153,7 @@ impl ChatOutput {
             "当前聊天批量回复: [谁是卧底内容已隐藏] {}条",
             messages.len()
         );
-        if !self.enabled {
+        if !self.enabled() {
             log::info!("当前聊天回复发送已关闭，仅记录脱敏日志");
             return Ok(());
         }
@@ -168,7 +178,7 @@ impl ChatOutput {
         for message in &messages {
             log::info!("游戏内回复: {}", redacted_chat_text(message));
         }
-        if !self.enabled {
+        if !self.enabled() {
             log::info!("游戏内回复发送已关闭，仅记录日志");
             return Ok(());
         }
@@ -186,7 +196,7 @@ impl ChatOutput {
             .iter()
             .map(|message| fit_chat_message(message))
             .collect::<Vec<_>>();
-        if !self.enabled {
+        if !self.enabled() {
             for message in &messages {
                 log::info!("当前聊天回复: {}", redacted_chat_text(message));
             }
@@ -211,7 +221,7 @@ impl ChatOutput {
             .iter()
             .map(|message| fit_chat_message(message))
             .collect::<Vec<_>>();
-        if !self.enabled {
+        if !self.enabled() {
             for message in &messages {
                 log::info!("游戏内回复: {}", redacted_chat_text(message));
             }

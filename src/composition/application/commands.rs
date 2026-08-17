@@ -196,15 +196,11 @@ impl ApplicationRuntime {
     }
 
     pub(super) fn immediate_administration_port(&self) -> ImmediateAdministrationPort {
+        let live_config = self.lifecycle.live_configs.snapshot();
         ImmediateAdministrationPort {
             business: self.business.business.clone(),
             monitor: self.lifecycle.monitor.clone(),
-            executed_commands_log_path: self
-                .lifecycle
-                .config
-                .state
-                .executed_commands_log_path
-                .clone(),
+            executed_commands_log_path: live_config.state.executed_commands_log_path.clone(),
         }
     }
 

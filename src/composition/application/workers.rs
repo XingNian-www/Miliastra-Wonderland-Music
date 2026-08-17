@@ -96,16 +96,6 @@ impl BackgroundCommandManager {
         Ok(())
     }
 
-    pub(super) fn is_idle(&self) -> Result<bool> {
-        self.reap_finished()?;
-        Ok(self
-            .inner
-            .state
-            .lock()
-            .map_err(|_| anyhow!("后台命令状态锁已损坏"))?
-            .is_empty())
-    }
-
     pub(super) fn stop(&self, name: &str) -> Result<bool> {
         let Some(command) = self
             .inner
@@ -206,14 +196,14 @@ fn run_background_lyrics(
             Ok(snapshot) => snapshot,
             Err(error) => {
                 log::warn!("后台歌词查询正式任务状态失败，暂缓发送: {error}");
-                if !sleep_background_lyrics_poll(poll, deadline) {
+                if !sleep_background_lyrics_poll(poll, deadline, &running, &stop) {
                     break;
                 }
                 continue;
             }
         };
         if scheduler.formal_busy() {
-            if !sleep_background_lyrics_poll(poll, deadline) {
+            if !sleep_background_lyrics_poll(poll, deadline, &running, &stop) {
                 break;
             }
             continue;
@@ -251,7 +241,7 @@ fn run_background_lyrics(
             Err(error) => log::debug!("后台歌词读取播放器状态失败: {error:#}"),
         }
 
-        if !sleep_background_lyrics_poll(poll, deadline) {
+        if !sleep_background_lyrics_poll(poll, deadline, &running, &stop) {
             break;
         }
     }
@@ -275,15 +265,34 @@ fn current_song_has_switched(first_key: &mut Option<TrackKey>, status: &PlayerSt
     false
 }
 
-fn sleep_background_lyrics_poll(poll: Duration, deadline: Option<Instant>) -> bool {
+fn sleep_background_lyrics_poll(
+    poll: Duration,
+    deadline: Option<Instant>,
+    running: &AtomicBool,
+    stop: &AtomicBool,
+) -> bool {
     let sleep_for = deadline.map_or(poll, |deadline| {
         poll.min(deadline.saturating_duration_since(Instant::now()))
     });
     if sleep_for.is_zero() {
         return false;
     }
-    sleep(sleep_for);
-    true
+    interruptible_sleep(sleep_for, || {
+        running.load(AtomicOrdering::SeqCst) && !stop.load(AtomicOrdering::SeqCst)
+    }) && deadline.is_none_or(|deadline| Instant::now() < deadline)
+}
+
+fn interruptible_sleep(duration: Duration, mut keep_running: impl FnMut() -> bool) -> bool {
+    const MAX_SLICE: Duration = Duration::from_millis(100);
+    let deadline = Instant::now() + duration;
+    while keep_running() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return true;
+        }
+        sleep(remaining.min(MAX_SLICE));
+    }
+    false
 }
 
 impl ApplicationRuntime {
@@ -643,6 +652,7 @@ impl ApplicationRuntime {
                 config: self.lifecycle.config.clone(),
                 live_configs: self.lifecycle.live_configs.clone(),
                 running: self.lifecycle.running.clone(),
+                reload_startup: self.lifecycle.reload_startup.clone(),
                 paused: self.lifecycle.paused.clone(),
                 console_reply_context: self.lifecycle.console_reply_context.clone(),
                 monitor: self.lifecycle.monitor.clone(),
@@ -707,7 +717,7 @@ impl PlaybackMonitorPort for PlaybackMonitorWorker {
     }
 
     fn wait(&mut self, duration: Duration) {
-        sleep(duration);
+        interruptible_sleep(duration, || self.running.load(AtomicOrdering::SeqCst));
     }
 
     fn player_status(&mut self) -> Result<PlayerStatus> {
@@ -780,6 +790,54 @@ fn suppress_automatic_advance_for_reload(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+
+    #[test]
+    fn long_worker_wait_stops_promptly_after_shutdown_signal() {
+        let running = Arc::new(AtomicBool::new(true));
+        let shutdown = Arc::clone(&running);
+        let worker = thread::spawn(move || {
+            interruptible_sleep(Duration::from_secs(60), || {
+                shutdown.load(AtomicOrdering::SeqCst)
+            })
+        });
+        thread::sleep(Duration::from_millis(20));
+        running.store(false, AtomicOrdering::SeqCst);
+
+        assert!(!worker.join().expect("interruptible wait worker"));
+    }
+
+    #[test]
+    fn shutdown_signal_wakes_a_waiter_that_reentered_after_engine_seal() {
+        let running = Arc::new(AtomicBool::new(true));
+        let task_engine = TaskEngineHandle::new(None);
+        let worker_running = Arc::clone(&running);
+        let worker_engine = task_engine.clone();
+        let (waiting_tx, waiting_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let mut generation = worker_engine.generation().expect("initial generation");
+            while worker_running.load(AtomicOrdering::SeqCst) {
+                waiting_tx.send(()).expect("report wait boundary");
+                generation = worker_engine
+                    .wait_for_change(generation)
+                    .expect("wait for task-engine change");
+            }
+        });
+
+        waiting_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker reached initial wait");
+        assert!(task_engine.begin_shutdown_if_idle().unwrap());
+        waiting_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker reentered wait after engine seal");
+
+        running.store(false, AtomicOrdering::SeqCst);
+        task_engine.wake().unwrap();
+        worker
+            .join()
+            .expect("waiting worker exits after final wake");
+    }
 
     #[test]
     fn finished_background_workers_are_reaped_before_restarting_same_name() {

@@ -16,7 +16,7 @@ mod workers;
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, sleep};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -49,16 +49,17 @@ use crate::features::idiom_chain::{IdiomChainApplication, IdiomChainService};
 use crate::features::invite::{InviteRequest, InviteService, InviteStart};
 use crate::features::moderation::{ModerationPolicy, ModerationResultTask, ModerationService};
 use crate::features::playback::{
-    ConfirmedPlaybackState, ExternalPlaybackObservation, PlaybackApplication,
-    PlaybackApplicationConfig, PlaybackCommand, PlaybackRequest, PlaybackRuntimeState,
-    PlaybackService, PlaybackStatePort, PlaybackStateUpdate, PlaybackTimePorts, PlayerController,
-    PlayerStatus, QueueItem, SongDedupCandidate,
+    ActivePlaybackIdentity, ConfirmedPlaybackState, ExternalPlaybackObservation,
+    PlaybackApplication, PlaybackApplicationConfig, PlaybackCommand, PlaybackObservation,
+    PlaybackRequest, PlaybackRuntimeState, PlaybackService, PlaybackStatePort, PlaybackStateUpdate,
+    PlaybackTimePorts, PlayerController, PlayerStatus, QueueAdvanceContext, QueueAdvanceDecision,
+    QueueItem, SongDedupCandidate, has_restorable_playback_progress,
 };
 use crate::features::song_request::{
     AiClient, ResolvedSongRequest, SongRequestApplication, SongRequestContext, SongRequestDecision,
     SongReviewClient, select_ai_candidate,
 };
-use crate::features::startup::{StartupService, StartupSource, StartupTask};
+use crate::features::startup::{StartupService, StartupSource, StartupTask, StartupTaskKind};
 use crate::features::turtle_soup::{
     self, SecondaryOcrObservation, SecondaryOcrStability, TurtleSoupApplication, TurtleSoupConfig,
     TurtleSoupService,
@@ -78,9 +79,8 @@ use crate::observation::chat::{
     SecondaryChatIdentity, SecondaryChatObservation, SecondaryHallBubble, SecondaryObservedMessage,
     SecondaryRecognizedMessage, TemplateArgs, UnreadFriendHit, classify_title, count_chat_markers,
     find_unread_friend_hits, hall_bubble_layout_is_stable, hall_bubble_sequence_is_retained_prefix,
-    hall_bubble_sequence_overlap, latest_incoming_bubble_rect, latest_incoming_fingerprint,
-    prepare_chat_scan, prepare_chat_scan_with_markers, recognize_prepared_chat,
-    secondary_hall_bubbles,
+    hall_bubble_sequence_overlap, latest_incoming_fingerprint, prepare_chat_scan,
+    prepare_chat_scan_with_markers, recognize_prepared_chat, secondary_hall_bubbles,
 };
 use crate::observation::decision::DecisionScreenLock;
 use crate::observation::shared::ObservationRead;
@@ -89,7 +89,7 @@ use crate::runtime::business::{
     BusinessEvent, BusinessRuntime, BusinessRuntimeEventSink, BusinessRuntimeHandle,
     BusinessRuntimeWorker,
 };
-use crate::runtime::chat_listener::ChatListenerMode;
+use crate::runtime::chat_listener::{ChatListenerMode, ChatListenerSnapshot};
 use crate::runtime::deadline_bridge::{BusinessRuntimeGroup, BusinessRuntimeGroupBuilder};
 use crate::runtime::decision::DecisionAction;
 use crate::runtime::deferred_chat::{
@@ -414,6 +414,173 @@ struct BusinessBundle {
     custom_workflow: CustomWorkflowService,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum ShutdownReason {
+    Running = 0,
+    ConfigReload = 1,
+    ConfigReloadWithStartup = 2,
+    UserExit = 3,
+}
+
+#[derive(Clone, Debug)]
+struct ShutdownState {
+    reason: Arc<AtomicU8>,
+}
+
+impl ShutdownState {
+    fn new() -> Self {
+        Self {
+            reason: Arc::new(AtomicU8::new(ShutdownReason::Running as u8)),
+        }
+    }
+
+    fn reason(&self) -> ShutdownReason {
+        match self.reason.load(AtomicOrdering::SeqCst) {
+            value if value == ShutdownReason::Running as u8 => ShutdownReason::Running,
+            value if value == ShutdownReason::ConfigReload as u8 => ShutdownReason::ConfigReload,
+            value if value == ShutdownReason::ConfigReloadWithStartup as u8 => {
+                ShutdownReason::ConfigReloadWithStartup
+            }
+            value if value == ShutdownReason::UserExit as u8 => ShutdownReason::UserExit,
+            value => panic!("invalid shutdown reason value: {value}"),
+        }
+    }
+
+    fn try_claim_config_reload(&self) -> bool {
+        self.reason
+            .compare_exchange(
+                ShutdownReason::Running as u8,
+                ShutdownReason::ConfigReload as u8,
+                AtomicOrdering::SeqCst,
+                AtomicOrdering::SeqCst,
+            )
+            .is_ok()
+    }
+
+    fn release_config_reload_claim(&self) {
+        let _ = self.reason.compare_exchange(
+            ShutdownReason::ConfigReload as u8,
+            ShutdownReason::Running as u8,
+            AtomicOrdering::SeqCst,
+            AtomicOrdering::SeqCst,
+        );
+    }
+
+    fn require_startup_after_reload(&self) {
+        let _ = self.reason.compare_exchange(
+            ShutdownReason::ConfigReload as u8,
+            ShutdownReason::ConfigReloadWithStartup as u8,
+            AtomicOrdering::SeqCst,
+            AtomicOrdering::SeqCst,
+        );
+    }
+
+    fn request_user_exit(&self) {
+        self.reason
+            .store(ShutdownReason::UserExit as u8, AtomicOrdering::SeqCst);
+    }
+}
+
+/// Startup actions which must complete before a reload replacement can publish ready.
+///
+/// The requirements are deliberately process-local. They describe the handoff which created
+/// this child, rather than the normal startup automation policy used by an ordinary launch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ReloadStartupActions(u8);
+
+impl ReloadStartupActions {
+    const START_GAME: u8 = 1 << 0;
+    const ENTER_WONDERLAND: u8 = 1 << 1;
+
+    fn from_startup_config(config: &AppConfig) -> Self {
+        Self::from_flags(
+            config.startup.enabled,
+            config.startup.launch_game || config.startup.enter_game,
+            config.startup.enter_wonderland,
+        )
+    }
+
+    const fn from_flags(enabled: bool, start_game: bool, enter_wonderland: bool) -> Self {
+        if !enabled {
+            return Self(0);
+        }
+        Self(
+            (if start_game { Self::START_GAME } else { 0 })
+                | (if enter_wonderland {
+                    Self::ENTER_WONDERLAND
+                } else {
+                    0
+                }),
+        )
+    }
+
+    const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    const fn includes_start_game(self) -> bool {
+        self.0 & Self::START_GAME != 0
+    }
+
+    const fn includes_enter_wonderland(self) -> bool {
+        self.0 & Self::ENTER_WONDERLAND != 0
+    }
+
+    const fn for_task(kind: StartupTaskKind) -> Self {
+        match kind {
+            StartupTaskKind::StartGame => Self(Self::START_GAME),
+            StartupTaskKind::EnterWonderland => Self(Self::ENTER_WONDERLAND),
+        }
+    }
+}
+
+/// Shared completion gate for startup work requested by a reload replacement.
+///
+/// A formal task runs through a reconstructed application facade, so this state must be shared
+/// separately from the owning runtime. Successful actions are monotonic for one child lifetime;
+/// failed actions remain missing and are retried by the listener under a cooldown.
+#[derive(Clone, Debug, Default)]
+struct ReloadStartupGate {
+    required: Arc<AtomicU8>,
+    completed: Arc<AtomicU8>,
+}
+
+impl ReloadStartupGate {
+    fn require_from_config(&self, config: &AppConfig) -> ReloadStartupActions {
+        let actions = ReloadStartupActions::from_startup_config(config);
+        self.require(actions);
+        actions
+    }
+
+    fn require(&self, actions: ReloadStartupActions) {
+        if !actions.is_empty() {
+            self.required.fetch_or(actions.0, AtomicOrdering::SeqCst);
+        }
+    }
+
+    fn required_actions(&self) -> ReloadStartupActions {
+        ReloadStartupActions(self.required.load(AtomicOrdering::SeqCst))
+    }
+
+    fn missing_actions(&self) -> ReloadStartupActions {
+        let required = self.required.load(AtomicOrdering::SeqCst);
+        let completed = self.completed.load(AtomicOrdering::SeqCst);
+        ReloadStartupActions(required & !completed)
+    }
+
+    fn is_satisfied(&self) -> bool {
+        self.missing_actions().is_empty()
+    }
+
+    fn record_success(&self, kind: StartupTaskKind) {
+        let action = ReloadStartupActions::for_task(kind);
+        if self.required.load(AtomicOrdering::SeqCst) & action.0 != 0 {
+            self.completed.fetch_or(action.0, AtomicOrdering::SeqCst);
+        }
+    }
+}
+
 struct LifecycleBundle {
     config: AppConfig,
     /// 热更新共享句柄集合（阶段 7）：HTTP 保存成功后 apply，
@@ -421,9 +588,11 @@ struct LifecycleBundle {
     live_configs: LiveConfigs,
     http_server: Option<http::HttpServer>,
     http_reload_blockers: Arc<AtomicUsize>,
+    http_reload_draining: Arc<AtomicBool>,
     openai_runtime: Option<OpenAiRuntime>,
     running: Arc<AtomicBool>,
-    reload_on_exit: bool,
+    shutdown: ShutdownState,
+    reload_startup: ReloadStartupGate,
     reload_check_after: Instant,
     paused: Arc<AtomicBool>,
     console_reply_context: Arc<AtomicBool>,
@@ -505,6 +674,7 @@ struct FormalTaskLifecycleContext {
     /// 热更新共享句柄集合：正式任务上下文（facade 重建）与 HTTP 服务共享同一份。
     live_configs: LiveConfigs,
     running: Arc<AtomicBool>,
+    reload_startup: ReloadStartupGate,
     paused: Arc<AtomicBool>,
     console_reply_context: Arc<AtomicBool>,
     monitor: MonitorShared,
@@ -577,9 +747,11 @@ impl FormalTaskExecutionContext {
                     live_configs: self.lifecycle.live_configs.clone(),
                     http_server: None,
                     http_reload_blockers: Arc::new(AtomicUsize::new(0)),
+                    http_reload_draining: Arc::new(AtomicBool::new(false)),
                     openai_runtime: None,
                     running: self.lifecycle.running.clone(),
-                    reload_on_exit: false,
+                    shutdown: ShutdownState::new(),
+                    reload_startup: self.lifecycle.reload_startup.clone(),
                     reload_check_after: Instant::now(),
                     paused: self.lifecycle.paused.clone(),
                     console_reply_context: self.lifecycle.console_reply_context.clone(),
@@ -620,6 +792,17 @@ impl PlaybackStatePort for BusinessPlaybackStateAdapter {
     fn update(&self, update: PlaybackStateUpdate) -> Result<bool> {
         self.business
             .update_playback_state(update)
+            .map_err(anyhow::Error::from)
+    }
+
+    fn record_observation_if_active(
+        &self,
+        expected: ActivePlaybackIdentity,
+        observation: PlaybackObservation,
+        immediate: bool,
+    ) -> Result<bool> {
+        self.business
+            .record_observation_if_active(expected, observation, immediate)
             .map_err(anyhow::Error::from)
     }
 
@@ -680,6 +863,15 @@ impl PlaybackStatePort for BusinessPlaybackStateAdapter {
     ) -> Result<crate::features::playback::SessionReconciliation> {
         self.business
             .reconcile_player_session(binding)
+            .map_err(anyhow::Error::from)
+    }
+
+    fn inspect_player_session(
+        &self,
+        binding: Option<crate::features::playback::PlaybackSessionBinding>,
+    ) -> Result<crate::features::playback::SessionReconciliation> {
+        self.business
+            .inspect_player_session(binding)
             .map_err(anyhow::Error::from)
     }
 
@@ -1298,6 +1490,14 @@ impl ApplicationRuntime {
         })?;
         let business = business_runtime.business_handle();
         let business_events = business_runtime.event_sink();
+        match listener::load_persisted_chat_listener_mode(&config.state.playback_state_path) {
+            Ok(Some(mode)) => {
+                business.complete_chat_listener_mode(mode)?;
+                log::info!("已恢复持久化的{}", mode.label());
+            }
+            Ok(None) => log::info!("无持久化聊天监听模式，使用默认一级监听"),
+            Err(error) => log::warn!("加载聊天监听模式失败，使用默认一级监听: {error:#}"),
+        }
         let card_games = CardGameApplication::new(Arc::new(business.clone()));
         let undercover_game = UndercoverApplication::new(Arc::new(business.clone()));
         let player = PlayerController::new(
@@ -1386,9 +1586,11 @@ impl ApplicationRuntime {
                 live_configs,
                 http_server: None,
                 http_reload_blockers: Arc::new(AtomicUsize::new(0)),
+                http_reload_draining: Arc::new(AtomicBool::new(false)),
                 openai_runtime: Some(openai_runtime),
                 running,
-                reload_on_exit: false,
+                shutdown: ShutdownState::new(),
+                reload_startup: ReloadStartupGate::default(),
                 reload_check_after: Instant::now(),
                 paused: Arc::new(AtomicBool::new(false)),
                 console_reply_context: Arc::new(AtomicBool::new(false)),
@@ -1622,17 +1824,6 @@ fn parse_secondary_sender_identity(value: &str) -> SecondarySenderIdentity {
     SecondarySenderIdentity {
         nickname: value.to_string(),
         remark: None,
-    }
-}
-
-fn secondary_optional_fingerprint_changed(
-    previous: Option<&ChangeFingerprint>,
-    current: Option<&ChangeFingerprint>,
-) -> bool {
-    match (previous, current) {
-        (Some(previous), Some(current)) => secondary_fingerprint_changed(previous, current),
-        (None, None) => false,
-        _ => true,
     }
 }
 

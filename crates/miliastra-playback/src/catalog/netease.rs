@@ -426,10 +426,10 @@ impl NeteaseAdapter {
                 "NetEase credential validation response is missing profile".to_owned(),
             ));
         };
-        if !profile
+        if profile
             .get("userId")
             .and_then(Value::as_i64)
-            .is_some_and(|user_id| user_id > 0)
+            .is_none_or(|user_id| user_id <= 0)
         {
             return Err(CatalogError::CredentialRejected(
                 "NetEase account session has no user id".to_owned(),

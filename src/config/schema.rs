@@ -18,7 +18,8 @@ pub enum ConfigSource {
     Bootstrap,
 }
 
-/// 生效级别：保存后立即生效 / 闲置时自动重载 / 人工重启生效。
+/// 生效级别：保存后立即生效 / 运行态闲置时重载 / 播放器闲置时重载 /
+/// 人工重启生效。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Effect {
@@ -26,6 +27,9 @@ pub enum Effect {
     Live,
     /// 保存后等待运行态闲置，再由看门狗重载子进程。
     IdleReload,
+    /// 保存后等待运行态闲置，且播放器已闲置或处于可安全恢复的用户暂停状态，
+    /// 再由看门狗重载子进程。
+    PlaybackIdleReload,
     /// 只能在人工重启后生效（用于 config.yaml 启动引导字段）。
     Restart,
 }
@@ -120,6 +124,20 @@ impl ConfigFieldSchema {
             label: label.to_string(),
             kind,
             effect: Effect::IdleReload,
+            source: ConfigSource::Db,
+            hint: hint.to_string(),
+            nullable: false,
+            optional_parent: false,
+        }
+    }
+
+    /// 数据库可编辑、保存后等待播放器闲置再自动重载的字段。
+    fn db_playback_idle_reload(path: &str, label: &str, kind: FieldKind, hint: &str) -> Self {
+        Self {
+            path: path.to_string(),
+            label: label.to_string(),
+            kind,
+            effect: Effect::PlaybackIdleReload,
             source: ConfigSource::Db,
             hint: hint.to_string(),
             nullable: false,
@@ -265,11 +283,11 @@ fn stability_section() -> Vec<ConfigFieldSchema> {
 /// timing 段：全部子段用点路径前缀（chat_scan/command/input/workflow/hall/invite/moderation/playback/decision/external）。
 fn timing_section() -> Vec<ConfigFieldSchema> {
     vec![
-        ConfigFieldSchema::db_idle_reload(
+        ConfigFieldSchema::db_live(
             "watchdog_restart_ms",
             "看门狗重启等待",
             int(1, MAX_TIMEOUT_MS),
-            "监听子进程异常退出后的重启等待时间，单位毫秒",
+            "监听子进程异常退出后的重启等待时间，单位毫秒；父看门狗会在下次异常退出时直接读取最新值，无需重载子进程",
         ),
         ConfigFieldSchema::db_live(
             "loop_idle_ms",
@@ -545,7 +563,7 @@ fn http_section() -> Vec<ConfigFieldSchema> {
             "access_token",
             "访问令牌",
             FieldKind::Secret,
-            "启动引导配置，在 config.yaml 修改后重启生效；非本机监听时必须设置；留空本机免鉴权",
+            "启动引导配置，在 config.yaml 修改后重启生效；非本机监听时必须设置；留空时由看门狗生成本次运行期临时令牌",
         ),
     ]
 }
@@ -999,7 +1017,7 @@ fn templates_section() -> Vec<ConfigFieldSchema> {
 /// playback 段：播放器凭据、程序路径与启动时加载的数值配置。
 fn playback_section() -> Vec<ConfigFieldSchema> {
     vec![
-        ConfigFieldSchema::db_idle_reload(
+        ConfigFieldSchema::db_playback_idle_reload(
             "credential_directory",
             "凭据目录",
             FieldKind::Path,
@@ -1011,7 +1029,7 @@ fn playback_section() -> Vec<ConfigFieldSchema> {
             FieldKind::Path,
             "受控登录使用的短生命周期助手",
         ),
-        ConfigFieldSchema::db_idle_reload(
+        ConfigFieldSchema::db_playback_idle_reload(
             "kugou_api_executable",
             "酷狗 API sidecar",
             FieldKind::Path,
@@ -1023,7 +1041,7 @@ fn playback_section() -> Vec<ConfigFieldSchema> {
             int(1, MAX_TIMEOUT_MS),
             "单次交互登录的最长时间，单位毫秒",
         ),
-        ConfigFieldSchema::db_idle_reload(
+        ConfigFieldSchema::db_playback_idle_reload(
             "kugou_api_base_url",
             "酷狗 API 地址",
             FieldKind::String,
@@ -2148,6 +2166,25 @@ pub fn section_schema(name: &str) -> Option<ConfigSectionSchema> {
         .find(|section| section.name == name)
 }
 
+/// 查询点路径对应的生效级别。Object/Rect/Point 的 JSON 叶子路径继承最深的
+/// schema 父字段；未声明路径返回 None。
+pub(crate) fn config_effect_for_path(path: &str) -> Option<Effect> {
+    config_sections()
+        .into_iter()
+        .flat_map(|section| section.fields)
+        .filter(|field| {
+            field.path == path
+                || (matches!(
+                    field.kind,
+                    FieldKind::Object | FieldKind::Rect | FieldKind::Point
+                ) && path
+                    .strip_prefix(&field.path)
+                    .is_some_and(|suffix| suffix.starts_with('.')))
+        })
+        .max_by_key(|field| field.path.len())
+        .map(|field| field.effect)
+}
+
 /// 内置默认配置的完整 JSON（AppConfig::default() 序列化，含 http/logging/state）。
 pub fn default_config_json() -> Value {
     serde_json::to_value(AppConfig::default()).expect("AppConfig 序列化不应失败")
@@ -2316,9 +2353,57 @@ mod tests {
             json!("idleReload")
         );
         assert_eq!(
+            serde_json::to_value(Effect::PlaybackIdleReload).unwrap(),
+            json!("playbackIdleReload")
+        );
+        assert_eq!(
             serde_json::to_value(Effect::Restart).unwrap(),
             json!("restart")
         );
+    }
+
+    #[test]
+    fn changed_leaf_paths_inherit_the_deepest_container_effect() {
+        assert_eq!(
+            config_effect_for_path("window.focus_point.x"),
+            Some(Effect::IdleReload)
+        );
+        assert_eq!(
+            config_effect_for_path("playback.audio_cache.directory"),
+            Some(Effect::IdleReload)
+        );
+        assert_eq!(config_effect_for_path("unknown.path"), None);
+    }
+
+    #[test]
+    fn only_playback_source_recovery_fields_wait_for_an_active_song() {
+        for path in [
+            "playback.credential_directory",
+            "playback.kugou_api_executable",
+            "playback.kugou_api_base_url",
+        ] {
+            assert_eq!(
+                config_effect_for_path(path),
+                Some(Effect::PlaybackIdleReload),
+                "field={path}"
+            );
+        }
+        for path in [
+            "stability.default_count",
+            "timing.playback.uri_stable_samples",
+            "timing.playback.transport_stable_samples",
+            "timing.playback.stale_timeout_ms",
+            "timing.external.volume_smooth_step_ms",
+            "playback.login_helper_executable",
+            "playback.login_timeout_ms",
+            "playback.audio_cache.enabled",
+        ] {
+            assert_eq!(
+                config_effect_for_path(path),
+                Some(Effect::IdleReload),
+                "field={path}"
+            );
+        }
     }
 
     #[test]

@@ -256,6 +256,10 @@ impl StartupTask {
         Self::new(StartupTaskKind::EnterWonderland, source.into())
     }
 
+    pub const fn kind(self) -> StartupTaskKind {
+        self.kind
+    }
+
     pub fn label(self) -> String {
         match self.kind {
             StartupTaskKind::StartGame => format!("启动游戏({})", self.source),

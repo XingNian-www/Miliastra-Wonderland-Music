@@ -50,6 +50,7 @@ pub fn start(
     config: &HotkeyConfig,
     running: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
+    request_exit: Arc<dyn Fn() + Send + Sync>,
     wake_tasks: Arc<dyn Fn() + Send + Sync>,
 ) -> Result<HotkeyRuntime> {
     if !config.enabled {
@@ -69,6 +70,7 @@ pub fn start(
             exit_key,
             worker_running,
             paused,
+            request_exit,
             wake_tasks,
             ready_sender,
         )
@@ -98,6 +100,7 @@ fn hotkey_loop(
     exit_key: VIRTUAL_KEY,
     running: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
+    request_exit: Arc<dyn Fn() + Send + Sync>,
     wake_tasks: Arc<dyn Fn() + Send + Sync>,
     ready: SyncSender<std::result::Result<u32, String>>,
 ) {
@@ -126,9 +129,10 @@ fn hotkey_loop(
         }
 
         let mut message = MSG::default();
-        while running.load(Ordering::SeqCst)
-            && GetMessageW(&mut message, Some(HWND(std::ptr::null_mut())), 0, 0).as_bool()
-        {
+        // WM_QUIT is the lifecycle stop boundary. Do not short-circuit on `running`: an EXIT
+        // hotkey may already be queued when a reload flips that flag, and it must still override
+        // the reload before shutdown posts WM_QUIT.
+        while GetMessageW(&mut message, Some(HWND(std::ptr::null_mut())), 0, 0).as_bool() {
             if message.message == WM_HOTKEY {
                 match message.wParam.0 as i32 {
                     PAUSE_ID => {
@@ -139,6 +143,7 @@ fn hotkey_loop(
                     }
                     EXIT_ID => {
                         log::info!("收到退出热键");
+                        request_exit();
                         running.store(false, Ordering::SeqCst);
                         wake_tasks();
                         break;

@@ -34,9 +34,10 @@ use crate::features::idiom_chain::{
 use crate::features::invite::{InviteRequest, InviteService, InviteStart};
 use crate::features::moderation::{ModerationWorkflowKey, ModerationWorkflowLedger};
 use crate::features::playback::{
-    ExternalPlaybackObservation, PlaybackMutationIntent, PlaybackMutationOutcome,
-    PlaybackRuntimeState, PlaybackService, PlaybackSessionBinding, PlaybackStateUpdate, QueueItem,
-    QueuePushOutcome, QueueRemoval, QueueRemoveOutcome, SessionReconciliation, SongDedupCandidate,
+    ActivePlaybackIdentity, ExternalPlaybackObservation, PlaybackMutationIntent,
+    PlaybackMutationOutcome, PlaybackObservation, PlaybackRuntimeState, PlaybackService,
+    PlaybackSessionBinding, PlaybackStateUpdate, QueueItem, QueuePushOutcome, QueueRemoval,
+    QueueRemoveOutcome, SessionReconciliation, SongDedupCandidate,
 };
 use crate::features::turtle_soup::{
     QuestionSubmitOutcome, SecondaryOcrObservation, SecondaryOcrStability, TurtleSoupAiCompletion,
@@ -515,6 +516,12 @@ enum PlaybackRuntimeMessage {
         update: PlaybackStateUpdate,
         response: SyncSender<Result<bool, BusinessRuntimeError>>,
     },
+    RecordObservationIfActive {
+        expected: ActivePlaybackIdentity,
+        observation: PlaybackObservation,
+        immediate: bool,
+        response: SyncSender<Result<bool, BusinessRuntimeError>>,
+    },
     ConfirmPlaybackAndDequeue {
         update: PlaybackStateUpdate,
         queue_item_id: Option<u64>,
@@ -536,6 +543,10 @@ enum PlaybackRuntimeMessage {
     },
     ClearExternalPlaybackTracker(SyncSender<Result<(), BusinessRuntimeError>>),
     ReconcilePlayerSession {
+        binding: Option<PlaybackSessionBinding>,
+        response: SyncSender<Result<SessionReconciliation, BusinessRuntimeError>>,
+    },
+    InspectPlayerSession {
         binding: Option<PlaybackSessionBinding>,
         response: SyncSender<Result<SessionReconciliation, BusinessRuntimeError>>,
     },
@@ -1386,6 +1397,34 @@ impl BusinessRuntimeHandle {
     ) -> Result<SessionReconciliation, BusinessRuntimeError> {
         self.request(|response| {
             RuntimeMessage::Playback(PlaybackRuntimeMessage::ReconcilePlayerSession {
+                binding,
+                response,
+            })
+        })
+    }
+
+    pub(crate) fn record_observation_if_active(
+        &self,
+        expected: ActivePlaybackIdentity,
+        observation: PlaybackObservation,
+        immediate: bool,
+    ) -> Result<bool, BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::Playback(PlaybackRuntimeMessage::RecordObservationIfActive {
+                expected,
+                observation,
+                immediate,
+                response,
+            })
+        })
+    }
+
+    pub(crate) fn inspect_player_session(
+        &self,
+        binding: Option<PlaybackSessionBinding>,
+    ) -> Result<SessionReconciliation, BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::Playback(PlaybackRuntimeMessage::InspectPlayerSession {
                 binding,
                 response,
             })

@@ -805,11 +805,9 @@ impl QqMusicAdapter {
         let identity = data.get("identity").unwrap_or(data);
         let vip = qq_account_is_vip(identity, data);
         let vip_type = vip_vip_type_label(identity, data);
-        let vip_expire_at_ms = identity
-            .get("HugeVipEnd")
-            .or_else(|| identity.get("LMEnd"))
-            .and_then(Value::as_str)
-            .and_then(parse_qq_date_ms);
+        let vip_expire_at_ms = vip
+            .then(|| qq_vip_expire_at_ms(identity, checked_at_ms))
+            .flatten();
         Ok(Some(ProviderAccountStatus {
             provider: PROVIDER.to_owned(),
             logged_in: true,
@@ -1580,6 +1578,22 @@ fn qq_account_is_vip(identity: &Value, data: &Value) -> bool {
         || qq_vip_flag(identity, "twelve")
 }
 
+/// The response keeps historical tier end dates, so only use dates belonging
+/// to a currently active tier. A user can hold both tiers; the later end date
+/// is when their ability to play VIP tracks changes.
+fn qq_vip_expire_at_ms(identity: &Value, now_ms: u64) -> Option<u64> {
+    [
+        qq_vip_flag(identity, "HugeVip").then_some("HugeVipEnd"),
+        qq_vip_flag(identity, "vip").then_some("LMEnd"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|field| identity.get(field).and_then(Value::as_str))
+    .filter_map(parse_qq_date_ms)
+    .filter(|expires_at_ms| *expires_at_ms > now_ms)
+    .max()
+}
+
 /// QQ 音乐的搜索端点可能在未登录时仍返回合法 JSON；仅接受没有明确业务错误码
 /// 的响应，避免把 HTTP 200 的拒绝包写入凭据存储。
 fn qq_validation_is_rejected(response: &Value) -> bool {
@@ -1625,6 +1639,9 @@ fn vip_vip_type_label(identity: &Value, data: &Value) -> String {
     labels.join("·")
 }
 
+/// QQ VIP 响应中的无时区日期使用北京时间（UTC+8）。
+const QQ_VIP_TIMEZONE_OFFSET_SECONDS: i64 = 8 * 60 * 60;
+
 /// 解析 QQ VIP 到期时间（"2026-07-20 07:50:53"）为 epoch 毫秒。
 fn epoch_ms() -> u64 {
     SystemTime::now()
@@ -1653,7 +1670,11 @@ fn parse_qq_date_ms(value: &str) -> Option<u64> {
     let minute = parts.next().unwrap_or(0);
     let second = parts.next().unwrap_or(0);
     let days = days_from_civil(year as i64, month as i64, day as i64)?;
-    Some((days * 86_400 + hour as i64 * 3_600 + minute as i64 * 60 + second as i64) as u64 * 1000)
+    let seconds = days
+        .checked_mul(86_400)?
+        .checked_add(hour as i64 * 3_600 + minute as i64 * 60 + second as i64)?
+        .checked_sub(QQ_VIP_TIMEZONE_OFFSET_SECONDS)?;
+    u64::try_from(seconds).ok()?.checked_mul(1_000)
 }
 
 /// 公历转儒略日（days since 1970-01-01）。
@@ -1794,8 +1815,9 @@ mod tests {
 
     use super::{
         PlaybackEligibility, QQ_QIMEI_FALLBACK, QqDevice, QqMusicAdapter, QqQimei,
-        parse_search_candidates, qq_account_is_vip, qq_eligibility, qq_filename, qq_resolver_ids,
-        qq_stream_url, qq_validation_is_rejected, vip_vip_type_label,
+        parse_qq_date_ms, parse_search_candidates, qq_account_is_vip, qq_eligibility, qq_filename,
+        qq_resolver_ids, qq_stream_url, qq_validation_is_rejected, qq_vip_expire_at_ms,
+        vip_vip_type_label,
     };
     use crate::catalog::{CatalogError, ProviderAccountStatus, SourceAdapter};
     use crate::credentials::{CredentialStore, ProviderCredential};
@@ -1968,6 +1990,27 @@ mod tests {
     }
 
     #[test]
+    fn qq_vip_expiry_uses_the_active_membership_tier() {
+        let identity = json!({
+            "HugeVip": 0,
+            "HugeVipEnd": "2030-07-20 07:50:53",
+            "vip": 1,
+            "LMEnd": "2031-08-21 08:00:00"
+        });
+
+        assert_eq!(
+            qq_vip_expire_at_ms(&identity, 0),
+            parse_qq_date_ms("2031-08-21 08:00:00")
+        );
+    }
+
+    #[test]
+    fn qq_vip_dates_are_interpreted_as_beijing_time() {
+        assert_eq!(parse_qq_date_ms("1970-01-01 08:00:00"), Some(0));
+        assert_eq!(parse_qq_date_ms("1970-01-01 07:59:59"), None);
+    }
+
+    #[test]
     fn qq_validation_rejects_explicit_business_error_envelopes() {
         assert!(!qq_validation_is_rejected(&json!({
             "code": 0,
@@ -2002,6 +2045,42 @@ mod tests {
         assert!(!cached.logged_in);
         assert!(cached.stale);
         assert_eq!(cached.last_error.as_deref(), Some("relogin_required"));
+        assert!(requests.recv_timeout(Duration::from_secs(2)).is_ok());
+        assert!(requests.recv_timeout(Duration::from_millis(100)).is_err());
+    }
+
+    #[tokio::test]
+    async fn qq_cached_account_status_keeps_the_provider_vip_result() {
+        let body = json!({
+            "req_0": {
+                "code": 0,
+                "data": {
+                    "identity": {
+                        "vip": 1,
+                        "HugeVipEnd": "2020-01-01 00:00:00"
+                    }
+                }
+            }
+        })
+        .to_string();
+        let (endpoint, requests) = fixture_server(body);
+        let adapter = QqMusicAdapter::with_endpoints(
+            credentials(),
+            Duration::from_secs(2),
+            endpoint.clone(),
+            endpoint,
+        )
+        .unwrap();
+
+        let fresh = adapter.refresh_account_status().await.unwrap().unwrap();
+        let cached = adapter.account_status().await.unwrap().unwrap();
+
+        assert!(fresh.vip);
+        assert!(fresh.vip_known);
+        assert!(!fresh.stale);
+        assert!(cached.vip);
+        assert!(cached.vip_known);
+        assert!(!cached.stale);
         assert!(requests.recv_timeout(Duration::from_secs(2)).is_ok());
         assert!(requests.recv_timeout(Duration::from_millis(100)).is_err());
     }

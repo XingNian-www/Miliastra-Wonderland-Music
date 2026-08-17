@@ -1,6 +1,47 @@
 use super::*;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReloadIdleState {
+    task_engine_idle: bool,
+    entertainment_idle: bool,
+    playback_idle: bool,
+    background_commands_idle: bool,
+    moderation_workers_idle: bool,
+    login_helper_idle: bool,
+    http_operations_idle: bool,
+}
+
+impl ReloadIdleState {
+    const fn is_idle(self) -> bool {
+        self.task_engine_idle
+            && self.entertainment_idle
+            && self.playback_idle
+            && self.background_commands_idle
+            && self.moderation_workers_idle
+            && self.login_helper_idle
+            && self.http_operations_idle
+    }
+}
+
+fn playback_is_idle(playback: &PlaybackRuntimeState) -> bool {
+    // 只有状态机明确确认 Idle 才允许重载；Unknown 代表观测不可靠，
+    // 必须继续等待，避免在仍可能播放时中断播放器。
+    playback.active_request.is_none() && playback.state == ConfirmedPlaybackState::Idle
+}
+
+fn reload_poll_wait(requested: Duration, pending_reload: bool) -> Duration {
+    if pending_reload {
+        requested.min(CONFIG_RELOAD_IDLE_CHECK_INTERVAL)
+    } else {
+        requested
+    }
+}
+
 impl ApplicationRuntime {
+    pub(super) fn reload_aware_wait(&self, requested: Duration) -> Duration {
+        reload_poll_wait(requested, self.lifecycle.live_configs.has_pending_reload())
+    }
+
     pub(super) fn record_command_activity(&self, observed_at: Instant) -> Result<()> {
         self.business
             .business
@@ -30,6 +71,77 @@ impl ApplicationRuntime {
             }
         }
         Ok(())
+    }
+
+    pub(super) fn maybe_reload_config_when_idle(&mut self) {
+        if !self.lifecycle.running.load(AtomicOrdering::SeqCst)
+            || !self.lifecycle.live_configs.has_pending_reload()
+        {
+            return;
+        }
+        let now = Instant::now();
+        if now < self.lifecycle.reload_check_after {
+            return;
+        }
+        self.lifecycle.reload_check_after = now + CONFIG_RELOAD_IDLE_CHECK_INTERVAL;
+        let idle = match self.reload_idle_state() {
+            Ok(idle) => idle,
+            Err(error) => {
+                log::warn!("读取闲置重载状态失败，本轮保持运行: {error:#}");
+                return;
+            }
+        };
+        if !idle.is_idle() {
+            return;
+        }
+        // 空闲检查与停止接单必须在任务引擎的同一把锁内完成，避免新任务落入两者之间。
+        match self.business.task_engine.begin_shutdown_if_idle() {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(error) => {
+                log::warn!("重载关停前原子锁定任务引擎失败，本轮保持运行: {error}");
+                return;
+            }
+        }
+        let Some(fields) = self.lifecycle.live_configs.begin_reload() else {
+            return;
+        };
+        log::info!(
+            "运行环境已闲置，开始配置重载关停: fields={}",
+            fields.into_iter().collect::<Vec<_>>().join(",")
+        );
+        self.lifecycle.reload_on_exit = true;
+        self.lifecycle.running.store(false, AtomicOrdering::SeqCst);
+    }
+
+    fn reload_idle_state(&self) -> Result<ReloadIdleState> {
+        let task_engine_idle = self.business.task_engine.is_idle()?;
+        let entertainment_idle = self.business.business.active_entertainment()?.is_none();
+        let playback = self.business.business.playback_state_snapshot()?;
+        let playback_idle = playback_is_idle(&playback);
+        let background_commands_idle = self.business.background_commands.is_idle()?;
+        let moderation_workers_idle = self
+            .business
+            .moderation_workers
+            .lock()
+            .map_err(|_| anyhow!("管理投票线程句柄锁已损坏"))?
+            .iter()
+            .all(thread::JoinHandle::is_finished);
+        let login_helper_idle = !self.playback.login_helper.status().active;
+        let http_operations_idle = self
+            .lifecycle
+            .http_reload_blockers
+            .load(AtomicOrdering::SeqCst)
+            == 0;
+        Ok(ReloadIdleState {
+            task_engine_idle,
+            entertainment_idle,
+            playback_idle,
+            background_commands_idle,
+            moderation_workers_idle,
+            login_helper_idle,
+            http_operations_idle,
+        })
     }
 
     pub(super) fn clear_idle_exit_timer(&self) -> Result<()> {
@@ -160,9 +272,10 @@ impl ApplicationRuntime {
         user_command: &str,
         final_command: &str,
     ) -> Result<()> {
+        let live_config = self.lifecycle.live_configs.snapshot();
         write_executed_command_fields(
             &self.lifecycle.monitor,
-            &self.lifecycle.config.state.executed_commands_log_path,
+            &live_config.state.executed_commands_log_path,
             message_type,
             username,
             user_command,
@@ -286,4 +399,80 @@ pub(super) fn write_executed_command_fields(
         .with_context(|| format!("open command log {}", path.display()))?;
     file.write_all(line.as_bytes())
         .with_context(|| format!("write command log {}", path.display()))
+}
+
+#[cfg(test)]
+mod reload_tests {
+    use std::time::Duration;
+
+    use super::{
+        CONFIG_RELOAD_IDLE_CHECK_INTERVAL, ReloadIdleState, playback_is_idle, reload_poll_wait,
+    };
+    use crate::features::playback::{ConfirmedPlaybackState, PlaybackRuntimeState};
+
+    fn idle_state() -> ReloadIdleState {
+        ReloadIdleState {
+            task_engine_idle: true,
+            entertainment_idle: true,
+            playback_idle: true,
+            background_commands_idle: true,
+            moderation_workers_idle: true,
+            login_helper_idle: true,
+            http_operations_idle: true,
+        }
+    }
+
+    #[test]
+    fn reload_requires_every_runtime_lane_to_be_idle() {
+        assert!(idle_state().is_idle());
+
+        let mut states = [idle_state(); 7];
+        states[0].task_engine_idle = false;
+        states[1].entertainment_idle = false;
+        states[2].playback_idle = false;
+        states[3].background_commands_idle = false;
+        states[4].moderation_workers_idle = false;
+        states[5].login_helper_idle = false;
+        states[6].http_operations_idle = false;
+
+        assert!(states.into_iter().all(|state| !state.is_idle()));
+    }
+
+    #[test]
+    fn reload_allows_queued_tracks_when_player_is_idle() {
+        // 待重载时队列内容会留在持久化存储中，重启后的新进程继续消费；
+        // 队列非空不应阻止当前歌曲结束后的重载。
+        assert!(idle_state().is_idle());
+    }
+
+    #[test]
+    fn playback_reload_idle_rejects_owned_and_external_sessions() {
+        let mut playback = PlaybackRuntimeState::default();
+        assert!(playback_is_idle(&playback));
+
+        playback.state = ConfirmedPlaybackState::ExternalPlayback;
+        assert!(!playback_is_idle(&playback));
+
+        playback.state = ConfirmedPlaybackState::Unknown;
+        assert!(!playback_is_idle(&playback));
+
+        playback.active_request = Some(Default::default());
+        assert!(!playback_is_idle(&playback));
+    }
+
+    #[test]
+    fn pending_reload_caps_scan_waits_to_the_idle_check_interval() {
+        assert_eq!(
+            reload_poll_wait(Duration::from_secs(60), true),
+            CONFIG_RELOAD_IDLE_CHECK_INTERVAL
+        );
+        assert_eq!(
+            reload_poll_wait(Duration::from_millis(250), true),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            reload_poll_wait(Duration::from_secs(60), false),
+            Duration::from_secs(60)
+        );
+    }
 }

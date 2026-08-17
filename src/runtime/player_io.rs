@@ -3,13 +3,15 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use super::player::{PlayerObservation, PlayerObservationConfig, PlayerObserver, RawPlayerSample};
 use miliastra_kernel::clock::{Clock, SystemClock};
 use miliastra_kernel::identity::{BusinessOperationId, BusinessOperationIdAllocator};
+
+const FAST_OBSERVATION_INTERVAL_LIMIT: Duration = Duration::from_millis(300);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PlayerRuntimeConfig {
@@ -37,6 +39,15 @@ impl Default for PlayerRuntimeConfig {
 }
 
 impl PlayerRuntimeConfig {
+    pub(crate) fn fast_observation_interval_for(normal_interval: Duration) -> Duration {
+        let interval = if normal_interval > FAST_OBSERVATION_INTERVAL_LIMIT {
+            FAST_OBSERVATION_INTERVAL_LIMIT
+        } else {
+            normal_interval / 2
+        };
+        interval.max(Duration::from_nanos(1))
+    }
+
     pub fn validate(&self) -> Result<(), PlayerRuntimeConfigError> {
         let fields = [
             (
@@ -1224,12 +1235,47 @@ impl PlayerRuntime {
         )
     }
 
+    pub fn start_with_live_observation_interval(
+        observation_port: impl PlayerObservationPort,
+        control_port: impl PlayerControlPort,
+        search_port: impl PlayerSearchPort,
+        config: PlayerRuntimeConfig,
+        normal_interval_ms: Arc<RwLock<u64>>,
+    ) -> Result<Self, PlayerRuntimeStartError> {
+        Self::start_with_clock_and_live_observation_interval(
+            observation_port,
+            control_port,
+            search_port,
+            config,
+            Arc::new(SystemClock),
+            Some(normal_interval_ms),
+        )
+    }
+
     fn start_with_clock(
         observation_port: impl PlayerObservationPort,
         control_port: impl PlayerControlPort,
         search_port: impl PlayerSearchPort,
         config: PlayerRuntimeConfig,
         clock: Arc<dyn Clock>,
+    ) -> Result<Self, PlayerRuntimeStartError> {
+        Self::start_with_clock_and_live_observation_interval(
+            observation_port,
+            control_port,
+            search_port,
+            config,
+            clock,
+            None,
+        )
+    }
+
+    fn start_with_clock_and_live_observation_interval(
+        observation_port: impl PlayerObservationPort,
+        control_port: impl PlayerControlPort,
+        search_port: impl PlayerSearchPort,
+        config: PlayerRuntimeConfig,
+        clock: Arc<dyn Clock>,
+        normal_interval_ms: Option<Arc<RwLock<u64>>>,
     ) -> Result<Self, PlayerRuntimeStartError> {
         config
             .validate()
@@ -1259,6 +1305,7 @@ impl PlayerRuntime {
                     worker_observation,
                     worker_latest,
                     config,
+                    normal_interval_ms,
                 );
             })
             .map_err(|source| PlayerRuntimeStartError::Spawn {
@@ -1406,6 +1453,7 @@ fn run_observation_lane(
     lane: Arc<RuntimeLane<ObservationCommand>>,
     latest: Arc<LatestObservationStore>,
     config: PlayerRuntimeConfig,
+    normal_interval_ms: Option<Arc<RwLock<u64>>>,
 ) {
     let _close_guard = ObservationCloseGuard(Arc::clone(&latest));
     let mut observer = PlayerObserver::new(SystemClock, config.observation);
@@ -1420,10 +1468,12 @@ fn run_observation_lane(
 
         let now = Instant::now();
         active_fast_demands.retain(|_, expires_at| *expires_at > now);
+        let (normal_interval, fast_interval) =
+            observation_intervals(&config, normal_interval_ms.as_ref());
         let interval = if active_fast_demands.is_empty() {
-            config.normal_observation_interval
+            normal_interval
         } else {
-            config.fast_observation_interval
+            fast_interval
         };
         let sample_due = last_sample_completed_at
             .and_then(|completed_at: Instant| completed_at.checked_add(interval))
@@ -1520,6 +1570,29 @@ fn run_observation_lane(
             }
         }
     }
+}
+
+fn observation_intervals(
+    config: &PlayerRuntimeConfig,
+    normal_interval_ms: Option<&Arc<RwLock<u64>>>,
+) -> (Duration, Duration) {
+    normal_interval_ms
+        .map(|normal_interval_ms| {
+            let normal_interval = Duration::from_millis(
+                (*normal_interval_ms
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner))
+                .max(1),
+            );
+            (
+                normal_interval,
+                PlayerRuntimeConfig::fast_observation_interval_for(normal_interval),
+            )
+        })
+        .unwrap_or((
+            config.normal_observation_interval,
+            config.fast_observation_interval,
+        ))
 }
 
 fn drain_observation_commands(receiver: &Receiver<ObservationCommand>) {
@@ -1739,7 +1812,7 @@ fn drain_search_commands(receiver: &Receiver<SearchCommand>) {
 mod tests {
     use std::collections::VecDeque;
     use std::sync::mpsc::{self, Receiver, SyncSender};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, RwLock};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -2107,6 +2180,22 @@ mod tests {
             control_queue_capacity: 4,
             search_queue_capacity: 4,
         }
+    }
+
+    #[test]
+    fn live_observation_interval_is_read_again_without_restarting_the_lane() {
+        let interval_ms = Arc::new(RwLock::new(800));
+        assert_eq!(
+            super::observation_intervals(&config(), Some(&interval_ms)),
+            (Duration::from_millis(800), Duration::from_millis(300))
+        );
+
+        *interval_ms.write().unwrap() = 200;
+
+        assert_eq!(
+            super::observation_intervals(&config(), Some(&interval_ms)),
+            (Duration::from_millis(200), Duration::from_millis(100))
+        );
     }
 
     #[test]
@@ -2583,6 +2672,7 @@ mod tests {
                 worker_lane,
                 worker_latest,
                 config(),
+                None,
             );
         });
 

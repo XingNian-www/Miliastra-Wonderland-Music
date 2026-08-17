@@ -1235,6 +1235,58 @@ fn native_player_and_login_routes_use_structured_json_without_secrets() {
         1
     );
 
+    let empty_kugou_locator = json!({
+        "trackRef": {
+            "key": {"provider": "kugou", "id": "ABCDEF0123456789"},
+            "resolverLocator": "kugou:ABCDEF0123456789::314159"
+        },
+        "metadata": {"title": "空专辑歌曲", "artists": []}
+    });
+    let empty_kugou_locator = http_post_json(
+        address,
+        "/player/play-track",
+        &empty_kugou_locator.to_string(),
+        None,
+    );
+    assert_eq!(empty_kugou_locator.status_line, "HTTP/1.1 200 OK");
+    assert_eq!(
+        state
+            .application
+            .queries
+            .playback_queue_snapshot()
+            .unwrap()
+            .len(),
+        2
+    );
+
+    let malformed_kugou_locator = json!({
+        "trackRef": {
+            "key": {"provider": "kugou", "id": "ABCDEF0123456789"},
+            "resolverLocator": "kugou:ABCDEF0123456789:pending:314159"
+        },
+        "metadata": {"title": "坏曲目", "artists": []}
+    });
+    let malformed_kugou_locator = http_post_json(
+        address,
+        "/player/play-track",
+        &malformed_kugou_locator.to_string(),
+        None,
+    );
+    assert_eq!(
+        malformed_kugou_locator.status_line,
+        "HTTP/1.1 400 Bad Request"
+    );
+    assert!(malformed_kugou_locator.body.contains("resolverLocator"));
+    assert_eq!(
+        state
+            .application
+            .queries
+            .playback_queue_snapshot()
+            .unwrap()
+            .len(),
+        2
+    );
+
     let unsupported_version = json!({
         "trackRef": {
             "key": {"provider": "netease", "id": "123"},
@@ -1257,7 +1309,7 @@ fn native_player_and_login_routes_use_structured_json_without_secrets() {
             .playback_queue_snapshot()
             .unwrap()
             .len(),
-        1
+        2
     );
 
     let session = http_post_json(
@@ -2155,6 +2207,9 @@ fn page_displays_disk_cache_track_list() {
     assert!(PAGE.contains("共 '+total+' 首 · 第 '"));
     // 未知孤儿曲目展示为「未知缓存」。
     assert!(PAGE.contains("未知缓存"));
+    // 缓存接口使用 source 字段，结构化播放接口要求 trackRef.key.provider。
+    assert!(PAGE.contains("trackRef:{key:{provider:t.source,id:t.id}"));
+    assert!(!PAGE.contains("trackRef:{key:{source:t.source,id:t.id}"));
 }
 
 #[test]
@@ -2230,8 +2285,11 @@ fn refresh_toggle_runs_full_uncached_refresh_when_resumed() {
     assert!(PAGE.contains("if(!refreshPaused)refreshAll()"));
     assert!(PAGE.contains("async function refreshAll()"));
     assert!(PAGE.contains(
-        "Promise.allSettled([loadMonitor(),loadHistory(),refreshPlayer(),loadPlaybackInsights(),loadLoginState(),loadPlayMode()])"
+        "Promise.allSettled([loadMonitor(),loadHistory(),refreshPlayer(),loadPlaybackInsights(),loadPlayMode()])"
     ));
+    assert!(PAGE.contains("async function refreshLoginProgress()"));
+    assert!(PAGE.contains("loginRuntimeStatus&&loginRuntimeStatus.active"));
+    assert!(!PAGE.contains("setInterval(()=>{if(!refreshPaused)loadLoginState()},2000)"));
     assert!(PAGE.contains("cache:'no-store'"));
     assert!(!PAGE.contains("onclick=\"loadMonitor()\""));
 }

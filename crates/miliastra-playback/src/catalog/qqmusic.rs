@@ -57,14 +57,14 @@ pub struct QqMusicAdapter {
     lyrics_url: Url,
     native_lyrics_url: Url,
     device: QqDevice,
-    /// 账号 VIP 状态缓存（成功 5 分钟/失败 60 秒），避免轮询频繁打账号接口。
+    /// 账号 VIP 状态缓存（成功 24 小时/失败 15 分钟），避免轮询频繁打账号接口。
     account_cache: std::sync::Arc<std::sync::Mutex<AccountStatusCache>>,
 }
 
-/// QQ 账号状态采用30分钟乐观缓存，避免频繁请求会员接口。
-const ACCOUNT_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
-/// 上次刷新失败后，旧成功结果继续返回；一分钟后才允许再次联网重试。
-const ACCOUNT_CACHE_FAILED_TTL: Duration = Duration::from_secs(60);
+/// QQ 账号状态采用 24 小时乐观缓存，避免频繁请求会员接口。
+const ACCOUNT_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+/// 上次刷新失败后，旧成功结果继续返回；15 分钟后才允许再次联网重试。
+const ACCOUNT_CACHE_FAILED_TTL: Duration = Duration::from_secs(15 * 60);
 
 impl QqMusicAdapter {
     pub fn new(credentials: CredentialStore, timeout: Duration) -> Result<Self, CatalogError> {
@@ -657,20 +657,45 @@ impl QqMusicAdapter {
         &self,
         force: bool,
     ) -> Result<Option<ProviderAccountStatus>, CatalogError> {
-        let now = std::time::Instant::now();
-        let checked_at_ms = epoch_ms();
-        let (generation, cached) = {
+        let (refresh_gate, cached) = {
             let guard = self.account_cache.lock().map_err(|_| {
                 CatalogError::Transient("QQ Music account cache poisoned".to_owned())
             })?;
             let cached = (!force)
                 .then(|| guard.cached(ACCOUNT_CACHE_TTL, ACCOUNT_CACHE_FAILED_TTL))
                 .flatten();
+            (guard.refresh_gate(), cached)
+        };
+        if let Some(status) = cached {
+            return Ok(Some(status));
+        }
+
+        // A normal cache miss joins the in-flight provider query, then reads the
+        // freshly written cache. A caller that explicitly requested refresh still
+        // performs a query unless it had to wait for another refresh already in flight.
+        let mut waited_for_refresh = false;
+        let _status_refresh = match refresh_gate.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                waited_for_refresh = true;
+                refresh_gate.lock().await
+            }
+        };
+        let (generation, cached) = {
+            let guard = self.account_cache.lock().map_err(|_| {
+                CatalogError::Transient("QQ Music account cache poisoned".to_owned())
+            })?;
+            let cached = (!force || waited_for_refresh)
+                .then(|| guard.cached(ACCOUNT_CACHE_TTL, ACCOUNT_CACHE_FAILED_TTL))
+                .flatten();
             (guard.generation(), cached)
         };
         if let Some(status) = cached {
-            return Ok(Some(status.clone()));
+            return Ok(Some(status));
         }
+
+        let now = std::time::Instant::now();
+        let checked_at_ms = epoch_ms();
         let result = self.query_account_status().await;
         let mut guard = self
             .account_cache
@@ -757,6 +782,20 @@ impl QqMusicAdapter {
             .json::<Value>()
             .await
             .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?;
+        if qq_response_requires_auth_refresh(&value) {
+            return Err(CatalogError::CredentialRejected(
+                "QQ Music vip_login_base rejected credentials".to_owned(),
+            ));
+        }
+        if value
+            .pointer("/req_0/code")
+            .and_then(as_i64)
+            .is_some_and(|code| code != 0)
+        {
+            return Err(CatalogError::InvalidResponse(
+                "QQ Music vip_login_base returned an error code".to_owned(),
+            ));
+        }
         let Some(data) = value.pointer("/req_0/data").filter(|v| v.is_object()) else {
             // 登录态失效或接口拒绝：视为查询失败，走失败缓存快速重试。
             return Err(CatalogError::InvalidResponse(
@@ -819,6 +858,11 @@ impl SourceAdapter for QqMusicAdapter {
         if !response.is_object() {
             return Err(CatalogError::InvalidResponse(
                 "QQ Music credential validation response is not an object".to_owned(),
+            ));
+        }
+        if qq_validation_is_rejected(&response) {
+            return Err(CatalogError::CredentialRejected(
+                "QQ Music credential validation was rejected".to_owned(),
             ));
         }
         Ok(())
@@ -1536,6 +1580,25 @@ fn qq_account_is_vip(identity: &Value, data: &Value) -> bool {
         || qq_vip_flag(identity, "twelve")
 }
 
+/// QQ 音乐的搜索端点可能在未登录时仍返回合法 JSON；仅接受没有明确业务错误码
+/// 的响应，避免把 HTTP 200 的拒绝包写入凭据存储。
+fn qq_validation_is_rejected(response: &Value) -> bool {
+    [
+        Some(response),
+        response.pointer("/req_0"),
+        response.pointer("/req_0/data"),
+    ]
+    .into_iter()
+    .flatten()
+    .flat_map(|value| {
+        ["code", "ret", "retcode"]
+            .into_iter()
+            .filter_map(|key| value.get(key))
+    })
+    .filter_map(as_i64)
+    .any(|code| code != 0)
+}
+
 /// 生成 QQ 音乐 VIP 类型标签（绿钻/SVIP/豪华绿钻/年费等组合）。
 fn vip_vip_type_label(identity: &Value, data: &Value) -> String {
     let mut labels = Vec::new();
@@ -1732,7 +1795,7 @@ mod tests {
     use super::{
         PlaybackEligibility, QQ_QIMEI_FALLBACK, QqDevice, QqMusicAdapter, QqQimei,
         parse_search_candidates, qq_account_is_vip, qq_eligibility, qq_filename, qq_resolver_ids,
-        qq_stream_url, vip_vip_type_label,
+        qq_stream_url, qq_validation_is_rejected, vip_vip_type_label,
     };
     use crate::catalog::{CatalogError, ProviderAccountStatus, SourceAdapter};
     use crate::credentials::{CredentialStore, ProviderCredential};
@@ -1902,6 +1965,45 @@ mod tests {
         let data = json!({"svip": 0, "star": 0});
 
         assert!(!qq_account_is_vip(&identity, &data));
+    }
+
+    #[test]
+    fn qq_validation_rejects_explicit_business_error_envelopes() {
+        assert!(!qq_validation_is_rejected(&json!({
+            "code": 0,
+            "req_0": {"code": 0, "data": {}}
+        })));
+        assert!(qq_validation_is_rejected(&json!({
+            "code": 0,
+            "req_0": {"code": 1001, "data": {}}
+        })));
+        assert!(qq_validation_is_rejected(&json!({
+            "req_0": {"code": "1001", "data": {}}
+        })));
+        assert!(qq_validation_is_rejected(&json!({"retcode": -1})));
+    }
+
+    #[tokio::test]
+    async fn qq_account_status_rejects_auth_error_envelopes_without_long_caching() {
+        let body = json!({"req_0": {"code": 1001, "data": {}}}).to_string();
+        let (endpoint, requests) = fixture_server(body);
+        let adapter = QqMusicAdapter::with_endpoints(
+            credentials(),
+            Duration::from_secs(2),
+            endpoint.clone(),
+            endpoint,
+        )
+        .unwrap();
+
+        let error = adapter.account_status().await.unwrap_err();
+        assert!(matches!(error, CatalogError::CredentialRejected(_)));
+
+        let cached = adapter.account_status().await.unwrap().unwrap();
+        assert!(!cached.logged_in);
+        assert!(cached.stale);
+        assert_eq!(cached.last_error.as_deref(), Some("relogin_required"));
+        assert!(requests.recv_timeout(Duration::from_secs(2)).is_ok());
+        assert!(requests.recv_timeout(Duration::from_millis(100)).is_err());
     }
 
     #[test]

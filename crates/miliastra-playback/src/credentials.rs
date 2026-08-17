@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub const SUPPORTED_PROVIDERS: &[&str] = &["qqmusic", "netease", "bilibili", "kugou"];
+/// Successful credential and account-status checks are intentionally sparse.
+/// Playback failures and explicit user actions remain separate recovery paths.
+pub(crate) const DAILY_REFRESH_INTERVAL_MS: u64 = 24 * 60 * 60 * 1000;
 const MAX_SECRET_BYTES: usize = 64 * 1024;
 const CREDENTIAL_SCHEMA_VERSION: u32 = 2;
 const REFRESH_STATE_FILE: &str = "refresh-state.json";
@@ -258,6 +261,7 @@ struct RefreshMetadata {
     state: String,
     last_refresh_at_ms: Option<u64>,
     next_refresh_check_at_ms: Option<u64>,
+    next_account_status_check_at_ms: Option<u64>,
     last_error: Option<String>,
 }
 
@@ -489,10 +493,14 @@ impl CredentialStore {
                 .refresh_metadata
                 .write()
                 .map_err(|_| CredentialError::Poisoned)?;
-            let previous = metadata.insert(
+            let previous = metadata.get(provider).cloned();
+            metadata.insert(
                 provider.to_owned(),
                 RefreshMetadata {
                     state: "refreshing".to_owned(),
+                    next_account_status_check_at_ms: previous
+                        .as_ref()
+                        .and_then(|metadata| metadata.next_account_status_check_at_ms),
                     ..RefreshMetadata::default()
                 },
             );
@@ -540,7 +548,7 @@ impl CredentialStore {
     /// 仅当同一凭据版本仍存在时写入刷新结果。
     ///
     /// 这把“检查版本 -> 更新刷新元数据”放在同一条凭据变更锁下，避免旧请求在
-    /// 新登录完成后把成功状态和 12 小时检查间隔写回新会话。
+    /// 新登录完成后把成功状态和日常检查间隔写回新会话。
     pub(crate) fn mark_refresh_finished_if_current_revision(
         &self,
         provider: &str,
@@ -573,12 +581,89 @@ impl CredentialStore {
         };
         if !current {
             drop(mutation);
-            self.discard_refresh(provider)?;
+            // A newer login/save already owns the metadata. The old request
+            // must release only its lease rather than deleting that schedule.
+            self.release_refresh_lease(provider);
             return Ok(false);
         }
         let persisted = self.write_refresh_metadata(provider, result, next_check_at_ms);
         drop(mutation);
         self.release_refresh_lease(provider);
+        persisted.map(|_| true)
+    }
+
+    /// Whether a configured provider is due for the background account/VIP
+    /// status refresh. This schedule is intentionally independent from the
+    /// credential-renewal deadline because NetEase has no credential refresh.
+    pub(crate) fn account_status_check_due(
+        &self,
+        provider: &str,
+        now_ms: u64,
+    ) -> Result<bool, CredentialError> {
+        let provider = canonical_provider(provider)?;
+        let configured = self
+            .credentials
+            .read()
+            .map_err(|_| CredentialError::Poisoned)?
+            .contains_key(provider);
+        if !configured {
+            return Ok(false);
+        }
+        Ok(self
+            .refresh_metadata
+            .read()
+            .map_err(|_| CredentialError::Poisoned)?
+            .get(provider)
+            .and_then(|metadata| metadata.next_account_status_check_at_ms)
+            .is_none_or(|next_check| next_check <= now_ms))
+    }
+
+    /// Record the next forced account/VIP status check only when the
+    /// credential observed before the network request is still current.
+    pub(crate) fn mark_account_status_check_finished_if_current_revision(
+        &self,
+        provider: &str,
+        expected_revision: u64,
+        next_check_at_ms: u64,
+    ) -> Result<bool, CredentialError> {
+        let provider = canonical_provider(provider)?;
+        let mutation = self
+            .mutation_lock
+            .lock()
+            .map_err(|_| CredentialError::Poisoned)?;
+        let revision = self
+            .credential_revisions
+            .read()
+            .map_err(|_| CredentialError::Poisoned)?
+            .get(provider)
+            .copied()
+            .unwrap_or_default();
+        let configured = self
+            .credentials
+            .read()
+            .map_err(|_| CredentialError::Poisoned)?
+            .contains_key(provider);
+        if !configured || revision != expected_revision {
+            return Ok(false);
+        }
+        let updated = {
+            let mut metadata = self
+                .refresh_metadata
+                .write()
+                .map_err(|_| CredentialError::Poisoned)?;
+            metadata
+                .entry(provider.to_owned())
+                .or_default()
+                .next_account_status_check_at_ms = Some(next_check_at_ms);
+            metadata.clone()
+        };
+        let persisted =
+            self.persist_refresh_metadata(&updated)
+                .map_err(|error| CredentialError::Write {
+                    path: self.refresh_state_path().unwrap_or_default(),
+                    error,
+                });
+        drop(mutation);
         persisted.map(|_| true)
     }
 
@@ -603,12 +688,16 @@ impl CredentialStore {
                 .refresh_metadata
                 .write()
                 .map_err(|_| CredentialError::Poisoned)?;
+            let next_account_status_check_at_ms = metadata
+                .get(provider)
+                .and_then(|metadata| metadata.next_account_status_check_at_ms);
             metadata.insert(
                 provider.to_owned(),
                 RefreshMetadata {
                     state: state.to_owned(),
                     last_refresh_at_ms: now,
                     next_refresh_check_at_ms: next_check_at_ms,
+                    next_account_status_check_at_ms,
                     last_error: error,
                 },
             );
@@ -740,6 +829,14 @@ impl CredentialStore {
             .map_err(|_| CredentialError::Poisoned)?;
         // 磁盘写入在 save_lock 下串行执行,且不持有 RwLock 写锁,
         // 避免 fsync/ACL 调用阻塞其他读取。
+        let mut status = credential.presence();
+        // 新登录/手工保存不能继承上一个会话的失败退避或“刷新中”标记；
+        // 同时从当前时刻开始计算下一次日常检查，避免启动后的首个 tick 立即续期。
+        let next_check_at_ms = epoch_ms().saturating_add(DAILY_REFRESH_INTERVAL_MS);
+        status.next_refresh_check_at_ms = status.refresh_supported.then_some(next_check_at_ms);
+        // 日程是凭据接受的一部分。先持久化它，避免磁盘失败时 UI 报告登录失败、
+        // 但新凭据其实已经写入且重启后丢失每日刷新安排。
+        self.schedule_initial_refresh_checks(provider, status.refresh_supported, next_check_at_ms)?;
         if let Some(directory) = self.directory.as_ref() {
             let _guard = self
                 .save_lock
@@ -751,12 +848,9 @@ impl CredentialStore {
             .credentials
             .write()
             .map_err(|_| CredentialError::Poisoned)?;
-        let status = credential.presence();
         credentials.insert(provider, credential);
         drop(credentials);
         self.bump_revision(provider)?;
-        // 新登录/手工保存不能继承上一个会话的失败退避或“刷新中”标记。
-        let _ = self.clear_refresh_metadata(provider);
         Ok(status)
     }
 
@@ -854,6 +948,43 @@ impl CredentialStore {
                 error,
             })
     }
+
+    fn schedule_initial_refresh_checks(
+        &self,
+        provider: &'static str,
+        refresh_supported: bool,
+        next_check_at_ms: u64,
+    ) -> Result<(), CredentialError> {
+        let updated = {
+            let mut metadata = self
+                .refresh_metadata
+                .write()
+                .map_err(|_| CredentialError::Poisoned)?;
+            metadata.insert(
+                provider.to_owned(),
+                RefreshMetadata {
+                    state: "idle".to_owned(),
+                    last_refresh_at_ms: None,
+                    next_refresh_check_at_ms: refresh_supported.then_some(next_check_at_ms),
+                    next_account_status_check_at_ms: Some(next_check_at_ms),
+                    last_error: None,
+                },
+            );
+            metadata.clone()
+        };
+        self.persist_refresh_metadata(&updated)
+            .map_err(|error| CredentialError::Write {
+                path: self.refresh_state_path().unwrap_or_default(),
+                error,
+            })
+    }
+}
+
+fn epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn canonical_provider(provider: &str) -> Result<&'static str, CredentialError> {
@@ -1283,7 +1414,8 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        CredentialError, CredentialStore, ProviderCredential, REFRESH_STATE_FILE, qq_refresh_ready,
+        CredentialError, CredentialStore, DAILY_REFRESH_INTERVAL_MS, ProviderCredential,
+        REFRESH_STATE_FILE, epoch_ms, qq_refresh_ready,
     };
 
     #[test]
@@ -1308,6 +1440,68 @@ mod tests {
         assert!(!qq_refresh_ready(&web));
         web.insert("wxrefresh_token".to_owned(), "refresh".to_owned());
         assert!(qq_refresh_ready(&web));
+    }
+
+    #[test]
+    fn saving_a_credential_defers_daily_refresh_and_account_status_checks() {
+        let store = CredentialStore::memory();
+        let before = epoch_ms();
+
+        let status = store
+            .save(
+                "kugou",
+                ProviderCredential::Kugou {
+                    token: "token".to_owned(),
+                    userid: "42".to_owned(),
+                    dfid: "device-42".to_owned(),
+                    cookies: BTreeMap::new(),
+                },
+            )
+            .unwrap();
+        let after = epoch_ms();
+        let next = status
+            .next_refresh_check_at_ms
+            .expect("refresh-capable credentials must receive a due time");
+
+        assert!(next >= before.saturating_add(DAILY_REFRESH_INTERVAL_MS));
+        assert!(next <= after.saturating_add(DAILY_REFRESH_INTERVAL_MS));
+        assert!(!store.account_status_check_due("kugou", after).unwrap());
+        assert!(store.account_status_check_due("kugou", next).unwrap());
+    }
+
+    #[test]
+    fn saved_daily_schedule_survives_restart() {
+        let directory = std::env::temp_dir().join(format!(
+            "miliastra-credentials-schedule-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = CredentialStore::open(directory.clone()).unwrap();
+        let status = store
+            .save(
+                "kugou",
+                ProviderCredential::Kugou {
+                    token: "token".to_owned(),
+                    userid: "42".to_owned(),
+                    dfid: "device-42".to_owned(),
+                    cookies: BTreeMap::new(),
+                },
+            )
+            .unwrap();
+        let next = status.next_refresh_check_at_ms.unwrap();
+        drop(store);
+
+        let reopened = CredentialStore::open(directory.clone()).unwrap();
+        assert_eq!(
+            reopened.status("kugou").unwrap().next_refresh_check_at_ms,
+            Some(next)
+        );
+        assert!(
+            !reopened
+                .account_status_check_due("kugou", epoch_ms())
+                .unwrap()
+        );
+
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -1384,6 +1578,31 @@ mod tests {
             .unwrap()
             .expect("the failed start must not leave the provider leased");
         drop(lease);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn saving_a_credential_requires_the_daily_schedule_to_persist_first() {
+        let directory =
+            std::env::temp_dir().join(format!("miliastra-credentials-{}", uuid::Uuid::new_v4()));
+        let store = CredentialStore::open(directory.clone()).unwrap();
+        // `write_atomic` cannot create a temporary file at this directory.
+        fs::create_dir(directory.join("refresh-state.tmp")).unwrap();
+
+        let result = store.save(
+            "qqmusic",
+            ProviderCredential::QqMusic {
+                cookies: BTreeMap::from([
+                    ("uin".to_owned(), "42".to_owned()),
+                    ("qqmusic_key".to_owned(), "key".to_owned()),
+                ]),
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(store.get("qqmusic").unwrap().is_none());
+        assert!(!directory.join("qqmusic.json").exists());
+
         fs::remove_dir_all(directory).unwrap();
     }
 

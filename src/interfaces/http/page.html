@@ -1247,7 +1247,7 @@ function renderAccountInfo(provider){
   const info=platformAccounts[provider]
   if(!info)return ''
   const vipLabel=info.vipKnown?(info.vip?(info.vipType&&info.vipType!=='0'?'VIP('+esc(info.vipType)+')':'VIP'):'非VIP'):(info.loggedIn?'VIP状态未知':'')
-  const expire=info.vipExpireAtMs?(' · 到期 '+esc(loginTime(info.vipExpireAtMs))):''
+  const expire=info.vipKnown&&info.vip&&info.vipExpireAtMs?(' · 到期 '+esc(loginTime(info.vipExpireAtMs))):''
   const stale=info.stale?'<span class="field-state">状态可能过期</span>':''
   const nickname=info.nickname||info.userId||'未知'
   const methodTag=info.loginMethod==='qq'?' · QQ登录':(info.loginMethod==='wechat'?' · 微信登录':'')

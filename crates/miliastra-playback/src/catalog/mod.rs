@@ -6,7 +6,7 @@ mod qqmusic;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 
@@ -256,20 +256,11 @@ impl AccountStatusCache {
             if cached_at.elapsed() >= if *failed { failed_ttl } else { success_ttl } {
                 return None;
             }
-            let mut status = status.clone();
-            // 会员到期是权威时间边界，不能因为账号缓存仍在一天窗口内而继续将
-            // 已到期会员当作可用。未知状态会交给曲目权限探测或下一次每日刷新确认。
-            if status.vip
-                && status
-                    .vip_expire_at_ms
-                    .is_some_and(|expires_at_ms| expires_at_ms <= current_epoch_ms())
-            {
-                status.vip = false;
-                status.vip_known = false;
-                status.stale = true;
-                status.last_error = Some("vip_status_expired".to_owned());
-            }
-            Some(status)
+            // Expiry fields can belong to one specific VIP tier and may remain in
+            // a response after that tier changes. The provider's `vip` result is
+            // authoritative for this cached observation; daily refreshes and an
+            // explicit playback `VipRequired` response correct it when needed.
+            Some(status.clone())
         })
     }
 
@@ -329,13 +320,6 @@ impl AccountStatusCache {
         self.generation = self.generation.wrapping_add(1);
         self.entry = None;
     }
-}
-
-fn current_epoch_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 /// 将账号状态查询错误映射为可公开展示的稳定错误码。
@@ -454,8 +438,7 @@ mod provider_contract_tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        AccountStatusCache, CatalogError, Failure, ProviderAccountStatus,
-        account_status_error_code, current_epoch_ms,
+        AccountStatusCache, CatalogError, Failure, ProviderAccountStatus, account_status_error_code,
     };
 
     #[test]
@@ -555,7 +538,7 @@ mod provider_contract_tests {
     }
 
     #[test]
-    fn account_status_cache_does_not_treat_an_expired_vip_as_current() {
+    fn account_status_cache_preserves_the_provider_vip_result_until_refresh() {
         let mut cache = AccountStatusCache::default();
         let generation = cache.generation();
         assert!(cache.store_if_current(
@@ -565,7 +548,7 @@ mod provider_contract_tests {
                 logged_in: true,
                 vip_known: true,
                 vip: true,
-                vip_expire_at_ms: Some(current_epoch_ms().saturating_sub(1)),
+                vip_expire_at_ms: Some(1),
                 ..ProviderAccountStatus::default()
             },
             Instant::now(),
@@ -575,10 +558,10 @@ mod provider_contract_tests {
         let cached = cache
             .cached(Duration::from_secs(60), Duration::from_secs(1))
             .expect("the account state itself is still cached");
-        assert!(!cached.vip);
-        assert!(!cached.vip_known);
-        assert!(cached.stale);
-        assert_eq!(cached.last_error.as_deref(), Some("vip_status_expired"));
+        assert!(cached.vip);
+        assert!(cached.vip_known);
+        assert!(!cached.stale);
+        assert_eq!(cached.vip_expire_at_ms, Some(1));
     }
 
     #[test]

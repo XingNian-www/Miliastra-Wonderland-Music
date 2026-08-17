@@ -1296,7 +1296,7 @@ fn is_mutating_route(path: &str) -> bool {
 }
 
 fn request_blocks_idle_reload(path: &str) -> bool {
-    is_mutating_route(path) || path == "/hall-screenshot"
+    is_mutating_route(path) || matches!(path, "/hall-screenshot" | "/search" | "/search/candidates")
 }
 
 fn try_begin_reload_blocking_request(state: &HttpSharedState) -> Option<ActiveConnectionGuard> {

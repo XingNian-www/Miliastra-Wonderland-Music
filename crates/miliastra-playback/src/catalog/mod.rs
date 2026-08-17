@@ -6,7 +6,7 @@ mod qqmusic;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 
@@ -117,8 +117,8 @@ impl CatalogError {
             Self::InvalidResolverLocator(_)
             | Self::ResolverLocatorSourceMismatch { .. }
             | Self::ResolverLocatorTrackMismatch { .. } => (
-                "provider_invalid_response",
-                "resolver locator is invalid",
+                "track_unavailable",
+                "track resolver metadata is invalid",
                 false,
             ),
         };
@@ -178,6 +178,20 @@ pub trait SourceAdapter: Send + Sync + 'static {
     }
     /// 使账号状态缓存失效。登录、退出和凭据更新后调用。
     fn invalidate_account_status(&self) {}
+    /// 播放请求已经给出了可以确定归因到账号的失败时，丢弃对应的乐观状态。
+    ///
+    /// 曲目元数据、版权、限流与网络错误不能说明登录态变化，因此不应触发刷新。
+    /// 默认实现只处理认证与会员结论；适配器可按平台协议补充更细的处理。
+    fn observe_playback_failure(&self, error: &CatalogError) {
+        if matches!(
+            error,
+            CatalogError::AuthRequired(_)
+                | CatalogError::CredentialRejected(_)
+                | CatalogError::VipRequired(_)
+        ) {
+            self.invalidate_account_status();
+        }
+    }
 }
 
 /// 平台账号状态（web 面板登录卡片展示）。
@@ -207,13 +221,28 @@ pub struct ProviderAccountStatus {
 /// 账号查询需要在释放互斥锁后等待网络返回。登录、登出或凭据更新期间，旧查询
 /// 的响应不应重新写入缓存；调用方在请求前记录 [`Self::generation`]，写回时使用
 /// [`Self::store_if_current`] 即可形成栅栏。
-#[derive(Default)]
 pub(crate) struct AccountStatusCache {
     generation: u64,
     entry: Option<(ProviderAccountStatus, Instant, bool)>,
+    /// 缓存未命中时只能有一个任务访问账号接口；其余调用者等待后重新读取缓存。
+    refresh_gate: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl Default for AccountStatusCache {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            entry: None,
+            refresh_gate: Arc::new(tokio::sync::Mutex::new(())),
+        }
+    }
 }
 
 impl AccountStatusCache {
+    pub(crate) fn refresh_gate(&self) -> Arc<tokio::sync::Mutex<()>> {
+        self.refresh_gate.clone()
+    }
+
     pub(crate) fn generation(&self) -> u64 {
         self.generation
     }
@@ -224,8 +253,23 @@ impl AccountStatusCache {
         failed_ttl: Duration,
     ) -> Option<ProviderAccountStatus> {
         self.entry.as_ref().and_then(|(status, cached_at, failed)| {
-            (cached_at.elapsed() < if *failed { failed_ttl } else { success_ttl })
-                .then(|| status.clone())
+            if cached_at.elapsed() >= if *failed { failed_ttl } else { success_ttl } {
+                return None;
+            }
+            let mut status = status.clone();
+            // 会员到期是权威时间边界，不能因为账号缓存仍在一天窗口内而继续将
+            // 已到期会员当作可用。未知状态会交给曲目权限探测或下一次每日刷新确认。
+            if status.vip
+                && status
+                    .vip_expire_at_ms
+                    .is_some_and(|expires_at_ms| expires_at_ms <= current_epoch_ms())
+            {
+                status.vip = false;
+                status.vip_known = false;
+                status.stale = true;
+                status.last_error = Some("vip_status_expired".to_owned());
+            }
+            Some(status)
         })
     }
 
@@ -285,6 +329,13 @@ impl AccountStatusCache {
         self.generation = self.generation.wrapping_add(1);
         self.entry = None;
     }
+}
+
+fn current_epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 /// 将账号状态查询错误映射为可公开展示的稳定错误码。
@@ -378,6 +429,19 @@ impl SourceCatalog {
         Ok(())
     }
 
+    /// 将播放过程中的确定性认证/VIP失败反馈给账号缓存。
+    pub fn observe_playback_failure(
+        &self,
+        source: &str,
+        error: &CatalogError,
+    ) -> Result<(), CatalogError> {
+        let adapter = self
+            .get(source)
+            .ok_or_else(|| CatalogError::UnknownSource(format!("unknown source: {source}")))?;
+        adapter.observe_playback_failure(error);
+        Ok(())
+    }
+
     pub fn sources(&self) -> Vec<String> {
         let mut sources = self.adapters.keys().cloned().collect::<Vec<_>>();
         sources.sort();
@@ -390,7 +454,8 @@ mod provider_contract_tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        AccountStatusCache, CatalogError, Failure, ProviderAccountStatus, account_status_error_code,
+        AccountStatusCache, CatalogError, Failure, ProviderAccountStatus,
+        account_status_error_code, current_epoch_ms,
     };
 
     #[test]
@@ -418,6 +483,11 @@ mod provider_contract_tests {
             ),
             (
                 CatalogError::Unavailable("no rights".to_owned()),
+                "track_unavailable",
+                false,
+            ),
+            (
+                CatalogError::InvalidResolverLocator("malformed metadata".to_owned()),
                 "track_unavailable",
                 false,
             ),
@@ -482,6 +552,33 @@ mod provider_contract_tests {
                 .cached(Duration::from_secs(1), Duration::from_secs(1))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn account_status_cache_does_not_treat_an_expired_vip_as_current() {
+        let mut cache = AccountStatusCache::default();
+        let generation = cache.generation();
+        assert!(cache.store_if_current(
+            generation,
+            ProviderAccountStatus {
+                provider: "qqmusic".to_owned(),
+                logged_in: true,
+                vip_known: true,
+                vip: true,
+                vip_expire_at_ms: Some(current_epoch_ms().saturating_sub(1)),
+                ..ProviderAccountStatus::default()
+            },
+            Instant::now(),
+            false,
+        ));
+
+        let cached = cache
+            .cached(Duration::from_secs(60), Duration::from_secs(1))
+            .expect("the account state itself is still cached");
+        assert!(!cached.vip);
+        assert!(!cached.vip_known);
+        assert!(cached.stale);
+        assert_eq!(cached.last_error.as_deref(), Some("vip_status_expired"));
     }
 
     #[test]

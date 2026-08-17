@@ -1125,7 +1125,7 @@ function renderCacheTracks(page){
 async function playCachedTrack(index){
   const t=cacheTracksItems[index]
   if(!t||!t.source||!t.id){setResult('缓存曲目信息不完整');return}
-  const body={trackRef:{key:{source:t.source,id:t.id}},metadata:{title:t.title||'缓存歌曲',artists:Array.isArray(t.artists)?t.artists:[]}}
+  const body={trackRef:{key:{provider:t.source,id:t.id}},metadata:{title:t.title||'缓存歌曲',artists:Array.isArray(t.artists)?t.artists:[]}}
   try{await jsonAction('/player/play-track',body)}catch(e){setResult('播放失败: '+e.message)}
 }
 async function deleteCachedTrack(index){
@@ -1616,9 +1616,18 @@ function toggleRefresh(){
   if(!refreshPaused)refreshAll()
 }
 async function refreshAll(){
-  const results=await Promise.allSettled([loadMonitor(),loadHistory(),refreshPlayer(),loadPlaybackInsights(),loadLoginState(),loadPlayMode()])
+  const results=await Promise.allSettled([loadMonitor(),loadHistory(),refreshPlayer(),loadPlaybackInsights(),loadPlayMode()])
   const failed=results.find((item)=>item.status==='rejected')
   if(failed)setResult('刷新失败: '+failed.reason.message)
+}
+async function refreshLoginProgress(){
+  try{
+    const next=await request('/player/login/status')
+    const wasActive=Boolean(loginRuntimeStatus&&loginRuntimeStatus.active)
+    loginRuntimeStatus=next||{active:false}
+    if(wasActive&&!loginRuntimeStatus.active){await loadLoginState();return}
+    renderLoginState()
+  }catch(e){/* 登录进度轮询失败不影响播放器主界面 */}
 }
 bindEnter('consoleChatText',sendConsoleChat)
 bindEnter('consoleChatPrefix',sendConsoleChat)
@@ -1640,10 +1649,11 @@ function switchTab(btn){
 $('accessToken').value=accessToken()
 loadOperatorWorkflows()
 refreshAll()
+loadLoginState()
 setInterval(()=>{if(!refreshPaused)loadMonitor()},1000)
 setInterval(()=>{if(!refreshPaused)refreshPlayer()},1000)
 setInterval(()=>{if(!refreshPaused)loadPlaybackInsights()},5000)
-setInterval(()=>{if(!refreshPaused)loadLoginState()},2000)
+setInterval(()=>{if(!refreshPaused&&loginRuntimeStatus&&loginRuntimeStatus.active)refreshLoginProgress()},2000)
 
 /* ===== 高级控制（原 /tools 独立页面，已并入左侧导航） ===== */
 const val=(id)=>{const el=$(id);return el?el.value.trim():''}

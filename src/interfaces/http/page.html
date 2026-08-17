@@ -1246,7 +1246,7 @@ let platformAccounts={}
 function renderAccountInfo(provider){
   const info=platformAccounts[provider]
   if(!info)return ''
-  const vipLabel=info.vipKnown?(info.vip?(info.vipType&&info.vipType!=='0'?'VIP('+esc(info.vipType)+')':'VIP'):'非VIP'):(info.loggedIn?'VIP状态未知':'')
+  const vipLabel=provider==='bilibili'?(info.loggedIn?'播放无需VIP':''):(info.vipKnown?(info.vip?(info.vipType&&info.vipType!=='0'?'VIP('+esc(info.vipType)+')':'VIP'):'非VIP'):(info.loggedIn?'VIP状态未知':''))
   const expire=info.vipKnown&&info.vip&&info.vipExpireAtMs?(' · 到期 '+esc(loginTime(info.vipExpireAtMs))):''
   const stale=info.stale?'<span class="field-state">状态可能过期</span>':''
   const nickname=info.nickname||info.userId||'未知'
@@ -1273,6 +1273,7 @@ async function refreshAccountStatus(provider){
 }
 function formatVipLabel(info){
   if(!info||!info.loggedIn)return ''
+  if(info.provider==='bilibili')return '，播放无需VIP'
   if(!info.vipKnown)return '，VIP状态未知'
   if(info.vip){
     const type=info.vipType&&info.vipType!=='0'?('（'+info.vipType+'）'):''

@@ -1475,6 +1475,8 @@ fn idle_reload_waits_for_http_operations_but_not_status_polling() {
     assert!(request_blocks_idle_reload("/config/save"));
     assert!(request_blocks_idle_reload("/player/login/start"));
     assert!(request_blocks_idle_reload("/hall-screenshot"));
+    assert!(request_blocks_idle_reload("/search"));
+    assert!(request_blocks_idle_reload("/search/candidates"));
     assert!(!request_blocks_idle_reload("/monitor"));
     assert!(!request_blocks_idle_reload("/status"));
 }

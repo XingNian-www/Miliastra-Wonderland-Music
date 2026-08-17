@@ -49,6 +49,12 @@ pub(crate) struct PlaybackSessionBinding {
     pub bound_at_ms: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ActivePlaybackIdentity {
+    pub(crate) track_key: TrackKey,
+    pub(crate) started_at_ms: u64,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct HandledTerminalOutcome {
@@ -332,6 +338,34 @@ impl RequestStateStore {
         self.snapshot.playback.clone()
     }
 
+    /// Records an observation only while the exact active request that produced the monitor
+    /// snapshot is still current. The identity check and durable update share one state-store
+    /// transaction, so a newer request cannot be overwritten between a controller snapshot and
+    /// observation persistence.
+    pub(crate) fn record_observation_if_active(
+        &mut self,
+        expected: &ActivePlaybackIdentity,
+        observation: PlaybackObservation,
+        immediate: bool,
+    ) -> Result<bool> {
+        let mut active_matched = false;
+        self.update(|snapshot| {
+            if active_request_identity(snapshot.playback.active_request.as_ref()).as_ref()
+                != Some(expected)
+            {
+                return false;
+            }
+            active_matched = true;
+            let update = if immediate {
+                PlaybackStateUpdate::ImmediateObservation(observation)
+            } else {
+                PlaybackStateUpdate::Observation(observation)
+            };
+            update.apply(&mut snapshot.playback)
+        })?;
+        Ok(active_matched)
+    }
+
     pub(crate) fn update(
         &mut self,
         mutation: impl FnOnce(&mut RequestStateSnapshot) -> bool,
@@ -351,31 +385,7 @@ impl RequestStateStore {
         binding: Option<PlaybackSessionBinding>,
     ) -> Result<SessionReconciliation> {
         let active = self.snapshot.playback.active_request.is_some();
-        let current = self.snapshot.session_binding.clone();
-        let decision = if !active {
-            SessionReconciliation::NoActiveRequest
-        } else {
-            match (&current, &binding) {
-                (_, Some(incoming)) if incoming.runtime_identity.trim().is_empty() => {
-                    SessionReconciliation::Unknown
-                }
-                (None, Some(_)) => SessionReconciliation::Bound,
-                (Some(existing), Some(incoming))
-                    if existing.runtime_identity == incoming.runtime_identity
-                        && existing.session_id == incoming.session_id
-                        && existing.generation == incoming.generation =>
-                {
-                    SessionReconciliation::Match
-                }
-                (Some(existing), Some(incoming))
-                    if existing.runtime_identity != incoming.runtime_identity =>
-                {
-                    SessionReconciliation::Restarted
-                }
-                (Some(_), Some(_)) => SessionReconciliation::Replaced,
-                (_, None) => SessionReconciliation::Unknown,
-            }
-        };
+        let decision = self.inspect_player_session(binding.as_ref());
         let should_replace = matches!(
             decision,
             SessionReconciliation::Bound
@@ -397,6 +407,17 @@ impl RequestStateStore {
             true
         })?;
         Ok(decision)
+    }
+
+    pub(crate) fn inspect_player_session(
+        &self,
+        binding: Option<&PlaybackSessionBinding>,
+    ) -> SessionReconciliation {
+        player_session_reconciliation(
+            self.snapshot.playback.active_request.is_some(),
+            self.snapshot.session_binding.as_ref(),
+            binding,
+        )
     }
 
     pub(crate) fn record_handled_terminal_outcome(
@@ -533,6 +554,36 @@ impl RequestStateStore {
              BEGIN SELECT RAISE(ABORT, '注入的写盘故障'); END",
         )?;
         Ok(())
+    }
+}
+
+fn player_session_reconciliation(
+    active: bool,
+    current: Option<&PlaybackSessionBinding>,
+    incoming: Option<&PlaybackSessionBinding>,
+) -> SessionReconciliation {
+    if !active {
+        return SessionReconciliation::NoActiveRequest;
+    }
+    match (current, incoming) {
+        (_, Some(incoming)) if incoming.runtime_identity.trim().is_empty() => {
+            SessionReconciliation::Unknown
+        }
+        (None, Some(_)) => SessionReconciliation::Bound,
+        (Some(existing), Some(incoming))
+            if existing.runtime_identity == incoming.runtime_identity
+                && existing.session_id == incoming.session_id
+                && existing.generation == incoming.generation =>
+        {
+            SessionReconciliation::Match
+        }
+        (Some(existing), Some(incoming))
+            if existing.runtime_identity != incoming.runtime_identity =>
+        {
+            SessionReconciliation::Restarted
+        }
+        (Some(_), Some(_)) => SessionReconciliation::Replaced,
+        (_, None) => SessionReconciliation::Unknown,
     }
 }
 
@@ -700,7 +751,16 @@ pub struct ActivePlaybackRequest {
     pub(crate) expected_generation: u64,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+impl ActivePlaybackRequest {
+    pub(crate) fn identity(&self) -> Option<ActivePlaybackIdentity> {
+        self.track.as_ref().map(|track| ActivePlaybackIdentity {
+            track_key: track.track_ref.key.clone(),
+            started_at_ms: self.started_at_ms,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct PlaybackObservation {
     pub status: String,
@@ -776,17 +836,28 @@ impl PersistentPlaybackState {
         }
         Ok(changed)
     }
+
+    pub(crate) fn record_observation_if_active(
+        &mut self,
+        expected: &ActivePlaybackIdentity,
+        observation: PlaybackObservation,
+        immediate: bool,
+    ) -> Result<bool> {
+        let mut store = self
+            .request_store
+            .lock()
+            .map_err(|_| anyhow::anyhow!("请求状态存储锁已中毒"))?;
+        let active_matched =
+            store.record_observation_if_active(expected, observation, immediate)?;
+        self.state = store.playback_snapshot();
+        Ok(active_matched)
+    }
 }
 
 fn active_request_identity(
     request: Option<&ActivePlaybackRequest>,
-) -> Option<(&miliastra_playback::TrackKey, u64)> {
-    request.and_then(|request| {
-        request
-            .track
-            .as_ref()
-            .map(|track| (&track.track_ref.key, request.started_at_ms))
-    })
+) -> Option<ActivePlaybackIdentity> {
+    request.and_then(ActivePlaybackRequest::identity)
 }
 
 impl PlaybackRuntimeState {
@@ -1474,6 +1545,88 @@ mod tests {
     }
 
     #[test]
+    fn conditional_observation_does_not_overwrite_a_new_active_request() {
+        let state_path = temp_request_state_path("conditional-observation");
+        let store =
+            RequestStateStore::load(state_path.clone(), crate::test_support::test_state_store())
+                .unwrap();
+        let old_track = test_track("miliastra://track/qqmusic/old", "旧歌 - 歌手A");
+        let new_track = test_track("miliastra://track/qqmusic/new", "新歌 - 歌手B");
+        let old_request = ActivePlaybackRequest {
+            track: Some(old_track.clone()),
+            started_at_ms: 10,
+            ..ActivePlaybackRequest::default()
+        };
+        let expected = old_request.identity().unwrap();
+        let new_observation = PlaybackObservation {
+            status: "playing".to_string(),
+            track: Some(new_track.clone()),
+            title: "新歌".to_string(),
+            artist: "歌手B".to_string(),
+            progress: 3.0,
+            duration: 180.0,
+            captured_at_ms: 30,
+            reliability: ObservationReliability::Reliable,
+        };
+        {
+            let mut store = store.lock().unwrap();
+            store
+                .update(|snapshot| {
+                    snapshot.playback.state = ConfirmedPlaybackState::RequestedSongPlaying;
+                    snapshot.playback.active_request = Some(old_request);
+                    true
+                })
+                .unwrap();
+            store
+                .update(|snapshot| {
+                    snapshot.playback.active_request = Some(ActivePlaybackRequest {
+                        track: Some(new_track.clone()),
+                        started_at_ms: 20,
+                        ..ActivePlaybackRequest::default()
+                    });
+                    snapshot.playback.last_observation = Some(new_observation.clone());
+                    true
+                })
+                .unwrap();
+
+            let accepted = store
+                .record_observation_if_active(
+                    &expected,
+                    PlaybackObservation {
+                        status: "playing".to_string(),
+                        track: Some(old_track),
+                        title: "旧歌".to_string(),
+                        artist: "歌手A".to_string(),
+                        progress: 90.0,
+                        duration: 180.0,
+                        captured_at_ms: 40,
+                        reliability: ObservationReliability::Reliable,
+                    },
+                    true,
+                )
+                .unwrap();
+            assert!(!accepted);
+            let playback = store.playback_snapshot();
+            assert_eq!(
+                playback
+                    .active_request
+                    .as_ref()
+                    .and_then(|request| request.track.as_ref())
+                    .map(|track| &track.track_ref.key),
+                Some(&new_track.track_ref.key)
+            );
+            let persisted_observation = playback.last_observation.unwrap();
+            assert_eq!(persisted_observation.track, new_observation.track);
+            assert_eq!(persisted_observation.progress, new_observation.progress);
+            assert_eq!(
+                persisted_observation.captured_at_ms,
+                new_observation.captured_at_ms
+            );
+        }
+        remove_request_state_path(state_path);
+    }
+
+    #[test]
     fn corrupted_database_fails_loudly_without_recovery() {
         let state_path = temp_request_state_path("corrupt-db");
         let store =
@@ -1574,6 +1727,27 @@ mod tests {
                 .unwrap(),
             SessionReconciliation::Match
         );
+        let replacement = PlaybackSessionBinding {
+            runtime_identity: "native-runtime-B".to_string(),
+            session_id: String::new(),
+            generation: 0,
+            bound_at_ms: 10,
+        };
+        {
+            let store = store.lock().unwrap();
+            assert_eq!(
+                store.inspect_player_session(Some(&replacement)),
+                SessionReconciliation::Restarted
+            );
+            assert_eq!(
+                store
+                    .snapshot
+                    .session_binding
+                    .as_ref()
+                    .map(|binding| binding.runtime_identity.as_str()),
+                Some("native-runtime-A")
+            );
+        }
         assert!(
             store
                 .lock()

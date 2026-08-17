@@ -129,6 +129,19 @@ impl PlaybackRuntimeState {
                 });
                 let _ = response.send(result);
             }
+            PlaybackRuntimeMessage::RecordObservationIfActive {
+                expected,
+                observation,
+                immediate,
+                response,
+            } => {
+                let result = self.service_mut().and_then(|service| {
+                    service
+                        .record_observation_if_active(expected, observation, immediate)
+                        .map_err(playback_operation_failed)
+                });
+                let _ = response.send(result);
+            }
             PlaybackRuntimeMessage::ConfirmPlaybackAndDequeue {
                 update,
                 queue_item_id,
@@ -194,6 +207,17 @@ impl PlaybackRuntimeState {
                         .reconcile_player_session(binding)
                         .map_err(playback_operation_failed)
                 });
+                let _ = response.send(result);
+            }
+            PlaybackRuntimeMessage::InspectPlayerSession { binding, response } => {
+                let result = self.service.as_ref().map_or(
+                    Err(BusinessRuntimeError::RuntimeStopped),
+                    |service| {
+                        service
+                            .inspect_player_session(binding)
+                            .map_err(playback_operation_failed)
+                    },
+                );
                 let _ = response.send(result);
             }
             PlaybackRuntimeMessage::ClaimTerminalOutcome {

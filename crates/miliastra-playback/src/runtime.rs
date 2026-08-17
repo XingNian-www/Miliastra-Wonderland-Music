@@ -1743,13 +1743,13 @@ async fn refresh_due_credentials(core: &PlaybackCore, credentials: &CredentialSt
         if result.is_ok() {
             let _ = core.invalidate_account_status(provider);
         }
-        if let Err(error) = result {
-            if !matches!(
+        if let Err(error) = result
+            && !matches!(
                 error,
                 PlaybackError::Failure(ref failure) if failure.code == "credential_refresh_in_progress"
-            ) {
-                tracing::warn!(provider = %provider, error = %error, "自动刷新凭据失败");
-            }
+            )
+        {
+            tracing::warn!(provider = %provider, error = %error, "自动刷新凭据失败");
         }
     }
 }

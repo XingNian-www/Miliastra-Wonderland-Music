@@ -62,7 +62,7 @@ use crate::features::command::{
 pub(crate) use controller::{
     MusicPlayerBackend, PlaybackNavigation, PlaybackOutcome, PlaybackRequest, PlaybackStatePort,
     PlaybackTimePorts, PlaybackVerification, PlayerController, QueueAdvanceContext,
-    QueueAdvanceDecision,
+    QueueAdvanceDecision, has_restorable_playback_progress,
 };
 pub(crate) use dedup::{PersistentSongDedupHistory, SongDedupCandidate};
 pub(crate) use format::{
@@ -70,10 +70,12 @@ pub(crate) use format::{
 };
 use miliastra_kernel::clock::WallClock;
 pub(crate) use queue::{PersistentQueue, QueueItem};
+#[cfg(test)]
+pub(crate) use state::ObservationReliability;
 pub(crate) use state::{
-    ActivePlaybackRequest, ConfirmedPlaybackState, ControlOperationRecord, PauseReason,
-    PersistentPlaybackState, PlaybackAttemptRecord, PlaybackObservation, PlaybackRuntimeState,
-    PlaybackSessionBinding, RequestStateStore, SessionReconciliation,
+    ActivePlaybackIdentity, ActivePlaybackRequest, ConfirmedPlaybackState, ControlOperationRecord,
+    PauseReason, PersistentPlaybackState, PlaybackAttemptRecord, PlaybackObservation,
+    PlaybackRuntimeState, PlaybackSessionBinding, RequestStateStore, SessionReconciliation,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -568,6 +570,8 @@ pub(crate) enum PlaybackStateUpdate {
     /// 持久化歌词翻译开关：后端切换成功后写入，供重启恢复。
     LyricsMode(bool),
     Observation(PlaybackObservation),
+    /// 配置重载关停前的最后观测必须绕过常规进度节流，供新进程精确续播。
+    ImmediateObservation(PlaybackObservation),
     Unknown,
     Restore(Box<PlaybackRuntimeState>),
 }
@@ -614,10 +618,10 @@ impl PlaybackStateUpdate {
                 request,
                 navigation,
             } => {
-                if navigation == PlaybackNavigation::Previous {
-                    playback.remove_previous_request(&request);
-                } else {
-                    playback.remember_current_playback();
+                match navigation {
+                    PlaybackNavigation::Normal => playback.remember_current_playback(),
+                    PlaybackNavigation::Previous => playback.remove_previous_request(&request),
+                    PlaybackNavigation::Restore => {}
                 }
                 // play 是异步操作，确认返回前用户可能已暂停：此时引擎实际处于暂停，
                 // 必须保留 User 暂停状态，否则暂停的歌不会自然结束，队列自动推进被永久卡住。
@@ -652,6 +656,10 @@ impl PlaybackStateUpdate {
                     playback.last_observation = Some(observation);
                     true
                 }
+            }
+            Self::ImmediateObservation(observation) => {
+                playback.last_observation = Some(observation);
+                true
             }
             Self::Unknown => {
                 playback.state = ConfirmedPlaybackState::Unknown;
@@ -902,6 +910,16 @@ impl PlaybackService {
             .update(|playback| update.apply(playback))
     }
 
+    pub(crate) fn record_observation_if_active(
+        &mut self,
+        expected: ActivePlaybackIdentity,
+        observation: PlaybackObservation,
+        immediate: bool,
+    ) -> Result<bool> {
+        self.playback_state
+            .record_observation_if_active(&expected, observation, immediate)
+    }
+
     /// 原子确认播放成功并从队列删除对应项（同一笔持久化）。
     ///
     /// 共享请求状态存储存在时，确认与队首出队在同一事务内落盘：
@@ -959,6 +977,19 @@ impl PlaybackService {
             .lock()
             .map_err(|_| anyhow::anyhow!("请求状态存储锁已中毒"))?
             .reconcile_player_session(binding)
+    }
+
+    pub(crate) fn inspect_player_session(
+        &self,
+        binding: Option<PlaybackSessionBinding>,
+    ) -> Result<SessionReconciliation> {
+        let Some(store) = &self.request_state else {
+            return Ok(SessionReconciliation::Unknown);
+        };
+        Ok(store
+            .lock()
+            .map_err(|_| anyhow::anyhow!("请求状态存储锁已中毒"))?
+            .inspect_player_session(binding.as_ref()))
     }
 
     pub(crate) fn claim_terminal_outcome(
@@ -1334,6 +1365,23 @@ mod tests {
         let last = playback.last_observation.as_ref().expect("observation");
         assert_eq!(last.progress, 10.0);
         assert_eq!(last.captured_at_ms, 1_000);
+    }
+
+    #[test]
+    fn immediate_observation_bypasses_progress_persistence_throttling() {
+        let mut playback = PlaybackRuntimeState::default();
+        assert!(
+            PlaybackStateUpdate::Observation(observation("playing", 10.0, 1_000))
+                .apply(&mut playback)
+        );
+
+        assert!(
+            PlaybackStateUpdate::ImmediateObservation(observation("playing", 12.0, 2_000))
+                .apply(&mut playback)
+        );
+        let last = playback.last_observation.as_ref().expect("observation");
+        assert_eq!(last.progress, 12.0);
+        assert_eq!(last.captured_at_ms, 2_000);
     }
 
     #[test]

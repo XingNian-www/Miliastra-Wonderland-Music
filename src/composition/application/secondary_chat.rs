@@ -216,18 +216,37 @@ fn secondary_hall_command_observation(
 type SecondaryHallCommandStability =
     Option<(Frame, Vec<SecondaryHallBubble>, Vec<SecondaryOcrMessage>)>;
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct SecondaryListenerRoundOutcome {
+    pub(super) scanned: bool,
+    pub(super) verified: bool,
+    pub(super) recovery_requested: bool,
+}
+
+pub(super) struct SecondaryListenerRoundState<'a> {
+    pub(super) last_friend_bubble: &'a mut Option<ChangeFingerprint>,
+    pub(super) hall_bubble_sequence: &'a mut Option<Vec<SecondaryHallBubble>>,
+    pub(super) hall_command_tracker: &'a mut SecondaryHallCommandTracker,
+    pub(super) last_title: &'a mut Option<ChangeFingerprint>,
+    pub(super) identity: &'a mut Option<SecondaryChatIdentity>,
+}
+
 impl ApplicationRuntime {
     pub(super) fn run_secondary_listener_round(
         &mut self,
         image: &DynamicImage,
-        last_friend_bubble: &mut Option<ChangeFingerprint>,
-        hall_bubble_sequence: &mut Option<Vec<SecondaryHallBubble>>,
-        hall_command_tracker: &mut SecondaryHallCommandTracker,
-        last_title: &mut Option<ChangeFingerprint>,
-        identity: &mut Option<SecondaryChatIdentity>,
-    ) -> Result<bool> {
-        if self.business.task_engine.snapshot()?.is_busy() {
-            return Ok(false);
+        state: SecondaryListenerRoundState<'_>,
+        allow_hall_recovery: bool,
+    ) -> Result<SecondaryListenerRoundOutcome> {
+        let SecondaryListenerRoundState {
+            last_friend_bubble,
+            hall_bubble_sequence,
+            hall_command_tracker,
+            last_title,
+            identity,
+        } = state;
+        if !self.business.task_engine.is_idle()? {
+            return Ok(SecondaryListenerRoundOutcome::default());
         }
         let title_fingerprint = rect_chat_change_fingerprint(image, SECONDARY_TITLE_RECT)?;
         let title_changed = identity.is_none()
@@ -246,13 +265,22 @@ impl ApplicationRuntime {
 
         let state = self.business.business.chat_listener_snapshot()?;
         if state.unread_task_pending {
-            return Ok(false);
+            return Ok(SecondaryListenerRoundOutcome::default());
         }
         let current_identity = identity.clone().unwrap_or(SecondaryChatIdentity::Unknown);
 
         if state.initial_unread_clear {
+            if current_identity != SecondaryChatIdentity::CurrentHall {
+                let recovery_requested =
+                    allow_hall_recovery && self.queue_secondary_hall_recovery()?;
+                return Ok(SecondaryListenerRoundOutcome {
+                    recovery_requested,
+                    ..Default::default()
+                });
+            }
             if let Some(hit) = find_unread_friend_hits(image).into_iter().next() {
-                return self.queue_secondary_unread_task(hit, true);
+                self.queue_secondary_unread_task(hit, true)?;
+                return Ok(SecondaryListenerRoundOutcome::default());
             }
             *last_friend_bubble = latest_incoming_fingerprint(image)?;
             let bubbles = secondary_hall_bubbles(image)?;
@@ -269,7 +297,11 @@ impl ApplicationRuntime {
                 .business
                 .finish_chat_listener_initial_unread_clear()?;
             log::info!("二级监听初始未读清场完成，当前大厅已建立消息基线");
-            return Ok(false);
+            return Ok(SecondaryListenerRoundOutcome {
+                scanned: false,
+                verified: true,
+                ..Default::default()
+            });
         }
 
         match current_identity {
@@ -281,27 +313,48 @@ impl ApplicationRuntime {
                         hall_command_tracker,
                     )?;
                     self.business.business.finish_chat_listener_hall_round()?;
-                    return Ok(scanned);
+                    return Ok(SecondaryListenerRoundOutcome {
+                        scanned,
+                        verified: true,
+                        ..Default::default()
+                    });
                 }
                 if let Some(hit) = find_unread_friend_hits(image).into_iter().next() {
-                    return self.queue_secondary_unread_task(hit, false);
+                    self.queue_secondary_unread_task(hit, false)?;
+                    return Ok(SecondaryListenerRoundOutcome::default());
                 }
-                self.scan_secondary_hall_if_changed(
+                let scanned = self.scan_secondary_hall_if_changed(
                     image,
                     hall_bubble_sequence,
                     hall_command_tracker,
-                )
+                )?;
+                Ok(SecondaryListenerRoundOutcome {
+                    scanned,
+                    verified: true,
+                    ..Default::default()
+                })
             }
-            SecondaryChatIdentity::Friend(name) => {
+            SecondaryChatIdentity::Friend(_) => {
                 if title_changed {
                     *last_friend_bubble = latest_incoming_fingerprint(image)?;
-                    return Ok(false);
                 }
-                self.scan_secondary_latest_if_changed(image, "pink", &name, last_friend_bubble)
+                let recovery_requested =
+                    allow_hall_recovery && self.queue_secondary_hall_recovery()?;
+                Ok(SecondaryListenerRoundOutcome {
+                    recovery_requested,
+                    ..Default::default()
+                })
             }
-            SecondaryChatIdentity::PublicChannel => self.queue_secondary_hall_recovery(),
-            SecondaryChatIdentity::StrangerMessages => Ok(false),
-            SecondaryChatIdentity::Unknown => Ok(false),
+            SecondaryChatIdentity::PublicChannel
+            | SecondaryChatIdentity::StrangerMessages
+            | SecondaryChatIdentity::Unknown => {
+                let recovery_requested =
+                    allow_hall_recovery && self.queue_secondary_hall_recovery()?;
+                Ok(SecondaryListenerRoundOutcome {
+                    recovery_requested,
+                    ..Default::default()
+                })
+            }
         }
     }
 
@@ -336,37 +389,7 @@ impl ApplicationRuntime {
             return Err(error);
         }
         log::info!("二级监听检测到不可执行会话，已加入恢复当前大厅任务");
-        Ok(false)
-    }
-
-    fn scan_secondary_latest_if_changed(
-        &mut self,
-        image: &DynamicImage,
-        message_type: &str,
-        friend_name: &str,
-        last_bubble: &mut Option<ChangeFingerprint>,
-    ) -> Result<bool> {
-        let current = latest_incoming_fingerprint(image)?;
-        let changed = match (&*last_bubble, &current) {
-            (None, Some(_)) => true,
-            (Some(previous), Some(current)) => secondary_fingerprint_changed(previous, current),
-            _ => false,
-        };
-        if !changed {
-            *last_bubble = current;
-            return Ok(false);
-        }
-
-        let refreshed = self.wait_for_secondary_bubble_stability()?;
-        let refreshed_fingerprint = latest_incoming_fingerprint(&refreshed.image)?;
-        let outcome = self.process_secondary_latest_message(
-            &refreshed.image,
-            refreshed.captured_at,
-            message_type,
-            friend_name,
-        )?;
-        *last_bubble = refreshed_fingerprint;
-        Ok(outcome)
+        Ok(true)
     }
 
     fn scan_secondary_hall_if_changed(
@@ -535,13 +558,7 @@ impl ApplicationRuntime {
             .business
             .finish_chat_listener_unread_task(!discard_only)?;
         if result.is_err() {
-            self.business
-                .business
-                .fail_chat_listener_mode_to_primary()?;
-            let _ = self.establish_ui_residency(
-                UiResidency::Primary,
-                ResidencyPurpose::IndependentRecovery("二级未读失败回退一级"),
-            );
+            log::warn!("二级未读任务失败，保留二级监听模式并等待下一轮驻留恢复");
         }
         result
     }
@@ -554,19 +571,7 @@ impl ApplicationRuntime {
         self.business
             .business
             .finish_chat_listener_unread_task(false)?;
-        match result {
-            Ok(()) => Ok(()),
-            Err(_) => {
-                self.business
-                    .business
-                    .fail_chat_listener_mode_to_primary()?;
-                let _ = self.establish_ui_residency(
-                    UiResidency::Primary,
-                    ResidencyPurpose::IndependentRecovery("二级大厅恢复失败回退一级"),
-                );
-                Err(anyhow!("二级监听无法恢复当前大厅，已回退一级监听"))
-            }
-        }
+        result.context("二级监听暂时无法恢复当前大厅，已保留二级模式并等待重试")
     }
 
     fn secondary_identity_from_frame(&self, image: &DynamicImage) -> Result<SecondaryChatIdentity> {
@@ -754,62 +759,6 @@ impl ApplicationRuntime {
                 "二级当前大厅",
             )));
         Ok(messages)
-    }
-
-    fn process_secondary_latest_message(
-        &mut self,
-        image: &DynamicImage,
-        captured_at: Instant,
-        message_type: &str,
-        friend_name: &str,
-    ) -> Result<bool> {
-        let Some(rect) = latest_incoming_bubble_rect(image) else {
-            return Ok(false);
-        };
-        Ok(self
-            .process_secondary_bubble_rects(
-                image,
-                captured_at,
-                std::iter::once((rect, None)),
-                message_type,
-                friend_name,
-            )?
-            .processed)
-    }
-
-    fn process_secondary_bubble_rects(
-        &mut self,
-        image: &DynamicImage,
-        captured_at: Instant,
-        regions: impl IntoIterator<Item = (Rect, Option<Rect>)>,
-        message_type: &str,
-        friend_name: &str,
-    ) -> Result<SecondaryBubbleProcessOutcome> {
-        let observation_frame = self.ui.chat_observations.begin_frame(captured_at)?;
-        let texts = self.recognize_secondary_bubble_rects(image, regions, message_type);
-        let texts = match texts {
-            Ok(texts) => texts,
-            Err(error) => {
-                if let Err(record_error) = self
-                    .ui
-                    .chat_observations
-                    .record_terminal_failure(observation_frame, format!("{error:#}"))
-                {
-                    log::error!("记录二级聊天观察终止失败异常: {record_error:#}");
-                }
-                return Err(error);
-            }
-        };
-        let accepts_turtle_questions = message_type == "blue"
-            && self.commands_enabled()?
-            && self.business.business.turtle_soup_accepts_questions()?;
-        self.process_secondary_recognized_messages(
-            observation_frame,
-            message_type,
-            friend_name,
-            accepts_turtle_questions,
-            texts,
-        )
     }
 
     fn recognize_secondary_bubble_rects(
@@ -1139,39 +1088,6 @@ impl ApplicationRuntime {
             processed = true;
         }
         Ok(processed)
-    }
-
-    fn wait_for_secondary_bubble_stability(&self) -> Result<Frame> {
-        const STABILITY_TIMEOUT_MS: u64 = 500;
-        let live_config = self.lifecycle.live_configs.snapshot();
-
-        let canvas = Canvas {
-            width: self.lifecycle.config.screen.expected_width,
-            height: self.lifecycle.config.screen.expected_height,
-            resize: true,
-        };
-        let first = load_frame(&canvas, &self.ui.game_ui)?;
-        let mut previous = latest_incoming_fingerprint(&first.image)?;
-        let mut latest_frame = first;
-        let poll_ms = live_config
-            .timing
-            .chat_scan
-            .change_debounce_ms
-            .clamp(100, 200);
-        let deadline = Instant::now() + Duration::from_millis(STABILITY_TIMEOUT_MS);
-
-        while Instant::now() < deadline {
-            sleep(Duration::from_millis(poll_ms));
-            let frame = load_frame(&canvas, &self.ui.game_ui)?;
-            let current = latest_incoming_fingerprint(&frame.image)?;
-            if !secondary_optional_fingerprint_changed(previous.as_ref(), current.as_ref()) {
-                return Ok(frame);
-            }
-            previous = current;
-            latest_frame = frame;
-        }
-        log::debug!("二级监听气泡稳定等待超时，按当前画面继续 OCR");
-        Ok(latest_frame)
     }
 
     fn wait_for_secondary_hall_stability(

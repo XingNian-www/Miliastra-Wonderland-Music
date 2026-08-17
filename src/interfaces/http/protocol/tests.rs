@@ -1480,6 +1480,17 @@ fn idle_reload_waits_for_http_operations_but_not_status_polling() {
 }
 
 #[test]
+fn reload_draining_rejects_new_blocking_requests_without_leaking_the_counter() {
+    let state = test_state();
+    assert!(try_begin_reload_blocking_request(&state).is_some());
+    assert_eq!(state.active_reload_blockers.load(Ordering::SeqCst), 0);
+
+    state.reload_draining.store(true, Ordering::SeqCst);
+    assert!(try_begin_reload_blocking_request(&state).is_none());
+    assert_eq!(state.active_reload_blockers.load(Ordering::SeqCst), 0);
+}
+
+#[test]
 fn turtle_soup_routes_have_expected_methods_and_monitor_snapshot() {
     assert!(!is_mutating_route("/turtle-soup"));
     assert!(is_json_route("/turtle-soup"));
@@ -3044,6 +3055,7 @@ fn config_schema_route_lists_all_sections_with_defaults() {
         .expect("audio_cache.enabled field");
     assert_eq!(cache_enabled["default"], json!(true));
     assert_eq!(cache_enabled["optionalParent"], true);
+    assert_eq!(cache_enabled["effect"], "idleReload");
     let cache_dir = playback["fields"]
         .as_array()
         .unwrap()
@@ -3294,7 +3306,18 @@ fn config_save_route_persists_and_reports_changed_fields() {
             .unwrap()
             .contains(&json!("queue.max_size"))
     );
-    assert!(response["appliedLiveFields"].as_array().unwrap().is_empty());
+    assert!(
+        response["runtimeReloadFields"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("queue.max_size"))
+    );
+    assert!(
+        !response["appliedLiveFields"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("queue.max_size"))
+    );
     assert!(state.live_configs.has_pending_reload());
     assert!(
         state
@@ -3304,6 +3327,69 @@ fn config_save_route_persists_and_reports_changed_fields() {
     );
     let store = state.config_store.lock().unwrap();
     assert_eq!(store.load_full().unwrap().queue.max_size, 20);
+}
+
+#[test]
+fn playback_configuration_uses_the_stricter_reload_barrier() {
+    let state = test_state();
+    let sections = full_config_sections(&state);
+    let body = serde_json::to_string(&json!({ "baseRevision": 1, "sections": sections })).unwrap();
+    let warm_up: Value =
+        serde_json::from_str(&config_save_route(body.as_bytes(), &state).unwrap()).unwrap();
+    assert_eq!(warm_up["revision"], 2);
+
+    let mut sections = full_config_sections(&state);
+    let current = sections["playback"]["credential_directory"]
+        .as_str()
+        .unwrap();
+    sections["playback"]["credential_directory"] = json!(format!("{current}-alternate"));
+    let body = serde_json::to_string(&json!({ "baseRevision": 2, "sections": sections })).unwrap();
+    let response: Value =
+        serde_json::from_str(&config_save_route(body.as_bytes(), &state).unwrap()).unwrap();
+
+    assert!(
+        response["playbackReloadFields"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("playback.credential_directory"))
+    );
+    assert!(
+        response["runtimeReloadFields"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(state.live_configs.pending_reload_requires_playback_idle());
+}
+
+#[test]
+fn playback_runtime_settings_use_the_normal_reload_barrier() {
+    let state = test_state();
+    let sections = full_config_sections(&state);
+    let body = serde_json::to_string(&json!({ "baseRevision": 1, "sections": sections })).unwrap();
+    let warm_up: Value =
+        serde_json::from_str(&config_save_route(body.as_bytes(), &state).unwrap()).unwrap();
+    assert_eq!(warm_up["revision"], 2);
+
+    let mut sections = full_config_sections(&state);
+    let current = sections["playback"]["login_timeout_ms"].as_u64().unwrap();
+    sections["playback"]["login_timeout_ms"] = json!(current + 1);
+    let body = serde_json::to_string(&json!({ "baseRevision": 2, "sections": sections })).unwrap();
+    let response: Value =
+        serde_json::from_str(&config_save_route(body.as_bytes(), &state).unwrap()).unwrap();
+
+    assert!(
+        response["runtimeReloadFields"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("playback.login_timeout_ms"))
+    );
+    assert!(
+        response["playbackReloadFields"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -3356,6 +3442,18 @@ fn config_save_route_applies_live_fields_to_shared_values() {
     assert!(response["restartFields"].as_array().unwrap().is_empty());
     assert_eq!(response["reloadScheduled"], false);
     assert!(response["reloadFields"].as_array().unwrap().is_empty());
+    assert!(
+        response["runtimeReloadFields"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        response["playbackReloadFields"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
     // 共享热更新值必须已覆盖：运行态读取点立即看到新值（不虚报已生效）。
     assert!(
         !*state
@@ -3416,6 +3514,10 @@ fn config_save_route_applies_live_fields_to_shared_values() {
         "Point 子路径必须继承父字段的 idleReload 效果: {}",
         response
     );
+    assert_eq!(
+        response["runtimeReloadFields"], response["reloadFields"],
+        "本轮只有普通运行态重载字段"
+    );
     assert!(
         *state
             .live_configs
@@ -3475,7 +3577,9 @@ fn config_rollback_route_applies_live_fields_to_shared_values() {
 fn config_save_succeeds_even_when_live_apply_fails() {
     let state = test_state();
     // 落库成功：手动走 store.save（等价于 config_save_route 的保存成功分支）。
-    let sections = full_config_sections(&state);
+    let mut sections = full_config_sections(&state);
+    let current = sections["timing"]["loop_idle_ms"].as_u64().unwrap();
+    sections["timing"]["loop_idle_ms"] = json!(current + 1);
     let mut store = state.config_store.lock().unwrap();
     let outcome = store
         .save(1, sections.as_object().expect("sections 对象").clone())
@@ -3497,7 +3601,8 @@ fn config_save_succeeds_even_when_live_apply_fails() {
     // 模拟必须使 apply 阶段读取失败，否则测试失去意义。
     assert!(store.load_full().is_err(), "破坏表后 load_full 必须失败");
 
-    // 保存成功分支的收尾：apply 失败被吞掉，仍返回保存成功响应（revision 等）。
+    // 保存成功分支的收尾：apply 失败不把已提交事务误报为失败，但 Live 字段
+    // 必须降级为闲置重载，不能继续宣称已经立即生效。
     let response: Value = serde_json::from_str(
         &save_outcome_response_after_apply(&state, &store, outcome, "配置已保存")
             .expect("save response"),
@@ -3505,6 +3610,15 @@ fn config_save_succeeds_even_when_live_apply_fails() {
     .expect("response JSON");
     assert_eq!(response["ok"], true);
     assert_eq!(response["revision"], 2);
+    assert!(response["appliedLiveFields"].as_array().unwrap().is_empty());
+    assert!(
+        response["runtimeReloadFields"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("timing.loop_idle_ms"))
+    );
+    assert_eq!(response["reloadScheduled"], true);
+    assert!(state.live_configs.has_pending_reload());
 }
 
 #[test]

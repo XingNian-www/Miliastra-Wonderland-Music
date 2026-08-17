@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
+use crate::RunOutcome;
 use crate::adapters::logging;
 use crate::config::{BootstrapConfig, ConfigStore};
 use crate::interfaces::tui::TuiHandle;
@@ -12,7 +13,7 @@ use crate::runtime::monitor::MonitorShared;
 pub(crate) mod application;
 use application::{ApplicationRuntime, ResolvedApplicationConfig};
 
-pub(crate) fn run(config_path: &Path) -> Result<()> {
+pub(crate) fn run(config_path: &Path) -> Result<RunOutcome> {
     let executable_root = config_path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("配置路径缺少 EXE 根目录: {}", config_path.display()))?;

@@ -359,6 +359,11 @@ pub(crate) trait PlaybackExecutionPort {
     fn user_pause_active(&mut self) -> Result<bool> {
         Ok(false)
     }
+    /// Whether a monitor-scheduled queue advance may start another track.
+    /// Manual playback commands use a purpose that does not consult this gate.
+    fn automatic_queue_advance_allowed(&mut self) -> Result<bool> {
+        Ok(true)
+    }
     /// 预加载曲目音源解析（后台、尽力而为；失败静默，播放时重新解析）。
     fn preload_track(&mut self, _track: &PlayableTrack) -> Result<()> {
         Ok(())
@@ -863,6 +868,10 @@ impl PlaybackApplication {
                 log::info!("自动出队已跳过: 播放器处于用户暂停状态");
                 return Ok(None);
             }
+            if purpose.stop_when_user_paused() && !port.automatic_queue_advance_allowed()? {
+                log::info!("自动出队已跳过: 配置重载待处理");
+                return Ok(None);
+            }
             let queue = port.playback_queue()?;
             // 点歌队列独立于播放模式，始终优先按入队顺序消费。
             // 只有队列为空时，单曲循环才作用于自动续播。
@@ -1122,6 +1131,14 @@ impl PlaybackApplication {
             log::info!("自动出队已跳过: 用户暂停状态在播放请求发送前生效");
             return Ok(PlaybackCompletion::new(
                 PlaybackResult::error(requested, request, None, "用户暂停"),
+                None,
+                false,
+            ));
+        }
+        if purpose.stop_when_user_paused() && !port.automatic_queue_advance_allowed()? {
+            log::info!("自动出队已跳过: 配置重载在播放请求发送前生效");
+            return Ok(PlaybackCompletion::new(
+                PlaybackResult::error(requested, request, None, "配置重载待处理"),
                 None,
                 false,
             ));
@@ -1566,6 +1583,7 @@ mod tests {
         ai_search_requests: Vec<(String, String, bool)>,
         played_uris: Vec<String>,
         user_paused: bool,
+        reload_pending: bool,
         pool: Vec<PlayableTrack>,
         preloaded: Vec<String>,
     }
@@ -1677,6 +1695,7 @@ mod tests {
             ai_search_requests: Vec::new(),
             played_uris: Vec::new(),
             user_paused: false,
+            reload_pending: false,
             pool: Vec::new(),
             preloaded: Vec::new(),
         };
@@ -1795,6 +1814,10 @@ mod tests {
 
         fn user_pause_active(&mut self) -> Result<bool> {
             Ok(self.user_paused)
+        }
+
+        fn automatic_queue_advance_allowed(&mut self) -> Result<bool> {
+            Ok(!self.reload_pending)
         }
     }
 
@@ -2058,6 +2081,7 @@ mod tests {
             ai_search_requests: Vec::new(),
             played_uris: Vec::new(),
             user_paused: false,
+            reload_pending: false,
             pool: Vec::new(),
             preloaded: Vec::new(),
         };
@@ -2099,6 +2123,7 @@ mod tests {
             ai_search_requests: Vec::new(),
             played_uris: Vec::new(),
             user_paused: true,
+            reload_pending: false,
             pool: Vec::new(),
             preloaded: Vec::new(),
         };
@@ -2117,6 +2142,67 @@ mod tests {
         assert!(port.removed_ids.is_empty());
         assert!(port.replies.is_empty());
         assert_eq!(port.queue.len(), 1);
+    }
+
+    #[test]
+    fn automatic_queue_keeps_items_when_reload_is_pending() {
+        let item = QueueItem {
+            id: 9,
+            keyword: "重载前保留歌曲".to_string(),
+            track: Some(test_track(
+                "miliastra://track/qqmusic/9",
+                "重载前保留歌曲 - 测试歌手",
+            )),
+            ..QueueItem::default()
+        };
+        let mut port = VerifyingPlaybackPort {
+            queue: vec![item],
+            verifications: VecDeque::new(),
+            removed_ids: Vec::new(),
+            replies: Vec::new(),
+            reply_error: false,
+            ai_search_result: Ok(None),
+            ai_search_requests: Vec::new(),
+            played_uris: Vec::new(),
+            user_paused: false,
+            reload_pending: true,
+            pool: Vec::new(),
+            preloaded: Vec::new(),
+        };
+        let application = PlaybackApplication::new(PlaybackApplicationConfig {
+            console_bypass_dedup: true,
+            queue_max_size: 20,
+            monitor_tick_ms: Arc::new(RwLock::new(50)),
+            monitor_status_ms: Arc::new(RwLock::new(50)),
+            help_batch_ms: 0,
+        });
+
+        application
+            .consume_queue_after_monitor("自然结束", &mut port)
+            .expect("pending reload should gate automatic queue consumption");
+
+        assert!(port.played_uris.is_empty());
+        assert!(port.removed_ids.is_empty());
+        assert_eq!(port.queue.len(), 1);
+
+        // Replacement process owns a fresh LiveConfigs instance (no pending reload),
+        // so the unchanged queue head can be consumed normally.
+        port.reload_pending = false;
+        port.verifications.push_back(PlaybackVerification::Success {
+            status: PlayerStatus {
+                status: "playing".to_string(),
+                current_uri: "miliastra://track/qqmusic/9".to_string(),
+                ..PlayerStatus::default()
+            },
+            message: "开始播放: 重载前保留歌曲".to_string(),
+        });
+        application
+            .consume_queue_after_monitor("重载后恢复", &mut port)
+            .expect("replacement process should consume the preserved queue head");
+
+        assert_eq!(port.played_uris, ["miliastra://track/qqmusic/9"]);
+        assert_eq!(port.removed_ids, [9]);
+        assert!(port.queue.is_empty());
     }
 
     #[test]
@@ -2190,6 +2276,7 @@ mod tests {
             ai_search_requests: Vec::new(),
             played_uris: Vec::new(),
             user_paused: false,
+            reload_pending: false,
             pool: vec![pool_track],
             preloaded: Vec::new(),
         };
@@ -2274,6 +2361,7 @@ mod tests {
             ai_search_requests: Vec::new(),
             played_uris: Vec::new(),
             user_paused: false,
+            reload_pending: false,
             pool: Vec::new(),
             preloaded: Vec::new(),
         };

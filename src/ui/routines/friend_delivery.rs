@@ -424,7 +424,7 @@ pub(crate) struct FriendDeliveryRoutineConfig {
     friend_list_region: Rect,
     secondary_hall_search_region: Rect,
     chat_click: PointConfig,
-    send_enabled: bool,
+    send_enabled: Arc<RwLock<bool>>,
     pub(super) after_activate_ms: u64,
     open_chat_ms: u64,
     pub(super) click_ms: u64,
@@ -450,6 +450,8 @@ pub(crate) struct FriendDeliveryRoutineConfigSource<'a> {
     pub(crate) input_timing: &'a InputTimingConfig,
     /// 好友投递自动重试次数共享句柄（热更新）。
     pub(crate) auto_retry_count: Arc<RwLock<u32>>,
+    /// 游戏内回复发送开关共享句柄（热更新）。
+    pub(crate) send_enabled: Arc<RwLock<bool>>,
     pub(crate) friend_list_region: Rect,
     pub(crate) friend_step_ms: u64,
     pub(crate) timeout_ms: u64,
@@ -469,7 +471,7 @@ impl FriendDeliveryRoutineConfig {
                 friend_list_region,
             ),
             chat_click: source.output.chat_click_2,
-            send_enabled: source.output.send_enabled,
+            send_enabled: source.send_enabled,
             after_activate_ms: source.input_timing.after_activate_ms,
             open_chat_ms: source.input_timing.open_chat_ms,
             click_ms: source.input_timing.click_ms,
@@ -498,6 +500,7 @@ impl FriendDeliveryRoutineConfig {
             output: &config.output,
             input_timing: &config.timing.input,
             auto_retry_count: live.friend_delivery_auto_retry_count,
+            send_enabled: live.output_send_enabled,
             friend_list_region: config.invite.friend_list_region.into(),
             friend_step_ms: config.timing.invite.step_ms,
             timeout_ms: config.timing.workflow.default_timeout_ms,
@@ -643,7 +646,12 @@ fn execute_hall_batch(
     let mut status = HallBatchStatus::Complete;
     let mut primary_chat_opened = false;
 
-    if !config.send_enabled || request.messages.is_empty() {
+    if !*config
+        .send_enabled
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        || request.messages.is_empty()
+    {
         sent = request.messages.len();
     } else if let Err(failure) = normalize_hall_batch_start(
         context,
@@ -803,7 +811,11 @@ pub(super) fn send_current_chat_message(
     config: &FriendDeliveryRoutineConfig,
     message: &str,
 ) -> std::result::Result<(), UiRoutineFailure> {
-    if !config.send_enabled {
+    if !*config
+        .send_enabled
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
         return Ok(());
     }
     context

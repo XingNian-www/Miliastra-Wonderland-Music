@@ -309,7 +309,6 @@ impl BootstrapConfig {
 }
 
 const BUILTIN_STABILITY_COUNT: u32 = 2;
-const PLAYER_FAST_OBSERVATION_INTERVAL: Duration = Duration::from_millis(300);
 const PLAYER_OBSERVATION_COMMAND_CAPACITY: usize = 16;
 const PLAYER_ACTIVE_FAST_DEMAND_CAPACITY: usize = 16;
 const PLAYER_CONTROL_QUEUE_CAPACITY: usize = 16;
@@ -521,11 +520,7 @@ impl AppConfig {
         let normal_observation_interval =
             Duration::from_millis(self.timing.playback.monitor_status_ms);
         let fast_observation_interval =
-            if normal_observation_interval > PLAYER_FAST_OBSERVATION_INTERVAL {
-                PLAYER_FAST_OBSERVATION_INTERVAL
-            } else {
-                normal_observation_interval / 2
-            };
+            PlayerRuntimeConfig::fast_observation_interval_for(normal_observation_interval);
         let defaults = PlayerObservationConfig::default();
         let config = PlayerRuntimeConfig {
             observation: PlayerObservationConfig {

@@ -11,6 +11,7 @@ use url::Url;
 
 use crate::catalog::{
     AccountStatusCache, CatalogError, PlaybackEligibility, ProviderSearchCandidate, SourceAdapter,
+    account_status_error_code,
 };
 use crate::credentials::{CredentialStore, ProviderCredential};
 use crate::domain::{ResolverLocator, SearchSpec, Song, SongKey, StreamSource};
@@ -62,14 +63,14 @@ pub struct KugouAdapter {
     client: Client,
     credentials: CredentialStore,
     api_base_url: Url,
-    /// 账号状态整体缓存（成功30分钟/失败60秒），防止轮询频繁打账号接口触发风控。
+    /// 账号状态整体缓存（成功 24 小时/失败 15 分钟），防止轮询频繁打账号接口触发风控。
     account_cache: Arc<std::sync::Mutex<AccountStatusCache>>,
 }
 
 /// 账号 VIP 状态缓存有效期（判定成功时）。
-const VIP_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
+const VIP_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// 判定失败（接口风控/超时）时的短缓存，尽快重试账号接口。
-const VIP_CACHE_FAILED_TTL: Duration = Duration::from_secs(60);
+const VIP_CACHE_FAILED_TTL: Duration = Duration::from_secs(15 * 60);
 
 impl KugouAdapter {
     pub fn new(
@@ -377,7 +378,11 @@ impl KugouAdapter {
     /// 因此 busi_vip 存在时以它为准（即使顶层 is_vip=0）。
     fn union_vip_status(data: &Value) -> UnionVipStatus {
         let mut status = UnionVipStatus::default();
-        if let Some(list) = data.get("busi_vip").and_then(Value::as_array) {
+        if let Some(list) = data
+            .get("busi_vip")
+            .and_then(Value::as_array)
+            .filter(|list| !list.is_empty())
+        {
             for entry in list {
                 if entry.get("is_vip").and_then(value_u64).unwrap_or(0) == 0 {
                     continue;
@@ -424,9 +429,7 @@ impl KugouAdapter {
         &self,
         force: bool,
     ) -> Result<crate::catalog::ProviderAccountStatus, CatalogError> {
-        let now = std::time::Instant::now();
-        let checked_at_ms = epoch_ms();
-        let (generation, cached) = {
+        let (refresh_gate, cached) = {
             let guard = self
                 .account_cache
                 .lock()
@@ -434,11 +437,36 @@ impl KugouAdapter {
             let cached = (!force)
                 .then(|| guard.cached(VIP_CACHE_TTL, VIP_CACHE_FAILED_TTL))
                 .flatten();
+            (guard.refresh_gate(), cached)
+        };
+        if let Some(status) = cached {
+            return Ok(status);
+        }
+
+        let mut waited_for_refresh = false;
+        let _status_refresh = match refresh_gate.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                waited_for_refresh = true;
+                refresh_gate.lock().await
+            }
+        };
+        let (generation, cached) = {
+            let guard = self
+                .account_cache
+                .lock()
+                .map_err(|_| CatalogError::Transient("Kugou account cache poisoned".to_owned()))?;
+            let cached = (!force || waited_for_refresh)
+                .then(|| guard.cached(VIP_CACHE_TTL, VIP_CACHE_FAILED_TTL))
+                .flatten();
             (guard.generation(), cached)
         };
         if let Some(status) = cached {
-            return Ok(status.clone());
+            return Ok(status);
         }
+
+        let now = std::time::Instant::now();
+        let checked_at_ms = epoch_ms();
         let result = self.query_account_status().await;
         let mut guard = self
             .account_cache
@@ -446,7 +474,7 @@ impl KugouAdapter {
             .map_err(|_| CatalogError::Transient("Kugou account cache poisoned".to_owned()))?;
         match result {
             Ok(status) => {
-                guard.store_if_current(generation, status.clone(), now, false);
+                guard.store_if_current(generation, status.clone(), now, status.stale);
                 Ok(status)
             }
             Err(error) => {
@@ -481,30 +509,39 @@ impl KugouAdapter {
         };
 
         match (detail, vip) {
-            (Ok(detail), Ok(vip)) => Ok(Self::account_status_from_responses(
-                &credential,
-                Some(&detail),
-                Some(&vip),
-                checked_at_ms,
-            )),
+            (Ok(detail), Ok(vip)) => {
+                let status = Self::account_status_from_responses(
+                    &credential,
+                    Some(&detail),
+                    Some(&vip),
+                    checked_at_ms,
+                );
+                Ok(Self::degraded_when_vip_unknown(status, None))
+            }
             // 基础资料可用时仍展示账号；VIP 结论明确标为未知。该行为与原有
             // 降级展示一致，且不会把 Cookie 中的猜测当作播放筛选结论。
-            (Ok(detail), Err(_)) => Ok(Self::account_status_from_responses(
-                &credential,
-                Some(&detail),
-                None,
-                checked_at_ms,
-            )),
+            (Ok(detail), Err(error)) => {
+                let status = Self::account_status_from_responses(
+                    &credential,
+                    Some(&detail),
+                    None,
+                    checked_at_ms,
+                );
+                Ok(Self::degraded_when_vip_unknown(status, Some(&error)))
+            }
             // /user/detail 失败并不代表 VIP 接口也失败。保留后者的权威结论，
             // 这样账号信息的短暂故障不会把 VIP 歌全部降为未知。
-            (Err(_), Ok(vip)) => Ok(Self::account_status_from_responses(
-                &credential,
-                None,
-                Some(&vip),
-                checked_at_ms,
-            )),
-            // 两类接口均不可用时，让缓存层记录一分钟失败状态，而不是把
-            // vip_known=false 当成三十分钟的成功结果。
+            (Err(_), Ok(vip)) => {
+                let status = Self::account_status_from_responses(
+                    &credential,
+                    None,
+                    Some(&vip),
+                    checked_at_ms,
+                );
+                Ok(Self::degraded_when_vip_unknown(status, None))
+            }
+            // 两类接口均不可用时，让缓存层记录短暂失败状态，而不是把
+            // vip_known=false 当成一天的成功结果。
             (Err(_), Err(error)) => Err(error),
         }
     }
@@ -574,6 +611,24 @@ impl KugouAdapter {
             stale: false,
             last_error: None,
         }
+    }
+
+    /// VIP 接口没有给出可靠结论时，保留已确认的账号资料，但按失败 TTL
+    /// 重新尝试会员查询，不能把 `vip_known=false` 固定一天。
+    fn degraded_when_vip_unknown(
+        mut status: crate::catalog::ProviderAccountStatus,
+        error: Option<&CatalogError>,
+    ) -> crate::catalog::ProviderAccountStatus {
+        if !status.vip_known {
+            status.stale = true;
+            status.last_error = Some(
+                error
+                    .map(account_status_error_code)
+                    .unwrap_or("provider_invalid_response")
+                    .to_owned(),
+            );
+        }
+        status
     }
 
     async fn account_json(
@@ -679,12 +734,16 @@ impl SourceAdapter for KugouAdapter {
         candidate: &ProviderCredential,
     ) -> Result<(), CatalogError> {
         let response = self.search_json("validation", 1, candidate).await?;
-        if response.is_object() {
-            Ok(())
-        } else {
+        if !response.is_object() {
             Err(CatalogError::InvalidResponse(
                 "Kugou credential validation response is not an object".to_owned(),
             ))
+        } else if kugou_validation_is_rejected(&response) {
+            Err(CatalogError::CredentialRejected(
+                "Kugou credential validation was rejected".to_owned(),
+            ))
+        } else {
+            Ok(())
         }
     }
 
@@ -780,7 +839,12 @@ impl SourceAdapter for KugouAdapter {
             Some(2) => Ok(PlaybackEligibility::PaidRequired),
             Some(1 | 3) => match self.account_vip_status().await {
                 Some(true) => Ok(PlaybackEligibility::Eligible),
-                Some(false) => Ok(PlaybackEligibility::VipRequired),
+                // 账号缓存是每天刷新一次的乐观结论；用户可能刚在平台侧开通会员。
+                // 对明确的 VIP 曲目以真实解析为准，避免旧的非 VIP 缓存直接挡歌。
+                Some(false) => {
+                    let _ = self.resolve(key, locator).await?;
+                    Ok(PlaybackEligibility::Eligible)
+                }
                 None => {
                     // 账号 VIP 状态无法判定：以实际解析结果为准（账号凭据能拿到流即可播）。
                     let _ = self.resolve(key, locator).await?;
@@ -896,17 +960,14 @@ fn parse_search_candidates(response: &Value) -> Result<Vec<ProviderSearchCandida
                 .or_else(|| raw.get("FileName"))
                 .and_then(Value::as_str)?
                 .trim();
-            if hash.is_empty() || title.is_empty() {
+            if hash.is_empty()
+                || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+                || title.is_empty()
+            {
                 return None;
             }
-            let album_id = raw
-                .get("AlbumID")
-                .and_then(value_string)
-                .unwrap_or_else(|| "0".to_owned());
-            let album_audio_id = raw
-                .get("MixSongID")
-                .and_then(value_string)
-                .unwrap_or_else(|| "0".to_owned());
+            let album_id = kugou_search_identifier(raw.get("AlbumID"))?;
+            let album_audio_id = kugou_search_identifier(raw.get("MixSongID"))?;
             let artists = raw
                 .get("SingerName")
                 .and_then(Value::as_str)
@@ -1012,25 +1073,23 @@ fn resolver_parts(
             "Kugou locator hash is invalid".to_owned(),
         ));
     }
-    if album_id.is_empty() || !album_id.chars().all(|character| character.is_ascii_digit()) {
-        return Err(CatalogError::InvalidResolverLocator(
-            "Kugou locator album id is invalid".to_owned(),
-        ));
+    let album_id = kugou_locator_identifier(album_id, "album id")?;
+    let album_audio_id = kugou_locator_identifier(album_audio_id, "album audio id")?;
+    Ok((hash.to_owned(), album_id, album_audio_id))
+}
+
+/// 专辑关联是可选信息；空值与没有 locator 时一致，统一按酷狗接口约定回退为 `0`。
+fn kugou_locator_identifier(value: &str, field: &str) -> Result<String, CatalogError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok("0".to_owned());
     }
-    if album_audio_id.is_empty()
-        || !album_audio_id
-            .chars()
-            .all(|character| character.is_ascii_digit())
-    {
-        return Err(CatalogError::InvalidResolverLocator(
-            "Kugou locator album audio id is invalid".to_owned(),
-        ));
+    if !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(CatalogError::InvalidResolverLocator(format!(
+            "Kugou locator {field} is invalid"
+        )));
     }
-    Ok((
-        hash.to_owned(),
-        album_id.to_owned(),
-        album_audio_id.to_owned(),
-    ))
+    Ok(value.to_owned())
 }
 
 fn cookie_header(cookies: &BTreeMap<String, String>) -> String {
@@ -1059,6 +1118,40 @@ fn decode_lrc_content(content: &str) -> Result<String, CatalogError> {
 
 fn response_data(value: &Value) -> &Value {
     value.get("data").unwrap_or(value)
+}
+
+/// 登录校验只接受没有明确业务错误码的 JSON 对象。HTTP 200 的错误包不能被
+/// 误当作有效凭据，否则会把失效 token 写入凭据存储。
+fn kugou_validation_is_rejected(response: &Value) -> bool {
+    let data = response_data(response);
+    [response, data].into_iter().any(|value| {
+        ["error_code", "errorCode", "code"]
+            .into_iter()
+            .filter_map(|field| value.get(field))
+            .filter_map(value_i64)
+            .any(|code| code != 0)
+            || value.get("error").is_some_and(kugou_error_value_is_present)
+    })
+}
+
+fn value_i64(value: &Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_u64().and_then(|value| value.try_into().ok()))
+        .or_else(|| value.as_str()?.trim().parse().ok())
+}
+
+fn kugou_error_value_is_present(value: &Value) -> bool {
+    match value {
+        Value::Null | Value::Bool(false) => false,
+        Value::Number(_) => value_i64(value).is_some_and(|code| code != 0),
+        Value::String(value) => {
+            let value = value.trim();
+            !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
+        }
+        Value::Array(values) => !values.is_empty(),
+        Value::Object(_) | Value::Bool(true) => true,
+    }
 }
 
 /// 解析酷狗时间字符串 "YYYY-MM-DD HH:MM:SS" 为毫秒时间戳。
@@ -1104,6 +1197,26 @@ fn value_string(value: &Value) -> Option<String> {
         .or_else(|| value.as_u64().map(|value| value.to_string()))
 }
 
+/// 酷狗搜索接口的专辑关联可缺失或为空；这两种情况按接口约定回退为 `0`。
+/// 显式的非数字值则表明候选元数据异常，不能写入队列。
+fn kugou_search_identifier(value: Option<&Value>) -> Option<String> {
+    let Some(value) = value else {
+        return Some("0".to_owned());
+    };
+    if value.is_null() {
+        return Some("0".to_owned());
+    }
+    let value = value_string(value)?;
+    let value = value.trim();
+    if value.is_empty() {
+        return Some("0".to_owned());
+    }
+    value
+        .bytes()
+        .all(|byte| byte.is_ascii_digit())
+        .then(|| value.to_owned())
+}
+
 fn value_u64(value: &Value) -> Option<u64> {
     value.as_u64().or_else(|| value.as_str()?.parse().ok())
 }
@@ -1137,15 +1250,19 @@ fn classify_request_error(error: reqwest::Error) -> CatalogError {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     use base64::Engine;
     use serde_json::json;
 
     use super::{
-        PROVIDER, decode_lrc_content, extract_stream_url, parse_kugou_datetime_ms,
-        parse_search_candidates, resolver_parts,
+        PROVIDER, decode_lrc_content, extract_stream_url, kugou_validation_is_rejected,
+        parse_kugou_datetime_ms, parse_search_candidates, resolver_parts,
     };
-    use crate::catalog::CatalogError;
+    use crate::catalog::{CatalogError, SourceAdapter};
     use crate::credentials::ProviderCredential;
     use crate::domain::{ResolverLocator, SongKey};
 
@@ -1192,6 +1309,56 @@ mod tests {
     }
 
     #[test]
+    fn search_drops_candidates_with_malformed_kugou_identifiers() {
+        let parsed = parse_search_candidates(&json!({"data": {"lists": [
+            {
+                "FileHash": "0123456789ABCDEF",
+                "OriSongName": "缺省标识歌曲",
+                "SingerName": "歌手"
+            },
+            {
+                "FileHash": "0011223344556677",
+                "OriSongName": "空白标识歌曲",
+                "SingerName": "歌手",
+                "AlbumID": "  ",
+                "MixSongID": ""
+            },
+            {
+                "FileHash": "ABCDEF0123456789",
+                "OriSongName": "坏专辑标识歌曲",
+                "SingerName": "歌手",
+                "AlbumID": "pending",
+                "MixSongID": "88"
+            },
+            {
+                "FileHash": "1122334455667788",
+                "OriSongName": "坏音频标识歌曲",
+                "SingerName": "歌手",
+                "AlbumID": "7",
+                "MixSongID": "pending"
+            },
+            {
+                "FileHash": "not-a-kugou-hash",
+                "OriSongName": "坏 Hash 歌曲",
+                "SingerName": "歌手",
+                "AlbumID": "7",
+                "MixSongID": "88"
+            }
+        ]}}))
+        .unwrap();
+
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(
+            parsed[0].song.resolver_locator.as_ref().unwrap().as_str(),
+            "kugou:0123456789ABCDEF:0:0"
+        );
+        assert_eq!(
+            parsed[1].song.resolver_locator.as_ref().unwrap().as_str(),
+            "kugou:0011223344556677:0:0"
+        );
+    }
+
+    #[test]
     fn stream_url_accepts_new_array_shape() {
         // 新版：顶层 url 为数组
         assert_eq!(
@@ -1223,6 +1390,26 @@ mod tests {
             )
         );
 
+        let empty_album = ResolverLocator::new("kugou:ABCDEF0123456789::314159").unwrap();
+        assert_eq!(
+            resolver_parts(&key, Some(&empty_album)).unwrap(),
+            (
+                "ABCDEF0123456789".to_owned(),
+                "0".to_owned(),
+                "314159".to_owned()
+            )
+        );
+
+        let empty_album_audio = ResolverLocator::new("kugou:ABCDEF0123456789:42:").unwrap();
+        assert_eq!(
+            resolver_parts(&key, Some(&empty_album_audio)).unwrap(),
+            (
+                "ABCDEF0123456789".to_owned(),
+                "42".to_owned(),
+                "0".to_owned()
+            )
+        );
+
         let legacy = ResolverLocator::new("kugou:v1:ABCDEF0123456789:42").unwrap();
         assert!(matches!(
             resolver_parts(&key, Some(&legacy)),
@@ -1251,6 +1438,100 @@ mod tests {
         assert!(header.contains("userid=123"));
         assert!(header.contains("dfid=device-id"));
         assert!(header.contains("mid=device-mid"));
+    }
+
+    #[test]
+    fn validation_rejects_explicit_kugou_error_envelopes() {
+        assert!(!kugou_validation_is_rejected(&json!({
+            "code": 0,
+            "data": {"lists": []}
+        })));
+        assert!(kugou_validation_is_rejected(&json!({
+            "error_code": 20018,
+            "message": "token invalid"
+        })));
+        assert!(kugou_validation_is_rejected(&json!({
+            "data": {"code": "1"}
+        })));
+        assert!(kugou_validation_is_rejected(&json!({
+            "error": "credential expired"
+        })));
+    }
+
+    #[tokio::test]
+    async fn concurrent_account_status_requests_share_one_provider_refresh() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut requests = 0;
+            while requests < 2 && Instant::now() < deadline {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                        continue;
+                    }
+                    Err(error) => panic!("fixture accept failed: {error}"),
+                };
+                let mut raw = [0_u8; 8 * 1024];
+                let size = stream.read(&mut raw).unwrap();
+                let request = String::from_utf8_lossy(&raw[..size]);
+                let body = if request.starts_with("GET /user/detail") {
+                    r#"{"data":{"userid":"42","nickname":"tester"}}"#
+                } else if request.starts_with("GET /youth/union/vip") {
+                    r#"{"data":{"is_vip":1}}"#
+                } else {
+                    panic!("unexpected Kugou account request: {request}");
+                };
+                if requests == 0 {
+                    // Give the second future time to observe the in-flight gate.
+                    thread::sleep(Duration::from_millis(50));
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+                requests += 1;
+            }
+            requests
+        });
+
+        let credentials = crate::credentials::CredentialStore::memory();
+        credentials
+            .save(
+                PROVIDER,
+                ProviderCredential::Kugou {
+                    token: "token".to_owned(),
+                    userid: "42".to_owned(),
+                    dfid: "device".to_owned(),
+                    cookies: BTreeMap::new(),
+                },
+            )
+            .unwrap();
+        let mut adapter = super::KugouAdapter::new(
+            credentials,
+            Duration::from_secs(1),
+            &format!("http://{address}/"),
+        )
+        .unwrap();
+        adapter.client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .unwrap();
+
+        let (first, second) = tokio::join!(
+            SourceAdapter::account_status(&adapter),
+            SourceAdapter::account_status(&adapter)
+        );
+        let first = first.unwrap().unwrap();
+        let second = second.unwrap().unwrap();
+        assert!(first.vip);
+        assert!(second.vip);
+        assert_eq!(server.join().unwrap(), 2);
     }
 
     #[test]
@@ -1377,6 +1658,12 @@ mod tests {
         assert_eq!(inactive.active, Some(false));
         let unknown = super::KugouAdapter::union_vip_status(&json!({"error": 1}));
         assert_eq!(unknown.active, None);
+
+        let empty_busi_vip = super::KugouAdapter::union_vip_status(&json!({
+            "is_vip": 1,
+            "busi_vip": []
+        }));
+        assert_eq!(empty_busi_vip.active, Some(true));
     }
 
     #[test]

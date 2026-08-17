@@ -2,6 +2,7 @@ use super::*;
 
 impl ApplicationRuntime {
     pub(super) fn execute_web_tool_request(&mut self, request: WebToolRequest) -> Result<String> {
+        let live_config = self.lifecycle.live_configs.snapshot();
         match request {
             WebToolRequest::Ocr { rect } => {
                 let frame = self.latest_frame()?;
@@ -67,9 +68,7 @@ impl ApplicationRuntime {
                     WebToolTemplate::WonderlandMapStar => {
                         self.lifecycle.config.startup.template_threshold
                     }
-                    WebToolTemplate::Custom(_) => {
-                        self.lifecycle.config.custom_workflows.default_threshold
-                    }
+                    WebToolTemplate::Custom(_) => live_config.custom_workflows.default_threshold,
                     _ => self.lifecycle.config.templates.marker_threshold,
                 };
                 let path = match &template {
@@ -133,9 +132,7 @@ impl ApplicationRuntime {
                         .templates
                         .wonderland_map_star
                         .clone(),
-                    WebToolTemplate::Custom(name) => self
-                        .lifecycle
-                        .config
+                    WebToolTemplate::Custom(name) => live_config
                         .custom_workflows
                         .templates
                         .get(name)

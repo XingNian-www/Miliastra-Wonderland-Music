@@ -1471,6 +1471,15 @@ fn chat_send_requires_post() {
 }
 
 #[test]
+fn idle_reload_waits_for_http_operations_but_not_status_polling() {
+    assert!(request_blocks_idle_reload("/config/save"));
+    assert!(request_blocks_idle_reload("/player/login/start"));
+    assert!(request_blocks_idle_reload("/hall-screenshot"));
+    assert!(!request_blocks_idle_reload("/monitor"));
+    assert!(!request_blocks_idle_reload("/status"));
+}
+
+#[test]
 fn turtle_soup_routes_have_expected_methods_and_monitor_snapshot() {
     assert!(!is_mutating_route("/turtle-soup"));
     assert!(is_json_route("/turtle-soup"));
@@ -2994,9 +3003,21 @@ fn config_schema_route_lists_all_sections_with_defaults() {
     assert_eq!(max_size["kind"]["type"], "int");
     assert_eq!(max_size["kind"]["min"], 1);
     assert_eq!(max_size["default"], 5);
-    assert_eq!(max_size["effect"], "restart");
+    assert_eq!(max_size["effect"], "idleReload");
     assert_eq!(max_size["source"], "db");
     assert_eq!(max_size["nullable"], false);
+    let http = sections
+        .iter()
+        .find(|section| section["name"] == "http")
+        .expect("http section");
+    let port = http["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|field| field["path"] == "http.port")
+        .expect("http.port field");
+    assert_eq!(port["effect"], "restart");
+    assert_eq!(port["source"], "bootstrap");
     // secret 字段的类型。
     let ai = sections
         .iter()
@@ -3264,14 +3285,23 @@ fn config_save_route_persists_and_reports_changed_fields() {
     assert_eq!(response["revision"], 2);
     let changed = response["changedFields"].as_array().unwrap();
     assert!(changed.contains(&json!("queue.max_size")));
-    assert_eq!(response["restartRequired"], true);
+    assert_eq!(response["restartRequired"], false);
+    assert!(response["restartFields"].as_array().unwrap().is_empty());
+    assert_eq!(response["reloadScheduled"], true);
     assert!(
-        response["restartFields"]
+        response["reloadFields"]
             .as_array()
             .unwrap()
             .contains(&json!("queue.max_size"))
     );
     assert!(response["appliedLiveFields"].as_array().unwrap().is_empty());
+    assert!(state.live_configs.has_pending_reload());
+    assert!(
+        state
+            .live_configs
+            .pending_reload_fields()
+            .contains("queue.max_size")
+    );
     let store = state.config_store.lock().unwrap();
     assert_eq!(store.load_full().unwrap().queue.max_size, 20);
 }
@@ -3288,9 +3318,11 @@ fn config_save_route_applies_live_fields_to_shared_values() {
     assert_eq!(warm_up["ok"], true);
     assert_eq!(warm_up["revision"], 2);
 
-    // 仅变更 Live 字段：queue.protect_current_song_until_finished → 无需重启。
+    // 仅变更 Live 字段：队列保护与主循环间隔 → 无需重启。
     let mut sections = full_config_sections(&state);
     sections["queue"]["protect_current_song_until_finished"] = json!(false);
+    sections["timing"]["loop_idle_ms"] = json!(123);
+    sections["custom_workflows"]["templates"]["hot-test"] = json!("deps/templates/hot-test.png");
     let body = serde_json::to_string(&json!({ "baseRevision": 2, "sections": sections })).unwrap();
     let response: Value =
         serde_json::from_str(&config_save_route(body.as_bytes(), &state).unwrap()).unwrap();
@@ -3304,12 +3336,26 @@ fn config_save_route_applies_live_fields_to_shared_values() {
         "live 字段必须进入 appliedLiveFields: {}",
         response
     );
+    assert!(
+        response["appliedLiveFields"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("timing.loop_idle_ms"))
+    );
+    assert!(
+        response["appliedLiveFields"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("custom_workflows.templates.hot-test"))
+    );
     assert_eq!(
         response["restartRequired"], false,
         "仅 live 变更时不得要求重启: {}",
         response
     );
     assert!(response["restartFields"].as_array().unwrap().is_empty());
+    assert_eq!(response["reloadScheduled"], false);
+    assert!(response["reloadFields"].as_array().unwrap().is_empty());
     // 共享热更新值必须已覆盖：运行态读取点立即看到新值（不虚报已生效）。
     assert!(
         !*state
@@ -3317,6 +3363,15 @@ fn config_save_route_applies_live_fields_to_shared_values() {
             .queue_protect_current_song
             .read()
             .unwrap()
+    );
+    assert_eq!(state.live_configs.snapshot().timing.loop_idle_ms, 123);
+    assert!(
+        state
+            .live_configs
+            .snapshot()
+            .custom_workflows
+            .templates
+            .contains_key("hot-test")
     );
     assert!(
         !state
@@ -3330,14 +3385,17 @@ fn config_save_route_applies_live_fields_to_shared_values() {
         "库中值必须同步落盘"
     );
 
-    // 混合变更（Live + Restart）：restartRequired=true，Live 字段仍进 appliedLiveFields。
+    // 混合变更（Live + IdleReload）：即时字段立即应用，重建字段登记闲置重载。
     let mut sections = full_config_sections(&state);
     sections["queue"]["protect_current_song_until_finished"] = json!(true);
     sections["queue"]["max_size"] = json!(30);
+    sections["window"]["focus_point"]["x"] = json!(321);
     let body = serde_json::to_string(&json!({ "baseRevision": 3, "sections": sections })).unwrap();
     let response: Value =
         serde_json::from_str(&config_save_route(body.as_bytes(), &state).unwrap()).unwrap();
-    assert_eq!(response["restartRequired"], true);
+    assert_eq!(response["restartRequired"], false);
+    assert!(response["restartFields"].as_array().unwrap().is_empty());
+    assert_eq!(response["reloadScheduled"], true);
     assert!(
         response["appliedLiveFields"]
             .as_array()
@@ -3345,10 +3403,18 @@ fn config_save_route_applies_live_fields_to_shared_values() {
             .contains(&json!("queue.protect_current_song_until_finished"))
     );
     assert!(
-        response["restartFields"]
+        response["reloadFields"]
             .as_array()
             .unwrap()
             .contains(&json!("queue.max_size"))
+    );
+    assert!(
+        response["reloadFields"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("window.focus_point.x")),
+        "Point 子路径必须继承父字段的 idleReload 效果: {}",
+        response
     );
     assert!(
         *state
@@ -3356,6 +3422,11 @@ fn config_save_route_applies_live_fields_to_shared_values() {
             .queue_protect_current_song
             .read()
             .unwrap()
+    );
+    assert_eq!(
+        state.live_configs.snapshot().queue.max_size,
+        crate::config::AppConfig::default().queue.max_size,
+        "已落库的 idleReload 字段不得提前进入有效运行态快照"
     );
 }
 

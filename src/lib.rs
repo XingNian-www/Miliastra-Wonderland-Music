@@ -14,6 +14,25 @@ pub mod observation;
 
 pub mod runtime;
 
+/// Watchdog child exit code reserved for a normal configuration reload.
+pub const CONFIG_RELOAD_EXIT_CODE: u8 = 75;
+
+/// Result of a fully torn-down application runtime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunOutcome {
+    Stopped,
+    Reload,
+}
+
+impl RunOutcome {
+    pub const fn exit_code(self) -> u8 {
+        match self {
+            Self::Stopped => 0,
+            Self::Reload => CONFIG_RELOAD_EXIT_CODE,
+        }
+    }
+}
+
 /// 根据主程序路径计算默认配置路径，不读取进程环境，便于测试。
 pub fn default_config_path(
     executable_path: &std::path::Path,
@@ -25,7 +44,7 @@ pub fn default_config_path(
 }
 
 #[cfg(target_os = "windows")]
-pub fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
+pub fn run(config_path: &std::path::Path) -> anyhow::Result<RunOutcome> {
     // 发布布局：EXE 同目录只保留 config.yaml 与主程序，
     // ffmpeg/MNN 等动态库统一放在 deps/dll/，启动时加入 DLL 搜索路径。
     add_dependency_dll_directory(config_path);
@@ -99,5 +118,12 @@ mod tests {
         let error = default_config_path(Path::new("")).expect_err("缺少父目录的主程序路径必须报错");
 
         assert!(error.to_string().contains("主程序路径缺少父目录"));
+    }
+
+    #[test]
+    fn run_outcome_reserves_a_dedicated_reload_exit_code() {
+        assert_eq!(RunOutcome::Stopped.exit_code(), 0);
+        assert_eq!(RunOutcome::Reload.exit_code(), CONFIG_RELOAD_EXIT_CODE);
+        assert_ne!(RunOutcome::Reload.exit_code(), 0);
     }
 }

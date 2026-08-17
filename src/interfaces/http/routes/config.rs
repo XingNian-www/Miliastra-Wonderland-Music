@@ -62,14 +62,6 @@ fn kind_json(kind: &FieldKind) -> Value {
     }
 }
 
-/// 生效级别小写字符串。
-fn effect_str(effect: Effect) -> &'static str {
-    match effect {
-        Effect::Live => "live",
-        Effect::Restart => "restart",
-    }
-}
-
 /// 来源小写字符串。
 fn source_str(source: ConfigSource) -> &'static str {
     match source {
@@ -97,7 +89,7 @@ fn field_json(
         "path": field.path,
         "label": field.label,
         "kind": kind_json(&field.kind),
-        "effect": effect_str(field.effect),
+        "effect": field.effect,
         "source": source_str(field.source),
         "hint": field.hint,
         "nullable": field.nullable,
@@ -140,9 +132,8 @@ fn field_errors_json(errors: &[ConfigFieldError]) -> Vec<Value> {
         .collect()
 }
 
-/// 保存/回滚落库成功后的收尾：先 best-effort 应用热更新（失败只记录日志，
-/// 绝不把已提交的保存误报为失败），再构造保存成功响应。响应内容只由
-/// outcome 决定，与 apply 结果无关。
+/// 保存/回滚落库成功后的收尾：先 best-effort 应用即时热更新（失败只记录日志，
+/// 绝不把已提交的保存误报为失败），再按变更字段登记闲置重载并构造成功响应。
 pub(super) fn save_outcome_response_after_apply(
     state: &HttpSharedState,
     store: &crate::config::ConfigStore,
@@ -152,7 +143,15 @@ pub(super) fn save_outcome_response_after_apply(
     if let Err(error) = apply_live_configs(state, store) {
         log::error!("{}，但热更新应用失败: {}", committed_label, error.message);
     }
-    save_outcome_json(&outcome)
+    let (restart_fields, reload_fields, applied_live_fields) =
+        split_changed_fields_by_effect(&outcome.changed_fields);
+    let reload_scheduled = !reload_fields.is_empty();
+    if reload_scheduled {
+        state
+            .live_configs
+            .schedule_reload(reload_fields.iter().cloned());
+    }
+    save_outcome_json(&outcome, restart_fields, reload_fields, applied_live_fields)
 }
 
 /// 校验失败业务响应（HTTP 200 + ok=false，前端按 ok 判断）。
@@ -165,38 +164,62 @@ fn validation_failed_json(errors: &[ConfigFieldError]) -> Value {
     })
 }
 
-/// 把变更字段按 schema 生效级别拆分为「重启生效」与「已热更新生效」两组；
-/// schema 未声明的路径（如 state.playback_state_path 注入项）归入重启生效。
+/// 把变更字段按 schema 生效级别拆分为「人工重启」「闲置自动重载」与
+/// 「已即时热更新」三组；
+/// Object/Rect/Point 的 JSON 叶子路径继承其 schema 父字段效果；其余未声明路径
+/// （如 state.playback_state_path 注入项）归入重启生效。
 /// appliedLiveFields 只收 effect==Live 的字段（保存成功后已由
 /// [`crate::config::LiveConfigs::apply`] 真正作用到运行态）。
-fn split_changed_fields_by_effect(changed_fields: &[String]) -> (Vec<String>, Vec<String>) {
-    let effects = config_sections()
+fn split_changed_fields_by_effect(
+    changed_fields: &[String],
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let fields = config_sections()
         .into_iter()
         .flat_map(|section| section.fields)
-        .map(|field| (field.path, field.effect))
-        .collect::<std::collections::HashMap<_, _>>();
+        .collect::<Vec<_>>();
     let mut restart = Vec::new();
+    let mut idle_reload = Vec::new();
     let mut applied_live = Vec::new();
     for path in changed_fields {
-        match effects.get(path) {
+        let effect = fields
+            .iter()
+            .filter(|field| {
+                field.path == *path
+                    || (matches!(
+                        field.kind,
+                        FieldKind::Object | FieldKind::Rect | FieldKind::Point
+                    ) && path
+                        .strip_prefix(&field.path)
+                        .is_some_and(|suffix| suffix.starts_with('.')))
+            })
+            .max_by_key(|field| field.path.len())
+            .map(|field| field.effect);
+        match effect {
             Some(Effect::Live) => applied_live.push(path.clone()),
+            Some(Effect::IdleReload) => idle_reload.push(path.clone()),
             Some(Effect::Restart) | None => restart.push(path.clone()),
         }
     }
-    (restart, applied_live)
+    (restart, idle_reload, applied_live)
 }
 
 /// 保存/回滚成功响应；restartRequired 由本次变更中实际需要重启的字段决定，
-/// 仅修改 Live 字段时为 false。
-fn save_outcome_json(outcome: &ConfigSaveOutcome) -> std::result::Result<String, AppError> {
-    let (restart_fields, applied_live_fields) =
-        split_changed_fields_by_effect(&outcome.changed_fields);
+/// reloadScheduled 表示本次变更已登记为闲置时自动重载。
+fn save_outcome_json(
+    outcome: &ConfigSaveOutcome,
+    restart_fields: Vec<String>,
+    reload_fields: Vec<String>,
+    applied_live_fields: Vec<String>,
+) -> std::result::Result<String, AppError> {
+    let reload_scheduled = !reload_fields.is_empty();
     serde_json::to_string(&json!({
         "ok": true,
         "revision": outcome.revision,
         "changedFields": outcome.changed_fields,
         "restartRequired": !restart_fields.is_empty(),
         "restartFields": restart_fields,
+        "reloadScheduled": reload_scheduled,
+        "reloadFields": reload_fields,
         "appliedLiveFields": applied_live_fields,
     }))
     .map_err(internal_error)

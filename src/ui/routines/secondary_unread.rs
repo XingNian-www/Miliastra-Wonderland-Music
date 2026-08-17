@@ -1,3 +1,4 @@
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use super::friend_delivery::{
@@ -94,19 +95,19 @@ impl SecondaryUnreadUi {
 pub(crate) struct SecondaryUnreadRoutineConfig {
     residency: FriendDeliveryRoutineConfig,
     same_line_y_tolerance: i32,
-    bubble_poll_ms: u64,
+    bubble_poll_ms: Arc<RwLock<u64>>,
 }
 
 impl SecondaryUnreadRoutineConfig {
     pub(crate) fn resolve(
         residency: FriendDeliveryRoutineConfig,
         same_line_y_tolerance: i32,
-        change_debounce_ms: u64,
+        change_debounce_ms: Arc<RwLock<u64>>,
     ) -> Self {
         Self {
             residency,
             same_line_y_tolerance,
-            bubble_poll_ms: change_debounce_ms.clamp(100, 200),
+            bubble_poll_ms: change_debounce_ms,
         }
     }
 }
@@ -220,7 +221,12 @@ fn wait_bubble_stable(
     let mut captured_at = Instant::now();
     let deadline = Instant::now() + Duration::from_millis(BUBBLE_STABILITY_TIMEOUT_MS);
     while Instant::now() < deadline {
-        sleep_ms(config.bubble_poll_ms);
+        let bubble_poll_ms = config
+            .bubble_poll_ms
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clamp(100, 200);
+        sleep_ms(bubble_poll_ms);
         let image = capture_normalized(
             context,
             &config.residency,

@@ -3,13 +3,19 @@ use image::{DynamicImage, GenericImageView};
 use crate::ui::geometry::{Point, Rect};
 
 const MIN_RED_PIXELS_PER_ROW: usize = 2;
+const REFERENCE_WIDTH: u32 = 1920;
+const REFERENCE_HEIGHT: u32 = 1080;
+const REFERENCE_FRIEND_LIST_X: i32 = 80;
+const REFERENCE_FRIEND_LIST_Y: i32 = 280;
 
-#[derive(Clone, Debug)]
-struct FriendUnreadConfig {
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FriendUnreadLayout {
     search_rect: Rect,
     avatar_left: i32,
     avatar_size: u32,
     avatar_top_scan_padding: i32,
+    avatar_outer_inset: i32,
+    avatar_boundary_width: i32,
     min_avatar_boundary_edges: usize,
     min_exclamation_pixels: usize,
     row_click_x: i32,
@@ -22,29 +28,72 @@ struct FriendUnreadConfig {
     max_pixels: usize,
     visibility_radius: i32,
     min_visibility_pixels: usize,
+    badge_avatar_overlap: i32,
+    badge_top_tolerance: i32,
 }
 
-impl Default for FriendUnreadConfig {
-    fn default() -> Self {
+impl FriendUnreadLayout {
+    pub(crate) fn resolve(
+        expected_width: u32,
+        expected_height: u32,
+        friend_list_region: Rect,
+    ) -> Self {
+        let scale_x = f64::from(expected_width.max(1)) / f64::from(REFERENCE_WIDTH);
+        let scale_y = f64::from(expected_height.max(1)) / f64::from(REFERENCE_HEIGHT);
+        let uniform_scale = scale_x.min(scale_y);
+        let area_scale = scale_x * scale_y;
+        let search_left_offset = scale_i32(54 - REFERENCE_FRIEND_LIST_X, scale_x);
+        let search_top_offset = scale_i32(250 - REFERENCE_FRIEND_LIST_Y, scale_y);
+        let click_offset = proportional_offset(friend_list_region.width, 70, 170);
+
         Self {
-            search_rect: Rect::new(54, 250, 28, 650),
-            avatar_left: 20,
-            avatar_size: 48,
-            avatar_top_scan_padding: 10,
+            search_rect: Rect::new(
+                friend_list_region.x + search_left_offset,
+                friend_list_region.y + search_top_offset,
+                scale_u32(28, scale_x),
+                friend_list_region
+                    .height
+                    .saturating_add(scale_u32(50, scale_y)),
+            ),
+            avatar_left: friend_list_region.x + scale_i32(20 - REFERENCE_FRIEND_LIST_X, scale_x),
+            avatar_size: scale_u32(48, uniform_scale),
+            avatar_top_scan_padding: scale_i32(10, scale_y),
+            avatar_outer_inset: scale_i32(2, uniform_scale).max(1),
+            avatar_boundary_width: scale_i32(4, uniform_scale).max(1),
             min_avatar_boundary_edges: 4,
-            min_exclamation_pixels: 1,
-            row_click_x: 150,
-            min_pixels_per_row: MIN_RED_PIXELS_PER_ROW,
-            min_width: 15,
-            max_width: 24,
-            min_height: 5,
-            max_height: 30,
-            min_pixels: 20,
-            max_pixels: 500,
-            visibility_radius: 14,
-            min_visibility_pixels: 20,
+            min_exclamation_pixels: scale_usize(1, area_scale),
+            row_click_x: friend_list_region.x + click_offset,
+            min_pixels_per_row: scale_usize(MIN_RED_PIXELS_PER_ROW, scale_x),
+            min_width: scale_i32(15, uniform_scale).max(1),
+            max_width: scale_i32(24, uniform_scale).max(1),
+            min_height: scale_i32(5, uniform_scale).max(1),
+            max_height: scale_i32(30, uniform_scale).max(1),
+            min_pixels: scale_usize(20, area_scale),
+            max_pixels: scale_usize(500, area_scale),
+            visibility_radius: scale_i32(14, uniform_scale).max(1),
+            min_visibility_pixels: scale_usize(20, area_scale),
+            badge_avatar_overlap: scale_i32(4, uniform_scale).max(1),
+            badge_top_tolerance: scale_i32(6, uniform_scale).max(1),
         }
     }
+}
+
+fn scale_i32(value: i32, scale: f64) -> i32 {
+    (f64::from(value) * scale).round() as i32
+}
+
+fn scale_u32(value: u32, scale: f64) -> u32 {
+    (f64::from(value) * scale).round().max(1.0) as u32
+}
+
+fn scale_usize(value: usize, scale: f64) -> usize {
+    (value as f64 * scale).round().max(1.0) as usize
+}
+
+fn proportional_offset(width: u32, numerator: u32, denominator: u32) -> i32 {
+    let rounded = (u64::from(width) * u64::from(numerator) + u64::from(denominator) / 2)
+        / u64::from(denominator.max(1));
+    rounded.min(u64::from(width.saturating_sub(1))) as i32
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -53,13 +102,19 @@ pub(crate) struct UnreadFriendHit {
     pub(crate) row_click: Point,
 }
 
-pub(crate) fn find_unread_friend_hits(image: &DynamicImage) -> Vec<UnreadFriendHit> {
-    detect_friend_unread(image, &FriendUnreadConfig::default())
+pub(crate) fn find_unread_friend_hits(
+    image: &DynamicImage,
+    layout: &FriendUnreadLayout,
+) -> Vec<UnreadFriendHit> {
+    detect_friend_unread(image, layout)
 }
 
-pub(crate) fn unread_hit_still_visible(image: &DynamicImage, hit: UnreadFriendHit) -> bool {
-    let config = FriendUnreadConfig::default();
-    let radius = config.visibility_radius.max(0);
+pub(crate) fn unread_hit_still_visible(
+    image: &DynamicImage,
+    hit: UnreadFriendHit,
+    layout: &FriendUnreadLayout,
+) -> bool {
+    let radius = layout.visibility_radius.max(0);
     let left = (hit.indicator.x - radius).max(0);
     let top = (hit.indicator.y - radius).max(0);
     let right = (hit.indicator.x + radius).min(image.width() as i32 - 1);
@@ -71,10 +126,10 @@ pub(crate) fn unread_hit_still_visible(image: &DynamicImage, hit: UnreadFriendHi
             is_unread_red(pixel[0], pixel[1], pixel[2])
         })
         .count();
-    red_pixels >= config.min_visibility_pixels
+    red_pixels >= layout.min_visibility_pixels
 }
 
-fn detect_friend_unread(image: &DynamicImage, config: &FriendUnreadConfig) -> Vec<UnreadFriendHit> {
+fn detect_friend_unread(image: &DynamicImage, config: &FriendUnreadLayout) -> Vec<UnreadFriendHit> {
     let Some(region) = bounded_rect(image, config.search_rect) else {
         return Vec::new();
     };
@@ -159,7 +214,7 @@ struct ActiveGroup {
 fn push_unread_group(
     hits: &mut Vec<UnreadFriendHit>,
     image: &DynamicImage,
-    config: &FriendUnreadConfig,
+    config: &FriendUnreadLayout,
     group: ActiveGroup,
 ) {
     let height = group.end - group.start + 1;
@@ -183,7 +238,7 @@ fn push_unread_group(
 
 fn badge_protrudes_from_avatar(
     image: &DynamicImage,
-    config: &FriendUnreadConfig,
+    config: &FriendUnreadLayout,
     badge_rect: Rect,
 ) -> bool {
     let scan_start = badge_rect.y - config.avatar_top_scan_padding;
@@ -195,16 +250,27 @@ fn badge_protrudes_from_avatar(
             config.avatar_size,
             config.avatar_size,
         );
-        let badge_is_right_top_protrusion = badge_rect.right() > avatar.right() - 4
+        let badge_is_right_top_protrusion = badge_rect.right()
+            > avatar.right() - config.badge_avatar_overlap
             && badge_rect.x >= avatar.x + config.avatar_size as i32 / 2
-            && badge_rect.y >= avatar.y - 6
+            && badge_rect.y >= avatar.y - config.badge_top_tolerance
             && badge_rect.y <= avatar.y + config.avatar_size as i32 / 3;
         badge_is_right_top_protrusion
-            && avatar_boundary_edges(image, avatar) >= config.min_avatar_boundary_edges
+            && avatar_boundary_edges(
+                image,
+                avatar,
+                config.avatar_outer_inset,
+                config.avatar_boundary_width,
+            ) >= config.min_avatar_boundary_edges
     })
 }
 
-fn avatar_boundary_edges(image: &DynamicImage, rect: Rect) -> usize {
+fn avatar_boundary_edges(
+    image: &DynamicImage,
+    rect: Rect,
+    outer_inset: i32,
+    boundary_width: i32,
+) -> usize {
     let Some(rect) = bounded_rect(image, rect) else {
         return 0;
     };
@@ -214,8 +280,8 @@ fn avatar_boundary_edges(image: &DynamicImage, rect: Rect) -> usize {
     }
     let center_x = rect.x + size / 2;
     let center_y = rect.y + size / 2;
-    let outer_radius = size / 2 - 2;
-    let inner_radius = (outer_radius - 4).max(1);
+    let outer_radius = size / 2 - outer_inset;
+    let inner_radius = (outer_radius - boundary_width).max(1);
     let samples = [
         (-3, -10),
         (3, -10),
@@ -313,11 +379,55 @@ mod tests {
         draw_friend_avatar(&mut image, 300);
         draw_unread_badge(&mut image, Rect::new(56, 300, 20, 20));
 
-        let hits = find_unread_friend_hits(&DynamicImage::ImageRgba8(image));
+        let hits = find_unread_friend_hits(&DynamicImage::ImageRgba8(image), &default_layout());
 
         assert_eq!(hits.len(), 1);
         assert!((hits[0].row_click.y - 310).abs() <= 1);
         assert_eq!(hits[0].row_click.x, 150);
+    }
+
+    #[test]
+    fn scales_detection_and_click_coordinates_for_1280_by_720() {
+        let friend_list = Rect::new(53, 187, 113, 400);
+        let layout = FriendUnreadLayout::resolve(1280, 720, friend_list);
+        let mut image = RgbaImage::from_pixel(1280, 720, Rgba([35, 40, 55, 255]));
+        draw_friend_avatar_at(&mut image, 13, 200, 32);
+        draw_unread_badge(&mut image, Rect::new(37, 200, 13, 13));
+
+        let hits = find_unread_friend_hits(&DynamicImage::ImageRgba8(image), &layout);
+
+        assert_eq!(layout.search_rect.x, 36);
+        assert_eq!(layout.search_rect.y, 167);
+        assert_eq!(layout.search_rect.width, 19);
+        assert_eq!(layout.search_rect.height, 433);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].row_click.x, 100);
+        assert_eq!(hits[0].row_click.y, 206);
+    }
+
+    #[test]
+    fn follows_a_moved_friend_list_region() {
+        let layout = FriendUnreadLayout::resolve(1920, 1080, Rect::new(300, 350, 170, 600));
+        let mut image = test_image();
+        draw_friend_avatar_at(&mut image, 240, 370, 48);
+        draw_unread_badge(&mut image, Rect::new(276, 370, 20, 20));
+
+        let hits = find_unread_friend_hits(&DynamicImage::ImageRgba8(image), &layout);
+
+        assert_eq!(layout.search_rect.x, 274);
+        assert_eq!(layout.search_rect.y, 320);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].row_click.x, 370);
+        assert_eq!(hits[0].row_click.y, 380);
+    }
+
+    #[test]
+    fn keeps_click_inside_a_narrow_friend_list_region() {
+        let friend_list = Rect::new(80, 280, 20, 600);
+        let layout = FriendUnreadLayout::resolve(1920, 1080, friend_list);
+
+        assert!(layout.row_click_x >= friend_list.x);
+        assert!(layout.row_click_x < friend_list.right());
     }
 
     #[test]
@@ -334,7 +444,9 @@ mod tests {
             Rgba([230, 62, 80, 255]),
         );
 
-        assert!(find_unread_friend_hits(&DynamicImage::ImageRgba8(image)).is_empty());
+        assert!(
+            find_unread_friend_hits(&DynamicImage::ImageRgba8(image), &default_layout()).is_empty()
+        );
     }
 
     #[test]
@@ -342,7 +454,9 @@ mod tests {
         let mut image = test_image();
         draw_unread_badge(&mut image, Rect::new(56, 300, 20, 20));
 
-        assert!(find_unread_friend_hits(&DynamicImage::ImageRgba8(image)).is_empty());
+        assert!(
+            find_unread_friend_hits(&DynamicImage::ImageRgba8(image), &default_layout()).is_empty()
+        );
     }
 
     #[test]
@@ -355,7 +469,9 @@ mod tests {
             Rgba([230, 62, 80, 255]),
         );
 
-        assert!(find_unread_friend_hits(&DynamicImage::ImageRgba8(image)).is_empty());
+        assert!(
+            find_unread_friend_hits(&DynamicImage::ImageRgba8(image), &default_layout()).is_empty()
+        );
     }
 
     #[test]
@@ -364,9 +480,14 @@ mod tests {
         draw_friend_avatar(&mut image, 300);
         draw_unread_badge(&mut image, Rect::new(56, 300, 20, 20));
         let image = DynamicImage::ImageRgba8(image);
-        let hit = find_unread_friend_hits(&image)[0];
+        let layout = default_layout();
+        let hit = find_unread_friend_hits(&image, &layout)[0];
 
-        assert!(unread_hit_still_visible(&image, hit));
+        assert!(unread_hit_still_visible(&image, hit, &layout));
+    }
+
+    fn default_layout() -> FriendUnreadLayout {
+        FriendUnreadLayout::resolve(1920, 1080, Rect::new(80, 280, 170, 600))
     }
 
     fn test_image() -> RgbaImage {
@@ -374,13 +495,19 @@ mod tests {
     }
 
     fn draw_friend_avatar(image: &mut RgbaImage, top: i32) {
-        let center_x = 44_i32;
-        let center_y = top + 24;
-        for y in top..top + 48 {
-            for x in 20..68 {
+        draw_friend_avatar_at(image, 20, top, 48);
+    }
+
+    fn draw_friend_avatar_at(image: &mut RgbaImage, left: i32, top: i32, size: u32) {
+        let size = size as i32;
+        let center_x = left + size / 2;
+        let center_y = top + size / 2;
+        let radius = size / 2 - 2;
+        for y in top..top + size {
+            for x in left..left + size {
                 let dx = x - center_x;
                 let dy = y - center_y;
-                if dx * dx + dy * dy <= 22_i32.pow(2) {
+                if dx * dx + dy * dy <= radius.pow(2) {
                     image.put_pixel(x as u32, y as u32, Rgba([190, 180, 170, 255]));
                 }
             }
@@ -389,13 +516,19 @@ mod tests {
 
     fn draw_unread_badge(image: &mut RgbaImage, rect: Rect) {
         fill_rect(image, rect, Rgba([230, 62, 80, 255]));
-        for y in rect.y + 4..rect.y + 13 {
-            for x in rect.x + 9..rect.x + 12 {
+        let stroke_width = ((rect.width * 3 + 10) / 20).max(1) as i32;
+        let stroke_left = rect.x + (rect.width as i32 - stroke_width) / 2;
+        let line_top = rect.y + ((rect.height * 4 + 10) / 20) as i32;
+        let line_bottom = rect.y + ((rect.height * 13 + 10) / 20) as i32;
+        let dot_top = rect.y + ((rect.height * 15 + 10) / 20) as i32;
+        let dot_bottom = rect.y + ((rect.height * 18 + 10) / 20) as i32;
+        for y in line_top..line_bottom {
+            for x in stroke_left..stroke_left + stroke_width {
                 image.put_pixel(x as u32, y as u32, Rgba([245, 245, 245, 255]));
             }
         }
-        for y in rect.y + 15..rect.y + 18 {
-            for x in rect.x + 9..rect.x + 12 {
+        for y in dot_top..dot_bottom {
+            for x in stroke_left..stroke_left + stroke_width {
                 image.put_pixel(x as u32, y as u32, Rgba([245, 245, 245, 255]));
             }
         }

@@ -1,5 +1,50 @@
 use super::*;
 
+struct SecondaryUnreadTaskCompletionGuard {
+    business: BusinessRuntimeHandle,
+    active: bool,
+    processed_message: bool,
+}
+
+impl SecondaryUnreadTaskCompletionGuard {
+    fn new(business: BusinessRuntimeHandle) -> Self {
+        Self {
+            business,
+            active: true,
+            processed_message: false,
+        }
+    }
+
+    fn mark_message_processed(&mut self) {
+        self.processed_message = true;
+    }
+
+    fn finish(mut self) -> Result<()> {
+        self.business
+            .finish_chat_listener_unread_task(self.processed_message)?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for SecondaryUnreadTaskCompletionGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let release = if self.processed_message {
+            self.business.finish_chat_listener_unread_task(true)
+        } else {
+            self.business.release_chat_listener_unread_task()
+        };
+        if let Err(error) = release {
+            log::error!("二级未读任务异常结束后释放 pending 状态失败: {error}");
+        } else {
+            log::warn!("二级未读任务异常结束，已释放 pending 状态并等待下一轮恢复");
+        }
+    }
+}
+
 fn primary_messages_after_cursor(
     messages: Vec<PrimaryObservedMessage>,
     cursor: PrimaryObservationCursor,
@@ -248,6 +293,11 @@ impl ApplicationRuntime {
         if !self.business.task_engine.is_idle()? {
             return Ok(SecondaryListenerRoundOutcome::default());
         }
+        let unread_layout = crate::observation::chat::FriendUnreadLayout::resolve(
+            self.lifecycle.config.screen.expected_width,
+            self.lifecycle.config.screen.expected_height,
+            self.lifecycle.config.invite.friend_list_region.into(),
+        );
         let title_fingerprint = rect_chat_change_fingerprint(image, SECONDARY_TITLE_RECT)?;
         let title_changed = identity.is_none()
             || last_title
@@ -278,7 +328,10 @@ impl ApplicationRuntime {
                     ..Default::default()
                 });
             }
-            if let Some(hit) = find_unread_friend_hits(image).into_iter().next() {
+            if let Some(hit) = find_unread_friend_hits(image, &unread_layout)
+                .into_iter()
+                .next()
+            {
                 self.queue_secondary_unread_task(hit, true)?;
                 return Ok(SecondaryListenerRoundOutcome::default());
             }
@@ -319,7 +372,10 @@ impl ApplicationRuntime {
                         ..Default::default()
                     });
                 }
-                if let Some(hit) = find_unread_friend_hits(image).into_iter().next() {
+                if let Some(hit) = find_unread_friend_hits(image, &unread_layout)
+                    .into_iter()
+                    .next()
+                {
                     self.queue_secondary_unread_task(hit, false)?;
                     return Ok(SecondaryListenerRoundOutcome::default());
                 }
@@ -499,6 +555,8 @@ impl ApplicationRuntime {
         hit: UnreadFriendHit,
         discard_only: bool,
     ) -> Result<()> {
+        let mut completion =
+            SecondaryUnreadTaskCompletionGuard::new(self.business.business.clone());
         let outcome = self
             .ui
             .secondary_unread_ui
@@ -506,7 +564,7 @@ impl ApplicationRuntime {
             .context("提交二级好友未读 UI 事务")?
             .wait()
             .context("等待二级好友未读 UI 事务")?;
-        let result = match outcome.effect() {
+        let processed_message = match outcome.effect() {
             SecondaryUnreadEffect::Message {
                 captured_at,
                 friend_name,
@@ -533,34 +591,29 @@ impl ApplicationRuntime {
                         sender: None,
                     }],
                 )?;
-                self.dispatch_chat_observations(dispatches).map(|_| ())
+                completion.mark_message_processed();
+                self.dispatch_chat_observations(dispatches)?;
+                true
             }
-            SecondaryUnreadEffect::Discarded | SecondaryUnreadEffect::NoMessage => Ok(()),
-            SecondaryUnreadEffect::SkippedNonFriend => {
-                log::warn!("二级监听好友未读: 打开后不是可执行好友会话，跳过 OCR");
-                Ok(())
-            }
+            SecondaryUnreadEffect::Discarded
+            | SecondaryUnreadEffect::NoMessage
+            | SecondaryUnreadEffect::Stale => false,
             SecondaryUnreadEffect::Failed(failure) => {
-                Err(anyhow!("二级好友未读处理失败：{failure}"))
+                return Err(anyhow!("二级好友未读处理失败：{failure}"));
             }
-        }
-        .and_then(|_| match outcome.residency() {
-            UiResidencyOutcome::Confirmed(UiResidencyTarget::SecondaryCurrentHall) => Ok(()),
+        };
+        match outcome.residency() {
+            UiResidencyOutcome::Confirmed(UiResidencyTarget::SecondaryCurrentHall) => {}
             UiResidencyOutcome::Confirmed(other) => {
-                Err(anyhow!("二级好友未读驻留结果错误: {other:?}"))
+                return Err(anyhow!("二级好友未读驻留结果错误: {other:?}"));
             }
             UiResidencyOutcome::Failed(failure) => {
-                Err(anyhow!("二级好友未读后恢复当前大厅失败：{failure}"))
+                return Err(anyhow!("二级好友未读后恢复当前大厅失败：{failure}"));
             }
-        });
-
-        self.business
-            .business
-            .finish_chat_listener_unread_task(!discard_only)?;
-        if result.is_err() {
-            log::warn!("二级未读任务失败，保留二级监听模式并等待下一轮驻留恢复");
         }
-        result
+
+        debug_assert_eq!(processed_message, completion.processed_message);
+        completion.finish()
     }
 
     pub(super) fn execute_restore_secondary_hall_task(&mut self) -> Result<()> {
@@ -1236,6 +1289,68 @@ mod tests {
             kind: SecondaryHallMessageKind::Command,
             requires_sender: true,
         }
+    }
+
+    #[test]
+    fn unread_completion_guard_releases_claim_after_error_and_panic() {
+        let runtime = BusinessRuntime::start(
+            8,
+            IdiomChainService::from_entries_for_test(&["画蛇添足", "足智多谋"], None),
+            CardGameService::new(LandlordConfig::default()),
+        )
+        .unwrap();
+        let business = runtime.handle();
+        assert!(
+            business
+                .request_chat_listener_mode(ChatListenerMode::Secondary)
+                .unwrap()
+        );
+        business
+            .complete_chat_listener_mode(ChatListenerMode::Secondary)
+            .unwrap();
+        business
+            .finish_chat_listener_initial_unread_clear()
+            .unwrap();
+        business.finish_chat_listener_hall_round().unwrap();
+
+        assert!(business.claim_chat_listener_unread_task().unwrap());
+        let failed: Result<()> = (|| {
+            let _completion = SecondaryUnreadTaskCompletionGuard::new(business.clone());
+            Err(anyhow!("模拟未读任务提前失败"))
+        })();
+        assert!(failed.is_err());
+        assert!(
+            !business
+                .chat_listener_snapshot()
+                .unwrap()
+                .unread_task_pending
+        );
+
+        assert!(business.claim_chat_listener_unread_task().unwrap());
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _completion = SecondaryUnreadTaskCompletionGuard::new(business.clone());
+            panic!("模拟未读任务 panic");
+        }));
+        assert!(unwind.is_err());
+        assert!(
+            !business
+                .chat_listener_snapshot()
+                .unwrap()
+                .unread_task_pending
+        );
+        assert!(business.claim_chat_listener_unread_task().unwrap());
+        business.release_chat_listener_unread_task().unwrap();
+
+        assert!(business.claim_chat_listener_unread_task().unwrap());
+        {
+            let mut completion = SecondaryUnreadTaskCompletionGuard::new(business.clone());
+            completion.mark_message_processed();
+        }
+        let snapshot = business.chat_listener_snapshot().unwrap();
+        assert!(!snapshot.unread_task_pending);
+        assert!(snapshot.hall_round_required);
+
+        runtime.shutdown().unwrap();
     }
 
     #[test]

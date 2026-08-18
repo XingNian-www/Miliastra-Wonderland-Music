@@ -59,6 +59,8 @@ impl SecondaryHallBubble {
 }
 
 pub(crate) fn latest_incoming_bubble_rect(image: &DynamicImage) -> Option<Rect> {
+    // 好友红点覆盖整个会话，但二级监听约定只把最下方（最新）的入站气泡作为命令候选；
+    // 打开会话时不会补放更早的未读气泡。
     let region = bounded_rect(image, MESSAGE_RECT)?;
     let mut groups = Vec::new();
     let mut active_start = None;

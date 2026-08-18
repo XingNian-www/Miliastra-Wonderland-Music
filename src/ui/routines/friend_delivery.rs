@@ -520,6 +520,14 @@ impl FriendDeliveryRoutineConfig {
     pub(super) fn timeout_ms(&self) -> u64 {
         self.timeout_ms
     }
+
+    pub(super) fn friend_list_region(&self) -> Rect {
+        self.friend_list_region
+    }
+
+    pub(super) fn friend_step_ms(&self) -> u64 {
+        self.friend_step_ms
+    }
 }
 
 struct SendFriendDeliveriesRoutine {

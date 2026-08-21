@@ -750,8 +750,8 @@ impl IdiomLexicon {
             })?;
             entries.push((
                 idiom,
-                non_empty_or_unspecified(fields.next().unwrap_or_default().trim().to_string()),
-                non_empty_or_unspecified(fields.next().unwrap_or_default().trim().to_string()),
+                with_default_label(fields.next().unwrap_or_default().trim().to_string()),
+                with_default_label(fields.next().unwrap_or_default().trim().to_string()),
             ));
         }
         Self::from_definitions(entries)
@@ -781,8 +781,8 @@ impl IdiomLexicon {
                 lexicon.explanations.insert(
                     idiom.clone(),
                     IdiomDetails {
-                        source: non_empty_or_unspecified(source),
-                        explanation: non_empty_or_unspecified(explanation),
+                        source: with_default_label(source),
+                        explanation: with_default_label(explanation),
                     },
                 );
             }
@@ -928,7 +928,7 @@ fn same_player(left: &str, right: &str) -> bool {
     left.trim().eq_ignore_ascii_case(right.trim())
 }
 
-fn non_empty_or_unspecified(value: String) -> String {
+fn with_default_label(value: String) -> String {
     if value.trim().is_empty() {
         "未注明".to_string()
     } else {

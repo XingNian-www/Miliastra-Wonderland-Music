@@ -2827,8 +2827,7 @@ mod tests {
 
     #[test]
     fn next_command_with_empty_queue_does_not_forward_to_engine_navigation() {
-        // 队列与播放池都为空：Next 不再转发给引擎（内置引擎会拒绝队列导航，
-        // 否则产生「播放器控制未确认」错误），静默完成并回复当前状态。
+        // 队列与播放池都为空：Next 静默完成并回复当前状态。
         let mut port = NavigationCommandPort {
             previous_request: None,
             played_uris: Vec::new(),
@@ -3107,8 +3106,7 @@ mod tests {
 
     #[test]
     fn previous_command_without_history_does_not_forward_to_engine_navigation() {
-        // 无历史请求：Previous 不再转发给引擎（内置引擎会拒绝队列导航），
-        // 静默完成并回复当前状态。
+        // 无历史请求：Previous 静默完成并回复当前状态。
         let mut port = NavigationCommandPort {
             previous_request: None,
             played_uris: Vec::new(),

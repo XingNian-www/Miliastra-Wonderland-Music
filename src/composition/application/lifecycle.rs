@@ -14,7 +14,7 @@ fn committed_run_result(result: Result<()>, reason: ShutdownReason) -> Result<Ru
         (Err(error), ShutdownReason::ConfigReload | ShutdownReason::ConfigReloadWithStartup) => {
             // Once the task engine has stopped accepting work, process replacement is
             // irreversible. Preserve the watchdog handoff even if a final forwarding step fails.
-            log::error!("配置重载已提交，关停尾部错误不再取消进程替换: {error:#}");
+            log::error!("配置重载已提交，关停尾部错误: {error:#}");
             Ok(match reason {
                 ShutdownReason::ConfigReload => RunOutcome::Reload,
                 ShutdownReason::ConfigReloadWithStartup => RunOutcome::ReloadWithStartup,
@@ -24,7 +24,7 @@ fn committed_run_result(result: Result<()>, reason: ShutdownReason) -> Result<Ru
         (Err(error), ShutdownReason::UserExit) => {
             // A concurrent tail failure must not turn an explicit user exit into watchdog error
             // recovery and restart the process the user just stopped.
-            log::error!("用户退出已提交，关停尾部错误不再触发看门狗重启: {error:#}");
+            log::error!("用户退出已提交，关停尾部错误: {error:#}");
             Ok(RunOutcome::Stopped)
         }
         (result, ShutdownReason::Running) => result.map(|()| RunOutcome::Stopped),

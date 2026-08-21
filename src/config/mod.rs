@@ -271,7 +271,7 @@ impl Default for AppConfig {
 /// 最小启动配置：仅含启动阶段必需的三个字段，从 config.yaml 读取。
 /// 完整业务配置（AppConfig）由 SQLite 配置中心（ConfigStore）管理，
 /// http/logging/state.playback_state_path 三个注入项由此结构提供。
-/// 解析严格拒绝未知段（旧版完整配置段会报错），详见 [`BootstrapConfig::load`]。
+/// 解析严格拒绝未知段，详见 [`BootstrapConfig::load`]。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BootstrapConfig {
@@ -284,12 +284,11 @@ pub struct BootstrapConfig {
 impl BootstrapConfig {
     /// 从 config.yaml 加载最小启动配置。
     ///
-    /// 严格解析（[`deny_unknown_fields`]）：config.yaml 只允许 database_path、
-    /// http、logging 三个引导段，旧版完整配置段会被拒绝并附带引导说明。
+    /// 严格解析（[`deny_unknown_fields`]）：只允许 database_path、http、logging 三个引导段。
     /// 字段缺失或为空时明确报错；database_path 为相对路径时相对
     /// `executable_root`（EXE 所在目录）解析为绝对路径。
     pub fn load(path: &Path, executable_root: &Path) -> Result<Self> {
-        const BOOTSTRAP_ONLY_HINT: &str = "config.yaml 现在只保留 database_path、http、logging 三个引导段，其余配置请通过 Web 面板「配置中心」管理（或在删除旧段后重试）";
+        const BOOTSTRAP_ONLY_HINT: &str = "config.yaml 只允许 database_path、http、logging 三个引导段，其余配置请通过 Web 面板「配置中心」管理";
         let text = fs::read_to_string(path)
             .with_context(|| format!("读取启动配置失败: {}", path.display()))?;
         let mut bootstrap: BootstrapConfig = serde_yaml::from_str(&text).with_context(|| {
@@ -545,7 +544,6 @@ impl AppConfig {
     }
 
     /// 仅测试：从完整 YAML 解析配置（不解析相对路径）。
-    /// 启动流程已改为 BootstrapConfig → ConfigStore 链路，生产代码不再直接读完整 YAML。
     #[cfg(test)]
     pub fn load(path: &Path) -> Result<Self> {
         let text = fs::read_to_string(path).with_context(|| {
@@ -557,8 +555,7 @@ impl AppConfig {
         serde_yaml::from_str(&text).with_context(|| format!("解析配置失败: {}", path.display()))
     }
 
-    /// 仅测试：从完整 YAML 加载并解析相对路径（启动流程已改为
-    /// BootstrapConfig → ConfigStore 链路，不再调用本函数）。
+    /// 仅测试：从完整 YAML 加载并解析相对路径。
     #[cfg(test)]
     pub(crate) fn load_from_root(path: &Path, executable_root: &Path) -> Result<Self> {
         let mut config = Self::load(path)?;

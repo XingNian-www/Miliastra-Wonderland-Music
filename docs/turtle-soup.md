@@ -26,7 +26,7 @@
 
 ## 题库
 
-题库是内容数据文件（不是功能配置）。复制发布包中的 `deps/docs/turtle_soup.example.yaml` 为 `deps/turtle_soup.yaml`，按示例填写：
+题库是内容数据文件。复制发布包中的 `deps/docs/turtle_soup.example.yaml` 为 `deps/turtle_soup.yaml`，按示例填写：
 
 ```yaml
 题目:

@@ -16,8 +16,7 @@ pub trait DeadlineModule: Send + Sync + 'static {
 
 /// Describes one module-specific deadline kind.
 ///
-/// Associating the module here prevents a deadline kind from being accidentally constructed as a
-/// token owned by another vertical module.
+/// Each deadline kind is bound to its owning vertical module.
 pub trait DeadlineKind: Clone + Debug + Eq + Hash + Send + 'static {
     type Module: DeadlineModule;
 }
@@ -309,9 +308,7 @@ impl Display for TimerCoreError {
 impl Error for TimerCoreError {}
 
 /// Pure deadline ordering and lifecycle state.
-///
-/// `TimerCore` neither reads a clock nor starts a worker. A runtime can drive it with a real clock,
-/// while business tests can drive it with `ManualClock` without sleeping.
+/// A runtime drives it with a real clock; tests can drive it with `ManualClock`.
 #[derive(Debug)]
 pub struct TimerCore<T: DeadlineIdentity> {
     state: TimerCoreState,

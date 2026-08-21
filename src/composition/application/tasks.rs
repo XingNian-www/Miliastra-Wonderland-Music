@@ -11,7 +11,7 @@ struct ReloadIdleState {
 }
 
 impl ReloadIdleState {
-    const fn non_http_idle(self, requires_playback_idle: bool) -> bool {
+    const fn background_idle(self, requires_playback_idle: bool) -> bool {
         self.task_engine_idle
             && self.entertainment_idle
             && if requires_playback_idle {
@@ -27,11 +27,11 @@ impl ReloadIdleState {
     }
 
     const fn is_idle(self, requires_playback_idle: bool) -> bool {
-        self.non_http_idle(requires_playback_idle) && self.http_operations_idle
+        self.background_idle(requires_playback_idle) && self.http_operations_idle
     }
 
     const fn drain_readiness(self, requires_playback_idle: bool) -> ReloadDrainReadiness {
-        if !self.non_http_idle(requires_playback_idle) {
+        if !self.background_idle(requires_playback_idle) {
             ReloadDrainReadiness::Unsafe
         } else if self.http_operations_idle {
             ReloadDrainReadiness::Ready

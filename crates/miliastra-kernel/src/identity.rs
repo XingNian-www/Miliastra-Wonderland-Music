@@ -4,9 +4,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Identifies one asynchronous operation submitted by the business runtime.
 ///
-/// The identifier is deliberately separate from runtime-specific identifiers such as
-/// `UiOperationId`, so a delayed result cannot accidentally be correlated by queue position or
-/// text content.
+/// Separate from runtime-specific identifiers such as `UiOperationId`:
+/// delayed results correlate only by this id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BusinessOperationId(u64);
 

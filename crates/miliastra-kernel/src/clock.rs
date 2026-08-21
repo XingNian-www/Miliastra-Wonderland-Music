@@ -4,17 +4,17 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// Supplies monotonic business time without coupling domain code to the system clock.
+/// Supplies monotonic business time to domain code.
 pub trait Clock: Send + Sync + 'static {
     fn now(&self) -> Instant;
 }
 
-/// Waits without forcing a business gateway to depend directly on the system scheduler.
+/// Waits for a duration in business gateways.
 pub trait Delay: Send + Sync + 'static {
     fn wait(&self, duration: Duration);
 }
 
-/// Supplies wall-clock metadata without using it to judge business deadlines.
+/// Supplies wall-clock metadata (not used for business deadline decisions).
 pub trait WallClock: Send + Sync + 'static {
     fn unix_seconds(&self) -> u64;
 

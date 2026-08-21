@@ -38,7 +38,7 @@
 
 ## 词库配置
 
-词库是内容数据文件（不是功能配置）。复制发布包中的 `deps/docs/undercover.example.yaml` 为 `deps/undercover.yaml`。每行填写一对词语，格式为 `平民词:卧底词`；顺序相反的词对视为同一对。
+词库是内容数据文件。复制发布包中的 `deps/docs/undercover.example.yaml` 为 `deps/undercover.yaml`。每行填写一对词语，格式为 `平民词:卧底词`；顺序相反的词对视为同一对。
 
 `undercover` 功能段在配置中心修改，字段结构如下（示意）：
 

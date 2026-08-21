@@ -581,8 +581,7 @@ impl CredentialStore {
         };
         if !current {
             drop(mutation);
-            // A newer login/save already owns the metadata. The old request
-            // must release only its lease rather than deleting that schedule.
+            // A newer login/save owns the metadata; release only this request's lease.
             self.release_refresh_lease(provider);
             return Ok(false);
         }
@@ -743,14 +742,14 @@ impl CredentialStore {
         persisted.map(|_| ())
     }
 
-    pub(crate) fn non_sensitive_path(&self, file_name: &str) -> Option<PathBuf> {
+    pub(crate) fn auxiliary_path(&self, file_name: &str) -> Option<PathBuf> {
         self.directory
             .as_ref()
             .map(|directory| directory.join(file_name))
     }
 
     fn refresh_state_path(&self) -> Option<PathBuf> {
-        self.non_sensitive_path(REFRESH_STATE_FILE)
+        self.auxiliary_path(REFRESH_STATE_FILE)
     }
 
     fn persist_refresh_metadata(
@@ -1084,8 +1083,8 @@ fn load_refresh_metadata(
     })?;
     let mut metadata: BTreeMap<String, RefreshMetadata> = serde_json::from_str(&text)
         .map_err(|error| CredentialError::Invalid(format!("{}: {error}", path.display())))?;
-    // 旧版本可能将 provider 原始错误写入该文件。状态会直接被 Web 面板读取，
-    // 因此加载时迁移为稳定错误码并立即落盘，避免升级后继续暴露旧的 URL 或凭据。
+    // 将不稳定的 provider 原始错误迁移为稳定错误码并立即落盘，
+    // 避免在 Web 面板暴露原始 URL 或凭据。
     let migrated = metadata.values_mut().fold(false, |changed, entry| {
         if entry.last_error.as_deref() == Some("refresh_failed") {
             changed

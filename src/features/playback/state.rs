@@ -84,7 +84,7 @@ pub(crate) struct ControlOperationRecord {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SessionReconciliation {
-    NoActiveRequest,
+    Idle,
     Bound,
     Match,
     Restarted,
@@ -563,7 +563,7 @@ fn player_session_reconciliation(
     incoming: Option<&PlaybackSessionBinding>,
 ) -> SessionReconciliation {
     if !active {
-        return SessionReconciliation::NoActiveRequest;
+        return SessionReconciliation::Idle;
     }
     match (current, incoming) {
         (_, Some(incoming)) if incoming.runtime_identity.trim().is_empty() => {

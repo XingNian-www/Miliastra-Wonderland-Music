@@ -530,7 +530,7 @@ impl CardGameService {
                 }
                 LandlordCommand::Hand => {
                     if let Err(error) = ensure_generation_capacity(&self.state) {
-                        clear_session_without_generation(&mut self.state);
+                        reset_transient_state(&mut self.state);
                         Self::release_active_card_game(entertainment);
                         return Err(error);
                     }
@@ -727,7 +727,7 @@ impl CardGameService {
             )
         } else {
             if let Err(error) = ensure_generation_capacity(&self.state) {
-                clear_session_without_generation(&mut self.state);
+                reset_transient_state(&mut self.state);
                 Self::release_active_card_game(entertainment);
                 return Err(error);
             }
@@ -769,12 +769,12 @@ impl CardGameService {
         let continues = pending_state.effect.continues_after(&result);
         let aborts = pending_state.effect.aborts_after(&result);
         if continues && let Err(error) = ensure_operation_capacity(&self.state) {
-            clear_session_without_generation(&mut self.state);
+            reset_transient_state(&mut self.state);
             Self::release_active_card_game(entertainment);
             return Err(error);
         }
         if aborts && let Err(error) = ensure_generation_capacity(&self.state) {
-            clear_session_without_generation(&mut self.state);
+            reset_transient_state(&mut self.state);
             Self::release_active_card_game(entertainment);
             return Err(error);
         }
@@ -1017,7 +1017,7 @@ impl CardGameService {
             PendingCardGameEffect::DeliverOutcomePrivate { .. }
         ) && let Err(error) = ensure_generation_capacity(&self.state)
         {
-            clear_session_without_generation(&mut self.state);
+            reset_transient_state(&mut self.state);
             Self::release_active_card_game(entertainment);
             return Err(error);
         }
@@ -1364,12 +1364,12 @@ impl CardGameService {
                 return Ok(None);
             }
             if let Err(error) = ensure_generation_capacity(&self.state) {
-                clear_session_without_generation(&mut self.state);
+                reset_transient_state(&mut self.state);
                 Self::release_active_card_game(entertainment);
                 return Err(error);
             }
             if let Err(error) = ensure_operation_capacity(&self.state) {
-                clear_session_without_generation(&mut self.state);
+                reset_transient_state(&mut self.state);
                 Self::release_active_card_game(entertainment);
                 return Err(error);
             }
@@ -1415,7 +1415,7 @@ impl CardGameService {
                 || reserved;
             if has_session {
                 let Some(next_generation) = self.state.session_generation.checked_next() else {
-                    clear_session_without_generation(&mut self.state);
+                    reset_transient_state(&mut self.state);
                     Self::release_active_card_game(entertainment);
                     bail!("card game session generation exhausted");
                 };
@@ -1547,7 +1547,7 @@ fn abort_state(state: &mut CardGameState) -> Result<bool> {
     Ok(state.game.abort() || pending || pending_retry || had_pending_effects)
 }
 
-fn clear_session_without_generation(state: &mut CardGameState) {
+fn reset_transient_state(state: &mut CardGameState) {
     state.pending_start = None;
     state.pending_retry = None;
     state.pending_effects.clear();

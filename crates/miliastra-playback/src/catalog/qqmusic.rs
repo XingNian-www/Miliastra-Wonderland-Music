@@ -73,7 +73,7 @@ impl QqMusicAdapter {
             .user_agent("miliastra-wonderland-music/0.1")
             .build()
             .map_err(|error| CatalogError::Transient(error.to_string()))?;
-        let device = QqDevice::load(credentials.non_sensitive_path(QQ_DEVICE_FILE))
+        let device = QqDevice::load(credentials.auxiliary_path(QQ_DEVICE_FILE))
             .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?;
         Ok(Self {
             client,

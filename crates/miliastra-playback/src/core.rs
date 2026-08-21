@@ -421,7 +421,7 @@ impl PlaybackCore {
             tracing::debug!(key = %song_key, "音源已在缓存中，跳过预加载");
             return Ok(());
         }
-        // 磁盘缓存优先：完整文件已落盘时直接注册本地代理，不调用 provider resolve。
+        // 磁盘缓存优先：完整文件已落盘时直接注册本地代理音源。
         if let Some(stream) = self.disk_complete_stream(&song_key, metadata).await {
             tracing::debug!(key = %song_key, "磁盘缓存命中，跳过预加载解析");
             self.cache_stream(song_key.clone(), stream);
@@ -490,8 +490,8 @@ impl PlaybackCore {
         cache.put(key, stream, unix_epoch_ms());
     }
 
-    /// 磁盘完整缓存命中：注册本地代理条目并返回代理音源；未命中返回 None。
-    /// 命中时不调用 provider resolve，源 URL 可不存在（代理直接服务磁盘文件）。
+    /// 磁盘完整缓存命中时注册本地代理条目并返回代理音源；未命中返回 None。
+    /// 代理直接服务磁盘文件，源 URL 可不存在。
     async fn disk_complete_stream(
         &self,
         song_key: &SongKey,
@@ -534,7 +534,7 @@ impl PlaybackCore {
             }
             None => {
                 // 磁盘缓存优先：完整文件已落盘时直接注册本地代理并返回代理音源，
-                // 不调用 provider resolve（断网/源站不可用也能播）。
+                // 断网或源站不可用也能播放。
                 if let Some(stream) = self.disk_complete_stream(&song_key, metadata).await {
                     tracing::debug!(key = %song_key, "磁盘缓存命中，跳过网络解析");
                     self.cache_stream(song_key.clone(), stream.clone());
@@ -1064,7 +1064,7 @@ impl PlaybackCore {
             {
                 return;
             }
-            // 直连源站：不再改写为缓存代理地址。
+            // 直连源站刷新流地址。
             if let Err(error) = engine
                 .command(EngineCommand::RefreshStream {
                     session_id,

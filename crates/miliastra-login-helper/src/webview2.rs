@@ -31,7 +31,7 @@ fn login_url(provider: &str) -> Option<&'static str> {
         "qqmusic" => Some("https://y.qq.com/portal/profile.html"),
         "netease" => Some("https://music.163.com/"),
         "bilibili" => Some("https://www.bilibili.com/"),
-        // 酷狗 /login/ 路径已下线（404），登录入口在首页右上角。
+        // 酷狗登录入口在首页右上角。
         "kugou" => Some("https://www.kugou.com/"),
         _ => None,
     }
@@ -338,8 +338,7 @@ fn exchange_qq_login_code(
     )?;
     if login_type == "1" {
         // QQ OAuth 交换只保证 openid/access_token/refresh_token；refresh_key
-        // 往往不返回（由移动端续期接口补发）。字段缺失时保留已合并部分并记录
-        // 诊断，不再整体丢弃——网页 Cookie 通常已包含其余字段。
+        // 往往不返回（由移动端续期接口补发）。字段缺失时保留已合并部分并记录诊断。
         let missing = [
             ("uin", ["uin"].as_slice()),
             ("musicKey", ["qqmusic_key", "qm_keyst"].as_slice()),
@@ -1086,10 +1085,7 @@ mod platform {
                 PCWSTR,
                 *mut c_void,
             ) -> HRESULT = unsafe { vtable_fn(manager, 5) };
-            // The disposable profile belongs to this one provider login. Read
-            // all profile cookies, then persist only the provider allowlist,
-            // so login flows that set session cookies on callback subdomains
-            // are still captured without broadening the credential boundary.
+            // Persist only the provider allowlist from the disposable profile cookies.
             let result = unsafe { get_cookies(manager, null(), handler) };
             unsafe { release_com(handler) };
             if result < 0 {

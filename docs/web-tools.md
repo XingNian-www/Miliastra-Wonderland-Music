@@ -23,7 +23,7 @@ http://127.0.0.1:18888/
 
 ## 配置中心
 
-配置中心页面用于查看和修改全部功能配置。功能配置统一保存在数据库 `deps/data/playback.sqlite3` 中，不再读取 `config.yaml` 的功能段；`config.yaml` 只保留 `database_path`、`http`、`logging` 三个启动引导段（其中 `http` 段在配置中心只读展示，需改监听地址或访问令牌时直接编辑 `config.yaml`）。
+配置中心页面用于查看和修改全部功能配置。功能配置统一保存在数据库 `deps/data/playback.sqlite3` 中；`config.yaml` 只保留 `database_path`、`http`、`logging` 三个启动引导段（其中 `http` 段在配置中心只读展示，需改监听地址或访问令牌时直接编辑 `config.yaml`）。
 
 - 按段展示字段、默认值与生效级别（立即生效 / 任务结束后自动重载 / 播放结束或暂停后自动重载 / 重启生效）。
 - 修改后先预检再保存；校验失败会逐字段提示。
@@ -59,7 +59,7 @@ http://127.0.0.1:18888/
 
 聊天点歌会记录发起点歌的聊天用户名。直接调用 `/queue/add` 或
 `/player/play-track` 时，可以通过 `requester` 参数指定点歌人；未指定时使用
-`WEB/API`。播放请求必须提交结构化 `trackRef` 和 `metadata`，不能提交旧 URI。
+`WEB/API`。播放请求必须提交结构化 `trackRef` 和 `metadata`。
 
 ## 高级工具页
 

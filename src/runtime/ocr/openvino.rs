@@ -839,8 +839,8 @@ fn required_path<'a>(path: &'a Option<std::path::PathBuf>, field: &str) -> Resul
 /// The dependency package keeps OpenVINO in `openvino/runtime/...`, while a local developer
 /// build may put `openvino_c.dll` directly beside the executable.  `openvino-sys` only searches
 /// environment variables and known system locations, so make the local layout visible before
-/// `Core::new()` asks it to load the library.  A failed local load is deliberately non-fatal: the
-/// existing `PATH`/`OPENVINO_INSTALL_DIR` fallback remains available.
+/// `Core::new()` asks it to load the library.  A failed local load falls back to the
+/// existing `PATH`/`OPENVINO_INSTALL_DIR` search paths.
 fn prepare_local_runtime_loading() {
     static PREPARE: std::sync::Once = std::sync::Once::new();
     PREPARE.call_once(|| {

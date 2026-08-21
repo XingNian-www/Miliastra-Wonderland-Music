@@ -1002,7 +1002,7 @@ impl SongRequestExecution<'_> {
 
 fn ai_candidate_source(song: &SongCommand) -> &'static str {
     if song.friend_username.trim().is_empty() {
-        // 大厅 AI 点歌不提供 B站 音源，B站 仅限好友点歌。
+        // 大厅 AI 点歌仅使用 QQ、网易、酷狗三源；B站 仅好友点歌。
         "qqmusic,netease,kugou"
     } else {
         song.source.as_str()

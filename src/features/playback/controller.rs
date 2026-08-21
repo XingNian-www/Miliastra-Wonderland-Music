@@ -955,7 +955,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
                     .map_err(|_| anyhow!("待恢复播放器 runtime 锁已损坏"))? = None;
                 session_reconciliation = SessionReconciliation::Match;
             }
-            SessionReconciliation::NoActiveRequest => {
+            SessionReconciliation::Idle => {
                 let _ = self.reconcile_player_session(&runtime_snapshot, &status)?;
             }
             SessionReconciliation::Match | SessionReconciliation::Unknown => {}
@@ -964,8 +964,8 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             && runtime_identity.is_empty()
             && !runtime_is_active
         {
-            // Without runtime identity, a stopped/unknown sample cannot replace a durable resume
-            // point for an active request. A later identified sample will reconcile it safely.
+            // A stopped/unknown sample without runtime identity cannot replace a durable resume point;
+            // a later identified sample reconciles it.
             return Ok(QueueAdvanceDecision::None);
         }
         if runtime_snapshot.active_request.is_some()
@@ -1232,7 +1232,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         status: &PlayerStatus,
     ) -> Result<SessionReconciliation> {
         if runtime.active_request.is_none() {
-            return Ok(SessionReconciliation::NoActiveRequest);
+            return Ok(SessionReconciliation::Idle);
         }
         let runtime_identity = status.runtime_identity.trim();
         if runtime_identity.is_empty() {
@@ -1250,7 +1250,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         status: &PlayerStatus,
     ) -> Result<SessionReconciliation> {
         if runtime.active_request.is_none() {
-            return Ok(SessionReconciliation::NoActiveRequest);
+            return Ok(SessionReconciliation::Idle);
         }
         let Some(binding) = self.player_session_binding(status) else {
             return Ok(SessionReconciliation::Unknown);
@@ -2074,7 +2074,7 @@ mod tests {
                 .active_request
                 .is_none()
             {
-                return Ok(SessionReconciliation::NoActiveRequest);
+                return Ok(SessionReconciliation::Idle);
             }
             let Some(incoming) = binding else {
                 return Ok(SessionReconciliation::Unknown);

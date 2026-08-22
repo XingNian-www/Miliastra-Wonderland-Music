@@ -33,7 +33,6 @@ use crate::lyrics::{TimedLyrics, parse_lrc_pair};
 const SEARCH_URL: &str = "https://u.y.qq.com/cgi-bin/musicu.fcg";
 const PROVIDER: &str = "qqmusic";
 const RESOLVE_URL: &str = "https://u.y.qq.com/cgi-bin/musicu.fcg";
-const LOGIN_URL: &str = "https://u.y.qq.com/cgi-bin/musics.fcg";
 const WEB_REFRESH_URL: &str = "https://c.y.qq.com/base/fcgi-bin/login_get_musickey.fcg";
 const LYRICS_URL: &str = "https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg";
 const LYRICS_NATIVE_URL: &str = "https://u.y.qq.com/cgi-bin/musicu.fcg";
@@ -53,7 +52,6 @@ pub struct QqMusicAdapter {
     credentials: CredentialStore,
     search_url: Url,
     resolve_url: Url,
-    login_url: Url,
     lyrics_url: Url,
     native_lyrics_url: Url,
     device: QqDevice,
@@ -83,8 +81,6 @@ impl QqMusicAdapter {
                 .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?,
             resolve_url: Url::parse(RESOLVE_URL)
                 .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?,
-            login_url: Url::parse(LOGIN_URL)
-                .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?,
             lyrics_url: Url::parse(LYRICS_URL)
                 .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?,
             native_lyrics_url: Url::parse(LYRICS_NATIVE_URL)
@@ -105,7 +101,6 @@ impl QqMusicAdapter {
         let mut adapter = Self::new(credentials, timeout)?;
         adapter.search_url = search_url;
         adapter.resolve_url = resolve_url.clone();
-        adapter.login_url = resolve_url;
         Ok(adapter)
     }
 
@@ -384,15 +379,12 @@ impl QqMusicAdapter {
             &self.device,
             &qimei,
         );
-        let body = serde_json::to_string(&payload)
-            .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?;
         let response = self
             .client
-            .post(self.login_url.clone())
-            .query(&[("sign", qq_sign(&body))])
+            .post(self.search_url.clone())
             .header("Content-Type", "application/json")
             .header("User-Agent", "QQMusic")
-            .body(body)
+            .json(&payload)
             .send()
             .await
             .map_err(classify_request_error)?;
@@ -1453,115 +1445,6 @@ fn qq_refresh_payload(
     })
 }
 
-fn qq_sign(payload: &str) -> String {
-    const PART_1: [usize; 7] = [23, 14, 6, 36, 16, 7, 19];
-    const PART_2: [usize; 8] = [16, 1, 32, 12, 19, 27, 8, 5];
-    const SCRAMBLE: [u8; 20] = [
-        89, 39, 179, 150, 218, 82, 58, 252, 177, 52, 186, 123, 120, 64, 242, 133, 143, 161, 121,
-        179,
-    ];
-    let digest = sha1_digest(payload.as_bytes());
-    let hex = digest
-        .iter()
-        .flat_map(|byte| [hex_digit(byte >> 4), hex_digit(byte & 0x0f)])
-        .collect::<Vec<_>>();
-    let part_1 = PART_1
-        .iter()
-        .map(|index| hex[*index] as char)
-        .collect::<String>();
-    let part_2 = PART_2
-        .iter()
-        .map(|index| hex[*index] as char)
-        .collect::<String>();
-    let scrambled = SCRAMBLE
-        .iter()
-        .enumerate()
-        .map(|(index, value)| {
-            value
-                ^ u8::from_str_radix(&String::from_utf8_lossy(&hex[index * 2..index * 2 + 2]), 16)
-                    .unwrap_or_default()
-        })
-        .collect::<Vec<_>>();
-    let encoded = base64::engine::general_purpose::STANDARD
-        .encode(scrambled)
-        .replace(['\\', '/', '+', '='], "")
-        .to_lowercase();
-    format!("zzc{part_1}{encoded}{part_2}").to_lowercase()
-}
-
-fn hex_digit(value: u8) -> u8 {
-    match value {
-        0..=9 => b'0' + value,
-        _ => b'A' + value - 10,
-    }
-}
-
-fn sha1_digest(input: &[u8]) -> [u8; 20] {
-    let bit_length = (input.len() as u64).wrapping_mul(8);
-    let mut message = input.to_vec();
-    message.push(0x80);
-    while message.len() % 64 != 56 {
-        message.push(0);
-    }
-    message.extend_from_slice(&bit_length.to_be_bytes());
-
-    let mut state = [
-        0x67452301u32,
-        0xefcdab89,
-        0x98badcfe,
-        0x10325476,
-        0xc3d2e1f0,
-    ];
-    for chunk in message.chunks_exact(64) {
-        let mut words = [0u32; 80];
-        for (index, word) in words[..16].iter_mut().enumerate() {
-            let offset = index * 4;
-            *word = u32::from_be_bytes([
-                chunk[offset],
-                chunk[offset + 1],
-                chunk[offset + 2],
-                chunk[offset + 3],
-            ]);
-        }
-        for index in 16..80 {
-            words[index] =
-                (words[index - 3] ^ words[index - 8] ^ words[index - 14] ^ words[index - 16])
-                    .rotate_left(1);
-        }
-        let (mut a, mut b, mut c, mut d, mut e) =
-            (state[0], state[1], state[2], state[3], state[4]);
-        for (index, word) in words.iter().enumerate() {
-            let (function, constant) = match index {
-                0..=19 => ((b & c) | ((!b) & d), 0x5a827999),
-                20..=39 => (b ^ c ^ d, 0x6ed9eba1),
-                40..=59 => ((b & c) | (b & d) | (c & d), 0x8f1bbcdc),
-                _ => (b ^ c ^ d, 0xca62c1d6),
-            };
-            let temporary = a
-                .rotate_left(5)
-                .wrapping_add(function)
-                .wrapping_add(e)
-                .wrapping_add(constant)
-                .wrapping_add(*word);
-            e = d;
-            d = c;
-            c = b.rotate_left(30);
-            b = a;
-            a = temporary;
-        }
-        state[0] = state[0].wrapping_add(a);
-        state[1] = state[1].wrapping_add(b);
-        state[2] = state[2].wrapping_add(c);
-        state[3] = state[3].wrapping_add(d);
-        state[4] = state[4].wrapping_add(e);
-    }
-    let mut output = [0u8; 20];
-    for (index, value) in state.iter().enumerate() {
-        output[index * 4..index * 4 + 4].copy_from_slice(&value.to_be_bytes());
-    }
-    output
-}
-
 fn as_i64(value: &Value) -> Option<i64> {
     value.as_i64().or_else(|| value.as_str()?.parse().ok())
 }
@@ -2122,14 +2005,6 @@ mod tests {
         assert_eq!(
             qq_eligibility(&json!({"action":{"switch":14},"file":{"size_128mp3":1}})),
             PlaybackEligibility::Eligible
-        );
-    }
-
-    #[test]
-    fn qq_refresh_signature_matches_the_reference_protocol() {
-        assert_eq!(
-            super::qq_sign(r#"{"a":1,"b":"中文"}"#),
-            "zzc8b37edfxsyzq9obzkzbgwezihhqkstxalgecaff800"
         );
     }
 

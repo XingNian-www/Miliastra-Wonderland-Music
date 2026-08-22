@@ -19,9 +19,7 @@ use miliastra_playback::{
     CredentialStatus, LoginOperation, LoginOperationWaitError, LoginSession, PlaybackError,
     PlaybackHandle, ProviderCredential, ProviderId,
 };
-use reqwest::blocking::Client as BlockingHttpClient;
 use serde::Serialize;
-use url::Url;
 use uuid::Uuid;
 
 const REAPER_POLL: Duration = Duration::from_millis(25);
@@ -172,113 +170,24 @@ trait KugouDeviceRegistrar: Send + Sync {
     ) -> Result<String, LoginHelperFailure>;
 }
 
-struct HttpKugouDeviceRegistrar {
-    client: BlockingHttpClient,
-    api_base_url: Url,
-}
+struct DirectKugouDeviceRegistrar;
 
-impl HttpKugouDeviceRegistrar {
-    fn new(api_base_url: &str, timeout: Duration) -> Result<Self, String> {
-        let api_base_url = Url::parse(api_base_url).map_err(|error| error.to_string())?;
-        let client = BlockingHttpClient::builder()
-            .timeout(timeout)
-            .user_agent("Miliastra-Wonderland-Music/4.1")
-            .build()
-            .map_err(|error| error.to_string())?;
-        Ok(Self {
-            client,
-            api_base_url,
-        })
-    }
-}
-
-/// 注册器创建失败时的降级实现:酷狗登录直接返回失败,不 panic。
-struct UnavailableKugouDeviceRegistrar;
-
-impl KugouDeviceRegistrar for UnavailableKugouDeviceRegistrar {
+impl KugouDeviceRegistrar for DirectKugouDeviceRegistrar {
     fn register(
         &self,
         _token: &str,
         _userid: &str,
-        _cookies: &BTreeMap<String, String>,
-    ) -> Result<String, LoginHelperFailure> {
-        Err(manager_failure(
-            "kugou_device_registration_unavailable",
-            "酷狗设备注册器不可用",
-            Some(miliastra_playback::ProviderId::Kugou),
-        ))
-    }
-}
-
-impl KugouDeviceRegistrar for HttpKugouDeviceRegistrar {
-    fn register(
-        &self,
-        token: &str,
-        userid: &str,
         cookies: &BTreeMap<String, String>,
     ) -> Result<String, LoginHelperFailure> {
-        let url = self.api_base_url.join("register/dev").map_err(|_| {
-            manager_failure(
-                "kugou_device_registration_failed",
-                "酷狗设备注册失败",
-                Some(ProviderId::Kugou),
-            )
-        })?;
-        let mut cookie_pairs = cookies
-            .iter()
-            .map(|(name, value)| format!("{name}={value}"))
-            .collect::<Vec<_>>();
-        cookie_pairs.push(format!("token={token}"));
-        cookie_pairs.push(format!("userid={userid}"));
-        let response = self
-            .client
-            .post(url)
-            .query(&[("token", token), ("userid", userid)])
-            .header(reqwest::header::COOKIE, cookie_pairs.join("; "))
-            .send()
-            .map_err(|_| {
-                manager_failure(
-                    "kugou_device_registration_failed",
-                    "酷狗设备注册失败",
-                    Some(ProviderId::Kugou),
-                )
-            })?;
-        let value = response
-            .error_for_status()
-            .map_err(|_| {
-                manager_failure(
-                    "kugou_device_registration_failed",
-                    "酷狗设备注册失败",
-                    Some(ProviderId::Kugou),
-                )
-            })?
-            .json::<serde_json::Value>()
-            .map_err(|_| {
-                manager_failure(
-                    "kugou_device_registration_failed",
-                    "酷狗设备注册响应无效",
-                    Some(ProviderId::Kugou),
-                )
-            })?;
-        value
-            .get("data")
-            .and_then(|data| data.get("dfid"))
-            .and_then(serde_json::Value::as_str)
-            .filter(|dfid| !dfid.trim().is_empty())
-            .map(ToOwned::to_owned)
-            .ok_or_else(|| {
-                manager_failure(
-                    "kugou_device_registration_failed",
-                    "酷狗设备注册未返回 dfid",
-                    Some(ProviderId::Kugou),
-                )
-            })
+        if let Some(dfid) = cookies.get("dfid").filter(|dfid| !dfid.trim().is_empty()) {
+            return Ok(dfid.clone());
+        }
+        Ok("-".to_owned())
     }
 }
 
 struct CommandHelperLauncher {
     executable: PathBuf,
-    credential_directory: PathBuf,
 }
 
 impl HelperLauncher for CommandHelperLauncher {
@@ -300,13 +209,6 @@ impl HelperLauncher for CommandHelperLauncher {
             // 持续读取 stderr，避免 sidecar 因管道写满而阻塞。其内容可能含有
             // 二维码 URL 或认证参数，不能转发到主程序日志。
             .stderr(Stdio::piped());
-        // 酷狗概念版扫码登录必须使用与 sidecar 相同的设备标识，
-        // 否则扫码 token 绑定匿名设备，概念版 API 会拒绝（20018）。
-        if provider == ProviderId::Kugou
-            && let Some(guid) = load_kugou_device_guid(&self.credential_directory)
-        {
-            command.env("KUGOU_API_GUID", guid);
-        }
         let mut child = command.spawn()?;
         let stdout = child.stdout.take().ok_or_else(|| {
             io::Error::new(
@@ -326,17 +228,6 @@ impl HelperLauncher for CommandHelperLauncher {
             stderr: Box::new(stderr),
         })
     }
-}
-
-/// 读取酷狗设备标识文件中的 GUID（与 sidecar 共用同一设备）。
-fn load_kugou_device_guid(directory: &std::path::Path) -> Option<String> {
-    let path = directory.join("kugou-device.json");
-    let text = std::fs::read_to_string(path).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-    value
-        .get("guid")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned)
 }
 
 struct CommandChild {
@@ -477,24 +368,11 @@ impl LoginHelperManager {
         executable: PathBuf,
         credential_directory: PathBuf,
         timeout: Duration,
-        kugou_api_base_url: &str,
     ) -> Self {
-        // 注册器创建失败时降级为不可用注册器(酷狗登录不可用,但其他平台不受影响)。
-        let registrar: Arc<dyn KugouDeviceRegistrar> =
-            match HttpKugouDeviceRegistrar::new(kugou_api_base_url, timeout) {
-                Ok(registrar) => Arc::new(registrar),
-                Err(error) => {
-                    log::error!("创建酷狗设备注册器失败(酷狗登录将不可用): {error}");
-                    Arc::new(UnavailableKugouDeviceRegistrar)
-                }
-            };
         Self::new_with_dependencies(
             Arc::new(playback),
-            Arc::new(CommandHelperLauncher {
-                executable,
-                credential_directory: credential_directory.clone(),
-            }),
-            registrar,
+            Arc::new(CommandHelperLauncher { executable }),
+            Arc::new(DirectKugouDeviceRegistrar),
             credential_directory,
             timeout,
         )

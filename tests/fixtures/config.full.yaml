@@ -332,14 +332,8 @@ playback:
   credential_directory: data/credentials
   # 受控登录使用的短生命周期助手
   login_helper_executable: miliastra-login-helper.exe
-  # 内置酷狗概念版 API sidecar；默认不启用。
-  # 仅当程序目录下存在 kugou-api.exe 或 app_win.exe 时才自动启动，
-  # 否则使用下方 kugou_api_base_url（外部已运行 KuGouMusicApi 服务时仍可访问）。
-  kugou_api_executable: kugou-api.exe
   # 单次交互登录的最长时间，单位毫秒
   login_timeout_ms: 180000
-  # 酷狗 KuGouMusicApi 服务地址；文档站不是 API 服务
-  kugou_api_base_url: http://127.0.0.1:3000
   # 音频数据缓存（本地代理 + 磁盘缓存）：缺失或 enabled=false 时不启用。
   # 播放时音源先落本地缓存，重复播放与断网时直接从磁盘服务。
   audio_cache:

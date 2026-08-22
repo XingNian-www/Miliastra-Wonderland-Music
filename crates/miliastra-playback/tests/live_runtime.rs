@@ -7,6 +7,7 @@ use miliastra_playback::{
     EndCause, EngineState, PlayableTrack, PlaybackHandle, PlaybackRuntime, ProviderCredential,
     ProviderId, SearchQuery, TrackKey, TrackMetadata, TrackRef,
 };
+use sha2::{Digest, Sha256};
 
 const CREDENTIAL_DIRECTORY: &str = "MILIASTRA_CREDENTIAL_DIRECTORY";
 const SEARCH_KEYWORD: &str = "\u{828a}\u{828a}";
@@ -15,6 +16,7 @@ const BILIBILI_BVID: &str = "BV1us411d75p";
 struct LiveRuntime {
     runtime: Option<PlaybackRuntime>,
     credential_directory: PathBuf,
+    source_file_hashes: Vec<(PathBuf, [u8; 32])>,
 }
 
 impl LiveRuntime {
@@ -25,19 +27,53 @@ impl LiveRuntime {
                 panic!(
                     "set {CREDENTIAL_DIRECTORY} to a directory containing provider credential JSON files"
                 )
-            });
+        });
         let credential_directory = temporary_credential_directory();
+        fs::create_dir_all(&credential_directory).unwrap_or_else(|error| {
+            panic!(
+                "create temporary credential directory {}: {error}",
+                credential_directory.display()
+            )
+        });
+        let mut credentials = Vec::new();
+        let mut source_file_hashes = Vec::new();
+        for provider in providers.iter().copied() {
+            let path = source.join(format!("{}.json", provider.as_str()));
+            let bytes = fs::read(&path)
+                .unwrap_or_else(|error| panic!("read credential {}: {error}", path.display()));
+            source_file_hashes.push((path.clone(), sha256(&bytes)));
+            let value: serde_json::Value = serde_json::from_slice(&bytes)
+                .unwrap_or_else(|error| panic!("parse credential {}: {error}", path.display()));
+            let credential: ProviderCredential =
+                serde_json::from_value(value.get("credential").cloned().unwrap_or(value))
+                    .unwrap_or_else(|error| panic!("parse credential {}: {error}", path.display()));
+            assert_eq!(credential.provider(), provider.as_str());
+            credentials.push((provider, credential));
+
+            // Device identity must exist before adapter construction. Copy it
+            // into the disposable directory and never write to the source.
+            for file_name in provider_auxiliary_files(provider) {
+                let auxiliary_path = source.join(file_name);
+                if !auxiliary_path.exists() {
+                    continue;
+                }
+                let auxiliary_bytes = fs::read(&auxiliary_path).unwrap_or_else(|error| {
+                    panic!(
+                        "read auxiliary credential {}: {error}",
+                        auxiliary_path.display()
+                    )
+                });
+                source_file_hashes.push((auxiliary_path.clone(), sha256(&auxiliary_bytes)));
+                fs::write(credential_directory.join(file_name), auxiliary_bytes).unwrap_or_else(
+                    |error| panic!("copy auxiliary credential {file_name}: {error}"),
+                );
+            }
+        }
+
         let runtime =
             PlaybackRuntime::start(&credential_directory, None).expect("start playback runtime");
         let handle = runtime.handle();
-        for provider in providers.iter().copied() {
-            let path = source.join(format!("{}.json", provider.as_str()));
-            let credential: ProviderCredential = serde_json::from_slice(
-                &fs::read(&path)
-                    .unwrap_or_else(|error| panic!("read credential {}: {error}", path.display())),
-            )
-            .unwrap_or_else(|error| panic!("parse credential {}: {error}", path.display()));
-            assert_eq!(credential.provider(), provider.as_str());
+        for (provider, credential) in credentials {
             let status = handle
                 .save_credential(credential)
                 .unwrap_or_else(|error| panic!("save {} credential: {error}", provider.as_str()));
@@ -46,11 +82,26 @@ impl LiveRuntime {
         Self {
             runtime: Some(runtime),
             credential_directory,
+            source_file_hashes,
         }
     }
 
     fn handle(&self) -> PlaybackHandle {
         self.runtime.as_ref().expect("runtime exists").handle()
+    }
+
+    fn assert_source_files_unchanged(&self) {
+        for (path, expected_hash) in &self.source_file_hashes {
+            let bytes = fs::read(path).unwrap_or_else(|error| {
+                panic!("re-read source credential {}: {error}", path.display())
+            });
+            assert_eq!(
+                &sha256(&bytes),
+                expected_hash,
+                "live test modified source credential {}",
+                path.display()
+            );
+        }
     }
 }
 
@@ -59,8 +110,21 @@ impl Drop for LiveRuntime {
         if let Some(runtime) = self.runtime.take() {
             runtime.shutdown().expect("shutdown playback runtime");
         }
+        self.assert_source_files_unchanged();
         let _ = fs::remove_dir_all(&self.credential_directory);
     }
+}
+
+fn provider_auxiliary_files(provider: ProviderId) -> &'static [&'static str] {
+    match provider {
+        ProviderId::QqMusic => &["qqmusic-device.json"],
+        ProviderId::Kugou => &["kugou-device.json"],
+        ProviderId::Netease | ProviderId::Bilibili => &[],
+    }
+}
+
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
 }
 
 #[test]
@@ -88,6 +152,38 @@ fn live_search_reports_provider_candidates() {
             serde_json::to_string(&candidates).expect("serialize live search candidates")
         );
     }
+}
+
+#[test]
+#[ignore = "requires live QQ Music credentials and public network access"]
+fn live_qq_refresh_status_and_search() {
+    let runtime = LiveRuntime::start(&[ProviderId::QqMusic]);
+    let handle = runtime.handle();
+    let status = handle
+        .refresh_credential(ProviderId::QqMusic)
+        .expect("refresh QQ Music credential");
+    assert!(status.configured);
+    let account = handle
+        .refresh_account_status(ProviderId::QqMusic)
+        .expect("refresh QQ Music account status")
+        .expect("QQ Music account status");
+    assert!(account.logged_in);
+    let candidates = handle
+        .search(SearchQuery {
+            keyword: SEARCH_KEYWORD.to_owned(),
+            providers: vec![ProviderId::QqMusic],
+            limit: 5,
+        })
+        .expect("search QQ Music");
+    assert!(!candidates.is_empty(), "QQ Music returned no candidates");
+    println!(
+        "LIVE_QQ logged_in={} vip_known={} vip={} candidates={}",
+        account.logged_in,
+        account.vip_known,
+        account.vip,
+        candidates.len()
+    );
+    runtime.assert_source_files_unchanged();
 }
 
 #[test]

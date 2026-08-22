@@ -66,11 +66,25 @@ fn allowed_cookie_names(provider: &str) -> &'static [&'static str] {
             "psrf_qqrefresh_key",
             "refresh_key",
             "psrf_qqunionid",
+            "unionid",
         ],
         "netease" => &["MUSIC_U", "__csrf"],
         // 酷狗网页登录凭据集中在单个 KuGoo cookie（值形如
         // t=token&KugooID=userid&ct=...），其余为辅助标识 cookie。
-        "kugou" => &["KuGoo", "dfid", "KugouGUID", "kg_mid", "mid"],
+        "kugou" => &[
+            "KuGoo",
+            "dfid",
+            "KugouGUID",
+            "KUGOU_API_GUID",
+            "KUGOU_API_MID",
+            "KUGOU_API_MAC",
+            "KUGOU_API_DEV",
+            "kg_mid",
+            "mid",
+            "t1",
+            "vip_type",
+            "vip_token",
+        ],
         "bilibili" => &[
             "SESSDATA",
             "bili_jct",
@@ -92,16 +106,24 @@ fn allowed_cookie_names(provider: &str) -> &'static [&'static str] {
 fn has_required_cookies(provider: &str, cookies: &BTreeMap<String, String>) -> bool {
     match provider {
         "qqmusic" => {
-            (cookies.contains_key("uin") || cookies.contains_key("wxuin"))
-                && (cookies.contains_key("qqmusic_key") || cookies.contains_key("qm_keyst"))
+            has_any_nonempty(cookies, &["uin", "wxuin"])
+                && has_any_nonempty(cookies, &["qqmusic_key", "qm_keyst", "lqm_keyst"])
         }
-        "netease" => cookies.contains_key("MUSIC_U"),
-        "bilibili" => cookies.contains_key("SESSDATA"),
-        "kugou" => cookies
-            .get("KuGoo")
-            .is_some_and(|value| value.contains("t=") && value.contains("KugooID=")),
+        "netease" => has_any_nonempty(cookies, &["MUSIC_U"]),
+        "bilibili" => has_any_nonempty(cookies, &["SESSDATA"]),
+        "kugou" => cookies.get("KuGoo").is_some_and(|value| {
+            !value.is_empty() && value.contains("t=") && value.contains("KugooID=")
+        }),
         _ => false,
     }
+}
+
+fn has_any_nonempty(cookies: &BTreeMap<String, String>, aliases: &[&str]) -> bool {
+    aliases.iter().any(|alias| {
+        cookies
+            .get(*alias)
+            .is_some_and(|value| !value.trim().is_empty())
+    })
 }
 
 const COOKIE_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -114,13 +136,48 @@ const QQ_LOGIN_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(15);
 const QQ_WEB_REFRESH_URL: &str = "https://c.y.qq.com/base/fcgi-bin/login_get_musickey.fcg";
 
 fn has_qq_refresh_cookies(cookies: &BTreeMap<String, String>) -> bool {
-    let has_any = |aliases: &[&str]| aliases.iter().any(|name| cookies.contains_key(*name));
-    has_any(&["psrf_qqopenid", "openid"])
-        && has_any(&["psrf_qqaccess_token", "access_token"])
+    let web_ready = has_any_nonempty(cookies, &["wxopenid"])
+        && has_any_nonempty(cookies, &["wxrefresh_token"])
+        && has_any_nonempty(cookies, &["qqmusic_key", "qm_keyst", "lqm_keyst"])
+        && has_any_nonempty(cookies, &["uin", "wxuin"]);
+    if web_ready {
+        return true;
+    }
+    let wechat_key = qq_music_key_is_wechat(cookies);
+    has_any_nonempty(cookies, &["uin", "wxuin"])
+        && has_any_nonempty(cookies, &["qqmusic_key", "qm_keyst", "lqm_keyst"])
+        && has_any_nonempty(cookies, &["psrf_qqopenid", "openid"])
+        && (wechat_key || has_any_nonempty(cookies, &["psrf_qqaccess_token", "access_token"]))
         // QQ OAuth 网页登录通常只下发 refresh_token，不保证下发 refresh_key；
         // refresh_key 由移动端续期响应补发，任一存在即可视为可刷新。
-        && (has_any(&["psrf_qqrefresh_token", "refresh_token"])
-            || has_any(&["psrf_qqrefresh_key", "refresh_key"]))
+        && (has_any_nonempty(cookies, &["psrf_qqrefresh_token", "refresh_token"])
+            || has_any_nonempty(cookies, &["psrf_qqrefresh_key", "refresh_key"]))
+}
+
+fn qq_music_key_is_wechat(cookies: &BTreeMap<String, String>) -> bool {
+    ["qqmusic_key", "qm_keyst", "lqm_keyst"]
+        .iter()
+        .find_map(|name| cookies.get(*name).filter(|value| !value.trim().is_empty()))
+        .is_some_and(|value| {
+            value
+                .trim()
+                .as_bytes()
+                .get(..3)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"W_X"))
+        })
+}
+
+fn first_nonempty_qq_cookie<'a>(
+    cookies: &'a BTreeMap<String, String>,
+    aliases: &[&str],
+) -> Option<&'a str> {
+    aliases.iter().find_map(|alias| {
+        cookies
+            .get(*alias)
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    })
 }
 
 fn parse_qq_login_callback(raw_url: &str) -> Option<(String, String)> {
@@ -149,7 +206,13 @@ fn remember_qq_login_callback(callback: &mut Option<(String, String)>, raw_url: 
 fn qq_login_exchange_payload(login_type: &str, code: &str) -> Option<Value> {
     match login_type {
         "1" => Some(json!({
-            "comm": {"g_tk": 5381, "platform": "yqq", "ct": 24, "cv": 0},
+            "comm": {
+                "tmeLoginType": 2,
+                "g_tk": 5381,
+                "platform": "yqq",
+                "ct": 24,
+                "cv": 0
+            },
             "req": {
                 "module": "QQConnectLogin.LoginServer",
                 "method": "QQLogin",
@@ -159,7 +222,7 @@ fn qq_login_exchange_payload(login_type: &str, code: &str) -> Option<Value> {
         "2" => Some(json!({
             "comm": {
                 "tmeAppID": "qqmusic",
-                "tmeLoginType": "1",
+                "tmeLoginType": 1,
                 "g_tk": 5381,
                 "platform": "yqq",
                 "ct": 24,
@@ -183,44 +246,241 @@ fn qq_login_response_data(body: &Value) -> Option<&serde_json::Map<String, Value
             return Some(data);
         }
     }
-    None
+    body.as_object()?
+        .iter()
+        .find_map(|(key, value)| {
+            qq_login_envelope_key(key)
+                .then(|| value.get("data"))
+                .flatten()
+                .and_then(Value::as_object)
+        })
+        .or_else(|| body.get("data").and_then(Value::as_object))
 }
 
 fn qq_login_response_code(body: &Value) -> Option<String> {
     for key in ["req", "req_0", "req_1", "req1"] {
-        if let Some(code) = body.get(key).and_then(|value| value.get("code")) {
-            return Some(value_to_string(code));
+        if let Some(value) = body.get(key) {
+            for field in ["code", "ret", "retcode"] {
+                if let Some(code) = value.get(field) {
+                    return Some(value_to_string(code));
+                }
+            }
         }
     }
-    body.get("code").map(value_to_string)
+    if let Some(code) = body.as_object()?.iter().find_map(|(key, value)| {
+        qq_login_envelope_key(key)
+            .then(|| {
+                ["code", "ret", "retcode"]
+                    .iter()
+                    .find_map(|field| value.get(*field))
+            })
+            .flatten()
+    }) {
+        return Some(value_to_string(code));
+    }
+    ["code", "ret", "retcode"]
+        .iter()
+        .find_map(|field| {
+            body.get(*field)
+                .or_else(|| body.pointer(&format!("/data/{field}")))
+        })
+        .map(value_to_string)
+}
+
+fn qq_login_payload_data(body: &Value) -> Option<&serde_json::Map<String, Value>> {
+    qq_login_response_data(body).or_else(|| body.as_object())
+}
+
+fn qq_response_string(data: &serde_json::Map<String, Value>, fields: &[&str]) -> Option<String> {
+    fields.iter().find_map(|field| {
+        data.get(*field)
+            .map(value_to_string)
+            .filter(|value| !value.trim().is_empty())
+    })
+}
+
+fn merge_qq_response_alias(
+    fields: &mut BTreeMap<String, String>,
+    data: &serde_json::Map<String, Value>,
+    sources: &[&str],
+    aliases: &[&str],
+) {
+    let Some(value) = qq_response_string(data, sources) else {
+        return;
+    };
+    replace_qq_cookie_alias(fields, aliases, &value);
+}
+
+fn qq_login_envelope_key(key: &str) -> bool {
+    if matches!(key, "req" | "search") {
+        return true;
+    }
+    let suffix = key.strip_prefix("req_").or_else(|| key.strip_prefix("req"));
+    suffix.is_some_and(|suffix| {
+        !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+    })
 }
 
 fn value_to_string(value: &Value) -> String {
     value
         .as_str()
+        .map(str::trim)
         .map(str::to_owned)
         .or_else(|| value.as_i64().map(|value| value.to_string()))
         .or_else(|| value.as_u64().map(|value| value.to_string()))
         .unwrap_or_default()
 }
 
-fn merge_qq_login_response_fields(cookies: &mut BTreeMap<String, String>, body: &Value) {
-    let Some(data) = qq_login_response_data(body).or_else(|| body.as_object()) else {
+fn value_as_i64(value: &Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_str().and_then(|text| text.trim().parse().ok()))
+}
+
+fn replace_qq_cookie_alias(cookies: &mut BTreeMap<String, String>, aliases: &[&str], value: &str) {
+    if aliases.is_empty() || value.is_empty() {
         return;
-    };
-    for (source, target) in [
-        ("openid", "psrf_qqopenid"),
-        ("access_token", "psrf_qqaccess_token"),
-        ("refresh_token", "psrf_qqrefresh_token"),
-        ("refresh_key", "psrf_qqrefresh_key"),
-        ("musickey", "qqmusic_key"),
-        ("musicid", "uin"),
-    ] {
-        let value = data.get(source).map(value_to_string).unwrap_or_default();
-        if !value.is_empty() {
-            cookies.insert(target.to_owned(), value);
+    }
+    let existing = aliases
+        .iter()
+        .copied()
+        .filter(|alias| cookies.contains_key(*alias))
+        .collect::<Vec<_>>();
+    if existing.is_empty() {
+        cookies.insert(aliases[0].to_owned(), value.to_owned());
+    } else {
+        for alias in existing {
+            cookies.insert(alias.to_owned(), value.to_owned());
         }
     }
+}
+
+fn normalize_qq_cookie_aliases(cookies: &mut BTreeMap<String, String>) {
+    for aliases in [
+        ["qqmusic_key", "qm_keyst", "lqm_keyst"].as_slice(),
+        ["uin", "wxuin"].as_slice(),
+        ["wxopenid", "psrf_qqopenid", "openid"].as_slice(),
+        ["wxaccess_token", "psrf_qqaccess_token", "access_token"].as_slice(),
+        ["wxrefresh_token", "psrf_qqrefresh_token", "refresh_token"].as_slice(),
+        ["psrf_qqrefresh_key", "refresh_key"].as_slice(),
+        ["wxunionid", "psrf_qqunionid", "unionid"].as_slice(),
+    ] {
+        let Some(value) = aliases.iter().find_map(|alias| {
+            cookies
+                .get(*alias)
+                .map(String::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        }) else {
+            continue;
+        };
+        replace_qq_cookie_alias(cookies, aliases, &value);
+    }
+}
+
+fn merge_qq_cookie_updates(
+    cookies: &mut BTreeMap<String, String>,
+    updates: &BTreeMap<String, String>,
+) {
+    cookies.extend(
+        updates
+            .iter()
+            .filter(|(_, value)| !value.trim().is_empty())
+            .map(|(name, value)| (name.clone(), value.clone())),
+    );
+    for aliases in [
+        ["qqmusic_key", "qm_keyst", "lqm_keyst"].as_slice(),
+        ["uin", "wxuin"].as_slice(),
+        ["wxopenid", "psrf_qqopenid", "openid"].as_slice(),
+        ["wxaccess_token", "psrf_qqaccess_token", "access_token"].as_slice(),
+        ["wxrefresh_token", "psrf_qqrefresh_token", "refresh_token"].as_slice(),
+        ["psrf_qqrefresh_key", "refresh_key"].as_slice(),
+        ["wxunionid", "psrf_qqunionid", "unionid"].as_slice(),
+    ] {
+        let Some(value) = aliases.iter().find_map(|alias| {
+            updates
+                .get(*alias)
+                .filter(|value| !value.trim().is_empty())
+                .cloned()
+        }) else {
+            continue;
+        };
+        replace_qq_cookie_alias(cookies, aliases, &value);
+    }
+}
+
+fn merge_qq_login_response_fields(cookies: &mut BTreeMap<String, String>, body: &Value) {
+    let Some(data) = qq_login_payload_data(body) else {
+        return;
+    };
+    merge_qq_response_alias(
+        cookies,
+        data,
+        &["openid"],
+        &["psrf_qqopenid", "openid", "wxopenid"],
+    );
+    merge_qq_response_alias(
+        cookies,
+        data,
+        &["wxopenid"],
+        &["wxopenid", "psrf_qqopenid", "openid"],
+    );
+    merge_qq_response_alias(
+        cookies,
+        data,
+        &["access_token"],
+        &["psrf_qqaccess_token", "access_token", "wxaccess_token"],
+    );
+    merge_qq_response_alias(
+        cookies,
+        data,
+        &["wxaccess_token"],
+        &["wxaccess_token", "psrf_qqaccess_token", "access_token"],
+    );
+    merge_qq_response_alias(
+        cookies,
+        data,
+        &["refresh_token"],
+        &["psrf_qqrefresh_token", "refresh_token", "wxrefresh_token"],
+    );
+    merge_qq_response_alias(
+        cookies,
+        data,
+        &["wxrefresh_token"],
+        &["wxrefresh_token", "psrf_qqrefresh_token", "refresh_token"],
+    );
+    merge_qq_response_alias(
+        cookies,
+        data,
+        &["refresh_key"],
+        &["psrf_qqrefresh_key", "refresh_key"],
+    );
+    merge_qq_response_alias(
+        cookies,
+        data,
+        &["musickey", "qqmusic_key", "qm_keyst", "lqm_keyst"],
+        &["qqmusic_key", "qm_keyst", "lqm_keyst"],
+    );
+    merge_qq_response_alias(
+        cookies,
+        data,
+        &["musicid", "str_musicid"],
+        &["uin", "wxuin"],
+    );
+    merge_qq_response_alias(
+        cookies,
+        data,
+        &["unionid"],
+        &["psrf_qqunionid", "unionid", "wxunionid"],
+    );
+    merge_qq_response_alias(
+        cookies,
+        data,
+        &["wxunionid"],
+        &["wxunionid", "psrf_qqunionid", "unionid"],
+    );
+    normalize_qq_cookie_aliases(cookies);
 }
 
 fn merge_qq_set_cookie_headers(
@@ -261,17 +521,104 @@ fn finish_qq_login_exchange<F>(
 where
     F: FnOnce(&BTreeMap<String, String>) -> Result<BTreeMap<String, String>, String>,
 {
+    let mut callback_error = callback_error;
     // 微信网页登录的授权码交换可能已经被页面消费；此时仍可用浏览器会话
-    // 刷新出凭据。因此必须在报告 callback 错误之前尝试该兜底路径。
+    // 刷新出凭据。交换成功且已经返回 access token 时不再额外消耗一次
+    // refresh token；只有失败或缺少 token 时才走会话兜底。
+    let callback_has_access_token = ["wxaccess_token", "psrf_qqaccess_token", "access_token"]
+        .iter()
+        .any(|name| {
+            fields
+                .get(*name)
+                .is_some_and(|value| !value.trim().is_empty())
+        });
+    let callback_has_music_key = ["qqmusic_key", "qm_keyst", "lqm_keyst"].iter().any(|name| {
+        fields
+            .get(*name)
+            .is_some_and(|value| !value.trim().is_empty())
+    });
+    let callback_has_uin = ["uin", "wxuin"].iter().any(|name| {
+        fields
+            .get(*name)
+            .is_some_and(|value| !value.trim().is_empty())
+    });
+    let callback_has_openid = ["wxopenid", "psrf_qqopenid", "openid"].iter().any(|name| {
+        fields
+            .get(*name)
+            .is_some_and(|value| !value.trim().is_empty())
+    });
+    let callback_has_refresh_material = [
+        "wxrefresh_token",
+        "psrf_qqrefresh_token",
+        "refresh_token",
+        "psrf_qqrefresh_key",
+        "refresh_key",
+    ]
+    .iter()
+    .any(|name| {
+        fields
+            .get(*name)
+            .is_some_and(|value| !value.trim().is_empty())
+    });
     if login_type == "2"
+        && (callback_error.is_some()
+            || !callback_has_access_token
+            || !callback_has_music_key
+            || !callback_has_uin
+            || !callback_has_openid
+            || !callback_has_refresh_material)
         && let Ok(web_fields) = refresh_web_session(cookies)
     {
+        // A partial callback can contain a new token while the WebView still
+        // holds the old key/openid tuple.  Once the browser-session refresh
+        // succeeds, its fields are the coherent credential set.  Remove every
+        // callback alias from the same credential groups before applying the
+        // web result; otherwise a stale `psrf_*` value can survive beside a
+        // fresh `wx*` value and the next refresh may combine two sessions.
+        for alias in [
+            "wxopenid",
+            "psrf_qqopenid",
+            "openid",
+            "wxaccess_token",
+            "psrf_qqaccess_token",
+            "access_token",
+            "wxrefresh_token",
+            "psrf_qqrefresh_token",
+            "refresh_token",
+            "wxrefresh_key",
+            "psrf_qqrefresh_key",
+            "refresh_key",
+            "wxunionid",
+            "psrf_qqunionid",
+            "unionid",
+            "qqmusic_key",
+            "qm_keyst",
+            "lqm_keyst",
+            "uin",
+            "wxuin",
+        ] {
+            fields.remove(alias);
+        }
         fields.extend(web_fields);
+        normalize_qq_cookie_aliases(&mut fields);
+        callback_error = None;
     }
-    if fields.is_empty()
-        && let Some(error) = callback_error
-    {
-        return Err(error);
+    if let Some(error) = callback_error.take() {
+        // A failed OAuth exchange may still return a few fields.  Never merge
+        // those untrusted partial values with the browser session: doing so
+        // can persist a half credential that fails only after a restart.  The
+        // browser cookie snapshot is the trusted fallback for a basic login;
+        // the next poll can still capture refresh material that arrives late.
+        if !has_required_cookies("qqmusic", cookies) {
+            return Err(error);
+        }
+        fields.clear();
+    }
+    if !fields.is_empty() {
+        // Preserve the WebView flow marker for account-status presentation.
+        // The refresh API's numeric `tmeLoginType` is a different contract
+        // marker and must not be inferred from this field later.
+        fields.insert("login_type".to_owned(), login_type.to_owned());
     }
     Ok(fields)
 }
@@ -323,9 +670,13 @@ fn exchange_qq_login_code(
                 "[qqmusic-oauth] 交换响应 data 字段: {data_keys}; 已合并字段: {}",
                 fields.keys().cloned().collect::<Vec<_>>().join(",")
             );
-            qq_login_response_code(&response)
-                .filter(|code| code != "0" && !code.is_empty())
-                .map(|code| format!("QQ Music web login returned code {code}"))
+            match qq_login_response_code(&response) {
+                Some(code) if code == "0" => None,
+                Some(code) if !code.is_empty() => {
+                    Some(format!("QQ Music web login returned code {code}"))
+                }
+                _ => Some("QQ Music web login response has no business code".to_owned()),
+            }
         }
         Err(error) => Some(error),
     };
@@ -341,7 +692,10 @@ fn exchange_qq_login_code(
         // 往往不返回（由移动端续期接口补发）。字段缺失时保留已合并部分并记录诊断。
         let missing = [
             ("uin", ["uin"].as_slice()),
-            ("musicKey", ["qqmusic_key", "qm_keyst"].as_slice()),
+            (
+                "musicKey",
+                ["qqmusic_key", "qm_keyst", "lqm_keyst"].as_slice(),
+            ),
             ("openId", ["psrf_qqopenid", "openid"].as_slice()),
             (
                 "accessToken",
@@ -376,25 +730,18 @@ fn exchange_qq_login_code(
 fn refresh_qq_web_session(
     cookies: &BTreeMap<String, String>,
 ) -> Result<BTreeMap<String, String>, String> {
-    let Some(open_id) = cookies.get("wxopenid").filter(|value| !value.is_empty()) else {
+    let Some(open_id) = first_nonempty_qq_cookie(cookies, &["wxopenid"]) else {
         return Err("QQ web session has no wxopenid".to_owned());
     };
-    let Some(refresh_token) = cookies
-        .get("wxrefresh_token")
-        .filter(|value| !value.is_empty())
-    else {
+    let Some(refresh_token) = first_nonempty_qq_cookie(cookies, &["wxrefresh_token"]) else {
         return Err("QQ web session has no wxrefresh_token".to_owned());
     };
-    let Some(music_key) = cookies
-        .get("qqmusic_key")
-        .or_else(|| cookies.get("qm_keyst"))
-        .filter(|value| !value.is_empty())
+    let Some(music_key) =
+        first_nonempty_qq_cookie(cookies, &["qqmusic_key", "qm_keyst", "lqm_keyst"])
     else {
         return Err("QQ web session has no music key".to_owned());
     };
-    let Some(music_uin) = cookies
-        .get("wxuin")
-        .or_else(|| cookies.get("uin"))
+    let Some(music_uin) = first_nonempty_qq_cookie(cookies, &["wxuin", "uin"])
         .map(|value| value.trim_start_matches('o'))
         .filter(|value| !value.is_empty())
     else {
@@ -420,8 +767,8 @@ fn refresh_qq_web_session(
         .enable_all()
         .build()
         .map_err(|error| error.to_string())?;
-    let response = runtime.block_on(async move {
-        reqwest::Client::builder()
+    let (response_headers, response) = runtime.block_on(async move {
+        let response = reqwest::Client::builder()
             .timeout(QQ_LOGIN_EXCHANGE_TIMEOUT)
             .user_agent("QQMusic")
             .build()
@@ -433,27 +780,55 @@ fn refresh_qq_web_session(
             .await
             .map_err(|error| error.to_string())?
             .error_for_status()
-            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        let headers = response.headers().clone();
+        let body = response
             .json::<Value>()
             .await
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        Ok::<_, String>((headers, body))
     })?;
-    if value_to_string(response.get("code").unwrap_or(&Value::Null)) != "0" {
+    let code = qq_login_response_code(&response).unwrap_or_default();
+    if code != "0" {
         return Err("QQ web session refresh was rejected".to_owned());
     }
     let mut fields = BTreeMap::new();
-    for (source, target) in [
-        ("wxaccess_token", "wxaccess_token"),
-        ("musickey", "qqmusic_key"),
-        ("musicuin", "wxuin"),
-    ] {
-        if let Some(value) = response.get(source).map(value_to_string)
-            && !value.is_empty()
-        {
-            fields.insert(target.to_owned(), value);
-        }
-    }
-    if fields.contains_key("wxaccess_token") {
+    merge_qq_set_cookie_headers(&mut fields, &response_headers);
+    let Some(data) = qq_login_payload_data(&response) else {
+        return Err("QQ web session refresh returned no data".to_owned());
+    };
+    merge_qq_response_alias(
+        &mut fields,
+        data,
+        &["wxaccess_token", "access_token"],
+        &["wxaccess_token"],
+    );
+    merge_qq_response_alias(
+        &mut fields,
+        data,
+        &["musickey", "qqmusic_key", "qm_keyst", "lqm_keyst"],
+        &["qqmusic_key", "qm_keyst", "lqm_keyst"],
+    );
+    merge_qq_response_alias(
+        &mut fields,
+        data,
+        &["musicuin", "musicid", "str_musicid"],
+        &["wxuin", "uin"],
+    );
+    merge_qq_response_alias(
+        &mut fields,
+        data,
+        &["wxrefresh_token", "refresh_token"],
+        &["wxrefresh_token"],
+    );
+    merge_qq_response_alias(&mut fields, data, &["wxopenid", "openid"], &["wxopenid"]);
+    merge_qq_response_alias(&mut fields, data, &["wxunionid", "unionid"], &["wxunionid"]);
+    normalize_qq_cookie_aliases(&mut fields);
+    if let Some(access_token) = ["wxaccess_token", "psrf_qqaccess_token", "access_token"]
+        .iter()
+        .find_map(|name| fields.get(*name).filter(|value| !value.trim().is_empty()))
+    {
+        fields.insert("wxaccess_token".to_owned(), access_token.to_owned());
         Ok(fields)
     } else {
         Err("QQ web session refresh returned no access token".to_owned())
@@ -473,9 +848,28 @@ const KUGOU_QR_CHECK_URL: &str = "https://login-user.kugou.com/v2/get_userinfo_q
 const KUGOU_QR_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const KUGOU_QR_POLL_ATTEMPTS: u32 = 90;
 const KUGOU_UA: &str = "Android15-1070-11083-46-0-DiscoveryDRADProtocol-wifi";
+const KUGOU_KG_RFC: &str = "B9EDA08A64250DEFFBCADDEE00F8F25F";
 
 /// 酷狗扫码轮询结果：`Ok(Some((token, userid, cookies)))` 表示登录成功。
-type KugouQrPollResult = Result<Option<(String, String, BTreeMap<String, String>)>, String>;
+type KugouQrPollResult =
+    Result<Option<(String, String, BTreeMap<String, String>)>, KugouQrPollError>;
+
+#[derive(Debug, PartialEq, Eq)]
+enum KugouQrPollError {
+    /// 请求层故障可以短暂重试；不保留原始错误，避免意外传播签名参数或二维码 key。
+    Transient,
+    /// 二维码状态或响应结构已经明确失败，重试不会恢复。
+    Terminal(String),
+}
+
+impl KugouQrPollError {
+    fn into_user_message(self) -> String {
+        match self {
+            Self::Transient => "酷狗二维码接口请求失败，请重试".to_owned(),
+            Self::Terminal(message) => message,
+        }
+    }
+}
 
 /// 酷狗 web 版签名：md5(盐值 + 参数按 key 排序后的 k=v 拼接 + 盐值)。
 fn kugou_web_signature(params: &BTreeMap<String, String>) -> String {
@@ -494,6 +888,7 @@ fn kugou_web_signature(params: &BTreeMap<String, String>) -> String {
 
 /// 计算酷狗设备 MID：md5(GUID) 的 hex 视为 128 位无符号大整数，转十进制。
 fn kugou_calculate_mid(guid: &str) -> String {
+    let guid = kugou_normalize_guid(guid);
     let mut hasher = Md5::new();
     hasher.update(guid.as_bytes());
     let hex = format!("{:x}", hasher.finalize());
@@ -502,14 +897,39 @@ fn kugou_calculate_mid(guid: &str) -> String {
         .unwrap_or_else(|_| "-".to_owned())
 }
 
+fn kugou_normalize_guid(guid: &str) -> String {
+    let guid = guid.trim();
+    let bytes = guid.as_bytes();
+    let is_uuid_v4 = bytes.len() == 36
+        && bytes[8] == b'-'
+        && bytes[13] == b'-'
+        && bytes[18] == b'-'
+        && bytes[23] == b'-'
+        && bytes[14].eq_ignore_ascii_case(&b'4')
+        && matches!(bytes[19].to_ascii_lowercase(), b'8' | b'9' | b'a' | b'b')
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| matches!(index, 8 | 13 | 18 | 23) || byte.is_ascii_hexdigit());
+    if is_uuid_v4 {
+        let mut hasher = Md5::new();
+        hasher.update(guid.as_bytes());
+        format!("{:x}", hasher.finalize())
+    } else {
+        guid.to_owned()
+    }
+}
+
 /// 扫码登录请求的默认参数。mid 必须与 sidecar 设备一致
 /// （主程序通过 KUGOU_API_GUID 环境变量传入），否则扫码 token
 /// 绑定匿名设备，概念版 API 会拒绝（error_code 20018）。
 fn kugou_default_params() -> BTreeMap<String, String> {
-    let mid = std::env::var("KUGOU_API_GUID")
-        .ok()
-        .map(|guid| kugou_calculate_mid(&guid))
-        .unwrap_or_else(|| "-".to_owned());
+    let mid = std::env::var("KUGOU_API_MID").unwrap_or_else(|_| {
+        std::env::var("KUGOU_API_GUID")
+            .ok()
+            .map(|guid| kugou_calculate_mid(&guid))
+            .unwrap_or_else(|| "-".to_owned())
+    });
     BTreeMap::from([
         ("dfid".to_owned(), "-".to_owned()),
         ("mid".to_owned(), mid),
@@ -551,8 +971,27 @@ fn kugou_web_get_with_cookies(
         .get(url)
         .query(&signed)
         .header("User-Agent", KUGOU_UA)
+        // Keep the login request headers aligned with the shared KuGou
+        // request layer; the QR endpoints also use these device headers for
+        // risk control even though their signature is the web variant.
+        .header(
+            "dfid",
+            params.get("dfid").map(String::as_str).unwrap_or("-"),
+        )
+        .header(
+            "clienttime",
+            params.get("clienttime").map(String::as_str).unwrap_or("0"),
+        )
+        .header("mid", params.get("mid").map(String::as_str).unwrap_or("-"))
+        .header("kg-rc", "1")
+        .header("kg-thash", "5d816a0")
+        .header("kg-rec", "1")
+        .header("kg-rf", KUGOU_KG_RFC)
         .send()
         .map_err(|error| format!("酷狗登录接口请求失败: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!("酷狗登录接口返回 HTTP {}", response.status()));
+    }
     let mut cookies = BTreeMap::new();
     for set_cookie in response.headers().get_all(reqwest::header::SET_COOKIE) {
         if let Ok(header) = set_cookie.to_str()
@@ -568,6 +1007,17 @@ fn kugou_web_get_with_cookies(
     let value = response
         .json::<serde_json::Value>()
         .map_err(|error| format!("酷狗登录接口响应无效: {error}"))?;
+    if value
+        .get("status")
+        .and_then(serde_json::Value::as_i64)
+        .is_some_and(|status| status == 0)
+        || value
+            .get("error_code")
+            .and_then(serde_json::Value::as_i64)
+            .is_some_and(|code| code != 0)
+    {
+        return Err("酷狗登录接口拒绝了请求".to_owned());
+    }
     Ok((value, cookies))
 }
 
@@ -579,7 +1029,7 @@ fn kugou_qr_key() -> Result<(String, String), String> {
     params.insert("plat".to_owned(), "4".to_owned());
     params.insert(
         "qrcode_txt".to_owned(),
-        "https://h5.kugou.com/apps/loginQRCode/html/index.html?appid=1001&".to_owned(),
+        format!("https://h5.kugou.com/apps/loginQRCode/html/index.html?appid={KUGOU_LITE_APPID}&"),
     );
     params.insert("srcappid".to_owned(), KUGOU_SRCAPPID.to_string());
     let value = kugou_web_get(KUGOU_QR_KEY_URL, &params)?;
@@ -611,64 +1061,108 @@ fn kugou_qr_page(image: &str) -> String {
     )
 }
 
-/// 轮询扫码状态。`Ok(Some((token, userid, cookies)))` 表示登录成功，
-/// cookies 为官方 Set-Cookie 下发的续期字段（t1 等）。
+fn parse_kugou_qr_poll_response(
+    value: &Value,
+    set_cookies: BTreeMap<String, String>,
+) -> KugouQrPollResult {
+    let status = value
+        .pointer("/data/status")
+        .and_then(value_as_i64)
+        .ok_or_else(|| {
+            KugouQrPollError::Terminal("酷狗二维码状态响应缺少有效 status".to_owned())
+        })?;
+    match status {
+        4 => {
+            let token = value
+                .pointer("/data/token")
+                .map(value_to_string)
+                .filter(|token| !token.is_empty())
+                .ok_or_else(|| KugouQrPollError::Terminal("酷狗扫码登录未返回 token".to_owned()))?;
+            // userid 可能是数字或字符串。
+            let userid = value
+                .pointer("/data/userid")
+                .map(value_to_string)
+                .filter(|userid| !userid.is_empty())
+                .ok_or_else(|| {
+                    KugouQrPollError::Terminal("酷狗扫码登录未返回 userid".to_owned())
+                })?;
+            Ok(Some((token, userid, set_cookies)))
+        }
+        0 => Err(KugouQrPollError::Terminal(
+            "酷狗二维码已过期，请重新登录".to_owned(),
+        )),
+        1 | 2 => Ok(None),
+        _ => Err(KugouQrPollError::Terminal(format!(
+            "酷狗二维码接口返回未知状态 {status}"
+        ))),
+    }
+}
+
+/// 轮询扫码状态。cookies 为官方 Set-Cookie 下发的续期字段（t1 等）。
 fn kugou_qr_poll(key: &str) -> KugouQrPollResult {
     let mut params = kugou_default_params();
     params.insert("plat".to_owned(), "4".to_owned());
     params.insert("srcappid".to_owned(), KUGOU_SRCAPPID.to_string());
     params.insert("qrcode".to_owned(), key.to_owned());
-    let (value, set_cookies) = kugou_web_get_with_cookies(KUGOU_QR_CHECK_URL, &params)?;
-    let status = value
-        .pointer("/data/status")
-        .and_then(serde_json::Value::as_i64)
-        .unwrap_or(0);
-    match status {
-        4 => {
-            let token = value
-                .pointer("/data/token")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| "酷狗扫码登录未返回 token".to_owned())?;
-            // userid 可能是数字或字符串。
-            let userid = value
-                .pointer("/data/userid")
-                .and_then(|value| {
-                    value
-                        .as_str()
-                        .map(str::to_owned)
-                        .or_else(|| value.as_i64().map(|id| id.to_string()))
-                })
-                .ok_or_else(|| "酷狗扫码登录未返回 userid".to_owned())?;
-            Ok(Some((token.to_owned(), userid, set_cookies)))
-        }
-        0 => Err("酷狗二维码已过期，请重新登录".to_owned()),
-        _ => Ok(None),
-    }
+    params.insert(
+        "dev".to_owned(),
+        std::env::var("KUGOU_API_DEV")
+            .map(|value| value.trim().to_ascii_uppercase())
+            .unwrap_or_else(|_| "-".to_owned()),
+    );
+    let (value, set_cookies) = kugou_web_get_with_cookies(KUGOU_QR_CHECK_URL, &params)
+        .map_err(|_| KugouQrPollError::Transient)?;
+    parse_kugou_qr_poll_response(&value, set_cookies)
 }
 
 /// 后台轮询线程：直到登录成功、连续失败或超时。
 /// 酷狗登录接口偶发连接重置，网络类错误连续出现多次才放弃。
-fn kugou_qr_poll_loop(key: &str, sender: std::sync::mpsc::Sender<KugouQrPollResult>) {
+fn kugou_qr_poll_loop(
+    key: &str,
+    sender: std::sync::mpsc::Sender<KugouQrPollResult>,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
     let mut consecutive_errors = 0;
     for _ in 0..KUGOU_QR_POLL_ATTEMPTS {
+        if cancel.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
         match kugou_qr_poll(key) {
             Ok(Some(triple)) => {
                 let _ = sender.send(Ok(Some(triple)));
                 return;
             }
             Ok(None) => consecutive_errors = 0,
-            Err(error) => {
-                eprintln!("[kugou-qr] poll error: {error:#}");
+            Err(KugouQrPollError::Transient) => {
+                // Do not echo the provider's raw error: it may contain the
+                // signed query, qrcode key, or a full request URL.
+                eprintln!(
+                    "[kugou-qr] poll attempt failed (consecutive={})",
+                    consecutive_errors + 1
+                );
                 consecutive_errors += 1;
                 if consecutive_errors >= 3 {
-                    let _ = sender.send(Err(error));
+                    let _ = sender.send(Err(KugouQrPollError::Terminal(
+                        "酷狗二维码接口连续失败，请重试".to_owned(),
+                    )));
                     return;
                 }
             }
+            Err(error @ KugouQrPollError::Terminal(_)) => {
+                let _ = sender.send(Err(error));
+                return;
+            }
+        }
+        if cancel.load(std::sync::atomic::Ordering::Acquire) {
+            return;
         }
         thread::sleep(KUGOU_QR_POLL_INTERVAL);
     }
-    let _ = sender.send(Err("酷狗扫码等待超时".to_owned()));
+    if !cancel.load(std::sync::atomic::Ordering::Acquire) {
+        let _ = sender.send(Err(KugouQrPollError::Terminal(
+            "酷狗扫码等待超时".to_owned(),
+        )));
+    }
 }
 
 /// QQ 与 B 站的刷新 cookie 在基础登录 cookie 之后写入。保持短暂轮询，
@@ -697,7 +1191,82 @@ fn should_complete_capture(
 
 #[cfg(test)]
 mod kugou_qr_tests {
-    use super::{kugou_qr_key, kugou_qr_poll};
+    use std::collections::BTreeMap;
+
+    use super::{
+        KugouQrPollError, kugou_qr_key, kugou_qr_poll, kugou_web_signature,
+        parse_kugou_qr_poll_response, value_as_i64,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn kugou_qr_signature_matches_upstream_web_vector() {
+        let params = BTreeMap::from([
+            ("dfid".to_owned(), "-".to_owned()),
+            ("mid".to_owned(), "123456789".to_owned()),
+            ("uuid".to_owned(), "-".to_owned()),
+            ("appid".to_owned(), "1001".to_owned()),
+            ("clientver".to_owned(), "11440".to_owned()),
+            ("clienttime".to_owned(), "1700000000".to_owned()),
+            ("type".to_owned(), "1".to_owned()),
+            ("plat".to_owned(), "4".to_owned()),
+            (
+                "qrcode_txt".to_owned(),
+                "https://h5.kugou.com/apps/loginQRCode/html/index.html?appid=3116&".to_owned(),
+            ),
+            ("srcappid".to_owned(), "2919".to_owned()),
+        ]);
+        assert_eq!(
+            kugou_web_signature(&params),
+            "da09e77f63350c605f82f9009eb5c827"
+        );
+    }
+
+    #[test]
+    fn kugou_qr_status_accepts_numeric_and_string_wire_values() {
+        assert_eq!(value_as_i64(&json!(4)), Some(4));
+        assert_eq!(value_as_i64(&json!("4")), Some(4));
+        assert_eq!(value_as_i64(&json!(" malformed ")), None);
+    }
+
+    #[test]
+    fn kugou_qr_statuses_distinguish_waiting_success_and_terminal_failures() {
+        for status in [json!(1), json!("2")] {
+            assert_eq!(
+                parse_kugou_qr_poll_response(&json!({"data": {"status": status}}), BTreeMap::new(),),
+                Ok(None)
+            );
+        }
+
+        let success = parse_kugou_qr_poll_response(
+            &json!({"data": {"status": 4, "token": "token", "userid": 42}}),
+            BTreeMap::from([("t1".to_owned(), "refresh".to_owned())]),
+        )
+        .expect("status 4 should succeed")
+        .expect("status 4 should include credentials");
+        assert_eq!(success.0, "token");
+        assert_eq!(success.1, "42");
+        assert_eq!(success.2.get("t1").map(String::as_str), Some("refresh"));
+
+        assert!(matches!(
+            parse_kugou_qr_poll_response(
+                &json!({"data": {"status": 0}}),
+                BTreeMap::new(),
+            ),
+            Err(KugouQrPollError::Terminal(message)) if message.contains("过期")
+        ));
+        assert!(matches!(
+            parse_kugou_qr_poll_response(
+                &json!({"data": {"status": 3}}),
+                BTreeMap::new(),
+            ),
+            Err(KugouQrPollError::Terminal(message)) if message.contains("未知状态 3")
+        ));
+        assert!(matches!(
+            parse_kugou_qr_poll_response(&json!({"data": {}}), BTreeMap::new()),
+            Err(KugouQrPollError::Terminal(message)) if message.contains("status")
+        ));
+    }
 
     #[test]
     #[ignore = "需要公网访问酷狗登录接口"]
@@ -831,6 +1400,7 @@ mod platform {
         js_probe_inflight: bool,
         bilibili_js_probe_attempts: u32,
         kugou_qr_rx: Option<mpsc::Receiver<KugouQrPollResult>>,
+        kugou_qr_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     }
 
     struct CaptureContext {
@@ -839,6 +1409,16 @@ mod platform {
         html: Option<Vec<u16>>,
         hwnd: HWND,
         state: Mutex<CaptureState>,
+    }
+
+    impl Drop for CaptureContext {
+        fn drop(&mut self) {
+            if let Ok(state) = self.state.lock()
+                && let Some(cancel) = state.kugou_qr_cancel.as_ref()
+            {
+                cancel.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
     }
 
     impl CaptureContext {
@@ -1034,16 +1614,33 @@ mod platform {
                 };
                 match receiver.try_recv() {
                     Ok(result) => Some(result),
-                    Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => None,
+                    Err(mpsc::TryRecvError::Empty) => None,
+                    Err(mpsc::TryRecvError::Disconnected) => Some(Err(
+                        super::KugouQrPollError::Terminal("酷狗二维码轮询线程已断开".to_owned()),
+                    )),
                 }
             };
             match result {
                 Some(Ok(Some((token, userid, set_cookies)))) => {
                     let mut cookies = BTreeMap::new();
                     cookies.insert("KuGoo".to_owned(), format!("t={token}&KugooID={userid}"));
-                    // 保留官方下发的续期字段（t1 等），概念版刷新接口依赖它们。
+                    // 保留官方下发的设备/续期字段；播放请求需要与登录时相同的
+                    // mid/dfid，token 刷新还依赖 t1 和 lite 设备字段。
                     for (name, value) in set_cookies {
-                        if matches!(name.as_str(), "t1" | "vip_type" | "vip_token") {
+                        if matches!(
+                            name.as_str(),
+                            "dfid"
+                                | "KugouGUID"
+                                | "KUGOU_API_GUID"
+                                | "KUGOU_API_MID"
+                                | "KUGOU_API_MAC"
+                                | "KUGOU_API_DEV"
+                                | "kg_mid"
+                                | "mid"
+                                | "t1"
+                                | "vip_type"
+                                | "vip_token"
+                        ) {
                             cookies.insert(name, value);
                         }
                     }
@@ -1053,7 +1650,7 @@ mod platform {
                 Some(Ok(None)) => {}
                 Some(Err(error)) => {
                     let mut state = self.state.lock().expect("capture state mutex poisoned");
-                    state.outcome = Some(Err(CaptureError::Io(error)));
+                    state.outcome = Some(Err(CaptureError::Io(error.into_user_message())));
                 }
                 None => {}
             }
@@ -1563,7 +2160,12 @@ mod platform {
         state.browser_cookies = browser_cookies;
         state.latest_cookies = cookies.clone();
         let exchange_cookies = state.exchange_cookies.clone();
-        state.latest_cookies.extend(exchange_cookies);
+        if context.provider == "qqmusic" {
+            super::merge_qq_cookie_updates(&mut state.latest_cookies, &exchange_cookies);
+            super::normalize_qq_cookie_aliases(&mut state.latest_cookies);
+        } else {
+            state.latest_cookies.extend(exchange_cookies);
+        }
         let cookies = state.latest_cookies.clone();
         let now = Instant::now();
         let exchange_pending = state.exchange_rx.is_some();
@@ -1870,24 +2472,30 @@ mod platform {
         // 酷狗走概念版扫码登录：获取二维码 key 与图片，窗口内直接显示
         // 二维码（内嵌 HTML，避免 H5 页对桌面 UA 跳转），后台轮询扫码状态；
         // 其余平台使用固定的登录页。
-        let (context, qr_receiver) = if provider == "kugou" {
+        let (context, qr_receiver, qr_cancel) = if provider == "kugou" {
             let (key, image) = super::kugou_qr_key().map_err(CaptureError::Io)?;
             let (sender, receiver) = mpsc::channel();
             let poll_key = key.clone();
-            thread::spawn(move || super::kugou_qr_poll_loop(&poll_key, sender));
+            let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let poll_cancel = std::sync::Arc::clone(&cancel);
+            thread::spawn(move || super::kugou_qr_poll_loop(&poll_key, sender, poll_cancel));
             let html = super::kugou_qr_page(&image);
-            let context = Rc::new(CaptureContext::new_with_html(provider, window.hwnd, &html)?);
-            (context, Some(receiver))
+            let context = match CaptureContext::new_with_html(provider, window.hwnd, &html) {
+                Ok(context) => Rc::new(context),
+                Err(error) => {
+                    cancel.store(true, std::sync::atomic::Ordering::Release);
+                    return Err(error);
+                }
+            };
+            (context, Some(receiver), Some(cancel))
         } else {
             let context = Rc::new(CaptureContext::new(provider, window.hwnd)?);
-            (context, None)
+            (context, None, None)
         };
         if let Some(receiver) = qr_receiver {
-            context
-                .state
-                .lock()
-                .expect("capture state mutex poisoned")
-                .kugou_qr_rx = Some(receiver);
+            let mut state = context.state.lock().expect("capture state mutex poisoned");
+            state.kugou_qr_rx = Some(receiver);
+            state.kugou_qr_cancel = qr_cancel;
         }
         window.attach_context(&context);
         let environment_handler = Box::into_raw(Box::new(EnvironmentHandler {
@@ -2083,8 +2691,9 @@ mod platform {
 mod tests {
     use super::{
         QQ_REFRESH_COOKIE_GRACE_PERIOD, allowed_cookie_names, finish_qq_login_exchange,
-        has_qq_refresh_cookies, has_required_cookies, login_url, merge_qq_login_response_fields,
-        parse_qq_login_callback, should_complete_capture,
+        has_qq_refresh_cookies, has_required_cookies, login_url, merge_qq_cookie_updates,
+        merge_qq_login_response_fields, normalize_qq_cookie_aliases, parse_qq_login_callback,
+        qq_login_response_code, qq_login_response_data, should_complete_capture,
     };
     use serde_json::json;
     use std::collections::BTreeMap;
@@ -2113,6 +2722,15 @@ mod tests {
         let bilibili = BTreeMap::from([("SESSDATA".to_owned(), "session".to_owned())]);
         assert!(has_required_cookies("bilibili", &bilibili));
         assert!(allowed_cookie_names("netease").contains(&"MUSIC_U"));
+
+        let incomplete_refresh = BTreeMap::from([
+            ("psrf_qqopenid".to_owned(), "open-id".to_owned()),
+            (
+                "psrf_qqrefresh_token".to_owned(),
+                "refresh-token".to_owned(),
+            ),
+        ]);
+        assert!(!has_qq_refresh_cookies(&incomplete_refresh));
     }
 
     #[test]
@@ -2188,6 +2806,17 @@ mod tests {
             Instant::now(),
         ));
         assert_eq!(required_seen_at, None);
+
+        let wechat = BTreeMap::from([
+            ("uin".to_owned(), "1".to_owned()),
+            ("qqmusic_key".to_owned(), "W_X_key".to_owned()),
+            ("psrf_qqopenid".to_owned(), "open-id".to_owned()),
+            (
+                "psrf_qqrefresh_token".to_owned(),
+                "refresh-token".to_owned(),
+            ),
+        ]);
+        assert!(has_qq_refresh_cookies(&wechat));
     }
 
     #[test]
@@ -2296,7 +2925,11 @@ mod tests {
 
     #[test]
     fn qq_web_session_fallback_precedes_callback_error() {
-        let cookies = BTreeMap::from([("wxopenid".to_owned(), "open-id".to_owned())]);
+        let cookies = BTreeMap::from([
+            ("wxopenid".to_owned(), "open-id".to_owned()),
+            ("wxuin".to_owned(), "42".to_owned()),
+            ("qqmusic_key".to_owned(), "Q_H_key".to_owned()),
+        ]);
         let fields = finish_qq_login_exchange(
             "2",
             &cookies,
@@ -2316,6 +2949,167 @@ mod tests {
             fields.get("wxaccess_token"),
             Some(&"web-access-token".to_owned())
         );
+        assert_eq!(fields.get("login_type"), Some(&"2".to_owned()));
+    }
+
+    #[test]
+    fn qq_failed_callback_does_not_return_partial_fields_without_basic_session() {
+        let error = finish_qq_login_exchange(
+            "1",
+            &BTreeMap::new(),
+            BTreeMap::from([("access_token".to_owned(), "partial".to_owned())]),
+            Some("callback exchange rejected".to_owned()),
+            |_| panic!("QQ login type 1 has no web-session fallback"),
+        )
+        .unwrap_err();
+        assert_eq!(error, "callback exchange rejected");
+    }
+
+    #[test]
+    fn qq_failed_callback_discards_partial_fields_when_basic_session_is_available() {
+        let cookies = BTreeMap::from([
+            ("uin".to_owned(), "42".to_owned()),
+            ("qqmusic_key".to_owned(), "Q_H_key".to_owned()),
+        ]);
+        let fields = finish_qq_login_exchange(
+            "1",
+            &cookies,
+            BTreeMap::from([("access_token".to_owned(), "partial".to_owned())]),
+            Some("callback exchange rejected".to_owned()),
+            |_| panic!("QQ login type 1 has no web-session fallback"),
+        )
+        .unwrap();
+        assert!(fields.is_empty());
+    }
+
+    #[test]
+    fn qq_login_response_data_accepts_root_data_envelope() {
+        let body = json!({"code": 0, "data": {"musickey": "key"}});
+        assert_eq!(
+            qq_login_response_data(&body)
+                .and_then(|data| data.get("musickey"))
+                .and_then(serde_json::Value::as_str),
+            Some("key")
+        );
+    }
+
+    #[test]
+    fn qq_login_response_code_accepts_legacy_return_code_envelopes() {
+        assert_eq!(
+            qq_login_response_code(&json!({"req_0": {"retcode": 0}})),
+            Some("0".to_owned())
+        );
+        assert_eq!(
+            qq_login_response_code(&json!({"data": {"ret": 1000}})),
+            Some("1000".to_owned())
+        );
+    }
+
+    #[test]
+    fn qq_login_response_merges_str_musicid_and_wechat_aliases() {
+        let mut cookies = BTreeMap::new();
+        merge_qq_login_response_fields(
+            &mut cookies,
+            &json!({
+                "code": 0,
+                "data": {
+                    "str_musicid": "42",
+                    "musickey": "W_X_key",
+                    "wxopenid": "wx-open-id",
+                    "wxaccess_token": "wx-access-token",
+                    "wxrefresh_token": "wx-refresh-token",
+                    "wxunionid": "wx-union-id"
+                }
+            }),
+        );
+        assert_eq!(cookies.get("uin"), Some(&"42".to_owned()));
+        assert_eq!(cookies.get("qqmusic_key"), Some(&"W_X_key".to_owned()));
+        assert_eq!(
+            cookies.get("wxaccess_token"),
+            Some(&"wx-access-token".to_owned())
+        );
+        assert_eq!(
+            cookies.get("wxrefresh_token"),
+            Some(&"wx-refresh-token".to_owned())
+        );
+    }
+
+    #[test]
+    fn qq_wechat_exchange_does_not_consume_web_refresh_when_callback_has_token() {
+        let cookies = BTreeMap::new();
+        let fields = finish_qq_login_exchange(
+            "2",
+            &cookies,
+            BTreeMap::from([
+                ("wxaccess_token".to_owned(), "callback-token".to_owned()),
+                ("qqmusic_key".to_owned(), "callback-key".to_owned()),
+                ("wxuin".to_owned(), "42".to_owned()),
+                ("wxopenid".to_owned(), "callback-openid".to_owned()),
+                (
+                    "wxrefresh_token".to_owned(),
+                    "callback-refresh-token".to_owned(),
+                ),
+            ]),
+            None,
+            |_| panic!("web fallback must not run after a successful token exchange"),
+        )
+        .unwrap();
+        assert_eq!(
+            fields.get("wxaccess_token"),
+            Some(&"callback-token".to_owned())
+        );
+    }
+
+    #[test]
+    fn qq_wechat_partial_callback_uses_a_coherent_web_refresh_set() {
+        let cookies = BTreeMap::from([
+            ("wxopenid".to_owned(), "session-openid".to_owned()),
+            ("wxrefresh_token".to_owned(), "session-refresh".to_owned()),
+            ("wxuin".to_owned(), "42".to_owned()),
+            ("qqmusic_key".to_owned(), "session-key".to_owned()),
+        ]);
+        let fields = finish_qq_login_exchange(
+            "2",
+            &cookies,
+            BTreeMap::from([
+                ("wxaccess_token".to_owned(), "callback-token".to_owned()),
+                ("qqmusic_key".to_owned(), "callback-key".to_owned()),
+                ("wxuin".to_owned(), "42".to_owned()),
+            ]),
+            None,
+            |_| {
+                Ok(BTreeMap::from([
+                    ("wxaccess_token".to_owned(), "web-token".to_owned()),
+                    ("qqmusic_key".to_owned(), "web-key".to_owned()),
+                    ("wxopenid".to_owned(), "web-openid".to_owned()),
+                    ("wxrefresh_token".to_owned(), "web-refresh".to_owned()),
+                    ("wxuin".to_owned(), "42".to_owned()),
+                ]))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(fields.get("wxaccess_token"), Some(&"web-token".to_owned()));
+        assert_eq!(fields.get("qqmusic_key"), Some(&"web-key".to_owned()));
+        assert_eq!(
+            fields.get("wxrefresh_token"),
+            Some(&"web-refresh".to_owned())
+        );
+        assert_eq!(fields.get("login_type"), Some(&"2".to_owned()));
+    }
+
+    #[test]
+    fn qq_web_refresh_cookies_are_ready_without_grace_delay() {
+        let cookies = BTreeMap::from([
+            ("wxopenid".to_owned(), "open-id".to_owned()),
+            ("wxrefresh_token".to_owned(), "refresh-token".to_owned()),
+            ("wxuin".to_owned(), "o42".to_owned()),
+            ("qqmusic_key".to_owned(), "Q_H_key".to_owned()),
+        ]);
+        assert!(has_qq_refresh_cookies(&cookies));
+        let now = Instant::now();
+        let mut seen = None;
+        assert!(should_complete_capture("qqmusic", &cookies, &mut seen, now,));
     }
 
     #[test]
@@ -2347,15 +3141,100 @@ mod tests {
     }
 
     #[test]
+    fn qq_login_response_updates_all_existing_cookie_aliases() {
+        let mut cookies = BTreeMap::from([
+            ("qqmusic_key".to_owned(), "old-key".to_owned()),
+            ("qm_keyst".to_owned(), "old-secondary-key".to_owned()),
+            ("uin".to_owned(), "1".to_owned()),
+            ("wxuin".to_owned(), "o1".to_owned()),
+        ]);
+        merge_qq_login_response_fields(
+            &mut cookies,
+            &json!({
+                "musicid": 42,
+                "musickey": "new-key"
+            }),
+        );
+        assert_eq!(cookies.get("qqmusic_key"), Some(&"new-key".to_owned()));
+        assert_eq!(cookies.get("qm_keyst"), Some(&"new-key".to_owned()));
+        assert_eq!(cookies.get("uin"), Some(&"42".to_owned()));
+        assert_eq!(cookies.get("wxuin"), Some(&"42".to_owned()));
+
+        cookies.insert("qm_keyst".to_owned(), "newer-key".to_owned());
+        normalize_qq_cookie_aliases(&mut cookies);
+        assert_eq!(cookies.get("qqmusic_key"), Some(&"new-key".to_owned()));
+        assert_eq!(cookies.get("qm_keyst"), Some(&"new-key".to_owned()));
+
+        cookies.insert("qqmusic_key".to_owned(), "   ".to_owned());
+        cookies.insert("qm_keyst".to_owned(), "secondary-key".to_owned());
+        normalize_qq_cookie_aliases(&mut cookies);
+        assert_eq!(
+            cookies.get("qqmusic_key"),
+            Some(&"secondary-key".to_owned())
+        );
+        assert_eq!(cookies.get("qm_keyst"), Some(&"secondary-key".to_owned()));
+    }
+
+    #[test]
+    fn qq_exchange_updates_win_over_stale_browser_aliases() {
+        let mut cookies = BTreeMap::from([
+            ("uin".to_owned(), "old-uin".to_owned()),
+            ("wxuin".to_owned(), "old-wxuin".to_owned()),
+            ("qqmusic_key".to_owned(), "old-key".to_owned()),
+            ("qm_keyst".to_owned(), "old-secondary-key".to_owned()),
+        ]);
+        let updates = BTreeMap::from([
+            ("wxuin".to_owned(), "new-wxuin".to_owned()),
+            ("qqmusic_key".to_owned(), "new-key".to_owned()),
+        ]);
+        merge_qq_cookie_updates(&mut cookies, &updates);
+        assert_eq!(cookies.get("uin"), Some(&"new-wxuin".to_owned()));
+        assert_eq!(cookies.get("wxuin"), Some(&"new-wxuin".to_owned()));
+        assert_eq!(cookies.get("qqmusic_key"), Some(&"new-key".to_owned()));
+        assert_eq!(cookies.get("qm_keyst"), Some(&"new-key".to_owned()));
+    }
+
+    #[test]
+    fn qq_exchange_empty_updates_do_not_erase_existing_cookies() {
+        let mut cookies = BTreeMap::from([
+            ("qqmusic_key".to_owned(), "existing-key".to_owned()),
+            ("qm_keyst".to_owned(), "existing-key".to_owned()),
+            ("session_cookie".to_owned(), "existing-session".to_owned()),
+        ]);
+        let updates = BTreeMap::from([
+            ("qqmusic_key".to_owned(), "   ".to_owned()),
+            ("qm_keyst".to_owned(), String::new()),
+            ("session_cookie".to_owned(), "\t".to_owned()),
+        ]);
+
+        merge_qq_cookie_updates(&mut cookies, &updates);
+
+        assert_eq!(
+            cookies.get("qqmusic_key").map(String::as_str),
+            Some("existing-key")
+        );
+        assert_eq!(
+            cookies.get("qm_keyst").map(String::as_str),
+            Some("existing-key")
+        );
+        assert_eq!(
+            cookies.get("session_cookie").map(String::as_str),
+            Some("existing-session")
+        );
+    }
+
+    #[test]
     fn qq_login_exchange_payloads_match_the_two_web_login_modes() {
         let qq = super::qq_login_exchange_payload("1", "callback-code").unwrap();
         assert_eq!(qq["req"]["module"], "QQConnectLogin.LoginServer");
         assert_eq!(qq["req"]["method"], "QQLogin");
         assert_eq!(qq["req"]["param"]["code"], "callback-code");
+        assert_eq!(qq["comm"]["tmeLoginType"], 2);
 
         let wechat = super::qq_login_exchange_payload("2", "callback-code").unwrap();
         assert_eq!(wechat["req"]["module"], "music.login.LoginServer");
         assert_eq!(wechat["req"]["param"]["strAppid"], "wx48db31d50e334801");
+        assert_eq!(wechat["comm"]["tmeLoginType"], 1);
         assert!(super::qq_login_exchange_payload("3", "callback-code").is_none());
     }
 

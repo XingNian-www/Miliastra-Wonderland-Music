@@ -15,6 +15,7 @@ pub use cache::{
 };
 pub use catalog::{
     KugouAccountStatus, KugouListenReport, PlaybackEligibility, ProviderAccountStatus, ProviderId,
+    kugou_calculate_mid, kugou_normalize_guid, kugou_register_device,
 };
 pub use credentials::{CredentialError, CredentialStatus, ProviderCredential};
 pub use domain::{

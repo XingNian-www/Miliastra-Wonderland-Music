@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
-use std::fs;
-use std::io::{self, Read};
+use std::fs::{self, OpenOptions};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,7 +19,7 @@ use miliastra_playback::{
     CredentialStatus, LoginOperation, LoginOperationWaitError, LoginSession, PlaybackError,
     PlaybackHandle, ProviderCredential, ProviderId,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 const REAPER_POLL: Duration = Duration::from_millis(25);
@@ -175,19 +175,104 @@ struct DirectKugouDeviceRegistrar;
 impl KugouDeviceRegistrar for DirectKugouDeviceRegistrar {
     fn register(
         &self,
-        _token: &str,
-        _userid: &str,
+        token: &str,
+        userid: &str,
         cookies: &BTreeMap<String, String>,
     ) -> Result<String, LoginHelperFailure> {
-        if let Some(dfid) = cookies.get("dfid").filter(|dfid| !dfid.trim().is_empty()) {
-            return Ok(dfid.clone());
-        }
-        Ok("-".to_owned())
+        miliastra_playback::kugou_register_device(token, userid, cookies).map_err(|_error| {
+            LoginHelperFailure {
+                code: "kugou_device_registration_failed".to_owned(),
+                message: "酷狗设备注册失败，请重试".to_owned(),
+                provider: Some(ProviderId::Kugou),
+            }
+        })
     }
 }
 
 struct CommandHelperLauncher {
     executable: PathBuf,
+    credential_directory: PathBuf,
+}
+
+const KUGOU_DEVICE_FILE: &str = "kugou-device.json";
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct KugouDeviceIdentity {
+    guid: String,
+    dev: String,
+    mac: String,
+}
+
+/// Keep the lite device identity stable across helper processes and restarts.
+/// The file shape is compatible with the former sidecar implementation.
+fn load_or_create_kugou_device(directory: &Path) -> io::Result<KugouDeviceIdentity> {
+    fs::create_dir_all(directory)?;
+    let path = directory.join(KUGOU_DEVICE_FILE);
+    if path.is_file() {
+        return read_kugou_device(&path);
+    }
+
+    let guid = Uuid::new_v4().to_string();
+    let device = KugouDeviceIdentity {
+        guid: miliastra_playback::kugou_normalize_guid(&guid),
+        dev: Uuid::new_v4().to_string().to_ascii_uppercase(),
+        mac: "02:00:00:00:00:00".to_owned(),
+    };
+    let content = serde_json::to_vec_pretty(&device)
+        .map_err(|error| io::Error::other(format!("serialize KuGou device identity: {error}")))?;
+    // `create_new` makes the first writer the owner.  A second helper process
+    // must never overwrite an identity that is already in use by playback.
+    match OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(mut file) => {
+            file.write_all(&content)?;
+            file.sync_all()?;
+            Ok(device)
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            // The winning process may still be writing.  Give it a short,
+            // bounded window to finish before parsing the shared file.
+            for _ in 0..10 {
+                match read_kugou_device(&path) {
+                    Ok(device) => return Ok(device),
+                    Err(read_error)
+                        if matches!(
+                            read_error.kind(),
+                            io::ErrorKind::NotFound
+                                | io::ErrorKind::UnexpectedEof
+                                | io::ErrorKind::InvalidData
+                        ) =>
+                    {
+                        thread::sleep(Duration::from_millis(10))
+                    }
+                    Err(read_error) => return Err(read_error),
+                }
+            }
+            read_kugou_device(&path)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn read_kugou_device(path: &Path) -> io::Result<KugouDeviceIdentity> {
+    let text = fs::read_to_string(path)?;
+    let device = serde_json::from_str::<KugouDeviceIdentity>(&text).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid KuGou device identity: {error}"),
+        )
+    })?;
+    if device.guid.trim().is_empty() || device.dev.trim().is_empty() || device.mac.trim().is_empty()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "KuGou device identity contains an empty field",
+        ));
+    }
+    Ok(KugouDeviceIdentity {
+        guid: miliastra_playback::kugou_normalize_guid(&device.guid),
+        dev: device.dev.trim().to_ascii_uppercase(),
+        mac: device.mac.trim().to_ascii_uppercase(),
+    })
 }
 
 impl HelperLauncher for CommandHelperLauncher {
@@ -209,6 +294,15 @@ impl HelperLauncher for CommandHelperLauncher {
             // 持续读取 stderr，避免 sidecar 因管道写满而阻塞。其内容可能含有
             // 二维码 URL 或认证参数，不能转发到主程序日志。
             .stderr(Stdio::piped());
+        if provider == ProviderId::Kugou {
+            let device = load_or_create_kugou_device(&self.credential_directory)?;
+            let mid = miliastra_playback::kugou_calculate_mid(&device.guid);
+            command
+                .env("KUGOU_API_GUID", device.guid)
+                .env("KUGOU_API_DEV", device.dev)
+                .env("KUGOU_API_MAC", device.mac.clone())
+                .env("KUGOU_API_MID", mid);
+        }
         let mut child = command.spawn()?;
         let stdout = child.stdout.take().ok_or_else(|| {
             io::Error::new(
@@ -261,6 +355,7 @@ struct ManagerInner {
     playback: Arc<dyn LoginPlaybackPort>,
     launcher: Arc<dyn HelperLauncher>,
     kugou_device_registrar: Arc<dyn KugouDeviceRegistrar>,
+    credential_directory: PathBuf,
     profile_root: PathBuf,
     timeout: Duration,
     state: Mutex<ManagerState>,
@@ -371,7 +466,10 @@ impl LoginHelperManager {
     ) -> Self {
         Self::new_with_dependencies(
             Arc::new(playback),
-            Arc::new(CommandHelperLauncher { executable }),
+            Arc::new(CommandHelperLauncher {
+                executable,
+                credential_directory: credential_directory.clone(),
+            }),
             Arc::new(DirectKugouDeviceRegistrar),
             credential_directory,
             timeout,
@@ -390,6 +488,7 @@ impl LoginHelperManager {
                 playback,
                 launcher,
                 kugou_device_registrar,
+                credential_directory: credential_directory.clone(),
                 profile_root: credential_directory.join(PROFILE_ROOT_NAME),
                 timeout: timeout.max(Duration::from_millis(1)),
                 state: Mutex::new(ManagerState {
@@ -551,13 +650,22 @@ impl LoginHelperManager {
         let worker_inner = Arc::clone(&self.inner);
         let worker_session = session.clone();
         let worker_profile = profile.clone();
-        let mut state = self.inner.state.lock().map_err(|_| {
-            manager_failure(
-                "login_manager_unavailable",
-                "登录管理器不可用",
-                Some(provider),
-            )
-        })?;
+        let mut state = match self.inner.state.lock() {
+            Ok(state) => state,
+            Err(_) => {
+                // The child has already been spawned at this point.  Do not
+                // leak it (or its temporary profile) when the manager mutex
+                // is poisoned between spawn and worker registration.
+                terminate_child(&child);
+                let _ = self.inner.playback.cancel_login(session.session_id);
+                cleanup_profile(&profile);
+                return Err(manager_failure(
+                    "login_manager_unavailable",
+                    "登录管理器不可用",
+                    Some(provider),
+                ));
+            }
+        };
         state.active = Some(ActiveLogin {
             session: session.clone(),
             cancel: Arc::clone(&cancel),
@@ -814,11 +922,20 @@ impl LoginHelperManager {
             .as_ref()
             .is_some_and(|active| active.session.session_id == session_id)
         {
-            return Err(manager_failure(
-                "login_cancel_timeout",
-                "取消登录超时",
-                Some(provider),
-            ));
+            // A WebView2 descendant can keep stdout/stderr inherited after the
+            // helper has been killed. Do not leave the manager permanently
+            // active waiting for that pipe to close: the session is cancelled,
+            // so detach the bounded worker and let its final cleanup observe
+            // the session-id fence below. A later login can start immediately.
+            let worker = state.worker.take();
+            state.active = None;
+            state.phase = LoginPhase::Failed;
+            let failure = manager_failure("login_cancel_timeout", "取消登录超时", Some(provider));
+            state.last_error = Some(failure.view());
+            self.inner.changed.notify_all();
+            drop(state);
+            drop(worker);
+            return Err(failure);
         }
         let worker = state.worker.take();
         drop(state);
@@ -1023,7 +1140,8 @@ fn process_message(
                 ));
             }
             set_active_phase(inner, session.session_id, LoginPhase::ValidatingCredential);
-            let credential = credential_from_payload_with_device_registration(inner, credential)?;
+            let credential =
+                credential_from_payload_with_device_registration(inner, credential, cancel)?;
             complete_login_until(inner, session, credential, cancel, deadline)
         }
         LoginHelperMessage::Error { provider, code, .. } => {
@@ -1148,6 +1266,7 @@ fn parse_helper_provider(
 fn credential_from_payload_with_device_registration(
     inner: &ManagerInner,
     payload: CredentialPayload,
+    cancel: &AtomicBool,
 ) -> Result<ProviderCredential, LoginHelperFailure> {
     match payload {
         CredentialPayload::Kugou {
@@ -1155,9 +1274,47 @@ fn credential_from_payload_with_device_registration(
             userid,
             mut cookies,
         } => {
+            if cancel.load(Ordering::Acquire) {
+                return Err(manager_failure(
+                    "login_cancelled",
+                    "登录任务已取消",
+                    Some(ProviderId::Kugou),
+                ));
+            }
+            let device =
+                load_or_create_kugou_device(&inner.credential_directory).map_err(|_error| {
+                    manager_failure(
+                        "kugou_device_identity_failed",
+                        "酷狗设备标识初始化失败",
+                        Some(ProviderId::Kugou),
+                    )
+                })?;
+            // The QR request and device registration must use exactly the
+            // identity that will be persisted with the new credential.
+            cookies.insert("KUGOU_API_GUID".to_owned(), device.guid.clone());
+            cookies.insert("KUGOU_API_DEV".to_owned(), device.dev.clone());
+            cookies.insert("KUGOU_API_MAC".to_owned(), device.mac.clone());
+            cookies.insert(
+                "KUGOU_API_MID".to_owned(),
+                miliastra_playback::kugou_calculate_mid(&device.guid),
+            );
+            if cancel.load(Ordering::Acquire) {
+                return Err(manager_failure(
+                    "login_cancelled",
+                    "登录任务已取消",
+                    Some(ProviderId::Kugou),
+                ));
+            }
             let dfid = inner
                 .kugou_device_registrar
                 .register(&token, &userid, &cookies)?;
+            if cancel.load(Ordering::Acquire) {
+                return Err(manager_failure(
+                    "login_cancelled",
+                    "登录任务已取消",
+                    Some(ProviderId::Kugou),
+                ));
+            }
             // dfid 已作为独立凭据字段保存；移除 cookie 副本以通过
             // 凭据 cookie 白名单校验。
             cookies.remove("dfid");
@@ -1750,6 +1907,37 @@ mod tests {
             "miliastra-login-{name}-{}-{suffix}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn legacy_kugou_device_is_normalized_without_rewriting_the_file() {
+        let directory = profile_root("kugou-device-migration");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(KUGOU_DEVICE_FILE);
+        let legacy_guid = "550e8400-e29b-41d4-a716-446655440000";
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&KugouDeviceIdentity {
+                guid: legacy_guid.to_owned(),
+                dev: "550e8400-e29b-41d4-a716-446655440001".to_owned(),
+                mac: "aa:bb:cc:dd:ee:ff".to_owned(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let loaded = load_or_create_kugou_device(&directory).unwrap();
+        assert_eq!(
+            loaded.guid,
+            miliastra_playback::kugou_normalize_guid(legacy_guid)
+        );
+        assert_eq!(loaded.dev, "550E8400-E29B-41D4-A716-446655440001");
+        assert_eq!(loaded.mac, "AA:BB:CC:DD:EE:FF");
+        let persisted: KugouDeviceIdentity =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(persisted.guid, legacy_guid);
+
+        fs::remove_dir_all(directory).unwrap();
     }
 
     fn manager(

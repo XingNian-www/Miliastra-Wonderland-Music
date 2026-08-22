@@ -130,6 +130,21 @@ impl Provider {
                     .filter_map(|pair| pair.split_once('='))
                     .map(|(name, value)| (name.to_owned(), value.to_owned()))
                     .collect::<BTreeMap<_, _>>();
+                // The parent process supplies the persistent lite-device
+                // identity. Include it in the payload so registration and
+                // subsequent playback use the same device as QR polling.
+                for name in ["KUGOU_API_GUID", "KUGOU_API_DEV", "KUGOU_API_MAC"] {
+                    if !cookies.contains_key(name)
+                        && let Ok(value) = std::env::var(name)
+                        && !value.trim().is_empty()
+                    {
+                        let value = match name {
+                            "KUGOU_API_DEV" | "KUGOU_API_MAC" => value.to_ascii_uppercase(),
+                            _ => value,
+                        };
+                        cookies.insert(name.to_owned(), value);
+                    }
+                }
                 CredentialPayload::Kugou {
                     token: fields.get("t").cloned().unwrap_or_default(),
                     userid: fields.get("KugooID").cloned().unwrap_or_default(),

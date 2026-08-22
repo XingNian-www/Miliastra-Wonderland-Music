@@ -11,13 +11,14 @@ async-trait = "0.1"
 base64 = "0.22"
 cbc = "0.1"
 cipher = "0.4"
+flate2 = "1"
 cpal = "0.18.1"
 ffmpeg-next = { version = "9.0.0", default-features = false, features = ["codec", "format", "software-resampling"] }
 log = { version = "0.4", features = ["std"] }
 md5 = "0.7"
 num-bigint = "0.4"
 rand = "0.8"
-reqwest = { workspace = true, features = ["form", "json", "query", "rustls"] }
+reqwest = { workspace = true, features = ["blocking", "form", "json", "query", "rustls"] }
 rsa = { version = "0.9", features = ["pem", "sha2"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { workspace = true, features = ["derive"] }

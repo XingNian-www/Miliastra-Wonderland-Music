@@ -114,10 +114,15 @@ impl ProviderCredential {
                         "psrf_qqrefresh_key",
                         "refresh_key",
                         "psrf_qqunionid",
+                        "unionid",
                     ],
                 )?;
                 require_any_cookie(cookies, "uin", &["uin", "wxuin"])?;
-                require_any_cookie(cookies, "musicKey", &["qqmusic_key", "qm_keyst"])?;
+                require_any_cookie(
+                    cookies,
+                    "musicKey",
+                    &["qqmusic_key", "qm_keyst", "lqm_keyst"],
+                )?;
             }
             Self::Netease { cookies } => {
                 require_allowed_cookie_names(cookies, &["MUSIC_U", "__csrf"])?;
@@ -155,7 +160,18 @@ impl ProviderCredential {
                 // t1 是概念版续期字段，登录/刷新时由官方 Set-Cookie 下发。
                 require_allowed_cookie_names(
                     cookies,
-                    &["KugouGUID", "kg_mid", "mid", "t1", "vip_type", "vip_token"],
+                    &[
+                        "KugouGUID",
+                        "KUGOU_API_GUID",
+                        "KUGOU_API_MID",
+                        "KUGOU_API_MAC",
+                        "KUGOU_API_DEV",
+                        "kg_mid",
+                        "mid",
+                        "t1",
+                        "vip_type",
+                        "vip_token",
+                    ],
                 )?;
             }
         }
@@ -175,7 +191,7 @@ impl ProviderCredential {
                 ("uin", has_any_cookie(cookies, &["uin", "wxuin"])),
                 (
                     "musicKey",
-                    has_any_cookie(cookies, &["qqmusic_key", "qm_keyst"]),
+                    has_any_cookie(cookies, &["qqmusic_key", "qm_keyst", "lqm_keyst"]),
                 ),
                 (
                     "openId",
@@ -1050,18 +1066,40 @@ fn has_value(value: &str) -> bool {
 fn qq_refresh_ready(cookies: &BTreeMap<String, String>) -> bool {
     let web_ready = has_any_cookie(cookies, &["wxopenid"])
         && has_any_cookie(cookies, &["wxrefresh_token"])
-        && has_any_cookie(cookies, &["qqmusic_key", "qm_keyst"])
+        && has_any_cookie(cookies, &["qqmusic_key", "qm_keyst", "lqm_keyst"])
         && has_any_cookie(cookies, &["uin", "wxuin"]);
     // QQ 网页登录（QQ OAuth）通常只下发 refresh_token，不保证下发
     // refresh_key；移动端续期接口接受两者任一作为已有登录凭据，并在响应中
     // 补发新的 refresh_token 与 refresh_key。因此任一存在即可刷新。
     let oauth_ready = has_any_cookie(cookies, &["uin", "wxuin"])
-        && has_any_cookie(cookies, &["qqmusic_key", "qm_keyst"])
-        && has_any_cookie(cookies, &["psrf_qqopenid", "openid"])
-        && has_any_cookie(cookies, &["psrf_qqaccess_token", "access_token"])
-        && (has_any_cookie(cookies, &["psrf_qqrefresh_token", "refresh_token"])
-            || has_any_cookie(cookies, &["psrf_qqrefresh_key", "refresh_key"]));
+        && has_any_cookie(cookies, &["qqmusic_key", "qm_keyst", "lqm_keyst"])
+        && has_any_cookie(cookies, &["psrf_qqopenid", "openid", "wxopenid"])
+        && (qq_refresh_key_is_wechat(cookies)
+            || has_any_cookie(
+                cookies,
+                &["psrf_qqaccess_token", "access_token", "wxaccess_token"],
+            ))
+        && (has_any_cookie(
+            cookies,
+            &["psrf_qqrefresh_token", "refresh_token", "wxrefresh_token"],
+        ) || has_any_cookie(cookies, &["psrf_qqrefresh_key", "refresh_key"]));
     web_ready || oauth_ready
+}
+
+/// The refresh protocol family is encoded in the music key. The WebView
+/// callback's `login_type` is a page-flow value and must not select this API
+/// contract.
+fn qq_refresh_key_is_wechat(cookies: &BTreeMap<String, String>) -> bool {
+    ["qqmusic_key", "qm_keyst", "lqm_keyst"]
+        .iter()
+        .find_map(|name| cookies.get(*name).filter(|value| has_value(value)))
+        .is_some_and(|value| {
+            value
+                .trim()
+                .as_bytes()
+                .get(..3)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"W_X"))
+        })
 }
 
 fn credential_path(directory: &Path, provider: &str) -> PathBuf {
@@ -1414,7 +1452,7 @@ mod tests {
 
     use super::{
         CredentialError, CredentialStore, DAILY_REFRESH_INTERVAL_MS, ProviderCredential,
-        REFRESH_STATE_FILE, epoch_ms, qq_refresh_ready,
+        REFRESH_STATE_FILE, epoch_ms, qq_refresh_key_is_wechat, qq_refresh_ready,
     };
 
     #[test]
@@ -1433,6 +1471,21 @@ mod tests {
         oauth.remove("psrf_qqrefresh_token");
         oauth.insert("psrf_qqrefresh_key".to_owned(), "key".to_owned());
         assert!(qq_refresh_ready(&oauth));
+
+        let mut wechat_oauth = BTreeMap::from([
+            ("uin".to_owned(), "123".to_owned()),
+            ("qqmusic_key".to_owned(), "W_X_key".to_owned()),
+            ("psrf_qqopenid".to_owned(), "openid".to_owned()),
+            ("psrf_qqrefresh_token".to_owned(), "refresh".to_owned()),
+        ]);
+        assert!(qq_refresh_ready(&wechat_oauth));
+        wechat_oauth.remove("psrf_qqrefresh_token");
+        wechat_oauth.insert("psrf_qqrefresh_key".to_owned(), "key".to_owned());
+        assert!(qq_refresh_ready(&wechat_oauth));
+        assert!(qq_refresh_key_is_wechat(&wechat_oauth));
+        wechat_oauth.insert("qqmusic_key".to_owned(), "   ".to_owned());
+        wechat_oauth.insert("qm_keyst".to_owned(), " w_x_secondary ".to_owned());
+        assert!(qq_refresh_key_is_wechat(&wechat_oauth));
 
         let mut web = basic;
         web.insert("wxopenid".to_owned(), "openid".to_owned());

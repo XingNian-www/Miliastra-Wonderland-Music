@@ -1,5 +1,6 @@
 mod bilibili;
 mod kugou;
+pub mod kugou_crypto;
 mod netease;
 mod provider;
 mod qqmusic;
@@ -41,7 +42,10 @@ pub trait CredentialRefreshAdapter: Send + Sync + 'static {
 
 pub use crate::domain::Failure;
 pub use bilibili::BilibiliAdapter;
-pub use kugou::{KugouAccountStatus, KugouAdapter, KugouListenReport};
+pub use kugou::{
+    KugouAccountStatus, KugouAdapter, KugouListenReport, kugou_calculate_mid, kugou_normalize_guid,
+    kugou_register_device,
+};
 pub use netease::NeteaseAdapter;
 pub use provider::{
     PlaybackEligibility, ProviderId, ProviderRegistry, ProviderSearchCandidate,

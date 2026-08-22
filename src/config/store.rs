@@ -7,7 +7,7 @@
 //!
 //! 启动流程读取完整配置，Web 配置中心负责保存、历史版本和回滚。
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -16,7 +16,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::OptionalExtension;
 use serde_json::{Map, Value};
 
-use super::schema::SECRET_PATHS;
+use super::schema::{SECRET_PATHS, config_sections};
 use super::{AppConfig, BootstrapConfig};
 
 /// 配置数据库 schema 版本；与请求状态快照版本 2、缓存 user_version 1 完全独立。
@@ -362,7 +362,10 @@ impl ConfigStore {
     /// 加载完整业务配置：读全部 config_sections 组装 JSON，注入启动引导
     /// （http/logging/state.playback_state_path），解析相对路径并通过完整校验。
     pub fn load_full(&self) -> Result<AppConfig> {
-        let sections = self.read_all_sections()?;
+        let mut sections = self.read_all_sections()?;
+        // 旧版本库可能残留已删除字段（如 playback.kugou_api_*），先剔除
+        // 再严格反序列化，避免 deny_unknown_fields 导致启动失败。
+        prune_unknown_schema_fields(&mut sections);
         let config = AppConfig::from_db_value(
             Value::Object(sections),
             &self.bootstrap,
@@ -412,7 +415,9 @@ impl ConfigStore {
         &self,
         sections: &Map<String, Value>,
     ) -> Result<Vec<ConfigFieldError>> {
-        let current_sections = self.read_all_sections()?;
+        // 未提交段（current）同样先剔除旧版残留字段，保证保存路径与加载一致。
+        let mut current_sections = self.read_all_sections()?;
+        prune_unknown_schema_fields(&mut current_sections);
         let mut merged = merge_sections(&current_sections, sections);
         // 与 save 同一路径：先应用清除标记，再保留其余 secret（保证预检结果
         // 与最终保存一致，清除标记不会被误判为非法类型）。
@@ -445,7 +450,9 @@ impl ConfigStore {
     ) -> std::result::Result<ConfigSaveOutcome, ConfigSaveError> {
         // 应用候选：并集合并、剔除注入段、secret 空值/掩码保留、
         // `{"__clear__": true}` 标记强制清除（写入空串，绕过保留规则）。
-        let current_sections = self.read_all_sections()?;
+        // current 先剔除旧版残留字段：加载时容忍、提交时清理，保存一次即迁移干净。
+        let mut current_sections = self.read_all_sections()?;
+        prune_unknown_schema_fields(&mut current_sections);
         let normalized_current = merge_sections(&current_sections, &Map::new());
         let mut merged = merge_sections(&current_sections, &sections);
         let mut forced_cleared = BTreeSet::new();
@@ -568,6 +575,8 @@ impl ConfigStore {
             .as_object()
             .cloned()
             .ok_or_else(|| anyhow!("目标版本快照必须是对象"))?;
+        // 旧版本历史快照同样可能携带已删除字段，先剔除再走 save 校验。
+        prune_unknown_schema_fields(&mut sections);
         let current_sections = self.read_all_sections()?;
         force_retain_secret_fields(&mut sections, &current_sections);
         self.save(base_revision, sections)
@@ -659,6 +668,37 @@ impl AppConfig {
         config.resolve_runtime_paths(executable_root);
         config.playback.normalize_audio_cache_paths(executable_root);
         Ok(config)
+    }
+}
+
+/// 剔除 config_sections 中当前 schema 未声明的字段（如旧版本库遗留的
+/// `playback.kugou_api_executable` / `playback.kugou_api_base_url`），
+/// 保证严格反序列化（deny_unknown_fields）不被历史数据破坏。
+///
+/// 只用于**库中已有数据**：启动加载、保存时未提交段（current）与回滚快照。
+/// 客户端提交段不经过此处，未知字段照旧被 save 拒绝（防篡改语义不变）。
+fn prune_unknown_schema_fields(sections: &mut Map<String, Value>) {
+    let known_by_section = config_sections()
+        .into_iter()
+        .map(|section| {
+            let mut keys = BTreeSet::new();
+            for field in &section.fields {
+                if let Some(rest) = field.path.strip_prefix(&format!("{}.", section.name))
+                    && let Some(leaf) = rest.split('.').next()
+                {
+                    keys.insert(leaf.to_string());
+                }
+            }
+            (section.name, keys)
+        })
+        .collect::<BTreeMap<_, _>>();
+    for (name, value) in sections.iter_mut() {
+        let Some(known) = known_by_section.get(name) else {
+            continue;
+        };
+        if let Some(object) = value.as_object_mut() {
+            object.retain(|key, _| known.contains(key));
+        }
     }
 }
 
@@ -1468,6 +1508,72 @@ mod tests {
             .as_object()
             .cloned()
             .unwrap()
+    }
+
+    #[test]
+    fn legacy_unknown_section_fields_are_pruned_before_strict_deserialization() {
+        let (root, database_path) = temp_database("legacy-prune");
+        let bootstrap = test_bootstrap(&database_path);
+        let store = ConfigStore::open(&database_path, &root, bootstrap.clone()).unwrap();
+
+        // 把 playback 段改写为旧版本库形态：携带已删除的 kugou_api_* 字段。
+        let playback = store.load_full().unwrap().playback.clone();
+        let mut playback_value = serde_json::to_value(playback.clone()).unwrap();
+        playback_value["kugou_api_executable"] = json!("kugou-api.exe");
+        playback_value["kugou_api_base_url"] = json!("http://127.0.0.1:3000");
+        let connection = rusqlite::Connection::open(&database_path).unwrap();
+        connection
+            .execute(
+                "INSERT OR REPLACE INTO config_sections (section, value_json, revision, updated_at_ms)
+                 VALUES ('playback', ?1, 1, 0)",
+                rusqlite::params![serde_json::to_string(&playback_value).unwrap()],
+            )
+            .unwrap();
+        drop(connection);
+
+        let mut store = ConfigStore::open(&database_path, &root, bootstrap).unwrap();
+        let loaded = store.load_full().unwrap();
+        assert_eq!(
+            loaded.playback.credential_directory, playback.credential_directory,
+            "旧字段剔除不得影响已知字段"
+        );
+        assert_eq!(
+            loaded.playback.login_timeout_ms, playback.login_timeout_ms,
+            "旧字段剔除不得影响已知字段"
+        );
+        // 保存任意段：current 旧字段先剔除 → save 成功，库中被清理。
+        let mut save_sections = Map::new();
+        let current = store.current_value().unwrap();
+        save_sections.insert("window".to_string(), current["window"].clone());
+        store.save(1, save_sections).unwrap();
+        let stored = stored_section(&database_path, "playback");
+        assert!(
+            stored.get("kugou_api_executable").is_none()
+                && stored.get("kugou_api_base_url").is_none(),
+            "保存后库中旧字段必须被清理: {stored}"
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn prune_keeps_nested_object_fields_declared_in_schema() {
+        let mut sections = Map::new();
+        sections.insert(
+            "playback".to_string(),
+            json!({
+                "credential_directory": "deps/data/credentials",
+                "audio_cache": {
+                    "enabled": true,
+                    "directory": ""
+                },
+                "stale_legacy_field": "remove-me"
+            }),
+        );
+        prune_unknown_schema_fields(&mut sections);
+        let playback = sections["playback"].as_object().unwrap();
+        assert!(playback.contains_key("credential_directory"));
+        assert!(playback.contains_key("audio_cache"));
+        assert!(!playback.contains_key("stale_legacy_field"));
     }
 
     #[test]

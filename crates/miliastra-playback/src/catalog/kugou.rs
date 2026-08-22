@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use md5::compute;
+use rand::{Rng, distributions::Alphanumeric};
 use reqwest::{Client, StatusCode};
+use serde::Serialize;
 use serde_json::Value;
 use url::Url;
 
@@ -18,24 +20,36 @@ use crate::credentials::{CredentialStore, ProviderCredential};
 use crate::domain::{ResolverLocator, SearchSpec, Song, SongKey, StreamSource};
 use crate::lyrics::{TimedLyrics, parse_lrc_pair};
 
+use super::kugou_crypto::{
+    KUGOU_LITE_RSA_PUBLIC_KEY, KugouLiteTokenRefreshInput, aes_cbc_decrypt_hex,
+    build_lite_token_refresh_body_text, decode_krc_base64, playlist_aes_decrypt_base64,
+    playlist_aes_encrypt_base64, rsa_pkcs1_encrypt_hex, rsa_raw_encrypt_json_hex,
+};
+
 const PROVIDER: &str = "kugou";
 
-/// 酷狗 web 版签名盐值。
-const KUGOU_WEB_SIGN_SALT: &str = "NVPh5oo715z5DIWAeQlhMDsWXXQV4hwt";
+/// 酷狗概念版 Android API 的签名盐值。
+const KUGOU_LITE_SIGN_SALT: &str = "LnT6xpN3khm36zse0QzvmgTZ3waWdRSA";
+/// `song_url` 的 `key` 参数使用的概念版盐值。
+const KUGOU_LITE_KEY_SALT: &str = "185672dd44712f60bb1736df5a377e82";
 const KUGOU_LITE_APPID: i64 = 3116;
 const KUGOU_LITE_CLIENTVER: i64 = 11440;
+const KUGOU_STREAM_CLIENTVER: i64 = 11430;
 const KUGOU_UA: &str = "Android15-1070-11083-46-0-DiscoveryDRADProtocol-wifi";
+const KUGOU_KG_RFC: &str = "B9EDA08A64250DEFFBCADDEE00F8F25F";
+const KUGOU_DEVICE_FILE: &str = "kugou-device.json";
 
 /// 官方端点
-const URL_SEARCH: &str = "https://complexsearch.kugou.com/v2/search/song";
+const URL_SEARCH: &str = "https://gateway.kugou.com/v3/search/song";
 const URL_SONG_STREAM: &str = "https://gateway.kugou.com/v5/url";
-const URL_PRIVILEGE: &str = "https://gateway.kugou.com/openapi/v1/privilege/lite";
-const URL_SEARCH_LYRIC: &str = "http://krcs.kugou.com/search";
-const URL_DOWNLOAD_LYRIC: &str = "http://krcs.kugou.com/download";
-const URL_TOKEN_REFRESH: &str = "https://login-user.kugou.com/v2/token_refresh";
+const URL_PRIVILEGE: &str = "https://gateway.kugou.com/v2/get_res_privilege/lite";
+const URL_SEARCH_LYRIC: &str = "https://lyrics.kugou.com/v1/search";
+const URL_DOWNLOAD_LYRIC: &str = "https://lyrics.kugou.com/download";
+const URL_TOKEN_REFRESH: &str = "http://login.user.kugou.com/v5/login_by_token";
 const URL_USER_DETAIL: &str = "https://gateway.kugou.com/v3/get_my_info";
-const URL_YOUTH_UNION_VIP: &str = "https://gateway.kugou.com/youth/v1/union/vip";
-const URL_USER_VIP_DETAIL: &str = "https://gateway.kugou.com/youth/v1/vip/detail";
+const URL_YOUTH_UNION_VIP: &str = "https://kugouvip.kugou.com/v1/get_union_vip";
+// KuGouMusicApi's user_vip_detail module aliases the union-vip endpoint.
+const URL_USER_VIP_DETAIL: &str = "https://kugouvip.kugou.com/v1/get_union_vip";
 const URL_YOUTH_VIP: &str = "https://gateway.kugou.com/youth/v1/ad/play_report";
 const URL_YOUTH_VIP_UPGRADE: &str =
     "https://gateway.kugou.com/youth/v1/listen_song/upgrade_vip_reward";
@@ -83,8 +97,61 @@ struct UnionVipStatus {
 pub struct KugouAdapter {
     client: Client,
     credentials: CredentialStore,
+    legacy_device: Option<KugouDeviceIdentity>,
     /// 账号状态整体缓存（成功 24 小时/失败 15 分钟），防止轮询频繁打账号接口触发风控。
     account_cache: Arc<std::sync::Mutex<AccountStatusCache>>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+struct KugouDeviceIdentity {
+    guid: String,
+    dev: String,
+    mac: String,
+}
+
+/// Body structs below intentionally follow the property order used by the
+/// corresponding KuGouMusicApi JavaScript modules.  Android signatures cover
+/// the serialized body bytes, so an equivalent but differently ordered JSON
+/// object is not interchangeable on the wire.
+#[derive(Serialize)]
+struct KugouUserDetailBody {
+    visit_time: u64,
+    usertype: u8,
+    p: String,
+    userid: u64,
+}
+
+#[derive(Serialize)]
+struct KugouAdPlayReportBody {
+    ad_id: u64,
+    play_end: u64,
+    play_start: u64,
+}
+
+#[derive(Serialize)]
+struct KugouPrivilegeResource {
+    #[serde(rename = "type")]
+    resource_type: &'static str,
+    page_id: u8,
+    hash: String,
+    album_id: String,
+}
+
+#[derive(Serialize)]
+struct KugouPrivilegeBody {
+    appid: i64,
+    area_code: u8,
+    behavior: &'static str,
+    clientver: i64,
+    need_hash_offset: u8,
+    relate: u8,
+    support_verify: u8,
+    resource: Vec<KugouPrivilegeResource>,
+    qualities: [&'static str; 9],
+}
+
+fn serialize_kugou_body<T: Serialize>(body: &T) -> Result<String, CatalogError> {
+    serde_json::to_string(body).map_err(|error| CatalogError::InvalidResponse(error.to_string()))
 }
 
 /// 账号 VIP 状态缓存有效期（判定成功时）。
@@ -92,8 +159,11 @@ const VIP_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// 判定失败（接口风控/超时）时的短缓存，尽快重试账号接口。
 const VIP_CACHE_FAILED_TTL: Duration = Duration::from_secs(15 * 60);
 
-/// 酷狗 web 版签名：md5(盐值 + 参数按 key 排序后的 k=v 拼接 + 盐值)。
-pub fn kugou_web_signature(params: &BTreeMap<String, String>) -> String {
+/// 计算概念版 Android 请求签名。
+///
+/// 酷狗 Android 请求把排序后的 `key=value` 参数串、原始请求体和盐值
+/// 一起计算 MD5；请求体必须是发送时完全相同的紧凑 JSON 字节序列。
+pub fn kugou_android_signature(params: &BTreeMap<String, String>, body: &str) -> String {
     let mut pairs = params.iter().collect::<Vec<_>>();
     pairs.sort_by(|left, right| left.0.cmp(right.0));
     let joined = pairs
@@ -101,9 +171,277 @@ pub fn kugou_web_signature(params: &BTreeMap<String, String>) -> String {
         .map(|(key, value)| format!("{key}={value}"))
         .collect::<String>();
     let digest = compute(format!(
-        "{KUGOU_WEB_SIGN_SALT}{joined}{KUGOU_WEB_SIGN_SALT}"
+        "{KUGOU_LITE_SIGN_SALT}{joined}{body}{KUGOU_LITE_SIGN_SALT}"
     ));
     format!("{digest:x}")
+}
+
+/// `song_url` 请求的资源 key：MD5(hash + lite salt + appid + mid + userid)。
+pub fn kugou_lite_sign_key(hash: &str, mid: &str, userid: &str) -> String {
+    let user = if userid.is_empty() { "0" } else { userid };
+    let device = if mid.is_empty() { "-" } else { mid };
+    let digest = compute(format!(
+        "{hash}{KUGOU_LITE_KEY_SALT}{KUGOU_LITE_APPID}{device}{user}"
+    ));
+    format!("{digest:x}")
+}
+
+/// Register the persistent device used by the lite client and obtain a
+/// server-issued `dfid`. This is the Rust equivalent of the upstream
+/// `/risk/v2/r_register_dev` module that the old sidecar called before URL
+/// resolution.
+pub fn kugou_register_device(
+    token: &str,
+    userid: &str,
+    cookies: &BTreeMap<String, String>,
+) -> Result<String, CatalogError> {
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct RegistrationPayload<'a> {
+        #[serde(rename = "availableRamSize")]
+        available_ram_size: u64,
+        #[serde(rename = "availableRomSize")]
+        available_rom_size: u64,
+        // KuGou's register_dev payload preserves the acronym casing here;
+        // serde's generic camelCase would emit `availableSdSize`.
+        #[serde(rename = "availableSDSize")]
+        available_sd_size: u64,
+        baseband_ver: &'a str,
+        battery_level: u8,
+        battery_status: u8,
+        brand: &'a str,
+        build_serial: &'a str,
+        device: &'a str,
+        imei: &'a str,
+        imsi: &'a str,
+        manufacturer: &'a str,
+        uuid: &'a str,
+        accelerometer: bool,
+        accelerometer_value: &'a str,
+        gravity: bool,
+        gravity_value: &'a str,
+        gyroscope: bool,
+        gyroscope_value: &'a str,
+        light: bool,
+        light_value: &'a str,
+        magnetic: bool,
+        magnetic_value: &'a str,
+        orientation: bool,
+        orientation_value: &'a str,
+        pressure: bool,
+        pressure_value: &'a str,
+        #[serde(rename = "step_counter")]
+        step_counter: bool,
+        #[serde(rename = "step_counterValue")]
+        step_counter_value: &'a str,
+        temperature: bool,
+        #[serde(rename = "temperatureValue")]
+        temperature_value: &'a str,
+    }
+    #[derive(serde::Serialize)]
+    struct RegistrationProof<'a> {
+        aes: &'a str,
+        uid: &'a str,
+        token: &'a str,
+    }
+
+    let guid = cookies
+        .get("KUGOU_API_GUID")
+        .or_else(|| cookies.get("KugouGUID"))
+        .map(String::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("miliastra-device");
+    let guid = kugou_normalize_guid(guid);
+    let device = RegistrationPayload {
+        available_ram_size: 4_983_533_568,
+        available_rom_size: 48_114_719,
+        available_sd_size: 48_114_717,
+        baseband_ver: "",
+        battery_level: 100,
+        battery_status: 3,
+        brand: "Redmi",
+        build_serial: "unknown",
+        device: "marble",
+        imei: &guid,
+        imsi: "",
+        manufacturer: "Xiaomi",
+        uuid: &guid,
+        accelerometer: false,
+        accelerometer_value: "",
+        gravity: false,
+        gravity_value: "",
+        gyroscope: false,
+        gyroscope_value: "",
+        light: false,
+        light_value: "",
+        magnetic: false,
+        magnetic_value: "",
+        orientation: false,
+        orientation_value: "",
+        pressure: false,
+        pressure_value: "",
+        step_counter: false,
+        step_counter_value: "",
+        temperature: false,
+        temperature_value: "",
+    };
+    let temporary_key = rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(6)
+        .map(char::from)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let encrypted_body = playlist_aes_encrypt_base64(
+        &serde_json::to_vec(&device)
+            .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?,
+        &temporary_key,
+    )
+    .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?;
+    let proof = RegistrationProof {
+        aes: &temporary_key,
+        uid: if userid.is_empty() { "0" } else { userid },
+        token,
+    };
+    let proof = rsa_pkcs1_encrypt_hex(
+        &serde_json::to_vec(&proof)
+            .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?,
+        KUGOU_LITE_RSA_PUBLIC_KEY,
+    )
+    .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+        .to_string();
+    let dfid = cookies
+        .get("dfid")
+        .map(String::as_str)
+        .filter(|value| {
+            let value = value.trim();
+            !value.is_empty() && !value.eq_ignore_ascii_case("undefined")
+        })
+        .unwrap_or("-");
+    let mid = cookies
+        .get("KUGOU_API_MID")
+        .or_else(|| cookies.get("mid"))
+        .or_else(|| cookies.get("kg_mid"))
+        .map(String::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| kugou_calculate_mid(&guid));
+    let mut params = BTreeMap::from([
+        ("appid".to_owned(), KUGOU_LITE_APPID.to_string()),
+        ("clientver".to_owned(), KUGOU_LITE_CLIENTVER.to_string()),
+        ("clienttime".to_owned(), now),
+        ("dfid".to_owned(), dfid.to_owned()),
+        ("mid".to_owned(), mid),
+        ("uuid".to_owned(), "-".to_owned()),
+        ("part".to_owned(), "1".to_owned()),
+        ("platid".to_owned(), "1".to_owned()),
+        ("p".to_owned(), proof),
+    ]);
+    if !token.is_empty() {
+        params.insert("token".to_owned(), token.to_owned());
+    }
+    if !userid.is_empty() {
+        params.insert("userid".to_owned(), userid.to_owned());
+    }
+    let signature = kugou_android_signature(&params, &encrypted_body);
+    params.insert("signature".to_owned(), signature);
+    let mut cookie_values = cookies.clone();
+    cookie_values.insert("token".to_owned(), token.to_owned());
+    cookie_values.insert("userid".to_owned(), userid.to_owned());
+    cookie_values.insert("dfid".to_owned(), dfid.to_owned());
+    let response = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .user_agent(KUGOU_UA)
+        .build()
+        .map_err(|error| CatalogError::Transient(error.to_string()))?
+        .post("https://userservice.kugou.com/risk/v2/r_register_dev")
+        .query(&params)
+        .headers(reqwest::header::HeaderMap::from_iter([
+            (
+                reqwest::header::HeaderName::from_static("clienttime"),
+                reqwest::header::HeaderValue::from_str(
+                    params.get("clienttime").map(String::as_str).unwrap_or("0"),
+                )
+                .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?,
+            ),
+            (
+                reqwest::header::HeaderName::from_static("dfid"),
+                reqwest::header::HeaderValue::from_str(dfid)
+                    .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?,
+            ),
+            (
+                reqwest::header::HeaderName::from_static("mid"),
+                reqwest::header::HeaderValue::from_str(
+                    params.get("mid").map(String::as_str).unwrap_or("-"),
+                )
+                .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?,
+            ),
+            (
+                reqwest::header::HeaderName::from_static("kg-rc"),
+                reqwest::header::HeaderValue::from_static("1"),
+            ),
+            (
+                reqwest::header::HeaderName::from_static("kg-thash"),
+                reqwest::header::HeaderValue::from_static("5d816a0"),
+            ),
+            (
+                reqwest::header::HeaderName::from_static("kg-rec"),
+                reqwest::header::HeaderValue::from_static("1"),
+            ),
+            (
+                reqwest::header::HeaderName::from_static("kg-rf"),
+                reqwest::header::HeaderValue::from_static(KUGOU_KG_RFC),
+            ),
+        ]))
+        .header("Cookie", cookie_header(&cookie_values))
+        // Axios 1.10 forwards this encrypted string without assigning a
+        // content type; the registration endpoint expects that exact shape.
+        .body(encrypted_body.clone())
+        .send()
+        .map_err(classify_request_error_blocking)?;
+    let status = response.status();
+    let bytes = response
+        .bytes()
+        .map_err(|error| CatalogError::Transient(error.to_string()))?;
+    if !status.is_success() {
+        return Err(CatalogError::Unavailable(format!(
+            "Kugou device registration returned HTTP {status}"
+        )));
+    }
+    let value = serde_json::from_slice::<Value>(&bytes)
+        .or_else(|_| {
+            let decrypted = playlist_aes_decrypt_base64(&bytes, &temporary_key)
+                .map_err(|error| serde_json::Error::io(std::io::Error::other(error.to_string())))?;
+            serde_json::from_slice::<Value>(&decrypted)
+        })
+        .map_err(|error| {
+            CatalogError::InvalidResponse(format!(
+                "Kugou device registration response is invalid: {error}"
+            ))
+        })?;
+    classify_business_response(&value)?;
+    let data = response_data(&value);
+    let registered = data
+        .get("dfid")
+        .and_then(value_string)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            CatalogError::CredentialRejected(
+                "Kugou device registration returned no dfid".to_owned(),
+            )
+        })?;
+    Ok(registered)
+}
+
+fn classify_request_error_blocking(error: reqwest::Error) -> CatalogError {
+    if error.is_timeout() {
+        CatalogError::TimedOut(error.to_string())
+    } else {
+        CatalogError::Transient(error.to_string())
+    }
 }
 
 /// 计算酷狗设备 MID：md5(GUID) 的 hex 视为 128 位无符号大整数，转十进制。
@@ -115,6 +453,71 @@ pub fn kugou_calculate_mid(guid: &str) -> String {
         .unwrap_or_else(|_| "-".to_owned())
 }
 
+/// Match KuGouMusicApi's device bootstrap: UUIDv4 values are first reduced
+/// to their MD5 hex form, while already-normalized device identifiers are
+/// kept unchanged. Older sidecars persisted the UUID form, so this helper is
+/// also used when loading the shared device file after an upgrade.
+pub fn kugou_normalize_guid(guid: &str) -> String {
+    let guid = guid.trim();
+    let bytes = guid.as_bytes();
+    let is_uuid_v4 = bytes.len() == 36
+        && bytes[8] == b'-'
+        && bytes[13] == b'-'
+        && bytes[18] == b'-'
+        && bytes[23] == b'-'
+        && bytes[14].eq_ignore_ascii_case(&b'4')
+        && matches!(bytes[19].to_ascii_lowercase(), b'8' | b'9' | b'a' | b'b')
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| matches!(index, 8 | 13 | 18 | 23) || byte.is_ascii_hexdigit());
+    if is_uuid_v4 {
+        format!("{:x}", compute(guid.as_bytes()))
+    } else {
+        guid.to_owned()
+    }
+}
+
+fn load_legacy_device_identity(credentials: &CredentialStore) -> Option<KugouDeviceIdentity> {
+    let path = credentials.auxiliary_path(KUGOU_DEVICE_FILE)?;
+    if !path.is_file() {
+        return None;
+    }
+    let loaded = (|| -> Result<KugouDeviceIdentity, String> {
+        let text = std::fs::read_to_string(&path).map_err(|error| error.to_string())?;
+        let device = serde_json::from_str::<KugouDeviceIdentity>(&text)
+            .map_err(|error| error.to_string())?;
+        if device.guid.trim().is_empty()
+            || device.dev.trim().is_empty()
+            || device.mac.trim().is_empty()
+        {
+            return Err("device identity contains an empty field".to_owned());
+        }
+        Ok(KugouDeviceIdentity {
+            guid: kugou_normalize_guid(&device.guid),
+            dev: device.dev.trim().to_ascii_uppercase(),
+            mac: device.mac.trim().to_ascii_uppercase(),
+        })
+    })();
+    match loaded {
+        Ok(device) => Some(device),
+        Err(error) => {
+            log::warn!("failed to load legacy KuGou device identity: {error}");
+            None
+        }
+    }
+}
+
+fn insert_cookie_default(cookies: &mut BTreeMap<String, String>, name: &str, value: &str) {
+    let missing = cookies.get(name).is_none_or(|current| {
+        let current = current.trim();
+        current.is_empty() || current == "-" || current.eq_ignore_ascii_case("undefined")
+    });
+    if missing {
+        cookies.insert(name.to_owned(), value.to_owned());
+    }
+}
+
 impl KugouAdapter {
     pub fn new(credentials: CredentialStore, timeout: Duration) -> Result<Self, CatalogError> {
         let client = Client::builder()
@@ -122,11 +525,43 @@ impl KugouAdapter {
             .user_agent(KUGOU_UA)
             .build()
             .map_err(|error| CatalogError::Transient(error.to_string()))?;
+        let legacy_device = load_legacy_device_identity(&credentials);
         Ok(Self {
             client,
             credentials,
+            legacy_device,
             account_cache: Arc::new(std::sync::Mutex::new(AccountStatusCache::default())),
         })
+    }
+
+    fn credential_with_device(&self, credential: &ProviderCredential) -> ProviderCredential {
+        let Some(device) = self.legacy_device.as_ref() else {
+            return credential.clone();
+        };
+        let ProviderCredential::Kugou {
+            token,
+            userid,
+            dfid,
+            cookies,
+        } = credential
+        else {
+            return credential.clone();
+        };
+        let mut cookies = cookies.clone();
+        insert_cookie_default(&mut cookies, "KUGOU_API_GUID", &device.guid);
+        insert_cookie_default(
+            &mut cookies,
+            "KUGOU_API_MID",
+            &kugou_calculate_mid(&device.guid),
+        );
+        insert_cookie_default(&mut cookies, "KUGOU_API_DEV", &device.dev);
+        insert_cookie_default(&mut cookies, "KUGOU_API_MAC", &device.mac);
+        ProviderCredential::Kugou {
+            token: token.clone(),
+            userid: userid.clone(),
+            dfid: dfid.clone(),
+            cookies,
+        }
     }
 
     fn credential_cookie_header(credential: &ProviderCredential) -> String {
@@ -151,6 +586,7 @@ impl KugouAdapter {
             .get(PROVIDER)
             .map_err(|error| CatalogError::AuthRequired(error.to_string()))?
             .ok_or_else(|| CatalogError::AuthRequired("Kugou credential_required".to_owned()))
+            .map(|credential| self.credential_with_device(&credential))
     }
 
     fn credential_fields(
@@ -170,55 +606,100 @@ impl KugouAdapter {
         Ok((token, userid, dfid))
     }
 
-    fn signed_params(
+    /// 从登录捕获的 Cookie 中取出 Android 请求所需的设备 MID。
+    /// `mid`/`kg_mid` 是服务端下发的十进制 MID；只有在旧凭据没有这两个
+    /// 字段时才从 `KugouGUID` 按官方算法派生，不能把 dfid 当作 GUID。
+    fn credential_mid(credential: Option<&ProviderCredential>) -> String {
+        let Some(credential) = credential else {
+            return "-".to_owned();
+        };
+        let cookies = credential.cookies();
+        for name in ["KUGOU_API_MID", "mid", "kg_mid"] {
+            if let Some(value) = cookies.get(name).map(String::as_str)
+                && !value.trim().is_empty()
+                && value != "undefined"
+            {
+                return value.trim().to_owned();
+            }
+        }
+        cookies
+            .get("KUGOU_API_GUID")
+            .or_else(|| cookies.get("KugouGUID"))
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| kugou_calculate_mid(&kugou_normalize_guid(value)))
+            .unwrap_or_else(|| "-".to_owned())
+    }
+
+    fn device_params(
         credential: Option<&ProviderCredential>,
-        extra: Vec<(&str, String)>,
+        appid: i64,
+        clientver: i64,
     ) -> BTreeMap<String, String> {
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0)
             .to_string();
-
-        let mut params = BTreeMap::new();
-        params.insert("appid".to_owned(), KUGOU_LITE_APPID.to_string());
-        params.insert("clientver".to_owned(), KUGOU_LITE_CLIENTVER.to_string());
-        params.insert("clienttime".to_owned(), now_secs);
-
         let (token, userid, dfid) = credential
             .and_then(|cred| Self::credential_fields(cred).ok())
             .unwrap_or(("", "", ""));
-
-        let mid = if !dfid.is_empty() {
-            kugou_calculate_mid(dfid)
-        } else {
-            "-".to_owned()
-        };
-
-        params.insert("mid".to_owned(), mid);
-        params.insert(
-            "dfid".to_owned(),
-            if dfid.is_empty() {
-                "-".to_owned()
-            } else {
-                dfid.to_owned()
-            },
-        );
-
+        let mut params = BTreeMap::from([
+            ("appid".to_owned(), appid.to_string()),
+            ("clientver".to_owned(), clientver.to_string()),
+            ("clienttime".to_owned(), now_secs),
+            (
+                "dfid".to_owned(),
+                if dfid.trim().is_empty() {
+                    "-".to_owned()
+                } else {
+                    dfid.to_owned()
+                },
+            ),
+            ("mid".to_owned(), Self::credential_mid(credential)),
+            ("uuid".to_owned(), "-".to_owned()),
+        ]);
         if !token.is_empty() {
             params.insert("token".to_owned(), token.to_owned());
         }
         if !userid.is_empty() {
             params.insert("userid".to_owned(), userid.to_owned());
         }
+        params
+    }
 
+    fn signed_params(
+        credential: Option<&ProviderCredential>,
+        extra: Vec<(&str, String)>,
+        body: &str,
+    ) -> BTreeMap<String, String> {
+        let mut params = Self::device_params(credential, KUGOU_LITE_APPID, KUGOU_LITE_CLIENTVER);
         for (k, v) in extra {
             params.insert(k.to_owned(), v);
         }
-
-        let signature = kugou_web_signature(&params);
+        let signature = kugou_android_signature(&params, body);
         params.insert("signature".to_owned(), signature);
         params
+    }
+
+    fn apply_device_headers(
+        request: reqwest::RequestBuilder,
+        params: &BTreeMap<String, String>,
+    ) -> reqwest::RequestBuilder {
+        request
+            .header("User-Agent", KUGOU_UA)
+            .header(
+                "dfid",
+                params.get("dfid").map(String::as_str).unwrap_or("-"),
+            )
+            .header(
+                "clienttime",
+                params.get("clienttime").map(String::as_str).unwrap_or("0"),
+            )
+            .header("mid", params.get("mid").map(String::as_str).unwrap_or("-"))
+            .header("kg-rc", "1")
+            .header("kg-thash", "5d816a0")
+            .header("kg-rec", "1")
+            .header("kg-rf", KUGOU_KG_RFC)
     }
 
     async fn get_json_direct(
@@ -227,8 +708,23 @@ impl KugouAdapter {
         query: Vec<(&str, String)>,
         credential: Option<&ProviderCredential>,
     ) -> Result<Value, CatalogError> {
-        let signed = Self::signed_params(credential, query);
-        let mut request = self.client.get(endpoint).query(&signed);
+        self.get_json_direct_with_headers(endpoint, query, credential, &[])
+            .await
+    }
+
+    async fn get_json_direct_with_headers(
+        &self,
+        endpoint: &str,
+        query: Vec<(&str, String)>,
+        credential: Option<&ProviderCredential>,
+        headers: &[(&str, &str)],
+    ) -> Result<Value, CatalogError> {
+        let signed = Self::signed_params(credential, query, "");
+        let mut request =
+            Self::apply_device_headers(self.client.get(endpoint).query(&signed), &signed);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
 
         if let Some(cred) = credential {
             request = request.header("Cookie", Self::credential_cookie_header(cred));
@@ -236,10 +732,43 @@ impl KugouAdapter {
 
         let response = request.send().await.map_err(classify_request_error)?;
         classify_status(&response)?;
-        response
+        let value = response
             .json::<Value>()
             .await
-            .map_err(|error| CatalogError::InvalidResponse(error.to_string()))
+            .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?;
+        if endpoint != URL_SONG_STREAM {
+            classify_business_response(&value)?;
+        }
+        Ok(value)
+    }
+
+    /// Send a signed request whose query is supplied verbatim.  The upstream
+    /// lyric-search module opts into `clearDefaultParams`, so its signature
+    /// covers only the endpoint-specific fields and not the normal device
+    /// defaults.
+    async fn get_json_explicit_params(
+        &self,
+        endpoint: &str,
+        query: BTreeMap<String, String>,
+        credential: Option<&ProviderCredential>,
+    ) -> Result<Value, CatalogError> {
+        let mut signed = query;
+        let signature = kugou_android_signature(&signed, "");
+        signed.insert("signature".to_owned(), signature);
+        let device = Self::device_params(credential, KUGOU_LITE_APPID, KUGOU_LITE_CLIENTVER);
+        let mut request =
+            Self::apply_device_headers(self.client.get(endpoint).query(&signed), &device);
+        if let Some(cred) = credential {
+            request = request.header("Cookie", Self::credential_cookie_header(cred));
+        }
+        let response = request.send().await.map_err(classify_request_error)?;
+        classify_status(&response)?;
+        let value = response
+            .json::<Value>()
+            .await
+            .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?;
+        classify_business_response(&value)?;
+        Ok(value)
     }
 
     async fn post_json_direct(
@@ -249,16 +778,60 @@ impl KugouAdapter {
         body: Option<&Value>,
         credential: Option<&ProviderCredential>,
     ) -> Result<(Value, reqwest::header::HeaderMap), CatalogError> {
-        let signed = Self::signed_params(credential, query);
-        let mut request = self.client.post(endpoint).query(&signed);
+        self.post_json_direct_with_headers(endpoint, query, body, credential, &[])
+            .await
+    }
+
+    async fn post_json_direct_with_headers(
+        &self,
+        endpoint: &str,
+        query: Vec<(&str, String)>,
+        body: Option<&Value>,
+        credential: Option<&ProviderCredential>,
+        headers: &[(&str, &str)],
+    ) -> Result<(Value, reqwest::header::HeaderMap), CatalogError> {
+        let body_text = body
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?;
+        self.post_json_text_direct_with_headers(
+            endpoint,
+            query,
+            body_text.as_deref(),
+            credential,
+            headers,
+        )
+        .await
+    }
+
+    /// Send a JSON body whose serialized bytes are supplied by the caller.
+    ///
+    /// KuGou's Android signature includes the raw body text.  Keeping this
+    /// path separate from `serde_json::Value` lets protocol-specific callers
+    /// preserve the insertion order emitted by the upstream JavaScript
+    /// `JSON.stringify` implementation.
+    async fn post_json_text_direct_with_headers(
+        &self,
+        endpoint: &str,
+        query: Vec<(&str, String)>,
+        body_text: Option<&str>,
+        credential: Option<&ProviderCredential>,
+        headers: &[(&str, &str)],
+    ) -> Result<(Value, reqwest::header::HeaderMap), CatalogError> {
+        let signed = Self::signed_params(credential, query, body_text.unwrap_or(""));
+        let mut request =
+            Self::apply_device_headers(self.client.post(endpoint).query(&signed), &signed);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
 
         if let Some(cred) = credential {
             request = request.header("Cookie", Self::credential_cookie_header(cred));
         }
-        if let Some(body_json) = body {
+        if let Some(body_text) = body_text {
             request = request
-                .header("Content-Type", "application/json; charset=utf-8")
-                .json(body_json);
+                .header("Content-Type", "application/json")
+                .body(body_text.to_owned());
         }
 
         let response = request.send().await.map_err(classify_request_error)?;
@@ -268,6 +841,9 @@ impl KugouAdapter {
             .json::<Value>()
             .await
             .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?;
+        if endpoint != URL_TOKEN_REFRESH {
+            classify_business_response(&value)?;
+        }
         Ok((value, headers))
     }
 
@@ -277,17 +853,61 @@ impl KugouAdapter {
         limit: usize,
         credential: &ProviderCredential,
     ) -> Result<Value, CatalogError> {
-        self.get_json_direct(
+        self.get_json_direct_with_headers(
             URL_SEARCH,
             vec![
+                ("albumhide", "0".to_owned()),
+                ("iscorrection", "1".to_owned()),
                 ("keyword", keyword.to_owned()),
+                ("nocollect", "0".to_owned()),
                 ("page", "1".to_owned()),
                 ("pagesize", limit.clamp(1, 30).to_string()),
-                ("type", "song".to_owned()),
+                ("platform", "AndroidFilter".to_owned()),
             ],
             Some(credential),
+            &[("x-router", "complexsearch.kugou.com")],
         )
         .await
+    }
+
+    async fn user_detail_json(
+        &self,
+        credential: &ProviderCredential,
+    ) -> Result<Value, CatalogError> {
+        let (token, userid, _) = Self::credential_fields(credential)?;
+        // user_detail.js names this field clienttime_ms, but the value is the
+        // current Unix time in seconds, as used by the official client.
+        let clienttime = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        #[derive(Serialize)]
+        struct UserDetailProof<'a> {
+            token: &'a str,
+            clienttime: u64,
+        }
+        let pk = rsa_raw_encrypt_json_hex(
+            &UserDetailProof { token, clienttime },
+            KUGOU_LITE_RSA_PUBLIC_KEY,
+        )
+        .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?
+        .to_ascii_uppercase();
+        let body = serialize_kugou_body(&KugouUserDetailBody {
+            visit_time: clienttime,
+            usertype: 1,
+            p: pk,
+            userid: userid.parse::<u64>().unwrap_or(0),
+        })?;
+        let (value, _) = self
+            .post_json_text_direct_with_headers(
+                URL_USER_DETAIL,
+                vec![("plat", "1".to_owned())],
+                Some(&body),
+                Some(credential),
+                &[("x-router", "usercenter.kugou.com")],
+            )
+            .await?;
+        Ok(value)
     }
 
     /// 概念版广告播放领取 VIP：上报一次完整广告播放（约 30 秒）。
@@ -297,13 +917,19 @@ impl KugouAdapter {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_millis() as u64)
             .unwrap_or(0);
-        let body = serde_json::json!({
-            "ad_id": KUGOU_VIP_AD_ID,
-            "play_end": now_ms,
-            "play_start": now_ms.saturating_sub(KUGOU_VIP_AD_PLAY_MS),
-        });
+        let body = serialize_kugou_body(&KugouAdPlayReportBody {
+            ad_id: KUGOU_VIP_AD_ID,
+            play_end: now_ms,
+            play_start: now_ms.saturating_sub(KUGOU_VIP_AD_PLAY_MS),
+        })?;
         let (value, _) = self
-            .post_json_direct(URL_YOUTH_VIP, Vec::new(), Some(&body), Some(&credential))
+            .post_json_text_direct_with_headers(
+                URL_YOUTH_VIP,
+                Vec::new(),
+                Some(&body),
+                Some(&credential),
+                &[],
+            )
             .await?;
         let data = response_data(&value);
         let code = value
@@ -366,12 +992,95 @@ impl KugouAdapter {
         &self,
         credential: &ProviderCredential,
     ) -> Result<ProviderCredential, CatalogError> {
-        let (_token, userid, dfid) = Self::credential_fields(credential)?;
+        let credential = self.credential_with_device(credential);
+        let credential = &credential;
+        let (token, userid, dfid) = Self::credential_fields(credential)?;
+        let cookies = credential.cookies();
+        let device_guid = cookies
+            .get("KUGOU_API_GUID")
+            .or_else(|| cookies.get("KugouGUID"))
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| kugou_normalize_guid(value))
+            .unwrap_or_else(|| format!("kugou-{dfid}"));
+        let device_mac = cookies
+            .get("KUGOU_API_MAC")
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| value.trim().to_ascii_uppercase())
+            .unwrap_or_else(|| "02:00:00:00:00:00".to_owned());
+        let device_name = cookies
+            .get("KUGOU_API_DEV")
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| value.trim().to_ascii_uppercase())
+            .unwrap_or_else(|| "MILIASTRA".to_owned());
+        let params_key = rand::thread_rng()
+            .sample_iter(&Alphanumeric)
+            .take(16)
+            .map(char::from)
+            .collect::<String>()
+            .to_ascii_lowercase();
+        let body = build_lite_token_refresh_body_text(&KugouLiteTokenRefreshInput {
+            now_ms: epoch_ms(),
+            token: token.to_owned(),
+            userid: userid.to_owned(),
+            dfid: dfid.to_owned(),
+            device_guid,
+            device_mac,
+            device_name,
+            previous_t1: cookies.get("t1").cloned(),
+            params_key: params_key.clone(),
+        })
+        .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?;
         let (value, headers) = self
-            .post_json_direct(URL_TOKEN_REFRESH, Vec::new(), None, Some(credential))
+            .post_json_text_direct_with_headers(
+                URL_TOKEN_REFRESH,
+                Vec::new(),
+                Some(&body),
+                Some(credential),
+                &[],
+            )
             .await?;
 
+        let response_body = response_data(&value);
+        let status = value
+            .get("status")
+            .or_else(|| response_body.get("status"))
+            .and_then(value_u64);
+        let error_code = value
+            .get("error_code")
+            .or_else(|| response_body.get("error_code"))
+            .and_then(value_i64);
+        let response_code = find_kugou_root_business_number(&value, "code");
+        if status.is_some_and(|status| status != 1)
+            || error_code.is_some_and(|error_code| error_code != 0)
+            || response_code.is_some_and(|code| code != 0)
+        {
+            return Err(CatalogError::AuthRequired(
+                "Kugou token refresh was rejected".to_owned(),
+            ));
+        }
+
+        let mut data = response_data(&value).clone();
+        if let Some(secu_params) = data.get("secu_params").and_then(Value::as_str) {
+            let key_hex = format!("{:x}", compute(params_key.as_bytes()));
+            let decrypted =
+                aes_cbc_decrypt_hex(secu_params, key_hex.as_bytes(), &key_hex.as_bytes()[16..])
+                    .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?;
+            let decoded = serde_json::from_slice::<Value>(&decrypted).unwrap_or_else(|_| {
+                Value::String(String::from_utf8_lossy(&decrypted).into_owned())
+            });
+            if let Some(source) = decoded.as_object() {
+                if let Some(target) = data.as_object_mut() {
+                    target.extend(source.clone());
+                }
+            } else if let Some(token) = decoded.as_str().filter(|value| !value.is_empty())
+                && let Some(target) = data.as_object_mut()
+            {
+                target.insert("token".to_owned(), Value::String(token.to_owned()));
+            }
+        }
+
         // 官方经 Set-Cookie 下发新的续期字段（t1 等），必须保留供下次刷新。
+        // dfid 是 ProviderCredential 的独立字段，不能重复写进 cookie 白名单。
         let mut refreshed_cookies = headers
             .get_all(reqwest::header::SET_COOKIE)
             .iter()
@@ -380,12 +1089,27 @@ impl KugouAdapter {
                 let (name, rest) = header.split_once('=')?;
                 let name = name.trim();
                 let value = rest.split(';').next()?.trim();
-                matches!(name, "t1" | "vip_type" | "vip_token")
-                    .then(|| (name.to_owned(), value.to_owned()))
+                matches!(
+                    name,
+                    "t1" | "vip_type"
+                        | "vip_token"
+                        | "KugouGUID"
+                        | "KUGOU_API_GUID"
+                        | "KUGOU_API_MID"
+                        | "KUGOU_API_MAC"
+                        | "KUGOU_API_DEV"
+                        | "mid"
+                        | "kg_mid"
+                )
+                .then(|| (name.to_owned(), value.to_owned()))
             })
             .collect::<BTreeMap<_, _>>();
+        for name in ["t1", "vip_type", "vip_token"] {
+            if let Some(value) = data.get(name).and_then(value_string) {
+                refreshed_cookies.insert(name.to_owned(), value);
+            }
+        }
 
-        let data = value.get("data").unwrap_or(&value);
         let new_token = data
             .get("token")
             .and_then(value_string)
@@ -562,17 +1286,27 @@ impl KugouAdapter {
     ) -> Result<crate::catalog::ProviderAccountStatus, CatalogError> {
         let checked_at_ms = epoch_ms();
         let credential = self.credential()?;
-        let detail = self
-            .get_json_direct(URL_USER_DETAIL, Vec::new(), Some(&credential))
-            .await;
+        let detail = self.user_detail_json(&credential).await;
         let vip = match self
-            .get_json_direct(URL_YOUTH_UNION_VIP, Vec::new(), Some(&credential))
+            .get_json_direct(
+                URL_YOUTH_UNION_VIP,
+                vec![
+                    ("busi_type", "concept".to_owned()),
+                    ("opt_product_types", "dvip,qvip".to_owned()),
+                    ("product_type", "svip".to_owned()),
+                ],
+                Some(&credential),
+            )
             .await
         {
             Ok(vip) => Ok(vip),
             Err(_) => {
-                self.get_json_direct(URL_USER_VIP_DETAIL, Vec::new(), Some(&credential))
-                    .await
+                self.get_json_direct(
+                    URL_USER_VIP_DETAIL,
+                    vec![("busi_type", "concept".to_owned())],
+                    Some(&credential),
+                )
+                .await
             }
         };
 
@@ -636,12 +1370,12 @@ impl KugouAdapter {
                     .map(|value| value.to_string()),
                 _ => None,
             });
+        let detail_status_code = detail_data
+            .and_then(|data| data.get("error_code"))
+            .and_then(value_u64);
         crate::catalog::ProviderAccountStatus {
             provider: PROVIDER.to_owned(),
-            logged_in: detail
-                .and_then(|detail| detail.get("error_code"))
-                .and_then(value_u64)
-                .is_none_or(|code| code == 0),
+            logged_in: detail_status_code.is_none_or(|code| code == 0),
             user_id: detail_data
                 .and_then(|data| data.get("userid"))
                 .and_then(value_string)
@@ -695,16 +1429,23 @@ impl KugouAdapter {
         credential: &ProviderCredential,
     ) -> Result<Value, CatalogError> {
         let result = self
-            .get_json_direct(
+            .get_json_explicit_params(
                 URL_SEARCH_LYRIC,
-                vec![
-                    ("hash", hash.to_owned()),
-                    ("album_audio_id", album_audio_id.to_owned()),
-                ],
+                BTreeMap::from([
+                    ("album_audio_id".to_owned(), album_audio_id.to_owned()),
+                    ("appid".to_owned(), KUGOU_LITE_APPID.to_string()),
+                    ("clientver".to_owned(), KUGOU_LITE_CLIENTVER.to_string()),
+                    ("duration".to_owned(), "0".to_owned()),
+                    ("hash".to_owned(), hash.to_owned()),
+                    ("keyword".to_owned(), String::new()),
+                    ("lrctxt".to_owned(), "1".to_owned()),
+                    ("man".to_owned(), "no".to_owned()),
+                ]),
                 Some(credential),
             )
             .await?;
-        let Some(candidate) = result
+        let result_data = response_data(&result);
+        let Some(candidate) = result_data
             .get("candidates")
             .and_then(Value::as_array)
             .and_then(|v| v.first())
@@ -722,8 +1463,10 @@ impl KugouAdapter {
             vec![
                 ("id", id),
                 ("accesskey", accesskey.to_owned()),
+                ("ver", "1".to_owned()),
+                ("client", "android".to_owned()),
                 ("fmt", "lrc".to_owned()),
-                ("decode", "true".to_owned()),
+                ("charset", "utf8".to_owned()),
             ],
             Some(credential),
         )
@@ -756,7 +1499,12 @@ impl SourceAdapter for KugouAdapter {
         &self,
         candidate: &ProviderCredential,
     ) -> Result<(), CatalogError> {
-        let response = self.search_json("validation", 1, candidate).await?;
+        let candidate = self.credential_with_device(candidate);
+        // Song search is available to anonymous and invalid sessions, so a
+        // successful search cannot validate the captured token. User detail
+        // returns error_code=20018 for a rejected login and exercises the same
+        // lite device identity that subsequent account requests require.
+        let response = self.user_detail_json(&candidate).await?;
         if !response.is_object() {
             Err(CatalogError::InvalidResponse(
                 "Kugou credential validation response is not an object".to_owned(),
@@ -795,25 +1543,53 @@ impl SourceAdapter for KugouAdapter {
         }
         let (hash, album_id, album_audio_id) = resolver_parts(key, locator)?;
         let credential = self.credential()?;
+        let (_, userid, _) = Self::credential_fields(&credential)?;
+        let mid = Self::credential_mid(Some(&credential));
+        let hash_lower = hash.to_ascii_lowercase();
+        let key = kugou_lite_sign_key(&hash_lower, &mid, userid);
         let response = self
-            .get_json_direct(
+            // KuGouMusicApi's `song_url.js` calls this `notSign`, but its
+            // request layer only checks `notSignature`; the actual upstream
+            // request therefore still carries the Android signature.
+            .get_json_direct_with_headers(
                 URL_SONG_STREAM,
                 vec![
-                    ("hash", hash),
                     ("album_id", album_id),
-                    ("album_audio_id", album_audio_id),
+                    ("area_code", "1".to_owned()),
+                    ("hash", hash_lower),
+                    ("ssa_flag", "is_fromtrack".to_owned()),
+                    ("version", KUGOU_STREAM_CLIENTVER.to_string()),
+                    ("page_id", "967177915".to_owned()),
                     ("quality", "320".to_owned()),
+                    ("album_audio_id", album_audio_id),
+                    ("behavior", "play".to_owned()),
+                    ("pid", "411".to_owned()),
+                    ("cmd", "26".to_owned()),
+                    ("pidversion", "3001".to_owned()),
+                    ("IsFreePart", "0".to_owned()),
+                    ("ppage_id", "356753938,823673182,967485191".to_owned()),
+                    ("cdnBackup", "1".to_owned()),
+                    ("module", String::new()),
+                    ("clientver", KUGOU_STREAM_CLIENTVER.to_string()),
+                    ("key", key),
                 ],
                 Some(&credential),
+                &[("x-router", "trackercdn.kugou.com")],
             )
             .await?;
         let url = match extract_stream_url(&response) {
             Some(url) => url,
             None => return Err(classify_kugou_resolve_failure(&response)),
         };
+        let url =
+            Url::parse(url).map_err(|error| CatalogError::InvalidResponse(error.to_string()))?;
+        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+            return Err(CatalogError::InvalidResponse(
+                "Kugou returned a non-HTTP media URL".to_owned(),
+            ));
+        }
         Ok(StreamSource {
-            url: Url::parse(url)
-                .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?,
+            url,
             headers: BTreeMap::from([("Referer".to_owned(), "https://www.kugou.com/".to_owned())]),
             expires_at_epoch_ms: None,
         })
@@ -831,28 +1607,48 @@ impl SourceAdapter for KugouAdapter {
         }
         let (hash, album_id, _) = resolver_parts(key, locator)?;
         let credential = self.credential()?;
-        let response = self
-            .get_json_direct(
+        let body = serialize_kugou_body(&KugouPrivilegeBody {
+            appid: KUGOU_LITE_APPID,
+            area_code: 1,
+            behavior: "play",
+            clientver: KUGOU_LITE_CLIENTVER,
+            need_hash_offset: 1,
+            relate: 1,
+            support_verify: 1,
+            resource: vec![KugouPrivilegeResource {
+                resource_type: "audio",
+                page_id: 0,
+                hash,
+                album_id,
+            }],
+            qualities: [
+                "128",
+                "320",
+                "flac",
+                "high",
+                "viper_atmos",
+                "viper_tape",
+                "viper_clear",
+                "super",
+                "multitrack",
+            ],
+        })?;
+        let (response, _) = self
+            .post_json_text_direct_with_headers(
                 URL_PRIVILEGE,
-                vec![("hash", hash), ("album_id", album_id)],
+                Vec::new(),
+                Some(&body),
                 Some(&credential),
+                &[("x-router", "media.store.kugou.com")],
             )
             .await?;
-        let item = response
-            .pointer("/data/0")
-            .or_else(|| response.pointer("/data"))
-            .and_then(|value| {
-                value
-                    .as_array()
-                    .and_then(|items| items.first())
-                    .or(Some(value))
-            });
+        let item = first_privilege_resource(response_data(&response));
         let Some(item) = item else {
             return Err(CatalogError::InvalidResponse(
                 "Kugou privilege response has no resource".to_owned(),
             ));
         };
-        let pay_type = item.get("pay_type").and_then(value_u64);
+        let pay_type = kugou_pay_type(item);
         match pay_type {
             Some(0) => Ok(PlaybackEligibility::Eligible),
             Some(2) => Ok(PlaybackEligibility::PaidRequired),
@@ -891,15 +1687,20 @@ impl SourceAdapter for KugouAdapter {
         if response.is_null() {
             return Ok(None);
         }
+        let data = response_data(&response);
         let content = response
             .get("decodeContent")
             .or_else(|| response.get("content"))
+            .or_else(|| data.get("decodeContent"))
+            .or_else(|| data.get("content"))
             .and_then(Value::as_str)
             .unwrap_or_default();
         let lyric = decode_lrc_content(content)?;
         let translation = response
             .get("decodeTrcContent")
             .or_else(|| response.get("trcContent"))
+            .or_else(|| data.get("decodeTrcContent"))
+            .or_else(|| data.get("trcContent"))
             .and_then(Value::as_str)
             .map(decode_lrc_content)
             .transpose()?;
@@ -934,75 +1735,94 @@ fn epoch_ms() -> u64 {
 }
 
 fn classify_kugou_resolve_failure(response: &Value) -> CatalogError {
-    let vip = response
-        .pointer("/data/vip")
-        .or_else(|| response.pointer("/vip"))
+    let data = response_data(response);
+    let vip = data
+        .get("vip")
+        .or_else(|| data.get("is_vip"))
+        .or_else(|| response.get("vip"))
         .and_then(value_u64);
     if vip == Some(1) {
         return CatalogError::VipRequired("Kugou track requires VIP membership".to_owned());
+    }
+    if let Err(error) = classify_business_response(response) {
+        return error;
     }
     CatalogError::Unavailable("Kugou returned no playable stream".to_owned())
 }
 
 fn extract_stream_url(response: &Value) -> Option<&str> {
-    response
-        .get("url")
-        .or_else(|| response.get("backupUrl"))
-        .and_then(|value| match value {
-            Value::Array(items) => items
-                .iter()
-                .find_map(|item| item.as_str().filter(|url| !url.is_empty())),
-            Value::String(text) => (!text.is_empty()).then_some(text.as_str()),
-            _ => None,
-        })
+    let data = response_data(response);
+    [data, response].into_iter().find_map(|value| {
+        value
+            .get("url")
+            .and_then(first_stream_url)
+            .or_else(|| value.get("backupUrl").and_then(first_stream_url))
+            .or_else(|| value.get("backup_url").and_then(first_stream_url))
+    })
+}
+
+fn first_stream_url(value: &Value) -> Option<&str> {
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .find_map(|item| item.as_str().filter(|url| !url.is_empty())),
+        Value::String(text) => (!text.is_empty()).then_some(text.as_str()),
+        _ => None,
+    }
 }
 
 fn parse_search_candidates(response: &Value) -> Result<Vec<ProviderSearchCandidate>, CatalogError> {
-    let songs = response
-        .pointer("/data/lists")
-        .or_else(|| response.pointer("/data/info"))
+    let data = response_data(response);
+    let songs = data
+        .get("lists")
+        .or_else(|| data.get("info"))
+        .or_else(|| data.pointer("/data/lists"))
+        .or_else(|| data.pointer("/data/info"))
         .and_then(Value::as_array)
         .ok_or_else(|| CatalogError::InvalidResponse("Kugou search list is missing".to_owned()))?;
     Ok(songs
         .iter()
         .filter_map(|raw| {
-            let hash = raw
-                .get("FileHash")
-                .or_else(|| raw.get("hash"))
-                .and_then(Value::as_str)?
-                .trim();
-            let title = raw
-                .get("OriSongName")
-                .or_else(|| raw.get("FileName"))
-                .or_else(|| raw.get("songname"))
-                .and_then(Value::as_str)?
-                .trim();
+            let hash = ["FileHash", "file_hash", "hash"]
+                .iter()
+                .find_map(|field| raw.get(*field).and_then(value_string))?;
+            let hash = hash.trim();
+            let title = [
+                "OriSongName",
+                "SongName",
+                "songname",
+                "FileName",
+                "filename",
+            ]
+            .iter()
+            .find_map(|field| raw.get(*field).and_then(value_string))?;
+            let title = title.trim();
             if hash.is_empty()
                 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
                 || title.is_empty()
             {
                 return None;
             }
-            let album_id =
-                kugou_search_identifier(raw.get("AlbumID").or_else(|| raw.get("album_id")))?;
-            let album_audio_id =
-                kugou_search_identifier(raw.get("MixSongID").or_else(|| raw.get("mixsongid")))?;
-            let artists = raw
-                .get("SingerName")
-                .or_else(|| raw.get("singername"))
-                .and_then(Value::as_str)
-                .map(|value| {
-                    value
-                        .split(['、', '/', '&'])
-                        .map(str::trim)
-                        .filter(|v| !v.is_empty())
-                        .map(str::to_owned)
-                        .collect()
-                })
-                .unwrap_or_default();
-            let duration_ms = raw
-                .get("Duration")
-                .or_else(|| raw.get("duration"))
+            let album_id = kugou_search_identifier(
+                ["AlbumID", "AlbumId", "album_id", "albumid"]
+                    .iter()
+                    .find_map(|field| raw.get(*field)),
+            )?;
+            let album_audio_id = kugou_search_identifier(
+                [
+                    "MixSongID",
+                    "MixSongId",
+                    "mixsongid",
+                    "AlbumAudioID",
+                    "album_audio_id",
+                ]
+                .iter()
+                .find_map(|field| raw.get(*field)),
+            )?;
+            let artists = kugou_artists(raw);
+            let duration_ms = ["Duration", "duration", "DurationMS", "duration_ms"]
+                .iter()
+                .find_map(|field| raw.get(*field))
                 .and_then(value_u64)
                 .map(|value| {
                     if value < 10_000 {
@@ -1021,7 +1841,9 @@ fn parse_search_candidates(response: &Value) -> Result<Vec<ProviderSearchCandida
                 artists,
                 album: raw
                     .get("AlbumName")
+                    .or_else(|| raw.get("Album"))
                     .or_else(|| raw.get("album_name"))
+                    .or_else(|| raw.get("albumname"))
                     .and_then(Value::as_str)
                     .filter(|v| !v.trim().is_empty())
                     .map(str::to_owned),
@@ -1039,20 +1861,77 @@ fn parse_search_candidates(response: &Value) -> Result<Vec<ProviderSearchCandida
         .collect::<Vec<_>>())
 }
 
+fn kugou_artists(raw: &Value) -> Vec<String> {
+    let Some(value) = ["SingerName", "singername", "Singer", "singer", "artists"]
+        .iter()
+        .find_map(|field| raw.get(*field))
+    else {
+        return Vec::new();
+    };
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|item| {
+                item.as_str()
+                    .map(str::to_owned)
+                    .or_else(|| item.get("name").and_then(Value::as_str).map(str::to_owned))
+            })
+            .flat_map(|text| {
+                text.split(['、', '/', '&'])
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .collect(),
+        Value::Object(object) => object
+            .get("name")
+            .and_then(Value::as_str)
+            .map(split_kugou_artists)
+            .unwrap_or_default(),
+        _ => value.as_str().map(split_kugou_artists).unwrap_or_default(),
+    }
+}
+
+fn split_kugou_artists(value: &str) -> Vec<String> {
+    value
+        .split(['、', '/', '&'])
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 fn kugou_candidate_is_vip(raw: &Value) -> bool {
-    if let Some(trans) = raw.get("TransParam").and_then(Value::as_str)
-        && let Ok(param) = serde_json::from_str::<Value>(trans)
-    {
-        for field in ["display_vip", "vip"] {
-            if let Some(value) = param.get(field).and_then(value_u64) {
-                return value != 0;
-            }
+    let trans = ["TransParam", "trans_param", "transParam"]
+        .iter()
+        .find_map(|field| raw.get(*field))
+        .and_then(parse_kugou_trans_param);
+    for value in [Some(raw), trans.as_ref()].into_iter().flatten() {
+        if ["display_vip", "displayVip", "vip", "is_vip", "isVip", "VIP"]
+            .iter()
+            .find_map(|field| value.get(*field).and_then(value_u64))
+            .is_some_and(|flag| flag != 0)
+        {
+            return true;
+        }
+        if ["pay_type", "payType", "PayType"]
+            .iter()
+            .find_map(|field| value.get(*field).and_then(value_u64))
+            .is_some_and(|pay_type| matches!(pay_type, 1 | 3))
+        {
+            return true;
         }
     }
-    raw.get("VIP")
-        .or_else(|| raw.get("is_vip"))
-        .and_then(value_u64)
-        .is_some_and(|value| value != 0)
+    false
+}
+
+fn parse_kugou_trans_param(value: &Value) -> Option<Value> {
+    match value {
+        Value::Object(_) => Some(value.clone()),
+        Value::String(text) => serde_json::from_str(text).ok(),
+        _ => None,
+    }
 }
 
 fn resolver_parts(
@@ -1129,6 +2008,8 @@ fn decode_lrc_content(content: &str) -> Result<String, CatalogError> {
         return Ok(String::new());
     }
     match base64::engine::general_purpose::STANDARD.decode(content) {
+        Ok(bytes) if bytes.starts_with(b"krc1") => decode_krc_base64(content)
+            .map_err(|error| CatalogError::InvalidResponse(error.to_string())),
         Ok(bytes) => String::from_utf8(bytes)
             .map_err(|error| CatalogError::InvalidResponse(error.to_string())),
         Err(_) => Ok(content.to_owned()),
@@ -1136,7 +2017,83 @@ fn decode_lrc_content(content: &str) -> Result<String, CatalogError> {
 }
 
 fn response_data(value: &Value) -> &Value {
-    value.get("data").unwrap_or(value)
+    let mut current = value;
+    // A few gateway deployments wrap the normal payload more than once as
+    // `{data:{data:...}}`.  Unwrap only bounded, object-shaped protocol
+    // envelopes so an ordinary payload field named `data` is not traversed
+    // indefinitely.
+    for _ in 0..3 {
+        let Some(data) = current.get("data") else {
+            break;
+        };
+        if data
+            .as_object()
+            .is_some_and(|object| object.contains_key("data"))
+        {
+            current = data;
+            continue;
+        }
+        return data;
+    }
+    current.get("data").unwrap_or(current)
+}
+
+fn first_privilege_resource(value: &Value) -> Option<&Value> {
+    fn find(value: &Value, depth: u8) -> Option<&Value> {
+        if depth > 8 {
+            return None;
+        }
+        match value {
+            Value::Array(items) => items.iter().find_map(|item| {
+                (kugou_pay_type(item).is_some())
+                    .then_some(item)
+                    .or_else(|| find(item, depth + 1))
+            }),
+            Value::Object(object) => {
+                if kugou_pay_type(value).is_some() {
+                    return Some(value);
+                }
+                for key in [
+                    "resource",
+                    "resources",
+                    "list",
+                    "lists",
+                    "items",
+                    "result",
+                    "data",
+                    "body",
+                    "privilege",
+                ] {
+                    if let Some(found) = object.get(key).and_then(|child| find(child, depth + 1)) {
+                        return Some(found);
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+    find(value, 0)
+}
+
+fn kugou_pay_type(value: &Value) -> Option<u64> {
+    ["pay_type", "payType", "PayType", "paytype"]
+        .iter()
+        .find_map(|field| value.get(*field).and_then(value_u64))
+        .or_else(|| {
+            value.get("privilege").and_then(|privilege| {
+                ["pay_type", "payType", "PayType", "paytype"]
+                    .iter()
+                    .find_map(|field| privilege.get(*field).and_then(value_u64))
+            })
+        })
+        .or_else(|| {
+            value.get("Privilege").and_then(|privilege| {
+                ["pay_type", "payType", "PayType", "paytype"]
+                    .iter()
+                    .find_map(|field| privilege.get(*field).and_then(value_u64))
+            })
+        })
 }
 
 fn kugou_validation_is_rejected(response: &Value) -> bool {
@@ -1207,6 +2164,7 @@ fn value_string(value: &Value) -> Option<String> {
     value
         .as_str()
         .map(str::to_owned)
+        .or_else(|| value.as_i64().map(|value| value.to_string()))
         .or_else(|| value.as_u64().map(|value| value.to_string()))
 }
 
@@ -1250,6 +2208,80 @@ fn classify_status(response: &reqwest::Response) -> Result<(), CatalogError> {
     }
 }
 
+fn classify_business_response(value: &Value) -> Result<(), CatalogError> {
+    let data = response_data(value);
+    let status = find_kugou_business_number(value, &["status"])
+        .or_else(|| data.get("status").and_then(value_i64));
+    let error_code = find_kugou_business_number(value, &["error_code", "errorCode"])
+        .or_else(|| data.get("error_code").and_then(value_i64))
+        .or_else(|| data.get("errorCode").and_then(value_i64));
+    let response_code = find_kugou_root_business_number(value, "code");
+    if status.is_some_and(|status| status == 0)
+        || error_code.is_some_and(|error_code| error_code != 0)
+        || response_code.is_some_and(|code| code != 0)
+    {
+        let code = [error_code, response_code, status]
+            .into_iter()
+            .flatten()
+            .find(|code| *code != 0)
+            .unwrap_or_default();
+        if matches!(code, 20001 | 20018 | 20019 | 20020 | 401 | 403) {
+            return Err(CatalogError::CredentialRejected(
+                "Kugou rejected the request credentials".to_owned(),
+            ));
+        }
+        return Err(CatalogError::InvalidResponse(
+            "Kugou API returned an error response".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Find a protocol status/error field through the small set of envelopes used
+/// by KuGou gateways. Song metadata is deliberately not traversed.
+fn find_kugou_business_number(value: &Value, fields: &[&str]) -> Option<i64> {
+    fn visit(value: &Value, fields: &[&str], depth: u8) -> Option<i64> {
+        if depth > 4 {
+            return None;
+        }
+        let object = value.as_object()?;
+        if let Some(number) = fields
+            .iter()
+            .find_map(|field| object.get(*field).and_then(value_i64))
+        {
+            return Some(number);
+        }
+        for key in ["data", "result", "body", "response"] {
+            if let Some(child) = object
+                .get(key)
+                .and_then(|child| visit(child, fields, depth + 1))
+            {
+                return Some(child);
+            }
+        }
+        None
+    }
+    visit(value, fields, 0)
+}
+
+/// `code` is used by a few gateway envelopes, but song metadata can also have
+/// a field with that name.  Restrict this lookup to the root and one known
+/// response wrapper; never recurse through lists or arbitrary nested objects.
+fn find_kugou_root_business_number(value: &Value, field: &str) -> Option<i64> {
+    let object = value.as_object()?;
+    object.get(field).and_then(value_i64).or_else(|| {
+        ["data", "result", "body", "response"]
+            .iter()
+            .find_map(|key| {
+                object
+                    .get(*key)?
+                    .as_object()?
+                    .get(field)
+                    .and_then(value_i64)
+            })
+    })
+}
+
 fn classify_request_error(error: reqwest::Error) -> CatalogError {
     if error.is_timeout() {
         CatalogError::TimedOut(error.to_string())
@@ -1265,25 +2297,150 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        decode_lrc_content, extract_stream_url, kugou_calculate_mid, kugou_validation_is_rejected,
-        kugou_web_signature, parse_kugou_datetime_ms, parse_search_candidates, resolver_parts,
+        KugouAdPlayReportBody, KugouPrivilegeBody, KugouPrivilegeResource,
+        classify_business_response, classify_kugou_resolve_failure, decode_lrc_content,
+        extract_stream_url, kugou_android_signature, kugou_calculate_mid, kugou_lite_sign_key,
+        kugou_normalize_guid, kugou_validation_is_rejected, load_legacy_device_identity,
+        parse_kugou_datetime_ms, parse_search_candidates, resolver_parts, serialize_kugou_body,
     };
     use crate::catalog::CatalogError;
     use crate::credentials::ProviderCredential;
     use crate::domain::{ResolverLocator, SongKey};
 
     #[test]
-    fn kugou_signature_and_mid_calculation() {
-        let mut params = BTreeMap::new();
-        params.insert("appid".to_owned(), "3116".to_owned());
-        params.insert("clientver".to_owned(), "11440".to_owned());
-        let sig = kugou_web_signature(&params);
-        assert!(!sig.is_empty());
-        assert_eq!(sig.len(), 32);
-
+    fn mid_calculation_is_decimal() {
         let mid = kugou_calculate_mid("test-guid-123");
         assert!(!mid.is_empty());
         assert!(mid.chars().all(|c| c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn uuidv4_guid_is_normalized_once_before_mid_calculation() {
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        let normalized = kugou_normalize_guid(uuid);
+        assert_eq!(normalized.len(), 32);
+        assert!(normalized.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        let expected =
+            u128::from_str_radix(&format!("{:x}", md5::compute(normalized.as_bytes())), 16)
+                .unwrap()
+                .to_string();
+        assert_eq!(kugou_calculate_mid(&normalized), expected);
+        assert_ne!(kugou_calculate_mid(&normalized), kugou_calculate_mid(uuid));
+        assert_eq!(kugou_normalize_guid("device-guid"), "device-guid");
+    }
+
+    #[test]
+    fn android_signature_sorts_params_and_includes_body() {
+        let params = BTreeMap::from([
+            ("appid".to_owned(), "3116".to_owned()),
+            ("clientver".to_owned(), "11440".to_owned()),
+            ("clienttime".to_owned(), "1700000000".to_owned()),
+            ("dfid".to_owned(), "dfid".to_owned()),
+            ("mid".to_owned(), "123".to_owned()),
+            ("uuid".to_owned(), "-".to_owned()),
+            ("token".to_owned(), "tok".to_owned()),
+            ("userid".to_owned(), "42".to_owned()),
+            ("keyword".to_owned(), "海阔天空".to_owned()),
+        ]);
+        assert_eq!(
+            kugou_android_signature(&params, "{}"),
+            "6805e7e467eb0f16c702de7388a3431a"
+        );
+        assert_eq!(
+            kugou_lite_sign_key("ABC", "123", "42"),
+            "8d3218976947812b23207c437f69dd5f"
+        );
+    }
+
+    #[test]
+    fn playback_signature_matches_upstream_case_sensitive_sorting_vector() {
+        let mut params = BTreeMap::from([
+            ("album_id".to_owned(), "123456".to_owned()),
+            ("area_code".to_owned(), "1".to_owned()),
+            (
+                "hash".to_owned(),
+                "abcdef0123456789abcdef0123456789".to_owned(),
+            ),
+            ("ssa_flag".to_owned(), "is_fromtrack".to_owned()),
+            ("version".to_owned(), "11430".to_owned()),
+            ("page_id".to_owned(), "967177915".to_owned()),
+            ("quality".to_owned(), "320".to_owned()),
+            ("album_audio_id".to_owned(), "987654321".to_owned()),
+            ("behavior".to_owned(), "play".to_owned()),
+            ("pid".to_owned(), "411".to_owned()),
+            ("cmd".to_owned(), "26".to_owned()),
+            ("pidversion".to_owned(), "3001".to_owned()),
+            ("IsFreePart".to_owned(), "0".to_owned()),
+            (
+                "ppage_id".to_owned(),
+                "356753938,823673182,967485191".to_owned(),
+            ),
+            ("cdnBackup".to_owned(), "1".to_owned()),
+            ("module".to_owned(), String::new()),
+            ("clientver".to_owned(), "11430".to_owned()),
+            ("dfid".to_owned(), "test-dfid".to_owned()),
+            ("mid".to_owned(), "12345678901234567890".to_owned()),
+            ("uuid".to_owned(), "-".to_owned()),
+            ("appid".to_owned(), "3116".to_owned()),
+            ("clienttime".to_owned(), "1700000000".to_owned()),
+            ("token".to_owned(), "test-token".to_owned()),
+            ("userid".to_owned(), "42".to_owned()),
+        ]);
+        let key = kugou_lite_sign_key(
+            "abcdef0123456789abcdef0123456789",
+            "12345678901234567890",
+            "42",
+        );
+        assert_eq!(key, "dbc11897d9041d25df1c41e1902cbf8d");
+        params.insert("key".to_owned(), key);
+        assert_eq!(
+            kugou_android_signature(&params, ""),
+            "edf100987bced84a64d8a83bc77097c1"
+        );
+    }
+
+    #[test]
+    fn signed_post_bodies_keep_upstream_json_property_order() {
+        assert_eq!(
+            serialize_kugou_body(&KugouAdPlayReportBody {
+                ad_id: 12_307_537_187,
+                play_end: 1_700_000_030_000,
+                play_start: 1_700_000_000_000,
+            })
+            .unwrap(),
+            "{\"ad_id\":12307537187,\"play_end\":1700000030000,\"play_start\":1700000000000}"
+        );
+
+        let body = serialize_kugou_body(&KugouPrivilegeBody {
+            appid: 3116,
+            area_code: 1,
+            behavior: "play",
+            clientver: 11440,
+            need_hash_offset: 1,
+            relate: 1,
+            support_verify: 1,
+            resource: vec![KugouPrivilegeResource {
+                resource_type: "audio",
+                page_id: 0,
+                hash: "ABC".to_owned(),
+                album_id: "7".to_owned(),
+            }],
+            qualities: [
+                "128",
+                "320",
+                "flac",
+                "high",
+                "viper_atmos",
+                "viper_tape",
+                "viper_clear",
+                "super",
+                "multitrack",
+            ],
+        })
+        .unwrap();
+        assert!(body.starts_with(
+            "{\"appid\":3116,\"area_code\":1,\"behavior\":\"play\",\"clientver\":11440,\"need_hash_offset\":1,\"relate\":1,\"support_verify\":1,\"resource\":[{\"type\":\"audio\",\"page_id\":0,\"hash\":\"ABC\",\"album_id\":\"7\"}],\"qualities\":["
+        ));
     }
 
     #[test]
@@ -1326,6 +2483,35 @@ mod tests {
             parsed[0].song.resolver_locator.as_ref().unwrap().as_str(),
             "kugou:0123456789ABCDEF:7:88"
         );
+    }
+
+    #[test]
+    fn search_accepts_lowercase_protocol_aliases_and_structured_trans_param() {
+        let parsed = parse_search_candidates(&json!({
+            "data": {"info": [{
+                "hash": "ABCDEF0123456789",
+                "songname": "别名歌曲",
+                "singername": [{"name": "歌手甲"}, {"name": "歌手乙"}],
+                "album_id": "9",
+                "album_audio_id": 77,
+                "album_name": "别名专辑",
+                "duration_ms": 181000,
+                "trans_param": {"PayType": 3}
+            }]}
+        }))
+        .unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].song.artists, ["歌手甲", "歌手乙"]);
+        assert_eq!(parsed[0].song.album.as_deref(), Some("别名专辑"));
+        assert_eq!(parsed[0].song.duration_ms, Some(181_000));
+        assert_eq!(
+            parsed[0].song.resolver_locator.as_ref().unwrap().as_str(),
+            "kugou:ABCDEF0123456789:9:77"
+        );
+        assert!(matches!(
+            parsed[0].eligibility,
+            crate::catalog::PlaybackEligibility::VipRequired
+        ));
     }
 
     #[test]
@@ -1389,6 +2575,13 @@ mod tests {
         assert_eq!(
             extract_stream_url(&json!({"backupUrl": ["http://cdn.example/bak.mp3"]})),
             Some("http://cdn.example/bak.mp3")
+        );
+        assert_eq!(
+            extract_stream_url(&json!({
+                "url": [],
+                "backupUrl": ["http://cdn.example/fallback.mp3"]
+            })),
+            Some("http://cdn.example/fallback.mp3")
         );
         assert_eq!(extract_stream_url(&json!({"url": []})), None);
         assert_eq!(extract_stream_url(&json!({"data": {"status": 1}})), None);
@@ -1458,6 +2651,46 @@ mod tests {
     }
 
     #[test]
+    fn credential_mid_prefers_server_cookie_over_dfid() {
+        let credential = ProviderCredential::Kugou {
+            token: "token".to_owned(),
+            userid: "123".to_owned(),
+            dfid: "dfid-is-not-mid".to_owned(),
+            cookies: BTreeMap::from([
+                ("mid".to_owned(), "987654321".to_owned()),
+                ("KugouGUID".to_owned(), "guid".to_owned()),
+            ]),
+        };
+        assert_eq!(
+            super::KugouAdapter::credential_mid(Some(&credential)),
+            "987654321"
+        );
+    }
+
+    #[test]
+    fn credential_mid_falls_back_to_api_guid() {
+        let credential = ProviderCredential::Kugou {
+            token: "token".to_owned(),
+            userid: "123".to_owned(),
+            dfid: "dfid".to_owned(),
+            cookies: BTreeMap::from([(
+                "KUGOU_API_GUID".to_owned(),
+                "550e8400-e29b-41d4-a716-446655440000".to_owned(),
+            )]),
+        };
+        let normalized = kugou_normalize_guid(
+            credential
+                .cookies()
+                .get("KUGOU_API_GUID")
+                .expect("api guid"),
+        );
+        assert_eq!(
+            super::KugouAdapter::credential_mid(Some(&credential)),
+            kugou_calculate_mid(&normalized)
+        );
+    }
+
+    #[test]
     fn validation_rejects_explicit_kugou_error_envelopes() {
         assert!(!kugou_validation_is_rejected(&json!({
             "code": 0,
@@ -1473,6 +2706,80 @@ mod tests {
         assert!(kugou_validation_is_rejected(&json!({
             "error": "credential expired"
         })));
+    }
+
+    #[test]
+    fn business_response_rejects_kugou_error_envelopes() {
+        assert!(classify_business_response(&json!({"status": 1, "data": {}})).is_ok());
+        assert!(matches!(
+            classify_business_response(&json!({"status": 0, "error_code": 20018})),
+            Err(CatalogError::CredentialRejected(_))
+        ));
+        assert!(matches!(
+            classify_business_response(&json!({"data": {"error_code": 1234}})),
+            Err(CatalogError::InvalidResponse(_))
+        ));
+        assert!(matches!(
+            classify_business_response(&json!({"data": {"errorCode": "20018"}})),
+            Err(CatalogError::CredentialRejected(_))
+        ));
+        assert!(matches!(
+            classify_business_response(&json!({"code": 20018, "data": {}})),
+            Err(CatalogError::CredentialRejected(_))
+        ));
+        assert!(
+            classify_business_response(&json!({
+                "data": {"lists": [{"code": 20018}]}
+            }))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn resolve_failure_preserves_vip_and_auth_classification() {
+        assert!(matches!(
+            classify_kugou_resolve_failure(&json!({"data": {"vip": 1}})),
+            CatalogError::VipRequired(_)
+        ));
+        assert!(matches!(
+            classify_kugou_resolve_failure(&json!({
+                "status": 0,
+                "error_code": 20018
+            })),
+            CatalogError::CredentialRejected(_)
+        ));
+        assert!(matches!(
+            classify_kugou_resolve_failure(&json!({"data": {}})),
+            CatalogError::Unavailable(_)
+        ));
+    }
+
+    #[test]
+    fn legacy_device_identity_is_normalized_without_rewriting_disk_shape() {
+        let directory =
+            std::env::temp_dir().join(format!("miliastra-kugou-device-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("kugou-device.json");
+        let original_guid = "550e8400-e29b-41d4-a716-446655440000";
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "guid": original_guid,
+                "dev": "device-id",
+                "mac": "aa:bb:cc:dd:ee:ff"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = crate::credentials::CredentialStore::open(directory.clone()).unwrap();
+        let loaded = load_legacy_device_identity(&store).unwrap();
+        assert_eq!(loaded.guid, kugou_normalize_guid(original_guid));
+        assert_eq!(loaded.dev, "DEVICE-ID");
+        assert_eq!(loaded.mac, "AA:BB:CC:DD:EE:FF");
+        let persisted = std::fs::read_to_string(&path).unwrap();
+        assert!(persisted.contains(original_guid));
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

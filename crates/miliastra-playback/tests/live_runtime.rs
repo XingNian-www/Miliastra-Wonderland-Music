@@ -27,8 +27,8 @@ impl LiveRuntime {
                 )
             });
         let credential_directory = temporary_credential_directory();
-        let runtime = PlaybackRuntime::start(&credential_directory, "http://127.0.0.1:3000", None)
-            .expect("start playback runtime");
+        let runtime =
+            PlaybackRuntime::start(&credential_directory, None).expect("start playback runtime");
         let handle = runtime.handle();
         for provider in providers.iter().copied() {
             let path = source.join(format!("{}.json", provider.as_str()));

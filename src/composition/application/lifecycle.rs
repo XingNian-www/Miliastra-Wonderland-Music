@@ -173,11 +173,6 @@ impl ApplicationRuntime {
         {
             log::error!("原生播放器关闭失败: {error:#}");
         }
-        if let Some(mut kugou_api) = self.playback.kugou_api_sidecar.take()
-            && let Err(error) = kugou_api.shutdown()
-        {
-            log::error!("酷狗 API sidecar 关闭失败: {error:#}");
-        }
         if let Some(openai_runtime) = self.lifecycle.openai_runtime.take() {
             openai_runtime.shutdown();
             log::info!("OpenAI runtime 已关闭");

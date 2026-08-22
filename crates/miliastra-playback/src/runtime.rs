@@ -289,11 +289,9 @@ impl LyricState {
 impl PlaybackRuntime {
     pub fn start(
         credential_directory: impl Into<PathBuf>,
-        kugou_api_base_url: &str,
         audio_cache_config: Option<crate::cache::AudioCacheConfig>,
     ) -> Result<Self, PlaybackError> {
         let credential_directory = credential_directory.into();
-        let kugou_api_base_url = kugou_api_base_url.to_owned();
         let (commands, command_rx) = mpsc::channel(COMMAND_CAPACITY);
         let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
         let thread = thread::Builder::new()
@@ -301,7 +299,6 @@ impl PlaybackRuntime {
             .spawn(move || {
                 run_runtime_thread(
                     credential_directory,
-                    kugou_api_base_url,
                     audio_cache_config,
                     command_rx,
                     ready_tx,
@@ -606,7 +603,6 @@ impl LoginOperation {
 
 fn run_runtime_thread(
     credential_directory: PathBuf,
-    kugou_api_base_url: String,
     audio_cache_config: Option<crate::cache::AudioCacheConfig>,
     command_rx: mpsc::Receiver<Command>,
     ready: std_mpsc::SyncSender<Result<(), PlaybackError>>,
@@ -630,7 +626,7 @@ fn run_runtime_thread(
                 return;
             }
         };
-        let catalog = match build_catalog(&credentials, &kugou_api_base_url) {
+        let catalog = match build_catalog(&credentials) {
             Ok(catalog) => catalog,
             Err(error) => {
                 let _ = ready.send(Err(error));
@@ -686,10 +682,7 @@ fn run_runtime_thread(
     });
 }
 
-fn build_catalog(
-    credentials: &CredentialStore,
-    kugou_api_base_url: &str,
-) -> Result<SourceCatalog, PlaybackError> {
+fn build_catalog(credentials: &CredentialStore) -> Result<SourceCatalog, PlaybackError> {
     let qqmusic = Arc::new(
         QqMusicAdapter::new(credentials.clone(), SOURCE_TIMEOUT)
             .map_err(|error| PlaybackError::Startup(error.to_string()))?,
@@ -701,7 +694,7 @@ fn build_catalog(
             .map_err(|error| PlaybackError::Startup(error.to_string()))?,
     );
     let kugou = Arc::new(
-        KugouAdapter::new(credentials.clone(), SOURCE_TIMEOUT, kugou_api_base_url)
+        KugouAdapter::new(credentials.clone(), SOURCE_TIMEOUT)
             .map_err(|error| PlaybackError::Startup(error.to_string()))?,
     );
     Ok(SourceCatalog::new([

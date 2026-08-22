@@ -1029,23 +1029,11 @@ fn playback_section() -> Vec<ConfigFieldSchema> {
             FieldKind::Path,
             "受控登录使用的短生命周期助手",
         ),
-        ConfigFieldSchema::db_playback_idle_reload(
-            "kugou_api_executable",
-            "酷狗 API sidecar",
-            FieldKind::Path,
-            "内置酷狗概念版 API sidecar；仅当程序目录下存在该文件时才自动启动",
-        ),
         ConfigFieldSchema::db_idle_reload(
             "login_timeout_ms",
             "登录超时",
             int(1, MAX_TIMEOUT_MS),
             "单次交互登录的最长时间，单位毫秒",
-        ),
-        ConfigFieldSchema::db_playback_idle_reload(
-            "kugou_api_base_url",
-            "酷狗 API 地址",
-            FieldKind::String,
-            "酷狗 KuGouMusicApi 服务地址；文档站不是 API 服务",
         ),
         ConfigFieldSchema::db_idle_reload(
             "audio_cache",
@@ -2377,11 +2365,7 @@ mod tests {
 
     #[test]
     fn only_playback_source_recovery_fields_wait_for_an_active_song() {
-        for path in [
-            "playback.credential_directory",
-            "playback.kugou_api_executable",
-            "playback.kugou_api_base_url",
-        ] {
+        for path in ["playback.credential_directory"] {
             assert_eq!(
                 config_effect_for_path(path),
                 Some(Effect::PlaybackIdleReload),
@@ -2488,7 +2472,7 @@ mod tests {
             }
         }
         assert_eq!(
-            total_fields, 266,
+            total_fields, 264,
             "schema 总字段数应与预期一致（声明数 = 实际数）"
         );
     }

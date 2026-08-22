@@ -22,7 +22,6 @@ use std::thread::{self, sleep};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use self::formal_task::{FormalTaskClient, FormalTaskRuntime};
-use crate::adapters::kugou_api::{KugouApiConfig, KugouApiSidecar, resolve_kugou_api_executable};
 use crate::adapters::login_helper::LoginHelperManager;
 use crate::adapters::native_playback::NativePlaybackAdapter;
 use crate::adapters::player::PlayerRuntimeBackend;
@@ -389,7 +388,6 @@ struct PlaybackBundle {
     native_playback: PlaybackHandle,
     login_helper: LoginHelperManager,
     native_playback_runtime: Option<NativePlaybackRuntime>,
-    kugou_api_sidecar: Option<KugouApiSidecar>,
 }
 
 struct BusinessBundle {
@@ -719,7 +717,6 @@ impl FormalTaskExecutionContext {
                     native_playback: self.playback.native_playback.clone(),
                     login_helper: self.playback.login_helper.clone(),
                     native_playback_runtime: None,
-                    kugou_api_sidecar: None,
                 },
                 business: BusinessBundle {
                     business: self.business.business.clone(),
@@ -1274,33 +1271,8 @@ impl ApplicationRuntime {
         let state_store: Arc<dyn miliastra_contracts::StateStore> =
             Arc::new(crate::adapters::file_store::FsStateStore);
         let ocr_device = ProductionOcrDevice::new(ocr_args.clone())?;
-        // 酷狗概念版 API 默认不启用：仅当目录下存在 kugou-api.exe 或 app_win.exe 时才自动启动。
-        // 缺失时回退到配置的 base_url（若外部已运行 KuGouMusicApi 服务仍可访问）。
-        let kugou_api_sidecar =
-            match resolve_kugou_api_executable(&config.playback.kugou_api_executable) {
-                Some(executable) => {
-                    log::info!("检测到酷狗 API sidecar: {}", executable.display());
-                    Some(
-                        KugouApiSidecar::start(&KugouApiConfig::new(
-                            executable,
-                            config.playback.credential_directory.clone(),
-                            config.logging.dir.clone(),
-                        ))
-                        .context("启动酷狗概念版 API")?,
-                    )
-                }
-                None => {
-                    log::warn!("未检测到 kugou-api.exe 或 app_win.exe，酷狗概念版 API 未启用");
-                    None
-                }
-            };
-        let kugou_api_base_url = kugou_api_sidecar
-            .as_ref()
-            .map(|sidecar| sidecar.base_url().to_string())
-            .unwrap_or_else(|| config.playback.kugou_api_base_url.clone());
         let native_playback_runtime = NativePlaybackRuntime::start(
             config.playback.credential_directory.clone(),
-            &kugou_api_base_url,
             // 统一数据库：缓存元数据与配置共用同一个 playback.sqlite3。
             config.playback.audio_cache_runtime_config(
                 config
@@ -1317,7 +1289,6 @@ impl ApplicationRuntime {
             config.playback.login_helper_executable.clone(),
             config.playback.credential_directory.clone(),
             Duration::from_millis(config.playback.login_timeout_ms),
-            &kugou_api_base_url,
         );
         let playback_adapter = NativePlaybackAdapter::new(
             native_playback.clone(),
@@ -1558,7 +1529,6 @@ impl ApplicationRuntime {
                 native_playback,
                 login_helper,
                 native_playback_runtime: Some(native_playback_runtime),
-                kugou_api_sidecar,
             },
             business: BusinessBundle {
                 business,

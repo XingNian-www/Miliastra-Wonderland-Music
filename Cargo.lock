@@ -2629,6 +2629,7 @@ dependencies = [
  "cipher",
  "cpal",
  "ffmpeg-next",
+ "flate2",
  "http-body-util",
  "log",
  "md5",

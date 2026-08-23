@@ -1,5 +1,8 @@
 use std::collections::BTreeMap;
 
+/// Configurable lyric lead is capped to avoid selecting content far ahead of playback.
+pub const MAX_LYRICS_LEAD_SECONDS: f64 = 60.0;
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TimedLyricLine {
@@ -52,13 +55,36 @@ impl TimedLyrics {
         position_seconds: f64,
         use_translation: bool,
     ) -> Option<&str> {
-        if !position_seconds.is_finite() || position_seconds < 0.0 {
+        self.line_at_seconds_with_lead_and_translation(position_seconds, 0.0, use_translation)
+    }
+
+    pub fn line_at_seconds_with_lead(
+        &self,
+        position_seconds: f64,
+        lead_seconds: f64,
+    ) -> Option<&str> {
+        self.line_at_seconds_with_lead_and_translation(position_seconds, lead_seconds, true)
+    }
+
+    pub fn line_at_seconds_with_lead_and_translation(
+        &self,
+        position_seconds: f64,
+        lead_seconds: f64,
+        use_translation: bool,
+    ) -> Option<&str> {
+        if !position_seconds.is_finite()
+            || position_seconds < 0.0
+            || !lead_seconds.is_finite()
+            || !(0.0..=MAX_LYRICS_LEAD_SECONDS).contains(&lead_seconds)
+        {
             return None;
         }
-        self.line_at_ms_with_translation(
-            (position_seconds * 1000.0).round() as u64,
-            use_translation,
-        )
+        let adjusted_seconds = position_seconds + lead_seconds;
+        let adjusted_ms = adjusted_seconds * 1000.0;
+        if !adjusted_ms.is_finite() || adjusted_ms >= u64::MAX as f64 {
+            return None;
+        }
+        self.line_at_ms_with_translation(adjusted_ms.round() as u64, use_translation)
     }
 }
 
@@ -190,7 +216,7 @@ fn parse_timestamp(value: &str) -> Result<Option<u64>, LyricsParseError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{TimedLyrics, parse_lrc_pair};
+    use super::{MAX_LYRICS_LEAD_SECONDS, TimedLyricLine, TimedLyrics, parse_lrc_pair};
 
     #[test]
     fn parses_multiple_timestamps_and_prefers_non_empty_translation() {
@@ -228,7 +254,63 @@ mod tests {
 
     #[test]
     fn invalid_positions_do_not_produce_a_line() {
-        let lyrics = TimedLyrics::new(Vec::new());
-        assert!(lyrics.is_none());
+        let lyrics = sample_lyrics();
+
+        for position in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.001] {
+            assert_eq!(lyrics.line_at_seconds(position), None);
+        }
+        assert_eq!(lyrics.line_at_seconds(f64::MAX), None);
+    }
+
+    #[test]
+    fn lyric_lead_selects_the_future_line_without_changing_zero_lead_behavior() {
+        let lyrics = sample_lyrics();
+
+        assert_eq!(lyrics.line_at_seconds_with_lead(0.5, 0.0), None);
+        assert_eq!(lyrics.line_at_seconds_with_lead(1.5, 0.0), Some("first"));
+        assert_eq!(lyrics.line_at_seconds_with_lead(0.5, 0.49), None);
+        assert_eq!(lyrics.line_at_seconds_with_lead(0.5, 0.5), Some("first"));
+        assert_eq!(lyrics.line_at_seconds_with_lead(1.5, 1.5), Some("third"));
+        assert_eq!(lyrics.line_at_seconds_with_lead(0.5, 4.5), Some("fifth"));
+    }
+
+    #[test]
+    fn invalid_lyric_lead_does_not_produce_a_line() {
+        let lyrics = sample_lyrics();
+
+        for lead in [
+            -0.001,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            MAX_LYRICS_LEAD_SECONDS + 0.001,
+        ] {
+            assert_eq!(lyrics.line_at_seconds_with_lead(1.0, lead), None);
+        }
+        assert_eq!(
+            lyrics.line_at_seconds_with_lead(0.0, MAX_LYRICS_LEAD_SECONDS),
+            Some("fifth")
+        );
+    }
+
+    fn sample_lyrics() -> TimedLyrics {
+        TimedLyrics::new(vec![
+            TimedLyricLine {
+                start_ms: 1_000,
+                text: "first".to_owned(),
+                translation: None,
+            },
+            TimedLyricLine {
+                start_ms: 3_000,
+                text: "third".to_owned(),
+                translation: None,
+            },
+            TimedLyricLine {
+                start_ms: 5_000,
+                text: "fifth".to_owned(),
+                translation: None,
+            },
+        ])
+        .expect("sample lyrics")
     }
 }

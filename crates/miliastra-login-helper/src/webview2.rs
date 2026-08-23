@@ -6,6 +6,8 @@ use std::time::Duration;
 use md5::{Digest, Md5};
 use serde_json::{Value, json};
 
+use crate::native_qr::NativeQrEvent;
+
 #[derive(Debug, thiserror::Error)]
 pub enum CaptureError {
     #[error("WebView2 Evergreen Runtime is missing")]
@@ -22,8 +24,9 @@ pub fn capture(
     provider: &str,
     profile: &Path,
     timeout: Duration,
+    publish_qr_code: &mut dyn FnMut(&str) -> Result<(), CaptureError>,
 ) -> Result<BTreeMap<String, String>, CaptureError> {
-    platform::capture(provider, profile, timeout)
+    platform::capture(provider, profile, timeout, publish_qr_code)
 }
 
 fn login_url(provider: &str) -> Option<&'static str> {
@@ -1046,11 +1049,16 @@ fn kugou_qr_key() -> Result<(String, String), String> {
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned)
         .unwrap_or_default();
+    if !image.is_empty() {
+        miliastra_login_protocol::validate_qr_image_data_url(&image)
+            .map_err(|_| "酷狗二维码图片格式无效".to_owned())?;
+    }
     Ok((key, image))
 }
 
 /// 构建二维码展示页 HTML（直接内嵌 base64 图片，避免 H5 页 UA 跳转）。
 fn kugou_qr_page(image: &str) -> String {
+    let image = escape_html_attribute(image);
     format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"><title>酷狗登录</title></head>\
          <body style=\"margin:0;background:#f5f5f5;display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;font-family:sans-serif\">\
@@ -1059,6 +1067,14 @@ fn kugou_qr_page(image: &str) -> String {
          <p style=\"color:#666;margin-top:18px;font-size:14px\">请使用酷狗 App 扫码登录</p>\
          </body></html>"
     )
+}
+
+fn escape_html_attribute(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 fn parse_kugou_qr_poll_response(
@@ -1194,7 +1210,7 @@ mod kugou_qr_tests {
     use std::collections::BTreeMap;
 
     use super::{
-        KugouQrPollError, kugou_qr_key, kugou_qr_poll, kugou_web_signature,
+        KugouQrPollError, escape_html_attribute, kugou_qr_key, kugou_qr_poll, kugou_web_signature,
         parse_kugou_qr_poll_response, value_as_i64,
     };
     use serde_json::json;
@@ -1269,11 +1285,23 @@ mod kugou_qr_tests {
     }
 
     #[test]
+    fn kugou_qr_page_attribute_escaping_blocks_markup_injection() {
+        let escaped = escape_html_attribute("data:image/png;base64,abc\" onerror=alert(1)<>");
+        assert_eq!(
+            escaped,
+            "data:image/png;base64,abc&quot; onerror=alert(1)&lt;&gt;"
+        );
+    }
+
+    #[test]
     #[ignore = "需要公网访问酷狗登录接口"]
     fn kugou_qr_key_and_poll_round_trip() {
         let (key, image) = kugou_qr_key().expect("获取二维码 key");
         assert!(!key.is_empty());
-        assert!(image.starts_with("data:image"));
+        miliastra_login_protocol::encode_message(
+            &miliastra_login_protocol::LoginHelperMessage::qr_code("kugou", image),
+        )
+        .expect("真实酷狗二维码应符合登录协议约束");
         let result = kugou_qr_poll(&key);
         eprintln!("poll 结果: {result:?}");
     }
@@ -1282,7 +1310,7 @@ mod kugou_qr_tests {
 #[cfg(windows)]
 #[allow(unsafe_op_in_unsafe_fn)]
 mod platform {
-    use super::{CaptureError, KugouQrPollResult, allowed_cookie_names, login_url};
+    use super::{CaptureError, KugouQrPollResult, NativeQrEvent, allowed_cookie_names, login_url};
     use std::collections::BTreeMap;
     use std::ffi::{OsStr, c_void};
     use std::mem::{size_of, transmute_copy};
@@ -1401,6 +1429,8 @@ mod platform {
         bilibili_js_probe_attempts: u32,
         kugou_qr_rx: Option<mpsc::Receiver<KugouQrPollResult>>,
         kugou_qr_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        native_qr_rx: Option<mpsc::Receiver<NativeQrEvent>>,
+        native_qr_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     }
 
     struct CaptureContext {
@@ -1413,10 +1443,13 @@ mod platform {
 
     impl Drop for CaptureContext {
         fn drop(&mut self) {
-            if let Ok(state) = self.state.lock()
-                && let Some(cancel) = state.kugou_qr_cancel.as_ref()
-            {
-                cancel.store(true, std::sync::atomic::Ordering::Release);
+            if let Ok(state) = self.state.lock() {
+                if let Some(cancel) = state.kugou_qr_cancel.as_ref() {
+                    cancel.store(true, std::sync::atomic::Ordering::Release);
+                }
+                if let Some(cancel) = state.native_qr_cancel.as_ref() {
+                    cancel.store(true, std::sync::atomic::Ordering::Release);
+                }
             }
         }
     }
@@ -1653,6 +1686,40 @@ mod platform {
                     state.outcome = Some(Err(CaptureError::Io(error.into_user_message())));
                 }
                 None => {}
+            }
+        }
+
+        fn poll_native_qr(self: &Rc<Self>) -> Option<String> {
+            if !matches!(self.provider.as_str(), "qqmusic" | "netease" | "bilibili") {
+                return None;
+            }
+            let event = {
+                let state = self.state.lock().expect("capture state mutex poisoned");
+                if state.outcome.is_some() {
+                    return None;
+                }
+                let receiver = state.native_qr_rx.as_ref()?;
+                match receiver.try_recv() {
+                    Ok(event) => Some(event),
+                    Err(mpsc::TryRecvError::Empty) => None,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        Some(NativeQrEvent::Error("二维码轮询线程已断开".to_owned()))
+                    }
+                }
+            };
+            match event {
+                Some(NativeQrEvent::Qr(image)) => Some(image),
+                Some(NativeQrEvent::Success(cookies)) => {
+                    let mut state = self.state.lock().expect("capture state mutex poisoned");
+                    state.outcome = Some(Ok(cookies));
+                    None
+                }
+                Some(NativeQrEvent::Error(message)) => {
+                    let mut state = self.state.lock().expect("capture state mutex poisoned");
+                    state.outcome = Some(Err(CaptureError::Io(message)));
+                    None
+                }
+                None => None,
             }
         }
 
@@ -2101,7 +2168,7 @@ mod platform {
             return S_OK;
         }
 
-        // 内嵌 HTML（酷狗二维码页）走 NavigateToString，其余走 Navigate。
+        // 内嵌 HTML（酷狗及原生二维码页）走 NavigateToString，其余走 Navigate。
         // ICoreWebView2::NavigateToString 位于 vtable 槽位 6。
         let hr = if let Some(html) = &context.html {
             let navigate_to_string: unsafe extern "system" fn(*mut c_void, PCWSTR) -> HRESULT =
@@ -2464,16 +2531,28 @@ mod platform {
         provider: &str,
         profile: &Path,
         timeout: Duration,
+        publish_qr_code: &mut dyn FnMut(&str) -> Result<(), CaptureError>,
     ) -> Result<BTreeMap<String, String>, CaptureError> {
         set_process_dpi_awareness();
+        // Include QR creation and WebView2 initialization in the same absolute
+        // deadline used by the polling loop. This prevents a slow provider
+        // endpoint from extending the advertised login timeout.
+        let deadline = Instant::now() + timeout;
         let _runtime = runtime_executable().ok_or(CaptureError::RuntimeMissing)?;
         let _com = ComApartment::initialize()?;
         let window = HostWindow::create()?;
-        // 酷狗走概念版扫码登录：获取二维码 key 与图片，窗口内直接显示
-        // 二维码（内嵌 HTML，避免 H5 页对桌面 UA 跳转），后台轮询扫码状态；
-        // 其余平台使用固定的登录页。
-        let (context, qr_receiver, qr_cancel) = if provider == "kugou" {
+        // 酷狗和三个原生二维码平台都在窗口内显示内嵌页面；只有未实现
+        // 原生二维码的入口才导航到固定登录页。
+        let mut kugou_qr_receiver = None;
+        let mut kugou_qr_cancel = None;
+        let mut native_qr_receiver = None;
+        let mut native_qr_cancel = None;
+        let context = if provider == "kugou" {
             let (key, image) = super::kugou_qr_key().map_err(CaptureError::Io)?;
+            if image.is_empty() {
+                return Err(CaptureError::Io("酷狗登录接口未返回二维码图片".to_owned()));
+            }
+            publish_qr_code(&image)?;
             let (sender, receiver) = mpsc::channel();
             let poll_key = key.clone();
             let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2481,21 +2560,62 @@ mod platform {
             thread::spawn(move || super::kugou_qr_poll_loop(&poll_key, sender, poll_cancel));
             let html = super::kugou_qr_page(&image);
             let context = match CaptureContext::new_with_html(provider, window.hwnd, &html) {
-                Ok(context) => Rc::new(context),
+                Ok(context) => context,
                 Err(error) => {
                     cancel.store(true, std::sync::atomic::Ordering::Release);
                     return Err(error);
                 }
             };
-            (context, Some(receiver), Some(cancel))
+            kugou_qr_receiver = Some(receiver);
+            kugou_qr_cancel = Some(cancel);
+            Rc::new(context)
+        } else if matches!(provider, "qqmusic" | "netease" | "bilibili") {
+            let (sender, receiver) = mpsc::channel();
+            let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match crate::native_qr::start(
+                provider,
+                remaining,
+                sender,
+                std::sync::Arc::clone(&cancel),
+            ) {
+                Ok(image) => {
+                    if let Err(error) = publish_qr_code(&image) {
+                        cancel.store(true, std::sync::atomic::Ordering::Release);
+                        return Err(error);
+                    }
+                    let html = crate::native_qr::page(provider, &image);
+                    let context = match CaptureContext::new_with_html(provider, window.hwnd, &html)
+                    {
+                        Ok(context) => context,
+                        Err(error) => {
+                            cancel.store(true, std::sync::atomic::Ordering::Release);
+                            return Err(error);
+                        }
+                    };
+                    native_qr_receiver = Some(receiver);
+                    native_qr_cancel = Some(cancel);
+                    Rc::new(context)
+                }
+                Err(_) => {
+                    // Keep the existing WebView login path as a bounded
+                    // compatibility fallback when a provider blocks its QR API.
+                    cancel.store(true, std::sync::atomic::Ordering::Release);
+                    Rc::new(CaptureContext::new(provider, window.hwnd)?)
+                }
+            }
         } else {
-            let context = Rc::new(CaptureContext::new(provider, window.hwnd)?);
-            (context, None, None)
+            Rc::new(CaptureContext::new(provider, window.hwnd)?)
         };
-        if let Some(receiver) = qr_receiver {
+        if let Some(receiver) = kugou_qr_receiver {
             let mut state = context.state.lock().expect("capture state mutex poisoned");
             state.kugou_qr_rx = Some(receiver);
-            state.kugou_qr_cancel = qr_cancel;
+            state.kugou_qr_cancel = kugou_qr_cancel;
+        }
+        if let Some(receiver) = native_qr_receiver {
+            let mut state = context.state.lock().expect("capture state mutex poisoned");
+            state.native_qr_rx = Some(receiver);
+            state.native_qr_cancel = native_qr_cancel;
         }
         window.attach_context(&context);
         let environment_handler = Box::into_raw(Box::new(EnvironmentHandler {
@@ -2520,12 +2640,18 @@ mod platform {
             ));
         }
 
-        let deadline = Instant::now() + timeout;
         let outcome = loop {
             pump_messages(&context);
             context.poll_navigation();
             context.poll_login_exchange();
             context.poll_kugou_qr();
+            if let Some(image) = context.poll_native_qr()
+                && let Err(error) = publish_qr_code(&image)
+            {
+                // Convert callback failures into the normal outcome path so
+                // COM interfaces and cancellation state are released below.
+                context.finish_error(error);
+            }
             context.poll_cookies();
             context.start_login_exchange();
             if let Some(outcome) = context.take_outcome() {
@@ -2682,6 +2808,7 @@ mod platform {
         _provider: &str,
         _profile: &Path,
         _timeout: Duration,
+        _publish_qr_code: &mut dyn FnMut(&str) -> Result<(), CaptureError>,
     ) -> Result<BTreeMap<String, String>, CaptureError> {
         Err(CaptureError::RuntimeMissing)
     }

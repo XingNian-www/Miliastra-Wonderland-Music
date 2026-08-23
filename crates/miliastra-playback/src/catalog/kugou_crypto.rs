@@ -1,6 +1,6 @@
-//! Pure Rust helpers for KuGou's lite Android protocol.
+//! Pure Rust helpers for KuGou's test (concept/lite) Android protocol.
 //!
-//! The lite login endpoints use UTF-8 JSON encrypted with AES-CBC (PKCS#7,
+//! The test/lite login endpoints use UTF-8 JSON encrypted with AES-CBC (PKCS#7,
 //! hex output), and a raw RSA public operation (no PKCS#1 padding).  Keeping
 //! these operations here makes the HTTP adapter easy to test without coupling
 //! the cryptographic code to a live request.
@@ -19,7 +19,7 @@ use rsa::traits::PublicKeyParts;
 use serde::Serialize;
 use std::io::Read;
 
-/// Public key used by the KuGou lite login endpoints.
+/// Public key used by the KuGou test/lite login endpoints.
 pub const KUGOU_LITE_RSA_PUBLIC_KEY: &str = "-----BEGIN PUBLIC KEY-----\nMIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDECi0Np2UR87scwrvTr72L6oO01rBbbBPriSDFPxr3Z5syug0O24QyQO8bg27+0+4kBzTBTBOZ/WWU0WryL1JSXRTXLgFVxtzIY41Pe7lPOgsfTCn5kZcvKhYKJesKnnJDNr5/abvTGf+rHG3YRwsCHcQ08/q6ifSioBszvb3QiwIDAQAB\n-----END PUBLIC KEY-----";
 
 const LITE_TOKEN_KEY: &[u8; 32] = b"c24f74ca2820225badc01946dba4fdf7";

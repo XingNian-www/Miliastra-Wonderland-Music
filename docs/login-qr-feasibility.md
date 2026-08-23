@@ -9,9 +9,10 @@
 
 详见 `crates/miliastra-login-helper/src/webview2.rs`，分两类：
 
-### 1.1 酷狗（已实现，作为参考模板）
-- 官方 API 直连：`kugou_qr_key()` 调 `https://login-user.kugou.com/v2/qrcode`，**直接返回 base64 二维码图**（`data.qrcode_img`）+ `data.qrcode`(key)。
+### 1.1 酷狗测试版 API（概念版/lite，已实现，作为参考模板）
+- 使用酷狗测试版 API（官方参数标识为概念版/lite）：`kugou_qr_key()` 调 `https://login-user.kugou.com/v2/qrcode`，**直接返回 base64 二维码图**（`data.qrcode_img`）+ `data.qrcode`(key)。
 - WebView2 仅用来显示图片（`kugou_qr_page()` 内嵌 base64 图）+ 后台线程轮询 `https://login-user.kugou.com/v2/get_userinfo_qrcode`，`status=4` 拿到 token/userid。
+- 播放、权限、登录刷新和设备注册同样沿用测试版/lite 参数（`appid=3116`、`clientver=11440`）；`lite` 是接口协议字段，不代表切换到标准版 API。
 - 无需页面导航、无需抓 cookie。二维码图直接通过现有协议上抛主程序。
 
 ### 1.2 QQ / 网易 / B 站（原生二维码已实现）

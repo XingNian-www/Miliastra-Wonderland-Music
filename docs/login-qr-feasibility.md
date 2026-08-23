@@ -1,109 +1,53 @@
-# 辅助登录·二维码提取功能 实现规格
+# 辅助登录·二维码提取功能实现规格
 
-> 调研依据：真实接口实测 + 现有代码路径核查，非静态猜测。
-> 目标：让 QQ 音乐 / 网易云 / 哔哩哔哩 也走「官方 API 直连拿二维码」登录，与酷狗统一。三个平台的原生二维码链路已经落地；当接口不可用时保留 WebView2 兼容回退。
+> 调研依据：真实页面结构、WebView2 本地运行结果和现有凭据采集路径。
+> 当前目标：QQ 音乐、网易云音乐、酷狗音乐统一使用官方 WebView2 登录页提取二维码；登录状态和最终凭据也由同一个 WebView2 profile 采集。哔哩哔哩暂时保留已有原生二维码链路。
 
----
+## 1. 总体架构
 
-## 1. 现有架构
+`crates/miliastra-login-helper/src/webview2.rs` 负责三家 WebView2 登录：
 
-详见 `crates/miliastra-login-helper/src/webview2.rs`，分两类：
+- WebView2 加载官方登录页，脚本每 250 ms 探测一次 DOM/Canvas。
+- 脚本只返回二维码图片 data URL 或官方图片 URL，不读取 `document.cookie`，也不把页面脚本当作登录协议。
+- data URL 在协议层校验 PNG/JPEG 文件头和 256 KiB 上限；图片 URL 只允许对应平台域名，由短时限 HTTP 客户端下载后再校验。
+- 二维码帧通过现有 `LoginHelperMessage::QrCode` 传给主进程，Cookie、OAuth 回调和登录完成判定继续走 WebView2 CookieManager。
+- WebView2 的绝对截止时间同时覆盖页面加载、二维码提取和 Cookie 轮询；取消或窗口关闭会释放 profile 和所有异步回调。
 
-### 1.1 酷狗测试版 API（概念版/lite，已实现，作为参考模板）
-- 使用酷狗测试版 API（官方参数标识为概念版/lite）：`kugou_qr_key()` 调 `https://login-user.kugou.com/v2/qrcode`，**直接返回 base64 二维码图**（`data.qrcode_img`）+ `data.qrcode`(key)。
-- WebView2 仅用来显示图片（`kugou_qr_page()` 内嵌 base64 图）+ 后台线程轮询 `https://login-user.kugou.com/v2/get_userinfo_qrcode`，`status=4` 拿到 token/userid。
-- 播放、权限、登录刷新和设备注册同样沿用测试版/lite 参数（`appid=3116`、`clientver=11440`）；`lite` 是接口协议字段，不代表切换到标准版 API。
-- 无需页面导航、无需抓 cookie。二维码图直接通过现有协议上抛主程序。
+`crates/miliastra-login-helper/src/native_qr.rs` 目前只由哔哩哔哩分支使用。QQ/网易云/酷狗不再启动 MQTT、二维码状态轮询或酷狗测试版二维码接口。
 
-### 1.2 QQ / 网易 / B 站（原生二维码已实现）
-- `native_qr.rs` 负责官方接口、二维码图片编码、轮询线程、取消和凭据映射。
-- 原生链路首先把 `QrCode` 帧送到主进程；登录成功后再送终态凭据。接口初始化失败时回退到原有 WebView2 页面抓 Cookie。
-- QQ 原生链路使用移动端 `CreateQRCode` + MQTT v5，成功后调用 `music.login.LoginServer/Login(tmeLoginType=6)` 换取完整凭据；旧 WebView OAuth 逻辑仍保留作回退。
+## 2. 三个平台的页面入口和提取方式
 
----
+| 平台 | WebView2 入口 | 页面二维码形态 | 提取方式 |
+| --- | --- | --- | --- |
+| QQ 音乐 | `xui.ptlogin2.qq.com/cgi-bin/xlogin` 官方 QQ OAuth QR 页 | `img.qrImg`，URL 指向 `xui.ptlogin2.qq.com/ssl/ptqrshow` | 读取图片 URL，带官方 Referer 下载并转 data URL；扫码后的 `graph.qq.com/oauth2.0/login_jump` 回调由导航事件捕获 |
+| 网易云音乐 | `https://music.163.com/` | 登录弹窗内约 228×228 的 `canvas` | 页面脚本点击 `data-action="login"`，调用 `canvas.toDataURL('image/png')` |
+| 酷狗音乐 | `https://login-user.kugou.com/login/?appid=1014...` | `alt="登录二维码"` 的 PNG data URL | 读取可见 `img` 的 data URL；扫码成功后页面写入 `KuGoo` Cookie |
 
-## 2. 关键判断：三平台接口实测结论
+QQ 直接打开官方 QR 页面是为了避开 QQ 音乐主页中的跨域 iframe；这仍是网页登录流程，OAuth 回调和 Cookie 都在同一个 WebView2 会话内完成。QQ 回调若只带 `code` 而没有外层 `login_type`，仅在 `graph.qq.com/oauth2.0/login_jump` 路径下推断为 QQ 登录类型 1。
 
-| 平台 | 二维码获取接口 | 返回"图"还是"内容URL" | 轮询接口 | 实测 |
-|------|--------------|---------------------|---------|------|
-| **哔哩哔哩** | `GET https://passport.bilibili.com/x/passport-login/web/qrcode/generate` | 内容 URL（登录页 URL）+ `qrcode_key`，本地生成 PNG | `GET /x/passport-login/web/qrcode/poll?qrcode_key=` | ✅ 已接入 |
-| **网易云** | `POST https://music.163.com/api/login/qrcode/unikey?type=1` | 只返回 `unikey`，本地生成 PNG | `POST /api/login/qrcode/client/login?key=&type=1` | ✅ 已接入；普通 API 实测返回 801，暂不依赖 eAPI |
-| **QQ音乐** | `POST https://u.y.qq.com/cgi-bin/musicu.fcg` 的 `CreateQRCode` | 官方直接返回 PNG data URL | WSS MQTT `mu.y.qq.com/ws/handshake` + `management.qrcode_login/<id>` | ✅ 已接入 |
+## 3. 二维码脚本约束
 
-**分类结论：**
-- QQ 音乐返回官方 PNG；B 站和网易云返回内容 URL，由 Rust `qrcode` 生成 PNG。
-- 三个平台都复用现有 `QrCode` 非终态帧；当前实现将登录助手协议升级到版本 4，Web API 仍复用 `/player/login/status`，没有新增路由。
+脚本采用通用候选评分而不是固定页面层级：
 
----
+- 只接受可见、近似正方形且边长至少 80 px 的 `canvas`/`img`。
+- `qr`、`qrcode`、`qrlogin`、`二维码` 等标记优先；普通 Logo 不会被选中。
+- NetEase Canvas 转 PNG；外链图片由 Rust 侧下载，限制 `http/https`、平台域名后缀和 256 KiB 响应大小。
+- 页面脚本不访问 Cookie、localStorage 或凭据字段；B 站已有的 refresh token 探测仍是独立的登录完成步骤。
 
-## 3. 原阻断点的处理结果
+## 4. 凭据采集和完成判定
 
-已在 `miliastra-login-helper` 引入纯 Rust `qrcode` + `image`，统一输出经过协议层 PNG 签名/大小校验的 data URL；网易云不再依赖文档中风险较高的 eAPI 路径，优先使用实测可用的普通 `/api` 轮询。
+- QQ：导航回调触发已有 OAuth 授权码交换；CookieManager 快照与交换结果合并，保留 `uin`、`qqmusic_key`、`openid/access_token/refresh_token` 等别名。
+- 网易云：CookieManager 以 `MUSIC_U` 为硬条件。旧客户端二维码接口扫码后返回 8821 的问题不再影响此路径，因为不再调用该接口。
+- 酷狗：CookieManager 以 `KuGoo` 中同时存在 `t=` 和 `KugooID=` 为硬条件；兼容网页 `encodeURIComponent` 写入的 `%3D/%26` 形式，设备辅助字段按 allowlist 保留。
+- 主进程仍通过 `/player/login/status` 返回活动会话的最新二维码，二维码刷新时替换旧图；最终凭据只在满足平台硬条件后发送终态帧。
 
----
+## 5. 验证结果
 
-## 4. 现有可复用代码
+已在 Windows 本机使用临时 WebView2 profile 实测：
 
-### 4.1 协议层
-`crates/miliastra-login-protocol/src/lib.rs`：
-- `LoginHelperMessage::QrCode { version, provider, image_data_url }` —— 非终态消息，主程序持续接收直到 `success`/`error`。
-- `validate_qr_data_url`：仅接受 `data:image/png;base64,` / `data:image/jpeg;base64,`，限 `MAX_QR_IMAGE_BYTES=256*1024`，校验文件头签名（PNG `\x89PNG\r\n\x1a\n`、JPEG `\xff\xd8\xff`）。
-- **A 类平台直接产出 PNG 即可通过校验，无需改协议。**
+- `qqmusic`：成功提取官方 `qrImg` URL 并发送协议版本 4 的 `qrCode` 帧。
+- `netease`：成功点击登录弹窗并把 Canvas 转成 PNG，发送 `qrCode` 帧。
+- `kugou`：成功提取官方 `data:image/png`，发送 `qrCode` 帧。
+- 三个测试均在未扫码时按绝对超时退出，没有启动对应原生二维码轮询线程。
 
-### 4.2 helper 主流程（参考酷狗分支）
-`crates/miliastra-login-helper/src/main.rs`：
-- `Provider` 枚举已有 `QqMusic / Netease / Bilibili / Kugou`，`id()` / `payload()` 已就绪。
-- 酷狗把二维码上抛到 `qr_code(args.provider, image_data_url)`，主程序进 `run_helper` 收到 `QrCode` 后 `store_qr_code`。
-
-### 4.3 主程序 QR 存储边界
-`src/adapters/login_helper.rs` 的 `store_qr_code()` 校验返回平台必须与活动会话一致，现在允许四个已支持平台：
-```rust
-if actual != session.provider {
-    return Err(...invalid_helper_provider...);
-}
-```
-二维码帧仍受协议层图片签名、大小和活动会话校验保护。
-
-### 4.4 平台常量与命名字段对照
-- `ProviderId::QqMusic/Netease/Bilibili/Kugou`，`as_str()` 分别为 `"qqmusic"/"netease"/"bilibili"/"kugou"`。
-- `webview2.rs` 的 `allowed_cookie_names` / `has_required_cookies` 已给出各平台登录后要抓的核心 cookie（QQ: uin/qqmusic_key 等；B 站: SESSDATA/bili_jct/DedeUserID + ac_time_value 刷新 token；网易: MUSIC_U；酷狗: KuGoo）。
-
----
-
-## 5. 各平台接入细则（已落地）
-
-### 5.1 QQ 音乐：CreateQRCode + MQTT v5
-
-- 生成：向 `https://u.y.qq.com/cgi-bin/musicu.fcg` 发送 `music.login.LoginServer/CreateQRCode`，使用 Android 公共参数（`ct=11`、`cv=14090008`、`tmeAppID=qqmusic`）。响应中的 `req_0.data.qrcode` 是官方 PNG data URL，`qrcodeID` 是本次会话标识。
-- 监听：连接 `wss://mu.y.qq.com/ws/handshake`，在 CONNECT/订阅属性中携带 `tmeAppID=qqmusic`、`business=management`、`hashTag/userID=qrcodeID`，订阅 `management.qrcode_login/<qrcodeID>`。事件类型优先从 MQTT v5 user property `type` 读取，再回退到 JSON 的 `type` 字段。
-- `scanned` 继续等待，`timeout`/`canceled` 结束，`cookies` 事件提取 `qqmusic_uin` 与 `qqmusic_key`，调用 `music.login.LoginServer/Login`（`tmeLoginType=6`）换取音乐凭据。响应同时检查顶层和 `req_0` 内层业务码，避免把顶层 `code=0` 误判为成功。
-- 原有 QQ WebView OAuth 链路仍保留：原生接口初始化失败时导航到原登录页，保证接口被限流或变更时仍可登录。
-
-### 5.2 哔哩哔哩：公开 Web QR 接口
-
-- 生成：`GET https://passport.bilibili.com/x/passport-login/web/qrcode/generate`，读取 `data.url` 与 `data.qrcode_key`；`url` 是二维码内容，不是图片，使用 Rust `qrcode` 渲染 PNG。
-- 轮询：`GET https://passport.bilibili.com/x/passport-login/web/qrcode/poll?qrcode_key=...`。`data.code` 为 `86101`（未扫码）或 `86090`（已扫码）时继续；`86038` 触发换码，最多使用 3 张二维码（初始二维码加 2 次自动刷新）；`0` 读取响应 `Set-Cookie`、成功 URL 查询参数和 `refresh_token`。
-- 成功至少要求 `SESSDATA` 非空；`bili_jct` 若由服务端下发则一并保留，但不是完成登录的硬性条件。`refresh_token` 映射到现有 B 站凭据的独立 `refresh_token` 字段（helper 内部暂存为 `ac_time_value`，发送终态前移出 cookie map）。
-- 轮询线程在每次换码后都会发送新的 `QrCode` 帧，主进程和 Web 页面会替换旧图片。
-
-### 5.3 网易云：普通 API unikey + client/login
-
-- 生成：`POST https://music.163.com/api/login/qrcode/unikey?type=1`，响应 `code=200` 与 `unikey`。二维码内容为 `https://music.163.com/login?codekey=<unikey>`，本地渲染 PNG；不依赖已失效的 `qrimg` 接口。
-- 轮询：`POST https://music.163.com/api/login/qrcode/client/login?key=<unikey>&type=1`。`801` 未扫码、`802` 已扫码、`803` 成功、`800` 过期。成功时合并 `Set-Cookie` 及响应中的 `cookie`/`cookies` 字符串，至少要求 `MUSIC_U`。
-- 这里没有引入 eAPI 加密：当前普通 `/api` 链路已实测生成 key、返回 `801`，实现面更小且避免把风控失败误报成登录成功；如果服务端未来关闭普通轮询，代码会收敛为可重试错误并保留 WebView2 回退。
-
----
-
-## 6. 传输与生命周期
-
-- helper 在取得第一张二维码后立即写出 `QrCode` 帧，主进程 `run_helper` 持续读取非终态帧并按活动会话保存；二维码刷新时发送新的 `QrCode`，Web 页面会替换旧图。
-- `store_qr_code` 校验 provider 必须与当前会话一致，协议层同时校验 data URL 的 MIME、Base64、PNG/JPEG 文件头和 256 KiB 解码上限；日志和 Debug 实现不会输出图片内容或凭据。
-- 每个平台轮询线程都有绝对截止时间、取消标志、网络连续失败收敛和有限换码次数。登录取消或窗口销毁时设置取消标志；原生二维码初始化失败时回到原 WebView2 登录页，轮询阶段的终态错误则明确返回给 Web UI。
-- Web UI `/player/login/status` 直接返回当前活动会话的 `qrCode.imageDataUrl`，页面按平台显示标题和扫码提示，不再只对酷狗显示二维码。
-
-## 7. 验证结果与剩余风险
-
-- 已验证：三平台真实公网二维码生成均通过协议图片校验；QQ MQTT WSS 连接在 8 秒边界内正常建立并可有界退出；helper `cargo check`、`cargo clippy --all-targets -D warnings`、单元测试全部通过。
-- 未执行真实账号扫码闭环（需要在设备上确认登录），因此 QQ `cookies` 事件到 `Login` 的最终凭据字段仍以服务端实际返回为准；解析器已覆盖数字/字符串业务码、嵌套 `req_0` 响应和常见 cookie 载体。
-- 平台接口属于第三方公开登录协议，可能出现限流、区域网络或字段变更。请求失败不会把空凭据写入存储；达到连续失败/过期上限后返回稳定错误码，用户可重新发起登录。
-- 原生二维码仍在现有 Windows WebView2 helper 窗口中运行，以便保留旧登录回退和消息循环；WebView2 Runtime 缺失时不会伪造成功凭据，而是返回运行时不可用错误。
+尚未完成真实账号扫码后的凭据闭环验证；需要在二维码有效期内扫码确认各平台当前 Cookie/OAuth 字段是否完整。失败不会写入空凭据，重复提取失败三次会返回稳定错误。

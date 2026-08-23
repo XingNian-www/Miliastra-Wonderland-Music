@@ -1,10 +1,14 @@
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::Path;
-use std::thread;
 use std::time::Duration;
 
-use md5::{Digest, Md5};
+use base64::Engine;
+use percent_encoding::percent_decode_str;
+use reqwest::blocking::Client;
+use reqwest::header::CONTENT_TYPE;
 use serde_json::{Value, json};
+use url::Url;
 
 use crate::native_qr::NativeQrEvent;
 
@@ -31,13 +35,218 @@ pub fn capture(
 
 fn login_url(provider: &str) -> Option<&'static str> {
     match provider {
-        "qqmusic" => Some("https://y.qq.com/portal/profile.html"),
+        // The public QQ Music page wraps this same official QR login in two
+        // cross-origin iframes. Opening the provider's QR page directly lets
+        // WebView2 inspect the image without a native MQTT implementation.
+        "qqmusic" => Some(
+            "https://xui.ptlogin2.qq.com/cgi-bin/xlogin?appid=716027609&daid=383&style=33&login_text=%E7%99%BB%E5%BD%95&hide_title_bar=1&hide_border=1&target=self&s_url=https%3A%2F%2Fgraph.qq.com%2Foauth2.0%2Flogin_jump&pt_3rd_aid=100497308&pt_feedback_link=https%3A%2F%2Fsupport.qq.com%2Fproducts%2F77942%3FcustomInfo%3D.appid100497308&theme=2&verify_theme=",
+        ),
         "netease" => Some("https://music.163.com/"),
         "bilibili" => Some("https://www.bilibili.com/"),
-        // 酷狗登录入口在首页右上角。
-        "kugou" => Some("https://www.kugou.com/"),
+        // Official web login page. It renders the QR as a data URL and sets
+        // the same KuGoo cookie after a scan.
+        "kugou" => Some(
+            "https://login-user.kugou.com/login/?appid=1014&ref=https%3A%2F%2Fwww.kugou.com%2Freg%2Fweb%2F&redirect_uri=https%3A%2F%2Fstaticssl.kugou.com%2Fcommon%2Fhtml%2Flogin%2Fregok.html",
+        ),
         _ => None,
     }
+}
+
+const WEB_QR_PROBE_INTERVAL: Duration = Duration::from_millis(250);
+const WEB_QR_SCRIPT_TIMEOUT: Duration = Duration::from_secs(3);
+const WEB_QR_FETCH_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Extract a QR image from the provider page currently displayed in WebView2.
+/// NetEase needs its login link clicked first; QQ and KuGou expose an image on
+/// their direct official login pages. The result is a data URL or an image URL
+/// that the native side validates before publishing to the HTTP UI.
+fn web_qr_probe_script() -> &'static str {
+    r#"(() => {
+      const visible = (node) => {
+        if (!node) return false;
+        const style = getComputedStyle(node);
+        const rect = node.getBoundingClientRect();
+        return style.display !== 'none' && style.visibility !== 'hidden' &&
+          style.opacity !== '0' && rect.width >= 80 && rect.height >= 80;
+      };
+      const square = (width, height) => width >= 80 && height >= 80 &&
+        Math.max(width, height) / Math.max(1, Math.min(width, height)) <= 1.35;
+      const wait = () => ({kind: 'wait'});
+      const imageSource = (node) => String(
+        node.currentSrc || node.src || node.getAttribute('data-src') ||
+        node.getAttribute('data-url') || ''
+      ).trim();
+
+      // NetEase keeps the QR dialog behind the login link on its home page.
+      if (location.hostname === 'music.163.com' &&
+          ![...document.querySelectorAll('[role="dialog"]')].some(visible)) {
+        const login = document.querySelector('[data-action="login"]') ||
+          [...document.querySelectorAll('a,button,[role="button"]')].find((node) =>
+            visible(node) && /^(登录|立即登录)$/.test((node.innerText || '').trim()));
+        if (login && !login.dataset.miliastraQrClicked) {
+          login.dataset.miliastraQrClicked = '1';
+          login.click();
+          return wait();
+        }
+      }
+
+      const candidates = [];
+      for (const node of document.querySelectorAll('canvas')) {
+        if (!visible(node)) continue;
+        const rect = node.getBoundingClientRect();
+        const width = node.width || rect.width;
+        const height = node.height || rect.height;
+        if (!square(width, height)) continue;
+        try {
+          const data = node.toDataURL('image/png');
+          if (data.startsWith('data:image/png;base64,')) {
+            candidates.push({score: 90, value: data});
+          }
+        } catch (_) {}
+      }
+      for (const node of document.querySelectorAll('img')) {
+        if (!visible(node)) continue;
+        const rect = node.getBoundingClientRect();
+        const width = node.naturalWidth || rect.width;
+        const height = node.naturalHeight || rect.height;
+        if (!square(width, height)) continue;
+        const source = imageSource(node);
+        if (!source || source.startsWith('data:image/svg')) continue;
+        const marker = [node.id, node.className, node.alt, node.title,
+          node.getAttribute('aria-label')].join(' ').toLowerCase();
+        const marked = /qr|qrcode|qrlogin|二维码|登录二维码/.test(marker);
+        const inline = source.startsWith('data:image/png') || source.startsWith('data:image/jpeg');
+        // Do not mistake a square album/advertisement image for a QR. The
+        // known provider QR images are either explicitly marked or inline
+        // data URLs; unmarked remote images are ignored.
+        if (!marked && !inline) continue;
+        let score = marked ? 120 : 20;
+        if (inline) score += 20;
+        candidates.push({score, value: source});
+      }
+      candidates.sort((left, right) => right.score - left.score);
+      return candidates.length ? {kind: 'image', value: candidates[0].value} : wait();
+    })()"#
+}
+
+fn web_qr_host_allowed(provider: &str, host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let suffixes: &[&str] = match provider {
+        "qqmusic" => &["qq.com"],
+        "netease" => &["163.com", "126.net"],
+        "kugou" => &["kugou.com"],
+        _ => &[],
+    };
+    suffixes
+        .iter()
+        .any(|suffix| host == *suffix || host.ends_with(&format!(".{suffix}")))
+}
+
+fn web_qr_url_allowed(provider: &str, url: &Url) -> bool {
+    matches!(url.scheme(), "https" | "http")
+        && url
+            .host_str()
+            .is_some_and(|host| web_qr_host_allowed(provider, host))
+}
+
+fn validate_web_qr_data_url(value: &str) -> Result<String, String> {
+    miliastra_login_protocol::validate_qr_image_data_url(value)
+        .map_err(|_| "网页登录二维码图片格式无效".to_owned())?;
+    Ok(value.to_owned())
+}
+
+fn parse_web_qr_probe_result(raw: &str) -> Option<(String, String)> {
+    let mut value = serde_json::from_str::<Value>(raw).ok()?;
+    // Some WebView2 Runtime versions serialize an object returned from
+    // ExecuteScript as a quoted JSON string. Accept both wire forms.
+    if let Value::String(encoded) = value {
+        value = serde_json::from_str(&encoded).ok()?;
+    }
+    let object = value.as_object()?;
+    let kind = object.get("kind")?.as_str()?.to_owned();
+    let value = object.get("value")?.as_str()?.to_owned();
+    (kind == "image" && !value.trim().is_empty()).then_some((kind, value))
+}
+
+/// Download an image URL discovered in the WebView2 DOM. This is only an
+/// image fetch; cookies, redirects and login state remain owned by WebView2.
+fn download_web_qr_image(provider: &str, raw_url: &str) -> Result<String, String> {
+    let url = Url::parse(raw_url).map_err(|_| "网页登录二维码地址无效".to_owned())?;
+    if !web_qr_url_allowed(provider, &url) {
+        return Err("网页登录二维码地址不受支持".to_owned());
+    }
+    let referer = match provider {
+        "qqmusic" => "https://xui.ptlogin2.qq.com/",
+        "netease" => "https://music.163.com/",
+        "kugou" => "https://login-user.kugou.com/",
+        _ => "https://music.163.com/",
+    };
+    let redirect_provider = provider.to_owned();
+    let redirect_policy = reqwest::redirect::Policy::custom(move |attempt| {
+        if attempt.previous().len() >= 8 {
+            attempt.stop()
+        } else if web_qr_url_allowed(&redirect_provider, attempt.url()) {
+            attempt.follow()
+        } else {
+            attempt.stop()
+        }
+    });
+    let client = Client::builder()
+        .timeout(WEB_QR_FETCH_TIMEOUT)
+        .redirect(redirect_policy)
+        .user_agent(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
+        )
+        .build()
+        .map_err(|_| "网页登录二维码网络客户端初始化失败".to_owned())?;
+    let mut response = client
+        .get(url)
+        .header("Referer", referer)
+        .header(
+            "Accept",
+            "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        )
+        .send()
+        .map_err(|_| "网页登录二维码图片请求失败".to_owned())?
+        .error_for_status()
+        .map_err(|_| "网页登录二维码图片请求失败".to_owned())?;
+    if !web_qr_url_allowed(provider, response.url()) {
+        return Err("网页登录二维码地址不受支持".to_owned());
+    }
+    if response
+        .content_length()
+        .is_some_and(|size| size > miliastra_login_protocol::MAX_QR_IMAGE_BYTES as u64)
+    {
+        return Err("网页登录二维码图片过大".to_owned());
+    }
+    let mut bytes = Vec::new();
+    response
+        .by_ref()
+        .take(miliastra_login_protocol::MAX_QR_IMAGE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "网页登录二维码图片读取失败".to_owned())?;
+    if bytes.is_empty() || bytes.len() > miliastra_login_protocol::MAX_QR_IMAGE_BYTES {
+        return Err("网页登录二维码图片过大".to_owned());
+    }
+    let mime = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .filter(|value| matches!(*value, "image/png" | "image/jpeg"))
+        .map(str::to_owned)
+        .or_else(|| {
+            if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+                Some("image/png".to_owned())
+            } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+                Some("image/jpeg".to_owned())
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| "网页登录二维码图片格式无效".to_owned())?;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    validate_web_qr_data_url(&format!("data:{mime};base64,{encoded}"))
 }
 
 fn allowed_cookie_names(provider: &str) -> &'static [&'static str] {
@@ -115,9 +324,18 @@ fn has_required_cookies(provider: &str, cookies: &BTreeMap<String, String>) -> b
         "netease" => has_any_nonempty(cookies, &["MUSIC_U"]),
         "bilibili" => has_any_nonempty(cookies, &["SESSDATA"]),
         "kugou" => cookies.get("KuGoo").is_some_and(|value| {
+            let value = decode_kugou_cookie_value(value);
             !value.is_empty() && value.contains("t=") && value.contains("KugooID=")
         }),
         _ => false,
+    }
+}
+
+fn decode_kugou_cookie_value(value: &str) -> String {
+    if value.as_bytes().contains(&b'%') {
+        percent_decode_str(value).decode_utf8_lossy().into_owned()
+    } else {
+        value.to_owned()
     }
 }
 
@@ -194,7 +412,15 @@ fn parse_qq_login_callback(raw_url: &str) -> Option<(String, String)> {
             _ => {}
         }
     }
-    Some((login_type?, code?))
+    // The direct QQ QR page uses the official `graph.qq.com/login_jump`
+    // callback and may omit the wrapper's `login_type=1` query parameter.
+    // It is unambiguously the QQ OAuth flow, so infer type 1 only for that
+    // callback host/path; never infer it from arbitrary page URLs.
+    let login_type = login_type.or_else(|| {
+        (url.host_str() == Some("graph.qq.com") && url.path().ends_with("/oauth2.0/login_jump"))
+            .then(|| "1".to_owned())
+    })?;
+    Some((login_type, code?))
 }
 
 fn remember_qq_login_callback(callback: &mut Option<(String, String)>, raw_url: &str) {
@@ -332,12 +558,6 @@ fn value_to_string(value: &Value) -> String {
         .or_else(|| value.as_i64().map(|value| value.to_string()))
         .or_else(|| value.as_u64().map(|value| value.to_string()))
         .unwrap_or_default()
-}
-
-fn value_as_i64(value: &Value) -> Option<i64> {
-    value
-        .as_i64()
-        .or_else(|| value.as_str().and_then(|text| text.trim().parse().ok()))
 }
 
 fn replace_qq_cookie_alias(cookies: &mut BTreeMap<String, String>, aliases: &[&str], value: &str) {
@@ -850,349 +1070,6 @@ fn refresh_qq_web_session(
     }
 }
 
-/// 酷狗测试版（概念版/lite）扫码登录凭据获取（不依赖 sidecar，直连酷狗官方接口）。
-///
-/// 流程：v2/qrcode 拿 key → WebView2 显示 H5 二维码页 → 用户用酷狗 App
-/// 扫码 → v2/get_userinfo_qrcode 轮询到 status=4 返回 token/userid。
-const KUGOU_WEB_SIGN_SALT: &str = "NVPh5oo715z5DIWAeQlhMDsWXXQV4hwt";
-const KUGOU_LITE_APPID: i64 = 3116;
-const KUGOU_LITE_CLIENTVER: i64 = 11440;
-const KUGOU_SRCAPPID: i64 = 2919;
-const KUGOU_QR_KEY_URL: &str = "https://login-user.kugou.com/v2/qrcode";
-const KUGOU_QR_CHECK_URL: &str = "https://login-user.kugou.com/v2/get_userinfo_qrcode";
-const KUGOU_QR_POLL_INTERVAL: Duration = Duration::from_secs(2);
-const KUGOU_QR_POLL_ATTEMPTS: u32 = 90;
-const KUGOU_UA: &str = "Android15-1070-11083-46-0-DiscoveryDRADProtocol-wifi";
-const KUGOU_KG_RFC: &str = "B9EDA08A64250DEFFBCADDEE00F8F25F";
-
-/// 酷狗扫码轮询结果：`Ok(Some((token, userid, cookies)))` 表示登录成功。
-type KugouQrPollResult =
-    Result<Option<(String, String, BTreeMap<String, String>)>, KugouQrPollError>;
-
-#[derive(Debug, PartialEq, Eq)]
-enum KugouQrPollError {
-    /// 请求层故障可以短暂重试；不保留原始错误，避免意外传播签名参数或二维码 key。
-    Transient,
-    /// 二维码状态或响应结构已经明确失败，重试不会恢复。
-    Terminal(String),
-}
-
-impl KugouQrPollError {
-    fn into_user_message(self) -> String {
-        match self {
-            Self::Transient => "酷狗二维码接口请求失败，请重试".to_owned(),
-            Self::Terminal(message) => message,
-        }
-    }
-}
-
-/// 酷狗 web 版签名：md5(盐值 + 参数按 key 排序后的 k=v 拼接 + 盐值)。
-fn kugou_web_signature(params: &BTreeMap<String, String>) -> String {
-    let mut pairs = params.iter().collect::<Vec<_>>();
-    pairs.sort_by(|left, right| left.0.cmp(right.0));
-    let joined = pairs
-        .iter()
-        .map(|(key, value)| format!("{key}={value}"))
-        .collect::<String>();
-    let mut hasher = Md5::new();
-    hasher.update(format!(
-        "{KUGOU_WEB_SIGN_SALT}{joined}{KUGOU_WEB_SIGN_SALT}"
-    ));
-    format!("{:x}", hasher.finalize())
-}
-
-/// 计算酷狗设备 MID：md5(GUID) 的 hex 视为 128 位无符号大整数，转十进制。
-fn kugou_calculate_mid(guid: &str) -> String {
-    let guid = kugou_normalize_guid(guid);
-    let mut hasher = Md5::new();
-    hasher.update(guid.as_bytes());
-    let hex = format!("{:x}", hasher.finalize());
-    u128::from_str_radix(&hex, 16)
-        .map(|value| value.to_string())
-        .unwrap_or_else(|_| "-".to_owned())
-}
-
-fn kugou_normalize_guid(guid: &str) -> String {
-    let guid = guid.trim();
-    let bytes = guid.as_bytes();
-    let is_uuid_v4 = bytes.len() == 36
-        && bytes[8] == b'-'
-        && bytes[13] == b'-'
-        && bytes[18] == b'-'
-        && bytes[23] == b'-'
-        && bytes[14].eq_ignore_ascii_case(&b'4')
-        && matches!(bytes[19].to_ascii_lowercase(), b'8' | b'9' | b'a' | b'b')
-        && bytes
-            .iter()
-            .enumerate()
-            .all(|(index, byte)| matches!(index, 8 | 13 | 18 | 23) || byte.is_ascii_hexdigit());
-    if is_uuid_v4 {
-        let mut hasher = Md5::new();
-        hasher.update(guid.as_bytes());
-        format!("{:x}", hasher.finalize())
-    } else {
-        guid.to_owned()
-    }
-}
-
-/// 扫码登录请求的默认参数。mid 必须与 sidecar 设备一致
-/// （主程序通过 KUGOU_API_GUID 环境变量传入），否则扫码 token
-/// 绑定匿名设备，测试版（概念版/lite）API 会拒绝（error_code 20018）。
-fn kugou_default_params() -> BTreeMap<String, String> {
-    let mid = std::env::var("KUGOU_API_MID").unwrap_or_else(|_| {
-        std::env::var("KUGOU_API_GUID")
-            .ok()
-            .map(|guid| kugou_calculate_mid(&guid))
-            .unwrap_or_else(|| "-".to_owned())
-    });
-    BTreeMap::from([
-        ("dfid".to_owned(), "-".to_owned()),
-        ("mid".to_owned(), mid),
-        ("uuid".to_owned(), "-".to_owned()),
-        ("appid".to_owned(), KUGOU_LITE_APPID.to_string()),
-        ("clientver".to_owned(), KUGOU_LITE_CLIENTVER.to_string()),
-        (
-            "clienttime".to_owned(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|duration| duration.as_secs())
-                .unwrap_or(0)
-                .to_string(),
-        ),
-    ])
-}
-
-fn kugou_web_get(
-    url: &str,
-    params: &BTreeMap<String, String>,
-) -> Result<serde_json::Value, String> {
-    kugou_web_get_with_cookies(url, params).map(|(value, _)| value)
-}
-
-/// 酷狗 web 接口请求，额外返回响应 Set-Cookie 的键值（续期字段如 t1 只经
-/// Set-Cookie 下发，不返回它们会导致测试版（概念版/lite）token 刷新被官方拒绝）。
-fn kugou_web_get_with_cookies(
-    url: &str,
-    params: &BTreeMap<String, String>,
-) -> Result<(serde_json::Value, BTreeMap<String, String>), String> {
-    let mut signed = params.clone();
-    let signature = kugou_web_signature(params);
-    signed.insert("signature".to_owned(), signature);
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|error| error.to_string())?;
-    let response = client
-        .get(url)
-        .query(&signed)
-        .header("User-Agent", KUGOU_UA)
-        // Keep the login request headers aligned with the shared KuGou
-        // request layer; the QR endpoints also use these device headers for
-        // risk control even though their signature is the web variant.
-        .header(
-            "dfid",
-            params.get("dfid").map(String::as_str).unwrap_or("-"),
-        )
-        .header(
-            "clienttime",
-            params.get("clienttime").map(String::as_str).unwrap_or("0"),
-        )
-        .header("mid", params.get("mid").map(String::as_str).unwrap_or("-"))
-        .header("kg-rc", "1")
-        .header("kg-thash", "5d816a0")
-        .header("kg-rec", "1")
-        .header("kg-rf", KUGOU_KG_RFC)
-        .send()
-        .map_err(|error| format!("酷狗登录接口请求失败: {error}"))?;
-    if !response.status().is_success() {
-        return Err(format!("酷狗登录接口返回 HTTP {}", response.status()));
-    }
-    let mut cookies = BTreeMap::new();
-    for set_cookie in response.headers().get_all(reqwest::header::SET_COOKIE) {
-        if let Ok(header) = set_cookie.to_str()
-            && let Some((name, rest)) = header.split_once('=')
-        {
-            let name = name.trim();
-            let value = rest.split(';').next().unwrap_or("").trim();
-            if !name.is_empty() && !value.is_empty() {
-                cookies.insert(name.to_owned(), value.to_owned());
-            }
-        }
-    }
-    let value = response
-        .json::<serde_json::Value>()
-        .map_err(|error| format!("酷狗登录接口响应无效: {error}"))?;
-    if value
-        .get("status")
-        .and_then(serde_json::Value::as_i64)
-        .is_some_and(|status| status == 0)
-        || value
-            .get("error_code")
-            .and_then(serde_json::Value::as_i64)
-            .is_some_and(|code| code != 0)
-    {
-        return Err("酷狗登录接口拒绝了请求".to_owned());
-    }
-    Ok((value, cookies))
-}
-
-/// 获取扫码登录 key 与二维码图片（base64 data URL）。
-fn kugou_qr_key() -> Result<(String, String), String> {
-    let mut params = kugou_default_params();
-    params.insert("appid".to_owned(), "1001".to_owned());
-    params.insert("type".to_owned(), "1".to_owned());
-    params.insert("plat".to_owned(), "4".to_owned());
-    params.insert(
-        "qrcode_txt".to_owned(),
-        format!("https://h5.kugou.com/apps/loginQRCode/html/index.html?appid={KUGOU_LITE_APPID}&"),
-    );
-    params.insert("srcappid".to_owned(), KUGOU_SRCAPPID.to_string());
-    let value = kugou_web_get(KUGOU_QR_KEY_URL, &params)?;
-    let key = value
-        .get("data")
-        .and_then(|data| data.get("qrcode"))
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned)
-        .filter(|key| !key.is_empty())
-        .ok_or_else(|| "酷狗二维码 key 获取失败".to_owned())?;
-    let image = value
-        .get("data")
-        .and_then(|data| data.get("qrcode_img"))
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned)
-        .unwrap_or_default();
-    if !image.is_empty() {
-        miliastra_login_protocol::validate_qr_image_data_url(&image)
-            .map_err(|_| "酷狗二维码图片格式无效".to_owned())?;
-    }
-    Ok((key, image))
-}
-
-/// 构建二维码展示页 HTML（直接内嵌 base64 图片，避免 H5 页 UA 跳转）。
-fn kugou_qr_page(image: &str) -> String {
-    let image = escape_html_attribute(image);
-    format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>酷狗登录</title></head>\
-         <body style=\"margin:0;background:#f5f5f5;display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;font-family:sans-serif\">\
-         <div style=\"background:#fff;padding:24px;border-radius:12px;box-shadow:0 2px 12px rgba(0,0,0,.08)\">\
-         <img src=\"{image}\" style=\"width:min(70vw,520px);height:auto;display:block\"></div>\
-         <p style=\"color:#666;margin-top:18px;font-size:14px\">请使用酷狗 App 扫码登录</p>\
-         </body></html>"
-    )
-}
-
-fn escape_html_attribute(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('"', "&quot;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-}
-
-fn parse_kugou_qr_poll_response(
-    value: &Value,
-    set_cookies: BTreeMap<String, String>,
-) -> KugouQrPollResult {
-    let status = value
-        .pointer("/data/status")
-        .and_then(value_as_i64)
-        .ok_or_else(|| {
-            KugouQrPollError::Terminal("酷狗二维码状态响应缺少有效 status".to_owned())
-        })?;
-    match status {
-        4 => {
-            let token = value
-                .pointer("/data/token")
-                .map(value_to_string)
-                .filter(|token| !token.is_empty())
-                .ok_or_else(|| KugouQrPollError::Terminal("酷狗扫码登录未返回 token".to_owned()))?;
-            // userid 可能是数字或字符串。
-            let userid = value
-                .pointer("/data/userid")
-                .map(value_to_string)
-                .filter(|userid| !userid.is_empty())
-                .ok_or_else(|| {
-                    KugouQrPollError::Terminal("酷狗扫码登录未返回 userid".to_owned())
-                })?;
-            Ok(Some((token, userid, set_cookies)))
-        }
-        0 => Err(KugouQrPollError::Terminal(
-            "酷狗二维码已过期，请重新登录".to_owned(),
-        )),
-        1 | 2 => Ok(None),
-        _ => Err(KugouQrPollError::Terminal(format!(
-            "酷狗二维码接口返回未知状态 {status}"
-        ))),
-    }
-}
-
-/// 轮询扫码状态。cookies 为官方 Set-Cookie 下发的续期字段（t1 等）。
-fn kugou_qr_poll(key: &str) -> KugouQrPollResult {
-    let mut params = kugou_default_params();
-    params.insert("plat".to_owned(), "4".to_owned());
-    params.insert("srcappid".to_owned(), KUGOU_SRCAPPID.to_string());
-    params.insert("qrcode".to_owned(), key.to_owned());
-    params.insert(
-        "dev".to_owned(),
-        std::env::var("KUGOU_API_DEV")
-            .map(|value| value.trim().to_ascii_uppercase())
-            .unwrap_or_else(|_| "-".to_owned()),
-    );
-    let (value, set_cookies) = kugou_web_get_with_cookies(KUGOU_QR_CHECK_URL, &params)
-        .map_err(|_| KugouQrPollError::Transient)?;
-    parse_kugou_qr_poll_response(&value, set_cookies)
-}
-
-/// 后台轮询线程：直到登录成功、连续失败或超时。
-/// 酷狗登录接口偶发连接重置，网络类错误连续出现多次才放弃。
-fn kugou_qr_poll_loop(
-    key: &str,
-    sender: std::sync::mpsc::Sender<KugouQrPollResult>,
-    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
-) {
-    let mut consecutive_errors = 0;
-    for _ in 0..KUGOU_QR_POLL_ATTEMPTS {
-        if cancel.load(std::sync::atomic::Ordering::Acquire) {
-            return;
-        }
-        match kugou_qr_poll(key) {
-            Ok(Some(triple)) => {
-                let _ = sender.send(Ok(Some(triple)));
-                return;
-            }
-            Ok(None) => consecutive_errors = 0,
-            Err(KugouQrPollError::Transient) => {
-                // Do not echo the provider's raw error: it may contain the
-                // signed query, qrcode key, or a full request URL.
-                eprintln!(
-                    "[kugou-qr] poll attempt failed (consecutive={})",
-                    consecutive_errors + 1
-                );
-                consecutive_errors += 1;
-                if consecutive_errors >= 3 {
-                    let _ = sender.send(Err(KugouQrPollError::Terminal(
-                        "酷狗二维码接口连续失败，请重试".to_owned(),
-                    )));
-                    return;
-                }
-            }
-            Err(error @ KugouQrPollError::Terminal(_)) => {
-                let _ = sender.send(Err(error));
-                return;
-            }
-        }
-        if cancel.load(std::sync::atomic::Ordering::Acquire) {
-            return;
-        }
-        thread::sleep(KUGOU_QR_POLL_INTERVAL);
-    }
-    if !cancel.load(std::sync::atomic::Ordering::Acquire) {
-        let _ = sender.send(Err(KugouQrPollError::Terminal(
-            "酷狗扫码等待超时".to_owned(),
-        )));
-    }
-}
-
 /// QQ 与 B 站的刷新 cookie 在基础登录 cookie 之后写入。保持短暂轮询，
 /// 使成功登录捕获到完整的可刷新凭据。
 fn should_complete_capture(
@@ -1217,112 +1094,10 @@ fn should_complete_capture(
     now.duration_since(*seen_at) >= QQ_REFRESH_COOKIE_GRACE_PERIOD
 }
 
-#[cfg(test)]
-mod kugou_qr_tests {
-    use std::collections::BTreeMap;
-
-    use super::{
-        KugouQrPollError, escape_html_attribute, kugou_qr_key, kugou_qr_poll, kugou_web_signature,
-        parse_kugou_qr_poll_response, value_as_i64,
-    };
-    use serde_json::json;
-
-    #[test]
-    fn kugou_qr_signature_matches_upstream_web_vector() {
-        let params = BTreeMap::from([
-            ("dfid".to_owned(), "-".to_owned()),
-            ("mid".to_owned(), "123456789".to_owned()),
-            ("uuid".to_owned(), "-".to_owned()),
-            ("appid".to_owned(), "1001".to_owned()),
-            ("clientver".to_owned(), "11440".to_owned()),
-            ("clienttime".to_owned(), "1700000000".to_owned()),
-            ("type".to_owned(), "1".to_owned()),
-            ("plat".to_owned(), "4".to_owned()),
-            (
-                "qrcode_txt".to_owned(),
-                "https://h5.kugou.com/apps/loginQRCode/html/index.html?appid=3116&".to_owned(),
-            ),
-            ("srcappid".to_owned(), "2919".to_owned()),
-        ]);
-        assert_eq!(
-            kugou_web_signature(&params),
-            "da09e77f63350c605f82f9009eb5c827"
-        );
-    }
-
-    #[test]
-    fn kugou_qr_status_accepts_numeric_and_string_wire_values() {
-        assert_eq!(value_as_i64(&json!(4)), Some(4));
-        assert_eq!(value_as_i64(&json!("4")), Some(4));
-        assert_eq!(value_as_i64(&json!(" malformed ")), None);
-    }
-
-    #[test]
-    fn kugou_qr_statuses_distinguish_waiting_success_and_terminal_failures() {
-        for status in [json!(1), json!("2")] {
-            assert_eq!(
-                parse_kugou_qr_poll_response(&json!({"data": {"status": status}}), BTreeMap::new(),),
-                Ok(None)
-            );
-        }
-
-        let success = parse_kugou_qr_poll_response(
-            &json!({"data": {"status": 4, "token": "token", "userid": 42}}),
-            BTreeMap::from([("t1".to_owned(), "refresh".to_owned())]),
-        )
-        .expect("status 4 should succeed")
-        .expect("status 4 should include credentials");
-        assert_eq!(success.0, "token");
-        assert_eq!(success.1, "42");
-        assert_eq!(success.2.get("t1").map(String::as_str), Some("refresh"));
-
-        assert!(matches!(
-            parse_kugou_qr_poll_response(
-                &json!({"data": {"status": 0}}),
-                BTreeMap::new(),
-            ),
-            Err(KugouQrPollError::Terminal(message)) if message.contains("过期")
-        ));
-        assert!(matches!(
-            parse_kugou_qr_poll_response(
-                &json!({"data": {"status": 3}}),
-                BTreeMap::new(),
-            ),
-            Err(KugouQrPollError::Terminal(message)) if message.contains("未知状态 3")
-        ));
-        assert!(matches!(
-            parse_kugou_qr_poll_response(&json!({"data": {}}), BTreeMap::new()),
-            Err(KugouQrPollError::Terminal(message)) if message.contains("status")
-        ));
-    }
-
-    #[test]
-    fn kugou_qr_page_attribute_escaping_blocks_markup_injection() {
-        let escaped = escape_html_attribute("data:image/png;base64,abc\" onerror=alert(1)<>");
-        assert_eq!(
-            escaped,
-            "data:image/png;base64,abc&quot; onerror=alert(1)&lt;&gt;"
-        );
-    }
-
-    #[test]
-    #[ignore = "需要公网访问酷狗登录接口"]
-    fn kugou_qr_key_and_poll_round_trip() {
-        let (key, image) = kugou_qr_key().expect("获取二维码 key");
-        assert!(!key.is_empty());
-        miliastra_login_protocol::encode_message(
-            &miliastra_login_protocol::LoginHelperMessage::qr_code("kugou", image),
-        )
-        .expect("真实酷狗二维码应符合登录协议约束");
-        let result = kugou_qr_poll(&key);
-        eprintln!("poll 结果: {result:?}");
-    }
-}
-
 #[cfg(windows)]
 #[allow(unsafe_op_in_unsafe_fn)]
 mod platform {
-    use super::{CaptureError, KugouQrPollResult, NativeQrEvent, allowed_cookie_names, login_url};
+    use super::{CaptureError, NativeQrEvent, allowed_cookie_names, login_url};
     use std::collections::BTreeMap;
     use std::ffi::{OsStr, c_void};
     use std::mem::{size_of, transmute_copy};
@@ -1412,6 +1187,12 @@ mod platform {
     type HandlerInvoke = unsafe extern "system" fn(*mut c_void, HRESULT, *mut c_void) -> HRESULT;
     type CookieCapture = (BTreeMap<String, String>, BTreeMap<String, String>);
 
+    #[derive(Clone, Copy)]
+    enum ScriptPurpose {
+        BilibiliToken,
+        WebQr,
+    }
+
     #[repr(C)]
     struct HandlerVtable {
         query_interface: HandlerQueryInterface,
@@ -1439,8 +1220,14 @@ mod platform {
         outcome: Option<Result<BTreeMap<String, String>, CaptureError>>,
         js_probe_inflight: bool,
         bilibili_js_probe_attempts: u32,
-        kugou_qr_rx: Option<mpsc::Receiver<KugouQrPollResult>>,
-        kugou_qr_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        web_qr_probe_inflight: bool,
+        web_qr_probe_started_at: Option<Instant>,
+        web_qr_next_probe: Option<Instant>,
+        web_qr_fetch_rx: Option<mpsc::Receiver<Result<String, String>>>,
+        web_qr_fetch_source: Option<String>,
+        web_qr_pending: Option<String>,
+        web_qr_published: Option<String>,
+        web_qr_failures: u8,
         native_qr_rx: Option<mpsc::Receiver<NativeQrEvent>>,
         native_qr_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     }
@@ -1455,13 +1242,10 @@ mod platform {
 
     impl Drop for CaptureContext {
         fn drop(&mut self) {
-            if let Ok(state) = self.state.lock() {
-                if let Some(cancel) = state.kugou_qr_cancel.as_ref() {
-                    cancel.store(true, std::sync::atomic::Ordering::Release);
-                }
-                if let Some(cancel) = state.native_qr_cancel.as_ref() {
-                    cancel.store(true, std::sync::atomic::Ordering::Release);
-                }
+            if let Ok(state) = self.state.lock()
+                && let Some(cancel) = state.native_qr_cancel.as_ref()
+            {
+                cancel.store(true, std::sync::atomic::Ordering::Release);
             }
         }
     }
@@ -1645,64 +1429,8 @@ mod platform {
             }
         }
 
-        fn poll_kugou_qr(self: &Rc<Self>) {
-            if self.provider != "kugou" {
-                return;
-            }
-            let result = {
-                let state = self.state.lock().expect("capture state mutex poisoned");
-                if state.outcome.is_some() {
-                    return;
-                }
-                let Some(receiver) = state.kugou_qr_rx.as_ref() else {
-                    return;
-                };
-                match receiver.try_recv() {
-                    Ok(result) => Some(result),
-                    Err(mpsc::TryRecvError::Empty) => None,
-                    Err(mpsc::TryRecvError::Disconnected) => Some(Err(
-                        super::KugouQrPollError::Terminal("酷狗二维码轮询线程已断开".to_owned()),
-                    )),
-                }
-            };
-            match result {
-                Some(Ok(Some((token, userid, set_cookies)))) => {
-                    let mut cookies = BTreeMap::new();
-                    cookies.insert("KuGoo".to_owned(), format!("t={token}&KugooID={userid}"));
-                    // 保留官方下发的设备/续期字段；播放请求需要与登录时相同的
-                    // mid/dfid，token 刷新还依赖 t1 和 lite 设备字段。
-                    for (name, value) in set_cookies {
-                        if matches!(
-                            name.as_str(),
-                            "dfid"
-                                | "KugouGUID"
-                                | "KUGOU_API_GUID"
-                                | "KUGOU_API_MID"
-                                | "KUGOU_API_MAC"
-                                | "KUGOU_API_DEV"
-                                | "kg_mid"
-                                | "mid"
-                                | "t1"
-                                | "vip_type"
-                                | "vip_token"
-                        ) {
-                            cookies.insert(name, value);
-                        }
-                    }
-                    let mut state = self.state.lock().expect("capture state mutex poisoned");
-                    state.outcome = Some(Ok(cookies));
-                }
-                Some(Ok(None)) => {}
-                Some(Err(error)) => {
-                    let mut state = self.state.lock().expect("capture state mutex poisoned");
-                    state.outcome = Some(Err(CaptureError::Io(error.into_user_message())));
-                }
-                None => {}
-            }
-        }
-
         fn poll_native_qr(self: &Rc<Self>) -> Option<String> {
-            if !matches!(self.provider.as_str(), "qqmusic" | "netease" | "bilibili") {
+            if self.provider != "bilibili" {
                 return None;
             }
             let event = {
@@ -1733,6 +1461,141 @@ mod platform {
                 }
                 None => None,
             }
+        }
+
+        /// Ask the currently loaded provider page for its QR image. The
+        /// script is intentionally polled instead of tied to a particular
+        /// navigation event because all three sites render the login dialog
+        /// asynchronously (and NetEase creates the canvas only after its
+        /// login link is clicked).
+        fn poll_web_qr(self: &Rc<Self>) -> Option<String> {
+            if !matches!(self.provider.as_str(), "qqmusic" | "netease" | "kugou") {
+                return None;
+            }
+            let now = Instant::now();
+            let mut schedule_probe = false;
+            let mut fetched = None;
+            {
+                let mut state = self.state.lock().expect("capture state mutex poisoned");
+                if state.outcome.is_some() || state.webview.is_null() {
+                    return None;
+                }
+                if let Some(receiver) = state.web_qr_fetch_rx.as_ref() {
+                    match receiver.try_recv() {
+                        Ok(result) => {
+                            state.web_qr_fetch_rx = None;
+                            fetched = Some(result);
+                        }
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            state.web_qr_fetch_rx = None;
+                            fetched = Some(Err("网页登录二维码图片线程已断开".to_owned()));
+                        }
+                        Err(mpsc::TryRecvError::Empty) => {}
+                    }
+                }
+                if let Some(result) = fetched.take() {
+                    match result {
+                        Ok(image) => {
+                            state.web_qr_pending = Some(image);
+                            state.web_qr_failures = 0;
+                        }
+                        Err(_) => {
+                            state.web_qr_fetch_source = None;
+                            state.web_qr_failures = state.web_qr_failures.saturating_add(1);
+                            if state.web_qr_failures >= 3 {
+                                state.outcome = Some(Err(CaptureError::Io(
+                                    "网页登录二维码图片连续提取失败，请重试".to_owned(),
+                                )));
+                            } else {
+                                state.web_qr_next_probe = Some(now + super::WEB_QR_PROBE_INTERVAL);
+                            }
+                        }
+                    }
+                }
+                if let Some(image) = state.web_qr_pending.take()
+                    && state.web_qr_published.as_ref() != Some(&image)
+                {
+                    state.web_qr_published = Some(image.clone());
+                    return Some(image);
+                }
+                if state.outcome.is_none() && state.web_qr_fetch_rx.is_none() {
+                    if state.web_qr_probe_inflight
+                        && state.web_qr_probe_started_at.is_some_and(|started| {
+                            started.elapsed() >= super::WEB_QR_SCRIPT_TIMEOUT
+                        })
+                    {
+                        state.web_qr_probe_inflight = false;
+                        state.web_qr_probe_started_at = None;
+                    }
+                    if !state.web_qr_probe_inflight
+                        && state
+                            .web_qr_next_probe
+                            .is_none_or(|deadline| now >= deadline)
+                    {
+                        state.web_qr_probe_inflight = true;
+                        state.web_qr_probe_started_at = Some(now);
+                        schedule_probe = true;
+                    }
+                }
+            }
+            if schedule_probe {
+                self.start_web_qr_probe();
+            }
+            None
+        }
+
+        fn start_web_qr_probe(self: &Rc<Self>) {
+            let webview = {
+                let state = self.state.lock().expect("capture state mutex poisoned");
+                state.webview
+            };
+            if webview.is_null() {
+                let mut state = self.state.lock().expect("capture state mutex poisoned");
+                state.web_qr_probe_inflight = false;
+                state.web_qr_probe_started_at = None;
+                state.web_qr_next_probe = Some(Instant::now() + super::WEB_QR_PROBE_INTERVAL);
+                return;
+            }
+            let handler = Box::into_raw(Box::new(ScriptHandler {
+                vtbl: &SCRIPT_HANDLER_VTABLE,
+                refs: AtomicU32::new(1),
+                context: Rc::clone(self),
+                purpose: ScriptPurpose::WebQr,
+            })) as *mut c_void;
+            let execute_script: unsafe extern "system" fn(
+                *mut c_void,
+                PCWSTR,
+                *mut c_void,
+            ) -> HRESULT = unsafe { vtable_fn(webview, 29) };
+            let script = wide(super::web_qr_probe_script());
+            let result = unsafe { execute_script(webview, script.as_ptr(), handler) };
+            unsafe { release_com(handler) };
+            if result < 0 {
+                let mut state = self.state.lock().expect("capture state mutex poisoned");
+                state.web_qr_probe_inflight = false;
+                state.web_qr_probe_started_at = None;
+                state.web_qr_next_probe = Some(Instant::now() + super::WEB_QR_PROBE_INTERVAL);
+            }
+        }
+
+        fn start_web_qr_fetch(self: &Rc<Self>, source: String) {
+            let (sender, receiver) = mpsc::channel();
+            {
+                let mut state = self.state.lock().expect("capture state mutex poisoned");
+                if state.web_qr_fetch_rx.is_some()
+                    || state.web_qr_fetch_source.as_deref() == Some(source.as_str())
+                {
+                    state.web_qr_next_probe = Some(Instant::now() + super::WEB_QR_PROBE_INTERVAL);
+                    return;
+                }
+                state.web_qr_fetch_source = Some(source.clone());
+                state.web_qr_fetch_rx = Some(receiver);
+            }
+            let provider = self.provider.clone();
+            thread::spawn(move || {
+                let result = super::download_web_qr_image(&provider, &source);
+                let _ = sender.send(result);
+            });
         }
 
         fn poll_cookies(self: &Rc<Self>) {
@@ -1813,6 +1676,7 @@ mod platform {
                 vtbl: &SCRIPT_HANDLER_VTABLE,
                 refs: AtomicU32::new(1),
                 context: Rc::clone(self),
+                purpose: ScriptPurpose::BilibiliToken,
             })) as *mut c_void;
             let execute_script: unsafe extern "system" fn(
                 *mut c_void,
@@ -1877,6 +1741,7 @@ mod platform {
         vtbl: &'static ScriptHandlerVtable,
         refs: AtomicU32,
         context: Rc<CaptureContext>,
+        purpose: ScriptPurpose,
     }
 
     type ScriptInvoke = unsafe extern "system" fn(*mut c_void, HRESULT, *const u16) -> HRESULT;
@@ -2180,7 +2045,7 @@ mod platform {
             return S_OK;
         }
 
-        // 内嵌 HTML（酷狗及原生二维码页）走 NavigateToString，其余走 Navigate。
+        // B 站原生二维码页走 NavigateToString，其余平台走官方登录页 Navigate。
         // ICoreWebView2::NavigateToString 位于 vtable 槽位 6。
         let hr = if let Some(html) = &context.html {
             let navigate_to_string: unsafe extern "system" fn(*mut c_void, PCWSTR) -> HRESULT =
@@ -2289,20 +2154,64 @@ mod platform {
         result: HRESULT,
         json_result: *const u16,
     ) -> HRESULT {
-        let context = (&*(this as *mut ScriptHandler)).context.clone();
-        let mut state = context.state.lock().expect("capture state mutex poisoned");
-        state.js_probe_inflight = false;
-        state.next_cookie_poll = Some(Instant::now());
-        if result >= 0 && !json_result.is_null() {
-            let text = unsafe { read_wide(json_result) };
-            // ExecuteScript 返回 JSON 编码：null 或带引号的字符串。
-            if let Ok(Some(value)) = serde_json::from_str::<Option<String>>(&text)
-                && !value.is_empty()
-            {
-                state
-                    .latest_cookies
-                    .insert("ac_time_value".to_owned(), value);
-                state.outcome = Some(Ok(state.latest_cookies.clone()));
+        let handler = &*(this as *mut ScriptHandler);
+        let context = handler.context.clone();
+        match handler.purpose {
+            ScriptPurpose::BilibiliToken => {
+                let mut state = context.state.lock().expect("capture state mutex poisoned");
+                state.js_probe_inflight = false;
+                state.next_cookie_poll = Some(Instant::now());
+                if result >= 0 && !json_result.is_null() {
+                    let text = unsafe { read_wide(json_result) };
+                    // ExecuteScript 返回 JSON 编码：null 或带引号的字符串。
+                    if let Ok(Some(value)) = serde_json::from_str::<Option<String>>(&text)
+                        && !value.is_empty()
+                    {
+                        state
+                            .latest_cookies
+                            .insert("ac_time_value".to_owned(), value);
+                        state.outcome = Some(Ok(state.latest_cookies.clone()));
+                    }
+                }
+            }
+            ScriptPurpose::WebQr => {
+                let parsed = if result >= 0 && !json_result.is_null() {
+                    let text = unsafe { read_wide(json_result) };
+                    super::parse_web_qr_probe_result(&text)
+                } else {
+                    None
+                };
+                {
+                    let mut state = context.state.lock().expect("capture state mutex poisoned");
+                    state.web_qr_probe_inflight = false;
+                    state.web_qr_probe_started_at = None;
+                    state.web_qr_next_probe = Some(Instant::now() + super::WEB_QR_PROBE_INTERVAL);
+                }
+                let Some((_, source)) = parsed else {
+                    return S_OK;
+                };
+                if source.starts_with("data:image/") {
+                    match super::validate_web_qr_data_url(&source) {
+                        Ok(image) => {
+                            let mut state =
+                                context.state.lock().expect("capture state mutex poisoned");
+                            state.web_qr_pending = Some(image);
+                            state.web_qr_failures = 0;
+                        }
+                        Err(_) => {
+                            let mut state =
+                                context.state.lock().expect("capture state mutex poisoned");
+                            state.web_qr_failures = state.web_qr_failures.saturating_add(1);
+                            if state.web_qr_failures >= 3 {
+                                state.outcome = Some(Err(CaptureError::Io(
+                                    "网页登录二维码图片连续提取失败，请重试".to_owned(),
+                                )));
+                            }
+                        }
+                    }
+                } else {
+                    context.start_web_qr_fetch(source);
+                }
             }
         }
         S_OK
@@ -2553,35 +2462,11 @@ mod platform {
         let _runtime = runtime_executable().ok_or(CaptureError::RuntimeMissing)?;
         let _com = ComApartment::initialize()?;
         let window = HostWindow::create()?;
-        // 酷狗和三个原生二维码平台都在窗口内显示内嵌页面；只有未实现
-        // 原生二维码的入口才导航到固定登录页。
-        let mut kugou_qr_receiver = None;
-        let mut kugou_qr_cancel = None;
+        // QQ 音乐、网易云和酷狗都使用官方 WebView2 登录页并从 DOM/
+        // Canvas 提取二维码。B 站暂时保留已有原生二维码实现。
         let mut native_qr_receiver = None;
         let mut native_qr_cancel = None;
-        let context = if provider == "kugou" {
-            let (key, image) = super::kugou_qr_key().map_err(CaptureError::Io)?;
-            if image.is_empty() {
-                return Err(CaptureError::Io("酷狗登录接口未返回二维码图片".to_owned()));
-            }
-            publish_qr_code(&image)?;
-            let (sender, receiver) = mpsc::channel();
-            let poll_key = key.clone();
-            let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let poll_cancel = std::sync::Arc::clone(&cancel);
-            thread::spawn(move || super::kugou_qr_poll_loop(&poll_key, sender, poll_cancel));
-            let html = super::kugou_qr_page(&image);
-            let context = match CaptureContext::new_with_html(provider, window.hwnd, &html) {
-                Ok(context) => context,
-                Err(error) => {
-                    cancel.store(true, std::sync::atomic::Ordering::Release);
-                    return Err(error);
-                }
-            };
-            kugou_qr_receiver = Some(receiver);
-            kugou_qr_cancel = Some(cancel);
-            Rc::new(context)
-        } else if matches!(provider, "qqmusic" | "netease" | "bilibili") {
+        let context = if provider == "bilibili" {
             let (sender, receiver) = mpsc::channel();
             let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -2619,11 +2504,6 @@ mod platform {
         } else {
             Rc::new(CaptureContext::new(provider, window.hwnd)?)
         };
-        if let Some(receiver) = kugou_qr_receiver {
-            let mut state = context.state.lock().expect("capture state mutex poisoned");
-            state.kugou_qr_rx = Some(receiver);
-            state.kugou_qr_cancel = kugou_qr_cancel;
-        }
         if let Some(receiver) = native_qr_receiver {
             let mut state = context.state.lock().expect("capture state mutex poisoned");
             state.native_qr_rx = Some(receiver);
@@ -2656,12 +2536,18 @@ mod platform {
             pump_messages(&context);
             context.poll_navigation();
             context.poll_login_exchange();
-            context.poll_kugou_qr();
             if let Some(image) = context.poll_native_qr()
                 && let Err(error) = publish_qr_code(&image)
             {
                 // Convert callback failures into the normal outcome path so
                 // COM interfaces and cancellation state are released below.
+                context.finish_error(error);
+            }
+            if let Some(image) = context.poll_web_qr()
+                && let Err(error) = publish_qr_code(&image)
+            {
+                // Convert callback failures into the normal outcome path so
+                // COM interfaces and the WebView2 profile are released.
                 context.finish_error(error);
             }
             context.poll_cookies();
@@ -2832,7 +2718,8 @@ mod tests {
         QQ_REFRESH_COOKIE_GRACE_PERIOD, allowed_cookie_names, finish_qq_login_exchange,
         has_qq_refresh_cookies, has_required_cookies, login_url, merge_qq_cookie_updates,
         merge_qq_login_response_fields, normalize_qq_cookie_aliases, parse_qq_login_callback,
-        qq_login_response_code, qq_login_response_data, should_complete_capture,
+        parse_web_qr_probe_result, qq_login_response_code, qq_login_response_data,
+        should_complete_capture, web_qr_host_allowed, web_qr_probe_script, web_qr_url_allowed,
     };
     use serde_json::json;
     use std::collections::BTreeMap;
@@ -2842,11 +2729,59 @@ mod tests {
     fn login_pages_are_provider_specific() {
         assert_eq!(
             login_url("qqmusic"),
-            Some("https://y.qq.com/portal/profile.html")
+            Some(
+                "https://xui.ptlogin2.qq.com/cgi-bin/xlogin?appid=716027609&daid=383&style=33&login_text=%E7%99%BB%E5%BD%95&hide_title_bar=1&hide_border=1&target=self&s_url=https%3A%2F%2Fgraph.qq.com%2Foauth2.0%2Flogin_jump&pt_3rd_aid=100497308&pt_feedback_link=https%3A%2F%2Fsupport.qq.com%2Fproducts%2F77942%3FcustomInfo%3D.appid100497308&theme=2&verify_theme=",
+            )
         );
         assert_eq!(login_url("netease"), Some("https://music.163.com/"));
+        assert!(
+            login_url("kugou")
+                .is_some_and(|url| { url.starts_with("https://login-user.kugou.com/login/") })
+        );
         assert_eq!(login_url("bilibili"), Some("https://www.bilibili.com/"));
         assert_eq!(login_url("kuwo"), None);
+    }
+
+    #[test]
+    fn web_qr_probe_parser_accepts_runtime_object_and_quoted_object() {
+        let image = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==";
+        let raw = format!(r##"{{"kind":"image","value":"{image}"}}"##);
+        assert_eq!(
+            parse_web_qr_probe_result(&raw),
+            Some(("image".to_owned(), image.to_owned()))
+        );
+        let quoted = serde_json::to_string(&raw).unwrap();
+        assert_eq!(
+            parse_web_qr_probe_result(&quoted).map(|(_, value)| value),
+            Some(image.to_owned())
+        );
+        assert_eq!(parse_web_qr_probe_result(r#"{"kind":"wait"}"#), None);
+    }
+
+    #[test]
+    fn web_qr_probe_script_contains_only_expected_login_actions() {
+        let script = web_qr_probe_script();
+        assert!(script.contains("data-action=\"login\""));
+        assert!(script.contains("toDataURL('image/png')"));
+        assert!(script.contains("qrlogin"));
+        assert!(!script.contains("document.cookie"));
+    }
+
+    #[test]
+    fn web_qr_image_hosts_are_provider_scoped() {
+        assert!(web_qr_host_allowed("qqmusic", "xui.ptlogin2.qq.com"));
+        assert!(!web_qr_host_allowed("qqmusic", "evil.example.com"));
+        assert!(web_qr_host_allowed("netease", "p5.music.126.net"));
+        assert!(web_qr_host_allowed("kugou", "login-user.kugou.com"));
+        assert!(!web_qr_host_allowed("kugou", "login-user.qq.com"));
+        assert!(web_qr_url_allowed(
+            "qqmusic",
+            &url::Url::parse("https://xui.ptlogin2.qq.com/ssl/ptqrshow").unwrap()
+        ));
+        assert!(!web_qr_url_allowed(
+            "qqmusic",
+            &url::Url::parse("https://evil.example/qr.png").unwrap()
+        ));
     }
 
     #[test]
@@ -2870,6 +2805,12 @@ mod tests {
             ),
         ]);
         assert!(!has_qq_refresh_cookies(&incomplete_refresh));
+
+        let kugou_encoded = BTreeMap::from([(
+            "KuGoo".to_owned(),
+            "t%3Dtoken%26KugooID%3D123%26ct%3D1700000000".to_owned(),
+        )]);
+        assert!(has_required_cookies("kugou", &kugou_encoded));
     }
 
     #[test]
@@ -3046,6 +2987,10 @@ mod tests {
         assert_eq!(
             parse_qq_login_callback("https://y.qq.com/portal/profile.html?code=abc"),
             None
+        );
+        assert_eq!(
+            parse_qq_login_callback("https://graph.qq.com/oauth2.0/login_jump?code=direct-qr-code"),
+            Some(("1".to_owned(), "direct-qr-code".to_owned()))
         );
     }
 

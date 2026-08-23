@@ -28,9 +28,9 @@ use super::kugou_crypto::{
 
 const PROVIDER: &str = "kugou";
 
-/// 酷狗概念版 Android API 的签名盐值。
+/// 酷狗测试版（概念版/lite）Android API 的签名盐值。
 const KUGOU_LITE_SIGN_SALT: &str = "LnT6xpN3khm36zse0QzvmgTZ3waWdRSA";
-/// `song_url` 的 `key` 参数使用的概念版盐值。
+/// `song_url` 的 `key` 参数使用的测试版（概念版/lite）盐值。
 const KUGOU_LITE_KEY_SALT: &str = "185672dd44712f60bb1736df5a377e82";
 const KUGOU_LITE_APPID: i64 = 3116;
 const KUGOU_LITE_CLIENTVER: i64 = 11440;
@@ -54,7 +54,7 @@ const URL_YOUTH_VIP: &str = "https://gateway.kugou.com/youth/v1/ad/play_report";
 const URL_YOUTH_VIP_UPGRADE: &str =
     "https://gateway.kugou.com/youth/v1/listen_song/upgrade_vip_reward";
 
-/// 概念版广告领取 VIP 的广告位 ID（官方 youth_vip.js 固定值）。
+/// 测试版（概念版/lite）广告领取 VIP 的广告位 ID（官方 youth_vip.js 固定值）。
 const KUGOU_VIP_AD_ID: u64 = 12_307_537_187;
 
 /// 广告播放时长（毫秒），官方固定 30 秒。
@@ -73,7 +73,7 @@ pub struct KugouAccountStatus {
     pub listen_report_available: bool,
 }
 
-/// 概念版 VIP 领取结果（广告播放领取）。
+/// 测试版（概念版/lite）VIP 领取结果（广告播放领取）。
 #[derive(Clone, Debug, Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KugouListenReport {
@@ -82,7 +82,7 @@ pub struct KugouListenReport {
     pub message: String,
 }
 
-/// get_union_vip 响应解析出的 VIP 状态（概念版 busi_vip 优先）。
+/// get_union_vip 响应解析出的 VIP 状态（测试版/概念版 busi_vip 优先）。
 #[derive(Clone, Debug, Default)]
 struct UnionVipStatus {
     /// 是否判定为 VIP；`None` 表示响应无法判定。
@@ -159,7 +159,7 @@ const VIP_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// 判定失败（接口风控/超时）时的短缓存，尽快重试账号接口。
 const VIP_CACHE_FAILED_TTL: Duration = Duration::from_secs(15 * 60);
 
-/// 计算概念版 Android 请求签名。
+/// 计算测试版（概念版/lite）Android 请求签名。
 ///
 /// 酷狗 Android 请求把排序后的 `key=value` 参数串、原始请求体和盐值
 /// 一起计算 MD5；请求体必须是发送时完全相同的紧凑 JSON 字节序列。
@@ -910,7 +910,7 @@ impl KugouAdapter {
         Ok(value)
     }
 
-    /// 概念版广告播放领取 VIP：上报一次完整广告播放（约 30 秒）。
+    /// 测试版（概念版/lite）广告播放领取 VIP：上报一次完整广告播放（约 30 秒）。
     pub async fn claim_vip(&self) -> Result<KugouListenReport, CatalogError> {
         let credential = self.credential()?;
         let now_ms = std::time::SystemTime::now()
@@ -953,7 +953,7 @@ impl KugouAdapter {
         })
     }
 
-    /// 概念版升级 VIP：听歌奖励升级。
+    /// 测试版（概念版/lite）升级 VIP：听歌奖励升级。
     pub async fn upgrade_vip(&self) -> Result<KugouListenReport, CatalogError> {
         let credential = self.credential()?;
         let (_, userid, _) = Self::credential_fields(&credential)?;

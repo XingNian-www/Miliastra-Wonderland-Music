@@ -38,6 +38,7 @@ pub(crate) const LIVE_CONFIG_PATHS: &[&str] = &[
     "timing.playback.status_poll_ms",
     "timing.playback.monitor_status_ms",
     "timing.playback.monitor_tick_ms",
+    "timing.playback.lyrics_lead_seconds",
     "song_dedup.enabled",
     "song_dedup.window_seconds",
     "song_dedup.max_count",
@@ -117,6 +118,8 @@ pub struct LiveConfigs {
     pub monitor_status_ms: Arc<RwLock<u64>>,
     /// timing.playback.monitor_tick_ms
     pub monitor_tick_ms: Arc<RwLock<u64>>,
+    /// timing.playback.lyrics_lead_seconds
+    pub lyrics_lead_seconds: Arc<RwLock<f64>>,
     /// timing.chat_scan.change_debounce_ms
     pub change_debounce_ms: Arc<RwLock<u64>>,
     /// song_dedup.enabled / window_seconds / max_count（整段共享，
@@ -153,6 +156,7 @@ impl LiveConfigs {
             status_poll_ms: Arc::new(RwLock::new(config.timing.playback.status_poll_ms)),
             monitor_status_ms: Arc::new(RwLock::new(config.timing.playback.monitor_status_ms)),
             monitor_tick_ms: Arc::new(RwLock::new(config.timing.playback.monitor_tick_ms)),
+            lyrics_lead_seconds: Arc::new(RwLock::new(config.timing.playback.lyrics_lead_seconds)),
             change_debounce_ms: Arc::new(RwLock::new(config.timing.chat_scan.change_debounce_ms)),
             song_dedup: Arc::new(RwLock::new(config.song_dedup.clone())),
             friend_delivery_auto_retry_count: Arc::new(RwLock::new(
@@ -256,6 +260,10 @@ impl LiveConfigs {
             .write()
             .unwrap_or_else(PoisonError::into_inner) = config.timing.playback.monitor_tick_ms;
         *self
+            .lyrics_lead_seconds
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = config.timing.playback.lyrics_lead_seconds;
+        *self
             .change_debounce_ms
             .write()
             .unwrap_or_else(PoisonError::into_inner) = config.timing.chat_scan.change_debounce_ms;
@@ -302,6 +310,7 @@ impl LiveConfigs {
         effective.timing.playback.status_poll_ms = config.timing.playback.status_poll_ms;
         effective.timing.playback.monitor_status_ms = config.timing.playback.monitor_status_ms;
         effective.timing.playback.monitor_tick_ms = config.timing.playback.monitor_tick_ms;
+        effective.timing.playback.lyrics_lead_seconds = config.timing.playback.lyrics_lead_seconds;
         effective.song_dedup.enabled = config.song_dedup.enabled;
         effective.song_dedup.window_seconds = config.song_dedup.window_seconds;
         effective.song_dedup.max_count = config.song_dedup.max_count;
@@ -331,6 +340,7 @@ mod tests {
         config.timing.playback.status_poll_ms = 1111;
         config.timing.playback.monitor_status_ms = 2222;
         config.timing.playback.monitor_tick_ms = 333;
+        config.timing.playback.lyrics_lead_seconds = 1.5;
         config.song_dedup.enabled = false;
         config.song_dedup.window_seconds = 123;
         config.song_dedup.max_count = 7;
@@ -361,6 +371,7 @@ mod tests {
         assert_eq!(*live.status_poll_ms.read().unwrap(), 1111);
         assert_eq!(*live.monitor_status_ms.read().unwrap(), 2222);
         assert_eq!(*live.monitor_tick_ms.read().unwrap(), 333);
+        assert_eq!(*live.lyrics_lead_seconds.read().unwrap(), 1.5);
         assert_eq!(*live.change_debounce_ms.read().unwrap(), 155);
         let dedup = live.song_dedup.read().unwrap();
         assert!(!dedup.enabled);
@@ -456,6 +467,7 @@ mod tests {
         assert_eq!(*live.status_poll_ms.read().unwrap(), 1111);
         assert_eq!(*live.monitor_status_ms.read().unwrap(), 2222);
         assert_eq!(*live.monitor_tick_ms.read().unwrap(), 333);
+        assert_eq!(*live.lyrics_lead_seconds.read().unwrap(), 1.5);
         assert_eq!(*live.change_debounce_ms.read().unwrap(), 155);
         let dedup = live.song_dedup.read().unwrap();
         assert!(!dedup.enabled);
@@ -484,6 +496,7 @@ mod tests {
         live.apply(&AppConfig::default());
         assert!(*live.queue_protect_current_song.read().unwrap());
         assert_eq!(live.song_dedup.read().unwrap().max_count, 1);
+        assert_eq!(*live.lyrics_lead_seconds.read().unwrap(), 0.0);
     }
 
     #[test]

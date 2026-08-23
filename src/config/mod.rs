@@ -2060,6 +2060,65 @@ stale_timeout_ms: 7500
     }
 
     #[test]
+    fn lyrics_lead_seconds_accepts_only_finite_values_from_zero_to_sixty() {
+        for valid in [0.0, 1.5, miliastra_playback::MAX_LYRICS_LEAD_SECONDS] {
+            let mut config: AppConfig =
+                serde_yaml::from_str(bundled_config_yaml()).expect("default config");
+            config.timing.playback.lyrics_lead_seconds = valid;
+            config.validate().expect("valid lyrics lead seconds");
+        }
+
+        for invalid in [
+            -0.001,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            miliastra_playback::MAX_LYRICS_LEAD_SECONDS + 0.001,
+        ] {
+            let mut config: AppConfig =
+                serde_yaml::from_str(bundled_config_yaml()).expect("default config");
+            config.timing.playback.lyrics_lead_seconds = invalid;
+            let error = config
+                .validate()
+                .expect_err("invalid lyrics lead seconds must be rejected");
+            assert!(
+                error
+                    .to_string()
+                    .contains("timing.playback.lyrics_lead_seconds"),
+                "value={invalid:?} error={error}"
+            );
+        }
+    }
+
+    #[test]
+    fn lyrics_lead_seconds_rejects_non_numeric_configuration_values() {
+        for invalid in ["\"1.5\"", "[1.5]"] {
+            let yaml = bundled_config_yaml().replace(
+                "lyrics_lead_seconds: 0.0",
+                &format!("lyrics_lead_seconds: {invalid}"),
+            );
+            let error = serde_yaml::from_str::<AppConfig>(&yaml)
+                .expect_err("non-numeric lyrics lead must be rejected");
+            assert!(error.to_string().contains("lyrics_lead_seconds"));
+        }
+    }
+
+    #[test]
+    fn missing_lyrics_lead_seconds_defaults_to_zero_for_existing_configurations() {
+        let mut value: serde_yaml::Value =
+            serde_yaml::from_str(bundled_config_yaml()).expect("default config value");
+        value["timing"]["playback"]
+            .as_mapping_mut()
+            .expect("playback timing mapping")
+            .remove(serde_yaml::Value::String("lyrics_lead_seconds".to_string()));
+
+        let config: AppConfig =
+            serde_yaml::from_value(value).expect("existing config without lyric lead");
+
+        assert_eq!(config.timing.playback.lyrics_lead_seconds, 0.0);
+    }
+
+    #[test]
     fn startup_validation_rejects_zero_runtime_intervals_timeouts_and_retries() {
         let invalid_fields: [ConfigMutation; 14] = [
             ("timing.watchdog_restart_ms", |config| {

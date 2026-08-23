@@ -420,67 +420,79 @@ fn merge_qq_login_response_fields(cookies: &mut BTreeMap<String, String>, body: 
     merge_qq_response_alias(
         cookies,
         data,
-        &["openid"],
+        &["openid", "openId"],
         &["psrf_qqopenid", "openid", "wxopenid"],
     );
     merge_qq_response_alias(
         cookies,
         data,
-        &["wxopenid"],
+        &["wxopenid", "wxOpenId"],
         &["wxopenid", "psrf_qqopenid", "openid"],
     );
     merge_qq_response_alias(
         cookies,
         data,
-        &["access_token"],
+        &["access_token", "accessToken"],
         &["psrf_qqaccess_token", "access_token", "wxaccess_token"],
     );
     merge_qq_response_alias(
         cookies,
         data,
-        &["wxaccess_token"],
+        &["wxaccess_token", "wxAccessToken"],
         &["wxaccess_token", "psrf_qqaccess_token", "access_token"],
     );
     merge_qq_response_alias(
         cookies,
         data,
-        &["refresh_token"],
+        &["refresh_token", "refreshToken"],
         &["psrf_qqrefresh_token", "refresh_token", "wxrefresh_token"],
     );
     merge_qq_response_alias(
         cookies,
         data,
-        &["wxrefresh_token"],
+        &["wxrefresh_token", "wxRefreshToken"],
         &["wxrefresh_token", "psrf_qqrefresh_token", "refresh_token"],
     );
     merge_qq_response_alias(
         cookies,
         data,
-        &["refresh_key"],
+        &["refresh_key", "refreshKey"],
         &["psrf_qqrefresh_key", "refresh_key"],
     );
     merge_qq_response_alias(
         cookies,
         data,
-        &["musickey", "qqmusic_key", "qm_keyst", "lqm_keyst"],
+        &[
+            "musickey",
+            "musicKey",
+            "qqmusic_key",
+            "qm_keyst",
+            "lqm_keyst",
+        ],
         &["qqmusic_key", "qm_keyst", "lqm_keyst"],
     );
     merge_qq_response_alias(
         cookies,
         data,
-        &["musicid", "str_musicid"],
+        &[
+            "musicid",
+            "musicuin",
+            "musicUin",
+            "str_musicid",
+            "qqmusic_uin",
+        ],
         &["uin", "wxuin"],
     );
     merge_qq_response_alias(
         cookies,
         data,
-        &["unionid"],
+        &["unionid", "unionId"],
         &["psrf_qqunionid", "unionid", "wxunionid"],
     );
     merge_qq_response_alias(
         cookies,
         data,
-        &["wxunionid"],
+        &["wxunionid", "wxUnionId"],
         &["wxunionid", "psrf_qqunionid", "unionid"],
     );
     normalize_qq_cookie_aliases(cookies);
@@ -838,7 +850,7 @@ fn refresh_qq_web_session(
     }
 }
 
-/// 酷狗概念版扫码登录凭据获取（不依赖 sidecar，直连酷狗官方接口）。
+/// 酷狗测试版（概念版/lite）扫码登录凭据获取（不依赖 sidecar，直连酷狗官方接口）。
 ///
 /// 流程：v2/qrcode 拿 key → WebView2 显示 H5 二维码页 → 用户用酷狗 App
 /// 扫码 → v2/get_userinfo_qrcode 轮询到 status=4 返回 token/userid。
@@ -925,7 +937,7 @@ fn kugou_normalize_guid(guid: &str) -> String {
 
 /// 扫码登录请求的默认参数。mid 必须与 sidecar 设备一致
 /// （主程序通过 KUGOU_API_GUID 环境变量传入），否则扫码 token
-/// 绑定匿名设备，概念版 API 会拒绝（error_code 20018）。
+/// 绑定匿名设备，测试版（概念版/lite）API 会拒绝（error_code 20018）。
 fn kugou_default_params() -> BTreeMap<String, String> {
     let mid = std::env::var("KUGOU_API_MID").unwrap_or_else(|_| {
         std::env::var("KUGOU_API_GUID")
@@ -958,7 +970,7 @@ fn kugou_web_get(
 }
 
 /// 酷狗 web 接口请求，额外返回响应 Set-Cookie 的键值（续期字段如 t1 只经
-/// Set-Cookie 下发，不返回它们会导致概念版 token 刷新被官方拒绝）。
+/// Set-Cookie 下发，不返回它们会导致测试版（概念版/lite）token 刷新被官方拒绝）。
 fn kugou_web_get_with_cookies(
     url: &str,
     params: &BTreeMap<String, String>,
@@ -3257,6 +3269,39 @@ mod tests {
             }),
         );
         assert_eq!(cookies.get("qqmusic_key"), Some(&"new-key".to_owned()));
+        assert_eq!(
+            cookies.get("psrf_qqrefresh_token"),
+            Some(&"refresh-token".to_owned())
+        );
+        assert_eq!(
+            cookies.get("psrf_qqrefresh_key"),
+            Some(&"refresh-key".to_owned())
+        );
+    }
+
+    #[test]
+    fn qq_login_response_accepts_camel_case_token_fields() {
+        let mut cookies = BTreeMap::new();
+        merge_qq_login_response_fields(
+            &mut cookies,
+            &json!({
+                "code": 0,
+                "data": {
+                    "musicUin": "42",
+                    "musicKey": "key",
+                    "openId": "open-id",
+                    "accessToken": "access-token",
+                    "refreshToken": "refresh-token",
+                    "refreshKey": "refresh-key",
+                    "unionId": "union-id"
+                }
+            }),
+        );
+        assert_eq!(cookies.get("uin"), Some(&"42".to_owned()));
+        assert_eq!(
+            cookies.get("psrf_qqaccess_token"),
+            Some(&"access-token".to_owned())
+        );
         assert_eq!(
             cookies.get("psrf_qqrefresh_token"),
             Some(&"refresh-token".to_owned())

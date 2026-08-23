@@ -6,6 +6,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::Parser;
 use miliastra_login_protocol::{CredentialPayload, LoginHelperMessage, encode_message};
+use percent_encoding::percent_decode_str;
 
 mod native_qr;
 mod webview2;
@@ -145,9 +146,17 @@ impl Provider {
             Self::Kugou => {
                 // 酷狗网页登录凭据集中在 KuGoo cookie：
                 // 值形如 t=<token>&KugooID=<userid>&ct=<时间戳>&...
-                let fields = cookies
+                let ku_goo = cookies
                     .remove("KuGoo")
-                    .unwrap_or_default()
+                    .map(|value| {
+                        if value.as_bytes().contains(&b'%') {
+                            percent_decode_str(&value).decode_utf8_lossy().into_owned()
+                        } else {
+                            value
+                        }
+                    })
+                    .unwrap_or_default();
+                let fields = ku_goo
                     .split('&')
                     .filter_map(|pair| pair.split_once('='))
                     .map(|(name, value)| (name.to_owned(), value.to_owned()))
@@ -229,6 +238,19 @@ mod tests {
         assert_eq!(userid, "123456");
         assert!(!cookies.contains_key("KuGoo"));
         assert_eq!(cookies.get("dfid").map(String::as_str), Some("dfid-value"));
+    }
+
+    #[test]
+    fn kugou_payload_decodes_web_cookie_value_before_parsing() {
+        let payload = Provider::Kugou.payload(BTreeMap::from([(
+            "KuGoo".to_owned(),
+            "t%3Dsecret-token%26KugooID%3D123456%26ct%3D1700000000".to_owned(),
+        )]));
+        let CredentialPayload::Kugou { token, userid, .. } = payload else {
+            panic!("expected Kugou payload");
+        };
+        assert_eq!(token, "secret-token");
+        assert_eq!(userid, "123456");
     }
 
     #[test]

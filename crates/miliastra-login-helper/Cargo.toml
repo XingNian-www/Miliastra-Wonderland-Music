@@ -9,10 +9,10 @@ build = "build.rs"
 [dependencies]
 anyhow = { workspace = true }
 clap = { version = "4", features = ["derive"] }
-md-5 = "0.10"
 miliastra-login-protocol = { workspace = true }
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["png"] }
+percent-encoding = "2"
 qrcode = { version = "0.14", default-features = true }
 reqwest = { workspace = true, features = ["blocking", "json", "query", "rustls"] }
 rumqttc = { version = "0.25.1", features = ["websocket"] }

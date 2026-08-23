@@ -157,7 +157,7 @@ impl ProviderCredential {
                         "Kugou token, userid and dfid must not be empty".to_owned(),
                     ));
                 }
-                // t1 是概念版续期字段，登录/刷新时由官方 Set-Cookie 下发。
+                // t1 是测试版（概念版/lite）续期字段，登录/刷新时由官方 Set-Cookie 下发。
                 require_allowed_cookie_names(
                     cookies,
                     &[

@@ -349,6 +349,10 @@ html[data-theme=light] .theme-toggle .moon{display:none}
 .login-account .vip-badge{color:var(--warn);font-weight:600}
 .login-account.vip{border:1px solid var(--warn-soft)}
 .login-refresh-info{color:var(--text-3);font-size:var(--fs-meta);line-height:1.5;word-break:break-word}
+.login-qr{display:grid;grid-template-columns:180px minmax(0,1fr);gap:var(--sp-4);align-items:center;margin-top:var(--sp-3);padding-top:var(--sp-3);border-top:1px solid var(--sep-1)}
+.login-qr img{display:block;width:180px;max-width:100%;aspect-ratio:1;object-fit:contain;padding:8px;background:#fff;border-radius:var(--radius-s)}
+.login-qr strong,.login-qr small{display:block}
+.login-qr small{margin-top:var(--sp-1);color:var(--text-3);line-height:1.5}
 .global-result{position:fixed;right:var(--sp-4);bottom:var(--sp-4);z-index:9;width:min(420px,calc(100vw - 32px));padding:var(--sp-3);border:1px solid var(--sep-1);border-radius:var(--radius-l);background:var(--bg-card);box-shadow:0 12px 40px rgba(0,0,0,.3)}
 .global-result .panel-head{height:28px}
 .global-result .panel-body{padding-top:var(--sp-2)}
@@ -422,7 +426,7 @@ input.config-invalid:focus,textarea.config-invalid:focus{border-color:var(--dang
  @media(max-width:1200px){.status-chips{gap:var(--sp-2)}.chip{font-size:var(--fs-meta)}.chip em{max-width:96px}}
  @media(max-width:1050px){.playback-layout{grid-template-columns:1fr}.playback-layout>.panel{grid-column:auto}.playback-queue-panel .queue-list{grid-template-columns:1fr}
  .topbar{grid-template-columns:1fr;padding:var(--sp-3) var(--sp-1) var(--sp-4)}.brand{padding:var(--sp-2) var(--sp-4);border-bottom:1px solid var(--sep-2)}.status-chips,.top-actions{flex-wrap:wrap;padding:var(--sp-3) var(--sp-4);border-left:none;border-top:1px solid var(--sep-2)}.top-actions{justify-content:flex-start}.page-grid{grid-template-columns:1fr}.page-grid>.panel{grid-column:auto}.turtle-stats{grid-template-columns:repeat(3,minmax(0,1fr))}.tools-grid{grid-template-columns:1fr}.tools-grid>.panel{grid-column:auto}.config-layout{grid-template-columns:1fr}.config-sidebar{position:static;max-height:none}.config-num-row{grid-template-columns:repeat(2,minmax(0,1fr))}}
- @media(max-width:720px){.app-nav{position:sticky;top:0;width:100%;height:auto;padding:var(--sp-2);border-right:0;border-bottom:1px solid var(--sep-1);overflow:hidden}.nav-brand{display:none}.nav-links{flex-direction:row;overflow-x:auto;scrollbar-width:thin}.nav-link{width:auto;flex:0 0 auto;white-space:nowrap}.nav-tools{margin-top:0}.shell{margin-left:0;padding:0 var(--sp-3) var(--sp-5)}.controls,.two,.three,.compact-form,.ocr-send,.ocr-options,.turtle-toolbar,.turtle-grid,.login-row,.login-session-grid,.login-facts{grid-template-columns:1fr}.login-row .controls{min-width:0}.turtle-stats{grid-template-columns:1fr 1fr}.undercover-toolbar{justify-content:stretch}.undercover-toolbar .btn{flex:1}.global-result{bottom:var(--sp-2)}.tools-grid{gap:var(--sp-4)}.playback-player-panel,.playback-request-panel{padding-left:var(--sp-2);padding-right:var(--sp-2)}.playback-player-panel .controls{grid-template-columns:repeat(2,minmax(0,1fr))}.playback-request-panel>.panel-body>.controls{grid-template-columns:repeat(2,minmax(0,1fr))}.playback-request-panel>.panel-body>.controls .btn.primary{grid-column:auto}.candidate-item{grid-template-columns:1fr}.candidate-actions{justify-content:flex-start}}
+ @media(max-width:720px){.app-nav{position:sticky;top:0;width:100%;height:auto;padding:var(--sp-2);border-right:0;border-bottom:1px solid var(--sep-1);overflow:hidden}.nav-brand{display:none}.nav-links{flex-direction:row;overflow-x:auto;scrollbar-width:thin}.nav-link{width:auto;flex:0 0 auto;white-space:nowrap}.nav-tools{margin-top:0}.shell{margin-left:0;padding:0 var(--sp-3) var(--sp-5)}.controls,.two,.three,.compact-form,.ocr-send,.ocr-options,.turtle-toolbar,.turtle-grid,.login-row,.login-session-grid,.login-facts,.login-qr{grid-template-columns:1fr}.login-row .controls{min-width:0}.login-qr img{width:min(180px,100%);justify-self:center}.turtle-stats{grid-template-columns:1fr 1fr}.undercover-toolbar{justify-content:stretch}.undercover-toolbar .btn{flex:1}.global-result{bottom:var(--sp-2)}.tools-grid{gap:var(--sp-4)}.playback-player-panel,.playback-request-panel{padding-left:var(--sp-2);padding-right:var(--sp-2)}.playback-player-panel .controls{grid-template-columns:repeat(2,minmax(0,1fr))}.playback-request-panel>.panel-body>.controls{grid-template-columns:repeat(2,minmax(0,1fr))}.playback-request-panel>.panel-body>.controls .btn.primary{grid-column:auto}.candidate-item{grid-template-columns:1fr}.candidate-actions{justify-content:flex-start}}
 </style>
 </head>
 <body>
@@ -923,6 +927,8 @@ let screenshotLoading=false
 let searchCandidateItems=[]
 let loginProviderItems=[]
 let loginRuntimeStatus={active:false}
+let loginStatusRequestIssued=0
+let loginStatusRequestApplied=0
 let operatorWorkflows=[]
 let taskSnapshots=[]
 let activeDecisionId=0
@@ -1177,6 +1183,7 @@ const providerNames={qqmusic:'QQ音乐',netease:'网易云音乐',bilibili:'哔�
 function providerLabel(provider){return providerNames[provider]||provider||'未知平台'}
 function loginTime(value){if(value==null)return '暂未提供';const date=new Date(typeof value==='number'&&value<1e12?value*1000:value);return isNaN(date.getTime())?'暂未提供':date.toLocaleString('zh-CN',{hour12:false})}
 function refreshTime(ms){return Number.isFinite(ms)?new Date(ms).toLocaleString():'未记录'}
+function loginQrDataUrl(value){return typeof value==='string'&&value.length<=700000&&/^data:image\/(?:png|jpeg);base64,[A-Za-z0-9+/]+={0,2}$/.test(value)?value:''}
 function renderLoginState(){
   const active=loginRuntimeStatus&&loginRuntimeStatus.active
   const activeProvider=active?loginRuntimeStatus.provider:''
@@ -1185,6 +1192,10 @@ function renderLoginState(){
   const deadline=loginRuntimeStatus.deadlineAtMs??loginRuntimeStatus.deadlineAt
   const remaining=loginRuntimeStatus.remainingSeconds??(deadline==null?null:Math.max(0,Math.ceil((new Date(deadline).getTime()-Date.now())/1000)))
   const error=loginRuntimeStatus.lastError||{}
+  const qr=active?(loginRuntimeStatus.qrCode||{}):{}
+  const qrImage=loginQrDataUrl(qr.imageDataUrl)
+  const qrLabel=active?providerLabel(activeProvider):'音乐平台'
+  const activeHint=active?(qrImage?'':(activeProvider==='kugou'?'正在获取酷狗登录二维码...':'二维码正在准备；若未显示，请在独立安全窗口完成登录。')):''
   $('loginSessionDetail').innerHTML='<div class="login-session-grid">'+
     '<div class="login-fact"><span>当前平台</span><strong>'+esc(active?providerLabel(activeProvider):'无')+'</strong></div>'+
     '<div class="login-fact"><span>会话 ID</span><strong title="'+esc(loginRuntimeStatus.sessionId||'')+'">'+esc(loginRuntimeStatus.sessionId||'无')+'</strong></div>'+
@@ -1194,7 +1205,9 @@ function renderLoginState(){
     '<div class="login-fact"><span>截止时间</span><strong>'+esc(loginTime(deadline))+'</strong></div>'+
     '<div class="login-fact"><span>最近错误代码</span><strong>'+esc(error.code||loginRuntimeStatus.lastErrorCode||'无')+'</strong></div>'+
     '<div class="login-fact"><span>最近错误信息</span><strong title="'+esc(error.message||loginRuntimeStatus.lastErrorMessage||'')+'">'+esc(error.message||loginRuntimeStatus.lastErrorMessage||'无')+'</strong></div></div>'+
-    (active?'<div class="result" style="margin-top:var(--sp-3);min-height:0">登录已在独立安全窗口中启动。请仅在该窗口输入账号信息，控制台不会显示 Cookie 值。</div>':'')
+    (qrImage?'<div class="login-qr"><img id="loginQrImage" alt="'+esc(qrLabel)+'登录二维码"><div><strong>使用'+esc(qrLabel)+' App 扫码登录</strong><small id="loginQrHint">二维码过期或扫码失败后，请重新发起登录。</small></div></div>':(activeHint?'<div class="result" style="margin-top:var(--sp-3);min-height:0">'+esc(activeHint)+'</div>':''))
+  const qrElement=$('loginQrImage')
+  if(qrElement){qrElement.addEventListener('error',()=>{qrElement.hidden=true;const hint=$('loginQrHint');if(hint)hint.textContent='二维码加载失败，请在独立窗口完成登录。'},{once:true});qrElement.src=qrImage}
   const items=Array.isArray(loginProviderItems)?loginProviderItems:[]
   $('loginProviders').innerHTML=items.map((item)=>{
     const provider=item.provider
@@ -1236,10 +1249,11 @@ function renderLoginState(){
   })})
 }
 async function loadLoginState(){
+  const statusRequestId=++loginStatusRequestIssued
   try{
     const results=await Promise.all([request('/player/providers'),request('/player/login/status')])
     loginProviderItems=Array.isArray(results[0])?results[0]:[]
-    loginRuntimeStatus=results[1]||{active:false}
+    if(statusRequestId>=loginStatusRequestApplied){loginStatusRequestApplied=statusRequestId;loginRuntimeStatus=results[1]||{active:false}}
     await loadPlatformAccounts()
     renderLoginState()
   }catch(e){$('loginMeta').textContent='读取失败';$('loginProviders').innerHTML='<div class="result">'+esc(e.message)+'</div>'}
@@ -1624,8 +1638,11 @@ async function refreshAll(){
   if(failed)setResult('刷新失败: '+failed.reason.message)
 }
 async function refreshLoginProgress(){
+  const statusRequestId=++loginStatusRequestIssued
   try{
     const next=await request('/player/login/status')
+    if(statusRequestId<loginStatusRequestApplied)return
+    loginStatusRequestApplied=statusRequestId
     const wasActive=Boolean(loginRuntimeStatus&&loginRuntimeStatus.active)
     loginRuntimeStatus=next||{active:false}
     if(wasActive&&!loginRuntimeStatus.active){await loadLoginState();return}

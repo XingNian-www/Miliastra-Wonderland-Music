@@ -22,7 +22,9 @@ pub use domain::{
     EndBehavior, EndCause, EngineState, Failure, ResolverLocator, ResolverLocatorError, SongKey,
     StreamSource,
 };
-pub use lyrics::{LyricsParseError, TimedLyricLine, TimedLyrics, parse_lrc_pair};
+pub use lyrics::{
+    LyricsParseError, MAX_LYRICS_LEAD_SECONDS, TimedLyricLine, TimedLyrics, parse_lrc_pair,
+};
 pub use model::{
     PlayableTrack, SearchCandidate, SearchQuery, TrackKey, TrackKeyError, TrackMetadata, TrackRef,
 };

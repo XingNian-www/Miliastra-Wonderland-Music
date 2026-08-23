@@ -1271,7 +1271,7 @@ impl ApplicationRuntime {
         let state_store: Arc<dyn miliastra_contracts::StateStore> =
             Arc::new(crate::adapters::file_store::FsStateStore);
         let ocr_device = ProductionOcrDevice::new(ocr_args.clone())?;
-        let native_playback_runtime = NativePlaybackRuntime::start(
+        let native_playback_runtime = NativePlaybackRuntime::start_with_lyrics_lead(
             config.playback.credential_directory.clone(),
             // 统一数据库：缓存元数据与配置共用同一个 playback.sqlite3。
             config.playback.audio_cache_runtime_config(
@@ -1281,6 +1281,7 @@ impl ApplicationRuntime {
                     .parent()
                     .expect("统一数据库路径必须有父目录"),
             ),
+            live_configs.lyrics_lead_seconds.clone(),
         )
         .context("启动原生播放器")?;
         let native_playback = native_playback_runtime.handle();

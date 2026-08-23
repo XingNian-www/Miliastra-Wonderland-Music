@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,6 +26,7 @@ const REAPER_POLL: Duration = Duration::from_millis(25);
 const TERMINATION_GRACE: Duration = Duration::from_secs(2);
 /// 等待登录助手输出线程退出的上限;超过则分离(孙进程可能持有管道写端)。
 const READER_JOIN_GRACE: Duration = Duration::from_secs(3);
+const MAX_LOGIN_HELPER_FRAMES: usize = 8;
 const PROFILE_ROOT_NAME: &str = ".login-profiles";
 
 /// The application owns the login lease and credential store. Keeping this
@@ -368,6 +369,7 @@ struct ManagerState {
     phase: LoginPhase,
     started_at_ms: Option<u64>,
     deadline_at_ms: Option<u64>,
+    qr_code: Option<LoginQrCodeView>,
     last_error: Option<LoginErrorView>,
 }
 
@@ -429,7 +431,25 @@ pub(crate) struct LoginManagerStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deadline_at_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub qr_code: Option<LoginQrCodeView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<LoginErrorView>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LoginQrCodeView {
+    pub image_data_url: String,
+    pub received_at_ms: u64,
+}
+
+impl std::fmt::Debug for LoginQrCodeView {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LoginQrCodeView")
+            .field("received_at_ms", &self.received_at_ms)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -497,6 +517,7 @@ impl LoginHelperManager {
                     phase: LoginPhase::Idle,
                     started_at_ms: None,
                     deadline_at_ms: None,
+                    qr_code: None,
                     last_error: None,
                 }),
                 changed: Condvar::new(),
@@ -552,6 +573,7 @@ impl LoginHelperManager {
                 provider: None,
                 started_at_ms: None,
                 deadline_at_ms: None,
+                qr_code: None,
                 last_error: Some(
                     manager_failure("login_manager_unavailable", "登录管理器不可用", None).view(),
                 ),
@@ -574,6 +596,7 @@ impl LoginHelperManager {
             provider,
             started_at_ms: state.started_at_ms,
             deadline_at_ms: state.deadline_at_ms,
+            qr_code: state.qr_code.clone(),
             last_error: state.last_error.clone(),
         }
     }
@@ -608,6 +631,7 @@ impl LoginHelperManager {
             state.phase = LoginPhase::Starting;
             state.started_at_ms = Some(started_at_ms);
             state.deadline_at_ms = Some(deadline_at_ms);
+            state.qr_code = None;
             state.last_error = None;
         }
 
@@ -698,6 +722,7 @@ impl LoginHelperManager {
                 );
                 state.active = None;
                 state.phase = LoginPhase::Failed;
+                state.qr_code = None;
                 state.last_error = Some(failure.view());
                 self.inner.changed.notify_all();
                 drop(state);
@@ -732,6 +757,7 @@ impl LoginHelperManager {
             let child = Arc::clone(&active.child);
             let provider = active.session.provider;
             state.phase = LoginPhase::Canceling;
+            state.qr_code = None;
             (cancel, child, provider)
         };
         cancel.store(true, Ordering::Release);
@@ -838,6 +864,7 @@ impl LoginHelperManager {
     fn record_start_failure(&self, failure: &LoginHelperFailure) {
         if let Ok(mut state) = self.inner.state.lock() {
             state.phase = LoginPhase::Failed;
+            state.qr_code = None;
             state.last_error = Some(failure.view());
         }
     }
@@ -930,6 +957,7 @@ impl LoginHelperManager {
             let worker = state.worker.take();
             state.active = None;
             state.phase = LoginPhase::Failed;
+            state.qr_code = None;
             let failure = manager_failure("login_cancel_timeout", "取消登录超时", Some(provider));
             state.last_error = Some(failure.view());
             self.inner.changed.notify_all();
@@ -957,7 +985,7 @@ fn run_helper(
     session: LoginSession,
     cancel: Arc<AtomicBool>,
     child: SharedChild,
-    mut stdout: Box<dyn Read + Send>,
+    stdout: Box<dyn Read + Send>,
     stderr: Box<dyn Read + Send>,
     profile: PathBuf,
 ) {
@@ -966,8 +994,7 @@ fn run_helper(
     let reader = thread::Builder::new()
         .name("login-helper-output".to_owned())
         .spawn(move || {
-            let result = read_limited(&mut *stdout);
-            let _ = output_tx.send(result);
+            read_message_frames(stdout, output_tx);
         });
     // 登录助手可能在 stderr 写入二维码 URL 或认证参数。持续排空该管道，
     // 但绝不记录原文，避免敏感信息进入主程序日志。
@@ -1015,15 +1042,29 @@ fn run_helper(
                 .saturating_duration_since(Instant::now())
                 .min(REAPER_POLL);
             match output_rx.recv_timeout(wait) {
-                Ok(Ok(bytes)) => {
-                    match decode_message(&bytes) {
-                        Ok(decoded) => message = Some(decoded),
-                        Err(error) => {
-                            failure = Some(protocol_failure(error, session.provider));
+                Ok(Ok(bytes)) => match decode_message(&bytes) {
+                    Ok(LoginHelperMessage::QrCode {
+                        provider,
+                        image_data_url,
+                        ..
+                    }) => {
+                        if let Err(error) =
+                            store_qr_code(&inner, &session, provider, image_data_url)
+                        {
+                            failure = Some(error);
+                            break;
                         }
                     }
-                    break;
-                }
+                    Ok(decoded) => {
+                        clear_active_qr_code(&inner, session.session_id);
+                        message = Some(decoded);
+                        break;
+                    }
+                    Err(error) => {
+                        failure = Some(protocol_failure(error, session.provider));
+                        break;
+                    }
+                },
                 Ok(Err(code)) => {
                     failure = Some(manager_failure(
                         code,
@@ -1043,6 +1084,10 @@ fn run_helper(
                 }
             }
         }
+    }
+    if failure.is_some() {
+        terminate_child(&child);
+        clear_active_qr_code(&inner, session.session_id);
     }
 
     let process_deadline = deadline.min(Instant::now() + TERMINATION_GRACE);
@@ -1102,6 +1147,7 @@ fn run_helper(
         .is_some_and(|active| active.session.session_id == session.session_id)
     {
         state.active = None;
+        state.qr_code = None;
         match result {
             Ok(()) => {
                 state.phase = LoginPhase::Idle;
@@ -1160,6 +1206,11 @@ fn process_message(
                 Some(session.provider),
             ))
         }
+        LoginHelperMessage::QrCode { .. } => Err(manager_failure(
+            "invalid_helper_message",
+            "登录助手返回无效结果",
+            Some(session.provider),
+        )),
     }
 }
 
@@ -1237,6 +1288,58 @@ fn set_active_phase(inner: &ManagerInner, session_id: Uuid, phase: LoginPhase) {
             .is_some_and(|active| active.session.session_id == session_id)
     {
         state.phase = phase;
+        inner.changed.notify_all();
+    }
+}
+
+fn store_qr_code(
+    inner: &ManagerInner,
+    session: &LoginSession,
+    provider: String,
+    image_data_url: String,
+) -> Result<(), LoginHelperFailure> {
+    let actual = parse_helper_provider(&provider, session.provider)?;
+    if actual != session.provider {
+        return Err(manager_failure(
+            "invalid_helper_provider",
+            "登录助手返回的平台与请求不匹配",
+            Some(session.provider),
+        ));
+    }
+    let mut state = inner.state.lock().map_err(|_| {
+        manager_failure(
+            "login_manager_unavailable",
+            "登录管理器不可用",
+            Some(session.provider),
+        )
+    })?;
+    if state
+        .active
+        .as_ref()
+        .is_none_or(|active| active.session.session_id != session.session_id)
+    {
+        return Err(manager_failure(
+            "login_session_invalid",
+            "登录会话无效",
+            Some(session.provider),
+        ));
+    }
+    state.qr_code = Some(LoginQrCodeView {
+        image_data_url,
+        received_at_ms: unix_time_ms(),
+    });
+    inner.changed.notify_all();
+    Ok(())
+}
+
+fn clear_active_qr_code(inner: &ManagerInner, session_id: Uuid) {
+    if let Ok(mut state) = inner.state.lock()
+        && state
+            .active
+            .as_ref()
+            .is_some_and(|active| active.session.session_id == session_id)
+    {
+        state.qr_code = None;
         inner.changed.notify_all();
     }
 }
@@ -1351,6 +1454,7 @@ fn protocol_failure(error: ProtocolError, provider: ProviderId) -> LoginHelperFa
         ProtocolError::TooLarge(_) => ("helper_output_too_large", "登录助手输出超过大小限制"),
         ProtocolError::NotSingleMessage
         | ProtocolError::UnsupportedVersion(_)
+        | ProtocolError::InvalidQrCode
         | ProtocolError::Json(_) => ("invalid_helper_message", "登录助手返回无效结果"),
     };
     manager_failure(code, message, Some(provider))
@@ -1455,6 +1559,7 @@ fn helper_error_text(code: &str) -> &'static str {
         "login_timeout" => "登录等待超时",
         "login_cancelled" => "登录窗口已关闭",
         "helper_output_too_large" => "登录助手输出超过大小限制",
+        "helper_output_too_many_messages" => "登录助手输出消息过多",
         "invalid_helper_message" => "登录助手返回无效结果",
         "invalid_helper_provider" => "登录助手返回的平台无效",
         "helper_process_failed" => "登录助手异常退出",
@@ -1463,20 +1568,59 @@ fn helper_error_text(code: &str) -> &'static str {
     }
 }
 
-fn read_limited(reader: &mut dyn Read) -> Result<Vec<u8>, &'static str> {
-    let mut output = Vec::new();
-    let mut buffer = [0_u8; 4096];
+fn read_message_frames(
+    reader: Box<dyn Read + Send>,
+    sender: std::sync::mpsc::SyncSender<Result<Vec<u8>, &'static str>>,
+) {
+    let mut reader = BufReader::new(reader);
+    let mut frame_count = 0usize;
     loop {
-        let read = reader
-            .read(&mut buffer)
-            .map_err(|_| "helper_output_unavailable")?;
-        if read == 0 {
-            return Ok(output);
+        let frame = match read_message_frame(&mut reader) {
+            Ok(Some(frame)) => frame,
+            Ok(None) => return,
+            Err(code) => {
+                let _ = sender.send(Err(code));
+                return;
+            }
+        };
+        frame_count += 1;
+        if frame_count > MAX_LOGIN_HELPER_FRAMES {
+            let _ = sender.send(Err("helper_output_too_many_messages"));
+            return;
         }
-        if output.len().saturating_add(read) > MAX_LOGIN_MESSAGE_BYTES {
-            return Err("helper_output_too_large");
+        if sender.send(Ok(frame)).is_err() {
+            return;
         }
-        output.extend_from_slice(&buffer[..read]);
+    }
+}
+
+fn read_message_frame(reader: &mut impl BufRead) -> Result<Option<Vec<u8>>, &'static str> {
+    let mut frame = Vec::new();
+    loop {
+        let (consumed, complete) = {
+            let available = reader.fill_buf().map_err(|_| "helper_output_unavailable")?;
+            if available.is_empty() {
+                return if frame.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(frame))
+                };
+            }
+            let newline = available.iter().position(|byte| *byte == b'\n');
+            let content_len = newline.unwrap_or(available.len());
+            if frame.len().saturating_add(content_len) > MAX_LOGIN_MESSAGE_BYTES {
+                return Err("helper_output_too_large");
+            }
+            frame.extend_from_slice(&available[..content_len]);
+            (
+                content_len + usize::from(newline.is_some()),
+                newline.is_some(),
+            )
+        };
+        reader.consume(consumed);
+        if complete {
+            return Ok(Some(frame));
+        }
     }
 }
 
@@ -1991,6 +2135,35 @@ mod tests {
         .unwrap()
     }
 
+    fn valid_qr_image() -> &'static str {
+        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    }
+
+    fn valid_kugou_login_stream() -> Vec<u8> {
+        let mut output =
+            encode_message(&LoginHelperMessage::qr_code("kugou", valid_qr_image())).unwrap();
+        output.push(b'\n');
+        output.extend(valid_kugou_success());
+        output.push(b'\n');
+        output
+    }
+
+    fn failed_kugou_login_stream() -> Vec<u8> {
+        let mut output =
+            encode_message(&LoginHelperMessage::qr_code("kugou", valid_qr_image())).unwrap();
+        output.push(b'\n');
+        output.extend(
+            encode_message(&LoginHelperMessage::error(
+                "kugou",
+                "login_timeout",
+                "timeout",
+            ))
+            .unwrap(),
+        );
+        output.push(b'\n');
+        output
+    }
+
     #[test]
     fn helper_stderr_is_drained_without_interpreting_its_contents() {
         let diagnostic = b"https://login.example.invalid/qr?token=secret-token\n";
@@ -2002,9 +2175,95 @@ mod tests {
     }
 
     #[test]
+    fn framed_output_delivers_qr_event_before_terminal_message() {
+        let qr = encode_message(&LoginHelperMessage::qr_code("kugou", valid_qr_image())).unwrap();
+        let success = valid_kugou_success();
+        let mut output = Vec::new();
+        output.extend(qr);
+        output.push(b'\n');
+        output.extend(success);
+        output.push(b'\n');
+        let (sender, receiver) = std::sync::mpsc::sync_channel(4);
+
+        read_message_frames(Box::new(Cursor::new(output)), sender);
+
+        let first = decode_message(&receiver.recv().unwrap().unwrap()).unwrap();
+        let second = decode_message(&receiver.recv().unwrap().unwrap()).unwrap();
+        assert!(matches!(first, LoginHelperMessage::QrCode { .. }));
+        assert!(matches!(second, LoginHelperMessage::Success { .. }));
+        assert!(receiver.recv().is_err());
+    }
+
+    #[test]
+    fn qr_code_is_scoped_to_active_session_and_cleared_on_cancel() {
+        let playback = FakePlayback::new();
+        let launcher = FakeLauncher::new([FakeScenario::Blocking]);
+        let manager = manager(
+            Arc::clone(&playback),
+            launcher,
+            "qr-session",
+            Duration::from_secs(10),
+        );
+        let session = manager.start(ProviderId::Kugou).unwrap();
+
+        store_qr_code(
+            &manager.inner,
+            &session,
+            "kugou".to_owned(),
+            valid_qr_image().to_owned(),
+        )
+        .unwrap();
+
+        let active = manager.status();
+        assert_eq!(active.session_id, Some(session.session_id));
+        assert!(active.qr_code.is_some());
+        assert!(!format!("{active:?}").contains("iVBOR"));
+
+        manager.cancel(session.session_id).unwrap();
+        assert!(manager.status().qr_code.is_none());
+        manager.shutdown().unwrap();
+    }
+
+    #[test]
+    fn qr_code_is_accepted_for_every_supported_provider() {
+        for (provider, name) in [
+            (ProviderId::QqMusic, "qqmusic"),
+            (ProviderId::Netease, "netease"),
+            (ProviderId::Bilibili, "bilibili"),
+            (ProviderId::Kugou, "kugou"),
+        ] {
+            let playback = FakePlayback::new();
+            let launcher = FakeLauncher::new([FakeScenario::Blocking]);
+            let manager = manager(
+                Arc::clone(&playback),
+                launcher,
+                &format!("qr-provider-{name}"),
+                Duration::from_secs(10),
+            );
+            let session = manager.start(provider).unwrap();
+
+            store_qr_code(
+                &manager.inner,
+                &session,
+                name.to_owned(),
+                valid_qr_image().to_owned(),
+            )
+            .unwrap();
+
+            let status = manager.status();
+            assert_eq!(status.provider, Some(provider));
+            assert!(status.qr_code.is_some(), "QR should be stored for {name}");
+
+            manager.cancel(session.session_id).unwrap();
+            assert!(manager.status().qr_code.is_none());
+            manager.shutdown().unwrap();
+        }
+    }
+
+    #[test]
     fn kugou_helper_payload_registers_device_before_completion() {
         let playback = FakePlayback::new();
-        let launcher = FakeLauncher::new([FakeScenario::Message(valid_kugou_success())]);
+        let launcher = FakeLauncher::new([FakeScenario::Message(valid_kugou_login_stream())]);
         let manager = manager(
             Arc::clone(&playback),
             launcher,
@@ -2014,8 +2273,30 @@ mod tests {
         manager.start(ProviderId::Kugou).unwrap();
         let status = wait_idle(&manager);
         assert!(!status.active);
+        assert!(status.qr_code.is_none());
         assert!(status.last_error.is_none());
         assert_eq!(playback.state.lock().unwrap().completed, 1);
+        manager.shutdown().unwrap();
+    }
+
+    #[test]
+    fn terminal_helper_error_clears_the_current_qr_code() {
+        let playback = FakePlayback::new();
+        let launcher = FakeLauncher::new([FakeScenario::Message(failed_kugou_login_stream())]);
+        let manager = manager(
+            Arc::clone(&playback),
+            launcher,
+            "kugou-qr-error",
+            Duration::from_secs(1),
+        );
+
+        manager.start(ProviderId::Kugou).unwrap();
+        let status = wait_idle(&manager);
+
+        assert!(status.qr_code.is_none());
+        assert_eq!(status.last_error.as_ref().unwrap().code, "login_timeout");
+        assert_eq!(playback.state.lock().unwrap().completed, 0);
+        assert_eq!(playback.state.lock().unwrap().cancelled, 1);
         manager.shutdown().unwrap();
     }
 

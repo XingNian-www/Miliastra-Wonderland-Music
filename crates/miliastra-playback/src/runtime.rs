@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
+use std::sync::{Arc, PoisonError, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -291,6 +291,19 @@ impl PlaybackRuntime {
         credential_directory: impl Into<PathBuf>,
         audio_cache_config: Option<crate::cache::AudioCacheConfig>,
     ) -> Result<Self, PlaybackError> {
+        Self::start_with_lyrics_lead(
+            credential_directory,
+            audio_cache_config,
+            Arc::new(RwLock::new(0.0)),
+        )
+    }
+
+    /// Starts the runtime with a lead time shared with the live configuration layer.
+    pub fn start_with_lyrics_lead(
+        credential_directory: impl Into<PathBuf>,
+        audio_cache_config: Option<crate::cache::AudioCacheConfig>,
+        lyrics_lead_seconds: Arc<RwLock<f64>>,
+    ) -> Result<Self, PlaybackError> {
         let credential_directory = credential_directory.into();
         let (commands, command_rx) = mpsc::channel(COMMAND_CAPACITY);
         let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
@@ -300,6 +313,7 @@ impl PlaybackRuntime {
                 run_runtime_thread(
                     credential_directory,
                     audio_cache_config,
+                    lyrics_lead_seconds,
                     command_rx,
                     ready_tx,
                 )
@@ -604,6 +618,7 @@ impl LoginOperation {
 fn run_runtime_thread(
     credential_directory: PathBuf,
     audio_cache_config: Option<crate::cache::AudioCacheConfig>,
+    lyrics_lead_seconds: Arc<RwLock<f64>>,
     command_rx: mpsc::Receiver<Command>,
     ready: std_mpsc::SyncSender<Result<(), PlaybackError>>,
 ) {
@@ -668,7 +683,7 @@ fn run_runtime_thread(
             return;
         }
         let audio_cache = core.audio_cache.clone();
-        let shutdown_reply = run_commands(command_rx, core, credentials).await;
+        let shutdown_reply = run_commands(command_rx, core, credentials, lyrics_lead_seconds).await;
         if let Some(cache) = audio_cache {
             cache.shutdown().await;
         }
@@ -730,6 +745,7 @@ async fn run_commands(
     mut commands: mpsc::Receiver<Command>,
     core: PlaybackCore,
     credentials: CredentialStore,
+    lyrics_lead_seconds: Arc<RwLock<f64>>,
 ) -> Option<Reply<()>> {
     let mut active_session: Option<SessionRef> = None;
     let mut active_track: Option<PlayableTrack> = None;
@@ -1040,8 +1056,15 @@ async fn run_commands(
             }
             Command::Snapshot(reply) => {
                 let engine_snapshot = core.snapshot();
-                let lyric_line_text =
-                    lyric_line_for_snapshot(&mut lyric_state, &engine_snapshot).await;
+                let lyrics_lead_seconds = *lyrics_lead_seconds
+                    .read()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let lyric_line_text = lyric_line_for_snapshot(
+                    &mut lyric_state,
+                    &engine_snapshot,
+                    lyrics_lead_seconds,
+                )
+                .await;
                 let snapshot =
                     public_snapshot(engine_snapshot, active_track.as_ref(), lyric_line_text);
                 let _ = reply.send(Ok(snapshot));
@@ -1393,6 +1416,7 @@ fn clear_lyric_state(state: &mut Option<LyricState>) {
 async fn lyric_line_for_snapshot(
     state: &mut Option<LyricState>,
     snapshot: &EngineSnapshot,
+    lead_seconds: f64,
 ) -> Option<String> {
     if state
         .as_ref()
@@ -1442,7 +1466,11 @@ async fn lyric_line_for_snapshot(
             ..
         } => lyrics
             .as_ref()?
-            .line_at_seconds_with_translation(position_seconds, *use_translation)
+            .line_at_seconds_with_lead_and_translation(
+                position_seconds,
+                lead_seconds,
+                *use_translation,
+            )
             .map(str::to_owned),
         LyricState::Loading { .. } => None,
     }
@@ -1925,7 +1953,11 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
             Ok(TimedLyrics::new(vec![TimedLyricLine {
-                start_ms: 1_000,
+                start_ms: if key.id == "future-track" {
+                    3_000
+                } else {
+                    1_000
+                },
                 text: key.id.clone(),
                 translation: Some(format!("translated-{}", key.id)),
             }]))
@@ -2340,6 +2372,20 @@ mod tests {
         engine: Arc<dyn AudioEngine>,
         credentials: CredentialStore,
     ) -> PlaybackRuntime {
+        test_runtime_with_catalog_and_lyrics_lead(
+            sources,
+            engine,
+            credentials,
+            Arc::new(RwLock::new(0.0)),
+        )
+    }
+
+    fn test_runtime_with_catalog_and_lyrics_lead(
+        sources: Vec<(String, Arc<dyn SourceAdapter>)>,
+        engine: Arc<dyn AudioEngine>,
+        credentials: CredentialStore,
+        lyrics_lead_seconds: Arc<RwLock<f64>>,
+    ) -> PlaybackRuntime {
         let core = PlaybackCore::new_with_registry(
             SourceCatalog::new(sources),
             ProviderRegistry,
@@ -2355,7 +2401,9 @@ mod tests {
                     .build()
                     .unwrap()
                     .block_on(async move {
-                        if let Some(reply) = run_commands(command_rx, core, credentials).await {
+                        if let Some(reply) =
+                            run_commands(command_rx, core, credentials, lyrics_lead_seconds).await
+                        {
                             let _ = reply.send(Ok(()));
                         }
                     });
@@ -3202,6 +3250,44 @@ mod tests {
             handle.set_lyrics_translation(true),
             Err(PlaybackError::NoActiveSession)
         ));
+
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn updated_lyrics_lead_is_used_without_restarting_the_runtime() {
+        let lyrics_lead_seconds = Arc::new(RwLock::new(1.5));
+        let runtime = test_runtime_with_catalog_and_lyrics_lead(
+            vec![(ProviderId::QqMusic.to_string(), Arc::new(FakeSource))],
+            Arc::new(FakeEngine::new()),
+            CredentialStore::memory(),
+            lyrics_lead_seconds.clone(),
+        );
+        let handle = runtime.handle();
+
+        handle
+            .play(playable_track("future-track"))
+            .unwrap()
+            .wait()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let mut line = None;
+        while std::time::Instant::now() < deadline {
+            line = handle.snapshot().unwrap().lyric_line_text;
+            if line.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(line.as_deref(), Some("translated-future-track"));
+
+        *lyrics_lead_seconds.write().unwrap() = 0.0;
+        assert_eq!(handle.snapshot().unwrap().lyric_line_text, None);
+        *lyrics_lead_seconds.write().unwrap() = 1.5;
+        assert_eq!(
+            handle.snapshot().unwrap().lyric_line_text.as_deref(),
+            Some("translated-future-track")
+        );
 
         runtime.shutdown().unwrap();
     }

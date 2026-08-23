@@ -13,8 +13,8 @@ use crate::features::startup::{StartupSource, StartupTaskKind};
 use crate::features::turtle_soup::{TurtleSoupAppendReceipt, TurtleSoupSnapshot};
 use crate::features::undercover::UndercoverSnapshot;
 use crate::interfaces::http::{
-    HttpAiPort, HttpHallPort, HttpLoginPort, HttpLoginStatus, HttpPlayerPort, HttpProviderView,
-    HttpQueryPort, HttpTaskPort,
+    HttpAiPort, HttpHallPort, HttpLoginPort, HttpLoginQrCodeView, HttpLoginStatus, HttpPlayerPort,
+    HttpProviderView, HttpQueryPort, HttpTaskPort,
 };
 use crate::runtime::chat_listener::ChatListenerState;
 use crate::runtime::player_io::SearchCandidate;
@@ -798,10 +798,15 @@ impl HttpLoginPort for HttpTestLoginPort {
 
     fn status(&self) -> HttpLoginStatus {
         let active = self.active.lock().unwrap().clone();
+        let qr_code = active.as_ref().map(|_| HttpLoginQrCodeView {
+            image_data_url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==".to_owned(),
+            received_at_ms: 1_700_000_000_000,
+        });
         HttpLoginStatus {
             active: active.is_some(),
             session_id: active.as_ref().map(|session| session.session_id),
             provider: active.map(|session| session.provider),
+            qr_code,
             last_error: None,
         }
     }
@@ -1394,6 +1399,87 @@ fn native_player_and_login_routes_use_structured_json_without_secrets() {
     let upgrade: Value = serde_json::from_str(&upgrade.body).expect("Kugou upgrade JSON");
     assert_eq!(upgrade["accepted"], true);
     assert_eq!(upgrade["vipDays"], 7);
+
+    server.shutdown().expect("shutdown HTTP server");
+}
+
+#[test]
+fn login_status_transports_qr_without_caching_or_recording_it() {
+    let mut state = test_state();
+    let server = start_test_http_server(&mut state, "");
+    let address = server.local_addr();
+    let session = http_post_json(
+        address,
+        "/player/login/start",
+        r#"{"provider":"kugou"}"#,
+        None,
+    );
+    let session: Value = serde_json::from_str(&session.body).expect("login session JSON");
+
+    let status = http_get(address, "/player/login/status", None);
+
+    assert_eq!(status.status_line, "HTTP/1.1 200 OK");
+    assert_eq!(
+        status.headers.get("cache-control").map(String::as_str),
+        Some("no-store")
+    );
+    let body: Value = serde_json::from_str(&status.body).expect("login status JSON");
+    assert_eq!(body["provider"], "kugou");
+    assert!(
+        body["qrCode"]["imageDataUrl"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("data:image/png;base64,"))
+    );
+    assert!(
+        state.history.lock().unwrap().iter().all(|item| {
+            item.command != "/player/login/status" && !item.result.contains("iVBOR")
+        })
+    );
+
+    let cancel = http_post_json(
+        address,
+        "/player/login/cancel",
+        &json!({"sessionId": session["sessionId"]}).to_string(),
+        None,
+    );
+    assert_eq!(cancel.status_line, "HTTP/1.1 200 OK");
+    server.shutdown().expect("shutdown HTTP server");
+}
+
+#[test]
+fn login_status_transports_qr_for_every_provider() {
+    let mut state = test_state();
+    let server = start_test_http_server(&mut state, "");
+    let address = server.local_addr();
+
+    for provider in ["qqmusic", "netease", "bilibili", "kugou"] {
+        let session = http_post_json(
+            address,
+            "/player/login/start",
+            &json!({"provider": provider}).to_string(),
+            None,
+        );
+        assert_eq!(session.status_line, "HTTP/1.1 200 OK", "{provider} start");
+        let session: Value = serde_json::from_str(&session.body).expect("login session JSON");
+
+        let status = http_get(address, "/player/login/status", None);
+        assert_eq!(status.status_line, "HTTP/1.1 200 OK", "{provider} status");
+        let status: Value = serde_json::from_str(&status.body).expect("login status JSON");
+        assert_eq!(status["provider"], provider);
+        assert!(
+            status["qrCode"]["imageDataUrl"]
+                .as_str()
+                .is_some_and(|value| value.starts_with("data:image/png;base64,"))
+        );
+
+        let cancel = http_post_json(
+            address,
+            "/player/login/cancel",
+            &json!({"sessionId": session["sessionId"]}).to_string(),
+            None,
+        );
+        assert_eq!(cancel.status_line, "HTTP/1.1 200 OK", "{provider} cancel");
+    }
 
     server.shutdown().expect("shutdown HTTP server");
 }
@@ -2314,6 +2400,16 @@ fn refresh_toggle_runs_full_uncached_refresh_when_resumed() {
     assert!(!PAGE.contains("setInterval(()=>{if(!refreshPaused)loadLoginState()},2000)"));
     assert!(PAGE.contains("cache:'no-store'"));
     assert!(!PAGE.contains("onclick=\"loadMonitor()\""));
+}
+
+#[test]
+fn login_page_renders_validated_kugou_qr_images() {
+    assert!(PAGE.contains("function loginQrDataUrl(value)"));
+    assert!(PAGE.contains("id=\"loginQrImage\""));
+    assert!(PAGE.contains("qrElement.src=qrImage"));
+    assert!(PAGE.contains("使用'+esc(qrLabel)+' App 扫码登录"));
+    assert!(PAGE.contains("data:image\\/(?:png|jpeg);base64"));
+    assert!(PAGE.contains("statusRequestId<loginStatusRequestApplied"));
 }
 
 #[test]
@@ -3789,6 +3885,7 @@ fn config_endpoints_require_access_token() {
         "/config/validate",
         "/config/save",
         "/config/rollback",
+        "/player/login/status",
     ] {
         let response = http_get(address, target, None);
         assert_eq!(

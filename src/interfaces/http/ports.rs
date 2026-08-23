@@ -204,6 +204,22 @@ pub(crate) struct HttpLoginErrorView {
     pub provider: Option<ProviderId>,
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct HttpLoginQrCodeView {
+    pub image_data_url: String,
+    pub received_at_ms: u64,
+}
+
+impl std::fmt::Debug for HttpLoginQrCodeView {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HttpLoginQrCodeView")
+            .field("received_at_ms", &self.received_at_ms)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct HttpLoginStatus {
@@ -212,6 +228,8 @@ pub(crate) struct HttpLoginStatus {
     pub session_id: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<ProviderId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qr_code: Option<HttpLoginQrCodeView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<HttpLoginErrorView>,
 }

@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use miliastra_playback::PlayableTrack;
+use miliastra_playback::{MAX_LYRICS_LEAD_SECONDS, PlayableTrack};
 #[cfg(test)]
 use miliastra_playback::{
     PlaybackEligibility, ProviderId, SearchCandidate, TrackKey, TrackMetadata, TrackRef,
@@ -84,6 +84,9 @@ pub struct PlaybackTimingConfig {
     pub status_poll_ms: u64,
     pub monitor_tick_ms: u64,
     pub monitor_status_ms: u64,
+    /// Amount added to the current playback position when selecting a lyric line.
+    #[serde(default = "default_lyrics_lead_seconds")]
+    pub lyrics_lead_seconds: f64,
     pub uri_stable_samples: u32,
     pub transport_stable_samples: u32,
     #[serde(deserialize_with = "deserialize_positive_u64")]
@@ -96,6 +99,7 @@ impl Default for PlaybackTimingConfig {
             status_poll_ms: 1000,
             monitor_tick_ms: 200,
             monitor_status_ms: 1000,
+            lyrics_lead_seconds: default_lyrics_lead_seconds(),
             uri_stable_samples: 0,
             transport_stable_samples: 0,
             stale_timeout_ms: 5000,
@@ -115,8 +119,20 @@ impl PlaybackTimingConfig {
                 bail!("{} 必须大于 0", field);
             }
         }
+        if !self.lyrics_lead_seconds.is_finite()
+            || !(0.0..=MAX_LYRICS_LEAD_SECONDS).contains(&self.lyrics_lead_seconds)
+        {
+            bail!(
+                "timing.playback.lyrics_lead_seconds 必须是 0 到 {} 之间的有限数字",
+                MAX_LYRICS_LEAD_SECONDS
+            );
+        }
         Ok(())
     }
+}
+
+fn default_lyrics_lead_seconds() -> f64 {
+    0.0
 }
 
 fn deserialize_positive_u64<'de, D>(deserializer: D) -> std::result::Result<u64, D::Error>

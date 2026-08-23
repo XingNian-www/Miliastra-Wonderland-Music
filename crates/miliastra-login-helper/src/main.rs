@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use miliastra_login_protocol::{CredentialPayload, LoginHelperMessage, encode_message};
 
+mod native_qr;
 mod webview2;
 
 #[derive(Debug, Parser)]
@@ -21,23 +22,40 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let message = run(&args).unwrap_or_else(|error| {
+    let mut stdout = std::io::stdout().lock();
+    let message = run(&args, &mut |image_data_url| {
+        write_message(
+            &mut stdout,
+            &LoginHelperMessage::qr_code(args.provider.clone(), image_data_url),
+        )
+    })
+    .unwrap_or_else(|error| {
         LoginHelperMessage::error(
             args.provider.clone(),
             helper_error_code(&error),
             helper_error_message(&error),
         )
     });
-    let encoded = encode_message(&message).context("encode login helper result")?;
-    let mut stdout = std::io::stdout().lock();
-    stdout
-        .write_all(&encoded)
-        .context("write login helper result")?;
-    stdout.flush().context("flush login helper result")?;
+    write_message(&mut stdout, &message).context("write final login helper result")?;
     Ok(())
 }
 
-fn run(args: &Args) -> Result<LoginHelperMessage> {
+fn write_message(writer: &mut dyn Write, message: &LoginHelperMessage) -> Result<()> {
+    let encoded = encode_message(message).context("encode login helper result")?;
+    writer
+        .write_all(&encoded)
+        .context("write login helper result")?;
+    writer
+        .write_all(b"\n")
+        .context("frame login helper result")?;
+    writer.flush().context("flush login helper result")?;
+    Ok(())
+}
+
+fn run(
+    args: &Args,
+    publish_qr_code: &mut dyn FnMut(&str) -> Result<()>,
+) -> Result<LoginHelperMessage> {
     let provider =
         Provider::parse(&args.provider).ok_or_else(|| anyhow::anyhow!("unsupported provider"))?;
     let profile = args
@@ -48,6 +66,10 @@ fn run(args: &Args) -> Result<LoginHelperMessage> {
         provider.id(),
         &profile,
         Duration::from_secs(args.timeout_seconds.max(1)),
+        &mut |image_data_url| {
+            publish_qr_code(image_data_url)
+                .map_err(|_| webview2::CaptureError::Io("publish QR code failed".to_owned()))
+        },
     )
     .context("credential capture failed")?;
     if cookies.is_empty() {
@@ -161,7 +183,7 @@ mod tests {
 
     use miliastra_login_protocol::CredentialPayload;
 
-    use super::{Provider, helper_error_code};
+    use super::{Provider, helper_error_code, write_message};
 
     #[test]
     fn provider_identifiers_are_closed_and_canonical() {
@@ -219,5 +241,22 @@ mod tests {
             helper_error_code(&anyhow::anyhow!("cookie=secret")),
             "credential_capture_failed"
         );
+    }
+
+    #[test]
+    fn helper_messages_are_flushed_as_newline_delimited_frames() {
+        let mut output = Vec::new();
+        write_message(
+            &mut output,
+            &miliastra_login_protocol::LoginHelperMessage::error(
+                "kugou",
+                "login_timeout",
+                "timeout",
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(output.last(), Some(&b'\n'));
+        miliastra_login_protocol::decode_message(&output[..output.len() - 1]).unwrap();
     }
 }

@@ -27,8 +27,8 @@ use crate::features::undercover::UndercoverCommand;
 use crate::interfaces::chat::ConsoleCommandIntent;
 use crate::interfaces::http::{
     HttpAiPort, HttpCommandError, HttpCommandPort, HttpLoginError, HttpLoginErrorView,
-    HttpLoginPort, HttpLoginStatus, HttpPlayerPort, HttpPlayerSearchError, HttpProviderView,
-    HttpTaskPort, PlayTrackRequest,
+    HttpLoginPort, HttpLoginQrCodeView, HttpLoginStatus, HttpPlayerPort, HttpPlayerSearchError,
+    HttpProviderView, HttpTaskPort, PlayTrackRequest,
 };
 use crate::runtime::business::{BusinessMutationIntent, BusinessMutationOutcome};
 use crate::runtime::chat_listener::ChatListenerMode;
@@ -730,6 +730,10 @@ fn login_status(status: LoginManagerStatus) -> HttpLoginStatus {
         active: status.active,
         session_id: status.session_id,
         provider: status.provider,
+        qr_code: status.qr_code.map(|qr_code| HttpLoginQrCodeView {
+            image_data_url: qr_code.image_data_url,
+            received_at_ms: qr_code.received_at_ms,
+        }),
         last_error: status.last_error.map(|error| HttpLoginErrorView {
             code: error.code,
             message: error.message,

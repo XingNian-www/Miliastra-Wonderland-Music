@@ -1,9 +1,11 @@
 use std::collections::BTreeMap;
 
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 
-pub const LOGIN_PROTOCOL_VERSION: u32 = 3;
-pub const MAX_LOGIN_MESSAGE_BYTES: usize = 64 * 1024;
+pub const LOGIN_PROTOCOL_VERSION: u32 = 4;
+pub const MAX_LOGIN_MESSAGE_BYTES: usize = 512 * 1024;
+pub const MAX_QR_IMAGE_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(
@@ -50,9 +52,15 @@ impl std::fmt::Debug for CredentialPayload {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "status", deny_unknown_fields)]
 pub enum LoginHelperMessage {
+    #[serde(rename = "qrCode")]
+    QrCode {
+        version: u32,
+        provider: String,
+        image_data_url: String,
+    },
     #[serde(rename = "success")]
     Success {
         version: u32,
@@ -69,6 +77,14 @@ pub enum LoginHelperMessage {
 }
 
 impl LoginHelperMessage {
+    pub fn qr_code(provider: impl Into<String>, image_data_url: impl Into<String>) -> Self {
+        Self::QrCode {
+            version: LOGIN_PROTOCOL_VERSION,
+            provider: provider.into(),
+            image_data_url: image_data_url.into(),
+        }
+    }
+
     pub fn success(provider: impl Into<String>, credential: CredentialPayload) -> Self {
         Self::Success {
             version: LOGIN_PROTOCOL_VERSION,
@@ -92,12 +108,55 @@ impl LoginHelperMessage {
 
     pub const fn version(&self) -> u32 {
         match self {
-            Self::Success { version, .. } | Self::Error { version, .. } => *version,
+            Self::QrCode { version, .. }
+            | Self::Success { version, .. }
+            | Self::Error { version, .. } => *version,
+        }
+    }
+
+    pub const fn is_terminal(&self) -> bool {
+        !matches!(self, Self::QrCode { .. })
+    }
+}
+
+impl std::fmt::Debug for LoginHelperMessage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::QrCode {
+                version, provider, ..
+            } => formatter
+                .debug_struct("QrCode")
+                .field("version", version)
+                .field("provider", provider)
+                .finish_non_exhaustive(),
+            Self::Success {
+                version,
+                provider,
+                credential,
+            } => formatter
+                .debug_struct("Success")
+                .field("version", version)
+                .field("provider", provider)
+                .field("credential", credential)
+                .finish(),
+            Self::Error {
+                version,
+                provider,
+                code,
+                message,
+            } => formatter
+                .debug_struct("Error")
+                .field("version", version)
+                .field("provider", provider)
+                .field("code", code)
+                .field("message", message)
+                .finish(),
         }
     }
 }
 
 pub fn encode_message(message: &LoginHelperMessage) -> Result<Vec<u8>, ProtocolError> {
+    validate_message(message)?;
     let encoded = serde_json::to_vec(message).map_err(ProtocolError::Json)?;
     if encoded.len() > MAX_LOGIN_MESSAGE_BYTES {
         return Err(ProtocolError::TooLarge(encoded.len()));
@@ -117,7 +176,51 @@ pub fn decode_message(bytes: &[u8]) -> Result<LoginHelperMessage, ProtocolError>
     if message.version() != LOGIN_PROTOCOL_VERSION {
         return Err(ProtocolError::UnsupportedVersion(message.version()));
     }
+    validate_message(&message)?;
     Ok(message)
+}
+
+fn validate_message(message: &LoginHelperMessage) -> Result<(), ProtocolError> {
+    let LoginHelperMessage::QrCode { image_data_url, .. } = message else {
+        return Ok(());
+    };
+    validate_qr_data_url(image_data_url)
+}
+
+pub fn validate_qr_image_data_url(value: &str) -> Result<(), ProtocolError> {
+    validate_qr_data_url(value)
+}
+
+fn validate_qr_data_url(value: &str) -> Result<(), ProtocolError> {
+    let (mime_type, encoded) = value
+        .strip_prefix("data:")
+        .and_then(|value| value.split_once(";base64,"))
+        .ok_or(ProtocolError::InvalidQrCode)?;
+    if !matches!(mime_type, "image/png" | "image/jpeg") || encoded.is_empty() {
+        return Err(ProtocolError::InvalidQrCode);
+    }
+    // Reject an oversized Base64 payload before decoding it. This keeps an
+    // invalid helper/API response from forcing an unbounded temporary
+    // allocation even though the decoded image has a strict size limit.
+    let max_encoded_len = MAX_QR_IMAGE_BYTES.div_ceil(3) * 4;
+    if encoded.len() > max_encoded_len {
+        return Err(ProtocolError::InvalidQrCode);
+    }
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| ProtocolError::InvalidQrCode)?;
+    if decoded.is_empty() || decoded.len() > MAX_QR_IMAGE_BYTES {
+        return Err(ProtocolError::InvalidQrCode);
+    }
+    let signature_matches = match mime_type {
+        "image/png" => decoded.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "image/jpeg" => decoded.starts_with(&[0xff, 0xd8, 0xff]),
+        _ => false,
+    };
+    if !signature_matches {
+        return Err(ProtocolError::InvalidQrCode);
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -125,6 +228,7 @@ pub enum ProtocolError {
     TooLarge(usize),
     NotSingleMessage,
     UnsupportedVersion(u32),
+    InvalidQrCode,
     Json(serde_json::Error),
 }
 
@@ -139,6 +243,7 @@ impl std::fmt::Display for ProtocolError {
                     "unsupported login helper protocol version: {version}"
                 )
             }
+            Self::InvalidQrCode => formatter.write_str("invalid login helper QR code image"),
             Self::Json(error) => write!(formatter, "invalid login helper message: {error}"),
         }
     }
@@ -149,6 +254,8 @@ impl std::error::Error for ProtocolError {}
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+
+    use base64::Engine;
 
     use super::{
         CredentialPayload, LOGIN_PROTOCOL_VERSION, LoginHelperMessage, MAX_LOGIN_MESSAGE_BYTES,
@@ -213,6 +320,62 @@ mod tests {
         assert!(matches!(
             decode_message(&vec![b'x'; MAX_LOGIN_MESSAGE_BYTES + 1]),
             Err(ProtocolError::TooLarge(_))
+        ));
+    }
+
+    #[test]
+    fn qr_code_round_trips_without_exposing_image_in_debug_output() {
+        let image = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==";
+        let message = LoginHelperMessage::qr_code("kugou", image);
+        let encoded = encode_message(&message).unwrap();
+        let decoded = decode_message(&encoded).unwrap();
+
+        assert!(!decoded.is_terminal());
+        assert!(!format!("{decoded:?}").contains("iVBOR"));
+        assert!(matches!(
+            decoded,
+            LoginHelperMessage::QrCode {
+                provider,
+                image_data_url,
+                ..
+            } if provider == "kugou" && image_data_url == image
+        ));
+    }
+
+    #[test]
+    fn qr_code_rejects_invalid_mime_base64_signature_and_size() {
+        for image in [
+            "data:image/svg+xml;base64,PHN2Zz4=",
+            "data:image/png;base64,not-base64!",
+            "data:image/png;base64,/9j/",
+        ] {
+            assert!(matches!(
+                encode_message(&LoginHelperMessage::qr_code("kugou", image)),
+                Err(ProtocolError::InvalidQrCode)
+            ));
+        }
+
+        let oversized =
+            base64::engine::general_purpose::STANDARD
+                .encode(vec![0_u8; super::MAX_QR_IMAGE_BYTES + 1]);
+        assert!(matches!(
+            encode_message(&LoginHelperMessage::qr_code(
+                "kugou",
+                format!("data:image/png;base64,{oversized}")
+            )),
+            Err(ProtocolError::InvalidQrCode)
+        ));
+    }
+
+    #[test]
+    fn qr_code_rejects_oversized_base64_before_decoding() {
+        let oversized = "A".repeat(super::MAX_QR_IMAGE_BYTES.div_ceil(3) * 4 + 1);
+        assert!(matches!(
+            encode_message(&LoginHelperMessage::qr_code(
+                "kugou",
+                format!("data:image/png;base64,{oversized}")
+            )),
+            Err(ProtocolError::InvalidQrCode)
         ));
     }
 }

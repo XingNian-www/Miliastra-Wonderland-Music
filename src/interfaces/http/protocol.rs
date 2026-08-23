@@ -1015,11 +1015,16 @@ fn handle_request(
     } else {
         "text/plain; charset=utf-8"
     };
+    let mut response_headers =
+        cors_headers(&request, &state.config.http.host, state.config.http.port);
+    if request.path == "/player/login/status" {
+        response_headers.push(("Cache-Control".to_owned(), "no-store".to_owned()));
+    }
     Ok(body_response(
         StatusCode::OK,
         content_type,
         body,
-        cors_headers(&request, &state.config.http.host, state.config.http.port),
+        response_headers,
     ))
 }
 
@@ -1066,6 +1071,7 @@ fn push_history(request: &Request, result: &str, ok: bool, state: &HttpSharedSta
                 | "/status"
                 | "/playback/insights"
                 | "/playback/cache/tracks"
+                | "/player/login/status"
                 | "/screenshot"
                 | "/hall-screenshot"
                 | "/favicon.ico"

@@ -469,6 +469,12 @@ fn timing_section() -> Vec<ConfigFieldSchema> {
             int(1, MAX_TIMEOUT_MS),
             "播放结束监控向原生播放运行时校准状态的间隔，单位毫秒；保存后立即生效",
         ),
+        ConfigFieldSchema::db_live(
+            "playback.lyrics_lead_seconds",
+            "歌词提前秒数",
+            float(0.0, miliastra_playback::MAX_LYRICS_LEAD_SECONDS),
+            "按当前播放进度向前查询歌词的秒数，支持小数，范围 0 到 60；保存后立即生效",
+        ),
         ConfigFieldSchema::db_idle_reload(
             "playback.uri_stable_samples",
             "URI 稳定确认次数",
@@ -2351,6 +2357,24 @@ mod tests {
     }
 
     #[test]
+    fn lyrics_lead_schema_exposes_the_valid_range_and_live_effect() {
+        let field = config_sections()
+            .into_iter()
+            .flat_map(|section| section.fields)
+            .find(|field| field.path == "timing.playback.lyrics_lead_seconds")
+            .expect("lyrics lead schema field");
+
+        assert_eq!(
+            field.kind,
+            FieldKind::Float {
+                min: 0.0,
+                max: miliastra_playback::MAX_LYRICS_LEAD_SECONDS,
+            }
+        );
+        assert_eq!(field.effect, Effect::Live);
+    }
+
+    #[test]
     fn changed_leaf_paths_inherit_the_deepest_container_effect() {
         assert_eq!(
             config_effect_for_path("window.focus_point.x"),
@@ -2472,7 +2496,7 @@ mod tests {
             }
         }
         assert_eq!(
-            total_fields, 264,
+            total_fields, 265,
             "schema 总字段数应与预期一致（声明数 = 实际数）"
         );
     }

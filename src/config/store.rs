@@ -385,6 +385,7 @@ impl ConfigStore {
     /// （config.yaml）原始值注入；state.playback_state_path 注入统一数据库路径。
     pub fn current_value(&self) -> Result<Value> {
         let mut value = Value::Object(self.read_all_sections()?);
+        fill_missing_defaults(&mut value, &AppConfig::default().to_db_value());
         if let Some(object) = value.as_object_mut() {
             object.insert(
                 "http".to_string(),
@@ -698,6 +699,22 @@ fn prune_unknown_schema_fields(sections: &mut Map<String, Value>) {
         };
         if let Some(object) = value.as_object_mut() {
             object.retain(|key, _| known.contains(key));
+        }
+    }
+}
+
+/// Existing databases can omit fields introduced with a serde default. Expose those fields to
+/// configuration clients without changing explicit values (including null) or resolving paths.
+fn fill_missing_defaults(current: &mut Value, defaults: &Value) {
+    let (Some(current), Some(defaults)) = (current.as_object_mut(), defaults.as_object()) else {
+        return;
+    };
+    for (key, default) in defaults {
+        match current.get_mut(key) {
+            Some(value) => fill_missing_defaults(value, default),
+            None => {
+                current.insert(key.clone(), default.clone());
+            }
         }
     }
 }
@@ -1552,6 +1569,45 @@ mod tests {
                 && stored.get("kugou_api_base_url").is_none(),
             "保存后库中旧字段必须被清理: {stored}"
         );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn legacy_timing_without_lyrics_lead_uses_and_exposes_the_default() {
+        let (root, database_path) = temp_database("legacy-lyrics-lead");
+        let bootstrap = test_bootstrap(&database_path);
+        let store = ConfigStore::open(&database_path, &root, bootstrap.clone()).unwrap();
+        drop(store);
+
+        let mut timing = stored_section(&database_path, "timing");
+        timing["playback"]
+            .as_object_mut()
+            .expect("playback timing object")
+            .remove("lyrics_lead_seconds");
+        let connection = rusqlite::Connection::open(&database_path).unwrap();
+        connection
+            .execute(
+                "UPDATE config_sections SET value_json = ?1 WHERE section = 'timing'",
+                rusqlite::params![serde_json::to_string(&timing).unwrap()],
+            )
+            .unwrap();
+        drop(connection);
+
+        let reopened = ConfigStore::open(&database_path, &root, bootstrap).unwrap();
+        assert_eq!(
+            reopened
+                .load_full()
+                .unwrap()
+                .timing
+                .playback
+                .lyrics_lead_seconds,
+            0.0
+        );
+        assert_eq!(
+            reopened.current_value().unwrap()["timing"]["playback"]["lyrics_lead_seconds"].as_f64(),
+            Some(0.0)
+        );
+        drop(reopened);
         cleanup(&root);
     }
 

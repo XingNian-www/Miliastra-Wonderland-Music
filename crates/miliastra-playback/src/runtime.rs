@@ -304,6 +304,23 @@ impl PlaybackRuntime {
         audio_cache_config: Option<crate::cache::AudioCacheConfig>,
         lyrics_lead_seconds: Arc<RwLock<f64>>,
     ) -> Result<Self, PlaybackError> {
+        Self::start_with_lyrics_lead_and_helper(
+            credential_directory,
+            audio_cache_config,
+            lyrics_lead_seconds,
+            None,
+        )
+    }
+
+    /// Starts the runtime and optionally routes KuGou Web requests through the
+    /// WebView2 login helper.  The existing start methods remain unchanged for
+    /// embedders and tests that do not provide a helper executable.
+    pub fn start_with_lyrics_lead_and_helper(
+        credential_directory: impl Into<PathBuf>,
+        audio_cache_config: Option<crate::cache::AudioCacheConfig>,
+        lyrics_lead_seconds: Arc<RwLock<f64>>,
+        login_helper_executable: Option<PathBuf>,
+    ) -> Result<Self, PlaybackError> {
         let credential_directory = credential_directory.into();
         let (commands, command_rx) = mpsc::channel(COMMAND_CAPACITY);
         let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
@@ -314,6 +331,7 @@ impl PlaybackRuntime {
                     credential_directory,
                     audio_cache_config,
                     lyrics_lead_seconds,
+                    login_helper_executable,
                     command_rx,
                     ready_tx,
                 )
@@ -619,6 +637,7 @@ fn run_runtime_thread(
     credential_directory: PathBuf,
     audio_cache_config: Option<crate::cache::AudioCacheConfig>,
     lyrics_lead_seconds: Arc<RwLock<f64>>,
+    login_helper_executable: Option<PathBuf>,
     command_rx: mpsc::Receiver<Command>,
     ready: std_mpsc::SyncSender<Result<(), PlaybackError>>,
 ) {
@@ -641,7 +660,7 @@ fn run_runtime_thread(
                 return;
             }
         };
-        let catalog = match build_catalog(&credentials) {
+        let catalog = match build_catalog(&credentials, login_helper_executable) {
             Ok(catalog) => catalog,
             Err(error) => {
                 let _ = ready.send(Err(error));
@@ -697,7 +716,10 @@ fn run_runtime_thread(
     });
 }
 
-fn build_catalog(credentials: &CredentialStore) -> Result<SourceCatalog, PlaybackError> {
+fn build_catalog(
+    credentials: &CredentialStore,
+    login_helper_executable: Option<PathBuf>,
+) -> Result<SourceCatalog, PlaybackError> {
     let qqmusic = Arc::new(
         QqMusicAdapter::new(credentials.clone(), SOURCE_TIMEOUT)
             .map_err(|error| PlaybackError::Startup(error.to_string()))?,
@@ -709,8 +731,12 @@ fn build_catalog(credentials: &CredentialStore) -> Result<SourceCatalog, Playbac
             .map_err(|error| PlaybackError::Startup(error.to_string()))?,
     );
     let kugou = Arc::new(
-        KugouAdapter::new(credentials.clone(), SOURCE_TIMEOUT)
-            .map_err(|error| PlaybackError::Startup(error.to_string()))?,
+        KugouAdapter::new_with_login_helper(
+            credentials.clone(),
+            SOURCE_TIMEOUT,
+            login_helper_executable,
+        )
+        .map_err(|error| PlaybackError::Startup(error.to_string()))?,
     );
     Ok(SourceCatalog::new([
         (

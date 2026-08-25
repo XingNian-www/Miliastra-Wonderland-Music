@@ -14,10 +14,11 @@ pub use cache::{
     CachedTrackPage, DEFAULT_MAX_REGISTRY_ENTRIES,
 };
 pub use catalog::{
-    KugouAccountStatus, KugouListenReport, PlaybackEligibility, ProviderAccountStatus, ProviderId,
-    kugou_calculate_mid, kugou_normalize_guid, kugou_register_device,
+    KugouAccountStatus, KugouAdapter, KugouListenReport, PlaybackEligibility,
+    ProviderAccountStatus, ProviderId, SourceAdapter, kugou_calculate_mid, kugou_normalize_guid,
+    kugou_register_device,
 };
-pub use credentials::{CredentialError, CredentialStatus, ProviderCredential};
+pub use credentials::{CredentialError, CredentialStatus, CredentialStore, ProviderCredential};
 pub use domain::{
     EndBehavior, EndCause, EngineState, Failure, ResolverLocator, ResolverLocatorError, SongKey,
     StreamSource,

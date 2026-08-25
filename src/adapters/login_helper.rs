@@ -1408,7 +1408,14 @@ fn credential_from_payload_with_device_registration(
                     Some(ProviderId::Kugou),
                 ));
             }
-            let dfid = inner
+            let web_dfid = cookies
+                .get("dfid")
+                .filter(|value| {
+                    let value = value.trim();
+                    !value.is_empty() && !value.eq_ignore_ascii_case("undefined") && value != "-"
+                })
+                .cloned();
+            let lite_dfid = inner
                 .kugou_device_registrar
                 .register(&token, &userid, &cookies)?;
             if cancel.load(Ordering::Acquire) {
@@ -1418,13 +1425,18 @@ fn credential_from_payload_with_device_registration(
                     Some(ProviderId::Kugou),
                 ));
             }
-            // dfid 已作为独立凭据字段保存；移除 cookie 副本以通过
-            // 凭据 cookie 白名单校验。
-            cookies.remove("dfid");
+            // Web 登录返回的 dfid 绑定 KuGoo 会话，必须原样保留。设备
+            // 注册返回的 dfid 只供 Lite/Android 请求使用，单独保存，不能
+            // 覆盖 Web 会话标识。
+            cookies.insert("KUGOU_API_DFID".to_owned(), lite_dfid);
             Ok(ProviderCredential::Kugou {
                 token,
                 userid,
-                dfid,
+                // Keep the browser session's dfid paired with KuGoo. A
+                // missing browser dfid is only possible with an old helper;
+                // use the registered value as a compatibility fallback.
+                dfid: web_dfid
+                    .unwrap_or_else(|| cookies.get("KUGOU_API_DFID").cloned().unwrap_or_default()),
                 cookies,
             })
         }
@@ -1852,8 +1864,16 @@ mod tests {
             session_id: Uuid,
             credential: ProviderCredential,
         ) -> Result<Box<dyn PendingLoginCompletion>, PlaybackError> {
-            if let ProviderCredential::Kugou { dfid, .. } = &credential {
-                assert_eq!(dfid, "test-dfid");
+            if let ProviderCredential::Kugou { dfid, cookies, .. } = &credential {
+                assert_eq!(dfid, "web-dfid");
+                assert_eq!(
+                    cookies.get("KuGoo").map(String::as_str),
+                    Some("t=test-token&KugooID=123&ct=1700000000")
+                );
+                assert_eq!(
+                    cookies.get("KUGOU_API_DFID").map(String::as_str),
+                    Some("test-dfid")
+                );
             }
             let state = Arc::clone(&self.state);
             let changed = Arc::clone(&self.changed);
@@ -1997,8 +2017,10 @@ mod tests {
             &self,
             _token: &str,
             _userid: &str,
-            _cookies: &BTreeMap<String, String>,
+            cookies: &BTreeMap<String, String>,
         ) -> Result<String, LoginHelperFailure> {
+            assert_eq!(cookies.get("dfid").map(String::as_str), Some("web-dfid"));
+            assert!(cookies.contains_key("KuGoo"));
             Ok("test-dfid".to_owned())
         }
     }
@@ -2127,9 +2149,15 @@ mod tests {
         encode_message(&LoginHelperMessage::success(
             "kugou",
             CredentialPayload::Kugou {
-                token: "token".to_owned(),
+                token: "test-token".to_owned(),
                 userid: "123".to_owned(),
-                cookies: BTreeMap::new(),
+                cookies: BTreeMap::from([
+                    (
+                        "KuGoo".to_owned(),
+                        "t=test-token&KugooID=123&ct=1700000000".to_owned(),
+                    ),
+                    ("dfid".to_owned(), "web-dfid".to_owned()),
+                ]),
             },
         ))
         .unwrap()

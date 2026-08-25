@@ -1,6 +1,9 @@
 //! 酷狗音乐公开接口适配器（纯 Rust 内置直连官方接口）。
 
 use std::collections::BTreeMap;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,9 +24,8 @@ use crate::domain::{ResolverLocator, SearchSpec, Song, SongKey, StreamSource};
 use crate::lyrics::{TimedLyrics, parse_lrc_pair};
 
 use super::kugou_crypto::{
-    KUGOU_LITE_RSA_PUBLIC_KEY, KugouLiteTokenRefreshInput, aes_cbc_decrypt_hex,
-    build_lite_token_refresh_body_text, decode_krc_base64, playlist_aes_decrypt_base64,
-    playlist_aes_encrypt_base64, rsa_pkcs1_encrypt_hex, rsa_raw_encrypt_json_hex,
+    KUGOU_LITE_RSA_PUBLIC_KEY, decode_krc_base64, playlist_aes_decrypt_base64,
+    playlist_aes_encrypt_base64, rsa_pkcs1_encrypt_hex,
 };
 
 const PROVIDER: &str = "kugou";
@@ -38,6 +40,15 @@ const KUGOU_STREAM_CLIENTVER: i64 = 11430;
 const KUGOU_UA: &str = "Android15-1070-11083-46-0-DiscoveryDRADProtocol-wifi";
 const KUGOU_KG_RFC: &str = "B9EDA08A64250DEFFBCADDEE00F8F25F";
 const KUGOU_DEVICE_FILE: &str = "kugou-device.json";
+/// Web 播放接口使用的签名盐和客户端参数。网页登录得到的 `KuGoo.t`
+/// 属于 Web 会话，不能送入上面的 Lite/Android 登录协议。
+const KUGOU_WEB_SIGN_SALT: &str = "NVPh5oo715z5DIWAeQlhMDsWXXQV4hwt";
+const KUGOU_WEB_SRCAPPID: &str = "2919";
+const KUGOU_WEB_CLIENTVER: &str = "20000";
+const KUGOU_WEB_APPID: &str = "1014";
+const KUGOU_WEB_PLATID: &str = "4";
+const KUGOU_WEB_UA: &str =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36";
 
 /// 官方端点
 const URL_SEARCH: &str = "https://gateway.kugou.com/v3/search/song";
@@ -45,11 +56,8 @@ const URL_SONG_STREAM: &str = "https://gateway.kugou.com/v5/url";
 const URL_PRIVILEGE: &str = "https://gateway.kugou.com/v2/get_res_privilege/lite";
 const URL_SEARCH_LYRIC: &str = "https://lyrics.kugou.com/v1/search";
 const URL_DOWNLOAD_LYRIC: &str = "https://lyrics.kugou.com/download";
-const URL_TOKEN_REFRESH: &str = "http://login.user.kugou.com/v5/login_by_token";
-const URL_USER_DETAIL: &str = "https://gateway.kugou.com/v3/get_my_info";
+const URL_WEB_SONGINFO: &str = "https://wwwapi.kugou.com/play/songinfo";
 const URL_YOUTH_UNION_VIP: &str = "https://kugouvip.kugou.com/v1/get_union_vip";
-// KuGouMusicApi's user_vip_detail module aliases the union-vip endpoint.
-const URL_USER_VIP_DETAIL: &str = "https://kugouvip.kugou.com/v1/get_union_vip";
 const URL_YOUTH_VIP: &str = "https://gateway.kugou.com/youth/v1/ad/play_report";
 const URL_YOUTH_VIP_UPGRADE: &str =
     "https://gateway.kugou.com/youth/v1/listen_song/upgrade_vip_reward";
@@ -98,6 +106,10 @@ pub struct KugouAdapter {
     client: Client,
     credentials: CredentialStore,
     legacy_device: Option<KugouDeviceIdentity>,
+    /// Production playback routes Web songinfo through the WebView2 helper so
+    /// the official SSA challenge can run in a real browser context.
+    login_helper_executable: Option<PathBuf>,
+    web_request_lock: Arc<tokio::sync::Mutex<()>>,
     /// 账号状态整体缓存（成功 24 小时/失败 15 分钟），防止轮询频繁打账号接口触发风控。
     account_cache: Arc<std::sync::Mutex<AccountStatusCache>>,
 }
@@ -113,14 +125,6 @@ struct KugouDeviceIdentity {
 /// corresponding KuGouMusicApi JavaScript modules.  Android signatures cover
 /// the serialized body bytes, so an equivalent but differently ordered JSON
 /// object is not interchangeable on the wire.
-#[derive(Serialize)]
-struct KugouUserDetailBody {
-    visit_time: u64,
-    usertype: u8,
-    p: String,
-    userid: u64,
-}
-
 #[derive(Serialize)]
 struct KugouAdPlayReportBody {
     ad_id: u64,
@@ -172,6 +176,21 @@ pub fn kugou_android_signature(params: &BTreeMap<String, String>, body: &str) ->
         .collect::<String>();
     let digest = compute(format!(
         "{KUGOU_LITE_SIGN_SALT}{joined}{body}{KUGOU_LITE_SIGN_SALT}"
+    ));
+    format!("{digest:x}")
+}
+
+/// 计算酷狗 Web 接口签名。
+///
+/// Web 版本只对查询参数签名：按参数名排序后拼接 `key=value`，不包含
+/// `&` 分隔符，也不包含最终的 `signature` 字段。
+pub fn kugou_web_signature(params: &BTreeMap<String, String>) -> String {
+    let joined = params
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<String>();
+    let digest = compute(format!(
+        "{KUGOU_WEB_SIGN_SALT}{joined}{KUGOU_WEB_SIGN_SALT}"
     ));
     format!("{digest:x}")
 }
@@ -520,6 +539,14 @@ fn insert_cookie_default(cookies: &mut BTreeMap<String, String>, name: &str, val
 
 impl KugouAdapter {
     pub fn new(credentials: CredentialStore, timeout: Duration) -> Result<Self, CatalogError> {
+        Self::new_with_login_helper(credentials, timeout, None)
+    }
+
+    pub fn new_with_login_helper(
+        credentials: CredentialStore,
+        timeout: Duration,
+        login_helper_executable: Option<PathBuf>,
+    ) -> Result<Self, CatalogError> {
         let client = Client::builder()
             .timeout(timeout)
             .user_agent(KUGOU_UA)
@@ -530,6 +557,9 @@ impl KugouAdapter {
             client,
             credentials,
             legacy_device,
+            login_helper_executable: login_helper_executable
+                .filter(|path| !path.as_os_str().is_empty()),
+            web_request_lock: Arc::new(tokio::sync::Mutex::new(())),
             account_cache: Arc::new(std::sync::Mutex::new(AccountStatusCache::default())),
         })
     }
@@ -549,6 +579,7 @@ impl KugouAdapter {
         };
         let mut cookies = cookies.clone();
         insert_cookie_default(&mut cookies, "KUGOU_API_GUID", &device.guid);
+        insert_cookie_default(&mut cookies, "KUGOU_API_DFID", dfid);
         insert_cookie_default(
             &mut cookies,
             "KUGOU_API_MID",
@@ -566,18 +597,49 @@ impl KugouAdapter {
 
     fn credential_cookie_header(credential: &ProviderCredential) -> String {
         let mut cookies = credential.cookies().clone();
-        let ProviderCredential::Kugou {
-            token,
-            userid,
-            dfid,
-            ..
-        } = credential
-        else {
+        let ProviderCredential::Kugou { .. } = credential else {
             return cookie_header(&cookies);
+        };
+        // Lite requests use the separately registered device identity. The
+        // browser-only KuGoo cookie belongs to the Web session and must not
+        // be mixed into this request family.
+        cookies.remove("KuGoo");
+        let ProviderCredential::Kugou { token, userid, .. } = credential else {
+            unreachable!();
         };
         cookies.insert("token".to_owned(), token.clone());
         cookies.insert("userid".to_owned(), userid.clone());
-        cookies.insert("dfid".to_owned(), dfid.clone());
+        cookies.insert("dfid".to_owned(), Self::lite_credential_dfid(credential));
+        cookie_header(&cookies)
+    }
+
+    fn web_credential_cookie_header(credential: &ProviderCredential) -> String {
+        let ProviderCredential::Kugou { token, userid, .. } = credential else {
+            return cookie_header(credential.cookies());
+        };
+        let mut cookies = credential.cookies().clone();
+        let ku_goo = cookies
+            .remove("KuGoo")
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| format!("t={token}&KugooID={userid}"));
+
+        // Do not leak the synthetic Lite identity into the browser request.
+        // The raw KuGoo value and the Web dfid remain paired.
+        for name in [
+            "KUGOU_API_DFID",
+            "KUGOU_API_GUID",
+            "KUGOU_API_MID",
+            "KUGOU_API_MAC",
+            "KUGOU_API_DEV",
+        ] {
+            cookies.remove(name);
+        }
+        cookies.insert("KuGoo".to_owned(), ku_goo);
+        // Some Web API deployments still read the split aliases even when
+        // KuGoo is present. Keep both representations consistent.
+        cookies.insert("token".to_owned(), token.clone());
+        cookies.insert("userid".to_owned(), userid.clone());
+        cookies.insert("dfid".to_owned(), Self::web_credential_dfid(credential));
         cookie_header(&cookies)
     }
 
@@ -606,6 +668,34 @@ impl KugouAdapter {
         Ok((token, userid, dfid))
     }
 
+    fn lite_credential_dfid(credential: &ProviderCredential) -> String {
+        let ProviderCredential::Kugou { dfid, cookies, .. } = credential else {
+            return "-".to_owned();
+        };
+        cookies
+            .get("KUGOU_API_DFID")
+            .filter(|value| {
+                let value = value.trim();
+                !value.is_empty() && !value.eq_ignore_ascii_case("undefined")
+            })
+            .cloned()
+            .unwrap_or_else(|| dfid.clone())
+    }
+
+    fn web_credential_dfid(credential: &ProviderCredential) -> String {
+        let ProviderCredential::Kugou { dfid, cookies, .. } = credential else {
+            return "-".to_owned();
+        };
+        cookies
+            .get("dfid")
+            .filter(|value| {
+                let value = value.trim();
+                !value.is_empty() && !value.eq_ignore_ascii_case("undefined") && value != "-"
+            })
+            .cloned()
+            .unwrap_or_else(|| dfid.clone())
+    }
+
     /// 从登录捕获的 Cookie 中取出 Android 请求所需的设备 MID。
     /// `mid`/`kg_mid` 是服务端下发的十进制 MID；只有在旧凭据没有这两个
     /// 字段时才从 `KugouGUID` 按官方算法派生，不能把 dfid 当作 GUID。
@@ -630,6 +720,22 @@ impl KugouAdapter {
             .unwrap_or_else(|| "-".to_owned())
     }
 
+    /// Web 播放优先使用登录页面返回的 `mid`/`kg_mid`。持久化的
+    /// `KUGOU_API_MID` 是 Lite 设备身份，不能覆盖 Web 会话的 MID。
+    fn web_credential_mid(credential: &ProviderCredential) -> String {
+        let cookies = credential.cookies();
+        ["mid", "kg_mid", "KUGOU_API_MID"]
+            .into_iter()
+            .find_map(|name| {
+                cookies.get(name).map(String::as_str).filter(|value| {
+                    let value = value.trim();
+                    !value.is_empty() && !value.eq_ignore_ascii_case("undefined")
+                })
+            })
+            .map(str::to_owned)
+            .unwrap_or_else(|| "-".to_owned())
+    }
+
     fn device_params(
         credential: Option<&ProviderCredential>,
         appid: i64,
@@ -640,9 +746,13 @@ impl KugouAdapter {
             .map(|d| d.as_secs())
             .unwrap_or(0)
             .to_string();
-        let (token, userid, dfid) = credential
+        let (token, userid) = credential
             .and_then(|cred| Self::credential_fields(cred).ok())
-            .unwrap_or(("", "", ""));
+            .map(|(token, userid, _)| (token, userid))
+            .unwrap_or(("", ""));
+        let dfid = credential
+            .map(Self::lite_credential_dfid)
+            .unwrap_or_else(|| "-".to_owned());
         let mut params = BTreeMap::from([
             ("appid".to_owned(), appid.to_string()),
             ("clientver".to_owned(), clientver.to_string()),
@@ -652,7 +762,7 @@ impl KugouAdapter {
                 if dfid.trim().is_empty() {
                     "-".to_owned()
                 } else {
-                    dfid.to_owned()
+                    dfid
                 },
             ),
             ("mid".to_owned(), Self::credential_mid(credential)),
@@ -700,6 +810,201 @@ impl KugouAdapter {
             .header("kg-thash", "5d816a0")
             .header("kg-rec", "1")
             .header("kg-rf", KUGOU_KG_RFC)
+    }
+
+    /// Build the query used by `wwwapi.kugou.com/play/songinfo`.
+    fn web_songinfo_params(
+        credential: &ProviderCredential,
+        selector: Option<(&str, String)>,
+    ) -> Result<BTreeMap<String, String>, CatalogError> {
+        let (token, userid, _) = Self::credential_fields(credential)?;
+        let dfid = Self::web_credential_dfid(credential);
+        let mut params = BTreeMap::from([
+            ("srcappid".to_owned(), KUGOU_WEB_SRCAPPID.to_owned()),
+            ("clientver".to_owned(), KUGOU_WEB_CLIENTVER.to_owned()),
+            ("clienttime".to_owned(), epoch_ms().to_string()),
+            ("mid".to_owned(), Self::web_credential_mid(credential)),
+            ("uuid".to_owned(), Self::web_credential_mid(credential)),
+            (
+                "dfid".to_owned(),
+                if dfid.trim().is_empty() {
+                    "-".to_owned()
+                } else {
+                    dfid
+                },
+            ),
+            ("appid".to_owned(), KUGOU_WEB_APPID.to_owned()),
+            ("platid".to_owned(), KUGOU_WEB_PLATID.to_owned()),
+            ("token".to_owned(), token.to_owned()),
+            ("userid".to_owned(), userid.to_owned()),
+        ]);
+        if let Some((name, value)) = selector {
+            params.insert(name.to_owned(), value);
+        }
+        Ok(params)
+    }
+
+    fn web_request_url(
+        endpoint: &str,
+        params: &BTreeMap<String, String>,
+    ) -> Result<String, CatalogError> {
+        let mut url = Url::parse(endpoint)
+            .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?;
+        {
+            let mut query = url.query_pairs_mut();
+            for (name, value) in params {
+                query.append_pair(name, value);
+            }
+        }
+        Ok(url.into())
+    }
+
+    fn web_request_cookies(credential: &ProviderCredential) -> BTreeMap<String, String> {
+        let ProviderCredential::Kugou {
+            token,
+            userid,
+            cookies,
+            ..
+        } = credential
+        else {
+            return BTreeMap::new();
+        };
+        let mut result = cookies.clone();
+        if !result
+            .get("KuGoo")
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            result.insert("KuGoo".to_owned(), format!("t={token}&KugooID={userid}"));
+        }
+        if !result
+            .get("dfid")
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            result.insert("dfid".to_owned(), Self::web_credential_dfid(credential));
+        }
+        result
+    }
+
+    async fn web_request_via_helper(
+        &self,
+        url: String,
+        credential: &ProviderCredential,
+        executable: &Path,
+    ) -> Result<Value, CatalogError> {
+        let _request_guard = self.web_request_lock.lock().await;
+        let profile = self
+            .credentials
+            .auxiliary_path(".kugou-web-request-profile")
+            .ok_or_else(|| {
+                CatalogError::Transient("Kugou WebView2 request profile is unavailable".to_owned())
+            })?;
+        std::fs::create_dir_all(&profile)
+            .map_err(|error| CatalogError::Transient(error.to_string()))?;
+        let ProviderCredential::Kugou { userid, .. } = credential else {
+            return Err(CatalogError::InvalidResponse(
+                "Kugou credential provider does not match adapter".to_owned(),
+            ));
+        };
+        let request = serde_json::json!({
+            "url": url,
+            "userid": userid,
+            "mid": Self::web_credential_mid(credential),
+            "cookies": Self::web_request_cookies(credential),
+        });
+        let executable = executable.to_owned();
+        let timeout = Duration::from_secs(30);
+        Ok(tokio::task::spawn_blocking(move || {
+            run_kugou_web_helper(&executable, &profile, timeout, &request)
+        })
+        .await
+        .map_err(|error| CatalogError::Transient(error.to_string()))??)
+    }
+
+    /// Send a Web songinfo request without interpreting its business status.
+    /// Resolve needs the complete error envelope so it can distinguish a VIP
+    /// restriction from an invalid credential.
+    async fn web_songinfo_json(
+        &self,
+        credential: &ProviderCredential,
+        selector: Option<(&str, String)>,
+    ) -> Result<Value, CatalogError> {
+        let mut params = Self::web_songinfo_params(credential, selector)?;
+        let signature = kugou_web_signature(&params);
+        params.insert("signature".to_owned(), signature);
+        if let Some(executable) = self.login_helper_executable.as_deref() {
+            let url = Self::web_request_url(URL_WEB_SONGINFO, &params)?;
+            return self
+                .web_request_via_helper(url, credential, executable)
+                .await;
+        }
+        let response = self
+            .client
+            .get(URL_WEB_SONGINFO)
+            .query(&params)
+            .header("User-Agent", KUGOU_WEB_UA)
+            .header("Referer", "https://www.kugou.com/")
+            .header("Origin", "https://www.kugou.com")
+            .header("Cookie", Self::web_credential_cookie_header(credential))
+            .send()
+            .await
+            .map_err(classify_request_error)?;
+        classify_status(&response)?;
+        response
+            .json::<Value>()
+            .await
+            .map_err(|error| CatalogError::InvalidResponse(error.to_string()))
+    }
+
+    async fn validate_web_credential(
+        &self,
+        credential: &ProviderCredential,
+    ) -> Result<(), CatalogError> {
+        // Omitting the selector makes the endpoint return err_code=20010 for
+        // a valid session, while an expired Web token returns err_code=30020.
+        let response = self.web_songinfo_json(credential, None).await?;
+        validate_web_credential_response(&response)
+    }
+
+    fn web_union_vip_params(
+        credential: &ProviderCredential,
+    ) -> Result<BTreeMap<String, String>, CatalogError> {
+        // The union-VIP endpoint is served on a different Web origin, but it
+        // expects the same signed Web session shape as play/songinfo. A bare
+        // cookie request returns 20010 and has no membership data.
+        let mut params = Self::web_songinfo_params(credential, None)?;
+        params.insert("busi_type".to_owned(), "concept".to_owned());
+        params.insert("opt_product_types".to_owned(), "dvip,qvip".to_owned());
+        params.insert("product_type".to_owned(), "svip".to_owned());
+        let signature = kugou_web_signature(&params);
+        params.insert("signature".to_owned(), signature);
+        Ok(params)
+    }
+
+    async fn web_union_vip_json(
+        &self,
+        credential: &ProviderCredential,
+    ) -> Result<Value, CatalogError> {
+        let params = Self::web_union_vip_params(credential)?;
+        if let Some(executable) = self.login_helper_executable.as_deref() {
+            let url = Self::web_request_url(URL_YOUTH_UNION_VIP, &params)?;
+            return self
+                .web_request_via_helper(url, credential, executable)
+                .await;
+        }
+
+        // Unit-test and embedding compatibility fallback. The production
+        // runtime wires the helper executable, so authenticated VIP lookups
+        // use the browser WebView2 session above.
+        self.get_json_direct(
+            URL_YOUTH_UNION_VIP,
+            vec![
+                ("busi_type", "concept".to_owned()),
+                ("opt_product_types", "dvip,qvip".to_owned()),
+                ("product_type", "svip".to_owned()),
+            ],
+            Some(credential),
+        )
+        .await
     }
 
     async fn get_json_direct(
@@ -841,9 +1146,7 @@ impl KugouAdapter {
             .json::<Value>()
             .await
             .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?;
-        if endpoint != URL_TOKEN_REFRESH {
-            classify_business_response(&value)?;
-        }
+        classify_business_response(&value)?;
         Ok((value, headers))
     }
 
@@ -874,40 +1177,7 @@ impl KugouAdapter {
         &self,
         credential: &ProviderCredential,
     ) -> Result<Value, CatalogError> {
-        let (token, userid, _) = Self::credential_fields(credential)?;
-        // user_detail.js names this field clienttime_ms, but the value is the
-        // current Unix time in seconds, as used by the official client.
-        let clienttime = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_secs())
-            .unwrap_or(0);
-        #[derive(Serialize)]
-        struct UserDetailProof<'a> {
-            token: &'a str,
-            clienttime: u64,
-        }
-        let pk = rsa_raw_encrypt_json_hex(
-            &UserDetailProof { token, clienttime },
-            KUGOU_LITE_RSA_PUBLIC_KEY,
-        )
-        .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?
-        .to_ascii_uppercase();
-        let body = serialize_kugou_body(&KugouUserDetailBody {
-            visit_time: clienttime,
-            usertype: 1,
-            p: pk,
-            userid: userid.parse::<u64>().unwrap_or(0),
-        })?;
-        let (value, _) = self
-            .post_json_text_direct_with_headers(
-                URL_USER_DETAIL,
-                vec![("plat", "1".to_owned())],
-                Some(&body),
-                Some(credential),
-                &[("x-router", "usercenter.kugou.com")],
-            )
-            .await?;
-        Ok(value)
+        self.web_songinfo_json(credential, None).await
     }
 
     /// 测试版（概念版/lite）广告播放领取 VIP：上报一次完整广告播放（约 30 秒）。
@@ -993,154 +1263,12 @@ impl KugouAdapter {
         credential: &ProviderCredential,
     ) -> Result<ProviderCredential, CatalogError> {
         let credential = self.credential_with_device(credential);
-        let credential = &credential;
-        let (token, userid, dfid) = Self::credential_fields(credential)?;
-        let cookies = credential.cookies();
-        let device_guid = cookies
-            .get("KUGOU_API_GUID")
-            .or_else(|| cookies.get("KugouGUID"))
-            .filter(|value| !value.trim().is_empty())
-            .map(|value| kugou_normalize_guid(value))
-            .unwrap_or_else(|| format!("kugou-{dfid}"));
-        let device_mac = cookies
-            .get("KUGOU_API_MAC")
-            .filter(|value| !value.trim().is_empty())
-            .map(|value| value.trim().to_ascii_uppercase())
-            .unwrap_or_else(|| "02:00:00:00:00:00".to_owned());
-        let device_name = cookies
-            .get("KUGOU_API_DEV")
-            .filter(|value| !value.trim().is_empty())
-            .map(|value| value.trim().to_ascii_uppercase())
-            .unwrap_or_else(|| "MILIASTRA".to_owned());
-        let params_key = rand::thread_rng()
-            .sample_iter(&Alphanumeric)
-            .take(16)
-            .map(char::from)
-            .collect::<String>()
-            .to_ascii_lowercase();
-        let body = build_lite_token_refresh_body_text(&KugouLiteTokenRefreshInput {
-            now_ms: epoch_ms(),
-            token: token.to_owned(),
-            userid: userid.to_owned(),
-            dfid: dfid.to_owned(),
-            device_guid,
-            device_mac,
-            device_name,
-            previous_t1: cookies.get("t1").cloned(),
-            params_key: params_key.clone(),
-        })
-        .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?;
-        let (value, headers) = self
-            .post_json_text_direct_with_headers(
-                URL_TOKEN_REFRESH,
-                Vec::new(),
-                Some(&body),
-                Some(credential),
-                &[],
-            )
-            .await?;
-
-        let response_body = response_data(&value);
-        let status = value
-            .get("status")
-            .or_else(|| response_body.get("status"))
-            .and_then(value_u64);
-        let error_code = value
-            .get("error_code")
-            .or_else(|| response_body.get("error_code"))
-            .and_then(value_i64);
-        let response_code = find_kugou_root_business_number(&value, "code");
-        if status.is_some_and(|status| status != 1)
-            || error_code.is_some_and(|error_code| error_code != 0)
-            || response_code.is_some_and(|code| code != 0)
-        {
-            return Err(CatalogError::AuthRequired(
-                "Kugou token refresh was rejected".to_owned(),
-            ));
-        }
-
-        let mut data = response_data(&value).clone();
-        if let Some(secu_params) = data.get("secu_params").and_then(Value::as_str) {
-            let key_hex = format!("{:x}", compute(params_key.as_bytes()));
-            let decrypted =
-                aes_cbc_decrypt_hex(secu_params, key_hex.as_bytes(), &key_hex.as_bytes()[16..])
-                    .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?;
-            let decoded = serde_json::from_slice::<Value>(&decrypted).unwrap_or_else(|_| {
-                Value::String(String::from_utf8_lossy(&decrypted).into_owned())
-            });
-            if let Some(source) = decoded.as_object() {
-                if let Some(target) = data.as_object_mut() {
-                    target.extend(source.clone());
-                }
-            } else if let Some(token) = decoded.as_str().filter(|value| !value.is_empty())
-                && let Some(target) = data.as_object_mut()
-            {
-                target.insert("token".to_owned(), Value::String(token.to_owned()));
-            }
-        }
-
-        // 官方经 Set-Cookie 下发新的续期字段（t1 等），必须保留供下次刷新。
-        // dfid 是 ProviderCredential 的独立字段，不能重复写进 cookie 白名单。
-        let mut refreshed_cookies = headers
-            .get_all(reqwest::header::SET_COOKIE)
-            .iter()
-            .filter_map(|header| header.to_str().ok())
-            .filter_map(|header| {
-                let (name, rest) = header.split_once('=')?;
-                let name = name.trim();
-                let value = rest.split(';').next()?.trim();
-                matches!(
-                    name,
-                    "t1" | "vip_type"
-                        | "vip_token"
-                        | "KugouGUID"
-                        | "KUGOU_API_GUID"
-                        | "KUGOU_API_MID"
-                        | "KUGOU_API_MAC"
-                        | "KUGOU_API_DEV"
-                        | "mid"
-                        | "kg_mid"
-                )
-                .then(|| (name.to_owned(), value.to_owned()))
-            })
-            .collect::<BTreeMap<_, _>>();
-        for name in ["t1", "vip_type", "vip_token"] {
-            if let Some(value) = data.get(name).and_then(value_string) {
-                refreshed_cookies.insert(name.to_owned(), value);
-            }
-        }
-
-        let new_token = data
-            .get("token")
-            .and_then(value_string)
-            .filter(|v| !v.is_empty())
-            .ok_or_else(|| {
-                CatalogError::AuthRequired("Kugou token refresh was rejected".to_owned())
-            })?;
-        let new_userid = data
-            .get("userid")
-            .and_then(value_string)
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| userid.to_owned());
-        let new_dfid = data
-            .get("dfid")
-            .and_then(value_string)
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| dfid.to_owned());
-        let ProviderCredential::Kugou { cookies, .. } = credential else {
-            return Err(CatalogError::CredentialRejected(
-                "kugou refresh requires a kugou credential".to_owned(),
-            ));
-        };
-        let mut merged_cookies = cookies.clone();
-        merged_cookies.extend(refreshed_cookies);
-        refreshed_cookies = merged_cookies;
-        Ok(ProviderCredential::Kugou {
-            token: new_token,
-            userid: new_userid,
-            dfid: new_dfid,
-            cookies: refreshed_cookies,
-        })
+        // Web QR login returns a Web session token. KuGou has no compatible
+        // Lite `login_by_token` refresh path for that session, so a refresh is
+        // an authenticated Web validation and the still-valid snapshot is
+        // returned unchanged.
+        self.validate_web_credential(&credential).await?;
+        Ok(credential)
     }
 
     /// 查询账号 VIP 状态。展示与播放共用同一份乐观缓存。
@@ -1168,11 +1296,19 @@ impl KugouAdapter {
 
     fn union_vip_status(data: &Value) -> UnionVipStatus {
         let mut status = UnionVipStatus::default();
-        if let Some(list) = data
-            .get("busi_vip")
-            .and_then(Value::as_array)
-            .filter(|list| !list.is_empty())
-        {
+        let candidate_data = [
+            Some(data),
+            data.get("data"),
+            data.get("data").and_then(|data| data.get("data")),
+        ];
+        for candidate in candidate_data.into_iter().flatten() {
+            let Some(list) = candidate
+                .get("busi_vip")
+                .and_then(Value::as_array)
+                .filter(|list| !list.is_empty())
+            else {
+                continue;
+            };
             for entry in list {
                 if entry.get("is_vip").and_then(value_u64).unwrap_or(0) == 0 {
                     continue;
@@ -1196,7 +1332,10 @@ impl KugouAdapter {
             }
             return status;
         }
-        status.active = Self::vip_flags_from_union(data);
+        status.active = candidate_data
+            .into_iter()
+            .flatten()
+            .find_map(Self::vip_flags_from_union);
         status
     }
 
@@ -1286,29 +1425,11 @@ impl KugouAdapter {
     ) -> Result<crate::catalog::ProviderAccountStatus, CatalogError> {
         let checked_at_ms = epoch_ms();
         let credential = self.credential()?;
-        let detail = self.user_detail_json(&credential).await;
-        let vip = match self
-            .get_json_direct(
-                URL_YOUTH_UNION_VIP,
-                vec![
-                    ("busi_type", "concept".to_owned()),
-                    ("opt_product_types", "dvip,qvip".to_owned()),
-                    ("product_type", "svip".to_owned()),
-                ],
-                Some(&credential),
-            )
+        let detail = self
+            .user_detail_json(&credential)
             .await
-        {
-            Ok(vip) => Ok(vip),
-            Err(_) => {
-                self.get_json_direct(
-                    URL_USER_VIP_DETAIL,
-                    vec![("busi_type", "concept".to_owned())],
-                    Some(&credential),
-                )
-                .await
-            }
-        };
+            .and_then(|value| validate_web_credential_response(&value).map(|_| value));
+        let vip = self.web_union_vip_json(&credential).await;
 
         match (detail, vip) {
             (Ok(detail), Ok(vip)) => {
@@ -1370,12 +1491,17 @@ impl KugouAdapter {
                     .map(|value| value.to_string()),
                 _ => None,
             });
-        let detail_status_code = detail_data
-            .and_then(|data| data.get("error_code"))
-            .and_then(value_u64);
+        let detail_status_code = detail_data.and_then(|data| {
+            data.get("error_code")
+                .or_else(|| data.get("errorCode"))
+                .or_else(|| data.get("err_code"))
+                .and_then(value_u64)
+        });
+        let detail_rejected = detail.is_some_and(kugou_web_credential_is_rejected);
         crate::catalog::ProviderAccountStatus {
             provider: PROVIDER.to_owned(),
-            logged_in: detail_status_code.is_none_or(|code| code == 0),
+            logged_in: !detail_rejected
+                && detail_status_code.is_none_or(|code| code == 0 || code == 20010),
             user_id: detail_data
                 .and_then(|data| data.get("userid"))
                 .and_then(value_string)
@@ -1500,22 +1626,7 @@ impl SourceAdapter for KugouAdapter {
         candidate: &ProviderCredential,
     ) -> Result<(), CatalogError> {
         let candidate = self.credential_with_device(candidate);
-        // Song search is available to anonymous and invalid sessions, so a
-        // successful search cannot validate the captured token. User detail
-        // returns error_code=20018 for a rejected login and exercises the same
-        // lite device identity that subsequent account requests require.
-        let response = self.user_detail_json(&candidate).await?;
-        if !response.is_object() {
-            Err(CatalogError::InvalidResponse(
-                "Kugou credential validation response is not an object".to_owned(),
-            ))
-        } else if kugou_validation_is_rejected(&response) {
-            Err(CatalogError::CredentialRejected(
-                "Kugou credential validation was rejected".to_owned(),
-            ))
-        } else {
-            Ok(())
-        }
+        self.validate_web_credential(&candidate).await
     }
 
     async fn search(
@@ -1541,48 +1652,32 @@ impl SourceAdapter for KugouAdapter {
                 "song key provider does not match Kugou adapter".to_owned(),
             ));
         }
-        let (hash, album_id, album_audio_id) = resolver_parts(key, locator)?;
+        let (hash, _album_id, _album_audio_id) = resolver_parts(key, locator)?;
         let credential = self.credential()?;
-        let (_, userid, _) = Self::credential_fields(&credential)?;
-        let mid = Self::credential_mid(Some(&credential));
         let hash_lower = hash.to_ascii_lowercase();
-        let key = kugou_lite_sign_key(&hash_lower, &mid, userid);
-        let response = self
-            // KuGouMusicApi's `song_url.js` calls this `notSign`, but its
-            // request layer only checks `notSignature`; the actual upstream
-            // request therefore still carries the Android signature.
-            .get_json_direct_with_headers(
-                URL_SONG_STREAM,
-                vec![
-                    ("album_id", album_id),
-                    ("area_code", "1".to_owned()),
-                    ("hash", hash_lower),
-                    ("ssa_flag", "is_fromtrack".to_owned()),
-                    ("version", KUGOU_STREAM_CLIENTVER.to_string()),
-                    ("page_id", "967177915".to_owned()),
-                    ("quality", "320".to_owned()),
-                    ("album_audio_id", album_audio_id),
-                    ("behavior", "play".to_owned()),
-                    ("pid", "411".to_owned()),
-                    ("cmd", "26".to_owned()),
-                    ("pidversion", "3001".to_owned()),
-                    ("IsFreePart", "0".to_owned()),
-                    ("ppage_id", "356753938,823673182,967485191".to_owned()),
-                    ("cdnBackup", "1".to_owned()),
-                    ("module", String::new()),
-                    ("clientver", KUGOU_STREAM_CLIENTVER.to_string()),
-                    ("key", key),
-                ],
-                Some(&credential),
-                &[("x-router", "trackercdn.kugou.com")],
-            )
+        // The QR login returns a Web token. Resolve through the same Web
+        // endpoint used by the browser: the first request translates the hash
+        // to `encode_album_audio_id`, and the second returns the CDN URL.
+        let first = self
+            .web_songinfo_json(&credential, Some(("hash", hash_lower)))
             .await?;
-        let url = match extract_stream_url(&response) {
-            Some(url) => url,
-            None => return Err(classify_kugou_resolve_failure(&response)),
+        let url = if let Some(url) = extract_stream_url(&first) {
+            url.to_owned()
+        } else {
+            let encoded_id = response_data(&first)
+                .get("encode_album_audio_id")
+                .and_then(value_string)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| classify_kugou_resolve_failure(&first))?;
+            let second = self
+                .web_songinfo_json(&credential, Some(("encode_album_audio_id", encoded_id)))
+                .await?;
+            extract_stream_url(&second)
+                .map(str::to_owned)
+                .ok_or_else(|| classify_kugou_resolve_failure(&second))?
         };
         let url =
-            Url::parse(url).map_err(|error| CatalogError::InvalidResponse(error.to_string()))?;
+            Url::parse(&url).map_err(|error| CatalogError::InvalidResponse(error.to_string()))?;
         if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
             return Err(CatalogError::InvalidResponse(
                 "Kugou returned a non-HTTP media URL".to_owned(),
@@ -1605,68 +1700,11 @@ impl SourceAdapter for KugouAdapter {
                 "song key provider does not match Kugou adapter".to_owned(),
             ));
         }
-        let (hash, album_id, _) = resolver_parts(key, locator)?;
-        let credential = self.credential()?;
-        let body = serialize_kugou_body(&KugouPrivilegeBody {
-            appid: KUGOU_LITE_APPID,
-            area_code: 1,
-            behavior: "play",
-            clientver: KUGOU_LITE_CLIENTVER,
-            need_hash_offset: 1,
-            relate: 1,
-            support_verify: 1,
-            resource: vec![KugouPrivilegeResource {
-                resource_type: "audio",
-                page_id: 0,
-                hash,
-                album_id,
-            }],
-            qualities: [
-                "128",
-                "320",
-                "flac",
-                "high",
-                "viper_atmos",
-                "viper_tape",
-                "viper_clear",
-                "super",
-                "multitrack",
-            ],
-        })?;
-        let (response, _) = self
-            .post_json_text_direct_with_headers(
-                URL_PRIVILEGE,
-                Vec::new(),
-                Some(&body),
-                Some(&credential),
-                &[("x-router", "media.store.kugou.com")],
-            )
-            .await?;
-        let item = first_privilege_resource(response_data(&response));
-        let Some(item) = item else {
-            return Err(CatalogError::InvalidResponse(
-                "Kugou privilege response has no resource".to_owned(),
-            ));
-        };
-        let pay_type = kugou_pay_type(item);
-        match pay_type {
-            Some(0) => Ok(PlaybackEligibility::Eligible),
-            Some(2) => Ok(PlaybackEligibility::PaidRequired),
-            Some(1 | 3) => match self.account_vip_status().await {
-                Some(true) => Ok(PlaybackEligibility::Eligible),
-                Some(false) => {
-                    let _ = self.resolve(key, locator).await?;
-                    Ok(PlaybackEligibility::Eligible)
-                }
-                None => {
-                    let _ = self.resolve(key, locator).await?;
-                    Ok(PlaybackEligibility::Eligible)
-                }
-            },
-            _ => Err(CatalogError::InvalidResponse(
-                "Kugou privilege response has no pay_type".to_owned(),
-            )),
-        }
+        // The Lite privilege endpoint rejects WebView2 credentials. The Web
+        // songinfo flow is authoritative for this session and also exercises
+        // the exact URL that playback will use.
+        let _ = self.resolve(key, locator).await?;
+        Ok(PlaybackEligibility::Eligible)
     }
 
     async fn lyrics(
@@ -1758,6 +1796,8 @@ fn extract_stream_url(response: &Value) -> Option<&str> {
             .and_then(first_stream_url)
             .or_else(|| value.get("backupUrl").and_then(first_stream_url))
             .or_else(|| value.get("backup_url").and_then(first_stream_url))
+            .or_else(|| value.get("play_url").and_then(first_stream_url))
+            .or_else(|| value.get("play_backup_url").and_then(first_stream_url))
     })
 }
 
@@ -2002,6 +2042,149 @@ fn cookie_header(cookies: &BTreeMap<String, String>) -> String {
         .join("; ")
 }
 
+/// Invoke the WebView2-only helper with a bounded JSON-over-stdio protocol.
+/// The helper owns the browser session and SSA verification; this function
+/// intentionally does not inspect or reproduce the challenge protocol.
+fn run_kugou_web_helper(
+    executable: &Path,
+    profile: &Path,
+    timeout: Duration,
+    request: &Value,
+) -> Result<Value, CatalogError> {
+    let input = serde_json::to_vec(request)
+        .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?;
+    let mut child = Command::new(executable)
+        .arg("kugou")
+        .arg("--kugou-web-request")
+        .arg("--profile")
+        .arg(profile)
+        .arg("--timeout-seconds")
+        .arg(timeout.as_secs().max(1).to_string())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        // The helper must never forward browser diagnostics or request data
+        // into the main process log.
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| CatalogError::Transient(error.to_string()))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(&input)
+            .map_err(|error| CatalogError::Transient(error.to_string()))?;
+    }
+
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(CatalogError::TimedOut(
+                    "Kugou WebView2 request timed out".to_owned(),
+                ));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(CatalogError::Transient(error.to_string()));
+            }
+        }
+    }
+
+    let mut output = Vec::new();
+    if let Some(stdout) = child.stdout.take() {
+        stdout
+            .take(2 * 1024 * 1024)
+            .read_to_end(&mut output)
+            .map_err(|error| CatalogError::Transient(error.to_string()))?;
+    }
+    let line = output
+        .split(|byte| *byte == b'\n')
+        .find(|line| !line.iter().all(u8::is_ascii_whitespace))
+        .ok_or_else(|| {
+            CatalogError::Transient("Kugou WebView2 helper returned no result".to_owned())
+        })?;
+    let envelope = serde_json::from_slice::<Value>(line).map_err(|_| {
+        CatalogError::InvalidResponse("Kugou WebView2 helper result is invalid".to_owned())
+    })?;
+    if envelope.get("status").and_then(Value::as_str) == Some("success") {
+        let response = envelope.get("response").cloned().ok_or_else(|| {
+            CatalogError::InvalidResponse("Kugou WebView2 helper result has no response".to_owned())
+        });
+        if let Ok(response) = &response {
+            log_kugou_web_vip_response_shape(request, response);
+        }
+        return response;
+    }
+    Err(CatalogError::Transient(
+        "Kugou WebView2 request was not completed".to_owned(),
+    ))
+}
+
+fn log_kugou_web_vip_response_shape(request: &Value, response: &Value) {
+    if std::env::var_os("MILIASTRA_KUGOU_WEB_DIAGNOSTICS").is_none() {
+        return;
+    }
+    let is_union_vip = request
+        .get("url")
+        .and_then(Value::as_str)
+        .and_then(|url| Url::parse(url).ok())
+        .is_some_and(|url| {
+            url.host_str() == Some("kugouvip.kugou.com") && url.path() == "/v1/get_union_vip"
+        });
+    if !is_union_vip {
+        return;
+    }
+
+    let data = response.get("data");
+    let nested_data = data.and_then(|value| value.get("data"));
+    let candidates = [Some(response), data, nested_data];
+    let busi_vip = candidates.into_iter().flatten().find_map(|value| {
+        value
+            .get("busi_vip")
+            .and_then(Value::as_array)
+            .filter(|items| !items.is_empty())
+    });
+    let first_busi_vip = busi_vip.and_then(|items| items.first());
+    let keys = |value: Option<&Value>| {
+        value
+            .and_then(Value::as_object)
+            .map(|object| {
+                let mut keys = object.keys().map(String::as_str).collect::<Vec<_>>();
+                keys.sort_unstable();
+                keys.join(",")
+            })
+            .unwrap_or_default()
+    };
+    let vip_flag = candidates
+        .into_iter()
+        .flatten()
+        .find_map(|value| value.get("is_vip").and_then(value_u64));
+    let first_vip_flag = first_busi_vip.and_then(|value| value.get("is_vip").and_then(value_u64));
+    let status = response.get("status").and_then(value_u64);
+    let error_code = response
+        .get("error_code")
+        .or_else(|| response.get("errorCode"))
+        .or_else(|| response.get("err_code"))
+        .and_then(value_u64);
+    let error_message_len = data
+        .and_then(|value| value.get("errmsg"))
+        .and_then(Value::as_str)
+        .map(str::len);
+    eprintln!(
+        "[kugou-web-vip] status={status:?} error_code={error_code:?} errmsg_len={error_message_len:?} top_keys={} data_keys={} nested_data_keys={} busi_vip_count={} is_vip={:?} first_busi_is_vip={:?} first_busi_keys={}",
+        keys(Some(response)),
+        keys(data),
+        keys(nested_data),
+        busi_vip.map_or(0, |items| items.len()),
+        vip_flag,
+        first_vip_flag,
+        keys(first_busi_vip),
+    );
+}
+
 fn decode_lrc_content(content: &str) -> Result<String, CatalogError> {
     use base64::Engine;
     if content.trim().is_empty() {
@@ -2099,12 +2282,67 @@ fn kugou_pay_type(value: &Value) -> Option<u64> {
 fn kugou_validation_is_rejected(response: &Value) -> bool {
     let data = response_data(response);
     [response, data].into_iter().any(|value| {
-        ["error_code", "errorCode", "code"]
+        ["error_code", "errorCode", "err_code", "code"]
             .into_iter()
             .filter_map(|field| value.get(field))
             .filter_map(value_i64)
             .any(|code| code != 0)
+            || value
+                .get("status")
+                .and_then(value_i64)
+                .is_some_and(|status| status == 0)
             || value.get("error").is_some_and(kugou_error_value_is_present)
+    })
+}
+
+fn kugou_web_credential_is_rejected(response: &Value) -> bool {
+    let data = response_data(response);
+    [response, data].into_iter().any(|value| {
+        ["err_code", "error_code", "errorCode", "code"]
+            .into_iter()
+            .filter_map(|field| value.get(field))
+            .filter_map(value_i64)
+            .any(|code| matches!(code, 20001 | 20018 | 20019 | 20020 | 30020 | 401 | 403))
+    })
+}
+
+fn validate_web_credential_response(response: &Value) -> Result<(), CatalogError> {
+    if !response.is_object() {
+        return Err(CatalogError::InvalidResponse(
+            "Kugou Web credential validation response is not an object".to_owned(),
+        ));
+    }
+    if kugou_web_credential_is_rejected(response) {
+        return Err(CatalogError::CredentialRejected(format!(
+            "Kugou Web credential was rejected (code={})",
+            kugou_web_rejection_code(response)
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "unknown".to_owned())
+        )));
+    }
+    let status = find_kugou_business_number(response, &["status"]);
+    let error_code =
+        find_kugou_business_number(response, &["err_code", "error_code", "errorCode", "code"]);
+    // With no hash the Web endpoint intentionally answers 20010 (missing
+    // required song parameters). That response still proves the token was
+    // accepted; 30020 is the explicit invalid-session response.
+    if status.is_some_and(|status| status == 0)
+        && error_code.is_some_and(|code| code != 20010 && code != 0)
+    {
+        return Err(CatalogError::InvalidResponse(
+            "Kugou Web credential validation returned an unexpected error".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn kugou_web_rejection_code(response: &Value) -> Option<i64> {
+    let data = response_data(response);
+    [response, data].into_iter().find_map(|value| {
+        ["err_code", "error_code", "errorCode", "code"]
+            .into_iter()
+            .find_map(|field| value.get(field).and_then(value_i64))
+            .filter(|code| matches!(code, 20001 | 20018 | 20019 | 20020 | 30020 | 401 | 403))
     })
 }
 
@@ -2212,9 +2450,10 @@ fn classify_business_response(value: &Value) -> Result<(), CatalogError> {
     let data = response_data(value);
     let status = find_kugou_business_number(value, &["status"])
         .or_else(|| data.get("status").and_then(value_i64));
-    let error_code = find_kugou_business_number(value, &["error_code", "errorCode"])
+    let error_code = find_kugou_business_number(value, &["err_code", "error_code", "errorCode"])
         .or_else(|| data.get("error_code").and_then(value_i64))
-        .or_else(|| data.get("errorCode").and_then(value_i64));
+        .or_else(|| data.get("errorCode").and_then(value_i64))
+        .or_else(|| data.get("err_code").and_then(value_i64));
     let response_code = find_kugou_root_business_number(value, "code");
     if status.is_some_and(|status| status == 0)
         || error_code.is_some_and(|error_code| error_code != 0)
@@ -2225,7 +2464,7 @@ fn classify_business_response(value: &Value) -> Result<(), CatalogError> {
             .flatten()
             .find(|code| *code != 0)
             .unwrap_or_default();
-        if matches!(code, 20001 | 20018 | 20019 | 20020 | 401 | 403) {
+        if matches!(code, 20001 | 20018 | 20019 | 20020 | 30020 | 401 | 403) {
             return Err(CatalogError::CredentialRejected(
                 "Kugou rejected the request credentials".to_owned(),
             ));
@@ -2302,6 +2541,7 @@ mod tests {
         extract_stream_url, kugou_android_signature, kugou_calculate_mid, kugou_lite_sign_key,
         kugou_normalize_guid, kugou_validation_is_rejected, load_legacy_device_identity,
         parse_kugou_datetime_ms, parse_search_candidates, resolver_parts, serialize_kugou_body,
+        validate_web_credential_response,
     };
     use crate::catalog::CatalogError;
     use crate::credentials::ProviderCredential;
@@ -2648,6 +2888,89 @@ mod tests {
         assert!(header.contains("userid=123"));
         assert!(header.contains("dfid=device-id"));
         assert!(header.contains("mid=device-mid"));
+    }
+
+    #[test]
+    fn web_and_lite_cookie_headers_keep_their_dfid_sessions_separate() {
+        let credential = ProviderCredential::Kugou {
+            token: "token-secret".to_owned(),
+            userid: "123".to_owned(),
+            dfid: "web-dfid-field".to_owned(),
+            cookies: BTreeMap::from([
+                (
+                    "KuGoo".to_owned(),
+                    "t=token-secret&KugooID=123&ct=1700000000".to_owned(),
+                ),
+                ("dfid".to_owned(), "web-dfid-cookie".to_owned()),
+                ("KUGOU_API_DFID".to_owned(), "lite-dfid".to_owned()),
+                ("mid".to_owned(), "web-mid".to_owned()),
+            ]),
+        };
+        let web = super::KugouAdapter::web_credential_cookie_header(&credential);
+        assert!(web.contains("KuGoo=t=token-secret&KugooID=123&ct=1700000000"));
+        assert!(web.contains("dfid=web-dfid-cookie"));
+        assert!(!web.contains("dfid=lite-dfid"));
+        assert!(!web.contains("KUGOU_API_DFID=lite-dfid"));
+
+        let lite = super::KugouAdapter::credential_cookie_header(&credential);
+        assert!(lite.contains("dfid=lite-dfid"));
+        assert!(lite.contains("token=token-secret"));
+        assert!(!lite.contains("KuGoo="));
+    }
+
+    #[test]
+    fn web_union_vip_params_keep_the_signed_web_session_shape() {
+        let credential = ProviderCredential::Kugou {
+            token: "token-secret".to_owned(),
+            userid: "123".to_owned(),
+            dfid: "web-dfid-field".to_owned(),
+            cookies: BTreeMap::from([
+                ("dfid".to_owned(), "web-dfid-cookie".to_owned()),
+                ("mid".to_owned(), "web-mid".to_owned()),
+            ]),
+        };
+
+        let params = super::KugouAdapter::web_union_vip_params(&credential).unwrap();
+        assert_eq!(
+            params.get("token").map(String::as_str),
+            Some("token-secret")
+        );
+        assert_eq!(params.get("userid").map(String::as_str), Some("123"));
+        assert_eq!(
+            params.get("dfid").map(String::as_str),
+            Some("web-dfid-cookie")
+        );
+        assert_eq!(params.get("mid").map(String::as_str), Some("web-mid"));
+        assert_eq!(params.get("busi_type").map(String::as_str), Some("concept"));
+        assert_eq!(
+            params.get("opt_product_types").map(String::as_str),
+            Some("dvip,qvip")
+        );
+        assert_eq!(params.get("product_type").map(String::as_str), Some("svip"));
+
+        let mut unsigned = params.clone();
+        let signature = unsigned.remove("signature").expect("Web signature");
+        assert_eq!(signature, super::kugou_web_signature(&unsigned));
+    }
+
+    #[test]
+    fn web_validation_accepts_missing_song_error_but_rejects_expired_session() {
+        assert!(
+            validate_web_credential_response(&json!({
+                "status": 0,
+                "err_code": 20010,
+                "error": "missing hash"
+            }))
+            .is_ok()
+        );
+        assert!(matches!(
+            validate_web_credential_response(&json!({
+                "status": 0,
+                "err_code": 30020,
+                "error": "token invalid"
+            })),
+            Err(CatalogError::CredentialRejected(_))
+        ));
     }
 
     #[test]

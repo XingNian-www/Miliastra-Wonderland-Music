@@ -6,7 +6,6 @@ use std::time::Duration;
 use base64::Engine;
 use percent_encoding::percent_decode_str;
 use reqwest::blocking::Client;
-use reqwest::header::CONTENT_TYPE;
 use serde_json::{Value, json};
 use url::Url;
 
@@ -818,6 +817,14 @@ fn bilibili_login_endpoint_url(raw: &str) -> bool {
     })
 }
 
+/// QQ's `ptqrshow` response is stateful: a second request creates a different
+/// QR ticket. Read only the response that WebView2 actually rendered.
+fn qq_web_qr_response_url(raw: &str) -> bool {
+    Url::parse(raw).ok().is_some_and(|url| {
+        web_qr_url_allowed("qqmusic", &url) && matches!(url.path(), "/ptqrshow" | "/ssl/ptqrshow")
+    })
+}
+
 fn parse_bilibili_login_payload(text: &str) -> Option<Value> {
     let text = text.trim().trim_start_matches('\u{feff}');
     let text = text
@@ -920,6 +927,12 @@ fn log_bilibili_capture_diagnostics(detail: &str) {
     }
 }
 
+fn log_qq_qr_capture_diagnostics(detail: &str) {
+    if std::env::var_os("MILIASTRA_LOGIN_HELPER_DIAGNOSTICS").is_some() {
+        eprintln!("[qq-qr-capture] {detail}");
+    }
+}
+
 fn parse_web_qr_probe_result(raw: &str) -> Option<(String, String)> {
     let value = parse_execute_script_value(raw)?;
     let object = value.as_object()?;
@@ -936,6 +949,21 @@ fn parse_execute_script_value(raw: &str) -> Option<Value> {
         Value::String(encoded) => serde_json::from_str(&encoded).ok(),
         value => Some(value),
     }
+}
+
+fn web_qr_image_data_url_from_bytes(bytes: &[u8]) -> Result<String, String> {
+    if bytes.is_empty() || bytes.len() > miliastra_login_protocol::MAX_QR_IMAGE_BYTES {
+        return Err("网页登录二维码图片过大".to_owned());
+    }
+    let mime = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        "image/png"
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        "image/jpeg"
+    } else {
+        return Err("网页登录二维码图片格式无效".to_owned());
+    };
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    validate_web_qr_data_url(&format!("data:{mime};base64,{encoded}"))
 }
 
 /// Download an image URL discovered in the WebView2 DOM. This is only an
@@ -998,25 +1026,7 @@ fn download_web_qr_image(provider: &str, raw_url: &str) -> Result<String, String
     if bytes.is_empty() || bytes.len() > miliastra_login_protocol::MAX_QR_IMAGE_BYTES {
         return Err("网页登录二维码图片过大".to_owned());
     }
-    let mime = response
-        .headers()
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(';').next())
-        .filter(|value| matches!(*value, "image/png" | "image/jpeg"))
-        .map(str::to_owned)
-        .or_else(|| {
-            if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-                Some("image/png".to_owned())
-            } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
-                Some("image/jpeg".to_owned())
-            } else {
-                None
-            }
-        })
-        .ok_or_else(|| "网页登录二维码图片格式无效".to_owned())?;
-    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-    validate_web_qr_data_url(&format!("data:{mime};base64,{encoded}"))
+    web_qr_image_data_url_from_bytes(&bytes)
 }
 
 fn allowed_cookie_names(provider: &str) -> &'static [&'static str] {
@@ -2010,6 +2020,12 @@ mod platform {
         KugouRequest,
     }
 
+    #[derive(Clone, Copy)]
+    enum WebResourceResponseKind {
+        BilibiliLogin,
+        QqQrImage,
+    }
+
     #[repr(C)]
     struct HandlerVtable {
         query_interface: HandlerQueryInterface,
@@ -2229,6 +2245,14 @@ mod platform {
             }
             state.bilibili_login_succeeded = true;
             state.next_cookie_poll = Some(Instant::now());
+        }
+
+        fn accept_web_qr_image(&self, image: String) {
+            let mut state = self.state.lock().expect("capture state mutex poisoned");
+            if state.outcome.is_none() {
+                state.web_qr_pending = Some(image);
+                state.web_qr_failures = 0;
+            }
         }
 
         fn start_initial_navigation(self: &Rc<Self>) {
@@ -2641,6 +2665,13 @@ mod platform {
         }
 
         fn start_web_qr_fetch(self: &Rc<Self>, source: String) {
+            // QQ's ptqrshow endpoint creates a fresh ticket for every GET.
+            // The WebResourceResponseReceived handler captures the response
+            // that the WebView actually rendered, so a second request would
+            // publish an unusable QR code.
+            if self.provider == "qqmusic" {
+                return;
+            }
             let (sender, receiver) = mpsc::channel();
             let now = Instant::now();
             {
@@ -2821,7 +2852,7 @@ mod platform {
         vtbl: &'static WebResourceContentHandlerVtable,
         refs: AtomicU32,
         context: Rc<CaptureContext>,
-        request_url: String,
+        response_kind: WebResourceResponseKind,
     }
 
     type NavigationStartingInvoke =
@@ -3380,33 +3411,34 @@ mod platform {
             state.next_cookie_poll = Some(Instant::now());
         }
 
-        let web_resource_response_token = if context.provider == "bilibili" {
-            let response_handler = Box::into_raw(Box::new(WebResourceResponseReceivedHandler {
-                vtbl: &WEB_RESOURCE_RESPONSE_RECEIVED_HANDLER_VTABLE,
-                refs: AtomicU32::new(1),
-                context: Rc::clone(&context),
-            })) as *mut c_void;
-            // ICoreWebView2_2::add_WebResourceResponseReceived.
-            let add_response: unsafe extern "system" fn(
-                *mut c_void,
-                *mut c_void,
-                *mut i64,
-            ) -> HRESULT = vtable_fn(webview2, 61);
-            let mut token = 0i64;
-            let hr = add_response(webview2, response_handler, &mut token);
-            release_com(response_handler);
-            if hr < 0 {
-                release_com(webview2);
-                context.finish_error(com_error(
-                    "ICoreWebView2_2::add_WebResourceResponseReceived",
-                    hr,
-                ));
-                return S_OK;
-            }
-            Some(token)
-        } else {
-            None
-        };
+        let web_resource_response_token =
+            if matches!(context.provider.as_str(), "bilibili" | "qqmusic") {
+                let response_handler = Box::into_raw(Box::new(WebResourceResponseReceivedHandler {
+                    vtbl: &WEB_RESOURCE_RESPONSE_RECEIVED_HANDLER_VTABLE,
+                    refs: AtomicU32::new(1),
+                    context: Rc::clone(&context),
+                })) as *mut c_void;
+                // ICoreWebView2_2::add_WebResourceResponseReceived.
+                let add_response: unsafe extern "system" fn(
+                    *mut c_void,
+                    *mut c_void,
+                    *mut i64,
+                ) -> HRESULT = vtable_fn(webview2, 61);
+                let mut token = 0i64;
+                let hr = add_response(webview2, response_handler, &mut token);
+                release_com(response_handler);
+                if hr < 0 {
+                    release_com(webview2);
+                    context.finish_error(com_error(
+                        "ICoreWebView2_2::add_WebResourceResponseReceived",
+                        hr,
+                    ));
+                    return S_OK;
+                }
+                Some(token)
+            } else {
+                None
+            };
         {
             let mut state = context.state.lock().expect("capture state mutex poisoned");
             state.web_resource_response_token = web_resource_response_token;
@@ -3629,7 +3661,7 @@ mod platform {
             return S_OK;
         }
         let handler = &*(this as *mut WebResourceResponseReceivedHandler);
-        if handler.context.provider != "bilibili" {
+        if !matches!(handler.context.provider.as_str(), "bilibili" | "qqmusic") {
             return S_OK;
         }
         let context = handler.context.clone();
@@ -3650,10 +3682,21 @@ mod platform {
             String::new()
         };
         unsafe { release_com(request) };
-        if !super::bilibili_login_endpoint_url(&request_url) {
-            return S_OK;
-        }
-        super::log_bilibili_capture_diagnostics("WebView2 response received for login endpoint");
+        let response_kind = match handler.context.provider.as_str() {
+            "bilibili" if super::bilibili_login_endpoint_url(&request_url) => {
+                super::log_bilibili_capture_diagnostics(
+                    "WebView2 response received for login endpoint",
+                );
+                WebResourceResponseKind::BilibiliLogin
+            }
+            "qqmusic" if super::qq_web_qr_response_url(&request_url) => {
+                super::log_qq_qr_capture_diagnostics(
+                    "WebView2 response received for rendered QR image",
+                );
+                WebResourceResponseKind::QqQrImage
+            }
+            _ => return S_OK,
+        };
 
         let get_response: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT =
             vtable_fn(args, 4);
@@ -3665,7 +3708,7 @@ mod platform {
             vtbl: &WEB_RESOURCE_CONTENT_HANDLER_VTABLE,
             refs: AtomicU32::new(1),
             context,
-            request_url,
+            response_kind,
         })) as *mut c_void;
         let get_content: unsafe extern "system" fn(*mut c_void, *mut c_void) -> HRESULT =
             vtable_fn(response, 6);
@@ -3673,7 +3716,16 @@ mod platform {
         unsafe { release_com(content_handler) };
         unsafe { release_com(response) };
         if result < 0 {
-            super::log_bilibili_capture_diagnostics("WebView2 response content read failed");
+            match response_kind {
+                WebResourceResponseKind::BilibiliLogin => {
+                    super::log_bilibili_capture_diagnostics(
+                        "WebView2 response content read failed",
+                    );
+                }
+                WebResourceResponseKind::QqQrImage => {
+                    super::log_qq_qr_capture_diagnostics("WebView2 QR image content read failed");
+                }
+            }
         }
         S_OK
     }
@@ -3684,31 +3736,66 @@ mod platform {
         stream: *mut c_void,
     ) -> HRESULT {
         let handler = &*(this as *mut WebResourceContentHandler);
-        if result < 0 || stream.is_null() {
-            super::log_bilibili_capture_diagnostics(
-                "WebView2 login response returned no readable content",
-            );
-            return S_OK;
+        match handler.response_kind {
+            WebResourceResponseKind::BilibiliLogin => {
+                if result < 0 || stream.is_null() {
+                    super::log_bilibili_capture_diagnostics(
+                        "WebView2 login response returned no readable content",
+                    );
+                    return S_OK;
+                }
+                let Some(text) = (unsafe { read_response_stream(stream) }) else {
+                    super::log_bilibili_capture_diagnostics(
+                        "WebView2 login response stream could not be decoded",
+                    );
+                    return S_OK;
+                };
+                let Some(payload) = super::parse_bilibili_login_payload(&text) else {
+                    super::log_bilibili_capture_diagnostics(
+                        "WebView2 login response JSON was invalid",
+                    );
+                    return S_OK;
+                };
+                super::log_bilibili_login_payload_shape(&payload);
+                handler.context.note_bilibili_login_response(&payload);
+                let Some(token) = super::bilibili_refresh_token_from_payload(&payload) else {
+                    super::log_bilibili_capture_diagnostics(
+                        "WebView2 login response had no refresh token",
+                    );
+                    return S_OK;
+                };
+                handler
+                    .context
+                    .accept_bilibili_refresh_token(&token, "WebView2 response");
+            }
+            WebResourceResponseKind::QqQrImage => {
+                if result < 0 || stream.is_null() {
+                    super::log_qq_qr_capture_diagnostics(
+                        "WebView2 QR image returned no readable content",
+                    );
+                    return S_OK;
+                }
+                let Some(bytes) = (unsafe {
+                    read_response_bytes(stream, miliastra_login_protocol::MAX_QR_IMAGE_BYTES)
+                }) else {
+                    super::log_qq_qr_capture_diagnostics(
+                        "WebView2 QR image stream could not be read",
+                    );
+                    return S_OK;
+                };
+                let byte_len = bytes.len();
+                let Ok(image) = super::web_qr_image_data_url_from_bytes(&bytes) else {
+                    super::log_qq_qr_capture_diagnostics(&format!(
+                        "WebView2 QR image had an invalid format bytes={byte_len}",
+                    ));
+                    return S_OK;
+                };
+                super::log_qq_qr_capture_diagnostics(&format!(
+                    "WebView2 QR image accepted bytes={byte_len}",
+                ));
+                handler.context.accept_web_qr_image(image);
+            }
         }
-        let Some(text) = (unsafe { read_response_stream(stream) }) else {
-            super::log_bilibili_capture_diagnostics(
-                "WebView2 login response stream could not be decoded",
-            );
-            return S_OK;
-        };
-        let Some(payload) = super::parse_bilibili_login_payload(&text) else {
-            super::log_bilibili_capture_diagnostics("WebView2 login response JSON was invalid");
-            return S_OK;
-        };
-        super::log_bilibili_login_payload_shape(&payload);
-        handler.context.note_bilibili_login_response(&payload);
-        let Some(token) = super::bilibili_refresh_token_from_payload(&payload) else {
-            super::log_bilibili_capture_diagnostics("WebView2 login response had no refresh token");
-            return S_OK;
-        };
-        handler
-            .context
-            .accept_bilibili_refresh_token(&token, "WebView2 response");
         S_OK
     }
 
@@ -3905,15 +3992,17 @@ mod platform {
         Ok((browser_cookies, cookies))
     }
 
-    unsafe fn read_response_stream(stream: *mut c_void) -> Option<String> {
-        const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+    unsafe fn read_response_bytes(
+        stream: *mut c_void,
+        max_response_bytes: usize,
+    ) -> Option<Vec<u8>> {
         const CHUNK_SIZE: usize = 4096;
-        if stream.is_null() {
+        if stream.is_null() || max_response_bytes == 0 {
             return None;
         }
         let read: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *mut u32) -> HRESULT =
             vtable_fn(stream, 3);
-        let mut bytes = Vec::with_capacity(CHUNK_SIZE);
+        let mut bytes = Vec::with_capacity(CHUNK_SIZE.min(max_response_bytes));
         let mut chunk = [0u8; CHUNK_SIZE];
         loop {
             let mut count = 0u32;
@@ -3927,7 +4016,7 @@ mod platform {
                 return None;
             }
             let count = count as usize;
-            if count > CHUNK_SIZE || bytes.len().checked_add(count)? > MAX_RESPONSE_BYTES {
+            if count > CHUNK_SIZE || bytes.len().checked_add(count)? > max_response_bytes {
                 return None;
             }
             bytes.extend_from_slice(&chunk[..count]);
@@ -3935,7 +4024,12 @@ mod platform {
                 break;
             }
         }
-        String::from_utf8(bytes).ok()
+        Some(bytes)
+    }
+
+    unsafe fn read_response_stream(stream: *mut c_void) -> Option<String> {
+        const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+        String::from_utf8(unsafe { read_response_bytes(stream, MAX_RESPONSE_BYTES) }?).ok()
     }
 
     unsafe fn read_wide(value: *const u16) -> String {
@@ -4402,9 +4496,10 @@ mod tests {
         has_required_cookies, kugou_request_script, login_url, merge_qq_cookie_updates,
         merge_qq_login_response_fields, normalize_qq_cookie_aliases, parse_bilibili_login_payload,
         parse_execute_script_value, parse_qq_login_callback, parse_web_qr_probe_result,
-        qq_login_response_code, qq_login_response_data, should_complete_capture,
-        valid_bilibili_refresh_token, validate_kugou_request_url, web_qr_bridge_script,
-        web_qr_host_allowed, web_qr_probe_script, web_qr_url_allowed,
+        qq_login_response_code, qq_login_response_data, qq_web_qr_response_url,
+        should_complete_capture, valid_bilibili_refresh_token, validate_kugou_request_url,
+        web_qr_bridge_script, web_qr_host_allowed, web_qr_image_data_url_from_bytes,
+        web_qr_probe_script, web_qr_url_allowed,
     };
     use serde_json::{Value, json};
     use std::collections::BTreeMap;
@@ -4533,6 +4628,32 @@ mod tests {
         assert!(!bilibili_login_endpoint_url(
             "https://evil.example/x/passport-login/web/qrcode/poll"
         ));
+    }
+
+    #[test]
+    fn qq_qr_response_is_scoped_to_official_ptqrshow() {
+        assert!(qq_web_qr_response_url(
+            "https://xui.ptlogin2.qq.com/ssl/ptqrshow?appid=100497308"
+        ));
+        assert!(qq_web_qr_response_url(
+            "https://ptlogin2.qq.com/ptqrshow?appid=100497308"
+        ));
+        assert!(!qq_web_qr_response_url(
+            "https://xui.ptlogin2.qq.com/ssl/logo.png"
+        ));
+        assert!(!qq_web_qr_response_url(
+            "https://evil.example/ssl/ptqrshow?appid=100497308"
+        ));
+    }
+
+    #[test]
+    fn web_qr_image_response_accepts_only_supported_image_bytes() {
+        let png = b"\x89PNG\r\n\x1a\n";
+        assert_eq!(
+            web_qr_image_data_url_from_bytes(png).as_deref(),
+            Ok("data:image/png;base64,iVBORw0KGgo=")
+        );
+        assert!(web_qr_image_data_url_from_bytes(b"GIF89a").is_err());
     }
 
     #[test]

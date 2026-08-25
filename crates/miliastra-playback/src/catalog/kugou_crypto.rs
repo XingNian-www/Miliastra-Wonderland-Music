@@ -234,7 +234,18 @@ pub fn rsa_pkcs1_encrypt_hex(
     public_key_pem: &str,
 ) -> Result<String, KugouCryptoError> {
     let normalized_pem = public_key_pem.replace("\\n", "\n");
-    let key = rsa::RsaPublicKey::from_public_key_pem(&normalized_pem)
+    // The RSA crate rejects some valid PEM values when the Base64 body is
+    // unwrapped. Decode the DER payload directly so line wrapping is irrelevant.
+    let der = normalized_pem
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("-----"))
+        .flat_map(str::chars)
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    let der = base64::engine::general_purpose::STANDARD
+        .decode(der.as_bytes())
+        .map_err(|error| KugouCryptoError::RsaKey(error.to_string()))?;
+    let key = rsa::RsaPublicKey::from_public_key_der(&der)
         .map_err(|error| KugouCryptoError::RsaKey(error.to_string()))?;
     let encrypted = key
         .encrypt(&mut thread_rng(), Pkcs1v15Encrypt, plaintext)
@@ -459,6 +470,14 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(first.len(), 256);
         assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn rsa_pkcs1_accepts_unwrapped_lite_public_key() {
+        let encrypted =
+            rsa_pkcs1_encrypt_hex(b"{\"uid\":\"42\"}", KUGOU_LITE_RSA_PUBLIC_KEY).unwrap();
+        assert_eq!(encrypted.len(), 256);
+        assert!(encrypted.bytes().all(|byte| byte.is_ascii_hexdigit()));
     }
 
     #[test]

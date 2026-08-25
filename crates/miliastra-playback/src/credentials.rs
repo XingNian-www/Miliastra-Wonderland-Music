@@ -161,8 +161,11 @@ impl ProviderCredential {
                 require_allowed_cookie_names(
                     cookies,
                     &[
+                        "KuGoo",
+                        "dfid",
                         "KugouGUID",
                         "KUGOU_API_GUID",
+                        "KUGOU_API_DFID",
                         "KUGOU_API_MID",
                         "KUGOU_API_MAC",
                         "KUGOU_API_DEV",

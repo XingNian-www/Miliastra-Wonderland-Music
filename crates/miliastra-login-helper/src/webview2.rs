@@ -10,9 +10,7 @@ use reqwest::header::CONTENT_TYPE;
 use serde_json::{Value, json};
 use url::Url;
 
-use crate::native_qr::NativeQrEvent;
-
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum CaptureError {
     #[error("WebView2 Evergreen Runtime is missing")]
     RuntimeMissing,
@@ -24,6 +22,17 @@ pub enum CaptureError {
     Io(String),
 }
 
+/// A bounded request handed to the WebView2-only KuGou bridge.  Keeping this
+/// as a separate input type prevents request details from being encoded in the
+/// helper command line or mixed into the interactive login state machine.
+#[derive(Clone, Debug)]
+pub struct KugouRequestInput {
+    pub url: String,
+    pub userid: String,
+    pub mid: String,
+    pub cookies: BTreeMap<String, String>,
+}
+
 pub fn capture(
     provider: &str,
     profile: &Path,
@@ -33,13 +42,335 @@ pub fn capture(
     platform::capture(provider, profile, timeout, publish_qr_code)
 }
 
+pub fn request_kugou_json(
+    profile: &Path,
+    timeout: Duration,
+    url: &str,
+    userid: &str,
+    mid: &str,
+    cookies: &BTreeMap<String, String>,
+) -> Result<Value, CaptureError> {
+    let request_url = kugou_request_url(url)?;
+    let mut filtered_cookies = cookies
+        .iter()
+        .filter(|(name, value)| {
+            !value.trim().is_empty()
+                && matches!(
+                    name.as_str(),
+                    "KuGoo" | "dfid" | "kg_dfid" | "kg_mid" | "mid" | "KugouGUID" | "t1"
+                )
+        })
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect::<BTreeMap<_, _>>();
+    // The official KgUser/getBaseInfo scripts read these browser-cookie
+    // aliases, while captured credentials commonly expose the same values as
+    // `dfid`/`mid`.
+    if let Some(value) = filtered_cookies.get("dfid").cloned() {
+        filtered_cookies
+            .entry("kg_dfid".to_owned())
+            .or_insert(value);
+    }
+    if let Some(value) = filtered_cookies.get("mid").cloned() {
+        filtered_cookies.entry("kg_mid".to_owned()).or_insert(value);
+    }
+    let input = KugouRequestInput {
+        url: request_url,
+        userid: if userid.trim().is_empty() {
+            "0".to_owned()
+        } else {
+            userid.to_owned()
+        },
+        mid: if mid.trim().is_empty() {
+            "-".to_owned()
+        } else {
+            mid.to_owned()
+        },
+        cookies: filtered_cookies,
+    };
+    if input.cookies.is_empty() {
+        return Err(CaptureError::Io("酷狗 Web 请求没有可用 Cookie".to_owned()));
+    }
+    platform::request_kugou_json(profile, timeout, input)
+}
+
+fn validate_kugou_request_url(url: &str) -> Result<Url, CaptureError> {
+    let parsed =
+        Url::parse(url).map_err(|_| CaptureError::Io("酷狗 Web 请求 URL 无效".to_owned()))?;
+    let request_allowed = matches!(
+        (parsed.host_str(), parsed.path()),
+        (
+            Some("wwwapi.kugou.com" | "wwwapiretry.kugou.com"),
+            "/play/songinfo"
+        ) | (Some("kugouvip.kugou.com"), "/v1/get_union_vip")
+    );
+    if parsed.scheme() != "https" || !request_allowed {
+        return Err(CaptureError::Io(
+            "酷狗 Web 请求 URL 不在允许范围内".to_owned(),
+        ));
+    }
+    Ok(parsed)
+}
+
+fn kugou_request_url(url: &str) -> Result<String, CaptureError> {
+    let mut parsed = validate_kugou_request_url(url)?;
+    if parsed.host_str() == Some("wwwapi.kugou.com") {
+        parsed
+            .set_host(Some("wwwapiretry.kugou.com"))
+            .map_err(|_| CaptureError::Io("酷狗 Web 请求地址转换失败".to_owned()))?;
+    }
+    Ok(parsed.into())
+}
+
+/// Build the page-side request. The retry host is the normal browser path for
+/// a request that the primary host has marked with an SSA challenge. A request
+/// without a challenge is returned immediately; the page is not turned into a
+/// verification dialog merely because the endpoint returned a business error.
+fn kugou_request_script(input: &KugouRequestInput) -> Result<String, CaptureError> {
+    let url = serde_json::to_string(&input.url)
+        .map_err(|error| CaptureError::Io(format!("酷狗请求 URL 编码失败: {error}")))?;
+    let userid = serde_json::to_string(&input.userid)
+        .map_err(|error| CaptureError::Io(format!("酷狗请求用户标识编码失败: {error}")))?;
+    let mid = serde_json::to_string(&input.mid)
+        .map_err(|error| CaptureError::Io(format!("酷狗请求 MID 编码失败: {error}")))?;
+    Ok(format!(
+        r#"(() => {{
+          const initialRequestUrl = {url};
+          let requestUrl = initialRequestUrl;
+          const requestUserId = {userid};
+          const requestMid = {mid};
+          const verifyScript = 'https://staticssl.kugou.com/verify/static/js/verify.min.js?20200707';
+          const jqueryScript = 'https://staticssl.kugou.com/common/js/min/jquery-2.1.4.min.js';
+          const state = {{ challengeCount: 0 }};
+          const postResult = (value) => {{
+            try {{
+              if (window.chrome && window.chrome.webview) {{
+                window.chrome.webview.postMessage({{
+                  bridge: '__miliastra_login_helper__',
+                  kind: 'kugou_request_result',
+                  value
+                }});
+              }}
+            }} catch (_) {{}}
+          }};
+          const loadScript = (src) => new Promise((resolve, reject) => {{
+            const existing = [...document.scripts].find((node) => node.src.indexOf(src) === 0);
+            if (existing) {{
+              if (window.verifyObject && typeof window.verifyObject.init === 'function') resolve();
+              else {{ existing.addEventListener('load', resolve, {{once: true}}); existing.addEventListener('error', reject, {{once: true}}); }}
+              return;
+            }}
+            const node = document.createElement('script');
+            node.src = src;
+            node.onload = () => resolve();
+            node.onerror = () => reject(new Error('verify script load failed'));
+            (document.head || document.documentElement).appendChild(node);
+          }});
+          const cookieNames = () => [...new Set(document.cookie.split(';')
+            .map((part) => part.split('=')[0].trim()).filter(Boolean))].sort();
+          const safeSummary = (result) => {{
+            const body = result && result.body && typeof result.body === 'object'
+              ? result.body : {{}};
+            const headers = result && result.headers;
+            const headerPresent = (name) => !!(headers && headers.get(name));
+            const numberField = (names) => {{
+              for (const name of names) {{
+                if (body[name] !== undefined && body[name] !== null) return String(body[name]);
+              }}
+              return '';
+            }};
+            return {{
+              origin: String(location.origin || ''),
+              requestHost: (() => {{ try {{ return new URL(requestUrl).hostname; }} catch (_) {{ return ''; }} }})(),
+              httpStatus: Number(result && result.httpStatus || 0),
+              status: numberField(['status']),
+              code: numberField(['code']),
+              errCode: numberField(['err_code', 'error_code', 'errorCode']),
+              bodyKeys: Object.keys(body).sort().slice(0, 32),
+              ssaCodePresent: headerPresent('SSA-CODE'),
+              ssaHmidPresent: headerPresent('SSA-HMID'),
+              cookieNames: cookieNames()
+            }};
+          }};
+          const fetchJson = async () => {{
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), 10000);
+            try {{
+              const response = await fetch(requestUrl, {{
+                method: 'GET',
+                credentials: 'include',
+                headers: {{ 'Accept': 'application/json, text/plain, */*' }},
+                signal: controller.signal
+              }});
+              const body = await response.json();
+              return {{ body, headers: response.headers, httpStatus: response.status }};
+            }} finally {{ clearTimeout(timer); }}
+          }};
+          const challengeFields = (result) => {{
+            const body = result && result.body ? result.body : {{}};
+            const data = body && body.data && typeof body.data === 'object' ? body.data : {{}};
+            const headers = result && result.headers;
+            const pick = (names) => {{
+              for (const source of [data, body]) {{
+                for (const name of names) {{
+                  if (source && source[name]) return source[name];
+                }}
+              }}
+              return '';
+            }};
+            return {{
+              eventid: (pick(['SSA-CODE', 'ssa_code', 'ssaCode', 'eventid']) ||
+                (headers && headers.get('SSA-CODE')) || ''),
+              hmid: (pick(['SSA-HMID', 'ssa_hmid', 'ssaHmid', 'hmid']) ||
+                (headers && headers.get('SSA-HMID')) || requestMid)
+            }};
+          }};
+          const isChallenge = (result, fields) => {{
+            const body = result && result.body ? result.body : {{}};
+            const code = Number(body.err_code ?? body.error_code ?? body.errorCode ?? 0);
+            return (code === 30020 || code === 20028) && !!fields.eventid;
+          }};
+          const runChallenge = (fields) => new Promise((resolve, reject) => {{
+            const callbackName = '__miliastra_kugou_verify_' + Date.now() + '_' + Math.random().toString(16).slice(2);
+            window[callbackName] = (value) => {{
+              try {{
+                delete window[callbackName];
+                if (value && Number(value.status) === 1) resolve();
+                else reject(new Error('verification rejected'));
+              }} catch (error) {{ reject(error); }}
+            }};
+            const invoke = () => {{
+              try {{
+                window.verifyObject.init(1014, fields.hmid || requestMid,
+                  requestUserId || '0', fields.eventid, callbackName, true);
+              }} catch (error) {{ reject(error); }}
+            }};
+            if (window.verifyObject && typeof window.verifyObject.init === 'function') invoke();
+            else loadScript(jqueryScript).catch(() => {{}}).then(() => loadScript(verifyScript)).then(invoke).catch(reject);
+          }});
+          const run = async () => {{
+            for (;;) {{
+              const result = await fetchJson();
+              const fields = challengeFields(result);
+              const diagnostics = safeSummary(result);
+              if (!isChallenge(result, fields)) return {{ ok: true, body: result.body, diagnostics }};
+              if (state.challengeCount++ >= 2) return {{ ok: false, message: 'challenge limit exceeded', diagnostics }};
+              try {{
+                await runChallenge(fields);
+              }} catch (error) {{
+                return {{
+                  ok: false,
+                  retry: true,
+                  message: String(error && error.message || error),
+                  diagnostics
+                }};
+              }}
+              // KgUser.search switches from the primary API host to the
+              // retry host after antiBrush succeeds. songinfo follows the
+              // same browser-side contract.
+              try {{
+                const retry = new URL(requestUrl);
+                if (retry.hostname === 'wwwapi.kugou.com') {{
+                  retry.hostname = 'wwwapiretry.kugou.com';
+                  requestUrl = retry.toString();
+                }}
+              }} catch (_) {{}}
+            }}
+          }};
+          run().then(postResult).catch((error) => postResult({{
+            ok: false,
+            retry: true,
+            message: String(error && error.message || error),
+            diagnostics: {{
+              origin: String(location.origin || ''),
+              requestHost: (() => {{ try {{ return new URL(requestUrl).hostname; }} catch (_) {{ return ''; }} }})(),
+              httpStatus: 0,
+              status: '',
+              code: '',
+              errCode: '',
+              bodyKeys: [],
+              ssaCodePresent: false,
+              ssaHmidPresent: false,
+              cookieNames: cookieNames()
+            }}
+          }}));
+          // ExecuteScript does not await a returned Promise. The actual
+          // result is delivered through WebMessageReceived above.
+          return true;
+        }})()"#,
+        url = url,
+        userid = userid,
+        mid = mid,
+    ))
+}
+
+fn log_kugou_request_diagnostics(value: &Value) {
+    if std::env::var_os("MILIASTRA_LOGIN_HELPER_DIAGNOSTICS").is_none() {
+        return;
+    }
+    let Some(summary) = value.get("diagnostics") else {
+        eprintln!("[kugou-web-request] browser response had no diagnostics");
+        return;
+    };
+    let fields = [
+        ("origin", summary.get("origin")),
+        ("requestHost", summary.get("requestHost")),
+        ("httpStatus", summary.get("httpStatus")),
+        ("status", summary.get("status")),
+        ("code", summary.get("code")),
+        ("errCode", summary.get("errCode")),
+        ("ssaCodePresent", summary.get("ssaCodePresent")),
+        ("ssaHmidPresent", summary.get("ssaHmidPresent")),
+        ("bodyKeys", summary.get("bodyKeys")),
+        ("cookieNames", summary.get("cookieNames")),
+    ]
+    .into_iter()
+    .filter_map(|(name, value)| value.map(|value| format!("{name}={value}")))
+    .collect::<Vec<_>>()
+    .join(" ");
+    eprintln!("[kugou-web-request] browser {fields}");
+}
+
+fn log_kugou_script_result_shape(raw: &str, parsed: Option<&Value>) {
+    if std::env::var_os("MILIASTRA_LOGIN_HELPER_DIAGNOSTICS").is_none() {
+        return;
+    }
+    let outer = serde_json::from_str::<Value>(raw).ok();
+    let outer_shape = outer
+        .as_ref()
+        .map(|value| match value {
+            Value::Null => "null".to_owned(),
+            Value::Bool(_) => "bool".to_owned(),
+            Value::Number(_) => "number".to_owned(),
+            Value::String(value) => format!("string(len={})", value.len()),
+            Value::Array(value) => format!("array(len={})", value.len()),
+            Value::Object(value) => format!("object(keys={})", value.len()),
+        })
+        .unwrap_or_else(|| "invalid-json".to_owned());
+    let parsed_shape = parsed
+        .map(|value| match value {
+            Value::Null => "null".to_owned(),
+            Value::Bool(_) => "bool".to_owned(),
+            Value::Number(_) => "number".to_owned(),
+            Value::String(value) => format!("string(len={})", value.len()),
+            Value::Array(value) => format!("array(len={})", value.len()),
+            Value::Object(value) => format!("object(keys={})", value.len()),
+        })
+        .unwrap_or_else(|| "none".to_owned());
+    eprintln!(
+        "[kugou-web-request] ExecuteScript result raw_len={} outer={} parsed={}",
+        raw.len(),
+        outer_shape,
+        parsed_shape
+    );
+}
+
 fn login_url(provider: &str) -> Option<&'static str> {
     match provider {
-        // The public QQ Music page wraps this same official QR login in two
-        // cross-origin iframes. Opening the provider's QR page directly lets
-        // WebView2 inspect the image without a native MQTT implementation.
+        // The OAuth document owns the ptlogin iframe and redirects the top
+        // level document to wx_redirect.html after a successful scan. Opening
+        // the iframe's xlogin document directly loses that parent callback.
         "qqmusic" => Some(
-            "https://xui.ptlogin2.qq.com/cgi-bin/xlogin?appid=716027609&daid=383&style=33&login_text=%E7%99%BB%E5%BD%95&hide_title_bar=1&hide_border=1&target=self&s_url=https%3A%2F%2Fgraph.qq.com%2Foauth2.0%2Flogin_jump&pt_3rd_aid=100497308&pt_feedback_link=https%3A%2F%2Fsupport.qq.com%2Fproducts%2F77942%3FcustomInfo%3D.appid100497308&theme=2&verify_theme=",
+            "https://graph.qq.com/oauth2.0/authorize?response_type=code&client_id=100497308&redirect_uri=https%3A%2F%2Fy.qq.com%2Fportal%2Fwx_redirect.html%3Flogin_type%3D1%26surl%3Dhttps%253A%252F%252Fy.qq.com%252Fn%252Fryqq_v2%252Fprofile&state=state&display=pc&scope=get_user_info%2Cget_app_friends",
         ),
         "netease" => Some("https://music.163.com/"),
         "bilibili" => Some("https://www.bilibili.com/"),
@@ -55,6 +386,286 @@ fn login_url(provider: &str) -> Option<&'static str> {
 const WEB_QR_PROBE_INTERVAL: Duration = Duration::from_millis(250);
 const WEB_QR_SCRIPT_TIMEOUT: Duration = Duration::from_secs(3);
 const WEB_QR_FETCH_TIMEOUT: Duration = Duration::from_secs(8);
+const WEB_QR_SCRIPT_INSTALL_FALLBACK: Duration = Duration::from_millis(750);
+const WEB_QR_REPEAT_FETCH_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Install before the first navigation so QR images and Bilibili's browser
+/// refresh token can be reported through the top-level WebView2 host bridge.
+/// It only observes Bilibili's documented login response and exact storage
+/// keys; it never reads document cookies or arbitrary page storage.
+fn web_qr_bridge_script() -> &'static str {
+    r#"(() => {
+      const bridge = '__miliastra_login_helper__';
+      const isTop = window === window.top;
+      const post = (payload) => {
+        const message = Object.assign({bridge, frameUrl: String(location.href)}, payload);
+        try {
+          if (isTop && window.chrome && window.chrome.webview) {
+            window.chrome.webview.postMessage(message);
+          } else if (window.top) {
+            window.top.postMessage(message, '*');
+          }
+        } catch (_) {}
+      };
+
+      // A child frame cannot call the host bridge reliably on every Runtime.
+      // Forward its bounded QR/login payload to the injected top-level bridge.
+      if (isTop) {
+        window.addEventListener('message', (event) => {
+          const data = event && event.data;
+          if (data && data.bridge === bridge &&
+              (data.kind === 'qr' || data.kind === 'qq_callback' ||
+               data.kind === 'bilibili_refresh')) {
+            post({kind: data.kind, value: String(data.value || ''),
+              frameUrl: String(data.frameUrl || '')});
+          }
+        }, true);
+        window.addEventListener('message', (event) => {
+          if (typeof (event && event.data) === 'string' &&
+              event.data.indexOf('qclogin_success') >= 0) {
+            post({kind: 'qq_event', value: event.data});
+          }
+        }, true);
+      }
+
+      const bilibiliHost = () => {
+        const host = String(location.hostname || '').toLowerCase();
+        return host === 'bilibili.com' || host.endsWith('.bilibili.com');
+      };
+      let lastBilibiliRefresh = '';
+      const emitBilibiliRefresh = (value) => {
+        value = String(value || '').trim();
+        if (!value || value.length > 1024 || value === lastBilibiliRefresh) return;
+        lastBilibiliRefresh = value;
+        post({kind: 'bilibili_refresh', value});
+      };
+      const refreshFromLoginPayload = (payload) => {
+        if (!payload || typeof payload !== 'object') return '';
+        const sources = [payload, payload.data, payload.data && payload.data.data,
+          payload.result];
+        for (const source of sources) {
+          if (!source || typeof source !== 'object') continue;
+          for (const name of ['refresh_token', 'refreshToken', 'ac_time_value']) {
+            const value = source[name];
+            if (typeof value === 'string' && value.trim()) return value;
+          }
+        }
+        return '';
+      };
+      const parseBilibiliLoginPayload = (text) => {
+        const normalized = String(text || '').trim().replace(/^\)\]\}',?\s*/, '');
+        if (!normalized) return null;
+        try { return JSON.parse(normalized); } catch (_) {}
+        const wrapped = normalized.match(/^[^(]+\(([\s\S]*)\)\s*;?\s*$/);
+        if (!wrapped) return null;
+        try { return JSON.parse(wrapped[1]); } catch (_) { return null; }
+      };
+      const isBilibiliLoginEndpoint = (raw) => {
+        try {
+          const url = new URL(String(raw || ''), location.href);
+          const host = String(url.hostname || '').toLowerCase();
+          if (host !== 'bilibili.com' && !host.endsWith('.bilibili.com')) return false;
+          return url.pathname === '/x/passport-login/web/qrcode/poll' ||
+            url.pathname === '/x/passport-login/web/cookie/refresh';
+        } catch (_) {
+          return false;
+        }
+      };
+      const inspectBilibiliLoginResponse = (url, text) => {
+        if (!isBilibiliLoginEndpoint(url) || !text || text.length > 65536) return;
+        const payload = parseBilibiliLoginPayload(text);
+        if (payload) emitBilibiliRefresh(refreshFromLoginPayload(payload));
+      };
+      const inspectBilibiliStorage = () => {
+        if (!bilibiliHost()) return;
+        for (const store of [window.localStorage, window.sessionStorage]) {
+          try {
+            for (const name of ['ac_time_value', 'refresh_token', 'refreshToken']) {
+              const value = store.getItem(name);
+              if (value) {
+                emitBilibiliRefresh(value);
+                return;
+              }
+            }
+          } catch (_) {}
+        }
+      };
+      const installBilibiliRefreshCapture = () => {
+        if (!bilibiliHost()) return;
+        const fetchMarker = '__miliastraBilibiliRefreshCapture';
+        try {
+          const currentFetch = window.fetch;
+          if (typeof currentFetch === 'function' && !currentFetch[fetchMarker]) {
+            const wrappedFetch = function(input) {
+              const result = currentFetch.apply(this, arguments);
+              try {
+                const url = input && input.url ? input.url : input;
+                if (isBilibiliLoginEndpoint(url)) {
+                  Promise.resolve(result).then((response) => {
+                    if (!response || typeof response.clone !== 'function') return '';
+                    return response.clone().text();
+                  }).then((text) => inspectBilibiliLoginResponse(url, text)).catch(() => {});
+                }
+              } catch (_) {}
+              return result;
+            };
+            try { Object.defineProperty(wrappedFetch, fetchMarker, {value: true}); }
+            catch (_) { wrappedFetch[fetchMarker] = true; }
+            window.fetch = wrappedFetch;
+          }
+          const xhrPrototype = window.XMLHttpRequest && window.XMLHttpRequest.prototype;
+          if (xhrPrototype && !xhrPrototype.__miliastraBilibiliXhrCapture) {
+            const xhrUrls = new WeakMap();
+            const originalOpen = xhrPrototype.open;
+            const originalSend = xhrPrototype.send;
+            xhrPrototype.__miliastraBilibiliXhrCapture = true;
+            xhrPrototype.open = function(method, url) {
+              xhrUrls.set(this, String(url || ''));
+              return originalOpen.apply(this, arguments);
+            };
+            xhrPrototype.send = function() {
+              const url = xhrUrls.get(this);
+              if (isBilibiliLoginEndpoint(url) && !this.__miliastraBilibiliRefreshListener) {
+                this.__miliastraBilibiliRefreshListener = true;
+                this.addEventListener('loadend', () => {
+                  try {
+                    const text = typeof this.responseText === 'string'
+                      ? this.responseText
+                      : (this.response && typeof this.response === 'object'
+                        ? JSON.stringify(this.response) : '');
+                    inspectBilibiliLoginResponse(url, text);
+                  } catch (_) {}
+                }, {once: true});
+              }
+              return originalSend.apply(this, arguments);
+            };
+          }
+        } catch (_) {}
+        inspectBilibiliStorage();
+      };
+      installBilibiliRefreshCapture();
+
+      const visible = (node) => {
+        if (!node) return false;
+        const style = getComputedStyle(node);
+        const rect = node.getBoundingClientRect();
+        return style.display !== 'none' && style.visibility !== 'hidden' &&
+          style.opacity !== '0' && rect.width >= 80 && rect.height >= 80;
+      };
+      const clickable = (node) => {
+        if (!node) return false;
+        const style = getComputedStyle(node);
+        const rect = node.getBoundingClientRect();
+        return style.display !== 'none' && style.visibility !== 'hidden' &&
+          style.opacity !== '0' && rect.width > 0 && rect.height > 0;
+      };
+
+      const bilibiliLogin = () => {
+        // Bilibili moved the login entry from an anchor/button to several
+        // clickable div variants. Prefer stable classes before text fallback.
+        const selectors = [
+          '.right-entry__outside.go-login-btn',
+          '.header-login-entry',
+          'div.login-btn',
+          '[class*="go-login-btn"]',
+          '[class*="header-login-entry"]',
+          '[class*="login-btn"]'
+        ];
+        for (const selector of selectors) {
+          const node = [...document.querySelectorAll(selector)].find((item) =>
+            clickable(item) && !item.dataset.miliastraQrClicked);
+          if (node) return node;
+        }
+        return [...document.querySelectorAll('a,button,[role="button"],div')].find((node) =>
+          clickable(node) && !node.dataset.miliastraQrClicked &&
+          /^(登录|立即登录)$/.test((node.innerText || '').trim()));
+      };
+      const square = (width, height) => width >= 80 && height >= 80 &&
+        Math.max(width, height) / Math.max(1, Math.min(width, height)) <= 1.35;
+      const imageSource = (node) => String(
+        node.currentSrc || node.src || node.getAttribute('data-src') ||
+        node.getAttribute('data-url') || ''
+      ).trim();
+      let last = '';
+      let lastEmittedAt = 0;
+      const emit = (value) => {
+        value = String(value || '').trim();
+        const now = Date.now();
+        if (!value || (value === last && now - lastEmittedAt < 2000)) return;
+        last = value;
+        lastEmittedAt = now;
+        post({kind: 'qr', value});
+      };
+      const probe = () => {
+        installBilibiliRefreshCapture();
+        if (location.hostname === 'www.bilibili.com' ||
+            location.hostname === 'bilibili.com') {
+          const login = bilibiliLogin();
+          if (login) {
+            login.dataset.miliastraQrClicked = '1';
+            try { login.click(); } catch (_) {}
+          }
+        }
+        const candidates = [];
+        const markedSelectors = [
+          'img.qrImg', '#qrlogin_img', 'img[alt*="二维码"]',
+          'img[alt*="QR"]', '[class*="qr"] img', '[id*="qr"] img'
+        ];
+        for (const selector of markedSelectors) {
+          for (const node of document.querySelectorAll(selector)) {
+            if (!visible(node)) continue;
+            const rect = node.getBoundingClientRect();
+            const width = node.naturalWidth || rect.width;
+            const height = node.naturalHeight || rect.height;
+            if (!square(width, height)) continue;
+            const source = imageSource(node);
+            if (source) candidates.push({score: 240, value: source});
+          }
+        }
+        for (const node of document.querySelectorAll('canvas')) {
+          if (!visible(node)) continue;
+          const rect = node.getBoundingClientRect();
+          const width = node.width || rect.width;
+          const height = node.height || rect.height;
+          if (!square(width, height)) continue;
+          try {
+            const value = node.toDataURL('image/png');
+            if (value.startsWith('data:image/png;base64,')) {
+              candidates.push({score: 180, value});
+            }
+          } catch (_) {}
+        }
+        for (const node of document.querySelectorAll('img')) {
+          if (!visible(node)) continue;
+          const rect = node.getBoundingClientRect();
+          const width = node.naturalWidth || rect.width;
+          const height = node.naturalHeight || rect.height;
+          if (!square(width, height)) continue;
+          const source = imageSource(node);
+          if (!source || source.startsWith('data:image/svg')) continue;
+          const marker = [node.id, node.className, node.alt, node.title,
+            node.getAttribute('aria-label')].join(' ').toLowerCase();
+          const marked = /qr|qrcode|qrlogin|二维码|登录二维码/.test(marker);
+          const inline = source.startsWith('data:image/png') ||
+            source.startsWith('data:image/jpeg');
+          if (!marked && !inline) continue;
+          candidates.push({score: marked ? (inline ? 220 : 200) : 120, value: source});
+        }
+        candidates.sort((left, right) => right.score - left.score);
+        if (candidates.length) emit(candidates[0].value);
+        if (location.hostname === 'graph.qq.com' &&
+            new URLSearchParams(location.search).has('code')) {
+          post({kind: 'qq_callback', value: String(location.href)});
+        }
+      };
+      probe();
+      try {
+        new MutationObserver(probe).observe(document.documentElement || document,
+          {subtree: true, childList: true, attributes: true});
+      } catch (_) {}
+      setInterval(probe, 500);
+    })()"#
+}
 
 /// Extract a QR image from the provider page currently displayed in WebView2.
 /// NetEase needs its login link clicked first; QQ and KuGou expose an image on
@@ -69,6 +680,31 @@ fn web_qr_probe_script() -> &'static str {
         return style.display !== 'none' && style.visibility !== 'hidden' &&
           style.opacity !== '0' && rect.width >= 80 && rect.height >= 80;
       };
+      const clickable = (node) => {
+        if (!node) return false;
+        const style = getComputedStyle(node);
+        const rect = node.getBoundingClientRect();
+        return style.display !== 'none' && style.visibility !== 'hidden' &&
+          style.opacity !== '0' && rect.width > 0 && rect.height > 0;
+      };
+      const bilibiliLogin = () => {
+        const selectors = [
+          '.right-entry__outside.go-login-btn',
+          '.header-login-entry',
+          'div.login-btn',
+          '[class*="go-login-btn"]',
+          '[class*="header-login-entry"]',
+          '[class*="login-btn"]'
+        ];
+        for (const selector of selectors) {
+          const node = [...document.querySelectorAll(selector)].find((item) =>
+            clickable(item) && !item.dataset.miliastraQrClicked);
+          if (node) return node;
+        }
+        return [...document.querySelectorAll('a,button,[role="button"],div')].find((node) =>
+          clickable(node) && !node.dataset.miliastraQrClicked &&
+          /^(登录|立即登录)$/.test((node.innerText || '').trim()));
+      };
       const square = (width, height) => width >= 80 && height >= 80 &&
         Math.max(width, height) / Math.max(1, Math.min(width, height)) <= 1.35;
       const wait = () => ({kind: 'wait'});
@@ -82,7 +718,17 @@ fn web_qr_probe_script() -> &'static str {
           ![...document.querySelectorAll('[role="dialog"]')].some(visible)) {
         const login = document.querySelector('[data-action="login"]') ||
           [...document.querySelectorAll('a,button,[role="button"]')].find((node) =>
-            visible(node) && /^(登录|立即登录)$/.test((node.innerText || '').trim()));
+            clickable(node) && /^(登录|立即登录)$/.test((node.innerText || '').trim()));
+        if (login && !login.dataset.miliastraQrClicked) {
+          login.dataset.miliastraQrClicked = '1';
+          login.click();
+          return wait();
+        }
+      }
+      if ((location.hostname === 'www.bilibili.com' ||
+           location.hostname === 'bilibili.com') &&
+           ![...document.querySelectorAll('img[alt*="二维码"], img[alt*="QR"]')].some(visible)) {
+        const login = bilibiliLogin();
         if (login && !login.dataset.miliastraQrClicked) {
           login.dataset.miliastraQrClicked = '1';
           login.click();
@@ -135,6 +781,7 @@ fn web_qr_host_allowed(provider: &str, host: &str) -> bool {
         "qqmusic" => &["qq.com"],
         "netease" => &["163.com", "126.net"],
         "kugou" => &["kugou.com"],
+        "bilibili" => &["bilibili.com", "hdslb.com"],
         _ => &[],
     };
     suffixes
@@ -149,23 +796,146 @@ fn web_qr_url_allowed(provider: &str, url: &Url) -> bool {
             .is_some_and(|host| web_qr_host_allowed(provider, host))
 }
 
+fn web_qr_message_source_allowed(provider: &str, source: &str, frame_url: &str) -> bool {
+    [source, frame_url].into_iter().any(|raw| {
+        Url::parse(raw).ok().is_some_and(|url| {
+            matches!(url.scheme(), "https" | "http")
+                && url
+                    .host_str()
+                    .is_some_and(|host| web_qr_host_allowed(provider, host))
+        })
+    })
+}
+
+fn bilibili_login_endpoint_url(raw: &str) -> bool {
+    Url::parse(raw).ok().is_some_and(|url| {
+        url.host_str()
+            .is_some_and(|host| web_qr_host_allowed("bilibili", host))
+            && matches!(
+                url.path(),
+                "/x/passport-login/web/qrcode/poll" | "/x/passport-login/web/cookie/refresh"
+            )
+    })
+}
+
+fn parse_bilibili_login_payload(text: &str) -> Option<Value> {
+    let text = text.trim().trim_start_matches('\u{feff}');
+    let text = text
+        .strip_prefix(")]}',")
+        .or_else(|| text.strip_prefix(")]}'\n"))
+        .unwrap_or(text)
+        .trim();
+    if text.is_empty() {
+        return None;
+    }
+    if let Ok(value) = serde_json::from_str(text) {
+        return Some(value);
+    }
+    let open = text.find('(')?;
+    let close = text.rfind(')')?;
+    (close > open).then(|| serde_json::from_str(&text[open + 1..close]).ok())?
+}
+
+fn bilibili_refresh_token_from_payload(payload: &Value) -> Option<String> {
+    fn visit(value: &Value, depth: u8) -> Option<String> {
+        if depth > 3 {
+            return None;
+        }
+        let object = value.as_object()?;
+        for name in ["refresh_token", "refreshToken", "ac_time_value", "token"] {
+            if let Some(token) = object
+                .get(name)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|token| valid_bilibili_refresh_token(token))
+            {
+                return Some(token.to_owned());
+            }
+        }
+        for name in ["data", "result"] {
+            if let Some(child) = object.get(name)
+                && let Some(token) = visit(child, depth + 1)
+            {
+                return Some(token);
+            }
+        }
+        None
+    }
+
+    visit(payload, 0)
+}
+
+fn bilibili_login_payload_is_success(payload: &Value) -> bool {
+    payload
+        .get("data")
+        .and_then(Value::as_object)
+        .and_then(|data| data.get("code"))
+        .is_some_and(|code| code.as_i64() == Some(0) || code.as_str() == Some("0"))
+}
+
+fn log_bilibili_login_payload_shape(payload: &Value) {
+    if std::env::var_os("MILIASTRA_LOGIN_HELPER_DIAGNOSTICS").is_none() {
+        return;
+    }
+    let top_code = payload
+        .get("code")
+        .map(Value::to_string)
+        .unwrap_or_else(|| "missing".to_owned());
+    let data = payload.get("data").and_then(Value::as_object);
+    let data_code = data
+        .and_then(|object| object.get("code"))
+        .map(Value::to_string)
+        .unwrap_or_else(|| "missing".to_owned());
+    let data_keys = data
+        .map(|object| {
+            object
+                .keys()
+                .take(32)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default();
+    eprintln!(
+        "[bilibili-capture] login response shape top_code={top_code} data_code={data_code} data_keys={data_keys}"
+    );
+}
+
 fn validate_web_qr_data_url(value: &str) -> Result<String, String> {
     miliastra_login_protocol::validate_qr_image_data_url(value)
         .map_err(|_| "网页登录二维码图片格式无效".to_owned())?;
     Ok(value.to_owned())
 }
 
-fn parse_web_qr_probe_result(raw: &str) -> Option<(String, String)> {
-    let mut value = serde_json::from_str::<Value>(raw).ok()?;
-    // Some WebView2 Runtime versions serialize an object returned from
-    // ExecuteScript as a quoted JSON string. Accept both wire forms.
-    if let Value::String(encoded) = value {
-        value = serde_json::from_str(&encoded).ok()?;
+fn valid_bilibili_refresh_token(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty()
+        && value.len() <= BILIBILI_REFRESH_TOKEN_MAX_LEN
+        && value.bytes().all(|byte| byte.is_ascii_graphic())
+}
+
+fn log_bilibili_capture_diagnostics(detail: &str) {
+    if std::env::var_os("MILIASTRA_LOGIN_HELPER_DIAGNOSTICS").is_some() {
+        eprintln!("[bilibili-capture] {detail}");
     }
+}
+
+fn parse_web_qr_probe_result(raw: &str) -> Option<(String, String)> {
+    let value = parse_execute_script_value(raw)?;
     let object = value.as_object()?;
     let kind = object.get("kind")?.as_str()?.to_owned();
     let value = object.get("value")?.as_str()?.to_owned();
     (kind == "image" && !value.trim().is_empty()).then_some((kind, value))
+}
+
+// WebView2 may return the script result as either a JSON value or a quoted
+// JSON string containing that value, depending on the runtime version.
+fn parse_execute_script_value(raw: &str) -> Option<Value> {
+    let value = serde_json::from_str::<Value>(raw).ok()?;
+    match value {
+        Value::String(encoded) => serde_json::from_str(&encoded).ok(),
+        value => Some(value),
+    }
 }
 
 /// Download an image URL discovered in the WebView2 DOM. This is only an
@@ -322,11 +1092,21 @@ fn has_required_cookies(provider: &str, cookies: &BTreeMap<String, String>) -> b
                 && has_any_nonempty(cookies, &["qqmusic_key", "qm_keyst", "lqm_keyst"])
         }
         "netease" => has_any_nonempty(cookies, &["MUSIC_U"]),
-        "bilibili" => has_any_nonempty(cookies, &["SESSDATA"]),
-        "kugou" => cookies.get("KuGoo").is_some_and(|value| {
-            let value = decode_kugou_cookie_value(value);
-            !value.is_empty() && value.contains("t=") && value.contains("KugooID=")
-        }),
+        // Bilibili assigns an anonymous SESSDATA-like session before QR
+        // login completes. DedeUserID is only present after the account
+        // session has been established, so requiring both prevents the
+        // refresh-token probe from timing out while the user is still
+        // looking at the QR code.
+        "bilibili" => {
+            has_any_nonempty(cookies, &["SESSDATA"]) && has_any_nonempty(cookies, &["DedeUserID"])
+        }
+        "kugou" => {
+            let web_cookie = cookies.get("KuGoo").is_some_and(|value| {
+                let value = decode_kugou_cookie_value(value);
+                !value.is_empty() && value.contains("t=") && value.contains("KugooID=")
+            });
+            web_cookie
+        }
         _ => false,
     }
 }
@@ -349,9 +1129,11 @@ fn has_any_nonempty(cookies: &BTreeMap<String, String>, aliases: &[&str]) -> boo
 
 const COOKIE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// B 站将 refresh_token 存在页面 localStorage/sessionStorage（键名
-/// ac_time_value），cookie 是否下发不稳定。登录完成后最多探测这么多次
-/// 读取它（约 6 秒），拿不到则按基础 cookie 判定正常完成。
-const BILIBILI_JS_PROBE_ATTEMPTS: u32 = 12;
+/// ac_time_value），cookie 是否下发不稳定。登录完成后保持一段受限探测，
+/// 但绝不把缺少 refresh_token 的基础 Cookie 当成完整登录结果。
+const BILIBILI_JS_PROBE_ATTEMPTS: u32 = 24;
+const BILIBILI_JS_PROBE_INTERVAL: Duration = Duration::from_millis(750);
+const BILIBILI_REFRESH_TOKEN_MAX_LEN: usize = 1024;
 const QQ_REFRESH_COOKIE_GRACE_PERIOD: Duration = Duration::from_secs(3);
 const QQ_LOGIN_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(15);
 const QQ_WEB_REFRESH_URL: &str = "https://c.y.qq.com/base/fcgi-bin/login_get_musickey.fcg";
@@ -1090,6 +1872,12 @@ fn should_complete_capture(
     if refresh_ready {
         return true;
     }
+    // The Bilibili refresh token is part of the persisted credential, not an
+    // optional enhancement. Cookie polling drives a bounded browser probe
+    // and reports an explicit capture failure when that probe is exhausted.
+    if provider == "bilibili" {
+        return false;
+    }
     let seen_at = required_seen_at.get_or_insert(now);
     now.duration_since(*seen_at) >= QQ_REFRESH_COOKIE_GRACE_PERIOD
 }
@@ -1097,7 +1885,9 @@ fn should_complete_capture(
 #[cfg(windows)]
 #[allow(unsafe_op_in_unsafe_fn)]
 mod platform {
-    use super::{CaptureError, NativeQrEvent, allowed_cookie_names, login_url};
+    use super::{
+        CaptureError, KugouRequestInput, allowed_cookie_names, kugou_request_script, login_url,
+    };
     use std::collections::BTreeMap;
     use std::ffi::{OsStr, c_void};
     use std::mem::{size_of, transmute_copy};
@@ -1110,6 +1900,8 @@ mod platform {
     use std::thread;
     use std::time::{Duration, Instant};
 
+    use serde_json::Value;
+    use url::Url;
     use windows_sys::Win32::Foundation::{
         E_INVALIDARG, E_NOINTERFACE, HWND, LPARAM, RECT, S_FALSE, S_OK, WPARAM,
     };
@@ -1179,6 +1971,30 @@ mod platform {
         data3: 0x4c6a,
         data4: [0xa5, 0x0b, 0x7c, 0x2e, 0x1d, 0x9f, 0x08, 0x53],
     };
+    const IID_WEB_MESSAGE_HANDLER: GUID = GUID {
+        data1: 0x57213f19,
+        data2: 0x00e6,
+        data3: 0x49fa,
+        data4: [0x8e, 0x07, 0x89, 0x8e, 0xa0, 0x1e, 0xcb, 0xd2],
+    };
+    const IID_SCRIPT_INSTALL_HANDLER: GUID = GUID {
+        data1: 0xb99369f3,
+        data2: 0x9b11,
+        data3: 0x47b5,
+        data4: [0xbc, 0x6f, 0x8e, 0x78, 0x95, 0xfc, 0xea, 0x17],
+    };
+    const IID_WEB_RESOURCE_RESPONSE_RECEIVED_HANDLER: GUID = GUID {
+        data1: 0x7de9898a,
+        data2: 0x24f5,
+        data3: 0x40c3,
+        data4: [0xa2, 0xde, 0xd4, 0xf4, 0x58, 0xe6, 0x98, 0x28],
+    };
+    const IID_WEB_RESOURCE_CONTENT_HANDLER: GUID = GUID {
+        data1: 0x875738e1,
+        data2: 0x9fa2,
+        data3: 0x40e3,
+        data4: [0x8b, 0x74, 0x2e, 0x89, 0x72, 0xdd, 0x6f, 0xe7],
+    };
 
     type HandlerQueryInterface =
         unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT;
@@ -1191,6 +2007,7 @@ mod platform {
     enum ScriptPurpose {
         BilibiliToken,
         WebQr,
+        KugouRequest,
     }
 
     #[repr(C)]
@@ -1220,34 +2037,32 @@ mod platform {
         outcome: Option<Result<BTreeMap<String, String>, CaptureError>>,
         js_probe_inflight: bool,
         bilibili_js_probe_attempts: u32,
+        bilibili_login_succeeded: bool,
+        bilibili_refresh_token: Option<String>,
         web_qr_probe_inflight: bool,
         web_qr_probe_started_at: Option<Instant>,
         web_qr_next_probe: Option<Instant>,
         web_qr_fetch_rx: Option<mpsc::Receiver<Result<String, String>>>,
         web_qr_fetch_source: Option<String>,
+        web_qr_last_fetch_at: Option<Instant>,
         web_qr_pending: Option<String>,
         web_qr_published: Option<String>,
         web_qr_failures: u8,
-        native_qr_rx: Option<mpsc::Receiver<NativeQrEvent>>,
-        native_qr_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        web_message_token: Option<i64>,
+        web_resource_response_token: Option<i64>,
+        script_install_started_at: Option<Instant>,
+        navigation_started: bool,
+        request_script_inflight: bool,
+        request_next_attempt: Option<Instant>,
+        request_outcome: Option<Result<Value, CaptureError>>,
     }
 
     struct CaptureContext {
         provider: String,
         url: Vec<u16>,
-        html: Option<Vec<u16>>,
         hwnd: HWND,
+        kugou_request: Option<KugouRequestInput>,
         state: Mutex<CaptureState>,
-    }
-
-    impl Drop for CaptureContext {
-        fn drop(&mut self) {
-            if let Ok(state) = self.state.lock()
-                && let Some(cancel) = state.native_qr_cancel.as_ref()
-            {
-                cancel.store(true, std::sync::atomic::Ordering::Release);
-            }
-        }
     }
 
     impl CaptureContext {
@@ -1262,26 +2077,39 @@ mod platform {
             Ok(Self {
                 provider: provider.to_owned(),
                 url: wide(url),
-                html: None,
                 hwnd,
+                kugou_request: None,
                 state: Mutex::new(CaptureState::default()),
             })
         }
 
-        fn new_with_html(provider: &str, hwnd: HWND, html: &str) -> Result<Self, CaptureError> {
+        fn new_kugou_request(hwnd: HWND, input: KugouRequestInput) -> Result<Self, CaptureError> {
+            // Execute the request from the API origin itself.  The KuGou API
+            // response does not consistently grant credentialed CORS from
+            // www.kugou.com, while a WebView2 page loaded at the request URL
+            // keeps the browser cookie jar and makes the request same-origin.
+            let navigation_url = input.url.clone();
             Ok(Self {
-                provider: provider.to_owned(),
-                url: Vec::new(),
-                html: Some(wide(html)),
+                provider: "kugou".to_owned(),
+                url: wide(&navigation_url),
                 hwnd,
+                kugou_request: Some(input),
                 state: Mutex::new(CaptureState::default()),
             })
         }
 
         fn finish_error(&self, error: CaptureError) {
+            if let CaptureError::Com(detail) = &error {
+                // HRESULTs are safe diagnostics: do not print page URLs or
+                // cookie values while still making COM failures actionable.
+                eprintln!("[webview2] COM error: {detail}");
+            }
             let mut state = self.state.lock().expect("capture state mutex poisoned");
             if state.outcome.is_none() {
-                state.outcome = Some(Err(error));
+                state.outcome = Some(Err(error.clone()));
+            }
+            if self.kugou_request.is_some() && state.request_outcome.is_none() {
+                state.request_outcome = Some(Err(error));
             }
             state.cookie_request_inflight = false;
         }
@@ -1291,6 +2119,14 @@ mod platform {
                 .lock()
                 .expect("capture state mutex poisoned")
                 .outcome
+                .take()
+        }
+
+        fn take_request_outcome(&self) -> Option<Result<Value, CaptureError>> {
+            self.state
+                .lock()
+                .expect("capture state mutex poisoned")
+                .request_outcome
                 .take()
         }
 
@@ -1352,6 +2188,262 @@ mod platform {
             let changed = state.login_callback != previous;
             if changed {
                 state.exchange_attempted = false;
+            }
+        }
+
+        fn accept_bilibili_refresh_token(&self, value: &str, source: &str) {
+            let value = value.trim();
+            if !super::valid_bilibili_refresh_token(value) {
+                super::log_bilibili_capture_diagnostics(&format!(
+                    "{source} ignored invalid refresh token length={}",
+                    value.len()
+                ));
+                return;
+            }
+            let mut state = self.state.lock().expect("capture state mutex poisoned");
+            if state.outcome.is_some() {
+                return;
+            }
+            super::log_bilibili_capture_diagnostics(&format!(
+                "{source} accepted refresh token length={}",
+                value.len()
+            ));
+            state.bilibili_refresh_token = Some(value.to_owned());
+            state
+                .latest_cookies
+                .insert("ac_time_value".to_owned(), value.to_owned());
+            // Re-read the cookie jar so the token is paired with the final
+            // browser session before completing the capture.
+            state.next_cookie_poll = Some(Instant::now());
+        }
+
+        fn note_bilibili_login_response(&self, payload: &Value) {
+            if !super::bilibili_login_payload_is_success(payload) {
+                return;
+            }
+            let mut state = self.state.lock().expect("capture state mutex poisoned");
+            if !state.bilibili_login_succeeded {
+                super::log_bilibili_capture_diagnostics(
+                    "Bilibili QR poll reported login success; awaiting refresh token",
+                );
+            }
+            state.bilibili_login_succeeded = true;
+            state.next_cookie_poll = Some(Instant::now());
+        }
+
+        fn start_initial_navigation(self: &Rc<Self>) {
+            let webview = {
+                let mut state = self.state.lock().expect("capture state mutex poisoned");
+                if state.outcome.is_some() || state.navigation_started {
+                    return;
+                }
+                state.navigation_started = true;
+                state.webview
+            };
+            if webview.is_null() {
+                self.finish_error(CaptureError::Com(
+                    "WebView2 初始化后没有可导航的 WebView".to_owned(),
+                ));
+                return;
+            }
+            let navigate: unsafe extern "system" fn(*mut c_void, PCWSTR) -> HRESULT =
+                unsafe { vtable_fn(webview, 5) };
+            let result = unsafe { navigate(webview, self.url.as_ptr()) };
+            if result < 0 {
+                self.finish_error(com_error("ICoreWebView2::Navigate", result));
+            } else if self.kugou_request.is_some() {
+                let mut state = self.state.lock().expect("capture state mutex poisoned");
+                state.request_next_attempt = Some(Instant::now() + Duration::from_millis(900));
+            }
+        }
+
+        /// Execute the signed songinfo request in the browser origin.  The
+        /// page-side script owns the official SSA challenge lifecycle and
+        /// returns only the JSON response to the host.
+        fn poll_kugou_request(self: &Rc<Self>) {
+            let input = match self.kugou_request.as_ref() {
+                Some(input) => input,
+                None => return,
+            };
+            let should_start = {
+                let mut state = self.state.lock().expect("capture state mutex poisoned");
+                if state.request_outcome.is_some()
+                    || state.request_script_inflight
+                    || state.webview.is_null()
+                    || !state.navigation_started
+                    || state
+                        .request_next_attempt
+                        .is_some_and(|deadline| Instant::now() < deadline)
+                {
+                    false
+                } else {
+                    state.request_script_inflight = true;
+                    true
+                }
+            };
+            if !should_start {
+                return;
+            }
+            let webview = {
+                let state = self.state.lock().expect("capture state mutex poisoned");
+                state.webview
+            };
+            let handler = Box::into_raw(Box::new(ScriptHandler {
+                vtbl: &SCRIPT_HANDLER_VTABLE,
+                refs: AtomicU32::new(1),
+                context: Rc::clone(self),
+                purpose: ScriptPurpose::KugouRequest,
+            })) as *mut c_void;
+            let execute_script: unsafe extern "system" fn(
+                *mut c_void,
+                PCWSTR,
+                *mut c_void,
+            ) -> HRESULT = unsafe { vtable_fn(webview, 29) };
+            let script = match kugou_request_script(input) {
+                Ok(script) => wide(&script),
+                Err(error) => {
+                    unsafe { release_com(handler) };
+                    self.finish_error(error);
+                    return;
+                }
+            };
+            let result = unsafe { execute_script(webview, script.as_ptr(), handler) };
+            unsafe { release_com(handler) };
+            if result < 0 {
+                let mut state = self.state.lock().expect("capture state mutex poisoned");
+                state.request_script_inflight = false;
+                state.request_next_attempt = Some(Instant::now() + Duration::from_millis(250));
+            }
+        }
+
+        fn ensure_initial_navigation(self: &Rc<Self>) {
+            let fallback = {
+                let state = self.state.lock().expect("capture state mutex poisoned");
+                state.navigation_started
+                    || state.outcome.is_some()
+                    || !state.script_install_started_at.is_some_and(|started| {
+                        started.elapsed() >= super::WEB_QR_SCRIPT_INSTALL_FALLBACK
+                    })
+            };
+            if !fallback {
+                // The completion callback is preferred because it guarantees
+                // document-created script registration. This watchdog keeps a
+                // Runtime callback failure from leaving a permanently white
+                // host window.
+                self.start_initial_navigation();
+            }
+        }
+
+        fn handle_web_message(self: &Rc<Self>, source: &str, raw_message: &str) {
+            let Some(object) = serde_json::from_str::<Value>(raw_message)
+                .ok()
+                .and_then(|value| value.as_object().cloned())
+            else {
+                return;
+            };
+            if object.get("bridge").and_then(Value::as_str) != Some("__miliastra_login_helper__") {
+                return;
+            }
+            let kind = object
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            match kind {
+                "kugou_request_result"
+                    if self.provider == "kugou"
+                        && self.kugou_request.is_some()
+                        && super::web_qr_message_source_allowed("kugou", source, "") =>
+                {
+                    let Some(value) = object.get("value").cloned() else {
+                        return;
+                    };
+                    self.finish_kugou_request_result(value);
+                }
+                "qq_callback" if self.provider == "qqmusic" => {
+                    let Some(callback_url) = object.get("value").and_then(Value::as_str) else {
+                        return;
+                    };
+                    if super::web_qr_message_source_allowed("qqmusic", source, callback_url) {
+                        self.remember_navigation_url(callback_url);
+                    }
+                }
+                "qq_event" if self.provider == "qqmusic" => {
+                    // The outer OAuth document normally redirects on its own;
+                    // force an immediate source check when the iframe reports
+                    // qclogin_success so a slow navigation cannot look like a
+                    // successful scan followed by a blank window.
+                    self.poll_navigation();
+                }
+                "bilibili_refresh" if self.provider == "bilibili" => {
+                    let Some(value) = object.get("value").and_then(Value::as_str) else {
+                        return;
+                    };
+                    let frame_url = object
+                        .get("frameUrl")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    if !super::web_qr_message_source_allowed("bilibili", source, frame_url) {
+                        super::log_bilibili_capture_diagnostics(
+                            "refresh bridge ignored because its source was outside Bilibili",
+                        );
+                        return;
+                    }
+                    self.accept_bilibili_refresh_token(value, "refresh bridge");
+                }
+                "qr" => {
+                    let Some(value) = object.get("value").and_then(Value::as_str) else {
+                        return;
+                    };
+                    let frame_url = object
+                        .get("frameUrl")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    if !super::web_qr_message_source_allowed(&self.provider, source, frame_url) {
+                        return;
+                    }
+                    if value.starts_with("data:image/") {
+                        if let Ok(image) = super::validate_web_qr_data_url(value) {
+                            let mut state =
+                                self.state.lock().expect("capture state mutex poisoned");
+                            if state.outcome.is_none() {
+                                state.web_qr_pending = Some(image);
+                                state.web_qr_failures = 0;
+                            }
+                        }
+                    } else if let Ok(url) = Url::parse(value)
+                        && super::web_qr_url_allowed(&self.provider, &url)
+                    {
+                        self.start_web_qr_fetch(value.to_owned());
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        fn finish_kugou_request_result(&self, value: Value) {
+            super::log_kugou_request_diagnostics(&value);
+            let mut state = self.state.lock().expect("capture state mutex poisoned");
+            state.request_script_inflight = false;
+            match value {
+                value if value.get("retry").and_then(Value::as_bool) == Some(true) => {
+                    state.request_next_attempt = Some(Instant::now() + Duration::from_millis(300));
+                }
+                value if value.get("ok").and_then(Value::as_bool) == Some(true) => {
+                    if let Some(body) = value.get("body").cloned() {
+                        state.request_outcome = Some(Ok(body));
+                    } else {
+                        state.request_outcome = Some(Err(CaptureError::Io(
+                            "酷狗 Web 请求响应缺少 body".to_owned(),
+                        )));
+                    }
+                }
+                value => {
+                    let message = value
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("酷狗网页风控验证失败");
+                    state.request_outcome = Some(Err(CaptureError::Io(message.to_owned())));
+                }
             }
         }
 
@@ -1429,47 +2521,15 @@ mod platform {
             }
         }
 
-        fn poll_native_qr(self: &Rc<Self>) -> Option<String> {
-            if self.provider != "bilibili" {
-                return None;
-            }
-            let event = {
-                let state = self.state.lock().expect("capture state mutex poisoned");
-                if state.outcome.is_some() {
-                    return None;
-                }
-                let receiver = state.native_qr_rx.as_ref()?;
-                match receiver.try_recv() {
-                    Ok(event) => Some(event),
-                    Err(mpsc::TryRecvError::Empty) => None,
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        Some(NativeQrEvent::Error("二维码轮询线程已断开".to_owned()))
-                    }
-                }
-            };
-            match event {
-                Some(NativeQrEvent::Qr(image)) => Some(image),
-                Some(NativeQrEvent::Success(cookies)) => {
-                    let mut state = self.state.lock().expect("capture state mutex poisoned");
-                    state.outcome = Some(Ok(cookies));
-                    None
-                }
-                Some(NativeQrEvent::Error(message)) => {
-                    let mut state = self.state.lock().expect("capture state mutex poisoned");
-                    state.outcome = Some(Err(CaptureError::Io(message)));
-                    None
-                }
-                None => None,
-            }
-        }
-
         /// Ask the currently loaded provider page for its QR image. The
-        /// script is intentionally polled instead of tied to a particular
-        /// navigation event because all three sites render the login dialog
-        /// asynchronously (and NetEase creates the canvas only after its
-        /// login link is clicked).
+        /// injected bridge is the primary path; this ExecuteScript probe is a
+        /// top-level fallback for runtimes that do not deliver child-frame
+        /// messages. All four providers stay inside the same WebView2 flow.
         fn poll_web_qr(self: &Rc<Self>) -> Option<String> {
-            if !matches!(self.provider.as_str(), "qqmusic" | "netease" | "kugou") {
+            if !matches!(
+                self.provider.as_str(),
+                "qqmusic" | "netease" | "bilibili" | "kugou"
+            ) {
                 return None;
             }
             let now = Instant::now();
@@ -1502,13 +2562,15 @@ mod platform {
                         Err(_) => {
                             state.web_qr_fetch_source = None;
                             state.web_qr_failures = state.web_qr_failures.saturating_add(1);
+                            // QR extraction is an auxiliary display path. A
+                            // transient image URL/content-type failure must
+                            // not abort the credential wait; the DOM bridge
+                            // may publish another candidate and cookie polling
+                            // must continue until login succeeds or times out.
                             if state.web_qr_failures >= 3 {
-                                state.outcome = Some(Err(CaptureError::Io(
-                                    "网页登录二维码图片连续提取失败，请重试".to_owned(),
-                                )));
-                            } else {
-                                state.web_qr_next_probe = Some(now + super::WEB_QR_PROBE_INTERVAL);
+                                state.web_qr_failures = 0;
                             }
+                            state.web_qr_next_probe = Some(now + super::WEB_QR_PROBE_INTERVAL);
                         }
                     }
                 }
@@ -1580,15 +2642,20 @@ mod platform {
 
         fn start_web_qr_fetch(self: &Rc<Self>, source: String) {
             let (sender, receiver) = mpsc::channel();
+            let now = Instant::now();
             {
                 let mut state = self.state.lock().expect("capture state mutex poisoned");
-                if state.web_qr_fetch_rx.is_some()
-                    || state.web_qr_fetch_source.as_deref() == Some(source.as_str())
-                {
+                let same_source_recently = state.web_qr_fetch_source.as_deref()
+                    == Some(source.as_str())
+                    && state.web_qr_last_fetch_at.is_some_and(|started| {
+                        started.elapsed() < super::WEB_QR_REPEAT_FETCH_INTERVAL
+                    });
+                if state.web_qr_fetch_rx.is_some() || same_source_recently {
                     state.web_qr_next_probe = Some(Instant::now() + super::WEB_QR_PROBE_INTERVAL);
                     return;
                 }
                 state.web_qr_fetch_source = Some(source.clone());
+                state.web_qr_last_fetch_at = Some(now);
                 state.web_qr_fetch_rx = Some(receiver);
             }
             let provider = self.provider.clone();
@@ -1641,13 +2708,9 @@ mod platform {
             if webview.is_null() {
                 let mut state = self.state.lock().expect("capture state mutex poisoned");
                 state.js_probe_inflight = false;
-                state.next_cookie_poll = Some(Instant::now());
+                state.next_cookie_poll = Some(Instant::now() + super::BILIBILI_JS_PROBE_INTERVAL);
                 return;
             }
-            let probe_index = {
-                let state = self.state.lock().expect("capture state mutex poisoned");
-                state.bilibili_js_probe_attempts
-            };
             let get_source: unsafe extern "system" fn(*mut c_void, *mut *mut u16) -> HRESULT =
                 unsafe { vtable_fn(webview, 4) };
             let mut source = null_mut();
@@ -1661,13 +2724,19 @@ mod platform {
             let navigate: unsafe extern "system" fn(*mut c_void, PCWSTR) -> HRESULT =
                 unsafe { vtable_fn(webview, 5) };
             let url = wide("https://www.bilibili.com/");
-            // 前 5 次探测交替刷新首页（触发前端写入 refresh_token）与读取。
-            let should_navigate = !on_bilibili || (probe_index <= 5 && probe_index % 2 == 1);
-            if should_navigate {
+            // A successful QR scan often leaves the top-level document on
+            // passport.bilibili.com. Navigate home once, then wait for its
+            // login bootstrap to write ac_time_value before probing again.
+            // Repeated immediate reloads used to exhaust every probe before
+            // that asynchronous write had a chance to run.
+            if !on_bilibili {
+                super::log_bilibili_capture_diagnostics(
+                    "refresh probe navigating to Bilibili home before storage read",
+                );
                 let _ = unsafe { navigate(webview, url.as_ptr()) };
                 let mut state = self.state.lock().expect("capture state mutex poisoned");
                 state.js_probe_inflight = false;
-                state.next_cookie_poll = Some(Instant::now());
+                state.next_cookie_poll = Some(Instant::now() + super::BILIBILI_JS_PROBE_INTERVAL);
                 return;
             }
             // ICoreWebView2::ExecuteScript 位于 vtable 槽位 29
@@ -1684,15 +2753,16 @@ mod platform {
                 *mut c_void,
             ) -> HRESULT = unsafe { vtable_fn(webview, 29) };
             let script = wide(
-                "(localStorage.getItem('ac_time_value')||sessionStorage.getItem('ac_time_value'))",
+                "(localStorage.getItem('ac_time_value')||localStorage.getItem('refresh_token')||localStorage.getItem('refreshToken')||sessionStorage.getItem('ac_time_value')||sessionStorage.getItem('refresh_token')||sessionStorage.getItem('refreshToken'))",
             );
+            super::log_bilibili_capture_diagnostics("refresh probe executing storage read");
             let result = unsafe { execute_script(webview, script.as_ptr(), handler) };
             unsafe { release_com(handler) };
             if result < 0 {
                 eprintln!("[js-probe] ExecuteScript failed: {result:#x}");
                 let mut state = self.state.lock().expect("capture state mutex poisoned");
                 state.js_probe_inflight = false;
-                state.next_cookie_poll = Some(Instant::now());
+                state.next_cookie_poll = Some(Instant::now() + super::BILIBILI_JS_PROBE_INTERVAL);
             }
         }
     }
@@ -1725,6 +2795,35 @@ mod platform {
         context: Rc<CaptureContext>,
     }
 
+    #[repr(C)]
+    struct WebMessageHandler {
+        vtbl: &'static WebMessageHandlerVtable,
+        refs: AtomicU32,
+        context: Rc<CaptureContext>,
+    }
+
+    #[repr(C)]
+    struct ScriptInstallHandler {
+        vtbl: &'static ScriptInstallHandlerVtable,
+        refs: AtomicU32,
+        context: Rc<CaptureContext>,
+    }
+
+    #[repr(C)]
+    struct WebResourceResponseReceivedHandler {
+        vtbl: &'static WebResourceResponseReceivedHandlerVtable,
+        refs: AtomicU32,
+        context: Rc<CaptureContext>,
+    }
+
+    #[repr(C)]
+    struct WebResourceContentHandler {
+        vtbl: &'static WebResourceContentHandlerVtable,
+        refs: AtomicU32,
+        context: Rc<CaptureContext>,
+        request_url: String,
+    }
+
     type NavigationStartingInvoke =
         unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> HRESULT;
 
@@ -1734,6 +2833,17 @@ mod platform {
         add_ref: HandlerAddRef,
         release: HandlerRelease,
         invoke: NavigationStartingInvoke,
+    }
+
+    type WebMessageInvoke =
+        unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> HRESULT;
+
+    #[repr(C)]
+    struct WebMessageHandlerVtable {
+        query_interface: HandlerQueryInterface,
+        add_ref: HandlerAddRef,
+        release: HandlerRelease,
+        invoke: WebMessageInvoke,
     }
 
     #[repr(C)]
@@ -1752,6 +2862,39 @@ mod platform {
         add_ref: HandlerAddRef,
         release: HandlerRelease,
         invoke: ScriptInvoke,
+    }
+
+    type ScriptInstallInvoke =
+        unsafe extern "system" fn(*mut c_void, HRESULT, *const u16) -> HRESULT;
+
+    #[repr(C)]
+    struct ScriptInstallHandlerVtable {
+        query_interface: HandlerQueryInterface,
+        add_ref: HandlerAddRef,
+        release: HandlerRelease,
+        invoke: ScriptInstallInvoke,
+    }
+
+    type WebResourceResponseReceivedInvoke =
+        unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> HRESULT;
+
+    #[repr(C)]
+    struct WebResourceResponseReceivedHandlerVtable {
+        query_interface: HandlerQueryInterface,
+        add_ref: HandlerAddRef,
+        release: HandlerRelease,
+        invoke: WebResourceResponseReceivedInvoke,
+    }
+
+    type WebResourceContentInvoke =
+        unsafe extern "system" fn(*mut c_void, HRESULT, *mut c_void) -> HRESULT;
+
+    #[repr(C)]
+    struct WebResourceContentHandlerVtable {
+        query_interface: HandlerQueryInterface,
+        add_ref: HandlerAddRef,
+        release: HandlerRelease,
+        invoke: WebResourceContentInvoke,
     }
 
     static ENVIRONMENT_HANDLER_VTABLE: HandlerVtable = HandlerVtable {
@@ -1779,12 +2922,38 @@ mod platform {
             release: navigation_starting_release,
             invoke: navigation_starting_invoke,
         };
+    static WEB_MESSAGE_HANDLER_VTABLE: WebMessageHandlerVtable = WebMessageHandlerVtable {
+        query_interface: web_message_query_interface,
+        add_ref: web_message_add_ref,
+        release: web_message_release,
+        invoke: web_message_invoke,
+    };
     static SCRIPT_HANDLER_VTABLE: ScriptHandlerVtable = ScriptHandlerVtable {
         query_interface: script_query_interface,
         add_ref: script_add_ref,
         release: script_release,
         invoke: script_invoke,
     };
+    static SCRIPT_INSTALL_HANDLER_VTABLE: ScriptInstallHandlerVtable = ScriptInstallHandlerVtable {
+        query_interface: script_install_query_interface,
+        add_ref: script_install_add_ref,
+        release: script_install_release,
+        invoke: script_install_invoke,
+    };
+    static WEB_RESOURCE_RESPONSE_RECEIVED_HANDLER_VTABLE: WebResourceResponseReceivedHandlerVtable =
+        WebResourceResponseReceivedHandlerVtable {
+            query_interface: web_resource_response_received_query_interface,
+            add_ref: web_resource_response_received_add_ref,
+            release: web_resource_response_received_release,
+            invoke: web_resource_response_received_invoke,
+        };
+    static WEB_RESOURCE_CONTENT_HANDLER_VTABLE: WebResourceContentHandlerVtable =
+        WebResourceContentHandlerVtable {
+            query_interface: web_resource_content_query_interface,
+            add_ref: web_resource_content_add_ref,
+            release: web_resource_content_release,
+            invoke: web_resource_content_invoke,
+        };
 
     unsafe extern "system" fn environment_query_interface(
         this: *mut c_void,
@@ -1830,12 +2999,68 @@ mod platform {
         )
     }
 
+    unsafe extern "system" fn web_message_query_interface(
+        this: *mut c_void,
+        riid: *const GUID,
+        out: *mut *mut c_void,
+    ) -> HRESULT {
+        query_interface(
+            this,
+            riid,
+            out,
+            &IID_WEB_MESSAGE_HANDLER,
+            web_message_add_ref,
+        )
+    }
+
     unsafe extern "system" fn script_query_interface(
         this: *mut c_void,
         riid: *const GUID,
         out: *mut *mut c_void,
     ) -> HRESULT {
         query_interface(this, riid, out, &IID_SCRIPT_HANDLER, script_add_ref)
+    }
+
+    unsafe extern "system" fn script_install_query_interface(
+        this: *mut c_void,
+        riid: *const GUID,
+        out: *mut *mut c_void,
+    ) -> HRESULT {
+        query_interface(
+            this,
+            riid,
+            out,
+            &IID_SCRIPT_INSTALL_HANDLER,
+            script_install_add_ref,
+        )
+    }
+
+    unsafe extern "system" fn web_resource_response_received_query_interface(
+        this: *mut c_void,
+        riid: *const GUID,
+        out: *mut *mut c_void,
+    ) -> HRESULT {
+        query_interface(
+            this,
+            riid,
+            out,
+            &IID_WEB_RESOURCE_RESPONSE_RECEIVED_HANDLER,
+            web_resource_response_received_add_ref,
+        )
+    }
+
+    unsafe extern "system" fn web_resource_content_query_interface(
+        this: *mut c_void,
+        riid: *const GUID,
+        out: *mut *mut c_void,
+    ) -> HRESULT {
+        query_interface(
+            this,
+            riid,
+            out,
+            &IID_WEB_RESOURCE_CONTENT_HANDLER,
+            web_resource_content_add_ref,
+        )
     }
 
     unsafe fn query_interface(
@@ -1874,7 +3099,23 @@ mod platform {
         handler_refs(this).fetch_add(1, Ordering::Relaxed) + 1
     }
 
+    unsafe extern "system" fn web_message_add_ref(this: *mut c_void) -> u32 {
+        handler_refs(this).fetch_add(1, Ordering::Relaxed) + 1
+    }
+
     unsafe extern "system" fn script_add_ref(this: *mut c_void) -> u32 {
+        handler_refs(this).fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    unsafe extern "system" fn script_install_add_ref(this: *mut c_void) -> u32 {
+        handler_refs(this).fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    unsafe extern "system" fn web_resource_response_received_add_ref(this: *mut c_void) -> u32 {
+        handler_refs(this).fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    unsafe extern "system" fn web_resource_content_add_ref(this: *mut c_void) -> u32 {
         handler_refs(this).fetch_add(1, Ordering::Relaxed) + 1
     }
 
@@ -1894,8 +3135,24 @@ mod platform {
         release_handler::<NavigationStartingHandler>(this)
     }
 
+    unsafe extern "system" fn web_message_release(this: *mut c_void) -> u32 {
+        release_handler::<WebMessageHandler>(this)
+    }
+
     unsafe extern "system" fn script_release(this: *mut c_void) -> u32 {
         release_handler::<ScriptHandler>(this)
+    }
+
+    unsafe extern "system" fn script_install_release(this: *mut c_void) -> u32 {
+        release_handler::<ScriptInstallHandler>(this)
+    }
+
+    unsafe extern "system" fn web_resource_response_received_release(this: *mut c_void) -> u32 {
+        release_handler::<WebResourceResponseReceivedHandler>(this)
+    }
+
+    unsafe extern "system" fn web_resource_content_release(this: *mut c_void) -> u32 {
+        release_handler::<WebResourceContentHandler>(this)
     }
 
     unsafe fn handler_refs(this: *mut c_void) -> &'static AtomicU32 {
@@ -2014,14 +3271,56 @@ mod platform {
             vtable_fn(webview2, 66);
         let mut cookie_manager = null_mut();
         let hr = get_manager(webview2, &mut cookie_manager);
-        release_com(webview2);
         if hr < 0 || cookie_manager.is_null() {
+            release_com(webview2);
             release_com(webview);
             context.finish_error(if hr < 0 {
                 com_error("ICoreWebView2_2::get_CookieManager", hr)
             } else {
                 CaptureError::Com("get_CookieManager returned a null manager".to_owned())
             });
+            return S_OK;
+        }
+
+        if let Some(input) = context.kugou_request.as_ref() {
+            if let Err(error) = set_kugou_request_cookies(cookie_manager, &input.cookies) {
+                release_com(cookie_manager);
+                release_com(webview2);
+                release_com(webview);
+                context.finish_error(error);
+                return S_OK;
+            }
+        }
+
+        // WebMessageReceived is enabled by default, but set it explicitly so
+        // the bridge remains correct with enterprise Runtime policies.
+        let get_settings: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT =
+            vtable_fn(webview, 3);
+        let mut settings = null_mut();
+        let hr = get_settings(webview, &mut settings);
+        if hr < 0 || settings.is_null() {
+            release_com(cookie_manager);
+            release_com(webview2);
+            release_com(webview);
+            context.finish_error(if hr < 0 {
+                com_error("ICoreWebView2::get_Settings", hr)
+            } else {
+                CaptureError::Com("get_Settings returned a null settings object".to_owned())
+            });
+            return S_OK;
+        }
+        let put_web_message: unsafe extern "system" fn(*mut c_void, i32) -> HRESULT =
+            vtable_fn(settings, 6);
+        let hr = put_web_message(settings, 1);
+        release_com(settings);
+        if hr < 0 {
+            release_com(cookie_manager);
+            release_com(webview2);
+            release_com(webview);
+            context.finish_error(com_error(
+                "ICoreWebView2Settings::put_IsWebMessageEnabled",
+                hr,
+            ));
             return S_OK;
         }
 
@@ -2040,26 +3339,30 @@ mod platform {
         release_com(navigation_handler);
         if hr < 0 {
             release_com(cookie_manager);
+            release_com(webview2);
             release_com(webview);
             context.finish_error(com_error("ICoreWebView2::add_NavigationStarting", hr));
             return S_OK;
         }
 
-        // B 站原生二维码页走 NavigateToString，其余平台走官方登录页 Navigate。
-        // ICoreWebView2::NavigateToString 位于 vtable 槽位 6。
-        let hr = if let Some(html) = &context.html {
-            let navigate_to_string: unsafe extern "system" fn(*mut c_void, PCWSTR) -> HRESULT =
-                vtable_fn(webview, 6);
-            navigate_to_string(webview, html.as_ptr())
-        } else {
-            let navigate: unsafe extern "system" fn(*mut c_void, PCWSTR) -> HRESULT =
-                vtable_fn(webview, 5);
-            navigate(webview, context.url.as_ptr())
-        };
+        let web_message_handler = Box::into_raw(Box::new(WebMessageHandler {
+            vtbl: &WEB_MESSAGE_HANDLER_VTABLE,
+            refs: AtomicU32::new(1),
+            context: Rc::clone(&context),
+        })) as *mut c_void;
+        let add_web_message: unsafe extern "system" fn(
+            *mut c_void,
+            *mut c_void,
+            *mut i64,
+        ) -> HRESULT = vtable_fn(webview, 34);
+        let mut web_message_token = 0i64;
+        let hr = add_web_message(webview, web_message_handler, &mut web_message_token);
+        release_com(web_message_handler);
         if hr < 0 {
             release_com(cookie_manager);
+            release_com(webview2);
             release_com(webview);
-            context.finish_error(com_error("ICoreWebView2::Navigate", hr));
+            context.finish_error(com_error("ICoreWebView2::add_WebMessageReceived", hr));
             return S_OK;
         }
 
@@ -2067,12 +3370,69 @@ mod platform {
             vtable_fn(controller, 4);
         let _ = put_visible(controller, 1);
 
-        let mut state = context.state.lock().expect("capture state mutex poisoned");
-        state.controller = controller;
-        state.webview = webview;
-        state.cookie_manager = cookie_manager;
-        state.next_cookie_poll = Some(Instant::now());
-        drop(state);
+        {
+            let mut state = context.state.lock().expect("capture state mutex poisoned");
+            state.controller = controller;
+            state.webview = webview;
+            state.cookie_manager = cookie_manager;
+            state.web_message_token = Some(web_message_token);
+            state.script_install_started_at = Some(Instant::now());
+            state.next_cookie_poll = Some(Instant::now());
+        }
+
+        let web_resource_response_token = if context.provider == "bilibili" {
+            let response_handler = Box::into_raw(Box::new(WebResourceResponseReceivedHandler {
+                vtbl: &WEB_RESOURCE_RESPONSE_RECEIVED_HANDLER_VTABLE,
+                refs: AtomicU32::new(1),
+                context: Rc::clone(&context),
+            })) as *mut c_void;
+            // ICoreWebView2_2::add_WebResourceResponseReceived.
+            let add_response: unsafe extern "system" fn(
+                *mut c_void,
+                *mut c_void,
+                *mut i64,
+            ) -> HRESULT = vtable_fn(webview2, 61);
+            let mut token = 0i64;
+            let hr = add_response(webview2, response_handler, &mut token);
+            release_com(response_handler);
+            if hr < 0 {
+                release_com(webview2);
+                context.finish_error(com_error(
+                    "ICoreWebView2_2::add_WebResourceResponseReceived",
+                    hr,
+                ));
+                return S_OK;
+            }
+            Some(token)
+        } else {
+            None
+        };
+        {
+            let mut state = context.state.lock().expect("capture state mutex poisoned");
+            state.web_resource_response_token = web_resource_response_token;
+        }
+        release_com(webview2);
+
+        // The completion callback is the only place that starts the first
+        // navigation. WebView2 otherwise may miss the document-created script
+        // on the initial page, especially for QQ's cross-origin iframe.
+        let script_handler = Box::into_raw(Box::new(ScriptInstallHandler {
+            vtbl: &SCRIPT_INSTALL_HANDLER_VTABLE,
+            refs: AtomicU32::new(1),
+            context: Rc::clone(&context),
+        })) as *mut c_void;
+        let add_script: unsafe extern "system" fn(*mut c_void, PCWSTR, *mut c_void) -> HRESULT =
+            vtable_fn(webview, 27);
+        let script = wide(super::web_qr_bridge_script());
+        let hr = add_script(webview, script.as_ptr(), script_handler);
+        release_com(script_handler);
+        if hr < 0 {
+            context.finish_error(com_error(
+                "ICoreWebView2::AddScriptToExecuteOnDocumentCreated",
+                hr,
+            ));
+            return S_OK;
+        }
         context.resize_webview_to_client_area();
         S_OK
     }
@@ -2110,9 +3470,44 @@ mod platform {
         } else {
             state.latest_cookies.extend(exchange_cookies);
         }
+        if context.provider == "bilibili"
+            && let Some(refresh_token) = state.bilibili_refresh_token.clone()
+        {
+            // GetCookies returns only browser cookies. Keep the refresh token
+            // received from the bounded page bridge across later polls.
+            state
+                .latest_cookies
+                .insert("ac_time_value".to_owned(), refresh_token);
+        }
         let cookies = state.latest_cookies.clone();
         let now = Instant::now();
         let exchange_pending = state.exchange_rx.is_some();
+        let bilibili_needs_refresh = !exchange_pending
+            && context.provider == "bilibili"
+            && state.bilibili_login_succeeded
+            && super::has_required_cookies("bilibili", &cookies)
+            && !cookies.contains_key("ac_time_value");
+        if bilibili_needs_refresh {
+            super::log_bilibili_capture_diagnostics(&format!(
+                "required cookies seen; refresh missing; probe attempt={}",
+                state.bilibili_js_probe_attempts
+            ));
+            if state.bilibili_js_probe_attempts >= super::BILIBILI_JS_PROBE_ATTEMPTS {
+                super::log_bilibili_capture_diagnostics("refresh probe limit exhausted");
+                state.outcome = Some(Err(CaptureError::Io(
+                    "B站登录成功后未能捕获 refreshToken".to_owned(),
+                )));
+            } else if !state.js_probe_inflight {
+                state.bilibili_js_probe_attempts += 1;
+                state.js_probe_inflight = true;
+                let webview = state.webview;
+                drop(state);
+                context.start_bilibili_js_probe(webview);
+            } else {
+                state.next_cookie_poll = Some(now + super::BILIBILI_JS_PROBE_INTERVAL);
+            }
+            return S_OK;
+        }
         let complete = !exchange_pending
             && super::should_complete_capture(
                 &context.provider,
@@ -2120,25 +3515,6 @@ mod platform {
                 &mut state.required_cookies_seen_at,
                 now,
             );
-        // B 站完成前先尝试从 localStorage/sessionStorage 探测 refresh_token：
-        // 未拿到且次数未耗尽时禁止完成，持续轮询（ExecuteScript 异步回调
-        // 可能晚于下一次 GetCookies，提前完成会错过稍后写入的值）。
-        let probing = complete
-            && context.provider == "bilibili"
-            && !cookies.contains_key("ac_time_value")
-            && state.bilibili_js_probe_attempts < super::BILIBILI_JS_PROBE_ATTEMPTS;
-        if probing {
-            if !state.js_probe_inflight {
-                state.bilibili_js_probe_attempts += 1;
-                state.js_probe_inflight = true;
-                let webview = state.webview;
-                drop(state);
-                context.start_bilibili_js_probe(webview);
-            } else {
-                state.next_cookie_poll = Some(now + super::COOKIE_POLL_INTERVAL);
-            }
-            return S_OK;
-        }
         if complete {
             state.outcome = Some(Ok(cookies));
         } else {
@@ -2160,19 +3536,33 @@ mod platform {
             ScriptPurpose::BilibiliToken => {
                 let mut state = context.state.lock().expect("capture state mutex poisoned");
                 state.js_probe_inflight = false;
-                state.next_cookie_poll = Some(Instant::now());
+                state.next_cookie_poll = Some(Instant::now() + super::BILIBILI_JS_PROBE_INTERVAL);
+                let mut storage_value_len = None;
+                let mut accepted = false;
                 if result >= 0 && !json_result.is_null() {
                     let text = unsafe { read_wide(json_result) };
                     // ExecuteScript 返回 JSON 编码：null 或带引号的字符串。
-                    if let Ok(Some(value)) = serde_json::from_str::<Option<String>>(&text)
-                        && !value.is_empty()
-                    {
-                        state
-                            .latest_cookies
-                            .insert("ac_time_value".to_owned(), value);
-                        state.outcome = Some(Ok(state.latest_cookies.clone()));
+                    if let Ok(Some(value)) = serde_json::from_str::<Option<String>>(&text) {
+                        storage_value_len = Some(value.len());
+                        if super::valid_bilibili_refresh_token(&value) {
+                            let value = value.trim().to_owned();
+                            accepted = true;
+                            state.bilibili_refresh_token = Some(value.clone());
+                            state
+                                .latest_cookies
+                                .insert("ac_time_value".to_owned(), value);
+                            if super::has_required_cookies("bilibili", &state.latest_cookies) {
+                                state.outcome = Some(Ok(state.latest_cookies.clone()));
+                            } else {
+                                state.next_cookie_poll = Some(Instant::now());
+                            }
+                        }
                     }
                 }
+                super::log_bilibili_capture_diagnostics(&format!(
+                    "storage probe callback result={result} value_length={:?} accepted={accepted}",
+                    storage_value_len
+                ));
             }
             ScriptPurpose::WebQr => {
                 let parsed = if result >= 0 && !json_result.is_null() {
@@ -2203,16 +3593,175 @@ mod platform {
                                 context.state.lock().expect("capture state mutex poisoned");
                             state.web_qr_failures = state.web_qr_failures.saturating_add(1);
                             if state.web_qr_failures >= 3 {
-                                state.outcome = Some(Err(CaptureError::Io(
-                                    "网页登录二维码图片连续提取失败，请重试".to_owned(),
-                                )));
+                                state.web_qr_failures = 0;
                             }
+                            state.web_qr_next_probe =
+                                Some(Instant::now() + super::WEB_QR_PROBE_INTERVAL);
                         }
                     }
                 } else {
                     context.start_web_qr_fetch(source);
                 }
             }
+            ScriptPurpose::KugouRequest => {
+                if result < 0 || json_result.is_null() {
+                    let mut state = context.state.lock().expect("capture state mutex poisoned");
+                    state.request_script_inflight = false;
+                    state.request_next_attempt = Some(Instant::now() + Duration::from_millis(250));
+                } else {
+                    let text = unsafe { read_wide(json_result) };
+                    super::log_kugou_script_result_shape(
+                        &text,
+                        super::parse_execute_script_value(&text).as_ref(),
+                    );
+                }
+            }
+        }
+        S_OK
+    }
+
+    unsafe extern "system" fn web_resource_response_received_invoke(
+        this: *mut c_void,
+        _sender: *mut c_void,
+        args: *mut c_void,
+    ) -> HRESULT {
+        if args.is_null() {
+            return S_OK;
+        }
+        let handler = &*(this as *mut WebResourceResponseReceivedHandler);
+        if handler.context.provider != "bilibili" {
+            return S_OK;
+        }
+        let context = handler.context.clone();
+        let get_request: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT =
+            vtable_fn(args, 3);
+        let mut request = null_mut();
+        if unsafe { get_request(args, &mut request) } < 0 || request.is_null() {
+            return S_OK;
+        }
+        let get_uri: unsafe extern "system" fn(*mut c_void, *mut *mut u16) -> HRESULT =
+            vtable_fn(request, 3);
+        let mut uri = null_mut();
+        let request_url = if unsafe { get_uri(request, &mut uri) } >= 0 && !uri.is_null() {
+            let value = unsafe { read_wide(uri) };
+            unsafe { CoTaskMemFree(uri as *const c_void) };
+            value
+        } else {
+            String::new()
+        };
+        unsafe { release_com(request) };
+        if !super::bilibili_login_endpoint_url(&request_url) {
+            return S_OK;
+        }
+        super::log_bilibili_capture_diagnostics("WebView2 response received for login endpoint");
+
+        let get_response: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT =
+            vtable_fn(args, 4);
+        let mut response = null_mut();
+        if unsafe { get_response(args, &mut response) } < 0 || response.is_null() {
+            return S_OK;
+        }
+        let content_handler = Box::into_raw(Box::new(WebResourceContentHandler {
+            vtbl: &WEB_RESOURCE_CONTENT_HANDLER_VTABLE,
+            refs: AtomicU32::new(1),
+            context,
+            request_url,
+        })) as *mut c_void;
+        let get_content: unsafe extern "system" fn(*mut c_void, *mut c_void) -> HRESULT =
+            vtable_fn(response, 6);
+        let result = unsafe { get_content(response, content_handler) };
+        unsafe { release_com(content_handler) };
+        unsafe { release_com(response) };
+        if result < 0 {
+            super::log_bilibili_capture_diagnostics("WebView2 response content read failed");
+        }
+        S_OK
+    }
+
+    unsafe extern "system" fn web_resource_content_invoke(
+        this: *mut c_void,
+        result: HRESULT,
+        stream: *mut c_void,
+    ) -> HRESULT {
+        let handler = &*(this as *mut WebResourceContentHandler);
+        if result < 0 || stream.is_null() {
+            super::log_bilibili_capture_diagnostics(
+                "WebView2 login response returned no readable content",
+            );
+            return S_OK;
+        }
+        let Some(text) = (unsafe { read_response_stream(stream) }) else {
+            super::log_bilibili_capture_diagnostics(
+                "WebView2 login response stream could not be decoded",
+            );
+            return S_OK;
+        };
+        let Some(payload) = super::parse_bilibili_login_payload(&text) else {
+            super::log_bilibili_capture_diagnostics("WebView2 login response JSON was invalid");
+            return S_OK;
+        };
+        super::log_bilibili_login_payload_shape(&payload);
+        handler.context.note_bilibili_login_response(&payload);
+        let Some(token) = super::bilibili_refresh_token_from_payload(&payload) else {
+            super::log_bilibili_capture_diagnostics("WebView2 login response had no refresh token");
+            return S_OK;
+        };
+        handler
+            .context
+            .accept_bilibili_refresh_token(&token, "WebView2 response");
+        S_OK
+    }
+
+    unsafe extern "system" fn script_install_invoke(
+        this: *mut c_void,
+        result: HRESULT,
+        _script_id: *const u16,
+    ) -> HRESULT {
+        let context = (&*(this as *mut ScriptInstallHandler)).context.clone();
+        if result < 0 {
+            context.finish_error(com_error(
+                "ICoreWebView2::AddScriptToExecuteOnDocumentCreated",
+                result,
+            ));
+        } else {
+            context.start_initial_navigation();
+        }
+        S_OK
+    }
+
+    unsafe extern "system" fn web_message_invoke(
+        this: *mut c_void,
+        _sender: *mut c_void,
+        args: *mut c_void,
+    ) -> HRESULT {
+        if args.is_null() {
+            return S_OK;
+        }
+        let context = (&*(this as *mut WebMessageHandler)).context.clone();
+        let get_source: unsafe extern "system" fn(*mut c_void, *mut *mut u16) -> HRESULT =
+            vtable_fn(args, 3);
+        let get_message: unsafe extern "system" fn(*mut c_void, *mut *mut u16) -> HRESULT =
+            vtable_fn(args, 4);
+        let mut source = null_mut();
+        let mut message = null_mut();
+        let source_hr = get_source(args, &mut source);
+        let message_hr = get_message(args, &mut message);
+        let source_text = if source_hr >= 0 && !source.is_null() {
+            let value = read_wide(source);
+            CoTaskMemFree(source as *const c_void);
+            value
+        } else {
+            String::new()
+        };
+        let message_text = if message_hr >= 0 && !message.is_null() {
+            let value = read_wide(message);
+            CoTaskMemFree(message as *const c_void);
+            value
+        } else {
+            String::new()
+        };
+        if source_hr >= 0 && message_hr >= 0 {
+            context.handle_web_message(&source_text, &message_text);
         }
         S_OK
     }
@@ -2236,6 +3785,57 @@ mod platform {
             context.remember_navigation_url(&raw_url);
         }
         S_OK
+    }
+
+    /// Seed the WebView2 cookie jar before navigating to the page origin.  The
+    /// request bridge deliberately uses browser cookies rather than an HTTP
+    /// client cookie header so SameSite, origin and challenge state follow the
+    /// normal web flow.
+    unsafe fn set_kugou_request_cookies(
+        manager: *mut c_void,
+        cookies: &BTreeMap<String, String>,
+    ) -> Result<(), CaptureError> {
+        let create_cookie: unsafe extern "system" fn(
+            *mut c_void,
+            PCWSTR,
+            PCWSTR,
+            PCWSTR,
+            PCWSTR,
+            *mut *mut c_void,
+        ) -> HRESULT = vtable_fn(manager, 3);
+        let add_or_update: unsafe extern "system" fn(*mut c_void, *mut c_void) -> HRESULT =
+            vtable_fn(manager, 6);
+        let domain = wide(".kugou.com");
+        let path = wide("/");
+        for (name, value) in cookies {
+            let name_wide = wide(name);
+            let value_wide = wide(value);
+            let mut cookie = null_mut();
+            let hr = create_cookie(
+                manager,
+                name_wide.as_ptr(),
+                value_wide.as_ptr(),
+                domain.as_ptr(),
+                path.as_ptr(),
+                &mut cookie,
+            );
+            if hr < 0 || cookie.is_null() {
+                return Err(if hr < 0 {
+                    com_error("ICoreWebView2CookieManager::CreateCookie", hr)
+                } else {
+                    CaptureError::Com("CreateCookie returned a null cookie".to_owned())
+                });
+            }
+            let hr = add_or_update(manager, cookie);
+            release_com(cookie);
+            if hr < 0 {
+                return Err(com_error(
+                    "ICoreWebView2CookieManager::AddOrUpdateCookie",
+                    hr,
+                ));
+            }
+        }
+        Ok(())
     }
 
     unsafe fn read_cookie_list(
@@ -2303,6 +3903,39 @@ mod platform {
             }
         }
         Ok((browser_cookies, cookies))
+    }
+
+    unsafe fn read_response_stream(stream: *mut c_void) -> Option<String> {
+        const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+        const CHUNK_SIZE: usize = 4096;
+        if stream.is_null() {
+            return None;
+        }
+        let read: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *mut u32) -> HRESULT =
+            vtable_fn(stream, 3);
+        let mut bytes = Vec::with_capacity(CHUNK_SIZE);
+        let mut chunk = [0u8; CHUNK_SIZE];
+        loop {
+            let mut count = 0u32;
+            let hr = read(
+                stream,
+                chunk.as_mut_ptr() as *mut c_void,
+                CHUNK_SIZE as u32,
+                &mut count,
+            );
+            if hr < 0 {
+                return None;
+            }
+            let count = count as usize;
+            if count > CHUNK_SIZE || bytes.len().checked_add(count)? > MAX_RESPONSE_BYTES {
+                return None;
+            }
+            bytes.extend_from_slice(&chunk[..count]);
+            if count == 0 {
+                break;
+            }
+        }
+        String::from_utf8(bytes).ok()
     }
 
     unsafe fn read_wide(value: *const u16) -> String {
@@ -2462,53 +4095,10 @@ mod platform {
         let _runtime = runtime_executable().ok_or(CaptureError::RuntimeMissing)?;
         let _com = ComApartment::initialize()?;
         let window = HostWindow::create()?;
-        // QQ 音乐、网易云和酷狗都使用官方 WebView2 登录页并从 DOM/
-        // Canvas 提取二维码。B 站暂时保留已有原生二维码实现。
-        let mut native_qr_receiver = None;
-        let mut native_qr_cancel = None;
-        let context = if provider == "bilibili" {
-            let (sender, receiver) = mpsc::channel();
-            let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            match crate::native_qr::start(
-                provider,
-                remaining,
-                sender,
-                std::sync::Arc::clone(&cancel),
-            ) {
-                Ok(image) => {
-                    if let Err(error) = publish_qr_code(&image) {
-                        cancel.store(true, std::sync::atomic::Ordering::Release);
-                        return Err(error);
-                    }
-                    let html = crate::native_qr::page(provider, &image);
-                    let context = match CaptureContext::new_with_html(provider, window.hwnd, &html)
-                    {
-                        Ok(context) => context,
-                        Err(error) => {
-                            cancel.store(true, std::sync::atomic::Ordering::Release);
-                            return Err(error);
-                        }
-                    };
-                    native_qr_receiver = Some(receiver);
-                    native_qr_cancel = Some(cancel);
-                    Rc::new(context)
-                }
-                Err(_) => {
-                    // Keep the existing WebView login path as a bounded
-                    // compatibility fallback when a provider blocks its QR API.
-                    cancel.store(true, std::sync::atomic::Ordering::Release);
-                    Rc::new(CaptureContext::new(provider, window.hwnd)?)
-                }
-            }
-        } else {
-            Rc::new(CaptureContext::new(provider, window.hwnd)?)
-        };
-        if let Some(receiver) = native_qr_receiver {
-            let mut state = context.state.lock().expect("capture state mutex poisoned");
-            state.native_qr_rx = Some(receiver);
-            state.native_qr_cancel = native_qr_cancel;
-        }
+        // Every provider uses its official page, DOM bridge, and CookieManager
+        // in the same WebView2 profile. No provider-specific native API is
+        // started before or alongside this flow.
+        let context = Rc::new(CaptureContext::new(provider, window.hwnd)?);
         window.attach_context(&context);
         let environment_handler = Box::into_raw(Box::new(EnvironmentHandler {
             vtbl: &ENVIRONMENT_HANDLER_VTABLE,
@@ -2534,15 +4124,9 @@ mod platform {
 
         let outcome = loop {
             pump_messages(&context);
+            context.ensure_initial_navigation();
             context.poll_navigation();
             context.poll_login_exchange();
-            if let Some(image) = context.poll_native_qr()
-                && let Err(error) = publish_qr_code(&image)
-            {
-                // Convert callback failures into the normal outcome path so
-                // COM interfaces and cancellation state are released below.
-                context.finish_error(error);
-            }
             if let Some(image) = context.poll_web_qr()
                 && let Err(error) = publish_qr_code(&image)
             {
@@ -2553,6 +4137,57 @@ mod platform {
             context.poll_cookies();
             context.start_login_exchange();
             if let Some(outcome) = context.take_outcome() {
+                break outcome;
+            }
+            if Instant::now() >= deadline {
+                break Err(CaptureError::Timeout);
+            }
+            thread::sleep(Duration::from_millis(20));
+        };
+        release_context_interfaces(&context);
+        window.clear_context();
+        outcome
+    }
+
+    pub fn request_kugou_json(
+        profile: &Path,
+        timeout: Duration,
+        input: KugouRequestInput,
+    ) -> Result<Value, CaptureError> {
+        set_process_dpi_awareness();
+        let deadline = Instant::now() + timeout;
+        let _runtime = runtime_executable().ok_or(CaptureError::RuntimeMissing)?;
+        let _com = ComApartment::initialize()?;
+        let window = HostWindow::create()?;
+        let context = Rc::new(CaptureContext::new_kugou_request(window.hwnd, input)?);
+        window.attach_context(&context);
+        let environment_handler = Box::into_raw(Box::new(EnvironmentHandler {
+            vtbl: &ENVIRONMENT_HANDLER_VTABLE,
+            refs: AtomicU32::new(1),
+            context: Rc::clone(&context),
+        })) as *mut c_void;
+        let user_data = wide(&profile.to_string_lossy());
+        let result = unsafe {
+            CreateCoreWebView2EnvironmentWithOptions(
+                null(),
+                user_data.as_ptr(),
+                null_mut(),
+                environment_handler,
+            )
+        };
+        unsafe { release_com(environment_handler) };
+        if result < 0 {
+            context.finish_error(com_error(
+                "CreateCoreWebView2EnvironmentWithOptions",
+                result,
+            ));
+        }
+
+        let outcome = loop {
+            pump_messages(&context);
+            context.ensure_initial_navigation();
+            context.poll_kugou_request();
+            if let Some(outcome) = context.take_request_outcome() {
                 break outcome;
             }
             if Instant::now() >= deadline {
@@ -2592,21 +4227,59 @@ mod platform {
     }
 
     fn release_context_interfaces(context: &CaptureContext) {
-        let (environment, cookie_manager, webview, controller) = {
+        let (
+            environment,
+            cookie_manager,
+            webview,
+            controller,
+            web_message_token,
+            web_resource_response_token,
+        ) = {
             let mut state = context.state.lock().expect("capture state mutex poisoned");
             let interfaces = (
                 state.environment,
                 state.cookie_manager,
                 state.webview,
                 state.controller,
+                state.web_message_token,
+                state.web_resource_response_token,
             );
             state.environment = null_mut();
             state.cookie_manager = null_mut();
             state.webview = null_mut();
             state.controller = null_mut();
+            state.web_message_token = None;
+            state.web_resource_response_token = None;
             interfaces
         };
         unsafe {
+            if !webview.is_null() {
+                if let Some(token) = web_resource_response_token {
+                    // remove_WebResourceResponseReceived lives on
+                    // ICoreWebView2_2, so reacquire that interface before
+                    // releasing the base WebView2 object.
+                    let query: unsafe extern "system" fn(
+                        *mut c_void,
+                        *const GUID,
+                        *mut *mut c_void,
+                    ) -> HRESULT = vtable_fn(webview, 0);
+                    let mut webview2 = null_mut();
+                    if query(webview, &IID_WEBVIEW2, &mut webview2) >= 0 && !webview2.is_null() {
+                        let remove_response: unsafe extern "system" fn(
+                            *mut c_void,
+                            i64,
+                        )
+                            -> HRESULT = vtable_fn(webview2, 62);
+                        let _ = remove_response(webview2, token);
+                        release_com(webview2);
+                    }
+                }
+                if let Some(token) = web_message_token {
+                    let remove_web_message: unsafe extern "system" fn(*mut c_void, i64) -> HRESULT =
+                        vtable_fn(webview, 35);
+                    let _ = remove_web_message(webview, token);
+                }
+            }
             release_com(environment);
             release_com(cookie_manager);
             release_com(webview);
@@ -2697,7 +4370,7 @@ mod platform {
 
 #[cfg(not(windows))]
 mod platform {
-    use super::CaptureError;
+    use super::{CaptureError, KugouRequestInput};
     use std::collections::BTreeMap;
     use std::path::Path;
     use std::time::Duration;
@@ -2710,18 +4383,30 @@ mod platform {
     ) -> Result<BTreeMap<String, String>, CaptureError> {
         Err(CaptureError::RuntimeMissing)
     }
+
+    pub fn request_kugou_json(
+        _profile: &Path,
+        _timeout: Duration,
+        _input: KugouRequestInput,
+    ) -> Result<serde_json::Value, CaptureError> {
+        Err(CaptureError::RuntimeMissing)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        QQ_REFRESH_COOKIE_GRACE_PERIOD, allowed_cookie_names, finish_qq_login_exchange,
-        has_qq_refresh_cookies, has_required_cookies, login_url, merge_qq_cookie_updates,
-        merge_qq_login_response_fields, normalize_qq_cookie_aliases, parse_qq_login_callback,
-        parse_web_qr_probe_result, qq_login_response_code, qq_login_response_data,
-        should_complete_capture, web_qr_host_allowed, web_qr_probe_script, web_qr_url_allowed,
+        CaptureError, KugouRequestInput, QQ_REFRESH_COOKIE_GRACE_PERIOD, allowed_cookie_names,
+        bilibili_login_endpoint_url, bilibili_login_payload_is_success,
+        bilibili_refresh_token_from_payload, finish_qq_login_exchange, has_qq_refresh_cookies,
+        has_required_cookies, kugou_request_script, login_url, merge_qq_cookie_updates,
+        merge_qq_login_response_fields, normalize_qq_cookie_aliases, parse_bilibili_login_payload,
+        parse_execute_script_value, parse_qq_login_callback, parse_web_qr_probe_result,
+        qq_login_response_code, qq_login_response_data, should_complete_capture,
+        valid_bilibili_refresh_token, validate_kugou_request_url, web_qr_bridge_script,
+        web_qr_host_allowed, web_qr_probe_script, web_qr_url_allowed,
     };
-    use serde_json::json;
+    use serde_json::{Value, json};
     use std::collections::BTreeMap;
     use std::time::{Duration, Instant};
 
@@ -2730,7 +4415,7 @@ mod tests {
         assert_eq!(
             login_url("qqmusic"),
             Some(
-                "https://xui.ptlogin2.qq.com/cgi-bin/xlogin?appid=716027609&daid=383&style=33&login_text=%E7%99%BB%E5%BD%95&hide_title_bar=1&hide_border=1&target=self&s_url=https%3A%2F%2Fgraph.qq.com%2Foauth2.0%2Flogin_jump&pt_3rd_aid=100497308&pt_feedback_link=https%3A%2F%2Fsupport.qq.com%2Fproducts%2F77942%3FcustomInfo%3D.appid100497308&theme=2&verify_theme=",
+                "https://graph.qq.com/oauth2.0/authorize?response_type=code&client_id=100497308&redirect_uri=https%3A%2F%2Fy.qq.com%2Fportal%2Fwx_redirect.html%3Flogin_type%3D1%26surl%3Dhttps%253A%252F%252Fy.qq.com%252Fn%252Fryqq_v2%252Fprofile&state=state&display=pc&scope=get_user_info%2Cget_app_friends",
             )
         );
         assert_eq!(login_url("netease"), Some("https://music.163.com/"));
@@ -2740,6 +4425,56 @@ mod tests {
         );
         assert_eq!(login_url("bilibili"), Some("https://www.bilibili.com/"));
         assert_eq!(login_url("kuwo"), None);
+    }
+
+    #[test]
+    fn kugou_request_url_validation_is_https_and_host_scoped() {
+        assert!(
+            validate_kugou_request_url("https://wwwapi.kugou.com/play/songinfo?signature=abc")
+                .is_ok()
+        );
+        assert!(
+            validate_kugou_request_url("https://wwwapiretry.kugou.com/play/songinfo?signature=abc")
+                .is_ok()
+        );
+        assert!(
+            validate_kugou_request_url("https://kugouvip.kugou.com/v1/get_union_vip?userid=1")
+                .is_ok()
+        );
+        for url in [
+            "http://wwwapi.kugou.com/play/songinfo",
+            "https://wwwapi.kugou.com/v1/get_union_vip",
+            "https://wwwapi.kugou.com.evil.example/play/songinfo",
+            "https://evil.example/play/songinfo",
+            "https://kugou.com/play/songinfo",
+            "https://kugouvip.kugou.com/v1/other",
+        ] {
+            assert!(matches!(
+                validate_kugou_request_url(url),
+                Err(CaptureError::Io(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn kugou_request_script_uses_official_challenge_and_retry_flow() {
+        let script = kugou_request_script(&KugouRequestInput {
+            url: "https://wwwapi.kugou.com/play/songinfo?signature=abc".to_owned(),
+            userid: "123".to_owned(),
+            mid: "mid-value".to_owned(),
+            cookies: BTreeMap::from([("KuGoo".to_owned(), "session".to_owned())]),
+        })
+        .unwrap();
+        assert!(script.contains("verifyObject.init(1014"));
+        assert!(script.contains("20028"));
+        assert!(script.contains("30020"));
+        assert!(script.contains("SSA-CODE"));
+        assert!(script.contains("wwwapiretry.kugou.com"));
+        assert!(script.contains("credentials: 'include'"));
+        assert!(script.contains("kugou_request_result"));
+        assert!(script.contains("window.chrome.webview.postMessage"));
+        assert!(script.contains("return true;"));
+        assert!(!script.contains("session"));
     }
 
     #[test]
@@ -2759,6 +4494,65 @@ mod tests {
     }
 
     #[test]
+    fn bilibili_login_parser_reads_refresh_token_from_api_data() {
+        let payload = parse_bilibili_login_payload(
+            r#"{"code":0,"data":{"refresh_token":"refresh-token-test"}}"#,
+        )
+        .expect("Bilibili JSON response should parse");
+        assert_eq!(
+            bilibili_refresh_token_from_payload(&payload).as_deref(),
+            Some("refresh-token-test")
+        );
+        assert!(valid_bilibili_refresh_token("refresh-token-test"));
+    }
+
+    #[test]
+    fn bilibili_login_success_is_distinguished_from_qr_waiting() {
+        let waiting =
+            parse_bilibili_login_payload(r#"{"code":0,"data":{"code":86101,"message":"未扫码"}}"#)
+                .expect("waiting response should parse");
+        let success = parse_bilibili_login_payload(
+            r#"{"code":0,"data":{"code":0,"refresh_token":"refresh-token-test"}}"#,
+        )
+        .expect("success response should parse");
+        assert!(!bilibili_login_payload_is_success(&waiting));
+        assert!(bilibili_login_payload_is_success(&success));
+    }
+
+    #[test]
+    fn bilibili_login_endpoint_is_scoped_to_official_login_paths() {
+        assert!(bilibili_login_endpoint_url(
+            "https://passport.bilibili.com/x/passport-login/web/qrcode/poll"
+        ));
+        assert!(bilibili_login_endpoint_url(
+            "https://passport.bilibili.com/x/passport-login/web/cookie/refresh"
+        ));
+        assert!(!bilibili_login_endpoint_url(
+            "https://passport.bilibili.com/x/passport-login/web/qrcode/generate"
+        ));
+        assert!(!bilibili_login_endpoint_url(
+            "https://evil.example/x/passport-login/web/qrcode/poll"
+        ));
+    }
+
+    #[test]
+    fn execute_script_parser_unwraps_quoted_json_values() {
+        let raw = r#"{"ok":true,"body":{"err_code":20010}}"#;
+        assert_eq!(
+            parse_execute_script_value(raw),
+            Some(json!({"ok": true, "body": {"err_code": 20010}}))
+        );
+
+        let quoted = serde_json::to_string(raw).unwrap();
+        assert_eq!(
+            parse_execute_script_value(&quoted),
+            parse_execute_script_value(raw)
+        );
+        assert_eq!(parse_execute_script_value("null"), Some(Value::Null));
+        assert_eq!(parse_execute_script_value("not-json"), None);
+    }
+
+    #[test]
     fn web_qr_probe_script_contains_only_expected_login_actions() {
         let script = web_qr_probe_script();
         assert!(script.contains("data-action=\"login\""));
@@ -2768,11 +4562,31 @@ mod tests {
     }
 
     #[test]
+    fn web_qr_bridge_captures_only_bounded_bilibili_refresh_sources() {
+        let script = web_qr_bridge_script();
+        assert!(script.contains("window.top.postMessage"));
+        assert!(script.contains("chrome.webview.postMessage"));
+        assert!(script.contains("qrlogin_img"));
+        assert!(script.contains("qclogin_success"));
+        assert!(script.contains("bilibili_refresh"));
+        assert!(script.contains("installBilibiliRefreshCapture"));
+        assert!(script.contains("parseBilibiliLoginPayload"));
+        assert!(script.contains("/x/passport-login/web/qrcode/poll"));
+        assert!(script.contains("ac_time_value"));
+        assert!(script.contains("window.localStorage"));
+        assert!(script.contains("store.getItem(name)"));
+        assert!(!script.contains("get_userinfo_qrcode"));
+        assert!(!script.contains("kugou_qr_login"));
+        assert!(!script.contains("document.cookie"));
+    }
+
+    #[test]
     fn web_qr_image_hosts_are_provider_scoped() {
         assert!(web_qr_host_allowed("qqmusic", "xui.ptlogin2.qq.com"));
         assert!(!web_qr_host_allowed("qqmusic", "evil.example.com"));
         assert!(web_qr_host_allowed("netease", "p5.music.126.net"));
         assert!(web_qr_host_allowed("kugou", "login-user.kugou.com"));
+        assert!(web_qr_host_allowed("bilibili", "www.bilibili.com"));
         assert!(!web_qr_host_allowed("kugou", "login-user.qq.com"));
         assert!(web_qr_url_allowed(
             "qqmusic",
@@ -2793,7 +4607,13 @@ mod tests {
         assert!(has_required_cookies("qqmusic", &qq));
         assert!(!has_qq_refresh_cookies(&qq));
         assert!(!has_required_cookies("netease", &qq));
-        let bilibili = BTreeMap::from([("SESSDATA".to_owned(), "session".to_owned())]);
+        let bilibili_anonymous =
+            BTreeMap::from([("SESSDATA".to_owned(), "anonymous-session".to_owned())]);
+        assert!(!has_required_cookies("bilibili", &bilibili_anonymous));
+        let bilibili = BTreeMap::from([
+            ("SESSDATA".to_owned(), "session".to_owned()),
+            ("DedeUserID".to_owned(), "42".to_owned()),
+        ]);
         assert!(has_required_cookies("bilibili", &bilibili));
         assert!(allowed_cookie_names("netease").contains(&"MUSIC_U"));
 
@@ -2811,6 +4631,12 @@ mod tests {
             "t%3Dtoken%26KugooID%3D123%26ct%3D1700000000".to_owned(),
         )]);
         assert!(has_required_cookies("kugou", &kugou_encoded));
+        let kugou_qr = BTreeMap::from([
+            ("KUGOU_QR_TOKEN".to_owned(), "lite-token".to_owned()),
+            ("KUGOU_QR_USERID".to_owned(), "123".to_owned()),
+        ]);
+        assert!(!has_required_cookies("kugou", &kugou_qr));
+        assert!(!allowed_cookie_names("kugou").contains(&"KUGOU_QR_TOKEN"));
     }
 
     #[test]
@@ -2931,8 +4757,11 @@ mod tests {
     }
 
     #[test]
-    fn bilibili_capture_waits_for_refresh_token_after_sessdata() {
-        let basic = BTreeMap::from([("SESSDATA".to_owned(), "session".to_owned())]);
+    fn bilibili_capture_waits_for_refresh_token_after_account_cookies() {
+        let basic = BTreeMap::from([
+            ("SESSDATA".to_owned(), "session".to_owned()),
+            ("DedeUserID".to_owned(), "42".to_owned()),
+        ]);
         let start = Instant::now();
         let mut required_seen_at = None;
 
@@ -2942,13 +4771,14 @@ mod tests {
             &mut required_seen_at,
             start,
         ));
-        assert_eq!(required_seen_at, Some(start));
+        assert_eq!(required_seen_at, None);
     }
 
     #[test]
     fn bilibili_capture_finishes_when_refresh_token_arrives() {
         let refreshable = BTreeMap::from([
             ("SESSDATA".to_owned(), "session".to_owned()),
+            ("DedeUserID".to_owned(), "42".to_owned()),
             ("ac_time_value".to_owned(), "refresh".to_owned()),
         ]);
         let mut required_seen_at = None;
@@ -2963,12 +4793,15 @@ mod tests {
     }
 
     #[test]
-    fn bilibili_capture_falls_back_to_basic_cookies_after_grace_period() {
-        let basic = BTreeMap::from([("SESSDATA".to_owned(), "session".to_owned())]);
+    fn bilibili_capture_never_falls_back_to_basic_cookies() {
+        let basic = BTreeMap::from([
+            ("SESSDATA".to_owned(), "session".to_owned()),
+            ("DedeUserID".to_owned(), "42".to_owned()),
+        ]);
         let start = Instant::now();
         let mut required_seen_at = Some(start);
 
-        assert!(should_complete_capture(
+        assert!(!should_complete_capture(
             "bilibili",
             &basic,
             &mut required_seen_at,

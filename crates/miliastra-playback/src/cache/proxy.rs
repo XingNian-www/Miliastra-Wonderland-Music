@@ -24,6 +24,8 @@ const MAX_REQUEST_HEADER_BYTES: usize = 16 * 1024;
 const STALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// 读取请求头的超时:慢速/挂起的本地连接不应无限占用任务。
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// 响应写入超时：慢/停读客户端不应无限挂住连接任务。
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(crate) async fn spawn_proxy_server(
     inner: Arc<CacheInner>,
@@ -252,18 +254,29 @@ async fn serve_complete(
             let head = format!(
                 "HTTP/1.1 206 Partial Content\r\nContent-Type: application/octet-stream\r\nContent-Length: {length}\r\nContent-Range: bytes {start}-{end}/{total}\r\nConnection: close\r\n\r\n"
             );
-            stream.write_all(head.as_bytes()).await?;
+            write_all_with_timeout(stream, head.as_bytes()).await?;
             copy_file_to_stream(&mut file, stream, length).await?;
         }
         None => {
             let head = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {total}\r\nConnection: close\r\n\r\n"
             );
-            stream.write_all(head.as_bytes()).await?;
+            write_all_with_timeout(stream, head.as_bytes()).await?;
             copy_file_to_stream(&mut file, stream, total).await?;
         }
     }
     Ok(())
+}
+
+async fn write_all_with_timeout(stream: &mut TcpStream, bytes: &[u8]) -> std::io::Result<()> {
+    tokio::time::timeout(WRITE_TIMEOUT, stream.write_all(bytes))
+        .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "写入代理响应超时，客户端停止读取",
+            )
+        })?
 }
 
 async fn copy_file_to_stream(
@@ -278,7 +291,7 @@ async fn copy_file_to_stream(
         if read == 0 {
             break;
         }
-        stream.write_all(&buffer[..read]).await?;
+        write_all_with_timeout(stream, &buffer[..read]).await?;
         remaining -= read as u64;
     }
     Ok(())
@@ -319,11 +332,9 @@ async fn serve_complete_chunked(
         if read == 0 {
             break;
         }
-        stream
-            .write_all(format!("{:x}\r\n", read).as_bytes())
-            .await?;
-        stream.write_all(&buffer[..read]).await?;
-        stream.write_all(b"\r\n").await?;
+        write_all_with_timeout(stream, format!("{:x}\r\n", read).as_bytes()).await?;
+        write_all_with_timeout(stream, &buffer[..read]).await?;
+        write_all_with_timeout(stream, b"\r\n").await?;
         remaining -= read as u64;
     }
     write_chunk_end(stream).await?;
@@ -346,7 +357,7 @@ async fn serve_streaming(
         return Ok(());
     }
     let head = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
-    stream.write_all(head.as_bytes()).await?;
+    write_all_with_timeout(stream, head.as_bytes()).await?;
 
     let mut file = loop {
         match tokio::fs::File::open(
@@ -381,9 +392,6 @@ async fn serve_streaming(
             }
         }
     };
-    if start > 0 {
-        file.seek(std::io::SeekFrom::Start(start)).await?;
-    }
     let mut next_read_offset = start as usize;
     let mut buffer = vec![0u8; IO_CHUNK_SIZE];
     loop {
@@ -395,11 +403,9 @@ async fn serve_streaming(
             if read == 0 {
                 break;
             }
-            stream
-                .write_all(format!("{:x}\r\n", read).as_bytes())
-                .await?;
-            stream.write_all(&buffer[..read]).await?;
-            stream.write_all(b"\r\n").await?;
+            write_all_with_timeout(stream, format!("{:x}\r\n", read).as_bytes()).await?;
+            write_all_with_timeout(stream, &buffer[..read]).await?;
+            write_all_with_timeout(stream, b"\r\n").await?;
             next_read_offset += read;
             continue;
         }
@@ -430,7 +436,7 @@ async fn serve_streaming(
 }
 
 async fn write_chunk_end(stream: &mut TcpStream) -> std::io::Result<()> {
-    stream.write_all(b"0\r\n\r\n").await
+    write_all_with_timeout(stream, b"0\r\n\r\n").await
 }
 
 #[cfg(test)]

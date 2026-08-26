@@ -203,7 +203,7 @@ html[data-theme=light] .theme-toggle .moon{display:none}
       <span class="chip"><i class="dot"></i><span>任务</span><em id="taskId" aria-live="polite">未开始</em></span>
       <span class="chip"><i class="dot"></i><span>工具</span><em>OCR / 模板 / 输入</em></span>
     </div>
-    <div class="top-actions"><button class="btn theme-toggle" onclick="toggleTheme()" title="切换日间 / 夜间模式"><svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg><svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg></button><input class="access-token" id="accessToken" type="password" placeholder="访问令牌" oninput="storeAccessToken()" onchange="loadTemplates()"><a class="btn" href="/">监控面板</a><button class="btn" onclick="loadTools()">刷新任务</button></div>
+    <div class="top-actions"><button class="btn theme-toggle" onclick="toggleTheme()" title="切换日间 / 夜间模式"><svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg><svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg></button><input class="access-token" id="accessToken" type="password" placeholder="访问令牌（自动记住）" oninput="storeAccessToken()" onchange="applyAccessToken()"><a class="btn" href="/">监控面板</a><button class="btn" onclick="loadTools()">刷新任务</button></div>
   </header>
   <main class="grid">
     <section class="panel">
@@ -259,8 +259,19 @@ let activeId=0
 let busy=false
 let templateItems=[]
 const taskStatusLabel={queued:'等待业务空闲',running:'执行中',completed:'已完成',failed:'失败'}
-function accessToken(){return sessionStorage.getItem('miliastraAccessToken')||''}
-function storeAccessToken(){sessionStorage.setItem('miliastraAccessToken',$('accessToken').value)}
+function readTokenCookie(){const match=document.cookie.match(/(?:^|;\s*)miliastraAccessToken=([^;]*)/);return match?decodeURIComponent(match[1]):''}
+function writeTokenCookie(value){
+  if(value){document.cookie='miliastraAccessToken='+encodeURIComponent(value)+';path=/;max-age=31536000;SameSite=Strict'}
+  else{document.cookie='miliastraAccessToken=;path=/;max-age=0;SameSite=Strict'}
+}
+function accessToken(){
+  const fromCookie=readTokenCookie();if(fromCookie)return fromCookie
+  const legacy=sessionStorage.getItem('miliastraAccessToken')||''
+  if(legacy){writeTokenCookie(legacy);sessionStorage.removeItem('miliastraAccessToken')}
+  return legacy
+}
+function storeAccessToken(){writeTokenCookie($('accessToken').value.trim())}
+function applyAccessToken(){storeAccessToken();loadTemplates();loadTools()}
 function requestHeaders(){const token=accessToken();return token?{'X-Miliastra-Token':token}:{}}
 async function request(url,method='GET'){
   const r=await fetch(url,{method,cache:'no-store',headers:requestHeaders()})

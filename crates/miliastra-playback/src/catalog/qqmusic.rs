@@ -267,7 +267,7 @@ impl QqMusicAdapter {
                 "method": "GetPlayLyricInfo",
                 "module": "music.musichallSong.PlayLyricInfo",
                 "param": {
-                    "songMID": song_mid,
+                    "songMid": song_mid,
                     "trans": 1
                 }
             }
@@ -482,6 +482,7 @@ impl QqMusicAdapter {
             }
         };
         let qimei = self.qimei().await;
+        let session = self.qq_session(&uin, music_key, login_type, &qimei).await;
         let payload = qq_refresh_payload(
             &uin,
             music_key,
@@ -494,6 +495,7 @@ impl QqMusicAdapter {
             login_type,
             &self.device,
             &qimei,
+            session.as_ref(),
         );
         let response = self
             .client
@@ -578,6 +580,63 @@ impl QqMusicAdapter {
             "unionid",
         );
         Ok(Some(ProviderCredential::QqMusic { cookies: refreshed }))
+    }
+
+    /// 发起 mobile Login 续期前先取 (uid, sid) 会话标识。请求或解析失败时
+    /// 记录 debug 日志并返回 None，续期继续走不带 sid/uid 的旧路径。
+    async fn qq_session(
+        &self,
+        uin: &str,
+        music_key: &str,
+        login_type: i64,
+        qimei: &QqQimei,
+    ) -> Option<(String, String)> {
+        let payload = json!({
+            "comm": qq_mobile_comm(uin, music_key, login_type, &self.device, qimei, None),
+            "req_0": {
+                "module": "music.getSession.session",
+                "method": "GetSession",
+                "param": {"uid": "", "vkey": 0, "caller": 0}
+            }
+        });
+        let result: Result<Value, CatalogError> = async {
+            let response = self
+                .client
+                .post(self.search_url.clone())
+                .header("Content-Type", "application/json")
+                .header("User-Agent", "QQMusic")
+                .json(&payload)
+                .send()
+                .await
+                .map_err(classify_request_error)?;
+            classify_status(&response)?;
+            response
+                .json::<Value>()
+                .await
+                .map_err(|error| CatalogError::InvalidResponse(error.to_string()))
+        }
+        .await;
+        let body = match result {
+            Ok(body) => body,
+            Err(error) => {
+                tracing::debug!(%error, "QQ GetSession 请求失败，续期按旧路径继续");
+                return None;
+            }
+        };
+        let session = body.pointer("/req_0/data/session").and_then(Value::as_object);
+        let sid = session
+            .and_then(|session| session.get("sid"))
+            .and_then(value_string);
+        let uid = session
+            .and_then(|session| session.get("uid"))
+            .and_then(value_string);
+        match (uid, sid) {
+            (Some(uid), Some(sid)) if !uid.is_empty() && !sid.is_empty() => Some((uid, sid)),
+            _ => {
+                tracing::debug!("QQ GetSession 响应缺少 uid/sid，续期按旧路径继续");
+                None
+            }
+        }
     }
 
     /// QQ Music's current web login stores a WeChat refresh session rather
@@ -1819,6 +1878,20 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (year, month as u32, day as u32)
 }
 
+/// 把 epoch 秒格式化为 UTC+8 的 "YYYY-MM-DD HH:MM:SS"。
+fn format_utc8_datetime(epoch: u64) -> String {
+    let shifted = epoch + 8 * 3600;
+    let days = (shifted / 86_400) as i64;
+    let seconds = shifted % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02}",
+        seconds / 3600,
+        (seconds % 3600) / 60,
+        seconds % 60
+    )
+}
+
 fn qimei_payload(device: &QqDevice) -> Result<QimeiRequest, CatalogError> {
     let mut rng = rand::thread_rng();
     let crypt_key = random_hex(&mut rng, 16);
@@ -1842,7 +1915,7 @@ fn qimei_payload(device: &QqDevice) -> Result<QimeiRequest, CatalogError> {
         "oz": "UhYmelwouA+V2nPWbOvLTgN2/m8jwGB+yUB5v9tysQg=",
         "oo": "Xecjt+9S1+f8Pz2VLSxgpw==",
         "kelong": "0",
-        "uptimes": format!("{}", epoch_secs().saturating_sub(rng.gen_range(0..14_401))),
+        "uptimes": format_utc8_datetime(epoch_secs().saturating_sub(rng.gen_range(0..14_401))),
         "multiUser": "0",
         "bod": device.brand,
         "dv": device.device,
@@ -1950,6 +2023,47 @@ fn md5_hex(value: &str) -> String {
     format!("{:x}", md5::compute(value))
 }
 
+/// 移动端请求的公共 comm 参数。GetSession 拿到的 session 标识带 uid/sid。
+fn qq_mobile_comm(
+    uin: &str,
+    music_key: &str,
+    login_type: i64,
+    device: &QqDevice,
+    qimei: &QqQimei,
+    session: Option<(&str, &str)>,
+) -> Value {
+    let mut comm = json!({
+        "v": QQ_MOBILE_VERSION,
+        "ct": 11,
+        "cv": QQ_MOBILE_VERSION,
+        "chid": "10003505",
+        "QIMEI": qimei.q16,
+        "QIMEI36": qimei.q36,
+        "tmeAppID": "qqmusic",
+        "format": "json",
+        "inCharset": "utf-8",
+        "outCharset": "utf-8",
+        "qq": uin,
+        "authst": music_key,
+        "tmeLoginType": login_type,
+        "OpenUDID": device.android_id,
+        "udid": device.boot_id,
+        "os_ver": device.version.release,
+        "aid": device.android_id,
+        "phonetype": device.model,
+        "devicelevel": device.version.sdk,
+        "newdevicelevel": device.version.sdk,
+        "nettype": "1030",
+        "rom": device.fingerprint,
+        "OpenUDID2": device.android_id
+    });
+    if let Some((uid, sid)) = session {
+        comm["uid"] = json!(uid);
+        comm["sid"] = json!(sid);
+    }
+    comm
+}
+
 #[allow(clippy::too_many_arguments)]
 fn qq_refresh_payload(
     uin: &str,
@@ -1963,6 +2077,7 @@ fn qq_refresh_payload(
     login_type: i64,
     device: &QqDevice,
     qimei: &QqQimei,
+    session: Option<&(String, String)>,
 ) -> Value {
     let param = if login_type == 1 {
         json!({
@@ -1987,31 +2102,14 @@ fn qq_refresh_payload(
         })
     };
     json!({
-        "comm": {
-            "v": QQ_MOBILE_VERSION,
-            "ct": 11,
-            "cv": QQ_MOBILE_VERSION,
-            "chid": "2005000982",
-            "QIMEI": qimei.q16,
-            "QIMEI36": qimei.q36,
-            "tmeAppID": "qqmusic",
-            "format": "json",
-            "inCharset": "utf-8",
-            "outCharset": "utf-8",
-            "qq": uin,
-            "authst": music_key,
-            "tmeLoginType": login_type,
-            "OpenUDID": device.android_id,
-            "udid": device.boot_id,
-            "os_ver": device.version.release,
-            "aid": device.android_id,
-            "phonetype": device.model,
-            "devicelevel": device.version.sdk,
-            "newdevicelevel": device.version.sdk,
-            "nettype": "1030",
-            "rom": device.fingerprint,
-            "OpenUDID2": device.android_id
-        },
+        "comm": qq_mobile_comm(
+            uin,
+            music_key,
+            login_type,
+            device,
+            qimei,
+            session.map(|(uid, sid)| (uid.as_str(), sid.as_str()))
+        ),
         "req": {
             "module": "music.login.LoginServer",
             "method": "Login",
@@ -2997,12 +3095,40 @@ mod tests {
                 q16: "".into(),
                 q36: QQ_QIMEI_FALLBACK.into(),
             },
+            None,
         );
         assert_eq!(payload["req"]["module"], "music.login.LoginServer");
         assert_eq!(payload["req"]["param"]["refresh_key"], "refresh-key");
         assert_eq!(payload["comm"]["qq"], "42");
         assert_eq!(payload["comm"]["tmeLoginType"], 2);
+        assert_eq!(payload["comm"]["chid"], "10003505");
+        assert!(payload["comm"].get("sid").is_none());
+        assert!(payload["comm"].get("uid").is_none());
         assert_eq!(payload["req"]["param"]["musicid"], 42);
+    }
+
+    #[test]
+    fn qq_refresh_payload_carries_get_session_uid_and_sid_in_comm() {
+        let session = ("session-uid".to_owned(), "session-sid".to_owned());
+        let payload = super::qq_refresh_payload(
+            "42",
+            "music-key",
+            "open-id",
+            "access-token",
+            "refresh-token",
+            "refresh-key",
+            "union-id",
+            42,
+            2,
+            &QqDevice::new(),
+            &QqQimei {
+                q16: "".into(),
+                q36: QQ_QIMEI_FALLBACK.into(),
+            },
+            Some(&session),
+        );
+        assert_eq!(payload["comm"]["uid"], "session-uid");
+        assert_eq!(payload["comm"]["sid"], "session-sid");
     }
 
     #[test]
@@ -3022,6 +3148,7 @@ mod tests {
                 q16: "".into(),
                 q36: QQ_QIMEI_FALLBACK.into(),
             },
+            None,
         );
         assert_eq!(payload["comm"]["tmeLoginType"], 1);
         assert_eq!(payload["req"]["param"]["str_musicid"], "42");
@@ -3123,6 +3250,15 @@ mod tests {
         assert!(loaded.qimei_saved_at.is_none());
         assert_eq!(loaded.path, Some(path));
         let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn qimei_uptimes_are_utc8_datetime_strings() {
+        assert_eq!(super::format_utc8_datetime(0), "1970-01-01 08:00:00");
+        assert_eq!(
+            super::format_utc8_datetime(1_756_000_000),
+            "2025-08-24 09:46:40"
+        );
     }
 
     #[test]
@@ -3288,6 +3424,9 @@ mod tests {
         let (endpoint, requests) = fixture_server_sequence(vec![
             Some(r#"{"search":{"code":1000}}"#.to_owned()),
             Some(
+                r#"{"req_0":{"code":0,"data":{"session":{"uid":"4242","sid":"sid-42"}}}}"#.to_owned(),
+            ),
+            Some(
                 r#"{"req":{"code":0,"data":{"musickey":"new-key","musicid":"42","openid":"new-open-id","access_token":"new-access-token","refresh_token":"new-refresh-token","refresh_key":"new-refresh-key"}}}"#.to_owned(),
             ),
             Some(r#"{"search":{"data":{"body":{"song":{"list":[]}}}}}"#.to_owned()),
@@ -3310,11 +3449,16 @@ mod tests {
             .unwrap();
         assert!(result.is_empty());
         let first = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        let session = requests.recv_timeout(Duration::from_secs(2)).unwrap();
         let refresh = requests.recv_timeout(Duration::from_secs(2)).unwrap();
         let retry = requests.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(first.starts_with("GET "));
+        assert!(session.starts_with("POST "));
+        assert!(session.contains("music.getSession.session"));
         assert!(refresh.starts_with("POST "));
         assert!(refresh.contains("refresh_key"));
+        assert!(refresh.contains(r#""sid":"sid-42""#));
+        assert!(refresh.contains(r#""uid":"4242""#));
         assert!(retry.starts_with("GET "));
 
         let current = store.get("qqmusic").unwrap().unwrap();
@@ -3361,6 +3505,8 @@ mod tests {
             .unwrap();
         let (endpoint, requests) = fixture_server_sequence(vec![
             Some(r#"{"search":{"code":1000}}"#.to_owned()),
+            // GetSession 失败不影响续期；续期请求继续走不带 sid/uid 的旧路径。
+            Some(r#"{"req_0":{"code":1000,"data":{}}}"#.to_owned()),
             Some(
                 r#"{"req":{"code":0,"data":{"musickey":"new-key","musicid":"42","openid":"new-open-id","access_token":"new-access-token","refresh_token":"new-refresh-token","refresh_key":"new-refresh-key"}}}"#.to_owned(),
             ),
@@ -3384,9 +3530,13 @@ mod tests {
             .unwrap();
         assert!(result.is_empty());
         let _ = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        let session = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(session.starts_with("POST "));
+        assert!(session.contains("music.getSession.session"));
         let refresh = requests.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(refresh.starts_with("POST "));
         assert!(refresh.contains("refresh_token"));
+        assert!(!refresh.contains(r#""sid""#));
         let _ = requests.recv_timeout(Duration::from_secs(2)).unwrap();
 
         let current = store.get("qqmusic").unwrap().unwrap();
@@ -3609,7 +3759,7 @@ mod tests {
             Some(&json!("GetPlayLyricInfo"))
         );
         assert_eq!(
-            payload.pointer("/req/param/songMID"),
+            payload.pointer("/req/param/songMid"),
             Some(&json!("songMid"))
         );
         assert_eq!(payload.pointer("/req/param/trans"), Some(&json!(1)));
@@ -3620,6 +3770,7 @@ mod tests {
     async fn qq_native_lyrics_retries_after_refresh_and_replays_request_options() {
         let (endpoint, requests) = fixture_server_sequence(vec![
             Some(r#"{"req":{"code":1000,"data":{}}}"#.to_owned()),
+            Some(r#"{"req_0":{"code":0,"data":{"session":{"uid":"4242","sid":"sid-42"}}}}"#.to_owned()),
             Some(r#"{"req":{"code":0,"data":{"musickey":"Q_H_L_rotated","musicid":"42","openid":"open-id","access_token":"access-token-rotated","refresh_token":"refresh-token-rotated","refresh_key":"refresh-key-rotated"}}}"#.to_owned()),
             Some(r#"{"req":{"code":0,"data":{"lyric":"[00:01.00]original","trans":"[00:01.00]translated"}}}"#.to_owned()),
         ]);
@@ -3661,7 +3812,8 @@ mod tests {
         assert_eq!(lyrics.line_at_ms(1_000), Some("translated"));
 
         let first = requests.recv_timeout(Duration::from_secs(2)).unwrap();
-        let second = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        let session = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        let refresh = requests.recv_timeout(Duration::from_secs(2)).unwrap();
         let third = requests.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(first.starts_with("GET "));
         assert!(first.contains("format=json"));
@@ -3671,8 +3823,11 @@ mod tests {
                 .to_ascii_lowercase()
                 .contains("referer: https://y.qq.com/")
         );
-        assert!(second.starts_with("POST "));
-        assert!(!second.contains("sign="));
+        assert!(session.starts_with("POST "));
+        assert!(session.contains("music.getSession.session"));
+        assert!(refresh.starts_with("POST "));
+        assert!(!refresh.contains("sign="));
+        assert!(refresh.contains(r#""sid":"sid-42""#));
         assert!(third.starts_with("GET "));
         assert!(third.contains("format=json"));
         assert!(

@@ -573,22 +573,26 @@ impl MetadataStore {
         ))
     }
 
-    /// 分页查询缓存歌曲列表（按最近使用倒序，hash 作次序兜底），
+    /// 分页查询缓存歌曲列表（排序键映射到固定列，hash 作次序兜底），
     /// 返回 (总条数, 本页记录)。
     pub(super) fn list_tracks(
         &self,
         offset: usize,
         limit: usize,
+        sort: super::CacheTrackSortKey,
+        ascending: bool,
     ) -> Result<(usize, Vec<TrackRecord>), MetadataStoreError> {
         let total: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM cached_tracks WHERE complete = 1",
             [],
             |row| row.get(0),
         )?;
+        let direction = if ascending { "ASC" } else { "DESC" };
+        let column = sort.column();
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {TRACK_COLUMNS} FROM cached_tracks
               WHERE complete = 1
-              ORDER BY updated_at DESC, hash ASC LIMIT ?2 OFFSET ?1"
+              ORDER BY {column} {direction}, hash ASC LIMIT ?2 OFFSET ?1"
         ))?;
         let offset = i64::try_from(offset).map_err(|_| MetadataStoreError::PaginationOverflow {
             parameter: "offset",
@@ -1113,19 +1117,30 @@ mod tests {
             )
             .unwrap();
 
-        let (total, page1) = store.list_tracks(0, 2).unwrap();
+        let (total, page1) = store
+            .list_tracks(0, 2, crate::cache::CacheTrackSortKey::LastUsed, false)
+            .unwrap();
         assert_eq!(total, 3);
         assert_eq!(page1.len(), 2);
         assert_eq!(page1[0].id.as_deref(), Some("c"));
         assert_eq!(page1[1].id.as_deref(), Some("b"));
 
-        let (total, page2) = store.list_tracks(2, 2).unwrap();
+        let (total, page2) = store
+            .list_tracks(2, 2, crate::cache::CacheTrackSortKey::LastUsed, false)
+            .unwrap();
         assert_eq!(total, 3);
         assert_eq!(page2.len(), 1);
         assert_eq!(page2[0].id.as_deref(), Some("a"));
 
         if usize::BITS > i64::BITS {
-            let error = store.list_tracks(usize::MAX, 1).unwrap_err();
+            let error = store
+                .list_tracks(
+                    usize::MAX,
+                    1,
+                    crate::cache::CacheTrackSortKey::LastUsed,
+                    false,
+                )
+                .unwrap_err();
             assert!(matches!(
                 error,
                 MetadataStoreError::PaginationOverflow {
@@ -1134,6 +1149,57 @@ mod tests {
                 }
             ));
         }
+
+        drop(store);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn list_tracks_sorts_by_requested_play_count() {
+        let directory = temp_directory();
+        let store = MetadataStore::open(&directory).unwrap();
+        for (id, count) in [("low", 1u64), ("high", 9), ("mid", 5)] {
+            let track_key = key("kugou", id);
+            store.upsert_track(&track_key, None).unwrap();
+            store
+                .mark_complete(&cache_key_hash(&track_key), 1024, true)
+                .unwrap();
+            store
+                .conn
+                .execute(
+                    "UPDATE cached_tracks SET requested_play_count = ?1 WHERE id = ?2",
+                    params![count, id],
+                )
+                .unwrap();
+        }
+
+        let (_, descending) = store
+            .list_tracks(
+                0,
+                10,
+                crate::cache::CacheTrackSortKey::RequestedPlayCount,
+                false,
+            )
+            .unwrap();
+        let ids: Vec<&str> = descending
+            .iter()
+            .map(|record| record.id.as_deref().unwrap())
+            .collect();
+        assert_eq!(ids, ["high", "mid", "low"]);
+
+        let (_, ascending) = store
+            .list_tracks(
+                0,
+                10,
+                crate::cache::CacheTrackSortKey::RequestedPlayCount,
+                true,
+            )
+            .unwrap();
+        let ids: Vec<&str> = ascending
+            .iter()
+            .map(|record| record.id.as_deref().unwrap())
+            .collect();
+        assert_eq!(ids, ["low", "mid", "high"]);
 
         drop(store);
         std::fs::remove_dir_all(&directory).unwrap();

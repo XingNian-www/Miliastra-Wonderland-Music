@@ -24,12 +24,17 @@ use crate::lyrics::{TimedLyrics, parse_lrc_pair};
 
 const SEARCH_URL: &str = "https://music.163.com/api/search/get";
 const PROVIDER: &str = "netease";
-const MEDIA_URL: &str = "https://music.163.com/weapi/song/enhance/player/url";
+// 解析链路升级到 v1（level 制），参考 NeteaseCloudMusicApiEnhanced/api-enhanced
+// main 分支 module/song_url_v1.js：不再用 br，改用 level + encodeType。
+const MEDIA_URL_V1: &str = "https://music.163.com/weapi/song/enhance/player/url/v1";
+// 旧 v0 端点，仅作为 v1 请求失败时的单次 fallback。
+const MEDIA_URL_V0: &str = "https://music.163.com/weapi/song/enhance/player/url";
 const LYRICS_URL: &str = "https://music.163.com/api/song/lyric";
 /// 账号状态接口（weapi）。返回 profile（昵称/ID/VIP 类型）。
 const ACCOUNT_URL: &str = "https://music.163.com/weapi/nuser/account/get";
 /// 黑胶 VIP 信息接口（weapi）。返回 musicPackage/associator 的 expireTime。
-const VIP_INFO_URL: &str = "https://music.163.com/api/music-vip-membership/front/vip/info";
+/// 参考实现 main 分支 module/vip_info_v2.js 用 client/vip/info，字段结构一致。
+const VIP_INFO_URL: &str = "https://music.163.com/api/music-vip-membership/client/vip/info";
 
 // ===== 网易云 weapi 加密 =====
 // 参考 feeluown-netease：AES-128-CBC 双重加密 + RSA 裸模幂（无填充）。
@@ -86,7 +91,8 @@ pub struct NeteaseAdapter {
     client: Client,
     credentials: CredentialStore,
     search_url: Url,
-    media_url: Url,
+    media_url_v1: Url,
+    media_url_v0: Url,
     lyrics_url: Url,
     account_url: Url,
     vip_url: Url,
@@ -111,7 +117,9 @@ impl NeteaseAdapter {
             credentials,
             search_url: Url::parse(SEARCH_URL)
                 .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?,
-            media_url: Url::parse(MEDIA_URL)
+            media_url_v1: Url::parse(MEDIA_URL_V1)
+                .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?,
+            media_url_v0: Url::parse(MEDIA_URL_V0)
                 .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?,
             lyrics_url: Url::parse(LYRICS_URL)
                 .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?,
@@ -128,6 +136,13 @@ impl NeteaseAdapter {
     #[cfg(test)]
     pub fn with_lyrics_endpoint(mut self, lyrics_url: Url) -> Self {
         self.lyrics_url = lyrics_url;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_media_endpoints(mut self, media_url_v1: Url, media_url_v0: Url) -> Self {
+        self.media_url_v1 = media_url_v1;
+        self.media_url_v0 = media_url_v0;
         self
     }
 
@@ -174,24 +189,54 @@ impl NeteaseAdapter {
 
     async fn resolve_json(&self, id: &str) -> Result<Value, CatalogError> {
         let credential = self.credential()?;
-        let params = serde_json::json!({
-            "ids": format!("[{id}]"),
-            "br": 320000,
-            "csrf_token": credential
+        // v1 请求体 1:1 抄参考实现 module/song_url_v1.js：level 制 + encodeType。
+        // 首选 exhigh；无 VIP 时服务端自动回退到可用 level。
+        let csrf_token = || {
+            credential
                 .cookies()
                 .get("__csrf")
                 .cloned()
-                .unwrap_or_default(),
+                .unwrap_or_default()
+        };
+        let params_v1 = serde_json::json!({
+            "ids": format!("[{id}]"),
+            "level": "exhigh",
+            "encodeType": "flac",
+            "csrf_token": csrf_token(),
         });
-        let payload = weapi_encrypt(&params)?;
+        match self
+            .post_media_url(&self.media_url_v1, &params_v1, &credential)
+            .await
+        {
+            Ok(value) => Ok(value),
+            Err(v1_error) => {
+                // 单次 fallback 到旧 v0（br 制），避免接口回退导致整体不可用；
+                // v0 也失败时报 v1 的原始错误，不再叠加更多链路。
+                let params_v0 = serde_json::json!({
+                    "ids": format!("[{id}]"),
+                    "br": 320000,
+                    "csrf_token": csrf_token(),
+                });
+                self.post_media_url(&self.media_url_v0, &params_v0, &credential)
+                    .await
+                    .map_err(|_| v1_error)
+            }
+        }
+    }
+
+    async fn post_media_url(
+        &self,
+        url: &Url,
+        params: &Value,
+        credential: &ProviderCredential,
+    ) -> Result<Value, CatalogError> {
+        let payload = weapi_encrypt(params)?;
         let response = self
             .client
-            .post(self.media_url.clone())
+            .post(url.clone())
             .form(&payload)
-            .header("Cookie", cookie_header(credential.cookies()))
+            .header("Cookie", weapi_cookie_header(credential.cookies()))
             .header("Referer", "https://music.163.com/")
-            // 服务端风控：缺 x-os: web 时返回的播放 URL 无效（下载 403）。
-            .header("x-os", "web")
             .send()
             .await
             .map_err(classify_request_error)?;
@@ -303,9 +348,8 @@ impl NeteaseAdapter {
             .client
             .post(self.account_url.clone())
             .form(&payload)
-            .header("Cookie", cookie_header(credential.cookies()))
+            .header("Cookie", weapi_cookie_header(credential.cookies()))
             .header("Referer", "https://music.163.com/")
-            .header("x-os", "web")
             .send()
             .await
             .map_err(classify_request_error)?;
@@ -335,7 +379,7 @@ impl NeteaseAdapter {
             .or_else(|| profile.get("newVipType"))
             .and_then(Value::as_i64)
             .unwrap_or(0);
-        // 黑胶 VIP 到期时间（weapi /api/music-vip-membership/front/vip/info）。
+        // 黑胶 VIP 到期时间（weapi /api/music-vip-membership/client/vip/info）。
         // 查询失败不阻塞账号状态，到期时间保持未知。
         let vip_expire_at_ms = self
             .vip_expire_at_ms(&credential, profile.get("userId"))
@@ -374,9 +418,8 @@ impl NeteaseAdapter {
             .client
             .post(self.vip_url.clone())
             .form(&payload)
-            .header("Cookie", cookie_header(credential.cookies()))
+            .header("Cookie", weapi_cookie_header(credential.cookies()))
             .header("Referer", "https://music.163.com/")
-            .header("x-os", "web")
             .send()
             .await
             .ok()?;
@@ -401,9 +444,8 @@ impl NeteaseAdapter {
             .client
             .post(self.account_url.clone())
             .form(&payload)
-            .header("Cookie", cookie_header(credential.cookies()))
+            .header("Cookie", weapi_cookie_header(credential.cookies()))
             .header("Referer", "https://music.163.com/")
-            .header("x-os", "web")
             .send()
             .await
             .map_err(classify_request_error)?;
@@ -731,6 +773,26 @@ fn cookie_header(cookies: &BTreeMap<String, String>) -> String {
         .join("; ")
 }
 
+/// weapi 请求的风控 cookie：参考实现 util/request.js 的 weapi 路径不注入
+/// x-os header，而是在 cookie 里补齐 pc 客户端标识。取值 1:1 抄 main 分支
+/// osMap.pc（os/appver/osver/channel）；用户 cookie 已有的键不覆盖。
+fn weapi_cookie_header(cookies: &BTreeMap<String, String>) -> String {
+    let mut merged = cookies.clone();
+    let defaults = [
+        ("os", "pc"),
+        ("appver", "3.1.17.204416"),
+        (
+            "osver",
+            "Microsoft-Windows-10-Professional-build-19045-64bit",
+        ),
+        ("channel", "netease"),
+    ];
+    for (key, value) in defaults {
+        merged.entry(key.to_owned()).or_insert_with(|| value.to_owned());
+    }
+    cookie_header(&merged)
+}
+
 fn classify_status(response: &reqwest::Response) -> Result<(), CatalogError> {
     match response.status() {
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(CatalogError::AuthRequired(
@@ -813,6 +875,34 @@ mod tests {
             )
             .unwrap();
         store
+    }
+
+    /// 顺序响应多个连接的测试服务器：每个连接按序消费一条 (状态码, body)，
+    /// 同时把原始请求文本发回 channel 供断言。
+    fn sequence_server(responses: Vec<(u16, String)>) -> (String, mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            for (status, body) in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut request = [0_u8; 64 * 1024];
+                let size = stream.read(&mut request).unwrap();
+                sender
+                    .send(String::from_utf8_lossy(&request[..size]).into_owned())
+                    .unwrap();
+                let reason = if status == 200 { "OK" } else { "Error" };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        (format!("http://{address}"), receiver)
     }
 
     #[test]
@@ -948,5 +1038,65 @@ mod tests {
         let request = request.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(request.contains("/song/lyric?id=42&lv=-1&kv=1&tv=-1"));
         assert!(request.to_ascii_lowercase().contains("cookie:"));
+    }
+
+    fn media_adapter(base: &str) -> NeteaseAdapter {
+        NeteaseAdapter::new(credentials(), Duration::from_secs(2))
+            .unwrap()
+            .with_media_endpoints(
+                Url::parse(&format!("{base}/weapi/song/enhance/player/url/v1")).unwrap(),
+                Url::parse(&format!("{base}/weapi/song/enhance/player/url")).unwrap(),
+            )
+    }
+
+    #[tokio::test]
+    async fn netease_resolve_uses_v1_level_and_cookie_risk_headers() {
+        let body = json!({"code":200,"data":[{"url":"https://m8.music.126.net/song.flac","expi":120}]})
+            .to_string();
+        let (base, requests) = sequence_server(vec![(200, body)]);
+        let adapter = media_adapter(&base);
+        let key = SongKey::new("netease", "42").unwrap();
+
+        let source = adapter.resolve(&key, None).await.unwrap();
+
+        assert_eq!(source.url.as_str(), "https://m8.music.126.net/song.flac");
+        let request = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(request.contains("/weapi/song/enhance/player/url/v1"));
+        // 风控字段走 cookie 注入（os/appver 等），不再用 x-os header。
+        let lower = request.to_ascii_lowercase();
+        assert!(lower.contains("os=pc"));
+        assert!(lower.contains("appver=3.1.17.204416"));
+        assert!(lower.contains("channel=netease"));
+        assert!(lower.contains("music_u=secret"));
+        assert!(!lower.contains("x-os:"));
+    }
+
+    #[tokio::test]
+    async fn netease_resolve_falls_back_to_v0_once_when_v1_fails() {
+        let ok = json!({"code":200,"data":[{"url":"https://m8.music.126.net/song.mp3","expi":120}]})
+            .to_string();
+        let (base, requests) = sequence_server(vec![(500, "{}".to_owned()), (200, ok)]);
+        let adapter = media_adapter(&base);
+        let key = SongKey::new("netease", "42").unwrap();
+
+        let source = adapter.resolve(&key, None).await.unwrap();
+
+        assert_eq!(source.url.as_str(), "https://m8.music.126.net/song.mp3");
+        let first = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        let second = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(first.contains("/weapi/song/enhance/player/url/v1"));
+        assert!(second.contains("/weapi/song/enhance/player/url HTTP"));
+    }
+
+    #[tokio::test]
+    async fn netease_resolve_reports_v1_error_when_both_versions_fail() {
+        let (base, _requests) =
+            sequence_server(vec![(500, "{}".to_owned()), (500, "{}".to_owned())]);
+        let adapter = media_adapter(&base);
+        let key = SongKey::new("netease", "42").unwrap();
+
+        let error = adapter.resolve(&key, None).await.unwrap_err();
+
+        assert!(matches!(error, CatalogError::Transient(_)));
     }
 }

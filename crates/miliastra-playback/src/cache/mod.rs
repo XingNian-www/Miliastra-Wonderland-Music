@@ -132,6 +132,34 @@ pub struct CachedTrackInfo {
     pub downloaded_at_ms: Option<u64>,
 }
 
+/// 磁盘缓存歌曲列表的排序键。HTTP 查询参数与 SQL 列的白名单映射，
+/// 避免把外部输入拼进 ORDER BY。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CacheTrackSortKey {
+    /// 最近使用（updated_at），默认。
+    #[default]
+    LastUsed,
+    PlayCount,
+    /// 点歌触发的播放次数。
+    RequestedPlayCount,
+    CacheHitCount,
+    FailureCount,
+    Bytes,
+}
+
+impl CacheTrackSortKey {
+    pub(crate) fn column(self) -> &'static str {
+        match self {
+            Self::LastUsed => "updated_at",
+            Self::PlayCount => "play_count",
+            Self::RequestedPlayCount => "requested_play_count",
+            Self::CacheHitCount => "cache_hit_count",
+            Self::FailureCount => "failure_count",
+            Self::Bytes => "bytes",
+        }
+    }
+}
+
 /// 磁盘缓存歌曲分页结果。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -628,15 +656,21 @@ impl AudioCache {
         )
     }
 
-    /// 分页查询磁盘缓存歌曲列表（按最近使用倒序；数据来自元数据索引）。
+    /// 分页查询磁盘缓存歌曲列表（支持排序键与升降序；数据来自元数据索引）。
     /// 缓存未启用或查询失败时返回空页并记录 warning，不中断调用方。
-    pub fn cached_tracks(&self, offset: usize, limit: usize) -> CachedTrackPage {
+    pub fn cached_tracks(
+        &self,
+        offset: usize,
+        limit: usize,
+        sort: CacheTrackSortKey,
+        ascending: bool,
+    ) -> CachedTrackPage {
         let inner = &self.inner;
         if !inner.config.enabled {
             return CachedTrackPage::empty(offset, limit);
         }
         let store = lock_metadata_store(&inner.metadata_store);
-        match store.list_tracks(offset, limit) {
+        match store.list_tracks(offset, limit, sort, ascending) {
             Ok((total, records)) => CachedTrackPage {
                 total,
                 offset,

@@ -188,7 +188,13 @@ enum Command {
         )>,
     ),
     /// 分页查询磁盘缓存歌曲列表（SQLite 查询走 spawn_blocking，不阻塞事件循环）。
-    CachedTracks(usize, usize, Reply<crate::cache::CachedTrackPage>),
+    CachedTracks(
+        usize,
+        usize,
+        crate::cache::CacheTrackSortKey,
+        bool,
+        Reply<crate::cache::CachedTrackPage>,
+    ),
     /// 清零单曲统计；保留音频缓存、曲目元数据与歌词。
     ResetTrackStatistics(crate::domain::SongKey, Reply<bool>),
     Shutdown(Reply<()>),
@@ -567,8 +573,10 @@ impl PlaybackHandle {
         &self,
         offset: usize,
         limit: usize,
+        sort: crate::cache::CacheTrackSortKey,
+        ascending: bool,
     ) -> Result<crate::cache::CachedTrackPage, PlaybackError> {
-        self.request(|reply| Command::CachedTracks(offset, limit, reply))
+        self.request(|reply| Command::CachedTracks(offset, limit, sort, ascending, reply))
     }
 
     /// 清零单曲播放与缓存统计。缓存资产、身份元数据和歌词不变。
@@ -911,17 +919,32 @@ async fn run_commands(
                 let Some(pending) = pending_login.take() else {
                     continue;
                 };
+                let save_credentials = credentials.clone();
+                let save_core = core.clone();
                 let result = match completion {
-                    Some(Ok((_, completion))) => completion
-                        .result
-                        .map_err(PlaybackError::from)
-                        .and_then(|()| {
-                            let status = credentials
-                                .save(pending.provider.as_str(), pending.credential)
-                                .map_err(internal_error)?;
-                            let _ = core.invalidate_account_status(pending.provider);
-                            Ok(status)
-                        }),
+                    Some(Ok((_, completion))) => match completion.result {
+                        Ok(()) => {
+                            let provider = pending.provider;
+                            let credential = pending.credential.clone();
+                            // 落盘移入阻塞线程池，登录验证完成的保存不卡命令循环。
+                            let saved = match tokio::task::spawn_blocking(move || {
+                                save_credentials.save(provider.as_str(), credential)
+                            })
+                            .await
+                            {
+                                Ok(Ok(status)) => Ok(status),
+                                Ok(Err(error)) => Err(internal_error(error)),
+                                Err(error) => Err(PlaybackError::Internal(format!(
+                                    "凭据保存任务失败: {error}"
+                                ))),
+                            };
+                            if saved.is_ok() {
+                                let _ = save_core.invalidate_account_status(provider);
+                            }
+                            saved
+                        }
+                        Err(error) => Err(PlaybackError::from(error)),
+                    },
                     Some(Err(error)) if error.is_cancelled() => Err(PlaybackError::Failure(
                         Failure::new("playback_cancelled", "credential validation was cancelled"),
                     )),
@@ -1186,24 +1209,50 @@ async fn run_commands(
             }
             Command::SaveCredential(credential, reply) => {
                 let provider = credential.provider();
-                let result = credentials
-                    .save(provider, credential)
-                    .map_err(internal_error)
-                    .inspect(|_| {
+                let save_credentials = credentials.clone();
+                let save_credential = credential;
+                let save_core = core.clone();
+                // 落盘含 fsync 与 ACL 设置，移入阻塞线程池避免卡住播放命令循环。
+                tokio::spawn(async move {
+                    let result = match tokio::task::spawn_blocking(move || {
+                        save_credentials.save(provider, save_credential)
+                    })
+                    .await
+                    {
+                        Ok(Ok(status)) => Ok(status),
+                        Ok(Err(error)) => Err(internal_error(error)),
+                        Err(error) => Err(PlaybackError::Internal(format!(
+                            "凭据保存任务失败: {error}"
+                        ))),
+                    };
+                    let result = result.inspect(|_| {
                         if let Ok(provider) = provider.parse::<ProviderId>() {
-                            let _ = core.invalidate_account_status(provider);
+                            let _ = save_core.invalidate_account_status(provider);
                         }
                     });
-                let _ = reply.send(result);
+                    let _ = reply.send(result);
+                });
             }
             Command::Logout(provider, reply) => {
-                let result = credentials
-                    .remove(provider.as_str())
-                    .map_err(internal_error)
-                    .inspect(|_| {
-                        let _ = core.invalidate_account_status(provider);
+                let remove_credentials = credentials.clone();
+                let remove_core = core.clone();
+                tokio::spawn(async move {
+                    let result = match tokio::task::spawn_blocking(move || {
+                        remove_credentials.remove(provider.as_str())
+                    })
+                    .await
+                    {
+                        Ok(Ok(status)) => Ok(status),
+                        Ok(Err(error)) => Err(internal_error(error)),
+                        Err(error) => Err(PlaybackError::Internal(format!(
+                            "凭据删除任务失败: {error}"
+                        ))),
+                    };
+                    let result = result.inspect(|_| {
+                        let _ = remove_core.invalidate_account_status(provider);
                     });
-                let _ = reply.send(result);
+                    let _ = reply.send(result);
+                });
             }
             Command::BeginLogin(provider, reply) => {
                 let result = core
@@ -1297,18 +1346,20 @@ async fn run_commands(
                     let _ = reply.send(Ok((None, Vec::new())));
                 }
             },
-            Command::CachedTracks(offset, limit, reply) => match core.audio_cache.clone() {
-                Some(cache) => {
-                    // SQLite 查询可能耗时，移到阻塞线程池，避免阻塞播放事件循环。
-                    tokio::task::spawn_blocking(move || {
-                        let page = cache.cached_tracks(offset, limit);
-                        let _ = reply.send(Ok(page));
-                    });
+            Command::CachedTracks(offset, limit, sort, ascending, reply) => {
+                match core.audio_cache.clone() {
+                    Some(cache) => {
+                        // SQLite 查询可能耗时，移到阻塞线程池，避免阻塞播放事件循环。
+                        tokio::task::spawn_blocking(move || {
+                            let page = cache.cached_tracks(offset, limit, sort, ascending);
+                            let _ = reply.send(Ok(page));
+                        });
+                    }
+                    None => {
+                        let _ = reply.send(Ok(crate::cache::CachedTrackPage::empty(offset, limit)));
+                    }
                 }
-                None => {
-                    let _ = reply.send(Ok(crate::cache::CachedTrackPage::empty(offset, limit)));
-                }
-            },
+            }
             Command::ResetTrackStatistics(key, reply) => match core.audio_cache.clone() {
                 Some(cache) => {
                     tokio::spawn(async move {

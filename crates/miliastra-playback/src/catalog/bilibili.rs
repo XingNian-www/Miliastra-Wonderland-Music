@@ -30,7 +30,8 @@ const SEARCH_URL: &str = "https://api.bilibili.com/x/web-interface/wbi/search/ty
 const PROVIDER: &str = "bilibili";
 const NAV_URL: &str = "https://api.bilibili.com/x/web-interface/nav";
 const VIEW_URL: &str = "https://api.bilibili.com/x/web-interface/view";
-const PLAYURL_URL: &str = "https://api.bilibili.com/x/player/playurl";
+// 官方已把播放地址接口迁到 wbi 签名路径；旧 /x/player/playurl 不再可靠。
+const PLAYURL_URL: &str = "https://api.bilibili.com/x/player/wbi/playurl";
 const COOKIE_INFO_URL: &str = "https://passport.bilibili.com/x/passport-login/web/cookie/info";
 const CORRESPOND_URL: &str = "https://www.bilibili.com/correspond/1/";
 const COOKIE_REFRESH_URL: &str =
@@ -54,11 +55,27 @@ pub struct BilibiliAdapter {
     cookie_refresh_url: Url,
     confirm_refresh_url: Url,
     account_cache: Arc<Mutex<AccountStatusCache>>,
+    wbi_keys: Arc<Mutex<Option<WbiKeys>>>,
+}
+
+/// nav 接口下发的 wbi 实时口令（img_key/sub_key），每日更替，按小时缓存。
+struct WbiKeys {
+    img_key: String,
+    sub_key: String,
+    fetched_at: std::time::Instant,
+}
+
+impl WbiKeys {
+    fn mixin_key(&self) -> String {
+        mixin_key(&self.img_key, &self.sub_key)
+    }
 }
 
 impl BilibiliAdapter {
     const ACCOUNT_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
     const ACCOUNT_CACHE_FAILED_TTL: Duration = Duration::from_secs(15 * 60);
+    // wbi 口令全站统一、每日更替，TTL 1 小时足够覆盖轮换窗口。
+    const WBI_KEYS_TTL: Duration = Duration::from_secs(60 * 60);
 
     pub fn new(credentials: CredentialStore, timeout: Duration) -> Result<Self, CatalogError> {
         let client = Client::builder()
@@ -86,6 +103,7 @@ impl BilibiliAdapter {
             confirm_refresh_url: Url::parse(CONFIRM_REFRESH_URL)
                 .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?,
             account_cache: Arc::new(Mutex::new(AccountStatusCache::default())),
+            wbi_keys: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -264,17 +282,92 @@ impl BilibiliAdapter {
         .await
     }
 
+    /// 获取 wbi 口令：优先读 1 小时缓存，其次请求 nav 接口实时提取，
+    /// 均失败则回退到 wbi.md 文档示例中的公开 fallback 口令。
+    async fn wbi_keys(&self) -> WbiKeys {
+        {
+            let guard = self.wbi_keys.lock().ok();
+            if let Some(keys) = guard
+                .as_ref()
+                .and_then(|guard| guard.as_ref())
+                .filter(|keys| keys.fetched_at.elapsed() < Self::WBI_KEYS_TTL)
+            {
+                return WbiKeys {
+                    img_key: keys.img_key.clone(),
+                    sub_key: keys.sub_key.clone(),
+                    fetched_at: keys.fetched_at,
+                };
+            }
+        }
+        if let Some(keys) = self.fetch_nav_wbi_keys().await {
+            if let Ok(mut guard) = self.wbi_keys.lock() {
+                *guard = Some(WbiKeys {
+                    img_key: keys.img_key.clone(),
+                    sub_key: keys.sub_key.clone(),
+                    fetched_at: keys.fetched_at,
+                });
+            }
+            return keys;
+        }
+        WbiKeys {
+            img_key: WBI_FALLBACK_IMG_KEY.to_owned(),
+            sub_key: WBI_FALLBACK_SUB_KEY.to_owned(),
+            fetched_at: std::time::Instant::now(),
+        }
+    }
+
+    /// 从 nav 接口提取 wbi_img 文件名作为口令（文件名即 32 位十六进制 token）。
+    /// nav 在未登录时也返回 wbi_img（code=-101），故这里不走 classify_api_response，
+    /// 只做结构解析；任何一步失败都返回 None（由调用方回退）。
+    async fn fetch_nav_wbi_keys(&self) -> Option<WbiKeys> {
+        let snapshot = self.credentials.snapshot(PROVIDER).ok()??;
+        let response = self
+            .client
+            .get(self.nav_url.clone())
+            .header("Cookie", cookie_header(snapshot.credential.cookies()))
+            .header("Referer", REFERER)
+            .header("User-Agent", USER_AGENT)
+            .send()
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let body = response.json::<Value>().await.ok()?;
+        let img_url = body.pointer("/data/wbi_img/img_url")?.as_str()?;
+        let sub_url = body.pointer("/data/wbi_img/sub_url")?.as_str()?;
+        Some(WbiKeys {
+            img_key: wbi_filename_key(img_url)?,
+            sub_key: wbi_filename_key(sub_url)?,
+            fetched_at: std::time::Instant::now(),
+        })
+    }
+
+    /// 给参数追加 wts/w_rid wbi 签名。
+    ///
+    /// 说明：若 nav 已拿到口令但签名请求仍返回 -352/-412（风控），
+    /// 直接按 classify_api_response 的映射上报错误，不做重试。
+    async fn sign_wbi(&self, params: &mut Vec<(String, String)>) {
+        let keys = self.wbi_keys().await;
+        let wts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as u32;
+        sign_wbi_params(params, &keys.mixin_key(), wts);
+    }
+
     async fn search_json(&self, keyword: &str, limit: usize) -> Result<Value, CatalogError> {
-        self.get_json(
-            &self.search_url,
-            &[
-                ("search_type".to_owned(), "video".to_owned()),
-                ("keyword".to_owned(), keyword.to_owned()),
-                ("page".to_owned(), "1".to_owned()),
-                ("page_size".to_owned(), limit.clamp(1, 10).to_string()),
-            ],
-        )
-        .await
+        // 现状：/x/web-interface/wbi/search/type 已强制 wbi 签名（w_rid/wts），
+        // 未签名请求会被风控接管（回 code:0 + data.v_voucher 空壳）。
+        // 这里先按 nav 下发的 img_key/sub_key 生成签名再提交。
+        let mut params = vec![
+            ("search_type".to_owned(), "video".to_owned()),
+            ("keyword".to_owned(), keyword.to_owned()),
+            ("page".to_owned(), "1".to_owned()),
+            ("page_size".to_owned(), limit.clamp(1, 10).to_string()),
+        ];
+        self.sign_wbi(&mut params).await;
+        self.get_json(&self.search_url, &params).await
     }
 
     async fn view_json(&self, bvid: &str) -> Result<Value, CatalogError> {
@@ -291,20 +384,19 @@ impl BilibiliAdapter {
             .ok_or_else(|| {
                 CatalogError::Unavailable("Bilibili video has no playable first page".to_owned())
             })?;
-        self.get_json(
-            &self.playurl_url,
-            &[
-                ("bvid".to_owned(), bvid.to_owned()),
-                ("cid".to_owned(), cid.to_string()),
-                // 16 requests independent DASH streams.  We consume audio only.
-                ("fnval".to_owned(), "16".to_owned()),
-                ("fnver".to_owned(), "0".to_owned()),
-                ("fourk".to_owned(), "0".to_owned()),
-                ("platform".to_owned(), "pc".to_owned()),
-                ("otype".to_owned(), "json".to_owned()),
-            ],
-        )
-        .await
+        // /x/player/wbi/playurl 与旧接口参数一致，但要求 wbi 签名。
+        let mut params = vec![
+            ("bvid".to_owned(), bvid.to_owned()),
+            ("cid".to_owned(), cid.to_string()),
+            // 16 requests independent DASH streams.  We consume audio only.
+            ("fnval".to_owned(), "16".to_owned()),
+            ("fnver".to_owned(), "0".to_owned()),
+            ("fourk".to_owned(), "0".to_owned()),
+            ("platform".to_owned(), "pc".to_owned()),
+            ("otype".to_owned(), "json".to_owned()),
+        ];
+        self.sign_wbi(&mut params).await;
+        self.get_json(&self.playurl_url, &params).await
     }
 
     async fn persist_set_cookie_updates(
@@ -961,6 +1053,79 @@ fn parse_refresh_csrf(html: &str) -> Option<String> {
     None
 }
 
+// ---- wbi 签名（按 bilibili-API-collect `docs/misc/sign/wbi.md` 1:1 实现） ----
+
+/// wbi.md 给出的重排映射表原表。
+const MIXIN_KEY_ENC_TAB: [u8; 64] = [
+    46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49, 33, 9, 42, 19,
+    29, 28, 14, 39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30, 4,
+    22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52,
+];
+
+// nav 接口不可用时的公开 fallback 口令（取自 wbi.md 的未登录响应示例；
+// 口令每日更替，fallback 仅保证请求可发出，失败时按 -352/-412 原样上报）。
+const WBI_FALLBACK_IMG_KEY: &str = "7cd084941338484aae1ad9425b84077c";
+const WBI_FALLBACK_SUB_KEY: &str = "4932caff0ff746eab6f01bf08b70ac45";
+
+/// 从 wbi 图片 url 截取文件名（不含扩展名）作为口令，
+/// 如 `https://i0.hdslb.com/bfs/wbi/<32hex>.png`。
+fn wbi_filename_key(url: &str) -> Option<String> {
+    url.rsplit('/')
+        .next()?
+        .split('.')
+        .next()
+        .filter(|key| !key.is_empty())
+        .map(str::to_owned)
+}
+
+/// img_key 拼接 sub_key 后按 MIXIN_KEY_ENC_TAB 取前 32 字节。
+fn mixin_key(img_key: &str, sub_key: &str) -> String {
+    let raw = [img_key, sub_key].concat();
+    let raw = raw.as_bytes();
+    MIXIN_KEY_ENC_TAB
+        .iter()
+        .take(32)
+        .map(|&index| raw[index as usize] as char)
+        .collect()
+}
+
+/// 按 wbi.md 规则编码：过滤 !'()* 字符；其余按 encodeURIComponent 语义
+/// （字母数字与 -_.~ 直出，其余 %XX 大写十六进制，空格为 %20 而非 +）。
+fn wbi_url_encode(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for character in value.chars() {
+        if character.is_ascii_alphanumeric() || "-_.~".contains(character) {
+            encoded.push(character);
+        } else if "!\'()*".contains(character) {
+            // 过滤掉
+        } else {
+            let mut buffer = [0_u8; 4];
+            for byte in character.encode_utf8(&mut buffer).as_bytes() {
+                encoded.push_str(&format!("%{byte:02X}"));
+            }
+        }
+    }
+    encoded
+}
+
+/// 对参数做 wbi 签名：值过滤 !'()* → 追加 wts → 按 key 排序编码 →
+/// w_rid = md5(query + mixin_key) → 追加 w_rid。直接原地改写 params。
+fn sign_wbi_params(params: &mut Vec<(String, String)>, mixin_key: &str, wts: u32) {
+    params.push(("wts".to_owned(), wts.to_string()));
+    for (_, value) in params.iter_mut() {
+        *value = value.chars().filter(|c| !"!'()*".contains(*c)).collect();
+    }
+    let mut sorted = params.clone();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    let query = sorted
+        .iter()
+        .map(|(key, value)| format!("{}={}", wbi_url_encode(key), wbi_url_encode(value)))
+        .collect::<Vec<_>>()
+        .join("&");
+    let w_rid = format!("{:x}", md5::compute(query + mixin_key));
+    params.push(("w_rid".to_owned(), w_rid));
+}
+
 fn classify_api_response(response: &Value) -> Result<(), CatalogError> {
     let code = response.get("code").and_then(as_i64).ok_or_else(|| {
         CatalogError::InvalidResponse("Bilibili response is missing code".to_owned())
@@ -1025,7 +1190,8 @@ mod tests {
 
     use super::{
         BilibiliAdapter, PlaybackEligibility, bilibili_dash_audio_url, bilibili_resolver_bvid,
-        is_bvid, normalize_bvid, parse_duration_ms, parse_search_candidates,
+        is_bvid, mixin_key, normalize_bvid, parse_duration_ms, parse_search_candidates,
+        sign_wbi_params, wbi_url_encode,
     };
     use crate::catalog::{CatalogError, ProviderAccountStatus, SourceAdapter};
     use crate::credentials::{CredentialStore, ProviderCredential};
@@ -1060,6 +1226,22 @@ mod tests {
             Url::parse(&format!("http://{address}/bilibili-fixture")).unwrap(),
             receiver,
         )
+    }
+
+    /// nav 接口的 wbi_img 响应体；签名路径下搜索/播放前会先请求一次 nav。
+    fn nav_wbi_fixture() -> String {
+        json!({
+            "code": 0,
+            "data": {
+                "isLogin": true,
+                "mid": 12345,
+                "wbi_img": {
+                    "img_url": "https://i0.hdslb.com/bfs/wbi/7cd084941338484aae1ad9425b84077c.png",
+                    "sub_url": "https://i0.hdslb.com/bfs/wbi/4932caff0ff746eab6f01bf08b70ac45.png"
+                }
+            }
+        })
+        .to_string()
     }
 
     fn credentials() -> CredentialStore {
@@ -1208,6 +1390,48 @@ mod tests {
     }
 
     #[test]
+    fn wbi_mixin_key_matches_the_document_vector() {
+        // wbi.md 官方示例：img_key/sub_key 打乱取前 32 位得到 mixin_key。
+        assert_eq!(
+            mixin_key(
+                "7cd084941338484aae1ad9425b84077c",
+                "4932caff0ff746eab6f01bf08b70ac45"
+            ),
+            "ea1db124af3c7062474693fa704f4ff8"
+        );
+    }
+
+    #[test]
+    fn wbi_encoding_filters_special_chars_and_uppercases_percent_hex() {
+        // wbi.md：空格编码为 %20（而非 +），百分号十六进制大写，!'()* 被剔除。
+        assert_eq!(wbi_url_encode("五一四"), "%E4%BA%94%E4%B8%80%E5%9B%9B");
+        assert_eq!(wbi_url_encode("one one four"), "one%20one%20four");
+        assert_eq!(wbi_url_encode("a!b'c(d)e*f"), "abcdef");
+    }
+
+    #[test]
+    fn wbi_sign_matches_the_document_vector() {
+        // wbi.md 原例：排序编码 + mixin_key 的 md5 即 w_rid。
+        let mut params = vec![
+            ("foo".to_owned(), "114".to_owned()),
+            ("bar".to_owned(), "514".to_owned()),
+            ("zab".to_owned(), "1919810".to_owned()),
+        ];
+        sign_wbi_params(&mut params, "ea1db124af3c7062474693fa704f4ff8", 1702204169);
+        assert!(
+            params
+                .iter()
+                .any(|(key, value)| key == "w_rid" && value == "8f6f2b5b3d485fe1886cec6a0be8c5d4"),
+            "params={params:?}"
+        );
+        assert!(
+            params
+                .iter()
+                .any(|(key, value)| key == "wts" && value == "1702204169")
+        );
+    }
+
+    #[test]
     fn bvid_matches_the_official_character_table() {
         // 官方示例与真实 BV 号。
         for bvid in [
@@ -1328,8 +1552,10 @@ mod tests {
 
     #[tokio::test]
     async fn search_keeps_using_search_api_for_plain_keywords() {
-        let (endpoint, requests) =
-            fixture_server(vec![json!({"code": 0, "data": {"result": []}}).to_string()]);
+        let (endpoint, requests) = fixture_server(vec![
+            nav_wbi_fixture(),
+            json!({"code": 0, "data": {"result": []}}).to_string(),
+        ]);
         let adapter = BilibiliAdapter::with_endpoints(
             credentials(),
             Duration::from_secs(2),
@@ -1349,8 +1575,12 @@ mod tests {
             .unwrap();
 
         assert!(result.is_empty());
+        let nav_request = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(nav_request.contains("/bilibili-fixture"));
         let request = requests.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(request.contains("search_type=video"));
+        assert!(request.contains("wts="));
+        assert!(request.contains("w_rid="));
     }
 
     #[tokio::test]
@@ -1373,6 +1603,7 @@ mod tests {
     async fn resolve_uses_injected_endpoints_and_never_forwards_cookies_to_the_cdn() {
         let (endpoint, requests) = fixture_server(vec![
             json!({"code": 0, "data": {"cid": 42}}).to_string(),
+            nav_wbi_fixture(),
             json!({"code": 0, "data": {"dash": {"audio": [{
                 "base_url": "https://cdn.example.test/audio.m4s", "bandwidth": 192000
             }]}}})
@@ -1398,9 +1629,12 @@ mod tests {
         );
         assert!(source.headers.contains_key("User-Agent"));
         let view_request = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        let _nav_request = requests.recv_timeout(Duration::from_secs(2)).unwrap();
         let playurl_request = requests.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(view_request.contains("bvid=BV1xx411c7mD"));
         assert!(playurl_request.contains("cid=42"));
+        assert!(playurl_request.contains("wts="));
+        assert!(playurl_request.contains("w_rid="));
         assert!(
             view_request
                 .to_ascii_lowercase()
@@ -1411,6 +1645,7 @@ mod tests {
     #[tokio::test]
     async fn search_uses_injected_endpoint_and_transmits_bilibili_cookie() {
         let (endpoint, requests) = fixture_server(vec![
+            nav_wbi_fixture(),
             json!({
                 "code": 0,
                 "data": {"result": []}
@@ -1436,8 +1671,10 @@ mod tests {
             .unwrap();
 
         assert!(result.is_empty());
+        let _nav_request = requests.recv_timeout(Duration::from_secs(2)).unwrap();
         let request = requests.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(request.contains("search_type=video"));
+        assert!(request.contains("w_rid="));
         assert!(
             request
                 .to_ascii_lowercase()

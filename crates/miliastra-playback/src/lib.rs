@@ -10,8 +10,8 @@ mod model;
 mod runtime;
 
 pub use cache::{
-    AudioCache, AudioCacheConfig, AudioCacheStats, AudioCacheTrackStatus, CachedTrackInfo,
-    CachedTrackPage, DEFAULT_MAX_REGISTRY_ENTRIES,
+    AudioCache, AudioCacheConfig, AudioCacheStats, AudioCacheTrackStatus, CacheTrackSortKey,
+    CachedTrackInfo, CachedTrackPage, DEFAULT_MAX_REGISTRY_ENTRIES,
 };
 pub use catalog::{
     KugouAccountStatus, KugouAdapter, KugouListenReport, PlaybackEligibility,

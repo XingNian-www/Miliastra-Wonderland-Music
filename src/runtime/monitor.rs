@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
-use std::sync::mpsc::{self, Sender, SyncSender};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -308,49 +309,70 @@ impl MonitorProjection {
     }
 }
 
+fn new_projection(log_limit: usize) -> MonitorProjection {
+    MonitorProjection {
+        state: MonitorState {
+            logs: VecDeque::new(),
+            log_limit: log_limit.max(20),
+            ocr: None,
+            queue: Vec::new(),
+            commands: VecDeque::new(),
+            status: "启动中".to_string(),
+            playback_controller: MonitorPlaybackController::default(),
+            chat_listener: MonitorChatListener::default(),
+            operational: MonitorOperationalState {
+                commands_enabled: true,
+                ..MonitorOperationalState::default()
+            },
+            ui_routine: None,
+            pending_tasks: Vec::new(),
+            web_tools: Arc::from(Vec::<DiagnosticTaskSnapshot>::new()),
+            tasks: Vec::new(),
+            task_engine_generation: None,
+            decision: None,
+            turtle_soup: TurtleSoupSnapshot::default(),
+            undercover: UndercoverSnapshot::default(),
+        },
+    }
+}
+
+fn run_monitor_projection(receiver: Receiver<MonitorMessage>, log_limit: usize) {
+    loop {
+        let result = catch_unwind(AssertUnwindSafe(|| projection_loop(&receiver, log_limit)));
+        match result {
+            Ok(()) => return,
+            Err(payload) => {
+                // 投影线程 panic 后重建投影状态继续服务，不让面板/日志静默停滞；
+                // 已消费但未 apply 完成的事件无法重放，状态以下一条事件为准收敛。
+                log::error!("监控投影线程 panic，重建投影状态后继续: {payload:?}");
+                thread::sleep(Duration::from_millis(500));
+            }
+        }
+    }
+}
+
+fn projection_loop(receiver: &Receiver<MonitorMessage>, log_limit: usize) {
+    let mut projection = new_projection(log_limit);
+    while let Ok(message) = receiver.recv() {
+        match message {
+            MonitorMessage::Event(event) => projection.apply(*event),
+            MonitorMessage::Snapshot(response) => {
+                let _ = response.send(projection.snapshot());
+            }
+            MonitorMessage::Shutdown(response) => {
+                let _ = response.send(());
+                break;
+            }
+        }
+    }
+}
+
 impl MonitorShared {
     pub(crate) fn new(log_limit: usize) -> Self {
-        let mut projection = MonitorProjection {
-            state: MonitorState {
-                logs: VecDeque::new(),
-                log_limit: log_limit.max(20),
-                ocr: None,
-                queue: Vec::new(),
-                commands: VecDeque::new(),
-                status: "启动中".to_string(),
-                playback_controller: MonitorPlaybackController::default(),
-                chat_listener: MonitorChatListener::default(),
-                operational: MonitorOperationalState {
-                    commands_enabled: true,
-                    ..MonitorOperationalState::default()
-                },
-                ui_routine: None,
-                pending_tasks: Vec::new(),
-                web_tools: Arc::from(Vec::<DiagnosticTaskSnapshot>::new()),
-                tasks: Vec::new(),
-                task_engine_generation: None,
-                decision: None,
-                turtle_soup: TurtleSoupSnapshot::default(),
-                undercover: UndercoverSnapshot::default(),
-            },
-        };
         let (events, receiver) = mpsc::channel::<MonitorMessage>();
         let worker = thread::Builder::new()
             .name("monitor-projection".to_string())
-            .spawn(move || {
-                while let Ok(message) = receiver.recv() {
-                    match message {
-                        MonitorMessage::Event(event) => projection.apply(*event),
-                        MonitorMessage::Snapshot(response) => {
-                            let _ = response.send(projection.snapshot());
-                        }
-                        MonitorMessage::Shutdown(response) => {
-                            let _ = response.send(());
-                            break;
-                        }
-                    }
-                }
-            })
+            .spawn(move || run_monitor_projection(receiver, log_limit))
             .expect("启动监控投影线程失败");
         Self {
             runtime: Arc::new(MonitorRuntime {

@@ -267,12 +267,36 @@ pub(super) fn playback_cache_tracks_route(
         return Err(bad_request("limit参数必须是1-500"));
     }
     let limit = limit.min(CACHE_TRACKS_MAX_LIMIT);
+    let sort = parse_cache_track_sort(query_value(query, "sort"))?;
+    let ascending = match query_value(query, "order").map(str::trim) {
+        None | Some("") | Some("desc") => false,
+        Some("asc") => true,
+        Some(_) => return Err(bad_request("order只允许desc/asc")),
+    };
     let page = state
         .application
         .player
-        .cached_tracks(offset, limit)
+        .cached_tracks(offset, limit, sort, ascending)
         .map_err(internal_error)?;
     serde_json::to_string(&page).map_err(internal_error)
+}
+
+/// sort 参数白名单：缺省为最近使用倒序，其余取值映射到固定排序键。
+fn parse_cache_track_sort(
+    value: Option<&str>,
+) -> std::result::Result<miliastra_playback::CacheTrackSortKey, AppError> {
+    use miliastra_playback::CacheTrackSortKey as Key;
+    match value.map(str::trim) {
+        None | Some("") | Some("last_used") => Ok(Key::LastUsed),
+        Some("play_count") => Ok(Key::PlayCount),
+        Some("requested_play_count") => Ok(Key::RequestedPlayCount),
+        Some("cache_hit_count") => Ok(Key::CacheHitCount),
+        Some("failure_count") => Ok(Key::FailureCount),
+        Some("bytes") => Ok(Key::Bytes),
+        Some(_) => Err(bad_request(
+            "sort只允许last_used/play_count/requested_play_count/cache_hit_count/failure_count/bytes",
+        )),
+    }
 }
 
 /// 解析分页参数：缺省返回 `default`；非整数（含负数）返回 bad request。

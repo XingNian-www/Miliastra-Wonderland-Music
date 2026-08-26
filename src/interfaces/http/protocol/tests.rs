@@ -668,7 +668,13 @@ impl HttpPlayerPort for HttpTestPlayerPort {
         ))
     }
 
-    fn cached_tracks(&self, offset: usize, limit: usize) -> Result<CachedTrackPage> {
+    fn cached_tracks(
+        &self,
+        offset: usize,
+        limit: usize,
+        _sort: miliastra_playback::CacheTrackSortKey,
+        _ascending: bool,
+    ) -> Result<CachedTrackPage> {
         // 模拟两条已知曲目与一条未知孤儿（无身份信息）的混合分页数据。
         let tracks = vec![
             CachedTrackInfo {

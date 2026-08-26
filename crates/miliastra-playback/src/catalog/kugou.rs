@@ -106,8 +106,8 @@ pub struct KugouAdapter {
     client: Client,
     credentials: CredentialStore,
     legacy_device: Option<KugouDeviceIdentity>,
-    /// Production playback routes Web songinfo through the WebView2 helper so
-    /// the official SSA challenge can run in a real browser context.
+    /// Web 请求默认直连；仅当酷狗返回 SSA 挑战时才回落到此 WebView2 helper，
+    /// 让挑战在真实浏览器上下文内完成。
     login_helper_executable: Option<PathBuf>,
     web_request_lock: Arc<tokio::sync::Mutex<()>>,
     /// 账号状态整体缓存（成功 24 小时/失败 15 分钟），防止轮询频繁打账号接口触发风控。
@@ -822,7 +822,9 @@ impl KugouAdapter {
         let mut params = BTreeMap::from([
             ("srcappid".to_owned(), KUGOU_WEB_SRCAPPID.to_owned()),
             ("clientver".to_owned(), KUGOU_WEB_CLIENTVER.to_owned()),
-            ("clienttime".to_owned(), epoch_ms().to_string()),
+            // 秒级时间戳，对齐上游 KuGouMusicApi request.js 的
+            // `Math.floor(Date.now() / 1000)`。
+            ("clienttime".to_owned(), epoch_secs().to_string()),
             ("mid".to_owned(), Self::web_credential_mid(credential)),
             ("uuid".to_owned(), Self::web_credential_mid(credential)),
             (
@@ -920,6 +922,36 @@ impl KugouAdapter {
         .map_err(|error| CatalogError::Transient(error.to_string()))??)
     }
 
+    /// 直连酷狗 Web 端点。返回 `Ok(Some)` 为正常 JSON；检测到 SSA 挑战
+    /// （`ssa-code` 响应头或非 JSON 安全页正文）返回 `Ok(None)`，由调用方
+    /// 回落 WebView2 helper；其余 HTTP 错误照常上抛。
+    async fn web_get_direct(
+        &self,
+        url: &str,
+        params: &BTreeMap<String, String>,
+        credential: &ProviderCredential,
+    ) -> Result<Option<Value>, CatalogError> {
+        let response = self
+            .client
+            .get(url)
+            .query(params)
+            .header("User-Agent", KUGOU_WEB_UA)
+            .header("Referer", "https://www.kugou.com/")
+            .header("Origin", "https://www.kugou.com")
+            .header("Cookie", Self::web_credential_cookie_header(credential))
+            .send()
+            .await
+            .map_err(classify_request_error)?;
+        if response.headers().contains_key("ssa-code") {
+            return Ok(None);
+        }
+        classify_status(&response)?;
+        match response.json::<Value>().await {
+            Ok(value) => Ok(Some(value)),
+            Err(_) => Ok(None),
+        }
+    }
+
     /// Send a Web songinfo request without interpreting its business status.
     /// Resolve needs the complete error envelope so it can distinguish a VIP
     /// restriction from an invalid credential.
@@ -931,28 +963,21 @@ impl KugouAdapter {
         let mut params = Self::web_songinfo_params(credential, selector)?;
         let signature = kugou_web_signature(&params);
         params.insert("signature".to_owned(), signature);
+        if let Some(value) = self
+            .web_get_direct(URL_WEB_SONGINFO, &params, credential)
+            .await?
+        {
+            return Ok(value);
+        }
         if let Some(executable) = self.login_helper_executable.as_deref() {
             let url = Self::web_request_url(URL_WEB_SONGINFO, &params)?;
             return self
                 .web_request_via_helper(url, credential, executable)
                 .await;
         }
-        let response = self
-            .client
-            .get(URL_WEB_SONGINFO)
-            .query(&params)
-            .header("User-Agent", KUGOU_WEB_UA)
-            .header("Referer", "https://www.kugou.com/")
-            .header("Origin", "https://www.kugou.com")
-            .header("Cookie", Self::web_credential_cookie_header(credential))
-            .send()
-            .await
-            .map_err(classify_request_error)?;
-        classify_status(&response)?;
-        response
-            .json::<Value>()
-            .await
-            .map_err(|error| CatalogError::InvalidResponse(error.to_string()))
+        Err(CatalogError::Transient(
+            "Kugou SSA challenge requires the WebView2 login helper".to_owned(),
+        ))
     }
 
     async fn validate_web_credential(
@@ -985,26 +1010,21 @@ impl KugouAdapter {
         credential: &ProviderCredential,
     ) -> Result<Value, CatalogError> {
         let params = Self::web_union_vip_params(credential)?;
+        if let Some(value) = self
+            .web_get_direct(URL_YOUTH_UNION_VIP, &params, credential)
+            .await?
+        {
+            return Ok(value);
+        }
         if let Some(executable) = self.login_helper_executable.as_deref() {
             let url = Self::web_request_url(URL_YOUTH_UNION_VIP, &params)?;
             return self
                 .web_request_via_helper(url, credential, executable)
                 .await;
         }
-
-        // Unit-test and embedding compatibility fallback. The production
-        // runtime wires the helper executable, so authenticated VIP lookups
-        // use the browser WebView2 session above.
-        self.get_json_direct(
-            URL_YOUTH_UNION_VIP,
-            vec![
-                ("busi_type", "concept".to_owned()),
-                ("opt_product_types", "dvip,qvip".to_owned()),
-                ("product_type", "svip".to_owned()),
-            ],
-            Some(credential),
-        )
-        .await
+        Err(CatalogError::Transient(
+            "Kugou SSA challenge requires the WebView2 login helper".to_owned(),
+        ))
     }
 
     async fn get_json_direct(
@@ -1047,22 +1067,19 @@ impl KugouAdapter {
         Ok(value)
     }
 
-    /// Send a signed request whose query is supplied verbatim.  The upstream
-    /// lyric-search module opts into `clearDefaultParams`, so its signature
-    /// covers only the endpoint-specific fields and not the normal device
-    /// defaults.
+    /// Send a request whose query is supplied verbatim, without a signature.
+    /// The upstream lyric-search module opts into `clearDefaultParams` and
+    /// `notSign`, so `lyrics.kugou.com/v1/search` only carries the
+    /// endpoint-specific fields and no device defaults or signature.
     async fn get_json_explicit_params(
         &self,
         endpoint: &str,
         query: BTreeMap<String, String>,
         credential: Option<&ProviderCredential>,
     ) -> Result<Value, CatalogError> {
-        let mut signed = query;
-        let signature = kugou_android_signature(&signed, "");
-        signed.insert("signature".to_owned(), signature);
         let device = Self::device_params(credential, KUGOU_LITE_APPID, KUGOU_LITE_CLIENTVER);
         let mut request =
-            Self::apply_device_headers(self.client.get(endpoint).query(&signed), &device);
+            Self::apply_device_headers(self.client.get(endpoint).query(&query), &device);
         if let Some(cred) = credential {
             request = request.header("Cookie", Self::credential_cookie_header(cred));
         }
@@ -1548,6 +1565,20 @@ impl KugouAdapter {
         status
     }
 
+    /// 歌词搜索的完整查询参数；上游模块标记 notSign，参数里不含 signature。
+    fn lyrics_search_params(hash: &str, album_audio_id: &str) -> BTreeMap<String, String> {
+        BTreeMap::from([
+            ("album_audio_id".to_owned(), album_audio_id.to_owned()),
+            ("appid".to_owned(), KUGOU_LITE_APPID.to_string()),
+            ("clientver".to_owned(), KUGOU_LITE_CLIENTVER.to_string()),
+            ("duration".to_owned(), "0".to_owned()),
+            ("hash".to_owned(), hash.to_owned()),
+            ("keyword".to_owned(), String::new()),
+            ("lrctxt".to_owned(), "1".to_owned()),
+            ("man".to_owned(), "no".to_owned()),
+        ])
+    }
+
     async fn lyrics_json(
         &self,
         hash: &str,
@@ -1557,16 +1588,7 @@ impl KugouAdapter {
         let result = self
             .get_json_explicit_params(
                 URL_SEARCH_LYRIC,
-                BTreeMap::from([
-                    ("album_audio_id".to_owned(), album_audio_id.to_owned()),
-                    ("appid".to_owned(), KUGOU_LITE_APPID.to_string()),
-                    ("clientver".to_owned(), KUGOU_LITE_CLIENTVER.to_string()),
-                    ("duration".to_owned(), "0".to_owned()),
-                    ("hash".to_owned(), hash.to_owned()),
-                    ("keyword".to_owned(), String::new()),
-                    ("lrctxt".to_owned(), "1".to_owned()),
-                    ("man".to_owned(), "no".to_owned()),
-                ]),
+                Self::lyrics_search_params(hash, album_audio_id),
                 Some(credential),
             )
             .await?;
@@ -1763,6 +1785,13 @@ impl SourceAdapter for KugouAdapter {
             guard.invalidate();
         }
     }
+}
+
+fn epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn epoch_ms() -> u64 {
@@ -2951,6 +2980,37 @@ mod tests {
         let mut unsigned = params.clone();
         let signature = unsigned.remove("signature").expect("Web signature");
         assert_eq!(signature, super::kugou_web_signature(&unsigned));
+    }
+
+    #[test]
+    fn lyrics_search_query_omits_signature() {
+        let params = super::KugouAdapter::lyrics_search_params("ABCDEF0123456789", "42");
+        assert!(!params.contains_key("signature"));
+        // 参数集合与上游 search_lyric.js 的 dataMap 一致。
+        assert_eq!(params.len(), 8);
+        assert_eq!(
+            params.get("album_audio_id").map(String::as_str),
+            Some("42")
+        );
+        assert_eq!(params.get("hash").map(String::as_str), Some("ABCDEF0123456789"));
+        assert_eq!(params.get("man").map(String::as_str), Some("no"));
+    }
+
+    #[test]
+    fn web_chain_clienttime_is_epoch_seconds() {
+        let credential = ProviderCredential::Kugou {
+            token: "token-secret".to_owned(),
+            userid: "123".to_owned(),
+            dfid: "web-dfid-field".to_owned(),
+            cookies: BTreeMap::new(),
+        };
+        let params = super::KugouAdapter::web_songinfo_params(&credential, None).unwrap();
+        let clienttime = params.get("clienttime").expect("web clienttime");
+        // 秒级时间戳当前为 10 位数字；毫秒级为 13 位。
+        assert!(clienttime.chars().all(|c| c.is_ascii_digit()));
+        assert_eq!(clienttime.len(), 10);
+        let parsed = clienttime.parse::<u64>().unwrap();
+        assert!(parsed.abs_diff(super::epoch_secs()) <= 60);
     }
 
     #[test]

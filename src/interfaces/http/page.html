@@ -683,6 +683,22 @@ input.config-invalid:focus,textarea.config-invalid:focus{border-color:var(--dang
       <div class="panel">
         <div class="panel-head"><h2>磁盘缓存歌曲</h2><small id="cacheTracksMeta">读取中</small></div>
         <div class="panel-body">
+          <div class="controls" style="margin-bottom:var(--sp-3)">
+            <select id="cacheTracksSort" onchange="cacheTracksSortChanged()" style="flex:1">
+              <option value="last_used:desc">最近使用（新→旧）</option>
+              <option value="last_used:asc">最近使用（旧→新）</option>
+              <option value="requested_play_count:desc">点歌次数（多→少）</option>
+              <option value="requested_play_count:asc">点歌次数（少→多）</option>
+              <option value="play_count:desc">播放次数（多→少）</option>
+              <option value="play_count:asc">播放次数（少→多）</option>
+              <option value="cache_hit_count:desc">缓存命中（多→少）</option>
+              <option value="cache_hit_count:asc">缓存命中（少→多）</option>
+              <option value="failure_count:desc">失败次数（多→少）</option>
+              <option value="failure_count:asc">失败次数（少→多）</option>
+              <option value="bytes:desc">文件大小（大→小）</option>
+              <option value="bytes:asc">文件大小（小→大）</option>
+            </select>
+          </div>
           <div class="cache-track-list" id="cacheTracks">读取中</div>
           <div class="controls" style="margin-top:var(--sp-3)">
             <button class="btn ghost" id="cacheTracksPrev" onclick="changeCacheTracksPage(-1)">上一页</button>
@@ -820,7 +836,7 @@ input.config-invalid:focus,textarea.config-invalid:focus{border-color:var(--dang
       <div class="panel">
         <div class="panel-head"><h2>访问令牌</h2><small>可选</small></div>
         <div class="panel-body">
-          <input id="accessToken" type="password" placeholder="访问令牌（可选）" oninput="storeAccessToken()" onchange="loadOperatorWorkflows()" style="width:100%">
+          <input id="accessToken" type="password" placeholder="访问令牌（可选，自动记住）" oninput="storeAccessToken()" onchange="applyAccessToken()" style="width:100%">
         </div>
       </div>
     </aside>
@@ -942,8 +958,27 @@ function setResult(value){
   }
   $('result').textContent=typeof value==='string'?value:JSON.stringify(value,null,2)
 }
-function accessToken(){return sessionStorage.getItem('miliastraAccessToken')||''}
-function storeAccessToken(){sessionStorage.setItem('miliastraAccessToken',$('accessToken').value)}
+function readTokenCookie(){const match=document.cookie.match(/(?:^|;\s*)miliastraAccessToken=([^;]*)/);return match?decodeURIComponent(match[1]):''}
+function writeTokenCookie(value){
+  if(value){document.cookie='miliastraAccessToken='+encodeURIComponent(value)+';path=/;max-age=31536000;SameSite=Strict'}
+  else{document.cookie='miliastraAccessToken=;path=/;max-age=0;SameSite=Strict'}
+}
+function accessToken(){
+  const fromCookie=readTokenCookie();if(fromCookie)return fromCookie
+  const legacy=sessionStorage.getItem('miliastraAccessToken')||''
+  if(legacy){writeTokenCookie(legacy);sessionStorage.removeItem('miliastraAccessToken')}
+  return legacy
+}
+function storeAccessToken(){writeTokenCookie($('accessToken').value.trim())}
+// 令牌生效后立即重拉全部一次性和周期数据，避免逐个页面手动 F5。
+function applyAccessToken(){
+  storeAccessToken()
+  refreshAll()
+  loadLoginState()
+  loadOperatorWorkflows()
+  loadToolTasks()
+  if(document.querySelector('.page-section.active')?.dataset.page==='config')loadConfigPage()
+}
 function requestHeaders(){const token=accessToken();return token?{'X-Miliastra-Token':token}:{}}
 function sourceLabel(v){return v==='netease'?'网易':v==='qqmusic'?'QQ':v==='bilibili'?'B站':v||'聚合'}
 function queryText(q){const rows=Object.entries(q||{}).filter(([,v])=>v!=null&&String(v)!=='');return rows.length?' '+rows.map(([k,v])=>k+'='+v).join(' '):''}
@@ -1108,6 +1143,15 @@ let cacheTracksLoading=false
 const cacheTracksPageSize=100
 let cacheTracksOffset=0
 let cacheTracksItems=[]
+let cacheTracksSort='last_used'
+let cacheTracksAscending=false
+function cacheTracksSortChanged(){
+  const [key,dir]=(($('cacheTracksSort').value)||'last_used:desc').split(':')
+  cacheTracksSort=key||'last_used'
+  cacheTracksAscending=dir==='asc'
+  cacheTracksOffset=0
+  loadCacheTracks()
+}
 function renderCacheTracks(page){
   const total=page&&page.total||0
   const tracks=Array.isArray(page&&page.tracks)?page.tracks:[]
@@ -1152,7 +1196,7 @@ async function loadCacheTracks(){
   if(cacheTracksLoading)return
   cacheTracksLoading=true
   try{
-    const page=await request('/playback/cache/tracks?offset='+cacheTracksOffset+'&limit='+cacheTracksPageSize)
+    const page=await request('/playback/cache/tracks?offset='+cacheTracksOffset+'&limit='+cacheTracksPageSize+'&sort='+cacheTracksSort+'&order='+(cacheTracksAscending?'asc':'desc'))
     if(page.total>0&&cacheTracksOffset>=page.total){cacheTracksOffset=Math.floor((page.total-1)/cacheTracksPageSize)*cacheTracksPageSize;cacheTracksLoading=false;return loadCacheTracks()}
     renderCacheTracks(page)
   }

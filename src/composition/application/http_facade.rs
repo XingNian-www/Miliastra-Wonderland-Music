@@ -581,8 +581,16 @@ impl HttpPlayerPort for ApplicationHttpPlayerFacade {
         Ok(self.playback.cache_stats(keys)?)
     }
 
-    fn cached_tracks(&self, offset: usize, limit: usize) -> Result<CachedTrackPage> {
-        Ok(self.playback.cached_tracks(offset, limit)?)
+    fn cached_tracks(
+        &self,
+        offset: usize,
+        limit: usize,
+        sort: miliastra_playback::CacheTrackSortKey,
+        ascending: bool,
+    ) -> Result<CachedTrackPage> {
+        Ok(self
+            .playback
+            .cached_tracks(offset, limit, sort, ascending)?)
     }
 
     fn reset_track_statistics(&self, key: &TrackKey) -> Result<bool> {

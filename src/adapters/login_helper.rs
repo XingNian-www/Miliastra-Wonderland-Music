@@ -143,7 +143,6 @@ trait ManagedChild: Send {
     /// Returns `Some(success)` once the child has been reaped.
     fn try_wait(&mut self) -> io::Result<Option<bool>>;
     fn kill(&mut self) -> io::Result<()>;
-    fn wait(&mut self) -> io::Result<bool>;
 }
 
 struct SpawnedHelper {
@@ -338,10 +337,6 @@ impl ManagedChild for CommandChild {
 
     fn kill(&mut self) -> io::Result<()> {
         self.child.kill()
-    }
-
-    fn wait(&mut self) -> io::Result<bool> {
-        self.child.wait().map(|status| status.success())
     }
 }
 
@@ -1676,7 +1671,18 @@ fn wait_child_until(child: &SharedChild, deadline: Instant) -> io::Result<bool> 
                 .map_err(|_| io::Error::other("login helper process state is unavailable"))?;
             if let Some(mut process) = process.take() {
                 let _ = process.kill();
-                return process.wait();
+                // 有限等待被杀进程退出，避免极端情况下无界阻塞登录请求。
+                let wait_deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    if let Some(success) = process.try_wait()? {
+                        drop(process);
+                        return Ok(success);
+                    }
+                    if Instant::now() >= wait_deadline {
+                        return Ok(true);
+                    }
+                    thread::sleep(REAPER_POLL);
+                }
             }
             return Ok(true);
         }
@@ -1979,14 +1985,6 @@ mod tests {
             state.success = false;
             self.state.1.notify_all();
             Ok(())
-        }
-
-        fn wait(&mut self) -> io::Result<bool> {
-            let mut state = self.state.0.lock().unwrap();
-            while !state.exited {
-                state = self.state.1.wait(state).unwrap();
-            }
-            Ok(state.success)
         }
     }
 

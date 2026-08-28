@@ -939,7 +939,7 @@ impl CardGameService {
                 result?;
                 Ok(CardGameResume::Completed(CardGameCompletion { action }))
             }
-            _ => unreachable!("pending effect type was checked before removal"),
+            _ => Err(anyhow!("牌局待处理效果恢复分支异常")),
         }
     }
 
@@ -1393,8 +1393,8 @@ impl CardGameService {
                     (Some(CardGameTimedOutcome { action, request }), false)
                 }
                 CardGameResume::Completed(_) => (None, release_on_completion),
-                CardGameResume::Late(_) => {
-                    unreachable!("a newly registered timed effect cannot be late")
+                CardGameResume::Late(completion) => {
+                    return Err(anyhow!("新登记的牌局定时效果异常失效: {completion:?}"));
                 }
             }
         };

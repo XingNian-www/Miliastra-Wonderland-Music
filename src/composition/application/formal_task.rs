@@ -31,6 +31,8 @@ use crate::runtime::ui::UiCoordinator;
 
 const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 const DROP_SHUTDOWN_GRACE: Duration = Duration::from_millis(100);
+/// 正式任务超时后给任务线程的宽限等待窗口。
+const FORMAL_TASK_JOIN_GRACE: Duration = Duration::from_secs(2);
 
 struct FormalTaskExecutionState {
     context: Mutex<Option<FormalTaskExecutionContext>>,
@@ -416,7 +418,14 @@ impl FormalTaskRuntime {
                 false
             }
             Err(RecvTimeoutError::Timeout) => {
-                drop(worker);
+                // stop_requested 已置位，任务线程完成当前任务后即退出；
+                // 宽限等待后仍超时才分离线程，避免 shutdown 无限阻塞。
+                let joined = self.finished.recv_timeout(FORMAL_TASK_JOIN_GRACE).is_ok();
+                if joined {
+                    let _ = worker.join();
+                } else {
+                    drop(worker);
+                }
                 true
             }
         };
@@ -868,7 +877,8 @@ mod tests {
             .expect("bounded formal task runtime shutdown");
 
         assert!(report.timed_out());
-        assert!(shutdown_started.elapsed() < Duration::from_millis(200));
+        // 超时后先给任务 FORMAL_TASK_JOIN_GRACE 宽限收尾，再放弃线程。
+        assert!(shutdown_started.elapsed() < FORMAL_TASK_JOIN_GRACE + Duration::from_millis(500));
         business_runtime.shutdown().expect("business shutdown");
     }
 }

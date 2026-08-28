@@ -71,9 +71,12 @@ impl ModerationConfig {
     }
 }
 
+/// 好友管理命令：按游戏内 UID 执行拉黑或屏蔽聊天。
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModerationCommand {
     pub action: ModerationAction,
+    /// 游戏内好友 UID，不是身份映射模块使用的 UUID。
+    /// 该 UID 直接用于游戏好友搜索、拉黑和屏蔽操作。
     pub uid: String,
     pub requester: String,
 }

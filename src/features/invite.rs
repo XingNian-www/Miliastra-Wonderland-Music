@@ -62,6 +62,7 @@ impl InviteConfig {
     }
 }
 
+/// 邀请命令：读取邀请序号或六位密码，并发起入厅确认流程。
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct InviteCommand {
     pub(crate) username: String,

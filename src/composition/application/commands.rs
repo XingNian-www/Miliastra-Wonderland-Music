@@ -210,6 +210,13 @@ impl ApplicationRuntime {
     }
 
     pub(super) fn execute_command(&mut self, parsed: &RoutedCommand) -> Result<()> {
+        if let Some(required) = parsed.permission_required {
+            let message = match required {
+                IdentityRole::Admin | IdentityRole::Owner => "权限不足：该命令仅限管理员使用",
+                IdentityRole::Friend => "权限不足：该命令仅限好友使用",
+            };
+            return ApplicationRuntime::reply(self, message);
+        }
         match &parsed.command {
             ModuleCommand::SongRequest(command) => {
                 let context = SongRequestContext {
@@ -325,7 +332,7 @@ impl ApplicationRuntime {
         self.business.turtle_soup_application.execute_command(
             &parsed.raw,
             &parsed.username,
-            parsed.message_type == "pink",
+            parsed.authority == CommandAuthority::Friend,
             command,
             &mut port,
         )
@@ -403,10 +410,9 @@ impl ApplicationRuntime {
         parsed: &RoutedCommand,
         command: &UndercoverCommand,
     ) -> Result<()> {
-        let source = match parsed.message_type.as_str() {
-            "pink" => UndercoverCommandSource::Friend,
-            "控制台" => UndercoverCommandSource::Console,
-            _ => UndercoverCommandSource::Hall,
+        let source = match parsed.authority {
+            CommandAuthority::Friend => UndercoverCommandSource::Friend,
+            CommandAuthority::HallMember => UndercoverCommandSource::Hall,
         };
         self.business.undercover_game.execute_command(
             &parsed.username,
@@ -652,6 +658,7 @@ impl HallMaintenancePort for ApplicationRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::features::command::CommandAuthority;
 
     #[test]
     fn card_game_lane_matches_the_effects_required_by_each_command() {
@@ -694,6 +701,9 @@ mod tests {
             user_command: "#状态".to_string(),
             message_type: "blue".to_string(),
             username: "测试玩家".to_string(),
+            authority: CommandAuthority::HallMember,
+            role: None,
+            permission_required: None,
             command: ModuleCommand::CardGame(LandlordCommand::Status),
             observation: CommandObservation {
                 captured_at: Some(captured_at),

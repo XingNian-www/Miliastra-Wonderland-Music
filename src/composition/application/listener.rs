@@ -1388,7 +1388,10 @@ impl ApplicationRuntime {
             })
             .collect::<Vec<_>>();
         let active_entertainment = self.business.business.active_entertainment()?;
-        let command_router = ChatCommandRouter::new(&self.business.custom_workflow);
+        let command_router = ChatCommandRouter::with_identity(
+            &self.business.custom_workflow,
+            &self.lifecycle.live_configs.identity,
+        );
         let visible_turtle_questions = if self.business.business.turtle_soup_accepts_questions()? {
             messages
                 .iter()

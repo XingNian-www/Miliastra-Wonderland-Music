@@ -7,6 +7,7 @@ use crate::features::command::{
 use crate::features::custom_workflow::CustomWorkflowService;
 use crate::features::entertainment::EntertainmentKind;
 use crate::features::hall::HallCommand;
+use crate::features::identity::{IdentityAccess, IdentityRole};
 use crate::features::idiom_chain::IdiomChainCommand;
 use crate::features::invite::InviteCommand;
 use crate::features::moderation::ModerationCommand;
@@ -38,12 +39,24 @@ type ModuleClaim = (ChatCommandModule, fn(&CommandEnvelope) -> bool);
 /// module parses its arguments. Hash commands use the active entertainment owner explicitly.
 pub(crate) struct ChatCommandRouter<'a> {
     custom_workflow: Option<&'a CustomWorkflowService>,
+    identity: Option<&'a IdentityAccess>,
 }
 
 impl<'a> ChatCommandRouter<'a> {
     pub(crate) const fn new(custom_workflow: &'a CustomWorkflowService) -> Self {
         Self {
             custom_workflow: Some(custom_workflow),
+            identity: None,
+        }
+    }
+
+    pub(crate) const fn with_identity(
+        custom_workflow: &'a CustomWorkflowService,
+        identity: &'a IdentityAccess,
+    ) -> Self {
+        Self {
+            custom_workflow: Some(custom_workflow),
+            identity: Some(identity),
         }
     }
 
@@ -51,6 +64,7 @@ impl<'a> ChatCommandRouter<'a> {
     pub(crate) const fn without_custom_workflow() -> Self {
         Self {
             custom_workflow: None,
+            identity: None,
         }
     }
 
@@ -70,17 +84,90 @@ impl<'a> ChatCommandRouter<'a> {
         envelope: &CommandEnvelope,
         active_entertainment: Option<EntertainmentKind>,
     ) -> Option<RoutedCommand> {
-        match self.route_match(envelope, active_entertainment) {
-            Some(matched) => Some(RoutedCommand::from_envelope(envelope, matched)),
-            // OCR 容错：命令文本带噪声标点时，用清理后的文本重试一次。
-            // 仅影响路由匹配，原始文本与观察信息仍取自原 envelope。
-            None => {
-                let tolerant = ocr_tolerant_command_text(envelope.command_text())?;
-                let tolerant_envelope = envelope.with_command_text(tolerant);
-                let matched = self.route_match(&tolerant_envelope, active_entertainment)?;
-                Some(RoutedCommand::from_envelope(envelope, matched))
+        let role = self
+            .identity
+            .and_then(|identity| identity.role_of(envelope.username()));
+        let authority = match role {
+            Some(IdentityRole::Friend | IdentityRole::Admin) => CommandAuthority::Friend,
+            _ => envelope.authority(),
+        };
+        let primary =
+            (authority != envelope.authority()).then(|| envelope.with_authority(authority));
+        let alternate_authority = match role {
+            Some(IdentityRole::Owner) => Some(match envelope.authority() {
+                CommandAuthority::HallMember => CommandAuthority::Friend,
+                CommandAuthority::Friend => CommandAuthority::HallMember,
+            }),
+            _ => None,
+        };
+        self.route_with_authorities(envelope, active_entertainment, primary, alternate_authority)
+            .or_else(|| {
+                (envelope.authority() == CommandAuthority::HallMember
+                    && self.identity.is_some()
+                    && role.is_none())
+                .then(|| self.route_as_permission_denied(envelope, active_entertainment))
+                .flatten()
+            })
+    }
+
+    fn route_as_permission_denied(
+        &self,
+        envelope: &CommandEnvelope,
+        active_entertainment: Option<EntertainmentKind>,
+    ) -> Option<RoutedCommand> {
+        if envelope.authority() != CommandAuthority::HallMember {
+            return None;
+        }
+        let candidate = envelope.with_authority(CommandAuthority::Friend);
+        let matched = self.route_match(&candidate, active_entertainment)?;
+        let mut routed = RoutedCommand::from_envelope(envelope, matched);
+        routed.permission_required = Some(IdentityRole::Admin);
+        Some(routed)
+    }
+
+    fn route_with_authorities(
+        &self,
+        envelope: &CommandEnvelope,
+        active_entertainment: Option<EntertainmentKind>,
+        primary: Option<CommandEnvelope>,
+        alternate_authority: Option<CommandAuthority>,
+    ) -> Option<RoutedCommand> {
+        let tolerant = ocr_tolerant_command_text(envelope.command_text());
+        for candidate in [
+            Some(envelope.clone()),
+            primary.clone(),
+            tolerant
+                .as_ref()
+                .map(|text| envelope.with_command_text(text)),
+            tolerant.as_ref().map(|text| {
+                primary.as_ref().map_or_else(
+                    || envelope.with_command_text(text),
+                    |candidate| candidate.with_command_text(text),
+                )
+            }),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Some(matched) = self.route_match(&candidate, active_entertainment) {
+                let mut routed = RoutedCommand::from_envelope(envelope, matched);
+                routed.authority = candidate.authority();
+                routed.message_type = candidate.message_type().to_string();
+                routed.role = role_for(self.identity, envelope.username());
+                return Some(routed);
+            }
+            if let Some(authority) = alternate_authority {
+                let candidate = candidate.with_authority(authority);
+                if let Some(matched) = self.route_match(&candidate, active_entertainment) {
+                    let mut routed = RoutedCommand::from_envelope(envelope, matched);
+                    routed.authority = candidate.authority();
+                    routed.message_type = candidate.message_type().to_string();
+                    routed.role = role_for(self.identity, envelope.username());
+                    return Some(routed);
+                }
             }
         }
+        None
     }
 
     fn route_match(
@@ -235,8 +322,9 @@ fn is_reserved_decision_command(envelope: &CommandEnvelope) -> bool {
         && [
             "邀请确认",
             "邀请拒绝",
-            "同意邀请",
+            "确认邀请",
             "拒绝邀请",
+            "同意邀请",
             "同意",
             "不同意",
         ]
@@ -255,6 +343,10 @@ fn decision_boundary(rest: &str) -> bool {
                 )
         }
     }
+}
+
+fn role_for(identity: Option<&IdentityAccess>, username: &str) -> Option<IdentityRole> {
+    identity.and_then(|identity| identity.role_of(username))
 }
 
 fn route_idiom(envelope: &CommandEnvelope) -> Option<FeatureCommandMatch<IdiomChainCommand>> {
@@ -305,6 +397,9 @@ mod tests {
     use crate::features::custom_workflow::{
         CustomWorkflowConfig, CustomWorkflowDefinition, CustomWorkflowService, CustomWorkflowStep,
         WorkflowDefaults,
+    };
+    use crate::features::identity::{
+        IdentityAccess, IdentityConfig, IdentityMapping, IdentityRole,
     };
 
     fn envelope(message_type: &str, command: &str) -> CommandEnvelope {
@@ -359,6 +454,84 @@ mod tests {
         );
         assert!(router.route(&envelope("blue", "@删除"), None).is_none());
         assert!(router.route(&envelope("pink", "@下一首"), None).is_none());
+    }
+
+    #[test]
+    fn unmapped_hall_member_gets_permission_denied_command() {
+        let identity = IdentityAccess::new(IdentityConfig::default());
+        let service = CustomWorkflowService::new(
+            crate::features::custom_workflow::CustomWorkflowConfig::default(),
+            WorkflowDefaults {
+                default_timeout_ms: 1_000,
+                default_poll_ms: 100,
+                default_step_wait_ms: 100,
+                decision_timeout_ms: 1_000,
+                decision_poll_ms: 100,
+                after_activate_ms: 100,
+                clipboard_hold_ms: 100,
+                stability_mean_threshold: 1.0,
+                stability_changed_ratio_threshold: 0.1,
+            },
+        );
+        let routed = ChatCommandRouter::with_identity(&service, &identity)
+            .route(&envelope("blue", "@删除"), None)
+            .expect("应识别权限不足命令");
+        assert_eq!(routed.permission_required, Some(IdentityRole::Admin));
+        assert_eq!(
+            routed.command,
+            ModuleCommand::Playback(PlaybackCommand::DeleteCurrentPoolTrack)
+        );
+    }
+
+    #[test]
+    fn identity_roles_expand_command_sources() {
+        let identity = IdentityAccess::new(IdentityConfig {
+            mappings: vec![
+                IdentityMapping {
+                    nickname: "用户".to_string(),
+                    id: uuid::Uuid::from_u128(1),
+                    role: IdentityRole::Owner,
+                    note: String::new(),
+                },
+                IdentityMapping {
+                    nickname: "管理员".to_string(),
+                    id: uuid::Uuid::from_u128(2),
+                    role: IdentityRole::Admin,
+                    note: String::new(),
+                },
+            ],
+        });
+        let service = CustomWorkflowService::new(
+            crate::features::custom_workflow::CustomWorkflowConfig::default(),
+            WorkflowDefaults {
+                default_timeout_ms: 1_000,
+                default_poll_ms: 100,
+                default_step_wait_ms: 100,
+                decision_timeout_ms: 1_000,
+                decision_poll_ms: 100,
+                after_activate_ms: 100,
+                clipboard_hold_ms: 100,
+                stability_mean_threshold: 1.0,
+                stability_changed_ratio_threshold: 0.1,
+            },
+        );
+        let router = ChatCommandRouter::with_identity(&service, &identity);
+        let routed = router.route(&envelope("blue", "@删除"), None).unwrap();
+        assert_eq!(routed.authority, CommandAuthority::Friend);
+        assert_eq!(routed.message_type, "pink");
+        assert_eq!(routed.role, Some(IdentityRole::Owner));
+
+        let admin = CommandEnvelope::new(
+            "用户：@删除",
+            "管理员",
+            "blue",
+            "@删除",
+            CommandObservation::default(),
+        )
+        .unwrap();
+        let routed = router.route(&admin, None).unwrap();
+        assert_eq!(routed.authority, CommandAuthority::Friend);
+        assert_eq!(routed.role, Some(IdentityRole::Admin));
     }
 
     #[test]

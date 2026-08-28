@@ -1231,7 +1231,7 @@ async fn resolve_stream_retry(
         Ok(Ok(stream)) => Some(stream),
         Ok(Err(error)) => {
             let _ = catalog.observe_playback_failure(&song_key.source, &error);
-            tracing::warn!(%song_key, %error, "stream retry resolution failed");
+            tracing::warn!(%song_key, "stream retry resolution failed");
             None
         }
         Err(_) => {

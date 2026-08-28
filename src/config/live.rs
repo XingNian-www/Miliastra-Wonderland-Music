@@ -14,6 +14,7 @@ use std::{
 };
 
 use crate::features::custom_workflow::CustomWorkflowConfig;
+use crate::features::identity::IdentityAccess;
 use crate::features::playback::{MatchConfig, SongDedupConfig};
 
 use super::{AppConfig, Effect, config_effect_for_path};
@@ -60,6 +61,7 @@ pub(crate) const LIVE_CONFIG_PATHS: &[&str] = &[
     "custom_workflows.max_hold_key_seconds",
     "custom_workflows.templates",
     "custom_workflows.workflows",
+    "identity.mappings",
 ];
 
 /// 当前进程真正采用的配置快照。
@@ -133,6 +135,8 @@ pub struct LiveConfigs {
     pub matching: Arc<RwLock<MatchConfig>>,
     /// custom_workflows.*
     pub custom_workflows: Arc<RwLock<CustomWorkflowConfig>>,
+    /// identity.mappings（整段共享，身份查询直接挂在该句柄上）
+    pub identity: IdentityAccess,
 }
 
 impl Default for LiveConfigs {
@@ -165,6 +169,7 @@ impl LiveConfigs {
             output_send_enabled: Arc::new(RwLock::new(config.output.send_enabled)),
             matching: Arc::new(RwLock::new(config.matching.clone())),
             custom_workflows: Arc::new(RwLock::new(config.custom_workflows.clone())),
+            identity: IdentityAccess::new(config.identity.clone()),
         }
     }
 
@@ -291,6 +296,7 @@ impl LiveConfigs {
             .custom_workflows
             .write()
             .unwrap_or_else(PoisonError::into_inner) = config.custom_workflows.clone();
+        self.identity.replace(config.identity.clone());
 
         let mut effective = Arc::unwrap_or_clone(self.effective.snapshot());
         effective.stability.secondary_hall_count = config.stability.secondary_hall_count;
@@ -320,6 +326,7 @@ impl LiveConfigs {
         effective.output.send_enabled = config.output.send_enabled;
         effective.matching = config.matching.clone();
         effective.custom_workflows = config.custom_workflows.clone();
+        effective.identity = config.identity.clone();
         self.effective.replace(effective);
     }
 }
@@ -330,6 +337,7 @@ mod tests {
 
     use super::*;
     use crate::config::config_sections;
+    use crate::features::identity::IdentityConfig;
 
     /// 构造一份与默认值不同的完整配置，用于取值/覆盖断言。
     fn changed_config() -> AppConfig {
@@ -360,6 +368,14 @@ mod tests {
         config.matching.enable_fuzzy_singer = false;
         config.custom_workflows.enabled = true;
         config.custom_workflows.default_threshold = 0.73;
+        config.identity = IdentityConfig {
+            mappings: vec![crate::features::identity::IdentityMapping {
+                nickname: "派蒙本蒙".to_string(),
+                id: uuid::Uuid::from_u128(1),
+                role: crate::features::identity::IdentityRole::Owner,
+                note: String::new(),
+            }],
+        };
         config
     }
 
@@ -481,6 +497,8 @@ mod tests {
             live.custom_workflows.read().unwrap().default_threshold,
             0.73
         );
+        assert!(live.identity.is_owner("派蒙本蒙"));
+        assert!(!live.identity.is_friend_or_above("陌生人"));
         let snapshot = live.snapshot();
         assert_eq!(snapshot.timing.watchdog_restart_ms, 4321);
         assert_eq!(snapshot.timing.chat_scan.fallback_ms, 4444);

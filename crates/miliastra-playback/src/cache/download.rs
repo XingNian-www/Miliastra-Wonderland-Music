@@ -247,7 +247,7 @@ async fn download_to_file(
     let mut response = tokio::time::timeout(inner.config.request_timeout, request.send())
         .await
         .map_err(|_| "等待源站响应头超时".to_owned())?
-        .map_err(|error| format!("源站请求失败: {error}"))?;
+        .map_err(|_| "源站请求失败".to_owned())?;
     if !response.status().is_success() {
         return Err(format!("源站返回 HTTP {}", response.status()));
     }
@@ -268,7 +268,7 @@ async fn download_to_file(
         let chunk = tokio::time::timeout(inner.config.request_timeout, response.chunk())
             .await
             .map_err(|_| "读取源站响应流超时".to_owned())?
-            .map_err(|error| format!("读取源站响应流失败: {error}"))?;
+            .map_err(|_| "读取源站响应流失败".to_owned())?;
         let Some(chunk) = chunk else {
             break;
         };

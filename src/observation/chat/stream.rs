@@ -140,14 +140,33 @@ impl ChatObservationShared {
             .state
             .lock()
             .map_err(|_| anyhow!("聊天观察流状态锁已损坏"))?;
-        if !(PRIMARY_VISIBLE_MIN_MESSAGES..=PRIMARY_VISIBLE_MAX_MESSAGES).contains(&messages.len())
-        {
-            if !messages.is_empty() {
-                log::debug!(
-                    "一级聊天本轮只识别到 {} 条消息，保留上一帧记录并等待重扫",
-                    messages.len()
-                );
-            }
+        // 消息数不在常见区间（2-5 条）时：空帧按噪声防护整帧置空等待重扫；
+        // 非零帧无条件保留，避免滚动瞬间的单条消息被吞掉导致指令漏执行
+        // （接受残影/UI 文字被误识别为消息的极低概率风险）。
+        if (PRIMARY_VISIBLE_MIN_MESSAGES..=PRIMARY_VISIBLE_MAX_MESSAGES).contains(&messages.len()) {
+        } else if !messages.is_empty() {
+            log::debug!("一级聊天本轮只识别到 {} 条消息，直接保留", messages.len());
+            // 区间外非空帧（典型为滚动瞬间的单条）：消息照常分配临时 id
+            // 派发执行，但不覆盖序列锚点，避免残影帧使下一帧匹配失效、
+            // 历史消息 id 断裂后重复识别。
+            let observed = messages
+                .into_iter()
+                .map(|message| PrimaryObservedMessage {
+                    id: new_primary_tracked_message(&mut state, &message, false).id,
+                    message,
+                    is_new: true,
+                })
+                .collect();
+            let dispatches = Self::publish_locked(
+                &mut state,
+                ChatObservation::Primary {
+                    frame,
+                    messages: observed,
+                },
+            )?;
+            Self::complete_success(&mut state, frame.id())?;
+            return Ok(dispatches);
+        } else {
             let dispatches = Self::publish_locked(
                 &mut state,
                 ChatObservation::Primary {
@@ -828,6 +847,36 @@ mod tests {
     }
 
     #[test]
+    fn primary_single_message_is_dispatched_as_new_without_replacing_baseline() {
+        let shared = ChatObservationShared::new();
+        publish_primary(
+            &shared,
+            vec![message_at("旧消息", 0, 10), message_at("旧命令", 20, 20)],
+        );
+
+        let single = publish_primary(&shared, vec![message_at("新命令", 0, 30)]);
+        assert_eq!(primary_messages(&single).len(), 1);
+        assert!(primary_messages(&single)[0].is_new);
+
+        let restored = publish_primary(
+            &shared,
+            vec![message_at("旧消息", 0, 40), message_at("旧命令", 20, 50)],
+        );
+        assert!(
+            primary_messages(&restored)
+                .iter()
+                .all(|message| !message.is_new)
+        );
+    }
+
+    #[test]
+    fn primary_empty_frame_dispatches_no_messages() {
+        let shared = ChatObservationShared::new();
+        let empty = publish_primary(&shared, Vec::new());
+        assert!(primary_messages(&empty).is_empty());
+    }
+
+    #[test]
     fn primary_ocr_correction_keeps_an_unhandled_message_new_for_retry() {
         let shared = ChatObservationShared::new();
         publish_primary(
@@ -952,7 +1001,7 @@ mod tests {
     }
 
     #[test]
-    fn primary_single_message_frame_does_not_replace_the_previous_sequence() {
+    fn primary_single_message_frame_is_kept_and_does_not_disturb_the_previous_sequence() {
         let shared = ChatObservationShared::new();
         let baseline = publish_primary(
             &shared,
@@ -961,7 +1010,8 @@ mod tests {
         let old_second_id = primary_messages(&baseline)[1].id.clone();
 
         let incomplete = publish_primary(&shared, vec![message_at("误识别", 0, 99)]);
-        assert!(primary_messages(&incomplete).is_empty());
+        let kept = primary_messages(&incomplete);
+        assert_eq!(kept.len(), 1, "单条非零帧按新契约无条件保留");
 
         let updated = vec![message_at("消息2", 0, 20), message_at("@确认", 20, 30)];
         let current = publish_primary(&shared, updated);

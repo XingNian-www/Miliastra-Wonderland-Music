@@ -15,6 +15,8 @@ pub enum CaptureError {
     RuntimeMissing,
     #[error("WebView2 login timed out before required cookies were captured")]
     Timeout,
+    #[error("WebView2 login window was closed before credentials were captured")]
+    Cancelled,
     #[error("WebView2 COM error: {0}")]
     Com(String),
     #[error("WebView2 I/O error: {0}")]
@@ -4310,7 +4312,7 @@ mod platform {
         };
         while unsafe { PeekMessageW(&mut message, null_mut(), 0, 0, PM_REMOVE) } != 0 {
             if message.message == 0x0012 {
-                context.finish_error(CaptureError::Com("login window was closed".to_owned()));
+                context.finish_error(CaptureError::Cancelled);
                 break;
             }
             unsafe {

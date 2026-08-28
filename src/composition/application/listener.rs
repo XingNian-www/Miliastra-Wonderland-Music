@@ -362,12 +362,15 @@ impl ApplicationRuntime {
                 .map(str::to_owned)
                 .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
         if uses_temporary_token {
+            // 文件日志只记录截断版，避免令牌随日志留存；完整令牌走
+            // target=web_token（只进 TUI/stderr），供用户输入面板。
             log::info!(
-                "Web 面板临时访问令牌(看门狗生命周期内保持不变,访问 http://{}:{} 时输入): {}",
+                "Web 面板临时令牌已生成(看门狗生命周期内保持不变,访问 http://{}:{} 时输入): {}...",
                 http_config.host,
                 http_config.port,
-                http_config.access_token
+                &http_config.access_token[..4]
             );
+            log::info!(target: "web_token", "Web 面板完整访问令牌: {}", http_config.access_token);
         }
         let http_state = http::HttpSharedState::new(
             http::HttpInterfaceConfig::new(
@@ -1363,6 +1366,15 @@ impl ApplicationRuntime {
         Ok(processed_secondary)
     }
 
+    pub(super) fn mapped_actor_name(&self, ocr_name: &str) -> String {
+        self.lifecycle.live_configs.identity.display_name(ocr_name)
+    }
+
+    fn map_command_actor(&self, mut command: RoutedCommand) -> RoutedCommand {
+        command.username = self.mapped_actor_name(&command.username);
+        command
+    }
+
     fn handle_scan_messages(
         &mut self,
         frame: ObservedFrame,
@@ -1441,6 +1453,7 @@ impl ApplicationRuntime {
             let Some(parsed_command) = command_router.route(&envelope, active_entertainment) else {
                 continue;
             };
+            let parsed_command = self.map_command_actor(parsed_command);
             if !self.commands_enabled()? && message.message_type != "pink" {
                 log::info!("命令识别已禁用，跳过: {}", parsed_command.raw);
                 self.ui
@@ -1574,8 +1587,9 @@ impl ApplicationRuntime {
                     ChatListenerModeCommand::Secondary => ChatListenerMode::Secondary,
                     ChatListenerModeCommand::Status => unreachable!(),
                 };
-                if !self.business.business.request_chat_listener_mode(target)? {
-                    let snapshot = self.business.business.chat_listener_snapshot()?;
+                let (queued, snapshot) =
+                    self.business.business.request_chat_listener_mode(target)?;
+                if !queued {
                     log::info!(
                         "监听模式切换已处于当前或等待状态，跳过: current={} pending={:?}",
                         snapshot.mode.label(),
@@ -1600,9 +1614,10 @@ impl ApplicationRuntime {
 
     pub(super) fn enqueue_turtle_soup_question(
         &self,
-        question: turtle_soup::TurtleSoupQuestion,
+        mut question: turtle_soup::TurtleSoupQuestion,
         observed_at: Instant,
     ) -> Result<()> {
+        question.rename_player(self.mapped_actor_name(&question.player));
         self.record_command_activity(observed_at)?;
         log::info!("海龟汤提问已加入正式输入队列: nickname={}", question.player);
         self.push_pending_task(PendingTask::TurtleSoupQuestion {
@@ -1693,6 +1708,7 @@ impl ApplicationRuntime {
     }
 
     pub(super) fn submit_secondary_command(&self, parsed: RoutedCommand) -> Result<()> {
+        let parsed = self.map_command_actor(parsed);
         if self.enqueue_chat_listener_command(&parsed)? {
             return Ok(());
         }

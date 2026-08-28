@@ -50,6 +50,7 @@ pub(crate) trait AdministrationApplicationPort: AdministrationImmediatePort {
     fn send_hall_batch(&mut self, messages: &[&str], delay_ms: u64) -> Result<()>;
 }
 
+/// 管理命令：帮助、开关命令识别、闲置退出、通告和运行状态控制。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ImmediateAdministrationOutcome {
     ContinueFormal,

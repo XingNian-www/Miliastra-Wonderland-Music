@@ -266,6 +266,7 @@ impl MatchConfig {
     }
 }
 
+/// 播放控制命令：点歌、切歌、暂停、恢复、歌词、队列和音量操作。
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum PlaybackCommand {
     Pause,

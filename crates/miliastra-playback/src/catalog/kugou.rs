@@ -32,11 +32,8 @@ const PROVIDER: &str = "kugou";
 
 /// 酷狗测试版（概念版/lite）Android API 的签名盐值。
 const KUGOU_LITE_SIGN_SALT: &str = "LnT6xpN3khm36zse0QzvmgTZ3waWdRSA";
-/// `song_url` 的 `key` 参数使用的测试版（概念版/lite）盐值。
-const KUGOU_LITE_KEY_SALT: &str = "185672dd44712f60bb1736df5a377e82";
 const KUGOU_LITE_APPID: i64 = 3116;
 const KUGOU_LITE_CLIENTVER: i64 = 11440;
-const KUGOU_STREAM_CLIENTVER: i64 = 11430;
 const KUGOU_UA: &str = "Android15-1070-11083-46-0-DiscoveryDRADProtocol-wifi";
 const KUGOU_KG_RFC: &str = "B9EDA08A64250DEFFBCADDEE00F8F25F";
 const KUGOU_DEVICE_FILE: &str = "kugou-device.json";
@@ -53,7 +50,6 @@ const KUGOU_WEB_UA: &str =
 /// 官方端点
 const URL_SEARCH: &str = "https://gateway.kugou.com/v3/search/song";
 const URL_SONG_STREAM: &str = "https://gateway.kugou.com/v5/url";
-const URL_PRIVILEGE: &str = "https://gateway.kugou.com/v2/get_res_privilege/lite";
 const URL_SEARCH_LYRIC: &str = "https://lyrics.kugou.com/v1/search";
 const URL_DOWNLOAD_LYRIC: &str = "https://lyrics.kugou.com/download";
 const URL_WEB_SONGINFO: &str = "https://wwwapi.kugou.com/play/songinfo";
@@ -132,28 +128,6 @@ struct KugouAdPlayReportBody {
     play_start: u64,
 }
 
-#[derive(Serialize)]
-struct KugouPrivilegeResource {
-    #[serde(rename = "type")]
-    resource_type: &'static str,
-    page_id: u8,
-    hash: String,
-    album_id: String,
-}
-
-#[derive(Serialize)]
-struct KugouPrivilegeBody {
-    appid: i64,
-    area_code: u8,
-    behavior: &'static str,
-    clientver: i64,
-    need_hash_offset: u8,
-    relate: u8,
-    support_verify: u8,
-    resource: Vec<KugouPrivilegeResource>,
-    qualities: [&'static str; 9],
-}
-
 fn serialize_kugou_body<T: Serialize>(body: &T) -> Result<String, CatalogError> {
     serde_json::to_string(body).map_err(|error| CatalogError::InvalidResponse(error.to_string()))
 }
@@ -191,16 +165,6 @@ pub fn kugou_web_signature(params: &BTreeMap<String, String>) -> String {
         .collect::<String>();
     let digest = compute(format!(
         "{KUGOU_WEB_SIGN_SALT}{joined}{KUGOU_WEB_SIGN_SALT}"
-    ));
-    format!("{digest:x}")
-}
-
-/// `song_url` 请求的资源 key：MD5(hash + lite salt + appid + mid + userid)。
-pub fn kugou_lite_sign_key(hash: &str, mid: &str, userid: &str) -> String {
-    let user = if userid.is_empty() { "0" } else { userid };
-    let device = if mid.is_empty() { "-" } else { mid };
-    let digest = compute(format!(
-        "{hash}{KUGOU_LITE_KEY_SALT}{KUGOU_LITE_APPID}{device}{user}"
     ));
     format!("{digest:x}")
 }
@@ -1288,15 +1252,6 @@ impl KugouAdapter {
         Ok(credential)
     }
 
-    /// 查询账号 VIP 状态。展示与播放共用同一份乐观缓存。
-    async fn account_vip_status(&self) -> Option<bool> {
-        self.account_status_cached(false)
-            .await
-            .ok()
-            .filter(|status| status.vip_known)
-            .map(|status| status.vip)
-    }
-
     /// 解析 get_union_vip 系列响应中的 VIP 判定字段（is_vip / vip_type / vip）。
     fn vip_flags_from_union(data: &Value) -> Option<bool> {
         let is_vip = data.get("is_vip").and_then(value_u64);
@@ -2250,80 +2205,6 @@ fn response_data(value: &Value) -> &Value {
     current.get("data").unwrap_or(current)
 }
 
-fn first_privilege_resource(value: &Value) -> Option<&Value> {
-    fn find(value: &Value, depth: u8) -> Option<&Value> {
-        if depth > 8 {
-            return None;
-        }
-        match value {
-            Value::Array(items) => items.iter().find_map(|item| {
-                (kugou_pay_type(item).is_some())
-                    .then_some(item)
-                    .or_else(|| find(item, depth + 1))
-            }),
-            Value::Object(object) => {
-                if kugou_pay_type(value).is_some() {
-                    return Some(value);
-                }
-                for key in [
-                    "resource",
-                    "resources",
-                    "list",
-                    "lists",
-                    "items",
-                    "result",
-                    "data",
-                    "body",
-                    "privilege",
-                ] {
-                    if let Some(found) = object.get(key).and_then(|child| find(child, depth + 1)) {
-                        return Some(found);
-                    }
-                }
-                None
-            }
-            _ => None,
-        }
-    }
-    find(value, 0)
-}
-
-fn kugou_pay_type(value: &Value) -> Option<u64> {
-    ["pay_type", "payType", "PayType", "paytype"]
-        .iter()
-        .find_map(|field| value.get(*field).and_then(value_u64))
-        .or_else(|| {
-            value.get("privilege").and_then(|privilege| {
-                ["pay_type", "payType", "PayType", "paytype"]
-                    .iter()
-                    .find_map(|field| privilege.get(*field).and_then(value_u64))
-            })
-        })
-        .or_else(|| {
-            value.get("Privilege").and_then(|privilege| {
-                ["pay_type", "payType", "PayType", "paytype"]
-                    .iter()
-                    .find_map(|field| privilege.get(*field).and_then(value_u64))
-            })
-        })
-}
-
-fn kugou_validation_is_rejected(response: &Value) -> bool {
-    let data = response_data(response);
-    [response, data].into_iter().any(|value| {
-        ["error_code", "errorCode", "err_code", "code"]
-            .into_iter()
-            .filter_map(|field| value.get(field))
-            .filter_map(value_i64)
-            .any(|code| code != 0)
-            || value
-                .get("status")
-                .and_then(value_i64)
-                .is_some_and(|status| status == 0)
-            || value.get("error").is_some_and(kugou_error_value_is_present)
-    })
-}
-
 fn kugou_web_credential_is_rejected(response: &Value) -> bool {
     let data = response_data(response);
     [response, data].into_iter().any(|value| {
@@ -2380,19 +2261,6 @@ fn value_i64(value: &Value) -> Option<i64> {
         .as_i64()
         .or_else(|| value.as_u64().and_then(|value| value.try_into().ok()))
         .or_else(|| value.as_str()?.trim().parse().ok())
-}
-
-fn kugou_error_value_is_present(value: &Value) -> bool {
-    match value {
-        Value::Null | Value::Bool(false) => false,
-        Value::Number(_) => value_i64(value).is_some_and(|code| code != 0),
-        Value::String(value) => {
-            let value = value.trim();
-            !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
-        }
-        Value::Array(values) => !values.is_empty(),
-        Value::Object(_) | Value::Bool(true) => true,
-    }
 }
 
 fn parse_kugou_datetime_ms(value: &str) -> Option<u64> {
@@ -2565,11 +2433,10 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        KugouAdPlayReportBody, KugouPrivilegeBody, KugouPrivilegeResource,
-        classify_business_response, classify_kugou_resolve_failure, decode_lrc_content,
-        extract_stream_url, kugou_android_signature, kugou_calculate_mid, kugou_lite_sign_key,
-        kugou_normalize_guid, kugou_validation_is_rejected, load_legacy_device_identity,
-        parse_kugou_datetime_ms, parse_search_candidates, resolver_parts, serialize_kugou_body,
+        KugouAdPlayReportBody, classify_business_response, classify_kugou_resolve_failure,
+        decode_lrc_content, extract_stream_url, kugou_android_signature, kugou_calculate_mid,
+        kugou_normalize_guid, load_legacy_device_identity, parse_kugou_datetime_ms,
+        parse_search_candidates, resolver_parts, serialize_kugou_body,
         validate_web_credential_response,
     };
     use crate::catalog::CatalogError;
@@ -2615,57 +2482,6 @@ mod tests {
             kugou_android_signature(&params, "{}"),
             "6805e7e467eb0f16c702de7388a3431a"
         );
-        assert_eq!(
-            kugou_lite_sign_key("ABC", "123", "42"),
-            "8d3218976947812b23207c437f69dd5f"
-        );
-    }
-
-    #[test]
-    fn playback_signature_matches_upstream_case_sensitive_sorting_vector() {
-        let mut params = BTreeMap::from([
-            ("album_id".to_owned(), "123456".to_owned()),
-            ("area_code".to_owned(), "1".to_owned()),
-            (
-                "hash".to_owned(),
-                "abcdef0123456789abcdef0123456789".to_owned(),
-            ),
-            ("ssa_flag".to_owned(), "is_fromtrack".to_owned()),
-            ("version".to_owned(), "11430".to_owned()),
-            ("page_id".to_owned(), "967177915".to_owned()),
-            ("quality".to_owned(), "320".to_owned()),
-            ("album_audio_id".to_owned(), "987654321".to_owned()),
-            ("behavior".to_owned(), "play".to_owned()),
-            ("pid".to_owned(), "411".to_owned()),
-            ("cmd".to_owned(), "26".to_owned()),
-            ("pidversion".to_owned(), "3001".to_owned()),
-            ("IsFreePart".to_owned(), "0".to_owned()),
-            (
-                "ppage_id".to_owned(),
-                "356753938,823673182,967485191".to_owned(),
-            ),
-            ("cdnBackup".to_owned(), "1".to_owned()),
-            ("module".to_owned(), String::new()),
-            ("clientver".to_owned(), "11430".to_owned()),
-            ("dfid".to_owned(), "test-dfid".to_owned()),
-            ("mid".to_owned(), "12345678901234567890".to_owned()),
-            ("uuid".to_owned(), "-".to_owned()),
-            ("appid".to_owned(), "3116".to_owned()),
-            ("clienttime".to_owned(), "1700000000".to_owned()),
-            ("token".to_owned(), "test-token".to_owned()),
-            ("userid".to_owned(), "42".to_owned()),
-        ]);
-        let key = kugou_lite_sign_key(
-            "abcdef0123456789abcdef0123456789",
-            "12345678901234567890",
-            "42",
-        );
-        assert_eq!(key, "dbc11897d9041d25df1c41e1902cbf8d");
-        params.insert("key".to_owned(), key);
-        assert_eq!(
-            kugou_android_signature(&params, ""),
-            "edf100987bced84a64d8a83bc77097c1"
-        );
     }
 
     #[test]
@@ -2679,37 +2495,6 @@ mod tests {
             .unwrap(),
             "{\"ad_id\":12307537187,\"play_end\":1700000030000,\"play_start\":1700000000000}"
         );
-
-        let body = serialize_kugou_body(&KugouPrivilegeBody {
-            appid: 3116,
-            area_code: 1,
-            behavior: "play",
-            clientver: 11440,
-            need_hash_offset: 1,
-            relate: 1,
-            support_verify: 1,
-            resource: vec![KugouPrivilegeResource {
-                resource_type: "audio",
-                page_id: 0,
-                hash: "ABC".to_owned(),
-                album_id: "7".to_owned(),
-            }],
-            qualities: [
-                "128",
-                "320",
-                "flac",
-                "high",
-                "viper_atmos",
-                "viper_tape",
-                "viper_clear",
-                "super",
-                "multitrack",
-            ],
-        })
-        .unwrap();
-        assert!(body.starts_with(
-            "{\"appid\":3116,\"area_code\":1,\"behavior\":\"play\",\"clientver\":11440,\"need_hash_offset\":1,\"relate\":1,\"support_verify\":1,\"resource\":[{\"type\":\"audio\",\"page_id\":0,\"hash\":\"ABC\",\"album_id\":\"7\"}],\"qualities\":["
-        ));
     }
 
     #[test]
@@ -3071,24 +2856,6 @@ mod tests {
             super::KugouAdapter::credential_mid(Some(&credential)),
             kugou_calculate_mid(&normalized)
         );
-    }
-
-    #[test]
-    fn validation_rejects_explicit_kugou_error_envelopes() {
-        assert!(!kugou_validation_is_rejected(&json!({
-            "code": 0,
-            "data": {"lists": []}
-        })));
-        assert!(kugou_validation_is_rejected(&json!({
-            "error_code": 20018,
-            "message": "token invalid"
-        })));
-        assert!(kugou_validation_is_rejected(&json!({
-            "data": {"code": "1"}
-        })));
-        assert!(kugou_validation_is_rejected(&json!({
-            "error": "credential expired"
-        })));
     }
 
     #[test]

@@ -5,6 +5,7 @@ use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
@@ -167,45 +168,90 @@ impl OcrRuntimeHandle {
 
 pub(crate) struct ProductionOcrDevice {
     args: ResolvedOcrArgs,
-    engine: OcrEngineBackend,
-    rebuild_due_at: Instant,
+    engine: Arc<Mutex<OcrEngineBackend>>,
+    rebuild_due_at: Arc<Mutex<Instant>>,
+    /// 后台重建进行中标记，防止重建间隔到期时重复触发。
+    rebuild_inflight: Arc<AtomicBool>,
 }
 
 impl ProductionOcrDevice {
     pub(crate) fn new(args: ResolvedOcrArgs) -> Result<Self> {
-        let engine = make_ocr_engine(&args)?;
+        let engine = Arc::new(Mutex::new(make_ocr_engine(&args)?));
         Ok(Self {
             args,
             engine,
-            rebuild_due_at: Instant::now() + OCR_REBUILD_INTERVAL,
+            rebuild_due_at: Arc::new(Mutex::new(Instant::now() + OCR_REBUILD_INTERVAL)),
+            rebuild_inflight: Arc::new(AtomicBool::new(false)),
         })
     }
 
     fn rebuild_if_due(&mut self) {
-        if Instant::now() < self.rebuild_due_at {
+        if Instant::now() < *lock_rebuild_due_at(&self.rebuild_due_at) {
             return;
         }
-        log::info!("OCR 引擎运行超过 1 小时，开始重建");
+        if self.rebuild_inflight.swap(true, Ordering::AcqRel) {
+            *lock_rebuild_due_at(&self.rebuild_due_at) =
+                Instant::now() + OCR_REBUILD_RETRY_INTERVAL;
+            return;
+        }
+        log::info!("OCR 引擎运行超过 1 小时，开始后台重建");
         let started = Instant::now();
-        match make_ocr_engine(&self.args) {
-            Ok(engine) => {
-                self.engine = engine;
-                self.rebuild_due_at = Instant::now() + OCR_REBUILD_INTERVAL;
-                log::info!("OCR 引擎重建完成");
-                log::info!(target: "timing", "OCR 引擎重建耗时: {}ms", started.elapsed().as_millis());
-            }
-            Err(error) => {
-                self.rebuild_due_at = Instant::now() + OCR_REBUILD_RETRY_INTERVAL;
-                log::error!("OCR 引擎重建失败，继续使用旧引擎，5分钟后重试: {error:#}");
-            }
+        let args = self.args.clone();
+        let engine = self.engine.clone();
+        let rebuild_due_at = self.rebuild_due_at.clone();
+        let inflight = self.rebuild_inflight.clone();
+        // 模型加载与预热在独立线程执行，期间旧引擎继续服务，不阻塞识别路径。
+        let spawned = std::thread::Builder::new()
+            .name("ocr-engine-rebuild".to_string())
+            .spawn(move || {
+                match make_ocr_engine(&args) {
+                    Ok(replacement) => {
+                        *lock_ocr_engine(&engine) = replacement;
+                        log::info!("OCR 引擎后台重建完成");
+                        log::info!(
+                            target: "timing",
+                            "OCR 引擎重建耗时: {}ms",
+                            started.elapsed().as_millis()
+                        );
+                    }
+                    Err(error) => {
+                        *lock_rebuild_due_at(&rebuild_due_at) =
+                            Instant::now() + OCR_REBUILD_RETRY_INTERVAL;
+                        log::error!("OCR 引擎重建失败，继续使用旧引擎: {error:#}");
+                    }
+                }
+                inflight.store(false, Ordering::Release);
+            });
+        if let Err(error) = spawned {
+            self.rebuild_inflight.store(false, Ordering::Release);
+            *lock_rebuild_due_at(&self.rebuild_due_at) =
+                Instant::now() + OCR_REBUILD_RETRY_INTERVAL;
+            log::error!("启动 OCR 引擎重建线程失败: {error:#}");
+        } else {
+            *lock_rebuild_due_at(&self.rebuild_due_at) = Instant::now() + OCR_REBUILD_INTERVAL;
         }
     }
+}
+
+fn lock_rebuild_due_at(due_at: &Arc<Mutex<Instant>>) -> std::sync::MutexGuard<'_, Instant> {
+    due_at
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn lock_ocr_engine(
+    engine: &Arc<Mutex<OcrEngineBackend>>,
+) -> std::sync::MutexGuard<'_, OcrEngineBackend> {
+    engine
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 impl OcrDevice for ProductionOcrDevice {
     fn recognize_lines(&mut self, image: &DynamicImage) -> Result<Vec<OcrLine>> {
         self.rebuild_if_due();
-        recognize_lines(&mut self.engine, image)
+        let mut engine = lock_ocr_engine(&self.engine);
+        recognize_lines(&mut *engine, image)
     }
 }
 
@@ -410,6 +456,9 @@ fn run_ocr_runtime(mut device: impl OcrDevice, channel: Arc<OcrChannel>) {
             if state.jobs.is_empty() {
                 return;
             }
+            // 刻意设计：严格按优先级取任务（UiConfirmation > ChatObservation >
+            // Diagnostic）。启动/乐土等 UI 例行程序依赖高优结果的及时性推进状态机，
+            // 聊天 OCR 是轮询型观察，允许在高优持续期间排队至 deadline 超时。
             let index = state
                 .jobs
                 .iter()
@@ -547,6 +596,15 @@ mod tests {
         };
         assert!(source.to_string().contains("simulated inference failure"));
         assert!(!runtime.shutdown().unwrap().timed_out);
+    }
+
+    #[test]
+    fn rebuild_failure_schedules_retry_interval() {
+        let due_at = Arc::new(Mutex::new(Instant::now() + OCR_REBUILD_INTERVAL));
+        *lock_rebuild_due_at(&due_at) = Instant::now() + OCR_REBUILD_RETRY_INTERVAL;
+        let delay = lock_rebuild_due_at(&due_at).saturating_duration_since(Instant::now());
+        assert!(delay <= OCR_REBUILD_RETRY_INTERVAL);
+        assert!(delay >= OCR_REBUILD_RETRY_INTERVAL.saturating_sub(Duration::from_secs(1)));
     }
 
     #[test]

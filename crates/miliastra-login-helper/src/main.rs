@@ -155,6 +155,7 @@ fn kugou_request_error_code(error: &webview2::CaptureError) -> &'static str {
     match error {
         webview2::CaptureError::RuntimeMissing => "webview_runtime_unavailable",
         webview2::CaptureError::Timeout => "kugou_web_request_timeout",
+        webview2::CaptureError::Cancelled => "kugou_web_request_failed",
         webview2::CaptureError::Com(_) => "kugou_webview_error",
         webview2::CaptureError::Io(_) => "kugou_web_request_failed",
     }
@@ -164,6 +165,7 @@ fn kugou_request_error_message(error: &webview2::CaptureError) -> &'static str {
     match error {
         webview2::CaptureError::RuntimeMissing => "WebView2 Runtime 不可用",
         webview2::CaptureError::Timeout => "酷狗网页请求超时",
+        webview2::CaptureError::Cancelled => "酷狗网页请求已取消",
         webview2::CaptureError::Com(_) => "酷狗 WebView2 请求失败",
         webview2::CaptureError::Io(_) => "酷狗网页请求失败",
     }
@@ -222,22 +224,38 @@ fn run(
 }
 
 fn helper_error_code(error: &anyhow::Error) -> &'static str {
-    // anyhow's Display value contains only the outer context. Inspect the
-    // complete chain so CaptureError::Timeout/RuntimeMissing keep their
-    // stable protocol codes after `context("credential capture failed")`.
-    let text = error
-        .chain()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join("\n");
-    if text.contains("unsupported provider") {
-        "unsupported_provider"
-    } else if text.contains("timed out") {
-        "login_timeout"
-    } else if text.contains("WebView2 Evergreen Runtime is missing") {
+    // 按根因类型分类，避免错误文本子串误匹配（如信息恰含 "closed"/"timed out"）。
+    if error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<webview2::CaptureError>(),
+            Some(webview2::CaptureError::RuntimeMissing)
+        )
+    }) {
         "webview_runtime_unavailable"
-    } else if text.contains("closed") {
+    } else if error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<webview2::CaptureError>(),
+            Some(webview2::CaptureError::Timeout)
+        )
+    }) {
+        "login_timeout"
+    } else if error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<webview2::CaptureError>(),
+            Some(webview2::CaptureError::Cancelled)
+        )
+    }) {
         "login_cancelled"
+    } else if error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<webview2::CaptureError>(),
+            Some(webview2::CaptureError::Com(_) | webview2::CaptureError::Io(_))
+        )
+    }) {
+        "credential_capture_failed"
+    } else if error.to_string().contains("unsupported provider") {
+        // Provider::parse 的固定内部文案，无独立错误类型。
+        "unsupported_provider"
     } else {
         "credential_capture_failed"
     }
@@ -459,18 +477,18 @@ mod tests {
             helper_error_code(&anyhow::anyhow!("cookie=secret")),
             "credential_capture_failed"
         );
-        assert_eq!(
-            helper_error_code(&anyhow::anyhow!(
-                "credential capture failed: WebView2 login timed out before required cookies were captured"
-            )),
-            "login_timeout"
-        );
-        assert_eq!(
-            helper_error_code(&anyhow::anyhow!(
-                "credential capture failed: WebView2 COM error: get_CookieManager failed with HRESULT 0x80004005"
-            )),
-            "credential_capture_failed"
-        );
+        let timed_out = anyhow::Error::new(super::webview2::CaptureError::Timeout)
+            .context("credential capture failed");
+        assert_eq!(helper_error_code(&timed_out), "login_timeout");
+        let closed = anyhow::Error::new(super::webview2::CaptureError::Cancelled)
+            .context("credential capture failed");
+        assert_eq!(helper_error_code(&closed), "login_cancelled");
+        // 错误信息恰含敏感词也不影响类型化分类。
+        let com = anyhow::Error::new(super::webview2::CaptureError::Com(
+            "timed out while closed".to_owned(),
+        ))
+        .context("credential capture failed");
+        assert_eq!(helper_error_code(&com), "credential_capture_failed");
     }
 
     #[test]

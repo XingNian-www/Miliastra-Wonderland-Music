@@ -6,6 +6,7 @@ use super::administration::AdministrationCommand;
 use super::card_games::LandlordCommand;
 use super::custom_workflow::CustomWorkflowCommand;
 use super::hall::HallCommand;
+use super::identity::IdentityRole;
 use super::idiom_chain::IdiomChainCommand;
 use super::invite::InviteCommand;
 use super::moderation::ModerationCommand;
@@ -15,12 +16,14 @@ use super::turtle_soup::TurtleSoupCommand;
 use super::undercover::UndercoverCommand;
 use crate::observation::chat::{ObservationFrameId, ObservedChatMessageId};
 
+/// 命令来源：大厅成员或好友私聊；身份角色在路由层单独判断。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CommandAuthority {
     HallMember,
     Friend,
 }
 
+/// 命令前缀：@ 用于功能命令，# 用于娱乐玩法或玩法中的操作。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CommandPrefix {
     At,
@@ -97,7 +100,18 @@ impl CommandEnvelope {
         })
     }
 
-    /// 生成仅替换命令文本的副本，用于 OCR 容错重试（观察信息与原始文本保留在原 envelope）。
+    /// 生成仅替换命令来源权限的副本，用于跨来源权限路由。
+    pub(crate) fn with_authority(&self, authority: CommandAuthority) -> Self {
+        Self {
+            message_type: match authority {
+                CommandAuthority::HallMember => "blue".to_string(),
+                CommandAuthority::Friend => "pink".to_string(),
+            },
+            authority,
+            ..self.clone()
+        }
+    }
+
     pub(crate) fn with_command_text(&self, command_text: impl Into<String>) -> Self {
         let command_text = command_text.into();
         let user_command = match self.prefix {
@@ -196,6 +210,9 @@ pub(crate) struct RoutedCommand {
     pub(crate) user_command: String,
     pub(crate) message_type: String,
     pub(crate) username: String,
+    pub(crate) authority: CommandAuthority,
+    pub(crate) role: Option<IdentityRole>,
+    pub(crate) permission_required: Option<IdentityRole>,
     pub(crate) command: ModuleCommand,
     pub(crate) observation: CommandObservation,
 }
@@ -212,6 +229,9 @@ impl RoutedCommand {
             user_command: envelope.user_command().to_string(),
             message_type: envelope.message_type.clone(),
             username: envelope.username.clone(),
+            authority: envelope.authority,
+            role: None,
+            permission_required: None,
             command: matched.command,
             observation: envelope.observation().clone(),
         }
@@ -229,6 +249,9 @@ impl RoutedCommand {
             raw,
             message_type: "控制台".to_string(),
             username: "控制台".to_string(),
+            authority: CommandAuthority::HallMember,
+            role: None,
+            permission_required: None,
             command,
             observation: CommandObservation {
                 captured_at: Some(Instant::now()),

@@ -495,25 +495,20 @@ fn parse_invite_decision(text: &str) -> Option<bool> {
         raw
     }
     .trim_start_matches(['：', ':', ' ', '\t', ']', '】']);
-    if command_text
-        .strip_prefix("@邀请确认")
-        .is_some_and(|rest| decision_boundary(rest.chars().next()))
+    if ["@邀请确认", "@确认邀请", "@同意邀请"]
+        .iter()
+        .any(|prefix| {
+            command_text
+                .strip_prefix(prefix)
+                .is_some_and(|rest| decision_boundary(rest.chars().next()))
+        })
     {
         Some(true)
-    } else if command_text
-        .strip_prefix("@邀请拒绝")
-        .is_some_and(|rest| decision_boundary(rest.chars().next()))
-    {
-        Some(false)
-    } else if command_text
-        .strip_prefix("@同意邀请")
-        .is_some_and(|rest| decision_boundary(rest.chars().next()))
-    {
-        Some(true)
-    } else if command_text
-        .strip_prefix("@拒绝邀请")
-        .is_some_and(|rest| decision_boundary(rest.chars().next()))
-    {
+    } else if ["@邀请拒绝", "@拒绝邀请"].iter().any(|prefix| {
+        command_text
+            .strip_prefix(prefix)
+            .is_some_and(|rest| decision_boundary(rest.chars().next()))
+    }) {
         Some(false)
     } else {
         None

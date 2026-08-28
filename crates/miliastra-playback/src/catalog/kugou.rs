@@ -836,15 +836,15 @@ impl KugouAdapter {
             return BTreeMap::new();
         };
         let mut result = cookies.clone();
-        if !result
+        if result
             .get("KuGoo")
-            .is_some_and(|value| !value.trim().is_empty())
+            .is_none_or(|value| value.trim().is_empty())
         {
             result.insert("KuGoo".to_owned(), format!("t={token}&KugooID={userid}"));
         }
-        if !result
+        if result
             .get("dfid")
-            .is_some_and(|value| !value.trim().is_empty())
+            .is_none_or(|value| value.trim().is_empty())
         {
             result.insert("dfid".to_owned(), Self::web_credential_dfid(credential));
         }
@@ -879,11 +879,11 @@ impl KugouAdapter {
         });
         let executable = executable.to_owned();
         let timeout = Duration::from_secs(30);
-        Ok(tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             run_kugou_web_helper(&executable, &profile, timeout, &request)
         })
         .await
-        .map_err(|error| CatalogError::Transient(error.to_string()))??)
+        .map_err(|error| CatalogError::Transient(error.to_string()))?
     }
 
     /// 直连酷狗 Web 端点。返回 `Ok(Some)` 为正常 JSON；检测到 SSA 挑战

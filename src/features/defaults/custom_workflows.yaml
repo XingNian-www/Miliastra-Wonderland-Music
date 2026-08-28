@@ -257,7 +257,7 @@ workflows:
       - type: key
         key: X
 
-  # 好友私聊 @通告 内容，向当前大厅发送“内容”
+  # 好友私聊 @通告 内容，向当前大厅发送“[触发者昵称]:内容”
   - name: notice
     enabled: true
     commands: [通告]
@@ -269,4 +269,4 @@ workflows:
     success_message: ""
     steps:
       - type: send_chat
-        message: "{{args}}"
+        message: "[{{username}}]:{{args}}"

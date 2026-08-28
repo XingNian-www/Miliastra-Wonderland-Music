@@ -832,7 +832,10 @@ impl ApplicationRuntime {
             None
         };
         let observes_hall = message_type == "blue";
-        let command_router = ChatCommandRouter::new(&self.business.custom_workflow);
+        let command_router = ChatCommandRouter::with_identity(
+            &self.business.custom_workflow,
+            &self.lifecycle.live_configs.identity,
+        );
         let mut texts = Vec::new();
         for (rect, sender_rect) in regions {
             let crop = crop_canvas(image, rect)?;
@@ -1065,7 +1068,10 @@ impl ApplicationRuntime {
                     .filter(|sender| !sender.is_empty())
                     .unwrap_or(SECONDARY_HALL_FALLBACK_SENDER)
             };
-            let router = ChatCommandRouter::new(&self.business.custom_workflow);
+            let router = ChatCommandRouter::with_identity(
+                &self.business.custom_workflow,
+                &self.lifecycle.live_configs.identity,
+            );
             if let Some(envelope) = command::parse_structured_song_envelope(
                 &text,
                 &shortcut_player,

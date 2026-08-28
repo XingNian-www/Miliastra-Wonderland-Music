@@ -38,11 +38,13 @@ use crate::features::card_games::{
 use crate::features::card_games::{CardGameCommandStart, LandlordConfig};
 use crate::features::chat_text::command_identity;
 use crate::features::command::{
-    CommandEnvelope, CommandObservation, CommandPrefix, ModuleCommand, RoutedCommand,
+    CommandAuthority, CommandEnvelope, CommandObservation, CommandPrefix, ModuleCommand,
+    RoutedCommand,
 };
 use crate::features::custom_workflow::{CustomWorkflowService, WorkflowDefaults};
 use crate::features::friend_delivery::{FriendBatchOutcome, FriendMessage};
 use crate::features::hall::{HallApplication, HallCommand, HallStateService};
+use crate::features::identity::IdentityRole;
 use crate::features::idiom_chain;
 use crate::features::idiom_chain::{IdiomChainApplication, IdiomChainService};
 use crate::features::invite::{InviteRequest, InviteService, InviteStart};

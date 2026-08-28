@@ -8,3 +8,6 @@
 /diagnostics
 .bitfun/
 /.bitfun/search/flashgrep-index/
+/crates/miliastra-playback/examples/
+/.tmp-kugou-reference/
+.clippy-report.txt

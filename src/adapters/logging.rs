@@ -66,6 +66,18 @@ impl Log for FileLogger {
             let _ = files.timing.write_all(format!("{line}\n").as_bytes());
             return;
         }
+        // 敏感 target（如完整 Web 访问令牌）只进 TUI/stderr，文件日志不落盘。
+        if is_file_hidden_target(record.target()) {
+            if let Ok(monitor) = self.monitor.lock()
+                && let Some(monitor) = monitor.as_ref()
+            {
+                monitor.push(line.clone());
+            }
+            if self.stderr.load(Ordering::Relaxed) {
+                let _ = std::io::stderr().write_all(format!("{line}\n").as_bytes());
+            }
+            return;
+        }
 
         if !is_monitor_hidden_target(record.target())
             && let Ok(monitor) = self.monitor.lock()
@@ -386,6 +398,11 @@ fn is_timing_target(target: &str) -> bool {
 
 fn is_monitor_hidden_target(target: &str) -> bool {
     target == "chat_scan_result"
+}
+
+/// 内容进入 TUI/stderr 但不写入文件日志的 target（用于完整敏感值）。
+fn is_file_hidden_target(target: &str) -> bool {
+    target == "web_token"
 }
 
 #[cfg(test)]

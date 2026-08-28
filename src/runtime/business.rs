@@ -575,7 +575,9 @@ enum ChatListenerRuntimeMessage {
     Snapshot(SyncSender<Result<ChatListenerSnapshot, BusinessRuntimeError>>),
     RequestMode {
         target: ChatListenerMode,
-        response: SyncSender<Result<bool, BusinessRuntimeError>>,
+        // 一次性返回请求结果与最新快照，避免「请求 + 单独快照」两段式
+        // 造成跨 actor 间隙的不一致。
+        response: SyncSender<Result<(bool, ChatListenerSnapshot), BusinessRuntimeError>>,
     },
     CompleteMode {
         mode: ChatListenerMode,
@@ -914,8 +916,8 @@ impl BusinessRuntimeHandle {
     ) -> Result<AdministrationMutationOutcome, BusinessRuntimeError> {
         Ok(match intent {
             AdministrationMutationIntent::RequestChatListenerMode(target) => {
-                let queued = self.request_chat_listener_mode(target)?;
-                let snapshot = self.chat_listener_snapshot()?;
+                // 请求与快照在同一 actor 消息内返回，消除两段式间隙。
+                let (queued, snapshot) = self.request_chat_listener_mode(target)?;
                 AdministrationMutationOutcome::ChatListenerModeRequested { queued, snapshot }
             }
             AdministrationMutationIntent::CancelChatListenerModeRequest(target) => {
@@ -1033,7 +1035,7 @@ impl BusinessRuntimeHandle {
     pub(crate) fn request_chat_listener_mode(
         &self,
         target: ChatListenerMode,
-    ) -> Result<bool, BusinessRuntimeError> {
+    ) -> Result<(bool, ChatListenerSnapshot), BusinessRuntimeError> {
         self.request(|response| {
             RuntimeMessage::ChatListener(ChatListenerRuntimeMessage::RequestMode {
                 target,
@@ -4102,7 +4104,8 @@ impl ChatListenerRuntimeState {
             }
             ChatListenerRuntimeMessage::RequestMode { target, response } => {
                 let changed = self.state.request_mode(target);
-                let _ = response.send(Ok(changed));
+                let snapshot = self.state.snapshot();
+                let _ = response.send(Ok((changed, snapshot)));
                 changed
             }
             ChatListenerRuntimeMessage::CompleteMode { mode, response } => {
@@ -4392,6 +4395,7 @@ mod tests {
             handle
                 .request_chat_listener_mode(ChatListenerMode::Secondary)
                 .unwrap()
+                .0
         );
         assert_eq!(
             handle.chat_listener_snapshot().unwrap().pending_mode,

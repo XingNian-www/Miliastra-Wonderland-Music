@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::thread::{self, JoinHandle};
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -14,7 +14,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     TranslateMessage, WM_HOTKEY, WM_QUIT,
 };
 
-use crate::config::HotkeyConfig;
+use crate::config::{HotkeyConfig, parse_hotkey_virtual_code};
 
 const PAUSE_ID: i32 = 1;
 const EXIT_ID: i32 = 2;
@@ -160,22 +160,5 @@ fn hotkey_loop(
 }
 
 fn parse_virtual_key(value: &str) -> Result<VIRTUAL_KEY> {
-    let normalized = value.trim().to_ascii_uppercase();
-    let key = match normalized.as_str() {
-        "F1" => 0x70,
-        "F2" => 0x71,
-        "F3" => 0x72,
-        "F4" => 0x73,
-        "F5" => 0x74,
-        "F6" => 0x75,
-        "F7" => 0x76,
-        "F8" => 0x77,
-        "F9" => 0x78,
-        "F10" => 0x79,
-        "F11" => 0x7A,
-        "F12" => 0x7B,
-        single if single.len() == 1 => single.as_bytes()[0] as u16,
-        _ => bail!("unsupported hotkey: {}", value),
-    };
-    Ok(VIRTUAL_KEY(key))
+    Ok(VIRTUAL_KEY(parse_hotkey_virtual_code(value)?))
 }

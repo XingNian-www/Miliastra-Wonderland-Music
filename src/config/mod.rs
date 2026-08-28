@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::features::card_games::LandlordConfig;
 use crate::features::custom_workflow::{CustomWorkflowConfig, WorkflowTimingConfig};
+use crate::features::identity::IdentityConfig;
 use crate::features::idiom_chain::IdiomChainConfig;
 use crate::features::invite::{InviteConfig, InviteTimingConfig};
 use crate::features::moderation::{ModerationConfig, ModerationTimingConfig};
@@ -92,6 +93,9 @@ pub struct AppConfig {
     /// 自定义流程；内嵌段可省略。
     #[serde(default)]
     pub custom_workflows: CustomWorkflowConfig,
+    /// 昵称身份映射；内嵌段可省略。
+    #[serde(default)]
+    pub identity: IdentityConfig,
 }
 
 impl Default for AppConfig {
@@ -160,6 +164,7 @@ impl Default for AppConfig {
             queue: QueueConfig::default(),
             song_dedup: SongDedupConfig::default(),
             idiom_chain: IdiomChainConfig::default(),
+            identity: IdentityConfig::default(),
             landlord: LandlordConfig::default(),
             undercover: UndercoverConfig::default(),
             turtle_soup: TurtleSoupConfig::default(),
@@ -406,6 +411,7 @@ impl AppConfig {
         self.ai.validate()?;
         self.song_review.validate()?;
         self.turtle_soup.validate()?;
+        self.identity.validate()?;
         self.validate_ui_geometry()?;
         Ok(())
     }
@@ -1629,8 +1635,36 @@ impl HotkeyConfig {
         if self.pause_key.eq_ignore_ascii_case(&self.exit_key) {
             bail!("hotkeys.pause_key 和 hotkeys.exit_key 不能相同");
         }
+        for (value, field) in [
+            (&self.pause_key, "hotkeys.pause_key"),
+            (&self.exit_key, "hotkeys.exit_key"),
+        ] {
+            parse_hotkey_virtual_code(value)
+                .map_err(|_| anyhow::anyhow!("{field} 仅支持 F1-F12 或单个 ASCII 字符"))?;
+        }
         Ok(())
     }
+}
+
+pub(crate) fn parse_hotkey_virtual_code(key: &str) -> Result<u16> {
+    let normalized = key.trim().to_ascii_uppercase();
+    let code = match normalized.as_str() {
+        "F1" => 0x70,
+        "F2" => 0x71,
+        "F3" => 0x72,
+        "F4" => 0x73,
+        "F5" => 0x74,
+        "F6" => 0x75,
+        "F7" => 0x76,
+        "F8" => 0x77,
+        "F9" => 0x78,
+        "F10" => 0x79,
+        "F11" => 0x7A,
+        "F12" => 0x7B,
+        single if single.len() == 1 && single.is_ascii() => single.as_bytes()[0] as u16,
+        _ => bail!("不支持的热键: {key}"),
+    };
+    Ok(code)
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -2401,6 +2435,24 @@ stale_timeout_ms: 7500
             "custom_workflows",
         ] {
             assert!(full.get(section).is_some(), "完整模板缺少顶层段 {section}");
+        }
+    }
+
+    #[test]
+    fn hotkey_parser_accepts_function_keys_and_single_ascii_characters() {
+        assert_eq!(parse_hotkey_virtual_code("F1").unwrap(), 0x70);
+        assert_eq!(parse_hotkey_virtual_code("f12").unwrap(), 0x7B);
+        assert_eq!(parse_hotkey_virtual_code("a").unwrap(), b'A' as u16);
+        assert_eq!(parse_hotkey_virtual_code("7").unwrap(), b'7' as u16);
+    }
+
+    #[test]
+    fn hotkey_parser_rejects_invalid_values() {
+        for value in ["", "F13", "AB", "中"] {
+            assert!(
+                parse_hotkey_virtual_code(value).is_err(),
+                "应拒绝 {value:?}"
+            );
         }
     }
 

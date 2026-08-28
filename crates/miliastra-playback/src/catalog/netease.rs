@@ -788,7 +788,9 @@ fn weapi_cookie_header(cookies: &BTreeMap<String, String>) -> String {
         ("channel", "netease"),
     ];
     for (key, value) in defaults {
-        merged.entry(key.to_owned()).or_insert_with(|| value.to_owned());
+        merged
+            .entry(key.to_owned())
+            .or_insert_with(|| value.to_owned());
     }
     cookie_header(&merged)
 }
@@ -1051,8 +1053,9 @@ mod tests {
 
     #[tokio::test]
     async fn netease_resolve_uses_v1_level_and_cookie_risk_headers() {
-        let body = json!({"code":200,"data":[{"url":"https://m8.music.126.net/song.flac","expi":120}]})
-            .to_string();
+        let body =
+            json!({"code":200,"data":[{"url":"https://m8.music.126.net/song.flac","expi":120}]})
+                .to_string();
         let (base, requests) = sequence_server(vec![(200, body)]);
         let adapter = media_adapter(&base);
         let key = SongKey::new("netease", "42").unwrap();
@@ -1073,8 +1076,9 @@ mod tests {
 
     #[tokio::test]
     async fn netease_resolve_falls_back_to_v0_once_when_v1_fails() {
-        let ok = json!({"code":200,"data":[{"url":"https://m8.music.126.net/song.mp3","expi":120}]})
-            .to_string();
+        let ok =
+            json!({"code":200,"data":[{"url":"https://m8.music.126.net/song.mp3","expi":120}]})
+                .to_string();
         let (base, requests) = sequence_server(vec![(500, "{}".to_owned()), (200, ok)]);
         let adapter = media_adapter(&base);
         let key = SongKey::new("netease", "42").unwrap();

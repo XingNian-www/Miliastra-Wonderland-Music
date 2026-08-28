@@ -155,6 +155,13 @@ pub(crate) struct TurtleSoupQuestion {
     kind: TurtleSoupQuestionKind,
 }
 
+impl TurtleSoupQuestion {
+    pub(crate) fn rename_player(&mut self, player: String) {
+        self.player_key = normalize_player_key(&player);
+        self.player = player;
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SecondaryOcrObservation {
     pub text: String,

@@ -6,6 +6,7 @@ pub(crate) mod custom_workflow;
 pub(crate) mod entertainment;
 pub(crate) mod friend_delivery;
 pub(crate) mod hall;
+pub(crate) mod identity;
 pub(crate) mod idiom_chain;
 pub(crate) mod invite;
 pub(crate) mod moderation;

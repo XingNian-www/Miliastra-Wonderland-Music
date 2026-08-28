@@ -1985,7 +1985,17 @@ fn custom_workflows_section() -> Vec<ConfigFieldSchema> {
     ]
 }
 
-/// 全部配置段 schema（27 段：与 AppConfig 顶层段一一对应，含 bootstrap 的 http/logging）。
+/// identity 段：OCR 备注昵称 → UUID/角色 的手动映射表。
+fn identity_section() -> Vec<ConfigFieldSchema> {
+    vec![ConfigFieldSchema::db_live(
+        "mappings",
+        "昵称身份映射",
+        FieldKind::Object,
+        "映射列表：在面板逐行添加昵称、备注与角色；UUID 由面板自动生成，仅用于内部去重且不会回显。昵称与 OCR 结果精确匹配，未映射昵称一律按路人处理；保存后立即生效。",
+    )]
+}
+
+/// 全部配置段 schema（28 段：与 AppConfig 顶层段一一对应，含 bootstrap 的 http/logging）。
 pub fn config_sections() -> Vec<ConfigSectionSchema> {
     vec![
         ConfigSectionSchema {
@@ -2149,6 +2159,12 @@ pub fn config_sections() -> Vec<ConfigSectionSchema> {
             label: "自定义流程".to_string(),
             order: 27,
             fields: with_section_prefix("custom_workflows", custom_workflows_section()),
+        },
+        ConfigSectionSchema {
+            name: "identity".to_string(),
+            label: "身份映射".to_string(),
+            order: 28,
+            fields: with_section_prefix("identity", identity_section()),
         },
     ]
 }
@@ -2496,7 +2512,7 @@ mod tests {
             }
         }
         assert_eq!(
-            total_fields, 265,
+            total_fields, 266,
             "schema 总字段数应与预期一致（声明数 = 实际数）"
         );
     }

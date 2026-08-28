@@ -2988,11 +2988,11 @@ mod tests {
         assert!(!params.contains_key("signature"));
         // 参数集合与上游 search_lyric.js 的 dataMap 一致。
         assert_eq!(params.len(), 8);
+        assert_eq!(params.get("album_audio_id").map(String::as_str), Some("42"));
         assert_eq!(
-            params.get("album_audio_id").map(String::as_str),
-            Some("42")
+            params.get("hash").map(String::as_str),
+            Some("ABCDEF0123456789")
         );
-        assert_eq!(params.get("hash").map(String::as_str), Some("ABCDEF0123456789"));
         assert_eq!(params.get("man").map(String::as_str), Some("no"));
     }
 

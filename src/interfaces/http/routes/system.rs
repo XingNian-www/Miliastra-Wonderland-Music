@@ -562,9 +562,13 @@ pub(super) fn hall_screenshot_response(
         .application
         .hall
         .capture_hall_screenshot()
-        .map_err(|error| AppError {
-            status: 503,
-            message: format!("主动检测大厅失败: {error:#}"),
+        .map_err(|error| {
+            // 内部错误详情只写日志，响应体不携带内部路径/错误链。
+            log::error!("主动检测大厅失败: {error:#}");
+            AppError {
+                status: 503,
+                message: "主动检测大厅失败".to_string(),
+            }
         })?;
     encoded_screenshot_response(
         request,

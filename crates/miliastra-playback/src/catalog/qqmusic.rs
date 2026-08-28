@@ -623,7 +623,9 @@ impl QqMusicAdapter {
                 return None;
             }
         };
-        let session = body.pointer("/req_0/data/session").and_then(Value::as_object);
+        let session = body
+            .pointer("/req_0/data/session")
+            .and_then(Value::as_object);
         let sid = session
             .and_then(|session| session.get("sid"))
             .and_then(value_string);

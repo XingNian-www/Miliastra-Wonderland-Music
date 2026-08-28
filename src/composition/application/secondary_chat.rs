@@ -1068,7 +1068,7 @@ impl ApplicationRuntime {
             let router = ChatCommandRouter::new(&self.business.custom_workflow);
             if let Some(envelope) = command::parse_structured_song_envelope(
                 &text,
-                shortcut_player,
+                &shortcut_player,
                 &message_type,
                 command_observation.clone(),
             ) && let Some(parsed) =
@@ -1109,22 +1109,9 @@ impl ApplicationRuntime {
                 continue;
             };
             let command_text = text[index..].trim().to_string();
-            let username = if message_type == "pink" {
-                if friend_name.trim().is_empty() {
-                    "二级好友"
-                } else {
-                    friend_name.trim()
-                }
-            } else {
-                message_sender
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|sender| !sender.is_empty())
-                    .unwrap_or(SECONDARY_HALL_FALLBACK_SENDER)
-            };
             let Some(envelope) = CommandEnvelope::new(
                 &text,
-                username,
+                shortcut_player,
                 &message_type,
                 command_text,
                 command_observation,
@@ -1304,6 +1291,7 @@ mod tests {
             business
                 .request_chat_listener_mode(ChatListenerMode::Secondary)
                 .unwrap()
+                .0
         );
         business
             .complete_chat_listener_mode(ChatListenerMode::Secondary)

@@ -17,7 +17,6 @@ use crate::features::moderation::{
     ModerationVotePort, ModerationVoteWork, is_moderation_vote_message,
 };
 use crate::interfaces::chat as command;
-use crate::observation::chat::ChatObservationShared;
 use crate::observation::decision::DecisionScreenLock;
 use crate::runtime::monitor::MonitorShared;
 use crate::runtime::ocr::OcrRuntimeHandle;

@@ -1969,6 +1969,15 @@ function randomRemarkNickname(){
   crypto.getRandomValues(bytes)
   return [...bytes].map(byte=>REMARK_CHARSET[byte%REMARK_CHARSET.length]).join('')
 }
+function identityRandomUuid(){
+  if(typeof crypto.randomUUID==='function')return crypto.randomUUID()
+  const bytes=new Uint8Array(16)
+  crypto.getRandomValues(bytes)
+  bytes[6]=(bytes[6]&15)|64
+  bytes[8]=(bytes[8]&63)|128
+  const hex=[...bytes].map(byte=>byte.toString(16).padStart(2,'0')).join('')
+  return hex.slice(0,8)+'-'+hex.slice(8,12)+'-'+hex.slice(12,16)+'-'+hex.slice(16,20)+'-'+hex.slice(20)
+}
 const IDENTITY_ROLE_LABELS={friend:'好友',admin:'管理员',owner:'主人'}
 function identityMappingsControl(){return $(configControlId('identity.mappings'))}
 function identityMappingsList(){
@@ -2040,7 +2049,7 @@ function identityAddRow(){
   if(!nickname){nickname=randomRemarkNickname()}
   if(items.some(m=>m&&m.nickname===nickname)){showConfigMessage('昵称 '+nickname+' 已存在','err');return}
   if(role==='owner'&&items.some(m=>m&&m.role==='owner')){showConfigMessage('主人只能有一位','err');return}
-  items.push({nickname:nickname,id:crypto.randomUUID(),role:role,note:note})
+  items.push({nickname:nickname,id:identityRandomUuid(),role:role,note:note})
   identityMappingsWrite(items)
   identityRenderTable()
   $('identityNewNickname').value='';$('identityNewNote').value=''

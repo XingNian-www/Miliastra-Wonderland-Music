@@ -17,7 +17,7 @@ use crate::features::moderation::{
     ModerationVotePort, ModerationVoteWork, is_moderation_vote_message,
 };
 use crate::interfaces::chat as command;
-use crate::observation::chat::{ChatObservationExclusiveGuard, ChatObservationShared};
+use crate::observation::chat::ChatObservationShared;
 use crate::observation::decision::DecisionScreenLock;
 use crate::runtime::monitor::MonitorShared;
 use crate::runtime::ocr::OcrRuntimeHandle;
@@ -35,7 +35,6 @@ struct ModerationVoteContext {
     game_ui: GameUi,
     ocr: OcrRuntimeHandle,
     monitor: MonitorShared,
-    chat_observations: ChatObservationShared,
     template_args: ResolvedTemplateArgs,
     chat_rect: Rect,
     canvas: Canvas,
@@ -43,13 +42,13 @@ struct ModerationVoteContext {
 
 impl ModerationVoteContext {
     fn open(self) -> Result<AppModerationVotePort> {
-        let observation_session = self.chat_observations.begin_exclusive()?;
         let mut port = AppModerationVotePort {
             running: self.running,
             game_ui: self.game_ui,
             ocr: self.ocr,
             monitor: self.monitor,
-            observation_session: Some(observation_session),
+            // 投票独立扫描粉色好友消息，只用屏幕基线过滤存量票；不占用聊天观察流，
+            // 一级、二级监听仍可持续发布和执行普通大厅命令。
             screen_lock: DecisionScreenLock::default(),
             template_args: self.template_args,
             chat_rect: self.chat_rect,
@@ -65,7 +64,6 @@ struct AppModerationVotePort {
     game_ui: GameUi,
     ocr: OcrRuntimeHandle,
     monitor: MonitorShared,
-    observation_session: Option<ChatObservationExclusiveGuard>,
     screen_lock: DecisionScreenLock,
     template_args: ResolvedTemplateArgs,
     chat_rect: Rect,
@@ -128,9 +126,7 @@ impl ModerationVotePort for AppModerationVotePort {
             .collect())
     }
 
-    fn finish(&mut self) {
-        self.observation_session.take();
-    }
+    fn finish(&mut self) {}
 }
 
 struct ModerationTaskContext {
@@ -273,7 +269,6 @@ impl ApplicationRuntime {
             game_ui: self.ui.game_ui.clone(),
             ocr: self.ui.ocr.clone(),
             monitor: self.lifecycle.monitor.clone(),
-            chat_observations: self.ui.chat_observations.clone(),
             template_args: self.ui.chat_templates.clone(),
             chat_rect: self.lifecycle.config.screen.chat_rect.into(),
             canvas: Canvas {

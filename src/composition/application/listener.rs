@@ -238,16 +238,6 @@ fn primary_command_candidates(
         .filter(|(_, message)| message.is_new)
 }
 
-fn select_http_access_token<'a>(
-    configured: &'a str,
-    watchdog_token: Option<&'a str>,
-) -> Option<&'a str> {
-    if !configured.trim().is_empty() {
-        return Some(configured);
-    }
-    watchdog_token.filter(|token| !token.trim().is_empty())
-}
-
 impl ApplicationRuntime {
     fn persist_listener_mode_best_effort(&self, mode: ChatListenerMode) {
         if let Err(error) =
@@ -354,24 +344,7 @@ impl ApplicationRuntime {
             .config_store
             .clone()
             .ok_or_else(|| anyhow!("配置中心存储尚未初始化"))?;
-        let mut http_config = self.lifecycle.config.http.clone();
-        let uses_temporary_token = http_config.access_token.trim().is_empty();
-        let watchdog_token = std::env::var(crate::WATCHDOG_HTTP_ACCESS_TOKEN_ENV).ok();
-        http_config.access_token =
-            select_http_access_token(&http_config.access_token, watchdog_token.as_deref())
-                .map(str::to_owned)
-                .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
-        if uses_temporary_token {
-            // 文件日志只记录截断版，避免令牌随日志留存；完整令牌走
-            // target=web_token（只进 TUI/stderr），供用户输入面板。
-            log::info!(
-                "Web 面板临时令牌已生成(看门狗生命周期内保持不变,访问 http://{}:{} 时输入): {}...",
-                http_config.host,
-                http_config.port,
-                &http_config.access_token[..4]
-            );
-            log::info!(target: "web_token", "Web 面板完整访问令牌: {}", http_config.access_token);
-        }
+        let http_config = self.lifecycle.config.http.clone();
         let http_state = http::HttpSharedState::new(
             http::HttpInterfaceConfig::new(
                 http_config,
@@ -1852,7 +1825,7 @@ mod tests {
         listener_ready_after_recheck, load_persisted_chat_listener_mode, merge_observed_inputs,
         persist_chat_listener_mode, primary_command_candidates, primary_rescan_can_publish,
         replacement_ready_allowed, replacement_startup_fallback_due, replacement_startup_retry_due,
-        secondary_hall_recovery_allowed, select_http_access_token, unresolved_ui_recovery_due,
+        secondary_hall_recovery_allowed, unresolved_ui_recovery_due,
     };
     use crate::observation::chat::{
         BubbleSequence, ChatIdentity, ChatMessage, ObservedChatMessageId, PrimaryObservedMessage,
@@ -1926,24 +1899,6 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(candidates, [(2, 3, "@状态")]);
-    }
-
-    #[test]
-    fn explicit_http_token_takes_priority_over_watchdog_token() {
-        assert_eq!(
-            select_http_access_token("configured-token", Some("watchdog-token")),
-            Some("configured-token")
-        );
-    }
-
-    #[test]
-    fn blank_http_token_inherits_non_blank_watchdog_token() {
-        assert_eq!(
-            select_http_access_token("", Some("watchdog-token")),
-            Some("watchdog-token")
-        );
-        assert_eq!(select_http_access_token("  ", Some("  ")), None);
-        assert_eq!(select_http_access_token("", None), None);
     }
 
     #[test]

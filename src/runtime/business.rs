@@ -5256,7 +5256,7 @@ mod tests {
                 barrier.wait();
                 matches!(
                     handle
-                        .begin_invite(InviteRequest::new(username, Some(9), None))
+                        .begin_invite(InviteRequest::new(username, username, Some(9), None))
                         .unwrap(),
                     InviteStart::Ready(_)
                 )

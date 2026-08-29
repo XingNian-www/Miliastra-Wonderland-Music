@@ -383,7 +383,7 @@ impl CustomWorkflowExecutionPort for ApplicationRuntime {
                 let InviteStart::Ready(execution) = self
                     .business
                     .business
-                    .begin_invite(InviteRequest::new(target, None, None))?
+                    .begin_invite(InviteRequest::new(target.clone(), target, None, None))?
                 else {
                     unreachable!("unsequenced custom workflow invites cannot be duplicates")
                 };

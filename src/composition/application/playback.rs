@@ -142,6 +142,9 @@ impl ApplicationRuntime {
                         return Ok(SongRequestDecision::SwitchSource);
                     }
                     SongRequestDecision::Ai if allow_ai => return Ok(SongRequestDecision::Ai),
+                    SongRequestDecision::Select | SongRequestDecision::SelectIndex(_) => {
+                        return Ok(decision);
+                    }
                     _ => {}
                 }
             }
@@ -154,15 +157,7 @@ impl ApplicationRuntime {
         } else if timeout_confirms {
             Ok(SongRequestDecision::Timeout)
         } else {
-            ApplicationRuntime::reply(
-                self,
-                if allow_switch_source {
-                    "此平台匹配失败,命令已超时(20s)下次可以尝试@确认@跳过@换源"
-                } else {
-                    "此平台匹配失败,命令已超时(20s)下次可以尝试@确认@跳过"
-                },
-            )?;
-            Ok(SongRequestDecision::Timeout)
+            Ok(SongRequestDecision::Cancelled)
         }
     }
 }

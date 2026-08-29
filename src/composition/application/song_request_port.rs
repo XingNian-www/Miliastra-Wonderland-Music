@@ -11,6 +11,11 @@ impl SongRequestPort for ApplicationRuntime {
         ApplicationRuntime::reply(self, message)
     }
 
+    fn reply_batch(&self, messages: &[String]) -> Result<()> {
+        let messages = messages.iter().map(String::as_str).collect::<Vec<_>>();
+        ApplicationRuntime::reply_batch(self, &messages, 0)
+    }
+
     fn prompt_and_wait_for_decision(
         &mut self,
         message: &str,

@@ -22,9 +22,6 @@ pub const CONFIG_RELOAD_EXIT_CODE: u8 = 75;
 /// Configuration reload exit code that asks the replacement to run startup automation.
 pub const CONFIG_RELOAD_WITH_STARTUP_EXIT_CODE: u8 = 77;
 
-/// Temporary HTTP access token inherited by every child in one watchdog lifetime.
-pub const WATCHDOG_HTTP_ACCESS_TOKEN_ENV: &str = "MILIASTRA_WATCHDOG_HTTP_ACCESS_TOKEN";
-
 /// One-shot marker set only for the child launched after a configuration reload.
 pub const CONFIG_RELOAD_CHILD_ENV: &str = "MILIASTRA_CONFIG_RELOAD_CHILD";
 

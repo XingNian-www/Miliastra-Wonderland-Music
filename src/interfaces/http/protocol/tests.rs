@@ -2953,7 +2953,7 @@ fn startup_wonderland_full_success_keeps_existing_contract() {
 }
 
 fn test_state_with_player_port(player: impl HttpPlayerPort + 'static) -> HttpTestState {
-    test_state_with_player_port_and_bootstrap_token(player, "")
+    test_state_with_player_port_and_bootstrap_token(player, "test-access-token")
 }
 
 fn test_state_with_player_port_and_bootstrap_token(

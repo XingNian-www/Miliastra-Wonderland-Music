@@ -1,22 +1,10 @@
-# Miliastra 最小启动配置
-# 本文件只保留启动引导所需的三个段：database_path、http、logging。
-# 旧版完整配置（window/screen/ocr/templates 等全部功能段）不再从本文件读取，
-# 升级时请删除旧段、只保留以下三个引导段；其余配置保存在统一数据库
-# playback.sqlite3 中，通过 Web 面板（http.port）的“配置中心”页面查看与修改。
-# 保留旧段会导致启动解析失败（未知字段被严格拒绝）。
-
-# 统一数据库路径（相对主程序所在目录）；存放配置、播放状态、队列、缓存索引、歌词
 database_path: deps/data/playback.sqlite3
-
-# Web 面板/配置中心
 http:
-  enabled: true
   host: 127.0.0.1
   port: 18888
-  # access_token 留空时生成临时令牌；自动重载期间保持不变，完整退出后重新生成
-  access_token: ""
-
-# 日志（日志初始化在数据库打开之前，必须留在引导配置）
+  enabled: true
+  # 留空时首次启动自动生成并写回本文件；后续启动持续使用该令牌
+  access_token: 5b459ddc378341d28339360dd0828ca7
 logging:
   dir: deps/logs
   level: info

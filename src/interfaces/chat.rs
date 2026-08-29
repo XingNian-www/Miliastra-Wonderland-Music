@@ -1052,8 +1052,21 @@ mod tests {
     }
 
     #[test]
-    fn rejects_pink_kugou_song_command() {
-        assert!(parse_text("[Alice]：@酷狗点歌 晴天 周杰伦", "pink").is_none());
+    fn parses_pink_kugou_song_command() {
+        let parsed =
+            parse_text("[Alice]：@酷狗点歌 晴天 周杰伦", "pink").expect("parse friend kugou song");
+        assert_eq!(
+            parsed.command,
+            ModuleCommand::SongRequest(SongCommand {
+                keyword: "晴天 周杰伦".to_string(),
+                source: SongSource::Kugou,
+                prefix: "酷狗点歌".to_string(),
+                prefer_accompaniment: false,
+                ai_assisted: false,
+                friend_username: "Alice".to_string(),
+            })
+        );
+        assert_eq!(parsed.message_type, "pink");
     }
 
     #[test]

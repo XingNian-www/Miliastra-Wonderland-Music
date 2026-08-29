@@ -1466,7 +1466,10 @@ impl ApplicationRuntime {
                 continue;
             };
             let parsed_command = self.map_command_actor(parsed_command);
-            if !self.commands_enabled()? && parsed_command.authority != CommandAuthority::Friend {
+            if !self.commands_enabled()?
+                && parsed_command.authority == CommandAuthority::HallMember
+                && parsed_command.role.is_none()
+            {
                 log::info!("命令识别已禁用，跳过: {}", parsed_command.raw);
                 self.ui
                     .chat_observations
@@ -1724,7 +1727,10 @@ impl ApplicationRuntime {
         if self.enqueue_chat_listener_command(&parsed)? {
             return Ok(());
         }
-        if !self.commands_enabled()? && parsed.authority != CommandAuthority::Friend {
+        if !self.commands_enabled()?
+            && parsed.authority == CommandAuthority::HallMember
+            && parsed.role.is_none()
+        {
             log::info!("命令识别已禁用，跳过二级大厅命令: {}", parsed.raw);
             return Ok(());
         }

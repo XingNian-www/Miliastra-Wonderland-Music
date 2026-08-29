@@ -65,7 +65,10 @@ impl InviteConfig {
 /// 邀请命令：读取邀请序号或六位密码，并发起入厅确认流程。
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct InviteCommand {
+    /// 游戏好友列表中的实际昵称，用于 UI 搜索。
     pub(crate) username: String,
+    /// 身份映射后的备注昵称，用于大厅通告和好友通知。
+    pub(crate) display_name: String,
     pub(crate) seq: Option<u32>,
     pub(crate) password: Option<String>,
 }
@@ -108,6 +111,7 @@ impl InviteCommand {
             raw_parameter,
             command: Self {
                 username: username.to_string(),
+                display_name: username.to_string(),
                 seq,
                 password,
             },
@@ -168,6 +172,7 @@ pub enum InviteDecision {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InviteRequest {
     pub username: String,
+    pub display_name: String,
     pub sequence: Option<u32>,
     pub password: Option<String>,
 }
@@ -175,11 +180,13 @@ pub struct InviteRequest {
 impl InviteRequest {
     pub fn new(
         username: impl Into<String>,
+        display_name: impl Into<String>,
         sequence: Option<u32>,
         password: Option<String>,
     ) -> Self {
         Self {
             username: username.into(),
+            display_name: display_name.into(),
             sequence,
             password,
         }
@@ -193,6 +200,7 @@ pub enum InviteStart {
 
 pub struct InviteExecution {
     username: String,
+    display_name: String,
     password: Option<String>,
 }
 
@@ -273,6 +281,7 @@ impl InviteService {
         }
         InviteStart::Ready(InviteExecution {
             username: request.username,
+            display_name: request.display_name,
             password: request.password,
         })
     }
@@ -281,6 +290,7 @@ impl InviteService {
 impl InviteExecution {
     pub fn run(self, port: &dyn InviteExecutionPort) -> Result<bool> {
         let username = self.username;
+        let display_name = self.display_name;
         let password = self.password;
         log::info!("邀请: 先检测是否公共大厅");
         if port.is_public_hall()? {
@@ -294,7 +304,7 @@ impl InviteExecution {
         }
         let announce = format!(
             "{}邀请BOT前往大厅,30s内@邀请确认@邀请拒绝,默认通过",
-            username
+            display_name
         );
         if let Err(error) = port.send_hall(&announce) {
             log::error!("邀请通告发送失败，直接执行邀请: {error:#}");
@@ -413,7 +423,7 @@ mod tests {
         sequence: Option<u32>,
     ) -> InviteExecution {
         let InviteStart::Ready(execution) =
-            service.begin(InviteRequest::new(username, sequence, None))
+            service.begin(InviteRequest::new(username, username, sequence, None))
         else {
             panic!("invite should be ready");
         };
@@ -428,7 +438,7 @@ mod tests {
         drop(begin_ready(&mut service, "甲", Some(7)));
         assert!(!service.should_accept(Some(7)));
         assert!(matches!(
-            service.begin(InviteRequest::new("乙", Some(7), None)),
+            service.begin(InviteRequest::new("乙", "乙", Some(7), None)),
             InviteStart::Duplicate { sequence: 7 }
         ));
     }
@@ -459,7 +469,7 @@ mod tests {
             drop(begin_ready(&mut service, "甲", Some(sequence)));
         }
         assert!(matches!(
-            service.begin(InviteRequest::new("甲", Some(1), None)),
+            service.begin(InviteRequest::new("甲", "甲", Some(1), None)),
             InviteStart::Duplicate { sequence: 1 }
         ));
 
@@ -533,7 +543,7 @@ mod tests {
 
         assert!(!service.should_accept(Some(11)));
         assert!(matches!(
-            service.begin(InviteRequest::new("甲", Some(11), None)),
+            service.begin(InviteRequest::new("甲", "甲", Some(11), None)),
             InviteStart::Duplicate { sequence: 11 }
         ));
     }

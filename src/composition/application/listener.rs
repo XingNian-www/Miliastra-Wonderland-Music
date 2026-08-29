@@ -1345,12 +1345,8 @@ impl ApplicationRuntime {
 
     fn map_command_actor(&self, mut command: RoutedCommand) -> RoutedCommand {
         let actor = self.mapped_actor_name(&command.username);
-        command.username = actor.clone();
         match &mut command.command {
-            ModuleCommand::SongRequest(song) if !song.friend_username.is_empty() => {
-                song.friend_username = actor.clone();
-            }
-            ModuleCommand::Invite(invite) => invite.username = actor.clone(),
+            ModuleCommand::Invite(invite) => invite.display_name = actor,
             ModuleCommand::Moderation(moderation) => moderation.requester = actor,
             _ => {}
         }

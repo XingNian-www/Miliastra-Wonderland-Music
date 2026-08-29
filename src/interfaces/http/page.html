@@ -427,11 +427,19 @@ input.config-invalid:focus,textarea.config-invalid:focus{border-color:var(--dang
  @media(max-width:1050px){.playback-layout{grid-template-columns:1fr}.playback-layout>.panel{grid-column:auto}.playback-queue-panel .queue-list{grid-template-columns:1fr}
  .topbar{grid-template-columns:1fr;padding:var(--sp-3) var(--sp-1) var(--sp-4)}.brand{padding:var(--sp-2) var(--sp-4);border-bottom:1px solid var(--sep-2)}.status-chips,.top-actions{flex-wrap:wrap;padding:var(--sp-3) var(--sp-4);border-left:none;border-top:1px solid var(--sep-2)}.top-actions{justify-content:flex-start}.page-grid{grid-template-columns:1fr}.page-grid>.panel{grid-column:auto}.turtle-stats{grid-template-columns:repeat(3,minmax(0,1fr))}.tools-grid{grid-template-columns:1fr}.tools-grid>.panel{grid-column:auto}.config-layout{grid-template-columns:1fr}.config-sidebar{position:static;max-height:none}.config-num-row{grid-template-columns:repeat(2,minmax(0,1fr))}}
  @media(max-width:720px){.app-nav{position:sticky;top:0;width:100%;height:auto;padding:var(--sp-2);border-right:0;border-bottom:1px solid var(--sep-1);overflow:hidden}.nav-brand{display:none}.nav-links{flex-direction:row;overflow-x:auto;scrollbar-width:thin}.nav-link{width:auto;flex:0 0 auto;white-space:nowrap}.nav-tools{margin-top:0}.shell{margin-left:0;padding:0 var(--sp-3) var(--sp-5)}.controls,.two,.three,.compact-form,.ocr-send,.ocr-options,.turtle-toolbar,.turtle-grid,.login-row,.login-session-grid,.login-facts,.login-qr{grid-template-columns:1fr}.login-row .controls{min-width:0}.login-qr img{width:min(180px,100%);justify-self:center}.turtle-stats{grid-template-columns:1fr 1fr}.undercover-toolbar{justify-content:stretch}.undercover-toolbar .btn{flex:1}.global-result{bottom:var(--sp-2)}.tools-grid{gap:var(--sp-4)}.playback-player-panel,.playback-request-panel{padding-left:var(--sp-2);padding-right:var(--sp-2)}.playback-player-panel .controls{grid-template-columns:repeat(2,minmax(0,1fr))}.playback-request-panel>.panel-body>.controls{grid-template-columns:repeat(2,minmax(0,1fr))}.playback-request-panel>.panel-body>.controls .btn.primary{grid-column:auto}.candidate-item{grid-template-columns:1fr}.candidate-actions{justify-content:flex-start}}
-.identity-table{width:100%;border-collapse:collapse;font-size:12px}
-.identity-table th,.identity-table td{padding:4px 6px;text-align:left;border-bottom:1px solid rgba(127,127,127,.25)}
-.identity-table input,.identity-table select{width:100%;box-sizing:border-box;background:var(--panel-bg);color:var(--fg);border:1px solid var(--border,#444);border-radius:6px;padding:4px 6px}
-.identity-empty{color:rgba(127,127,127,.8);text-align:center;padding:10px 0}
-@media(max-width:900px){.identity-table{min-width:620px}.identity-table{display:block;overflow-x:auto}.config-string-row:has(#identityNewNote){align-items:stretch;flex-wrap:wrap}.config-string-row:has(#identityNewNote) input{min-width:160px}}
+.identity-table-wrap{overflow-x:auto;border:1px solid var(--sep-2);border-radius:var(--radius-s)}
+.identity-table{width:100%;border-collapse:collapse;font-size:var(--fs-item);min-width:620px}
+.identity-table th,.identity-table td{padding:var(--sp-2);text-align:left;border-bottom:1px solid var(--sep-2);vertical-align:middle}
+.identity-table th{color:var(--text-2);font-size:var(--fs-meta);font-weight:600;white-space:nowrap}
+.identity-table tbody tr:last-child td{border-bottom:0}
+.identity-table input,.identity-table select{width:100%;box-sizing:border-box;background:var(--bg-input);color:var(--text-1);border:1px solid var(--sep-1);border-radius:var(--radius-s);padding:5px 8px;min-height:var(--ctl-h)}
+.identity-table input:focus,.identity-table select:focus{border-color:var(--accent);outline:0;box-shadow:0 0 0 3px var(--accent-soft)}
+.identity-empty{color:var(--text-3);text-align:center;padding:var(--sp-4) 0!important}
+.identity-repair{width:100%;font-family:var(--font-mono);font-size:var(--fs-meta)}
+.identity-add-row{display:flex;gap:var(--sp-2);align-items:center;flex-wrap:wrap}
+.identity-add-row input{min-width:160px;flex:1}
+.identity-add-row select{min-width:100px}
+@media(max-width:900px){.identity-add-row{align-items:stretch}.identity-add-row>*{min-width:160px;flex:1}.identity-add-row .btn{flex:0 0 auto}}
 </style>
 </head>
 <body>
@@ -1981,20 +1989,40 @@ function identityRenderTable(){
   const wrap=$(configControlId('identity.mappings')+'-table')
   if(!wrap)return
   const items=identityMappingsList()
-  if(items===null){wrap.innerHTML='<div class="config-field-hint">JSON 无法解析，表格已停用；修正后切换分段再回来。</div>';return}
+  if(items===null){
+    const el=identityMappingsControl()
+    wrap.innerHTML='<div class="config-field-hint">JSON 无法解析，请在下方修正后点击应用。</div><textarea id="identityRepairJson" class="identity-repair" rows="6">'+esc(el?el.value:'')+'</textarea><button type="button" class="btn small" onclick="identityRepairJsonApply()">应用修正后的 JSON</button>'
+    return
+  }
   const rows=items.map((m,i)=>{
-    const role=m&&typeof m==='object'&&IDENTITY_ROLE_LABELS[m.role]?m.role:'friend'
+    const mapping=m&&typeof m==='object'&&!Array.isArray(m)?m:{}
+    const role=IDENTITY_ROLE_LABELS[mapping.role]?mapping.role:'friend'
     const select=['friend','admin','owner'].map(r=>'<option value="'+r+'"'+(role===r?' selected':'')+'>'+IDENTITY_ROLE_LABELS[r]+'</option>').join('')
-    return '<tr><td><input value="'+esc(m.nickname||'')+'" placeholder="备注昵称" oninput="identityTableSet('+i+',\'nickname\',this.value)"></td>'
-      +'<td><input value="'+esc(m.note||'')+'" placeholder="备注（仅面板显示）" oninput="identityTableSet('+i+',\'note\',this.value)"></td>'
+    return '<tr><td><input value="'+esc(mapping.nickname||'')+'" placeholder="备注昵称" oninput="identityTableSet('+i+',\'nickname\',this.value)"></td>'
+      +'<td><input value="'+esc(mapping.note||'')+'" placeholder="备注（仅面板显示）" oninput="identityTableSet('+i+',\'note\',this.value)"></td>'
       +'<td><select onchange="identityTableSet('+i+',\'role\',this.value)">'+select+'</select></td>'
       +'<td><button type="button" class="btn small warn" onclick="identityTableRemove('+i+')">删除</button></td></tr>'
   }).join('')
-  wrap.innerHTML='<table class="identity-table"><thead><tr><th>备注昵称</th><th>备注</th><th>角色</th><th></th></tr></thead><tbody>'+(rows||'<tr><td colspan="4" class="identity-empty">暂无映射</td></tr>')+'</tbody></table>'
+  wrap.innerHTML='<div class="identity-table-wrap"><table class="identity-table"><thead><tr><th>备注昵称</th><th>备注</th><th>角色</th><th></th></tr></thead><tbody>'+(rows||'<tr><td colspan="4" class="identity-empty">暂无映射</td></tr>')+'</tbody></table></div>'
+}
+function identityRepairJsonApply(){
+  const repair=$('identityRepairJson');if(!repair)return
+  const text=String(repair.value||'').trim()
+  try{
+    const value=JSON.parse(text)
+    if(!Array.isArray(value))throw new Error('必须是数组')
+    identityMappingsWrite(value)
+    identityRenderTable()
+    showConfigMessage('JSON 已应用，请检查映射后保存','ok')
+  }catch(e){showConfigMessage('身份映射 JSON 无效：'+e.message,'err')}
 }
 function identityTableSet(index,field,value){
-  const items=identityMappingsList();if(!items||!items[index])return
-  items[index][field]=value
+  const items=identityMappingsList();if(!items||!items[index]||typeof items[index]!=='object'||Array.isArray(items[index]))return
+  const next=String(value??'')
+  if(field==='nickname'&&items.some((item,i)=>i!==index&&item&&item.nickname===next.trim())){
+    showConfigMessage('昵称 '+next.trim()+' 已存在','err');identityRenderTable();return
+  }
+  items[index][field]=field==='nickname'?next.trim():next
   identityMappingsWrite(items)
 }
 function identityTableRemove(index){
@@ -2028,9 +2056,9 @@ function identityMappingsEditor(path,value){
   const id=configControlId(path)
   const text=value==null?'[]':JSON.stringify(value,null,2)
   return '<textarea id="'+id+'" data-cfg="'+path+'" data-cfg-object="1" style="display:none" data-identity-editor="1">'+esc(text)+'</textarea>'
-    +'<div class="config-string-row"><button type="button" class="btn small" onclick="identityCopyRandomNickname()">生成随机昵称</button>'
-    +'<input id="identityNewNickname" placeholder="备注昵称（留空自动随机）" style="flex:1">'
-    +'<input id="identityNewNote" placeholder="备注（可选）" style="width:180px">'
+    +'<div class="identity-add-row"><button type="button" class="btn small" onclick="identityCopyRandomNickname()">生成随机昵称</button>'
+    +'<input id="identityNewNickname" placeholder="备注昵称（留空自动随机）">'
+    +'<input id="identityNewNote" placeholder="备注（可选）">'
     +'<select id="identityNewRole"><option value="friend">好友</option><option value="admin">管理员</option><option value="owner">主人</option></select>'
     +'<button type="button" class="btn small primary" onclick="identityAddRow()">添加</button></div>'
     +'<div class="config-field-hint">添加时自动生成 UUID 用于内部区分，任何页面都不显示该编号；昵称建议用随机值并同步改游戏内好友备注。</div>'

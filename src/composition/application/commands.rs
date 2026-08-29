@@ -351,8 +351,12 @@ impl ApplicationRuntime {
         parsed: &RoutedCommand,
         invite: &crate::features::invite::InviteCommand,
     ) -> Result<()> {
-        let request =
-            InviteRequest::new(invite.username.clone(), invite.seq, invite.password.clone());
+        let request = InviteRequest::new(
+            invite.username.clone(),
+            invite.display_name.clone(),
+            invite.seq,
+            invite.password.clone(),
+        );
         let execution = match self.business.business.begin_invite(request)? {
             InviteStart::Duplicate { sequence } => {
                 log::info!("邀请参数 {} 已执行过，跳过", sequence);

@@ -1371,7 +1371,16 @@ impl ApplicationRuntime {
     }
 
     fn map_command_actor(&self, mut command: RoutedCommand) -> RoutedCommand {
-        command.username = self.mapped_actor_name(&command.username);
+        let actor = self.mapped_actor_name(&command.username);
+        command.username = actor.clone();
+        match &mut command.command {
+            ModuleCommand::SongRequest(song) if !song.friend_username.is_empty() => {
+                song.friend_username = actor.clone();
+            }
+            ModuleCommand::Invite(invite) => invite.username = actor.clone(),
+            ModuleCommand::Moderation(moderation) => moderation.requester = actor,
+            _ => {}
+        }
         command
     }
 
@@ -1457,7 +1466,7 @@ impl ApplicationRuntime {
                 continue;
             };
             let parsed_command = self.map_command_actor(parsed_command);
-            if !self.commands_enabled()? && message.message_type != "pink" {
+            if !self.commands_enabled()? && parsed_command.authority != CommandAuthority::Friend {
                 log::info!("命令识别已禁用，跳过: {}", parsed_command.raw);
                 self.ui
                     .chat_observations
@@ -1715,7 +1724,7 @@ impl ApplicationRuntime {
         if self.enqueue_chat_listener_command(&parsed)? {
             return Ok(());
         }
-        if !self.commands_enabled()? && parsed.message_type != "pink" {
+        if !self.commands_enabled()? && parsed.authority != CommandAuthority::Friend {
             log::info!("命令识别已禁用，跳过二级大厅命令: {}", parsed.raw);
             return Ok(());
         }

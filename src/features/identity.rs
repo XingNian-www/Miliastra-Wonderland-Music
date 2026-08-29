@@ -130,19 +130,23 @@ impl IdentityAccess {
         self.resolve(nickname).map(|identity| identity.role)
     }
 
+    #[cfg(test)]
     /// 是否达到指定角色（含更高角色）；未映射昵称一律 false。
     pub fn is_at_least(&self, nickname: &str, required: IdentityRole) -> bool {
         self.role_of(nickname).is_some_and(|role| role >= required)
     }
 
+    #[cfg(test)]
     pub fn is_owner(&self, nickname: &str) -> bool {
         self.is_at_least(nickname, IdentityRole::Owner)
     }
 
+    #[cfg(test)]
     pub fn is_admin_or_above(&self, nickname: &str) -> bool {
         self.is_at_least(nickname, IdentityRole::Admin)
     }
 
+    #[cfg(test)]
     pub fn is_friend_or_above(&self, nickname: &str) -> bool {
         self.is_at_least(nickname, IdentityRole::Friend)
     }

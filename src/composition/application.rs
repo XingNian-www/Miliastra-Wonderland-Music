@@ -1756,6 +1756,14 @@ fn classify_secondary_hall_message(
             requires_sender: true,
         };
     }
+    if secondary_hall_command_text(text)
+        .is_some_and(|command| command.trim_start().starts_with('@'))
+    {
+        return SecondaryHallMessageClassification {
+            kind: SecondaryHallMessageKind::Command,
+            requires_sender: true,
+        };
+    }
     SecondaryHallMessageClassification {
         kind: SecondaryHallMessageKind::Ignored,
         requires_sender: false,
@@ -1939,6 +1947,12 @@ mod tests {
         let ignored = classify_secondary_hall_message("普通聊天", None, true);
         assert_eq!(ignored.kind, SecondaryHallMessageKind::Ignored);
         assert!(!ignored.requires_sender);
+
+        for text in ["@删除", "@邀请1"] {
+            let fallback = classify_secondary_hall_message(text, None, false);
+            assert_eq!(fallback.kind, SecondaryHallMessageKind::Command);
+            assert!(fallback.requires_sender, "text={text}");
+        }
     }
 
     #[test]

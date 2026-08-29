@@ -2405,13 +2405,12 @@ mod tests {
 
     #[test]
     fn only_playback_source_recovery_fields_wait_for_an_active_song() {
-        for path in ["playback.credential_directory"] {
-            assert_eq!(
-                config_effect_for_path(path),
-                Some(Effect::PlaybackIdleReload),
-                "field={path}"
-            );
-        }
+        let path = "playback.credential_directory";
+        assert_eq!(
+            config_effect_for_path(path),
+            Some(Effect::PlaybackIdleReload),
+            "field={path}"
+        );
         for path in [
             "stability.default_count",
             "timing.playback.uri_stable_samples",

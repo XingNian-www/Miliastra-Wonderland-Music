@@ -43,6 +43,7 @@ pub(crate) struct ChatCommandRouter<'a> {
 }
 
 impl<'a> ChatCommandRouter<'a> {
+    #[cfg(test)]
     pub(crate) const fn new(custom_workflow: &'a CustomWorkflowService) -> Self {
         Self {
             custom_workflow: Some(custom_workflow),
@@ -134,17 +135,16 @@ impl<'a> ChatCommandRouter<'a> {
     ) -> Option<RoutedCommand> {
         let tolerant = ocr_tolerant_command_text(envelope.command_text());
         for candidate in [
-            Some(envelope.clone()),
             primary.clone(),
+            Some(envelope.clone()),
+            tolerant.as_ref().and_then(|text| {
+                primary
+                    .as_ref()
+                    .map(|candidate| candidate.with_command_text(text))
+            }),
             tolerant
                 .as_ref()
                 .map(|text| envelope.with_command_text(text)),
-            tolerant.as_ref().map(|text| {
-                primary.as_ref().map_or_else(
-                    || envelope.with_command_text(text),
-                    |candidate| candidate.with_command_text(text),
-                )
-            }),
         ]
         .into_iter()
         .flatten()
@@ -499,6 +499,12 @@ mod tests {
                     role: IdentityRole::Admin,
                     note: String::new(),
                 },
+                IdentityMapping {
+                    nickname: "好友".to_string(),
+                    id: uuid::Uuid::from_u128(3),
+                    role: IdentityRole::Friend,
+                    note: "好友备注".to_string(),
+                },
             ],
         });
         let service = CustomWorkflowService::new(
@@ -532,6 +538,20 @@ mod tests {
         let routed = router.route(&admin, None).unwrap();
         assert_eq!(routed.authority, CommandAuthority::Friend);
         assert_eq!(routed.role, Some(IdentityRole::Admin));
+
+        let friend = CommandEnvelope::new(
+            "好友：@删除",
+            "好友",
+            "blue",
+            "@删除",
+            CommandObservation::default(),
+        )
+        .unwrap();
+        let routed = router.route(&friend, None).unwrap();
+        assert_eq!(routed.authority, CommandAuthority::Friend);
+        assert_eq!(routed.message_type, "pink");
+        assert_eq!(routed.role, Some(IdentityRole::Friend));
+        assert_eq!(routed.permission_required, None);
     }
 
     #[test]

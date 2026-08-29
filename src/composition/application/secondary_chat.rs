@@ -826,11 +826,7 @@ impl ApplicationRuntime {
         let accepts_turtle_questions = message_type == "blue"
             && commands_enabled
             && self.business.business.turtle_soup_accepts_questions()?;
-        let active_entertainment = if commands_enabled {
-            self.business.business.active_entertainment()?
-        } else {
-            None
-        };
+        let active_entertainment = self.business.business.active_entertainment()?;
         let observes_hall = message_type == "blue";
         let command_router = ChatCommandRouter::with_identity(
             &self.business.custom_workflow,
@@ -844,36 +840,37 @@ impl ApplicationRuntime {
                 self.lifecycle.config.ocr.same_line_y_tolerance,
                 OcrPriority::ChatObservation,
             )?;
-            let classification = if observes_hall && commands_enabled {
-                let routed = secondary_hall_command_text(&text)
-                    .and_then(|command_text| {
-                        CommandEnvelope::new(
-                            &text,
-                            SECONDARY_HALL_FALLBACK_SENDER,
-                            "blue",
-                            command_text,
-                            CommandObservation::default(),
-                        )
+            let classification = if observes_hall {
+                let routed = commands_enabled
+                    .then(|| {
+                        secondary_hall_command_text(&text)
+                            .and_then(|command_text| {
+                                CommandEnvelope::new(
+                                    &text,
+                                    SECONDARY_HALL_FALLBACK_SENDER,
+                                    "blue",
+                                    command_text,
+                                    CommandObservation::default(),
+                                )
+                            })
+                            .or_else(|| {
+                                command::parse_structured_song_envelope(
+                                    &text,
+                                    SECONDARY_HALL_FALLBACK_SENDER,
+                                    "blue",
+                                    CommandObservation::default(),
+                                )
+                            })
+                            .and_then(|envelope| {
+                                command_router.route(&envelope, active_entertainment)
+                            })
                     })
-                    .or_else(|| {
-                        command::parse_structured_song_envelope(
-                            &text,
-                            SECONDARY_HALL_FALLBACK_SENDER,
-                            "blue",
-                            CommandObservation::default(),
-                        )
-                    })
-                    .and_then(|envelope| command_router.route(&envelope, active_entertainment));
+                    .flatten();
                 classify_secondary_hall_message(
                     &text,
                     routed.as_ref().map(|command| &command.command),
                     accepts_turtle_questions,
                 )
-            } else if observes_hall {
-                SecondaryHallMessageClassification {
-                    kind: SecondaryHallMessageKind::Ignored,
-                    requires_sender: false,
-                }
             } else {
                 SecondaryHallMessageClassification {
                     kind: SecondaryHallMessageKind::Command,
@@ -1074,7 +1071,7 @@ impl ApplicationRuntime {
             );
             if let Some(envelope) = command::parse_structured_song_envelope(
                 &text,
-                &shortcut_player,
+                shortcut_player,
                 &message_type,
                 command_observation.clone(),
             ) && let Some(parsed) =
@@ -1308,10 +1305,10 @@ mod tests {
         business.finish_chat_listener_hall_round().unwrap();
 
         assert!(business.claim_chat_listener_unread_task().unwrap());
-        let failed: Result<()> = (|| {
+        let failed: Result<()> = {
             let _completion = SecondaryUnreadTaskCompletionGuard::new(business.clone());
             Err(anyhow!("模拟未读任务提前失败"))
-        })();
+        };
         assert!(failed.is_err());
         assert!(
             !business

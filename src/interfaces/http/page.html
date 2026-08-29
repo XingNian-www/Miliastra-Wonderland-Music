@@ -847,9 +847,9 @@ input.config-invalid:focus,textarea.config-invalid:focus{border-color:var(--dang
       </div>
 
       <div class="panel">
-        <div class="panel-head"><h2>访问令牌</h2><small>可选</small></div>
+        <div class="panel-head"><h2>访问令牌</h2><small>必填</small></div>
         <div class="panel-body">
-          <input id="accessToken" type="password" placeholder="访问令牌（可选，自动记住）" oninput="storeAccessToken()" onchange="applyAccessToken()" style="width:100%">
+          <input id="accessToken" type="password" placeholder="请输入访问令牌" required oninput="storeAccessToken()" onchange="applyAccessToken()" style="width:100%">
         </div>
       </div>
     </aside>

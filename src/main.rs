@@ -48,17 +48,12 @@ impl WatchdogChildHandoff {
 fn configure_watchdog_child(
     command: &mut std::process::Command,
     config_path: &std::path::Path,
-    http_access_token: &str,
     handoff: WatchdogChildHandoff,
     ready_file: Option<&std::path::Path>,
 ) {
     command
         .env("MILIASTRA_WATCHDOG_CHILD", "1")
-        .env("MILIASTRA_CONFIG_PATH", config_path)
-        .env(
-            miliastra_wonderland_music::WATCHDOG_HTTP_ACCESS_TOKEN_ENV,
-            http_access_token,
-        );
+        .env("MILIASTRA_CONFIG_PATH", config_path);
     if handoff.config_reload {
         command.env(miliastra_wonderland_music::CONFIG_RELOAD_CHILD_ENV, "1");
         if let Some(ready_file) = ready_file {
@@ -159,10 +154,6 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
         Err(_) => None,
     };
 
-    // Blank access_token still requires authentication. Keep one temporary token stable across
-    // every child restart owned by this watchdog process so a configuration reload does not
-    // invalidate an already authenticated Web panel session.
-    let watchdog_http_access_token = uuid::Uuid::new_v4().simple().to_string();
     let mut next_child_handoff = WatchdogChildHandoff::default();
     let mut cached_restart_ms = miliastra_wonderland_music::watchdog_restart_ms(&config_path)
         .unwrap_or_else(|error| {
@@ -175,13 +166,7 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
         let handoff = next_child_handoff;
         let ready_file = handoff.config_reload.then(replacement_ready_file);
         let mut command = Command::new(&current_exe);
-        configure_watchdog_child(
-            &mut command,
-            &config_path,
-            &watchdog_http_access_token,
-            handoff,
-            ready_file.as_deref(),
-        );
+        configure_watchdog_child(&mut command, &config_path, handoff, ready_file.as_deref());
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
@@ -354,21 +339,16 @@ mod tests {
     }
 
     #[test]
-    fn watchdog_child_environment_carries_stable_token_and_scoped_reload_marker() {
+    fn watchdog_child_environment_carries_scoped_reload_marker() {
         let mut reload_command = Command::new("child.exe");
         configure_watchdog_child(
             &mut reload_command,
             Path::new(r"C:\Miliastra\config.yaml"),
-            "stable-token",
             WatchdogChildHandoff {
                 config_reload: true,
                 run_startup: true,
             },
             Some(Path::new(r"C:\Miliastra\replacement.ready")),
-        );
-        assert_eq!(
-            command_environment(&reload_command, "MILIASTRA_WATCHDOG_HTTP_ACCESS_TOKEN"),
-            Some(OsStr::new("stable-token"))
         );
         assert_eq!(
             command_environment(&reload_command, "MILIASTRA_CONFIG_RELOAD_CHILD"),
@@ -387,16 +367,8 @@ mod tests {
         configure_watchdog_child(
             &mut crash_restart_command,
             Path::new(r"C:\Miliastra\config.yaml"),
-            "stable-token",
             WatchdogChildHandoff::after_exit(WatchdogChildHandoff::default(), Some(1), false),
             None,
-        );
-        assert_eq!(
-            command_environment(
-                &crash_restart_command,
-                "MILIASTRA_WATCHDOG_HTTP_ACCESS_TOKEN"
-            ),
-            Some(OsStr::new("stable-token"))
         );
         assert_eq!(
             command_environment(&crash_restart_command, "MILIASTRA_CONFIG_RELOAD_CHILD"),

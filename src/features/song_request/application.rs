@@ -30,6 +30,9 @@ pub(crate) enum SongRequestDecision {
     Ai,
     Timeout,
     Stopped,
+    Cancelled,
+    Select,
+    SelectIndex(usize),
 }
 
 impl SongRequestDecision {
@@ -64,6 +67,14 @@ impl SongRequestDecision {
             .is_some_and(|rest| decision_boundary(rest.chars().next()))
         {
             Some(Self::SwitchSource)
+        } else if command_text
+            .strip_prefix("@选择")
+            .is_some_and(|rest| decision_boundary(rest.chars().next()))
+        {
+            Some(Self::Select)
+        } else if let Some(rest) = command_text.strip_prefix('@') {
+            let index = rest.parse::<usize>().ok()?;
+            (1..=5).contains(&index).then_some(Self::SelectIndex(index))
         } else {
             None
         }
@@ -137,6 +148,8 @@ impl Display for SongSearchFailure {
 
 pub(crate) trait SongRequestPort {
     fn reply(&self, message: &str) -> Result<()>;
+
+    fn reply_batch(&self, messages: &[String]) -> Result<()>;
 
     fn prompt_and_wait_for_decision(
         &mut self,
@@ -566,13 +579,21 @@ impl SongRequestExecution<'_> {
             pick.score,
             pick.reason
         );
-        let message = format!("{}AI匹配:{},@确认@跳过", label, candidate.text);
-        match self.prompt_and_wait_for_decision(&message, false, false, true)? {
-            SongRequestDecision::Confirm | SongRequestDecision::Timeout => {}
-            SongRequestDecision::Skip => return Ok(None),
-            SongRequestDecision::Stopped => return Ok(None),
-            SongRequestDecision::SwitchSource | SongRequestDecision::Ai => return Ok(None),
-        }
+        let message = format!("{}AI匹配:{},@确认@跳过@选择", label, candidate.text);
+        let decision = self.prompt_candidate_decision(&message, &candidates, false, false)?;
+        let candidate = match decision {
+            SongRequestDecision::Confirm | SongRequestDecision::Timeout => candidate,
+            SongRequestDecision::SelectIndex(index) => candidates
+                .get(index - 1)
+                .cloned()
+                .ok_or_else(|| anyhow!("歌曲候选索引超出范围: {index}"))?,
+            SongRequestDecision::Skip
+            | SongRequestDecision::Stopped
+            | SongRequestDecision::Select
+            | SongRequestDecision::Cancelled
+            | SongRequestDecision::SwitchSource
+            | SongRequestDecision::Ai => return Ok(None),
+        };
         Ok(Some(ResolvedSongRequest {
             keyword: candidate.text.clone(),
             source: String::new(),
@@ -635,45 +656,63 @@ impl SongRequestExecution<'_> {
                     | SongRequestDecision::Skip
                     | SongRequestDecision::Timeout
                     | SongRequestDecision::Stopped
-                    | SongRequestDecision::Ai => return Ok(None),
+                    | SongRequestDecision::Ai
+                    | SongRequestDecision::Select
+                    | SongRequestDecision::Cancelled
+                    | SongRequestDecision::SelectIndex(_) => return Ok(None),
                 }
             };
             let song_title = picked.candidate.text.clone();
-            let track = picked.candidate.playable_track();
             let actions = if self.ai.enabled() {
-                "@确认@跳过@换源@AI"
+                "@确认@跳过@换源@AI@选择"
             } else {
-                "@确认@跳过@换源"
+                "@确认@跳过@换源@选择"
             };
             let prompt = format!("{}搜索到:{},{}", request.label(), song_title, actions);
-            let decision =
-                self.prompt_and_wait_for_decision(&prompt, true, self.ai.enabled(), true)?;
-            match decision {
-                SongRequestDecision::Confirm | SongRequestDecision::Timeout => {
-                    return Ok(Some(ResolvedSongRequest {
-                        keyword: picked.candidate.text.clone(),
-                        source: source.to_string(),
-                        prefer_accompaniment: request.prefer_accompaniment,
-                        ai_original_text: String::new(),
-                        track: Some(track),
-                        friend_username: request.friend_username.clone(),
-                        requester: request.requester.clone(),
-                        console_bypass_dedup: request.console_bypass_dedup,
-                        candidate_snapshot: picked.candidate_snapshot,
-                    }));
+            let decision = self.prompt_candidate_decision(
+                &prompt,
+                &picked.candidate_snapshot,
+                true,
+                self.ai.enabled(),
+            )?;
+            let selected = match decision {
+                SongRequestDecision::SelectIndex(index) => picked
+                    .candidate_snapshot
+                    .get(index - 1)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("歌曲候选索引超出范围: {index}"))?,
+                SongRequestDecision::Confirm | SongRequestDecision::Timeout => picked.candidate,
+                _ => {
+                    return match decision {
+                        SongRequestDecision::Skip
+                        | SongRequestDecision::Stopped
+                        | SongRequestDecision::Select
+                        | SongRequestDecision::Cancelled => Ok(None),
+                        SongRequestDecision::SwitchSource => {
+                            let next_source = alternate_music_source(source);
+                            self.resolve_and_confirm_song_with_source(song, next_source)
+                        }
+                        SongRequestDecision::Ai if self.ai.enabled() => {
+                            self.resolve_and_confirm_song_ai(song)
+                        }
+                        SongRequestDecision::Ai => Ok(None),
+                        SongRequestDecision::Confirm
+                        | SongRequestDecision::Timeout
+                        | SongRequestDecision::SelectIndex(_) => unreachable!(),
+                    };
                 }
-                SongRequestDecision::Skip => {
-                    return Ok(None);
-                }
-                SongRequestDecision::SwitchSource => {
-                    let next_source = alternate_music_source(source);
-                    return self.resolve_and_confirm_song_with_source(song, next_source);
-                }
-                SongRequestDecision::Ai if self.ai.enabled() => {
-                    return self.resolve_and_confirm_song_ai(song);
-                }
-                SongRequestDecision::Stopped | SongRequestDecision::Ai => return Ok(None),
-            }
+            };
+            return Ok(Some(ResolvedSongRequest {
+                keyword: selected.text.clone(),
+                source: source.to_string(),
+                prefer_accompaniment: request.prefer_accompaniment,
+                ai_original_text: String::new(),
+                track: Some(selected.playable_track()),
+                friend_username: request.friend_username.clone(),
+                requester: request.requester.clone(),
+                console_bypass_dedup: request.console_bypass_dedup,
+                candidate_snapshot: picked.candidate_snapshot,
+            }));
         }
         Ok(Some(request))
     }
@@ -719,13 +758,16 @@ impl SongRequestExecution<'_> {
                 | SongRequestDecision::Skip
                 | SongRequestDecision::Timeout
                 | SongRequestDecision::Stopped
-                | SongRequestDecision::Ai => return Ok(None),
+                | SongRequestDecision::Ai
+                | SongRequestDecision::Select
+                | SongRequestDecision::Cancelled
+                | SongRequestDecision::SelectIndex(_) => return Ok(None),
             }
         };
         let actions = if self.ai.enabled() {
-            "@确认@跳过@换源@AI"
+            "@确认@跳过@换源@AI@选择"
         } else {
-            "@确认@跳过@换源"
+            "@确认@跳过@换源@选择"
         };
         let prompt = format!(
             "{}搜索到:{},{}",
@@ -733,7 +775,12 @@ impl SongRequestExecution<'_> {
             picked.candidate.text,
             actions
         );
-        let decision = self.prompt_and_wait_for_decision(&prompt, true, self.ai.enabled(), true)?;
+        let decision = self.prompt_candidate_decision(
+            &prompt,
+            &picked.candidate_snapshot,
+            true,
+            self.ai.enabled(),
+        )?;
         match decision {
             SongRequestDecision::Confirm | SongRequestDecision::Timeout => {
                 Ok(Some(ResolvedSongRequest {
@@ -748,13 +795,33 @@ impl SongRequestExecution<'_> {
                     candidate_snapshot: picked.candidate_snapshot,
                 }))
             }
+            SongRequestDecision::SelectIndex(index) => {
+                let candidate = picked
+                    .candidate_snapshot
+                    .get(index - 1)
+                    .ok_or_else(|| anyhow!("歌曲候选索引超出范围: {index}"))?;
+                Ok(Some(ResolvedSongRequest {
+                    keyword: candidate.text.clone(),
+                    source: source.to_string(),
+                    prefer_accompaniment: song.prefer_accompaniment,
+                    ai_original_text: String::new(),
+                    track: Some(candidate.playable_track()),
+                    friend_username: song.friend_username.clone(),
+                    requester: String::new(),
+                    console_bypass_dedup: false,
+                    candidate_snapshot: picked.candidate_snapshot,
+                }))
+            }
             SongRequestDecision::Skip => Ok(None),
             SongRequestDecision::SwitchSource => {
                 let next_source = alternate_music_source(source);
                 self.resolve_and_confirm_song_with_source(song, next_source)
             }
             SongRequestDecision::Ai if self.ai.enabled() => self.resolve_and_confirm_song_ai(song),
-            SongRequestDecision::Stopped | SongRequestDecision::Ai => Ok(None),
+            SongRequestDecision::Stopped
+            | SongRequestDecision::Ai
+            | SongRequestDecision::Select
+            | SongRequestDecision::Cancelled => Ok(None),
         }
     }
 
@@ -885,17 +952,17 @@ impl SongRequestExecution<'_> {
             return Ok(true);
         }
 
-        let (title, artist) = split_candidate_title_artist(&request.keyword);
-        let track_key = request
+        let track = request
             .track
             .as_ref()
-            .map(|track| track.track_ref.key.clone())
             .ok_or_else(|| anyhow!("候选歌曲审核缺少结构化曲目"))?;
+        let (title, artist) = split_candidate_title_artist(&request.keyword);
         let candidate = SongReviewCandidate {
             source: request.source.clone(),
             title,
             artist,
-            track_key,
+            duration_ms: track.metadata.duration_ms,
+            track_key: track.track_ref.key.clone(),
             message_type: context.message_type.clone(),
             username: context.username.clone(),
         };
@@ -980,6 +1047,33 @@ impl SongRequestExecution<'_> {
             allow_switch_source,
             allow_ai,
             default_confirm,
+        )
+    }
+
+    fn prompt_candidate_decision(
+        &mut self,
+        message: &str,
+        candidates: &[SearchCandidate],
+        allow_switch_source: bool,
+        allow_ai: bool,
+    ) -> Result<SongRequestDecision> {
+        let decision =
+            self.prompt_and_wait_for_decision(message, allow_switch_source, allow_ai, true)?;
+        if decision != SongRequestDecision::Select {
+            return Ok(decision);
+        }
+        let choices = candidates
+            .iter()
+            .take(5)
+            .enumerate()
+            .map(|(index, candidate)| format!("@{} {}", index + 1, candidate.selection_text()))
+            .collect::<Vec<_>>();
+        self.port.reply_batch(&choices)?;
+        self.prompt_and_wait_for_decision(
+            &format!("请输入@1至@{}选择歌曲", candidates.len().min(5)),
+            false,
+            false,
+            false,
         )
     }
 
@@ -1251,6 +1345,11 @@ mod tests {
             Ok(())
         }
 
+        fn reply_batch(&self, messages: &[String]) -> Result<()> {
+            self.replies.borrow_mut().extend(messages.iter().cloned());
+            Ok(())
+        }
+
         fn prompt_and_wait_for_decision(
             &mut self,
             message: &str,
@@ -1462,7 +1561,45 @@ mod tests {
 
         assert_eq!(
             port.decision_prompts.borrow().as_slice(),
-            ["搜索到:晴天 - 周杰伦,@确认@跳过@换源"]
+            ["搜索到:晴天 - 周杰伦,@确认@跳过@换源@选择"]
+        );
+    }
+
+    #[test]
+    fn selecting_a_candidate_uses_the_requested_track_metadata() {
+        let first = test_candidate("第一首", "miliastra://track/qqmusic/1");
+        let second = test_candidate("第二首", "miliastra://track/qqmusic/2");
+        let mut selected = picked("第一首", "miliastra://track/qqmusic/1");
+        selected.candidate_snapshot = vec![first, second];
+        let mut port = FakePort::idle([Some(selected)]);
+        port.decisions = VecDeque::from([
+            SongRequestDecision::Select,
+            SongRequestDecision::SelectIndex(2),
+        ]);
+
+        application()
+            .execute(&context(), &command(), &mut port)
+            .expect("song request");
+
+        assert_eq!(
+            port.played.borrow()[0]
+                .track
+                .as_ref()
+                .map(|track| track.track_ref.key.to_string())
+                .as_deref(),
+            Some("miliastra://track/qqmusic/2")
+        );
+        assert!(
+            port.replies
+                .borrow()
+                .iter()
+                .any(|reply| reply.starts_with("@1 "))
+        );
+        assert!(
+            port.replies
+                .borrow()
+                .iter()
+                .any(|reply| reply.starts_with("@2 "))
         );
     }
 
@@ -1585,6 +1722,24 @@ mod tests {
             assert_eq!(failure.user_message(), expected);
             assert!(!failure.user_message().contains("无音源"));
         }
+    }
+
+    #[test]
+    fn decision_parser_accepts_selection_commands() {
+        assert_eq!(
+            SongRequestDecision::parse("@选择"),
+            Some(SongRequestDecision::Select)
+        );
+        assert_eq!(
+            SongRequestDecision::parse("@5"),
+            Some(SongRequestDecision::SelectIndex(5))
+        );
+        assert_eq!(SongRequestDecision::parse("@6"), None);
+        assert_eq!(SongRequestDecision::parse("@0"), None);
+        assert_eq!(
+            SongRequestDecision::parse("@选择"),
+            Some(SongRequestDecision::Select)
+        );
     }
 
     #[test]

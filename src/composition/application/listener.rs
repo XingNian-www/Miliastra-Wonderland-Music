@@ -1765,6 +1765,9 @@ impl ApplicationRuntime {
         parsed: &RoutedCommand,
         propagate_log_error: bool,
     ) -> Result<bool> {
+        if parsed.permission_required.is_some() {
+            return Ok(false);
+        }
         let ModuleCommand::Administration(command) = &parsed.command else {
             return Ok(false);
         };

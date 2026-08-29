@@ -418,17 +418,21 @@ impl DeferredChatSender {
 
             match item {
                 DeferredChatItem::Message(message) => {
+                    let text = self
+                        .live_configs
+                        .identity
+                        .replace_display_names(&message.text);
                     let result = match target {
-                        DeferredChatTarget::Primary => self.chat_output.send(&message.text),
+                        DeferredChatTarget::Primary => self.chat_output.send(&text),
                         DeferredChatTarget::SecondaryCurrentHall => {
-                            self.chat_output.send_current_chat(&message.text)
+                            self.chat_output.send_current_chat(&text)
                         }
                         DeferredChatTarget::CurrentHall => {
                             let residency = self.active_ui_residency()?;
                             match residency {
-                                UiResidency::Primary => self.chat_output.send(&message.text),
+                                UiResidency::Primary => self.chat_output.send(&text),
                                 UiResidency::SecondaryCurrentHall => {
-                                    self.chat_output.send_current_chat(&message.text)
+                                    self.chat_output.send_current_chat(&text)
                                 }
                             }
                         }
@@ -447,7 +451,15 @@ impl DeferredChatSender {
                         }
                         DeferredChatTarget::CurrentHall => self.active_ui_residency()?,
                     };
-                    let messages = batch.remaining_texts();
+                    let mapped_messages = batch
+                        .remaining_texts()
+                        .iter()
+                        .map(|message| self.live_configs.identity.replace_display_names(message))
+                        .collect::<Vec<_>>();
+                    let messages = mapped_messages
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>();
                     let batch_interval_ms =
                         self.live_configs.snapshot().timing.command.help_batch_ms;
                     let outcome = match residency {

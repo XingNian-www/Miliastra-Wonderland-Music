@@ -113,6 +113,7 @@ pub(crate) struct SongReviewCandidate {
     pub source: String,
     pub title: String,
     pub artist: String,
+    pub duration_ms: Option<u64>,
     pub track_key: TrackKey,
     pub message_type: String,
     pub username: String,
@@ -287,7 +288,8 @@ fn build_review_prompt(
     [
         "任务：审核即将播放或加入队列的候选歌曲是否适合“舒缓、轻松、不吵闹”的房间氛围。",
         "请尽量使用联网搜索结果判断，优先参考可靠来源中的曲风标签、歌曲介绍、歌词摘要、现场/混音版本说明和公开评论里的整体听感描述。",
-        "联网搜索不到足够信息时，再根据歌曲名称、歌手、候选 URI 和用户提供描述保守判断。",
+        "联网搜索不到足够信息时，再根据歌曲名称、歌手、候选 URI、歌曲时长和用户提供描述保守判断。",
+        "歌曲时长是辅助参考：短时长可能是片段或循环版本，超长可能是现场、合集或特殊版本，不得仅凭时长单独决定评级。",
         "只返回 JSON，不要解释、不要注释、不要 Markdown 代码块。",
         "必须输出结构：{\"level\":number,\"reason\":string,\"tags\":[string]}。",
         "level 必须是 1 到 10 的整数，表达歌曲对房间氛围的打扰强度，不是推荐分、匹配分或好听程度。",
@@ -509,6 +511,7 @@ mod tests {
             source: "qqmusic".to_string(),
             title: "测试".to_string(),
             artist: "歌手".to_string(),
+            duration_ms: None,
             track_key: test_track("miliastra://track/qqmusic/retry-test", "测试 - 歌手")
                 .track_ref
                 .key,
@@ -639,6 +642,7 @@ mod tests {
             source: "qqmusic".to_string(),
             title: "晴天".to_string(),
             artist: "周杰伦".to_string(),
+            duration_ms: None,
             track_key: test_track("miliastra://track/qqmusic/1", "晴天 - 周杰伦")
                 .track_ref
                 .key,

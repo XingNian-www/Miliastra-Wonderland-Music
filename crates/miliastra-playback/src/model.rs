@@ -137,6 +137,21 @@ impl SearchCandidate {
         }
     }
 
+    pub fn selection_text(&self) -> String {
+        let artists = if self.metadata.artists.is_empty() {
+            "未知歌手".to_owned()
+        } else {
+            self.metadata.artists.join(" / ")
+        };
+        let duration = self
+            .metadata
+            .duration_ms
+            .map(format_duration)
+            .map(|value| format!(" [{value}]"))
+            .unwrap_or_default();
+        format!("{} - {}{}", self.metadata.title, artists, duration)
+    }
+
     pub fn select_preferred_equivalent(candidates: &[Self]) -> Option<Self> {
         let first = candidates.first()?;
         let identity = comparable_identity(&first.text);
@@ -167,19 +182,30 @@ fn format_candidate_text(metadata: &TrackMetadata, provider: ProviderId) -> Stri
     } else {
         metadata.artists.join(" / ")
     };
+    let duration = metadata
+        .duration_ms
+        .map(format_duration)
+        .map(|value| format!(" [{value}]"))
+        .unwrap_or_default();
     format!(
-        "{} - {} [{}]",
+        "{} - {} [{}]{}",
         metadata.title,
         artists,
-        provider_label(provider)
+        provider_label(provider),
+        duration
     )
+}
+
+fn format_duration(duration_ms: u64) -> String {
+    let total_seconds = duration_ms / 1_000;
+    format!("{:02}:{:02}", total_seconds / 60, total_seconds % 60)
 }
 
 /// 点歌展示用的平台简化中文标识。
 fn provider_label(provider: ProviderId) -> &'static str {
     match provider {
-        ProviderId::QqMusic => "QQ",
-        ProviderId::Netease => "网易",
+        ProviderId::QqMusic => "QQ音乐",
+        ProviderId::Netease => "网易云",
         ProviderId::Bilibili => "B站",
         ProviderId::Kugou => "酷狗",
     }
@@ -233,5 +259,37 @@ mod tests {
         }"#;
 
         assert!(serde_json::from_str::<PlayableTrack>(json).is_err());
+    }
+
+    #[test]
+    fn candidate_text_includes_duration_when_available() {
+        let song = Song {
+            key: SongKey::new("qqmusic", "test").unwrap(),
+            resolver_locator: None,
+            title: "晴天".to_string(),
+            artists: vec!["周杰伦".to_string()],
+            album: None,
+            duration_ms: Some(209_000),
+        };
+
+        let candidate = SearchCandidate::from_song(song, PlaybackEligibility::Eligible).unwrap();
+
+        assert_eq!(candidate.text, "晴天 - 周杰伦 [QQ音乐] [03:29]");
+    }
+
+    #[test]
+    fn candidate_text_omits_missing_duration() {
+        let song = Song {
+            key: SongKey::new("qqmusic", "test").unwrap(),
+            resolver_locator: None,
+            title: "晴天".to_string(),
+            artists: vec!["周杰伦".to_string()],
+            album: None,
+            duration_ms: None,
+        };
+
+        let candidate = SearchCandidate::from_song(song, PlaybackEligibility::Eligible).unwrap();
+
+        assert_eq!(candidate.text, "晴天 - 周杰伦 [QQ音乐]");
     }
 }

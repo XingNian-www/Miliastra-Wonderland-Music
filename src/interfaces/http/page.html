@@ -1962,10 +1962,11 @@ function showConfigMessage(text,kind){
   el.classList.remove('hidden')
 }
 function clearConfigMessage(){const el=$('configMessage');if(el)el.classList.add('hidden')}
-// 身份映射随机昵称：剔除 OCR 易混字符 0/O/o、1/I/i/l/L、J/j、5/S/s、2/Z/z、8/B、9/g/q、6/b。
-const REMARK_CHARSET='347ACDEFGHKMNPQRTUVWXYacdefhkmnprtuwxy'
+// 身份映射随机昵称：6 位、36 字符；剔除 OCR 易混字符和字宽过大的 M/m。
+// 36^6 约为 21.8 亿，攻击者每月仅能改 5 次昵称时，猜中指定映射的概率约为 2.3e-9。
+const REMARK_CHARSET='347ACDEFGHKNPQRTUVWXYacdefhknprtuwxy'
 function randomRemarkNickname(){
-  const bytes=new Uint8Array(10)
+  const bytes=new Uint8Array(6)
   crypto.getRandomValues(bytes)
   return [...bytes].map(byte=>REMARK_CHARSET[byte%REMARK_CHARSET.length]).join('')
 }

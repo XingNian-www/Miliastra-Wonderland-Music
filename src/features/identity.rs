@@ -126,6 +126,40 @@ impl IdentityAccess {
             .unwrap_or_else(|| nickname.to_owned())
     }
 
+    /// 在聊天发送前替换文本中的 OCR 身份昵称，避免把映射字符串原样发回大厅。
+    pub fn replace_display_names(&self, text: &str) -> String {
+        let mut mappings = self
+            .inner
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .mappings
+            .iter()
+            .filter_map(|mapping| {
+                let display_name = mapping.note.trim();
+                (!mapping.nickname.is_empty() && !display_name.is_empty())
+                    .then(|| (mapping.nickname.clone(), display_name.to_owned()))
+            })
+            .collect::<Vec<_>>();
+        mappings.sort_by(|left, right| right.0.len().cmp(&left.0.len()));
+
+        let mut result = String::with_capacity(text.len());
+        let mut remaining = text;
+        while !remaining.is_empty() {
+            if let Some((nickname, display_name)) = mappings
+                .iter()
+                .find(|(nickname, _)| remaining.starts_with(nickname))
+            {
+                result.push_str(display_name);
+                remaining = &remaining[nickname.len()..];
+            } else {
+                let character = remaining.chars().next().expect("非空字符串必定包含字符");
+                result.push(character);
+                remaining = &remaining[character.len_utf8()..];
+            }
+        }
+        result
+    }
+
     pub fn role_of(&self, nickname: &str) -> Option<IdentityRole> {
         self.resolve(nickname).map(|identity| identity.role)
     }
@@ -188,6 +222,32 @@ mod tests {
         assert_eq!(access.display_name("陌生人"), "陌生人");
         assert!(access.resolve("派蒙本蒙 ").is_none(), "尾部空白不模糊匹配");
         assert!(access.resolve("陌生人").is_none(), "未知昵称不映射");
+    }
+
+    #[test]
+    fn replace_display_names_maps_longest_names_and_preserves_unknown_text() {
+        let mut config = sample_config();
+        config.mappings.push(IdentityMapping {
+            nickname: "好友".to_string(),
+            id: Uuid::from_u128(4),
+            role: IdentityRole::Friend,
+            note: "短备注".to_string(),
+        });
+        let access = IdentityAccess::new(config);
+        assert_eq!(
+            access.replace_display_names("@派蒙本蒙的请求,@好友甲已处理,陌生人"),
+            "@主人备注的请求,@短备注甲已处理,陌生人"
+        );
+        assert_eq!(access.replace_display_names("好友甲好友"), "短备注甲短备注");
+    }
+
+    #[test]
+    fn replace_display_names_ignores_empty_notes() {
+        let access = IdentityAccess::new(sample_config());
+        assert_eq!(
+            access.replace_display_names("管理小助手和好友甲"),
+            "管理小助手和好友甲"
+        );
     }
 
     #[test]

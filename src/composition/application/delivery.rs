@@ -2,17 +2,22 @@ use super::*;
 
 impl ApplicationRuntime {
     pub(super) fn reply(&self, message: &str) -> Result<()> {
+        let mapped = self
+            .lifecycle
+            .live_configs
+            .identity
+            .replace_display_names(message);
         let prefixed;
         let message = if self
             .lifecycle
             .console_reply_context
             .load(AtomicOrdering::SeqCst)
-            && !message.starts_with("[控制台]:")
+            && !mapped.starts_with("[控制台]:")
         {
-            prefixed = format!("[控制台]: {}", message);
+            prefixed = format!("[控制台]: {}", mapped);
             prefixed.as_str()
         } else {
-            message
+            mapped.as_str()
         };
         match self.active_ui_residency()? {
             UiResidency::Primary => self.ui.chat_output.send_for_command(message),
@@ -28,15 +33,25 @@ impl ApplicationRuntime {
             .timing
             .command
             .help_batch_ms;
+        let mapped = messages
+            .iter()
+            .map(|message| {
+                self.lifecycle
+                    .live_configs
+                    .identity
+                    .replace_display_names(message)
+            })
+            .collect::<Vec<_>>();
+        let messages = mapped.iter().map(String::as_str).collect::<Vec<_>>();
         match self.active_ui_residency()? {
             UiResidency::Primary => self
                 .ui
                 .chat_output
-                .send_batch_for_command(messages, delay_ms),
+                .send_batch_for_command(&messages, delay_ms),
             UiResidency::SecondaryCurrentHall => self
                 .ui
                 .chat_output
-                .send_current_chat_batch(messages, delay_ms),
+                .send_current_chat_batch(&messages, delay_ms),
         }
     }
 

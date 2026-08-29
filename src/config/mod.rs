@@ -5,6 +5,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::adapters::file_store::write_atomic;
+
 use crate::features::card_games::LandlordConfig;
 use crate::features::custom_workflow::{CustomWorkflowConfig, WorkflowTimingConfig};
 use crate::features::identity::IdentityConfig;
@@ -289,7 +291,7 @@ impl BootstrapConfig {
     /// 从 config.yaml 加载最小启动配置。
     ///
     /// 严格解析（[`deny_unknown_fields`]）：只允许 database_path、http、logging 三个引导段。
-    /// 字段缺失或为空时明确报错；database_path 为相对路径时相对
+    /// access_token 缺失时自动生成并持久化；database_path 为相对路径时相对
     /// `executable_root`（EXE 所在目录）解析为绝对路径。
     pub fn load(path: &Path, executable_root: &Path) -> Result<Self> {
         const BOOTSTRAP_ONLY_HINT: &str = "config.yaml 只允许 database_path、http、logging 三个引导段，其余配置请通过 Web 面板「配置中心」管理";
@@ -303,6 +305,12 @@ impl BootstrapConfig {
         })?;
         if bootstrap.database_path.as_os_str().is_empty() {
             bail!("config.yaml 的 database_path 不能为空。{BOOTSTRAP_ONLY_HINT}");
+        }
+        if bootstrap.http.access_token.trim().is_empty() {
+            bootstrap.http.access_token = uuid::Uuid::new_v4().simple().to_string();
+            let serialized = serde_yaml::to_string(&bootstrap).context("序列化启动配置失败")?;
+            write_atomic(path, serialized.as_bytes(), "启动配置")
+                .with_context(|| format!("写入自动生成的访问令牌失败: {}", path.display()))?;
         }
         if bootstrap.database_path.is_relative() {
             bootstrap.database_path = executable_root.join(&bootstrap.database_path);
@@ -1474,7 +1482,7 @@ impl Default for HttpConfig {
             host: "127.0.0.1".to_string(),
             port: 18888,
             enabled: true,
-            access_token: String::new(),
+            access_token: "miliastra-default-access-token".to_string(),
         }
     }
 }
@@ -1490,12 +1498,8 @@ impl HttpConfig {
         if self.port == 0 {
             bail!("http.port 必须大于 0");
         }
-        if !matches!(
-            self.host.trim().to_ascii_lowercase().as_str(),
-            "127.0.0.1" | "localhost" | "::1"
-        ) && self.access_token.trim().is_empty()
-        {
-            bail!("HTTP 监听非本机地址时必须设置 http.access_token");
+        if self.access_token.trim().is_empty() {
+            bail!("http.access_token 不能为空");
         }
         Ok(())
     }
@@ -1841,11 +1845,10 @@ stale_timeout_ms: 7500
         let bootstrap = bootstrap_config_yaml();
         let defaults = AppConfig::default();
 
-        assert_eq!(
-            serde_yaml::to_value(&bootstrap.http).expect("序列化 http 段"),
-            serde_yaml::to_value(&defaults.http).expect("序列化默认 http 段"),
-            "config.yaml 的 http 段必须与 AppConfig::default() 一致"
-        );
+        assert_eq!(bootstrap.http.host, defaults.http.host);
+        assert_eq!(bootstrap.http.port, defaults.http.port);
+        assert_eq!(bootstrap.http.enabled, defaults.http.enabled);
+        assert!(!bootstrap.http.access_token.trim().is_empty());
         assert_eq!(
             serde_yaml::to_value(&bootstrap.logging).expect("序列化 logging 段"),
             serde_yaml::to_value(&defaults.logging).expect("序列化默认 logging 段"),

@@ -88,20 +88,18 @@ impl<'a> ChatCommandRouter<'a> {
         let role = self
             .identity
             .and_then(|identity| identity.role_of(envelope.username()));
-        let authority = match role {
-            Some(IdentityRole::Friend | IdentityRole::Admin) => CommandAuthority::Friend,
-            _ => envelope.authority(),
-        };
-        let primary =
-            (authority != envelope.authority()).then(|| envelope.with_authority(authority));
         let alternate_authority = match role {
-            Some(IdentityRole::Owner) => Some(match envelope.authority() {
-                CommandAuthority::HallMember => CommandAuthority::Friend,
-                CommandAuthority::Friend => CommandAuthority::HallMember,
-            }),
+            Some(IdentityRole::Friend | IdentityRole::Admin | IdentityRole::Owner)
+                if envelope.authority() == CommandAuthority::HallMember =>
+            {
+                Some(CommandAuthority::Friend)
+            }
+            Some(IdentityRole::Owner) if envelope.authority() == CommandAuthority::Friend => {
+                Some(CommandAuthority::HallMember)
+            }
             _ => None,
         };
-        self.route_with_authorities(envelope, active_entertainment, primary, alternate_authority)
+        self.route_with_authorities(envelope, active_entertainment, None, alternate_authority)
             .or_else(|| {
                 (envelope.authority() == CommandAuthority::HallMember
                     && self.identity.is_some()
@@ -151,8 +149,8 @@ impl<'a> ChatCommandRouter<'a> {
         {
             if let Some(matched) = self.route_match(&candidate, active_entertainment) {
                 let mut routed = RoutedCommand::from_envelope(envelope, matched);
-                routed.authority = candidate.authority();
-                routed.message_type = candidate.message_type().to_string();
+                routed.authority = envelope.authority();
+                routed.message_type = envelope.message_type().to_string();
                 routed.role = role_for(self.identity, envelope.username());
                 return Some(routed);
             }
@@ -160,8 +158,8 @@ impl<'a> ChatCommandRouter<'a> {
                 let candidate = candidate.with_authority(authority);
                 if let Some(matched) = self.route_match(&candidate, active_entertainment) {
                     let mut routed = RoutedCommand::from_envelope(envelope, matched);
-                    routed.authority = candidate.authority();
-                    routed.message_type = candidate.message_type().to_string();
+                    routed.authority = envelope.authority();
+                    routed.message_type = envelope.message_type().to_string();
                     routed.role = role_for(self.identity, envelope.username());
                     return Some(routed);
                 }
@@ -523,8 +521,8 @@ mod tests {
         );
         let router = ChatCommandRouter::with_identity(&service, &identity);
         let routed = router.route(&envelope("blue", "@删除"), None).unwrap();
-        assert_eq!(routed.authority, CommandAuthority::Friend);
-        assert_eq!(routed.message_type, "pink");
+        assert_eq!(routed.authority, CommandAuthority::HallMember);
+        assert_eq!(routed.message_type, "blue");
         assert_eq!(routed.role, Some(IdentityRole::Owner));
 
         let admin = CommandEnvelope::new(
@@ -536,7 +534,8 @@ mod tests {
         )
         .unwrap();
         let routed = router.route(&admin, None).unwrap();
-        assert_eq!(routed.authority, CommandAuthority::Friend);
+        assert_eq!(routed.authority, CommandAuthority::HallMember);
+        assert_eq!(routed.message_type, "blue");
         assert_eq!(routed.role, Some(IdentityRole::Admin));
 
         let friend = CommandEnvelope::new(
@@ -548,10 +547,31 @@ mod tests {
         )
         .unwrap();
         let routed = router.route(&friend, None).unwrap();
-        assert_eq!(routed.authority, CommandAuthority::Friend);
-        assert_eq!(routed.message_type, "pink");
+        assert_eq!(routed.authority, CommandAuthority::HallMember);
+        assert_eq!(routed.message_type, "blue");
         assert_eq!(routed.role, Some(IdentityRole::Friend));
         assert_eq!(routed.permission_required, None);
+
+        for command in ["@大厅检测", "@大厅时间", "#斗地主", "#接龙画蛇添足"] {
+            let hall = CommandEnvelope::new(
+                format!("好友：{command}"),
+                "好友",
+                "blue",
+                command,
+                CommandObservation::default(),
+            )
+            .unwrap();
+            let routed = router
+                .route(&hall, None)
+                .unwrap_or_else(|| panic!("映射好友大厅命令未路由: {command}"));
+            assert_eq!(
+                routed.authority,
+                CommandAuthority::HallMember,
+                "command={command}"
+            );
+            assert_eq!(routed.message_type, "blue", "command={command}");
+            assert_eq!(routed.role, Some(IdentityRole::Friend), "command={command}");
+        }
     }
 
     #[test]

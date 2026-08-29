@@ -309,6 +309,7 @@ const HALL_COMMANDS: &[(&str, SongSource, bool)] = &[
     ("搜索", SongSource::QqMusic, false),
 ];
 
+// 好友点歌默认开放全部音源；AI 点歌和 AI 搜索使用 All，由后端在全部音源中选择结果。
 const FRIEND_COMMANDS: &[(&str, SongSource, bool)] = &[
     ("AI点歌", SongSource::All, true),
     ("AI搜索", SongSource::All, true),
@@ -317,6 +318,7 @@ const FRIEND_COMMANDS: &[(&str, SongSource, bool)] = &[
     ("网易点歌", SongSource::Netease, false),
     ("网易云点歌", SongSource::Netease, false),
     ("网易搜索", SongSource::Netease, false),
+    ("酷狗点歌", SongSource::Kugou, false),
     ("B站点歌", SongSource::Bilibili, false),
     ("B站搜索", SongSource::Bilibili, false),
     ("点歌", SongSource::QqMusic, false),

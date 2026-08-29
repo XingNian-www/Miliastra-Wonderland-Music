@@ -251,7 +251,7 @@ impl OcrDevice for ProductionOcrDevice {
     fn recognize_lines(&mut self, image: &DynamicImage) -> Result<Vec<OcrLine>> {
         self.rebuild_if_due();
         let mut engine = lock_ocr_engine(&self.engine);
-        recognize_lines(&mut *engine, image)
+        recognize_lines(&mut engine, image)
     }
 }
 

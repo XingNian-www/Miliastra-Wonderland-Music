@@ -149,11 +149,17 @@ impl Display for SongSearchFailure {
 pub(crate) trait SongRequestPort {
     fn reply(&self, message: &str) -> Result<()>;
 
-    fn reply_batch(&self, messages: &[String]) -> Result<()>;
-
     fn prompt_and_wait_for_decision(
         &mut self,
         message: &str,
+        allow_switch_source: bool,
+        allow_ai: bool,
+        default_confirm: bool,
+    ) -> Result<SongRequestDecision>;
+
+    fn prompt_and_wait_for_decision_batch(
+        &mut self,
+        messages: &[String],
         allow_switch_source: bool,
         allow_ai: bool,
         default_confirm: bool,
@@ -583,10 +589,10 @@ impl SongRequestExecution<'_> {
         let decision = self.prompt_candidate_decision(&message, &candidates, false, false)?;
         let candidate = match decision {
             SongRequestDecision::Confirm | SongRequestDecision::Timeout => candidate,
-            SongRequestDecision::SelectIndex(index) => candidates
-                .get(index - 1)
-                .cloned()
-                .ok_or_else(|| anyhow!("歌曲候选索引超出范围: {index}"))?,
+            SongRequestDecision::SelectIndex(index) => match candidates.get(index - 1).cloned() {
+                Some(candidate) => candidate,
+                None => return Ok(None),
+            },
             SongRequestDecision::Skip
             | SongRequestDecision::Stopped
             | SongRequestDecision::Select
@@ -676,11 +682,12 @@ impl SongRequestExecution<'_> {
                 self.ai.enabled(),
             )?;
             let selected = match decision {
-                SongRequestDecision::SelectIndex(index) => picked
-                    .candidate_snapshot
-                    .get(index - 1)
-                    .cloned()
-                    .ok_or_else(|| anyhow!("歌曲候选索引超出范围: {index}"))?,
+                SongRequestDecision::SelectIndex(index) => {
+                    let Some(candidate) = picked.candidate_snapshot.get(index - 1).cloned() else {
+                        return Ok(None);
+                    };
+                    candidate
+                }
                 SongRequestDecision::Confirm | SongRequestDecision::Timeout => picked.candidate,
                 _ => {
                     return match decision {
@@ -1068,13 +1075,11 @@ impl SongRequestExecution<'_> {
             .enumerate()
             .map(|(index, candidate)| format!("@{} {}", index + 1, candidate.selection_text()))
             .collect::<Vec<_>>();
-        self.port.reply_batch(&choices)?;
-        self.prompt_and_wait_for_decision(
-            &format!("请输入@1至@{}选择歌曲", candidates.len().min(5)),
-            false,
-            false,
-            false,
-        )
+        let prompt = format!("请输入@1至@{}选择歌曲或@跳过", candidates.len().min(5));
+        let mut messages = choices;
+        messages.push(prompt);
+        self.port
+            .prompt_and_wait_for_decision_batch(&messages, false, false, false)
     }
 
     fn playback_queue(&self) -> Result<Vec<QueueItem>> {
@@ -1345,9 +1350,18 @@ mod tests {
             Ok(())
         }
 
-        fn reply_batch(&self, messages: &[String]) -> Result<()> {
+        fn prompt_and_wait_for_decision_batch(
+            &mut self,
+            messages: &[String],
+            _allow_switch_source: bool,
+            _allow_ai: bool,
+            _default_confirm: bool,
+        ) -> Result<SongRequestDecision> {
             self.replies.borrow_mut().extend(messages.iter().cloned());
-            Ok(())
+            Ok(self
+                .decisions
+                .pop_front()
+                .unwrap_or(SongRequestDecision::Timeout))
         }
 
         fn prompt_and_wait_for_decision(

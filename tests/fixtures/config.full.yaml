@@ -693,6 +693,8 @@ startup:
 invite:
   # 好友备注连续完整匹配次数；大于 1 时覆盖全局值，0 或 1 表示继承
   friend_name_stable_count: 0
+  # 所有列表页精确匹配失败后，回到顶部搜索候选；默认关闭
+  fuzzy_friend_match: false
   # 好友列表 OCR 区域，用于查找发起邀请的用户名
   friend_list_region:
     x: 80

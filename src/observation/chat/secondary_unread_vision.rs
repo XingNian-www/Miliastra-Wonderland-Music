@@ -111,7 +111,7 @@ pub(crate) fn find_unread_friend_hits(
 
 pub(crate) fn unread_hit_still_visible(
     image: &DynamicImage,
-    hit: UnreadFriendHit,
+    hit: &UnreadFriendHit,
     layout: &FriendUnreadLayout,
 ) -> bool {
     let radius = layout.visibility_radius.max(0);
@@ -483,7 +483,7 @@ mod tests {
         let layout = default_layout();
         let hit = find_unread_friend_hits(&image, &layout)[0];
 
-        assert!(unread_hit_still_visible(&image, hit, &layout));
+        assert!(unread_hit_still_visible(&image, &hit, &layout));
     }
 
     fn default_layout() -> FriendUnreadLayout {

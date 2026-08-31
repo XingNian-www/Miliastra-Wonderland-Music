@@ -277,15 +277,16 @@ impl ApplicationRuntime {
         command: &idiom_chain::IdiomChainCommand,
     ) -> Result<()> {
         let observed_at = command_observed_at(parsed);
+        let player = self.canonical_actor_name(&parsed.username);
         if command.requires_executor() {
             let application = self.business.idiom_chain_application;
-            application.execute_explanation(&parsed.username, command, observed_at, self)
+            application.execute_explanation(&player, command, observed_at, self)
         } else {
             log::debug!("成语接龙命令已按正式队列顺序处理，回复进入延迟聊天队列");
             let mut port = self.deferred_idiom_chain_port();
             self.business.idiom_chain_application.execute_deferred(
                 &parsed.raw,
-                &parsed.username,
+                &player,
                 command,
                 observed_at,
                 &mut port,
@@ -299,9 +300,10 @@ impl ApplicationRuntime {
         command: &LandlordCommand,
     ) -> Result<()> {
         let observed_at = command_observed_at(parsed);
+        let player = self.canonical_actor_name(&parsed.username);
         match card_game_effect_lane(command) {
             CardGameEffectLane::Formal => self.business.card_games.execute_command(
-                &parsed.username,
+                &player,
                 command,
                 observed_at,
                 CardGameEffectLane::Formal,
@@ -312,7 +314,7 @@ impl ApplicationRuntime {
                     task_engine: self.business.task_engine.clone(),
                 };
                 self.business.card_games.execute_command(
-                    &parsed.username,
+                    &player,
                     command,
                     observed_at,
                     CardGameEffectLane::Deferred,
@@ -329,9 +331,10 @@ impl ApplicationRuntime {
     ) -> Result<()> {
         log::debug!("海龟汤控制命令已按正式队列顺序处理，回复进入延迟聊天队列");
         let mut port = self.turtle_soup_command_port();
+        let player = self.canonical_actor_name(&parsed.username);
         self.business.turtle_soup_application.execute_command(
             &parsed.raw,
-            &parsed.username,
+            &player,
             parsed.authority == CommandAuthority::Friend,
             command,
             &mut port,
@@ -418,8 +421,9 @@ impl ApplicationRuntime {
             CommandAuthority::Friend => UndercoverCommandSource::Friend,
             CommandAuthority::HallMember => UndercoverCommandSource::Hall,
         };
+        let player = self.canonical_actor_name(&parsed.username);
         self.business.undercover_game.execute_command(
-            &parsed.username,
+            &player,
             source,
             command,
             command_observed_at(parsed),

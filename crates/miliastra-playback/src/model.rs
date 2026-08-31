@@ -182,18 +182,11 @@ fn format_candidate_text(metadata: &TrackMetadata, provider: ProviderId) -> Stri
     } else {
         metadata.artists.join(" / ")
     };
-    let duration = metadata
-        .duration_ms
-        .map(format_duration)
-        .map(|value| format!(" [{value}]"))
-        .unwrap_or_default();
-    format!(
-        "{} - {} [{}]{}",
-        metadata.title,
-        artists,
-        provider_label(provider),
-        duration
-    )
+    let source = metadata.duration_ms.map(format_duration).map_or_else(
+        || format!("[{}]", provider_label(provider)),
+        |duration| format!("[{} {}]", provider_label(provider), duration),
+    );
+    format!("{} - {} {}", metadata.title, artists, source)
 }
 
 fn format_duration(duration_ms: u64) -> String {
@@ -204,8 +197,8 @@ fn format_duration(duration_ms: u64) -> String {
 /// 点歌展示用的平台简化中文标识。
 fn provider_label(provider: ProviderId) -> &'static str {
     match provider {
-        ProviderId::QqMusic => "QQ音乐",
-        ProviderId::Netease => "网易云",
+        ProviderId::QqMusic => "QQ",
+        ProviderId::Netease => "网易",
         ProviderId::Bilibili => "B站",
         ProviderId::Kugou => "酷狗",
     }
@@ -274,7 +267,7 @@ mod tests {
 
         let candidate = SearchCandidate::from_song(song, PlaybackEligibility::Eligible).unwrap();
 
-        assert_eq!(candidate.text, "晴天 - 周杰伦 [QQ音乐] [03:29]");
+        assert_eq!(candidate.text, "晴天 - 周杰伦 [QQ 03:29]");
     }
 
     #[test]
@@ -290,6 +283,6 @@ mod tests {
 
         let candidate = SearchCandidate::from_song(song, PlaybackEligibility::Eligible).unwrap();
 
-        assert_eq!(candidate.text, "晴天 - 周杰伦 [QQ音乐]");
+        assert_eq!(candidate.text, "晴天 - 周杰伦 [QQ]");
     }
 }

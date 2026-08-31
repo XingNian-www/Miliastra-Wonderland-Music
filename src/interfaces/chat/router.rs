@@ -455,6 +455,35 @@ mod tests {
     }
 
     #[test]
+    fn unmapped_friend_keeps_friend_source_permissions() {
+        let identity = IdentityAccess::new(IdentityConfig::default());
+        let service = CustomWorkflowService::new(
+            crate::features::custom_workflow::CustomWorkflowConfig::default(),
+            WorkflowDefaults {
+                default_timeout_ms: 1_000,
+                default_poll_ms: 100,
+                default_step_wait_ms: 100,
+                decision_timeout_ms: 1_000,
+                decision_poll_ms: 100,
+                after_activate_ms: 100,
+                clipboard_hold_ms: 100,
+                stability_mean_threshold: 1.0,
+                stability_changed_ratio_threshold: 0.1,
+            },
+        );
+        let routed = ChatCommandRouter::with_identity(&service, &identity)
+            .route(&envelope("pink", "@删除"), None)
+            .expect("无备注好友私聊应保留好友来源命令");
+        assert_eq!(routed.authority, CommandAuthority::Friend);
+        assert_eq!(routed.role, None);
+        assert_eq!(routed.permission_required, None);
+        assert_eq!(
+            routed.command,
+            ModuleCommand::Playback(PlaybackCommand::DeleteCurrentPoolTrack)
+        );
+    }
+
+    #[test]
     fn unmapped_hall_member_gets_permission_denied_command() {
         let identity = IdentityAccess::new(IdentityConfig::default());
         let service = CustomWorkflowService::new(

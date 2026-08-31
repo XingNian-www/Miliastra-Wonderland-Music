@@ -11,7 +11,7 @@ use crate::config::AppConfig;
 use crate::config::{
     InputTimingConfig, OcrConfig, OutputConfig, PointConfig, ScreenConfig, TemplateConfig,
 };
-use crate::observation::chat::{SECONDARY_TITLE_RECT, SecondaryChatIdentity, classify_title};
+use crate::observation::chat::secondary_hall_bubbles;
 use crate::runtime::ocr::{OcrPriority, OcrRuntimeHandle, merge_ocr_lines};
 use crate::runtime::ui::{
     InputCertainty, UiOperation, UiRoutine, UiRoutineContext, UiRoutineFailure,
@@ -1049,15 +1049,19 @@ fn conversation_confirmation_key(
     ocr: &OcrRuntimeHandle,
     image: &DynamicImage,
     _config: &FriendDeliveryRoutineConfig,
-    _normalized_target: &str,
+    normalized_target: &str,
 ) -> std::result::Result<Option<String>, UiRoutineFailure> {
-    let title = merged_text(ocr, image, SECONDARY_TITLE_RECT)?;
-    Ok(match classify_title(&title) {
-        SecondaryChatIdentity::CurrentHall | SecondaryChatIdentity::PublicChannel => None,
-        SecondaryChatIdentity::Friend(_)
-        | SecondaryChatIdentity::StrangerMessages
-        | SecondaryChatIdentity::Unknown => Some("allowed-chat".to_string()),
-    })
+    let mut matches = secondary_hall_bubbles(image)
+        .map_err(|error| after_input_failure("confirm_friend_sender", error))?
+        .into_iter()
+        .filter_map(|bubble| {
+            let sender = merged_text(ocr, image, bubble.sender_rect()).ok()?;
+            let sender = normalize_lock_text(&sender);
+            (sender == normalized_target).then_some(sender)
+        })
+        .collect::<Vec<_>>();
+    matches.dedup();
+    Ok((matches.len() == 1).then(|| matches.remove(0)))
 }
 
 pub(super) fn restore_residency(
@@ -1243,20 +1247,23 @@ fn restore_secondary_hall(
 
 fn current_title_is_hall(
     context: &mut UiRoutineContext<'_>,
-    ocr: &OcrRuntimeHandle,
+    _ocr: &OcrRuntimeHandle,
     config: &FriendDeliveryRoutineConfig,
 ) -> std::result::Result<bool, UiRoutineFailure> {
     let image = capture_normalized(
         context,
         config,
-        "observe_secondary_title",
+        "observe_secondary_hall",
         InputCertainty::AfterInputUnknown,
     )?;
-    let title = merged_text(ocr, &image, SECONDARY_TITLE_RECT)?;
-    Ok(matches!(
-        classify_title(&title),
-        SecondaryChatIdentity::CurrentHall
-    ))
+    Ok(best_template_hit(
+        &image,
+        Some(config.secondary_hall_search_region),
+        &config.secondary_hall_template,
+        config.template_threshold,
+    )
+    .map_err(|error| after_input_failure("observe_secondary_hall", error))?
+    .is_some())
 }
 
 fn confirm_current_hall(
@@ -1430,6 +1437,7 @@ mod tests {
     use image::{DynamicImage, GenericImage};
 
     use super::*;
+    use crate::observation::chat::SECONDARY_TITLE_RECT;
 
     #[test]
     fn friend_list_drag_runs_from_the_lowest_avatar_to_the_highest_avatar() {

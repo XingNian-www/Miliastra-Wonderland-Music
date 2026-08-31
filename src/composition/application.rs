@@ -201,6 +201,7 @@ impl ResolvedApplicationConfig {
                 auto_retry_count: live_configs.friend_delivery_auto_retry_count.clone(),
                 send_enabled: live_configs.output_send_enabled.clone(),
                 friend_list_region: app.invite.friend_list_region.into(),
+                fuzzy_friend_match: app.invite.fuzzy_friend_match,
                 friend_step_ms: app.timing.invite.step_ms,
                 timeout_ms: app.timing.workflow.default_timeout_ms,
                 poll_ms: app.timing.workflow.default_poll_ms,

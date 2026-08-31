@@ -14,6 +14,9 @@ use crate::features::command::{
 #[serde(deny_unknown_fields)]
 pub struct InviteConfig {
     pub friend_name_stable_count: u32,
+    /// 所有列表页精确匹配失败后，是否回到顶部启用候选评分匹配。
+    #[serde(default)]
+    pub fuzzy_friend_match: bool,
     pub friend_list_region: RectConfig,
     pub friend_chat_region: RectConfig,
     pub view_star_region: RectConfig,

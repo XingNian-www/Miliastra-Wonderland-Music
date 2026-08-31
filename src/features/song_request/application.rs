@@ -1075,11 +1075,14 @@ impl SongRequestExecution<'_> {
             .enumerate()
             .map(|(index, candidate)| format!("@{} {}", index + 1, candidate.selection_text()))
             .collect::<Vec<_>>();
-        let prompt = format!("请输入@1至@{}选择歌曲或@跳过", candidates.len().min(5));
+        let prompt = format!(
+            "请输入@1至@{}选择歌曲，或@换源重新搜索，或@跳过",
+            candidates.len().min(5)
+        );
         let mut messages = choices;
         messages.push(prompt);
         self.port
-            .prompt_and_wait_for_decision_batch(&messages, false, false, false)
+            .prompt_and_wait_for_decision_batch(&messages, true, false, false)
     }
 
     fn playback_queue(&self) -> Result<Vec<QueueItem>> {
@@ -1568,6 +1571,10 @@ mod tests {
     fn candidate_prompt_uses_one_prompt_and_decision_operation() {
         let mut port =
             FakePort::idle([Some(picked("晴天 - 周杰伦", "miliastra://track/qqmusic/1"))]);
+        port.decisions = VecDeque::from([
+            SongRequestDecision::Select,
+            SongRequestDecision::SelectIndex(1),
+        ]);
 
         application()
             .execute(&context(), &command(), &mut port)
@@ -1576,6 +1583,12 @@ mod tests {
         assert_eq!(
             port.decision_prompts.borrow().as_slice(),
             ["搜索到:晴天 - 周杰伦,@确认@跳过@换源@选择"]
+        );
+        assert!(
+            port.replies
+                .borrow()
+                .iter()
+                .any(|reply| reply == "请输入@1至@1选择歌曲，或@换源重新搜索，或@跳过")
         );
     }
 
@@ -1614,6 +1627,35 @@ mod tests {
                 .borrow()
                 .iter()
                 .any(|reply| reply.starts_with("@2 "))
+        );
+    }
+
+    #[test]
+    fn selecting_source_switches_candidate_search_to_the_other_provider() {
+        let mut port = FakePort::idle([
+            Some(picked("晴天 - 周杰伦", "miliastra://track/qqmusic/1")),
+            Some(picked("晴天 - 周杰伦", "miliastra://track/netease/2")),
+        ]);
+        port.decisions = VecDeque::from([
+            SongRequestDecision::Select,
+            SongRequestDecision::SwitchSource,
+            SongRequestDecision::Confirm,
+        ]);
+
+        application()
+            .execute(&context(), &command(), &mut port)
+            .expect("song request");
+
+        assert_eq!(
+            port.search_sources.borrow().as_slice(),
+            ["qqmusic", "netease"]
+        );
+        assert_eq!(port.played.borrow()[0].source, "netease");
+        assert!(
+            port.replies
+                .borrow()
+                .iter()
+                .any(|reply| reply.contains("@换源重新搜索"))
         );
     }
 
@@ -1743,6 +1785,10 @@ mod tests {
         assert_eq!(
             SongRequestDecision::parse("@选择"),
             Some(SongRequestDecision::Select)
+        );
+        assert_eq!(
+            SongRequestDecision::parse("@换源"),
+            Some(SongRequestDecision::SwitchSource)
         );
         assert_eq!(
             SongRequestDecision::parse("@5"),

@@ -76,9 +76,9 @@ use crate::interfaces::ui_plan::{WorkflowOperation, WorkflowResidency};
 use crate::observation::chat::{
     ChatMessage, ChatObservationDispatch, ChatObservationExclusiveGuard, ChatObservationShared,
     ChatScanTelemetry, ChatScanTelemetrySink, CompletionAdvanceSubscriber, ObservedFrame,
-    PrimaryObservationCursor, PrimaryObservedMessage, ResolvedTemplateArgs, SECONDARY_TITLE_RECT,
-    SecondaryChatIdentity, SecondaryChatObservation, SecondaryHallBubble, SecondaryObservedMessage,
-    SecondaryRecognizedMessage, TemplateArgs, UnreadFriendHit, classify_title, count_chat_markers,
+    PrimaryObservationCursor, PrimaryObservedMessage, ResolvedTemplateArgs, SecondaryChatIdentity,
+    SecondaryChatObservation, SecondaryHallBubble, SecondaryObservedMessage,
+    SecondaryRecognizedMessage, TemplateArgs, UnreadFriendHit, count_chat_markers,
     find_unread_friend_hits, hall_bubble_layout_is_stable, hall_bubble_sequence_is_retained_prefix,
     hall_bubble_sequence_overlap, latest_incoming_fingerprint, prepare_chat_scan,
     prepare_chat_scan_with_markers, recognize_prepared_chat, secondary_hall_bubbles,
@@ -1653,14 +1653,6 @@ fn command_log_field(value: &str) -> String {
 
 fn elapsed_ms(started: Instant) -> u128 {
     started.elapsed().as_millis()
-}
-
-fn secondary_fingerprint_changed(
-    previous: &ChangeFingerprint,
-    current: &ChangeFingerprint,
-) -> bool {
-    let stats = change_stats(previous, current);
-    stats.mean_abs_diff >= 0.8 || stats.changed_ratio >= 0.01
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

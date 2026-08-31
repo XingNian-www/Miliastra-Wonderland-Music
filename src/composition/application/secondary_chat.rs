@@ -272,7 +272,6 @@ pub(super) struct SecondaryListenerRoundState<'a> {
     pub(super) last_friend_bubble: &'a mut Option<ChangeFingerprint>,
     pub(super) hall_bubble_sequence: &'a mut Option<Vec<SecondaryHallBubble>>,
     pub(super) hall_command_tracker: &'a mut SecondaryHallCommandTracker,
-    pub(super) last_title: &'a mut Option<ChangeFingerprint>,
     pub(super) identity: &'a mut Option<SecondaryChatIdentity>,
 }
 
@@ -287,7 +286,6 @@ impl ApplicationRuntime {
             last_friend_bubble,
             hall_bubble_sequence,
             hall_command_tracker,
-            last_title,
             identity,
         } = state;
         if !self.business.task_engine.is_idle()? {
@@ -298,21 +296,13 @@ impl ApplicationRuntime {
             self.lifecycle.config.screen.expected_height,
             self.lifecycle.config.invite.friend_list_region.into(),
         );
-        let title_fingerprint = rect_chat_change_fingerprint(image, SECONDARY_TITLE_RECT)?;
-        let title_changed = identity.is_none()
-            || last_title
-                .as_ref()
-                .is_none_or(|previous| secondary_fingerprint_changed(previous, &title_fingerprint));
-        if title_changed {
-            let observed_identity = self.secondary_identity_from_frame(image)?;
-            if identity.as_ref() != Some(&observed_identity) {
-                hall_bubble_sequence.take();
-                hall_command_tracker.reset();
-            }
-            *identity = Some(observed_identity);
+        let observed_identity = self.secondary_identity_from_frame(image)?;
+        let identity_changed = identity.as_ref() != Some(&observed_identity);
+        if identity_changed {
+            hall_bubble_sequence.take();
+            hall_command_tracker.reset();
         }
-        *last_title = Some(title_fingerprint);
-
+        *identity = Some(observed_identity);
         let state = self.business.business.chat_listener_snapshot()?;
         if state.unread_task_pending {
             return Ok(SecondaryListenerRoundOutcome::default());
@@ -390,20 +380,7 @@ impl ApplicationRuntime {
                     ..Default::default()
                 })
             }
-            SecondaryChatIdentity::Friend(_) => {
-                if title_changed {
-                    *last_friend_bubble = latest_incoming_fingerprint(image)?;
-                }
-                let recovery_requested =
-                    allow_hall_recovery && self.queue_secondary_hall_recovery()?;
-                Ok(SecondaryListenerRoundOutcome {
-                    recovery_requested,
-                    ..Default::default()
-                })
-            }
-            SecondaryChatIdentity::PublicChannel
-            | SecondaryChatIdentity::StrangerMessages
-            | SecondaryChatIdentity::Unknown => {
+            SecondaryChatIdentity::Unknown => {
                 let recovery_requested =
                     allow_hall_recovery && self.queue_secondary_hall_recovery()?;
                 Ok(SecondaryListenerRoundOutcome {
@@ -422,6 +399,7 @@ impl ApplicationRuntime {
         if !self.business.business.claim_chat_listener_unread_task()? {
             return Ok(false);
         }
+        let queued_y = hit.row_click.y;
         if let Err(error) =
             self.push_pending_task(PendingTask::SecondaryUnread { hit, discard_only })
         {
@@ -430,7 +408,7 @@ impl ApplicationRuntime {
         }
         log::info!(
             "二级监听检测到好友未读红点: y={} discard_only={}",
-            hit.row_click.y,
+            queued_y,
             discard_only
         );
         Ok(false)
@@ -628,14 +606,26 @@ impl ApplicationRuntime {
     }
 
     fn secondary_identity_from_frame(&self, image: &DynamicImage) -> Result<SecondaryChatIdentity> {
-        let crop = crop_canvas(image, SECONDARY_TITLE_RECT)?;
-        let title = self.ui.ocr.merged_text(
-            crop,
-            self.lifecycle.config.ocr.same_line_y_tolerance,
-            OcrPriority::ChatObservation,
-        )?;
-        log::debug!("二级监听顶部标题 OCR: {}", title);
-        Ok(classify_title(&title))
+        let anchor: Rect = self.lifecycle.config.screen.secondary_hall_rect.into();
+        let friend_list: Rect = self.lifecycle.config.invite.friend_list_region.into();
+        let hall_rect = Rect::new(
+            anchor.x.min(friend_list.x),
+            anchor.y.min(friend_list.y),
+            (anchor.right().max(friend_list.right()) - anchor.x.min(friend_list.x)) as u32,
+            (anchor.bottom().max(friend_list.bottom()) - anchor.y.min(friend_list.y)) as u32,
+        );
+        let hall = best_template_hit(
+            image,
+            Some(hall_rect),
+            &self.lifecycle.config.templates.secondary_hall,
+            self.lifecycle.config.templates.marker_threshold,
+        )?
+        .is_some();
+        Ok(if hall {
+            SecondaryChatIdentity::CurrentHall
+        } else {
+            SecondaryChatIdentity::Unknown
+        })
     }
 
     pub(super) fn begin_chat_decision_reader<A, P>(
@@ -1053,17 +1043,14 @@ impl ApplicationRuntime {
                 message_id: Some(message_id.clone()),
             };
             let shortcut_player = if message_type == "pink" {
-                if friend_name.trim().is_empty() {
-                    "二级好友"
-                } else {
-                    friend_name.trim()
-                }
+                friend_name.trim().to_string()
             } else {
                 message_sender
                     .as_deref()
                     .map(str::trim)
                     .filter(|sender| !sender.is_empty())
                     .unwrap_or(SECONDARY_HALL_FALLBACK_SENDER)
+                    .to_string()
             };
             let router = ChatCommandRouter::with_identity(
                 &self.business.custom_workflow,
@@ -1071,7 +1058,7 @@ impl ApplicationRuntime {
             );
             if let Some(envelope) = command::parse_structured_song_envelope(
                 &text,
-                shortcut_player,
+                &shortcut_player,
                 &message_type,
                 command_observation.clone(),
             ) && let Some(parsed) =
@@ -1083,7 +1070,7 @@ impl ApplicationRuntime {
             }
             if let Some(envelope) = CommandEnvelope::new(
                 &text,
-                shortcut_player,
+                &shortcut_player,
                 &message_type,
                 text.trim(),
                 command_observation.clone(),
@@ -1114,7 +1101,7 @@ impl ApplicationRuntime {
             let command_text = text[index..].trim().to_string();
             let Some(envelope) = CommandEnvelope::new(
                 &text,
-                shortcut_player,
+                &shortcut_player,
                 &message_type,
                 command_text,
                 command_observation,

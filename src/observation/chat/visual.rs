@@ -8,7 +8,7 @@ use super::secondary_hall_vision::confirmed_secondary_hall_bubbles;
 use crate::ui::change_detection::{ChangeFingerprint, change_stats, rect_chat_change_fingerprint};
 use crate::ui::geometry::Rect;
 
-// 坐标沿用项目固定的 1920x1080 游戏画布；监听模式本身仍是运行期状态。
+// 仅供旧 OCR 测试和通用标题裁剪工具使用，不参与二级身份判断。
 pub(crate) const SECONDARY_TITLE_RECT: Rect = Rect::new(600, 24, 480, 72);
 const MESSAGE_RECT: Rect = Rect::new(250, 90, 1_020, 850);
 const MIN_BUBBLE_PIXELS_PER_ROW: usize = 20;
@@ -16,27 +16,7 @@ const MIN_BUBBLE_PIXELS_PER_ROW: usize = 20;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SecondaryChatIdentity {
     CurrentHall,
-    PublicChannel,
-    StrangerMessages,
-    Friend(String),
     Unknown,
-}
-
-pub(crate) fn classify_title(text: &str) -> SecondaryChatIdentity {
-    let text = text.trim();
-    if text.is_empty() {
-        return SecondaryChatIdentity::Unknown;
-    }
-    if text.contains("当前大厅") {
-        return SecondaryChatIdentity::CurrentHall;
-    }
-    if text.contains("公开频道") || text.contains("公共大厅") {
-        return SecondaryChatIdentity::PublicChannel;
-    }
-    if text.contains("陌生人消息") {
-        return SecondaryChatIdentity::StrangerMessages;
-    }
-    SecondaryChatIdentity::Friend(text.to_string())
 }
 
 #[derive(Clone, Debug)]
@@ -239,30 +219,6 @@ mod tests {
     use image::{Rgba, RgbaImage};
 
     use super::*;
-
-    #[test]
-    fn classifies_known_titles_before_friend_titles() {
-        assert_eq!(
-            classify_title("当前大厅"),
-            SecondaryChatIdentity::CurrentHall
-        );
-        assert_eq!(
-            classify_title("公开频道"),
-            SecondaryChatIdentity::PublicChannel
-        );
-        assert_eq!(
-            classify_title("公共大厅"),
-            SecondaryChatIdentity::PublicChannel
-        );
-        assert_eq!(
-            classify_title("陌生人消息"),
-            SecondaryChatIdentity::StrangerMessages
-        );
-        assert_eq!(
-            classify_title("难以识别的昵称"),
-            SecondaryChatIdentity::Friend("难以识别的昵称".to_string())
-        );
-    }
 
     #[test]
     fn finds_lowest_dark_bubble_only() {

@@ -4,15 +4,14 @@ use std::thread::sleep;
 use std::time::Duration;
 
 use enigo::Key;
-use image::DynamicImage;
+use image::{DynamicImage, GenericImageView};
 
 #[cfg(test)]
 use crate::config::AppConfig;
 use crate::config::{
     InputTimingConfig, OcrConfig, OutputConfig, PointConfig, ScreenConfig, TemplateConfig,
 };
-use crate::observation::chat::secondary_hall_bubbles;
-use crate::runtime::ocr::{OcrPriority, OcrRuntimeHandle, merge_ocr_lines};
+use crate::runtime::ocr::{OcrPriority, OcrRuntimeHandle};
 use crate::runtime::ui::{
     InputCertainty, UiOperation, UiRoutine, UiRoutineContext, UiRoutineFailure,
     UiRoutineProgressStage, UiRuntimeHandle, UiStateKind, UiStateObservation, UiSubmitError,
@@ -1010,58 +1009,74 @@ fn confirm_friend_conversation(
 ) -> std::result::Result<(), UiRoutineFailure> {
     context.publish_progress(UiRoutineProgressStage::ConfirmingUi);
     let target = normalize_lock_text(recipient);
-    let attempts = confirmation_attempts(config);
-    let mut stable_key = None;
-    let mut streak = 0_u32;
-    for attempt in 0..attempts {
-        let image = capture_normalized(
-            context,
-            config,
-            "confirm_friend_conversation",
-            InputCertainty::AfterInputUnknown,
-        )?;
-        if let Some(key) = conversation_confirmation_key(ocr, &image, config, &target)? {
-            if stable_key.as_deref() == Some(key.as_str()) {
-                streak = streak.saturating_add(1);
-            } else {
-                stable_key = Some(key);
-                streak = 1;
-            }
-            if streak >= config.stable_count {
-                return Ok(());
-            }
-        } else {
-            stable_key = None;
-            streak = 0;
-        }
-        if attempt + 1 < attempts {
-            sleep_ms(config.poll_ms);
-        }
+    let image = capture_normalized(
+        context,
+        config,
+        "confirm_friend_conversation",
+        InputCertainty::AfterInputUnknown,
+    )?;
+    let highlighted = highlighted_row(&image, selected_row_region(config));
+    let matches = matching_text_rows(ocr, &image, config.friend_list_region, &target)?;
+    if highlighted.is_some_and(|row| matches.iter().any(|point| point_in_rect(*point, row))) {
+        return Ok(());
     }
     Err(UiRoutineFailure::new(
         InputCertainty::AfterInputUnknown,
         "confirm_friend_conversation",
-        "selected conversation is current hall or public channel",
+        "highlighted friend row did not contain the requested OCR name",
     ))
 }
 
-fn conversation_confirmation_key(
-    ocr: &OcrRuntimeHandle,
-    image: &DynamicImage,
-    _config: &FriendDeliveryRoutineConfig,
-    normalized_target: &str,
-) -> std::result::Result<Option<String>, UiRoutineFailure> {
-    let mut matches = secondary_hall_bubbles(image)
-        .map_err(|error| after_input_failure("confirm_friend_sender", error))?
-        .into_iter()
-        .filter_map(|bubble| {
-            let sender = merged_text(ocr, image, bubble.sender_rect()).ok()?;
-            let sender = normalize_lock_text(&sender);
-            (sender == normalized_target).then_some(sender)
-        })
-        .collect::<Vec<_>>();
-    matches.dedup();
-    Ok((matches.len() == 1).then(|| matches.remove(0)))
+fn selected_row_region(config: &FriendDeliveryRoutineConfig) -> Rect {
+    Rect::new(
+        config.friend_list_region.x.saturating_sub(70),
+        config.friend_list_region.y,
+        config.friend_list_region.width.saturating_add(110),
+        config.friend_list_region.height,
+    )
+}
+
+fn point_in_rect(point: Point, rect: Rect) -> bool {
+    (rect.x..rect.right()).contains(&point.x) && (rect.y..rect.bottom()).contains(&point.y)
+}
+
+fn highlighted_row(image: &DynamicImage, region: Rect) -> Option<Rect> {
+    let scan_region = region;
+    let start = scan_region.y.max(0);
+    let end = scan_region.bottom().min(image.height() as i32);
+    let mut runs = Vec::new();
+    let mut run_start = None;
+    for y in start..end {
+        let bright = (scan_region.x.max(0)..scan_region.right().min(image.width() as i32))
+            .filter(|x| {
+                let pixel = image.get_pixel(*x as u32, y as u32).0;
+                let luminance =
+                    (u16::from(pixel[0]) + u16::from(pixel[1]) + u16::from(pixel[2])) / 3;
+                luminance >= 50
+            })
+            .count();
+        let width =
+            (scan_region.right().min(image.width() as i32) - scan_region.x.max(0)).max(1) as usize;
+        if bright * 2 >= width {
+            run_start.get_or_insert(y);
+        } else if let Some(top) = run_start.take()
+            && y - top >= 24
+        {
+            runs.push((top, y));
+        }
+    }
+    if let Some(top) = run_start
+        && end - top >= 24
+    {
+        runs.push((top, end));
+    }
+    let (top, bottom) = runs.into_iter().max_by_key(|(top, bottom)| bottom - top)?;
+    Some(Rect::new(
+        scan_region.x.max(0),
+        top,
+        (scan_region.right().min(image.width() as i32) - scan_region.x.max(0)) as u32,
+        (bottom - top) as u32,
+    ))
 }
 
 pub(super) fn restore_residency(
@@ -1271,25 +1286,41 @@ fn confirm_current_hall(
     ocr: &OcrRuntimeHandle,
     config: &FriendDeliveryRoutineConfig,
 ) -> std::result::Result<(), UiRoutineFailure> {
-    let mut streak = 0_u32;
-    for attempt in 0..confirmation_attempts(config) {
-        if current_title_is_hall(context, ocr, config)? {
-            streak = streak.saturating_add(1);
-            if streak >= config.stable_count {
-                return Ok(());
-            }
-        } else {
-            streak = 0;
-        }
-        if attempt + 1 < confirmation_attempts(config) {
-            sleep_ms(config.poll_ms);
-        }
+    let image = capture_normalized(
+        context,
+        config,
+        "confirm_secondary_hall",
+        InputCertainty::AfterInputUnknown,
+    )?;
+    let highlighted = highlighted_row(&image, selected_row_region(config));
+    let hall_matches = matching_text_rows(
+        ocr,
+        &image,
+        config.friend_list_region,
+        &normalize_lock_text("当前大厅"),
+    )?;
+    if highlighted.is_some_and(|row| hall_matches.iter().any(|point| point_in_rect(*point, row)))
+        || current_title_is_hall_image(&image, config)
+    {
+        return Ok(());
     }
     Err(UiRoutineFailure::new(
         InputCertainty::AfterInputUnknown,
         "confirm_secondary_hall",
-        "current-hall title did not become stable",
+        "highlighted hall row OCR did not become stable",
     ))
+}
+
+fn current_title_is_hall_image(image: &DynamicImage, config: &FriendDeliveryRoutineConfig) -> bool {
+    best_template_hit(
+        image,
+        Some(config.secondary_hall_search_region),
+        &config.secondary_hall_template,
+        config.template_threshold,
+    )
+    .ok()
+    .flatten()
+    .is_some()
 }
 
 fn matching_text_rows(
@@ -1316,19 +1347,6 @@ fn matching_text_rows(
             })
         })
         .collect())
-}
-
-fn merged_text(
-    ocr: &OcrRuntimeHandle,
-    image: &DynamicImage,
-    region: Rect,
-) -> std::result::Result<String, UiRoutineFailure> {
-    let crop = crop_canvas(image, region)
-        .map_err(|error| after_input_failure("crop_ocr_confirmation", error))?;
-    let lines = ocr
-        .recognize_lines(crop, OcrPriority::UiConfirmation)
-        .map_err(|error| after_input_failure("ocr_confirmation", error.into()))?;
-    Ok(merge_ocr_lines(lines, 12))
 }
 
 pub(super) fn capture_normalized(
@@ -1522,15 +1540,9 @@ mod tests {
         );
 
         let routine = FriendDeliveryRoutineConfig::from_app(&config);
-        assert_eq!(
-            conversation_confirmation_key(
-                &handle,
-                &image,
-                &routine,
-                &normalize_lock_text("不存在的好友")
-            )
-            .expect("accept any non-blacklisted title in fast mode"),
-            Some("allowed-chat".to_string())
+        assert!(
+            !highlighted_row(&image, selected_row_region(&routine))
+                .is_some_and(|row| { samples[0].iter().any(|point| point_in_rect(*point, row)) })
         );
 
         let state = Arc::new(Mutex::new(TestUiState {
@@ -1616,7 +1628,26 @@ mod tests {
 
     impl UiDevice for RecordingDevice {
         fn capture(&mut self) -> Result<DynamicImage> {
-            Ok(self.frame.clone())
+            let mut frame = self.frame.clone();
+            let selected_y = {
+                let state = self.state.lock().unwrap();
+                match &state.conversation {
+                    Conversation::Hall => Some(365),
+                    Conversation::Friend(friend) => self
+                        .friend_rows
+                        .iter()
+                        .find(|(_, name)| name == friend)
+                        .map(|(y, _)| *y),
+                }
+            };
+            if let Some(y) = selected_y {
+                for row_y in (y - 35).max(0)..(y + 35) {
+                    for x in 10..290 {
+                        frame.put_pixel(x, row_y as u32, image::Rgba([65, 73, 86, 255]));
+                    }
+                }
+            }
+            Ok(frame)
         }
 
         fn ensure_ready(&mut self, _after_activate_ms: u64) -> Result<()> {
@@ -1685,6 +1716,17 @@ mod tests {
     impl OcrDevice for FriendOcrDevice {
         fn recognize_lines(&mut self, image: &DynamicImage) -> Result<Vec<OcrLine>> {
             let size = (image.width(), image.height());
+            if size.0 > self.friend_list_size.0 && size.1 <= self.friend_list_size.1 {
+                let title = match &self.state.lock().unwrap().conversation {
+                    Conversation::Hall => "当前大厅".to_string(),
+                    Conversation::Friend(friend) => friend.clone(),
+                };
+                return Ok(vec![OcrLine {
+                    text: title,
+                    confidence: 1.0,
+                    bbox: Rect::new(75, 35, 120, 30),
+                }]);
+            }
             if size == self.friend_list_size {
                 return Ok(vec![
                     OcrLine {
@@ -1724,6 +1766,13 @@ mod tests {
     impl OcrDevice for TitleFallbackOcrDevice {
         fn recognize_lines(&mut self, image: &DynamicImage) -> Result<Vec<OcrLine>> {
             let size = (image.width(), image.height());
+            if size.0 > self.friend_list_size.0 && size.1 <= self.friend_list_size.1 {
+                return Ok(vec![OcrLine {
+                    text: "萌萌".to_string(),
+                    confidence: 1.0,
+                    bbox: Rect::new(75, 35, 120, 30),
+                }]);
+            }
             if size == self.friend_list_size {
                 return Ok(vec![OcrLine {
                     text: "萌萌".to_string(),
@@ -1837,14 +1886,14 @@ mod tests {
         let state = state.lock().unwrap();
         assert_eq!(state.selected_friends, ["甲", "乙"]);
         assert_eq!(state.pasted, ["甲一", "乙一", "乙二"]);
-        assert_eq!(state.hall_clicks, 1);
+        assert_eq!(state.hall_clicks, 0);
 
         ui_runtime.shutdown().unwrap();
         ocr_runtime.shutdown().unwrap();
     }
 
     #[test]
-    fn friend_conversation_falls_back_to_the_chat_region_when_title_has_no_name() {
+    fn friend_conversation_confirms_from_the_highlighted_row_when_title_has_no_name() {
         let mut config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
         config.timing.input.after_activate_ms = 0;
         config.timing.input.open_chat_ms = 0;
@@ -1910,7 +1959,7 @@ mod tests {
         let state = state.lock().unwrap();
         assert_eq!(state.selected_friends, ["萌萌"]);
         assert_eq!(state.pasted, ["报名成功"]);
-        assert_eq!(state.hall_clicks, 1);
+        assert_eq!(state.hall_clicks, 0);
 
         ui_runtime.shutdown().unwrap();
         ocr_runtime.shutdown().unwrap();

@@ -421,6 +421,7 @@ impl FriendDeliveryUi {
 pub(crate) struct FriendDeliveryRoutineConfig {
     pub(super) screen: ScreenConfig,
     friend_list_region: Rect,
+    fuzzy_friend_match: bool,
     secondary_hall_search_region: Rect,
     chat_click: PointConfig,
     send_enabled: Arc<RwLock<bool>>,
@@ -452,6 +453,7 @@ pub(crate) struct FriendDeliveryRoutineConfigSource<'a> {
     /// 游戏内回复发送开关共享句柄（热更新）。
     pub(crate) send_enabled: Arc<RwLock<bool>>,
     pub(crate) friend_list_region: Rect,
+    pub(crate) fuzzy_friend_match: bool,
     pub(crate) friend_step_ms: u64,
     pub(crate) timeout_ms: u64,
     pub(crate) poll_ms: u64,
@@ -465,6 +467,7 @@ impl FriendDeliveryRoutineConfig {
         Self {
             screen: source.screen.clone(),
             friend_list_region,
+            fuzzy_friend_match: source.fuzzy_friend_match,
             secondary_hall_search_region: secondary_hall_search_rect(
                 hall_anchor,
                 friend_list_region,
@@ -501,6 +504,7 @@ impl FriendDeliveryRoutineConfig {
             auto_retry_count: live.friend_delivery_auto_retry_count,
             send_enabled: live.output_send_enabled,
             friend_list_region: config.invite.friend_list_region.into(),
+            fuzzy_friend_match: config.invite.fuzzy_friend_match,
             friend_step_ms: config.timing.invite.step_ms,
             timeout_ms: config.timing.workflow.default_timeout_ms,
             poll_ms: config.timing.workflow.default_poll_ms,
@@ -554,6 +558,15 @@ enum PageSearch {
     Found(Point),
     Missing,
 }
+
+#[derive(Clone, Debug)]
+struct FriendOcrRow {
+    text: String,
+    point: Point,
+}
+
+const FUZZY_FRIEND_MIN_SCORE: f32 = 0.55;
+const FUZZY_FRIEND_MIN_MARGIN: f32 = 0.12;
 
 fn execute_friend_deliveries(
     context: &mut UiRoutineContext<'_>,
@@ -810,7 +823,7 @@ pub(super) fn open_friend_conversation(
         .click_point(point.x, point.y)
         .map_err(|error| after_input_failure("select_friend", error))?;
     sleep_ms(config.friend_step_ms);
-    confirm_friend_conversation(context, ocr, config, recipient)
+    confirm_friend_conversation(context, ocr, config, recipient, point)
 }
 
 pub(super) fn send_current_chat_message(
@@ -923,11 +936,111 @@ fn locate_stable_friend_row(
             .map_err(|error| after_input_failure("drag_friend_list", error))?;
         wait_friend_list_stable(context, config)?;
     }
+    if config.fuzzy_friend_match {
+        return search_top_friend_candidate(context, ocr, config, recipient);
+    }
     Err(UiRoutineFailure::new(
         InputCertainty::AfterInputUnknown,
         "locate_friend",
         "no unique stable friend row was found within two list drags",
     ))
+}
+
+fn search_top_friend_candidate(
+    context: &mut UiRoutineContext<'_>,
+    ocr: &OcrRuntimeHandle,
+    config: &FriendDeliveryRoutineConfig,
+    recipient: &str,
+) -> std::result::Result<Point, UiRoutineFailure> {
+    let (from, to) = friend_list_drag_points(config.friend_list_region);
+    context
+        .device()
+        .drag_point(to.x, to.y, from.x, from.y)
+        .map_err(|error| after_input_failure("scroll_friend_list_to_top", error))?;
+    wait_friend_list_stable(context, config)?;
+    let image = capture_normalized(
+        context,
+        config,
+        "fuzzy_friend_list",
+        InputCertainty::AfterInputUnknown,
+    )?;
+    let rows = ocr_friend_rows(ocr, &image, config.friend_list_region)?;
+    let mut candidates = rows
+        .into_iter()
+        .map(|row| (score_friend_candidate(recipient, &row.text), row))
+        .filter(|(score, _)| *score >= FUZZY_FRIEND_MIN_SCORE)
+        .collect::<Vec<_>>();
+    candidates.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let Some((best_score, best)) = candidates.first() else {
+        return Err(UiRoutineFailure::new(
+            InputCertainty::AfterInputUnknown,
+            "locate_friend_fuzzy",
+            "no fuzzy friend candidate reached the score threshold",
+        ));
+    };
+    if candidates
+        .get(1)
+        .is_some_and(|(score, _)| best_score - score < FUZZY_FRIEND_MIN_MARGIN)
+    {
+        return Err(UiRoutineFailure::new(
+            InputCertainty::AfterInputUnknown,
+            "locate_friend_fuzzy",
+            "fuzzy friend candidates were not sufficiently distinct",
+        ));
+    }
+    Ok(best.point)
+}
+
+fn ocr_friend_rows(
+    ocr: &OcrRuntimeHandle,
+    image: &DynamicImage,
+    region: Rect,
+) -> std::result::Result<Vec<FriendOcrRow>, UiRoutineFailure> {
+    let crop = crop_canvas(image, region)
+        .map_err(|error| after_input_failure("crop_friend_list", error))?;
+    let lines = ocr
+        .recognize_lines(crop, OcrPriority::UiConfirmation)
+        .map_err(|error| after_input_failure("ocr_friend_list", error.into()))?;
+    Ok(lines
+        .into_iter()
+        .filter_map(|line| {
+            let text = line.text.trim().to_string();
+            (!text.is_empty()).then_some(FriendOcrRow {
+                text,
+                point: Point::new(
+                    region.x + line.bbox.center().x,
+                    region.y + line.bbox.center().y,
+                ),
+            })
+        })
+        .collect())
+}
+
+fn score_friend_candidate(target: &str, candidate: &str) -> f32 {
+    let target = normalize_lock_text(target);
+    let candidate = normalize_lock_text(candidate);
+    if target.is_empty() || candidate.is_empty() {
+        return 0.0;
+    }
+    if candidate == target {
+        return 1.0;
+    }
+    let common = longest_common_subsequence(target.chars().collect(), candidate.chars().collect());
+    common as f32 / target.chars().count().max(candidate.chars().count()) as f32
+}
+
+fn longest_common_subsequence(left: Vec<char>, right: Vec<char>) -> usize {
+    let mut table = vec![vec![0; right.len() + 1]; left.len() + 1];
+    for (i, left_char) in left.iter().enumerate() {
+        for (j, right_char) in right.iter().enumerate() {
+            table[i + 1][j + 1] = if left_char == right_char {
+                table[i][j] + 1
+            } else {
+                table[i][j + 1].max(table[i + 1][j])
+            };
+        }
+    }
+    table[left.len()][right.len()]
 }
 
 pub(super) fn friend_list_drag_points(region: Rect) -> (Point, Point) {
@@ -1006,6 +1119,7 @@ fn confirm_friend_conversation(
     ocr: &OcrRuntimeHandle,
     config: &FriendDeliveryRoutineConfig,
     recipient: &str,
+    selected_point: Point,
 ) -> std::result::Result<(), UiRoutineFailure> {
     context.publish_progress(UiRoutineProgressStage::ConfirmingUi);
     let target = normalize_lock_text(recipient);
@@ -1017,7 +1131,17 @@ fn confirm_friend_conversation(
     )?;
     let highlighted = highlighted_row(&image, selected_row_region(config));
     let matches = matching_text_rows(ocr, &image, config.friend_list_region, &target)?;
-    if highlighted.is_some_and(|row| matches.iter().any(|point| point_in_rect(*point, row))) {
+    let fuzzy_selected = config.fuzzy_friend_match
+        && matches.is_empty()
+        && ocr_friend_rows(ocr, &image, config.friend_list_region)?
+            .into_iter()
+            .any(|candidate| {
+                candidate.point.y.abs_diff(selected_point.y) <= FRIEND_ROW_Y_TOLERANCE as u32
+            });
+    if highlighted.is_some_and(|row| {
+        point_in_rect(selected_point, row)
+            && (matches.iter().any(|point| point_in_rect(*point, row)) || fuzzy_selected)
+    }) {
         return Ok(());
     }
     Err(UiRoutineFailure::new(
@@ -1456,6 +1580,32 @@ mod tests {
 
     use super::*;
     use crate::observation::chat::SECONDARY_TITLE_RECT;
+
+    #[test]
+    fn fuzzy_friend_candidate_score_accepts_lost_special_characters() {
+        assert_eq!(score_friend_candidate("摩羯233★", "摩羯233"), 5.0 / 6.0);
+        assert!(score_friend_candidate("摩羯233★", "摩羯233") >= FUZZY_FRIEND_MIN_SCORE);
+        assert!(score_friend_candidate("摩羯233★", "天秤233") < FUZZY_FRIEND_MIN_SCORE);
+    }
+
+    #[test]
+    fn fuzzy_friend_candidate_requires_a_clear_leader() {
+        let candidates = [
+            score_friend_candidate("小明★", "小明"),
+            score_friend_candidate("小明★", "小红"),
+        ];
+        assert!(candidates[0] - candidates[1] >= FUZZY_FRIEND_MIN_MARGIN);
+        assert!(
+            score_friend_candidate("小明★", "小红") - score_friend_candidate("小明★", "小朋")
+                < FUZZY_FRIEND_MIN_MARGIN
+        );
+    }
+
+    #[test]
+    fn fuzzy_friend_matching_is_disabled_by_default() {
+        let config = AppConfig::default();
+        assert!(!config.invite.fuzzy_friend_match);
+    }
 
     #[test]
     fn friend_list_drag_runs_from_the_lowest_avatar_to_the_highest_avatar() {

@@ -1901,6 +1901,12 @@ fn invite_section() -> Vec<ConfigFieldSchema> {
             "好友备注连续完整匹配次数；大于 1 时覆盖全局值，0 或 1 表示继承",
         ),
         ConfigFieldSchema::db_idle_reload(
+            "fuzzy_friend_match",
+            "好友候选评分匹配",
+            FieldKind::Bool,
+            "所有列表页精确匹配失败后，回到顶部搜索候选；默认关闭",
+        ),
+        ConfigFieldSchema::db_idle_reload(
             "friend_list_region",
             "好友列表区域",
             FieldKind::Rect,

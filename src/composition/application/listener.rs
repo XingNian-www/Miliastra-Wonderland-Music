@@ -542,7 +542,6 @@ impl ApplicationRuntime {
         let mut secondary_friend_bubble_fingerprint: Option<ChangeFingerprint> = None;
         let mut secondary_hall_bubble_sequence: Option<Vec<SecondaryHallBubble>> = None;
         let mut secondary_hall_command_tracker = SecondaryHallCommandTracker::default();
-        let mut secondary_title_fingerprint: Option<ChangeFingerprint> = None;
         let mut secondary_identity: Option<SecondaryChatIdentity> = None;
         let mut listener_residency_retry_after = Instant::now();
         let config_reload_child = std::env::var_os(crate::CONFIG_RELOAD_CHILD_ENV).is_some();
@@ -587,7 +586,6 @@ impl ApplicationRuntime {
                 secondary_friend_bubble_fingerprint = None;
                 secondary_hall_bubble_sequence = None;
                 secondary_hall_command_tracker.reset();
-                secondary_title_fingerprint = None;
                 secondary_identity = None;
                 unresolved_ui_since = None;
                 self.maybe_idle_exit()?;
@@ -774,7 +772,6 @@ impl ApplicationRuntime {
                         secondary_friend_bubble_fingerprint = None;
                         secondary_hall_bubble_sequence = None;
                         secondary_hall_command_tracker.reset();
-                        secondary_title_fingerprint = None;
                         secondary_identity = None;
                         log::debug!("驻留恢复后废弃当前旧观察帧，下一轮重新验证");
                     } else {
@@ -810,7 +807,6 @@ impl ApplicationRuntime {
                                                 &mut secondary_hall_bubble_sequence,
                                             hall_command_tracker:
                                                 &mut secondary_hall_command_tracker,
-                                            last_title: &mut secondary_title_fingerprint,
                                             identity: &mut secondary_identity,
                                         },
                                         allow_hall_recovery,
@@ -829,7 +825,6 @@ impl ApplicationRuntime {
                                     secondary_friend_bubble_fingerprint = None;
                                     secondary_hall_bubble_sequence = None;
                                     secondary_hall_command_tracker.reset();
-                                    secondary_title_fingerprint = None;
                                     secondary_identity = None;
                                     None
                                 };
@@ -857,7 +852,6 @@ impl ApplicationRuntime {
                                     secondary_friend_bubble_fingerprint = None;
                                     secondary_hall_bubble_sequence = None;
                                     secondary_hall_command_tracker.reset();
-                                    secondary_title_fingerprint = None;
                                     secondary_identity = None;
                                 }
                                 let primary_started = Instant::now();
@@ -1114,7 +1108,6 @@ impl ApplicationRuntime {
                                 secondary_friend_bubble_fingerprint = None;
                                 secondary_hall_bubble_sequence = None;
                                 secondary_hall_command_tracker.reset();
-                                secondary_title_fingerprint = None;
                                 secondary_identity = None;
                                 log::debug!("当前不是一级聊天界面，跳过聊天扫描: {}", ui_state);
                                 log::info!(target: "timing",
@@ -1177,7 +1170,6 @@ impl ApplicationRuntime {
                     secondary_friend_bubble_fingerprint = None;
                     secondary_hall_bubble_sequence = None;
                     secondary_hall_command_tracker.reset();
-                    secondary_title_fingerprint = None;
                     secondary_identity = None;
                     let observed_window_detection_generation =
                         self.ui.window_detection_signal.generation()?;
@@ -1341,6 +1333,13 @@ impl ApplicationRuntime {
 
     pub(super) fn mapped_actor_name(&self, ocr_name: &str) -> String {
         self.lifecycle.live_configs.identity.display_name(ocr_name)
+    }
+
+    pub(super) fn canonical_actor_name(&self, ocr_name: &str) -> String {
+        self.lifecycle
+            .live_configs
+            .identity
+            .canonical_name(ocr_name)
     }
 
     fn map_command_actor(&self, mut command: RoutedCommand) -> RoutedCommand {

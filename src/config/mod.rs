@@ -237,6 +237,7 @@ impl Default for AppConfig {
             },
             invite: InviteConfig {
                 friend_name_stable_count: 0,
+                fuzzy_friend_match: false,
                 friend_list_region: RectConfig {
                     x: 80,
                     y: 280,

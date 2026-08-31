@@ -9,6 +9,7 @@ use crate::ui::change_detection::{ChangeFingerprint, change_stats, rect_chat_cha
 use crate::ui::geometry::Rect;
 
 // 仅供旧 OCR 测试和通用标题裁剪工具使用，不参与二级身份判断。
+#[cfg(all(test, feature = "ocr-mnn"))]
 pub(crate) const SECONDARY_TITLE_RECT: Rect = Rect::new(600, 24, 480, 72);
 const MESSAGE_RECT: Rect = Rect::new(250, 90, 1_020, 850);
 const MIN_BUBBLE_PIXELS_PER_ROW: usize = 20;

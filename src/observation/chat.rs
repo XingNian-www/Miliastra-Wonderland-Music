@@ -29,6 +29,9 @@ pub(crate) use visual::{
     latest_incoming_bubble_rect, latest_incoming_fingerprint, secondary_hall_bubbles,
 };
 
+#[cfg(all(test, feature = "ocr-mnn"))]
+pub(crate) use visual::SECONDARY_TITLE_RECT;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct VisualSessionId(u64);
 

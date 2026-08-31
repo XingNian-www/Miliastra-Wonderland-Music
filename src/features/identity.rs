@@ -115,7 +115,7 @@ impl IdentityAccess {
             .map(|mapping| ResolvedIdentity {
                 id: mapping.id,
                 role: mapping.role,
-                nickname: nickname.to_owned(),
+                nickname: mapping.nickname.clone(),
                 note: mapping.note.clone(),
             })
     }
@@ -123,6 +123,13 @@ impl IdentityAccess {
     pub fn display_name(&self, nickname: &str) -> String {
         self.resolve(nickname)
             .map(|identity| identity.display_name().to_owned())
+            .unwrap_or_else(|| nickname.to_owned())
+    }
+
+    /// 获取好友操作接口使用的原始游戏昵称；备注昵称只用于身份识别和展示。
+    pub fn canonical_name(&self, nickname: &str) -> String {
+        self.resolve(nickname)
+            .map(|identity| identity.nickname)
             .unwrap_or_else(|| nickname.to_owned())
     }
 
@@ -219,6 +226,8 @@ mod tests {
         assert_eq!(owner.role, IdentityRole::Owner);
         assert_eq!(owner.display_name(), "主人备注");
         assert_eq!(access.display_name("管理小助手"), "管理小助手");
+        assert_eq!(access.display_name("主人备注"), "主人备注");
+        assert_eq!(access.role_of("主人备注"), None);
         assert_eq!(access.display_name("陌生人"), "陌生人");
         assert!(access.resolve("派蒙本蒙 ").is_none(), "尾部空白不模糊匹配");
         assert!(access.resolve("陌生人").is_none(), "未知昵称不映射");

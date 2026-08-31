@@ -6,9 +6,8 @@ use super::friend_delivery::{
     before_input_failure, capture_normalized, restore_residency, sleep_ms,
 };
 use crate::observation::chat::{
-    FriendUnreadLayout, SECONDARY_TITLE_RECT, SecondaryChatIdentity, UnreadFriendHit,
-    classify_title, find_unread_friend_hits, latest_incoming_bubble_rect,
-    latest_incoming_fingerprint, unread_hit_still_visible,
+    FriendUnreadLayout, UnreadFriendHit, find_unread_friend_hits, latest_incoming_bubble_rect,
+    latest_incoming_fingerprint, secondary_hall_bubbles, unread_hit_still_visible,
 };
 use crate::runtime::ocr::{OcrPriority, OcrRuntimeHandle, merge_ocr_lines};
 use crate::runtime::ui::{
@@ -17,7 +16,7 @@ use crate::runtime::ui::{
 };
 use crate::ui::geometry::{Rect, crop_canvas};
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct ProcessSecondaryUnread {
     hit: UnreadFriendHit,
     discard_only: bool,
@@ -192,7 +191,7 @@ fn process_unread(
             "confirm_secondary_unread_opened",
             InputCertainty::AfterInputUnknown,
         )?;
-        if !unread_hit_still_visible(&image, hit, &config.unread_layout) {
+        if !unread_hit_still_visible(&image, &hit, &config.unread_layout) {
             opened = true;
             break;
         }
@@ -207,22 +206,16 @@ fn process_unread(
     let deadline = Instant::now() + Duration::from_millis(config.residency.timeout_ms());
     loop {
         let (image, captured_at) = wait_bubble_stable(context, config, deadline)?;
-        let title = merged_text(ocr, &image, SECONDARY_TITLE_RECT, config)?;
-        let friend_name = match classify_title(&title) {
-            SecondaryChatIdentity::Friend(name) => name,
-            SecondaryChatIdentity::Unknown => "二级好友".to_string(),
-            SecondaryChatIdentity::CurrentHall
-            | SecondaryChatIdentity::PublicChannel
-            | SecondaryChatIdentity::StrangerMessages => {
-                if Instant::now() >= deadline {
-                    return Err(unread_message_failure(
-                        "conversation title did not become a friend before timeout",
-                    ));
-                }
-                sleep_ms(bubble_poll_ms(config));
-                continue;
+        let friend_name = confirmed_unread_friend_name(ocr, &image, &hit, config)?;
+        if friend_name.is_empty() {
+            if Instant::now() >= deadline {
+                return Err(unread_message_failure(
+                    "selected friend name did not become stable before timeout",
+                ));
             }
-        };
+            sleep_ms(bubble_poll_ms(config));
+            continue;
+        }
         let rect = latest_incoming_bubble_rect(&image).ok_or_else(|| {
             unread_message_failure("stable incoming bubble disappeared before OCR")
         })?;
@@ -241,6 +234,23 @@ fn process_unread(
         }
         sleep_ms(bubble_poll_ms(config));
     }
+}
+
+fn confirmed_unread_friend_name(
+    ocr: &OcrRuntimeHandle,
+    image: &image::DynamicImage,
+    hit: &UnreadFriendHit,
+    config: &SecondaryUnreadRoutineConfig,
+) -> Result<String, UiRoutineFailure> {
+    let names = secondary_hall_bubbles(image)
+        .map_err(|error| after_input_failure("confirm_secondary_unread_sender", error))?
+        .into_iter()
+        .filter(|bubble| (bubble.sender_rect().y - hit.row_click.y).abs() <= 72)
+        .filter_map(|bubble| merged_text(ocr, image, bubble.sender_rect(), config).ok())
+        .map(|name| crate::text::normalize_comparison_text(&name))
+        .filter(|name| !name.is_empty())
+        .collect::<Vec<_>>();
+    Ok(names.into_iter().next().unwrap_or_default())
 }
 
 fn reacquire_unread_hit(
@@ -268,10 +278,10 @@ fn reacquire_unread_hit(
     )?;
     Ok(find_unread_friend_hits(&confirmed, &config.unread_layout)
         .into_iter()
-        .find(|hit| same_unread_hit(candidate, *hit)))
+        .find(|hit| same_unread_hit(&candidate, hit)))
 }
 
-fn same_unread_hit(first: UnreadFriendHit, second: UnreadFriendHit) -> bool {
+fn same_unread_hit(first: &UnreadFriendHit, second: &UnreadFriendHit) -> bool {
     first.indicator.x.abs_diff(second.indicator.x) <= 4
         && first.indicator.y.abs_diff(second.indicator.y) <= 4
 }
@@ -518,7 +528,7 @@ mod tests {
             row_click: Point::new(150, 330),
         };
 
-        assert!(same_unread_hit(first, close));
-        assert!(!same_unread_hit(first, moved));
+        assert!(same_unread_hit(&first, &close));
+        assert!(!same_unread_hit(&first, &moved));
     }
 }

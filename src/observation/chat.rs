@@ -24,10 +24,9 @@ pub(crate) use stream::{
     SecondaryChatObservation, SecondaryObservedMessage, SecondaryRecognizedMessage,
 };
 pub(crate) use visual::{
-    SECONDARY_TITLE_RECT, SecondaryChatIdentity, SecondaryHallBubble, classify_title,
-    hall_bubble_layout_is_stable, hall_bubble_sequence_is_retained_prefix,
-    hall_bubble_sequence_overlap, latest_incoming_bubble_rect, latest_incoming_fingerprint,
-    secondary_hall_bubbles,
+    SecondaryChatIdentity, SecondaryHallBubble, hall_bubble_layout_is_stable,
+    hall_bubble_sequence_is_retained_prefix, hall_bubble_sequence_overlap,
+    latest_incoming_bubble_rect, latest_incoming_fingerprint, secondary_hall_bubbles,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

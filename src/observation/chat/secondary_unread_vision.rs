@@ -30,6 +30,8 @@ pub(crate) struct FriendUnreadLayout {
     min_visibility_pixels: usize,
     badge_avatar_overlap: i32,
     badge_top_tolerance: i32,
+    friend_name_left: i32,
+    friend_name_width: u32,
 }
 
 impl FriendUnreadLayout {
@@ -74,6 +76,8 @@ impl FriendUnreadLayout {
             min_visibility_pixels: scale_usize(20, area_scale),
             badge_avatar_overlap: scale_i32(4, uniform_scale).max(1),
             badge_top_tolerance: scale_i32(6, uniform_scale).max(1),
+            friend_name_left: friend_list_region.x,
+            friend_name_width: friend_list_region.width,
         }
     }
 }
@@ -107,6 +111,16 @@ pub(crate) fn find_unread_friend_hits(
     layout: &FriendUnreadLayout,
 ) -> Vec<UnreadFriendHit> {
     detect_friend_unread(image, layout)
+}
+
+pub(crate) fn friend_name_region(hit: &UnreadFriendHit, layout: &FriendUnreadLayout) -> Rect {
+    let row_height = layout.avatar_size as i32 + layout.avatar_top_scan_padding * 2;
+    Rect::new(
+        layout.friend_name_left,
+        hit.row_click.y - row_height / 2,
+        layout.friend_name_width,
+        row_height.max(1) as u32,
+    )
 }
 
 pub(crate) fn unread_hit_still_visible(

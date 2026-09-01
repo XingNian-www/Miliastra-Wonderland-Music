@@ -1052,11 +1052,6 @@ pub(super) fn friend_list_drag_points(region: Rect) -> (Point, Point) {
     )
 }
 
-fn current_hall_restore_drag_points(region: Rect) -> (Point, Point) {
-    let (bottom, top) = friend_list_drag_points(region);
-    (top, bottom)
-}
-
 fn search_current_friend_page(
     context: &mut UiRoutineContext<'_>,
     ocr: &OcrRuntimeHandle,
@@ -1327,13 +1322,12 @@ fn confirm_primary_visual_stability(
 
 fn restore_secondary_hall(
     context: &mut UiRoutineContext<'_>,
-    ocr: &OcrRuntimeHandle,
+    _ocr: &OcrRuntimeHandle,
     config: &FriendDeliveryRoutineConfig,
 ) -> std::result::Result<(), UiRoutineFailure> {
     ensure_secondary_chat(context, config)?;
-    if current_title_is_hall(context, ocr, config)? {
-        return confirm_current_hall(context, ocr, config);
-    }
+    // “当前大厅”位置固定。模板命中后只点击一次，不用好友高亮和 OCR 做二次确认。
+    // 未命中时向上滚动列表，避免当前选中的好友私聊目标被误当成大厅。
     let mut pages = Vec::<ChangeFingerprint>::new();
     for drag_index in 0..=MAX_FRIEND_LIST_DRAGS {
         let image = capture_normalized(
@@ -1356,7 +1350,7 @@ fn restore_secondary_hall(
                 .click_point(point.x, point.y)
                 .map_err(|error| after_input_failure("select_secondary_hall", error))?;
             sleep_ms(config.click_ms);
-            return confirm_current_hall(context, ocr, config);
+            return Ok(());
         }
         let fingerprint = rect_chat_change_fingerprint(&image, config.friend_list_region)
             .map_err(|error| after_input_failure("fingerprint_secondary_hall_list", error))?;
@@ -1370,7 +1364,7 @@ fn restore_secondary_hall(
         if drag_index == MAX_FRIEND_LIST_DRAGS {
             break;
         }
-        let (from, to) = current_hall_restore_drag_points(config.friend_list_region);
+        let (from, to) = friend_list_drag_points(config.friend_list_region);
         context
             .device()
             .drag_point(from.x, from.y, to.x, to.y)
@@ -1382,69 +1376,6 @@ fn restore_secondary_hall(
         "restore_secondary_hall",
         "current-hall template was not found after two downward avatar drags",
     ))
-}
-
-fn current_title_is_hall(
-    context: &mut UiRoutineContext<'_>,
-    _ocr: &OcrRuntimeHandle,
-    config: &FriendDeliveryRoutineConfig,
-) -> std::result::Result<bool, UiRoutineFailure> {
-    let image = capture_normalized(
-        context,
-        config,
-        "observe_secondary_hall",
-        InputCertainty::AfterInputUnknown,
-    )?;
-    Ok(best_template_hit(
-        &image,
-        Some(config.secondary_hall_search_region),
-        &config.secondary_hall_template,
-        config.template_threshold,
-    )
-    .map_err(|error| after_input_failure("observe_secondary_hall", error))?
-    .is_some())
-}
-
-fn confirm_current_hall(
-    context: &mut UiRoutineContext<'_>,
-    ocr: &OcrRuntimeHandle,
-    config: &FriendDeliveryRoutineConfig,
-) -> std::result::Result<(), UiRoutineFailure> {
-    let image = capture_normalized(
-        context,
-        config,
-        "confirm_secondary_hall",
-        InputCertainty::AfterInputUnknown,
-    )?;
-    let highlighted = highlighted_row(&image, selected_row_region(config));
-    let hall_matches = matching_text_rows(
-        ocr,
-        &image,
-        config.friend_list_region,
-        &normalize_lock_text("当前大厅"),
-    )?;
-    if highlighted.is_some_and(|row| hall_matches.iter().any(|point| point_in_rect(*point, row)))
-        || current_title_is_hall_image(&image, config)
-    {
-        return Ok(());
-    }
-    Err(UiRoutineFailure::new(
-        InputCertainty::AfterInputUnknown,
-        "confirm_secondary_hall",
-        "highlighted hall row OCR did not become stable",
-    ))
-}
-
-fn current_title_is_hall_image(image: &DynamicImage, config: &FriendDeliveryRoutineConfig) -> bool {
-    best_template_hit(
-        image,
-        Some(config.secondary_hall_search_region),
-        &config.secondary_hall_template,
-        config.template_threshold,
-    )
-    .ok()
-    .flatten()
-    .is_some()
 }
 
 fn matching_text_rows(
@@ -1617,12 +1548,12 @@ mod tests {
     }
 
     #[test]
-    fn current_hall_restore_drags_the_highest_avatar_downward() {
-        let (from, to) = current_hall_restore_drag_points(Rect::new(80, 280, 170, 600));
+    fn current_hall_restore_scrolls_list_upward_when_template_is_missing() {
+        let (from, to) = friend_list_drag_points(Rect::new(80, 280, 170, 600));
 
-        assert_eq!((from.x, from.y), (40, 330));
-        assert_eq!((to.x, to.y), (40, 830));
-        assert!(from.y < to.y);
+        assert_eq!((from.x, from.y), (40, 830));
+        assert_eq!((to.x, to.y), (40, 330));
+        assert!(from.y > to.y);
         assert_eq!(MAX_FRIEND_LIST_DRAGS, 2);
     }
     use crate::config::AppConfig;

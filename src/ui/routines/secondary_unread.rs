@@ -6,8 +6,8 @@ use super::friend_delivery::{
     before_input_failure, capture_normalized, restore_residency, sleep_ms,
 };
 use crate::observation::chat::{
-    FriendUnreadLayout, UnreadFriendHit, find_unread_friend_hits, latest_incoming_bubble_rect,
-    latest_incoming_fingerprint, secondary_hall_bubbles, unread_hit_still_visible,
+    FriendUnreadLayout, UnreadFriendHit, find_unread_friend_hits, friend_name_region,
+    latest_incoming_bubble_rect, latest_incoming_fingerprint, unread_hit_still_visible,
 };
 use crate::runtime::ocr::{OcrPriority, OcrRuntimeHandle, merge_ocr_lines};
 use crate::runtime::ui::{
@@ -242,15 +242,10 @@ fn confirmed_unread_friend_name(
     hit: &UnreadFriendHit,
     config: &SecondaryUnreadRoutineConfig,
 ) -> Result<String, UiRoutineFailure> {
-    let names = secondary_hall_bubbles(image)
-        .map_err(|error| after_input_failure("confirm_secondary_unread_sender", error))?
-        .into_iter()
-        .filter(|bubble| (bubble.sender_rect().y - hit.row_click.y).abs() <= 72)
-        .filter_map(|bubble| merged_text(ocr, image, bubble.sender_rect(), config).ok())
+    // 红点绑定好友列表行；从红点同一行的昵称区域取名，不再从聊天气泡反推好友身份。
+    let name_region = friend_name_region(hit, &config.unread_layout);
+    merged_text(ocr, image, name_region, config)
         .map(|name| crate::text::normalize_comparison_text(&name))
-        .filter(|name| !name.is_empty())
-        .collect::<Vec<_>>();
-    Ok(names.into_iter().next().unwrap_or_default())
 }
 
 fn reacquire_unread_hit(

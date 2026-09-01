@@ -34,6 +34,7 @@ const DRAG_START_SETTLE_MS: u64 = 100;
 const DRAG_PRESS_SETTLE_MS: u64 = 100;
 const DRAG_STEPS: i32 = 8;
 const DRAG_STEP_MS: u64 = 30;
+const DRAG_BEFORE_RELEASE_MS: u64 = 200;
 const DRAG_RELEASE_SETTLE_MS: u64 = 500;
 
 #[derive(Clone, Debug)]
@@ -173,6 +174,7 @@ impl GameWindow {
             }
             Ok(())
         })();
+        sleep(Duration::from_millis(DRAG_BEFORE_RELEASE_MS));
         let release_result = enigo
             .button(Button::Left, Direction::Release)
             .context("release mouse after drag");

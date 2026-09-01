@@ -16,7 +16,8 @@ pub(crate) use scan::{
     prepare_chat_scan_with_markers, recognize_prepared_chat, scan_chat_markers,
 };
 pub(crate) use secondary_unread_vision::{
-    FriendUnreadLayout, UnreadFriendHit, find_unread_friend_hits, unread_hit_still_visible,
+    FriendUnreadLayout, UnreadFriendHit, find_unread_friend_hits, friend_name_region,
+    unread_hit_still_visible,
 };
 pub(crate) use stream::{
     ChatObservationDispatch, ChatObservationExclusiveGuard, ChatObservationShared,

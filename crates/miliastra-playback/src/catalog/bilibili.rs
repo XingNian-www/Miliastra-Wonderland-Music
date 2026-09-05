@@ -872,14 +872,75 @@ fn correct_bvid_char(character: char) -> Option<char> {
         return Some(character);
     }
     match character {
-        // OCR 常把数字 1 识别成大写 I、小写 l、竖线、撇号或反引号；
+        // OCR 常把大写 J 识别成大写 I、小写 l、竖线、撇号或反引号；
         // 表内小写 o 与数字 0、大写 O 同形，OCR 常把 o 识别成 0/O；
         // 表内大写 J 常被 OCR 识别成右方括号（半角/全角）。
-        'I' | 'l' | '|' | '\'' | '`' => Some('1'),
+        'I' | 'l' | '|' | '\'' | '`' => Some('J'),
         'O' | '0' => Some('o'),
         ']' | '】' => Some('J'),
         _ => None,
     }
+}
+
+/// 将 OCR 识别出的 J 形近字符修复为合法的大写 J。
+fn bvid_char_options(character: char, offset: usize) -> &'static [char] {
+    match character {
+        // BV1 的第三位固定为 1，不能把这一位猜成 J。
+        'I' | 'l' | '|' | '\'' | '`' if offset == 0 => &['1'],
+        // OCR 常把 J 看成 I、l 或竖线；合法数字 1 在归一化前已直接保留。
+        'I' | 'l' | '|' | '\'' | '`' => &['J'],
+        _ => &[],
+    }
+}
+
+/// 从文本中提取规范 BV 号并执行 OCR 修复。
+///
+/// 合法的数字 `1` 不会被擅自改成 J：两者都是官方字符，且 BV 号没有校验位，
+/// 对这种输入无法从文本本身判断原字符。这样可以避免把真实 BV 号误改。
+fn normalize_bvid_candidates(input: &str) -> Vec<String> {
+    let characters = input.chars().collect::<Vec<_>>();
+    if characters.len() < 12 {
+        return Vec::new();
+    }
+    for start in 0..=characters.len() - 12 {
+        if !matches!(characters[start], 'B' | 'b') || !matches!(characters[start + 1], 'V' | 'v') {
+            continue;
+        }
+        let mut candidates = vec![String::from("BV")];
+        for (offset, &character) in characters[start + 2..start + 12].iter().enumerate() {
+            let options = if is_bvid_char(character) {
+                vec![character]
+            } else if let Some(corrected) = correct_bvid_char(character) {
+                // `correct_bvid_char` supplies the conservative legacy mapping for characters
+                // such as O/0 and brackets. J/I/1 ambiguity is handled explicitly above.
+                if matches!(character, 'I' | 'l' | '|' | '\'' | '`') {
+                    bvid_char_options(character, offset).to_vec()
+                } else {
+                    vec![corrected]
+                }
+            } else {
+                candidates.clear();
+                break;
+            };
+            let mut expanded = Vec::with_capacity(candidates.len() * options.len());
+            for candidate in &candidates {
+                for &option in &options {
+                    let mut value = candidate.clone();
+                    value.push(option);
+                    expanded.push(value);
+                }
+            }
+            candidates = expanded;
+            if candidates.is_empty() {
+                break;
+            }
+        }
+        candidates.retain(|candidate| is_bvid(candidate));
+        if !candidates.is_empty() {
+            return candidates;
+        }
+    }
+    Vec::new()
 }
 
 /// 从含 OCR 噪声的文本中容错提取规范化 BV 号（BV1 + 9 位官方字符）。
@@ -888,34 +949,17 @@ fn correct_bvid_char(character: char) -> Option<char> {
 /// 窗口滑动扫描：文本中任何「bv + 10 位可纠正字符」的 12 位片段都算命中，
 /// 因此分享链接、URL 参数、混入标点/混淆字符的 OCR 结果均可提取。
 pub(crate) fn normalize_bvid(input: &str) -> Option<String> {
-    let characters = input.chars().collect::<Vec<_>>();
-    if characters.len() < 12 {
-        return None;
-    }
-    for start in 0..=characters.len() - 12 {
-        if !matches!(characters[start], 'B' | 'b') || !matches!(characters[start + 1], 'V' | 'v') {
-            continue;
-        }
-        let mut corrected = String::with_capacity(12);
-        // 前缀强制归一为大写 BV；第三位仍走混淆纠正（I/l/0/|/撇号 → 1）。
-        corrected.push('B');
-        corrected.push('V');
-        let mut valid = true;
-        for &character in &characters[start + 2..start + 12] {
-            match correct_bvid_char(character) {
-                Some(character) => corrected.push(character),
-                None => {
-                    valid = false;
-                    break;
-                }
-            }
-        }
-        // 官方格式要求第三位固定为 1（BV1 前缀）。
-        if valid && corrected.starts_with("BV1") {
-            return Some(corrected);
-        }
-    }
-    None
+    normalize_bvid_candidates(input).into_iter().next()
+}
+
+/// Public input normalizer used by chat command parsing.
+pub fn bilibili_normalize_bvid(input: &str) -> Option<String> {
+    normalize_bvid(input)
+}
+
+/// Strict official-format validator used by external track-reference handlers.
+pub fn bilibili_is_bvid(value: &str) -> bool {
+    is_bvid(value)
 }
 
 fn is_bvid(value: &str) -> bool {
@@ -1472,11 +1516,11 @@ mod tests {
             ),
             ("【标题】 BV1GJ411x7h7 超好听", Some("BV1GJ411x7h7")),
             ("bv1GJ411x7h7", Some("BV1GJ411x7h7")),
-            // OCR 把数字 1 识别成大写 I / 小写 l / 竖线 / 撇号。
-            ("BV1GJ4I1x7h7", Some("BV1GJ411x7h7")),
-            ("BV1GJ4l1x7h7", Some("BV1GJ411x7h7")),
-            ("BV1GJ41|x7h7", Some("BV1GJ411x7h7")),
-            ("BV1GJ41'x7h7", Some("BV1GJ411x7h7")),
+            // OCR 把大写 J 识别成大写 I / 小写 l / 竖线 / 撇号。
+            ("BV1GJ4I1x7h7", Some("BV1GJ4J1x7h7")),
+            ("BV1GJ4l1x7h7", Some("BV1GJ4J1x7h7")),
+            ("BV1GJ41|x7h7", Some("BV1GJ41Jx7h7")),
+            ("BV1GJ41'x7h7", Some("BV1GJ41Jx7h7")),
             // OCR 把表内小写 o 识别成大写 O 或数字 0。
             ("BV1GJ4O1x7h7", Some("BV1GJ4o1x7h7")),
             ("BV1GJ401x7h7", Some("BV1GJ4o1x7h7")),
@@ -1512,7 +1556,7 @@ mod tests {
             json!({
                 "code": 0,
                 "data": {
-                    "bvid": "BV1GJ411x7h7",
+                    "bvid": "BV1GJ4J1x7h7",
                     "title": "Sample &amp; Title",
                     "owner": {"name": "Uploader"},
                     "duration": "03:21"
@@ -1529,7 +1573,7 @@ mod tests {
         )
         .unwrap();
 
-        // 模拟游戏聊天 OCR 结果：BV 号前带分享文案、数字 1 被识别成大写 I。
+        // 模拟游戏聊天 OCR 结果：BV 号前带分享文案、大写 J 被识别成大写 I。
         let result = adapter
             .search(&SearchSpec {
                 keyword: "这个视频 BV1GJ4I1x7h7 好听".to_owned(),
@@ -1540,13 +1584,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].song.key.id, "BV1GJ411x7h7");
+        assert_eq!(result[0].song.key.id, "BV1GJ4J1x7h7");
         assert_eq!(result[0].song.title, "Sample & Title");
         assert_eq!(result[0].song.artists, ["Uploader"]);
         assert_eq!(result[0].song.duration_ms, Some(201_000));
         assert_eq!(result[0].eligibility, PlaybackEligibility::Eligible);
         let request = requests.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert!(request.contains("bvid=BV1GJ411x7h7"));
+        assert!(request.contains("bvid=BV1GJ4J1x7h7"));
         assert!(!request.contains("search_type"));
     }
 

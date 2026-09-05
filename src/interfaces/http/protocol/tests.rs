@@ -24,6 +24,58 @@ use miliastra_playback::{
     KugouListenReport, LoginSession, TrackKey,
 };
 
+#[test]
+fn api_identity_mapping_changes_display_fields_without_changing_track_metadata() {
+    use crate::features::identity::{IdentityConfig, IdentityMapping, IdentityRole};
+
+    let identity = IdentityAccess::new(IdentityConfig {
+        mappings: vec![IdentityMapping {
+            nickname: "游戏备注".to_string(),
+            id: Uuid::from_u128(1),
+            role: IdentityRole::Friend,
+            note: "显示昵称".to_string(),
+        }],
+    });
+    let mut value = json!({
+        "requester": "游戏备注",
+        "queue": [{"friendUsername": "游戏备注", "requester": "游戏备注"}],
+        "turtleSoup": {
+            "starter": "游戏备注",
+            "participants": ["游戏备注", "未映射用户"],
+            "recentJudgments": [{"player": "游戏备注"}]
+        },
+        "undercover": {"players": [{"name": "游戏备注"}]},
+        "message": "游戏备注已加入队列",
+        "logs": ["游戏备注发起点歌"],
+        "status": "游戏备注",
+        "result": "{\"requester\":\"游戏备注\",\"track\":{\"metadata\":{\"title\":\"游戏备注\"}}}",
+        "track": {"metadata": {"title": "游戏备注", "artists": ["游戏备注"]}},
+        "id": "游戏备注"
+    });
+    map_api_identity_json(&mut value, &identity);
+
+    assert_eq!(value["requester"], "显示昵称");
+    assert_eq!(value["queue"][0]["friendUsername"], "显示昵称");
+    assert_eq!(value["queue"][0]["requester"], "显示昵称");
+    assert_eq!(value["turtleSoup"]["starter"], "显示昵称");
+    assert_eq!(value["turtleSoup"]["participants"][0], "显示昵称");
+    assert_eq!(value["turtleSoup"]["participants"][1], "未映射用户");
+    assert_eq!(
+        value["turtleSoup"]["recentJudgments"][0]["player"],
+        "显示昵称"
+    );
+    assert_eq!(value["undercover"]["players"][0]["name"], "显示昵称");
+    assert_eq!(value["message"], "显示昵称已加入队列");
+    assert_eq!(value["logs"][0], "显示昵称发起点歌");
+    assert_eq!(value["status"], "游戏备注");
+    let result: Value = serde_json::from_str(value["result"].as_str().unwrap()).unwrap();
+    assert_eq!(result["requester"], "显示昵称");
+    assert_eq!(result["track"]["metadata"]["title"], "游戏备注");
+    assert_eq!(value["track"]["metadata"]["title"], "游戏备注");
+    assert_eq!(value["track"]["metadata"]["artists"][0], "游戏备注");
+    assert_eq!(value["id"], "游戏备注");
+}
+
 fn custom_workflow_service_from_config_parts(
     config: &CustomWorkflowConfig,
     timing: &TimingConfig,

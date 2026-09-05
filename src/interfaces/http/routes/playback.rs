@@ -17,7 +17,9 @@ pub(super) fn status_route(
             status.requester = request.requester;
         }
     }
-    serde_json::to_string(&status).map_err(internal_error)
+    let mut value = serde_json::to_value(status).map_err(internal_error)?;
+    map_api_identity_json(&mut value, &state.live_configs.identity);
+    serde_json::to_string(&value).map_err(internal_error)
 }
 
 pub(super) fn playback_insights_route(
@@ -79,11 +81,12 @@ pub(super) fn playback_insights_route(
             })
         })
         .collect();
-    serde_json::to_string(&json!({
+    let mut value = json!({
         "history": history,
         "cache": cache,
-    }))
-    .map_err(internal_error)
+    });
+    map_api_identity_json(&mut value, &state.live_configs.identity);
+    serde_json::to_string(&value).map_err(internal_error)
 }
 
 /// 磁盘缓存歌曲列表页大小上限。
@@ -667,14 +670,16 @@ pub(super) fn enqueue_remote_song(
 }
 
 pub(super) fn queue_json(state: &HttpSharedState) -> std::result::Result<String, AppError> {
-    serde_json::to_string(
-        &state
+    let mut value = serde_json::to_value(
+        state
             .application
             .queries
             .playback_queue_snapshot()
             .map_err(internal_error)?,
     )
-    .map_err(internal_error)
+    .map_err(internal_error)?;
+    map_api_identity_json(&mut value, &state.live_configs.identity);
+    serde_json::to_string(&value).map_err(internal_error)
 }
 
 pub(super) fn queue_add(

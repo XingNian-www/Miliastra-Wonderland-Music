@@ -39,4 +39,4 @@ idiom_chain:
   allow_anyone_stop: false
 ```
 
-词库随发布包放在 `assets/idioms.txt`，通常不需要修改。调整超时或结束权限后重启程序即可生效。
+词库随发布包放在 `deps/assets/idioms.txt`，通常不需要修改。通过配置中心调整超时或结束权限，保存后会在当前任务结束后自动重载。

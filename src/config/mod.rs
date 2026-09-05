@@ -1474,6 +1474,7 @@ pub struct HttpConfig {
     pub host: String,
     pub port: u16,
     pub enabled: bool,
+    #[serde(default)]
     pub access_token: String,
 }
 
@@ -1830,31 +1831,56 @@ stale_timeout_ms: 7500
             .expect("JSON 往返后的配置必须能通过完整校验");
     }
 
-    /// 读取仓库根 config.yaml 并解析为最小启动配置（BootstrapConfig）。
+    /// 直接解析发布模板，避免测试读取或改写本机启动配置。
     fn bootstrap_config_yaml() -> BootstrapConfig {
-        let config_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.yaml");
-        let executable_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        BootstrapConfig::load(&config_path, executable_root).expect("加载启动配置")
+        serde_yaml::from_str(include_str!("../../config.example.yaml"))
+            .expect("解析发布启动配置模板")
     }
 
     #[test]
-    fn config_yaml_bootstrap_http_logging_match_defaults() {
-        // 仓库根 config.yaml 是最小启动配置：启动时只读 database_path/http/logging
-        // 三个引导字段，完整业务配置由 SQLite 配置中心以 AppConfig::default() 建库。
-        // config.yaml 的 http/logging 必须与 AppConfig::default() 对应段一致，
-        // 保证新库初始化与启动引导同源（http.port 等注入值与默认值不冲突）。
+    fn release_bootstrap_http_logging_match_defaults_without_a_shared_token() {
         let bootstrap = bootstrap_config_yaml();
         let defaults = AppConfig::default();
 
         assert_eq!(bootstrap.http.host, defaults.http.host);
         assert_eq!(bootstrap.http.port, defaults.http.port);
         assert_eq!(bootstrap.http.enabled, defaults.http.enabled);
-        assert!(!bootstrap.http.access_token.trim().is_empty());
+        assert!(bootstrap.http.access_token.is_empty());
+        assert!(bootstrap.http.validate().is_err());
         assert_eq!(
             serde_yaml::to_value(&bootstrap.logging).expect("序列化 logging 段"),
             serde_yaml::to_value(&defaults.logging).expect("序列化默认 logging 段"),
-            "config.yaml 的 logging 段必须与 AppConfig::default() 一致"
+            "发布模板的 logging 段必须与 AppConfig::default() 一致"
         );
+    }
+
+    #[test]
+    fn bootstrap_generates_and_preserves_a_token_when_empty_or_omitted() {
+        let root = std::env::temp_dir().join(format!("bootstrap-token-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let mut previous_token = String::new();
+        for omit_token in [false, true] {
+            let mut value = serde_yaml::to_value(bootstrap_config_yaml()).unwrap();
+            if omit_token {
+                value["http"]
+                    .as_mapping_mut()
+                    .unwrap()
+                    .remove("access_token");
+            }
+            let config_path = root.join("config.yaml");
+            fs::write(&config_path, serde_yaml::to_string(&value).unwrap()).unwrap();
+            let bootstrap = BootstrapConfig::load(&config_path, &root).unwrap();
+            bootstrap.http.validate().unwrap();
+            assert!(uuid::Uuid::parse_str(&bootstrap.http.access_token).is_ok());
+            assert_ne!(bootstrap.http.access_token, previous_token);
+            let reloaded = BootstrapConfig::load(&config_path, &root).unwrap();
+            assert_eq!(bootstrap.http.access_token, reloaded.http.access_token);
+            let persisted: BootstrapConfig =
+                serde_yaml::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+            assert!(persisted.database_path.is_relative());
+            previous_token = bootstrap.http.access_token;
+        }
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -2467,7 +2493,6 @@ stale_timeout_ms: 7500
             "window.focus_point",
             "screen.secondary_back_rect",
             "templates.secondary_back",
-            "http.access_token",
             "logging.rotate_daily",
             "logging.retain_days",
             "friend_delivery.auto_retry_count",

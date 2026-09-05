@@ -147,7 +147,7 @@ impl IdentityAccess {
                     .then(|| (mapping.nickname.clone(), display_name.to_owned()))
             })
             .collect::<Vec<_>>();
-        mappings.sort_by(|left, right| right.0.len().cmp(&left.0.len()));
+        mappings.sort_by_key(|mapping| std::cmp::Reverse(mapping.0.len()));
 
         let mut result = String::with_capacity(text.len());
         let mut remaining = text;

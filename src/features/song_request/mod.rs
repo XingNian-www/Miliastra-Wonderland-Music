@@ -208,6 +208,14 @@ fn parse_with_commands(
     for (prefix, source, ai_assisted) in commands {
         if strip_ascii_case_prefix(command, prefix).is_some() {
             let mut song = parse_with_source(command, prefix, *source, *ai_assisted)?;
+            // 好友默认点歌支持直接发送 B 站 BV 号；仅对明确的“点歌”命令切换音源，
+            // 保持 QQ点歌、搜索及大厅命令的原有语义。
+            if prefix.eq_ignore_ascii_case("点歌") && *source == SongSource::QqMusic {
+                if let Some(bvid) = miliastra_playback::bilibili_normalize_bvid(&song.keyword) {
+                    song.source = SongSource::Bilibili;
+                    song.keyword = bvid;
+                }
+            }
             song.friend_username = username.to_string();
             return Some(song);
         }

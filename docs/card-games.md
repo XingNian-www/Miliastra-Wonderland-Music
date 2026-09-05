@@ -74,4 +74,4 @@ landlord:
   hand_cooldown_seconds: 10
 ```
 
-`enabled` 同时控制斗地主和跑得快。`turn_timeout_seconds` 控制抢地主和出牌的单回合时限；程序会在剩余约 30 秒时发送提醒。修改配置后重启程序生效。
+`enabled` 同时控制斗地主和跑得快。`turn_timeout_seconds` 控制抢地主和出牌的单回合时限；程序会在剩余约 30 秒时发送提醒。通过配置中心修改，保存后会在当前任务结束后自动重载。

@@ -143,8 +143,7 @@ impl MusicPlayerBackend for PlayerRuntimeBackend {
         self.dispatch(PlayerControl::PlayRestored(track.clone(), seek_seconds))
     }
 
-    /// 歌曲级不可播放（无音源/需要VIP/无版权）——这类错误会触发自动换源尝试其他平台；
-    /// 认证/限流/超时等平台级错误不在此列。
+    /// 歌曲级不可播放；登录/请求错误单独分类，限流和超时保留重试语义。
     fn is_track_unavailable_error(&self, error: &anyhow::Error) -> bool {
         matches!(
             error
@@ -152,6 +151,20 @@ impl MusicPlayerBackend for PlayerRuntimeBackend {
                 .and_then(|failure| failure.code.as_deref()),
             Some("track_unavailable" | "track_vip_required" | "track_no_copyright")
         )
+    }
+
+    fn item_scoped_playback_error_message(&self, error: &anyhow::Error) -> Option<&'static str> {
+        match error
+            .downcast_ref::<PlayerControlFailure>()?
+            .code
+            .as_deref()?
+        {
+            "provider_auth_required" => Some("尚未登录，请先登录"),
+            "relogin_required" => Some("登录凭据已失效，请重新登录"),
+            "unknown_provider" => Some("不支持该音乐平台"),
+            "invalid_request" => Some("播放请求无效"),
+            _ => None,
+        }
     }
 
     fn pause(&self) -> Result<String> {
@@ -211,7 +224,7 @@ mod tests {
         }
     }
 
-    struct TrackUnavailableControlPort;
+    struct RejectingControlPort(&'static str);
 
     struct ConstantObservationPort {
         sample: RawPlayerSample,
@@ -223,11 +236,11 @@ mod tests {
         }
     }
 
-    impl PlayerControlPort for TrackUnavailableControlPort {
+    impl PlayerControlPort for RejectingControlPort {
         fn dispatch(&mut self, _control: &PlayerControl) -> ControlDispatch {
             ControlDispatch::immediate(ControlDispatchOutcome::rejected_with_code(
                 "playback failure [track_unavailable]: no playable URL",
-                "track_unavailable",
+                self.0,
             ))
         }
     }
@@ -306,7 +319,7 @@ mod tests {
     fn runtime_backend_preserves_track_unavailable_code() {
         let runtime = PlayerRuntime::start(
             FailingObservationPort,
-            TrackUnavailableControlPort,
+            RejectingControlPort("track_unavailable"),
             EmptySearchPort,
             PlayerRuntimeConfig::default(),
         )
@@ -330,6 +343,41 @@ mod tests {
     }
 
     #[test]
+    fn runtime_backend_distinguishes_rejected_credentials_from_player_failures() {
+        for (code, expected) in [
+            ("relogin_required", Some("登录凭据已失效，请重新登录")),
+            ("provider_auth_required", Some("尚未登录，请先登录")),
+            ("provider_timeout", None),
+            ("provider_rate_limited", None),
+            ("playback_failed", None),
+        ] {
+            let runtime = PlayerRuntime::start(
+                FailingObservationPort,
+                RejectingControlPort(code),
+                EmptySearchPort,
+                PlayerRuntimeConfig::default(),
+            )
+            .unwrap();
+            let backend = PlayerRuntimeBackend::new(runtime.handle());
+            let track = crate::features::playback::test_track(
+                "miliastra://track/kugou/rejected",
+                "Song - Artist",
+            );
+            let error = backend
+                .play(&track, true)
+                .unwrap_err()
+                .context("play dispatch");
+            assert_eq!(
+                backend.item_scoped_playback_error_message(&error),
+                expected,
+                "{code}"
+            );
+            assert!(!backend.is_track_unavailable_error(&error));
+            runtime.shutdown().unwrap();
+        }
+    }
+
+    #[test]
     fn runtime_backend_derives_the_display_uri_from_the_stable_track_key() {
         let track = crate::features::playback::test_track(
             "miliastra://track/netease/track-2",
@@ -344,7 +392,7 @@ mod tests {
             ConstantObservationPort {
                 sample: RawPlayerSample::new(track.clone(), TransportState::Playing),
             },
-            TrackUnavailableControlPort,
+            RejectingControlPort("track_unavailable"),
             EmptySearchPort,
             config,
         )

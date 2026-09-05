@@ -1,6 +1,6 @@
 //! 昵称映射与身份权限。
 //!
-//! OCR 读到的备注昵称精确映射到稳定 UUID 与角色；未映射的昵称一律按路人
+//! OCR 读到的游戏内备注昵称精确映射到角色与对外显示备注；未映射的昵称一律按路人
 //! 处理，不做任何自动归并。权限三级：主人（Owner）> 管理员（Admin）>
 //! 好友（Friend），高级角色包含低级角色的全部权限。
 
@@ -19,13 +19,13 @@ pub enum IdentityRole {
     Owner,
 }
 
-/// 一条映射：OCR 备注昵称 → 稳定 UUID + 角色。
+/// 一条映射：游戏内备注昵称 → 系统标识、角色与对外显示备注。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IdentityMapping {
     /// 游戏内好友备注昵称，与 OCR 结果精确匹配。
     pub nickname: String,
-    /// 内部身份 UUID：仅用于数据库内区分与去重，面板不回显。
+    /// 系统维护的映射标识。
     pub id: Uuid,
     pub role: IdentityRole,
     /// 面板展示用备注（记录这是谁）；旧数据缺失时视为空串。

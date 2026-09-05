@@ -41,7 +41,7 @@ pub trait CredentialRefreshAdapter: Send + Sync + 'static {
 }
 
 pub use crate::domain::Failure;
-pub use bilibili::BilibiliAdapter;
+pub use bilibili::{BilibiliAdapter, bilibili_is_bvid, bilibili_normalize_bvid};
 pub use kugou::{
     KugouAccountStatus, KugouAdapter, KugouListenReport, kugou_calculate_mid, kugou_normalize_guid,
     kugou_register_device,

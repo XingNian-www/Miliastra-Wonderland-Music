@@ -109,7 +109,16 @@ impl UndercoverDeliveryPort for ApplicationRuntime {
     }
 
     fn send_hall_batch(&self, messages: &[String]) -> Result<()> {
-        let refs = messages.iter().map(String::as_str).collect::<Vec<_>>();
+        let mapped = messages
+            .iter()
+            .map(|message| {
+                self.lifecycle
+                    .live_configs
+                    .identity
+                    .replace_display_names(message)
+            })
+            .collect::<Vec<_>>();
+        let refs = mapped.iter().map(String::as_str).collect::<Vec<_>>();
         let help_batch_ms = self
             .lifecycle
             .live_configs

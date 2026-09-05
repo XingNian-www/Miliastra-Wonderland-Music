@@ -1897,7 +1897,7 @@ document.addEventListener('keydown',event=>{
 })
 initToolsPage()
 
-/* ===== 配置中心（阶段 6：Web 配置页面） ===== */
+/* ===== 配置中心 ===== */
 const SECRET_MASK_TEXT='••••••'
 // extra_body 主流模型快速配置（值经官方文档核对；合并到请求体顶层，null 不发送）。
 // OpenAI 兼容平台（Kimi/豆包等）通常无需额外字段，选预设即得到 {}。
@@ -2040,14 +2040,6 @@ function showConfigMessage(text,kind){
   el.classList.remove('hidden')
 }
 function clearConfigMessage(){const el=$('configMessage');if(el)el.classList.add('hidden')}
-// 身份映射随机昵称：6 位、36 字符；剔除 OCR 易混字符和字宽过大的 M/m。
-// 36^6 约为 21.8 亿，攻击者每月仅能改 5 次昵称时，猜中指定映射的概率约为 2.3e-9。
-const REMARK_CHARSET='347ACDEFGHKNPQRTUVWXYacdefhknprtuwxy'
-function randomRemarkNickname(){
-  const bytes=new Uint8Array(6)
-  crypto.getRandomValues(bytes)
-  return [...bytes].map(byte=>REMARK_CHARSET[byte%REMARK_CHARSET.length]).join('')
-}
 function identityRandomUuid(){
   if(typeof crypto.randomUUID==='function')return crypto.randomUUID()
   const bytes=new Uint8Array(16)
@@ -2086,12 +2078,12 @@ function identityRenderTable(){
     const mapping=m&&typeof m==='object'&&!Array.isArray(m)?m:{}
     const role=IDENTITY_ROLE_LABELS[mapping.role]?mapping.role:'friend'
     const select=['friend','admin','owner'].map(r=>'<option value="'+r+'"'+(role===r?' selected':'')+'>'+IDENTITY_ROLE_LABELS[r]+'</option>').join('')
-    return '<tr><td><input value="'+esc(mapping.nickname||'')+'" placeholder="备注昵称" oninput="identityTableSet('+i+',\'nickname\',this.value)"></td>'
-      +'<td><input value="'+esc(mapping.note||'')+'" placeholder="备注（仅面板显示）" oninput="identityTableSet('+i+',\'note\',this.value)"></td>'
+    return '<tr><td><input value="'+esc(mapping.nickname||'')+'" placeholder="游戏内昵称" oninput="identityTableSet('+i+',\'nickname\',this.value)"></td>'
+      +'<td><input value="'+esc(mapping.note||'')+'" placeholder="显示昵称（可选）" oninput="identityTableSet('+i+',\'note\',this.value)"></td>'
       +'<td><select onchange="identityTableSet('+i+',\'role\',this.value)">'+select+'</select></td>'
       +'<td><button type="button" class="btn small warn" onclick="identityTableRemove('+i+')">删除</button></td></tr>'
   }).join('')
-  wrap.innerHTML='<div class="identity-table-wrap"><table class="identity-table"><thead><tr><th>备注昵称</th><th>备注</th><th>角色</th><th></th></tr></thead><tbody>'+(rows||'<tr><td colspan="4" class="identity-empty">暂无映射</td></tr>')+'</tbody></table></div>'
+  wrap.innerHTML='<div class="identity-table-wrap"><table class="identity-table"><thead><tr><th>游戏内昵称</th><th>显示昵称</th><th>角色</th><th></th></tr></thead><tbody>'+(rows||'<tr><td colspan="4" class="identity-empty">暂无映射</td></tr>')+'</tbody></table></div>'
 }
 function identityRepairJsonApply(){
   const repair=$('identityRepairJson');if(!repair)return
@@ -2125,7 +2117,7 @@ function identityAddRow(){
   let nickname=String($('identityNewNickname').value||'').trim()
   const note=String($('identityNewNote').value||'').trim()
   const role=$('identityNewRole').value||'friend'
-  if(!nickname){nickname=randomRemarkNickname()}
+  if(!nickname){showConfigMessage('请输入游戏内昵称','err');return}
   if(items.some(m=>m&&m.nickname===nickname)){showConfigMessage('昵称 '+nickname+' 已存在','err');return}
   if(role==='owner'&&items.some(m=>m&&m.role==='owner')){showConfigMessage('主人只能有一位','err');return}
   items.push({nickname:nickname,id:identityRandomUuid(),role:role,note:note})
@@ -2134,22 +2126,14 @@ function identityAddRow(){
   $('identityNewNickname').value='';$('identityNewNote').value=''
   showConfigMessage('已添加「'+nickname+'」，记得保存','ok')
 }
-async function identityCopyRandomNickname(){
-  const nick=randomRemarkNickname()
-  $('identityNewNickname').value=nick
-  try{await navigator.clipboard.writeText(nick);showConfigMessage('已生成并填入/复制昵称: '+nick,'ok')}
-  catch{showConfigMessage('已生成昵称: '+nick,'ok')}
-}
 function identityMappingsEditor(path,value){
   const id=configControlId(path)
   const text=value==null?'[]':JSON.stringify(value,null,2)
   return '<textarea id="'+id+'" data-cfg="'+path+'" data-cfg-object="1" style="display:none" data-identity-editor="1">'+esc(text)+'</textarea>'
-    +'<div class="identity-add-row"><button type="button" class="btn small" onclick="identityCopyRandomNickname()">生成随机昵称</button>'
-    +'<input id="identityNewNickname" placeholder="备注昵称（留空自动随机）">'
-    +'<input id="identityNewNote" placeholder="备注（可选）">'
+    +'<div class="identity-add-row"><input id="identityNewNickname" placeholder="游戏内昵称">'
+    +'<input id="identityNewNote" placeholder="显示昵称（可选）">'
     +'<select id="identityNewRole"><option value="friend">好友</option><option value="admin">管理员</option><option value="owner">主人</option></select>'
     +'<button type="button" class="btn small primary" onclick="identityAddRow()">添加</button></div>'
-    +'<div class="config-field-hint">添加时自动生成 UUID 用于内部区分，任何页面都不显示该编号；昵称建议用随机值并同步改游戏内好友备注。</div>'
     +'<div id="'+id+'-table" style="margin-top:8px"></div>'
 }
 function configSectionByName(name){return (configSchema||[]).find(s=>s.name===name)}
@@ -2316,7 +2300,7 @@ function configControlHtml(field,value){
     const text=value==null?'':JSON.stringify(value,null,2)
     const placeholder=field.nullable?'null 表示未启用；填入 JSON 对象以启用':'必须是 JSON 对象'
     let html=''
-    // 身份映射：行式表格编辑器；UUID 不回显，隐藏 textarea 承载提交 JSON。
+    // 身份映射：行式表格编辑器；隐藏 textarea 承载提交 JSON。
     if(field.path==='identity.mappings')return identityMappingsEditor(path, value)
     // 点歌 AI 使用服务商专属结构化控件；只有 custom 保留自由 JSON。
     if(field.path==='ai.extra_body')return aiExtraBodyEditor(path,value)

@@ -89,6 +89,7 @@ struct ChatObservationState {
     visual_session: VisualSessionId,
     next_bubble_sequence: u64,
     primary_visible: Vec<PrimaryTrackedMessage>,
+    primary_partial: Vec<PrimaryTrackedMessage>,
     primary_initialized: bool,
     ledger: ChatObservationLedger,
     completion_advances: SharedObservationStream<CompletionAdvance>,
@@ -121,6 +122,7 @@ impl ChatObservationShared {
                 visual_session: VisualSessionId::new(1),
                 next_bubble_sequence: 1,
                 primary_visible: Vec::new(),
+                primary_partial: Vec::new(),
                 primary_initialized: false,
                 ledger: ChatObservationLedger::new(),
                 completion_advances: SharedObservationStream::new(
@@ -146,17 +148,7 @@ impl ChatObservationShared {
         if (PRIMARY_VISIBLE_MIN_MESSAGES..=PRIMARY_VISIBLE_MAX_MESSAGES).contains(&messages.len()) {
         } else if !messages.is_empty() {
             log::debug!("一级聊天本轮只识别到 {} 条消息，直接保留", messages.len());
-            // 区间外非空帧（典型为滚动瞬间的单条）：消息照常分配临时 id
-            // 派发执行，但不覆盖序列锚点，避免残影帧使下一帧匹配失效、
-            // 历史消息 id 断裂后重复识别。
-            let observed = messages
-                .into_iter()
-                .map(|message| PrimaryObservedMessage {
-                    id: new_primary_tracked_message(&mut state, &message, false).id,
-                    message,
-                    is_new: true,
-                })
-                .collect();
+            let observed = track_primary_partial_messages(&mut state, messages);
             let dispatches = Self::publish_locked(
                 &mut state,
                 ChatObservation::Primary {
@@ -227,15 +219,19 @@ impl ChatObservationShared {
             .state
             .lock()
             .map_err(|_| anyhow!("聊天观察流状态锁已损坏"))?;
-        let Some(message) = state
-            .primary_visible
-            .iter_mut()
-            .find(|message| &message.id == id)
-        else {
-            return Ok(false);
-        };
-        message.handled = true;
-        Ok(true)
+        let ChatObservationState {
+            primary_visible,
+            primary_partial,
+            ..
+        } = &mut *state;
+        let mut acknowledged = false;
+        for message in primary_visible.iter_mut().chain(primary_partial.iter_mut()) {
+            if &message.id == id {
+                message.handled = true;
+                acknowledged = true;
+            }
+        }
+        Ok(acknowledged)
     }
 
     pub(crate) fn publish_secondary(
@@ -325,6 +321,7 @@ impl ChatObservationShared {
         state.visual_session = VisualSessionId::new(next);
         state.next_bubble_sequence = 1;
         state.primary_visible.clear();
+        state.primary_partial.clear();
         state.primary_initialized = false;
         Ok(state.visual_session)
     }
@@ -414,11 +411,79 @@ fn track_primary_messages(
     state: &mut ChatObservationState,
     messages: Vec<ChatMessage>,
 ) -> Vec<PrimaryObservedMessage> {
+    let partial = std::mem::take(&mut state.primary_partial);
+    state.primary_initialized |= !partial.is_empty();
+    let first_new_sequence = state.next_bubble_sequence;
+    let mut observed = track_primary_sequence(state, messages, true);
+    reuse_primary_message_ids(state, &mut observed, &partial, first_new_sequence);
+    observed
+}
+
+fn track_primary_partial_messages(
+    state: &mut ChatObservationState,
+    messages: Vec<ChatMessage>,
+) -> Vec<PrimaryObservedMessage> {
+    // Keep the full-frame anchor while retaining identities that can be acknowledged.
+    let anchor = std::mem::take(&mut state.primary_visible);
+    let initialized = state.primary_initialized;
+    state.primary_visible = if state.primary_partial.is_empty() {
+        anchor.clone()
+    } else {
+        std::mem::take(&mut state.primary_partial)
+    };
+    state.primary_initialized = true;
+    let first_new_sequence = state.next_bubble_sequence;
+    let mut observed = track_primary_sequence(state, messages, false);
+    reuse_primary_message_ids(state, &mut observed, &anchor, first_new_sequence);
+    state.primary_partial = std::mem::replace(&mut state.primary_visible, anchor);
+    state.primary_initialized = initialized;
+    observed
+}
+
+fn reuse_primary_message_ids(
+    state: &mut ChatObservationState,
+    observed: &mut [PrimaryObservedMessage],
+    previous: &[PrimaryTrackedMessage],
+    first_new_sequence: u64,
+) {
+    let mut used_ids = observed
+        .iter()
+        .map(|message| message.id.clone())
+        .collect::<Vec<_>>();
+    for (index, (message, tracked)) in observed
+        .iter_mut()
+        .zip(state.primary_visible.iter_mut())
+        .enumerate()
+    {
+        if message.id.bubble_sequence.get() < first_new_sequence {
+            continue;
+        }
+        // Match each old bubble once so an appended identical command stays new.
+        let Some(previous) = previous.iter().find(|previous| {
+            previous.message_type == tracked.message_type
+                && previous.text_key == tracked.text_key
+                && !used_ids.contains(&previous.id)
+        }) else {
+            continue;
+        };
+        tracked.id = previous.id.clone();
+        tracked.handled = previous.handled;
+        message.id = previous.id.clone();
+        message.is_new = !previous.handled;
+        used_ids[index] = previous.id.clone();
+    }
+}
+
+fn track_primary_sequence(
+    state: &mut ChatObservationState,
+    messages: Vec<ChatMessage>,
+    allow_ocr_revision: bool,
+) -> Vec<PrimaryObservedMessage> {
     if !state.primary_initialized {
         return establish_primary_baseline(state, messages);
     }
 
-    let Some(overlap) = primary_suffix_prefix_overlap(state, &messages) else {
+    let Some(overlap) = primary_suffix_prefix_overlap(state, &messages, allow_ocr_revision) else {
         log::debug!("一级聊天当前画面无法与旧画面可靠对应，立即按内容重建基线");
         return rebase_primary_baseline(state, messages);
     };
@@ -576,6 +641,7 @@ fn is_cjk(character: char) -> bool {
 fn primary_suffix_prefix_overlap(
     state: &ChatObservationState,
     current: &[ChatMessage],
+    allow_ocr_revision: bool,
 ) -> Option<usize> {
     let previous = &state.primary_visible;
     let maximum = previous.len().min(current.len());
@@ -596,7 +662,12 @@ fn primary_suffix_prefix_overlap(
                         )
                     }),
             );
-            score.is_reliable().then_some((overlap, score))
+            let reliable = if allow_ocr_revision {
+                score.is_reliable()
+            } else {
+                score.exact == overlap
+            };
+            reliable.then_some((overlap, score))
         })
         .max_by_key(|(overlap, score)| (score.weight(), score.exact, *overlap))
         .map(|(overlap, _)| overlap)
@@ -870,10 +941,105 @@ mod tests {
     }
 
     #[test]
-    fn primary_empty_frame_dispatches_no_messages() {
+    fn primary_partial_frame_retains_an_already_handled_message() {
         let shared = ChatObservationShared::new();
+        let baseline = publish_primary(
+            &shared,
+            vec![message_at("旧消息", 0, 10), message_at("@状态", 20, 20)],
+        );
+        let command_id = primary_messages(&baseline)[1].id.clone();
+
+        let partial = publish_primary(&shared, vec![message_at("@状态", 0, 20)]);
+
+        assert_eq!(primary_messages(&partial)[0].id, command_id);
+        assert!(!primary_messages(&partial)[0].is_new);
+    }
+
+    #[test]
+    fn primary_partial_frame_does_not_merge_similar_commands() {
+        let shared = ChatObservationShared::new();
+        let baseline = publish_primary(
+            &shared,
+            vec![message_at("旧消息", 0, 10), message_at("@帮助", 20, 20)],
+        );
+        let mut previous_id = primary_messages(&baseline)[1].id.clone();
+
+        for text in ["@下一首", "@上一首"] {
+            let partial = publish_primary(&shared, vec![message_at(text, 0, 30)]);
+            let command = &primary_messages(&partial)[0];
+            assert_ne!(command.id, previous_id);
+            assert!(command.is_new);
+            assert!(shared.acknowledge_primary(&command.id).unwrap());
+            previous_id = command.id.clone();
+        }
+    }
+
+    #[test]
+    fn primary_partial_frame_message_keeps_identity_when_full_frame_returns() {
+        let shared = ChatObservationShared::new();
+        publish_primary(
+            &shared,
+            vec![message_at("旧消息", 0, 10), message_at("旧命令", 20, 20)],
+        );
+        let partial = publish_primary(&shared, vec![message_at("@状态", 0, 30)]);
+        let command_id = primary_messages(&partial)[0].id.clone();
+        assert!(primary_messages(&partial)[0].is_new);
+        assert!(shared.acknowledge_primary(&command_id).unwrap());
+
         let empty = publish_primary(&shared, Vec::new());
         assert!(primary_messages(&empty).is_empty());
+        let repeated = publish_primary(&shared, vec![message_at("@状态", 10, 30)]);
+        assert_eq!(primary_messages(&repeated)[0].id, command_id);
+        assert!(!primary_messages(&repeated)[0].is_new);
+
+        let restored = publish_primary(
+            &shared,
+            vec![message_at("旧命令", 0, 20), message_at("@状态", 20, 30)],
+        );
+        assert_eq!(primary_messages(&restored)[1].id, command_id);
+        assert!(!primary_messages(&restored)[1].is_new);
+
+        let appended = publish_primary(
+            &shared,
+            vec![message_at("@状态", 0, 30), message_at("@状态", 20, 30)],
+        );
+        assert_eq!(primary_messages(&appended)[0].id, command_id);
+        assert!(!primary_messages(&appended)[0].is_new);
+        assert_ne!(primary_messages(&appended)[1].id, command_id);
+        assert!(primary_messages(&appended)[1].is_new);
+    }
+
+    #[test]
+    fn primary_partial_frame_with_extra_markers_keeps_new_bubble_multiplicity() {
+        let shared = ChatObservationShared::new();
+        publish_primary(
+            &shared,
+            vec![message_at("旧消息", 0, 10), message_at("旧命令", 20, 20)],
+        );
+        let expanded = vec![
+            message_at("旧消息", 0, 10),
+            message_at("旧命令", 20, 20),
+            message_at("聊天甲", 40, 30),
+            message_at("聊天乙", 60, 40),
+            message_at("聊天丙", 80, 50),
+            message_at("@状态", 100, 60),
+        ];
+        let first = publish_primary(&shared, expanded.clone());
+        let command_id = primary_messages(&first)[5].id.clone();
+        assert!(shared.acknowledge_primary(&command_id).unwrap());
+
+        let repeated = publish_primary(&shared, expanded.clone());
+        assert_eq!(primary_messages(&repeated)[5].id, command_id);
+        assert!(!primary_messages(&repeated)[5].is_new);
+
+        let mut appended = expanded;
+        appended.remove(0);
+        appended.push(message_at("@状态", 120, 60));
+        let appended = publish_primary(&shared, appended);
+        assert_eq!(primary_messages(&appended)[4].id, command_id);
+        assert!(!primary_messages(&appended)[4].is_new);
+        assert_ne!(primary_messages(&appended)[5].id, command_id);
+        assert!(primary_messages(&appended)[5].is_new);
     }
 
     #[test]

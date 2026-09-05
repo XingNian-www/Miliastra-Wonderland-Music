@@ -69,7 +69,7 @@ pub fn get_text() -> Result<Option<String>> {
 pub fn set_text(text: &str) -> Result<()> {
     use std::ptr::copy_nonoverlapping;
 
-    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Foundation::{GlobalFree, HANDLE};
     use windows::Win32::System::DataExchange::{EmptyClipboard, OpenClipboard, SetClipboardData};
     use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
 
@@ -87,12 +87,16 @@ pub fn set_text(text: &str) -> Result<()> {
         let memory = GlobalAlloc(GMEM_MOVEABLE, byte_len).context("allocate clipboard memory")?;
         let locked = GlobalLock(memory);
         if locked.is_null() {
+            let _ = GlobalFree(Some(memory));
             bail!("lock clipboard memory failed");
         }
         copy_nonoverlapping(wide.as_ptr(), locked.cast::<u16>(), wide.len());
         let _ = GlobalUnlock(memory);
 
-        SetClipboardData(CF_UNICODETEXT, Some(HANDLE(memory.0))).context("set clipboard data")?;
+        if let Err(error) = SetClipboardData(CF_UNICODETEXT, Some(HANDLE(memory.0))) {
+            let _ = GlobalFree(Some(memory));
+            return Err(error).context("set clipboard data");
+        }
     }
 
     Ok(())

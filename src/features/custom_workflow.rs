@@ -268,11 +268,6 @@ impl CustomWorkflowCommand {
         let identity = self.lock_identity();
         format!("custom_workflow:{}:{}", identity.workflow, identity.args)
     }
-
-    #[cfg(test)]
-    pub fn same_request(&self, other: &Self) -> bool {
-        self.lock_identity() == other.lock_identity()
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -350,7 +345,7 @@ pub struct CustomWorkflowService {
 }
 
 impl CustomWorkflowService {
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn new(config: CustomWorkflowConfig, defaults: WorkflowDefaults) -> Self {
         Self {
             config: Arc::new(RwLock::new(config)),
@@ -369,11 +364,6 @@ impl CustomWorkflowService {
         self.config
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    #[allow(dead_code)]
-    pub fn enabled(&self) -> bool {
-        self.config().enabled
     }
 
     pub fn claims_chat(&self, envelope: &CommandEnvelope) -> bool {
@@ -1823,7 +1813,7 @@ mod tests {
     }
 
     #[test]
-    fn lock_identity_matches_previous_normalized_semantics() {
+    fn lock_key_normalizes_workflow_and_arguments() {
         let first = CustomWorkflowCommand {
             name: "ignored".to_string(),
             workflow: " Test-Flow ".to_string(),
@@ -1835,7 +1825,7 @@ mod tests {
             args: "a b".to_string(),
         };
 
-        assert!(first.same_request(&second));
+        assert_eq!(first.lock_key(), second.lock_key());
         assert_eq!(first.lock_key(), "custom_workflow:testflow:ab");
     }
 

@@ -213,39 +213,6 @@ impl PlaybackExecutionPort for ApplicationRuntime {
             .map_err(playback_search_failure)
     }
 
-    fn ai_search_and_pick(
-        &mut self,
-        keyword: &str,
-        source: &str,
-        prefer_accompaniment: bool,
-    ) -> std::result::Result<Option<PlaybackPickedCandidate>, PlaybackSearchFailure> {
-        if !self.business.ai.enabled() {
-            return Err(PlaybackSearchFailure::Unavailable(
-                "点歌 AI 未启用".to_string(),
-            ));
-        }
-        let candidates = self
-            .playback
-            .player_search
-            .search_candidates(keyword, source)
-            .map_err(playback_search_failure)?;
-        if candidates.is_empty() {
-            return Ok(None);
-        }
-        let (candidate, _pick) = select_ai_candidate(
-            &self.business.ai,
-            keyword,
-            prefer_accompaniment,
-            &candidates,
-        )
-        .map_err(|error| PlaybackSearchFailure::Backend(error.to_string()))?;
-        Ok(Some(PlaybackPickedCandidate {
-            track: candidate.playable_track(),
-            text: candidate.text,
-            candidate_snapshot: candidates,
-        }))
-    }
-
     fn song_dedup_limited(&mut self, request: &PlaybackRequest) -> Result<bool> {
         self.playback.player.song_dedup_limited(request)
     }

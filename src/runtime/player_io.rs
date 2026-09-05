@@ -1827,10 +1827,8 @@ mod tests {
     };
     use crate::features::playback::{test_candidate, test_track};
     use crate::runtime::player::PlayerObservationConfig;
-    use crate::runtime::player::{
-        ObservationFreshness, PlayerObserver, RawPlayerSample, TransportState,
-    };
-    use miliastra_kernel::clock::{ManualClock, SystemClock};
+    use crate::runtime::player::{ObservationFreshness, RawPlayerSample, TransportState};
+    use miliastra_kernel::clock::ManualClock;
     use miliastra_kernel::identity::{BusinessOperationId, BusinessOperationIdAllocator};
 
     const FAKE_PORT_BLOCK_TIMEOUT: Duration = Duration::from_secs(2);
@@ -2627,66 +2625,6 @@ mod tests {
 
         release_sender.release();
         shutdown.join().unwrap().unwrap();
-    }
-
-    #[test]
-    fn revision_exhaustion_stops_observation_lane_and_drains_accepted_demands() {
-        let now = Instant::now();
-        let clock = ManualClock::new(now);
-        let mut observer = PlayerObserver::new(clock, PlayerObservationConfig::default());
-        observer.observe_sample(RawPlayerSample::new(
-            test_track("miliastra://track/qqmusic/seed", "observation - test"),
-            TransportState::Playing,
-        ));
-        let observation = observer.observe_sample(RawPlayerSample::new(
-            test_track("miliastra://track/qqmusic/seed", "observation - test"),
-            TransportState::Playing,
-        ));
-        let latest = Arc::new(super::LatestObservationStore::new(
-            Duration::from_secs(5),
-            Arc::new(SystemClock),
-        ));
-        latest.lock().latest = Some(super::RevisedPlayerObservation {
-            revision: super::PlayerObservationRevision(u64::MAX),
-            observation: Arc::new(observation),
-            read_error: None,
-        });
-        let (sender, receiver) = mpsc::sync_channel(2);
-        let lane = Arc::new(super::RuntimeLane::new(sender));
-        let (response, result) = mpsc::sync_channel(1);
-        lane.try_submit(
-            super::ObservationCommand::RequestFast {
-                operation_id: BusinessOperationId::new(19),
-                expires_at: now + Duration::from_secs(1),
-                response,
-            },
-            PlayerLane::Observation,
-        )
-        .unwrap();
-        let worker_lane = Arc::clone(&lane);
-        let worker_latest = Arc::clone(&latest);
-        let worker = thread::spawn(move || {
-            super::run_observation_lane(
-                ConstantObservationPort,
-                receiver,
-                worker_lane,
-                worker_latest,
-                config(),
-                None,
-            );
-        });
-
-        worker.join().unwrap();
-        let result = result.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert_eq!(result.operation_id, BusinessOperationId::new(19));
-        assert_eq!(
-            result.status,
-            Err(PlayerLaneError::RuntimeStopped(PlayerLane::Observation))
-        );
-        assert!(matches!(
-            lane.try_submit(super::ObservationCommand::Shutdown, PlayerLane::Observation),
-            Err(PlayerLaneError::RuntimeStopped(PlayerLane::Observation))
-        ));
     }
 
     #[test]

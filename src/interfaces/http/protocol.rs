@@ -72,6 +72,7 @@ use crate::features::custom_workflow::CustomWorkflowService;
 #[cfg(test)]
 use crate::features::custom_workflow::WorkflowDefaults;
 use crate::features::hall::{HallCommand, HallMutationIntent, HallMutationOutcome, HallStatePatch};
+use crate::features::identity::IdentityAccess;
 use crate::features::invite::InviteConfig;
 use crate::features::moderation::ModerationConfig;
 #[cfg(test)]
@@ -699,6 +700,103 @@ struct Request {
 struct AppError {
     status: u16,
     message: String,
+}
+
+/// Apply the configured public display names to JSON returned by the HTTP API.
+/// Internal game nicknames remain unchanged in commands, targeting and permission checks.
+pub(super) fn map_api_identity_json(value: &mut serde_json::Value, identity: &IdentityAccess) {
+    fn visit(value: &mut serde_json::Value, identity: &IdentityAccess, parent_key: Option<&str>) {
+        match value {
+            serde_json::Value::Object(object) => {
+                for (key, child) in object.iter_mut() {
+                    if matches!(
+                        key.as_str(),
+                        "requester"
+                            | "friendUsername"
+                            | "player"
+                            | "starter"
+                            | "sender"
+                            | "username"
+                    ) || (parent_key == Some("players") && key == "name")
+                    {
+                        map_exact(child, identity);
+                    } else if matches!(
+                        key.as_str(),
+                        "participants" | "logs" | "messages" | "commands" | "pendingTasks"
+                    ) {
+                        map_text_collection(child, identity);
+                    } else if key == "message" {
+                        map_text(child, identity);
+                    } else if key == "result" {
+                        map_result(child, identity);
+                    } else if key == "label"
+                        && matches!(
+                            parent_key,
+                            Some("tasks") | Some("webTools") | Some("decision")
+                        )
+                    {
+                        map_text(child, identity);
+                    } else {
+                        visit(child, identity, Some(key));
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for child in items {
+                    visit(child, identity, parent_key);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn map_exact(value: &mut serde_json::Value, identity: &IdentityAccess) {
+        if let serde_json::Value::String(text) = value {
+            *text = identity.display_name(text);
+        } else {
+            visit(value, identity, None);
+        }
+    }
+
+    fn map_text(value: &mut serde_json::Value, identity: &IdentityAccess) {
+        if let serde_json::Value::String(text) = value {
+            *text = identity.replace_display_names(text);
+        } else {
+            visit(value, identity, None);
+        }
+    }
+
+    fn map_text_collection(value: &mut serde_json::Value, identity: &IdentityAccess) {
+        match value {
+            serde_json::Value::String(text) => *text = identity.replace_display_names(text),
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    map_text_collection(item, identity);
+                }
+            }
+            _ => visit(value, identity, None),
+        }
+    }
+
+    // Diagnostic task results are often JSON encoded in a string. Decode and map
+    // structured results first so a display name containing quotes cannot corrupt
+    // the embedded JSON; plain text results still receive the normal replacement.
+    fn map_result(value: &mut serde_json::Value, identity: &IdentityAccess) {
+        let serde_json::Value::String(text) = value else {
+            visit(value, identity, Some("result"));
+            return;
+        };
+        if let Ok(mut nested) = serde_json::from_str::<serde_json::Value>(text) {
+            visit(&mut nested, identity, None);
+            if let Ok(mapped) = serde_json::to_string(&nested) {
+                *text = mapped;
+                return;
+            }
+        }
+        *text = identity.replace_display_names(text);
+    }
+
+    visit(value, identity, None);
 }
 
 #[derive(Clone, Copy, Debug)]

@@ -70,7 +70,9 @@ pub(super) fn tool_task_route(
             status: 404,
             message: "Web 工具任务不存在或已过期".to_string(),
         })?;
-    serde_json::to_string(&snapshot).map_err(internal_error)
+    let mut value = serde_json::to_value(snapshot).map_err(internal_error)?;
+    map_api_identity_json(&mut value, &state.live_configs.identity);
+    serde_json::to_string(&value).map_err(internal_error)
 }
 
 pub(super) fn tool_templates_route(
@@ -303,7 +305,9 @@ pub(super) fn enqueue_web_tool(
             },
             message: error.to_string(),
         })?;
-    serde_json::to_string(&snapshot).map_err(internal_error)
+    let mut value = serde_json::to_value(snapshot).map_err(internal_error)?;
+    map_api_identity_json(&mut value, &state.live_configs.identity);
+    serde_json::to_string(&value).map_err(internal_error)
 }
 
 pub(super) fn parse_tool_id(query: &[(String, String)]) -> std::result::Result<u64, AppError> {
@@ -486,14 +490,15 @@ pub(super) fn state_json(state: &HttpSharedState) -> std::result::Result<String,
         .queries
         .hall_state_snapshot()
         .map_err(internal_error)?;
-    serde_json::to_string(&json!({
+    let mut value = json!({
         "playback": playback,
         "hallRemainingMinutes": hall.remaining_minutes,
         "hallRemainingUpdatedAt": hall.remaining_updated_at,
         "hallExpiringWarningSent": hall.expiring_warning_sent,
         "hallRemainingMinutesNow": hall.remaining_minutes_now(),
-    }))
-    .map_err(internal_error)
+    });
+    map_api_identity_json(&mut value, &state.live_configs.identity);
+    serde_json::to_string(&value).map_err(internal_error)
 }
 
 pub(super) fn state_save(
@@ -526,7 +531,9 @@ pub(super) fn history_json(state: &HttpSharedState) -> std::result::Result<Strin
         .history
         .lock()
         .map_err(|_| internal_message("历史锁已损坏"))?;
-    serde_json::to_string(&*history).map_err(internal_error)
+    let mut value = serde_json::to_value(&*history).map_err(internal_error)?;
+    map_api_identity_json(&mut value, &state.live_configs.identity);
+    serde_json::to_string(&value).map_err(internal_error)
 }
 
 pub(super) fn clear_history(state: &HttpSharedState) -> std::result::Result<String, AppError> {
@@ -620,7 +627,9 @@ pub(super) fn encoded_screenshot_response(
 }
 
 pub(super) fn monitor_json(state: &HttpSharedState) -> std::result::Result<String, AppError> {
-    serde_json::to_string(&state.monitor.snapshot()).map_err(internal_error)
+    let mut value = serde_json::to_value(state.monitor.snapshot()).map_err(internal_error)?;
+    map_api_identity_json(&mut value, &state.live_configs.identity);
+    serde_json::to_string(&value).map_err(internal_error)
 }
 
 pub(super) fn hall_state_patch(

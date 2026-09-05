@@ -3,7 +3,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use miliastra_playback::{
     AudioCacheStats, AudioCacheTrackStatus, CachedTrackPage, CredentialStatus, LoginSession,
-    PlayableTrack, PlaybackHandle, ProviderId, TrackKey,
+    PlayableTrack, PlaybackHandle, ProviderId, TrackKey, bilibili_is_bvid,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -541,7 +541,7 @@ fn is_ascii_alphanumeric(value: &str) -> bool {
 }
 
 fn is_bilibili_bvid(value: &str) -> bool {
-    value.starts_with("BV") && (8..=32).contains(&value.len()) && is_ascii_alphanumeric(value)
+    bilibili_is_bvid(value)
 }
 
 #[derive(Clone)]

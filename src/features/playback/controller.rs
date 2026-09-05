@@ -37,6 +37,10 @@ pub(crate) trait MusicPlayerBackend: Clone + Send + Sync + 'static {
     fn is_track_unavailable_error(&self, _error: &anyhow::Error) -> bool {
         false
     }
+    /// A rejected source/request can be skipped without declaring the player unusable.
+    fn item_scoped_playback_error_message(&self, _error: &anyhow::Error) -> Option<&'static str> {
+        None
+    }
     fn pause(&self) -> Result<String>;
     fn resume(&self) -> Result<String>;
     fn set_volume(&self, volume: &str) -> Result<String>;
@@ -310,8 +314,8 @@ pub(crate) enum PlaybackOutcome {
     /// A deterministic failure of this Song Request only.  The queue may
     /// discard it after the outcome is recorded and consider the next item.
     ItemScopedFailure,
-    /// The player, provider, credentials, or recovery state is not known to
-    /// be usable for the next request.  Keep the queue head for retry/skip.
+    /// The player or recovery state is not known to be usable for the next
+    /// request. Keep the queue head for retry/skip.
     QueueBlockingFailure,
     DedupLimited,
 }
@@ -469,6 +473,13 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
 
     pub(crate) fn is_track_unavailable_error(&self, error: &anyhow::Error) -> bool {
         self.backend.is_track_unavailable_error(error)
+    }
+
+    pub(crate) fn item_scoped_playback_error_message(
+        &self,
+        error: &anyhow::Error,
+    ) -> Option<&'static str> {
+        self.backend.item_scoped_playback_error_message(error)
     }
 
     pub(crate) fn clear_active_request(&self) -> Result<()> {

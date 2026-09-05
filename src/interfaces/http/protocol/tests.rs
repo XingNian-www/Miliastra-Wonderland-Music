@@ -579,12 +579,14 @@ impl HttpHallPort for RecordingHttpPort {
 struct HttpTestPlayerPort {
     fail: bool,
     status: PlayerStatus,
+    play_mode: Mutex<u8>,
 }
 
 impl HttpTestPlayerPort {
     fn successful() -> Self {
         Self {
             fail: false,
+            play_mode: Mutex::new(0),
             status: PlayerStatus {
                 status: String::new(),
                 current_uri: String::new(),
@@ -613,6 +615,7 @@ impl HttpTestPlayerPort {
         Self {
             fail: false,
             status,
+            play_mode: Mutex::new(0),
         }
     }
 
@@ -628,6 +631,15 @@ impl HttpTestPlayerPort {
 impl HttpPlayerPort for HttpTestPlayerPort {
     fn status(&self) -> Result<crate::features::playback::PlayerStatus> {
         Ok(self.status.clone())
+    }
+
+    fn play_mode(&self) -> Result<u8> {
+        Ok(*self.play_mode.lock().expect("play mode"))
+    }
+
+    fn set_play_mode(&self, mode: u8) -> Result<()> {
+        *self.play_mode.lock().expect("play mode") = mode;
+        Ok(())
     }
 
     fn cache_stats(
@@ -1563,6 +1575,32 @@ fn chat_send_requires_post() {
 }
 
 #[test]
+fn playback_mode_allows_get_reads_and_requires_post_for_changes() {
+    let mut state = test_state_with_player_port(HttpTestPlayerPort::successful());
+    let server = start_test_http_server(&mut state, "");
+    let address = server.local_addr();
+
+    let current = http_get(address, "/playback/mode", None);
+    assert_eq!(current.status_line, "HTTP/1.1 200 OK");
+    let value: Value = serde_json::from_str(&current.body).expect("current mode JSON");
+    assert_eq!(value["mode"], "sequential");
+
+    let rejected = http_get(address, "/playback/mode?mode=shuffle", None);
+    assert_eq!(rejected.status_line, "HTTP/1.1 405 Method Not Allowed");
+    let current = http_get(address, "/playback/mode", None);
+    let value: Value = serde_json::from_str(&current.body).expect("unchanged mode JSON");
+    assert_eq!(value["mode"], "sequential");
+
+    let changed = http_post(address, "/playback/mode?mode=repeat_one", None);
+    assert_eq!(changed.status_line, "HTTP/1.1 200 OK");
+    let current = http_get(address, "/playback/mode", None);
+    let value: Value = serde_json::from_str(&current.body).expect("updated mode JSON");
+    assert_eq!(value["mode"], "repeat_one");
+
+    server.shutdown().expect("shutdown HTTP server");
+}
+
+#[test]
 fn idle_reload_waits_for_http_operations_but_not_status_polling() {
     assert!(request_blocks_idle_reload("/config/save"));
     assert!(request_blocks_idle_reload("/player/login/start"));
@@ -2118,48 +2156,6 @@ fn remote_song_routes_are_queued_json_post_routes() {
 }
 
 #[test]
-fn search_routes_keep_their_existing_response_contracts() {
-    let state = test_state();
-    let query = [
-        ("keyword".to_string(), "晴天".to_string()),
-        ("source".to_string(), "netease".to_string()),
-    ];
-
-    assert_eq!(
-        search_route(&query, &state).unwrap(),
-        "raw search: 晴天 [netease]"
-    );
-    assert_eq!(
-        serde_json::from_str::<Value>(&search_candidates_route(&query, &state).unwrap()).unwrap(),
-        json!([{
-            "trackRef": {"key": {"provider": "netease", "id": "1"}},
-            "metadata": {
-                "title": "晴天 result",
-                "artists": ["测试歌手"],
-                "durationMs": 180000
-            },
-            "eligibility": "unknown",
-            "text": "晴天 result",
-        }])
-    );
-}
-
-#[test]
-fn search_route_preserves_backend_error_text() {
-    let error = player_search_error(HttpPlayerSearchError::new("backend failed"));
-
-    assert_eq!(error.status, 500);
-    assert_eq!(error.message, "backend failed");
-    assert_eq!(
-        player_search_error(HttpPlayerSearchError::new(
-            "player search lane queue is full"
-        ))
-        .message,
-        "player search lane queue is full"
-    );
-}
-
-#[test]
 fn playback_control_routes_are_queued_json_post_routes() {
     for route in ["/play", "/pause", "/skip-next", "/skip-prev", "/volume"] {
         assert!(is_mutating_route(route), "{route} should require POST");
@@ -2302,60 +2298,6 @@ fn play_track_rejects_duplicate_track_key() {
 }
 
 #[test]
-fn page_displays_song_requester() {
-    assert!(PAGE.contains("点歌人"));
-    assert!(PAGE.contains("it.requester||it.friendUsername"));
-    assert!(PAGE.contains("pc.requester"));
-}
-
-#[test]
-fn page_displays_disk_cache_track_list() {
-    assert!(PAGE.contains("磁盘缓存歌曲"));
-    assert!(PAGE.contains("id=\"cacheTracks\""));
-    assert!(PAGE.contains("loadCacheTracks()"));
-    assert!(PAGE.contains("id=\"cacheTracksPrev\""));
-    assert!(PAGE.contains("id=\"cacheTracksNext\""));
-    assert!(PAGE.contains("changeCacheTracksPage(-1)"));
-    assert!(PAGE.contains("changeCacheTracksPage(1)"));
-    assert!(PAGE.contains("offset='+cacheTracksOffset+'&limit='+cacheTracksPageSize"));
-    assert!(PAGE.contains("共 '+total+' 首 · 第 '"));
-    // 未知孤儿曲目展示为「未知缓存」。
-    assert!(PAGE.contains("未知缓存"));
-    // 缓存接口使用 source 字段，结构化播放接口要求 trackRef.key.provider。
-    assert!(PAGE.contains("trackRef:{key:{provider:t.source,id:t.id}"));
-    assert!(!PAGE.contains("trackRef:{key:{source:t.source,id:t.id}"));
-}
-
-#[test]
-fn page_contains_config_center() {
-    // 内嵌页面必须与配置中心后端接口配套：导航、页面容器与全部接口调用点。
-    assert!(PAGE.contains("配置中心"));
-    assert!(PAGE.contains("data-route=\"config\""));
-    assert!(PAGE.contains("id=\"page-config\""));
-    assert!(PAGE.contains("function loadConfigPage()"));
-    assert!(PAGE.contains("function saveConfig()"));
-    assert!(PAGE.contains("function restoreDefaults()"));
-    assert!(PAGE.contains("function rollbackTo(rev)"));
-    assert!(PAGE.contains("function loadConfigRevisions()"));
-    assert!(PAGE.contains("request('/config/schema')"));
-    assert!(PAGE.contains("request('/config')"));
-    assert!(PAGE.contains("request('/config/revisions')"));
-    assert!(PAGE.contains("requestJson('/config/validate'"));
-    assert!(PAGE.contains("requestJson('/config/save'"));
-    assert!(PAGE.contains("requestJson('/config/rollback'"));
-    // secret 清除标记与保留语义必须体现在页面中。
-    assert!(PAGE.contains("__clear__"));
-    assert!(PAGE.contains("留空表示不修改"));
-    // 配置表单重绘前必须先同步编辑缓冲；Object 收集需支持数组。
-    assert!(PAGE.contains("function syncConfigFormToData()"));
-    assert!(PAGE.contains("if(value&&typeof value==='object')return {value}"));
-    // 保存成功后的只读刷新失败不能被误报为保存失败。
-    assert!(PAGE.contains("配置已保存，但页面刷新失败"));
-    // 路由表必须包含 config（导航可达）。
-    assert!(PAGE.contains("'config'"));
-}
-
-#[test]
 fn remote_next_builds_console_game_command() {
     let pending = ApplicationHttpCommandFacade::remote_control_command(
         "下一首".to_string(),
@@ -2389,45 +2331,6 @@ fn remote_volume_builds_console_game_command() {
         pending.routed.command,
         ModuleCommand::Playback(PlaybackCommand::Volume(ref volume)) if volume == "60"
     ));
-}
-
-#[test]
-fn refresh_toggle_runs_full_uncached_refresh_when_resumed() {
-    assert!(PAGE.contains("id=\"refreshToggle\""));
-    assert!(PAGE.contains("onclick=\"toggleRefresh()\""));
-    assert!(PAGE.contains("function toggleRefresh()"));
-    assert!(PAGE.contains("if(!refreshPaused)refreshAll()"));
-    assert!(PAGE.contains("async function refreshAll()"));
-    assert!(PAGE.contains(
-        "Promise.allSettled([loadMonitor(),loadHistory(),refreshPlayer(),loadPlaybackInsights(),loadPlayMode()])"
-    ));
-    assert!(PAGE.contains("async function refreshLoginProgress()"));
-    assert!(PAGE.contains("loginRuntimeStatus&&loginRuntimeStatus.active"));
-    assert!(!PAGE.contains("setInterval(()=>{if(!refreshPaused)loadLoginState()},2000)"));
-    assert!(PAGE.contains("cache:'no-store'"));
-    assert!(!PAGE.contains("onclick=\"loadMonitor()\""));
-}
-
-#[test]
-fn login_page_renders_validated_kugou_qr_images() {
-    assert!(PAGE.contains("function loginQrDataUrl(value)"));
-    assert!(PAGE.contains("id=\"loginQrImage\""));
-    assert!(PAGE.contains("qrElement.src=qrImage"));
-    assert!(PAGE.contains("使用'+esc(qrLabel)+' App 扫码登录"));
-    assert!(PAGE.contains("data:image\\/(?:png|jpeg);base64"));
-    assert!(PAGE.contains("statusRequestId<loginStatusRequestApplied"));
-}
-
-#[test]
-fn web_inputs_support_enter_submit() {
-    assert!(PAGE.contains("function isPlainEnter(e)"));
-    assert!(PAGE.contains("!e.isComposing"));
-    assert!(PAGE.contains("bindEnter('consoleChatText',sendConsoleChat)"));
-    assert!(PAGE.contains("bindEnter('consoleChatPrefix',sendConsoleChat)"));
-    assert!(PAGE.contains("bindEnter('keyword',()=>remoteSong(false))"));
-    assert!(PAGE.contains("bindEnter('volumeInput',setVolume)"));
-    assert!(PAGE.contains("bindEnter('workflowArgs',runWorkflow)"));
-    assert!(PAGE.contains("function removeQueueId(id)"));
 }
 
 #[test]

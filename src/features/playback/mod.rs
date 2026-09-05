@@ -461,17 +461,6 @@ impl PlaybackCommand {
             Self::QueueClear => "queue_clear".to_string(),
         }
     }
-
-    #[cfg(test)]
-    pub(crate) fn same_request(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Volume(left), Self::Volume(right)) => {
-                command_identity(left) == command_identity(right)
-            }
-            (Self::QueueDelete(left), Self::QueueDelete(right)) => left == right,
-            _ => self.lock_key() == other.lock_key(),
-        }
-    }
 }
 
 const PLAYBACK_COMMAND_PREFIXES: &[&str] = &[
@@ -1183,8 +1172,10 @@ mod tests {
             PlaybackCommand::Lyrics.lock_key(),
             PlaybackCommand::LyricsFor(5).lock_key()
         );
-        assert!(!PlaybackCommand::Lyrics.same_request(&PlaybackCommand::LyricsFor(5)));
-        assert!(PlaybackCommand::LyricsFor(5).same_request(&PlaybackCommand::LyricsFor(300)));
+        assert_eq!(
+            PlaybackCommand::LyricsFor(5).lock_key(),
+            PlaybackCommand::LyricsFor(300).lock_key()
+        );
     }
 
     #[test]

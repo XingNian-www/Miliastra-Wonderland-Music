@@ -278,24 +278,6 @@ impl ModuleCommand {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn same_request(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::SongRequest(left), Self::SongRequest(right)) => left.same_request(right),
-            (Self::Playback(left), Self::Playback(right)) => left.same_request(right),
-            (Self::Hall(left), Self::Hall(right)) => left.same_request(right),
-            (Self::Administration(left), Self::Administration(right)) => left.same_request(right),
-            (Self::IdiomChain(left), Self::IdiomChain(right)) => left.same_request(right),
-            (Self::CardGame(left), Self::CardGame(right)) => left.same_request(right),
-            (Self::TurtleSoup(left), Self::TurtleSoup(right)) => left.same_request(right),
-            (Self::Undercover(left), Self::Undercover(right)) => left.same_request(right),
-            (Self::Invite(left), Self::Invite(right)) => left.same_request(right),
-            (Self::Moderation(left), Self::Moderation(right)) => left.same_request(right),
-            (Self::CustomWorkflow(left), Self::CustomWorkflow(right)) => left.same_request(right),
-            _ => false,
-        }
-    }
-
     pub(crate) fn scopes_lock_to_actor(&self) -> bool {
         matches!(self, Self::CardGame(_) | Self::Undercover(_))
     }

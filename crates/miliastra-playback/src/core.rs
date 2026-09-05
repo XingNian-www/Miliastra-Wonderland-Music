@@ -281,40 +281,44 @@ impl PlaybackCore {
         }
 
         let sources = self.requested_sources(spec.sources)?;
-        let requests = sources.iter().cloned().map(|source| {
-            let request_source = source.clone();
-            let catalog = self.catalog.clone();
-            let registry = self.registry;
-            let keyword = keyword.to_owned();
-            let request_timeout = self.source_timeout;
-            let per_source_limit = spec.limit;
-            let task = tokio::spawn(async move {
-                if let Some(registry) = registry.as_ref()
-                    && let Err(failure) = registry.require_enabled(&request_source)
-                {
-                    return Err(failure);
-                }
-                let Some(adapter) = catalog.get(&request_source) else {
-                    return Err(CatalogError::UnknownSource(request_source.clone())
-                        .as_failure(Some(&request_source)));
-                };
-                let source_spec = SearchSpec {
-                    keyword,
-                    sources: vec![request_source.clone()],
-                    limit: per_source_limit,
-                };
-                let candidates = timeout(request_timeout, adapter.search(&source_spec))
-                    .await
-                    .map_err(|_| {
-                        CatalogError::TimedOut(request_source.clone())
-                            .as_failure(Some(&request_source))
-                    })?
-                    .map_err(|error| error.as_failure(Some(&request_source)))?;
-                let candidates = probe_candidates(adapter, candidates, request_timeout).await;
-                Ok(candidates)
-            });
-            (source, task)
-        });
+        let requests = sources
+            .iter()
+            .cloned()
+            .map(|source| {
+                let request_source = source.clone();
+                let catalog = self.catalog.clone();
+                let registry = self.registry;
+                let keyword = keyword.to_owned();
+                let request_timeout = self.source_timeout;
+                let per_source_limit = spec.limit;
+                let task = tokio::spawn(async move {
+                    if let Some(registry) = registry.as_ref()
+                        && let Err(failure) = registry.require_enabled(&request_source)
+                    {
+                        return Err(failure);
+                    }
+                    let Some(adapter) = catalog.get(&request_source) else {
+                        return Err(CatalogError::UnknownSource(request_source.clone())
+                            .as_failure(Some(&request_source)));
+                    };
+                    let source_spec = SearchSpec {
+                        keyword,
+                        sources: vec![request_source.clone()],
+                        limit: per_source_limit,
+                    };
+                    let candidates = timeout(request_timeout, adapter.search(&source_spec))
+                        .await
+                        .map_err(|_| {
+                            CatalogError::TimedOut(request_source.clone())
+                                .as_failure(Some(&request_source))
+                        })?
+                        .map_err(|error| error.as_failure(Some(&request_source)))?;
+                    let candidates = probe_candidates(adapter, candidates, request_timeout).await;
+                    Ok(candidates)
+                });
+                (source, task)
+            })
+            .collect::<Vec<_>>();
 
         let mut outcomes = Vec::with_capacity(sources.len());
         for (source, task) in requests {
@@ -1910,6 +1914,64 @@ mod tests {
         assert_eq!(response.songs, vec![song("qq", "q1"), song("qq", "q2")]);
         assert_eq!(response.failures.len(), 1);
         assert_eq!(response.failures[0].source, "wy");
+    }
+
+    #[tokio::test]
+    async fn search_starts_all_sources_before_waiting_for_results() {
+        struct ConcurrentSource {
+            all_started: Arc<tokio::sync::Barrier>,
+        }
+
+        #[async_trait]
+        impl SourceAdapter for ConcurrentSource {
+            async fn search(
+                &self,
+                spec: &SearchSpec,
+            ) -> Result<Vec<ProviderSearchCandidate>, CatalogError> {
+                self.all_started.wait().await;
+                Ok(vec![ProviderSearchCandidate {
+                    song: song(&spec.sources[0], "1"),
+                    eligibility: PlaybackEligibility::Eligible,
+                }])
+            }
+
+            async fn resolve(
+                &self,
+                _key: &SongKey,
+                _locator: Option<&ResolverLocator>,
+            ) -> Result<StreamSource, CatalogError> {
+                unreachable!("eligible search candidates do not need a probe")
+            }
+        }
+
+        let all_started = Arc::new(tokio::sync::Barrier::new(2));
+        let (core, _) = core(
+            ["first", "second"]
+                .into_iter()
+                .map(|source| {
+                    (
+                        source.to_owned(),
+                        Arc::new(ConcurrentSource {
+                            all_started: all_started.clone(),
+                        }) as Arc<dyn SourceAdapter>,
+                    )
+                })
+                .collect(),
+        );
+
+        let result = core
+            .search(SearchSpec {
+                keyword: "track".to_owned(),
+                sources: vec!["first".to_owned(), "second".to_owned()],
+                limit: 5,
+            })
+            .await
+            .unwrap();
+
+        assert!(result.failures.is_empty(), "{:#?}", result.failures);
+        assert_eq!(result.songs.len(), 2);
+        assert_eq!(result.outcomes[0].provider, "first");
+        assert_eq!(result.outcomes[1].provider, "second");
     }
 
     #[tokio::test]

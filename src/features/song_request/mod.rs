@@ -11,17 +11,14 @@ use crate::features::chat_text::{
 use crate::features::command::{
     CommandAuthority, CommandEnvelope, CommandPrefix, FeatureCommandMatch,
 };
-#[cfg(test)]
-use crate::text::normalize_comparison_text;
 
 pub(crate) use ai::{AiCandidatePickResult, AiClient, AiConfig};
 pub(crate) use application::{
     ResolvedSongRequest, SongRequestApplication, SongRequestContext, SongRequestDecision,
-    SongRequestPort, SongSearchFailure, select_ai_candidate,
+    SongRequestPort, SongSearchFailure,
 };
 pub(crate) use review::{
     SongReviewCandidate, SongReviewClient, SongReviewConfig, SongReviewDecision,
-    split_candidate_title_artist,
 };
 pub use search::{CandidateEligibility, PickedCandidate, SearchCandidate};
 
@@ -174,14 +171,6 @@ impl SongCommand {
             command_identity(&self.keyword)
         )
     }
-
-    #[cfg(test)]
-    pub(crate) fn same_request(&self, other: &Self) -> bool {
-        command_identity(&self.friend_username) == command_identity(&other.friend_username)
-            && self.source == other.source
-            && self.prefer_accompaniment == other.prefer_accompaniment
-            && same_lock_keyword(&self.keyword, &other.keyword)
-    }
 }
 
 fn joined_command(matched: &str, argument: &str) -> String {
@@ -190,49 +179,6 @@ fn joined_command(matched: &str, argument: &str) -> String {
     } else {
         format!("{matched} {argument}")
     }
-}
-
-#[cfg(test)]
-fn same_lock_keyword(left: &str, right: &str) -> bool {
-    let left = normalize_comparison_text(left);
-    let right = normalize_comparison_text(right);
-    if left.is_empty() || right.is_empty() {
-        return false;
-    }
-    if left == right {
-        return true;
-    }
-    let min_length = left.chars().count().min(right.chars().count());
-    if left.contains(&right) || right.contains(&left) {
-        return min_length >= 2;
-    }
-    if min_length < 4 {
-        return false;
-    }
-    let prefix_length = 16.min(min_length);
-    let left_prefix = left.chars().take(prefix_length).collect::<String>();
-    let right_prefix = right.chars().take(prefix_length).collect::<String>();
-    levenshtein_distance(&left_prefix, &right_prefix) <= 1.max(prefix_length / 4)
-}
-
-#[cfg(test)]
-fn levenshtein_distance(left: &str, right: &str) -> usize {
-    let right_chars = right.chars().collect::<Vec<_>>();
-    let mut costs = (0..=right_chars.len()).collect::<Vec<_>>();
-    for (i, left_ch) in left.chars().enumerate() {
-        let mut last = i;
-        costs[0] = i + 1;
-        for (j, right_ch) in right_chars.iter().enumerate() {
-            let old = costs[j + 1];
-            costs[j + 1] = if left_ch == *right_ch {
-                last
-            } else {
-                1 + last.min(costs[j]).min(costs[j + 1])
-            };
-            last = old;
-        }
-    }
-    costs[right_chars.len()]
 }
 
 pub(crate) fn parse_hall_syntax(command: &str) -> Option<CommandSyntax<'_, SongCommand>> {

@@ -261,6 +261,7 @@ enum PlaybackPurpose {
     Requested,
     Queue { stop_when_user_paused: bool },
     Pool { stop_when_user_paused: bool },
+    Repeat,
     Previous,
     SourceRetry { stop_when_user_paused: bool },
 }
@@ -277,6 +278,7 @@ impl PlaybackPurpose {
             | Self::SourceRetry {
                 stop_when_user_paused,
             } => stop_when_user_paused,
+            Self::Repeat => true,
             Self::Requested | Self::Previous => false,
         }
     }
@@ -288,7 +290,7 @@ impl PlaybackPurpose {
     const fn allows_source_switch(self) -> bool {
         matches!(
             self,
-            Self::Requested | Self::Queue { .. } | Self::Pool { .. }
+            Self::Requested | Self::Queue { .. } | Self::Pool { .. } | Self::Repeat
         )
     }
 
@@ -300,7 +302,7 @@ impl PlaybackPurpose {
         match self {
             Self::Requested => Some(selection.dedup_reject_message()),
             Self::Queue { .. } => Some(selection.dedup_skip_message()),
-            Self::Previous | Self::SourceRetry { .. } | Self::Pool { .. } => None,
+            Self::Previous | Self::SourceRetry { .. } | Self::Pool { .. } | Self::Repeat => None,
         }
     }
 }
@@ -330,17 +332,6 @@ pub(crate) trait PlaybackExecutionPort {
         source: &str,
         prefer_accompaniment: bool,
     ) -> std::result::Result<Option<PlaybackPickedCandidate>, PlaybackSearchFailure>;
-    #[allow(dead_code)]
-    fn ai_search_and_pick(
-        &mut self,
-        _keyword: &str,
-        _source: &str,
-        _prefer_accompaniment: bool,
-    ) -> std::result::Result<Option<PlaybackPickedCandidate>, PlaybackSearchFailure> {
-        Err(PlaybackSearchFailure::Unavailable(
-            "点歌 AI 未启用".to_string(),
-        ))
-    }
     fn song_dedup_limited(&mut self, request: &PlaybackRequest) -> Result<bool>;
     fn play_and_verify(&mut self, request: &PlaybackRequest) -> Result<PlaybackVerification>;
     fn is_track_unavailable_error(&self, _error: &anyhow::Error) -> bool {
@@ -451,7 +442,7 @@ pub(crate) struct PlaybackApplication {
     /// 播放模式(Web 运行期设置,不持久化)。
     play_mode: Arc<AtomicU8>,
     /// 最近一次成功播放的选择(单曲循环重播用)。
-    last_played: Arc<Mutex<Option<PlaybackSelection>>>,
+    last_played: Arc<Mutex<Option<PlaybackRequest>>>,
 }
 
 #[derive(Default)]
@@ -875,16 +866,19 @@ impl PlaybackApplication {
             let queue = port.playback_queue()?;
             // 点歌队列独立于播放模式，始终优先按入队顺序消费。
             // 只有队列为空时，单曲循环才作用于自动续播。
-            if queue.is_empty() && self.play_mode() == PLAY_MODE_REPEAT_ONE {
+            if queue.is_empty()
+                && purpose.stop_when_user_paused()
+                && self.play_mode() == PLAY_MODE_REPEAT_ONE
+            {
                 let last = self
                     .last_played
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .clone();
-                if let Some(mut selection) = last {
-                    selection.queue_item_id = None;
+                if let Some(selection) = last {
                     log::info!("单曲循环重播({}): {}", reason, selection.keyword);
-                    let completion = self.run_selection(&selection, purpose, port)?;
+                    let completion =
+                        self.run_request(&selection, &selection, PlaybackPurpose::Repeat, port)?;
                     match self.finish_playback(completion, port)?.outcome() {
                         PlaybackOutcome::Success => {
                             return Ok(Some(ConsumedSelection::Queue {
@@ -920,11 +914,6 @@ impl PlaybackApplication {
                 let completion = self.run_selection(&selection, pool_purpose, port)?;
                 match self.finish_playback(completion, port)?.outcome() {
                     PlaybackOutcome::Success => {
-                        *self
-                            .last_played
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                            Some(selection.clone());
                         return Ok(Some(ConsumedSelection::Pool {
                             keyword: selection.keyword,
                         }));
@@ -964,11 +953,6 @@ impl PlaybackApplication {
             let result = self.finish_playback(completion, port)?;
             match result.outcome() {
                 PlaybackOutcome::Success => {
-                    // 记录重播记忆(单曲循环用)。
-                    *self
-                        .last_played
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(request.clone());
                     // 预加载后续曲目音源（解析 + 音频预下载），缩短下次切歌延迟；失败静默。
                     self.preload_next_track(port, &pool_excluded)?;
                     return Ok(Some(ConsumedSelection::Queue {
@@ -999,11 +983,6 @@ impl PlaybackApplication {
         // 点歌确认播放成功后，同样预加载下一首（队列优先，空则池随机），
         // 连续播放时下一首直接命中本地缓存，避免起播等待。
         if result.outcome() == PlaybackOutcome::Success {
-            // 记录重播记忆(单曲循环用)。
-            *self
-                .last_played
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(request.clone());
             self.preload_next_track(port, &HashSet::new())?;
         }
         Ok(result)
@@ -1288,6 +1267,16 @@ impl PlaybackApplication {
         completion: PlaybackCompletion,
         port: &mut P,
     ) -> Result<PlaybackResult> {
+        if completion.result.outcome() == PlaybackOutcome::Success {
+            let mut request = completion.result.final_request().clone();
+            // 重播最终成功曲目，不再消费原队列项或重复执行上一曲历史导航。
+            request.queue_item_id = None;
+            request.navigation = PlaybackNavigation::Normal;
+            *self
+                .last_played
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(request);
+        }
         if completion.update_monitor {
             port.update_monitor();
         }
@@ -1567,7 +1556,6 @@ mod tests {
         track_unavailable: bool,
         always_unavailable: bool,
         play_attempts: usize,
-        ai_searches: Vec<(String, String, bool)>,
         pool: Vec<PlayableTrack>,
     }
 
@@ -1577,10 +1565,6 @@ mod tests {
         removed_ids: Vec<u64>,
         replies: Vec<String>,
         reply_error: bool,
-        #[allow(dead_code)]
-        ai_search_result:
-            std::result::Result<Option<PlaybackPickedCandidate>, PlaybackSearchFailure>,
-        ai_search_requests: Vec<(String, String, bool)>,
         played_uris: Vec<String>,
         user_paused: bool,
         reload_pending: bool,
@@ -1648,25 +1632,6 @@ mod tests {
     }
 
     #[test]
-    fn play_mode_defaults_to_shuffle_and_handle_shares_state() {
-        let application = PlaybackApplication::new(PlaybackApplicationConfig {
-            console_bypass_dedup: true,
-            queue_max_size: 20,
-            monitor_tick_ms: Arc::new(RwLock::new(50)),
-            monitor_status_ms: Arc::new(RwLock::new(100)),
-            help_batch_ms: 0,
-        });
-        // 默认随机播放歌曲池；点歌队列仍固定按顺序消费。
-        assert_eq!(application.play_mode(), PLAY_MODE_SHUFFLE);
-        // Web 面板共享句柄写入后,应用侧立即可见。
-        let handle = application.play_mode_handle();
-        handle.store(PLAY_MODE_SHUFFLE, Ordering::Relaxed);
-        assert_eq!(application.play_mode(), PLAY_MODE_SHUFFLE);
-        handle.store(PLAY_MODE_REPEAT_ONE, Ordering::Relaxed);
-        assert_eq!(application.play_mode(), PLAY_MODE_REPEAT_ONE);
-    }
-
-    #[test]
     fn queued_songs_ignore_play_mode_and_keep_insertion_order() {
         let queue = [1, 2].map(|id| QueueItem {
             id,
@@ -1691,8 +1656,6 @@ mod tests {
             removed_ids: Vec::new(),
             replies: Vec::new(),
             reply_error: false,
-            ai_search_result: Ok(None),
-            ai_search_requests: Vec::new(),
             played_uris: Vec::new(),
             user_paused: false,
             reload_pending: false,
@@ -1738,20 +1701,6 @@ mod tests {
             _prefer_accompaniment: bool,
         ) -> std::result::Result<Option<PlaybackPickedCandidate>, PlaybackSearchFailure> {
             unreachable!("queued items already have URIs")
-        }
-
-        fn ai_search_and_pick(
-            &mut self,
-            keyword: &str,
-            source: &str,
-            prefer_accompaniment: bool,
-        ) -> std::result::Result<Option<PlaybackPickedCandidate>, PlaybackSearchFailure> {
-            self.ai_search_requests.push((
-                keyword.to_string(),
-                source.to_string(),
-                prefer_accompaniment,
-            ));
-            self.ai_search_result.clone()
         }
 
         fn song_dedup_limited(&mut self, _request: &PlaybackRequest) -> Result<bool> {
@@ -1838,24 +1787,6 @@ mod tests {
             unreachable!("the queued item already has a URI")
         }
 
-        fn ai_search_and_pick(
-            &mut self,
-            keyword: &str,
-            source: &str,
-            prefer_accompaniment: bool,
-        ) -> std::result::Result<Option<PlaybackPickedCandidate>, PlaybackSearchFailure> {
-            self.ai_searches.push((
-                keyword.to_string(),
-                source.to_string(),
-                prefer_accompaniment,
-            ));
-            Ok(self.track_unavailable.then(|| PlaybackPickedCandidate {
-                text: "备用歌曲 - 歌手".to_string(),
-                track: test_track("miliastra://track/netease/backup", "备用歌曲 - 歌手"),
-                candidate_snapshot: Vec::new(),
-            }))
-        }
-
         fn song_dedup_limited(&mut self, _request: &PlaybackRequest) -> Result<bool> {
             Ok(false)
         }
@@ -1929,7 +1860,6 @@ mod tests {
             track_unavailable: false,
             always_unavailable: false,
             play_attempts: 0,
-            ai_searches: Vec::new(),
             pool: Vec::new(),
         };
         let application = PlaybackApplication::new(PlaybackApplicationConfig {
@@ -1970,7 +1900,6 @@ mod tests {
             track_unavailable: true,
             always_unavailable: false,
             play_attempts: 0,
-            ai_searches: Vec::new(),
             pool: Vec::new(),
         };
         let application = PlaybackApplication::new(PlaybackApplicationConfig {
@@ -1987,7 +1916,6 @@ mod tests {
 
         assert!(port.queue.is_empty());
         assert_eq!(port.removed, [QueueRemoval::Id(17)]);
-        assert_eq!(port.ai_searches, []);
         assert_eq!(port.play_attempts, 2);
         assert_eq!(
             port.replies,
@@ -2031,7 +1959,6 @@ mod tests {
             track_unavailable: true,
             always_unavailable: true,
             play_attempts: 0,
-            ai_searches: Vec::new(),
             pool: Vec::new(),
         };
         let application = PlaybackApplication::new(PlaybackApplicationConfig {
@@ -2047,7 +1974,6 @@ mod tests {
             .expect("retry failure should be reported without another source switch");
 
         assert_eq!(port.play_attempts, 2);
-        assert_eq!(port.ai_searches, []);
         assert_eq!(port.removed, [QueueRemoval::Id(18)]);
         assert!(port.queue.is_empty());
         assert_eq!(port.replies, ["平台无对应歌曲音源"]);
@@ -2077,8 +2003,6 @@ mod tests {
             removed_ids: Vec::new(),
             replies: Vec::new(),
             reply_error: true,
-            ai_search_result: Ok(None),
-            ai_search_requests: Vec::new(),
             played_uris: Vec::new(),
             user_paused: false,
             reload_pending: false,
@@ -2119,8 +2043,6 @@ mod tests {
             removed_ids: Vec::new(),
             replies: Vec::new(),
             reply_error: false,
-            ai_search_result: Ok(None),
-            ai_search_requests: Vec::new(),
             played_uris: Vec::new(),
             user_paused: true,
             reload_pending: false,
@@ -2161,8 +2083,6 @@ mod tests {
             removed_ids: Vec::new(),
             replies: Vec::new(),
             reply_error: false,
-            ai_search_result: Ok(None),
-            ai_search_requests: Vec::new(),
             played_uris: Vec::new(),
             user_paused: false,
             reload_pending: true,
@@ -2234,7 +2154,6 @@ mod tests {
             track_unavailable: true,
             always_unavailable: true,
             play_attempts: 0,
-            ai_searches: Vec::new(),
             pool: Vec::new(),
         };
         let application = PlaybackApplication::new(PlaybackApplicationConfig {
@@ -2272,8 +2191,6 @@ mod tests {
             removed_ids: Vec::new(),
             replies: Vec::new(),
             reply_error: false,
-            ai_search_result: Ok(None),
-            ai_search_requests: Vec::new(),
             played_uris: Vec::new(),
             user_paused: false,
             reload_pending: false,
@@ -2288,6 +2205,7 @@ mod tests {
             help_batch_ms: 0,
         });
 
+        assert_eq!(application.play_mode(), PLAY_MODE_SHUFFLE);
         application
             .consume_queue_after_monitor("自然结束", &mut port)
             .unwrap();
@@ -2307,7 +2225,6 @@ mod tests {
             track_unavailable: true,
             always_unavailable: true,
             play_attempts: 0,
-            ai_searches: Vec::new(),
             pool: vec![
                 test_track("miliastra://track/qqmusic/pool-1", "池歌一 - 歌手A"),
                 test_track("miliastra://track/qqmusic/pool-2", "池歌二 - 歌手B"),
@@ -2357,8 +2274,6 @@ mod tests {
             removed_ids: Vec::new(),
             replies: Vec::new(),
             reply_error: false,
-            ai_search_result: Ok(None),
-            ai_search_requests: Vec::new(),
             played_uris: Vec::new(),
             user_paused: false,
             reload_pending: false,
@@ -2386,6 +2301,7 @@ mod tests {
         );
     }
 
+    #[derive(Default)]
     struct NavigationCommandPort {
         previous_request: Option<PlaybackRequest>,
         played_uris: Vec<String>,
@@ -2420,8 +2336,8 @@ mod tests {
             unreachable!("navigation target already has a URI")
         }
 
-        fn song_dedup_limited(&mut self, _request: &PlaybackRequest) -> Result<bool> {
-            Ok(false)
+        fn song_dedup_limited(&mut self, request: &PlaybackRequest) -> Result<bool> {
+            Ok(self.played_uris.contains(&request.uri()))
         }
 
         fn play_and_verify(&mut self, request: &PlaybackRequest) -> Result<PlaybackVerification> {
@@ -2535,6 +2451,224 @@ mod tests {
                 clock.advance(duration).expect("advance test clock");
             }
         }
+    }
+
+    fn repeat_application() -> PlaybackApplication {
+        let application = PlaybackApplication::new(PlaybackApplicationConfig {
+            console_bypass_dedup: true,
+            queue_max_size: 20,
+            monitor_tick_ms: Arc::new(RwLock::new(50)),
+            monitor_status_ms: Arc::new(RwLock::new(100)),
+            help_batch_ms: 0,
+        });
+        application
+            .play_mode_handle()
+            .store(PLAY_MODE_REPEAT_ONE, Ordering::Relaxed);
+        application
+    }
+
+    fn repeat_verification(track: &PlayableTrack) -> PlaybackVerification {
+        PlaybackVerification::Success {
+            status: PlayerStatus {
+                status: "playing".to_string(),
+                current_uri: track.track_ref.key.to_string(),
+                current_track: Some(track.clone()),
+                ..PlayerStatus::default()
+            },
+            message: "playing".to_string(),
+        }
+    }
+
+    #[test]
+    fn repeat_one_automatic_replay_ignores_request_dedup() {
+        let track = test_track("miliastra://track/qqmusic/repeat", "Repeat - Artist");
+        let mut port = NavigationCommandPort {
+            verifications: [repeat_verification(&track), repeat_verification(&track)].into(),
+            ..NavigationCommandPort::default()
+        };
+        let application = repeat_application();
+        let mut selection = pool_selection(&track);
+        selection.requester = "friend".to_string();
+
+        application.play_confirmed(&selection, &mut port).unwrap();
+        assert!(port.song_dedup_limited(&selection.request()).unwrap());
+        let repeated = application
+            .consume_queue_after_monitor("natural end", &mut port)
+            .unwrap();
+
+        assert!(repeated.is_some());
+        assert_eq!(port.played_uris, vec![selection.request().uri(); 2]);
+    }
+
+    #[test]
+    fn repeat_one_manual_commands_advance_to_pool() {
+        for command in [
+            PlaybackCommand::Next,
+            PlaybackCommand::DeleteCurrentPoolTrack,
+        ] {
+            let current = test_track("miliastra://track/qqmusic/current", "Current - Artist");
+            let next = test_track("miliastra://track/qqmusic/next", "Next - Artist");
+            let mut port = NavigationCommandPort {
+                verifications: [repeat_verification(&current), repeat_verification(&next)].into(),
+                pool: vec![next.clone(), current.clone()],
+                status: PlayerStatus {
+                    current_track: Some(current.clone()),
+                    ..PlayerStatus::default()
+                },
+                ..NavigationCommandPort::default()
+            };
+            let application = repeat_application();
+            let mut selection = pool_selection(&current);
+            selection.console_bypass_dedup = true;
+            application.play_confirmed(&selection, &mut port).unwrap();
+            let context = PlaybackCommandContext {
+                message_type: "console".to_string(),
+                username: "tester".to_string(),
+                user_command: "next".to_string(),
+            };
+
+            application
+                .execute_command(&context, &command, &mut port)
+                .unwrap();
+
+            assert_eq!(
+                port.played_uris,
+                [
+                    current.track_ref.key.to_string(),
+                    next.track_ref.key.to_string()
+                ],
+                "manual command {command:?} must advance"
+            );
+            if matches!(command, PlaybackCommand::DeleteCurrentPoolTrack) {
+                assert_eq!(port.pool, [next]);
+            }
+        }
+    }
+
+    #[test]
+    fn repeat_one_previous_replays_the_previous_track() {
+        let current = test_track("miliastra://track/qqmusic/current", "Current - Artist");
+        let previous = test_track("miliastra://track/qqmusic/previous", "Previous - Artist");
+        let mut previous_request = pool_selection(&previous).request();
+        previous_request.navigation = PlaybackNavigation::Previous;
+        let mut port = NavigationCommandPort {
+            previous_request: Some(previous_request),
+            verifications: [
+                repeat_verification(&current),
+                repeat_verification(&previous),
+                repeat_verification(&previous),
+            ]
+            .into(),
+            ..NavigationCommandPort::default()
+        };
+        let application = repeat_application();
+        let mut selection = pool_selection(&current);
+        selection.console_bypass_dedup = true;
+        application.play_confirmed(&selection, &mut port).unwrap();
+
+        application
+            .execute_command(
+                &PlaybackCommandContext {
+                    message_type: "console".to_string(),
+                    username: "tester".to_string(),
+                    user_command: "previous".to_string(),
+                },
+                &PlaybackCommand::Previous,
+                &mut port,
+            )
+            .unwrap();
+        application
+            .consume_queue_after_monitor("natural end", &mut port)
+            .unwrap();
+
+        assert_eq!(
+            port.played_uris,
+            [
+                current.track_ref.key.to_string(),
+                previous.track_ref.key.to_string(),
+                previous.track_ref.key.to_string(),
+            ]
+        );
+    }
+
+    struct SourceSwitchRepeatPort {
+        inner: NavigationCommandPort,
+        unavailable: TrackKey,
+        attempted: Vec<String>,
+    }
+
+    impl PlaybackExecutionPort for SourceSwitchRepeatPort {
+        fn reply(&mut self, message: &str) -> Result<()> {
+            self.inner.reply(message)
+        }
+        fn update_monitor(&mut self) {}
+        fn search_and_pick(
+            &mut self,
+            _keyword: &str,
+            _source: &str,
+            _prefer_accompaniment: bool,
+        ) -> std::result::Result<Option<PlaybackPickedCandidate>, PlaybackSearchFailure> {
+            unreachable!("source switch uses the candidate snapshot")
+        }
+        fn song_dedup_limited(&mut self, request: &PlaybackRequest) -> Result<bool> {
+            self.inner.song_dedup_limited(request)
+        }
+        fn play_and_verify(&mut self, request: &PlaybackRequest) -> Result<PlaybackVerification> {
+            self.attempted.push(request.uri());
+            if request.track.as_ref().unwrap().track_ref.key == self.unavailable {
+                bail!("track unavailable");
+            }
+            self.inner.play_and_verify(request)
+        }
+        fn is_track_unavailable_error(&self, error: &anyhow::Error) -> bool {
+            error.to_string() == "track unavailable"
+        }
+        fn player_status(&mut self) -> Result<PlayerStatus> {
+            self.inner.player_status()
+        }
+        fn playback_queue(&mut self) -> Result<Vec<QueueItem>> {
+            self.inner.playback_queue()
+        }
+        fn remove_playback_queue(&mut self, removal: QueueRemoval) -> Result<()> {
+            self.inner.remove_playback_queue(removal)
+        }
+    }
+
+    #[test]
+    fn repeat_one_source_switch_replays_the_successful_source() {
+        let original = test_track("miliastra://track/qqmusic/original", "Song - Artist");
+        let alternate = test_candidate("Song - Artist", "miliastra://track/netease/alternate");
+        let alternate_track = alternate.playable_track();
+        let mut port = SourceSwitchRepeatPort {
+            inner: NavigationCommandPort {
+                verifications: [
+                    repeat_verification(&alternate_track),
+                    repeat_verification(&alternate_track),
+                ]
+                .into(),
+                ..NavigationCommandPort::default()
+            },
+            unavailable: original.track_ref.key.clone(),
+            attempted: Vec::new(),
+        };
+        let application = repeat_application();
+        let mut selection = pool_selection(&original);
+        selection.candidate_snapshot = vec![alternate];
+
+        let result = application.play_confirmed(&selection, &mut port).unwrap();
+        assert!(result.source_switched());
+        application
+            .consume_queue_after_monitor("natural end", &mut port)
+            .unwrap();
+
+        assert_eq!(
+            port.attempted,
+            [
+                original.track_ref.key.to_string(),
+                alternate_track.track_ref.key.to_string(),
+                alternate_track.track_ref.key.to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -2758,71 +2892,6 @@ mod tests {
         );
         assert!(combined.contains(&format!("1.{}", "甲".repeat(30))));
         assert!(combined.contains(&format!("2.{}", "乙".repeat(30))));
-    }
-
-    #[test]
-    fn previous_prefers_known_uri_over_native_navigation() {
-        let previous_uri = "miliastra://track/qqmusic/previous";
-        let mut port = NavigationCommandPort {
-            previous_request: Some(PlaybackRequest {
-                keyword: "上一首歌曲".to_string(),
-                source: "qqmusic".to_string(),
-                prefer_accompaniment: false,
-                track: Some(test_track(previous_uri, "上一首歌曲 - 测试歌手")),
-                requester: String::new(),
-                navigation: PlaybackNavigation::Previous,
-                candidate_snapshot: Vec::new(),
-                queue_item_id: None,
-            }),
-            played_uris: Vec::new(),
-            verifications: VecDeque::from([PlaybackVerification::Success {
-                status: PlayerStatus {
-                    status: "playing".to_string(),
-                    current_uri: previous_uri.to_string(),
-                    name: "上一首歌曲".to_string(),
-                    duration: 180.0,
-                    progress: 1.0,
-                    ..PlayerStatus::default()
-                },
-                message: "开始播放: 上一首歌曲".to_string(),
-            }]),
-            replies: Vec::new(),
-            batch_replies: Vec::new(),
-            batch_delays: Vec::new(),
-            queue: Vec::new(),
-            pool: Vec::new(),
-            status_updates: VecDeque::new(),
-            clock: None,
-            status: PlayerStatus {
-                status: "playing".to_string(),
-                current_uri: previous_uri.to_string(),
-                name: "上一首歌曲".to_string(),
-                duration: 180.0,
-                progress: 1.0,
-                ..PlayerStatus::default()
-            },
-            stop_continuous_lyrics_after_statuses: None,
-            status_calls: 0,
-            background_lyrics_starts: Vec::new(),
-        };
-        let application = PlaybackApplication::new(PlaybackApplicationConfig {
-            console_bypass_dedup: true,
-            queue_max_size: 20,
-            monitor_tick_ms: Arc::new(RwLock::new(50)),
-            monitor_status_ms: Arc::new(RwLock::new(50)),
-            help_batch_ms: 0,
-        });
-        let context = PlaybackCommandContext {
-            message_type: "blue".to_string(),
-            username: "tester".to_string(),
-            user_command: "@上一首".to_string(),
-        };
-
-        application
-            .execute_command(&context, &PlaybackCommand::Previous, &mut port)
-            .expect("previous command");
-
-        assert_eq!(port.played_uris, [previous_uri]);
     }
 
     #[test]

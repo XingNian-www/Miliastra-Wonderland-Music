@@ -710,6 +710,13 @@ mod tests {
         let outcome = hall_ui.submit_read(ReadHallInfo).unwrap().wait().unwrap();
         let screenshot = outcome.screenshot().expect("hall screenshot").to_rgba8();
 
+        assert_eq!(
+            (screenshot.width(), screenshot.height()),
+            (
+                config.screen.expected_width,
+                config.screen.expected_height * 2
+            )
+        );
         assert_eq!(*screenshot.get_pixel(0, 0), Rgba([255, 0, 0, 255]));
         assert_eq!(
             *screenshot.get_pixel(0, config.screen.expected_height),
@@ -777,21 +784,6 @@ mod tests {
 
         ui_runtime.shutdown().unwrap();
         ocr_runtime.shutdown().unwrap();
-    }
-
-    #[test]
-    fn hall_screenshot_merge_stacks_before_and_after_scroll_frames() {
-        let mut first = DynamicImage::new_rgba8(3, 2);
-        first.put_pixel(0, 0, Rgba([255, 0, 0, 255]));
-        let mut scrolled = DynamicImage::new_rgba8(3, 4);
-        scrolled.put_pixel(0, 0, Rgba([0, 255, 0, 255]));
-
-        let merged = merge_hall_screenshots(&first, &scrolled);
-        let merged = merged.to_rgba8();
-
-        assert_eq!((merged.width(), merged.height()), (3, 6));
-        assert_eq!(*merged.get_pixel(0, 0), Rgba([255, 0, 0, 255]));
-        assert_eq!(*merged.get_pixel(0, 2), Rgba([0, 255, 0, 255]));
     }
 
     fn primary_frame(config: &AppConfig) -> DynamicImage {

@@ -1112,13 +1112,10 @@ fn has_required_cookies(provider: &str, cookies: &BTreeMap<String, String>) -> b
         "bilibili" => {
             has_any_nonempty(cookies, &["SESSDATA"]) && has_any_nonempty(cookies, &["DedeUserID"])
         }
-        "kugou" => {
-            let web_cookie = cookies.get("KuGoo").is_some_and(|value| {
-                let value = decode_kugou_cookie_value(value);
-                !value.is_empty() && value.contains("t=") && value.contains("KugooID=")
-            });
-            web_cookie
-        }
+        "kugou" => cookies.get("KuGoo").is_some_and(|value| {
+            let value = decode_kugou_cookie_value(value);
+            !value.is_empty() && value.contains("t=") && value.contains("KugooID=")
+        }),
         _ => false,
     }
 }
@@ -3315,14 +3312,14 @@ mod platform {
             return S_OK;
         }
 
-        if let Some(input) = context.kugou_request.as_ref() {
-            if let Err(error) = set_kugou_request_cookies(cookie_manager, &input.cookies) {
-                release_com(cookie_manager);
-                release_com(webview2);
-                release_com(webview);
-                context.finish_error(error);
-                return S_OK;
-            }
+        if let Some(input) = context.kugou_request.as_ref()
+            && let Err(error) = set_kugou_request_cookies(cookie_manager, &input.cookies)
+        {
+            release_com(cookie_manager);
+            release_com(webview2);
+            release_com(webview);
+            context.finish_error(error);
+            return S_OK;
         }
 
         // WebMessageReceived is enabled by default, but set it explicitly so

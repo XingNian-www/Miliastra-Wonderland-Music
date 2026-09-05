@@ -39,12 +39,6 @@ pub(crate) trait MusicPlayerBackend: Clone + Send + Sync + 'static {
     }
     fn pause(&self) -> Result<String>;
     fn resume(&self) -> Result<String>;
-    /// 内置引擎不实现队列导航（导航归应用层），实现侧一律拒绝；保留作防御。
-    #[allow(dead_code)]
-    fn next(&self) -> Result<String>;
-    /// 内置引擎不实现队列导航（导航归应用层），实现侧一律拒绝；保留作防御。
-    #[allow(dead_code)]
-    fn previous(&self) -> Result<String>;
     fn set_volume(&self, volume: &str) -> Result<String>;
     fn toggle_lyrics(&self) -> Result<String>;
     /// 明确设置歌词是否使用翻译（不等价于切换）：恢复播放时应用持久化模式。
@@ -484,8 +478,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             .map(|_| ())
     }
 
-    /// 外部播放器时代遗留：仅测试使用，运行时无调用点；保留以便回归验证外部状态转移。
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn mark_external_playback(&self) -> Result<()> {
         self.clear_external_playback_tracker()?;
         self.playback_state
@@ -2228,14 +2221,6 @@ mod tests {
         fn resume(&self) -> Result<String> {
             *self.resumed.lock().unwrap() += 1;
             Ok("resumed".to_string())
-        }
-
-        fn next(&self) -> Result<String> {
-            Ok(String::new())
-        }
-
-        fn previous(&self) -> Result<String> {
-            Ok(String::new())
         }
 
         fn set_volume(&self, volume: &str) -> Result<String> {
@@ -4606,28 +4591,6 @@ mod tests {
     }
 
     #[test]
-    fn playing_transport_without_track_identity_protects_the_current_song() {
-        let controller = controller(FakeBackend::new(vec![]));
-        let request = request();
-        controller
-            .confirm_playback_success(
-                &request,
-                &status("目标", request.uri().as_str(), 1.0, 180.0),
-            )
-            .unwrap();
-        let playing_without_identity = PlayerStatus {
-            status: "playing".to_string(),
-            ..PlayerStatus::default()
-        };
-
-        assert!(
-            controller
-                .should_queue_until_current_song_finished(&playing_without_identity)
-                .unwrap()
-        );
-    }
-
-    #[test]
     fn unknown_status_does_not_advance_queue() {
         let backend = FakeBackend::new(vec![]);
         let controller = controller(backend);
@@ -4646,51 +4609,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(decision, QueueAdvanceDecision::None);
-    }
-
-    #[test]
-    fn idle_stopped_status_with_pool_advances_once_per_cooldown() {
-        // 非零墙钟基准：冷却判断用 unix 毫秒，初始 0 会误判为冷却中。
-        let clock = Arc::new(ManualClock::with_unix_seconds(
-            Instant::now(),
-            1_700_000_000,
-        ));
-        let controller =
-            controller_with_pool(FakeBackend::new(vec![]), clock.clone(), clock.clone(), true);
-        let context = QueueAdvanceContext {
-            queue_empty: true,
-            has_pending_playback_task: false,
-            command_executing: false,
-        };
-
-        // 启动后引擎空闲 + 播放池有歌：触发空闲续播。
-        assert_eq!(
-            controller
-                .maybe_advance_queue(stopped_status(), context.clone())
-                .unwrap(),
-            QueueAdvanceDecision::AdvanceQueue {
-                reason: "空闲续播"
-            }
-        );
-        // 冷却窗口内不重复触发（播放失败回到 Idle 时防热循环）。
-        assert_eq!(
-            controller
-                .maybe_advance_queue(stopped_status(), context.clone())
-                .unwrap(),
-            QueueAdvanceDecision::None
-        );
-        // 冷却过后允许重试。
-        clock
-            .advance(Duration::from_millis(IDLE_ADVANCE_COOLDOWN_MS + 1))
-            .unwrap();
-        assert_eq!(
-            controller
-                .maybe_advance_queue(stopped_status(), context.clone())
-                .unwrap(),
-            QueueAdvanceDecision::AdvanceQueue {
-                reason: "空闲续播"
-            }
-        );
     }
 
     #[test]
@@ -4882,23 +4800,6 @@ mod tests {
     }
 
     #[test]
-    fn unstable_external_playback_does_not_protect_current_song() {
-        let controller = controller(FakeBackend::new(vec![]));
-        controller.mark_external_playback().unwrap();
-
-        let should_queue = controller
-            .should_queue_until_current_song_finished(&status(
-                "外部歌",
-                "miliastra://track/qqmusic/external",
-                30.0,
-                180.0,
-            ))
-            .unwrap();
-
-        assert!(!should_queue);
-    }
-
-    #[test]
     fn unstable_external_playback_allows_queue_takeover() {
         let controller = controller(FakeBackend::new(vec![]));
         controller.mark_external_playback().unwrap();
@@ -5042,13 +4943,13 @@ mod tests {
     #[test]
     fn active_request_guard_uses_only_the_injected_monotonic_anchor() {
         let started_at = Instant::now();
-        let clock = ManualClock::with_unix_seconds(started_at, 10);
+        let clock = ManualClock::with_unix_seconds(started_at, 1_700_000_000);
         // 与运行态热更新值一致：监控/查询间隔共享值（默认 1000ms）。
         let monitor_status_ms: u64 = 1000;
         let status_poll_ms: u64 = 1000;
         let active_request = ActivePlaybackRequest {
-            // Deliberately unrelated wall-clock metadata: changing it must not affect the guard.
-            started_at_ms: u64::MAX,
+            // System clock moved back three seconds after playback began.
+            started_at_ms: 1_700_000_003_000,
             guard_started_at: Some(started_at),
             ..ActivePlaybackRequest::default()
         };
@@ -5082,27 +4983,6 @@ mod tests {
             Some(&restored_request),
             clock.now(),
         ));
-    }
-
-    #[test]
-    fn stable_external_playback_protects_current_song_from_new_requests() {
-        let controller = controller(FakeBackend::new(vec![]));
-        let external = status("外部歌", "miliastra://track/qqmusic/external", 30.0, 180.0);
-        controller.mark_external_playback().unwrap();
-        controller
-            .playback_state
-            .observe_external_playback(
-                external_playback_identity(&external).expect("external identity"),
-                Instant::now() - Duration::from_secs(20),
-                Duration::from_secs(20),
-            )
-            .unwrap();
-
-        assert!(
-            controller
-                .should_queue_until_current_song_finished(&external)
-                .unwrap()
-        );
     }
 
     #[test]

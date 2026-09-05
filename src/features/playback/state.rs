@@ -1244,21 +1244,6 @@ mod tests {
     }
 
     #[test]
-    fn persisted_state_without_navigation_history_restores_an_empty_history() {
-        let restored: PlaybackRuntimeState = serde_json::from_str(
-            r#"{
-                "state": "idle",
-                "pauseReason": "none",
-                "activeRequest": null,
-                "lastObservation": null
-            }"#,
-        )
-        .expect("older playback state remains readable");
-
-        assert!(restored.previous_requests.is_empty());
-    }
-
-    #[test]
     fn persisted_active_request_requires_all_current_fields() {
         let error = serde_json::from_str::<PlaybackRuntimeState>(
             r#"{
@@ -1849,6 +1834,7 @@ mod tests {
         .expect("旧版快照必须可读");
         assert_eq!(restored.volume, 100);
         assert!(restored.use_translation);
+        assert!(restored.previous_requests.is_empty());
 
         // 序列化往返保留音量与歌词模式。
         let state = PlaybackRuntimeState {

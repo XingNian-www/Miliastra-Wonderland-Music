@@ -58,7 +58,7 @@ use crate::features::playback::{
 };
 use crate::features::song_request::{
     AiClient, ResolvedSongRequest, SongRequestApplication, SongRequestContext, SongRequestDecision,
-    SongReviewClient, select_ai_candidate,
+    SongReviewClient,
 };
 use crate::features::startup::{StartupService, StartupSource, StartupTask, StartupTaskKind};
 use crate::features::turtle_soup::{

@@ -193,7 +193,7 @@ impl LiveConfigs {
     }
 
     /// 返回当前进程累计等待重载的字段；结果按路径排序并与内部状态解耦。
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) fn pending_reload_fields(&self) -> BTreeSet<String> {
         self.pending_reload
             .lock()

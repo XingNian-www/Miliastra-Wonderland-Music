@@ -111,11 +111,6 @@ impl ModerationCommand {
     pub fn lock_key(&self) -> String {
         format!("moderation:{}:{}", self.action.label(), self.uid)
     }
-
-    #[cfg(test)]
-    pub(crate) fn same_request(&self, other: &Self) -> bool {
-        self.action == other.action && self.uid == other.uid
-    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]

@@ -158,11 +158,6 @@ impl UndercoverCommand {
             Self::Abstain => "undercover:vote:abstain".to_string(),
         }
     }
-
-    #[cfg(test)]
-    pub(crate) fn same_request(&self, other: &Self) -> bool {
-        self.lock_key() == other.lock_key()
-    }
 }
 
 fn parse_vote_position(value: &str) -> Option<char> {

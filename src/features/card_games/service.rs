@@ -1440,16 +1440,6 @@ impl CardGameService {
     }
 
     #[cfg(test)]
-    pub(crate) fn set_next_operation_id_for_test(&mut self, value: u64) {
-        self.state.next_operation_id = value;
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_session_generation_for_test(&mut self, value: u64) {
-        self.state.session_generation = SessionGeneration::new(value);
-    }
-
-    #[cfg(test)]
     pub(crate) fn pending_effect_count_for_test(&self) -> usize {
         self.state.pending_effects.len()
     }

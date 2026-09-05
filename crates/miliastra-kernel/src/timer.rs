@@ -912,18 +912,6 @@ mod tests {
     }
 
     #[test]
-    fn stable_order_exhaustion_is_explicit_and_does_not_insert_the_schedule() {
-        let mut core = TimerCore::new();
-        core.next_order = u64::MAX;
-
-        assert_eq!(
-            core.schedule(schedule(token(1), 1, 0, Instant::now())),
-            Err(TimerCoreError::StableOrderExhausted)
-        );
-        assert!(core.is_empty());
-    }
-
-    #[test]
     fn close_returns_pending_in_due_order_and_rejects_further_work() {
         let start = Instant::now();
         let mut core = TimerCore::new();

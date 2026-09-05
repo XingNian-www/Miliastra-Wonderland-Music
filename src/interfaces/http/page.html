@@ -1086,12 +1086,12 @@ async function onProgressChange(){
   if(!currentDuration||currentDuration<=0)return
   const pct=Number($('progressSlider').value)/10
   const position=currentDuration*pct/100
-  try{await call('/playback/seek?position='+position.toFixed(1),'POST')}catch(e){setResult('跳转失败: '+e.message)}
+  if(!await call('/playback/seek?position='+position.toFixed(1),'POST'))return
   loadStatus()
 }
 let currentPlayMode='shuffle'
 async function setPlayMode(mode){
-  try{await call('/playback/mode?mode='+mode,'POST')}catch(e){setResult('设置播放模式失败: '+e.message);return}
+  if(!await call('/playback/mode?mode='+mode,'POST'))return
   currentPlayMode=mode
   refreshModeButtons()
   setResult('播放模式已切换: '+({sequential:'顺序',repeat_one:'单曲循环',shuffle:'随机'}[mode]||mode))

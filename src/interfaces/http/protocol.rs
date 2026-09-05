@@ -1284,7 +1284,9 @@ fn enforce_method(
     if request.method != "GET" && request.method != "POST" {
         return Err(method_not_allowed("只支持GET或POST"));
     }
-    if is_mutating_route(&request.path) && request.method != "POST" {
+    let reads_playback_mode = request.path == "/playback/mode"
+        && query_value(&request.query, "mode").is_none_or(|value| value.trim().is_empty());
+    if is_mutating_route(&request.path) && request.method != "POST" && !reads_playback_mode {
         return Err(method_not_allowed("该接口需要POST请求"));
     }
     if matches!(

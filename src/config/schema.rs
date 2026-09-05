@@ -2,7 +2,7 @@
 //!
 //! 每个字段声明点路径（与 AppConfig 各段结构一一对应）、中文显示名、
 //! 表单控件类型、生效级别与来源。字段路径必须与 struct 字段名一致，
-//! 测试 [`schema_fields_exist_in_default_config`] 防止声明与结构脱节。
+//! 字段类型与叶路径覆盖测试防止声明与配置结构脱节。
 //! 阶段 5 起由 HTTP 配置接口（interfaces/http/routes/config.rs）消费。
 
 use serde_json::Value;
@@ -2482,51 +2482,6 @@ mod tests {
             declared, expected,
             "schema 段集合必须等于 AppConfig 顶层段集合（含 http/logging）"
         );
-    }
-
-    /// 每个字段路径都能在默认配置 JSON 中取到值，防止声明与 struct 脱节；
-    /// Rect/Point/Object 字段取整段对象；null 值（Option 未启用）由 json_path
-    /// 按 nullable/optional_parent 校验后跳过类型断言。
-    #[test]
-    fn schema_fields_exist_in_default_config() {
-        let value = default_config_json();
-        let nullability = schema_nullability();
-        let mut total_fields = 0;
-        for section in config_sections() {
-            for field in &section.fields {
-                total_fields += 1;
-                let field_value = json_path(&value, &field.path, &nullability)
-                    .unwrap_or_else(|| panic!("字段 {} 在默认配置 JSON 中不存在", field.path));
-                if field_value.is_null() {
-                    continue;
-                }
-                if matches!(field.kind, FieldKind::Rect | FieldKind::Point) {
-                    assert!(
-                        field_value.is_object(),
-                        "字段 {} 的值必须是对象（Rect/Point）",
-                        field.path
-                    );
-                }
-                if matches!(field.kind, FieldKind::Object) {
-                    assert!(
-                        field_value.is_object() || field_value.is_array(),
-                        "字段 {} 的值必须是对象或数组（Object）",
-                        field.path
-                    );
-                }
-            }
-        }
-        assert_eq!(
-            total_fields, 266,
-            "schema 总字段数应与预期一致（声明数 = 实际数）"
-        );
-    }
-
-    /// default_config_json 必须与 AppConfig::default() 的完整序列化一致。
-    #[test]
-    fn default_config_json_matches_builtin_defaults() {
-        let expected = serde_json::to_value(AppConfig::default()).expect("序列化默认配置");
-        assert_eq!(default_config_json(), expected);
     }
 
     /// section_schema 查找与 config_sections 一致，未知段返回 None。

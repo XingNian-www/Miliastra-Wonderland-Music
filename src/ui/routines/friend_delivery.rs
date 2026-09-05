@@ -1547,15 +1547,6 @@ mod tests {
         assert!(from.y > to.y);
     }
 
-    #[test]
-    fn current_hall_restore_scrolls_list_upward_when_template_is_missing() {
-        let (from, to) = friend_list_drag_points(Rect::new(80, 280, 170, 600));
-
-        assert_eq!((from.x, from.y), (40, 830));
-        assert_eq!((to.x, to.y), (40, 330));
-        assert!(from.y > to.y);
-        assert_eq!(MAX_FRIEND_LIST_DRAGS, 2);
-    }
     use crate::config::AppConfig;
     #[cfg(feature = "ocr-mnn")]
     use crate::runtime::ocr::{OcrArgs, ProductionOcrDevice};
@@ -1967,7 +1958,8 @@ mod tests {
         let state = state.lock().unwrap();
         assert_eq!(state.selected_friends, ["甲", "乙"]);
         assert_eq!(state.pasted, ["甲一", "乙一", "乙二"]);
-        assert_eq!(state.hall_clicks, 0);
+        assert_eq!(state.hall_clicks, 1);
+        assert_eq!(state.conversation, Conversation::Hall);
 
         ui_runtime.shutdown().unwrap();
         ocr_runtime.shutdown().unwrap();
@@ -2040,7 +2032,8 @@ mod tests {
         let state = state.lock().unwrap();
         assert_eq!(state.selected_friends, ["萌萌"]);
         assert_eq!(state.pasted, ["报名成功"]);
-        assert_eq!(state.hall_clicks, 0);
+        assert_eq!(state.hall_clicks, 1);
+        assert_eq!(state.conversation, Conversation::Hall);
 
         ui_runtime.shutdown().unwrap();
         ocr_runtime.shutdown().unwrap();

@@ -187,11 +187,6 @@ impl IdiomChainCommand {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn same_request(&self, other: &Self) -> bool {
-        self.lock_key() == other.lock_key()
-    }
-
     pub(crate) const fn requires_executor(&self) -> bool {
         matches!(self, Self::Explain(_))
     }

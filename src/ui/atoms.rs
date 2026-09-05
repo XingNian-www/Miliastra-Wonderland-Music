@@ -194,75 +194,6 @@ mod tests {
     use super::*;
     use crate::runtime::ui::{UiDevice, UiRuntime};
 
-    macro_rules! impl_noop_input_backend {
-        () => {
-            fn click_point(&self, _point: PointConfig) -> Result<()> {
-                Ok(())
-            }
-
-            fn ensure_ready(&self, _after_activate_ms: u64) -> Result<()> {
-                Ok(())
-            }
-
-            fn close_window(&self) -> Result<()> {
-                Ok(())
-            }
-        };
-    }
-
-    struct FakeGameUiBackend;
-
-    impl GameUiBackend for FakeGameUiBackend {
-        fn capture(&self) -> Result<DynamicImage> {
-            Ok(DynamicImage::new_rgba8(3, 2))
-        }
-
-        fn press_key(&self, _key: Key) -> Result<()> {
-            Ok(())
-        }
-
-        impl_noop_input_backend!();
-    }
-
-    #[test]
-    fn shared_game_ui_delegates_capture_to_its_backend() {
-        let ui = GameUi::new(FakeGameUiBackend);
-
-        let image = ui.capture().unwrap();
-
-        assert_eq!(image.width(), 3);
-        assert_eq!(image.height(), 2);
-    }
-
-    struct RecordingGameUiBackend {
-        keys: Arc<Mutex<Vec<Key>>>,
-    }
-
-    impl GameUiBackend for RecordingGameUiBackend {
-        fn capture(&self) -> Result<DynamicImage> {
-            Ok(DynamicImage::new_rgba8(1, 1))
-        }
-
-        fn press_key(&self, key: Key) -> Result<()> {
-            self.keys.lock().unwrap().push(key);
-            Ok(())
-        }
-
-        impl_noop_input_backend!();
-    }
-
-    #[test]
-    fn cloned_game_ui_handles_share_one_input_backend() {
-        let keys = Arc::new(Mutex::new(Vec::new()));
-        let ui = GameUi::new(RecordingGameUiBackend { keys: keys.clone() });
-        let clone = ui.clone();
-
-        ui.press_key(Key::Return).unwrap();
-        clone.press_key(Key::Escape).unwrap();
-
-        assert_eq!(*keys.lock().unwrap(), vec![Key::Return, Key::Escape]);
-    }
-
     struct RecordingUiDevice {
         keys: Arc<Mutex<Vec<Key>>>,
     }
@@ -285,6 +216,8 @@ mod tests {
         let ui = GameUi::runtime(runtime.handle());
         let clone = ui.clone();
 
+        let image = ui.capture().unwrap();
+        assert_eq!((image.width(), image.height()), (1, 1));
         ui.press_key(Key::Return).unwrap();
         clone.press_key(Key::Escape).unwrap();
 

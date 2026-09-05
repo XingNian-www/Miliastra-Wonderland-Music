@@ -32,10 +32,14 @@ const PROVIDER: &str = "kugou";
 
 /// 酷狗测试版（概念版/lite）Android API 的签名盐值。
 const KUGOU_LITE_SIGN_SALT: &str = "LnT6xpN3khm36zse0QzvmgTZ3waWdRSA";
+const KUGOU_LITE_SIGN_KEY_SALT: &str = "185672dd44712f60bb1736df5a377e82";
 const KUGOU_LITE_APPID: i64 = 3116;
 const KUGOU_LITE_CLIENTVER: i64 = 11440;
 const KUGOU_UA: &str = "Android15-1070-11083-46-0-DiscoveryDRADProtocol-wifi";
 const KUGOU_KG_RFC: &str = "B9EDA08A64250DEFFBCADDEE00F8F25F";
+const KUGOU_LITE_URL_VERSION: &str = "11430";
+const KUGOU_LITE_URL_PAGE_ID: &str = "967177915";
+const KUGOU_LITE_URL_PPAGE_ID: &str = "356753938,823673182,967485191";
 const KUGOU_DEVICE_FILE: &str = "kugou-device.json";
 /// Web 播放接口使用的签名盐和客户端参数。网页登录得到的 `KuGoo.t`
 /// 属于 Web 会话，不能送入上面的 Lite/Android 登录协议。
@@ -150,6 +154,18 @@ pub fn kugou_android_signature(params: &BTreeMap<String, String>, body: &str) ->
         .collect::<String>();
     let digest = compute(format!(
         "{KUGOU_LITE_SIGN_SALT}{joined}{body}{KUGOU_LITE_SIGN_SALT}"
+    ));
+    format!("{digest:x}")
+}
+
+/// Build the `key` accepted by the concept/lite `/v5/url` endpoint.
+///
+/// This is separate from the request `signature`: the upstream `song_url`
+/// module enables `encryptKey`, so playback requests carry this hash key and
+/// use the endpoint's fixed playback parameter map.
+fn kugou_lite_sign_key(hash: &str, mid: &str, userid: &str) -> String {
+    let digest = compute(format!(
+        "{hash}{KUGOU_LITE_SIGN_KEY_SALT}{KUGOU_LITE_APPID}{mid}{userid}"
     ));
     format!("{digest:x}")
 }
@@ -755,6 +771,60 @@ impl KugouAdapter {
         params
     }
 
+    /// Build the exact concept/lite `module/song_url` parameter map.
+    ///
+    /// The upstream module overwrites the default client version with 11430,
+    /// adds the fixed lite playback identifiers, and enables `encryptKey`.
+    /// It does not use the Web session signature or the Web playback endpoint.
+    fn lite_song_url_params(
+        credential: &ProviderCredential,
+        hash: &str,
+        album_id: &str,
+        album_audio_id: &str,
+    ) -> Result<BTreeMap<String, String>, CatalogError> {
+        let (token, userid, _) = Self::credential_fields(credential)?;
+        let mut params =
+            Self::device_params(Some(credential), KUGOU_LITE_APPID, KUGOU_LITE_CLIENTVER);
+        params.extend([
+            ("album_id".to_owned(), album_id.to_owned()),
+            ("area_code".to_owned(), "1".to_owned()),
+            ("hash".to_owned(), hash.to_ascii_lowercase()),
+            ("ssa_flag".to_owned(), "is_fromtrack".to_owned()),
+            ("version".to_owned(), KUGOU_LITE_URL_VERSION.to_owned()),
+            ("page_id".to_owned(), KUGOU_LITE_URL_PAGE_ID.to_owned()),
+            ("quality".to_owned(), "128".to_owned()),
+            ("album_audio_id".to_owned(), album_audio_id.to_owned()),
+            ("behavior".to_owned(), "play".to_owned()),
+            ("pid".to_owned(), "411".to_owned()),
+            ("cmd".to_owned(), "26".to_owned()),
+            ("pidversion".to_owned(), "3001".to_owned()),
+            ("IsFreePart".to_owned(), "0".to_owned()),
+            ("ppage_id".to_owned(), KUGOU_LITE_URL_PPAGE_ID.to_owned()),
+            ("cdnBackup".to_owned(), "1".to_owned()),
+            ("module".to_owned(), String::new()),
+            // `song_url.js` supplies this endpoint-specific version after the
+            // request helper's default clientver has been merged.
+            ("clientver".to_owned(), KUGOU_LITE_URL_VERSION.to_owned()),
+        ]);
+        let mid = params.get("mid").map(String::as_str).unwrap_or("-");
+        params.insert(
+            "key".to_owned(),
+            kugou_lite_sign_key(
+                &params["hash"],
+                mid,
+                if userid.is_empty() { "0" } else { userid },
+            ),
+        );
+        // The upstream module passes `notSign` (rather than the request
+        // helper's `notSignature` flag), so request.js still adds the normal
+        // Android signature after injecting `key`. Mirror that wire contract.
+        params.insert("signature".to_owned(), kugou_android_signature(&params, ""));
+        if !token.is_empty() {
+            params.insert("token".to_owned(), token.to_owned());
+        }
+        Ok(params)
+    }
+
     fn apply_device_headers(
         request: reqwest::RequestBuilder,
         params: &BTreeMap<String, String>,
@@ -836,6 +906,17 @@ impl KugouAdapter {
             return BTreeMap::new();
         };
         let mut result = cookies.clone();
+        // WebView2 must use the browser session identity only. Mixing the
+        // Lite device cookies with KuGoo makes SSA see two device sessions.
+        for name in [
+            "KUGOU_API_DFID",
+            "KUGOU_API_GUID",
+            "KUGOU_API_MID",
+            "KUGOU_API_MAC",
+            "KUGOU_API_DEV",
+        ] {
+            result.remove(name);
+        }
         if result
             .get("KuGoo")
             .is_none_or(|value| value.trim().is_empty())
@@ -878,7 +959,9 @@ impl KugouAdapter {
             "cookies": Self::web_request_cookies(credential),
         });
         let executable = executable.to_owned();
-        let timeout = Duration::from_secs(30);
+        // Keep the child below the 15s playback source timeout so cancellation
+        // cannot release the profile lock while the helper is still running.
+        let timeout = Duration::from_secs(14);
         tokio::task::spawn_blocking(move || {
             run_kugou_web_helper(&executable, &profile, timeout, &request)
         })
@@ -911,6 +994,7 @@ impl KugouAdapter {
         }
         classify_status(&response)?;
         match response.json::<Value>().await {
+            Ok(value) if is_web_challenge_response(&value) => Ok(None),
             Ok(value) => Ok(Some(value)),
             Err(_) => Ok(None),
         }
@@ -1028,6 +1112,28 @@ impl KugouAdapter {
         if endpoint != URL_SONG_STREAM {
             classify_business_response(&value)?;
         }
+        Ok(value)
+    }
+
+    async fn get_lite_song_url(
+        &self,
+        credential: &ProviderCredential,
+        hash: &str,
+        album_id: &str,
+        album_audio_id: &str,
+    ) -> Result<Value, CatalogError> {
+        let params = Self::lite_song_url_params(credential, hash, album_id, album_audio_id)?;
+        let request =
+            Self::apply_device_headers(self.client.get(URL_SONG_STREAM).query(&params), &params)
+                .header("x-router", "trackercdn.kugou.com")
+                .header("Cookie", Self::credential_cookie_header(credential));
+        let response = request.send().await.map_err(classify_request_error)?;
+        classify_status(&response)?;
+        let value = response
+            .json::<Value>()
+            .await
+            .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?;
+        classify_business_response(&value)?;
         Ok(value)
     }
 
@@ -1629,30 +1735,17 @@ impl SourceAdapter for KugouAdapter {
                 "song key provider does not match Kugou adapter".to_owned(),
             ));
         }
-        let (hash, _album_id, _album_audio_id) = resolver_parts(key, locator)?;
+        let (hash, album_id, album_audio_id) = resolver_parts(key, locator)?;
         let credential = self.credential()?;
-        let hash_lower = hash.to_ascii_lowercase();
-        // The QR login returns a Web token. Resolve through the same Web
-        // endpoint used by the browser: the first request translates the hash
-        // to `encode_album_audio_id`, and the second returns the CDN URL.
-        let first = self
-            .web_songinfo_json(&credential, Some(("hash", hash_lower)))
+        // Follow the concept/lite Android route used by the upstream
+        // `module/song_url.js`. This keeps playback on `/v5/url` and avoids
+        // mixing a Web KuGoo session with the Lite device identity.
+        let response = self
+            .get_lite_song_url(&credential, &hash, &album_id, &album_audio_id)
             .await?;
-        let url = if let Some(url) = extract_stream_url(&first) {
-            url.to_owned()
-        } else {
-            let encoded_id = response_data(&first)
-                .get("encode_album_audio_id")
-                .and_then(value_string)
-                .filter(|value| !value.trim().is_empty())
-                .ok_or_else(|| classify_kugou_resolve_failure(&first))?;
-            let second = self
-                .web_songinfo_json(&credential, Some(("encode_album_audio_id", encoded_id)))
-                .await?;
-            extract_stream_url(&second)
-                .map(str::to_owned)
-                .ok_or_else(|| classify_kugou_resolve_failure(&second))?
-        };
+        let url = extract_stream_url(&response)
+            .map(str::to_owned)
+            .ok_or_else(|| classify_kugou_resolve_failure(&response))?;
         let url =
             Url::parse(&url).map_err(|error| CatalogError::InvalidResponse(error.to_string()))?;
         if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
@@ -1677,11 +1770,18 @@ impl SourceAdapter for KugouAdapter {
                 "song key provider does not match Kugou adapter".to_owned(),
             ));
         }
-        // The Lite privilege endpoint rejects WebView2 credentials. The Web
-        // songinfo flow is authoritative for this session and also exercises
-        // the exact URL that playback will use.
+        // Resolve through the same Lite `/v5/url` request that playback uses;
+        // this avoids a separate privilege/Web endpoint and keeps probe
+        // behavior aligned with the actual stream URL contract.
         let _ = self.resolve(key, locator).await?;
         Ok(PlaybackEligibility::Eligible)
+    }
+
+    fn probe_unknown_candidates(&self) -> bool {
+        // Search can return several unknown tracks at once. Resolving each
+        // one hits the playback endpoint and creates a request burst; defer
+        // the authoritative check to the selected track's play request.
+        false
     }
 
     async fn lyrics(
@@ -1770,6 +1870,24 @@ fn classify_kugou_resolve_failure(response: &Value) -> CatalogError {
         return error;
     }
     CatalogError::Unavailable("Kugou returned no playable stream".to_owned())
+}
+
+/// Web songinfo can return an SSA challenge as HTTP 200 JSON. Let the
+/// WebView2 helper perform the verification instead of treating it as a dead
+/// credential.
+fn is_web_challenge_response(response: &Value) -> bool {
+    let data = response_data(response);
+    let code = [response, data].into_iter().find_map(|value| {
+        ["err_code", "error_code", "errorCode", "code"]
+            .into_iter()
+            .find_map(|field| value.get(field).and_then(value_i64))
+    });
+    let eventid = [response, data].into_iter().find_map(|value| {
+        ["eventid", "eventId", "ssaCode", "ssa_code"]
+            .into_iter()
+            .find_map(|field| value.get(field).and_then(Value::as_str))
+    });
+    matches!(code, Some(20028 | 30020)) && eventid.is_some_and(|value| !value.is_empty())
 }
 
 fn extract_stream_url(response: &Value) -> Option<&str> {
@@ -2434,10 +2552,10 @@ mod tests {
 
     use super::{
         KugouAdPlayReportBody, classify_business_response, classify_kugou_resolve_failure,
-        decode_lrc_content, extract_stream_url, kugou_android_signature, kugou_calculate_mid,
-        kugou_normalize_guid, load_legacy_device_identity, parse_kugou_datetime_ms,
-        parse_search_candidates, resolver_parts, serialize_kugou_body,
-        validate_web_credential_response,
+        decode_lrc_content, extract_stream_url, is_web_challenge_response, kugou_android_signature,
+        kugou_calculate_mid, kugou_lite_sign_key, kugou_normalize_guid,
+        load_legacy_device_identity, parse_kugou_datetime_ms, parse_search_candidates,
+        resolver_parts, serialize_kugou_body, validate_web_credential_response,
     };
     use crate::catalog::CatalogError;
     use crate::credentials::ProviderCredential;
@@ -2482,6 +2600,45 @@ mod tests {
             kugou_android_signature(&params, "{}"),
             "6805e7e467eb0f16c702de7388a3431a"
         );
+    }
+
+    #[test]
+    fn lite_song_url_key_matches_upstream_sign_key_contract() {
+        assert_eq!(
+            kugou_lite_sign_key("abcdef0123456789", "123456", "42"),
+            "36bcafbf94d27e9684ac89f531c3acba"
+        );
+    }
+
+    #[test]
+    fn lite_song_url_params_match_upstream_playback_contract() {
+        let credential = ProviderCredential::Kugou {
+            token: "tok".to_owned(),
+            userid: "42".to_owned(),
+            dfid: "dfid".to_owned(),
+            cookies: BTreeMap::from([("KUGOU_API_MID".to_owned(), "123456".to_owned())]),
+        };
+        let params =
+            super::KugouAdapter::lite_song_url_params(&credential, "ABCDEF0123456789", "7", "88")
+                .unwrap();
+        assert_eq!(
+            params.get("hash").map(String::as_str),
+            Some("abcdef0123456789")
+        );
+        assert_eq!(params.get("album_id").map(String::as_str), Some("7"));
+        assert_eq!(params.get("album_audio_id").map(String::as_str), Some("88"));
+        assert_eq!(params.get("clientver").map(String::as_str), Some("11430"));
+        assert_eq!(params.get("pid").map(String::as_str), Some("411"));
+        assert_eq!(params.get("page_id").map(String::as_str), Some("967177915"));
+        assert_eq!(
+            params.get("ppage_id").map(String::as_str),
+            Some("356753938,823673182,967485191")
+        );
+        assert_eq!(
+            params.get("key").map(String::as_str),
+            Some("36bcafbf94d27e9684ac89f531c3acba")
+        );
+        assert_eq!(params.get("signature").map(String::len), Some(32));
     }
 
     #[test]
@@ -2816,6 +2973,25 @@ mod tests {
             })),
             Err(CatalogError::CredentialRejected(_))
         ));
+    }
+
+    #[test]
+    fn web_challenge_json_is_detected_without_misclassifying_normal_errors() {
+        assert!(is_web_challenge_response(&json!({
+            "err_code": 30020,
+            "data": {"eventid": "challenge-id"}
+        })));
+        assert!(is_web_challenge_response(&json!({
+            "data": {"error_code": 20028, "ssaCode": "challenge-id"}
+        })));
+        assert!(!is_web_challenge_response(&json!({
+            "err_code": 30020,
+            "error": "expired session"
+        })));
+        assert!(!is_web_challenge_response(&json!({
+            "err_code": 20010,
+            "data": {"eventid": "request-id"}
+        })));
     }
 
     #[test]

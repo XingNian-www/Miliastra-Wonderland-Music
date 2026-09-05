@@ -569,7 +569,7 @@ fn http_section() -> Vec<ConfigFieldSchema> {
             "access_token",
             "访问令牌",
             FieldKind::Secret,
-            "启动引导配置，在 config.yaml 修改后重启生效；非本机监听时必须设置；留空时由看门狗生成本次运行期临时令牌",
+            "启动引导配置，在 config.yaml 修改后重启生效；非本机监听时必须设置；首次留空时程序自动生成并写回",
         ),
     ]
 }
@@ -1991,13 +1991,13 @@ fn custom_workflows_section() -> Vec<ConfigFieldSchema> {
     ]
 }
 
-/// identity 段：OCR 备注昵称 → UUID/角色 的手动映射表。
+/// identity 段：游戏内昵称到角色和对外显示昵称的映射表。
 fn identity_section() -> Vec<ConfigFieldSchema> {
     vec![ConfigFieldSchema::db_live(
         "mappings",
         "昵称身份映射",
         FieldKind::Object,
-        "映射列表：在面板逐行添加昵称、备注与角色；UUID 由面板自动生成，仅用于内部去重且不会回显。昵称与 OCR 结果精确匹配，未映射昵称一律按路人处理；保存后立即生效。",
+        "游戏内昵称与 OCR 结果精确匹配；显示昵称用于游戏回复、Web 和 API，留空时显示游戏内昵称；角色控制命令权限。保存后立即生效。",
     )]
 }
 

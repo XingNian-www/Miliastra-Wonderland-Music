@@ -1606,10 +1606,9 @@ impl ApplicationRuntime {
 
     pub(super) fn enqueue_turtle_soup_question(
         &self,
-        mut question: turtle_soup::TurtleSoupQuestion,
+        question: turtle_soup::TurtleSoupQuestion,
         observed_at: Instant,
     ) -> Result<()> {
-        question.rename_player(self.mapped_actor_name(&question.player));
         self.record_command_activity(observed_at)?;
         log::info!("海龟汤提问已加入正式输入队列: nickname={}", question.player);
         self.push_pending_task(PendingTask::TurtleSoupQuestion {

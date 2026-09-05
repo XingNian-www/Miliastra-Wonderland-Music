@@ -301,6 +301,7 @@ html[data-theme=light] .theme-toggle .moon{display:none}
 .nav-brand{padding:0 var(--sp-3) var(--sp-5);font-weight:700;letter-spacing:.2px}
 .nav-brand span{display:block;margin-top:2px;color:var(--text-2);font-size:var(--fs-meta);font-weight:500}
 .nav-links{display:flex;flex-direction:column;gap:var(--sp-1);min-width:0}
+.btn:focus-visible,.nav-link:focus-visible,.tab:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .nav-link{width:100%;height:36px;padding:0 var(--sp-3);border:0;border-radius:var(--radius-s);background:transparent;color:var(--text-2);text-align:left;cursor:pointer}
 .nav-link:hover{background:var(--fill-1);color:var(--text-1)}
 .nav-link.active{background:var(--accent-soft);color:var(--accent);font-weight:600}
@@ -440,6 +441,14 @@ input.config-invalid:focus,textarea.config-invalid:focus{border-color:var(--dang
 .identity-add-row input{min-width:160px;flex:1}
 .identity-add-row select{min-width:100px}
 @media(max-width:900px){.identity-add-row{align-items:stretch}.identity-add-row>*{min-width:160px;flex:1}.identity-add-row .btn{flex:0 0 auto}}
+@media(max-width:720px){
+  html,body{overflow-x:hidden}
+  .nav-links{scrollbar-width:none}
+  .nav-links::-webkit-scrollbar{display:none}
+  .topbar{position:relative}
+  .status-chips{overflow-x:auto;scrollbar-width:none}
+  .status-chips::-webkit-scrollbar{display:none}
+}
 </style>
 </head>
 <body>
@@ -588,14 +597,14 @@ input.config-invalid:focus,textarea.config-invalid:focus{border-color:var(--dang
 
       <div class="panel wide">
         <div class="panel-head">
-          <div class="tabs" role="tablist">
-            <button class="tab active" data-target="turtlePanel" data-meta="turtleMeta" onclick="switchTab(this)">海龟汤</button>
-            <button class="tab" data-target="undercoverPanel" data-meta="undercoverMeta" onclick="switchTab(this)">谁是卧底</button>
+            <div class="tabs" role="tablist" aria-label="娱乐玩法">
+              <button class="tab active" id="turtleTab" role="tab" aria-selected="true" aria-controls="turtlePanel" data-target="turtlePanel" data-meta="turtleMeta" onclick="switchTab(this)">海龟汤</button>
+              <button class="tab" id="undercoverTab" role="tab" aria-selected="false" aria-controls="undercoverPanel" data-target="undercoverPanel" data-meta="undercoverMeta" onclick="switchTab(this)">谁是卧底</button>
           </div>
           <small><span class="tab-meta" id="turtleMeta">功能未启用</span><span class="tab-meta hidden" id="undercoverMeta">功能未启用</span></small>
         </div>
         <div class="panel-body">
-          <div class="tab-body" id="turtlePanel">
+          <div class="tab-body" id="turtlePanel" role="tabpanel" aria-labelledby="turtleTab">
             <div class="turtle-toolbar">
               <input id="turtlePuzzleId" placeholder="未使用题目 ID，可留空随机">
               <button class="btn primary" id="turtleRandomStart" onclick="startTurtleSoup(false)" disabled>随机开局</button>
@@ -615,7 +624,7 @@ input.config-invalid:focus,textarea.config-invalid:focus{border-color:var(--dang
               <div class="history turtle-history" id="turtleJudgments">暂无裁决</div>
             </div>
           </div>
-          <div class="tab-body hidden" id="undercoverPanel">
+          <div class="tab-body hidden" id="undercoverPanel" role="tabpanel" aria-labelledby="undercoverTab">
             <div class="undercover-toolbar">
               <button class="btn primary" id="undercoverStart" onclick="startUndercover()" disabled>开始当前房间</button>
               <button class="btn warn" id="undercoverEnd" onclick="endUndercover()" disabled>结束</button>
@@ -635,15 +644,15 @@ input.config-invalid:focus,textarea.config-invalid:focus{border-color:var(--dang
 
       <div class="panel wide">
         <div class="panel-head">
-          <div class="tabs" role="tablist">
-            <button class="tab active" data-target="monitorLogs" onclick="switchTab(this)">事件日志</button>
-            <button class="tab" data-target="monitorCommands" onclick="switchTab(this)">命令记录</button>
+            <div class="tabs" role="tablist" aria-label="监控记录">
+              <button class="tab active" id="logsTab" role="tab" aria-selected="true" aria-controls="monitorLogs" data-target="monitorLogs" onclick="switchTab(this)">事件日志</button>
+              <button class="tab" id="commandsTab" role="tab" aria-selected="false" aria-controls="monitorCommands" data-target="monitorCommands" onclick="switchTab(this)">命令记录</button>
           </div>
           <small>实时</small>
         </div>
         <div class="panel-body">
-          <pre class="scroll tab-body" id="monitorLogs">暂无日志</pre>
-          <pre class="scroll tab-body hidden" id="monitorCommands">暂无命令</pre>
+          <pre class="scroll tab-body" id="monitorLogs" role="tabpanel" aria-labelledby="logsTab">暂无日志</pre>
+          <pre class="scroll tab-body hidden" id="monitorCommands" role="tabpanel" aria-labelledby="commandsTab">暂无命令</pre>
         </div>
       </div>
     </section>
@@ -856,7 +865,7 @@ input.config-invalid:focus,textarea.config-invalid:focus{border-color:var(--dang
   </main>
 </div>
 
-<div class="modal hidden" id="screenshotModal">
+<div class="modal hidden" id="screenshotModal" role="dialog" aria-modal="true" aria-labelledby="screenshotTitle">
   <div class="modal-head">
     <strong id="screenshotTitle">游戏截图</strong>
     <button class="btn small" onclick="closeScreenshot()">关闭</button>
@@ -917,7 +926,23 @@ let configRevisionsOpen=false
 let configSecretDraft={}
 function navigateTo(route,updateHash=true){
   if(!pageRoutes.includes(route))route='overview'
-  if(configUnsaved&&route!==document.querySelector('.page-section.active')?.dataset.page&&!confirm('有未保存的配置修改，确定离开配置中心？'))return
+  const currentRoute=document.querySelector('.page-section.active')?.dataset.page
+  // Only leaving the config page needs a discard confirmation. Once the user
+  // has accepted leaving, navigating back to config must not prompt again.
+  if(configUnsaved&&currentRoute==='config'&&route!==currentRoute){
+    if(!confirm('有未保存的配置修改，确定离开配置中心？')){
+      // A browser Back/Forward already changed the hash before hashchange runs;
+      // restore it when the user keeps the current page.
+      if(!updateHash&&currentRoute&&location.hash!=='#'+currentRoute)history.replaceState(null,'','#'+currentRoute)
+      return
+    }
+    // Discard the local draft so returning to the config page reads the
+    // server version instead of showing changes the user just abandoned.
+    configUnsaved=false
+    configDirty.clear()
+    configData=null
+    configActiveSection=null
+  }
   document.querySelectorAll('.page-section').forEach(page=>page.classList.toggle('active',page.dataset.page===route))
   document.querySelectorAll('.nav-link[data-route]').forEach(link=>link.classList.toggle('active',link.dataset.route===route))
   try{localStorage.setItem('miliastraRoute',route)}catch(e){}
@@ -953,6 +978,9 @@ let monitorLoading=false
 let historyLoading=false
 let playbackInsightsLoading=false
 let screenshotLoading=false
+let playerRefreshPromise=null
+let playModeLoading=false
+let playModeRequestGeneration=0
 let searchCandidateItems=[]
 let loginProviderItems=[]
 let loginRuntimeStatus={active:false}
@@ -993,7 +1021,7 @@ function applyAccessToken(){
   if(document.querySelector('.page-section.active')?.dataset.page==='config')loadConfigPage()
 }
 function requestHeaders(){const token=accessToken();return token?{'X-Miliastra-Token':token}:{}}
-function sourceLabel(v){return v==='netease'?'网易':v==='qqmusic'?'QQ':v==='bilibili'?'B站':v||'聚合'}
+function sourceLabel(v){return v==='netease'?'网易':v==='qqmusic'?'QQ':v==='bilibili'?'B站':v==='kugou'?'酷狗':v||'聚合'}
 function queryText(q){const rows=Object.entries(q||{}).filter(([,v])=>v!=null&&String(v)!=='');return rows.length?' '+rows.map(([k,v])=>k+'='+v).join(' '):''}
 function preferParam(){return $('preferAccompaniment').checked?'&preferAccompaniment=1':''}
 function keyword(){return $('keyword').value.trim()}
@@ -1008,21 +1036,28 @@ function bindEnter(id,handler){
     handler()
   })
 }
+function parseResponse(text,status){
+  if(text.trim().startsWith('<'))return 'HTTP '+status
+  try{
+    const value=JSON.parse(text)
+    if(value&&typeof value==='object'&&value.ok===false)throw new Error(value.message||value.error||value.code||('HTTP '+status))
+    return value
+  }catch(error){
+    if(error instanceof Error&&error.message&&error.message!=='Unexpected end of JSON input'&&!/Unexpected token/.test(error.message))throw error
+    return text
+  }
+}
 async function request(url,method){
   const r=await fetch(url,{method:method||'GET',cache:'no-store',headers:requestHeaders()})
   const text=await r.text()
-  if(!r.ok)throw new Error(text||('HTTP '+r.status))
-  const type=r.headers.get('content-type')||''
-  if(type.includes('application/json')){try{return JSON.parse(text)}catch{return text}}
-  return text
+  if(!r.ok){let detail='HTTP '+r.status;try{const value=JSON.parse(text);detail=value.message||value.error||detail}catch{}throw new Error(detail)}
+  return parseResponse(text,r.status)
 }
 async function requestJson(url,body){
   const r=await fetch(url,{method:'POST',cache:'no-store',headers:{...requestHeaders(),'Content-Type':'application/json'},body:JSON.stringify(body)})
   const text=await r.text()
-  if(!r.ok)throw new Error(text||('HTTP '+r.status))
-  const type=r.headers.get('content-type')||''
-  if(type.includes('application/json')){try{return JSON.parse(text)}catch{return text}}
-  return text
+  if(!r.ok){let detail='HTTP '+r.status;try{const value=JSON.parse(text);detail=value.message||value.error||detail}catch{}throw new Error(detail)}
+  return parseResponse(text,r.status)
 }
 async function call(url,method){
   const mutating=(method||'GET')==='POST'
@@ -1062,7 +1097,10 @@ function renderProgress(d){
   const progress=safeNum(d.progress)
   const duration=safeNum(d.duration)
   currentDuration=duration
-  if(progress==null&&duration==null){box.classList.add('hidden');return}
+  // `hidden` is a native boolean attribute; toggling only the CSS helper class
+  // cannot override it, so keep both states in sync.
+  if(progress==null&&duration==null){box.hidden=true;box.classList.add('hidden');return}
+  box.hidden=false
   box.classList.remove('hidden')
   const fill=(duration!=null&&duration>0)?Math.max(0,Math.min(100,progress/duration*100)):0
   $('progressFill').style.width=fill+'%'
@@ -1070,7 +1108,7 @@ function renderProgress(d){
     $('progressSlider').value=String(Math.round(fill*10))
     $('progressTime').textContent=fmt(progress)+' / '+fmt(duration)
   }
-  const failure=d.failureCode?('失败: '+d.failureMessage+(d.failureRetryable?'（可重试）':'')):''
+  const failure=d.failureCode?('失败: '+(d.failureMessage||'未知原因')+(d.failureRetryable?'（可重试）':'')):''
   const lyric=d.lyricLineText?('歌词: '+d.lyricLineText):''
   $('progressMeta').textContent=[failure,lyric].filter(Boolean).join(' · ')
 }
@@ -1092,6 +1130,7 @@ async function onProgressChange(){
 let currentPlayMode='shuffle'
 async function setPlayMode(mode){
   if(!await call('/playback/mode?mode='+mode,'POST'))return
+  playModeRequestGeneration++
   currentPlayMode=mode
   refreshModeButtons()
   setResult('播放模式已切换: '+({sequential:'顺序',repeat_one:'单曲循环',shuffle:'随机'}[mode]||mode))
@@ -1103,13 +1142,29 @@ function refreshModeButtons(){
   if(el)el.classList.add('active')
 }
 async function loadPlayMode(){
-  try{currentPlayMode=(await request('/playback/mode')).mode||'shuffle'}catch(e){currentPlayMode='shuffle'}
+  if(playModeLoading)return
+  playModeLoading=true
+  const generation=playModeRequestGeneration
+  let nextMode=null
+  try{nextMode=(await request('/playback/mode')).mode||'shuffle'}catch(e){}
+  finally{playModeLoading=false}
+  if(generation!==playModeRequestGeneration||nextMode==null)return
+  currentPlayMode=nextMode
   refreshModeButtons()
 }
-async function refreshPlayer(){
-  const d=await request('/status')
-  renderPlayer(d)
-  return d
+function refreshPlayer(){
+  // 状态每秒刷新一次；复用进行中的请求，避免慢响应按返回顺序覆盖新状态。
+  if(playerRefreshPromise)return playerRefreshPromise
+  const requestPromise=(async()=>{
+    const d=await request('/status')
+    renderPlayer(d)
+    return d
+  })()
+  playerRefreshPromise=requestPromise.then(
+    value=>{playerRefreshPromise=null;return value},
+    error=>{playerRefreshPromise=null;throw error}
+  )
+  return playerRefreshPromise
 }
 function renderPlaybackInsights(data){
   const cache=data&&data.cache
@@ -1309,11 +1364,17 @@ async function loadLoginState(){
   const statusRequestId=++loginStatusRequestIssued
   try{
     const results=await Promise.all([request('/player/providers'),request('/player/login/status')])
+    if(statusRequestId!==loginStatusRequestIssued)return
     loginProviderItems=Array.isArray(results[0])?results[0]:[]
     if(statusRequestId>=loginStatusRequestApplied){loginStatusRequestApplied=statusRequestId;loginRuntimeStatus=results[1]||{active:false}}
     await loadPlatformAccounts()
+    if(statusRequestId!==loginStatusRequestIssued)return
     renderLoginState()
-  }catch(e){$('loginMeta').textContent='读取失败';$('loginProviders').innerHTML='<div class="result">'+esc(e.message)+'</div>'}
+  }catch(e){
+    if(statusRequestId!==loginStatusRequestIssued)return
+    $('loginMeta').textContent='读取失败'
+    $('loginProviders').innerHTML='<div class="result">'+esc(e.message)+'</div>'
+  }
 }
 let platformAccounts={}
 function renderAccountInfo(provider){
@@ -1594,7 +1655,13 @@ function renderUndercover(u){
 }
 function renderMonitor(d){
   const operational=d.operational||{}
-  setState('serviceState',(d.status||'未知')+(operational.scannerPaused?' / 扫描暂停':''),'ok')
+  const serviceStatus=d.status||'未知'
+  const serviceState=operational.scannerPaused
+    ? 'warn'
+    : /退出|关停|失败|错误/.test(serviceStatus)
+      ? 'err'
+      : serviceStatus==='运行中' ? 'ok' : 'neutral'
+  setState('serviceState',serviceStatus+(operational.scannerPaused?' / 扫描暂停':''),serviceState)
   $('uiState').textContent=operational.uiState||'未知'
   const q=Array.isArray(d.queue)?d.queue:[]
   const tasks=Array.isArray(d.tasks)?d.tasks:[]
@@ -1717,19 +1784,30 @@ function setState(id,text,state){const el=$(id);el.textContent=text;const chip=e
 function toggleTheme(){const t=document.documentElement.dataset.theme==='light'?'dark':'light';document.documentElement.dataset.theme=t;try{localStorage.setItem('miliastraTheme',t)}catch(e){}}
 function switchTab(btn){
   const group=btn.parentElement
-  group.querySelectorAll('.tab').forEach(t=>t.classList.toggle('active',t===btn))
+  group.querySelectorAll('.tab').forEach(t=>{
+    const active=t===btn
+    t.classList.toggle('active',active)
+    if(t.getAttribute('role')==='tab')t.setAttribute('aria-selected',String(active))
+  })
   const target=btn.dataset.target
   const panel=btn.closest('.panel')
   panel.querySelectorAll('.tab-body').forEach(b=>b.classList.toggle('hidden',b.id!==target))
   if(btn.dataset.meta)panel.querySelectorAll('.tab-meta').forEach(m=>m.classList.toggle('hidden',m.id!==btn.dataset.meta))
 }
+document.addEventListener('keydown',event=>{
+  if(event.key==='Escape'&&!$('screenshotModal').classList.contains('hidden')){
+    closeScreenshot()
+    event.preventDefault()
+  }
+})
 $('accessToken').value=accessToken()
 loadOperatorWorkflows()
 refreshAll()
 loadLoginState()
 setInterval(()=>{if(!refreshPaused)loadMonitor()},1000)
-setInterval(()=>{if(!refreshPaused)refreshPlayer()},1000)
+setInterval(()=>{if(!refreshPaused)refreshPlayer().catch(()=>{})},1000)
 setInterval(()=>{if(!refreshPaused)loadPlaybackInsights()},5000)
+setInterval(()=>{if(!refreshPaused)loadPlayMode()},5000)
 setInterval(()=>{if(!refreshPaused&&loginRuntimeStatus&&loginRuntimeStatus.active)refreshLoginProgress()},2000)
 
 /* ===== 高级控制（原 /tools 独立页面，已并入左侧导航） ===== */

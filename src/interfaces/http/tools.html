@@ -157,6 +157,7 @@ select{appearance:none;-webkit-appearance:none;background-image:url("data:image/
 .btn:active{transform:translateY(1px)}
 .btn:disabled{opacity:.45;cursor:not-allowed}
 .btn:disabled::before{display:none}
+.btn:focus-visible,a.btn:focus-visible,.task:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 a.btn{text-decoration:none}
 .primary{background:var(--text-1);color:var(--inverse);border-color:transparent;font-weight:600}
 .primary::before{background:var(--primary-hover)}
@@ -191,7 +192,7 @@ html[data-theme=light] .theme-toggle .moon{display:none}
 
 @media(max-width:1200px){.status-chips{gap:var(--sp-2)}.chip{font-size:var(--fs-meta)}.chip em{max-width:96px}}
 @media(max-width:1050px){.topbar{grid-template-columns:1fr;padding:var(--sp-3) var(--sp-1) var(--sp-4)}.brand{padding:var(--sp-2) var(--sp-4);border-bottom:1px solid var(--sep-2)}.status-chips,.top-actions{flex-wrap:wrap;padding:var(--sp-3) var(--sp-4);border-left:none;border-top:1px solid var(--sep-2)}.top-actions{justify-content:flex-start}.grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
-@media(max-width:720px){.shell{padding:0 var(--sp-3) var(--sp-4)}.topbar{padding:var(--sp-3) var(--sp-1) var(--sp-4);margin-bottom:var(--sp-4)}.top-actions{gap:var(--sp-1)}.top-actions .access-token{width:160px;flex:1 1 160px}.grid{grid-template-columns:1fr;gap:var(--sp-4)}.wide{grid-column:auto}.row{flex-wrap:wrap}.row>.btn{flex:1 1 auto}.three{grid-template-columns:1fr}.two{grid-template-columns:1fr}}
+@media(max-width:720px){body{overflow-x:hidden}.shell{padding:0 var(--sp-3) var(--sp-4)}.topbar{padding:var(--sp-3) var(--sp-1) var(--sp-4);margin-bottom:var(--sp-4)}.top-actions{gap:var(--sp-1)}.top-actions .access-token{width:160px;flex:1 1 160px}.grid{grid-template-columns:1fr;gap:var(--sp-4)}.wide{grid-column:auto}.row{flex-wrap:wrap}.row>.btn{flex:1 1 auto}.three{grid-template-columns:1fr}.two{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
@@ -257,9 +258,12 @@ const val=id=>$(id).value.trim()
 const esc=s=>String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')
 let activeId=0
 let busy=false
+let taskPollGeneration=0
+let toolsLoadGeneration=0
+let templatesLoadGeneration=0
 let templateItems=[]
 const taskStatusLabel={queued:'等待业务空闲',running:'执行中',completed:'已完成',failed:'失败'}
-function readTokenCookie(){const match=document.cookie.match(/(?:^|;\s*)miliastraAccessToken=([^;]*)/);return match?decodeURIComponent(match[1]):''}
+function readTokenCookie(){const match=document.cookie.match(/(?:^|;\s*)miliastraAccessToken=([^;]*)/);if(!match)return '';try{return decodeURIComponent(match[1])}catch{return ''}}
 function writeTokenCookie(value){
   if(value){document.cookie='miliastraAccessToken='+encodeURIComponent(value)+';path=/;max-age=31536000;SameSite=Strict'}
   else{document.cookie='miliastraAccessToken=;path=/;max-age=0;SameSite=Strict'}
@@ -276,8 +280,22 @@ function requestHeaders(){const token=accessToken();return token?{'X-Miliastra-T
 async function request(url,method='GET'){
   const r=await fetch(url,{method,cache:'no-store',headers:requestHeaders()})
   const text=await r.text()
-  if(!r.ok)throw new Error(text||('HTTP '+r.status))
-  try{return JSON.parse(text)}catch{return text}
+  if(!r.ok){
+    let detail=''
+    try{const value=JSON.parse(text);if(value&&typeof value==='object')detail=value.message||value.error||''}catch{}
+    if(!detail&&text.trim()&&!/^<!doctype html/i.test(text.trim())&&!/^<html[\s>]/i.test(text.trim()))detail=text.trim()
+    throw new Error(detail||('HTTP '+r.status))
+  }
+  const trimmed=text.trim()
+  if(trimmed.startsWith('<'))return 'HTTP '+r.status
+  try{
+    const value=JSON.parse(text)
+    if(value&&typeof value==='object'&&value.ok===false)throw new Error(value.message||value.error||value.code||('HTTP '+r.status))
+    return value
+  }catch(error){
+    if(error instanceof Error&&error.message&&error.message!=='Unexpected end of JSON input'&&!/Unexpected token/.test(error.message))throw error
+    return text
+  }
 }
 function setResult(text){$('result').textContent=typeof text==='string'?text:JSON.stringify(text,null,2)}
 function setHeaderState(text,state){const el=$('state');el.textContent=text;const chip=el.closest('.chip');if(chip)chip.dataset.state=state}
@@ -285,25 +303,34 @@ function setBusy(value){busy=value;document.querySelectorAll('button').forEach(b
 function params(values){const p=new URLSearchParams();for(const [k,v] of Object.entries(values||{})){if(v!==undefined&&v!==null&&String(v)!=='')p.set(k,v)}const s=p.toString();return s?'?'+s:''}
 async function run(path,values){
   if(busy)return
+  const generation=++taskPollGeneration
   setBusy(true);setResult('任务已提交...')
-  try{const task=await request(path+params(values),'POST');activeId=task.id;$('taskId').textContent='任务 #'+task.id;await pollTask()}
-  catch(error){setResult('错误: '+error.message);setBusy(false)}
-  await loadTools()
+  try{
+    const task=await request(path+params(values),'POST')
+    if(generation!==taskPollGeneration)return
+    const taskId=Number(task&&task.id)
+    if(!Number.isSafeInteger(taskId)||taskId<1)throw new Error('任务响应无效')
+    activeId=taskId;$('taskId').textContent='任务 #'+taskId;await pollTask(generation)
+  }catch(error){if(generation===taskPollGeneration){setResult('错误: '+error.message);setBusy(false)}}
+  if(generation===taskPollGeneration)await loadTools()
 }
-async function pollTask(){
+async function pollTask(generation=taskPollGeneration){
+  if(generation!==taskPollGeneration)return
   try{
     const task=await request('/tools/task?id='+encodeURIComponent(activeId))
+    if(generation!==taskPollGeneration)return
      const label=taskStatusLabel[task.status]||task.status
      setHeaderState('任务 #'+task.id+' '+label,task.status==='failed'?'err':task.status==='completed'?'ok':task.status==='running'?'ok':'neutral')
-    setResult(task.result||'等待执行...')
-    if(task.status==='queued'||task.status==='running'){setTimeout(pollTask,500);return}
-  }catch(error){setResult('读取任务失败: '+error.message)}
+     setResult(task.result||'等待执行...')
+     if(task.status==='queued'||task.status==='running'){setTimeout(()=>pollTask(generation),500);return}
+  }catch(error){if(generation!==taskPollGeneration)return;setResult('读取任务失败: '+error.message)}
+  if(generation!==taskPollGeneration)return
   setBusy(false);loadTools()
 }
-function matchTemplate(click){run('/tools/template',{template:val('template'),rect:val('templateRect'),threshold:val('threshold'),click:click?'1':''})}
-function clickPoint(){run('/tools/click',{x:val('x'),y:val('y')})}
-function sendKey(){run('/tools/key',{key:val('key')})}
-function aiPreview(){run('/tools/ai-preview',{keyword:val('aiKeyword'),preferAccompaniment:$('aiAccompaniment').checked?'1':''})}
+function matchTemplate(click){const template=val('template');if(!template){setResult('错误: 请选择模板');return}run('/tools/template',{template,rect:val('templateRect'),threshold:val('threshold'),click:click?'1':''})}
+function clickPoint(){const x=val('x'),y=val('y');if(!x||!y){setResult('错误: 请输入 x 和 y 坐标');return}run('/tools/click',{x,y})}
+function sendKey(){const key=val('key');if(!key){setResult('错误: 请输入要发送的按键');return}run('/tools/key',{key})}
+function aiPreview(){const keyword=val('aiKeyword');if(!keyword){setResult('错误: 请输入 AI 候选诊断关键词');return}run('/tools/ai-preview',{keyword,preferAccompaniment:$('aiAccompaniment').checked?'1':''})}
 function sampleChatChanges(){run('/tools/chat-change-samples',{samples:val('changeSamples')})}
 function panelBenchmark(){run('/tools/panel-benchmark',{rounds:val('benchmarkRounds')})}
 async function openScreenshot(){
@@ -316,8 +343,19 @@ async function openScreenshot(){
   setBusy(false)
 }
 function renderTasks(items){const el=$('tasks');if(!Array.isArray(items)||!items.length){el.textContent='暂无任务';return}el.innerHTML=items.map(item=>'<button class="task" onclick="inspectTask('+Number(item.id)+')"><span class="state '+(item.status==='failed'?'err':item.status==='completed'?'ok':'')+'">'+esc(taskStatusLabel[item.status]||item.status)+'</span>#'+item.id+' '+esc(item.label)+'</button>').join('')}
-function inspectTask(id){if(busy)return;activeId=id;$('taskId').textContent='任务 #'+id;setBusy(true);pollTask()}
-async function loadTemplates(){try{const items=await request('/tools/templates');templateItems=Array.isArray(items)?items:[];const selected=val('template');$('template').innerHTML=templateItems.map(item=>'<option value="'+esc(item.name)+'">'+esc(item.label)+'</option>').join('');if([...$('template').options].some(option=>option.value===selected))$('template').value=selected;return templateItems}catch(error){setHeaderState('模板读取失败','err');return []}}
+function inspectTask(id){if(busy)return;const taskId=Number(id);if(!Number.isSafeInteger(taskId)||taskId<1){setResult('错误: 任务编号无效');return}taskPollGeneration++;activeId=taskId;$('taskId').textContent='任务 #'+taskId;setBusy(true);pollTask(taskPollGeneration)}
+async function loadTemplates(){
+  const generation=++templatesLoadGeneration
+  try{
+    const items=await request('/tools/templates')
+    if(generation!==templatesLoadGeneration)return templateItems
+    templateItems=Array.isArray(items)?items:[]
+    const selected=val('template')
+    $('template').innerHTML=templateItems.map(item=>'<option value="'+esc(item.name)+'">'+esc(item.label)+'</option>').join('')
+    if([...$('template').options].some(option=>option.value===selected))$('template').value=selected
+    return templateItems
+  }catch(error){if(generation===templatesLoadGeneration)setHeaderState('模板读取失败','err');return []}
+}
 async function useConfiguredTemplateRegion(){
   try{
     const items=await loadTemplates()
@@ -329,7 +367,14 @@ async function useConfiguredTemplateRegion(){
     setResult('已读取 '+item.label+' 的配置区域')
   }catch(error){setResult('错误: '+error.message)}
 }
-async function loadTools(){try{const monitor=await request('/monitor');renderTasks(monitor.webTools)}catch(error){setHeaderState('任务读取失败','err')}}
+async function loadTools(){
+  const generation=++toolsLoadGeneration
+  try{
+    const monitor=await request('/monitor')
+    if(generation!==toolsLoadGeneration)return
+    renderTasks(monitor&&monitor.webTools)
+  }catch(error){if(generation===toolsLoadGeneration)setHeaderState('任务读取失败','err')}
+}
 document.addEventListener('keydown',event=>{if(event.key==='Enter'&&!event.isComposing&&event.target.tagName==='INPUT'){const map={ocrRect:()=>run('/tools/ocr',{rect:val('ocrRect')}),x:clickPoint,y:clickPoint,key:sendKey,aiKeyword:aiPreview,threshold:()=>matchTemplate(false),templateRect:()=>matchTemplate(false),changeSamples:sampleChatChanges,benchmarkRounds:panelBenchmark};const action=map[event.target.id];if(action){event.preventDefault();action()}}})
 $('accessToken').value=accessToken()
 function toggleTheme(){const t=document.documentElement.dataset.theme==='light'?'dark':'light';document.documentElement.dataset.theme=t;try{localStorage.setItem('miliastraTheme',t)}catch(e){}}

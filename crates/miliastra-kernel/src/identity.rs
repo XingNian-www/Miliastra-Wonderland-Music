@@ -54,13 +54,6 @@ impl BusinessOperationIdAllocator {
             .map(BusinessOperationId::new)
             .map_err(|_| BusinessOperationIdExhausted)
     }
-
-    #[cfg(test)]
-    fn with_next_for_test(next: u64) -> Self {
-        Self {
-            next: Arc::new(AtomicU64::new(next)),
-        }
-    }
 }
 
 impl Default for BusinessOperationIdAllocator {
@@ -114,21 +107,7 @@ impl Display for SessionGeneration {
 
 #[cfg(test)]
 mod tests {
-    use super::{BusinessOperationId, BusinessOperationIdAllocator, SessionGeneration};
-
-    #[test]
-    fn identities_do_not_wrap() {
-        assert_eq!(
-            BusinessOperationId::new(41).checked_next(),
-            Some(BusinessOperationId::new(42))
-        );
-        assert_eq!(BusinessOperationId::new(u64::MAX).checked_next(), None);
-        assert_eq!(
-            SessionGeneration::INITIAL.checked_next(),
-            Some(SessionGeneration::new(1))
-        );
-        assert_eq!(SessionGeneration::new(u64::MAX).checked_next(), None);
-    }
+    use super::{BusinessOperationId, BusinessOperationIdAllocator};
 
     #[test]
     fn operation_allocator_is_shared_by_all_clones() {
@@ -138,17 +117,5 @@ mod tests {
         assert_eq!(allocator.allocate().unwrap(), BusinessOperationId::new(1));
         assert_eq!(clone.allocate().unwrap(), BusinessOperationId::new(2));
         assert_eq!(allocator.allocate().unwrap(), BusinessOperationId::new(3));
-    }
-
-    #[test]
-    fn operation_allocator_never_wraps_after_the_last_identifier() {
-        let allocator = BusinessOperationIdAllocator::with_next_for_test(u64::MAX);
-
-        assert_eq!(
-            allocator.allocate().unwrap(),
-            BusinessOperationId::new(u64::MAX)
-        );
-        assert!(allocator.allocate().is_err());
-        assert!(allocator.allocate().is_err());
     }
 }

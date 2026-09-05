@@ -275,31 +275,35 @@ impl PlayerSearchPort for NativePlaybackAdapter {
         prefer_accompaniment: bool,
     ) -> Result<Option<PickedCandidate>, PlayerSearchError> {
         let candidates = self.search_candidates(keyword, source)?;
-        let formatted = format_candidates(&candidates);
-        // 只保留可播放与无法确认的候选；VIP/无版权/需购买/不可播的歌曲直接屏蔽
-        // （搜索标注已按账号凭据判定：VIP 账号的 VIP 歌解析成功会标可播放）。
-        let playable = candidates
-            .iter()
-            .filter(|candidate| {
-                matches!(
-                    candidate.eligibility,
-                    PlaybackEligibility::Eligible | PlaybackEligibility::Unknown
-                )
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        let preferred = if prefer_accompaniment {
-            playable
-                .iter()
-                .find(|candidate| is_accompaniment(&candidate.text))
-                .cloned()
-                .or_else(|| SearchCandidate::select_preferred_equivalent(&playable))
-        } else {
-            SearchCandidate::select_preferred_equivalent(&playable)
-        };
-        Ok(preferred
-            .map(|candidate| PickedCandidate::with_snapshot(candidate, candidates, formatted)))
+        Ok(pick_playable_candidate(candidates, prefer_accompaniment))
     }
+}
+
+fn pick_playable_candidate(
+    candidates: Vec<SearchCandidate>,
+    prefer_accompaniment: bool,
+) -> Option<PickedCandidate> {
+    // 搜索已按账号凭据校准 VIP 状态，推荐和手选必须共享同一份可用候选。
+    let playable = candidates
+        .into_iter()
+        .filter(|candidate| {
+            matches!(
+                candidate.eligibility,
+                PlaybackEligibility::Eligible | PlaybackEligibility::Unknown
+            )
+        })
+        .collect::<Vec<_>>();
+    let preferred = if prefer_accompaniment {
+        playable
+            .iter()
+            .find(|candidate| is_accompaniment(&candidate.text))
+            .cloned()
+            .or_else(|| SearchCandidate::select_preferred_equivalent(&playable))
+    } else {
+        SearchCandidate::select_preferred_equivalent(&playable)
+    };
+    let formatted = format_candidates(&playable);
+    preferred.map(|candidate| PickedCandidate::with_snapshot(candidate, playable, formatted))
 }
 
 fn providers(source: &str) -> Result<Vec<ProviderId>, PlayerSearchError> {
@@ -381,8 +385,49 @@ fn dispatch_error(error: PlaybackError) -> ControlDispatchOutcome {
 
 #[cfg(test)]
 mod tests {
-    use super::{providers, volume_smooth_sequence};
-    use miliastra_playback::ProviderId;
+    use super::{pick_playable_candidate, providers, volume_smooth_sequence};
+    use crate::features::playback::test_candidate;
+    use miliastra_playback::{PlaybackEligibility, ProviderId};
+
+    #[test]
+    fn candidate_snapshot_and_numbering_only_include_playable_search_results() {
+        let candidates = [
+            PlaybackEligibility::NoCopyright,
+            PlaybackEligibility::Eligible,
+            PlaybackEligibility::VipRequired,
+            PlaybackEligibility::PaidRequired,
+            PlaybackEligibility::Ineligible,
+            PlaybackEligibility::Unknown,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, eligibility)| {
+            let mut candidate = test_candidate(
+                &format!("candidate-{index}"),
+                &format!("miliastra://track/qqmusic/{index}"),
+            );
+            candidate.eligibility = eligibility;
+            candidate
+        })
+        .collect();
+
+        let picked = pick_playable_candidate(candidates, false).expect("playable candidates");
+
+        assert_eq!(picked.candidate.track_ref.key.id, "1");
+        assert_eq!(
+            picked
+                .candidate_snapshot
+                .iter()
+                .map(|candidate| candidate.track_ref.key.id.as_str())
+                .collect::<Vec<_>>(),
+            ["1", "5"]
+        );
+        assert_eq!(
+            picked.formatted_candidates,
+            "1. candidate-1\n2. candidate-5"
+        );
+        assert_eq!(picked.candidate_snapshot[0], picked.candidate);
+    }
 
     #[test]
     fn provider_list_accepts_the_ai_multi_platform_source() {

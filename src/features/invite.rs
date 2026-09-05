@@ -132,18 +132,6 @@ impl InviteCommand {
             )
         }
     }
-
-    #[cfg(test)]
-    pub(crate) fn same_request(&self, other: &Self) -> bool {
-        match (self.seq, other.seq) {
-            (Some(left), Some(right)) => left == right,
-            (None, None) => {
-                command_identity(&self.username) == command_identity(&other.username)
-                    && self.password == other.password
-            }
-            _ => false,
-        }
-    }
 }
 
 fn invite_arg_trailing_is_empty(value: &str) -> bool {

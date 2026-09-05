@@ -65,6 +65,22 @@ struct SecondaryOcrMessage {
     requires_sender: bool,
 }
 
+fn classify_secondary_hall_routed_message(
+    text: &str,
+    routed: Option<&RoutedCommand>,
+    accepts_turtle_questions: bool,
+) -> SecondaryHallMessageClassification {
+    let mut classification = classify_secondary_hall_message(
+        text,
+        routed.map(|command| &command.command),
+        accepts_turtle_questions,
+    );
+    // The first route uses a placeholder, so authorization needs the real speaker.
+    classification.requires_sender |=
+        routed.is_some_and(|command| command.permission_required.is_some());
+    classification
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SecondaryHallActorObservation {
     nickname: String,
@@ -856,9 +872,9 @@ impl ApplicationRuntime {
                             })
                     })
                     .flatten();
-                classify_secondary_hall_message(
+                classify_secondary_hall_routed_message(
                     &text,
-                    routed.as_ref().map(|command| &command.command),
+                    routed.as_ref(),
                     accepts_turtle_questions,
                 )
             } else {
@@ -1235,6 +1251,56 @@ impl ApplicationRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secondary_permission_check_reads_sender_before_rejecting_mapped_administrator() {
+        use crate::features::identity::{IdentityAccess, IdentityConfig, IdentityMapping};
+
+        let identity = IdentityAccess::new(IdentityConfig {
+            mappings: vec![IdentityMapping {
+                nickname: "管理员".to_string(),
+                id: uuid::Uuid::from_u128(1),
+                role: IdentityRole::Admin,
+                note: String::new(),
+            }],
+        });
+        let service = CustomWorkflowService::new(
+            crate::features::custom_workflow::CustomWorkflowConfig::default(),
+            WorkflowDefaults {
+                default_timeout_ms: 1_000,
+                default_poll_ms: 100,
+                default_step_wait_ms: 100,
+                decision_timeout_ms: 1_000,
+                decision_poll_ms: 100,
+                after_activate_ms: 100,
+                clipboard_hold_ms: 100,
+                stability_mean_threshold: 1.0,
+                stability_changed_ratio_threshold: 0.1,
+            },
+        );
+        let router = ChatCommandRouter::with_identity(&service, &identity);
+        for text in ["@禁用", "@闲置退出 15", "@删除", "@监听模式 一级"] {
+            let envelope = |sender: &str| {
+                CommandEnvelope::new(text, sender, "blue", text, CommandObservation::default())
+                    .unwrap()
+            };
+            let provisional = router
+                .route(&envelope(SECONDARY_HALL_FALLBACK_SENDER), None)
+                .unwrap();
+            assert_eq!(provisional.permission_required, Some(IdentityRole::Admin));
+            let classification =
+                classify_secondary_hall_routed_message(text, Some(&provisional), false);
+            assert_eq!(classification.kind, SecondaryHallMessageKind::Command);
+            assert!(classification.requires_sender, "command={text}");
+
+            let authorized = router.route(&envelope("管理员"), None).unwrap();
+            assert_eq!(authorized.permission_required, None, "command={text}");
+            assert_eq!(authorized.role, Some(IdentityRole::Admin));
+        }
+        let disabled = classify_secondary_hall_routed_message("@启用", None, false);
+        assert_eq!(disabled.kind, SecondaryHallMessageKind::Command);
+        assert!(disabled.requires_sender);
+    }
 
     fn primary_message(text: &str, y: i32) -> ChatMessage {
         ChatMessage {

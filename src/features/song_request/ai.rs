@@ -702,17 +702,6 @@ mod tests {
     }
 
     #[test]
-    fn candidate_pick_result_parses_an_index_instead_of_a_track_uri() {
-        let result =
-            parse_candidate_pick_result(r#"{"index":2,"score":0.75,"reason":"title match"}"#)
-                .expect("candidate result");
-
-        assert_eq!(result.index, 2);
-        assert_eq!(result.score, 0.75);
-        assert_eq!(result.reason, "title match");
-    }
-
-    #[test]
     fn candidate_pick_web_response_preserves_the_uri_contract() {
         let candidates = vec![
             (

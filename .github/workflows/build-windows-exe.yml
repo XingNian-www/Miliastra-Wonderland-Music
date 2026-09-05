@@ -19,7 +19,7 @@ on:
       - README.md
       - THIRD_PARTY_NOTICES.md
       - assets/**
-      - config.yaml
+      - config.example.yaml
       - crates/**
       - docs/**
       - scripts/**
@@ -183,11 +183,15 @@ jobs:
           }
           Copy-Item 'assets' (Join-Path $dist 'deps') -Recurse
           Copy-Item 'models' (Join-Path $dist 'deps') -Recurse
-          Copy-Item 'config.yaml' $dist
+          Copy-Item 'config.example.yaml' (Join-Path $dist 'config.yaml')
           New-Item -ItemType Directory -Force -Path (Join-Path $dist 'deps/docs') | Out-Null
-          Copy-Item 'turtle_soup.example.yaml', 'undercover.example.yaml', 'README.md', 'THIRD_PARTY_NOTICES.md' (Join-Path $dist 'deps/docs')
+          Copy-Item 'turtle_soup.example.yaml', 'undercover.example.yaml', 'README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md' (Join-Path $dist 'deps/docs')
+          Copy-Item 'docs' (Join-Path $dist 'deps/docs') -Recurse
           # 预置配置库：以当前默认配置初始化 deps/data/playback.sqlite3
           & 'target/x86_64-pc-windows-msvc/release/examples/ensure-config-db.exe' (Join-Path $dist 'config.yaml')
+          if ($LASTEXITCODE -ne 0) { throw '发布配置库初始化失败' }
+          # 初始化会生成构建机令牌；恢复模板，让每份安装在首次启动时生成独立令牌。
+          Copy-Item 'config.example.yaml' (Join-Path $dist 'config.yaml') -Force
 
           $requiredDirectories = @(
             'deps\assets',

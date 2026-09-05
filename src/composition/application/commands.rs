@@ -16,6 +16,7 @@ use crate::features::turtle_soup::{
 
 pub(super) struct ImmediateAdministrationPort {
     business: BusinessRuntimeHandle,
+    task_engine: TaskEngineHandle,
     monitor: MonitorShared,
     executed_commands_log_path: std::path::PathBuf,
 }
@@ -154,6 +155,10 @@ impl AdministrationImmediatePort for ImmediateAdministrationPort {
             .map_err(anyhow::Error::from)
     }
 
+    fn enqueue_hall_reply(&mut self, message: &str) -> Result<()> {
+        enqueue_current_hall_reply(&self.task_engine, message)
+    }
+
     fn configure_idle_exit(&mut self, minutes: u32) -> Result<()> {
         configure_idle_exit(&self.business, minutes)
     }
@@ -199,6 +204,7 @@ impl ApplicationRuntime {
         let live_config = self.lifecycle.live_configs.snapshot();
         ImmediateAdministrationPort {
             business: self.business.business.clone(),
+            task_engine: self.business.task_engine.clone(),
             monitor: self.lifecycle.monitor.clone(),
             executed_commands_log_path: live_config.state.executed_commands_log_path.clone(),
         }
@@ -485,6 +491,10 @@ impl AdministrationImmediatePort for ApplicationRuntime {
             .business
             .set_commands_enabled(enabled)
             .map_err(anyhow::Error::from)
+    }
+
+    fn enqueue_hall_reply(&mut self, message: &str) -> Result<()> {
+        enqueue_current_hall_reply(&self.business.task_engine, message)
     }
 
     fn configure_idle_exit(&mut self, minutes: u32) -> Result<()> {

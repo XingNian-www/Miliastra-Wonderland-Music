@@ -1447,16 +1447,6 @@ impl ApplicationRuntime {
                 continue;
             };
             let parsed_command = self.map_command_actor(parsed_command);
-            if !self.commands_enabled()?
-                && parsed_command.authority == CommandAuthority::HallMember
-                && parsed_command.role.is_none()
-            {
-                log::info!("命令识别已禁用，跳过: {}", parsed_command.raw);
-                self.ui
-                    .chat_observations
-                    .acknowledge_primary(&observed.id)?;
-                continue;
-            }
             if let ModuleCommand::Invite(invite) = &parsed_command.command
                 && !self.business.business.invite_should_accept(invite.seq)?
             {
@@ -1498,11 +1488,7 @@ impl ApplicationRuntime {
             }
             return Ok(());
         }
-        let questions = if self.commands_enabled()? {
-            attach_question_orders(visible_turtle_questions, new_turtle_questions)?
-        } else {
-            Vec::new()
-        };
+        let questions = attach_question_orders(visible_turtle_questions, new_turtle_questions)?;
         let commands = accepted
             .into_iter()
             .map(|pending| {
@@ -1524,9 +1510,16 @@ impl ApplicationRuntime {
         for input in merge_observed_inputs(commands, questions) {
             match input {
                 ObservedInput::Question(question) => {
-                    self.enqueue_turtle_soup_question(question, frame.captured_at())?;
+                    if self.commands_enabled()? {
+                        self.enqueue_turtle_soup_question(question, frame.captured_at())?;
+                    }
                 }
                 ObservedInput::Command(pending) => {
+                    if self.command_is_disabled(&pending.routed)? {
+                        log::info!("命令识别已禁用，跳过: {}", pending.routed.raw);
+                        self.acknowledge_primary_command(&pending.routed)?;
+                        continue;
+                    }
                     if self.enqueue_chat_listener_command(&pending.routed)? {
                         self.acknowledge_primary_command(&pending.routed)?;
                         continue;
@@ -1542,6 +1535,12 @@ impl ApplicationRuntime {
             }
         }
         Ok(())
+    }
+
+    fn command_is_disabled(&self, command: &RoutedCommand) -> Result<bool> {
+        Ok(!self.commands_enabled()?
+            && command.authority == CommandAuthority::HallMember
+            && command.role.is_none())
     }
 
     fn acknowledge_primary_command(&self, command: &RoutedCommand) -> Result<()> {
@@ -1705,10 +1704,7 @@ impl ApplicationRuntime {
         if self.enqueue_chat_listener_command(&parsed)? {
             return Ok(());
         }
-        if !self.commands_enabled()?
-            && parsed.authority == CommandAuthority::HallMember
-            && parsed.role.is_none()
-        {
+        if self.command_is_disabled(&parsed)? {
             log::info!("命令识别已禁用，跳过二级大厅命令: {}", parsed.raw);
             return Ok(());
         }

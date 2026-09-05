@@ -36,6 +36,7 @@ pub(crate) struct AdministrationCommandContext {
 
 pub(crate) trait AdministrationImmediatePort {
     fn set_commands_enabled(&mut self, enabled: bool) -> Result<()>;
+    fn enqueue_hall_reply(&mut self, message: &str) -> Result<()>;
     fn configure_idle_exit(&mut self, minutes: u32) -> Result<()>;
     fn record_command_activity(&mut self) -> Result<()>;
     fn log_executed(
@@ -93,11 +94,7 @@ impl AdministrationApplication {
                         "disable commands"
                     },
                 )?;
-                port.send_hall(if *enabled {
-                    "管理员已启用大厅命令识别功能"
-                } else {
-                    "管理员已禁用大厅命令识别功能"
-                })
+                port.send_hall(command_availability_feedback(*enabled))
             }
             AdministrationCommand::IdleExit { minutes } => {
                 port.configure_idle_exit((*minutes).max(IDLE_EXIT_MIN_MINUTES))?;
@@ -122,9 +119,24 @@ impl AdministrationApplication {
         port: &mut P,
     ) -> Result<ImmediateAdministrationOutcome> {
         match command.dispatch() {
-            AdministrationDispatch::ApplyCommandAvailabilityThenFormal { enabled } => {
+            AdministrationDispatch::ConfigureCommandAvailability { enabled } => {
+                port.record_command_activity()?;
                 port.set_commands_enabled(enabled)?;
-                Ok(ImmediateAdministrationOutcome::ContinueFormal)
+                let log_result = port.log_executed(
+                    context,
+                    if enabled {
+                        "enable commands"
+                    } else {
+                        "disable commands"
+                    },
+                );
+                if propagate_log_error {
+                    log_result?;
+                } else if let Err(error) = log_result {
+                    log::error!("写入执行命令日志失败: {error:#}");
+                }
+                port.enqueue_hall_reply(command_availability_feedback(enabled))?;
+                Ok(ImmediateAdministrationOutcome::Handled)
             }
             AdministrationDispatch::ConfigureIdleExit { minutes } => {
                 port.record_command_activity()?;
@@ -141,6 +153,14 @@ impl AdministrationApplication {
                 Ok(ImmediateAdministrationOutcome::ContinueFormal)
             }
         }
+    }
+}
+
+fn command_availability_feedback(enabled: bool) -> &'static str {
+    if enabled {
+        "管理员已启用大厅命令识别功能"
+    } else {
+        "管理员已禁用大厅命令识别功能"
     }
 }
 
@@ -207,7 +227,7 @@ pub(crate) struct FriendAdministrationMatch {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AdministrationDispatch {
     FormalTask,
-    ApplyCommandAvailabilityThenFormal { enabled: bool },
+    ConfigureCommandAvailability { enabled: bool },
     ConfigureIdleExit { minutes: u32 },
     ChatListenerMode(ChatListenerModeCommand),
 }
@@ -273,7 +293,7 @@ impl AdministrationCommand {
         match self {
             Self::Help | Self::EntertainmentHelp => AdministrationDispatch::FormalTask,
             Self::SetCommandsEnabled { enabled, .. } => {
-                AdministrationDispatch::ApplyCommandAvailabilityThenFormal { enabled: *enabled }
+                AdministrationDispatch::ConfigureCommandAvailability { enabled: *enabled }
             }
             Self::IdleExit { minutes } => {
                 AdministrationDispatch::ConfigureIdleExit { minutes: *minutes }
@@ -391,10 +411,18 @@ mod tests {
     #[derive(Default)]
     struct RecordingPort {
         batches: Vec<Vec<String>>,
+        commands_enabled: bool,
+        replies: Vec<String>,
     }
 
     impl AdministrationImmediatePort for RecordingPort {
-        fn set_commands_enabled(&mut self, _enabled: bool) -> Result<()> {
+        fn set_commands_enabled(&mut self, enabled: bool) -> Result<()> {
+            self.commands_enabled = enabled;
+            Ok(())
+        }
+
+        fn enqueue_hall_reply(&mut self, message: &str) -> Result<()> {
+            self.replies.push(message.to_string());
             Ok(())
         }
 
@@ -413,6 +441,41 @@ mod tests {
         ) -> Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn alternating_command_switches_complete_without_queued_state_replay() {
+        let mut port = RecordingPort::default();
+        let application = AdministrationApplication::new(150);
+        for enabled in [false, true, false] {
+            let context = AdministrationCommandContext {
+                message_type: "pink".to_string(),
+                username: "好友".to_string(),
+                user_command: if enabled { "@启用" } else { "@禁用" }.to_string(),
+            };
+            let outcome = application
+                .apply_immediate(
+                    &context,
+                    &AdministrationCommand::SetCommandsEnabled {
+                        enabled,
+                        username: context.username.clone(),
+                    },
+                    true,
+                    &mut port,
+                )
+                .unwrap();
+            assert_eq!(outcome, ImmediateAdministrationOutcome::Handled);
+            assert_eq!(port.commands_enabled, enabled);
+        }
+        assert_eq!(
+            port.replies,
+            [
+                "管理员已禁用大厅命令识别功能",
+                "管理员已启用大厅命令识别功能",
+                "管理员已禁用大厅命令识别功能",
+            ]
+        );
+        assert!(!port.commands_enabled);
     }
 
     impl AdministrationApplicationPort for RecordingPort {

@@ -44,7 +44,7 @@ pub(crate) fn parse_command_envelope(
     message_type: &str,
     observation: CommandObservation,
 ) -> Option<CommandEnvelope> {
-    if !matches!(message_type, "blue" | "pink") || is_feedback_text(text) {
+    if !matches!(message_type, "blue" | "pink") {
         return None;
     }
     if message_type == "blue" && text.starts_with("播放") && text.contains(" - ") {
@@ -52,6 +52,10 @@ pub(crate) fn parse_command_envelope(
     }
 
     if text.trim_start().starts_with("歌曲名") {
+        // Apply feedback filtering only to implicit song requests, never to @/# arguments.
+        if is_feedback_text(text) {
+            return None;
+        }
         return parse_structured_song_envelope(
             text,
             if message_type == "pink" {
@@ -87,6 +91,7 @@ pub(crate) fn parse_command_envelope(
     )
     .or_else(|| {
         parse_structured_song_envelope(raw_command_text, &username, message_type, observation)
+            .filter(|_| !is_feedback_text(raw_command_text))
     })
 }
 
@@ -265,6 +270,23 @@ mod tests {
                 ai_assisted: false,
                 friend_username: String::new(),
             })
+        );
+    }
+
+    #[test]
+    fn feedback_words_in_free_form_command_arguments_are_preserved() {
+        let envelope =
+            parse_command_envelope("[好友]：@通告 换源", "pink", CommandObservation::default())
+                .expect("free-form command should not be filtered by feedback words");
+
+        assert_eq!(envelope.command_text(), "通告 换源");
+        assert!(
+            parse_command_envelope(
+                "用户：搜索到:晴天,@确认@跳过@换源",
+                "blue",
+                CommandObservation::default(),
+            )
+            .is_none()
         );
     }
 

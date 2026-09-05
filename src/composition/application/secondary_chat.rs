@@ -69,6 +69,7 @@ fn classify_secondary_hall_routed_message(
     text: &str,
     routed: Option<&RoutedCommand>,
     accepts_turtle_questions: bool,
+    commands_enabled: bool,
 ) -> SecondaryHallMessageClassification {
     let mut classification = classify_secondary_hall_message(
         text,
@@ -76,8 +77,9 @@ fn classify_secondary_hall_routed_message(
         accepts_turtle_questions,
     );
     // The first route uses a placeholder, so authorization needs the real speaker.
-    classification.requires_sender |=
-        routed.is_some_and(|command| command.permission_required.is_some());
+    classification.requires_sender |= routed
+        .is_some_and(|command| command.permission_required.is_some())
+        || (!commands_enabled && classification.kind == SecondaryHallMessageKind::Command);
     classification
 }
 
@@ -847,35 +849,30 @@ impl ApplicationRuntime {
                 OcrPriority::ChatObservation,
             )?;
             let classification = if observes_hall {
-                let routed = commands_enabled
-                    .then(|| {
-                        secondary_hall_command_text(&text)
-                            .and_then(|command_text| {
-                                CommandEnvelope::new(
-                                    &text,
-                                    SECONDARY_HALL_FALLBACK_SENDER,
-                                    "blue",
-                                    command_text,
-                                    CommandObservation::default(),
-                                )
-                            })
-                            .or_else(|| {
-                                command::parse_structured_song_envelope(
-                                    &text,
-                                    SECONDARY_HALL_FALLBACK_SENDER,
-                                    "blue",
-                                    CommandObservation::default(),
-                                )
-                            })
-                            .and_then(|envelope| {
-                                command_router.route(&envelope, active_entertainment)
-                            })
+                let routed = secondary_hall_command_text(&text)
+                    .and_then(|command_text| {
+                        CommandEnvelope::new(
+                            &text,
+                            SECONDARY_HALL_FALLBACK_SENDER,
+                            "blue",
+                            command_text,
+                            CommandObservation::default(),
+                        )
                     })
-                    .flatten();
+                    .or_else(|| {
+                        command::parse_structured_song_envelope(
+                            &text,
+                            SECONDARY_HALL_FALLBACK_SENDER,
+                            "blue",
+                            CommandObservation::default(),
+                        )
+                    })
+                    .and_then(|envelope| command_router.route(&envelope, active_entertainment));
                 classify_secondary_hall_routed_message(
                     &text,
                     routed.as_ref(),
                     accepts_turtle_questions,
+                    commands_enabled,
                 )
             } else {
                 SecondaryHallMessageClassification {
@@ -1250,6 +1247,8 @@ impl ApplicationRuntime {
 
 #[cfg(test)]
 mod tests {
+    use crate::features::entertainment::EntertainmentKind;
+
     use super::*;
 
     #[test]
@@ -1289,7 +1288,7 @@ mod tests {
                 .unwrap();
             assert_eq!(provisional.permission_required, Some(IdentityRole::Admin));
             let classification =
-                classify_secondary_hall_routed_message(text, Some(&provisional), false);
+                classify_secondary_hall_routed_message(text, Some(&provisional), false, true);
             assert_eq!(classification.kind, SecondaryHallMessageKind::Command);
             assert!(classification.requires_sender, "command={text}");
 
@@ -1297,9 +1296,30 @@ mod tests {
             assert_eq!(authorized.permission_required, None, "command={text}");
             assert_eq!(authorized.role, Some(IdentityRole::Admin));
         }
-        let disabled = classify_secondary_hall_routed_message("@启用", None, false);
+        let disabled = classify_secondary_hall_routed_message("@启用", None, false, false);
         assert_eq!(disabled.kind, SecondaryHallMessageKind::Command);
         assert!(disabled.requires_sender);
+        for text in ["#状态", "#结束"] {
+            let envelope = |sender: &str| {
+                CommandEnvelope::new(text, sender, "blue", text, CommandObservation::default())
+                    .unwrap()
+            };
+            let provisional = router
+                .route(
+                    &envelope(SECONDARY_HALL_FALLBACK_SENDER),
+                    Some(EntertainmentKind::TurtleSoup),
+                )
+                .unwrap();
+            let classification =
+                classify_secondary_hall_routed_message(text, Some(&provisional), false, false);
+            assert_eq!(classification.kind, SecondaryHallMessageKind::Command);
+            assert!(classification.requires_sender, "disabled command={text}");
+            let authorized = router
+                .route(&envelope("管理员"), Some(EntertainmentKind::TurtleSoup))
+                .unwrap();
+            assert_eq!(authorized.permission_required, None);
+            assert_eq!(authorized.role, Some(IdentityRole::Admin));
+        }
     }
 
     fn primary_message(text: &str, y: i32) -> ChatMessage {

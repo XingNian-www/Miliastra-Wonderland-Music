@@ -165,6 +165,12 @@ pub trait SourceAdapter: Send + Sync + 'static {
         let _ = self.resolve(key, locator).await?;
         Ok(PlaybackEligibility::Eligible)
     }
+    /// Whether candidates without an explicit eligibility marker should be
+    /// probed during search. Providers with costly or challenge-prone stream
+    /// endpoints can defer that check until the user actually plays a track.
+    fn probe_unknown_candidates(&self) -> bool {
+        true
+    }
     async fn lyrics(
         &self,
         _key: &SongKey,

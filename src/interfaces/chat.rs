@@ -856,6 +856,48 @@ mod tests {
     }
 
     #[test]
+    fn friend_default_song_command_routes_bvid_to_bilibili() {
+        let parsed =
+            parse_text("[Alice]：@点歌 BV1GJ4I1x7h7", "pink").expect("friend BV song command");
+        assert_eq!(
+            parsed.command,
+            ModuleCommand::SongRequest(SongCommand {
+                keyword: "BV1GJ4J1x7h7".to_string(),
+                source: SongSource::Bilibili,
+                prefix: "点歌".to_string(),
+                prefer_accompaniment: false,
+                ai_assisted: false,
+                friend_username: "Alice".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn friend_bvid_keeps_a_real_one_and_repairs_terminal_bracket_to_j() {
+        let unchanged =
+            parse_text("[Alice]：@点歌 BV1GJ411x7h7", "pink").expect("friend BV song command");
+        let repaired = parse_text("[Alice]：@点歌 BV1GJ411x7h]", "pink")
+            .expect("friend BV song command with OCR bracket");
+
+        let ModuleCommand::SongRequest(unchanged) = unchanged.command else {
+            panic!("expected song command");
+        };
+        let ModuleCommand::SongRequest(repaired) = repaired.command else {
+            panic!("expected song command");
+        };
+        assert_eq!(unchanged.source, SongSource::Bilibili);
+        assert_eq!(unchanged.keyword, "BV1GJ411x7h7");
+        assert_eq!(repaired.source, SongSource::Bilibili);
+        assert_eq!(repaired.keyword, "BV1GJ411x7hJ");
+    }
+
+    #[test]
+    fn bvid_shortcut_and_bare_bvid_are_not_commands() {
+        assert!(parse_text("[Alice]：@BV1GJ411x7h7", "pink").is_none());
+        assert!(parse_text("[Alice]：BV1GJ411x7h7", "pink").is_none());
+    }
+
+    #[test]
     fn song_lock_treats_ai_and_plain_hall_song_as_same_request() {
         let plain = parse_text("用户：@点歌 晴天 周杰伦", "blue").expect("parse plain song");
         let ai = parse_text("用户：@AI点歌 晴天 周杰伦", "blue").expect("parse ai song");

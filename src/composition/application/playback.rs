@@ -225,6 +225,12 @@ impl PlaybackExecutionPort for ApplicationRuntime {
         self.playback.player.is_track_unavailable_error(error)
     }
 
+    fn item_scoped_playback_error_message(&self, error: &anyhow::Error) -> Option<&'static str> {
+        self.playback
+            .player
+            .item_scoped_playback_error_message(error)
+    }
+
     fn player_status(&mut self) -> Result<PlayerStatus> {
         self.playback.player.status()
     }

@@ -4,14 +4,16 @@ pub(super) fn turtle_soup_route(
     _query: &[(String, String)],
     state: &HttpSharedState,
 ) -> std::result::Result<String, AppError> {
-    serde_json::to_string(
-        &state
+    let mut value = serde_json::to_value(
+        state
             .application
             .queries
             .turtle_soup_snapshot()
             .map_err(internal_error)?,
     )
-    .map_err(internal_error)
+    .map_err(internal_error)?;
+    map_api_identity_json(&mut value, &state.live_configs.identity);
+    serde_json::to_string(&value).map_err(internal_error)
 }
 
 pub(super) fn turtle_soup_start_route(
@@ -39,11 +41,12 @@ pub(super) fn turtle_soup_start_route(
             "turtle soup start intent returned a different outcome",
         ));
     };
-    serde_json::to_string(&json!({
+    let mut value = json!({
         "ok": true,
         "turtleSoup": snapshot,
-    }))
-    .map_err(internal_error)
+    });
+    map_api_identity_json(&mut value, &state.live_configs.identity);
+    serde_json::to_string(&value).map_err(internal_error)
 }
 
 pub(super) fn turtle_soup_end_route(
@@ -73,11 +76,12 @@ pub(super) fn turtle_soup_end_route(
             message: "当前没有可结束的海龟汤".to_string(),
         });
     }
-    serde_json::to_string(&json!({
+    let mut value = json!({
         "ok": true,
         "turtleSoup": snapshot,
-    }))
-    .map_err(internal_error)
+    });
+    map_api_identity_json(&mut value, &state.live_configs.identity);
+    serde_json::to_string(&value).map_err(internal_error)
 }
 
 pub(super) fn turtle_soup_questions_route(
@@ -124,7 +128,9 @@ pub(super) fn undercover_route(
         .queries
         .undercover_snapshot()
         .map_err(internal_error)?;
-    serde_json::to_string(&snapshot).map_err(internal_error)
+    let mut value = serde_json::to_value(snapshot).map_err(internal_error)?;
+    map_api_identity_json(&mut value, &state.live_configs.identity);
+    serde_json::to_string(&value).map_err(internal_error)
 }
 
 pub(super) fn undercover_start_route(

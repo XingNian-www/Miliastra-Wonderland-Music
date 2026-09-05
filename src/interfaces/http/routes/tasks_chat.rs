@@ -113,6 +113,7 @@ pub(super) fn chat_send(
     let message = format!("{}{}", prefix, text);
     let receipt =
         required_enqueue_receipt(state.application.tasks.enqueue_console_chat(text, prefix))?;
+    let message = state.live_configs.identity.replace_display_names(&message);
     Ok(json!({
         "ok": true,
         "queued": true,

@@ -136,11 +136,6 @@ impl ApplicationRuntime {
     }
 
     pub(super) fn send_friend_message(&self, username: &str, message: &str) -> Result<bool> {
-        let message = self
-            .lifecycle
-            .live_configs
-            .identity
-            .replace_display_names(message);
         log::info!("好友发言: {} -> {}", username, redacted_chat_text(&message));
         self.send_friend_delivery_routine(username, &message)
     }
@@ -158,10 +153,7 @@ impl ApplicationRuntime {
     }
 
     fn send_friend_delivery_routine(&self, username: &str, message: &str) -> Result<bool> {
-        let outcome = self.send_friend_delivery_batch(&[FriendMessage::new(
-            username,
-            fit_chat_message(message),
-        )])?;
+        let outcome = self.send_friend_delivery_batch(&[FriendMessage::new(username, message)])?;
         match outcome {
             FriendBatchOutcome::Complete => Ok(true),
             FriendBatchOutcome::Failed { failure, .. }
@@ -185,13 +177,27 @@ impl ApplicationRuntime {
             super::UiResidency::SecondaryCurrentHall => UiResidencyTarget::SecondaryCurrentHall,
         };
         let mut grouped = Vec::<(String, Vec<String>)>::new();
+        let mut raw_grouped = Vec::<(String, Vec<String>)>::new();
         for message in messages {
+            let display_message = self
+                .lifecycle
+                .live_configs
+                .identity
+                .replace_display_names(message.message());
+            let display_message = fit_chat_message(&display_message);
             if let Some((recipient, items)) = grouped.last_mut()
+                && recipient == message.recipient()
+            {
+                items.push(display_message);
+            } else {
+                grouped.push((message.recipient().to_string(), vec![display_message]));
+            }
+            if let Some((recipient, items)) = raw_grouped.last_mut()
                 && recipient == message.recipient()
             {
                 items.push(message.message().to_string());
             } else {
-                grouped.push((
+                raw_grouped.push((
                     message.recipient().to_string(),
                     vec![message.message().to_string()],
                 ));
@@ -199,6 +205,13 @@ impl ApplicationRuntime {
         }
         let request = SendFriendDeliveries::new(
             grouped
+                .into_iter()
+                .map(|(recipient, messages)| FriendDelivery::new(recipient, messages))
+                .collect(),
+            residency,
+        );
+        let raw_request = SendFriendDeliveries::new(
+            raw_grouped
                 .into_iter()
                 .map(|(recipient, messages)| FriendDelivery::new(recipient, messages))
                 .collect(),
@@ -255,7 +268,7 @@ impl ApplicationRuntime {
         }
 
         let retryable = outcome
-            .safe_retry_request(&request)
+            .safe_retry_request(&raw_request)
             .map(|request| {
                 request
                     .deliveries()
@@ -367,6 +380,11 @@ impl CustomWorkflowExecutionPort for ApplicationRuntime {
         match capability {
             WorkflowCapability::SendHall { message } => self.reply(&message),
             WorkflowCapability::SendCurrentChat { message } => {
+                let message = self
+                    .lifecycle
+                    .live_configs
+                    .identity
+                    .replace_display_names(&message);
                 self.ui.chat_output.send_current_chat(&message)
             }
             WorkflowCapability::SendFriendMessage { target, message } => {
@@ -430,7 +448,13 @@ impl InviteExecutionPort for ApplicationRuntime {
             .submit(ExecuteInvite::new(
                 username,
                 password.map(str::to_string),
-                fit_chat_message(notification),
+                fit_chat_message(
+                    &self
+                        .lifecycle
+                        .live_configs
+                        .identity
+                        .replace_display_names(notification),
+                ),
                 residency,
             ))
             .map_err(|error| anyhow!("邀请未进入 UI runtime: {error}"))?

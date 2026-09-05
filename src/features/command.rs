@@ -69,11 +69,20 @@ impl CommandEnvelope {
             _ => return None,
         };
         let user_command = user_command.into();
-        let user_command = user_command
-            .trim()
-            .trim_end_matches([']', '】'])
-            .trim_end()
-            .to_string();
+        let trimmed_command = user_command.trim();
+        // 通用 OCR 清理会删除末尾括号，但 `J` 也可能被识别成 `]`/`】`。
+        // 含 BV 片段时保留该字符，让 B 站归一化器负责修复；其他命令继续沿用
+        // 原有的括号清理行为。
+        let user_command = if trimmed_command.ends_with([']', '】'])
+            && !miliastra_playback::bilibili_normalize_bvid(trimmed_command).is_some()
+        {
+            trimmed_command
+                .trim_end_matches([']', '】'])
+                .trim_end()
+                .to_string()
+        } else {
+            trimmed_command.to_string()
+        };
         let (prefix, command_text) = if let Some(text) = user_command.strip_prefix('@') {
             (CommandPrefix::At, text)
         } else {

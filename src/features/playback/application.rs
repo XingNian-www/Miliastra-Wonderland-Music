@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use miliastra_playback::{PlayableTrack, TrackKey};
+use miliastra_playback::{PlayableTrack, ProviderId, TrackKey};
 
 use crate::features::song_request::SearchCandidate;
 use crate::text::{MAX_CHAT_WIDTH, char_width, display_width};
@@ -23,29 +23,6 @@ pub(crate) struct PlaybackCommandContext {
     pub(crate) message_type: String,
     pub(crate) username: String,
     pub(crate) user_command: String,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AlternatePlaybackSource {
-    QqMusic,
-    Netease,
-}
-
-impl AlternatePlaybackSource {
-    fn other_than(current: &str) -> Self {
-        if current == "netease" {
-            Self::QqMusic
-        } else {
-            Self::Netease
-        }
-    }
-
-    const fn id(self) -> &'static str {
-        match self {
-            Self::QqMusic => "qqmusic",
-            Self::Netease => "netease",
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -336,6 +313,9 @@ pub(crate) trait PlaybackExecutionPort {
     fn play_and_verify(&mut self, request: &PlaybackRequest) -> Result<PlaybackVerification>;
     fn is_track_unavailable_error(&self, _error: &anyhow::Error) -> bool {
         false
+    }
+    fn item_scoped_playback_error_message(&self, _error: &anyhow::Error) -> Option<&'static str> {
+        None
     }
     fn player_status(&mut self) -> Result<PlayerStatus>;
     fn playback_queue(&mut self) -> Result<Vec<QueueItem>>;
@@ -1124,31 +1104,21 @@ impl PlaybackApplication {
         }
         let verification = match port.play_and_verify(request) {
             Ok(verification) => verification,
-            Err(error)
-                if purpose.allows_source_switch() && port.is_track_unavailable_error(&error) =>
-            {
-                log::info!(
-                    "请求歌曲已被播放器标记为不可用，尝试备用来源: uri={}",
-                    request.uri()
-                );
-                return self.switch_source_and_play(requested, request, None, purpose, port);
-            }
             Err(error) => {
-                if matches!(purpose, PlaybackPurpose::SourceRetry { .. })
-                    && port.is_track_unavailable_error(&error)
-                {
-                    log::info!(
-                        "备用来源也已确认无音源，完成项目级失败: uri={}",
-                        request.uri()
+                log::warn!("播放候选失败: uri={} error={error:#}", request.uri());
+                let item_message = port.item_scoped_playback_error_message(&error);
+                if port.is_track_unavailable_error(&error) || item_message.is_some() {
+                    let reason = item_message.map_or_else(
+                        || "平台无对应歌曲音源".to_string(),
+                        |message| format!("{}: {message}", request_source(request)),
                     );
+                    if purpose.allows_source_switch() {
+                        return self
+                            .switch_source_and_play(requested, request, purpose, &reason, port);
+                    }
                     return Ok(PlaybackCompletion::new(
-                        PlaybackResult::no_source(
-                            requested,
-                            request,
-                            None,
-                            "所有候选平台均无对应歌曲音源",
-                        ),
-                        Some("平台无对应歌曲音源".to_string()),
+                        PlaybackResult::no_source(requested, request, None, reason.clone()),
+                        purpose.replies_with_play_message().then_some(reason),
                         false,
                     ));
                 }
@@ -1161,7 +1131,9 @@ impl PlaybackApplication {
                 log::error!("播放候选失败: {reply}");
                 return Ok(PlaybackCompletion::new(
                     PlaybackResult::error(requested, request, None, reply.clone()),
-                    purpose.replies_with_play_message().then_some(reply),
+                    (purpose.replies_with_play_message()
+                        || matches!(purpose, PlaybackPurpose::SourceRetry { .. }))
+                    .then_some(reply),
                     false,
                 ));
             }
@@ -1194,71 +1166,69 @@ impl PlaybackApplication {
         &self,
         requested: &PlaybackRequest,
         request: &PlaybackRequest,
-        _mismatch_status: Option<&PlayerStatus>,
         purpose: PlaybackPurpose,
+        failure_reason: &str,
         port: &mut P,
     ) -> Result<PlaybackCompletion> {
-        let current_source = request_source(request);
-        let next_source = AlternatePlaybackSource::other_than(current_source);
-        let candidate = request.track.as_ref().and_then(|reference| {
-            select_snapshot_candidate(
-                &request.candidate_snapshot,
-                next_source.id(),
-                request.prefer_accompaniment,
-                reference,
-            )
-        });
-        let Some(candidate) = candidate else {
-            return Ok(PlaybackCompletion::new(
-                PlaybackResult::no_source(
-                    requested,
-                    request,
-                    None,
-                    format!("{} 平台无对应歌曲音源", next_source.id()),
-                ),
-                purpose
-                    .replies_with_play_message()
-                    .then(|| "平台无对应歌曲音源".to_string()),
-                true,
-            ));
-        };
-        let picked = PlaybackPickedCandidate {
-            text: candidate.text.clone(),
-            track: candidate.playable_track(),
-            candidate_snapshot: request.candidate_snapshot.clone(),
-        };
-        log::info!(
-            "AI 自动换源候选: source={} keyword={} uri={}",
-            next_source.id(),
-            picked.text,
-            picked.track.track_ref.key
+        let candidates = alternate_snapshot_candidates(request);
+        let mut reasons = vec![failure_reason.to_string()];
+        let mut completion = PlaybackCompletion::new(
+            PlaybackResult::no_source(requested, request, None, failure_reason),
+            None,
+            true,
         );
-        let resolved = PlaybackSelection {
-            keyword: picked.text.clone(),
-            source: next_source.id().to_string(),
-            prefer_accompaniment: request.prefer_accompaniment,
-            ai_original_text: String::new(),
-            track: Some(picked.track),
-            friend_username: String::new(),
-            requester: request.requester.clone(),
-            console_bypass_dedup: false,
-            candidate_snapshot: request.candidate_snapshot.clone(),
-            queue_item_id: request.queue_item_id,
-        };
-        let mut completion = self.run_request(
-            requested,
-            &resolved.request(),
-            PlaybackPurpose::SourceRetry {
-                stop_when_user_paused: purpose.stop_when_user_paused(),
-            },
-            port,
-        )?;
-        if completion.result.outcome() == PlaybackOutcome::Success {
-            completion.reply = Some(format!(
-                "因平台无音源,已由AI自动切换至:{}",
-                compact_candidate_title(&resolved.keyword)
-            ));
+        // Each alternate provider contributes at most one matching candidate.
+        // SourceRetry never switches recursively, so an unavailable snapshot is finite.
+        for candidate in candidates {
+            let mut resolved = request.clone();
+            resolved.keyword = candidate.text.clone();
+            resolved.source = candidate.track_ref.key.provider.to_string();
+            resolved.track = Some(candidate.playable_track());
+            log::info!(
+                "自动换源候选: source={} keyword={} uri={}",
+                resolved.source,
+                resolved.keyword,
+                resolved.uri()
+            );
+            completion = self.run_request(
+                requested,
+                &resolved,
+                PlaybackPurpose::SourceRetry {
+                    stop_when_user_paused: purpose.stop_when_user_paused(),
+                },
+                port,
+            )?;
+            match completion.result.outcome() {
+                PlaybackOutcome::Success => {
+                    completion.reply = purpose.replies_with_play_message().then(|| {
+                        format!("已自动换源:{}", compact_candidate_title(&resolved.keyword))
+                    });
+                    return Ok(completion);
+                }
+                PlaybackOutcome::ItemScopedFailure => {
+                    if let Some(reason) = completion.result.failure_reason()
+                        && !reasons.iter().any(|existing| existing == reason)
+                    {
+                        reasons.push(reason.to_string());
+                    }
+                }
+                _ => {
+                    if !purpose.replies_with_play_message() {
+                        completion.reply = None;
+                    }
+                    return Ok(completion);
+                }
+            }
         }
+        let reason = reasons.join("; ");
+        completion.result.failure_reason = Some(reason.clone());
+        completion.reply = purpose.replies_with_play_message().then(|| {
+            if matches!(purpose, PlaybackPurpose::Queue { .. }) {
+                format!("{reason}，已跳过当前歌曲")
+            } else {
+                reason
+            }
+        });
         Ok(completion)
     }
 
@@ -1341,6 +1311,31 @@ fn select_snapshot_candidate(
     comparable
         .into_iter()
         .max_by_key(|candidate| candidate.eligibility.preference_rank())
+}
+
+fn alternate_snapshot_candidates(request: &PlaybackRequest) -> Vec<SearchCandidate> {
+    let Some(reference) = request.track.as_ref() else {
+        return Vec::new();
+    };
+    let mut candidates = ProviderId::ALL
+        .into_iter()
+        .filter(|provider| *provider != reference.track_ref.key.provider)
+        .filter_map(|provider| {
+            select_snapshot_candidate(
+                &request.candidate_snapshot,
+                provider.as_str(),
+                request.prefer_accompaniment,
+                reference,
+            )
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|candidate| {
+        std::cmp::Reverse((
+            request.prefer_accompaniment && is_accompaniment_candidate(&candidate.text),
+            candidate.eligibility.preference_rank(),
+        ))
+    });
+    candidates
 }
 
 fn candidate_matches_reference(candidate: &SearchCandidate, reference: &PlayableTrack) -> bool {
@@ -1555,6 +1550,7 @@ mod tests {
         replies: Vec<String>,
         track_unavailable: bool,
         always_unavailable: bool,
+        item_scoped_error: bool,
         play_attempts: usize,
         pool: Vec<PlayableTrack>,
     }
@@ -1813,6 +1809,14 @@ mod tests {
             self.track_unavailable && error.to_string() == "track unavailable"
         }
 
+        fn item_scoped_playback_error_message(
+            &self,
+            _error: &anyhow::Error,
+        ) -> Option<&'static str> {
+            self.item_scoped_error
+                .then_some("登录凭据已失效，请重新登录")
+        }
+
         fn player_status(&mut self) -> Result<PlayerStatus> {
             unreachable!("playback never started")
         }
@@ -1859,6 +1863,7 @@ mod tests {
             replies: Vec::new(),
             track_unavailable: false,
             always_unavailable: false,
+            item_scoped_error: false,
             play_attempts: 0,
             pool: Vec::new(),
         };
@@ -1876,6 +1881,54 @@ mod tests {
 
         assert!(port.removed.is_empty());
         assert_eq!(port.replies, ["player unavailable"]);
+    }
+
+    #[test]
+    fn item_scoped_provider_failure_is_removed_and_queue_continues() {
+        let queue = [1, 2]
+            .into_iter()
+            .map(|id| QueueItem {
+                id,
+                keyword: format!("酷狗歌曲{id}"),
+                track: Some(test_track(
+                    &format!("miliastra://track/kugou/{id}"),
+                    &format!("酷狗歌曲{id} - 歌手"),
+                )),
+                ..QueueItem::default()
+            })
+            .collect();
+        let mut port = FailingPlaybackPort {
+            queue,
+            removed: Vec::new(),
+            replies: Vec::new(),
+            track_unavailable: false,
+            always_unavailable: false,
+            item_scoped_error: true,
+            play_attempts: 0,
+            pool: Vec::new(),
+        };
+        let application = PlaybackApplication::new(PlaybackApplicationConfig {
+            console_bypass_dedup: true,
+            queue_max_size: 20,
+            monitor_tick_ms: Arc::new(RwLock::new(50)),
+            monitor_status_ms: Arc::new(RwLock::new(50)),
+            help_batch_ms: 0,
+        });
+
+        application
+            .consume_queue("credential-rejected", &mut port)
+            .expect("deterministic provider failure should not block queue");
+
+        assert!(port.queue.is_empty());
+        assert_eq!(port.removed, [QueueRemoval::Id(1), QueueRemoval::Id(2)]);
+        assert_eq!(port.play_attempts, 2);
+        assert_eq!(
+            port.replies,
+            [
+                "kugou: 登录凭据已失效，请重新登录，已跳过当前歌曲",
+                "kugou: 登录凭据已失效，请重新登录，已跳过当前歌曲"
+            ]
+        );
     }
 
     #[test]
@@ -1899,6 +1952,7 @@ mod tests {
             replies: Vec::new(),
             track_unavailable: true,
             always_unavailable: false,
+            item_scoped_error: false,
             play_attempts: 0,
             pool: Vec::new(),
         };
@@ -1917,10 +1971,7 @@ mod tests {
         assert!(port.queue.is_empty());
         assert_eq!(port.removed, [QueueRemoval::Id(17)]);
         assert_eq!(port.play_attempts, 2);
-        assert_eq!(
-            port.replies,
-            ["因平台无音源,已由AI自动切换至:不可用候选-测试歌手"]
-        );
+        assert_eq!(port.replies, ["已自动换源:不可用候选-测试歌手"]);
     }
 
     #[test]
@@ -1958,6 +2009,7 @@ mod tests {
             replies: Vec::new(),
             track_unavailable: true,
             always_unavailable: true,
+            item_scoped_error: false,
             play_attempts: 0,
             pool: Vec::new(),
         };
@@ -1976,7 +2028,7 @@ mod tests {
         assert_eq!(port.play_attempts, 2);
         assert_eq!(port.removed, [QueueRemoval::Id(18)]);
         assert!(port.queue.is_empty());
-        assert_eq!(port.replies, ["平台无对应歌曲音源"]);
+        assert_eq!(port.replies, ["平台无对应歌曲音源，已跳过当前歌曲"]);
     }
 
     #[test]
@@ -2153,6 +2205,7 @@ mod tests {
             replies: Vec::new(),
             track_unavailable: true,
             always_unavailable: true,
+            item_scoped_error: false,
             play_attempts: 0,
             pool: Vec::new(),
         };
@@ -2172,7 +2225,13 @@ mod tests {
         assert_eq!(port.removed, [QueueRemoval::Id(11), QueueRemoval::Id(12)]);
         // 每首歌各尝试一次：换源时无候选快照，直接确认项目级失败并丢弃。
         assert_eq!(port.play_attempts, 2);
-        assert_eq!(port.replies, ["平台无对应歌曲音源", "平台无对应歌曲音源"]);
+        assert_eq!(
+            port.replies,
+            [
+                "平台无对应歌曲音源，已跳过当前歌曲",
+                "平台无对应歌曲音源，已跳过当前歌曲"
+            ]
+        );
     }
 
     #[test]
@@ -2224,6 +2283,7 @@ mod tests {
             replies: Vec::new(),
             track_unavailable: true,
             always_unavailable: true,
+            item_scoped_error: false,
             play_attempts: 0,
             pool: vec![
                 test_track("miliastra://track/qqmusic/pool-1", "池歌一 - 歌手A"),
@@ -2631,6 +2691,200 @@ mod tests {
         }
         fn remove_playback_queue(&mut self, removal: QueueRemoval) -> Result<()> {
             self.inner.remove_playback_queue(removal)
+        }
+    }
+
+    #[derive(Default)]
+    struct SourceFailurePort {
+        inner: NavigationCommandPort,
+        errors: VecDeque<&'static str>,
+        requests: Vec<PlaybackRequest>,
+        pause_after_failure: bool,
+        paused: bool,
+    }
+
+    impl PlaybackExecutionPort for SourceFailurePort {
+        fn reply(&mut self, message: &str) -> Result<()> {
+            self.inner.reply(message)
+        }
+        fn update_monitor(&mut self) {}
+        fn search_and_pick(
+            &mut self,
+            _keyword: &str,
+            _source: &str,
+            _prefer_accompaniment: bool,
+        ) -> std::result::Result<Option<PlaybackPickedCandidate>, PlaybackSearchFailure> {
+            unreachable!("fallback uses the saved snapshot without searching again")
+        }
+        fn song_dedup_limited(&mut self, request: &PlaybackRequest) -> Result<bool> {
+            self.inner.song_dedup_limited(request)
+        }
+        fn play_and_verify(&mut self, request: &PlaybackRequest) -> Result<PlaybackVerification> {
+            self.requests.push(request.clone());
+            if let Some(error) = self.errors.pop_front() {
+                self.paused = self.pause_after_failure;
+                bail!("{error}");
+            }
+            self.inner.play_and_verify(request)
+        }
+        fn is_track_unavailable_error(&self, error: &anyhow::Error) -> bool {
+            error.to_string() == "track_unavailable"
+        }
+        fn item_scoped_playback_error_message(
+            &self,
+            error: &anyhow::Error,
+        ) -> Option<&'static str> {
+            (error.to_string() == "relogin_required").then_some("登录凭据已失效，请重新登录")
+        }
+        fn player_status(&mut self) -> Result<PlayerStatus> {
+            self.inner.player_status()
+        }
+        fn playback_queue(&mut self) -> Result<Vec<QueueItem>> {
+            self.inner.playback_queue()
+        }
+        fn remove_playback_queue(&mut self, removal: QueueRemoval) -> Result<()> {
+            self.inner.remove_playback_queue(removal)
+        }
+        fn user_pause_active(&mut self) -> Result<bool> {
+            Ok(self.paused)
+        }
+    }
+
+    #[test]
+    fn rejected_kugou_queue_head_advances_to_playable_next_track() {
+        let next = test_track("miliastra://track/netease/next", "Next - Artist");
+        let mut port = SourceFailurePort {
+            inner: NavigationCommandPort {
+                queue: vec![
+                    QueueItem {
+                        id: 1,
+                        keyword: "Rejected".into(),
+                        track: Some(test_track(
+                            "miliastra://track/kugou/rejected",
+                            "Song - Artist",
+                        )),
+                        ..QueueItem::default()
+                    },
+                    QueueItem {
+                        id: 2,
+                        keyword: "Next".into(),
+                        track: Some(next.clone()),
+                        ..QueueItem::default()
+                    },
+                ],
+                verifications: [repeat_verification(&next)].into(),
+                ..NavigationCommandPort::default()
+            },
+            errors: ["relogin_required"].into(),
+            ..SourceFailurePort::default()
+        };
+        let played = repeat_application()
+            .consume_queue_after_monitor("idle_keep_alive", &mut port)
+            .unwrap();
+        assert_eq!(
+            played,
+            Some(ConsumedSelection::Queue {
+                keyword: "Next".into()
+            })
+        );
+        assert!(port.inner.queue.is_empty());
+        assert_eq!(port.requests.len(), 2);
+        assert_eq!(port.inner.played_uris, [next.track_ref.key.to_string()]);
+        assert_eq!(
+            port.inner.replies[0],
+            "kugou: 登录凭据已失效，请重新登录，已跳过当前歌曲"
+        );
+    }
+
+    #[test]
+    fn rejected_source_tries_each_matching_platform_once_and_retains_request_identity() {
+        let original = test_track("miliastra://track/kugou/original", "Song - Artist");
+        let netease = test_candidate("Song - Artist", "miliastra://track/netease/backup");
+        let mut selection = pool_selection(&original);
+        selection.requester = "friend".into();
+        selection.queue_item_id = Some(11);
+        selection.candidate_snapshot = vec![
+            test_candidate("Song - Artist", "miliastra://track/kugou/same-provider"),
+            test_candidate("Song - Artist", "miliastra://track/qqmusic/backup"),
+            test_candidate("Song - Artist", "miliastra://track/qqmusic/duplicate"),
+            test_candidate("Unrelated - Other", "miliastra://track/bilibili/wrong"),
+            netease.clone(),
+        ];
+        let mut port = SourceFailurePort {
+            inner: NavigationCommandPort {
+                verifications: [repeat_verification(&netease.playable_track())].into(),
+                ..NavigationCommandPort::default()
+            },
+            errors: ["relogin_required", "track_unavailable"].into(),
+            ..SourceFailurePort::default()
+        };
+        let result = repeat_application()
+            .play_confirmed(&selection, &mut port)
+            .unwrap();
+        assert_eq!(result.outcome(), PlaybackOutcome::Success);
+        assert!(result.source_switched());
+        assert_eq!(result.requested().uri(), original.track_ref.key.to_string());
+        assert_eq!(
+            result.final_request().uri(),
+            netease.track_ref.key.to_string()
+        );
+        assert_eq!(
+            port.requests.iter().map(request_source).collect::<Vec<_>>(),
+            ["kugou", "qqmusic", "netease"]
+        );
+        assert!(
+            port.requests
+                .iter()
+                .all(|request| request.requester == "friend" && request.queue_item_id == Some(11))
+        );
+        assert_eq!(port.inner.replies, ["已自动换源:Song-Artist"]);
+    }
+
+    #[test]
+    fn alternate_credential_failure_is_skipped_but_player_failure_or_pause_preserves_head() {
+        for (second_error, pause, removed) in [
+            ("relogin_required", false, true),
+            ("player unavailable", false, false),
+            ("relogin_required", true, false),
+        ] {
+            let mut port = SourceFailurePort {
+                inner: NavigationCommandPort {
+                    queue: vec![QueueItem {
+                        id: 3,
+                        keyword: "Song".into(),
+                        track: Some(test_track(
+                            "miliastra://track/kugou/original",
+                            "Song - Artist",
+                        )),
+                        candidate_snapshot: vec![test_candidate(
+                            "Song - Artist",
+                            "miliastra://track/qqmusic/backup",
+                        )],
+                        ..QueueItem::default()
+                    }],
+                    ..NavigationCommandPort::default()
+                },
+                errors: ["relogin_required", second_error].into(),
+                pause_after_failure: pause,
+                ..SourceFailurePort::default()
+            };
+            assert!(
+                repeat_application()
+                    .consume_queue_after_monitor("idle_keep_alive", &mut port)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(port.inner.queue.is_empty(), removed);
+            assert_eq!(port.requests.len(), if pause { 1 } else { 2 });
+            if removed {
+                assert_eq!(port.inner.replies.len(), 1);
+                assert!(port.inner.replies[0].contains("qqmusic: 登录凭据已失效"));
+                assert!(port.inner.replies[0].ends_with("已跳过当前歌曲"));
+            } else if pause {
+                assert!(port.inner.replies.is_empty());
+            } else {
+                assert_eq!(port.inner.replies, ["player unavailable"]);
+            }
         }
     }
 

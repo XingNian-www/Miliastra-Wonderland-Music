@@ -71,7 +71,7 @@ async fn probe_candidates(
             // 仍需探测一次，避免用户刚开通会员时被一天的旧负缓存挡住。
             PlaybackEligibility::VipRequired => account_vip != Some(true),
             // 元数据未给出判定：探测确认。
-            PlaybackEligibility::Unknown => true,
+            PlaybackEligibility::Unknown => adapter.probe_unknown_candidates(),
             // 免费可播/无版权/付费/不可播与账号 VIP 无关，直接采用。
             _ => false,
         };
@@ -184,6 +184,10 @@ impl ResolveCache {
         while self.entries.len() > RESOLVE_CACHE_MAX_ENTRIES {
             self.entries.remove(0);
         }
+    }
+
+    fn invalidate(&mut self, key: &SongKey) {
+        self.entries.retain(|entry| entry.key != *key);
     }
 }
 
@@ -1001,6 +1005,7 @@ impl PlaybackCore {
         let source_timeout = self.source_timeout;
         let latest_generation = self.generation.clone();
         let audio_cache = self.audio_cache.clone();
+        let resolve_cache = self.resolve_cache.clone();
         tokio::spawn(async move {
             let mut snapshots = engine.subscribe();
             // 第一轮：缓存优先。
@@ -1008,6 +1013,17 @@ impl PlaybackCore {
                 .await
             {
                 return;
+            }
+            // A stream failure means both the origin URL and any local proxy
+            // file may be stale. Drop them before resolving the replacement.
+            if let Some(cache) = &audio_cache {
+                cache.invalidate(&song_key).await;
+            }
+            {
+                let mut cache = resolve_cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                cache.invalidate(&song_key);
             }
             let Some(stream) = resolve_stream_retry(
                 &catalog,
@@ -1019,6 +1035,12 @@ impl PlaybackCore {
             else {
                 return;
             };
+            {
+                let mut cache = resolve_cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                cache.put(song_key.clone(), stream.clone(), unix_epoch_ms());
+            }
             if !generation_is_latest(&latest_generation, generation)
                 || !snapshot_is_stream_failure(&snapshots.borrow(), generation, session_id)
             {
@@ -1050,9 +1072,6 @@ impl PlaybackCore {
             {
                 return;
             }
-            if let Some(cache) = &audio_cache {
-                cache.invalidate(&song_key).await;
-            }
             let Some(stream) = resolve_stream_retry(
                 &catalog,
                 &song_key,
@@ -1063,6 +1082,12 @@ impl PlaybackCore {
             else {
                 return;
             };
+            {
+                let mut cache = resolve_cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                cache.put(song_key.clone(), stream.clone(), unix_epoch_ms());
+            }
             if !generation_is_latest(&latest_generation, generation)
                 || !snapshot_is_stream_failure(&snapshots.borrow(), generation, session_id)
             {
